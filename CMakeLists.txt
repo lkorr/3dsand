@@ -322,6 +322,9 @@ add_executable(sandvox
   # a still lake needs before draining it can be arithmetic
   # (docs/PLAN_water_master.md).
   src/sim/waterbody.cpp
+  # The current field: sinks, vortices, sources and streams summed
+  # analytically, the wind field applied to water (plan component 8).
+  src/sim/currentprim.cpp
   src/sim/voxload.cpp
   # The baked tree atlas: assets/trees/*.svtree -> one storage buffer that
   # worldgen samples instead of evaluating implicit tree shapes per cell.
@@ -364,6 +367,7 @@ add_executable(sandvox
   src/test/selftest_worldio.cpp
   src/test/selftest_spell.cpp
   src/test/selftest_playerkit.cpp
+  src/test/selftest_equipment.cpp
   src/test/selftest_audio.cpp
   src/audio/device.cpp
   src/audio/library.cpp

@@ -235,6 +235,20 @@ Status GatePlayerKit(Ctx& c, std::string& detail) {
     kit.bag.slots[0] = {rock, 2};
     kit.bag.slots[Bag::kSlots - 1] = {blade, 1};
     kit.equip.slots[sheath] = {blade, 1};
+    // v2: WORN DAMAGE. The owner's decision is that armour damage persists
+    // EXACTLY, so this is a lattice and not a percentage — and a lattice is
+    // the one thing a format bump has to be able to carry without silently
+    // truncating. Two shells, one holed and one intact, because "the empty
+    // entries survive too" is the half that a save writing only the damaged
+    // shells would get wrong by re-indexing them.
+    {
+      WornDamage d;
+      d.shells.resize(2);
+      d.shells[0].hp = 4.5f;
+      d.shells[0].lattice.push_back(PrefabVoxel{1, 2, 3, 48, 200});
+      d.shells[0].lattice.push_back(PrefabVoxel{4, 5, 6, 49, 0});
+      kit.SetDamage("kit_blade", std::move(d));
+    }
 
     PlayerKitRefs refs{&caster, &glyphs, &hb, &kit, &items};
     EntityIO io = MakeEntityIO(c.debris, c.mobs, nullptr, &refs);
@@ -256,6 +270,7 @@ Status GatePlayerKit(Ctx& c, std::string& detail) {
                 kit.equip.At(sheath).Empty() &&
                 caster.inventory.owned.empty(),
             "reset clears the hotbar, the pack, the equipment and the glyphs");
+      check(kit.wornDamage.empty(), "and the worn damage with them");
 
       check(plyr->load(bytes.data(), bytes.size(), kPlayerKitSaveVersion),
             "and the payload loads back");
@@ -278,6 +293,31 @@ Status GatePlayerKit(Ctx& c, std::string& detail) {
                 caster.inventory.At(4) == glyphs.Find("kit_fire"),
             "and the bindings landed on the right keys");
       check(caster.inventory.At(1) < 0, "leaving the unbound keys unbound");
+
+      // v2: the holes came back where they were. Compared cell for cell,
+      // because "the right number of voxels" is what a format that dropped
+      // the coordinates would also report.
+      const WornDamage* d = kit.Damage("kit_blade");
+      check(d != nullptr, "worn damage came back");
+      if (d) {
+        check(d->shells.size() == 2,
+              "including the intact shell, so the per-shell indices still line "
+              "up with the item's cover order");
+        check(d->shells[0].hp == 4.5f, "and the hp that was left");
+        check(d->shells[0].lattice.size() == 2, "and both damaged cells");
+        if (d->shells[0].lattice.size() == 2) {
+          const PrefabVoxel& v0 = d->shells[0].lattice[0];
+          const PrefabVoxel& v1 = d->shells[0].lattice[1];
+          check(v0.x == 1 && v0.y == 2 && v0.z == 3 && v0.material == 48 &&
+                    v0.color == 200,
+                "cell for cell, material and art colour included");
+          check(v1.x == 4 && v1.y == 5 && v1.z == 6 && v1.material == 49,
+                "and so does the second");
+        }
+        check(d->shells[1].Empty(),
+              "an undamaged shell round-trips as empty rather than as a "
+              "full copy of itself");
+      }
 
       // A truncated payload must be REFUSED, not half-applied. Saves get
       // truncated by full disks and interrupted writes, and a half-applied

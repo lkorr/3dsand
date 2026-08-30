@@ -803,9 +803,31 @@ void DrawInventoryScreen(UIState& s) {
   }
   ImGui::End();
 
+  // ---- DRAGGED OUT OF EVERY PANEL: PUT IT ON THE FLOOR --------------------
+  //
+  // Every slot is a drop TARGET, so a drag that ends anywhere else has been
+  // refused by all of them and imgui simply forgets it. That silence is the
+  // problem: "drag it out of the window" is the gesture every inventory in the
+  // genre uses for discard, and having it do nothing reads as broken.
+  //
+  // Detected the only way imgui allows — the payload was still live last frame
+  // and the mouse has now been released with nobody accepting it. Deliberately
+  // AFTER every panel has had its chance, so a legal move is never mistaken
+  // for a drop.
+  if (const ImGuiPayload* p = ImGui::GetDragDropPayload()) {
+    if (p->IsDataType(kPayloadItem) &&
+        ImGui::IsMouseReleased(ImGuiMouseButton_Left) &&
+        !ImGui::IsAnyItemHovered()) {
+      KitRef from{};
+      std::memcpy(&from, p->Data, sizeof(from));
+      s.dropItem.pending = true;
+      s.dropItem.from = from;
+    }
+  }
+
   // The one line of instruction, centred under everything.
   {
-    const char* hint = "I or Esc to close";
+    const char* hint = "I or Esc to close   |   drag out to drop";
     const ImVec2 ts = ImGui::CalcTextSize(hint);
     bg->AddText(ImVec2((disp.x - ts.x) * 0.5f, disp.y - ts.y - 8),
                 Fade(ui::ColParchDim(), 0.75f), hint);

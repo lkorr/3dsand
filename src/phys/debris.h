@@ -105,6 +105,31 @@ class DebrisSystem {
                  std::vector<PrefabVoxel> skinVoxels = {},
                  uint32_t bleedMat = 0);
 
+  // TAKE A BODY OUT OF THE WORLD. Not damage and not a cull: the thing has
+  // been picked up, and it stops existing as matter. Goes through the same
+  // ReleaseBody every other disposal does, so the brick is freed and the
+  // "gone" notification fires exactly once (see SetOnBodyGone) — which is what
+  // keeps the ground-item registry from outliving the handle it names.
+  bool DestroyBody(uint64_t handle);
+
+  // A body's AUTHORITATIVE lattice, by handle — the skin where it has one, the
+  // collider where it does not, promoted to PrefabVoxel so the caller does not
+  // have to know which. `outScale` is the units that lattice is in.
+  //
+  // For the ground-item save (game/persist.cpp 'ITMS'): a dropped robe that
+  // has burned through has to come back burnt, and the only copy of those
+  // holes is the body's own lattice. Reading the DERIVED side instead would
+  // save something the next re-derive overwrites (phys/lattice.h).
+  bool BodyLatticeOf(uint64_t handle, std::vector<PrefabVoxel>& out,
+                     uint32_t& outScale) const;
+
+  // Per-material density, as every body-creating call here already takes it.
+  // Exposed so a caller that builds a body and hands it straight over (a
+  // dropped item — game/worlditems.h) uses the SAME table this system does,
+  // rather than threading a second copy through from wherever materials were
+  // loaded and having the two disagree after an R reload.
+  const std::vector<float>& DensityOf() const { return densityOf_; }
+
   // Laser body cut (PLAN §C2): partition a body's voxels by the world-space
   // plane (point, normal), destroy it, spawn both halves at the same pose
   // with inherited velocity. False when the cut misses or a half is too
@@ -146,6 +171,21 @@ class DebrisSystem {
   // Micro bodies must allocate out of the same set the renderer uploads, so
   // the owner hands it over once at startup. Not owned.
   void SetMicroSet(MicroBodySet* set) { microSet_ = set; }
+  // ---- "this body is gone" -------------------------------------------------
+  //
+  // Called for every body this system releases, whatever released it: culled
+  // out of the window, burned to nothing, blown apart, or reset. It exists for
+  // ONE caller — the dropped-item registry (game/worlditems.h), which maps a
+  // body handle to an item name and must not outlive the handle. Jolt reuses
+  // handles, so a stale entry would eventually re-match a NEW body and hand
+  // the player a sword they picked up off a rock.
+  //
+  // A callback rather than the registry being a member here: DebrisSystem has
+  // no business knowing what an item is, and this way "a burned robe on the
+  // ground is GONE" needs no code on this side to be true.
+  void SetOnBodyGone(std::function<void(uint64_t)> cb) {
+    onBodyGone_ = std::move(cb);
+  }
   // This tick's integer day phase, so a day/night-gated reaction behaves the
   // same on a body as it does in the grid (sim/reactcpu.h). Set it wherever the
   // tick's dayPhase is already computed; leaving it unset means night.
@@ -433,6 +473,7 @@ class DebrisSystem {
   // culled, settled, dissolved or split without freeing its brick leaks pool
   // words that nothing will ever reclaim, and the pool is a hard ceiling.
   void ReleaseBody(Body& b);
+  std::function<void(uint64_t)> onBodyGone_;
   // Settle-back (PLAN §B6): a long-asleep, near-axis-aligned body converts
   // its voxels to CellOps (fill-air-only: grid content wins deterministically
   // on the GPU) and frees its body. At most one body per tick.

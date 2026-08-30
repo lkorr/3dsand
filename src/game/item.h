@@ -58,10 +58,58 @@
 
 // What the engine does with an item when it is held. Adding a kind means
 // adding a case where the tick loop dispatches on Held(), not a new system.
+//
+// THE WORN KINDS ARE A CONTIGUOUS RANGE, and `ItemKindIsWorn` is the only
+// place that knows it. They are not one "Armor" kind with a slot field because
+// the slot table (game/equipment.h) validates by KIND — one kind per slot is
+// what makes "a helm does not go on your feet" authored data rather than a
+// branch, and it is the same shape the sheath already uses.
 enum class ItemKind : uint8_t {
   None = 0,
   Melee,   // swung: drives game/melee.h, cuts with its part's authored `edge`
+  // ---- worn: fills its slot's shells over the wearer's own limbs ----
+  ArmorHead,
+  ArmorChest,
+  ArmorLegs,
+  ArmorBoots,
+  ArmorShoulders,
+  ArmorHands,
+  ArmorBelt,
+  Trinket,
 };
+
+// Is this kind WORN (a set of shells over the body) rather than merely carried?
+// The one predicate that knows the enum's layout; everything else asks this.
+inline bool ItemKindIsWorn(ItemKind k) {
+  return k >= ItemKind::ArmorHead && k <= ItemKind::Trinket;
+}
+
+// Kind <-> name. Kinds cross items.json in both directions and a mis-parsed
+// kind is a silently unequippable item, so the table lives once and both
+// directions read it.
+inline const char* ItemKindName(ItemKind k) {
+  switch (k) {
+    case ItemKind::Melee: return "melee";
+    case ItemKind::ArmorHead: return "armor_head";
+    case ItemKind::ArmorChest: return "armor_chest";
+    case ItemKind::ArmorLegs: return "armor_legs";
+    case ItemKind::ArmorBoots: return "armor_boots";
+    case ItemKind::ArmorShoulders: return "armor_shoulders";
+    case ItemKind::ArmorHands: return "armor_hands";
+    case ItemKind::ArmorBelt: return "armor_belt";
+    case ItemKind::Trinket: return "trinket";
+    case ItemKind::None: break;
+  }
+  return "none";
+}
+
+inline ItemKind ItemKindFromName(const std::string& s) {
+  for (int i = 1; i <= (int)ItemKind::Trinket; i++) {
+    const ItemKind k = (ItemKind)i;
+    if (s == ItemKindName(k)) return k;
+  }
+  return ItemKind::None;
+}
 
 // How an item sits in one particular attachment context. Two rules are stolen
 // verbatim from Minecraft's display block, because both are the kind of thing
@@ -102,6 +150,116 @@ struct ItemHilt {
   Vec3 halfExtents{};      // ditto; kept for the debug overlay and tests
 };
 
+// ONE SHELL OF A WORN PIECE — the covering over a single body part.
+//
+// A worn piece is not one mesh: a robe is a torso panel, two sleeves and a
+// skirt, and each of those has to move with the limb it covers. So a piece is
+// a LIST of shells, and wearing it appends one rig slot per entry — the same
+// borrowed-slot trick a held weapon uses (see the note at the top of this
+// file), applied N times instead of once. Everything that already works for a
+// held item therefore works per shell with no new code: it burns, dissolves,
+// carves, severs with the arm it is strapped to, drops as debris, and renders
+// through the same micro path.
+//
+// BOUND BY LIMB NAME, never by index. Every humanoid rig in the repo names its
+// parts the same way ("head", "armU.L", "hips"), so a helmet authored for the
+// stock human finds the right part on any of them, and a wearer that simply
+// has no such limb skips that shell — a sleeve on a one-armed mob attaches to
+// the arm that exists. That is what makes "goblin helmets look right on
+// anyone" CONTENT rather than code.
+struct ItemCover {
+  std::string part;        // body limb name this shell attaches to ("torso")
+  std::string model;       // model name inside the item's own .vox
+
+  // ---- authored placement, converted micro -> world voxels at load ---------
+  // The shell's MIN CORNER measured from the covered limb's own min corner,
+  // in the item's authored micro units (divided by `ItemDef::scale` at load,
+  // like every other length in the sidecar).
+  Vec3 offset{};
+  // The covered limb's world-voxel box this shell was DRAWN AGAINST. The fit
+  // resample (P6) divides the wearer's actual limb box by this to get the
+  // per-axis ratio; a zero box means "no fit data, wear it as authored".
+  Vec3 fitBox{};
+  // Per-shell durability. A piece's toughness is the sum of its shells, and
+  // losing one strap does not cost you the pauldron on the other shoulder.
+  float hp = 10.0f;
+
+  // ---- geometry, filled by LoadItemAsset from the named model -------------
+  IVec3 size{};                    // model box, MICRO units
+  IVec3 modelOffset{};             // model min corner within the .vox, MICRO
+  int microModel = -1;             // index into the shared micro-body pool
+  std::vector<PrefabVoxel> voxels;
+};
+
+// PER-AXIS NEAREST-NEIGHBOUR RESAMPLE — how one authored helmet fits heads it
+// was not drawn for.
+//
+// THE ONLY NON-UNIFORM SCALE IN THE ENGINE, and deliberately the smallest one
+// that does the job. Everything else here scales by an integer lattice divisor,
+// which cannot express "this goblin's head is wider than it is tall relative to
+// the mannequin's". A shell lattice is a small integer box, so a per-axis NN
+// resample is:
+//
+//   * INTEGER, and therefore exactly reproducible — `src = (i * srcDim) /
+//     dstDim` and nothing else. Same inputs, same bytes, every time.
+//   * HOLE-FREE BY CONSTRUCTION when growing. Every target cell maps to
+//     exactly one source cell, so a solid source cannot produce a gap; several
+//     target cells sharing a source is what "bigger" means.
+//   * single-pass, and it matches the blocky aesthetic up to about 2x, which
+//     is far past any humanoid-to-humanoid difference.
+//
+// Rejected: generating the shell procedurally from the wearer's own surface
+// (dilate by one, which is exactly how the stock set is authored). Perfect fit,
+// but it loses the authored silhouette — the hood's peak stops being a peak —
+// and an armour system whose pieces cannot look like anything in particular is
+// not worth having. Revisit for a generic "cloth drape".
+//
+// Voxels outside `srcDims` are ignored rather than clamped: a lattice that
+// disagrees with its own declared box is a content bug, and folding it onto
+// the edge would hide it as a smear.
+inline std::vector<PrefabVoxel> ResampleLattice(
+    const std::vector<PrefabVoxel>& src, IVec3 srcDims, IVec3 dstDims) {
+  std::vector<PrefabVoxel> out;
+  if (srcDims.x <= 0 || srcDims.y <= 0 || srcDims.z <= 0 || dstDims.x <= 0 ||
+      dstDims.y <= 0 || dstDims.z <= 0)
+    return out;
+  if (srcDims.x == dstDims.x && srcDims.y == dstDims.y &&
+      srcDims.z == dstDims.z)
+    return src;
+
+  // Dense source, because the sample is a random access and a sparse scan per
+  // target cell would be O(n*m). One byte pair per source cell; a shell box is
+  // a few tens of thousands of cells at most.
+  const size_t n = (size_t)srcDims.x * srcDims.y * srcDims.z;
+  std::vector<uint16_t> mat(n, 0);
+  std::vector<uint8_t> col(n, 0);
+  for (const PrefabVoxel& v : src) {
+    if (v.x < 0 || v.y < 0 || v.z < 0 || v.x >= srcDims.x ||
+        v.y >= srcDims.y || v.z >= srcDims.z)
+      continue;
+    const size_t i =
+        ((size_t)v.z * srcDims.y + (size_t)v.y) * srcDims.x + (size_t)v.x;
+    mat[i] = v.material;
+    col[i] = v.color;
+  }
+  out.reserve(src.size());
+  for (int z = 0; z < dstDims.z; z++) {
+    const int sz = (int)(((int64_t)z * srcDims.z) / dstDims.z);
+    for (int y = 0; y < dstDims.y; y++) {
+      const int sy = (int)(((int64_t)y * srcDims.y) / dstDims.y);
+      for (int x = 0; x < dstDims.x; x++) {
+        const int sx = (int)(((int64_t)x * srcDims.x) / dstDims.x);
+        const size_t i =
+            ((size_t)sz * srcDims.y + (size_t)sy) * srcDims.x + (size_t)sx;
+        if (!mat[i]) continue;
+        out.push_back(PrefabVoxel{(int16_t)x, (int16_t)y, (int16_t)z, mat[i],
+                                  col[i]});
+      }
+    }
+  }
+  return out;
+}
+
 struct ItemDef {
   std::string name;        // display name, and the id other data refers to
   ItemKind kind = ItemKind::None;
@@ -132,6 +290,13 @@ struct ItemDef {
     auto it = grip.find(context);
     return it == grip.end() ? nullptr : &it->second;
   }
+
+  // ---- how it is WORN -----------------------------------------------------
+  // Empty for everything that is not an armour kind. Non-empty is what makes
+  // Mob::WearItem have anything to do; a worn kind with no cover entries is a
+  // content error the loader reports, since it would equip into the slot and
+  // then be invisible.
+  std::vector<ItemCover> cover;
 
   // The hilt box (see ItemHilt). One per item rather than one per context: a
   // sword is gripped by the same part of itself whichever hand holds it, and

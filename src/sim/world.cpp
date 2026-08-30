@@ -90,11 +90,14 @@ void World::Init(const rhi::Device& device) {
   dirtyViz = CreateBuffer(device, kDirtyBytes, U::Storage | U::CopyDst, "dirtyViz");
   actVoxViz = CreateBuffer(device, kActVoxVizBytes, U::Storage | U::CopyDst, "actVoxViz");
   pick = CreateBuffer(device, 32, U::Storage | U::CopySrc | U::CopyDst, "pick");
-  // The water-body ledger (world.h's block above). 4 KiB of GPU-owned state,
-  // zeroed here and by EncodeLoadReset: a descriptor is a description of a
-  // world, and a stale one after a worldgen/load reads as a fresh one.
+  // The water-body ledger AND (from M5) the measured container curves and split
+  // maps that sit past the end of it — see the kWaterCurveBase block in
+  // world.h for why they share one buffer rather than taking a binding. 60 KiB
+  // of GPU-owned state, zeroed here and by EncodeLoadReset: a descriptor is a
+  // description of a world, and a stale one after a worldgen/load reads as a
+  // fresh one.
   waterBodyState = CreateBuffer(
-      device, (uint64_t)kWaterBodyCap * kWaterBodyStateWords * 4,
+      device, (uint64_t)kWaterBodyStateTotalWords * 4,
       U::Storage | U::CopySrc | U::CopyDst, "waterBodyState");
 
   particles[0] = CreateBuffer(device, (uint64_t)kParticleCap * 32, U::Storage, "particlesA");

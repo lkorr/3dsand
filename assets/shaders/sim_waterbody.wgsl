@@ -163,6 +163,14 @@ fn wbBase(b : u32) -> u32 { return b * WATERBODY_STATE_WORDS; }
 fn wbGet(b : u32, w : u32) -> i32 { return atomicLoad(&waterBodyState[wbBase(b) + w]); }
 fn wbSet(b : u32, w : u32, v : i32) { atomicStore(&waterBodyState[wbBase(b) + w], v); }
 
+// ---- M5: the sweep block, past the end of the ledger in the same buffer ----
+fn swGet(b : u32, w : u32) -> i32 {
+  return atomicLoad(&waterBodyState[wbCurveBase(b) + w]);
+}
+fn swSet(b : u32, w : u32, v : i32) {
+  atomicStore(&waterBodyState[wbCurveBase(b) + w], v);
+}
+
 // The two CPU-sent rows. Read straight off the module-scope uniform rather than
 // through a helper that takes TickParams BY VALUE: common.wgsl:522 records what
 // the by-value form costs when a function dynamically indexes a uniform array —
@@ -174,6 +182,64 @@ fn wbSeed(b : u32) -> vec4<i32> { return T.waterBodies[b * 2u + 1u]; }
 
 // A chunk-list entry: (bodyIndex << 16) | chunkSlot, four to a std140 row.
 fn wbChunkEntry(i : u32) -> u32 { return T.waterChunks[i >> 2u][i & 3u]; }
+
+// ============================================================================
+// M5 — THE FOOTPRINT TEST, and it is the one seam every pass below goes
+// through. Before M5 "is this column mine" was a disc test and nothing else.
+// After a basin SPLITS it is a disc test AND a component test, because the same
+// disc now holds two pools that must descend at their own rates.
+//
+// THE IDENTITY PROPERTY. A basin with no split map reads component 0 for every
+// grid cell (the buffer is zeroed at worldgen, and a body only ever gets a map
+// written when the sweep is scheduled for it, which needs a dig). A body's own
+// component index is 0 unless the CPU flagged it a child. So on every world
+// M2/M3/M4 shipped, `wbOwns` is exactly the disc test it replaced, bit for bit
+// — which is why M5 does not move the hash at sim.waterBodyMode 0 or at 1.
+// ============================================================================
+fn wbSplitAt(b : u32, gi : u32) -> u32 {
+  if (gi >= WATER_SPLIT_CELLS) { return WB_COMP_NONE; }
+  let w = atomicLoad(&waterBodyState[wbCurveBase(b) + SW_SPLIT0 + (gi >> 4u)]);
+  return (u32(w) >> ((gi & 15u) * 2u)) & 3u;
+}
+// `radius` is carried rather than recomputed per call: every caller already has
+// the geometry row, and an isqrt per cell in the shave's inner loop would be a
+// real cost for a number that is constant across the dispatch.
+// THE MAP LIVES IN THE PARENT'S BLOCK, and a child must be told so. The sweep
+// runs once per basin and writes one split map, into the block of the body that
+// owns the basin; a child has a curve block of its own that nothing ever fills.
+// The first version had `wbOwns` read `wbCurveBase(b)` for whatever body asked,
+// so a child read all-zeroes, saw SW_COMPS 0, concluded "no split" and answered
+// "I own nothing anywhere" — its adoption reduce measured zero eighths and it
+// sat in WB_CANDIDATE forever while the parent went on governing both pools.
+// One map, one owner (design guideline #3), named in the signature so a caller
+// cannot forget which body it belongs to.
+fn wbMapOwner(b : u32, flags : i32) -> u32 {
+  if ((flags & WBF_CHILD) == 0) { return b; }
+  return u32((flags >> WBF_PARENT_SHIFT) & WBF_PARENT_MASK);
+}
+fn wbOwns(owner : u32, comp : u32, x : i32, z : i32, g : vec4<i32>,
+          radius : i32) -> bool {
+  let dx = x - g.x;
+  let dz = z - g.y;
+  // i32 is ample: kWindPrimMaxExtent-scale radii square to ~2.6e5 and the
+  // window is 512 cells across, so the largest legal dx*dx + dz*dz is ~5.2e5.
+  if (dx * dx + dz * dz > g.z) { return false; }
+  // No split map yet: SW_COMPS is 0 and the whole disc belongs to component 0.
+  // A CHILD owns nothing in that state, which is exactly right — it is a body
+  // waiting for a pool that does not exist yet, and its reduce measures zero.
+  if (swGet(owner, SW_COMPS) <= 1) { return comp == 0u; }
+  let cell = wbSplitAt(owner, wbGridIndex(x, z, g.x, g.y, radius));
+  // A BLOCKED grid cell falls to component 0. It holds no water at the mapped
+  // level by definition, so which body "owns" it decides nothing about mass —
+  // but leaving it unowned would drop any water standing ABOVE the split
+  // elevation out of every footprint at once, and that water is real.
+  if (cell == WB_COMP_NONE) { return comp == 0u; }
+  return cell == comp;
+}
+// The CPU-sent component index and child flag (TickParams row 1, word 3).
+fn wbComp(flags : i32) -> u32 {
+  return u32((flags >> WBF_COMP_SHIFT) & WBF_COMP_MASK);
+}
 
 // The slot's 3D chunk coord, then the WORLD chunk it currently holds. World
 // coords for logic, slot index for memory — the invariant this engine states in
@@ -289,6 +355,94 @@ fn wbLedger(@builtin(global_invocation_id) gid : vec3<u32>) {
   let rdirty = wbGet(b, WBS_RDIRTY);
   wbSet(b, WBS_RDIRTY, 0);
 
+  // ==========================================================================
+  // M5 — ARM THIS TICK'S SWEEP, AND THE CYCLE BOUNDARY (components 2 + 10).
+  //
+  // The sweep ACCUMULATES — atomicAdd per container cell, atomicOr per open
+  // grid cell — so something has to zero the slots it is about to fill, and it
+  // cannot be the sweep itself: that dispatch is one workgroup per listed chunk
+  // and no workgroup may assume it ran first. The ledger is one thread per
+  // body, it is recorded before every chunk-shaped pass in the row block, and
+  // it already owns every "clear for this tick's writers" line in this file
+  // (WBS_SHAVED, WBS_SEEN, WBS_HOLEKEYN). So it clears here, for the same
+  // reason and on the same cadence.
+  // ==========================================================================
+  // RESOLVE THE SWEEP LEVEL, ONCE, HERE. The CPU sends either a cursor level or
+  // WB_SWEEP_LIVE ("the level the shave is actually working"), and only the GPU
+  // knows the second one. Resolving it in each of the three passes that need it
+  // would be three evaluations of one number, and they would DISAGREE on any
+  // tick the shave lowers the level between the ledger and the sweep — the
+  // clear would zero one area slot while the accumulate filled another, and the
+  // count would grow forever. So it is published, exactly as the discharge law
+  // publishes WBS_EMIT and WBS_JETV from its single evaluation of h.
+  // PROMOTE last tick's arm before anything can re-arm it. 2 means "wbReduce
+  // filled RSUM during the tick this was set"; 1 means "the value is ready and
+  // the adopted branch below may spend it".
+  if (wbGet(b, WBS_REAUDIT) == 2) { wbSet(b, WBS_REAUDIT, 1); }
+  var sweepY = T.waterSweepLevel;
+  if (sweepY == WB_SWEEP_LIVE) { sweepY = wbGet(b, WBS_LEVEL); }
+  let sweepIdx = sweepY - floorY - 1;
+  let sweepMine = b == T.waterSweepSlot && (flags & WBF_CHILD) == 0;
+  let sweepChild = (flags & WBF_CHILD) != 0 &&
+                   u32((flags >> WBF_PARENT_SHIFT) & WBF_PARENT_MASK) ==
+                       T.waterSweepSlot;
+  wbSet(b, WBS_SWEEPY, select(WB_SWEEP_NONE, sweepY,
+                              sweepMine || sweepChild));
+  if (sweepMine) {
+    if (sweepIdx >= 0 && sweepIdx < i32(WATER_CURVE_MAXY)) {
+      swSet(b, SW_AREA0 + u32(sweepIdx), 0);
+    }
+    for (var sw = 0u; sw < WATER_SPLIT_CELLS / 32u; sw++) {
+      atomicStore(&waterBodyState[WATER_SCRATCH_BASE + sw], 0);
+    }
+  }
+  // THE CYCLE BOUNDARY. `sweepIdx == 0` is the first level of a full pass over
+  // the basin — a pure function of the tick, like every schedule in this design
+  // (plan section 3.4) — and it is where component 10's re-derive actually
+  // begins. Two things reset here and one thing is armed:
+  //
+  //   * SW_SPILLY and SW_SPLITY go back to their atomic identities, so a rim
+  //     the player filled in or a partition they knocked down stops being
+  //     reported within one cycle rather than forever. A monotone accumulator
+  //     that never forgets is how "derived data" becomes stale authority.
+  //   * WBS_REAUDIT is armed, which is THE FIX for the leftover M2 named and M3
+  //     did not close: a body adopted once carries the volume it had at
+  //     adoption, and anyone who digs into it makes that number a lie. It
+  //     bounds the discharge through `held = VOLUME - DRAINED`, so a stale one
+  //     stops a lake draining that still has plenty in it.
+  //
+  // Parent and child arm on the SAME boundary, which is why the child carries
+  // its parent's slot in its flags: two pools re-measuring on different ticks
+  // would briefly report a `held` sum that does not add up to the basin's
+  // water, and a conservation gate cannot tell that apart from a leak.
+  // Tested against the CURSOR the CPU sent, not against the resolved level: the
+  // live-level refresh steps land on arbitrary Y values and would otherwise
+  // reset the accumulators every time the surface happened to sit one cell above
+  // the floor.
+  if ((sweepMine || sweepChild) && T.waterSweepLevel == floorY + 1) {
+    if (sweepMine) {
+      swSet(b, SW_FLOORY, floorY);
+      // PROMOTE, then reset. The *Y words now hold the reduction over the cycle
+      // that just finished; the *YN words start the next one. See the SW_SPILLYN
+      // note in common.wgsl for the failure this replaced.
+      swSet(b, SW_SPILLY, swGet(b, SW_SPILLYN));
+      swSet(b, SW_SPLITY, swGet(b, SW_SPLITYN));
+      swSet(b, SW_SPILLYN, WB_HOLE_NONE);
+      swSet(b, SW_SPLITYN, WB_SPLIT_NONE);
+    }
+    if (st == WB_ADOPTED) {
+      wbSet(b, WBS_RSUM, 0);
+      // ARMED == 2, not 1, and the two-step is not ceremony. The consume below
+      // is in the SAME invocation of this kernel: written as a single flag it
+      // fired on the tick it was armed, read the RSUM it had just zeroed, and
+      // set VOLUME = 0 + DRAINED — which makes `held` zero, which REFUSES every
+      // drain. The lake stopped draining and the gate reported a level that
+      // never moved. Plan section 3.3 is about passes; this is the same rule
+      // one level down, inside one pass.
+      wbSet(b, WBS_REAUDIT, 2);
+    }
+  }
+
   if ((flags & WBF_PROPOSE) == 0) {
     // The CPU's own deterministic refusals (straddle, out of window, over the
     // spill, at the cap). Not a hysteresis exit — those bodies were never
@@ -366,6 +520,38 @@ fn wbLedger(@builtin(global_invocation_id) gid : vec3<u32>) {
   var debit = wbGet(b, WBS_DEBIT);
   var level = wbGet(b, WBS_LEVEL);
   var area = wbGet(b, WBS_AREA);
+
+  // ---- M5: CONSUME THE RE-AUDIT (component 10) ----------------------------
+  //
+  // LAST tick's wbReduce refilled WBS_RSUM over this body's CURRENT footprint —
+  // which after a split is only its own component's cells. Plan section 3.3
+  // again, at pass granularity: the pass that arms the tally is not the pass
+  // that spends it.
+  //
+  // ONLY VOLUME MOVES, and the FORM of the move is the whole correctness
+  // argument. The standing invariant between the ledger and the cells is
+  //
+  //     voxels(this body) == held + debit,   held = VOLUME - DRAINED
+  //
+  // because a debit is water already accounted gone that no shave has taken off
+  // the cells yet (plan section 3.3's legitimate divergence). The reduce
+  // measured `voxels` into RSUM, so the volume that preserves the invariant is
+  // `RSUM + DRAINED - DEBIT` and not `RSUM + DRAINED`. The simpler form makes
+  // `held` equal today's voxels and then lets the outstanding debit be shaved
+  // out from under it, so the body permanently over-reports what it holds by
+  // one drain's worth — and pass B catches it as a split whose halves do not
+  // sum to the basin.
+  //
+  // WBS_DRAINED and WBS_DEBIT are NOT touched: they are the cumulative terms
+  // `--gate waterbody` passes A and H balance their identity on, and a re-audit
+  // that reset either would read to both of them as a leak of everything the
+  // body had ever drained.
+  if (wbGet(b, WBS_REAUDIT) == 1) {
+    wbSet(b, WBS_REAUDIT, 0);
+    wbSet(b, WBS_VOLUME,
+          wbGet(b, WBS_RSUM) + wbGet(b, WBS_DRAINED) - wbGet(b, WBS_DEBIT));
+    wbSet(b, WBS_AUDITTICK, i32(T.tick));
+  }
 
   // (2) DEBIT WHAT WAS GRANTED. `shaved` is what the cells actually gave up
   // last tick, which is not what was asked for whenever a cell held fewer
@@ -508,8 +694,19 @@ fn wbLedger(@builtin(global_invocation_id) gid : vec3<u32>) {
   // number is counted and debited, so the dither is not an approximation, it is
   // just how the remainder is spatially distributed. Without it the whole lake
   // snaps down a step at once and reads as an edit rather than as drainage.
-  let steps = debit / area;
-  let frac = debit - steps * area;
+  // ONE VOXEL PER TICK, MAXIMUM (rule 2: bound every emergent process). At the
+  // shipped configuration this cap never binds — pass A's tap is sized at
+  // exactly one eighth-step so `steps` is 1, and the discharge law's whole
+  // emission is bounded by sim.drainMaxEighthsPerTick, three orders below a
+  // lake's surface area. It exists for the case M5 introduced: a body whose
+  // FOOTPRINT SHRINKS under a split still owes a debit accrued against the
+  // whole basin, and `debit / area` over the half it kept is a 20-eighth step —
+  // which is not a level model descending, it is a bulldozer, and it strips the
+  // pool the parent was left with before the second descriptor can adopt it.
+  // Capped, the surplus simply stays outstanding and is taken over the
+  // following ticks; refusal is graceful because refused water is still water.
+  let steps = min(debit / area, WB_MAX_STEPS);
+  let frac = select(0, debit - steps * area, steps < WB_MAX_STEPS);
   wbSet(b, WBS_STEPS, steps);
   wbSet(b, WBS_FRAC, frac);
   wbSet(b, WBS_DEBIT, debit);
@@ -556,18 +753,28 @@ fn wbReduce(@builtin(workgroup_id) wg : vec3<u32>,
   let b = e >> 16u;
   let slot = e & 0xFFFFu;
   if (b >= T.waterBodyCount) { return; }
-  if (wbGet(b, WBS_STATE) != WB_MEASURING) { return; }
+  // M5: the reduce now serves TWO callers. Adoption is the original one and
+  // runs exactly once, on the single tick a body spends in WB_MEASURING. The
+  // RE-AUDIT is the second: an adopted body whose basin someone dug into
+  // re-measures on its sweep cycle's first level, which is once per
+  // kWaterSweepPeriod * span ticks and only while the basin is dirty. A still
+  // lake nobody has touched runs neither, which is what keeps this the ONE
+  // whole-footprint pass in the design.
+  let rState = wbGet(b, WBS_STATE);
+  let reaudit = wbGet(b, WBS_REAUDIT) != 0;
+  if (rState != WB_MEASURING && !(reaudit && rState == WB_ADOPTED)) { return; }
 
   let g = wbGeom(b);
   let seed = wbSeed(b);
   let wc = wbSlotWorldChunk(slot);
   let x = wc.x * i32(CHUNK) + i32(li.x);
   let z = wc.z * i32(CHUNK) + i32(li.z);
-  // i32 is ample: kWindPrimMaxExtent-scale radii square to ~2.6e5 and the
-  // window is 512 cells across, so the largest legal dx*dx + dz*dz is ~5.2e5.
-  let dx = x - g.x;
-  let dz = z - g.y;
-  if (dx * dx + dz * dz > g.z) { return; }
+  // M5: the disc test AND the split component test, in one seam (wbOwns). On an
+  // unsplit basin this is bit-identical to the bare disc test it replaced.
+  if (!wbOwns(wbMapOwner(b, seed.w), wbComp(seed.w), x, z, g,
+              i32(wbIsqrt(u32(max(g.z, 0)))))) {
+    return;
+  }
 
   var sum = 0;
   var top = -0x40000000;
@@ -580,7 +787,11 @@ fn wbReduce(@builtin(workgroup_id) wg : vec3<u32>,
     top = max(top, y);
   }
   if (sum > 0) { atomicAdd(&waterBodyState[wbBase(b) + WBS_RSUM], sum); }
-  if (top > -0x40000000) {
+  // THE LEVEL IS AN ADOPTION-ONLY OUTPUT. A re-audit must not touch it: an
+  // adopted body's level is the ledger's, moved down by the shave as layers
+  // empty, and an atomicMax against a straggler cell left standing above the
+  // free surface would jack it back up and un-drain the lake on paper.
+  if (rState == WB_MEASURING && top > -0x40000000) {
     atomicMax(&waterBodyState[wbBase(b) + WBS_LEVEL], top);
   }
 }
@@ -633,11 +844,14 @@ fn wbShave(@builtin(workgroup_id) wg : vec3<u32>,
 
   let x = wc.x * i32(CHUNK) + i32(li.x);
   let z = wc.z * i32(CHUNK) + i32(li.z);
-  // i32 is ample: kWindPrimMaxExtent-scale radii square to ~2.6e5 and the
-  // window is 512 cells across, so the largest legal dx*dx + dz*dz is ~5.2e5.
-  let dx = x - g.x;
-  let dz = z - g.y;
-  if (dx * dx + dz * dz > g.z) { return; }
+  // M5: disc AND split component (wbOwns). After a basin splits this is what
+  // keeps the parent shaving its own pool and stops it taking eighths off the
+  // puddle on the other side of the partition — a pool with no hole in it must
+  // stop descending, and before M5 it did not.
+  if (!wbOwns(wbMapOwner(b, seed.w), wbComp(seed.w), x, z, g,
+              i32(wbIsqrt(u32(max(g.z, 0)))))) {
+    return;
+  }
 
   for (var y = y1; y >= y0; y--) {
     if (y <= seed.x) { break; }              // at or below the basin floor
@@ -807,7 +1021,13 @@ fn wbHole(@builtin(workgroup_id) wg : vec3<u32>,
   let z = wc.z * i32(CHUNK) + i32(li.z);
   let dx = x - g.x;
   let dz = z - g.y;
-  if (dx * dx + dz * dz > g.z) { return; }
+  // M5: disc AND split component. A hole belongs to the pool standing over it,
+  // so after a split each body finds its OWN holes — which is what makes the
+  // puddle with the shaft in it the one that keeps draining.
+  if (!wbOwns(wbMapOwner(b, seed.w), wbComp(seed.w), x, z, g,
+              i32(wbIsqrt(u32(max(g.z, 0)))))) {
+    return;
+  }
 
   let cyLo = wc.y * i32(CHUNK);
   let y0 = max(cyLo, seed.x - WB_HOLE_YBIAS);
@@ -850,6 +1070,403 @@ fn wbHole(@builtin(workgroup_id) wg : vec3<u32>,
       atomicMin(&waterBodyState[wbBase(b) + WBS_HOLEKEYN],
                 wbHoleKey(hy - seed.x, dx, dz));
       found = true;
+    }
+  }
+}
+
+// ============================================================================
+// M5 — THE CONTAINER SWEEP (plan component 2, case 2; component 10).
+// One workgroup per listed chunk, one thread per (x,z) COLUMN.
+//
+// ---- WHY THIS RUNS ON THE GPU AND NOT ON THE CPU --------------------------
+//
+// Plan section 2 offers three homes for the sweep, in preference order: a GPU
+// compute pass over the basin's chunk AABB writing the table to a small buffer;
+// an ASYNC readback through voxregion; a CPU walk. The first is the only one
+// that is rule-1 clean, and the reason is one M1 already paid for.
+//
+// The table decides which pool a cell belongs to and therefore which cells the
+// shave takes an eighth off. That is a voxel write. A table derived from a
+// READBACK would have its CONTENT fixed by the tick it was requested on (fine)
+// and its ARRIVAL fixed by fence retirement (not fine) — so "when did the lake
+// start draining as two puddles" would depend on when a fence retired, on a
+// machine, on a driver. `--gate waterbody` pass F would not catch it either,
+// because two runs in one process share a fence cadence. That is exactly the
+// hazard section 1.1 correction 2 records, arriving through a different door.
+//
+// So the sweep is a kernel, its output is consumed by kernels, and the CPU's
+// entire contribution is a SCHEDULE: which body, which level, both pure
+// functions of the tick (plan section 3.4).
+//
+// ---- THE FOUR OUTPUTS, AND WHICH PASS PRODUCES EACH -----------------------
+//
+//   1. area(y)          this pass, atomicAdd per container cell   -> SW_AREA0
+//   2. spill elevation  this pass, atomicMin over the ring out    -> SW_SPILLY
+//   3. split elevations wbSplit, atomicMax over split levels      -> SW_SPLITY
+//   4. split children   wbSplit, the 2-bit component map          -> SW_SPLIT0
+//
+// One level per scheduled tick. A 26-deep bowl is a 26-scheduled-tick =
+// 104-world-tick re-derive, i.e. 3.5 s of staleness in the worst case, and that
+// costs pace rather than mass — the table is a schedule, not an authority (plan
+// section 3.2), so the shave still debits what it actually removed either way.
+//
+// ---- COUNT CELLS, NOT COLUMNS ---------------------------------------------
+//
+// Plan section 2 is emphatic and this pass obeys it: the inner test counts a
+// CELL at the swept level, so a cave, an overhang, a ledge or a flooded tunnel
+// under the lake is counted once each. Counting columns would silently
+// reimplement the single-span-per-column assumption that got heightfields
+// rejected in RESEARCH_water_architecture.md section 4.1.1 — and it would do it
+// invisibly, because a flat-floored test basin gives the same answer either
+// way.
+// ============================================================================
+@compute @workgroup_size(16, 1, 16)
+fn wbSweep(@builtin(workgroup_id) wg : vec3<u32>,
+           @builtin(local_invocation_id) li : vec3<u32>) {
+  if (wg.x >= T.waterChunkCount) { return; }
+  let e = wbChunkEntry(wg.x);
+  let b = e >> 16u;
+  let slot = e & 0xFFFFu;
+  // ONE BODY PER TICK. The schedule is the CPU's only say in this, and it is
+  // `slot % kWaterSweepPeriod == tick % kWaterSweepPeriod` — see
+  // WaterBodySystem::BuildGpu. Every other body returns here.
+  if (b != T.waterSweepSlot || b >= T.waterBodyCount) { return; }
+  let g = wbGeom(b);
+  let seed = wbSeed(b);
+  // Only the PARENT sweeps. A split child shares its parent's disc and reads
+  // its parent's map; sweeping twice would double every area count.
+  if ((seed.w & WBF_CHILD) != 0) { return; }
+
+  let floorY = seed.x;
+  // THE LEDGER RESOLVED THIS, and this pass does not second-guess it. See the
+  // note over WBS_SWEEPY in the ledger: the CPU may ask for "the live level",
+  // only the GPU knows what that is, and the shave may have moved it between
+  // the ledger's clear and this accumulate.
+  let y = wbGet(b, WBS_SWEEPY);
+  let idx = y - floorY - 1;
+  if (idx < 0 || idx >= i32(WATER_CURVE_MAXY)) { return; }
+  let radius = i32(wbIsqrt(u32(max(g.z, 0))));
+
+  let wc = wbSlotWorldChunk(slot);
+  // The swept level has to be inside THIS chunk or the chunk has nothing to say
+  // about it. That is what makes the pass O(footprint area) rather than
+  // O(footprint volume): a body's whole column of chunks is listed and all but
+  // one Y layer of them return after three scalar loads — the same shape the
+  // shave's two-Y band has.
+  let cyLo = wc.y * i32(CHUNK);
+  if (y < cyLo || y >= cyLo + i32(CHUNK)) { return; }
+
+  let x = wc.x * i32(CHUNK) + i32(li.x);
+  let z = wc.z * i32(CHUNK) + i32(li.z);
+  let dx = x - g.x;
+  let dz = z - g.y;
+  let d2 = dx * dx + dz * dz;
+
+  // A CONTAINER CELL is one that could hold this body's water: air, or the
+  // body's own liquid. NOT "any non-solid" and not "water" — air is what a dug
+  // basin is full of before it fills and the body's liquid is what it holds
+  // after, and the curve has to give the same answer either way or a drain
+  // would re-pace itself as it descends.
+  let w = voxWordAt(vec3<i32>(x, y, z));
+  let m = i32(voxMat(w));
+  let container = m == i32(MAT_AIR) || m == g.w;
+
+  if (d2 <= g.z) {
+    if (container) {
+      atomicAdd(&waterBodyState[wbCurveBase(b) + SW_AREA0 + u32(idx)], 1);
+      // OUTPUT 4's input: the openness bitmap the label propagation reads. One
+      // bit per grid cell, set if ANY column in it is open — the LIBERAL
+      // direction, which can only ever UNDER-split. See world.h's
+      // kWaterSplitGrid note on why over-splitting is the unsafe one.
+      let gi = wbGridIndex(x, z, g.x, g.y, radius);
+      if (gi < WATER_SPLIT_CELLS) {
+        atomicOr(&waterBodyState[WATER_SCRATCH_BASE + (gi >> 5u)],
+                 i32(1u << (gi & 31u)));
+      }
+    }
+  } else if (d2 <= g.z + 2 * radius + 1) {
+    // OUTPUT 2, THE SPILL ELEVATION: the ring one cell OUTSIDE the disc. Water
+    // leaves a basin over its rim and the rim is not in the basin — probing
+    // inside the disc would find the pool floor and report that the lake spills
+    // at its own bottom. For an intact tarn or authored pool this ring is berm
+    // or rim lift, solid through the whole scanned span, so SW_SPILLY stays at
+    // WB_HOLE_NONE and says "this basin does not leak". Notch the rim and it
+    // reports the notch, which is component 5's first enter test made real for
+    // terrain the player shaped.
+    if (container) {
+      atomicMin(&waterBodyState[wbCurveBase(b) + SW_SPILLYN], y);
+    }
+  }
+}
+
+// The label-propagation scratch. 2,304 u32 = 9,216 B, comfortably inside the
+// 16 KiB workgroup-storage floor. A second array for double buffering would
+// have doubled that and gone over; the read-phase / barrier / write-phase split
+// below buys the same race freedom for nothing, because a thread only ever
+// WRITES cells it owns.
+var<workgroup> gLabel : array<u32, 2304>;
+var<workgroup> gRoots : array<u32, 8>;
+var<workgroup> gSize : array<u32, 8>;
+var<workgroup> gPick : array<u32, 4>;
+var<workgroup> gRootCount : atomic<u32>;
+var<workgroup> gChanged : atomic<u32>;
+var<workgroup> gMapDirty : atomic<u32>;
+
+// ============================================================================
+// M5 — THE SPLIT (plan component 2, outputs 3 and 4; component 10).
+// ONE workgroup, 256 threads, nine grid cells each.
+//
+// ---- WHY A SINGLE WORKGROUP, AND WHY THAT IS THE POINT --------------------
+//
+// This is connected-component labelling, which classically wants union-find
+// with path compression — and path compression wants atomicCAS, which
+// CLAUDE.md rule 1 bans outright because a CAS loop's outcome depends on which
+// thread arrived first. Min-label propagation reaches the same answer with no
+// CAS at all (integer min is associative and commutative, so the fixpoint is
+// unique), but naive propagation across a whole dispatch races on the
+// neighbour read.
+//
+// Inside ONE workgroup that race has a standard deterministic answer: read
+// phase into registers, `workgroupBarrier()`, write phase into cells this
+// thread alone owns. The fixpoint is then a pure function of the input bitmap.
+// It costs one under-occupied workgroup, which is the right trade for a pass
+// that runs once per scheduled tick on one basin.
+//
+// ---- THE MERGE TREE, WHICH IS WHY THE PLAN WANTED A SWEEP AT ALL ----------
+//
+// Plan section 2: "every height where two components MERGE going up is a height
+// where one basin SPLITS going down. This is the merge tree of the terrain."
+// The sweep visits every level of the basin in turn, so the merge tree falls
+// out as the set of levels whose component count exceeds one — and the SPLIT
+// ELEVATION is the highest of them (atomicMax, order-free). That is output 3.
+// Output 4 is the map itself, which is what makes a split an exact partition of
+// the parent's cells rather than a search for where to cut.
+//
+// ---- WHAT A SPLIT DOES, AND WHY NO NEW ARITHMETIC IS INVOLVED -------------
+//
+// Nothing here divides anybody's water. The map changes which cells each body
+// OWNS; the existing ladder does the rest. The child's adoption reduce measures
+// its own voxels, the parent's re-audit re-measures what is left, and both are
+// voxel sums — so held(parent) + held(child) equals the parent's pre-split
+// voxel content BY MEASUREMENT, not by a division that could round. That is
+// plan section 5's "both directions must be mass-exact" reused rather than
+// re-derived, and it is what `--gate waterbody` pass B asserts.
+// ============================================================================
+@compute @workgroup_size(256)fn wbSplit(@builtin(local_invocation_id) li : vec3<u32>) {
+  // ---- THE UNIFORMITY CONTRACT, and it shapes this whole function ---------
+  //
+  // `workgroupBarrier` may only be called from UNIFORM control flow, and WGSL's
+  // analysis treats anything loaded from a storage buffer as possibly
+  // non-uniform. This pass has to read two such values — the resolved sweep
+  // level the ledger published (WBS_SWEEPY) and the body's live level
+  // (WBS_LEVEL) — so neither may gate a `return` or an `if` that contains a
+  // barrier. Every early-out below is therefore either UNIFORM (derived only
+  // from the uniform buffer) or a FLAG that guards work rather than control
+  // flow. The barriers all sit at function top level, so every invocation
+  // executes exactly the same sequence of them.
+  //
+  // The first version returned on the level test and Tint rejected it in as
+  // many words: "control flow depends on possibly non-uniform value". Writing
+  // it the other way costs a few hundred wasted workgroup ops on the rare tick
+  // where the level is out of range, and buys a kernel that provably cannot
+  // deadlock.
+  let b = T.waterSweepSlot;
+  if (b >= T.waterBodyCount || b >= WATERBODY_CAP) { return; }   // uniform
+  let seed = wbSeed(b);
+  if ((seed.w & WBF_CHILD) != 0) { return; }                     // uniform
+
+  // Same published level wbSweep used, for the same reason: the openness bitmap
+  // this pass labels was written at THAT level and at no other.
+  let y = wbGet(b, WBS_SWEEPY);
+  let idx = y - seed.x - 1;
+  // `inRange` and not `active`: `active` is a RESERVED KEYWORD in WGSL, the
+  // same trap `target` already is (CLAUDE.md's build-gotchas list).
+  let inRange = idx >= 0 && idx < i32(WATER_CURVE_MAXY);
+
+  let t = li.x;
+  let per = WATER_SPLIT_CELLS / 256u;   // 9
+
+  // ---- seed: open cells label themselves, blocked cells take the sentinel --
+  for (var k = 0u; k < per; k++) {
+    let i = t * per + k;
+    let bit = (u32(atomicLoad(&waterBodyState[WATER_SCRATCH_BASE + (i >> 5u)]))
+               >> (i & 31u)) & 1u;
+    gLabel[i] = select(0xFFFFFFFFu, i, bit != 0u && inRange);
+  }
+  if (t == 0u) { atomicStore(&gRootCount, 0u); atomicStore(&gMapDirty, 0u); }
+  workgroupBarrier();
+
+  // ---- propagate to a fixpoint --------------------------------------------
+  // 96 iterations, ALWAYS, with no early break. The bound is rule 2 (bound
+  // every emergent process) and it is comfortably past a 48-wide grid's
+  // straight-line diameter; running it to the bound rather than breaking on a
+  // workgroup flag is the same uniformity argument as above. `converged` ends
+  // up meaning "the last iteration changed nothing", which is the property the
+  // split decision actually needs — a basin shaped like a spiral that has not
+  // settled by 96 REFUSES to split, which is the safe direction, because an
+  // unsplit basin is one the CA already knows how to handle.
+  for (var iter = 0; iter < 96; iter++) {
+    if (t == 0u) { atomicStore(&gChanged, 0u); }
+    workgroupBarrier();
+    // READ PHASE. Every load below is of a cell some other thread may write in
+    // the write phase, which is why the barrier between them is not optional.
+    var want = array<u32, 9>(0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u);
+    for (var k = 0u; k < per; k++) {
+      let i = t * per + k;
+      var mn = gLabel[i];
+      if (mn != 0xFFFFFFFFu) {
+        let gx = i % WATER_SPLIT_GRID;
+        let gz = i / WATER_SPLIT_GRID;
+        if (gx > 0u) { mn = min(mn, gLabel[i - 1u]); }
+        if (gx + 1u < WATER_SPLIT_GRID) { mn = min(mn, gLabel[i + 1u]); }
+        if (gz > 0u) { mn = min(mn, gLabel[i - WATER_SPLIT_GRID]); }
+        if (gz + 1u < WATER_SPLIT_GRID) { mn = min(mn, gLabel[i + WATER_SPLIT_GRID]); }
+      }
+      want[k] = mn;
+    }
+    workgroupBarrier();
+    // WRITE PHASE. Only cells this thread owns, so no two invocations can
+    // disagree about a cell and the fixpoint is a pure function of the bitmap.
+    for (var k = 0u; k < per; k++) {
+      let i = t * per + k;
+      if (want[k] != gLabel[i]) {
+        gLabel[i] = want[k];
+        atomicAdd(&gChanged, 1u);
+      }
+    }
+    workgroupBarrier();
+  }
+  let converged = atomicLoad(&gChanged) == 0u;
+
+  // ---- roots, in ascending index order ------------------------------------
+  // A cell is a ROOT when it labelled itself, which after the fixpoint means it
+  // is the smallest index in its component. Collected by ONE thread in a single
+  // ascending scan, so the ranking is a property of the grid rather than of
+  // which invocation got there first — the same reason the ledger's hole key is
+  // an atomicMin over a packed position rather than a first-writer-wins.
+  //
+  // SIZED, and then the small ones DROPPED, which the first version did not do
+  // and paid for. Ranking the first four roots by grid index alone made
+  // component 0 whatever component happened to touch the lowest-numbered grid
+  // cell — and at the top of a disc that is a SPECK: two or three open cells
+  // where the circle's edge clips a grid cell. The parent inherited the speck,
+  // the child inherited the entire lake, and the parent was left holding a
+  // debit against a pool with no water in it. So: collect up to eight roots,
+  // count what each actually owns, keep the ones over a floor, and take the
+  // three largest. Ties break by grid index, and the kept roots are numbered in
+  // ASCENDING index order, so the whole assignment is a pure function of the
+  // bitmap.
+  if (t == 0u) {
+    for (var r = 0u; r < 8u; r++) { gRoots[r] = 0xFFFFFFFFu; gSize[r] = 0u; }
+    var n = 0u;
+    for (var i = 0u; i < WATER_SPLIT_CELLS; i++) {
+      if (gLabel[i] == i) {
+        if (n < 8u) { gRoots[n] = i; }
+        n = n + 1u;
+      }
+    }
+    for (var i = 0u; i < WATER_SPLIT_CELLS; i++) {
+      let lab = gLabel[i];
+      if (lab == 0xFFFFFFFFu) { continue; }
+      for (var r = 0u; r < 8u; r++) {
+        if (gRoots[r] == lab) { gSize[r] = gSize[r] + 1u; }
+      }
+    }
+    // A component under WB_SPLIT_MIN_CELLS grid cells is not a pool, it is an
+    // artefact of the downsample. Folding it back into the parent is the same
+    // safe degradation every refusal here takes — the CA handles a puddle.
+    for (var q = 0u; q < 4u; q++) { gPick[q] = 0xFFFFFFFFu; }
+    var kept = 0u;
+    for (var q = 0u; q < 3u; q++) {
+      var best = 0xFFFFFFFFu;
+      var bestSize = 0u;
+      for (var r = 0u; r < 8u; r++) {
+        if (gRoots[r] == 0xFFFFFFFFu) { continue; }
+        if (gSize[r] < WB_SPLIT_MIN_CELLS) { continue; }
+        var taken = false;
+        for (var q2 = 0u; q2 < q; q2++) {
+          if (gPick[q2] == gRoots[r]) { taken = true; }
+        }
+        if (taken) { continue; }
+        if (gSize[r] > bestSize) { bestSize = gSize[r]; best = gRoots[r]; }
+      }
+      if (best != 0xFFFFFFFFu) { gPick[q] = best; kept = kept + 1u; }
+    }
+    // Number the kept roots by ascending grid index, so "component 0" is a
+    // property of the terrain and not of which one happened to be largest this
+    // tick — a component that swapped index with its sibling would swap the two
+    // pools' ledgers.
+    for (var a = 0u; a + 1u < 3u; a++) {
+      for (var bq = 0u; bq + 1u < 3u - a; bq++) {
+        if (gPick[bq] > gPick[bq + 1u]) {
+          let tmp = gPick[bq];
+          gPick[bq] = gPick[bq + 1u];
+          gPick[bq + 1u] = tmp;
+        }
+      }
+    }
+    atomicStore(&gRootCount, kept);
+  }
+  workgroupBarrier();
+  let roots = atomicLoad(&gRootCount);
+
+  // OUTPUT 3: THE SPLIT ELEVATION. atomicMax over every level this cycle has
+  // found disconnected — the merge tree read downward, which is plan section
+  // 2's fourth output and the reason it wanted a height-ordered sweep rather
+  // than a flood fill per level. Reset to WB_SPLIT_NONE at the cycle's first
+  // level by the ledger, so a partition the player knocks down stops being
+  // reported within one cycle instead of forever.
+  if (t == 0u && inRange && converged && roots > 1u) {
+    atomicMax(&waterBodyState[wbCurveBase(b) + SW_SPLITYN], y);
+  }
+
+  // ---- OUTPUT 4: THE ACTIVE MAP -------------------------------------------
+  // Written ONLY when the swept level is the body's LIVE level, because that is
+  // the only level a footprint test ever asks about. A map from some other
+  // level would tell the shave to split a surface nowhere near the partition.
+  // A FLAG rather than a return, per the uniformity contract at the top.
+  let writeMap = inRange && converged && y == wbGet(b, WBS_LEVEL);
+  // More components than the 2-bit map can name: publish ONE, i.e. refuse to
+  // split. Safe degradation, the same answer every refusal in this subsystem
+  // gives — "simulated the way it is today".
+  var comps = 1u;
+  if (roots >= 1u && roots <= 3u) { comps = roots; }
+
+  // 144 words, one thread each. No atomics: a word is 16 grid cells and one
+  // thread owns all 16 of them.
+  if (t < WATER_SPLIT_WORDS && writeMap) {
+    var packed = 0u;
+    for (var k = 0u; k < 16u; k++) {
+      let i = t * 16u + k;
+      var comp = WB_COMP_NONE;
+      let lab = gLabel[i];
+      if (lab != 0xFFFFFFFFu) {
+        if (comps > 1u) {
+          for (var r = 0u; r < 3u; r++) {
+            if (gPick[r] == lab) { comp = r; }
+          }
+          // A dropped speck, or a component past the third, keeps
+          // WB_COMP_NONE, which wbOwns hands back to the parent — so it is
+          // simulated the way it is today, which is the same answer as not
+          // splitting at all.
+        } else {
+          comp = 0u;
+        }
+      }
+      packed = packed | (comp << (k * 2u));
+    }
+    let addr = wbCurveBase(b) + SW_SPLIT0 + t;
+    if (u32(atomicLoad(&waterBodyState[addr])) != packed) {
+      atomicStore(&waterBodyState[addr], i32(packed));
+      atomicAdd(&gMapDirty, 1u);
+    }
+  }
+  workgroupBarrier();
+  if (t == 0u && writeMap) {
+    swSet(b, SW_COMPS, i32(comps));
+    swSet(b, SW_MAPY, y);
+    if (atomicLoad(&gMapDirty) != 0u) {
+      swSet(b, SW_MAPGEN, swGet(b, SW_MAPGEN) + 1);
     }
   }
 }

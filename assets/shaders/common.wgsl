@@ -441,9 +441,12 @@ struct TickParams {
   waterDrainBodies    : u32,
   waterDrainMax       : i32,
   waterExciteRadius   : i32,
-  padWb0 : u32,            // see the alignment arithmetic in world.h
-  padWb1 : u32,
-  padWb2 : u32,
+  // M5: the scheduled re-derive. Both are pure functions of the tick — see the
+  // note in world.h and plan section 3.4. WATERBODY_CAP means "nothing is
+  // scheduled", which is every tick of a lake nobody has dug into.
+  waterSweepSlot  : u32,
+  waterSweepLevel : i32,
+  padWb2 : u32,            // see the alignment arithmetic in world.h
   padWb3 : u32,
   padWb4 : u32,
   // WATERBODY_CAP bodies x 2 rows. The literal 128 is deliberate, exactly like
@@ -451,8 +454,35 @@ struct TickParams {
   // scripts/check_invariants.py, so a cap changed on one side and not the other
   // fails the check rather than silently reading zeros.
   waterBodies : array<vec4<i32>, 128>,
-  // WATER_CHUNK_CAP entries, four to a std140 row.
-  waterChunks : array<vec4<u32>, 128>,
+  // WATER_CHUNK_CAP entries, four to a std140 row. 256 rows = 1024 entries;
+  // M5 doubled it because a dug basin lists its split child's footprint too.
+  waterChunks : array<vec4<u32>, 256>,
+  // ---- THE CURRENT FIELD, the SIM's copy (docs/PLAN_water_master.md
+  // component 8; src/sim/currentprim.h; must match TickParams in world.h) ----
+  //
+  // A clone of the wind primitive block above, deliberately and structurally:
+  // same cap, same three-row packing, same union-AABB early-out, same
+  // float/integer transcription pair. Water flow is the same KIND of object as
+  // wind — a bounded list of parametric shapes summed analytically at a sample
+  // point — and building it as a second thing shaped differently would have
+  // meant a second set of overflow arguments to get wrong.
+  //
+  // MODE 0 IS AN EXACT IDENTITY, and it is the shipping default. currentAtQ
+  // returns the zero vector on `currentMode == 0` before it looks at anything,
+  // so no sim kernel can see this block and the pinned world hash cannot move.
+  // Same shape as windMode and waterBodyMode.
+  currentMode      : u32,
+  currentPrimCount : u32,
+  padCp0 : u32,
+  padCp1 : u32,
+  currentPrimLo : vec3<i32>,   // union AABB, inclusive world cells; lo > hi
+  padCp2 : i32,                // means "no primitives"
+  currentPrimHi : vec3<i32>,
+  padCp3 : i32,
+  // CURRENT_PRIM_CAP primitives x 3 rows. The literal 96 is deliberate for
+  // windPrims' reason: this file and world.h are compared on TOTAL SIZE by
+  // scripts/check_invariants.py. Keep 96 = 3 * kCurrentPrimCap.
+  currentPrims : array<vec4<i32>, 96>,
 };
 
 // ---- WATER BODIES: the GPU-owned ledger's word map (M2/M3) -----------------
@@ -512,6 +542,26 @@ const WBS_JETV      : u32 = 22u;  // Q16.16 cells/tick, downward
 // mitigation UNMEASURED — this word is the measurement, and it is cumulative
 // rather than per-tick so a gate reading it once still sees the whole window.
 const WBS_EXSHELL   : u32 = 23u;
+// ---- M5: the re-audit (component 10) --------------------------------------
+// ARMED by the ledger on the first level of each sweep cycle, CONSUMED by it on
+// the next tick after wbReduce has refilled WBS_RSUM. This is the fix for the
+// leftover M2 named and M3 did not close: a body adopted once carries the
+// volume it had at adoption, and someone who digs into it makes that number a
+// lie — which bounds the discharge through `held = VOLUME - DRAINED` and stops
+// a lake draining that has plenty left.
+//
+// It refreshes VOLUME ONLY, as `rsum + drained`, so `held` becomes the measured
+// voxel sum while WBS_DRAINED — the cumulative term `--gate waterbody` passes A
+// and H balance their identity on — is not touched. A re-audit that reset
+// DRAINED would look exactly like a leak to both of them.
+const WBS_REAUDIT   : u32 = 24u;
+const WBS_AUDITTICK : u32 = 25u;  // attribution: the last re-audit's tick
+// The RESOLVED sweep level for this tick, published by the ledger and read by
+// wbSweep and wbSplit. See kWaterSweepLive in world.h for why it is published
+// rather than recomputed. WB_SWEEP_NONE means nothing sweeps this tick.
+const WBS_SWEEPY    : u32 = 26u;
+const WB_SWEEP_LIVE : i32 = -0x7FFFFFFF;
+const WB_SWEEP_NONE : i32 = -0x40000001;
 
 // The ladder, GPU side. Candidate -> Measuring -> Adopted, and Releasing is the
 // way out. Measuring is its own state rather than a flag because the reduce is
@@ -526,6 +576,137 @@ const WB_RELEASING : i32 = 3;
 // CPU-sent per-body flags (TickParams.waterBodies row 1, word 3).
 const WBF_PROPOSE : i32 = 1;   // the CPU's deterministic tests all passed
 const WBF_RELEASE : i32 = 2;   // an EXIT test failed; hand this body back
+// M5: which component of a SPLIT basin this body governs, in bits 2..3. A body
+// with component 0 and a basin with no split map is exactly what M2/M3/M4
+// shipped — the map reads all-zero, every cell answers component 0, and the
+// footprint test collapses to the disc test it always was. That is why M5's
+// split machinery is an exact identity on a lake nobody has dug into.
+const WBF_COMP_SHIFT : u32 = 2u;
+const WBF_COMP_MASK  : i32 = 3;
+// M5: the body is a SPLIT CHILD. Carried separately from the component index
+// because "component 0" is also what an unsplit parent answers, and the ledger
+// needs to tell "I am the original body" from "I am the second pool that
+// appeared when the level fell past a partition" — a child with no cells is a
+// candidate that never adopts, and that must not be reported as a body the CPU
+// refused.
+const WBF_CHILD : i32 = 16;
+// M5: a child's PARENT slot, in bits 8..15. Carried so the ledger can arm a
+// child's re-audit on the same cycle boundary as its parent's — two pools that
+// re-measured on different ticks would report a `held` sum that briefly does
+// not add up to the water in the basin, and a conservation gate has no way to
+// tell that apart from a leak.
+const WBF_PARENT_SHIFT : u32 = 8u;
+const WBF_PARENT_MASK  : i32 = 255;
+// "No split found." atomicMax's identity, and deliberately far below any legal
+// world Y so the first disconnected level found always wins.
+const WB_SPLIT_NONE : i32 = -0x40000000;
+
+// ============================================================================
+// M5 — THE MEASURED CONTAINER CURVE AND THE SPLIT MAP (plan components 2 case
+// 2 and 10). Word map for the region of `waterBodyState` past the ledger.
+//
+// Must match kWaterCurve*/kWaterSplit*/kWaterSweep* in src/sim/world.h and the
+// SW_* reader in src/test/selftest_water.cpp.
+//
+// WHY THIS IS DERIVED DATA AND NOT AN AUTHORITY. Plan section 3.2: the surface
+// shave counts what it ACTUALLY removed and debits that, so nothing here can
+// ever become a mass number. area(y) paces a descent, the spill elevation gates
+// a jurisdiction test, the split map picks which pool a cell belongs to. An
+// approximate or few-ticks-stale table costs pace and picks a slightly wrong
+// moment to split. It cannot lose an eighth, and that is the property that lets
+// the sweep be scheduled at all.
+// ============================================================================
+// WATER_SPLIT_GRID / _CELLS / _WORDS, WATER_CURVE_MAXY / _WORDS,
+// WATER_SWEEP_HEADER, WATER_CURVE_BASE and WATER_SCRATCH_BASE are GENERATED
+// from world.h by ShaderConstantPrelude — the engine's standing rule that a
+// world constant a shader must agree with is never restated in WGSL. Only the
+// FIELD NAMES below are this file's, because a word map is a protocol rather
+// than a size.
+// ---- header ----
+// The area table's floor. Stored rather than re-derived from TickParams so a
+// reader (the gate, the ledger) can interpret the table without also knowing
+// which tick wrote it.
+const SW_FLOORY   : u32 = 0u;
+// How many Y entries the table actually covers, and whether the basin was
+// deeper than WATER_CURVE_MAXY and got truncated. Reported, not hidden: an
+// approximation nobody can see is an approximation nobody can bound.
+const SW_SPANY    : u32 = 1u;
+const SW_TRUNC    : u32 = 2u;
+// OUTPUT 2 of the sweep: the SPILL ELEVATION — the lowest world Y at which the
+// basin's rim is open to the outside. atomicMin target, so WB_HOLE_NONE is the
+// identity. Above it the container curve is meaningless because the body is not
+// a body, it is a flow (plan component 5's first enter test).
+const SW_SPILLY   : u32 = 3u;
+// OUTPUT 3 of the sweep: the SPLIT ELEVATION — the highest level at which the
+// basin's wet region is disconnected, i.e. the merge tree's first merge going
+// up and therefore the first split going down. WB_HOLE_NONE means "no split
+// found in any level scanned so far".
+const SW_SPLITY   : u32 = 4u;
+// Components found at the level the ACTIVE map describes, and which level that
+// is. The active map is written only when the swept level equals the body's own
+// live level, because that is the only level a footprint test ever asks about.
+const SW_COMPS    : u32 = 5u;
+const SW_MAPY     : u32 = 6u;
+// Bumped every time the active map CHANGES. The ledger watches it and re-audits
+// the body's volume when it moves — that is component 10's whole trigger, and
+// it is tick-deterministic because the sweep that bumps it is.
+const SW_MAPGEN   : u32 = 7u;
+// THE ACCUMULATORS' "NEXT" HALF, and it is plan section 3.3 at cycle
+// granularity rather than tick granularity.
+//
+// SW_SPILLY and SW_SPLITY are atomic reductions over EVERY LEVEL of the basin,
+// and a sweep visits one level per scheduled tick — so the reduction is only
+// meaningful once a whole cycle has been walked. Accumulated in place they were
+// worse than useless: a reader between the cycle's reset and its end sees the
+// maximum over however many levels happened to have been scanned, which for a
+// draining lake is "roughly the live level" and looks exactly like a correct
+// answer. Measured on the first version of `--gate waterbody` pass B as a split
+// elevation of 188 against a partition whose top is at 205.
+//
+// So the sweep accumulates into the *N words and the cycle boundary PROMOTES
+// them, which makes SW_SPILLY/SW_SPLITY the result of the last COMPLETE pass
+// over the basin and nothing else.
+const SW_SPILLYN  : u32 = 8u;
+const SW_SPLITYN  : u32 = 9u;
+// area(y): WATER_CURVE_MAXY entries, cells at y = SW_FLOORY + 1 + i. CELLS, not
+// columns (plan section 2) — a cave, an overhang or a flooded tunnel under the
+// lake is counted, and counting columns would silently reimplement the
+// single-span assumption that got heightfields rejected.
+const SW_AREA0    : u32 = WATER_SWEEP_HEADER;
+// The split map: 2 bits per grid cell, WATER_SPLIT_WORDS words.
+const SW_SPLIT0   : u32 = WATER_SWEEP_HEADER + WATER_CURVE_MAXY;
+// "This grid cell holds no water at the mapped level." Distinct from component
+// 0 so a blocked cell cannot silently enlarge the parent's footprint.
+const WB_COMP_NONE : u32 = 3u;
+// Smallest component the split will name, in GRID CELLS. Below this a
+// "component" is an artefact of the downsample — the two or three cells
+// where the disc's edge clips a grid cell — and naming it costs a whole
+// descriptor and hands the parent a pool with no water in it. 8 grid cells
+// is ~72 columns at the harness lake's step of 3.
+const WB_SPLIT_MIN_CELLS : u32 = 8u;
+// Most whole eighths one tick's shave may take off a surface cell: one whole
+// voxel. See the note at the `steps` computation in sim_waterbody.wgsl.
+const WB_MAX_STEPS : i32 = 8;
+
+fn wbCurveBase(b : u32) -> u32 { return WATER_CURVE_BASE + b * WATER_CURVE_WORDS; }
+// The basin's column AABB -> grid step. Derived from the geometry the CPU
+// already sends (the disc bound) rather than sent as its own field, so the two
+// cannot disagree: one number, one owner.
+fn wbGridStep(radius : i32) -> i32 {
+  return max(1, (2 * radius + 1 + i32(WATER_SPLIT_GRID) - 1) /
+                    i32(WATER_SPLIT_GRID));
+}
+// World column -> grid cell index, or WATER_SPLIT_CELLS when outside the grid.
+fn wbGridIndex(x : i32, z : i32, cx : i32, cz : i32, radius : i32) -> u32 {
+  let step = wbGridStep(radius);
+  let gx = (x - (cx - radius)) / step;
+  let gz = (z - (cz - radius)) / step;
+  if (gx < 0 || gz < 0 || gx >= i32(WATER_SPLIT_GRID) ||
+      gz >= i32(WATER_SPLIT_GRID)) {
+    return WATER_SPLIT_CELLS;
+  }
+  return u32(gz) * WATER_SPLIT_GRID + u32(gx);
+}
 
 // "No hole." atomicMin's identity, and deliberately i32-positive so the packed
 // key ordering below is a plain integer compare.
@@ -578,6 +759,29 @@ const WPRIM_F_SHIFT   : u32 = 4u;
 const WPRIM_F_AIR     : u32 = 1u;
 const WPRIM_F_WATER   : u32 = 2u;
 const WPRIM_F_ENTRAIN : u32 = 4u;
+
+// ---- current primitive encoding — must match src/sim/world.h ---------------
+// docs/PLAN_water_master.md component 8. Four shapes, and the set is closed for
+// the same reason the wind set is: they are SUMMABLE, and superposition of
+// sources, sinks and vortices is a real solution of Laplace's equation rather
+// than a pile of special cases. A river entering a pool and spreading outward
+// is what a point SOURCE does for free — the plan's §0 correction 4 — so there
+// is no diffusion step, no relaxation, no stored field and nothing to wake.
+const CURRENT_PRIM_CAP  : u32 = 32u;
+const CURRENT_PRIM_ROWS : u32 = 3u;
+const CPRIM_SINK   : u32 = 0u;   // drain inflow: radial IN, 1/r^2, clamped
+const CPRIM_SOURCE : u32 = 1u;   // river mouth / jet base: radial OUT, 1/r^2
+const CPRIM_VORTEX : u32 = 2u;   // swirl about an axis: Gamma/2*pi*r tangential
+const CPRIM_STREAM : u32 = 3u;   // uniform flow down a bed gradient
+const CPRIM_KIND_MASK : u32 = 0xFu;
+const CPRIM_F_SHIFT   : u32 = 4u;
+// A primitive the SIM is allowed to read. Seeded primitives derived from
+// anything the CPU learned from a readback carry this CLEAR, so they reach the
+// renderer and the player and never the hashed world — see the authority note
+// over currentAtQ.
+const CPRIM_F_SIM     : u32 = 1u;
+// Impact-ripple ring size — must match kWaveImpactCap in src/sim/world.h.
+const WAVE_IMPACT_CAP : u32 = 16u;
 
 // ---- day phase helpers (integer; sim-side) ----
 // 0 = midnight, 0x4000 = sunrise, 0x8000 = noon, 0xC000 = sunset.
@@ -776,6 +980,43 @@ struct RenderParams {
   windPrimHi : vec3<i32>,
   _pwpr4 : i32,
   windPrims : array<vec4<i32>, 96>,   // 3 * WIND_PRIM_CAP — see TickParams
+  // ---- the current field, the RENDER copy (plan component 8) --------------
+  // The same resolved list TickParams carries, in the same encoding, from the
+  // same CurrentPrimSystem in the same frame — the windPrims argument exactly.
+  // It is what makes the surface waves drift with the flow (component 9), what
+  // the arrow overlay draws, and what the foam reads its convergence from; a
+  // consumer with its own idea of where the water is going would be a picture
+  // of a different current.
+  //
+  // The render copy carries its OWN mode word rather than reading the sim's,
+  // because the two answer different questions: `currentMode` gates whether a
+  // sim kernel may read the field (rule 1 territory), and `currentRenderOn`
+  // gates whether the renderer draws it. The render arm ships ON while the sim
+  // arm ships OFF, which is the whole shape of M4 — see DESIGN.md §9c.
+  currentRenderOn  : u32,
+  currentPrimCount : u32,
+  _pcpr0 : u32,
+  _pcpr1 : u32,
+  currentPrimLo : vec3<i32>,
+  _pcpr2 : i32,
+  currentPrimHi : vec3<i32>,
+  _pcpr3 : i32,
+  currentPrims : array<vec4<i32>, 96>,   // 3 * CURRENT_PRIM_CAP
+  // ---- component 9: impact ripples ---------------------------------------
+  // A BOUNDED ring of recent water impacts, each drawn as an analytic
+  // expanding ring with amplitude decay. Plan component 9 names the upgrade
+  // path (a per-body 2D wave-equation texture, i.e. stored state plus a
+  // solver) and says DO NOT START THERE — so this is the windAt() idiom
+  // instead: the displacement is a pure function of (eventList, t), the list is
+  // fixed-size, and an empty list costs one compare.
+  //
+  // (x, z) in world VOXELS, `t0` the R.time the impact happened at, `amp` its
+  // strength in metres of initial crest. amp <= 0 is a dead slot.
+  waveImpactCount : u32,
+  _pwi0 : u32,
+  _pwi1 : u32,
+  _pwi2 : u32,
+  waveImpacts : array<vec4f, 16>,   // WAVE_IMPACT_CAP
 };
 
 // Reversed-Z depth (clear 0, compare GreaterEqual): depth = KNEAR / viewZ.
@@ -1663,6 +1904,334 @@ fn windAtQ(p : vec3<i32>, T : ptr<uniform, TickParams>) -> vec3<i32> {
          vec3<i32>(wq(WINDQ_W1, w1.x), wq(WINDQ_W1, w1.y), wq(WINDQ_W1, w1.z)) +
          vec3<i32>(wq(WINDQ_W2, w2.x), wq(WINDQ_W2, w2.y), wq(WINDQ_W2, w2.z)) +
          windPrimAtQ(p, T);
+}
+
+// ============================ THE CURRENT FIELD =============================
+// docs/PLAN_water_master.md component 8. DESIGN.md §9c states the invariants.
+//
+// A CLONE OF THE WIND FIELD, and the word is meant literally: same three-row
+// primitive packing, same union-AABB whole-loop reject, same float/integer
+// transcription pair sitting adjacent in one file, same `ptr<uniform, T>` rule.
+// Water flow is the same KIND of object as wind — a bounded list of parametric
+// shapes summed analytically at a sample point, like point lights — and the one
+// thing that would have made it harder is inventing a second shape for it.
+//
+// SUPERPOSITION ONLY. There is no neighbour coupling, no stored field, no
+// relaxation pass and nothing to wake. The behaviour that motivated the field —
+// a river running into a pool and dissipating outward — is what a point SOURCE
+// does for free under superposition (plan §0 correction 4); a real vector
+// diffusion would mean stored state, a solver, per-tick cost and a system that
+// does not sleep. Superposition of sources, sinks and vortices is a real
+// solution of Laplace's equation, not a hack: incompressible irrotational flow
+// away from boundaries is approximately what pond water does.
+//
+// THE FIELD OWNS NO MASS, and that is what makes its accuracy envelope
+// acceptable. No no-flow boundary at terrain, no separation, no eddies behind
+// obstacles, no turbulence. A wrong current pushes a leaf the wrong way; it
+// cannot lose an eighth of water. The ledger (component 3) is the only thing
+// that moves mass, and it never reads this.
+//
+// UNITS. World CELLS PER SECOND, matching windAt() exactly so the two can be
+// compared directly by anyone debugging them, and Q16.16 in the integer arm for
+// the same reason. Each consumer converts to its own per-tick units at its own
+// call site with a const factor.
+//
+// THE SINK/VORTEX ASYMMETRY IS THE WHOLE LOOK. The sink is 1/r^2 and is only a
+// couple of cells wide at any realistic discharge; the vortex is Gamma/2*pi*r
+// and reaches far. That is why real whirlpools look enormous while the actual
+// suction is a small throat: design the visible danger around the tangential
+// term and the lethality around the sink.
+
+// Vortex inflow as a fraction of the tangential swirl — WPRIM_INFLOW's
+// argument, at a whirlpool's scale: a vortex that only span would never gather
+// anything into itself. A property of the shape, so a constant and not a knob.
+const CPRIM_INFLOW : f32 = 0.22;
+const CPRIM_INFLOW_Q8 : i32 = 56;   // the same 0.22, Q8, for the integer path
+
+// Exact integer floor(sqrt(v)), v in [0, 2^30). Restoring binary method,
+// constant time, no float and no table.
+//
+// WHY THERE IS A SQUARE ROOT HERE AND NONE IN THE WIND BLOCK. windPrimEvalQ
+// gets away without one because every wind profile is quadratic in the distance
+// (1 - r^2/R^2), which r^2 already gives. The two profiles this field exists
+// for are NOT: Gamma/2*pi*r and 1/r^2 are both about the true radius, and
+// faking them with r^2 would make a whirlpool's tangential speed fall off as
+// 1/r^2 — which is the sink's profile, i.e. exactly the "reaches far" property
+// the vortex is here to provide. So one isqrt is paid, and it is paid ONCE per
+// primitive per sample: sink, source and vortex all consume the same radius.
+fn curISqrt(v : i32) -> i32 {
+  var x = max(v, 0);
+  var res = 0;
+  var bit = 1 << 30u;
+  // Both loops are bounded by the constant above, so this is fixed-cost.
+  while (bit > x) { bit = bit >> 2u; }
+  while (bit != 0) {
+    if (x >= res + bit) {
+      x = x - (res + bit);
+      res = (res >> 1u) + bit;
+    } else {
+      res = res >> 1u;
+    }
+    bit = bit >> 2u;
+  }
+  return res;
+}
+
+// One primitive's contribution at a float sample point, world cells/s.
+// TRANSCRIBED from — and by — the integer evaluator currentPrimEvalQ below, the
+// same standing obligation windPrimEvalF/Q carry: change a profile in one,
+// change it in the other in the same edit. Float here rather than a conversion
+// of the integer answer because the renderer samples at fractional positions
+// and quantising a whirlpool to whole cells makes its rings visibly staircase.
+//
+// PACKING (must match CurrentPrimGpu in src/sim/currentprim.h):
+//   w0 = (x, y, z, kind | flags << 4)          origin, world cells
+//   w1 = (dirX, dirY, dirZ, strengthQ)         unit axis Q16.16, cells/s Q16.16
+//   w2 = (radius, reach, swirlQ, riseQ)        cells, cells, Q16.16, Q16.16
+//
+// `strength` is the speed AT THE CORE RADIUS for every kind, which is what lets
+// the four shapes share one cap and one overflow argument: the profile can only
+// ever attenuate it.
+fn currentPrimEvalF(p : vec3f, w0 : vec4<i32>, w1 : vec4<i32>,
+                    w2 : vec4<i32>) -> vec3f {
+  let kind = u32(w0.w) & CPRIM_KIND_MASK;
+  let pos = vec3f(f32(w0.x), f32(w0.y), f32(w0.z));
+  let dir = vec3f(f32(w1.x), f32(w1.y), f32(w1.z)) * (1.0 / 65536.0);
+  let s = f32(w1.w) * (1.0 / 65536.0);      // cells/s, envelope already applied
+  let rad = max(f32(w2.x), 1.0);
+  let len = max(f32(w2.y), 1.0);
+  let swirl = f32(w2.z) * (1.0 / 65536.0);
+  let rise = f32(w2.w) * (1.0 / 65536.0);
+  // THE CORE. r -> 0 is a pole in both profiles, so both are clamped to a
+  // throat an eighth of the footprint across. This is not a numerical fudge:
+  // a real drain has a physical orifice and the flow inside it is bounded by
+  // the discharge, not by 1/r^2. Floor of 1 cell, because a sub-voxel throat
+  // is not a thing this engine can draw.
+  let core = max(rad * 0.125, 1.0);
+
+  let d = p - pos;
+  let d2 = dot(d, d);
+  let rr = rad * rad;
+
+  if (kind == CPRIM_SINK || kind == CPRIM_SOURCE) {
+    if (d2 > rr) { return vec3f(0.0); }
+    let r = sqrt(d2);
+    let rc = max(r, core);
+    // Soft rim, quadratic, the wind block's idiom — the field must reach zero
+    // at its declared footprint or the AABB reject would be a visible edge.
+    let edge = 1.0 - d2 / rr;
+    let mag = s * (core * core) / (rc * rc) * edge;
+    let sgn = select(1.0, -1.0, kind == CPRIM_SINK);
+    return (d / rc) * (mag * sgn);
+  }
+
+  let ax = dot(d, dir);
+  let r2 = max(0.0, d2 - ax * ax);
+  if (r2 > rr) { return vec3f(0.0); }
+  if (abs(ax) > len) { return vec3f(0.0); }
+  let radW = 1.0 - r2 / rr;
+  let axW = 1.0 - abs(ax) / len;
+
+  if (kind == CPRIM_VORTEX) {
+    let perp = d - dir * ax;             // radial offset from the axis
+    let rp = sqrt(r2);
+    let rpc = max(rp, core);
+    let tang = cross(dir, perp);         // same length as perp, 90 deg round
+    // v_theta = Gamma / (2 pi r), written as s * core / r so that `s` means
+    // "the tangential speed at the core" for every kind. Gamma is then
+    // 2 pi core s, and the CPU is what converts sim.currentVortexGamma into it.
+    let vt = s * core / rpc * radW * axW;
+    return (tang / rpc) * (vt * swirl) - (perp / rpc) * (vt * CPRIM_INFLOW) +
+           dir * (rise * s * radW * axW);
+  }
+
+  // CPRIM_STREAM: uniform flow along the axis, tapered to nothing at the rim
+  // and at both ends. Symmetric in `ax` (unlike WPRIM_CONE, which is a mouth):
+  // a reach of river has no front.
+  return dir * (s * radW * axW);
+}
+
+// The primitive sum at a point, world cells/s. Zero primitives is one compare;
+// a point outside every footprint is four.
+// THE UNIFORM ARRIVES BY POINTER — see the WIND UNIFORMS note above
+// RenderParams. This function dynamically indexes a uniform array, which is the
+// exact shape that cost 220 ms/frame; plan §9 ranks it as risk 5.
+fn currentPrimAt(p : vec3f, R : ptr<uniform, RenderParams>) -> vec3f {
+  if ((*R).currentPrimCount == 0u) { return vec3f(0.0); }
+  let pi = vec3<i32>(floor(p));
+  if (any(pi < (*R).currentPrimLo) || any(pi > (*R).currentPrimHi)) {
+    return vec3f(0.0);
+  }
+  var acc = vec3f(0.0);
+  let n = min((*R).currentPrimCount, CURRENT_PRIM_CAP);
+  for (var i = 0u; i < n; i = i + 1u) {
+    let b = i * CURRENT_PRIM_ROWS;
+    acc += currentPrimEvalF(p, (*R).currentPrims[b], (*R).currentPrims[b + 1u],
+                            (*R).currentPrims[b + 2u]);
+  }
+  return acc;
+}
+
+// THE FIELD, render side. World cells/s at world position `p`.
+//
+// There is no ambient term to add — unlike wind, which has weather everywhere,
+// still water is still. The stream arm is a PRIMITIVE (CPRIM_STREAM, seeded
+// from the landform bed gradient on the CPU), not a global, because a river is
+// somewhere and a wind is everywhere.
+fn currentAt(p : vec3f, R : ptr<uniform, RenderParams>) -> vec3f {
+  if ((*R).currentRenderOn == 0u) { return vec3f(0.0); }
+  return currentPrimAt(p, R);
+}
+
+// CONVERGENCE of the field at a point, per second — negative divergence, so
+// positive means "the flow is piling up here". This is what foam rides.
+//
+// A CENTRAL DIFFERENCE, not a symbolic derivative, and that is a deliberate
+// choice rather than laziness: the analytic divergence of the sum would be a
+// THIRD transcription of every profile, drifting from the other two with
+// nothing checking it, for four evaluations of a function that early-outs to
+// one compare outside the AABB. `e` is in world cells.
+fn currentConvergeAt(p : vec3f, R : ptr<uniform, RenderParams>) -> f32 {
+  if ((*R).currentRenderOn == 0u || (*R).currentPrimCount == 0u) { return 0.0; }
+  let e = 1.5;
+  let vx1 = currentPrimAt(p + vec3f(e, 0.0, 0.0), R).x;
+  let vx0 = currentPrimAt(p - vec3f(e, 0.0, 0.0), R).x;
+  let vz1 = currentPrimAt(p + vec3f(0.0, 0.0, e), R).z;
+  let vz0 = currentPrimAt(p - vec3f(0.0, 0.0, e), R).z;
+  return -((vx1 - vx0) + (vz1 - vz0)) / (2.0 * e);
+}
+
+// ==================== THE CURRENT FIELD, IN INTEGERS ========================
+// The transcription of currentPrimEvalF above, for the same reason windAtQ is
+// the transcription of windAt: everything below is read by sim kernels whose
+// output reaches the grid, so rule 1 applies — integer only, no f32 anywhere,
+// square root included. f32 `sqrt()` is not bit-identical between vendors and
+// the world hash is compared across machines.
+//
+// OVERFLOW, bounded by construction exactly as windPrimEvalQ's is:
+//   * the Chebyshev reject caps |d| at max(radius, reach) + 1 <= 513, so
+//     d2 <= 3 * 513^2 < 2^20 and every dot product stays well inside i32.
+//   * weights are carried in Q10 (1024 = 1.0), never Q16.16.
+//   * `core <= rc` and `core <= rpc` by construction, so the 1/r^2 and 1/r
+//     numerators can only ATTENUATE the strength — the radius cancels and
+//     there is no clamp in the inner loop.
+//   * strength is capped CPU-side at kCurrentPrimMaxSpeed and the list at 32,
+//     so the accumulated sum cannot leave i32 either.
+//
+// PRECISION. Per-cell gradients are formed as (magQ / 64) * (w10 / 16) rather
+// than the more obvious (.../1024) * w10 — the same scale with four more bits
+// kept, which is what stops a weak, wide current truncating to nothing.
+fn currentPrimEvalQ(p : vec3<i32>, w0 : vec4<i32>, w1 : vec4<i32>,
+                    w2 : vec4<i32>) -> vec3<i32> {
+  let rad = max(w2.x, 1);
+  let len = max(w2.y, 1);
+  let d = p - w0.xyz;
+  // Chebyshev reject before anything is squared: this is what bounds every
+  // intermediate below, so it must come first and must use the LARGER extent.
+  let ext = max(rad, len) + 1;
+  if (max(max(abs(d.x), abs(d.y)), abs(d.z)) > ext) { return vec3<i32>(0); }
+
+  let kind = u32(w0.w) & CPRIM_KIND_MASK;
+  let dir = w1.xyz;                        // Q16.16 unit axis
+  let sQ = w1.w;                           // Q16.16 cells/s, envelope applied
+  let d2 = d.x * d.x + d.y * d.y + d.z * d.z;
+  let rr = rad * rad;
+  let core = max(rad / 8, 1);              // currentPrimEvalF's rad * 0.125
+
+  if (kind == CPRIM_SINK || kind == CPRIM_SOURCE) {
+    if (d2 > rr) { return vec3<i32>(0); }
+    let rc = max(curISqrt(d2), core);
+    // (core/rc)^2 in Q10. core <= rc, so this is 0..1024 and cannot overflow:
+    // core*core*1024 <= 64*64*1024 = 2^22.
+    let inv10 = (core * core * 1024) / (rc * rc);
+    let edge10 = 1024 - (d2 * 1024) / rr;
+    let w10 = (inv10 * edge10) / 1024;
+    let magQ = (sQ / 64) * (w10 / 16);     // = sQ * w10 / 1024
+    // Unit-ish offset in Q16.16: |dirU| = 65536 * min(r, rc) / rc <= 65536,
+    // which is what keeps the wq() product inside i32.
+    let dirU = vec3<i32>((d.x * 65536) / rc, (d.y * 65536) / rc,
+                         (d.z * 65536) / rc);
+    let v = vec3<i32>(wq(dirU.x, magQ), wq(dirU.y, magQ), wq(dirU.z, magQ));
+    return select(v, -v, kind == CPRIM_SINK);
+  }
+
+  let ax = (d.x * dir.x + d.y * dir.y + d.z * dir.z) / 65536;   // cells
+  let r2 = max(0, d2 - ax * ax);
+  if (r2 > rr) { return vec3<i32>(0); }
+  if (abs(ax) > len) { return vec3<i32>(0); }
+  let rad10 = 1024 - (r2 * 1024) / rr;
+  let ax10 = 1024 - (abs(ax) * 1024) / len;
+  let w10 = (rad10 * ax10) / 1024;
+
+  if (kind == CPRIM_VORTEX) {
+    let along = vec3<i32>((dir.x * ax) / 65536, (dir.y * ax) / 65536,
+                          (dir.z * ax) / 65536);
+    let perp = d - along;                  // radial offset from the axis
+    let rpc = max(curISqrt(perp.x * perp.x + perp.y * perp.y + perp.z * perp.z),
+                  core);
+    let tang = vec3<i32>((dir.y * perp.z - dir.z * perp.y) / 65536,
+                         (dir.z * perp.x - dir.x * perp.z) / 65536,
+                         (dir.x * perp.y - dir.y * perp.x) / 65536);
+    // s * core / rpc — the Gamma/2*pi*r profile. Divide FIRST: core <= rpc, so
+    // the quotient can only shrink sQ and nothing here can leave i32.
+    let vtQ = (sQ / rpc) * core;
+    let magQ = (vtQ / 64) * (w10 / 16);
+    let tangU = vec3<i32>((tang.x * 65536) / rpc, (tang.y * 65536) / rpc,
+                          (tang.z * 65536) / rpc);
+    let perpU = vec3<i32>((perp.x * 65536) / rpc, (perp.y * 65536) / rpc,
+                          (perp.z * 65536) / rpc);
+    let sw = w2.z >> 8u;                   // swirl, Q8
+    let swirlQ = (magQ / 256) * sw;
+    let inQ = (magQ / 256) * CPRIM_INFLOW_Q8;
+    // Axial lift: a share of the full strength, not of the per-cell gradient —
+    // windPrimEvalQ's argument, and the same arithmetic.
+    let liftQ = (wq(w2.w, sQ) / 1024) * w10;
+    return vec3<i32>(wq(tangU.x, swirlQ) - wq(perpU.x, inQ),
+                     wq(tangU.y, swirlQ) - wq(perpU.y, inQ),
+                     wq(tangU.z, swirlQ) - wq(perpU.z, inQ)) +
+           vec3<i32>(wq(dir.x, liftQ), wq(dir.y, liftQ), wq(dir.z, liftQ));
+  }
+
+  // CPRIM_STREAM.
+  let sw = (sQ / 1024) * w10;
+  return vec3<i32>(wq(dir.x, sw), wq(dir.y, sw), wq(dir.z, sw));
+}
+
+// THE FIELD, for the sim. Q16.16 world cells per second at world cell `p`.
+//
+// Returns the ZERO vector when sim.currentMode is off, which is what makes the
+// whole of M4 hash-neutral by construction at the shipping default — but do NOT
+// rely on that alone at a call site: a drag term reading zero current still
+// drags. Every consumer gates on T.currentMode itself, and says so.
+//
+// THE AUTHORITY LINE, and it is the one thing about this field that is not a
+// straight copy of wind. The seeders (currentprim.cpp) may only put a primitive
+// on THIS list if its parameters are a pure function of the tick input stream.
+// A drain's sink and vortex are seeded from the MUTATION that cut the hole —
+// which rides the mutation queue and is therefore tick-deterministic — and NOT
+// from the GPU ledger's WBS_EMIT, which the CPU could only learn from an async
+// readback arriving on a schedule set by fence retirement. That is M1's §1.1
+// correction 2 restated: "seeded when the CPU got around to noticing" is a
+// scheduling-dependent outcome the moment a kernel reads it. Primitives that do
+// not clear that bar carry CPRIM_F_SIM clear and reach the renderer only.
+fn currentAtQ(p : vec3<i32>, T : ptr<uniform, TickParams>) -> vec3<i32> {
+  if ((*T).currentMode == 0u) { return vec3<i32>(0, 0, 0); }
+  if ((*T).currentPrimCount == 0u) { return vec3<i32>(0); }
+  if (any(p < (*T).currentPrimLo) || any(p > (*T).currentPrimHi)) {
+    return vec3<i32>(0);
+  }
+  var acc = vec3<i32>(0);
+  let n = min((*T).currentPrimCount, CURRENT_PRIM_CAP);
+  for (var i = 0u; i < n; i = i + 1u) {
+    let b = i * CURRENT_PRIM_ROWS;
+    let w0 = (*T).currentPrims[b];
+    // Only primitives the CPU can defend as a pure function of the tick stream
+    // reach a kernel. See the authority note above.
+    if (((u32(w0.w) >> CPRIM_F_SHIFT) & CPRIM_F_SIM) == 0u) { continue; }
+    acc += currentPrimEvalQ(p, w0, (*T).currentPrims[b + 1u],
+                            (*T).currentPrims[b + 2u]);
+  }
+  return acc;
 }
 
 // ---- particles: voxels in flight (DESIGN.md §5) ----

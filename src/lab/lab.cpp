@@ -74,18 +74,47 @@ constexpr int kPondChamberTop = kPondSurf - kPondDepth - 12;   // 89
 constexpr int kPondChamberLo = kPondChamberTop - kChamberH + 1;
 
 // `worldlake` uses the authored lake in worldgen.wgsl genColumn: a disc at
-// (420,420) of radius 68 whose terrain is flattened to poolY = 44 and filled
-// to poolY + 24 = 68. ~348,600 water voxels (a cylinder, not a bowl — bigger
+// (420,420) of radius vlen(68) whose terrain is flattened to poolY and filled
+// to poolY + vlen(24). ~348,600 water voxels (a cylinder, not a bowl — bigger
 // than any generated pond of the same radius). It is authored rather than
 // hash-placed, so it is at a KNOWN address in every seed, which is what makes
 // the main-world arm of this measurement a scripted, repeatable run instead
 // of a description of somebody flying around.
-constexpr int kLakeCX = 420, kLakeCZ = 420;
-constexpr int kLakeR = 68;
-constexpr int kLakeFloor = 44;        // poolY: terrain top inside the disc
-constexpr int kLakeSurf = 68;         // poolY + 24
-constexpr int kLakeChamberTop = 31;
-constexpr int kLakeChamberLo = kLakeChamberTop - kChamberH + 1;   // 12
+//
+// DERIVED, never literals. `poolY` is `worldgen.spawnPlainY - vlen(15)` and
+// the terrain overhaul has already moved `spawnPlainY` once (44 -> 200), which
+// carried the lake from y 44..68 to y 185..209. These constants were baked at
+// the OLD datum, so the audit box, the plug shaft and the sealed drain chamber
+// all sat ~141 voxels of solid rock BELOW the water: every `worldlake` arm of
+// `--fluid-bench` reported `plug pulled: 0 eighths standing`, and the three
+// worldlake rows of PLAN_water_master §1's baseline table became
+// unreproducible. `World::AuthoredPoolList` is the one authority for where
+// that lake is (the `waterbody` gate reads the same list); ask it instead.
+// Recomputed on every call rather than cached: tuning is loaded — and, in the
+// bench, re-set per run — after static init.
+struct LakeGeom {
+  int cx, cz, r;
+  int floorY;       // poolY: the flat terrain top inside the disc
+  int surfY;        // the fill level; water occupies (floorY, surfY]
+  int chamberTop;   // drain chamber roof, buried under the lake floor
+  int chamberLo;
+};
+LakeGeom Lake() {
+  World::AuthoredPool pools[World::kAuthoredPools];
+  World::AuthoredPoolList(pools);
+  const World::AuthoredPool& w = pools[0];   // basin 0 is the water lake
+  LakeGeom g{};
+  g.cx = w.cx;
+  g.cz = w.cz;
+  g.r = w.r;
+  g.floorY = w.floorY;
+  g.surfY = w.waterY;
+  // Same 13-voxel rock plug under the floor the old literals described
+  // (44 -> 31); the chamber then hangs kChamberH below its roof.
+  g.chamberTop = g.floorY - 13;
+  g.chamberLo = g.chamberTop - kChamberH + 1;
+  return g;
+}
 
 // The hill ramp: solid up to `G + 19 - drop(x)` for ramp x-offsets 0..31.
 // (dx*3)/5 steps 1 voxel down every 1-2 columns — a stepped ~31 deg slope,
@@ -364,10 +393,11 @@ void LabSceneCamera(int scene, Vec3& eye, float& yaw, float& pitch) {
     // dimple at once.
     case kLabPond:
     case kLabWorldLake: {
-      const float r = (float)(scene == kLabPond ? sPondRadius : kLakeR);
-      const float cx = (float)(scene == kLabPond ? CX : kLakeCX);
-      const float cz = (float)(scene == kLabPond ? CZ : kLakeCZ);
-      const float surf = (float)(scene == kLabPond ? kPondSurf : kLakeSurf);
+      const LakeGeom L = Lake();
+      const float r = (float)(scene == kLabPond ? sPondRadius : L.r);
+      const float cx = (float)(scene == kLabPond ? CX : L.cx);
+      const float cz = (float)(scene == kLabPond ? CZ : L.cz);
+      const float surf = (float)(scene == kLabPond ? kPondSurf : L.surfY);
       const float k = 1.5f * r * 0.70710678f;
       eye = {cx - k, surf + 0.9f * r, cz - k};
       target = {cx, surf - 4.0f, cz};
@@ -435,14 +465,15 @@ uint32_t LabScenePlugTick(int scene) {
 void LabScenePlugOps(int scene, std::vector<CellOp>& out) {
   if (scene != kLabPond && scene != kLabWorldLake) return;
   const bool pond = scene == kLabPond;
-  const int cx = pond ? CX : kLakeCX;
-  const int cz = pond ? CZ : kLakeCZ;
+  const LakeGeom L = Lake();
+  const int cx = pond ? CX : L.cx;
+  const int cz = pond ? CZ : L.cz;
   // Shaft: from the cell just under the body's floor down to the chamber.
   const int shaftTop = pond ? kPondSurf - kPondDepthRim -
                                   (kPondDepth - kPondDepthRim)   // bowl centre
-                            : kLakeFloor;
-  const int chamberTop = pond ? kPondChamberTop : kLakeChamberTop;
-  const int chamberLo = pond ? kPondChamberLo : kLakeChamberLo;
+                            : L.floorY;
+  const int chamberTop = pond ? kPondChamberTop : L.chamberTop;
+  const int chamberLo = pond ? kPondChamberLo : L.chamberLo;
   for (int y = chamberTop + 1; y <= shaftTop; y++)
     for (int z = cz - kDrainHalf; z <= cz + kDrainHalf; z++)
       for (int x = cx - kDrainHalf; x <= cx + kDrainHalf; x++)
@@ -541,10 +572,12 @@ void LabSceneBounds(int scene, IVec3& lo, IVec3& hi) {
       hi = {CX + r + 2, G + 2, CZ + r + 2};
       return;
     }
-    case kLabWorldLake:
-      lo = {kLakeCX - kLakeR - 4, kLakeChamberLo - 2, kLakeCZ - kLakeR - 4};
-      hi = {kLakeCX + kLakeR + 4, kLakeSurf + 4, kLakeCZ + kLakeR + 4};
+    case kLabWorldLake: {
+      const LakeGeom L = Lake();
+      lo = {L.cx - L.r - 4, L.chamberLo - 2, L.cz - L.r - 4};
+      hi = {L.cx + L.r + 4, L.surfY + 4, L.cz + L.r + 4};
       return;
+    }
   }
   lo = {0, 0, 0};
   hi = {0, 0, 0};
@@ -848,10 +881,11 @@ int RunFluidBench(GpuContext& ctx, World& world, Simulation& sim,
     // The CPU mirror follows this chunk; it must sit on the body being
     // measured or the mirror-fed paths (and the streaming wake) look at the
     // wrong half of the world.
+    const LakeGeom lake = Lake();
     const IVec3 pc =
         scene == kLabWorldLake
-            ? IVec3{kLakeCX / (int)kChunk, kLakeSurf / (int)kChunk,
-                    kLakeCZ / (int)kChunk}
+            ? IVec3{lake.cx / (int)kChunk, lake.surfY / (int)kChunk,
+                    lake.cz / (int)kChunk}
             : IVec3{CX / (int)kChunk, G / (int)kChunk, CZ / (int)kChunk};
 
     // ---- the standing-water sweep, hoisted -------------------------------
@@ -871,10 +905,10 @@ int RunFluidBench(GpuContext& ctx, World& world, Simulation& sim,
     // is not a drain. Counted as a subtotal of the same sweep — the chamber is
     // inside the audit box already (LabSceneBounds reaches kPondChamberLo).
     const bool hasChamber = scene == kLabPond || scene == kLabWorldLake;
-    const int chCx = scene == kLabPond ? CX : kLakeCX;
-    const int chCz = scene == kLabPond ? CZ : kLakeCZ;
-    const int chLo = scene == kLabPond ? kPondChamberLo : kLakeChamberLo;
-    const int chHi = scene == kLabPond ? kPondChamberTop : kLakeChamberTop;
+    const int chCx = scene == kLabPond ? CX : lake.cx;
+    const int chCz = scene == kLabPond ? CZ : lake.cz;
+    const int chLo = scene == kLabPond ? kPondChamberLo : lake.chamberLo;
+    const int chHi = scene == kLabPond ? kPondChamberTop : lake.chamberTop;
     auto inChamber = [&](int x, int y, int z) {
       return y >= chLo && y <= chHi && x >= chCx - kChamberHalf &&
              x <= chCx + kChamberHalf && z >= chCz - kChamberHalf &&
@@ -1234,8 +1268,8 @@ int RunFluidBench(GpuContext& ctx, World& world, Simulation& sim,
     // guess. Two columns: the one directly over the drain, and one 8 voxels
     // out, which is where a lateral trigger would have to act.
     if (plugTick != 0) {
-      const int cx = scene == kLabPond ? CX : kLakeCX;
-      const int cz = scene == kLabPond ? CZ : kLakeCZ;
+      const int cx = scene == kLabPond ? CX : lake.cx;
+      const int cz = scene == kLabPond ? CZ : lake.cz;
       IVec3 blo, bhi;
       LabSceneBounds(scene, blo, bhi);
       std::vector<uint32_t> cbuf((size_t)kChunkVol);

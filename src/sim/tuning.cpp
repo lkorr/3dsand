@@ -236,6 +236,9 @@ bool SetSimField(Tuning& t, const std::string& name, float value) {
     {"drainMaxEighthsPerTick", &Tuning::Sim::drainMaxEighthsPerTick},
     {"drainExciteRadius", &Tuning::Sim::drainExciteRadius},
     {"windMode", &Tuning::Sim::windMode},
+    {"currentMode", &Tuning::Sim::currentMode},
+    {"currentVortexRadius", &Tuning::Sim::currentVortexRadius},
+    {"currentStreamMinSlope", &Tuning::Sim::currentStreamMinSlope},
   };
   for (const auto& e : iFields) {
     if (name == e.n) { s.*(e.p) = (int)value; return true; }
@@ -274,6 +277,11 @@ bool SetSimField(Tuning& t, const std::string& name, float value) {
     {"windDragRef", &Tuning::Sim::windDragRef},
     {"fluidAttractSame", &Tuning::Sim::fluidAttractSame},
     {"fluidAttractDiff", &Tuning::Sim::fluidAttractDiff},
+    {"currentVortexGamma", &Tuning::Sim::currentVortexGamma},
+    {"currentVortexDecay", &Tuning::Sim::currentVortexDecay},
+    {"currentSinkSpeed", &Tuning::Sim::currentSinkSpeed},
+    {"currentStreamScale", &Tuning::Sim::currentStreamScale},
+    {"currentDrag", &Tuning::Sim::currentDrag},
   };
   for (const auto& e : fFields) {
     if (name == e.n) { s.*(e.p) = value; return true; }
@@ -838,6 +846,16 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadF(*g, "windPartScale", s.windPartScale, out, at);
     ReadF(*g, "windDragRef", s.windDragRef, out, at);
     ReadI(*g, "windWakeChunks", s.windWakeChunks, out, at);
+    // The current field (plan component 8). CPU-side by design —
+    // the shader reads resolved primitives, never a knob.
+    ReadI(*g, "currentMode", s.currentMode, out, at);
+    ReadF(*g, "currentVortexGamma", s.currentVortexGamma, out, at);
+    ReadF(*g, "currentVortexDecay", s.currentVortexDecay, out, at);
+    ReadI(*g, "currentVortexRadius", s.currentVortexRadius, out, at);
+    ReadF(*g, "currentSinkSpeed", s.currentSinkSpeed, out, at);
+    ReadF(*g, "currentStreamScale", s.currentStreamScale, out, at);
+    ReadI(*g, "currentStreamMinSlope", s.currentStreamMinSlope, out, at);
+    ReadF(*g, "currentDrag", s.currentDrag, out, at);
     // MLS-MPM fluid: HUMAN units in the JSON (voxels/s², (vox/s)², vox²/s,
     // seconds), converted to Q16.16-per-tick at shader compile time
     // (sim_fluid.wgsl's const block). These clamps keep the CONVERTED values
@@ -947,6 +965,31 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     if (s.fluidExcitePerch < 0 || s.fluidExcitePerch > 1) {
       out.warnings.push_back("sim.fluidExcitePerch out of 0..1; clamped");
       s.fluidExcitePerch = s.fluidExcitePerch < 0 ? 0 : 1;
+    }
+    // ---- the current field (plan component 8) ----
+    // The bounds are the shader's overflow audit expressed in human units:
+    // kCurrentPrimMaxSpeed is 200 cells/s = 20 m/s, and kCurrentPrimMaxExtent
+    // is what every intermediate in currentPrimEvalQ is bounded against.
+    if (s.currentMode < 0 || s.currentMode > 1) {
+      out.warnings.push_back("sim.currentMode out of 0..1; clamped");
+      s.currentMode = s.currentMode < 0 ? 0 : 1;
+    }
+    clampWarnF(s.currentVortexGamma, 0.0f, 400.0f, "currentVortexGamma");
+    // A decay of zero is the bug plan component 8 names outright — a funnel
+    // standing open in still water — so the floor is a real number, not 0.
+    clampWarnF(s.currentVortexDecay, 0.05f, 120.0f, "currentVortexDecay");
+    clampWarnF(s.currentSinkSpeed, 0.0f, 20.0f, "currentSinkSpeed");
+    clampWarnF(s.currentStreamScale, 0.0f, 20.0f, "currentStreamScale");
+    clampWarnF(s.currentDrag, 0.0f, 30.0f, "currentDrag");
+    if (s.currentVortexRadius < 4 ||
+        s.currentVortexRadius > kCurrentPrimMaxExtent) {
+      out.warnings.push_back("sim.currentVortexRadius out of 4..512; clamped");
+      s.currentVortexRadius =
+          s.currentVortexRadius < 4 ? 4 : kCurrentPrimMaxExtent;
+    }
+    if (s.currentStreamMinSlope < 0 || s.currentStreamMinSlope > 4096) {
+      out.warnings.push_back("sim.currentStreamMinSlope out of 0..4096; clamped");
+      s.currentStreamMinSlope = s.currentStreamMinSlope < 0 ? 0 : 4096;
     }
     // ---- water bodies (docs/PLAN_water_master.md) ----
     if (s.waterBodyMode < 0 || s.waterBodyMode > 1) {
@@ -1309,6 +1352,9 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     auto& r = out.render;
     const std::string at = "render";
     ReadF(*g, "skyGradient", r.skyGradient, out, at);
+    ReadB(*g, "dbgCurrentField", r.dbgCurrentField, out, at);
+    ReadF(*g, "dbgCurrentSpacing", r.dbgCurrentSpacing, out, at);
+    ReadF(*g, "dbgCurrentRadius", r.dbgCurrentRadius, out, at);
     ReadF(*g, "skyHorizonOffset", r.skyHorizonOffset, out, at);
     ReadV3(*g, "skyHorizon", r.skyHorizon, out, at);
     ReadV3(*g, "skyZenith", r.skyZenith, out, at);

@@ -165,17 +165,22 @@ void WaterBodySystem::Reset() {
   basins_.clear();
   curves_.clear();
   bodies_.clear();
+  children_.clear();
+  curveDirtyUntil_.clear();
   chunkBody_.assign(kNumChunks, 0u);
   builtOrigin_ = IVec3{1 << 30, 1 << 30, 1 << 30};
   builtSeed_ = 0;
   straddles_ = 0;
   outOfWindow_ = 0;
   drainHotUntil_ = 0;
+  holeHints_.clear();
   gpu_.bodies.clear();
   gpu_.chunks.clear();
   gpu_.bodyCount = 0;
   gpu_.writesThisTick = false;
   gpu_.drainArmed = false;
+  gpu_.sweepSlot = kWaterBodyCap;
+  gpu_.sweepLevel = 0;
 }
 
 void WaterBodySystem::RebuildBasins(const World& world, uint32_t seed) {
@@ -261,6 +266,7 @@ void WaterBodySystem::Relabel(const World& world) {
   chunkBody_.assign(kNumChunks, 0u);
   straddles_ = 0;
   bodies_.assign(basins_.size(), WaterBodyDesc{});
+  children_.clear();
 
   for (size_t i = 0; i < basins_.size(); i++) {
     const WaterBasin& b = basins_[i];
@@ -341,6 +347,11 @@ void WaterBodySystem::Classify(const World& world, uint32_t tick) {
     d.surfaceArea = WaterBasinAreaAt(curves_[i], d.level);
     d.volumeEighths = WaterBasinVolumeEighths(curves_[i], d.level);
     d.matId = WaterMatId(basins_[i].matName);
+    // M5, component 10's CHEAP DETECTION, refreshed from the latch the tick
+    // stream sets. A dirty curve is the ONLY thing that makes a basin propose a
+    // split child or take a slot in the sweep schedule, so this one boolean is
+    // where the whole feature's idle cost goes to zero.
+    d.curveDirty = CurveDirty(d.basinId);
   }
 
   // ---- pass 2: the ladder, biggest body first -----------------------------
@@ -452,6 +463,46 @@ void WaterBodySystem::Classify(const World& world, uint32_t tick) {
     d.gpuSlot = proposed++;
     chunkBudget -= (uint32_t)d.chunks.size();
   }
+
+  // ---- M5: THE SPLIT CHILDREN (component 10) -----------------------------
+  //
+  // A basin someone has DUG IN gets a second body proposed over the same disc,
+  // flagged WBF_CHILD with component index 1. It owns no cells until the GPU's
+  // sweep finds the wet region disconnected at the live level and publishes a
+  // two-component map; until then its reduce measures zero and the ladder
+  // refuses it for volume. So this costs a GPU slot and a copy of the chunk
+  // list, and it costs them ONLY while somebody is digging in a lake.
+  //
+  // WHY THE CPU PROPOSES A BODY IT CANNOT SEE THE NEED FOR: the split is a GPU
+  // fact, derived from a level and a voxel scan the GPU owns, and the only way
+  // the CPU could learn it is a readback arriving on fence retirement — which
+  // is section 1.1's correction 2, the hazard M1 recorded and M2 closed. The
+  // authority split is reused verbatim: the CPU proposes on tick-deterministic
+  // inputs ("was this basin dug in?"), the GPU disposes ("is it two pools?").
+  //
+  // A SECOND PASS, after every parent has its slot, and deliberately: children
+  // must not push a parent past the cap, because an unproposed PARENT is a
+  // whole lake handed back to the CA to buy a pool that may never exist.
+  for (size_t oi = 0; oi < order.size() && kWaterBodyChildren > 0; oi++) {
+    const size_t i = order[oi];
+    const WaterBodyDesc& d = bodies_[i];
+    if (d.state != WaterBodyState::Proposed || !d.curveDirty) continue;
+    if (d.gpuSlot >= kWaterBodyCap) continue;
+    if (proposed >= (uint32_t)std::clamp(s.waterBodyMaxCount, 0,
+                                         (int)kWaterBodyCap))
+      continue;
+    if (d.chunks.size() > chunkBudget) continue;   // rule 2, charged first
+    WaterBodyDesc c = d;
+    c.isChild = true;
+    c.childOf = d.gpuSlot;
+    c.component = 1;
+    c.curveDirty = false;
+    c.refusal = WaterBodyRefusal::None;
+    c.state = WaterBodyState::Proposed;
+    c.gpuSlot = proposed++;
+    chunkBudget -= (uint32_t)c.chunks.size();
+    children_.push_back(std::move(c));
+  }
 }
 
 // ---- the CPU->GPU payload --------------------------------------------------
@@ -466,11 +517,16 @@ void WaterBodySystem::BuildGpu(uint32_t tick, int testDrain, int drainMax) {
   gpu_.bodyCount = 0;
   gpu_.writesThisTick = false;
   gpu_.drainArmed = false;
+  gpu_.sweepSlot = kWaterBodyCap;
+  gpu_.sweepLevel = 0;
 
   // Slot order, not registry order: the GPU indexes by slot and the ledger it
   // carries belongs to whatever body held that slot last tick.
   const WaterBodyDesc* bySlot[kWaterBodyCap] = {};
   for (const WaterBodyDesc& d : bodies_) {
+    if (d.gpuSlot < kWaterBodyCap) bySlot[d.gpuSlot] = &d;
+  }
+  for (const WaterBodyDesc& d : children_) {
     if (d.gpuSlot < kWaterBodyCap) bySlot[d.gpuSlot] = &d;
   }
   uint32_t n = 0;
@@ -496,6 +552,14 @@ void WaterBodySystem::BuildGpu(uint32_t tick, int testDrain, int drainMax) {
     // paying off its debit) and it is on its way out.
     row[7] = d.state == WaterBodyState::Releasing ? 3
                                                   : (d.state == WaterBodyState::Proposed ? 1 : 0);
+    // M5: the component this body governs (bits 2..3), whether it is a split
+    // CHILD (bit 4) and, if so, its parent's slot (bits 8..15). Zero for every
+    // body M2/M3/M4 ever proposed, which is what makes the split machinery an
+    // exact identity on a lake nobody has dug into — wbOwns collapses to the
+    // disc test it replaced.
+    row[7] |= (int32_t)((d.component & 3u) << 2);
+    if (d.isChild)
+      row[7] |= 16 | (int32_t)((d.childOf & 0xFFu) << 8);
     for (uint32_t slot : d.chunks) {
       if (gpu_.chunks.size() >= kWaterChunkCap) break;   // Classify charged this
       gpu_.chunks.push_back((k << 16) | (slot & 0xFFFFu));
@@ -531,16 +595,138 @@ void WaterBodySystem::BuildGpu(uint32_t tick, int testDrain, int drainMax) {
       (testDrain > 0 && !gpu_.chunks.empty()) || gpu_.drainArmed ||
       (drainMax > 0 && tick < drainHotUntil_ + kWaterDrainSettleTicks &&
        !gpu_.chunks.empty());
+
+  // ---- M5: THE SWEEP SCHEDULE (plan section 3.4) -------------------------
+  //
+  // Every input below is the tick or a pure function of (seed, window, tuning).
+  // Nothing here asks what arrived, what changed, or what the CPU noticed —
+  // plan section 3.4 in one sentence, and `--gate waterbody` pass F is the gate
+  // on it:
+  //
+  //   > Any work spread over ticks must be scheduled as `id % N == tick % N`,
+  //   > never "when the CPU got around to it." A re-derive "when convenient" is
+  //   > a scheduling-dependent outcome and breaks rule 1 through the back door.
+  //
+  // The rotation is over the DIRTY parents only, in slot order, so the
+  // eligible set is itself a deterministic function of the registry. `id % N`
+  // literally would have been worse rather than purer: with period 4 and 64
+  // slots, slots 0, 4, 8 ... all match on the same tick and only the first
+  // would ever sweep.
+  //
+  // TWO KINDS OF STEP, alternating. The odd steps walk a CURSOR down the
+  // basin's Y span and are what build the area table and the merge tree. The
+  // even steps ask for the LIVE level (kWaterSweepLive) and are what keep the
+  // active split map next to the surface the shave is actually working —
+  // during a drain the level moves faster than a cursor crossing 26 levels can
+  // follow, so a cursor-only schedule would publish a map for a level the water
+  // left ten seconds ago.
+  if (tick % kWaterSweepPeriod != 0) return;
+  std::vector<uint32_t> dirty;
+  for (uint32_t k = 0; k < n; k++) {
+    const WaterBodyDesc* d = bySlot[k];
+    if (d && !d->isChild && d->curveDirty &&
+        d->state == WaterBodyState::Proposed)
+      dirty.push_back(k);
+  }
+  if (dirty.empty()) return;
+  const uint32_t cycle = tick / kWaterSweepPeriod;
+  const uint32_t sel = cycle % (uint32_t)dirty.size();
+  const uint32_t slot = dirty[sel];
+  const WaterBodyDesc* d = bySlot[slot];
+  const WaterBasin* b = Basin(d->basinId);
+  if (!b) return;
+  const uint32_t step = cycle / (uint32_t)dirty.size();
+  gpu_.sweepSlot = slot;
+  if ((step & 1u) == 0u) {
+    gpu_.sweepLevel = kWaterSweepLive;
+  } else {
+    const int span = std::clamp(b->spillY - b->floorY, 1, (int)kWaterCurveMaxY);
+    gpu_.sweepLevel = b->floorY + 1 + (int)((step >> 1) % (uint32_t)span);
+  }
 }
 
 void WaterBodySystem::Tick(const World& world, uint32_t seed, uint32_t tick,
                            int mode, int testDrain, int drainMax,
-                           bool worldEdited) {
+                           bool worldEdited, IVec3 editCell) {
   mode_ = mode;
   // The hot latch (see waterbody.h). Set from the tick input stream only, so a
   // replay reproduces it and the twice-run determinism gate compares it.
   if (mode != 0 && drainMax > 0 && worldEdited)
     drainHotUntil_ = tick + kWaterDrainHotTicks;
+  // THE HOLE HINT (component 8's drain seeder). Recorded from the same tick-
+  // stream signal on the same tick, against LAST tick's labelling — which is
+  // the labelling the caller's own `worldEdited` test used, so the two cannot
+  // disagree about which body was dug into. Expired on the same window the
+  // latch runs on: a swirl must not outlive the dig by longer than the drain
+  // could have.
+  if (mode != 0) {
+    // M5: forget a dig whose window has closed, on the same cadence and for
+    // the same reason the hole hints expire — a basin that is no longer being
+    // re-derived stops proposing a split child, which is what returns its idle
+    // cost to zero.
+    curveDirtyUntil_.erase(
+        std::remove_if(curveDirtyUntil_.begin(), curveDirtyUntil_.end(),
+                       [&](const std::pair<uint32_t, uint32_t>& e) {
+                         return tick >= e.second;
+                       }),
+        curveDirtyUntil_.end());
+    holeHints_.erase(
+        std::remove_if(holeHints_.begin(), holeHints_.end(),
+                       [&](const WaterBodyHole& h) {
+                         return tick >= h.tick + kWaterDrainHotTicks;
+                       }),
+        holeHints_.end());
+    if (worldEdited && chunkBody_.size() == kNumChunks &&
+        world.ChunkInWindow({editCell.x >> 4, editCell.y >> 4,
+                             editCell.z >> 4})) {
+      const uint32_t slot = World::SlotChunkIndex(
+          {editCell.x >> 4, editCell.y >> 4, editCell.z >> 4});
+      const uint32_t bi = slot < kNumChunks ? chunkBody_[slot] : 0u;
+      if (bi != 0 && bi - 1 < bodies_.size()) {
+        // ---- M5: COMPONENT 10's CHEAP DETECTION ------------------------
+        //
+        // A mutation landed in a chunk this basin LABELLED, so the container
+        // may have changed: a shaft bored through the floor, a partition
+        // raised, a rim notched, a cavern opened under the bed. That is the
+        // whole trigger the plan asks for — "detect the POSSIBILITY cheaply, a
+        // mutation touched a rim chunk of a labelled basin, then schedule the
+        // re-derive over N ticks" — and it costs one vector lookup on a tick
+        // where a mutation already happened.
+        //
+        // A LATCH, not a per-tick test, for the frame-local-value gotcha's
+        // reason and the drain latch's: the dig is one tick and its
+        // consequences are minutes. It shares kWaterDrainHotTicks with the
+        // drain window because the two describe the same event, and a curve
+        // that stopped being re-derived while its lake was still draining
+        // would go stale in exactly the case the re-derive exists for.
+        const uint32_t basinId = bodies_[bi - 1].basinId;
+        bool haveDirty = false;
+        for (auto& e : curveDirtyUntil_) {
+          if (e.first != basinId) continue;
+          e.second = tick + kWaterDrainHotTicks;
+          haveDirty = true;
+          break;
+        }
+        if (!haveDirty)
+          curveDirtyUntil_.push_back({basinId, tick + kWaterDrainHotTicks});
+        WaterBodyHole h;
+        h.valid = true;
+        h.basinId = bodies_[bi - 1].basinId;
+        h.x = editCell.x;
+        h.y = editCell.y;
+        h.z = editCell.z;
+        h.tick = tick;
+        bool found = false;
+        for (WaterBodyHole& e : holeHints_) {
+          if (e.basinId != h.basinId) continue;
+          e = h;
+          found = true;
+          break;
+        }
+        if (!found) holeHints_.push_back(h);
+      }
+    }
+  }
   if (mode == 0) {
     // THE OFF SWITCH, and it is an early-out rather than a flag consulted
     // later. Nothing is built, nothing is labelled, nothing is classified — so
@@ -599,6 +785,24 @@ uint32_t WaterBodySystem::ProposedCount() const {
   for (const auto& d : bodies_)
     if (d.state == WaterBodyState::Proposed) n++;
   return n;
+}
+
+WaterBodyHole WaterBodySystem::HoleHint(uint32_t basinId) const {
+  for (const WaterBodyHole& h : holeHints_)
+    if (h.basinId == basinId) return h;
+  return WaterBodyHole{};
+}
+
+const WaterBodyDesc* WaterBodySystem::FindChild(uint32_t basinId) const {
+  for (const auto& d : children_)
+    if (d.basinId == basinId) return &d;
+  return nullptr;
+}
+
+bool WaterBodySystem::CurveDirty(uint32_t basinId) const {
+  for (const auto& e : curveDirtyUntil_)
+    if (e.first == basinId) return true;
+  return false;
 }
 
 const WaterBodyDesc* WaterBodySystem::Find(uint32_t basinId) const {

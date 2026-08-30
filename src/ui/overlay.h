@@ -424,6 +424,14 @@ struct UIState {
     bool pending = false;
     KitRef from, to;
   } moveItem;
+  // A drag that landed on NOTHING — dropped outside every panel. The one
+  // gesture the move latch cannot express, because it has no destination
+  // KitRef: this says "put it on the floor" and main.cpp turns it into a real
+  // debris body (game/worlditems.h).
+  struct DropIntent {
+    bool pending = false;
+    KitRef from;
+  } dropItem;
   // A glyph dropped on a bound slot, BY NAME rather than by library index:
   // glyph indices are file-order dependent and die on every R reload, and a
   // latch that survives one frame can easily straddle one.

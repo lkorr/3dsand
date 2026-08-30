@@ -348,6 +348,21 @@ limb kills (`MobLimbDef::vital`, `mob.h:35`).
 
 ### Package D — armour and clothing
 
+**LANDED 2026-08-29.** Built as `docs/PLAN_items_equipment.md`, which supersedes
+this section; DESIGN.md §8c is the architecture of record. The prediction below
+held: a shell is a rig part, so per-voxel burning and dissolving arrived with no
+armour-specific fire code, and `--gate armor-react` measures 114 skin voxels
+lost bare against 0 under a steel plate purely from `steel` not carrying
+`tag:dissolvable`.
+
+One thing this section did NOT anticipate, and it is the interesting part. "The
+world reaches the body" is a question the burn pass asks about the WORLD, and a
+shell is in neither the grid nor the body's lattice — so fire lapping at a
+sleeve read to the arm underneath exactly as fire lapping at the arm. Occlusion
+(`Mob::WornAlong`) is the one genuinely new mechanic armour needed, it has to be
+asked along a segment rather than at a point, and it only works for limbs
+thicker than a grid cell. See §8c.
+
 **Do this last. It is genuinely modular and it genuinely benefits from being
 second.**
 

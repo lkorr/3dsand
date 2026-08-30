@@ -1,8 +1,6 @@
 {
-  "comment": "Items are CONTENT, like materials.json and glyphs.json — not look-and-feel knobs like tuning.json. This file holds an item's BEHAVIOUR: its id, the kind the engine switches on, and its damage numbers. THE ART IS NOT HERE, and it is not part of any creature either: each item owns <id>.vox plus an <id>.json sidecar carrying its grip and its cutting edge. A held item BORROWS a rig slot, so while worn it is a real rig part — severable with the arm, droppable as debris, carvable per voxel — but its geometry has its own origin, so a weapon can never inflate the box of the body holding it. That was a real bug: as a rig prop the sword reached 30 micro outside mina's prefab box and drew her body offset from her own arm. Hot-reloads on R alongside materials and glyphs.",
-
+  "comment": "Items are CONTENT, like materials.json and glyphs.json \u00e2\u20ac\u201d not look-and-feel knobs like tuning.json. This file holds an item's BEHAVIOUR: its id, the kind the engine switches on, and its damage numbers. THE ART IS NOT HERE, and it is not part of any creature either: each item owns <id>.vox plus an <id>.json sidecar carrying its grip and its cutting edge. A held item BORROWS a rig slot, so while worn it is a real rig part \u00e2\u20ac\u201d severable with the arm, droppable as debris, carvable per voxel \u00e2\u20ac\u201d but its geometry has its own origin, so a weapon can never inflate the box of the body holding it. That was a real bug: as a rig prop the sword reached 30 micro outside mina's prefab box and drew her body offset from her own arm. Hot-reloads on R alongside materials and glyphs.",
   "kinds": "melee = swung, and cuts along the `edge` segment its own sidecar declares (see scripts/gen_sword_item.py). The blade geometry is what decides the wound; `carveBonus` only widens it.",
-
   "items": [
     {
       "id": "sword",
@@ -11,6 +9,26 @@
       "carveBonus": 0.15,
       "reach": 9.0,
       "desc": "A straight double-edged arming sword. Held point-up; it cuts with the length of its blade, so where you land it is where the wound opens."
+    },
+    {
+      "id": "hood",
+      "kind": "armor_head",
+      "desc": "A deep cloth cowl. It keeps the rain off and catches fire readily; what it will not do is stop a blade."
+    },
+    {
+      "id": "robe",
+      "kind": "armor_chest",
+      "desc": "A heavy black robe, sleeves to the wrist and a skirt to the knee. Cloth over skin: fire reaches the cloth first."
+    },
+    {
+      "id": "sash",
+      "kind": "armor_belt",
+      "desc": "A gold-shot band worn at the waist, over the robe."
+    },
+    {
+      "id": "boots",
+      "kind": "armor_boots",
+      "desc": "Cut leather, slow to catch. Better against a spill than against a fire."
     }
   ]
 }

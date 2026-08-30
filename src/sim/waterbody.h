@@ -235,6 +235,30 @@ struct WaterBodyDesc {
   // place a name becomes a number (design guideline #4: author by name, resolve
   // at the consumer's boundary).
   uint32_t matId = 0;
+  // ---- M5: the split child (component 10) --------------------------------
+  //
+  // A basin someone has DUG IN proposes a second body over the same disc,
+  // flagged WBF_CHILD with component index 1. It owns nothing until the GPU's
+  // sweep finds the basin's wet region disconnected at the live level and
+  // publishes a two-component map; until then its reduce measures zero, the
+  // ladder refuses it for volume, and it costs one GPU slot and one copy of the
+  // chunk list. So a lake nobody has touched proposes no child at all and pays
+  // exactly what it paid at M4.
+  //
+  // WHY THE CPU PROPOSES A BODY IT CANNOT SEE THE NEED FOR. The split is a GPU
+  // fact — it comes from a level and a voxel scan the GPU owns — and the CPU
+  // could only learn it through a readback, which is §1.1 correction 2 all over
+  // again. So the authority split M2 established is reused verbatim: the CPU
+  // proposes on tick-deterministic inputs (was this basin dug in?), the GPU
+  // disposes (is it actually two pools?).
+  uint32_t childOf = kNoGpuSlot;   // parent GPU slot, for a child descriptor
+  uint32_t component = 0;          // which component of the split map is mine
+  bool isChild = false;
+  // Set when a mutation lands in a chunk this basin labelled: the cheap
+  // detection of the POSSIBILITY that the container changed (plan component
+  // 10). Sticky for kWaterDrainHotTicks, like the drain latch and for the same
+  // reason — a dig is one tick and its consequences are minutes.
+  bool curveDirty = false;
   // Slot in the GPU ledger, or kNoGpuSlot. Assigned in proposal order and
   // STABLE across ticks for as long as the body stays proposed, because the
   // ledger it indexes is carried state: a body that changed slots would inherit
@@ -245,6 +269,26 @@ struct WaterBodyDesc {
   std::vector<uint32_t> chunks;
   // Inclusive world-cell AABB of the basin's water. The bound on everything.
   IVec3 lo{0, 0, 0}, hi{-1, -1, -1};
+};
+
+// THE HOLE HINT (component 8's drain seeder, docs/PLAN_water_master.md M4).
+//
+// Where the MUTATION that armed this body's drain window happened, and on which
+// tick. It is deliberately NOT the ledger's hole (`WBS_HOLEKEY`): that is a GPU
+// fact derived from a level the GPU owns, and the only way the CPU could learn
+// it is a readback arriving on a schedule set by fence retirement — which is
+// M1's §1.1 correction 2, and would put scheduling inside the input of a field
+// a sim kernel reads.
+//
+// What the CPU knows on the TICK INPUT STREAM is the dig, and a dig is where
+// the hole is. So this is exact in the case that matters (a player boring a
+// shaft), approximate in the case that does not (which of several digs the
+// ledger picked as deepest), and free.
+struct WaterBodyHole {
+  bool valid = false;
+  uint32_t basinId = 0;
+  int32_t x = 0, y = 0, z = 0;
+  uint32_t tick = 0;   // the tick the mutation arrived on
 };
 
 // ---- component 2, the analytic half ---------------------------------------
@@ -324,6 +368,23 @@ struct WaterBodyGpu {
   // declared the way entrainment's are, or the writes land in JITTER sentinels
   // and voxStore counts page faults instead of draining a lake.
   bool writesThisTick = false;
+  // ---- M5: THE SCHEDULED RE-DERIVE (components 2 case 2 + 10) ------------
+  //
+  // Which GPU slot's container curve is being re-derived this tick, and at
+  // which world Y. `kWaterBodyCap` means NOTHING IS SCHEDULED, which is the
+  // state of every basin nobody has dug into, and it is what makes the two
+  // sweep pass rows unrecorded (C_WATERSWEEP).
+  //
+  // BOTH ARE PURE FUNCTIONS OF THE TICK, and that is the entire rule-1 argument
+  // for this milestone. The body is picked by `slot % kWaterSweepPeriod ==
+  // tick % kWaterSweepPeriod` and the level by a cursor derived from
+  // `tick / kWaterSweepPeriod` — never "the one the CPU noticed had changed",
+  // never "the one whose readback arrived". `--gate waterbody` pass F is the
+  // gate on exactly this, and plan §3.4 is blunt about the alternative: a
+  // re-derive scheduled on CPU convenience is a scheduling-dependent outcome
+  // and breaks rule 1 through the back door.
+  uint32_t sweepSlot = kWaterBodyCap;
+  int32_t sweepLevel = 0;
   // COULD A HOLE BE DRAINING THIS TICK — the same mutation latch, exposed
   // separately because it gates a different thing: whether the CPU reserves the
   // discharge's spawn-op block at all.
@@ -366,11 +427,33 @@ class WaterBodySystem {
   // it is what tells the CPU whether a shave can fire this tick, which is what
   // decides whether the footprint has to be declared to the page table. It is
   // NOT part of any decision about which bodies exist.
+  //
+  // `editCell` is the world cell of that mutation (meaningless when
+  // `worldEdited` is false). It is recorded per body as the hole hint component
+  // 8's drain seeder reads — see WaterBodyHole above. Defaulted so a caller
+  // that has no cell to offer still compiles into the M3 behaviour exactly.
   void Tick(const World& world, uint32_t seed, uint32_t tick, int mode,
-            int testDrain, int drainMax, bool worldEdited);
+            int testDrain, int drainMax, bool worldEdited,
+            IVec3 editCell = IVec3{0, 0, 0});
+
+  // The live hole hint for a basin, or an invalid record. Expires with the same
+  // hot window the drain latch uses, so a swirl cannot outlive the dig that
+  // caused it by more than the drain could have.
+  WaterBodyHole HoleHint(uint32_t basinId) const;
 
   const std::vector<WaterBasin>& Basins() const { return basins_; }
   const std::vector<WaterBodyDesc>& Bodies() const { return bodies_; }
+  // M5: the split children proposed this tick, one per dug basin at most. Kept
+  // OUT of `bodies_` rather than appended to it because `bodies_` is parallel
+  // to `basins_` and `curves_`, and three vectors that are parallel except
+  // sometimes is the kind of invariant that holds until the day it does not.
+  const std::vector<WaterBodyDesc>& Children() const { return children_; }
+  // The child descriptor for a basin, or nullptr. For the gate and the overlay.
+  const WaterBodyDesc* FindChild(uint32_t basinId) const;
+  // Has a mutation landed in this basin's labelled chunks recently enough that
+  // its container curve is being re-derived? Component 10's cheap detection,
+  // exposed so `--gate waterbody` can assert the schedule rather than infer it.
+  bool CurveDirty(uint32_t basinId) const;
 
   // Chunk SLOT index -> body index + 1, or 0 for "no body". Sparse aux layer
   // keyed by chunk (design guideline #2) rather than four bits stolen from the
@@ -412,13 +495,27 @@ class WaterBodySystem {
   std::vector<WaterBasin> basins_;
   std::vector<WaterBasinCurve> curves_;   // parallel to basins_
   std::vector<WaterBodyDesc> bodies_;     // parallel to basins_
+  std::vector<WaterBodyDesc> children_;   // M5: split children, NOT parallel
   std::vector<uint32_t> chunkBody_;
+  // Keyed by basinId, NOT parallel to bodies_ — a window rebuild renumbers the
+  // descriptors and a hint that followed an index would jump between lakes.
+  // Kept OUT of WaterBodyDesc on purpose: the descriptor is what gate pass G
+  // recomputes from voxels and asserts equality on, and a field recording
+  // "which tick a dig happened" is not recomputable from a world state.
+  std::vector<WaterBodyHole> holeHints_;
   WaterBodyGpu gpu_;
   IVec3 builtOrigin_{1 << 30, 1 << 30, 1 << 30};
   uint32_t builtSeed_ = 0;
   uint32_t straddles_ = 0;
   uint32_t outOfWindow_ = 0;
   int mode_ = 0;
+  // M5, component 10's CHEAP DETECTION. Keyed by basin id (not by index — a
+  // window rebuild renumbers the descriptors and a flag that followed an index
+  // would re-derive the wrong lake), value = the tick the dig is forgotten on.
+  // A basin whose curve is dirty proposes a split child and takes a slot in the
+  // sweep schedule; every other basin does neither, which is where the zero
+  // idle cost comes from.
+  std::vector<std::pair<uint32_t, uint32_t>> curveDirtyUntil_;
   // THE DRAIN HOT WINDOW (M3). A discharge makes the shave fire, the shave
   // writes RESTING voxels, and a write into a chunk the page table was never
   // told about is a lost eighth reported as a page fault. So the footprint has

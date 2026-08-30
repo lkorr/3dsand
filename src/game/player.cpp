@@ -4,6 +4,7 @@
 #include <cmath>
 
 #include "sim/tuning.h"
+#include "sim/currentprim.h"
 
 namespace {
 
@@ -792,6 +793,29 @@ void Player::Update(float dt, const PlayerInput& in, const Vec3& flatFwd,
       // water-edge jump cannot work at any impulse — see the note on
       // `submersion` above.
       vel.y *= std::exp(-T().liquidDrag * submersion * dt);
+
+      // ---- THE CURRENT (docs/PLAN_water_master.md component 8) ------------
+      // The water you are in is going somewhere, and a whirlpool that does not
+      // pull you into it is a painting of a whirlpool.
+      //
+      // A DRAG toward the local flow, not a push, for windDrag's reason: drag
+      // is self-limiting, so no current and no knob can throw a swimmer faster
+      // than the water is moving, and no budget of its own is needed. Scaled by
+      // SUBMERSION, which this file already computes as a fraction — ankle-deep
+      // in a stream nudges, fully under a drain drags hard — so partial
+      // buoyancy and partial current come out of the same number for free.
+      //
+      // Vertical included, deliberately: the downward limb of a drain's vortex
+      // is the part that is dangerous, and dropping it would leave a whirlpool
+      // that spins you and never takes you down.
+      const Vec3 cur = sandvox::CurrentAtCpu(pos);
+      if (cur.x != 0.0f || cur.y != 0.0f || cur.z != 0.0f) {
+        const float k =
+            1.0f - std::exp(-CurrentTuning().sim.currentDrag * submersion * dt);
+        vel.x += (cur.x - vel.x) * k;
+        vel.y += (cur.y - vel.y) * k;
+        vel.z += (cur.z - vel.z) * k;
+      }
 
       // Water-edge mantle. Gated on the same canJump/jumpScale the dry jump is
       // — a wizard with no legs cannot pull themselves out of a pool either.

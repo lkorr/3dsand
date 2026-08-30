@@ -839,10 +839,15 @@ static_assert(kWaterBodyScalars == kWaterBodyCap * kWaterBodyWords,
 // all three: a body whose footprint does not fit is not listed, which means
 // "simulated the way it is today".
 //
-// 512 covers the harness's authored lake (r=68 -> ~69 chunk columns x 2 layers)
-// with room for a second body. It is a CEILING, not a per-tick cost: the list is
-// empty at sim.waterBodyMode 0 and holds only the bodies the CPU proposed.
-constexpr uint32_t kWaterChunkCap = 512;
+// 512 covered the harness's authored lake (r=68 -> ~69 chunk columns x 2
+// layers) with room for a second body. M5 doubled it to 1024 because a basin
+// someone has DUG IN proposes a SPLIT CHILD alongside it (see
+// kWaterBodyChildren) and the child re-lists the same footprint under its own
+// body index. It is a CEILING, not a per-tick cost: the list is empty at
+// sim.waterBodyMode 0, holds only the bodies the CPU proposed, and the child is
+// proposed only while the parent's curve is dirty — so an untouched lake pays
+// exactly what it paid at M4.
+constexpr uint32_t kWaterChunkCap = 1024;
 // u32 words per body in the GPU-OWNED ledger buffer (world.waterBodyState).
 // The level, the debit and everything derived from what the shave actually
 // removed live here and not on the CPU, because the only honest source for
@@ -853,8 +858,10 @@ constexpr uint32_t kWaterChunkCap = 512;
 // are derived from a level the GPU owns, and the discharge law's single
 // evaluation of `h` has to reach the op writer without a round trip through the
 // CPU. The four attribution words plan §7 asked for BEFORE they were needed are
-// still there and are still spare.
-constexpr uint32_t kWaterBodyStateWords = 24;
+// still there and are still spare. M5 widened it again, to 27: the re-audit
+// arm, its attribution tick, and the RESOLVED sweep level (WBS_REAUDIT /
+// WBS_AUDITTICK / WBS_SWEEPY in common.wgsl).
+constexpr uint32_t kWaterBodyStateWords = 27;
 // DRAIN OP SLOTS PER BODY (component 6). The discharge is emitted through the
 // existing spawnAppend seam, which reads a CPU-sized op stream — so the CPU
 // RESERVES a contiguous block per body it proposes and the GPU fills it. This
@@ -868,6 +875,85 @@ constexpr uint32_t kWaterBodyStateWords = 24;
 // the milestone's throughput claim, and 16 KiB of upload per body per tick,
 // which is inside the <1 MB/tick CPU->GPU budget with three orders to spare.
 constexpr uint32_t kWaterDrainOpsPerBody = 512;
+
+// ---- M5: the measured container curve + the split map (components 2/10) ----
+//
+// THE SWEEP'S FOUR OUTPUTS (plan §2, case 2) all live in the SAME buffer as the
+// ledger, past the end of it, rather than in a buffer of their own. That is a
+// deliberate refusal to add a binding: `waterBodyState` is already
+// `array<atomic<i32>>` at simBGL_ 24, already an `A(WaterBodyState)` row in
+// every water pass, and every accumulator the sweep needs (atomicAdd for the
+// area count, atomicMin for the spill, atomicOr for the openness bitmap) is a
+// sanctioned order-free atomic. A second buffer would have bought nothing and
+// cost a binding, a pass-table resource and a barrier class.
+//
+//   [0, kWaterBodyCap * kWaterBodyStateWords)                the ledger
+//   [kWaterCurveBase, + kWaterBodyCap * kWaterCurveWords)    per-body sweep
+//   [kWaterSweepScratchBase, + kWaterSweepScratchWords)      shared scratch
+//
+// THE SPLIT GRID IS A DOWNSAMPLE, and that is the one approximation in M5.
+// Connectivity is computed on a `kWaterSplitGrid`^2 grid laid over the basin's
+// column AABB, one grid cell spanning `ceil(diameter / 48)` columns — 3 columns
+// for the harness lake's 137. A grid cell is OPEN at a level if ANY of its
+// columns is, which is the LIBERAL direction on purpose: it can only ever
+// UNDER-split (report one pool where there are two), and under-splitting is the
+// status quo — the CA handles it, exactly as it handles every basin this system
+// declines. Over-splitting would strand water in a puddle nobody drains, which
+// is the direction that is not safe. A partition thinner than 2*step-1 columns
+// may therefore go unseen; that is documented rather than hidden, and
+// `--gate waterbody` pass B builds a wall thick enough to be seen.
+constexpr uint32_t kWaterSplitGrid = 48;
+constexpr uint32_t kWaterSplitCells = 2304;   // kWaterSplitGrid^2
+static_assert(kWaterSplitCells == kWaterSplitGrid * kWaterSplitGrid,
+              "kWaterSplitCells must equal kWaterSplitGrid^2");
+// Two bits per grid cell: the component index a body's footprint test compares
+// against. 0..2 are real components, 3 is "blocked / no water here".
+constexpr uint32_t kWaterSplitWords = 144;    // kWaterSplitCells * 2 / 32
+// area(y) entries per body. One per world Y from the basin floor up; a basin
+// deeper than this is truncated and says so (SW_TRUNC), which is a reported
+// approximation and not a mass error — the table is a SCHEDULE (plan §3.2).
+constexpr uint32_t kWaterCurveMaxY = 64;
+// Header words before the area table. See SW_* in common.wgsl.
+constexpr uint32_t kWaterSweepHeaderWords = 10;
+constexpr uint32_t kWaterCurveWords = 218;    // 10 + 64 + 144
+static_assert(kWaterCurveWords == kWaterSweepHeaderWords + kWaterCurveMaxY +
+                                      kWaterSplitWords,
+              "kWaterCurveWords must equal the header + area + split blocks");
+// SHARED scratch, not per body: exactly one basin is swept per tick (the
+// schedule is `basinId % N == tick % N`, plan §3.4), so the openness bitmap the
+// label propagation reads has one writer and one reader per tick.
+constexpr uint32_t kWaterSweepScratchWords = 128;
+constexpr uint32_t kWaterCurveBase = kWaterBodyCap * kWaterBodyStateWords;  // 1664
+constexpr uint32_t kWaterSweepScratchBase =
+    kWaterCurveBase + kWaterBodyCap * kWaterCurveWords;
+constexpr uint32_t kWaterBodyStateTotalWords =
+    kWaterSweepScratchBase + kWaterSweepScratchWords;
+// THE SCHEDULE PERIOD (plan §3.4). A basin re-derives on ticks where
+// `slot % kWaterSweepPeriod == tick % kWaterSweepPeriod`, and one LEVEL of its
+// column AABB per scheduled tick. So a full re-derive of a 26-deep bowl costs
+// 26 scheduled ticks = 104 world ticks = 3.5 s, during which the table is
+// stale. That is fine and it is the plan's own argument: water is slow, and the
+// table is a schedule, so a stale one costs pace and never mass.
+constexpr uint32_t kWaterSweepPeriod = 4;
+// SPLIT CHILDREN a dug basin may propose. One, so a basin becomes at most two
+// pools; a third component is left to the CA, which is the same safe
+// degradation every refusal in this subsystem takes. Raising it costs a chunk
+// list per child and nothing else.
+constexpr uint32_t kWaterBodyChildren = 1;
+// `TickParams.waterSweepLevel` sentinel: sweep the body's LIVE level rather
+// than a cursor level.
+//
+// The active split map is only ever asked about at the level the shave is
+// working, and during a drain that level moves faster than a cursor walking
+// the whole basin can follow. But the live level is a GPU fact — it is what
+// M2 moved off the CPU on purpose — so the CPU cannot name it. It names this
+// sentinel instead and the LEDGER resolves it, publishing the answer into
+// WBS_SWEEPY for the two sweep passes to read. One evaluation, two consumers,
+// exactly as the discharge law publishes WBS_EMIT and WBS_JETV: if the sweep
+// re-resolved it for itself it would disagree with the clear the ledger
+// already did, on any tick the shave moved the level in between.
+constexpr int32_t kWaterSweepLive = -0x7FFFFFFF;
+
 // Largest radius / axial reach a primitive may declare, world cells (51 m).
 // Load-bearing twice: it bounds the footprint the wake budget is spent on, and
 // it bounds every intermediate in the integer field evaluation (see the
@@ -901,6 +987,52 @@ constexpr uint32_t kWindPrimWater = 1u << 1;
 // it is the flag that costs chunk wakes, and a decorative gust has no business
 // rearranging the terrain it blows past.
 constexpr uint32_t kWindPrimEntrain = 1u << 2;
+
+// ---- CURRENT PRIMITIVE ceilings and encoding (docs/PLAN_water_master.md
+// component 8; src/sim/currentprim.h owns the system) ----
+//
+// Here rather than in currentprim.h for the wind-primitive reason: these are
+// the GPU LAYOUT, and world.h is where a layout a shader must agree with is
+// stated. Must match CURRENT_PRIM_* / CPRIM_* in assets/shaders/common.wgsl.
+//
+// 32 is the same cap wind carries, and for the same argument: every live
+// primitive is summed at every sample inside the union AABB, so this is a
+// per-sample cost as much as a memory one. A whirlpool per drain plus a stream
+// per river reach in the residency window is a handful.
+constexpr uint32_t kCurrentPrimCap = 32;
+constexpr uint32_t kCurrentPrimWords = 12;   // 3 x vec4<i32>
+// kCurrentPrimCap * kCurrentPrimWords, written as a LITERAL for exactly the
+// reason kWindPrimScalars is — check_invariants.py's `params` check parses a
+// C++ array dimension as a bare identifier bound to an integer literal, and an
+// expression makes it SKIP the whole struct comparison silently.
+constexpr uint32_t kCurrentPrimScalars = 384;
+static_assert(kCurrentPrimScalars == kCurrentPrimCap * kCurrentPrimWords,
+              "kCurrentPrimScalars must equal cap * words");
+// Largest radius / axial reach, world cells. Bounds every intermediate in the
+// integer evaluation (see the overflow argument above currentPrimEvalQ).
+constexpr int32_t kCurrentPrimMaxExtent = 512;
+// Largest core speed, world cells/s (20 m/s). A whirlpool's throat at 20 m/s is
+// already faster than anything in this engine swims; the cap is what keeps the
+// Q16.16 accumulator inside i32 across a full list.
+constexpr int32_t kCurrentPrimMaxSpeed = 200;
+
+// Primitive kinds — must match CPRIM_* in common.wgsl.
+constexpr uint32_t kCurrentPrimSink = 0;
+constexpr uint32_t kCurrentPrimSource = 1;
+constexpr uint32_t kCurrentPrimVortex = 2;
+constexpr uint32_t kCurrentPrimStream = 3;
+// THE SIM LICENCE. Set only on primitives whose parameters are a pure function
+// of the tick input stream; currentAtQ skips every primitive without it, so a
+// primitive seeded from anything the CPU learned asynchronously can reach the
+// renderer and the player and never the hashed world. See the authority note
+// over currentAtQ in common.wgsl.
+constexpr uint32_t kCurrentPrimSim = 1u << 0;
+
+// Impact-ripple ring size (component 9) — must match WAVE_IMPACT_CAP in
+// common.wgsl. Sixteen is a second and a half of splashes at a plausible rate,
+// and the ring is what makes "a ripple is the memory of an event" bounded by
+// construction instead of a growing list.
+constexpr uint32_t kWaveImpactCap = 16;
 
 // Must match TickParams in common.wgsl.
 struct TickParams {
@@ -1075,7 +1207,18 @@ struct TickParams {
   // sim.drainExciteRadius — component 7's v1 knob, world cells. 0 disables the
   // shell entirely and is an exact identity (no cell can satisfy the trigger).
   int32_t waterExciteRadius = 0;
-  // FIVE pad words, and the count is arithmetic rather than taste: `windWake`
+  // ---- M5: THE SCHEDULED RE-DERIVE (components 2 case 2 + 10) -------------
+  //
+  // Which body's container curve is being re-derived this tick, and at which
+  // world Y. BOTH are pure functions of the tick: the slot is picked by
+  // `slot % kWaterSweepPeriod == tick % kWaterSweepPeriod` and the level cycles
+  // the basin's own Y span, so a re-derive can never happen "when the CPU got
+  // around to it" (plan §3.4, and the whole subject of `--gate waterbody` pass
+  // F). `kWaterBodyCap` means NOTHING IS SCHEDULED, which is the state of every
+  // lake nobody has dug into and is what makes C_WATERSWEEP false.
+  uint32_t waterSweepSlot = kWaterBodyCap;   // kWaterBodyCap == "none"
+  int32_t waterSweepLevel = 0;
+  // THREE pad words, and the count is arithmetic rather than taste: `windWake`
   // ends 16-byte aligned, `vizActive` puts us 4 B past that, and std140 will
   // align `waterBodies` (an array of vec4) to 16. So the header between them
   // must be 4 + 15*4 = 64 B or the two structs disagree — and they disagree
@@ -1083,8 +1226,8 @@ struct TickParams {
   // shader's std140 rounds up to the next vec4, which slides every descriptor
   // by two scalars. check_invariants.py compares the shapes and is the only
   // thing that catches it; see vizActive's own note above for the last time.
-  uint32_t padWb0 = 0;
-  uint32_t padWb1 = 0;
+  // M5 spent two of the five on the sweep schedule above; the total is
+  // unchanged, which is why widening TickParams here moved nothing.
   uint32_t padWb2 = 0;
   uint32_t padWb3 = 0;
   uint32_t padWb4 = 0;
@@ -1094,6 +1237,29 @@ struct TickParams {
   int32_t waterBodies[kWaterBodyScalars] = {};
   // (bodyIndex << 16) | chunkSlot, four to a std140 row.
   uint32_t waterChunks[kWaterChunkCap] = {};
+
+  // ---- THE CURRENT FIELD, the SIM's copy (plan component 8;
+  // src/sim/currentprim.h; must match TickParams in common.wgsl) ----
+  //
+  // A structural clone of the wind primitive block above — same cap, same
+  // three-row packing, same union AABB, same float/integer transcription pair.
+  // It rides the uniform for the same reasons: no new binding, no new barrier,
+  // no new dispatch, and a count of zero is an exact identity.
+  //
+  // MODE 0 IS THE SHIPPING DEFAULT AND IS BIT-IDENTICAL. currentAtQ returns
+  // zero on `currentMode == 0` before it reads anything else, so no sim kernel
+  // can see this block and the pinned world hash cannot move. The RENDER arm
+  // ships on regardless (RenderParams::currentRenderOn), because a renderer
+  // cannot write a voxel — that split is what makes M4 visible without moving
+  // the hash. See DESIGN.md §9c.
+  uint32_t currentMode = 0;
+  uint32_t currentPrimCount = 0;
+  uint32_t padCp0 = 0, padCp1 = 0;
+  int32_t currentPrimLo[3] = {1, 1, 1};   // union AABB, inclusive world cells
+  int32_t padCp2 = 0;                     // (lo > hi = no primitives)
+  int32_t currentPrimHi[3] = {0, 0, 0};
+  int32_t padCp3 = 0;
+  int32_t currentPrims[kCurrentPrimScalars] = {};
 };
 
 // Q8 unit for the two dev multipliers above — must match WINDQ_SCALE_ONE in
@@ -1344,6 +1510,32 @@ struct RenderParams {
   int32_t windPrimHi[3] = {0, 0, 0};
   int32_t pad_wpr4 = 0;
   int32_t windPrims[kWindPrimScalars] = {};
+
+  // ---- the current field, the RENDER copy (plan component 8) -------------
+  // The SAME resolved list TickParams carries, from the same
+  // CurrentPrimSystem in the same frame — the windPrims argument exactly, and
+  // it is what makes the surface waves drift with the flow, the arrow overlay
+  // agree with the player's drift, and the foam sit on real convergence lines.
+  //
+  // `currentRenderOn` is its OWN gate rather than a copy of `currentMode`,
+  // and the asymmetry is the milestone: the render arm ships ON and the sim
+  // arm ships OFF, because a render field cannot write a voxel and a sim field
+  // moves the pinned hash.
+  uint32_t currentRenderOn = 0;
+  uint32_t currentPrimCount = 0;
+  uint32_t pad_cpr0 = 0, pad_cpr1 = 0;
+  int32_t currentPrimLo[3] = {1, 1, 1};
+  int32_t pad_cpr2 = 0;
+  int32_t currentPrimHi[3] = {0, 0, 0};
+  int32_t pad_cpr3 = 0;
+  int32_t currentPrims[kCurrentPrimScalars] = {};
+  // ---- component 9: the impact-ripple ring -------------------------------
+  // (x, z) world voxels, `t0` the R.time value the impact landed at, `amp` its
+  // strength in metres of initial crest. amp <= 0 is a dead slot. Bounded by
+  // construction — see kWaveImpactCap.
+  uint32_t waveImpactCount = 0;
+  uint32_t pad_wi0 = 0, pad_wi1 = 0, pad_wi2 = 0;
+  float waveImpacts[kWaveImpactCap * 4] = {};
 };
 static_assert(sizeof(RenderParams) % 16 == 0,
               "RenderParams must be a whole number of std140 rows");

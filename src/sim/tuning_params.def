@@ -192,6 +192,17 @@ TP_F(render, rippleAmpScale, TUNE_RIPPLE_AMP_SCALE, 0.35f)
 TP_F(render, rippleSpeedScale, TUNE_RIPPLE_SPEED_SCALE, 0.4f)
 TP_F(render, waterFetchLow, TUNE_WATER_FETCH_LOW, 0.35f)
 TP_F(render, waterFetchHigh, TUNE_WATER_FETCH_HIGH, 0.85f)
+TP_F(render, waveDispersion, TUNE_WAVE_DISPERSION, 1.0f)
+TP_F(render, waveSteepness, TUNE_WAVE_STEEPNESS, 0.55f)
+TP_F(render, waveShoreDepth, TUNE_WAVE_SHORE_DEPTH, 0.45f)
+TP_F(render, waveFlowScale, TUNE_WAVE_FLOW_SCALE, 1.0f)
+TP_F(render, waveFoamThreshold, TUNE_WAVE_FOAM_THRESHOLD, 0.12f)
+TP_F(render, waveFoamGain, TUNE_WAVE_FOAM_GAIN, 3.0f)
+TP_F(render, waveImpactSpeed, TUNE_WAVE_IMPACT_SPEED, 1.8f)
+TP_F(render, waveImpactDecay, TUNE_WAVE_IMPACT_DECAY, 2.5f)
+TP_F(render, waveImpactLen, TUNE_WAVE_IMPACT_LEN, 0.70f)
+TP_F(render, dbgCurrentSpacing, TUNE_CUR_DBG_SPACING, 6.0f)
+TP_F(render, dbgCurrentRadius, TUNE_CUR_DBG_RADIUS, 40.0f)
 TP_F(render, reflectionCutoff, TUNE_REFLECTION_CUTOFF, 0.06f)
 TP_I(render, reflectionSteps, TUNE_REFLECTION_STEPS, 96)
 TP_F(render, causticGain, TUNE_CAUSTIC_GAIN, 1.5f)
@@ -539,6 +550,11 @@ TP_F(sim, windDriftSpeed, TUNE_WIND_DRIFT_SPEED, 12.0f)
 TP_F(sim, windDriftMax, TUNE_WIND_DRIFT_MAX, 0.5f)
 TP_F(sim, windEntrainSpeed, TUNE_WIND_ENTRAIN_SPEED, 2.0f)
 TP_F(sim, windEntrainRate, TUNE_WIND_ENTRAIN_RATE, 6.0f)
+// ---- the CURRENT field's one sim coupling (PLAN_water_master.md comp 8)
+// The only current knob the SHADER reads. Everything else about the field is
+// resolved into primitives on the CPU, so this is the whole .def surface:
+// a human-unit rate const-eval'd into Q16-per-substep, the fluid lane's trick.
+TP_F(sim, currentDrag, TUNE_CURRENT_DRAG, 6.0f)
 
 // ---- worldgen (integer; needs a world regen to take effect) ----
 // EVERY LENGTH IN THIS GROUP IS AUTHORED AT refVoxelsPerMetre VOXELS PER METRE,

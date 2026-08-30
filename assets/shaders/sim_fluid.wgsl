@@ -213,6 +213,14 @@ const FLUID_WIND_MASS : i32 = max(i32(round(
     clamp(TUNE_WIND_FLUID_MASS, 0.02, 4.0) * f32(FLUID_REST_DENSITY >> 6u))), 1);
 // Q16.16 cells/s (windAtQ's unit) -> Q16.16 cells/tick.
 const FLUID_WIND_HZ : i32 = 30;
+// THE CURRENT FIELD's one sim coupling (docs/PLAN_water_master.md component 8).
+// Same shape and same units as FLUID_WIND_DRAG above — a per-SECOND rate, so
+// divided by the substep count for the reason the gravity add is. There is no
+// exposure gate and no ramp: air touches the skin of a body of water, a current
+// runs through it, and that difference is why this is a second term rather than
+// a second weather vector.
+const FLUID_CURRENT_DRAG : i32 = i32(round(clamp(TUNE_CURRENT_DRAG, 0.0, 30.0) *
+    65536.0 / (30.0 * f32(FLUID_SUBSTEPS))));
 
 // 0.5 cell in Q16.16 — the cell-center offset of the node lattice.
 const FLUID_HALF : i32 = 32768;
@@ -803,6 +811,33 @@ fn gridUpdate(@builtin(workgroup_id) wg : vec3<u32>,
       v.x += mq(w.x / FLUID_WIND_HZ - v.x, k);
       v.y += mq(w.y / FLUID_WIND_HZ - v.y, k);
       v.z += mq(w.z / FLUID_WIND_HZ - v.z, k);
+    }
+  }
+
+  // ---- the current field (docs/PLAN_water_master.md component 8) -----------
+  // THE SIM ARM, and it is the ONLY sim consumer the current field has. A jet
+  // out of a drain is MPM, the water it lands in is MPM, and a whirlpool that
+  // does not turn either of them is a picture rather than a current.
+  //
+  // Gated on T.currentMode for the identical reason the wind block above is
+  // gated on T.windMode, and the argument is worth restating because it is the
+  // reason mode 0 is an EXACT identity rather than an approximate one: this is
+  // a DRAG term, so a zero field still pulls every node toward a standstill.
+  // That is not "no current", it is "infinite still water", and it would move
+  // the pinned hash through the settle seam. Reading the gate is what makes
+  // `sim.currentMode = 0` bit-identical to a build without this block.
+  //
+  // NO EXPOSURE TEST, unlike wind: air only touches the skin of a body of
+  // water, but a current runs THROUGH it. That difference is the whole reason
+  // this is a second term rather than a second weather vector.
+  if (T.currentMode != 0u && FLUID_CURRENT_DRAG > 0) {
+    let cv = currentAtQ(c, &T);
+    // The AABB reject inside currentAtQ makes this free everywhere there is no
+    // primitive, which is everywhere in a world with no drain in it.
+    if (cv.x != 0 || cv.y != 0 || cv.z != 0) {
+      v.x += mq(cv.x / FLUID_WIND_HZ - v.x, FLUID_CURRENT_DRAG);
+      v.y += mq(cv.y / FLUID_WIND_HZ - v.y, FLUID_CURRENT_DRAG);
+      v.z += mq(cv.z / FLUID_WIND_HZ - v.z, FLUID_CURRENT_DRAG);
     }
   }
 

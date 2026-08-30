@@ -1130,6 +1130,16 @@ bool MobSystem::EquipItem(uint64_t mobId, const ItemDef* item,
   return mob ? mob->EquipItem(item, context) : false;
 }
 
+bool MobSystem::WearItem(uint64_t mobId, const ItemDef* item, int equipSlot) {
+  Mob* mob = FindMobById(mobId);
+  return mob ? mob->WearItem(item, equipSlot) : false;
+}
+
+bool MobSystem::UnwearItem(uint64_t mobId, int equipSlot) {
+  Mob* mob = FindMobById(mobId);
+  return mob ? mob->UnwearItem(equipSlot) : false;
+}
+
 uint64_t MobSystem::Spawn(int defIndex, IVec3 atVoxel) {
   if (defIndex < 0 || defIndex >= (int)defs_.size()) return 0;
   if (mobs_.size() >= kMaxMobs) return 0;
@@ -1175,6 +1185,12 @@ bool Mob::BuildRig(const MobDef& def, Vec3 origin) {
   heldItem_.clear();
   heldPartIndex_ = -1;
   heldPart_.clear();
+  // Same rule as the weapon, and for the same reason: a respawn must not
+  // inherit the last life's coat. The armour itself is not lost — it lives in
+  // the wearer's Equipment, which is a different owner — but the SHELLS are
+  // rig state and belong to this rig only.
+  worn_.clear();
+  baseLimbs_ = (int)def.limbs.size();
   limbs_.assign(def.limbs.size(), MobLimb{});
 
   // SKIN -> WORLD. The .vox model is authored on the skin lattice, so every
@@ -2575,6 +2591,22 @@ constexpr uint32_t kBurnQueued = 0x80000000u;
 // one grid voxel would.
 constexpr int kBurnFaceSamplesMax = 8;
 
+// ---- how far the worn-occlusion ray looks -----------------------------------
+//
+// Both reaches are in WORLD VOXELS and both are "one grid cell, plus enough
+// slack for the gap between a rounded limb and a garment cut to its box".
+// That gap is what makes a point test useless (BurnLimbView::occlude): a
+// diagonal on a tube can be two or three lattice cells clear of the cloth
+// around it.
+//
+// They are deliberately SHORT. A long ray would start finding the far side of
+// the coat from inside it, which would make a limb protect itself.
+constexpr float kWornSeedReach = 1.25f;   // sample point -> the hot cell
+constexpr float kWornNbrReach = 1.0f;     // surface voxel -> its world cell
+// Hard cap on lattice steps, whatever the reach asks for. Every loop in this
+// system is bounded; this one is a cost that scales with skinScale.
+constexpr int kWornMarchMax = 12;
+
 const IVec3 kBurnDirs[6] = {{0, 1, 0}, {0, -1, 0}, {1, 0, 0},
                             {-1, 0, 0}, {0, 0, 1}, {0, 0, -1}};
 
@@ -2597,10 +2629,10 @@ BurnLimbView Mob::ViewOf(MobLimb& limb) {
   BurnLimbView v;
   v.skin = fine ? &limb.skinVoxels : nullptr;
   v.coll = fine ? nullptr : &limb.voxels;
-  v.scale = fine ? def.skinScale : def.physScale;
+  v.scale = fine ? SkinScaleOf(limb) : PhysScaleOf(limb);
   v.xf = &limb.xf;
   v.size = limb.size;
-  v.physScale = def.physScale;
+  v.physScale = PhysScaleOf(limb);
   v.microModel = &limb.microModel;
   v.carved = &limb.carved;
   v.flipbook = &limb.flipbookModel;
@@ -2749,7 +2781,7 @@ bool Mob::RebuildLimbBody(int limbIndex) {
   const MobDef& def = *def_;
   // COLLIDER pitch: limb.voxels are physScale units, so the Jolt body is built
   // at 1/physScale.
-  const float pitch = 1.0f / (float)std::max(1u, def.physScale);
+  const float pitch = 1.0f / (float)std::max(1u, PhysScaleOf(limb));
   phys_->GetTransform(limb.body, limb.xf);
   uint64_t nh = phys_->CreateDebrisBodyXf(limb.voxels, limb.xf, DensityOf(),
                                           true /*allowKinematic*/, pitch);
@@ -2923,7 +2955,7 @@ bool Mob::CarveLimb(int limbIndex, World& world,
   const bool fine = limb.HasFineSkin();
   // ONE world-space volume, re-expressed per lattice. The collider predicate
   // always exists; the skin one only when the skin is a separate lattice.
-  const auto keep = carveAt((float)std::max(1u, def.physScale));
+  const auto keep = carveAt((float)std::max(1u, PhysScaleOf(limb)));
 
   std::vector<DebrisVoxel> removed;
   for (const DebrisVoxel& v : limb.voxels)
@@ -2938,7 +2970,7 @@ bool Mob::CarveLimb(int limbIndex, World& world,
   Vec3 skinLostSum{};
   size_t skinLostN = 0;
   if (fine) {
-    const auto keepSkin = carveAt((float)std::max(1u, def.skinScale));
+    const auto keepSkin = carveAt((float)std::max(1u, SkinScaleOf(limb)));
     const size_t before = limb.skinVoxels.size();
     limb.skinVoxels.erase(
         std::remove_if(limb.skinVoxels.begin(), limb.skinVoxels.end(),
@@ -2972,7 +3004,7 @@ bool Mob::CarveLimb(int limbIndex, World& world,
   if (spall != nullptr && spall->rounds > 0 && spall->strength > 0.0f &&
       spall->radius > 0.0f) {
     const float scale =
-        (float)std::max(1u, fine ? def.skinScale : def.physScale);
+        (float)std::max(1u, fine ? SkinScaleOf(limb) : PhysScaleOf(limb));
     const Vec3 cLocal = spall->centerLocal * scale;
     const float rLocal = spall->radius * scale;
     const float r2 = rLocal * rLocal;
@@ -3076,7 +3108,8 @@ bool Mob::CarveLimb(int limbIndex, World& world,
     bool overflow = false;
     limb.voxels = DownsampleSkin(
         limb.skinVoxels,
-        std::max(1u, def.skinScale / std::max(1u, def.physScale)), &overflow);
+        std::max(1u, SkinScaleOf(limb) / std::max(1u, PhysScaleOf(limb))),
+        &overflow);
   } else {
     limb.voxels.erase(
         std::remove_if(limb.voxels.begin(), limb.voxels.end(),
@@ -3102,7 +3135,7 @@ bool Mob::CarveLimb(int limbIndex, World& world,
       for (const DebrisVoxel& v : colliderBefore)
         if (!after.count(ck(v))) removed.push_back(v);
     }
-    LimbVoxelsToParticles(limb, def.physScale, removed, world, spawns);
+    LimbVoxelsToParticles(limb, PhysScaleOf(limb), removed, world, spawns);
   }
   MarkInstancesDirty();
 
@@ -3151,14 +3184,14 @@ bool Mob::CarveLimb(int limbIndex, World& world,
       for (const DebrisVoxel& v : removed)
         c += Vec3{(float)v.x, (float)v.y, (float)v.z};
       n = removed.size();
-      c = c * (1.0f / (float)n / (float)std::max(1u, def.physScale));
+      c = c * (1.0f / (float)n / (float)std::max(1u, PhysScaleOf(limb)));
     } else if (skinLostN) {
       // Collider too coarse to notice, skin was not: fall back to the skin's
       // own account of where the damage landed rather than leaving the wound
       // at wherever the last one happened to be.
       n = skinLostN;
       c = skinLostSum *
-          (1.0f / (float)n / (float)std::max(1u, def.skinScale));
+          (1.0f / (float)n / (float)std::max(1u, SkinScaleOf(limb)));
     }
     if (n) limb.woundLocal = c;
     limb.bleedBudget = AddBleedBudget(limb.bleedBudget,
@@ -3227,7 +3260,7 @@ bool Mob::CarveLimb(int limbIndex, World& world,
       // expressed on THAT lattice: physScale, not skinScale. (This is the
       // conversion the loader's skinScale one at the top of the file is easiest
       // to confuse with; they run in opposite directions on different data.)
-      Vec3 aMicro = limb.anchorLimb * (float)std::max(1u, def.physScale);
+      Vec3 aMicro = limb.anchorLimb * (float)std::max(1u, PhysScaleOf(limb));
       // Which components are big enough to still be this limb (see the
       // straggler note in the loop below). Both floors are the ones the limb is
       // about to be judged by anyway: kMinFragmentVoxels is "too few voxels to
@@ -3287,7 +3320,7 @@ bool Mob::CarveLimb(int limbIndex, World& world,
       // voxel belongs to is what decides where it goes.
       if (fine) {
         const uint32_t ratio =
-            std::max(1u, def.skinScale / std::max(1u, def.physScale));
+            std::max(1u, SkinScaleOf(limb) / std::max(1u, PhysScaleOf(limb)));
         std::unordered_map<uint32_t, uint32_t> blockComp;
         blockComp.reserve(n * 2);
         for (uint32_t i = 0; i < n; i++)
@@ -3316,11 +3349,11 @@ bool Mob::CarveLimb(int limbIndex, World& world,
           // A carved-off fragment becomes its own debris body, packed from the
           // COLLIDER voxels it was split on — it has no skin lattice of its
           // own, so its brick is packed at physScale to match its coords.
-          EmitCarvedFragment(limb, def.physScale, std::move(parts[c]),
+          EmitCarvedFragment(limb, PhysScaleOf(limb), std::move(parts[c]),
                              world, spawns);
           budget--;
         } else {
-          LimbVoxelsToParticles(limb, def.physScale, parts[c], world, spawns);
+          LimbVoxelsToParticles(limb, PhysScaleOf(limb), parts[c], world, spawns);
         }
       }
       // Losing the disconnected mass can itself take the limb under the floor.
@@ -3344,7 +3377,7 @@ bool Mob::CarveLimb(int limbIndex, World& world,
   // Art, then collider. ReskinLimbMicro may shift the limb origin, and the
   // collider must be built from the voxels in their FINAL frame.
   if (limb.microModel >= 0)
-    ReskinLimbMicro(limb, def.skinScale, def.physScale);
+    ReskinLimbMicro(limb, SkinScaleOf(limb), PhysScaleOf(limb));
   RebuildLimbBody(limbIndex);
   // The carve compacted the lattice (and may have rebased it), so every entry
   // in the burn index now points at the wrong voxel. Drop it: the next burn
@@ -3385,7 +3418,7 @@ bool Mob::FlushBurn(int limbIndex, World& world,
   if (limb.burn.removed == 0) return true;
   const MobDef& def = *def_;
   const bool fine = limb.HasFineSkin();
-  const uint32_t latScale = fine ? def.skinScale : def.physScale;
+  const uint32_t latScale = fine ? SkinScaleOf(limb) : PhysScaleOf(limb);
   const size_t n = fine ? limb.skinVoxels.size() : limb.voxels.size();
   // Scale the threshold with the limb. 12 voxels out of a 62-voxel dummy arm
   // is a real shape change and must rebuild now; 12 out of a 31k mina torso is
@@ -3742,7 +3775,31 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
             const Vec3 p = fc + u * (((float)a + 0.5f) / (float)S - 0.5f) +
                            w * (((float)b + 0.5f) / (float)S - 0.5f);
             const Vec3 l = RotateInv(q, p - v.xf->pos) * (float)v.scale;
-            queue(cellOf({ifloor(l.x), ifloor(l.y), ifloor(l.z)}));
+            const uint32_t seed = cellOf({ifloor(l.x), ifloor(l.y),
+                                          ifloor(l.z)});
+            // RESOLVE THE CELL FIRST. Most face samples land on nothing — the
+            // six-direction walk fires away from the limb as often as toward
+            // it — and asking about armour before knowing there is anything to
+            // protect both wastes the march and, worse, makes the counters
+            // below meaningless: 15,640 "passed" samples turned out to be
+            // overwhelmingly samples that seeded nothing at all.
+            if (seed == kNoBurnCell || st.idx[seed] == 0) continue;
+            // ARMOUR, half one: THE FIRE IS TOUCHING THE ROBE, NOT THE ARM.
+            //
+            // Asked BACKWARDS, from the sample point toward the hot cell,
+            // because that is the direction the heat has to travel. A point
+            // test at `p` alone is not enough: `p` is a sixteenth of a world
+            // voxel past the shared face, so on a cell whose box overlaps the
+            // limb it lands INSIDE the flesh, past a shell that is exactly
+            // where it should be.
+            if (v.occlude) {
+              if (v.WornAlong(p, dv * -1.0f, kWornSeedReach)) {
+                wornStats_.seedsBlocked++;
+                continue;
+              }
+              wornStats_.seedsPassed++;
+            }
+            queue(seed);
           }
       }
     }
@@ -3839,7 +3896,46 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
         const Vec3 wv =
             worldOf(vp) + Rotate(q, Vec3{(float)d.x * inv, (float)d.y * inv,
                                         (float)d.z * inv});
-        nmat[k] = worldMatAt({ifloor(wv.x), ifloor(wv.y), ifloor(wv.z)});
+        // ARMOUR, half two: WHAT IS OUTSIDE ME MAY BE MY OWN COAT.
+        //
+        // Substituting the shell's material for the world's is the whole
+        // mechanic, and it does two jobs at once because both directions read
+        // this array:
+        //
+        //   * The voxel's OWN rules count hot neighbours (flesh needs three
+        //     to catch). Under a robe the neighbour is cloth, so the skin
+        //     never reaches its own ignition threshold — and the robe, whose
+        //     own pass sees the real fire, burns.
+        //   * The INBOUND pass below looks for a world neighbour whose rule
+        //     rewrites this voxel. Acid becomes cloth, so it does not match,
+        //     and the acid instead eats the shell through the shell's own
+        //     pass. Steel simply never dissolves, because `steel` carries no
+        //     tag:dissolvable — no armour value said so.
+        //
+        // `ncell` stays kNoBurnCell, so the read-only rule still holds: the
+        // flesh cannot rewrite the cloth. The cloth's own pass owns the cloth.
+        //
+        // ONLY WHEN THERE IS SOMETHING TO BE PROTECTED FROM. The world material
+        // is read first and the march only runs against a cell that can
+        // actually act on this body — a surface voxel facing open air is the
+        // overwhelmingly common case and costs nothing. Substituting cloth for
+        // AIR would change no rule anyway: neither is hot, neither attacks.
+        const uint32_t wm =
+            worldMatAt({ifloor(wv.x), ifloor(wv.y), ifloor(wv.z)});
+        const bool threat = wm != 0 &&
+                            ((wm < matHot_.size() && matHot_[wm]) ||
+                             (wm < matAttacksBody_.size() &&
+                              matAttacksBody_[wm]));
+        const Vec3 outward{(float)d.x, (float)d.y, (float)d.z};
+        const uint32_t worn =
+            threat ? v.WornAlong(wv, Rotate(q, outward), kWornNbrReach) : 0u;
+        if (threat && v.occlude) {
+          wornStats_.nbrThreats++;
+          if (worn) wornStats_.nbrSubstituted++;
+          else if (v.WornAlong(wv, Rotate(q, outward), kWornNbrReach * 4.0f))
+            wornStats_.nbrMissInReach++;
+        }
+        nmat[k] = worn ? worn : wm;
         ncell[k] = kNoBurnCell;
       }
     }
@@ -3991,10 +4087,22 @@ void Mob::BurnTick(uint32_t tick, World& world, std::vector<CellOp>& cellOps,
   // and it looks entirely innocent at the call site (PLAN §5).
   const uint32_t mobKey = (uint32_t)id_ * 0x9E3779B9u;
 
+  // The occlusion context, hoisted out of the loop so its address is stable
+  // for the whole call. `limb` is rewritten per iteration; BurnOneLimb runs
+  // synchronously and never keeps the pointer, so one instance is enough.
+  WornProbe probe{this, -1};
   for (int li = 0; li < (int)limbs_.size(); li++) {
     if (frontBudget == 0) break;
     if (!limbs_[li].body) continue;
     BurnLimbView v = ViewOf(limbs_[li]);
+    // Only a limb something is actually WORN OVER pays for the probe, and an
+    // undressed creature does not even transform a point. `worn_` is empty for
+    // every mob in the game today, so this is a vector-empty test per limb.
+    if (LimbHasShells(li)) {
+      probe.limb = li;
+      v.occlude = &WornProbe::Call;
+      v.occludeCtx = &probe;
+    }
     const uint32_t key = mobKey + (uint32_t)li * 2654435761u;
     if (sys_->BurnOneLimb(v, tick, key, world, cellOps, frontBudget, opsBudget))
       MarkInstancesDirty();
@@ -4043,7 +4151,7 @@ bool Mob::CarveLimbRadial(uint64_t bodyHandle, Vec3 centerWorldVoxel,
     // art rather than of whatever collider resolution the engine happened to
     // derive -- otherwise the same blast would tear differently on two rigs
     // that only differ in limb size.
-    const float jitterScale = (float)std::max(1u, def.skinScale);
+    const float jitterScale = (float)std::max(1u, SkinScaleOf(limb));
 
     // ---- crater shape (tuning.json gore.carve*) ----------------------------
     const auto& gt = CurrentTuning().gore;
@@ -4056,7 +4164,7 @@ bool Mob::CarveLimbRadial(uint64_t bodyHandle, Vec3 centerWorldVoxel,
     // CarveRadialAll does for its reject sphere).
     float limbExtent = 1.0f;
     {
-      const float inv = 1.0f / (float)std::max(1u, def.physScale);
+      const float inv = 1.0f / (float)std::max(1u, PhysScaleOf(limb));
       limbExtent = std::max(
           0.5f, 0.5f * Vec3{(float)limb.size.x, (float)limb.size.y,
                             (float)limb.size.z}.len() * inv);
@@ -4178,7 +4286,7 @@ void Mob::CarveRadialAll(Vec3 centerWorldVoxel, float radiusVoxels,
       phys_->GetTransform(l.body, xf);
       // cheap reject against the limb's bounding sphere. l.size is in
       // COLLIDER units, so it divides by physScale.
-      const float inv = 1.0f / (float)std::max(1u, def_->physScale);
+      const float inv = 1.0f / (float)std::max(1u, PhysScaleOf(l));
       float r =
           0.5f * Vec3{(float)l.size.x, (float)l.size.y, (float)l.size.z}.len() *
           inv;
@@ -4373,7 +4481,7 @@ void Mob::DetachLimb(int limbIndex, bool adopt) {
     // the debris body would fall back to its collider lattice and the limb
     // would visibly coarsen at the moment it came off.
     debris_->AdoptBody(limb.body, limb.voxels, limb.xf,
-                       limb.MicroRef(def.skinScale), def.physScale,
+                       limb.MicroRef(SkinScaleOf(limb)), PhysScaleOf(limb),
                        std::move(limb.skinVoxels), def.bleedMat);
     limb.skinVoxels.clear();
     limb.carved = false;
@@ -4436,7 +4544,7 @@ void Mob::Die() {
     DropBurnIndex(limb.burn);
     phys_->SetBodyKinematic(limb.body, false);
     debris_->AdoptBody(limb.body, limb.voxels, limb.xf,
-                       limb.MicroRef(def_->skinScale), def_->physScale,
+                       limb.MicroRef(SkinScaleOf(limb)), PhysScaleOf(limb),
                        std::move(limb.skinVoxels), def_->bleedMat);
     // NOTE THE ABSENT OnBodyReleasedToWorld. A limb that is SEVERED gets its
     // avatar-layer exemption stripped, but only after kSeverHoldSeconds
@@ -4918,7 +5026,7 @@ bool MobSystem::LoadState(const uint8_t* data, size_t len, uint32_t version) {
       L.anchorRoot = ls[i].anchorRoot;
       L.anchorLimb = ls[i].anchorLimb;
       if (L.microModel >= 0)
-        m.ReskinLimbMicro(L, def.skinScale, def.physScale);
+        m.ReskinLimbMicro(L, m.SkinScaleOf(L), m.PhysScaleOf(L));
       m.RebuildLimbBody((int)i);
     }
     // Severs second: DetachLimb recurses into children, and doing it after
@@ -4956,19 +5064,14 @@ bool Mob::EquipItem(const ItemDef* item, const char* context) {
   // Unequip first, always — including on a re-equip, so swapping weapons goes
   // through exactly one code path instead of a "replace in place" variant that
   // would have to duplicate the joint and body teardown.
+  //
+  // The weapon is NO LONGER GUARANTEED TO BE LAST: worn shells share the
+  // appended tail with it, so an armoured character who draws a sword and then
+  // puts on a hood has the blade in the middle. RemoveAppendedSlots owns that
+  // (mob.h); this used to be a `pop_back` and the assumption behind it is the
+  // one thing armour genuinely broke.
   if (heldSlot_ >= 0) {
-    MobLimb& old = limbs_[heldSlot_];
-    if (old.joint) phys_->DestroyJoint(old.joint);
-    if (old.body) phys_->RemoveBody(old.body);
-    // The slot is appended last, so popping it keeps limbs_/skel_/limbDefs_
-    // index-parallel with no renumbering. Anything holding a part index across
-    // an equip would be broken by a mid-vector erase; this cannot be.
-    limbs_.pop_back();
-    skel_.parts.pop_back();
-    limbDefs_.pop_back();
-    if ((int)hidden_.size() > heldSlot_) hidden_.pop_back();
-    anim_.partAlive.resize(skel_.parts.size());
-    anim_.springs.resize(skel_.parts.size());
+    RemoveAppendedSlots(heldSlot_, 1);
     heldSlot_ = -1;
     heldItem_.clear();
     heldPartIndex_ = -1;
@@ -5080,7 +5183,11 @@ bool Mob::EquipItem(const ItemDef* item, const char* context) {
   p.voxels.reserve(item->voxels.size());
   for (const PrefabVoxel& v : item->voxels) {
     uint32_t variant = ((uint32_t)(v.x * 7 + v.y * 13 + v.z * 29)) % 3u;
-    p.voxels.push_back({(int8_t)v.x, (int8_t)v.y, (int8_t)v.z, 0,
+    // `color` rides along, as it does for a body limb and for a worn shell.
+    // It used to be dropped here, which was invisible only because the one
+    // item in the game is unpainted — a painted weapon would have rendered in
+    // its bare material colours with nothing to say why.
+    p.voxels.push_back({(int8_t)v.x, (int8_t)v.y, (int8_t)v.z, v.color,
                         (uint16_t)(v.material | (variant << 12))});
   }
 
@@ -5154,8 +5261,678 @@ bool Mob::EquipItem(const ItemDef* item, const char* context) {
   // stay in step with the slot rather than being a second source of truth.
   heldPartIndex_ = slot;
   heldPart_ = ld.name;
+  // A weapon lattice is the ITEM's, at the ITEM's scale — not the wearer's
+  // skin. Recorded so every scale-taking operation on this slot (burn, carve,
+  // re-skin, drop) converts by the right divisor; before shells existed this
+  // happened to agree with the def on every rig in the repo, which is exactly
+  // the kind of agreement that stops being true without anybody noticing.
+  p.ownSkinScale = item->scale ? item->scale : 1u;
+  p.ownPhysScale = p.ownSkinScale;
   MarkInstancesDirty();
   return true;
+}
+
+// ============================================================================
+// THE APPENDED TAIL — worn shells and the held item
+//
+// Slots at or past `baseLimbs_` are not part of the authored rig. They are
+// appended by EquipItem (one) and WearItem (one per ItemCover), and they are
+// the only slots that may be removed from a live rig. See the long note on
+// RemoveAppendedSlots in mob.h for why removal ERASES rather than rebuilds.
+// ============================================================================
+
+bool Mob::AppendedInvariantHolds() const {
+  const size_t n = limbs_.size();
+  return skel_.parts.size() == n && limbDefs_.size() == n &&
+         hidden_.size() == n && anim_.partAlive.size() == n &&
+         anim_.springs.size() == n && (int)n >= baseLimbs_;
+}
+
+void Mob::RemoveAppendedSlots(int first, int count) {
+  if (count <= 0 || !phys_) return;
+  const int n = (int)limbs_.size();
+  // Refuse anything that is not wholly inside the appended tail. A caller that
+  // gets this wrong would be erasing an authored limb out from under every
+  // part index in the rig, so it fails loudly rather than corrupting quietly.
+  if (first < baseLimbs_ || first + count > n) {
+    std::printf(
+        "mob: RemoveAppendedSlots(%d,%d) is outside the appended tail "
+        "[%d,%d) — refused\n",
+        first, count, baseLimbs_, n);
+    return;
+  }
+
+  // Physics first, while the handles are still reachable.
+  for (int i = first; i < first + count; i++) {
+    MobLimb& L = limbs_[i];
+    if (L.joint) {
+      phys_->DestroyJoint(L.joint);
+      L.joint = 0;
+    }
+    if (L.body) {
+      phys_->RemoveBody(L.body);
+      L.body = 0;
+    }
+    // The brick is this slot's OWN copy-on-write clone the moment anything
+    // damaged it, and once the slot is gone nothing downstream will ever free
+    // it. ReleaseLimbMicro no-ops on an undamaged slot (shared model) and on a
+    // severed one (the brick went with the debris).
+    ReleaseLimbMicro(L);
+    DropBurnIndex(L.burn);
+  }
+
+  auto cut = [&](auto& v) {
+    if ((int)v.size() >= first + count)
+      v.erase(v.begin() + first, v.begin() + first + count);
+  };
+  cut(limbs_);
+  cut(skel_.parts);
+  cut(limbDefs_);
+  cut(hidden_);
+  cut(anim_.partAlive);
+  cut(anim_.springs);
+  // model/local are rebuilt from the skeleton every tick, but truncate them
+  // too: between here and the next PreTick something could read a stale entry
+  // past the end of the rig, and a size mismatch is the cheapest thing to
+  // avoid and the most annoying to diagnose.
+  cut(anim_.model);
+  cut(anim_.local);
+
+  // ---- fix up every index that referred past the hole ---------------------
+  // -1 means "that slot IS gone". No parent index needs fixing: an appended
+  // slot is never a parent (mob.h), so every surviving parent points below
+  // `first`. Checked rather than assumed, because the day somebody straps a
+  // pauldron to a pauldron this is the assertion that says so.
+  auto shift = [&](int s) {
+    if (s < first) return s;
+    if (s < first + count) return -1;
+    return s - count;
+  };
+  for (size_t i = 0; i < skel_.parts.size(); i++) {
+    const int par = skel_.parts[i].parent;
+    if (par >= first)
+      std::printf(
+          "mob: part \"%s\" was parented to an appended slot (%d) that has "
+          "just been removed — the rig is now inconsistent\n",
+          skel_.parts[i].name.c_str(), par);
+  }
+
+  if (heldSlot_ >= 0) {
+    heldSlot_ = shift(heldSlot_);
+    heldPartIndex_ = heldSlot_;
+    if (heldSlot_ < 0) {
+      heldItem_.clear();
+      heldPart_.clear();
+    }
+  }
+  for (size_t w = 0; w < worn_.size();) {
+    WornPiece& p = worn_[w];
+    for (size_t k = 0; k < p.slots.size();) {
+      const int s = shift(p.slots[k]);
+      if (s < 0) {
+        // ALL THREE, or the piece's own parallel arrays drift: `index` is the
+        // occlusion cache and `cover` says which ItemCover entry this shell
+        // came from, which is what CaptureWorn indexes the damage blob by.
+        // Dropping only `slots` would put a sleeve's holes on the hood.
+        p.slots.erase(p.slots.begin() + k);
+        if (k < p.index.size()) p.index.erase(p.index.begin() + k);
+        if (k < p.cover.size()) p.cover.erase(p.cover.begin() + k);
+      } else {
+        p.slots[k] = s;
+        k++;
+      }
+    }
+    if (p.slots.empty())
+      worn_.erase(worn_.begin() + w);
+    else
+      w++;
+  }
+
+  if (!AppendedInvariantHolds())
+    std::printf(
+        "mob: appended vectors fell out of step after a removal "
+        "(limbs %zu / parts %zu / defs %zu / hidden %zu / alive %zu)\n",
+        limbs_.size(), skel_.parts.size(), limbDefs_.size(), hidden_.size(),
+        anim_.partAlive.size());
+  MarkInstancesDirty();
+}
+
+// ---- one shell of a worn piece ---------------------------------------------
+//
+// A SHELL RIDES ITS LIMB. Unlike the held item — which is a foreign object
+// aligned hilt-to-socket and therefore needs its own placement block in
+// SubmitPose — a shell shares the covered limb's anchor and rotation exactly.
+// So its AnimPart rest transform is the IDENTITY, AnimFlatten puts it where
+// the covered part goes, and the ordinary kinematic drive loop places it with
+// no special case anywhere. The only authored number is where its own corner
+// sits relative to the limb's.
+int Mob::AppendWornShell(const ItemDef& item, const ItemCover& cover,
+                         int bodyLimb, const std::string& partName) {
+  if (!phys_ || bodyLimb < 0 || bodyLimb >= (int)limbs_.size()) return -1;
+  if (cover.voxels.empty()) return -1;
+  // A limb that has already come off cannot be covered. Not an error: an
+  // armless mob putting on a robe simply wears the parts of it that have
+  // somewhere to go.
+  if (!limbs_[bodyLimb].body) return -1;
+
+  const uint32_t itemScale = item.scale ? item.scale : 1u;
+
+  // ---- FIT: RESAMPLE TO THE WEARER THIS PIECE IS ACTUALLY ON --------------
+  //
+  // A shell is authored against ONE mannequin — `cover.fitBox` records whose
+  // limb, in world voxels. Anybody else's limb is a different size, and the
+  // difference is per-axis: a goblin is not a small human, it is a wide short
+  // one. So the lattice is resampled by the ratio of the two boxes and the
+  // authored offset is carried along by the same rationals, which is what
+  // makes "goblin helmets look right on anyone" CONTENT rather than a piece
+  // of art per species.
+  //
+  // Computed as INTEGER RATIONALS in the item's own micro units, not as a
+  // float scale: the resample indexes cells, and a float that lands a
+  // hair either side of an integer would resample differently on two machines
+  // for no reason anybody could see.
+  //
+  // Skipped entirely at ratio 1, which is the stock set on the stock human and
+  // therefore the overwhelmingly common case. It costs a comparison, and it
+  // matters for more than speed: at ratio 1 the shell keeps sharing the def's
+  // brick until something damages it, exactly as a body limb does.
+  IVec3 fitSrc{cover.size.x, cover.size.y, cover.size.z};
+  IVec3 fitDst = fitSrc;
+  Vec3 fitOffset = cover.offset;
+  if (cover.fitBox.x > 0.5f / (float)itemScale &&
+      cover.fitBox.y > 0.5f / (float)itemScale &&
+      cover.fitBox.z > 0.5f / (float)itemScale) {
+    // The wearer's own limb box, in the item's micro units. `limb.size` is in
+    // COLLIDER units, so it divides by that limb's phys scale to reach world
+    // voxels before it multiplies back up — using the wrong divisor here is
+    // the silent-joint-shift class of bug the skin/collider split exists to
+    // make impossible.
+    const MobLimb& hostLimb = limbs_[bodyLimb];
+    const float hostInv = 1.0f / (float)std::max(1u, PhysScaleOf(hostLimb));
+    const int wear[3] = {
+        (int)std::lround((float)hostLimb.size.x * hostInv * (float)itemScale),
+        (int)std::lround((float)hostLimb.size.y * hostInv * (float)itemScale),
+        (int)std::lround((float)hostLimb.size.z * hostInv * (float)itemScale)};
+    const int fit[3] = {
+        (int)std::lround(cover.fitBox.x * (float)itemScale),
+        (int)std::lround(cover.fitBox.y * (float)itemScale),
+        (int)std::lround(cover.fitBox.z * (float)itemScale)};
+    int dst[3] = {fitSrc.x, fitSrc.y, fitSrc.z};
+    const int srcA[3] = {fitSrc.x, fitSrc.y, fitSrc.z};
+    float off[3] = {cover.offset.x, cover.offset.y, cover.offset.z};
+    bool any = false;
+    for (int a = 0; a < 3; a++) {
+      if (fit[a] <= 0 || wear[a] <= 0) continue;
+      // BOUNDED, like every other emergent quantity here. A fitBox that
+      // disagrees wildly with the wearer is a content error, and the honest
+      // failure is a garment that fits badly rather than one that allocates a
+      // lattice the size of a chunk.
+      int64_t d = ((int64_t)srcA[a] * wear[a]) / fit[a];
+      d = std::max<int64_t>(srcA[a] / 4, std::min<int64_t>(srcA[a] * 4, d));
+      dst[a] = (int)std::max<int64_t>(1, d);
+      off[a] = off[a] * (float)wear[a] / (float)fit[a];
+      if (dst[a] != srcA[a]) any = true;
+    }
+    if (any) {
+      fitDst = IVec3{dst[0], dst[1], dst[2]};
+      fitOffset = Vec3{off[0], off[1], off[2]};
+    }
+  }
+  const bool resampled = fitDst.x != fitSrc.x || fitDst.y != fitSrc.y ||
+                         fitDst.z != fitSrc.z;
+  std::vector<PrefabVoxel> fitted;
+  if (resampled) fitted = ResampleLattice(cover.voxels, fitSrc, fitDst);
+  const std::vector<PrefabVoxel>& shellVox =
+      resampled ? fitted : cover.voxels;
+  const IVec3 shellSize = resampled ? fitDst : cover.size;
+  // The shell's COLLIDER pitch is the wearer's, not the item's: a Jolt body
+  // built at the art's own resolution would be an order of magnitude more
+  // boxes than the limb it wraps, for a shape the physics never needs that
+  // finely. Data still flows skin -> collider and never back, exactly as
+  // BuildRig arranges for a body limb, so the two lattices cannot drift.
+  const uint32_t physScale =
+      std::min(itemScale, std::max(1u, def_ ? def_->physScale : 1u));
+  const uint32_t ratio = std::max(1u, itemScale / std::max(1u, physScale));
+
+  const int slot = (int)limbs_.size();
+  limbs_.push_back(MobLimb{});
+  limbDefs_.push_back(MobLimbDef{});
+  skel_.parts.push_back(AnimPart{});
+  hidden_.push_back(0);
+
+  MobLimbDef& ld = limbDefs_[slot];
+  // Named for what it is and what it covers, so a printf about a rig part is
+  // legible and so DetachLimb's parent-by-name recursion finds it.
+  ld.name = "worn:" + item.name + ":" + partName;
+  ld.parent = limbDefs_[bodyLimb].name;
+  ld.joint = Physics::JointType::Fixed;   // a strap does not hinge
+  ld.hp = cover.hp;
+  ld.severable = true;                    // a cut strap drops the pauldron
+  ld.vital = false;                       // losing your hood is not fatal
+  // "worn" is deliberately NOT one of the figure tags (head/spine/arm/...), so
+  // main.cpp's BodySlotFor returns -1 for it and the HUD body diagram keeps
+  // counting the CREATURE's injuries rather than its wardrobe's.
+  ld.tag = "worn";
+  ld.microModel = cover.microModel;
+
+  AnimPart& ap = skel_.parts[slot];
+  ap.name = ld.name;
+  ap.parent = bodyLimb;
+  ap.tag = ld.tag;
+  ap.rest = Transform{};                          // identity: ride the limb
+  ap.anchorLocal = skel_.parts[bodyLimb].anchorLocal;
+
+  const MobLimb& host = limbs_[bodyLimb];
+  MobLimb& p = limbs_[slot];
+  p.hp = cover.hp;
+  p.microModel = cover.microModel;
+  p.ownSkinScale = itemScale;
+  p.ownPhysScale = physScale;
+  // restOffset MEANS THE MODEL'S MIN CORNER in the creature's rest frame —
+  // the contract every other part keeps and what the drive loop assumes when
+  // it recovers the corner with anchorW - Rotate(rot, anchorLimb).
+  p.restOffset = host.restOffset + fitOffset;
+  // Same anchor as the limb it wraps, which is what `ap.rest` being the
+  // identity means geometrically. anchorLimb is that anchor measured from this
+  // part's own corner — the identical `anchor - restOffset` relationship a
+  // body limb states.
+  p.anchorRoot = host.anchorRoot;
+  p.anchorLimb = host.anchorRoot - p.restOffset;
+
+  // Skin, then the collider derived from it by the same majority-fill the
+  // body path uses. `color` rides along untouched: it is ART (the .col layers
+  // are where a black robe gets its black), independent of the material, and
+  // only the material reaches the collider.
+  if (ratio > 1) {
+    p.skinVoxels.reserve(shellVox.size());
+    for (const PrefabVoxel& v : shellVox) {
+      const uint32_t variant =
+          ((uint32_t)(v.x * 7 + v.y * 13 + v.z * 29)) % 3u;
+      p.skinVoxels.push_back(
+          {v.x, v.y, v.z, (uint16_t)(v.material | (variant << 12)), v.color});
+    }
+    bool overflow = false;
+    p.voxels = DownsampleSkin(p.skinVoxels, ratio, &overflow);
+    if (overflow)
+      std::printf(
+          "mob: shell \"%s\" exceeded the collider's +-127 bound; part of it "
+          "was dropped from the collider (item scale too fine)\n",
+          ld.name.c_str());
+    p.size = IVec3{(shellSize.x + (int)ratio - 1) / (int)ratio,
+                   (shellSize.y + (int)ratio - 1) / (int)ratio,
+                   (shellSize.z + (int)ratio - 1) / (int)ratio};
+  } else {
+    p.size = shellSize;
+    p.voxels.reserve(shellVox.size());
+    for (const PrefabVoxel& v : shellVox) {
+      const uint32_t variant =
+          ((uint32_t)(v.x * 7 + v.y * 13 + v.z * 29)) % 3u;
+      p.voxels.push_back({(int8_t)v.x, (int8_t)v.y, (int8_t)v.z, v.color,
+                          (uint16_t)(v.material | (variant << 12))});
+    }
+  }
+  // A RESAMPLED SHELL NEEDS ITS OWN BRICK. The def's brick is the authored
+  // lattice at the authored size, shared by every instance of the item;
+  // drawing a resized shell through it would render the mannequin's helmet on
+  // the goblin's head. Packed into the SAME copy-on-write pool a damaged limb
+  // clones into, and marked owned (`carved`) so ReleaseLimbMicro returns it on
+  // unwear -- otherwise every equip would leak a brick.
+  //
+  // Pool exhaustion DEGRADES rather than crashes: the shell keeps its physics,
+  // its hp and its occlusion and simply draws at the authored size. That is
+  // the null-check lesson at ensureOwnedBrick, in the one other place a brick
+  // is allocated outside the loader.
+  if (resampled && MicroSet() && itemScale > 1) {
+    std::string log;
+    const int own = MicroBodyPack(*MicroSet(), shellVox, shellSize, itemScale,
+                                  "fit/" + ld.name, log);
+    if (own >= 0) {
+      p.microModel = own;
+      ld.microModel = own;
+      p.carved = true;   // "this slot owns its brick" -- the flag's real sense
+    } else if (!log.empty()) {
+      std::printf("%s", log.c_str());
+    }
+  }
+  p.voxelsAtSpawn =
+      (uint32_t)(p.HasFineSkin() ? p.skinVoxels.size() : p.voxels.size());
+  p.voxelsCharged = p.voxelsAtSpawn;
+
+  // Placed by the SAME two steps the drive loop takes, in the same order, so
+  // the wear frame and every frame after it agree and the shell does not pop
+  // into position: reach the anchor through the host, then back off to the
+  // corner the collider is built around.
+  const Quat hostQ{host.xf.quat[0], host.xf.quat[1], host.xf.quat[2],
+                   host.xf.quat[3]};
+  BodyTransform bxf{};
+  bxf.pos = host.xf.pos + Rotate(hostQ, host.anchorLimb) -
+            Rotate(hostQ, p.anchorLimb);
+  bxf.quat[0] = hostQ.x; bxf.quat[1] = hostQ.y;
+  bxf.quat[2] = hostQ.z; bxf.quat[3] = hostQ.w;
+  p.body = phys_->CreateDebrisBodyXf(p.voxels, bxf, DensityOf(), true,
+                                     1.0f / (float)std::max(1u, physScale));
+  if (p.body == 0) {
+    // The slot is still LAST at this point, so unwinding it is a pop.
+    limbs_.pop_back();
+    skel_.parts.pop_back();
+    limbDefs_.pop_back();
+    hidden_.pop_back();
+    return -1;
+  }
+  phys_->SetBodyKinematic(p.body, true);
+  if (AvatarLayer()) phys_->SetBodyAvatarLayer(p.body, true);
+  p.xf = bxf;
+  p.joint = phys_->CreateJoint(host.body, p.body, JointDescFor(ld, p.xf.pos));
+
+  anim_.partAlive.resize(skel_.parts.size(), 1);
+  anim_.springs.resize(skel_.parts.size(), SpringState{});
+  return slot;
+}
+
+bool Mob::WearItem(const ItemDef* item, int equipSlot,
+                   const WornDamage* damage) {
+  if (!def_ || !phys_ || !item) return false;
+  if (limbs_.empty()) return false;   // unspawned: nothing to put it on
+  if (item->cover.empty()) return false;
+
+  // Take off whatever was in this slot first, always — including on a
+  // re-wear, so swapping a hood for a helm goes through one path rather than a
+  // "replace in place" variant that would duplicate the teardown.
+  UnwearItem(equipSlot);
+
+  WornPiece piece;
+  piece.equipSlot = equipSlot;
+  piece.item = item->name;
+  for (const ItemCover& cv : item->cover) {
+    // BY LIMB NAME. A wearer with no such part simply skips that shell —
+    // that is what makes one authored helmet fit any humanoid rig, and it is
+    // deliberately not an error.
+    int host = -1;
+    for (int i = 0; i < baseLimbs_ && i < (int)limbDefs_.size(); i++)
+      if (limbDefs_[i].name == cv.part) { host = i; break; }
+    if (host < 0) continue;
+    const int slot = AppendWornShell(*item, cv, host, cv.part);
+    if (slot < 0) continue;
+    // PUT THE DAMAGE BACK. Indexed by the piece's own COVER ORDER rather than
+    // by the appended slot, because a cover entry that found no limb on this
+    // wearer is skipped and the two lists would then be out of step — a
+    // one-armed goblin would get its sleeve's holes on its hood.
+    const size_t coverIndex = (size_t)(&cv - item->cover.data());
+    if (damage && coverIndex < damage->shells.size() &&
+        !damage->shells[coverIndex].Empty())
+      RestoreShellLattice(slot, damage->shells[coverIndex]);
+    piece.slots.push_back(slot);
+    piece.index.push_back(WornPiece::ShellIndex{});
+    piece.cover.push_back((int)coverIndex);
+  }
+  if (piece.slots.empty()) return false;   // nothing of it found a home
+
+  // Nothing on this creature collides with anything else on it: a pauldron
+  // resting against a helmet would fight the solver every tick, exactly as a
+  // sword resting against a thigh would.
+  {
+    std::vector<uint64_t> handles;
+    for (const MobLimb& l : limbs_)
+      if (l.body) handles.push_back(l.body);
+    phys_->DisableCollisionsAmong(handles);
+  }
+
+  worn_.push_back(std::move(piece));
+  if (!AppendedInvariantHolds())
+    std::printf("mob: appended vectors fell out of step after WearItem\n");
+  MarkInstancesDirty();
+  return true;
+}
+
+bool Mob::UnwearItem(int equipSlot) {
+  for (size_t w = 0; w < worn_.size(); w++) {
+    if (worn_[w].equipSlot != equipSlot) continue;
+    // The slots of one piece are contiguous ONLY when nothing was appended
+    // between them, which is true today (WearItem appends them in one loop)
+    // but is not something to rely on. Removed one at a time, highest first,
+    // so each removal cannot renumber a slot this loop has not reached yet.
+    std::vector<int> slots = worn_[w].slots;
+    std::sort(slots.begin(), slots.end(), std::greater<int>());
+    for (int s : slots) RemoveAppendedSlots(s, 1);
+    // RemoveAppendedSlots drops a WornPiece once its last slot is gone, so the
+    // entry is already off `worn_` by here — but only if every slot really was
+    // one of its own. Sweep defensively rather than indexing back into a
+    // vector another call may have reshaped.
+    for (size_t k = 0; k < worn_.size(); k++)
+      if (worn_[k].equipSlot == equipSlot) {
+        worn_.erase(worn_.begin() + k);
+        break;
+      }
+    MarkInstancesDirty();
+    return true;
+  }
+  return false;
+}
+
+void Mob::RestoreShellLattice(int slot, const WornShellDamage& d) {
+  if (slot < 0 || slot >= (int)limbs_.size()) return;
+  MobLimb& L = limbs_[slot];
+  if (d.hp >= 0.0f) L.hp = d.hp;
+  if (d.lattice.empty()) return;
+
+  // The AUTHORITATIVE lattice, whichever it is: a shell with a separate skin
+  // carries its damage there and re-derives the collider, one with a single
+  // lattice carries it in the collider. Writing the derived side instead would
+  // be undone by the next re-derive (phys/lattice.h's one-way rule), which is
+  // a quiet way to lose exactly what this call exists to keep.
+  const uint32_t skinS = SkinScaleOf(L), physS = PhysScaleOf(L);
+  const uint32_t ratio = std::max(1u, skinS / std::max(1u, physS));
+  if (ratio > 1) {
+    L.skinVoxels.clear();
+    L.skinVoxels.reserve(d.lattice.size());
+    for (const PrefabVoxel& v : d.lattice) L.skinVoxels.push_back(v);
+    bool overflow = false;
+    L.voxels = DownsampleSkin(L.skinVoxels, ratio, &overflow);
+  } else {
+    L.skinVoxels.clear();
+    L.voxels.clear();
+    L.voxels.reserve(d.lattice.size());
+    for (const PrefabVoxel& v : d.lattice)
+      L.voxels.push_back({(int8_t)v.x, (int8_t)v.y, (int8_t)v.z, v.color,
+                          v.material});
+  }
+  // `voxelsAtSpawn` is the DENOMINATOR damage fractions are measured against
+  // and must stay the AUTHORED volume — resetting it to what is left would
+  // make a half-destroyed piece read as pristine and take another full
+  // piece's worth of damage to come apart.
+  L.voxelsCharged =
+      (uint32_t)(L.HasFineSkin() ? L.skinVoxels.size() : L.voxels.size());
+
+  // Art, then collider, in that order: ReskinLimbMicro may shift the limb
+  // origin and the body must be built from the voxels in their FINAL frame.
+  if (L.microModel >= 0) ReskinLimbMicro(L, skinS, physS);
+  RebuildLimbBody(slot);
+  DropBurnIndex(L.burn);
+  MarkInstancesDirty();
+}
+
+bool Mob::CaptureWorn(int equipSlot, WornDamage& out) const {
+  for (const WornPiece& p : worn_) {
+    if (p.equipSlot != equipSlot) continue;
+    out.Clear();
+    // Sized by the piece's COVER count, not by how many shells this wearer
+    // ended up with, so the blob means the same thing on the next body.
+    size_t n = 0;
+    for (int ci : p.cover) n = std::max(n, (size_t)ci + 1);
+    out.shells.resize(n);
+    for (size_t k = 0; k < p.slots.size() && k < p.cover.size(); k++) {
+      const int slot = p.slots[k];
+      const int ci = p.cover[k];
+      if (slot < 0 || slot >= (int)limbs_.size() || ci < 0) continue;
+      const MobLimb& L = limbs_[slot];
+      WornShellDamage& d = out.shells[(size_t)ci];
+      // ONLY WHAT DIFFERS FROM THE AUTHORED PIECE. An undamaged shell must
+      // produce an EMPTY entry, or every equip writes a full lattice into the
+      // save and the file grows by the size of the wardrobe rather than by the
+      // wounds. The authored values are right there in the rig's own limb def,
+      // which is the copy this instance was built from.
+      const float authoredHp =
+          slot < (int)limbDefs_.size() ? limbDefs_[slot].hp : L.hp;
+      if (L.hp != authoredHp) d.hp = L.hp;
+      const size_t now =
+          L.HasFineSkin() ? L.skinVoxels.size() : L.voxels.size();
+      if (now == (size_t)L.voxelsAtSpawn) continue;   // nothing lost
+      d.lattice.reserve(now);
+      if (L.HasFineSkin()) {
+        for (const PrefabVoxel& v : L.skinVoxels) d.lattice.push_back(v);
+      } else {
+        for (const DebrisVoxel& v : L.voxels)
+          d.lattice.push_back(PrefabVoxel{(int16_t)v.x, (int16_t)v.y,
+                                          (int16_t)v.z, v.payload, v.color});
+      }
+    }
+    return true;
+  }
+  return false;
+}
+
+const std::string& Mob::WornItem(int equipSlot) const {
+  static const std::string kNone;
+  for (const WornPiece& p : worn_)
+    if (p.equipSlot == equipSlot) return p.item;
+  return kNone;
+}
+
+const std::vector<int>& Mob::WornSlotsAt(int pieceIndex) const {
+  static const std::vector<int> kNone;
+  return (pieceIndex >= 0 && pieceIndex < (int)worn_.size())
+             ? worn_[pieceIndex].slots
+             : kNone;
+}
+
+bool Mob::LimbHasShells(int bodyLimb) const {
+  if (bodyLimb < 0) return false;
+  for (const WornPiece& p : worn_)
+    for (int s : p.slots)
+      if (s >= 0 && s < (int)skel_.parts.size() &&
+          skel_.parts[s].parent == bodyLimb)
+        return true;
+  return false;
+}
+
+// ---- the worn-occlusion probe ----------------------------------------------
+//
+// "Is the world actually touching this limb, or is it touching the robe over
+// it?" The burn pass cannot answer that on its own: a shell's voxels are
+// neither in the grid nor in the body limb's lattice, so fire lapping at a
+// sleeve reads to the arm underneath as fire lapping at the arm.
+//
+// Answered geometrically, and it reports the shell's MATERIAL rather than a
+// bool — which is what makes the mechanic emergent instead of a rule. The
+// flesh's neighbour simply becomes "cloth" instead of "fire", cloth-over-flesh
+// semantics fall out of the ordinary reaction table, and the moment the shell
+// burns through, the probe returns 0 there and the skin is exposed. No
+// integrity threshold, no armour value, nothing to tune.
+uint32_t Mob::WornAlong(int bodyLimb, const Vec3& from, const Vec3& dir,
+                        float dist) {
+  if (worn_.empty() || bodyLimb < 0) return 0;
+  for (WornPiece& piece : worn_) {
+    for (size_t k = 0; k < piece.slots.size(); k++) {
+      const int s = piece.slots[k];
+      if (s < 0 || s >= (int)limbs_.size()) continue;
+      if (skel_.parts[s].parent != bodyLimb) continue;
+      MobLimb& shell = limbs_[s];
+      if (!shell.body) continue;          // strap cut: it is not there any more
+      const bool fine = shell.HasFineSkin();
+      const size_t n = fine ? shell.skinVoxels.size() : shell.voxels.size();
+      if (n == 0) continue;
+      if (k >= piece.index.size()) continue;
+      WornPiece::ShellIndex& ix = piece.index[k];
+
+      // (Re)build the dense index whenever the lattice changed size. Carving
+      // and burning both COMPACT the lattice, so the count is a sufficient
+      // witness — and it is the same witness the save/restore path uses to
+      // decide a limb was carved.
+      if (ix.builtFor != n) {
+        IVec3 mn{1 << 30, 1 << 30, 1 << 30}, mx{-(1 << 30), -(1 << 30),
+                                                -(1 << 30)};
+        for (size_t i = 0; i < n; i++) {
+          const IVec3 q = fine ? IVec3{shell.skinVoxels[i].x,
+                                       shell.skinVoxels[i].y,
+                                       shell.skinVoxels[i].z}
+                               : IVec3{shell.voxels[i].x, shell.voxels[i].y,
+                                       shell.voxels[i].z};
+          mn.x = std::min(mn.x, q.x); mn.y = std::min(mn.y, q.y);
+          mn.z = std::min(mn.z, q.z);
+          mx.x = std::max(mx.x, q.x); mx.y = std::max(mx.y, q.y);
+          mx.z = std::max(mx.z, q.z);
+        }
+        const IVec3 dims{mx.x - mn.x + 1, mx.y - mn.y + 1, mx.z - mn.z + 1};
+        const uint64_t cells = (uint64_t)dims.x * dims.y * dims.z;
+        // Same refusal BuildBurnIndex makes, and for the same reason: a long
+        // diagonal sliver would allocate a lot to index very little. A refused
+        // shell simply does not occlude, which fails toward "the fire reaches
+        // the skin" — the honest direction to fail in.
+        if (cells > (1u << 20)) {
+          ix.builtFor = n;
+          ix.mat.clear();
+          ix.dims = IVec3{0, 0, 0};
+          continue;
+        }
+        ix.min = mn;
+        ix.dims = dims;
+        ix.mat.assign((size_t)cells, 0);
+        for (size_t i = 0; i < n; i++) {
+          const IVec3 q = fine ? IVec3{shell.skinVoxels[i].x,
+                                       shell.skinVoxels[i].y,
+                                       shell.skinVoxels[i].z}
+                               : IVec3{shell.voxels[i].x, shell.voxels[i].y,
+                                       shell.voxels[i].z};
+          const uint32_t m = fine
+                                 ? (uint32_t)(shell.skinVoxels[i].material &
+                                              0xFFFu)
+                                 : (uint32_t)(shell.voxels[i].payload & 0xFFFu);
+          // A material-0 tombstone is an unflushed burn: the voxel is already
+          // gone and must not go on occluding.
+          if (m == 0) continue;
+          const size_t ci = (size_t)(((q.z - mn.z) * (size_t)dims.y +
+                                      (q.y - mn.y)) *
+                                         (size_t)dims.x +
+                                     (q.x - mn.x));
+          ix.mat[ci] = (uint16_t)m;
+        }
+        ix.builtFor = n;
+      }
+      if (ix.mat.empty()) continue;
+
+      // World -> the shell's own lattice. The pose is read from `shell.xf` as
+      // the animation left it, NEVER re-read from Jolt: a live shell is
+      // kinematic and re-posed every tick, and a mid-pass re-read would test
+      // against a pose the rest of the burn pass was not computed against
+      // (gotcha-live-limb-carve-pose).
+      const Quat q{shell.xf.quat[0], shell.xf.quat[1], shell.xf.quat[2],
+                   shell.xf.quat[3]};
+      const float scale = (float)std::max(1u, SkinScaleOf(shell));
+      Vec3 l = RotateInv(q, from - shell.xf.pos) * scale;
+      // ONE transform for the whole march. A shell rides its limb, so the
+      // rotation does not change along the segment: the lattice-space step is
+      // the rotated direction, and moving 1/scale world voxels is one cell.
+      const float dl = dir.len();
+      const Vec3 stepL =
+          dl > 1e-6f ? RotateInv(q, dir * (1.0f / dl)) : Vec3{0, 0, 0};
+      // Bounded, like every other loop in this system: a caller asking for a
+      // long ray gets a truncated one rather than an unbounded cost.
+      const int steps =
+          std::min(kWornMarchMax, std::max(1, (int)(dist * scale) + 1));
+      for (int st = 0; st < steps; st++) {
+        const int lx = ifloor(l.x) - ix.min.x, ly = ifloor(l.y) - ix.min.y,
+                  lz = ifloor(l.z) - ix.min.z;
+        if (lx >= 0 && ly >= 0 && lz >= 0 && lx < ix.dims.x &&
+            ly < ix.dims.y && lz < ix.dims.z) {
+          const uint32_t m =
+              ix.mat[(size_t)(((size_t)lz * ix.dims.y + ly) * ix.dims.x + lx)];
+          if (m) return m;
+        }
+        l += stepL;
+      }
+    }
+  }
+  return 0;
 }
 
 void Mob::SetWeaponPose(Vec3 handOffset, Vec3 bladeDir, Vec3 bladeUp,

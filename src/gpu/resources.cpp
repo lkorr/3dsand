@@ -156,6 +156,19 @@ std::string ShaderConstantPrelude() {
   o << "const WATERBODY_STATE_WORDS : u32 = " << kWaterBodyStateWords << "u;\n";
   o << "const WATER_CHUNK_CAP : u32 = " << kWaterChunkCap << "u;\n";
   o << "const WATER_DRAIN_OPS : u32 = " << kWaterDrainOpsPerBody << "u;\n";
+  // M5: the measured container curve and the split map, which live past the end
+  // of the ledger in the SAME buffer (world.h's kWaterCurveBase block says why).
+  // Generated for the reason every layout constant is: WATER_CURVE_BASE is
+  // arithmetic over three other caps, and a shader that recomputed it would go
+  // on reading the old offset the day one of them moved.
+  o << "const WATER_SPLIT_GRID : u32 = " << kWaterSplitGrid << "u;\n";
+  o << "const WATER_SPLIT_CELLS : u32 = " << kWaterSplitCells << "u;\n";
+  o << "const WATER_SPLIT_WORDS : u32 = " << kWaterSplitWords << "u;\n";
+  o << "const WATER_CURVE_MAXY : u32 = " << kWaterCurveMaxY << "u;\n";
+  o << "const WATER_SWEEP_HEADER : u32 = " << kWaterSweepHeaderWords << "u;\n";
+  o << "const WATER_CURVE_WORDS : u32 = " << kWaterCurveWords << "u;\n";
+  o << "const WATER_CURVE_BASE : u32 = " << kWaterCurveBase << "u;\n";
+  o << "const WATER_SCRATCH_BASE : u32 = " << kWaterSweepScratchBase << "u;\n";
   // Far-field cascades (render-only LOD, DESIGN.md §9). The far field lives on
   // its own kFarN^3 grid, decoupled from the window; level k (1-based) cells
   // span 2^(k + FAR_SHIFT_BASE) fine voxels (see world.h).
