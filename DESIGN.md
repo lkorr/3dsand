@@ -2465,13 +2465,19 @@ world hash.
   path. Adopt once bodies carry their voxel payloads (M6).
 - **Far-field cascades (implemented 2026-08-19; docs/PLAN_far_field_cascades.md):**
   view distance beyond the residency window comes from kFarLevels nested
-  toroidal kFarN³ (256³) volumes centered on the player, one material byte per
+  toroidal kFarN³ (512³ since 2026-08-29; was 256³) volumes centered on the player, one material byte per
   cell. The far grid is DECOUPLED from the window size (phase 5, when the
   window went 512³): level k cells span 2^(k + kFarShiftBase) fine voxels with
   the shift base chosen so level k's box edge is always 2^k WINDOW edges —
-  cascade distances scale with the window at constant memory (128 MiB total at
-  kFarLevels = 8; outermost half-extent = 256× the window radius ≈ 4 km at the
-  512³ window and 6.25 cm voxels). Levels are filled on the GPU by sampling `genCell()` at stride
+  cascade distances scale with the window at constant memory (1024 MiB total at
+  kFarLevels = 8 and kFarN = 512, measured with `SANDVOX_GPUMEM=1`; outermost
+  half-extent = 256× the window radius = 6553.6 m at the 512³ window and 10 cm
+  voxels, asserted by the `far-fog` gate). kFarN went 256 → 512 on 2026-08-29
+  to halve the apparent cascade block from ~6 px to ~3 px: because a cascade
+  cell is POINT-SAMPLED at its centre voxel, cell size is also the size of the
+  smallest authored structure that survives the horizon, which is the LOD's
+  worst case and the one player-built content lands in.
+  Levels are filled on the GPU by sampling `genCell()` at stride
   (worldgen.wgsl `far` — the "sieve"), recentered with hysteresis like the
   streaming window, and refilled a plane at a time (≤ kFarListCap
   level-chunks/tick, managed by `sim/farfield`). **Edits reach the far field

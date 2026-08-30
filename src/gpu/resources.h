@@ -1,5 +1,7 @@
 #pragma once
+#include <cstdint>
 #include <string>
+#include <vector>
 
 #include "gpu/rhi.h"
 
@@ -7,6 +9,21 @@
 // parts. (The seam itself is gpu/rhi.h.)
 rhi::Buffer CreateBuffer(const rhi::Device& device, uint64_t size,
                          rhi::BufferUsage usage, const char* label);
+
+// ---- GPU buffer budget (diagnostics) ---------------------------------------
+// CreateBuffer above is the single choke point for every buffer the engine
+// owns, so it records one of these per allocation. This exists so that a
+// question like "what does kFarN=512 or a 1024^3 window actually cost?" is
+// answered by an allocation record instead of by re-deriving constants on
+// paper. Never read by the sim, never hashed.
+struct GpuBufferRecord {
+  std::string label;
+  uint64_t bytes;
+};
+uint64_t GpuBufferBytesTotal();
+const std::vector<GpuBufferRecord>& GpuBufferRecords();
+// Prints every buffer >= 1 MiB largest-first, plus a rolled-up tail and total.
+void DumpGpuBufferBudget(const char* whenLabel);
 
 // The world constants, emitted as WGSL `const` declarations generated from the
 // C++ definitions in sim/world.h, so the two can never disagree. Prepended
