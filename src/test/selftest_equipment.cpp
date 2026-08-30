@@ -266,8 +266,16 @@ Status GateArmorWear(Ctx& c, std::string& detail) {
                                         {footA}, 4, mat, fixtureMicro);
 
   mobs.Reset();
-  const int h = World::TerrainHeight(150, 150, kDefaultSeed);
-  const uint64_t id = mobs.Spawn(avDef, {150, h + 1, 150});
+  // ANCHORED TO THE LIVE WINDOW, never an absolute column. By the time this
+  // runs in a full suite, earlier gates have walked the residency window along
+  // x, and a fixture outside it is simply not simulated -- the trap
+  // selftest.h's ordering note describes and `mob-burn` has already paid for
+  // once. It passes either way today because nothing here writes to the world,
+  // which is exactly why it would have rotted silently.
+  const IVec3 wOrg = c.world.WindowOrigin();
+  const int sx = wOrg.x * (int)kChunk + 150, sz = wOrg.z * (int)kChunk + 150;
+  const int h = World::TerrainHeight(sx, sz, kDefaultSeed);
+  const uint64_t id = mobs.Spawn(avDef, {sx, h + 1, sz});
   Mob* mob = mobs.FindMobById(id);
   if (!mob) {
     detail = "spawn failed";
@@ -1139,8 +1147,11 @@ Status GateArmorFit(Ctx& c, std::string& detail) {
   asSmallMannequin.cover[0].fitBox = asAuthored.cover[0].fitBox * 0.6f;
 
   mobs.Reset();
-  const int h = World::TerrainHeight(160, 160, kDefaultSeed);
-  const uint64_t id = mobs.Spawn(avDef, {160, h + 1, 160});
+  // Window-anchored for the same reason armor-wear is; see the note there.
+  const IVec3 wOrg = c.world.WindowOrigin();
+  const int sx = wOrg.x * (int)kChunk + 160, sz = wOrg.z * (int)kChunk + 160;
+  const int h = World::TerrainHeight(sx, sz, kDefaultSeed);
+  const uint64_t id = mobs.Spawn(avDef, {sx, h + 1, sz});
   Mob* m = mobs.FindMobById(id);
   if (!m) {
     detail = "spawn refused";
