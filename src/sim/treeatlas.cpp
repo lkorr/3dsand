@@ -142,10 +142,27 @@ bool LoadTreeAtlas(const std::string& dir, const std::vector<MaterialDef>& mats,
   out = TreeAtlas{};
   char buf[512];
 
-  // Engine material ids are 1-based indices into `mats`, the same convention
-  // every other name resolution in the engine uses.
+  // AN ENGINE MATERIAL ID IS THE INDEX INTO `mats`, NOT THE INDEX PLUS ONE.
+  // `mats` already carries AIR at index 0 — LoadAssets synthesises it and it is
+  // not in materials.json — so the +1 that a 1-based table would need has
+  // already been paid for by that entry. Every other resolver in the engine
+  // agrees (FindMaterial in materials.cpp, FindMaterialId in debris.cpp and
+  // mob.cpp all return `(int)i`), and so does VoxPaletteJson, which emits
+  // `"id": i` for the browser.
+  //
+  // This line read `i + 1` and it is worth saying exactly what that cost,
+  // because the failure was SILENT: every name still resolved, so nothing was
+  // reported, and every tree simply wore the material one slot along from the
+  // one it named. `wood` became `sand` (a POWDER: trunks rained out of the
+  // canopy, and the branches they had been holding up came loose and were
+  // converted to rigidbodies by the support scan), `birch_wood` became `petal`
+  // (trees made of flowers), `bark_light` became id 111 — one PAST the end of
+  // the table, so the shader read a garbage MaterialGpu and the branch
+  // skeleton rendered as transparent, non-colliding ghosts — and all three
+  // leaf tiers shifted, which is why the Trees tab's colours never matched the
+  // forest. One table, one wrong index, five apparently unrelated bugs.
   std::unordered_map<std::string, uint32_t> byName;
-  for (size_t i = 0; i < mats.size(); i++) byName[mats[i].name] = static_cast<uint32_t>(i + 1);
+  for (size_t i = 0; i < mats.size(); i++) byName[mats[i].name] = static_cast<uint32_t>(i);
 
   std::vector<fs::path> paths;
   std::error_code ec;

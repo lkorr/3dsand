@@ -737,7 +737,16 @@ async function refreshList(select) {
 // (This comment lives OUT here on purpose. Inside the template literal below,
 // the backticks it used to quote those class names closed the string.)
 const CSS = `
-#view-trees{display:flex;gap:12px;height:calc(100vh - 150px);min-height:520px}
+/* .active IS LOAD-BEARING, not decoration. tuner.html switches tabs with
+   '.view{display:none}' / '.view.active{display:block}', which are specificity
+   (0,1,0) and (0,2,0). A bare '#view-trees' is (1,0,0) and beats BOTH, so this
+   panel stayed display:flex on every tab and its 100vh height sat on top of
+   whichever one you actually clicked -- the Wiki tab rendered the tree editor.
+   '#view-trees.active' is (1,1,0): it still wins while the tab is open, and
+   matches nothing at all while it is closed, so '.view{display:none}' applies
+   again. Any future tab that needs a display mode other than block must be
+   written this same way. */
+#view-trees.active{display:flex;gap:12px;height:calc(100vh - 150px);min-height:520px}
 #view-trees .tgleft{width:360px;flex:0 0 360px;display:flex;flex-direction:column;gap:8px;min-height:0}
 #view-trees .tgright{flex:1;display:flex;flex-direction:column;gap:8px;min-width:0}
 #view-trees .tgbar{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
