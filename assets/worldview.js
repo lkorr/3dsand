@@ -664,24 +664,47 @@
   //
   // `opts.streaming === false` (set by that tab) is what stops update() from
   // asking a server that is not there for regions that do not exist.
-  WorldView.prototype.setLocalRegion = function (cells, nx, ny, nz, origin) {
-    var o = origin || [0, 0, 0];
-    var key = 'local';
-    var old = this.regions.get(key);
-    if (old) this._freeRegion(old);
+  // SEVERAL authored grids at once, each with its own size and world offset.
+  // The Trees tab's quad view is four separate trees rather than one composited
+  // grid on purpose: a 2x2 layout of great oaks in a single array is
+  // (2*231)^2*150 = 32M cells of which the trees occupy an eighth, and both the
+  // Uint16Array and the R16UI texture pay for all of it. Four regions pay for
+  // four trees.
+  //
+  // Keys are 'local0..N' and every entry keeps rx/ry/rz = 0, so _neighborSlabs
+  // (which looks up by regionKey) finds nothing for any of them — which is what
+  // we want: a missing neighbour meshes as OPAQUE and would otherwise weld the
+  // facing sides of two adjacent trees shut.
+  WorldView.prototype.setLocalRegions = function (list) {
+    var self = this;
+    this.regions.forEach(function (r) { self._freeRegion(r); });
     this.regions.clear();
     this.gen++;
-    var r = {
-      key: key, level: 0, rx: 0, ry: 0, rz: 0,
-      lod: 1, nx: nx, ny: ny, nz: nz,
-      origin: [o[0], o[1], o[2]],
-      cells: cells, tex: null, op: null, fl: null, meshing: false,
-      dirty: true, gen: this.gen, rev: 0
-    };
-    this.regions.set(key, r);
-    this._uploadTex(r);
+    var out = [];
+    for (var i = 0; i < list.length; i++) {
+      var e = list[i];
+      var o = e.origin || [0, 0, 0];
+      var r = {
+        key: 'local' + i, level: 0, rx: 0, ry: 0, rz: 0,
+        lod: 1, nx: e.nx, ny: e.ny, nz: e.nz,
+        origin: [o[0], o[1], o[2]],
+        cells: e.cells, tex: null, op: null, fl: null, meshing: false,
+        dirty: true, gen: this.gen, rev: 0
+      };
+      this.regions.set(r.key, r);
+      this._uploadTex(r);
+      out.push(r);
+    }
+    // _meshPass takes at most two in flight and _onWorker pumps the rest as
+    // each finishes, so two priming calls drain the whole list.
     this._meshPass();
-    return r;
+    this._meshPass();
+    return out;
+  };
+
+  WorldView.prototype.setLocalRegion = function (cells, nx, ny, nz, origin) {
+    return this.setLocalRegions(
+        [{cells: cells, nx: nx, ny: ny, nz: nz, origin: origin}])[0];
   };
 
   WorldView.prototype.update = function () {
@@ -822,8 +845,8 @@
     var eye = this.camEye();
     this.regions.forEach(function (r) {
       if (!r.dirty || r.meshing || !r.cells) return;
-      var ext = r.nx * r.lod;
-      var cx = r.origin[0] + ext / 2, cy = r.origin[1] + ext / 2, cz = r.origin[2] + ext / 2;
+      var cx = r.origin[0] + r.nx * r.lod / 2, cy = r.origin[1] + r.ny * r.lod / 2,
+          cz = r.origin[2] + r.nz * r.lod / 2;
       var pri = r.level * 1e6 + Math.hypot(cx - eye[0], cy - eye[1], cz - eye[2]);
       if (pri < bestPri) { bestPri = pri; pick = r; }
     });
@@ -1098,8 +1121,8 @@
     this.regions.forEach(function (r) {
       if (!r.op && !r.fl) return;
       if (!self._visible(r, mvp)) return;
-      var ext = r.nx * r.lod;
-      var cx = r.origin[0] + ext / 2, cy = r.origin[1] + ext / 2, cz = r.origin[2] + ext / 2;
+      var cx = r.origin[0] + r.nx * r.lod / 2, cy = r.origin[1] + r.ny * r.lod / 2,
+          cz = r.origin[2] + r.nz * r.lod / 2;
       list.push({r: r, d: Math.hypot(cx - eye[0], cy - eye[1], cz - eye[2])});
     });
     list.sort(function (a, b) { return a.d - b.d; });
@@ -1138,11 +1161,15 @@
   // under your feet. A box is out only when all eight corners fail the SAME
   // clip plane.
   WorldView.prototype._visible = function (r, mvp) {
-    var ext = r.nx * r.lod;
+    // PER AXIS, not r.nx three times. A streamed region is a cube so the two
+    // agree there, but an AUTHORED one is whatever shape it was handed: a tree
+    // is far taller than it is wide, and testing its box as nx^3 culls the
+    // crown the moment the camera looks up at it.
+    var ex = r.nx * r.lod, ey = r.ny * r.lod, ez = r.nz * r.lod;
     var o = r.origin;
     var all = 63;
     for (var i = 0; i < 8; i++) {
-      var x = o[0] + (i & 1 ? ext : 0), y = o[1] + (i & 2 ? ext : 0), z = o[2] + (i & 4 ? ext : 0);
+      var x = o[0] + (i & 1 ? ex : 0), y = o[1] + (i & 2 ? ey : 0), z = o[2] + (i & 4 ? ez : 0);
       var cx = mvp[0] * x + mvp[4] * y + mvp[8] * z + mvp[12];
       var cy = mvp[1] * x + mvp[5] * y + mvp[9] * z + mvp[13];
       var cz = mvp[2] * x + mvp[6] * y + mvp[10] * z + mvp[14];
@@ -1163,7 +1190,7 @@
     // than by editing: it is how you look inside a hill without carving it.
     if (this.view.sliceEnabled) {
       var ax = this.view.sliceAxis;
-      var lo = r.origin[ax], hi = lo + r.nx * r.lod;
+      var lo = r.origin[ax], hi = lo + [r.nx, r.ny, r.nz][ax] * r.lod;
       if (lo > this.view.slicePos) return;
       if (this.view.sliceThick > 0 && hi < this.view.slicePos - this.view.sliceThick) return;
     }

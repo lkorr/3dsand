@@ -1553,6 +1553,31 @@ tree's baked grid has something in this exact column, so `treeFromCands`
 typically runs zero or one iterations, and each one is a short scan of a
 column-RLE run list rather than fifteen segment-distance tests.
 
+**The clump primitive is a knob, not a constant** (2026-08-30). A crown built
+out of one shape can only ever be a pile of that shape, which is what made every
+early crown here read as a bunch of grapes. `foliage.clumpShape` picks among
+four — blob, plate (squashed along its axis: the tiered spray of a cedar),
+spray (stretched along it and thin across: a leafy shoot, not a ball), and cone
+(a spruce sprig) — and `foliage.clumpAxis` decides whether that axis is world-up
+or the twig the lobe grows on. All four are the same spheroid field measured in
+the clump's own frame, so they cost the same, they smooth-min to each other, and
+a crown may mix them. `foliage.hollow` eats the core out of every lobe: a real
+crown is a surface, and on an oak 0.7 is visually identical from outside for
+**half** the leaf voxels (54,771 → 26,354).
+
+Defaults are `clumpShape 0 / clumpAxis 0 / hollow 0`, and the field pass keeps a
+separate loop for exactly that case. Not laziness — the general loop computes
+the same spheroid but *reassociates* the arithmetic, and a float that
+reassociates moves a voxel, which moves the atlas, which moves the world hash.
+An opt-in knob must not re-bake ten species.
+
+The tab grew a **quad view** to go with it: four seeds at once, one per
+quadrant, under one orbit camera, because a shape knob is judged on a stand and
+not on a specimen. It is four WorldView regions at four origins rather than one
+composited grid — a 2x2 of great oaks in a single array is 32M cells of which
+the trees are an eighth, and both the array and its 3D texture would pay for the
+empty seven. Save, Bake and Export still act on the first tree.
+
 ##### The height contract (2026-08-26)
 
 > `World::TerrainHeight(x, z, seed)` ≡ `genColumn(x, z, seed).h`, **exactly**, for

@@ -193,6 +193,64 @@ async function waitFor(pred, ms){
     ok = await waitFor(function(){ return stats.textContent !== before; }, 20000);
     say(ok, 'a slider regenerates the tree');
 
+    // ---- 5d. the quad view -------------------------------------------------
+    // FOUR REGIONS, NOT ONE COMPOSITED GRID, is the design claim — so assert
+    // the region count, not just "the picture changed". A composite would show
+    // four trees and still be the thing this was written to avoid.
+    function rngByLabel(txt) {
+      var rows = document.querySelectorAll('#view-trees .tgrow');
+      for (var i = 0; i < rows.length; i++) {
+        var l = rows[i].querySelector('label');
+        if (l && l.textContent === txt) return rows[i].querySelector('.tgrng');
+      }
+      return null;
+    }
+    var oneRegion = wv.regions.size;
+    var quadBox = null;
+    document.querySelectorAll('#view-trees .tgbar label').forEach(function (l) {
+      if (/quad/.test(l.textContent)) quadBox = l.querySelector('input');
+    });
+    say(!!quadBox, 'the quad checkbox is on the toolbar');
+    var pre = stats.textContent;
+    quadBox.checked = true;
+    quadBox.dispatchEvent(new Event('change', {bubbles: true}));
+    ok = await waitFor(function(){ return /^quad /.test(stats.textContent); }, 30000);
+    say(ok, 'quad on: ' + stats.textContent.replace(/\s+/g, ' ').slice(0, 90));
+    say(wv.regions.size === 4, 'four separate regions, not one composited grid (' +
+        wv.regions.size + ')');
+    var ox = new Set();
+    wv.regions.forEach(function (r) { ox.add(r.origin.join(',')); });
+    say(ox.size === 4, 'four distinct origins (' + ox.size + ')');
+    // And it still REACHES THE FRAMEBUFFER — four regions that all mesh to
+    // nothing would pass every count above.
+    var qq = 0;
+    ok = await waitFor(function(){ wv.render(); qq = wv.stats.quads; return qq > 100; }, 40000);
+    say(ok, 'quad view meshed ' + qq.toLocaleString() + ' quads');
+    quadBox.checked = false;
+    quadBox.dispatchEvent(new Event('change', {bubbles: true}));
+    ok = await waitFor(function(){ return wv.regions.size === oneRegion; }, 30000);
+    say(ok, 'unchecking it goes back to ' + wv.regions.size + ' region');
+
+    // ---- 5e. foliage shape, and the leafy-level bound ----------------------
+    // `lowest leafy level` is bounded by `branch levels`: the deepest branch a
+    // tree HAS is levels-1, so a fixed 0..9 max made most of the slider mean
+    // "no leaves" and read as a broken control.
+    var lvl = rngByLabel('branch levels'), leafy = rngByLabel('lowest leafy level');
+    say(!!lvl && !!leafy, 'found the branch-levels and lowest-leafy-level rows');
+    say(leafy.max === lvl.value, 'lowest leafy level is capped at branch levels (' +
+        leafy.max + ' vs ' + lvl.value + ')');
+    var shp = rngByLabel('clump shape');
+    say(!!shp, 'the clump shape row exists (0 blob / 1 plate / 2 spray / 3 cone)');
+    before = stats.textContent;
+    shp.value = '2';
+    shp.dispatchEvent(new Event('input', {bubbles: true}));
+    ok = await waitFor(function(){ return stats.textContent !== before; }, 30000);
+    say(ok, 'clump shape 2 (spray) regenerated: ' +
+        stats.textContent.replace(/\s+/g, ' ').slice(0, 90));
+    say(!/NO FOLIAGE/.test(stats.textContent), 'and it still grew leaves');
+    shp.value = '0';
+    shp.dispatchEvent(new Event('input', {bubbles: true}));
+
     // ---- 6. the save routes -----------------------------------------------
     var src = await (await fetch('/api/model?path=trees/' + sel.value + '.json',
                                  {cache:'no-store'})).text();
