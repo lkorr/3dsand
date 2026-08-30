@@ -386,6 +386,15 @@ struct UIState {
     std::string kind;
     std::string tip;    // the tooltip body: damage, reach, whatever the def has
     int count = 0;
+    // ---- worn condition (game/equipment.h) ----------------------------------
+    // Voxels of the piece still present, over what it started with. 1 for
+    // anything that is not a worn piece, so a slot that never had a condition
+    // cannot be drawn as a full bar by accident — it simply has nothing to say.
+    // `ruined` is the tuning threshold already applied, so the panel never
+    // holds a second copy of the rule (game/equipment.h GearRuined).
+    float condition = 1.0f;
+    bool wearable = false;
+    bool ruined = false;
   };
   std::vector<KitSlotUI> bagSlots;      // Bag::kSlots, row-major
   std::vector<KitSlotUI> hotbarSlots;   // kItemSlots

@@ -3173,7 +3173,26 @@ bool Mob::CarveLimb(int limbIndex, World& world,
   limb.voxelsCharged = nowCount;
   const float lost = (float)lostCount / (float)at0;
   limb.hp -= lost * limbDefs_[limbIndex].hp * kCarveDamagePerVolume;
-  if (def.bleedMat) {
+  // ---- WHAT MAY BLEED, AND WHAT MAY NOT ------------------------------------
+  //
+  // Two exclusions, both of them reported as bugs and both of them the same
+  // mistake: this function is reached by causes that are not a cut, and it was
+  // written as though every caller were one.
+  //
+  //   * A GARMENT HAS NO BLOOD IN IT. A shell is a borrowed rig slot, so
+  //     `def.bleedMat` — the WEARER's blood — was being sprayed out of a
+  //     burning robe. See Mob::IsWornSlot.
+  //   * FIRE CAUTERISES. FlushBurn expresses a tick of burning as a carve and
+  //     fires every max(12, n>>6) voxels removed, so a limb on fire carves
+  //     itself dozens of times a second; each one topped the drip budget back
+  //     up, which is why being on fire read as haemorrhaging. Charring is not
+  //     a wound that bleeds, and the material chain (skin -> cooked -> burning
+  //     -> charred) is already the whole visual account of it.
+  //
+  // The HP CHARGE above is deliberately outside both: fire still kills you, and
+  // a burnt shell still loses its own durability. Only the blood is refused.
+  const bool bleeds = !inBurnFlush_ && !IsWornSlot(limbIndex);
+  if (def.bleedMat && bleeds) {
     // Centroid of what was removed, in limb-local WORLD voxels — the frame
     // woundLocal is read in (PreTick rotates it by the limb's live quat).
     // Taken on whichever lattice actually registered the carve, then divided
@@ -3390,7 +3409,11 @@ bool Mob::CarveLimb(int limbIndex, World& world,
   // bound; voicing both would double a single blow. `lost` is already the
   // fraction of the limb's volume removed, so `lost * kCarveDamagePerVolume`
   // is the fraction of its max hp — exactly what the hurt slot documents.
-  if (lost > 0.0f)
+  //
+  // A GARMENT DOES NOT CRY OUT. Same exclusion as the blood above: a hole
+  // opening in a hood is the hood's damage, not the wearer's, and voicing it
+  // made a burning robe sound like a mauling.
+  if (lost > 0.0f && !IsWornSlot(limbIndex))
     if (sys_)
     sys_->PushVoice(*this, MobSystem::VoiceKind::Hurt, limb.xf.pos,
                     lost * kCarveDamagePerVolume);
@@ -3754,7 +3777,14 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
   // same matter per tick as one roll on one grid voxel.
   if (!scanHot.empty()) {
     const int S = std::min<int>((int)v.scale, kBurnFaceSamplesMax);
-    uint32_t probes = kBurnScanCells;
+    // Its OWN budget, not the world-scan's. These count two different things —
+    // kBurnScanCells bounds how many world CELLS are looked at, this bounds how
+    // many face SAMPLES are transformed — and sharing one number silently tied
+    // "how big a neighbourhood may I look at" to "how much of my surface may
+    // catch this tick". With the face cull below in place a limb in acid spends
+    // these on faces that really do touch it, so the ceiling is now reached
+    // only by a body genuinely submerged.
+    uint32_t probes = kBurnSeedProbes;
     for (const IVec3& c : scanHot) {
       if (!probes) break;
       for (const IVec3& d : kBurnDirs) {
@@ -3769,6 +3799,30 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
         const Vec3 fc = Vec3{(float)c.x + 0.5f, (float)c.y + 0.5f,
                              (float)c.z + 0.5f} +
                         dv * (0.5f + 0.5f * inv);
+        // ---- CULL THE WHOLE FACE BEFORE SAMPLING IT -------------------------
+        //
+        // Five of these six directions fire AWAY from the limb, and each one
+        // was costing S*S transforms to discover that. At skinScale 8 that is
+        // 384 samples per reactive world cell, so a body submerged in acid ran
+        // its per-limb probe budget out on ~10 of the several hundred cells
+        // actually touching it — which is most of "acid does not do nearly
+        // enough damage", the rest being the rate (see the acid+tag:organic
+        // rule in reactions.json).
+        //
+        // One transform answers it. The S*S samples span half a world voxel
+        // either side of `fc` in the face plane, so in lattice units they lie
+        // within `scale/2 + 1` cells of its image; if that ball misses the
+        // lattice box entirely, none of them can seed anything. Conservative in
+        // the safe direction — it can only ever admit a face that has no
+        // voxels, never reject one that has.
+        {
+          const Vec3 lc = RotateInv(q, fc - v.xf->pos) * (float)v.scale;
+          const float r = (float)v.scale * 0.5f + 1.0f;
+          if (lc.x < (float)bm.x - r || lc.x > (float)(bm.x + bd.x) + r ||
+              lc.y < (float)bm.y - r || lc.y > (float)(bm.y + bd.y) + r ||
+              lc.z < (float)bm.z - r || lc.z > (float)(bm.z + bd.z) + r)
+            continue;
+        }
         for (int a = 0; a < S && probes; a++)
           for (int b = 0; b < S && probes; b++) {
             probes--;
@@ -4362,7 +4416,42 @@ void Mob::Sever(int limbIndex) {
           anchorW, id_, limbIndex, defIndex_, sys_->bladeCut_,
           sys_->bladeCut_ ? sys_->bladeSeverity_ : 1.0f});
 
-      DetachLimb(limbIndex, true);
+      // ---- A GARMENT THAT COMES OFF IS NOT AN AMPUTATION -------------------
+      //
+      // Everything below this point is GORE — a stump wound on the parent, an
+      // arterial gout armed for severDecayTicks, and a throw of conserved blood
+      // voxels. A worn shell reaching here means a robe burnt through or a
+      // strap was cut, and running the gore path on it sprayed the WEARER's
+      // blood out of their own coat. Suppressed for the same reason CarveLimb
+      // suppresses the drip: see Mob::IsWornSlot.
+      //
+      // FIRE IS THE OTHER SUPPRESSION, and it applies to real limbs too: an arm
+      // that burns THROUGH parts company already cauterised, and arming a gout
+      // there is the second half of "being on fire causes spurts like crazy".
+      const bool worn = IsWornSlot(limbIndex);
+      const bool gore = !worn && !inBurnFlush_;
+      // ...AND IT MUST NOT BECOME A RIGIDBODY INSIDE THE WEARER.
+      //
+      // DetachLimb(adopt=true) hands the slot to DebrisSystem, which makes it
+      // an ordinary dynamic body — spawned exactly overlapping the player
+      // capsule it was strapped to, and outside Layers::AVATAR, so Jolt's
+      // resolution of that overlap fires the player across the room. That is
+      // the reported "clothes burning off launches the player", and it is not
+      // a physics tuning problem: a garment consumed BY FIRE has nothing left
+      // to fall off, so there should be no body at all. Rags cut loose by a
+      // blade still drop, because that is a piece of gear hitting the floor.
+      const bool adopt = !(worn && inBurnFlush_);
+      DetachLimb(limbIndex, adopt);
+      if (!adopt) {
+        // Burnt to nothing: make the lattice say so, or CaptureWorn (which
+        // reads the shells, not the body) would record the last un-flushed
+        // state and the piece would come out of the wardrobe intact.
+        MobLimb& gone = limbs_[limbIndex];
+        gone.skinVoxels.clear();
+        gone.voxels.clear();
+        gone.hp = 0.0f;
+      }
+      if (!gore) return;
       // the stump bleeds: wound at the joint on the PARENT side
       for (size_t k = 0; k < limbDefs_.size(); k++)
         if (limbDefs_[k].name == ld.parent) {
@@ -5776,6 +5865,19 @@ bool Mob::CaptureWorn(int equipSlot, WornDamage& out) const {
       if (L.hp != authoredHp) d.hp = L.hp;
       const size_t now =
           L.HasFineSkin() ? L.skinVoxels.size() : L.voxels.size();
+      // CONDITION TRAVELS WITH THE BLOB, as two counts rather than as a
+      // percentage. The lattice below is the exact record and is the thing the
+      // armour mechanic actually reads; these are so the CHARACTER SCREEN can
+      // say "62%" about a piece sitting in the pack, where there is no shell to
+      // measure and re-deriving the denominator would mean re-running the fit
+      // resample against a wearer who is not currently wearing it.
+      //
+      // Written for EVERY shell, including undamaged ones, so the ratio is
+      // whole-piece rather than "the ratio over the shells that happened to be
+      // hurt". WornShellDamage::Empty() ignores them when they agree, so an
+      // untouched piece still costs nothing in the save.
+      d.atSpawn = L.voxelsAtSpawn;
+      d.live = (uint32_t)now;
       if (now == (size_t)L.voxelsAtSpawn) continue;   // nothing lost
       d.lattice.reserve(now);
       if (L.HasFineSkin()) {
@@ -5789,6 +5891,24 @@ bool Mob::CaptureWorn(int equipSlot, WornDamage& out) const {
     return true;
   }
   return false;
+}
+
+float Mob::WornCondition(int equipSlot) const {
+  for (const WornPiece& p : worn_) {
+    if (p.equipSlot != equipSlot) continue;
+    // Volume-weighted, not a mean of per-shell fractions: a robe is a torso
+    // shell and two sleeves, and averaging the fractions would let a sleeve
+    // burnt away count as much as the body of the garment.
+    uint64_t at0 = 0, now = 0;
+    for (int slot : p.slots) {
+      if (slot < 0 || slot >= (int)limbs_.size()) continue;
+      const MobLimb& L = limbs_[slot];
+      at0 += L.voxelsAtSpawn;
+      now += L.HasFineSkin() ? L.skinVoxels.size() : L.voxels.size();
+    }
+    return at0 ? std::min(1.0f, (float)now / (float)at0) : 1.0f;
+  }
+  return 1.0f;
 }
 
 const std::string& Mob::WornItem(int equipSlot) const {

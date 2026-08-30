@@ -106,6 +106,7 @@ void SavePlayerKit(const PlayerKitRefs& r, std::vector<uint8_t>& out) {
   //
   //   u32 pieces  then per piece: str item, u32 shells,
   //                 then per shell: f32 hp (-1 = as authored),
+  //                                 u32 atSpawn, u32 live   (v3, condition)
   //                                 u32 voxelCount, then per voxel:
   //                                   i32 x, i32 y, i32 z, u32 material,
   //                                   u32 colour
@@ -123,6 +124,8 @@ void SavePlayerKit(const PlayerKitRefs& r, std::vector<uint8_t>& out) {
     PutU32(out, (uint32_t)kv.second.shells.size());
     for (const WornShellDamage& sh : kv.second.shells) {
       PutF32(out, sh.hp);
+      PutU32(out, sh.atSpawn);
+      PutU32(out, sh.live);
       PutU32(out, (uint32_t)sh.lattice.size());
       for (const PrefabVoxel& v : sh.lattice) {
         PutU32(out, (uint32_t)(int32_t)v.x);
@@ -198,6 +201,8 @@ bool LoadPlayerKit(const PlayerKitRefs& r, const uint8_t* data, size_t len,
         WornShellDamage sh;
         const uint32_t hpBits = rd.U32();
         std::memcpy(&sh.hp, &hpBits, 4);
+        sh.atSpawn = rd.U32();
+        sh.live = rd.U32();
         const uint32_t nv = rd.U32();
         // A count that cannot fit is a corrupt file, not a very large robe.
         // Five u32 per voxel, so refuse BEFORE reserving whatever it asked

@@ -169,6 +169,18 @@ void ItemSlot(UIState& s, const char* id, ImVec2 at,
       ImGui::PopStyleColor();
       if (!item.kind.empty()) ImGui::TextDisabled("%s", item.kind.c_str());
       if (!item.tip.empty()) ImGui::TextUnformatted(item.tip.c_str());
+      // CONDITION, and only for something that can be worn: a sword has no
+      // shells to count, and printing "100%" against one would invent a
+      // durability stat this game deliberately does not have.
+      if (item.wearable) {
+        ImGui::TextDisabled("condition %.0f%%", item.condition * 100.0f);
+        if (item.ruined) {
+          ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(
+                                                   ui::ColBlood()));
+          ImGui::TextUnformatted("RUINED - too little left to mend");
+          ImGui::PopStyleColor();
+        }
+      }
     } else if (whyNot && *whyNot && !acceptsAnything) {
       ImGui::TextDisabled("empty");
       ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(

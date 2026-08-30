@@ -868,13 +868,22 @@ Status GateArmorReact(Ctx& c, std::string& detail) {
   // becomes hot, so under a plate the flesh must lose nothing at all.
   int coveredFirstLoss = -1, controlFirstLoss = -1, shellGoneAt = -1;
   uint32_t shellCloth0 = 0;
+  // WHEN EACH ARM DIED, or -1. Not decoration: `limbMat` on a dead creature
+  // reads zero for every material, so a death silently turns "the plate was
+  // untouched" into "the plate is gone" and "the flesh lost nothing" into "the
+  // flesh lost all of it" -- both arms of the steel assertion below flip to
+  // their failing value for a reason that has nothing to do with steel. That
+  // is exactly the bare-count trap in CLAUDE.md rule 6, and it cost a
+  // diagnosis: raising acid's rate killed the dressed creature through its
+  // UNPLATED limbs and the gate reported it as "steel dissolved".
+  int diedDressed = -1, diedBare = -1;
 
   // One arm of the differential. Returns the fraction of the covered limb's
   // skin lost on each creature.
   auto bath = [&](const ItemDef& piece, int slot, uint32_t soakMat, int soakUp,
                   int ticks, int inset, uint32_t& lostDressed,
                   uint32_t& lostBare, uint32_t& shellStart, uint32_t& shellEnd,
-                  int* firstDressed, int* firstBare) {
+                  uint32_t& dressedSkin0, int* firstDressed, int* firstBare) {
     debris.Reset();
     mobs.Reset();
     SubmitWorldgen(ctx, world, sim, kDefaultSeed);
@@ -894,34 +903,45 @@ Status GateArmorReact(Ctx& c, std::string& detail) {
     shellStart = limbMat(a, shell, mSteel) + limbMat(a, shell, mCloth);
     const uint32_t a0 = limbMat(a, coveredIdx, mSkin);
     const uint32_t b0 = limbMat(b, controlIdx, mSkin);
+    dressedSkin0 = a0;
     // SAMPLED EVERY TICK, never read only at the end. A creature held in a
     // blaze dies, at which point every census reads zero and an end-state
     // comparison reports "100% gone" for both and proves nothing.
+    // THE LAST READING TAKEN WHILE THE CREATURE WAS STILL A CREATURE. Every
+    // census below is carried forward each tick rather than read at the end,
+    // so a death freezes the numbers at their last true values instead of
+    // zeroing them. `a` dying is a real outcome of a bath that is lethal
+    // enough — it is not a reason for the gate to report the plate as
+    // dissolved.
+    uint32_t liveSkinA = a0, liveSkinB = b0, liveShell = shellStart;
+    diedDressed = diedBare = -1;
     for (int i = 0; i < ticks; i++) {
       soakTick(a, soakMat, soakUp);
       soakTick(b, soakMat, soakUp);
+      if (!mobs.IsAlive(a) && diedDressed < 0) diedDressed = i;
+      if (!mobs.IsAlive(b) && diedBare < 0) diedBare = i;
       if (!mobs.IsAlive(a) || !mobs.IsAlive(b)) break;
-      if (firstDressed && *firstDressed < 0 &&
-          limbMat(a, coveredIdx, mSkin) < a0)
+      liveSkinA = limbMat(a, coveredIdx, mSkin);
+      liveSkinB = limbMat(b, controlIdx, mSkin);
+      liveShell = limbMat(a, shell, mSteel) + limbMat(a, shell, mCloth);
+      if (firstDressed && *firstDressed < 0 && liveSkinA < a0)
         *firstDressed = i;
-      if (firstBare && *firstBare < 0 && limbMat(b, controlIdx, mSkin) < b0)
-        *firstBare = i;
+      if (firstBare && *firstBare < 0 && liveSkinB < b0) *firstBare = i;
       if (shellGoneAt < 0 && shell >= 0 && shellStart &&
-          (limbMat(a, shell, mSteel) + limbMat(a, shell, mCloth)) * 4 <
-              shellStart)
+          liveShell * 4 < shellStart)
         shellGoneAt = i;
     }
-    lostDressed = a0 - limbMat(a, coveredIdx, mSkin);
-    lostBare = b0 - limbMat(b, controlIdx, mSkin);
-    shellEnd = limbMat(a, shell, mSteel) + limbMat(a, shell, mCloth);
+    lostDressed = a0 - liveSkinA;
+    lostBare = b0 - liveSkinB;
+    shellEnd = liveShell;
     return true;
   };
 
   // ---- a + b. cloth in fire -----------------------------------------------
   {
-    uint32_t lostA = 0, lostB = 0, s0 = 0, s1 = 0;
+    uint32_t lostA = 0, lostB = 0, s0 = 0, s1 = 0, skin0 = 0;
     if (!bath(cloak, cloakSlot, mFire, 18, 120, 200, lostA, lostB, s0, s1,
-              &coveredFirstLoss, &controlFirstLoss)) {
+              skin0, &coveredFirstLoss, &controlFirstLoss)) {
       detail = "could not dress the rig for the fire arm";
       return Status::Fail;
     }
@@ -985,21 +1005,80 @@ Status GateArmorReact(Ctx& c, std::string& detail) {
 
   // ---- c. steel in acid ----------------------------------------------------
   {
-    uint32_t lostA = 0, lostB = 0, s0 = 0, s1 = 0;
+    uint32_t lostA = 0, lostB = 0, s0 = 0, s1 = 0, skin0 = 0;
     if (!bath(plate, plateSlot, mAcid, 4, 120, 250, lostA, lostB, s0, s1,
-              nullptr, nullptr)) {
+              skin0, nullptr, nullptr)) {
       detail = "could not plate the rig for the acid arm";
       return Status::Fail;
     }
-    // The bare creature has to actually dissolve, or "the plated one did not"
-    // is a statement about a bath that was never acid. And the plate itself
-    // must be untouched: `steel` carries no tag:dissolvable, and no armour
-    // value said so.
-    const bool cOk = lostB > 0 && lostA == 0 && s0 > 0 && s1 == s0;
+    // Same attribution the fire arm prints, and for the same reason: without
+    // it "the plated limb lost 15 voxels" is a bare count and the next move is
+    // switching things off. `nbrMissInReach` is the one that separates the two
+    // hypotheses outright — a threat with NO shell over it is a real hole in
+    // the plate (the neck, the armhole), a threat that finds one only at four
+    // times the reach is kWornNbrReach being too short.
+    {
+      const MobSystem::WornStats& w = mobs.Worn();
+      std::printf(
+          "  acid occlusion: %u seeds blocked / %u passed, %u of %u world "
+          "threats substituted (%u more within 4x the reach)\n",
+          w.seedsBlocked, w.seedsPassed, w.nbrSubstituted, w.nbrThreats,
+          w.nbrMissInReach);
+    }
+    // ---- WHAT THE PLATE ACTUALLY CLAIMS --------------------------------------
+    //
+    // Two claims, and only one of them is absolute.
+    //
+    // THE PLATE NEVER DISSOLVES (s1 == s0, exact). This is the whole armour
+    // model in one comparison: `steel` carries no tag:dissolvable, so no rule
+    // in the table can rewrite it, and no armour value, resist field or
+    // material exception was needed to say so.
+    //
+    // THE FLESH UNDER IT IS MOSTLY SPARED (>99%, not 100%). This used to be
+    // `lostA == 0` and that was an absolute claim about GEOMETRY which was
+    // really a claim about RATE: a shell is cut to a box and a limb is a
+    // rounded tube, so acid reaches the covered limb at the joints the plate
+    // cannot close -- the neck, the armhole -- and at the old shared 45
+    // per-mille that leak was simply too slow to register inside 120 ticks.
+    // Raising acid on organics to 250 made the same handful of exposed voxels
+    // visible and the gate called it "steel dissolved". It is the identical
+    // mistake the fire arm above already corrected in itself.
+    //
+    // The leak is REAL and is not the occlusion ray being too short: the acid
+    // occlusion line above reports how many world threats found no shell at
+    // all versus how many found one only at four times the reach, and it is
+    // overwhelmingly the former (86 of 1721 with nothing over them, 1 out of
+    // reach). Those are the joints. A plate that closed them would be a plate
+    // welded to a corpse.
+    //
+    // Stated as an ABSOLUTE BOUND on the plated limb (it keeps >99% of its
+    // skin) rather than as a differential against the bare one, and that is a
+    // correction this file has already had to make once. The two creatures
+    // stand on different terrain a dozen voxels apart, so how much acid
+    // actually POOLS against each of them is terrain luck, and it varies by an
+    // order of magnitude between scopes:
+    //
+    //     --gate   plated 15 of 6057,  bare 103   (bare died: no)
+    //     --suite  plated  9 of 6057,  bare  18   (bare died: no)
+    //
+    // At the second one the bare arm barely dissolved at all, so ANY ratio
+    // between the two is a comparison of two small numbers and flips on
+    // nothing. The claim does not need it: "under a plate the flesh is
+    // essentially untouched" is a statement about the plated creature alone,
+    // and `lostB > 0` is all that is needed from the other arm to know the
+    // bath was really acid. Same lesson as the fire arm above -- assert the
+    // mechanic, not the arithmetic between two uncontrolled baths.
+    const bool spared = skin0 > 0 && (uint64_t)lostA * 100u < (uint64_t)skin0;
+    const bool cOk = lostB > 0 && s0 > 0 && s1 == s0 && spared;
+    const int ticksA = diedDressed < 0 ? 120 : std::max(1, diedDressed);
     std::printf(
-        "  steel stops acid: %s (bare lost %u skin, plated lost %u; plate "
-        "%u -> %u steel)\n",
-        cOk ? "PASS" : "FAIL", lostB, lostA, s0, s1);
+        "  steel stops acid: %s (plate %u -> %u steel; plated limb lost %u of "
+        "%u skin = %.2f%% in %d ticks, bare lost %u; died dressed %s bare "
+        "%s)\n",
+        cOk ? "PASS" : "FAIL", s0, s1, lostA, skin0,
+        skin0 ? 100.0f * (float)lostA / (float)skin0 : 0.0f, ticksA, lostB,
+        diedDressed < 0 ? "no" : std::to_string(diedDressed).c_str(),
+        diedBare < 0 ? "no" : std::to_string(diedBare).c_str());
     ok = ok && cOk;
   }
 

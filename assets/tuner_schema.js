@@ -146,6 +146,20 @@ const TUNING_SCHEMA = [
       {k:'stateFollow', n:'injury follow', d:'How strongly the camera follows the body down when a dismemberment state lowers it (crawl, squirm). 1 rides the pose exactly; below 1 the camera stays a little higher than a crawling body, which frames it better than lying on the floor with it.', min:0, max:1, step:0.05},
       {k:'speedFov', n:'speed FOV', d:'Extra field of view at full sprint, added on top of the camera FOV and eased in. Sells speed without the player touching a setting. 0 disables.', min:0, max:0.4, step:0.01, u:'rad'},
       {k:'speedFovHalflife', n:'speed FOV smoothing', d:'Half-life of the speed FOV easing in and out. Short values punch; long values breathe.', min:0.01, max:2, step:0.01, u:'s'},
+      {k:'zoomStep', n:'wheel zoom step', d:'How much one mouse-wheel notch changes the boom, as a fraction of the tuned length. The wheel only zooms while the camera is in third person or over-shoulder; in first person it still picks a hotbar slot. 0 disables zooming.', min:0, max:1, step:0.01, u:'x'},
+      {k:'zoomMin', n:'closest zoom', d:'The nearest the wheel may pull the camera, as a MULTIPLIER on the boom length above rather than its own distance — so plain third and over-shoulder keep their authored relationship at every zoom level, and re-tuning either boom does not move where the player’s zoom sits.', min:0.05, max:4, step:0.05, u:'x'},
+      {k:'zoomMax', n:'farthest zoom', d:'The farthest the wheel may push the camera, same multiplier. World collision still pulls the boom in, so a large value is a ceiling rather than a promise.', min:0.05, max:8, step:0.05, u:'x'},
+    ],
+  },
+
+  {
+    id: 'gear',
+    title: 'Gear',
+    icon: '\u{1F6E1}',
+    apply: 'cpu',
+    blurb: 'Worn equipment. There is deliberately almost nothing here: armour in this engine has no resist numbers and no armour class — a piece protects by being geometrically IN THE WAY of whatever is coming (a ray, not a point), and it stops acid because steel carries no <code>dissolvable</code> tag rather than because a stat said so. What a piece has been through is its own voxels being carved and burnt away, which is why the one number below is measured in voxels remaining.',
+    params: [
+      {k:'ruinedCondition', n:'ruined below', d:'The fraction of its original voxels a worn piece has to keep to still count as gear rather than as rags. Below it the character screen calls the piece RUINED. It can still be worn — whatever is left still covers whatever it still covers — but this is the line a repair, and anything that scales with condition, is expected to refuse. Condition is voxels still present, not hp: hp also falls to blunt trauma, and it is not what the occlusion probe reads.', min:0, max:1, step:0.05},
     ],
   },
 

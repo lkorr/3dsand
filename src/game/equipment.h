@@ -206,8 +206,23 @@ inline bool EquipSlotAccepts(int slot, ItemKind kind) {
 // and a save.
 struct WornShellDamage {
   float hp = -1.0f;                  // < 0 = as authored
+  // ---- CONDITION, as two counts rather than as a fraction -------------------
+  // `live` of `atSpawn` voxels are still there. Both 0 means "never measured",
+  // which is what an entry for a piece that has not been worn since this was
+  // added looks like, and reads as whole.
+  //
+  // Kept ALONGSIDE the exact lattice, not instead of it, and the distinction is
+  // the one the save format's own note makes: the lattice is the truth (it puts
+  // the holes back where they were), these are a SUMMARY for a piece that is
+  // not on a body, where there is no shell to count and re-deriving the
+  // denominator would mean re-running the per-axis fit resample against a
+  // wearer who is not wearing it.
+  uint32_t atSpawn = 0;
+  uint32_t live = 0;
   std::vector<PrefabVoxel> lattice;  // empty = as authored
-  bool Empty() const { return hp < 0.0f && lattice.empty(); }
+  bool Empty() const {
+    return hp < 0.0f && lattice.empty() && live >= atSpawn;
+  }
 };
 
 struct WornDamage {
@@ -218,7 +233,42 @@ struct WornDamage {
     return true;
   }
   void Clear() { shells.clear(); }
+  // How much of the whole piece is still there, 0..1. Volume-weighted across
+  // its shells (Mob::WornCondition computes the same thing off the live rig and
+  // the two must agree): a robe is a torso shell and two sleeves, and a mean of
+  // per-shell fractions would let a burnt-off sleeve weigh as much as the body
+  // of the garment.
+  float Condition() const {
+    uint64_t a = 0, l = 0;
+    for (const WornShellDamage& s : shells) { a += s.atSpawn; l += s.live; }
+    if (!a) return 1.0f;
+    const float f = (float)l / (float)a;
+    return f < 0.0f ? 0.0f : (f > 1.0f ? 1.0f : f);
+  }
 };
+
+// ---- RUINED ------------------------------------------------------------------
+//
+// Past a point a piece is not damaged gear, it is rags: too little of it is
+// left to be worth mending, and — because protection here is geometric — too
+// little of it is left to be in the way of anything either. That threshold is a
+// TUNING VALUE (`gear.ruinedCondition`), not a constant, because the right
+// number is a feel judgement and hard-coding it would cost a rebuild to try 0.3
+// instead of 0.4.
+//
+// The comparison lives here as a named function so "what counts as ruined" has
+// exactly one spelling, and the threshold is PASSED IN rather than read: this
+// header deliberately has no engine coupling (see the note at the top), and
+// pulling sim/tuning.h in for one float would be the first crack in that.
+//
+// A piece can still be WORN while ruined. Nothing here refuses to equip it —
+// the shells that remain still occlude what they cover, and taking your last
+// scorched hood off because the game decided it was scrap would be worse than
+// wearing it. Ruin is what a repair, and anything that scales with condition,
+// is expected to refuse.
+inline bool GearRuined(float condition, float ruinedAt) {
+  return condition < ruinedAt;
+}
 
 struct Equipment {
   ItemStack slots[kEquipSlotCount];

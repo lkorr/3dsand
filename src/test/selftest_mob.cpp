@@ -2308,7 +2308,7 @@ Status GateMobBurn(Ctx& c, std::string& detail) {
                  mClothChar = matId("cloth_charred"), mSkin = matId("skin"),
                  mCooked = matId("flesh_cooked"),
                  mCharred = matId("flesh_charred"),
-                 mBurning = matId("flesh_burning");
+                 mBurning = matId("flesh_burning"), mBlood = matId("blood");
   if (!mFire || !mAcid || !mCloth || !mSkin || !mCooked || !mBurning) {
     detail = "body-reactivity materials missing from materials.json";
     return Status::Fail;
@@ -2396,6 +2396,21 @@ Status GateMobBurn(Ctx& c, std::string& detail) {
 
   uint32_t t = 12000;
   uint32_t mobFireOps = 0;
+  // FIRE DOES NOT BLEED. Counted in the same place the fire ops are, because
+  // both are "what the burn pass pushed into the world this tick" and neither
+  // can be recovered afterwards -- blood droplets are micro particles that die
+  // on contact, so an end-state census of the world cannot tell a body that
+  // never bled from one that bled and dried.
+  //
+  // Two independent streams, because burning reached the gore path by two
+  // different routes and closing one would have hidden the other:
+  //   * the DRIP -- CarveLimb topping up a limb's bleed budget on every burn
+  //     flush, i.e. dozens of times a second while alight;
+  //   * the GOUT -- Sever arming an arterial spray on the parent when a limb
+  //     finally burns through.
+  uint32_t burnBloodDrops = 0;
+  uint32_t burnBleedTicks = 0;
+  bool countBlood = false;
   // The residency window follows this. It is set per fixture rather than left
   // at the origin because a mob outside the window DESPAWNS: with the window at
   // chunk y 0 and the wizard standing at terrain height, every census below
@@ -2433,6 +2448,11 @@ Status GateMobBurn(Ctx& c, std::string& detail) {
     mobs.PreTick(t + 1, world, ops, cellOps, spawns);
     for (const CellOp& op : cellOps)
       if ((op.word & 0xFFFu) == mFire) mobFireOps++;
+    if (countBlood) {
+      for (const ParticleSpawn& s : spawns)
+        if ((s.payload & 0xFFFu) == mBlood) burnBloodDrops++;
+      if (!mobs.BleedSources().empty()) burnBleedTicks++;
+    }
     if (soakMat) {
       const Vec3 at = mobs.LimbVoxelPos(id, rootLimb, 0);
       const IVec3 b{ifloor(at.x), ifloor(at.y), ifloor(at.z)};
@@ -2669,11 +2689,14 @@ Status GateMobBurn(Ctx& c, std::string& detail) {
     mobs.ClearSeverStats();
     uint32_t peakAlight = 0;
     int deathTick = -1;
+    burnBloodDrops = burnBleedTicks = 0;
+    countBlood = true;
     for (int i = 0; i < 630; i++) {
       burnTick(id, 0, 0);
       peakAlight = std::max(peakAlight, alightInWorld());
       if (deathTick < 0 && !mobs.IsAlive(id)) deathTick = i;
     }
+    countBlood = false;
     const bool died = deathTick >= 0;
     const float worstSever = mobs.WorstSeverFraction();
     const std::string worstName = mobs.WorstSeverLimb();
@@ -2699,6 +2722,27 @@ Status GateMobBurn(Ctx& c, std::string& detail) {
              : "creature survived");
     std::fflush(stdout);
     ok = ok && hOk;
+
+    // ---- claim 3: FIRE CAUTERISES ------------------------------------------
+    //
+    // A creature burning to death, for 630 ticks, must not produce ONE drop of
+    // blood. Zero is the right threshold and not a strict one: burning reached
+    // the gore path through CarveLimb's drip and Sever's gout, both of which
+    // now refuse while `inBurnFlush_` is set, so any non-zero here means a
+    // third route nobody has found yet rather than a rate that needs tuning.
+    //
+    // Asserted on the SPAWN STREAM and on BleedSources, which are different
+    // things: the first is matter thrown into the world, the second is what the
+    // audio layer would turn into a wound loop. A body that quietly holds a
+    // full bleed budget while emitting nothing is still bleeding as far as
+    // every other system is concerned.
+    const bool dryOk = burnBloodDrops == 0 && burnBleedTicks == 0;
+    std::printf(
+        "  fire does not bleed: %s (%u blood droplets, %u of 630 ticks with an "
+        "open wound)\n",
+        dryOk ? "PASS" : "FAIL", burnBloodDrops, burnBleedTicks);
+    std::fflush(stdout);
+    ok = ok && dryOk;
     mobs.Reset();
     debris.Reset();
   }

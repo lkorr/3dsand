@@ -612,6 +612,21 @@ class Mob {
   // are file-order and die on an R reload (item.h's index hazard).
   const std::string& WornItem(int equipSlot) const;
   int WornPieceCount() const { return (int)worn_.size(); }
+  // HOW MUCH OF THE PIECE IS STILL THERE, 0..1, summed over its shells and
+  // weighted by their volume — one hole in a pauldron must not read the same as
+  // a robe burnt to rags. 1 for a slot wearing nothing, so a caller that does
+  // not check can only be told "whole".
+  //
+  // Voxels, not hp, because voxels are what the armour mechanic is: protection
+  // here is a shell being geometrically IN THE WAY, so the fraction of it that
+  // is still in the way is the honest measure of condition. hp is a rig
+  // durability number that also falls to blunt trauma and is not what the
+  // occlusion probe reads.
+  //
+  // LIVE — off the shells themselves. The blob in PlayerKit::wornDamage is only
+  // written when a piece comes OFF, so asking that while wearing it reports the
+  // condition it was in the last time it was taken off.
+  float WornCondition(int equipSlot) const;
   // Rig slots this piece occupies, for tests and for the occlusion probe.
   const std::vector<int>& WornSlotsAt(int pieceIndex) const;
   // Is `worldPos` inside a live voxel of any shell worn over `bodyLimb`?
@@ -930,6 +945,31 @@ class Mob {
   // Re-entrancy guard: FlushBurn expresses itself as a CarveLimb, and
   // CarveLimb flushes before it reads the lattice.
   bool inBurnFlush_ = false;
+
+  // ---- IS THIS RIG SLOT A GARMENT? -------------------------------------------
+  //
+  // The one question the gore path has to ask and could not. Armour is "a set
+  // of borrowed rig slots" (DESIGN.md 8c), which is what makes a shell burn,
+  // dissolve, carve and sever through the body's own machinery with no armour
+  // code -- and is exactly why the body's own machinery then treated a robe
+  // burning off the shoulders as a shoulder coming off: CarveLimb charged a
+  // wound and a drip budget, and Sever armed an arterial gout on the PARENT
+  // limb. Three reported symptoms, one missing distinction:
+  //
+  //   * "fire burning clothes off triggers blood spurts/dismemberment"
+  //   * "clothes burning off launches the player" (the shell was handed to
+  //     DebrisSystem as a dynamic body overlapping the wearer's own capsule)
+  //   * a burning garment reading as an injury on the body HUD
+  //
+  // Asked by TAG, not by index: `ld.tag == "worn"` is what AppendWornShell
+  // stamps and what main.cpp's BodySlotFor already keys the HUD off, so there
+  // is one spelling of "this is wardrobe, not anatomy" rather than two. The
+  // held item (an appended slot with the item's own tag) is deliberately NOT
+  // worn -- a sword cut out of the hand is not a garment and never bled.
+  bool IsWornSlot(int limbIndex) const {
+    return limbIndex >= baseLimbs_ && limbIndex < (int)limbDefs_.size() &&
+           limbDefs_[limbIndex].tag == "worn";
+  }
 
   // how long a severed piece holds its last animated pose before ragdolling
   static constexpr float kSeverHoldSeconds = 0.25f;
@@ -1482,6 +1522,13 @@ class MobSystem {
   // order 128 cells; this is the guard against a pathological pose, not a
   // budget anything normal comes near.
   static constexpr uint32_t kBurnScanCells = 4096;
+  // Face SAMPLES one limb may transform when seeding from world contact. A
+  // reactive cell touching the limb costs S*S of these (64 at skinScale 8), and
+  // the direction cull in BurnOneLimb means only faces that really do point at
+  // the limb spend any. Sized so a limb SUBMERGED in acid — a few hundred
+  // contact faces — seeds its whole wetted surface in one tick instead of a
+  // tenth of it, which is what it was doing while this shared kBurnScanCells.
+  static constexpr uint32_t kBurnSeedProbes = 32768;
   // Ticks a cold limb keeps its dense index before releasing it, so a limb
   // walking through a campfire does not rebuild the index every other tick.
   static constexpr uint32_t kBurnIndexGrace = 30;
