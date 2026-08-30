@@ -580,27 +580,40 @@ fn dayWeight() -> f32 {
   return R.sunUp * (1.0 - eclipseDim());
 }
 
-fn skyAirglow(rdIn : vec3f) -> vec3f {
-  let rd = normalize(rdIn);
-  let dayW = dayWeight();
+// ---- the tiers, split so the chain does its shared work ONCE ---------------
+// The three public entry points below stack: skyColor -> skyColorNoBodies ->
+// skyAirglow. Written as three self-contained functions, each re-normalized
+// the direction and each called dayWeight() — so ONE sky pixel paid three
+// normalize() and three pow() (dayWeight -> eclipseDim) for two values that
+// cannot differ between the levels. These *U variants take the unit direction
+// and the day weight as arguments; the wrappers keep the old signatures, so
+// every existing call site is unchanged and the ones that already pass
+// normalize(...) are not made to pay for it twice.
+fn skyAirglowU(rd : vec3f, dayW : f32) -> vec3f {
   var c = daySky(rd) * dayW;
   if (dayW < 0.999) { c += nightGlow(rd) * (1.0 - dayW); }
   return max(c, vec3f(0.0));
 }
 
-fn skyColorNoBodies(rdIn : vec3f) -> vec3f {
-  let rd = normalize(rdIn);
-  let dayW = dayWeight();
-  var c = skyAirglow(rd);
+fn skyColorNoBodiesU(rd : vec3f, dayW : f32) -> vec3f {
+  var c = skyAirglowU(rd, dayW);
   // Stars fade out under daylight rather than popping off.
   if (dayW < 0.999) { c += starField(rd) * (1.0 - dayW); }
   return max(c, vec3f(0.0));
 }
 
+fn skyAirglow(rdIn : vec3f) -> vec3f {
+  return skyAirglowU(normalize(rdIn), dayWeight());
+}
+
+fn skyColorNoBodies(rdIn : vec3f) -> vec3f {
+  return skyColorNoBodiesU(normalize(rdIn), dayWeight());
+}
+
 fn skyColor(rdIn : vec3f) -> vec3f {
   let rd = normalize(rdIn);
   let dayW = dayWeight();
-  var c = skyColorNoBodies(rd);
+  var c = skyColorNoBodiesU(rd, dayW);
   // The moons fade in as the sky darkens — including when it darkens because
   // one of them is in front of the sun. During totality the occulter is at
   // full strength, which is exactly what puts a black disc on the sun.
@@ -1386,7 +1399,6 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool) -> Hit {
   //
   // 0xFFFFFFFF is not a valid chunk index (they are < NUM_CHUNKS), so the first
   // iteration always misses and no separate priming step is needed.
-  var cchIdx = 0xFFFFFFFFu;
   var cchOcc = 0u;
   var cchPt = 0u;
   var cchMask0 = 0u;
@@ -1399,13 +1411,26 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool) -> Hit {
   // so an off build pays nothing for the experiment being kept.
   let subLoad = SUBOCC_SKIP;
 
+  // Window bounds as a plain integer box, hoisted. inBounds() -> inWindow()
+  // re-reads R.origin and recomputes `originChunk * CHUNK` on EVERY step of
+  // EVERY ray in the frame — and `wloI` above is that exact expression, three
+  // lines up. Same test, same result, no uniform load and no multiply per step.
+  let wloHi = wloI + vec3<i32>(i32(WORLD_N));
+  // Chunk-change detection on the CHUNK COORD rather than the linear index.
+  // chunkIndexW() costs 2 integer multiplies and 2 adds on top of the mask and
+  // shift, per step, to produce a value used only as an equality key — and the
+  // key only actually changes on ~1 step in 16. Compare the shifted coord (3
+  // shifts + a vec3 compare) and pay for the linear index inside the miss.
+  var cchC = vec3<i32>(0x7FFFFFFF);
+
   for (var i = 0; i < 4096; i++) {
     if (i >= maxSteps) { break; }
-    if (!inBounds(cell)) { break; }
+    if (any(cell < wloI) || any(cell >= wloHi)) { break; }
 
-    let chIdx = chunkIndexW(cell);
-    if (chIdx != cchIdx) {
-      cchIdx = chIdx;
+    let cc = cell >> vec3<u32>(CHUNK_SHIFT);
+    if (any(cc != cchC)) {
+      cchC = cc;
+      let chIdx = chunkIndexW(cell);
       cchOcc = occupancy[chIdx];
       cchPt = pageEntryOf(chIdx);
       if (subLoad) {
@@ -3193,7 +3218,11 @@ fn phaseHG(cosTheta : f32, g : f32) -> f32 {
   let d = 1.0 + g2 - 2.0 * g * cosTheta;
   // d can reach 0 only at g = 1, which LoadTuning clamps away from; the max()
   // is belt-and-braces against a hand-edited prelude.
-  return (1.0 - g2) / (4.0 * 3.14159265 * pow(max(d, 1e-4), 1.5));
+  // d^1.5 as d*sqrt(d), matching phaseMie() at the top of this file — the same
+  // function, written the cheap way there and with a pow() here. pow lowers to
+  // log2+mul+exp2 (three transcendental slots); this is one sqrt and one mul.
+  let dc = max(d, 1e-4);
+  return (1.0 - g2) / (4.0 * 3.14159265 * (dc * sqrt(dc)));
 }
 
 // ---- volumetric light shafts ----
@@ -4599,9 +4628,18 @@ fn heatSpill(cell : vec3<i32>, n : vec3f) -> vec3f {
     // up-facing rims sample sideways into the pool and glow pink.
     let c = cell + vec3<i32>(floor(n * s + vec3f(0.5)));
     if (!inBounds(c)) { break; }
+    // ONE address translation for both reads. chunkOcc() and voxWordAt() each
+    // recompute chunkIndexOf(c & WORLD_MASK) independently, so a tap that
+    // survives the reject paid for the same index twice — and voxWordAt then
+    // makes its voxels[] address DEPEND on its own pageTable[] load, which
+    // serialises two round trips. Hoisting the index and handing the entry to
+    // voxWordAtEntry is exactly what trace()'s DDA already does, and for the
+    // same reason (common.wgsl, "Hoisting the entry turns that into one
+    // independent load"). Same words read, same order, same result.
+    let ci = chunkIndexW(c);
     // chunk-level reject first: an empty or lava-free chunk costs one read
-    if (occTotal(chunkOcc(c)) == 0u) { continue; }
-    let mm = materials[voxMat(voxWordAt(c))];
+    if (occTotal(occupancy[ci]) == 0u) { continue; }
+    let mm = materials[voxMat(voxWordAtEntry(pageEntryOf(ci), c))];
     if (mm.klass == CLASS_LIQUID && (mm.flags & MATF_OPAQUE) != 0u &&
         mm.emission > 0u) {
       // inverse-square-ish falloff, normalised so a touching cell gives ~1
@@ -4849,20 +4887,37 @@ fn fluidNodeBase(c : vec3<i32>) -> i32 {
 // allowed to push its surface through its own ceiling. The blob model never
 // looked above 1 either (iso <= 1), so nothing there changes.
 fn fluidCellAt(c : vec3<i32>) -> vec3f {
+  // ---- ONE address translation for both halves of the cell ----------------
+  // This used to call fluidNodeBase(c) AND voxWordAt(c), which derive the SAME
+  // chunk slot by two different routes: chunkSlotIndex(worldChunkOf(c)) is
+  // ((c >> 4) & 31) and chunkIndexOf(c & WORLD_MASK) is ((c & 511) >> 4) —
+  // the same five bits of c. So the pair recomputed one index twice and, worse,
+  // ran two independent dependent-load chains (map -> grid, table -> voxels).
+  //
+  // This is the hottest tap in the water path: fluidRowAt takes 4 of these,
+  // fluidFieldAt 2-3 rows, and fluidNormalAt 4 fields — ~32 per water-pixel
+  // normal, on top of the march's own budget. Same words read, same order.
+  let wc = worldChunkOf(c);
+  let slot = chunkSlotIndex(wc);
   var m = 0.0;
   var vy = 0.0;
-  let b = fluidNodeBase(c);
-  if (b >= 0) {
-    m = f32(fluidGridR[u32(b)]) * (1.0 / 1024.0);   // Q10 -> particle masses
-    // Word 2 is the node's post-BC Y velocity, Q16.16 cells/tick; x30 for the
-    // tick rate puts it in voxels/second, the unit fluidSettleEps is authored
-    // in. It comes off the same grid row as the mass one word away, so in
-    // practice it is not a second fetch.
-    vy = abs(f32(fluidGridR[u32(b) + 2u])) * (30.0 / 65536.0);
+  if (chunkInWindow(wc, R.origin)) {
+    let bm = fluidBlockMapR[slot];
+    if (bm != 0u) {
+      let lo = vec3<u32>(c & vec3<i32>(CHUNK_MASK));
+      let b = ((bm - 1u) * CHUNK_VOL + (lo.z * CHUNK + lo.y) * CHUNK + lo.x) *
+              FLUID_GW;
+      m = f32(fluidGridR[b]) * (1.0 / 1024.0);   // Q10 -> particle masses
+      // Word 2 is the node's post-BC Y velocity, Q16.16 cells/tick; x30 for the
+      // tick rate puts it in voxels/second, the unit fluidSettleEps is authored
+      // in. It comes off the same grid row as the mass one word away, so in
+      // practice it is not a second fetch.
+      vy = abs(f32(fluidGridR[b + 2u])) * (30.0 / 65536.0);
+    }
   }
   var fill = m / max(TUNE_FLUID_REST_DENSITY, 1.0);
   var blocker = 0.0;
-  let w = voxWordAt(c);
+  let w = voxWordAtEntry(pageEntryOf(slot), c);
   let mat = voxMat(w);
   if (mat != MAT_AIR) {
     let k = materials[mat].klass;
@@ -5948,7 +6003,12 @@ fn shadeMpmFluid(ro : vec3f, rd : vec3f, fh : FluidHit, caMat : u32,
   // ---- Fresnel (Schlick, F0 from the tuner's IOR) ----
   let ior = max(TUNE_FLUID_IOR, 1.01);
   let f0 = ((ior - 1.0) / (ior + 1.0)) * ((ior - 1.0) / (ior + 1.0));
-  var fres = f0 + (1.0 - f0) * pow(1.0 - cosI, 5.0);
+  // Schlick's fifth power as a 3-multiply chain. A literal integer exponent
+  // through pow() is log2+mul+exp2 AND carries a relative error; x2*x2*x is
+  // exact and cheaper.
+  let sx = 1.0 - cosI;
+  let sx2 = sx * sx;
+  var fres = f0 + (1.0 - f0) * (sx2 * sx2 * sx);
   // A film thinner than a couple of cells is not a coherent mirror. Measured on
   // the COLUMN, not on the march's own thickness: a one-cell excited film on a
   // deep lake is the surface of that lake and reflects like one.
@@ -5970,7 +6030,10 @@ fn shadeMpmFluid(ro : vec3f, rd : vec3f, fh : FluidHit, caMat : u32,
   let refr = refract(rd, n, 1.0 / ior);
   var behind = sceneBehind;
   let refrW = 1.0 - caFrac;
-  if (colVox > 0.75 && refrW > 0.02 && length(refr) > 0.5) {
+  // dot > 0.25 rather than length > 0.5: sqrt is correctly rounded and
+  // monotone and both constants are exact, so this is the SAME predicate
+  // without the square root.
+  if (colVox > 0.75 && refrW > 0.02 && dot(refr, refr) > 0.25) {
     behind = mix(sceneBehind,
                  traceRefraction(hitP + refr * 0.75, refr, colVox, sceneBehind),
                  refrW);

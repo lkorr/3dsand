@@ -19,6 +19,8 @@
 #include "test/support.h"
 
 #include "sim/pagetable.h"
+#include "sim/rng_simd.h"  // rng::Pcg8 / JitterStateInRow8 (the simd gate)
+#include "sim/scan.h"      // scan::FirstIndexWhereMasked   (the simd gate)
 #include "sim/stream.h"  // RleEncodeChunk / RleEncodeSentinelChunk (fusion gate)
 
 using namespace sandvox;
@@ -2448,10 +2450,152 @@ Status GateDaylightBoundary(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---- simd: the derived vector forms equal their scalar definitions --------
+//
+// sim/scan.h and sim/rng_simd.h are strength reductions of loops that classify
+// and verify whole chunks (PageTable::Classify, the hysteresis free probe).
+// They are guarded by #if defined(__AVX2__), and A `#if` PROVES NOTHING ABOUT
+// THE BRANCH IT DID NOT COMPILE — so this gate compares the two IN THE SAME
+// BINARY rather than trusting that two build configurations agree.
+//
+// Two things here are genuinely new arithmetic rather than a mechanical
+// substitution, and they are the two this sweeps hardest:
+//   - Pcg8's vpsrlvd, which agrees with C++ `>>` only because (s>>28)+4 is
+//     always < 32. Every one of the 16 possible (s>>28) values is exercised.
+//   - Mod3_8's magic-number division by 3.
+//
+// It also exercises FirstIndexWhereMasked's SCALAR TAIL, which no production
+// call site can reach: every real caller passes n == kChunkVol (a multiple of
+// 8), so without this the tail would be untested code that ships.
+Status GateSimd(Ctx&, std::string& detail) {
+  uint32_t checked = 0, bad = 0;
+  std::string firstBad;
+
+  // ---- (a) FirstIndexWhereMasked vs its scalar definition ----------------
+  // Lengths straddling the 8-wide block, and a mismatch planted at EVERY
+  // index in turn (plus the no-mismatch case), against several masks.
+  {
+    const uint32_t masks[] = {0xFFFFFFFFu, 0xFF000FFFu, 0x00000FFFu, 0u};
+    const size_t lens[] = {0, 1, 7, 8, 9, 15, 16, 17, 31, 32, 33, 4096};
+    std::vector<uint32_t> buf(4096);
+    for (uint32_t mask : masks)
+      for (size_t n : lens) {
+        // planted == n means "no mismatch anywhere".
+        for (size_t planted = 0; planted <= n; planted++) {
+          for (size_t i = 0; i < n; i++) buf[i] = 0xAAAA5555u;
+          const uint32_t want = 0xAAAA5555u & mask;
+          if (planted < n) buf[planted] = 0xAAAA5555u ^ 0x1001u;
+          const size_t got =
+              scan::FirstIndexWhereMasked(buf.data(), n, mask, want);
+          const size_t exp =
+              scan::ScalarFirstIndexWhereMasked(buf.data(), n, mask, want);
+          checked++;
+          if (got != exp) {
+            bad++;
+            if (firstBad.empty()) {
+              char b[192];
+              std::snprintf(b, sizeof(b),
+                            "scan mask %08x n %zu planted %zu: got %zu want %zu",
+                            mask, n, planted, got, exp);
+              firstBad = b;
+            }
+          }
+          if (n > 64 && planted > 40) break;  // 4096 x 4096 is not the point
+        }
+      }
+  }
+
+#if defined(__AVX2__)
+  // ---- (b) Pcg8 vs rng::Pcg ---------------------------------------------
+  // Edge words, then a stride that walks the whole u32 range so every value of
+  // the (s>>28) shift selector is hit many times over.
+  {
+    std::vector<uint32_t> probe = {0u, 1u, 2u, 7u, 0xFFFFFFFFu, 0xFFFFFFFEu,
+                                   0x80000000u, 0x7FFFFFFFu, 0xC0FFEEu,
+                                   747796405u, 2891336453u, 277803737u};
+    // Force each of the 16 (s>>28) selectors: invert Pcg's first step so s
+    // lands in a chosen top nibble. s = v*A + B  =>  v = (s - B) * A^-1.
+    // A^-1 mod 2^32 for A = 747796405 is 3425556037.
+    for (uint32_t nib = 0; nib < 16; nib++) {
+      const uint32_t s = (nib << 28) | 0x0123456u;
+      probe.push_back((uint32_t)((s - 2891336453u) * 3425556037u));
+    }
+    for (uint64_t v = 0; v < 0x100000000ull; v += 0x3B9ACAull)  // ~1,100 samples
+      probe.push_back((uint32_t)v);
+    for (size_t i = 0; i + 8 <= probe.size(); i += 8) {
+      const __m256i in = _mm256_loadu_si256((const __m256i*)(probe.data() + i));
+      uint32_t out[8];
+      _mm256_storeu_si256((__m256i*)out, rng::Pcg8(in));
+      for (int k = 0; k < 8; k++) {
+        const uint32_t exp = rng::Pcg(probe[i + k]);
+        checked++;
+        if (out[k] != exp) {
+          bad++;
+          if (firstBad.empty()) {
+            char b[160];
+            std::snprintf(b, sizeof(b), "Pcg8(%08x): got %08x want %08x",
+                          probe[i + k], out[k], exp);
+            firstBad = b;
+          }
+        }
+      }
+    }
+  }
+
+  // ---- (c) JitterStateInRow8 vs JitterStateInRow (covers Mod3_8) ---------
+  // Real row seeds at real coordinates, including negative ones — the world
+  // is signed and the (uint32_t) cast of a negative coord is the documented
+  // two's-complement path both forms must take.
+  {
+    const int ys[] = {-4097, -16, -1, 0, 1, 15, 16, 4096};
+    const int zs[] = {-4097, -16, -1, 0, 1, 15, 16, 4096};
+    const int xs[] = {-4096, -17, 0, 16, 1024};
+    const uint32_t seeds[] = {0u, 1u, 0xC0FFEEu, 0xDEADBEEFu};
+    const __m256i lane = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
+    for (uint32_t seed : seeds)
+      for (int y : ys)
+        for (int z : zs)
+          for (int xb : xs) {
+            const uint32_t rowSeed = JitterRowSeed(y, z, seed);
+            uint32_t out[8];
+            _mm256_storeu_si256(
+                (__m256i*)out,
+                rng::JitterStateInRow8(
+                    rowSeed, _mm256_add_epi32(_mm256_set1_epi32(xb), lane),
+                    seed));
+            for (int k = 0; k < 8; k++) {
+              const uint32_t exp = JitterStateInRow(rowSeed, xb + k, seed);
+              checked++;
+              if (out[k] != exp) {
+                bad++;
+                if (firstBad.empty()) {
+                  char b[192];
+                  std::snprintf(b, sizeof(b),
+                                "jitter seed %08x y %d z %d x %d: got %u want %u",
+                                seed, y, z, xb + k, out[k], exp);
+                  firstBad = b;
+                }
+              }
+            }
+          }
+  }
+#endif
+
+  char buf[320];
+  std::snprintf(buf, sizeof(buf),
+                "%s path: %u derived==definition checks, %u mismatch%s%s%s",
+                scan::kHaveAvx2 ? "AVX2" : "SCALAR-ONLY (no __AVX2__)", checked,
+                bad, bad == 1 ? "" : "es", firstBad.empty() ? "" : " | first: ",
+                firstBad.c_str());
+  detail = buf;
+  return bad == 0 ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& SimGates() {
   static const std::vector<Gate> g = {
+      {"simd", "sim", {}, false, GateSimd},
       {"determinism", "sim", {}, false, GateDeterminism},
       {"sleep", "sim", {}, false, GateSleep},
       {"evaporation", "sim", {}, false, GateEvaporation},

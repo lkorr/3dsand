@@ -65,6 +65,13 @@ const char* const kOrder[] = {
     // neither disturb the pristine worldgen `terrain` needs nor be disturbed
     // by anything. Running it before the expensive gates also means a broken
     // equipment model is reported in the first second of a full run.
+    // FIRST OF ALL, for the same reason player-kit is early and then some:
+    // `simd` is pure arithmetic — no world, no GPU, no assets, no fixtures —
+    // so it can neither disturb pristine worldgen nor be disturbed. It asserts
+    // that sim/scan.h and sim/rng_simd.h compute what their scalar definitions
+    // compute, which is a precondition for trusting ANY later gate's page
+    // table: PageTable::Classify decides sentinel promotion with them.
+    "simd",
     "player-kit",
     // SECOND, and for the same reason: `tree-atlas` reads assets/trees/*.svtree
     // off disk and asserts on the bytes. No world, no GPU, no state left

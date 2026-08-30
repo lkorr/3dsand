@@ -455,6 +455,19 @@ if(MSVC)
   target_compile_options(sandvox PRIVATE $<$<CONFIG:Release>:/Zi>)
   target_link_options(sandvox PRIVATE
     $<$<CONFIG:Release>:/DEBUG /OPT:REF /OPT:ICF>)
+  # /arch:AVX2 is LOAD-BEARING and used to be an ACCIDENT. sim/scan.h and
+  # sim/rng_simd.h compile their vector paths under __AVX2__, which MSVC
+  # predefines only under this flag — and until now the flag reached this
+  # target solely as a side effect of Jolt's PUBLIC compile options
+  # (Jolt.cmake: target_compile_options(Jolt PUBLIC /arch:AVX2)). A Jolt bump,
+  # a USE_AVX2=OFF, or dropping the physics dependency would have silently
+  # reverted PageTable::Classify's hot loop to scalar with no diagnostic and no
+  # test failure — only a ~4x slower paged path. State it here instead.
+  #
+  # This changes nothing about the current build; it only stops the flag from
+  # being someone else's to remove. NOT /fp:fast — see the deliberate note on
+  # the Jolt options above; relaxed float must never reach the sim.
+  target_compile_options(sandvox PRIVATE /arch:AVX2)
 endif()
 
 # ---------------------------------------------------------------------------

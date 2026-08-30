@@ -2268,4 +2268,14 @@ class World {
   // chunks that were never copied). Set alongside PageTable::SetWorldSeed so
   // the two synthesis paths cannot disagree.
   uint32_t mirrorSeed_ = 0;
+
+  // Scratch for ONE sequential copy of the readback slot's per-chunk arrays
+  // (dirty / occupancy / support) before they are scanned. The slot is a
+  // persistently mapped host allocation, and a word-at-a-time scan of one is
+  // the worst possible consumer of it — the same mistake Stream::HarvestEvict
+  // documents and measures (stream.cpp, "One sequential copy out of
+  // write-combined map memory"). The mirror memcpy at the top of the readback
+  // callback already did this for its 432 KiB; these three arrays never got
+  // the same treatment. Sized once, on first use.
+  std::vector<uint8_t> snapBounce_;
 };

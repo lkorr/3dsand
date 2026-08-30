@@ -148,14 +148,26 @@ void RleEncodeSentinelChunk(uint32_t entry, IVec3 wc, uint32_t seed,
 }
 
 bool RleDecodeChunk(const uint32_t* rle, size_t pairs, uint32_t* out) {
+  // The decoded word is the stored word VERBATIM, and only because the
+  // never-stamp is zero. If that ever changes this must OR it back in, so
+  // assert it rather than leaving a `| 0` in the inner loop to imply it.
+  static_assert(kStampNever == 0,
+                "RleDecodeChunk emits the stored word unchanged because "
+                "kStampNever is 0 (= 'hasn't acted', so everything may move on "
+                "the first tick); a non-zero never-stamp must be OR'd back in");
   uint32_t i = 0;
   for (size_t p = 0; p < pairs; p++) {
-    uint32_t run = rle[p * 2];
-    uint32_t w = rle[p * 2 + 1];
-    if (i + run > kChunkVol) return false;
-    // kStampNever = "hasn't acted": everything may move on the first tick
-    for (uint32_t k = 0; k < run; k++)
-      out[i++] = w | (kStampNever << kStampShift);
+    const uint32_t run = rle[p * 2];
+    const uint32_t w = rle[p * 2 + 1];
+    // NO-WRAP form of `i + run > kChunkVol`. That test was 32-bit arithmetic
+    // on an attacker-influenced length: `run` comes off disk via the region
+    // store, and i=1, run=0xFFFFFFFF wraps the sum to 0, passes the guard, and
+    // fills ~4 G words past a 16 KiB buffer. `i <= kChunkVol` is an invariant
+    // here (it only ever advances by an accepted run), so the subtraction
+    // cannot underflow.
+    if (run > kChunkVol - i) return false;
+    std::fill_n(out + i, run, w);
+    i += run;
   }
   return i == kChunkVol;
 }

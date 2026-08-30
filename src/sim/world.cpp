@@ -393,23 +393,63 @@ void World::KickReadback() {
               const int mx = (int)(m % 3), my = (int)((m / 3) % 3),
                         mz = (int)(m / 9);
               const IVec3 wc{sl.base.x + mx, sl.base.y + my, sl.base.z + mz};
-              if ((e & kPtJitterBit) == 0u) {
-                const uint32_t w = SynthWord(e);
-                for (uint32_t i = 0; i < kChunkVol; i++) dst[i] = w;
+              // SynthWordAt returns 0 for air whatever the JITTER bit says
+              // (world.h), so an air-tagged JITTER sentinel must NOT take the
+              // row branch below — it would produce 0 | (state << 12). Classify
+              // refuses to mint JITTER(air), so this cannot arise today; the
+              // branch makes the equivalence unconditional instead of argued.
+              if ((e & kPtMatMask) == kMatAir) {
+                std::fill_n(dst, kChunkVol, 0u);
+              } else if ((e & kPtJitterBit) == 0u) {
+                std::fill_n(dst, kChunkVol, SynthWord(e));
               } else {
+                // ROW ORDER, as pagetable.cpp's JITTER verify and
+                // RleEncodeSentinelChunk already do it: Pcg(y) and the z term
+                // are loop-invariant across a row, so JitterRowSeed removes
+                // one of three PCG rounds per cell. Strictly derived from
+                // SynthWordAt (world.h says so, and page-roundtrip compares
+                // them) — this is a strength reduction, not a second rule.
                 const int bx = wc.x * (int)kChunk, by = wc.y * (int)kChunk,
                           bz = wc.z * (int)kChunk;
-                for (uint32_t i = 0; i < kChunkVol; i++)
-                  dst[i] = SynthWordAt(e, bx + (int)(i % kChunk),
-                                       by + (int)((i / kChunk) % kChunk),
-                                       bz + (int)(i / (kChunk * kChunk)),
-                                       mirrorSeed_);
+                const uint32_t mat = e & kPtMatMask;
+                const uint32_t stampBits = kStampNever << kStampShift;
+                uint32_t i = 0;
+                for (int lz = 0; lz < (int)kChunk; lz++)
+                  for (int ly = 0; ly < (int)kChunk; ly++) {
+                    const uint32_t rowSeed =
+                        JitterRowSeed(by + ly, bz + lz, mirrorSeed_);
+                    for (int lx = 0; lx < (int)kChunk; lx++, i++)
+                      dst[i] = mat |
+                               (JitterStateInRow(rowSeed, bx + lx, mirrorSeed_)
+                                << 12) |
+                               stampBits;
+                  }
               }
             }
             snap_.mirrorBase = sl.base;
             snap_.windowOrigin = sl.origin;
-            const uint32_t* dirtyW = (const uint32_t*)(p + kDirtyOff);
-            const uint32_t* occW = (const uint32_t*)(p + kOccOff);
+            // ---- ONE sequential copy of the per-chunk arrays -------------
+            // `p` is the persistently mapped readback slot. The mirror above
+            // is already memcpy'd out before it is touched; dirty/occ/support
+            // never were, and were scanned a word at a time (3 x 32,768 words
+            // = 384 KiB) straight out of mapped host memory, with occW[i]
+            // re-loaded three times per iteration. That is the exact consumer
+            // Stream::HarvestEvict warns about ("One sequential copy out of
+            // write-combined map memory; Classify then reads cached RAM").
+            //
+            // dirty, occ, the hash/pick/pcount block and support are
+            // contiguous in the slot layout at the top of this file, so ONE
+            // copy covers all of them. Rebasing by kDirtyOff lets every reader
+            // below keep its original `+ kXxxOff` form.
+            constexpr uint64_t kBounceBytes =
+                (kSupportOff + kSupportBytes) - kDirtyOff;
+            if (snapBounce_.size() < kBounceBytes) snapBounce_.resize(kBounceBytes);
+            std::memcpy(snapBounce_.data(), p + kDirtyOff, kBounceBytes);
+            const uint8_t* b = snapBounce_.data() - kDirtyOff;
+
+            const uint32_t* dirtyW = (const uint32_t*)(b + kDirtyOff);
+            const uint32_t* occW = (const uint32_t*)(b + kOccOff);
+            const uint32_t* supW = (const uint32_t*)(b + kSupportOff);
             uint32_t active = 0;
             uint64_t total = 0;
             for (uint32_t i = 0; i < kNumChunks; i++) {
@@ -422,20 +462,22 @@ void World::KickReadback() {
               // in its own array rather than masked away, because the page
               // table's free path needs it and reading it back per candidate
               // was costing a blocking WaitIdle + 16 KiB per chunk.
-              snap_.occupancy[i] = occW[i] & 0xFFFFu;
-              snap_.occStain[i] = (occW[i] >> 31) & 1u;
-              total += occW[i] & 0xFFFFu;
+              const uint32_t o = occW[i];          // ONE load, was three
+              const uint32_t nonAir = o & 0xFFFFu;
+              snap_.occupancy[i] = nonAir;
+              snap_.occStain[i] = (o >> 31) & 1u;
+              total += nonAir;
+              // Folded in from its own second pass over the same 32,768
+              // chunks — safe now that all three streams are cached RAM.
+              snap_.supportFlags[i] = supW[i] != 0 ? 1 : 0;
             }
             snap_.activeChunks = active;
             snap_.voxelTotal = total;
-            std::memcpy(&snap_.worldHash, p + kHashOff, 4);
+            std::memcpy(&snap_.worldHash, b + kHashOff, 4);
             std::memcpy(&snap_.pageFaults, p + kPageFaultOff, 4);
-            std::memcpy(snap_.pick, p + kPickOff, 32);
-            const uint32_t* supW = (const uint32_t*)(p + kSupportOff);
-            for (uint32_t i = 0; i < kNumChunks; i++)
-              snap_.supportFlags[i] = supW[i] != 0 ? 1 : 0;
+            std::memcpy(snap_.pick, b + kPickOff, 32);
             uint32_t pcounts[2];
-            std::memcpy(pcounts, p + kPCountOff, 8);
+            std::memcpy(pcounts, b + kPCountOff, 8);
             snap_.particleCount =
                 std::min(pcounts[sl.particleLivePage & 1], kParticleCap);
             // MLS-MPM fluid seam: live count, event counters, block list.
@@ -475,18 +517,39 @@ void World::KickReadback() {
                 const uint32_t e =
                     i < sl.fetchSentinel.size() ? sl.fetchSentinel[i] : 0u;
                 if (e != 0u) {
-                  cc.voxels.assign(kChunkVol, 0u);  // §2.1a
+                  // resize, not assign: every branch below writes all 4,096
+                  // words, so assign's zero-fill was 16 KiB of memset thrown
+                  // away immediately. (§2.1a)
+                  cc.voxels.resize(kChunkVol);
+                  uint32_t* dst = cc.voxels.data();
                   const IVec3 wc = sl.fetchIds[i];
-                  const int bx = wc.x * (int)kChunk, by = wc.y * (int)kChunk,
-                            bz = wc.z * (int)kChunk;
-                  // Positional for JITTER, one repeated word otherwise —
-                  // SynthWordAt collapses to SynthWord when the bit is clear,
-                  // so this one loop is correct for every sentinel form.
-                  for (uint32_t k = 0; k < kChunkVol; k++)
-                    cc.voxels[k] = SynthWordAt(
-                        e, bx + (int)(k % kChunk),
-                        by + (int)((k / kChunk) % kChunk),
-                        bz + (int)(k / (kChunk * kChunk)), mirrorSeed_);
+                  // Same three cases, and for the same reasons, as the mirror
+                  // synthesis above: air is one word whatever the JITTER bit
+                  // says, non-JITTER is one word by definition, and JITTER
+                  // walks rows so JitterRowSeed can hoist the y/z half of the
+                  // hash out of the inner loop.
+                  if ((e & kPtMatMask) == kMatAir) {
+                    std::fill_n(dst, kChunkVol, 0u);
+                  } else if ((e & kPtJitterBit) == 0u) {
+                    std::fill_n(dst, kChunkVol, SynthWord(e));
+                  } else {
+                    const int bx = wc.x * (int)kChunk, by = wc.y * (int)kChunk,
+                              bz = wc.z * (int)kChunk;
+                    const uint32_t mat = e & kPtMatMask;
+                    const uint32_t stampBits = kStampNever << kStampShift;
+                    uint32_t k = 0;
+                    for (int lz = 0; lz < (int)kChunk; lz++)
+                      for (int ly = 0; ly < (int)kChunk; ly++) {
+                        const uint32_t rowSeed =
+                            JitterRowSeed(by + ly, bz + lz, mirrorSeed_);
+                        for (int lx = 0; lx < (int)kChunk; lx++, k++)
+                          dst[k] = mat |
+                                   (JitterStateInRow(rowSeed, bx + lx,
+                                                     mirrorSeed_)
+                                    << 12) |
+                                   stampBits;
+                      }
+                  }
                 } else {
                   cc.voxels.assign(
                       (const uint32_t*)(p + kFetchOff + i * kChunkBytes),
