@@ -66,7 +66,13 @@
     "pitchLift": 0.35,
     "stateFollow": 0.75,
     "speedFov": 0.06,
-    "speedFovHalflife": 0.35
+    "speedFovHalflife": 0.35,
+    "zoomStep": 0.12,
+    "zoomMin": 0.35,
+    "zoomMax": 2.5
+  },
+  "gear": {
+    "ruinedCondition": 0.4
   },
   "avatar": {
     "enabled": true,

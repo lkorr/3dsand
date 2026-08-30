@@ -454,6 +454,23 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadF(*g, "stateFollow", c.stateFollow, out, at);
     ReadF(*g, "speedFov", c.speedFov, out, at);
     ReadF(*g, "speedFovHalflife", c.speedFovHalflife, out, at);
+    ReadF(*g, "zoomStep", c.zoomStep, out, at);
+    ReadF(*g, "zoomMin", c.zoomMin, out, at);
+    ReadF(*g, "zoomMax", c.zoomMax, out, at);
+    // An inverted or degenerate range would let the wheel drive the boom to
+    // zero (the camera inside the character) or past the far cascade. Clamped
+    // rather than reported, because both ends have a defensible meaning and the
+    // honest failure is a zoom that stops sooner than asked.
+    c.zoomMin = std::clamp(c.zoomMin, 0.05f, 4.0f);
+    c.zoomMax = std::clamp(c.zoomMax, c.zoomMin, 8.0f);
+    c.zoomStep = std::clamp(c.zoomStep, 0.0f, 1.0f);
+  }
+
+  if (const json* g = Find(j, "gear")) {
+    auto& c = out.gear;
+    const std::string at = "gear";
+    ReadF(*g, "ruinedCondition", c.ruinedCondition, out, at);
+    c.ruinedCondition = std::clamp(c.ruinedCondition, 0.0f, 1.0f);
   }
 
   if (const json* g = Find(j, "avatar")) {

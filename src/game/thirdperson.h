@@ -76,13 +76,27 @@ class ThirdPersonRig {
 
   // Reset all smoothing (teleport, respawn, mode change on the same frame).
   // Without this a teleport smears the camera across the whole world.
+  //
+  // The ZOOM deliberately survives it: it is a player preference, not smoothing
+  // state, and having a respawn or a fly-mode toggle silently put the camera
+  // back where the tuning file wanted it is the sort of thing that reads as the
+  // setting not sticking.
   void Snap() { initialized_ = false; }
+
+  // The wheel. `notches` is signed, positive = scrolled up = zoom IN, which is
+  // the direction every game in the genre uses. Held as a MULTIPLIER on the
+  // tuned boom (thirdPerson.zoomMin/zoomMax) rather than as a distance, so the
+  // two boom lengths keep their authored relationship and re-tuning either one
+  // does not move where the player left their zoom.
+  void Zoom(float notches);
+  float ZoomFactor() const { return zoom_; }
 
  private:
   Vec3 eye_{};
   Vec3 focusSmooth_{};
   float distNow_ = 0;
   float distGoal_ = 0;
+  float zoom_ = 1.0f;
   bool occluded_ = false;
   bool initialized_ = false;
 };

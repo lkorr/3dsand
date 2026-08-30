@@ -264,7 +264,26 @@ struct Tuning {
     // without the player touching a setting.
     float speedFov = 0.06f;
     float speedFovHalflife = 0.35f;
+    // ---- wheel zoom ---------------------------------------------------------
+    // The boom length the player can dial for themselves, as a MULTIPLIER on
+    // `distance`/`shoulderDist` rather than as its own pair of distances: the
+    // two modes then keep their authored relationship (over-shoulder stays
+    // tighter than plain third) at every zoom level, and re-tuning either
+    // distance does not silently move where the player's zoom sits.
+    float zoomStep = 0.12f;   // multiplier change per wheel notch
+    float zoomMin = 0.35f;    // closest, as a fraction of the tuned boom
+    float zoomMax = 2.5f;     // farthest
   } thirdPerson;
+
+  // ---- gear condition ----
+  struct Gear {
+    // Below this fraction of its authored voxels a worn piece is RUINED — see
+    // GearRuined in game/equipment.h. Condition is measured in VOXELS STILL
+    // THERE, because that is what the armour mechanic reads: a shell protects
+    // by being geometrically in the way, so how much of it is in the way is
+    // what its condition means.
+    float ruinedCondition = 0.40f;
+  } gear;
 
   // ---- player avatar ----
   struct Avatar {

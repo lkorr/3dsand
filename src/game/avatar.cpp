@@ -1993,7 +1993,14 @@ void PlayerAvatar::BurnParts(uint32_t tick, World& world,
   // of burning NPCs starve the fire on the character the camera is pointed
   // at. The PASS underneath (Mob::BurnTick -> MobSystem::BurnOneLimb) is the
   // shared one.
-  uint32_t frontBudget = 4096;
+  // 4096 was sized for FIRE, whose front is a 2D flame edge a few hundred
+  // voxels wide. DISSOLUTION is not a front — acid attacks the whole wetted
+  // surface at once, and at skinScale 8 a submerged human is order 25k exposed
+  // sub-voxels, so the pass was sampling about a sixth of the body per tick and
+  // the character came apart over a minute instead of over seconds. Raised for
+  // the player only, in the same spirit the separate budget exists at all: this
+  // is one creature, and it is the one the camera is pointed at.
+  uint32_t frontBudget = 16384;
   uint32_t opsBudget = 48;
   BurnTick(tick, world, cellOps, spawns, frontBudget, opsBudget);
 }

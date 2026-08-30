@@ -63,7 +63,10 @@ struct PlayerKitRefs {
 // existing round-trip test asserts exactly that refusal, and a save format
 // that silently accepts a shorter payload is how a truncated file turns into
 // a player's inventory quietly emptying.
-constexpr uint32_t kPlayerKitSaveVersion = 2;
+// Version 3 adds the CONDITION SUMMARY to each shell record (voxels at spawn,
+// voxels still live). Derivable from the lattice only while the piece is on a
+// body, which is exactly when it is not in this file — see WornShellDamage.
+constexpr uint32_t kPlayerKitSaveVersion = 3;
 
 // ITEMS ON THE GROUND ('ITMS'): what is lying around, by name and pose.
 //

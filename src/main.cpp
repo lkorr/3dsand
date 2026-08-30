@@ -85,6 +85,15 @@ constexpr uint64_t kDevFanOwner = 0xDEFA11Au;
 // This closes a stale comment in the frame loop that claimed the wheel picked
 // a hotbar slot — Inventory::Scroll (game/item.h) has been written and
 // unreachable since it was added, because nothing ever installed a callback.
+//
+// INSTALLED BEFORE Overlay::Init, AND THAT ORDER IS LOAD-BEARING.
+// ImGui_ImplGlfw_InitForOther(window, /*install_callbacks=*/true) installs its
+// OWN scroll callback and CHAINS to whatever was registered before it. Setting
+// this one afterwards replaced ImGui's outright, so ImGui never saw a wheel
+// event and every scrollable panel in the dev overlay was frozen — which read
+// as "scrolling is disabled in the menu" and is in fact a one-line ordering
+// bug. Registering first puts this at the tail of ImGui's chain: both get the
+// event, and WantsMouse() below decides who acts on it.
 double g_scrollY = 0.0;
 void ScrollCallback(GLFWwindow*, double, double dy) { g_scrollY += dy; }
 
@@ -2761,6 +2770,11 @@ int main(int argc, char** argv) {
     return selftest::Run(sc, stOpt);
   }
 
+  // BEFORE Overlay::Init — ImGui's own scroll callback chains to whatever was
+  // installed first, and installing after it replaces ImGui's and freezes every
+  // scrollable panel in the overlay. See the note on ScrollCallback.
+  glfwSetScrollCallback(window, ScrollCallback);
+
   Overlay overlay;
   if (!overlay.Init(window, ctx.device, ctx.surfaceFormat, assetDir)) return 1;
 
@@ -2948,7 +2962,6 @@ int main(int argc, char** argv) {
   // cursor grabbed out from under them.
   bool captureBeforeUi = true;
   glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
-  glfwSetScrollCallback(window, ScrollCallback);
   double mx0 = 0, my0 = 0;
   glfwGetCursorPos(window, &mx0, &my0);
   // Look sensitivity scale while a melee weapon is up, eased rather than
@@ -3366,15 +3379,26 @@ int main(int argc, char** argv) {
                        captured ? GLFW_CURSOR_DISABLED : GLFW_CURSOR_NORMAL);
       glfwGetCursorPos(window, &mx0, &my0);
     }
-    // The wheel, drained once per frame. While the screen is open (or any
-    // ImGui window wants the mouse) it belongs to the UI; otherwise it picks a
-    // hotbar slot, which is what the melee tool has claimed to do since it was
-    // written.
+    // The wheel, drained once per frame. Three claimants, in priority order:
+    //
+    //   1. THE UI. The character screen, or any dev-overlay window the cursor
+    //      is over. ImGui has already consumed the same event through its own
+    //      callback (see ScrollCallback's note on the install order), so this
+    //      only has to decline.
+    //   2. THE CAMERA, whenever the view is not first person. A boom camera
+    //      with no zoom is the one control every third-person game has and
+    //      this did not.
+    //   3. THE HOTBAR, which is what it has always done and what remains
+    //      correct in first person, where there is no boom to move.
     {
       const double dy = g_scrollY;
       g_scrollY = 0.0;
-      if (dy != 0.0 && !ui.inventoryOpen && !overlay.WantsMouse() && captured)
-        hotbar.Scroll(dy > 0 ? -1 : 1);
+      if (dy != 0.0 && !ui.inventoryOpen && !overlay.WantsMouse() && captured) {
+        if (camMode != CameraMode::First)
+          tpRig.Zoom((float)dy);
+        else
+          hotbar.Scroll(dy > 0 ? -1 : 1);
+      }
     }
     double mx, my;
     glfwGetCursorPos(window, &mx, &my);
@@ -5609,12 +5633,31 @@ int main(int argc, char** argv) {
       // string copies) and it is the reason the panel can never show something
       // the game does not have.
       {
+        // CONDITION COMES FROM WHEREVER THE PIECE ACTUALLY IS. On the body the
+        // shells are the truth and the blob in `kit.wornDamage` is stale (it is
+        // only written when a piece comes OFF); in the pack there are no shells
+        // and the blob is all there is. Asking the wrong one is not a rounding
+        // error — it is a robe that reads 100% while it burns off your back.
+        const float ruinedAt = CurrentTuning().gear.ruinedCondition;
+        auto conditionOf = [&](const ItemDef* d) {
+          if (!d || !ItemKindIsWorn(d->kind)) return 1.0f;
+          for (int s = 0; s < kEquipSlotCount; s++)
+            if (avatar.Spawned() && avatar.WornItem(s) == d->name)
+              return avatar.WornCondition(s);
+          const WornDamage* w = kit.Damage(d->name);
+          return w ? w->Condition() : 1.0f;
+        };
         auto mirror = [&](const ItemStack& st) {
           UIState::KitSlotUI u;
           const ItemDef* d = items.At(st.Empty() ? -1 : st.def);
           if (!d) return u;
           u.name = d->name;
           u.count = st.count;
+          u.wearable = ItemKindIsWorn(d->kind);
+          if (u.wearable) {
+            u.condition = conditionOf(d);
+            u.ruined = GearRuined(u.condition, ruinedAt);
+          }
           switch (d->kind) {
             case ItemKind::Melee: u.kind = "melee"; break;
             default: u.kind = ""; break;

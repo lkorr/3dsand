@@ -4708,9 +4708,56 @@ reads them out one call before the rig forgets and `WearItem` puts them back.
 Off the body they live in `PlayerKit::wornDamage`, keyed by ITEM NAME (not by
 slot, or dragging the robe through the pack would mend it; not by instance,
 because an `ItemStack` has no identity and giving stacks one is a much larger
-change than armour needed). `PLYR` is at v2 for the map, `ITMS` carries a
-ground item's lattice the same way, and a v1 payload is refused rather than
+change than armour needed). `PLYR` is at v3 for the map, `ITMS` carries a
+ground item's lattice the same way, and an older payload is refused rather than
 half-applied.
+
+**Condition is a summary, not the record.** The lattice above stays the truth —
+it is what puts the wear back in the right places, and on armour whose whole
+mechanic is "the world reaches you through the gap" that is not a cosmetic
+distinction. What v3 adds beside it is two counts per shell (voxels at spawn,
+voxels live), because the character screen has to say something about a piece
+sitting in the PACK, where there is no shell to measure and re-deriving the
+denominator would mean re-running the per-axis fit resample against a wearer
+who is not wearing it. `Mob::WornCondition` answers the same question off the
+live rig and the two must agree; both are volume-weighted across a piece's
+shells, so a burnt-off sleeve does not weigh as much as the body of the robe.
+
+Measured in VOXELS rather than hp, because protection here is geometric: a
+shell protects by being in the way, so how much of it is still in the way is
+what its condition means. hp also falls to blunt trauma and is not what the
+occlusion probe reads. Below `gear.ruinedCondition` a piece is **ruined** —
+still wearable (whatever remains still covers whatever it still covers), but
+that is the line a repair, and anything that scales with condition, is expected
+to refuse. There is deliberately no repair and no enchantment system yet; this
+is the substrate either would read.
+
+### A shell is a rig slot, and the gore path did not know that
+
+The borrowed-slot trick buys burning, dissolving, carving and severing for
+free — and it bought the GORE path too, which was wrong in three ways at once,
+all of them reported as separate bugs. A robe burning off sprayed the WEARER's
+blood (`CarveLimb` topping up a drip budget on a garment), cried out in their
+voice, and was handed to `DebrisSystem` as a dynamic body spawned overlapping
+the wearer's own capsule — outside `Layers::AVATAR`, so resolving that overlap
+fired the player across the room.
+
+`Mob::IsWornSlot` is the missing distinction, asked by TAG (`"worn"`, the same
+one `BodySlotFor` already keys the HUD off) rather than by index, so there is
+one spelling of "wardrobe, not anatomy". A garment neither bleeds nor voices,
+and one consumed BY FIRE is not adopted as debris at all — there is nothing
+left to fall off. Rags cut loose by a blade still drop, because that is a piece
+of gear hitting the floor.
+
+**Fire cauterises**, and that half applies to real limbs too. `FlushBurn`
+expresses a tick of burning as a carve and fires every `max(12, n>>6)` voxels
+removed, so a limb alight carves itself dozens of times a second and each one
+topped the bleed budget back up — being on fire read as haemorrhaging. Both the
+drip and `Sever`'s arterial gout now refuse while `inBurnFlush_` is set. The hp
+charge is deliberately outside the exclusion: fire still kills you, and a burnt
+shell still loses its own durability. Only the blood is refused.
+`mob-burn`'s `fire does not bleed` asserts zero droplets and zero open wounds
+across 630 ticks of a creature burning to death.
 
 ### The stock set
 

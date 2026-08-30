@@ -44,39 +44,39 @@
       "becomes": "water"
     },
     {
-      "note": "-------- combustion: each flammable defines its burn character --------"
+      "note": "-------- combustion: each flammable defines its burn character --------\nTHE IGNITION CHANCE IS HOW FAST FIRE SPREADS THROUGH THE FUEL; the decay rules further down are how long a lit voxel takes to be consumed. They are separate levers and this note exists because they are easy to confuse. Wood/bark were slowed 1.5x here (18 -> 12, birch 22 -> 15, staff 16 -> 11) so a fire creeps up a trunk instead of running it; the ember decays below are UNCHANGED, so a lit log still burns out on the same schedule it always did."
     },
     {
       "self": "wood",
       "neighbor": "tag:hot",
-      "chance": 18,
+      "chance": 12,
       "selfBecomes": "ember"
     },
     {
       "self": "birch_wood",
       "neighbor": "tag:hot",
-      "chance": 22,
+      "chance": 15,
       "selfBecomes": "ember"
     },
     {
-      "note": "foliage flashes to fire and is CONSUMED (no ember stage): a burning canopy should vanish in flame, not decay into thousands of ash voxels raining through the crown. Chances are high because leaves are thin fuel; the burn is bounded by the canopy itself (fire decays in ~6 ticks and leaves nothing that grows)."
+      "note": "foliage flashes to fire and is CONSUMED (no ember stage): a burning canopy should vanish in flame, not decay into thousands of ash voxels raining through the crown. Chances are high because leaves are thin fuel; the burn is bounded by the canopy itself (fire decays in ~6 ticks and leaves nothing that grows). ALL FOLIAGE CHANCES WERE CUT 3x on owner report that a crown went up too readily (leaves 225->75->25, needles 380->127, autumn 400->133): a tree should catch and take a while about it rather than flashing over the instant an ember touches it. The RATIOS between the three fuels are preserved -- dry needles and dead autumn leaf still catch several times faster than green leaves, which is the read that makes a pine forest frightening and an oak wood merely flammable."
     },
     {
       "self": "leaves",
       "neighbor": "tag:hot",
-      "chance": 75,
+      "chance": 25,
       "selfBecomes": "fire"
     },
     {
       "self": "pine_needles",
       "neighbor": "tag:hot",
-      "chance": 380,
+      "chance": 127,
       "selfBecomes": "fire"
     },
     {
       "self": "autumn_leaves",
       "neighbor": "tag:hot",
-      "chance": 400,
+      "chance": 133,
       "selfBecomes": "fire"
     },
     {
@@ -85,49 +85,49 @@
     {
       "self": "leaves_dark",
       "neighbor": "tag:hot",
-      "chance": 75,
+      "chance": 25,
       "selfBecomes": "fire"
     },
     {
       "self": "leaves_lit",
       "neighbor": "tag:hot",
-      "chance": 75,
+      "chance": 25,
       "selfBecomes": "fire"
     },
     {
       "self": "pine_dark",
       "neighbor": "tag:hot",
-      "chance": 380,
+      "chance": 127,
       "selfBecomes": "fire"
     },
     {
       "self": "pine_lit",
       "neighbor": "tag:hot",
-      "chance": 380,
+      "chance": 127,
       "selfBecomes": "fire"
     },
     {
       "self": "autumn_dark",
       "neighbor": "tag:hot",
-      "chance": 400,
+      "chance": 133,
       "selfBecomes": "fire"
     },
     {
       "self": "autumn_lit",
       "neighbor": "tag:hot",
-      "chance": 400,
+      "chance": 133,
       "selfBecomes": "fire"
     },
     {
       "self": "bark_dark",
       "neighbor": "tag:hot",
-      "chance": 18,
+      "chance": 12,
       "selfBecomes": "ember"
     },
     {
       "self": "bark_light",
       "neighbor": "tag:hot",
-      "chance": 18,
+      "chance": 12,
       "selfBecomes": "ember"
     },
     {
@@ -285,6 +285,13 @@
       "neighbor": "gravel",
       "chance": 30,
       "neighborBecomes": "sand"
+    },
+    {
+      "note": "ACID EATS MEAT FAR FASTER THAN IT EATS ROCK, and this is the rule that says so. Ordered BEFORE the generic tag:dissolvable rule below, per the file's specific-before-generic convention, so mineral erosion keeps its old slow chain and only organics get the fast one.\n\nWHY IT MATTERS OUT OF PROPORTION TO ITS SIZE: this rule reaches a BODY. mob.cpp's inbound pass evaluates acid's own rules FROM the grid cell ONTO each body voxel it touches (the same direction the GPU evaluates them), so skin, flesh, bone, cloth and leather -- all tag:organic -- are eaten by this line and by nothing that had to be written for them. At the old shared 45 per-mille a limb at skinScale 8 lost about 4.5% of ONE sub-voxel layer per tick, roughly two seconds per layer and the better part of a minute for an arm, which is what 'acid does not do nearly enough damage' actually was. At 250 a layer goes in about ten ticks.\n\nSteel is unaffected because `steel` carries no tag:organic and no tag:dissolvable -- armour still protects, and still for the reason equipment.h states: not a resist number, an absence of the tag.",
+      "self": "acid",
+      "neighbor": "tag:organic",
+      "chance": 250,
+      "neighborBecomes": "air"
     },
     {
       "self": "acid",
@@ -783,7 +790,7 @@
       "becomes": "air"
     },
     {
-      "note": "FLESH: sears on contact, ignites only under a WIDE front. skin -> flesh_cooked is a plain pair rule, so a single lick of flame cooks the surface and a creature can be seared without being destroyed. Ignition is the scaled decay below."
+      "note": "FLESH: sears on contact, ignites only under a WIDE front. skin -> flesh_cooked is a plain pair rule, so a single lick of flame cooks the surface and a creature can be seared without being destroyed. Ignition is the scaled decay below.\n\nIGNITION WAS RAISED 9.75x IN TWO PASSES (40 -> 130 -> 390) on owner report that a body was not flammable enough. THE SEAR WAS NOT, and the attempt to raise it is worth recording because it was wrong for a reason that is easy to repeat: skin -> flesh_cooked is a COLOUR CHANGE, not combustion, so raising it makes a body look cooked faster without making it any more likely to catch. It also broke the one comparison this whole section is built on -- at sear 220 vs cloth's 200 the flesh reacted to a single hot face MORE eagerly than the cloth over it, which inverts 'cloth catches at about 8x flesh's rate' -- and the mob-burn gate caught it as cloth and skin halving on the same tick. Flammability is the decay below; the sear stays at 90. THE MINCOUNT DID NOT MOVE and must not: 3 is the reason a lone ember on a shoulder gutters out, and it is provable rather than tuned (see the next note). At 390 with scaleMax 4 the scaled chance is 858 per-mille at the minCount-3 threshold and saturates at 1000 under a full six-face front, i.e. cooked flesh under a real fire ignites within a tick or two -- the SEAR (90) is now what paces a body catching alight, not the ignition. Raising the chance makes a real fire take hold quickly; lowering the count would make ANY spark take hold, which is a different and much worse game."
     },
     {
       "note": "minCount 3 is deliberate and provable: a lone burning voxel plus the single fire cell it emits reach 2, so one ignited voxel cannot restart itself no matter how the dice fall. Three simultaneously hot faces means a real fire -- or burning cloth lying against the skin, which is exactly how a clothing layer is supposed to kill you."
@@ -797,7 +804,7 @@
     {
       "self": "flesh_cooked",
       "decay": true,
-      "chance": 40,
+      "chance": 390,
       "becomes": "flesh_burning",
       "scaleByNeighbors": {
         "neighbor": "tag:hot",
@@ -852,7 +859,7 @@
     {
       "self": "staff_wood",
       "neighbor": "tag:hot",
-      "chance": 16,
+      "chance": 11,
       "selfBecomes": "ember"
     }
   ]
