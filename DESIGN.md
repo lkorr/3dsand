@@ -2370,10 +2370,28 @@ fact that the *player* owns the body rather than the gait:
   nothing: the stock human's hip sits 6.75 voxels over its ankle against a 6.79
   chain, so the foot could travel **0.7 voxels** before the two-bone solver hit
   its reach clamp — and a clamped solve is one fixed straight-leg pose for every
-  target beyond it. `stanceCrouch_` solves for the highest hip that can still
-  reach the far end of the stride the gait is about to ask for, and drops the
-  pelvis by the difference. It reads only the rig and the player's own speed,
-  never a foot position, so it is not the feedback path above.
+  target beyond it. `stanceCrouch_` drops the pelvis by the difference.
+
+  **The demand is measured per foot, per tick, and it is a HORIZONTAL question.**
+  Solving once for the far end of the stride and holding that height through the
+  cycle is the wrong shape and backwards from a real walk, where the pelvis is
+  lowest at double support and *highest* at midstance with the supporting leg
+  vertical. Held, it put the leg at its most bent exactly where it should be
+  straightest: measured 0.77 voxels of permanent crouch at walk pace (88% leg
+  extension, ~56° of knee, every tick) and the `kMaxCrouchLegLengths` clamp from
+  first step to last at a sprint — a character who walks flat ground kneeling.
+  Taking the excursion from where each foot *actually is* makes the pelvis fall
+  and rise once per step out of the geometry, with no oscillator to keep in
+  phase with anything: 0.28↔0.44 voxels on the stock human at walk pace, stance
+  knee at its authored ~9°, swing knee to 68°.
+
+  Only the foot's **horizontal** offset is read; the vertical stays the rig's
+  authored `span`. Using the foot's world height instead makes the crouch a
+  function of the gap between the body's sole and the surface the probe found,
+  so anything that floats or sinks the body relative to its footing is answered
+  by burying the pelvis — and it would put `bodyY_` downstream of a probe
+  height, which is the feedback path above. The horizontal descends only from
+  `origin_.x/z` and the velocity lead, so it cannot close that loop.
 - **The IK effector is the ANKLE, so the foot goal is raised by `restSoleY_`.**
   `GroundHeightAt` returns the surface the *min corner* rests on; handing that
   to the solver asks for the full hip-to-corner drop and clamps on every tick
@@ -2392,6 +2410,19 @@ to the feet at speeds between the two authored clip periods. The NPC path
 deliberately keeps the free oscillator — its swing is a flat `stepDuration` at
 mob speeds, where the mismatch is small — and rigs with no leg chains
 (`dummy.json`) keep it because they have no foot to lock to.
+
+**The gait keeps its footing across a lost tick, and needs more slack than the
+clips do.** `Player::grounded` is a 0.1-voxel positional probe, so on microvoxel
+terrain it drops false constantly — cresting a bump, stepping down a voxel (a
+genuine ~0.14 s of air at walk pace, longer than `avatar.airDebounce`). Losing
+the gait for even one tick is not a subtle artifact: `UpdateAirPose` clears
+`footInit_`, so both feet re-plant from scratch, and `gaitWeight_` fades the leg
+IK out to the rest hang — the legs snap to standing in the middle of a stride,
+over and over. So the gait runs on its own coyote window (`kGaitCoyoteSeconds`),
+bounded by **distance** as well as time: air time alone cannot tell a kerb from
+a launch, but a jump has left the floor by half a leg within about three ticks
+and there is no footing left to keep. A hang or a mantle is support for the
+clips but never for the gait — the feet are nowhere near a floor in either.
 
 **Air-state clips fire on events, not on contact loss.** `jump` plays on
 `Player::jumped`, a sticky latch set where the impulse is actually applied and

@@ -1004,10 +1004,25 @@ def main():
 
     # walk/run arm swing: additive over the gait, masked to the arms and spine
     # so the IK-driven legs are untouched. Periods derived above.
+    #
     # Arm swing, raised with the legs: the stride is a real 57-degree sweep
     # now that the foot IK is no longer clamped straight, and the previous
     # 16/22 was sized against a leg that barely moved.
-    for nm, deg, period in (("walk", 22, walk_ms), ("run", 30, run_ms)):
+    #
+    # ...AND THEN TRIMMED TO 0.6 OF THAT. Sizing the shoulder off the hip was
+    # right in kind and too far in degree: a walking body's arm sweeps roughly
+    # half what its leg does, because the arm is a passive counterweight to the
+    # pelvis and not a second stride. At parity the figure reads as MARCHING.
+    # Kept as a trim on the leg-derived number rather than folded into it, so
+    # the relationship stays legible — 22/30 is what the stride asks for, and
+    # ARM_SWING is how much of it the shoulder is actually given.
+    ARM_SWING = 0.6
+    # The forearm holds a fixed CARRY ANGLE (-18) with a swing about it. Only
+    # the swing part is trimmed: scaling the whole track would also straighten
+    # the elbow, which is a different edit and not the one asked for.
+    fore_mid, fore_amp = -18.0, 8.0 * ARM_SWING
+    for nm, deg, period in (("walk", 22 * ARM_SWING, walk_ms),
+                            ("run", 30 * ARM_SWING, run_ms)):
         clips[nm] = {
             "durationMs": period, "loop": True, "mode": "additive",
             "blendInMs": 180, "blendOutMs": 180,
@@ -1015,14 +1030,16 @@ def main():
             "tracks": {
                 "armU.L": swing(deg, period, 0),
                 "armU.R": swing(deg, period, 1),
-                "armL.L": {"rot": [{"t": 0, "q": qx(-10), "ease": "quadInOut"},
-                                   {"t": period // 2, "q": qx(-26),
+                "armL.L": {"rot": [{"t": 0, "q": qx(fore_mid + fore_amp),
                                     "ease": "quadInOut"},
-                                   {"t": period, "q": qx(-10)}]},
-                "armL.R": {"rot": [{"t": 0, "q": qx(-26), "ease": "quadInOut"},
-                                   {"t": period // 2, "q": qx(-10),
+                                   {"t": period // 2, "q": qx(fore_mid - fore_amp),
                                     "ease": "quadInOut"},
-                                   {"t": period, "q": qx(-26)}]},
+                                   {"t": period, "q": qx(fore_mid + fore_amp)}]},
+                "armL.R": {"rot": [{"t": 0, "q": qx(fore_mid - fore_amp),
+                                    "ease": "quadInOut"},
+                                   {"t": period // 2, "q": qx(fore_mid + fore_amp),
+                                    "ease": "quadInOut"},
+                                   {"t": period, "q": qx(fore_mid - fore_amp)}]},
                 "torso": {"rot": [{"t": 0, "q": qy(-deg * 0.16),
                                    "ease": "quadInOut"},
                                   {"t": period // 2, "q": qy(deg * 0.16),
