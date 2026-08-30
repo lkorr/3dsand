@@ -47,27 +47,46 @@ for (int run = 0; run < 2; run++) {
 }
 bool deterministic = hashes[0] == hashes[1];
 
-// The GOLDEN check. Twice-run equality proves the sim reproduces itself; it
-// does NOT prove it still simulates the same world. A change that quietly makes
-// the sim do less stays perfectly self-consistent and sails through — the
-// phase-2b Vulkan-port work found exactly that, a build where the mutate and
-// explode passes dispatched ZERO workgroups with the full suite green.
+// ---- THE TWO CHECKS ARE DIFFERENT CLAIMS. DO NOT CONFLATE THEM. ------------
 //
-// So the final hash is pinned in tests/baseline.json ("determinismHash") and a
-// mismatch is a REGRESSION, handled like a known-fail flip: an intentional
-// content or sim change updates the recorded value in the same commit. An
-// absent key means "not pinned" and only reports — a checkout predating the key
-// still behaves as before. See tests/BASELINE.md.
+// `deterministic` above is THE INVARIANT (CLAUDE.md rule 1): the same
+// seed+tick+inputs reproduce bit-identically. If that fails, something is
+// scheduling-dependent and the sim is broken. Stop and report.
+//
+// `goldenOk` below is a CHANGE DETECTOR, and nothing more. Twice-run equality
+// proves the sim reproduces itself; it does NOT prove it still simulates the
+// same world. A change that quietly makes the sim do less stays perfectly
+// self-consistent and sails through — the phase-2b Vulkan-port work found
+// exactly that, a build where the mutate and explode passes dispatched ZERO
+// workgroups with the full suite green. Pinning the final hash is what converts
+// "the sim agrees with itself" into "the sim agrees with what we recorded".
+//
+// A MOVED PIN IS NOT A BROKEN SIM. Every intentional change to hashed state
+// moves it — a reaction chance, a material, a sim.* value, a re-baked asset.
+// The correct response to an EXPECTED move is `--selftest --rebaseline` in the
+// same commit, and no investigation whatsoever: there is nothing to diagnose,
+// and treating the old number as a target to restore is how a five-minute data
+// change turns into an afternoon. Only an UNEXPECTED move is information.
+//
+// An absent key means "not pinned" and only reports — a checkout predating the
+// key still behaves as before. See tests/BASELINE.md.
 char got[16];
 std::snprintf(got, sizeof(got), "%08x", hashes[0].back());
 const std::string& golden = GoldenDeterminismHash();
 bool goldenOk = golden.empty() || golden == got;
 
+// The status word names WHICH claim failed, because they mean opposite things:
+// "determinism FAILED" is a broken sim, "pin moved" is usually just a change
+// that has not been rebaselined yet.
 std::printf("determinism: %s (final hash %s over %d ticks%s)\n",
-            (deterministic && goldenOk) ? "PASS" : "FAIL", got, kTicks,
+            (deterministic && goldenOk) ? "PASS"
+            : !deterministic            ? "FAIL"
+                                        : "PIN MOVED",
+            got, kTicks,
             golden.empty() ? ", not pinned"
             : goldenOk     ? ", matches baseline"
-                           : "");
+                           : ", sim reproduces itself; only the recorded value "
+                             "differs - rebaseline if you meant it");
 if (!deterministic) {
   for (int i = 0; i < kTicks; i++) {
     if (hashes[0][i] != hashes[1][i]) {
@@ -79,19 +98,30 @@ if (!deterministic) {
 }
 if (!goldenOk) {
   std::printf(
-      "  GOLDEN HASH MISMATCH: baseline says %s, this build produced %s.\n"
-      "  The sim is self-consistent but simulates a DIFFERENT world than the\n"
-      "  one recorded. If that was intentional (a material, reaction, tuning\n"
-      "  sim.* or kernel change), set \"determinismHash\": \"%s\" in\n"
-      "  tests/baseline.json in the SAME commit. If it was not, you have found\n"
-      "  a real behaviour change — see tests/BASELINE.md.\n",
-      golden.c_str(), got, got);
+      "  PINNED HASH MOVED: baseline says %s, this build produced %s.\n"
+      "  THE SIM IS NOT BROKEN. Determinism itself PASSED (two runs of the\n"
+      "  same seed agreed bit for bit) — this line only says the world you\n"
+      "  simulate differs from the one last recorded.\n"
+      "    * Did you MEAN to change hashed state (a material, a reaction\n"
+      "      chance, a sim.* value, a re-baked asset)? Then this is expected.\n"
+      "      Run --selftest --rebaseline, commit the new value alongside your\n"
+      "      change, and move on. Do NOT investigate it and do NOT try to get\n"
+      "      %s back; there is nothing here to diagnose.\n"
+      "    * Did you NOT expect it? Then this is the finding: something\n"
+      "      changed behaviour that you did not intend. See tests/BASELINE.md\n"
+      "      and the escalation ladder in CLAUDE.md.\n",
+      golden.c_str(), got, golden.c_str());
 }
 
+  // Says PIN MOVED, not MISMATCH: this string is what lands in last_run.json
+  // and in the regression summary, and "mismatch" reads as a broken sim when
+  // the sim in fact reproduced itself perfectly two lines above.
   std::string goldenNote = golden.empty() ? ", golden hash not pinned"
                            : goldenOk     ? ", matches golden"
-                                          : ", GOLDEN MISMATCH (baseline " +
-                                                golden + ")";
+                                          : ", PIN MOVED from baseline " +
+                                                golden +
+                                                " (determinism itself passed; "
+                                                "rebaseline if intended)";
   detail = Format("final hash %s over %d ticks%s", got, kTicks,
                   goldenNote.c_str());
 
