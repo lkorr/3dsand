@@ -20,7 +20,22 @@ Claim before editing: `world.h`, `common.wgsl`, `simulation.cpp`, `main.cpp`, `C
 ## Three inviolable rules
 
 ### 1. Bit-deterministic simulation
-Same seed+tick+inputs → same world hash everywhere. Integer-only sim math (no f32 in CA). Stateless counter-based RNG: `hash3(seed,tick,cellIndex)`. No scheduling-dependent outcomes (no atomics-CAS, no subgroup ops). Write reach ≤1 cell. **Gate:** `--selftest` runs sim twice, compares hashes. Pinned hash: `b717a33d` (was `d1c6c322` until the GAS VERTICAL MODEL: a gas no longer rises unconditionally -- buoyancy is a probability wind redistributes into rise/flat/sink tiers plus an up-diagonal lean, so a freely rising plume leans downwind instead of never reaching a line of wind code -- 2026-08-25; `47dd1520` until the DRAG RAMP: the particle/MPM drag RATE now scales with the local wind magnitude (`sim.windDragRef`) instead of applying in full at any wind, so calm air is ballistic again — a fixed rate is air resistance in disguise and cut terminal fall from 6 to 0.86 vox/tick the moment wind switched on, and the `wind x particles` slider at 0 made it worse rather than restoring the old behaviour — 2026-08-25; `882a30f3` until the WIND FLIP: `sim.windMode` 0 -> 1, so the CA drift bias, the ballistic-particle drag and the MPM node force are live — 2026-08-25; `dc666ada` until the LEVELLING pass: `filmPressed` + `bridgeLevel` in sim_step.wgsl, sim.liquidMinFilm back to 1, and the seam's surface-step excite trigger — 2026-08-25; `58b27f33` before WP5b gave settled liquid MPM boundary mass; `7b01cfd8` before WP5 flipped sim.fluidExciteMode to 1; `7cfa2420` before the CA liquid four-defect fix). If it moves, you broke the sim — stop and report.
+Same seed+tick+inputs → same world hash everywhere. Integer-only sim math (no f32 in CA). Stateless counter-based RNG: `hash3(seed,tick,cellIndex)`. No scheduling-dependent outcomes (no atomics-CAS, no subgroup ops). Write reach ≤1 cell. **Gate:** `--selftest` runs sim twice and compares hashes.
+
+**THE INVARIANT IS DETERMINISM. THE PINNED HASH IS NOT THE INVARIANT.**
+
+The thing that must never break is *reproducibility*: two runs of the same seed+tick+inputs produce identical results. That is what the gate's twice-run comparison tests, and a failure there is a genuine stop-and-report bug.
+
+`determinismHash` in `tests/baseline.json` is a different and much weaker thing: a **change detector**. It answers "did the world I simulate differ from the one recorded last time", which is useful only because a sim that quietly does *less* stays perfectly self-consistent (the Vulkan port shipped a build where mutate and explode dispatched zero workgroups and the whole suite was green).
+
+So:
+
+- **A moved hash is not a regression. It is a notification.** Every intentional change to hashed state moves it — a reaction chance, a material, a `sim.*` value, a worldgen tweak, a tree re-bake. That is the system working.
+- **If you changed hashed state on purpose, rebaseline it in the same commit and move on.** `--selftest --rebaseline`. Do not investigate it, do not A/B it, do not try to get the old number back, and do not report it as a finding. There is nothing to diagnose.
+- **Only chase it when you did NOT expect it to move.** Then it has told you something and the ladder in "When to run what" below applies.
+- **Never explain a hash move by saying the sim broke** unless the twice-run comparison also failed. Those are separate claims and only the second one is about determinism.
+
+New numbers are fine. Reproducible numbers are mandatory. History of past moves and when to flip the pin: `tests/BASELINE.md`.
 
 ### 2. Cost scales with activity, not world size
 Every system sleeps when idle. Dispatch over compacted dirty-chunk list via `DispatchWorkgroupsIndirect`, never full world. Chunks clear dirty flags and sleep when settled. Reaction growth must be subcritical (expected offspring/tick < 1). Selftest asserts ≤32 active chunks at rest. Bound every emergent process.
@@ -140,6 +155,21 @@ already established?"** If there is no answer, skip it. Sessions here have spent
    same `sedSlope=0` arm reported `settle-back` PASS under `--gate settle-back`
    and FAIL under `--selftest`, which cost a wrong conclusion and two runs to
    undo. Run both arms at the same scope, or neither.
+8. **A moved `determinismHash` you EXPECTED to move costs exactly one command.**
+   Not a diagnosis, not a differential, not a second opinion. If you changed a
+   reaction chance, a material, a `sim.*` value or a baked asset, the hash was
+   always going to move — see rule 1. `--selftest --rebaseline` records it and
+   you are done. Rebaselining is a normal part of landing a change, not an
+   admission of anything, and it is the ONE case where the "what claim does this
+   establish" test at the top of this section is answered by "none, and that is
+   correct". Measured: a session spent three extra runs and a merge-time
+   verification build re-confirming a hash move it had itself caused on purpose.
+
+   The corollary, because it is the expensive half: **when the hash moves, the
+   data-driven change is usually not the interesting part of your work.** Spend
+   the run budget on the gate that asserts the BEHAVIOUR you changed instead
+   (`mob-burn`, `armor-react`, ...). A hash is one number that says "something
+   differs"; a gate line says what.
 
 **Full acceptance is an END-OF-WORK event, run ONCE**, on the tree you intend to
 ship. Use `--suite acceptance` (one process, one command):
