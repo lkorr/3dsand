@@ -465,7 +465,8 @@
     // moving the camera, so a camera-only signature would freeze the view mid
     // brush stroke.
     this.editRev = 0;
-    this.stats = {regions: 0, quads: 0, draws: 0, fetches: 0, bytes: 0, ms: 0};
+    this.stats = {regions: 0, quads: 0, draws: 0, fetches: 0, bytes: 0, ms: 0,
+                  farD: 0, farNeed: 0};
 
     this.view = {
       mode: 'material',           // material | class | height
@@ -1087,7 +1088,34 @@
     var eye = this.camEye(), fwd = this.camForward();
     // The far plane follows the coarsest resident level; a fixed one either
     // clips the horizon or wastes the whole depth range on the near field.
+    //
+    // BUT THE LEVEL SIZE IS A STREAMING FACT, and an AUTHORED region has
+    // nothing to do with REGION_N. The Trees tab runs at levels = 1, which
+    // yields 192 voxels of depth — fine for one oak, and less than half of what
+    // a 2x2 stand of great oaks needs, so the back of the quad was clipped away
+    // and pulling the camera back only deleted more of it. Even a lone great
+    // oak (211x169x184) framed past it.
+    //
+    // So the streaming value is a FLOOR now, not the answer: grow it to reach
+    // the farthest corner of everything actually resident. In streaming mode
+    // the coarsest shell's corner is ~2.6*ext against a 3*ext floor, so the
+    // floor still wins and nothing there changes.
     var farD = this._levelExtent(this.view.levels - 1) * 3;
+    var need = 0;
+    this.regions.forEach(function (r) {
+      var o = r.origin;
+      var dx = Math.max(Math.abs(o[0] - eye[0]), Math.abs(o[0] + r.nx * r.lod - eye[0]));
+      var dy = Math.max(Math.abs(o[1] - eye[1]), Math.abs(o[1] + r.ny * r.lod - eye[1]));
+      var dz = Math.max(Math.abs(o[2] - eye[2]), Math.abs(o[2] + r.nz * r.lod - eye[2]));
+      var d = Math.sqrt(dx * dx + dy * dy + dz * dz);
+      if (d > need) need = d;
+    });
+    farD = Math.max(farD, need * 1.05 + 8);
+    // Reported because "the back of the scene is missing" is otherwise
+    // indistinguishable from "it has not meshed yet": one is this number being
+    // too small and the other is a worker still running.
+    this.stats.farD = farD;
+    this.stats.farNeed = need;
     var proj = m4persp(this.fov(), dw / dh, 0.4, farD);
     var viewM = m4look(eye[0], eye[1], eye[2],
                        eye[0] + fwd[0], eye[1] + fwd[1], eye[2] + fwd[2], 0, 1, 0);

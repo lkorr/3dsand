@@ -226,6 +226,20 @@ async function waitFor(pred, ms){
     var qq = 0;
     ok = await waitFor(function(){ wv.render(); qq = wv.stats.quads; return qq > 100; }, 40000);
     say(ok, 'quad view meshed ' + qq.toLocaleString() + ' quads');
+    // ALL FOUR AT ONCE is the literal ask. `stats.regions` counts what BOTH
+    // finished meshing and survived the frustum, so it has to be waited on —
+    // the worker takes two at a time and asserting it one frame after the
+    // quad-count wait measures the mesh queue, not the camera.
+    ok = await waitFor(function(){ wv.render(); return wv.stats.regions === 4; }, 40000);
+    say(ok, 'all four draw at the framing distance (' + wv.stats.regions +
+        ' of 4, cam.dist ' + Math.round(wv.cam.dist) + ')');
+    // And the far plane is the reason, stated as a number: the streaming
+    // formula gives REGION_N*3 = 192 at levels=1, which is less than the
+    // corner distance of a stand and used to clip its back half.
+    say(wv.stats.farD >= wv.stats.farNeed,
+        'far plane covers the scene: ' + Math.round(wv.stats.farD) +
+        ' vs a farthest corner at ' + Math.round(wv.stats.farNeed) +
+        ' (the streaming-only value would have been 192)');
     quadBox.checked = false;
     quadBox.dispatchEvent(new Event('change', {bubbles: true}));
     ok = await waitFor(function(){ return wv.regions.size === oneRegion; }, 30000);
