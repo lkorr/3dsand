@@ -162,6 +162,18 @@ struct Image {
   // after the last touch, and the submit that rendered it waits the acquire
   // semaphore / signals the per-image render-done semaphore.
   bool presentable = false;
+  // SAMPLED image: something outside the recorder is going to READ this in a
+  // shader, so the recorder's Finish() leaves it in SHADER_READ_ONLY_OPTIMAL
+  // after the last touch — the exact parallel of `presentable` above, and for
+  // the same reason. A colour attachment otherwise ends a pass in
+  // COLOR_ATTACHMENT_OPTIMAL and stays there, so a descriptor that names it as
+  // a sampled image is describing a layout the image is not in.
+  //
+  // The one consumer today is the character panel's avatar portrait, which
+  // ImGui samples through a descriptor of its own (src/ui/overlay.cpp). Set
+  // from TextureUsage::TextureBinding at creation, so any future
+  // render-to-texture gets it without touching this file again.
+  bool sampled = false;
   std::string label;
 };
 

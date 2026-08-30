@@ -198,6 +198,23 @@ struct AnimPart {
   // legacy no-IK fallback (dummy.json): sinusoidal swing about `axis`
   Vec3 axis{1, 0, 0};
   float swingAmp = 0, swingPhase = 0;
+  // ---- POSE-SPACE joint limit (optional; sidecar "poseLimit") --------------
+  // A RANGE OF MOTION FOR THE ANIMATION, which is a different thing from the
+  // ragdoll limits next to it in MobLimbDef. `minAngle`/`maxAngle` and the
+  // swing-twist cone are Jolt constraints: they bound a DYNAMIC body, and a
+  // live limb is KINEMATIC — the pose pipeline writes its transform every tick
+  // and the solver never sees a constraint at all. So nothing whatsoever
+  // stopped the IK from raking a thigh out behind the body or folding it up
+  // through the pelvis; the only guard was a selftest noticing afterwards.
+  //
+  // This clamps the SOLVED pose instead, about the part's own REST frame, so
+  // an anatomically impossible leg is unrepresentable rather than merely
+  // untested. Authored in degrees, stored in radians. Applied after the IK and
+  // before the pose is submitted (AnimClampPoseLimits).
+  bool hasPoseLimit = false;
+  Vec3 poseAxis{1, 0, 0};        // in the part's own rest frame
+  float poseMin = -3.14159265f;  // radians, about poseAxis, 0 = rest
+  float poseMax = 3.14159265f;
 };
 
 // The whole rig, shared by all instances of a def (immutable after load).
@@ -227,6 +244,19 @@ struct ClipInstance {
   float weight = 1.0f;           // requested weight before blend in/out
   bool stopping = false;         // blending out, remove at weight 0
   float fade = 0;                // current blend-in/out factor 0..1
+  // PLAYBACK RATE, multiplied into the playhead only — never into `ageMs`.
+  //
+  // A clip's authored period is right for exactly ONE speed. The walk and run
+  // arm swings are derived from the runtime's step model at walk pace and at
+  // sprint pace (scripts/gen_human.py arm_cycle_ms), which leaves every speed
+  // BETWEEN them — most of the speeds actually played — with arms cycling at a
+  // rate the feet do not share, so they drift in and out of phase. The avatar
+  // sets this from the live stride rate so one authored cycle spans one stride
+  // at any pace.
+  //
+  // `ageMs` is deliberately excluded: it is the blend-in's clock and a blend is
+  // measured in real seconds, not in stride fractions.
+  float rate = 1.0f;
 };
 
 struct FootState {
@@ -292,6 +322,20 @@ void AnimFlatten(const AnimSkeleton& sk, AnimState& st);
 // `targetModel` is the desired effector position in model space.
 void AnimSolveTwoBone(const AnimSkeleton& sk, AnimState& st, const IkChain& chain,
                       Vec3 targetModel, float weight);
+
+// Stage 6. Clamp every part carrying a `poseLimit` back inside its authored
+// range of motion, then re-flatten the affected subtrees so children follow.
+// Runs AFTER all IK, because the IK is what puts a joint outside its range;
+// running it before would clamp a pose the solver is about to overwrite.
+//
+// Works purely in st.model[], the frame the IK writes, and deliberately does
+// NOT write st.local[] — stage 1 reseeds every local from the rest pose on the
+// next frame, so anything stored there would be discarded unread. This is the
+// same reason AnimSolveTwoBone leaves local alone.
+//
+// Parts with no limit are untouched, so this is a no-op on every rig that
+// authors none.
+void AnimClampPoseLimits(const AnimSkeleton& sk, AnimState& st);
 
 // Holden spring integration for one part's local rotation offset.
 void AnimSpringStep(const SpringDef& def, SpringState& s, Vec3 goal, float dt);

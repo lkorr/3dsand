@@ -42,6 +42,13 @@
 @group(0) @binding(15) var<storage, read_write> supportOut : array<atomic<u32>>;
 @group(0) @binding(17) var<storage, read>       pageTable : array<u32>;
 @group(0) @binding(18) var<storage, read_write> pageFaults : array<atomic<u32>>;
+@group(0) @binding(23) var<storage, read_write> actVoxViz  : array<atomic<u32>>;
+
+fn markVoxActive(idx : u32) {
+  if (T.vizActive != 0u && idx != PT_NO_WORD) {
+    atomicOr(&actVoxViz[idx >> 5u], 1u << (idx & 31u));
+  }
+}
 
 // Unloaded space is solid and inert (DESIGN.md §3): the sim's world edge is
 // the residency window, not a fixed cube.
@@ -122,10 +129,12 @@ fn tryMove(src : vec3<i32>, dst : vec3<i32>, myWord : u32, myDensity : i32, risi
   // falls is still stained, and the air it left behind is not. Both sides of
   // the swap therefore carry their own source word's stain bits.
   voxStore(di, packVoxKeepStain(voxMat(myWord), voxState(myWord), stamp, myWord));
+  markVoxActive(di);
   // displaced fluid (or air) swaps into the source cell, stamped so it does
   // not act again this tick
-  voxStore(voxWordIndex((src)),
-           packVoxKeepStain(voxMat(tw), voxState(tw), stamp, tw));
+  let si = voxWordIndex((src));
+  voxStore(si, packVoxKeepStain(voxMat(tw), voxState(tw), stamp, tw));
+  markVoxActive(si);
   markDirty(src);
   markDirty(dst);
   // a powder sliding out from under a solid may leave it floating
@@ -155,7 +164,9 @@ fn transferLiquid(src : vec3<i32>, dst : vec3<i32>, mat : u32,
   let dw = voxWordAt((dst));
   if (t >= sf) { voxStore(si, 0u); }
   else { voxStore(si, packVoxKeepStain(mat, sf - t - 1u, stamp, sw)); }
+  markVoxActive(si);
   voxStore(di, packVoxKeepStain(mat, df + t - 1u, stamp, dw));
+  markVoxActive(di);
   markDirty(src);
   markDirty(dst);
 }
@@ -411,6 +422,7 @@ fn doReactions(c : vec3<i32>, idx : u32, slotIdx : u32, w : u32, mat : u32,
       if ((rr % REACT_CHANCE_DEN) < chance) {
         if (rule.prodSelf == 0u) { voxStore(idx, 0u); }
         else { voxStore(idx, packVox(rule.prodSelf, productState(rule.prodSelf, rnd), stamp)); }
+        markVoxActive(idx);
         markDirty(c);
         flagSupportLoss(c, m.klass, rule.prodSelf);  // ember->ash drops the wood above
         return true;
@@ -427,11 +439,13 @@ fn doReactions(c : vec3<i32>, idx : u32, slotIdx : u32, w : u32, mat : u32,
         keepAwake = keepAwake || !lightGated;
         if ((rr % REACT_CHANCE_DEN) < rule.chance) {
           voxStore(ni, packVox(rule.prodNbr, productState(rule.prodNbr, rr >> 4u), stamp));
+          markVoxActive(ni);
           markDirty(n);
           markDirty(c);
           if (rule.prodSelf != PROD_KEEP) {
             if (rule.prodSelf == 0u) { voxStore(idx, 0u); }
             else { voxStore(idx, packVox(rule.prodSelf, productState(rule.prodSelf, rnd), stamp)); }
+            markVoxActive(idx);
             flagSupportLoss(c, m.klass, rule.prodSelf);
             return true;
           }
@@ -469,6 +483,7 @@ fn doReactions(c : vec3<i32>, idx : u32, slotIdx : u32, w : u32, mat : u32,
             // rewrites air over air, harmless.
             if (rule.prodNbr == 0u) { voxStore(ni, 0u); }
             else { voxStore(ni, packVox(rule.prodNbr, productState(rule.prodNbr, rr >> 4u), stamp)); }
+            markVoxActive(ni);
             markDirty(n);
             if (!synthFluid) {
               flagSupportLoss(n, materials[nmat].klass, rule.prodNbr);
@@ -477,6 +492,7 @@ fn doReactions(c : vec3<i32>, idx : u32, slotIdx : u32, w : u32, mat : u32,
           if (rule.prodSelf != PROD_KEEP) {
             if (rule.prodSelf == 0u) { voxStore(idx, 0u); }
             else { voxStore(idx, packVox(rule.prodSelf, productState(rule.prodSelf, rnd), stamp)); }
+            markVoxActive(idx);
             markDirty(c);
             flagSupportLoss(c, m.klass, rule.prodSelf);
             return true;
@@ -647,6 +663,7 @@ fn doStaining(c : vec3<i32>, idx : u32, m : Material, rnd : u32) -> bool {
       var washedType = curType;
       if (washed == 0u) { washedType = 0u; }
       voxStore(ni, (nw & ~STAIN_BITS) | packStain(washedType, washed));
+      markVoxActive(ni);
       markDirty(n);
       markDirty(c);
       break;
@@ -671,6 +688,7 @@ fn doStaining(c : vec3<i32>, idx : u32, m : Material, rnd : u32) -> bool {
       amt = min(cur + addAmt, ceiling);
     }
     voxStore(ni, (nw & ~STAIN_BITS) | packStain(stainType, amt));
+    markVoxActive(ni);
     markDirty(n);
 
     // ---- absorption: the liquid SPENDS itself soaking in ----
@@ -697,6 +715,7 @@ fn doStaining(c : vec3<i32>, idx : u32, m : Material, rnd : u32) -> bool {
       } else {
         voxStore(idx, packVoxKeepStain(selfMat, sf - 2u, stamp, selfWord));
       }
+      markVoxActive(idx);
     }
 
     // Consumption: the stain eats the voxel it just marked. Rolled from a
@@ -706,6 +725,7 @@ fn doStaining(c : vec3<i32>, idx : u32, m : Material, rnd : u32) -> bool {
     let croll = hash3(rnd, 0x51A17u, niSlot) % 1000u;
     if (croll < matStainConsume(m)) {
       voxStore(ni, 0u);
+      markVoxActive(ni);
       // The voxel that vanished may have been holding a solid up.
       flagSupportLoss(n, nk, MAT_AIR);
     }

@@ -24,6 +24,7 @@
 #include "game/persist.h"
 #include "game/camera.h"
 #include "game/caster.h"
+#include "game/equipment.h"
 #include "game/item.h"
 #include "game/melee.h"
 #include "game/mob.h"
@@ -73,6 +74,43 @@ namespace {
 // retires those and nothing else. A spell's gust owns itself (the casterId) and
 // expires on its own TTL; the panel has no business reaching into gameplay.
 constexpr uint64_t kDevFanOwner = 0xDEFA11Au;
+
+// ---- the scroll wheel -------------------------------------------------------
+// GLFW callbacks are C function pointers, so the accumulator is file-scope.
+// ACCUMULATED rather than sampled, because scroll arrives as discrete events
+// inside glfwPollEvents and a frame that polls two notches must see two: a
+// "last event wins" read would quietly drop half a fast flick.
+//
+// This closes a stale comment in the frame loop that claimed the wheel picked
+// a hotbar slot — Inventory::Scroll (game/item.h) has been written and
+// unreachable since it was added, because nothing ever installed a callback.
+double g_scrollY = 0.0;
+void ScrollCallback(GLFWwindow*, double, double dy) { g_scrollY += dy; }
+
+// ---- --shot-inventory: the character screen as a reviewable image ----------
+//
+// The screen's whole job is to be LOOKED at, and the only thing that can judge
+// it is a picture. Without this, every visual iteration costs a human opening
+// the game, walking somewhere, cutting bits off themselves and pressing I.
+//
+// It runs the ORDINARY windowed loop — same overlay, same portrait pass, same
+// everything — and on one scheduled frame renders the whole thing a SECOND
+// time into an offscreen target and writes it out. A second render rather than
+// a swapchain grab because a presented image is not copyable, and re-recording
+// the frame is both cheap and exactly what the screen already contains.
+//
+// The damage is scripted at fixed ticks so the picture is the same every run:
+// an arm off, a hand off, and a bore through the torso, which between them
+// exercise the severed row, the burning/bleeding chips and the "% intact" bar
+// that hp alone cannot produce.
+bool g_shotInventory = false;
+// TWO pictures, because the screen has two halves and one of them cannot be
+// seen from the other: the equipment view and the injury inspector share a
+// frame and a portrait but show completely different things.
+constexpr uint64_t kShotInvOpenFrame = 150;    // let the avatar spawn and settle
+constexpr uint64_t kShotInvDamageFrame = 170;
+constexpr uint64_t kShotInvGearFrame = 220;    // -> screenshot_inventory.bmp
+constexpr uint64_t kShotInvCaptureFrame = 240;  // -> ..._health.bmp; last frame
 
 
 // --frames N (phase 4b D3): windowed verification harness. 0 = play normally.
@@ -364,8 +402,58 @@ int BodySlotFor(const char* name, const char* tag) {
   return -1;  // props, held items, anything the figure has no place for
 }
 
-void FillBodyUI(const PlayerAvatar& avatar, UIState& ui) {
+// Human-readable name per figure slot, for the character screen's injury list.
+// Indexed by UIState::BodySlot, so it is one table beside the enum rather than
+// a string built from the rig's part names — a rig's authored name ("armL.R")
+// is a content identifier and has no business being shown to a player.
+const char* BodySlotLabel(int slot) {
+  static const char* k[UIState::kSlotCount] = {
+      "Head",         "Torso",         "Hips",
+      "Left upper arm", "Left forearm", "Left hand",
+      "Right upper arm", "Right forearm", "Right hand",
+      "Left thigh",   "Left shin",     "Left foot",
+      "Right thigh",  "Right shin",    "Right foot"};
+  return (slot >= 0 && slot < UIState::kSlotCount) ? k[slot] : "?";
+}
+
+// ---- BURN DAMAGE IS MATERIAL IDENTITY, NOT A FIELD -------------------------
+//
+// A limb that has been in a fire does not carry a "burned" number: its voxels
+// have REACTED, skin -> flesh_cooked -> flesh_burning -> flesh_charred -> ash,
+// and the same ladder exists for cloth. So "this arm is 40% charred" is a
+// count over the limb's own voxels by material id, and needs no new engine
+// state at all — which is why these ids are resolved ONCE (after every
+// material load, never per frame: PartMaterialCount is a scan, and a material
+// name lookup on top of it every frame for every limb would be gratuitous).
+struct BurnMats {
+  std::vector<uint32_t> cooked;   // "on the way": cooked + actively burning
+  std::vector<uint32_t> charred;  // "gone": charred + ash
+};
+
+BurnMats ResolveBurnMats(const std::vector<MaterialDef>& mats) {
+  BurnMats bm;
+  auto find = [&](const char* name, std::vector<uint32_t>& out) {
+    for (size_t i = 0; i < mats.size(); i++)
+      if (mats[i].name == name) {
+        out.push_back((uint32_t)i);
+        return;
+      }
+  };
+  // Named, never hardcoded by id (CLAUDE.md conventions). A name that is not
+  // in this content simply contributes nothing — the readout degrades to "not
+  // charred" rather than reporting a wrong material's count.
+  for (const char* n : {"flesh_cooked", "flesh_burning", "cloth_burning"})
+    find(n, bm.cooked);
+  for (const char* n : {"flesh_charred", "ash", "cloth_charred"})
+    find(n, bm.charred);
+  return bm;
+}
+
+void FillBodyUI(const PlayerAvatar& avatar, const BurnMats& burnMats,
+                UIState& ui) {
   for (int i = 0; i < UIState::kSlotCount; i++) ui.body[i] = {};
+  for (int i = 0; i < UIState::kSlotCount; i++)
+    ui.body[i].label = BodySlotLabel(i);
   const MobDef* def = avatar.Def();
   ui.bodyValid = def != nullptr;
   if (!def) return;
@@ -377,17 +465,212 @@ void FillBodyUI(const PlayerAvatar& avatar, UIState& ui) {
     if (slot < 0) continue;
     UIState::BodyPartUI& b = ui.body[slot];
     b.present = true;
+    b.hpMax = avatar.PartHpMax(i);
     if (!avatar.PartAlive(i)) {
       b.severed = true;
       b.hpFrac = 0.0f;
+      b.hp = 0.0f;
+      b.voxelFrac = 0.0f;
       continue;  // a lost limb neither bleeds nor reports damage
     }
     const float max = avatar.PartHpMax(i);
     const float hp = avatar.PartHp(i);
+    b.hp = hp;
     b.hpFrac = max > 0.0f ? hp / max : 1.0f;
     if (b.hpFrac < 0.0f) b.hpFrac = 0.0f;
     if (b.hpFrac > 1.0f) b.hpFrac = 1.0f;
     b.bleeding = avatar.PartBleeding(i);
+    b.burningVoxels = avatar.PartBurningCount(i);
+
+    const uint32_t spawn = avatar.PartVoxelsAtSpawn(i);
+    const uint32_t now = avatar.PartVoxelCount(i);
+    b.voxelFrac = spawn > 0 ? std::clamp((float)now / (float)spawn, 0.0f, 1.0f)
+                            : 1.0f;
+    if (now > 0) {
+      uint32_t cooked = 0, charred = 0;
+      for (uint32_t m : burnMats.cooked) cooked += avatar.PartMaterialCount(i, m);
+      for (uint32_t m : burnMats.charred)
+        charred += avatar.PartMaterialCount(i, m);
+      // Charred counts double against "intact-looking": cooked flesh is still
+      // flesh, charred flesh is structurally gone. Reported as one fraction
+      // because the player's question is "how much of this limb is ruined",
+      // not "which rung of the reaction ladder is it on".
+      b.charredFrac =
+          std::clamp((float)(cooked + charred * 2) / (float)(now * 2), 0.0f,
+                     1.0f);
+    }
+  }
+}
+
+// ---- the character panel's live avatar portrait -----------------------------
+//
+// A SECOND CAMERA POINTED AT THE PLAYER'S OWN RIG, rendered offscreen once per
+// frame while the screen is open and sampled by ImGui. It is the whole reason
+// the panel needs no portrait ART: the avatar is one live copy-on-write
+// micro-voxel body, so missing voxels, char/cook material transitions, severed
+// limbs, dismemberment poses and whatever is in its hand all appear for free.
+// Nothing in the panel knows about any of them.
+//
+// The recipe is --shot-mob's `shoot` lambda: place a camera, write the render
+// params, open a pass on an offscreen view, draw the bodies, submit. The one
+// real cost is the SECOND SUBMIT — world.renderUBO is a single buffer, so two
+// cameras cannot share one command buffer, and each write has to be followed
+// by its own submit for the deferred upload to land in front of the right pass.
+// The camera is held as a real `Camera` (yaw/pitch) rather than as a hand-built
+// basis, and that is load-bearing: WriteRenderParams derives camRight/camUp/
+// camFwd from a Camera, so the basis the SHADER marches with and the basis the
+// inspector projects with are the same three lines of code. A second
+// hand-rolled basis here would only have to agree with Camera::Right()'s
+// handedness — and getting that backwards produces a mirror image, which reads
+// as "the outline is on the wrong arm" rather than as a maths bug.
+struct PortraitCam {
+  bool valid = false;
+  Camera cam;
+  Vec3 eye{}, target{};
+  float tanHalf = 0.5f, aspect = 1.0f;
+};
+
+// The eight corners of a limb's oriented collider box, in world voxels. Used
+// both to FRAME the portrait and to outline limbs on it — one helper so the
+// two can never disagree about where a limb is.
+bool LimbBoxCorners(const PlayerAvatar& av, Physics& phys, int part,
+                    Vec3 out[8]) {
+  const uint64_t body = av.PartBody(part);
+  if (!body) return false;
+  Vec3 pos;
+  Quat rot;
+  if (!av.PartWorldTransform(part, pos, rot)) return false;
+  Vec3 lo, hi;
+  // Body-origin-local, centre of mass already baked in — the same convention
+  // rigrender::AppendDebugBox relies on, which is why the debug overlay and
+  // this agree about where a limb is.
+  if (!phys.GetLocalBounds(body, lo, hi)) return false;
+  for (int i = 0; i < 8; i++) {
+    const Vec3 c{(i & 1) ? hi.x : lo.x, (i & 2) ? hi.y : lo.y,
+                 (i & 4) ? hi.z : lo.z};
+    out[i] = pos + QuatRotate(rot, c);
+  }
+  return true;
+}
+
+// Frame the LIVE body, not the def's box. A def-sized frame is wrong twice
+// over: a rig that has lost both legs is half the height it was authored at,
+// and the origin of a heavily dismembered body is nowhere near the part of it
+// you can still see (the same lesson --shot-mob learned about corpses).
+PortraitCam MakePortraitCam(const PlayerAvatar& av, Physics& phys, float yaw,
+                            float pitch, float aspect) {
+  PortraitCam pc;
+  if (!av.Spawned() || !av.Def()) return pc;
+  Vec3 lo{1e9f, 1e9f, 1e9f}, hi{-1e9f, -1e9f, -1e9f};
+  const int limbCount = (int)av.Def()->limbs.size();
+  bool any = false;
+  for (int i = 0; i < limbCount; i++) {
+    Vec3 c[8];
+    if (!LimbBoxCorners(av, phys, i, c)) continue;
+    any = true;
+    for (const Vec3& p : c) {
+      lo = Vec3{std::min(lo.x, p.x), std::min(lo.y, p.y), std::min(lo.z, p.z)};
+      hi = Vec3{std::max(hi.x, p.x), std::max(hi.y, p.y), std::max(hi.z, p.z)};
+    }
+  }
+  if (!any) return pc;
+
+  pc.target = (lo + hi) * 0.5f;
+  pc.tanHalf = std::tan(CurrentTuning().camera.fovY * 0.5f);
+  pc.aspect = aspect;
+  // FIT HEIGHT AND WIDTH SEPARATELY, but take the width from the HORIZONTAL
+  // RADIUS rather than from the box's x or z extent. Both halves of that matter:
+  //   * a bounding SPHERE is far too loose for a standing figure — the body is
+  //     ~17 voxels tall and ~6 across, so the diagonal is nearly the height and
+  //     fitting it leaves the character a third of the frame with air all round;
+  //   * but the box's own x/z extents SWING as the orbit turns, so a fit taken
+  //     from them would make the character breathe in and out while you drag.
+  // The horizontal radius is the largest half-extent in the ground plane, which
+  // is rotation-invariant, and the height does not rotate at all.
+  const Vec3 half = (hi - lo) * 0.5f;
+  const float halfH = std::max(0.5f, half.y);
+  const float radiusXZ = std::max(0.5f, std::max(half.x, half.z));
+  const float fitV = halfH / pc.tanHalf;
+  const float fitH = radiusXZ / (pc.tanHalf * std::max(aspect, 1e-3f));
+  // The margin covers two things at once: air around the silhouette, and the
+  // fact that a camera TILTED off the horizontal needs more vertical room than
+  // the body's own half-height (the tilt swings the frame off the box centre,
+  // and a fit computed as if it were level crops the head).
+  const float dist = std::max(fitV, fitH) * 1.28f;
+
+  // Orbit: the camera looks ALONG (yaw, pitch) and is pushed back down that
+  // ray from the target. Pitch is clamped by the panel that produces it, so
+  // this needs no second clamp — one owner for one rule.
+  pc.cam.yaw = yaw;
+  pc.cam.pitch = pitch;
+  pc.eye = pc.target - pc.cam.Forward() * dist;
+  pc.valid = true;
+  return pc;
+}
+
+// World point -> portrait-normalized (0,0 top-left .. 1,1 bottom-right).
+//
+// This is the INVERSE of raymarch.wgsl's primary ray, which builds
+//   dir = normalize(camFwd + camRight * (ndc.x * tanHalfFov * aspect)
+//                          + camUp    * (ndc.y * tanHalfFov))
+// over a full-screen triangle whose `uv` IS clip space, under a
+// negative-height viewport (vk_record.cpp) — so ndc.y = +1 is the TOP of the
+// image. Getting that flip wrong shows up as an inspector that outlines the
+// feet when you damage the head, which is why it is spelled out here.
+bool ProjectToPortrait(const PortraitCam& pc, const Vec3& p, float out[2]) {
+  const Vec3 fwd = pc.cam.Forward(), right = pc.cam.Right(), up = pc.cam.Up();
+  const Vec3 d = p - pc.eye;
+  const float z = d.dot(fwd);
+  if (z <= 0.05f) return false;                  // behind, or on the plane
+  const float ndcX = d.dot(right) / (z * pc.tanHalf * pc.aspect);
+  const float ndcY = d.dot(up) / (z * pc.tanHalf);
+  out[0] = 0.5f + 0.5f * ndcX;
+  out[1] = 0.5f - 0.5f * ndcY;
+  return true;
+}
+
+// Fill each figure slot's projected outline. Runs after FillBodyUI, and only
+// while the inspector is showing — projecting 15 boxes is cheap but it is not
+// free, and nothing reads the result otherwise.
+void ProjectBodyUI(const PlayerAvatar& av, Physics& phys, const PortraitCam& pc,
+                   UIState& ui) {
+  for (int i = 0; i < UIState::kSlotCount; i++) ui.body[i].projValid = false;
+  if (!pc.valid || !av.Def()) return;
+  const int limbCount = (int)av.Def()->limbs.size();
+  for (int i = 0; i < limbCount; i++) {
+    const int slot = BodySlotFor(av.PartName(i), av.PartTag(i));
+    if (slot < 0) continue;
+    Vec3 c[8];
+    if (!LimbBoxCorners(av, phys, i, c)) continue;
+    float mn[2] = {1e9f, 1e9f}, mx[2] = {-1e9f, -1e9f};
+    int hits = 0;
+    for (const Vec3& p : c) {
+      float uv[2];
+      if (!ProjectToPortrait(pc, p, uv)) continue;
+      hits++;
+      mn[0] = std::min(mn[0], uv[0]);
+      mn[1] = std::min(mn[1], uv[1]);
+      mx[0] = std::max(mx[0], uv[0]);
+      mx[1] = std::max(mx[1], uv[1]);
+    }
+    // A partially-clipped box would report a bound built from the corners that
+    // happened to survive, which is a smaller rectangle in the wrong place.
+    // All eight or nothing.
+    if (hits != 8) continue;
+    UIState::BodyPartUI& b = ui.body[slot];
+    // Several rig limbs can map to one figure slot; take the UNION so the
+    // outline covers the whole thing the label names.
+    if (b.projValid) {
+      mn[0] = std::min(mn[0], b.projMin[0]);
+      mn[1] = std::min(mn[1], b.projMin[1]);
+      mx[0] = std::max(mx[0], b.projMax[0]);
+      mx[1] = std::max(mx[1], b.projMax[1]);
+    }
+    b.projMin[0] = mn[0];
+    b.projMin[1] = mn[1];
+    b.projMax[0] = mx[0];
+    b.projMax[1] = mx[1];
+    b.projValid = true;
   }
 }
 
@@ -1671,6 +1954,35 @@ int WriteHeightmap(const std::string& spec, const std::string& outPath) {
 int main(int argc, char** argv) {
   InstallCrashHandler();
 
+  // --crash-test: fault on purpose, so the crash REPORTER is verifiable.
+  // The handler is the one piece of code whose correctness cannot be observed
+  // during normal operation — it only ever runs when something else has already
+  // gone wrong, which is the worst moment to discover that its stack walk is
+  // broken. Six real dumps on 2026-08-27 were unusable and nobody knew until
+  // they were needed. One flag, no GPU, no window, ~0.2 s: run it after any
+  // edit to crash.cpp and read crash.log.
+  //
+  // Deliberately a NULL READ, matching the historical 0xC0000005 signature, so
+  // what the log prints here is directly comparable to a real dump.
+  // `--crash-test[=null|abort|throw]` picks WHICH fatal path to take, because
+  // they reach the reporter through four different mechanisms and only the
+  // first is an SEH exception. abort() in particular is the page pool's
+  // documented exhaustion path, and it used to write nothing at all.
+  for (int i = 1; i < argc; i++) {
+    std::string a = argv[i];
+    if (a.rfind("--crash-test", 0) != 0) continue;
+    const std::string kind =
+        a.size() > 12 && a[12] == '=' ? a.substr(13) : "null";
+    std::fprintf(stderr, "--crash-test=%s: failing on purpose\n", kind.c_str());
+    if (kind == "abort") {
+      std::fprintf(stderr, "FATAL: pretend page pool exhausted\n");
+      std::abort();
+    }
+    if (kind == "throw") throw std::runtime_error("crash-test uncaught throw");
+    volatile int* p = nullptr;
+    return *p;
+  }
+
   bool selftest = false;
   bool shot = false;
   bool measure = false;  // --measure: Vulkan-port sizing harness (headless)
@@ -1748,6 +2060,8 @@ int main(int argc, char** argv) {
           "  --shot-fluid-pond     MPM fluid poured into a generated pond\n"
           "                        (the MPM/settled-water seam)\n"
           "  --shot-mob <def>      Mob pose look iteration (def[:limb,...])\n"
+          "  --shot-inventory      Character screen (I) with a damaged avatar,\n"
+          "                        one frame to screenshot_inventory.bmp\n"
           "  --time <0..1>         Time of day for --shot (0=midnight, 0.5=noon)\n\n"
           "Fluid lab:\n"
           "  --lab [scene]         Windowed fluid lab (basin|hill|faucet|pool|slosh|pond|worldlake)\n"
@@ -1817,6 +2131,14 @@ int main(int argc, char** argv) {
     else if (a == "--frames") {
       if (i + 1 >= argc) { std::fprintf(stderr, "--frames requires a count\n"); return 1; }
       g_harnessFrames = (uint64_t)std::atoll(argv[++i]);
+    }
+    // `--shot-inventory` is the character screen's look-iteration harness: run
+    // the windowed game, spawn and damage the avatar on a fixed schedule, open
+    // the screen, and write ONE frame out as a BMP. See the note at
+    // g_shotInventory.
+    else if (a == "--shot-inventory") {
+      g_shotInventory = true;
+      g_harnessFrames = kShotInvCaptureFrame;
     }
     else if (a == "--autofly") g_autofly = true;
     else if (a == "--autofly-hard") { g_autofly = true; g_autoflyHard = true; }
@@ -2094,6 +2416,15 @@ int main(int argc, char** argv) {
       }
       MicroSet mic;
       { std::string ml; LoadMicroVox(ad + "/materials/materials.json", ad, m, mic, ml); }
+      // The second world this process builds needs the same trees as the first
+      // -- a treeless second world would hash differently for a reason that has
+      // nothing to do with what is being tested.
+      TreeAtlas stTrees;
+      { std::string tl;
+        if (!LoadTreeAtlas(ad + "/trees", m, stTrees, tl)) {
+          std::fprintf(stderr, "%s", tl.c_str());
+          return 1;
+        } }
       GpuContext stCtx;
       if (!stCtx.Init(nullptr, 1600, 900, lowPowerAdapter, false, backend,
                       vkValidation, sledgehammer))
@@ -2102,7 +2433,7 @@ int main(int argc, char** argv) {
       stWorld.residency = World::Residency::Paged;
       stWorld.Init(stCtx.device);
       Simulation stSim;
-      if (!stSim.Init(stCtx.device, stWorld, m, rx, mic, ad + "/shaders"))
+      if (!stSim.Init(stCtx.device, stWorld, m, rx, mic, stTrees, ad + "/shaders"))
         return 1;
       Physics stPhys; stPhys.Init();
       DebrisSystem stDebris; stDebris.Init(&stPhys, &stWorld, m, rx);
@@ -2228,6 +2559,21 @@ int main(int argc, char** argv) {
                 micro.materialCount, micro.frameCount, micro.pool.size());
   }
 
+  // The baked tree atlas (src/sim/treeatlas.h). AFTER LoadAssets, because it
+  // resolves the material NAMES its .svtree files carry against the compiled
+  // table, and before Simulation::Init, which uploads it.
+  TreeAtlas treeAtlas;
+  {
+    std::string tlog;
+    if (!LoadTreeAtlas(assetDir + "/trees", mats, treeAtlas, tlog)) {
+      std::fprintf(stderr, "%s", tlog.c_str());
+      std::fprintf(stderr, "tree atlas failed to load -- refusing to start with a "
+                           "half-read forest\n");
+      return 1;
+    }
+    if (!tlog.empty()) std::fprintf(stderr, "%s", tlog.c_str());
+  }
+
   GLFWwindow* window = nullptr;
   if (!selftest && !shot && !measure && !fluidBench && shotMob.empty() &&
       voxdumpArgs.empty() && !voxserve) {
@@ -2253,7 +2599,8 @@ int main(int argc, char** argv) {
       residencyPaged ? World::Residency::Paged : World::Residency::Dense;
   world.Init(ctx.device);
   Simulation sim;
-  if (!sim.Init(ctx.device, world, mats, reactions, micro, assetDir + "/shaders"))
+  if (!sim.Init(ctx.device, world, mats, reactions, micro, treeAtlas,
+                assetDir + "/shaders"))
     return 1;
 
   Physics phys;
@@ -2400,7 +2747,7 @@ int main(int argc, char** argv) {
   }
 
   Overlay overlay;
-  if (!overlay.Init(window, ctx.device, ctx.surfaceFormat)) return 1;
+  if (!overlay.Init(window, ctx.device, ctx.surfaceFormat, assetDir)) return 1;
 
   // Audio comes up HERE, after the three headless modes have returned: none of
   // --shot/--shot-mob/--selftest should ever open a sound device (there is no
@@ -2484,6 +2831,40 @@ int main(int argc, char** argv) {
     ui.materialColors.push_back(m.gpu.color0);
   }
 
+  // ---- the character panel's portrait target -------------------------------
+  // Created ONCE at a fixed size, never resized with the window: the image is
+  // displayed 1:1 at whole-pixel coordinates through a nearest sampler, so a
+  // target that tracked the framebuffer would resample it and throw away
+  // exactly the crispness the sampler is there for. RenderAttachment because
+  // the world pipelines draw into it, TextureBinding because ImGui samples it.
+  //
+  // NEVER READ BACK. rhi::ReadBufferBlocking is forbidden in the frame path
+  // (rhi.h), and nothing here needs it: the pixels go straight from the pass
+  // that wrote them to the ImGui draw that samples them, GPU-side, in the same
+  // frame.
+  //
+  // THE FORMAT IS THE SWAPCHAIN'S, and that is not cosmetic:
+  // Simulation::EnsureRenderPipelines caches on ONE target format and rebuilds
+  // EVERY render pipeline when it changes. A portrait in RGBA8 beside a
+  // BGRA8 swapchain would therefore rebuild the whole render pipeline set
+  // TWICE PER FRAME for as long as the screen was open.
+  constexpr uint32_t kPortraitW = 320, kPortraitH = 448;
+  rhi::Texture portraitTexture = ctx.device.CreateTexture(
+      {kPortraitW, kPortraitH, 1}, ctx.surfaceFormat,
+      rhi::TextureUsage::RenderAttachment | rhi::TextureUsage::TextureBinding,
+      "avatarPortrait");
+  rhi::TextureView portraitView = portraitTexture.CreateView();
+  ui.portraitTex = overlay.RegisterTexture(portraitView);
+  ui.portraitW = (int)kPortraitW;
+  ui.portraitH = (int)kPortraitH;
+  // A FIXED "studio" sun, independent of the world clock. --shot-mob's own
+  // comment says why: midnight is the worst possible light for judging a
+  // silhouette, and a character sheet that goes unreadable at night is one you
+  // cannot use half the time. 0.30 of a day is mid-morning, the same phase the
+  // fluid shots pick for the same reason.
+  const uint32_t kPortraitLightTick =
+      (uint32_t)(0.30 * (double)TicksPerDay(CurrentTuning()));
+
   // Material COLLISION class LUT for the player's mirror queries. Not raw
   // klass: BuildCollisionClasses remaps passable vegetation to gas so the
   // capsule sweep moves through reeds and kelp (sim/materials.h).
@@ -2546,7 +2927,13 @@ int main(int argc, char** argv) {
   uint64_t playerBody = phys.CreatePlayerBody(Player::kHalfXZ, Player::kHalfY);
 
   bool captured = true;
+  // What `captured` was before the character screen took the cursor, so
+  // closing hands it back rather than assuming. A player who pressed Esc to
+  // free the cursor, then opened the screen, then closed it, must not have the
+  // cursor grabbed out from under them.
+  bool captureBeforeUi = true;
   glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
+  glfwSetScrollCallback(window, ScrollCallback);
   double mx0 = 0, my0 = 0;
   glfwGetCursorPos(window, &mx0, &my0);
   // Look sensitivity scale while a melee weapon is up, eased rather than
@@ -2554,7 +2941,7 @@ int main(int argc, char** argv) {
   float lookSensNow = 1.0f;
 
   KeyEdge eP, eN, eV, eF1, eF3, eF4, eF5, eF6, eF9, eF10, eR, eEsc, eLBracket, eRBracket, eJump,
-      eG, eX, eB, eT, eO, eM, eK, eTab, eC, eH, eZ, eBack, eU, eL;
+      eG, eX, eB, eT, eO, eM, eK, eTab, eC, eH, eZ, eBack, eU, eL, eI;
   KeyEdge eGlyph[kGlyphSlots];
   bool prevMouseL = false;
   bool prevMouseR = false;
@@ -2589,11 +2976,36 @@ int main(int argc, char** argv) {
   // into the avatar, exactly as it already does for heading.
   MeleeState melee;
   Inventory hotbar;
+  // The rest of the kit: worn/sheathed/quick slots and the pack
+  // (game/equipment.h). Held beside the hotbar rather than inside it because
+  // the hotbar is WHAT IS IN YOUR HAND and predates all of this; the melee
+  // path reads Inventory::Selected() and must keep doing exactly that.
+  PlayerKit kit;
   {
     // Placeholder acquisition, mirroring GrantAllAndBind: you start with one
     // of everything the library defines. A real pickup loop replaces this.
     for (int i = 0; i < (int)items.items.size(); i++) hotbar.Add(i, 1);
   }
+  // The equipment slot table, mirrored into the UI once. It is authored data
+  // (game/equipment.h EquipSlots), so the panel reads it rather than
+  // restating it — the day ItemKind::ArmorHead exists, this needs no change.
+  {
+    ui.equipDefs.clear();
+    for (int i = 0; i < kEquipSlotCount; i++) {
+      const EquipSlotDef& d = EquipSlotAt(i);
+      UIState::EquipSlotUI u;
+      u.label = d.label;
+      u.icon = d.icon;
+      u.why = d.why;
+      u.acceptsAnything = d.accepts[0] != ItemKind::None;
+      ui.equipDefs.push_back(std::move(u));
+    }
+    ui.bagCols = Bag::kCols;
+    ui.bagRows = Bag::kRows;
+  }
+  // Burn-material ids for the inspector's charred readout, resolved ONCE here
+  // and again after every materials reload — never per frame (see ResolveBurnMats).
+  BurnMats burnMats = ResolveBurnMats(mats);
   // The blade's position last tick, so the sweep has something to sweep FROM.
   // Invalid until the first tick with a weapon drawn — a swing that started
   // from an unknown pose would carve a segment the blade never travelled.
@@ -2699,6 +3111,51 @@ int main(int argc, char** argv) {
     // The park probe is tick-scheduled, so it decides its own end: --frames
     // only has to be generous enough to reach it.
     if (g_parkDone) glfwSetWindowShouldClose(window, 1);
+
+    // --shot-inventory's scripted schedule. Frame-counted rather than
+    // wall-clocked so the same picture comes out on any machine.
+    if (g_shotInventory) {
+      // FLY MODE HAS NO BODY (see the avatar block in the tick loop): the rig
+      // is despawned while flying, so a harness that left the game's default
+      // fly=true would photograph an empty portrait frame and prove nothing.
+      // Walking is also what the screen is normally opened from.
+      if (frameCounter == 1) {
+        ui.fly = false;
+        player.fly = false;
+      }
+      if (frameCounter == kShotInvOpenFrame) {
+        ui.inventoryOpen = true;
+        // The dev panel is F1-hideable and sits ON TOP of the character
+        // screen by design (a menu must not make F5 unreachable) — which
+        // means it also sits on top of the thing this harness exists to
+        // photograph. Hidden for the shot only.
+        ui.visible = false;
+        captured = false;
+        captureBeforeUi = false;
+        glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
+      }
+      if (frameCounter == kShotInvDamageFrame && avatar.Spawned()) {
+        // ONE sever and a shallow bore. Deliberately survivable: a DEAD avatar
+        // is despawned and respawned, so an overzealous script photographs an
+        // empty frame — which is exactly what the first version of this did.
+        // Between them the two produce a SEVERED row, a bleeding stump, and a
+        // limb at full hp that has nonetheless lost voxels (the "% intact"
+        // bar, the readout hp cannot produce and therefore the one most worth
+        // having a picture of).
+        avatar.SeverByName("hand.R");
+        std::vector<ParticleSpawn> shotSpawns;
+        Vec3 chest;
+        const int torso = avatar.Parts().torso;
+        if (torso >= 0 && avatar.PartAnchorWorld(torso, chest))
+          avatar.CarveRadial(chest, 1.8f, world, shotSpawns);
+        std::printf("--shot-inventory: severed hand.R, bored the torso "
+                    "(health %d/%d)\n",
+                    avatar.TotalHealth(), avatar.HealthMax());
+      }
+      // Swap to the inspector between the two captures, so the second picture
+      // is the half the first cannot show.
+      if (frameCounter == kShotInvGearFrame + 1) ui.inspectMode = true;
+    }
     glfwPollEvents();
     double now = NowSeconds();
     float dt = (float)(now - lastTime);
@@ -2771,11 +3228,62 @@ int main(int argc, char** argv) {
 
     // ---- input ----
     auto key = [&](int k) { return glfwGetKey(window, k) == GLFW_PRESS; };
-    if (eEsc.Pressed(key(GLFW_KEY_ESCAPE))) {
-      captured = !captured;
+
+    // ---- WHO IS LISTENING TO THE KEYBOARD ----------------------------------
+    //
+    // Three tiers, and the middle one is a bug fix that predates this screen:
+    //
+    //   uiTyping  an ImGui widget has keyboard focus (a text field, a slider
+    //             being typed into). NOTHING game-side may fire. Until now
+    //             io.WantCaptureKeyboard was never consulted anywhere, so
+    //             typing "5" into a dev-panel field also switched the brush
+    //             material and typing "b" placed a prefab.
+    //   gameKeys  the world is being played: no menu, nothing focused.
+    //   devKeys   F-keys, pause, step, reload. These stay live WITH the
+    //             character screen open on purpose — F1/F5/F9 must not become
+    //             unreachable because a menu is up.
+    const bool uiTyping = overlay.WantsKeyboard();
+    const bool devKeys = !uiTyping;
+    const bool gameKeys = !ui.inventoryOpen && !uiTyping;
+
+    // I opens and closes the character screen. Opening frees the cursor and
+    // remembers what capture WAS, so closing restores it rather than assuming.
+    if (devKeys && eI.Pressed(key(GLFW_KEY_I))) {
+      ui.inventoryOpen = !ui.inventoryOpen;
+      if (ui.inventoryOpen) {
+        captureBeforeUi = captured;
+        captured = false;
+      } else {
+        captured = captureBeforeUi;
+      }
       glfwSetInputMode(window, GLFW_CURSOR,
                        captured ? GLFW_CURSOR_DISABLED : GLFW_CURSOR_NORMAL);
       glfwGetCursorPos(window, &mx0, &my0);
+    }
+    // Esc CLOSES the screen when it is open, and otherwise does what it always
+    // did. Escape meaning "back out of the thing in front of me" before it
+    // means "let go of the mouse" is the order every game uses, and it is the
+    // one that does not strand a player with a menu they cannot dismiss.
+    if (devKeys && eEsc.Pressed(key(GLFW_KEY_ESCAPE))) {
+      if (ui.inventoryOpen) {
+        ui.inventoryOpen = false;
+        captured = captureBeforeUi;
+      } else {
+        captured = !captured;
+      }
+      glfwSetInputMode(window, GLFW_CURSOR,
+                       captured ? GLFW_CURSOR_DISABLED : GLFW_CURSOR_NORMAL);
+      glfwGetCursorPos(window, &mx0, &my0);
+    }
+    // The wheel, drained once per frame. While the screen is open (or any
+    // ImGui window wants the mouse) it belongs to the UI; otherwise it picks a
+    // hotbar slot, which is what the melee tool has claimed to do since it was
+    // written.
+    {
+      const double dy = g_scrollY;
+      g_scrollY = 0.0;
+      if (dy != 0.0 && !ui.inventoryOpen && !overlay.WantsMouse() && captured)
+        hotbar.Scroll(dy > 0 ? -1 : 1);
     }
     double mx, my;
     glfwGetCursorPos(window, &mx, &my);
@@ -2816,26 +3324,28 @@ int main(int argc, char** argv) {
     mx0 = mx;
     my0 = my;
 
-    if (eP.Pressed(key(GLFW_KEY_P))) ui.paused = !ui.paused;
-    if (eN.Pressed(key(GLFW_KEY_N))) ui.stepOnce = true;
-    if (eV.Pressed(key(GLFW_KEY_V))) ui.fly = !ui.fly;
-    if (eF1.Pressed(key(GLFW_KEY_F1))) ui.visible = !ui.visible;
-    if (eF3.Pressed(key(GLFW_KEY_F3)))
+    // The DEV tier: still live with the character screen open, dead while an
+    // ImGui field has focus.
+    if (devKeys && eP.Pressed(key(GLFW_KEY_P))) ui.paused = !ui.paused;
+    if (devKeys && eN.Pressed(key(GLFW_KEY_N))) ui.stepOnce = true;
+    if (devKeys && eV.Pressed(key(GLFW_KEY_V))) ui.fly = !ui.fly;
+    if (devKeys && eF1.Pressed(key(GLFW_KEY_F1))) ui.visible = !ui.visible;
+    if (devKeys && eF3.Pressed(key(GLFW_KEY_F3)))
       ui.showCollisionBoxes = !ui.showCollisionBoxes;
     // F4: the wind slope-field arrows (docs/RESEARCH_wind.md §4.8). Beside F3
     // because the two are the same kind of thing — a debug view of something
     // the world is doing invisibly — and free when off either way.
-    if (eF4.Pressed(key(GLFW_KEY_F4)))
+    if (devKeys && eF4.Pressed(key(GLFW_KEY_F4)))
       ui.showWindField = !ui.showWindField;
-    if (eF5.Pressed(key(GLFW_KEY_F5))) ui.reloadShaders = true;
-    if (eF6.Pressed(key(GLFW_KEY_F6)))
+    if (devKeys && eF5.Pressed(key(GLFW_KEY_F5))) ui.reloadShaders = true;
+    if (devKeys && eF6.Pressed(key(GLFW_KEY_F6)))
       ui.showDirtyChunks = !ui.showDirtyChunks;
-    if (eF9.Pressed(key(GLFW_KEY_F9))) ui.saveWorld = true;
-    if (eF10.Pressed(key(GLFW_KEY_F10))) ui.loadWorld = true;
-    if (eR.Pressed(key(GLFW_KEY_R))) ui.reloadMaterials = true;
-    if (eLBracket.Pressed(key(GLFW_KEY_LEFT_BRACKET)))
+    if (devKeys && eF9.Pressed(key(GLFW_KEY_F9))) ui.saveWorld = true;
+    if (devKeys && eF10.Pressed(key(GLFW_KEY_F10))) ui.loadWorld = true;
+    if (devKeys && eR.Pressed(key(GLFW_KEY_R))) ui.reloadMaterials = true;
+    if (gameKeys && eLBracket.Pressed(key(GLFW_KEY_LEFT_BRACKET)))
       ui.brushRadius = std::max(1, ui.brushRadius - 1);
-    if (eRBracket.Pressed(key(GLFW_KEY_RIGHT_BRACKET)))
+    if (gameKeys && eRBracket.Pressed(key(GLFW_KEY_RIGHT_BRACKET)))
       ui.brushRadius = std::min(7, ui.brushRadius + 1);
     // The number row is SHARED: it picks a brush material normally and SPEAKS
     // glyphs in magic mode (Z). Both wanted 1-8 and the brush binding predates
@@ -2843,7 +3353,7 @@ int main(int argc, char** argv) {
     // than silently stealing its keys.
     if (!ui.magicMode) {
       for (int i = 0; i < 8; i++)
-        if (key(GLFW_KEY_1 + i) && i + 1 < (int)mats.size()) {
+        if (gameKeys && key(GLFW_KEY_1 + i) && i + 1 < (int)mats.size()) {
           if (ui.tool == UIState::kToolFluid)
             ui.fluidSpecies = i & 3;
           else
@@ -2915,19 +3425,32 @@ int main(int argc, char** argv) {
       for (const char* nm : kSeverOrder)
         if (avatar.SeverByName(nm)) break;
     }
-    if (ui.tool == UIState::kToolPrefab && eT.Pressed(key(GLFW_KEY_T)))
+    if (gameKeys && ui.tool == UIState::kToolPrefab &&
+        eT.Pressed(key(GLFW_KEY_T)))
       ui.prefabRot = (ui.prefabRot + 1) & 3;
-    if (ui.tool == UIState::kToolPrefab && eO.Pressed(key(GLFW_KEY_O)) &&
-        !prefabs.empty())
+    if (gameKeys && ui.tool == UIState::kToolPrefab &&
+        eO.Pressed(key(GLFW_KEY_O)) && !prefabs.empty())
       ui.prefabSelected = (ui.prefabSelected + 1) % (int)prefabs.size();
 
+    // MOVEMENT WAS NEVER GATED. It predates every other binding here and was
+    // read straight off the keyboard, so WASD walked the player while a dev
+    // panel field had focus and would walk them around behind the character
+    // screen. `gameKeys` is the fix, and the axes are left at zero rather than
+    // frozen so the controller decelerates properly instead of holding the
+    // last input.
     PlayerInput pin;
-    pin.forward = (key(GLFW_KEY_W) ? 1.f : 0.f) - (key(GLFW_KEY_S) ? 1.f : 0.f);
-    pin.strafe = (key(GLFW_KEY_D) ? 1.f : 0.f) - (key(GLFW_KEY_A) ? 1.f : 0.f);
-    pin.up = key(GLFW_KEY_SPACE);
-    pin.down = key(GLFW_KEY_LEFT_CONTROL);
-    pin.sprint = key(GLFW_KEY_LEFT_SHIFT);
-    pin.jumpPressed = eJump.Pressed(key(GLFW_KEY_SPACE));
+    if (gameKeys) {
+      pin.forward = (key(GLFW_KEY_W) ? 1.f : 0.f) - (key(GLFW_KEY_S) ? 1.f : 0.f);
+      pin.strafe = (key(GLFW_KEY_D) ? 1.f : 0.f) - (key(GLFW_KEY_A) ? 1.f : 0.f);
+      pin.up = key(GLFW_KEY_SPACE);
+      pin.down = key(GLFW_KEY_LEFT_CONTROL);
+      pin.sprint = key(GLFW_KEY_LEFT_SHIFT);
+      pin.jumpPressed = eJump.Pressed(key(GLFW_KEY_SPACE));
+    } else {
+      // Keep the jump edge fed with `false` so a space held THROUGH a menu
+      // does not read as a fresh press the instant it closes.
+      eJump.Pressed(false);
+    }
     // --autofly: hold W+sprint in fly mode, no human at the keyboard. Exists to
     // reproduce the streaming-shift stutter, which only appears when the window
     // origin moves several chunks per second.
@@ -3132,10 +3655,34 @@ int main(int argc, char** argv) {
         {
           GlyphLibrary next;
           std::string gerr;
+          // WHAT WAS BOUND, BY NAME, BEFORE THE INDICES DIE. A glyph slot
+          // holds an index into GlyphLibrary::glyphs, which is file-order
+          // dependent — so an edit that merely REORDERS glyphs.json silently
+          // rebinds every key to a different spell. Until the character screen
+          // existed the point was moot (GrantAllAndBind overwrote the
+          // bindings anyway, which is its own bug: every reload threw away
+          // whatever the player had arranged). Snapshot, reload, re-resolve.
+          std::vector<std::string> boundNames(kGlyphSlots);
+          for (int i = 0; i < kGlyphSlots; i++) {
+            const int gi = caster.inventory.At(i);
+            if (gi >= 0 && gi < (int)glyphs.glyphs.size())
+              boundNames[i] = glyphs.glyphs[gi].id;
+          }
           if (LoadGlyphs(assetDir + "/spells/glyphs.json", mats, next, gerr)) {
             glyphs = std::move(next);
             spells.Clear();          // live projectiles hold stale glyph indices
-            caster.inventory.GrantAllAndBind(glyphs);
+            caster.inventory.GrantAllAndBind(glyphs);   // acquisition placeholder
+            // Re-bind by name over the identity mapping GrantAllAndBind just
+            // laid down. A name that no longer exists leaves the slot EMPTY
+            // rather than pointing at whatever now occupies that index — the
+            // same rule the item hotbar's re-validation below uses.
+            for (int i = 0; i < kGlyphSlots; i++) {
+              if (boundNames[i].empty()) {
+                caster.inventory.Bind(i, -1);
+                continue;
+              }
+              caster.inventory.Bind(i, glyphs.Find(boundNames[i]));
+            }
             caster.Clear(glyphs);
             std::printf("glyphs reloaded (%zu)\n", glyphs.glyphs.size());
           } else {
@@ -3163,12 +3710,47 @@ int main(int argc, char** argv) {
         if (!mlog.empty()) std::fprintf(stderr, "%s", mlog.c_str());
         // Items MUST reload here too: their bricks live in the pool that was
         // just thrown away, so a stale ItemDef would hold a model index into
-        // a freed model. The hotbar stores indices into `items`, so it is
-        // re-validated below once the new library exists.
+        // a freed model.
+        //
+        // AND EVERY SLOT THAT HOLDS AN ITEM INDEX MUST BE RE-RESOLVED. The
+        // hotbar, the pack and the equipment all store indices into
+        // ItemLibrary::items, which is file-order dependent; an items.json
+        // that merely reorders entries would otherwise turn a sheathed sword
+        // into whatever now sits at that index. This block used to carry a
+        // comment promising the hotbar was "re-validated below" — it was not,
+        // and the character screen makes the consequence permanent rather than
+        // transient, so the promise is kept here for all three containers.
         {
+          auto snapshot = [&](ItemStack* v, int n,
+                              std::vector<std::pair<std::string, int>>& out) {
+            out.clear();
+            for (int i = 0; i < n; i++)
+              out.push_back({KitItemName(v[i], items), v[i].count});
+          };
+          auto restore = [&](ItemStack* v, int n,
+                             const std::vector<std::pair<std::string, int>>& in) {
+            for (int i = 0; i < n && i < (int)in.size(); i++) {
+              const ItemStack s = KitItemFromName(in[i].first, in[i].second,
+                                                  items);
+              if (!in[i].first.empty() && s.Empty())
+                std::fprintf(stderr,
+                             "items reload: \"%s\" is gone; slot emptied\n",
+                             in[i].first.c_str());
+              v[i] = s;
+            }
+          };
+          std::vector<std::pair<std::string, int>> hb, bg, eq;
+          snapshot(hotbar.slots, kItemSlots, hb);
+          snapshot(kit.bag.slots, Bag::kSlots, bg);
+          snapshot(kit.equip.slots, kEquipSlotCount, eq);
+
           std::string ierr;
           LoadItems(assetDir + "/items", mats.size(), mbSet, items, ierr);
           if (!ierr.empty()) std::fprintf(stderr, "%s", ierr.c_str());
+
+          restore(hotbar.slots, kItemSlots, hb);
+          restore(kit.bag.slots, Bag::kSlots, bg);
+          restore(kit.equip.slots, kEquipSlotCount, eq);
         }
         sim.UploadMicroBodies(ctx.queue, mbSet);
         mobs.SetDefs(std::move(mobDefs));
@@ -3187,6 +3769,10 @@ int main(int argc, char** argv) {
         for (const MobDef& d : mobs.Defs()) ui.mobNames.push_back(d.name);
         if (ui.mobSelected >= (int)mobs.Defs().size()) ui.mobSelected = 0;
         classOf = BuildCollisionClasses(mats);
+        // The burn ladder is resolved by NAME, so a materials edit that adds,
+        // removes or reorders flesh_charred/ash has to re-resolve here or the
+        // inspector's charred readout counts the wrong material.
+        burnMats = ResolveBurnMats(mats);
         ui.materialNames.clear();
         ui.materialColors.clear();
         for (auto& m : mats) {
@@ -3236,13 +3822,15 @@ int main(int argc, char** argv) {
       ctx.WaitIdle();
       // Grid + entities: everything outside the voxel grid rides the
       // entities.sve sections registered in game/persist.cpp.
-      EntityIO eio = MakeEntityIO(debris, mobs, &avatar);
+      PlayerKitRefs kitRefs{&caster, &glyphs, &hotbar, &kit, &items};
+      EntityIO eio = MakeEntityIO(debris, mobs, &avatar, &kitRefs);
       SaveWorld(ctx, world, stream, "world.svd", mats, &eio);
     }
     if (ui.loadWorld) {
       ui.loadWorld = false;
       ctx.WaitIdle();
-      EntityIO eio = MakeEntityIO(debris, mobs, &avatar);
+      PlayerKitRefs kitRefs{&caster, &glyphs, &hotbar, &kit, &items};
+      EntityIO eio = MakeEntityIO(debris, mobs, &avatar, &kitRefs);
       if (LoadWorld(ctx, world, sim, stream, "world.svd", mats, &eio)) {
         // Debris/mobs were reset and reloaded by their sections; the avatar
         // was despawned by its reset and respawns on the next tick, applying
@@ -3837,7 +4425,22 @@ int main(int argc, char** argv) {
           float lookRel = camHeading - avatarHeading;
           while (lookRel > 3.14159265f) lookRel -= 6.2831853f;
           while (lookRel < -3.14159265f) lookRel += 6.2831853f;
-          avatar.SetLook(lookRel, cam.pitch);
+          float lookPitch = cam.pitch;
+          // WHILE THE CHARACTER SCREEN IS OPEN, the head follows the CURSOR
+          // over the portrait instead of the camera — the camera is not
+          // moving, so the ordinary rule would leave the character staring
+          // fixedly past you while you look them over.
+          //
+          // The panel reports where the pointer is (portraitLook, normalized
+          // to the frame) and this turns it into a look; posing the rig stays
+          // game-side, which is why the UI reports a cursor rather than a
+          // pose. SetLook clamps against the rig's own neck limits, so the
+          // generous gains here cannot over-rotate anything.
+          if (ui.inventoryOpen && ui.portraitLookValid) {
+            lookRel = ui.portraitLook[0] * 0.9f;
+            lookPitch = ui.portraitLook[1] * 0.5f;
+          }
+          avatar.SetLook(lookRel, lookPitch);
         }
         if (avatar.Spawned())
           avatar.PreTick(tick, player, avatarHeading, kTickDt, world, ops,
@@ -3868,6 +4471,10 @@ int main(int argc, char** argv) {
         // ratchets upward, and the next avatar to spawn would inherit the
         // hardest hit the session ever recorded and die on its first tick.
         player.impactDeltaV = Vec3{0, 0, 0};
+        // Same drain, same reason (see Player::jumped): the avatar's `jump`
+        // clip is edge-triggered off this latch, and Player::Update sets it
+        // per FRAME while this loop runs 0..4 times per frame.
+        player.jumped = false;
       }
 
       // ---- magic (game/spell.h) ---------------------------------------------
@@ -4326,6 +4933,9 @@ int main(int argc, char** argv) {
       // offset so voxel steps glide instead of popping. Everything that can
       // feed the sim (brush/laser/grenade rays, physics) stays on EyePos.
       Vec3 eye = player.ViewEyePos();
+      // First-person part-hiding mask, hoisted so the portrait pass below can
+      // restore it after drawing the whole body. See the note at its fill.
+      std::vector<uint8_t> hide;
       // ---- avatar camera ----
       // The rig only decides where the RENDER eye sits. Picking rays, the
       // brush, the laser and the grenade all keep using player.EyePos(), so
@@ -4352,7 +4962,14 @@ int main(int argc, char** argv) {
         // Hide the body in first person so the player is not inside their own
         // hat, but keep the arms and the staff — seeing your own hands is most
         // of what sells a first-person body.
-        std::vector<uint8_t> hide;
+        //
+        // HOISTED out of this block because the AVATAR PORTRAIT needs it back.
+        // The hide mask feeds the shared bodyInstances/microInsts buffers, so
+        // the portrait (which must show the whole body) and the main view
+        // (which in first person must not) cannot both read one upload — the
+        // portrait pass below re-uploads with an empty mask, draws, and then
+        // restores this one for the main pass.
+        hide.clear();
         if (avatar.Spawned()) {
           const AvatarParts& p = avatar.Parts();
           // Sized from the LIVE rig, not the def: a held item borrows an
@@ -4539,22 +5156,22 @@ int main(int argc, char** argv) {
       float fogTarget = std::clamp(kFogOpticalDepths / far.SafeRadiusMeters(),
                                    kFarFogDensity, kFarFogDensityMax);
       fogSmooth += (fogTarget - fogSmooth) * kFogLerpPerFrame;
-      WriteRenderParams(ctx.queue, world, eye, cam,
-                        (float)ctx.width / (float)ctx.height, ui.shadows,
-                        (float)now, fogSmooth, (float)ctx.height, tick,
-                        fluidCount,
-                        (float)(accumulator / kTickDt),
-                        ui.showDirtyVoxels ? 2u : 0u);
-      if (ui.showDirtyVoxels) {
-        const WorldSnapshot& ds = world.Snap();
-        if (ds.valid && ds.dirtyFlags.size() == kNumChunks) {
-          static std::vector<uint32_t> df(kNumChunks);
-          for (uint32_t i = 0; i < kNumChunks; i++)
-            df[i] = ds.dirtyFlags[i] ? ds.tick : 0u;
-          ctx.queue.WriteBuffer(world.dirtyViz, 0, df.data(),
-                                kNumChunks * sizeof(uint32_t));
-        }
-      }
+      // HOISTED INTO A LAMBDA because it may have to run TWICE. world.renderUBO
+      // is one buffer, so the avatar portrait's camera necessarily clobbers
+      // the main camera; the portrait pass writes its own params, submits, and
+      // then calls this again to put the world's camera back in front of the
+      // main pass. One definition, so the two cannot drift.
+      auto writeMainRenderParams = [&] {
+        WriteRenderParams(ctx.queue, world, eye, cam,
+                          (float)ctx.width / (float)ctx.height, ui.shadows,
+                          (float)now, fogSmooth, (float)ctx.height, tick,
+                          fluidCount,
+                          (float)(accumulator / kTickDt),
+                          ui.showDirtyVoxels ? 2u : 0u);
+      };
+      writeMainRenderParams();
+      // actVoxViz is filled GPU-side by sim_step.wgsl when vizActive is set;
+      // the old CPU dirtyViz upload (stamp-comparison) is no longer needed.
 
       // Celestial readout for the panel. Recomputed rather than cached out of
       // WriteRenderParams because the solve is a handful of trig calls once a
@@ -4627,7 +5244,8 @@ int main(int argc, char** argv) {
       // authored TAG and side suffix rather than by part name, so any humanoid
       // rig fills the same figure. A limb the rig does not have stays absent
       // and simply is not drawn.
-      FillBodyUI(avatar, ui);
+      FillBodyUI(avatar, burnMats, ui);
+      ui.locoState = avatar.Spawned() ? avatar.Locomotion().stateName : "";
       ui.spellCost = caster.compiled.manaCost;
       ui.spellText = caster.readout.text;
       ui.spellVerdict = caster.readout.verdict;
@@ -4684,10 +5302,132 @@ int main(int argc, char** argv) {
         }
       }
 
+      // The portrait camera. Computed here, BEFORE the panel is drawn, because
+      // the inspector's limb outlines are projections through this exact
+      // camera and the panel draws them in the same frame the pass renders.
+      // Cheap and skipped entirely when the screen is closed.
+      PortraitCam portraitCam;
+      if (ui.inventoryOpen) {
+        // THE ORBIT IS RELATIVE TO THE CHARACTER'S OWN FACING, so opening the
+        // screen always shows their FRONT and turning the body does not spin
+        // the portrait out from under the player's drag.
+        //
+        // The two conventions differ and the conversion is the whole reason
+        // this is a comment: a rig's forward is (sin h, ., cos h) while a
+        // Camera's is (cos yaw, ., sin yaw), so a camera LOOKING AT the face
+        // needs forward == -rigForward, i.e. yaw = atan2(-cos h, -sin h).
+        const float frontYaw =
+            std::atan2(-std::cos(avatarHeading), -std::sin(avatarHeading));
+        portraitCam = MakePortraitCam(avatar, phys, frontYaw + ui.portraitYaw,
+                                      ui.portraitPitch,
+                                      (float)kPortraitW / (float)kPortraitH);
+        if (ui.inspectMode) ProjectBodyUI(avatar, phys, portraitCam, ui);
+      }
+
+      // ======================================================================
+      // THE CHARACTER SCREEN: consume last frame's intents, then re-mirror.
+      // ======================================================================
+      //
+      // ORDER MATTERS AND IS THE WHOLE CONTRACT. The screen sets a latch; this
+      // block executes it against the REAL container and then rebuilds the
+      // mirror the screen will read. So the panel's own view of an item is
+      // never authoritative and never even one frame stale in a way that could
+      // be acted on twice — the latch is cleared here, by its consumer, the
+      // same shape every other one-shot in this loop uses.
+      if (ui.moveItem.pending) {
+        ui.moveItem.pending = false;
+        const MoveResult r =
+            kit.Move(ui.moveItem.from, ui.moveItem.to, hotbar, items);
+        const char* why = MoveResultText(r, ui.moveItem.to);
+        if (why && *why) {
+          ui.kitMessage = why;
+          ui.kitMessageAge = 0.0f;
+        }
+        // A move into or out of the HOTBAR can change what is in hand, and the
+        // melee path reads Inventory::Selected() straight out of it — so the
+        // equip/unequip comparison in the tick loop does the rest by itself on
+        // the next tick. Nothing to do here, which is the point of routing the
+        // change through the real container rather than around it.
+      }
+      if (ui.bindGlyph.pending) {
+        ui.bindGlyph.pending = false;
+        // BY NAME. The panel never handles a glyph index, so a bind cannot
+        // survive into a reload as a stale index (see the R-reload block).
+        const int gi = ui.bindGlyph.glyphId.empty()
+                           ? -1
+                           : glyphs.Find(ui.bindGlyph.glyphId);
+        if (!caster.inventory.Bind(ui.bindGlyph.slot, gi)) {
+          ui.kitMessage = "you do not know that glyph";
+          ui.kitMessageAge = 0.0f;
+        }
+      }
+      ui.kitMessageAge += dt;
+
+      // ---- the mirrors -------------------------------------------------------
+      // Rebuilt every frame from the real containers. Cheap (a few dozen
+      // string copies) and it is the reason the panel can never show something
+      // the game does not have.
+      {
+        auto mirror = [&](const ItemStack& st) {
+          UIState::KitSlotUI u;
+          const ItemDef* d = items.At(st.Empty() ? -1 : st.def);
+          if (!d) return u;
+          u.name = d->name;
+          u.count = st.count;
+          switch (d->kind) {
+            case ItemKind::Melee: u.kind = "melee"; break;
+            default: u.kind = ""; break;
+          }
+          // Whatever the def actually carries — no invented stats. A melee
+          // item has damage and reach; something with neither says nothing
+          // rather than saying "0".
+          char tip[192];
+          if (d->kind == ItemKind::Melee) {
+            std::snprintf(tip, sizeof tip,
+                          "%.0f damage at full speed\n%.1f voxel reach%s",
+                          d->damage, d->reach,
+                          d->hasEdge ? "\ncuts along its own edge" : "");
+            u.tip = tip;
+          }
+          return u;
+        };
+        ui.hotbarSlots.clear();
+        for (int i = 0; i < kItemSlots; i++)
+          ui.hotbarSlots.push_back(mirror(hotbar.slots[i]));
+        ui.bagSlots.clear();
+        for (int i = 0; i < Bag::kSlots; i++)
+          ui.bagSlots.push_back(mirror(kit.bag.slots[i]));
+        ui.equipSlots.clear();
+        for (int i = 0; i < kEquipSlotCount; i++)
+          ui.equipSlots.push_back(mirror(kit.equip.slots[i]));
+
+        ui.glyphsOwned.clear();
+        for (int gi : caster.inventory.owned) {
+          if (gi < 0 || gi >= (int)glyphs.glyphs.size()) continue;
+          const GlyphDef& g = glyphs.glyphs[gi];
+          UIState::GlyphUI u;
+          u.id = g.id;
+          u.desc = g.desc;
+          u.type = (int)g.type;
+          u.mana = g.mana;
+          // The element swatch is the material's own gpu colour, so a fire
+          // glyph is the colour fire actually renders as rather than a colour
+          // somebody picked for the UI.
+          if (g.type == GlyphType::Element && g.material < mats.size())
+            u.color = mats[g.material].gpu.color0;
+          ui.glyphsOwned.push_back(std::move(u));
+        }
+      }
+
       overlay.BeginFrame();
       // HUD first, dev panel second: the panel is a real ImGui window and gets
       // to sit on top of the chrome, not the other way round.
-      overlay.DrawHUD(ui);
+      //
+      // The HUD is SUPPRESSED while the character screen is open: the screen
+      // already shows both pools and the body condition, larger and with the
+      // numbers spelled out, so drawing the corner chrome underneath it is two
+      // readouts of the same thing fighting for the same corner.
+      if (!ui.inventoryOpen) overlay.DrawHUD(ui);
       overlay.Draw(ui);
 
       // Wind force multipliers. Its OWN latch, and deliberately not folded
@@ -4956,6 +5696,88 @@ int main(int argc, char** argv) {
       // write with the pass open is legal in WebGPU and illegal in Vulkan.
       uint32_t microCount = sim.UploadMicroBodyInsts(ctx.queue, microInsts);
 
+      // ======================================================================
+      // THE AVATAR PORTRAIT PASS — its own submit, before the frame's.
+      // ======================================================================
+      //
+      // WHY A SEPARATE SUBMIT AND NOT A SECOND PASS IN THE SAME ENCODER:
+      // world.renderUBO is ONE buffer. Two passes recorded into one command
+      // buffer would both read whichever camera landed last, so the portrait
+      // and the world would necessarily share a camera. Queue writes drain at
+      // the head of the NEXT command buffer, so "write params, submit; write
+      // params, submit" is exactly the pattern that gives each pass its own —
+      // and it is the same shape the --shot harnesses already use.
+      //
+      // THE INSTANCE RE-UPLOAD is the other half of the same problem, one
+      // level down: in first person the shared bodyInstances/micro lists have
+      // the torso and legs HIDDEN, and a portrait of a floating pair of arms
+      // is not a portrait. So the portrait re-uploads with an empty mask,
+      // draws, and hands the real mask back for the main pass. Both uploads
+      // are followed by their own submit, for the same reason as the camera.
+      //
+      // No DrawWorld: the clear colour IS the backdrop, and a raymarch of the
+      // whole residency window to fill 320x448 pixels behind a character is
+      // the most expensive possible way to draw a background.
+      if (ui.inventoryOpen && portraitCam.valid && portraitView) {
+        avatar.SetHiddenParts({});               // the WHOLE body, always
+        std::vector<BodyVoxInst> pInst;
+        bodyReg.BuildInstances(pInst);
+        if (!pInst.empty())
+          ctx.queue.WriteBuffer(world.bodyInstances, 0, pInst.data(),
+                                pInst.size() * sizeof(BodyVoxInst));
+        // The TRANSFORMS need no re-upload: a hidden limb still consumes its
+        // slot (game/mob.cpp's walk advances for every part with a body,
+        // drawn or not), so the transform array is mask-independent by
+        // construction. Only the instance lists change.
+        microInsts.clear();
+        bodyReg.BuildMicroInsts(microInsts);
+        const uint32_t pMicro = sim.UploadMicroBodyInsts(ctx.queue, microInsts);
+
+        WriteRenderParams(ctx.queue, world, portraitCam.eye, portraitCam.cam,
+                          portraitCam.aspect, /*shadows=*/true, (float)now,
+                          /*fogDensity=*/0.0f, (float)kPortraitH,
+                          kPortraitLightTick);
+        rhi::CommandEncoder pEnc = ctx.device.CreateCommandEncoder();
+        // Near-black indigo, the panel's own deepest tone, so the portrait
+        // reads as an inset rather than as a hole punched in the sheet.
+        const float kPortraitClear[4] = {0.055f, 0.048f, 0.086f, 1.0f};
+        rhi::RenderPass pRp =
+            sim.BeginAuxRenderPass(pEnc, portraitView, ctx.surfaceFormat,
+                                   kPortraitW, kPortraitH, kPortraitClear);
+        sim.DrawBodies(pRp, (uint32_t)pInst.size());
+        sim.DrawMicroBodies(pRp, pMicro);
+        pRp.End();
+        // One line, on the captured frames only: "the portrait drew N bodies
+        // from HERE". It is what turns "the frame is empty" from a guess into
+        // a reading — an empty portrait is either no instances, a camera not
+        // pointed at the body, or a sprite drawn over the top, and this
+        // separates the first two from the third in a single run. (It was the
+        // third: a 9-slice frame whose middle slice was opaque.)
+        if (g_shotInventory && (frameCounter == kShotInvGearFrame ||
+                                frameCounter == kShotInvCaptureFrame))
+          std::printf("--shot-inventory: portrait cube=%zu micro=%u "
+                      "eye=(%.1f %.1f %.1f) target=(%.1f %.1f %.1f)\n",
+                      pInst.size(), pMicro, portraitCam.eye.x, portraitCam.eye.y,
+                      portraitCam.eye.z, portraitCam.target.x,
+                      portraitCam.target.y, portraitCam.target.z);
+        ctx.queue.Submit(pEnc.Finish());
+
+        // Put the world back: the real hide mask, its instances, and the
+        // player's own camera. The mask change re-dirties the avatar, so the
+        // rebuild below is a genuine requirement rather than a precaution.
+        avatar.SetHiddenParts(hide);
+        std::vector<BodyVoxInst> mInst;
+        bodyReg.BuildInstances(mInst);
+        bodyInstCount = (uint32_t)mInst.size();
+        if (!mInst.empty())
+          ctx.queue.WriteBuffer(world.bodyInstances, 0, mInst.data(),
+                                mInst.size() * sizeof(BodyVoxInst));
+        microInsts.clear();
+        bodyReg.BuildMicroInsts(microInsts);
+        microCount = sim.UploadMicroBodyInsts(ctx.queue, microInsts);
+        writeMainRenderParams();
+      }
+
       rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
       rhi::RenderPass rp = sim.BeginRenderPass(enc, target, ctx.surfaceFormat,
                                                        ctx.width, ctx.height);
@@ -4982,6 +5804,73 @@ int main(int argc, char** argv) {
       overlay.Render(rp);
       rp.End();
       ctx.queue.Submit(enc.Finish());
+
+      // ---- --shot-inventory: the same frame again, into a file -------------
+      // A presented swapchain image cannot be copied, so the frame is
+      // RE-RECORDED into an offscreen target of the same size (same depth
+      // cache, so nothing thrashes) and read back. The blocking readback is
+      // legal here for the same reason it is in --shot: this is the last frame
+      // of a harness run, not the frame path of a game.
+      if (g_shotInventory && (frameCounter == kShotInvGearFrame ||
+                              frameCounter == kShotInvCaptureFrame)) {
+        const char* shotPath = frameCounter == kShotInvGearFrame
+                                   ? "screenshot_inventory.bmp"
+                                   : "screenshot_inventory_health.bmp";
+        const uint32_t W = ctx.width, H = ctx.height;
+        rhi::Texture shotTex = ctx.device.CreateTexture(
+            {W, H, 1}, ctx.surfaceFormat,
+            rhi::TextureUsage::RenderAttachment | rhi::TextureUsage::CopySrc,
+            "inventoryShot");
+        rhi::CommandEncoder senc = ctx.device.CreateCommandEncoder();
+        rhi::RenderPass srp = sim.BeginRenderPass(
+            senc, shotTex.CreateView(), ctx.surfaceFormat, W, H);
+        sim.DrawWorld(srp);
+        sim.DrawBodies(srp, bodyInstCount);
+        sim.DrawMicroBodies(srp, microCount);
+        overlay.RenderRecorded(srp);
+        srp.End();
+        ctx.queue.Submit(senc.Finish());
+        ctx.WaitIdle();
+        // The copy goes in its OWN encoder, submitted after the render has
+        // retired — the shape RunShots::grab uses. Folding it into the render
+        // encoder is legal in the headless harnesses and produced a black
+        // image here.
+        rhi::Buffer shotBuf = CreateBuffer(
+            ctx.device, (uint64_t)W * H * 4,
+            rhi::BufferUsage::MapRead | rhi::BufferUsage::CopyDst,
+            "inventoryShotRead");
+        rhi::CommandEncoder cenc = ctx.device.CreateCommandEncoder();
+        rhi::TexelCopyTexture src{};
+        src.texture = shotTex;
+        rhi::TexelCopyBuffer dst{};
+        dst.buffer = shotBuf;
+        dst.bytesPerRow = W * 4;
+        dst.rowsPerImage = H;
+        cenc.CopyTextureToBuffer(src, dst, {W, H, 1});
+        ctx.queue.Submit(cenc.Finish());
+        ctx.WaitIdle();
+        std::vector<uint8_t> px((size_t)W * H * 4, 0);
+        if (rhi::ReadBufferBlocking(ctx.device, shotBuf, 0, px.data(),
+                                    px.size())) {
+          // The swapchain is BGRA and WriteBmpFile expects RGBA; swap in place
+          // rather than teaching the writer about formats, which every other
+          // caller would then have to care about.
+          if (ctx.surfaceFormat == rhi::TextureFormat::BGRA8Unorm)
+            for (size_t i = 0; i < px.size(); i += 4)
+              std::swap(px[i], px[i + 2]);
+          // A byte sum, because "the file was written" is not the claim that
+          // matters — an all-zero image writes just as successfully as a real
+          // one, and a harness whose failure mode is a black rectangle needs
+          // to say so out loud rather than print "wrote".
+          uint64_t sum = 0;
+          for (uint8_t b : px) sum += b;
+          if (WriteBmpFile(shotPath, px, W, H))
+            std::printf("wrote %s (%ux%u, pixel sum %llu%s)\n", shotPath, W, H,
+                        (unsigned long long)sum,
+                        sum == 0 ? " *** ALL BLACK ***" : "");
+        }
+      }
+
       ctx.Present();
     }
     if (telemetry.Active() && ticksThisFrame > 0) {

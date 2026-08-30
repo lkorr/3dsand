@@ -3,6 +3,7 @@
 #include <string>
 #include <vector>
 
+#include "game/kitref.h"   // KitRef: the one slot address the screen drags in
 #include "gpu/rhi.h"
 
 struct GLFWwindow;
@@ -280,6 +281,39 @@ struct UIState {
     bool severed = false;   // lost — drawn as a stump, not as a damaged limb
     bool bleeding = false;  // actively losing blood — flashes
     float hpFrac = 1.0f;    // 1 = untouched, 0 = destroyed; drives the tint
+    // ---- the INSPECTOR's extra columns (ui/inventory_ui.cpp) --------------
+    // The stick figure needs only hpFrac; the character screen's health view
+    // reports what actually happened to the limb, which hp alone cannot say.
+    //
+    // voxelFrac is the load-bearing one: a laser can bore an arm hollow
+    // without driving its hp to zero, and a blast can shave hp off a limb that
+    // has lost no geometry at all, so "how hurt" and "how much is left" are
+    // genuinely two measurements. charredFrac and burningVoxels come from
+    // MATERIAL IDENTITY on the limb's own voxels (skin -> cooked -> burning ->
+    // charred -> ash), which is why burn damage needs no new engine state at
+    // all — the answer was already in the voxels.
+    float voxelFrac = 1.0f;      // live voxels / voxels at spawn
+    float charredFrac = 0.0f;    // share of the limb cooked/charred through
+    uint32_t burningVoxels = 0;  // voxels alight RIGHT NOW
+    float hp = 0, hpMax = 0;     // absolute, for the numeric readout
+    // WHERE THE LIMB IS ON THE PORTRAIT, so the inspector can outline it.
+    // Normalized to the portrait frame: (0,0) top-left, (1,1) bottom-right,
+    // as the screen-space bounds of the limb's projected oriented box.
+    //
+    // ALREADY PROJECTED, deliberately. main.cpp owns the portrait camera, so
+    // it is the only thing that can turn a world-space box into a place on
+    // that image; handing the UI a view-projection matrix and eight corners
+    // would put a second copy of the camera convention in the overlay, which
+    // is precisely how the two would drift. The UI draws a rectangle.
+    // A SEVERED limb gets no marker here, deliberately: it has no body, so
+    // there is nothing at any position to point at, and the arm being visibly
+    // ABSENT from the portrait is already the clearest possible statement that
+    // it is gone. The injury list carries the word. (An X drawn at a guessed
+    // anchor would be a marker for something that is not there, which is worse
+    // than the hole.)
+    float projMin[2] = {0, 0}, projMax[2] = {0, 0};
+    bool projValid = false;
+    const char* label = "";  // "Left forearm" etc, for the damage list
   };
   BodyPartUI body[kSlotCount];
   bool bodyValid = false;   // false until the avatar has spawned
@@ -299,13 +333,145 @@ struct UIState {
   int windWakeChunks = 0;   // chunks the primitives woke last tick
   // slot -> glyph id, for the bound-key strip. Empty string = unbound slot.
   std::vector<std::string> glyphSlots;
+
+  // ==========================================================================
+  // THE CHARACTER SCREEN (I) — ui/inventory_ui.cpp
+  // ==========================================================================
+  //
+  // Everything below is MIRROR IN, INTENT OUT, and the split is the whole
+  // contract this file has always claimed ("the overlay never owns inventory
+  // state — it only draws it"). The screen reads the mirrors, and when the
+  // player drags something it sets a one-shot latch; main.cpp consumes the
+  // latch, calls the real method on the real container, and the change shows
+  // up in next frame's mirror. Nothing in ui/ ever writes a game container.
+  //
+  // The latches follow placeWindFan's pattern above — sticky flags cleared by
+  // the consumer, never frame-local bools — for the reason recorded there: the
+  // fixed-tick loop runs zero times on most frames, and a frame-local bool is
+  // discarded unread most of the time.
+
+  bool inventoryOpen = false;   // I toggles; main.cpp owns the cursor/capture
+  bool inspectMode = false;     // left panel: CHARACTER (gear) vs HEALTH
+
+  // ---- the live avatar portrait (main.cpp's second render pass) ------------
+  // `portraitTex` is an ImTextureID (a VkDescriptorSet behind the scenes) that
+  // Overlay::RegisterTexture handed back; 0 means "not registered yet, draw
+  // the empty frame". Held as uint64_t rather than ImTextureID so this header
+  // stays free of imgui.h — main.cpp includes it and must not need ImGui.
+  uint64_t portraitTex = 0;
+  int portraitW = 0, portraitH = 0;
+  // Orbit, radians. Written by the panel's drag and READ by main.cpp when it
+  // places the portrait camera — the same shape as brushRadius, i.e. a view
+  // parameter the UI is allowed to edit because nothing in the world depends
+  // on it.
+  // Yaw is an OFFSET from the character's own facing (main.cpp adds it), so 0
+  // is always a front view however the body happens to be turned. Pitch is
+  // absolute and slightly negative: looking a little DOWN at a standing figure
+  // is the angle that reads as a portrait rather than as a worm's-eye shot.
+  float portraitYaw = 0.0f, portraitPitch = -0.08f;
+  // Cursor position over the portrait frame, normalized to [-1,1] with +y up,
+  // valid only while the pointer is inside it and not dragging. main.cpp turns
+  // this into a SetLook() so the character glances at the mouse — GAME state
+  // (it moves a real rig), which is exactly why the UI reports the cursor and
+  // does not pose anything itself.
+  float portraitLook[2] = {0, 0};
+  bool portraitLookValid = false;
+
+  // ---- item mirrors -------------------------------------------------------
+  // One row per slot in each container, in slot order. `name` empty = the slot
+  // is empty. `kind` is a display word ("melee"), not an enum, because the
+  // screen shows it and never branches on it.
+  struct KitSlotUI {
+    std::string name;
+    std::string kind;
+    std::string tip;    // the tooltip body: damage, reach, whatever the def has
+    int count = 0;
+  };
+  std::vector<KitSlotUI> bagSlots;      // Bag::kSlots, row-major
+  std::vector<KitSlotUI> hotbarSlots;   // kItemSlots
+  std::vector<KitSlotUI> equipSlots;    // kEquipSlotCount
+  // Per equipment slot, from the authored table in game/equipment.h. Mirrored
+  // rather than re-declared here on purpose: the accepted-kinds table is where
+  // future armour lands, and a second copy in the UI would be the thing that
+  // goes stale the day it does.
+  struct EquipSlotUI {
+    std::string label;
+    std::string icon;    // chrome-atlas sprite key for the empty engraving
+    std::string why;     // refusal sentence when the slot accepts nothing
+    bool acceptsAnything = false;
+  };
+  std::vector<EquipSlotUI> equipDefs;
+  int bagCols = 8, bagRows = 4;
+
+  // ---- arsenal mirror (game/caster.h GlyphInventory) ----------------------
+  struct GlyphUI {
+    std::string id;
+    std::string desc;
+    int type = 0;         // GlyphType: 0 element, 1 form, 2 modifier
+    int mana = 0;
+    uint32_t color = 0;   // element swatch (gpu color0), 0 = not an element
+  };
+  std::vector<GlyphUI> glyphsOwned;
+  // `glyphSlots` above is already the bound strip (slot -> glyph id) and IS
+  // the arsenal's bottom row — the panel and the live hotkeys read one mirror,
+  // which is what makes binding in the panel provably the same thing as the
+  // number row.
+
+  // ---- intents (one-shot latches, consumed by main.cpp) -------------------
+  // A drag that landed. `from`/`to` are KitRefs (game/kitref.h), so one latch
+  // covers bag<->hotbar<->equipment without a case per pair.
+  struct MoveIntent {
+    bool pending = false;
+    KitRef from, to;
+  } moveItem;
+  // A glyph dropped on a bound slot, BY NAME rather than by library index:
+  // glyph indices are file-order dependent and die on every R reload, and a
+  // latch that survives one frame can easily straddle one.
+  struct BindIntent {
+    bool pending = false;
+    int slot = -1;             // 0..kGlyphSlots-1
+    std::string glyphId;       // empty = unbind
+  } bindGlyph;
+
+  // What the last refused action said, and how long ago. Flashed under the
+  // panel rather than swallowed: a slot that silently declines is the failure
+  // mode that makes an inventory feel broken (game/equipment.h MoveResult).
+  std::string kitMessage;
+  float kitMessageAge = 1e9f;   // seconds; main.cpp ages it
+
+  // The avatar's active dismemberment state ("normal", "crawling", "limping"),
+  // from AvatarLocomotion::stateName. One line, and it says more about a pair
+  // of lost legs than any number of bars.
+  std::string locoState;
 };
 
 class Overlay {
  public:
+  // `assetDir` is where assets/ui/chrome.{bmp,json} live. A missing or broken
+  // chrome file is NOT a failure: the screen falls back to flat rectangles
+  // with identical layout, and the reason is printed once.
   bool Init(GLFWwindow* window, const rhi::Device& device,
-            rhi::TextureFormat format);
+            rhi::TextureFormat format, const std::string& assetDir);
   void BeginFrame();
+
+  // ---- handing a rendered texture to ImGui --------------------------------
+  // Registers an offscreen colour view as an ImGui-drawable image and returns
+  // an ImTextureID (as uint64_t, so this header stays imgui-free). The ONE
+  // caller is main.cpp's avatar portrait; the descriptor is owned by the ImGui
+  // Vulkan backend and released by Unregister or by Shutdown.
+  //
+  // `view` must outlive the registration — the descriptor points straight at
+  // the VkImageView. Registering the same view twice returns two descriptors,
+  // so callers register once and keep the id.
+  uint64_t RegisterTexture(const rhi::TextureView& view);
+  void UnregisterTexture(uint64_t id);
+
+  // True when ImGui wants the mouse / keyboard this frame. main.cpp gates the
+  // game's own bindings on these so typing in a dev-panel field stops firing
+  // key actions — a bug that predates the character screen and is fixed by the
+  // same gate the screen needs.
+  bool WantsMouse() const;
+  bool WantsKeyboard() const;
   // The player-facing HUD: health + mana in the bottom-left corner. Separate
   // from Draw() and drawn unconditionally, because the dev panel is F1-hideable
   // and the HUD must not be.
@@ -317,8 +483,24 @@ class Overlay {
   // `yBottom` and returns the height it reserved, so DrawHUD stacks the "DEAD"
   // banner above it without duplicating the figure's proportions.
   float DrawBodyFigure(const UIState& s, float x, float yBottom);
+  // One VkSampler for every registered texture (nearest + clamp: the portrait
+  // is displayed at an integer multiple and must stay pixel-crisp). Held as
+  // uint64_t so the header names no Vulkan type — the handle itself is only
+  // ever touched inside overlay.cpp, the sanctioned backend-exception file.
+  uint64_t sampler_ = 0;
+  const void* device_ = nullptr;   // vk::Backend*, for sampler destruction
 
  public:
   void Render(const rhi::RenderPass& pass);
+  // Re-record the draw data this frame ALREADY built into a second pass,
+  // WITHOUT calling ImGui::Render() again. The one caller is
+  // --shot-inventory, which renders the whole frame a second time into an
+  // offscreen target so the character screen can be reviewed as an image.
+  //
+  // Split out rather than making Render() re-entrant because the difference is
+  // real: ImGui::Render() finalizes the frame's draw lists and must happen
+  // exactly once, while replaying those lists into another pass is free and
+  // may happen any number of times.
+  void RenderRecorded(const rhi::RenderPass& pass);
   void Shutdown();
 };

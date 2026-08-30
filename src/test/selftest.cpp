@@ -27,6 +27,7 @@ namespace selftest {
 
 // Each domain file exposes its gates through one of these.
 const std::vector<Gate>& TerrainGates();
+const std::vector<Gate>& TreeGates();
 const std::vector<Gate>& SimGates();
 const std::vector<Gate>& CaGates();
 const std::vector<Gate>& WindGates();
@@ -39,6 +40,7 @@ const std::vector<Gate>& AudioGates();
 const std::vector<Gate>& WorldIoGates();
 const std::vector<Gate>& VoxRegionGates();
 const std::vector<Gate>& SpellGates();
+const std::vector<Gate>& PlayerKitGates();
 
 // THE EXECUTION ORDER, and it is load-bearing.
 //
@@ -57,6 +59,17 @@ const char* const kOrder[] = {
     // property every later gate's fixture placement silently assumes. It also
     // has to run before anything moves the window, and it leaves the origin
     // exactly where `determinism` (which does not set it) needs it.
+    // FIRST OF ALL, and it costs nothing to put it there: `player-kit` is
+    // pure CPU with its own fixtures — no world, no GPU, no assets — so it can
+    // neither disturb the pristine worldgen `terrain` needs nor be disturbed
+    // by anything. Running it before the expensive gates also means a broken
+    // equipment model is reported in the first second of a full run.
+    "player-kit",
+    // SECOND, and for the same reason: `tree-atlas` reads assets/trees/*.svtree
+    // off disk and asserts on the bytes. No world, no GPU, no state left
+    // behind -- and when the atlas is wrong every gate after it is measuring a
+    // forest nobody authored, so it belongs before them rather than after.
+    "tree-atlas",
     "terrain",
     // SECOND, and it wants the same thing `terrain` does: pristine worldgen at
     // an unmoved origin. Its whole subject is the ANALYTIC basin registry, and
@@ -76,10 +89,16 @@ const char* const kOrder[] = {
     "blood-stain", "flung-liquid", "fluid-det",     "fluid-settle",
     "fluid-excite", "fluid-onwater", "fluid-stain", "fluid-react", "far-fog",  "far-downsample",
     "far-persist",
-    "screenshots", "player-walk", "player-waterjump", "player-ledgegrab",
+    "screenshots", "fire-depth", "player-walk", "player-waterjump", "player-ledgegrab",
     "player-plants", "debris",
     "audio-impact", "audio-mob-voice", "audio-ambience",
-    "prefab",      "settle-back",    "player-body", "ragdoll-joints",
+    // "mob" restored to its original slot (it sat between prefab and
+    // settle-back until ec764e8 dropped it from both here and MobGates()).
+    // The position matters: gates share one World and several depend on what
+    // an earlier one left behind, so re-adding it anywhere else would be a
+    // different test.
+    "prefab",      "mob",            "settle-back", "player-body",
+    "ragdoll-joints",
     "save-load",   "save-entities", "region-store", "streaming",     "spells",
     "page-roundtrip", "daylight-boundary",
     // Per-voxel body reactivity. Late, and it must be: it lights real fires and
@@ -98,13 +117,13 @@ const char* const kOrder[] = {
 const std::vector<Gate>& Registry() {
   static std::vector<Gate> all = [] {
     std::vector<Gate> pool;
-    for (const auto* g : {&TerrainGates(),
+    for (const auto* g : {&TerrainGates(), &TreeGates(),
                           &SimGates(), &CaGates(), &WindGates(), &WaterGates(),
                           &RenderGates(),
                           &PlayerGates(),
                           &MobGates(), &BodyGates(), &WorldIoGates(), &AudioGates(),
                           &VoxRegionGates(),
-                          &SpellGates()})
+                          &SpellGates(), &PlayerKitGates()})
       pool.insert(pool.end(), g->begin(), g->end());
 
     std::vector<Gate> v;

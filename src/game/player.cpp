@@ -779,7 +779,10 @@ void Player::Update(float dt, const PlayerInput& in, const Vec3& flatFwd,
     vel.z += (wish.z - vel.z) * blend;
 
     // ---- jump: buffered press + coyote window, both consumed on use ----
-    bool jumped = false;
+    // Frame-local: "did we launch on THIS frame", read by the ground snap
+    // below. Distinct from the sticky Player::jumped latch the avatar reads,
+    // which survives until main.cpp drains it — see the note there.
+    bool launched = false;
     waterJumped = false;
     if (inLiquid) {
       // Drag proportional to how much of the body is actually in the water
@@ -856,6 +859,11 @@ void Player::Update(float dt, const PlayerInput& in, const Vec3& flatFwd,
       jumpBuffer = 0.0f;
       coyoteTimer = 0.0f;  // consume both, or one press pogos every frame
       onGround = false;    // no snapping or stepping on the frame we launch
+      launched = true;
+      // The LATCH the avatar's jump clip reads (see Player::jumped). Set where
+      // the impulse is actually applied, so nothing that merely leaves the
+      // ground — a step-down, a bump crest, a ledge release — can claim to be
+      // a jump. Never cleared here: main.cpp drains it after the tick batch.
       jumped = true;
     }
     const float vmax = T().maxFall / kVoxelMeters;
@@ -896,7 +904,7 @@ void Player::Update(float dt, const PlayerInput& in, const Vec3& flatFwd,
     // Source calls this at the end of every WalkMove. It is what turns walking
     // *down* rough ground from a series of little falls into contact motion,
     // and it is why grounded stays true across noise. Skipped while rising.
-    if (onGround && !jumped && vel.y <= nonJumpSpeed) {
+    if (onGround && !launched && vel.y <= nonJumpSpeed) {
       float snap = GroundProbe(pos, 0.1f + (float)kMaxStepUpVoxels, kindAt);
       if (snap > 0.0f) {
         float yBefore = pos.y;

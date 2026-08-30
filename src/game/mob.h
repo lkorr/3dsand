@@ -55,6 +55,20 @@ struct MobLimbDef {
   // between limb and parent when absent (anchorAuto)
   Vec3 anchor{};
   bool anchorAuto = true;
+  // ---- POSE-SPACE range of motion (sidecar "poseLimit"; optional) ----------
+  // THE LIMITS ABOVE DO NOT BIND AN ANIMATED LIMB. `minAngle`/`maxAngle` and
+  // the swing-twist cone are handed to Jolt, and Jolt only enforces them on a
+  // DYNAMIC body — a live limb is kinematic, re-posed every tick by the
+  // animation pipeline, so the IK could put a thigh anywhere it liked and no
+  // constraint in this struct had a word to say about it. "Legs raking out
+  // behind" and "legs folded up inside the torso" were both that.
+  //
+  // This is the animation's own range of motion, clamped on the solved pose
+  // (AnimClampPoseLimits) about the part's REST frame. Authored in DEGREES in
+  // the sidecar, stored in radians here like every other angle.
+  bool hasPoseLimit = false;
+  Vec3 poseAxis{1, 0, 0};
+  float poseMin = -3.14159265f, poseMax = 3.14159265f;
   // walk-cycle swing (radians) about X through the joint anchor; phase in
   // half-turns so arm.L/leg.R can counter-swing arm.R/leg.L. Kept as the
   // no-IK fallback for rigs without `chains` (dummy.json) — it now runs as a
@@ -270,7 +284,16 @@ struct BodyBurnState {
   // Consecutive ticks with an empty front, so a body walking in and out of a
   // campfire does not rebuild its index every other tick.
   uint32_t quiet = 0;
-  bool Burning() const { return !front.empty(); }
+  // "This limb still carries burning matter", and the ONE piece of burn state
+  // that SURVIVES DropBurnIndex. `front` cannot: its entries are cells of the
+  // index box that was just thrown away. Every carve drops the index (the
+  // lattice compacted underneath it) and burning carves constantly, so without
+  // this the cheap gate at the top of BurnOneLimb — "nothing hot nearby and an
+  // empty front, so exit" — fired on the tick after the last flush and the
+  // limb's flesh_burning voxels never rolled their decay again. That is a
+  // character left permanently coated in flame that has nothing left to burn.
+  bool alight = false;
+  bool Burning() const { return !front.empty() || alight; }
 };
 
 // One limb or part, described in the terms the burn pass needs.
@@ -389,6 +412,11 @@ struct MobLimb {
   bool carved = false;
   // Voxel count the limb was authored with, so damage is a FRACTION of it.
   uint32_t voxelsAtSpawn = 0;
+  // Voxel count the last carve already CHARGED to hp. `voxelsAtSpawn` is the
+  // denominator of the fraction; this is the previous numerator, and without it
+  // every carve re-charges everything the limb has ever lost — see the
+  // incremental-loss note in Mob::CarveLimb.
+  uint32_t voxelsCharged = 0;
   // Per-voxel burning / dissolution (see BodyBurnState above).
   BodyBurnState burn;
 };
@@ -552,9 +580,27 @@ class Mob {
   // ---- carving internals (docs/DESIGN.md §7) --------------------------------
   using LimbCarveKeep = std::function<bool(int, int, int)>;
   using LimbCarveFactory = std::function<LimbCarveKeep(float)>;
+  // ---- SPALL: let a hole grow into its own rim -----------------------------
+  // A predicate can only ask "should this voxel go", one voxel at a time, with
+  // no idea what is left around it. "Take more where matter is already missing"
+  // is a question about OCCUPANCY, and CarveLimb is the only place that knows
+  // it — it owns the limb's authoritative voxel list. So the growth lives here
+  // rather than in the crater predicate.
+  //
+  // Optional by construction: only the radial blast path fills one in, so the
+  // burn flush and the laser's clean kerf are untouched without either of them
+  // having to opt out.
+  struct CarveSpall {
+    Vec3 centerLocal{};   // blast centre in the limb's BODY frame, world voxels
+    float radius = 0;     // world voxels
+    float strength = 0;   // 0..1; 0 disables
+    int rounds = 0;       // passes; each can only remove
+    uint32_t seed = 0;    // same (mob, limb) key the crater noise uses
+  };
   bool CarveLimb(int limbIndex, World& world,
                  std::vector<ParticleSpawn>& spawns, bool eject,
-                 const LimbCarveFactory& carveAt);
+                 const LimbCarveFactory& carveAt,
+                 const CarveSpall* spall = nullptr);
   bool ReskinLimbMicro(MobLimb& limb, uint32_t skinScale, uint32_t physScale);
   bool RebuildLimbBody(int limbIndex);
   void EmitCarvedFragment(const MobLimb& src, uint32_t physScale,
@@ -612,6 +658,22 @@ class Mob {
   Vec3 bodyUp_{0, 1, 0};       // foot-plane normal (slope tilt)
   float bodyY_ = 0;            // prefab MIN CORNER height (same frame as origin_.y)
   float restSoleY_ = 0;        // rest sole height above the min corner
+  // Rest height of the leg chain's ROOT (the hip anchor) above the min corner,
+  // measured off the rig in BuildRig beside restSoleY_. The pair of them is the
+  // rig's standing leg SPAN: `restHipY_ - restSoleY_` is how far the hip sits
+  // above the ankle in the authored pose, and comparing that against the
+  // chain's summed bone lengths is the only way to know how much reach a stride
+  // has left to spend. On this human it is 6.75 against a 6.79 chain — a
+  // standing figure's legs are all but straight, which is why the avatar has to
+  // crouch to walk at all (see the stance note in PlayerAvatar::UpdateGait).
+  float restHipY_ = 0;
+  // Horizontal distance from that hip anchor to its own ankle anchor in the
+  // REST pose. Not zero: this human's ankle sits 0.5 world voxels in front of
+  // its hip (the shank leans forward), and the gait's stance point inherits
+  // that offset — so the foot starts half a voxel into its own forward reach
+  // before the velocity lead adds anything. Left out of the stance crouch it
+  // consumed the entire reach reserve and the IK sat on its clamp.
+  float restFootAhead_ = 0;
   bool footInit_ = false;
 
   // The rig this instance actually animates: a COPY of def_->skel/limbs,
@@ -680,7 +742,11 @@ class MobSystem {
   void SetDayPhase(uint32_t phase) { dayPhase_ = phase; }
   void SetDefs(std::vector<MobDef> defs);           // hot reload
   const std::vector<MobDef>& Defs() const { return defs_; }
-  void Reset();                                      // world regen
+  // Tear down every mob. `rewindIds` also restarts the id counter, which is a
+  // TEST-ONLY seam: mob ids seed gore variance and the blast crater's noise, so
+  // rewinding them changes how the next creature bleeds and tears. See the note
+  // at the definition.
+  void Reset(bool rewindIds = false);                                      // world regen
 
   // Spawn def at a world cell (mob min corner; caller picks ground). 0 = fail.
   uint64_t Spawn(int defIndex, IVec3 atVoxel);
@@ -872,6 +938,25 @@ class MobSystem {
   }
   uint64_t LimbBody(uint64_t mobId, int limbIndex) const;
   bool IsAlive(uint64_t mobId) const;
+
+  // THE MOST INTACT LIMB ANY SEVER HAS TAKEN since the last clear, as a
+  // fraction of that limb's spawn volume, with its name. -1 = nothing severed.
+  //
+  // A limb is supposed to come off because it RAN OUT: the geometric floor is
+  // kLimbCollapseFraction (25% left) and the hp floor at
+  // kCarveDamagePerVolume 1.5 is 33% left. So a sever recorded well above
+  // those is by construction not a limb that was eaten — it is a damage rule
+  // over-charging, or the connectivity split giving the limb's identity to a
+  // fragment. Both of those shipped, and from outside both read only as "a
+  // limb came off". Sampling from a test is impossible without this: the
+  // instant is one tick wide, and if the limb was vital the whole limb list is
+  // gone by the time anyone could look.
+  float WorstSeverFraction() const { return worstSeverFrac_; }
+  const std::string& WorstSeverLimb() const { return worstSeverLimb_; }
+  void ClearSeverStats() {
+    worstSeverFrac_ = -1.0f;
+    worstSeverLimb_.clear();
+  }
   Vec3 MobOrigin(uint64_t mobId) const;
   // The mob's facing direction — the SAME `fwd` the kinematic walk translates
   // along and the same yaw the limb submit applies, so a test written against
@@ -916,6 +1001,15 @@ class MobSystem {
   // would silently measure nothing on exactly the rigs carving matters most on.
   uint32_t LimbVoxelCount(uint64_t mobId, int limbIndex) const;
   uint32_t LimbVoxelsAtSpawn(uint64_t mobId, int limbIndex) const;
+  // How many of a limb's surviving voxels have at least `minOpen` of their six
+  // face-neighbours missing — the roughness of what a carve LEFT BEHIND.
+  //
+  // A voxel count alone cannot tell a torn chunk from a fine sprinkle: remove
+  // the same number of voxels as white noise and as a correlated blob and the
+  // count is identical while the result looks nothing alike. Isolated spurs are
+  // what speckle leaves and what a chunk does not, so this is the shape of the
+  // crater expressed as a number the crater gate can assert on.
+  uint32_t LimbOpenFaceCount(uint64_t mobId, int limbIndex, int minOpen) const;
   // ---- per-voxel burning introspection ---------------------------------------
   // How many voxels of this limb are currently ALIGHT (carry a decay/emit rule).
   // This is the size of the active front, and it is the number the burn gate
@@ -1095,6 +1189,10 @@ class MobSystem {
   // Drained by main.cpp each frame. Bounded by the same limits that bound
   // severing itself: a mob has a fixed limb count and kMaxMobs of them exist.
   std::vector<SeverEvent> severs_;
+  // See WorstSeverFraction. Written by Mob::Sever, cleared only on request —
+  // this is a high-water mark over a whole test, not a per-tick event queue.
+  float worstSeverFrac_ = -1.0f;
+  std::string worstSeverLimb_;
   std::vector<BleedSource> bleeds_;
   std::vector<VoiceEvent> voices_;
   // Push a creature voice, de-duplicating Hurt per mob per drain window (see

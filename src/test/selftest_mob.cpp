@@ -635,6 +635,109 @@ bool mobOk = false;
                     carveOk ? "PASS" : "FAIL", v0, spawnVox, v1,
                     stillAttached ? 1 : 0, passes, aliveAfter ? 1 : 0);
         mobOk = mobOk && carveOk;
+
+        // ---- CRATER SHAPE: the chunkiness slider, and its off switch ------
+        //
+        // `gore.carveChunkiness` 0 must remove EXACTLY the voxels the old
+        // white-noise crater removed. That is not a nicety: the slider is
+        // meant to be an A/B between the old look and the new one, and a
+        // "0" that is merely close is not an A/B, it is a third behaviour
+        // nobody chose. It is also the thing that makes the whole feature
+        // safe to land — carving pushes ParticleSpawns into the tick stream,
+        // so a crater that changed shape at 0 would move the world hash.
+        //
+        // THREE ARMS, NOT TWO. Running 0 then 1 and comparing tells you the
+        // slider does something, but it cannot separate "the slider changed
+        // the crater" from "the second mob was carved out of a body the first
+        // pass had already dirtied". Running the CONTROL TWICE and requiring
+        // arms 1 and 3 to agree is what makes the comparison mean anything
+        // (gotcha: a hash-identity test needs three arms).
+        int craterLost[3] = {0, 0, 0};
+        int craterSpur[3] = {0, 0, 0};
+        int humanDef = -1;
+        for (size_t i = 0; i < mobs.Defs().size(); i++)
+          if (mobs.Defs()[i].name == kAvatarDefName) humanDef = (int)i;
+        if (humanDef >= 0) {
+          const Tuning saved = CurrentTuning();
+          const MobDef& hd = mobs.Defs()[humanDef];
+          int torso = -1;
+          for (size_t i = 0; i < hd.limbs.size(); i++)
+            if (hd.limbs[i].name == "torso") torso = (int)i;
+          const float arms[3] = {0.0f, 1.0f, 0.0f};
+          for (int a = 0; a < 3 && torso >= 0; a++) {
+            Tuning t = saved;
+            t.gore.carveChunkiness = arms[a];
+            SetCurrentTuning(t);
+            debris.Reset();
+            // rewindIds: the mob id seeds the crater noise, so the two control
+            // arms are only comparable if the id repeats. This is the ONLY
+            // caller that asks for it — rewinding by default moved `mob-burn`
+            // (see the note on MobSystem::Reset).
+            mobs.Reset(/*rewindIds=*/true);
+            const uint64_t bid = mobs.Spawn(humanDef, {147, h + 1, 147});
+            for (int i = 0; i < 6; i++) mobTick({});
+            const uint32_t before = mobs.LimbVoxelCount(bid, torso);
+            if (before == 0) break;
+            // The torso, because it is the biggest limb on the rig (~4.5 world
+            // voxels across) and a blast has to be SMALLER than the limb for
+            // there to be a crater shape to measure at all. On a thigh — about
+            // one voxel thick here — every arm removed everything inside the
+            // radius and the numbers, though real, carried no signal.
+            const uint64_t lb = mobs.LimbBody(bid, torso);
+            std::vector<ParticleSpawn> cs;
+            // eject=false: this measures the crater's SHAPE, and ejecting
+            // ~400 flesh voxels as particles three times over would dump real
+            // matter into a world the gates after this one place fixtures in
+            // by absolute coordinate. The ejection path itself is covered by
+            // the carve subtest above and by the game.
+            mobs.CarveLimbRadial(lb, mobs.LimbVoxelPos(bid, torso, before / 2),
+                                 1.5f, true, false, world, cs);
+            for (int i = 0; i < 3; i++) mobTick({});
+            craterLost[a] = (int)before - (int)mobs.LimbVoxelCount(bid, torso);
+            // Survivors with 3+ open faces: isolated spurs and pockmarks. This
+            // is the shape of what was LEFT, and it is what separates a torn
+            // hole from a sprinkle — measuring it needs no world-space query,
+            // which matters because a carve rebuilds the limb body and any
+            // before/after probe in world space compares two different frames.
+            craterSpur[a] = (int)mobs.LimbOpenFaceCount(bid, torso, 3);
+          }
+          SetCurrentTuning(saved);
+          mobs.Reset();
+          debris.Reset();
+        }
+        // Arms 1 and 3 are the same tuning on the same fixture: identical, or
+        // arm 2 is being compared against noise and proves nothing.
+        const bool craterRepeatable = craterLost[0] == craterLost[2] &&
+                                      craterSpur[0] == craterSpur[2];
+        const bool craterMoves = craterLost[1] != craterLost[0];
+        // THE FRINGE IS SPARED. `1 - t^2` is still 0.36 at 80% of the radius,
+        // so the old crater really did take a bit of everything it touched;
+        // raising it to a power drops that to 0.05 and the same blast removes
+        // materially LESS in total. Asserting "removes more" would be
+        // asserting the opposite of the feature.
+        const bool craterConcentrates = craterLost[1] < craterLost[0];
+        // ...AND WHAT IT TOOK CAME OFF IN ONE PIECE. Removing less could also
+        // mean removing less everywhere, which would leave the survivors MORE
+        // pockmarked, not less. Spurs per voxel removed falling is only
+        // consistent with the removal being contiguous — that is the
+        // difference between a hole and a speckle, stated as a number.
+        const float spurRate0 =
+            craterLost[0] > 0 ? (float)craterSpur[0] / (float)craterLost[0] : 0.0f;
+        const float spurRate1 =
+            craterLost[1] > 0 ? (float)craterSpur[1] / (float)craterLost[1] : 0.0f;
+        const bool craterCleaner = craterLost[1] > 0 && spurRate1 < spurRate0 * 0.8f;
+        const bool craterOk = craterRepeatable && craterMoves &&
+                              craterConcentrates && craterCleaner;
+        std::printf(
+            "mob crater shape (torso): %s (chunkiness 0/1/0 -> lost %d/%d/%d "
+            "collider voxels, ragged survivors %d/%d/%d = %.2f/%.2f per voxel "
+            "removed; repeatable=%d reaches=%d sparesFringe=%d cleaner=%d)\n",
+            craterOk ? "PASS" : "FAIL", craterLost[0], craterLost[1],
+            craterLost[2], craterSpur[0], craterSpur[1], craterSpur[2],
+            spurRate0, spurRate1, craterRepeatable ? 1 : 0,
+            craterMoves ? 1 : 0, craterConcentrates ? 1 : 0,
+            craterCleaner ? 1 : 0);
+        mobOk = mobOk && craterOk;
         debris.Reset();
         mobs.Reset();
       } else {
@@ -797,8 +900,18 @@ bool mobOk = false;
           debris.QueueSupportEvents(world.Snap());
           debris.PreTick(t + 1, world, cellOps, spawns);
           ++t;
+          // THE MIRROR FOLLOWS THE BODY, as it does in the game. This was
+          // pinned to the SPAWN chunk, and every loop below walks the player
+          // tens of voxels away from it — well past the 3x3x3 CPU mirror, where
+          // World::KindAt returns Unknown for everything. Unknown is treated as
+          // passable (gotcha: the mirror is tiny), so anything that collides
+          // through it falls through the world: the ramp fixture below dropped
+          // the body 156 voxels before this line moved. The gait's own probe
+          // never noticed because it reads the general chunk cache instead.
+          const IVec3 pc{ifloor(pl.pos.x) >> 4, ifloor(pl.pos.y) >> 4,
+                         ifloor(pl.pos.z) >> 4};
           SubmitTick(ctx, world, sim, t, kDefaultSeed, ops, {}, cellOps,
-                     false, {140 / 16, h2 / 16, 140 / 16}, true, false,
+                     false, pc, true, false,
                      spawns);
           ctx.WaitIdle();
           ctx.ProcessEvents();
@@ -1037,6 +1150,36 @@ bool mobOk = false;
           if (axis.y > 0) axis = axis * -1.0f;   // fold down, as swingOf does
           return std::atan2(axis.x, -axis.y) * 57.29578f;
         };
+        // JOINT ANGLES IN THE RIG'S OWN FRAME, which is what a `poseLimit` is
+        // stated in — the world-space measures above cannot see a range-of-
+        // motion violation at all, because a leg swung 120 degrees past its
+        // hip still reads as a perfectly ordinary elevation once the body has
+        // turned under it.
+        //
+        // Signed rotation of a part about MODEL X relative to its parent, in
+        // degrees, POSITIVE = FORWARD. On these rigs a positive rotation about
+        // +X swings a hanging limb backward (verified against swingOf's own
+        // convention above, where negative reads "behind"), so the sign is
+        // flipped here to match how a human would describe a hip.
+        // Reported as the twist about model +X, in degrees, which is EXACTLY
+        // the quantity AnimClampPoseLimits clamps — so a number here compares
+        // directly against the authored min/max instead of being a second,
+        // differently-defined angle that has to be reconciled by hand. Recall
+        // that +X swings a hanging limb BACKWARD on these rigs, hence:
+        //   hip  authored {axis:[-1,0,0], min:-10, max:80}  =>  x in [-80, +10]
+        //   knee authored {axis:[ 1,0,0], min:  0, max:90}  =>  x in [  0, +90]
+        auto jointTwistX = [&](int part, int parent) {
+          Vec3 p, pp;
+          Quat q, pq;
+          if (part < 0 || parent < 0) return 0.0f;
+          if (!avatar.PartModelTransform(part, p, q)) return 0.0f;
+          if (!avatar.PartModelTransform(parent, pp, pq)) return 0.0f;
+          const Quat rel = QuatMul(QuatConj(pq), q);
+          float a = 2.0f * std::atan2(rel.x, rel.w) * 57.29578f;
+          while (a > 180.0f) a -= 360.0f;
+          while (a <= -180.0f) a += 360.0f;
+          return a;
+        };
         const int legParts[4] = {avatar.PartIndex("legU.L"),
                                  avatar.PartIndex("legU.R"),
                                  avatar.PartIndex("legL.L"),
@@ -1056,15 +1199,123 @@ bool mobOk = false;
         float maxLegLateral = 0.0f;
         float sumLegLateral[2] = {0.0f, 0.0f};
         int nLegLateral = 0;
+        // ---- joint ranges and knee bend, in the rig's own frame ----
+        // hipX is the direct test for the POSE LIMITS; kneeX is also the direct
+        // test for the ANKLE-FRAME foot target, because a leg whose IK target
+        // is past full extension is CLAMPED by AnimSolveTwoBone every tick and
+        // a clamped two-bone solve has a dead-straight knee by construction.
+        // Before that fix this rig walked at 0.0 degrees of knee bend.
+        float hipXLo = 999.0f, hipXHi = -999.0f;
+        float kneeXLo = 999.0f, kneeXHi = -999.0f;
+        // ---- stride coherence ----
+        // Footfalls against the gait phase's own cycles over the same window.
+        // A biped stride is two footfalls, so a coherent clock completes
+        // footfalls/2 cycles. The free-running oscillator this replaced ran at
+        // ~2.6x the footfall rate, which no pose measure can see and which IS
+        // the "sways left and right really fast and it's jittery" report.
+        int walkFootfalls = 0, phaseCycles = 0;
+        float prevPhase = avatar.GaitPhase();
+        // The crouch is what BUYS the stride its reach, so it has to be
+        // sampled while WALKING. Reading it at the end of the gate reports the
+        // parked standing value and says nothing about whether the leg had
+        // room to swing.
+        float maxCrouch = 0.0f;
         const float walkStep =
             (CurrentTuning().player.walkSpeed / kVoxelMeters) * kTickDt;
         // State the velocity this teleport represents — the avatar reads the
         // player's own vel now, not a position difference. See the note at
         // the first walk loop above.
         pl.vel = Vec3{0, 0, walkStep / kTickDt};
+        // KEEP THE BODY ON THE GROUND IT IS WALKING OVER.
+        //
+        // This loop advances the player by ASSIGNING pl.pos.z — a deliberate
+        // teleport, so the gait is measured without the controller in the way
+        // (see the velocity note above). But it only ever moved z, and the
+        // terrain under it is real worldgen that rises and falls, so after a
+        // few dozen voxels the body was walking through the air well above the
+        // surface (or buried in it). The gait's ground probe correctly reported
+        // the real ground far below, the IK target went out of reach, and
+        // avatar.cpp's stale-plant guard — `rel.len() > legLength * 1.6` —
+        // dropped the solve entirely. The legs then sat at EXACT rest: the
+        // trace reads `legU -0.0 / -0.0, shin 90.0 / 90.0` for the last dozen
+        // ticks of the window, which is not a gait failing, it is a gait that
+        // was never asked to run.
+        //
+        // Every pose extreme this loop reports was measured through that, so
+        // the numbers were a fixture artifact. Snap y to the real surface each
+        // tick and the body walks on the ground the probe can see.
+        const std::vector<uint32_t> walkClassOf = BuildCollisionClasses(mats);
+        // WALK ON GROUND THIS TEST OWNS, not on whatever worldgen happens to
+        // be here. Every loop above teleports the player forward, so by now the
+        // body is ~60 voxels from where it spawned and standing over terrain
+        // nobody chose — measured, a hillside climbing most of a voxel per tick.
+        // That is not "flat ground at the player's real speed", it is an
+        // uncontrolled incline, and every pose extreme this loop reports was
+        // measured on it. Stamp a flat stone shelf and walk that: the ramp
+        // fixture further down is where sloped ground is deliberately tested,
+        // and keeping the two separate is what lets either failure name itself.
+        {
+          const int px = ifloor(pl.pos.x), pz = ifloor(pl.pos.z) + 2;
+          const int py = ifloor(pl.pos.y - Player::kHalfY);
+          for (int seg = 0; seg < 12; seg++) {
+            std::vector<BrushOp> ops;
+            std::vector<ParticleSpawn> spawns;
+            std::vector<CellOp> cellOps;
+            for (int k = 0; k < 6; k++) {
+              const int zz = pz + seg * 6 + k;
+              for (int dx = -4; dx <= 4; dx += 4)
+                ops.push_back(BrushOp{px + dx, py - 3, zz, 2, 1u, 1});
+            }
+            ++t;
+            SubmitTick(ctx, world, sim, t, kDefaultSeed, ops, {}, cellOps,
+                       false,
+                       IVec3{px >> 4, py >> 4, (pz + seg * 6) >> 4}, true,
+                       false, spawns);
+            ctx.WaitIdle();
+            ctx.ProcessEvents();
+          }
+          for (int i = 0; i < 6; i++) avTick();
+        }
+        // THE PROBE MUST NOT START FROM THE ANSWER IT LAST GAVE. Scanning down
+        // from `pl.pos.y` — which this same lambda wrote on the previous tick —
+        // is a feedback loop: half of a 17-voxel body is 8.5 voxels, so once
+        // the scan starts inside a hill it finds the hill's INTERIOR, the body
+        // rises by that, the next scan starts higher still, and the sole
+        // climbed 13 voxels a tick. (Measured: soleY 213 -> 226 -> 239 -> 252.)
+        // Same shape as the avatar's own gait-height bug, one layer out.
+        //
+        // Anchored to the PREVIOUS SOLE plus ONE voxel instead. This loop is
+        // the FLAT case and walks a shelf this test stamped, so a surface more
+        // than a voxel up is the hillside the shelf is cut into, not ground
+        // this fixture means to walk.
+        int climbWindow = 1;
+        auto surfaceY = [&](float wx, float wz, float prevSole) {
+          const int x = ifloor(wx), z = ifloor(wz);
+          const int from = ifloor(prevSole) + climbWindow;
+          for (int y = from; y > from - 40; y--)
+            if (world.KindAt(IVec3{x, y, z}, walkClassOf) == CellKind::Solid)
+              return (float)(y + 1);
+          return prevSole;
+        };
+        // The head-look loops above ran ~200 ticks without draining, so start
+        // the footfall count from empty or the first sample carries all of it.
+        avatar.ClearFootfalls();
+        prevPhase = avatar.GaitPhase();
         for (int i = 0; i < 90; i++) {
           pl.pos.z += walkStep;   // forward at heading 0, see swingOf above
+          pl.pos.y = surfaceY(pl.pos.x, pl.pos.z,
+                              pl.pos.y - Player::kHalfY) + Player::kHalfY;
           avTick();
+          // Sampled OUTSIDE the steady-state cutoff below, because both of
+          // these are RATES: a footfall counted while the phase count is not
+          // would make the ratio wrong by exactly the transient.
+          {
+            const float ph = avatar.GaitPhase();
+            if (ph < prevPhase - 0.25f) phaseCycles++;   // wrapped past 1
+            prevPhase = ph;
+            walkFootfalls += (int)avatar.Footfalls().size();
+          }
+          avatar.ClearFootfalls();
           // Let the gait reach STEADY STATE before sampling. From a standing
           // start both feet are planted under the body and the first strides
           // are catching up, so the legs legitimately pass through low
@@ -1087,6 +1338,7 @@ bool mobOk = false;
           // to paper over a leg that is genuinely lying down — read the
           // SANDVOX_GAITDBG trace and confirm the dip is a single tick at
           // the edge of the window first.
+          maxCrouch = std::max(maxCrouch, avatar.StanceCrouch());
           if (i < 36) continue;
           for (int lp : legParts)
             if (lp >= 0) minLegElev = std::min(minLegElev, elevationOf(lp));
@@ -1108,6 +1360,17 @@ bool mobOk = false;
               minArmElev = std::min(minArmElev, e);
               maxArmElev = std::max(maxArmElev, e);
             }
+          {
+            const int hips = avatar.PartIndex("hips");
+            for (int s = 0; s < 2; s++) {
+              const float hx = jointTwistX(legParts[s], hips);
+              hipXLo = std::min(hipXLo, hx);
+              hipXHi = std::max(hipXHi, hx);
+              const float kx = jointTwistX(legParts[2 + s], legParts[s]);
+              kneeXLo = std::min(kneeXLo, kx);
+              kneeXHi = std::max(kneeXHi, kx);
+            }
+          }
           // Per-tick gait trace. The summary line only reports extremes, and
           // a gait fails in ways an extreme cannot show — both legs stuck in
           // phase, an arm swinging at a quarter amplitude, a leg that never
@@ -1127,6 +1390,15 @@ bool mobOk = false;
                 elevationOf(legParts[1]), elevationOf(legParts[2]),
                 elevationOf(legParts[3]), lateralOf(legParts[0]),
                 lateralOf(legParts[1]));
+            std::printf(
+                "        crouch %.2f hipX %6.1f/%6.1f kneeX %6.1f/%6.1f "
+                "bodyY %.2f soleY %.2f\n",
+                avatar.StanceCrouch(),
+                jointTwistX(legParts[0], avatar.PartIndex("hips")),
+                jointTwistX(legParts[1], avatar.PartIndex("hips")),
+                jointTwistX(legParts[2], legParts[0]),
+                jointTwistX(legParts[3], legParts[1]),
+                avatar.BodyY(), pl.pos.y - Player::kHalfY);
           }
         }
         // A walking leg should never lie down. A healthy stride bottoms out
@@ -1181,6 +1453,81 @@ bool mobOk = false;
         bool armsSwing = (maxArmElev - minArmElev) > 20.0f;
         bool armsHang = std::fabs(maxArmElev) < 60.0f &&
                         std::fabs(minArmElev) < 60.0f;
+
+        // THE KNEE MUST ACTUALLY BEND. This is the direct regression test for
+        // the foot IK target being in the ANKLE's frame.
+        //
+        // GroundHeightAt returns the SURFACE, which is where the model's MIN
+        // CORNER rests; the chain's effector is the ankle JOINT, which on this
+        // rig sits 0.75 world voxels above that corner. Handing the solver the
+        // surface therefore asks for 7.50 voxels of reach out of a 6.79-voxel
+        // leg, and AnimSolveTwoBone clamps to its reach annulus on every single
+        // tick — a clamped two-bone solve is a DEAD STRAIGHT limb by
+        // construction, so the knee measured 0.0 degrees for the whole of every
+        // walk and every subtlety the gait computed upstream was thrown away at
+        // that one line. It is the root of "the legs don't swing enough", and
+        // no pose measure that existed here could see it: a straight leg
+        // rotating about the hip still elevates, still alternates, still stays
+        // out of the splay bound.
+        //
+        // The bend also needs somewhere to come FROM, which is the stance
+        // crouch: with the pelvis pinned at the AABB sole this rig's reachable
+        // stride was 0.7 voxels, so the fix is only half a fix without it.
+        const float kneeFlex = std::max(kneeXHi, 0.0f);
+        bool kneeBends = kneeFlex > 8.0f;
+
+        // ...AND THE JOINTS MUST STAY INSIDE THE AUTHORED RANGE OF MOTION.
+        // The ragdoll limits in the sidecar cannot do this: Jolt only enforces
+        // them on a dynamic body and a live limb is kinematic, so until
+        // AnimClampPoseLimits there was nothing at all between the IK and an
+        // anatomically impossible leg. Measured as the twist about model +X,
+        // the same quantity the clamp works in (see jointTwistX).
+        //
+        // The bounds are READ OFF THE RIG, never restated here. A limit is
+        // authored data (assets/mobs/human.json `poseLimit`), and a test that
+        // hardcoded the same numbers would be a second copy to keep in sync —
+        // it would also pass while measuring nothing if the JSON changed. The
+        // authored axis carries the SIGN convention, so it has to come along:
+        // the hip is authored about -X (positive = forward, as a human would
+        // say it) and the knee about +X.
+        const float kSlack = 1.5f;
+        auto limitOf = [&](const char* part, float& lo, float& hi) {
+          lo = -180.0f;
+          hi = 180.0f;
+          const int i = avatar.PartIndex(part);
+          if (i < 0 || i >= avatar.LimbCount()) return false;
+          const MobLimbDef& ld = avatar.LimbDefAt(i);
+          if (!ld.hasPoseLimit) return false;
+          const float deg = 57.29578f;
+          // Express the authored range in the +X frame jointTwistX reports in.
+          if (ld.poseAxis.x < 0) {
+            lo = -ld.poseMax * deg;
+            hi = -ld.poseMin * deg;
+          } else {
+            lo = ld.poseMin * deg;
+            hi = ld.poseMax * deg;
+          }
+          return true;
+        };
+        float hipLimLo = 0, hipLimHi = 0, kneeLimLo = 0, kneeLimHi = 0;
+        const bool haveLimits = limitOf("legU.L", hipLimLo, hipLimHi) &&
+                                limitOf("legL.L", kneeLimLo, kneeLimHi);
+        bool jointsInRange =
+            haveLimits && hipXLo > hipLimLo - kSlack &&
+            hipXHi < hipLimHi + kSlack && kneeXLo > kneeLimLo - kSlack &&
+            kneeXHi < kneeLimHi + kSlack;
+
+        // ONE CLOCK. A biped stride is two footfalls, so the gait phase must
+        // complete footfalls/2 cycles over the same window. The oscillator this
+        // replaced ran at cadence * speedFactor — 2.6x the real footfall rate
+        // on this rig at walk pace, and at 8.13 Hz against a 30 Hz tick, under
+        // four samples per cycle. That is the jitter, and it is invisible to
+        // every other assertion on this page because it is a property of the
+        // RATE rather than of any pose.
+        const float wantCycles = (float)walkFootfalls * 0.5f;
+        bool strideCoherent =
+            walkFootfalls >= 4 &&
+            std::fabs((float)phaseCycles - wantCycles) <= wantCycles * 0.5f + 1.0f;
 
         // ---- FALLING: the legs must not invert into the body ----
         //
@@ -1356,6 +1703,186 @@ bool mobOk = false;
         // to inject.
         bool poseContinuous = worstJump < worstJumpFlat * 1.6f + 6.0f;
 
+        // ---- A REAL RAMP: sloped voxels, walked by the real controller ----
+        //
+        // The fixture above walks FLAT with a ragged `grounded` bit, and its
+        // own comment says so: holding y flat isolates the raggedness, and
+        // building a real ramp "would be the other way to do this". The
+        // reported bug is about actual sloped ground ("on anything but flat
+        // ground the legs stop moving rhythmically"), so build the ramp.
+        //
+        // Everything the flat fixture cannot reach lives here: the ground probe
+        // returns a DIFFERENT height under each foot and a rising one every
+        // tick, so the swing arc lands above where it lifted, the stance span
+        // shortens and lengthens under the hip, and the step trigger fires on a
+        // moving target. A gait that only works on a plane fails here and
+        // nowhere else on this page.
+        float rampKneeFlex = 0.0f;
+        float rampHipLo = 999.0f, rampHipHi = -999.0f;
+        int rampFootfalls = 0;
+        int rampJumpTicks = 0, rampFallTicks = 0;
+        float rampWorstJump = 0.0f;
+        // How far the body actually got, so a fixture that never climbed
+        // reports as a FIXTURE problem rather than as a silent "0 footfalls"
+        // indistinguishable from a gait that stopped stepping.
+        float rampClimb = 0.0f, rampAdvance = 0.0f, rampStartY = 0.0f,
+              rampStartZ = 0.0f;
+        {
+          // The controller collides against the CPU mirror through the same
+          // collision-class table the game builds; it is not the raw material
+          // id, and vegetation reading as gas is the point of it.
+          const std::vector<uint32_t> classOf = BuildCollisionClasses(mats);
+          auto kindAt = [&](IVec3 c) { return world.KindAt(c, classOf); };
+
+          // PUT THE BODY BACK ON REAL GROUND FIRST. Every loop above advances
+          // the player by ASSIGNING pl.pos, which is a teleport with no
+          // collision — so by here the body is at an arbitrary height over
+          // whatever terrain happens to be under it. Handing that straight to
+          // the real controller drops it into a genuine 60-tick fall, which
+          // does not merely break this fixture: the avatar takes real fall
+          // damage from it and every assertion AFTER this block (the sever
+          // ladder, the debris count, the teardown) then runs on a corpse.
+          const int rx = 200, rz = 200;
+          const int rh = World::TerrainHeight(rx, rz, kDefaultSeed);
+          pl.pos = Vec3{(float)rx + 0.5f, (float)(rh + 2) + Player::kHalfY,
+                        (float)rz + 0.5f};
+          pl.vel = Vec3{};
+          pl.grounded = true;
+          for (int i = 0; i < 20; i++) {
+            PlayerInput idle{};
+            pl.Update(kTickDt, idle, Vec3{0, 0, 1}, Vec3{1, 0, 0},
+                      Vec3{0, 0, 1}, kindAt);
+            avTick();
+          }
+
+          // Stone stairs climbing +Z from where the body settled: one voxel of
+          // rise per two travelled, a ~26 degree grade. Steep enough to be a
+          // hill, and inside the controller's step budget so the walk stays a
+          // walk instead of degenerating into a series of hops. Laid through
+          // the MutationQueue like every other world edit (rule 3); radius-2
+          // spheres overlap into a continuous bank, centred three below the
+          // surface they are meant to produce so the sphere's TOP lands there
+          // rather than burying the walkable cell.
+          const int x0 = (int)pl.pos.x, z0 = (int)pl.pos.z;
+          const int y0 = (int)(pl.pos.y - Player::kHalfY);
+          const uint32_t stone = 1;
+          // Overlapping radius-3 spheres at EVERY z, starting at the body's own
+          // cell so there is no seam between the real terrain and the ramp for
+          // the sweep to catch on, and rising one voxel per three travelled
+          // (~18 degrees). A coarser grade built from isolated 1-voxel risers
+          // is a staircase, and the controller pays a step-up for each one.
+          for (int seg = 0; seg < 13; seg++) {
+            std::vector<BrushOp> ops;
+            std::vector<ParticleSpawn> spawns;
+            std::vector<CellOp> cellOps;
+            for (int k = 0; k < 5; k++) {
+              const int zz = z0 + seg * 5 + k;
+              const int yy = y0 + (zz - z0) / 3;
+              for (int dx = -4; dx <= 4; dx += 4)
+                ops.push_back(BrushOp{x0 + dx, yy - 4, zz, 3, stone, 1});
+            }
+            ++t;
+            SubmitTick(ctx, world, sim, t, kDefaultSeed, ops, {}, cellOps,
+                       false, {rx / 16, rh / 16, rz / 16}, true, false, spawns);
+            ctx.WaitIdle();
+            ctx.ProcessEvents();
+          }
+          // Let the mirror catch up: the CPU chunk cache is one tick latent and
+          // the gait's ground probe reads it, so walking before it arrives
+          // measures the gait against terrain that is not there yet.
+          for (int i = 0; i < 10; i++) {
+            PlayerInput idle{};
+            pl.Update(kTickDt, idle, Vec3{0, 0, 1}, Vec3{1, 0, 0},
+                      Vec3{0, 0, 1}, kindAt);
+            avTick();
+          }
+
+          const int watch[4] = {avatar.PartIndex("armU.L"),
+                                avatar.PartIndex("armU.R"),
+                                avatar.PartIndex("legU.L"),
+                                avatar.PartIndex("legU.R")};
+          Quat prev[4];
+          bool havePrev = false;
+          const int hips = avatar.PartIndex("hips");
+          const float step =
+              (CurrentTuning().player.walkSpeed / kVoxelMeters) * kTickDt;
+          climbWindow = 2;   // the ramp climbs; the flat shelf does not
+          rampStartY = pl.pos.y;
+          rampStartZ = pl.pos.z;
+          avatar.ClearFootfalls();
+          for (int i = 0; i < 90; i++) {
+            // Advanced the same way the flat loop is: teleport forward, then
+            // read y back out of the REAL VOXELS the ramp is made of. The body
+            // and the terrain therefore agree — which is the thing the flat
+            // fixture's comment says matters — while the collision sweep stays
+            // out of it. That is deliberate: the gait is what is under test
+            // here, and driving Player::Update instead made this fixture
+            // measure the CONTROLLER (it jammed against the stamped ramp at
+            // t28 and the body sat still for 60 ticks, reporting a gait
+            // failure that was nothing of the sort).
+            pl.pos.z += step;
+            pl.pos.y = surfaceY(pl.pos.x, pl.pos.z,
+                                pl.pos.y - Player::kHalfY) + Player::kHalfY;
+            pl.vel = Vec3{0, 0, step / kTickDt};
+            pl.grounded = true;
+            avTick();
+            rampFootfalls += (int)avatar.Footfalls().size();
+            avatar.ClearFootfalls();
+            if (getenv("SANDVOX_GAITDBG"))
+              std::printf("  ramp t%02d z=%.1f y=%.1f grounded=%d spd=%.1f\n",
+                          i, pl.pos.z, pl.pos.y - Player::kHalfY,
+                          pl.grounded ? 1 : 0, avatar.SpeedNow());
+            if (i < 25) continue;   // let the climb reach steady state
+            // NEITHER AIR CLIP MAY PLAY. Cresting each step legitimately
+            // breaks contact for a tick, which used to fire the arms-up `jump`
+            // one-shot; and a step DOWN clears any air debounce, which used to
+            // start `fall`. Both are now gated on real events (a launch, and a
+            // real drop below the last supported height), so walking a hill
+            // must show neither.
+            if (avatar.ClipActive("jump")) rampJumpTicks++;
+            if (avatar.ClipWeight("fall") > 0.05f) rampFallTicks++;
+            for (int s = 0; s < 2; s++) {
+              rampHipLo = std::min(rampHipLo, jointTwistX(watch[2 + s], hips));
+              rampHipHi = std::max(rampHipHi, jointTwistX(watch[2 + s], hips));
+              rampKneeFlex = std::max(
+                  rampKneeFlex,
+                  jointTwistX(avatar.PartIndex(s ? "legL.R" : "legL.L"),
+                              watch[2 + s]));
+            }
+            Quat cur[4];
+            bool ok = true;
+            for (int k = 0; k < 4; k++) {
+              Vec3 p;
+              if (watch[k] < 0 || !avatar.PartModelTransform(watch[k], p, cur[k]))
+                ok = false;
+            }
+            if (!ok) continue;
+            if (havePrev)
+              for (int k = 0; k < 4; k++) {
+                float d = std::fabs(prev[k].x * cur[k].x + prev[k].y * cur[k].y +
+                                    prev[k].z * cur[k].z + prev[k].w * cur[k].w);
+                d = std::clamp(d, 0.0f, 1.0f);
+                rampWorstJump =
+                    std::max(rampWorstJump, 2.0f * std::acos(d) * 57.29578f);
+              }
+            for (int k = 0; k < 4; k++) prev[k] = cur[k];
+            havePrev = true;
+          }
+          rampClimb = pl.pos.y - rampStartY;
+          rampAdvance = pl.pos.z - rampStartZ;
+          pl.vel = Vec3{};
+          pl.grounded = true;
+        }
+        // The legs must keep stepping on the slope, must bend, must stay in
+        // range, and must not read as continuously snapping. Thresholds are
+        // deliberately looser than the flat case — a climb IS a bigger motion —
+        // but "stopped moving rhythmically" and "raked out of range" both fail.
+        bool rampWalks = rampFootfalls >= 3 && rampKneeFlex > 6.0f &&
+                         rampHipLo > hipLimLo - 4.0f &&
+                         rampHipHi < hipLimHi + 4.0f &&
+                         rampWorstJump < worstJumpFlat * 2.2f + 12.0f;
+        bool rampNoAirClips = rampJumpTicks == 0 && rampFallTicks == 0;
+
         // Walk DOWN the state ladder and check the movement coupling at each
         // rung. Speed must be non-increasing and must actually drop by the
         // end — the whole point of the states is that damage costs you.
@@ -1393,7 +1920,9 @@ bool mobOk = false;
                     noSelfPush && monotone && slowed && noJump &&
                     statesSeen > 0 && partsGone && becameDebris && tornDown &&
                     legsUpright && legsAlternate && legsNotSplayed &&
-                    legsNotInverted && armsHang && armsSwing && poseContinuous;
+                    legsNotInverted && armsHang && armsSwing && poseContinuous &&
+                    kneeBends && jointsInRange && strideCoherent &&
+                    rampWalks && rampNoAirClips;
         std::printf(
             "avatar: %s (%d parts, spawned=%d bodies=%d, followed %.1f vox, "
             "y-drift %.2f vox, self-push %.3f vox, states seen=%d (last %d) "
@@ -1415,6 +1944,28 @@ bool mobOk = false;
             armsHang ? 1 : 0, armsSwing ? 1 : 0, worstLegUp,
             legsNotInverted ? 1 : 0, worstJumpFlat, worstJump,
             poseContinuous ? 1 : 0);
+        // Reported on its own line: these are the locomotion pass's own
+        // claims, and burying five more numbers in the paragraph above is how
+        // a regression hides. Every one is a MEASUREMENT next to the authored
+        // limit it is checked against, so a failure names its own cause.
+        std::printf(
+            "avatar gait clock+range: %s (knee flex %.1f deg bends=%d; "
+            "hip x %.1f..%.1f vs [%.0f,%.0f] knee x %.1f..%.1f vs [%.0f,%.0f] "
+            "inRange=%d; %d footfalls vs %d phase cycles (want %.1f) "
+            "coherent=%d, stride %.2f Hz, crouch %.2f vox; "
+            "RAMP climbed %.1f over %.1f vox, %d footfalls knee %.1f "
+            "hip %.1f..%.1f posejump %.1f "
+            "walks=%d, jumpTicks=%d fallTicks=%d clean=%d)\n",
+            (kneeBends && jointsInRange && strideCoherent && rampWalks &&
+             rampNoAirClips) ? "PASS" : "FAIL",
+            kneeFlex, kneeBends ? 1 : 0, hipXLo, hipXHi, hipLimLo, hipLimHi,
+            kneeXLo, kneeXHi, kneeLimLo, kneeLimHi,
+            jointsInRange ? 1 : 0, walkFootfalls, phaseCycles, wantCycles,
+            strideCoherent ? 1 : 0, avatar.StrideRate(), maxCrouch,
+            rampClimb, rampAdvance,
+            rampFootfalls, rampKneeFlex, rampHipLo, rampHipHi, rampWorstJump,
+            rampWalks ? 1 : 0, rampJumpTicks, rampFallTicks,
+            rampNoAirClips ? 1 : 0);
         mobOk = mobOk && avOk;
 
         // Reported separately so a head-look regression cannot hide inside
@@ -1707,6 +2258,22 @@ bool mobOk = false;
       }
     }
   }
+
+  // LEAVE THE WORLD AS THIS GATE FOUND IT — the same restore GateMobBurn
+  // does, and for the same reason (CLAUDE.md rule 7: gates share one World and
+  // the ones after this place fixtures by ABSOLUTE coordinate).
+  //
+  // This gate never needed it while it only spawned mobs. The locomotion pass
+  // added real terrain: a flat stone shelf for the walk fixture and a stone
+  // ramp for the climb, plus whatever the carve subtests ejected. Without the
+  // restore that stone persisted, and `mob-burn` — which passes standalone —
+  // failed in `--suite acceptance` and nowhere else. That is exactly the
+  // ordering trap rule 7 describes, and the cost of finding it is why the
+  // restore belongs here rather than in a comment telling the next person.
+  mobs.Reset();
+  debris.Reset();
+  SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+  ctx.WaitIdle();
 }
 
   // Verdict: the flag the moved body already computed.
@@ -1835,6 +2402,26 @@ Status GateMobBurn(Ctx& c, std::string& detail) {
   // read zero and every assertion failed for a reason that had nothing to do
   // with burning (CLAUDE.md: anchor a fixture, never write an absolute Y).
   IVec3 pchunk{10, 0, 10};
+
+  // ...AND NEVER AN ABSOLUTE X OR Z EITHER, which is the other half of the same
+  // rule and cost this gate a long-standing in-suite failure.
+  //
+  // The Y was anchored; the columns were literals (170, 200, 230, 260). Those
+  // sit comfortably inside the window when the gate runs ALONE, because the
+  // origin is still {0,0,0}. In a full run `streaming` has already walked the
+  // player out and left the origin ~20 chunks along x — so every fixture landed
+  // OUTSIDE the residency window, where world writes are dropped and reactions
+  // never run. The symptom was a whole gate of zeroes (0 alight, 0 fire ops,
+  // 0 indexed cells) that passed perfectly on its own: exactly the trap
+  // selftest.h's ordering note describes, in the file that already quoted it.
+  //
+  // `inset` keeps the original spacing, so the fixtures stay as far apart from
+  // each other as they were — they must not share terrain, and one of them
+  // lights a sustained blaze.
+  const IVec3 wOrg = world.WindowOrigin();
+  auto fixture = [&](int inset) {
+    return IVec3{wOrg.x * (int)kChunk + inset, 0, wOrg.z * (int)kChunk + inset};
+  };
   // One tick of the real thing. `soakMat` fills the mob's own box every tick (a
   // sustained blaze, or a bath of acid). The ops the MOB emitted are counted
   // BEFORE the fixture adds its own, so "the limb emitted fire into the grid"
@@ -1879,9 +2466,10 @@ Status GateMobBurn(Ctx& c, std::string& detail) {
     mobs.Reset();
     SubmitWorldgen(ctx, world, sim, kDefaultSeed);
     ctx.WaitIdle();
-    const int h = World::TerrainHeight(170, 170, kDefaultSeed);
-    pchunk = IVec3{170 / 16, h / 16, 170 / 16};
-    const uint64_t id = mobs.Spawn(wizDef, {170, h + 1, 170});
+    const IVec3 site = fixture(170);
+    const int h = World::TerrainHeight(site.x, site.z, kDefaultSeed);
+    pchunk = IVec3{site.x >> 4, h >> 4, site.z >> 4};
+    const uint64_t id = mobs.Spawn(wizDef, {site.x, h + 1, site.z});
     if (id) {
       const uint32_t cloth0 = census(id, mCloth), skin0 = census(id, mSkin);
       const uint32_t fireOps0 = mobFireOps;
@@ -1908,9 +2496,10 @@ Status GateMobBurn(Ctx& c, std::string& detail) {
     mobs.Reset();
     SubmitWorldgen(ctx, world, sim, kDefaultSeed);
     ctx.WaitIdle();
-    const int h = World::TerrainHeight(200, 200, kDefaultSeed);
-    pchunk = IVec3{200 / 16, h / 16, 200 / 16};
-    const uint64_t id = mobs.Spawn(wizDef, {200, h + 1, 200});
+    const IVec3 site = fixture(200);
+    const int h = World::TerrainHeight(site.x, site.z, kDefaultSeed);
+    pchunk = IVec3{site.x >> 4, h >> 4, site.z >> 4};
+    const uint64_t id = mobs.Spawn(wizDef, {site.x, h + 1, site.z});
     if (!id) {
       detail = "spawn refused";
       return Status::Fail;
@@ -2006,6 +2595,115 @@ Status GateMobBurn(Ctx& c, std::string& detail) {
     debris.Reset();
   }
 
+  // ---- H. FIRE EATS BEFORE IT TAKES, AND WHAT IT LEAVES IS CHAR -----------
+  // Subtest F asserts the burn FRONT reaches zero, and that is a different
+  // claim: the front is a list of cells in the burn INDEX, and every carve
+  // throws the index away. Both of the bugs pinned here made F pass.
+  //
+  //   1. The front hit zero because the index had been dropped, not because
+  //      anything stopped burning. The cheap gate at the top of BurnOneLimb
+  //      ("nothing hot nearby and an empty front") then refused to rebuild it,
+  //      so the body's cloth_burning / flesh_burning voxels never rolled their
+  //      decay again: a character left permanently sheathed in flame that had
+  //      nothing left to burn. Only a MATERIAL census sees this, which is why
+  //      that is what is asserted, and why it is taken over the DEBRIS too --
+  //      a corpse is bodies, not limbs, and a mob-only census goes quiet the
+  //      moment the mob does.
+  //
+  //   2. Carve damage was charged CUMULATIVELY (Mob::CarveLimb): `at0 -
+  //      nowCount` is everything the limb has EVER lost, so N carves cost
+  //      N(N+1)/2. Burning flushes every max(12, n>>6) voxels removed, so a
+  //      burning limb carves dozens of times and reached hp 0 having lost about
+  //      14% of its volume. Every fire dismembered.
+  //
+  // The second claim is stated as an INVARIANT rather than as "the creature
+  // survives", because a wizard whose whole robe burns is authored to die (see
+  // the clothing-layer note in reactions.json) and a fixture tuned to keep it
+  // alive would be testing the fixture. What must never happen is a limb
+  // leaving while it is still mostly there: the geometric floor is
+  // kLimbCollapseFraction (25% left) and the hp floor at
+  // kCarveDamagePerVolume 1.5 is 33% left, so 50% is a bound both routes clear
+  // comfortably and the cumulative bug (86% left) misses by a mile.
+  {
+    debris.Reset();
+    mobs.Reset();
+    SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+    ctx.WaitIdle();
+    const IVec3 site = fixture(230);
+    const int h = World::TerrainHeight(site.x, site.z, kDefaultSeed);
+    pchunk = IVec3{site.x >> 4, h >> 4, site.z >> 4};
+    const uint64_t id = mobs.Spawn(wizDef, {site.x, h + 1, site.z});
+    if (!id) {
+      detail = "spawn refused";
+      return Status::Fail;
+    }
+    for (int i = 0; i < 12; i++) burnTick(id, 0, 0);  // settle onto the ground
+
+    // NO WORLD FIRE. The soak box the other subtests use keeps relighting the
+    // body, and a non-empty `scanHot` means the cheap gate never runs at all --
+    // the index is rebuilt every tick and the frozen-material case cannot
+    // occur. Igniting a patch and then leaving the creature alone is the whole
+    // point: this is the "you walked out of the fire" case.
+    int armLimb = -1;
+    for (int li = 0; li < nLimbs; li++)
+      if (mobs.Defs()[wizDef].limbs[li].name == "armU.L") armLimb = li;
+    const uint32_t lit =
+        armLimb >= 0 ? mobs.IgniteLimb(id, armLimb, 60u, mCloth) : 0u;
+
+    auto alightOnMob = [&]() {
+      return mobs.IsAlive(id) ? census(id, mClothBurn) + census(id, mBurning)
+                              : 0u;
+    };
+    auto alightInWorld = [&]() {
+      return alightOnMob() + debris.TotalBodyMaterial(mClothBurn) +
+             debris.TotalBodyMaterial(mBurning);
+    };
+
+    // THE INVARIANT IS MEASURED WHERE IT HAPPENS. Inferring "a limb came off
+    // while it was still mostly there" from outside cannot be made to work:
+    // Die() detaches every limb at once, DetachLimb cascades to a limb's
+    // children (so a healthy forearm "comes off" whenever its upper arm does),
+    // and a limb can lose half of itself to a connectivity split inside the
+    // same tick it is cut. Three attempts at an external metric each measured
+    // one of those instead of the claim. MobSystem records it at the cut.
+    mobs.ClearSeverStats();
+    uint32_t peakAlight = 0;
+    int deathTick = -1;
+    for (int i = 0; i < 630; i++) {
+      burnTick(id, 0, 0);
+      peakAlight = std::max(peakAlight, alightInWorld());
+      if (deathTick < 0 && !mobs.IsAlive(id)) deathTick = i;
+    }
+    const bool died = deathTick >= 0;
+    const float worstSever = mobs.WorstSeverFraction();
+    const std::string worstName = mobs.WorstSeverLimb();
+
+    const uint32_t stillAlight = alightInWorld();
+    const uint32_t charred =
+        (mobs.IsAlive(id) ? census(id, mClothChar) + census(id, mCharred) : 0u) +
+        debris.TotalBodyMaterial(mClothChar) + debris.TotalBodyMaterial(mCharred);
+
+    const bool wasLit = lit > 0 && peakAlight > 0;
+    const bool out = stillAlight == 0;      // claim 1: nothing still burning
+    const bool charOk = charred > 0;        // it charred rather than vanishing
+    const bool ate = worstSever <= 0.5f;    // claim 2: fire eats before it takes
+    const bool hOk = wasLit && out && charOk && ate;
+    std::printf(
+        "  burn leaves char: %s (%u lit, peak %u alight -> %u after 630 quiet "
+        "ticks, %u charred; worst sever %s at %.0f%% of spawn volume, floor "
+        "50%%; %s)\n",
+        hOk ? "PASS" : "FAIL", lit, peakAlight, stillAlight, charred,
+        worstSever < 0.0f ? "(nothing severed)" : worstName.c_str(),
+        worstSever < 0.0f ? 0.0f : worstSever * 100.0f,
+        died ? ("creature died at t+" + std::to_string(deathTick)).c_str()
+             : "creature survived");
+    std::fflush(stdout);
+    ok = ok && hOk;
+    mobs.Reset();
+    debris.Reset();
+  }
+
+
   // ---- G. a SEVERED burning limb keeps burning, and so does a corpse -------
   // DebrisSystem::BurnBodies refused micro bodies outright until this package,
   // for two reasons that had both expired: the copy-on-write brick pool shipped
@@ -2021,9 +2719,10 @@ Status GateMobBurn(Ctx& c, std::string& detail) {
     mobs.Reset();
     SubmitWorldgen(ctx, world, sim, kDefaultSeed);
     ctx.WaitIdle();
-    const int h = World::TerrainHeight(260, 260, kDefaultSeed);
-    pchunk = IVec3{260 / 16, h / 16, 260 / 16};
-    const uint64_t id = mobs.Spawn(wizDef, {260, h + 1, 260});
+    const IVec3 site = fixture(260);
+    const int h = World::TerrainHeight(site.x, site.z, kDefaultSeed);
+    pchunk = IVec3{site.x >> 4, h >> 4, site.z >> 4};
+    const uint64_t id = mobs.Spawn(wizDef, {site.x, h + 1, site.z});
     uint32_t adopted = 0, before = 0, after = 0, bodies = 0;
     if (id) {
       for (int i = 0; i < 12; i++) burnTick(id, 0, 0);
@@ -2062,9 +2761,10 @@ Status GateMobBurn(Ctx& c, std::string& detail) {
     mobs.Reset();
     SubmitWorldgen(ctx, world, sim, kDefaultSeed);
     ctx.WaitIdle();
-    const int h = World::TerrainHeight(230, 230, kDefaultSeed);
-    pchunk = IVec3{230 / 16, h / 16, 230 / 16};
-    const uint64_t id = mobs.Spawn(wizDef, {230, h + 1, 230});
+    const IVec3 site = fixture(230);
+    const int h = World::TerrainHeight(site.x, site.z, kDefaultSeed);
+    pchunk = IVec3{site.x >> 4, h >> 4, site.z >> 4};
+    const uint64_t id = mobs.Spawn(wizDef, {site.x, h + 1, site.z});
     uint32_t before = 0, after = 0;
     if (id) {
       for (int i = 0; i < 10; i++) burnTick(id, 0, 0);
@@ -2099,15 +2799,17 @@ Status GateMobBurn(Ctx& c, std::string& detail) {
     int avDef = -1;
     for (size_t i = 0; i < mobs.Defs().size(); i++)
       if (mobs.Defs()[i].name == avDefName) avDef = (int)i;
-    const int h = World::TerrainHeight(300, 300, kDefaultSeed);
-    pchunk = IVec3{300 / 16, h / 16, 300 / 16};
+    const IVec3 site = fixture(300);
+    const int h = World::TerrainHeight(site.x, site.z, kDefaultSeed);
+    pchunk = IVec3{site.x >> 4, h >> 4, site.z >> 4};
     PlayerAvatar avatar;
     avatar.Init(&c.phys, &world, &debris, mats, &mobs);
     if (avDef >= 0) avatar.SetDefs(&mobs.Defs(), avDefName);
     Player pl;
     pl.fly = false;
     pl.grounded = true;
-    pl.pos = Vec3{300.5f, (float)(h + 2) + Player::kHalfY, 300.5f};
+    pl.pos = Vec3{(float)site.x + 0.5f, (float)(h + 2) + Player::kHalfY,
+                  (float)site.z + 0.5f};
     const bool spawned = avDef >= 0 && avatar.Spawn(pl, 0.0f);
     const int nParts = spawned ? (int)mobs.Defs()[avDef].limbs.size() : 0;
     auto avCensus = [&](uint32_t mat) {
@@ -2129,7 +2831,7 @@ Status GateMobBurn(Ctx& c, std::string& detail) {
       for (const CellOp& op : cellOps)
         if ((op.word & 0xFFFu) == mFire) avFireOps++;
       if (soakMat) {
-        const IVec3 b{300, h + 1, 300};
+        const IVec3 b{site.x, h + 1, site.z};
         for (int dy = -2; dy <= 18; dy++)
           for (int dz = -3; dz <= 3; dz++)
             for (int dx = -3; dx <= 3; dx++) {
@@ -2152,26 +2854,36 @@ Status GateMobBurn(Ctx& c, std::string& detail) {
       avatar.PostStep();
     };
 
-    uint32_t idleFront = 0, cloth0 = 0, peakAlight = 0, peakChar = 0;
-    float clothLost = 0;
+    // WHAT "BURNS" MEANS DEPENDS ON WHAT THE AVATAR IS MADE OF, and this
+    // subtest must not assume the player is dressed. `human`, the stock base
+    // body, is ONE material (flesh) everywhere with its colours in an art layer
+    // — a cloth census on it is legitimately 0, and asserting cloth here would
+    // fail a perfectly correct rig for the crime of wearing nothing. The claim
+    // this subtest owns is narrower than it looks: that the avatar's OWN BODY
+    // is wired into the same burn pass mobs use. So it measures the body mass
+    // the rig actually has, cloth plus flesh. The cloth-goes-FIRST ordering is
+    // a separate claim and is asserted on the wizard above, which wears a robe.
+    uint32_t idleFront = 0, body0 = 0, cloth0 = 0, peakAlight = 0, peakChar = 0;
+    float bodyLost = 0;
     if (spawned) {
       for (int i = 0; i < 10; i++) avTick(0);
       idleFront = avBurning();            // an idle player must cost nothing
       cloth0 = avCensus(mCloth);
-      uint32_t lastCloth = cloth0;
+      body0 = cloth0 + avCensus(mSkin);
+      uint32_t lastBody = body0;
       for (int i = 0; i < 90 && avatar.Spawned() && avatar.IsAlive(); i++) {
         avTick(mFire);
-        const uint32_t cl = avCensus(mCloth);
-        if (cl) lastCloth = cl;
+        const uint32_t bd = avCensus(mCloth) + avCensus(mSkin);
+        if (bd) lastBody = bd;
         peakAlight = std::max(peakAlight,
                               avCensus(mClothBurn) + avCensus(mBurning));
         peakChar = std::max(peakChar, avCensus(mClothChar) + avCensus(mCooked) +
                                           avCensus(mCharred));
       }
-      clothLost = cloth0 ? (float)(cloth0 - lastCloth) / (float)cloth0 : 0.0f;
+      bodyLost = body0 ? (float)(body0 - lastBody) / (float)body0 : 0.0f;
     }
-    const bool hOk = spawned && idleFront == 0 && cloth0 > 0 &&
-                     clothLost > 0.05f && peakAlight > 0 && peakChar > 0 &&
+    const bool hOk = spawned && idleFront == 0 && body0 > 0 &&
+                     bodyLost > 0.05f && peakAlight > 0 && peakChar > 0 &&
                      avFireOps > 0;
     uint32_t indexed = 0;
     for (int i = 0; i < nParts; i++) indexed += avatar.PartBurnIndexCells(i);
@@ -2179,11 +2891,11 @@ Status GateMobBurn(Ctx& c, std::string& detail) {
     // pass never even saw anything reactive next to the player (a CPU-mirror
     // problem), non-zero with nothing alight means it saw and did not react (a
     // rules problem). They have completely different causes.
-    std::printf("  player burns: %s (idle front %u, cloth %u -> %.0f%% gone, "
-                "peak %u alight / %u charred, %u fire ops; %d parts, %u bodies,"
-                " %u indexed cells)\n",
-                hOk ? "PASS" : "FAIL", idleFront, cloth0, clothLost * 100.0f,
-                peakAlight, peakChar, avFireOps, nParts,
+    std::printf("  player burns: %s (idle front %u, body %u of which cloth %u "
+                "-> %.0f%% gone, peak %u alight / %u charred, %u fire ops; "
+                "%d parts, %u bodies, %u indexed cells)\n",
+                hOk ? "PASS" : "FAIL", idleFront, body0, cloth0,
+                bodyLost * 100.0f, peakAlight, peakChar, avFireOps, nParts,
                 avatar.LimbBodyCount(), indexed);
                 std::fflush(stdout);
     ok = ok && hOk;
@@ -2206,6 +2918,18 @@ Status GateMobBurn(Ctx& c, std::string& detail) {
 
 const std::vector<Gate>& MobGates() {
   static const std::vector<Gate> g = {
+      // THE GAIT AND AVATAR GATE, re-registered. It was dropped by ec764e8
+      // ("test cleanup") which emptied this list but left GateMob and its
+      // ~1200 lines of pose assertions in the file — so every claim in there
+      // (legs alternate, legs not splayed, legs not inverted in a fall, arms
+      // swing, pose continuity on ragged ground) has been dead code, compiled
+      // and never called, ever since. Nothing pointed at it: `--gate mob`
+      // answered "no such gate", which reads as a typo rather than as a gate
+      // that used to exist.
+      //
+      // Draws: the micro-body view sweep renders the critter from 14 angles
+      // into the shared offscreen target.
+      {"mob", "mob", {}, false, GateMob, /*needsRender=*/true},
       // Per-voxel body reactivity. No render: every claim is a count.
       {"mob-burn", "mob", {}, false, GateMobBurn, /*needsRender=*/false},
   };

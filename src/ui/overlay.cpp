@@ -16,14 +16,21 @@
 #include "gpu/rhi_vk.h"
 #include "gpu/rhi_vulkan.h"
 #include "sim/world.h"   // kWindPrimCap for the primitive panel
+#include "ui/inventory_ui.h"
+#include "ui/theme.h"
 
 bool Overlay::Init(GLFWwindow* window, const rhi::Device& device,
-                   rhi::TextureFormat format) {
+                   rhi::TextureFormat format, const std::string& assetDir) {
   IMGUI_CHECKVERSION();
   ImGui::CreateContext();
-  ImGui::StyleColorsDark();
-  ImGui::GetStyle().Alpha = 0.92f;
+  ui::ApplyFantasyTheme();
   if (!ImGui_ImplGlfw_InitForOther(window, true)) return false;
+  {
+    std::string cerr;
+    if (!ui::LoadChrome(assetDir, cerr))
+      std::fprintf(stderr, "ui/chrome: %s (panels will draw plain)\n",
+                   cerr.c_str());
+  }
 
   vk::Backend* be = rhi::vkr::NativeBackend(device);
   if (!be) return false;
@@ -60,13 +67,67 @@ bool Overlay::Init(GLFWwindow* window, const rhi::Device& device,
   info.PipelineInfoMain.PipelineRenderingCreateInfo.pColorAttachmentFormats = &colorFmt;
   info.PipelineInfoMain.PipelineRenderingCreateInfo.depthAttachmentFormat =
       VK_FORMAT_D32_SFLOAT;
-  return ImGui_ImplVulkan_Init(&info);
+  if (!ImGui_ImplVulkan_Init(&info)) return false;
+
+  // ---- the one sampler (character-panel portrait) --------------------------
+  // NEAREST + CLAMP, and both halves matter. The portrait is rendered at a
+  // fixed offscreen size and displayed at an integer multiple of it, so linear
+  // filtering would buy nothing but blur — and the whole look here is pixels
+  // on a whole-number grid. Clamp because a portrait is not tiled and an edge
+  // that wraps is a visible seam.
+  //
+  // Resolved through InstanceProc rather than a DeviceFns row: the engine
+  // loads Vulkan dynamically (VK_NO_PROTOTYPES) and DeviceFns carries only the
+  // entry points the SIM needs. One sampler created once, in the one file
+  // allowed to name Vulkan handles at all, does not earn a row in that table.
+  device_ = be;
+  auto createSampler =
+      (PFN_vkCreateSampler)be->InstanceProc("vkCreateSampler");
+  if (createSampler) {
+    VkSamplerCreateInfo si{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+    si.magFilter = si.minFilter = VK_FILTER_NEAREST;
+    si.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+    si.addressModeU = si.addressModeV = si.addressModeW =
+        VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    si.maxLod = 1.0f;
+    VkSampler smp = VK_NULL_HANDLE;
+    if (createSampler(be->Device(), &si, nullptr, &smp) == VK_SUCCESS)
+      sampler_ = (uint64_t)smp;
+  }
+  if (!sampler_)
+    std::fprintf(stderr,
+                 "ui: no sampler — the character portrait will draw empty\n");
+  return true;
+}
+
+uint64_t Overlay::RegisterTexture(const rhi::TextureView& view) {
+  VkImageView iv = rhi::vkr::NativeImageView(view);
+  if (!iv || !sampler_) return 0;
+  // SHADER_READ_ONLY_OPTIMAL: the recorder leaves a colour attachment in that
+  // layout after the pass that wrote it, which is the whole reason the
+  // portrait can be sampled without an explicit transition here.
+  VkDescriptorSet ds = ImGui_ImplVulkan_AddTexture(
+      (VkSampler)sampler_, iv, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+  return (uint64_t)ds;
+}
+
+void Overlay::UnregisterTexture(uint64_t id) {
+  if (id) ImGui_ImplVulkan_RemoveTexture((VkDescriptorSet)id);
+}
+
+bool Overlay::WantsMouse() const { return ImGui::GetIO().WantCaptureMouse; }
+bool Overlay::WantsKeyboard() const {
+  return ImGui::GetIO().WantCaptureKeyboard;
 }
 
 void Overlay::BeginFrame() {
   ImGui_ImplVulkan_NewFrame();
   ImGui_ImplGlfw_NewFrame();
   ImGui::NewFrame();
+  // AFTER NewFrame: ImGui may have created or resized its texture during font
+  // baking, and the chrome rects have to be re-blitted when it does (ui/theme.h
+  // "THE ONE HAZARD").
+  ui::RefreshChrome();
 }
 
 // ---- the player-facing HUD --------------------------------------------------
@@ -82,6 +143,7 @@ void Overlay::BeginFrame() {
 // pools get one bar each and the cost is shown as drain off the right end of
 // whichever pool will pay it.
 void Overlay::DrawHUD(const UIState& s) {
+  ImGui::PushFont(ui::FontSmall());
   ImDrawList* d = ImGui::GetForegroundDrawList();
   const ImVec2 disp = ImGui::GetIO().DisplaySize;
 
@@ -146,6 +208,7 @@ void Overlay::DrawHUD(const UIState& s) {
     d->AddText(ImVec2(tp.x + 1, tp.y + 1), IM_COL32(0, 0, 0, 190), dead);
     d->AddText(tp, IM_COL32(255, 70, 60, 255), dead);
   }
+  ImGui::PopFont();
 }
 
 // ---- the body-condition stick figure ----------------------------------------
@@ -277,14 +340,25 @@ float Overlay::DrawBodyFigure(const UIState& s, float x, float yBottom) {
 }
 
 void Overlay::Draw(UIState& s) {
-  // crosshair
-  ImDrawList* dl = ImGui::GetForegroundDrawList();
-  ImVec2 c = ImGui::GetIO().DisplaySize;
-  c.x *= 0.5f;
-  c.y *= 0.5f;
-  dl->AddCircleFilled(c, 2.5f, IM_COL32(255, 255, 255, 200));
+  // The character screen owns the frame while it is open: no crosshair (the
+  // cursor is free), and it is drawn BEFORE the dev panel so the dev panel
+  // stays reachable on top of it — F1 is not supposed to become unavailable
+  // just because a menu is up.
+  if (s.inventoryOpen) {
+    ImGui::PushFont(ui::FontLarge());
+    DrawInventoryScreen(s);
+    ImGui::PopFont();
+  } else {
+    ImDrawList* dl = ImGui::GetForegroundDrawList();
+    ImVec2 c = ImGui::GetIO().DisplaySize;
+    c.x *= 0.5f;
+    c.y *= 0.5f;
+    dl->AddCircleFilled(c, 2.5f, IM_COL32(255, 255, 255, 200));
+  }
 
   if (!s.visible) return;
+
+  ImGui::PushFont(ui::FontSmall());
 
   ImGui::SetNextWindowPos(ImVec2(12, 12), ImGuiCond_FirstUseEver);
   ImGui::SetNextWindowSize(ImVec2(340, 0), ImGuiCond_FirstUseEver);
@@ -540,9 +614,9 @@ void Overlay::Draw(UIState& s) {
   ImGui::Checkbox("active voxels", &s.showDirtyVoxels);
   if (ImGui::IsItemHovered())
     ImGui::SetTooltip(
-        "Red wireframe on every voxel that MOVED this tick (has a fresh\n"
-        "stamp). Shows exactly which cells are triggering a chunk's dirty\n"
-        "flag. Combine with F6 (dirty chunks) to see cause and effect.");
+        "Red wireframe on every voxel the CA wrote this tick. Filled\n"
+        "GPU-side so there is no snapshot lag or stamp aliasing.\n"
+        "Combine with F6 (dirty chunks) to see cause and effect.");
   ImGui::Checkbox("wind field (F4)", &s.showWindField);
   if (ImGui::IsItemHovered())
     ImGui::SetTooltip(
@@ -910,6 +984,8 @@ void Overlay::Draw(UIState& s) {
     }
     ImGui::End();
   }
+
+  ImGui::PopFont();
 }
 
 void Overlay::Render(const rhi::RenderPass& pass) {
@@ -917,7 +993,27 @@ void Overlay::Render(const rhi::RenderPass& pass) {
   ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), rhi::vkr::NativeCmd(pass));
 }
 
+void Overlay::RenderRecorded(const rhi::RenderPass& pass) {
+  // GetDrawData() stays valid until the next NewFrame, so replaying it costs
+  // nothing but the draw calls.
+  if (ImDrawData* d = ImGui::GetDrawData())
+    ImGui_ImplVulkan_RenderDrawData(d, rhi::vkr::NativeCmd(pass));
+}
+
 void Overlay::Shutdown() {
+  if (sampler_ && device_) {
+    vk::Backend* be = (vk::Backend*)device_;
+    auto destroySampler =
+        (PFN_vkDestroySampler)be->InstanceProc("vkDestroySampler");
+    // Every ImGui descriptor pointing at this sampler dies with the backend's
+    // pool in the Shutdown below, and the device is idle by the time main.cpp
+    // reaches here (ctx.WaitIdle precedes it), so no in-flight command buffer
+    // can still reference it.
+    if (destroySampler) destroySampler(be->Device(), (VkSampler)sampler_,
+                                       nullptr);
+    sampler_ = 0;
+    device_ = nullptr;
+  }
   ImGui_ImplVulkan_Shutdown();
   ImGui_ImplGlfw_Shutdown();
   ImGui::DestroyContext();

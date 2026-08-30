@@ -1,6 +1,7 @@
 #include "sim/world.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 
 #include "gpu/resources.h"
@@ -227,6 +228,12 @@ void World::Init(const rhi::Device& device) {
   snap_.occStain.assign(kNumChunks, 0);
   snap_.fluidBlocks.assign(kFluidBlocks, 0);
   snap_.fluidMirror.assign(27ull * kChunkVol, 0);
+
+  // SANDVOX_GPUMEM=1 prints the buffer budget. Here rather than at exit because
+  // this is where every window- and cascade-sized allocation has just happened
+  // (the page pool, the far-field levels, the fluid scratch), and those are the
+  // ones a sizing decision turns on.
+  if (getenv("SANDVOX_GPUMEM")) DumpGpuBufferBudget("after World::Init");
 }
 
 void World::RequestChunkFetch(IVec3 worldChunk) {

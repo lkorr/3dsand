@@ -1578,15 +1578,24 @@ constexpr int kFluidRenderPadVox = 2 * (int)kChunk;
 // cascade. Those two constants trade horizon distance against near coverage;
 // only kFarN trades memory against detail.
 //
-// At kFarN=256 and 1080p/70deg that constant was ~6 px per cell, which is the
+// At kFarN=256 and 1080p/70deg that constant was ~6 px per cell, which was the
 // LOD's real weakness: every cascade cell is a visible 6-pixel block, so a
 // distant structure is quantised ~6x coarser than the screen can resolve and
 // visibly restructures as it crosses into the residency window. 512 halves
 // that to ~3 px, for 8x the per-level memory (kFarN^3).
 //
-// That 8x is paid for by DROPPING LEVELS, not by adding VRAM: see kFarLevels.
-constexpr uint32_t kFarN = 256;
-constexpr uint32_t kFarNChunk = kFarN / kChunk;  // 16
+// 512 SHIPS as of 2026-08-29, and it was paid for with VRAM rather than by
+// dropping levels — see kFarLevels for why that trade went the other way than
+// the comment there used to assume. Measured with SANDVOX_GPUMEM=1: farVox
+// 128.00 -> 1024.00 MiB, World::Init total 793.72 -> 1690.59 MiB.
+//
+// This matters MOST for authored content, which is the thing the cascades
+// serve worst: a cascade cell is POINT-SAMPLED at the fine voxel in its centre
+// (see farSurfaceMat in worldgen.wgsl), so a structure is representable at
+// level k only if its extent reaches a whole cell. Halving the cell size
+// halves the size of the smallest building that survives the horizon.
+constexpr uint32_t kFarN = 512;
+constexpr uint32_t kFarNChunk = kFarN / kChunk;  // 32
 constexpr uint32_t kFarNumChunks = kFarNChunk * kFarNChunk * kFarNChunk;
 // Fill-queue entries pack (level-1) above a chunk SLOT index. The shift must
 // be wide enough for kFarNumChunks slots — it was hardcoded to 12 (exactly
@@ -1612,16 +1621,24 @@ constexpr uint32_t kFarShiftAlign = [] {
 static_assert(kWorldN >= kFarN && (kFarN << kFarShiftAlign) == kWorldN,
               "kFarN must divide kWorldN by a power of two");
 constexpr uint32_t kFarShiftBase = kFarShiftAlign;
-// 6 levels at kFarN=512: outermost half-extent 1638 m at the 512 window and
-// 10 cm voxels, farVox = 6 x 128 MiB = 768 MiB.
+// 8 levels at kFarN=512: outermost half-extent 6554 m at the 512 window and
+// 10 cm voxels, farVox = 8 x 128 MiB = 1024 MiB (measured, not derived:
+// SANDVOX_GPUMEM=1).
 //
-// Two levels were REMOVED to pay for the resolution above, and the horizon
-// they carried (6554 m) is worth much less than it sounds: fog is pinned so
-// opacity reaches ~99% at the outermost half-extent, so level 7 sat behind
-// ~90% fog and level 8 behind ~99%. Dropping them trades terrain almost
-// nobody can see for 2x the angular detail on the terrain everyone looks at.
-// Raising this back to 8 is legal (it costs 256 MiB more) if the horizon ever
-// matters more than the near detail — the fog pin follows automatically.
+// This block previously described a 6-level configuration that was never the
+// one building — it read "Two levels were REMOVED to pay for the resolution
+// above" while the code sat at kFarN=256 and kFarLevels=8, i.e. it documented
+// neither the old resolution nor the old level count. It is rewritten to the
+// shipped configuration; do not restore that text.
+//
+// Dropping to 6 IS still the cheap escape if VRAM ever gets tight: it costs
+// 2 x 128 MiB = 256 MiB and pulls the horizon 6554 m -> 1638 m, which is worth
+// less than it sounds because fog is pinned so opacity reaches ~99% at the
+// outermost half-extent — level 7 sits behind ~90% fog and level 8 behind
+// ~99%. The fog pin follows kFarLevels automatically. The reason it was NOT
+// taken here is that the resolution bump is a fixed 896 MiB either way and an
+// 8 GiB card has the room, so paying for the horizon a second time with detail
+// nobody can see was the worse of the two trades.
 constexpr uint32_t kFarLevels = 8;
 static_assert((uint64_t)kFarLevels * kFarVox < (1ull << 32),
               "farVox byte indices must fit u32");

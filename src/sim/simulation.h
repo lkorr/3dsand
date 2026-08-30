@@ -7,6 +7,7 @@
 #include "sim/microbody.h"
 #include "sim/microvox.h"
 #include "sim/pass_table.h"
+#include "sim/treeatlas.h"
 #include "sim/world.h"
 
 // Owns the compute pipelines + bind groups and records the fixed-tick GPU
@@ -19,7 +20,7 @@ class Simulation {
   bool Init(const rhi::Device& device, World& world,
             const std::vector<MaterialDef>& mats,
             const std::vector<ReactionGpu>& reactions, const MicroSet& micro,
-            const std::string& shaderDir);
+            const TreeAtlas& trees, const std::string& shaderDir);
 
   // Recompile all WGSL from disk; returns false (keeping old pipelines) on
   // compile error.
@@ -187,6 +188,19 @@ class Simulation {
                                           const rhi::TextureView& target,
                                           rhi::TextureFormat format,
                                           uint32_t width, uint32_t height);
+  // Same pass, on the SECOND depth cache and with a caller-chosen clear
+  // colour. For an offscreen pass drawn in the same frame as the main one at a
+  // different size — today the character panel's avatar portrait.
+  //
+  // It exists as its own entry point rather than as a parameter on
+  // BeginRenderPass because the reason is not the clear colour, it is the
+  // DEPTH CACHE: EnsureDepth keys on (width, height) alone, so alternating a
+  // 448x640 portrait with a 1600x900 frame through one cache recreates a
+  // full-screen depth texture twice every frame the panel is open.
+  rhi::RenderPass BeginAuxRenderPass(const rhi::CommandEncoder& enc,
+                                     const rhi::TextureView& target,
+                                     rhi::TextureFormat format, uint32_t width,
+                                     uint32_t height, const float clear[4]);
   void DrawWorld(const rhi::RenderPass& pass);
   void DrawParticles(const rhi::RenderPass& pass);
   // MLS-MPM fluid prototype: instanced cubes from the fluid particle buffer.
@@ -265,6 +279,7 @@ class Simulation {
  private:
   bool BuildPipelines(const rhi::Device& device, std::string* err);
   void EnsureDepth(uint32_t width, uint32_t height);
+  void EnsureAuxDepth(uint32_t width, uint32_t height);
   void EnsureRenderPipelines(rhi::TextureFormat format);
   // Stamp the cached art palette into a material table being (re)built.
   void ApplyArtPalette(std::vector<MaterialGpu>& table) const;
@@ -293,6 +308,12 @@ class Simulation {
   std::string shaderDir_;
   rhi::Buffer materialBuf_;
   rhi::Buffer reactionBuf_;
+  // The baked tree atlas (src/sim/treeatlas.h): load-time asset data, bound
+  // read-only into simBGL_ and simSlimBGL_ at binding 26. Never rewritten
+  // after Init -- editing a species means re-baking and restarting, exactly
+  // like a change to the material table's SIZE.
+  rhi::Buffer treeAtlasBuf_;
+  size_t treeAtlasWords_ = 0;
   // Art palette RGB (0x00RRGGBB), indexed from kArtPaletteBaseGpu. Cached so a
   // materials hot-reload can restore it — see SetArtPalette.
   std::vector<uint32_t> artPalette_;
@@ -341,6 +362,14 @@ class Simulation {
   rhi::Texture depthTex_;
   rhi::TextureView depthView_;
   uint32_t depthW_ = 0, depthH_ = 0;
+  // SECOND depth target, for a pass whose size is NOT the swapchain's — today
+  // the character panel's avatar portrait (main.cpp). EnsureDepth caches on
+  // size alone, so two differently-sized passes in one frame would destroy and
+  // recreate a full-screen depth texture TWICE PER FRAME while the panel is
+  // open. One extra cache, keyed independently, is the whole fix.
+  rhi::Texture auxDepthTex_;
+  rhi::TextureView auxDepthView_;
+  uint32_t auxDepthW_ = 0, auxDepthH_ = 0;
 
   // Two bind groups: page 0 reads dirty[0]/writes dirty[1], page 1 reversed.
   // Particle groups follow the same paging (b0 = read page, b1 = write page).

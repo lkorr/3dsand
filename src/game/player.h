@@ -159,6 +159,20 @@ class Player {
   // which is also what stops a multi-tick frame applying the same hit 4 times.
   Vec3 impactDeltaV{0, 0, 0};
 
+  // A JUMP WAS ACTUALLY LAUNCHED since this was last drained. Sticky, and
+  // cleared by main.cpp after the tick batch, for exactly the reason
+  // impactDeltaV above is: Update() runs once per FRAME and the avatar consumes
+  // this inside the fixed-tick loop, which runs zero times on most frames at
+  // 60+ fps against a 30 Hz tick. A plain per-frame bool would be false again
+  // before any tick ever read it.
+  //
+  // The avatar's `jump` clip keys on THIS rather than on losing ground contact.
+  // Contact loss is not a jump: stepping off a kerb at 16 voxels/s clears the
+  // 0.12 s air debounce easily, and the clip is an arms-up one-shot, so every
+  // step-down on broken ground threw the arms in the air. Only a launch is a
+  // launch.
+  bool jumped = false;
+
   static constexpr float kHalfXZ = 0.30f / kVoxelMeters;     // 0.6 m wide
   static constexpr float kHalfY = 0.85f / kVoxelMeters;      // 1.7 m tall
   static constexpr float kEyeOffset = 0.65f / kVoxelMeters;  // eyes near the top

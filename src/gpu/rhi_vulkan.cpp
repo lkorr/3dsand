@@ -1172,6 +1172,9 @@ Image* Backend::CreateImage(uint32_t w, uint32_t h, rhi::TextureFormat fmt,
   im->aspect = isDepth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
   im->layout = VK_IMAGE_LAYOUT_UNDEFINED;
   im->label = label ? label : "";
+  // See Image::sampled: a texture something will SAMPLE has to be handed back
+  // in SHADER_READ_ONLY_OPTIMAL, which the recorder does at Finish().
+  im->sampled = ((uint32_t)usage & (uint32_t)rhi::TextureUsage::TextureBinding) != 0;
 
   VkImageCreateInfo ici{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
   ici.imageType = VK_IMAGE_TYPE_2D;

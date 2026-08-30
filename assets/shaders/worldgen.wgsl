@@ -40,6 +40,12 @@
 // drains at the head of the next command buffer, and the deferred writes
 // interleave (see world.cpp).
 @group(0) @binding(19) var<storage, read> pageFillList : array<u32>;
+// The BAKED TREE ATLAS (src/sim/treeatlas.h). Read-only asset data uploaded
+// once at load, like `materials` — see the tree section below for the layout
+// and for why worldgen samples a baked grid instead of evaluating tree shapes.
+// Binding 26 in BOTH simBGL_ and simSlimBGL_: `far`/`fardown` run on the slim
+// group and both reach the tree sampler.
+@group(0) @binding(26) var<storage, read> treeAtlas : array<u32>;
 @group(0) @binding(17) var<storage, read>       pageTable : array<u32>;
 @group(0) @binding(18) var<storage, read_write> pageFaults : array<atomic<u32>>;
 
@@ -83,7 +89,7 @@ const M_SCRUB        : u32 = 73u;   // creosote/sage: passable
 const M_TUSSOCK      : u32 = 74u;   // dry bunchgrass: passable
 const M_HEATH        : u32 = 75u;   // huckleberry/juniper: passable
 const M_CUSHION      : u32 = 76u;   // alpine cushion / lichen crust: passable
-// ---- vines / climbers / hanging moss (materials.json ids 77..80) ----
+// ---- climbers (materials.json ids 77..80) ----
 // These numbers are ARRAY POSITIONS in materials.json (id == index + 1), and
 // they are not the ids this block was authored against: it was reserved 70..76
 // and landed at 77..80 because another agent's block committed in between.
@@ -91,9 +97,10 @@ const M_CUSHION      : u32 = 76u;   // alpine cushion / lichen crust: passable
 // positions, never from what was reserved:
 //   python -c "import json;[print(i+1,m['id']) for i,m in
 //              enumerate(json.load(open('assets/materials/materials.json'))['materials'])]"
-const M_VINE_HANG      : u32 = 77u;
-const M_CREEPER_FLOWER : u32 = 78u;
-const M_MOSS_HANG      : u32 = 79u;
+// vine_hang (77), creeper_flower (78) and moss_hang (79) still EXIST as
+// materials — the brush and the micro models are unchanged — but worldgen no
+// longer places any of them: see the note where treeVineFrom used to be. Ivy is
+// the one climber still generated, and only on arena and ruin WALLS.
 const M_IVY            : u32 = 80u;
 // ---- meadow wildflowers (materials.json ids 65..69) ----
 // Five micro-model species that vary by CLUMP, not per cell: see the ground
@@ -626,6 +633,13 @@ fn inSpawnClearing(x : i32, z : i32) -> bool {
   return x >= 0 && x <= 220 && z >= 0 && z <= 220;
 }
 
+// Does a tree at (wx,wz) with horizontal reach `r` put ANY of itself over the
+// clearing? The trunk being outside is not enough — see the long note at the
+// call site in treeInfoAt.
+fn crownMeetsSpawnClearing(wx : i32, wz : i32, r : i32) -> bool {
+  return wx + r >= 0 && wx - r <= 220 && wz + r >= 0 && wz - r <= 220;
+}
+
 // Inside the clearing, the columns the selftest actually drops bodies onto keep
 // the ORIGINAL bare sand cap instead of the grass-over-stone forest floor.
 // Those fixtures (debris islands at (60,60), the prefab at (80,80), the burn
@@ -945,113 +959,145 @@ fn pondNear(x : i32, z : i32, seed : u32) -> Shore {
 // MIRROR-END height
 
 // ---- trees ----
-// SCALE: every dimension below is written as DECIMETRES and converted with
-// `* VOX_PER_M / 10`, never as a bare voxel count — the first cut of this
-// system used bare counts and produced 10-voxel "oaks" that were 60 cm tall,
-// i.e. knee-high shrubs. If you tune these, tune the metres.
 //
-// VOX_PER_M IS THE WORLD'S OWN VOXELS-PER-METRE and nothing else. It was a
-// hardcoded 16 — correct when a voxel was 6.25 cm, and left behind when
-// world.h moved to kVoxelMeters = 0.10. For that whole interval every tree in
-// the game was 1.6x the metre size its own table documents: the "11.9 m" great
-// oak was 190 voxels of trunk, i.e. 19 m, and TREE_MAX_ABOVE was 278 voxels
-// (18 chunks), which is where the terrain gate's `chunkColSlack` of 20 came
-// from. Reading it from the prelude constant makes the table's metres true
-// again and makes them STAY true at any voxel size.
-//
-// The old comment justified the mismatch as "half real scale, because the
-// window is 256 voxels tall and does not stream in Y". Both halves of that are
-// false now — kWorldN is 512 and Stream::ShiftAxis handles axis 1 — so the
-// constraint it was trading against does not exist.
+// SCALE, for everything below that is still authored as a number rather than
+// baked: dimensions are written as DECIMETRES and converted with
+// `* VOX_PER_M / 10`, never as a bare voxel count — the first cut of the tree
+// system used bare counts and produced 10-voxel "oaks" that were 60 cm tall.
+// VOX_PER_M IS THE WORLD'S OWN VOXELS-PER-METRE, read from the prelude so the
+// tables stay metre-true at any voxel size. (The trees themselves no longer
+// need it: their sizes are metres in assets/trees/*.json and voxels in the
+// baked atlas. The cacti below still do.)
 const VOX_PER_M : i32 = VOXELS_PER_M;
+
+// ---- THE BAKED ATLAS, AND WHY THE IMPLICIT SHAPES ARE GONE ----------------
+//
+// Worldgen is a pure per-cell function: genChunk answers for one voxel with no
+// memory of its neighbours and no way to walk a turtle. Every tree this engine
+// ever grew was therefore an IMPLICIT SHAPE re-derived per cell — a hash-eroded
+// ellipsoid for oak, a diamond cone for pine, a hand-unrolled five-limb
+// skeleton for birch. That is the ceiling of the technique, and it is why the
+// forest read as lollipops.
+//
+// So the trees are voxelized ONCE, offline, by assets/editor/treegen.js: a
+// Weber-Penn branch skeleton stamped as round-cone SDFs, with smooth-min'd
+// ellipsoid leaf clumps at the outer stems and a SHADING BAKE that resolves
+// each leaf voxel's lit/mid/dark tier into a material choice. src/sim/
+// treeatlas.h uploads the result. What is left here is a bounds check, one
+// column lookup and a short run scan.
+//
+// THE EDITOR IS THE ONLY VOXELIZER, deliberately. A WGSL copy of the SDF and
+// clump logic would be a second implementation that has to agree with the
+// first, which is the drift the tuner's "one authoring surface" rule exists to
+// prevent. The price is that editing a species and re-baking MOVES THE WORLD
+// HASH — one `--selftest --rebaseline`, exactly as for tuning.json.
+//
+// WHAT THE ATLAS IS, as words:
+//
+//   header             16 words (TA_H_* below)
+//   species directory  TA_SPECIES_WORDS per species (TA_S_*)
+//   biome table        4 x (1 + speciesCount) cumulative weights
+//   per species:       variant directory (TA_V_*), then per variant a
+//                      column table of (runOffset, runCount) pairs indexed
+//                      [lz * nx + lx], then the runs
+//
+//   run word: material (12 bits) | state (4) | y0 (9) | length (7)
+//
+// Every offset is a WORD INDEX into this buffer, absolute, fixed up by the
+// C++ loader. Material ids are resolved from the file's NAME table at load
+// (design guideline 4), so renumbering materials.json cannot silently recolour
+// a forest. The baked state nibble is IGNORED here: worldgen applies its own
+// positional palette jitter at the bottom of genCellIn, because a voxel word
+// with an authored state cannot be represented by the page table's JITTER
+// sentinel and a forest that defeats page compression is not worth three
+// colours the engine already provides.
+const TA_H_SPECIES_COUNT : u32 = 2u;
+const TA_H_MAX_REACH     : u32 = 4u;
+const TA_H_MAX_ABOVE     : u32 = 5u;
+const TA_H_BIOME_TABLE   : u32 = 6u;
+const TA_H_SPECIES_DIR   : u32 = 7u;
+
+const TA_SPECIES_WORDS : u32 = 24u;
+const TA_S_VARIANT_DIR : u32 = 0u;
+const TA_S_VARIANT_CNT : u32 = 1u;
+const TA_S_REACH       : u32 = 2u;
+const TA_S_ABOVE       : u32 = 3u;
+const TA_S_CROWN_Y     : u32 = 4u;
+const TA_S_CROWN_R     : u32 = 5u;
+const TA_S_MIN_Y       : u32 = 6u;
+const TA_S_MAX_Y       : u32 = 7u;
+const TA_S_MAX_SLOPE   : u32 = 8u;
+const TA_S_SPARSITY    : u32 = 9u;
+const TA_S_CANOPY_MAT  : u32 = 10u;
+const TA_S_SHADE       : u32 = 11u;
+const TA_S_AUTUMN      : u32 = 12u;
+const TA_S_LEAF0       : u32 = 13u;
+const TA_S_AUTUMN0     : u32 = 16u;
+
+const TA_VARIANT_WORDS : u32 = 12u;
+const TA_V_NX      : u32 = 0u;
+const TA_V_NY      : u32 = 1u;
+const TA_V_NZ      : u32 = 2u;
+const TA_V_ANCHORX : u32 = 3u;
+const TA_V_ANCHORZ : u32 = 4u;
+const TA_V_COLUMNS : u32 = 5u;
+
+fn taSpeciesCount() -> i32 { return i32(treeAtlas[TA_H_SPECIES_COUNT]); }
+fn taSpecies(sp : i32, w : u32) -> u32 {
+  return treeAtlas[treeAtlas[TA_H_SPECIES_DIR] + u32(sp) * TA_SPECIES_WORDS + w];
+}
 
 // Placement is per TREE_TILE XZ tile: hash the tile, and it either holds one
 // tree or none. The tile has to be at least as wide as a canopy or trees
-// overlap into mush; at 10 m great oaks that means a 6 m tile, not the 1 m
-// (16-voxel) tile the shrub-sized first cut used.
-// Sized against the widest canopy: a great oak is radius ~67 voxels (4.2 m),
-// so trunks need ~9 m of spacing or every crown swallows its neighbours and
-// the forest becomes one undifferentiated green ceiling. Some overlap is good
-// — that is what closes the canopy — but it has to be overlap, not merger.
-const TREE_TILE : i32 = TUNE_TREE_TILE;         // 9 m between trunk sites
-// How many tiles out to search: a canopy can overhang its own tile by
-// (radius + in-tile jitter), here 67 + 72 = 139 voxels, just under one tile.
-const TREE_SCAN : i32 = 2;           // +-2 tiles, comfortably covers it
+// overlap into mush. Some overlap is good — that is what closes a canopy — but
+// it has to be overlap, not merger.
+const TREE_TILE : i32 = TUNE_TREE_TILE;         // ~14 m between trunk sites
+// How many tiles out to search. See the NINE derivation at TreeCands.
+const TREE_SCAN : i32 = 2;
 //
 // Everything is a pure function of (tile coords, seed) — no state, no
 // scattering pass — so a tree straddling a chunk border generates identically
 // from either chunk, and a chunk evicted and re-entered regrows the same tree.
 
-// ---- BOUNDS on the size table below, for treeAt's cheap rejects ------------
+// ---- BOUNDS, now MEASURED rather than derived ------------------------------
 //
-// These are NOT the rule. Every tile that survives them still goes through the
-// exact per-tile `reach` and `vtop` tests in treeAt, so a bound that is too
-// LOOSE costs a few wasted tile lookups and changes no output. A bound that is
-// too TIGHT shears canopies and MOVES THE WORLD HASH — so if the size table in
-// treeInfo grows a species or a dimension, these must be re-derived upward with
-// it. check_invariants.py asserts they still dominate the table.
-//
-// Why they exist, measured: treeAt ran its 25-tile scan for EVERY air cell
-// above ground, and each tile's treeInfo costs a biomeAt + a baseHeight + a
-// pondAt (~20 hashes) — all of it paid before the `y > vtop` test that rejects
-// it. A cell 300 voxels up in open sky therefore paid ~500 hashes to conclude
-// "no tree here". Under --autofly-surface that was the whole of genChunk's
-// 21 ms per window shift, which the paged streaming path then fences on
-// (docs/PLAN_surface_flight_perf.md B2).
-//
-// The jitter is `j = (hsh >> 12) % 5`, so every maximum below is at j = 4.
-const TREE_MAX_TRUNK_DM : i32 = 95 + 4 * 6;   // great oak, the tallest trunk
-const TREE_MAX_RAD_DM   : i32 = 42 + 4 * 3;   // great oak, the widest crown
-const TREE_BIRCH_RAD_DM : i32 = 22 + 4 * 2;   // birch: the one species whose
-                                              // gate adds a second radius
-const TREE_PINE_TRUNK_DM : i32 = 70 + 4 * 8;  // pine, the second-tallest
-// The widest horizontal `reach` any species can ask for. Birch wins it despite
-// its narrow crown, because its gate is `radius * 5/2 + 4` (a branch skeleton,
-// not a leaf ball).
-const TREE_MAX_REACH : i32 =
-    max(TREE_MAX_RAD_DM * VOX_PER_M / 10 + 2,
-        (TREE_BIRCH_RAD_DM * VOX_PER_M / 10) * 5 / 2 + 4);
-// The tallest a tree cell can sit ABOVE its own trunk's ground, per species —
-// `vtop - base` at maximum jitter. Taken as a max over species rather than by
-// summing the biggest of each dimension, which would be ~35% looser and stop
-// the sky short-circuit from firing at all.
-const TREE_MAX_ABOVE : i32 =
-    max(TREE_MAX_TRUNK_DM * VOX_PER_M / 10 + TREE_MAX_RAD_DM * VOX_PER_M / 10 + 2,
-        max((65 + 4 * 6) * VOX_PER_M / 10
-              + 2 * (TREE_BIRCH_RAD_DM * VOX_PER_M / 10) + 2,
-            TREE_PINE_TRUNK_DM * VOX_PER_M / 10
-              + (24 + 4 * 2) * VOX_PER_M / 10 + 2));
-// A trunk only exists below the treeline (treeInfoAt returns `present = false`
-// at or above it), so that is the highest ground any trunk can stand on and
-// above TREE_MAX_BASE + TREE_MAX_ABOVE there is no tree anywhere in the world,
-// at any seed — one compare replaces the whole scan.
-//
-// This USED to also min() against `baseHeight + hillAmplitude +
-// detailAmplitude`, the top of the terrain band. Package C's octave ladder has
-// no such closed-form ceiling (five centred octaves plus a sediment wedge), and
-// a bound that is too TIGHT shears canopies and moves the world hash. The
-// treeline alone is correct at any relief, and it is the tighter of the two
-// anyway in every configuration the ladder can produce. The hoisted path does
-// not use this at all — `cands.top` is strictly tighter still.
-const TREE_MAX_BASE : i32 = TUNE_TREELINE - 1;
-const TREE_MAX_TOP : i32 = TREE_MAX_BASE + TREE_MAX_ABOVE;
+// The old file carried a hand-maintained table of per-species maxima with a
+// standing warning that a bound too TIGHT shears canopies and moves the world
+// hash. Both numbers are now measured off the baked grids by the bake
+// (`meta.reachXZ` / `meta.above` in treegen.js, asserted per species by
+// scripts/test_treegen.mjs) and reduced to a max by the C++ loader. There is
+// nothing left to keep in sync: the bound is a property of the voxels.
+fn treeMaxAbove() -> i32 { return i32(treeAtlas[TA_H_MAX_ABOVE]); }
+fn treeMaxReach() -> i32 { return i32(treeAtlas[TA_H_MAX_REACH]); }
+// A trunk only exists below the treeline, so that is the highest ground any
+// trunk can stand on; above it plus the tallest species there is no tree
+// anywhere in the world, at any seed — one compare replaces the whole scan.
+// The HOISTED path does not use this at all: `cands.top` is strictly tighter.
+fn treeMaxTop() -> i32 { return TUNE_TREELINE - 1 + treeMaxAbove(); }
 
-// Per-tile tree descriptor, unpacked from one hash.
+// Per-tile tree descriptor. The FULL form, used by the scans that need a
+// species' metadata (undergrowth cover, the far-field canopy proxy); the
+// per-cell path uses the compact TreeCand below.
 struct Tree {
   present : bool,
-  species : u32,   // 0 oak, 1 pine, 2 birch, 3 great oak, 4 bush
+  sp      : i32,   // species index into the atlas, -1 when absent
+  varOff  : u32,   // word offset of this tree's variant directory entry
   wx      : i32,   // trunk world x/z
   wz      : i32,
   base    : i32,   // ground height at the trunk
-  trunk   : i32,   // trunk height in voxels
-  radius  : i32,   // canopy radius
+  rot     : u32,   // 0..3 quarter turns applied to the variant
+  mir     : bool,  // mirrored in x as well
+  reach   : i32,   // horizontal reach of the species, voxels
+  above   : i32,   // vertical reach above `base`
+  crownR  : i32,   // crown proxy radius (far field, undergrowth cover)
+  shade   : i32,   // 0..255 canopy cover cast on the forest floor
+  autumn  : bool,  // this TREE (not this species) wears the autumn ramp
   rnd     : u32,   // spare bits for per-tree jitter
 };
 
-// The HASH-ONLY half of treeInfo: WHERE the trunk stands, and nothing that
-// costs a noise lookup. Split out so treeAt can reject a tile on distance —
-// and then on ground height alone — before paying for the site's biome and
-// pond queries. One hash3 for the whole thing.
+// The HASH-ONLY half: WHERE the trunk stands, and nothing that costs a noise
+// lookup. Split out so the scan can reject a tile on distance — and then on
+// ground height alone — before paying for the site's biome and pond queries.
 struct TreeSite {
   hsh : u32,
   wx  : i32,
@@ -1070,87 +1116,131 @@ fn treeSite(tx : i32, tz : i32, seed : u32) -> TreeSite {
   return s;
 }
 
-// The rest of treeInfo, given a site and the ground height AT that site.
+// The rest of treeInfo, given a site and the LAND at that site.
 //
-// `base` is passed in rather than sampled here because treeAt has already had
-// to know it for its vertical reject, and baseHeight is eight hashes — sampling
-// it twice would be the most expensive thing this function does. It is the same
-// value either way (baseHeight is a pure function of the site), so the split
-// changes no output; treeInfo below is the unchanged one-shot form for the
-// callers that have no reject to do.
-fn treeInfoAt(s : TreeSite, base : i32, seed : u32) -> Tree {
+// `land` is passed in rather than sampled here because the caller has already
+// had to know the ground height for its vertical reject, and landAt is eight
+// hashes — sampling it twice would be the most expensive thing this function
+// does. It carries the SLOPE as well, which costs nothing extra and is what the
+// per-species steepness gate needs: `Land.slope` is the coarse landform
+// gradient (the hill octaves, not the grain), which is the only gradient a
+// slope gate may read — the grain octave crosses a whole gate in one column.
+fn treeInfoAt(s : TreeSite, land : Land, seed : u32) -> Tree {
   var t : Tree;
   t.present = false;
-  t.species = 0u; t.wx = s.wx; t.wz = s.wz; t.base = base;
-  t.trunk = 0; t.radius = 0; t.rnd = s.hsh;
+  t.sp = -1; t.varOff = 0u;
+  t.wx = s.wx; t.wz = s.wz; t.base = land.h;
+  t.rot = 0u; t.mir = false;
+  t.reach = 0; t.above = 0; t.crownR = 0; t.shade = 0; t.autumn = false;
+  t.rnd = s.hsh;
+
+  let ns = taSpeciesCount();
+  if (ns <= 0) { return t; }            // no atlas: a legal, treeless world
 
   let hsh = s.hsh;
-  let biome = biomeAt(t.wx, t.wz, seed);
-  let h = base;
+  let h = land.h;
 
   // No trees on snowfields, in ponds, or over the selftest fixture sites.
   if (h >= TREELINE) { return t; }
-  if (inSpawnClearing(t.wx, t.wz)) { return t; }
   if (pondAt(t.wx, t.wz, seed).y >= 0) { return t; }
+  // (The spawn clearing is checked AFTER the species draw, where the crown's
+  // real width is known — see the note at that test.)
 
-  // density by biome: forest is nearly every tile, meadow is sparse clearing,
+  // Density by biome: forest is nearly every tile, meadow is sparse clearing,
   // desert gets the occasional dead bush.
+  let biome = biomeAt(t.wx, t.wz, seed);
   let roll = (hsh >> 17u) % 100u;
   var chance = 0u;
   if (biome == B_FOREST)      { chance = TUNE_TREE_CHANCE_FOREST; }
   else if (biome == B_PINE)   { chance = TUNE_TREE_CHANCE_PINE; }
   else if (biome == B_MEADOW) { chance = TUNE_TREE_CHANCE_MEADOW; }
-  else                        { chance = TUNE_TREE_CHANCE_DESERT; }   // desert
+  else                        { chance = TUNE_TREE_CHANCE_DESERT; }
   if (roll >= chance) { return t; }
 
-  // species by biome
-  let sroll = (hsh >> 24u) % 100u;
-  if (biome == B_DESERT) {
-    t.species = 4u;                                    // bush
-  } else if (biome == B_PINE) {
-    t.species = select(1u, 0u, sroll < 18u);           // mostly pine
-  } else if (biome == B_MEADOW) {
-    if (sroll < 45u)      { t.species = 4u; }          // bushes
-    else if (sroll < 80u) { t.species = 2u; }          // birch
-    else                  { t.species = 0u; }
-  } else {                                             // forest
-    if (sroll < 46u)      { t.species = 0u; }          // oak
-    else if (sroll < 62u) { t.species = 2u; }          // birch
-    else if (sroll < 76u) { t.species = 1u; }          // pine
-    else if (sroll < 84u) { t.species = 3u; }          // great oak
-    else                  { t.species = 4u; }          // bush
+  // ---- WHICH SPECIES: a weighted draw from the biome's own table -----------
+  // The table is cumulative weights, built by the C++ loader from each
+  // species' authored `placement.biomes` and divided by its `sparsity`. So
+  // adding a species file DILUTES the others rather than needing every table
+  // rewritten, and "where does an oak grow" lives in oak.json and nowhere else.
+  //
+  // ITS OWN HASH, not a bit-slice of `hsh`. Slices of one hash correlate, and
+  // the density roll above is already spending this one — the pond-life block
+  // in this file documents at length what that correlation does to a scatter.
+  let h2 = hash3(seed ^ 0x7BEE6u, bitcast<u32>(s.wx), bitcast<u32>(s.wz));
+  let bt = treeAtlas[TA_H_BIOME_TABLE] + u32(biome) * (1u + u32(ns));
+  let total = treeAtlas[bt];
+  if (total == 0u) { return t; }        // no species wants this biome
+  let pickRoll = h2 % total;
+  var sp = -1;
+  for (var i = 0; i < ns; i++) {
+    if (pickRoll < treeAtlas[bt + 1u + u32(i)]) { sp = i; break; }
   }
+  if (sp < 0) { return t; }
 
-  // Dimensions in TENTHS OF A METRE, converted below — the whole point is that
-  // these read as physical sizes next to a 1.7 m player, not as voxel counts.
-  // Crown radius stays near half the trunk height: taller and the tree reads as
-  // a pole, wider and neighbouring canopies merge into one ceiling.
-  let j = i32((hsh >> 12u) % 5u);   // per-tree size jitter, in 0.1 m steps
-  var trunkDm = 0;
-  var radDm = 0;
-  switch (t.species) {
-    //                        trunk           crown radius
-    case 0u: { trunkDm = 55 + j * 5;  radDm = 28 + j * 2; }   // oak      5.5-7.5 m
-    case 1u: { trunkDm = 70 + j * 8;  radDm = 24 + j * 2; }   // pine     7.0-10 m
-    // Birch is a branch SKELETON, not a crown: `radius` here is the reach of a
-    // primary limb, not the extent of a leaf ball, so it can be generous
-    // without the canopy-merger problem that constrains the round species.
-    case 2u: { trunkDm = 65 + j * 6;  radDm = 22 + j * 2; }   // birch    6.5-9.0 m
-    case 3u: { trunkDm = 95 + j * 6;  radDm = 42 + j * 3; }   // great oak 9.5-12 m
-    default: { trunkDm = 8;           radDm = 9 + j; }        // bush     ~0.8 m
-  }
-  t.trunk = trunkDm * VOX_PER_M / 10;
-  t.radius = radDm * VOX_PER_M / 10;
+  // ---- PLACEMENT GATES ------------------------------------------------------
+  // Altitude band and steepness, per species, from the species file. A gated-out
+  // pick grows NOTHING rather than re-rolling, and that is the point: it is what
+  // thins a forest as the ground steepens and what gives each species its own
+  // treeline, instead of substituting a different tree and keeping the density
+  // flat everywhere.
+  let minY = i32(taSpecies(sp, TA_S_MIN_Y));
+  let maxY = i32(taSpecies(sp, TA_S_MAX_Y));
+  if (minY >= 0 && h < minY) { return t; }
+  if (maxY >= 0 && h > maxY) { return t; }
+  let maxSlope = i32(taSpecies(sp, TA_S_MAX_SLOPE));
+  if (maxSlope > 0 && land.slope > maxSlope) { return t; }
+
+  // ---- WHICH VARIANT, AND HOW IT SITS --------------------------------------
+  // variants x 4 rotations x mirror is 24 appearances from three baked trees,
+  // and the rotation costs two integer swaps at sample time. A third hash for
+  // the same reason as the second.
+  let h3 = hash3(seed ^ 0x7BEE7u, bitcast<u32>(s.wx), bitcast<u32>(s.wz));
+  let vc = max(i32(taSpecies(sp, TA_S_VARIANT_CNT)), 1);
+  t.varOff = taSpecies(sp, TA_S_VARIANT_DIR) + (h3 % u32(vc)) * TA_VARIANT_WORDS;
+  t.rot = (h3 >> 9u) & 3u;
+  t.mir = ((h3 >> 11u) & 1u) != 0u;
+
+  t.reach = i32(taSpecies(sp, TA_S_REACH));
+
+  // ---- THE SPAWN CLEARING IS A CLEARING, NOT A TRUNK BAN -------------------
+  // Checked HERE rather than up with the other rejects, because it needs the
+  // species' CROWN WIDTH and that is not known until the draw above.
+  //
+  // The old test refused trunks INSIDE the box and nothing else, which was
+  // survivable while the widest crown was ~5 m: an oak just outside the fence
+  // overhung it by a few metres of leaves nobody stood under. The baked atlas
+  // put a great oak's reach at 11.5 m, and the player spawns ten voxels above
+  // the ground at the middle of that box — so they materialised INSIDE a canopy
+  // that had grown over the clearing from outside it, landed on the leaves and
+  // walked off the edge. Expanding the keep-out by the tree's own reach is what
+  // makes the clearing mean what its name says at any crown width.
+  // Box OVERLAP, not a corner test: a crown wider than the clearing would pass
+  // every corner check while covering the whole thing.
+  if (crownMeetsSpawnClearing(t.wx, t.wz, t.reach)) { return t; }
+
+  t.sp = sp;
+  t.above = i32(taSpecies(sp, TA_S_ABOVE));
+  t.crownR = i32(taSpecies(sp, TA_S_CROWN_R));
+  t.shade = i32(taSpecies(sp, TA_S_SHADE));
+  // Autumn is per TREE, never per voxel: a stand turns together or not at all.
+  //
+  // The species file authors WHETHER and HOW OFTEN this species turns (an oak
+  // does, a spruce never will), and `worldgen.autumnFraction` scales that
+  // globally so the whole world's autumn can be dialled from the tuner without
+  // re-baking ten atlases. The knob is a 1-in-N rarity whose DEFAULT is 5, so
+  // dividing by 5 makes the default an exact no-op and the authored numbers
+  // mean what they say — raise it and every species turns rarer together.
+  let ac = taSpecies(sp, TA_S_AUTUMN) * TUNE_AUTUMN_FRACTION / 5u;
+  t.autumn = ac != 0u && ((h3 >> 14u) % max(ac, 1u)) == 0u;
   t.present = true;
   return t;
 }
 
 // The one-shot form, for callers with no reject of their own to do first
-// (undergrowthSite, treeCanopyAt). Identical to what this function was before
-// the site split.
+// (undergrowthSite, treeCanopyAt).
 fn treeInfo(tx : i32, tz : i32, seed : u32) -> Tree {
   let s = treeSite(tx, tz, seed);
-  return treeInfoAt(s, baseHeight(s.wx, s.wz, seed), seed);
+  return treeInfoAt(s, landAt(s.wx, s.wz, seed), seed);
 }
 
 // Integer sine on a 256-step circle, returning -256..256. Bhaskara-style
@@ -1200,559 +1290,179 @@ fn segDist2(px : i32, py : i32, pz : i32,
   return ex * ex + ey * ey + ez * ez;
 }
 
-// A birch carries BIRCH_LIMBS primary limbs off the upper bole, each of which
-// forks into BIRCH_SUBS twigs. Leaves live ONLY in a small blob at each twig
-// tip — that is the whole look: bare white bark structure, green only at the
-// extremities, nothing like a sphere on a stick.
-const BIRCH_LIMBS : i32 = 5;
-const BIRCH_SUBS  : i32 = 3;
-
-// Direction for limb `i` of tree `t`, normalized to length ~256. Spread around
-// the compass by golden-angle-ish stepping (integer approximation) so limbs
-// never stack, with per-tree and per-limb hash jitter on azimuth and pitch.
-//
-// The vector MUST be normalized: callers scale it by (length / 256), so an
-// un-normalized direction makes branch length depend on direction. The first
-// cut built (cos*horiz, rise, sin*horiz) with horiz = 256 - rise, which gave a
-// vector dominated by `rise` and a horizontal reach of ~11 voxels — the limbs
-// hugged the bole and the tree rendered as a bare pole with a fork on top.
-fn birchLimbDir(t : Tree, i : i32, gen : i32) -> vec3<i32> {
-  let h = hash3(t.rnd ^ 0x5B12u, bitcast<u32>(i), bitcast<u32>(gen));
-  // azimuth in 0..255 (a 256-step circle), stepped by ~137/360 of a turn
-  let az = (i * 97 + i32(h % 24u) + i32(t.rnd >> 19u) * 3 + gen * 41) & 255;
-  // Pitch as a 0..256 "how much of the direction is upward" weight. Primaries
-  // sit near 45 degrees (the angle that actually reads as a branch); twigs
-  // climb a bit more steeply so the crown gathers rather than splays flat.
-  var up = 110 + i32((h >> 7u) % 70u);       // ~0.43..0.70 of unit, ~25-45 deg
-  if (gen == 1) { up = 140 + i32((h >> 13u) % 80u); }
-  // horizontal magnitude = sqrt(256^2 - up^2), by integer Newton iteration
-  var hm = 256 - up / 2;                     // seed ('target' is reserved in WGSL)
-  let hm2 = 256 * 256 - up * up;
-  for (var it = 0; it < 4; it++) { hm = (hm + hm2 / max(hm, 1)) / 2; }
-  let c = isin((az + 64) & 255);   // cos = sin(az + 90deg), in -256..256
-  let s = isin(az);
-  return vec3<i32>((c * hm) / 256, up, (s * hm) / 256);
-}
-
-// Material this tree contributes at world cell (x,y,z), or MAT_AIR.
-fn treeCell(t : Tree, x : i32, y : i32, z : i32, seed : u32) -> u32 {
-  let dx = x - t.wx;
-  let dz = z - t.wz;
-  let dy = y - t.base;               // height above the trunk's ground
-  if (dy < 0) { return MAT_AIR; }
-
-  // Crown centre sits BELOW the trunk top by about a third of the radius, so
-  // the trunk runs up into the foliage instead of holding a ball above itself.
-  // Centring on t.trunk exactly leaves a bare pole with a hat on it, which is
-  // what makes a voxel forest read as lollipops from any distance.
-  let topY = t.trunk - t.radius / 3;
-  let r = t.radius;
-
-  // leaf material per species
-  var leaf = M_LEAVES;
-  if (t.species == 1u) { leaf = M_PINE; }
-  // a slice of broadleaf stands go autumn, by tree not by voxel
-  else if ((t.rnd >> 5u) % TUNE_AUTUMN_FRACTION == 0u) { leaf = M_AUTUMN; }
-  var bark = M_WOOD;
-  if (t.species == 2u) { bark = M_BIRCH; }
-
-  // ---- trunk ----
-  // Trunk radius is PROPORTIONAL to height (~1/22, so a 6 m oak gets a ~0.5 m
-  // thick bole) and tapers toward the crown. Fixed small radii were the other
-  // half of the shrub bug: a 1-voxel stem under a 6 m tree is a wire that
-  // vanishes at any distance and leaves the canopy apparently floating.
-  var tr = max(t.trunk / 22, 1);
-  if (t.species == 2u) { tr = max(tr * 3 / 4, 1); }   // birch: slimmer
-  if (t.species == 4u) { tr = 0; }                    // bush: single stem
-  // taper: full width at the base, ~60% by the crown
-  let taper = tr - (tr * dy * 2) / max(t.trunk * 5, 1);
-  var trNow = max(taper, select(1, 0, t.species == 4u));
-  // flared root buttress on the great oaks
-  if (t.species == 3u && dy < t.trunk / 6) { trNow = trNow + tr / 2; }
-  // Birch skips the straight box column: its bole is part of the branch
-  // skeleton below, so it can lean and taper as one continuous structure.
-  if (t.species != 2u && dy <= t.trunk && abs(dx) <= trNow && abs(dz) <= trNow) {
-    // round off the corners so it isn't a visible square column
-    if (abs(dx) + abs(dz) <= trNow + trNow / 2 + 1) { return bark; }
-  }
-
-  switch (t.species) {
-    // ---- oak / great oak: blobby round crown, wider than tall ----
-    case 0u, 3u: {
-      let cy = topY;
-      let vy = (dy - cy) * 3 / 2;              // squash vertically
-      let d2 = dx * dx + dz * dz + vy * vy;
-      if (d2 <= r * r) {
-        // hash-nibbled edge so the crown silhouette is ragged, not a sphere
-        let n = hash3(seed ^ 0x1EAFu, bitcast<u32>(x) ^ (bitcast<u32>(z) << 11u),
-                      bitcast<u32>(y)) % 100u;
-        let edge = d2 * 100 / max(r * r, 1);   // 0 centre .. 100 rim
-        if (edge < 62 || n > u32(edge - 40)) { return leaf; }
-      }
-      // great oaks get a second, lower crown lobe for a layered canopy
-      if (t.species == 3u) {
-        let vy2 = (dy - (cy - r)) * 2;
-        let d3 = dx * dx + dz * dz + vy2 * vy2;
-        let r2 = r * 3 / 4;
-        if (d3 <= r2 * r2) { return leaf; }
-      }
-      return MAT_AIR;
-    }
-    // ---- pine: stacked conical skirts, narrowing to a tip ----
-    case 1u: {
-      let tip = t.trunk + t.trunk / 8;         // crown overshoots the bole
-      let start = t.trunk / 4;                 // bare lower trunk
-      if (dy < start || dy > tip) { return MAT_AIR; }
-      let up = tip - dy;                       // distance below the tip
-      let span = max(tip - start, 1);
-      // Cone radius grows linearly downward to the full crown radius, with a
-      // saw-tooth so the skirts read as layered boughs. Both the slope and the
-      // skirt period are derived from the tree's own size — the old fixed
-      // `up / 3` and `up % 4` only made a cone at all on a 16-voxel sapling.
-      let skirt = max(t.trunk / 10, 2);
-      var cr = (up * r) / span + (up % skirt) / 2 - skirt / 4;
-      cr = clamp(cr, 0, r);
-      let md = abs(dx) + abs(dz);              // diamond cross-section
-      if (md <= cr) { return leaf; }
-      return MAT_AIR;
-    }
-    // ---- birch: generative branching structure ----
-    // Not a crown at all: a leaning bole that forks into limbs, each of which
-    // forks again into twigs, with leaves ONLY as small clusters at the twig
-    // tips. What you should see is white bark tracery with green confetti at
-    // the extremities — the deliberate opposite of the lollipop the round
-    // crown produced. Everything is re-derived from t.rnd per cell.
-    case 2u: {
-      // + r again for the leaf cluster carried on top of the highest twig tip
-      if (dy > t.trunk + r * 2) { return MAT_AIR; }
-
-      // Bole: a 3-segment polyline that drifts as it rises, so the trunk has a
-      // natural lean and slight S-curve instead of being a plumb column.
-      let leanH = hash3(t.rnd ^ 0xB01Eu, 1u, 0u);
-      let lx = i32(leanH % 17u) - 8;           // total drift, voxels, over the bole
-      let lz = i32((leanH >> 8u) % 17u) - 8;
-      // Fork height: where the bole stops being a single stem. Kept low (just
-      // under half) so the branch structure is most of the tree's visible mass
-      // — a high fork leaves a bare pole, which is the silhouette this whole
-      // rewrite exists to kill.
-      let forkY = t.trunk * 9 / 20;
-      let topBole = t.trunk;
-
-      var btr = max(t.trunk / 30, 1);          // birch is a slim tree
-      // bole point at height h (0..topBole), drifting quadratically
-      // p(h) = base + lean * (h/topBole)^2
-      let hq = (dy * 1024) / max(topBole, 1);
-      let bxAt = (lx * hq * hq) / (1024 * 1024);
-      let bzAt = (lz * hq * hq) / (1024 * 1024);
-      // bole radius tapers from btr at the ground to ~1 at the top
-      let boleR = max(btr - (btr * dy) / max(topBole, 1) + select(0, 1, dy < topBole / 8), 1);
-      if (dy <= topBole) {
-        let ex = dx - bxAt; let ez = dz - bzAt;
-        if (ex * ex + ez * ez <= boleR * boleR) { return bark; }
-      }
-
-      // Limbs branch off between forkY and the bole top, climbing outward.
-      // Each limb is one segment; each spawns BIRCH_SUBS twigs from its far
-      // end. Leaves are tested first at the twig tips, then the wood — so a
-      // tip cluster reads as foliage rather than bark poking through it.
-      // Limb length. r + r/2 made limbs that shot out like scaffolding poles,
-      // longer than the tree was wide; the crown has to stay narrower than its
-      // height or the birch stops reading as a slender tree.
-      let limbLen = r;
-      for (var i = 0; i < BIRCH_LIMBS; i++) {
-        let lh = hash3(t.rnd ^ 0xC0DEu, bitcast<u32>(i), 7u);
-        // attachment height, spread up the upper bole
-        let ah = forkY + ((topBole - forkY) * i) / BIRCH_LIMBS
-                 + i32(lh % u32(max((topBole - forkY) / BIRCH_LIMBS, 1)));
-        let ahq = (ah * 1024) / max(topBole, 1);
-        let ax = (lx * ahq * ahq) / (1024 * 1024);
-        let az = (lz * ahq * ahq) / (1024 * 1024);
-        let d0 = birchLimbDir(t, i, 0);
-        // limb length shrinks with attachment height: lower limbs are longest
-        let ll = limbLen - (limbLen * (ah - forkY)) / max((topBole - forkY) * 2, 1);
-        // A limb is TWO segments, not one: it leaves the bole climbing and then
-        // bends over toward horizontal at the elbow. A single straight segment
-        // is what made the first working version read as scaffolding poles —
-        // real branches curve, and the bend is most of what sells it.
-        let mx = ax + (d0.x * ll) / (256 * 2);
-        let my = ah + (d0.y * ll) / (256 * 2);
-        let mz = az + (d0.z * ll) / (256 * 2);
-        // outer half keeps the horizontal run but sheds most of the climb
-        let ex = mx + (d0.x * ll) / (256 * 2);
-        let ey = my + (d0.y * ll) / (256 * 5);
-        let ez = mz + (d0.z * ll) / (256 * 2);
-
-        // cheap AABB reject for the whole limb + its twigs before any distance
-        // work: twigs extend at most twigLen past the limb end, plus a cluster
-        let pad = ll * 3 / 4 + r / 5 + 4;
-        if (dx < min(ax, ex) - pad || dx > max(ax, ex) + pad ||
-            dz < min(az, ez) - pad || dz > max(az, ez) + pad ||
-            dy < min(ah, ey) - pad || dy > max(ah, ey) + pad) { continue; }
-
-        // Twigs. One set sprouts from the ELBOW and one from the TIP, so
-        // foliage is distributed along the limb instead of bunching in a knot
-        // at the far end and leaving a long bare arm behind it.
-        let twigLen = ll / 2 + ll / 4;
-        for (var k = 0; k < BIRCH_SUBS * 2; k++) {
-          let sub = k % BIRCH_SUBS;
-          let fromTip = k >= BIRCH_SUBS;
-          let d1 = birchLimbDir(t, i * 8 + sub + 1, 1);
-          // blend the twig direction toward the parent limb so it continues
-          // the branch rather than starting a new random spray
-          let tdx = (d1.x + d0.x) / 2;
-          let tdy = (d1.y + d0.y) / 2;
-          let tdz = (d1.z + d0.z) / 2;
-          // elbow twigs are shorter — they are lower-order branches
-          let tl = select(twigLen * 2 / 3, twigLen, fromTip);
-          let sx = select(mx, ex, fromTip);
-          let sy = select(my, ey, fromTip);
-          let sz = select(mz, ez, fromTip);
-          let tx2 = sx + (tdx * tl) / 256;
-          let ty2 = sy + (tdy * tl) / 256;
-          let tz2 = sz + (tdz * tl) / 256;
-
-          // Leaf cluster at the twig tip — a small hash-eroded blob, the ONLY
-          // place this species puts foliage. Kept SMALL on purpose: at r*2/5
-          // (~1 m) the fifteen clusters merged back into the solid ball this
-          // rewrite exists to avoid. ~0.4 m reads as a tuft on a branch tip.
-          let cr = max(r / 5, 4);
-          let ddx = dx - tx2; let ddy = dy - ty2; let ddz = dz - tz2;
-          let cd2 = ddx * ddx + ddy * ddy + ddz * ddz;
-          if (cd2 <= cr * cr) {
-            let n = hash3(seed ^ 0x81C4u,
-                          bitcast<u32>(x) ^ (bitcast<u32>(z) << 11u),
-                          bitcast<u32>(y)) % 100u;
-            // Solid at the blob core, ragged only at its rim. Eroding the core
-            // too (the first cut cut ~25% everywhere) made the clusters read as
-            // green dust at any distance instead of as foliage.
-            let edge = (cd2 * 100) / max(cr * cr, 1);
-            if (edge < 45 || n > u32(edge - 20)) { return leaf; }
-          }
-          // The twig itself. A 1-voxel radius twig is a wire that aliases into
-          // a dotted line and disappears a few metres out; 2 keeps it readable.
-          if (segDist2(dx, dy, dz, sx, sy, sz, tx2, ty2, tz2) <= 4) {
-            return bark;
-          }
-        }
-
-        // The limb, as its two segments: thicker on the inner half near the
-        // bole, thinner past the elbow, so it visibly tapers outward.
-        if (segDist2(dx, dy, dz, ax, ah, az, mx, my, mz) <= 4) { return bark; }
-        if (segDist2(dx, dy, dz, mx, my, mz, ex, ey, ez) <= 4) { return bark; }
-      }
-      return MAT_AIR;
-    }
-    // ---- bush: a low leafy dome ----
-    default: {
-      let vy = (dy - 1) * 2;
-      if (dx * dx + dz * dz + vy * vy <= r * r) { return leaf; }
-      return MAT_AIR;
-    }
-  }
-}
-
-// ---- hanging vines, moss beards and trunk ivy (implicit, per-cell) ----
-//
-// THE PROBLEM THIS SOLVES. A vine is the one plant whose real-world form is a
-// PATH: it starts somewhere and travels. Worldgen has no turtle to walk it —
-// genCell sees one cell and must answer for that cell alone, with no memory of
-// the cells above it and no ability to write into them. So a vine cannot be
-// grown; it has to be a CLOSED-FORM PREDICATE that every cell along the strand
-// independently agrees on.
-//
-// The trick is that a hanging vine has exactly one degree of freedom: the
-// column it hangs in. Fix the column and the whole strand is determined by two
-// numbers — where it starts (the canopy underside directly above) and how far
-// it falls (a per-column hash). Both are pure functions of (column, tree), so
-// every cell in the strand derives the identical pair and the strand is
-// continuous by construction rather than by being drawn.
-//
-// That is why the canopy underside is computed ANALYTICALLY below instead of
-// by marching upward looking for leaves. Marching would be the obvious port of
-// the turtle idea and it is exactly wrong here: it costs O(vine length) leaf
-// evaluations per cell, and treeCell is not cheap (a birch alone is 5 limbs x
-// 6 twigs of segment distance). Each species' crown is an implicit surface we
-// already have the parameters for, so its underside is one integer sqrt.
-//
-// Rule 2: everything here is INERT, placed once. A growing vine is the textbook
-// version of the thing the file header warns about — it would keep every forest
-// chunk awake forever. `vine` (material 22) is the REACTIVE garden vine and is
-// deliberately NOT what this places.
-
-// Underside of the tree's foliage in the column (dx,dz) relative to the trunk,
-// as a height above t.base, or -1 if this column carries no canopy to hang
-// from. This is the inverse of the crown tests in treeCell: same parameters,
-// solved for the lowest y instead of tested at a given y.
-fn canopyUnderside(t : Tree, dx : i32, dz : i32) -> i32 {
-  let d2 = dx * dx + dz * dz;
-  let r = t.radius;
-  let topY = t.trunk - t.radius / 3;
-  switch (t.species) {
-    // Round crowns: the treeCell test is dx^2 + dz^2 + ((dy-cy)*3/2)^2 <= r^2,
-    // so the lowest dy in this column is cy - (2/3)*sqrt(r^2 - d2). Great oaks
-    // carry a second, lower lobe centred at cy - r with a 2x vertical squash
-    // and radius 3r/4 — whichever hangs lower is the real underside.
-    case 0u, 3u: {
-      var low = 0x7FFFFFFF;
-      if (d2 <= r * r) {
-        let s = i32(isqrt(u32(r * r - d2)));
-        low = topY - (s * 2) / 3;
-      }
-      if (t.species == 3u) {
-        let r2 = r * 3 / 4;
-        if (d2 <= r2 * r2) {
-          let s2 = i32(isqrt(u32(r2 * r2 - d2)));
-          low = min(low, (topY - r) - s2 / 2);
-        }
-      }
-      if (low == 0x7FFFFFFF) { return -1; }
-      return low;
-    }
-    // Pine: a downward-widening cone, so its underside in a column is the
-    // height at which the cone radius (diamond metric, as in treeCell) equals
-    // that column's distance. Solving cr = (up*r)/span for `up` and converting
-    // back: dy = tip - (md*span)/r. The saw-tooth skirt is ignored here — it
-    // moves the boundary by a voxel or two and a vine hanging from a needle
-    // rather than from the bough beneath it is not a distinction anyone sees.
-    case 1u: {
-      let tip = t.trunk + t.trunk / 8;
-      let start = t.trunk / 4;
-      let span = max(tip - start, 1);
-      let md = abs(dx) + abs(dz);
-      if (md > r) { return -1; }
-      let dy = tip - (md * span) / max(r, 1);
-      if (dy < start) { return -1; }
-      return dy;
-    }
-    // Birch has no crown surface at all — its foliage is fifteen small blobs at
-    // twig tips, and there is no closed form for "the lowest one over this
-    // column". Birches get moss beards off their LIMBS instead (handled by the
-    // caller, which already has the limb geometry in hand), never a curtain.
-    // Bushes are too low to hang anything from.
-    default: { return -1; }
-  }
-}
-
-// Vine material contributed by tree `t` at world cell (x,y,z), or MAT_AIR.
-// Called from treeAt's existing tile loop, so it adds NO new world scan: the
-// 25 tiles were already visited and `t` is already in registers.
-fn treeVine(t : Tree, x : i32, y : i32, z : i32, seed : u32) -> u32 {
-  let dx = x - t.wx;
-  let dz = z - t.wz;
-  let dy = y - t.base;
-  if (dy < 0) { return MAT_AIR; }
-
-  // Bushes carry nothing; birch is handled as a moss beard further down.
-  if (t.species == 4u) { return MAT_AIR; }
-
-  // ---- 1. curtain vines under a round/conic canopy ----
-  // One hash per COLUMN (not per cell): the column either hosts a strand or it
-  // does not, and every cell of that strand reads the same roll. A per-cell
-  // roll would give dashed vines, which is the same bug the pond plants call
-  // out — and the salt is distinct per feature, never a bit-slice of a shared
-  // hash, because slices of one hash correlate (see the pond-life note).
-  let hv = hash3(seed ^ 0x71E5u, bitcast<u32>(x), bitcast<u32>(z));
-  // Great oaks are the trees that read as ancient, so they drape hardest.
-  var chance = TUNE_VINE_CHANCE;
-  if (t.species == 3u) { chance = max(TUNE_VINE_CHANCE / 2u, 1u); }
-  if ((hv % chance) == 0u) {
-    let under = canopyUnderside(t, dx, dz);
-    if (under >= 0) {
-      // Strand length, jittered per column so the curtain has a ragged hem
-      // instead of a machine-cut edge — the single most obvious tell that a
-      // procedural vine is procedural.
-      let len = TUNE_VINE_LEN_MIN + i32((hv >> 7u) % u32(max(TUNE_VINE_LEN_SPAN, 1)));
-      // The strand occupies (under - len, under]: it starts INSIDE the foliage
-      // by one cell so there is no visible gap between leaf and vine, and runs
-      // down from there.
-      if (dy <= under && dy > under - len) {
-        // Never let a strand reach the ground: a vine that touches down reads
-        // as a pillar and, worse, is something the player walks into where
-        // they expected floor. Held clear of the trunk's own ground height,
-        // which is the only ground height this function knows.
-        if (dy > 2) {
-          // A minority of strands flower. Gated on the SAME column roll, so a
-          // blossom can only appear on a column that actually grew a vine —
-          // the lilypad/blossom precedent.
-          if (((hv >> 17u) % TUNE_CREEPER_FLOWER_CHANCE) == 0u &&
-              ((dy + i32(hv >> 24u)) % 7) == 0) {
-            return M_CREEPER_FLOWER;
-          }
-          return M_VINE_HANG;
-        }
-      }
-    }
-  }
-
-  // ---- 2. moss beards on the great oaks and birches ----
-  // Spanish-moss style: not a strand from the canopy underside but a short,
-  // fuzzy skirt clinging to the outer canopy rim and to birch limbs, which is
-  // what makes an old forest read as damp rather than merely green.
-  // Restricted to the species that carry it so the whole forest does not fur
-  // over: great oaks (the ancient ones) and birch (whose bare limbs are what
-  // the beard is legible against).
-  if (t.species == 3u || t.species == 2u) {
-    let hm = hash3(seed ^ 0x3055u, bitcast<u32>(x), bitcast<u32>(z));
-    if ((hm % TUNE_MOSS_CHANCE) == 0u) {
-      // For the great oak, hang from the canopy underside like a short vine.
-      // For the birch there is no underside, so the beard hangs from the
-      // BOLE-TOP plane instead, thinned toward the middle so it reads as
-      // hanging off the limb structure rather than as a disc.
-      // 'from' is a RESERVED KEYWORD in WGSL — hence the awkward name.
-      var anchor = -1;
-      if (t.species == 3u) {
-        anchor = canopyUnderside(t, dx, dz);
-      } else {
-        // Birch: limbs occupy the band between the fork and the bole top and
-        // reach `radius` outward. A beard cell is legal inside that annulus,
-        // hanging from a height that falls off with distance so the skirt
-        // follows the limbs' outward-and-downward sweep.
-        let d2 = dx * dx + dz * dz;
-        let rr = t.radius;
-        if (d2 <= rr * rr && d2 > (rr / 3) * (rr / 3)) {
-          let d = i32(isqrt(u32(d2)));
-          anchor = t.trunk - (d * t.trunk) / max(rr * 3, 1);
-        }
-      }
-      if (anchor >= 0) {
-        let mlen = TUNE_MOSS_LEN_MIN + i32((hm >> 9u) % u32(max(TUNE_MOSS_LEN_SPAN, 1)));
-        if (dy <= anchor && dy > anchor - mlen && dy > 2) {
-          return M_MOSS_HANG;
-        }
-      }
-    }
-  }
-
-  // ---- 3. ivy climbing the bole ----
-  // The one climber that is not a hanging strand. Derived as a thin shell
-  // AROUND the trunk cylinder treeCell already defines, so it hugs whatever
-  // the trunk actually is (including the great oak's flared buttress) without
-  // restating the trunk shape: same taper expression, evaluated at +1.
-  // Angular gating by an isin() lobe makes the ivy climb in a couple of ropes
-  // up one side rather than sheathing the trunk uniformly.
-  if (t.species != 2u && dy <= t.trunk * 3 / 4) {
-    var tr = max(t.trunk / 22, 1);
-    let taper = tr - (tr * dy * 2) / max(t.trunk * 5, 1);
-    var trNow = max(taper, 1);
-    if (t.species == 3u && dy < t.trunk / 6) { trNow = trNow + tr / 2; }
-    // the shell: just outside the bark the trunk test claims
-    let ad = abs(dx) + abs(dz);
-    let onShell = max(abs(dx), abs(dz)) <= trNow + 1 && ad > trNow + trNow / 2 + 1 &&
-                  ad <= trNow + trNow / 2 + 3;
-    if (onShell) {
-      // Which side of the trunk, as a 256-step angle, from the sign-corrected
-      // octant — cheap and integer, no atan needed: the ivy only has to pick a
-      // consistent side, not a precise bearing.
-      let ang = (dx * 32) / max(abs(dx) + abs(dz), 1) + select(128, 0, dx >= 0);
-      // Two ropes that spiral: the favoured angle drifts with height.
-      let phase = (i32(t.rnd >> 11u) & 255) + dy * TUNE_IVY_TWIST / 16;
-      let off = ((ang - phase) & 127) - 64;
-      let hi = hash3(seed ^ 0x1E9Au, bitcast<u32>(x), bitcast<u32>(z));
-      if (abs(off) < 26 && (hi % TUNE_IVY_CHANCE) == 0u) {
-        return M_IVY;
-      }
-    }
-  }
-
-  return MAT_AIR;
-}
-
-// Union of every tree whose canopy can reach (x,y,z): the (2*TREE_SCAN+1)^2
-// tile neighborhood, which must cover the largest canopy radius (great oak,
-// ~4.5 m = 72 voxels) plus the trunk's in-tile jitter. First non-air wins —
-// order is by tile index, a fixed priority, never dispatch order (rule 1).
 // ---- THE TREE COLUMN, hoisted out of the per-cell path --------------------
 //
-// WHICH TILES CAN PUT A CANOPY OVER THIS COLUMN IS A FUNCTION OF (x, z) ALONE.
-// The 25-tile scan, the trunk sites, the ground under each of them and the whole
-// of treeInfoAt are y-independent; only the `reach`/`vtop` compares and the
-// shape test are not. genCellIn asks per AIR cell above the ground, which in a
-// streamed-in vertical slab is most of the chunk, so a column was paying ~150
-// hash3 sixteen times for one answer.
+// WHICH TREES CAN PUT A VOXEL OVER THIS COLUMN IS A FUNCTION OF (x, z) ALONE.
+// The tile scan, the trunk sites, the ground under each of them, the species
+// draw, the variant and its rotation are all y-independent — and so, now, is
+// the COLUMN LOOKUP itself: rotating (dx,dz) into variant space and fetching
+// that column's run list happens once per column, not once per cell. genCellIn
+// asks per AIR cell above the ground, which in a streamed-in vertical slab is
+// most of the chunk, so this is the difference between one lookup and sixteen.
 //
-// AND THE SET IS SMALL. TREE_TILE is 144 and a site sits in the middle half of
-// its tile, so tile `t` puts its trunk in [144t+36, 144t+107]; TREE_MAX_REACH is
-// 124, so the tiles that can reach column x are those whose site range meets
-// [x-124, x+124], which spans 319 voxels of tile origin and therefore at most
-// ceil(319/144) + 1 = 3 tiles per axis. NINE, at any x, for any seed. (The
-// LoadTuning clamp on worldgen.treeTile is what keeps that arithmetic true; drop
-// the tile below ~112 and a tenth candidate exists and would be silently lost.)
+// It also SHRINKS THE CANDIDATE SET to trees that actually cover this column.
+// The old code kept every tile whose crown radius reached, then re-tested a
+// shape per cell; a column-empty tree is now dropped outright at hoist time,
+// so the per-cell loop typically runs zero or one iterations under open sky and
+// one or two under a closed canopy.
 //
-// So the reject ladder gets STRICTLY BETTER, not just cheaper: reject #1 was
-// `y > TREE_MAX_TOP`, a world-wide constant derived from the terrain band that
-// dies the moment the band widens (package C). It becomes `y > cands.top`, the
-// highest canopy over THIS column — a correct local ceiling that survives any
-// relief.
+// NINE IS ENOUGH, and it is checked rather than assumed. A site sits in the
+// middle half of its tile, so tile `t` puts its trunk in
+// [TILE*t + TILE/4, TILE*t + 3*TILE/4); a tile can reach column x only if that
+// range meets [x - reach, x + reach], which spans 2*reach + TILE/2 - 1 voxels
+// of tile origin and therefore covers at most (2*reach + TILE/2 - 1)/TILE + 1
+// tiles per axis. At TILE 144 that is three per axis — nine — for any species
+// narrower than 180 voxels. `reach` is now ASSET DATA, so LoadTreeAtlas
+// (src/sim/treeatlas.h MaxReachForNineCandidates) REFUSES an atlas that would
+// break the derivation: past the bound the shader silently drops a candidate,
+// and the symptom is a canopy missing from some columns and present on others.
 const TREE_CAND_MAX : i32 = 9;
+
+// The compact per-column form. Deliberately NINE WORDS: this array lives on the
+// function stack of genChunk and a wide struct here is scratch traffic on every
+// worldgen thread. Everything a per-cell test needs and nothing it does not —
+// the species metadata stays in the atlas, where the two scans that want it
+// (undergrowth, far canopy) read it directly.
+struct TreeCand {
+  wx     : i32,
+  wz     : i32,
+  base   : i32,   // ground at the trunk; local y 0 sits at base + 1
+  ny     : i32,   // variant height, for the vertical bound
+  vtop   : i32,   // highest world y this tree can occupy
+  colOff : u32,   // this column's run list in the atlas
+  colCnt : u32,
+  leafSw : u32,   // autumn substitution: 0 = none, else the species' word offset
+};
+
 struct TreeCands {
   n   : i32,
   top : i32,             // highest vtop in the set; far below any y when empty
-  t   : array<Tree, 9>,  // TREE_CAND_MAX; WGSL wants a literal here
+  t   : array<TreeCand, 9>,  // TREE_CAND_MAX; WGSL wants a literal here
 };
+
+// Rotate a trunk-relative offset into the variant's own grid. Four quarter
+// turns plus an optional mirror give 8 orientations from one baked tree, for
+// two integer swaps and a negate.
+fn treeLocalXZ(t : Tree, dx : i32, dz : i32) -> vec2<i32> {
+  var rx = dx;
+  var rz = dz;
+  switch (t.rot) {
+    case 1u: { rx = -dz; rz = dx; }
+    case 2u: { rx = -dx; rz = -dz; }
+    case 3u: { rx = dz;  rz = -dx; }
+    default: {}
+  }
+  if (t.mir) { rx = -rx; }
+  let ax = i32(treeAtlas[t.varOff + TA_V_ANCHORX]);
+  let az = i32(treeAtlas[t.varOff + TA_V_ANCHORZ]);
+  return vec2<i32>(ax + rx, az + rz);
+}
 
 fn treeCandsInto(c : ptr<function, TreeCands>, x : i32, z : i32, seed : u32) {
   (*c).n = 0;
   (*c).top = -1048576;
+  if (taSpeciesCount() <= 0) { return; }
+  let maxReach = treeMaxReach();
   let tx = fdiv(x, TREE_TILE);
   let tz = fdiv(z, TREE_TILE);
   for (var oz = -TREE_SCAN; oz <= TREE_SCAN; oz++) {
     for (var ox = -TREE_SCAN; ox <= TREE_SCAN; ox++) {
-      // Horizontal reject on the trunk site alone (one hash). A +-2 tile's
-      // trunk is at least 181 voxels away and TREE_MAX_REACH is 124, so the
-      // outer ring of the scan is rejected outright and only ~4 of the 25 tiles
-      // reach the noise queries below. TREE_SCAN stays 2 because the exact
-      // per-species reach still decides; this only stops us PAYING for the
-      // tiles it was always going to refuse.
+      // Horizontal reject on the trunk site alone (one hash), against the
+      // WIDEST species in the atlas. A +-2 tile's trunk is at least
+      // TILE*2 - TILE/4 away, so the outer ring is rejected outright and only
+      // a few of the 25 tiles reach the noise queries below.
       let s = treeSite(tx + ox, tz + oz, seed);
-      if (abs(x - s.wx) > TREE_MAX_REACH || abs(z - s.wz) > TREE_MAX_REACH) {
-        continue;
-      }
-      let t = treeInfoAt(s, baseHeight(s.wx, s.wz, seed), seed);
+      if (abs(x - s.wx) > maxReach || abs(z - s.wz) > maxReach) { continue; }
+      let t = treeInfoAt(s, landAt(s.wx, s.wz, seed), seed);
       if (!t.present) { continue; }
+      // Now the species' OWN reach, which is what actually decides.
+      if (abs(x - t.wx) > t.reach || abs(z - t.wz) > t.reach) { continue; }
+
+      // The column lookup, hoisted. A tree whose baked grid has nothing in this
+      // column is not a candidate at all: the atlas is the whole tree, so an
+      // empty column can contribute nothing.
+      let l = treeLocalXZ(t, x - t.wx, z - t.wz);
+      let nx = i32(treeAtlas[t.varOff + TA_V_NX]);
+      let nz = i32(treeAtlas[t.varOff + TA_V_NZ]);
+      if (l.x < 0 || l.y < 0 || l.x >= nx || l.y >= nz) { continue; }
+      let ci = treeAtlas[t.varOff + TA_V_COLUMNS] +
+               u32(l.y * nx + l.x) * 2u;
+      let cnt = treeAtlas[ci + 1u];
+      if (cnt == 0u) { continue; }
+
       if ((*c).n >= TREE_CAND_MAX) { continue; }   // see the NINE derivation
-      (*c).t[(*c).n] = t;
+      var e : TreeCand;
+      e.wx = t.wx; e.wz = t.wz; e.base = t.base;
+      e.ny = i32(treeAtlas[t.varOff + TA_V_NY]);
+      // Local y 0 sits one voxel ABOVE the ground: genCellIn only asks about
+      // cells with y > h, so a row at y == base could never be reached and
+      // baking one would waste a layer of every variant.
+      e.vtop = t.base + 1 + e.ny;
+      e.colOff = treeAtlas[ci];
+      e.colCnt = cnt;
+      e.leafSw = select(0u,
+          treeAtlas[TA_H_SPECIES_DIR] + u32(t.sp) * TA_SPECIES_WORDS,
+          t.autumn);
+      (*c).t[(*c).n] = e;
       (*c).n = (*c).n + 1;
-      // Vertical extent must cover the tallest thing the species can put above
-      // its bole: the pine tip overshoots the trunk by trunk/8, and round
-      // crowns reach topY + r. Clipping this is how canopies get flat tops.
-      // Birch twig tips climb to ~trunk + r and then carry a leaf cluster on
-      // top of that, so it needs the extra cluster radius or every birch gets
-      // its uppermost foliage sheared off in a flat plane.
-      var vtop = t.base + t.trunk + t.radius + 2;
-      if (t.species == 2u) { vtop = vtop + t.radius; }
-      (*c).top = max((*c).top, vtop);
+      (*c).top = max((*c).top, e.vtop);
     }
   }
 }
 
-// The y-dependent half. Order is by tile index, a fixed priority, never dispatch
-// order (rule 1) — candidates were appended in that order, so first non-air
-// still wins the same tile it always did.
-fn treeFromCands(c : ptr<function, TreeCands>, x : i32, y : i32, z : i32,
-                 seed : u32) -> u32 {
+// Material this tree contributes at world height `y`, or MAT_AIR.
+//
+// The whole per-cell cost of a tree, and it is a linear scan of ONE column's
+// runs — typically one to three of them. Runs are sorted ascending and do not
+// overlap, so the first run that starts above `ly` ends the search.
+fn treeCellFrom(c : TreeCand, y : i32) -> u32 {
+  let ly = y - c.base - 1;
+  if (ly < 0 || ly >= c.ny) { return MAT_AIR; }
+  for (var k = 0u; k < c.colCnt; k++) {
+    let r = treeAtlas[c.colOff + k];
+    let y0 = i32((r >> 16u) & 0x1FFu);
+    if (ly < y0) { return MAT_AIR; }
+    if (ly < y0 + i32((r >> 25u) & 0x7Fu)) {
+      var m = r & 0xFFFu;
+      // AUTUMN: a per-TREE substitution across the species' three-step leaf
+      // ramp. Done as a ramp rather than one flat colour because replacing a
+      // shaded green with a flat orange would throw away the shading bake on
+      // exactly the trees the eye goes to. Three compares, on leaf voxels of
+      // autumn trees only.
+      if (c.leafSw != 0u) {
+        for (var i = 0u; i < 3u; i++) {
+          if (m == treeAtlas[c.leafSw + TA_S_LEAF0 + i]) {
+            m = treeAtlas[c.leafSw + TA_S_AUTUMN0 + i];
+            break;
+          }
+        }
+      }
+      return m;
+    }
+  }
+  return MAT_AIR;
+}
+
+// NO IMPLICIT DECORATION HANGS OFF A TREE. There used to be a per-cell
+// `treeVineFrom` here that draped vine curtains and Spanish-moss beards from
+// the canopy underside and spiralled ivy ropes up the bole, all as closed-form
+// predicates on top of the baked runs. It is gone on purpose: the .svtree atlas
+// is now the WHOLE tree, so what the tuner's Trees tab renders is exactly what
+// the world grows, with nothing added behind the author's back. A decoration
+// that belongs on a tree belongs in treegen.js, where it can be seen while it
+// is being authored. (`ivy` the material survives — the arena and ruin walls
+// place it, and that is a wall, not a tree.)
+//
+// The y-dependent half. Order is by tile index, a fixed priority, never
+// dispatch order (rule 1) — candidates were appended in that order, so first
+// non-air still wins the same tile it always did.
+fn treeFromCands(c : ptr<function, TreeCands>, y : i32) -> u32 {
   if (y > (*c).top) { return MAT_AIR; }
   for (var i = 0; i < (*c).n; i++) {
-    let t = (*c).t[i];
-    // cheap reject before the per-species shape test. Birch is a branching
-    // skeleton, not a crown: its limbs reach r + r/2 and their twigs extend
-    // past that, so it needs a wider gate than the round-crown species or
-    // the outer branches get sliced off at an invisible cylinder.
-    var reach = t.radius + 2;
-    if (t.species == 2u) { reach = t.radius * 5 / 2 + 4; }
-    if (abs(x - t.wx) > reach || abs(z - t.wz) > reach) { continue; }
-    var vtop = t.base + t.trunk + t.radius + 2;
-    if (t.species == 2u) { vtop = vtop + t.radius; }
-    if (y < t.base || y > vtop) { continue; }
-    let m = treeCell(t, x, y, z, seed);
+    let e = (*c).t[i];
+    if (y < e.base || y > e.vtop) { continue; }
+    let m = treeCellFrom(e, y);
     if (m != MAT_AIR) { return m; }
-    // Vines/moss/ivy fill cells the tree itself left EMPTY, so they are
-    // tested second and can never displace bark or foliage. No extra scan:
-    // this is the same tile, the same `t`, one more predicate.
-    // The horizontal gate above already bounds them — every strand hangs
-    // inside the canopy footprint or on the bole — and the vertical gate is
-    // bounded below by t.base, which is where a strand is cut off anyway.
-    let vm = treeVine(t, x, y, z, seed);
-    if (vm != MAT_AIR) { return vm; }
   }
   return MAT_AIR;
 }
@@ -1761,14 +1471,14 @@ fn treeFromCands(c : ptr<function, TreeCands>, x : i32, y : i32, z : i32,
 // with it the far cascades). ONE implementation of the rule, split the way
 // genColumn/genCellIn are split — not a second copy that has to agree.
 //
-// The TREE_MAX_TOP pre-reject stays HERE and only here: it is what stops an
-// isolated sky cell paying for a candidate scan it will not use. The hoisted
+// The world-wide vertical pre-reject stays HERE and only here: it is what stops
+// an isolated sky cell paying for a candidate scan it will not use. The hoisted
 // path does not need it, because `cands.top` is strictly tighter.
 fn treeAt(x : i32, y : i32, z : i32, seed : u32) -> u32 {
-  if (y > TREE_MAX_TOP) { return MAT_AIR; }
+  if (y > treeMaxTop()) { return MAT_AIR; }
   var c : TreeCands;
   treeCandsInto(&c, x, z, seed);
-  return treeFromCands(&c, x, y, z, seed);
+  return treeFromCands(&c, y);
 }
 
 // ---- cacti: the desert's implicit tall shape --------------------------------
@@ -2158,7 +1868,7 @@ fn flowerAt(x : i32, z : i32, seed : u32, cover : i32) -> Flower {
 struct Undergrowth {
   cover   : i32,   // 0 = open sky, 255 = deep under a crown
   trunkD2 : i32,   // squared XZ distance to the nearest trunk, or a large value
-  species : u32,   // species of that nearest tree (0..4)
+  shade   : i32,   // how much canopy that nearest tree casts, 0 for a shrub
   rnd     : u32,   // that tree's hash, for per-tree variation of its own ring
 };
 
@@ -2175,7 +1885,7 @@ fn undergrowthSite(x : i32, z : i32, seed : u32) -> Undergrowth {
   var u : Undergrowth;
   u.cover = 0;
   u.trunkD2 = 1 << 24;      // "no trunk anywhere near", larger than any reach
-  u.species = 0u;
+  u.shade = 0;
   u.rnd = 0u;
 
   let tx = fdiv(x, TREE_TILE);
@@ -2192,22 +1902,19 @@ fn undergrowthSite(x : i32, z : i32, seed : u32) -> Undergrowth {
       // is fixed (rule 1) — never by dispatch order.
       if (d2 < u.trunkD2) {
         u.trunkD2 = d2;
-        u.species = t.species;
+        u.shade = t.shade;
         u.rnd = t.rnd;
       }
 
-      // Canopy cover. A bush (species 4) is knee-high and shades nothing, so it
-      // contributes none — including it made every meadow read as closed forest
-      // because bushes are the commonest meadow tile.
-      if (t.species == 4u) { continue; }
-      // Birch is a branch skeleton with leaf clusters at the twig tips, so it
-      // covers a wider circle far more thinly. Same approximation the far field
-      // makes in treeCanopyAt: a bigger radius, much less weight.
-      var r = t.radius;
-      var peak = 200;
-      if (t.species == 2u) { r = t.radius * 2; peak = 90; }
-      else if (t.species == 1u) { peak = 230; }   // pine: dense, dark
-      else if (t.species == 3u) { peak = 255; }   // great oak: the darkest floor
+      // Canopy cover, from the species' OWN authored shade and its MEASURED
+      // crown radius. A shrub is authored at shade 0 and contributes none —
+      // counting one made every meadow read as closed forest, because shrubs
+      // are the commonest meadow tile. An airy birch and a dark spruce differ
+      // by their number here rather than by a branch on a species id, which is
+      // what lets a new species file arrive without touching this function.
+      let r = t.crownR;
+      let peak = t.shade;
+      if (peak <= 0 || r <= 0) { continue; }
       if (d2 > r * r) { continue; }
       // Linear ramp in the RADIUS (not in d2), so the falloff is even across
       // the crown instead of hugging the rim. Integer sqrt-free: compare d2
@@ -2889,7 +2596,7 @@ fn genCellIn(col : Col,
   // (a tree rooted on a pool rim would drop leaves into the pool).
   if (mat == MAT_AIR && !inRim && y > h && h < TREELINE && pond < 0) {
     var tm = MAT_AIR;
-    if (treeValid) { tm = treeFromCands(trees, x, y, z, seed); }
+    if (treeValid) { tm = treeFromCands(trees, y); }
     else { tm = treeAt(x, y, z, seed); }
     if (tm != MAT_AIR) { mat = tm; }
   }
@@ -3025,8 +2732,10 @@ fn genCellIn(col : Col,
       // mushrooms grow on the leaf mould around a bole rather than on the bark.
       // Radius scales with the tree so a great oak carries a wider ring.
       let ringOut = UG_SHROOM_RING + i32(ug.rnd >> 28u);
+      // Not around a shrub: a mushroom ring wants a bole and leaf mould, and
+      // `shade == 0` is exactly the species that have neither.
       let atBase = ug.trunkD2 > 9 && ug.trunkD2 < ringOut * ringOut &&
-                   ug.species != 4u;
+                   ug.shade > 0;
       if (atBase && (hShroom % UG_SHROOM_BASE_CHANCE) == 0u) {
         // Red fly-agaric is the rarer, showier one; the pale toadstool is the
         // common ring. Gated on the SAME roll that placed a mushroom at all, so
@@ -3480,22 +3189,29 @@ fn treeCanopyAt(x : i32, z : i32, seed : u32) -> u32 {
   for (var oz = -TREE_SCAN; oz <= TREE_SCAN; oz++) {
     for (var ox = -TREE_SCAN; ox <= TREE_SCAN; ox++) {
       let t = treeInfo(tx + ox, tz + oz, seed);
-      if (!t.present || t.species == 4u) { continue; }   // bushes: too small
+      if (!t.present) { continue; }
+      // The species' own far-field proxy material, out of the atlas: the mid
+      // step of its leaf ramp, or ZERO for a species with no foliage worth
+      // painting at kilometre range (the bush, the dead tree). Authored, not
+      // guessed from a species id.
+      let cm = taSpecies(t.sp, TA_S_CANOPY_MAT);
+      if (cm == MAT_AIR) { continue; }
       let dx = x - t.wx; let dz = z - t.wz;
-      // Birch spreads its leaf clusters out at the twig tips rather than
-      // filling a disc, so its far-field footprint is a wider but sparser
-      // ring; approximated as a larger disc with a hash punch-out so distant
-      // birch stands stay airy instead of reading as solid canopy.
-      if (t.species == 2u) {
-        let br = t.radius * 2;
-        if (dx * dx + dz * dz > br * br) { continue; }
-        if (hash3(seed ^ 0x2B17u, bitcast<u32>(x), bitcast<u32>(z)) % 5u < 2u) {
+      // The crown proxy is the MEASURED crown radius of the baked variants, so
+      // the footprint matches the tree that actually grows here.
+      if (dx * dx + dz * dz > t.crownR * t.crownR) { continue; }
+      // An airy species (birch, eucalypt) spreads its foliage in tufts with sky
+      // between them, so a solid disc at range would read as a denser wood than
+      // the near field shows. Punch it out in proportion to how much shade the
+      // species actually casts -- the same number the forest floor reads.
+      if (t.shade < 160) {
+        let punch = u32(clamp((160 - t.shade) / 24, 0, 5));
+        if (hash3(seed ^ 0x2B17u, bitcast<u32>(x), bitcast<u32>(z)) % 8u < punch) {
           continue;
         }
-      } else if (dx * dx + dz * dz > t.radius * t.radius) { continue; }
-      if (t.species == 1u) { return M_PINE; }
-      if ((t.rnd >> 5u) % TUNE_AUTUMN_FRACTION == 0u) { return M_AUTUMN; }
-      return M_LEAVES;
+      }
+      if (t.autumn) { return taSpecies(t.sp, TA_S_AUTUMN0 + 1u); }
+      return cm;
     }
   }
   return MAT_AIR;

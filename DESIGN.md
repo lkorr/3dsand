@@ -1484,7 +1484,99 @@ hardcoded 16 — correct when a voxel was 6.25 cm, and left behind when `world.h
 moved to `kVoxelMeters = 0.10`. For that whole interval every tree in the game
 was 1.6× the metre size its own table documents (the "11.9 m" great oak was 19 m
 of trunk). It reads `VOXELS_PER_M` from the prelude now, so the table's metres
-are true at any voxel size.
+are true at any voxel size. (Trees themselves no longer read it at all — their
+sizes are metres in `assets/trees/*.json` and voxels in the baked atlas. The
+cacti still do.)
+
+##### Trees: a BAKED ATLAS, and one voxelizer (2026-08-29)
+
+> **The editor is the only voxelizer. `assets/editor/treegen.js` produces every
+> tree voxel in the game; the engine samples what it baked and knows nothing
+> about how a tree is built.**
+
+Worldgen is a pure per-cell function: `genChunk` answers for one voxel with no
+memory of its neighbours and no way to walk a turtle. So every tree the engine
+grew was an IMPLICIT SHAPE re-derived per cell — a hash-eroded ellipsoid for
+oak, a diamond cone for pine, a hand-unrolled five-limb skeleton for birch.
+That is the ceiling of the technique and it is why the forest read as lollipops.
+
+The pipeline now is:
+
+| stage | artefact | owner |
+|---|---|---|
+| author | `assets/trees/<species>.json` | the tuner's **Trees** tab |
+| voxelize | in memory | `assets/editor/treegen.js` |
+| bake | `assets/trees/<species>.svtree` | `scripts/bake_trees.mjs`, or the tab's Bake button |
+| load | one GPU storage buffer | `src/sim/treeatlas.{h,cpp}` |
+| place | voxels | `worldgen.wgsl` `treeCandsInto` / `treeCellFrom` |
+
+The generator is Weber & Penn 1995 reduced to the parameters that earn a
+slider: a recursive stem skeleton under a crown-envelope curve (`shape`),
+stamped as round-cone SDFs, with smooth-min'd ellipsoid leaf CLUMPS at the
+outer stems. The clumps are the visual thesis — foliage lives in lobes around
+branch tips, never in one canopy-sized ball — and a **shading bake** (a mix of
+the clump-sphere normal and the whole-canopy normal, plus depth into the clump)
+gives those lobes readable form at zero engine cost, because it resolves to a
+choice among a three-material shade ramp (`leaves_dark` / `leaves` /
+`leaves_lit`, and the bark and needle equivalents).
+
+Four consequences worth stating, because each one is a rule:
+
+- **No second implementation.** There is deliberately no C++ or WGSL copy of
+  the SDF/clump/shading logic. What the Trees tab shows is byte-for-byte what
+  worldgen places, because it is the same function.
+- **Nothing is added to a tree after the bake.** The atlas is the WHOLE tree.
+  The cutover initially kept worldgen's implicit decoration — `treeVineFrom`,
+  a closed-form predicate that draped vine curtains and Spanish-moss beards
+  from the canopy underside and spiralled ivy ropes up the bole — and that
+  quietly broke the bullet above: the tab showed a tree, the world showed a
+  tree wearing something the author never saw and could not preview. It is
+  gone (2026-08-30), along with its nine `worldgen.*` tuning rows. A
+  decoration that belongs on a tree is authored in `treegen.js`, where it is
+  visible while it is being made. The `vine_hang` / `creeper_flower` /
+  `moss_hang` MATERIALS still exist for the brush; nothing generates them.
+  Wall ivy on the arena and ruins is unrelated and unchanged.
+- **Editing a species moves the world hash.** The atlas is engine input exactly
+  like `tuning.json`. Re-bake, then one `--selftest --rebaseline`. The
+  `tree-atlas` gate pins the atlas bytes separately, so the hash diff has a
+  cause attached.
+- **Authored by name, resolved at load.** A `.svtree` carries a material NAME
+  table and its runs hold local palette indices; the loader maps them to engine
+  ids. Renumbering `materials.json` cannot silently recolour a forest.
+- **Placement rides in the species file.** Biome weights, a per-species
+  altitude band and treeline, a slope gate and the canopy shade the forest
+  floor reads all live in `<species>.json` and are lifted into the atlas
+  directory. Adding a tree touches one file.
+
+The per-cell cost went DOWN: a candidate is now dropped at hoist time unless the
+tree's baked grid has something in this exact column, so `treeFromCands`
+typically runs zero or one iterations, and each one is a short scan of a
+column-RLE run list rather than fifteen segment-distance tests.
+
+**The clump primitive is a knob, not a constant** (2026-08-30). A crown built
+out of one shape can only ever be a pile of that shape, which is what made every
+early crown here read as a bunch of grapes. `foliage.clumpShape` picks among
+four — blob, plate (squashed along its axis: the tiered spray of a cedar),
+spray (stretched along it and thin across: a leafy shoot, not a ball), and cone
+(a spruce sprig) — and `foliage.clumpAxis` decides whether that axis is world-up
+or the twig the lobe grows on. All four are the same spheroid field measured in
+the clump's own frame, so they cost the same, they smooth-min to each other, and
+a crown may mix them. `foliage.hollow` eats the core out of every lobe: a real
+crown is a surface, and on an oak 0.7 is visually identical from outside for
+**half** the leaf voxels (54,771 → 26,354).
+
+Defaults are `clumpShape 0 / clumpAxis 0 / hollow 0`, and the field pass keeps a
+separate loop for exactly that case. Not laziness — the general loop computes
+the same spheroid but *reassociates* the arithmetic, and a float that
+reassociates moves a voxel, which moves the atlas, which moves the world hash.
+An opt-in knob must not re-bake ten species.
+
+The tab grew a **quad view** to go with it: four seeds at once, one per
+quadrant, under one orbit camera, because a shape knob is judged on a stand and
+not on a specimen. It is four WorldView regions at four origins rather than one
+composited grid — a 2x2 of great oaks in a single array is 32M cells of which
+the trees are an eighth, and both the array and its 3D texture would pay for the
+empty seven. Save, Bake and Export still act on the first tree.
 
 ##### The height contract (2026-08-26)
 
@@ -1743,6 +1835,32 @@ neighbors, so this needs an explicit connectivity pass:
     `physics.explosionBodyDamageScale` × the destruction radius, kept separate
     from the impulse reach so a blast pushes objects from further away than it
     dismembers them.
+  - **The crater on a BODY has a shape** (`Mob::CarveLimbRadial`, so the player
+    avatar and every NPC share it; the debris path above is unchanged). The
+    original rule — an independent coin flip per voxel against `1 - t²` — is
+    the wrong shape twice over. `1 - t²` is still 0.36 at 80% of the radius, so
+    a large blast really does take a bit of everything it touches; and white
+    noise has **no feature size**, so what comes off is a fine speckle no
+    falloff curve can turn into a piece. Three mechanisms fix it, all lerped
+    from the old behaviour by `gore.carveChunkiness` (0 reproduces it exactly,
+    which the `mob` gate asserts with a three-arm 0/1/0 control):
+    - **correlated noise** — value noise at `gore.carveBlobSize`, sampled on
+      the **skin** lattice so the crater is a property of the art and not of
+      whatever collider resolution the engine derived;
+    - **a tighter falloff** — `(1 - t²)^gore.carveFalloff`, same endpoints, so
+      the crater concentrates rather than shrinking;
+    - **spall** (`Mob::CarveSpall`) — `gore.carveSpallRounds` passes that
+      remove survivors inside the blast with 3+ missing face-neighbours,
+      re-deriving occupancy between rounds. This is the one thing a predicate
+      *cannot* express, because it is a question about occupancy rather than
+      about a voxel, and `CarveLimb` is the only place occupancy is known. It
+      is what makes damage accumulate in one place: a second hit widens the
+      first wound instead of stippling fresh flesh beside it.
+
+    All three scale with **severity** — the blast radius against the limb's own
+    extent — so a close charge chunks and a distant graze still stipples. The
+    spall parameter is optional and only the radial path fills it, which keeps
+    the burn flush and the laser's clean kerf out of it by construction.
   - **The laser** (`MeltBodyAt`) bores a channel tick by tick and the body
     splits when that channel actually severs it. No cutting plane is chosen,
     so what comes apart is decided by the geometry the player carved rather
@@ -2225,8 +2343,14 @@ consumes it and owns the physics plumbing. Per mob per tick:
    would be order-dependent.
 3. **Additive** layers applied *after* the normalize: `q_out = q_base *
    nlerp(identity, dq, w)`, with `dq = conj(q_ref) * q_src` measured against
-   the clip's own frame 0. Applying them before the normalize would let the
-   weight division scale the delta away.
+   the part's **rest** pose. Applying them before the normalize would let the
+   weight division scale the delta away. The reference is rest and *not* the
+   clip's own frame 0: a cyclic clip authored `+14 → −14 → +14` has its whole
+   swing subtracted away by a frame-0 reference and becomes a one-sided
+   `0 → −28 → 0`, so the pose never crosses rest and both arms sit permanently
+   off to the same side — the "zombie arms" look. Rest is also the only
+   reference under which two additive layers compose the way an animator
+   expects.
 4. **Flatten** parent→child in one linear pass; the loader topologically sorts
    limbs so a parent's index is always below its children's.
 5. **IK** — two-bone analytic, in model space, strictly a **post-process**.
@@ -2236,7 +2360,25 @@ consumes it and owns the physics plumbing. Per mob per tick:
    root angle uses the `atan2` form, and the bend plane comes from an
    **explicit per-chain pole vector** with a fixed fallback axis when the
    cross product degenerates near full extension.
-6. **Physics blend / submit** through the existing `MoveKinematicBody` path.
+6. **Pose limits** (`AnimClampPoseLimits`) — clamp every part carrying an
+   authored `poseLimit` back inside its range of motion, about the part's own
+   **rest** frame, then recompose the subtree below it. Runs *after all IK*,
+   never between solves: the IK is what puts a joint out of range, and a later
+   solve would undo an earlier clamp.
+
+   This exists because **the ragdoll limits do not bind an animated limb**.
+   `MobLimbDef::minAngle/maxAngle` and the swing-twist cone are Jolt
+   constraints, and Jolt only enforces them on a *dynamic* body — a live limb
+   is kinematic and re-posed every tick, so nothing at all stood between the IK
+   and an anatomically impossible leg. A single-axis limit clamps only the
+   **twist** about the authored axis and leaves the swing free, so "the hip
+   pitches between −20 and +85" can be stated without also constraining
+   abduction.
+
+   The limits are authored data (`assets/mobs/*.json`), and they should be
+   **measured, not guessed**: `--selftest --gate mob` prints each joint's
+   observed range next to its authored one for a flat walk and a ramp climb.
+7. **Physics blend / submit** through the existing `MoveKinematicBody` path.
 
 **Gait** is the base layer and needs no per-gait table. Each leg's ideal
 contact is `hip + fwd·strideBias + vel·leadTime`, snapped down through
@@ -2250,6 +2392,51 @@ the foot-plane normal (Newell's method)** — which is why walking up voxel
 stairs works with zero slope-handling code. Pelvis bob runs at 2× step
 frequency (one rise per footfall), sway/roll at 1×, plus spine
 counter-rotation and a progressive phase lag per hierarchy level.
+
+**The avatar's gait differs from a mob's in three ways**, all forced by the
+fact that the *player* owns the body rather than the gait:
+
+- **Body height comes from the player**, not from the foot average — the AABB
+  has already resolved against the terrain, and re-deriving height from feet
+  whose goal falls back to that same height is a loop that runs away at ~9.5
+  voxels/tick. The feet supply only the slope.
+- **The pelvis therefore has to CROUCH to buy the stride any reach.** With the
+  hip pinned at a fixed height above the ground, the reachable stride is
+  `sqrt(reach² − span²)`, and on a rig authored standing that is nearly
+  nothing: the stock human's hip sits 6.75 voxels over its ankle against a 6.79
+  chain, so the foot could travel **0.7 voxels** before the two-bone solver hit
+  its reach clamp — and a clamped solve is one fixed straight-leg pose for every
+  target beyond it. `stanceCrouch_` solves for the highest hip that can still
+  reach the far end of the stride the gait is about to ask for, and drops the
+  pelvis by the difference. It reads only the rig and the player's own speed,
+  never a foot position, so it is not the feedback path above.
+- **The IK effector is the ANKLE, so the foot goal is raised by `restSoleY_`.**
+  `GroundHeightAt` returns the surface the *min corner* rests on; handing that
+  to the solver asks for the full hip-to-corner drop and clamps on every tick
+  of every walk.
+
+**One stride clock.** `gaitPhase` on the avatar is driven **by the feet**: the
+rate is the measured period between touchdowns and the phase is pulled onto a
+half-turn boundary at each one (`PlayerAvatar::SyncStrideClock`). The feet step
+on a *drift threshold* while the bob/sway ran off `cadence × speedFactor` — two
+clocks that disagreed by ~2.6× on the stock human, which at a 30 Hz tick is a
+bob under four samples per cycle and reads on screen as a fast lateral jitter.
+It cannot be tuned out, because the ratio itself moves with speed. With one
+clock, `bobFreqMul 2` means "once per footfall" *by construction*. The walk/run
+clips ride the same rate through `ClipInstance::rate`, so the arms stay locked
+to the feet at speeds between the two authored clip periods. The NPC path
+deliberately keeps the free oscillator — its swing is a flat `stepDuration` at
+mob speeds, where the mismatch is small — and rigs with no leg chains
+(`dummy.json`) keep it because they have no foot to lock to.
+
+**Air-state clips fire on events, not on contact loss.** `jump` plays on
+`Player::jumped`, a sticky latch set where the impulse is actually applied and
+drained by `main.cpp` after the tick batch; losing contact is not a jump, and a
+step-down at walking pace clears any debounce. `fall` additionally requires a
+real **drop** below the height support was last held at (`avatar.fallMinDrop`),
+and its flail is a weight **ramp** over `fallFlailDelay`/`fallFlailRamp` rather
+than a pose that switches on — so a short drop never reaches the wide shape and
+only a genuine fall arrives at it.
 
 **Springs** (Holden's closed form, unconditionally stable at any dt) drive
 parts like tails. A part is *keyed or jiggled, never both*, so a spring never
@@ -2370,6 +2557,52 @@ ticks rather than once because the failure was *animated* — a single sample ca
 land on a frame where the limb swing happens to cancel. With the layer
 assignment removed that assertion reads ~19 voxels/tick.
 
+**THE EXEMPTION IS PART OF THE HANDLE, and every new handle must re-apply it.**
+The layer lives on a Jolt body, and three paths mint bodies for a live avatar:
+`BuildRig`, `EquipItem` and — the one that was missed — `RebuildLimbBody`.
+Every carve rebuilds a limb's collider, which REPLACES its handle, so the first
+bite of acid, fire, laser or blast put that limb back on `MOVING`, inside the
+capsule, and `PlayerPushOut` resumed shoving the player in a direction that
+swung with the gait. `EmitCarvedFragment` had the same shape: a gobbet is born
+inside the capsule, so it takes the avatar layer too and keeps it (a lump of
+you that has stopped colliding with you is invisible; one that ejects you is
+not).
+
+**A corpse is not a severed limb and does not get released.** `DetachLimb`
+strips the exemption only after `kSeverHoldSeconds`, by which time the piece
+has swung clear. `Die()` has no such beat — every limb goes dynamic at once, in
+the standing pose, entirely inside the proxy — so handing that to `MOVING` is a
+dozen unresolvable penetrations and the solver fires the whole ragdoll out of
+the capsule. `Mob::Die` therefore does **not** call `OnBodyReleasedToWorld`; the
+corpse keeps the exemption for good and keels over where it stood.
+
+**Damage from carving is INCREMENTAL** (`Mob::CarveLimb`). `voxelsAtSpawn` is
+fixed, so `at0 - nowCount` is everything the limb has ever lost; charging that
+on every carve makes N carves cost N(N+1)/2. Rare carves hid it — burning
+exposed it, because `FlushBurn` expresses itself as a carve every
+`max(12, n>>6)` voxels removed, so a burning limb carves dozens of times and
+reached hp 0 having lost ~14% of itself. `MobLimb::voxelsCharged` holds the
+previous numerator; the denominator stays `at0`.
+
+**A straggler may not inherit a limb.** The connectivity split after a carve
+gives the limb's identity to the component nearest the joint anchor — correct
+between two real pieces, and wrong for a single loose voxel that is merely
+*nearer* than the mass (the tie-break only fired on an exact distance tie,
+which never happens). Burning is a machine for producing that voxel: it eats
+holes, and holes strand specks. A wizard's head, 82% of its skin still there,
+was handed to a ONE-voxel component and then severed by
+`voxels.size() < kMinFragmentVoxels`; the head is vital, so the creature died.
+Only a component that could still BE the limb — `kMinFragmentVoxels` and
+`kLimbCollapseFraction` of the pre-split count — may now inherit it.
+
+`MobSystem::WorstSeverFraction()` records how much of a limb was still there
+when it came off, at the cut. That is the number that separates the two ways a
+limb can leave — it ran out (small) versus something took it while it was still
+a limb (large) — and it cannot be sampled from outside: `Die()` detaches every
+limb at once, `DetachLimb` cascades to children, and a limb can lose half of
+itself to a split inside the tick it is cut. The `mob-burn` gate's
+"burn leaves char" asserts on it.
+
 **Dismemberment drives movement.** `AvatarLocomotion` is the single place the
 damage state is turned into gameplay: `speedScale` comes from the matched
 `AnimStateRule`, while `jumpScale`/`canJump` are derived from *leg liveness*
@@ -2419,13 +2652,19 @@ world hash.
   path. Adopt once bodies carry their voxel payloads (M6).
 - **Far-field cascades (implemented 2026-08-19; docs/PLAN_far_field_cascades.md):**
   view distance beyond the residency window comes from kFarLevels nested
-  toroidal kFarN³ (256³) volumes centered on the player, one material byte per
+  toroidal kFarN³ (512³ since 2026-08-29; was 256³) volumes centered on the player, one material byte per
   cell. The far grid is DECOUPLED from the window size (phase 5, when the
   window went 512³): level k cells span 2^(k + kFarShiftBase) fine voxels with
   the shift base chosen so level k's box edge is always 2^k WINDOW edges —
-  cascade distances scale with the window at constant memory (128 MiB total at
-  kFarLevels = 8; outermost half-extent = 256× the window radius ≈ 4 km at the
-  512³ window and 6.25 cm voxels). Levels are filled on the GPU by sampling `genCell()` at stride
+  cascade distances scale with the window at constant memory (1024 MiB total at
+  kFarLevels = 8 and kFarN = 512, measured with `SANDVOX_GPUMEM=1`; outermost
+  half-extent = 256× the window radius = 6553.6 m at the 512³ window and 10 cm
+  voxels, asserted by the `far-fog` gate). kFarN went 256 → 512 on 2026-08-29
+  to halve the apparent cascade block from ~6 px to ~3 px: because a cascade
+  cell is POINT-SAMPLED at its centre voxel, cell size is also the size of the
+  smallest authored structure that survives the horizon, which is the LOD's
+  worst case and the one player-built content lands in.
+  Levels are filled on the GPU by sampling `genCell()` at stride
   (worldgen.wgsl `far` — the "sieve"), recentered with hysteresis like the
   streaming window, and refilled a plane at a time (≤ kFarListCap
   level-chunks/tick, managed by `sim/farfield`). **Edits reach the far field
@@ -2966,6 +3205,31 @@ scaled uniformly, so all three parametrizations share one `t`. Get this wrong by
 normalizing and micro bodies punch through terrain or sink into it. Hardware
 `GreaterEqual` testing then composites them against the world, particles, cubes
 and sprites with no sorting anywhere.
+
+**A VOLUME NEEDS A DEPTH TOO, and it is the MEDIAN one.** The raymarcher runs
+first and the raster passes draw on top of the depth it wrote. Gas is not a
+surface — `trace()` accumulates it and keeps marching — so a pixel full of fire
+reported the depth of the SOLID BEHIND the flame, or the far plane for a ray
+that crossed the plume into sky. Every mob, debris chunk and dropped item
+therefore passed the depth test against fire it was genuinely behind and drew
+straight over it: fire never composited in front of a rigidbody at any distance
+or density, and a burning creature had its own flames painted behind it.
+
+Writing depth at the plume's FIRST cell is worse than the bug — a single wisp of
+smoke would then hard-clip a body standing behind it. `Hit.gasHalfT` is the
+point where the accumulated GAS crosses half opacity (`MEDIA_HALF_TAU`, ln 2;
+~1.8 cells at fire's authored opacity 150/255, ~4 at smoke's 70/255), which is
+the honest single depth for a volume: a wisp never reaches it and nothing
+changes, geometry beyond it is more hidden than shown, and geometry in FRONT of
+it still wins the reversed-Z test and draws over the flame. Liquids are excluded
+— they have a real interface (`liqT`) and already report it. Ordering geometry
+*inside* a plume still needs order-independent transparency.
+
+Gated by `--selftest --gate fire-depth`, which renders a stone block behind a
+fire slab and the same block in front of it and compares both against the flame
+alone: **56 px vs 93,433 px**. Both arms are the claim — a first-cell depth
+would also pass the "behind" half while wrecking the "front" half, so an arm
+that only checks the fix is not a test.
 
 **Routing.** Body render slots are shared: a slot with a micro model draws here
 and contributes NO cube instances (drawing both would double-draw at the wrong
@@ -4230,6 +4494,127 @@ and reads back as the material it asked for.
 `bash scripts/check_worldview.sh` covers the half that C++ cannot see: real
 Chrome, real WebGL2, the real worker, `/api/voxregion` over HTTP, greedy
 meshing, LOD shells, a pixel readback, a raycast, an edit and an undo.
+
+## 8b. The character screen (added 2026-08-29)
+
+The screen the armour, weapon, pickup and spell-acquisition systems land into.
+`I` opens it; `Esc` closes it before it does anything else. Three regions over a
+dimmed but **still running** world:
+
+* **left** — a LIVE avatar portrait with armour slots flanking it, sheath and
+  quick slots beneath, and a `CHARACTER`/`HEALTH` toggle that swaps the same
+  frame between equipment and an injury inspector.
+* **top right** — the arsenal: every glyph the player owns, and the ten bound
+  slots that **are** the magic-mode number row.
+* **bottom right** — the pack (4x8) and the hotbar row, with drag between all of
+  them.
+
+The sim keeps running while it is open. This is WoW, not single-player
+Minecraft: the engine is real-time and the MutationQueue is a future network
+stream (§10), so a pause would be a lie the moment a second player existed.
+
+### The portrait is the avatar, not a picture of one
+
+`src/main.cpp` renders a **second camera** at the player's own rig into a
+320x448 offscreen target once per frame while the screen is open, and ImGui
+samples it. That is the whole reason the panel needs no portrait art and no
+paper-doll layer: the avatar is one live copy-on-write micro-voxel body, so
+missing voxels, char/cook material transitions (§6), severed limbs (§7),
+dismemberment poses and whatever is in its hand all appear **for free**, and
+nothing in the UI knows about any of them. Cost is ~2 draw calls over ~18 OBB
+instances, no shadows, no raymarch — the honest cost is the second submit.
+
+Three things about it are load-bearing and were each learned the hard way:
+
+* **`world.renderUBO` is ONE buffer**, so two cameras cannot share a command
+  buffer. Each pass writes its own params and is submitted separately; queue
+  writes drain at the head of the next command buffer, which is exactly what
+  makes that work. The main camera is re-written after the portrait submits.
+* **The instance lists are shared too.** In first person the body is hidden and
+  the arms are not (§8), so the portrait re-uploads with an empty hide mask,
+  draws, and hands the real mask back — the same write-then-submit pattern one
+  level down.
+* **A sampled render target needs a layout.** `vk::Image::sampled` (set from
+  `TextureUsage::TextureBinding`) makes the recorder leave it in
+  `SHADER_READ_ONLY_OPTIMAL` at `Finish()`, exactly as `presentable` does for
+  the swapchain. Without it the attachment ends the pass in
+  `COLOR_ATTACHMENT_OPTIMAL` and ImGui's descriptor describes a layout the image
+  is not in.
+
+The portrait's light is a **fixed studio sun** independent of the world clock:
+`--shot-mob`'s own comment says why — midnight is the worst possible light for a
+silhouette, and a character sheet that goes unreadable at night is one you
+cannot use half the time.
+
+### Equipment is a slot TABLE, and the table is the schema
+
+`src/game/equipment.h` holds `EquipSlots()`: one row per slot, each naming the
+`ItemKind`s it accepts. That table **is** the armour system's schema. Armour
+content does not exist yet, so every armour row accepts nothing and says so —
+`MoveResult::WrongKind` carries the sentence the tooltip shows. The day
+`ItemKind::ArmorHead` exists, the change is one row, not a branch.
+
+Two rows accept something today (sheath and the quick slots take
+`ItemKind::Melee`), which is what proves the move/validate/persist pipe end to
+end with the one item the game has. A move is always a **swap**, never an
+overwrite, and validates BOTH ends — so no mis-drop can destroy an item.
+
+Sheathing is **data only**: the slot holds a weapon, it does not draw it on the
+avatar's back. The visual is a `sheath_back` socket in the rig plus a matching
+grip context on the item — `ItemGrip`'s context map (`game/item.h`) already
+anticipates exactly that, so it is content, not code.
+
+### Mirror in, intent out
+
+`ui/inventory_ui.cpp` is a drawing function. It reads `UIState`'s mirrors and
+writes `UIState`'s one-shot intent latches; it never touches an `Inventory`, an
+`Equipment`, a `GlyphInventory` or the avatar. `main.cpp` consumes the latch,
+calls the real method, and next frame's mirror shows the result. The one address
+both sides speak is `KitRef` (`game/kitref.h`) — a dependency-free header
+precisely so the UI can name a slot without pulling the item system in, and so
+there is one definition rather than two that must agree.
+
+Binding a glyph in the arsenal rewires the live number row, because the panel
+and the keys read one mirror.
+
+### Everything crosses by NAME
+
+Item and glyph slots hold indices into `ItemLibrary::items` /
+`GlyphLibrary::glyphs`, both **file-order dependent** and renumbered by any edit
+to `items.json` or `glyphs.json`. So every crossing — the `R` hot reload, the
+`PLYR` save section — snapshots names and re-resolves them. A name that no
+longer resolves empties the slot with a log line: content legitimately
+disappears between saves, and that is the contract, not a failure.
+
+This closed two live bugs as well as preventing new ones: the hot-reload path
+carried a comment promising the hotbar was "re-validated below" and there was no
+such code, and `GrantAllAndBind` threw away the player's spell bindings on every
+`R`.
+
+### Persistence: `entities.sve` section `PLYR` v1
+
+Registered in `game/persist.cpp` beside `DBRS`/`MOBS`/`AVTR`. A bundle of
+references rather than a system with its own `SaveState`, because no single
+object owns all of it — the hotbar predates the pack and the caster is
+deliberately separate from the player. Length-prefixed strings with explicit
+counts, so a build whose `kItemSlots` or `Bag::kSlots` has changed reads an older
+file correctly instead of walking off the end. A truncated or unknown-version
+payload is REFUSED, not half-applied.
+
+### Verification
+
+`--gate player-kit` (`src/test/selftest_playerkit.cpp`) is CPU-only and builds
+its own two-item / three-glyph fixtures, so it asserts on the RULES rather than
+on today's content: the refusal matrix in both directions, swap-never-overwrite,
+binding by ownership, name re-resolution across a simulated library reorder, and
+a `PLYR` round trip compared **by name**. It runs in milliseconds and needs no
+GPU, which is what makes it the whole iteration loop for the equipment model.
+
+`--shot-inventory` runs the windowed game, damages the avatar on a fixed
+schedule and writes two frames — `screenshot_inventory.bmp` (gear) and
+`screenshot_inventory_health.bmp` (inspector). The screen's job is to be looked
+at, so the harness that judges it produces a picture; it prints the image's
+pixel sum, because "wrote the file" is true of an all-black rectangle too.
 
 ## 10. Networking (design now, build later)
 

@@ -256,6 +256,8 @@ hashes are identical, the parameter doesn't reach the kernel at those values.
 | `assets/worldedits/` | authored `.svedit` layers, applied by `worldgen.editLayer` |
 | `assets/sound_schema.js` | only list of sound slots; must match `Cues::kSlotPrefix` in `audio/cues.cpp` |
 | `assets/spells/glyphs.json` | glyph content, materials by name, hot-reloads with R |
+| `assets/trees/` | `<species>.json` = authored tree params (the truth), `<species>.svtree` = the baked voxel atlas the engine loads. Voxelized ONLY by `assets/editor/treegen.js`; re-bake with `node scripts/bake_trees.mjs`, which MOVES THE WORLD HASH |
+| `assets/editor/treegen.js` + `trees.js` | the tree generator (pure, Node-runnable) + the tuner's Trees tab |
 | `assets/prefabs/`, `assets/mobs/` | `.vox` art + mob `.json` sidecars |
 
 ## Design guidelines (from [Lin 2021](docs/refs/perfect_voxel_engine.md))
