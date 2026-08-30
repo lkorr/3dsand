@@ -64,7 +64,7 @@ const TUNING_SCHEMA = [
     apply: 'cpu',
     blurb: 'Movement feel. Everything is stated in metres and m/s and converted to voxels at use, so these keep their meaning if the voxel size changes.',
     params: [
-      {k:'model', n:'player model', d:'Which mob def to use as the player avatar. Change takes effect on F5 (tuning reload). <b>human</b> is the stock base body — one material (flesh) everywhere, painted per voxel, with only a pair of shorts on it, so the armour system has a clean surface to equip onto. The others are finished characters with their clothing welded into the geometry.', type:'select', options:['human','mina','asha','wizard']},
+      {k:'model', n:'player model', d:'Which mob def to use as the player avatar. Change takes effect on F5 (tuning reload). <b>human</b> is the stock base body — flesh everywhere, painted per voxel, with only a pair of linen shorts on it, so the armour system has a clean surface to equip onto. The shorts are their own material (<i>undercloth</i>) rather than a paint colour, because burning a body voxel clears its art colour: painted-on clothing chars into bare flesh and the character reads as naked, so anything that must survive a fire has to be a material. The others are finished characters with their clothing welded into the geometry.', type:'select', options:['human','mina','asha','wizard']},
       {k:'walkSpeed', n:'walk speed', d:'Base ground speed. Quake is ~5.5, Minecraft ~4.3.', min:0.5, max:20, step:0.05, u:'m/s'},
       {k:'sprintSpeed', n:'sprint speed', d:'Speed while holding shift on the ground.', min:0.5, max:30, step:0.05, u:'m/s'},
       {k:'gravity', n:'gravity', d:'Fall acceleration. 9.81 is real gravity, which reads as floaty next to most shooters — raise it for snappier falls.', min:0, max:40, step:0.05, u:'m/s²'},
@@ -258,6 +258,19 @@ const TUNING_SCHEMA = [
     params: [
       {k:'waterFreezes', n:'water freezes at night', d:'Exposed water turns to ice on clear nights, and existing ice spreads into the water it touches. Freezing works from the shore inward — deep open water cannot nucleate ice, so ponds skin over from the bank rather than flash-freezing. Off leaves every pond liquid through the night. Needs open sky, so cave water is unaffected either way.', bool:true},
       {k:'iceMelts', n:'ice and snow melt in sun', d:'Snow and ice in direct daylight melt back to water. Off makes winter permanent. Note this only governs SUNLIGHT: ice and snow still melt on contact with fire and lava regardless, since that is a heat rule rather than a weather one. Turning this off while freezing stays on means ice only ever accumulates — stable, but one-way.', bool:true},
+    ],
+  },
+
+  {
+    id: 'combustion',
+    title: 'Combustion',
+    icon: '\u{1F525}',
+    apply: 'cpu',
+    group: 'combustion',
+    determinism: true,
+    blurb: 'How long anything in the world stays ALIGHT. Like Weather next door, this tab is read by the reaction COMPILER rather than by a kernel: the multiplier is folded into the authored chances when reactions.json is compiled, so the GPU cannot tell a scaled rule from a hand-written one and the world costs nothing extra to run at any setting. Reload (F5) rebuilds the reaction table, so a change here applies on the same keypress as an edit to the Materials tab. It changes the world hash for the same reason editing a chance by hand does — it is content, not a divergence.',
+    params: [
+      {k:'burnDurationPct', n:'burn duration', d:'How long a lit voxel stays lit, as a percentage of what reactions.json authors: 100 is the authored figure, 200 is twice as long, 50 is half. It divides the chance of every rule marked "burnDuration" in that file. Two kinds carry the mark. The ones that RETIRE a burning voxel — an ember to ash, smoke or air, and burning cloth, undercloth, hair and flesh to their charred or spent forms — are the feature. The RELIGHT rules (charred back to burning) are scaled with them because they are the only closed loop in the fire economy: leaving them alone while the burn got longer multiplied the loop’s gain by the same factor, and past about 400% it would cross 1.0 and burn forever. Scaling both means the slider changes the fire’s CLOCK and never its shape — a corpse in lava re-flares half as often and stays lit twice as long. All of a material’s branches scale by the same factor, so the RATIOS between them never move: doubling the duration does not change what fraction of a burnt robe survives as ash rather than vanishing.\n\nIt does NOT touch three things next to it, and each exclusion is deliberate. IGNITION chances (how fast fire spreads through fuel) are a separate lever authored per fuel — though turning this up does spread fire further anyway, because a voxel that stays lit twice as long emits its upward flame twice as many times over its life, which is the reason to reach for this knob rather than for the ignition rates. EMIT chances are left alone so a longer burn is a brighter one rather than a dimmer one spread thin. And EXTINGUISHER rules are left alone so water beats the burn to the tick at any setting.\n\nAt 100 a cloth voxel burns for about 26 ticks (0.9 s) and flesh for about 20; a wood ember smoulders for about 140. The default 200 doubles all of those.', min:25, max:800, step:5, int:true, u:'%', warn:'Changes the world hash. Deterministic, just a different world — rebaseline in the same commit.'},
     ],
   },
 

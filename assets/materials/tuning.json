@@ -823,6 +823,9 @@
     "waterFreezes": false,
     "iceMelts": false
   },
+  "combustion": {
+    "burnDurationPct": 200
+  },
   "wind": {
     "windSpeed": 6,
     "windDirDeg": 45,

@@ -570,6 +570,33 @@ static bool LoadReactionsJson(const std::string& path, std::vector<MaterialDef>&
     // the GPU never sees a float (rule 1). Every machine loading the same JSON
     // gets the same integer.
     double chanceMille = r.value("chance", 0.0);
+    // ---- "burnDuration": the one authored knob that scales a chance --------
+    //
+    // A rule marked this way is one that RETIRES A BURNING VOXEL, and its
+    // chance is divided by combustion.burnDurationPct — so 200 halves the
+    // per-tick death rate and doubles how long anything in the world stays
+    // alight. The whole point of doing it here rather than per-cell is that
+    // the GPU never learns the knob exists: the scaled value is rounded into
+    // the same integer an authored chance compiles to, once, on the CPU
+    // (rule 1). See Tuning::Combustion for what is deliberately NOT scaled.
+    //
+    // Applied BEFORE the range check so the check is the one that catches an
+    // out-of-range result, and so a scaled rule cannot slip past 1000
+    // per-mille at a low setting. The floor below is the other half: a rule
+    // scaled toward zero still fires eventually rather than becoming an
+    // eternal flame.
+    // Gated on the AUTHORED value already being in range, so a rule that
+    // forgot its "chance" still reports "chance must be ..." rather than being
+    // quietly floored into a legal one by the scaling.
+    const bool burnDur = r.value("burnDuration", false) &&
+                         chanceMille >= kReactChanceMinMille &&
+                         chanceMille <= 1000.0;
+    if (burnDur) {
+      const int pct = CurrentTuning().combustion.burnDurationPct;
+      chanceMille = chanceMille * 100.0 / (double)(pct > 0 ? pct : 100);
+      if (chanceMille > 1000.0) chanceMille = 1000.0;
+      if (chanceMille < kReactChanceMinMille) chanceMille = kReactChanceMinMille;
+    }
     if (!(chanceMille >= kReactChanceMinMille) || chanceMille > 1000.0) {
       errors += path + ": reaction self=\"" + self + "\": chance must be " +
                 FormatMille(kReactChanceMinMille) + "..1000 per-mille\n";

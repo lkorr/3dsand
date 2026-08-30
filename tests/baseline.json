@@ -3,7 +3,7 @@
   "_recorded_at": "46b7ec7 2026-08-21, RTX 3060 Ti; last re-recorded 2026-08-25 for the GAS VERTICAL MODEL (buoyancy as a redistributable probability)",
   "_treeAtlas_about": "tree-atlas gate. treeAtlasHash is FNV-1a over the uploaded atlas buffer (assets/trees/*.svtree, remapped to engine material ids). It moves when a species is re-baked -- which also moves determinismHash, so this is what names WHICH asset did it instead of leaving a world-hash diff with no cause attached. Re-bake with node scripts/bake_trees.mjs, then --selftest --rebaseline.",
   "treeAtlasHash": "a359d57915a7cad2",
-  "determinismHash": "f1703a32",
+  "determinismHash": "3ec6f97e",
   "determinism": "pass",
   "sleep": "pass",
   "ca-slope": "pass",
@@ -76,7 +76,7 @@
   "terrain.rampMaxObserved": "34",
   "terrain.localReliefObserved": "129",
   "terrain.farReliefObserved": "958",
-  "terrain.settleProxyObserved": "3",
+  "terrain.settleProxyObserved": "0",
 
   "_smoke_about": "Pinned hash sequences for --vk-smoke and --vk-smoke-loud. Each entry is [tick, hash]. tick 0 = worldgen. Re-record with --rebaseline.",
   "smokeQuiet": [

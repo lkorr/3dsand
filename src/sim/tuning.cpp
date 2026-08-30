@@ -1308,6 +1308,23 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadB(*g, "iceMelts", w.iceMelts, out, at);
   }
 
+  // ---- combustion: read by the REACTION COMPILER, not by a kernel ----
+  if (const json* g = Find(j, "combustion")) {
+    auto& cb = out.combustion;
+    const std::string at = "combustion";
+    ReadI(*g, "burnDurationPct", cb.burnDurationPct, out, at);
+    // Clamped rather than validated away, because the failure at the bottom is
+    // silent and total: at 0 the divide would send every retire rule's chance
+    // to the 1-unit floor materials.cpp applies, i.e. "a lit voxel effectively
+    // never goes out", which is rule 2 broken by a typo. 25% is a quarter of
+    // the authored duration and is already very fast; 800% is ~27 s per cloth
+    // voxel and is well past anything playable.
+    if (cb.burnDurationPct < 25 || cb.burnDurationPct > 800) {
+      out.warnings.push_back("combustion.burnDurationPct outside 25..800; clamped");
+      cb.burnDurationPct = cb.burnDurationPct < 25 ? 25 : 800;
+    }
+  }
+
   // ---- wind (docs/RESEARCH_wind.md; the field itself is common.wgsl) ----
   if (const json* g = Find(j, "wind")) {
     auto& w = out.wind;

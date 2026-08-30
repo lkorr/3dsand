@@ -2508,6 +2508,81 @@
         "dissolvable"
       ],
       "molten": "fire"
+    },
+    {
+      "//": "APPEND ONLY BELOW THIS LINE. A material's id IS its index in this array, and every .vox in the project paints with those indices -- inserting a material anywhere but the end silently renumbers every model after it (see the treeatlas 'i+1' incident). Art palette slots start at 128 (kArtPaletteBase, sim/voxload.h), so this list may grow to 127 entries and no further.",
+      "//2": "UNDERCLOTH. The linen the base human model wears, and the reason it is a material rather than a paint colour. Body voxels are 8 bits of material plus 8 bits of ART COLOUR, and every reaction that rewrites a body voxel CLEARS the colour byte (BurnLimbView::Set) -- deliberately, because the burn chain's whole visual account of itself is the material it turns into, and a nonzero art slot would paint straight over the char. So underwear painted onto skin voxels burned to flesh_cooked, lost its paint, and the wearer read as NAKED rather than as scorched. Giving the garment its own id costs nothing and puts the fix where the rest of the burn model already lives: its own chain, in JSON. Colour is the mid tone of the art layer it replaces, so an UNPAINTED use of this material still reads as undyed cloth.",
+      "id": "undercloth",
+      "class": "solid",
+      "density": 320,
+      "hardness": 4,
+      "rubble": "ash",
+      "colors": [
+        "#7a6a4e",
+        "#665843",
+        "#8d7c5c"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable"
+      ],
+      "molten": "fire"
+    },
+    {
+      "//": "Undercloth alight. A near-copy of cloth_burning and NOT the same material, which is the entire mechanic: cloth_burning is CONSUMED (it has a becomes-air branch, so a robe burns into holes), and this one is not. See its rules in reactions.json.",
+      "id": "undercloth_burning",
+      "class": "solid",
+      "density": 300,
+      "hardness": 2,
+      "rubble": "ash",
+      "emission": 190,
+      "colors": [
+        "#ff8a2a",
+        "#e05c15",
+        "#ffb347"
+      ],
+      "tags": [
+        "hot",
+        "organic",
+        "dissolvable"
+      ],
+      "molten": "fire"
+    },
+    {
+      "//": "Scorched undercloth: the TERMINUS of the whole chain, and the only material in this file that authors no rules at all. That is the point rather than an omission -- it can never burn away, so a torched character keeps a blackened garment instead of losing it, and it can never re-ignite, so the chunk it sits in sleeps (rule 2). NEUTRAL-COOL where the flesh chars beside it are warm brown-black, which is the whole readability job: value alone would not separate scorched linen (#262326) from charred flesh (#3a2f2a) at a glance, but hue does, and it is the same neutral family cloth_charred already uses because both are burnt fabric. A touch darker than cloth_charred: this garment burns to completion rather than into rags.",
+      "id": "undercloth_charred",
+      "class": "solid",
+      "density": 280,
+      "hardness": 2,
+      "colors": [
+        "#262326",
+        "#1c1a1d",
+        "#322e33"
+      ],
+      "tags": [
+        "organic",
+        "dissolvable"
+      ],
+      "molten": "fire"
+    },
+    {
+      "//": "DEEP CHAR: one stage past flesh_charred. Charred is what a body looks like the moment the flame passes over it -- dark, but still brown and still recognisably meat. Sustained fire takes it further, and this is where it ends: cinder, near-black, crisp. Authored as a separate id rather than as another palette jitter of flesh_charred because it is not a shade, it is a STATE -- it has different rules (none), so a corpse driven this far can neither re-ignite nor be driven further, which is what makes a torched body a settled, permanently black thing rather than one that smoulders on the edge of relighting. hardness 2 continues the ramp (skin 8 -> cooked 7 -> charred 3 -> cinder 2): a cindered limb comes apart at a touch.",
+      "id": "flesh_cinder",
+      "class": "solid",
+      "density": 520,
+      "hardness": 2,
+      "rubble": "ash",
+      "colors": [
+        "#191411",
+        "#0f0c0a",
+        "#241d18"
+      ],
+      "tags": [
+        "organic",
+        "dissolvable"
+      ],
+      "molten": "fire"
     }
   ]
 }

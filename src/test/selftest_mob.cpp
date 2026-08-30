@@ -2308,9 +2308,16 @@ Status GateMobBurn(Ctx& c, std::string& detail) {
                  mClothChar = matId("cloth_charred"), mSkin = matId("skin"),
                  mCooked = matId("flesh_cooked"),
                  mCharred = matId("flesh_charred"),
-                 mBurning = matId("flesh_burning"), mBlood = matId("blood");
+                 mBurning = matId("flesh_burning"), mBlood = matId("blood"),
+                 mCinder = matId("flesh_cinder"), mUnder = matId("undercloth"),
+                 mUnderBurn = matId("undercloth_burning"),
+                 mUnderChar = matId("undercloth_charred");
   if (!mFire || !mAcid || !mCloth || !mSkin || !mCooked || !mBurning) {
     detail = "body-reactivity materials missing from materials.json";
+    return Status::Fail;
+  }
+  if (!mCinder || !mUnder || !mUnderBurn || !mUnderChar) {
+    detail = "undercloth / flesh_cinder missing from materials.json";
     return Status::Fail;
   }
 
@@ -2368,6 +2375,137 @@ Status GateMobBurn(Ctx& c, std::string& detail) {
       }
     }
     ok = ok && a;
+  }
+
+  // ---- I. the three claims that live entirely in the COMPILED TABLE --------
+  // No fixture, no ticks, no GPU: each of these is a statement about what
+  // reactions.json compiled to, and asserting it here costs microseconds where
+  // reproducing it through a burning creature costs hundreds of ticks and
+  // could only ever show it happening rather than show it being impossible.
+  {
+    // ---- I.1 the burn-duration multiplier reaches the compiler -------------
+    // combustion.burnDurationPct is folded into the authored chance at LOAD
+    // (sim/materials.cpp), so nothing downstream can see it and --sweep — which
+    // only reloads shaders — cannot reach it either. The differential is
+    // therefore taken where the knob is spent: compile the same two files
+    // twice, at 100% and at 200%, and compare the tables.
+    //
+    // Two halves, and the second is the one worth having. That SOMETHING moved
+    // proves the knob is wired; that everything which moved moved by EXACTLY
+    // the factor proves it did not also quietly rescale an ignition or an emit
+    // rule, which is the failure that would look like a working feature and
+    // play like a different game.
+    const std::string mp = AssetDir() + "/materials/materials.json";
+    const std::string rp = AssetDir() + "/materials/reactions.json";
+    const Tuning saved = CurrentTuning();
+    std::vector<MaterialDef> m1, m2;
+    std::vector<ReactionGpu> r1, r2;
+    std::string e1, e2;
+    Tuning t1 = saved;
+    t1.combustion.burnDurationPct = 100;
+    SetCurrentTuning(t1);
+    const bool load1 = LoadAssets(mp, rp, m1, r1, e1);
+    Tuning t2 = saved;
+    t2.combustion.burnDurationPct = 200;
+    SetCurrentTuning(t2);
+    const bool load2 = LoadAssets(mp, rp, m2, r2, e2);
+    SetCurrentTuning(saved);
+
+    uint32_t scaled = 0, wrongFactor = 0;
+    bool sameShape = load1 && load2 && r1.size() == r2.size();
+    if (sameShape) {
+      for (size_t i = 0; i < r1.size(); i++) {
+        // Everything but the chance must be untouched: this knob rewrites a
+        // rate, never a rule.
+        if (r1[i].packed != r2[i].packed || r1[i].prodSelf != r2[i].prodSelf ||
+            r1[i].prodNbr != r2[i].prodNbr || r1[i].cond != r2[i].cond) {
+          sameShape = false;
+          break;
+        }
+        if (r1[i].chance == r2[i].chance) continue;
+        scaled++;
+        // Halved, up to the round-half-up the compiler applies once.
+        const uint32_t want = (r1[i].chance + 1u) / 2u;
+        if (r2[i].chance + 1u < want || r2[i].chance > want + 1u) wrongFactor++;
+      }
+    }
+    const bool i1 = sameShape && scaled > 0 && wrongFactor == 0;
+    std::printf("  burn duration knob: %s (%u rules halved at 200%%, %u by the "
+                "wrong factor; live setting %d%%)\n",
+                i1 ? "PASS" : "FAIL", scaled, wrongFactor,
+                saved.combustion.burnDurationPct);
+    if (!i1 && (!load1 || !load2))
+      std::printf("    reload failed: %s%s\n", e1.c_str(), e2.c_str());
+    std::fflush(stdout);
+    ok = ok && i1;
+
+    // ---- I.2 A BURNT CHARACTER IS NEVER A NAKED ONE ------------------------
+    // The base human's linen is a material, not a paint colour, precisely so
+    // that burning it cannot expose skin — every reaction that rewrites a body
+    // voxel clears its art colour, so a painted-on garment burns into whatever
+    // the underlying material chars to and reads as bare flesh.
+    //
+    // Asserted as a REACHABILITY claim over the whole chain rather than as
+    // "undercloth_burning has no air branch", because the hole could be opened
+    // by any of the three materials, or by a fourth added between them later.
+    // Nothing in the closure may produce air (prodSelf 0), and the closure must
+    // terminate at undercloth_charred, which authors no rules at all.
+    {
+      std::vector<uint32_t> stack{mUnder}, seen{mUnder};
+      bool leaks = false, closed = true;
+      while (!stack.empty() && closed) {
+        const uint32_t id = stack.back();
+        stack.pop_back();
+        const MaterialGpu& g = mats[id].gpu;
+        for (uint32_t i = 0; i < g.reactCount; i++) {
+          const ReactionGpu& rr = c.reactions[g.reactOffset + i];
+          const uint32_t kind = rr.packed & 3u;
+          // An EMIT rule's prodNbr goes into a NEIGHBOURING air cell (the
+          // flame licking upward) and is not this voxel becoming anything —
+          // only prodSelf is the chain.
+          if (kind == kReactEmit && rr.prodSelf == kProdKeep) continue;
+          if (rr.prodSelf == 0u) { leaks = true; break; }
+          if (rr.prodSelf == kProdKeep) continue;
+          const uint32_t p = rr.prodSelf & 0xFFFu;
+          if (std::find(seen.begin(), seen.end(), p) != seen.end()) continue;
+          seen.push_back(p);
+          stack.push_back(p);
+        }
+      }
+      // Every state the linen can reach must be one of its own three, or the
+      // chain has escaped into a material with different (consumable) rules.
+      for (uint32_t s : seen)
+        if (s != mUnder && s != mUnderBurn && s != mUnderChar) closed = false;
+      const bool terminal = mats[mUnderChar].gpu.reactCount == 0;
+      const bool i2 = !leaks && closed && terminal;
+      std::printf("  linen chars, never bares: %s (%zu states reachable, "
+                  "air branch %s, terminus %s)\n",
+                  i2 ? "PASS" : "FAIL", seen.size(), leaks ? "PRESENT" : "none",
+                  terminal ? "inert" : "still reactive");
+      std::fflush(stdout);
+      ok = ok && i2;
+    }
+
+    // ---- I.3 deep char exists and ENDS ------------------------------------
+    // flesh_cinder is the stage past flesh_charred, and the reason it is a
+    // material rather than a palette jitter is that it has no rules — a torched
+    // corpse is permanently black AND permanently settled. A cinder that could
+    // re-ignite would be a corpse whose chunk never sleeps (rule 2), so the
+    // "authors nothing" half is the load-bearing one.
+    {
+      bool reachable = false;
+      const MaterialGpu& g = mats[mCharred].gpu;
+      for (uint32_t i = 0; i < g.reactCount; i++)
+        if ((c.reactions[g.reactOffset + i].prodSelf & 0xFFFu) == mCinder)
+          reachable = true;
+      const bool inert = mats[mCinder].gpu.reactCount == 0;
+      const bool i3 = reachable && inert;
+      std::printf("  deep char: %s (charred -> cinder %s, cinder %s)\n",
+                  i3 ? "PASS" : "FAIL", reachable ? "authored" : "MISSING",
+                  inert ? "inert" : "STILL REACTIVE");
+      std::fflush(stdout);
+      ok = ok && i3;
+    }
   }
 
   int wizDef = -1;
@@ -2670,14 +2808,24 @@ Status GateMobBurn(Ctx& c, std::string& detail) {
     const uint32_t lit =
         armLimb >= 0 ? mobs.IgniteLimb(id, armLimb, 60u, mCloth) : 0u;
 
-    auto alightOnMob = [&]() {
-      return mobs.IsAlive(id) ? census(id, mClothBurn) + census(id, mBurning)
-                              : 0u;
+    // Split by material, because "13 voxels still alight" is a bare count and
+    // a bare count buys one hypothesis per run (CLAUDE.md rule 6). WHICH
+    // material is still lit says which relight loop failed to converge: cloth
+    // and flesh have separate charred -> burning rules with different chances
+    // and different minCounts, and the combustion clock scales both. It paid
+    // for itself on its first run: "13 still alight" at 200% was 13 CLOTH and 0
+    // flesh, and still falling — a longer tail from a longer burn, not the
+    // relight loop refusing to converge, which is what the bare count had
+    // looked like and would have been diagnosed as.
+    auto alightCloth = [&]() {
+      return (mobs.IsAlive(id) ? census(id, mClothBurn) : 0u) +
+             debris.TotalBodyMaterial(mClothBurn);
     };
-    auto alightInWorld = [&]() {
-      return alightOnMob() + debris.TotalBodyMaterial(mClothBurn) +
+    auto alightFlesh = [&]() {
+      return (mobs.IsAlive(id) ? census(id, mBurning) : 0u) +
              debris.TotalBodyMaterial(mBurning);
     };
+    auto alightInWorld = [&]() { return alightCloth() + alightFlesh(); };
 
     // THE INVARIANT IS MEASURED WHERE IT HAPPENS. Inferring "a limb came off
     // while it was still mostly there" from outside cannot be made to work:
@@ -2691,7 +2839,17 @@ Status GateMobBurn(Ctx& c, std::string& detail) {
     int deathTick = -1;
     burnBloodDrops = burnBleedTicks = 0;
     countBlood = true;
-    for (int i = 0; i < 630; i++) {
+    // THE QUIET WINDOW IS A DURATION, SO IT SCALES WITH THE BURN CLOCK. 630
+    // ticks was chosen against the chances reactions.json authored, and
+    // combustion.burnDurationPct multiplies exactly those — so a literal here
+    // is a deadline that silently tightens every time the slider goes up. It
+    // failed that way on the first run at 200%: 13 voxels still alight, which
+    // reads as "the fire never went out" and is really "the fire takes twice
+    // as long to go out and you gave it the same wall clock". The claim being
+    // asserted is that the burn TERMINATES, and terminating twice as slowly is
+    // the feature working, not a regression.
+    const int kQuiet = 630 * CurrentTuning().combustion.burnDurationPct / 100;
+    for (int i = 0; i < kQuiet; i++) {
       burnTick(id, 0, 0);
       peakAlight = std::max(peakAlight, alightInWorld());
       if (deathTick < 0 && !mobs.IsAlive(id)) deathTick = i;
@@ -2712,20 +2870,36 @@ Status GateMobBurn(Ctx& c, std::string& detail) {
     const bool ate = worstSever <= 0.5f;    // claim 2: fire eats before it takes
     const bool hOk = wasLit && out && charOk && ate;
     std::printf(
-        "  burn leaves char: %s (%u lit, peak %u alight -> %u after 630 quiet "
+        "  burn leaves char: %s (%u lit, peak %u alight -> %u after %d quiet "
         "ticks, %u charred; worst sever %s at %.0f%% of spawn volume, floor "
         "50%%; %s)\n",
-        hOk ? "PASS" : "FAIL", lit, peakAlight, stillAlight, charred,
+        hOk ? "PASS" : "FAIL", lit, peakAlight, stillAlight, kQuiet, charred,
         worstSever < 0.0f ? "(nothing severed)" : worstName.c_str(),
         worstSever < 0.0f ? 0.0f : worstSever * 100.0f,
         died ? ("creature died at t+" + std::to_string(deathTick)).c_str()
              : "creature survived");
+    // Attribution at the point of failure: name the material that would not go
+    // out, and say whether the remainder is still FALLING or has settled into a
+    // steady state. Those are different bugs — a long tail is a clock that
+    // wants more ticks, a plateau is a relight loop whose gain has reached 1
+    // and will never converge (CLAUDE.md rule 2) — and the count alone cannot
+    // tell them apart, which is what cost this line a run.
+    if (!out) {
+      const uint32_t stuckCloth = alightCloth(), stuckFlesh = alightFlesh();
+      for (int i = 0; i < kQuiet / 2; i++) burnTick(0, 0, 0);
+      std::printf("    still alight: %u cloth + %u flesh; %u after %d further "
+                  "quiet ticks (%s)\n",
+                  stuckCloth, stuckFlesh, alightInWorld(), kQuiet / 2,
+                  alightInWorld() < stillAlight ? "still falling"
+                                                : "PLATEAU — loop gain >= 1");
+    }
     std::fflush(stdout);
     ok = ok && hOk;
 
     // ---- claim 3: FIRE CAUTERISES ------------------------------------------
     //
-    // A creature burning to death, for 630 ticks, must not produce ONE drop of
+    // A creature burning to death, for the whole quiet window, must not
+    // produce ONE drop of
     // blood. Zero is the right threshold and not a strict one: burning reached
     // the gore path through CarveLimb's drip and Sever's gout, both of which
     // now refuse while `inBurnFlush_` is set, so any non-zero here means a
@@ -2738,9 +2912,9 @@ Status GateMobBurn(Ctx& c, std::string& detail) {
     // every other system is concerned.
     const bool dryOk = burnBloodDrops == 0 && burnBleedTicks == 0;
     std::printf(
-        "  fire does not bleed: %s (%u blood droplets, %u of 630 ticks with an "
+        "  fire does not bleed: %s (%u blood droplets, %u of %d ticks with an "
         "open wound)\n",
-        dryOk ? "PASS" : "FAIL", burnBloodDrops, burnBleedTicks);
+        dryOk ? "PASS" : "FAIL", burnBloodDrops, burnBleedTicks, kQuiet);
     std::fflush(stdout);
     ok = ok && dryOk;
     mobs.Reset();
@@ -2899,30 +3073,40 @@ Status GateMobBurn(Ctx& c, std::string& detail) {
     };
 
     // WHAT "BURNS" MEANS DEPENDS ON WHAT THE AVATAR IS MADE OF, and this
-    // subtest must not assume the player is dressed. `human`, the stock base
-    // body, is ONE material (flesh) everywhere with its colours in an art layer
-    // — a cloth census on it is legitimately 0, and asserting cloth here would
-    // fail a perfectly correct rig for the crime of wearing nothing. The claim
-    // this subtest owns is narrower than it looks: that the avatar's OWN BODY
-    // is wired into the same burn pass mobs use. So it measures the body mass
-    // the rig actually has, cloth plus flesh. The cloth-goes-FIRST ordering is
-    // a separate claim and is asserted on the wizard above, which wears a robe.
+    // subtest must not assume the player is dressed in any particular thing.
+    // `human`, the stock base body, is flesh plus one garment: a linen
+    // undercloth on the hips and upper thighs, which is its own material rather
+    // than a paint colour so that burning it chars instead of exposing skin. A
+    // robe_cloth census on it is legitimately 0, and asserting robe cloth here
+    // would fail a perfectly correct rig for the crime of not wearing a robe
+    // (gotcha-gate-hardcodes-asset-cast). The claim this subtest owns is
+    // narrower than it looks: that the avatar's OWN BODY is wired into the same
+    // burn pass mobs use. So it measures WHATEVER body mass the rig has —
+    // flesh, robe and linen — and the cloth-goes-FIRST ordering is a separate
+    // claim, asserted on the wizard above.
     uint32_t idleFront = 0, body0 = 0, cloth0 = 0, peakAlight = 0, peakChar = 0;
     float bodyLost = 0;
+    auto avBody = [&]() {
+      return avCensus(mCloth) + avCensus(mUnder) + avCensus(mSkin);
+    };
     if (spawned) {
       for (int i = 0; i < 10; i++) avTick(0);
       idleFront = avBurning();            // an idle player must cost nothing
-      cloth0 = avCensus(mCloth);
-      body0 = cloth0 + avCensus(mSkin);
+      cloth0 = avCensus(mCloth) + avCensus(mUnder);
+      body0 = avBody();
       uint32_t lastBody = body0;
       for (int i = 0; i < 90 && avatar.Spawned() && avatar.IsAlive(); i++) {
         avTick(mFire);
-        const uint32_t bd = avCensus(mCloth) + avCensus(mSkin);
+        const uint32_t bd = avBody();
         if (bd) lastBody = bd;
-        peakAlight = std::max(peakAlight,
-                              avCensus(mClothBurn) + avCensus(mBurning));
-        peakChar = std::max(peakChar, avCensus(mClothChar) + avCensus(mCooked) +
-                                          avCensus(mCharred));
+        peakAlight = std::max(peakAlight, avCensus(mClothBurn) +
+                                              avCensus(mUnderBurn) +
+                                              avCensus(mBurning));
+        peakChar = std::max(peakChar, avCensus(mClothChar) +
+                                          avCensus(mUnderChar) +
+                                          avCensus(mCooked) +
+                                          avCensus(mCharred) +
+                                          avCensus(mCinder));
       }
       bodyLost = body0 ? (float)(body0 - lastBody) / (float)body0 : 0.0f;
     }

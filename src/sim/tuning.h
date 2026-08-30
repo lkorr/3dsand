@@ -1498,6 +1498,62 @@ struct Tuning {
     bool iceMelts = true;
   } weather;
 
+  // ---- combustion: how long anything in the world stays alight ----
+  //
+  // The second group (after `weather`) that is consumed by the REACTION
+  // COMPILER rather than by a kernel, and for the same reason: it is cheaper
+  // and clearer to change what the table SAYS than to have every cell in the
+  // world re-derive it. LoadAssets reads this while compiling reactions.json —
+  // which is why LoadTuning must run before LoadAssets on every path that has
+  // both, including the F5 reload (see the note at the reload site in
+  // main.cpp).
+  //
+  // Nothing here reaches a shader, so there is no row in tuning_params.def and
+  // no TUNE_* constant. The multiplier is applied on the CPU in double and
+  // rounded ONCE into the same integer chance an authored value compiles to
+  // (rule 1) — the GPU cannot tell a scaled rule from a hand-authored one.
+  struct Combustion {
+    // Percent multiplier on how long a LIT voxel stays lit: 100 = exactly what
+    // reactions.json authors, 200 = twice as long, 50 = half.
+    //
+    // It divides the chance of every rule that carries "burnDuration": true,
+    // which is every rule belonging to the COMBUSTION CLOCK. Two kinds qualify.
+    // The rules that RETIRE a burning voxel — ember to ash/smoke/air,
+    // cloth/undercloth/hair/flesh burning to their charred or spent forms — are
+    // the feature. The RELIGHT rules (charred back to burning) are the subtler
+    // half: they are the only closed loop in the fire economy, its gain is
+    // (relight chance) x (how long a neighbour stays lit), and scaling only the
+    // retire side multiplies that gain by the same factor. That is a CEILING
+    // argument, not a fix for anything visible at the default: measured at
+    // 200%, scaling the relight rules moved `mob-burn`'s quiet corpse from 13
+    // voxels still alight to 15, i.e. not at all. At this knob's 800% the
+    // unscaled gain would cross 1.0 and the fire would never go out (rule 2).
+    // Scaling both holds the gain exactly where the author put it at every
+    // setting — the slider changes the fire's CLOCK and never its shape.
+    //
+    // Because it scales all of a material's branches by the same factor, the
+    // RATIOS between them are untouched: doubling the duration does not change
+    // what fraction of a burnt robe survives as ash.
+    //
+    // It deliberately does NOT touch three neighbouring things:
+    //   * IGNITION chances — how fast fire spreads through fuel is a separate
+    //     lever, and reactions.json says so at the top of its combustion
+    //     section. Turning this up still spreads fire FURTHER, though, because
+    //     a voxel that stays lit twice as long emits its upward fire twice as
+    //     many times over its life.
+    //   * EMIT chances — how much flame a lit voxel shows per tick. Scaling
+    //     these too would make a longer burn a dimmer one, which is the
+    //     opposite of what anyone reaches for this knob to get.
+    //   * EXTINGUISHER rules — water must beat the burn to the tick at any
+    //     setting.
+    //
+    // Default 200 (owner request, 2026-08-30): flammability had just been
+    // raised and bodies caught readily but went out again in well under a
+    // second, so a burning character neither spread the fire nor took much
+    // damage from it.
+    int burnDurationPct = 200;
+  } combustion;
+
   // ---- wind: the ambient field (docs/RESEARCH_wind.md, DESIGN.md §12) ----
   //
   // Wind is a PURE FUNCTION of (world position, time) — `windAt` in
