@@ -1,0 +1,131 @@
+{
+  "name": "oak",
+  "displayName": "Oak",
+  "variants": 3,
+  "shape": 2,
+  "baseSize": 0.3,
+  "scale": 7.5,
+  "scaleV": 1.4,
+  "levels": 3,
+  "ratio": 0.042,
+  "ratioPower": 0.95,
+  "flare": 1,
+  "attractionUp": 0.42,
+  "whorlCount": 0,
+  "lobes": 5,
+  "lobeDepth": 0.09,
+  "barkNoise": 0.85,
+  "levelsData": [
+    {
+      "length": 1,
+      "lengthV": 0.1,
+      "taper": 0.5,
+      "branches": 0,
+      "downAngle": 60,
+      "downAngleV": 0,
+      "rotate": 137.5,
+      "rotateV": 12,
+      "curve": 8,
+      "curveBack": 0,
+      "curveV": 45,
+      "curveRes": 7,
+      "segSplits": 0.25,
+      "splitAngle": 24,
+      "splitAngleV": 10
+    },
+    {
+      "length": 0.62,
+      "lengthV": 0.22,
+      "taper": 0.85,
+      "branches": 8,
+      "downAngle": 48,
+      "downAngleV": -38,
+      "rotate": 137.5,
+      "rotateV": 22,
+      "curve": -20,
+      "curveBack": 26,
+      "curveV": 60,
+      "curveRes": 6,
+      "segSplits": 0.12,
+      "splitAngle": 22,
+      "splitAngleV": 8
+    },
+    {
+      "length": 0.46,
+      "lengthV": 0.28,
+      "taper": 0.9,
+      "branches": 5,
+      "downAngle": 44,
+      "downAngleV": 22,
+      "rotate": 137.5,
+      "rotateV": 30,
+      "curve": 14,
+      "curveBack": 0,
+      "curveV": 75,
+      "curveRes": 4,
+      "segSplits": 0,
+      "splitAngle": 20,
+      "splitAngleV": 8
+    },
+    {
+      "length": 0.4,
+      "lengthV": 0.1,
+      "taper": 1,
+      "branches": 4,
+      "downAngle": 45,
+      "downAngleV": 0,
+      "rotate": 137.5,
+      "rotateV": 12,
+      "curve": 0,
+      "curveBack": 0,
+      "curveV": 60,
+      "curveRes": 3,
+      "segSplits": 0,
+      "splitAngle": 20,
+      "splitAngleV": 8
+    }
+  ],
+  "foliage": {
+    "startLevel": 2,
+    "clumpsPerStem": 1,
+    "tipBias": 0.5,
+    "radius": 0.62,
+    "radiusV": 0.2,
+    "elongation": 0.72,
+    "droop": 0.18,
+    "density": 0.8,
+    "noiseScale": 2.8,
+    "sminK": 2.2,
+    "canopyShadeMix": 0.5,
+    "depthShade": 0.8
+  },
+  "bark": [
+    "bark_dark",
+    "wood",
+    "bark_light"
+  ],
+  "leaf": [
+    "leaves_dark",
+    "leaves",
+    "leaves_lit"
+  ],
+  "autumnLeaf": [
+    "autumn_dark",
+    "autumn_leaves",
+    "autumn_lit"
+  ],
+  "autumnChance": 5,
+  "placement": {
+    "biomes": {
+      "forest": 42,
+      "meadow": 16,
+      "pine": 4,
+      "desert": 0
+    },
+    "minY": -1,
+    "maxY": 214,
+    "maxSlope": 420,
+    "sparsity": 1,
+    "shade": 210
+  }
+}

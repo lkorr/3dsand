@@ -12,6 +12,13 @@
 #include <nlohmann/json.hpp>
 
 namespace ui {
+
+static ImFont* g_fontSmall = nullptr;
+static ImFont* g_fontLarge = nullptr;
+
+ImFont* FontSmall() { return g_fontSmall; }
+ImFont* FontLarge() { return g_fontLarge; }
+
 namespace {
 
 using nlohmann::json;
@@ -227,16 +234,21 @@ void ApplyFantasyTheme() {
   c[ImGuiCol_NavCursor] = V(ColGold());
   c[ImGuiCol_ModalWindowDimBg] = V(ColInk(), 0.55f);
 
-  // THE FONT. ProggyClean (the built-in) is already a hand-hinted PIXEL font
-  // at exactly 13 px, so the only thing that can ruin it is a non-integer
-  // scale. Loaded at 26 px = 2x with no anti-aliasing and no oversampling: the
-  // glyphs come out as doubled pixels, which is exactly right beside 2x
-  // chrome, and it costs no font file.
-  ImFontConfig cfg;
-  cfg.SizePixels = 26.0f;
-  cfg.OversampleH = cfg.OversampleV = 1;
-  cfg.PixelSnapH = true;
-  ImGui::GetIO().Fonts->AddFontDefault(&cfg);
+  // TWO FONTS, both ProggyClean (the built-in pixel font, hand-hinted at 13 px).
+  // The 13 px version is the dev panel's native size — readable and compact.
+  // The 26 px version (2x) sits beside kChromeScale=2 chrome in the inventory
+  // screen. Both live in the same atlas; the first font added is ImGui's default.
+  ImFontConfig cfgSmall;
+  cfgSmall.SizePixels = 13.0f;
+  cfgSmall.OversampleH = cfgSmall.OversampleV = 1;
+  cfgSmall.PixelSnapH = true;
+  g_fontSmall = ImGui::GetIO().Fonts->AddFontDefault(&cfgSmall);
+
+  ImFontConfig cfgLarge;
+  cfgLarge.SizePixels = 26.0f;
+  cfgLarge.OversampleH = cfgLarge.OversampleV = 1;
+  cfgLarge.PixelSnapH = true;
+  g_fontLarge = ImGui::GetIO().Fonts->AddFontDefault(&cfgLarge);
 }
 
 bool LoadChrome(const std::string& assetDir, std::string& err) {

@@ -295,7 +295,10 @@ void AnimSampleAndBlend(const AnimSkeleton& sk, AnimState& st, float dt) {
     }
     const AnimClip& c = sk.clips[inst.clip];
 
-    inst.timeMs += dt * 1000.0f;
+    // The playhead carries the instance's rate; the AGE does not — see the
+    // note on ClipInstance::rate. Clamped positive so a bad rate can stall a
+    // clip but never run it backwards through its own blend.
+    inst.timeMs += dt * 1000.0f * std::max(inst.rate, 0.0f);
     inst.ageMs += dt * 1000.0f;
     if (c.loop && c.durationMs > 0) {
       while (inst.timeMs >= (float)c.durationMs) inst.timeMs -= (float)c.durationMs;
@@ -545,6 +548,105 @@ void AnimSolveTwoBone(const AnimSkeleton& sk, AnimState& st,
     st.model[k].rot = QuatNormalize(QuatMul(st.model[i1].rot, st.local[k].rot));
     st.model[k].pos =
         st.model[i1].pos + QuatRotate(st.model[i1].rot, st.local[k].pos);
+  }
+}
+
+// ---- stage 6: pose-space joint limits ---------------------------------------
+
+namespace {
+
+// Swing-twist decomposition, clamp the twist, recompose. `axis` must be unit.
+//
+// The twist is the part of `q` about `axis`; the swing is everything else, and
+// it is left ALONE. That split is what makes a one-axis limit useful on a ball
+// joint: a hip may be told "you pitch between -10 and +80 degrees" without also
+// being told how far it may abduct, which is a separate anatomical fact and a
+// separate number.
+Quat ClampTwist(const Quat& q, Vec3 axis, float lo, float hi) {
+  const Vec3 v{q.x, q.y, q.z};
+  const float d = v.dot(axis);
+  Quat twist{axis.x * d, axis.y * d, axis.z * d, q.w};
+  const float mag =
+      std::sqrt(twist.x * twist.x + twist.y * twist.y + twist.z * twist.z +
+                twist.w * twist.w);
+  // Degenerate: `q` is a half turn about an axis perpendicular to ours, so the
+  // projection carries no information about the twist. There is no meaningful
+  // angle to clamp, and inventing one would snap the joint.
+  if (mag < 1e-5f) return q;
+  twist.x /= mag; twist.y /= mag; twist.z /= mag; twist.w /= mag;
+  // Signed angle about `axis`. The normalized twist's vector part lies along
+  // +-axis by construction, so its dot with the axis IS the signed sine term.
+  // atan2 rather than 2*acos(w) because acos loses the sign and is ill-
+  // conditioned near zero, which is where a joint sits most of the time.
+  const float s = Vec3{twist.x, twist.y, twist.z}.dot(axis);
+  float ang = 2.0f * std::atan2(s, twist.w);
+  // Wrap into (-pi, pi] before clamping: an angle that has wrapped past a half
+  // turn is nearer the opposite stop, and clamping the unwrapped value would
+  // drive the joint the long way round.
+  while (ang > 3.14159265f) ang -= 6.2831853f;
+  while (ang <= -3.14159265f) ang += 6.2831853f;
+  const float clamped = std::clamp(ang, lo, hi);
+  if (std::fabs(clamped - ang) < 1e-6f) return q;  // already legal
+  // swing = q * conj(twist); rebuild with the clamped twist.
+  const Quat swing = QuatMul(q, QuatConj(twist));
+  return QuatNormalize(QuatMul(swing, QuatAxisAngle(axis, clamped)));
+}
+
+}  // namespace
+
+void AnimClampPoseLimits(const AnimSkeleton& sk, AnimState& st) {
+  const size_t n = sk.parts.size();
+  if (st.model.size() < n) return;
+  bool any = false;
+  for (size_t i = 0; i < n; i++) any |= sk.parts[i].hasPoseLimit;
+  if (!any) return;  // the common case: nothing authored, nothing to pay for
+
+  // SNAPSHOT THE POSE AS THE IK LEFT IT, expressed parent-relative.
+  //
+  // st.local[] cannot be used here: the IK writes st.model[] directly and never
+  // updates local, so local still holds the pre-IK pose. Re-deriving each
+  // part's local transform from the model pair is what lets a clamp on the hip
+  // carry the knee and the foot with it while KEEPING the knee's own solved
+  // bend — recomposing from local would throw the IK away.
+  static thread_local std::vector<Transform> eff;
+  eff.resize(n);
+  for (size_t i = 0; i < n; i++) {
+    const int par = sk.parts[i].parent;
+    if (par < 0 || (size_t)par >= n) {
+      eff[i] = st.model[i];
+      continue;
+    }
+    const Quat inv = QuatConj(st.model[par].rot);
+    eff[i].rot = QuatNormalize(QuatMul(inv, st.model[i].rot));
+    eff[i].pos = QuatRotate(inv, st.model[i].pos - st.model[par].pos);
+  }
+
+  // Parents-first, which sk.ParentsFirst() guarantees: a child recomposes
+  // against a parent that has already been clamped, so the correction
+  // propagates down the limb in one pass with no second flatten.
+  for (size_t i = 0; i < n; i++) {
+    const AnimPart& p = sk.parts[i];
+    const int par = p.parent;
+    if (p.hasPoseLimit) {
+      const float len = p.poseAxis.len();
+      if (len > 1e-5f) {
+        const Vec3 axis = p.poseAxis * (1.0f / len);
+        // Measured against REST, not against the parent: "0 degrees" has to
+        // mean the pose the art was drawn in, or every rig would need its
+        // limits re-derived from wherever its bind pose happens to sit.
+        const Quat rest = p.rest.rot;
+        const Quat delta = QuatMul(QuatConj(rest), eff[i].rot);
+        eff[i].rot = QuatNormalize(
+            QuatMul(rest, ClampTwist(delta, axis, p.poseMin, p.poseMax)));
+      }
+    }
+    if (par < 0 || (size_t)par >= n) {
+      st.model[i] = eff[i];
+    } else {
+      st.model[i].rot = QuatNormalize(QuatMul(st.model[par].rot, eff[i].rot));
+      st.model[i].pos =
+          st.model[par].pos + QuatRotate(st.model[par].rot, eff[i].pos);
+    }
   }
 }
 

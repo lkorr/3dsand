@@ -648,7 +648,47 @@
     return want;
   };
 
+  // ---- a LOCAL region, with no server behind it ---------------------------
+  //
+  // Everything above streams: _desired() decides what should be resident, the
+  // queue fetches it from /api/voxregion, the worker decodes and meshes it.
+  // The Trees tab has no terrain and no server request to make — it has a
+  // Uint16Array that assets/editor/treegen.js just produced in this same tab,
+  // and it wants it drawn.
+  //
+  // This is the seam for that: the same region record the `decoded` worker
+  // branch builds, handed straight to the same upload and mesh path. The
+  // viewer's AO, slice, isolate, palette, orbit camera, screenshot and picking
+  // all work on it unchanged, which is the whole reason the Trees tab reuses
+  // WorldView instead of growing a second WebGL renderer that would drift.
+  //
+  // `opts.streaming === false` (set by that tab) is what stops update() from
+  // asking a server that is not there for regions that do not exist.
+  WorldView.prototype.setLocalRegion = function (cells, nx, ny, nz, origin) {
+    var o = origin || [0, 0, 0];
+    var key = 'local';
+    var old = this.regions.get(key);
+    if (old) this._freeRegion(old);
+    this.regions.clear();
+    this.gen++;
+    var r = {
+      key: key, level: 0, rx: 0, ry: 0, rz: 0,
+      lod: 1, nx: nx, ny: ny, nz: nz,
+      origin: [o[0], o[1], o[2]],
+      cells: cells, tex: null, op: null, fl: null, meshing: false,
+      dirty: true, gen: this.gen, rev: 0
+    };
+    this.regions.set(key, r);
+    this._uploadTex(r);
+    this._meshPass();
+    return r;
+  };
+
   WorldView.prototype.update = function () {
+    // A local region is authored, not streamed: there is nothing to want and
+    // nothing to evict, and running the streamer would delete the one region
+    // the tab is showing on its first frame.
+    if (this.opts.streaming === false) return;
     var want = this._desired();
     var live = new Set();
     for (var i = 0; i < want.length; i++) {
@@ -839,6 +879,24 @@
   WorldView.prototype._uploadTex = function (r) {
     var gl = this.gl;
     if (!r.tex) r.tex = gl.createTexture();
+    // UNPACK_ALIGNMENT 1, and it is load-bearing for any region that is not
+    // 64 wide. The default is 4: GL then expects every row of the upload to be
+    // padded to a 4-byte boundary, so a 16-bit region whose width is not even
+    // (75 * 2 = 150 bytes) needs 152 bytes per row and the source array is
+    // short — the whole texImage3D FAILS with INVALID_OPERATION and the
+    // texture keeps whatever it had, which is nothing.
+    //
+    // Every streamed region is REGION_N = 64 wide (128 bytes, divisible by 4),
+    // so this was invisible until the Trees tab handed setLocalRegion a grid
+    // sized to a tree. The symptom was a black canvas with a correct mesh,
+    // 13,474 quads drawn and no error at draw time — the error had been raised
+    // one upload earlier and cleared by the next getError.
+    //
+    // Explicit unit, for the same class of reason: this used to inherit
+    // whatever activeTexture the last render() happened to leave, which was
+    // TEXTURE0 by luck rather than by contract.
+    gl.activeTexture(gl.TEXTURE0);
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
     gl.bindTexture(gl.TEXTURE_3D, r.tex);
     gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
     gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
@@ -1184,6 +1242,17 @@
       var m = this.tool.measure;
       pushLine(a, m.a[0] + 0.5, m.a[1] + 0.5, m.a[2] + 0.5,
                m.b[0] + 0.5, m.b[1] + 0.5, m.b[2] + 0.5, [1, 0.6, 0.2, 1]);
+    }
+    // Host overlay. One callback, so a tab can draw its own lines in world
+    // space without a second GL program or a second pass — the Trees tab uses
+    // it for the branch skeleton, which is where a wrong-looking tree is
+    // usually actually wrong (the voxels hide the angle that caused it).
+    if (this.onOverlay) {
+      var self = this;
+      this.onOverlay(function (x0, y0, z0, x1, y1, z1, col) {
+        pushLine(a, x0, y0, z0, x1, y1, z1, col || [1, 1, 1, 1]);
+      });
+      void self;
     }
     if (!a.length) return;
     var gl = this.gl;

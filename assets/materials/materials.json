@@ -2344,6 +2344,170 @@
         "dissolvable"
       ],
       "molten": "fire"
+    },
+    {
+      "//": "TREE SHADE RAMPS (assets/editor/treegen.js). Each foliage and bark family is a THREE-material ramp -- dark, the plain material the rest of the game already knows, and lit -- and the tree voxelizer picks between them offline from a baked normal (part clump-sphere, part whole-canopy) plus depth into the clump. That is the entire Rundlett canopy trick, and it costs the renderer nothing: by the time a voxel exists its shade is already a material id. The three colours inside each material stay what they are everywhere else, per-cell palette jitter on the state nibble, so a crown has texture as well as form. Every one of these is INERT and carries exactly id 34's tag row, so fire, dissolve and the foliage rules treat a dark leaf as a leaf.",
+      "id": "leaves_dark",
+      "footstep": "leaf",
+      "class": "solid",
+      "density": 320,
+      "hardness": 6,
+      "rubble": "ash",
+      "colors": [
+        "#1e4a1f",
+        "#193f1b",
+        "#255627"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable",
+        "foliage"
+      ],
+      "molten": "fire"
+    },
+    {
+      "id": "leaves_lit",
+      "footstep": "leaf",
+      "class": "solid",
+      "density": 320,
+      "hardness": 6,
+      "rubble": "ash",
+      "colors": [
+        "#63b84a",
+        "#57a840",
+        "#79cd5d"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable",
+        "foliage"
+      ],
+      "molten": "fire"
+    },
+    {
+      "id": "pine_dark",
+      "footstep": "leaf",
+      "class": "solid",
+      "density": 300,
+      "hardness": 6,
+      "rubble": "ash",
+      "colors": [
+        "#0f3320",
+        "#0c2b1a",
+        "#143d27"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable",
+        "foliage"
+      ],
+      "molten": "fire"
+    },
+    {
+      "id": "pine_lit",
+      "footstep": "leaf",
+      "class": "solid",
+      "density": 300,
+      "hardness": 6,
+      "rubble": "ash",
+      "colors": [
+        "#3d8c55",
+        "#347c4a",
+        "#4d9f66"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable",
+        "foliage"
+      ],
+      "molten": "fire"
+    },
+    {
+      "id": "autumn_dark",
+      "footstep": "leaf",
+      "class": "solid",
+      "density": 320,
+      "hardness": 6,
+      "rubble": "ash",
+      "colors": [
+        "#7a3d13",
+        "#68320f",
+        "#8c4c1d"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable",
+        "foliage"
+      ],
+      "molten": "fire"
+    },
+    {
+      "id": "autumn_lit",
+      "footstep": "leaf",
+      "class": "solid",
+      "density": 320,
+      "hardness": 6,
+      "rubble": "ash",
+      "colors": [
+        "#f0a95e",
+        "#e29a4a",
+        "#ffc271"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable",
+        "foliage"
+      ],
+      "molten": "fire"
+    },
+    {
+      "//": "Bark ramp. Same three-tier idea on the wood side: a bole with a shaded and a lit face reads as a cylinder, where one flat brown reads as a column of paint.",
+      "id": "bark_dark",
+      "sounds": {
+        "break": "branch"
+      },
+      "footstep": "branch",
+      "class": "solid",
+      "density": 600,
+      "hardness": 40,
+      "colors": [
+        "#3f2a18",
+        "#372414",
+        "#4a331f"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable"
+      ],
+      "molten": "fire"
+    },
+    {
+      "id": "bark_light",
+      "sounds": {
+        "break": "branch"
+      },
+      "footstep": "branch",
+      "class": "solid",
+      "density": 600,
+      "hardness": 40,
+      "colors": [
+        "#a4784c",
+        "#956b42",
+        "#b98a5c"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable"
+      ],
+      "molten": "fire"
     }
   ]
 }

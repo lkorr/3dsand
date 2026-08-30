@@ -473,6 +473,14 @@ def main():
         h = math.radians(deg) * 0.5
         return [0.0, 0.0, round(math.sin(h), 4), round(math.cos(h), 4)]
 
+    def qxz(dx, dz):
+        """X then Z, matching QuatFromEulerDeg's X->Y->Z order (anim.h)."""
+        a, b = math.radians(dx) * 0.5, math.radians(dz) * 0.5
+        sa, ca, sb, cb = math.sin(a), math.cos(a), math.sin(b), math.cos(b)
+        # q = qz * qx  (Z applied last, i.e. outermost)
+        return [round(sa * cb, 4), round(sa * sb, 4),
+                round(ca * sb, 4), round(ca * cb, 4)]
+
     ident = [0.0, 0.0, 0.0, 1.0]
 
     U = float(SKIN_UPSCALE)
@@ -625,6 +633,13 @@ def main():
             },
         }
 
+    # JUMPING. The legs TUCK, which on this rig is a NEGATIVE rotation about X:
+    # +X swings a hanging limb backward (verified against the selftest's own
+    # swingOf convention, where negative reads "behind the body"). The old +35
+    # / +25 keys therefore raked both legs out BEHIND the character, which is
+    # the reported "both back legs move behind him" -- and because the clip
+    # used to fire on any loss of ground contact, an ordinary step-down played
+    # it. It now fires only on Player::jumped, a real launch.
     clips["jump"] = {
         "durationMs": 500, "loop": False, "mode": "additive",
         "blendInMs": 60, "blendOutMs": 200,
@@ -634,31 +649,50 @@ def main():
                               {"t": 160, "q": qx(-10), "ease": "cubicInOut"},
                               {"t": 500, "q": qx(0)}]},
             "armU.L": {"rot": [{"t": 0, "q": qx(0), "ease": "cubicOut"},
-                               {"t": 200, "q": qx(-70), "ease": "cubicInOut"},
+                               {"t": 200, "q": qx(-42), "ease": "cubicInOut"},
                                {"t": 500, "q": qx(0)}]},
             "armU.R": {"rot": [{"t": 0, "q": qx(0), "ease": "cubicOut"},
-                               {"t": 200, "q": qx(-70), "ease": "cubicInOut"},
+                               {"t": 200, "q": qx(-42), "ease": "cubicInOut"},
                                {"t": 500, "q": qx(0)}]},
             "legU.L": {"rot": [{"t": 0, "q": qx(0), "ease": "cubicOut"},
-                               {"t": 220, "q": qx(35), "ease": "cubicInOut"},
+                               {"t": 220, "q": qx(-32), "ease": "cubicInOut"},
                                {"t": 500, "q": qx(0)}]},
             "legU.R": {"rot": [{"t": 0, "q": qx(0), "ease": "cubicOut"},
-                               {"t": 220, "q": qx(25), "ease": "cubicInOut"},
+                               {"t": 220, "q": qx(-22), "ease": "cubicInOut"},
                                {"t": 500, "q": qx(0)}]},
         },
     }
+    # FALLING. Authored NEAR-NATURAL and opened out by WEIGHT, not by being a
+    # single wide pose that switches on: avatar.cpp ramps this clip's weight
+    # over avatar.fallFlailDelay/fallFlailRamp seconds of air, so a step off a
+    # kerb plays a hint of it and only a genuine drop reaches the full shape.
+    #
+    # The old pose keyed both arms at -88 deg about X, which on this rig is 88
+    # degrees FORWARD (a positive X rotation swings a hanging limb backward, so
+    # negative swings it forward) -- both arms shot straight out in front, which
+    # is the reported look and is not what a falling body does anyway. Arms go
+    # OUT TO THE SIDES and trail slightly back; model +X is the character's
+    # LEFT on these rigs, so .L abducts with +Z and .R with -Z.
     clips["fall"] = {
-        "durationMs": 700, "loop": True, "mode": "additive",
+        "durationMs": 900, "loop": True, "mode": "additive",
         "blendInMs": 250, "blendOutMs": 250,
-        "mask": ["torso", "armU.L", "armU.R"],
+        "mask": ["torso", "armU.L", "armU.R", "armL.L", "armL.R"],
         "tracks": {
-            "torso": {"rot": [{"t": 0, "q": qx(6)}]},
-            "armU.L": {"rot": [{"t": 0, "q": qx(-88), "ease": "quadInOut"},
-                               {"t": 350, "q": qx(-100), "ease": "quadInOut"},
-                               {"t": 700, "q": qx(-88)}]},
-            "armU.R": {"rot": [{"t": 0, "q": qx(-88), "ease": "quadInOut"},
-                               {"t": 350, "q": qx(-100), "ease": "quadInOut"},
-                               {"t": 700, "q": qx(-88)}]},
+            "torso": {"rot": [{"t": 0, "q": qx(7), "ease": "quadInOut"},
+                              {"t": 450, "q": qx(11), "ease": "quadInOut"},
+                              {"t": 900, "q": qx(7)}]},
+            "armU.L": {"rot": [{"t": 0, "q": qxz(14, 52), "ease": "quadInOut"},
+                               {"t": 450, "q": qxz(4, 62), "ease": "quadInOut"},
+                               {"t": 900, "q": qxz(14, 52)}]},
+            "armU.R": {"rot": [{"t": 0, "q": qxz(4, -62), "ease": "quadInOut"},
+                               {"t": 450, "q": qxz(14, -52), "ease": "quadInOut"},
+                               {"t": 900, "q": qxz(4, -62)}]},
+            "armL.L": {"rot": [{"t": 0, "q": qx(-18), "ease": "quadInOut"},
+                               {"t": 450, "q": qx(-30), "ease": "quadInOut"},
+                               {"t": 900, "q": qx(-18)}]},
+            "armL.R": {"rot": [{"t": 0, "q": qx(-30), "ease": "quadInOut"},
+                               {"t": 450, "q": qx(-18), "ease": "quadInOut"},
+                               {"t": 900, "q": qx(-30)}]},
         },
     }
     clips["land"] = {

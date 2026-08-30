@@ -349,6 +349,25 @@ struct Tuning {
     // one tick; a bump crest never does. Too high and a genuine jump animates
     // late. 0 restores the old undebounced behaviour.
     float airDebounce = 0.12f;
+    // ---- what counts as a FALL, and how wild it looks -----------------------
+    // THE FLAIL IS RAMPED, NOT SWITCHED. `fall` used to be a single wide pose
+    // (both arms out in front, both legs raked behind) that started whole the
+    // moment airTime passed a threshold — so a step off a kerb played the same
+    // arms-out shape as a drop off a cliff, and the character seemed to be
+    // permanently falling while walking on rough ground. The clip is authored
+    // near-natural now and its WEIGHT ramps with how long the body has been in
+    // the air: a short drop never reaches the wide pose at all, and a genuine
+    // fall arrives at it over a beat instead of snapping into it.
+    //
+    // Seconds of air before the flail starts to come in, and seconds it takes
+    // to reach full once it does.
+    float fallFlailDelay = 0.35f;
+    float fallFlailRamp = 0.9f;
+    // Meters the body must have DROPPED below the height it last had support at
+    // before the fall clip may play at all. Air time alone is not a fall: a
+    // step-down clears any debounce, and so does cresting a bump at speed.
+    // Distance is the honest question, and it is the one a player would answer.
+    float fallMinDrop = 1.2f;
     // Damage/dismemberment feel.
     float severImpulse = 6.0f;   // extra shove given to a part as it comes off
     // How long the corpse's parts stay before the avatar can respawn, seconds.
@@ -673,6 +692,41 @@ struct Tuning {
     // that varies per mob makes the bleedBudgetCap bound unreadable.
     float bleedGain = 1.0f;
     Variance bleedGainVar;
+
+    // ========================================================================
+    // D. CRATER SHAPE — what a blast takes off a body, and in what size pieces
+    // ========================================================================
+    // The old crater was per-voxel WHITE NOISE against a `1 - t^2` radial
+    // falloff. Both halves work against concentration: `1 - t^2` is still 0.75
+    // at half the radius and 0.36 at 80% of it, so a large blast genuinely does
+    // sprinkle the whole body, and an independent coin flip per voxel has no
+    // feature size at all — what comes off is a fine speckle rather than a
+    // piece. That is the reported "thin scatter of voxels spread over the whole
+    // body".
+    //
+    // These four turn that into a torn chunk. carveChunkiness is the master
+    // slider and 0 reproduces the old behaviour EXACTLY (the noise lerps back
+    // to the same Hash3 draw, the falloff exponent lerps back to 1, and the
+    // spall pass is skipped) — that identity is asserted by the mob gate, so
+    // the knob is a genuine A/B rather than an approximation of one.
+    float carveChunkiness = 0.65f;
+    // Feature size of the correlated noise, in SKIN voxels. This is the size of
+    // the lumps that come off. Kept on the skin lattice for the same reason the
+    // rim jitter already is: the crater's shape must be a property of the ART,
+    // not of whichever collider resolution the engine happened to derive, or
+    // the same blast tears differently on two rigs that differ only in scale.
+    float carveBlobSize = 3.5f;
+    // Exponent on the radial falloff at full chunkiness. Higher concentrates
+    // the removal at the blast: at 3, the chance is 0.42 at half the radius and
+    // 0.047 at 80% of it, against 0.75 and 0.36 before.
+    float carveFalloff = 3.0f;
+    // How many SPALL rounds run after the radial pass. Each round takes
+    // surviving voxels that are inside the blast and already have enough
+    // missing face-neighbours — so a hole grows into its own rim instead of a
+    // second blast having to find fresh voxels. This is what makes damage
+    // accumulate in one place, and what makes a blast beside an arm take the
+    // arm. Bounded and small: each round is one pass over the limb's voxels.
+    int carveSpallRounds = 2;
   } gore;
 
   // ---- grenade ----

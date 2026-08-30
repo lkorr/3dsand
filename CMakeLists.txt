@@ -323,6 +323,9 @@ add_executable(sandvox
   # (docs/PLAN_water_master.md).
   src/sim/waterbody.cpp
   src/sim/voxload.cpp
+  # The baked tree atlas: assets/trees/*.svtree -> one storage buffer that
+  # worldgen samples instead of evaluating implicit tree shapes per cell.
+  src/sim/treeatlas.cpp
   src/sim/microvox.cpp
   src/sim/microbody.cpp
   src/game/player.cpp
@@ -349,6 +352,7 @@ add_executable(sandvox
   src/test/selftest.cpp
   src/test/selftest_voxregion.cpp
   src/test/selftest_terrain.cpp
+  src/test/selftest_trees.cpp
   src/test/selftest_sim.cpp
   src/test/selftest_ca.cpp
   src/test/selftest_wind.cpp

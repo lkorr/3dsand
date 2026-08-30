@@ -473,6 +473,10 @@ bool LoadTuning(const std::string& path, Tuning& out) {
         std::clamp(a.headLookRecenterHalflife, 0.0f, 3.0f);
     ReadF(*g, "ikBlendHalflife", a.ikBlendHalflife, out, at);
     ReadF(*g, "airDebounce", a.airDebounce, out, at);
+    ReadF(*g, "fallFlailDelay", a.fallFlailDelay, out, at);
+    ReadF(*g, "fallFlailRamp", a.fallFlailRamp, out, at);
+    a.fallFlailRamp = std::max(a.fallFlailRamp, 0.0f);
+    ReadF(*g, "fallMinDrop", a.fallMinDrop, out, at);
     ReadB(*g, "firstPersonArms", a.firstPersonArms, out, at);
     ReadF(*g, "footTrim", a.footTrim, out, at);
     ReadF(*g, "severImpulse", a.severImpulse, out, at);
@@ -636,6 +640,22 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadVar(*g, "severVoxelSpeedVar", e.severVoxelSpeedVar, out, at);
     ReadVar(*g, "severDecayTicksVar", e.severDecayTicksVar, out, at);
     ReadVar(*g, "microLifeTicksVar", e.microLifeTicksVar, out, at);
+    // ---- D. crater shape ----
+    ReadF(*g, "carveChunkiness", e.carveChunkiness, out, at);
+    // 0 is a load-bearing value, not just the low end: the mob gate asserts
+    // that carveChunkiness 0 removes byte-identically the same voxels the old
+    // white-noise crater did. Clamping it here is what keeps that identity
+    // reachable from a slider that has been dragged past the end.
+    e.carveChunkiness = std::clamp(e.carveChunkiness, 0.0f, 1.0f);
+    ReadF(*g, "carveBlobSize", e.carveBlobSize, out, at);
+    e.carveBlobSize = std::max(e.carveBlobSize, 0.5f);
+    ReadF(*g, "carveFalloff", e.carveFalloff, out, at);
+    e.carveFalloff = std::clamp(e.carveFalloff, 1.0f, 8.0f);
+    ReadI(*g, "carveSpallRounds", e.carveSpallRounds, out, at);
+    // Each round is a full pass over the limb's voxels and can only ever
+    // REMOVE, so an unbounded count is a way to erase a body one slider drag
+    // at a time. Four is already past the point where more reads as different.
+    e.carveSpallRounds = std::clamp(e.carveSpallRounds, 0, 4);
     // A negative or zero gain would silently disable bleeding rather than
     // reading as a tuning mistake, so floor it just above zero.
     if (e.bleedGain < 0.0f) {
