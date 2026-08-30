@@ -80,6 +80,57 @@
       "selfBecomes": "fire"
     },
     {
+      "note": "THE SHADE RAMPS BURN LIKE WHAT THEY ARE. assets/editor/treegen.js bakes each foliage and bark family as a three-material ramp (dark / plain / lit) so a crown has form; combustion in this file is authored BY NAME, not by tag, so a ramp member with no rule of its own is a leaf that will not catch. Same chance as its plain sibling in every case -- these are lighting tiers, not different fuels, and a canopy that burned in stripes would be worse than one that did not burn at all."
+    },
+    {
+      "self": "leaves_dark",
+      "neighbor": "tag:hot",
+      "chance": 75,
+      "selfBecomes": "fire"
+    },
+    {
+      "self": "leaves_lit",
+      "neighbor": "tag:hot",
+      "chance": 75,
+      "selfBecomes": "fire"
+    },
+    {
+      "self": "pine_dark",
+      "neighbor": "tag:hot",
+      "chance": 380,
+      "selfBecomes": "fire"
+    },
+    {
+      "self": "pine_lit",
+      "neighbor": "tag:hot",
+      "chance": 380,
+      "selfBecomes": "fire"
+    },
+    {
+      "self": "autumn_dark",
+      "neighbor": "tag:hot",
+      "chance": 400,
+      "selfBecomes": "fire"
+    },
+    {
+      "self": "autumn_lit",
+      "neighbor": "tag:hot",
+      "chance": 400,
+      "selfBecomes": "fire"
+    },
+    {
+      "self": "bark_dark",
+      "neighbor": "tag:hot",
+      "chance": 18,
+      "selfBecomes": "ember"
+    },
+    {
+      "self": "bark_light",
+      "neighbor": "tag:hot",
+      "chance": 18,
+      "selfBecomes": "ember"
+    },
+    {
       "self": "grass",
       "neighbor": "tag:hot",
       "chance": 220,
@@ -577,6 +628,22 @@
     },
     {
       "self": "pine_needles",
+      "neighbor": "glass",
+      "needsSky": true,
+      "when": "day",
+      "minLight": 235,
+      "chance": 60,
+      "selfBecomes": "fire"
+    },    {
+      "self": "pine_dark",
+      "neighbor": "glass",
+      "needsSky": true,
+      "when": "day",
+      "minLight": 235,
+      "chance": 60,
+      "selfBecomes": "fire"
+    },    {
+      "self": "pine_lit",
       "neighbor": "glass",
       "needsSky": true,
       "when": "day",

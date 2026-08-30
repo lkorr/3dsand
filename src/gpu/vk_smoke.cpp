@@ -302,7 +302,19 @@ bool RunScenario(bool loud, bool lowPower, bool sledgehammer, bool validation,
   world.Init(ctx.device);
   Simulation sim;
   MicroSet micro;
-  if (!sim.Init(ctx.device, world, mats, reactions, micro, assetDir + "/shaders")) {
+  // The smoke harness runs the REAL worldgen, so it needs the real trees --
+  // without them every probe would hash a treeless world and the pinned tables
+  // would silently describe a different game.
+  TreeAtlas treeAtlas;
+  {
+    std::string tlog;
+    if (!LoadTreeAtlas(assetDir + "/trees", mats, treeAtlas, tlog)) {
+      std::printf("tree atlas: FAIL\n%s", tlog.c_str());
+      return false;
+    }
+  }
+  if (!sim.Init(ctx.device, world, mats, reactions, micro, treeAtlas,
+                assetDir + "/shaders")) {
     std::printf("sim init: FAIL\n");
     return false;
   }

@@ -140,8 +140,16 @@ def readable():
 # metadata that makes it a limb rather than a lump — hp, joint, tag, anchor.
 # Exactly the same .vox+.json shape as a mob, one rung down the hierarchy, so
 # it rides these routes unchanged. See assets/editor/limblib.js for the format.
-MODEL_DIRS = ("models", "mobs", "microvox", "items", "limbs")
-MODEL_EXTS = (".vox", ".json")
+# `trees` is the algorithmic tree editor's directory: <species>.json is the
+# authored parameter set (the source of truth) and <species>.svtree is the baked
+# voxel atlas the engine loads. Same .json+per-file-binary shape as a mob, one
+# rung further from geometry, so it rides these two routes unchanged.
+#
+# `prefabs` is here so the Trees tab can export a .vox of a generated tree for
+# hand-placement with the in-game prefab tool. Read-write like the rest -- the
+# containment check in _model_path() is what keeps that safe.
+MODEL_DIRS = ("models", "mobs", "microvox", "items", "limbs", "trees", "prefabs")
+MODEL_EXTS = (".vox", ".json", ".svtree")
 # The one MODEL_DIRS entry with a delete route (/api/limb/delete). Named here
 # so that route cannot be pointed at another directory by editing one string.
 LIMB_DIR_NAME = "limbs"
@@ -1147,6 +1155,14 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception as e:
                     return self._json(400, {"ok": False,
                                             "error": "not valid JSON: %s" % e})
+            elif path.lower().endswith(".svtree"):
+                # Same rule as the .vox magic check below and for the same
+                # reason: the engine ABORTS on a malformed atlas, so a
+                # half-written or wrong-typed file here is a game that will not
+                # start. src/sim/treeatlas.h kFileMagic.
+                if data[:4] != b"SVTR":
+                    return self._json(400, {"ok": False,
+                                            "error": "not a .svtree file (bad magic)"})
             else:
                 if data[:4] != b"VOX ":
                     return self._json(400, {"ok": False,

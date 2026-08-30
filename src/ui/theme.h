@@ -53,6 +53,11 @@ constexpr float kChromeScale = 2.0f;
 // Apply the style + font. Call once, after ImGui::CreateContext().
 void ApplyFantasyTheme();
 
+// Two fonts: the 26 px chrome font for the inventory screen and HUD, and the
+// native 13 px ProggyClean for the dev panel. Both are in the same atlas.
+ImFont* FontSmall();   // 13 px — dev panel, fluid tuning window
+ImFont* FontLarge();   // 26 px — inventory screen, HUD bars
+
 // ---- the chrome atlas ------------------------------------------------------
 
 struct ChromeSprite {

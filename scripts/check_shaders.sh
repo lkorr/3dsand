@@ -154,6 +154,10 @@ W_MBPOOL=$((1 << W_MBSHIFT))
 W_WBCAP="$(cpp_const kWaterBodyCap)"
 W_WBWORDS="$(cpp_const kWaterBodyWords)"
 W_WBSTATE="$(cpp_const kWaterBodyStateWords)"
+# Present in ShaderConstantPrelude() but missing here, so every check_shaders.sh
+# run reported sim_waterbody.wgsl as broken while the real build compiled it
+# fine -- exactly the "add it to BOTH" gap CLAUDE.md names.
+W_WDRAINOPS="$(cpp_const kWaterDrainOpsPerBody)"
 W_WCHUNKCAP="$(cpp_const kWaterChunkCap)"
 if [ -z "$W_WBCAP" ] || [ -z "$W_WBWORDS" ] || [ -z "$W_WBSTATE" ] \
    || [ -z "$W_WCHUNKCAP" ]; then
@@ -219,6 +223,7 @@ PRELUDE_TEXT="$(printf '%s\n' \
   "const WATERBODY_CAP : u32 = ${W_WBCAP}u;" \
   "const WATERBODY_WORDS : u32 = ${W_WBWORDS}u;" \
   "const WATERBODY_STATE_WORDS : u32 = ${W_WBSTATE}u;" \
+  "const WATER_DRAIN_OPS : u32 = ${W_WDRAINOPS}u;" \
   "const WATER_CHUNK_CAP : u32 = ${W_WCHUNKCAP}u;" \
   "const FAR_LEVELS : u32 = ${W_FAR}u;" \
   "const FAR_N : u32 = ${W_FARN}u;" \

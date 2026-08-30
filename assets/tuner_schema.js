@@ -920,7 +920,7 @@ const TUNING_SCHEMA = [
       {k:'treeChancePine', n:'pine density', d:'Percent of tiles that grow a tree in pine biome.', min:0, max:100, step:1, int:true, u:'%'},
       {k:'treeChanceMeadow', n:'meadow density', d:'Percent of tiles that grow a tree in meadow.', min:0, max:100, step:1, int:true, u:'%'},
       {k:'treeChanceDesert', n:'desert density', d:'Percent of tiles that grow a tree in desert.', min:0, max:100, step:1, int:true, u:'%'},
-      {k:'autumnFraction', n:'autumn rarity', d:'One in this many broadleaf trees turns autumn-coloured.', min:1, max:50, step:1, int:true},
+      {k:'autumnFraction', n:'autumn rarity', d:'GLOBAL scale on autumn colour. Whether a species turns at all, and how often, is authored per species in assets/trees/<name>.json; this dials the whole world together without re-baking. 5 is the neutral value the species files are written against — higher is rarer, lower is commoner.', min:1, max:50, step:1, int:true},
       {k:'pondTile', n:'pond spacing', d:'Grid spacing between possible pond sites.', min:32, max:1024, step:16, int:true, u:'vox'},
       {k:'pondChance', n:'pond rarity', d:'One in this many pond tiles actually gets a pond.', min:1, max:32, step:1, int:true},
       {k:'pondRadiusMin', n:'pond min radius', d:'Smallest pond radius.', min:2, max:100, step:1, int:true, u:'vox'},

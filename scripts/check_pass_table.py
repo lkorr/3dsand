@@ -207,6 +207,9 @@ BUF_TO_WGSL = {
     "ActVoxViz": {"actVoxViz"},
     # The water-body drain ledger, GPU-owned (sim_waterbody.wgsl).
     "WaterBodyState": {"waterBodyState"},
+    # The baked tree atlas, binding 26 of BOTH simBGL_ and simSlimBGL_ (the
+    # far-cascade pipelines call genCell, so they sample it too).
+    "TreeAtlas": {"treeAtlas"},
     # Indirect-args and transfer-only buffers are never bound in a bind group,
     # so no WGSL name maps to them and the walk cannot see them. Correct: they
     # are consumed by vkCmdDispatchIndirect / vkCmdCopyBuffer, not by a shader.
@@ -238,6 +241,8 @@ _SIM_GROUP0 = {
     "actVoxViz",
     # The water-body drain ledger, binding 24 (docs/PLAN_water_master.md M2).
     "waterBodyState",
+    # The baked tree atlas, binding 26.
+    "treeAtlas",
     # The discharge's emission seam, binding 25 (M3).
     "waterSpawnOps",
 }
@@ -249,7 +254,13 @@ _SIM_GROUP0 = {
 # shell trigger inside the excite/settle seam, which runs on this layout, and
 # binding 24 has to name the same buffer in every module that declares it.
 _SLIM_GROUP0 = {"voxels", "dirtyIn", "dirtyOut", "materials", "T",
-                "pageTable", "pageFaults", "waterBodyState"}
+                "pageTable", "pageFaults", "waterBodyState",
+                # treeAtlas is in the SLIM group as well as the full one: `far`
+                # and `fardown` build on farPL_ and both reach the tree sampler
+                # (genCell -> treeAt, farSurfaceMat -> treeCanopyAt), so binding
+                # 26 has to name the same buffer in every module that declares
+                # it -- the same argument as waterBodyState above.
+                "treeAtlas"}
 _PARTICLE_GROUP1 = {"pRead", "pReadBuf", "pWrite", "counts", "claim", "pArgs",
                     "expOps", "expMask", "spawnOps"}
 _FAR_GROUP1 = {"farVox", "farOcc", "farList", "F", "farDirty", "farPatch"}

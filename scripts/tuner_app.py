@@ -71,10 +71,17 @@ def main():
     ts.ROOT = root
     ts.ASSETS = os.path.join(root, "assets")
     ts.MATDIR = os.path.join(ts.ASSETS, "materials")
+    # REBUILT, NOT PATCHED, and that is a standing hazard: this dict is a second
+    # copy of tuner_server.WRITABLE and the two silently drift. `items` was
+    # missing here for exactly that reason -- the browser could save items.json
+    # and the packaged app could not, with no error either side. Derive the keys
+    # from the module rather than retyping them, so a new writable file is added
+    # once.
     ts.WRITABLE = {
         "materials": os.path.join(ts.MATDIR, "materials.json"),
         "reactions": os.path.join(ts.MATDIR, "reactions.json"),
         "tuning": os.path.join(ts.MATDIR, "tuning.json"),
+        "items": os.path.join(ts.ASSETS, "items", "items.json"),
     }
     ts.EXE = os.path.join(root, "build", "Release", "sandvox.exe")
 

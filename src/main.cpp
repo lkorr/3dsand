@@ -2346,6 +2346,15 @@ int main(int argc, char** argv) {
       }
       MicroSet mic;
       { std::string ml; LoadMicroVox(ad + "/materials/materials.json", ad, m, mic, ml); }
+      // The second world this process builds needs the same trees as the first
+      // -- a treeless second world would hash differently for a reason that has
+      // nothing to do with what is being tested.
+      TreeAtlas stTrees;
+      { std::string tl;
+        if (!LoadTreeAtlas(ad + "/trees", m, stTrees, tl)) {
+          std::fprintf(stderr, "%s", tl.c_str());
+          return 1;
+        } }
       GpuContext stCtx;
       if (!stCtx.Init(nullptr, 1600, 900, lowPowerAdapter, false, backend,
                       vkValidation, sledgehammer))
@@ -2354,7 +2363,7 @@ int main(int argc, char** argv) {
       stWorld.residency = World::Residency::Paged;
       stWorld.Init(stCtx.device);
       Simulation stSim;
-      if (!stSim.Init(stCtx.device, stWorld, m, rx, mic, ad + "/shaders"))
+      if (!stSim.Init(stCtx.device, stWorld, m, rx, mic, stTrees, ad + "/shaders"))
         return 1;
       Physics stPhys; stPhys.Init();
       DebrisSystem stDebris; stDebris.Init(&stPhys, &stWorld, m, rx);
@@ -2480,6 +2489,21 @@ int main(int argc, char** argv) {
                 micro.materialCount, micro.frameCount, micro.pool.size());
   }
 
+  // The baked tree atlas (src/sim/treeatlas.h). AFTER LoadAssets, because it
+  // resolves the material NAMES its .svtree files carry against the compiled
+  // table, and before Simulation::Init, which uploads it.
+  TreeAtlas treeAtlas;
+  {
+    std::string tlog;
+    if (!LoadTreeAtlas(assetDir + "/trees", mats, treeAtlas, tlog)) {
+      std::fprintf(stderr, "%s", tlog.c_str());
+      std::fprintf(stderr, "tree atlas failed to load -- refusing to start with a "
+                           "half-read forest\n");
+      return 1;
+    }
+    if (!tlog.empty()) std::fprintf(stderr, "%s", tlog.c_str());
+  }
+
   GLFWwindow* window = nullptr;
   if (!selftest && !shot && !measure && !fluidBench && shotMob.empty() &&
       voxdumpArgs.empty() && !voxserve) {
@@ -2505,7 +2529,8 @@ int main(int argc, char** argv) {
       residencyPaged ? World::Residency::Paged : World::Residency::Dense;
   world.Init(ctx.device);
   Simulation sim;
-  if (!sim.Init(ctx.device, world, mats, reactions, micro, assetDir + "/shaders"))
+  if (!sim.Init(ctx.device, world, mats, reactions, micro, treeAtlas,
+                assetDir + "/shaders"))
     return 1;
 
   Physics phys;

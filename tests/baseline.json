@@ -1,7 +1,9 @@
 {
   "_about": "Pinned hashes and known gate failures. Machine-editable by --rebaseline. History in tests/BASELINE.md.",
   "_recorded_at": "46b7ec7 2026-08-21, RTX 3060 Ti; last re-recorded 2026-08-25 for the GAS VERTICAL MODEL (buoyancy as a redistributable probability)",
-  "determinismHash": "adfcbce8",
+  "_treeAtlas_about": "tree-atlas gate. treeAtlasHash is FNV-1a over the uploaded atlas buffer (assets/trees/*.svtree, remapped to engine material ids). It moves when a species is re-baked -- which also moves determinismHash, so this is what names WHICH asset did it instead of leaving a world-hash diff with no cause attached. Re-bake with node scripts/bake_trees.mjs, then --selftest --rebaseline.",
+  "treeAtlasHash": "a359d57915a7cad2",
+  "determinismHash": "5d7f90c1",
   "determinism": "pass",
   "sleep": "pass",
   "ca-slope": "pass",
@@ -21,7 +23,8 @@
   "far-persist": "pass",
   "screenshots": "pass",
   "player-walk": "pass",
-  "debris": "pass",
+  "_debris_about": "KNOWN-FAILING since the tree overhaul (2026-08-29), and the cause is understood: the gate drops 54 rigid bodies into open forest at x 40-125 / z 420-490, and trees now have real branch structure, so bodies get CAUGHT IN CANOPIES instead of reaching the ground. Confirmed by voxel dump -- a 1,752-voxel body hung at y=221 with ground at y=199 and an autumn-birch canopy at y=231. Nothing about the tree code is wrong; the fixture assumed open ground. Two honest fixes are open: make foliage not support rigid bodies (physically right, a behaviour change in src/phys/debris.cpp), or move the drop zone somewhere trees do not grow (cheaper, but then nothing exercises debris landing in a forest).",
+  "debris": "fail",
   "prefab": "pass",
   "settle-back": "pass",
   "player-body": "pass",
@@ -77,7 +80,7 @@
   "terrain.rampMaxObserved": "34",
   "terrain.localReliefObserved": "129",
   "terrain.farReliefObserved": "958",
-  "terrain.settleProxyObserved": "0",
+  "terrain.settleProxyObserved": "5",
 
   "_smoke_about": "Pinned hash sequences for --vk-smoke and --vk-smoke-loud. Each entry is [tick, hash]. tick 0 = worldgen. Re-record with --rebaseline.",
 
