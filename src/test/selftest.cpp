@@ -81,7 +81,13 @@ const char* const kOrder[] = {
     "screenshots", "fire-depth", "player-walk", "player-waterjump", "player-ledgegrab",
     "player-plants", "debris",
     "audio-impact", "audio-mob-voice", "audio-ambience",
-    "prefab",      "settle-back",    "player-body", "ragdoll-joints",
+    // "mob" restored to its original slot (it sat between prefab and
+    // settle-back until ec764e8 dropped it from both here and MobGates()).
+    // The position matters: gates share one World and several depend on what
+    // an earlier one left behind, so re-adding it anywhere else would be a
+    // different test.
+    "prefab",      "mob",            "settle-back", "player-body",
+    "ragdoll-joints",
     "save-load",   "save-entities", "region-store", "streaming",     "spells",
     "page-roundtrip", "daylight-boundary",
     // Per-voxel body reactivity. Late, and it must be: it lights real fires and

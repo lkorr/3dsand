@@ -1743,6 +1743,32 @@ neighbors, so this needs an explicit connectivity pass:
     `physics.explosionBodyDamageScale` × the destruction radius, kept separate
     from the impulse reach so a blast pushes objects from further away than it
     dismembers them.
+  - **The crater on a BODY has a shape** (`Mob::CarveLimbRadial`, so the player
+    avatar and every NPC share it; the debris path above is unchanged). The
+    original rule — an independent coin flip per voxel against `1 - t²` — is
+    the wrong shape twice over. `1 - t²` is still 0.36 at 80% of the radius, so
+    a large blast really does take a bit of everything it touches; and white
+    noise has **no feature size**, so what comes off is a fine speckle no
+    falloff curve can turn into a piece. Three mechanisms fix it, all lerped
+    from the old behaviour by `gore.carveChunkiness` (0 reproduces it exactly,
+    which the `mob` gate asserts with a three-arm 0/1/0 control):
+    - **correlated noise** — value noise at `gore.carveBlobSize`, sampled on
+      the **skin** lattice so the crater is a property of the art and not of
+      whatever collider resolution the engine derived;
+    - **a tighter falloff** — `(1 - t²)^gore.carveFalloff`, same endpoints, so
+      the crater concentrates rather than shrinking;
+    - **spall** (`Mob::CarveSpall`) — `gore.carveSpallRounds` passes that
+      remove survivors inside the blast with 3+ missing face-neighbours,
+      re-deriving occupancy between rounds. This is the one thing a predicate
+      *cannot* express, because it is a question about occupancy rather than
+      about a voxel, and `CarveLimb` is the only place occupancy is known. It
+      is what makes damage accumulate in one place: a second hit widens the
+      first wound instead of stippling fresh flesh beside it.
+
+    All three scale with **severity** — the blast radius against the limb's own
+    extent — so a close charge chunks and a distant graze still stipples. The
+    spall parameter is optional and only the radial path fills it, which keeps
+    the burn flush and the laser's clean kerf out of it by construction.
   - **The laser** (`MeltBodyAt`) bores a channel tick by tick and the body
     splits when that channel actually severs it. No cutting plane is chosen,
     so what comes apart is decided by the geometry the player carved rather
@@ -2225,8 +2251,14 @@ consumes it and owns the physics plumbing. Per mob per tick:
    would be order-dependent.
 3. **Additive** layers applied *after* the normalize: `q_out = q_base *
    nlerp(identity, dq, w)`, with `dq = conj(q_ref) * q_src` measured against
-   the clip's own frame 0. Applying them before the normalize would let the
-   weight division scale the delta away.
+   the part's **rest** pose. Applying them before the normalize would let the
+   weight division scale the delta away. The reference is rest and *not* the
+   clip's own frame 0: a cyclic clip authored `+14 → −14 → +14` has its whole
+   swing subtracted away by a frame-0 reference and becomes a one-sided
+   `0 → −28 → 0`, so the pose never crosses rest and both arms sit permanently
+   off to the same side — the "zombie arms" look. Rest is also the only
+   reference under which two additive layers compose the way an animator
+   expects.
 4. **Flatten** parent→child in one linear pass; the loader topologically sorts
    limbs so a parent's index is always below its children's.
 5. **IK** — two-bone analytic, in model space, strictly a **post-process**.
@@ -2236,7 +2268,25 @@ consumes it and owns the physics plumbing. Per mob per tick:
    root angle uses the `atan2` form, and the bend plane comes from an
    **explicit per-chain pole vector** with a fixed fallback axis when the
    cross product degenerates near full extension.
-6. **Physics blend / submit** through the existing `MoveKinematicBody` path.
+6. **Pose limits** (`AnimClampPoseLimits`) — clamp every part carrying an
+   authored `poseLimit` back inside its range of motion, about the part's own
+   **rest** frame, then recompose the subtree below it. Runs *after all IK*,
+   never between solves: the IK is what puts a joint out of range, and a later
+   solve would undo an earlier clamp.
+
+   This exists because **the ragdoll limits do not bind an animated limb**.
+   `MobLimbDef::minAngle/maxAngle` and the swing-twist cone are Jolt
+   constraints, and Jolt only enforces them on a *dynamic* body — a live limb
+   is kinematic and re-posed every tick, so nothing at all stood between the IK
+   and an anatomically impossible leg. A single-axis limit clamps only the
+   **twist** about the authored axis and leaves the swing free, so "the hip
+   pitches between −20 and +85" can be stated without also constraining
+   abduction.
+
+   The limits are authored data (`assets/mobs/*.json`), and they should be
+   **measured, not guessed**: `--selftest --gate mob` prints each joint's
+   observed range next to its authored one for a flat walk and a ramp climb.
+7. **Physics blend / submit** through the existing `MoveKinematicBody` path.
 
 **Gait** is the base layer and needs no per-gait table. Each leg's ideal
 contact is `hip + fwd·strideBias + vel·leadTime`, snapped down through
@@ -2250,6 +2300,51 @@ the foot-plane normal (Newell's method)** — which is why walking up voxel
 stairs works with zero slope-handling code. Pelvis bob runs at 2× step
 frequency (one rise per footfall), sway/roll at 1×, plus spine
 counter-rotation and a progressive phase lag per hierarchy level.
+
+**The avatar's gait differs from a mob's in three ways**, all forced by the
+fact that the *player* owns the body rather than the gait:
+
+- **Body height comes from the player**, not from the foot average — the AABB
+  has already resolved against the terrain, and re-deriving height from feet
+  whose goal falls back to that same height is a loop that runs away at ~9.5
+  voxels/tick. The feet supply only the slope.
+- **The pelvis therefore has to CROUCH to buy the stride any reach.** With the
+  hip pinned at a fixed height above the ground, the reachable stride is
+  `sqrt(reach² − span²)`, and on a rig authored standing that is nearly
+  nothing: the stock human's hip sits 6.75 voxels over its ankle against a 6.79
+  chain, so the foot could travel **0.7 voxels** before the two-bone solver hit
+  its reach clamp — and a clamped solve is one fixed straight-leg pose for every
+  target beyond it. `stanceCrouch_` solves for the highest hip that can still
+  reach the far end of the stride the gait is about to ask for, and drops the
+  pelvis by the difference. It reads only the rig and the player's own speed,
+  never a foot position, so it is not the feedback path above.
+- **The IK effector is the ANKLE, so the foot goal is raised by `restSoleY_`.**
+  `GroundHeightAt` returns the surface the *min corner* rests on; handing that
+  to the solver asks for the full hip-to-corner drop and clamps on every tick
+  of every walk.
+
+**One stride clock.** `gaitPhase` on the avatar is driven **by the feet**: the
+rate is the measured period between touchdowns and the phase is pulled onto a
+half-turn boundary at each one (`PlayerAvatar::SyncStrideClock`). The feet step
+on a *drift threshold* while the bob/sway ran off `cadence × speedFactor` — two
+clocks that disagreed by ~2.6× on the stock human, which at a 30 Hz tick is a
+bob under four samples per cycle and reads on screen as a fast lateral jitter.
+It cannot be tuned out, because the ratio itself moves with speed. With one
+clock, `bobFreqMul 2` means "once per footfall" *by construction*. The walk/run
+clips ride the same rate through `ClipInstance::rate`, so the arms stay locked
+to the feet at speeds between the two authored clip periods. The NPC path
+deliberately keeps the free oscillator — its swing is a flat `stepDuration` at
+mob speeds, where the mismatch is small — and rigs with no leg chains
+(`dummy.json`) keep it because they have no foot to lock to.
+
+**Air-state clips fire on events, not on contact loss.** `jump` plays on
+`Player::jumped`, a sticky latch set where the impulse is actually applied and
+drained by `main.cpp` after the tick batch; losing contact is not a jump, and a
+step-down at walking pace clears any debounce. `fall` additionally requires a
+real **drop** below the height support was last held at (`avatar.fallMinDrop`),
+and its flail is a weight **ramp** over `fallFlailDelay`/`fallFlailRamp` rather
+than a pose that switches on — so a short drop never reaches the wide shape and
+only a genuine fall arrives at it.
 
 **Springs** (Holden's closed form, unconditionally stable at any dt) drive
 parts like tails. A part is *keyed or jiggled, never both*, so a spring never

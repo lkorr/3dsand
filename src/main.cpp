@@ -4353,6 +4353,10 @@ int main(int argc, char** argv) {
         // ratchets upward, and the next avatar to spawn would inherit the
         // hardest hit the session ever recorded and die on its first tick.
         player.impactDeltaV = Vec3{0, 0, 0};
+        // Same drain, same reason (see Player::jumped): the avatar's `jump`
+        // clip is edge-triggered off this latch, and Player::Update sets it
+        // per FRAME while this loop runs 0..4 times per frame.
+        player.jumped = false;
       }
 
       // ---- magic (game/spell.h) ---------------------------------------------

@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <fstream>
 #include <unordered_map>
+#include <unordered_set>
 
 #include <nlohmann/json.hpp>
 
@@ -36,6 +37,45 @@ inline Vec3 RotateInv(const Quat& q, Vec3 v) { return QuatRotateInv(q, v); }
 using rng::Hash3;
 using rng::Pcg;
 using rng::SignedUnit;
+
+// ---- correlated noise for the blast crater (Tuning::Gore carve*) -----------
+//
+// WHITE NOISE CANNOT MAKE A CHUNK. An independent draw per voxel has no feature
+// size at all, so whatever radial falloff it is thresholded against, what comes
+// off is a fine speckle — which is exactly the reported "thin scatter of voxels
+// spread over the whole body". Correlating the draws over a few voxels is what
+// makes neighbours leave together, and the correlation length IS the size of the
+// piece that tears away.
+//
+// Ordinary trilinear value noise: hash the eight lattice corners, smoothstep
+// between them. Keyed off the same rng::Hash3 the rim jitter uses, so it is
+// reproducible for a given (mob, limb) and a replay tears the same way. Limbs
+// are outside the hashed grid domain, so floats here are legal (rule 1 governs
+// the sim, not gameplay state) — the same licence the jitter already takes.
+float ValueNoise3(uint32_t seed, float x, float y, float z) {
+  const float fx = std::floor(x), fy = std::floor(y), fz = std::floor(z);
+  const int ix = (int)fx, iy = (int)fy, iz = (int)fz;
+  const float tx = x - fx, ty = y - fy, tz = z - fz;
+  // Smoothstep the interpolants, or the field is C0 and the crater rim shows
+  // the lattice as flat facets.
+  auto sm = [](float t) { return t * t * (3.0f - 2.0f * t); };
+  const float ux = sm(tx), uy = sm(ty), uz = sm(tz);
+  auto corner = [&](int cx, int cy, int cz) {
+    const uint32_t h = Hash3(seed ^ 0x9E3779B9u, (uint32_t)(cx * 73856093),
+                             (uint32_t)(cy * 19349663) ^
+                                 (uint32_t)(cz * 83492791));
+    return (float)(h & 0xFFFFu) / 65535.0f;
+  };
+  auto lerp = [](float a, float b, float t) { return a + (b - a) * t; };
+  const float c000 = corner(ix, iy, iz), c100 = corner(ix + 1, iy, iz);
+  const float c010 = corner(ix, iy + 1, iz), c110 = corner(ix + 1, iy + 1, iz);
+  const float c001 = corner(ix, iy, iz + 1), c101 = corner(ix + 1, iy, iz + 1);
+  const float c011 = corner(ix, iy + 1, iz + 1);
+  const float c111 = corner(ix + 1, iy + 1, iz + 1);
+  const float x00 = lerp(c000, c100, ux), x10 = lerp(c010, c110, ux);
+  const float x01 = lerp(c001, c101, ux), x11 = lerp(c011, c111, ux);
+  return lerp(lerp(x00, x10, uy), lerp(x01, x11, uy), uz);
+}
 
 // Event-scoped variance, applied at the spray sites. Entity-scoped variances
 // were already resolved into mob.gore_ at spawn, so these pass through — this is
@@ -353,6 +393,23 @@ bool LoadMobDefs(const std::string& dir, const std::vector<MaterialDef>& mats,
         ld.twistLimit = l.value("twist", jl.twist);
         ld.jointFriction = l.value("jointFriction", jl.friction);
       }
+      // Pose-space range of motion. Deliberately NOT folded into the "cone"
+      // block above: that one is a Jolt constraint on a dynamic body and this
+      // one bounds the animated pose, and conflating them is exactly the
+      // confusion that let an IK-driven thigh swing to any angle it liked while
+      // a perfectly good-looking ragdoll limit sat in the same sidecar. Degrees
+      // in, radians out, like `edge` converts its units at the same point.
+      if (l.contains("poseLimit") && l["poseLimit"].is_object()) {
+        const json& pl = l["poseLimit"];
+        ld.hasPoseLimit = true;
+        if (pl.contains("axis") && pl["axis"].size() == 3)
+          ld.poseAxis = {pl["axis"][0].get<float>(), pl["axis"][1].get<float>(),
+                         pl["axis"][2].get<float>()};
+        const float kDeg = 3.14159265f / 180.0f;
+        ld.poseMin = pl.value("min", -180.0f) * kDeg;
+        ld.poseMax = pl.value("max", 180.0f) * kDeg;
+        if (ld.poseMin > ld.poseMax) std::swap(ld.poseMin, ld.poseMax);
+      }
       if (l.contains("anchor") && l["anchor"].size() == 3) {
         ld.anchor = {l["anchor"][0].get<float>(), l["anchor"][1].get<float>(),
                      l["anchor"][2].get<float>()};
@@ -461,6 +518,10 @@ bool LoadMobDefs(const std::string& dir, const std::vector<MaterialDef>& mats,
         p.swingPhase = ld.swingPhase;
         p.hasSpring = ld.hasSpring;
         p.spring = ld.spring;
+        p.hasPoseLimit = ld.hasPoseLimit;
+        p.poseAxis = ld.poseAxis;
+        p.poseMin = ld.poseMin;
+        p.poseMax = ld.poseMax;
       }
       // rest transforms come from the .vox layout: a part's local rest
       // position is its joint anchor relative to the parent's anchor.
@@ -929,9 +990,28 @@ void MobSystem::OnMaterialsReloaded(const std::vector<MaterialDef>& mats,
 
 void MobSystem::SetDefs(std::vector<MobDef> defs) { defs_ = std::move(defs); }
 
-void MobSystem::Reset() {
+void MobSystem::Reset(bool rewindIds) {
   for (Mob& m : mobs_) m.ReleaseRig();
   mobs_.clear();
+  // THE ID COUNTER IS DELIBERATELY NOT REWOUND BY DEFAULT.
+  //
+  // A mob id is not just a handle: it seeds the entity-scoped gore variance
+  // (MakeGoreProfile) and the blast crater's noise (Mob::CarveLimbRadial keys
+  // on `id_ * 2654435761u`). So rewinding it is a real behaviour change —
+  // the next creature spawned after a reset inherits the previous first
+  // creature's gore personality and tears the same way.
+  //
+  // It is tempting to call that "correct", since Reset() otherwise restores
+  // the initial state. It was tried, and it MOVED A GATE: `mob-burn`'s
+  // cloth-vs-flesh subtest burned a mina to 100% of both instead of 95%/51%,
+  // in-suite only, because her burn draw is id-keyed. Shipping randomness is
+  // not worth re-rolling to make a test tidy.
+  //
+  // `rewindIds` is that test's seam and nothing else uses it: an A/B that runs
+  // the same tuning twice around a changed one needs the id-seeded draws to
+  // repeat, or its two control arms disagree and the middle arm proves nothing
+  // (measured: 164 voxels vs 155 with the counter running).
+  if (rewindIds) nextId_ = 1;
   instancesDirty_ = true;
 }
 
@@ -1270,19 +1350,38 @@ bool Mob::BuildRig(const MobDef& def, Vec3 origin) {
   // authored per-rig trim for exactly this residual — see the stance term in
   // UpdateGait — and it is already within a voxel on every current def.
   {
-    float lowest = 0;
+    float lowest = 0, hipOfLowest = 0, aheadOfLowest = 0;
     bool any = false;
     for (const IkChain& ch : def.skel.chains) {
       if (ch.tag != "leg" || ch.parts.empty()) continue;
+      // Horizontal hip -> ankle offset in the rest pose, accumulated the same
+      // way the heights are.
+      float ax = 0, az = 0;
+      for (size_t k = 1; k < ch.parts.size(); k++) {
+        ax += def.skel.parts[ch.parts[k]].rest.pos.x;
+        az += def.skel.parts[ch.parts[k]].rest.pos.z;
+      }
+      const float ahead = std::sqrt(ax * ax + az * az);
       // rest.pos is parent-relative (anchorLocal deltas), so accumulating from
       // the chain root's absolute anchor reproduces AnimFlatten's rest result
       // without running the whole pipeline.
-      float y = def.skel.parts[ch.parts[0]].anchorLocal.y;
+      const float hip = def.skel.parts[ch.parts[0]].anchorLocal.y;
+      float y = hip;
       for (size_t k = 1; k < ch.parts.size(); k++)
         y += def.skel.parts[ch.parts[k]].rest.pos.y;
-      if (!any || y < lowest) { lowest = y; any = true; }
+      // The HIP of whichever leg reaches lowest, not the highest hip on the
+      // rig: the span these two describe has to belong to ONE chain, or a rig
+      // with legs at different heights reports a span no leg actually has.
+      if (!any || y < lowest) {
+        lowest = y;
+        hipOfLowest = hip;
+        aheadOfLowest = ahead;
+        any = true;
+      }
     }
     restSoleY_ = any ? lowest : 0.0f;
+    restHipY_ = any ? hipOfLowest : 0.0f;
+    restFootAhead_ = any ? aheadOfLowest : 0.0f;
   }
   anim_.lastPos = origin_;
   bodyY_ = origin_.y;
@@ -1741,6 +1840,16 @@ void MobSystem::UpdateAnimation(Mob& mob, const MobDef& def, World& world,
                                  0.0f, 1.5f);
 
   const GaitDef& g = sk.gait;
+  // THE NPC GAIT STILL RUNS A FREE OSCILLATOR, and that is a deliberate scope
+  // line rather than an oversight. PlayerAvatar drives its phase from the feet
+  // (PlayerAvatar::SyncStrideClock) because on the avatar the two clocks
+  // disagree by ~2.6x and the bob reads as a jitter — but the avatar's swing
+  // duration is budget-capped against the player's much higher speed, which is
+  // what makes the mismatch that large. The NPC path swings for a flat
+  // `stepDuration` at mob speeds, where cadence is close enough that nobody has
+  // reported it. Anyone unifying these should port the sync, not the
+  // oscillator: `mob.phase_` below is also the legacy swingAmp drive for rigs
+  // with no chains, and THAT genuinely has no foot to lock to.
   st.gaitPhase += dt * (g.present ? g.cadence : 2.2f) * speedFactor;
   if (st.gaitPhase > 1.0f) st.gaitPhase -= std::floor(st.gaitPhase);
   mob.phase_ = st.gaitPhase * 6.2831853f;
@@ -1892,6 +2001,11 @@ void MobSystem::UpdateAnimation(Mob& mob, const MobDef& def, World& world,
       AnimSolveTwoBone(sk, st, sk.chains[c], prefabPt, weight);
     }
   }
+
+  // ---- stage 6: the pose has to be anatomically possible ----
+  // After every solve, never between them: the IK is what puts a joint out of
+  // range, so clamping earlier would only clamp a pose about to be replaced.
+  AnimClampPoseLimits(sk, st);
 
   // ---- flipbooks: integer frame index from elapsed ms ----
   if (st.flipbook.book >= 0 && st.flipbook.book < (int)sk.flipbooks.size()) {
@@ -2786,7 +2900,8 @@ void Mob::EmitCarvedFragment(const MobLimb& src, uint32_t physScale,
 
 bool Mob::CarveLimb(int limbIndex, World& world,
                           std::vector<ParticleSpawn>& spawns, bool eject,
-                          const LimbCarveFactory& carveAt) {
+                          const LimbCarveFactory& carveAt,
+                          const CarveSpall* spall) {
   // Burning leaves material-0 TOMBSTONES in the lattice between its batched
   // flushes, and every reader of the lattice has to see past them: counting
   // them as present would over-report the limb's volume (so a limb burnt to a
@@ -2839,7 +2954,121 @@ bool Mob::CarveLimb(int limbIndex, World& world,
   }
   if (removed.empty() && !skinRemoved) return true;  // nothing in range
 
-  if (eject) LimbVoxelsToParticles(limb, def.physScale, removed, world, spawns);
+  // ---- SPALL: grow the hole into its own rim -------------------------------
+  //
+  // The crater predicate is a per-voxel question and cannot express "take more
+  // where matter is already missing" — it has no idea what is left. This does,
+  // because `limb` is the authoritative voxel list, and that is the whole
+  // reason the growth lives in CarveLimb rather than in the predicate.
+  //
+  // Each round removes surviving voxels that are INSIDE the blast and already
+  // have enough missing face-neighbours, weighted toward the centre. That turns
+  // a rim of isolated survivors into a torn edge, makes a second hit on an
+  // existing wound widen it instead of stippling fresh flesh next to it, and is
+  // what lets a blast beside an arm take the arm.
+  //
+  // Runs on whichever lattice is AUTHORITATIVE (the skin when there is one), so
+  // the collider re-derive below picks the result up for free.
+  if (spall != nullptr && spall->rounds > 0 && spall->strength > 0.0f &&
+      spall->radius > 0.0f) {
+    const float scale =
+        (float)std::max(1u, fine ? def.skinScale : def.physScale);
+    const Vec3 cLocal = spall->centerLocal * scale;
+    const float rLocal = spall->radius * scale;
+    const float r2 = rLocal * rLocal;
+    // Packed key over the lattice. int16 skin coords, so 21 bits per axis with
+    // a bias is ample and collision-free (unlike hashing the position, which
+    // would make occupancy probabilistic — the one thing this pass must not be).
+    auto key = [](int x, int y, int z) -> uint64_t {
+      return ((uint64_t)(uint32_t)(x + 32768) << 42) |
+             ((uint64_t)(uint32_t)(y + 32768) << 21) |
+             (uint64_t)(uint32_t)(z + 32768);
+    };
+    std::unordered_set<uint64_t> live;
+    auto rebuild = [&] {
+      live.clear();
+      if (fine) {
+        live.reserve(limb.skinVoxels.size() * 2);
+        for (const PrefabVoxel& v : limb.skinVoxels) live.insert(key(v.x, v.y, v.z));
+      } else {
+        live.reserve(limb.voxels.size() * 2);
+        for (const DebrisVoxel& v : limb.voxels) live.insert(key(v.x, v.y, v.z));
+      }
+    };
+    rebuild();
+    // A voxel on an intact surface already has one open face, so "eroded"
+    // starts at three: fewer and this eats the whole skin from the outside in
+    // rather than widening the crater.
+    constexpr int kMinOpenFaces = 3;
+    for (int round = 0; round < spall->rounds; round++) {
+      size_t took = 0;
+      auto doomed = [&](int x, int y, int z) {
+        const Vec3 d{(float)x + 0.5f - cLocal.x, (float)y + 0.5f - cLocal.y,
+                     (float)z + 0.5f - cLocal.z};
+        const float d2 = d.dot(d);
+        if (d2 >= r2) return false;               // outside the blast
+        int open = 0;
+        static const int kN[6][3] = {{1, 0, 0}, {-1, 0, 0}, {0, 1, 0},
+                                     {0, -1, 0}, {0, 0, 1}, {0, 0, -1}};
+        for (const auto& n : kN)
+          if (!live.count(key(x + n[0], y + n[1], z + n[2]))) open++;
+        if (open < kMinOpenFaces) return false;
+        // Proximity-weighted, so the tearing is concentrated at the blast and
+        // fades out rather than eroding the rim uniformly. Keyed on the same
+        // (mob, limb) seed plus the round, so a replay spalls identically.
+        const float t = std::sqrt(d2 / r2);
+        const float chance = spall->strength * (1.0f - t) *
+                             ((float)open / 6.0f);
+        const uint32_t h =
+            Hash3(spall->seed + 0x5BF03635u * (uint32_t)(round + 1),
+                  (uint32_t)(x * 73856093) ^ (uint32_t)(y * 19349663),
+                  (uint32_t)(z * 83492791));
+        return (float)(h & 0xFFFFu) / 65535.0f < chance;
+      };
+      if (fine) {
+        const size_t before = limb.skinVoxels.size();
+        limb.skinVoxels.erase(
+            std::remove_if(limb.skinVoxels.begin(), limb.skinVoxels.end(),
+                           [&](const PrefabVoxel& v) {
+                             if (!doomed(v.x, v.y, v.z)) return false;
+                             skinLostSum +=
+                                 Vec3{(float)v.x, (float)v.y, (float)v.z};
+                             skinLostN++;
+                             return true;
+                           }),
+            limb.skinVoxels.end());
+        took = before - limb.skinVoxels.size();
+        if (took) skinRemoved = true;
+      } else {
+        const size_t before = limb.voxels.size();
+        limb.voxels.erase(
+            std::remove_if(limb.voxels.begin(), limb.voxels.end(),
+                           [&](const DebrisVoxel& v) {
+                             if (!doomed(v.x, v.y, v.z)) return false;
+                             removed.push_back(v);
+                             return true;
+                           }),
+            limb.voxels.end());
+        took = before - limb.voxels.size();
+      }
+      // Nothing left to grow into: stop rather than paying for empty passes.
+      if (took == 0) break;
+      // The NEXT round must see the hole this one opened, or every round tests
+      // the same rim and the growth is one round wide however many are asked
+      // for. This is the whole mechanism.
+      rebuild();
+    }
+  }
+
+  // THE PARTICLES ARE BILLED FROM THE COLLIDER DELTA, not from the predicate.
+  //
+  // On a fine skin the spall above ran on the SKIN, so the `removed` list built
+  // from the collider predicate no longer describes what actually left the body
+  // — it would under-report a torn chunk as a sprinkle of gore. Re-deriving the
+  // collider first and differencing gives the honest set, and it is the same
+  // set the physics is about to be rebuilt from.
+  std::vector<DebrisVoxel> colliderBefore;
+  if (fine && eject) colliderBefore = limb.voxels;
   if (fine) {
     // Skin is authoritative: re-derive the collider from what the carve left
     // rather than carving the collider in parallel. Disagreement between the
@@ -2855,6 +3084,25 @@ bool Mob::CarveLimb(int limbIndex, World& world,
                          return !keep(v.x, v.y, v.z);
                        }),
         limb.voxels.end());
+  }
+  if (eject) {
+    if (fine) {
+      // What the collider lost across the whole carve, spall included. The
+      // predicate-built `removed` is deliberately discarded here rather than
+      // merged: on a fine skin it was only ever an approximation of this.
+      std::unordered_set<uint64_t> after;
+      after.reserve(limb.voxels.size() * 2);
+      auto ck = [](const DebrisVoxel& v) -> uint64_t {
+        return ((uint64_t)(uint32_t)(v.x + 32768) << 42) |
+               ((uint64_t)(uint32_t)(v.y + 32768) << 21) |
+               (uint64_t)(uint32_t)(v.z + 32768);
+      };
+      for (const DebrisVoxel& v : limb.voxels) after.insert(ck(v));
+      removed.clear();
+      for (const DebrisVoxel& v : colliderBefore)
+        if (!after.count(ck(v))) removed.push_back(v);
+    }
+    LimbVoxelsToParticles(limb, def.physScale, removed, world, spawns);
   }
   MarkInstancesDirty();
 
@@ -3796,9 +4044,58 @@ bool Mob::CarveLimbRadial(uint64_t bodyHandle, Vec3 centerWorldVoxel,
     // derive -- otherwise the same blast would tear differently on two rigs
     // that only differ in limb size.
     const float jitterScale = (float)std::max(1u, def.skinScale);
+
+    // ---- crater shape (tuning.json gore.carve*) ----------------------------
+    const auto& gt = CurrentTuning().gore;
+    // SEVERITY COUPLES TO THE BLAST. A grazing hit from a distant explosion
+    // and a charge going off against the elbow should not tear the same way,
+    // and the honest measure of "how big was this, for THIS limb" is the blast
+    // radius against the limb's own extent — a radius that swallows the arm
+    // chunks it, one that clips the edge still stipples. `l.size` is in
+    // collider units, hence the physScale division (the same conversion
+    // CarveRadialAll does for its reject sphere).
+    float limbExtent = 1.0f;
+    {
+      const float inv = 1.0f / (float)std::max(1u, def.physScale);
+      limbExtent = std::max(
+          0.5f, 0.5f * Vec3{(float)limb.size.x, (float)limb.size.y,
+                            (float)limb.size.z}.len() * inv);
+    }
+    // 0 at a graze, 1 once the blast is as big as the limb. Bounded above so a
+    // huge explosion does not keep escalating past "took the whole thing".
+    const float severity =
+        std::clamp(radiusVoxels / limbExtent, 0.0f, 1.0f);
+    // The master slider, scaled by severity so distance still reads. Everything
+    // below lerps from the OLD behaviour at chunk == 0 — that identity is what
+    // makes the slider an A/B rather than an approximation, and the mob gate
+    // asserts it.
+    const float chunk =
+        std::clamp(gt.carveChunkiness, 0.0f, 1.0f) * (0.35f + 0.65f * severity);
+    const float falloffExp = 1.0f + (gt.carveFalloff - 1.0f) * chunk;
+    const float blob = std::max(gt.carveBlobSize, 0.5f);
+
+    // The spall pass, filled ONLY on this path — a null pointer is what keeps
+    // the burn flush (mob.cpp's FlushBurn carve) and the laser's clean bore out
+    // of it by construction, rather than by each of them remembering to say no.
+    // `ragged` is part of the gate for the same reason: a kerf that spalled
+    // would stop being a kerf.
+    Mob::CarveSpall spallData{};
+    const bool wantSpall = ragged && chunk > 0.0f && gt.carveSpallRounds > 0;
+    if (wantSpall) {
+      spallData.centerLocal = cBody;
+      spallData.radius = radiusVoxels;
+      // Severity again: a close blast tears its rim apart, a distant one just
+      // stipples. Same coupling the falloff gets, so the two move together.
+      spallData.strength = std::clamp(0.55f * chunk, 0.0f, 1.0f);
+      spallData.rounds = gt.carveSpallRounds;
+      spallData.seed = seed;
+    }
+    const Mob::CarveSpall* spallPtr = wantSpall ? &spallData : nullptr;
+
     CarveLimb(
         (int)i, world, spawns, eject,
-        [&, cBody, seed, jitterScale](float scale) -> LimbCarveKeep {
+        [&, cBody, seed, jitterScale, chunk, falloffExp,
+         blob](float scale) -> LimbCarveKeep {
           const Vec3 cLocal = cBody * scale;
           const float rLocal = radiusVoxels * scale;
           const float rLocal2 = rLocal * rLocal;
@@ -3815,17 +4112,46 @@ bool Mob::CarveLimbRadial(uint64_t bodyHandle, Vec3 centerWorldVoxel,
             // so a float hash is fine -- rule 1 governs the grid.
             float t = std::sqrt(d2 / rLocal2);
             float chance = 1.0f - t * t;
+            // TIGHTEN THE CRATER. `1 - t^2` is 0.75 at half the radius and
+            // 0.36 at 80% of it, which is why a large blast really did remove
+            // a bit of everything it touched instead of a hole where it hit.
+            // Raising it to a power concentrates the removal without moving
+            // the endpoints (it is still 1 at the centre and 0 at the rim), so
+            // the crater gets tighter rather than smaller.
+            if (falloffExp > 1.0f) chance = std::pow(chance, falloffExp);
             // Quantised onto the skin lattice so both passes agree on which
             // part of the rim is torn.
             int sx = (int)std::floor((float)x * toSkin);
             int sy = (int)std::floor((float)y * toSkin);
             int sz = (int)std::floor((float)z * toSkin);
-            uint32_t h = Hash3(seed, (uint32_t)sx * 73856093u,
-                               (uint32_t)sy * 19349663u ^
-                                   (uint32_t)sz * 83492791u);
-            return (float)(h & 0xFFFFu) / 65535.0f >= chance;
+            const uint32_t h = Hash3(seed, (uint32_t)sx * 73856093u,
+                                     (uint32_t)sy * 19349663u ^
+                                         (uint32_t)sz * 83492791u);
+            const float white = (float)(h & 0xFFFFu) / 65535.0f;
+            // CORRELATED NOISE INSTEAD OF WHITE NOISE.
+            //
+            // An independent draw per voxel has no feature size, so what it
+            // removes is a fine speckle by construction — no falloff shape can
+            // make speckle into a chunk. Sampling a SMOOTH field at
+            // carveBlobSize instead gives neighbouring voxels correlated draws,
+            // so they leave together, and the blob size IS the size of the
+            // piece that comes off.
+            //
+            // Sampled on the SKIN lattice for the same reason the jitter above
+            // is: the crater's shape is a property of the art, so the same
+            // blast tears identically whatever collider resolution the engine
+            // derived for this def.
+            float draw = white;
+            if (chunk > 0.0f) {
+              const float smooth =
+                  ValueNoise3(seed, (float)sx / blob, (float)sy / blob,
+                              (float)sz / blob);
+              draw = white + (smooth - white) * chunk;
+            }
+            return draw >= chance;
           };
-        });
+        },
+        spallPtr);
     return true;
   }
   return false;
@@ -4365,6 +4691,45 @@ uint32_t MobSystem::LimbVoxelCount(uint64_t mobId, int limbIndex) const {
   for (const Mob& mob : mobs_)
     if (mob.id_ == mobId && limbIndex >= 0 && limbIndex < (int)mob.limbs_.size())
       return (uint32_t)mob.limbs_[limbIndex].voxels.size();
+  return 0;
+}
+
+uint32_t MobSystem::LimbOpenFaceCount(uint64_t mobId, int limbIndex,
+                                      int minOpen) const {
+  for (const Mob& mob : mobs_) {
+    if (mob.id_ != mobId || limbIndex < 0 ||
+        limbIndex >= (int)mob.limbs_.size())
+      continue;
+    const MobLimb& limb = mob.limbs_[limbIndex];
+    // Measured on the SKIN when there is one, for the same reason the crater
+    // noise is keyed there: the shape belongs to the art, not to whichever
+    // collider resolution the engine derived.
+    const bool fine = limb.HasFineSkin();
+    auto key = [](int x, int y, int z) -> uint64_t {
+      return ((uint64_t)(uint32_t)(x + 32768) << 42) |
+             ((uint64_t)(uint32_t)(y + 32768) << 21) |
+             (uint64_t)(uint32_t)(z + 32768);
+    };
+    std::unordered_set<uint64_t> live;
+    if (fine)
+      for (const PrefabVoxel& v : limb.skinVoxels) live.insert(key(v.x, v.y, v.z));
+    else
+      for (const DebrisVoxel& v : limb.voxels) live.insert(key(v.x, v.y, v.z));
+    static const int kN[6][3] = {{1, 0, 0}, {-1, 0, 0}, {0, 1, 0},
+                                 {0, -1, 0}, {0, 0, 1}, {0, 0, -1}};
+    uint32_t n = 0;
+    auto tally = [&](int x, int y, int z) {
+      int open = 0;
+      for (const auto& d : kN)
+        if (!live.count(key(x + d[0], y + d[1], z + d[2]))) open++;
+      if (open >= minOpen) n++;
+    };
+    if (fine)
+      for (const PrefabVoxel& v : limb.skinVoxels) tally(v.x, v.y, v.z);
+    else
+      for (const DebrisVoxel& v : limb.voxels) tally(v.x, v.y, v.z);
+    return n;
+  }
   return 0;
 }
 

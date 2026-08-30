@@ -328,6 +328,34 @@ class PlayerAvatar : public Mob {
     return skel_.clips[c].name.c_str();
   }
   int LocoState() const { return anim_.locoState; }
+  // ---- stride clock readouts (diagnostics and the mob gate) ----------------
+  // The pelvis bob/sway and the arm clips run off THIS phase, and the feet are
+  // what advance it. Counting its cycles against the footfalls is the only way
+  // to assert the two clocks are one — a bob at 2.6x the footfall rate looks
+  // fine in every per-part pose measure and is exactly the reported jitter.
+  float GaitPhase() const { return anim_.gaitPhase; }
+  float StrideRate() const { return strideRate_; }   // strides/sec, 0 = parked
+  // How far the pelvis is dropped below the player's AABB sole, world voxels.
+  float StanceCrouch() const { return stanceCrouch_; }
+  // Requested weight of the named clip's live instance, or 0 if not running.
+  // The fall flail is a RAMP now, so "is the fall clip active" is no longer the
+  // question — "how far in is it" is.
+  float ClipWeight(const char* name) const {
+    if (!def_) return 0.0f;
+    const int c = skel_.FindClip(name);
+    if (c < 0) return 0.0f;
+    for (const ClipInstance& inst : anim_.clips)
+      if (inst.clip == c && !inst.stopping) return inst.weight;
+    return 0.0f;
+  }
+  bool ClipActive(const char* name) const {
+    if (!def_) return false;
+    const int c = skel_.FindClip(name);
+    if (c < 0) return false;
+    for (const ClipInstance& inst : anim_.clips)
+      if (inst.clip == c && !inst.stopping) return true;
+    return false;
+  }
 
  protected:
   // ---- THE EXPLICIT EXCEPTIONS (Mob's virtual seam) -------------------------
@@ -371,6 +399,9 @@ class PlayerAvatar : public Mob {
   // Airborne leg pose: relaxes the legs toward their rest hang instead of
   // leaving IK chasing a stale world-space foot plant.
   void UpdateAirPose(float dt);
+  // Lock the pelvis/arm clock onto a foot touchdown on leg chain `chain`.
+  // The ONLY writer of strideRate_ and of anim_.gaitPhase's correction term.
+  void SyncStrideClock(int chain);
   void ResolveParts();
   // Per-voxel burning under the avatar's PRIVATE budget — a crowd of burning
   // NPCs must not starve the fire on the player character.
@@ -411,6 +442,30 @@ class PlayerAvatar : public Mob {
   float lastFallSpeed_ = 0;
   bool running_ = false;
   float airTime_ = 0;
+  // Previous tick's Player::jumped, so the jump clip fires on the LATCH'S
+  // rising edge. The latch is sticky across a whole frame's tick batch and a
+  // one-shot rewinds when retriggered, so the raw flag would freeze it at t=0.
+  bool prevJumpLatch_ = false;
+  // Body height (origin_.y, world voxels) the last time anything was holding
+  // the body up. `supportY_ - origin_.y` is how far this fall has actually
+  // dropped, which is the question "is this a fall" really asks — air time
+  // alone answers it wrong for every step-down.
+  float supportY_ = 0.0f;
+
+  // ---- the stride clock (PlayerAvatar::SyncStrideClock) --------------------
+  // The pelvis bob/sway/roll and the walk/run arm clips are driven from the
+  // FEET, not from a free-running oscillator. These are its whole state:
+  // seconds since the last touchdown, the smoothed step period it measures,
+  // the stride rate derived from that (strides/sec, 0 = not walking) and which
+  // leg landed last.
+  float sinceTouchdown_ = 0.0f;
+  float stepPeriod_ = 0.0f;
+  float strideRate_ = 0.0f;
+  int lastFootDown_ = -1;
+  // How far the pelvis is dropped below the player's AABB sole, world voxels.
+  // Derived from the rig and the current speed — this is the reach the stride
+  // is spent out of. See the stance note in UpdateGait.
+  float stanceCrouch_ = 0.0f;
 
   // Head look: the goal set by SetLook, and the smoothed value the rig is
   // actually posed at. Two of them so the head EASES onto the mouse rather

@@ -55,6 +55,20 @@ struct MobLimbDef {
   // between limb and parent when absent (anchorAuto)
   Vec3 anchor{};
   bool anchorAuto = true;
+  // ---- POSE-SPACE range of motion (sidecar "poseLimit"; optional) ----------
+  // THE LIMITS ABOVE DO NOT BIND AN ANIMATED LIMB. `minAngle`/`maxAngle` and
+  // the swing-twist cone are handed to Jolt, and Jolt only enforces them on a
+  // DYNAMIC body — a live limb is kinematic, re-posed every tick by the
+  // animation pipeline, so the IK could put a thigh anywhere it liked and no
+  // constraint in this struct had a word to say about it. "Legs raking out
+  // behind" and "legs folded up inside the torso" were both that.
+  //
+  // This is the animation's own range of motion, clamped on the solved pose
+  // (AnimClampPoseLimits) about the part's REST frame. Authored in DEGREES in
+  // the sidecar, stored in radians here like every other angle.
+  bool hasPoseLimit = false;
+  Vec3 poseAxis{1, 0, 0};
+  float poseMin = -3.14159265f, poseMax = 3.14159265f;
   // walk-cycle swing (radians) about X through the joint anchor; phase in
   // half-turns so arm.L/leg.R can counter-swing arm.R/leg.L. Kept as the
   // no-IK fallback for rigs without `chains` (dummy.json) — it now runs as a
@@ -566,9 +580,27 @@ class Mob {
   // ---- carving internals (docs/DESIGN.md §7) --------------------------------
   using LimbCarveKeep = std::function<bool(int, int, int)>;
   using LimbCarveFactory = std::function<LimbCarveKeep(float)>;
+  // ---- SPALL: let a hole grow into its own rim -----------------------------
+  // A predicate can only ask "should this voxel go", one voxel at a time, with
+  // no idea what is left around it. "Take more where matter is already missing"
+  // is a question about OCCUPANCY, and CarveLimb is the only place that knows
+  // it — it owns the limb's authoritative voxel list. So the growth lives here
+  // rather than in the crater predicate.
+  //
+  // Optional by construction: only the radial blast path fills one in, so the
+  // burn flush and the laser's clean kerf are untouched without either of them
+  // having to opt out.
+  struct CarveSpall {
+    Vec3 centerLocal{};   // blast centre in the limb's BODY frame, world voxels
+    float radius = 0;     // world voxels
+    float strength = 0;   // 0..1; 0 disables
+    int rounds = 0;       // passes; each can only remove
+    uint32_t seed = 0;    // same (mob, limb) key the crater noise uses
+  };
   bool CarveLimb(int limbIndex, World& world,
                  std::vector<ParticleSpawn>& spawns, bool eject,
-                 const LimbCarveFactory& carveAt);
+                 const LimbCarveFactory& carveAt,
+                 const CarveSpall* spall = nullptr);
   bool ReskinLimbMicro(MobLimb& limb, uint32_t skinScale, uint32_t physScale);
   bool RebuildLimbBody(int limbIndex);
   void EmitCarvedFragment(const MobLimb& src, uint32_t physScale,
@@ -626,6 +658,22 @@ class Mob {
   Vec3 bodyUp_{0, 1, 0};       // foot-plane normal (slope tilt)
   float bodyY_ = 0;            // prefab MIN CORNER height (same frame as origin_.y)
   float restSoleY_ = 0;        // rest sole height above the min corner
+  // Rest height of the leg chain's ROOT (the hip anchor) above the min corner,
+  // measured off the rig in BuildRig beside restSoleY_. The pair of them is the
+  // rig's standing leg SPAN: `restHipY_ - restSoleY_` is how far the hip sits
+  // above the ankle in the authored pose, and comparing that against the
+  // chain's summed bone lengths is the only way to know how much reach a stride
+  // has left to spend. On this human it is 6.75 against a 6.79 chain — a
+  // standing figure's legs are all but straight, which is why the avatar has to
+  // crouch to walk at all (see the stance note in PlayerAvatar::UpdateGait).
+  float restHipY_ = 0;
+  // Horizontal distance from that hip anchor to its own ankle anchor in the
+  // REST pose. Not zero: this human's ankle sits 0.5 world voxels in front of
+  // its hip (the shank leans forward), and the gait's stance point inherits
+  // that offset — so the foot starts half a voxel into its own forward reach
+  // before the velocity lead adds anything. Left out of the stance crouch it
+  // consumed the entire reach reserve and the IK sat on its clamp.
+  float restFootAhead_ = 0;
   bool footInit_ = false;
 
   // The rig this instance actually animates: a COPY of def_->skel/limbs,
@@ -694,7 +742,11 @@ class MobSystem {
   void SetDayPhase(uint32_t phase) { dayPhase_ = phase; }
   void SetDefs(std::vector<MobDef> defs);           // hot reload
   const std::vector<MobDef>& Defs() const { return defs_; }
-  void Reset();                                      // world regen
+  // Tear down every mob. `rewindIds` also restarts the id counter, which is a
+  // TEST-ONLY seam: mob ids seed gore variance and the blast crater's noise, so
+  // rewinding them changes how the next creature bleeds and tears. See the note
+  // at the definition.
+  void Reset(bool rewindIds = false);                                      // world regen
 
   // Spawn def at a world cell (mob min corner; caller picks ground). 0 = fail.
   uint64_t Spawn(int defIndex, IVec3 atVoxel);
@@ -949,6 +1001,15 @@ class MobSystem {
   // would silently measure nothing on exactly the rigs carving matters most on.
   uint32_t LimbVoxelCount(uint64_t mobId, int limbIndex) const;
   uint32_t LimbVoxelsAtSpawn(uint64_t mobId, int limbIndex) const;
+  // How many of a limb's surviving voxels have at least `minOpen` of their six
+  // face-neighbours missing — the roughness of what a carve LEFT BEHIND.
+  //
+  // A voxel count alone cannot tell a torn chunk from a fine sprinkle: remove
+  // the same number of voxels as white noise and as a correlated blob and the
+  // count is identical while the result looks nothing alike. Isolated spurs are
+  // what speckle leaves and what a chunk does not, so this is the shape of the
+  // crater expressed as a number the crater gate can assert on.
+  uint32_t LimbOpenFaceCount(uint64_t mobId, int limbIndex, int minOpen) const;
   // ---- per-voxel burning introspection ---------------------------------------
   // How many voxels of this limb are currently ALIGHT (carry a decay/emit rule).
   // This is the size of the active front, and it is the number the burn gate

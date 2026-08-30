@@ -761,6 +761,14 @@ def main():
         h = math.radians(deg) * 0.5
         return [0.0, 0.0, round(math.sin(h), 4), round(math.cos(h), 4)]
 
+    def qxz(dx, dz):
+        """X then Z, matching QuatFromEulerDeg's X->Y->Z order (anim.h)."""
+        a, b = math.radians(dx) * 0.5, math.radians(dz) * 0.5
+        sa, ca, sb, cb = math.sin(a), math.cos(a), math.sin(b), math.cos(b)
+        # q = qz * qx  (Z applied last, i.e. outermost)
+        return [round(sa * cb, 4), round(sa * sb, 4),
+                round(ca * sb, 4), round(ca * cb, 4)]
+
     ident = [0.0, 0.0, 0.0, 1.0]
 
     # A joint sits at the seam between a part and its parent, so restating its
@@ -828,12 +836,43 @@ def main():
             "name": f"legU.{side}", "parent": "hips", "joint": "ball",
             "hp": 22, "severable": True, "tag": "leg",
             "anchor": joint_top(f"legU.{side}"),      # hip
+            # RANGE OF MOTION FOR THE ANIMATION, which the minAngle/cone limits
+            # elsewhere in this sidecar do NOT provide: those are Jolt
+            # constraints and Jolt only enforces them on a dynamic body, while
+            # a live limb is kinematic and re-posed every tick. So nothing
+            # bounded the IK at all, and a thigh could be raked out behind the
+            # body or folded up through the pelvis with no complaint from
+            # anything but a selftest.
+            #
+            # The axis is NEGATED X so that positive reads FORWARD, the way a
+            # human would describe a hip: on these rigs a positive rotation
+            # about model +X swings a hanging limb BACKWARD. 0 is the authored
+            # rest pose (straight down).
+            # MEASURED, not guessed. With the limits opened right out, a
+            # healthy walk on flat ground uses -44..+16 degrees here and the
+            # ramp fixture reaches -61..+16 (selftest --gate mob prints both).
+            # So 80 forward is ample, but 10 BACK clips an ordinary stride: the
+            # trailing thigh genuinely needs ~16 degrees at 1.6 m/s on a 0.68 m
+            # leg, and pinning it at 10 held the leg on its stop for a third of
+            # every cycle. 20 back / 85 forward leaves honest margin and still
+            # makes "raked out behind" and "folded through the pelvis"
+            # unrepresentable.
+            "poseLimit": {"axis": [-1, 0, 0], "min": -20, "max": 85},
             "severImpactSpeed": 18.0})
         limbs.append({
             "name": f"legL.{side}", "parent": f"legU.{side}", "joint": "hinge",
             "hp": 18, "severable": True, "tag": "leg", "axis": [1, 0, 0],
             "minAngle": -2.4, "maxAngle": 0.05,
             "anchor": joint_top(f"legL.{side}"),      # knee
+            # A knee flexes one way and does not hyperextend. Flexion swings the
+            # shin BACKWARD relative to the thigh, which is +X here (see the hip
+            # note above), and 0 is the rest pose — so `min: 0` is exactly the
+            # statement that the leg is never straighter than it was drawn.
+            # Measured the same way: 82 on the flat, 88 climbing. 90 sat right
+            # on top of that and the knee spent whole strides pinned at it, so
+            # the ceiling is 100 — still far short of a knee folding the wrong
+            # way, which is what `min: 0` is really guarding.
+            "poseLimit": {"axis": [1, 0, 0], "min": 0, "max": 100},
             "severImpactSpeed": 16.0})
         limbs.append({
             "name": f"foot.{side}", "parent": f"legL.{side}", "joint": "hinge",
@@ -965,7 +1004,10 @@ def main():
 
     # walk/run arm swing: additive over the gait, masked to the arms and spine
     # so the IK-driven legs are untouched. Periods derived above.
-    for nm, deg, period in (("walk", 16, walk_ms), ("run", 22, run_ms)):
+    # Arm swing, raised with the legs: the stride is a real 57-degree sweep
+    # now that the foot IK is no longer clamped straight, and the previous
+    # 16/22 was sized against a leg that barely moved.
+    for nm, deg, period in (("walk", 22, walk_ms), ("run", 30, run_ms)):
         clips[nm] = {
             "durationMs": period, "loop": True, "mode": "additive",
             "blendInMs": 180, "blendOutMs": 180,
@@ -989,6 +1031,13 @@ def main():
             },
         }
 
+    # JUMPING. The legs TUCK, which on this rig is a NEGATIVE rotation about X:
+    # +X swings a hanging limb backward (verified against the selftest's own
+    # swingOf convention, where negative reads "behind the body"). The old +35
+    # / +25 keys therefore raked both legs out BEHIND the character, which is
+    # the reported "both back legs move behind him" -- and because the clip
+    # used to fire on any loss of ground contact, an ordinary step-down played
+    # it. It now fires only on Player::jumped, a real launch.
     clips["jump"] = {
         "durationMs": 500, "loop": False, "mode": "additive",
         "blendInMs": 60, "blendOutMs": 200,
@@ -998,31 +1047,50 @@ def main():
                               {"t": 160, "q": qx(-10), "ease": "cubicInOut"},
                               {"t": 500, "q": qx(0)}]},
             "armU.L": {"rot": [{"t": 0, "q": qx(0), "ease": "cubicOut"},
-                               {"t": 200, "q": qx(-70), "ease": "cubicInOut"},
+                               {"t": 200, "q": qx(-42), "ease": "cubicInOut"},
                                {"t": 500, "q": qx(0)}]},
             "armU.R": {"rot": [{"t": 0, "q": qx(0), "ease": "cubicOut"},
-                               {"t": 200, "q": qx(-70), "ease": "cubicInOut"},
+                               {"t": 200, "q": qx(-42), "ease": "cubicInOut"},
                                {"t": 500, "q": qx(0)}]},
             "legU.L": {"rot": [{"t": 0, "q": qx(0), "ease": "cubicOut"},
-                               {"t": 220, "q": qx(35), "ease": "cubicInOut"},
+                               {"t": 220, "q": qx(-32), "ease": "cubicInOut"},
                                {"t": 500, "q": qx(0)}]},
             "legU.R": {"rot": [{"t": 0, "q": qx(0), "ease": "cubicOut"},
-                               {"t": 220, "q": qx(25), "ease": "cubicInOut"},
+                               {"t": 220, "q": qx(-22), "ease": "cubicInOut"},
                                {"t": 500, "q": qx(0)}]},
         },
     }
+    # FALLING. Authored NEAR-NATURAL and opened out by WEIGHT, not by being a
+    # single wide pose that switches on: avatar.cpp ramps this clip's weight
+    # over avatar.fallFlailDelay/fallFlailRamp seconds of air, so a step off a
+    # kerb plays a hint of it and only a genuine drop reaches the full shape.
+    #
+    # The old pose keyed both arms at -88 deg about X, which on this rig is 88
+    # degrees FORWARD (a positive X rotation swings a hanging limb backward, so
+    # negative swings it forward) -- both arms shot straight out in front, which
+    # is the reported look and is not what a falling body does anyway. Arms go
+    # OUT TO THE SIDES and trail slightly back; model +X is the character's
+    # LEFT on these rigs, so .L abducts with +Z and .R with -Z.
     clips["fall"] = {
-        "durationMs": 700, "loop": True, "mode": "additive",
+        "durationMs": 900, "loop": True, "mode": "additive",
         "blendInMs": 250, "blendOutMs": 250,
-        "mask": ["torso", "armU.L", "armU.R"],
+        "mask": ["torso", "armU.L", "armU.R", "armL.L", "armL.R"],
         "tracks": {
-            "torso": {"rot": [{"t": 0, "q": qx(6)}]},
-            "armU.L": {"rot": [{"t": 0, "q": qx(-88), "ease": "quadInOut"},
-                               {"t": 350, "q": qx(-100), "ease": "quadInOut"},
-                               {"t": 700, "q": qx(-88)}]},
-            "armU.R": {"rot": [{"t": 0, "q": qx(-88), "ease": "quadInOut"},
-                               {"t": 350, "q": qx(-100), "ease": "quadInOut"},
-                               {"t": 700, "q": qx(-88)}]},
+            "torso": {"rot": [{"t": 0, "q": qx(7), "ease": "quadInOut"},
+                              {"t": 450, "q": qx(11), "ease": "quadInOut"},
+                              {"t": 900, "q": qx(7)}]},
+            "armU.L": {"rot": [{"t": 0, "q": qxz(14, 52), "ease": "quadInOut"},
+                               {"t": 450, "q": qxz(4, 62), "ease": "quadInOut"},
+                               {"t": 900, "q": qxz(14, 52)}]},
+            "armU.R": {"rot": [{"t": 0, "q": qxz(4, -62), "ease": "quadInOut"},
+                               {"t": 450, "q": qxz(14, -52), "ease": "quadInOut"},
+                               {"t": 900, "q": qxz(4, -62)}]},
+            "armL.L": {"rot": [{"t": 0, "q": qx(-18), "ease": "quadInOut"},
+                               {"t": 450, "q": qx(-30), "ease": "quadInOut"},
+                               {"t": 900, "q": qx(-18)}]},
+            "armL.R": {"rot": [{"t": 0, "q": qx(-30), "ease": "quadInOut"},
+                               {"t": 450, "q": qx(-18), "ease": "quadInOut"},
+                               {"t": 900, "q": qx(-30)}]},
         },
     }
     clips["land"] = {
@@ -1296,7 +1364,14 @@ def main():
             # runtime caps it, and these are the values it caps.
             "cadence": 8.0, "strideBias": 0.42, "leadTime": 0.10,
             "stepThreshold": STEP_THRESHOLD, "stepDuration": STEP_DURATION,
-            "stepHeight": 0.18,
+            # A LOW ARC, because this rig stands with near-straight legs. Hip
+            # to ankle is 6.75 against a 6.79-voxel chain, so the knee has to
+            # fold hard for even a small lift: at the old 0.18 (1.22 voxels of
+            # foot rise) the mid-swing knee wanted 113 degrees and sat on its
+            # limit through the whole swing. 0.08 is 0.54 voxels -- 5 cm on a
+            # 1.7 m body, which is what a walking foot actually clears -- and
+            # lands the mid-swing knee near 80.
+            "stepHeight": 0.08,
             "rideHeight": ride_height,
             # bob/sway are in world voxels, on a figure the same height as mina.
             "bobAmp": 0.045, "bobFreqMul": 2.0, "swayAmp": 0.03,
