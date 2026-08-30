@@ -43,3 +43,11 @@ AGENTS_BOARD.md
 
 # PreToolUse redundancy-check scratch ledger (scripts/test_redundancy_check.sh)
 .claude/.test-ledger
+
+# Third-party reference builds dropped under docs/refs for study. Shipped game
+# builds are someone else's copyrighted binaries+assets (the one that prompted
+# this rule is marked "All Rights Reserved ... reproduction via any medium is
+# strictly prohibited"), and this repo has a remote. Keep them on disk, out of
+# history. Prose notes ABOUT a reference belong in docs/refs as .md and are not
+# matched here.
+docs/refs/*/
