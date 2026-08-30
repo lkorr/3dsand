@@ -2187,12 +2187,19 @@ wrote into the flattened pose it also fought the animation pipeline and widened
 the walk until the legs failed their own upright assertion — a "leg bug" whose
 cause was the thing the character was holding.
 
-**A held item is a rig part, not an object.** The sword is a part of the
-avatar's own `.vox` (`scripts/gen_mina.py`, the staff precedent from
-`gen_wizard.py`): severable, non-vital, cheap to knock loose. Equipping is
-"show that part". So a dropped sword, a severed sword-arm, a burnt sword and a
-carved sword are all things the existing systems already do, and `ItemDef`
-stays a name plus a behaviour kind rather than a mesh.
+**A held item is a rig part, not an object.** Equipping BORROWS A RIG SLOT: the
+item's own geometry fills a real `MobLimb` parented to the socket's limb, so
+while worn it is a rig part in every respect -- severable, non-vital, cheap to
+knock loose. A dropped sword, a severed sword-arm, a burnt sword and a carved
+sword are therefore all things the existing systems already do, and `ItemDef`
+stays a name plus a behaviour kind plus its OWN `.vox`.
+
+*(Corrected 2026-08-29. This paragraph used to say the sword was a part of the
+avatar's own `.vox`, which is how it worked when it was written and stopped
+being true when items became standalone assets -- `assets/items/sword.{vox,json}`
+and the borrowed-slot note at the top of `game/item.h`. The distinction is
+load-bearing rather than pedantic: it is exactly what stops a weapon inflating
+the creature's own box, which is the trap recorded two paragraphs down.)*
 
 Two traps worth recording, both found by the selftest:
 
@@ -4549,20 +4556,141 @@ cannot use half the time.
 ### Equipment is a slot TABLE, and the table is the schema
 
 `src/game/equipment.h` holds `EquipSlots()`: one row per slot, each naming the
-`ItemKind`s it accepts. That table **is** the armour system's schema. Armour
-content does not exist yet, so every armour row accepts nothing and says so —
-`MoveResult::WrongKind` carries the sentence the tooltip shows. The day
-`ItemKind::ArmorHead` exists, the change is one row, not a branch.
+`ItemKind`s it accepts. That table **is** the armour system's schema. When
+`ItemKind::ArmorHead` arrived the change WAS one row and no branch anywhere,
+which is the claim this section made while the rows were still empty. A slot
+that refuses still says why — `MoveResult::WrongKind` carries the sentence the
+tooltip shows. A move is always a **swap**, never an overwrite, and validates
+BOTH ends, so no mis-drop can destroy an item.
 
-Two rows accept something today (sheath and the quick slots take
-`ItemKind::Melee`), which is what proves the move/validate/persist pipe end to
-end with the one item the game has. A move is always a **swap**, never an
-overwrite, and validates BOTH ends — so no mis-drop can destroy an item.
+## 8c. Armour and equippables (added 2026-08-29)
 
-Sheathing is **data only**: the slot holds a weapon, it does not draw it on the
-avatar's back. The visual is a `sheath_back` socket in the rig plus a matching
-grip context on the item — `ItemGrip`'s context map (`game/item.h`) already
-anticipates exactly that, so it is content, not code.
+### A worn piece is a set of borrowed rig slots
+
+Wearing appends ONE RIG LIMB PER COVERED BODY PART — a **shell**: parent = the
+covered limb, fixed joint, `tag: "worn"`, not vital, its own hp, its own
+voxels, its own micro brick (`ItemCover` in `game/item.h`, `Mob::WearItem`).
+It is the held-item trick N times instead of once, and it inherits, with no new
+code: burning and dissolving, per-voxel carving, severing with the limb it is
+strapped to (a cut strap drops the pauldron), dropping as debris,
+live-transform hitboxes, and rendering. "Degraded armour shows the body
+underneath" is automatic — the shell encloses the limb, so a hole in the cloth
+IS the skin.
+
+Rejected: folding armour voxels into the body limb's own lattice, the way
+mina's robe works. Burn ordering would be free, but unequip, per-piece hp,
+sever-as-a-piece, drop and persistence all become entangled bookkeeping in one
+lattice. Separate slots keep one owner per fact.
+
+Cover entries bind by **limb name**. Every humanoid rig here names its parts
+the same way, so one authored helmet finds the right part on any of them and a
+wearer lacking a named limb simply skips that shell — which is what makes
+"goblin helmets look right on anyone" content rather than code.
+
+**The appended tail is the one real refactor armour needed.** Shells and a held
+weapon share the region past `Mob::AppendedBase()`, so removing a piece removes
+a group from the MIDDLE of it. `RemoveAppendedSlots` ERASES that range and
+fixes up the indices that referred past it, rather than tearing the tail down
+and re-appending the survivors: an appended slot is never a parent, so nothing
+can be orphaned, and — the reason that matters — a survivor's lattice is never
+let go of, so removing the robe cannot mend the boots.
+
+### Protection is geometry and materials, never a number
+
+There is no armour class, no resist field and no damage mitigation anywhere.
+Cloth burns because it IS `robe_cloth` (chance 200/1000 against skin's 90);
+steel stops acid because `steel` carries no `tag:dissolvable`, so acid's rule
+never matches it. The one genuinely new mechanic is **occlusion**: the burn
+pass reads the world around a limb, and a shell's voxels are in neither the
+grid nor the limb's lattice, so without help fire lapping at a sleeve reads to
+the arm underneath exactly as fire lapping at the arm.
+
+`Mob::WornAlong` closes that, and it returns the occluding shell's MATERIAL
+rather than a bool — which is what keeps the behaviour emergent. The flesh's
+neighbour simply becomes "cloth" instead of "fire"; cloth-over-flesh semantics
+fall out of the ordinary authored table; and the moment the shell burns through
+the probe returns nothing there and the skin is exposed. No integrity
+threshold, nothing to tune.
+
+**Asked along a SEGMENT, not at a point.** A limb is a rounded tube inside a
+garment cut to its box, so on any diagonal there are several empty cells
+between the flesh and the cloth: the obvious "is the cell one step outside me
+inside a shell" test reads correct and leaks completely. Measured, before the
+fix: a fully enclosed arm caught fire three ticks *before* the bare one beside
+it.
+
+**And it only works at the scale the grid can resolve.** An arm is 0.76 world
+voxels across and its coat adds 0.24; the grid cell is one world voxel, so for
+a limb thinner than a cell there is no "outside the coat" and no probe can put
+one between the fire and the flesh. This is a property of a grid-coupled body,
+not a bug to fix: armour occludes on the torso and on anything larger, and on a
+forearm it does not. `--gate armor-react` therefore measures the torso, with a
+second undressed creature as the control — and it measures 114 skin voxels lost
+bare against 0 under a steel plate.
+
+### Fit: authored at stock size, resampled per wearer
+
+Each cover entry records the `fitBox` it was drawn against. At equip, the
+wearer's own limb box divided by that box gives a per-axis rational, and the
+shell lattice is resampled by nearest neighbour in integer math
+(`ResampleLattice`, `game/item.h`) — the only non-uniform scale in the engine,
+and the smallest one that can express "a goblin is not a small human, it is a
+wide short one". A resampled shell packs its own copy-on-write brick and frees
+it on unwear; at ratio 1 (the stock set on the stock human) nothing is
+resampled and the def's brick is shared, exactly as a body limb shares its.
+
+### The sheath is the weapon slot
+
+A blade is either DRAWN (a real rig part in the fist) or STOWED (an entry in
+the Sheath slot and nothing else). `Q` toggles; drawing forces the melee tool
+and stowing puts the previous one back; a weapon that leaves the sheath while
+drawn stops being drawn (`SheathState`, `game/equipment.h` — three cases, all
+easy to get subtly wrong, so they live in one testable struct rather than in
+the frame loop). The hotbar keeps the number row and stops being where a weapon
+comes from.
+
+Sheathing is still **visually** data only: the slot holds a weapon, it does not
+draw it on the avatar's back. That visual is a `sheath_back` socket in the rig
+plus a matching grip context on the item — `ItemGrip`'s context map
+(`game/item.h`) already anticipates exactly that, so it is content, not code.
+
+### Ground items are debris that remember their name
+
+A dropped item IS an ordinary `DebrisSystem` body: it falls, settles, burns,
+dissolves and can be blown apart, none of it written twice. The only thing
+debris cannot carry is IDENTITY, and that is the whole of `WorldItems`
+(`game/worlditems.h`) — body handle to item name, by name because library
+indices die on every R reload. Dropping is a drag out of the character screen;
+picking up is `E` and a short camera ray filtered through the registry, so a
+body the registry does not know is scenery and is left alone.
+
+The registry MUST NOT outlive the body: Jolt reuses handles, so a stale entry
+would eventually re-match a new body and hand the player a sword they picked up
+off a rock. `DebrisSystem::SetOnBodyGone` is the one seam that keeps the two in
+step, and it means a robe that burns up on the ground is simply GONE.
+
+### Damage persists exactly
+
+Not a durability percentage — the holes themselves. While a piece is on, its
+wounds are the shells'; the shells die with the slots, so `Mob::CaptureWorn`
+reads them out one call before the rig forgets and `WearItem` puts them back.
+Off the body they live in `PlayerKit::wornDamage`, keyed by ITEM NAME (not by
+slot, or dragging the robe through the pack would mend it; not by instance,
+because an `ItemStack` has no identity and giving stacks one is a much larger
+change than armour needed). `PLYR` is at v2 for the map, `ITMS` carries a
+ground item's lattice the same way, and a v1 payload is refused rather than
+half-applied.
+
+### The stock set
+
+`scripts/gen_stock_armor.py` emits hood / robe / sash / boots. The geometry is
+DERIVED, not drawn: each shell is the stock human's own silhouette dilated
+outward by one authored micro with the body subtracted back off, importing
+`gen_human.py`'s limb table rather than restating it. So the garment fits by
+construction, is strictly outside the body, and re-proportioning the human
+re-proportions the coat. Colour is art-palette slots in `.col` layers, never
+materials — painting with materials is what makes mina's sash burn on a
+different schedule from her sleeve.
 
 ### Mirror in, intent out
 

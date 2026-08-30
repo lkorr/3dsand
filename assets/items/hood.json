@@ -1,0 +1,24 @@
+{
+  "comment": "The hood, a WORN piece: one shell per covered limb, each of which becomes a real rig slot on the wearer and therefore burns, dissolves, carves, severs and drops exactly as a limb does. Geometry is the stock human's own silhouette dilated outward by one authored micro, so it fits by construction. Regenerate with scripts/gen_stock_armor.py \u2014 `offset` and `fitBox` are MEASURED off gen_human.py's limb table, so editing them by hand puts the garment off the body.",
+  "name": "hood",
+  "scale": 8,
+  "hp": 14.0,
+  "severable": true,
+  "cover": [
+    {
+      "part": "head",
+      "model": "head",
+      "offset": [
+        -2,
+        4,
+        -2
+      ],
+      "fitBox": [
+        20,
+        32,
+        18
+      ],
+      "hp": 14.0
+    }
+  ]
+}

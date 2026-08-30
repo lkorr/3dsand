@@ -41,6 +41,7 @@ const std::vector<Gate>& WorldIoGates();
 const std::vector<Gate>& VoxRegionGates();
 const std::vector<Gate>& SpellGates();
 const std::vector<Gate>& PlayerKitGates();
+const std::vector<Gate>& EquipmentGates();
 
 // THE EXECUTION ORDER, and it is load-bearing.
 //
@@ -98,6 +99,11 @@ const char* const kOrder[] = {
     // an earlier one left behind, so re-adding it anywhere else would be a
     // different test.
     "prefab",      "mob",            "settle-back", "player-body",
+    // Wearing things. After `mob` because it spawns the avatar def on real
+    // terrain and carves a shell, which wants the same standing world the
+    // body gates run in; before `ragdoll-joints` because it leaves the rig
+    // undressed and MobSystem reset, which is what that gate expects to find.
+    "armor-wear", "item-ground", "armor-fit",
     "ragdoll-joints",
     "save-load",   "save-entities", "region-store", "streaming",     "spells",
     "page-roundtrip", "daylight-boundary",
@@ -105,6 +111,11 @@ const char* const kOrder[] = {
     // pours real acid at absolute coordinates, and it regenerates the world on
     // the way out so the gates after it still find pristine terrain (rule 7).
     "mob-burn",
+    // Armour reactivity, right after `mob-burn` and for the same reasons: it
+    // lights real fires and pours real acid at absolute coordinates, and it
+    // regenerates the world on the way out so the gates after it still find
+    // pristine terrain (rule 7).
+    "armor-react",
     // LAST of the world-touching gates, and it must be: BuildVoxRegion moves
     // the residency window and resets the page table, which is the state every
     // other gate's fixture placement assumes. It restores both before it
@@ -123,7 +134,7 @@ const std::vector<Gate>& Registry() {
                           &PlayerGates(),
                           &MobGates(), &BodyGates(), &WorldIoGates(), &AudioGates(),
                           &VoxRegionGates(),
-                          &SpellGates(), &PlayerKitGates()})
+                          &SpellGates(), &PlayerKitGates(), &EquipmentGates()})
       pool.insert(pool.end(), g->begin(), g->end());
 
     std::vector<Gate> v;

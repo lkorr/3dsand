@@ -25,6 +25,7 @@
 #include "game/camera.h"
 #include "game/caster.h"
 #include "game/equipment.h"
+#include "game/worlditems.h"
 #include "game/item.h"
 #include "game/melee.h"
 #include "game/mob.h"
@@ -2605,8 +2606,22 @@ int main(int argc, char** argv) {
 
   Physics phys;
   if (!phys.Init()) return 1;
+  // WHAT IS LYING ON THE GROUND. A dropped item is an ordinary debris body
+  // (game/worlditems.h); this registry is the only thing debris cannot carry
+  // — which body used to be which item. The release hook keeps the two in
+  // step: Jolt reuses handles, so an entry that outlived its body would
+  // eventually hand the player a sword they picked up off a rock.
+  //
+  // DECLARED BEFORE `debris`, and that is not tidiness. `debris` holds a
+  // callback into this object, so it must be destroyed FIRST — with the
+  // declarations the other way round, any future DebrisSystem destructor that
+  // released its bodies would call into a WorldItems that no longer exists.
+  // Ordering makes that unrepresentable; a teardown call would only make it
+  // unlikely.
+  WorldItems ground;
   DebrisSystem debris;
   debris.Init(&phys, &world, mats, reactions);
+  debris.SetOnBodyGone([&ground](uint64_t h) { ground.OnBodyGone(h); });
   MobSystem mobs;
   mobs.Init(&phys, &world, &debris, mats, reactions);
   // Micro-body bricks (PLAN §C) are packed at mob-def load and uploaded
@@ -2941,7 +2956,8 @@ int main(int argc, char** argv) {
   float lookSensNow = 1.0f;
 
   KeyEdge eP, eN, eV, eF1, eF3, eF4, eF5, eF6, eF9, eF10, eR, eEsc, eLBracket, eRBracket, eJump,
-      eG, eX, eB, eT, eO, eM, eK, eTab, eC, eH, eZ, eBack, eU, eL, eI;
+      eG, eX, eB, eT, eO, eM, eK, eTab, eC, eH, eZ, eBack, eU, eL, eI, eQ,
+      eE;
   KeyEdge eGlyph[kGlyphSlots];
   bool prevMouseL = false;
   bool prevMouseR = false;
@@ -2981,10 +2997,63 @@ int main(int argc, char** argv) {
   // the hotbar is WHAT IS IN YOUR HAND and predates all of this; the melee
   // path reads Inventory::Selected() and must keep doing exactly that.
   PlayerKit kit;
+  // What we last ASKED the body to wear, per equip slot. Not a second copy of
+  // the equipment — it is the record that keeps a REFUSED piece (a helm on a
+  // creature with no head) from being retried thirty times a second. Cleared
+  // whenever the avatar is rebuilt, because a fresh rig wears nothing and
+  // every slot has to be offered to it again.
+  std::string wearTried[kEquipSlotCount];
+  // ---- THE SHEATH IS THE WEAPON SLOT -------------------------------------
+  //
+  // A blade is either DRAWN (a real rig part in the fist, swinging) or STOWED
+  // (an entry in the Sheath equip slot and nothing else). Q toggles. The
+  // hotbar stays exactly what it was — WHAT IS IN YOUR HAND for consumables
+  // and tools, still selected by the number row — it simply stops being where
+  // a weapon comes from, because "the sword you are carrying" and "the potion
+  // you have selected" were never the same question.
+  //
+  // `toolBeforeDraw` is what the tool selector goes back to on stow. Drawing
+  // forces the melee tool (otherwise you draw a sword and the left mouse
+  // button still paints stone), and silently keeping it afterwards would
+  // strand the player in a mode they never chose.
+  SheathState sheath;
+  sheath.toolBefore = UIState::kToolBrush;
+  const int kSheathSlot = (int)EquipSlotId::Sheath;
+  // What the Sheath slot holds, as a kind. Written as a lambda because both
+  // the key press and the per-frame reconcile ask, and re-deriving it at each
+  // site is how the two stop agreeing.
+  auto sheathKind = [&] {
+    const ItemStack& sh = kit.equip.At(kSheathSlot);
+    const ItemDef* d = items.At(sh.Empty() ? -1 : sh.def);
+    return d ? d->kind : ItemKind::None;
+  };
   {
-    // Placeholder acquisition, mirroring GrantAllAndBind: you start with one
-    // of everything the library defines. A real pickup loop replaces this.
-    for (int i = 0; i < (int)items.items.size(); i++) hotbar.Add(i, 1);
+    // ---- THE STARTING KIT, AND IT IS STILL A STUB ------------------------
+    //
+    // One of everything the library defines, put somewhere it can actually be
+    // USED rather than all of it in the hotbar: a weapon goes to the sheath
+    // (which is where the draw key looks), armour goes to the pack (so it can
+    // be dragged onto the figure), and anything else keeps the hotbar. Before
+    // this, an armour item started in the hotbar and there was no way to get
+    // it onto the body without first knowing to drag it out.
+    //
+    // MARKED AS A STUB deliberately: an economy replaces this, and the pickup
+    // loop that P5 landed is the first half of one. What it must not become is
+    // "the starting kit", quietly, because nobody removed it.
+    for (int i = 0; i < (int)items.items.size(); i++) {
+      const ItemDef& it = items.items[i];
+      int home = -1;
+      for (int s = 0; s < kEquipSlotCount && home < 0; s++)
+        if (!EquipSlotIsWorn(s) && EquipSlotAccepts(s, it.kind) &&
+            kit.equip.At(s).Empty())
+          home = s;
+      if (home >= 0)
+        kit.equip.slots[home] = {i, 1};       // the sword, into the sheath
+      else if (ItemKindIsWorn(it.kind))
+        kit.bag.Add(i, 1);                     // armour, into the pack
+      else
+        hotbar.Add(i, 1);
+    }
   }
   // The equipment slot table, mirrored into the UI once. It is authored data
   // (game/equipment.h EquipSlots), so the panel reads it rather than
@@ -3124,6 +3193,28 @@ int main(int argc, char** argv) {
         player.fly = false;
       }
       if (frameCounter == kShotInvOpenFrame) {
+        // DRESS THE FIGURE BEFORE PHOTOGRAPHING IT. The portrait is the only
+        // view of worn armour anybody looks at while iterating on it, and an
+        // undressed portrait proves that the panel draws — which was never in
+        // doubt. Every worn item in the library goes into the first slot that
+        // accepts its kind; the wear sync in the tick loop does the rest, so
+        // this harness drives the SAME path the player does rather than
+        // reaching into the rig.
+        int dressed = 0;
+        for (int i = 0; i < (int)items.items.size(); i++) {
+          const ItemDef& it = items.items[i];
+          if (!ItemKindIsWorn(it.kind)) continue;
+          for (int s = 0; s < kEquipSlotCount; s++)
+            if (EquipSlotAccepts(s, it.kind) && kit.equip.At(s).Empty()) {
+              kit.equip.slots[s] = {i, 1};
+              dressed++;
+              break;
+            }
+        }
+        if (dressed)
+          std::printf("--shot-inventory: dressed the avatar in %d worn "
+                      "pieces\n",
+                      dressed);
         ui.inventoryOpen = true;
         // The dev panel is F1-hideable and sits ON TOP of the character
         // screen by design (a menu must not make F5 unreachable) — which
@@ -3387,6 +3478,53 @@ int main(int argc, char** argv) {
       grenades.push_back(g);
     }
     if (captured && eX.Pressed(key(GLFW_KEY_X))) ui.pendingDetonate = true;
+    // DRAW / STOW. Q rather than the X the plan proposed: X already
+    // detonates, and a key that does two things is a key that does the wrong
+    // one under pressure.
+    if (captured && eQ.Pressed(key(GLFW_KEY_Q)) &&
+        !sheath.Toggle(sheathKind(), UIState::kToolMelee, ui.tool)) {
+      // Reaching for a sword that is not there says so, rather than silently
+      // arming an empty hand — the same rule the equipment panel's refusals
+      // follow.
+      ui.kitMessage = "your sheath is empty";
+      ui.kitMessageAge = 0.0f;
+    }
+    // ---- E: PICK IT UP ------------------------------------------------------
+    //
+    // A short camera ray filtered through the ground registry, which is what
+    // makes this cheap: the ray finds the nearest DYNAMIC body (the same cast
+    // the laser uses), and the registry answers "is that a thing, and which
+    // thing". A body the registry does not know is scenery — a rock, a corpse,
+    // a chunk of somebody's wall — and is left alone.
+    if (captured && eE.Pressed(key(GLFW_KEY_E))) {
+      // Arm's length, in world voxels. A literal rather than a tuning knob
+      // because it is a HUMAN dimension, not a feel dial: the avatar is 17
+      // voxels tall (gen_human's height contract), so 5 is about how far a
+      // person can reach without walking.
+      constexpr float kPickupReach = 5.0f;
+      float frac = 1.0f;
+      const uint64_t hit = phys.CastRayBody(player.EyePos(), cam.Forward(),
+                                            kPickupReach, frac);
+      const WorldItem* w = hit ? ground.Find(hit) : nullptr;
+      if (w) {
+        const int di = items.Find(w->item);
+        // Bag first, hotbar as the overflow. A full pack REFUSES rather than
+        // silently swallowing or silently dropping: the item stays exactly
+        // where it was, which is the only behaviour under which a pickup
+        // cannot lose anything.
+        int where = di >= 0 ? kit.bag.Add(di, 1) : -1;
+        if (where < 0 && di >= 0) where = hotbar.Add(di, 1);
+        if (where >= 0) {
+          ui.kitMessage = "picked up " + w->item;
+          // Order matters: the registry entry is dropped by the release hook
+          // when the body goes, so this is one call, not two.
+          debris.DestroyBody(hit);
+        } else {
+          ui.kitMessage = "you have no room for that";
+        }
+        ui.kitMessageAge = 0.0f;
+      }
+    }
     if (captured && eTab.Pressed(key(GLFW_KEY_TAB))) {
       ui.tool = (ui.tool + 1) % UIState::kToolCount;
       if (ui.tool == UIState::kToolFluid && fluidCueMat != 0)
@@ -3823,14 +3961,16 @@ int main(int argc, char** argv) {
       // Grid + entities: everything outside the voxel grid rides the
       // entities.sve sections registered in game/persist.cpp.
       PlayerKitRefs kitRefs{&caster, &glyphs, &hotbar, &kit, &items};
-      EntityIO eio = MakeEntityIO(debris, mobs, &avatar, &kitRefs);
+      WorldItemRefs groundRefs{&ground, &phys, &debris, &mbSet, &items};
+      EntityIO eio = MakeEntityIO(debris, mobs, &avatar, &kitRefs, &groundRefs);
       SaveWorld(ctx, world, stream, "world.svd", mats, &eio);
     }
     if (ui.loadWorld) {
       ui.loadWorld = false;
       ctx.WaitIdle();
       PlayerKitRefs kitRefs{&caster, &glyphs, &hotbar, &kit, &items};
-      EntityIO eio = MakeEntityIO(debris, mobs, &avatar, &kitRefs);
+      WorldItemRefs groundRefs{&ground, &phys, &debris, &mbSet, &items};
+      EntityIO eio = MakeEntityIO(debris, mobs, &avatar, &kitRefs, &groundRefs);
       if (LoadWorld(ctx, world, sim, stream, "world.svd", mats, &eio)) {
         // Debris/mobs were reset and reloaded by their sections; the avatar
         // was despawned by its reset and respawns on the next tick, applying
@@ -3968,7 +4108,16 @@ int main(int argc, char** argv) {
     // MELEE: hold LMB with the melee tool to arm the weapon, then flick.
     // Magic mode wins the mouse, so guarding and casting can never both be
     // live on the same button.
-    const ItemDef* heldItem = items.At(hotbar.HeldDef());
+    // WHAT IS IN THE HAND comes from the SHEATH, not the hotbar (see the
+    // draw/stow block above). A weapon that left the sheath while it was drawn
+    // — dragged into the pack from the character screen, say — is no longer
+    // drawn, and this is where that is noticed: the state lives on one side of
+    // the question, so there is nothing to keep in step.
+    sheath.Reconcile(sheathKind(), UIState::kToolMelee, ui.tool);
+    const ItemStack& sheathed = kit.equip.At(kSheathSlot);
+    const ItemDef* heldItem =
+        sheath.drawn ? items.At(sheathed.Empty() ? -1 : sheathed.def)
+                     : nullptr;
     const bool meleeArmed = ui.tool == UIState::kToolMelee && !ui.magicMode &&
                             heldItem && heldItem->kind == ItemKind::Melee;
     const bool meleeHeld = meleeArmed && mouseL;
@@ -4384,6 +4533,9 @@ int main(int argc, char** argv) {
         const bool wantAvatar = av.enabled && !player.fly;
         if (wantAvatar && avatar.HasDef() && !avatar.Spawned()) {
           avatar.Spawn(player, avatarHeading);
+          // A new rig wears nothing (Mob::BuildRig clears its shells), so the
+          // armour sync below has to be offered every slot again.
+          for (std::string& w : wearTried) w.clear();
           tpRig.Snap();   // re-entering from fly: don't ease across the gap
         }
         if (!wantAvatar && avatar.Spawned()) avatar.Despawn();
@@ -4408,6 +4560,57 @@ int main(int argc, char** argv) {
             const float w = melee.Phase() == SwingPhase::Idle ? 0.0f : 1.0f;
             avatar.SetWeaponPose(melee.HandOffset(), melee.BladeDir(),
                                  melee.BladeUp(), w);
+          }
+        }
+        // ---- ARMOUR: what the equipment says vs what the body wears --------
+        //
+        // The SAME change-detection seam the weapon uses one block up, and in
+        // the same place in the frame for the same reason: WearItem builds
+        // bodies and joints, so it must run once per CHANGE rather than once
+        // per tick, and it must run before PreTick flattens the pose and
+        // submits the kinematic targets — a shell appended after that would
+        // sit at its spawn pose for a tick and visibly snap into place.
+        //
+        // Compared BY NAME, which is also what makes this survive an R
+        // hot-reload: library indices renumber, the name does not. A respawn
+        // clears the rig's shells (BuildRig) and this loop simply puts them
+        // back on the next tick, with no despawn/respawn bookkeeping anywhere.
+        //
+        // `wearTried` is what stops a REFUSED piece from being retried every
+        // tick. Comparing against what the body is actually wearing is not
+        // enough on its own: a piece that finds no limb to hang on (a helm on
+        // a headless mob) leaves the slot un-worn, so the two would disagree
+        // forever and WearItem would rebuild nothing, loudly, 30 times a
+        // second. This records the last ATTEMPT, which the slot changing is
+        // what clears.
+        if (avatar.Spawned()) {
+          for (int s = 0; s < kEquipSlotCount; s++) {
+            if (!EquipSlotIsWorn(s)) continue;
+            const ItemStack& st = kit.equip.At(s);
+            const ItemDef* want = items.At(st.Empty() ? -1 : st.def);
+            const std::string wantName = want ? want->name : std::string();
+            if (avatar.WornItem(s) == wantName && wearTried[s] == wantName)
+              continue;
+            if (wearTried[s] == wantName && avatar.WornItem(s).empty() &&
+                !wantName.empty())
+              continue;   // already refused this one; nothing has changed
+            // TAKING IT OFF KEEPS ITS WOUNDS. The shells are the only place
+            // the damage lives while the piece is on, and they are destroyed
+            // with the slots — so it is read out here, one call before the
+            // rig forgets it, and handed back on the next wear. Without this
+            // pair, changing boots mends the pair you took off.
+            const std::string had = avatar.WornItem(s);
+            if (!had.empty()) {
+              WornDamage d;
+              if (avatar.CaptureWorn(s, d)) kit.SetDamage(had, std::move(d));
+            }
+            wearTried[s] = wantName;
+            if (wantName.empty()) {
+              avatar.UnwearItem(s);
+            } else if (!avatar.WearItem(want, s, kit.Damage(wantName))) {
+              ui.kitMessage = "that does not fit you";
+              ui.kitMessageAge = 0.0f;
+            }
           }
         }
         // Head look, the other half of the turn policy above: whatever yaw the
@@ -4990,6 +5193,17 @@ int main(int argc, char** argv) {
                                    p.handL, p.handR, p.staff, heldPart, -1};
               for (int k : keep)
                 if (k >= 0 && k < (int)hide.size()) hide[k] = 0;
+              // ...AND WHATEVER IS WORN OVER THEM. The keep list names BODY
+              // parts, so with a robe on, the arms you see in first person
+              // would be bare while the sleeves stayed behind with the hidden
+              // torso. A shell is kept exactly when the part it covers is —
+              // read off the rig's parent link rather than from a second list
+              // of sleeve names that would have to be maintained per item.
+              for (int i = avatar.AppendedBase(); i < (int)hide.size(); i++) {
+                const int par = avatar.PartParent(i);
+                if (par >= 0 && par < (int)hide.size() && hide[par] == 0)
+                  hide[i] = 0;
+              }
             }
           }
           // NOTHING TO HIDE FOR UNHELD ITEMS ANY MORE. The rig used to carry
@@ -5348,6 +5562,33 @@ int main(int argc, char** argv) {
         // equip/unequip comparison in the tick loop does the rest by itself on
         // the next tick. Nothing to do here, which is the point of routing the
         // change through the real container rather than around it.
+      }
+      // ---- DROP: the drag that landed on nothing ------------------------
+      //
+      // Consumed at the SAME point in the frame as the move latch, and for the
+      // same reason: the panel's view of a slot is never authoritative, so the
+      // intent is executed against the real container here and the mirror is
+      // rebuilt below.
+      if (ui.dropItem.pending) {
+        ui.dropItem.pending = false;
+        ItemStack* src = kit.Resolve(ui.dropItem.from, hotbar);
+        const ItemDef* def = src && !src->Empty() ? items.At(src->def) : nullptr;
+        if (def) {
+          // Thrown gently forward from the eye, so it lands in front of you
+          // rather than inside your own capsule.
+          const Vec3 at = player.EyePos() + cam.Forward() * 2.0f;
+          const Vec3 vel = cam.Forward() * 4.0f + player.vel;
+          if (DropItemToWorld(*def, at, vel, phys, debris, &mbSet, ground)) {
+            // ONE of the stack. Dropping a count you did not mean to is the
+            // mis-click this system's swap-never-overwrite rule exists to
+            // prevent, and it applies here too.
+            if (--src->count <= 0) *src = ItemStack{};
+            ui.kitMessage = "dropped";
+          } else {
+            ui.kitMessage = "there is nowhere to put that";
+          }
+          ui.kitMessageAge = 0.0f;
+        }
       }
       if (ui.bindGlyph.pending) {
         ui.bindGlyph.pending = false;

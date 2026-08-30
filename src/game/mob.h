@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "game/anim.h"
+#include "game/equipment.h"
 #include "math3d.h"
 #include "phys/debris.h"
 #include "phys/physics.h"
@@ -316,6 +317,52 @@ struct BurnLimbView {
   int* flipbook = nullptr;     // cleared on first damage; a frame swap heals
   BodyBurnState* burn = nullptr;
 
+  // ---- IS SOMETHING WORN IN THE WAY? --------------------------------------
+  //
+  // The burn pass reads the WORLD around a limb — to seed fire from contact,
+  // and to let a world neighbour's rule (acid) rewrite the limb. Neither
+  // knows about armour: a worn shell's voxels are in neither the grid nor
+  // this limb's lattice, so fire lapping at a sleeve reads to the arm
+  // underneath exactly as fire lapping at the arm.
+  //
+  // This closes that, and it is the ONE genuinely new mechanic armour needed.
+  // It returns the occluding shell's MATERIAL rather than a bool, which is
+  // what keeps the behaviour emergent: the flesh's neighbour simply becomes
+  // "cloth" instead of "fire", cloth-over-flesh semantics fall out of the
+  // ordinary authored table, and when the shell burns through the probe
+  // returns 0 there and the skin is exposed. No integrity threshold, no
+  // resist value, nothing to tune.
+  //
+  // A SEGMENT, NOT A POINT, and that distinction is the whole difference
+  // between this working and appearing to.
+  //
+  // The obvious test — "is the cell one lattice step outside this voxel inside
+  // a shell?" — reads correct and leaks completely, because a limb is a
+  // ROUNDED TUBE inside a garment cut to its box. On any diagonal there are
+  // several empty cells between the flesh and the cloth, so the point one step
+  // out lands in the gap, the probe says "nothing there", and fire walks
+  // straight through intact armour. Measured: a fully enclosed arm caught fire
+  // three ticks after the bare one beside it.
+  //
+  // So the question is asked as a RAY: is there anything worn between me and
+  // the world, within `dist` world voxels along `dir`. Marching costs one
+  // transform and a handful of array reads, because a shell rides its limb and
+  // therefore shares its rotation — the direction in the shell's lattice is
+  // fixed for the whole march.
+  //
+  // A raw function pointer and a context, NOT a std::function: this view is
+  // built per limb per tick, and a capturing std::function would heap-allocate
+  // once per limb per tick for a feature most creatures do not use. Null on
+  // anything that cannot be wearing armour (debris, a corpse).
+  using OccludeFn = uint32_t (*)(void* ctx, const Vec3& from, const Vec3& dir,
+                                 float dist);
+  OccludeFn occlude = nullptr;
+  void* occludeCtx = nullptr;
+  // dist 0 is a point test at `from`.
+  uint32_t WornAlong(const Vec3& from, const Vec3& dir, float dist) const {
+    return occlude ? occlude(occludeCtx, from, dir, dist) : 0u;
+  }
+
   size_t Size() const { return skin ? skin->size() : coll->size(); }
   IVec3 At(size_t i) const {
     return skin ? IVec3{(*skin)[i].x, (*skin)[i].y, (*skin)[i].z}
@@ -382,6 +429,20 @@ struct MobLimb {
   std::vector<PrefabVoxel> skinVoxels;
   bool HasFineSkin() const { return !skinVoxels.empty(); }
   int microModel = -1;       // -1 = cube path
+  // ---- LATTICE PITCH FOR A LIMB THAT IS NOT THE CREATURE'S OWN ART --------
+  // A body limb's voxels are authored in the def's skin lattice, so the def's
+  // skinScale/physScale describe them and there is nothing to store. A worn
+  // shell and a held item are not: they come out of an ITEM's .vox at the
+  // ITEM's scale, which need not be the wearer's — a scale-4 sword on a
+  // skinScale-8 human. Every scale-taking operation on a limb (burn, carve,
+  // re-skin, collider rebuild, drop-to-debris) has to use the lattice the
+  // voxels are ACTUALLY on, or it converts the geometry by the wrong divisor
+  // and the wound lands somewhere else on the item than where it was struck.
+  //
+  // 0 means "the def's", which is every authored body limb. Read through
+  // Mob::SkinScaleOf / PhysScaleOf, never directly.
+  uint32_t ownSkinScale = 0;
+  uint32_t ownPhysScale = 0;
   // Takes the SKIN scale: a MicroBodyRef is a render description.
   MicroBodyRef MicroRef(uint32_t skinScale) const {
     return microModel < 0 ? MicroBodyRef{}
@@ -423,6 +484,7 @@ struct MobLimb {
 
 class MobSystem;
 struct ItemDef;
+struct ItemCover;
 
 // ============================================================================
 // ONE CREATURE. The base class of every articulated body in the game: NPCs
@@ -520,6 +582,65 @@ class Mob {
   bool EquipItem(const ItemDef* item, const char* context = "held_right");
   const std::string& HeldItem() const { return heldItem_; }
   int HeldSlot() const { return heldSlot_; }
+
+  // ---- WEARING an item (the same borrowed slot, N times) ------------------
+  // A worn piece appends one rig slot per ItemCover entry — a SHELL: parented
+  // to the covered limb by a fixed joint, tagged "worn", not vital, with its
+  // own hp, its own voxels and its own micro brick. Everything the held-item
+  // path already earns is inherited per shell: burning, dissolving, per-voxel
+  // carving, severing with the limb it is strapped to, dropping as debris,
+  // live-transform hitboxes, rendering.
+  //
+  // On the BASE class for the same reason EquipItem is: a goblin in a helmet
+  // is one WearItem call, and the player wears exactly the same way.
+  //
+  // `equipSlot` is an EquipSlotId as an int — the key the piece is later
+  // removed by, and the only thing tying a shell group back to the character
+  // screen. Pass a null item to UnwearItem's slot instead of here.
+  // `damage` puts a piece back on AS IT WAS. Null wears it as authored, which
+  // is the common case; passing a blob captured by CaptureWorn is what makes
+  // taking your boots off and putting them back on stop being a repair
+  // (game/equipment.h WornDamage).
+  bool WearItem(const ItemDef* item, int equipSlot,
+                const WornDamage* damage = nullptr);
+  bool UnwearItem(int equipSlot);
+  // Read what a worn piece has been through, in its item's cover order. Call
+  // it BEFORE UnwearItem: the shells are the only place the damage lives while
+  // the piece is on, and they are destroyed with the slots.
+  bool CaptureWorn(int equipSlot, WornDamage& out) const;
+  // The item name worn in a slot, or empty. By NAME because library indices
+  // are file-order and die on an R reload (item.h's index hazard).
+  const std::string& WornItem(int equipSlot) const;
+  int WornPieceCount() const { return (int)worn_.size(); }
+  // Rig slots this piece occupies, for tests and for the occlusion probe.
+  const std::vector<int>& WornSlotsAt(int pieceIndex) const;
+  // Is `worldPos` inside a live voxel of any shell worn over `bodyLimb`?
+  // Reports the occluding shell's MATERIAL (0 = not occluded), because the
+  // burn pass does not want a bool — it wants to know what the flesh's
+  // neighbour actually is once a robe is in the way (see the call sites in
+  // BurnOneLimb).
+  //
+  // NON-CONST because it builds the per-shell occupancy index on first use;
+  // the index is derived data and the answer is a pure function of the
+  // lattice, so this is a cache fill, not a mutation of anything observable.
+  uint32_t WornOccludes(int bodyLimb, const Vec3& worldPos) {
+    return WornAlong(bodyLimb, worldPos, Vec3{0, 1, 0}, 0.0f);
+  }
+  // The same question asked along a SEGMENT: the first shell material met
+  // between `from` and `from + dir * dist`, stepping one shell-lattice cell at
+  // a time. `dist` 0 degenerates to the point test above.
+  //
+  // A ray rather than a point because a limb is a rounded tube inside a
+  // garment cut to its box — see the long note on BurnLimbView::occlude for
+  // what testing the point costs.
+  uint32_t WornAlong(int bodyLimb, const Vec3& from, const Vec3& dir,
+                     float dist);
+  // Does any shell cover this body limb at all? The cheap gate in front of the
+  // probe, so an undressed creature never even transforms a point.
+  bool LimbHasShells(int bodyLimb) const;
+  // Rig slots that are NOT part of the authored rig: worn shells and a held
+  // item, always at the tail. `LimbCount() - AppendedBase()` of them.
+  int AppendedBase() const { return baseLimbs_; }
   // The held weapon's cutting edge in WORLD voxels, from its live transform.
   bool WeaponEdge(Vec3& outBase, Vec3& outTip, float& outHalfWidth) const;
   // Is this Jolt body one of this creature's own parts?
@@ -571,6 +692,16 @@ class Mob {
   bool LimbAlive(int i) const {
     return i >= 0 && i < (int)anim_.partAlive.size() && anim_.partAlive[i] != 0;
   }
+  // THE LATTICE A LIMB'S VOXELS ARE ACTUALLY ON (see MobLimb::ownSkinScale).
+  // Every limb-scoped scale conversion goes through these two rather than
+  // reading def_->skinScale directly, so a shell or a weapon authored at its
+  // own resolution is converted by its own divisor.
+  uint32_t SkinScaleOf(const MobLimb& l) const {
+    return l.ownSkinScale ? l.ownSkinScale : (def_ ? def_->skinScale : 1u);
+  }
+  uint32_t PhysScaleOf(const MobLimb& l) const {
+    return l.ownPhysScale ? l.ownPhysScale : (def_ ? def_->physScale : 1u);
+  }
 
   // Build limbs/bodies/joints/anim state from the def at `origin` (min corner,
   // world voxels). Seeds the per-instance rig copy (skel_/limbDefs_). False =
@@ -613,6 +744,63 @@ class Mob {
   void DetachLimb(int limbIndex, bool adopt);
   // Tear down every body/joint/brick this rig still owns (despawn, reset).
   void ReleaseRig();
+
+  // ---- the APPENDED TAIL: shells and the held item -------------------------
+  //
+  // THE REMOVAL SEAM, and the one invariant everything about wearing rests on.
+  //
+  // Before armour there was exactly one appended slot and unequipping it was
+  // `pop_back` on four parallel vectors — index-parallel by construction,
+  // nothing to renumber. Several worn pieces plus a weapon break that: taking
+  // off the robe while the boots and the sword stay on removes a group from
+  // the MIDDLE of the tail.
+  //
+  // What this does is ERASE that range and FIX UP the indices that referred
+  // past it, rather than tearing the whole tail down and re-appending the
+  // survivors. Two reasons, and the second is the one that matters:
+  //
+  //   * An appended slot is never a PARENT. Shells hang off body limbs and a
+  //     held item off a hand, both of which live below baseLimbs_, so erasing
+  //     one can orphan nothing and no parent index inside the base rig moves.
+  //     Only the appended indices after the hole shift, and there are exactly
+  //     three kinds of reference to them: heldSlot_/heldPartIndex_ and each
+  //     WornPiece::slots. All three are fixed here.
+  //   * A survivor's LATTICE IS NOT REBUILT, because it is never let go of. A
+  //     re-append would have to carry the carved voxels, the owned brick index
+  //     and the current hp across by hand, and re-loading any one of them from
+  //     the def would silently HEAL a damaged pauldron — a bug that looks like
+  //     nothing until somebody notices their armour repairing itself when they
+  //     take off an unrelated piece. Moving the MobLimb wholesale makes that
+  //     unrepresentable instead of merely tested for.
+  //
+  // Destroys the joints and bodies of the removed range only. `count` slots
+  // starting at `first`, which must be a range wholly inside the tail.
+  void RemoveAppendedSlots(int first, int count);
+  // Append one shell of a worn piece over `bodyLimb`. Returns the new slot, or
+  // -1. Split out of WearItem so the per-cover loop reads as a list of shells
+  // rather than as one 200-line function.
+  int AppendWornShell(const ItemDef& item, const ItemCover& cover,
+                      int bodyLimb, const std::string& partName);
+  // Replace a shell's authoritative lattice with a saved one and re-derive
+  // everything downstream of it (collider, brick, Jolt body). The same three
+  // steps MobSystem::LoadState takes for a carved limb, and for the same
+  // reason: the lattice is the truth and the rest is derived from it.
+  void RestoreShellLattice(int slot, const WornShellDamage& d);
+  // Every appended vector is the same length, and several loops assume it.
+  // Cheap enough to assert after every structural change.
+  bool AppendedInvariantHolds() const;
+  // Binds Mob::WornOccludes to BurnLimbView's plain function-pointer hook.
+  // A struct rather than a lambda because the hook must be a raw pointer (see
+  // BurnLimbView::occlude) and the context has to outlive the call.
+  struct WornProbe {
+    Mob* mob;
+    int limb;
+    static uint32_t Call(void* ctx, const Vec3& from, const Vec3& dir,
+                         float dist) {
+      WornProbe* s = static_cast<WornProbe*>(ctx);
+      return s->mob->WornAlong(s->limb, from, dir, dist);
+    }
+  };
 
   // ---- burn internals -------------------------------------------------------
   BurnLimbView ViewOf(MobLimb& limb);
@@ -684,6 +872,47 @@ class Mob {
   AnimSkeleton skel_;
   std::vector<MobLimbDef> limbDefs_;
   std::vector<uint8_t> hidden_;      // per-limb render suppression
+
+  // How many slots the AUTHORED rig has. Everything at or past this index was
+  // APPENDED — a worn shell or a held item — and is the only thing
+  // RemoveAppendedSlots is allowed to touch. Recorded once in BuildRig rather
+  // than re-derived from def_->limbs.size() at each use, because a hot reload
+  // can swap the def under a live rig and the two would then disagree.
+  int baseLimbs_ = 0;
+
+  // ONE WORN PIECE: which equip slot it came from, what it is by name, and the
+  // appended rig slots it occupies (one per ItemCover entry that found a limb).
+  //
+  // By NAME, not by library index: item indices are file-order and every R
+  // hot-reload renumbers them (item.h's index hazard). The slot LIST is
+  // index-into-limbs_ and is fixed up by RemoveAppendedSlots whenever anything
+  // ahead of it in the appended tail goes away.
+  struct WornPiece {
+    int equipSlot = -1;
+    std::string item;
+    std::vector<int> slots;
+    // Which COVER ENTRY each slot came from, parallel to `slots`. Not the same
+    // as the slot's position in the list: a cover entry that finds no limb on
+    // this wearer is skipped, so a one-armed goblin's robe has three shells
+    // from cover entries 0, 1 and 4. Damage is indexed by cover entry, and
+    // without this the blob would be applied to the wrong shells.
+    std::vector<int> cover;
+    // ---- the occlusion index (one per shell, parallel to `slots`) ----------
+    // Dense material-by-cell over the shell's own lattice box, so
+    // WornOccludes is an O(1) transform-and-look-up rather than a walk of a
+    // few thousand voxels per probe. DERIVED and disposable: rebuilt whenever
+    // the shell's voxel count changes, which is the only thing that can move
+    // a hole into it (carve and burn both compact the lattice). Built LAZILY,
+    // so a dressed creature standing in a field costs nothing at all — the
+    // probe is only ever reached from the burn pass's `scanHot` branch.
+    struct ShellIndex {
+      IVec3 min{}, dims{};
+      std::vector<uint16_t> mat;   // 0 = no voxel here
+      size_t builtFor = (size_t)-1;  // voxel count the index was built from
+    };
+    std::vector<ShellIndex> index;
+  };
+  std::vector<WornPiece> worn_;
 
   // Held item state — ONE piece of entity<->slot sync, kept only in EquipItem.
   int heldSlot_ = -1;
@@ -758,6 +987,13 @@ class MobSystem {
   // equips one (the implementation is Mob::EquipItem, shared with the avatar).
   bool EquipItem(uint64_t mobId, const ItemDef* item,
                  const char* context = "held_right");
+  // The same scaffolding for ARMOUR: any creature can be dressed through the
+  // identical path the player uses (Mob::WearItem). Nothing calls these yet —
+  // AI that chooses to put a helmet on is out of scope — but the API is what
+  // makes "the goblin is wearing the helmet it dropped" content rather than a
+  // feature.
+  bool WearItem(uint64_t mobId, const ItemDef* item, int equipSlot);
+  bool UnwearItem(uint64_t mobId, int equipSlot);
 
   // Once per tick BEFORE debris.PreTick: kinematic walk drive, terrain
   // anchors, bleeding (bounded BrushOps into `ops`), despawn out-of-window.
@@ -1051,6 +1287,28 @@ class MobSystem {
   // Returns true if anything changed. `frontBudget`/`opsBudget` are in/out and
   // shared across every body burning this tick (rule 2: bound the process, not
   // each participant).
+  // ---- WHAT THE ARMOUR ACTUALLY STOPPED, counted -------------------------
+  //
+  // Not diagnostics-in-passing: this is the reporter CLAUDE.md's rule 6 asks
+  // for. "The covered limb caught fire" has at least three causes — the shell
+  // is somewhere else, the probe's transform is wrong, or the burn pass
+  // samples past a shell that is exactly where it should be — and a boolean
+  // at the end of a 160-tick fire distinguishes none of them. These do, on one
+  // line, for the cost of three increments.
+  struct WornStats {
+    uint32_t seedsBlocked = 0;   // contact samples the coat refused
+    uint32_t seedsPassed = 0;    // ...and ones that reached the skin anyway
+    uint32_t nbrSubstituted = 0; // world neighbours replaced by cloth/steel
+    uint32_t nbrThreats = 0;     // ...out of this many that could have acted
+    // Misses a LONGER ray would have caught. Separates "the reach is too
+    // short" from "there is genuinely no shell in that direction", which is
+    // the one distinction a bare miss count cannot make and the one that
+    // decides whether the fix is a constant or a redesign.
+    uint32_t nbrMissInReach = 0;
+  };
+  const WornStats& Worn() const { return wornStats_; }
+  void ResetWornStats() { wornStats_ = WornStats{}; }
+
   bool BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey, World& world,
                    std::vector<CellOp>& cellOps, uint32_t& frontBudget,
                    uint32_t& opsBudget);
@@ -1152,6 +1410,7 @@ class MobSystem {
   std::vector<ReactionGpu> reactions_;
   std::vector<uint8_t> matSelfActive_;  // has decay/emit rules — i.e. is ALIGHT
   std::vector<uint8_t> matHasPair_;     // has pair rules — i.e. is ignitable
+  WornStats wornStats_{};
   std::vector<uint8_t> matHot_;         // carries tag:hot
   // Material has a pair rule that REWRITES ITS NEIGHBOUR. This is the inbound
   // half of the world coupling and it is what makes acid work with no

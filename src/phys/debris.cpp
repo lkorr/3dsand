@@ -1470,6 +1470,10 @@ void DebrisSystem::ReleaseBody(Body& b) {
   // MicroBodyFree — only copy-on-write clones this body owns are reclaimed.
   if (b.micro.Valid() && microSet_) MicroBodyFree(*microSet_, b.micro.model);
   b.micro = MicroBodyRef{};
+  // Told BEFORE the handle is destroyed, so a listener may still ask physics
+  // about it. Every path that lets go of a body funnels through here, which is
+  // what makes one notification enough (see SetOnBodyGone).
+  if (b.handle && onBodyGone_) onBodyGone_(b.handle);
   if (b.handle) phys_->RemoveBody(b.handle);
   b.handle = 0;
 }
@@ -1917,6 +1921,38 @@ bool DebrisSystem::SplitBody(uint64_t handle, Vec3 planePointVoxel,
   bodies_.push_back(std::move(newBodies[1]));
   instancesDirty_ = true;
   return true;
+}
+
+bool DebrisSystem::DestroyBody(uint64_t handle) {
+  if (!handle) return false;
+  for (size_t i = 0; i < bodies_.size(); i++) {
+    if (bodies_[i].handle != handle) continue;
+    ReleaseBody(bodies_[i]);
+    bodies_.erase(bodies_.begin() + i);
+    instancesDirty_ = true;
+    return true;
+  }
+  return false;
+}
+
+bool DebrisSystem::BodyLatticeOf(uint64_t handle, std::vector<PrefabVoxel>& out,
+                                 uint32_t& outScale) const {
+  for (const Body& b : bodies_) {
+    if (b.handle != handle) continue;
+    out.clear();
+    if (b.HasFineSkin()) {
+      outScale = b.micro.skinScale;
+      out = b.skinVoxels;
+    } else {
+      outScale = b.physScale ? b.physScale : 1u;
+      out.reserve(b.voxels.size());
+      for (const DebrisVoxel& v : b.voxels)
+        out.push_back(PrefabVoxel{(int16_t)v.x, (int16_t)v.y, (int16_t)v.z,
+                                  v.payload, v.color});
+    }
+    return true;
+  }
+  return false;
 }
 
 void DebrisSystem::ManageTerrain(uint32_t tick, World& world) {

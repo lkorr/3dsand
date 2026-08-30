@@ -308,6 +308,15 @@ class PlayerAvatar : public Mob {
                ? limbDefs_[part].tag.c_str()
                : "";
   }
+  // Rig index of this part's parent, or -1 for the root. The first-person hide
+  // mask needs it: a worn shell has to be kept or hidden with the part it
+  // covers, and the keep-list is written in terms of BODY parts (an armoured
+  // sleeve would otherwise vanish off an arm you can still see).
+  int PartParent(int part) const {
+    return part >= 0 && part < (int)skel_.parts.size()
+               ? skel_.parts[part].parent
+               : -1;
+  }
   int ActiveClips() const { return (int)anim_.clips.size(); }
   // Measured planar speed in world voxels/sec (presentation/diagnostics only).
   float SpeedNow() const { return speedNow_; }

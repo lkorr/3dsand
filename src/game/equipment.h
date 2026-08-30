@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -18,23 +19,27 @@
 //
 // WHY A SLOT TABLE RATHER THAN A BAG WITH TAGS. The interesting decision an
 // equipment system makes is "what may go here", and that decision is DATA:
-// `EquipSlotDef::accepts` is a list of ItemKinds, and the day
-// ItemKind::ArmorHead exists the change is one row in kEquipSlots, not a new
-// branch anywhere. Until then the armour slots accept NOTHING and say so out
-// loud (MoveResult::WrongKind carries the reason string the UI shows), which
-// is honest scaffolding rather than a slot that silently swallows a sword.
+// `EquipSlotDef::accepts` is a list of ItemKinds, and when ItemKind::ArmorHead
+// arrived the change WAS one row in kEquipSlots and no new branch anywhere —
+// the claim this file made while the armour rows were still empty, now spent.
+// A slot that refuses still says why out loud (MoveResult::WrongKind carries
+// the reason string the UI shows) rather than declining silently.
 //
 // WHAT IS NOT HERE, ON PURPOSE:
 //   * No stack limits. ItemStack::count is already a count and nothing in the
 //     game produces more than one of anything yet; a cap invented before the
 //     first stackable item exists would be a guess.
-//   * No visual sheathing. Sheath holds a melee item as DATA; drawing it on
-//     the back needs a `sheath_back` socket in the rig plus a matching grip
-//     context on the item (game/item.h's ItemGrip map already anticipates
-//     exactly this), which is content, not code.
-//   * No weight, no durability, no set bonuses. Those are content systems that
-//     want authored data files, and inventing their shape from zero content is
-//     how you get a schema nobody can author against.
+//   * No visual sheathing. Sheath holds a melee item as DATA; the draw key
+//     takes it OUT of the sheath and into the hand through the ordinary
+//     Mob::EquipItem path. Drawing it on the BACK while stowed needs a
+//     `sheath_back` socket in the rig plus a matching grip context on the item
+//     (game/item.h's ItemGrip map already anticipates exactly this), which is
+//     content, not code.
+//   * No weight, no armour class, no set bonuses. Protection here is geometric
+//     occlusion plus material identity — a steel plate stops acid because
+//     `steel` carries no `tag:dissolvable`, not because it has a resist field.
+//     Durability IS real, but it is the shell's own hp and its own voxels
+//     being carved away, not a number counting down.
 //
 // INDEX HAZARD (the one real trap). ItemStack::def is an index into
 // ItemLibrary::items, which is FILE-ORDER dependent and invalidated by every
@@ -105,15 +110,21 @@ struct EquipSlotDef {
 // a kind to a row and that slot accepts it, with no other code change.
 inline const EquipSlotDef* EquipSlots() {
   static const EquipSlotDef k[kEquipSlotCount] = {
-      {EquipSlotId::Head, "Head", "slot_head", {}, "requires: a helm"},
-      {EquipSlotId::Chest, "Chest", "slot_chest", {}, "requires: a cuirass"},
-      {EquipSlotId::Legs, "Legs", "slot_legs", {}, "requires: greaves"},
-      {EquipSlotId::Boots, "Boots", "slot_boots", {}, "requires: boots"},
-      {EquipSlotId::Shoulders, "Shoulders", "slot_shoulders", {},
-       "requires: pauldrons"},
-      {EquipSlotId::Hands, "Hands", "slot_hands", {}, "requires: gauntlets"},
-      {EquipSlotId::Belt, "Belt", "slot_belt", {}, "requires: a girdle"},
-      {EquipSlotId::Trinket, "Trinket", "slot_trinket", {},
+      {EquipSlotId::Head, "Head", "slot_head", {ItemKind::ArmorHead},
+       "requires: a helm"},
+      {EquipSlotId::Chest, "Chest", "slot_chest", {ItemKind::ArmorChest},
+       "requires: a cuirass"},
+      {EquipSlotId::Legs, "Legs", "slot_legs", {ItemKind::ArmorLegs},
+       "requires: greaves"},
+      {EquipSlotId::Boots, "Boots", "slot_boots", {ItemKind::ArmorBoots},
+       "requires: boots"},
+      {EquipSlotId::Shoulders, "Shoulders", "slot_shoulders",
+       {ItemKind::ArmorShoulders}, "requires: pauldrons"},
+      {EquipSlotId::Hands, "Hands", "slot_hands", {ItemKind::ArmorHands},
+       "requires: gauntlets"},
+      {EquipSlotId::Belt, "Belt", "slot_belt", {ItemKind::ArmorBelt},
+       "requires: a girdle"},
+      {EquipSlotId::Trinket, "Trinket", "slot_trinket", {ItemKind::Trinket},
        "requires: a trinket"},
       // The two rows that accept something today. A sword dragged here proves
       // the whole move/validate/persist pipe end to end, which is the point of
@@ -141,6 +152,16 @@ inline const EquipSlotDef& EquipSlotAt(int i) {
 // Does this slot take this kind? ItemKind::None is never accepted, so an empty
 // `accepts` list refuses everything by construction rather than by a special
 // case.
+// Does an item in this slot go ON THE BODY? The sheath and the quick slots
+// carry an item without wearing it, so the wear/unwear sync in the tick loop
+// must not fire for them — asked here rather than by testing the slot id at
+// the call site, because that test would then live in main.cpp AND in the
+// gate AND in the save path.
+inline bool EquipSlotIsWorn(int slot) {
+  if (slot < 0 || slot >= kEquipSlotCount) return false;
+  return EquipSlotAt(slot).id <= EquipSlotId::Trinket;
+}
+
 inline bool EquipSlotAccepts(int slot, ItemKind kind) {
   if (slot < 0 || slot >= kEquipSlotCount) return false;
   if (kind == ItemKind::None) return false;
@@ -149,6 +170,55 @@ inline bool EquipSlotAccepts(int slot, ItemKind kind) {
     if (k == kind) return true;
   return false;
 }
+
+// ---- WHAT A WORN PIECE HAS BEEN THROUGH -------------------------------------
+//
+// A shell on the body is a rig slot and carries its own damage: burnt-through
+// cloth, a hole a blade opened, the hp that is left. The moment the piece comes
+// OFF, that rig slot is destroyed — and with it every trace of what happened to
+// the garment, unless something outside the body is holding it.
+//
+// This is that something. One blob per equip slot, one entry per cover entry in
+// the item's own order.
+//
+// WHY NOT REBUILD FROM THE DEF. Because the def is the PRISTINE piece. Taking
+// off your boots to put on a different pair and finding the first pair mended
+// is the bug this exists to make unrepresentable, and it is a bug nothing else
+// in the suite would notice: everything still works, the armour is just
+// quietly free.
+//
+// THE LATTICE IS THE AUTHORITATIVE ONE — the skin where a shell has a separate
+// skin, the collider where it does not. Storing the derived side would be
+// storing something the next re-derive overwrites (phys/lattice.h's one-way
+// rule), which is a subtler way of losing the damage.
+//
+// KEYED BY ITEM NAME, not by slot and not by instance.
+//
+// Not by SLOT, because dragging the robe to the pack and back would then mend
+// it — the slot emptied, and the blob went with it. Not by INSTANCE, because
+// an ItemStack has no identity: it is a library index and a count, and giving
+// stacks instance ids is a far larger change than armour needed.
+//
+// So the unit is "your robe". Two robes in one pack would share one set of
+// holes, which is a real limitation and an acceptable one while nothing in the
+// game produces two of anything. What DOES hold — and is what the owner asked
+// for — is that damage survives unequip, re-equip, a move through the pack,
+// and a save.
+struct WornShellDamage {
+  float hp = -1.0f;                  // < 0 = as authored
+  std::vector<PrefabVoxel> lattice;  // empty = as authored
+  bool Empty() const { return hp < 0.0f && lattice.empty(); }
+};
+
+struct WornDamage {
+  std::vector<WornShellDamage> shells;
+  bool Empty() const {
+    for (const WornShellDamage& s : shells)
+      if (!s.Empty()) return false;
+    return true;
+  }
+  void Clear() { shells.clear(); }
+};
 
 struct Equipment {
   ItemStack slots[kEquipSlotCount];
@@ -207,6 +277,26 @@ struct Bag {
 struct PlayerKit {
   Equipment equip;
   Bag bag;
+  // Damage carried by worn pieces that are not currently ON the body (see
+  // WornDamage). Held here rather than on Equipment because it outlives any
+  // one slot: a robe dragged to the pack and back is the same robe.
+  std::map<std::string, WornDamage> wornDamage;
+
+  // Read a piece's damage, or null when it has never been hurt. Const so a
+  // caller cannot create an entry by asking.
+  const WornDamage* Damage(const std::string& item) const {
+    auto it = wornDamage.find(item);
+    return it == wornDamage.end() ? nullptr : &it->second;
+  }
+  // Record it, or forget it when the piece is whole again (a re-wear of an
+  // undamaged piece must not leave an empty blob behind to be saved).
+  void SetDamage(const std::string& item, WornDamage d) {
+    if (item.empty()) return;
+    if (d.Empty())
+      wornDamage.erase(item);
+    else
+      wornDamage[item] = std::move(d);
+  }
 
   // Resolve a reference to the stack it names. `hotbar` is passed in rather
   // than owned: the hotbar predates this struct, main.cpp owns it, and moving
@@ -261,6 +351,50 @@ struct PlayerKit {
     *a = *b;
     *b = tmp;
     return MoveResult::Ok;
+  }
+};
+
+// ---- DRAWN OR STOWED --------------------------------------------------------
+//
+// The Sheath slot is where a weapon lives; this is whether it is currently IN
+// THE HAND. Two states and one key, which is the whole feature — but the rule
+// has three cases that are easy to get subtly wrong, so it lives here as a
+// plain struct rather than as a branch in the frame loop:
+//
+//   * Drawing forces the melee tool. Without it you pull a sword and the left
+//     mouse button still paints stone.
+//   * Stowing puts the PREVIOUS tool back. Forcing a mode and never
+//     un-forcing it strands the player somewhere they did not choose.
+//   * A weapon that LEAVES the sheath while drawn is no longer drawn. The
+//     character screen can move it into the pack mid-swing, and nothing about
+//     the key press knows that happened — so the reconcile runs every frame
+//     and there is exactly one place the two facts have to agree.
+//
+// No engine coupling of any kind (`tool` is an int the caller owns), which is
+// what lets --gate armor-wear assert on it with no window and no GPU.
+struct SheathState {
+  bool drawn = false;
+  int toolBefore = 0;
+
+  // The key press. False = nothing to draw; the caller shows a refusal.
+  bool Toggle(ItemKind sheathKind, int meleeTool, int& tool) {
+    if (drawn) {
+      drawn = false;
+      tool = toolBefore;
+      return true;
+    }
+    if (sheathKind != ItemKind::Melee) return false;
+    drawn = true;
+    toolBefore = tool;
+    tool = meleeTool;
+    return true;
+  }
+
+  // Every frame, before the hand is read.
+  void Reconcile(ItemKind sheathKind, int meleeTool, int& tool) {
+    if (!drawn || sheathKind == ItemKind::Melee) return;
+    drawn = false;
+    if (tool == meleeTool) tool = toolBefore;
   }
 };
 
