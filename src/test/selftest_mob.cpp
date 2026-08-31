@@ -1090,7 +1090,33 @@ bool mobOk = false;
         while (hipsYaw > 180.0f) hipsYaw -= 360.0f;
         while (hipsYaw < -180.0f) hipsYaw += 360.0f;
         bool hipsHeld = std::fabs(hipsYaw) < 12.0f;
-        bool lookOk = lookTurns && hipsHeld;
+        // ---- the rear release band (avatar.headLookReleaseYaw) ----
+        // Third person orbits the camera all the way round a body that faces
+        // its travel direction, so the look delta reaches 180. Clamping alone
+        // makes every angle past the cone the same pose — head pinned at its
+        // stop — and dead behind is exactly where you want the character's own
+        // forward pose instead. Assert the SHAPE of the band, not its width:
+        // still craning outside it, near neutral at 180, and symmetric across
+        // the wrap (both signs of 175 must agree, or the goal snaps as the
+        // camera crosses straight-behind).
+        auto lookSettle = [&](float deg) {
+          avatar.SetLook(deg / 57.29578f, 0.0f);
+          for (int i = 0; i < 40; i++) avTick();
+          return relHeadYaw() - headRest;
+        };
+        const float headOutside = lookSettle(120.0f);  // band starts at 130
+        const float headBehind = lookSettle(179.0f);
+        const float headBehindNeg = lookSettle(-179.0f);
+        // RELATIVE to the craning pose, not an absolute "near zero". The idle
+        // rig carries a standing bias of several degrees at this joint — the
+        // +-60 pair above recovers +51 / -63 for the same 60 degrees asked —
+        // so an absolute neutral bound would be gating that bias as much as
+        // the release. A fraction of the crane is the actual claim: dead
+        // behind, the head is holding the body's pose and not the camera's.
+        bool releaseOk = std::fabs(headOutside) > 25.0f &&
+                         std::fabs(headBehind) < 0.35f * std::fabs(headOutside) &&
+                         std::fabs(headBehindNeg) < 0.35f * std::fabs(headOutside);
+        bool lookOk = lookTurns && hipsHeld && releaseOk;
         avatar.SetLook(0.0f, 0.0f);
         for (int i = 0; i < 40; i++) avTick();
 
@@ -1997,8 +2023,10 @@ bool mobOk = false;
         std::printf(
             "avatar head look: %s (look +60 deg -> head %+.1f deg, -60 -> "
             "%+.1f deg, both vs hips and SIGN-MATCHING the input; "
-            "hips held %.1f deg)\n",
-            lookOk ? "PASS" : "FAIL", headPos, headNeg, hipsYaw);
+            "hips held %.1f deg; rear release: 120 -> %+.1f still craning, "
+            "179 -> %+.1f, -179 -> %+.1f both back to forward)\n",
+            lookOk ? "PASS" : "FAIL", headPos, headNeg, hipsYaw, headOutside,
+            headBehind, headBehindNeg);
         mobOk = mobOk && lookOk;
 
         // ---- body facing policy (ResolveAvatarHeading) ----

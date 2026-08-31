@@ -485,6 +485,12 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     // 0 is meaningful (body always faces the camera, the old behaviour); the
     // ceiling stops a value that would let the head face backwards.
     a.headLookYaw = std::clamp(a.headLookYaw, 0.0f, 110.0f);
+    ReadF(*g, "headLookReleaseYaw", a.headLookReleaseYaw, out, at);
+    // 0 disables the release. The ceiling is 180 minus the head cone: a band
+    // wider than the reachable range would be fading a look that has not
+    // started yet, so the neck would never reach its stop at any angle.
+    a.headLookReleaseYaw =
+        std::clamp(a.headLookReleaseYaw, 0.0f, 180.0f - a.headLookYaw);
     ReadF(*g, "headLookPitchUp", a.headLookPitchUp, out, at);
     a.headLookPitchUp = std::clamp(a.headLookPitchUp, 0.0f, 89.0f);
     ReadF(*g, "headLookPitchDown", a.headLookPitchDown, out, at);

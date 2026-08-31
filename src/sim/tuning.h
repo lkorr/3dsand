@@ -330,6 +330,19 @@ struct Tuning {
     // why there is no separate "recenter" rate and no hysteresis to chatter
     // on: the constraint is geometric, not a state machine.
     float headLookYaw = 70.0f;
+    // THE LOOK LETS GO WHEN THE CAMERA COMES ROUND TO THE FRONT. Width, in
+    // degrees measured inward from straight-behind (180), of the band where
+    // the head-look goal fades back to the body's own facing. Third person
+    // only in practice: first person drags the body so the offset can never
+    // leave the cone above, so this band is unreachable there.
+    //
+    // Without it, orbiting the camera to look the character in the face leaves
+    // the neck pinned at its stop craning over one shoulder for the whole
+    // front half of the orbit — you can never see the character's actual
+    // forward pose. The fade is a smoothstep, so it is flat at both ends: no
+    // crease entering the band, and no snap across the 180 wrap (both signs
+    // approach zero there). 0 disables it and restores the always-crane.
+    float headLookReleaseYaw = 50.0f;
     // Head pitch range, degrees up/down. The camera pitch clamp is ~89°, and
     // a neck does not do that, so this clamps separately.
     float headLookPitchUp = 55.0f;

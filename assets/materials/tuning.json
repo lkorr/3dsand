@@ -81,6 +81,7 @@
     "velocityHalflife": 0.08,
     "firstPersonTurnHalflife": 0.05,
     "headLookYaw": 70,
+    "headLookReleaseYaw": 50,
     "headLookPitchUp": 55,
     "headLookPitchDown": 60,
     "headLookSpine": 0.25,

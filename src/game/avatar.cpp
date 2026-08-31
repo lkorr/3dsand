@@ -225,7 +225,42 @@ void PlayerAvatar::SetLook(float yawRel, float pitch) {
   while (yawRel > 3.14159265f) yawRel -= 6.2831853f;
   while (yawRel < -3.14159265f) yawRel += 6.2831853f;
   const float yLim = a.headLookYaw * kDeg;
-  lookYawGoal_ = std::clamp(yawRel, -yLim, yLim);
+  // THE NECK LETS GO WHEN THE CAMERA COMES ROUND TO THE FRONT.
+  //
+  // Third person faces the body at its TRAVEL direction, so orbiting the
+  // camera sweeps `yawRel` across the whole circle. Clamped alone, everything
+  // past the cone reads as one pose: the head pinned at its stop, craning over
+  // a shoulder at a camera it cannot reach. That is the right answer at 90
+  // degrees and the wrong one at 180, where the camera is looking the
+  // character in the face and the interesting pose is the one the character is
+  // actually holding — facing forward.
+  //
+  // So the goal is scaled down to nothing across the last `headLookReleaseYaw`
+  // degrees before straight-behind. Two properties matter and both come from
+  // the smoothstep rather than from a lerp:
+  //   - it is flat at t=1, so there is no crease where the band begins; the
+  //     head keeps sitting at its stop through the whole approach;
+  //   - it is flat at t=0, so the released zone is genuinely a zone and not a
+  //     single angle, which is the "sweet spot" this exists for. It also makes
+  //     the +180/-180 wrap a non-event: both signs reach zero there, so the
+  //     goal is continuous even though `yawRel` jumps.
+  // The head then eases onto the new goal over headLookHalflife like any other
+  // look, so crossing into the band is a turn-back, not a snap.
+  //
+  // PITCH IS DELIBERATELY NOT RELEASED. Yaw is what hides the character's face
+  // from a front-on camera; pitch tracking the camera just means the head is
+  // level with whoever is looking at it, which is what you want while circling.
+  //
+  // First person never gets here: ResolveAvatarHeading drags the body so the
+  // offset cannot leave the cone, so |yawRel| stays well under the band.
+  float release = 1.0f;
+  const float band = a.headLookReleaseYaw * kDeg;
+  if (band > 1e-4f) {
+    const float t =
+        std::clamp((3.14159265f - std::fabs(yawRel)) / band, 0.0f, 1.0f);
+    release = t * t * (3.0f - 2.0f * t);
+  }
+  lookYawGoal_ = std::clamp(yawRel, -yLim, yLim) * release;
   lookPitchGoal_ =
       std::clamp(pitch, -a.headLookPitchDown * kDeg, a.headLookPitchUp * kDeg);
 }
