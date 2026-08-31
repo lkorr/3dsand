@@ -158,6 +158,71 @@ f.addEventListener('load', () => {
               !!root && !!root.querySelector('.pv-hero') &&
               root.querySelectorAll('.pv-svg').length >= 2,
               (root ? root.querySelectorAll('.pv-svg').length : 0) + ' charts');
+
+        // THE ROLLING WINDOW IS REAL, not just non-crashing.
+        //
+        // Every assertion above passes whether the tiles average one second or
+        // twenty, because they only ask whether the page rendered. These ask
+        // whether the number changed when the window did — which is the whole
+        // feature, and the only way to catch a windowing helper that silently
+        // returns the view unchanged.
+        const all = W.pvSetWindow(0);       // whole ring
+        // THE WINDOW IS SIZED FROM THE DATA, not hardcoded. A fixed 0.5 s
+        // assertion fails whenever the harness happens to collect less than
+        // half a second of frames — measured: 36 frames at 13.8 ms is 497 ms,
+        // so pvRecent correctly declined to window and the test called that a
+        // bug. Half the ring's own wall clock always bites and still proves the
+        // mechanism.
+        const ringMs = (all ? all.frames * all.wallMs : 0);
+        const short = W.pvSetWindow((ringMs / 2) / 1000);
+        check('a shorter window averages fewer frames than the ring',
+              !!short && !!all && short.windowed && short.frames < all.frames,
+              short && all ? (short.frames + ' frames of ' + all.frames
+                              + ' in the ring, ' + ringMs.toFixed(0) + ' ms')
+                           : 'no state');
+        check('the window says which frames it used',
+              !!short && /last .* s/.test(short.label) && /frames/.test(short.label),
+              short ? short.label : 'no label');
+        // A window longer than the data must NOT pretend to be one: it reports
+        // the whole ring and says so, rather than labelling 0.4 s of frames
+        // "the last 5 seconds".
+        const over = W.pvSetWindow(9999);
+        check('a window longer than the ring reports the ring',
+              !!over && !over.windowed && over.frames === all.frames
+                     && /whole ring \(\d+ frames\)/.test(over.label),
+              over ? over.label : 'no state');
+        // A windowed GPU total must still be a real number. The trap this
+        // guards is the fence ring: GPU timestamps land two or three frames
+        // late, so a short window can contain only unresolved frames and would
+        // report the GPU as costing nothing — which is exactly what
+        // perfnodes.h says this page must never draw.
+        check('a short window still reports GPU work',
+              !!short && short.gpuMs > 0,
+              short ? short.gpuMs.toFixed(2) + ' ms vs ' + all.gpuMs.toFixed(2)
+                      + ' ms over the ring' : 'no state');
+        check('the tiles state their averaging window',
+              !!root && !!root.querySelector('.pv-winnote'),
+              root && root.querySelector('.pv-winnote')
+                ? root.querySelector('.pv-winnote').textContent.slice(0, 60) : 'missing');
+        check('the window picker is offered on live',
+              !!root && root.querySelectorAll('.pv-chip-win').length >= 3,
+              (root ? root.querySelectorAll('.pv-chip-win').length : 0) + ' options');
+        W.pvSetWindow(1);   // back to the default
+
+        // LAYOUT, in the arm where the live-only chrome actually exists. The
+        // recorded arm's overflow assertions cannot see the window picker or
+        // the window caption, because neither renders for a recorded scenario
+        // — so a control that pushed the scenario row off the page would ship
+        // green. `--shot` does not cover it either: it screenshots a fresh load
+        // that has no samples and therefore no live view at all.
+        const de = D.documentElement;
+        check('live page does not overflow horizontally',
+              de.scrollWidth <= de.clientWidth + 2,
+              'scrollWidth ' + de.scrollWidth + ' vs client ' + de.clientWidth);
+        let lclip = 0;
+        root.querySelectorAll('.pv-sec, .pv-bars, .pv-scenarios')
+            .forEach(e => { if (e.scrollWidth > e.clientWidth + 2) lclip++; });
+        check('no live section overflows its column', lclip === 0, lclip + ' clipped');
       }
       check('no page errors', errs.length === 0, errs.join(' | '));
       done();

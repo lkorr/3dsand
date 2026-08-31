@@ -125,8 +125,22 @@ COMMON=(--headless=new --disable-gpu --use-angle=swiftshader-webgl
         --virtual-time-budget=45000 --window-size=1440,2400)
 
 if [ -n "$SHOT" ]; then
+  # `|| true` swallowed every failure and the echo below claimed success
+  # regardless, so `--shot` reported "wrote build/x.png" for a file Chrome had
+  # never created -- which cost two runs before anyone thought to `ls`. Say what
+  # actually happened, the same rule as the pixel-sum check in the C++ shots.
+  #
+  # NOTE it screenshots a FRESH page load, so under --live/--fake it captures
+  # the tab before any telemetry sample has arrived. The live arm's own layout
+  # assertions run inside the page that HAS the samples; this is for the
+  # recorded view.
   "$CHROME" "${COMMON[@]}" --screenshot="$SHOT" "$URL" 2>/dev/null || true
-  echo "check_perfview: wrote $SHOT"
+  if [ -s "$SHOT" ]; then
+    echo "check_perfview: wrote $SHOT ($(wc -c < "$SHOT") bytes)"
+  else
+    echo "check_perfview: SHOT FAILED — $SHOT was not written" >&2
+    rm -f "$SHOT"
+  fi
 fi
 
 # ---- the live/fake arm runs in REAL time ----

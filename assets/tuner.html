@@ -552,6 +552,23 @@
   .pv-chip-live.on{border-color:var(--green)}
   .pv-chip-live.on b{color:var(--green)}
 
+  /* The averaging-window picker. Pushed to the right and drawn smaller than
+     the scenario chips on purpose: it selects how the numbers are SMOOTHED,
+     not what is being measured, and giving it equal weight to "which
+     scenario" would misrepresent it as a bigger choice than it is. */
+  .pv-winpick{display:flex;align-items:center;gap:6px;margin-left:auto}
+  .pv-winpick-lbl{font:11px/1 var(--mono);color:var(--faint);
+    text-transform:uppercase;letter-spacing:.06em}
+  .pv-chip-win{
+    display:block;padding:5px 10px;border-radius:6px;
+    font:11px/1 var(--mono);color:var(--dim);
+  }
+  .pv-chip-win.on{border-color:var(--green);color:var(--green);
+    background:var(--card2)}
+  /* States the window the tiles beside it averaged. Recessive, because it is
+     a caption on the numbers rather than one of them. */
+  .pv-winnote{margin:0 0 10px}
+
   .pv-sec{margin:0 0 30px}
   .pv-sec h2{font-size:20px;margin:0 0 4px;letter-spacing:-.01em}
   .pv-sec h3{font-size:13px;margin:22px 0 4px;color:var(--fg);
@@ -8532,7 +8549,7 @@ const ARCH_NODES={
     desc:'`--perf`, and the tuner tab that reads it. Five scenarios \u2014 idle, a burning tree, a streaming flythrough, an explosion storm and a draining lake \u2014 each recorded frame by frame with per-component CPU scopes, per-PASS GPU timestamps and the counters that explain them. Answers one question: where did my frame go, and which part of the engine do I fix.',
     files:['src/measure/perfsuite.h','src/measure/perfsuite.cpp','src/measure/perfnodes.h','assets/perfview.js','assets/perfview_test.html','scripts/check_perfview.sh'],
     sym:['sandvox::RunPerf','PerfSample','PerfNodeForPass','kPerfNodes','PassTimer::KickDeferred','renderPerformance'],
-    details:'<b>Run it:</b> <code>bash scripts/run.sh ./build/Release/sandvox.exe --perf</code> writes <code>build/perf.json</code>; the tuner\u2019s <b>Performance</b> tab reads it, and its <b>Run performance tests</b> button does the same through the run mutex. <code>--scenario &lt;id&gt;</code> runs one.<br><br><b>The taxonomy is shared.</b> <code>perfnodes.h</code> maps every PASS() row and every CPU scope onto an <code>ARCH_NODES</code> key \u2014 the same boxes as the map above \u2014 and <code>scripts/check_invariants.py</code> fails if a node here is not a box there, if a claimed pass is not a real row, or if any timed row is claimed by nobody. That last one is the important one: an unattributed dispatch is GPU time that silently vanishes from the page.<br><br><b>Two measurement problems it exists to have solved.</b> (1) <i>Granularity:</i> <code>prep(mutate+explode+compact)</code> is ONE pass group covering THREE components, so the timer gained a ROW granularity (<code>PassTimer::SetRowGranularity</code>) \u2014 timestamps are pure observation, and the harness refuses to run if attaching them moves the world hash. (2) <i>Pacing:</i> without a bound on frames in flight the CPU races ahead and the measured distribution is a queue depth, not a frame time \u2014 measured as p50 0.64 ms / p95 196 ms before a 3-deep fence ring was added.<br><br><b>Live mode</b> is the same charts fed by <code>--telemetry</code> instead of a file.<br><br><b>Verify the page, not just the numbers:</b> <code>bash scripts/check_perfview.sh</code> drives the real tab in real headless Chrome and checks content AND layout.'},
+    details:'<b>Run it:</b> <code>bash scripts/run.sh ./build/Release/sandvox.exe --perf</code> writes <code>build/perf.json</code>; the tuner\u2019s <b>Performance</b> tab reads it, and its <b>Run performance tests</b> button does the same through the run mutex. <code>--scenario &lt;id&gt;</code> runs one.<br><br><b>The taxonomy is shared.</b> <code>perfnodes.h</code> maps every PASS() row and every CPU scope onto an <code>ARCH_NODES</code> key \u2014 the same boxes as the map above \u2014 and <code>scripts/check_invariants.py</code> fails if a node here is not a box there, if a claimed pass is not a real row, or if any timed row is claimed by nobody. That last one is the important one: an unattributed dispatch is GPU time that silently vanishes from the page.<br><br><b>Two measurement problems it exists to have solved.</b> (1) <i>Granularity:</i> <code>prep(mutate+explode+compact)</code> is ONE pass group covering THREE components, so the timer gained a ROW granularity (<code>PassTimer::SetRowGranularity</code>) \u2014 timestamps are pure observation, and the harness refuses to run if attaching them moves the world hash. (2) <i>Pacing:</i> without a bound on frames in flight the CPU races ahead and the measured distribution is a queue depth, not a frame time \u2014 measured as p50 0.64 ms / p95 196 ms before a 3-deep fence ring was added.<br><br><b>Live mode</b> is the same charts fed by <code>--telemetry</code> instead of a file. <b>Its NUMBERS are a rolling mean over a trailing ~1 s window; its CHARTS are the whole 20 s ring.</b> Every ms figure used to be the mean over the entire ring, which is useless for the one thing a live view is for — you walk into a fire, the raymarch doubles, and the tile creeps toward the new value over twenty seconds without ever reaching it. The window is WALL CLOCK, not a frame count, so “one second” stays one second when the game slows down; it widens itself if it would otherwise hold no frame whose GPU timestamps have resolved, because a window of pending frames would draw the GPU as costing nothing. p99 and the page-fault counter deliberately stay on the full ring — a percentile over one second is the maximum wearing a percentile’s name, and a bug counter must not age out before you have seen it.<br><br><b>Verify the page, not just the numbers:</b> <code>bash scripts/check_perfview.sh</code> drives the real tab in real headless Chrome and checks content AND layout.'},
 
   measureSys:{label:'Measure Harness',tag:'cpu',
     desc:'The --measure headless sizing run: occupancy histogram of the residency window plus per-compute-pass GPU timings in three activity scenarios.',

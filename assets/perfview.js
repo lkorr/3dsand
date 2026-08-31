@@ -260,10 +260,26 @@ for (const s of PV_PCTL_SERIES) if (s.p != null) PV_TILE_NOTE[s.key] = s.tip;
 // (assets/perfview_test.html) and for poking at it from the console.
 window.pvState = () => ({ PERF, scenario: pvScenario, live: pvLive,
                           connected: pvLive.connected,
-                          pctlOn: pvPctlOn, pctlWin: pvPctlWin });
+                          pctlOn: pvPctlOn, pctlWin: pvPctlWin,
+                          winSec: pvWinSec });
 window.pvSetScenario = id => { pvScenario = id; renderPerformance(); };
 // Harness/console hook: flip a percentile series without synthesising a click.
 window.pvTogglePctl = k => { pvPctlOn[k] = !pvPctlOn[k]; renderPerformance(); };
+// Harness/console hook: set the averaging window and report what the numbers
+// were actually computed from. Returns the window's own description of itself
+// plus the frame count, so a test can assert that a 0.5 s window really did
+// average fewer frames than the whole ring rather than merely not crashing.
+window.pvSetWindow = sec => {
+  pvWinSec = sec;
+  renderPerformance();
+  const V = pvView();
+  if (!V) return null;
+  const W = pvRecent(V, pvWinSec);
+  return { winSec: pvWinSec, label: pvWinLabel(W),
+           frames: (W.wall||[]).length, ringFrames: (V.wall||[]).length,
+           windowed: !!W.windowed, wallMs: pvMean(W.wall),
+           gpuMs: pvTotals(W).gpuMs };
+};
 
 /* ================= tiny DOM + SVG helpers ================= */
 
@@ -372,13 +388,93 @@ function pvPctl(a, p){
   return v[lo] * (1 - (i-lo)) + v[hi] * (i-lo);
 }
 
+/* ---- the rolling window --------------------------------------------------
+ *
+ * WHY EVERY NUMBER ON THE PAGE IS A TRAILING MEAN AND NOT A RUNNING ONE.
+ *
+ * The live ring holds PV_LIVE_CAP frames — about 20 seconds. Every ms figure
+ * on this page used to be the mean over ALL of it, which makes the numbers
+ * useless for the thing you use a live view for: you walk into a fire, the
+ * raymarch doubles, and the tile creeps up over the next twenty seconds and
+ * never actually reaches the new value. A twenty-second mean of a world that
+ * changed four seconds ago is a number about neither world.
+ *
+ * So the SUMMARY numbers (tiles, verdict, component bars, counter means) are a
+ * mean over the last `pvWinSec` seconds, and the CHARTS still draw the whole
+ * ring. That split is the point: a chart is history and wants every frame, a
+ * tile answers "what is it doing NOW" and wants a short window.
+ *
+ * THE WINDOW IS WALL CLOCK, NOT A FRAME COUNT. A fixed 60 frames is one second
+ * at 60 fps, three at 20, and half at 120 — so the window would silently get
+ * longer exactly when the game got slower, which is when you are watching. It
+ * walks back summing `wallMs` instead, so "1 second" means one second at any
+ * frame rate.
+ */
+const PV_WIN_SECS = [0.5, 1, 2, 5, 0];   // 0 = the whole ring
+let pvWinSec = 1;
+
+// The trailing slice of a view covering ~`seconds` of wall clock. Returns the
+// view unchanged for a recorded scenario (the whole run IS the measurement —
+// there is no "now" to be near) or when the ring is shorter than the window.
+function pvRecent(V, seconds){
+  if (!V || !V.live || !(seconds > 0)) return V;
+  const wall = V.wall || [];
+  const n = wall.length;
+  if (!n) return V;
+  let ms = 0, from = n - 1;
+  for (; from > 0; from--){
+    ms += wall[from] || 0;
+    if (ms >= seconds * 1000) break;
+  }
+  // A GPU timestamp rides a fence ring and lands two or three frames late, so
+  // the newest frames routinely carry the CPU half only. A window that happens
+  // to contain no resolved frame would report "the GPU cost nothing", which is
+  // the one thing perfnodes.h says this page must never draw. Widen until it
+  // holds a few real ones — better a slightly longer window than a false zero.
+  const gv = V.gpuValid || [];
+  if (gv.length){
+    let valid = 0;
+    for (let i = from; i < n; i++) if (gv[i]) valid++;
+    while (from > 0 && valid < 4){ from--; if (gv[from]) valid++; ms += wall[from] || 0; }
+  }
+  if (from <= 0) return V;
+  const cut = o => { const r = {}; for (const k in o) r[k] = o[k].slice(from); return r; };
+  return { ...V, wall: wall.slice(from), cpu: cut(V.cpu||{}), gpu: cut(V.gpu||{}),
+           counters: cut(V.counters||{}), gpuValid: gv.slice(from),
+           windowed: true, windowMs: ms, windowFrames: n - from };
+}
+
+// How the window describes itself, for the labels that must not lie about
+// which frames they averaged.
+function pvWinLabel(V){
+  // Phrased to read after "a mean over the ...", which is the only place it
+  // appears in prose. "over the all 33 frames" is what the obvious wording
+  // produced.
+  if (!V || !V.live) return 'whole run';
+  if (!V.windowed) return 'whole ring (' + (V.wall||[]).length + ' frames)';
+  return 'last ' + pvNum(V.windowMs/1000, 1) + ' s · ' + V.windowFrames + ' frames';
+}
+
+// Mean over the frames whose GPU queries actually resolved. Averaging a
+// pending frame in as a zero drags every GPU bar down, and the shorter the
+// window the worse it gets — at one second the two or three unresolved frames
+// at the head are 5% of the sample instead of 0.2%.
+function pvGpuMean(V, arr){
+  if (!arr || !arr.length) return 0;
+  const gv = V.gpuValid || [];
+  if (!gv.length) return pvMean(arr);
+  let s = 0, n = 0;
+  for (let i = 0; i < arr.length; i++){ if (!gv[i]) continue; s += arr[i]; n++; }
+  return n ? s / n : 0;
+}
+
 // Mean ms per frame for every GPU node and every CPU scope, plus the two
-// totals the verdict rests on.
+// totals the verdict rests on. `V` is already windowed by the caller.
 function pvTotals(V){
   const gpu = [], cpuBusy = [];
   let gpuMs = 0, cpuBusyMs = 0, waitMs = 0;
   for (const k in (V.gpu||{})){
-    const m = pvMean(V.gpu[k]);
+    const m = pvGpuMean(V, V.gpu[k]);
     if (m <= 0) continue;
     gpu.push({ id: k, label: pvNodeLabel(k), ms: m });
     gpuMs += m;
@@ -983,12 +1079,16 @@ function renderPerformance(){
     return;
   }
 
-  const T = pvTotals(V);
-  root.append(pvVerdictPanel(V, T));
+  // W is the trailing window the NUMBERS are means of; V stays the whole ring,
+  // which is what the CHARTS draw. Every section takes both and is explicit
+  // about which one it read — see the pvRecent header.
+  const W = pvRecent(V, pvWinSec);
+  const T = pvTotals(W);
+  root.append(pvVerdictPanel(V, T, W));
   root.append(pvTimelineSection(V, T));
   root.append(pvPercentileSection(V, T));
-  root.append(pvBreakdownSection(V, T));
-  root.append(pvCountersSection(V));
+  root.append(pvBreakdownSection(V, T, W));
+  root.append(pvCountersSection(V, W));
   root.append(pvDistributionSection(V));
   if (!V.live){
     root.append(pvComparisonSection());
@@ -1035,11 +1135,31 @@ function pvScenarioBar(){
     pvEl('b', {}, 'Live session'),
     pvEl('span', {}, pvLive.connected ? pvLive.samples.length + ' frames'
                                       : 'not connected')));
+
+  // THE AVERAGING WINDOW, only on live — a recorded scenario has no "now" for
+  // a trailing window to trail behind, and offering the control there would
+  // imply otherwise. One second is the default because it is short enough to
+  // track what you just walked into and long enough that a 60 fps sample is 60
+  // frames, which is a steady number rather than a flicker.
+  if (pvScenario === '__live__'){
+    const w = pvEl('div', { class:'pv-winpick',
+      title:'The trailing wall-clock window every millisecond figure and every '
+          + 'counter headline is averaged over. Charts always draw the whole '
+          + 'ring; this only moves the numbers.' });
+    w.append(pvEl('span', { class:'pv-winpick-lbl' }, 'average over'));
+    for (const s of PV_WIN_SECS)
+      w.append(pvEl('button', {
+        class:'pv-chip pv-chip-win' + (pvWinSec===s?' on':''),
+        onclick:() => { pvWinSec = s; renderPerformance(); } },
+        s > 0 ? (s < 1 ? (s*1000)+' ms' : s+' s') : 'all'));
+    row.append(w);
+  }
   return row;
 }
 
 /* ---- verdict -------------------------------------------------------------- */
-function pvVerdictPanel(V, T){
+function pvVerdictPanel(V, T, W){
+  W = W || V;
   const v = pvVerdict(T);
   const fps = T.wallMs > 0 ? 1000/T.wallMs : 0;
   const worst = (T.gpu[0] && (!T.cpuBusy[0] || T.gpu[0].ms >= T.cpuBusy[0].ms))
@@ -1058,11 +1178,24 @@ function pvVerdictPanel(V, T){
       ' at ' + pvNum(worst.ms) + ' ms/frame (' + pvPct(worst.ms/(T.wallMs||1))
       + ' of the frame)') : null));
 
+  // WHICH FRAMES THESE TILES AVERAGED, said out loud. A mean whose window is
+  // not stated is the same trap as a duration with no denominator.
+  const win = pvWinLabel(W);
+  sec.append(pvEl('p', { class:'note pv-winnote' },
+    'Every millisecond figure below is a mean over the ', pvEl('b', {}, win),
+    V.live ? '. The charts further down draw the whole ring.'
+           : '. Recorded runs have no “now”, so the window is the run.'));
+
   const tiles = pvEl('div', { class:'pv-tiles' });
   tiles.append(pvTile('Frame time (mean)', pvNum(T.wallMs,1), 'ms',
-                      pvNum(fps,0) + ' fps'));
+                      pvNum(fps,0) + ' fps · ' + win));
+  // p99 and the page-fault counter deliberately stay on the FULL ring. A
+  // percentile over one second of frames is just the maximum wearing a
+  // percentile's name, and a hitch that scrolls out of view in a second is a
+  // hitch you cannot read. The same goes for a bug counter: page faults must
+  // not age out of the display before you have seen them.
   tiles.append(pvTile('Frame time (p99)', pvNum(pvPctl(V.wall,0.99),1), 'ms',
-                      'the hitch, not the average'));
+                      'the hitch, over all ' + (V.wall||[]).length + ' frames'));
   tiles.append(pvTile('GPU work', pvNum(T.gpuMs,1), 'ms',
                       pvPct(T.gpuMs/(T.wallMs||1)) + ' of the frame'));
   tiles.append(pvTile('CPU busy', pvNum(T.cpuBusyMs,1), 'ms',
@@ -1217,17 +1350,21 @@ function pvPercentileSection(V, T){
  * The list the page exists for. Sorted by cost, GPU and CPU kept apart, each
  * bar carrying the counter that explains it.
  */
-function pvBreakdownSection(V, T){
+function pvBreakdownSection(V, T, W){
+  W = W || V;
   const sec = pvEl('section', { class:'pv-sec' });
   sec.append(pvEl('h3', {}, 'Cost by engine component'));
   sec.append(pvEl('p', { class:'note' },
-    'Mean milliseconds per frame. The right-hand column is the work that '
-    + 'produced it — a duration with no denominator says a component is '
-    + 'slow without saying why. Component names are the same boxes as the '
-    + 'Engine tab’s architecture map.'));
+    'Mean milliseconds per frame over the ' + pvWinLabel(W) + '. The '
+    + 'right-hand column is the work that produced it — a duration with no '
+    + 'denominator says a component is slow without saying why. Component '
+    + 'names are the same boxes as the Engine tab’s architecture map.'));
 
+  // The counters come from the SAME window as the ms figures beside them. A
+  // one-second raymarch mean explained by a twenty-second chunk count is two
+  // different measurements sharing a sentence.
   const cmean = {};
-  for (const k in (V.counters||{})) cmean[k] = pvMean(V.counters[k]);
+  for (const k in (W.counters||{})) cmean[k] = pvMean(W.counters[k]);
   const whyFor = id => {
     const parts = [];
     for (const c of ((PERF && PERF.counters) || [])){
@@ -1239,7 +1376,7 @@ function pvBreakdownSection(V, T){
     // The per-chunk number is what the compute budget is denominated in, so it
     // is derived here rather than left for the reader to divide.
     if (id === 'caLoop' && cmean.activeChunks > 0){
-      const per = (pvMean(V.gpu.caLoop||[]) * 1000) / cmean.activeChunks;
+      const per = (pvGpuMean(W, W.gpu.caLoop||[]) * 1000) / cmean.activeChunks;
       parts.push(pvNum(per,2) + ' µs/chunk');
     }
     return parts.join(' · ');
@@ -1300,7 +1437,8 @@ function pvBreakdownSection(V, T){
  * Small multiples. Each counter is its own chart with its own scale — never two
  * counters on one plot, which is the dual-axis mistake wearing a sparkline.
  */
-function pvCountersSection(V){
+function pvCountersSection(V, W){
+  W = W || V;
   const keys = Object.keys(V.counters||{}).filter(k => pvSum(V.counters[k]) > 0);
   if (!keys.length) return pvEl('span');
   const sec = pvEl('section', { class:'pv-sec' });
@@ -1308,18 +1446,27 @@ function pvCountersSection(V){
   sec.append(pvEl('p', { class:'note' },
     'The denominators. Each is its own chart with its own scale — two '
     + 'counters sharing one plot would imply a relationship the numbers do not '
-    + 'have.'));
+    + 'have. The big figure is the mean over the ' + pvWinLabel(W)
+    + '; the sparkline is the whole ring.'));
   const grid = pvEl('div', { class:'pv-spark-grid' });
   for (const k of keys){
     const def = pvCounterDef(k) || { label:k, node:null, bug:false };
     const v = V.counters[k];
+    // THE HEADLINE WAS THE LAST SAMPLE, which is one frame of a counter that
+    // moves every frame — the particle count flickering through four digits is
+    // not a reading, it is noise with a font. Same window as the ms figures it
+    // is there to explain.
+    const w = (W.counters && W.counters[k]) || v;
     const card = pvEl('div', { class:'pv-spark' + (def.bug ? ' bug' : '') });
     card.append(pvEl('div', { class:'pv-spark-head' },
       pvEl('span', { class:'pv-spark-label' }, def.label),
-      pvEl('span', { class:'pv-spark-val' }, pvInt(v[v.length-1]))));
+      pvEl('span', { class:'pv-spark-val' }, pvInt(pvMean(w)))));
     card.append(pvSpark(v, { bug: def.bug }));
+    // Peak stays over the WHOLE ring: a spike is the thing you are looking for
+    // and a windowed peak forgets it a second later. Doubly so for a bug
+    // counter, where the peak is the entire point.
     card.append(pvEl('div', { class:'pv-spark-foot' },
-      'peak ' + pvInt(Math.max(...v)) + ' · mean ' + pvInt(pvMean(v))
+      'peak ' + pvInt(Math.max(...v)) + ' over ' + v.length + ' frames'
       + (def.node ? ' · explains ' + pvNodeLabel(def.node) : '')));
     grid.append(card);
   }
