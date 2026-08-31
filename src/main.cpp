@@ -2003,6 +2003,7 @@ int main(int argc, char** argv) {
   // (src/measure/perfsuite.cpp). Headless, like --measure, and for the same
   // reason: a windowed run measures the compositor as much as the engine.
   bool perf = false;
+  bool renderBudget = false;
   sandvox::PerfOptions perfOpt;
   bool rebaseline = false;  // --rebaseline: write observed values into baseline.json
   bool suiteAcceptance = false;  // --suite acceptance: one-process full acceptance
@@ -2094,7 +2095,9 @@ int main(int argc, char** argv) {
           "  --perf                Performance suite -> build/perf.json (tuner Performance tab)\n"
           "  --perf-list           List the --perf scenarios and exit\n"
           "  --scenario <id>       One --perf scenario (idle|treeburn|flythrough|explosion|water)\n"
-          "  --perf-out <path>     Where --perf writes its JSON\n\n"
+          "  --perf-out <path>     Where --perf writes its JSON\n"
+          "  --perf-w/--perf-h <n> Offscreen render size for --perf/--render-budget\n"
+          "  --render-budget       Where INSIDE the raymarch the GPU frame went\n\n"
           "Residency:\n"
           "  --residency paged|dense  Voxel buffer residency mode (default: paged)\n\n"
           "Vulkan / debug:\n"
@@ -2179,6 +2182,19 @@ int main(int argc, char** argv) {
     else if (a == "--measure") measure = true;
     else if (a == "--perf") perf = true;
     else if (a == "--perf-list") { perf = true; perfOpt.list = true; }
+    // `--render-budget` reuses --perf's scenario cameras and --perf-w/h, so it
+    // shares perfOpt and is dispatched AHEAD of --perf below: `--render-budget
+    // --scenario water` must budget the water camera, not run the water
+    // scenario.
+    else if (a == "--render-budget") renderBudget = true;
+    else if (a == "--perf-w") {
+      if (i + 1 >= argc) { std::fprintf(stderr, "--perf-w requires a width\n"); return 1; }
+      perfOpt.width = (uint32_t)std::atoi(argv[++i]);
+    }
+    else if (a == "--perf-h") {
+      if (i + 1 >= argc) { std::fprintf(stderr, "--perf-h requires a height\n"); return 1; }
+      perfOpt.height = (uint32_t)std::atoi(argv[++i]);
+    }
     else if (a == "--scenario") {
       if (i + 1 >= argc) { std::fprintf(stderr, "--scenario requires a scenario id\n"); return 1; }
       perfOpt.only = argv[++i];
@@ -2620,7 +2636,8 @@ int main(int argc, char** argv) {
   // Timestamps: --measure and --fluid-bench are the only modes that request
   // the TimestampQuery device feature (per-pass GPU timings).
   if (!ctx.Init(window, 1600, 900, lowPowerAdapter,
-                /*wantTimestamps=*/measure || perf || fluidBench || telemetryEnabled,
+                /*wantTimestamps=*/measure || perf || renderBudget || fluidBench ||
+                    telemetryEnabled,
                 backend, vkValidation,
                 sledgehammer))
     return 1;
@@ -2732,6 +2749,8 @@ int main(int argc, char** argv) {
   far.Init(&world);
 
   if (measure) return RunMeasure(ctx, world, sim, mats);
+  if (renderBudget)
+    return sandvox::RunRenderBudget(ctx, world, sim, mats, perfOpt);
   if (perf) return sandvox::RunPerf(ctx, world, sim, mats, perfOpt);
   // The voxel-region modes answer here: after the device, shaders and material
   // table exist (genCell is WGSL and the palette is the COMPILED table), and
@@ -5231,8 +5250,32 @@ int main(int argc, char** argv) {
     if (ui.paused) accumulator = std::min(accumulator, (double)kTickDt);
 
     // ---- render ----
-    double tRender0 = NowSeconds();
+    //
+    // ACQUIREFRAME IS A WAIT, NOT WORK, AND IT IS BILLED AS ONE.
+    //
+    // ctx.AcquireFrame() blocks twice before it returns anything: on the fence
+    // of the submit that last used this acquire slot (rhi_vulkan.cpp,
+    // AcquireSwapchainImage), and then inside vkAcquireNextImageKHR with an
+    // infinite timeout — and the swapchain is VK_PRESENT_MODE_FIFO_KHR, so that
+    // second block IS vsync. Neither is the CPU doing anything.
+    //
+    // Both used to land inside PerfScope::RenderCpu, because tRender0 was taken
+    // on the line above the acquire. The Performance tab then reported ~18.9 ms
+    // of "render-pass encode: draw calls, instance buffers, overlay" on a frame
+    // whose actual encode is ~0.07 ms, and read as CPU-bound while the machine
+    // was 100% GPU-bound. It is the same trap as the free-probe stall and the
+    // "39.5 ms readback" that was two thirds genChunk: a fence tells you HOW
+    // MUCH you waited, never WHAT you waited for, so it must be charged to the
+    // thing that made you wait.
+    //
+    // So the wait goes to `present`, which is where perfnodes.h already says it
+    // belongs ("AcquireFrame + Present. Under vsync this row IS the wait") and
+    // where the offscreen --perf harness has always put its own frame-in-flight
+    // throttle. Live telemetry and the harness now agree, which is the property
+    // that makes a number measured in one comparable to the other.
+    double tAcquire0 = NowSeconds();
     rhi::TextureView target = ctx.AcquireFrame();
+    double tRender0 = NowSeconds();
     if (target) {
       // ViewEyePos, not EyePos: the render camera rides the step-smoothing
       // offset so voxel steps glide instead of popping. Everything that can
@@ -6253,13 +6296,21 @@ int main(int argc, char** argv) {
       if (liveRenderTimed) liveRenderTimer.KickDeferred(ctx, liveFrameNo);
       if (telemetry.HasClient()) {
         using sandvox::PerfScope;
+        // Encode only — the acquire wait above is not in this span.
         liveSample.cpuMs[(int)PerfScope::RenderCpu] +=
             (tPresent0 - tRender0) * 1000.0;
+        // The swapchain wait (AcquireFrame) plus the present itself. Under FIFO
+        // this is the whole vsync/GPU-completion stall and is normally the
+        // largest CPU row on the page; that is the frame finishing early, not
+        // the CPU being busy.
         liveSample.cpuMs[(int)PerfScope::Present] +=
-            (NowSeconds() - tPresent0) * 1000.0;
+            ((tRender0 - tAcquire0) + (NowSeconds() - tPresent0)) * 1000.0;
       }
     }
-    if (g_harnessFrames > 0) g_harnessRenderMs += (NowSeconds() - tRender0) * 1000.0;
+    // tAcquire0, not tRender0: this harness number has always been "acquire +
+    // encode + present", and the scope split above must not silently redefine
+    // it into encode-only.
+    if (g_harnessFrames > 0) g_harnessRenderMs += (NowSeconds() - tAcquire0) * 1000.0;
     ctx.ProcessEvents();  // pumps MapAsync callbacks (mirror updates)
     telemetry.Poll();
 

@@ -175,9 +175,11 @@ inline constexpr PerfNodeDef kPerfNodes[] = {
      PerfScope::Count, "",
      "The whole render pass, measured as one GPU span. Usually the largest "
      "single number on this page, and the one resolution scales."},
-    {"uiOverlay", "UI Overlay", "renderPass", PerfSide::Cpu, PerfScope::Present,
+    {"uiOverlay", "Swapchain wait", "renderPass", PerfSide::Cpu,
+     PerfScope::Present,
      "", "AcquireFrame + Present. Under vsync this row IS the wait, so a large "
-     "value here means the frame finished early."},
+     "value here means the CPU had nothing left to do — read the GPU bars, not "
+     "this one, to find the frame's real cost."},
 
     // ---- game systems (CPU) ----
     {"gameSystems", "Game Systems", nullptr, PerfSide::Cpu, PerfScope::GameLogic,

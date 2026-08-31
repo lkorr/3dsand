@@ -19,6 +19,7 @@
 #include "gpu/resources.h"
 #include "math3d.h"
 #include "measure/perfnodes.h"
+#include "sim/celestial.h"
 #include "sim/materials.h"
 #include "sim/pagetable.h"
 #include "sim/simulation.h"
@@ -1316,12 +1317,491 @@ Run PerfRunner::Record(const Scenario& sc) {
   return r;
 }
 
+// ---------------------------------------------------------------------------
+// --render-budget: WHERE INSIDE THE RAYMARCH THE FRAME WENT.
+//
+// WHY THIS EXISTS. `--perf` reports the render pass as ONE number — `raymarch`,
+// which on the idle scenario is 16.6 ms of a 16.6 ms GPU frame. That is a bare
+// count in exactly the sense CLAUDE.md's rule 6 means it: it says the frame is
+// the raymarch and stops, and the only way forward from it is to start turning
+// features off one at a time, one binary invocation per hypothesis, which is
+// the sequence that rule names as indefensible.
+//
+// So this is the attribution instead. ONE process, ONE world, ONE camera, and
+// an ARM per suspected cost centre — each arm renders the identical frame with
+// exactly one knob moved and reports its own GPU span. The delta from baseline
+// is that feature's cost, and the whole table lands in one run.
+//
+// WHAT AN ARM'S NUMBER IS AND IS NOT. `noshadow` minus `baseline` is the cost
+// of the shadow ray. It is NOT a proposal to ship without shadows — an arm is a
+// measurement, not a setting, and several of them (nofar, primary256) would be
+// visibly wrong to play with. Read the column as "this many ms are spent here",
+// then decide separately whether that work can be made cheaper or skipped.
+//
+// EVERY ARM RENDERS THE SAME WORLD STATE. The world is generated and settled
+// ONCE, before the first arm, and no arm ticks the sim — a re-settle between
+// arms would put different voxels in front of the camera and every delta would
+// be measuring terrain instead of the knob. That also makes the run cheap: the
+// ~10 s setup is paid once rather than per arm.
+//
+// A RECOMPILE IS NOT A CONFOUND. Most knobs here are TUNE_* WGSL constants, so
+// an arm has to reload the shaders (the F5 path) to take effect. The reload
+// happens BEFORE the arm's warmup frames and is not inside the timed span; the
+// GPU timestamps bracket the render pass itself.
+// ---------------------------------------------------------------------------
+// RenderParams.time — the ANIMATION clock (waves, flicker, sway), NOT the time
+// of day. That trap cost a run: `time` looks like an hour-of-day parameter and
+// --shot passes 11.7 to it, but WriteRenderParams derives the sun and moons
+// from Celestial().RenderTickInterp(TICK, ...) and ignores `time` entirely for
+// lighting. Setting it to "midday" produced a starfield. The time of day is
+// chosen by kNoonTick below, which is a real search over the celestial cycle.
+constexpr float kBudgetAnimTime = 11.7f;
+
+// The celestial tick whose sky has the sun highest, found by scanning the cycle
+// rather than hardcoded: cycleMinutes is a tuning value, so any constant here
+// would silently become the wrong time of day the first time it moved.
+//
+// WHY DAYLIGHT MATTERS TO A RENDER BUDGET AT ALL: sunShadowAt is gated on
+// `lambert > 0.0`, so at night the key light is the moon, most of the frame
+// fails that test, and the largest row in this table is measured on the pixels
+// that would NOT cast it in a real session. Budget under the lighting the game
+// is played in.
+uint32_t FindNoonTick(const Tuning& tun) {
+  uint32_t best = 0;
+  float bestUp = -2.0f;
+  // Coarse scan over a generous superset of any authored cycle length; the sun
+  // elevation is smooth, so step 64 cannot miss the peak by anything that
+  // matters to a lighting condition.
+  for (uint32_t t = 0; t < 200000u; t += 64u) {
+    const float up = ComputeSky(tun, (double)t).sunDir[1];
+    if (up > bestUp) { bestUp = up; best = t; }
+  }
+  return best;
+}
+
+struct RenderArm {
+  const char* id;
+  const char* label;      // what moved, in the units the knob is written in
+  // Mutates a COPY of the baseline tuning. nullptr = leave tuning alone.
+  void (*apply)(Tuning& t);
+  bool shadows;           // the RenderParams shadow bit for this arm
+  uint32_t widthDiv;      // 1 = full res, 2 = half res in each axis
+  const char* means;      // what the delta from baseline is the cost OF
+};
+
+const RenderArm kRenderArms[] = {
+    {"baseline", "everything on", nullptr, true, 1,
+     "the frame as it ships — every other row is a delta from this"},
+
+    // The shadow ray is a SECOND FULL trace() per lit pixel (sunShadowAt), and
+    // with shadowMaxDist at 999 m nothing in a 512-voxel window ever reaches
+    // the cheap cascade path, so every one of them is a fine march.
+    {"noshadow", "sun shadows off (RenderParams bit)", nullptr, false, 1,
+     "the shadow ray's TRAVERSAL — the call site stays in the shader"},
+    // THE PAIR THAT SEPARATES WORK FROM FOOTPRINT, and the reason both halves
+    // are here. `noshadow` turns the shadow ray off through a RenderParams bit,
+    // at RUNTIME: the branch is not taken, but the inlined trace() is still in
+    // the compiled shader and still owns its registers. `shadow0` turns it off
+    // through a WGSL const, at COMPILE time, so the whole call can be folded
+    // away. The difference between the two is not traversal — no ray is cast in
+    // either — it is the OCCUPANCY TAX of that call site existing at all.
+    {"shadow0", "shadowSteps 384 -> 0 (const-folded away)",
+     [](Tuning& t) { t.render.shadowSteps = 0; }, true, 1,
+     "traversal PLUS the register footprint of the shadow call site"},
+    {"shadow64", "shadowSteps 384 -> 64",
+     [](Tuning& t) { t.render.shadowSteps = 64; }, true, 1,
+     "how DEEP the shadow march runs past 64 steps before it finds a blocker"},
+    {"shadow16", "shadowSteps 384 -> 16",
+     [](Tuning& t) { t.render.shadowSteps = 16; }, true, 1,
+     "the same, past 16 — with shadow64 this brackets the march's real depth"},
+
+    // The primary ray. 4096 steps is a budget, not a cost: the DDA breaks on
+    // the first blocker. Clamping it says how far the average ray actually got.
+    {"primary256", "primarySteps 4096 -> 256",
+     [](Tuning& t) { t.render.primarySteps = 256; }, true, 1,
+     "primary DDA steps past 256 — near zero here means rays terminate early"},
+
+    // In-window LOD. Everything nearer than lodHandoffDist marches at full 10 cm
+    // resolution; past it the cascade takes over.
+    {"lod8", "lodHandoffDist 24 -> 8 m",
+     [](Tuning& t) { t.render.lodHandoffDist = 8.0f; }, true, 1,
+     "fine marching between 8 m and 24 m that the cascade could have covered"},
+
+    {"nofar", "farSteps 384 -> 0",
+     [](Tuning& t) { t.render.farSteps = 0; }, true, 1,
+     "the far-field cascade march for rays that leave the fine window"},
+
+    {"nomicro", "microMaxPerRay 8 -> 0",
+     [](Tuning& t) { t.render.microMaxPerRay = 0; }, true, 1,
+     "micro-brick traversal: grass strands, petals, tufts"},
+
+    {"noreflect", "reflectionSteps 96 -> 0",
+     [](Tuning& t) { t.render.reflectionSteps = 0; }, true, 1,
+     "secondary reflection rays off water and ice"},
+    // The Fresnel gate, not the step budget: this stops traceReflection from
+    // being CALLED at the three water sites (it does not gate ice, which has
+    // its own iceReflectMin). Against `noreflect` it separates "the reflection
+    // ray is expensive" from "the reflection ray fires on far more pixels than
+    // it should".
+    // The same work/footprint pair as noshadow vs shadow0, for reflections.
+    // These three constants gate every traceReflection() call site there is
+    // (water x2, MPM surface, and ice, which has its own threshold), so no
+    // reflection ray can be cast — but reflectionSteps is unchanged, so the
+    // inlined trace() inside traceReflection is still compiled in. Against
+    // `noreflect` this is the entire difference between casting the ray and
+    // merely being able to.
+    {"reflgate", "all reflection call sites gated off (steps unchanged)",
+     [](Tuning& t) {
+       t.render.reflectionCutoff = 1.0f;
+       t.render.iceReflectMin = 2.0f;
+       t.render.fluidReflect = 0.0f;
+     },
+     true, 1, "reflection ray TRAVERSAL only, with the code still resident"},
+    {"shadow32", "shadowSteps 384 -> 32",
+     [](Tuning& t) { t.render.shadowSteps = 32; }, true, 1,
+     "shadow march past 32 steps"},
+
+    // Not a feature — the denominator. If the frame halves in cost at a quarter
+    // of the pixels it is per-pixel ray work, and the fix is fewer rays or
+    // cheaper ones; if it does not, something fixed-cost dominates.
+    {"halfres", "render 960x540 instead of 1920x1080", nullptr, true, 2,
+     "pixel-linearity: a 4x pixel cut should be a ~4x time cut"},
+};
+constexpr int kRenderArmCount =
+    (int)(sizeof(kRenderArms) / sizeof(kRenderArms[0]));
+
+// One arm's measured result.
+struct ArmResult {
+  const RenderArm* arm = nullptr;
+  double gpuP50 = 0, gpuP95 = 0;
+  int frames = 0;
+  bool ok = false;
+  std::string why;
+};
+
+class RenderBudgetRunner {
+ public:
+  RenderBudgetRunner(GpuContext& ctx, World& world, Simulation& sim,
+                     Stream& stream, const PerfOptions& opt)
+      : ctx_(ctx), world_(world), sim_(sim), stream_(stream), opt_(opt) {}
+
+  bool Init() {
+    haveTimer_ = timer_.Init(ctx_, 2);
+    if (!pacer_.Init(ctx_)) return false;
+    for (int i = 0; i < 2; i++) {
+      const uint32_t d = i == 0 ? 1u : 2u;
+      tex_[i] = ctx_.device.CreateTexture(
+          {opt_.width / d, opt_.height / d, 1}, rhi::TextureFormat::RGBA8Unorm,
+          rhi::TextureUsage::RenderAttachment | rhi::TextureUsage::CopySrc,
+          "renderBudgetTarget");
+      if (!tex_[i]) return false;
+      view_[i] = tex_[i].CreateView();
+    }
+    return haveTimer_;
+  }
+
+  // Generate + settle the world ONCE. Every arm renders this exact state.
+  void SettleWorld() {
+    stream_.OnRegen();
+    SubmitWorldgen(ctx_, world_, sim_, kDefaultSeed);
+    ctx_.WaitIdle();
+    for (uint32_t t = 1; t <= 300; t++)
+      SubmitTick(ctx_, world_, sim_, t, kDefaultSeed, {}, {}, {}, t % 15 == 0,
+                 {8, 3, 8}, false, false);
+    ctx_.WaitIdle();
+  }
+
+  ArmResult Measure(const RenderArm& arm, const Tuning& base, const Scene& s,
+                    uint32_t warm, uint32_t frames) {
+    ArmResult res;
+    res.arm = &arm;
+
+    // Apply the arm to a COPY of the baseline, then take the F5 path so the
+    // TUNE_* constants are re-const-folded into the shader.
+    Tuning t = base;
+    if (arm.apply) {
+      arm.apply(t);
+      SetCurrentTuning(t);
+      if (!sim_.ReloadShaders(ctx_.device)) {
+        SetCurrentTuning(base);
+        sim_.ReloadShaders(ctx_.device);
+        res.why = "shader reload failed";
+        return res;
+      }
+    } else {
+      SetCurrentTuning(t);
+    }
+
+    const uint32_t d = arm.widthDiv;
+    const uint32_t W = opt_.width / d, H = opt_.height / d;
+    const rhi::TextureView& view = view_[d == 1 ? 0 : 1];
+
+    std::vector<double> ms;
+    timer_.ResetStats();
+    for (uint32_t f = 0; f < warm + frames; f++) {
+      // The camera and the frame index are FIXED across arms. `frame` feeds
+      // the dither key and every animated term (waves, flicker, sway); letting
+      // it advance would make each arm a slightly different picture and put
+      // that difference into the delta.
+      // MIDDAY (11.7), not the 0.0 the --perf harness passes. Time of day is
+      // not cosmetic here: at night keyLightDir is the moon, `lambert > 0.0`
+      // rejects most of the frame, and the shadow ray — the single largest row
+      // in this table — is never cast on the pixels that would cast it in a
+      // real session. A budget must be taken under the lighting the game is
+      // actually played in.
+      WriteRenderParams(ctx_.queue, world_, s.eye, s.cam, (float)W / (float)H,
+                        arm.shadows, kBudgetAnimTime, kFarFogDensity, (float)H,
+                        noonTick_, s.fluidLive);
+      rhi::CommandEncoder enc = ctx_.device.CreateCommandEncoder();
+      uint32_t rb = 0, re = 0;
+      const bool timed = timer_.AllocPassPair("render", rb, re);
+      if (timed) enc.WriteTimestamp(timer_.NativeQuerySet(), rb, false);
+      {
+        rhi::RenderPass rp = sim_.BeginRenderPass(
+            enc, view, rhi::TextureFormat::RGBA8Unorm, W, H);
+        sim_.DrawWorld(rp);
+        rp.End();
+      }
+      if (timed) enc.WriteTimestamp(timer_.NativeQuerySet(), re, true);
+      timer_.EncodeResolve(enc);
+      pacer_.Mark(enc);
+      ctx_.queue.Submit(enc.Finish());
+      timer_.KickDeferred(ctx_, f);
+      pacer_.Throttle(ctx_);
+      ctx_.ProcessEvents();
+      if (timer_.PollDeferred(ctx_) > 0) {
+        const uint32_t tag = timer_.LastFrameTag();
+        if (tag >= warm)
+          for (const PassSample& ps : timer_.LastFrame())
+            ms.push_back((double)ps.ns / 1e6);
+      }
+    }
+    pacer_.Drain();
+    ctx_.WaitIdle();
+    for (int drain = 0; drain < 8; drain++) {
+      ctx_.ProcessEvents();
+      if (timer_.PollDeferred(ctx_) > 0 && timer_.LastFrameTag() >= warm)
+        for (const PassSample& ps : timer_.LastFrame())
+          ms.push_back((double)ps.ns / 1e6);
+    }
+
+    if (ms.empty()) {
+      res.why = "no GPU timestamps landed";
+      return res;
+    }
+    res.gpuP50 = Percentile(ms, 0.50);
+    res.gpuP95 = Percentile(ms, 0.95);
+    res.frames = (int)ms.size();
+    res.ok = true;
+    return res;
+  }
+
+  // SHOW WHAT WAS MEASURED.
+  //
+  // Every row of the table above is a property of ONE PICTURE, and "reflections
+  // are 28% of the frame" means something completely different depending on
+  // whether that picture is a lake or a hillside. A budget printed without the
+  // frame beside it invites exactly the misreading the table exists to prevent,
+  // so the run writes the baseline frame out and says what it summed to — an
+  // all-black render is a plausible way for these numbers to be nonsense, and
+  // "wrote the file" would not catch it.
+  //
+  // Own encoder, submitted after the render has retired: a copy folded into the
+  // render encoder reads back zeros.
+  void Shot(const Scene& s, const char* path) {
+    const uint32_t W = opt_.width, H = opt_.height;
+    WriteRenderParams(ctx_.queue, world_, s.eye, s.cam, (float)W / (float)H,
+                      /*shadows=*/true, kBudgetAnimTime, kFarFogDensity,
+                      (float)H, noonTick_, s.fluidLive);
+    rhi::CommandEncoder enc = ctx_.device.CreateCommandEncoder();
+    {
+      rhi::RenderPass rp = sim_.BeginRenderPass(
+          enc, view_[0], rhi::TextureFormat::RGBA8Unorm, W, H);
+      sim_.DrawWorld(rp);
+      rp.End();
+    }
+    ctx_.queue.Submit(enc.Finish());
+    ctx_.WaitIdle();
+
+    rhi::Buffer buf = CreateBuffer(
+        ctx_.device, (uint64_t)W * H * 4,
+        rhi::BufferUsage::MapRead | rhi::BufferUsage::CopyDst, "budgetShot");
+    rhi::CommandEncoder cenc = ctx_.device.CreateCommandEncoder();
+    rhi::TexelCopyTexture src{};
+    src.texture = tex_[0];
+    rhi::TexelCopyBuffer dst{};
+    dst.buffer = buf;
+    dst.bytesPerRow = W * 4;
+    dst.rowsPerImage = H;
+    cenc.CopyTextureToBuffer(src, dst, {W, H, 1});
+    ctx_.queue.Submit(cenc.Finish());
+    ctx_.WaitIdle();
+
+    std::vector<uint8_t> px((size_t)W * H * 4, 0);
+    if (!rhi::ReadBufferBlocking(ctx_.device, buf, 0, px.data(), px.size()))
+      return;
+    uint64_t sum = 0;
+    for (uint8_t b : px) sum += b;
+    if (WriteBmpFile(path, px, W, H))
+      std::printf("  frame written to %s (pixel sum %llu%s)\n", path,
+                  (unsigned long long)sum,
+                  sum == 0 ? " *** ALL BLACK — the table above is not of "
+                             "anything ***" : "");
+  }
+
+ private:
+  GpuContext& ctx_;
+  World& world_;
+  Simulation& sim_;
+  Stream& stream_;
+  const PerfOptions& opt_;
+  PassTimer timer_;
+  bool haveTimer_ = false;
+  rhi::Texture tex_[2];
+  rhi::TextureView view_[2];
+  FramePacer pacer_;
+ public:
+  // Fixed across every arm: the frame each arm renders must be the SAME frame,
+  // and this is the tick the sky is derived from.
+  uint32_t noonTick_ = 0;
+};
+
 }  // namespace
+
+int RunRenderBudget(GpuContext& ctx, World& world, Simulation& sim,
+                    const std::vector<MaterialDef>& mats,
+                    const PerfOptions& opt) {
+  std::printf("=== sandvox --render-budget: where inside the raymarch ===\n");
+  std::printf("adapter: %s\n", ctx.DeviceName().c_str());
+  if (!ctx.timestampsEnabled) {
+    std::fprintf(stderr,
+                 "--render-budget: this device has no GPU timestamps. Every "
+                 "number would be zero. Refusing.\n");
+    return 1;
+  }
+
+  // Which camera. `--scenario <id>` borrows any --perf scenario's viewpoint;
+  // with no scenario named, this uses its OWN overlook (below) rather than
+  // `idle`'s.
+  //
+  // WHY NOT JUST USE `idle`. Because `idle` is not a view of the world. Its eye
+  // sits 18 VOXELS — 1.8 m — above the terrain height at (256, 256), which in
+  // this seed puts it hard against a rock face: the frame it renders is ~70% a
+  // wall two metres away, a strip of grass, and a sliver of sky. That is a fine
+  // scenario for --perf, whose job is a repeatable frame, and a bad one for
+  // attribution, because a camera that sees no water reports the reflection
+  // budget of a world with no water in it and a camera whose rays all terminate
+  // in 20 voxels reports that the primary march is free.
+  //
+  // The screenshot at the end of this run exists because that misreading is
+  // otherwise undetectable from the table.
+  const Scenario* pick = nullptr;
+  if (!opt.only.empty()) {
+    for (const Scenario& s : kScenarios)
+      if (opt.only == s.id) { pick = &s; break; }
+    if (!pick) {
+      std::fprintf(stderr, "--render-budget: no scenario named '%s'\n",
+                   opt.only.c_str());
+      return 1;
+    }
+  }
+
+  Stream stream;
+  stream.Init(&ctx, &world, &sim, kDefaultSeed);
+  stream.OnMaterialsReloaded(mats);
+
+  RenderBudgetRunner runner(ctx, world, sim, stream, opt);
+  if (!runner.Init()) {
+    std::fprintf(stderr, "--render-budget: could not set up the render target "
+                         "or the timer\n");
+    return 1;
+  }
+  runner.SettleWorld();
+
+  Scene scene{ctx, world, sim, stream, mats};
+  if (pick) {
+    std::string why;
+    if (!pick->setup(scene, why)) {
+      std::fprintf(stderr, "--render-budget: scenario '%s' declined: %s\n",
+                   pick->id, why.c_str());
+      return 1;
+    }
+  } else {
+    // THE OVERLOOK. High enough to clear the terrain it stands on, pitched down
+    // far enough that the frame is roughly a third near ground, a third middle
+    // distance and a third horizon-and-sky. That mix is the point: it exercises
+    // the fine march, the in-window LOD handoff, the far cascade and the sky
+    // path in one frame, in something like the proportion a player standing on
+    // a hillside sees. A camera that sees only one of those reports a budget
+    // for one of those.
+    const int gx = 256, gz = 256;
+    const int h = World::TerrainHeight(gx, gz, kDefaultSeed);
+    scene.eye = {(float)gx, (float)(h + 120), (float)gz};
+    scene.cam.yaw = 0.785f;
+    scene.cam.pitch = -0.32f;
+    scene.note = "overlook: 12 m up, pitched into the middle distance";
+  }
+  std::printf("camera: %s — %s\n", pick ? pick->id : "overlook",
+              scene.note.c_str());
+  runner.noonTick_ = FindNoonTick(CurrentTuning());
+  std::printf("        eye (%.0f, %.0f, %.0f)  yaw %.2f  pitch %.2f\n",
+              scene.eye.x, scene.eye.y, scene.eye.z, scene.cam.yaw,
+              scene.cam.pitch);
+  std::printf("        sky at celestial tick %u — sun elevation %+.2f, the "
+              "highest in the cycle\n",
+              runner.noonTick_,
+              ComputeSky(CurrentTuning(), (double)runner.noonTick_).sunDir[1]);
+  std::printf("render: %ux%u   arms: %d   (one settled world, one camera, "
+              "one knob moved per arm)\n\n",
+              opt.width, opt.height, kRenderArmCount);
+
+  // The tuning every arm is a delta FROM. Restored after each arm, and again at
+  // the end, so nothing here leaks into a later harness in the same process.
+  const Tuning base = CurrentTuning();
+
+  std::vector<ArmResult> out;
+  for (const RenderArm& arm : kRenderArms) {
+    ArmResult r = runner.Measure(arm, base, scene, /*warm=*/12, /*frames=*/48);
+    std::printf("  %-11s %-42s ", arm.id, arm.label);
+    if (!r.ok) std::printf("SKIPPED — %s\n", r.why.c_str());
+    else std::printf("%7.2f ms\n", r.gpuP50);
+    std::fflush(stdout);
+    out.push_back(r);
+  }
+  SetCurrentTuning(base);
+  sim.ReloadShaders(ctx.device);
+  runner.Shot(scene, "build/render_budget.bmp");
+
+  // ---- the table the run exists to print --------------------------------
+  const double b = out.empty() || !out[0].ok ? 0.0 : out[0].gpuP50;
+  std::printf("\n  baseline raymarch: %.2f ms at %ux%u\n\n", b, opt.width,
+              opt.height);
+  std::printf("  %-11s %9s %9s  %s\n", "arm", "ms", "saved", "what the saving is the cost of");
+  std::printf("  %-11s %9s %9s  %s\n", "---", "--", "-----", "------------------------------");
+  for (const ArmResult& r : out) {
+    if (!r.ok) { std::printf("  %-11s   SKIPPED  %s\n", r.arm->id, r.why.c_str()); continue; }
+    if (r.arm == &kRenderArms[0]) continue;
+    const double saved = b - r.gpuP50;
+    std::printf("  %-11s %9.2f %8.2f%s  %s\n", r.arm->id, r.gpuP50, saved,
+                b > 0 ? "" : " ", r.arm->means);
+  }
+  std::printf("\n  percentages of the %.2f ms baseline:\n", b);
+  for (const ArmResult& r : out) {
+    if (!r.ok || r.arm == &kRenderArms[0] || b <= 0) continue;
+    std::printf("    %-11s %5.1f%%\n", r.arm->id, 100.0 * (b - r.gpuP50) / b);
+  }
+  std::printf(
+      "\n  An arm is a MEASUREMENT, not a setting: `nofar` and `primary256` "
+      "render\n  a visibly wrong world. Read each row as \"this many ms are "
+      "spent here\".\n");
+  return ctx.ReportVkValidation("--render-budget") > 0 ? 1 : 0;
+}
+
+namespace {
 
 // ---------------------------------------------------------------------------
 // JSON emission
 // ---------------------------------------------------------------------------
-namespace {
 
 // Series are emitted as flat arrays rather than an array of objects: a 900-row
 // scenario with 13 CPU scopes and 25 nodes is ~35k numbers, and the object form

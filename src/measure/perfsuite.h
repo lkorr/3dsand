@@ -64,4 +64,21 @@ struct PerfOptions {
 int RunPerf(GpuContext& ctx, World& world, Simulation& sim,
             const std::vector<MaterialDef>& mats, const PerfOptions& opt);
 
+// `--render-budget`: the raymarch's OWN breakdown.
+//
+// --perf answers "where did my frame go" and, when the answer is "the render
+// pass", stops — `raymarch` is one GPU span with nothing inside it. This is the
+// next question: WHERE inside it. One settled world, one camera, one arm per
+// suspected cost centre, each rendering the identical frame with exactly one
+// knob moved, all in a single process. The delta from the baseline arm is that
+// feature's cost.
+//
+// It exists so that diagnosing the render never becomes the feature-by-feature
+// elimination sequence CLAUDE.md's rule 6 forbids: the whole table is one run.
+// `opt.only` picks the camera (any --perf scenario id, default `idle`);
+// `opt.width/height` set the resolution. Prints a table; writes no JSON.
+int RunRenderBudget(GpuContext& ctx, World& world, Simulation& sim,
+                    const std::vector<MaterialDef>& mats,
+                    const PerfOptions& opt);
+
 }  // namespace sandvox
