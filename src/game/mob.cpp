@@ -2271,8 +2271,25 @@ void Mob::RegisterTerrainAnchor() {
   // once and World::Cached returns that first copy forever.
   if (!debris_ || !def_) return;
   const Vec3 ws = def_->worldSize;
-  const float r =
-      0.5f * std::sqrt(ws.x * ws.x + ws.y * ws.y + ws.z * ws.z);
+  float r = 0.5f * std::sqrt(ws.x * ws.x + ws.y * ws.y + ws.z * ws.z);
+  // A NAVIGATING CREATURE MUST SEE AS FAR AS IT PLANS.
+  //
+  // The anchor is the only thing that keeps chunks in the CPU mirror, and a
+  // body-sized one covers about twelve voxels — so an A* search with a 30-voxel
+  // horizon asked about columns nothing had fetched, got UNKNOWN, and (rule 1
+  // of ai_nav.h, correctly) treated them as open. It then planned a beautiful
+  // straight line through a solid wall, walked into it, and stood there: the
+  // drive's own probe DOES reach the wall, so the mob was vetoed by geometry
+  // its planner could not see. Measured — waypoint 27 voxels dead ahead through
+  // a 31-column stone fence, frozen for 300 ticks.
+  //
+  // Widened only while the creature actually has a target (rule 2: cost scales
+  // with activity). An idle or unaware mob pays exactly what it always did.
+  if (ai_.profile >= 0 && ai_.hasTarget && sys_ != nullptr) {
+    const ai::Profile* pr = sys_->Behaviors().At(ai_.profile);
+    if (pr != nullptr && pr->movement.mobile)
+      r = std::max(r, pr->movement.navRadius + 4.0f);
+  }
   debris_->AddTerrainAnchor(
       origin_ + Vec3{ws.x * 0.5f, ws.y * 0.5f, ws.z * 0.5f}, r);
 }

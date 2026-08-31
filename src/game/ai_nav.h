@@ -61,11 +61,24 @@ struct NavPath {
   std::vector<Vec3> pts;
   size_t cursor = 0;
   bool valid = false;
+  // WHAT THE PLANNER COULD SEE, from the last search. Not decoration: a route
+  // that walks into solid rock and a route that walks into space the mirror
+  // never fetched are the same picture from outside and completely different
+  // bugs, and the second one is the common one here — the CPU mirror is small
+  // and unknown reads as open by design. `unknown` climbing with the search
+  // radius means the terrain anchor is not keeping up with the horizon.
+  // `colsSteep` counts columns whose ground stands more than one step above
+  // the start — i.e. the columns a WALL is made of. A wall is not `blocked`
+  // (that word is reserved for a column with no standing room); it is a column
+  // the step rule refuses, and conflating the two hides exactly the case this
+  // planner exists for.
+  uint32_t colsProbed = 0, colsUnknown = 0, colsBlocked = 0, colsSteep = 0;
 
   void Clear() {
     pts.clear();
     cursor = 0;
     valid = false;
+    colsProbed = colsUnknown = colsBlocked = colsSteep = 0;
   }
   bool Done() const { return !valid || cursor >= pts.size(); }
   const Vec3& Current() const { return pts[cursor]; }
@@ -103,9 +116,23 @@ struct NavParams {
   // unknown and therefore (rule 1) as walkable at the inherited height. For
   // local combat nav a band of roughly +-12 voxels is the whole fight.
   int probeUp = 12;
-  int maxNodes = 1200;    // expansion budget; the hard bound on one search
-  float dropPenalty = 0.35f;  // extra cost per voxel of fall, so paths prefer flat
-  float climbPenalty = 0.5f;  // ...and per voxel of climb, which costs more
+  // Expansion budget: the hard bound on one search. It has to be able to reach
+  // AROUND the grid, not merely across it — routing past a wall that spans most
+  // of the local view means sweeping the region beside it, and a budget sized
+  // for the straight-line case makes the planner give up on exactly the
+  // obstacle it exists for. `FindPath` raises this to the grid's own cell count
+  // when the caller asks for less.
+  int maxNodes = 4000;
+  // Extra cost per voxel of fall and of climb. Climbing is expensive on
+  // purpose, and much more so than it first looks worth: a pile of rubble is
+  // usually a sequence of legal single-voxel steps, so a cheap climb lets the
+  // search go straight over an obstacle that the DRIVE — which vetoes on a
+  // probe several voxels ahead rather than one column at a time — will then
+  // refuse to walk. When the two disagree the mob stands at the foot of the
+  // pile. Making the flat detour competitive is the cheap half of keeping them
+  // agreed; the other half is not authoring cliffs the planner can ramp up.
+  float dropPenalty = 1.0f;
+  float climbPenalty = 4.0f;
 };
 
 // Plan from `fromVox` to `toVox` (world voxels; only X/Z are used to pick

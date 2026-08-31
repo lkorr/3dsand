@@ -242,6 +242,10 @@ bool FindPath(const NavProbe& probe, const NavParams& p, Vec3 fromVox,
   s.f[startIdx] = Heuristic(gxGoal - gxStart, gzGoal - gzStart);
   HeapPush(s, startIdx);
 
+  // Never less than the grid holds: a budget below the cell count cannot
+  // express "search the whole neighbourhood", and the failure it produces is
+  // indistinguishable from "there is no way through".
+  const int nodeBudget = std::max(p.maxNodes, s.side * s.side);
   int expanded = 0;
   bool reached = false;
   while (!s.heap.empty()) {
@@ -252,7 +256,7 @@ bool FindPath(const NavProbe& probe, const NavParams& p, Vec3 fromVox,
       reached = true;
       break;
     }
-    if (++expanded > p.maxNodes) break;
+    if (++expanded > nodeBudget) break;
 
     const int cgx = cur % s.side, cgz = cur / s.side;
     const int cy = (int)s.colY[cur];
@@ -290,6 +294,16 @@ bool FindPath(const NavProbe& probe, const NavParams& p, Vec3 fromVox,
       s.f[ni] = ng + Heuristic(gxGoal - ngx, gzGoal - ngz);
       HeapPush(s, ni);
     }
+  }
+
+  // Census of what the search actually saw, whether or not it succeeded.
+  for (size_t i = 0; i < s.kind.size(); i++) {
+    const uint8_t k = s.kind[i];
+    if (k == kUnprobed) continue;
+    out.colsProbed++;
+    if (k == kUnknownCol) out.colsUnknown++;
+    else if (k == kBlockedCol) out.colsBlocked++;
+    else if ((int)s.colY[i] - startHeight > p.maxStepUp) out.colsSteep++;
   }
 
   if (!reached) return false;

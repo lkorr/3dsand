@@ -379,6 +379,16 @@ struct Brain {
   uint32_t nextRepathTick = 0;
   Vec3 pathTarget{};             // the goal the live path was planned for
   bool navFailed = false;        // last plan failed; steering direct
+  // How many A* searches this creature has actually run. A DIAGNOSTIC, and a
+  // load-bearing one: a replan count that climbs with the cadence rather than
+  // with the number of obstacles means the planner is re-deciding a symmetric
+  // route every few ticks, which reads as a mob dithering in place.
+  uint32_t replans = 0;
+  // Progress along the CURRENT waypoint, and how long there has been none. A
+  // path is retired by being walked or by stalling, never by the agent drifting
+  // off the straight line it was planned along — see UpdatePath.
+  float lastWaypointDist = 1e9f;
+  uint32_t stuckTicks = 0;
 
   void Reset() {
     *this = Brain{profile};

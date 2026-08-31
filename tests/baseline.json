@@ -49,7 +49,7 @@
   "aiFaceToleranceRad": "0.12",
   "aiFaceMaxDriftVox": "0.001",
   "aiApproachGapVox": "30",
-  "aiApproachTicks": "400",
+  "aiApproachTicks": "600",
   "aiApproachHoldTicks": "240",
   "aiApproachBandTolVox": "2.5",
   "aiApproachMinClearVox": "3.0",

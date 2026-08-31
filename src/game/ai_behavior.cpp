@@ -79,7 +79,12 @@ float Deflect(float want, float selfHeading, const GroundView& g) {
       bestOff = cost;
     }
   }
-  if (best < 0) return want;   // boxed in: keep asking, the drive refuses anyway
+  // Boxed in on every probe. Reversing is the legacy wander's answer and it is
+  // the right one here too: returning `want` leaves the mob asking for a
+  // heading the drive will veto, which is a creature standing still against a
+  // rock forever rather than a creature that backed out of a dead end. Still a
+  // desired heading, so the turn rate applies and it pivots.
+  if (best < 0) return selfHeading + kPi;
   float off = (kTau * (float)best) / (float)GroundView::kProbes;
   if (off > kPi) off -= kTau;
   return selfHeading + off * 0.6f;
@@ -462,36 +467,82 @@ void UpdatePath(Brain& b, const Profile& pr, const SelfView& self,
   np.radius = (int)std::lround(pr.movement.navRadius);
   np.maxStepUp = pr.movement.maxStepUp;
   np.maxStepDown = pr.movement.maxStepDown;
-  np.headroom = std::max(2, (int)std::ceil(self.size.y * 0.75f));
+  // HEADROOM MUST NOT BE STRICTER THAN THE LOCOMOTION IT STEERS. The obvious
+  // value is the creature's own height, and it is wrong: the walk drive checks
+  // ground rise and nothing else, so a planner that demands 13 clear voxels
+  // over every column refuses whole regions — anything under a canopy, a ledge
+  // or an arch — that the mob would in fact walk straight through. The planner
+  // then reports "no way around" for a wall with open ground on both sides.
+  // Three voxels is enough to reject a crawlspace and nothing else, and being
+  // LOOSER than the drive is the safe direction to be wrong in: the drive's own
+  // probe still refuses what it cannot walk.
+  np.headroom = 3;
 
   // Retire waypoints we have arrived at BEFORE deciding whether to replan, so
   // "the path is finished" and "the path is stale" are different answers.
   const Vec3 foot = self.Foot();
   while (!b.path.Done() &&
-         PlanarDist(foot, b.path.Current()) <= kWaypointRadius)
+         PlanarDist(foot, b.path.Current()) <= kWaypointRadius) {
     b.path.cursor++;
+    b.lastWaypointDist = 1e9f;   // the progress clock is per WAYPOINT
+    b.stuckTicks = 0;
+  }
 
-  bool replan = false;
-  if (tick >= b.nextRepathTick) replan = true;
-  // The target walked away from the route it was planned for. Cheap test, and
-  // it is what keeps a duelist from running to where you WERE.
-  if (b.path.valid && PlanarDist(b.pathTarget, b.targetPos) > 4.0f) replan = true;
-  if (b.path.Done()) replan = true;
-  if (!replan) return;
-
+  // A LIVE PATH IS KEPT UNTIL IT IS ACTUALLY WRONG. The cadence is permission
+  // to RE-EXAMINE, not an instruction to re-plan.
+  //
+  // Measured, and it is the single worst failure mode this planner has: routing
+  // around a wall from the left and from the right cost almost exactly the
+  // same, so a from-scratch plan every ten ticks alternated between them. The
+  // mob walked 94 voxels in 400 ticks and made no progress at all — it spent
+  // every tick turning, which also drove `align` (and therefore its forward
+  // speed) to nearly nothing. Symmetric obstacles are the common case, not a
+  // pathological one, so the fix has to be structural rather than a tie-break.
+  if (tick < b.nextRepathTick && !b.path.Done()) return;
   b.nextRepathTick = tick + std::max(2u, pr.movement.repathTicks);
-  b.pathTarget = b.targetPos;
 
   // THE STRAIGHT LINE FIRST. Most of a fight is fought in the open, and asking
-  // A* to confirm what a 12-sample line already knows is the expensive way to
-  // learn nothing. This is also the graceful-degradation path: with no plan and
-  // a clear line, "walk at them" is exactly right.
+  // A* to confirm what a 24-sample line already knows is the expensive way to
+  // learn nothing. This is also where a mob that has just rounded an obstacle
+  // DROPS its detour, and the graceful-degradation path: with no plan and a
+  // clear line, "walk at them" is exactly right.
   if (LineWalkable(v.probe, np, foot, b.targetPos)) {
     b.path.Clear();
     b.navFailed = false;
     return;
   }
+
+  // Still committed? A live path is given up for exactly two reasons: the
+  // target walked away from the route it was planned for (so it leads to where
+  // you WERE), or the mob has STOPPED MAKING PROGRESS along it.
+  //
+  // The progress test is what replaced "is the straight line to my next
+  // waypoint still walkable", which sounds like the right question and is not.
+  // A string-pulled waypoint is straight-line reachable FROM WHERE THE PATH WAS
+  // PLANNED; once the body has drifted a voxel off that line the segment can
+  // clip the corner it was routed around, so the test failed on every healthy
+  // path that hugged an obstacle — the mob threw its route away every ten ticks
+  // and milled in front of the wall for 600 of them. Progress is the honest
+  // question, and it also covers the destructible-terrain case this world
+  // actually has: a path that now runs into a fresh crater stops making
+  // progress by itself.
+  if (!b.path.Done() && PlanarDist(b.pathTarget, b.targetPos) <= 4.0f) {
+    const float dw = PlanarDist(foot, b.path.Current());
+    if (dw < b.lastWaypointDist - 0.25f) {
+      b.lastWaypointDist = dw;
+      b.stuckTicks = 0;
+      return;
+    }
+    b.stuckTicks += std::max(2u, pr.movement.repathTicks);
+    if (b.stuckTicks < 30) return;
+  }
+
+  b.pathTarget = b.targetPos;
+  b.replans++;
+  b.stuckTicks = 0;
   b.navFailed = !FindPath(v.probe, np, foot, b.targetPos, b.path);
+  b.lastWaypointDist =
+      b.path.Done() ? 1e9f : PlanarDist(foot, b.path.Current());
 }
 
 // Where the follower currently wants to walk: the live waypoint, or the target
@@ -536,14 +587,35 @@ bool Think(Brain& brain, const Library& lib, const SelfView& self,
   const bool disengaging = tick < brain.disengageUntil;
   if (disengaging && hi > 0) lo = hi;
   const float d = brain.targetDist;
+  const float slack = std::max(0.25f, pr.movement.bandSlack);
+
+  // THE DEADBAND IS A SCHMITT TRIGGER, and it has to be: a band whose entry and
+  // exit edges are the same number is a FIXPOINT, not a band. Measured — the
+  // first version tested `d > rangeMax` both ways, so a duelist closing on an
+  // 11-voxel ceiling asymptoted onto 11.000 and stayed "very slightly too far"
+  // for 241 consecutive ticks: never content, so never circling, and parked
+  // one voxel outside a 10-voxel weapon reach, so never attacking either. The
+  // CA liquid levelling note in CLAUDE.md's memory is the same shape of bug.
+  //
+  // So: while CORRECTING, aim for the INNER band (pull all the way to
+  // hi - slack); once CONTENT, only give the position up on crossing the OUTER
+  // edge. Which of the two applies is read off the incumbent intent, which is
+  // the only piece of state that already means "am I currently fixing this".
+  const bool correcting = brain.intent == Intent::Approach ||
+                          brain.intent == Intent::HoldRange;
+  float tlo = lo, thi = hi;
+  if (correcting && hi > lo) {
+    const float mid = (lo + hi) * 0.5f;
+    tlo = std::min(lo + slack, mid);
+    thi = std::max(hi - slack, mid);
+  }
   float bandErr = 0;                       // + too far, - too close
   if (brain.hasTarget && hi > 0) {
-    if (d > hi) bandErr = d - hi;
-    else if (d < lo) bandErr = d - lo;
+    if (d > thi) bandErr = d - thi;
+    else if (d < tlo) bandErr = d - tlo;
   } else if (brain.hasTarget) {
     bandErr = d;                           // no band authored: just close
   }
-  const float slack = std::max(0.25f, pr.movement.bandSlack);
 
   // ARRIVAL CLAMP. Never ask for more speed than closes the remaining error in
   // one tick. Without this the band is a property of the creature's STRIDE
@@ -662,7 +734,25 @@ bool Think(Brain& brain, const Library& lib, const SelfView& self,
     case Intent::Approach: {
       UpdatePath(brain, pr, self, view, tick);
       const Vec3 wp = SteerPoint(brain);
-      out.desiredHeading = Deflect(BearingTo(self.Foot(), wp), self.heading, ground);
+      const float want = BearingTo(self.Foot(), wp);
+      // THE FAN STAYS, EVEN ON A PLANNED ROUTE — and this is the one place the
+      // two-avoidance-layers objection has to lose, because the drive's veto is
+      // not advice. `DriveLocomotion` refuses forward motion outright while
+      // probe 0 is blocked, and that probe reaches half the creature's own
+      // footprint plus two voxels — roughly eleven for a humanoid. A path that
+      // hugs an obstacle therefore aims the nose at something eleven voxels
+      // ahead, and the mob stands still forever with a perfectly good route in
+      // hand. Measured exactly that: frozen at one position for 600 ticks,
+      // waypoint 3.4 voxels away, never advancing the cursor.
+      //
+      // So the fan's job here is not "decide where to go" — the planner decided
+      // — it is "find the nearest heading to that decision the drive will
+      // actually honour". Deflect scores by angular distance from what was
+      // WANTED rather than from the nose, which is what makes it a projection
+      // onto the walkable set instead of a competing opinion. The dithering
+      // this used to cause was never the fan: it was the path being thrown away
+      // every ten ticks (see UpdatePath).
+      out.desiredHeading = Deflect(want, self.heading, ground);
       out.driveScale = sp * pr.movement.approachSpeed;
       // Only ease off when walking straight AT the target — a waypoint is not
       // the goal, and slowing into every corner of a path is a shuffle.

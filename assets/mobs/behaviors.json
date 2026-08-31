@@ -39,7 +39,7 @@
       "faction": "monster",
       "hysteresis": 0.28,
       "perception": { "sightRange": 46, "fovDegrees": 300, "requireLos": true, "aggro": "hostile", "alertDecayTicks": 180, "keepRangeScale": 1.45 },
-      "movement": { "mobile": true, "rangeMin": 7, "rangeMax": 11, "bandSlack": 1.4, "approachSpeed": 1.0, "strafeSpeed": 0.5, "retreatSpeed": 0.75, "circleTendency": 0.75, "circleHoldTicks": 34, "repathTicks": 10, "navRadius": 22, "maxStepUp": 2, "maxStepDown": 5 },
+      "movement": { "mobile": true, "rangeMin": 7, "rangeMax": 11, "bandSlack": 1.4, "approachSpeed": 1.0, "strafeSpeed": 0.5, "retreatSpeed": 0.75, "circleTendency": 0.75, "circleHoldTicks": 34, "repathTicks": 10, "navRadius": 30, "maxStepUp": 2, "maxStepDown": 5 },
       "attack": { "style": "slash", "reach": 10, "aimTolerance": 0.4, "cadenceTicks": 34, "jitterTicks": 22, "commitTicks": 10, "disengageTicks": 26 },
       "intents": {
         "idle": { "weight": 0.05, "cooldownTicks": 0, "minDwellTicks": 0 },

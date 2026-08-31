@@ -2281,6 +2281,22 @@ IVec3 AiFlatSpot(int cx, int cz, int search, int half, uint32_t seed,
   return IVec3{bestX, World::TerrainHeight(bestX, bestZ, seed), bestZ};
 }
 
+// Where an AI fixture goes: the CENTRE OF THE RESIDENCY WINDOW, never a fixed
+// world coordinate.
+//
+// This is the trap selftest.h names in as many words, and it cost this gate one
+// full-suite run to relearn: `streaming` leaves the window origin ~20 chunks
+// out, so a mob spawned at an absolute (140,140) lands outside it and
+// MobSystem::PreTick despawns it on the first tick as out-of-window. The
+// symptom is not "the AI misbehaved" — it is a target 134 voxels away, zero
+// ticks in any intent and a null Brain, because there is no creature at all.
+// Every one of these gates passed standalone and failed in the suite.
+IVec3 AiFixtureCentre(const World& world) {
+  const IVec3 o = world.WindowOrigin();
+  return IVec3{(o.x + (int)kNChunk / 2) * (int)kChunk, 0,
+               (o.z + (int)kNChunk / 2) * (int)kChunk};
+}
+
 // Everything an AI gate needs to advance one tick. The mob systems run in the
 // same order PreTick does in the game, so a behaviour cannot pass here by
 // depending on an ordering the frame loop does not have.
@@ -2289,9 +2305,10 @@ struct AiTicker {
   uint32_t tick = 7000;
   IVec3 playerChunk{8, 8, 8};
 
-  void operator()(const std::vector<BrushOp>& ops = {}) {
+  void operator()(const std::vector<BrushOp>& ops = {},
+                  const std::vector<CellOp>& cells = {}) {
     std::vector<ParticleSpawn> spawns;
-    std::vector<CellOp> cellOps;
+    std::vector<CellOp> cellOps = cells;
     std::vector<BrushOp> myOps = ops;
     c.mobs.PreTick(tick + 1, c.world, myOps, cellOps, spawns);
     c.debris.QueueSupportEvents(c.world.Snap());
@@ -2358,7 +2375,9 @@ Status GateAiDummy(Ctx& c, std::string& detail) {
   const MobDef& def = c.mobs.Defs()[defIndex];
 
   int relief = 0;
-  const IVec3 spot = AiFlatSpot(140, 140, 96, 16, kDefaultSeed, relief);
+  const IVec3 anchor = AiFixtureCentre(c.world);
+  const IVec3 spot =
+      AiFlatSpot(anchor.x, anchor.z, 96, 16, kDefaultSeed, relief);
   std::string why;
   const uint64_t id =
       AiSpawn(c, defIndex, {spot.x, spot.y + 1, spot.z}, "dummy", why);
@@ -2376,7 +2395,11 @@ Status GateAiDummy(Ctx& c, std::string& detail) {
       Vec3{(float)spot.x + 9.0f, (float)spot.y + 8.0f, (float)spot.z}, 3.0f,
       17.0f, true);
 
-  AiTicker tick{c, 7000, {spot.x / 16, spot.y / 16, spot.z / 16}};
+  // Arithmetic shift, not divide: a residency window that has streamed to
+  // negative world coordinates makes `/ 16` round toward zero and name the
+  // wrong chunk. The player chunk is also the fixture's own, so the tick
+  // stream does not shift the window out from under the mob mid-gate.
+  AiTicker tick{c, 7000, {spot.x >> 4, spot.y >> 4, spot.z >> 4}};
   tick();   // one tick so the rig settles onto the ground before measuring
   const Vec3 p0 = c.mobs.MobOrigin(id);
   const float h0 = c.mobs.MobHeading(id);
@@ -2392,6 +2415,12 @@ Status GateAiDummy(Ctx& c, std::string& detail) {
   }
   const ai::Brain* br = c.mobs.MobBrain(id);
   const bool sawNothing = br != nullptr && !br->hasTarget;
+  // A despawned mob has zero drift and zero turn too. Without this line the two
+  // assertions above are vacuously true for exactly the failure that is easiest
+  // to cause — a fixture placed outside the residency window (see
+  // AiFixtureCentre) — which is how this gate reported PASS-shaped numbers on a
+  // creature that had not existed for ninety ticks.
+  const bool stillHere = c.mobs.IsAlive(id) && br != nullptr;
 
   // EXACT zero, not "small": the dummy profile authorizes no drive at all, so
   // any motion is a code path that ignored the data. The bounds live in
@@ -2399,12 +2428,14 @@ Status GateAiDummy(Ctx& c, std::string& detail) {
   // min corner can be re-pinned without a rebuild.
   const float driftMax = (float)BaselineNumber("aiDummyMaxDriftVox", 0.001);
   const float turnMax = (float)BaselineNumber("aiDummyMaxTurnRad", 0.001);
-  const bool ok = maxDrift <= driftMax && maxTurn <= turnMax && sawNothing;
+  const bool ok =
+      stillHere && maxDrift <= driftMax && maxTurn <= turnMax && sawNothing;
   RecordObserved("aiFlatSpotRelief", (double)relief);
   detail = Format(
-      "%d ticks, drift %.5f vox (<= %.3f), turn %.5f rad (<= %.3f), blind %d, "
-      "terrain relief %d",
-      ticks, maxDrift, driftMax, maxTurn, turnMax, sawNothing ? 1 : 0, relief);
+      "%d ticks, alive %d, drift %.5f vox (<= %.3f), turn %.5f rad (<= %.3f), "
+      "blind %d, terrain relief %d",
+      ticks, stillHere ? 1 : 0, maxDrift, driftMax, maxTurn, turnMax,
+      sawNothing ? 1 : 0, relief);
   c.mobs.ClearPlayerActor();
   c.mobs.ClearAttackRequests();
   c.debris.Reset();
@@ -2426,7 +2457,9 @@ Status GateAiFace(Ctx& c, std::string& detail) {
   }
   const MobDef& def = c.mobs.Defs()[defIndex];
   int relief = 0;
-  const IVec3 spot = AiFlatSpot(140, 140, 96, 18, kDefaultSeed, relief);
+  const IVec3 anchor = AiFixtureCentre(c.world);
+  const IVec3 spot =
+      AiFlatSpot(anchor.x, anchor.z, 96, 18, kDefaultSeed, relief);
 
   std::string why;
   const uint64_t id = AiSpawn(c, defIndex, {spot.x, spot.y + 1, spot.z},
@@ -2436,7 +2469,11 @@ Status GateAiFace(Ctx& c, std::string& detail) {
     return Status::Fail;
   }
 
-  AiTicker tick{c, 7200, {spot.x / 16, spot.y / 16, spot.z / 16}};
+  // Arithmetic shift, not divide: a residency window that has streamed to
+  // negative world coordinates makes `/ 16` round toward zero and name the
+  // wrong chunk. The player chunk is also the fixture's own, so the tick
+  // stream does not shift the window out from under the mob mid-gate.
+  AiTicker tick{c, 7200, {spot.x >> 4, spot.y >> 4, spot.z >> 4}};
   tick();
   const Vec3 p0 = c.mobs.MobOrigin(id);
 
@@ -2479,14 +2516,16 @@ Status GateAiFace(Ctx& c, std::string& detail) {
   }
 
   const float driftMax = (float)BaselineNumber("aiFaceMaxDriftVox", 0.001);
-  const bool ok = worstErr <= tol && maxDrift <= driftMax &&
-                  perceived == (int)(sizeof(kBearings) / sizeof(float));
+  // Same reason as ai-dummy's: a despawned mob has a foot drift of zero.
+  const bool stillHere = c.mobs.IsAlive(id);
+  const int nB = (int)(sizeof(kBearings) / sizeof(float));
+  const bool ok = stillHere && worstErr <= tol && maxDrift <= driftMax &&
+                  perceived == nB;
   detail = Format(
-      "%d bearings, worst facing error %.3f rad (<= %.3f), foot drift %.5f vox "
-      "(<= %.3f), perceived %d/%d, %d attack requests, relief %d",
-      (int)(sizeof(kBearings) / sizeof(float)), worstErr, tol, maxDrift,
-      driftMax, perceived, (int)(sizeof(kBearings) / sizeof(float)), attacks,
-      relief);
+      "%d bearings, alive %d, worst facing error %.3f rad (<= %.3f), foot drift "
+      "%.5f vox (<= %.3f), perceived %d/%d, %d attack requests, relief %d",
+      nB, stillHere ? 1 : 0, worstErr, tol, maxDrift, driftMax, perceived, nB,
+      attacks, relief);
   c.mobs.ClearPlayerActor();
   c.mobs.ClearAttackRequests();
   c.debris.Reset();
@@ -2515,41 +2554,61 @@ Status GateAiApproach(Ctx& c, std::string& detail) {
   const ai::Profile& dp = c.mobs.Behaviors().profiles[prof];
 
   int relief = 0;
-  const IVec3 spot = AiFlatSpot(140, 140, 96, 22, kDefaultSeed, relief);
+  const IVec3 anchor = AiFixtureCentre(c.world);
+  const IVec3 spot =
+      AiFlatSpot(anchor.x, anchor.z, 96, 22, kDefaultSeed, relief);
   const int gapVox = (int)BaselineNumber("aiApproachGapVox", 20);
   const int tx = spot.x, tz = spot.z + gapVox;
   const int th = World::TerrainHeight(tx, tz, kDefaultSeed);
 
-  AiTicker tick{c, 7400, {spot.x / 16, spot.y / 16, spot.z / 16}};
+  // Arithmetic shift, not divide: a residency window that has streamed to
+  // negative world coordinates makes `/ 16` round toward zero and name the
+  // wrong chunk. The player chunk is also the fixture's own, so the tick
+  // stream does not shift the window out from under the mob mid-gate.
+  AiTicker tick{c, 7400, {spot.x >> 4, spot.y >> 4, spot.z >> 4}};
 
   // ---- the wall --------------------------------------------------------
   // Stone spheres straddling the straight line, at each column's own terrain
-  // height so undulation cannot bury or float them. Six voxels tall: a body
-  // cannot step it (SenseGround refuses a rise past 2), and a ray from the
-  // mob's eye down to the target's chest clears it — so the duelist can SEE
-  // its target the whole time and the only thing being tested is whether it
-  // can WALK to it. A wall that also broke line of sight would make a
-  // perception failure look like a navigation failure.
+  // height so undulation cannot bury or float them. Seven voxels tall above the
+  // ground: a body cannot step it (SenseGround refuses a rise past 2), and a
+  // ray from the mob's eye down to the target's chest clears it — so the
+  // duelist can SEE its target the whole time and the only thing being tested
+  // is whether it can WALK to it. A wall that also broke line of sight would
+  // make a perception failure look like a navigation failure.
+  //
+  // CELL OPS, NOT A BRUSH — A SPHERE IS A RAMP. The brush only paints spheres,
+  // and a fence of them is climbable: near a sphere's edge the surface rises
+  // about two voxels per column, which is exactly the planner's step limit. So
+  // A* cheerfully routed OVER the "wall" while the drive — whose probe looks
+  // several voxels ahead and refuses anything more than two up from where it
+  // stands — refused to walk the route it was given, and the mob stood at the
+  // foot of the rubble for 600 ticks. The column census made it unambiguous:
+  // 0 unknown columns, 66 steep ones, and a waypoint 27 voxels dead ahead.
+  //
+  // A real wall is vertical. Written cell by cell, one voxel thick, so the rise
+  // from the ground in front of it to its top happens in ONE column step and
+  // neither the planner nor the drive can talk itself up it.
   const uint32_t stone = [&] {
     for (size_t i = 0; i < c.mats.size(); i++)
       if (c.mats[i].name == "stone") return (uint32_t)i;
     return 1u;
   }();
+  const int kWallHalfX = 16, kWallHeight = 8;
   {
-    std::vector<BrushOp> wall;
-    for (int i = -3; i <= 3; i++) {
-      const int wx = spot.x + i * 4, wz = spot.z + gapVox / 2;
+    std::vector<CellOp> wall;
+    const int wz = spot.z + gapVox / 2;
+    for (int wx = spot.x - kWallHalfX; wx <= spot.x + kWallHalfX; wx++) {
       const int wh = World::TerrainHeight(wx, wz, kDefaultSeed);
-      BrushOp op{};
-      op.x = wx;
-      op.y = wh + 3;
-      op.z = wz;
-      op.radius = 3;
-      op.material = stone;
-      op.mode = 1;   // overwrite
-      wall.push_back(op);
+      // Two voxels thick: the ground probe samples columns, and a one-voxel
+      // sheet can be stepped across diagonally between two column centres.
+      for (int dz = 0; dz < 2; dz++)
+        for (int k = 0; k < kWallHeight; k++) {
+          const IVec3 cell{wx, wh + 1 + k, wz + dz};
+          if (!c.world.CellInWindow(cell)) continue;
+          wall.push_back(CellOp{World::SlotCellIndex(cell), stone});
+        }
     }
-    tick(wall);
+    tick({}, wall);
   }
   // The CPU mirror trails the GPU: the planner reads World::Cached, and a wall
   // the mirror has not seen yet is a wall the navigator will walk into. Tick
@@ -2579,15 +2638,19 @@ Status GateAiApproach(Ctx& c, std::string& detail) {
                         17.0f, true);
   for (int i = 0; i < 20; i++) tick();   // anchors fetch the chunks around the mob
 
-  // Does the mirror have the wall? Probed through the same collision classes
-  // the navigator uses.
-  int wallSeen = 0;
+  // Does the mirror have the wall, and is it CONTINUOUS? Probed at every column
+  // the fence covers, not only at the sphere centres — the version that sampled
+  // centres reported a complete wall the mob then walked through. Sampled at
+  // the ground+2 the mob's own step-up limit cares about, through the same
+  // collision classes the navigator uses.
+  int wallSeen = 0, wallCols = 0;
   {
     const std::vector<uint32_t> classOf = BuildCollisionClasses(c.mats);
-    for (int i = -3; i <= 3; i++) {
-      const int wx = spot.x + i * 4, wz = spot.z + gapVox / 2;
+    const int wz = spot.z + gapVox / 2;
+    for (int wx = spot.x - kWallHalfX; wx <= spot.x + kWallHalfX; wx++) {
       const int wh = World::TerrainHeight(wx, wz, kDefaultSeed);
-      if (c.world.KindAt(IVec3{wx, wh + 4, wz}, classOf) == CellKind::Solid)
+      wallCols++;
+      if (c.world.KindAt(IVec3{wx, wh + 2, wz}, classOf) == CellKind::Solid)
         wallSeen++;
     }
   }
@@ -2612,12 +2675,26 @@ Status GateAiApproach(Ctx& c, std::string& detail) {
   // at a fraction of drive) was invisible.
   int intentTicks[(int)ai::Intent::Count] = {};
   float travelled = 0;
+  // WHERE it crossed the wall's plane, not merely that it got past. A detour is
+  // a crossing at |x| beyond the wall's end; walking THROUGH one is a crossing
+  // at x ~ 0, and the two are indistinguishable from "arrived at tick N".
+  const float wallZ = (float)(spot.z + gapVox / 2);
+  const float wallHalfX = (float)kWallHalfX;
+  float crossX = 0;
+  int crossTick = -1;
+  int stepNo = 0;
   Vec3 prevPos = c.mobs.MobOrigin(id);
   auto step = [&]() {
     tick();
     const Vec3 now = c.mobs.MobOrigin(id);
     travelled += AiPlanar(now, prevPos);
     prevPos = now;
+    const Vec3 ctr = AiMobCentre(c.mobs, id, def);
+    if (crossTick < 0 && ctr.z > wallZ) {
+      crossTick = stepNo;
+      crossX = std::abs(ctr.x - (float)spot.x);
+    }
+    stepNo++;
     const ai::Brain* br = c.mobs.MobBrain(id);
     if (br != nullptr) {
       intentTicks[(int)br->intent]++;
@@ -2627,6 +2704,26 @@ Status GateAiApproach(Ctx& c, std::string& detail) {
     c.mobs.ClearAttackRequests();
     const float d = AiPlanar(AiMobCentre(c.mobs, id, def), targetC);
     minDist = std::min(minDist, d);
+    // A trace, not a bare verdict. Where the mob actually WAS, what it was
+    // doing and whether it had a plan, sampled thinly enough to read: a gate
+    // that only reports "did not arrive" makes the next reader guess between
+    // "the planner found nothing", "it found something and could not follow
+    // it" and "it oscillated". Cheap and off by default in spirit — 12 lines
+    // over a 600-tick run.
+    if (br != nullptr && (stepNo % 50) == 0) {
+      const bool haveWp = !br->path.Done();
+      const Vec3 wp = haveWp ? br->path.Current() : Vec3{};
+      std::printf(
+          "    ai-approach t%3d: at (%+6.1f,%+6.1f) d %5.1f  %-9s path %2zu/%2zu"
+          " wp (%+6.1f,%+6.1f)%s  replans %u  cols %u probed / %u unknown / %u "
+          "blocked / %u steep\n",
+          stepNo, ctr.x - (float)spot.x, ctr.z - (float)spot.z, d,
+          ai::IntentName(br->intent), br->path.cursor, br->path.pts.size(),
+          haveWp ? wp.x - (float)spot.x : 0.0f,
+          haveWp ? wp.z - (float)spot.z : 0.0f,
+          br->navFailed ? "  NAVFAIL" : "", br->replans, br->path.colsProbed,
+          br->path.colsUnknown, br->path.colsBlocked, br->path.colsSteep);
+    }
     return d;
   };
   for (int i = 0; i < budget && arriveTick < 0; i++) {
@@ -2660,19 +2757,30 @@ Status GateAiApproach(Ctx& c, std::string& detail) {
   // footwork keeps the target off the nose, which is exactly the bug the first
   // run of this gate found.
   const int minAttacks = (int)BaselineNumber("aiApproachMinAttacks", 2);
-  const bool ok = wallSeen >= 5 && arriveTick >= 0 && everPathed &&
+  // The crossing must be a DETOUR: past the end of the wall, not through it.
+  // Without this the gate is satisfied by a mob that walks straight over a
+  // 6-voxel step the locomotion is supposed to refuse, which would make it a
+  // test of nothing.
+  const bool detoured = crossTick >= 0 && crossX > wallHalfX * 0.6f;
+  const bool ok = wallSeen == wallCols && arriveTick >= 0 && everPathed &&
+                  detoured &&
                   minDist >= minClear && outOfBand <= outAllowed &&
                   attacks >= minAttacks;
   RecordObserved("aiApproachArriveTick", (double)arriveTick);
   RecordObserved("aiApproachAttacks", (double)attacks);
   detail = Format(
-      "wall %d/7 in mirror, start %.1f vox, arrived tick %d/%d (%.0f vox "
-      "walked), pathed %d, band [%.1f,%.1f]+-%.1f: %d/%d ticks out (worst "
-      "%.2f), closest %.2f (>= %.1f), %d attacks (>= %d), intents "
-      "idle/face/appr/hold/circ/atk %d/%d/%d/%d/%d/%d, relief %d",
-      wallSeen, startDist, arriveTick, budget, travelled, everPathed ? 1 : 0,
-      dp.movement.rangeMin, dp.movement.rangeMax, bandTol, outOfBand, holdTicks,
-      worstOut, minDist, minClear, attacks, minAttacks,
+      "wall %d/%d columns in mirror (half-width %.0f), start %.1f vox, crossed "
+      "the wall "
+      "plane at tick %d, |x| %.1f from centre (detour %d), arrived tick %d/%d "
+      "(%.0f vox walked), pathed %d, band [%.1f,%.1f]+-%.1f: %d/%d ticks out "
+      "(worst %.2f), closest %.2f (>= %.1f), %d attacks (>= %d), %u replans, "
+      "intents idle/face/appr/hold/circ/atk %d/%d/%d/%d/%d/%d, relief %d",
+      wallSeen, wallCols, wallHalfX, startDist, crossTick, crossX,
+      detoured ? 1 : 0,
+      arriveTick, budget, travelled, everPathed ? 1 : 0, dp.movement.rangeMin,
+      dp.movement.rangeMax, bandTol, outOfBand, holdTicks, worstOut, minDist,
+      minClear, attacks, minAttacks,
+      c.mobs.MobBrain(id) != nullptr ? c.mobs.MobBrain(id)->replans : 0u,
       intentTicks[0], intentTicks[1], intentTicks[2], intentTicks[3],
       intentTicks[4], intentTicks[5], relief);
 
