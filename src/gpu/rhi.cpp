@@ -102,6 +102,11 @@ void CommandEncoder::ResolveQuerySet(const QuerySet& qs, uint32_t firstQuery,
   p_->ResolveQuerySet(qs, firstQuery, queryCount, dst, dstOffset);
 }
 
+void CommandEncoder::WriteTimestamp(const QuerySet& qs, uint32_t index,
+                                    bool bottom) const {
+  p_->WriteTimestamp(qs, index, bottom);
+}
+
 ComputePass CommandEncoder::BeginComputePass(const char* label) const {
   return p_->BeginComputePass(label, nullptr);
 }

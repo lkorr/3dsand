@@ -66,6 +66,11 @@ class GpuContext {
   // are gathered continuously, but only the F5-reload scope pops them during
   // play). Returns the count, so a harness can assert ZERO and report honestly.
   size_t ReportVkValidation(const char* tag) const;
+  // The physical device's name ("NVIDIA GeForce RTX 3060 Ti"), or "" before
+  // Init. Diagnostics: the performance page stamps it into every recorded run,
+  // because a frame time with no GPU attached to it is not comparable to
+  // anything — including the same number measured on this machine last month.
+  std::string DeviceName() const;
   // True only when Init was asked for timestamps AND the adapter supports them.
   bool timestampsEnabled = false;
   // GPU timestamp period in nanoseconds per tick, from

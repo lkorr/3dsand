@@ -238,13 +238,26 @@ void Telemetry::Drop(intptr_t fd) {
   }
 }
 
-void Telemetry::Broadcast(uint32_t tick, const TelemetryStage* stages, int count) {
-  if (listen_ == kInvalid) return;
-  bool anyClient = false;
+bool Telemetry::HasClient() const {
+  if (listen_ == kInvalid) return false;
+  for (int i = 0; i < kMaxClients; i++)
+    if (clients_[i] != kInvalid) return true;
+  return false;
+}
+
+void Telemetry::SendAll(const char* json, int len) {
   for (int i = 0; i < kMaxClients; i++) {
-    if (clients_[i] != kInvalid) { anyClient = true; break; }
+    if (clients_[i] == kInvalid) continue;
+    char peek;
+    int r = recv((SOCKET)clients_[i], &peek, 1, MSG_PEEK);
+    if (r == 0) { Drop(clients_[i]); continue; }
+    if (r < 0 && !WouldBlock()) { Drop(clients_[i]); continue; }
+    Send(clients_[i], json, len);
   }
-  if (!anyClient) return;
+}
+
+void Telemetry::Broadcast(uint32_t tick, const TelemetryStage* stages, int count) {
+  if (!HasClient()) return;
 
   char json[2048];
   int pos = std::snprintf(json, sizeof(json), "{\"tick\":%u,\"stages\":{", tick);
@@ -254,15 +267,72 @@ void Telemetry::Broadcast(uint32_t tick, const TelemetryStage* stages, int count
                          stages[i].name, stages[i].ms);
   }
   pos += std::snprintf(json + pos, sizeof(json) - pos, "}}");
+  SendAll(json, pos);
+}
 
-  for (int i = 0; i < kMaxClients; i++) {
-    if (clients_[i] == kInvalid) continue;
-    char peek;
-    int r = recv((SOCKET)clients_[i], &peek, 1, MSG_PEEK);
-    if (r == 0) { Drop(clients_[i]); continue; }
-    if (r < 0 && !WouldBlock()) { Drop(clients_[i]); continue; }
-    Send(clients_[i], json, pos);
+// The v2 per-frame sample.
+//
+// Zeros are DROPPED, not sent. A settled world has one non-zero GPU node out of
+// twenty-five, and at 60 fps the difference between sending the zeros and not
+// is about 1.4 MB/s of loopback traffic to draw nothing — on a socket whose
+// whole purpose is to not perturb the frame it is measuring. The page treats a
+// missing key as zero, which is the same thing it does for a recorded run
+// (perfsuite.cpp drops flat-zero series for the same reason).
+void Telemetry::BroadcastSample(const sandvox::PerfSample& s) {
+  using namespace sandvox;
+  if (!HasClient()) return;
+
+  // 4 KiB is comfortably above the worst case: 13 scopes + 25 nodes + 14
+  // counters, each about 24 bytes of key and number, is under 1.3 KiB even with
+  // nothing dropped. The snprintf bound is still checked at every append —
+  // a truncated JSON object is a page that stops updating with no error.
+  char j[4096];
+  int p = std::snprintf(j, sizeof j,
+                        "{\"v\":2,\"tick\":%u,\"frame\":%u,\"wallMs\":%.3f,"
+                        "\"gpuValid\":%s",
+                        s.tick, s.frame, s.wallMs, s.gpuValid ? "true" : "false");
+
+  auto room = [&] { return p < (int)sizeof(j) - 96; };
+
+  p += std::snprintf(j + p, sizeof(j) - p, ",\"cpu\":{");
+  bool first = true;
+  for (int i = 0; i < kPerfScopeCount && room(); i++) {
+    if (s.cpuMs[i] <= 0.0) continue;
+    p += std::snprintf(j + p, sizeof(j) - p, "%s\"%s\":%.3f", first ? "" : ",",
+                       kPerfScopeKeys[i], s.cpuMs[i]);
+    first = false;
   }
+  p += std::snprintf(j + p, sizeof(j) - p, "},\"gpu\":{");
+  first = true;
+  for (int i = 0; i < kPerfNodeCount && room(); i++) {
+    if (s.gpuMs[i] <= 0.0) continue;
+    p += std::snprintf(j + p, sizeof(j) - p, "%s\"%s\":%.3f", first ? "" : ",",
+                       kPerfNodes[i].node, s.gpuMs[i]);
+    first = false;
+  }
+  p += std::snprintf(j + p, sizeof(j) - p, "},\"counters\":{");
+  first = true;
+  for (int i = 0; i < kPerfCounterCount && room(); i++) {
+    if (s.counters[i] <= 0.0) continue;
+    p += std::snprintf(j + p, sizeof(j) - p, "%s\"%s\":%.0f", first ? "" : ",",
+                       kPerfCounters[i].key, s.counters[i]);
+    first = false;
+  }
+  // The v1 half, so the Engine tab's chips keep updating off the same message.
+  // Only the five stage names it already knows; it ignores anything else.
+  p += std::snprintf(j + p, sizeof(j) - p,
+                     "},\"stages\":{\"stream\":{\"ms\":%.3f},"
+                     "\"submit\":{\"ms\":%.3f},\"physics\":{\"ms\":%.3f},"
+                     "\"post\":{\"ms\":%.3f},\"render\":{\"ms\":%.3f},"
+                     "\"readback\":{\"ms\":%.3f}}}",
+                     s.cpuMs[(int)PerfScope::Stream],
+                     s.cpuMs[(int)PerfScope::Submit],
+                     s.cpuMs[(int)PerfScope::Physics],
+                     s.cpuMs[(int)PerfScope::PostStep],
+                     s.cpuMs[(int)PerfScope::RenderCpu],
+                     s.cpuMs[(int)PerfScope::Readback]);
+  if (p >= (int)sizeof(j)) return;   // truncated: send nothing rather than junk
+  SendAll(j, p);
 }
 
 void Telemetry::Shutdown() {

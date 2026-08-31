@@ -19,6 +19,11 @@ struct GpuContext::Backend {
 
 vk::Backend* GpuContext::VkBackend() const { return back_ ? back_->vk.get() : nullptr; }
 
+std::string GpuContext::DeviceName() const {
+  vk::Backend* be = VkBackend();
+  return be ? be->GetCaps().deviceName : std::string();
+}
+
 size_t GpuContext::ReportVkValidation(const char* tag) const {
   vk::Backend* be = VkBackend();
   if (!be) return 0;

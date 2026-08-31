@@ -242,6 +242,7 @@ struct VkrEncoder final : CommandEncoderImpl {
   }
   void ResolveQuerySet(const QuerySet& qs, uint32_t firstQuery, uint32_t queryCount,
                        const Buffer& dst, uint64_t dstOffset) override;
+  void WriteTimestamp(const QuerySet& qs, uint32_t index, bool bottom) override;
   ComputePass BeginComputePass(const char*, const PassTimestampWrites*) override {
     // Nothing reaches this on Vulkan: sim recording goes through the
     // RecordTableVulkan bridge (the recorder walks the rows itself), and the
@@ -611,6 +612,20 @@ void VkrEncoder::ResolveQuerySet(const QuerySet& qs, uint32_t firstQuery,
   st->be->Fns().CmdResetQueryPool(cmd, q->pool, firstQuery, queryCount);
 }
 
+void VkrEncoder::WriteTimestamp(const QuerySet& qs, uint32_t index, bool bottom) {
+  auto* q = static_cast<VkrQuerySet*>(qs.Get());
+  if (!q || q->pool == VK_NULL_HANDLE) return;
+  // No DeclareUse: a timestamp write touches no tracked buffer, so it creates
+  // no hazard and needs no barrier. It must NOT be recorded inside a render
+  // pass on the ALL_COMMANDS path, which is why the render span is bracketed
+  // around BeginRenderPass/End rather than inside it.
+  st->be->Fns().CmdWriteTimestamp2(
+      cmd,
+      bottom ? VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT
+             : VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT,
+      q->pool, index);
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------- bridge ----
@@ -699,7 +714,7 @@ void RecordTableVulkan(const CommandEncoder& enc, pass::Table which, const Table
     if (q && q->pool != VK_NULL_HANDLE) {
       e->rec->SetTimer(q->pool, [timer](const char* name, uint32_t& b, uint32_t& en) {
         return timer->AllocPassPair(name, b, en);
-      });
+      }, timer->RowGranularity());
     }
   }
 

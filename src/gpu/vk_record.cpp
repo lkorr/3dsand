@@ -371,9 +371,11 @@ void Recorder::DeclareUse(Buffer* b, pass::Acc acc) {
 }
 
 void Recorder::SetTimer(VkQueryPool pool,
-                        std::function<bool(const char*, uint32_t&, uint32_t&)> alloc) {
+                        std::function<bool(const char*, uint32_t&, uint32_t&)> alloc,
+                        bool perRow) {
   timerPool_ = pool;
   timerAlloc_ = std::move(alloc);
+  timerPerRow_ = perRow;
 }
 
 // --measure only. Begin latches at TOP_OF_PIPE (waits for nothing), end at
@@ -452,9 +454,12 @@ void Recorder::RecordTable(pass::Table which, const RecordCtx& cx) {
 
     // --measure: the row's `group` label is exactly where Dawn opens/closes a
     // ComputePassEncoder, so the timestamp pair spans the same rows.
-    if (timerPool_ != VK_NULL_HANDLE && r.group != timerGroup_) {
+    // --perf (timerPerRow_): key on the row instead, so a group covering
+    // several architecture components reports one number each.
+    const char* timerKey = timerPerRow_ ? r.name : r.group;
+    if (timerPool_ != VK_NULL_HANDLE && timerKey != timerGroup_) {
       TimerClose();
-      TimerOpen(r.group);
+      TimerOpen(timerKey);
     }
 
     VkPipelineLayout layout = VK_NULL_HANDLE;

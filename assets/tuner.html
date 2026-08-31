@@ -520,6 +520,162 @@
     opacity:1;box-shadow:0 0 0 2px #ffd479,0 0 18px rgba(255,212,121,.45);
   }
 
+
+  /* ---------- performance ----------
+     The Performance tab (assets/perfview.js). Chart COLOURS live in the JS,
+     next to the code that assigns them: they are validated as a set by the
+     data-viz palette checker and splitting the set from the assignment is how
+     a palette silently stops being the one that was validated. Everything
+     here is layout, plus the text tokens the charts borrow through var(). */
+  .pv-bar{
+    display:flex;align-items:center;gap:10px;flex-wrap:wrap;
+    padding:10px 14px;background:var(--card);border:1px solid var(--line);
+    border-radius:8px;margin:14px 0;position:sticky;top:52px;z-index:20;
+  }
+  .pv-bar .dot{width:8px;height:8px;border-radius:50%;background:var(--faint);flex:none;transition:background .2s}
+  .pv-bar.live .dot{background:var(--green);box-shadow:0 0 8px var(--green)}
+  .pv-bar .lbl{font:12px/1.4 var(--mono);color:var(--dim)}
+  .pv-bar .spacer{flex:1}
+
+  .pv-scenarios{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:18px}
+  .pv-chip{
+    display:flex;flex-direction:column;align-items:flex-start;gap:3px;
+    padding:8px 14px;border-radius:8px;background:var(--card);
+    border:1px solid var(--line);cursor:pointer;text-align:left;
+  }
+  .pv-chip b{font-size:13px;color:var(--fg);font-weight:600}
+  .pv-chip span{font:11px/1 var(--mono);color:var(--faint)}
+  .pv-chip:hover{border-color:var(--line2)}
+  .pv-chip.on{border-color:var(--acc);background:var(--card2)}
+  .pv-chip.on b{color:var(--acc)}
+  .pv-chip.skipped b{color:var(--faint);text-decoration:line-through}
+  .pv-chip-live.on{border-color:var(--green)}
+  .pv-chip-live.on b{color:var(--green)}
+
+  .pv-sec{margin:0 0 30px}
+  .pv-sec h2{font-size:20px;margin:0 0 4px;letter-spacing:-.01em}
+  .pv-sec h3{font-size:13px;margin:22px 0 4px;color:var(--fg);
+             text-transform:uppercase;letter-spacing:.09em}
+  .pv-sec h3.pv-h3b{margin-top:28px}
+  .pv-sec h4.pv-h4{font:11px/1 var(--mono);color:var(--faint);margin:18px 0 8px;
+                   text-transform:uppercase;letter-spacing:.1em}
+  .pv-sec .note{max-width:78ch;margin:4px 0 14px;color:var(--dim);font-size:12.5px;line-height:1.55}
+  .pv-scen-head{border-bottom:1px solid var(--line);padding-bottom:12px;margin-bottom:16px}
+  .pv-fixture{font:11.5px/1.5 var(--mono);color:var(--amber);margin:6px 0 0}
+
+  /* The verdict. A status tone, so it is allowed a status colour - and it
+     always ships with the words, never the colour alone. */
+  .pv-hero{
+    display:flex;align-items:baseline;gap:16px;flex-wrap:wrap;
+    padding:16px 18px;border-radius:10px;background:var(--card);
+    border:1px solid var(--line);border-left-width:4px;margin-bottom:14px;
+  }
+  .pv-hero.tone-amber{border-left-color:var(--amber)}
+  .pv-hero.tone-red{border-left-color:var(--red)}
+  .pv-hero.tone-green{border-left-color:var(--green)}
+  .pv-hero-badge{font:600 26px/1 var(--sans);letter-spacing:-.02em;color:var(--fg)}
+  .pv-hero-why{color:var(--dim);font-size:13px}
+  .pv-hero-worst{flex-basis:100%;color:var(--dim);font-size:12.5px;margin-top:2px}
+  .pv-hero-worst b{color:var(--fg)}
+
+  .pv-tiles{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:8px}
+  .pv-tile{
+    flex:1 1 150px;min-width:140px;padding:11px 14px;border-radius:8px;
+    background:var(--card);border:1px solid var(--line);
+  }
+  .pv-tile-label{font-size:11px;color:var(--faint);text-transform:uppercase;letter-spacing:.07em}
+  .pv-tile-value{font:600 24px/1.2 var(--sans);color:var(--fg);margin-top:5px;letter-spacing:-.02em}
+  .pv-tile-unit{font-size:12px;color:var(--dim);margin-left:3px;font-weight:400}
+  .pv-tile-sub{font:11px/1.4 var(--mono);color:var(--faint);margin-top:3px}
+  .pv-tile.tone-red{border-color:var(--red)}
+  .pv-tile.tone-red .pv-tile-value{color:var(--red)}
+  .pv-tile.tone-amber .pv-tile-value{color:var(--amber)}
+
+  .pv-svg{display:block;width:100%;background:var(--card);border:1px solid var(--line);
+          border-radius:8px;margin-top:6px}
+
+  .pv-legend{display:flex;gap:14px;flex-wrap:wrap;margin:8px 0 2px}
+  .pv-legend-item{display:inline-flex;align-items:center;gap:6px;font-size:12px;color:var(--dim)}
+  .pv-legend-ms{font:11px/1 var(--mono);color:var(--faint)}
+  .pv-sw{width:10px;height:10px;border-radius:3px;flex:none;display:inline-block}
+  /* A line series gets a line key, not a filled square: the swatch should
+     look like the mark it names. */
+  .pv-sw.line{height:2px;border-radius:1px;width:14px}
+
+  /* Bars. The label column is fixed-width so every track shares one baseline;
+     a ragged left edge makes lengths incomparable at a glance. */
+  .pv-bars{border:1px solid var(--line);border-radius:8px;overflow:hidden;background:var(--card)}
+  .pv-bar-row{
+    display:grid;grid-template-columns:210px 1fr 74px 52px minmax(0,1.1fr);
+    align-items:center;gap:10px;padding:6px 12px;border-bottom:1px solid var(--bg);
+  }
+  .pv-bar-row:last-child{border-bottom:0}
+  .pv-bar-row.dim{opacity:.72}
+  .pv-bar-label{display:flex;align-items:center;gap:7px;font-size:12.5px;color:var(--fg);
+                white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .pv-side{font:9px/1 var(--mono);padding:2px 4px;border-radius:3px;
+           background:var(--bg);color:var(--faint);text-transform:uppercase}
+  .pv-bar-track{height:14px;background:var(--bg);border-radius:4px;overflow:hidden}
+  .pv-bar-fill{height:100%;border-radius:0 4px 4px 0;min-width:2px}
+  .pv-bar-val{font:12px/1 var(--mono);color:var(--fg);text-align:right}
+  .pv-bar-pct{font:11px/1 var(--mono);color:var(--faint);text-align:right}
+  .pv-bar-why{font:11px/1.35 var(--mono);color:var(--dim);
+              white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+
+  .pv-spark-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:10px}
+  .pv-spark{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:10px 12px}
+  .pv-spark.bug{border-color:var(--red)}
+  .pv-spark-head{display:flex;justify-content:space-between;align-items:baseline;gap:8px}
+  .pv-spark-label{font-size:11.5px;color:var(--dim)}
+  .pv-spark-val{font:600 15px/1 var(--mono);color:var(--fg)}
+  .pv-spark .pv-svg{border:0;background:transparent;margin:2px 0 0}
+  .pv-spark-foot{font:10px/1.4 var(--mono);color:var(--faint);margin-top:2px}
+
+  .pv-heat{width:100%;border-collapse:separate;border-spacing:2px;font-size:12px}
+  .pv-heat th{font:10px/1.3 var(--mono);color:var(--faint);text-transform:uppercase;
+              letter-spacing:.06em;padding:4px 6px;text-align:center;font-weight:400}
+  .pv-heat th:first-child{text-align:left}
+  .pv-heat-name{color:var(--fg);padding:5px 8px;background:var(--card);
+                border-radius:4px;white-space:nowrap}
+  .pv-heat-cell{font:11px/1 var(--mono);text-align:center;padding:7px 6px;
+                border-radius:4px;background:var(--bg);color:var(--faint)}
+  .pv-heat-legend{display:flex;align-items:center;gap:3px;margin-top:10px}
+  .pv-heat-chip{width:34px;height:11px;border-radius:2px}
+  .pv-heat-legend-lab{font:10px/1 var(--mono);color:var(--faint);margin:0 6px}
+
+  .pv-table-wrap{max-height:420px;overflow:auto;border:1px solid var(--line);border-radius:8px}
+  .pv-table{width:100%;border-collapse:collapse;font-size:12px;background:var(--card)}
+  .pv-table th{position:sticky;top:0;background:var(--card2);z-index:1;
+               font:10px/1 var(--mono);color:var(--faint);text-transform:uppercase;
+               letter-spacing:.06em;padding:8px;text-align:left;font-weight:400;
+               border-bottom:1px solid var(--line)}
+  .pv-table td{padding:5px 8px;border-bottom:1px solid var(--bg);color:var(--dim)}
+  .pv-table td.mono{font-family:var(--mono)}
+  .pv-table th.r,.pv-table td.r{text-align:right}
+  .pv-table tbody tr:hover td{background:var(--card2);color:var(--fg)}
+
+  .pv-empty,.pv-skip{padding:40px 24px;text-align:center;color:var(--dim);
+                     background:var(--card);border:1px solid var(--line);border-radius:8px}
+  .pv-skip{text-align:left;border-color:var(--amber)}
+  .pv-skip h3{color:var(--amber);margin:0 0 8px;font-size:14px}
+  .pv-warn{color:var(--amber);font:11.5px/1.5 var(--mono);margin-top:10px;max-width:80ch}
+  .pv-method{border-top:1px solid var(--line);padding-top:6px}
+  .pv-method ul{max-width:82ch;color:var(--dim);font-size:12.5px;line-height:1.6;padding-left:18px}
+  .pv-method li{margin-bottom:5px}
+
+  .pv-tip{
+    position:fixed;display:none;z-index:400;pointer-events:none;
+    background:var(--bg2);border:1px solid var(--line2);border-radius:7px;
+    padding:8px 10px;min-width:190px;box-shadow:0 8px 26px rgba(0,0,0,.55);
+  }
+  .pv-tip-head{font:11px/1 var(--mono);color:var(--faint);margin-bottom:6px}
+  .pv-tip-row{display:flex;align-items:center;gap:7px;font-size:11.5px;margin:2px 0}
+  .pv-tip-label{color:var(--dim);flex:1;white-space:nowrap}
+  .pv-tip-val{font:11.5px/1 var(--mono);color:var(--fg)}
+  .pv-tip-total{border-top:1px solid var(--line);margin-top:5px;padding-top:5px}
+  .pv-tip-total .pv-tip-label{color:var(--fg)}
+  .pv-tip-warn{font:10px/1.4 var(--mono);color:var(--amber);margin-top:6px;max-width:26ch}
+
   /* ---------- engine ---------- */
   .eng-bar{
     display:flex;align-items:center;gap:14px;flex-wrap:wrap;
@@ -1497,6 +1653,7 @@
   <button data-tab="wiki">Wiki</button>
   <button data-tab="notes">Notes</button>
   <button data-tab="engine">Engine</button>
+  <button data-tab="performance">Performance</button>
 </nav>
 
 <main>
@@ -1866,6 +2023,10 @@
 
   <!-- ENGINE — architecture reference + live telemetry + event log -->
   <section class="view" id="view-engine"></section>
+
+  <!-- PERFORMANCE - recorded --perf runs + the live telemetry view.
+       Built entirely by assets/perfview.js, like the Engine tab. -->
+  <section class="view" id="view-performance"></section>
 </main>
 
 <div id="valbar">
@@ -1893,6 +2054,10 @@
      a worker, a streamer and an edit model, and inlining ~1,200 lines of that
      into the page would bury every other tab's code. -->
 <script src="worldview.js"></script>
+<!-- The Performance tab. Its own file for the same reason worldview.js is:
+     it is a chart library plus a live socket, and inlining it would bury
+     every other tab. -->
+<script src="perfview.js"></script>
 <script>
 'use strict';
 /* ================= state ================= */
@@ -4938,6 +5103,9 @@ function renderAll(){
   // before any material names it.
   if(activeTab==='audio'){renderAudio();return;}
   if(activeTab==='engine'){renderEngine();return;}
+  // Performance owns its own DOM and its own data (build/perf.json + the
+  // telemetry socket); it renders with no materials loaded.
+  if(activeTab==='performance'){renderPerformance();return;}
   if(!mat||!rx)return;
   if(activeTab==='overview')renderOverview();
   else if(activeTab==='materials')renderMaterials();
@@ -8193,9 +8361,9 @@ const ARCH_NODES={
 
   // ---------------------------------------------------------------- tools
   toolsSys:{label:'Tools & Telemetry',tag:'cpu',
-    desc:'Everything outside the game binary: this browser tuner, the voxel/rig editor, the localhost telemetry stream that feeds this page live, and the headless sizing harness.',
+    desc:'Everything outside the game binary: this browser tuner, the voxel/rig editor, the localhost telemetry stream that feeds this page live, the performance suite behind the Performance tab, and the headless sizing harness.',
     files:['assets/tuner.html','assets/editor/','scripts/'],
-    children:['tunerApp','voxelEditor','telemetrySys','measureSys','labHarness']},
+    children:['tunerApp','voxelEditor','telemetrySys','perfSuite','measureSys','labHarness']},
 
   tunerApp:{label:'Tuner (this page)',tag:'cpu',
     desc:'The browser editor for every JSON the engine reads — materials, reactions, tuning, items, sounds, spells — plus the Wiki, Notes and this Engine tab. Served by a small Python server or the packaged exe.',
@@ -8209,10 +8377,16 @@ const ARCH_NODES={
     details:'Loaded as an ES module with a vendored three.js; every failure path is caught, so a browser without WebGL or a missing vendor file leaves the other tabs untouched.<br><br><code>anim.js</code> is a port of <code>src/game/anim.cpp</code> — keep them in sync.<br><br>The limb library saves and swaps parts between creatures through <code>assets/limbs/</code>, which is created on first save and needs the tuner server (a <code>file://</code> page cannot list it).'},
 
   telemetrySys:{label:'Telemetry Stream',tag:'cpu',
-    desc:'A localhost-only WebSocket server streaming one JSON object per tick to this page. Zero cost when disabled.',
-    files:['src/telemetry.h','src/telemetry.cpp'],
-    sym:['Telemetry::Start','Telemetry::Broadcast','TelemetryStage'],
-    details:'Start the game with <code>--telemetry</code> (port via <code>--telemetry-port</code>, default 8080), then press <b>connect</b> in the bar at the top of this page.<br><br>Wire format: <code>{"tick":N,"stages":{"ca":{"ms":0.18},...}}</code>. <b>Stage keys match the <code>data-eng-stage</code> attributes below</b>, so adding a stage needs no page changes beyond a new block. The frame loop currently broadcasts <code>stream</code>, <code>submit</code>, <code>physics</code>, <code>post</code> per tick and <code>render</code> per frame.'},
+    desc:'A localhost-only WebSocket server streaming one JSON object per FRAME to this page. Two formats on one socket: v1 stage chips for this tab, v2 full per-component samples for the Performance tab. Zero cost when nobody is attached.',
+    files:['src/telemetry.h','src/telemetry.cpp','src/measure/perfnodes.h'],
+    sym:['Telemetry::Start','Telemetry::Broadcast','Telemetry::BroadcastSample','TelemetryStage'],
+    details:'Start the game with <code>--telemetry</code> (port via <code>--telemetry-port</code>, default 8080), then press <b>connect</b> in the bar at the top of this page.<br><br>Wire format: <code>{"tick":N,"stages":{"ca":{"ms":0.18},...}}</code>. <b>Stage keys match the <code>data-eng-stage</code> attributes below</b>, so adding a stage needs no page changes beyond a new block. The frame loop currently broadcasts <code>stream</code>, <code>submit</code>, <code>physics</code>, <code>post</code> per tick and <code>render</code> per frame.<br><br><b>v2 (the Performance tab).</b> The same message also carries <code>{"v":2,"wallMs":..,"cpu":{..},"gpu":{..},"counters":{..}}</code> — one <code>PerfSample</code> (src/measure/perfnodes.h) per RENDERED FRAME, which is the same struct <code>--perf</code> records, so a live session and a recorded run draw with the same code. GPU pass times ride a fence ring and arrive two or three frames late, tagged with the frame that produced them; nothing in the frame path ever waits on a timestamp. Zeros are dropped from the wire — a settled world has one non-zero GPU node out of twenty-five.'},
+
+  perfSuite:{label:'Performance Suite',tag:'cpu',
+    desc:'`--perf`, and the tuner tab that reads it. Five scenarios \u2014 idle, a burning tree, a streaming flythrough, an explosion storm and a draining lake \u2014 each recorded frame by frame with per-component CPU scopes, per-PASS GPU timestamps and the counters that explain them. Answers one question: where did my frame go, and which part of the engine do I fix.',
+    files:['src/measure/perfsuite.h','src/measure/perfsuite.cpp','src/measure/perfnodes.h','assets/perfview.js','assets/perfview_test.html','scripts/check_perfview.sh'],
+    sym:['sandvox::RunPerf','PerfSample','PerfNodeForPass','kPerfNodes','PassTimer::KickDeferred','renderPerformance'],
+    details:'<b>Run it:</b> <code>bash scripts/run.sh ./build/Release/sandvox.exe --perf</code> writes <code>build/perf.json</code>; the tuner\u2019s <b>Performance</b> tab reads it, and its <b>Run performance tests</b> button does the same through the run mutex. <code>--scenario &lt;id&gt;</code> runs one.<br><br><b>The taxonomy is shared.</b> <code>perfnodes.h</code> maps every PASS() row and every CPU scope onto an <code>ARCH_NODES</code> key \u2014 the same boxes as the map above \u2014 and <code>scripts/check_invariants.py</code> fails if a node here is not a box there, if a claimed pass is not a real row, or if any timed row is claimed by nobody. That last one is the important one: an unattributed dispatch is GPU time that silently vanishes from the page.<br><br><b>Two measurement problems it exists to have solved.</b> (1) <i>Granularity:</i> <code>prep(mutate+explode+compact)</code> is ONE pass group covering THREE components, so the timer gained a ROW granularity (<code>PassTimer::SetRowGranularity</code>) \u2014 timestamps are pure observation, and the harness refuses to run if attaching them moves the world hash. (2) <i>Pacing:</i> without a bound on frames in flight the CPU races ahead and the measured distribution is a queue depth, not a frame time \u2014 measured as p50 0.64 ms / p95 196 ms before a 3-deep fence ring was added.<br><br><b>Live mode</b> is the same charts fed by <code>--telemetry</code> instead of a file.<br><br><b>Verify the page, not just the numbers:</b> <code>bash scripts/check_perfview.sh</code> drives the real tab in real headless Chrome and checks content AND layout.'},
 
   measureSys:{label:'Measure Harness',tag:'cpu',
     desc:'The --measure headless sizing run: occupancy histogram of the residency window plus per-compute-pass GPU timings in three activity scenarios.',
@@ -9782,6 +9956,7 @@ function renderEngine(){
   const recentSec=el('div',{class:'status-section'});
   recentSec.appendChild(el('h4',{},'Recently Landed'));
   const recentItems=[
+    {label:'Performance tab: where the frame goes',desc:'A dashboard that answers one question &mdash; which part of the engine is eating this frame &mdash; and a headless harness that feeds it. <code>--perf</code> runs five scenarios (idle, a 30 s canopy fire on the tallest real worldgen tree, a streaming flythrough, an explosion storm, a draining authored lake), each on its own freshly generated and re-settled world, and records EVERY FRAME: per-component CPU scopes, per-PASS GPU timestamps, and the counters that explain them. The taxonomy is shared with the map above &mdash; <code>src/measure/perfnodes.h</code> maps each PASS() row and CPU scope onto an <code>ARCH_NODES</code> key, and <code>check_invariants.py</code> fails if a row is claimed by nobody, claimed twice, or billed to a box that does not exist. Three measurement problems had to be solved before any of it meant anything, and each one produced a wrong number first. (1) GRANULARITY: <code>prep(mutate+explode+compact)</code> is one pass group covering three components, so the timer gained ROW granularity &mdash; a timestamp brackets different dispatches but reorders none, and the harness refuses to start if attaching it moves the world hash (checked, both arms <code>ef522e11</code>). (2) PACING: with no bound on frames in flight the CPU races ahead and the &lsquo;distribution&rsquo; is a queue depth &mdash; measured p50 0.64 ms / p95 196.56 ms, which became p50 39.07 / p95 43.02 once a 3-deep fence ring capped it the way a swapchain does. (3) INDEPENDENCE: scenarios shared a World, so the flythrough left the residency window somewhere else and the lake scenario reported &lsquo;no pond&rsquo; about a world that has one. Live mode is the same charts fed by <code>--telemetry</code> instead of a file: one <code>PerfSample</code> per rendered frame, GPU times arriving two or three frames late through a fence ring so the frame path never waits. CPU BUSY and CPU WAITING are never summed &mdash; a large wait is the shape of the bottleneck, not a cost. <code>scripts/check_perfview.sh</code> drives the real tab in real headless Chrome and checks content and layout, because none of the numbers being right makes the page readable'},
     {label:'The avatar IS a Mob (inheritance refactor)',desc:'class Mob is now the per-creature entity — one implementation of damage, sever, per-voxel carve, burn/dissolve, bleed (gore profile, gouts, drip spray), item holding, pose submit and rendering — and PlayerAvatar DERIVES from it, so every mechanic that applies to an NPC applies to the player through the same code by construction. The avatar&rsquo;s old parallel copies had already drifted: its explosion damage was an hp-only approximation with no real carving, its burn flush never rebuilt the collider, its bleeding lacked variance and spray. All gone. Player-only behaviour is confined to the driver (input, gait, head look, weapon arm, footfalls, health API, fall damage) and four explicit virtuals (AvatarLayer, OnBodyReleasedToWorld, DropLimbListOnDeath, MarkInstancesDirty). Mob combat scaffolding is live: MobSystem::EquipItem(mobId, item) hands any creature a sword through the identical rig-slot borrow the player uses. NPC pose/bleed timing kept byte-compatible (SubmitPose writeXf=false); determinism hash adfcbce8 unmoved; mob-burn gate green standalone including acid dissolution and the player-burns wiring'},
     {label:'Water looks alive: current field + Gerstner waves (M4)',desc:'A lake is no longer a still blue disc. The CURRENT FIELD is a pure function of position - a bounded list of sinks, vortices, sources and streams summed analytically, exactly the way the wind field works, with no stored field, no neighbour coupling and no relaxation pass, so it costs nothing where nobody is looking and can never wake a chunk. It owns no mass, which is what lets its accuracy be loose: a wrong current pushes a leaf the wrong way, it cannot lose a drop. The asymmetry is the whole look and it is asserted rather than eyeballed - a vortex falls off as &Gamma;/2&pi;r and REACHES (measured ratio 2.25 across a doubling of radius), a sink falls off as 1/r&sup2; and does not (4.49) - which is why real whirlpools look enormous while the suction is a small throat. &Gamma; and its chirality come from a hash of the hole position, which is physics rather than a fudge (a bathtub vortex is concentrated ambient circulation, so the swirl is an initial condition), and it decays when the flow stops, because a funnel standing open in still water is instantly wrong. The SURFACE WAVES are Gerstner octaves evaluated where a ray hits the water - never per sample through the volume, which is the mistake that collapsed the frame rate during fires - with each octave&rsquo;s speed from the real dispersion relation &omega;&sup2;=g&middot;k&middot;tanh(k&middot;h) at the LOCAL depth. That one constant choice is the difference between water and a scrolling texture, and because the depth is local the same term also slows the long swell as it reaches a bank while the chop barely changes, which is shoaling, for free. Wave phase is evaluated at position minus current times time, so flow reads as flow; foam sits on the field&rsquo;s convergence lines; a bounded ring of recent impacts draws expanding rings. The player is dragged by the current scaled by how submerged they are. None of it moves the pinned world hash: sim.currentMode is 0 and the sim evaluator returns zero before reading anything, while the render arm ships on because a renderer cannot write a voxel - and the gate proves BOTH halves in one run, three arms, where the middle arm is REQUIRED to differ so the off switch is not vacuous. A mostly-water 1080p frame went 6.30 to 6.24 ms. Gate <code>current</code>'},
     {label:'A dug lake re-derives itself, and splits (M5)',desc:'The last milestone of the water plan, and the one that covers terrain the PLAYER shaped. Everything before it governed basins worldgen makes, which are closed forms &mdash; a tarn is an integer parabola, an authored pool a flat cylinder &mdash; so their area-per-height tables are free and exact. Dig into one and they are lies. M5 measures the container instead: one scheduled GPU sweep over the basin, one level per tick, producing four things at once because they are all the same walk &mdash; the area at each height, the elevation the basin spills at, the elevations it SPLITS at going down, and which cells each half gets. That last one is the point: any bowl with an uneven floor becomes two puddles as the level falls past the high point between them, and that is the last phase of every drain rather than an exotic case. It runs as a kernel and not a readback for a rule-1 reason &mdash; the table decides which cells the shave takes water off, so a table that arrives when a fence retires puts scheduling inside a voxel write. It labels connectivity by min-propagation inside one workgroup rather than by union-find, because path compression wants atomicCAS and this engine does not allow one. And a split does no arithmetic: the map changes who OWNS which cells and the existing adopt/release machinery measures both halves from the voxels, so they sum to the parent exactly. Measured: split elevation 205 against a known partition top of 205, two descriptors, 943,427 + 942,418 = 1,885,845 eighths against 1,885,845 real (+0), the measured area curve matching an independent lattice walk both above and through the wall, and two identical runs producing one world mid-drain. It also closes the leftover M2 named: a body whose voxels changed under it now re-audits its volume on its sweep cycle, which is what stops a dug lake reporting it has nothing left to drain. Gate <code>waterbody</code> passes B and F'},
@@ -9993,6 +10168,11 @@ try{
 // file, a syntax error) the Models pane would sit empty with no explanation.
 // This runs after it and only speaks up when nothing registered.
 window.addEventListener('load',()=>{
+  // Fetch build/perf.json up front rather than on tab activation: it is a
+  // static file, the Performance tab is useless without it, and a tab that
+  // renders "no data" for half a second every time you open it reads as broken.
+  // A 404 is the normal state before the first run and is handled quietly.
+  try{ pvLoad(false); }catch(e){ console.error('perf.json load failed', e); }
   try{ tunerDeepLink(); }catch(e){ console.error('deep link failed', e); }
   setTimeout(()=>{
     const s=document.querySelector('#view-models');

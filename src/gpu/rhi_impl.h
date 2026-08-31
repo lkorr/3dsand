@@ -96,6 +96,7 @@ struct CommandEncoderImpl {
                                    const Extent3D& extent) = 0;
   virtual void ResolveQuerySet(const QuerySet& qs, uint32_t firstQuery, uint32_t queryCount,
                                const Buffer& dst, uint64_t dstOffset) = 0;
+  virtual void WriteTimestamp(const QuerySet& qs, uint32_t index, bool bottom) = 0;
   // ts == nullptr means an untimed pass; the public API's two overloads
   // collapse here so a backend implements exactly one entry point.
   virtual ComputePass BeginComputePass(const char* label, const PassTimestampWrites* ts) = 0;

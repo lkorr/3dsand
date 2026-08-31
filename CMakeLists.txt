@@ -299,6 +299,7 @@ add_executable(sandvox
   src/gpu/vk_info.cpp
   src/gpu/vk_smoke.cpp
   src/measure/measure.cpp
+  src/measure/perfsuite.cpp
   # The fluid lab (docs/PLAN_fluid_overhaul.md §4): --lab scenes + the
   # --fluid-bench harness. Same layer as measure — it consumes test/support.h.
   src/lab/lab.cpp

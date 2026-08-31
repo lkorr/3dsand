@@ -1,0 +1,161 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>perfview harness</title>
+<style>
+  html,body{margin:0;background:#0e1116;color:#d7dde6;font:13px/1.5 "Cascadia Code",Consolas,monospace}
+  #out{padding:10px 14px;white-space:pre-wrap}
+  iframe{width:1400px;height:2400px;border:0;display:block}
+  .ok{color:#7cf03a} .bad{color:#ff6b6b}
+</style>
+</head>
+<body>
+<pre id="out">running…</pre>
+<iframe id="f"></iframe>
+<script>
+// The harness forwards its own query string to the tuner, so
+// `perfview_test.html?scenario=treeburn` checks (and screenshots) that scenario
+// rather than whichever one happens to sort first.
+document.getElementById('f').src =
+  'tuner.html?tab=performance&' + location.search.replace(/^\?/, '');
+</script>
+<script>
+/* perfview_test.html — the browser half of the Performance tab's verification.
+ *
+ * WHY THIS EXISTS. `--perf` proves the NUMBERS: the harness asserts the timer
+ * does not move the world hash, that every pass is attributed, that the tree
+ * actually burned. None of that says whether the page parses the JSON, builds
+ * the charts, and lays them out without collisions — and every one of those can
+ * break without touching a line of C++.
+ *
+ * So this drives the real tuner in real Chrome against the real server, the way
+ * scripts/check_worldview.sh does for the Worldgen tab. It iframes
+ * tuner.html?tab=performance rather than reimplementing the boot sequence,
+ * because a harness that builds the page its own way stops testing the page.
+ *
+ * It checks CONTENT (did the charts get built from the data) and LAYOUT (does
+ * anything overflow), because a chart that renders 300px wider than its column
+ * is invisible to every assertion about its DOM.
+ */
+const out = document.getElementById('out');
+const lines = [];
+let fails = 0;
+function check(name, cond, detail){
+  if (!cond) fails++;
+  lines.push((cond ? '  PASS  ' : '  FAIL  ') + name + (detail ? '   ' + detail : ''));
+}
+function done(){
+  out.innerHTML = lines.join('\n') + '\n\n'
+    + (fails ? '<span class="bad">RESULT FAIL (' + fails + ')</span>'
+             : '<span class="ok">RESULT OK</span>');
+}
+
+const f = document.getElementById('f');
+f.addEventListener('load', () => {
+  const W = f.contentWindow, D = f.contentDocument;
+  // Surface any error the page threw; an exception mid-render leaves a
+  // half-built DOM that some of the checks below would otherwise pass on.
+  const errs = [];
+  W.addEventListener('error', e => errs.push(e.message));
+
+  // Poll for the data rather than sleeping a guess: perf.json is fetched at
+  // window load and the tab renders from it.
+  let tries = 0;
+  const tick = () => {
+    const root = D.getElementById('view-performance');
+    // window.pvState(), not window.PERF: perfview.js declares its state with
+    // `let` in a classic script, so it lives in the global lexical environment
+    // and never becomes a window property.
+    const st = W.pvState ? W.pvState() : null;
+    const ready = st && st.PERF && root && root.querySelector('.pv-hero');
+    if (!ready && ++tries < 100){ setTimeout(tick, 100); return; }
+    run(W, D, root, errs);
+    done();
+  };
+  setTimeout(tick, 200);
+});
+
+function run(W, D, root, errs){
+  check('no page errors', errs.length === 0, errs.join(' | '));
+  check('Performance tab is the active view',
+        !!root && root.classList.contains('active'));
+  if (!root){ return; }
+
+  const P = W.pvState().PERF;
+  check('perf.json parsed', !!P, P ? '' : 'PERF is null — no build/perf.json?');
+  if (!P) return;
+  check('has scenarios', P.scenarios && P.scenarios.length >= 1,
+        (P.scenarios||[]).length + ' scenarios');
+  check('has the node taxonomy', P.nodes && P.nodes.length >= 10,
+        (P.nodes||[]).length + ' nodes');
+  const ran = P.scenarios.filter(s => !s.skipped);
+  check('at least one scenario recorded frames', ran.length >= 1,
+        ran.length + ' of ' + P.scenarios.length + ' ran');
+  check('the tree-burn scenario ran',
+        P.scenarios.some(s => s.id === 'treeburn' && !s.skipped),
+        (P.scenarios.find(s=>s.id==='treeburn')||{}).skipWhy || '');
+
+  // ---- content ----
+  const hero = root.querySelector('.pv-hero-badge');
+  check('verdict rendered', !!hero && /BOUND/.test(hero.textContent),
+        hero ? hero.textContent : '');
+  check('stat tiles rendered', root.querySelectorAll('.pv-tile').length >= 5,
+        root.querySelectorAll('.pv-tile').length + ' tiles');
+
+  const areas = root.querySelectorAll('.pv-svg');
+  check('charts rendered', areas.length >= 3, areas.length + ' svg charts');
+  const bands = root.querySelectorAll('.pv-svg path[fill]:not([fill="none"])');
+  check('stacked bands drawn', bands.length >= 3, bands.length + ' filled paths');
+
+  const bars = root.querySelectorAll('.pv-bar-row');
+  check('component bars rendered', bars.length >= 5, bars.length + ' rows');
+  // Every bar must carry a number; an empty value column means the row was
+  // built from a series that is not there.
+  let blank = 0;
+  bars.forEach(b => { if (!/\d/.test(b.querySelector('.pv-bar-val').textContent)) blank++; });
+  check('every bar has a value', blank === 0, blank + ' blank');
+
+  const sparks = root.querySelectorAll('.pv-spark');
+  check('counter sparklines rendered', sparks.length >= 3, sparks.length + ' counters');
+
+  const heat = root.querySelectorAll('.pv-heat tbody tr');
+  check('scenario heatmap rendered', heat.length >= 3, heat.length + ' rows');
+
+  const passRows = root.querySelectorAll('.pv-table tbody tr');
+  check('pass drill-down rendered', passRows.length >= 5, passRows.length + ' passes');
+  // The Component column comes from the harness (perfnodes.h), not from a
+  // second mapping in JS. All-dashes means the JSON lost the `node` field.
+  let named = 0;
+  passRows.forEach(r => { if (r.children[1].textContent.trim() !== '—') named++; });
+  check('passes are attributed to components', named >= passRows.length * 0.9,
+        named + ' of ' + passRows.length + ' named');
+
+  // ---- the number that must add up ----
+  // The bars claim to account for the GPU total. If a pass fell through
+  // attribution the page would quietly under-report and look fine.
+  const sc = ran[0];
+  const un = sc.unattributed || { ns: 0, names: [] };
+  check('no unattributed GPU time', un.ns === 0,
+        un.ns ? (un.names.join(', ')) : '');
+
+  // ---- layout ----
+  // A chart 300px wider than its column is invisible to every DOM assertion
+  // above and obvious to a human. Measured, not eyeballed.
+  const de = D.documentElement;
+  check('page does not overflow horizontally',
+        de.scrollWidth <= de.clientWidth + 2,
+        'scrollWidth ' + de.scrollWidth + ' vs client ' + de.clientWidth);
+  let clipped = 0;
+  root.querySelectorAll('.pv-sec, .pv-bars, .pv-table-wrap, .pv-heat')
+      .forEach(e => { if (e.scrollWidth > e.clientWidth + 2) clipped++; });
+  check('no section overflows its column', clipped === 0, clipped + ' clipped');
+  // Charts must actually have height; a 0-height SVG renders nothing and
+  // throws nothing.
+  let flat = 0;
+  areas.forEach(s => { if (s.getBoundingClientRect().height < 20) flat++; });
+  check('charts have height', flat === 0, flat + ' zero-height');
+}
+</script>
+</body>
+</html>

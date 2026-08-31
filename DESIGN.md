@@ -4307,6 +4307,77 @@ Principles (Noita's lessons, taken as requirements):
 - **Communicate causality** (NetHack standard: the player should conclude
   "I wasn't careful," not "the game is buggy").
 
+### The performance suite (added 2026-08-30; `measure/perfsuite.*`, `measure/perfnodes.h`, `assets/perfview.js`)
+
+"Instrument from day one" above was satisfied by an on-screen overlay and two
+harnesses that each answer half a question. `--measure` reports per-pass GPU time
+averaged over three synthetic scenarios, blocking after every tick — so its wall
+clock is a latency, not a frame rate, and it says so. `--selftest` reports one
+advisory render number. Neither answers the question anyone actually has, which
+is **"where did THIS frame go, and which part of the engine do I fix?"**
+
+`--perf` answers it, and the tuner's **Performance** tab draws the answer.
+
+**The taxonomy is shared with the architecture map.** `measure/perfnodes.h` is
+one table mapping every `PASS()` row in `pass_table.def` and every CPU scope the
+frame loop opens onto an `ARCH_NODES` key from `assets/tuner.html` — so a bar on
+the Performance tab is the same component as a box on the Engine tab, by
+construction. `scripts/check_invariants.py` (`perfnodes`) fails the build if a
+node here is not a box there, if a claimed pass is not a real row, if two nodes
+claim one pass, or **if any timed row is claimed by nobody**. That last one is
+the important one and nothing else would catch it: an unattributed dispatch is
+GPU time that silently disappears from the page, and the bars still agree with
+each other while quietly ceasing to agree with the frame.
+
+**Five scenarios, each on its own world.** idle (rule 2's floor), a 30-second
+canopy fire on the tallest real worldgen tree near the window, a streaming
+flythrough, an explosion storm, and a draining authored lake. Every one
+regenerates and re-settles the world and reloads the residency window first, so
+any subset produces the same numbers as the full run — which is the only
+property that makes `--scenario <id>` useful for iterating.
+
+**Three measurement problems had to be solved before any of it meant anything,
+and each produced a plausible wrong number first. They are recorded because the
+wrong numbers all looked fine:**
+
+1. **Granularity.** `prep(mutate+explode+compact)` is ONE pass group spanning
+   THREE architecture components, so a page keyed on groups cannot answer "is it
+   the mutation queue or the explosion". `PassTimer::SetRowGranularity` moves the
+   timestamp pair onto the individual row. A timestamp brackets different
+   dispatches but reorders none — and rather than leave that as an argument, the
+   harness refuses to start unless an untimed and a row-timed 60-tick run produce
+   the same world hash.
+2. **Pacing.** With no bound on frames in flight the CPU races ahead of the GPU
+   and the measured "distribution" is a queue depth: measured p50 **0.64 ms** /
+   p95 **196.56 ms** over 900 frames, which is not a frame-time distribution at
+   all. A 3-deep fence ring — what a swapchain does — turned that into p50 39.07
+   / p95 43.02.
+3. **Independence.** Scenarios shared one `World`. The flythrough left the
+   residency window 900 voxels away, and the lake scenario then reported "no
+   pond in the window" about a world that has one. `Stream::ReloadWindow` per
+   scenario; `SetWindowOrigin` alone is not enough, because the origin is
+   `World`'s and the residency is `Stream`'s.
+
+**CPU BUSY and CPU WAITING are never summed.** The `present` scope is the CPU
+parked in front of a full frame queue. It is not a cost, it is the *shape* of the
+bottleneck: large means the GPU is the limit and the CPU has headroom. Adding it
+to a "total CPU" bar is the fastest way to read this page backwards.
+
+**Live mode is the same charts.** `--telemetry` broadcasts one `PerfSample` per
+rendered frame — the same struct `--perf` records — so the page draws a live
+session and a recorded run with the same code. GPU pass times come back through
+`PassTimer::KickDeferred`/`PollDeferred`, a fence ring that lets the numbers
+arrive two or three frames late **tagged with the frame that produced them**;
+the frame path never waits on a timestamp, and a frame whose queries have not
+landed is marked rather than drawn as a GPU that cost nothing.
+
+**Verify the page, not just the numbers.** `scripts/check_perfview.sh` drives the
+real tab in real headless Chrome and asserts both content (charts built from the
+data, passes attributed, nothing unattributed) and layout (nothing overflows its
+column, no zero-height chart) — because none of the numbers being right makes the
+page readable, and a chart 300 px wider than its column is invisible to every
+assertion about its DOM.
+
 ## 12. Tech Stack
 
 **Update (2026-08-22): the browser requirement is dropped and a native Vulkan

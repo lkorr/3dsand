@@ -230,6 +230,97 @@ def check_arch_paths():
             f"in kOrder (src/test/selftest.cpp) -- that command runs nothing")
 
 
+
+# --------------------------------------------------- performance node table
+def check_perf_nodes():
+    """src/measure/perfnodes.h  <->  ARCH_NODES  and  <->  pass_table.def.
+
+    The Performance tab bills every millisecond of a frame to a component. Three
+    lists have to agree for a bar on that page to mean anything:
+
+      1. `node:` in kPerfNodes must be an ARCH_NODES key, or the bar the user
+         clicks is not the box they clicked on the Engine map.
+      2. every name in `passKeys` must be a real PASS() row, or a component is
+         attributed GPU time from a dispatch that does not exist.
+      3. every COMPUTE PASS() row must appear in exactly one node's passKeys.
+
+    (3) is the one that matters most and the one nothing else would catch. A
+    pass nobody claims is GPU time that silently vanishes from the page: the
+    bars still add up to each other, they just stop adding up to the frame. The
+    harness counts it as `unattributed` and the page prints a warning, but that
+    is a report at runtime -- this is the check that stops it being written.
+
+    Fill/Copy rows (group `nullptr`) are untimed by construction and excluded.
+    """
+    hdr = read("src/measure/perfnodes.h")
+    tuner = read("assets/tuner.html")
+    table = read("src/sim/pass_table.def")
+    if not (hdr and tuner and table):
+        return
+    checked.append("perf node table")
+
+    # kPerfNodes rows: {"node", "label", parent, side, scope, "passKeys", ...}
+    body = re.search(r"kPerfNodes\[\]\s*=\s*\{(.*?)\n\};", hdr, re.S)
+    if not body:
+        problems.append("check_perf_nodes: could not find kPerfNodes in "
+                        "src/measure/perfnodes.h")
+        return
+    rows = re.findall(r'\{\s*"([A-Za-z0-9_]+)"\s*,\s*"[^"]*"\s*,'
+                      r'\s*(?:nullptr|"[A-Za-z0-9_]+")\s*,'
+                      r'\s*PerfSide::\w+\s*,\s*PerfScope::\w+\s*,'
+                      r'\s*((?:"[^"]*"\s*)+),', body.group(1), re.S)
+    if not rows:
+        problems.append("check_perf_nodes: kPerfNodes parsed to zero rows -- "
+                        "the row shape changed and this check went blind")
+        return
+
+    arch = re.search(r"const ARCH_NODES\s*=\s*\{(.*?)\nconst ARCH_EDGES",
+                     tuner, re.S)
+    known_nodes = set(re.findall(r"^  ([A-Za-z0-9_]+):\{", arch.group(1), re.M)) \
+                  if arch else set()
+
+    # Also collect parents, so a mis-typed parent does not build a broken tree.
+    parents = re.findall(r'\{\s*"[A-Za-z0-9_]+"\s*,\s*"[^"]*"\s*,'
+                         r'\s*"([A-Za-z0-9_]+)"\s*,\s*PerfSide::', body.group(1))
+
+    for nid in [r[0] for r in rows] + parents:
+        if known_nodes and nid not in known_nodes:
+            problems.append(
+                f"perfnodes.h bills time to '{nid}', which is not an ARCH_NODES "
+                f"key in assets/tuner.html -- the Performance tab would show a "
+                f"component the Engine map has no box for")
+
+    # Compute rows only: a Fill/Copy row has `nullptr` where the group label goes
+    # and is never timed.
+    compute = set()
+    for name, group in re.findall(r"^PASS\(\s*([A-Za-z0-9_]+)\s*,\s*"
+                                  r"(nullptr|\"[^\"]*\")", table, re.M):
+        if group != "nullptr":
+            compute.add(name)
+
+    claimed = {}
+    for nid, keyblob in rows:
+        for key in re.findall(r'"([^"]*)"', keyblob):
+            for name in [k for k in key.split(";") if k]:
+                if name not in compute:
+                    problems.append(
+                        f"perfnodes.h node '{nid}' claims pass '{name}', which is "
+                        f"not a timed PASS() row in src/sim/pass_table.def")
+                elif name in claimed:
+                    problems.append(
+                        f"pass '{name}' is claimed by BOTH '{claimed[name]}' and "
+                        f"'{nid}' in perfnodes.h -- its GPU time would be counted "
+                        f"twice")
+                else:
+                    claimed[name] = nid
+
+    for name in sorted(compute - set(claimed)):
+        problems.append(
+            f"PASS row '{name}' (src/sim/pass_table.def) is claimed by no node in "
+            f"src/measure/perfnodes.h -- its GPU time would vanish from the "
+            f"Performance tab instead of appearing under some component")
+
+
 # ------------------------------------------------------ CPU/GPU struct pairs
 #
 # Every struct the CPU fills and a shader reads is declared twice -- once in
@@ -862,6 +953,7 @@ ALL = {
     "render": check_render_paths,
     "world": check_world_consts,
     "arch": check_arch_paths,
+    "perfnodes": check_perf_nodes,
     "params": check_gpu_structs,
     "windprim": check_wind_prims,
     "curprim": check_current_prims,
@@ -876,7 +968,7 @@ RELEVANT = {
     "src/sim/tuning.h": ["tuning"],
     "src/sim/tuning_params.def": ["tuning", "substeps", "wgunits"],
     "scripts/tuning_prelude.py": ["tuning"],
-    "assets/tuner.html": ["render", "arch"],
+    "assets/tuner.html": ["render", "arch", "perfnodes"],
     "src/sim/materials.cpp": ["render"],
     "src/gpu/resources.cpp": ["world"],
     "src/test/selftest.cpp": ["arch"],
@@ -888,7 +980,8 @@ RELEVANT = {
     "src/gpu/rhi_record.h": ["counts"],
     "src/gpu/vk_record.h": ["counts"],
     "src/gpu/rhi_vk.cpp": ["counts"],
-    "src/sim/pass_table.def": ["counts"],
+    "src/sim/pass_table.def": ["counts", "perfnodes"],
+    "src/measure/perfnodes.h": ["perfnodes"],
 }
 
 if __name__ == "__main__":

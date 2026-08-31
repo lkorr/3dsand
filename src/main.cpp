@@ -59,6 +59,9 @@
 #include "test/selftest.h"
 #include "tools/voxregion.h"  // --voxdump / --voxserve, the tuner's voxel view
 #include "measure/measure.h"
+#include "measure/perfsuite.h"
+#include "measure/perfnodes.h"
+#include "gpu/passtimer.h"
 #include "test/support.h"
 #include "ui/overlay.h"
 #include "crash.h"
@@ -1674,6 +1677,11 @@ int main(int argc, char** argv) {
   bool selftest = false;
   bool shot = false;
   bool measure = false;  // --measure: Vulkan-port sizing harness (headless)
+  // --perf: the engine performance suite behind the tuner's Performance tab
+  // (src/measure/perfsuite.cpp). Headless, like --measure, and for the same
+  // reason: a windowed run measures the compositor as much as the engine.
+  bool perf = false;
+  sandvox::PerfOptions perfOpt;
   bool rebaseline = false;  // --rebaseline: write observed values into baseline.json
   bool suiteAcceptance = false;  // --suite acceptance: one-process full acceptance
   std::string sweepParam;   // --sweep sim.X=a,b,c
@@ -1758,7 +1766,11 @@ int main(int argc, char** argv) {
           "  --autofly-hard        Adversarial autofly (diagonal + descent)\n"
           "  --autofly-surface     Surface-following autofly\n"
           "  --autofly-park        Surface autofly that stops (sleep discriminator)\n"
-          "  --measure             Vulkan sizing harness (occupancy + GPU timings)\n\n"
+          "  --measure             Vulkan sizing harness (occupancy + GPU timings)\n"
+          "  --perf                Performance suite -> build/perf.json (tuner Performance tab)\n"
+          "  --perf-list           List the --perf scenarios and exit\n"
+          "  --scenario <id>       One --perf scenario (idle|treeburn|flythrough|explosion|water)\n"
+          "  --perf-out <path>     Where --perf writes its JSON\n\n"
           "Residency:\n"
           "  --residency paged|dense  Voxel buffer residency mode (default: paged)\n\n"
           "Vulkan / debug:\n"
@@ -1833,6 +1845,17 @@ int main(int argc, char** argv) {
     // timings. Headless, off by default, and the ONLY thing that requests the
     // TimestampQuery device feature.
     else if (a == "--measure") measure = true;
+    else if (a == "--perf") perf = true;
+    else if (a == "--perf-list") { perf = true; perfOpt.list = true; }
+    else if (a == "--scenario") {
+      if (i + 1 >= argc) { std::fprintf(stderr, "--scenario requires a scenario id\n"); return 1; }
+      perfOpt.only = argv[++i];
+      perf = true;
+    }
+    else if (a == "--perf-out") {
+      if (i + 1 >= argc) { std::fprintf(stderr, "--perf-out requires a path\n"); return 1; }
+      perfOpt.out = argv[++i];
+    }
     // `--residency paged|dense` selects the voxel buffer's residency
     // (docs/PLAN_page_table.md §6.2). Paged is the default; dense is the
     // identity-map oracle. ONE variable with a total order of values rather
@@ -2229,7 +2252,7 @@ int main(int argc, char** argv) {
   }
 
   GLFWwindow* window = nullptr;
-  if (!selftest && !shot && !measure && !fluidBench && shotMob.empty() &&
+  if (!selftest && !shot && !measure && !perf && !fluidBench && shotMob.empty() &&
       voxdumpArgs.empty() && !voxserve) {
     if (!glfwInit()) return 1;
     glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
@@ -2241,7 +2264,8 @@ int main(int argc, char** argv) {
   // Timestamps: --measure and --fluid-bench are the only modes that request
   // the TimestampQuery device feature (per-pass GPU timings).
   if (!ctx.Init(window, 1600, 900, lowPowerAdapter,
-                /*wantTimestamps=*/measure || fluidBench, backend, vkValidation,
+                /*wantTimestamps=*/measure || perf || fluidBench || telemetryEnabled,
+                backend, vkValidation,
                 sledgehammer))
     return 1;
 
@@ -2255,6 +2279,40 @@ int main(int argc, char** argv) {
   Simulation sim;
   if (!sim.Init(ctx.device, world, mats, reactions, micro, assetDir + "/shaders"))
     return 1;
+
+  // ---- LIVE PERFORMANCE TELEMETRY (--telemetry) ---------------------------
+  //
+  // The tuner's Performance tab in "watch me play" mode: the same PerfSample
+  // the --perf harness records, produced once per frame and pushed down the
+  // WebSocket. Everything below is gated on `telemetryEnabled`, which is off by
+  // default, so the ordinary game encodes the same command buffers it always
+  // did and pays nothing — the ONE cost that survives the flag being off is
+  // this pair of default-constructed PassTimers, which allocate nothing until
+  // Init() is called.
+  //
+  // ROW granularity, deferred collection. Blocking on timestamps at 60 fps
+  // would make the profiler the slowest thing in the frame; KickDeferred puts
+  // the map behind a fence and PollDeferred picks it up two or three frames
+  // later, tagged with the frame it belongs to.
+  PassTimer liveTimer, liveRenderTimer;
+  bool liveTimed = false;
+  if (telemetryEnabled) {
+    if (liveTimer.Init(ctx, 192)) {
+      liveTimer.SetRowGranularity(true);
+      sim.SetPassTimer(&liveTimer);
+      liveTimed = liveRenderTimer.Init(ctx, 2);
+    }
+    std::printf("telemetry: live on port %u, GPU pass timings %s\n",
+                telemetryPort, liveTimed ? "ON" : "unavailable (no timestamps)");
+  }
+  // The frame being accumulated, and the map from a frame number to the sample
+  // still waiting for its GPU numbers. Three deep: a deferred timestamp map
+  // lands two or three frames after the work, and a sample that has already
+  // been sent cannot be corrected.
+  sandvox::PerfSample liveSample;
+  uint32_t liveFrameNo = 0;
+  struct LivePending { uint32_t frame; sandvox::PerfSample s; };
+  std::vector<LivePending> livePending;
 
   Physics phys;
   if (!phys.Init()) return 1;
@@ -2303,6 +2361,7 @@ int main(int argc, char** argv) {
   far.Init(&world);
 
   if (measure) return RunMeasure(ctx, world, sim, mats);
+  if (perf) return sandvox::RunPerf(ctx, world, sim, mats, perfOpt);
   // The voxel-region modes answer here: after the device, shaders and material
   // table exist (genCell is WGSL and the palette is the COMPILED table), and
   // before anything spawns a player, a mob or a physics world — none of which a
@@ -4304,17 +4363,19 @@ int main(int argc, char** argv) {
         player.ApplyPush(phys.PlayerPushOut(playerBody, player.pos), kindAt);
       double tEnd = NowSeconds();
       tickMsSmooth += ((float)((tEnd - t0) * 1000.0) - tickMsSmooth) * 0.1f;
-      if (telemetry.Active()) {
-        double streamMs = (tSubmit0 - t0) * 1000.0;
-        double submitMs = (tSubmit1 - tSubmit0) * 1000.0;
-        double physMs = (tPhys1 - tSubmit1) * 1000.0;
-        double postMs = (tEnd - tPhys1) * 1000.0;
-        TelemetryStage stages[] = {
-          {"stream", streamMs}, {"submit", submitMs},
-          {"physics", physMs}, {"post", postMs},
-        };
-        telemetry.Broadcast(tick, stages, 4);
+      // Accumulate this tick into the frame's sample rather than sending it.
+      // A frame may run 0..4 ticks, and a chart whose x axis is FRAMES has to
+      // show what the frame cost — sending per tick made a 4-tick frame look
+      // like four cheap frames and a 0-tick frame look like a gap.
+      if (telemetry.HasClient()) {
+        using sandvox::PerfScope;
+        liveSample.cpuMs[(int)PerfScope::Stream] += (tSubmit0 - t0) * 1000.0;
+        liveSample.cpuMs[(int)PerfScope::Submit] += (tSubmit1 - tSubmit0) * 1000.0;
+        liveSample.cpuMs[(int)PerfScope::Physics] += (tPhys1 - tSubmit1) * 1000.0;
+        liveSample.cpuMs[(int)PerfScope::PostStep] += (tEnd - tPhys1) * 1000.0;
+        liveSample.tick = tick;
       }
+      if (liveTimed) liveTimer.KickDeferred(ctx, liveFrameNo);
     }
     if (ui.paused) accumulator = std::min(accumulator, (double)kTickDt);
 
@@ -4957,6 +5018,17 @@ int main(int argc, char** argv) {
       uint32_t microCount = sim.UploadMicroBodyInsts(ctx.queue, microInsts);
 
       rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
+      // --telemetry: bracket the whole render pass with a GPU timestamp pair,
+      // OUTSIDE the pass (a write at ALL_COMMANDS is not legal inside a
+      // dynamic-rendering scope). This is the only way the Performance tab can
+      // say "the GPU is the bottleneck and it is the raymarch" rather than
+      // inferring it from how long the CPU spent waiting in Present.
+      uint32_t liveRb = 0, liveRe = 0;
+      const bool liveRenderTimed =
+          liveTimed && telemetry.HasClient() &&
+          liveRenderTimer.AllocPassPair("render", liveRb, liveRe);
+      if (liveRenderTimed)
+        enc.WriteTimestamp(liveRenderTimer.NativeQuerySet(), liveRb, false);
       rhi::RenderPass rp = sim.BeginRenderPass(enc, target, ctx.surfaceFormat,
                                                        ctx.width, ctx.height);
       sim.DrawWorld(rp);
@@ -4981,17 +5053,93 @@ int main(int argc, char** argv) {
                                    : 0u);
       overlay.Render(rp);
       rp.End();
+      if (liveRenderTimed) {
+        enc.WriteTimestamp(liveRenderTimer.NativeQuerySet(), liveRe, true);
+        liveRenderTimer.EncodeResolve(enc);
+      }
+      double tPresent0 = NowSeconds();
       ctx.queue.Submit(enc.Finish());
       ctx.Present();
-    }
-    if (telemetry.Active() && ticksThisFrame > 0) {
-      double renderMs = (NowSeconds() - tRender0) * 1000.0;
-      TelemetryStage rs = {"render", renderMs};
-      telemetry.Broadcast(tick, &rs, 1);
+      if (liveRenderTimed) liveRenderTimer.KickDeferred(ctx, liveFrameNo);
+      if (telemetry.HasClient()) {
+        using sandvox::PerfScope;
+        liveSample.cpuMs[(int)PerfScope::RenderCpu] +=
+            (tPresent0 - tRender0) * 1000.0;
+        liveSample.cpuMs[(int)PerfScope::Present] +=
+            (NowSeconds() - tPresent0) * 1000.0;
+      }
     }
     if (g_harnessFrames > 0) g_harnessRenderMs += (NowSeconds() - tRender0) * 1000.0;
     ctx.ProcessEvents();  // pumps MapAsync callbacks (mirror updates)
     telemetry.Poll();
+
+    // ---- LIVE TELEMETRY: close the frame and send it --------------------
+    //
+    // GPU numbers arrive two or three frames late, so a frame is held in
+    // `livePending` until either its timestamps land or it ages out. Sending a
+    // frame early and "correcting" it later is not an option — the page has
+    // already drawn it, and a bar that retroactively grows is worse than one
+    // that is honestly marked as having no GPU data.
+    if (telemetry.HasClient()) {
+      using sandvox::PerfScope;
+      liveSample.frame = liveFrameNo;
+      liveSample.wallMs = (NowSeconds() - now) * 1000.0;
+      liveSample.cpuMs[(int)PerfScope::Input] +=
+          std::max(0.0, liveSample.wallMs - sandvox::PerfCpuTotal(liveSample));
+      // Counters, from the snapshot the pump above may just have landed.
+      const WorldSnapshot& lsn = world.Snap();
+      auto ctr = [&](sandvox::PerfCounter c, double v) {
+        liveSample.counters[(int)c] = v;
+      };
+      if (lsn.valid) {
+        ctr(sandvox::PerfCounter::ActiveChunks, lsn.activeChunks);
+        ctr(sandvox::PerfCounter::Particles, lsn.particleCount);
+        ctr(sandvox::PerfCounter::FluidParticles, lsn.fluidLive);
+        ctr(sandvox::PerfCounter::PageFaults, lsn.pageFaults);
+        ctr(sandvox::PerfCounter::VoxelsNonAir, (double)lsn.voxelTotal);
+      }
+      if (world.pages)
+        ctr(sandvox::PerfCounter::PagesResident, world.pages->PagesInUse());
+      livePending.push_back({liveFrameNo, liveSample});
+
+      // Harvest whatever has landed and post it to the frame it belongs to.
+      auto post = [&](PassTimer& t, bool isRender) {
+        const uint32_t tag = t.LastFrameTag();
+        for (LivePending& lp : livePending) {
+          if (lp.frame != tag) continue;
+          for (const PassSample& ps : t.LastFrame()) {
+            int node = -1;
+            if (isRender) {
+              for (int n = 0; n < sandvox::kPerfNodeCount; n++)
+                if (std::strcmp(sandvox::kPerfNodes[n].node, "raymarch") == 0) {
+                  node = n; break;
+                }
+            } else {
+              node = sandvox::PerfNodeForPass(ps.name);
+            }
+            if (node < 0) continue;
+            lp.s.gpuMs[node] += (double)ps.ns / 1e6;
+            lp.s.gpuValid = true;
+          }
+          break;
+        }
+      };
+      if (liveTimed && liveTimer.PollDeferred(ctx) > 0) post(liveTimer, false);
+      if (liveTimed && liveRenderTimer.PollDeferred(ctx) > 0)
+        post(liveRenderTimer, true);
+
+      // Send anything that is complete or three frames old, oldest first.
+      while (!livePending.empty() &&
+             (livePending.front().s.gpuValid ||
+              liveFrameNo - livePending.front().frame >= 3)) {
+        telemetry.BroadcastSample(livePending.front().s);
+        livePending.erase(livePending.begin());
+      }
+      liveSample = sandvox::PerfSample{};
+    } else if (!livePending.empty()) {
+      livePending.clear();   // browser went away; do not hoard frames
+    }
+    liveFrameNo++;
   }
 
   if (g_harnessFrames > 0 && frameCounter > 0) {

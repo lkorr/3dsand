@@ -390,6 +390,20 @@ class CommandEncoder {
   void ResolveQuerySet(const QuerySet& qs, uint32_t firstQuery, uint32_t queryCount,
                        const Buffer& dst, uint64_t dstOffset) const;
 
+  // Encoder-level timestamp write (measurement only). The compute side gets
+  // its timestamps from the pass table's group transitions, but the RENDER pass
+  // is not in that table and had no GPU span at all — which left "is the GPU
+  // the bottleneck?" answerable only by inference from CPU present-wait. This
+  // is the one primitive that makes it a measurement.
+  //
+  // `bottom` selects the stage: false latches at TOP_OF_PIPE (waits for
+  // nothing, so it marks where the GPU REACHED this point) and true at
+  // ALL_COMMANDS (everything before has completed). Bracket a pass with
+  // false-then-true, exactly as the recorder's TimerOpen/TimerClose do.
+  //
+  // Writes no memory and orders nothing: it cannot change what the frame draws.
+  void WriteTimestamp(const QuerySet& qs, uint32_t index, bool bottom) const;
+
   ComputePass BeginComputePass(const char* label = nullptr) const;
   // Overload carrying GPU timestamp writes (measurement harness only).
   ComputePass BeginComputePass(const char* label, const PassTimestampWrites& ts) const;

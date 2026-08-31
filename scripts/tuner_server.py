@@ -399,6 +399,11 @@ EXE = os.path.join(ROOT, "build", "Release", "sandvox.exe")
 # Build state, shared with the poller. Guarded because ThreadingHTTPServer
 # handles the build POST and the status GETs on different threads.
 _lock = threading.Lock()
+# Performance-suite state. Its own lock: a perf run is minutes long and holds
+# the machine-global run mutex, so "is one already going" has to be answerable
+# without waiting on the build lock.
+_perf_lock = threading.Lock()
+_perf = {"running": False, "ok": False, "log": "", "error": ""}
 _build = {"running": False, "ok": None, "log": "", "returncode": None}
 # Serialises /api/heightmap: a slider drag queues a dozen requests and there is
 # no point running a dozen copies of the exporter.
@@ -1101,6 +1106,23 @@ class Handler(BaseHTTPRequestHandler):
             with open(path, "rb") as f:
                 return self._send(200, f.read(), "application/octet-stream")
 
+        if p == "/perf.json":
+            # The Performance tab reads build/perf.json, which lives OUTSIDE
+            # assets/ (it is build output, not an authored asset, and it must
+            # not be committed). Served explicitly rather than by widening the
+            # static root, which would expose the whole build directory.
+            path = os.path.join(ROOT, "build", "perf.json")
+            if not os.path.isfile(path):
+                return self._json(404, {"ok": False,
+                                        "error": "no build/perf.json yet -- "
+                                                 "run the performance suite"})
+            with open(path, "rb") as f:
+                return self._send(200, f.read(), "application/json")
+
+        if p == "/api/perf/status":
+            with _perf_lock:
+                return self._json(200, dict(_perf))
+
         if p == "/api/status":
             with _lock:
                 b = dict(_build)
@@ -1428,6 +1450,59 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, {"ok": True, "pid": q.pid})
             except Exception as e:
                 return self._json(500, {"ok": False, "error": repr(e)})
+
+        if p == "/api/perf/run":
+            # `sandvox --perf`, THROUGH scripts/run.sh so it takes the machine-
+            # global run mutex. That is not ceremony: concurrent sandvox
+            # processes saturate the GPU and every number the suite records
+            # becomes garbage (CLAUDE.md, "an unmutexed sandvox.exe poisons
+            # every perf number"). run.sh blocks until the lock is free, so a
+            # build or another session's run simply delays this one.
+            if not os.path.isfile(EXE):
+                return self._json(400, {"ok": False,
+                                        "error": "sandvox.exe not found -- build first"})
+            with _perf_lock:
+                if _perf["running"]:
+                    return self._json(409, {"ok": False,
+                                            "error": "a perf run is already in flight"})
+                _perf.update(running=True, ok=False, log="", error="")
+
+            body = self._body()
+            scenario = body.get("scenario") or ""
+            argv = ["bash", os.path.join(ROOT, "scripts", "run.sh"), EXE, "--perf"]
+            # Whitelist: the scenario id is never spliced from client text.
+            if scenario in ("idle", "treeburn", "flythrough", "explosion", "water"):
+                argv += ["--scenario", scenario]
+            elif scenario:
+                with _perf_lock:
+                    _perf.update(running=False, error="unknown scenario %r" % (scenario,))
+                return self._json(400, {"ok": False, "error": "unknown scenario"})
+
+            def run_perf():
+                try:
+                    env = dict(os.environ, SANDVOX_NO_CRASH_DIALOG="1")
+                    r = subprocess.run(argv, cwd=ROOT, capture_output=True,
+                                       text=True, timeout=2400, env=env,
+                                       creationflags=getattr(subprocess,
+                                                             "CREATE_NO_WINDOW", 0))
+                    with _perf_lock:
+                        _perf.update(running=False, ok=(r.returncode == 0),
+                                     log=(r.stdout or "")[-20000:],
+                                     error=(r.stderr or "")[-4000:])
+                except Exception as e:
+                    with _perf_lock:
+                        _perf.update(running=False, ok=False, error=repr(e))
+
+            t = threading.Thread(target=run_perf, daemon=True)
+            t.start()
+            # Synchronous from the page's point of view: the button is disabled
+            # for the duration anyway, and a run that finishes into a status
+            # endpoint nobody polls is a run whose failure nobody sees.
+            t.join(2400)
+            with _perf_lock:
+                st = dict(_perf)
+            return self._json(200, {"ok": st["ok"], "log": st["log"],
+                                    "error": st["error"]})
 
         if p == "/api/kill":
             n = 0

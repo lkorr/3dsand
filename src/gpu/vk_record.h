@@ -229,8 +229,15 @@ class Recorder {
   // timestamps. `alloc` hands out (begin, end) query indices for a named pass
   // and may refuse (pool full) — the pass then simply goes untimed, matching
   // PassTimer::BeginPass's fallback.
+  //
+  // `perRow` keys the pair on the row's own `name` instead of its `group`
+  // (gpu/passtimer.h): `prep(mutate+explode+compact)` is one group spanning
+  // three architecture components, and the Performance tab has to tell them
+  // apart. Timestamps are pure observation — this changes which dispatches a
+  // pair BRACKETS, never the dispatches, the barriers or the world hash.
   void SetTimer(VkQueryPool pool,
-                std::function<bool(const char*, uint32_t&, uint32_t&)> alloc);
+                std::function<bool(const char*, uint32_t&, uint32_t&)> alloc,
+                bool perRow = false);
 
   // ---- off-table copies whose SOURCE is a tracked table buffer -------------
   //
@@ -386,8 +393,9 @@ class Recorder {
   // --measure timer state (null/absent in every non-measure run).
   VkQueryPool timerPool_ = VK_NULL_HANDLE;
   std::function<bool(const char*, uint32_t&, uint32_t&)> timerAlloc_;
-  const char* timerGroup_ = nullptr;   // open group label, null when closed
+  const char* timerGroup_ = nullptr;   // open pass label, null when closed
   uint32_t timerEndIdx_ = UINT32_MAX;  // end query index of the open pair
+  bool timerPerRow_ = false;           // key on Row::name, not Row::group
 };
 
 }  // namespace vk
