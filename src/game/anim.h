@@ -383,6 +383,39 @@ void AnimFlatten(const AnimSkeleton& sk, AnimState& st);
 void AnimSolveTwoBone(const AnimSkeleton& sk, AnimState& st, const IkChain& chain,
                       Vec3 targetModel, float weight);
 
+// A HINGE WHOSE PLANE IS STEERED, for the duration of one solve.
+//
+// `AnimPart::poseAxis` is a fact about the joint stated in the part's own rest
+// frame, and for a knee that is the whole story: the leg IK's bend plane is
+// fixed by an authored pole and the two agree by construction. A MOUSE-DIRECTED
+// arm is the case that breaks it. The stroke driver (game/melee.h) rotates the
+// weapon arm's bend plane into the plane of the cut, so the plane the solver
+// actually bends in moves every tick — and the authored axis, being fixed in
+// the upper arm's frame, no longer coincides with it. The hinge clamp then does
+// exactly what it promises and DISCARDS the off-axis swing, which throws away
+// most of the solve and leaves the hand short of the target: a horizontal cut
+// collapses back into a forward jab.
+//
+// The anatomically honest fix is to roll the SHOULDER until the elbow's own
+// hinge plane contains the cut — a real arm aims its elbow that way, and the
+// PoseBallLimit note above says so. Rolling the upper bone about its own axis
+// does not move the elbow, but it does change the two-bone solution (the bend
+// plane is determined by the pole), so doing it after the solve means resolving
+// the chain against a moving constraint. This is the same thing expressed as
+// data instead: the joint stays a ONE-DEGREE-OF-FREEDOM hinge with its authored
+// 0..130 degree range — what changes is which plane that degree of freedom
+// lives in, which is precisely what shoulder roll buys and which is invisible
+// on a near-cylindrical upper arm. The RANGE, the part of the limit that keeps
+// the pose humanly possible, is never touched.
+//
+// `blend` fades the override toward the authored axis so a take-over and a
+// hand-back do not pop; 0 is "authored axis", 1 is "the solved plane".
+struct PoseAxisOverride {
+  int part = -1;        // index into sk.parts; -1 = inactive
+  Vec3 axis{1, 0, 0};   // replacement hinge axis, in the part's REST frame
+  float blend = 0.0f;   // 0..1 toward `axis`
+};
+
 // Stage 6. Clamp every part carrying a `poseLimit` back inside its authored
 // range of motion, then re-flatten the affected subtrees so children follow.
 // Runs AFTER all IK, because the IK is what puts a joint outside its range;
@@ -395,7 +428,9 @@ void AnimSolveTwoBone(const AnimSkeleton& sk, AnimState& st, const IkChain& chai
 //
 // Parts with no limit are untouched, so this is a no-op on every rig that
 // authors none.
-void AnimClampPoseLimits(const AnimSkeleton& sk, AnimState& st);
+void AnimClampPoseLimits(const AnimSkeleton& sk, AnimState& st,
+                         const PoseAxisOverride* overrides = nullptr,
+                         int overrideCount = 0);
 
 // Holden spring integration for one part's local rotation offset.
 void AnimSpringStep(const SpringDef& def, SpringState& s, Vec3 goal, float dt);

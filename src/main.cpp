@@ -197,6 +197,10 @@ double g_harnessRenderMs = 0.0;
 // settle, which is what a ~550 steady state with no rule at fault looks like.
 // Nothing here never sleeps; the settle is just far longer than one tick.
 bool g_autoflyPark = false;
+// --duel-dummy: spawn one sword-armed human in front of the player and leave it
+// there. The manual half of the melee gates — `swing` and `swing-plane` assert
+// the trajectory and the wound, and this is where a person judges the FEEL.
+bool g_duelDummy = false;
 constexpr uint32_t kParkFlyTicks = 300;    // fly this far out, then stop
 // Settle window, in ticks, before the sample is taken. Overridable because the
 // whole question is "does this decay or plateau", and one duration cannot
@@ -2086,6 +2090,7 @@ int main(int argc, char** argv) {
           "  --lab [scene]         Windowed fluid lab (basin|hill|faucet|pool|slosh|pond|worldlake)\n"
           "  --fluid-bench [scene] Headless fluid timing harness (scene|pond<N>|pours|all)\n\n"
           "Harness / perf:\n"
+          "  --duel-dummy          Spawn a sword-armed human 3 m ahead (melee feel)\n"
           "  --frames <N>          Run windowed game for N frames then exit\n"
           "  --autofly             Enable autofly camera\n"
           "  --autofly-hard        Adversarial autofly (diagonal + descent)\n"
@@ -2165,6 +2170,13 @@ int main(int argc, char** argv) {
       g_shotInventory = true;
       g_harnessFrames = kShotInvCaptureFrame;
     }
+    // `--duel-dummy` is the melee FEEL harness: a sword-armed human standing
+    // three metres in front of the spawn, with nothing driving it. Mobs have no
+    // AI yet, so "stands still" is simply the default and this flag is only a
+    // spawn — the point is to have something at a known distance to cut, so the
+    // stroke can be judged against a body rather than against the sky. Phase B's
+    // AI/spawn panel supersedes it; keep the footprint here at one bool.
+    else if (a == "--duel-dummy") g_duelDummy = true;
     else if (a == "--autofly") g_autofly = true;
     else if (a == "--autofly-hard") { g_autofly = true; g_autoflyHard = true; }
     else if (a == "--autofly-surface") { g_autofly = true; g_autoflySurface = true; }
@@ -3171,6 +3183,8 @@ int main(int argc, char** argv) {
   // from an unknown pose would carve a segment the blade never travelled.
   Vec3 lastEdgeBase{}, lastEdgeTip{};
   bool lastEdgeValid = false;
+  // --duel-dummy fires once, from inside the tick loop (see the note there).
+  bool duelDummySpawned = false;
 
   // particle-pass gating: tick-deterministic inputs only (see SubmitTick note)
   bool everExploded = false;
@@ -3513,7 +3527,7 @@ int main(int argc, char** argv) {
     // mouse is sampled at; the tick loop below runs 0..4 times per frame and
     // integrating it there would multiply-count a fast flick into a much
     // faster one.
-    if (captured) melee.AddMouse((float)(mx - mx0), (float)(my - my0));
+    if (captured) melee.Feed((float)(mx - mx0), (float)(my - my0));
     mx0 = mx;
     my0 = my;
 
@@ -4380,6 +4394,37 @@ int main(int argc, char** argv) {
       // the confounding load the lab exists to exclude. Consume the request
       // so it cannot latch across a mode where it would fire.
       if (labScene >= 0) ui.spawnMob = false;
+      // ---- --duel-dummy: one target, once, three metres ahead ---------------
+      // Deferred to the tick loop rather than done at load because the player's
+      // position and the terrain height under it are only settled here, and a
+      // dummy spawned inside a hill is not a dummy. A mob with no AI stands
+      // where it is put, so nothing else is needed to keep it still.
+      if (g_duelDummy && !duelDummySpawned && avatar.Spawned()) {
+        duelDummySpawned = true;
+        int humanDef = -1;
+        for (size_t i = 0; i < mobs.Defs().size(); i++)
+          if (mobs.Defs()[i].name == "human") humanDef = (int)i;
+        if (humanDef >= 0) {
+          const MobDef& d = mobs.Defs()[humanDef];
+          const Vec3 fwd = cam.Forward();
+          const float dist = MetresToCells(3.0f);
+          const int sx = ifloor(player.pos.x + fwd.x * dist) - d.prefab.size.x / 2;
+          const int sz = ifloor(player.pos.z + fwd.z * dist) - d.prefab.size.z / 2;
+          const int sy = World::TerrainHeight(sx + d.prefab.size.x / 2,
+                                              sz + d.prefab.size.z / 2,
+                                              kDefaultSeed) + 1;
+          const uint64_t id = mobs.Spawn(humanDef, {sx, sy, sz});
+          // ARMED, so the dummy is the same body a real opponent will be:
+          // a sword in its hand is a limb the player's edge can bind against
+          // and, in Phase C, an arm that will swing back.
+          const ItemDef* sword = items.At(items.Find("sword"));
+          if (id && sword) mobs.EquipItem(id, sword);
+          std::printf("--duel-dummy: human at (%d,%d,%d)%s\n", sx, sy, sz,
+                      id ? "" : " FAILED");
+        } else {
+          std::fprintf(stderr, "--duel-dummy: no \"human\" mob def\n");
+        }
+      }
       if (ui.spawnMob) {
         ui.spawnMob = false;
         const WorldSnapshot& msnap = world.Snap();
@@ -4658,13 +4703,14 @@ int main(int argc, char** argv) {
             const ItemDef* want = meleeArmed ? heldItem : nullptr;
             const std::string wantName = want ? want->name : std::string();
             if (avatar.HeldItem() != wantName) avatar.EquipItem(want);
-            // WHERE THE ARM IS, so taking control of it is not a teleport: the
-            // swing seeds itself from the live pose and bounds itself by the
-            // rig's own reach (game/melee.h SetArm).
-            Vec3 handNow;
+            // WHERE THE BLADE IS, so taking control of it is not a teleport:
+            // the stroke seeds itself from the live point AND the live hand,
+            // takes its blade length from the pair, and bounds itself by the
+            // rig's own reach (game/melee.h SetStroke).
+            Vec3 handNow, tipNow, flatNow;
             float reachNow = 0;
-            if (avatar.WeaponArmPose(handNow, reachNow))
-              melee.SetArm(handNow, reachNow);
+            if (avatar.WeaponStrokePose(handNow, tipNow, flatNow, reachNow))
+              melee.SetStroke(handNow, tipNow, flatNow, reachNow);
             else
               melee.ClearArm();
           } else {
@@ -4676,9 +4722,11 @@ int main(int argc, char** argv) {
             // Weight rises while the weapon is up and FADES over the releasing
             // recover, so the arm is handed back to the walk cycle across a
             // couple of hundred ms instead of being dropped in one tick from
-            // wherever the player left it (melee.h PoseWeight).
-            avatar.SetWeaponPose(melee.HandOffset(), melee.BladeDir(),
-                                 melee.BladeUp(), melee.PoseWeight());
+            // wherever the player left it (melee.h PoseWeight). The whole pose
+            // travels as ONE value — hand, blade axis, blade roll and the
+            // elbow's bend pole — because the rig needs all four to put the
+            // sword where the stroke says it is.
+            avatar.SetWeaponPose(melee.Pose());
           }
         }
         // ---- ARMOUR: what the equipment says vs what the body wears --------
@@ -4990,87 +5038,23 @@ int main(int argc, char** argv) {
       // Deferred to this point for the same reason the laser kerf is: a carve
       // needs the `spawns` list debris.PreTick fills just above.
       if (avatar.Spawned() && meleeArmed) {
-        Vec3 eb, et;
+        Vec3 eb, et, ef;
         float ehw = 0;
-        if (avatar.WeaponEdge(eb, et, ehw)) {
-          if (lastEdgeValid) {
-            // Tip speed is what scales the damage: the base of a blade barely
-            // moves in a swing that whips the point through, and a cut should
-            // reflect that. Measured over the tick, in world voxels/sec.
-            const float tipSpeed = (et - lastEdgeTip).len() / kTickDt;
-            const MeleeTuning& mt = melee.tuning;
-            if (melee.Cutting() && tipSpeed > mt.minSpeed) {
-              float t = (tipSpeed - mt.minSpeed) /
-                        std::max(mt.fullSpeed - mt.minSpeed, 1e-3f);
-              const float power = std::clamp(t, 0.0f, 1.0f);
-              const float radius = ehw + heldItem->carveBonus;
-              // Sample along the blade AND across the sweep, so a fast cut
-              // does not tunnel between ticks. Both counts are bounded and
-              // scale with how far the blade actually moved (rule 2): a
-              // stationary blade costs one probe, and no swing can cost more
-              // than kMaxSteps * kMaxAlong however fast the mouse is flicked.
-              const float sweep = (et - lastEdgeTip).len();
-              const int kMaxSteps = 6, kMaxAlong = 5;
-              const int steps = std::clamp(
-                  (int)std::ceil(sweep / std::max(radius, 0.5f)), 1, kMaxSteps);
-              const int along = std::clamp(
-                  (int)std::ceil((et - eb).len() / std::max(radius, 0.5f)), 1,
-                  kMaxAlong);
-              // One hit per body per swing tick: without this the same limb is
-              // carved once per probe and a single cut removes a whole arm.
-              std::vector<uint64_t> hitBodies;
-              for (int s = 1; s <= steps && (int)hitBodies.size() < 8; s++) {
-                const float u = (float)s / (float)steps;
-                const Vec3 a = lastEdgeBase + (eb - lastEdgeBase) * u;
-                const Vec3 b = lastEdgeTip + (et - lastEdgeTip) * u;
-                for (int k = 0; k <= along; k++) {
-                  const float v = (float)k / (float)along;
-                  const Vec3 p = a + (b - a) * v;
-                  // A short ray along the blade's own length is what finds
-                  // what the edge is passing through. Using the segment the
-                  // blade occupies (rather than a point test) is what lets a
-                  // thin fast blade hit at all.
-                  const Vec3 seg = (b - a);
-                  const float segLen = seg.len();
-                  if (segLen < 1e-4f) continue;
-                  float frac = 1.0f;
-                  const float probe = std::max(radius * 2.0f, 0.6f);
-                  uint64_t hb = phys.CastRayBody(p, seg.normalized(), probe, frac);
-                  if (!hb) continue;
-                  bool seen = false;
-                  for (uint64_t h : hitBodies) seen |= (h == hb);
-                  if (seen) continue;
-                  // A weapon must not cut its wielder. The avatar's own parts
-                  // are permanently inside the swing arc — the blade starts in
-                  // its own hand — so without this every guard would saw
-                  // through the arm holding it.
-                  if (avatar.OwnsBody(hb)) continue;
-                  hitBodies.push_back(hb);
-                  const Vec3 at = p + seg.normalized() * (frac * probe);
-                  // LIVE FLESH CARVES; DEBRIS MELTS. The same two populations
-                  // the laser splits on, through the same two calls — a mob
-                  // limb loses voxels exactly where the edge crossed it, which
-                  // is what makes dismemberment geometric rather than a
-                  // threshold (DESIGN.md §7 "Carving living bodies").
-                  const float dmg = heldItem->damage * power;
-                  // Everything severed inside this scope is a BLADE cut, and
-                  // gets the wet dismember sound on top of the creature's own
-                  // cry. Both calls below can sever several frames deep —
-                  // Damage() at zero hp or over the impact threshold,
-                  // CarveLimbRadial() when the limb collapses — so the cause
-                  // is marked around them rather than passed down through a
-                  // chain the laser and explosions also use.
-                  MobSystem::BladeCutScope blade(mobs, power);
-                  if (mobs.Damage(hb, dmg, at, tipSpeed)) {
-                    mobs.CarveLimbRadial(hb, at, radius * (0.6f + 0.4f * power),
-                                         true /*ragged*/, true /*eject*/, world,
-                                         spawns);
-                  } else {
-                    debris.MeltBodyAt(hb, at, radius, world, spawns);
-                  }
-                }
-              }
-            }
+        if (avatar.WeaponEdge(eb, et, ehw, &ef)) {
+          if (lastEdgeValid && melee.Cutting()) {
+            EdgeSweep sw;
+            sw.aPrev = lastEdgeBase;
+            sw.bPrev = lastEdgeTip;
+            sw.aNow = eb;
+            sw.bNow = et;
+            sw.flatNow = ef;
+            sw.dt = kTickDt;
+            sw.halfWidth = ehw;
+            sw.damage = heldItem->damage;
+            sw.carveBonus = heldItem->carveBonus;
+            sw.valid = true;
+            MeleeSweepDamage(sw, melee.tuning, avatar, phys, mobs, debris,
+                             world, spawns);
           }
           lastEdgeBase = eb;
           lastEdgeTip = et;

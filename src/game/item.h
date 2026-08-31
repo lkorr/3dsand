@@ -340,6 +340,19 @@ struct ItemDef {
   bool hasEdge = false;
   Vec3 edgeFrom{}, edgeTo{};
   float edgeHalfWidth = 0;
+  // WHICH WAY THE FLAT FACES, in the same local frame: the normal of the
+  // blade's cutting plane, so the EDGE is perpendicular to both this and the
+  // edge segment. Unit, authored beside `axis` in the sidecar's `edge` block.
+  //
+  // Needed by two separate things and derivable by neither. The stroke driver
+  // rolls the blade so the edge leads the travel (melee.h), and the damage
+  // sweep scales a hit by how edge-on it was (MeleeEdgeAlign) — and "which of
+  // the two axes perpendicular to the blade is the thin one" is a fact about
+  // the ART that only the art's own generator knows. A blade with none
+  // authored falls back to an arbitrary perpendicular, which costs nothing but
+  // makes its roll meaningless: it will always read as half-aligned.
+  bool hasEdgeFlat = false;
+  Vec3 edgeFlat{0, 1, 0};
 
   // ---- melee ----
   // Damage per hit at full swing speed. Scaled by how fast the edge is
