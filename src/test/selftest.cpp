@@ -144,6 +144,14 @@ const char* const kOrder[] = {
     // 900 ticks, and it regenerates the world on the way out so the gates
     // after it still find pristine terrain (rule 7).
     "fire-down",
+    // The swing's OTHER half. `swing` up top is MeleeState alone and costs
+    // milliseconds; this one stands an avatar on real terrain with the blade
+    // drawn, spawns a dummy to cut, and measures the sword's world trajectory
+    // through the whole IK/clamp/physics pipeline. It belongs down here with
+    // the world-touching gates for exactly the reasons they give: it carves
+    // real bodies at absolute coordinates, and it regenerates worldgen on the
+    // way out so the gates after it still find pristine terrain (rule 7).
+    "swing-plane",
     // LAST of the world-touching gates, and it must be: BuildVoxRegion moves
     // the residency window and resets the page table, which is the state every
     // other gate's fixture placement assumes. It restores both before it

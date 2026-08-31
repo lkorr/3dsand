@@ -715,6 +715,7 @@ void MeleeState::Reset() {
   tipPrev_ = Vec3{};
   tipVel_ = Vec3{};
   tangent_ = Vec3{};
+  extendLive_ = 0;
   framePrimed_ = false;
   recoverHold_ = false;
 }
@@ -724,11 +725,39 @@ void MeleeState::Reset() {
 // Given the integrated stroke, produce the tip, the blade frame, the bend pole
 // and finally the hand. Everything is in BASIS coordinates until the last four
 // lines; nothing here reads the input.
-void MeleeState::RebuildFrame(float dt, const Vec3& right, const Vec3& up,
-                              const Vec3& fwd) {
+void MeleeState::RadiusBand(float& lo, float& hi, float& handRadius) const {
   const float handReach =
       (armValid_ ? armReach_ : tuning.fallbackReach) * tuning.reachFraction;
-  const float tipReach = handReach + bladeLen_;
+  // THE LIVE extension, not the tuning target: a take-over starts the arm
+  // wherever the animation had it and eases from there, and a band computed
+  // from the target would refuse the pose the arm is actually in.
+  handRadius = std::clamp(extendLive_ > 1e-4f ? extendLive_
+                                              : handReach * tuning.handExtend,
+                          0.05f, handReach);
+  const float L = bladeLen_;
+  if (L < 1e-4f) {
+    // No blade: the point IS the hand, so the band is simply the arm.
+    lo = handReach * 0.15f;
+    hi = handReach;
+    return;
+  }
+  // The reach annulus of a one-link chain of length L pinned at radius
+  // handRadius. Margins keep the ends off the degenerate cases: at `hi` the
+  // blade lies exactly along the arm's own line (nothing left to lean) and at
+  // `lo` it doubles back on it.
+  const float margin = std::min(0.25f, std::max(L, handRadius) * 0.05f);
+  lo = std::fabs(L - handRadius) + margin;
+  hi = L + handRadius - margin;
+  if (hi <= lo) {           // degenerate: the two lengths coincide
+    lo = std::max(handRadius * 0.4f, 0.05f);
+    hi = handRadius + L;
+  }
+}
+
+void MeleeState::RebuildFrame(float dt, const Vec3& right, const Vec3& up,
+                              const Vec3& fwd) {
+  float rLo = 0, rHi = 0, rHand = 0;
+  RadiusBand(rLo, rHi, rHand);
 
   // THE TOTAL, clamped: the steered stroke plus the cut's follow-through. az_
   // and el_ were already clamped as they were integrated (that is what banks
@@ -738,8 +767,7 @@ void MeleeState::RebuildFrame(float dt, const Vec3& right, const Vec3& up,
   const float azLo = handSign_ > 0 ? -tuning.azAcross : -tuning.azOut;
   const float az = std::clamp(az_ + swingAz_, azLo, azHi);
   const float el = std::clamp(el_ + swingEl_, tuning.elMin, tuning.elMax);
-  const float r = std::clamp(radius_ + swingOut_,
-                             tipReach * tuning.radiusMinFraction, tipReach);
+  const float r = std::clamp(radius_ + swingOut_, rLo, rHi);
 
   const float ce = std::cos(el), se = std::sin(el);
   const Vec3 tipL{r * ce * std::sin(az), r * se, r * ce * std::cos(az)};
@@ -765,11 +793,73 @@ void MeleeState::RebuildFrame(float dt, const Vec3& right, const Vec3& up,
     if (t.len() > 1e-3f) tangent_ = t.normalized();
   }
 
-  // THE BLADE LEANS INTO THE CUT. Along the radius, tilted toward where the
-  // point is going: at bladeLead 0 the sword is a straight extension of the
-  // shoulder-to-tip line (a lunge), and higher values cock the wrist back so
-  // the point leads the hand through the arc.
-  Vec3 wantDir = radial + tangent_ * tuning.bladeLead;
+  // ---- HOW FAR THE BLADE LEANS OFF THE RADIUS -----------------------------
+  //
+  // NOT A TASTE CONSTANT — a law of cosines. The point is at radius `r`, the
+  // blade is a rigid `bladeLen_` long, and the hand is to be held at `rHand`:
+  // that triangle has exactly one interior angle at the point, so the blade's
+  // angle to the shoulder-to-point line is DETERMINED. Solving it here instead
+  // of picking a lean is what guarantees the derived hand is somewhere the arm
+  // can actually be. The first version leaned a fixed amount off the radius
+  // and, with a 1.1 m sword on a 1.0 m arm, put the hand AT the shoulder and
+  // folded the whole chain into the chest — measured through the rig, the sword
+  // then missed its commanded point by up to 19.8 voxels on an 11.2 voxel
+  // stroke, which is the arm not following the mouse at all.
+  //
+  // WHICH SIDE it leans to is the only free choice, and `handLead` makes it:
+  // +1 puts the hand AHEAD of the point along the travel, which is a sabre cut.
+  //
+  // THE ARM SETTLES, THE PLANE TURNS, AND THE BLADE IS REBUILT FROM BOTH. The
+  // two smoothed quantities are `extendLive_` (how far the hand is held from
+  // the shoulder) and `perpL_` (which way the lean goes); the direction itself
+  // is recomputed exactly every tick, so |tip - hand| is bladeLen_ and |hand|
+  // is extendLive_ at EVERY instant, transients included. Smoothing the
+  // direction instead put the hand at the shoulder on every reversal — see the
+  // note on perpL_ in melee.h.
+  const float handReachNow =
+      (armValid_ ? armReach_ : tuning.fallbackReach) * tuning.reachFraction;
+  extendLive_ = extendLive_ > 1e-4f ? extendLive_ : rHand;
+  extendLive_ +=
+      (std::clamp(handReachNow * tuning.handExtend, 0.05f, handReachNow) -
+       extendLive_) *
+      SmoothAlpha(tuning.extendSmoothing, dt);
+
+  // WHICH WAY THE LEAN GOES: with the travel (so the hand leads the point), or
+  // against it. Rotated toward the target ABOUT THE RADIUS at a bounded rate,
+  // which is the only way to cross a reversal without passing through the
+  // degenerate middle. With nothing travelling the plane simply holds.
+  {
+    Vec3 want = tangent_;
+    if (want.len() < 1e-3f) want = perpL_;
+    want = want - radial * radial.dot(want);
+    if (want.len() < 1e-4f) want = AnyPerp(radial);
+    want = want.normalized();
+    // Re-project the stored plane onto the CURRENT radius first: the radius
+    // moved this tick, and a perpendicular to last tick's is not one to this.
+    Vec3 cur = perpL_ - radial * radial.dot(perpL_);
+    if (cur.len() < 1e-4f) cur = AnyPerp(radial);
+    cur = cur.normalized();
+    const float c = std::clamp(cur.dot(want), -1.0f, 1.0f);
+    const float sgn = cur.cross(want).dot(radial) < 0.0f ? -1.0f : 1.0f;
+    float turn = std::acos(c) * sgn;
+    const float maxTurn = std::max(tuning.leanTurnRate, 0.0f) * dt;
+    turn = std::clamp(turn, -maxTurn, maxTurn);
+    // Rodrigues about the radius; `cur` is already perpendicular to it, so the
+    // axial term drops out.
+    perpL_ = cur * std::cos(turn) + radial.cross(cur) * std::sin(turn);
+    perpL_ = perpL_.len() > 1e-5f ? perpL_.normalized() : cur;
+  }
+
+  Vec3 wantDir = radial;
+  if (bladeLen_ > 1e-4f && r > 1e-4f) {
+    const float cosT = std::clamp((r * r + bladeLen_ * bladeLen_ -
+                                   extendLive_ * extendLive_) /
+                                      (2.0f * bladeLen_ * r),
+                                  -1.0f, 1.0f);
+    const float sinT = std::sqrt(std::max(0.0f, 1.0f - cosT * cosT));
+    const float s = tuning.handLead >= 0.0f ? 1.0f : -1.0f;
+    wantDir = radial * cosT - perpL_ * (sinT * s);
+  }
   if (wantDir.len() < 1e-5f) wantDir = radial;
   wantDir = wantDir.normalized();
   // THE FLAT FACES OUT OF THE STROKE PLANE, which is the same statement as
@@ -779,18 +869,12 @@ void MeleeState::RebuildFrame(float dt, const Vec3& right, const Vec3& up,
   if (wantFlat.len() < 1e-3f) wantFlat = bladeFlatL_;   // no travel: hold the roll
   if (wantFlat.len() < 1e-3f) wantFlat = AnyPerp(wantDir);
   wantFlat = wantFlat.normalized();
-  // THE ELBOW TRAILS THE HAND. The pole says which way the middle joint
-  // bulges, so putting it opposite the travel puts the bend plane IN the plane
-  // of the cut — a horizontal sweep then reads as shoulder rotation plus elbow
-  // extension in the horizontal plane, which the fixed authored pole could
-  // never do. With no travel it falls back to straight behind, which is these
-  // rigs' own authored arm pole ([0,0,-1]).
-  const Vec3 wantPole =
-      tangent_.len() > 1e-3f ? tangent_ * -1.0f : Vec3{0, 0, -1};
-
   const float a = SmoothAlpha(tuning.bladeSmoothing, dt);
-  bladeDirL_ = Lerp(bladeDirL_, wantDir, a);
-  bladeDirL_ = bladeDirL_.len() > 1e-5f ? bladeDirL_.normalized() : wantDir;
+  // NOT SMOOTHED — see above. The smoothing that makes this continuous lives in
+  // `extendLive_` and `perpL_`, both of which the direction is exactly derived
+  // from, so the hand-to-point constraint holds on every tick instead of only
+  // in the steady state.
+  bladeDirL_ = wantDir;
   bladeFlatL_ = Lerp(bladeFlatL_, wantFlat, a);
   // Re-orthogonalize every tick: two independently smoothed unit vectors drift
   // out of square, and a "flat normal" that is not perpendicular to the blade
@@ -798,17 +882,52 @@ void MeleeState::RebuildFrame(float dt, const Vec3& right, const Vec3& up,
   bladeFlatL_ = bladeFlatL_ - bladeDirL_ * bladeDirL_.dot(bladeFlatL_);
   bladeFlatL_ = bladeFlatL_.len() > 1e-5f ? bladeFlatL_.normalized()
                                           : AnyPerp(bladeDirL_);
-  poleL_ = Lerp(poleL_, wantPole, a);
-  poleL_ = poleL_.len() > 1e-5f ? poleL_.normalized() : wantPole;
 
   // THE HAND IS THE TIP MINUS A BLADE. Not the other way round — that
-  // inversion IS this rewrite. The residual clamp below is a safety net for the
-  // lean (a blade at an angle to the radius puts the hand fractionally further
-  // out than r - bladeLen); the thing that actually keeps the arm in reach is
-  // the clamp on `radius_` itself, which is why nothing banks.
+  // inversion IS this rewrite. The residual clamp below is a safety net; the
+  // thing that actually keeps the arm in reach is `extendLive_`, which the
+  // blade's own angle is solved against, so nothing banks.
   Vec3 handL = tipL - bladeDirL_ * bladeLen_;
+  const float handReach =
+      (armValid_ ? armReach_ : tuning.fallbackReach) * tuning.reachFraction;
   const float hd = handL.len();
   if (handReach > 1e-3f && hd > handReach) handL = handL * (handReach / hd);
+
+  // THE ELBOW TRAILS THE HAND — and it is the HAND'S OWN travel that says so,
+  // not the point's. The pole names the plane the two-bone solver bends in, and
+  // a plane is only defined relative to the chain it bends: the solver
+  // immediately orthogonalizes whatever it is given against the shoulder-to-
+  // HAND direction. The first version handed it the tip's tangent, which for a
+  // long blade is a completely different direction — measured mid-sweep, the
+  // tip tangent came out at 153 degrees to the arm, so 89% of the pole was the
+  // useless component the solver throws away and the bend plane was decided by
+  // the 11% that survived. Building it from the hand's travel keeps it
+  // perpendicular to the arm by construction.
+  //
+  // With no travel it falls back to straight behind, which is these rigs' own
+  // authored arm pole ([0,0,-1]) and the pose a resting elbow is in.
+  {
+    const Vec3 handVel =
+        (framePrimed_ && dt > 1e-6f) ? (handL - handPrev_) * (1.0f / dt)
+                                     : Vec3{};
+    handPrev_ = handL;
+    handVel_ = framePrimed_ ? Lerp(handVel_, handVel, a) : Vec3{};
+    const Vec3 handDir = handL.len() > 1e-4f ? handL.normalized() : Vec3{0, 0, 1};
+    Vec3 along = handVel_ - handDir * handDir.dot(handVel_);
+    Vec3 wantPole = along.len() > 1e-2f ? along.normalized() * -1.0f
+                                        : Vec3{0, 0, -1};
+    // ...orthogonalized here too, so the value handed across is already a plane
+    // rather than a hint the solver has to rescue.
+    wantPole = wantPole - handDir * handDir.dot(wantPole);
+    if (wantPole.len() < 1e-3f) {
+      wantPole = Vec3{0, 0, -1};
+      wantPole = wantPole - handDir * handDir.dot(wantPole);
+    }
+    if (wantPole.len() < 1e-3f) wantPole = AnyPerp(handDir);
+    poleL_ = Lerp(poleL_, wantPole.normalized(), a);
+    poleL_ = poleL_ - handDir * handDir.dot(poleL_);
+    poleL_ = poleL_.len() > 1e-5f ? poleL_.normalized() : AnyPerp(handDir);
+  }
 
   tip_ = ToWorld(tipL, right, up, fwd);
   hand_ = ToWorld(handL, right, up, fwd);
@@ -857,9 +976,9 @@ void MeleeState::Update(float dt, bool held, bool armed, const Vec3& right,
 
   phaseTime_ += dt;
 
-  const float handReach =
-      (armValid_ ? armReach_ : tuning.fallbackReach) * tuning.reachFraction;
-  const float tipReach = handReach + bladeLen_;
+  float rLo = 0, rHi = 0, rHand = 0;
+  RadiusBand(rLo, rHi, rHand);
+  const float tipReach = rHi;
   const float azHi = handSign_ > 0 ? tuning.azOut : tuning.azAcross;
   const float azLo = handSign_ > 0 ? -tuning.azAcross : -tuning.azOut;
 
@@ -885,7 +1004,17 @@ void MeleeState::Update(float dt, bool held, bool armed, const Vec3& right,
         const Vec3 seedTip = armValid_ ? armTip_ : guard;
         const Vec3 seedHand = armValid_ ? armHand_ : guard;
         Vec3 tipL = ToBasis(seedTip, right, up, fwd);
+        // THE ARM STARTS AS EXTENDED AS IT ACTUALLY IS. `extendLive_` is what
+        // the whole blade geometry is solved against, so seeding it from the
+        // live hand is what makes the take-over exact: the law of cosines then
+        // reproduces the blade's real angle rather than the tuning's, and the
+        // arm eases out to `handExtend` over the following fifth of a second.
+        extendLive_ = std::max(ToBasis(seedHand, right, up, fwd).len(), 0.05f);
         radius_ = tipL.len();
+        // The band has to be recomputed against that seeded extension, or the
+        // clamp below would judge the pose the arm is IN against the pose the
+        // tuning wants it in and move the blade on the take-over tick.
+        RadiusBand(rLo, rHi, rHand);
         if (radius_ < 1e-4f) {
           tipL = Vec3{0, 0, tipReach};
           radius_ = tipReach;
@@ -898,8 +1027,7 @@ void MeleeState::Update(float dt, bool held, bool armed, const Vec3& right,
         // melee.h says so.
         az_ = std::clamp(az_, azLo, azHi);
         el_ = std::clamp(el_, tuning.elMin, tuning.elMax);
-        radius_ =
-            std::clamp(radius_, tipReach * tuning.radiusMinFraction, tipReach);
+        radius_ = std::clamp(radius_, rLo, rHi);
         swingAz_ = swingEl_ = swingOut_ = 0;
 
         // SEED THE DERIVED FRAME FROM THE BLADE ITSELF, and skip this tick's
@@ -915,10 +1043,36 @@ void MeleeState::Update(float dt, bool held, bool armed, const Vec3& right,
         Vec3 fl = ToBasis(armFlat_, right, up, fwd);
         fl = fl - bladeDirL_ * bladeDirL_.dot(fl);
         bladeFlatL_ = fl.len() > 1e-3f ? fl.normalized() : AnyPerp(bladeDirL_);
+        // AND THE LEAN PLANE FROM THE BLADE'S OWN ANGLE. Inverting the law of
+        // cosines' own form: the blade is `radial * cos - perp * sin * s`, so
+        // the perpendicular is what is left of it once the radial part is
+        // taken out, negated by the lead's sign. Seeded this way, the first
+        // rebuilt tick reproduces the seed exactly instead of rotating the
+        // sword to whichever side the tuning happens to prefer.
+        {
+          const Vec3 rad = tipL.len() > 1e-5f ? tipL.normalized() : Vec3{0, 0, 1};
+          Vec3 pc = bladeDirL_ - rad * rad.dot(bladeDirL_);
+          const float s = tuning.handLead >= 0.0f ? 1.0f : -1.0f;
+          if (pc.len() > 1e-4f) {
+            perpL_ = pc.normalized() * -s;
+          } else {
+            // A blade that starts along its own radius says nothing about which
+            // way it will lean, and the fallback matters: `AnyPerp` picks the
+            // VERTICAL perpendicular, which starts every stroke leaning
+            // downward and takes a fifth of a second to rotate out. A sword is
+            // swung sideways far more often than it is dropped, so the
+            // horizontal perpendicular is the better prior — and it is the one
+            // a horizontal cut is already asking for.
+            const Vec3 h = rad.cross(Vec3{0, 1, 0});
+            perpL_ = h.len() > 1e-3f ? h.normalized() : AnyPerp(rad);
+          }
+        }
         poleL_ = Vec3{0, 0, -1};
         tangent_ = Vec3{};
         tipVel_ = Vec3{};
         tipPrev_ = tipL;
+        handPrev_ = handL;
+        handVel_ = Vec3{};
         framePrimed_ = true;
         tip_ = ToWorld(tipL, right, up, fwd);
         hand_ = ToWorld(handL, right, up, fwd);
@@ -1009,8 +1163,7 @@ void MeleeState::Update(float dt, bool held, bool armed, const Vec3& right,
     az_ = std::clamp(az_ + delta.x * tuning.aimGainX, azLo, azHi);
     el_ =
         std::clamp(el_ - delta.y * tuning.aimGainY, tuning.elMin, tuning.elMax);
-    radius_ = std::clamp(radius_ + delta.z * tuning.reachGain,
-                         tipReach * tuning.radiusMinFraction, tipReach);
+    radius_ = std::clamp(radius_ + delta.z * tuning.reachGain, rLo, rHi);
   }
 
   switch (phase_) {

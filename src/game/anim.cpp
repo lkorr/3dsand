@@ -746,12 +746,18 @@ void AnimClampPoseLimits(const AnimSkeleton& sk, AnimState& st,
           const float b = ov.blend > 1.0f ? 1.0f : ov.blend;
           const Vec3 a = raw.normalized();
           const Vec3 o = ov.axis.normalized();
-          // Sign-fix before mixing: the override is a PLANE normal and either
-          // sense names the same plane, but averaging two opposed vectors
-          // cancels to nothing and would leave the hinge axis undefined
-          // exactly at the halfway point of the blend.
-          const Vec3 os = a.dot(o) < 0.0f ? o * -1.0f : o;
-          raw = a + (os - a) * b;
+          // SIGN-FIX THE AUTHORED AXIS TOWARD THE OVERRIDE, never the other way
+          // round. Either sense names the same plane, but only one of them
+          // makes the joint's authored [min, max] describe the bend it is
+          // actually in — and the caller has already MEASURED which one that
+          // is (see the note at ApplyWeaponArm's sign block). Flipping the
+          // override to match the authored axis instead would undo that
+          // measurement and clamp a legitimately-bent elbow straight.
+          //
+          // The flip is only ever applied while blending; at blend 1 the
+          // authored axis drops out entirely.
+          const Vec3 as = a.dot(o) < 0.0f ? a * -1.0f : a;
+          raw = as + (o - as) * b;
           break;
         }
         const float len = raw.len();

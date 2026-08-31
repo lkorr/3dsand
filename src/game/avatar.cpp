@@ -1425,7 +1425,22 @@ void PlayerAvatar::UpdateAnimation(float dt, World& world, bool grounded,
   // torso" stop being things a gate has to notice after the fact and become
   // unrepresentable: the hip simply cannot reach those angles, whatever target
   // the solver was handed. Rigs that author no `poseLimit` pay one bool test.
-  AnimClampPoseLimits(sk, st);
+  //
+  // The weapon arm hands in ONE exception, and only while a stroke is live: the
+  // elbow's hinge PLANE is steered into the plane of the cut. Its RANGE is not
+  // touched, so the joint stays exactly as impossible to hyperextend as it was
+  // — see anim.h PoseAxisOverride for why a steered plane is the anatomically
+  // honest answer and not a loophole.
+  //
+  // FORGETTING THE OVERRIDE HERE IS SILENT AND EXPENSIVE. It was, for four
+  // measured runs: the solve reached its target (`ikMiss 0.00` every tick) and
+  // the clamp then discarded the whole off-plane component of the elbow, so the
+  // arm arrived up to 2.9 voxels from where the stroke asked with every
+  // in-pipeline probe reporting success. Mob::RecordWeaponClamp is what makes
+  // that visible now, and it only runs if it is called — which is why it sits
+  // on the same line.
+  AnimClampPoseLimits(sk, st, &weaponHinge, 1);
+  RecordWeaponClamp(sk, st);
 }
 
 // ---- per-tick ---------------------------------------------------------------

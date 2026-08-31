@@ -184,9 +184,37 @@ struct MeleeTuning {
   // tick — the one thing the whole design forbids.
   float elMin = -1.50f;     // 86 deg below level: the arm hangs at the side
   float elMax = 1.48f;      // 85 deg: overhead, just short of straight up
-  // Tip radius floor, as a fraction of the full arm+blade reach. A point drawn
-  // any closer is inside the wielder's own chest.
-  float radiusMinFraction = 0.35f;
+  // HOW EXTENDED THE ARM IS HELD, as a fraction of its own reach. This is the
+  // number that decides the blade's angle to the arm, and it decides it by
+  // GEOMETRY rather than by taste: given where the point is and how long the
+  // blade is, the hand can only be one distance from the shoulder, so fixing
+  // that distance fixes the angle (see RebuildFrame's law of cosines).
+  //
+  // It replaced a fixed "the blade lies along the radius, leaning a little into
+  // the travel", which is a fine description of a cut and an unusable control
+  // law: this sword is 1.1 m and the arm is 1.0 m, so a radial blade put the
+  // HAND at the shoulder and the IK folded the arm into the chest. Measured,
+  // the sword then missed its commanded point by up to 19.8 voxels on a 11.2
+  // voxel stroke — the arm was not following the mouse at all.
+  //
+  // 0.78 is a comfortably bent arm: enough extension to swing from, enough bend
+  // left that a cut can drive through rather than starting locked.
+  float handExtend = 0.78f;
+  // Seconds of halflife on the arm's extension easing back to `handExtend`
+  // after a take-over started it somewhere else. Slower than the blade's own
+  // smoothing on purpose: this is the arm settling, not the wrist working.
+  float extendSmoothing = 0.18f;
+  // How fast the lean plane may rotate about the radius, radians/sec. A rate
+  // limit rather than a halflife because the thing being limited is an ANGLE on
+  // a circle: an exponential blend between two opposite directions has to pass
+  // through the middle, and on this circle the middle is the degenerate case.
+  float leanTurnRate = 18.0f;
+  // WHICH END LEADS. +1 puts the HAND ahead of the point through the arc — a
+  // sabre cut, where you drive the hilt and the blade whips through behind it.
+  // -1 puts the point ahead. Only the SIGN is read: the size of the lean is
+  // already fixed by handExtend above, and letting this scale it too would let
+  // two knobs disagree about where the hand is.
+  float handLead = 1.0f;
   // Fallback arm reach, used only when the rig has not reported one through
   // MeleeState::SetStroke (no weapon equipped yet, or a severed arm). The live
   // rig's own bone lengths are preferred — see SetStroke.
@@ -224,21 +252,29 @@ struct MeleeTuning {
   // is also what carries the blade THROUGH a target rather than past it. This
   // is the radial channel doing the job the old law did with a forward offset.
   float swingExtend = 0.16f;
-  // How far the blade leans off the radius INTO the direction of travel, as a
-  // tangent (0 = the blade lies exactly along the shoulder-to-tip line, which
-  // is a lunge; higher = the point leads and the wrist cocks back). Small: a
-  // cut is mostly a rotation of a nearly-straight line about the shoulder.
-  float bladeLead = 0.30f;
   // Seconds of halflife on the blade frame and on the arm's bend plane. This
   // is what makes a take-over continuous — control starts at the blade's ACTUAL
   // orientation and eases to the commanded one — and what stops the flat of the
   // blade from snapping through 90 degrees when the tip changes direction.
   float bladeSmoothing = 0.055f;
-  // How far the wrist (plus whatever pronation the forearm has left) may take
-  // the blade away from the orientation the solved arm would give it, radians.
-  // The rig's elbow is a strict hinge, so forearm roll has nowhere to live but
-  // here; 85 degrees is a wrist plus a forearm and no more.
-  float wristMaxAngle = 1.48f;
+  // How far the wrist may take the blade away from the orientation the solved
+  // arm would give it for free, radians.
+  //
+  // IT IS NOT ALL WRIST, and that is why the number is so large. This rig's
+  // authored grip holds the blade PERPENDICULAR to the forearm (sword.json's
+  // -90 degree grip rotation, and gen_sword_item.py says so in as many words),
+  // which was right when the sword was never re-aimed. A cut wants the blade
+  // roughly along the arm's own line, so about 90 degrees of this budget is
+  // spent undoing the authored grip before any steering happens at all —
+  // measured, the stroke asked for 2.0 to 3.0 radians and an 85-degree cap
+  // clipped every tick of it, which showed up as the blade pointing up to 100
+  // degrees away from the cut.
+  //
+  // The structural fix is to re-author the grip so a neutral wrist already
+  // holds the blade along the arm; that changes how a sheathed sword looks in
+  // every screenshot, so it belongs with the rest of the tuning promotion
+  // rather than here. Until then this bounds the STEERING and not the grip.
+  float wristMaxAngle = 2.80f;
   // ---- the edge leads the cut ---------------------------------------------
   // Damage multiplier for a cut whose travel lies exactly in the FLAT of the
   // blade — a slap with the side. 1.0 disables edge alignment entirely; 0 makes
@@ -323,8 +359,9 @@ struct WeaponPose {
   // forearm gives it for free, radians. Carried ON THE POSE rather than read
   // from a tuning struct in the rig code because Mob has no MeleeState and must
   // not grow one: the driver owns the feel, the rig owns the anatomy, and this
-  // is the one number that crosses.
-  float wristMaxAngle = 1.48f;
+  // is the one number that crosses. (Default mirrors MeleeTuning's; see the
+  // long note there for why it is not 90 degrees.)
+  float wristMaxAngle = 2.80f;
   // False is the legacy contract: drive the arm at `hand` and leave the blade
   // at whatever grip angle the fist gives it. True is the stroke driver: the
   // hand is ORIENTED so the blade points along bladeDir with its flat facing
@@ -451,6 +488,13 @@ class MeleeState {
   // The stroke's own frame, rebuilt each tick from the basis handed to Update.
   void RebuildFrame(float dt, const Vec3& right, const Vec3& up,
                     const Vec3& fwd);
+  // THE ANNULUS OF TIP RADII THE ARM CAN ACTUALLY SERVE, given the blade it is
+  // holding and how extended `handExtend` says to hold it. Exactly the reach
+  // annulus a two-bone solver clamps to, one link further out: hand-to-point is
+  // a rigid bone too. Both the integrator and the seed clamp `radius_` with it,
+  // which is what keeps the derived hand inside the arm without the CLAMP being
+  // what does the keeping.
+  void RadiusBand(float& lo, float& hi, float& handRadius) const;
 
   SwingPhase phase_ = SwingPhase::Idle;
   float phaseTime_ = 0;
@@ -485,11 +529,25 @@ class MeleeState {
   Vec3 tipPrev_{};
   Vec3 tipVel_{};
   Vec3 tangent_{};
+  // The HAND's own travel, which is what the bend pole is built from — a plane
+  // for the arm to bend in has to be stated about the arm.
+  Vec3 handPrev_{}, handVel_{};
   // The blade frame and the bend pole, SMOOTHED, in the basis frame. Kept here
   // rather than only in world space for the same reason az_/el_ are: the basis
   // turns with the view every tick, and a world-space memory would read that
   // turn as blade motion and roll the edge into it.
   Vec3 bladeDirL_{0, 0, 1}, bladeFlatL_{0, 1, 0}, poleL_{0, 0, -1};
+  // THE LEAN PLANE, and how extended the arm is being held. These two are the
+  // smoothed state, and the blade direction is REBUILT from them every tick
+  // rather than being smoothed itself — see RebuildFrame. Smoothing a direction
+  // is what a first version did, and it is wrong for a reason that only shows
+  // up on a REVERSAL: the two ends of that interpolation lean opposite ways, so
+  // the path between them passes through the radius, where the hand is
+  // |r - bladeLen| from the shoulder. With a sword longer than the arm that is
+  // the shoulder itself, and the whole chain folded into the chest for three
+  // ticks every time the player changed direction.
+  Vec3 perpL_{0, 1, 0};       // unit, perpendicular to the radius
+  float extendLive_ = 0;      // the hand's distance from the shoulder, eased
   bool framePrimed_ = false;
   // The live arm, from SetStroke. `armReach_` is a bone length, not a tuning;
   // `bladeLen_` is the rig's own hand-to-point distance.

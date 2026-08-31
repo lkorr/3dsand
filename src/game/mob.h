@@ -743,6 +743,15 @@ class Mob {
                   Vec3* outFlat = nullptr) const;
   // Is this Jolt body one of this creature's own parts?
   bool OwnsBody(uint64_t bodyHandle) const;
+  // WHERE A LIMB'S JOINT IS, in world voxels, off its LIVE transform.
+  //
+  // `xf.pos` alone is the limb's min CORNER, which is not the joint and which
+  // swings around it as the limb rotates — so anything that used the corner as
+  // a centre of rotation would read a pure rotation as a translation. This runs
+  // the same `xf.pos + rot * anchorLimb` composition the kinematic submit path
+  // inverts, which is the joint itself. The `swing-plane` gate measures the
+  // sword's arc about the shoulder with it.
+  bool PartJointWorld(int part, Vec3& out) const;
   // THE STROKE DRIVER'S COMMAND TO THE RIG (game/melee.h). Presentation only;
   // consumed by the driver's own animation pass through ApplyWeaponArm.
   void SetWeaponPose(const WeaponPose& pose);
@@ -777,6 +786,29 @@ class Mob {
   // target the IK will be handed on the very next tick.
   bool WeaponStrokePose(Vec3& outHandFromShoulder, Vec3& outTipFromShoulder,
                         Vec3& outFlat, float& outReach) const;
+
+  // WHY THE SWORD IS NOT WHERE THE STROKE ASKED, in four numbers.
+  //
+  // There are three independent ways for a weapon pose to come out wrong — the
+  // IK cannot reach the hand, the wrist cannot take the blade angle, or the
+  // pose-limit clamp undoes the solve — and every one of them shows up
+  // downstream as the same thing: a sword somewhere else. Chasing that with A/B
+  // elimination costs one hypothesis per run (CLAUDE.md rule 6); recording the
+  // three at the point of failure costs nothing and prints the answer on one
+  // line. `swing-plane`'s follow pass reads exactly this.
+  struct WeaponArmDiag {
+    bool ran = false;
+    float ikMiss = 0;        // hand target -> solved hand, world voxels
+    float wristWant = 0;     // radians the blade asked the wrist to travel
+    float wristApplied = 0;  // ...and what the wrist limit allowed
+    float clampMove = 0;     // radians AnimClampPoseLimits then took back
+    float clampShift = 0;    // ...and how far it moved the HAND, world voxels
+    float shoulderClamp = 0; // radians the ball limit took off the shoulder
+    float elbowClamp = 0;    // radians the hinge took off the elbow
+    float roundTrip = 0;     // commanded hand -> WeaponArmPose's read of it
+    Vec3 cmdHand{}, gotHand{};  // the two ends of that comparison
+  };
+  const WeaponArmDiag& WeaponArmDiagnostics() const { return weaponDiag_; }
 
   // ---- render plumbing (per creature; MobSystem chains these over its list) -
   // The Append* walks MUST visit slots in the same order: the slot a transform
@@ -814,6 +846,10 @@ class Mob {
   // SetWeaponPose does.
   void ApplyWeaponArm(const AnimSkeleton& sk, AnimState& st,
                       PoseAxisOverride& ov) const;
+  // Called by both drivers straight after AnimClampPoseLimits: fills in
+  // WeaponArmDiag::clampMove, the one piece of attribution that cannot be
+  // collected inside ApplyWeaponArm because the clamp has not run yet.
+  void RecordWeaponClamp(const AnimSkeleton& sk, const AnimState& st) const;
 
   // ---- THE EXPLICIT-EXCEPTION SEAM ------------------------------------------
   // Everything the avatar does differently from an NPC goes through one of
@@ -1069,6 +1105,10 @@ class Mob {
   // Swing pose pushed in by the driver (SetWeaponPose). Pure presentation.
   WeaponPose weapon_{};
   float weaponWeight_ = 0;     // weapon_.weight, clamped once on the way in
+  mutable WeaponArmDiag weaponDiag_{};
+  mutable Quat weaponHandPreClamp_{}, weaponUpPreClamp_{}, weaponLoPreClamp_{};
+  mutable Vec3 weaponHandPosPreClamp_{};
+  mutable int weaponHandPart_ = -1, weaponUpPart_ = -1, weaponLoPart_ = -1;
 
   // Particles authored outside the tick (Sever is reached from damage handling
   // all over the frame); drained by the driver's PreTick.
