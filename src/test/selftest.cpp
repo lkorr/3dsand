@@ -44,6 +44,7 @@ const std::vector<Gate>& SpellGates();
 const std::vector<Gate>& PlayerKitGates();
 const std::vector<Gate>& SwingGates();
 const std::vector<Gate>& EquipmentGates();
+const std::vector<Gate>& WoundGates();
 
 // THE EXECUTION ORDER, and it is load-bearing.
 //
@@ -144,6 +145,31 @@ const char* const kOrder[] = {
     // 900 ticks, and it regenerates the world on the way out so the gates
     // after it still find pristine terrain (rule 7).
     "fire-down",
+    // ---- THE WOUND MODEL ---------------------------------------------------
+    // LAST of the mob gates, and the position is a lesson rather than a
+    // preference.
+    //
+    // These four belong with the world-touching mob gates: they spawn creatures
+    // at absolute coordinates inside the residency window, and `wound-bleed`
+    // pours real blood into the CA and regenerates the world on the way out,
+    // exactly as `mob-burn` does. The obvious slot was therefore right after
+    // `mob-burn` — and putting them there FAILED `armor-react`, whose acid bath
+    // found the bare arm losing 0 skin voxels in 120 ticks where it had lost 18.
+    //
+    // Nothing about acid, armour or occlusion had changed. A gate that merely
+    // SPAWNS CREATURES perturbs every id-keyed draw after it (MobSystem's id
+    // counter seeds the gore profile, the crater noise and the burn/dissolve
+    // RNG key), and armour's acid arm is already documented in its own source
+    // as swinging by an order of magnitude between scopes for that reason.
+    // Restoring the id counter (MobSystem::SetNextIdCounter, which these gates
+    // do) closes the largest channel but not every one of them: the suite's
+    // shared World, page table and tick stream are others.
+    //
+    // So the rule a NEW gate should follow, and the reason this comment is
+    // long: a gate added to a suite that shares one World has to go where it
+    // disturbs the fewest gates that were there first, and that is the END of
+    // its group — not the middle of it, however well it reads there.
+    "wound-chip", "wound-accumulate", "wound-heft", "wound-bleed",
     // LAST of the world-touching gates, and it must be: BuildVoxRegion moves
     // the residency window and resets the page table, which is the state every
     // other gate's fixture placement assumes. It restores both before it
@@ -163,7 +189,7 @@ const std::vector<Gate>& Registry() {
                           &MobGates(), &BodyGates(), &WorldIoGates(), &AudioGates(),
                           &VoxRegionGates(),
                           &SpellGates(), &PlayerKitGates(), &SwingGates(),
-                          &EquipmentGates()})
+                          &EquipmentGates(), &WoundGates()})
       pool.insert(pool.end(), g->begin(), g->end());
 
     std::vector<Gate> v;

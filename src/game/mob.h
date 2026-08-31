@@ -1419,6 +1419,24 @@ class MobSystem {
   uint64_t MobIdAt(uint32_t i) const {
     return i < mobs_.size() ? mobs_[i].Id() : 0;
   }
+  // ---- THE ID COUNTER, AND PUTTING IT BACK ----------------------------------
+  //
+  // A mob id is not a handle: it seeds the entity-scoped gore variance
+  // (MakeGoreProfile), the blast crater's noise, and the per-limb RNG key the
+  // burn/dissolve pass draws against. So a caller that merely SPAWNS creatures
+  // shifts every later creature's randomness, which is a property gates share
+  // one World for and nothing else in the suite can see.
+  //
+  // Measured: inserting four gates that each spawn a handful of fixtures ahead
+  // of `armor-react` re-rolled its acid bath and the bare arm dissolved 0 skin
+  // voxels in 120 ticks instead of 18, failing a `lostB > 0` sanity check about
+  // whether the bath was acid at all. Nothing about acid had changed.
+  //
+  // Reset(rewindIds=true) is NOT the fix: setting the counter to 1 is a
+  // different perturbation, not the absence of one. A gate that wants to leave
+  // the suite as it found it saves this and puts it back.
+  uint64_t NextIdCounter() const { return nextId_; }
+  void SetNextIdCounter(uint64_t n) { nextId_ = n ? n : 1; }
   uint64_t LimbBody(uint64_t mobId, int limbIndex) const;
   bool IsAlive(uint64_t mobId) const;
 
