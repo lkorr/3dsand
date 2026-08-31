@@ -5004,6 +5004,19 @@ int main(int argc, char** argv) {
                         std::max(mt.fullSpeed - mt.minSpeed, 1e-3f);
               const float power = std::clamp(t, 0.0f, 1.0f);
               const float radius = ehw + heldItem->carveBonus;
+              // ---- WHAT THE WOUND MODEL NEEDS, MEASURED ONCE ---------------
+              // HEFT: the weapon's own volume against the reference, so a
+              // greatsword cuts deeper than a knife because it IS bigger
+              // (item.h ItemDef::heftVolume). WHICH WAY THE EDGE IS GOING:
+              // how far the blade travelled over the tick, which is the axis
+              // a kerf penetrates along and the one thing a radius has no way
+              // to express. Both are per-swing constants, so they are lifted
+              // clear of the sample loops below.
+              const auto& goreT = CurrentTuning().gore;
+              const float heft =
+                  heldItem->HeftFactor(goreT.woundHeftRef, goreT.woundHeftMax);
+              const Vec3 sweepDir =
+                  ((eb + et) - (lastEdgeBase + lastEdgeTip)).normalized();
               // Sample along the blade AND across the sweep, so a fast cut
               // does not tunnel between ticks. Both counts are bounded and
               // scale with how far the blade actually moved (rule 2): a
@@ -5062,9 +5075,38 @@ int main(int argc, char** argv) {
                   // chain the laser and explosions also use.
                   MobSystem::BladeCutScope blade(mobs, power);
                   if (mobs.Damage(hb, dmg, at, tipSpeed)) {
-                    mobs.CarveLimbRadial(hb, at, radius * (0.6f + 0.4f * power),
-                                         true /*ragged*/, true /*eject*/, world,
-                                         spawns);
+                    // A KERF, NOT A BITE. The radial carve this replaced took
+                    // a sphere out of the limb, which at any radius that felt
+                    // like a sword was most of an arm — and Damage() severed
+                    // on contact anyway, so the shape never got to matter.
+                    // Now it is the only thing that decides dismemberment:
+                    // the slot follows the blade's own edge and the direction
+                    // the swing is going, and a limb comes off when the
+                    // lattice has been cut through (game/mob.h BladeCut).
+                    BladeCut cut;
+                    cut.at = at;
+                    cut.edgeAxis = seg.normalized();
+                    // A stationary blade has no travel direction to speak of;
+                    // fall back to boring along its own length, which is what
+                    // a press with no swing behind it does.
+                    cut.cutDir = sweepDir.len() > 1e-4f ? sweepDir
+                                                        : seg.normalized();
+                    // The blade's OWN thickness decides the kerf's width; the
+                    // tuning knob only scales it, because the geometry is
+                    // supposed to be what decides the wound (items.json says
+                    // so about carveBonus for the same reason).
+                    cut.halfWidth = std::max(radius * goreT.cutWidth, 0.08f);
+                    cut.depth =
+                        (goreT.cutDepth + goreT.cutDepthPower * power) * heft;
+                    cut.length =
+                        goreT.cutLength * (0.4f + 0.6f * power) * heft;
+                    cut.power = power;
+                    // Counter-based, off the tick and the probe index: the
+                    // ragged rim and the blood soak must replay identically,
+                    // and nothing here may key on a Jolt float.
+                    cut.seed = tick * 2654435761u +
+                               (uint32_t)hitBodies.size() * 40503u;
+                    mobs.CutLimb(hb, cut, world, spawns);
                   } else {
                     debris.MeltBodyAt(hb, at, radius, world, spawns);
                   }

@@ -193,6 +193,14 @@ bool LoadItemAsset(const std::string& dir, size_t materialCount,
     d.size = held->size;
     d.offset = held->offset;
     d.voxels = held->voxels;
+    // HEFT IS MEASURED, NOT AUTHORED (item.h ItemDef::heftVolume). The voxel
+    // count divided by scale^3 is the item's volume in WORLD voxels, which is
+    // the one number that says "this is a greatsword and that is a knife"
+    // without anybody writing it down twice. Taken AFTER the upsample above,
+    // so `scale` and `voxels` are on the same lattice — reading it before
+    // would inflate a low-resolution item by artUpsample^3.
+    const float sc = (float)(d.scale ? d.scale : 1u);
+    d.heftVolume = (float)d.voxels.size() / (sc * sc * sc);
   }
 
   d.hp = s.value("hp", 30.0f);
@@ -434,6 +442,11 @@ bool LoadItems(const std::string& dir, size_t materialCount,
     }
     d.damage = it.value("damage", 12.0f);
     d.carveBonus = it.value("carveBonus", 0.0f);
+    // The authored heft OVERRIDE. Absent (or 0) is the normal case and means
+    // "derive it from the art" — LoadItemAsset below fills heftVolume and
+    // ItemDef::HeftFactor does the division. Present is for the item whose
+    // geometry lies about its mass.
+    d.heft = it.value("heft", 0.0f);
     // items.json authors reach in world voxels at the legacy 10 vox/m
     // baseline; rescale so the same number means the same distance.
     d.reach = it.value("reach", 9.0f) *

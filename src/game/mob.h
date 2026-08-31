@@ -204,6 +204,18 @@ struct MobDef {
   Prefab prefab;               // one model per limb
   int rootLimb = -1;           // index into limbs
   uint32_t bleedMat = 0;       // 0 = mob does not bleed
+  // What the FLESH AROUND A CUT becomes — the soak, not the drip. Sidecar
+  // `bleed.woundMaterial`, defaulting to `bleedMat` so no existing mob needs a
+  // new key: a creature's own blood is already the right colour for meat it is
+  // running out of. Separate from bleedMat because they are different
+  // questions ("what pools on the floor" vs "what the wound looks like") and
+  // an insect that leaks sap should be able to answer them differently.
+  //
+  // A MATERIAL rather than a colour, for the same reason charring is one: a
+  // nonzero art slot overrides the material colour on a painted surface
+  // (BurnLimbView::Set says so), so a stain carried as paint would be
+  // invisible on exactly the clothed limbs it matters most on.
+  uint32_t woundMat = 0;
   float bleedPerDamage = 1.5f; // wound budget voxels per point of damage
   float speed = 4.0f;          // voxels/sec walk speed
   // Micro-voxel AUTHORING scale (docs/PLAN_voxel_editor.md §C): 1 = the legacy
@@ -550,8 +562,53 @@ struct MobLimb {
   // every carve re-charges everything the limb has ever lost — see the
   // incremental-loss note in Mob::CarveLimb.
   uint32_t voxelsCharged = 0;
+  // ---- HOW MUCH FLESH THIS LIMB HAS AT ITS JOINT ---------------------------
+  // Voxel count inside a sphere of gore.woundNeckRadius around `anchorLimb`,
+  // on whichever lattice is authoritative. It is what "hanging by a thread"
+  // is measured against (Mob::CarveLimb): a limb can be 60% intact overall and
+  // still be attached by four voxels, and no whole-limb fraction can see that.
+  //
+  // 0 = NOT YET TAKEN, and it is taken lazily at the top of the first carve
+  // rather than at spawn. Two reasons: spawn happens in three places (BuildRig,
+  // the save load overlay, the worn-shell append) and a count taken in only two
+  // of them is a silent zero; and the count costs a pass over the lattice,
+  // which a creature that is never cut should not pay. The cost of laziness is
+  // that a limb first cut when it is already half burnt records the burnt
+  // count — which is CONSERVATIVE (a lower denominator makes the sever harder,
+  // never easier), so it fails safe.
+  uint32_t neckAtSpawn = 0;
   // Per-voxel burning / dissolution (see BodyBurnState above).
   BodyBurnState burn;
+};
+
+// ---- ONE BLADE HIT, AS GEOMETRY --------------------------------------------
+//
+// The argument to Mob::CutLimb, and the whole of what a sword knows about a
+// wound. Everything is in WORLD VOXELS and world directions; the limb converts
+// into its own frame and into whichever lattice it is testing.
+//
+// WHY A KERF AND NOT A SPHERE. A blast is a point with a radius, and the
+// radial carve (CarveLimbRadial) is the right shape for it. An edge is not: it
+// enters at a point, travels in the direction the swing is going, and cuts a
+// SLOT the length of the part of the blade that made contact. Carving a sphere
+// for it is what made a sword's touch remove a spherical bite out of an arm —
+// which, at any radius large enough to feel like a sword, is most of the arm.
+//
+// The three axes are independent and all three are measured rather than tuned:
+// `edgeAxis` comes from the item's authored edge segment through its live pose,
+// `cutDir` from how far the tip actually travelled this tick, and `halfWidth`
+// from the blade's own authored thickness. Only the DEPTH is a tuning
+// question, because only the depth depends on how hard you swung.
+struct BladeCut {
+  Vec3 at{};          // contact point, world voxels
+  Vec3 edgeAxis{};    // unit, along the blade's edge (the slot's long axis)
+  Vec3 cutDir{};      // unit, the direction the edge is travelling
+  float halfWidth = 0.25f;  // kerf half-thickness, world voxels
+  float depth = 0.5f;       // how far in the edge bit, world voxels
+  float length = 1.0f;      // half-length of the slot along the edge
+  float power = 1.0f;       // 0..1 swing commitment, for the audio severity
+  uint32_t seed = 0;        // ragged-rim / stain draw key; see the note in
+                            // Mob::CutLimb about why this is not a tick
 };
 
 class MobSystem;
@@ -601,11 +658,31 @@ class Mob {
 
   // ---- damage / dismemberment (shared; see MobSystem for the id-keyed API) --
   // Damage a limb by physics body handle. Returns true if the handle belonged
-  // to one of this creature's limbs. Severs / kills at 0 hp; a hit past the
-  // limb's severImpactSpeed severs regardless of remaining hp; a hit crossing
-  // a joint anchor severs outright.
+  // to one of this creature's limbs.
+  //
+  // WHAT IT NO LONGER DOES: sever. Three thresholds used to fire a Sever()
+  // from here — a hit within 1.75 voxels of a joint anchor, a hit past the
+  // limb's severImpactSpeed, and hp reaching zero — and between them a sword
+  // took a limb off on FIRST CONTACT, anywhere, every time. Dismemberment is
+  // now structural (see Mob::CutLimb and the connectivity block in
+  // Mob::CarveLimb): a limb comes off when its lattice has been cut through.
+  //
+  // What survives here: hp still falls, the wound is still recorded, the
+  // flinch and the hurt cry still fire, and hp reaching zero on a VITAL or
+  // ROOT limb still kills the creature — death is a consequence of damage, a
+  // missing arm is a consequence of geometry. `severImpactSpeed` survives as
+  // an extreme-speed exception, scaled by gore.woundImpactSeverScale so an
+  // ordinary swing cannot reach it.
   bool Damage(uint64_t bodyHandle, float amount, Vec3 hitWorldVoxel,
               float impactSpeed = 0.0f);
+  // ---- THE BLADE PATH ------------------------------------------------------
+  // Cut a live limb along the swept edge: a narrow slot, not a spherical bite.
+  // Removes voxels, ejects them as gore, soaks the exposed flesh in the
+  // creature's wound material, and — when the lattice has genuinely parted —
+  // routes the dismemberment through the ordinary Sever(). Returns true when
+  // the handle was one of this creature's live limbs.
+  bool CutLimb(uint64_t bodyHandle, const BladeCut& cut, World& world,
+               std::vector<ParticleSpawn>& spawns);
   // Detach a limb now. Root/vital kills instead.
   void Sever(int limbIndex);
   void Die();
@@ -829,6 +906,26 @@ class Mob {
                  const CarveSpall* spall = nullptr);
   bool ReskinLimbMicro(MobLimb& limb, uint32_t skinScale, uint32_t physScale);
   bool RebuildLimbBody(int limbIndex);
+  // ---- the wound model's two helpers (game/mob.cpp, and the notes there) ----
+  // Voxels of `limb` within `radiusWorld` world voxels of its joint anchor, on
+  // whichever lattice is authoritative. ONE pass, no allocation. This is the
+  // measure MobLimb::neckAtSpawn records and the neck sever compares against.
+  uint32_t NeckCount(const MobLimb& limb, float radiusWorld) const;
+  // Soak the flesh around a cut. Rewrites the MATERIAL of a hash-selected
+  // fraction of the voxels within `radiusWorld` of `centreLocal` (limb-local
+  // world voxels) to the creature's wound material, and pokes the micro brick
+  // so it is visible without a full re-skin. Returns how many took the stain.
+  //
+  // Bounded by ONE pass over the limb's authoritative lattice, on hit ticks
+  // only — the same bound the spall pass carries, and for the same reason: the
+  // question is about occupancy, so only the owner of the voxel list can ask
+  // it. Refuses worn slots and item slots outright (a garment has no blood in
+  // it — see IsWornSlot).
+  uint32_t StainWound(int limbIndex, Vec3 centreLocal, float radiusWorld,
+                      uint32_t seed);
+  // Does hp reaching zero take this limb OFF, or merely kill the creature?
+  // See the note at the call sites: geometry dismembers, damage kills.
+  bool HpZeroSevers(int limbIndex) const;
   void EmitCarvedFragment(const MobLimb& src, uint32_t physScale,
                           std::vector<DebrisVoxel> part, World& world,
                           std::vector<ParticleSpawn>& spawns);
@@ -1025,6 +1122,31 @@ class Mob {
   // Re-entrancy guard: FlushBurn expresses itself as a CarveLimb, and
   // CarveLimb flushes before it reads the lattice.
   bool inBurnFlush_ = false;
+  // ---- "THIS CARVE IS AN EDGE, NOT A BLAST OR A FIRE" ------------------------
+  //
+  // Set for the duration of Mob::CutLimb's carve, and read by exactly two
+  // rules in CarveLimb: the cut-through sever and the neck sever. Both are
+  // deliberately NOT applied to the other carve causes, and the reason is
+  // asymmetric risk rather than principle.
+  //
+  //   * BURNING already has a documented, tested account of what happens when
+  //     a limb comes apart (the anchor component keeps the identity, the rest
+  //     leaves as fragments, and `mob-burn` asserts a limb never leaves while
+  //     it is still mostly there). Routing a burn-through into Sever() would
+  //     re-open exactly the "a burning body dismembers instead of charring"
+  //     bug that block was written to close.
+  //   * A BLAST is a sphere and has no direction; "cut through" is not a thing
+  //     it does. Its existing behaviour — crater, fragments, collapse when too
+  //     little is left — is the right account of it.
+  //
+  // A blade is the one cause where the geometry says something the fraction
+  // cannot, so it is the one cause that gets to ask.
+  //
+  // Note this is a MOB-level flag, not MobSystem::bladeCut_ (which exists for
+  // the AUDIO cause and is set by the caller around a whole sweep). They mean
+  // different things and the avatar has no MobSystem at all, which is what
+  // Phase C's "an NPC cuts the player" path needs.
+  bool inBladeCut_ = false;
 
   // ---- IS THIS RIG SLOT A GARMENT? -------------------------------------------
   //
@@ -1160,6 +1282,11 @@ class MobSystem {
   bool CarveLimbRadial(uint64_t bodyHandle, Vec3 centerWorldVoxel,
                        float radiusVoxels, bool ragged, bool eject, World& world,
                        std::vector<ParticleSpawn>& spawns);
+  // THE BLADE ENTRY POINT — a kerf along the swept edge rather than a sphere,
+  // plus the blood soak and the structural sever. See Mob::CutLimb and the
+  // BladeCut struct above. Returns true when the handle was a live limb.
+  bool CutLimb(uint64_t bodyHandle, const BladeCut& cut, World& world,
+               std::vector<ParticleSpawn>& spawns);
   // Every live limb of every mob within the blast — the explosion entry point.
   void CarveMobsRadial(Vec3 centerWorldVoxel, float radiusVoxels, World& world,
                        std::vector<ParticleSpawn>& spawns);
@@ -1470,6 +1597,15 @@ class MobSystem {
   // that wants to keep cutting (the selftest, a future aim assist) has to aim
   // at flesh that is actually still present.
   Vec3 LimbVoxelPos(uint64_t mobId, int limbIndex, uint32_t n) const;
+  // The limb's JOINT ANCHOR in world voxels, through its live pose. Invariant
+  // across carves (see the impl), which is what a test that keeps cutting one
+  // cross-section needs and LimbVoxelPos cannot give — that one names the nth
+  // SURVIVING voxel and therefore walks as the limb is eaten.
+  Vec3 LimbAnchorPos(uint64_t mobId, int limbIndex) const;
+  // Voxels on the AUTHORITATIVE lattice (skin when there is one), i.e. the
+  // lattice LimbVoxelsAtSpawn counted. LimbVoxelCount reports the collider,
+  // and mixing the two scales every fraction by (skinScale/physScale)^3.
+  uint32_t LimbArtVoxelCount(uint64_t mobId, int limbIndex) const;
 
  private:
   // ---- per-voxel burning / dissolution (docs/PLAN_body_reactivity.md) --------

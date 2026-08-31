@@ -759,6 +759,96 @@ struct Tuning {
     // accumulate in one place, and what makes a blast beside an arm take the
     // arm. Bounded and small: each round is one pass over the limb's voxels.
     int carveSpallRounds = 2;
+
+    // ========================================================================
+    // E. THE WOUND MODEL — what a BLADE does, as opposed to a blast
+    // ========================================================================
+    // A blast is a sphere and a blade is a SLOT. The distinction is the whole
+    // feature: severing used to be an EVENT (three thresholds in Mob::Damage
+    // fired a Sever() the instant a sword touched anything), and it is now a
+    // CONSEQUENCE — the limb comes off when its lattice has genuinely been cut
+    // through. Every number below therefore describes GEOMETRY, and the only
+    // thing that decides dismemberment is what is left of the limb.
+    //
+    // All lengths are WORLD VOXELS, so they mean the same thing on a
+    // skinScale-8 human and a scale-1 critter (game/mob.h Mob::CutLimb
+    // converts into whichever lattice it is testing).
+
+    // ---- E1. the kerf: how deep the edge bites, and how wide a slot ----------
+    // Depth at zero commitment, and the extra at a full-speed cut. Total depth
+    // is (cutDepth + cutDepthPower * power) * heft, where `power` is the swing's
+    // 0..1 speed fraction and `heft` is the weapon's own volume against
+    // woundHeftRef below. A knife at a lazy wave takes a chip; a greatsword at
+    // full swing opens a gash three times as deep, and that ratio IS the
+    // "a big enough sword dismembers in one or two blows" rule — no separate
+    // chance roll decides it.
+    float cutDepth = 0.08f;
+    float cutDepthPower = 0.32f;
+    // Half-length of the slot ALONG the edge, at full power. A cut is a slice,
+    // not a hole: this is what makes it read as an edge passing through rather
+    // than as a bite. Scaled by 0.4 + 0.6 * power so a graze is short.
+    float cutLength = 0.90f;
+    // Kerf half-thickness as a MULTIPLE of the blade's own authored
+    // edgeHalfWidth (item.h). Below 1 because the authored half-width is the
+    // widest part of the blade and the edge itself is thinner; the taper toward
+    // the bottom of the cut is applied on top of this.
+    float cutWidth = 0.20f;
+    // Spall applied to a cut, separately from the blast's carveSpallRounds. A
+    // cut wants a LITTLE of it — enough that the second blow into the same
+    // gash widens it instead of stippling fresh flesh beside it (that is the
+    // "sustained hits dismember" mechanism), and not so much that one swing
+    // tears an arm off. Zero makes every cut a clean bore.
+    int cutSpallRounds = 1;
+    float cutSpallStrength = 0.30f;
+
+    // ---- E2. heft: how much weapon is behind the edge -----------------------
+    // The item's own voxel volume in WORLD voxels that reads as heft 1.0.
+    // DERIVED, not authored: an item's .vox is right there, so a weapon's mass
+    // is a fact about its art rather than a number somebody has to keep in
+    // sync with it (item.h ItemDef::heftVolume). The stock arming sword is
+    // 340 art voxels at scale 4 = 5.3 world voxels, which is where this
+    // default comes from — retune it and every weapon rescales together.
+    float woundHeftRef = 5.3f;
+    // Ceiling on the derived factor, so a comically large authored prop cannot
+    // turn one swing into an amputation by arithmetic alone.
+    float woundHeftMax = 4.0f;
+
+    // ---- E3. blood on the flesh --------------------------------------------
+    // A cut leaves the meat around it soaked. Same mechanism as charring: the
+    // exposed voxels' MATERIAL is rewritten (mob sidecar bleed.woundMaterial,
+    // defaulting to the creature's own bleed material), so it renders, it
+    // travels with a severed limb, and it ejects as blood when cut again.
+    // Radius around the cut in world voxels, and the fraction of the voxels in
+    // range that take the stain — below 1 so the soak is mottled rather than a
+    // uniform repaint, which reads as a red limb rather than a wound.
+    float woundStainRadius = 0.60f;
+    float woundStainDensity = 0.55f;
+
+    // ---- E4. when a cut becomes a dismemberment -----------------------------
+    // Both rules are STRUCTURAL and both fire only on a blade cut (a burn's
+    // charring behaviour is deliberately untouched — see Mob::CarveLimb).
+    //
+    // CUT THROUGH: the carve disconnected a piece of the limb that is at least
+    // this fraction of what the limb still had. That is the edge coming out the
+    // other side, and it routes through Sever() so the gout, the byBlade audio
+    // and the dismember loco states all fire.
+    float woundSeverFraction = 0.28f;
+    // HANGING BY A THREAD: the limb is still one piece, but the flesh at its
+    // JOINT is mostly gone. Measured as the voxel count inside a sphere of
+    // woundNeckRadius world voxels around the joint anchor, against the same
+    // count taken on the intact limb (MobLimb::neckAtSpawn). Below this
+    // fraction the limb is not attached to anything worth the name.
+    float woundNeckRadius = 0.80f;
+    float woundNeckFraction = 0.28f;
+
+    // ---- E5. what is left of the old instant-sever thresholds ---------------
+    // A limb's authored `severImpactSpeed` (assets/mobs/*.json) survives as an
+    // EXTREME-speed exception, multiplied by this. The authored numbers (9..20
+    // voxels/sec) were written when a hit anywhere near a joint severed
+    // outright, so at face value an ordinary swing trips them every time and
+    // nothing below ever gets a chance to run. Scaling here rather than
+    // rewriting every mob sidecar keeps it one knob and one rebuild-free edit.
+    float woundImpactSeverScale = 4.0f;
   } gore;
 
   // ---- grenade ----
