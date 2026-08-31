@@ -3346,6 +3346,7 @@ Status GateMobBurn(Ctx& c, std::string& detail) {
     if (spawned) {
       for (int i = 0; i < 10; i++) avTick(0);
       idleFront = avBurning();            // an idle player must cost nothing
+      mobs.ResetBurnStats();  // count only what the BLAZE below asked of it
       cloth0 = avCensus(mCloth) + avCensus(mUnder);
       body0 = avBody();
       uint32_t lastBody = body0;
@@ -3380,6 +3381,58 @@ Status GateMobBurn(Ctx& c, std::string& detail) {
                 bodyLost * 100.0f, peakAlight, peakChar, avFireOps, nParts,
                 avatar.LimbBodyCount(), indexed);
                 std::fflush(stdout);
+    // HOW FAR DOWN THE CHAIN THE FIRE ACTUALLY GOT, and why it stopped there.
+    //
+    // `peakChar` above lumps flesh_cooked in with flesh_charred, and those are
+    // two completely different outcomes: cooked is a SEAR (one hot face, no
+    // combustion) and charred is what is left after the voxel burned. A body
+    // whose whole surface seared and never ignited scores exactly the same on
+    // that number as one that burned through, which is what let "the player
+    // only chars at the limb outlines" sit under a green gate. Split, and
+    // reported next to the ramp histogram that says whether the threshold or
+    // the fire is what is missing (MobSystem::BurnStats).
+    if (spawned) {
+      const MobSystem::BurnStats& bs = mobs.Burn();
+      std::printf("    stages: skin %u cooked %u burning %u charred %u "
+                  "cinder %u | linen %u burning %u charred %u\n",
+                  avCensus(mSkin), avCensus(mCooked), avCensus(mBurning),
+                  avCensus(mCharred), avCensus(mCinder), avCensus(mUnder),
+                  avCensus(mUnderBurn), avCensus(mUnderChar));
+      // ---- FLESH REACHES CHAR, and this is the line that says so ----------
+      //
+      // The claim above is "the player is wired into the burn pass", and it
+      // was true while the character stood in a bonfire for three seconds and
+      // came out PINK. Everything that made that visible was lumped together:
+      // `peakChar` counts flesh_cooked, which is a SEAR at one hot face and
+      // not combustion at all, so a body that only ever seared scored the same
+      // as one that burned. Measured before the world-pitch fix in
+      // MobSystem::BurnOneLimb, 9.8% of flesh reached a char state and it was
+      // all on the convex edges of the limbs; after, 23.7%, spread over the
+      // surface. The floor is set between those two, so this fails if the ramp
+      // ever stops reaching a body's flat faces again.
+      const uint32_t flesh = avCensus(mSkin) + avCensus(mCooked) +
+                             avCensus(mBurning) + avCensus(mCharred) +
+                             avCensus(mCinder);
+      const uint32_t past = avCensus(mCharred) + avCensus(mCinder);
+      const double charPct = flesh ? 100.0 * (double)past / (double)flesh : 0.0;
+      const double floorPct = BaselineNumber("mobBurnFleshCharPctMin", 15.0);
+      const bool charOk = charPct >= floorPct;
+      std::printf("    flesh past the sear: %s (%.1f%% charred/cinder of %u "
+                  "flesh, floor %.1f%%)\n",
+                  charOk ? "PASS" : "FAIL", charPct, flesh, floorPct);
+      ok = ok && charOk;
+      std::printf("    ramp: %u rolls, %u refused by minCount, %u widened at "
+                  "world pitch | hot faces 0:%u 1:%u 2:%u 3:%u 4:%u 5:%u 6:%u\n",
+                  bs.rampRolls, bs.rampRefused, bs.rampWidened,
+                  bs.hotFaces[0], bs.hotFaces[1],
+                  bs.hotFaces[2], bs.hotFaces[3], bs.hotFaces[4],
+                  bs.hotFaces[5], bs.hotFaces[6]);
+      std::printf("    exposure: %u candidates | world-facing faces "
+                  "0:%u 1:%u 2:%u 3:%u 4:%u 5:%u 6:%u\n",
+                  bs.candidates, bs.exposed[0], bs.exposed[1], bs.exposed[2],
+                  bs.exposed[3], bs.exposed[4], bs.exposed[5], bs.exposed[6]);
+      std::fflush(stdout);
+    }
     ok = ok && hOk;
     avatar.Despawn();
     mobs.Reset();

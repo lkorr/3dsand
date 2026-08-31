@@ -1429,6 +1429,34 @@ class MobSystem {
   const WornStats& Worn() const { return wornStats_; }
   void ResetWornStats() { wornStats_ = WornStats{}; }
 
+  // ---- WHY THE FIRE STOPPED, counted --------------------------------------
+  //
+  // Rule 6 for the other half of the pass. "The body stopped charring" has two
+  // causes that a material census at the end cannot tell apart: the fire never
+  // reached the voxel, or it reached it and the neighbour-count ramp refused
+  // it. This distinguishes them on one line.
+  //
+  // `hotFaces` is the distribution of `cnt` at the instant ReactScaledChance()
+  // decides. A spectrum piled at 1 and 2 with nothing at 3 says an authored
+  // minCount is geometrically UNREACHABLE rather than merely unlucky, which is
+  // a different bug with a different fix than "the fire is too weak".
+  //
+  // `exposed` is that distribution one step earlier: how many of a candidate's
+  // six faces have no lattice neighbour, i.e. how much of it the world can
+  // touch at all. For a voxel whose only heat source is the world that number
+  // is the CEILING on the ramp count, so the two histograms together say
+  // whether the threshold or the fire is what is missing.
+  struct BurnStats {
+    uint32_t candidates = 0;    // voxels the pass evaluated a rule for
+    uint32_t rampRolls = 0;     // scaled rules reached
+    uint32_t rampRefused = 0;   // ...of which minCount refused outright
+    uint32_t rampWidened = 0;   // ...and ones the world-pitch reading raised
+    uint32_t hotFaces[7] = {};  // ramp count histogram, 0..6
+    uint32_t exposed[7] = {};   // faces with no lattice neighbour, 0..6
+  };
+  const BurnStats& Burn() const { return burnStats_; }
+  void ResetBurnStats() { burnStats_ = BurnStats{}; }
+
   bool BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey, World& world,
                    std::vector<CellOp>& cellOps, uint32_t& frontBudget,
                    uint32_t& opsBudget);
@@ -1531,6 +1559,7 @@ class MobSystem {
   std::vector<uint8_t> matSelfActive_;  // has decay/emit rules — i.e. is ALIGHT
   std::vector<uint8_t> matHasPair_;     // has pair rules — i.e. is ignitable
   WornStats wornStats_{};
+  BurnStats burnStats_{};
   std::vector<uint8_t> matHot_;         // carries tag:hot
   // Material has a pair rule that REWRITES ITS NEIGHBOUR. This is the inbound
   // half of the world coupling and it is what makes acid work with no

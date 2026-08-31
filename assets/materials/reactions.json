@@ -841,6 +841,9 @@
       "selfBecomes": "flesh_cooked"
     },
     {
+      "note": "ON A BODY THE COUNT IS TAKEN AT WORLD PITCH, and without that this minCount means something entirely different from what the paragraph above says.\n\nIn the grid, fire and flesh are cells of the same size, so \"three of my six faces are hot\" really is \"I am half-surrounded by fire\". A mob or the player is a lattice EIGHT TIMES FINER (skinScale 8), and five of a skin sub-voxel's six faces are its own flesh however large the fire outside is -- so the count is 1 on a flat surface, 2 on a convex edge, and reaches 3 only on a convex CORNER. Measured over a 90-tick immersion of the bare `human` rig: world-facing faces 0:711k 1:465k 2:190k 3:26k, 92% of every ignition roll refused, 11 of 22,775 flesh voxels lost. On screen that is a character who sears brown all over and turns black ONLY along the outlines of its limbs.\n\nSo MobSystem::BurnOneLimb reads the four world cells TANGENTIAL to each exposed face and lets that face count for as much as the fire against it is WIDE (1..5), taken as a max against the ordinary lattice count. One cell of flame is still 1 and still gutters out -- the claim the paragraph above makes is intact, and is now true of bodies as well as of the grid -- while a wall of flame is 5 and takes hold. That is a change to WHERE THE SIX NEIGHBOURS COME FROM, which sim/reactcpu.h names as the one part of the two evaluators that legitimately differs; every authored number here, including this minCount, is untouched and shared. 9.8% -> 23.7% of flesh past the sear at 90 ticks, 45% cinder at 400. Guarded by mobBurnFleshCharPctMin in tests/baseline.json, which exists because the gate counted flesh_cooked -- a SEAR at one hot face, not combustion -- as \"charred\", so a body that only seared scored the same as one that burned."
+    },
+    {
       "self": "flesh_cooked",
       "decay": true,
       "chance": 390,

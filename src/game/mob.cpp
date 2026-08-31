@@ -4133,6 +4133,39 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
     // `scale` of the limb's own voxels and read the wrong thing entirely.
     uint32_t nmat[6];
     uint32_t ncell[6];
+    // ---- HOW WIDE THE OUTSIDE IS, sampled at WORLD pitch ------------------
+    //
+    // The materials in the four world cells TANGENTIAL to each exposed face,
+    // filled only for a face that has something other than air outside it.
+    // This is what the neighbour-count ramp is widened with below, and the
+    // reason it has to exist is geometric rather than a matter of tuning:
+    //
+    // `scaleByNeighbors` asks "how many of my six faces are hot", and in the
+    // GRID that is a fair proxy for how big the fire is, because the fire and
+    // the flesh are cells of the same size. On a body they are not. A skin
+    // voxel at skinScale 8 is an eighth of a world voxel across, and five of
+    // its six faces are its own flesh no matter how large the fire outside is
+    // — so the count for a voxel on a FLAT surface is 1, on a convex EDGE 2,
+    // and only on a convex CORNER 3. Measured over a 90-tick immersion of the
+    // bare `human` rig, the world-facing-face histogram was 0:711k 1:465k
+    // 2:190k 3:26k, i.e. 98% of the body could never reach an authored
+    // minCount of 3 from world heat at all, and 92% of every ignition roll was
+    // refused. The character seared brown all over and turned black ONLY along
+    // the outlines of its limbs, which is exactly the shape of that histogram.
+    //
+    // The fix is not to lower the minCount — that really would make any spark
+    // take hold, which is the game reactions.json argues at length against.
+    // It is to measure the same quantity the author meant at the pitch the
+    // fire is actually stored at: a face pointing into fire counts for as much
+    // as the fire against it is WIDE. One cell of flame is still 1 and still
+    // gutters out; a wall of it is 5 and takes hold.
+    //
+    // Sourcing the six neighbours differently is the licensed difference
+    // between the two evaluators of one table — sim/reactcpu.h says so in as
+    // many words. The gates, the ramp arithmetic and every authored number
+    // stay shared and unmoved.
+    uint32_t ntan[6][4];
+    bool tanValid[6] = {};
     for (int k = 0; k < 6; k++) {
       const IVec3& d = kBurnDirs[k];
       const uint32_t nc = cellOf({vp.x + d.x, vp.y + d.y, vp.z + d.z});
@@ -4186,7 +4219,36 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
         }
         nmat[k] = worn ? worn : wm;
         ncell[k] = kNoBurnCell;
+        // The tangential ring, at WORLD pitch (see the note above the array).
+        // Gated on the face not facing open air, which is the overwhelmingly
+        // common case and the one that must stay free — a limb in the open
+        // pays nothing for this, and a limb in a fire pays four memoized reads
+        // per exposed face. Sourced from the WORLD even under a shell: what is
+        // being measured is the size of the fire, and a coat does not make the
+        // bonfire smaller. Whether the heat reaches the skin is `worn`'s job,
+        // one line up, and it already answered.
+        if (wm != 0) {
+          const IVec3 wc{ifloor(wv.x), ifloor(wv.y), ifloor(wv.z)};
+          int t = 0;
+          for (int j = 0; j < 6 && t < 4; j++) {
+            const IVec3& e = kBurnDirs[j];
+            if (e.x * d.x + e.y * d.y + e.z * d.z != 0) continue;  // parallel
+            ntan[k][t++] = worldMatAt({wc.x + e.x, wc.y + e.y, wc.z + e.z});
+          }
+          tanValid[k] = t == 4;
+        }
       }
+    }
+
+    // How much of this voxel the WORLD can touch. Recorded before any rule
+    // runs, because it is the ceiling on every ramp count below and it is a
+    // fact about the limb's SHAPE rather than about the fire (see BurnStats).
+    {
+      uint32_t exposed = 0;
+      for (int k = 0; k < 6; k++)
+        if (ncell[k] == kNoBurnCell) exposed++;
+      burnStats_.candidates++;
+      burnStats_.exposed[exposed]++;
     }
 
     // ---- 1. this voxel's own rules ----
@@ -4206,8 +4268,38 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
         uint32_t cnt = 0;
         for (int k = 0; k < 6; k++)
           if (ReactNbrMatches(r, nmat[k], matGpu_) != invert) cnt++;
+        // WIDEN AT WORLD PITCH. A face pointing into matter this rule reacts
+        // to counts for as much as that matter is wide across the face, so
+        // `minCount 3` on a body means "a real fire" exactly as it does in the
+        // grid, instead of "you are a corner" (see the ntan note above).
+        //
+        // Taken as a MAX, not a sum: the two are measurements of the same
+        // quantity at two pitches and adding them would double-count the very
+        // cell that produced `nmat[k]`. The direct form only — an INVERTED
+        // ramp counts neighbours that do NOT match (rules like "exposed to
+        // air on N sides"), and for those the wide-face reading is not the
+        // same question, so they keep the lattice count they were authored
+        // against.
+        if (!invert) {
+          for (int k = 0; k < 6; k++) {
+            if (!tanValid[k]) continue;
+            if (!ReactNbrMatches(r, nmat[k], matGpu_)) continue;
+            uint32_t w = 1;  // the face's own cell, already known to match
+            for (int j = 0; j < 4; j++)
+              if (ReactNbrMatches(r, ntan[k][j], matGpu_)) w++;
+            if (w > cnt) {
+              cnt = w;
+              burnStats_.rampWidened++;
+            }
+          }
+        }
         chance = ReactScaledChance(r, cnt);
-        if (chance == 0) continue;
+        burnStats_.rampRolls++;
+        burnStats_.hotFaces[cnt < 7 ? cnt : 6]++;
+        if (chance == 0) {
+          burnStats_.rampRefused++;
+          continue;
+        }
       }
       const uint32_t rr = Hash3(limbKey ^ (cell * 2246822519u), tick, ri);
       if (rr % kReactChanceDen >= chance) continue;
