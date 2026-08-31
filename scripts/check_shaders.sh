@@ -123,17 +123,23 @@ W_MATSLOTS="$(cpp_const kMaterialSlots)"
 W_STAINBASE=$((W_MATSLOTS - 8))
 
 # Art palette — same shape as the stain palette: a run of reserved material
-# slots holding per-voxel mob SKIN colours (world.h kArtPaletteBaseGpu). The
-# lowest .vox palette index that counts as art comes from sim/voxload.h, which
-# is the other half of the same convention.
+# slots holding per-voxel mob SKIN colours (world.h kArtPaletteBaseGpu).
+#
+# There is no ART_SLOT_MIN any more. Shaders index this run with a 1-BASED
+# MERGED art index, and the .vox palette slot is converted to one on the CPU at
+# load (MicroBodyMergeArt), so voxload.h's kArtPaletteBase no longer reaches
+# WGSL and is deliberately not scraped here.
 W_ARTSLOTS="$(cpp_const kArtPaletteSlotsGpu)"
 [ -n "$W_ARTSLOTS" ] || {
   echo "check_shaders: cannot parse kArtPaletteSlotsGpu from $WORLD_H" >&2; exit 1; }
 W_ARTBASE=$((W_STAINBASE - W_ARTSLOTS))
-VOXLOAD_H="$ROOT/src/sim/voxload.h"
-W_ARTSLOTMIN="$(sed -n 's/^constexpr int kArtPaletteBase = \([0-9]*\);.*/\1/p' "$VOXLOAD_H" | head -1)"
-[ -n "$W_ARTSLOTMIN" ] || {
-  echo "check_shaders: cannot parse kArtPaletteBase from $VOXLOAD_H" >&2; exit 1; }
+
+# Tint palette — the third reserved run (world.h kTintPaletteBaseGpu), holding
+# per-material GRID colours indexed by a MATF_TINTED material's state nibble.
+W_TINTSLOTS="$(cpp_const kTintPaletteSlotsGpu)"
+[ -n "$W_TINTSLOTS" ] || {
+  echo "check_shaders: cannot parse kTintPaletteSlotsGpu from $WORLD_H" >&2; exit 1; }
+W_TINTBASE=$((W_ARTBASE - W_TINTSLOTS))
 
 # Static micro-detail brick pool (render-only). kMicroPoolWordsWorld is written
 # as a shift expression in world.h, so scrape the shift and redo the arithmetic
@@ -232,7 +238,7 @@ PRELUDE_TEXT="$(printf '%s\n' \
   "const PT_NO_WORD : u32 = ${W_PTNOWORD}u;" \
   "const STAIN_PALETTE_BASE : u32 = ${W_STAINBASE}u;" \
   "const ART_PALETTE_BASE : u32 = ${W_ARTBASE}u;" \
-  "const ART_SLOT_MIN : u32 = ${W_ARTSLOTMIN}u;" \
+  "const TINT_PALETTE_BASE : u32 = ${W_TINTBASE}u;" \
   "const MICRO_POOL_WORDS : u32 = ${W_MICROPOOL}u;" \
   "const MICRO_BODY_POOL_WORDS : u32 = ${W_MBPOOL}u;" \
   "const MATERIAL_SLOTS : u32 = ${W_MATSLOTS}u;" \

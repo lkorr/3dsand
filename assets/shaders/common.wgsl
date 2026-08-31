@@ -38,6 +38,17 @@ const MATF_MICRO  : u32 = 4u;
 // explosions remove them, and the renderer draws them as solid geometry. Kept
 // here so the flag bits cannot drift from sim/materials.h (kMatFlagPassable).
 const MATF_PASSABLE : u32 = 8u;
+// TINTED: this material's state nibble is a COLOUR index, not a jitter variant.
+// Mirrors kMatFlagTinted in sim/materials.h, which carries the full rationale.
+// The nibble indexes this material's own run of the tint palette, which is what
+// gives a GRID cell a per-voxel colour — art colour never reaches the grid.
+// Liquids can never carry it (their nibble is fullness); refused at load.
+const MATF_TINTED : u32 = 16u;
+// Start of this material's 16-entry tint run, packed into the free high half of
+// `flags` (bits 16..23) — see the wind note below for why `flags` and not a new
+// field. Mirrors kMatTintBaseShift / kMatTintBaseMask in sim/materials.h.
+const MATF_TINT_BASE_SHIFT : u32 = 16u;
+const MATF_TINT_BASE_MASK  : u32 = 0xFFu;
 // ---- wind response, packed into the SAME word (docs/RESEARCH_wind.md §4.5) ----
 // `flags` bits 0..7 are the MATF_* booleans above (4 used, 4 spare); bits 8..15
 // are two 4-bit AUTHORED numbers, and 16..31 are still free.
@@ -1048,9 +1059,29 @@ fn unpackColor(c : u32) -> vec3f {
   return vec3f(f32(c & 0xFFu), f32((c >> 8u) & 0xFFu), f32((c >> 16u) & 0xFFu)) / 255.0;
 }
 
-// The 3-variant palette is a property of Material (declared above), so its
-// decode belongs here rather than being re-derived by each render path.
-fn paletteColor(m : Material, state : u32) -> vec3f {
+// The state-nibble palette is a property of Material (declared above), so its
+// decode belongs here rather than being re-derived by each render path. There
+// are TWO decodes and the material picks which: the 3-variant cosmetic jitter
+// every ordinary material uses, and the 16-entry TINT run a MATF_TINTED one
+// uses instead (sim/materials.h).
+//
+// `pal` is the material table itself, threaded in as a pointer because a tinted
+// material resolves against the reserved tint run and common.wgsl is prepended
+// BEFORE each shader declares its own `materials` binding — so this function
+// cannot name it. Passing it keeps ONE definition shared by the raymarcher, the
+// cube path and the brick march, which is the whole point of this function
+// living here: a live mob's arm and the severed one beside it must shade
+// identically, and a copy cannot enforce that.
+fn paletteColor(m : Material, state : u32,
+                pal : ptr<storage, array<Material>, read>) -> vec3f {
+  if ((m.flags & MATF_TINTED) != 0u) {
+    // Direct index, NOT `% 3`: state 0..15 maps straight onto the run, and tint
+    // 0 is authored as the material's natural colour so a voxel that arrives
+    // with state 0 (an old save, a CPU path that never heard of tints) reads as
+    // undyed rather than as some arbitrary dye.
+    let base = (m.flags >> MATF_TINT_BASE_SHIFT) & MATF_TINT_BASE_MASK;
+    return unpackColor((*pal)[TINT_PALETTE_BASE + base + (state & 0xFu)].color0);
+  }
   switch (state % 3u) {
     case 0u: { return unpackColor(m.color0); }
     case 1u: { return unpackColor(m.color1); }

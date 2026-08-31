@@ -28,7 +28,7 @@ struct BodyTransform {
 
 // One voxel of a debris body, in body-local voxel coordinates.
 //
-// `color` is an ART palette slot (sim/voxload.h kArtPaletteBase), independent
+// `color` is a 1-BASED MERGED art index (0 = unpainted), independent
 // of the material in `payload`: a creature is one material all over and
 // painted per voxel, and a limb that lands back in the world grid becomes its
 // MATERIAL, never its colour. 0 = unpainted, i.e. use the material's colour.

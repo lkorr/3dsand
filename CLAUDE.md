@@ -300,12 +300,14 @@ hashes are identical, the parameter doesn't reach the kernel at those values.
 | 0–11 | material id | 4096 slots |
 | 12–15 | state nibble | liquids: fullness 1..8; others: palette jitter |
 | 16–18 | tick stamp | substep gate, cycles 1..7; `STAMP_NEVER`=0 for all new voxels |
-| 19–23 | FREE | scratch only unless hash mask + `kPersistMask` widened |
+| 19–23 | MPM excite scratch | `EXCITE_PEND_BIT` + capped depth; set and consumed within ONE tick. **Not free** |
 | 24–27 | stain amount | 0..15 |
 | 28–30 | stain type | 0=clean, 1..7 palette slots |
 | 31 | `kCellOpIfAir` | transient CPU→GPU flag |
 
 Allocation must agree in: `common.wgsl` (`voxMat`), `world.h`, and this table. Stamp+bits 19–23 excluded from world hash and stripped on save.
+
+**The word is FULL — there are no spare bits.** Bits 19–23 read "FREE" here and in `world.h` until 2026-08-30 while `common.wgsl` had owned them as excite scratch since the MPM seam landed; stain amount is not narrowable either (water applies the full 0..15). New per-voxel state must reinterpret a span it already owns — as `MATF_TINTED` reinterprets the state nibble for grid colour — or go to a sparse auxiliary layer. Claiming the excite bits for durable state would also delete that seam's safety argument, and `sim.exciteMode` defaults to 0 so no current test would catch it.
 
 ## Critical invariants
 

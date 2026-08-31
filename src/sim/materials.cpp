@@ -274,6 +274,45 @@ static bool LoadMaterialsJson(const std::string& path, std::vector<MaterialDef>&
     // a solid for the CA, the brush, fire and the renderer. See kMatFlagPassable.
     if (m.value("passable", false)) d.gpu.flags |= kMatFlagPassable;
 
+    // ---- tints: GRID colour, per material (sim/materials.h kMatFlagTinted) --
+    //
+    //   "tints": ["#3b2f6b", "#8b1a1a", ...]      up to kMatTintsMax
+    //
+    // The flag and the tint-run base are set in a POST-PASS below, not here:
+    // the base is an offset into one shared palette run, so it can only be
+    // assigned once every material's tint count is known.
+    if (m.contains("tints")) {
+      if (!m["tints"].is_array()) {
+        errors += path + ": material \"" + d.name + "\": \"tints\" must be an array\n";
+      } else if (m["tints"].size() > kMatTintsMax) {
+        // A hard error rather than a truncation. The state nibble is four bits
+        // wide, so a 17th tint is not "one colour lost" — it is unreachable,
+        // and silently dropping it would leave the author's 17th dye looking
+        // like their 1st with nothing to say why.
+        errors += path + ": material \"" + d.name + "\": " +
+                  std::to_string(m["tints"].size()) + " tints, max " +
+                  std::to_string(kMatTintsMax) + " (the state nibble is 4 bits)\n";
+      } else if (d.gpu.klass == CLASS_LIQUID) {
+        // A liquid's state nibble is its FULLNESS (LIQ_FULL_STATE, DESIGN.md
+        // §4), so tinting one would not merely mis-colour it — it would make
+        // the renderer read flow depth as a dye index and the CA read a dye
+        // index as flow depth. Refused rather than ignored.
+        errors += path + ": material \"" + d.name + "\": liquids cannot be "
+                  "tinted — the state nibble is fullness\n";
+      } else {
+        for (const auto& t : m["tints"]) {
+          uint32_t rgb = 0;
+          if (!t.is_string() || !ParseColor(t.get<std::string>(), rgb)) {
+            errors += path + ": material \"" + d.name +
+                      "\": tints must be \"#rrggbb\" strings\n";
+            d.tints.clear();
+            break;
+          }
+          d.tints.push_back(rgb);
+        }
+      }
+    }
+
     // ---- wind coupling (docs/RESEARCH_wind.md §4.5, invariant 7) ----
     // Two 4-bit numbers in the high half of the same flags word — see
     // kMatWind* in materials.h for why they are packed there. Absent means
@@ -345,6 +384,43 @@ static bool LoadMaterialsJson(const std::string& path, std::vector<MaterialDef>&
       d.gpu.tagMask |= bit;
     }
     mats.push_back(d);
+  }
+
+  // ---- assign tint runs (sim/materials.h kMatFlagTinted) --------------------
+  // A POST-PASS because a material's tint base is an offset into ONE shared
+  // palette run, so it cannot be known until every material's tint count is.
+  // Walked in file order, so the assignment is stable across loads and a
+  // material's base only moves when a material BEFORE it changes tint count —
+  // which is a reload-time fact, never a runtime one.
+  //
+  // Nothing here can move the world hash: tints are colours, and the state
+  // nibble they reinterpret was already hashed with exactly the same bits
+  // whatever they mean. A tinted material changes what a voxel LOOKS like, not
+  // what it IS.
+  {
+    uint32_t next = 0;
+    for (MaterialDef& d : mats) {
+      if (d.tints.empty()) continue;
+      if (next + kMatTintsMax > kTintPaletteSlotsGpu) {
+        // Refuse rather than wrap: a base that overflowed its 8 bits would
+        // alias onto another material's dyes, which reads as "my armour is the
+        // wrong colour" with nothing pointing at the palette.
+        errors += path + ": material \"" + d.name +
+                  "\": tint palette full (" +
+                  std::to_string(kTintPaletteSlotsGpu / kMatTintsMax) +
+                  " tinted materials max)\n";
+        d.tints.clear();
+        continue;
+      }
+      // Runs are kMatTintsMax apart regardless of how many tints the material
+      // actually declared, so `base + state` is in range for ANY state nibble a
+      // voxel can carry — including one a CPU path wrote before this material
+      // grew its tint list. Unused entries stay black but are unreachable in
+      // practice because nothing generates a state above the declared count.
+      d.gpu.flags |= kMatFlagTinted;
+      d.gpu.flags |= (next & kMatTintBaseMask) << kMatTintBaseShift;
+      next += kMatTintsMax;
+    }
   }
 
   if (mats.size() > 4096) errors += path + ": more than 4095 materials (12-bit ID limit)\n";

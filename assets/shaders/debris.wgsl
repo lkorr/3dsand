@@ -85,7 +85,7 @@ fn vsParticle(@builtin(vertex_index) vi : u32,
 
   let mat = p.payload & 0xFFFu;
   let m = materials[mat];
-  var albedo = paletteColor(m, p.payload >> 12u);
+  var albedo = paletteColor(m, p.payload >> 12u, &materials);
 
   // FOAM particles (bit 31 of payload, set by sim_fluid.wgsl's g2p) are not
   // made of any material — they are air in water. Colouring them by a material
@@ -145,7 +145,7 @@ fn vsBody(@builtin(vertex_index) vi : u32,
   if (art != 0u) {
     albedo = unpackColor(materials[ART_PALETTE_BASE + (art - 1u)].color0);
   } else {
-    albedo = paletteColor(m, (b.packed >> 12u) & 0xFu);
+    albedo = paletteColor(m, (b.packed >> 12u) & 0xFu, &materials);
   }
 
   var out : VSOut;

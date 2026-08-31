@@ -117,29 +117,42 @@ std::vector<uint8_t> MicroBodyMergeArt(MicroBodySet& set,
                                        std::string& log) {
   // Identity by default, so a prefab that painted nothing costs nothing and
   // every unpainted voxel keeps color 0.
+  //
+  // INDEXED BY .vox PALETTE SLOT (128..255), VALUED IN MERGED 1-BASED INDICES.
+  // The two sides of this table are deliberately different numbering systems
+  // and that IS the conversion: the caller applies it once
+  // (`if (v.color) v.color = remap[v.color]`) and from that point on a
+  // PrefabVoxel/DebrisVoxel `color` is a merged index, never a .vox slot again.
   std::vector<uint8_t> remap(256, 0);
   if (artColors.empty()) return remap;
 
   uint32_t dropped = 0;
+  // The SOURCE bound is the per-file limit (a .vox addresses art at 128..255);
+  // the MERGED bound below is kArtPaletteSlotsGpu. Conflating the two is what
+  // used to cap the whole cast at 128 colours — see the note in world.h.
   for (size_t i = 0; i < artColors.size() && i < (size_t)kArtPaletteSlots; i++) {
     const uint32_t rgb = artColors[i];
     const int srcSlot = kArtPaletteBase + (int)i;
     if (srcSlot > kArtPaletteTop) break;
     // Colours are deduplicated across prefabs: two mobs painted the same red
-    // share one slot, which is what keeps 128 slots enough for a whole cast.
+    // share one slot, which is what keeps the merged palette small enough for a
+    // whole cast plus its wardrobe.
     auto it = std::find(set.artColors.begin(), set.artColors.end(), rgb);
     size_t at;
     if (it != set.artColors.end()) {
       at = (size_t)(it - set.artColors.begin());
     } else {
-      if (set.artColors.size() >= (size_t)kArtPaletteSlots) { dropped++; continue; }
+      if (set.artColors.size() >= (size_t)kArtPaletteSlotsGpu) { dropped++; continue; }
       at = set.artColors.size();
       set.artColors.push_back(rgb);
     }
-    remap[srcSlot] = (uint8_t)(kArtPaletteBase + at);
+    // 1-BASED: 0 is reserved for "unpainted, use the material's own colour", so
+    // merged entry `at` is stored as `at + 1`. This is also why the merged
+    // ceiling is 255 and not 256 — the byte has to hold at+1.
+    remap[srcSlot] = (uint8_t)(at + 1);
   }
   if (dropped)
-    log += label + ": art palette full (" + std::to_string(kArtPaletteSlots) +
+    log += label + ": art palette full (" + std::to_string(kArtPaletteSlotsGpu) +
            " colours across all loaded models); " + std::to_string(dropped) +
            " colour(s) fall back to the material colour\n";
   return remap;

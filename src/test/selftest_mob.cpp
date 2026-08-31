@@ -2585,21 +2585,21 @@ Status GateMobBurn(Ctx& c, std::string& detail) {
     return 0;
   };
   const uint32_t mFire = matId("fire"), mAcid = matId("acid"),
-                 mCloth = matId("robe_cloth"),
+                 mCloth = matId("cloth"),
                  mClothBurn = matId("cloth_burning"),
                  mClothChar = matId("cloth_charred"), mSkin = matId("skin"),
                  mCooked = matId("flesh_cooked"),
                  mCharred = matId("flesh_charred"),
                  mBurning = matId("flesh_burning"), mBlood = matId("blood"),
-                 mCinder = matId("flesh_cinder"), mUnder = matId("undercloth"),
-                 mUnderBurn = matId("undercloth_burning"),
-                 mUnderChar = matId("undercloth_charred");
+                 mCinder = matId("flesh_cinder"), mUnder = matId("linen"),
+                 mUnderBurn = matId("linen_burning"),
+                 mUnderChar = matId("linen_charred");
   if (!mFire || !mAcid || !mCloth || !mSkin || !mCooked || !mBurning) {
     detail = "body-reactivity materials missing from materials.json";
     return Status::Fail;
   }
   if (!mCinder || !mUnder || !mUnderBurn || !mUnderChar) {
-    detail = "undercloth / flesh_cinder missing from materials.json";
+    detail = "linen / flesh_cinder missing from materials.json";
     return Status::Fail;
   }
 
@@ -2728,10 +2728,10 @@ Status GateMobBurn(Ctx& c, std::string& detail) {
     // the underlying material chars to and reads as bare flesh.
     //
     // Asserted as a REACHABILITY claim over the whole chain rather than as
-    // "undercloth_burning has no air branch", because the hole could be opened
+    // "linen_burning has no air branch", because the hole could be opened
     // by any of the three materials, or by a fourth added between them later.
     // Nothing in the closure may produce air (prodSelf 0), and the closure must
-    // terminate at undercloth_charred, which authors no rules at all.
+    // terminate at linen_charred, which authors no rules at all.
     {
       std::vector<uint32_t> stack{mUnder}, seen{mUnder};
       bool leaks = false, closed = true;
@@ -2794,7 +2794,7 @@ Status GateMobBurn(Ctx& c, std::string& detail) {
   for (size_t i = 0; i < mobs.Defs().size(); i++)
     if (mobs.Defs()[i].name == "wizard") wizDef = (int)i;
   if (wizDef < 0) {
-    detail = "no wizard def (the fixture: robe_cloth over skin on one rig)";
+    detail = "no wizard def (the fixture: cloth over skin on one rig)";
     return Status::Fail;
   }
   const int nLimbs = (int)mobs.Defs()[wizDef].limbs.size();
@@ -3357,9 +3357,9 @@ Status GateMobBurn(Ctx& c, std::string& detail) {
     // WHAT "BURNS" MEANS DEPENDS ON WHAT THE AVATAR IS MADE OF, and this
     // subtest must not assume the player is dressed in any particular thing.
     // `human`, the stock base body, is flesh plus one garment: a linen
-    // undercloth on the hips and upper thighs, which is its own material rather
+    // linen on the hips and upper thighs, which is its own material rather
     // than a paint colour so that burning it chars instead of exposing skin. A
-    // robe_cloth census on it is legitimately 0, and asserting robe cloth here
+    // cloth census on it is legitimately 0, and asserting robe cloth here
     // would fail a perfectly correct rig for the crime of not wearing a robe
     // (gotcha-gate-hardcodes-asset-cast). The claim this subtest owns is
     // narrower than it looks: that the avatar's OWN BODY is wired into the same

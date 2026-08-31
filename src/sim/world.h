@@ -414,8 +414,14 @@ constexpr uint32_t kMaxCellOpsPerTick = 65536;
 constexpr uint32_t kCellOpIfAir = 0x80000000u;
 
 // ---- the voxel word ----
-// bits 0..11 material, 12..15 state, 16..18 tick-stamp, 19..23 FREE,
+// bits 0..11 material, 12..15 state, 16..18 tick-stamp, 19..23 excite scratch,
 // 24..27 stain amount, 28..30 stain type, 31 kCellOpIfAir (never stored).
+//
+// THERE ARE NO FREE BITS. Every span above is spoken for; bits 19..23 in
+// particular are NOT free despite what this comment said until 2026-08-30 (see
+// the excite-scratch block below). Anything needing new per-voxel state must
+// either reinterpret a span it already owns — the way MATF_TINTED reinterprets
+// the state nibble — or go to a sparse auxiliary layer (CLAUDE.md).
 //
 // ---- the tick stamp ----
 // EXACT mirror of the STAMP_* consts in common.wgsl (that file is what the
@@ -442,12 +448,29 @@ inline uint32_t PackVoxNew(uint32_t mat, uint32_t state) {
   return (mat & 0xFFFu) | ((state & 0xFu) << 12) | (kStampNever << kStampShift);
 }
 
-// ---- the free span ----
-// Bits 19..23: unallocated. Neither hashed nor persisted (see above), so they
-// hold per-tick scratch only unless the hash mask in sim_occupancy.wgsl and
-// kPersistMask in stream.cpp are BOTH widened to cover them. Claiming them
-// means saying so here and in the common.wgsl allocation table.
-constexpr uint32_t kFreeBits = 0x00F80000u;
+// ---- the excite scratch span (NOT free) ------------------------------------
+// Bits 19..23 belong to the MPM excite/settle seam. EXACT mirror of
+// EXCITE_PEND_BIT / EXCITE_DEPTH_SHIFT / EXCITE_SCRATCH_BITS in common.wgsl,
+// which is the file the shaders see; this is for the CPU paths that build voxel
+// words and must not scribble on them. exciteDetect sets bit 19 and stashes a
+// capped hydrostatic depth in 20..23; exciteEmit consumes the mark the SAME
+// tick, so the span is per-tick scratch and never persists.
+//
+// This comment used to read "unallocated / FREE", which it had not been since
+// the excite seam landed. The disagreement was live for months and is exactly
+// the "two places must agree" class CLAUDE.md keeps a checker for — the voxel
+// word allocation must agree here, in common.wgsl's voxMat block, and in
+// CLAUDE.md's table.
+//
+// WHY IT MATTERS THAT THESE STAY OUT OF THE HASH. The excite seam's own safety
+// argument is that the bits are excluded from the world hash (sim_occupancy.wgsl)
+// and stripped on save (kPersistMask in stream.h), and that no kernel runs
+// between detect and emit — so a half-finished mark can never leak into hashed
+// state. Widening either mask to claim these bits for durable state DELETES
+// that argument. `sim.exciteMode` defaults to 0, so nothing in the current test
+// set would catch the breakage; it would surface later as nondeterministic
+// water. Per-voxel colour went to the state nibble instead (MATF_TINTED).
+constexpr uint32_t kExciteScratchBits = 0x00F80000u;
 
 // ---- sub-chunk occupancy bitmask (PLAN_surface_flight_perf.md A2) ----------
 // RENDER-ONLY DERIVED DATA, appended to the `occupancy` buffer after the
@@ -812,16 +835,64 @@ constexpr uint32_t kStainPaletteBase = kMaterialSlots - 8;
 // Same trick as the stain palette above, for the same reason. A mob's skin
 // carries a per-voxel ART COLOUR that is independent of its material — a
 // creature is "meat" everywhere and painted all over — so the renderer needs
-// slot -> colour for something that is not a material id. These 128 entries
+// slot -> colour for something that is not a material id. These entries
 // sit just below the stain palette, are filled by Simulation::UploadTables
 // from the loaded prefabs' art palettes, and are inert as materials (nothing
 // can reference them: ids are assigned from the bottom up).
 //
-// 128 matches kArtPaletteSlots in sim/voxload.h, which is the .vox side of the
-// same range; the two must agree. Art colour is render-only and never reaches
-// a world cell, so none of this can move the world hash (rule 1).
-constexpr uint32_t kArtPaletteSlotsGpu = 128;
+// ---- why this is 255 and voxload.h's kArtPaletteSlots is 128 ----
+// They are two DIFFERENT limits and used to be conflated at 128.
+//
+//   kArtPaletteSlots (voxload.h) = 128 is the PER-FILE limit: a .vox addresses
+//   art with palette indices 128..255, because material ids own the bottom half
+//   of the same 256-entry palette. One garment cannot exceed it, and none comes
+//   close.
+//
+//   This constant is the MERGED limit across every prefab loaded at once, and
+//   it is bounded instead by the art byte in the micro voxel (microbody.h bits
+//   8..15) and by MicroBodyMergeArt's uint8_t remap table. Art is stored there
+//   as a 1-BASED merged index — 0 means "unpainted, use the material's own
+//   colour" — so the ceiling is 255, not 256.
+//
+// Storing the merged INDEX rather than the .vox SLOT is what buys the extra
+// range: the old encoding wrote slot = 128 + index into the same byte, which
+// capped the merged palette at 128 for no reason other than the rebasing.
+// debris.wgsl's cube path was already 1-based; this makes the micro path agree,
+// so all three encodings (file, micro brick, cube) now mean the same thing.
+//
+// Art colour is render-only and never reaches a world cell, so none of this can
+// move the world hash (rule 1). GRID colour is a separate mechanism that
+// resolves through this same palette run — see MATF_TINTED.
+constexpr uint32_t kArtPaletteSlotsGpu = 255;
 constexpr uint32_t kArtPaletteBaseGpu = kStainPaletteBase - kArtPaletteSlotsGpu;
+
+// ---- the tint palette (GRID colour — sim/materials.h kMatFlagTinted) --------
+// Third reserved run in the material table, same trick as the stain and art
+// palettes above and for the same reason: the renderer needs index -> colour
+// for something that is not a material id, and a reserved run costs no new
+// binding and rides the existing table upload (so tints hot-reload with R).
+//
+// A MATF_TINTED material reinterprets the voxel word's state nibble as an index
+// into ITS OWN 16-entry run here, at kTintPaletteBaseGpu + tintBase + state.
+//
+// WHY THIS IS A SEPARATE RUN FROM THE ART PALETTE, given that both hold "a
+// colour that is not a material's". They have different LIFETIMES. The art
+// palette is rebuilt wholesale every time prefabs load (mob.cpp clears it, so
+// model indices cannot go stale across a hot reload); the tint palette is
+// authored in materials.json and must survive exactly as long as the material
+// table does. Sharing one run would mean a prefab reload silently wiping the
+// tints, which is the kind of coupling that shows up as the world quietly
+// changing colour three reloads later.
+//
+// 256 entries = 16 materials at the 16-tint maximum, which is far past the
+// handful of substances that want tinting. Real material ids number ~115, so
+// this run is nowhere near them and nothing can reference it as a material
+// (ids are assigned from the bottom up).
+constexpr uint32_t kTintPaletteSlotsGpu = 256;
+constexpr uint32_t kTintPaletteBaseGpu = kArtPaletteBaseGpu - kTintPaletteSlotsGpu;
+static_assert(kTintPaletteBaseGpu > 1024,
+              "reserved palette runs have grown down into the material id "
+              "space — raise kMaterialSlots or shrink a run");
 
 // ---- static micro-detail brick pool (render-only — sim/microvox.h) ----------
 // The raymarcher substitutes a subdiv^3 voxel model for cells of a MATF_MICRO

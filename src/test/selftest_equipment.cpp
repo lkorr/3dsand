@@ -526,7 +526,7 @@ Status GateArmorWear(Ctx& c, std::string& detail) {
 //
 // There is no resist field anywhere in this feature and there is not going to
 // be one. A robe stops fire reaching the skin for exactly two reasons: it is
-// physically in the way (the occlusion probe), and it is `robe_cloth`, which
+// physically in the way (the occlusion probe), and it is `cloth`, which
 // the authored table says catches at 200/1000 against skin's 90. Steel stops
 // acid because `steel` carries no `tag:dissolvable` and therefore never
 // matches acid's rule — an absence, not a rule of its own.
@@ -562,7 +562,7 @@ Status GateArmorReact(Ctx& c, std::string& detail) {
     return 0;
   };
   const uint32_t mFire = matId("fire"), mAcid = matId("acid"),
-                 mCloth = matId("robe_cloth"), mSteel = matId("steel"),
+                 mCloth = matId("cloth"), mSteel = matId("steel"),
                  mSkin = matId("skin");
   if (!mFire || !mAcid || !mCloth || !mSteel || !mSkin) {
     detail = "armour/reactivity materials missing from materials.json";

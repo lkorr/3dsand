@@ -909,7 +909,7 @@
       "molten": "fire"
     },
     {
-      "id": "robe_cloth",
+      "id": "cloth",
       "class": "solid",
       "density": 320,
       "hardness": 5,
@@ -927,6 +927,7 @@
       "molten": "fire"
     },
     {
+      "//": "DEPRECATED ALIAS OF cloth. Kept only because this array is APPEND-ONLY -- a material's id IS its index and every .vox paints with those indices, so deleting this row would renumber the 65 materials after it. Nothing authored from 2026-08-30 should paint it: the gold is a TINT of cloth now, not a material. The one thing lost in the fold is `emission: 6`, a faint gilt glow that a tint cannot express; if that turns out to matter it wants a MATF flag, not a material.",
       "id": "robe_trim",
       "class": "solid",
       "density": 330,
@@ -946,6 +947,7 @@
       "molten": "fire"
     },
     {
+      "//": "DEPRECATED ALIAS OF cloth, and the clearest case in the file: every physical field here -- class, density 320, hardness 5, rubble, molten, tags -- is byte-identical to cloth. It existed ONLY to be darker, which is a colour wearing a material's clothes and precisely the pollution the tint system removes. Kept because the array is append-only (see robe_trim above). Nothing new should paint it.",
       "id": "robe_shadow",
       "class": "solid",
       "density": 320,
@@ -2288,7 +2290,7 @@
       "molten": "fire"
     },
     {
-      "//": "Cloth alight. Shared by every fabric (robe_cloth/trim/shadow) and by leather, so the burn character is authored ONCE and a new fabric inherits it by naming this as its product.",
+      "//": "Cloth alight. Shared by every fabric (cloth/trim/shadow) and by leather, so the burn character is authored ONCE and a new fabric inherits it by naming this as its product.",
       "id": "cloth_burning",
       "class": "solid",
       "density": 300,
@@ -2512,7 +2514,7 @@
     {
       "//": "APPEND ONLY BELOW THIS LINE. A material's id IS its index in this array, and every .vox in the project paints with those indices -- inserting a material anywhere but the end silently renumbers every model after it (see the treeatlas 'i+1' incident). Art palette slots start at 128 (kArtPaletteBase, sim/voxload.h), so this list may grow to 127 entries and no further.",
       "//2": "UNDERCLOTH. The linen the base human model wears, and the reason it is a material rather than a paint colour. Body voxels are 8 bits of material plus 8 bits of ART COLOUR, and every reaction that rewrites a body voxel CLEARS the colour byte (BurnLimbView::Set) -- deliberately, because the burn chain's whole visual account of itself is the material it turns into, and a nonzero art slot would paint straight over the char. So underwear painted onto skin voxels burned to flesh_cooked, lost its paint, and the wearer read as NAKED rather than as scorched. Giving the garment its own id costs nothing and puts the fix where the rest of the burn model already lives: its own chain, in JSON. Colour is the mid tone of the art layer it replaces, so an UNPAINTED use of this material still reads as undyed cloth.",
-      "id": "undercloth",
+      "id": "linen",
       "class": "solid",
       "density": 320,
       "hardness": 4,
@@ -2531,7 +2533,7 @@
     },
     {
       "//": "Undercloth alight. A near-copy of cloth_burning and NOT the same material, which is the entire mechanic: cloth_burning is CONSUMED (it has a becomes-air branch, so a robe burns into holes), and this one is not. See its rules in reactions.json.",
-      "id": "undercloth_burning",
+      "id": "linen_burning",
       "class": "solid",
       "density": 300,
       "hardness": 2,
@@ -2550,8 +2552,8 @@
       "molten": "fire"
     },
     {
-      "//": "Scorched undercloth: the TERMINUS of the whole chain, and the only material in this file that authors no rules at all. That is the point rather than an omission -- it can never burn away, so a torched character keeps a blackened garment instead of losing it, and it can never re-ignite, so the chunk it sits in sleeps (rule 2). NEUTRAL-COOL where the flesh chars beside it are warm brown-black, which is the whole readability job: value alone would not separate scorched linen (#262326) from charred flesh (#3a2f2a) at a glance, but hue does, and it is the same neutral family cloth_charred already uses because both are burnt fabric. A touch darker than cloth_charred: this garment burns to completion rather than into rags.",
-      "id": "undercloth_charred",
+      "//": "Scorched linen: the TERMINUS of the whole chain, and the only material in this file that authors no rules at all. That is the point rather than an omission -- it can never burn away, so a torched character keeps a blackened garment instead of losing it, and it can never re-ignite, so the chunk it sits in sleeps (rule 2). NEUTRAL-COOL where the flesh chars beside it are warm brown-black, which is the whole readability job: value alone would not separate scorched linen (#262326) from charred flesh (#3a2f2a) at a glance, but hue does, and it is the same neutral family cloth_charred already uses because both are burnt fabric. A touch darker than cloth_charred: this garment burns to completion rather than into rags.",
+      "id": "linen_charred",
       "class": "solid",
       "density": 280,
       "hardness": 2,

@@ -18,7 +18,6 @@
 #include "game/camera.h"
 #include "game/player.h"
 #include "gpu/resources.h"
-#include "sim/voxload.h"  // kArtPaletteBase
 #include "test/selftest.h"
 #include "test/support.h"
 
@@ -286,8 +285,12 @@ auto note = [&failed](bool ok, const char* name) {
       for (int x = 0; x < 3; x++)
         // PAINTED, deliberately: art colour is presentation only, so this
         // block must land in the grid as plain stone. See the check below.
-        vox.push_back({(int8_t)x, (int8_t)y, (int8_t)z,
-                       (uint8_t)kArtPaletteBase, kMatStone});
+        //
+        // 1 is the first MERGED art index (0 = unpainted); this used to be
+        // kArtPaletteBase because `color` held a raw .vox palette slot. Stone is
+        // not MATF_TINTED, so nothing carries the colour into the grid and the
+        // assertion below is unchanged in meaning.
+        vox.push_back({(int8_t)x, (int8_t)y, (int8_t)z, 1u, kMatStone});
   // Two voxels above the pad, axis-aligned, so the landing is a short square
   // drop rather than a tumble down whatever slope worldgen put here.
   const int dropY = padY + 3;

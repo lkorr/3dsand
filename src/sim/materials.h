@@ -38,6 +38,47 @@ constexpr uint32_t kMatFlagMicro = 4;
 // that needs changing.
 constexpr uint32_t kMatFlagPassable = 8;
 
+// ---- TINTED: the state nibble is a colour, not a jitter variant -------------
+// Authored in materials.json as `"tints": ["#rrggbb", ...]`, up to
+// kMatTintsMax entries.
+//
+// A tinted material reinterprets voxel-word bits 12..15: instead of selecting
+// one of the three cosmetic `colors` variants with `state % 3`, the nibble is a
+// direct index into this material's run of the TINT PALETTE (world.h
+// kTintPaletteBaseGpu). That is what lets a green-flesh mob's rubble stay green
+// after it lands in the grid — the colour is finally something a GRID cell can
+// carry, where art colour never was.
+//
+// WHY THE NIBBLE AND NOT NEW BITS. The voxel word is full — bits 19..23 look
+// free in old comments but belong to the MPM excite seam (world.h). The nibble
+// is the one span already hashed, already persisted, already carried by
+// DebrisVoxel::payload and ParticleSpawn::payload, so reinterpreting it costs
+// no format change anywhere: no hash-mask widen, no kPersistMask widen, no
+// save-format bump, no payload growth.
+//
+// THE PRICE, all of it real:
+//   * 16 tints per material, not 256. The body's 8-bit art colour is quantized
+//     to the nearest tint when a voxel crosses into the grid.
+//   * LIQUIDS CANNOT BE TINTED. Their nibble is fullness (LIQ_FULL_STATE) and
+//     tinting one would corrupt flow. Refused at load.
+//   * A tinted material loses its 3-variant jitter, so this is wrong for bulk
+//     terrain (stone, dirt) and right for painted matter (flesh, cloth).
+//   * Tinted materials must not be placed by WORLDGEN, which writes
+//     `state = rnd % 3` and would scatter tints 0..2 across them.
+//
+// Tint 0 is the material's natural colour by convention (author it first), so a
+// voxel that arrives with state 0 — a CPU path that never heard of tints, an
+// old save, a worldgen cell — reads as undyed rather than as a wrong colour.
+// That is what makes the flag safe to add to an existing material.
+constexpr uint32_t kMatFlagTinted = 16;
+// Max tints per material: the state nibble is 4 bits.
+constexpr uint32_t kMatTintsMax = 16;
+// Where this material's tint run starts inside the shared tint palette, packed
+// into the free high half of `flags` (bits 16..23) rather than added as a
+// field, for the reason the wind nibbles give below: MaterialGpu is exactly 64
+// bytes and every reader tests `flags` with a mask.
+constexpr uint32_t kMatTintBaseShift = 16, kMatTintBaseMask = 0xFF;
+
 // ---- wind coupling, packed into the SAME flags word ------------------------
 // docs/RESEARCH_wind.md §4.5, invariant 7. Bits 0..7 are the MATF_* booleans
 // above (4 used, 4 spare); bits 8..11 and 12..15 are two authored 4-bit
@@ -273,6 +314,15 @@ struct MaterialDef {
   // as a voxel's stain amount. 0 = never absorbs. Mirrors the top nibble of
   // gpu.stainPack; kept unpacked here for the tuner and the wiki.
   uint32_t absorbCapacity = 0;
+  // GRID colours for a MATF_TINTED material (materials.json "tints"), packed
+  // 0x00RRGGBB, at most kMatTintsMax. Entry i is what a voxel of this material
+  // with state nibble i renders as; entry 0 is the natural colour by
+  // convention. Empty = not tinted, and the nibble keeps its jitter meaning.
+  //
+  // Kept unpacked here, like absorbCapacity, because the packed side is a run
+  // in a reserved region of the GPU material table (world.h kTintPaletteBaseGpu)
+  // that the tuner and the wiki cannot read back.
+  std::vector<uint32_t> tints;
   // Unpacked mirrors of gpu.flags bits 8..15 (see kMatWind* above), kept for
   // the tuner and the wiki the way absorbCapacity is — the packed word is the
   // truth, these are for anything that wants to READ the value back without

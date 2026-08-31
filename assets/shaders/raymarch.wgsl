@@ -3034,7 +3034,7 @@ fn traceReflection(p : vec3f, n : vec3f, rd : vec3f) -> vec3f {
 // different reflected off the surface vs seen through it.
 fn shadeSecondaryHit(h : Hit) -> vec3f {
   let m = materials[voxMat(h.word)];
-  var albedo = paletteColor(m, voxState(h.word));
+  var albedo = paletteColor(m, voxState(h.word), &materials);
   if (m.klass == CLASS_LIQUID) { albedo = unpackColor(m.color0); }
   var rn = vec3f(0.0);
   rn[h.axis] = -h.sgn;
@@ -6262,7 +6262,7 @@ fn fs(in : VSOut) -> FSOut {
       // and the texture contrast visibly drops at every LOD handoff.
       let jc = (far.cell << vec3<u32>(farCellShift(far.level))) >> vec3<u32>(3u);
       let jit = pcg(u32(jc.x * 7 + jc.y * 131 + jc.z * 2917));
-      var albedo = paletteColor(m, jit);
+      var albedo = paletteColor(m, jit, &materials);
       var n = vec3f(0.0);
       n[far.axis] = -far.sgn;
       if (m.klass == CLASS_LIQUID) {
@@ -6326,7 +6326,7 @@ fn fs(in : VSOut) -> FSOut {
     let paletteState = select(voxState(h.word),
                               hash3(R.seed, 1u, cellIndexW(h.cell) ^ h.micMat),
                               isMicro);
-    var albedo = paletteColor(m, paletteState);
+    var albedo = paletteColor(m, paletteState, &materials);
     if (m.klass == CLASS_LIQUID) {
       // liquid state nibble is fullness, not a palette variant: fuller = deeper
       let fullness = f32(voxState(h.word) + 1u) / 8.0;

@@ -6,7 +6,6 @@
 #include <sstream>
 
 #include "sim/tuning.h"
-#include "sim/voxload.h"  // kArtPaletteBase, mirrored into the WGSL prelude
 #include "sim/world.h"
 
 // ---- GPU buffer budget -----------------------------------------------------
@@ -135,11 +134,16 @@ std::string ShaderConstantPrelude() {
   // Art palette: reserved material-table entries holding a mob skin's per-voxel
   // ART colours, which are independent of its material (world.h). The micro and
   // cube body passes index materials[ART_PALETTE_BASE + slot].
+  // Both body passes index materials[ART_PALETTE_BASE + (art - 1)] with a
+  // 1-BASED merged art index; 0 means unpainted. There is deliberately no
+  // ART_SLOT_MIN any more — the .vox palette slot is converted to a merged
+  // index once, on the CPU at load (MicroBodyMergeArt), so no shader needs to
+  // know where the .vox art range starts.
   o << "const ART_PALETTE_BASE : u32 = " << kArtPaletteBaseGpu << "u;\n";
-  // Lowest .vox palette index that means "art colour" rather than material id
-  // (kArtPaletteBase, sim/voxload.h). Slot s maps to ART_PALETTE_BASE + s -
-  // ART_SLOT_MIN.
-  o << "const ART_SLOT_MIN : u32 = " << kArtPaletteBase << "u;\n";
+  // Tint palette: a third reserved run holding per-material GRID colours, which
+  // a MATF_TINTED material's state nibble indexes (world.h). paletteColor()
+  // reads materials[TINT_PALETTE_BASE + tintBase + state].
+  o << "const TINT_PALETTE_BASE : u32 = " << kTintPaletteBaseGpu << "u;\n";
   // Static micro-detail (render-only, DESIGN.md §9): the size of the brick pool
   // the raymarcher bounds-checks its nested DDA fetches against.
   o << "const MICRO_POOL_WORDS : u32 = " << kMicroPoolWordsWorld << "u;\n";

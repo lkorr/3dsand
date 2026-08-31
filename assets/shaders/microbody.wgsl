@@ -260,15 +260,16 @@ fn fs(in : VSOut) -> FSOut {
   // identical on every machine — render-only, but a replay should still look
   // the same). Art colour is what lets a creature be one material all over and
   // still be painted; the material is what a severed limb becomes.
-  // `hitArt` is a .vox palette slot in ART_SLOT_MIN..255. The reserved
-  // material-table run is indexed from its base, so slot ART_SLOT_MIN is
-  // entry 0 — the SAME entry the cube path reaches with its 1-based art index
-  // 1 (debris.wgsl). A slot below the art range is not a colour: unpainted.
+  // `hitArt` is a 1-BASED merged art index (0 = unpainted), the exact same
+  // encoding debris.wgsl's cube path uses — so both body passes now decode
+  // colour identically and index 1 means the same colour in each. It used to be
+  // a raw .vox palette slot rebased by ART_SLOT_MIN, which capped the merged
+  // palette at 128 for no reason but the rebasing (see world.h).
   var albedo : vec3f;
-  if (hitArt >= ART_SLOT_MIN) {
-    albedo = unpackColor(materials[ART_PALETTE_BASE + (hitArt - ART_SLOT_MIN)].color0);
+  if (hitArt != 0u) {
+    albedo = unpackColor(materials[ART_PALETTE_BASE + (hitArt - 1u)].color0);
   } else {
-    albedo = paletteColor(mat, u32(c.x * 7 + c.y * 13 + c.z * 29));
+    albedo = paletteColor(mat, u32(c.x * 7 + c.y * 13 + c.z * 29), &materials);
   }
 
   // `tCur` is already the parameter along the UNNORMALIZED camera-to-fragment

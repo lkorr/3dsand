@@ -47,13 +47,17 @@ inline bool AppendVoxInsts(std::vector<BodyVoxInst>& out, uint32_t slot,
     // path's equivalent of the brick poke the micro path gets for free.
     if ((v.payload & 0xFFFu) == 0) continue;
     // Art colour rides in bits 28..31, clamped to the 4 bits this path has
-    // (debris.h). `v.color` is a .vox palette SLOT, so it is rebased to a
-    // 1-based art index first; 0 stays 0, leaving an unpainted voxel
-    // bit-identical to what this packed before art colour existed.
+    // (debris.h). `v.color` is ALREADY a 1-based merged art index by the time it
+    // reaches here — MicroBodyMergeArt's remap is applied once at load, at the
+    // two prefab entry points (game/mob.cpp, game/melee.cpp) — so there is no
+    // rebasing left to do and 0 still means unpainted.
+    //
+    // The clamp is a real limitation, not a formality: this path has 4 bits, so
+    // a voxel painted with merged index > kCubeArtMax draws in colour
+    // kCubeArtMax rather than in its own. It only affects the CUBE path (plain
+    // debris and scale-1 limbs); the micro brick path carries the full 8 bits.
     const uint32_t art =
-        IsArtPaletteIndex(v.color)
-            ? (uint32_t)std::min<int>(v.color - kArtPaletteBase + 1, kCubeArtMax)
-            : 0u;
+        v.color ? (uint32_t)std::min<int>(v.color, kCubeArtMax) : 0u;
     out.push_back({(float)v.x, (float)v.y, (float)v.z,
                    (uint32_t)v.payload | (slot << 16) | (art << 28)});
   }

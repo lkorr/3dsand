@@ -591,6 +591,24 @@ void Simulation::UploadTables(const rhi::Queue& queue,
     table[kStainPaletteBase + type].stainColor = d.gpu.stainColor;
   }
 
+  // Tint palette, same trick one range lower again (world.h): a MATF_TINTED
+  // material's state nibble indexes its own 16-entry run here, which is how a
+  // GRID cell carries a colour at all. Unlike the art palette this needs no
+  // re-apply hook — tints are authored in materials.json, so they arrive with
+  // the very table being rebuilt and cannot go stale against it.
+  //
+  // `color0`, deliberately the same field the art palette uses: paletteColor()
+  // reads one field for both runs, so a tint and an art colour with the same
+  // RGB are literally the same bytes in the same place, and the "a mob's skin
+  // and its rubble shade identically" claim is structural rather than a pair of
+  // tables that happen to agree.
+  for (const auto& d : mats) {
+    if (d.tints.empty()) continue;
+    const uint32_t base = (d.gpu.flags >> kMatTintBaseShift) & kMatTintBaseMask;
+    for (size_t i = 0; i < d.tints.size() && i < kMatTintsMax; i++)
+      table[kTintPaletteBaseGpu + base + i].color0 = ArtRgbToGpu(d.tints[i]);
+  }
+
   // Art palette, same trick one range lower (world.h). Re-applied here because
   // this function rebuilds the WHOLE table: without it, hot-reloading
   // materials.json would silently repaint every mob in its raw material

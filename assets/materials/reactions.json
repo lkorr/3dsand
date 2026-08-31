@@ -268,7 +268,7 @@
       "note": "The ember stage IS the burn: wood ignites to ember on contact with tag:hot, then smolders here until one of these decay rules retires it. Their SUM is the death rate, so scaling all three together sets burn DURATION without touching how fire spreads (that is the wood+tag:hot ignition rule above, deliberately left fast). Total 7 per-mille vs the old 27 = wood takes ~4x longer to be consumed, ~140 ticks mean. Within that budget ash is ~1/4 of decays and smoke is doubled relative to the old 20:7 ash:smoke split, so a burnt-out fire leaves a scatter of ash rather than a floor of it. Embers also live 4x longer, so each one emits its upward fire ~4x more over its life: fire persists longer without spreading faster."
     },
     {
-      "note": "\"burnDuration\": true MARKS A RULE AS PART OF THE COMBUSTION CLOCK. Every marked chance is divided by combustion.burnDurationPct at load (src/sim/materials.cpp), so the Combustion tab is one slider over how long anything in the world stays alight, authored once here rather than by hand-editing eighteen chances that have to keep their ratios.\n\nTwo kinds of rule carry it, and the second is not obvious. The first is every rule that RETIRES a burning voxel -- ember to ash, smoke or air; burning cloth, undercloth, hair and flesh to their spent forms. Halving those is the feature.\n\nThe second is every RELIGHT rule (charred back to burning). Those are the only rules in the file that put matter BACK into a burning state, so they are the only closed loop in the fire economy, and its gain is (relight chance per tick) x (how long a neighbour stays lit). Scaling the burn duration without scaling these multiplies that gain by the same factor, which is fine at 200% -- measured, the difference at the `mob-burn` corpse was 13 voxels still alight versus 15, i.e. nothing -- and is not fine at the top of the slider, where an unscaled gain would cross 1.0 and the fire would never go out (CLAUDE.md rule 2). This is a CEILING argument, not a fix for anything observed at the default: dividing the relight rules too holds the gain exactly where the author put it at every setting, so the slider changes the CLOCK of the fire and never its shape. A corpse in lava re-flares half as often and stays lit twice as long, which is the same corpse running at half speed.\n\nIt is NOT on the ignition rules, the emit rules or the extinguisher rules, and each exclusion is a decision: ignition is how fast fire SPREADS (a separate lever -- see the combustion note at the top of this file -- and leaving it alone is what makes a longer burn also spread further, since a voxel that stays lit twice as long emits its upward flame twice as many times), emit is how much flame a lit voxel SHOWS, and dousing must beat the burn to the tick at any setting."
+      "note": "\"burnDuration\": true MARKS A RULE AS PART OF THE COMBUSTION CLOCK. Every marked chance is divided by combustion.burnDurationPct at load (src/sim/materials.cpp), so the Combustion tab is one slider over how long anything in the world stays alight, authored once here rather than by hand-editing eighteen chances that have to keep their ratios.\n\nTwo kinds of rule carry it, and the second is not obvious. The first is every rule that RETIRES a burning voxel -- ember to ash, smoke or air; burning cloth, linen, hair and flesh to their spent forms. Halving those is the feature.\n\nThe second is every RELIGHT rule (charred back to burning). Those are the only rules in the file that put matter BACK into a burning state, so they are the only closed loop in the fire economy, and its gain is (relight chance per tick) x (how long a neighbour stays lit). Scaling the burn duration without scaling these multiplies that gain by the same factor, which is fine at 200% -- measured, the difference at the `mob-burn` corpse was 13 voxels still alight versus 15, i.e. nothing -- and is not fine at the top of the slider, where an unscaled gain would cross 1.0 and the fire would never go out (CLAUDE.md rule 2). This is a CEILING argument, not a fix for anything observed at the default: dividing the relight rules too holds the gain exactly where the author put it at every setting, so the slider changes the CLOCK of the fire and never its shape. A corpse in lava re-flares half as often and stays lit twice as long, which is the same corpse running at half speed.\n\nIt is NOT on the ignition rules, the emit rules or the extinguisher rules, and each exclusion is a decision: ignition is how fast fire SPREADS (a separate lever -- see the combustion note at the top of this file -- and leaving it alone is what makes a longer burn also spread further, since a voxel that stays lit twice as long emits its upward flame twice as many times), emit is how much flame a lit voxel SHOWS, and dousing must beat the burn to the tick at any setting."
     },
     {
       "self": "ember",
@@ -733,7 +733,7 @@
       "note": "-------- BODIES: per-voxel burning (docs/PLAN_body_reactivity.md) --------"
     },
     {
-      "note": "These materials only ever exist as MOB and ITEM geometry, so until now they were tagged flammable and had no rules at all: a creature could stand in a bonfire forever. Nothing below is mob-specific. MobSystem::BurnLimbs and DebrisSystem::BurnBodies run this same authored table over body voxels through the CPU mirror in sim/reactcpu.h, so a burning limb, a severed burning arm, a dropped burning staff and a robe_cloth voxel that settled into the grid all behave identically."
+      "note": "These materials only ever exist as MOB and ITEM geometry, so until now they were tagged flammable and had no rules at all: a creature could stand in a bonfire forever. Nothing below is mob-specific. MobSystem::BurnLimbs and DebrisSystem::BurnBodies run this same authored table over body voxels through the CPU mirror in sim/reactcpu.h, so a burning limb, a severed burning arm, a dropped burning staff and a cloth voxel that settled into the grid all behave identically."
     },
     {
       "note": "THE SHAPE OF THE MECHANIC. Cloth catches from ONE hot neighbour at about 8x flesh's rate; flesh does not catch at all until THREE of its six faces are hot. That is authored as a decay rule with scaleByNeighbors, because a pair rule's neighbour fields are already spoken for by its partner. The minCount is the load-bearing number: it is what makes a lone ember on a shoulder gutter out while a wide burning front races, i.e. the difference between 'the mob is on fire' as a boolean and fire as a front with a width."
@@ -742,7 +742,7 @@
       "note": "CLOTH: catches from a single hot face and is CONSUMED, leaving holes and scorched rag. All three robe materials share one burning state so the burn character is authored once and a new fabric inherits it by naming cloth_burning as its product."
     },
     {
-      "self": "robe_cloth",
+      "self": "cloth",
       "neighbor": "tag:hot",
       "chance": 200,
       "selfBecomes": "cloth_burning"
@@ -866,38 +866,38 @@
       "becomes": "air"
     },
     {
-      "note": "-------- UNDERCLOTH: the base human's linen, which BLACKENS AND STAYS --------\nA near-copy of the cloth chain above with one branch deleted, and the deletion is the mechanic. cloth_burning is CONSUMED (26.67 of its 39 per-mille go to air), which is right for a robe -- a burnt robe should hang in rags. It is wrong for the one garment the character is wearing UNDER everything: burning it away undresses them, and 'the player caught fire and is now naked' is a worse read than any amount of scorching.\n\nSo undercloth_burning has exactly one decay branch and it lands on undercloth_charred, which authors no rules at all. Same 39 per-mille total, so it burns for the same LENGTH of time as a robe and responds to the burn-duration slider identically; only the destination moved. It still catches at cloth's rate, still emits fire upward while alight, so it still spreads a fire and still cooks the flesh underneath through the ordinary table -- what it cannot do is disappear."
+      "note": "-------- UNDERCLOTH: the base human's linen, which BLACKENS AND STAYS --------\nA near-copy of the cloth chain above with one branch deleted, and the deletion is the mechanic. cloth_burning is CONSUMED (26.67 of its 39 per-mille go to air), which is right for a robe -- a burnt robe should hang in rags. It is wrong for the one garment the character is wearing UNDER everything: burning it away undresses them, and 'the player caught fire and is now naked' is a worse read than any amount of scorching.\n\nSo linen_burning has exactly one decay branch and it lands on linen_charred, which authors no rules at all. Same 39 per-mille total, so it burns for the same LENGTH of time as a robe and responds to the burn-duration slider identically; only the destination moved. It still catches at cloth's rate, still emits fire upward while alight, so it still spreads a fire and still cooks the flesh underneath through the ordinary table -- what it cannot do is disappear."
     },
     {
-      "self": "undercloth",
+      "self": "linen",
       "neighbor": "tag:hot",
       "chance": 200,
-      "selfBecomes": "undercloth_burning"
+      "selfBecomes": "linen_burning"
     },
     {
-      "self": "undercloth_burning",
+      "self": "linen_burning",
       "neighbor": "tag:extinguisher",
       "chance": 450,
-      "selfBecomes": "undercloth_charred"
+      "selfBecomes": "linen_charred"
     },
     {
-      "self": "undercloth_burning",
+      "self": "linen_burning",
       "emit": "fire",
       "dir": "up",
       "chance": 120
     },
     {
-      "self": "undercloth_burning",
+      "self": "linen_burning",
       "emit": "fire",
       "dir": "down",
       "chance": 60
     },
     {
-      "self": "undercloth_burning",
+      "self": "linen_burning",
       "decay": true,
       "burnDuration": true,
       "chance": 39,
-      "becomes": "undercloth_charred"
+      "becomes": "linen_charred"
     },
     {
       "note": "FLESH: sears on contact, ignites only under a WIDE front. skin -> flesh_cooked is a plain pair rule, so a single lick of flame cooks the surface and a creature can be seared without being destroyed. Ignition is the scaled decay below.\n\nIGNITION WAS RAISED 9.75x IN TWO PASSES (40 -> 130 -> 390) on owner report that a body was not flammable enough. THE SEAR WAS NOT, and the attempt to raise it is worth recording because it was wrong for a reason that is easy to repeat: skin -> flesh_cooked is a COLOUR CHANGE, not combustion, so raising it makes a body look cooked faster without making it any more likely to catch. It also broke the one comparison this whole section is built on -- at sear 220 vs cloth's 200 the flesh reacted to a single hot face MORE eagerly than the cloth over it, which inverts 'cloth catches at about 8x flesh's rate' -- and the mob-burn gate caught it as cloth and skin halving on the same tick. Flammability is the decay below; the sear stays at 90. THE MINCOUNT DID NOT MOVE and must not: 3 is the reason a lone ember on a shoulder gutters out, and it is provable rather than tuned (see the next note). At 390 with scaleMax 4 the scaled chance is 858 per-mille at the minCount-3 threshold and saturates at 1000 under a full six-face front, i.e. cooked flesh under a real fire ignites within a tick or two -- the SEAR (90) is now what paces a body catching alight, not the ignition. Raising the chance makes a real fire take hold quickly; lowering the count would make ANY spark take hold, which is a different and much worse game."
