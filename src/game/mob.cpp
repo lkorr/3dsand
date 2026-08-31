@@ -300,6 +300,21 @@ bool LoadMobDefs(const std::string& dir, const std::vector<MaterialDef>& mats,
       int id = FindMaterialId(mats, bm);
       if (id < 0) log += jp + ": unknown bleed material \"" + bm + "\"\n";
       else def.bleedMat = (uint32_t)id;
+      // WHAT A CUT LEAVES ON THE MEAT, as opposed to what runs out of it.
+      // Optional, and defaulting to the bleed material rather than to nothing:
+      // a creature's own blood is already the right colour for flesh it is
+      // losing, so every mob in the repo gets a soaked wound with no content
+      // edit, and one that wants a different answer (sap, ichor, oil) says so
+      // in one key. See MobDef::woundMat for why this is a MATERIAL.
+      const std::string wm = j["bleed"].value("woundMaterial", "");
+      if (!wm.empty()) {
+        const int wid = FindMaterialId(mats, wm);
+        if (wid < 0)
+          log += jp + ": unknown bleed woundMaterial \"" + wm + "\"\n";
+        else
+          def.woundMat = (uint32_t)wid;
+      }
+      if (def.woundMat == 0) def.woundMat = def.bleedMat;
       // NOT rescaled: this is a COUNT of voxels a wound may still owe, i.e.
       // a volume budget, and volume goes as the cube of the voxel scale. It
       // is gore rate rather than size or shape, so it is left as authored
@@ -2907,24 +2922,35 @@ bool Mob::Damage(uint64_t bodyHandle, float amount, Vec3 hitWorldVoxel,
     // severable — you can cut the sword out of a hand) like any limb.
     const MobLimbDef& ld = limbDefs_[i];
     Quat q{limb.xf.quat[0], limb.xf.quat[1], limb.xf.quat[2], limb.xf.quat[3]};
-    // beam crossing the joint anchor severs outright (PLAN §C2)
-    if ((int)i != def_->rootLimb && limb.joint) {
-      Vec3 anchorW = limb.xf.pos + Rotate(q, limb.anchorLimb);
-      if ((hitWorldVoxel - anchorW).len() < 1.75f) {
-        Sever((int)i);
-        return true;
-      }
-    }
-    // Second sever threshold: a fast enough impact takes the limb off no
-    // matter how much hp is left. severImpactSpeed == 0 means "absent" =
-    // infinite, so unconfigured rigs behave exactly as before.
-    bool impactSevers =
-        ld.severImpactSpeed > 0 && impactSpeed >= ld.severImpactSpeed;
+    // ---- THE THREE INSTANT SEVERS, AND WHAT BECAME OF THEM ------------------
+    //
+    // 1. JOINT PROXIMITY (a hit within 1.75 voxels of the anchor severed
+    //    outright) is GONE, with no replacement. It was a "the beam crossed
+    //    the elbow" rule that a swung blade trips constantly — every limb on a
+    //    humanoid has an anchor and 1.75 voxels is most of a forearm — so in
+    //    practice a sword removed whatever it first touched. A joint is now
+    //    cut through like any other flesh: it is thin there, so it still parts
+    //    first, but it parts because the lattice parted.
+    //
+    // 2. IMPACT SPEED survives, as the extreme-speed exception it was meant to
+    //    be, scaled by gore.woundImpactSeverScale. The authored numbers
+    //    (assets/mobs/*.json, 9..20 voxels/sec) were written against rule 1's
+    //    world where contact severed anyway; a committed swing's tip runs well
+    //    past 20, so at face value this fires on every real hit and the whole
+    //    structural model below never gets a turn. The scale is a tuning knob
+    //    rather than a rewrite of every sidecar.
+    //
+    // 3. HP <= 0 no longer takes a limb off. See HpZeroSevers: damage kills a
+    //    creature, geometry dismembers it.
+    const float impactBar =
+        ld.severImpactSpeed * CurrentTuning().gore.woundImpactSeverScale;
+    const bool impactSevers = ld.severImpactSpeed > 0 && impactBar > 0 &&
+                              impactSpeed >= impactBar;
     limb.hp -= amount;
     limb.woundLocal = RotateInv(q, hitWorldVoxel - limb.xf.pos);
     limb.bleedBudget =
         AddBleedBudget(limb.bleedBudget, amount * def_->bleedPerDamage);
-    if (limb.hp <= 0 || impactSevers) {
+    if (impactSevers || (limb.hp <= 0 && HpZeroSevers((int)i))) {
       Sever((int)i);
     } else {
       // non-fatal hit: flinch. This is the one wired trigger for now — it
@@ -2942,6 +2968,420 @@ bool Mob::Damage(uint64_t bodyHandle, float amount, Vec3 hitWorldVoxel,
         sys_->PushVoice(*this, MobSystem::VoiceKind::Hurt, hitWorldVoxel,
                         ld.hp > 0 ? amount / ld.hp : 1.0f);
     }
+    return true;
+  }
+  return false;
+}
+
+// ============================================================================
+// THE WOUND MODEL — a cut is a slot, and dismemberment is what is left of the
+// lattice afterwards (owner's spec, DESIGN.md §7).
+//
+// Three pieces, and they are deliberately separate:
+//
+//   Mob::CutLimb    the KERF. Carves the swept edge's own shape and soaks the
+//                   exposed flesh; knows nothing about severing.
+//   Mob::StainWound the SOAK. A material rewrite over the cut surface, the
+//                   same mechanism charring uses.
+//   Mob::CarveLimb  the STRUCTURE. Already owned the connectivity split; the
+//                   two sever rules the blade adds live there because that is
+//                   the one place that holds the limb's authoritative voxels.
+//
+// Nothing in this file rolls a "did it dismember" chance. That was the whole
+// complaint: a threshold decides instantly and identically every time, so a
+// sword either always takes a limb or never does. Geometry does neither.
+// ============================================================================
+
+bool Mob::HpZeroSevers(int limbIndex) const {
+  // FIRE KEEPS ITS OLD ANSWER. FlushBurn expresses a tick of burning as a
+  // carve, and `mob-burn` asserts a whole account of how a limb burns through
+  // (the anchor component keeps the identity, a limb never leaves while it is
+  // still mostly there). Changing what hp 0 means underneath that is a
+  // different change with a different gate; this one is about blades.
+  if (inBurnFlush_) return true;
+  if (!def_) return true;
+  if (limbIndex < 0 || limbIndex >= (int)limbDefs_.size()) return true;
+  // A VITAL OR ROOT LIMB AT ZERO IS A DEATH, NOT AN AMPUTATION — and Sever()
+  // is the function that says so (it routes root/vital/non-severable straight
+  // to Die()). So "hp zero severs" stays true for exactly those, and the
+  // creature still dies of damage the way it always did.
+  //
+  // For everything else hp is no longer allowed to remove a limb. The owner's
+  // spec in one line: hp <= 0 means death/collapse, not automatic limb
+  // removal. An arm hacked to zero hangs there, ruined, until the edge has
+  // actually been through it.
+  if (limbIndex == def_->rootLimb) return true;
+  const MobLimbDef& ld = limbDefs_[limbIndex];
+  return ld.vital || !ld.severable;
+}
+
+uint32_t Mob::NeckCount(const MobLimb& limb, float radiusWorld) const {
+  if (radiusWorld <= 0.0f) return 0;
+  const bool fine = limb.HasFineSkin();
+  const float scale =
+      (float)std::max(1u, fine ? SkinScaleOf(limb) : PhysScaleOf(limb));
+  // The anchor is stored in limb-local WORLD voxels; the lattice is not.
+  const Vec3 a = limb.anchorLimb * scale;
+  const float r = radiusWorld * scale;
+  const float r2 = r * r;
+  uint32_t n = 0;
+  auto test = [&](float x, float y, float z) {
+    const Vec3 d{x + 0.5f - a.x, y + 0.5f - a.y, z + 0.5f - a.z};
+    if (d.dot(d) < r2) n++;
+  };
+  if (fine)
+    for (const PrefabVoxel& v : limb.skinVoxels)
+      test((float)v.x, (float)v.y, (float)v.z);
+  else
+    for (const DebrisVoxel& v : limb.voxels)
+      test((float)v.x, (float)v.y, (float)v.z);
+  return n;
+}
+
+uint32_t Mob::StainWound(int limbIndex, Vec3 centreLocal, float radiusWorld,
+                         uint32_t seed) {
+  if (!def_ || limbIndex < 0 || limbIndex >= (int)limbs_.size()) return 0;
+  // A GARMENT HAS NO BLOOD IN IT, and neither has a sword. Both are borrowed
+  // rig slots (DESIGN.md §8c) and both reach every path a limb reaches, which
+  // is how the gore code previously sprayed a wearer's blood out of their own
+  // coat. The held item is not `worn`, so it needs its own exclusion: an
+  // appended slot that is not part of the authored rig is luggage.
+  if (IsWornSlot(limbIndex) || limbIndex >= baseLimbs_) return 0;
+  const uint32_t stain = def_->woundMat;
+  if (!stain || radiusWorld <= 0.0f) return 0;
+  const auto& gt = CurrentTuning().gore;
+  const float density = std::clamp(gt.woundStainDensity, 0.0f, 1.0f);
+  if (density <= 0.0f) return 0;
+
+  MobLimb& limb = limbs_[limbIndex];
+  const bool fine = limb.HasFineSkin();
+  const float scale =
+      (float)std::max(1u, fine ? SkinScaleOf(limb) : PhysScaleOf(limb));
+  const Vec3 c = centreLocal * scale;
+  const float r = radiusWorld * scale;
+  const float r2 = r * r;
+
+  // THE BRICK MUST BE OWNED BEFORE IT CAN BE POKED. Every instance of a def
+  // shares one packed model until something damages a particular body; poking
+  // a shared brick would repaint every creature of that species. Same
+  // copy-on-write the ignite path takes, and the same three flags: the limb
+  // owns its model, it is `carved` (so ReleaseLimbMicro frees it), and its
+  // flipbooks are off (a frame swap would re-point rendering at intact art and
+  // heal the wound on screen).
+  MicroBodySet* micro = MicroSet();
+  bool poke = false;
+  if (micro && limb.microModel >= 0) {
+    const int own = MicroBodyOwn(*micro, (uint32_t)limb.microModel);
+    if (own >= 0) {
+      limb.microModel = own;
+      limb.carved = true;
+      limb.flipbookModel = -1;
+      poke = true;
+    }
+  }
+
+  uint32_t stained = 0;
+  // ONE PASS over the authoritative lattice, on a hit tick only. That is the
+  // same bound the spall pass carries and it is the honest one: the question
+  // "which of my voxels are near the cut" can only be answered by whoever owns
+  // the voxel list. The sphere test rejects before the hash, so a limb the cut
+  // did not reach costs one distance compare per voxel and no draws.
+  auto consider = [&](float lx, float ly, float lz, uint32_t mat,
+                      auto&& apply) {
+    if (mat == 0 || mat == (stain & 0xFFFu)) return;  // tombstone, or already
+    const Vec3 d{lx + 0.5f - c.x, ly + 0.5f - c.y, lz + 0.5f - c.z};
+    const float d2 = d.dot(d);
+    if (d2 >= r2) return;
+    // Mottled, not repainted. A uniform swap over the sphere reads as a red
+    // limb; a hash-selected fraction weighted toward the cut reads as meat
+    // that has bled over itself. Weighted by 1 - t so the rim is only
+    // speckled, and keyed on the LATTICE position so a replay stains the same
+    // voxels and a second cut in the same place deepens the same soak.
+    const float t = std::sqrt(d2 / r2);
+    const float chance = density * (1.0f - t * t);
+    const uint32_t h = Hash3(seed, (uint32_t)((int)lx * 73856093),
+                             (uint32_t)((int)ly * 19349663) ^
+                                 (uint32_t)((int)lz * 83492791));
+    if ((float)(h & 0xFFFFu) / 65535.0f >= chance) return;
+    apply();
+    stained++;
+  };
+
+  if (fine) {
+    for (PrefabVoxel& v : limb.skinVoxels)
+      consider((float)v.x, (float)v.y, (float)v.z, (uint32_t)(v.material & 0xFFFu),
+               [&] {
+                 v.material = (uint16_t)(stain & 0xFFFu);
+                 // The art slot MUST go with it, for the reason
+                 // BurnLimbView::Set spells out: a nonzero art colour
+                 // overrides the material's own in microbody.wgsl, so a
+                 // stained voxel that kept its slot goes on being painted
+                 // skin-pink and the wound is invisible on exactly the
+                 // painted surfaces it matters most on.
+                 v.color = 0;
+                 if (poke)
+                   MicroBodyPoke(*micro, (uint32_t)limb.microModel, v.x, v.y,
+                                 v.z, (uint8_t)(stain & 0xFFu), 0);
+               });
+  } else {
+    for (DebrisVoxel& v : limb.voxels)
+      consider((float)v.x, (float)v.y, (float)v.z, (uint32_t)(v.payload & 0xFFFu),
+               [&] {
+                 v.payload = (uint16_t)(stain & 0xFFFu);
+                 v.color = 0;
+                 if (poke)
+                   MicroBodyPoke(*micro, (uint32_t)limb.microModel, v.x, v.y,
+                                 v.z, (uint8_t)(stain & 0xFFu), 0);
+               });
+  }
+  if (!stained) return 0;
+  // The COLLIDER is derived from the skin by a (material, colour) majority
+  // vote, so a skin-only stain would be invisible to everything that reads the
+  // coarse lattice — the settle-back seam, the particle conversion, the
+  // material census a test takes. Re-deriving here rather than at the next
+  // carve keeps the two lattices from disagreeing about what the limb is made
+  // of, which phys/lattice.h makes unrepresentable on purpose.
+  if (fine) {
+    bool overflow = false;
+    limb.voxels = DownsampleSkin(
+        limb.skinVoxels,
+        std::max(1u, SkinScaleOf(limb) / std::max(1u, PhysScaleOf(limb))),
+        &overflow);
+  }
+  MarkInstancesDirty();
+  return stained;
+}
+
+bool MobSystem::CutLimb(uint64_t bodyHandle, const BladeCut& cut, World& world,
+                        std::vector<ParticleSpawn>& spawns) {
+  for (Mob& mob : mobs_)
+    if (mob.CutLimb(bodyHandle, cut, world, spawns)) return true;
+  return false;
+}
+
+bool Mob::CutLimb(uint64_t bodyHandle, const BladeCut& cut, World& world,
+                  std::vector<ParticleSpawn>& spawns) {
+  if (!phys_) return false;
+  for (size_t i = 0; i < limbs_.size(); i++) {
+    if (limbs_[i].body != bodyHandle) continue;
+    MobLimb& limb = limbs_[i];
+    // Read the pose ONCE, here, and let CarveLimb test against exactly this
+    // one. A live limb is kinematic and re-posed every tick, so re-reading it
+    // mid-carve tests the voxels against a pose the predicate never saw
+    // (gotcha-live-limb-carve-pose). CarveLimb deliberately does not refresh.
+    phys_->GetTransform(limb.body, limb.xf);
+    const Quat q{limb.xf.quat[0], limb.xf.quat[1], limb.xf.quat[2],
+                 limb.xf.quat[3]};
+
+    // ---- the slot's own frame, in the limb's BODY frame --------------------
+    // Three axes: along the edge (u), the way the edge is travelling (w), and
+    // the flat of the blade (v). Two of them are MEASURED — the item's
+    // authored edge segment through its live pose, and how far the tip really
+    // moved this tick — so the wound's orientation cannot drift from the art
+    // or from the swing.
+    const Vec3 cLocal = RotateInv(q, cut.at - limb.xf.pos);
+    Vec3 u = RotateInv(q, cut.edgeAxis);
+    Vec3 w = RotateInv(q, cut.cutDir);
+    const float ul = u.len(), wl = w.len();
+    u = ul > 1e-4f ? u * (1.0f / ul) : Vec3{1, 0, 0};
+    w = wl > 1e-4f ? w * (1.0f / wl) : Vec3{0, -1, 0};
+    Vec3 v = u.cross(w);
+    if (v.len() < 0.15f) {
+      // A THRUST, NOT A CUT: the edge is travelling along its own length, so
+      // "the flat of the blade" is undefined and the cross product is noise.
+      // Any perpendicular will do — the slot is then a round-ish bore, which
+      // is what a thrust actually makes.
+      v = u.cross(Vec3{0, 1, 0});
+      if (v.len() < 0.15f) v = u.cross(Vec3{1, 0, 0});
+    }
+    v = v.normalized();
+    // Re-derive the travel axis from the two exact ones, so the frame is
+    // orthonormal by construction instead of by however square the inputs
+    // happened to be.
+    w = v.cross(u).normalized();
+
+    const auto& gt = CurrentTuning().gore;
+    const float depth = std::max(cut.depth, 0.0f);
+    const float halfW = std::max(cut.halfWidth, 1e-3f);
+    const float halfL = std::max(cut.length, 1e-3f);
+    // HOW FAR BACK THE SLOT STARTS. `cut.at` is a ray hit on the JOLT
+    // COLLIDER, which is a greedy box merge inflated by a convex radius — it
+    // is near the surface, not on it, and at skinScale 8 "near" is several
+    // skin voxels. A slot that started exactly at the hit point would
+    // sometimes float clear of the art and remove nothing at all, which reads
+    // as the blade passing through the body. Backing it off by a fraction of
+    // its own depth costs a little over-reach on the entry face and buys the
+    // cut always landing.
+    //
+    // Small, and it only has to cover the last fraction of a lattice cell:
+    // the slot's entry is SNAPPED TO FLESH just below, so it is not absorbing
+    // a collider inflation any more. The world is 10 voxels to the metre and a
+    // human upper leg is about 1.2 world voxels thick, so half a voxel of
+    // backoff would put most of a chip outside the limb.
+    const float back = 0.15f * depth + 0.10f;
+    const uint32_t seed =
+        (uint32_t)id_ * 2654435761u + (uint32_t)i * 40503u + cut.seed;
+    const float jitterScale = (float)std::max(1u, SkinScaleOf(limb));
+
+    // ---- WHERE THE EDGE MEETS FLESH ------------------------------------------
+    //
+    // THE SLOT STARTS AT THE SURFACE, NOT AT THE HIT POINT, and this one line
+    // is what makes the whole "sustained hits dismember" mechanic work.
+    //
+    // A kerf of fixed depth placed at a fixed point SATURATES: the first blow
+    // empties the slot, and every blow after it finds that space already gone
+    // and removes nothing. Measured before this existed — 46 identical cuts to
+    // one cross-section of a human thigh took 2.6% each and never severed,
+    // because they were all the same 2.6%. A player hacking at one spot would
+    // have watched the wound stop getting deeper.
+    //
+    // The physical statement is "the edge bites `depth` into whatever it first
+    // meets", so the entry plane is found rather than assumed: the smallest
+    // projection onto the travel axis over the voxels inside the slot's own
+    // cross-section. A second blow then starts at the bottom of the first
+    // one's gash and goes `depth` further, which is what cutting is.
+    //
+    // It also removes the collider's inflation from the arithmetic. `cut.at`
+    // is a ray hit on a greedy box merge padded by a convex radius, i.e. near
+    // the surface rather than on it, and at skinScale 8 "near" is several skin
+    // voxels of guesswork that the backoff constant above used to absorb.
+    //
+    // COST: one pass over the authoritative lattice, on a hit tick, with a
+    // rejection test before any arithmetic — the same bound as the stain pass
+    // and the spall pass, and for the same reason (only the owner of the voxel
+    // list can answer a question about occupancy).
+    float entry = 0.0f;
+    {
+      const bool fine = limb.HasFineSkin();
+      const float sc =
+          (float)std::max(1u, fine ? SkinScaleOf(limb) : PhysScaleOf(limb));
+      const Vec3 c = cLocal * sc;
+      // THE CORE OF THE SLOT, NOT ALL OF IT. The edge is at the middle of the
+      // kerf; the rest of the footprint is the wedge behind it, and the ragged
+      // rim deliberately leaves stragglers out there. Probing the whole
+      // footprint lets one surviving rim voxel pin the entry plane at the
+      // original surface, so the groove stops advancing while the blade goes
+      // on shaving its own rim — measured at 31 blows to part a thigh instead
+      // of four, which reads as a blunt sword rather than as a probe reading
+      // the wrong voxel.
+      const float hw = halfW * sc * 0.35f, hl = halfL * sc * 0.35f;
+      float best = 1e30f;
+      auto probe = [&](float x, float y, float z) {
+        const Vec3 d{x + 0.5f - c.x, y + 0.5f - c.y, z + 0.5f - c.z};
+        if (std::fabs(d.dot(u)) > hl || std::fabs(d.dot(v)) > hw) return;
+        best = std::min(best, d.dot(w));
+      };
+      if (fine)
+        for (const PrefabVoxel& pv : limb.skinVoxels)
+          probe((float)pv.x, (float)pv.y, (float)pv.z);
+      else
+        for (const DebrisVoxel& dv : limb.voxels)
+          probe((float)dv.x, (float)dv.y, (float)dv.z);
+      if (best < 1e29f) {
+        const float e = best / sc;
+        // CLAMPED, because "the nearest flesh in this column" is not always
+        // "the surface the blade met": a limb bent back on itself can put a
+        // hand's worth of voxels a long way up the travel axis, and an
+        // unclamped snap would teleport the slot there and cut something the
+        // edge never touched. Beyond a cut's own reach, keep the hit point.
+        const float lim = depth + 1.0f;
+        if (e > -lim && e < lim) entry = e;
+      }
+    }
+    const Vec3 slotAt = cLocal + w * entry;
+
+    // A LITTLE SPALL, and only a little. This is the mechanism that makes
+    // "sustained hits dismember": a second cut into an existing gash finds
+    // voxels that already have open faces and takes them, so the wound
+    // DEEPENS rather than stippling fresh flesh beside it. Its own knob
+    // rather than the blast's, because a blast wants two rounds of it and a
+    // cut wants at most one — a kerf that spalled hard would stop being a kerf.
+    Mob::CarveSpall spall{};
+    const bool wantSpall =
+        gt.cutSpallRounds > 0 && gt.cutSpallStrength > 0.0f && depth > 0.0f;
+    if (wantSpall) {
+      // Centred on the cut and sized to the SLOT, not to a blast radius: the
+      // spall pass is a sphere test, and one sized to the depth is the volume
+      // the edge actually disturbed.
+      spall.centerLocal = slotAt + w * (depth * 0.5f);
+      spall.radius = std::max(depth, halfW * 2.0f);
+      spall.strength = std::clamp(gt.cutSpallStrength, 0.0f, 1.0f);
+      spall.rounds = gt.cutSpallRounds;
+      spall.seed = seed;
+    }
+
+    // Everything the two structural sever rules in CarveLimb need to know is
+    // "an edge did this" — see Mob::inBladeCut_ for why the other carve causes
+    // are deliberately excluded. Scoped, because CarveLimb can re-enter this
+    // mob through Sever() and must not leave the flag standing.
+    struct BladeScope {
+      bool& f;
+      bool prev;
+      explicit BladeScope(bool& flag) : f(flag), prev(flag) { f = true; }
+      ~BladeScope() { f = prev; }
+    } bladeScope(inBladeCut_);
+
+    const bool alive = CarveLimb(
+        (int)i, world, spawns, /*eject=*/true,
+        [=](float scale) -> LimbCarveKeep {
+          // ONE world-space slot, re-expressed per lattice — the same
+          // contract CarveLimbRadial's factory has, so a fine-skinned limb
+          // loses the same physical volume from both of its lattices.
+          const Vec3 c = slotAt * scale;
+          const float dep = depth * scale;
+          const float hw = halfW * scale;
+          const float hl = halfL * scale;
+          const float bk = back * scale;
+          const float toSkin = jitterScale / scale;
+          return [=](int x, int y, int z) -> bool {  // true = KEEP
+            const Vec3 p{(float)x + 0.5f, (float)y + 0.5f, (float)z + 0.5f};
+            const Vec3 d = p - c;
+            const float dw = d.dot(w);
+            if (dw < -bk || dw > dep) return true;
+            const float du = d.dot(u), dv = d.dot(v);
+            // A BLADE IS A WEDGE. The slot narrows toward its bottom, in both
+            // of the axes that are not the travel direction: that is what
+            // makes a shallow contact a chip and a deep one a gash, from one
+            // shape, with no second case. `t` is 0 at the entry face.
+            const float t =
+                dep > 1e-4f ? std::clamp(dw / dep, 0.0f, 1.0f) : 0.0f;
+            const float wAt = hw * (1.0f - 0.55f * t);
+            const float lAt = hl * (1.0f - 0.35f * t);
+            const float fu = std::fabs(du), fv = std::fabs(dv);
+            if (fu > lAt || fv > wAt) return true;
+            // RAGGED RIM, on the same terms the blast crater's is: certain
+            // removal in the core of the slot, thinning to nothing at its
+            // edge, quantised onto the SKIN lattice so both passes tear the
+            // same way and the wound's shape is a property of the art rather
+            // than of whichever collider resolution the def derived.
+            //
+            // CPU gameplay state — limbs are outside the hashed domain — so a
+            // float hash is fine here; rule 1 governs the grid, and everything
+            // this cut puts INTO the grid goes through the ordinary
+            // ParticleSpawn/BrushOp streams.
+            const float e = std::max(fu / std::max(lAt, 1e-3f),
+                                     std::max(fv / std::max(wAt, 1e-3f), t));
+            const float chance = 1.0f - e * e;
+            const int sx = (int)std::floor((float)x * toSkin);
+            const int sy = (int)std::floor((float)y * toSkin);
+            const int sz = (int)std::floor((float)z * toSkin);
+            const uint32_t h = Hash3(seed, (uint32_t)sx * 73856093u,
+                                     (uint32_t)sy * 19349663u ^
+                                         (uint32_t)sz * 83492791u);
+            return (float)(h & 0xFFFFu) / 65535.0f >= chance;
+          };
+        },
+        wantSpall ? &spall : nullptr);
+
+    // SEVERED OR DEAD: `limb`, `limbs_` and possibly this whole creature are
+    // gone. Nothing below may touch them — the same contract every other
+    // CarveLimb caller honours.
+    if (!alive) return true;
+
+    // The soak goes on LAST, over what survived, and centred a little way into
+    // the cut so it follows the gash rather than ringing the entry point.
+    StainWound((int)i, slotAt + w * (depth * 0.5f),
+               CurrentTuning().gore.woundStainRadius, seed ^ 0x51ED5u);
     return true;
   }
   return false;
@@ -3409,6 +3849,15 @@ bool Mob::CarveLimb(int limbIndex, World& world,
   MobLimb& limb = limbs_[limbIndex];
   if (!limb.body || limb.voxels.empty()) return true;
   const MobDef& def = *def_;
+  const auto& gt = CurrentTuning().gore;
+  // HOW MUCH FLESH THIS LIMB HAD AT ITS JOINT, taken lazily, here, before this
+  // carve removes anything (MobLimb::neckAtSpawn says why it is not taken at
+  // spawn). Floored at 1 so a limb whose anchor sits outside its own lattice
+  // records a real answer once instead of re-measuring on every carve — the
+  // comparison then reads "the neck is empty", which is the correct verdict
+  // for that geometry anyway.
+  if (limb.neckAtSpawn == 0)
+    limb.neckAtSpawn = std::max(1u, NeckCount(limb, gt.woundNeckRadius));
   // NOTE: limb.xf is deliberately NOT refreshed from Jolt here. the predicate
   // was built against the pose the CALLER measured, and a live limb is
   // kinematic — the animation pipeline re-poses it every tick — so re-reading
@@ -3689,7 +4138,15 @@ bool Mob::CarveLimb(int limbIndex, World& world,
   const bool collapsed =
       limb.voxels.size() < kMinFragmentVoxels ||
       (float)nowCount < kLimbCollapseFraction * (float)at0;
-  if (collapsed || limb.hp <= 0) {
+  // HP IS NO LONGER A DISMEMBERMENT RULE (except where it always was — see
+  // HpZeroSevers). It was the third of the three instant severs the owner's
+  // spec deletes, and it is the one that survives a blade cut the longest: a
+  // sword does 14 damage and a critter's limb has less hp than that, so the
+  // very first contact reached zero and took the limb off before a single
+  // voxel of geometry had been consulted. A vital or root limb at zero still
+  // routes to Sever(), which still routes to Die() — the creature dies of
+  // damage, it simply does not come apart of it.
+  if (collapsed || (limb.hp <= 0 && HpZeroSevers(limbIndex))) {
     // Sever() re-enters this mob by id and may call Die(); after it, neither
     // `mob` nor `limb` may be assumed live, so nothing below may touch them.
     Sever(limbIndex);
@@ -3824,6 +4281,17 @@ bool Mob::CarveLimb(int limbIndex, World& world,
       }
       limb.voxels = std::move(parts[keepComp]);
 
+      // THE PIECE THAT PARTED COMPANY, measured before the fragments leave.
+      // This is the whole structural dismemberment test: "the biggest thing
+      // that is no longer joined to the anchor", as a fraction of what the
+      // limb still had. A chip is a handful of voxels; an edge that came out
+      // the other side leaves a component the size of the rest of the limb,
+      // and no whole-limb fraction can tell those apart (the limb keeps 60% of
+      // itself in both cases).
+      uint32_t partedOff = 0;
+      for (uint32_t c = 0; c < (uint32_t)compSize.size(); c++)
+        if (c != keepComp) partedOff = std::max(partedOff, compSize[c]);
+
       uint32_t budget = kMaxCarveFragments;
       for (uint32_t c = 0; c < (uint32_t)parts.size(); c++) {
         if (c == keepComp || parts[c].empty()) continue;
@@ -3846,6 +4314,54 @@ bool Mob::CarveLimb(int limbIndex, World& world,
         Sever(limbIndex);
         return false;
       }
+
+      // ---- CUT THROUGH: the edge came out the other side --------------------
+      //
+      // The limb still has enough of itself to be a limb, and a substantial
+      // piece of it is nonetheless lying on the ground. That is a
+      // dismemberment, and until now it was not treated as one: the distal
+      // half became an anonymous debris fragment while the rig went on driving
+      // the proximal stub as a live arm. No gout, no `byBlade` cue, no
+      // dismember loco state — a severed forearm that the animation system had
+      // never heard about.
+      //
+      // Routed through the ORDINARY Sever(), deliberately. This change is
+      // about WHEN a limb comes off, not about what coming off means: the
+      // anchor is captured, the stump bleeds on the parent, the arterial gout
+      // is armed, the sever event carries its cause, and DetachLimb cascades
+      // to children exactly as before.
+      //
+      // BLADE ONLY — see Mob::inBladeCut_. A blast has no "other side" and
+      // fire has a tested account of its own.
+      if (inBladeCut_ &&
+          (float)partedOff >= gt.woundSeverFraction * (float)n) {
+        Sever(limbIndex);
+        return false;
+      }
+    }
+  }
+
+  // ---- HANGING BY A THREAD ---------------------------------------------------
+  //
+  // The second structural rule, and the one connectivity cannot state. A limb
+  // can be 70% intact overall and attached by four voxels of shoulder: nothing
+  // has disconnected, so the block above is silent, and the whole-limb
+  // fractions above it are nowhere near their floors. What has actually
+  // happened is that the flesh AT THE JOINT is gone, and that is measured at
+  // the joint or not at all (MobLimb::neckAtSpawn).
+  //
+  // This is what makes a run of cuts to one spot converge instead of asymptote:
+  // reach-1 lattices leave diagonal slivers that 6-connectivity happily calls
+  // "still one piece" forever, and without this rule a patient player could saw
+  // an arm to a thread and never take it off.
+  //
+  // Blade only, same reasoning. Bounded: one pass over the limb's lattice, on
+  // a hit tick, after a carve that already did several.
+  if (inBladeCut_ && limb.neckAtSpawn > 0 && gt.woundNeckRadius > 0.0f) {
+    const uint32_t neck = NeckCount(limb, gt.woundNeckRadius);
+    if ((float)neck < gt.woundNeckFraction * (float)limb.neckAtSpawn) {
+      Sever(limbIndex);
+      return false;
     }
   }
 
@@ -5534,6 +6050,42 @@ Vec3 MobSystem::LimbVoxelPos(uint64_t mobId, int limbIndex, uint32_t n) const {
     return limb.xf.pos + Rotate(q, c);
   }
   return Vec3{};
+}
+
+Vec3 MobSystem::LimbAnchorPos(uint64_t mobId, int limbIndex) const {
+  for (const Mob& mob : mobs_) {
+    if (mob.id_ != mobId) continue;
+    if (limbIndex < 0 || limbIndex >= (int)mob.limbs_.size()) break;
+    const MobLimb& limb = mob.limbs_[limbIndex];
+    // The SAME construction Sever() uses to locate the cut, and for the same
+    // reason: `anchorLimb` through the pose Jolt is actually holding is
+    // correct under any animation, heading or slope, while origin_ +
+    // anchorRoot is a rest-pose offset that ignores both the heading and the
+    // animated body height. A carve that rebases the brick moves xf.pos and
+    // anchorLimb in opposite directions (ReskinLimbMicro), so this world point
+    // is INVARIANT across cuts — which is what lets a test hack at one
+    // cross-section instead of chasing a moving target.
+    if (!limb.body) return mob.origin_ + limb.anchorRoot;
+    const Quat q{limb.xf.quat[0], limb.xf.quat[1], limb.xf.quat[2],
+                 limb.xf.quat[3]};
+    return limb.xf.pos + Rotate(q, limb.anchorLimb);
+  }
+  return Vec3{};
+}
+
+uint32_t MobSystem::LimbArtVoxelCount(uint64_t mobId, int limbIndex) const {
+  for (const Mob& mob : mobs_) {
+    if (mob.id_ != mobId || limbIndex < 0 ||
+        limbIndex >= (int)mob.limbs_.size())
+      continue;
+    const MobLimb& l = mob.limbs_[limbIndex];
+    // The AUTHORITATIVE lattice, which is the one `voxelsAtSpawn` counted.
+    // LimbVoxelCount reports the COLLIDER, and on a fine-skinned limb the two
+    // differ by (skinScale/physScale)^3 — so a fraction built from one and a
+    // denominator from the other is wrong by a factor of 64 on a stock human.
+    return (uint32_t)(l.HasFineSkin() ? l.skinVoxels.size() : l.voxels.size());
+  }
+  return 0;
 }
 
 uint32_t MobSystem::LimbBodyCount() const {

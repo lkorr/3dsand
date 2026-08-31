@@ -687,6 +687,50 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     // REMOVE, so an unbounded count is a way to erase a body one slider drag
     // at a time. Four is already past the point where more reads as different.
     e.carveSpallRounds = std::clamp(e.carveSpallRounds, 0, 4);
+    // ---- E. the wound model (game/mob.h Mob::CutLimb) ----------------------
+    ReadF(*g, "cutDepth", e.cutDepth, out, at);
+    ReadF(*g, "cutDepthPower", e.cutDepthPower, out, at);
+    ReadF(*g, "cutLength", e.cutLength, out, at);
+    ReadF(*g, "cutWidth", e.cutWidth, out, at);
+    ReadI(*g, "cutSpallRounds", e.cutSpallRounds, out, at);
+    ReadF(*g, "cutSpallStrength", e.cutSpallStrength, out, at);
+    ReadF(*g, "woundHeftRef", e.woundHeftRef, out, at);
+    ReadF(*g, "woundHeftMax", e.woundHeftMax, out, at);
+    ReadF(*g, "woundStainRadius", e.woundStainRadius, out, at);
+    ReadF(*g, "woundStainDensity", e.woundStainDensity, out, at);
+    ReadF(*g, "woundSeverFraction", e.woundSeverFraction, out, at);
+    ReadF(*g, "woundNeckRadius", e.woundNeckRadius, out, at);
+    ReadF(*g, "woundNeckFraction", e.woundNeckFraction, out, at);
+    ReadF(*g, "woundImpactSeverScale", e.woundImpactSeverScale, out, at);
+    // BOUNDS, not taste. Each of these is a value that turns the wound model
+    // into something other than a wound model at the ends of its range, and
+    // the tuner offers a text box as well as a slider.
+    //
+    // A negative depth or length is a kerf that removes nothing, which reads
+    // as "the sword stopped working" rather than as a bad number; a huge one
+    // is a swing that erases a limb, which is exactly the behaviour this whole
+    // change exists to remove. woundHeftRef divides, so zero is a division by
+    // zero dressed up as a slider.
+    e.cutDepth = std::clamp(e.cutDepth, 0.0f, 8.0f);
+    e.cutDepthPower = std::clamp(e.cutDepthPower, 0.0f, 8.0f);
+    e.cutLength = std::clamp(e.cutLength, 0.1f, 16.0f);
+    e.cutWidth = std::clamp(e.cutWidth, 0.05f, 4.0f);
+    e.cutSpallRounds = std::clamp(e.cutSpallRounds, 0, 4);
+    e.cutSpallStrength = std::clamp(e.cutSpallStrength, 0.0f, 1.0f);
+    if (e.woundHeftRef < 0.01f) {
+      out.warnings.push_back(at + ".woundHeftRef <= 0; clamped");
+      e.woundHeftRef = 0.01f;
+    }
+    e.woundHeftMax = std::clamp(e.woundHeftMax, 1.0f, 32.0f);
+    e.woundStainRadius = std::clamp(e.woundStainRadius, 0.0f, 16.0f);
+    e.woundStainDensity = std::clamp(e.woundStainDensity, 0.0f, 1.0f);
+    // A sever fraction of 0 severs on the first disconnected speck — that is
+    // the straggler bug in Mob::CarveLimb wearing a slider — and 1 can never
+    // fire at all. Both ends are excluded rather than merely discouraged.
+    e.woundSeverFraction = std::clamp(e.woundSeverFraction, 0.05f, 0.95f);
+    e.woundNeckRadius = std::clamp(e.woundNeckRadius, 0.0f, 16.0f);
+    e.woundNeckFraction = std::clamp(e.woundNeckFraction, 0.0f, 0.95f);
+    e.woundImpactSeverScale = std::max(e.woundImpactSeverScale, 0.0f);
     // A negative or zero gain would silently disable bleeding rather than
     // reading as a tuning mistake, so floor it just above zero.
     if (e.bleedGain < 0.0f) {

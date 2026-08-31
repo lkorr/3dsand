@@ -2066,6 +2066,67 @@ Brick ownership follows the body: a carved limb owns its COW model, and
 exactly one system will ever free it — which is also why a severed carved limb
 keeps its wounds as debris with no special case.
 
+### The wound model: a blade cuts (2026-08-31; `Mob::CutLimb`, `sim/tuning.h` §E)
+
+The section above says dismemberment is geometry. For blades it was not: three
+thresholds in `Mob::Damage` — a hit within 1.75 voxels of a joint anchor, a hit
+past the limb's authored `severImpactSpeed`, and hp reaching zero — each fired a
+`Sever()` outright, and a swung sword tripped all three on first contact. The
+per-voxel carve ran alongside them as decoration on a decision already made:
+touch a creature with a sword, lose a limb, anywhere, every time.
+
+**A cut is a slot, and dismemberment is what is left of the lattice.**
+
+- **The kerf.** `BladeCut` (game/mob.h) is one hit as pure geometry: the contact
+  point, the blade's own edge axis, the direction the edge is travelling, its
+  half-thickness, and how deep it bit. Two of those are MEASURED — the item's
+  authored `edge` segment through its live pose, and how far the tip really
+  moved this tick — so a wound's orientation cannot drift from the art or from
+  the swing. `Mob::CutLimb` builds an orthonormal frame from them and carves a
+  tapering wedge-shaped slot through `CarveLimb`, so everything that already
+  followed a carve (re-skin, collider rebuild, connectivity split, hp charge,
+  bleed budget, hurt cry) follows a cut with no new plumbing.
+- **The slot starts at the SURFACE, not at the hit point.** A fixed-depth kerf
+  at a fixed point saturates: the first blow empties it and every blow after
+  finds that space already gone. Measured before this existed — 46 identical
+  cuts to one thigh took 2.6% each and never severed. `CutLimb` finds the
+  nearest flesh along the travel axis over the slot's own core footprint and
+  puts the entry plane there, so the second blow starts at the bottom of the
+  first one's gash. It also takes the collider's convex-radius inflation out of
+  the arithmetic, since `cut.at` is a ray hit on a padded box merge rather than
+  a point on the art.
+- **Blood is a MATERIAL, not a colour.** `StainWound` rewrites a hash-selected
+  fraction of the flesh around the cut to the creature's wound material
+  (`bleed.woundMaterial`, defaulting to its own blood) — the same mechanism
+  charring uses, and for the same reason: a nonzero art slot overrides the
+  material colour in `microbody.wgsl`, so a stain carried as paint is invisible
+  on exactly the painted surfaces it matters most on. It renders, it travels
+  with a severed limb, and it ejects as blood when cut again.
+- **Two structural sever rules, both blade-only.** *Cut through*: a component of
+  the limb at least `gore.woundSeverFraction` of what it had is no longer joined
+  to the anchor — the edge came out the other side. *Hanging by a thread*: the
+  limb is still one piece but the flesh inside `gore.woundNeckRadius` of its
+  JOINT has fallen below `gore.woundNeckFraction` of what was there intact,
+  which is the thing connectivity cannot state (reach-1 lattices leave diagonal
+  slivers that 6-connectivity calls "one piece" forever). Both route through the
+  ordinary `Sever()`, so this changes WHEN a limb comes off and nothing about
+  what coming off means. Neither applies to a burn (which has its own tested
+  account of charring through) or to a blast (which has no "other side").
+- **Heft is derived from the art.** `ItemDef::heftVolume` is the item's own
+  voxel count in world voxels; the factor the wound model consumes is that
+  against `gore.woundHeftRef` (the stock arming sword, 5.3). A greatsword cuts
+  deeper because it IS bigger, and re-authoring the blade re-weighs it in the
+  same edit. `assets/items/cleaver.*` is the heavy end at 1.85x.
+- **What survives of the three instant severs.** The joint-proximity rule is
+  deleted outright. `severImpactSpeed` remains as an extreme-speed exception
+  scaled by `gore.woundImpactSeverScale`, because the authored 9–20 voxels/sec
+  were written for a world where contact severed anyway. `hp <= 0` no longer
+  removes a limb: on a root or vital limb it still routes to `Die()`, so damage
+  kills a creature — it simply does not take it apart (`Mob::HpZeroSevers`).
+
+Gated by `wound-chip` / `wound-accumulate` / `wound-heft` / `wound-bleed`, with
+the hit-count BAND (not an exact count) in `tests/baseline.json`.
+
 ---
 
 ## 8. Player & Projectiles

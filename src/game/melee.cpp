@@ -10,6 +10,7 @@
 #include "phys/debris.h"  // DebrisSystem: ...and melts loose ones
 #include "phys/physics.h"
 #include "sim/scale.h"    // SkinScaleFor / NeededArtUpsample / kLegacyAuthoring*
+#include "sim/tuning.h"   // CurrentTuning().gore: the kerf's shape lives there
 #include "sim/voxload.h"  // UpsamplePrefab
 
 // See melee.h for what this is and why. Three halves, in file order: the item
@@ -195,6 +196,14 @@ bool LoadItemAsset(const std::string& dir, size_t materialCount,
     d.size = held->size;
     d.offset = held->offset;
     d.voxels = held->voxels;
+    // HEFT IS MEASURED, NOT AUTHORED (item.h ItemDef::heftVolume). The voxel
+    // count divided by scale^3 is the item's volume in WORLD voxels, which is
+    // the one number that says "this is a greatsword and that is a knife"
+    // without anybody writing it down twice. Taken AFTER the upsample above,
+    // so `scale` and `voxels` are on the same lattice — reading it before
+    // would inflate a low-resolution item by artUpsample^3.
+    const float sc = (float)(d.scale ? d.scale : 1u);
+    d.heftVolume = (float)d.voxels.size() / (sc * sc * sc);
   }
 
   d.hp = s.value("hp", 30.0f);
@@ -452,6 +461,11 @@ bool LoadItems(const std::string& dir, size_t materialCount,
     }
     d.damage = it.value("damage", 12.0f);
     d.carveBonus = it.value("carveBonus", 0.0f);
+    // The authored heft OVERRIDE. Absent (or 0) is the normal case and means
+    // "derive it from the art" — LoadItemAsset below fills heftVolume and
+    // ItemDef::HeftFactor does the division. Present is for the item whose
+    // geometry lies about its mass.
+    d.heft = it.value("heft", 0.0f);
     // items.json authors reach in world voxels at the legacy 10 vox/m
     // baseline; rescale so the same number means the same distance.
     d.reach = it.value("reach", 9.0f) *
@@ -548,8 +562,23 @@ EdgeSweepResult MeleeSweepDamage(const EdgeSweep& s, const MeleeTuning& t,
   // weapon. `edgeFloor` is what keeps a flat from being free — a flat still
   // bruises, and still breaks what it lands on.
   out.edgeAlign = MeleeEdgeAlign(s.flatNow, travel, t.edgeFloor);
+  // ONE `power`, AND IT IS ALREADY EDGE-SCALED. Everything downstream — the
+  // damage, the blade-cut scope, and the KERF'S DEPTH AND LENGTH below — reads
+  // this value, so a flat-on slap does a shallower wound as well as a weaker
+  // one without the wound model needing to know that edge alignment exists.
+  // Deliberate: it is the one place the two halves of the melee overhaul meet,
+  // and multiplying `edgeAlign` in a second time further down would square it.
   const float power = out.power * out.edgeAlign;
   const float radius = s.halfWidth + s.carveBonus;
+  // ---- WHAT THE WOUND MODEL NEEDS, MEASURED ONCE ---------------------------
+  // WHICH WAY THE EDGE IS GOING: how far the blade's MIDPOINT travelled over
+  // the tick, which is the axis a kerf penetrates along and the one thing a
+  // radius has no way to express. The mid-blade rather than the tip because a
+  // cut near the hilt is going where the hilt is going. A per-sweep constant,
+  // so it is lifted clear of the sample loops below.
+  const auto& goreT = CurrentTuning().gore;
+  const Vec3 sweepDir =
+      ((s.aNow + s.bNow) - (s.aPrev + s.bPrev)).normalized();
 
   // Sample along the blade AND across the sweep, so a fast cut does not tunnel
   // between ticks. Both counts are bounded and scale with how far the blade
@@ -600,13 +629,46 @@ EdgeSweepResult MeleeSweepDamage(const EdgeSweep& s, const MeleeTuning& t,
       // Everything severed inside this scope is a BLADE cut, and gets the wet
       // dismember sound on top of the creature's own cry. Both calls below can
       // sever several frames deep — Damage() at zero hp or over the impact
-      // threshold, CarveLimbRadial() when the limb collapses — so the cause is
+      // threshold, CutLimb() when the lattice is cut through — so the cause is
       // marked around them rather than passed down through a chain the laser
       // and explosions also use.
       MobSystem::BladeCutScope blade(mobs, power);
       if (mobs.Damage(hb, dmg, at, out.tipSpeed)) {
-        mobs.CarveLimbRadial(hb, at, radius * (0.6f + 0.4f * power),
-                             true /*ragged*/, true /*eject*/, world, spawns);
+        // A KERF, NOT A BITE. The radial carve this replaced took a sphere out
+        // of the limb, which at any radius that felt like a sword was most of
+        // an arm — and Damage() severed on contact anyway, so the shape never
+        // got to matter. Now it is the only thing that decides dismemberment:
+        // the slot follows the blade's own edge and the direction the swing is
+        // going, and a limb comes off when the lattice has been cut through
+        // (game/mob.h BladeCut).
+        //
+        // THIS IS THE ONLY PLACE THE KERF IS BUILT. It lives inside the sweep
+        // rather than at the player's call site precisely because there are
+        // three callers — the player's tick, an attacking NPC's tick, and the
+        // gate — and a second copy of these six lines is how the player's cut
+        // and the NPC's quietly stop being the same cut.
+        BladeCut cut;
+        cut.at = at;
+        cut.edgeAxis = seg.normalized();
+        // A stationary blade has no travel direction to speak of; fall back to
+        // boring along its own length, which is what a press with no swing
+        // behind it does.
+        cut.cutDir = sweepDir.len() > 1e-4f ? sweepDir : seg.normalized();
+        // The blade's OWN thickness decides the kerf's width; the tuning knob
+        // only scales it, because the geometry is supposed to be what decides
+        // the wound (items.json says so about carveBonus for the same reason).
+        cut.halfWidth = std::max(radius * goreT.cutWidth, 0.08f);
+        // `power` here is speed x edge-alignment (see the note where it is
+        // formed) and `s.heft` is the weapon's own volume, so how deep the
+        // wound goes is: how fast, how well-angled, and how much sword.
+        cut.depth = (goreT.cutDepth + goreT.cutDepthPower * power) * s.heft;
+        cut.length = goreT.cutLength * (0.4f + 0.6f * power) * s.heft;
+        cut.power = power;
+        // Counter-based, off the tick and the probe index: the ragged rim and
+        // the blood soak must replay identically, and nothing here may key on
+        // a Jolt float.
+        cut.seed = s.tick * 2654435761u + (uint32_t)hitBodies.size() * 40503u;
+        mobs.CutLimb(hb, cut, world, spawns);
       } else {
         debris.MeltBodyAt(hb, at, radius, world, spawns);
       }

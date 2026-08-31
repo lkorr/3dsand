@@ -1057,6 +1057,12 @@ Status GateSwingPlane(Ctx& c, std::string& detail) {
           sw.halfWidth = sword->edgeHalfWidth;
           sw.damage = sword->damage;
           sw.carveBonus = sword->carveBonus;
+          // The SHIPPED sword's heft, not the neutral default: the kerf's
+          // depth scales with it, so a gate that left it at 1 would be
+          // measuring a wound no weapon in the game makes.
+          sw.heft = sword->HeftFactor(CurrentTuning().gore.woundHeftRef,
+                                      CurrentTuning().gore.woundHeftMax);
+          sw.tick = (uint32_t)i;
           sw.valid = true;
           std::vector<ParticleSpawn> spawns;
           MeleeSweepDamage(sw, melee.tuning, avatar, phys, mobs, debris, world,
@@ -1185,6 +1191,12 @@ Status GateSwingPlane(Ctx& c, std::string& detail) {
       sw.halfWidth = sword->edgeHalfWidth;
       sw.damage = sword->damage;
       sw.carveBonus = sword->carveBonus;
+      // Same sword, same tick seed in both arms — the whole point of the pair
+      // is that they differ ONLY in the blade's roll, and the kerf's seed and
+      // heft are two more things that must not be allowed to vary.
+      sw.heft = sword->HeftFactor(CurrentTuning().gore.woundHeftRef,
+                                  CurrentTuning().gore.woundHeftMax);
+      sw.tick = 7u;
       sw.valid = true;
       std::vector<ParticleSpawn> spawns;
       res = MeleeSweepDamage(sw, melee.tuning, avatar, phys, mobs, debris,

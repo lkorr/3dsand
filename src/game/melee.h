@@ -306,6 +306,21 @@ struct EdgeSweep {
   float halfWidth = 0;     // carve radius, world voxels
   float damage = 0;        // the item's damage at full swing speed
   float carveBonus = 0;    // extra carve radius beyond the blade's own
+  // HOW MUCH WEAPON IS BEHIND THE EDGE, dimensionless (item.h
+  // ItemDef::HeftFactor: the item's own voxel volume against
+  // `gore.woundHeftRef`). Scales the kerf's depth and length, so a greatsword
+  // cuts through what a knife has to saw at. 1 is the neutral value a
+  // fabricated sweep gets for free, and it is deliberately the DEFAULT: a gate
+  // that only wants to measure the geometry should not have to own an ItemDef.
+  //
+  // The FACTOR rather than the volume, because the conversion needs the gore
+  // tuning and this header is included by item.h's consumers; the callers each
+  // do the one-line `item->HeftFactor(g.woundHeftRef, g.woundHeftMax)`.
+  float heft = 1.0f;
+  // Sim tick, for the wound's counter-based seed. The ragged rim and the blood
+  // soak must replay identically from the same tick+probe, and nothing in the
+  // kerf may key on a Jolt float (game/mob.h BladeCut::seed).
+  uint32_t tick = 0;
   bool valid = false;
 };
 

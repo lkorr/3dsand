@@ -5162,6 +5162,16 @@ int main(int argc, char** argv) {
             sw.halfWidth = ehw;
             sw.damage = heldItem->damage;
             sw.carveBonus = heldItem->carveBonus;
+            // HEFT: the weapon's own volume against the reference, so a
+            // greatsword cuts deeper than a knife because it IS bigger
+            // (item.h ItemDef::heftVolume). Derived from the art, resolved
+            // here because only the caller knows which item is in the fist.
+            {
+              const auto& goreT = CurrentTuning().gore;
+              sw.heft = heldItem->HeftFactor(goreT.woundHeftRef,
+                                             goreT.woundHeftMax);
+            }
+            sw.tick = tick;
             sw.valid = true;
             MeleeSweepDamage(sw, melee.tuning, avatar, phys, mobs, debris,
                              world, spawns);

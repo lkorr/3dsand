@@ -362,6 +362,38 @@ struct ItemDef {
   // voxels. This is the difference between a cut and a cleave; keep it small,
   // since the blade geometry is supposed to be what decides the wound.
   float carveBonus = 0.0f;
+
+  // ---- HEFT: how much weapon is behind the edge ---------------------------
+  //
+  // DERIVED FROM THE ART, because the art is right there. `heftVolume` is the
+  // item's own voxel count expressed in WORLD voxels — voxels / scale^3 — and
+  // it is a fact about the .vox rather than a number in a sidecar that
+  // somebody has to keep true when the blade changes. A greatsword is heavier
+  // than a knife because it IS bigger, and re-authoring the mesh re-derives
+  // the weight in the same edit.
+  //
+  // Filled at load (melee.cpp LoadItemAsset) for the HELD model only: a worn
+  // piece has no single model and never swings, so its heft stays 0.
+  //
+  // The dimensionless factor the wound model consumes is this against
+  // `gore.woundHeftRef` (sim/tuning.h §E2), so retuning the reference rescales
+  // every weapon at once with no rebuild. `heft` is the AUTHORED OVERRIDE for
+  // the case the geometry cannot state — a hollow ceremonial blade, a
+  // lead-cored club — and 0 means "derive it".
+  float heftVolume = 0.0f;
+  float heft = 0.0f;
+  // `refVolume` is gore.woundHeftRef; `maxFactor` is gore.woundHeftMax. Kept
+  // as arguments rather than reaching for CurrentTuning() so item.h stays free
+  // of the tuning header, which the loader and the tests both depend on.
+  float HeftFactor(float refVolume, float maxFactor) const {
+    if (heft > 0.0f) return heft < maxFactor ? heft : maxFactor;
+    if (heftVolume <= 0.0f || refVolume <= 0.0f) return 1.0f;
+    const float f = heftVolume / refVolume;
+    // Floored well below 1 rather than at it: a dagger SHOULD cut shallower
+    // than an arming sword, and that is most of what makes "a knife needs
+    // sustained work" true without a second rule.
+    return f < 0.2f ? 0.2f : (f > maxFactor ? maxFactor : f);
+  }
   // Reach in world voxels from the shoulder, used to size the swing arc.
   // METRES-derived: 0.9 m from the shoulder. A bare 9 cells halved the
   // player's effective reach the moment kVoxelMeters did.
