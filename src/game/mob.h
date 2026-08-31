@@ -9,7 +9,8 @@
 #include "game/ai_behavior.h"
 #include "game/anim.h"
 #include "game/equipment.h"
-#include "game/melee.h"   // WeaponPose: the stroke driver's command to the rig
+#include "game/melee.h"     // WeaponPose: the stroke driver's command to the rig
+#include "game/strokes.h"   // NpcStroke: one authored swing, live
 #include "math3d.h"
 #include "phys/debris.h"
 #include "phys/physics.h"
@@ -670,6 +671,14 @@ class Mob {
   // Rig size INCLUDING a borrowed item slot (limbDefs_ tracks limbs_).
   int LimbCount() const { return (int)limbDefs_.size(); }
   const MobLimbDef& LimbDefAt(int i) const { return limbDefs_[i]; }
+  // LIVE hp of one rig slot, INCLUDING the appended ones. A held weapon is a
+  // borrowed slot with its own hp (item.h ItemDef::hp), which is what a parry
+  // charges, and there was no way to read it from outside. -1 for a slot that
+  // does not exist, so a caller that does not check cannot mistake "gone" for
+  // "unhurt". PlayerAvatar::PartHp is the same reading, kept for its callers.
+  float LimbHpAt(int i) const {
+    return i >= 0 && i < (int)limbs_.size() ? limbs_[i].hp : -1.0f;
+  }
 
   // ---- damage / dismemberment (shared; see MobSystem for the id-keyed API) --
   // Damage a limb by physics body handle. Returns true if the handle belonged
@@ -820,6 +829,26 @@ class Mob {
   // Rig slots that are NOT part of the authored rig: worn shells and a held
   // item, always at the tail. `LimbCount() - AppendedBase()` of them.
   int AppendedBase() const { return baseLimbs_; }
+  // ---- THE LIVE SWING (game/strokes.h) -------------------------------------
+  // An NPC's stroke program, or Idle. On the BASE class for the same reason
+  // SetWeaponPose and ApplyWeaponArm are: the machinery is shared and only the
+  // DRIVER differs. The player avatar never uses this one — main.cpp owns a
+  // MeleeState fed by the mouse — but nothing here would break if it did.
+  //
+  // Pure presentation state: never saved, never hashed, rebuilt from nothing.
+  NpcStroke& Stroke() { return stroke_; }
+  const NpcStroke& Stroke() const { return stroke_; }
+  // WHICH WAY THIS BODY FACES. The same `AxisAngle({0,1,0}, heading) * +Z` the
+  // walk step and the limb submit use -- one convention, one formula, so a
+  // caller cannot drift from the direction the mob actually translates along.
+  // MobSystem::MobFacing is the id-keyed wrapper for callers holding only an id.
+  Vec3 Facing() const;
+  float Heading() const { return heading_; }
+  // +1 when the weapon is in a hand on the body's RIGHT, -1 on its left. Read
+  // off the RIG (the socket part's name), not off the equip context string, so
+  // a left-handed def needs no second spelling of the same fact.
+  float HandSign() const;
+
   // The held weapon's cutting edge in WORLD voxels, from its live transform.
   // `outFlat`, when asked for, is the normal of the blade's cutting plane in
   // world space — how edge-on a cut was is a property of the pose, so it is
@@ -1222,6 +1251,8 @@ class Mob {
   Vec3 gripBody_{};            // grip point in the item's BODY frame
   // Swing pose pushed in by the driver (SetWeaponPose). Pure presentation.
   WeaponPose weapon_{};
+  // The authored attack this creature is executing, if any (game/strokes.h).
+  NpcStroke stroke_{};
   float weaponWeight_ = 0;     // weapon_.weight, clamped once on the way in
   mutable WeaponArmDiag weaponDiag_{};
   mutable Quat weaponHandPreClamp_{}, weaponUpPreClamp_{}, weaponLoPreClamp_{};
@@ -1359,6 +1390,108 @@ class MobSystem {
   // so two factions fight the moment two profiles disagree about `faction`.
   void SetPlayerActor(Vec3 centreVox, float radius, float height, bool alive);
   void ClearPlayerActor() { playerActorValid_ = false; }
+
+  // ---- THE PLAYER AS A TARGET ---------------------------------------------
+  //
+  // The avatar is a Mob (game/avatar.h) but it is NOT in `mobs_`: it is owned
+  // by main.cpp and driven by the player. Every body-handle-keyed entry point
+  // below therefore missed it, and the frame loop worked around that by asking
+  // `avatar.Damage(...)` first and `mobs.Damage(...)` second at each of its own
+  // call sites. That workaround does not reach INSIDE MeleeSweepDamage — which
+  // is one function with three callers by design — so an NPC's sweep found the
+  // player's limbs, failed to recognise them, and melted them as debris.
+  //
+  // Registering the avatar here is the fix, and it is the smaller change: the
+  // four handle-keyed lookups (FindLimb, FindOwner, Damage, CutLimb,
+  // CarveLimbRadial) consult it AFTER the mob list, so every existing caller
+  // that already checked the avatar first is bit-identical, and the one caller
+  // that could not check it now works.
+  //
+  // Deliberately NOT extended to CarveMobsRadial: that one is position-keyed
+  // (the explosion path) and the avatar already has its own CarveRadial call
+  // beside it. Routing it here as well would carve the player twice.
+  void SetAvatar(Mob* avatar) { avatar_ = avatar; }
+  Mob* Avatar() const { return avatar_; }
+  // WHICH CREATURE OWNS THIS BODY, and which of its rig slots it is. The
+  // three-way flesh/garment/weapon classification the parry needs is then the
+  // rig's own: `< owner->AppendedBase()` is flesh, `== owner->HeldSlot()` is
+  // the weapon, and anything else appended is a worn shell.
+  Mob* FindOwner(uint64_t bodyHandle, int* outLimbIndex = nullptr);
+
+  // ---- BLADE ON BLADE (game/melee.h BlockEvent) ---------------------------
+  // Reported the way SeverEvents and VoiceEvents are, and for the same reason:
+  // this system knows nothing about audio or particles. Phase D turns each into
+  // a clang and a spark.
+  //
+  // ONE LIST FOR BOTH DIRECTIONS. MeleeSweepDamage pushes here whoever swung,
+  // so an NPC parried by the player and a player parried by an NPC arrive
+  // through the same drain — a second list keyed by "was it the player" is
+  // exactly the kind of split that rots.
+  //
+  // Pushing also APPLIES the defender's shove, because MobSystem is the only
+  // thing that can reach an NPC's stroke; a block whose defender is the avatar
+  // is left for main.cpp, which owns that MeleeState.
+  // ---- IS SOMEBODY ELSE'S BLADE IN THE PATH OF THIS SWEEP? ----------------
+  //
+  // GEOMETRY, NOT A RAY CAST, and the reason is measured rather than stylistic.
+  // MeleeSweepDamage finds what it hits by casting rays along the swinging
+  // blade's own axis, which is exactly right for a BODY and useless against
+  // another BLADE: a sword's collider is the item's own art at the item's own
+  // scale, about a QUARTER OF A VOXEL thick, and a zero-radius ray through a
+  // quarter-voxel slab is a coincidence rather than a test. Measured in
+  // `npc-block`: two edges passing within 0.28 voxels of each other, seven
+  // sweeps run, zero rays finding the blade — and a ray fired deliberately
+  // straight down the defender's own edge segment came back empty too.
+  //
+  // So the question is asked of the two EDGE SEGMENTS, which are the
+  // authoritative hitboxes anyway (melee.h note 1, "the pose is the hitbox"):
+  // if the quad this sweep covers passes within `gap` of another creature's
+  // held edge, that blade is in the way. Cheap and bounded — kMaxMobs
+  // creatures, a fixed sample grid, and only on a tick that is actually
+  // cutting.
+  //
+  // `wielder` is excluded; so is anything not holding an item. Returns the
+  // closest such blade, its body handle, and where the two met.
+  bool FindParry(const Mob& wielder, const Vec3& aPrev, const Vec3& bPrev,
+                 const Vec3& aNow, const Vec3& bNow, float gap, Mob*& outBlocker,
+                 uint64_t& outBody, Vec3& outAt);
+  void PushBlockEvent(const BlockEvent& ev, const MeleeTuning& t);
+  const std::vector<BlockEvent>& BlockEvents() const { return blocks_; }
+  void ClearBlockEvents() { blocks_.clear(); }
+
+  // ---- authored attack styles (game/strokes.h) ----------------------------
+  // Hot-reloaded from assets/mobs/attack_styles.json on R, exactly as the
+  // behaviour library is. A live stroke keeps the style INDEX it started with,
+  // which is safe for the same reason a live Brain keeps its profile index
+  // between reloads: both are re-resolved on the next attack.
+  void SetAttackStyles(StyleLibrary lib) { styles_ = std::move(lib); }
+  const StyleLibrary& AttackStyles() const { return styles_; }
+
+  // ---- DRIVING A SWING BY HAND --------------------------------------------
+  //
+  // The same kind of seam `SetDesiredHeading` already is, and documented the
+  // same way: for the gates now, and for scripted encounters later. Neither
+  // bypasses any mechanic — ForceAttack runs the identical stroke program the
+  // AI's request would have started, and SetGuard is the windup's own drive
+  // held open — so a test that uses them is testing the shipping path.
+  //
+  // ForceAttack: swing `style` at `targetPoint`, now. False if the creature has
+  // no weapon, the style is not loaded, or a stroke is already live (a queued
+  // swing is an unbounded backlog, rule 2 — see the note at PreTick's call).
+  bool ForceAttack(uint64_t mobId, const std::string& style, Vec3 targetPoint,
+                   uint32_t tick);
+  // SetGuard: hold the blade at a stated azimuth/elevation in the creature's
+  // OWN facing basis, with the point pushed out to `reachFrac` of the arm's
+  // reach. Held until ClearGuard or until an attack replaces it. This is how a
+  // defender comes to have its sword across a line without attacking — which
+  // is the whole of emergent blocking from the defender's side.
+  bool SetGuard(uint64_t mobId, float az, float el, float reachFrac);
+  void ClearGuard(uint64_t mobId);
+  // The item library, so an NPC's sweep can read the damage, carve bonus and
+  // HEFT of whatever is in its fist. By POINTER and not owned: items reload on
+  // R and a copy here would be a second, stale library. The Mob stores its held
+  // item BY NAME (item.h's index hazard), so the resolve happens per swing.
+  void SetItems(const ItemLibrary* items) { items_ = items; }
 
   // ---- the attack seam (Phase C consumes this) ----------------------------
   // Requests issued this tick. The AI decides WHEN and WHERE; it never swings,
@@ -1590,6 +1723,9 @@ class MobSystem {
   void SetNextIdCounter(uint64_t n) { nextId_ = n ? n : 1; }
   uint64_t LimbBody(uint64_t mobId, int limbIndex) const;
   bool IsAlive(uint64_t mobId) const;
+  // The live stroke of one creature, for the gates and the dev readout. Null
+  // when there is no such mob.
+  const NpcStroke* MobStroke(uint64_t mobId) const;
 
   // THE MOST INTACT LIMB ANY SEVER HAS TAKEN since the last clear, as a
   // fraction of that limb's spawn volume, with its name. -1 = nothing severed.
@@ -1628,6 +1764,20 @@ class MobSystem {
   // desired heading directly, leaving the turn-rate clamp fully in force. The
   // wander behaviour re-takes control as soon as it next wants to turn.
   void SetDesiredHeading(uint64_t mobId, float radians);
+  // ...AND THE ONE THAT ACTUALLY TURNS THE BODY, instantly. The scripted-
+  // placement seam: "this creature is standing here facing that", which a
+  // desired heading cannot express.
+  //
+  // SetDesiredHeading is NOT a substitute and the difference is not academic.
+  // Every intent in ai::Think writes `out.desiredHeading` every tick — Idle
+  // writes the CURRENT heading, deliberately, so an idle creature does not keep
+  // turning toward a target it had three seconds ago — so a desired heading
+  // pushed in from outside is overwritten before the turn-rate clamp has moved
+  // the body a degree. Measured: a `training_dummy` told to face its opponent
+  // stood with its back to it and held its guard pointing the wrong way down
+  // the field, and the block gate reported "0 block events" for a feature that
+  // worked.
+  void SetHeading(uint64_t mobId, float radians);
   // Gait introspection: how many chains currently have a swinging foot, and
   // how far the planted feet have travelled. The selftest asserts the
   // one-group-swinging invariant per tick rather than comparing step rates
@@ -1828,9 +1978,17 @@ class MobSystem {
   };
   GroundSense SenseGround(const Mob& mob, const MobDef& def, World& world) const;
 
+  // ---- executing an authored attack (game/strokes.h) ----------------------
+  // Called from PreTick's per-mob loop, between the steering stages and the
+  // animation. The long note at their definitions says why the order within a
+  // tick is what it is.
+  void BeginStroke(Mob& mob, const ai::AttackRequest& req, uint32_t tick);
+  void StepStroke(Mob& mob, uint32_t tick, World& world,
+                  std::vector<ParticleSpawn>& spawns);
+
   // Pick this tick's desired heading and drive scale. This is THE AI seam: the
   // only stage that gets to have an opinion, and it may write nothing except
-  // mob.desiredHeading / mob.driveScale. Currently a wander-and-avoid.
+  // mob.desiredHeading / mob.driveScale.
   void DecideIntent(Mob& mob, const MobDef& def, const GroundSense& sense,
                     uint32_t tick, float dt);
 
@@ -1900,6 +2058,17 @@ class MobSystem {
   ai::Actor playerActor_;
   bool playerActorValid_ = false;
   std::vector<ai::AttackRequest> attacks_;
+  // ---- phase C: executing an attack ---------------------------------------
+  // The authored style library, and the item library the swings resolve their
+  // weapon against. Neither is owned by the creature: styles hot-reload with R
+  // and item indices are file-order (item.h's index hazard), so a Mob stores
+  // its weapon BY NAME and the swing looks it up.
+  StyleLibrary styles_;
+  const ItemLibrary* items_ = nullptr;
+  std::vector<BlockEvent> blocks_;
+  // The player's body, registered by main.cpp so the handle-keyed lookups can
+  // find it. NOT owned and NOT in `mobs_` — see SetAvatar.
+  Mob* avatar_ = nullptr;
   uint64_t nextId_ = 1;
   bool instancesDirty_ = false;
   // Particles authored outside PreTick — Sever() is reached from damage

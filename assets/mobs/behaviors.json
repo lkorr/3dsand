@@ -12,9 +12,42 @@
       "hysteresis": 0.22,
       "perception": { "sightRange": 0, "fovDegrees": 360, "requireLos": true, "aggro": "passive", "alertDecayTicks": 0, "keepRangeScale": 1.0 },
       "movement": { "mobile": false, "rangeMin": 0, "rangeMax": 0, "bandSlack": 1.5, "approachSpeed": 0, "strafeSpeed": 0, "retreatSpeed": 0, "circleTendency": 0, "circleHoldTicks": 24, "repathTicks": 30, "navRadius": 8, "maxStepUp": 2, "maxStepDown": 5 },
-      "attack": { "style": "none", "reach": 0, "aimTolerance": 0.45, "cadenceTicks": 0, "jitterTicks": 0, "commitTicks": 0, "disengageTicks": 0 },
+      "attack": { "styles": [], "reach": 0, "aimTolerance": 0.45, "cadenceTicks": 0, "jitterTicks": 0, "commitTicks": 0, "disengageTicks": 0 },
       "intents": {
         "idle": { "weight": 1.0, "cooldownTicks": 0, "minDwellTicks": 0 }
+      }
+    },
+    {
+      "comment": "A dummy of a DIFFERENT FACTION, so a hostile creature will actually pick it as a target. `dummy` is faction \"monster\" and so is everything that would swing at it, which makes it a training partner nobody attacks. Otherwise identical: blind, passive, immobile.",
+      "name": "training_dummy",
+      "label": "Training dummy (quarry)",
+      "color": 3238002687,
+      "faction": "quarry",
+      "hysteresis": 0.22,
+      "perception": { "sightRange": 0, "fovDegrees": 360, "requireLos": true, "aggro": "passive", "alertDecayTicks": 0, "keepRangeScale": 1.0 },
+      "movement": { "mobile": false, "rangeMin": 0, "rangeMax": 0, "bandSlack": 1.5, "approachSpeed": 0, "strafeSpeed": 0, "retreatSpeed": 0, "circleTendency": 0, "circleHoldTicks": 24, "repathTicks": 30, "navRadius": 8, "maxStepUp": 2, "maxStepDown": 5 },
+      "attack": { "styles": [], "reach": 0, "aimTolerance": 0.45, "cadenceTicks": 0, "jitterTicks": 0, "commitTicks": 0, "disengageTicks": 0 },
+      "intents": {
+        "idle": { "weight": 1.0, "cooldownTicks": 0, "minDwellTicks": 0 }
+      }
+    },
+    {
+      "comment": "A duelist of the OPPOSING faction, so two of them fight. Identical to `duelist` apart from the faction name.",
+      "name": "duelist_blue",
+      "label": "Duelist (blue)",
+      "color": 3225419775,
+      "faction": "quarry",
+      "hysteresis": 0.28,
+      "perception": { "sightRange": 46, "fovDegrees": 300, "requireLos": true, "aggro": "hostile", "alertDecayTicks": 180, "keepRangeScale": 1.45 },
+      "movement": { "mobile": true, "rangeMin": 7, "rangeMax": 11, "bandSlack": 1.4, "approachSpeed": 1.0, "strafeSpeed": 0.5, "retreatSpeed": 0.75, "circleTendency": 0.75, "circleHoldTicks": 34, "repathTicks": 10, "navRadius": 30, "maxStepUp": 2, "maxStepDown": 5 },
+      "attack": { "styles": ["horizontal_r", "horizontal_l", "overhead", "diagonal", "thrust"], "reach": 10, "aimTolerance": 0.4, "cadenceTicks": 34, "jitterTicks": 22, "commitTicks": 10, "disengageTicks": 26 },
+      "intents": {
+        "idle": { "weight": 0.05, "cooldownTicks": 0, "minDwellTicks": 0 },
+        "face": { "weight": 0.45, "cooldownTicks": 0, "minDwellTicks": 4 },
+        "approach": { "weight": 1.15, "cooldownTicks": 0, "minDwellTicks": 8 },
+        "holdRange": { "weight": 1.05, "cooldownTicks": 0, "minDwellTicks": 8 },
+        "circle": { "weight": 0.9, "cooldownTicks": 18, "minDwellTicks": 26 },
+        "attack": { "weight": 3.0, "cooldownTicks": 0, "minDwellTicks": 0 }
       }
     },
     {
@@ -25,7 +58,7 @@
       "hysteresis": 0.25,
       "perception": { "sightRange": 34, "fovDegrees": 360, "requireLos": true, "aggro": "hostile", "alertDecayTicks": 150, "keepRangeScale": 1.4 },
       "movement": { "mobile": false, "rangeMin": 0, "rangeMax": 0, "bandSlack": 1.5, "approachSpeed": 0, "strafeSpeed": 0, "retreatSpeed": 0, "circleTendency": 0, "circleHoldTicks": 24, "repathTicks": 30, "navRadius": 8, "maxStepUp": 2, "maxStepDown": 5 },
-      "attack": { "style": "slash", "reach": 11, "aimTolerance": 0.5, "cadenceTicks": 36, "jitterTicks": 14, "commitTicks": 10, "disengageTicks": 0 },
+      "attack": { "styles": ["horizontal_r", "overhead", "thrust"], "reach": 11, "aimTolerance": 0.5, "cadenceTicks": 36, "jitterTicks": 14, "commitTicks": 10, "disengageTicks": 0 },
       "intents": {
         "idle": { "weight": 0.05, "cooldownTicks": 0, "minDwellTicks": 0 },
         "face": { "weight": 1.0, "cooldownTicks": 0, "minDwellTicks": 0 },
@@ -40,7 +73,7 @@
       "hysteresis": 0.28,
       "perception": { "sightRange": 46, "fovDegrees": 300, "requireLos": true, "aggro": "hostile", "alertDecayTicks": 180, "keepRangeScale": 1.45 },
       "movement": { "mobile": true, "rangeMin": 7, "rangeMax": 11, "bandSlack": 1.4, "approachSpeed": 1.0, "strafeSpeed": 0.5, "retreatSpeed": 0.75, "circleTendency": 0.75, "circleHoldTicks": 34, "repathTicks": 10, "navRadius": 30, "maxStepUp": 2, "maxStepDown": 5 },
-      "attack": { "style": "slash", "reach": 10, "aimTolerance": 0.4, "cadenceTicks": 34, "jitterTicks": 22, "commitTicks": 10, "disengageTicks": 26 },
+      "attack": { "styles": ["horizontal_r", "horizontal_l", "overhead", "diagonal", "thrust"], "reach": 10, "aimTolerance": 0.4, "cadenceTicks": 34, "jitterTicks": 22, "commitTicks": 10, "disengageTicks": 26 },
       "intents": {
         "idle": { "weight": 0.05, "cooldownTicks": 0, "minDwellTicks": 0 },
         "face": { "weight": 0.45, "cooldownTicks": 0, "minDwellTicks": 4 },

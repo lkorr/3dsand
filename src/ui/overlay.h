@@ -299,11 +299,16 @@ struct UIState {
   float aiIntentWeight[6] = {};        // one per ai::Intent, in enum order
   int aiIntentCooldown[6] = {};
   int aiIntentDwell[6] = {};
-  // Last attack request drained from the seam, for the readout. Phase C
-  // replaces this consumer with a real stroke; until then, SEEING the requests
-  // is what proves the seam fires at the right moments.
+  // Last attack request drained from the seam, and the last PARRY. Both are
+  // readouts rather than mechanisms: seeing the requests is what proves the AI
+  // seam still fires at the right moments, and seeing the blocks is what
+  // proves emergent blocking is happening at all — a defender's blade in the
+  // way makes no sound yet (phase D), so without this line a parry and a miss
+  // look identical.
   std::string aiLastAttack;
   int aiAttackCount = 0;
+  std::string aiLastBlock;
+  int aiBlockCount = 0;
 
   std::vector<std::string> materialNames;  // index == material id
   std::vector<uint32_t> materialColors;    // 0xAABBGGRR swatch (gpu color0)

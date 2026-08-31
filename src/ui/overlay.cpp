@@ -1026,7 +1026,14 @@ void Overlay::Draw(UIState& s) {
                                              ? "(none yet)"
                                              : s.aiLastAttack.c_str());
           ImGui::TextDisabled("the AI decides WHEN and WHERE; the stroke");
-          ImGui::TextDisabled("system (phase C) consumes these requests");
+          ImGui::TextDisabled("program (game/strokes.h) swings them");
+          ImGui::Separator();
+          ImGui::Text("parries: %d", s.aiBlockCount);
+          ImGui::TextWrapped("last: %s", s.aiLastBlock.empty()
+                                             ? "(none yet)"
+                                             : s.aiLastBlock.c_str());
+          ImGui::TextDisabled("blocking is EMERGENT: a blade in the path");
+          ImGui::TextDisabled("stops the blow. There is no block button.");
           ImGui::EndTabItem();
         }
 

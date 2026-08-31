@@ -238,7 +238,16 @@ bool LoadBehaviors(const std::string& path, Library& out, std::string& log) {
     }
     if (p.contains("attack")) {
       const auto& q = p["attack"];
-      pr.attack.style = q.value("style", std::string("slash"));
+      // BOTH SPELLINGS, one meaning. `styles` wins when present; a lone
+      // `style` is read as a one-entry list so older authored files load
+      // unchanged (the same "a newer file still loads on an older binary"
+      // contract this loader keeps in the other direction).
+      if (q.contains("styles") && q["styles"].is_array()) {
+        for (const auto& v : q["styles"])
+          if (v.is_string()) pr.attack.styles.push_back(v.get<std::string>());
+      }
+      if (pr.attack.styles.empty())
+        pr.attack.styles.push_back(q.value("style", std::string("slash")));
       pr.attack.reach = q.value("reach", 8.0f);
       pr.attack.aimTolerance = q.value("aimTolerance", 0.45f);
       pr.attack.cadenceTicks = q.value("cadenceTicks", 40u);
@@ -317,8 +326,11 @@ bool SaveBehaviors(const std::string& path, const Library& lib,
       << ", \"navRadius\": " << num(p.movement.navRadius)
       << ", \"maxStepUp\": " << p.movement.maxStepUp
       << ", \"maxStepDown\": " << p.movement.maxStepDown << " },\n";
-    o << "      \"attack\": { \"style\": \"" << p.attack.style
-      << "\", \"reach\": " << num(p.attack.reach)
+    o << "      \"attack\": { \"styles\": [";
+  for (size_t i = 0; i < p.attack.styles.size(); i++)
+    o << (i ? ", " : "") << "\"" << p.attack.styles[i] << "\"";
+  o << "]"
+      << ", \"reach\": " << num(p.attack.reach)
       << ", \"aimTolerance\": " << num(p.attack.aimTolerance)
       << ", \"cadenceTicks\": " << p.attack.cadenceTicks
       << ", \"jitterTicks\": " << p.attack.jitterTicks
@@ -837,7 +849,12 @@ bool Think(Brain& brain, const Library& lib, const SelfView& self,
       out.attack = true;
       out.request.mobId = self.id;
       out.request.targetId = brain.targetId;
-      out.request.style = pr.attack.style;
+      // The chosen style is resolved by the stroke system, not here: this
+      // layer hands over the whole authored LIST's first entry as a label and
+      // lets PickAttackStyle draw. Carrying a name at all is for the debug
+      // readout and for a future scripted attack that wants to name one.
+      out.request.style =
+          pr.attack.styles.empty() ? std::string() : pr.attack.styles[0];
       out.request.targetPoint = brain.targetPos;
       out.request.tick = tick;
       out.request.commitTicks = pr.attack.commitTicks;

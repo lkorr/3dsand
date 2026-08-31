@@ -2516,6 +2516,10 @@ int main(int argc, char** argv) {
           std::string blog;
           ai::LoadBehaviors(ad + "/mobs/behaviors.json", beh, blog);
           stMobs.SetBehaviors(std::move(beh));
+          StyleLibrary sty;
+          LoadAttackStyles(ad + "/mobs/attack_styles.json", sty, blog);
+          stMobs.SetAttackStyles(std::move(sty));
+          stMobs.SetItems(&stItems);
         }
         Stream stStream;
         stStream.Init(&stCtx, &stWorld, &stSim, kDefaultSeed);
@@ -2766,8 +2770,18 @@ int main(int argc, char** argv) {
     std::string blog;
     if (ai::LoadBehaviors(assetDir + "/mobs/behaviors.json", beh, blog))
       std::printf("loaded %zu behaviour profiles\n", beh.profiles.size());
+    // ...and the authored ATTACK STYLES they swing with (game/strokes.h). Same
+    // contract: a missing file is content, not an error — the AI still issues
+    // attack requests and the log says why nothing swings.
+    StyleLibrary sty;
+    if (LoadAttackStyles(assetDir + "/mobs/attack_styles.json", sty, blog))
+      std::printf("loaded %zu attack styles\n", sty.styles.size());
     if (!blog.empty()) std::fprintf(stderr, "%s", blog.c_str());
     mobs.SetBehaviors(std::move(beh));
+    mobs.SetAttackStyles(std::move(sty));
+    // The item library, so an NPC's sweep can read the damage and HEFT of
+    // whatever is in its fist. By pointer, because items reload on R.
+    mobs.SetItems(&items);
   }
   Stream stream;
   stream.Init(&ctx, &world, &sim, kDefaultSeed);
@@ -3018,6 +3032,13 @@ int main(int argc, char** argv) {
   PlayerAvatar avatar;
   avatar.Init(&phys, &world, &debris, mats, &mobs);
   avatar.SetDefs(&mobs.Defs(), avatarDefName);
+  // THE PLAYER IS A TARGET. The avatar is a Mob but it is not in MobSystem's
+  // list, so the handle-keyed lookups could not find it and an NPC's sweep
+  // melted the player's limbs as debris instead of wounding them
+  // (MobSystem::SetAvatar has the whole argument). Registered ONCE here, for
+  // the whole session: it is a pointer to a member of this frame, and
+  // Despawn/Revive rebuild the rig behind it without moving the object.
+  mobs.SetAvatar(&avatar);
   ThirdPersonRig tpRig;
   CameraMode camMode = CameraMode::First;
   float avatarHeading = 0.0f;   // body facing, radians about +Y
@@ -4038,6 +4059,13 @@ int main(int argc, char** argv) {
           ai::LoadBehaviors(assetDir + "/mobs/behaviors.json", beh, blog);
           if (!blog.empty()) std::fprintf(stderr, "%s", blog.c_str());
           mobs.SetBehaviors(std::move(beh));
+          // Attack styles reload with them, for the same reason: retuning a
+          // windup and hitting R must be visible on the duelists already
+          // fighting you.
+          StyleLibrary sty;
+          LoadAttackStyles(assetDir + "/mobs/attack_styles.json", sty, blog);
+          if (!blog.empty()) std::fprintf(stderr, "%s", blog.c_str());
+          mobs.SetAttackStyles(std::move(sty));
           ui.aiProfileNames.clear();
           for (const ai::Profile& p : mobs.Behaviors().profiles)
             ui.aiProfileNames.push_back(p.name);
@@ -5173,8 +5201,14 @@ int main(int argc, char** argv) {
             }
             sw.tick = tick;
             sw.valid = true;
-            MeleeSweepDamage(sw, melee.tuning, avatar, phys, mobs, debris,
-                             world, spawns);
+            const EdgeSweepResult mres = MeleeSweepDamage(
+                sw, melee.tuning, avatar, phys, mobs, debris, world, spawns);
+            // PARRIED BY AN NPC'S BLADE. The sweep reports; ending the stroke
+            // is the caller's job, because MeleeSweepDamage has no business
+            // reaching into whichever driver happens to own this swing
+            // (melee.h EdgeSweepResult). The player's cut stops here: no
+            // follow-through, no second bite past the blade that stopped it.
+            if (mres.arrested) melee.Arrest();
           }
           lastEdgeBase = eb;
           lastEdgeTip = et;
@@ -5719,6 +5753,41 @@ int main(int argc, char** argv) {
         ui.aiAttackCount++;
       }
       mobs.ClearAttackRequests();
+      // ---- BLADE ON BLADE (game/melee.h BlockEvent) -----------------------
+      //
+      // Drained here for the same reason the attack requests above are: they
+      // accumulate across the frame's 0..4 sub-ticks, and a per-frame read of a
+      // per-tick event otherwise drops three of every four.
+      //
+      // TODO(phase D): the CUE. There is no `melee_block` sound slot yet
+      // (assets/sound_schema.js + Cues::kSlotPrefix must agree, CLAUDE.md), and
+      // no spark burst. Both want `ev.at` and `ev.power`, which is why the
+      // event carries them; until then the readout is the only consumer and
+      // this is the one place to hook them in.
+      for (const BlockEvent& ev : mobs.BlockEvents()) {
+        char line[160];
+        std::snprintf(line, sizeof line,
+                      "#%llu blocked by #%llu at (%.0f,%.0f,%.0f) power %.2f",
+                      (unsigned long long)ev.attackerId,
+                      (unsigned long long)ev.blockerId, ev.at.x, ev.at.y,
+                      ev.at.z, ev.power);
+        ui.aiLastBlock = line;
+        ui.aiBlockCount++;
+        // THE PLAYER'S OWN GUARD IS BEATEN OPEN HERE and not in MobSystem,
+        // because this MeleeState is main.cpp's: MobSystem::PushBlockEvent
+        // nudges its own mobs and deliberately leaves the avatar to its owner.
+        // Same counter-based draw, so both sides of an exchange shove the same
+        // way (CLAUDE.md rule 1).
+        if (avatar.Spawned() && ev.blockerId == avatar.Id()) {
+          const uint32_t h = rng::Hash3((uint32_t)ev.blockerId ^ 0xB10Cu,
+                                        (uint32_t)ev.attackerId, 0);
+          melee.Nudge((h & 1u ? 1.0f : -1.0f) * melee.tuning.blockNudgeAz *
+                          ev.power,
+                      (h & 2u ? 1.0f : -1.0f) * melee.tuning.blockNudgeEl *
+                          ev.power);
+        }
+      }
+      mobs.ClearBlockEvents();
       // Ledge-grab readout: the probe result plus every latch gate, so "why
       // didn't it grab" is readable in the panel rather than inferred. The
       // gates mirror the latch condition in Player::Update exactly.

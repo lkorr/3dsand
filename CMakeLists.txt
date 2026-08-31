@@ -348,6 +348,7 @@ add_executable(sandvox
   src/game/thirdperson.cpp
   src/game/spell.cpp
   src/game/melee.cpp
+  src/game/strokes.cpp
   # The acceptance gate. support.cpp holds the sim/render plumbing that main.cpp
   # and the gates share; each selftest_*.cpp is one domain's gates. Split out of
   # main.cpp so `--gate <name>` can run one in seconds and so two agents editing
@@ -374,6 +375,7 @@ add_executable(sandvox
   src/test/selftest_spell.cpp
   src/test/selftest_playerkit.cpp
   src/test/selftest_swing.cpp
+  src/test/selftest_combat.cpp
   src/test/selftest_equipment.cpp
   src/test/selftest_wound.cpp
   src/test/selftest_audio.cpp

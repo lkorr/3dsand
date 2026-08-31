@@ -580,6 +580,42 @@ EdgeSweepResult MeleeSweepDamage(const EdgeSweep& s, const MeleeTuning& t,
   const Vec3 sweepDir =
       ((s.aNow + s.bNow) - (s.aPrev + s.bPrev)).normalized();
 
+  // ---- BLADE ON BLADE, ASKED FIRST AND ASKED GEOMETRICALLY ----------------
+  //
+  // Before any probe, because a parry ENDS the sweep: letting the ray probes
+  // run first would let a blow that was stopped by a sword still open the arm
+  // behind it on the same tick.
+  //
+  // And geometrically, because the probes cannot answer it. They are rays down
+  // the swinging blade's axis — right for a body, useless against a weapon,
+  // whose collider is the item's own art at the item's own scale and about a
+  // quarter of a voxel thick. See MobSystem::FindParry for the measurement.
+  {
+    Mob* blocker = nullptr;
+    uint64_t blockBody = 0;
+    Vec3 blockAt{};
+    if (mobs.FindParry(wielder, s.aPrev, s.bPrev, s.aNow, s.bNow,
+                       t.blockGap + s.halfWidth, blocker, blockBody, blockAt)) {
+      out.arrested = true;
+      out.block.attackerId = wielder.Id();
+      out.block.blockerId = blocker->Id();
+      out.block.blockerBody = blockBody;
+      out.block.at = blockAt;
+      out.block.power = power;
+      // THE BLOCKING BLADE PAYS. Ordinary limb damage on the item's own slot:
+      // items carry hp and severImpactSpeed (item.h), so a weapon wears down
+      // under repeated parries and one that catches something far too fast is
+      // knocked out of the hand — both by mechanisms that were already there.
+      // Deliberately NOT inside a BladeCutScope: a clang is not a
+      // dismemberment and must not arm the wet cue.
+      mobs.Damage(blockBody, s.damage * power * t.blockItemDamage, blockAt,
+                  out.tipSpeed);
+      // ...and the defender's guard is beaten open a little, deterministically.
+      mobs.PushBlockEvent(out.block, t);
+      return out;
+    }
+  }
+
   // Sample along the blade AND across the sweep, so a fast cut does not tunnel
   // between ticks. Both counts are bounded and scale with how far the blade
   // actually moved (CLAUDE.md rule 2): a stationary blade costs one probe, and
@@ -599,17 +635,33 @@ EdgeSweepResult MeleeSweepDamage(const EdgeSweep& s, const MeleeTuning& t,
     const float u = (float)step / (float)steps;
     const Vec3 a = s.aPrev + (s.aNow - s.aPrev) * u;
     const Vec3 b = s.bPrev + (s.bNow - s.bPrev) * u;
-    for (int k = 0; k <= along; k++) {
+    const Vec3 seg = b - a;
+    const float segLen = seg.len();
+    if (segLen < 1e-4f) continue;
+    // ---- THE PROBES TILE THE BLADE; THEY DO NOT SAMPLE IT -------------------
+    //
+    // Each ray runs along the blade's own axis for exactly the distance to the
+    // NEXT sample point, plus the blade's own half-thickness. That covers the
+    // whole edge with no gaps, which is what "the pose is the hitbox" (melee.h
+    // note 1) actually requires and what the first version did not do: it cast
+    // `along + 1` rays of a FIXED ~1 voxel from points spaced 1.6 voxels apart,
+    // so 40% of the blade probed nothing at all.
+    //
+    // On a human-sized target that is invisible — a torso is wide enough that
+    // some ray finds it — and on a SWORD it is fatal. Measured in `npc-block`:
+    // two blades whose edges passed within 0.28 voxels of each other, five
+    // sweeps run, ZERO bodies hit. Emergent blocking cannot work through a
+    // hitbox with holes in it, and neither can a thrust at a limb.
+    //
+    // The loop bound moves with it: `k < along` rather than `k <= along`,
+    // because the last START point plus its own tile is what reaches the tip.
+    // Casting from the tip as well would put a whole extra tile PAST the point,
+    // which is a hitbox longer than the weapon.
+    const float probe = std::max(segLen / (float)along + radius, 0.6f);
+    for (int k = 0; k < along; k++) {
       const float v = (float)k / (float)along;
       const Vec3 p = a + (b - a) * v;
-      // A short ray along the blade's own length is what finds what the edge is
-      // passing through. Using the segment the blade occupies (rather than a
-      // point test) is what lets a thin fast blade hit at all.
-      const Vec3 seg = b - a;
-      const float segLen = seg.len();
-      if (segLen < 1e-4f) continue;
       float frac = 1.0f;
-      const float probe = std::max(radius * 2.0f, 0.6f);
       const uint64_t hb = phys.CastRayBody(p, seg.normalized(), probe, frac);
       if (!hb) continue;
       bool seen = false;
@@ -619,8 +671,21 @@ EdgeSweepResult MeleeSweepDamage(const EdgeSweep& s, const MeleeTuning& t,
       // permanently inside the swing arc — the blade starts in its own hand —
       // so without this every guard would saw through the arm holding it.
       if (wielder.OwnsBody(hb)) continue;
-      hitBodies.push_back(hb);
       const Vec3 at = p + seg.normalized() * (frac * probe);
+
+      // A PROBE THAT DID FIND A WEAPON. The geometric test above is what
+      // actually detects parries; this is the safety net for the rare ray that
+      // happens to catch a blade edge-on, and its only job is to make sure a
+      // weapon is never CARVED as if it were flesh. `HeldSlot()` IS the
+      // borrowed slot the item filled (Mob::EquipItem), so this cannot drift
+      // from what is really in the fist, and it is the same distinction
+      // Mob::StainWound draws when it refuses to bleed a sword.
+      {
+        int li = -1;
+        Mob* owner = mobs.FindOwner(hb, &li);
+        if (owner != nullptr && li >= 0 && li == owner->HeldSlot()) continue;
+      }
+      hitBodies.push_back(hb);
       // LIVE FLESH CARVES; DEBRIS MELTS. The same two populations the laser
       // splits on, through the same two calls — a mob limb loses voxels exactly
       // where the edge crossed it, which is what makes dismemberment geometric
@@ -762,6 +827,34 @@ WeaponPose MeleeState::Pose() const {
   // use to drive the arm at a bare point with no opinion about the weapon.
   p.steerBlade = true;
   return p;
+}
+
+void MeleeState::Arrest() {
+  // Only a LIVE cut can be arrested. Guard and Idle have nothing to stop, and
+  // a stroke already recovering must not have its recover restarted — a caller
+  // that sees a parry on three consecutive ticks would otherwise hold the arm
+  // in Recover forever.
+  if (phase_ != SwingPhase::Wind && phase_ != SwingPhase::Slash) return;
+  phase_ = SwingPhase::Recover;
+  phaseTime_ = 0;
+  // The follow-through the cut had left does NOT happen: the arc decays from
+  // wherever the blade was stopped, which is what makes a parry read as the
+  // blow being checked rather than as the animation finishing anyway.
+  swingAz_ = 0;
+  swingEl_ = 0;
+  swingOut_ = 0;
+  // The button is still down (that is what a parry mid-swing means), so the
+  // arm is kept rather than handed back — see PoseWeight.
+  recoverHold_ = true;
+}
+
+void MeleeState::Nudge(float dAz, float dEl) {
+  // The STORED stroke, so the shove is subject to the same stops as any other
+  // input and banks nothing past them (melee.h, "the clamp banks nothing").
+  const float azLo = handSign_ >= 0 ? -tuning.azAcross : -tuning.azOut;
+  const float azHi = handSign_ >= 0 ? tuning.azOut : tuning.azAcross;
+  az_ = std::clamp(az_ + dAz, azLo, azHi);
+  el_ = std::clamp(el_ + dEl, tuning.elMin, tuning.elMax);
 }
 
 void MeleeState::Reset() {

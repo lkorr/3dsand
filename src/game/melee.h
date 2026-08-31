@@ -276,6 +276,40 @@ struct MeleeTuning {
   // rather than here. Until then this bounds the STEERING and not the grip.
   float wristMaxAngle = 2.80f;
   // ---- the edge leads the cut ---------------------------------------------
+  // ---- BLOCKING IS EMERGENT (Phase C) --------------------------------------
+  //
+  // There is NO block button and no block state. A blade physically in the path
+  // of a stroke stops it, because MeleeSweepDamage's probes hit the defender's
+  // WEAPON before they hit the defender — the held item is a real rig slot with
+  // a real collider (DESIGN.md 8c), so it was always in the way and the sweep
+  // was simply carving straight through it. A parry is that hit, classified.
+  //
+  // The three numbers below are what a parry costs, and they are here rather
+  // than in tuning.json for the same reason the rest of this struct is: they
+  // are the knobs being DESIGNED. They move to tuning.json with the others once
+  // the feel settles.
+
+  // HOW CLOSE TWO EDGES HAVE TO PASS TO COUNT AS A PARRY, world voxels. Not a
+  // fudge factor: it is the two blades' own thickness plus the width of the
+  // guard and the fist behind them, none of which the authored `edge` segment
+  // (a LINE down the cutting edge) represents. A blow that passes within a
+  // couple of centimetres of a raised sword has been stopped by it, and a
+  // player who watched that go through would be right to call it a bug.
+  float blockGap = MetresToCells(0.14f);
+  // Fraction of the blow's own damage the BLOCKING WEAPON takes as item hp.
+  // Items have hp and are severable (item.h ItemDef::hp/severable), so this
+  // needs no new mechanism — a sword that blocks all day eventually breaks, and
+  // one that blocks something far too heavy is knocked out of the hand by the
+  // existing severImpactSpeed rule. 1.0 would make a parry cost the defender's
+  // weapon exactly what it would have cost their arm, which is too much: an arm
+  // absorbs a cut by being cut, a blade absorbs it by being a blade.
+  float blockItemDamage = 0.35f;
+  // How far a blocked blow beats the DEFENDER'S guard open, radians of stroke
+  // azimuth/elevation at full power. Blocking must not be free: a heavy blow
+  // that lands on your blade should still move it. Hash-seeded and bounded, so
+  // it is a deterministic shove rather than a random one (CLAUDE.md rule 1).
+  float blockNudgeAz = 0.30f;
+  float blockNudgeEl = 0.18f;
   // Damage multiplier for a cut whose travel lies exactly in the FLAT of the
   // blade — a slap with the side. 1.0 disables edge alignment entirely; 0 makes
   // a flat hit free. Real flats still bruise and still break bones, so this is
@@ -294,6 +328,20 @@ struct MeleeTuning {
 // copy of this formula would be a second source of truth that passes while
 // measuring nothing.
 float MeleeEdgeAlign(const Vec3& flat, const Vec3& travel, float floorFrac);
+
+// A BLADE MET A BLADE. Reported out of the sweep rather than acted on inside
+// it, for the same reason MobSystem reports sever and voice events instead of
+// playing sounds: this layer knows nothing about audio, and both ends of a
+// parry are owned by callers it cannot reach (the player's MeleeState lives in
+// main.cpp, an NPC's in its Mob). Phase D turns this into the clang and the
+// spark; MobSystem accumulates them so one drain serves both directions.
+struct BlockEvent {
+  uint64_t attackerId = 0;   // whose stroke was stopped
+  uint64_t blockerId = 0;    // whose weapon stopped it
+  uint64_t blockerBody = 0;  // the item's Jolt body, so a caller can charge it
+  Vec3 at{};                 // world voxels, where the blades met
+  float power = 0;           // 0..1, speed x edge alignment of the blow
+};
 
 // One resolved cut of the blade this tick: the quad the edge swept, how fast it
 // was going, and which way its flat was facing while it did. MeleeSweepDamage
@@ -332,6 +380,14 @@ struct EdgeSweepResult {
   float tipSpeed = 0;      // world voxels/sec
   float power = 0;         // 0..1 speed ramp, before edge alignment
   float edgeAlign = 1;     // MeleeEdgeAlign's answer, 0..1
+  // THE STROKE WAS STOPPED. One flag rather than a list, because a sweep can
+  // only be arrested once: the first blade in the path kills the remainder of
+  // this tick's probes, so a stroke cannot parry off one weapon and carry on
+  // through a second. The CALLER is what ends the stroke early
+  // (MeleeState::Arrest for the player, NpcStroke's cut phase for an NPC) —
+  // this function has no business reaching into either.
+  bool arrested = false;
+  BlockEvent block{};
 };
 
 // Forward declarations only: this header is included BY mob.h, so it may not
@@ -355,6 +411,17 @@ struct ParticleSpawn;
 //
 // `wielder` is excluded from its own sweep — a blade starts inside its owner's
 // fist and would otherwise saw through the arm holding it.
+//
+// AND SOMEBODY ELSE'S FIST IS NOT. A probe that meets another creature's HELD
+// ITEM is a PARRY, not a cut: the stroke is arrested, the remainder of this
+// tick's probes are abandoned, the blocking weapon takes item hp, and a
+// BlockEvent comes back on the result. Worn armour is deliberately NOT a parry
+// — a shell is strapped to the limb it covers and stopping a blow with it is
+// what armour is for, so it keeps taking the cut it always did (the wound model
+// already carves shells and the occlusion probe already accounts for them).
+// The three-way classification is the rig's own: a slot below `AppendedBase()`
+// is FLESH, one at or above it tagged `worn` is a GARMENT, and the one at
+// `HeldSlot()` is a WEAPON.
 EdgeSweepResult MeleeSweepDamage(const EdgeSweep& sweep, const MeleeTuning& t,
                                  const Mob& wielder, Physics& phys,
                                  MobSystem& mobs, DebrisSystem& debris,
@@ -474,6 +541,24 @@ class MeleeState {
   float StrokeAz() const { return az_; }
   float StrokeEl() const { return el_; }
   float StrokeRadius() const { return radius_; }
+  // THE ANNULUS OF TIP RADII THIS ARM CAN ACTUALLY SERVE, world voxels, given
+  // the blade it is holding and how extended it is being held.
+  //
+  // PUBLIC because a scripted stroke has to author its reach IN it. An NPC
+  // thrust authored as a fraction of the ARM's length looked correct and did
+  // nothing: measured on the human rig the band is only [3.8, 6.5] voxels wide
+  // (the point is a blade's length off a hand that is itself most of an arm
+  // out, so the two lengths nearly cancel), and every style's chamber and lunge
+  // landed outside it and was clamped. The commanded radius then moved 0.15
+  // voxels on a stroke asking for four, and the only symptom was a thrust that
+  // read as a twitch.
+  //
+  // Zero-width or degenerate bands are already handled inside; the caller only
+  // has to clamp into what it gets back.
+  void ReachBand(float& lo, float& hi) const {
+    float hand = 0;
+    RadiusBand(lo, hi, hand);
+  }
 
   // How much of the arm this claims, 0..1. Not a bool, because the tick the
   // claim ENDS is a pop otherwise: the hand is wherever the player left it and
@@ -496,6 +581,21 @@ class MeleeState {
   float MouseSpeed() const { return mouseSpeed_; }
 
   void Reset();
+
+  // ---- what a parry does to the two strokes involved ------------------------
+  // END THIS STROKE NOW. The cut met something solid, so the follow-through it
+  // had left does not happen: the driver drops into Recover with whatever arc
+  // it had already spent, and the arm is handed back over the usual ramp rather
+  // than being snapped anywhere. Idempotent — a stroke already recovering or
+  // idle is left alone, so a caller may call it on every blocked tick.
+  void Arrest();
+  // ...AND SHOVE THE OTHER ONE. A bounded nudge to the stored stroke state, so
+  // a guard that stops a heavy blow is beaten open a little. It moves az_/el_
+  // and NOT a pose, which is what keeps it continuous: the point is displaced
+  // on its own reach sphere and the arm follows it there like any other input.
+  // The caller supplies the magnitudes AND the sign (hash-seeded); this only
+  // applies and re-clamps them.
+  void Nudge(float dAz, float dEl);
 
   MeleeTuning tuning;
 

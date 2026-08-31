@@ -1,0 +1,48 @@
+{
+  "comment": "NPC ATTACK STYLES. A style is a named STROKE PROGRAM: a windup that raises the blade into a stance, then a cut that drives it through the target line. It is fed to the SAME driver the player's mouse feeds (game/melee.h MeleeState, via StrokeSample), so an NPC swing is a motion a person could make and a fix to the feel is a fix to both. Hot-reloads on R alongside materials, behaviours, glyphs and items. The full schema, and the reasoning behind every field, is at the top of src/game/strokes.h.",
+
+  "notes": "ANGLES ARE RADIANS in the mob's own facing basis: azimuth 0 is straight ahead and positive is the mob's right; elevation 0 is level. REACH is a fraction of the arm's own reach band, so a thrust is the same lunge on a long arm and a short one. TICKS are 30 Hz sim ticks -- a windup of 12 is 0.40 s of visible blade raise, which IS the telegraph (there is no UI indicator). The cut is CENTRED on the aim point: the windup lands at aim minus half the cut's own travel, so the blade passes through where it was aimed rather than starting there.",
+
+  "styles": [
+    {
+      "name": "horizontal_r",
+      "label": "Horizontal cut, weapon side across",
+      "windup": { "ticks": 12, "az": 0.30, "el": 0.10, "reach": -0.05 },
+      "cut": { "ticks": 7, "az": -2.30, "el": 0.00, "reach": 0.10 },
+      "recover": { "ticks": 10 },
+      "jitter": { "az": 0.20, "el": 0.08, "tempo": 0.25 }
+    },
+    {
+      "name": "horizontal_l",
+      "label": "Backhand cut, across to weapon side",
+      "windup": { "ticks": 13, "az": -0.25, "el": 0.08, "reach": -0.05 },
+      "cut": { "ticks": 7, "az": 2.10, "el": 0.00, "reach": 0.10 },
+      "recover": { "ticks": 11 },
+      "jitter": { "az": 0.18, "el": 0.08, "tempo": 0.25 }
+    },
+    {
+      "name": "overhead",
+      "label": "Overhead chop from a high guard",
+      "windup": { "ticks": 14, "az": 0.20, "el": 0.55, "reach": -0.10 },
+      "cut": { "ticks": 6, "az": -0.15, "el": -1.90, "reach": 0.14 },
+      "recover": { "ticks": 12 },
+      "jitter": { "az": 0.22, "el": 0.10, "tempo": 0.22 }
+    },
+    {
+      "name": "diagonal",
+      "label": "Descending diagonal, shoulder to hip",
+      "windup": { "ticks": 12, "az": 0.35, "el": 0.45, "reach": -0.08 },
+      "cut": { "ticks": 7, "az": -1.60, "el": -1.40, "reach": 0.12 },
+      "recover": { "ticks": 10 },
+      "jitter": { "az": 0.20, "el": 0.10, "tempo": 0.25 }
+    },
+    {
+      "name": "thrust",
+      "label": "Rear chamber, then a straight thrust",
+      "windup": { "ticks": 11, "az": 0.28, "el": 0.05, "reach": -0.45 },
+      "cut": { "ticks": 5, "az": -0.20, "el": 0.00, "reach": 0.85 },
+      "recover": { "ticks": 12 },
+      "jitter": { "az": 0.14, "el": 0.06, "tempo": 0.28 }
+    }
+  ]
+}

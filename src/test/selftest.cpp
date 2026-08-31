@@ -43,6 +43,7 @@ const std::vector<Gate>& VoxRegionGates();
 const std::vector<Gate>& SpellGates();
 const std::vector<Gate>& PlayerKitGates();
 const std::vector<Gate>& SwingGates();
+const std::vector<Gate>& CombatGates();
 const std::vector<Gate>& EquipmentGates();
 const std::vector<Gate>& WoundGates();
 
@@ -188,6 +189,15 @@ const char* const kOrder[] = {
     // disturbs the fewest gates that were there first, and that is the END of
     // its group — not the middle of it, however well it reads there.
     "wound-chip", "wound-accumulate", "wound-heft", "wound-bleed",
+    // ---- NPCs SWINGING, AND BLADES MEETING BLADES (phase C) ---------------
+    // APPENDED at the very end of the mob group, following the rule the block
+    // above spells out: a new gate in a shared-World suite goes LAST in its
+    // group so it inherits state instead of changing what everything after it
+    // inherits. These four spawn armed creatures and let them cut each other
+    // up, which is about as large a perturbation as this suite has, so they go
+    // after even the wound gates. Each restores the id counter and regenerates
+    // worldgen on the way out.
+    "npc-strike", "npc-block", "npc-styles", "duel",
     // LAST of the world-touching gates, and it must be: BuildVoxRegion moves
     // the residency window and resets the page table, which is the state every
     // other gate's fixture placement assumes. It restores both before it
@@ -207,7 +217,7 @@ const std::vector<Gate>& Registry() {
                           &MobGates(), &BodyGates(), &WorldIoGates(), &AudioGates(),
                           &VoxRegionGates(),
                           &SpellGates(), &PlayerKitGates(), &SwingGates(),
-                          &EquipmentGates(), &WoundGates()})
+                          &EquipmentGates(), &WoundGates(), &CombatGates()})
       pool.insert(pool.end(), g->begin(), g->end());
 
     std::vector<Gate> v;
