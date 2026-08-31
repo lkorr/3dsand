@@ -152,6 +152,16 @@ const char* const kOrder[] = {
     // real bodies at absolute coordinates, and it regenerates worldgen on the
     // way out so the gates after it still find pristine terrain (rule 7).
     "swing-plane",
+    // NPC AI. After the world-restoring gates above because all of them want
+    // pristine terrain to place a fixture on and each regenerates on its way
+    // out; before voxregion because ai-approach writes a real stone wall and
+    // regenerates too, and stacking two world-restoring gates next to each
+    // other keeps the "who left the world like this" question answerable
+    // (CLAUDE.md rule 7). APPENDED at the end of this group rather than spliced
+    // into the middle of it: a new gate in a shared-World suite goes last in
+    // its group, so it inherits state instead of changing what everything
+    // after it inherits.
+    "ai-dummy", "ai-face", "ai-approach",
     // LAST of the world-touching gates, and it must be: BuildVoxRegion moves
     // the residency window and resets the page table, which is the state every
     // other gate's fixture placement assumes. It restores both before it

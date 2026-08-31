@@ -2422,9 +2422,29 @@ responsibility:
 | Stage | Function | May write | Why it is separate |
 |---|---|---|---|
 | sense | `SenseGround` | — | One terrain probe per tick, an 8-way fan in the *mob's own frame*. Intent and drive can no longer disagree about the ground (they each ran their own probe before), and a future sensor — vision cone, sound event, nav query — has one obvious place to join. |
-| intent | `DecideIntent` | `desiredHeading`, `driveScale` | **The AI seam.** The only stage allowed an opinion. Today it is wander-and-avoid; a behaviour tree or utility scorer replaces this one function and inherits working steering, drive, gait and pose. |
+| intent | `DecideIntent` | `desiredHeading`, `driveScale`, `driveStrafe` | **The AI seam.** The only stage allowed an opinion. A mob with an authored `behavior` is driven by the utility arbiter in `game/ai_behavior.cpp` (next section); one without falls through to the original wander-and-avoid, unchanged. |
 | steer | `Steer` | `heading`, `turnVel` | The only writer of body facing, and it moves it at a bounded, ramped rate. |
-| drive | `DriveLocomotion` | `origin`, `phase` | Translates along the **actual** facing, scaled by alignment with intent. |
+| drive | `DriveLocomotion` | `origin`, `phase` | Translates a **local 2D velocity** — forward along the actual facing, plus a lateral term — with the alignment scale applied to the forward component only. |
+
+The drive stage takes a signed forward term and a lateral one rather than a
+single forward scalar, and that is a *combat* requirement rather than a
+generalisation for its own sake: a duelist that has to turn its back to give
+ground reads as a rout, and circling a target while facing it is *pure* strafe.
+Both are impossible with a forward-only scalar, since a negative one used to
+mean "do not move".
+
+The alignment scale stays on the forward term alone. `align` answers "how well
+does my facing match where I want to *go*", which is exactly the wrong question
+for a sidestep or a back-pedal — a duelist circling a target it is squarely
+facing has an alignment of 1 and a step to the side to make. The per-direction
+wall check follows the same split: the fan is in the mob's own frame at 45°
+steps, so probe 0 is ahead, 2 its right, 4 behind and 6 its left, and a
+back-pedal that only consulted probe 0 would reverse straight into the rock it
+just stepped away from.
+
+**None of this weakens the invariant.** `Steer` is still the only writer of
+`heading_`; the drive vector only changes which direction the body translates
+*relative to* that heading.
 
 The load-bearing split is `heading` (where the body points) versus
 `desiredHeading` (where it wants to point). Because drive translates along
@@ -2471,6 +2491,111 @@ snap: the per-tick facing delta stays under the rate cap, the turn takes real
 time (~0.67 s, not one tick), it arrives without overshoot, and the mob is seen
 *travelling* along **21 distinct headings** in a single turn — impossible for a
 90° snap (4 in the whole plane) and for turn-in-place-then-go (1).
+
+### NPC behaviour: a utility arbiter over named intents (2026-08-31; `game/ai_behavior.*`, `game/ai_nav.*`)
+
+The seam above had one occupant — wander-and-avoid — and no notion of a target,
+an aggro state or a reason to be anywhere in particular. This is the layer that
+gives it those, and it is meant to carry the whole cast: guards, grazers,
+fleeing critters, archers, pack hunters.
+
+**The split that makes that possible is vocabulary versus character.** An
+*intent* is a verb the engine knows how to perform (Idle, FaceTarget, Approach,
+HoldRange, CircleStrafe, RequestAttack) — a scorer plus an actuator, and it has
+to be code, because "circle the target at the outer edge of my band" is
+geometry. A *profile* is a named creature character: which verbs it is allowed
+at all, how much it wants each, how far it sees, what range it likes, how often
+it swings. That is data — `assets/mobs/behaviors.json`, hot-reloaded on **R**
+with materials, glyphs and items, and a mob sidecar opts in with one key,
+`"behavior": "duelist"`.
+
+There is deliberately no `enum MobKind` and no `switch (mob.type)` (design rule
+4). An intent *absent* from a profile's `intents` map has weight 0 and is
+disabled — that is the enable flag, rather than a second boolean nobody would
+keep in sync with the weight. An empty profile is a blind, immobile statue, so a
+creature only ever does what its JSON asked for. **Adding a creature is a JSON
+edit; adding a verb is one enum entry, one scorer and one actuator, and every
+existing profile is untouched.** The three launch profiles are exactly this:
+`dummy` (no perception, no movement, no turn), `swordsman_static` (perceives,
+faces, swings in reach, feet nailed down) and `duelist` (all of it), and they
+share every line of code.
+
+**The arbiter is utility scoring with three authored dampers.** Pure argmax over
+continuous scores is a machine for producing twitching creatures — two intents
+within a hair of each other swap every tick — so an intent gets a flat
+`hysteresis` bonus while it is the incumbent, cannot be dropped before
+`minDwellTicks` unless its own score has fallen to zero, and cannot be re-picked
+for `cooldownTicks` after it ends (charged on *exit*, so a long circle is not
+punished by its own duration). Perception carries its own hysteresis for the
+same reason: a target already tracked is held to a larger radius than one being
+acquired (`keepRangeScale`), or anything standing on the boundary is acquired
+and dropped on alternate ticks and the arbiter above it oscillates for reasons
+that look like a bug in the arbiter.
+
+**Targets are actors, not "the player".** `MobSystem::PreTick` rebuilds one list
+per tick from the player capsule plus every live mob, keyed only by faction, and
+target selection scans it. Mob-vs-mob combat therefore needs no further code —
+two factions fight the moment two profiles disagree about `faction`. The player
+position is pushed in once per **tick** (`SetPlayerActor`), never per frame: the
+tick loop runs 0–4 times per frame and a target sampled on the frame clock would
+make an NPC's decisions a function of frame rate.
+
+**Navigation is local and combat-scoped** (`ai_nav.h`): A* over walkable
+*columns* inside the CPU mirror, string-pulled so the route is "walk to the
+corner, then walk to the target" rather than a grid staircase, replanned on a
+cadence and when the target walks off the end of its own path. Three things are
+load-bearing. *Unknown is walkable* — the probe reaches past the mirror long
+before it reaches anything interesting, and a planner that treats "I cannot see
+it" as "there is a wall" builds a cage out of its own ignorance (the same rule
+the steering layer already lives by); an unknown column inherits the height of
+whoever reached it. *The probe is injected, not reimplemented* — `NavProbe` is a
+pair of function pointers and the caller binds `Mob::GroundHeightAt`, so the
+planner cannot come to disagree with the locomotion it is steering; the step-up
+limit likewise has to match what `SenseGround` will climb, or the planner hands
+the drive a path it refuses to walk. *The straight line is tried first*, which
+is both the cheap case and the graceful-degradation case: with no plan and a
+clear line, "walk at them" is exactly right, and a failed search falls back to
+direct steering plus the existing fan avoidance rather than to standing still.
+
+**The attack seam is a request, not a swing.** This layer decides *when* and
+*where* and emits an `ai::AttackRequest` (style id, target point, target id,
+tick, commitment window) into `MobSystem::AttackRequests()`, drained by the
+consumer exactly as sever and voice events are. It plays no clip, sets no pose
+and deals no damage; while a request is live the arbiter pins the mob to
+FaceTarget for `commitTicks` so a stroke system can assume the body is not
+pirouetting mid-swing. The attack clock is advanced when the request goes out
+rather than when a blow lands, because this layer must not learn whether a blow
+landed — an AI that waits for hit confirmation stops swinging the moment the
+seam is stubbed.
+
+**Determinism.** Everything here is CPU-float gameplay state beside the gait and
+the melee pose; the AI never writes a voxel, it writes a desired heading and a
+drive vector. It runs only inside the fixed 30 Hz tick, and every random draw —
+the attack jitter, the orbit direction — is `rng::Hash3(id ^ salt, tick, index)`,
+so a replay of the same fight has the same rhythm.
+
+One measured trap, and it is not a tuning question: **tangential speed is
+bounded by the neck, not the legs.** An orbit of radius *r* walked at *v*
+demands an angular rate *v/r*, and a body whose turn rate cannot follow spends
+the whole circle looking off to one side — so it never gets its nose on the
+target, never satisfies the aim tolerance, and has its forward drive scaled down
+by an alignment it can never reach. Authored at `strafeSpeed` 0.5 on a creature
+walking 60 vox/s, mina needed 3.3 rad/s against a 2.8 rad/s cap and issued
+**zero** attacks in 240 ticks of holding range. The strafe is now capped at
+`turnRate * 0.7 * r`, and the `ai-approach` gate asserts a minimum attack count
+precisely so this cannot come back silently: the arbiter can score perfectly and
+still never fire.
+
+The three gates are built around what is actually falsifiable, since "it got
+closer" and "its heading changed" are satisfied by almost every wrong
+implementation: `ai-dummy` asserts *exactly* zero motion and zero turn with a
+target in plain sight (the whole "behaviour is data" claim in one number, since
+the dummy shares every line with the duelist and differs only in JSON);
+`ai-face` asserts convergence on non-quantized bearings with the feet nailed
+down; `ai-approach` asserts a real detour around a wall the mob can see over but
+not walk through, then arrival *and residence* inside the band, no occupation of
+the target's space, and swings actually issued. Thresholds are in
+`tests/baseline.json`.
 
 - **Bleeding:** wound budgets, capped per tick, emitted as radius-1 brush ops;
   blood is a real material (organic tags → burns/reacts for free) with a

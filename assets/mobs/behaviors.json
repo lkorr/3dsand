@@ -1,0 +1,54 @@
+{
+  "comment": "NPC BEHAVIOUR PROFILES. Vocabulary (which intents exist) is code; character (which intents a creature is allowed, how much it wants each, how far it sees, what range it likes, how often it swings) is this file. A mob sidecar opts in with \"behavior\": \"<name>\"; the dev overlay's AI panel switches it at runtime and can write this file back. Hot-reloads on R alongside materials, glyphs and items. The full schema, and the reasoning behind every field, is at the top of src/game/ai_behavior.cpp and src/game/ai_behavior.h.",
+
+  "notes": "An intent ABSENT from a profile's \"intents\" map has weight 0 and is disabled — that is the enable flag, deliberately not a second boolean nobody would keep in sync. An empty profile is a blind, immobile statue, so a creature only ever does what its JSON asked for. Ranges are WORLD VOXELS centre-to-centre (kVoxelMeters = 0.10, so 10 voxels is a metre); cadences are 30 Hz sim TICKS.",
+
+  "profiles": [
+    {
+      "name": "dummy",
+      "label": "Training dummy",
+      "color": 3238002687,
+      "faction": "monster",
+      "hysteresis": 0.22,
+      "perception": { "sightRange": 0, "fovDegrees": 360, "requireLos": true, "aggro": "passive", "alertDecayTicks": 0, "keepRangeScale": 1.0 },
+      "movement": { "mobile": false, "rangeMin": 0, "rangeMax": 0, "bandSlack": 1.5, "approachSpeed": 0, "strafeSpeed": 0, "retreatSpeed": 0, "circleTendency": 0, "circleHoldTicks": 24, "repathTicks": 30, "navRadius": 8, "maxStepUp": 2, "maxStepDown": 5 },
+      "attack": { "style": "none", "reach": 0, "aimTolerance": 0.45, "cadenceTicks": 0, "jitterTicks": 0, "commitTicks": 0, "disengageTicks": 0 },
+      "intents": {
+        "idle": { "weight": 1.0, "cooldownTicks": 0, "minDwellTicks": 0 }
+      }
+    },
+    {
+      "name": "swordsman_static",
+      "label": "Static swordsman",
+      "color": 3238068480,
+      "faction": "monster",
+      "hysteresis": 0.25,
+      "perception": { "sightRange": 34, "fovDegrees": 360, "requireLos": true, "aggro": "hostile", "alertDecayTicks": 150, "keepRangeScale": 1.4 },
+      "movement": { "mobile": false, "rangeMin": 0, "rangeMax": 0, "bandSlack": 1.5, "approachSpeed": 0, "strafeSpeed": 0, "retreatSpeed": 0, "circleTendency": 0, "circleHoldTicks": 24, "repathTicks": 30, "navRadius": 8, "maxStepUp": 2, "maxStepDown": 5 },
+      "attack": { "style": "slash", "reach": 11, "aimTolerance": 0.5, "cadenceTicks": 36, "jitterTicks": 14, "commitTicks": 10, "disengageTicks": 0 },
+      "intents": {
+        "idle": { "weight": 0.05, "cooldownTicks": 0, "minDwellTicks": 0 },
+        "face": { "weight": 1.0, "cooldownTicks": 0, "minDwellTicks": 0 },
+        "attack": { "weight": 3.0, "cooldownTicks": 0, "minDwellTicks": 0 }
+      }
+    },
+    {
+      "name": "duelist",
+      "label": "Duelist",
+      "color": 3225419775,
+      "faction": "monster",
+      "hysteresis": 0.28,
+      "perception": { "sightRange": 46, "fovDegrees": 300, "requireLos": true, "aggro": "hostile", "alertDecayTicks": 180, "keepRangeScale": 1.45 },
+      "movement": { "mobile": true, "rangeMin": 7, "rangeMax": 11, "bandSlack": 1.4, "approachSpeed": 1.0, "strafeSpeed": 0.5, "retreatSpeed": 0.75, "circleTendency": 0.75, "circleHoldTicks": 34, "repathTicks": 10, "navRadius": 30, "maxStepUp": 2, "maxStepDown": 5 },
+      "attack": { "style": "slash", "reach": 10, "aimTolerance": 0.4, "cadenceTicks": 34, "jitterTicks": 22, "commitTicks": 10, "disengageTicks": 26 },
+      "intents": {
+        "idle": { "weight": 0.05, "cooldownTicks": 0, "minDwellTicks": 0 },
+        "face": { "weight": 0.45, "cooldownTicks": 0, "minDwellTicks": 4 },
+        "approach": { "weight": 1.15, "cooldownTicks": 0, "minDwellTicks": 8 },
+        "holdRange": { "weight": 1.05, "cooldownTicks": 0, "minDwellTicks": 8 },
+        "circle": { "weight": 0.9, "cooldownTicks": 18, "minDwellTicks": 26 },
+        "attack": { "weight": 3.0, "cooldownTicks": 0, "minDwellTicks": 0 }
+      }
+    }
+  ]
+}

@@ -325,6 +325,10 @@ bool LoadMobDefs(const std::string& dir, const std::vector<MaterialDef>& mats,
         (float)kVoxelsPerMetre / (float)(sidecarVpm > 0 ? sidecarVpm
                                                        : kVoxelsPerMetre);
     def.speed = j.value("speed", 4.0f) * worldLen;
+    // Optional AI profile, BY NAME (assets/mobs/behaviors.json). Absent means
+    // "no AI": the creature keeps the wander-and-avoid DecideIntent has always
+    // had, so adding this system changed nothing about any existing sidecar.
+    def.behavior = j.value("behavior", std::string());
 
     // Sound slots (assets/sound_schema.js). Presentation only, so a bad entry
     // is skipped rather than failing the def — a mob with a typo'd sound name
@@ -1179,11 +1183,69 @@ void MobSystem::OnMaterialsReloaded(const std::vector<MaterialDef>& mats,
   }
 }
 
-void MobSystem::SetDefs(std::vector<MobDef> defs) { defs_ = std::move(defs); }
+void MobSystem::SetDefs(std::vector<MobDef> defs) {
+  defs_ = std::move(defs);
+  // A live mob's `def_` points into this vector, so a hot reload has to re-seat
+  // it before anything reads a stale pointer. Profiles are re-resolved with it,
+  // since a def may have gained or lost its "behavior" key in the same edit.
+  for (Mob& m : mobs_) {
+    if (m.defIndex_ >= 0 && m.defIndex_ < (int)defs_.size()) {
+      m.def_ = &defs_[m.defIndex_];
+      m.ai_ = ai::Brain(behaviors_.Find(defs_[m.defIndex_].behavior));
+    }
+  }
+}
+
+void MobSystem::SetBehaviors(ai::Library lib) {
+  behaviors_ = std::move(lib);
+  // Re-resolve BY NAME rather than keeping the old index: the reload may have
+  // inserted, removed or reordered profiles, and an index survives all three
+  // silently while pointing at the wrong creature's character.
+  for (Mob& m : mobs_) {
+    const std::string& want =
+        m.def_ != nullptr ? m.def_->behavior : std::string();
+    const int p = behaviors_.Find(want);
+    if (p != m.ai_.profile) m.ai_ = ai::Brain(p);
+  }
+}
+
+bool MobSystem::SetMobBehavior(uint64_t mobId, const std::string& name) {
+  Mob* m = FindMobById(mobId);
+  if (m == nullptr) return false;
+  const int p = name.empty() ? -1 : behaviors_.Find(name);
+  if (!name.empty() && p < 0) return false;
+  // A fresh Brain, not a profile swap on the old one: alert timers, attack
+  // clocks and a half-walked path all belong to the character that was running,
+  // and carrying them across is how a dummy inherits a duelist's swing timer.
+  m->ai_ = ai::Brain(p);
+  return true;
+}
+
+const ai::Brain* MobSystem::MobBrain(uint64_t mobId) const {
+  for (const Mob& m : mobs_)
+    if (m.id_ == mobId) return &m.ai_;
+  return nullptr;
+}
+
+void MobSystem::SetPlayerActor(Vec3 centreVox, float radius, float height,
+                               bool alive) {
+  playerActor_.id = 0;   // 0 is the reserved player id; mob ids start at 1
+  playerActor_.centre = centreVox;
+  playerActor_.radius = radius;
+  playerActor_.height = height;
+  playerActor_.faction = ai::FactionId("player");
+  playerActor_.alive = alive;
+  playerActorValid_ = true;
+}
 
 void MobSystem::Reset(bool rewindIds) {
   for (Mob& m : mobs_) m.ReleaseRig();
   mobs_.clear();
+  // The AI's two derived mirrors: the per-tick actor list PreTick rebuilds and
+  // the attack requests nobody has drained yet. Both are pure derived state, so
+  // a Reset simply drops them (game/mob.h AttackRequests).
+  attacks_.clear();
+  actors_.clear();
   // THE ID COUNTER IS DELIBERATELY NOT REWOUND BY DEFAULT.
   //
   // A mob id is not just a handle: it seeds the entity-scoped gore variance
@@ -1345,6 +1407,11 @@ uint64_t MobSystem::Spawn(int defIndex, IVec3 atVoxel) {
   mob.gore_ = Mob::MakeGoreProfile(mob.id_);
   mob.defIndex_ = defIndex;
   mob.def_ = &def;
+  // Resolve the sidecar's AI profile by name, here rather than at def load: the
+  // behaviour library reloads independently (R), so an index baked into the def
+  // would rot the moment a profile was inserted above it. -1 = no AI, and the
+  // creature keeps the legacy wander.
+  mob.ai_ = ai::Brain(behaviors_.Find(def.behavior));
   if (!mob.BuildRig(def, Vec3{(float)atVoxel.x, (float)atVoxel.y,
                               (float)atVoxel.z}))
     return 0;
@@ -1720,10 +1787,126 @@ MobSystem::GroundSense MobSystem::SenseGround(const Mob& mob, const MobDef& def,
 // rather than by a fixed 90-degree turn is what makes the avoidance produce
 // free angles — a mob grazing a wall deflects a few degrees along it instead
 // of ricocheting orthogonally.
+// ---- the CPU mirror, in the shape the AI layer asks for --------------------
+//
+// game/ai_behavior.h and game/ai_nav.h deliberately know nothing about World,
+// CachedChunk or the residency window: they take function pointers. These three
+// adapters are the only place that knowledge meets them, and all three obey the
+// same rule the steering layer already lives by — UNKNOWN IS OPEN. A creature
+// must not be fenced in, blinded, or made to refuse a path by the edge of its
+// own knowledge (DESIGN.md, "Unknown footing must read as WALKABLE").
+namespace {
+
+struct AiProbeCtx {
+  const Mob* mob = nullptr;
+  World* world = nullptr;
+  const std::vector<uint32_t>* classOf = nullptr;
+};
+
+// Is this cell something a body cannot stand in? Reads the SAME collision
+// classes the ground probe does, so "walkable" means one thing in this engine.
+bool AiCellBlocked(const AiProbeCtx& c, int x, int y, int z) {
+  const IVec3 cell{x, y, z};
+  if (!c.world->CellInWindow(cell)) return false;      // outside = open
+  const IVec3 wc{x >> 4, y >> 4, z >> 4};
+  const CachedChunk* cc = c.world->Cached(wc);
+  if (cc == nullptr || cc->voxels.size() != kChunkVol) return false;  // unknown = open
+  const uint32_t lx = (uint32_t)(x & 15), ly = (uint32_t)(y & 15),
+                 lz = (uint32_t)(z & 15);
+  const uint32_t mat = cc->voxels[(lz * kChunk + ly) * kChunk + lx] & 0xFFF;
+  if (mat == 0 || mat >= c.classOf->size()) return false;
+  const uint32_t k = (*c.classOf)[mat];
+  return k == CLASS_SOLID || k == CLASS_POWDER;
+}
+
+bool AiProbeGround(void* ctx, int x, int z, int yFrom, int& outY) {
+  AiProbeCtx& c = *(AiProbeCtx*)ctx;
+  return c.mob->GroundHeightAt(*c.world, x, z, yFrom, outY);
+}
+
+bool AiProbeBlocked(void* ctx, int x, int y, int z) {
+  return AiCellBlocked(*(AiProbeCtx*)ctx, x, y, z);
+}
+
+// Line of sight: one voxel-stepped sample walk, exactly the sampler
+// audio/occlusion.cpp uses, minus the material acoustics. A creature that can
+// see through a hill is the classic "how did it know that" complaint; a
+// creature blinded by a sapling is the opposite one, and only SOLID matter
+// stops the ray (a mob can see you through smoke and through its own blood).
+bool AiLineOfSight(void* ctx, Vec3 from, Vec3 to) {
+  AiProbeCtx& c = *(AiProbeCtx*)ctx;
+  const Vec3 d = to - from;
+  const float len = d.len();
+  if (len < 1e-3f) return true;
+  const int steps = std::min(96, (int)len);
+  const Vec3 step = d * (1.0f / (float)std::max(1, steps));
+  // Skip the first and last sample: the endpoints are the two bodies' own
+  // cells, and a creature standing in tall grass must not be blind.
+  for (int i = 1; i < steps; i++) {
+    const Vec3 p = from + step * (float)i;
+    if (AiCellBlocked(c, ifloor(p.x), ifloor(p.y), ifloor(p.z))) return false;
+  }
+  return true;
+}
+
+}  // namespace
+
 void MobSystem::DecideIntent(Mob& mob, const MobDef& def,
                              const GroundSense& sense, uint32_t tick,
                              float dt) {
   mob.driveScale_ = 1.0f;
+  mob.driveStrafe_ = 0.0f;
+
+  // ---- THE BEHAVIOUR LAYER ------------------------------------------------
+  // A mob with an authored profile is driven by game/ai_behavior.cpp; one
+  // without falls through to the wander-and-avoid below, unchanged. That is the
+  // whole integration: the AI is another OPINION at this seam, and it may still
+  // write nothing but desiredHeading and the local drive vector.
+  if (mob.ai_.profile >= 0 && world_ != nullptr) {
+    AiProbeCtx pctx{&mob, world_, &classOf_};
+    ai::SelfView self;
+    self.id = mob.id_;
+    self.origin = mob.origin_;
+    self.size = def.worldSize;
+    self.heading = mob.heading_;
+    self.speed = def.speed;
+    // The MOVING rate, not the standing one: the behaviour layer uses it to
+    // bound a circle-strafe, and a creature is by definition moving while it
+    // circles (Steer couples turn rate to speed by turnRateMoving).
+    self.turnRate = mob.skel_.loco.turnRate *
+                    std::max(0.05f, mob.skel_.loco.turnRateMoving);
+    const ai::Profile* prof = behaviors_.At(mob.ai_.profile);
+    self.faction = prof != nullptr ? ai::FactionId(prof->faction) : 0u;
+
+    ai::GroundView gv;
+    gv.haveGround = sense.haveGround;
+    gv.groundY = sense.groundY;
+    static_assert((int)ai::GroundView::kProbes == GroundSense::kProbeCount,
+                  "the AI's fan view and SenseGround's fan must be the same fan");
+    for (int i = 0; i < GroundSense::kProbeCount; i++) {
+      gv.clear[i] = sense.clear[i];
+      gv.stepUp[i] = sense.stepUp[i];
+    }
+
+    ai::WorldView wv;
+    wv.actors = &actors_;
+    wv.probe.ground = &AiProbeGround;
+    wv.probe.blocked = &AiProbeBlocked;
+    wv.probe.ctx = &pctx;
+    wv.lineOfSight = &AiLineOfSight;
+    wv.losCtx = &pctx;
+
+    ai::IntentOut out;
+    if (ai::Think(mob.ai_, behaviors_, self, gv, wv, tick, dt, out)) {
+      mob.desiredHeading_ = out.desiredHeading;
+      mob.driveScale_ = out.driveScale;
+      mob.driveStrafe_ = out.driveStrafe;
+      if (out.attack && attacks_.size() < kMaxMobs * 2)
+        attacks_.push_back(std::move(out.request));
+      return;
+    }
+  }
+
   if (!sense.haveGround) return;
 
   // The forward probe is index 0 by construction of the fan.
@@ -1863,20 +2046,40 @@ void MobSystem::DriveLocomotion(Mob& mob, const MobDef& def,
           ? mob.skel_.states[mob.anim_.locoState].speedScale
           : 1.0f;
 
-  // Translate along the ACTUAL facing, scaled by how well it is aligned with
-  // intent. A mob mid-turn therefore traces an arc, and one that has to turn
-  // around pivots roughly in place — both fall out of this one multiply rather
-  // than needing a turn-in-place special case.
-  const float drive = def.speed * speedScale * mob.driveScale_ * align;
-  if (drive <= 0.0f) return;
-  // Do not walk into a wall we can already feel. The mob keeps turning (Steer
-  // ran before this and is unaffected), so it grinds along the obstacle and
-  // turns off it rather than freezing against it.
-  if (!sense.clear[0]) return;
+  // Translate in the mob's OWN frame: forward along the ACTUAL facing (so a mob
+  // mid-turn traces an arc and one turning around pivots roughly in place —
+  // both fall out of the `align` multiply rather than needing a special case),
+  // plus a lateral term for footwork.
+  //
+  // THE ALIGNMENT SCALE APPLIES ONLY TO FORWARD DRIVE, on purpose. `align` is
+  // "how well does my facing match where I want to GO", which is exactly the
+  // wrong question for a strafe or a back-pedal: a duelist circling a target it
+  // is squarely facing has an alignment of 1 and a sidestep to make, and one
+  // giving ground is deliberately walking the way it is NOT looking.
+  const float base = def.speed * speedScale;
+  float fwdDrive = base * mob.driveScale_ * align;
+  float sideDrive = base * mob.driveStrafe_;
+
+  // Do not walk into a wall we can already feel, PER DIRECTION. The mob keeps
+  // turning (Steer ran before this and is unaffected), so it grinds along the
+  // obstacle and turns off it rather than freezing against it. The fan is in
+  // the mob's own frame at 45-degree steps, so probe 0 is ahead, 2 is its
+  // right, 4 behind and 6 its left — a back-pedal that ignored probe 4 would
+  // reverse straight into the rock it just stepped away from.
+  if (fwdDrive > 0 && !sense.clear[0]) fwdDrive = 0;
+  if (fwdDrive < 0 && !sense.clear[4]) fwdDrive = 0;
+  if (sideDrive > 0 && !sense.clear[2]) sideDrive = 0;
+  if (sideDrive < 0 && !sense.clear[6]) sideDrive = 0;
+  if (fwdDrive == 0.0f && sideDrive == 0.0f) return;
 
   const Vec3 fwd{std::sin(mob.heading_), 0, std::cos(mob.heading_)};
-  mob.origin_ += fwd * (drive * dt);
-  mob.phase_ += drive * dt * 2.2f;  // stride frequency
+  const Vec3 rgt{std::cos(mob.heading_), 0, -std::sin(mob.heading_)};
+  const Vec3 vel = fwd * fwdDrive + rgt * sideDrive;
+  mob.origin_ += vel * dt;
+  // Stride frequency follows the SPEED, not the forward component: a mob
+  // sidestepping is still taking steps, and driving the gait off `fwdDrive`
+  // alone would leave it gliding.
+  mob.phase_ += vel.len() * dt * 2.2f;
 }
 
 // Procedural gait layer. Writes foot targets into mob.anim_.feet and derives
@@ -2280,6 +2483,32 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
   // loop. Nothing has to remember to remove an entry.
   bleeds_.clear();
 
+  // ---- who is on the field, as the behaviour layer sees it ----------------
+  // The player and every live mob in ONE list, keyed only by faction. That is
+  // the whole reason mob-vs-mob combat later is a JSON change and not a second
+  // targeting path: nothing downstream asks what KIND of thing an entry is.
+  // Rebuilt every tick for the same reason `bleeds_` is — a despawned creature
+  // stops being a target by not being here.
+  actors_.clear();
+  if (playerActorValid_) actors_.push_back(playerActor_);
+  for (const Mob& m : mobs_) {
+    if (!m.alive_ || m.def_ == nullptr) continue;
+    const ai::Profile* pr = behaviors_.At(m.ai_.profile);
+    ai::Actor a;
+    a.id = m.id_;
+    a.centre = Vec3{m.origin_.x + m.def_->worldSize.x * 0.5f,
+                    m.origin_.y + m.def_->worldSize.y * 0.5f,
+                    m.origin_.z + m.def_->worldSize.z * 0.5f};
+    a.radius = 0.5f * std::max(m.def_->worldSize.x, m.def_->worldSize.z);
+    a.height = m.def_->worldSize.y;
+    // A creature with no profile has no faction of its own, so it belongs to
+    // none and is a legal target for anything hostile. That is the useful
+    // default: a wandering critter should be huntable without being authored.
+    a.faction = pr != nullptr ? ai::FactionId(pr->faction) : ~0u;
+    a.alive = true;
+    actors_.push_back(std::move(a));
+  }
+
   for (size_t mi = 0; mi < mobs_.size();) {
     Mob& mob = mobs_[mi];
     const MobDef& def = defs_[mob.defIndex_];
@@ -2390,8 +2619,25 @@ void Mob::RegisterTerrainAnchor() {
   // once and World::Cached returns that first copy forever.
   if (!debris_ || !def_) return;
   const Vec3 ws = def_->worldSize;
-  const float r =
-      0.5f * std::sqrt(ws.x * ws.x + ws.y * ws.y + ws.z * ws.z);
+  float r = 0.5f * std::sqrt(ws.x * ws.x + ws.y * ws.y + ws.z * ws.z);
+  // A NAVIGATING CREATURE MUST SEE AS FAR AS IT PLANS.
+  //
+  // The anchor is the only thing that keeps chunks in the CPU mirror, and a
+  // body-sized one covers about twelve voxels — so an A* search with a 30-voxel
+  // horizon asked about columns nothing had fetched, got UNKNOWN, and (rule 1
+  // of ai_nav.h, correctly) treated them as open. It then planned a beautiful
+  // straight line through a solid wall, walked into it, and stood there: the
+  // drive's own probe DOES reach the wall, so the mob was vetoed by geometry
+  // its planner could not see. Measured — waypoint 27 voxels dead ahead through
+  // a 31-column stone fence, frozen for 300 ticks.
+  //
+  // Widened only while the creature actually has a target (rule 2: cost scales
+  // with activity). An idle or unaware mob pays exactly what it always did.
+  if (ai_.profile >= 0 && ai_.hasTarget && sys_ != nullptr) {
+    const ai::Profile* pr = sys_->Behaviors().At(ai_.profile);
+    if (pr != nullptr && pr->movement.mobile)
+      r = std::max(r, pr->movement.navRadius + 4.0f);
+  }
   debris_->AddTerrainAnchor(
       origin_ + Vec3{ws.x * 0.5f, ws.y * 0.5f, ws.z * 0.5f}, r);
 }

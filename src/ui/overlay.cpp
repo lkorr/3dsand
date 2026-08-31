@@ -770,6 +770,11 @@ void Overlay::Draw(UIState& s) {
     if (ImGui::Button("fluid tuning..."))
       s.fluidWindowOpen = !s.fluidWindowOpen;
   }
+  if (s.tool == UIState::kToolMob) {
+    if (ImGui::Button("NPC AI...")) s.aiWindowOpen = !s.aiWindowOpen;
+    ImGui::SameLine();
+    ImGui::TextDisabled("%d live", (int)s.aiMobIds.size());
+  }
   if (s.tool == UIState::kToolBrush) {
     ImGui::TextDisabled("LMB paint  RMB erase  1-8 / combo below");
   } else if (s.tool == UIState::kToolLaser) {
@@ -985,6 +990,201 @@ void Overlay::Draw(UIState& s) {
     ImGui::End();
   }
 
+  // ---- NPC AI window (game/ai_behavior.h) ---------------------------------
+  //
+  // Same shape as the fluid window above, for the same reason: the overlay owns
+  // no game state. Buttons set one-shot bools, sliders write UIState mirrors,
+  // and main.cpp is the only thing that touches MobSystem or the behaviour
+  // library. Scrolling is ImGui's own — see the note in overlay.h about why
+  // installing a GLFW scroll callback here would freeze the wheel everywhere.
+  if (s.aiWindowOpen) {
+    ImGui::SetNextWindowPos(ImVec2(720, 12), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(400, 720), ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("NPC AI", &s.aiWindowOpen)) {
+      if (ImGui::BeginTabBar("##aitabs")) {
+        // ---- Spawn -------------------------------------------------------
+        if (ImGui::BeginTabItem("Spawn")) {
+          ImGui::TextDisabled("spawns a humanoid with a sword, a few metres");
+          ImGui::TextDisabled("ahead of you (or at the crosshair hit)");
+          if (ImGui::Button("dummy##ai")) s.aiSpawnDummy = true;
+          ImGui::SameLine();
+          ImGui::TextDisabled("blind, never moves, never turns");
+          if (ImGui::Button("static swordsman##ai")) s.aiSpawnStatic = true;
+          ImGui::SameLine();
+          ImGui::TextDisabled("turns to face, swings in reach");
+          if (ImGui::Button("duelist##ai")) s.aiSpawnDuelist = true;
+          ImGui::SameLine();
+          ImGui::TextDisabled("paths in, holds range, circles");
+          ImGui::Separator();
+          if (ImGui::Button("kill all spawned##ai")) s.aiKillSpawned = true;
+          ImGui::Separator();
+          ImGui::Checkbox("debug viz (path / target / band)", &s.showAiDebug);
+          ImGui::Checkbox("...include the range-band ring", &s.showAiRing);
+          ImGui::Separator();
+          ImGui::Text("attack requests: %d", s.aiAttackCount);
+          ImGui::TextWrapped("last: %s", s.aiLastAttack.empty()
+                                             ? "(none yet)"
+                                             : s.aiLastAttack.c_str());
+          ImGui::TextDisabled("the AI decides WHEN and WHERE; the stroke");
+          ImGui::TextDisabled("system (phase C) consumes these requests");
+          ImGui::EndTabItem();
+        }
+
+        // ---- Mobs --------------------------------------------------------
+        if (ImGui::BeginTabItem("Mobs")) {
+          if (s.aiMobIds.empty()) {
+            ImGui::TextDisabled("no live mobs");
+          } else {
+            if (s.aiMobSelected >= (int)s.aiMobIds.size()) s.aiMobSelected = 0;
+            // A child region so a crowd scrolls instead of pushing the
+            // behaviour controls off the bottom of the window.
+            ImGui::BeginChild("##ailist", ImVec2(0, 190), true);
+            for (int i = 0; i < (int)s.aiMobLabels.size(); i++) {
+              // PushID per row: two creatures on the same profile produce the
+              // same label text, and ImGui hashes the label — without this the
+              // selection sticks on the first of them.
+              ImGui::PushID(i);
+              if (ImGui::Selectable(s.aiMobLabels[i].c_str(),
+                                    i == s.aiMobSelected))
+                s.aiMobSelected = i;
+              ImGui::PopID();
+            }
+            ImGui::EndChild();
+            ImGui::Separator();
+            if (!s.aiProfileNames.empty()) {
+              if (s.aiBehaviorPick >= (int)s.aiProfileNames.size())
+                s.aiBehaviorPick = 0;
+              ImGui::TextUnformatted("behaviour");
+              ImGui::SameLine();
+              // "##" so this combo cannot hash to the same id as the profile
+              // combo on the next tab.
+              if (ImGui::BeginCombo("##aibeh",
+                                    s.aiProfileNames[s.aiBehaviorPick].c_str())) {
+                for (int i = 0; i < (int)s.aiProfileNames.size(); i++) {
+                  ImGui::PushID(i);
+                  if (ImGui::Selectable(s.aiProfileNames[i].c_str(),
+                                        i == s.aiBehaviorPick))
+                    s.aiBehaviorPick = i;
+                  ImGui::PopID();
+                }
+                ImGui::EndCombo();
+              }
+              ImGui::SameLine();
+              if (ImGui::Button("apply to selected")) s.aiApplyBehavior = true;
+            }
+          }
+          ImGui::EndTabItem();
+        }
+
+        // ---- Profile -----------------------------------------------------
+        if (ImGui::BeginTabItem("Profile")) {
+          if (s.aiProfileNames.empty()) {
+            ImGui::TextDisabled("assets/mobs/behaviors.json has no profiles");
+          } else {
+            if (s.aiProfileEdit >= (int)s.aiProfileNames.size())
+              s.aiProfileEdit = 0;
+            ImGui::TextUnformatted("editing");
+            ImGui::SameLine();
+            if (ImGui::BeginCombo("##aiprof",
+                                  s.aiProfileNames[s.aiProfileEdit].c_str())) {
+              for (int i = 0; i < (int)s.aiProfileNames.size(); i++) {
+                ImGui::PushID(i);
+                if (ImGui::Selectable(s.aiProfileNames[i].c_str(),
+                                      i == s.aiProfileEdit)) {
+                  s.aiProfileEdit = i;
+                  s.aiProfileReseat = true;   // reload mirrors from the library
+                }
+                ImGui::PopID();
+              }
+              ImGui::EndCombo();
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Save")) s.aiSaveBehaviors = true;
+            if (!s.aiSaveStatus.empty()) {
+              ImGui::SameLine();
+              ImGui::TextDisabled("%s", s.aiSaveStatus.c_str());
+            }
+            ImGui::TextDisabled("sliders are LIVE: every mob on this profile");
+            ImGui::TextDisabled("updates as you drag. Save writes the JSON.");
+            ImGui::Separator();
+
+            // Every slider latches aiTuningDirty on its own return value —
+            // the wind panel's shape, not the fluid panel's Apply button. These
+            // knobs cost nothing to apply (no shader touches them), and an AI
+            // you have to press Apply to feel is an AI you cannot tune.
+            auto f = [&s](const char* label, float* v, float lo, float hi) {
+              if (ImGui::SliderFloat(label, v, lo, hi, "%.2f"))
+                s.aiTuningDirty = true;
+            };
+            auto i32 = [&s](const char* label, int* v, int lo, int hi) {
+              if (ImGui::SliderInt(label, v, lo, hi)) s.aiTuningDirty = true;
+            };
+            auto b = [&s](const char* label, bool* v) {
+              if (ImGui::Checkbox(label, v)) s.aiTuningDirty = true;
+            };
+
+            if (ImGui::CollapsingHeader("Perception",
+                                        ImGuiTreeNodeFlags_DefaultOpen)) {
+              f("sight range (vox)", &s.aiSightRange, 0.0f, 120.0f);
+              f("FOV (deg, 360 = all round)", &s.aiFovDegrees, 20.0f, 360.0f);
+              b("needs line of sight", &s.aiRequireLos);
+              i32("alert decay (ticks)", &s.aiAlertDecayTicks, 0, 600);
+              f("keep-range hysteresis", &s.aiKeepRangeScale, 1.0f, 3.0f);
+            }
+            if (ImGui::CollapsingHeader("Movement",
+                                        ImGuiTreeNodeFlags_DefaultOpen)) {
+              b("can move its feet", &s.aiMobile);
+              f("range min (vox)", &s.aiRangeMin, 0.0f, 60.0f);
+              f("range max (vox)", &s.aiRangeMax, 0.0f, 60.0f);
+              f("band deadband (vox)", &s.aiBandSlack, 0.0f, 8.0f);
+              f("approach speed x", &s.aiApproachSpeed, 0.0f, 2.0f);
+              f("strafe speed x", &s.aiStrafeSpeed, 0.0f, 2.0f);
+              f("retreat speed x", &s.aiRetreatSpeed, 0.0f, 2.0f);
+              f("circle tendency", &s.aiCircleTendency, 0.0f, 1.0f);
+              i32("circle hold (ticks)", &s.aiCircleHoldTicks, 4, 180);
+              i32("repath (ticks)", &s.aiRepathTicks, 2, 120);
+              f("nav radius (vox)", &s.aiNavRadius, 4.0f, 40.0f);
+            }
+            if (ImGui::CollapsingHeader("Attack")) {
+              f("reach (vox)", &s.aiAttackReach, 0.0f, 40.0f);
+              f("aim tolerance (rad)", &s.aiAimTolerance, 0.05f, 1.6f);
+              i32("cadence (ticks)", &s.aiCadenceTicks, 1, 240);
+              i32("jitter (ticks)", &s.aiJitterTicks, 0, 120);
+              i32("commit (ticks)", &s.aiCommitTicks, 0, 90);
+              i32("disengage (ticks)", &s.aiDisengageTicks, 0, 180);
+            }
+            if (ImGui::CollapsingHeader("Arbiter",
+                                        ImGuiTreeNodeFlags_DefaultOpen)) {
+              f("hysteresis (incumbent bonus)", &s.aiHysteresis, 0.0f, 1.5f);
+              ImGui::TextDisabled("weight 0 = the intent is DISABLED");
+              static const char* kIntent[6] = {"idle",      "face",
+                                               "approach",  "holdRange",
+                                               "circle",    "attack"};
+              for (int k = 0; k < 6; k++) {
+                ImGui::PushID(k);
+                ImGui::TextUnformatted(kIntent[k]);
+                if (ImGui::SliderFloat("weight", &s.aiIntentWeight[k], 0.0f,
+                                       4.0f, "%.2f"))
+                  s.aiTuningDirty = true;
+                if (ImGui::SliderInt("cooldown", &s.aiIntentCooldown[k], 0, 180))
+                  s.aiTuningDirty = true;
+                if (ImGui::SliderInt("min dwell", &s.aiIntentDwell[k], 0, 180))
+                  s.aiTuningDirty = true;
+                ImGui::PopID();
+                ImGui::Separator();
+              }
+            }
+          }
+          ImGui::EndTabItem();
+        }
+        ImGui::EndTabBar();
+      }
+    }
+    ImGui::End();
+  }
+
+  // Closes the FontSmall push at the top of BuildUI: every window above draws
+  // in it, so the pop must stay LAST no matter how many panels get appended.
   ImGui::PopFont();
 }
 
