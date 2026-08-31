@@ -7,26 +7,26 @@
     {
       "name": "horizontal_r",
       "label": "Horizontal cut, weapon side across",
-      "windup": { "ticks": 12, "az": 0.30, "el": 0.10, "reach": -0.05 },
+      "windup": { "ticks": 12, "az": 0.30, "el": 0.05, "reach": -0.05 },
       "cut": { "ticks": 7, "az": -2.30, "el": 0.00, "reach": 0.10 },
       "recover": { "ticks": 10 },
-      "jitter": { "az": 0.20, "el": 0.08, "tempo": 0.25 }
+      "jitter": { "az": 0.10, "el": 0.04, "tempo": 0.25 }
     },
     {
       "name": "horizontal_l",
       "label": "Backhand cut, across to weapon side",
-      "windup": { "ticks": 13, "az": -0.25, "el": 0.08, "reach": -0.05 },
+      "windup": { "ticks": 13, "az": -0.25, "el": 0.04, "reach": -0.05 },
       "cut": { "ticks": 7, "az": 2.10, "el": 0.00, "reach": 0.10 },
       "recover": { "ticks": 11 },
-      "jitter": { "az": 0.18, "el": 0.08, "tempo": 0.25 }
+      "jitter": { "az": 0.10, "el": 0.04, "tempo": 0.25 }
     },
     {
       "name": "overhead",
       "label": "Overhead chop from a high guard",
-      "windup": { "ticks": 14, "az": 0.20, "el": 0.55, "reach": -0.10 },
+      "windup": { "ticks": 14, "az": 0.06, "el": 0.55, "reach": -0.10 },
       "cut": { "ticks": 6, "az": -0.15, "el": -1.90, "reach": 0.14 },
       "recover": { "ticks": 12 },
-      "jitter": { "az": 0.22, "el": 0.10, "tempo": 0.22 }
+      "jitter": { "az": 0.08, "el": 0.06, "tempo": 0.22 }
     },
     {
       "name": "diagonal",
@@ -34,7 +34,7 @@
       "windup": { "ticks": 12, "az": 0.35, "el": 0.45, "reach": -0.08 },
       "cut": { "ticks": 7, "az": -1.60, "el": -1.40, "reach": 0.12 },
       "recover": { "ticks": 10 },
-      "jitter": { "az": 0.20, "el": 0.10, "tempo": 0.25 }
+      "jitter": { "az": 0.12, "el": 0.06, "tempo": 0.25 }
     },
     {
       "name": "thrust",
@@ -42,7 +42,7 @@
       "windup": { "ticks": 11, "az": 0.28, "el": 0.05, "reach": -0.45 },
       "cut": { "ticks": 5, "az": -0.20, "el": 0.00, "reach": 0.85 },
       "recover": { "ticks": 12 },
-      "jitter": { "az": 0.14, "el": 0.06, "tempo": 0.28 }
+      "jitter": { "az": 0.08, "el": 0.04, "tempo": 0.28 }
     }
   ]
 }

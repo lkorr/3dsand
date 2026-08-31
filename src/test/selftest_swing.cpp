@@ -753,6 +753,18 @@ Status GateSwingPlane(Ctx& c, std::string& detail) {
   const IVec3 wo = world.WindowOrigin();
   const int gx = (wo.x + (int)kNChunk / 2) * (int)kChunk;
   const int gz = (wo.z + (int)kNChunk / 2) * (int)kChunk;
+  // THE WINDOW CENTRE, AND NOT THE FLATTEST PATCH NEAR IT. Moving this fixture
+  // 96 voxels away to find flat ground was tried and it broke `ai-approach`,
+  // which reported "wall 0/33 columns in mirror" and walked its mob straight
+  // through a stone wall: that gate writes its wall as BrushOps and then reads
+  // the CPU MIRROR, and the mirror only holds chunks something has anchored —
+  // which, until this gate moved, was this gate's own avatar standing on the
+  // very spot ai-approach builds on. A latent dependency in a gate three
+  // positions later, and worth recording rather than routing around silently.
+  //
+  // The slope this was meant to fix is handled where it belongs instead: the
+  // cut AIMS AT THE TARGET'S LIVE CHEST (pass E) rather than assuming the two
+  // bodies settled at the same height.
   const int gh = World::TerrainHeight(gx, gz, kDefaultSeed);
   uint32_t t = 21000;
   // ...AND THE WINDOW MUST NOT MOVE UNDER THE FIXTURE while the gate runs.
@@ -1359,8 +1371,29 @@ Status GateSwingPlane(Ctx& c, std::string& detail) {
       // whose chest is what a cut is aimed at. Closed-loop, for the reason
       // `readyTo` exists: an open-loop version of this line parked the blade
       // on the azimuth stop.
-      const bool eReady = readyTo(1.15f, 0.15f);
+      // THE ELEVATION IS MEASURED, NOT ASSUMED. A fixed ready of 0.15 rad puts
+      // the blade at chest height only when the avatar and its target settled
+      // on the same floor, and on a slope they do not: in the full suite the
+      // dummy came to rest 2.8 voxels lower than it does standalone and the
+      // whole sweep passed over its head (tip box y 233..241 against a body
+      // spanning 217..234), which the gate reported as "0 of 0 wounded limbs"
+      // about a fixture that was alive and fifteen-limbed the whole time.
+      //
+      // Taken about the LIVE shoulder and against the LIVE chest, so it is
+      // right on any ground and needs no flat-spot search (see the anchor note).
+      const Vec3 tgtChest{(float)dx + dd.worldSize.x * 0.5f,
+                          mobs.MobOrigin(tid).y + dd.worldSize.y * 0.60f,
+                          (float)dz + dd.worldSize.z * 0.5f};
+      const Vec3 sh = shoulderWorld();
+      const Vec3 toTgt = tgtChest - sh;
+      const float aimEl = std::asin(std::clamp(
+          toTgt.y / std::max(toTgt.len(), 1e-3f), -1.0f, 1.0f));
+      const bool eReady = readyTo(1.15f, aimEl);
       check(eReady, "the cut's ready reached its start pose");
+      std::printf(
+          "swing-plane E: shoulder y %.1f, target chest y %.1f, ready el "
+          "%.2f rad\n",
+          sh.y, tgtChest.y, aimEl);
       std::vector<Vec3> tipPath, basePath;
       BladeRead prev = readBlade();
       int sweptTicks = 0;
@@ -1500,8 +1533,12 @@ Status GateSwingPlane(Ctx& c, std::string& detail) {
       // did exactly that and reported zero voxels lost for BOTH arms, which
       // reads as "edge alignment is broken" and was really "the fixture
       // missed". Hilt in front of the chest, point behind it.
+      // OFF THE LIVE BODY. Computing this from the SPAWN cell assumes the rig
+      // settled where it was put, and a rig settles onto whatever ground is
+      // under it — the same slope that put pass E's sweep over the target's
+      // head would put this reference cut through empty air.
       const Vec3 chest{(float)dx + dd.worldSize.x * 0.5f,
-                       (float)(dh + 2) + dd.worldSize.y * 0.66f,
+                       mobs.MobOrigin(tid).y + dd.worldSize.y * 0.66f,
                        (float)dz + dd.worldSize.z * 0.5f};
       const Vec3 travel{-3.0f, 0, 0};
       EdgeSweep sw;
