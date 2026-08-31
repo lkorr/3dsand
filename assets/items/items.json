@@ -11,6 +11,14 @@
       "desc": "A straight double-edged arming sword. Held point-up; it cuts with the length of its blade, so where you land it is where the wound opens."
     },
     {
+      "id": "cleaver",
+      "kind": "melee",
+      "damage": 20.0,
+      "carveBonus": 0.25,
+      "reach": 11.0,
+      "desc": "A two-handed cleaver, wide at the tip and heavy with it. It is not quicker than a sword and it is not subtler; it simply arrives with more behind the edge, and takes a limb in a third of the blows."
+    },
+    {
       "id": "hood",
       "kind": "armor_head",
       "desc": "A deep cloth cowl. It keeps the rain off and catches fire readily; what it will not do is stop a blade."
