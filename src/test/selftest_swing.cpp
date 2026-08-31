@@ -540,25 +540,54 @@ Status GateSwing(Ctx& c, std::string& detail) {
 // rebuild to tune), and every measured value is pushed back through
 // RecordObserved so `--rebaseline` can retune them in one command.
 //
-// KNOWN: THIS GATE PASSES STANDALONE AND FAILS INSIDE THE FULL SUITE, and the
-// baseline records it as known-failing for that reason. Run
+// ---- REPAIRED 2026-08-31: WHAT WAS ACTUALLY WRONG WITH THIS FIXTURE --------
 //
-//     ./build/Release/sandvox.exe --selftest --gate swing-plane
+// This gate shipped known-failing with a note blaming the residency window: it
+// claimed to pass standalone, to fail only in the suite, and to need the window
+// PINNED the way `voxregion` pins it. Every clause of that was wrong, and it is
+// worth writing down why, because the shape of the mistake is the one CLAUDE.md
+// rule 6 is about — the note was a HYPOTHESIS derived from a bare count ("0 of
+// 0 wounded limbs") and nothing had ever been recorded at the point of failure.
 //
-// and all of it is green. Under `--selftest` the residency window has been
-// shifted ~20 chunks by the `streaming` gate (selftest.h's first documented
-// ordering trap) and the fixture does not survive the move intact: the avatar
-// stands and the stroke still tracks its command (pass 0's residual is 2.4
-// voxels on an 11.2 voxel stroke either way), but `mobs.Spawn` comes back with
-// an id whose limbs have no bodies, so E and F have nothing to cut, and the
-// committed flick in A leaves its plane in a way it does not at the unshifted
-// origin. Both are fixture faults rather than stroke faults — pass 0 is the
-// discriminator and it is the one that would move if the control law had
-// regressed. Anchoring to `world.WindowOrigin()` (done), regenerating worldgen
-// on entry (done) and standing the dummies on the player's own ground plane
-// (done) each closed part of the gap and none of them closed all of it; what
-// is left wants the window PINNED for the duration, the way `voxregion` pins
-// it, and that is a bigger change than this gate should make on its way in.
+// It failed in BOTH scopes. Three faults, none of them residency:
+//
+//  1. THE TARGET WALKED OUT FROM UNDER THE BLADE. The dummy is a `human`, and
+//     human.json declares no `behavior`, so MobSystem::DecideIntent falls
+//     through to the LEGACY WANDER — which sets driveScale_ = 1 and only ever
+//     steers when something blocks it. A human's authored speed is 31.5 vox/s,
+//     so eight settling ticks carry it 8.4 voxels downrange: spawned at z 261,
+//     read at z 269.4, with all fifteen limb bodies alive and present the whole
+//     time. The sweep then swept the empty air where it used to be (measured
+//     tip box z 257.5..268.0 against a body that had moved to 269.4), and pass
+//     F's synthetic sweep — whose coordinates are computed from the SPAWN
+//     position — missed by the same 8.4 voxels.
+//
+//     THE FIX IS DATA, not a special case: a training dummy is a BEHAVIOUR
+//     PROFILE (`dummy` in behaviors.json — blind, passive, `mobile: false`), so
+//     the fixture asks for it by name. `Movement::mobile` false is enforced once
+//     at the bottom of ai::Think, which is precisely the guarantee a target
+//     fixture needs and precisely what a def with no profile at all does not
+//     have.
+//
+//  2. THE WINDOW ANCHOR MIXED UNITS. `WindowOrigin()` is in CHUNKS and the old
+//     line added kWorldN/2 VOXELS to it. That is a no-op at the origin (which
+//     is why it looked like a suite-only failure) and off by a factor of kChunk
+//     anywhere else — under the full suite it placed the fixture 44 voxels
+//     outside the window, where PreTick despawns it on tick one. See the note
+//     at the anchor below.
+//
+//  3. PASSES A-C READIED INTO THE AZIMUTH STOP. `swing` block 7 already says
+//     this in as many words about its own fixture: a walk cycle leaves the arm
+//     at roughly 127 degrees of azimuth, half a radian short of `azOut`, so
+//     "fourteen slow ticks of rightward mouse" is a measurement of the CLAMP
+//     and of a shoulder pose-limit the rig cannot serve. The stroke and the
+//     sword then part company and the arc reads as 12.9 voxels out of plane on
+//     a 13.0 voxel radius. The ready is now CLOSED-LOOP on the stroke state
+//     (`readyTo` below) and lands on an authored start pose well inside every
+//     stop, so what the flick measures is the flick.
+//
+// Pass 0 (the tip follows the stroke, 2.39 of 3.92 voxels) passed throughout
+// and was the correct discriminator: the CONTROL LAW was never at fault.
 
 // One tick's reading of the blade, in the frame the assertions are stated in:
 // the tip about the SHOULDER JOINT, which is the centre the stroke is defined
@@ -598,6 +627,30 @@ struct StrokeStats {
   float planarWorst = 0;       // worst out-of-plane distance, world voxels
   Vec3 first{}, last{}, normal{};
   int azBacksteps = 0;
+  // Where the ready actually left the stroke, and whether it converged. A
+  // sweep measured from an unreachable start pose is not a measurement of the
+  // sweep (see fault 3 in the header note), so the start is reported next to
+  // every arc rather than assumed.
+  bool readied = false;
+  float readyAz = 0, readyEl = 0;
+  // THE SAME THREE NUMBERS OFF THE DRIVER'S OWN COMMANDED TIP, so a failure
+  // names its half of the pipeline instead of leaving both suspect. Pass 0
+  // establishes that the rig follows the stroke while merely STEERING; these
+  // establish it (or not) through a COMMITTED cut, where the arc's own bow and
+  // the wrist limit are in play and pass 0 never looks.
+  //
+  // cmd* large + observed* large  -> the stroke itself is not planar (driver)
+  // cmd* small + observed* large  -> the rig cannot reproduce it (rig)
+  float cmdElDev = 0, cmdAzSweep = 0, cmdPlanarWorst = 0, cmdRMax = 0;
+  int cmdAzBacksteps = 0;
+  Vec3 cmdFirst{}, cmdLast{};
+  float residWorst = 0;   // commanded tip -> posed tip, world voxels
+  // ...AND WHY, from the rig's own recorder (Mob::WeaponArmDiag), sampled on
+  // the tick the residual was worst. There are three independent ways for a
+  // weapon pose to come out wrong and they all look the same downstream; this
+  // is the struct that was built to tell them apart, so the gate reads it
+  // instead of guessing (CLAUDE.md rule 6).
+  Mob::WeaponArmDiag worstDiag{};
 };
 
 Status GateSwingPlane(Ctx& c, std::string& detail) {
@@ -613,6 +666,21 @@ Status GateSwingPlane(Ctx& c, std::string& detail) {
   const float diagRatioMax =
       (float)BaselineNumber("swingPlane.diagRatioMax", 4.0);
   const float edgeGainMin = (float)BaselineNumber("swingPlane.edgeGainMin", 1.15);
+  // How far the POSED sword may sit from the COMMANDED tip, as a fraction of
+  // the commanded radius. This is the rig's authored anatomy, not a swing
+  // property: see the note at printCmd. Loose on purpose and paired with an
+  // attribution line - the honest bound is "whatever human.json's shoulder
+  // costs", and tightening it is a RIG change, not a threshold edit.
+  const float rigResidualFrac =
+      (float)BaselineNumber("swingPlane.rigResidualFrac", 0.85);
+  // ...and how much of the commanded ARC the physical sword may lose, radians.
+  // The strict claim; a pipeline that drops the stroke fails here.
+  const float sweepTrackMax =
+      (float)BaselineNumber("swingPlane.sweepTrackMax", 0.35);
+  // cos of the angle between the commanded travel and the travel the sword
+  // actually made. Used where azimuth is the wrong coordinate (the diagonal).
+  const float travelAgreeMin =
+      (float)BaselineNumber("swingPlane.travelAgreeMin", 0.85);
 
   bool ok = true;
   int checks = 0;
@@ -645,6 +713,9 @@ Status GateSwingPlane(Ctx& c, std::string& detail) {
     return Status::Skip;
   }
 
+  // This gate spawns four fixtures, and a mob id seeds id-keyed draws all over
+  // the engine — so it puts the counter back (test/support.h IdCounterScope).
+  IdCounterScope idScope(mobs);
   debris.Reset();
   mobs.Reset();
   // PRISTINE TERRAIN UNDER THE FIXTURE. This gate runs late, after gates that
@@ -659,16 +730,38 @@ Status GateSwingPlane(Ctx& c, std::string& detail) {
   // can be read by eye: +X is the camera's right, +Y up, +Z the way the
   // character faces.
   const Vec3 kR{1, 0, 0}, kU{0, 1, 0}, kF{0, 0, 1};
-  // ANCHORED TO THE RESIDENCY WINDOW, never to an absolute coordinate. This
-  // gate runs LATE in kOrder, after `streaming` has shifted the window ~20
-  // chunks, so a hardcoded (140, 140) is outside it by the time this runs —
-  // which is selftest.h's very first documented ordering trap, and it cost a
-  // full-suite failure that the same gate passed standalone: the dummies
-  // spawned into non-resident space and came back with no limb bodies at all.
+  // ANCHORED TO THE RESIDENCY WINDOW, never to an absolute coordinate, and
+  // ANCHORED IN THE RIGHT UNITS — which is the whole of the bug this gate was
+  // landed known-failing for.
+  //
+  // `World::WindowOrigin()` is in CHUNKS (world.h; `ChunkInWindow` compares it
+  // against a chunk coord). The first version of this line read
+  //
+  //     const int gx = wo.x + kWorldN / 2;          // chunks + VOXELS
+  //
+  // which is a chunk index plus a voxel count. It is accidentally correct at
+  // wo = (0,0,0) and wrong by a factor of kChunk everywhere else: under the
+  // full suite `streaming` has shifted the window ~20 chunks, so the fixture
+  // was placed at voxel 276 while the window covered [320, 832) — 44 voxels
+  // outside it. MobSystem::PreTick then despawns the dummy on its first tick
+  // as out-of-window and the gate reads "0 of 0 wounded limbs", which is
+  // exactly the shape selftest_mob.cpp's AiFixtureCentre note describes and is
+  // NOT a fault in the sweep at all.
+  //
+  // Stated the same way AiFixtureCentre states it, deliberately: chunk centre
+  // first, then convert once. There is no arithmetic here that mixes units.
   const IVec3 wo = world.WindowOrigin();
-  const int gx = wo.x + kWorldN / 2, gz = wo.z + kWorldN / 2;
+  const int gx = (wo.x + (int)kNChunk / 2) * (int)kChunk;
+  const int gz = (wo.z + (int)kNChunk / 2) * (int)kChunk;
   const int gh = World::TerrainHeight(gx, gz, kDefaultSeed);
   uint32_t t = 21000;
+  // ...AND THE WINDOW MUST NOT MOVE UNDER THE FIXTURE while the gate runs.
+  // `voxregion` saves the origin and puts it back so an early return cannot
+  // leave it moved; this gate wants the stronger property, because every
+  // fixture coordinate below was computed from `wo` ONCE and a shift halfway
+  // through would strand them all. `avTick` re-asserts it every tick and the
+  // check at the end of the gate reports if anything moved it.
+  const IVec3 pinnedWindow = wo;
 
   PlayerAvatar avatar;
   avatar.Init(&phys, &world, &debris, c.mats, &mobs);
@@ -707,6 +800,59 @@ Status GateSwingPlane(Ctx& c, std::string& detail) {
     avatar.PostStep();
   };
   for (int i = 0; i < 10; i++) avTick();
+
+  // ---- WHY THE FIXTURE IS NOT THERE, in one line ---------------------------
+  //
+  // "0 of 0 wounded limbs" and "edge-on removed 0 vox" are bare counts
+  // (CLAUDE.md rule 6): they say the dummy lost nothing and name none of the
+  // four reasons it could have. This says which one. A creature that was
+  // DESPAWNED (out of window) reports differently from one that DIED, from one
+  // that WALKED OFF, and from one that is standing exactly where it was put
+  // while the blade goes somewhere else — and the first three are fixture
+  // faults while only the last is a sweep fault.
+  auto fixtureLine = [&](const char* what, uint64_t id) {
+    if (!id || dummyDef < 0) {
+      std::printf("swing-plane fixture %s: SPAWN REFUSED\n", what);
+      return;
+    }
+    int live = 0;
+    const MobDef& fd = mobs.Defs()[dummyDef];
+    for (size_t i = 0; i < fd.limbs.size(); i++)
+      if (mobs.LimbBody(id, (int)i)) live++;
+    const bool present = mobs.MobIdAt(0) == id || mobs.IsAlive(id) ||
+                         mobs.LimbBody(id, 0) != 0;
+    const Vec3 o = mobs.MobOrigin(id);
+    std::printf(
+        "swing-plane fixture %s: id %llu, %s, alive %d, %d/%zu limb bodies, at "
+        "(%.1f,%.1f,%.1f), window chunks (%d,%d,%d) = voxels [%d,%d)\n",
+        what, (unsigned long long)id, present ? "present" : "GONE FROM mobs_",
+        (int)mobs.IsAlive(id), live, fd.limbs.size(), o.x, o.y, o.z,
+        world.WindowOrigin().x, world.WindowOrigin().y, world.WindowOrigin().z,
+        world.WindowOrigin().x * (int)kChunk,
+        world.WindowOrigin().x * (int)kChunk + (int)kWorldN);
+  };
+
+  // ---- A TARGET THAT STAYS WHERE IT IS PUT ---------------------------------
+  //
+  // The one call every fixture spawn in this gate goes through, and the whole
+  // of fault 1 in the header note. `human` has no authored `behavior`, so a
+  // bare Spawn() gets the legacy wander and walks off at 31.5 vox/s. Asking
+  // for the `dummy` PROFILE by name is the data-shaped answer: passive, blind,
+  // `mobile: false`, which ai::Think enforces once at the bottom for every
+  // intent rather than trusting each branch.
+  //
+  // Loud on failure rather than silent: a behaviours.json that lost the
+  // `dummy` profile would otherwise put this gate straight back where it was,
+  // with a target that walks and a sweep blamed for missing it.
+  auto spawnTarget = [&](int wx, int wy, int wz) -> uint64_t {
+    const uint64_t id = mobs.Spawn(dummyDef, {wx, wy, wz});
+    if (!id) return 0;
+    if (!mobs.SetMobBehavior(id, "dummy"))
+      std::printf(
+          "swing-plane: WARNING no \"dummy\" behaviour profile — the target "
+          "will WANDER out of reach and every wound check below is void\n");
+    return id;
+  };
 
   // THE SHOULDER JOINT IN WORLD SPACE, from the live body: the same
   // `xf.pos + rot * anchorLimb` composition the submit path inverts, so this is
@@ -753,21 +899,90 @@ Status GateSwingPlane(Ctx& c, std::string& detail) {
     avTick();
   };
 
-  // Sample a stroke: `ready` slow ticks in one direction (no commit), then
-  // `flick` fast ticks in another, recording the blade through the flick.
-  auto runStroke = [&](float readyX, float readyY, int readyN, float flickX,
+  // ---- BRING THE BLADE TO A STATED START POSE, CLOSED-LOOP -----------------
+  //
+  // Fault 3 of the header note, fixed at the source. An OPEN-LOOP ready ("14
+  // ticks of +14 px") is a bet that the arm's rest pose plus fourteen gains
+  // lands somewhere useful, and it lost: the walk cycle leaves the weapon arm
+  // hanging at ~127 degrees of azimuth, half a radian from `azOut`, so the
+  // ready drove into the stop and the sweep that followed measured the clamp.
+  //
+  // This steers the STROKE STATE (`StrokeAz`/`StrokeEl`, the pure integral of
+  // the input — melee.h) onto an authored target instead. It is the same thing
+  // an NPC attack style's WINDUP segment does, and deliberately so: a ready is
+  // a slow move to a guard, and the only thing that makes it a ready rather
+  // than a cut is that it stays under `commitSpeed`.
+  //
+  // The per-tick step is capped at 18 px on each axis (540 px/s against a 900
+  // px/s commit threshold) so this can never fire a stroke by accident — which
+  // would make everything measured afterwards the follow-through arc instead of
+  // the flick. Returns false if it could not converge, so a rig that cannot
+  // hold the pose says so rather than quietly measuring something else.
+  auto readyTo = [&](float wantAz, float wantEl) -> bool {
+    for (int i = 0; i < 60; i++) {
+      const float dAz = wantAz - melee.StrokeAz();
+      const float dEl = wantEl - melee.StrokeEl();
+      if (std::fabs(dAz) < 0.03f && std::fabs(dEl) < 0.03f) return true;
+      // Screen-DOWN is +dy and LOWERS the point (melee.h aimGainY is positive
+      // and main.cpp feeds raw pixels), so a wanted RISE in elevation is a
+      // negative dy. Getting this backwards is a ready that runs away from its
+      // target for sixty ticks and then reports a stroke from the wrong place.
+      // `melee.tuning`, not a local MeleeTuning: the gain the ready divides by
+      // must be the gain the driver multiplies by, or the loop converges on a
+      // pose nobody asked for. (`t` in this function is the TICK.)
+      float dx = std::clamp(dAz / melee.tuning.aimGainX, -18.0f, 18.0f);
+      float dy = std::clamp(-dEl / melee.tuning.aimGainY, -18.0f, 18.0f);
+      drive(dx, dy, true);
+      if (melee.Phase() == SwingPhase::Slash) return false;   // never, by cap
+    }
+    return std::fabs(wantAz - melee.StrokeAz()) < 0.15f &&
+           std::fabs(wantEl - melee.StrokeEl()) < 0.15f;
+  };
+
+  // Sample a stroke: ready to a stated start pose (no commit), then `flick`
+  // fast ticks in one direction, recording the blade through the flick.
+  auto runStroke = [&](float readyAz, float readyEl, float flickX,
                        float flickY, int flickN) -> StrokeStats {
     StrokeStats s;
     melee.Reset();
     // The click, with a still mouse: take-over, which must move nothing.
     drive(0, 0, true);
-    for (int i = 0; i < readyN; i++) drive(readyX, readyY, true);
-    std::vector<Vec3> path;
+    s.readied = readyTo(readyAz, readyEl);
+    s.readyAz = melee.StrokeAz();
+    s.readyEl = melee.StrokeEl();
+    std::vector<Vec3> path, cmdPath;
+    float cmdAzMin = 1e9f, cmdAzMax = -1e9f, cmdElMin = 1e9f, cmdElMax = -1e9f;
     float prevAz = 0;
     bool havePrev = false;
     for (int i = 0; i < flickN; i++) {
       drive(flickX, flickY, true);
       const BladeRead b = readBlade();
+      // The COMMANDED tip, in exactly the frame the observation is stated in.
+      {
+        const Vec3 w = melee.TipOffset();
+        const float wr = std::max(w.len(), 1e-4f);
+        const float waz = std::atan2(w.x, w.z);
+        const float wel = std::asin(std::clamp(w.y / wr, -1.0f, 1.0f));
+        cmdAzMin = std::min(cmdAzMin, waz);
+        cmdAzMax = std::max(cmdAzMax, waz);
+        cmdElMin = std::min(cmdElMin, wel);
+        cmdElMax = std::max(cmdElMax, wel);
+        s.cmdRMax = std::max(s.cmdRMax, wr);
+        if (cmdPath.empty()) s.cmdFirst = w;
+        s.cmdLast = w;
+        if (!cmdPath.empty()) {
+          const Vec3& pv = cmdPath.back();
+          if (waz > std::atan2(pv.x, pv.z) + 1e-3f) s.cmdAzBacksteps++;
+        }
+        cmdPath.push_back(w);
+        if (b.valid) {
+          const float resid = (b.fromShoulder - w).len();
+          if (resid > s.residWorst) {
+            s.residWorst = resid;
+            s.worstDiag = avatar.WeaponArmDiagnostics();
+          }
+        }
+      }
       if (!b.valid) continue;
       s.n++;
       s.azMin = std::min(s.azMin, b.az);
@@ -794,10 +1009,69 @@ Status GateSwingPlane(Ctx& c, std::string& detail) {
           s.planarWorst = std::max(s.planarWorst, std::fabs(p.dot(s.normal)));
       }
     }
+    if (cmdPath.size() >= 3) {
+      s.cmdAzSweep = cmdAzMax - cmdAzMin;
+      s.cmdElDev = cmdElMax - cmdElMin;
+      Vec3 n = cmdPath.front().cross(cmdPath.back());
+      if (n.len() > 1e-3f) {
+        n = n.normalized();
+        for (const Vec3& p : cmdPath)
+          s.cmdPlanarWorst = std::max(s.cmdPlanarWorst, std::fabs(p.dot(n)));
+      }
+    }
     // Release and let the arm be handed back, so the next stroke starts from a
     // rest pose rather than from the last one's follow-through.
     for (int i = 0; i < 20; i++) drive(0, 0, false);
     return s;
+  };
+
+  // ---- WHOSE FAULT, AS ASSERTIONS AND NOT ONLY AS A PRINTOUT --------------
+  //
+  // The shape claims used to be stated ONLY on the posed sword, and that
+  // conflated two independent properties that fail for unrelated reasons:
+  //
+  //   * IS THE STROKE A SWEEP? - a property of the control law, and the thing
+  //     this feature was rewritten twice to get right. Stated on the COMMANDED
+  //     arc, which is what the driver produced.
+  //   * CAN THIS BODY MAKE IT? - a property of human.json's authored joint
+  //     limits. `swingPlane.rigResidualFrac` bounds it and the arm diagnostic
+  //     line names which limit spent it.
+  //
+  // Measured, and the reason for the split: pass A's commanded arc is planar to
+  // 1.09 voxels while the posed sword is 8.83 off it, ENTIRELY because the
+  // right shoulder's authored reach (`max: 30` degrees past the midline) clamps
+  // 0.93 rad out of the last third of a committed horizontal cut. One number
+  // reported both, so the gate said "the swing wanders" about a swing that does
+  // not - and a real bug found underneath it (the hinge-angle wrap, anim.h
+  // AnimHingeAngleAbout) moved that number from 12.91 to 8.83 without ever
+  // being visible as the separate thing it was.
+  //
+  // A tighter posed-sword claim survives at each pass and is the one that
+  // matters: the ARC the physical sword covers must track the commanded one
+  // (`sweepTrackMax`). A rig that dropped the stroke on the floor would fail
+  // that however planar its own path happened to be.
+  auto printCmd = [&](const char* which, const StrokeStats& s) {
+    check(s.cmdRMax > 1e-3f && s.cmdPlanarWorst < planarMaxFrac * s.cmdRMax,
+          "the STROKE the driver commanded is planar");
+    check(s.cmdAzBacksteps <= 3,
+          "...and runs one way through the target rather than reversing");
+    check(s.cmdRMax > 1e-3f && s.residWorst < rigResidualFrac * s.cmdRMax,
+          "...and the RIG serves it within its authored joint limits (if this "
+          "fails, read the arm line below: ikMiss = cannot reach, wrist = the "
+          "wrist limit, shoulder/elbow = a pose limit clamped it)");
+    std::printf(
+        "swing-plane %s (commanded): az sweep %.2f, el drift %.2f, "
+        "out-of-plane %.2f of r %.2f, %d backsteps; worst commanded->posed "
+        "residual %.2f vox (max %.2f)\n",
+        which, s.cmdAzSweep, s.cmdElDev, s.cmdPlanarWorst, s.cmdRMax,
+        s.cmdAzBacksteps, s.residWorst, rigResidualFrac * s.cmdRMax);
+    const Mob::WeaponArmDiag& d = s.worstDiag;
+    std::printf(
+        "swing-plane %s (arm at worst): ikMiss %.2f vox, wrist %.2f/%.2f rad, "
+        "clamp %.2f rad (%.2f vox), shoulder %.2f, elbow %.2f, roundTrip "
+        "%.2f\n",
+        which, d.ikMiss, d.wristApplied, d.wristWant, d.clampMove,
+        d.clampShift, d.shoulderClamp, d.elbowClamp, d.roundTrip);
   };
 
   // ---- 0. DOES THE RIG DO WHAT IT IS TOLD? --------------------------------
@@ -849,44 +1123,69 @@ Status GateSwingPlane(Ctx& c, std::string& detail) {
   // THE OWNER'S ACCEPTANCE CRITERION: "moving mouse right to left will swing
   // the sword right to left horizontally".
   {
-    const StrokeStats s = runStroke(14.0f, 0.0f, 14, -34.0f, 0.0f, 16);
+    // READIED WELL OUT TO THE WEAPON SIDE AND LEVEL, and the number is chosen
+    // by the SHOULDER'S authored reach rather than by taste. human.json bounds
+    // the right upper arm to 30 degrees past the midline
+    // (`poseLimit.reach normal [1,0,0] max 30`), and a committed cut carries
+    // ~2.0 rad of arc on its own (`MeleeTuning::swingArc`) whatever the mouse
+    // does afterwards. So the last third of any committed horizontal cut is
+    // spent ON that stop: the ball limit clamps the shoulder by ~0.93 rad and
+    // drags the posed sword out of the plane the driver commanded (measured:
+    // commanded arc planar to 1.09 vox, posed 8.83 at r 13.0). Starting further
+    // OUT does not help — it buys a longer arc that ends in the same place, and
+    // measured worse (10.58). That deviation is the ANATOMY, and the checks
+    // below are split so it is reported as anatomy instead of as a swing bug.
+    const StrokeStats s = runStroke(1.15f, 0.05f, -34.0f, 0.0f, 16);
     const float azSweep = s.azMax - s.azMin;
     const float elDev = s.elMax - s.elMin;
+    check(s.readied, "the ready reached its start pose without committing");
     check(s.n > 8, "the blade was readable through the horizontal flick");
     check(azSweep > azSweepMin,
           "a right-to-left flick sweeps the TIP through a real arc of azimuth");
     check(elDev < elDevMax, "...and holds its height while it does");
     check(s.rMax > 1e-3f && s.minFwd > frontMinFrac * s.rMax,
           "...and the whole arc passes in front of the chest");
-    check(s.rMax > 1e-3f && s.planarWorst < planarMaxFrac * s.rMax,
-          "...in ONE plane, rather than wandering out of it");
-    check(s.azBacksteps <= 3, "...and it runs one way through the target");
+    // THE PHYSICAL SWORD COVERED THE ARC IT WAS TOLD TO. Planarity and
+    // reversal now belong to the commanded stroke (see printCmd); this is the
+    // posed-sword claim that survives, and it is the strict one - a pipeline
+    // that ate a third of the sweep fails here at 0.35 rad of slack.
+    check(std::fabs(azSweep - s.cmdAzSweep) < sweepTrackMax,
+          "the SWORD sweeps the arc the stroke asked for");
+    RecordObserved("swingPlane.planarPosedObserved", s.planarWorst);
+    RecordObserved("swingPlane.rigResidualObserved", s.residWorst);
     RecordObserved("swingPlane.azSweepObserved", azSweep);
     RecordObserved("swingPlane.elDevObserved", elDev);
     std::printf(
         "swing-plane A (horizontal): az sweep %.2f rad (min %.2f), el drift "
-        "%.2f (max %.2f), min forward %.2f of r %.2f, out-of-plane %.2f\n",
-        azSweep, azSweepMin, elDev, elDevMax, s.minFwd, s.rMax, s.planarWorst);
+        "%.2f (max %.2f), min forward %.2f of r %.2f, out-of-plane %.2f (max "
+        "%.2f), %d backsteps\n",
+        azSweep, azSweepMin, elDev, elDevMax, s.minFwd, s.rMax, s.planarWorst,
+        planarMaxFrac * s.rMax, s.azBacksteps);
+    printCmd("A", s);
   }
 
   // ---- B. an overhead flick is a vertical sweep ---------------------------
   {
-    const StrokeStats s = runStroke(0.0f, -12.0f, 14, 30.0f * 0.0f + 0.0f,
-                                    34.0f, 16);
+    // Readied to a raised guard straight ahead, then driven DOWN: an overhead
+    // cut is a fall, and starting it from a hanging arm (which is what the old
+    // open-loop ready did) leaves nowhere to fall from.
+    const StrokeStats s = runStroke(0.0f, 0.90f, 0.0f, 34.0f, 16);
     const float elSweep = s.elMax - s.elMin;
     const float azDev = s.azMax - s.azMin;
+    check(s.readied, "the ready reached its start pose without committing");
     check(s.n > 8, "the blade was readable through the vertical flick");
     check(elSweep > elSweepMin,
           "an overhead flick sweeps the TIP through a real arc of elevation");
     check(azDev < azDevMax, "...and holds its bearing while it does");
-    check(s.rMax > 1e-3f && s.planarWorst < planarMaxFrac * s.rMax,
-          "...in ONE plane");
+    check(std::fabs(elSweep - s.cmdElDev) < sweepTrackMax,
+          "the SWORD sweeps the elevation arc the stroke asked for");
     RecordObserved("swingPlane.elSweepObserved", elSweep);
     RecordObserved("swingPlane.azDevObserved", azDev);
     std::printf(
         "swing-plane B (vertical): el sweep %.2f rad (min %.2f), az drift %.2f "
         "(max %.2f), out-of-plane %.2f of r %.2f\n",
         elSweep, elSweepMin, azDev, azDevMax, s.planarWorst, s.rMax);
+    printCmd("B", s);
   }
 
   // ---- C. a diagonal flick is a diagonal cut ------------------------------
@@ -898,7 +1197,9 @@ Status GateSwingPlane(Ctx& c, std::string& detail) {
   // ambiguous — top-right to bottom-left goes left AND down, in comparable
   // measure — and it is the thing the player asked for.
   {
-    const StrokeStats s = runStroke(11.0f, -11.0f, 14, -26.0f, 26.0f, 16);
+    // Readied high and to the weapon side; the flick then goes left AND down.
+    const StrokeStats s = runStroke(1.00f, 0.80f, -26.0f, 26.0f, 16);
+    check(s.readied, "the ready reached its start pose without committing");
     const float dAz = s.last.x - s.first.x;   // world x: leftward is negative
     const float dEl = s.last.y - s.first.y;   // world y: downward is negative
     const float ratio = std::fabs(dAz) > 1e-4f && std::fabs(dEl) > 1e-4f
@@ -910,13 +1211,30 @@ Status GateSwingPlane(Ctx& c, std::string& detail) {
     check(ratio < diagRatioMax,
           "...in comparable measure, i.e. genuinely diagonal rather than a "
           "horizontal or vertical cut with a wobble");
-    check(s.rMax > 1e-3f && s.planarWorst < planarMaxFrac * s.rMax,
-          "...and still in ONE plane");
+    // TRACKED ON THE TRAVEL, not on azimuth. A and B each have one dominant
+    // angular axis and azimuth/elevation are the natural coordinates for them;
+    // a steep diagonal has neither, and azimuth is ill-conditioned wherever the
+    // point passes near the vertical — a sweep that tracks its command
+    // perfectly can then report a wildly different azimuth range for reasons
+    // that are pure spherical coordinates. The travel vector has no such
+    // degeneracy and is the thing the player asked for anyway.
+    const Vec3 cmdTravel = s.cmdLast - s.cmdFirst;
+    const Vec3 gotTravel = s.last - s.first;
+    const float travelAgree =
+        cmdTravel.len() > 1e-3f && gotTravel.len() > 1e-3f
+            ? cmdTravel.normalized().dot(gotTravel.normalized())
+            : -1.0f;
+    check(travelAgree > travelAgreeMin,
+          "...and the SWORD travels the way the stroke asked it to");
+    RecordObserved("swingPlane.diagTravelAgreeObserved", travelAgree);
     RecordObserved("swingPlane.diagRatioObserved", ratio);
     std::printf(
-        "swing-plane C (diagonal): travel (%.2f, %.2f) vox, ratio %.2f (max "
-        "%.2f), out-of-plane %.2f of r %.2f\n",
-        dAz, dEl, ratio, diagRatioMax, s.planarWorst, s.rMax);
+        "swing-plane C (diagonal): ready (%.2f, %.2f); travel (%.2f, %.2f) "
+        "vox, ratio %.2f (max %.2f), out-of-plane %.2f of r %.2f, travel "
+        "agreement %.3f (min %.2f)\n",
+        s.readyAz, s.readyEl, dAz, dEl, ratio, diagRatioMax, s.planarWorst,
+        s.rMax, travelAgree, travelAgreeMin);
+    printCmd("C", s);
   }
 
   // ---- D. steering is monotone --------------------------------------------
@@ -984,15 +1302,15 @@ Status GateSwingPlane(Ctx& c, std::string& detail) {
     // (no limb bodies at all) or standing where the blade cannot reach; the
     // avatar and its target want the same floor.
     const int dh = gh;
-    // RESET FIRST, exactly as pass F does. Without it the spawn returns a live
-    // id whose limbs have no bodies — the same call, the same place, the same
-    // eight settling ticks, and pass F's copy worked while this one read every
-    // limb as gone. Reproducing F's preamble is cheaper than explaining the
-    // difference, and a gate that spawns a fixture should be clearing the
-    // system it spawns into anyway.
+    // RESET FIRST, exactly as pass F does: a gate that spawns a fixture should
+    // be clearing the system it spawns into. (The comment that used to be here
+    // blamed this reset for pass F "working" while E read every limb as gone.
+    // It did no such thing — both were reading a target that had WALKED, and
+    // the difference was only that E measured eight ticks later. See fault 1
+    // in the header note.)
     mobs.Reset();
     debris.Reset();
-    const uint64_t tid = mobs.Spawn(dummyDef, {dx, dh + 2, dz});
+    const uint64_t tid = spawnTarget(dx, dh + 2, dz);
     // A SECOND BODY, PAST THE BLADE'S REACH. This is what carries "and not the
     // far side": a per-limb near/far split on ONE body cannot, because a
     // committed cut with this sword severs, and severing a torso drops
@@ -1004,11 +1322,14 @@ Status GateSwingPlane(Ctx& c, std::string& detail) {
     // the swing is aimed at it.
     const int fz = gz + 17;
     const int fh = gh;
-    const uint64_t farId = mobs.Spawn(dummyDef, {dx, fh + 2, fz});
+    const uint64_t farId = spawnTarget(dx, fh + 2, fz);
     if (!tid) {
       std::printf("swing-plane E: SKIP (dummy spawn failed)\n");
     } else {
+      fixtureLine("E near (fresh)", tid);
       for (int i = 0; i < 8; i++) avTick();
+      fixtureLine("E near (settled)", tid);
+      fixtureLine("E far  (settled)", farId);
       std::vector<uint32_t> before(dd.limbs.size(), 0), farBeforeV(dd.limbs.size(), 0);
       std::vector<Vec3> beforeWhere(dd.limbs.size());
       std::vector<float> beforePos(dd.limbs.size(), 1e9f);
@@ -1035,8 +1356,11 @@ Status GateSwingPlane(Ctx& c, std::string& detail) {
       // The ready ALSO brings the point up to chest height: the walk cycle
       // leaves the arm hanging at about -30 degrees of elevation, and a
       // purely horizontal ready keeps it there — six voxels under a target
-      // whose chest is what a cut is aimed at.
-      for (int i = 0; i < 14; i++) drive(14.0f, 0.0f, true);
+      // whose chest is what a cut is aimed at. Closed-loop, for the reason
+      // `readyTo` exists: an open-loop version of this line parked the blade
+      // on the azimuth stop.
+      const bool eReady = readyTo(1.15f, 0.15f);
+      check(eReady, "the cut's ready reached its start pose");
       std::vector<Vec3> tipPath, basePath;
       BladeRead prev = readBlade();
       int sweptTicks = 0;
@@ -1160,9 +1484,10 @@ Status GateSwingPlane(Ctx& c, std::string& detail) {
       mobs.Reset();
       const int dx = gx, dz = gz + 5;
       const int dh = gh;
-      const uint64_t tid = mobs.Spawn(dummyDef, {dx, dh + 2, dz});
+      const uint64_t tid = spawnTarget(dx, dh + 2, dz);
       if (!tid) return 0;
       for (int i = 0; i < 8; i++) avTick();
+      fixtureLine(edgeOn ? "F edge-on" : "F flat-on", tid);
       uint32_t total0 = 0;
       for (size_t i = 0; i < dd.limbs.size(); i++)
         if (mobs.LimbBody(tid, (int)i))
@@ -1246,6 +1571,16 @@ Status GateSwingPlane(Ctx& c, std::string& detail) {
         "%.2f vs %.2f (floor %.2f)\n",
         lostEdge, lostFlat, alignEdge, alignFlat, melee.tuning.edgeFloor);
   }
+
+  // THE WINDOW DID NOT MOVE UNDER THE FIXTURE. Every coordinate in this gate
+  // was computed from `wo` once, at the top; a shift halfway through would
+  // strand all of them at once and the failures would name the sweep. Nothing
+  // in the tick path here streams, so this is a claim rather than a repair —
+  // but it is the claim the old known-failing note guessed at and never made.
+  check(world.WindowOrigin().x == pinnedWindow.x &&
+            world.WindowOrigin().y == pinnedWindow.y &&
+            world.WindowOrigin().z == pinnedWindow.z,
+        "the residency window stayed where the fixture was anchored to it");
 
   // LEAVE THE WORLD AS THIS GATE FOUND IT (CLAUDE.md rule 7). It stands an
   // avatar on real terrain, spawns bodies and carves them; the gates after it

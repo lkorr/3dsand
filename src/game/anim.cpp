@@ -595,7 +595,12 @@ Quat ClampTwist(const Quat& q, Vec3 axis, float lo, float hi) {
 // The signed rotation of `q` about `axis`, ignoring everything else. Same
 // projection ClampTwist uses; split out because the hinge below wants the ANGLE
 // and then throws the rest of `q` away rather than putting it back.
-bool TwistAngleAbout(const Quat& q, Vec3 axis, float* out) {
+//
+// THE BODY OF THE PUBLIC AnimHingeAngleAbout (below the namespace), because
+// `Mob::ApplyWeaponArm` asks the same question about the same joint one stage
+// earlier and the two used to be independent copies that disagreed about the
+// WRAP — see anim.h for what that cost.
+bool TwistAngleAboutImpl(const Quat& q, Vec3 axis, float* out) {
   const Vec3 v{q.x, q.y, q.z};
   const float d = v.dot(axis);
   Quat t{axis.x * d, axis.y * d, axis.z * d, q.w};
@@ -618,7 +623,7 @@ Quat ClampHinge(const Quat& q, Vec3 axis, float lo, float hi) {
   // Snapping such a pose to the nearest stop would be inventing a number, so
   // the nearest legal HINGE is the one the joint is already closest to, and
   // with no angle to read that is the rest end of the range.
-  if (!TwistAngleAbout(q, axis, &ang)) ang = 0.0f;
+  if (!AnimHingeAngleAbout(q, axis, &ang)) ang = 0.0f;
   return QuatAxisAngle(axis, std::clamp(ang, lo, hi));
 }
 
@@ -683,6 +688,11 @@ Quat ClampBall(const Quat& q, const PoseBallLimit& lim) {
 }
 
 }  // namespace
+
+// See anim.h: the ONE place a hinge's bend angle is measured.
+bool AnimHingeAngleAbout(const Quat& q, const Vec3& axis, float* out) {
+  return TwistAngleAboutImpl(q, axis, out);
+}
 
 void AnimClampPoseLimits(const AnimSkeleton& sk, AnimState& st,
                          const PoseAxisOverride* overrides, int overrideCount) {

@@ -225,29 +225,8 @@ uint64_t SpawnTarget(Ctx& c, const Target& t, int inset, IVec3& outChunk) {
   return id;
 }
 
-// LEAVE THE SUITE'S RANDOMNESS AS WE FOUND IT.
-//
-// These gates spawn a lot of creatures — ChooseTarget tries every def, and each
-// gate stands up its own fixture — and a mob id seeds id-keyed draws all over
-// the engine (gore profile, crater noise, the burn/dissolve RNG key). Gates
-// share one MobSystem, so spawning here re-rolls every gate after us.
-//
-// It is not hypothetical: the first full run with these four in kOrder failed
-// `armor-react`, whose acid bath found the BARE arm losing 0 skin voxels in 120
-// ticks where it had lost 18. Nothing about acid, armour or occlusion had
-// changed — the creature simply had a different id and therefore a different
-// draw. That gate's own comment already records the same numbers swinging by an
-// order of magnitude between `--gate` and `--suite` scope for the same reason.
-//
-// Restoring the counter is the honest fix. MobSystem::Reset(rewindIds=true) is
-// not: setting it to 1 is a different perturbation rather than no perturbation,
-// and mob.cpp records a gate that moved when somebody tried exactly that.
-struct IdCounterScope {
-  MobSystem& sys;
-  uint64_t saved;
-  explicit IdCounterScope(MobSystem& s) : sys(s), saved(s.NextIdCounter()) {}
-  ~IdCounterScope() { sys.SetNextIdCounter(saved); }
-};
+// The id-counter guard these four gates open with is shared: test/support.h
+// IdCounterScope, with the whole argument for why it exists written there.
 
 // Pristine terrain under the fixtures.
 //

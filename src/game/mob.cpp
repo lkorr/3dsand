@@ -7328,18 +7328,28 @@ void Mob::ApplyWeaponArm(const AnimSkeleton& sk, AnimState& st,
         // relative to the authored one and matching would choose the wrong half
         // every time. (Measured as `clampRot 1.23 shift 2.88`, on exactly the
         // ticks where the stroke crossed the arm's own line.)
+        //
+        // MEASURED WITH THE CLAMP'S OWN FUNCTION, and that is the whole of the
+        // fix. This block used to carry its own copy of the projection, and the
+        // copy did not WRAP the angle into (-pi, pi] the way AnimClampPoseLimits'
+        // does. A forearm whose delta-from-rest landed in the far hemisphere
+        // then read as +4.89 rad here (positive: keep the axis) and as -1.39 rad
+        // there (below the elbow's authored min of 0: clamp it straight), so the
+        // clamp threw away 1.39 rad of a perfectly good solve on exactly the
+        // ticks a committed horizontal cut passed through its own arm's line.
+        //
+        // The symptom was entirely somewhere else: `swing-plane` A measured the
+        // driver's arc as planar to 1.09 voxels and the posed sword as 10.58
+        // voxels off it, 1.52 rad out of level — "the swing wanders". One
+        // shared function, one wrap, both readings agree.
         {
           const Quat delta =
               QuatNormalize(QuatMul(QuatConj(fore.rest.rot),
                                     QuatMul(QuatConj(st.model[forePar].rot),
                                             st.model[i1].rot)));
-          const Vec3 v{delta.x, delta.y, delta.z};
-          const float d = v.dot(axis);
-          const float mag = std::sqrt(d * d + delta.w * delta.w);
-          if (mag > 1e-5f) {
-            const float ang = 2.0f * std::atan2(d / mag, delta.w / mag);
-            if (ang < 0.0f) axis = axis * -1.0f;
-          }
+          float ang = 0;
+          if (AnimHingeAngleAbout(delta, axis, &ang) && ang < 0.0f)
+            axis = axis * -1.0f;
         }
         ov.part = i1;
         ov.axis = axis;
