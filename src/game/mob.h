@@ -5,6 +5,7 @@
 #include <string>
 #include <vector>
 
+#include "game/ai_behavior.h"
 #include "game/anim.h"
 #include "math3d.h"
 #include "phys/debris.h"
@@ -200,6 +201,13 @@ struct MobDef {
   // one creature borrowing another's voice is always wrong. Presentation only;
   // an unknown set name is a diagnostic, never a load failure.
   std::map<std::string, std::string> sounds;
+  // Optional AI profile name from the sidecar's "behavior" key, resolved
+  // against assets/mobs/behaviors.json AT SPAWN rather than at load — the
+  // behaviour library hot-reloads on its own (R), and a def holding an INDEX
+  // into it would rot the moment a profile was added above it. By name, like
+  // every other cross-asset reference in this engine (CLAUDE.md design rule 4).
+  // Empty = no AI: the creature keeps the legacy wander-and-avoid.
+  std::string behavior;
 
   const std::string& Sound(const char* slot) const {
     static const std::string kNone;
@@ -600,8 +608,21 @@ class Mob {
   float heading_ = 0;
   float desiredHeading_ = 0;
   float turnVel_ = 0;
+  // Local drive velocity, as multipliers on def.speed in the mob's OWN frame:
+  // `driveScale_` forward (now SIGNED — a back-pedal is not a rout), and
+  // `driveStrafe_` to the mob's right. The lateral term is what makes footwork
+  // possible at all: a duelist that has to turn its back to give ground reads
+  // as fleeing, and circling a target while facing it is pure strafe.
+  //
+  // This does NOT weaken the steering invariant. Steer remains the only writer
+  // of `heading_`; these two only change which direction the body translates
+  // RELATIVE to that heading, which is the drive stage's own job.
   float driveScale_ = 1.0f;
+  float driveStrafe_ = 0.0f;
   uint32_t blockedTicks_ = 0;
+  // The behaviour layer's per-creature memory (game/ai_behavior.h). Pure
+  // gameplay state: never hashed, never saved, rebuilt from the def on spawn.
+  ai::Brain ai_;
   float phase_ = 0;            // walk cycle (legacy swing fallback)
   uint32_t lastTurnTick_ = 0;
 
@@ -681,6 +702,45 @@ class MobSystem {
   void SetDefs(std::vector<MobDef> defs);           // hot reload
   const std::vector<MobDef>& Defs() const { return defs_; }
   void Reset();                                      // world regen
+
+  // ---- NPC behaviour (game/ai_behavior.h) ---------------------------------
+  // The profile library, hot-reloaded from assets/mobs/behaviors.json on R.
+  // Setting it re-resolves every LIVE mob's profile by name, so an edit is
+  // visible on the creatures already standing there rather than only on the
+  // next ones spawned (the same contract RefreshGoreProfiles has).
+  void SetBehaviors(ai::Library lib);
+  const ai::Library& Behaviors() const { return behaviors_; }
+  // Mutable, for the dev panel's live sliders: they write THROUGH to the
+  // in-memory profile so every mob on it updates at once. There is deliberately
+  // no per-mob override — "this one duelist is braver" is variance, and this
+  // engine already has a place for that (DESIGN.md, per-instance tuning).
+  ai::Library& BehaviorsMut() { return behaviors_; }
+  // Switch one live creature's profile by name ("" clears it back to the legacy
+  // wander). Returns false if the mob or the profile does not exist.
+  bool SetMobBehavior(uint64_t mobId, const std::string& name);
+  // The behaviour layer's live state for one creature, or null. The dev panel
+  // and the debug viz read the whole Brain rather than a dozen accessors —
+  // it IS the introspection surface, and every field on it is already
+  // presentation state.
+  const ai::Brain* MobBrain(uint64_t mobId) const;
+
+  // WHO THE MOBS ARE FIGHTING. Pushed in once per tick by the frame loop with
+  // the player's capsule; the selftest pushes a scripted point instead, which
+  // is why this is a real seam and not a test hook. Mob-vs-mob targeting needs
+  // no further API: PreTick already adds every live mob to the same actor list,
+  // so two factions fight the moment two profiles disagree about `faction`.
+  void SetPlayerActor(Vec3 centreVox, float radius, float height, bool alive);
+  void ClearPlayerActor() { playerActorValid_ = false; }
+
+  // ---- the attack seam (Phase C consumes this) ----------------------------
+  // Requests issued this tick. The AI decides WHEN and WHERE; it never swings,
+  // plays a clip, or deals damage. Drained by the consumer exactly as
+  // SeverEvents/VoiceEvents are, and bounded by construction: at most one per
+  // mob per tick, kMaxMobs mobs, and the attack cadence is ticks apart.
+  const std::vector<ai::AttackRequest>& AttackRequests() const {
+    return attacks_;
+  }
+  void ClearAttackRequests() { attacks_.clear(); }
 
   // Spawn def at a world cell (mob min corner; caller picks ground). 0 = fail.
   uint64_t Spawn(int defIndex, IVec3 atVoxel);
@@ -1084,6 +1144,15 @@ class MobSystem {
   uint32_t dayPhase_ = 0;
   std::vector<MobDef> defs_;
   std::vector<Mob> mobs_;
+  // ---- behaviour layer ------------------------------------------------------
+  ai::Library behaviors_;
+  // Rebuilt at the top of every PreTick from the player actor plus every live
+  // mob. Cheap (kMaxMobs + 1 entries) and it is what makes target selection a
+  // scan over "things" rather than a special case for the player.
+  std::vector<ai::Actor> actors_;
+  ai::Actor playerActor_;
+  bool playerActorValid_ = false;
+  std::vector<ai::AttackRequest> attacks_;
   uint64_t nextId_ = 1;
   bool instancesDirty_ = false;
   // Particles authored outside PreTick — Sever() is reached from damage

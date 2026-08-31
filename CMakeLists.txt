@@ -333,6 +333,10 @@ add_executable(sandvox
   src/game/brush.cpp
   src/game/prefab.cpp
   src/game/mob.cpp
+  # NPC AI: the utility arbiter over named intents (behaviors.json is its
+  # content) and the local combat navigator it steers with.
+  src/game/ai_behavior.cpp
+  src/game/ai_nav.cpp
   src/game/bodyreg.cpp
   src/game/persist.cpp
   src/game/anim.cpp
