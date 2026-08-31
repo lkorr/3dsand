@@ -545,6 +545,18 @@ bool Think(Brain& brain, const Library& lib, const SelfView& self,
   }
   const float slack = std::max(0.25f, pr.movement.bandSlack);
 
+  // ARRIVAL CLAMP. Never ask for more speed than closes the remaining error in
+  // one tick. Without this the band is a property of the creature's STRIDE
+  // rather than of its profile: mina walks 60 voxels a second, which is two
+  // voxels per tick, and a 4-voxel band authored for a sword fight would be
+  // crossed and re-crossed forever by a mob that can only ever be on one side
+  // of it. Expressed as a fraction of full speed so it composes with the
+  // authored approach/retreat factors instead of replacing them.
+  const float perTick = std::max(1e-3f, self.speed * std::max(dt, 1e-4f));
+  auto arrive = [&](float remaining) {
+    return std::clamp(std::abs(remaining) / perTick, 0.0f, 1.0f);
+  };
+
   // ---- the attack clock ---------------------------------------------------
   // Cadence plus a per-attack hash-RNG jitter. The jitter is the difference
   // between a duelist and a metronome, and it is drawn from (id, tick) so a
@@ -652,19 +664,25 @@ bool Think(Brain& brain, const Library& lib, const SelfView& self,
       const Vec3 wp = SteerPoint(brain);
       out.desiredHeading = Deflect(BearingTo(self.Foot(), wp), self.heading, ground);
       out.driveScale = sp * pr.movement.approachSpeed;
+      // Only ease off when walking straight AT the target — a waypoint is not
+      // the goal, and slowing into every corner of a path is a shuffle.
+      if (brain.path.Done())
+        out.driveScale = std::min(out.driveScale, sp * arrive(bandErr));
       break;
     }
 
     case Intent::HoldRange: {
       out.desiredHeading = bearing;   // never turn your back to give ground
       if (bandErr < 0) {
-        out.driveScale = -sp * pr.movement.retreatSpeed;
+        out.driveScale =
+            -sp * std::min(pr.movement.retreatSpeed, arrive(bandErr));
       } else if (bandErr > 0) {
         // Small closing correction. Deliberately NOT routed through the
         // navigator: inside a couple of voxels of the band there is nothing to
         // route around, and replanning here would cost a search per tick for a
         // step the mob takes anyway.
-        out.driveScale = sp * pr.movement.approachSpeed * 0.55f;
+        out.driveScale =
+            sp * std::min(pr.movement.approachSpeed * 0.55f, arrive(bandErr));
         const int p = ProbeFor(bearing, self.heading);
         if (ground.haveGround && !ground.clear[p]) out.driveScale = 0;
       }
@@ -681,11 +699,24 @@ bool Think(Brain& brain, const Library& lib, const SelfView& self,
         brain.circleUntil = tick + std::max(6u, pr.movement.circleHoldTicks);
       }
       out.desiredHeading = bearing;
-      out.driveStrafe = sp * pr.movement.strafeSpeed * (float)brain.circleSign;
+      // TANGENTIAL SPEED IS BOUNDED BY THE NECK, not by the legs. See
+      // SelfView::turnRate: v/r is the angular rate an orbit demands, and a
+      // body that cannot turn that fast orbits with its target off to one side
+      // for the whole circle. 0.7 of the cap, not 1.0, because Steer has to
+      // spend some of its rate ARRIVING at the bearing rather than only
+      // tracking it, and because the target moves too.
+      const float orbitR = std::max(1.0f, d);
+      const float maxTangential = self.turnRate * 0.7f * orbitR;
+      const float strafeCap =
+          std::min(pr.movement.strafeSpeed, maxTangential / std::max(1.0f, self.speed));
+      out.driveStrafe = sp * strafeCap * (float)brain.circleSign;
       // Hold the radius while orbiting: a pure tangential step walks a polygon
       // outward, and the band would be lost within a couple of seconds.
       const float mid = (lo + hi) * 0.5f;
-      if (hi > 0) out.driveScale = std::clamp((d - mid) * 0.12f, -0.35f, 0.35f) * sp;
+      if (hi > 0) {
+        const float cap = std::min(0.35f, arrive(d - mid));
+        out.driveScale = std::clamp((d - mid) * 0.12f, -cap, cap) * sp;
+      }
       // Refuse to strafe into a wall we can already feel; the fan index for
       // +-90 degrees in the mob's own frame is 2 and 6.
       const int sp2 = out.driveStrafe > 0 ? 2 : 6;

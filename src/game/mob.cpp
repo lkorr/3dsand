@@ -1548,6 +1548,11 @@ void MobSystem::DecideIntent(Mob& mob, const MobDef& def,
     self.size = def.worldSize;
     self.heading = mob.heading_;
     self.speed = def.speed;
+    // The MOVING rate, not the standing one: the behaviour layer uses it to
+    // bound a circle-strafe, and a creature is by definition moving while it
+    // circles (Steer couples turn rate to speed by turnRateMoving).
+    self.turnRate = mob.skel_.loco.turnRate *
+                    std::max(0.05f, mob.skel_.loco.turnRateMoving);
     const ai::Profile* prof = behaviors_.At(mob.ai_.profile);
     self.faction = prof != nullptr ? ai::FactionId(prof->faction) : 0u;
 

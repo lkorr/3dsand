@@ -86,6 +86,12 @@ const char* const kOrder[] = {
     // pours real acid at absolute coordinates, and it regenerates the world on
     // the way out so the gates after it still find pristine terrain (rule 7).
     "mob-burn",
+    // NPC AI. After mob-burn because both want pristine terrain to place a
+    // fixture on and mob-burn regenerates on its way out; before voxregion
+    // because ai-approach writes a real stone wall and regenerates too, and
+    // stacking two world-restoring gates next to each other keeps the "who
+    // left the world like this" question answerable (CLAUDE.md rule 7).
+    "ai-dummy", "ai-face", "ai-approach",
     // LAST of the world-touching gates, and it must be: BuildVoxRegion moves
     // the residency window and resets the page table, which is the state every
     // other gate's fixture placement assumes. It restores both before it

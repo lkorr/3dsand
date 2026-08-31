@@ -296,6 +296,15 @@ struct SelfView {
   Vec3 size{};          // worldSize
   float heading = 0;
   float speed = 4.0f;   // def.speed, world voxels/sec
+  // The yaw rate this body can actually sustain WHILE MOVING (rad/s), from its
+  // rig's LocomotionDef. The behaviour layer needs it for one thing and it is
+  // not cosmetic: an orbit of radius r walked at v induces an angular rate v/r,
+  // and a creature whose neck cannot follow that spends the whole circle
+  // looking behind itself — it never gets its nose on the target, so it never
+  // attacks, and its drive is scaled down by an alignment it can never reach.
+  // Measured: mina circling at the authored 0.5 x 60 vox/s needed 3.3 rad/s
+  // against a 2.8 rad/s cap and issued ZERO attacks in 240 ticks of holding.
+  float turnRate = 3.6f;
   uint32_t faction = 0;
   Vec3 Centre() const {
     return Vec3{origin.x + size.x * 0.5f, origin.y + size.y * 0.5f,

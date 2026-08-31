@@ -2202,12 +2202,502 @@ Status GateMobBurn(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ============================================================================
+// NPC AI gates (game/ai_behavior.h, game/ai_nav.h)
+//
+// WHAT THESE ASSERT, AND WHY EACH IS THE ASSERTION IT IS.
+//
+// The AI is a utility arbiter that writes a desired heading and a local drive
+// vector. Almost every wrong implementation of that still produces a mob that
+// "moves toward the player and turns", so "it got closer" and "its heading
+// changed" are worthless claims — the same trap the steering gate documents.
+// What is actually falsifiable:
+//
+//   ai-dummy    A profile that authorizes nothing must produce EXACTLY zero
+//               motion and EXACTLY zero turn, with a target standing in plain
+//               sight. This is the whole "behaviour is data" claim in one
+//               number: the dummy shares every line of code with the duelist
+//               and differs only in JSON.
+//   ai-face     A static swordsman's heading must CONVERGE on the bearing to a
+//               target moved to arbitrary, non-quantized angles around it —
+//               and its feet must not move while it does. Convergence to a
+//               free angle is what separates "faces the target" from "snaps to
+//               one of eight probe directions".
+//   ai-approach A duelist must cross a wall it cannot walk through (so the
+//               navigator, not the steering, is what is being tested), settle
+//               INSIDE its authored band, STAY there, and never occupy the
+//               target's space. Reaching the target is easy; staying at arm's
+//               length without dithering is the thing that is hard and the
+//               thing that reads as good.
+//
+// FIXTURE NOTES. These gates run late (after mob-burn) and the last of them
+// writes real voxels, so it regenerates the world on the way out — the gates
+// after it place fixtures by absolute coordinate (CLAUDE.md rule 7). Thresholds
+// live in tests/baseline.json, not here.
+// ============================================================================
+
+// The humanoid rig the AI gates drive. Chosen by CAPABILITY rather than by
+// name: it has to publish a `held_right` socket or the sword cannot be
+// equipped, and the whole fixture would silently be testing an unarmed mob.
+// The stock player model wins the tie when several qualify.
+int AiHumanoidDef(const MobSystem& mobs) {
+  int best = -1;
+  for (size_t i = 0; i < mobs.Defs().size(); i++) {
+    if (mobs.Defs()[i].FindSocket("held_right") < 0) continue;
+    if (best < 0 || mobs.Defs()[i].name == "mina") best = (int)i;
+  }
+  return best;
+}
+
+// The flattest patch of terrain within `search` voxels of (cx,cz), sampled on a
+// coarse grid over a `half`-voxel half-extent.
+//
+// Terrain is procedural and this gate must not be pinned to a hand-picked
+// coordinate that a worldgen tweak silently puts on a cliff — the fixture asks
+// the SAME height function the world is built from where the flat ground is,
+// and reports the relief it settled for so a future failure says "the terrain
+// moved" instead of "the AI broke".
+IVec3 AiFlatSpot(int cx, int cz, int search, int half, uint32_t seed,
+                 int& outRelief) {
+  int bestX = cx, bestZ = cz, bestRelief = INT32_MAX;
+  for (int oz = -search; oz <= search; oz += 8) {
+    for (int ox = -search; ox <= search; ox += 8) {
+      int lo = INT32_MAX, hi = INT32_MIN;
+      for (int dz = -half; dz <= half; dz += 3)
+        for (int dx = -half; dx <= half; dx += 3) {
+          const int h = World::TerrainHeight(cx + ox + dx, cz + oz + dz, seed);
+          lo = std::min(lo, h);
+          hi = std::max(hi, h);
+        }
+      const int relief = hi - lo;
+      if (relief < bestRelief) {
+        bestRelief = relief;
+        bestX = cx + ox;
+        bestZ = cz + oz;
+      }
+    }
+  }
+  outRelief = bestRelief;
+  return IVec3{bestX, World::TerrainHeight(bestX, bestZ, seed), bestZ};
+}
+
+// Everything an AI gate needs to advance one tick. The mob systems run in the
+// same order PreTick does in the game, so a behaviour cannot pass here by
+// depending on an ordering the frame loop does not have.
+struct AiTicker {
+  Ctx& c;
+  uint32_t tick = 7000;
+  IVec3 playerChunk{8, 8, 8};
+
+  void operator()(const std::vector<BrushOp>& ops = {}) {
+    std::vector<ParticleSpawn> spawns;
+    std::vector<CellOp> cellOps;
+    std::vector<BrushOp> myOps = ops;
+    c.mobs.PreTick(tick + 1, c.world, myOps, cellOps, spawns);
+    c.debris.QueueSupportEvents(c.world.Snap());
+    c.debris.PreTick(tick + 1, c.world, cellOps, spawns);
+    ++tick;
+    SubmitTick(c.ctx, c.world, c.sim, tick, kDefaultSeed, myOps, {}, cellOps,
+               false, playerChunk, true, false, spawns);
+    c.ctx.WaitIdle();
+    c.ctx.ProcessEvents();
+    c.phys.Step(kTickDt);
+    c.debris.PostStep();
+    c.mobs.PostStep();
+  }
+};
+
+Vec3 AiMobCentre(const MobSystem& mobs, uint64_t id, const MobDef& def) {
+  const Vec3 o = mobs.MobOrigin(id);
+  return Vec3{o.x + def.worldSize.x * 0.5f, o.y + def.worldSize.y * 0.5f,
+              o.z + def.worldSize.z * 0.5f};
+}
+
+float AiPlanar(Vec3 a, Vec3 b) {
+  const float dx = a.x - b.x, dz = a.z - b.z;
+  return std::sqrt(dx * dx + dz * dz);
+}
+
+// Spawn one AI-driven humanoid with a sword, on the flat spot, with `profile`
+// applied. Returns 0 on any failure, with the reason already in `why`.
+uint64_t AiSpawn(Ctx& c, int defIndex, IVec3 at, const char* profile,
+                 std::string& why) {
+  const uint64_t id = c.mobs.Spawn(defIndex, at);
+  if (id == 0) {
+    why = "Spawn refused";
+    return 0;
+  }
+  if (!c.mobs.SetMobBehavior(id, profile)) {
+    why = std::string("no behaviour profile \"") + profile +
+          "\" in assets/mobs/behaviors.json";
+    return 0;
+  }
+  // A mob with a sword is one EquipItem call (mob.h). Not decorative here: an
+  // attack request that goes out from an unarmed creature is a different claim.
+  const ItemDef* sword = c.items.At(c.items.Find("sword"));
+  if (sword != nullptr) c.mobs.EquipItem(id, sword);
+  return id;
+}
+
+// ---- ai-dummy --------------------------------------------------------------
+Status GateAiDummy(Ctx& c, std::string& detail) {
+  c.debris.Reset();
+  c.mobs.Reset();
+  SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+  c.ctx.WaitIdle();
+
+  const int defIndex = AiHumanoidDef(c.mobs);
+  if (defIndex < 0) {
+    detail = "no mob def publishes a held_right socket";
+    return Status::Fail;
+  }
+  if (c.mobs.Behaviors().profiles.empty()) {
+    detail = "assets/mobs/behaviors.json loaded no profiles";
+    return Status::Fail;
+  }
+  const MobDef& def = c.mobs.Defs()[defIndex];
+
+  int relief = 0;
+  const IVec3 spot = AiFlatSpot(140, 140, 96, 16, kDefaultSeed, relief);
+  std::string why;
+  const uint64_t id =
+      AiSpawn(c, defIndex, {spot.x, spot.y + 1, spot.z}, "dummy", why);
+  if (id == 0) {
+    detail = why;
+    return Status::Fail;
+  }
+
+  // A target in PLAIN SIGHT, close enough to attack. The claim is not "an
+  // unprovoked dummy stands still" — that is trivially true of a mob with no
+  // AI at all. It is "a dummy standing next to something a duelist would
+  // charge does not move a millimetre", which is only true if the profile, and
+  // nothing else, is what authorizes motion.
+  c.mobs.SetPlayerActor(
+      Vec3{(float)spot.x + 9.0f, (float)spot.y + 8.0f, (float)spot.z}, 3.0f,
+      17.0f, true);
+
+  AiTicker tick{c, 7000, {spot.x / 16, spot.y / 16, spot.z / 16}};
+  tick();   // one tick so the rig settles onto the ground before measuring
+  const Vec3 p0 = c.mobs.MobOrigin(id);
+  const float h0 = c.mobs.MobHeading(id);
+  const int ticks = (int)BaselineNumber("aiDummyTicks", 90);
+  float maxDrift = 0, maxTurn = 0;
+  for (int i = 0; i < ticks; i++) {
+    tick();
+    const Vec3 p = c.mobs.MobOrigin(id);
+    maxDrift = std::max(maxDrift, AiPlanar(p, p0));
+    maxTurn = std::max(maxTurn,
+                       std::abs(std::remainder(c.mobs.MobHeading(id) - h0,
+                                               6.2831853f)));
+  }
+  const ai::Brain* br = c.mobs.MobBrain(id);
+  const bool sawNothing = br != nullptr && !br->hasTarget;
+
+  // EXACT zero, not "small": the dummy profile authorizes no drive at all, so
+  // any motion is a code path that ignored the data. The bounds live in
+  // baseline.json only so a future gait change that legitimately jitters the
+  // min corner can be re-pinned without a rebuild.
+  const float driftMax = (float)BaselineNumber("aiDummyMaxDriftVox", 0.001);
+  const float turnMax = (float)BaselineNumber("aiDummyMaxTurnRad", 0.001);
+  const bool ok = maxDrift <= driftMax && maxTurn <= turnMax && sawNothing;
+  RecordObserved("aiFlatSpotRelief", (double)relief);
+  detail = Format(
+      "%d ticks, drift %.5f vox (<= %.3f), turn %.5f rad (<= %.3f), blind %d, "
+      "terrain relief %d",
+      ticks, maxDrift, driftMax, maxTurn, turnMax, sawNothing ? 1 : 0, relief);
+  c.mobs.ClearPlayerActor();
+  c.mobs.ClearAttackRequests();
+  c.debris.Reset();
+  c.mobs.Reset();
+  return ok ? Status::Pass : Status::Fail;
+}
+
+// ---- ai-face ---------------------------------------------------------------
+Status GateAiFace(Ctx& c, std::string& detail) {
+  c.debris.Reset();
+  c.mobs.Reset();
+  SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+  c.ctx.WaitIdle();
+
+  const int defIndex = AiHumanoidDef(c.mobs);
+  if (defIndex < 0) {
+    detail = "no mob def publishes a held_right socket";
+    return Status::Fail;
+  }
+  const MobDef& def = c.mobs.Defs()[defIndex];
+  int relief = 0;
+  const IVec3 spot = AiFlatSpot(140, 140, 96, 18, kDefaultSeed, relief);
+
+  std::string why;
+  const uint64_t id = AiSpawn(c, defIndex, {spot.x, spot.y + 1, spot.z},
+                              "swordsman_static", why);
+  if (id == 0) {
+    detail = why;
+    return Status::Fail;
+  }
+
+  AiTicker tick{c, 7200, {spot.x / 16, spot.y / 16, spot.z / 16}};
+  tick();
+  const Vec3 p0 = c.mobs.MobOrigin(id);
+
+  // Deliberately NOT multiples of 45 or 90 degrees. The terrain fan has eight
+  // directions and the legacy avoidance aims at 0.6 of a probe offset; a
+  // quantized implementation lands on those, and a gate that tested them would
+  // pass on exactly the bug it exists to catch.
+  const float kBearings[] = {0.9f, 2.6f, -1.7f, -3.0f, 0.35f};
+  const float radius = (float)BaselineNumber("aiFaceRadiusVox", 16);
+  const int settle = (int)BaselineNumber("aiFaceSettleTicks", 70);
+  const float tol = (float)BaselineNumber("aiFaceToleranceRad", 0.12);
+
+  float worstErr = 0, maxDrift = 0;
+  int perceived = 0;
+  int attacks = 0;
+  for (float b : kBearings) {
+    const int tx = spot.x + (int)std::lround(std::sin(b) * radius);
+    const int tz = spot.z + (int)std::lround(std::cos(b) * radius);
+    const int th = World::TerrainHeight(tx, tz, kDefaultSeed);
+    c.mobs.SetPlayerActor(Vec3{(float)tx, (float)th + 8.0f, (float)tz}, 3.0f,
+                          17.0f, true);
+    for (int i = 0; i < settle; i++) {
+      tick();
+      maxDrift = std::max(maxDrift, AiPlanar(c.mobs.MobOrigin(id), p0));
+    }
+    const ai::Brain* br = c.mobs.MobBrain(id);
+    if (br != nullptr && br->hasTarget) perceived++;
+    // The bearing the mob SHOULD hold is the one to the target's centre from
+    // its own centre, which is not the same as `b` once the rig's min corner
+    // and its half-extent are accounted for. Deriving it rather than restating
+    // `b` is what stops this being a circular assertion.
+    const Vec3 me = AiMobCentre(c.mobs, id, def);
+    const float want =
+        std::atan2((float)tx - me.x, (float)tz - me.z);
+    const float err =
+        std::abs(std::remainder(c.mobs.MobHeading(id) - want, 6.2831853f));
+    worstErr = std::max(worstErr, err);
+    attacks += (int)c.mobs.AttackRequests().size();
+    c.mobs.ClearAttackRequests();
+  }
+
+  const float driftMax = (float)BaselineNumber("aiFaceMaxDriftVox", 0.001);
+  const bool ok = worstErr <= tol && maxDrift <= driftMax &&
+                  perceived == (int)(sizeof(kBearings) / sizeof(float));
+  detail = Format(
+      "%d bearings, worst facing error %.3f rad (<= %.3f), foot drift %.5f vox "
+      "(<= %.3f), perceived %d/%d, %d attack requests, relief %d",
+      (int)(sizeof(kBearings) / sizeof(float)), worstErr, tol, maxDrift,
+      driftMax, perceived, (int)(sizeof(kBearings) / sizeof(float)), attacks,
+      relief);
+  c.mobs.ClearPlayerActor();
+  c.mobs.ClearAttackRequests();
+  c.debris.Reset();
+  c.mobs.Reset();
+  return ok ? Status::Pass : Status::Fail;
+}
+
+// ---- ai-approach -----------------------------------------------------------
+Status GateAiApproach(Ctx& c, std::string& detail) {
+  c.debris.Reset();
+  c.mobs.Reset();
+  SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+  c.ctx.WaitIdle();
+
+  const int defIndex = AiHumanoidDef(c.mobs);
+  if (defIndex < 0) {
+    detail = "no mob def publishes a held_right socket";
+    return Status::Fail;
+  }
+  const MobDef& def = c.mobs.Defs()[defIndex];
+  const int prof = c.mobs.Behaviors().Find("duelist");
+  if (prof < 0) {
+    detail = "no \"duelist\" profile in assets/mobs/behaviors.json";
+    return Status::Fail;
+  }
+  const ai::Profile& dp = c.mobs.Behaviors().profiles[prof];
+
+  int relief = 0;
+  const IVec3 spot = AiFlatSpot(140, 140, 96, 22, kDefaultSeed, relief);
+  const int gapVox = (int)BaselineNumber("aiApproachGapVox", 20);
+  const int tx = spot.x, tz = spot.z + gapVox;
+  const int th = World::TerrainHeight(tx, tz, kDefaultSeed);
+
+  AiTicker tick{c, 7400, {spot.x / 16, spot.y / 16, spot.z / 16}};
+
+  // ---- the wall --------------------------------------------------------
+  // Stone spheres straddling the straight line, at each column's own terrain
+  // height so undulation cannot bury or float them. Six voxels tall: a body
+  // cannot step it (SenseGround refuses a rise past 2), and a ray from the
+  // mob's eye down to the target's chest clears it — so the duelist can SEE
+  // its target the whole time and the only thing being tested is whether it
+  // can WALK to it. A wall that also broke line of sight would make a
+  // perception failure look like a navigation failure.
+  const uint32_t stone = [&] {
+    for (size_t i = 0; i < c.mats.size(); i++)
+      if (c.mats[i].name == "stone") return (uint32_t)i;
+    return 1u;
+  }();
+  {
+    std::vector<BrushOp> wall;
+    for (int i = -3; i <= 3; i++) {
+      const int wx = spot.x + i * 4, wz = spot.z + gapVox / 2;
+      const int wh = World::TerrainHeight(wx, wz, kDefaultSeed);
+      BrushOp op{};
+      op.x = wx;
+      op.y = wh + 3;
+      op.z = wz;
+      op.radius = 3;
+      op.material = stone;
+      op.mode = 1;   // overwrite
+      wall.push_back(op);
+    }
+    tick(wall);
+  }
+  // The CPU mirror trails the GPU: the planner reads World::Cached, and a wall
+  // the mirror has not seen yet is a wall the navigator will walk into. Tick
+  // until the chunks come back, then ASSERT the mirror actually has it — a
+  // nav failure and a stale mirror are different bugs and this is the line
+  // that tells them apart.
+  for (int i = 0; i < 40; i++) tick();
+
+  // Spawn so the mob's CENTRE lands on the flat spot: Spawn takes the prefab's
+  // min corner, and a humanoid's box is wide enough that ignoring that puts the
+  // creature half a body off the line the wall was built across — which showed
+  // up as a start distance of 11 voxels on a 20-voxel fixture, already inside
+  // the band the gate was about to test.
+  std::string why;
+  const uint64_t id =
+      AiSpawn(c, defIndex,
+              {spot.x - (int)(def.worldSize.x * 0.5f), spot.y + 1,
+               spot.z - (int)(def.worldSize.z * 0.5f)},
+              "duelist", why);
+  if (id == 0) {
+    detail = why;
+    SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+    c.ctx.WaitIdle();
+    return Status::Fail;
+  }
+  c.mobs.SetPlayerActor(Vec3{(float)tx, (float)th + 8.0f, (float)tz}, 3.0f,
+                        17.0f, true);
+  for (int i = 0; i < 20; i++) tick();   // anchors fetch the chunks around the mob
+
+  // Does the mirror have the wall? Probed through the same collision classes
+  // the navigator uses.
+  int wallSeen = 0;
+  {
+    const std::vector<uint32_t> classOf = BuildCollisionClasses(c.mats);
+    for (int i = -3; i <= 3; i++) {
+      const int wx = spot.x + i * 4, wz = spot.z + gapVox / 2;
+      const int wh = World::TerrainHeight(wx, wz, kDefaultSeed);
+      if (c.world.KindAt(IVec3{wx, wh + 4, wz}, classOf) == CellKind::Solid)
+        wallSeen++;
+    }
+  }
+
+  // ---- the run ---------------------------------------------------------
+  const int budget = (int)BaselineNumber("aiApproachTicks", 400);
+  const int holdTicks = (int)BaselineNumber("aiApproachHoldTicks", 240);
+  const float bandTol = (float)BaselineNumber("aiApproachBandTolVox", 2.5);
+  const float minClear = (float)BaselineNumber("aiApproachMinClearVox", 3.0);
+
+  const Vec3 targetC{(float)tx, (float)th + 8.0f, (float)tz};
+  const float startDist = AiPlanar(AiMobCentre(c.mobs, id, def), targetC);
+  int arriveTick = -1;
+  float minDist = 1e9f;
+  int attacks = 0;
+  bool everPathed = false;
+  // ATTRIBUTION, not a bare number. "Arrived at tick 161" is exactly the kind
+  // of count CLAUDE.md warns about: it invites turning features off one at a
+  // time. Ticks-per-intent plus ground actually covered says WHERE the time
+  // went in one line — the first version of this gate reported only the tick
+  // and the cause (an orbit the neck could not follow, so every tick was spent
+  // at a fraction of drive) was invisible.
+  int intentTicks[(int)ai::Intent::Count] = {};
+  float travelled = 0;
+  Vec3 prevPos = c.mobs.MobOrigin(id);
+  auto step = [&]() {
+    tick();
+    const Vec3 now = c.mobs.MobOrigin(id);
+    travelled += AiPlanar(now, prevPos);
+    prevPos = now;
+    const ai::Brain* br = c.mobs.MobBrain(id);
+    if (br != nullptr) {
+      intentTicks[(int)br->intent]++;
+      if (br->path.valid) everPathed = true;
+    }
+    attacks += (int)c.mobs.AttackRequests().size();
+    c.mobs.ClearAttackRequests();
+    const float d = AiPlanar(AiMobCentre(c.mobs, id, def), targetC);
+    minDist = std::min(minDist, d);
+    return d;
+  };
+  for (int i = 0; i < budget && arriveTick < 0; i++) {
+    const float d = step();
+    if (d >= dp.movement.rangeMin - bandTol && d <= dp.movement.rangeMax + bandTol)
+      arriveTick = i;
+  }
+
+  // ...and then STAYS there. Arriving is easy; a mob that overshoots into the
+  // target, or oscillates across the band edge, or drifts back out because its
+  // circle-strafe walks a widening polygon, all pass an arrival-only test and
+  // all read as broken.
+  int outOfBand = 0;
+  float worstOut = 0;
+  if (arriveTick >= 0) {
+    for (int i = 0; i < holdTicks; i++) {
+      const float d = step();
+      const float over = std::max(0.0f, d - (dp.movement.rangeMax + bandTol));
+      const float under = std::max(0.0f, (dp.movement.rangeMin - bandTol) - d);
+      if (over > 0 || under > 0) {
+        outOfBand++;
+        worstOut = std::max(worstOut, std::max(over, under));
+      }
+    }
+  }
+
+  const int outAllowed = (int)BaselineNumber("aiApproachOutOfBandTicks", 12);
+  // A duel with no swings in it is not a duel. This is the one assertion that
+  // ties the whole chain — perceive, path, hold range, aim — to the seam Phase
+  // C consumes: the arbiter can score perfectly and still never fire if the
+  // footwork keeps the target off the nose, which is exactly the bug the first
+  // run of this gate found.
+  const int minAttacks = (int)BaselineNumber("aiApproachMinAttacks", 2);
+  const bool ok = wallSeen >= 5 && arriveTick >= 0 && everPathed &&
+                  minDist >= minClear && outOfBand <= outAllowed &&
+                  attacks >= minAttacks;
+  RecordObserved("aiApproachArriveTick", (double)arriveTick);
+  RecordObserved("aiApproachAttacks", (double)attacks);
+  detail = Format(
+      "wall %d/7 in mirror, start %.1f vox, arrived tick %d/%d (%.0f vox "
+      "walked), pathed %d, band [%.1f,%.1f]+-%.1f: %d/%d ticks out (worst "
+      "%.2f), closest %.2f (>= %.1f), %d attacks (>= %d), intents "
+      "idle/face/appr/hold/circ/atk %d/%d/%d/%d/%d/%d, relief %d",
+      wallSeen, startDist, arriveTick, budget, travelled, everPathed ? 1 : 0,
+      dp.movement.rangeMin, dp.movement.rangeMax, bandTol, outOfBand, holdTicks,
+      worstOut, minDist, minClear, attacks, minAttacks,
+      intentTicks[0], intentTicks[1], intentTicks[2], intentTicks[3],
+      intentTicks[4], intentTicks[5], relief);
+
+  c.mobs.ClearPlayerActor();
+  c.mobs.ClearAttackRequests();
+  c.debris.Reset();
+  c.mobs.Reset();
+  // The wall is real grid state and the gates after this one place fixtures by
+  // absolute coordinate (CLAUDE.md rule 7).
+  SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+  c.ctx.WaitIdle();
+  return ok ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& MobGates() {
   static const std::vector<Gate> g = {
       // Per-voxel body reactivity. No render: every claim is a count.
       {"mob-burn", "mob", {}, false, GateMobBurn, /*needsRender=*/false},
+      // NPC AI. No render either: every claim is a distance, an angle or a
+      // count, which is what makes them iterable with `--gate` alone.
+      {"ai-dummy", "mob", {}, false, GateAiDummy, /*needsRender=*/false},
+      {"ai-face", "mob", {}, false, GateAiFace, /*needsRender=*/false},
+      {"ai-approach", "mob", {}, false, GateAiApproach, /*needsRender=*/false},
   };
   return g;
 }

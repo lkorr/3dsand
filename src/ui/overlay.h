@@ -241,6 +241,69 @@ struct UIState {
   int mobSelected = 0;           // index into mobNames
   std::vector<std::string> mobNames;
 
+  // ---- NPC AI panel (game/ai_behavior.h) ----------------------------------
+  //
+  // Shaped exactly like the MPM fluid panel next door: mirror fields the
+  // overlay draws, one-shot bools the frame loop consumes, and a dirty latch
+  // for the sliders. The overlay never reaches into MobSystem — main.cpp
+  // mirrors the live creature list in and applies the requests out, which is
+  // what keeps this a producer on the same path gameplay uses rather than a
+  // dev-only side channel into the AI.
+  //
+  // NO CUSTOM SCROLL CALLBACK. ImGui installs its own via
+  // ImGui_ImplGlfw_InitForOther(window, true) inside Overlay::Init, and its
+  // handler chains BACKWARD to whatever was installed before it — so a
+  // callback registered AFTER Init silently replaces ImGui's and freezes the
+  // wheel in every scrollable panel. Nothing in this engine installs one, this
+  // panel does not need one (an ImGui child region scrolls by itself), and
+  // that is the correct amount.
+  bool aiWindowOpen = false;
+  bool aiSpawnDummy = false;      // one-shot: spawn ahead of the crosshair
+  bool aiSpawnStatic = false;
+  bool aiSpawnDuelist = false;
+  bool aiKillSpawned = false;     // one-shot: despawn everything this panel made
+  bool aiSaveBehaviors = false;   // one-shot: write assets/mobs/behaviors.json
+  bool aiApplyBehavior = false;   // one-shot: aiBehaviorPick -> the selected mob
+  bool showAiDebug = false;       // in-world path / target / band viz
+  bool showAiRing = true;         // ...the range-band ring specifically
+  std::string aiSaveStatus;       // last save result, shown next to the button
+  // Live creatures, mirrored per frame. Parallel arrays rather than a struct
+  // because UIState is a POD the overlay may only read — the same shape
+  // mobNames/materialNames already have.
+  std::vector<uint64_t> aiMobIds;
+  std::vector<std::string> aiMobLabels;   // "#3 mina [duelist] approach d=14.2"
+  int aiMobSelected = 0;
+  int aiBehaviorPick = 0;                 // index into aiProfileNames
+  std::vector<std::string> aiProfileNames;
+  // The profile whose sliders are on screen, and the values themselves. Written
+  // THROUGH to the in-memory profile by main.cpp when aiTuningDirty latches, so
+  // every mob on that profile updates at once (there is deliberately no
+  // per-mob override — see MobSystem::BehaviorsMut).
+  int aiProfileEdit = 0;
+  bool aiTuningDirty = false;
+  bool aiProfileReseat = true;    // reload the mirrors below from the library
+  float aiSightRange = 0, aiFovDegrees = 360, aiKeepRangeScale = 1.4f;
+  int aiAlertDecayTicks = 90;
+  bool aiRequireLos = true;
+  bool aiMobile = false;
+  float aiRangeMin = 0, aiRangeMax = 0, aiBandSlack = 1.5f;
+  float aiApproachSpeed = 1, aiStrafeSpeed = 0.55f, aiRetreatSpeed = 0.8f;
+  float aiCircleTendency = 0;
+  int aiCircleHoldTicks = 24, aiRepathTicks = 12;
+  float aiNavRadius = 22;
+  float aiAttackReach = 8, aiAimTolerance = 0.45f;
+  int aiCadenceTicks = 40, aiJitterTicks = 18, aiCommitTicks = 10,
+      aiDisengageTicks = 22;
+  float aiHysteresis = 0.22f;
+  float aiIntentWeight[6] = {};        // one per ai::Intent, in enum order
+  int aiIntentCooldown[6] = {};
+  int aiIntentDwell[6] = {};
+  // Last attack request drained from the seam, for the readout. Phase C
+  // replaces this consumer with a real stroke; until then, SEEING the requests
+  // is what proves the seam fires at the right moments.
+  std::string aiLastAttack;
+  int aiAttackCount = 0;
+
   std::vector<std::string> materialNames;  // index == material id
   std::vector<uint32_t> materialColors;    // 0xAABBGGRR swatch (gpu color0)
   bool visible = true;

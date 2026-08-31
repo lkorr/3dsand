@@ -2119,6 +2119,12 @@ int main(int argc, char** argv) {
         LoadItems(ad + "/items", m.size(), stMbSet, stItems, ie);
         stSim.UploadMicroBodies(stCtx.queue, stMbSet);
         stMobs.SetDefs(std::move(defs));
+        {
+          ai::Library beh;
+          std::string blog;
+          ai::LoadBehaviors(ad + "/mobs/behaviors.json", beh, blog);
+          stMobs.SetBehaviors(std::move(beh));
+        }
         Stream stStream;
         stStream.Init(&stCtx, &stWorld, &stSim, kDefaultSeed);
         stStream.OnMaterialsReloaded(m);
@@ -2295,6 +2301,15 @@ int main(int argc, char** argv) {
     if (itemsOk) std::printf("loaded %zu items\n", items.items.size());
     sim.UploadMicroBodies(ctx.queue, mbSet);
     mobs.SetDefs(std::move(mobDefs));
+    // NPC behaviour profiles (game/ai_behavior.h). Content, like materials and
+    // glyphs: a missing file is not an error, it just means every mob keeps the
+    // wander-and-avoid it has always had.
+    ai::Library beh;
+    std::string blog;
+    if (ai::LoadBehaviors(assetDir + "/mobs/behaviors.json", beh, blog))
+      std::printf("loaded %zu behaviour profiles\n", beh.profiles.size());
+    if (!blog.empty()) std::fprintf(stderr, "%s", blog.c_str());
+    mobs.SetBehaviors(std::move(beh));
   }
   Stream stream;
   stream.Init(&ctx, &world, &sim, kDefaultSeed);
@@ -2522,6 +2537,11 @@ int main(int argc, char** argv) {
   ui.mobNames.clear();
   for (const Prefab& p : prefabs) ui.prefabNames.push_back(p.name);
   for (const MobDef& d : mobs.Defs()) ui.mobNames.push_back(d.name);
+  for (const ai::Profile& p : mobs.Behaviors().profiles)
+    ui.aiProfileNames.push_back(p.name);
+  // Creatures the AI panel put in the world, so its "kill all spawned" button
+  // reaps exactly those and leaves content-placed mobs alone.
+  std::vector<uint64_t> aiSpawnedMobs;
   int spawnH = World::TerrainHeight(140, 140, kDefaultSeed);
   player.pos = Vec3{140, (float)(spawnH + 10), 140};
   // Lab: fixed per-scene pose, flying, aimed at the scene — the same pose the
@@ -3172,6 +3192,20 @@ int main(int argc, char** argv) {
         }
         sim.UploadMicroBodies(ctx.queue, mbSet);
         mobs.SetDefs(std::move(mobDefs));
+        // Behaviour profiles reload with the rest of the content. SetBehaviors
+        // re-resolves every LIVE mob's profile by name, so retuning a duelist
+        // and hitting R is visible on the duelists already fighting you rather
+        // than only on the next one spawned.
+        {
+          ai::Library beh;
+          std::string blog;
+          ai::LoadBehaviors(assetDir + "/mobs/behaviors.json", beh, blog);
+          if (!blog.empty()) std::fprintf(stderr, "%s", blog.c_str());
+          mobs.SetBehaviors(std::move(beh));
+          ui.aiProfileNames.clear();
+          for (const ai::Profile& p : mobs.Behaviors().profiles)
+            ui.aiProfileNames.push_back(p.name);
+        }
         // The avatar holds a MobDef* INTO that vector, so it must be
         // re-published after SetDefs replaces the contents or the pointer
         // dangles. SetDefs despawns first, which also drops limb bodies that
@@ -3554,6 +3588,73 @@ int main(int argc, char** argv) {
         }
       }
 
+      // ---- NPC AI panel: spawn / despawn / retarget (game/ai_behavior.h) ---
+      //
+      // Producers on the SAME path gameplay uses: MobSystem::Spawn, then
+      // EquipItem, then SetMobBehavior. There is no dev-only entry into the AI,
+      // which is why the panel's duelist and a duelist placed by content are
+      // the same creature.
+      if (labScene >= 0) {
+        ui.aiSpawnDummy = ui.aiSpawnStatic = ui.aiSpawnDuelist = false;
+        ui.aiKillSpawned = false;
+      }
+      if (ui.aiSpawnDummy || ui.aiSpawnStatic || ui.aiSpawnDuelist) {
+        const char* profile = ui.aiSpawnDummy      ? "dummy"
+                              : ui.aiSpawnStatic   ? "swordsman_static"
+                                                   : "duelist";
+        ui.aiSpawnDummy = ui.aiSpawnStatic = ui.aiSpawnDuelist = false;
+        // A humanoid that can actually HOLD the sword: picked by capability
+        // (a `held_right` socket) rather than by name, so renaming an asset
+        // cannot silently spawn an unarmed creature.
+        int aiDef = -1;
+        for (size_t i = 0; i < mobs.Defs().size(); i++) {
+          if (mobs.Defs()[i].FindSocket("held_right") < 0) continue;
+          if (aiDef < 0 || mobs.Defs()[i].name == avatarDefName) aiDef = (int)i;
+        }
+        if (aiDef >= 0) {
+          // Crosshair hit when there is one, otherwise a few metres ahead on
+          // the ground: spawning behind you is useless for watching a duelist.
+          const WorldSnapshot& asnap = world.Snap();
+          IVec3 at{};
+          const MobDef& d = mobs.Defs()[aiDef];
+          if (asnap.valid && asnap.pick[0] != 0) {
+            at = IVec3{(int)asnap.pick[5] - d.prefab.size.x / 2,
+                       (int)asnap.pick[6],
+                       (int)asnap.pick[7] - d.prefab.size.z / 2};
+          } else {
+            const Vec3 fwd = cam.Forward();
+            const int sx = ifloor(player.pos.x + fwd.x * 40.0f);
+            const int sz = ifloor(player.pos.z + fwd.z * 40.0f);
+            at = IVec3{sx, World::TerrainHeight(sx, sz, kDefaultSeed) + 1, sz};
+          }
+          const uint64_t nid = mobs.Spawn(aiDef, at);
+          if (nid != 0) {
+            const ItemDef* sword = items.At(items.Find("sword"));
+            if (sword != nullptr) mobs.EquipItem(nid, sword);
+            mobs.SetMobBehavior(nid, profile);
+            aiSpawnedMobs.push_back(nid);
+          }
+        }
+      }
+      if (ui.aiKillSpawned) {
+        ui.aiKillSpawned = false;
+        // Kill rather than delete: a corpse ragdolls, its limbs become debris,
+        // and the whole teardown path gets exercised. Silently dropping the
+        // rig would be a second despawn implementation.
+        for (uint64_t mid : aiSpawnedMobs)
+          if (Mob* m = mobs.FindMobById(mid)) m->Die();
+        aiSpawnedMobs.clear();
+      }
+      if (ui.aiApplyBehavior) {
+        ui.aiApplyBehavior = false;
+        if (ui.aiMobSelected >= 0 &&
+            ui.aiMobSelected < (int)ui.aiMobIds.size() &&
+            ui.aiBehaviorPick >= 0 &&
+            ui.aiBehaviorPick < (int)ui.aiProfileNames.size())
+          mobs.SetMobBehavior(ui.aiMobIds[ui.aiMobSelected],
+                              ui.aiProfileNames[ui.aiBehaviorPick]);
+      }
+
       // rolling sphere (K): a rigidbody ball, half the player's height in
       // diameter, made of the current brush material. The collider is a true
       // Jolt sphere (CreateSphereBody) so it rolls smoothly; rendering is a
@@ -3750,6 +3851,15 @@ int main(int argc, char** argv) {
       // sim/reactcpu.h for why the CPU has to agree with the GPU here.
       mobs.SetDayPhase(DayPhaseNow(tick));
       debris.SetDayPhase(DayPhaseNow(tick));
+
+      // WHO THE NPCs ARE FIGHTING, pushed once per TICK rather than per frame.
+      // The tick loop runs 0..4 times per frame, and a target position sampled
+      // on the frame clock would make an NPC's decisions a function of frame
+      // rate — the same reason the burn pass and the gait live in here.
+      // Deliberately the capsule, not the avatar rig: the capsule is what the
+      // player actually occupies, and it exists even before the avatar spawns.
+      mobs.SetPlayerActor(player.pos, Player::kHalfXZ, Player::kHalfY * 2.0f,
+                          ui.playerAlive);
 
       // mobs: kinematic walk drive, terrain anchors for ManageTerrain,
       // bleeding ops, per-voxel burning — must run before debris.PreTick
@@ -4588,6 +4698,57 @@ int main(int argc, char** argv) {
       ui.activeBodyCount = debris.ActiveBodyCount();
       ui.prefabPending = (uint32_t)placer.PendingCount();
       ui.mobCount = mobs.MobCount();
+
+      // ---- NPC AI panel mirror (game/ai_behavior.h) ------------------------
+      //
+      // The overlay never reaches into MobSystem; everything it draws is
+      // mirrored here, and everything it asks for comes back as a flag. One
+      // line per creature: who it is, what character it is running, what it
+      // DECIDED this tick and how far its target is. That last pair is the
+      // whole debugging surface — "it walked at me" and "it scored Approach
+      // 1.15 against HoldRange 0.6" are very different amounts of information.
+      ui.aiMobIds.clear();
+      ui.aiMobLabels.clear();
+      for (uint32_t i = 0; i < mobs.MobCount(); i++) {
+        const uint64_t mid = mobs.MobIdAt(i);
+        if (mid == 0) continue;
+        const ai::Brain* br = mobs.MobBrain(mid);
+        const ai::Profile* pf =
+            br != nullptr ? mobs.Behaviors().At(br->profile) : nullptr;
+        char line[192];
+        std::snprintf(line, sizeof line, "#%llu  %-16s %-10s %s d=%.1f%s",
+                      (unsigned long long)mid,
+                      pf != nullptr ? pf->name.c_str() : "(no ai)",
+                      br != nullptr ? ai::IntentName(br->intent) : "-",
+                      br != nullptr && br->hasTarget
+                          ? (br->visible ? "seen" : "lost")
+                          : "----",
+                      br != nullptr ? br->targetDist : 0.0f,
+                      br != nullptr && br->path.valid ? "  [path]" : "");
+        ui.aiMobIds.push_back(mid);
+        ui.aiMobLabels.push_back(line);
+      }
+
+      // ---- the attack seam, consumed ---------------------------------------
+      // Phase C replaces this with a real stroke. Until then the requests are
+      // DRAINED AND SHOWN, which is the correct stub: a seam nobody reads is a
+      // seam nobody notices has stopped firing. Drained here, once per FRAME,
+      // after the tick loop has run 0..4 times — the requests accumulate across
+      // those sub-ticks exactly as sever and voice events do, precisely because
+      // a per-frame read of a per-tick event otherwise drops three of four.
+      for (const ai::AttackRequest& r : mobs.AttackRequests()) {
+        char line[192];
+        std::snprintf(line, sizeof line,
+                      "mob #%llu -> #%llu  style \"%s\"  at (%.0f,%.0f,%.0f)  "
+                      "d=%.1f  commit %u ticks  (tick %u)",
+                      (unsigned long long)r.mobId,
+                      (unsigned long long)r.targetId, r.style.c_str(),
+                      r.targetPoint.x, r.targetPoint.y, r.targetPoint.z,
+                      r.distance, r.commitTicks, r.tick);
+        ui.aiLastAttack = line;
+        ui.aiAttackCount++;
+      }
+      mobs.ClearAttackRequests();
       // Ledge-grab readout: the probe result plus every latch gate, so "why
       // didn't it grab" is readable in the panel rather than inferred. The
       // gates mirror the latch condition in Player::Update exactly.
@@ -4703,6 +4864,88 @@ int main(int argc, char** argv) {
         t.sim.windPartScale = ui.windPartScale;
         t.sim.windDragRef = ui.windDragRef;
         SetCurrentTuning(t);
+      }
+
+      // ---- NPC behaviour profile editing -----------------------------------
+      //
+      // Its own latch, like the wind knobs and for the same reason: nothing
+      // here touches a shader, so an AI you have to press Apply to feel would
+      // be an AI you cannot tune. Write-through is to the PROFILE, so every mob
+      // running it changes at once — a per-mob override would be variance, and
+      // this engine already has a place for that.
+      {
+        ai::Library& lib = mobs.BehaviorsMut();
+        ai::Profile* pe = lib.At(ui.aiProfileEdit);
+        if (pe != nullptr && ui.aiProfileReseat) {
+          ui.aiProfileReseat = false;
+          ui.aiSightRange = pe->perception.sightRange;
+          ui.aiFovDegrees = pe->perception.fovDegrees;
+          ui.aiRequireLos = pe->perception.requireLos;
+          ui.aiAlertDecayTicks = (int)pe->perception.alertDecayTicks;
+          ui.aiKeepRangeScale = pe->perception.keepRangeScale;
+          ui.aiMobile = pe->movement.mobile;
+          ui.aiRangeMin = pe->movement.rangeMin;
+          ui.aiRangeMax = pe->movement.rangeMax;
+          ui.aiBandSlack = pe->movement.bandSlack;
+          ui.aiApproachSpeed = pe->movement.approachSpeed;
+          ui.aiStrafeSpeed = pe->movement.strafeSpeed;
+          ui.aiRetreatSpeed = pe->movement.retreatSpeed;
+          ui.aiCircleTendency = pe->movement.circleTendency;
+          ui.aiCircleHoldTicks = (int)pe->movement.circleHoldTicks;
+          ui.aiRepathTicks = (int)pe->movement.repathTicks;
+          ui.aiNavRadius = pe->movement.navRadius;
+          ui.aiAttackReach = pe->attack.reach;
+          ui.aiAimTolerance = pe->attack.aimTolerance;
+          ui.aiCadenceTicks = (int)pe->attack.cadenceTicks;
+          ui.aiJitterTicks = (int)pe->attack.jitterTicks;
+          ui.aiCommitTicks = (int)pe->attack.commitTicks;
+          ui.aiDisengageTicks = (int)pe->attack.disengageTicks;
+          ui.aiHysteresis = pe->hysteresis;
+          for (int k = 0; k < (int)ai::Intent::Count && k < 6; k++) {
+            ui.aiIntentWeight[k] = pe->intents[k].weight;
+            ui.aiIntentCooldown[k] = (int)pe->intents[k].cooldownTicks;
+            ui.aiIntentDwell[k] = (int)pe->intents[k].minDwellTicks;
+          }
+        }
+        if (pe != nullptr && ui.aiTuningDirty) {
+          ui.aiTuningDirty = false;
+          pe->perception.sightRange = ui.aiSightRange;
+          pe->perception.fovDegrees = ui.aiFovDegrees;
+          pe->perception.requireLos = ui.aiRequireLos;
+          pe->perception.alertDecayTicks = (uint32_t)ui.aiAlertDecayTicks;
+          pe->perception.keepRangeScale = ui.aiKeepRangeScale;
+          pe->movement.mobile = ui.aiMobile;
+          pe->movement.rangeMin = ui.aiRangeMin;
+          pe->movement.rangeMax = ui.aiRangeMax;
+          pe->movement.bandSlack = ui.aiBandSlack;
+          pe->movement.approachSpeed = ui.aiApproachSpeed;
+          pe->movement.strafeSpeed = ui.aiStrafeSpeed;
+          pe->movement.retreatSpeed = ui.aiRetreatSpeed;
+          pe->movement.circleTendency = ui.aiCircleTendency;
+          pe->movement.circleHoldTicks = (uint32_t)ui.aiCircleHoldTicks;
+          pe->movement.repathTicks = (uint32_t)ui.aiRepathTicks;
+          pe->movement.navRadius = ui.aiNavRadius;
+          pe->attack.reach = ui.aiAttackReach;
+          pe->attack.aimTolerance = ui.aiAimTolerance;
+          pe->attack.cadenceTicks = (uint32_t)ui.aiCadenceTicks;
+          pe->attack.jitterTicks = (uint32_t)ui.aiJitterTicks;
+          pe->attack.commitTicks = (uint32_t)ui.aiCommitTicks;
+          pe->attack.disengageTicks = (uint32_t)ui.aiDisengageTicks;
+          pe->hysteresis = ui.aiHysteresis;
+          for (int k = 0; k < (int)ai::Intent::Count && k < 6; k++) {
+            pe->intents[k].weight = ui.aiIntentWeight[k];
+            pe->intents[k].cooldownTicks = (uint32_t)ui.aiIntentCooldown[k];
+            pe->intents[k].minDwellTicks = (uint32_t)ui.aiIntentDwell[k];
+          }
+        }
+        if (ui.aiSaveBehaviors) {
+          ui.aiSaveBehaviors = false;
+          std::string serr;
+          ui.aiSaveStatus =
+              ai::SaveBehaviors(assetDir + "/mobs/behaviors.json", lib, serr)
+                  ? "saved"
+                  : ("FAILED: " + serr);
+        }
       }
 
       if (ui.fluidTuningDirty) {
@@ -4912,6 +5155,86 @@ int main(int argc, char** argv) {
             b.quat[3] = 1.0f;
             b.color = 0xC000FF00u;
             dbg.push_back(b);
+          }
+        }
+      }
+      // ---- NPC AI debug viz (game/ai_behavior.h) --------------------------
+      //
+      // There is no line primitive in this engine — debug_lines.wgsl draws
+      // oriented BOXES and nothing else — so a segment is a very thin box and a
+      // ring is a dashed circle of small ones. That is not a workaround to be
+      // apologised for: the box path is already barrier-correct, depth-tested
+      // off (so a path behind a hill still reads), and costs literally zero
+      // when the count is zero.
+      //
+      // Colour carries the meaning: the profile's own colour for the path, a
+      // brighter version of it for the line to the target, and a dimmer one for
+      // the range band. Per-mob state labels are in the panel rather than in
+      // the world, because this engine has no world-space text (overlay.cpp
+      // draws screen chrome only) and inventing a projection for a dev readout
+      // is not worth the surface area.
+      if (ui.showAiDebug) {
+        auto segment = [&](Vec3 a, Vec3 b, float halfW, uint32_t col) {
+          if (dbg.size() >= kMaxDebugBoxes) return;
+          const Vec3 d = b - a;
+          const float len = d.len();
+          if (len < 1e-3f) return;
+          // Yaw+pitch to point local +Z along the segment; the box is then a
+          // stick of half-length len/2.
+          const float yaw = std::atan2(d.x, d.z);
+          const float pitch =
+              -std::atan2(d.y, std::sqrt(d.x * d.x + d.z * d.z));
+          const Quat q = QuatMul(QuatAxisAngle({0, 1, 0}, yaw),
+                                 QuatAxisAngle({1, 0, 0}, pitch));
+          DebugBox bx{};
+          const Vec3 mid = (a + b) * 0.5f;
+          bx.pos[0] = mid.x; bx.pos[1] = mid.y; bx.pos[2] = mid.z;
+          bx.half[0] = halfW; bx.half[1] = halfW; bx.half[2] = len * 0.5f;
+          bx.quat[0] = q.x; bx.quat[1] = q.y; bx.quat[2] = q.z; bx.quat[3] = q.w;
+          bx.color = col;
+          dbg.push_back(bx);
+        };
+        for (uint32_t i = 0; i < mobs.MobCount(); i++) {
+          const uint64_t mid = mobs.MobIdAt(i);
+          const ai::Brain* br = mobs.MobBrain(mid);
+          if (br == nullptr || br->profile < 0) continue;
+          const ai::Profile* pf = mobs.Behaviors().At(br->profile);
+          if (pf == nullptr) continue;
+          const Vec3 o = mobs.MobOrigin(mid);
+          const Vec3 foot{o.x, o.y, o.z};
+          // path polyline, from the mob through every remaining waypoint
+          Vec3 prev = foot;
+          for (size_t w = br->path.cursor; w < br->path.pts.size(); w++) {
+            segment(prev + Vec3{0, 1, 0}, br->path.pts[w] + Vec3{0, 1, 0}, 0.18f,
+                    pf->color);
+            prev = br->path.pts[w];
+          }
+          if (!br->hasTarget) continue;
+          // line to the target: solid while it can SEE it, and that is the
+          // distinction worth showing — a mob heading for a remembered position
+          // looks identical to one that is tracking you.
+          segment(foot + Vec3{0, 6, 0}, br->targetPos, br->visible ? 0.3f : 0.12f,
+                  br->visible ? 0xE0FFFFFFu : 0x60FFFFFFu);
+          if (!ui.showAiRing || pf->movement.rangeMax <= 0) continue;
+          // the engagement band, as two dashed rings about the TARGET — the
+          // band is a property of the distance between them, so drawing it
+          // around the thing being circled is what makes "it is holding its
+          // range" visible instead of inferred.
+          for (int k = 0; k < 24 && dbg.size() < kMaxDebugBoxes; k++) {
+            const float a0 = (float)k * (6.2831853f / 24.0f);
+            for (int e = 0; e < 2; e++) {
+              const float r = e == 0 ? pf->movement.rangeMin
+                                     : pf->movement.rangeMax;
+              if (r <= 0) continue;
+              DebugBox bx{};
+              bx.pos[0] = br->targetPos.x + std::sin(a0) * r;
+              bx.pos[1] = br->targetPos.y - 6.0f;
+              bx.pos[2] = br->targetPos.z + std::cos(a0) * r;
+              bx.half[0] = bx.half[1] = bx.half[2] = 0.35f;
+              bx.quat[3] = 1.0f;
+              bx.color = e == 0 ? 0x80FF4040u : 0x8040FF40u;
+              dbg.push_back(bx);
+            }
           }
         }
       }
