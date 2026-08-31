@@ -2395,6 +2395,27 @@ character was holding.
 An authored attack is the same driver replayed from a polyline of deltas, so a
 mob swings with the player's arm rather than an approximation of it.
 
+**One sweep, one kerf, three callers** (integrated 2026-08-31). The damage half
+of this system is `MeleeSweepDamage(EdgeSweep, MeleeTuning, wielder, ...)` in
+`game/melee.cpp` — lifted out of main.cpp's tick loop the moment an attacking
+NPC and a gate needed the same code the player runs. It is also the ONLY place
+a `BladeCut` is built: the sweep finds what the edge passed through, and where
+it used to call `CarveLimbRadial` it now fills the kerf described in the wound
+model section above and calls `Mob::CutLimb`. Keeping that construction inside
+the sweep rather than at each call site is deliberate — the player's cut, an
+NPC's cut and the gate's cut are then the same cut by construction, and there is
+no second copy of the depth formula to drift.
+
+The two halves meet at exactly one number. `MeleeSweepDamage` forms
+`power = speedRamp * MeleeEdgeAlign(...)` once, and everything downstream reads
+that value: the damage, the `BladeCutScope`, and the kerf's `depth` and
+`length`. So a flat-on slap makes a shallower wound as well as a weaker one, for
+free, and the wound model never has to know that edge alignment exists.
+Multiplying `edgeAlign` in a second time when the kerf is built would square it.
+`EdgeSweep::heft` carries the weapon's `ItemDef::HeftFactor` (default 1, so a
+gate that only wants the geometry needs no item) and `EdgeSweep::tick` seeds the
+wound's counter-based RNG.
+
 `--gate swing` covers the mapping (CPU-only, milliseconds, its own fixtures);
 `--gate swing-plane` drives the same driver through the real rig and asserts on
 the sword's own world trajectory; `arm-readback` inside `--gate mob` covers the
