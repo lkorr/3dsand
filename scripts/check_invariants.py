@@ -326,6 +326,53 @@ def check_perf_nodes():
             f"Performance tab instead of appearing under some component")
 
 
+# ------------------------------------------------------ perf scope tooltips
+#
+# The Performance tab explains every CPU scope on hover, and that prose lives in
+# assets/perfview.js (PV_SCOPE_NOTE) rather than in the C++ header, because it
+# is page copy: putting it in perfnodes.h would cost a rebuild AND a
+# multi-minute `--perf` re-record to fix a typo.
+#
+# The price of that choice is a second list that can drift from
+# `kPerfScopeKeys`, and the drift is silent in both directions -- a new
+# PerfScope enumerator gets a bar with no explanation, and a renamed one leaves
+# dead prose behind that never appears. So the two are checked here, which is
+# what makes the split safe rather than sloppy.
+def check_perf_scope_notes():
+    hdr = read("src/measure/perfnodes.h")
+    js = read("assets/perfview.js")
+    if not (hdr and js):
+        return
+    checked.append("perf scope notes")
+
+    m = re.search(r"kPerfScopeKeys\[\]\s*=\s*\{(.*?)\};", hdr, re.S)
+    if not m:
+        problems.append("check_perf_scope_notes: could not find kPerfScopeKeys "
+                        "in src/measure/perfnodes.h")
+        return
+    keys = re.findall(r'"([A-Za-z0-9_]+)"', m.group(1))
+
+    j = re.search(r"const PV_SCOPE_NOTE\s*=\s*\{(.*?)\n\};", js, re.S)
+    if not j:
+        problems.append("check_perf_scope_notes: could not find PV_SCOPE_NOTE "
+                        "in assets/perfview.js")
+        return
+    noted = re.findall(r"^\s{2}([A-Za-z0-9_]+):", j.group(1), re.M)
+
+    for k in keys:
+        if k not in noted:
+            problems.append(
+                f"PerfScope '{k}' (kPerfScopeKeys in src/measure/perfnodes.h) has "
+                f"no entry in PV_SCOPE_NOTE (assets/perfview.js) -- its bar on "
+                f"the Performance tab would have no hover explanation")
+    for k in noted:
+        if k not in keys:
+            problems.append(
+                f"PV_SCOPE_NOTE (assets/perfview.js) explains '{k}', which is not "
+                f"a kPerfScopeKeys entry in src/measure/perfnodes.h -- dead prose "
+                f"that can never be shown")
+
+
 # ------------------------------------------------------ CPU/GPU struct pairs
 #
 # Every struct the CPU fills and a shader reads is declared twice -- once in
@@ -1130,6 +1177,7 @@ ALL = {
     "world": check_world_consts,
     "arch": check_arch_paths,
     "perfnodes": check_perf_nodes,
+    "perfscopes": check_perf_scope_notes,
     "params": check_gpu_structs,
     "windprim": check_wind_prims,
     "curprim": check_current_prims,
@@ -1145,6 +1193,8 @@ RELEVANT = {
     "src/sim/tuning_params.def": ["tuning", "substeps", "wgunits"],
     "scripts/tuning_prelude.py": ["tuning"],
     "assets/tuner.html": ["render", "arch", "perfnodes"],
+    "assets/perfview.js": ["perfscopes"],
+    "src/measure/perfnodes.h": ["perfnodes", "perfscopes"],
     "src/sim/materials.cpp": ["render"],
     "src/gpu/resources.cpp": ["world"],
     "src/test/selftest.cpp": ["arch"],
