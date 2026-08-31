@@ -59,25 +59,25 @@
       "selfBecomes": "ember"
     },
     {
-      "note": "foliage flashes to fire and is CONSUMED (no ember stage): a burning canopy should vanish in flame, not decay into thousands of ash voxels raining through the crown. Chances are high because leaves are thin fuel; the burn is bounded by the canopy itself (fire decays in ~6 ticks and leaves nothing that grows). ALL FOLIAGE CHANCES WERE CUT 3x on owner report that a crown went up too readily (leaves 225->75->25, needles 380->127, autumn 400->133): a tree should catch and take a while about it rather than flashing over the instant an ember touches it. The RATIOS between the three fuels are preserved -- dry needles and dead autumn leaf still catch several times faster than green leaves, which is the read that makes a pine forest frightening and an oak wood merely flammable."
+      "note": "foliage is CONSUMED and leaves no ash: a burning canopy should vanish in flame, not decay into thousands of ash voxels raining through the crown. Chances are high because leaves are thin fuel; the burn is bounded by the canopy itself (leaf_burning leaves nothing that grows). ALL FOLIAGE CHANCES WERE CUT 3x on owner report that a crown went up too readily (leaves 225->75->25, needles 380->127, autumn 400->133): a tree should catch and take a while about it rather than flashing over the instant an ember touches it. The RATIOS between the three fuels are preserved -- dry needles and dead autumn leaf still catch several times faster than green leaves, which is the read that makes a pine forest frightening and an oak wood merely flammable. NONE OF THOSE NUMBERS MOVED for the leaf_burning change below and none of them should: they are how fast a crown catches, which the owner has already tuned twice.\n\nWHAT DID CHANGE IS THE PRODUCT. These rules used to read `selfBecomes: fire`, and that is why a lit tree cooked the top of the crown and left the bottom-most layer of leaves alone. `fire` is a GAS that rises with probability 1 in calm air, so a burnt leaf turned itself into the one thing that immediately leaves the neighbourhood: the leaf directly below got exactly one 2.5% roll before its only heat source floated away, and nothing would ever bring heat back down to it. Wood never had this problem because it ignites to `ember`, a stationary tag:hot solid. Foliage now does the same through `leaf_burning`, which is ember-for-leaves: it stands still, cooks all six of its faces for the length of its burn, and decays to air rather than ash. Spread is now a front with a direction-free shape instead of a rising plume."
     },
     {
       "self": "leaves",
       "neighbor": "tag:hot",
       "chance": 25,
-      "selfBecomes": "fire"
+      "selfBecomes": "leaf_burning"
     },
     {
       "self": "pine_needles",
       "neighbor": "tag:hot",
       "chance": 127,
-      "selfBecomes": "fire"
+      "selfBecomes": "leaf_burning"
     },
     {
       "self": "autumn_leaves",
       "neighbor": "tag:hot",
       "chance": 133,
-      "selfBecomes": "fire"
+      "selfBecomes": "leaf_burning"
     },
     {
       "note": "THE SHADE RAMPS BURN LIKE WHAT THEY ARE. assets/editor/treegen.js bakes each foliage and bark family as a three-material ramp (dark / plain / lit) so a crown has form; combustion in this file is authored BY NAME, not by tag, so a ramp member with no rule of its own is a leaf that will not catch. Same chance as its plain sibling in every case -- these are lighting tiers, not different fuels, and a canopy that burned in stripes would be worse than one that did not burn at all."
@@ -86,37 +86,37 @@
       "self": "leaves_dark",
       "neighbor": "tag:hot",
       "chance": 25,
-      "selfBecomes": "fire"
+      "selfBecomes": "leaf_burning"
     },
     {
       "self": "leaves_lit",
       "neighbor": "tag:hot",
       "chance": 25,
-      "selfBecomes": "fire"
+      "selfBecomes": "leaf_burning"
     },
     {
       "self": "pine_dark",
       "neighbor": "tag:hot",
       "chance": 127,
-      "selfBecomes": "fire"
+      "selfBecomes": "leaf_burning"
     },
     {
       "self": "pine_lit",
       "neighbor": "tag:hot",
       "chance": 127,
-      "selfBecomes": "fire"
+      "selfBecomes": "leaf_burning"
     },
     {
       "self": "autumn_dark",
       "neighbor": "tag:hot",
       "chance": 133,
-      "selfBecomes": "fire"
+      "selfBecomes": "leaf_burning"
     },
     {
       "self": "autumn_lit",
       "neighbor": "tag:hot",
       "chance": 133,
-      "selfBecomes": "fire"
+      "selfBecomes": "leaf_burning"
     },
     {
       "self": "bark_dark",
@@ -129,6 +129,50 @@
       "neighbor": "tag:hot",
       "chance": 12,
       "selfBecomes": "ember"
+    },
+    {
+      "note": "-------- leaf_burning: ember for leaves. Stands still, cooks its neighbours in every direction, leaves nothing --------\nTHE DECAY TOTAL IS THE WHOLE TUNING SURFACE HERE. 80 per-mille is ~12.5 ticks (0.4 s) per leaf voxel, against `fire`'s ~6, and that number is chosen for reach rather than for looks: a green leaf catches at 25 per-mille per hot face, so a neighbour exposed for 12.5 ticks catches with probability 1 - 0.975^12.5 = 27%, and a leaf with four foliage neighbours passes the fire on ~1.1 times before it is spent. Just over unity, which is what a crown that burns through looks like -- and it is bounded the way the file has always bounded foliage, by the fuel being CONSUMED into something that authors no rules, not by the growth factor. Per TICK the growth is 0.09, well inside rule 2.\n\nCut this total and the front stalls out in the interior of a canopy; raise it and a single spark takes the whole forest. It is the one number to reach for if a burning tree feels wrong, and it is a much better lever than the ignition chances above, which the owner has already tuned twice and which control how readily a crown catches at all rather than how far the fire then travels.\n\nNo ash branch AT ALL, deliberately, where cloth and flesh both keep a rare one: a crown is tens of thousands of voxels and even a 0.33 per-mille ash branch would rain a floor of it under every burnt tree. Smoke is the visible residue instead.\n\nDouse first, then emit, then the decays -- the ember ordering, for the ember reason: water must beat the burn to the tick."
+    },
+    {
+      "self": "leaf_burning",
+      "neighbor": "tag:extinguisher",
+      "chance": 400,
+      "selfBecomes": "air"
+    },
+    {
+      "note": "THE THREE EMIT RULES ARE ONE RULE WITH A PREFERENCE, and the shape is load-bearing. An emit rule only fires into an AIR neighbour: sim_step.wgsl's RK_EMIT arm scans the allowed directions and falls through to the next rule when none of them is air. So `up` is tried first and gets the whole chance whenever the flame has somewhere to go, which keeps a burning crown looking like a burning crown; and when the cell above is more canopy -- i.e. exactly in the interior, where the old model delivered no heat downward at all -- the up rule is skipped entirely and the down and side rules get their full roll. The flame licks down only where it cannot go up, which is both the right picture and the cheap one.\n\nDown at half of up rather than at parity because this is still fire: the asymmetry is real physics, it just should not have been TOTAL. The old model was 90:0."
+    },
+    {
+      "self": "leaf_burning",
+      "emit": "fire",
+      "dir": "up",
+      "chance": 70
+    },
+    {
+      "self": "leaf_burning",
+      "emit": "fire",
+      "dir": "down",
+      "chance": 35
+    },
+    {
+      "self": "leaf_burning",
+      "emit": "fire",
+      "dir": "side",
+      "chance": 35
+    },
+    {
+      "self": "leaf_burning",
+      "decay": true,
+      "burnDuration": true,
+      "chance": 72,
+      "becomes": "air"
+    },
+    {
+      "self": "leaf_burning",
+      "decay": true,
+      "burnDuration": true,
+      "chance": 8,
+      "becomes": "smoke"
     },
     {
       "self": "grass",
@@ -206,10 +250,19 @@
       "selfBecomes": "wood"
     },
     {
+      "note": "EVERY EMIT RULE IN THIS FILE USED TO BE dir:up, AND THAT WAS THE BUG. Combined with `fire` being a gas that rises with probability 1 in calm air (gasIntent, sim_step.wgsl), it meant the world had no downward heat path of any kind: the only thing that ever warmed a voxel from above was a stationary tag:hot SOLID touching it directly. Owner report, two symptoms, one cause -- a lit tree cooks the top of its crown and ignores the bottom layer of leaves, and a character whose torso burns through never lights his own legs.\n\nSo every up-emit below now has a down sibling at half its chance. The half is not timidity, it is the physics being restored to an asymmetry instead of an absolute: fire really does prefer to go up, it just does not refuse to go down.\n\nWHY THE ORDER IS SAFE. RK_EMIT only fires into an AIR neighbour and falls through to the next rule when no allowed direction is air, so `up` first costs the down rule nothing in the case that matters -- a flame with fuel or ground above it skips the up rule entirely and the down rule rolls at full chance. In the open the up rule wins most ticks and the flame still reads as rising. One caveat worth recording because the two evaluators differ here: MobSystem::BurnOneLimb's emit arm does NOT test the target for air before consuming the rule (it relies on kCellOpIfAir downstream), so on a BODY the down rule gets the residual ~93% of its chance rather than the full amount. That is still hundreds of fire voxels a tick under a burning torso, which is what reaches the legs -- the limb lattices cannot see each other at all, so the world grid is the only channel between them."
+    },
+    {
       "self": "ember",
       "emit": "fire",
       "dir": "up",
       "chance": 90
+    },
+    {
+      "self": "ember",
+      "emit": "fire",
+      "dir": "down",
+      "chance": 45
     },
     {
       "note": "The ember stage IS the burn: wood ignites to ember on contact with tag:hot, then smolders here until one of these decay rules retires it. Their SUM is the death rate, so scaling all three together sets burn DURATION without touching how fire spreads (that is the wood+tag:hot ignition rule above, deliberately left fast). Total 7 per-mille vs the old 27 = wood takes ~4x longer to be consumed, ~140 ticks mean. Within that budget ash is ~1/4 of decays and smoke is doubled relative to the old 20:7 ash:smoke split, so a burnt-out fire leaves a scatter of ash rather than a floor of it. Embers also live 4x longer, so each one emits its upward fire ~4x more over its life: fire persists longer without spreading faster."
@@ -738,6 +791,12 @@
     },
     {
       "self": "cloth_burning",
+      "emit": "fire",
+      "dir": "down",
+      "chance": 60
+    },
+    {
+      "self": "cloth_burning",
       "decay": true,
       "burnDuration": true,
       "chance": 26.67,
@@ -795,6 +854,12 @@
     },
     {
       "self": "hair_burning",
+      "emit": "fire",
+      "dir": "down",
+      "chance": 100
+    },
+    {
+      "self": "hair_burning",
       "decay": true,
       "burnDuration": true,
       "chance": 180,
@@ -820,6 +885,12 @@
       "emit": "fire",
       "dir": "up",
       "chance": 120
+    },
+    {
+      "self": "undercloth_burning",
+      "emit": "fire",
+      "dir": "down",
+      "chance": 60
     },
     {
       "self": "undercloth_burning",
@@ -868,6 +939,12 @@
       "emit": "fire",
       "dir": "up",
       "chance": 70
+    },
+    {
+      "self": "flesh_burning",
+      "emit": "fire",
+      "dir": "down",
+      "chance": 35
     },
     {
       "self": "flesh_burning",

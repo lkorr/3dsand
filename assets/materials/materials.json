@@ -2583,6 +2583,24 @@
         "dissolvable"
       ],
       "molten": "fire"
+    },
+    {
+      "//": "FOLIAGE ACTUALLY ALIGHT -- and the reason it has to be a material at all is that fire in this engine only ever moves UP. `fire` is a gas with rise probability 1024/1024 in calm air (gasIntent, sim_step.wgsl), and every emit rule in reactions.json is dir:up, so the world's whole flame budget migrates upward through the fuel. Wood survives that because it ignites to `ember`, a STATIONARY tag:hot solid that cooks all six of its faces for ~140 ticks -- which is why a trunk burns downward. Foliage went straight to `fire`, so a burnt leaf converted itself into the one thing that immediately floats away and left nothing behind to heat the leaf below it. Owner report: a lit tree cooks the top of the crown and leaves the bottom-most layer of leaves untouched. That is exactly the shape of a rising-only heat source.\n\nSo this is `ember` for leaves, and it is a separate id rather than a reuse of `ember` for the two reasons reactions.json already argues at the foliage ignition rules: it must not decay to ASH (a canopy that rained thousands of ash voxels through itself was the thing that authoring was written to avoid), and it must be light and short-lived rather than a dense smouldering log. It leaves NOTHING -- air and a little smoke -- so the burn is still bounded by the canopy consuming itself, which is the same subcriticality argument as before (CLAUDE.md rule 2); all that changed is that the heat now sits still long enough to be conducted sideways and DOWN.\n\nNot tagged flammable: it is already burning, and a second ignition rule reaching it would be a loop. hardness 1 and a low density because it is a leaf, not a coal -- a burning crown should still come apart at a touch.",
+      "id": "leaf_burning",
+      "class": "solid",
+      "density": 300,
+      "hardness": 1,
+      "emission": 200,
+      "colors": [
+        "#e8701c",
+        "#c04f12",
+        "#ffa233"
+      ],
+      "tags": [
+        "hot",
+        "organic"
+      ],
+      "molten": "fire"
     }
   ]
 }

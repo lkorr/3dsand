@@ -139,6 +139,11 @@ const char* const kOrder[] = {
     // regenerates the world on the way out so the gates after it still find
     // pristine terrain (rule 7).
     "armor-react",
+    // Fire's DOWNWARD reach, and it sits here for the same reason the two
+    // above do: it lights a real fire at absolute coordinates and burns for
+    // 900 ticks, and it regenerates the world on the way out so the gates
+    // after it still find pristine terrain (rule 7).
+    "fire-down",
     // LAST of the world-touching gates, and it must be: BuildVoxRegion moves
     // the residency window and resets the page table, which is the state every
     // other gate's fixture placement assumes. It restores both before it

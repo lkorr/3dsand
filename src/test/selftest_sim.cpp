@@ -2591,6 +2591,169 @@ Status GateSimd(Ctx&, std::string& detail) {
   return bad == 0 ? Status::Pass : Status::Fail;
 }
 
+// ---- fire-down: can fire travel DOWNWARD at all? ---------------------------
+//
+// THE BUG THIS EXISTS FOR. Nothing in the world had a downward heat path.
+// `fire` is a gas with rise probability 1024/1024 in calm air (gasIntent,
+// sim_step.wgsl) and every emit rule in reactions.json was `dir: up`, so the
+// only way heat ever reached a voxel from above was a STATIONARY tag:hot solid
+// touching it. Wood had one (`ember`); foliage did not, because
+// `leaves + tag:hot` produced `fire` directly — i.e. a burnt leaf converted
+// itself into the one thing that immediately leaves the neighbourhood. Owner
+// report, two symptoms and one cause: a lit tree cooks the top of its crown
+// and never touches the bottom layer of leaves, and a character whose torso
+// burns through never lights his own legs.
+//
+// TWO ARMS, because the fix is two mechanisms and either one alone would let a
+// one-armed gate pass while half the bug survived:
+//
+//   A. CONDUCTION, through solid fuel. A leaf slab lit across its TOP face
+//      must burn all the way to its BOTTOM layer. This is the `leaf_burning`
+//      stage: a stationary tag:hot solid that cooks all six of its faces for
+//      the length of its burn. Note there is no flame in this arm at all —
+//      RK_EMIT only fires into an AIR neighbour, and the interior of a slab
+//      has none — so it measures conduction and nothing else.
+//
+//   B. EMISSION, one cell down through air. A second slab sits below the first
+//      with ONE cell of air between them, and must catch. Nothing conducts
+//      across air, so this arm can only pass through the `dir: down` emit
+//      siblings, and it is the exact analogue of the body case: MobSystem's
+//      limb lattices cannot see each other, so a burning torso reaches the
+//      legs ONLY by putting fire into the world cell between them.
+//
+// WHY ONE CELL AND NOT TWO. Because one cell is the whole claim, and a gate
+// that asserted more would be asserting a feature nothing here implements.
+// Measured with a two-cell gap: 0%, and the arithmetic says why rather than
+// leaving it a mystery. A flame RISES every tick it lives, so it gets exactly
+// one roll at each altitude on its way out; giving `fire` its own downward
+// emit therefore buys ~0.05 cells of descent, not the ~0.33 a stationary
+// emitter would get, and no survivable chance closes a two-cell gap (the
+// self-replication ceiling is chance 138, where a fire never goes out at all).
+// Heat crossing OPEN AIR at range is radiant transfer, which this engine has
+// never modelled and which is not what either reported symptom needed.
+//
+// WHY A SLAB AND NOT A COLUMN. A 1-wide column of leaves is a 1-D chain with
+// one link per voxel, and at any survivable per-link probability it dies out —
+// under the fix as surely as without it. A slab gives an interior voxel the
+// six neighbours the authored chances were written against, which is the
+// geometry a canopy actually has.
+//
+// FLOATED IN CLEAR AIR, well above the terrain, so the arms measure the fuel
+// and not whatever the ground under the fixture happens to be, and the world
+// is regenerated on the way out (rule 7: the gates after this one still expect
+// pristine terrain).
+Status GateFireDown(Ctx& c, std::string& detail) {
+  GpuContext& ctx = c.ctx;
+  World& world = c.world;
+  Simulation& sim = c.sim;
+
+  auto matId = [&](const char* n) -> uint32_t {
+    for (size_t i = 0; i < c.mats.size(); i++)
+      if (c.mats[i].name == n) return (uint32_t)i;
+    return 0;
+  };
+  const uint32_t mLeaf = matId("leaves"), mEmber = matId("ember"),
+                 mBurn = matId("leaf_burning");
+  if (!mLeaf || !mEmber || !mBurn) {
+    detail = "leaves, ember or leaf_burning missing from materials.json";
+    return Status::Fail;
+  }
+
+  SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+  ctx.WaitIdle();
+
+  // Geometry. Two slabs, W x W in plan, kDeep tall, separated by kGap of air.
+  // The igniter is a layer of `ember` laid ON TOP of the upper slab: a
+  // stationary heat source, so the arms measure how far the fire TRAVELS
+  // rather than how long the match was held.
+  const int W = 9, kDeep = 8, kGap = 1;
+  const int cx = 200, cz = 200, R = W / 2;
+  const int baseY = FixtureYOver(cx - R - 1, cz - R - 1, cx + R + 1, cz + R + 1,
+                                 kDefaultSeed, 24);
+  const int loTop = baseY + kDeep - 1;              // top layer of the LOWER slab
+  const int hiBot = baseY + kDeep + kGap;           // bottom layer of the UPPER slab
+  const int hiTop = hiBot + kDeep - 1;
+
+  std::vector<CellOp> scene;
+  auto put = [&](int x, int y, int z, uint32_t m) {
+    scene.push_back({World::SlotCellIndex({x, y, z}), m & 0xFFFu});
+  };
+  for (int z = -R; z <= R; z++)
+    for (int x = -R; x <= R; x++) {
+      for (int y = 0; y < kDeep; y++) {            // lower slab
+        put(cx + x, baseY + y, cz + z, mLeaf);
+        put(cx + x, hiBot + y, cz + z, mLeaf);     // upper slab
+      }
+      for (int y = 0; y < kGap; y++)               // the gap must be AIR
+        put(cx + x, baseY + kDeep + y, cz + z, 0u);
+      put(cx + x, hiTop + 1, cz + z, mEmber);      // the match
+    }
+
+  uint32_t t = 1;
+  SubmitTick(ctx, world, sim, t, kDefaultSeed, {}, {}, scene, false,
+             {12, 12, 12}, false, false);
+  ctx.WaitIdle();
+
+  // Long enough for a front to cross both slabs and the gap at the authored
+  // rates, and short enough to stay a ~10 s gate. A layer transition is order
+  // 20 ticks (a leaf catches at 25 per-mille per hot face and leaf_burning
+  // exposes it for ~12.5), so 18 layers of travel wants several hundred.
+  const uint32_t kTicks = 900;
+  for (uint32_t i = 2; i <= kTicks; i++)
+    SubmitTick(ctx, world, sim, ++t, kDefaultSeed, {}, {}, {}, false,
+               {12, 12, 12}, false, false);
+  ctx.WaitIdle();
+
+  std::vector<uint32_t> vox(kNumChunks * (size_t)kChunkVol);
+  ReadVoxelsSync(ctx, world, 0, kNumChunks, vox.data(), "fireDownRead");
+  auto at = [&](int x, int y, int z) {
+    return vox[World::SlotCellIndex({x, y, z})] & 0xFFFu;
+  };
+
+  // "Touched by fire" is `no longer leaves`. Leaves are consumed to air (or
+  // are mid-burn as leaf_burning); nothing else in the fixture can remove
+  // them, and counting the leaves LEFT rather than the products is what keeps
+  // the assertion independent of which decay branch won.
+  auto layerBurnt = [&](int y) {
+    uint32_t gone = 0;
+    for (int z = -R; z <= R; z++)
+      for (int x = -R; x <= R; x++)
+        if (at(cx + x, y, cz + z) != mLeaf) gone++;
+    return gone;
+  };
+  const uint32_t cells = (uint32_t)(W * W);
+  const uint32_t hiTopGone = layerBurnt(hiTop), hiBotGone = layerBurnt(hiBot);
+  const uint32_t loTopGone = layerBurnt(loTop), loBotGone = layerBurnt(baseY);
+
+  const double floorPct = BaselineNumber("fireDownLayerPctMin", 60.0);
+  auto pct = [&](uint32_t n) { return 100.0 * (double)n / (double)cells; };
+
+  // Arm A fails as "the front stalled inside the slab", arm B as "the front
+  // never crossed the gap" — and the top layer is asserted too, so a fixture
+  // that never lit at all reports THAT rather than looking like a spread bug.
+  const bool lit = pct(hiTopGone) >= floorPct;
+  const bool armA = pct(hiBotGone) >= floorPct;
+  const bool armB = pct(loTopGone) >= floorPct;
+  const bool armBDeep = pct(loBotGone) >= floorPct;
+
+  char buf[512];
+  std::snprintf(buf, sizeof(buf),
+                "%s: lit %.0f%% | A conduct (slab bottom) %.0f%% | B emit "
+                "(down %d cell of air) %.0f%% | lower slab bottom %.0f%% "
+                "[floor %.0f%%, %u ticks, %dx%d slabs %d deep]",
+                (lit && armA && armB && armBDeep) ? "PASS" : "FAIL",
+                pct(hiTopGone), pct(hiBotGone), kGap, pct(loTopGone),
+                pct(loBotGone), floorPct, kTicks, W, W, kDeep);
+  detail = buf;
+  std::printf("fire-down: %s\n", buf);
+
+  // Rule 7: leave pristine terrain for the gates after this one.
+  SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+  ctx.WaitIdle();
+
+  return (lit && armA && armB && armBDeep) ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& SimGates() {
@@ -2609,6 +2772,7 @@ const std::vector<Gate>& SimGates() {
       {"fluid-react", "sim", {}, false, GateFluidReact},
       {"prefab", "sim", {}, false, GatePrefab},
       {"page-roundtrip", "sim", {}, false, GatePageRoundtrip},
+      {"fire-down", "sim", {}, false, GateFireDown},
       {"daylight-boundary", "sim", {}, false, GateDaylightBoundary},
       // No draw of its own, but its verdict reads bestFrameMs, which only the
       // screenshots gate sets — so it needs the render path transitively.
