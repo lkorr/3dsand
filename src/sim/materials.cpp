@@ -301,14 +301,28 @@ static bool LoadMaterialsJson(const std::string& path, std::vector<MaterialDef>&
                   "tinted — the state nibble is fullness\n";
       } else {
         for (const auto& t : m["tints"]) {
-          uint32_t rgb = 0;
-          if (!t.is_string() || !ParseColor(t.get<std::string>(), rgb)) {
+          uint32_t abgr = 0;
+          if (!t.is_string() || !ParseColor(t.get<std::string>(), abgr)) {
             errors += path + ": material \"" + d.name +
                       "\": tints must be \"#rrggbb\" strings\n";
             d.tints.clear();
             break;
           }
-          d.tints.push_back(rgb);
+          // ParseColor hands back the GPU's 0xAABBGGRR, which is right for
+          // color0/1/2 and WRONG here. Tints are stored as plain 0x00RRGGBB —
+          // the packing MicroBodySet::artColors already uses — for two reasons
+          // that both matter:
+          //   * UploadTables runs ArtRgbToGpu over this run exactly as it does
+          //     over the art run, so leaving it in GPU order swapped red and
+          //     blue on every authored dye (a purple robe landing in the grid
+          //     as a teal one, and reading as an art mistake, not a packing
+          //     one — which is the bug ArtRgbToGpu's own comment warns about).
+          //   * quantizing a body's 8-bit ART colour to its material's nearest
+          //     tint (DebrisSystem::RefreshTintMap) compares the two lists
+          //     channel for channel, and two packings would make "nearest"
+          //     mean nothing.
+          d.tints.push_back(((abgr & 0xFFu) << 16) | (abgr & 0xFF00u) |
+                            ((abgr >> 16) & 0xFFu));
         }
       }
     }

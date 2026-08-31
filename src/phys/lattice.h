@@ -26,6 +26,19 @@
 // DownsampleMicro applies for settle-back, so a carved shape reads the same way
 // to physics as it does to the eye.
 //
+// The plurality is over the (material, ART COLOUR) PAIR, not over the material
+// alone, so the coarse lattice keeps the paint. It has to: the collider lattice
+// is what settle-back and the particle conversion read when a body's matter
+// re-enters the grid, and that is where a body voxel's 8-bit art colour is
+// quantized to its material's nearest authored tint (sim/materials.h
+// kMatFlagTinted). Voting on the material alone zeroed the colour here, which
+// made every fine-skinned body — i.e. every character — land in the world
+// undyed while plain cube debris kept its paint.
+//
+// Pairing rather than voting twice is also what keeps the two answers
+// CONSISTENT: an independent colour vote could hand a block the material of the
+// flesh under a robe and the colour of the robe over it.
+//
 // Coordinates are assumed non-negative (bodies are rebased to their min
 // corner). A block index past 127 cannot be represented in a DebrisVoxel and is
 // DROPPED with `*overflow` set, rather than wrapping the way an (int8_t) cast
@@ -39,7 +52,7 @@ inline std::vector<DebrisVoxel> DownsampleSkin(
   struct Blk {
     uint32_t count = 0;
     int n = 0;
-    uint16_t mat[kMaxDistinct]{};
+    uint32_t pair[kMaxDistinct]{};  // material | color << 16
     uint32_t hits[kMaxDistinct]{};
   };
   std::unordered_map<uint64_t, Blk> blocks;
@@ -54,12 +67,13 @@ inline std::vector<DebrisVoxel> DownsampleSkin(
     // fields wide means a future bound change cannot alias two blocks onto one
     // key the way a packed-byte key would.
     uint64_t key = ((uint64_t)bx << 42) | ((uint64_t)by << 21) | (uint64_t)bz;
+    const uint32_t pair = (uint32_t)v.material | ((uint32_t)v.color << 16);
     Blk& blk = blocks[key];
     blk.count++;
     int k = 0;
     for (; k < blk.n; k++)
-      if (blk.mat[k] == v.material) break;
-    if (k == blk.n && blk.n < kMaxDistinct) blk.mat[blk.n++] = v.material;
+      if (blk.pair[k] == pair) break;
+    if (k == blk.n && blk.n < kMaxDistinct) blk.pair[blk.n++] = pair;
     if (k < kMaxDistinct) blk.hits[k]++;
   }
   if (overflow) *overflow = over;
@@ -72,7 +86,8 @@ inline std::vector<DebrisVoxel> DownsampleSkin(
     for (int k = 1; k < blk.n; k++)
       if (blk.hits[k] > blk.hits[best]) best = k;
     out.push_back({(int8_t)((key >> 42) & 0x1FF), (int8_t)((key >> 21) & 0x1FF),
-                   (int8_t)(key & 0x1FF), 0, blk.mat[best]});
+                   (int8_t)(key & 0x1FF), (uint8_t)(blk.pair[best] >> 16),
+                   (uint16_t)(blk.pair[best] & 0xFFFFu)});
   }
   return out;
 }

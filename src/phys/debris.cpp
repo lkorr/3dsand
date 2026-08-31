@@ -116,6 +116,12 @@ struct BodyLattice {
     return skin ? (uint32_t)((*skin)[i].material & 0xFFFu)
                 : (uint32_t)((*coll)[i].payload & 0xFFFu);
   }
+  // Merged art-palette index, 0 = unpainted. The one thing a body voxel knows
+  // about its colour, and the input to the grid-tint quantization when its
+  // matter escapes into the world (DebrisSystem::GridStateFor).
+  uint32_t Color(size_t i) const {
+    return skin ? (uint32_t)(*skin)[i].color : (uint32_t)(*coll)[i].color;
+  }
   // Rewrite a voxel's material, keeping a cosmetic variant and ZEROING the art
   // slot — microbody.wgsl lets a nonzero art colour override the material
   // colour, so a charred voxel that kept its slot goes on being painted
@@ -143,6 +149,35 @@ int FindMaterialId(const std::vector<MaterialDef>& mats, const std::string& name
   return -1;
 }
 
+// Index of the entry in `tints` closest to `rgb`, both packed 0x00RRGGBB.
+//
+// Plain squared distance in integer RGB. Not a perceptual space, deliberately:
+// this runs once at load over at most 255 x 16 pairs, the inputs are an
+// author's dye list and an author's palette, and a Lab conversion would put
+// floats and a colour-science dependency in the path of a decision that only
+// has to pick the obvious neighbour. int32 is enough — the worst case is
+// 3 * 255^2 = 195075.
+//
+// Ties go to the LOWEST index, which is what makes tint 0 (the natural colour,
+// by the kMatFlagTinted convention) the answer when nothing is closer.
+uint32_t NearestTint(const std::vector<uint32_t>& tints, uint32_t rgb) {
+  const int32_t r = (int32_t)((rgb >> 16) & 0xFF), g = (int32_t)((rgb >> 8) & 0xFF),
+                b = (int32_t)(rgb & 0xFF);
+  uint32_t best = 0;
+  int32_t bestD = INT32_MAX;
+  for (size_t i = 0; i < tints.size() && i < kMatTintsMax; i++) {
+    const int32_t dr = r - (int32_t)((tints[i] >> 16) & 0xFF);
+    const int32_t dg = g - (int32_t)((tints[i] >> 8) & 0xFF);
+    const int32_t db = b - (int32_t)(tints[i] & 0xFF);
+    const int32_t d = dr * dr + dg * dg + db * db;
+    if (d < bestD) {
+      bestD = d;
+      best = (uint32_t)i;
+    }
+  }
+  return best;
+}
+
 }  // namespace
 
 void DebrisSystem::Init(Physics* phys, World* world, const std::vector<MaterialDef>& mats,
@@ -158,6 +193,8 @@ void DebrisSystem::OnMaterialsReloaded(const std::vector<MaterialDef>& mats,
   densityOf_.clear();
   rubbleOf_.clear();
   foliageOf_.clear();
+  matTints_.clear();
+  tintMapValid_ = false;  // tint lists just moved: the art map derived from them
   matGpu_.clear();
   matSelfActive_.clear();
   matHasPair_.clear();
@@ -168,6 +205,7 @@ void DebrisSystem::OnMaterialsReloaded(const std::vector<MaterialDef>& mats,
     classOf_.push_back(m.gpu.klass);
     densityOf_.push_back((float)m.gpu.density);
     matGpu_.push_back(m.gpu);
+    matTints_.push_back(m.tints);
     // which rule shapes this material owns (drives the burn-pass gates)
     uint8_t selfActive = 0, hasPair = 0;
     for (uint32_t ri = 0; ri < m.gpu.reactCount; ri++) {
@@ -201,6 +239,45 @@ void DebrisSystem::OnMaterialsReloaded(const std::vector<MaterialDef>& mats,
     foliageOf_.push_back(foliage);
   }
   for (Body& b : bodies_) RecountBurn(b);  // hot-reload can change rule sets
+}
+
+void DebrisSystem::RefreshTintMap() {
+  // FNV-1a over the merged palette. 255 words at most, once a tick, against a
+  // rebuild that only happens when it actually changed — see the header for why
+  // this is a content stamp and not a length.
+  uint64_t stamp = 1469598103934665603ull;
+  const size_t art = microSet_ ? microSet_->artColors.size() : 0;
+  for (size_t i = 0; i < art; i++)
+    stamp = (stamp ^ microSet_->artColors[i]) * 1099511628211ull;
+  stamp = (stamp ^ (uint64_t)art) * 1099511628211ull;
+  if (tintMapValid_ && stamp == tintArtStamp_) return;
+  tintArtStamp_ = stamp;
+  tintMapValid_ = true;
+
+  tintOfArt_.assign(matTints_.size(), {});
+  for (size_t m = 0; m < matTints_.size(); m++) {
+    if (matTints_[m].empty()) continue;  // not MATF_TINTED: no table, no cost
+    std::vector<uint8_t>& tbl = tintOfArt_[m];
+    // +1 for the unpainted slot at 0. It stays 0 = the natural colour: an
+    // unpainted voxel has no colour to quantize, and running it through
+    // NearestTint against black would dye every plain limb with whichever tint
+    // happened to be darkest.
+    tbl.assign(art + 1, 0);
+    for (size_t a = 0; a < art; a++)
+      tbl[a + 1] = (uint8_t)NearestTint(matTints_[m], microSet_->artColors[a]);
+  }
+}
+
+uint32_t DebrisSystem::GridStateFor(uint32_t mat, uint32_t art,
+                                    uint32_t fallback) const {
+  if (mat >= tintOfArt_.size()) return fallback;
+  const std::vector<uint8_t>& tbl = tintOfArt_[mat];
+  if (tbl.empty()) return fallback;  // untinted: the caller's jitter variant
+  // Past the end means the palette shrank under a body that still holds an old
+  // index — a hot reload between a limb being severed and it landing. Tint 0
+  // rather than a wrap: an undyed corpse is a miss, a randomly dyed one is a bug
+  // report.
+  return art < tbl.size() ? (uint32_t)tbl[art] : 0u;
 }
 
 void DebrisSystem::RecountBurn(Body& b) const {
@@ -485,8 +562,23 @@ void DebrisSystem::RunIslandDetection(const Event& e, uint32_t tick, World& worl
         // palette variant, not a raw 2-bit mask: `& 3u` produced state 3, which
         // no material has a colour for (the shaders all select with `% 3u`).
         uint32_t state = ((cellIdx * 2654435761u) >> 8) % 3u;
-        if (rub < matGpu_.size() && matGpu_[rub].klass == CLASS_LIQUID)
+        if (rub < matGpu_.size() && matGpu_[rub].klass == CLASS_LIQUID) {
           state = 7u;  // LIQ_FULL_STATE: the nibble is fullness for liquids
+        } else if (rub < matGpu_.size() &&
+                   (matGpu_[rub].flags & kMatFlagTinted)) {
+          // A DYED voxel keeps its dye when it crumbles. There is no art colour
+          // to quantize at this seam — this matter is already in the grid, and
+          // the nibble it arrives with IS its tint index — so the carry is
+          // exact, not a re-derivation.
+          //
+          // Only when the SOURCE was tinted too. Otherwise the incoming nibble
+          // is a cosmetic jitter 0..2, and reading it as a tint index would dye
+          // rubble at random out of the first three entries of the destination's
+          // list; tint 0 (the natural colour) is the honest answer there.
+          const bool srcTinted =
+              mat < matGpu_.size() && (matGpu_[mat].flags & kMatFlagTinted);
+          state = srcTinted ? ((words[i] >> 12) & 0xFu) : 0u;
+        }
         // A scrap that keeps its own SOLID material cannot fall in the grid
         // (sim_step returns early for CLASS_SOLID), so writing it back in place
         // would leave it hanging where its support used to be. Hand it to the
@@ -566,6 +658,11 @@ void DebrisSystem::RunIslandDetection(const Event& e, uint32_t tick, World& worl
 
 void DebrisSystem::PreTick(uint32_t tick, World& world, std::vector<CellOp>& cellOps,
                            std::vector<ParticleSpawn>& spawns) {
+  // Cheap and idempotent: an unchanged art palette early-outs on a stamp
+  // compare. Here rather than at a load-time call site because the palette is
+  // rebuilt by the mob loader, the item loader and every R hot-reload, and the
+  // owner has no one place that is after all three.
+  RefreshTintMap();
   // promote flagged support-loss chunks into events while there is queue room
   for (int i = 0; i < kSupportDrainPerTick && !pendingSupport_.empty(); i++) {
     IVec3 wc = pendingSupport_.front();
@@ -616,6 +713,11 @@ namespace {
 // distinct materials, and at those sizes a hash map is all overhead. Past
 // kMaxDistinct materials in one block the first-seen ones win, which is
 // invisible — no authored limb has eight materials in a 2x2x2 box.
+//
+// The plurality is over the (payload, ART COLOUR) PAIR, for the reason
+// DownsampleSkin in phys/lattice.h spells out: this is the lattice settle-back
+// reads, so dropping the colour here is dropping the dye on the way into the
+// grid (sim/materials.h kMatFlagTinted).
 std::vector<DebrisVoxel> DownsampleMicro(const std::vector<DebrisVoxel>& src,
                                          uint32_t scale) {
   const int s = (int)scale;
@@ -624,7 +726,7 @@ std::vector<DebrisVoxel> DownsampleMicro(const std::vector<DebrisVoxel>& src,
   struct Blk {
     uint32_t count = 0;
     int n = 0;
-    uint16_t mat[kMaxDistinct]{};
+    uint32_t pair[kMaxDistinct]{};  // payload | color << 16
     uint32_t hits[kMaxDistinct]{};
   };
   std::unordered_map<uint64_t, Blk> blocks;
@@ -634,12 +736,13 @@ std::vector<DebrisVoxel> DownsampleMicro(const std::vector<DebrisVoxel>& src,
     uint64_t key = ((uint64_t)(uint8_t)((int)v.x / s) << 32) |
                    ((uint64_t)(uint8_t)((int)v.y / s) << 16) |
                    (uint8_t)((int)v.z / s);
+    const uint32_t pair = (uint32_t)v.payload | ((uint32_t)v.color << 16);
     Blk& blk = blocks[key];
     blk.count++;
     int k = 0;
     for (; k < blk.n; k++)
-      if (blk.mat[k] == v.payload) break;
-    if (k == blk.n && blk.n < kMaxDistinct) blk.mat[blk.n++] = v.payload;
+      if (blk.pair[k] == pair) break;
+    if (k == blk.n && blk.n < kMaxDistinct) blk.pair[blk.n++] = pair;
     if (k < kMaxDistinct) blk.hits[k]++;
   }
 
@@ -651,7 +754,8 @@ std::vector<DebrisVoxel> DownsampleMicro(const std::vector<DebrisVoxel>& src,
     for (int k = 1; k < blk.n; k++)
       if (blk.hits[k] > blk.hits[best]) best = k;
     out.push_back({(int8_t)(uint8_t)(key >> 32), (int8_t)(uint8_t)(key >> 16),
-                   (int8_t)(uint8_t)key, 0, blk.mat[best]});
+                   (int8_t)(uint8_t)key, (uint8_t)(blk.pair[best] >> 16),
+                   (uint16_t)(blk.pair[best] & 0xFFFFu)});
   }
   return out;
 }
@@ -733,9 +837,18 @@ void DebrisSystem::SettleBodies(uint32_t tick, World& world,
       // fill-air-only: occupied cells win on the GPU (deterministic — grid
       // state is hashed, and the op replays identically). Minor volume loss
       // where the world grew into the footprint is accepted (§B6).
-      // payload already carries mat+state; add the unstamped stamp field.
-      uint32_t word = (uint32_t)v.payload | (kStampNever << kStampShift) |
-                      kCellOpIfAir;
+      //
+      // The payload already carries mat+state; the state is REPLACED for a
+      // tinted material, because this is the seam the whole grid-tint mechanism
+      // exists for. A body voxel's colour lives in an 8-bit art index no world
+      // cell can hold, so it is quantized here to the material's nearest
+      // authored tint and written into the nibble the payload was already
+      // spending on a cosmetic jitter variant. Untinted materials keep that
+      // variant, unchanged.
+      const uint32_t mat = (uint32_t)v.payload & 0xFFFu;
+      const uint32_t state =
+          GridStateFor(mat, v.color, ((uint32_t)v.payload >> 12) & 0xFu);
+      uint32_t word = PackVoxNew(mat, state) | kCellOpIfAir;
       cellOps.push_back({World::SlotCellIndex(cell), word});
     }
     if (!inWindow) {
@@ -926,9 +1039,16 @@ void DebrisSystem::BurnBodies(uint32_t tick, World& world,
             cellOps.size() < kMaxCellOpsPerTick) {
           IVec3 cell = worldCellOf(p);
           if (world.CellInWindow(cell)) {
+            // THIS VOXEL'S OWN MATTER leaving the body (ash off a burning robe,
+            // blood off a shattering limb) — not the emission in the branch
+            // below, which puts fire into a neighbouring AIR cell and has no
+            // colour to inherit. So the dye follows it: quantize the voxel's art
+            // colour to the PRODUCT's tints, since a purple robe's ash is
+            // whatever ash a purple robe leaves, not whatever cloth is nearest.
             uint32_t state = matGpu_[pm].klass == CLASS_LIQUID
                                  ? 7u  // LIQ_FULL_STATE
-                                 : (rr >> 6u) % 3u;
+                                 : GridStateFor(pm, lat.Color(vi),
+                                                (rr >> 6u) % 3u);
             cellOps.push_back({World::SlotCellIndex(cell),
                                PackVoxNew(pm, state) | kCellOpIfAir});
             opsBudget--;
@@ -1393,7 +1513,15 @@ void DebrisSystem::VoxelsToParticles(const Body& b,
     s.vx = (int32_t)std::lround(vel.x * 256.0f / 30.0f);
     s.vy = (int32_t)std::lround(vel.y * 256.0f / 30.0f);
     s.vz = (int32_t)std::lround(vel.z * 256.0f / 30.0f);
-    s.payload = v.payload;
+    // Same tint quantization settle-back does, and for the same reason: a
+    // particle carries its payload verbatim through the ballistic pass and
+    // rejoins the grid as that word, so the dye has to be in the nibble BEFORE
+    // the matter leaves the body. Skipping it here is what would make a
+    // shattered corpse's chunks the right colour and its spray the wrong one.
+    const uint32_t pmat = (uint32_t)v.payload & 0xFFFu;
+    const uint32_t pstate =
+        GridStateFor(pmat, v.color, ((uint32_t)v.payload >> 12) & 0xFu);
+    s.payload = (uint16_t)(pmat | (pstate << 12));
     s.flags = 1u;  // PFLAG_ALIVE
     spawns.push_back(s);
   }

@@ -919,6 +919,23 @@
         "#31275a",
         "#473a80"
       ],
+      "//tints": "GRID dyes for fabric (sim/materials.h kMatFlagTinted): what a garment's colour becomes once its matter is in the world grid, where the 8-bit art colour a body voxel carries cannot follow it. Entry 0 is cloth's own indigo, so an unpainted cloth voxel and any CPU path that never heard of tints both read UNDYED. Entries 1 and 2 are the two materials this list retires -- robe_shadow's fold-dark and robe_trim's gold, each of which existed only to be a colour, which is the pollution the tint system removes. The rest is a dye wheel wide enough that any authored garment lands on something recognisable rather than on the nearest thing that happens to exist. Cloth is never placed by worldgen, which is what makes tinting it safe: worldgen writes state = rnd % 3 and would scatter dyes 0..2 across a tinted material.",
+      "tints": [
+        "#3b2f6b",
+        "#241c46",
+        "#c9a227",
+        "#7d1f1f",
+        "#a8442a",
+        "#e0d7bf",
+        "#2f5a34",
+        "#2a5a78",
+        "#5a2a5e",
+        "#23231f",
+        "#8a5a3a",
+        "#c4738f",
+        "#4a5a2a",
+        "#d9c48a"
+      ],
       "tags": [
         "flammable",
         "organic",
@@ -976,6 +993,21 @@
         "#c68d63",
         "#e8b287"
       ],
+      "//tints": "GRID complexions (sim/materials.h kMatFlagTinted), and the reason the mechanism exists: a green-fleshed mob's severed arm used to land in the world the raw colour of `skin`, because its complexion lived in an 8-bit art index and no world cell can hold one. Human range first, then the non-human hues a bestiary actually needs -- an art colour is quantized to the NEAREST of these by RGB distance at load, so the list only has to cover the families, not every shade. Entry 0 is skin's own colour, so an unpainted body reads undyed. flesh_cooked / flesh_charred / flesh_cinder carry the same families at their own values, which is what keeps a green mob greenish as it burns instead of snapping to human brown at the first reaction.",
+      "tints": [
+        "#d9a074",
+        "#f4dcc2",
+        "#e5b68c",
+        "#b9814f",
+        "#8a5a34",
+        "#57381f",
+        "#2e2018",
+        "#7fa86a",
+        "#93a8b8",
+        "#b8687f",
+        "#6f5fa0",
+        "#c8c46e"
+      ],
       "tags": [
         "flammable",
         "organic",
@@ -1012,6 +1044,17 @@
         "#4b301b",
         "#6b472b"
       ],
+      "//tints": "GRID dyes for hide (sim/materials.h kMatFlagTinted). Narrower than cloth's wheel on purpose: leather takes dye badly and the real range is tanning depth plus a few saturated finishes, so a wide wheel here would only invent colours no armourer would produce. Entry 0 is leather's own tan.",
+      "tints": [
+        "#5a3a22",
+        "#8a5c35",
+        "#3a2416",
+        "#1e1712",
+        "#7a5a3a",
+        "#6a2a2a",
+        "#2f3a30",
+        "#2a3448"
+      ],
       "tags": [
         "flammable",
         "organic",
@@ -1033,6 +1076,15 @@
         "#6a4a2c",
         "#5b3e24",
         "#7d5a38"
+      ],
+      "//tints": "GRID timbers (sim/materials.h kMatFlagTinted): the species/finish of a haft, kept once the prop breaks and its matter enters the grid. THIS is the tinted wood and `wood` is NOT, which is the whole worldgen constraint in one pair of materials -- `wood` is what every tree and the spawn platform are made of, and worldgen writes state = rnd % 3, so tinting it would scatter dyes 0..2 across every trunk in the world. staff_wood is only ever placed by prefabs and items, so its nibble is nobody else's.",
+      "tints": [
+        "#6a4a2c",
+        "#3a2618",
+        "#9a7a52",
+        "#c8b48a",
+        "#4a3a2a",
+        "#2a2320"
       ],
       "tags": [
         "flammable",
@@ -1069,6 +1121,15 @@
         "#d0cab4",
         "#f2eeda"
       ],
+      "//tints": "GRID bone (sim/materials.h kMatFlagTinted). Not dyes -- AGE: fresh, bleached, weathered, stained, old, scorched. That is the only axis bone varies on, and it is worth carrying into the grid because a skeleton's bones and the bones of the thing it killed last year should not land in the world the same colour. Entry 0 is bone's own.",
+      "tints": [
+        "#e4dfcb",
+        "#f2eee0",
+        "#c4b898",
+        "#9a8a68",
+        "#6a5f48",
+        "#3a352a"
+      ],
       "tags": [
         "organic",
         "dissolvable"
@@ -1085,6 +1146,17 @@
         "#b8bfc8",
         "#9aa2ad",
         "#d8dee6"
+      ],
+      "//tints": "GRID metal finishes (sim/materials.h kMatFlagTinted): blued, blackened, brass, bronze, copper, polished, gunmetal. All ONE material -- steel's density 7800 and hardness 200 are what a blade weighs and how it resists a blast, and a bronze buckle differing from a steel one by a colour is exactly what a tint is for and exactly what another material id is not. Entry 0 is steel's own. Never placed by worldgen, so the nibble is free.",
+      "tints": [
+        "#b8bfc8",
+        "#6f7780",
+        "#3a4048",
+        "#c9a24a",
+        "#b06a3a",
+        "#c07a72",
+        "#d8dee6",
+        "#6a7a86"
       ],
       "tags": [
         "mineral"
@@ -2244,6 +2316,21 @@
         "#96593d",
         "#b87a58"
       ],
+      "//tints": "skin's complexion families again, at cooked value, IN THE SAME ORDER -- that ordering is a convenience for a reader, not a mechanism: the quantization is by RGB distance from the body voxel's own art colour to THIS list, so a green mob's seared flesh finds entry 7 here because entry 7 is the greenish one, not because it was entry 7 there. Which means the chain degrades gracefully if a later edit reorders one list and forgets the other.",
+      "tints": [
+        "#a86a4a",
+        "#c99a78",
+        "#b8825c",
+        "#96633e",
+        "#6f4a2c",
+        "#4a301c",
+        "#281c15",
+        "#6d7f4a",
+        "#7d8a92",
+        "#96545f",
+        "#5c5170",
+        "#a09258"
+      ],
       "tags": [
         "flammable",
         "organic",
@@ -2282,6 +2369,16 @@
         "#3a2f2a",
         "#2c2320",
         "#4a3c34"
+      ],
+      "//tints": "Deliberately SHORT, and the short list is the statement: char is char. Fire destroys colour, so carrying twelve complexions this far down the chain would claim a distinction that is not there. What survives is a whisper of hue -- warm, cool, greenish -- over a value that is nearly the same in every entry, so a burnt orc reads faintly different from a burnt human at arm's length and identical from across a room, which is correct.",
+      "tints": [
+        "#3a2f2a",
+        "#45372f",
+        "#332923",
+        "#262020",
+        "#1c1614",
+        "#33382c",
+        "#2e3236"
       ],
       "tags": [
         "organic",
@@ -2524,6 +2621,17 @@
         "#665843",
         "#8d7c5c"
       ],
+      "//tints": "Undercloth shades, and muted rather than cloth's dye wheel because that is what undyed linen IS -- bleach, wear and soot, not colour. Tinted for the same reason this material exists at all: the fix that gave the undercloth its own id was about a garment surviving a burn as a garment, and a garment that survives the burn and then lands in the grid the colour of raw flax has only moved the problem one seam along.",
+      "tints": [
+        "#7a6a4e",
+        "#d8cdb4",
+        "#a89a78",
+        "#5c5138",
+        "#8a6a5a",
+        "#6a7a6a",
+        "#6a6a80",
+        "#3a332a"
+      ],
       "tags": [
         "flammable",
         "organic",
@@ -2579,6 +2687,13 @@
         "#191411",
         "#0f0c0a",
         "#241d18"
+      ],
+      "//tints": "Four near-identical near-blacks, which is what the TERMINUS of the burn chain should be worth. It is tinted at all only so the chain has no hole in it: an untinted material reads its nibble as a jitter variant, so a cinder voxel arriving with a tint index would silently pick a palette variant instead, and the next author to wonder why the chain stops here would have to read three files to find out it does not matter.",
+      "tints": [
+        "#191411",
+        "#1d1714",
+        "#16110f",
+        "#14161a"
       ],
       "tags": [
         "organic",

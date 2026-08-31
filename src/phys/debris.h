@@ -171,6 +171,35 @@ class DebrisSystem {
   // Micro bodies must allocate out of the same set the renderer uploads, so
   // the owner hands it over once at startup. Not owned.
   void SetMicroSet(MicroBodySet* set) { microSet_ = set; }
+
+  // ---- art colour -> GRID tint (sim/materials.h kMatFlagTinted) ------------
+  //
+  // A body voxel carries an 8-bit ART colour, which is render-only: nothing in
+  // the world grid can hold it, so a green-fleshed corpse used to land in the
+  // world the raw colour of `skin`. A MATF_TINTED material can hold 16 GRID
+  // colours in the state nibble, and this is the map between the two — built
+  // once, on the CPU, at load.
+  //
+  // Nearest by INTEGER RGB distance over the merged art palette
+  // (MicroBodySet::artColors, whose 1-based indices `DebrisVoxel::color` and
+  // `PrefabVoxel::color` hold). Integer and load-time, so rule 1 is untouched
+  // twice over: no float ever reaches a sim decision, and the result is a
+  // constant for the whole run of a given materials.json + prefab set.
+  //
+  // REBUILT ON DEMAND rather than pushed by a setter, because the two inputs
+  // arrive from different places at different times — materials from
+  // OnMaterialsReloaded, the merged palette from LoadMobDefs (and again from
+  // the item loader, and again on every R hot-reload, which CLEARS the palette
+  // and renumbers it). A stamp over the palette's CONTENTS, not its length,
+  // is what makes "drop one mob, add another" invalidate it: same count,
+  // different colours, and a length check would have kept the stale table and
+  // repainted everything with the previous load's dyes.
+  void RefreshTintMap();
+  // The state nibble to write into the grid for `mat` carrying merged art
+  // index `art` (0 = unpainted). Returns `fallback` — the cosmetic jitter
+  // variant every caller already computed — when `mat` is not tinted, so an
+  // untinted material behaves exactly as it did before this existed.
+  uint32_t GridStateFor(uint32_t mat, uint32_t art, uint32_t fallback) const;
   // ---- "this body is gone" -------------------------------------------------
   //
   // Called for every body this system releases, whatever released it: culled
@@ -499,6 +528,17 @@ class DebrisSystem {
   std::vector<uint8_t> matSelfActive_;  // material has decay/emit rules
   std::vector<uint8_t> matHasPair_;     // material has pair rules
   std::vector<uint8_t> matHasScaled_;   // material has scaleByNeighbors rules
+  // Authored GRID tints per material id, 0x00RRGGBB (MaterialDef::tints).
+  // Empty for everything that is not MATF_TINTED, which is almost everything.
+  std::vector<std::vector<uint32_t>> matTints_;
+  // Per material, merged-art-index -> tint index. Entry 0 is the unpainted
+  // case and is always tint 0, the material's natural colour by convention —
+  // so a body voxel nobody painted lands undyed rather than as whichever dye
+  // happens to sit closest to nothing. Empty for an untinted material; see
+  // RefreshTintMap.
+  std::vector<std::vector<uint8_t>> tintOfArt_;
+  uint64_t tintArtStamp_ = 0;   // content stamp of the palette it was built from
+  bool tintMapValid_ = false;   // cleared by OnMaterialsReloaded
   // Integer day phase for the current tick, mirroring TickParams.dayPhase, so
   // the CPU reaction mirror can evaluate a rule's day/night gate exactly as
   // sim_step.wgsl does (sim/reactcpu.h). 0 (deep night) until the owner sets
