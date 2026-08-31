@@ -1,5 +1,7 @@
 #include "game/avatar.h"
 
+#include "sim/scale.h"  // MetresToCells
+
 #include "phys/lattice.h"
 
 #include <algorithm>
@@ -1321,8 +1323,13 @@ void PlayerAvatar::UpdateAnimation(float dt, World& world, bool grounded,
     // rig — do not have to spend.
     const float aheadRaw = ((float)hangLipW_.x + 0.5f - cx) * dir.x +
                            ((float)hangLipW_.z + 0.5f - cz) * dir.z;
-    const float ahead = std::clamp(aheadRaw - 0.55f, Player::kHalfXZ * 0.6f,
-                                   Player::kHalfXZ + 1.2f);
+    // The two bare terms were world voxels sitting either side of a
+    // metres-derived kHalfXZ — a mixed-unit clamp, so at 5 cm the 5.5 cm
+    // setback and the 12 cm overhang both halved while the capsule they bound
+    // did not, and the palm stopped landing on the lip.
+    const float ahead = std::clamp(aheadRaw - MetresToCells(0.055f),
+                                   Player::kHalfXZ * 0.6f,
+                                   Player::kHalfXZ + MetresToCells(0.12f));
     for (size_t c = 0; c < sk.chains.size(); c++) {
       const IkChain& ch = sk.chains[c];
       if (ch.tag != "arm" || ch.parts.empty() || ch.effector < 0) continue;
@@ -1331,7 +1338,8 @@ void PlayerAvatar::UpdateAnimation(float dt, World& world, bool grounded,
       const Vec3 shoulder = sk.parts[ch.parts[0]].anchorLocal;
       const float latM = shoulder.x - pivot.x;  // this arm's own spread
       // Palm rest point on the lip: fingers just over the top surface.
-      Vec3 palmW{cx + leftW.x * latM + dir.x * ahead, lipTopY + 0.2f,
+      Vec3 palmW{cx + leftW.x * latM + dir.x * ahead,
+                 lipTopY + MetresToCells(0.02f),
                  cz + leftW.z * latM + dir.z * ahead};
       Vec3 rel = palmW - bodyOrigin - pivot;
       Vec3 palmPrefab = RotateInv(yaw, rel) + pivot;
@@ -1400,9 +1408,12 @@ void PlayerAvatar::UpdateAnimation(float dt, World& world, bool grounded,
       // a real dead hang stretches them. Bounded, weight-faded, and ZERO for
       // any rig whose arms genuinely reach: long-armed models never shrug.
       if (shortBy > 0.0f && toT.len() > 1e-4f) {
-        constexpr float kShrugCapVox = 2.5f;
+        // 25 cm of shoulder shrug. In metres because it is bounded against a
+        // real arm's shortfall: a bare 2.5 cells would let the shoulder travel
+        // half as far at 5 cm and the hang would stop reaching the ledge.
+        const float kShrugCap = MetresToCells(0.25f);
         const Vec3 shift =
-            toT * (std::min(shortBy, kShrugCapVox) / toT.len() * weight);
+            toT * (std::min(shortBy, kShrugCap) / toT.len() * weight);
         st.model[i0].pos += shift;
         st.model[i1].pos += shift;
         if (ie != i1) st.model[ie].pos += shift;
@@ -1814,7 +1825,10 @@ void PlayerAvatar::SelfDestruct(Vec3 atWorldVoxel, float radiusVox,
     if (!PartAlive((int)i) || !limbs_[i].body) continue;
     const MobLimbDef& ld = limbDefs_[i];
     if ((int)i == def_->rootLimb || ld.vital || !ld.severable) continue;
-    if ((limbs_[i].xf.pos - atWorldVoxel).len() <= radiusVox + 2.0f)
+    // 20 cm of margin past the blast radius, so the limb sweep covers the same
+    // real shell at any voxel size.
+    if ((limbs_[i].xf.pos - atWorldVoxel).len() <=
+        radiusVox + MetresToCells(0.2f))
       hits.push_back((int)i);
   }
   for (int i : hits)

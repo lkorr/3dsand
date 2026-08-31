@@ -28,6 +28,7 @@ namespace selftest {
 // Each domain file exposes its gates through one of these.
 const std::vector<Gate>& TerrainGates();
 const std::vector<Gate>& TreeGates();
+const std::vector<Gate>& ScaleGates();
 const std::vector<Gate>& SimGates();
 const std::vector<Gate>& CaGates();
 const std::vector<Gate>& WindGates();
@@ -72,6 +73,14 @@ const char* const kOrder[] = {
     // compute, which is a precondition for trusting ANY later gate's page
     // table: PageTable::Classify decides sentinel promotion with them.
     "simd",
+    // THIRD, and for the same reasons: `scale` is pure CPU over the loaded
+    // defs and the atlas files -- no world, no GPU, no fixtures. It asserts
+    // that everything authored is the PHYSICAL size it claims, which every
+    // other gate in the suite is blind to (they measure art-lattice counts,
+    // which are identical on a world where everything is half-size). A
+    // wrong-scale world makes every later gate meaningless, so it belongs
+    // with the other cheap front-loaded checks rather than after them.
+    "scale",
     "player-kit",
     // SECOND, and for the same reason: `tree-atlas` reads assets/trees/*.svtree
     // off disk and asserts on the bytes. No world, no GPU, no state left
@@ -135,7 +144,7 @@ const char* const kOrder[] = {
 const std::vector<Gate>& Registry() {
   static std::vector<Gate> all = [] {
     std::vector<Gate> pool;
-    for (const auto* g : {&TerrainGates(), &TreeGates(),
+    for (const auto* g : {&TerrainGates(), &TreeGates(), &ScaleGates(),
                           &SimGates(), &CaGates(), &WindGates(), &WaterGates(),
                           &RenderGates(),
                           &PlayerGates(),

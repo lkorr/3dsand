@@ -11,6 +11,19 @@
  *   node scripts/bake_trees.mjs --seed       # (re)write the shipped presets
  *                                            # as assets/trees/*.json first
  *   node scripts/bake_trees.mjs --stats      # generate + report, write nothing
+ *   node scripts/bake_trees.mjs --vpm 20     # bake at an explicit scale
+ *
+ * THE BAKE SCALE comes from src/sim/world.h, not from a constant in here or in
+ * treegen.js. Species files are authored in METRES; the atlas is voxels; the
+ * thing that converts them is `kVoxelMeters`, so this script parses it out of
+ * world.h the same way scripts/gen_human.py does. That parse is the whole
+ * mechanism — treegen.js used to carry a hand-copied `VOX_PER_M = 10` claiming
+ * to "mirror world.h", and when world.h moved to 5 cm every tree in the game
+ * baked at half its authored height with nothing able to notice.
+ *
+ * The scale used is written into the .svtree header and CHECKED by the C++
+ * loader against the live kVoxelsPerMetre, so a stale atlas is a named refusal
+ * rather than a small forest.
  *
  * Editing a species and re-baking MOVES THE WORLD HASH — the atlas is engine
  * input exactly like tuning.json. That is a one-command rebaseline
@@ -28,7 +41,30 @@ const T = await import(pathToFileURL(join(ROOT, 'assets/editor/treegen.js')).hre
 const args = process.argv.slice(2);
 const doSeed = args.includes('--seed');
 const statsOnly = args.includes('--stats');
-const only = args.filter(a => !a.startsWith('--'));
+
+// ---- the bake scale, from world.h ------------------------------------------
+// Derived, never restated: kVoxelsPerMetre is the integer reciprocal of
+// kVoxelMeters and world.h says so itself. `--vpm N` overrides, for baking a
+// comparison atlas without touching the engine.
+function voxelsPerMetreFromWorldH() {
+  const src = readFileSync(join(ROOT, 'src/sim/world.h'), 'utf8');
+  const m = src.match(/kVoxelMeters\s*=\s*([0-9.]+)f/);
+  if (!m) throw new Error('could not find kVoxelMeters in src/sim/world.h');
+  const metres = parseFloat(m[1]);
+  const vpm = Math.round(1 / metres);
+  if (!(vpm > 0) || Math.abs(1 / vpm - metres) > 1e-9) {
+    throw new Error(`kVoxelMeters ${metres} is not the reciprocal of a whole ` +
+                    `number of voxels per metre — the atlas needs an integer scale`);
+  }
+  return vpm;
+}
+const vpmFlag = args.indexOf('--vpm');
+const VPM = vpmFlag >= 0 ? parseInt(args[vpmFlag + 1], 10)
+                         : voxelsPerMetreFromWorldH();
+if (!(VPM > 0)) { console.error('bad --vpm'); process.exit(2); }
+
+const only = args.filter((a, i) => !a.startsWith('--') &&
+                                   !(vpmFlag >= 0 && i === vpmFlag + 1));
 
 mkdirSync(DIR, { recursive: true });
 
@@ -54,7 +90,7 @@ let totalBytes = 0, worst = 0;
 for (const name of files) {
   const params = JSON.parse(readFileSync(join(DIR, name + '.json'), 'utf8'));
   const t0 = Date.now();
-  const r = T.bakeAtlas(params);
+  const r = T.bakeAtlas(params, null, { vpm: VPM });
   const ms = Date.now() - t0;
   worst = Math.max(worst, ms);
   totalBytes += r.meta.bytes;
@@ -79,5 +115,12 @@ for (const name of files) {
   }
 }
 console.log(`\n${files.length} species, ${(totalBytes / 1048576).toFixed(2)} MiB` +
-            ` of atlas, slowest bake ${worst} ms` +
+            ` of atlas at ${VPM} vox/m (${(100 / VPM).toFixed(1)} cm voxels)` +
+            `, slowest bake ${worst} ms` +
             (statsOnly ? '  (--stats: nothing written)' : ''));
+if (!statsOnly) {
+  // Say it out loud: the atlas is hashed engine input, and the loader now
+  // refuses a scale mismatch, so a bake is only half a landing.
+  console.log('next: bash scripts/build.sh && ' +
+              './build/Release/sandvox.exe --selftest --rebaseline');
+}

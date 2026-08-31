@@ -954,9 +954,82 @@ def check_tree_atlas():
                 f"tree atlas: treegen.js writes a {m.group(1)}-word .svtree "
                 f"header, treeatlas.h reads {cpp['kFileHeaderWords']}")
 
+
+def check_run_word_layout():
+    """The .svtree run word is packed in THREE places and must agree in all.
+
+    material(12) | state(4) | y0(Y0_BITS) | len(LEN_BITS), written by
+    assets/editor/treegen.js (packRun), read by src/sim/treeatlas.h's constants
+    and by assets/shaders/worldgen.wgsl (treeCellFrom).
+
+    A disagreement is not a crash: every side keeps decoding, just at the wrong
+    bit offsets, so the atlas parses and the forest comes out as noise -- and
+    the world hash moves for a reason nobody can name. The widths moved once
+    already (y0 9->11, len 7->5, to fit a 22 m redwood at 5 cm voxels), which is
+    exactly the kind of change that lands in two files out of three.
+    """
+    js, hdr, wgsl = (read("assets/editor/treegen.js"),
+                     read("src/sim/treeatlas.h"),
+                     read("assets/shaders/worldgen.wgsl"))
+    if not js or not hdr or not wgsl:
+        return
+    checked.append("svtree run word")
+
+    def one(pat, txt, what):
+        m = re.search(pat, txt)
+        return int(m.group(1)) if m else None
+
+    js_y0 = one(r"export const Y0_BITS = (\d+);", js, "js")
+    js_len = one(r"export const LEN_BITS = (\d+);", js, "js")
+    h_y0 = one(r"kRunY0Bits = (\d+);", hdr, "h")
+    h_len = one(r"kRunLenBits = (\d+);", hdr, "h")
+    w_y0mask = one(r"TREE_RUN_Y0_MASK\s*:\s*u32\s*=\s*(\d+)u", wgsl, "wgsl")
+    w_shift = one(r"TREE_RUN_LEN_SHIFT\s*:\s*u32\s*=\s*(\d+)u", wgsl, "wgsl")
+    w_lenmask = one(r"TREE_RUN_LEN_MASK\s*:\s*u32\s*=\s*(\d+)u", wgsl, "wgsl")
+
+    missing = [n for n, v in (("treegen.js Y0_BITS", js_y0),
+                              ("treegen.js LEN_BITS", js_len),
+                              ("treeatlas.h kRunY0Bits", h_y0),
+                              ("treeatlas.h kRunLenBits", h_len),
+                              ("worldgen.wgsl TREE_RUN_Y0_MASK", w_y0mask),
+                              ("worldgen.wgsl TREE_RUN_LEN_SHIFT", w_shift),
+                              ("worldgen.wgsl TREE_RUN_LEN_MASK", w_lenmask))
+               if v is None]
+    if missing:
+        problems.append("svtree run word: cannot find " + ", ".join(missing) +
+                        " -- the three-way layout check cannot run")
+        return
+
+    if js_y0 != h_y0 or js_len != h_len:
+        problems.append(
+            f"svtree run word: treegen.js packs y0/len as {js_y0}/{js_len} bits "
+            f"but treeatlas.h reads {h_y0}/{h_len} -- the C++ loader and the "
+            f"baker disagree about where a run's height lives")
+    if w_y0mask != (1 << h_y0) - 1:
+        problems.append(
+            f"svtree run word: worldgen.wgsl TREE_RUN_Y0_MASK is {w_y0mask} but "
+            f"{h_y0} y0 bits means {(1 << h_y0) - 1} -- the shader would "
+            f"truncate or over-read every run's start height")
+    if w_shift != 16 + h_y0:
+        problems.append(
+            f"svtree run word: worldgen.wgsl TREE_RUN_LEN_SHIFT is {w_shift} but "
+            f"16 + {h_y0} y0 bits means {16 + h_y0} -- the shader would read a "
+            f"run's length out of the wrong bits")
+    if w_lenmask != (1 << h_len) - 1:
+        problems.append(
+            f"svtree run word: worldgen.wgsl TREE_RUN_LEN_MASK is {w_lenmask} "
+            f"but {h_len} len bits means {(1 << h_len) - 1}")
+    if 16 + h_y0 + h_len != 32:
+        problems.append(
+            f"svtree run word: material(12) + state(4) + y0({h_y0}) + "
+            f"len({h_len}) is {16 + h_y0 + h_len} bits, not 32 -- the fields "
+            f"overlap or waste the word")
+
+
 ALL = {
     "worldgen": check_worldgen_mirror,
     "treeatlas": check_tree_atlas,
+    "runword": check_run_word_layout,
     "wgunits": check_worldgen_units,
     "wgdefaults": check_worldgen_defaults,
     "sound": check_sound_slots,

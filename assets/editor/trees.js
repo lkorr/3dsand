@@ -126,8 +126,10 @@ const GLOBAL_ROWS = [
       'cylindrical (redwood: a column, not a cone) - 5 flame (birch, aspen) - ' +
       '6 inverse conical (willow) - 7 tend flame.'},
   {k: 'scale', n: 'height (m)', min: 0.4, max: 30, step: 0.1,
-   d: 'Trunk length in metres. Voxels are 10 cm, so this reads true next to a ' +
-      '1.7 m player.'},
+   d: 'Trunk length in METRES, so this reads true next to a 1.7 m player at ' +
+      'any voxel size. The bake converts it using the scale recorded in the ' +
+      '.svtree header; changing the engine voxel size means re-baking, not ' +
+      're-authoring.'},
   {k: 'scaleV', n: 'height variance (m)', min: 0, max: 6, step: 0.1,
    d: 'Per-tree jitter on the height. What makes two oaks in a stand not the ' +
       'same oak.'},

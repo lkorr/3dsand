@@ -1,4 +1,5 @@
 #pragma once
+#include "sim/scale.h"  // MetresToCells / MetresToCellsI
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -67,9 +68,15 @@ struct MobLimbDef {
   // This is the animation's own range of motion, clamped on the solved pose
   // (AnimClampPoseLimits) about the part's REST frame. Authored in DEGREES in
   // the sidecar, stored in radians here like every other angle.
+  //
+  // Three shapes, because three joints: a bounded one-axis clamp (the knee and
+  // hip), a true one-DOF `hinge` (the elbow), and the ball form (the shoulder).
+  // AnimPart carries the same fields and anim.h documents what each one is for.
   bool hasPoseLimit = false;
   Vec3 poseAxis{1, 0, 0};
   float poseMin = -3.14159265f, poseMax = 3.14159265f;
+  bool poseHinge = false;
+  PoseBallLimit poseBall;
   // walk-cycle swing (radians) about X through the joint anchor; phase in
   // half-turns so arm.L/leg.R can counter-swing arm.R/leg.L. Kept as the
   // no-IK fallback for rigs without `chains` (dummy.json) — it now runs as a
@@ -162,7 +169,35 @@ struct MobSocketDef {
 // with, so no existing creature's mass, contacts or ground probes move, while
 // leaving the skin free to go to 8. Raising this is a physics-budget decision,
 // not an art one.
-inline constexpr uint32_t kMaxPhysScale = 4;
+//
+// AND IT IS A PHYSICAL RESOLUTION, NOT A RATIO. `physScale` counts collider
+// voxels per WORLD voxel, so a fixed 4 means a different real cell size at
+// every kVoxelMeters: 40 collider voxels/metre at 10 cm, 80 at 5 cm, 160 at
+// 2.5 cm. Since the cost is cubic, holding the ratio would have handed the same
+// physical limb 8x the boxes each time the voxel halved — a physics budget
+// silently multiplied by an art-side decision, which is the exact coupling the
+// skin/collider split exists to break.
+//
+// So the ceiling is authored as a real cell size (2.5 cm collider voxels, the
+// resolution every current rig shipped at) and the ratio is derived. At 10 cm
+// this is 4 and nothing moves; at 5 cm it is 2 and a limb keeps the collider it
+// always had.
+// Mob locomotion budgets, authored in METRES and resolved to cells.
+//
+// The player's equivalents have been metres-derived since v0.2
+// (Player::kStepUpM, player.h:189); the mob's were bare cell counts, so at
+// 5 cm voxels a mob could step up half as far as it used to and probe half
+// as high for its own footing while the player was unaffected. Same world,
+// two different physics.
+inline constexpr int kMobStepUpCells = MetresToCellsI(0.20f);
+// How far above the mob's origin a ground probe starts looking down.
+inline constexpr int kMobProbeLiftCells = MetresToCellsI(0.30f);
+
+inline constexpr int kColliderVoxelsPerMetre = 40;
+inline constexpr uint32_t kMaxPhysScale = (uint32_t)(
+    kColliderVoxelsPerMetre / kVoxelsPerMetre < 1
+        ? 1
+        : kColliderVoxelsPerMetre / kVoxelsPerMetre);
 
 struct MobDef {
   std::string name;
@@ -190,6 +225,43 @@ struct MobDef {
   // conversion point, so the animation runtime and the gait code need no scale
   // awareness at all.
   uint32_t skinScale = 1;
+  // The AUTHORING resolution of the .vox art, in art voxels per METRE, and the
+  // thing that gives a grid of voxels a physical size at all. This is the field
+  // sidecars declare; `skinScale` above is DERIVED from it and kVoxelsPerMetre.
+  //
+  // A .vox is a bare lattice: 136 voxels tall is 1.7 m only because the art is
+  // 80 voxels/metre. That fact used to live nowhere — `skinScale: 8` was
+  // authored directly, meaning "8 art voxels per WORLD voxel", which silently
+  // encoded "and the world is 10 cm". So when kVoxelMeters went to 5 cm the
+  // human stayed 17 world voxels and became 0.85 m: exactly half the height of
+  // the collision capsule it drives, with no test anywhere asserting otherwise.
+  //
+  // Declaring the metre scale instead makes the derivation automatic and the
+  // art file untouched: human at 80 art vox/m is skinScale 8 at 10 cm, 4 at
+  // 5 cm, 2 at 2.5 cm — same 1.7 m every time, and the world-cell model simply
+  // gets finer. Re-authoring the art at a higher resolution later is then a
+  // pure data change: bump this number, change no code.
+  int artVoxelsPerMetre = 0;
+  // Block replication applied to the art grid at load, when the art is COARSER
+  // than the world (`artVoxelsPerMetre < kVoxelsPerMetre`) and no integer
+  // skinScale could exist. Exact and lossless — it preserves world size and
+  // adds no detail — so it is always safe in this direction.
+  //
+  // Authored offsets (anchors, sockets, cutting edges, clip keys) are in the
+  // ORIGINAL art grid and are NOT rescaled by it; they convert through
+  // ArtToWorld() below, which divides that out. Keeping them in the authored
+  // frame is what lets the upsample stay invisible to every sidecar.
+  uint32_t artUpsample = 1;
+  // Authored art units -> world voxels. The ONE conversion for every length a
+  // sidecar states in the art's lattice.
+  //
+  // Not simply `1/skinScale`: after an upsample the voxel grid is `artUpsample`
+  // times finer than the numbers in the JSON, and skinScale describes the
+  // GRID. This divides that back out, so `anchor * ArtToWorld()` is correct
+  // whether or not the art was replicated.
+  float ArtToWorld() const {
+    return (float)artUpsample / (float)(skinScale ? skinScale : 1u);
+  }
   // Collider resolution, in collider voxels per world voxel. DERIVED at load,
   // never authored: the finest of {8,4,2,1} whose limb extents still fit the
   // DebrisVoxel int8 bound of +-120. Always <= skinScale.

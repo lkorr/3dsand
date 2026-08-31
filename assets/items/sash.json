@@ -1,8 +1,8 @@
 {
-  "comment": "The sash, a WORN piece: one shell per covered limb, each of which becomes a real rig slot on the wearer and therefore burns, dissolves, carves, severs and drops exactly as a limb does. Geometry is the stock human's own silhouette dilated outward by one authored micro, so it fits by construction. Regenerate with scripts/gen_stock_armor.py \u2014 `offset` and `fitBox` are MEASURED off gen_human.py's limb table, so editing them by hand puts the garment off the body.",
+  "comment": "The sash, a WORN piece: one shell per covered limb, each of which becomes a real rig slot on the wearer and therefore burns, dissolves, carves, severs and drops exactly as a limb does. Geometry is the stock human's own silhouette dilated outward by one authored micro, so it fits by construction. Regenerate with scripts/gen_stock_armor.py — `offset` and `fitBox` are MEASURED off gen_human.py's limb table, so editing them by hand puts the garment off the body.",
   "name": "sash",
-  "scale": 8,
-  "hp": 8.0,
+  "artVoxelsPerMetre": 80,
+  "hp": 8,
   "severable": true,
   "cover": [
     {
@@ -18,7 +18,7 @@
         20,
         12
       ],
-      "hp": 8.0
+      "hp": 8
     }
   ]
 }

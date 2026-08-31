@@ -14,7 +14,7 @@
   "whorlCount": 0,
   "lobes": 4,
   "lobeDepth": 0.12,
-  "barkNoise": 1.1,
+  "barkNoise": 0.11,
   "levelsData": [
     {
       "length": 1,
@@ -94,8 +94,8 @@
     "elongation": 0.65,
     "droop": 0.25,
     "density": 0.88,
-    "noiseScale": 2.6,
-    "sminK": 2.5,
+    "noiseScale": 0.26,
+    "sminK": 0.25,
     "canopyShadeMix": 0.5,
     "depthShade": 0.75
   },

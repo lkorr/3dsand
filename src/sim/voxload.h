@@ -101,3 +101,26 @@ bool LoadVoxFile(const std::string& path, size_t materialCount, Prefab& out,
 // Returns false only if the directory exists but nothing loaded cleanly.
 bool LoadPrefabDir(const std::string& dir, size_t materialCount,
                    std::vector<Prefab>& out, std::string& log);
+
+// Block-replicate every model's voxel grid by `u` on each axis (DESIGN.md §3b).
+//
+// A .vox has no intrinsic size — it is a lattice, and its physical size comes
+// from the `artVoxelsPerMetre` its sidecar declares. When that is COARSER than
+// the world (a 10 vox/m asset in a 20 vox/m world) there is no integer
+// art-per-world-voxel scale, and the art would have to be redrawn to keep its
+// metre size. This buys that size instead: the model is the shape it was,
+// sampled u times more finely, so the silhouette is bit-identical and only the
+// cell count changes (u^3 of them).
+//
+// It ADDS NO DETAIL and is not meant to. Re-authoring at a higher
+// artVoxelsPerMetre later removes the upsample with no code change.
+//
+// Sizes, offsets and `sceneMin` all move with the lattice — sceneMin especially,
+// since game/melee.cpp converts authored boxes through it and leaving it behind
+// would land a sword's hilt a model-depth from its blade.
+//
+// The reverse (art finer than the world) is deliberately absent: downsampling
+// is lossy and would need a deterministic tie-break to stay rule-1 clean, and
+// it cannot arise while every asset is drawn at or above the coarsest voxel
+// size in use.
+void UpsamplePrefab(Prefab& p, uint32_t u);

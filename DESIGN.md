@@ -258,6 +258,95 @@ are deduplicated across mob defs, so 128 slots cover a whole cast.
 
 ---
 
+## 3b. Voxel scale — authored size is METRES (added 2026-08-30)
+
+`kVoxelMeters` is meant to be a knob. Halving it should make the world finer,
+not smaller: a 1.7 m player stays 1.7 m, a 7.5 m oak stays 7.5 m, and only the
+number of cells they are made of changes.
+
+That did not hold. `kVoxelMeters` had not moved since v0.2, and when it went
+0.10 -> 0.05 the split showed up immediately:
+
+* **The player controller was fine.** `player.h` has said
+  `kHalfY = 0.85f / kVoxelMeters` since the beginning, so the capsule stayed
+  1.7 m and every movement row in `Tuning::Player` came with it.
+* **Everything AUTHORED halved.** The avatar art, mobs, items, armour and every
+  tree are baked cell counts, and a cell count only means a size next to the
+  scale it was authored at — which nothing recorded. The human became 0.85 m
+  *inside a 1.7 m capsule*, and the whole selftest suite stayed green, because
+  every existing assertion is expressed in the asset's own lattice and those
+  ratios all held.
+
+### The rule
+
+> **No authored quantity representing a physical length may be expressed in
+> cells without also recording the cells-per-metre it was authored at.**
+
+Non-worldgen code authors in **metres** and converts at use, through
+`src/sim/scale.h` (`MetresToCells`, `MetresPerSecToCells`, `MetresToCellsI`).
+The `worldgen` tuning group keeps its own older mechanism — rows authored in
+voxels at `worldgen.refVoxelsPerMetre`, rescaled by `LoadTuning` — because a
+terrain octave amplitude has no natural metre value. Two mechanisms, one line
+between them; do not add a third.
+
+### Three asset classes, three mechanisms
+
+| Class | Examples | Mechanism | At 2x resolution |
+|---|---|---|---|
+| Procedural, authored in metres | `assets/trees/*.json` -> `.svtree` | Re-baked at the engine's scale; the header records it and the loader refuses a mismatch | Same height, **finer detail** |
+| Hand-authored voxel art | `assets/mobs/*.vox`, `assets/items/*.vox` | Sidecar declares `artVoxelsPerMetre`; `skinScale` is derived | Same silhouette, finer world-cell model |
+| Scalar constants | capsule, gait, reaches, melee | Metres in source, converted at use | Same physical value |
+
+**Trees.** `assets/editor/treegen.js` takes the bake scale as a parameter;
+`scripts/bake_trees.mjs` reads `kVoxelMeters` out of `world.h`. `.svtree` is
+version 2 and stores `bakeVoxelsPerMetre` in header word 29, and
+`treeatlas.cpp` **refuses** an atlas whose scale is not the engine's, naming
+both numbers — the same policy as `worldio.cpp`'s bit-exact save check. The run
+word was repacked `material(12) | state(4) | y0(11) | len(5)`; the old 9-bit y0
+capped a variant at 512 cells and a 22 m redwood needs ~520 at 5 cm.
+
+**Voxel art.** `artVoxelsPerMetre` is the authored fact and `skinScale` is
+`artVoxelsPerMetre / kVoxelsPerMetre`. The human is 80 art vox/m, so skinScale
+is 8 at 10 cm and 4 at 5 cm — **the .vox is untouched** and the collider gets
+finer for free. Art coarser than the world is block-replicated
+(`UpsamplePrefab`); the reverse is deliberately absent, since downsampling is
+lossy and cannot arise while every asset is drawn at or above the coarsest
+voxel size in use.
+
+Authored offsets (anchors, sockets, cutting edges, cover boxes) stay in the
+art's own lattice and convert through `MobDef::ArtToWorld()`, which divides out
+any upsample. **Two lattices meet at the rig**: `ld.anchor` is authored while
+`AutoAnchor` is measured off the (possibly replicated) prefab, and they need
+different divisors — using one for both collapses an upsampled rig toward its
+own origin while the art still looks correct.
+
+World-space sidecar rows (`speed`, `severImpactSpeed`, `gait.rideHeight`,
+`states[].bodyYOffset`, clip position keys) are neither art units nor metres:
+they are world voxels, declared by `sidecarVoxelsPerMetre` (default 10) and
+rescaled at load. `bleed.perDamage` is deliberately NOT rescaled — it is a
+volume budget, which goes as the cube, and it is gore rate rather than size.
+
+### The gate
+
+`--gate scale` (`src/test/selftest_scale.cpp`) is pure CPU and runs near the
+front of `kOrder`. Its load-bearing assertion is the only non-circular one
+available: the avatar's height comes from the art, `Player::kHalfY` comes from
+`0.85f / kVoxelMeters`, and nothing but intent ever linked them. Most other
+size checks reduce algebraically to `box / artVoxelsPerMetre` and would pass at
+any scale, so the rest of the gate leans on metre pins in `tests/baseline.json`
+— recorded at one voxel size, re-checked at another.
+
+`scripts/set_voxel_scale.sh <metres>` edits `world.h`, re-bakes the atlas and
+prints the build + rebaseline commands. It refuses to go below 10 vox/m,
+because that is the resolution the art is drawn at.
+
+### Known-unscaled, on purpose or not yet
+
+Not fixed here, and none of it affects tree/player/mob size: worldgen's POI
+literals (the arena, wood platform and ruins in `worldgen.wgsl` never took
+`vlen()`), explosion and spell radii, `gore.*`, `debris.min*Voxels`, the `sim.*`
+integer rows (determinism-critical, so their own change), and `.svedit` layers.
+
 ## 4. The Simulation (GPU cellular automaton)
 
 Fixed 30 Hz tick. Each tick, dispatch compute over dirty chunks only, batched via
@@ -2377,14 +2466,49 @@ consumes it and owns the physics plumbing. Per mob per tick:
    `MobLimbDef::minAngle/maxAngle` and the swing-twist cone are Jolt
    constraints, and Jolt only enforces them on a *dynamic* body — a live limb
    is kinematic and re-posed every tick, so nothing at all stood between the IK
-   and an anatomically impossible leg. A single-axis limit clamps only the
-   **twist** about the authored axis and leaves the swing free, so "the hip
-   pitches between −20 and +85" can be stated without also constraining
-   abduction.
+   and an anatomically impossible leg.
+
+   **Three shapes, because three kinds of joint.** Which one a limb gets is
+   read off the authored `poseLimit` object, and no rig authors two:
+
+   - **Axis** (`axis`/`min`/`max`) — clamps only the *twist* about the authored
+     axis and leaves the swing free, so "the hip pitches between −20 and +85"
+     can be stated without also constraining abduction. Right for the hip and
+     the knee, where the solver only ever drives one plane anyway.
+   - **Hinge** (the same, plus `hinge: true`) — one degree of freedom, not one
+     *bounded* degree of freedom: the off-axis swing is **discarded**, so the
+     joint's rotation is a pure rotation about the axis. This is the elbow. The
+     two-bone solver picks its bend axis in *model* space from the chain's pole
+     vector, and that axis only coincides with the forearm's own hinge axis
+     under pure flexion or pure abduction — at any blend of the two it opens
+     the elbow sideways, which the axis form cannot see because the on-axis
+     component stays perfectly legal. Measured with the flag off, the solver
+     takes the forearm **67° out of plane and 103° into hyperextension**.
+   - **Ball** (`bone`/`reach`/`twist`, `PoseBallLimit` in `anim.h`) — bounds
+     *where the bone may point* with up to two perpendicular half-spaces, plus
+     a roll bound about the bone. This is the shoulder, and it is a different
+     shape from the other two because the weapon arm is aimed by the **mouse**
+     at arbitrary points on the sphere rather than swept through one plane. A
+     cone cannot express it: the reachable set of a shoulder is very nearly
+     "the sphere minus the region behind the torso minus a wedge across the
+     midline", and any cone tight enough to exclude the back also excludes
+     arm-straight-out-to-the-side. The normals must be perpendicular — the
+     nearest legal direction has a closed form for an orthonormal pair and does
+     not otherwise, and the loader rejects a tilted pair rather than solving
+     the wrong problem quietly. Measured with the limits opened out, the upper
+     arm reaches **89° behind the frontal plane and 60° across the midline**,
+     i.e. through the ribcage.
 
    The limits are authored data (`assets/mobs/*.json`), and they should be
    **measured, not guessed**: `--selftest --gate mob` prints each joint's
-   observed range next to its authored one for a flat walk and a ramp climb.
+   observed range next to its authored one — the hip and knee over a flat walk
+   and a ramp climb, the shoulder and elbow over a fan of 14 hostile IK targets
+   scaled to 0.72 of the rig's own arm (`arm-limits`). The fan is scaled rather
+   than authored in world voxels for two reasons: a literal offset is a
+   different fraction of an arm at every `kVoxelMeters`, and an out-of-reach
+   target is not a hostile target at all — the solver clamps to its reach
+   annulus and a clamped two-bone solve is a dead straight limb, so the elbow
+   assertion would measure nothing.
 7. **Physics blend / submit** through the existing `MoveKinematicBody` path.
 
 **Gait** is the base layer and needs no per-gait table. Each leg's ideal

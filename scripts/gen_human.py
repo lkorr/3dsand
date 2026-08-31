@@ -108,15 +108,36 @@ ART_RGB = {
 ART_SCALE = 4
 SKIN_UPSCALE = 2
 SCALE = ART_SCALE * SKIN_UPSCALE   # 8 skin voxels per world voxel, as shipped
-WORLD_H = 17                        # world voxels head to toe = Player::kHalfY*2
-MICRO_H = WORLD_H * ART_SCALE       # 68, in the AUTHORED lattice
+# ---- THE SIZE CONTRACT IS METRES (DESIGN.md 3b) -----------------------------
+# HEIGHT_M is the physical fact; the lattice figures below are DERIVED from it
+# and from the art's own resolution. WORLD_H used to be a literal 17 "world
+# voxels head to toe", which fixed a real height only while kVoxelMeters was
+# 0.10 -- so when the engine moved to 0.05 the figure stayed 17 cells and
+# became 0.85 m: half the collision capsule it drives, with the art file
+# perfectly correct and nothing able to notice.
+#
+# ART_VOXELS_PER_METRE is what the sidecar declares and is now the ONLY scale
+# this generator needs. kVoxelMeters does not appear in the contract at all:
+# tuning.json's player.halfHeight is already metres, so the cross-check below
+# is metres against metres and this file no longer has to be regenerated when
+# the engine's voxel size changes.
+HEIGHT_M = 1.70                      # head to toe
+EYE_M = 1.50                         # first-person camera row
+ART_VOXELS_PER_METRE = 80            # shipped art resolution (the sidecar value)
+AUTHORED_VOXELS_PER_METRE = ART_VOXELS_PER_METRE // SKIN_UPSCALE   # 40
+# The scale the sidecar's WORLD-space rows (speed, severImpactSpeed, rideHeight,
+# bodyYOffset, clip pos) are written at. The loader rescales them from here to
+# the live kVoxelsPerMetre -- see mob.cpp's `sidecarVoxelsPerMetre`.
+SIDECAR_VOXELS_PER_METRE = 10
+WORLD_H = round(HEIGHT_M * AUTHORED_VOXELS_PER_METRE / ART_SCALE)
+MICRO_H = round(HEIGHT_M * AUTHORED_VOXELS_PER_METRE)
 
 # The eye line, in AUTHORED scene z. Player::kEyeOffset (0.65 m above the AABB
 # centre, i.e. 1.50 m up at kVoxelMeters 0.10) puts the first-person camera at
 # world voxel 15 = art micro 60. This is the one number in the table below that
 # is not free, and head_vox() derives the eye row from it rather than restating
 # it — see the note there about the trap this avoids.
-EYE_Z = 15 * ART_SCALE
+EYE_Z = round(EYE_M * AUTHORED_VOXELS_PER_METRE)
 
 # The SPEED contract: `speed` in the sidecar is the reference top speed in world
 # voxels/sec that the runtime divides measured speed by to get `speedFactor`,
@@ -129,7 +150,10 @@ EYE_Z = 15 * ART_SCALE
 # 0.53, which quietly halves every gait amplitude the factor scales. Reading the
 # live value instead means this file cannot go stale the same way, and the walk
 # and run clip periods below are derived from it rather than transcribed.
-VOXEL_METERS = 0.10
+# VOXEL_METERS is GONE on purpose. Every number this file emits is now
+# either metres or a lattice figure derived from a declared
+# voxels-per-metre, so there is nothing left for the engine's voxel
+# size to change. Reintroducing it would reintroduce the coupling.
 
 
 # ---- .vox writing -----------------------------------------------------------
@@ -637,24 +661,18 @@ def main():
     with open(os.path.join(root, "assets", "materials", "tuning.json")) as tf:
         player = json.load(tf)["player"]
     sprint_mps, walk_mps = player["sprintSpeed"], player["walkSpeed"]
-    with open(os.path.join(root, "src", "sim", "world.h")) as wf:
-        m = re.search(r"kVoxelMeters\s*=\s*([0-9.]+)f", wf.read())
-    assert m, "could not find kVoxelMeters in src/sim/world.h"
-    assert abs(float(m.group(1)) - VOXEL_METERS) < 1e-9, (
-        f"world.h kVoxelMeters is {m.group(1)}, this file assumes "
-        f"{VOXEL_METERS} — update VOXEL_METERS and regenerate")
+    # No kVoxelMeters check: the contract below is metres against
+    # metres, so this generator is voxel-size independent by
+    # construction rather than by assertion.
     # The height contract's other half: the AABB and the eye offset this rig is
     # drawn to. Restating them here as literals is what let mina's `speed` rot;
     # reading them means a tuning change complains at generation time.
-    assert abs(player["halfHeight"] * 2 / VOXEL_METERS - WORLD_H) < 1e-6, (
-        f"tuning.json player.halfHeight {player['halfHeight']} is "
-        f"{player['halfHeight'] * 2 / VOXEL_METERS} world voxels tall, this "
-        f"file draws {WORLD_H}")
-    assert abs((player["halfHeight"] + player["eyeOffset"]) / VOXEL_METERS
-               - EYE_Z / ART_SCALE) < 1e-6, (
+    assert abs(player["halfHeight"] * 2 - HEIGHT_M) < 1e-6, (
+        f"tuning.json player.halfHeight {player['halfHeight']} makes the "
+        f"figure {player['halfHeight'] * 2} m tall, this file draws {HEIGHT_M} m")
+    assert abs(player["halfHeight"] + player["eyeOffset"] - EYE_M) < 1e-6, (
         f"tuning.json puts the eye at "
-        f"{(player['halfHeight'] + player['eyeOffset']) / VOXEL_METERS} world "
-        f"voxels, this file draws the face at {EYE_Z / ART_SCALE}")
+        f"{player['halfHeight'] + player['eyeOffset']} m, this file draws {EYE_M} m")
 
     # The four gait constants avatar.cpp owns, read out of it rather than
     # copied. The step-period model below is only worth deriving if it is the
@@ -815,16 +833,75 @@ def main():
          "spring": {"halflife": 0.12, "gain": 0.18, "maxAngle": 0.3}},
     ]
     for side in ("L", "R"):
+        # Which way is "across the chest" for THIS arm. Model +X is the
+        # character's LEFT on these rigs (they are authored mirrored: .L sits at
+        # the higher engine x — see the weapon-arm note in avatar.cpp), so the
+        # left arm reaches across toward -X and the right arm toward +X.
+        inward = [-1, 0, 0] if side == "L" else [1, 0, 0]
         limbs.append({
             "name": f"armU.{side}", "parent": "torso", "joint": "ball",
             "hp": 16, "severable": True, "tag": "arm",
             "anchor": joint_top(f"armU.{side}"),      # shoulder
+            # THE SHOULDER, and the reason the one-axis form used by the hip and
+            # knee below is not enough for it. That form bounds one component of
+            # the rotation and leaves the other two free, which is fine for a
+            # joint the solver only ever drives in one plane; the weapon arm is
+            # driven by the MOUSE through the same IK chain, at any direction in
+            # the sphere, and it would happily rake the arm straight back or
+            # fold it across the chest and through the ribs with a perfectly
+            # legal X component the whole time. See PoseBallLimit in anim.h.
+            #
+            # Stated as the two things a torso actually forbids:
+            #   - no more than 50 deg behind the frontal plane. Measured, not
+            #     guessed: the run clip's arm swing reaches -42 on the wizard
+            #     (the widest of the four rigs), so anything under ~45 would put
+            #     an ordinary sprint on its stop every stride. Human shoulder
+            #     extension is ~50-60, so this is the anatomy AND the margin.
+            #   - no more than 30 deg past the body's midline. Enough for a
+            #     cross-body cut and for the hands to meet in front; past that
+            #     the upper arm is inside the ribcage.
+            # Both are half-spaces on where the bone POINTS, so they hold at
+            # every elevation — an arm swung up and then back is caught by the
+            # same number as one swung back at rest height, which is the failure
+            # a flexion-only limit cannot see.
+            #
+            # The twist bound is not decoration. The shoulder's roll is what
+            # aims the ELBOW's hinge plane (below), so leaving it free lets a
+            # correctly-hinged forearm swing medially into the torso. +-75 is
+            # loose enough that the IK never touches it in a normal reach (the
+            # solver's aim is a minimal rotation and introduces no twist of its
+            # own) and tight enough that accumulated roll cannot invert the
+            # elbow.
+            "poseLimit": {
+                "bone": [0, -1, 0],
+                "reach": [{"normal": [0, 0, -1], "max": 50},
+                          {"normal": inward, "max": 30}],
+                "twist": {"min": -75, "max": 75}},
             "severImpactSpeed": 15.0})
         limbs.append({
             "name": f"armL.{side}", "parent": f"armU.{side}", "joint": "hinge",
             "hp": 13, "severable": True, "tag": "arm", "axis": [1, 0, 0],
             "minAngle": -2.4, "maxAngle": 0.05,
             "anchor": joint_top(f"armL.{side}"),      # elbow
+            # AN ELBOW IS A HINGE, and `hinge: true` is what makes that true of
+            # the pose and not just of the ragdoll: it discards the off-axis
+            # swing instead of merely bounding the on-axis part. The two-bone IK
+            # picks its bend axis in MODEL space from the chain's pole vector,
+            # which coincides with the forearm's own hinge axis under pure
+            # flexion and under pure abduction but not at a blend of the two —
+            # and at a blend it opens the elbow sideways, which is most of what
+            # "the arm clips through the character" looks like.
+            #
+            # 0 is the drawn rest pose, arm straight, and the joint never goes
+            # below it (no hyperextension); 130 is a full fold. Flexion swings
+            # the forearm FORWARD relative to the upper arm, which is about -X
+            # on these rigs (a positive rotation about +X swings a hanging limb
+            # backward — same convention as the hip note below). Every authored
+            # clip on all four humanoid rigs already lives in +10..+70 about
+            # this axis with zero off-plane component, so this bounds the
+            # solver, not the animation.
+            "poseLimit": {"axis": [-1, 0, 0], "min": 0, "max": 130,
+                          "hinge": True},
             "severImpactSpeed": 13.0})
         limbs.append({
             "name": f"hand.{side}", "parent": f"armL.{side}", "joint": "ball",
@@ -940,12 +1017,12 @@ def main():
     hip_z = ART_LIMBS["legU.L"][1][2] + ART_LIMBS["legU.L"][0][2]
     ankle_z = ART_LIMBS["foot.L"][1][2] + 3.0
     leg_len = (hip_z - ankle_z) / ART_SCALE          # world voxels
-    ref_speed = sprint_mps / VOXEL_METERS            # world voxels/sec
+    ref_speed = sprint_mps * SIDECAR_VOXELS_PER_METRE  # sidecar vox/sec
     STEP_DURATION, STEP_THRESHOLD = 0.10, 0.3
 
     def arm_cycle_ms(v_mps):
         """Milliseconds for two steps at this speed — one full arm cycle."""
-        v = v_mps / VOXEL_METERS
+        v = v_mps * SIDECAR_VOXELS_PER_METRE
         speed_factor = min(max(v / ref_speed, 0.0), 1.5)
         dur = max(STEP_DURATION / max(speed_factor, min_swing_scale), min_swing_s)
         dur = max(min(dur, swing_frac * max_lead * leg_len / v), min_swing_s)

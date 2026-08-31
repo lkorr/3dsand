@@ -1,4 +1,5 @@
 #pragma once
+#include "sim/scale.h"  // MetresToCells
 #include <cstdint>
 #include <map>
 #include <string>
@@ -268,7 +269,25 @@ struct ItemDef {
   // Loaded from assets/items/<name>.vox. Held geometry is per-ITEM, never a
   // part of the wearer's prefab — see the note at the top of this file.
   Prefab prefab;
-  uint32_t scale = 1;      // micro voxels per world voxel, from the sidecar
+  // Micro voxels per WORLD voxel. DERIVED at load from artVoxelsPerMetre and
+  // kVoxelsPerMetre — the same change, and for the same reason, as
+  // MobDef::skinScale. It used to be the authored `scale` field, which fixed a
+  // physical size only because the world happened to be 10 cm, so a sword
+  // halved in metres the moment kVoxelMeters did while its grip socket (rig
+  // geometry, in the wearer's frame) did not: a blade that no longer reached
+  // its own hilt.
+  uint32_t scale = 1;
+  // The art's authoring resolution, in art voxels per METRE. See
+  // MobDef::artVoxelsPerMetre — items and mobs share the whole mechanism
+  // because a worn robe is measured against a wearer's limb box and the two
+  // must land in one frame.
+  int artVoxelsPerMetre = 0;
+  uint32_t artUpsample = 1;   // block replication applied when art < world
+  // Authored art units -> world voxels, for every length the sidecar states in
+  // the art lattice (hilt, edge, cover offset/fitBox).
+  float ArtToWorld() const {
+    return (float)artUpsample / (float)(scale ? scale : 1u);
+  }
   IVec3 size{};            // model box, MICRO units
   IVec3 offset{};          // model min corner within the .vox, MICRO units
   int microModel = -1;     // index into the shared micro-body pool, -1 = none
@@ -331,7 +350,9 @@ struct ItemDef {
   // since the blade geometry is supposed to be what decides the wound.
   float carveBonus = 0.0f;
   // Reach in world voxels from the shoulder, used to size the swing arc.
-  float reach = 9.0f;
+  // METRES-derived: 0.9 m from the shoulder. A bare 9 cells halved the
+  // player's effective reach the moment kVoxelMeters did.
+  float reach = MetresToCells(0.9f);
 };
 
 // The item library. Loaded once; indices into it are what a slot stores, the

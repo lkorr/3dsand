@@ -356,6 +356,7 @@ add_executable(sandvox
   src/test/selftest_voxregion.cpp
   src/test/selftest_terrain.cpp
   src/test/selftest_trees.cpp
+  src/test/selftest_scale.cpp
   src/test/selftest_sim.cpp
   src/test/selftest_ca.cpp
   src/test/selftest_wind.cpp

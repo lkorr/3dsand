@@ -88,8 +88,8 @@ Status GateTreeAtlas(Ctx& c, std::string& detail) {
           const uint32_t* col = W + d[treeatlas::kVColumns] + ((size_t)z * nx + x) * 2;
           for (uint32_t k = 0; k < col[1]; k++) {
             const uint32_t r = W[col[0] + k];
-            const int y0 = (int)((r >> 16) & 0x1FFu);
-            const int len = (int)((r >> 25) & 0x7Fu);
+            const int y0 = (int)((r >> 16) & treeatlas::kRunMaxY0);
+            const int len = (int)((r >> (16 + treeatlas::kRunY0Bits)) & treeatlas::kRunMaxLen);
             runs++;
             voxels += (size_t)len;
             if ((r & 0xFFFu) == 0) airRuns++;
@@ -158,8 +158,8 @@ Status GateTreeAtlas(Ctx& c, std::string& detail) {
         const uint32_t* col = W + d[treeatlas::kVColumns] + ((size_t)z * nx + x) * 2;
         for (uint32_t k = 0; k < col[1]; k++) {
           const uint32_t r = W[col[0] + k];
-          const int y0 = (int)((r >> 16) & 0x1FFu);
-          const int len = (int)((r >> 25) & 0x7Fu);
+          const int y0 = (int)((r >> 16) & treeatlas::kRunMaxY0);
+          const int len = (int)((r >> (16 + treeatlas::kRunY0Bits)) & treeatlas::kRunMaxLen);
           for (int y = y0; y < y0 + len && y < ny; y++) want[(size_t)y] = r & 0xFFFu;
         }
         for (int y = 0; y < ny; y++) {

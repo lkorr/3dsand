@@ -335,6 +335,22 @@ bool mobOk = false;
                                 xf.size() * sizeof(BodyXformGpu));
         std::vector<MicroBodyInstGpu> microInsts;
         bodyReg.BuildMicroInsts(microInsts);
+        // WHETHER THIS PROBE CAN RUN AT ALL depends on the voxel size.
+        // A limb only gets a micro brick when its def's skinScale > 1
+        // (mob.cpp), and skinScale is now DERIVED as artVoxelsPerMetre /
+        // kVoxelsPerMetre (DESIGN.md 3b). The critter's art is 20 vox/m, so
+        // in a 20 vox/m world it is exactly 1:1 with the grid, takes the
+        // ordinary cube path, and has no bricks to render — the mob is the
+        // right physical size, it simply has no sub-cell detail left.
+        //
+        // That is a legitimate state, not a rendering bug, so it SKIPS —
+        // but only when expected. An empty list while the def still says
+        // skinScale > 1 means the bricks went missing, which is exactly
+        // what this probe exists to catch, and still fails.
+        uint32_t critterSkin = 1;
+        for (const MobDef& md : mobs.Defs())
+          if (md.name == "critter") critterSkin = md.skinScale;
+        const bool microExpected = critterSkin > 1;
         std::vector<BodyVoxInst> inst;
         bodyReg.BuildInstances(inst);
         if (!inst.empty())
@@ -450,7 +466,7 @@ bool mobOk = false;
         // rendering nothing, which is exactly the reported symptom.
         int soloBad = 0, soloFirst = -1;
         uint32_t soloMin = 0xFFFFFFFFu;
-        {
+        if (!microInsts.empty()) {
           std::vector<MicroBodyInstGpu> solo(1, microInsts[0]);
           // Park the single body in open air well above the terrain, with an
           // identity quaternion, so nothing occludes it and no gait pose
@@ -531,8 +547,16 @@ bool mobOk = false;
                                   xf.size() * sizeof(BodyXformGpu));
         }
 
-        bool microOk = !microInsts.empty() && badDirs == 0 && soloBad == 0;
-        std::printf("micro body render: %s (%zu micro slots, %d/%d views drew, "
+        const bool microSkipped = microInsts.empty() && !microExpected;
+        bool microOk = microSkipped ||
+                       (!microInsts.empty() && badDirs == 0 && soloBad == 0);
+        if (microSkipped)
+          std::printf("micro body render: SKIPPED (critter skinScale 1 at "
+                      "%d world vox/m - art is 1:1 with the grid, so it "
+                      "takes the cube path and has no bricks to probe)\n",
+                      kVoxelsPerMetre);
+        else
+          std::printf("micro body render: %s (%zu micro slots, %d/%d views drew, "
                     "%u..%u px changed of %u, solo body %d/%d views (min %u px), "
                     "%zu cube instances from micro limbs)\n",
                     microOk ? "PASS" : "FAIL", microInsts.size(),
@@ -2252,6 +2276,187 @@ bool mobOk = false;
                 missedFar ? 1 : 0, selfSafe ? 1 : 0,
                 hiltInFist ? 1 : 0, gripGap);
             mobOk = mobOk && meleeOk;
+
+            // ---- THE ARM IS AN ARM, AT EVERY TARGET THE MOUSE CAN NAME ----
+            //
+            // The weapon arm is driven by the MOUSE through a two-bone IK
+            // chain, so unlike the legs it is aimed at arbitrary points on the
+            // sphere — including behind the shoulder and across the chest. The
+            // solver has no opinion about anatomy: handed such a point it
+            // reaches it, raking the upper arm through the torso and opening
+            // the elbow sideways. `poseLimit` on armU/armL is what forbids
+            // that (anim.h PoseBallLimit / AnimPart::poseHinge), and this is
+            // the only thing between it and the screen.
+            //
+            // WHY A FAN AND NOT ONE POSE. A single hostile target proves one
+            // clamp fires. The failure being gated is a REGION of the input
+            // space, and the two worst corners (down-and-back, up-and-across)
+            // are not reachable by any one offset — the earlier version of the
+            // ball clamp handled the pure-back case correctly and let the
+            // back-and-across corner through, which no single-target test
+            // could have seen.
+            //
+            // The bounds are READ OFF THE RIG, never restated here, exactly as
+            // the hip/knee assertions above do it: a limit is authored data and
+            // a test carrying its own copy is a second source of truth that
+            // passes while measuring nothing.
+            {
+              const int shoulderPart = avatar.PartIndex("armU.R");
+              const int elbowPart = avatar.PartIndex("armL.R");
+              const float kDeg = 57.29578f;
+              // Slack absorbs the ONE tick of lag between the clamp and this
+              // readback plus the IK blend weight ramping; it is not a licence
+              // for the joint to be a little bit illegal.
+              const float kSlack = 2.0f;
+              PoseBallLimit ball;
+              bool haveBall = false, haveHinge = false;
+              float hingeLo = 0, hingeHi = 0;
+              Vec3 hingeAxis{1, 0, 0};
+              if (shoulderPart >= 0 && shoulderPart < avatar.LimbCount()) {
+                const MobLimbDef& ld = avatar.LimbDefAt(shoulderPart);
+                ball = ld.poseBall;
+                haveBall = ball.has && ball.reachCount == 2;
+              }
+              bool hingeEnforced = false;
+              if (elbowPart >= 0 && elbowPart < avatar.LimbCount()) {
+                const MobLimbDef& ld = avatar.LimbDefAt(elbowPart);
+                // MEASURE whenever a limit exists; REQUIRE the hinge flag
+                // separately. Keeping those apart is what makes the control
+                // runnable without a rebuild: flip `hinge` to false in the
+                // sidecar and this still reports how far out of plane the
+                // solver takes the forearm, while correctly failing.
+                haveHinge = ld.hasPoseLimit;
+                hingeEnforced = ld.poseHinge;
+                hingeAxis = ld.poseAxis.normalized();
+                hingeLo = ld.poseMin * kDeg;
+                hingeHi = ld.poseMax * kDeg;
+              }
+              // The part's rotation relative to its PARENT, which is the frame
+              // a poseLimit is stated in (the rests on these rigs are identity,
+              // so parent-relative and rest-relative coincide; measuring
+              // parent-relative is what makes this independent of the clamp).
+              auto relOf = [&](int part, int parent, Quat& out) {
+                Vec3 p, pp;
+                Quat q, pq;
+                if (part < 0 || parent < 0) return false;
+                if (!avatar.PartModelTransform(part, p, q)) return false;
+                if (!avatar.PartModelTransform(parent, pp, pq)) return false;
+                out = QuatNormalize(QuatMul(QuatConj(pq), q));
+                return true;
+              };
+              // Hostile hand targets, shoulder-relative world voxels, in the
+              // frame SetWeaponPose takes: +Z forward, +X the camera's right,
+              // +Y up. Every one of these is a place a fast mouse flick
+              // genuinely puts the target — behind, across, and the corners.
+              const Vec3 kFan[] = {
+                  {0, 0, -8},    {0, -6, -6},  {0, 6, -6},   {-9, 0, -4},
+                  {9, 0, -4},    {-9, -5, 0},  {-9, 5, 2},   {-10, 0, 1},
+                  {-7, -7, -5},  {-7, 7, -5},  {2, -9, -3},  {2, 9, -3},
+                  {0, 0, 9},     {6, 6, 6},
+              };
+              // SCALED TO THE RIG'S OWN ARM, not left as world voxels.
+              //
+              // Two reasons, and the second is the one that cost a run. A
+              // literal 9-voxel offset means a different fraction of an arm at
+              // every kVoxelMeters, so this would have quietly become an
+              // out-of-reach test the next time the voxel size moved. And an
+              // out-of-reach target is not a hostile target at all: the
+              // two-bone solver clamps to its reach annulus, and a clamped
+              // two-bone solve is a DEAD STRAIGHT limb by construction (the
+              // same trap the leg IK note above documents). The elbow then
+              // reads ~0 at every target and the hinge assertion measures
+              // nothing. 0.72 of full reach keeps the elbow honestly bent
+              // while still putting the HAND well outside the shoulder's legal
+              // cone, which is the input this is about.
+              float armLen = 0.0f;
+              {
+                Vec3 ps, pe, ph;
+                Quat qs, qe, qh;
+                const int handPart2 = avatar.PartIndex("hand.R");
+                if (avatar.PartModelTransform(shoulderPart, ps, qs) &&
+                    avatar.PartModelTransform(elbowPart, pe, qe) &&
+                    handPart2 >= 0 &&
+                    avatar.PartModelTransform(handPart2, ph, qh))
+                  armLen = (pe - ps).len() + (ph - pe).len();
+              }
+              const float fanScale =
+                  armLen > 1e-3f ? armLen * 0.72f / 9.0f : 1.0f;
+              // ABSOLUTE degrees past each plane, not the overshoot. The
+              // overshoot alone reads 0.0 both when the clamp is holding the
+              // joint exactly on its stop and when the limits have been opened
+              // right out — the same number for "working" and "measuring" — so
+              // the absolute is what the control run below actually needs.
+              float worstBehind = -90.0f, worstAcross = -90.0f;
+              float worstElbowLo = 999.0f, worstElbowHi = -999.0f;
+              float worstOffHinge = 0.0f;
+              int samples = 0;
+              for (const Vec3& raw : kFan) {
+                const Vec3 tgt = raw * fanScale;
+                avatar.SetWeaponPose(tgt, Vec3{0, 0, 1}, Vec3{0, 1, 0}, 1.0f);
+                for (int i = 0; i < 6; i++) avTick();
+                Quat rel;
+                if (haveBall && relOf(shoulderPart, avatar.PartIndex("torso"),
+                                      rel)) {
+                  // WHERE THE BONE POINTS, which is what the limit bounds —
+                  // an angle about one axis cannot see "the arm is behind"
+                  // once the shoulder has also abducted.
+                  const Vec3 d = QuatRotate(rel, ball.bone);
+                  for (int k = 0; k < 2; k++) {
+                    const float past =
+                        std::asin(std::clamp(d.dot(ball.reachNormal[k]), -1.0f,
+                                             1.0f)) * kDeg;
+                    float& worst = k == 0 ? worstBehind : worstAcross;
+                    worst = std::max(worst, past);
+                  }
+                  samples++;
+                }
+                if (haveHinge && relOf(elbowPart, shoulderPart, rel)) {
+                  // A HINGE HAS TO BE MEASURED AS A HINGE. The angle alone
+                  // would pass on a forearm swung 40 degrees out of its plane
+                  // with a legal in-plane component, which is exactly the
+                  // sideways-elbow pose. So measure both: the bend, and how
+                  // far the bone left the plane it is allowed to move in.
+                  const Vec3 bone{0, -1, 0};
+                  const Vec3 d = QuatRotate(rel, bone);
+                  worstOffHinge =
+                      std::max(worstOffHinge, std::fabs(d.dot(hingeAxis)) );
+                  // Signed bend in the hinge plane, in the authored axis'
+                  // own sense (positive = the direction min/max count in).
+                  const Vec3 ref = bone;
+                  const Vec3 perp = hingeAxis.cross(ref);
+                  const float ang =
+                      std::atan2(d.dot(perp), d.dot(ref)) * kDeg;
+                  worstElbowLo = std::min(worstElbowLo, ang);
+                  worstElbowHi = std::max(worstElbowHi, ang);
+                }
+              }
+              avatar.SetWeaponPose(Vec3{}, Vec3{0, 0, 1}, Vec3{0, 1, 0}, 0.0f);
+              for (int i = 0; i < 4; i++) avTick();
+
+              const float behindLim =
+                  haveBall ? std::asin(ball.reachSin[0]) * kDeg : 0.0f;
+              const float acrossLim =
+                  haveBall ? std::asin(ball.reachSin[1]) * kDeg : 0.0f;
+              const bool armLimited =
+                  haveBall && haveHinge && hingeEnforced &&
+                  samples == (int)(sizeof(kFan) / sizeof(kFan[0])) &&
+                  worstBehind <= behindLim + kSlack &&
+                  worstAcross <= acrossLim + kSlack &&
+                  worstElbowLo >= hingeLo - kSlack &&
+                  worstElbowHi <= hingeHi + kSlack &&
+                  // sin(2 degrees) — the forearm stays in its plane.
+                  worstOffHinge <= 0.035f;
+              std::printf(
+                  "arm-limits: %s (%d targets at 0.72 of a %.1f vox arm; "
+                  "shoulder reached %.1f deg behind vs stop %.0f, %.1f across "
+                  "the midline vs stop %.0f; elbow %.1f..%.1f deg vs authored "
+                  "%.0f..%.0f hinged=%d, worst off-hinge %.3f)\n",
+                  armLimited ? "PASS" : "FAIL", samples, armLen, worstBehind,
+                  behindLim, worstAcross, acrossLim, worstElbowLo,
+                  worstElbowHi, hingeLo, hingeHi, hingeEnforced ? 1 : 0,
+                  worstOffHinge);
+              mobOk = mobOk && armLimited;
+            }
           }
         }
         debris.Reset();

@@ -8,6 +8,7 @@
 #include <unordered_map>
 
 #include "sim/tuning.h"   // worldgen.treeTile, for the candidate-set bound
+#include "sim/world.h"    // kVoxelsPerMetre, for the atlas bake-scale check
 
 namespace fs = std::filesystem;
 using namespace treeatlas;
@@ -51,7 +52,12 @@ bool ParseFile(const fs::path& path, File& out, std::string& err) {
   const size_t n = w.size();
   if (n < static_cast<size_t>(kFileHeaderWords)) { err = "truncated header"; return false; }
   if (w[0] != kFileMagic) { err = "bad magic"; return false; }
-  if (w[1] != 1u) { err = "unsupported version " + std::to_string(w[1]); return false; }
+  if (w[1] != kFileVersion) {
+    err = "unsupported version " + std::to_string(w[1]) + " (this build reads " +
+          std::to_string(kFileVersion) +
+          "); re-bake with `node scripts/bake_trees.mjs`";
+    return false;
+  }
   if (w[2] != static_cast<uint32_t>(kFileHeaderWords)) {
     err = "header is " + std::to_string(w[2]) + " words, expected " +
           std::to_string(kFileHeaderWords);
@@ -61,6 +67,30 @@ bool ParseFile(const fs::path& path, File& out, std::string& err) {
     err = "declares " + std::to_string(w[7]) + " words, file holds " +
           std::to_string(n);
     return false;
+  }
+  // THE SCALE CHECK, and the reason v2 exists.
+  //
+  // Everything past this point — reach, above, crownY/R, the variant dims, the
+  // run Y0s, minY/maxY — is a VOXEL COUNT, and a voxel count only means a
+  // physical size next to the scale it was baked at. worldgen stamps the atlas
+  // 1:1 into the world, so a file baked at a different voxels-per-metre than
+  // the engine runs at produces a forest at the wrong size, everywhere, with
+  // every internal consistency check still passing. That is exactly what
+  // happened when kVoxelMeters moved to 0.05 against an atlas hard-baked at 10
+  // voxels/metre: half-height trees and nothing anywhere able to say so.
+  //
+  // So refuse, and NAME BOTH NUMBERS — same policy as worldio.cpp's
+  // kVoxelMeters bit-compare on saves. A wrong-scale forest is not a
+  // degradation to tolerate; it is a stale asset with a one-line fix.
+  {
+    const uint32_t bakeVpm = w[kFileWordBakeVpm];
+    if (bakeVpm != static_cast<uint32_t>(kVoxelsPerMetre)) {
+      err = "baked at " + std::to_string(bakeVpm) + " voxels/metre, engine is " +
+            std::to_string(kVoxelsPerMetre) + " (kVoxelMeters=" +
+            std::to_string(kVoxelMeters) + ") — re-bake with " +
+            "`node scripts/bake_trees.mjs`";
+      return false;
+    }
   }
   out.variantCount = static_cast<int>(w[3]);
   const int nameCount = static_cast<int>(w[4]);
@@ -371,8 +401,9 @@ uint32_t TreeAtlasCellAt(const TreeAtlas& atlas, int species, int variant,
   const uint32_t off = col[0], cnt = col[1];
   for (uint32_t k = 0; k < cnt; k++) {
     const uint32_t r = W[off + k];
-    const int y0 = static_cast<int>((r >> 16) & 0x1FFu);
-    const int len = static_cast<int>((r >> 25) & 0x7Fu);
+    const int y0 = static_cast<int>((r >> 16) & treeatlas::kRunMaxY0);
+    const int len =
+        static_cast<int>((r >> (16 + treeatlas::kRunY0Bits)) & treeatlas::kRunMaxLen);
     if (ly < y0) return 0;              // runs are sorted; nothing below can hit
     if (ly < y0 + len) return r & 0xFFFu;
   }

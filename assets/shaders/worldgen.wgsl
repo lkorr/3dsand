@@ -965,9 +965,20 @@ fn pondNear(x : i32, z : i32, seed : u32) -> Shore {
 // `* VOX_PER_M / 10`, never as a bare voxel count — the first cut of the tree
 // system used bare counts and produced 10-voxel "oaks" that were 60 cm tall.
 // VOX_PER_M IS THE WORLD'S OWN VOXELS-PER-METRE, read from the prelude so the
-// tables stay metre-true at any voxel size. (The trees themselves no longer
-// need it: their sizes are metres in assets/trees/*.json and voxels in the
-// baked atlas. The cacti below still do.)
+// tables stay metre-true at any voxel size.
+//
+// It used to say here that "the trees themselves no longer need it: their sizes
+// are metres in assets/trees/*.json and voxels in the baked atlas". Both halves
+// were true and the conclusion was false — the metres never reached this
+// shader, only the voxels did, and NOTHING rescaled between them, so the atlas
+// silently inherited whatever scale the baker happened to run at. That premise
+// is what hid half-height forests at 5 cm voxels for as long as it did.
+//
+// What actually keeps trees metre-true now is that the .svtree header records
+// its bake scale and src/sim/treeatlas.cpp REFUSES an atlas whose scale is not
+// this world's. The stamping below can then stay 1:1, which is the cheap path —
+// but it is only correct because of that check, not because of a property of
+// the data.
 const VOX_PER_M : i32 = VOXELS_PER_M;
 
 // ---- THE BAKED ATLAS, AND WHY THE IMPLICIT SHAPES ARE GONE ----------------
@@ -1410,6 +1421,20 @@ fn treeCandsInto(c : ptr<function, TreeCands>, x : i32, z : i32, seed : u32) {
   }
 }
 
+// The .svtree run word: material(12) | state(4) | y0(11) | len(5).
+//
+// MIRRORS src/sim/treeatlas.h (kRunY0Bits / kRunLenBits) and
+// assets/editor/treegen.js (packRun). Three implementations of one layout;
+// scripts/check_invariants.py asserts they agree, because a silent disagreement
+// here decodes every tree in the world into noise.
+//
+// Y0 used to be 9 bits, capping a variant at 512 voxels — fine at 10 cm, but a
+// 22 m redwood needs ~520 at 5 cm. Two bits moved from LEN to Y0, so runs are
+// split at 31 instead of 127 and the height ceiling is 2047.
+const TREE_RUN_Y0_MASK : u32 = 2047u;
+const TREE_RUN_LEN_SHIFT : u32 = 27u;   // 16 + Y0 bits
+const TREE_RUN_LEN_MASK : u32 = 31u;
+
 // Material this tree contributes at world height `y`, or MAT_AIR.
 //
 // The whole per-cell cost of a tree, and it is a linear scan of ONE column's
@@ -1420,9 +1445,9 @@ fn treeCellFrom(c : TreeCand, y : i32) -> u32 {
   if (ly < 0 || ly >= c.ny) { return MAT_AIR; }
   for (var k = 0u; k < c.colCnt; k++) {
     let r = treeAtlas[c.colOff + k];
-    let y0 = i32((r >> 16u) & 0x1FFu);
+    let y0 = i32((r >> 16u) & TREE_RUN_Y0_MASK);
     if (ly < y0) { return MAT_AIR; }
-    if (ly < y0 + i32((r >> 25u) & 0x7Fu)) {
+    if (ly < y0 + i32((r >> TREE_RUN_LEN_SHIFT) & TREE_RUN_LEN_MASK)) {
       var m = r & 0xFFFu;
       // AUTUMN: a per-TREE substitution across the species' three-step leaf
       // ramp. Done as a ramp rather than one flat colour because replacing a

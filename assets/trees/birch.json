@@ -14,7 +14,7 @@
   "whorlCount": 0,
   "lobes": 0,
   "lobeDepth": 0.1,
-  "barkNoise": 0.4,
+  "barkNoise": 0.04,
   "levelsData": [
     {
       "length": 1,
@@ -94,8 +94,8 @@
     "elongation": 0.85,
     "droop": 0.35,
     "density": 0.68,
-    "noiseScale": 2.4,
-    "sminK": 1.6,
+    "noiseScale": 0.24,
+    "sminK": 0.16,
     "canopyShadeMix": 0.4,
     "depthShade": 0.7
   },
@@ -123,7 +123,7 @@
       "desert": 0
     },
     "minY": -1,
-    "maxY": 220,
+    "maxY": 22,
     "maxSlope": 460,
     "sparsity": 1,
     "shade": 95

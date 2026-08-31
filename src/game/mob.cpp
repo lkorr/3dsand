@@ -17,6 +17,7 @@
 #include "sim/bytestream.h"
 #include "sim/reactcpu.h"
 #include "sim/rng.h"
+#include "sim/scale.h"   // SkinScaleFor / NeededArtUpsample / MetresToCells
 #include "sim/tuning.h"
 
 using nlohmann::json;
@@ -299,9 +300,31 @@ bool LoadMobDefs(const std::string& dir, const std::vector<MaterialDef>& mats,
       int id = FindMaterialId(mats, bm);
       if (id < 0) log += jp + ": unknown bleed material \"" + bm + "\"\n";
       else def.bleedMat = (uint32_t)id;
+      // NOT rescaled: this is a COUNT of voxels a wound may still owe, i.e.
+      // a volume budget, and volume goes as the cube of the voxel scale. It
+      // is gore rate rather than size or shape, so it is left as authored
+      // and flagged here instead of being silently cubed.
       def.bleedPerDamage = j["bleed"].value("perDamage", 1.5f);
     }
-    def.speed = j.value("speed", 4.0f);
+    // ---- WORLD-SPACE SIDECAR LENGTHS (DESIGN.md §3b) --------------------
+    // `speed`, `severImpactSpeed`, `gait.rideHeight`, `states[].bodyYOffset`
+    // and clip position keys are WORLD VOXELS (or voxels/sec), not art
+    // units -- so `artVoxelsPerMetre` does not describe them and the art
+    // upsample must not touch them. They still have a scale, though: every
+    // one was authored when the world was 10 voxels/metre, which is what
+    // `sidecarVoxelsPerMetre` writes down.
+    //
+    // Without this, a correctly-sized 1.7 m human walked at half its
+    // authored speed in m/s the moment kVoxelMeters halved -- the body the
+    // right size, moving through the world at the wrong one, against a
+    // stride budget that avatar.cpp:54 already documents as barely
+    // positive.
+    const int sidecarVpm =
+        j.value("sidecarVoxelsPerMetre", kLegacyAuthoringVoxelsPerMetre);
+    const float worldLen =
+        (float)kVoxelsPerMetre / (float)(sidecarVpm > 0 ? sidecarVpm
+                                                       : kVoxelsPerMetre);
+    def.speed = j.value("speed", 4.0f) * worldLen;
 
     // Sound slots (assets/sound_schema.js). Presentation only, so a bad entry
     // is skipped rather than failing the def — a mob with a typo'd sound name
@@ -312,25 +335,75 @@ bool LoadMobDefs(const std::string& dir, const std::vector<MaterialDef>& mats,
         if (name.is_string() && !name.get<std::string>().empty())
           def.sounds[slot] = name.get<std::string>();
 
-    // Micro-voxel AUTHORING scale (PLAN §C). Anything other than 1/2/4/8 is a
-    // typo, not a feature: fall back to 1 loudly rather than half-applying it.
+    // Declared here rather than below the limb loop: the art-scale block that
+    // follows can fail a def outright (a scale that admits no integer
+    // skinScale), and that has to reach the same `ok` the limb checks use.
+    bool ok = true;
+
+    // ---- ART SCALE (DESIGN.md §3b) ------------------------------------------
     //
-    // "skinScale" is the current name. "scale" is kept as an alias meaning
-    // BOTH lattices are equal, which is what it meant before the split — that
-    // is what keeps every already-authored sidecar loading unchanged. An asset
-    // that says "scale" gets the old single-lattice behaviour exactly; only an
-    // asset that says "skinScale" opts into a derived coarser collider.
-    const bool authoredSkin = j.contains("skinScale");
-    def.skinScale = j.value("skinScale", j.value("scale", 1u));
-    if (def.skinScale != 1 && def.skinScale != 2 && def.skinScale != 4 &&
-        def.skinScale != 8) {
-      log += jp + ": " + (authoredSkin ? "skinScale" : "scale") +
-             " must be 1, 2, 4 or 8 (got " + std::to_string(def.skinScale) +
-             ") — using 1\n";
-      def.skinScale = 1;
+    // `artVoxelsPerMetre` is the authored fact; `skinScale` is DERIVED from it
+    // and the engine's kVoxelsPerMetre. See MobDef::artVoxelsPerMetre for why
+    // the direction matters — authoring skinScale directly encoded "and the
+    // world is 10 cm" into every sidecar, so the human halved in metres the
+    // moment kVoxelMeters did.
+    //
+    // "skinScale"/"scale" survive as LEGACY: they said art voxels per WORLD
+    // voxel, and every asset that used them was authored at 10 voxels/metre, so
+    // that is the reading they get. Loud, because a modded asset silently
+    // assumed to be 10 vox/m is exactly the failure this replaces.
+    if (j.contains("artVoxelsPerMetre")) {
+      def.artVoxelsPerMetre = j.value("artVoxelsPerMetre", 0);
+    } else {
+      const bool authoredSkin = j.contains("skinScale");
+      const uint32_t legacy = j.value("skinScale", j.value("scale", 1u));
+      def.artVoxelsPerMetre = (int)legacy * kLegacyAuthoringVoxelsPerMetre;
+      log += jp + ": no \"artVoxelsPerMetre\"; reading legacy " +
+             std::string(authoredSkin ? "skinScale" : "scale") + " " +
+             std::to_string(legacy) + " as " +
+             std::to_string(def.artVoxelsPerMetre) +
+             " art voxels/metre (authored at " +
+             std::to_string(kLegacyAuthoringVoxelsPerMetre) +
+             " voxels/metre). Declare artVoxelsPerMetre to be explicit.\n";
     }
 
-    bool ok = true;
+    if (def.artVoxelsPerMetre <= 0) {
+      log += jp + ": artVoxelsPerMetre must be positive (got " +
+             std::to_string(def.artVoxelsPerMetre) + ") — using " +
+             std::to_string(kVoxelsPerMetre) + " (art is 1:1 with world)\n";
+      def.artVoxelsPerMetre = kVoxelsPerMetre;
+      ok = false;
+    }
+
+    // Art coarser than the world has no integer skinScale, so replicate the
+    // grid until it does. Lossless, and it costs u^3 voxels — but it is the
+    // only way a 10 vox/m asset can hold its metre size in a 20 vox/m world
+    // without being redrawn.
+    def.artUpsample = NeededArtUpsample(def.artVoxelsPerMetre);
+    def.skinScale =
+        SkinScaleFor(def.artVoxelsPerMetre * (int)def.artUpsample);
+    if (def.skinScale != 1 && def.skinScale != 2 && def.skinScale != 4 &&
+        def.skinScale != 8) {
+      log += jp + ": artVoxelsPerMetre " +
+             std::to_string(def.artVoxelsPerMetre) + " gives skinScale " +
+             std::to_string(def.skinScale) + " at " +
+             std::to_string(kVoxelsPerMetre) +
+             " world voxels/metre, which must be 1, 2, 4 or 8 — the art scale "
+             "has to be a power-of-two multiple of the world scale. Using 1; "
+             "this mob will be the wrong physical size.\n";
+      def.skinScale = 1;
+      def.artUpsample = 1;
+      ok = false;
+    }
+    if (def.artUpsample > 1) {
+      UpsamplePrefab(def.prefab, def.artUpsample);
+      log += def.name + ": art is " + std::to_string(def.artVoxelsPerMetre) +
+             " vox/m in a " + std::to_string(kVoxelsPerMetre) +
+             " vox/m world — block-replicated " +
+             std::to_string(def.artUpsample) + "x to skinScale " +
+             std::to_string(def.skinScale) + " (same size, no new detail)\n";
+    }
+
     for (auto& l : j.value("limbs", json::array())) {
       MobLimbDef ld;
       ld.name = l.value("name", "");
@@ -346,7 +419,7 @@ bool LoadMobDefs(const std::string& dir, const std::vector<MaterialDef>& mats,
       ld.swingPhase = l.value("swingPhase", 0.0f);
       ld.tag = l.value("tag", "");
       // absent severImpactSpeed = "never severs on impact alone"
-      ld.severImpactSpeed = l.value("severImpactSpeed", 0.0f);
+      ld.severImpactSpeed = l.value("severImpactSpeed", 0.0f) * worldLen;
       // A cutting edge: the segment this part cuts along, in its own local
       // frame. Authored in MICRO units along an axis of the part's model box;
       // converted to world voxels below, with the anchors.
@@ -401,14 +474,79 @@ bool LoadMobDefs(const std::string& dir, const std::vector<MaterialDef>& mats,
       // in, radians out, like `edge` converts its units at the same point.
       if (l.contains("poseLimit") && l["poseLimit"].is_object()) {
         const json& pl = l["poseLimit"];
-        ld.hasPoseLimit = true;
-        if (pl.contains("axis") && pl["axis"].size() == 3)
-          ld.poseAxis = {pl["axis"][0].get<float>(), pl["axis"][1].get<float>(),
-                         pl["axis"][2].get<float>()};
         const float kDeg = 3.14159265f / 180.0f;
-        ld.poseMin = pl.value("min", -180.0f) * kDeg;
-        ld.poseMax = pl.value("max", 180.0f) * kDeg;
-        if (ld.poseMin > ld.poseMax) std::swap(ld.poseMin, ld.poseMax);
+        auto vec3 = [&](const char* key, Vec3 dflt) {
+          if (!pl.contains(key) || pl[key].size() != 3) return dflt;
+          return Vec3{pl[key][0].get<float>(), pl[key][1].get<float>(),
+                      pl[key][2].get<float>()};
+        };
+        // BALL FORM (a shoulder): bounded by where the bone may POINT, not by
+        // one rotation component. Selected by the presence of `bone`, because
+        // the bone direction is the thing the axis form has no use for and the
+        // ball form cannot work without.
+        if (pl.contains("bone")) {
+          PoseBallLimit& b = ld.poseBall;
+          b.has = true;
+          b.bone = vec3("bone", {0, -1, 0});
+          if (b.bone.len() < 1e-5f) {
+            log += jp + ": limb \"" + ld.name + "\" poseLimit.bone is zero\n";
+            ok = false;
+          } else {
+            b.bone = b.bone.normalized();
+          }
+          if (pl.contains("reach") && pl["reach"].is_array()) {
+            for (const json& r : pl["reach"]) {
+              if (b.reachCount >= 2) {
+                log += jp + ": limb \"" + ld.name +
+                       "\" poseLimit.reach takes at most 2 planes (see "
+                       "PoseBallLimit in anim.h)\n";
+                ok = false;
+                break;
+              }
+              Vec3 nrm{0, 0, 1};
+              if (r.contains("normal") && r["normal"].size() == 3)
+                nrm = {r["normal"][0].get<float>(), r["normal"][1].get<float>(),
+                       r["normal"][2].get<float>()};
+              if (nrm.len() < 1e-5f) {
+                log += jp + ": limb \"" + ld.name +
+                       "\" poseLimit.reach normal is zero\n";
+                ok = false;
+                continue;
+              }
+              nrm = nrm.normalized();
+              // The closed-form projection is only the NEAREST legal direction
+              // when the planes are perpendicular; a tilted pair would be
+              // solved wrong and look almost right, so it is a load error.
+              if (b.reachCount == 1 &&
+                  std::fabs(nrm.dot(b.reachNormal[0])) > 1e-3f) {
+                log += jp + ": limb \"" + ld.name +
+                       "\" poseLimit.reach normals must be perpendicular\n";
+                ok = false;
+              }
+              b.reachNormal[b.reachCount] = nrm;
+              // "at most N degrees past this plane" — the plane itself is 0.
+              b.reachSin[b.reachCount] =
+                  std::sin(std::clamp(r.value("max", 0.0f), -90.0f, 90.0f) *
+                           kDeg);
+              b.reachCount++;
+            }
+          }
+          if (pl.contains("twist") && pl["twist"].is_object()) {
+            b.hasTwist = true;
+            b.twistMin = pl["twist"].value("min", -180.0f) * kDeg;
+            b.twistMax = pl["twist"].value("max", 180.0f) * kDeg;
+            if (b.twistMin > b.twistMax) std::swap(b.twistMin, b.twistMax);
+          }
+        } else {
+          ld.hasPoseLimit = true;
+          ld.poseAxis = vec3("axis", ld.poseAxis);
+          ld.poseMin = pl.value("min", -180.0f) * kDeg;
+          ld.poseMax = pl.value("max", 180.0f) * kDeg;
+          if (ld.poseMin > ld.poseMax) std::swap(ld.poseMin, ld.poseMax);
+          // A hinge is one DOF, not one bounded DOF: it also discards the
+          // off-axis swing (anim.h, AnimPart::poseHinge).
+          ld.poseHinge = pl.value("hinge", false);
+        }
       }
       if (l.contains("anchor") && l["anchor"].size() == 3) {
         ld.anchor = {l["anchor"][0].get<float>(), l["anchor"][1].get<float>(),
@@ -522,21 +660,41 @@ bool LoadMobDefs(const std::string& dir, const std::vector<MaterialDef>& mats,
         p.poseAxis = ld.poseAxis;
         p.poseMin = ld.poseMin;
         p.poseMax = ld.poseMax;
+        p.poseHinge = ld.poseHinge;
+        p.poseBall = ld.poseBall;
       }
       // rest transforms come from the .vox layout: a part's local rest
       // position is its joint anchor relative to the parent's anchor.
       for (size_t i = 0; i < def.limbs.size(); i++) {
         const MobLimbDef& ld = def.limbs[i];
         int mi = FindModel(def.prefab, ld.name);
+        // TWO LATTICES MEET HERE, and they are not the same one after an art
+        // upsample (DESIGN.md §3b). `ld.anchor` is AUTHORED, so it is in the
+        // sidecar's original art grid; AutoAnchor and the root fallback are
+        // DERIVED FROM def.prefab, which UpsamplePrefab may have multiplied by
+        // artUpsample. Dividing both by skinScale would put every authored
+        // joint of an upsampled rig at 1/artUpsample of its intended offset —
+        // a rig that collapses toward its own origin, with the art still
+        // looking perfectly correct.
+        //
+        // ArtToWorld() divides the upsample back out; the derived branches take
+        // the plain skin->world divisor. They agree exactly when artUpsample
+        // is 1, which is every asset that has not been redrawn coarser than
+        // the world.
         Vec3 anchor = ld.anchor;
+        float aInv = def.ArtToWorld();
+        const float prefabInv = 1.0f / (float)def.skinScale;
         if (ld.anchorAuto && (int)i != def.rootLimb) {
           int pmi = FindModel(def.prefab, ld.parent);
-          if (mi >= 0 && pmi >= 0)
+          if (mi >= 0 && pmi >= 0) {
             anchor = AutoAnchor(def.prefab.models[mi], def.prefab.models[pmi]);
+            aInv = prefabInv;
+          }
         } else if ((int)i == def.rootLimb && mi >= 0) {
           const PrefabModel& m = def.prefab.models[mi];
           anchor = Vec3{(float)m.offset.x + m.size.x * 0.5f, (float)m.offset.y,
                         (float)m.offset.z + m.size.z * 0.5f};
+          aInv = prefabInv;
         }
         // SKIN -> WORLD. Anchors are authored in .vox coordinates, which at
         // skinScale>1 are SKIN units — this is the ART's lattice, so it is
@@ -549,8 +707,7 @@ bool LoadMobDefs(const std::string& dir, const std::vector<MaterialDef>& mats,
         // Converting HERE, once, is what keeps every downstream stage
         // (AnimFlatten, IK, GroundHeightAt, the joint anchors in Spawn)
         // completely scale-unaware.
-        const float inv = 1.0f / (float)def.skinScale;
-        sk.parts[i].anchorLocal = anchor * inv;
+        sk.parts[i].anchorLocal = anchor * aInv;
         // The cutting edge rides the same conversion, for the same reason: it
         // is rig geometry, and every consumer downstream works in world
         // voxels. Its offsets are measured from the part's own ORIGIN (the
@@ -559,9 +716,11 @@ bool LoadMobDefs(const std::string& dir, const std::vector<MaterialDef>& mats,
         // carries the origin.
         MobLimbDef& mld = def.limbs[i];
         if (mld.hasEdge) {
-          mld.edgeFrom = mld.edgeFrom * inv;
-          mld.edgeTo = mld.edgeTo * inv;
-          mld.edgeHalfWidth *= inv;
+          // Always authored, so always the art-frame divisor.
+          const float eInv = def.ArtToWorld();
+          mld.edgeFrom = mld.edgeFrom * eInv;
+          mld.edgeTo = mld.edgeTo * eInv;
+          mld.edgeHalfWidth *= eInv;
         }
         // THE BONE: from the joint anchor to the limb's own centre, in the
         // rest pose. This is the centre line of the ball joint's swing cone
@@ -571,14 +730,18 @@ bool LoadMobDefs(const std::string& dir, const std::vector<MaterialDef>& mats,
         // centred anywhere but the rest direction parks the limb against its
         // own limit while it is still standing.
         //
-        // Both terms are in SKIN units, and it is normalised, so no conversion
-        // is needed — the scale cancels.
+        // It is normalised, so a common scale would cancel — but the two terms
+        // do NOT share one after an art upsample: `centre` is measured off the
+        // (possibly replicated) prefab and `anchor` may be authored in the
+        // original grid. Convert each with its own divisor first; when
+        // artUpsample is 1 they are the same number and this is the old
+        // expression exactly.
         if ((int)i != def.rootLimb && mi >= 0) {
           const PrefabModel& m = def.prefab.models[mi];
           const Vec3 centre{(float)m.offset.x + m.size.x * 0.5f,
                             (float)m.offset.y + m.size.y * 0.5f,
                             (float)m.offset.z + m.size.z * 0.5f};
-          const Vec3 bone = centre - anchor;
+          const Vec3 bone = centre * prefabInv - anchor * aInv;
           // A limb whose centre IS its anchor (a ball-shaped head sat exactly
           // on the neck) has no direction to speak of; straight down is the
           // rig-neutral guess and the cone stays symmetric about it.
@@ -602,8 +765,10 @@ bool LoadMobDefs(const std::string& dir, const std::vector<MaterialDef>& mats,
       //
       // Offsets take the SAME skin -> world conversion the anchors just did,
       // and for the same reason: everything downstream works in world voxels.
+      // Authored, so it is the art-frame divisor (ArtToWorld), not the raw
+      // 1/skinScale — see the two-lattices note at the anchors above.
       {
-        const float inv = 1.0f / (float)def.skinScale;
+        const float inv = def.ArtToWorld();
         for (const auto& s : j.value("sockets", json::array())) {
           MobSocketDef sd;
           sd.name = s.value("name", "");
@@ -640,7 +805,9 @@ bool LoadMobDefs(const std::string& dir, const std::vector<MaterialDef>& mats,
         gd.stepThreshold = g.value("stepThreshold", 0.6f);
         gd.stepDuration = g.value("stepDuration", 0.22f);
         gd.stepHeight = g.value("stepHeight", 0.25f);
-        gd.rideHeight = g.value("rideHeight", 0.9f);
+        // World voxels: a per-rig trim of about one cell at the authored
+        // scale, so it has to follow the scale or the rig sinks.
+        gd.rideHeight = g.value("rideHeight", 0.9f) * worldLen;
         gd.bobAmp = g.value("bobAmp", 0.06f);
         gd.bobFreqMul = g.value("bobFreqMul", 2.0f);
         gd.swayAmp = g.value("swayAmp", 0.05f);
@@ -718,7 +885,7 @@ bool LoadMobDefs(const std::string& dir, const std::vector<MaterialDef>& mats,
         rule.clip = s.value("clip", "");
         rule.speedScale = s.value("speedScale", 1.0f);
         rule.disableGait = s.value("disableGait", false);
-        rule.bodyYOffset = s.value("bodyYOffset", 0.0f);
+        rule.bodyYOffset = s.value("bodyYOffset", 0.0f) * worldLen;
         if (rule.missingAll.empty() && rule.missingAnyOf.empty() &&
             rule.minChainsLost <= 0)
           log += jp + ": state \"" + rule.name +
@@ -775,9 +942,19 @@ bool LoadMobDefs(const std::string& dir, const std::vector<MaterialDef>& mats,
               key.hasRot = true;
               if (k.contains("ease")) key.ease = ParseEase(k["ease"].get<std::string>());
             }
+            // NOT art units, and so NOT subject to the art upsample: a clip's
+            // position track is a DELTA added straight onto `rest.pos`
+            // (anim.cpp:385), which is world voxels. Multiplying these by
+            // artUpsample the way the anchors are would displace every keyed
+            // translation of an upsampled rig.
+            //
+            // They are world voxels rather than metres, though, which makes
+            // them a voxel-size dependency of their own — scaled below with the
+            // rest of the sidecar's world-space lengths.
             for (const auto& k : t.value().value("pos", json::array())) {
               AnimKey& key = upsert(k.value("t", 0));
-              key.pos = JsonVec3(k.contains("v") ? k["v"] : json(), {});
+              key.pos = JsonVec3(k.contains("v") ? k["v"] : json(), {}) *
+                        worldLen;
               key.hasPos = true;
               if (k.contains("ease")) key.ease = ParseEase(k["ease"].get<std::string>());
             }
@@ -1408,7 +1585,11 @@ bool Mob::GroundHeightAt(World& world, int wx, int wz, int yFrom,
                          int& outY, uint32_t* outMat) const {
   // scan down through the chunk cache; request fetches for missing chunks
   // (bounded: one column per creature per tick)
-  for (int y = yFrom; y > yFrom - 24; y--) {
+  // 2.4 m of downward scan. Authored in metres: a fixed 24 cells is 2.4 m at
+  // 10 cm and 1.2 m at 5 cm, which silently shortens how far a mob can find
+  // the ground below it and turns walkable terrain into an invisible drop.
+  const int kScanDepth = MetresToCellsI(2.4f);
+  for (int y = yFrom; y > yFrom - kScanDepth; y--) {
     IVec3 cell{wx, y, wz};
     if (!world.CellInWindow(cell)) return false;
     IVec3 wc{wx >> 4, y >> 4, wz >> 4};
@@ -1465,7 +1646,7 @@ MobSystem::GroundSense MobSystem::SenseGround(const Mob& mob, const MobDef& def,
   GroundSense s;
   const float cx = mob.origin_.x + def.worldSize.x * 0.5f;
   const float cz = mob.origin_.z + def.worldSize.z * 0.5f;
-  const int yFrom = ifloor(mob.origin_.y) + 3;
+  const int yFrom = ifloor(mob.origin_.y) + kMobProbeLiftCells;
   s.haveGround = mob.GroundHeightAt(world, ifloor(cx), ifloor(cz), yFrom, s.groundY);
 
   // Probe at the mob's own footprint plus a margin, so a wide creature notices
@@ -1473,8 +1654,11 @@ MobSystem::GroundSense MobSystem::SenseGround(const Mob& mob, const MobDef& def,
   // PER AXIS (an ellipse, not a circle) to match the footprint of a non-square
   // mob — an isotropic max() makes a long creature probe well past where it
   // can actually walk, and it stops short of gaps it would fit through.
-  const float reachX = def.worldSize.x * 0.5f + 2.0f;
-  const float reachZ = def.worldSize.z * 0.5f + 2.0f;
+  // 20 cm of margin beyond the body box, in metres so the fan reaches the
+  // same real distance past the mob at any voxel size.
+  const float senseMargin = MetresToCells(0.2f);
+  const float reachX = def.worldSize.x * 0.5f + senseMargin;
+  const float reachZ = def.worldSize.z * 0.5f + senseMargin;
   for (int i = 0; i < GroundSense::kProbeCount; i++) {
     const float yaw =
         mob.heading_ + (6.2831853f * (float)i) / (float)GroundSense::kProbeCount;
@@ -1498,10 +1682,15 @@ MobSystem::GroundSense MobSystem::SenseGround(const Mob& mob, const MobDef& def,
     }
     const int rise = s.haveGround ? py - s.groundY : 0;
     s.stepUp[i] = rise;
-    // > 2 voxels of rise is beyond step-up reach; a big DROP is survivable but
+    // Beyond 20 cm of rise is past step-up reach; a big DROP is survivable but
     // not desirable, so it is walkable and the intent layer merely prefers
     // flatter ground.
-    s.clear[i] = rise <= 2;
+    //
+    // METRES, like the player's own kMaxStepUpVoxels (player.h:190) which has
+    // derived its budget from kStepUpM since v0.2. This one was a bare 2, so a
+    // mob's step-up silently halved in real terms at 5 cm while the player's
+    // held: the same kerb the player walks over becomes a wall to a mob.
+    s.clear[i] = rise <= kMobStepUpCells;
   }
   return s;
 }
@@ -1645,7 +1834,10 @@ void MobSystem::DriveLocomotion(Mob& mob, const MobDef& def,
   if (!sense.haveGround) return;  // walk only when footing is known
 
   // settle feet onto the ground
-  mob.origin_.y += std::clamp((float)sense.groundY - mob.origin_.y, -0.3f, 0.3f);
+  // 3 cm per tick of ground snap. A rate in cells would double in real terms
+  // every time the voxel halved, turning a smooth settle into a pop.
+  const float snap = MetresToCells(0.03f);
+  mob.origin_.y += std::clamp((float)sense.groundY - mob.origin_.y, -snap, snap);
 
   // A maimed mob keeps moving, just slower: the active dismemberment state
   // scales the drive speed (a crawl covers ground at a fraction of a walk; a
@@ -1739,7 +1931,7 @@ void MobSystem::UpdateGait(Mob& mob, const MobDef& def, World& world, float dt) 
                  mob.anim_.velocity * g.leadTime;
     int groundY = 0;
     if (mob.GroundHeightAt(world, ifloor(ideal.x), ifloor(ideal.z),
-                       ifloor(mob.origin_.y) + 3, groundY))
+                       ifloor(mob.origin_.y) + kMobProbeLiftCells, groundY))
       ideal.y = (float)groundY;
     else
       ideal.y = mob.origin_.y;
@@ -2601,8 +2793,11 @@ constexpr int kBurnFaceSamplesMax = 8;
 //
 // They are deliberately SHORT. A long ray would start finding the far side of
 // the coat from inside it, which would make a limb protect itself.
-constexpr float kWornSeedReach = 1.25f;   // sample point -> the hot cell
-constexpr float kWornNbrReach = 1.0f;     // surface voxel -> its world cell
+// Authored in METRES: these reach from a sample point to a neighbouring cell,
+// so as bare cell counts they would have halved in real terms at 5 cm and
+// stopped finding the very cells they exist to find.
+const float kWornSeedReach = MetresToCells(0.125f);  // sample point -> hot cell
+const float kWornNbrReach = MetresToCells(0.10f);    // surface voxel -> its cell
 // Hard cap on lattice steps, whatever the reach asks for. Every loop in this
 // system is bounded; this one is a cost that scales with skinScale.
 constexpr int kWornMarchMax = 12;

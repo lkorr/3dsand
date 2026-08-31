@@ -49,11 +49,35 @@ LEATHER = 53    # leather      — jerkin, bracers, boots, belt
 ART_SCALE = 4
 SKIN_UPSCALE = 2
 SCALE = ART_SCALE * SKIN_UPSCALE  # 8
-WORLD_H = 17
-MICRO_H = WORLD_H * SCALE  # 136
+# ---- THE SIZE CONTRACT IS METRES (DESIGN.md 3b) -----------------------------
+# HEIGHT_M is the physical fact; the lattice figures below are DERIVED from it
+# and from the art's own resolution. WORLD_H used to be a literal 17 "world
+# voxels head to toe", which fixed a real height only while kVoxelMeters was
+# 0.10 -- so when the engine moved to 0.05 the figure stayed 17 cells and
+# became 0.85 m: half the collision capsule it drives, with the art file
+# perfectly correct and nothing able to notice.
+#
+# ART_VOXELS_PER_METRE is what the sidecar declares and is now the ONLY scale
+# this generator needs. kVoxelMeters does not appear in the contract at all:
+# tuning.json's player.halfHeight is already metres, so the cross-check below
+# is metres against metres and this file no longer has to be regenerated when
+# the engine's voxel size changes.
+HEIGHT_M = 1.70                      # head to toe
+EYE_M = 1.50                         # first-person camera row
+ART_VOXELS_PER_METRE = 80            # shipped art resolution (the sidecar value)
+AUTHORED_VOXELS_PER_METRE = ART_VOXELS_PER_METRE // SKIN_UPSCALE   # 40
+# The scale the sidecar's WORLD-space rows (speed, severImpactSpeed, rideHeight,
+# bodyYOffset, clip pos) are written at. The loader rescales them from here to
+# the live kVoxelsPerMetre -- see mob.cpp's `sidecarVoxelsPerMetre`.
+SIDECAR_VOXELS_PER_METRE = 10
+WORLD_H = round(HEIGHT_M * AUTHORED_VOXELS_PER_METRE / ART_SCALE)
+MICRO_H = round(HEIGHT_M * ART_VOXELS_PER_METRE)
 
 SPRINT_SPEED_MPS = 6.0
-VOXEL_METERS = 0.10
+# VOXEL_METERS is GONE on purpose. Every number this file emits is now
+# either metres or a lattice figure derived from a declared
+# voxels-per-metre, so there is nothing left for the engine's voxel
+# size to change. Reintroducing it would reintroduce the coupling.
 
 
 # ---- .vox writing ----------------------------------------------------------
@@ -408,12 +432,9 @@ def main():
     # generator stays runnable after the tuner changes the sprint speed.
     with open(os.path.join(root, "assets", "materials", "tuning.json")) as tf:
         sprint = json.load(tf)["player"]["sprintSpeed"]
-    with open(os.path.join(root, "src", "sim", "world.h")) as wf:
-        m = re.search(r"kVoxelMeters\s*=\s*([0-9.]+)f", wf.read())
-    assert m, "could not find kVoxelMeters in src/sim/world.h"
-    assert abs(float(m.group(1)) - VOXEL_METERS) < 1e-9, (
-        f"world.h kVoxelMeters is {m.group(1)}, this file assumes "
-        f"{VOXEL_METERS} — update VOXEL_METERS and regenerate")
+    # No kVoxelMeters check: the contract below is metres against
+    # metres, so this generator is voxel-size independent by
+    # construction rather than by assertion.
 
     body = b""
     graph = b""
@@ -919,7 +940,7 @@ def main():
         "root": "hips",
         "skinScale": SCALE,
         "bleed": {"material": "blood", "perDamage": 2.5},
-        "speed": sprint / VOXEL_METERS,
+        "speed": sprint * SIDECAR_VOXELS_PER_METRE,
         "gait": {
             "groups": [["legU.L"], ["legU.R"]],
             "cadence": 8.0, "strideBias": 0.42, "leadTime": 0.10,

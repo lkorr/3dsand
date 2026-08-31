@@ -99,6 +99,23 @@ enum : int {
 // The .svtree file's own header, for the reader below.
 inline constexpr uint32_t kFileMagic = 0x52545653u;   // 'SVTR'
 inline constexpr int kFileHeaderWords = 32;
+// v2 spends header word 29 on the BAKE SCALE in voxels/metre. Species files are
+// authored in METRES; the atlas is voxels; this word is the only record of
+// which conversion produced it, and ParseFile refuses a file whose scale is not
+// the engine's kVoxelsPerMetre. v1 had no such word and was implicitly 10.
+inline constexpr uint32_t kFileVersion = 2;
+inline constexpr int kFileWordBakeVpm = 29;
+
+// Run word layout, mirrored in assets/editor/treegen.js (packRun) and
+// assets/shaders/worldgen.wgsl (treeCellFrom). Three places, one layout —
+// scripts/check_invariants.py asserts they agree.
+//
+// Y0 was 9 bits, which capped a variant at 512 voxels: fine at 10 cm, but a
+// 22 m redwood needs ~520 at 5 cm and clipped. Two bits moved from LEN to Y0.
+inline constexpr int kRunY0Bits = 11;
+inline constexpr int kRunLenBits = 5;
+inline constexpr uint32_t kRunMaxY0 = (1u << kRunY0Bits) - 1u;    // 2047
+inline constexpr uint32_t kRunMaxLen = (1u << kRunLenBits) - 1u;  // 31
 
 }  // namespace treeatlas
 

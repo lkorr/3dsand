@@ -46,9 +46,13 @@
  * gives those lobes readable form with zero engine cost, because it resolves
  * to a MATERIAL choice out of a 3-step shade ramp.
  *
- * COORDINATES are the engine's: Y up, X/Z horizontal, one cell = one voxel =
- * `kVoxelMeters` (0.10 m at time of writing), so every length parameter below
- * is authored in METRES and reads true next to a 1.7 m player.
+ * COORDINATES are the engine's: Y up, X/Z horizontal, one cell = one voxel.
+ * Every length parameter below is authored in METRES and reads true next to a
+ * 1.7 m player at ANY voxel size — the bake scale is a parameter (`opts.vpm`,
+ * defaulting to DEFAULT_VOX_PER_M) and is recorded in the .svtree header, so
+ * changing the engine's `kVoxelMeters` means re-baking rather than re-authoring.
+ * Do not restate what kVoxelMeters currently is here; that comment has been
+ * wrong once already.
  */
 
 'use strict';
@@ -57,20 +61,41 @@
 // constants
 // =============================================================================
 
-/** Voxels per metre the params are authored at. Mirrors world.h
- *  kVoxelsPerMetre / worldgen.refVoxelsPerMetre. Changing the engine's voxel
- *  size means re-baking, not re-authoring — which is the right direction. */
-export const VOX_PER_M = 10;
+/** DEFAULT voxels per metre to bake at — the AUTHORING BASELINE, not a mirror
+ *  of anything. Every length in a species file is metres; this is the scale the
+ *  tuner previews at and the scale `bake_trees.mjs` falls back to.
+ *
+ *  It used to claim it "mirrors world.h kVoxelsPerMetre", by hand-copied
+ *  literal, and that claim was the whole bug: when world.h moved to 5 cm this
+ *  stayed at 10 and every tree in the world baked at half its authored height,
+ *  with nothing anywhere able to notice. The scale is now a PARAMETER
+ *  (`opts.vpm` on generateTree/bakeAtlas) and the value used is written into
+ *  the .svtree header, where the C++ loader checks it against the real
+ *  kVoxelsPerMetre and refuses a mismatch by name. */
+export const DEFAULT_VOX_PER_M = 10;
 
-/** Hard ceiling on a baked variant, per axis. The .svtree run encoding spends
- *  9 bits on the start Y (0..511) so this must stay under 512; 384 voxels is
- *  38 m, taller than any real sequoia, and keeps a single variant's column
- *  table inside a megabyte. */
-export const MAX_DIM = 384;
+/** Hard ceiling on a baked variant, per axis, in VOXELS at the bake scale.
+ *  38 m is taller than any real sequoia; expressing it in metres is the point,
+ *  since a fixed voxel count would silently become 19 m at 5 cm voxels and clip
+ *  the redwood. Must stay inside the run encoding's Y0_BITS (see packRun). */
+export const MAX_DIM_METRES = 38;
+export function maxDim(vpm) { return Math.ceil(MAX_DIM_METRES * vpm); }
 
-/** Longest run a single .svtree word can express (7-bit length field). Longer
- *  runs are split; a 200-voxel trunk column costs two words. */
-export const MAX_RUN = 127;
+/** Run encoding field widths. The word is FULL — 16 bits of material+state,
+ *  then Y0 and LEN share what is left — so these two trade against each other
+ *  and nothing else.
+ *
+ *  Y0 was 9 bits (0..511) and LEN 7 (1..127), which caps a variant at 512
+ *  voxels: fine at 10 cm, but a 22 m redwood needs ~520 at 5 cm and ~1040 at
+ *  2.5 cm, so it clipped. Moving two bits from LEN to Y0 buys 2047 voxels of
+ *  height — 102 m at 5 cm, 51 m at 2.5 cm — at the cost of splitting long runs
+ *  more often. That trade is right for this data: tree columns are mostly short
+ *  leaf runs, and only a solid trunk pays, at 4 words per 127 voxels instead of
+ *  1. */
+export const Y0_BITS = 11;
+export const LEN_BITS = 5;
+export const MAX_Y0 = (1 << Y0_BITS) - 1;      // 2047
+export const MAX_RUN = (1 << LEN_BITS) - 1;    // 31
 
 /** The bake's fixed key light. NOT the game's sun — the game's sun moves, and
  *  a tree whose leaves are baked to one sun angle would be wrong twice a day.
@@ -239,7 +264,7 @@ export function defaultParams() {
     lobeDepth: 0.10,
     /** Bark relief: SDF minus value noise, in voxels. Under ~0.4 it does
      *  nothing; over ~1.5 the trunk starts shedding disconnected chips. */
-    barkNoise: 0.7,
+    barkNoise: 0.07,
 
     levelsData: [defaultLevel(0), defaultLevel(1), defaultLevel(2),
                  defaultLevel(3)],
@@ -298,11 +323,11 @@ export function defaultParams() {
        *  scale 1) is what made the previous generation's crowns read as green
        *  dust at any distance, and it also multiplies the baked run count by
        *  ~8x. Erode in blobs. */
-      noiseScale: 2.6,
+      noiseScale: 0.26,
       /** Smooth-min weld radius between neighbouring clumps, in voxels. 0
        *  leaves them as separate beads; too high melts the lobes back into
        *  the ball this whole design exists to avoid. */
-      sminK: 2.5,
+      sminK: 0.25,
       /** 0 = shade purely by the clump's own sphere normal (every lobe reads
        *  as its own ball); 1 = shade by the whole canopy (the lobes vanish
        *  into one mass). The interesting range is 0.35..0.7. */
@@ -360,10 +385,18 @@ export function defaultParams() {
 /** Deep-merge an authored (possibly partial) params object onto the defaults,
  *  so a species file only has to state what it changes and old files keep
  *  loading when a knob is added. */
-export function normalizeParams(src) {
+// `vpm` is the BAKE SCALE, not a species parameter: it is carried on the
+// normalized object so every downstream function that already receives `P` can
+// convert metres without a new argument, and it survives re-normalization
+// (bakeAtlas normalizes, then generateTree normalizes the result again) because
+// an already-normalized P supplies it through `src`.
+export function normalizeParams(src, vpm) {
   const p = defaultParams();
+  p.vpm = (vpm | 0) > 0 ? (vpm | 0)
+        : (src && (src.vpm | 0) > 0 ? (src.vpm | 0) : DEFAULT_VOX_PER_M);
   if (!src) return p;
   for (const k of Object.keys(p)) {
+    if (k === 'vpm') continue;   // set above; never authored in a species file
     if (!(k in src)) continue;
     const a = p[k], b = src[k];
     if (k === 'levelsData') {
@@ -423,7 +456,7 @@ const MAX_CLUMPS = 4000;
 
 function buildSkeleton(P, seed) {
   const S = { stems: [], clumps: [], truncated: false };
-  const vpm = VOX_PER_M;
+  const vpm = P.vpm;
   const rootHash = hashN(seed, 0x7A11, P.levels | 0);
 
   // Trunk length, jittered per seed. `scaleV` is why two oaks in a stand are
@@ -659,7 +692,7 @@ function growStem(S, P, spec) {
                       ((i + 0.5) / n + 0.14 * frandS(ph, 0x31, i)), 0, 1);
       const at = pointAlong(pts, rads, t);
       const rad = Math.max(1.2,
-          (F.radius + F.radiusV * frandS(ph, 0x32, i)) * VOX_PER_M);
+          (F.radius + F.radiusV * frandS(ph, 0x32, i)) * P.vpm);
       // Clumps sit slightly OFF the stem, in a hashed direction, so a branch
       // carries a row of lobes rather than a sausage centred on itself.
       const off = normalize([frandS(ph, 0x33, i), frandS(ph, 0x34, i) * 0.5,
@@ -781,9 +814,16 @@ function vnoise(x, y, z, s, salt) {
  *            names:string[], skeleton:object}}
  */
 export function generateTree(params, seed, opts) {
-  const P = normalizeParams(params);
+  const P = normalizeParams(params, opts && opts.vpm);
   const t0 = (typeof performance !== 'undefined') ? performance.now() : 0;
   const S = buildSkeleton(P, seed | 0);
+
+  // Metre-authored bark relief, resolved to bake-scale voxels. It is a SHAPE
+  // parameter, not a texture one — it is what a trunk's silhouette is roughened
+  // by — so leaving it in voxels would have quietly halved the relief on the
+  // same tree at 5 cm. (`foliage.noiseScale` and `foliage.sminK` get the same
+  // treatment where they are unpacked, below.)
+  const barkNoiseVox = P.barkNoise * P.vpm;
 
   // ---- local palette -------------------------------------------------------
   // Index 0 is always air. Everything else is assigned in first-use order and
@@ -808,7 +848,7 @@ export function generateTree(params, seed, opts) {
   };
   for (const st of S.stems) {
     for (let i = 0; i < st.pts.length; i++) {
-      grow(st.pts[i], st.rads[i] + P.barkNoise + 1);
+      grow(st.pts[i], st.rads[i] + barkNoiseVox + 1);
     }
   }
   // The isotropic half-extent a clump can reach, for the grid bound.
@@ -846,10 +886,15 @@ export function generateTree(params, seed, opts) {
   let nx = Math.ceil(hi[0]) - ox + 2;
   let ny = Math.ceil(Math.max(hi[1], 1)) + 2;
   let nz = Math.ceil(hi[2]) - oz + 2;
-  const clipped = (nx > MAX_DIM || ny > MAX_DIM || nz > MAX_DIM);
-  nx = Math.max(1, Math.min(MAX_DIM, nx));
-  ny = Math.max(1, Math.min(MAX_DIM, ny));
-  nz = Math.max(1, Math.min(MAX_DIM, nz));
+  // The ceiling is metres, resolved at the bake scale — see MAX_DIM_METRES.
+  // Also hard-capped by the run encoding's Y0 field, which is the format limit
+  // rather than a design one: a variant taller than MAX_Y0 could not address
+  // its own top voxel.
+  const dimCap = Math.min(maxDim(P.vpm), MAX_Y0);
+  const clipped = (nx > dimCap || ny > dimCap || nz > dimCap);
+  nx = Math.max(1, Math.min(dimCap, nx));
+  ny = Math.max(1, Math.min(dimCap, ny));
+  nz = Math.max(1, Math.min(dimCap, nz));
 
   const cells = new Uint16Array(nx * ny * nz);
   const at = (x, y, z) => (z * ny + y) * nx + x;
@@ -885,7 +930,7 @@ export function generateTree(params, seed, opts) {
   stampStems(thin);
 
   function stampSegment(a, b, r1, r2) {
-    const pad = Math.max(r1, r2) + P.barkNoise + 1.5;
+    const pad = Math.max(r1, r2) + barkNoiseVox + 1.5;
     const x0 = Math.max(0, Math.floor(Math.min(a[0], b[0]) - pad) + gx);
     const x1 = Math.min(nx - 1, Math.ceil(Math.max(a[0], b[0]) + pad) + gx);
     const y0 = Math.max(0, Math.floor(Math.min(a[1], b[1]) - pad) + gy);
@@ -896,12 +941,12 @@ export function generateTree(params, seed, opts) {
     const axis = normalize(sub(b, a));
     // Bark relief is a FRACTION of the stem's own radius, not an absolute
     // number of voxels. Authored absolutely (the obvious reading of a
-    // "barkNoise: 0.85" slider) it eats a 0.8-voxel twig alive: the amplitude
+    // "barkNoise: 0.085" slider) it eats a 0.8-voxel twig alive: the amplitude
     // exceeds the radius, half the branch falls below the surface, and an oak
     // came out with 1,724 wood voxels — a bare trunk under a floating crown,
     // which is the exact failure this whole rewrite exists to kill. Trunks keep
     // the full authored relief; twigs get what fits.
-    const relief = Math.min(P.barkNoise, Math.max(r1, r2) * 0.45);
+    const relief = Math.min(barkNoiseVox, Math.max(r1, r2) * 0.45);
     for (let z = z0; z <= z1; z++) {
       const wz = z - gz + 0.5;
       for (let y = y0; y <= y1; y++) {
@@ -959,8 +1004,12 @@ export function generateTree(params, seed, opts) {
   const depthShade = clamp(F.depthShade, 0, 1);
   const shadeMix = clamp(F.canopyShadeMix, 0, 1);
   const density = clamp(F.density, 0.05, 1);
-  const nscale = Math.max(0.6, F.noiseScale);
-  const sminK = Math.max(0, F.sminK);
+  // Both authored in METRES, resolved here to bake-scale voxels. The floors
+  // stay in voxels on purpose: an erosion cell finer than ~0.6 voxels has
+  // nothing left to erode, which is a property of the lattice and not of the
+  // species.
+  const nscale = Math.max(0.6, F.noiseScale * P.vpm);
+  const sminK = Math.max(0, F.sminK * P.vpm);
   const shape = Math.max(0, Math.min(3, F.clumpShape | 0));
   const axisAmt = clamp(F.clumpAxis, 0, 1);
   const hollow = clamp(F.hollow, 0, 1);
@@ -1312,7 +1361,12 @@ export function generateTree(params, seed, opts) {
 // two can disagree. The C++ loader lifts it straight into the atlas directory.
 
 export const SVTREE_MAGIC = 0x52545653;   // 'SVTR' little-endian
-export const SVTREE_VERSION = 1;
+// v2 spends one of the three reserved header words on the BAKE SCALE
+// (voxels/metre). Bumped rather than sneaked into a spare word silently,
+// because the point of recording it is that the loader can REFUSE a mismatch —
+// and a v1 file has no honest answer to "what scale is this", only the
+// historical assumption that it is DEFAULT_VOX_PER_M.
+export const SVTREE_VERSION = 2;
 const HEADER_WORDS = 32;
 const VARIANT_WORDS = 12;
 /** Biome order, and it is the ENGINE's: worldgen.wgsl B_FOREST=0, B_MEADOW=1,
@@ -1320,11 +1374,17 @@ const VARIANT_WORDS = 12;
  *  table by the biome id with no lookup. */
 export const BIOME_ORDER = ['forest', 'meadow', 'pine', 'desert'];
 
+// material(12) | state(4) | y0(Y0_BITS) | len(LEN_BITS). Mirrored in
+// worldgen.wgsl's treeCellFrom and asserted by scripts/check_invariants.py —
+// three places, one layout, so the widths live in the constants above rather
+// than as literals here.
 function packRun(word16, y0, runLen) {
-  return ((word16 & 0xFFFF) | ((y0 & 0x1FF) << 16) | ((runLen & 0x7F) << 25)) >>> 0;
+  return ((word16 & 0xFFFF) | ((y0 & MAX_Y0) << 16) |
+          ((runLen & MAX_RUN) << (16 + Y0_BITS))) >>> 0;
 }
 export function unpackRun(w) {
-  return { word: w & 0xFFFF, y0: (w >>> 16) & 0x1FF, len: (w >>> 25) & 0x7F };
+  return { word: w & 0xFFFF, y0: (w >>> 16) & MAX_Y0,
+           len: (w >>> (16 + Y0_BITS)) & MAX_RUN };
 }
 
 /**
@@ -1334,11 +1394,14 @@ export function unpackRun(w) {
  * @param {number[]} seeds explicit seed list (defaults to 0..variants-1)
  * @returns {{buf:ArrayBuffer, meta:object}}
  */
-export function bakeAtlas(params, seeds) {
-  const P = normalizeParams(params);
+export function bakeAtlas(params, seeds, opts) {
+  const P = normalizeParams(params, opts && opts.vpm);
   const list = seeds && seeds.length ? seeds
       : Array.from({ length: Math.max(1, P.variants | 0) }, (_, i) => i);
 
+  // P already carries the bake scale, and normalizeParams preserves it through
+  // the re-normalize inside generateTree — so the variants cannot be baked at a
+  // different scale than the header this function goes on to write.
   const trees = list.map(s => generateTree(P, s));
 
   // One name table across all variants — they share a params object so they
@@ -1458,11 +1521,23 @@ export function bakeAtlas(params, seeds) {
     out[23 + i] = nameIdx.get(P.leaf[i]) || 0;
     out[26 + i] = turns ? (nameIdx.get(P.autumnLeaf[i]) || 0) : 0;
   }
-  out[29] = 0; out[30] = 0; out[31] = 0;
+  // v2, word 29: the scale this file was baked at. The C++ loader compares it
+  // against kVoxelsPerMetre and refuses the atlas by name on a mismatch, so a
+  // stale bake is a loud failure instead of a forest at the wrong size.
+  out[29] = P.vpm >>> 0; out[30] = 0; out[31] = 0;
   // Signed values go through the u32 array as two's complement; the C++ and
   // WGSL sides both read them back as i32.
-  out[16] = (PL.minY | 0) >>> 0;
-  out[17] = (PL.maxY | 0) >>> 0;
+  //
+  // minY/maxY are authored in METRES and resolved to absolute world voxels
+  // here, at the bake scale — they are compared against terrain height, which
+  // IS scaled (worldgen.treeline goes through ReadWgLen). Leaving them as raw
+  // voxels made every species' ceiling stay put while the ground doubled, which
+  // silently stopped nine of ten species from spawning at 5 cm. Negative is the
+  // "unbounded" sentinel (worldgen.wgsl checks `>= 0`) and must survive the
+  // conversion, so it is passed through rather than scaled.
+  const plY = (m) => (m < 0 ? -1 : Math.round(m * P.vpm));
+  out[16] = plY(+PL.minY) >>> 0;
+  out[17] = plY(+PL.maxY) >>> 0;
   out[18] = Math.max(0, PL.maxSlope | 0);
   out[19] = Math.max(1, PL.sparsity | 0);
 
@@ -1534,6 +1609,11 @@ export function readAtlas(buf) {
   BIOME_ORDER.forEach((b, i) => { biomes[b] = w[12 + i]; });
   return {
     words: w, names: names, variants: variants,
+    // The bake scale (v2, word 29). Every voxel figure below — reach, above,
+    // crownY/R, the variant dims, minY/maxY — is in THIS scale's cells, not the
+    // engine's, and the two are only interchangeable because the loader refuses
+    // a file whose vpm does not match kVoxelsPerMetre.
+    vpm: w[29],
     reachXZ: w[8], above: w[9], crownY: w[10], crownR: w[11],
     placement: { biomes: biomes, minY: w[16] | 0, maxY: w[17] | 0,
                  maxSlope: w[18], sparsity: w[19], shade: w[21] },
@@ -1598,7 +1678,7 @@ export const PRESETS = {
     name: 'oak', autumnChance: 5, displayName: 'Oak', variants: 3,
     shape: 2, baseSize: 0.30, scale: 7.5, scaleV: 1.4, levels: 3,
     ratio: 0.042, ratioPower: 0.95, flare: 1.0, attractionUp: 0.42,
-    lobes: 5, lobeDepth: 0.09, barkNoise: 0.85,
+    lobes: 5, lobeDepth: 0.09, barkNoise: 0.085,
     levelsData: [
       { length: 1.0, taper: 0.5, curveRes: 7, curve: 8, curveV: 45,
         segSplits: 0.25, splitAngle: 24, splitAngleV: 10 },
@@ -1612,11 +1692,11 @@ export const PRESETS = {
     ],
     foliage: { startLevel: 2, clumpsPerStem: 1.0, tipBias: 0.5, radius: 0.62,
                radiusV: 0.2, elongation: 0.72, droop: 0.18, density: 0.8,
-               noiseScale: 2.8, sminK: 2.2, canopyShadeMix: 0.5, depthShade: 0.8 },
+               noiseScale: 0.28, sminK: 0.22, canopyShadeMix: 0.5, depthShade: 0.8 },
     bark: ['bark_dark', 'wood', 'bark_light'],
     leaf: ['leaves_dark', 'leaves', 'leaves_lit'],
     placement: { biomes: { forest: 42, meadow: 16, pine: 4, desert: 0 },
-                 maxY: 214, maxSlope: 420, sparsity: 1, shade: 210 }
+                 maxY: 21.4, maxSlope: 420, sparsity: 1, shade: 210 }
   }),
 
   // The ancient one. Same species, twice the mass: a thicker bole, a deeper
@@ -1627,7 +1707,7 @@ export const PRESETS = {
     name: 'great_oak', autumnChance: 6, displayName: 'Great oak', variants: 3,
     shape: 2, baseSize: 0.26, scale: 11.0, scaleV: 1.6, levels: 4,
     ratio: 0.052, ratioPower: 0.9, flare: 1.6, attractionUp: 0.34,
-    lobes: 6, lobeDepth: 0.13, barkNoise: 1.0,
+    lobes: 6, lobeDepth: 0.13, barkNoise: 0.1,
     levelsData: [
       { length: 1.0, taper: 0.45, curveRes: 8, curve: 10, curveV: 55,
         segSplits: 0.3, splitAngle: 28, splitAngleV: 12 },
@@ -1641,9 +1721,9 @@ export const PRESETS = {
     ],
     foliage: { startLevel: 3, clumpsPerStem: 1.0, tipBias: 0.45, radius: 0.72,
                radiusV: 0.24, elongation: 0.70, droop: 0.22, density: 0.82,
-               noiseScale: 3.0, sminK: 2.6, canopyShadeMix: 0.45, depthShade: 0.85 },
+               noiseScale: 0.3, sminK: 0.26, canopyShadeMix: 0.45, depthShade: 0.85 },
     placement: { biomes: { forest: 12, meadow: 5, pine: 0, desert: 0 },
-                 maxY: 206, maxSlope: 340, sparsity: 1, shade: 255 }
+                 maxY: 20.6, maxSlope: 340, sparsity: 1, shade: 255 }
   }),
 
   // Pine: a bare lower bole, WHORLED branches (the parameter vanilla
@@ -1654,7 +1734,7 @@ export const PRESETS = {
     name: 'pine', displayName: 'Pine', variants: 3,
     shape: 0, baseSize: 0.42, scale: 12.0, scaleV: 2.4, levels: 3,
     ratio: 0.022, ratioPower: 1.5, flare: 0.5, attractionUp: 0.5,
-    whorlCount: 5, lobes: 0, barkNoise: 0.9,
+    whorlCount: 5, lobes: 0, barkNoise: 0.09,
     levelsData: [
       { length: 1.0, taper: 0.92, curveRes: 12, curve: 0, curveV: 18, segSplits: 0 },
       { length: 0.34, lengthV: 0.14, branches: 24, downAngle: 78, downAngleV: -36,
@@ -1665,11 +1745,11 @@ export const PRESETS = {
     ],
     foliage: { startLevel: 2, clumpsPerStem: 1.6, tipBias: 0.16, radius: 0.44,
                radiusV: 0.12, elongation: 1.9, droop: 0.05, density: 0.78,
-               noiseScale: 2.2, sminK: 2.0, canopyShadeMix: 0.55, depthShade: 0.7 },
+               noiseScale: 0.22, sminK: 0.2, canopyShadeMix: 0.55, depthShade: 0.7 },
     bark: ['bark_dark', 'wood', 'bark_light'],
     leaf: ['pine_dark', 'pine_needles', 'pine_lit'],
     placement: { biomes: { forest: 14, meadow: 2, pine: 60, desert: 0 },
-                 maxY: 226, maxSlope: 560, sparsity: 1, shade: 230 }
+                 maxY: 22.6, maxSlope: 560, sparsity: 1, shade: 230 }
   }),
 
   // Spruce: the pine's colder sibling. Narrower envelope, shorter branches,
@@ -1679,7 +1759,7 @@ export const PRESETS = {
     name: 'spruce', displayName: 'Spruce', variants: 3,
     shape: 0, baseSize: 0.14, scale: 13.5, scaleV: 2.8, levels: 3,
     ratio: 0.019, ratioPower: 1.6, flare: 0.35, attractionUp: 0.25,
-    whorlCount: 6, barkNoise: 0.7,
+    whorlCount: 6, barkNoise: 0.07,
     levelsData: [
       { length: 1.0, taper: 0.96, curveRes: 14, curve: 0, curveV: 10 },
       { length: 0.28, lengthV: 0.1, branches: 34, downAngle: 92, downAngleV: -30,
@@ -1690,11 +1770,11 @@ export const PRESETS = {
     ],
     foliage: { startLevel: 2, clumpsPerStem: 1.5, tipBias: 0.10, radius: 0.40,
                radiusV: 0.1, elongation: 2.3, droop: 0.02, density: 0.84,
-               noiseScale: 2.0, sminK: 1.8, canopyShadeMix: 0.6, depthShade: 0.72 },
+               noiseScale: 0.2, sminK: 0.18, canopyShadeMix: 0.6, depthShade: 0.72 },
     bark: ['bark_dark', 'wood', 'bark_light'],
     leaf: ['pine_dark', 'pine_needles', 'pine_lit'],
     placement: { biomes: { forest: 4, meadow: 0, pine: 34, desert: 0 },
-                 minY: 190, maxY: 236, maxSlope: 640, sparsity: 1, shade: 240 }
+                 minY: 19, maxY: 23.6, maxSlope: 640, sparsity: 1, shade: 240 }
   }),
 
   // Birch: slender, flame-shaped, with drooping twig ends (the NEGATIVE
@@ -1705,7 +1785,7 @@ export const PRESETS = {
     name: 'birch', autumnChance: 4, displayName: 'Birch', variants: 3,
     shape: 5, baseSize: 0.34, scale: 9.0, scaleV: 1.6, levels: 3,
     ratio: 0.017, ratioPower: 1.35, flare: 0.4, attractionUp: -0.18,
-    barkNoise: 0.4,
+    barkNoise: 0.04,
     levelsData: [
       { length: 1.0, taper: 0.85, curveRes: 10, curve: 4, curveV: 40, segSplits: 0.15,
         splitAngle: 14 },
@@ -1717,11 +1797,11 @@ export const PRESETS = {
     ],
     foliage: { startLevel: 2, clumpsPerStem: 1.2, tipBias: 0.45, radius: 0.40,
                radiusV: 0.14, elongation: 0.85, droop: 0.35, density: 0.68,
-               noiseScale: 2.4, sminK: 1.6, canopyShadeMix: 0.4, depthShade: 0.7 },
+               noiseScale: 0.24, sminK: 0.16, canopyShadeMix: 0.4, depthShade: 0.7 },
     bark: ['wood', 'birch_wood', 'birch_wood'],
     leaf: ['leaves_dark', 'leaves', 'leaves_lit'],
     placement: { biomes: { forest: 18, meadow: 30, pine: 8, desert: 0 },
-                 maxY: 220, maxSlope: 460, sparsity: 1, shade: 95 }
+                 maxY: 22, maxSlope: 460, sparsity: 1, shade: 95 }
   }),
 
   // Redwood: a COLUMN, not a cone. `shape 4` (tapered cylindrical) plus very
@@ -1731,7 +1811,7 @@ export const PRESETS = {
     name: 'redwood', displayName: 'Redwood', variants: 2,
     shape: 4, baseSize: 0.55, scale: 22.0, scaleV: 4.0, levels: 3,
     ratio: 0.028, ratioPower: 1.7, flare: 2.2, attractionUp: 0.55,
-    whorlCount: 4, lobes: 7, lobeDepth: 0.10, barkNoise: 1.2,
+    whorlCount: 4, lobes: 7, lobeDepth: 0.10, barkNoise: 0.12,
     levelsData: [
       { length: 1.0, taper: 0.86, curveRes: 16, curve: 0, curveV: 12 },
       { length: 0.15, lengthV: 0.06, branches: 40, downAngle: 84, downAngleV: -28,
@@ -1742,11 +1822,11 @@ export const PRESETS = {
     ],
     foliage: { startLevel: 2, clumpsPerStem: 1.6, tipBias: 0.12, radius: 0.36,
                radiusV: 0.1, elongation: 1.35, droop: 0.1, density: 0.86,
-               noiseScale: 2.0, sminK: 1.6, canopyShadeMix: 0.6, depthShade: 0.75 },
+               noiseScale: 0.2, sminK: 0.16, canopyShadeMix: 0.6, depthShade: 0.75 },
     bark: ['bark_dark', 'wood', 'bark_light'],
     leaf: ['pine_dark', 'pine_needles', 'pine_lit'],
     placement: { biomes: { forest: 3, meadow: 0, pine: 10, desert: 0 },
-                 maxY: 218, maxSlope: 300, sparsity: 2, shade: 235 }
+                 maxY: 21.8, maxSlope: 300, sparsity: 2, shade: 235 }
   }),
 
   // Eucalypt: the GAPS are the identity. Sparse branches, foliage hanging
@@ -1756,7 +1836,7 @@ export const PRESETS = {
     name: 'eucalyptus', displayName: 'Eucalyptus', variants: 3,
     shape: 6, baseSize: 0.44, scale: 14.0, scaleV: 3.0, levels: 3,
     ratio: 0.021, ratioPower: 1.4, flare: 0.6, attractionUp: -0.1,
-    barkNoise: 0.3,
+    barkNoise: 0.03,
     levelsData: [
       { length: 1.0, taper: 0.8, curveRes: 10, curve: 14, curveV: 60, segSplits: 0.3,
         splitAngle: 18 },
@@ -1768,11 +1848,11 @@ export const PRESETS = {
     ],
     foliage: { startLevel: 2, clumpsPerStem: 1.2, tipBias: 0.55, radius: 0.5,
                radiusV: 0.2, elongation: 1.5, droop: 0.75, density: 0.52,
-               noiseScale: 2.8, sminK: 1.4, canopyShadeMix: 0.35, depthShade: 0.65 },
+               noiseScale: 0.28, sminK: 0.14, canopyShadeMix: 0.35, depthShade: 0.65 },
     bark: ['wood', 'birch_wood', 'birch_wood'],
     leaf: ['leaves_dark', 'leaves', 'leaves_lit'],
     placement: { biomes: { forest: 5, meadow: 12, pine: 0, desert: 8 },
-                 maxY: 212, maxSlope: 500, sparsity: 1, shade: 110 }
+                 maxY: 21.2, maxSlope: 500, sparsity: 1, shade: 110 }
   }),
 
   // Willow: negative attractionUp all the way down, an inverse-conical
@@ -1781,7 +1861,7 @@ export const PRESETS = {
     name: 'willow', displayName: 'Willow', variants: 2,
     shape: 6, baseSize: 0.2, scale: 8.0, scaleV: 1.4, levels: 3,
     ratio: 0.032, ratioPower: 1.25, flare: 1.1, attractionUp: -0.85,
-    lobes: 4, lobeDepth: 0.1, barkNoise: 0.9,
+    lobes: 4, lobeDepth: 0.1, barkNoise: 0.09,
     levelsData: [
       { length: 1.0, taper: 0.6, curveRes: 8, curve: 6, curveV: 60, segSplits: 0.4,
         splitAngle: 28 },
@@ -1793,10 +1873,10 @@ export const PRESETS = {
     ],
     foliage: { startLevel: 2, clumpsPerStem: 1.4, tipBias: 0.28, radius: 0.38,
                radiusV: 0.12, elongation: 1.6, droop: 0.6, density: 0.66,
-               noiseScale: 2.4, sminK: 1.5, canopyShadeMix: 0.4, depthShade: 0.7 },
+               noiseScale: 0.24, sminK: 0.15, canopyShadeMix: 0.4, depthShade: 0.7 },
     leaf: ['leaves_dark', 'leaves', 'leaves_lit'],
     placement: { biomes: { forest: 6, meadow: 14, pine: 0, desert: 0 },
-                 maxY: 204, maxSlope: 260, sparsity: 1, shade: 190 }
+                 maxY: 20.4, maxSlope: 260, sparsity: 1, shade: 190 }
   }),
 
   // Bush: one level, a stub of a stem, and clumps doing all the work. It is a
@@ -1805,7 +1885,7 @@ export const PRESETS = {
   bush: preset({
     name: 'bush', displayName: 'Bush', variants: 3,
     shape: 1, baseSize: 0.05, scale: 1.1, scaleV: 0.35, levels: 3,
-    ratio: 0.055, ratioPower: 1.0, flare: 0.3, attractionUp: 0.2, barkNoise: 0.25,
+    ratio: 0.055, ratioPower: 1.0, flare: 0.3, attractionUp: 0.2, barkNoise: 0.025,
     levelsData: [
       { length: 1.0, taper: 0.7, curveRes: 4, curveV: 60, segSplits: 0.8,
         splitAngle: 42, splitAngleV: 16 },
@@ -1821,10 +1901,10 @@ export const PRESETS = {
     // "hedge block".
     foliage: { startLevel: 2, clumpsPerStem: 1.4, tipBias: 0.25, radius: 0.22,
                radiusV: 0.08, elongation: 0.85, droop: 0.05, density: 0.7,
-               noiseScale: 1.8, sminK: 1.2, canopyShadeMix: 0.5, depthShade: 0.6 },
+               noiseScale: 0.18, sminK: 0.12, canopyShadeMix: 0.5, depthShade: 0.6 },
     leaf: ['leaves_dark', 'leaves', 'leaves_lit'],
     placement: { biomes: { forest: 16, meadow: 40, pine: 12, desert: 26 },
-                 maxY: 232, maxSlope: 700, sparsity: 1, shade: 0 }
+                 maxY: 23.2, maxSlope: 700, sparsity: 1, shade: 0 }
   }),
 
   // Dead tree: bare structure, no foliage at all. Cheap to place, and the one
@@ -1833,7 +1913,7 @@ export const PRESETS = {
     name: 'dead', displayName: 'Dead tree', variants: 2,
     shape: 2, baseSize: 0.3, scale: 6.5, scaleV: 1.6, levels: 3,
     ratio: 0.03, ratioPower: 1.3, flare: 0.9, attractionUp: 0.5,
-    lobes: 4, lobeDepth: 0.12, barkNoise: 1.1,
+    lobes: 4, lobeDepth: 0.12, barkNoise: 0.11,
     levelsData: [
       { length: 1.0, taper: 0.75, curveRes: 7, curve: 12, curveV: 90,
         segSplits: 0.4, splitAngle: 30 },

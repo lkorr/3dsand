@@ -443,3 +443,32 @@ bool LoadPrefabDir(const std::string& dir, size_t materialCount,
   }
   return any;
 }
+
+// Declared in voxload.h, where the rationale lives.
+void UpsamplePrefab(Prefab& p, uint32_t u) {
+  if (u <= 1) return;
+  const int s = (int)u;
+  for (PrefabModel& m : p.models) {
+    std::vector<PrefabVoxel> out;
+    out.reserve(m.voxels.size() * (size_t)s * s * s);
+    for (const PrefabVoxel& v : m.voxels) {
+      for (int dz = 0; dz < s; dz++)
+        for (int dy = 0; dy < s; dy++)
+          for (int dx = 0; dx < s; dx++) {
+            PrefabVoxel n = v;
+            n.x = (int16_t)(v.x * s + dx);
+            n.y = (int16_t)(v.y * s + dy);
+            n.z = (int16_t)(v.z * s + dz);
+            out.push_back(n);
+          }
+    }
+    m.voxels.swap(out);
+    // Extents and both origins scale with the lattice. `sceneMin` especially:
+    // melee.cpp converts authored boxes through it, and leaving it in the old
+    // lattice would land a sword's hilt a model-depth away from its blade.
+    m.size = {m.size.x * s, m.size.y * s, m.size.z * s};
+    m.offset = {m.offset.x * s, m.offset.y * s, m.offset.z * s};
+    m.sceneMin = {m.sceneMin.x * s, m.sceneMin.y * s, m.sceneMin.z * s};
+  }
+  p.size = {p.size.x * s, p.size.y * s, p.size.z * s};
+}

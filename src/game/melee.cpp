@@ -6,6 +6,9 @@
 
 #include <nlohmann/json.hpp>
 
+#include "sim/scale.h"    // SkinScaleFor / NeededArtUpsample / kLegacyAuthoring*
+#include "sim/voxload.h"  // UpsamplePrefab
+
 // See melee.h for what this is and why. This file is only the motion: the
 // damage side lives in main.cpp's tick loop, which owns the ray casts and the
 // spawn/op lists a carve has to reach.
@@ -65,8 +68,35 @@ bool LoadItemAsset(const std::string& dir, size_t materialCount,
         if (v.color) v.color = remap[v.color];
   }
 
-  d.scale = s.value("scale", 1u);
-  if (d.scale < 1) d.scale = 1;
+  // ---- ART SCALE (DESIGN.md §3b) --------------------------------------------
+  // Authored as voxels/METRE; the micro-per-world `scale` is derived. Legacy
+  // sidecars said `scale` directly, which silently meant "and the world is
+  // 10 cm" — see ItemDef::artVoxelsPerMetre.
+  if (s.contains("artVoxelsPerMetre")) {
+    d.artVoxelsPerMetre = s.value("artVoxelsPerMetre", 0);
+  } else {
+    const uint32_t legacy = std::max(1u, s.value("scale", 1u));
+    d.artVoxelsPerMetre = (int)legacy * kLegacyAuthoringVoxelsPerMetre;
+    errors += "items: \"" + d.name + "\" has no \"artVoxelsPerMetre\"; " +
+              "reading legacy scale " + std::to_string(legacy) + " as " +
+              std::to_string(d.artVoxelsPerMetre) + " art voxels/metre\n";
+  }
+  if (d.artVoxelsPerMetre <= 0) {
+    errors += "items: \"" + d.name + "\" artVoxelsPerMetre must be positive\n";
+    d.artVoxelsPerMetre = kVoxelsPerMetre;
+  }
+  d.artUpsample = NeededArtUpsample(d.artVoxelsPerMetre);
+  d.scale = SkinScaleFor(d.artVoxelsPerMetre * (int)d.artUpsample);
+  if (d.scale != 1 && d.scale != 2 && d.scale != 4 && d.scale != 8) {
+    errors += "items: \"" + d.name + "\" artVoxelsPerMetre " +
+              std::to_string(d.artVoxelsPerMetre) + " gives scale " +
+              std::to_string(d.scale) + " at " + std::to_string(kVoxelsPerMetre) +
+              " world voxels/metre — must be 1, 2, 4 or 8. Using 1; this item " +
+              "will be the wrong physical size.\n";
+    d.scale = 1;
+    d.artUpsample = 1;
+  }
+  if (d.artUpsample > 1) UpsamplePrefab(d.prefab, d.artUpsample);
 
   auto findModel = [&](const std::string& want) -> int {
     for (size_t i = 0; i < d.prefab.models.size(); i++)
@@ -83,7 +113,8 @@ bool LoadItemAsset(const std::string& dir, size_t materialCount,
   // Parsed BEFORE the single-model block below, because a worn piece has no
   // one model to be: `d.voxels` stays empty and the geometry lives per shell.
   const bool worn = ItemKindIsWorn(d.kind);
-  const float invScale = 1.0f / (float)d.scale;
+  // Authored art units -> world voxels; divides out any upsample.
+  const float invScale = d.ArtToWorld();
   if (s.contains("cover") && s["cover"].is_array()) {
     auto vec3Of = [](const json& j, Vec3 dflt) {
       if (!j.is_array() || j.size() != 3) return dflt;
@@ -403,7 +434,10 @@ bool LoadItems(const std::string& dir, size_t materialCount,
     }
     d.damage = it.value("damage", 12.0f);
     d.carveBonus = it.value("carveBonus", 0.0f);
-    d.reach = it.value("reach", 9.0f);
+    // items.json authors reach in world voxels at the legacy 10 vox/m
+    // baseline; rescale so the same number means the same distance.
+    d.reach = it.value("reach", 9.0f) *
+              ((float)kVoxelsPerMetre / (float)kLegacyAuthoringVoxelsPerMetre);
     // A broken item is skipped, never fatal: one bad asset must not cost the
     // player their whole hotbar (DESIGN.md §6, the same rule mob defs follow).
     if (!LoadItemAsset(dir, materialCount, micro, d, errors)) continue;

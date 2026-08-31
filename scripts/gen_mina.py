@@ -108,8 +108,29 @@ LEATHER = 53    # leather      shoes under the hem
 ART_SCALE = 4   # what the literals below are drawn in
 SKIN_UPSCALE = 2
 SCALE = ART_SCALE * SKIN_UPSCALE  # 8 skin voxels per world voxel, as shipped
-WORLD_H = 17    # world voxels, head to toe — matches Player::kHalfY * 2
-MICRO_H = WORLD_H * SCALE  # 136
+# ---- THE SIZE CONTRACT IS METRES (DESIGN.md 3b) -----------------------------
+# HEIGHT_M is the physical fact; the lattice figures below are DERIVED from it
+# and from the art's own resolution. WORLD_H used to be a literal 17 "world
+# voxels head to toe", which fixed a real height only while kVoxelMeters was
+# 0.10 -- so when the engine moved to 0.05 the figure stayed 17 cells and
+# became 0.85 m: half the collision capsule it drives, with the art file
+# perfectly correct and nothing able to notice.
+#
+# ART_VOXELS_PER_METRE is what the sidecar declares and is now the ONLY scale
+# this generator needs. kVoxelMeters does not appear in the contract at all:
+# tuning.json's player.halfHeight is already metres, so the cross-check below
+# is metres against metres and this file no longer has to be regenerated when
+# the engine's voxel size changes.
+HEIGHT_M = 1.70                      # head to toe
+EYE_M = 1.50                         # first-person camera row
+ART_VOXELS_PER_METRE = 80            # shipped art resolution (the sidecar value)
+AUTHORED_VOXELS_PER_METRE = ART_VOXELS_PER_METRE // SKIN_UPSCALE   # 40
+# The scale the sidecar's WORLD-space rows (speed, severImpactSpeed, rideHeight,
+# bodyYOffset, clip pos) are written at. The loader rescales them from here to
+# the live kVoxelsPerMetre -- see mob.cpp's `sidecarVoxelsPerMetre`.
+SIDECAR_VOXELS_PER_METRE = 10
+WORLD_H = round(HEIGHT_M * AUTHORED_VOXELS_PER_METRE / ART_SCALE)
+MICRO_H = round(HEIGHT_M * ART_VOXELS_PER_METRE)
 
 # The SPEED contract, the companion to the height contract above. `speed` in
 # the sidecar is the reference top speed in world voxels/sec that the runtime
@@ -119,7 +140,10 @@ MICRO_H = WORLD_H * SCALE  # 136
 #   sim/world.h kVoxelMeters        0.10 m
 # giving 60 world voxels/sec. Asserted in main() against the same files.
 SPRINT_SPEED_MPS = 6.0
-VOXEL_METERS = 0.10
+# VOXEL_METERS is GONE on purpose. Every number this file emits is now
+# either metres or a lattice figure derived from a declared
+# voxels-per-metre, so there is nothing left for the engine's voxel
+# size to change. Reintroducing it would reintroduce the coupling.
 
 
 # ---- .vox writing (same helpers as gen_wizard.py / gen_critter_mob.py) ------
@@ -616,12 +640,9 @@ def main():
     assert abs(sprint - SPRINT_SPEED_MPS) < 1e-6, (
         f"tuning.json player.sprintSpeed is {sprint}, this file assumes "
         f"{SPRINT_SPEED_MPS} — update SPRINT_SPEED_MPS and regenerate")
-    with open(os.path.join(root, "src", "sim", "world.h")) as wf:
-        m = re.search(r"kVoxelMeters\s*=\s*([0-9.]+)f", wf.read())
-    assert m, "could not find kVoxelMeters in src/sim/world.h"
-    assert abs(float(m.group(1)) - VOXEL_METERS) < 1e-9, (
-        f"world.h kVoxelMeters is {m.group(1)}, this file assumes "
-        f"{VOXEL_METERS} — update VOXEL_METERS and regenerate")
+    # No kVoxelMeters check: the contract below is metres against
+    # metres, so this generator is voxel-size independent by
+    # construction rather than by assertion.
 
     body = b""
     graph = b""
@@ -1301,7 +1322,7 @@ def main():
         # leaves speedFactor pinned at its 1.5 clamp for every step the player
         # ever takes: max bob, max sway, max roll, max head deflection, always.
         # Sprint is the reference because that is the fastest normal locomotion.
-        "speed": SPRINT_SPEED_MPS / VOXEL_METERS,
+        "speed": SPRINT_SPEED_MPS * SIDECAR_VOXELS_PER_METRE,
         "gait": {
             # Biped: two SINGLETON groups, so only one foot may swing at a
             # time. That single constraint is the whole gait state machine.
