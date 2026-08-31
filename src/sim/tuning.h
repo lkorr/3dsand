@@ -961,9 +961,11 @@ struct Tuning {
     float flashChip = 0.35f;
     float flashFlesh = 0.85f;
     float flashSever = 1.60f;
-    // Seconds of halflife on the decay. Short: a flash the player can still see
-    // when the next blow lands stops reading as a hit and starts reading as a
-    // shader bug.
+    // Seconds of halflife on the decay, aged on the TICK (MobSystem::PreTick)
+    // so it runs in a gate as well as in the game — and so it slows down with
+    // the world under hit-stop, which is right, since the two are describing
+    // the same blow. Short: a flash the player can still see when the next blow
+    // lands stops reading as a hit and starts reading as a shader bug.
     float flashHalflife = 0.075f;
     // ---- combat cues --------------------------------------------------------
     // Volumes are the same 0..N trim every other cue group uses; radius is the

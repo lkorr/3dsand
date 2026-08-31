@@ -2488,6 +2488,10 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
   // pass writes fire into the hashed grid, so running it off the render clock
   // would make the world a function of frame rate.
   BurnLimbs(tick, world, cellOps, spawns);
+  // The hit flash ages on the TICK, with everything else that ages. See
+  // DecayHitFlash for why it is not on the frame clock — the short version is
+  // that a gate damages limbs and never runs a frame.
+  DecayHitFlash(dt);
   IVec3 wo = world.WindowOrigin();
   Vec3 wlo{(float)(wo.x * (int)kChunk), (float)(wo.y * (int)kChunk),
            (float)(wo.z * (int)kChunk)};
@@ -5836,9 +5840,24 @@ void Mob::AppendDebugBoxes(std::vector<DebugBox>& out, size_t limit,
 
 // ---- hit flash -------------------------------------------------------------
 //
-// See MobSystem::DecayHitFlash's note in mob.h for why this is FRAME time and
-// not tick time. The system-wide early-out is what makes it free in a world
-// where nothing is being hit, which is nearly always (rule 2).
+// ON THE TICK, and the first version had it on the FRAME. The argument for the
+// frame was that a flash is a length of time the player perceives, so it should
+// not run at a different rate when the tick loop happens to run 0, 1 or 4 times
+// — which it does constantly, and which hit-stop makes worse on purpose. That
+// argument is fine and the conclusion was still wrong, for a reason it does not
+// mention: THE ONLY CALLER OF A FRAME-DRIVEN DECAY IS THE WINDOWED FRAME LOOP,
+// and the selftest never reaches it. A gate that damages a limb — `mob`,
+// `mob carve`, `wound-*`, `armor-react` — would have lit that limb and left it
+// lit for the rest of the process, straight through the micro-body render
+// probe's own image comparison two subtests later.
+//
+// The tick is the clock everything else ages on, gates included, and the thing
+// the frame argument was protecting turns out to be a feature here: under
+// hit-stop the flash slows down with the world, which is what you want, since
+// the two effects are describing the same blow.
+//
+// The system-wide early-out is what makes it free in a world where nothing has
+// been hit, which is nearly always (rule 2).
 void MobSystem::DecayHitFlash(float dt) {
   if (dt <= 0.0f) return;
   const float halflife = std::max(CurrentTuning().combatfx.flashHalflife, 0.01f);

@@ -5903,10 +5903,9 @@ int main(int argc, char** argv) {
       combatWhooshCue.pending = false;
       combatFleshCue.pending = false;
       combatClangCue.pending = false;
-      // The hit flash decays in REAL time, once per frame — see
-      // MobSystem::DecayHitFlash for why not per tick. Unconditional for the
-      // same reason: it is not an audio effect and must not depend on one.
-      mobs.DecayHitFlash((float)dt);
+      // (The hit flash is NOT decayed here. It ages on the tick, inside
+      // MobSystem::PreTick, because a frame-driven decay is never called by
+      // the selftest — see MobSystem::DecayHitFlash.)
       // Adaptive fog: pin the fade to whatever cascade radius is actually
       // filled, so a backlogged refill (spawn, load, teleport, sprinting past
       // a level's hysteresis) fogs out the pending bands instead of showing

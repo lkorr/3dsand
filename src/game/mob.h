@@ -1558,18 +1558,18 @@ class MobSystem {
   const std::vector<BleedSource>& BleedSources() const { return bleeds_; }
 
   // ---- hit flash ----------------------------------------------------------
-  // Decay every limb's hit flash by REAL elapsed time. Called once per FRAME
-  // from main.cpp, deliberately not from PreTick:
-  //
-  //   * a flash is a length of time the player perceives, so it must not run
-  //     at a different rate when the tick loop happens to run 0, 1 or 4 times
-  //     this frame — which it does, constantly, and which hit-stop makes worse
-  //     on purpose (sim/tuning.h Tuning::CombatFx);
-  //   * it is presentation state, so a tick has no business touching it.
+  // Age every limb's hit flash. Called from PreTick, so it runs wherever the
+  // world runs — including in a gate, which is the whole reason it is not on
+  // the frame clock (see the long note at the definition: a frame-driven decay
+  // is never called by the selftest at all, so a gate that damages a limb
+  // leaves it lit for the rest of the process).
   //
   // Exponential, with the halflife from combatfx.flashHalflife. Cost when
   // nothing has been hit is one float compare per limb, and it early-outs on
   // the whole system as soon as every flash has decayed to zero.
+  //
+  // Public rather than private because a fixture that wants to age a flash
+  // without stepping the whole world should not have to run PreTick to do it.
   void DecayHitFlash(float dt);
   // Light one limb up, by BODY HANDLE — the same key Damage() resolves, so a
   // caller that already knows which body it hit does not have to find the limb
