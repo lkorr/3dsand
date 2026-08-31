@@ -76,6 +76,7 @@ void PageTable::Init(const rhi::Device& device, World& world) {
   // change the world.
   if (const char* nj = getenv("SANDVOX_NO_JITTER"))
     jitterEnabled_ = !(nj[0] == '1');
+  auditEnabled_ = getenv("SANDVOX_PT_AUDIT") != nullptr;
   poolPages_ = world.PoolPages();
   tableDirtyMark_.assign(kNumChunks, 0);
   ResetIdentity(device.GetQueue());
@@ -138,8 +139,21 @@ void PageTable::ResetIdentity(const rhi::Queue& queue) {
   }
   // Slots past the pool (paged mode) start EMPTY rather than resident.
   for (uint32_t i = poolPages_; i < kNumChunks; i++) t[i] = kPtEmpty;
-  // Pages past the slot count would be free; there are none, since
-  // poolPages_ <= kNumChunks in both modes.
+  // PAGES PAST THE SLOT COUNT ARE THE RETIRE HEADROOM, and they must be seeded
+  // onto the free list HERE or they are unreachable for the life of the
+  // process. The identity seeding above can only hand out pages 0..kNumChunks-1
+  // (one per slot), and nothing else ever invents a page index — Alloc only
+  // pops what is on this list. So without this loop the headroom is allocated
+  // in VRAM, counted by kPoolPages, and never usable: raising the pool would
+  // be a silent no-op on every path that starts from the identity map, which
+  // is worldgen and LoadWorld, i.e. all of them.
+  //
+  // This spot previously held a comment asserting there were no such pages.
+  // That was true only while kPoolPages was capped at kNumChunks, and it is
+  // exactly the kind of invariant-by-comment that survives the change which
+  // invalidates it. Pushed high-to-low so the LIFO pops the lowest first,
+  // matching ResetAllEmpty.
+  for (uint32_t p = poolPages_; p-- > kNumChunks;) freePages_.push_back(p);
   //
   // pagesHighWater_ is deliberately NOT latched here. Identity seeding claims
   // min(kNumChunks, poolPages_) pages BY CONSTRUCTION — in paged mode a
@@ -186,21 +200,177 @@ uint32_t PageTable::Alloc() {
     pagesHighWater_ = std::max(pagesHighWater_, pagesInUse_);
     return p;
   }
+  // LAST CHANCE BEFORE THE ABORT: hand back anything the retire queue has
+  // already aged out. kPoolPages is sized so this can never be REQUIRED, but
+  // it costs nothing and it removes a whole ORDERING hazard from the guarantee
+  // — RetirePages runs at the END of a tick, after Materialize, so a page that
+  // aged out during this tick is sitting in the queue, reusable, and simply
+  // has not been drained yet. Relying on the sizing alone would make the
+  // proof depend on call order as well as on arithmetic.
+  //
+  // It cannot free anything early: the same age test applies, so the in-flight
+  // eviction-copy guarantee (risk 5) is untouched. tick_ may lag the tick
+  // RetirePages is normally called with, which makes this drain strictly more
+  // conservative, never less.
+  DrainRetired(tick_);
+  if (!freePages_.empty()) {
+    const uint32_t p = freePages_.back();
+    freePages_.pop_back();
+    pagesInUse_++;
+    pagesHighWater_ = std::max(pagesHighWater_, pagesInUse_);
+    return p;
+  }
   // EXHAUSTION IS FATAL, in every mode (§3.8, settled by the user). The
   // reasoning is short and better than a graceful degradation: if the pool can
   // exhaust in normal play, the pool is MIS-SIZED. That is a bug in
   // kPoolPages, and the right response to a bug is to fail loudly at the
   // moment of detection, not to invent a behaviour that hides it and mutates
   // the world while doing so.
+  //
+  // WHAT THIS REPORT MUST ANSWER, and did not for two crashes on 2026-08-30:
+  // "0 free" is a bare count, and a bare count buys one hypothesis per
+  // reproduction (CLAUDE.md rule 6). There are four distinct ways the free
+  // list can empty, they call for four different fixes, and they are told
+  // apart only by numbers that exist right here and nowhere else:
+  //
+  //   1. GENUINE DEMAND — every slot wants a real page. Then resident ==
+  //      poolPages_ and the pool is honestly too small for the window.
+  //   2. RETIRE STARVATION — pages freed within the last kRetireTicks are
+  //      parked, so `retired` is large and `resident + retired` saturates the
+  //      pool while thousands of slots are still sentinels. Fix: overprovision
+  //      by the queue ceiling, or drain on demand.
+  //   3. A BOOKKEEPING LEAK — pagesInUse_ disagrees with the table's own
+  //      count of non-sentinel slots. Fix: the mis-accounted path.
+  //   4. A LOST PAGE — a page index reachable from neither the table, nor the
+  //      free list, nor the retire queue. Fix: whoever dropped it.
+  //
+  // So the audit below RECOUNTS from the authoritative structures rather than
+  // trusting the counters, and reports the residual. AuditPages() is shared
+  // with the SANDVOX_PT_AUDIT per-tick check, which is what lets cases 3 and 4
+  // be caught at the tick they FIRST occur rather than thousands of ticks
+  // later when the leak finally reaches the bottom of the pool.
+  const PageAudit a = AuditPages();
+  // The oldest retire entry's age says whether the queue is DRAINING or
+  // STUCK: anything at or past kRetireTicks should already have been handed
+  // back by RetirePages, so a large age means RetirePages is not running on
+  // this path (or is being fed a different tick counter than the one the
+  // entries were stamped with).
+  const uint32_t oldestAge =
+      retire_.empty() ? 0u : (tick_ - retire_.front().tick);
+  std::fflush(stdout);
+  std::fprintf(
+      stderr,
+      "\nFATAL: page pool exhausted: 1 page needed, 0 free.\n"
+      "  pool           %u pages (%.1f MiB)\n"
+      "  counters       inUse %u, highWater %u, freed %llu, "
+      "allocs mat %llu / ovr %llu\n"
+      "  free list      %zu\n"
+      "  retire queue   %zu parked (oldest age %u ticks, kRetireTicks %u)\n"
+      "  table recount  %u resident | sentinels: %u empty, %u uniform, "
+      "%u jitter, %u other\n"
+      "  page audit     %u lost, %u aliased, %u out-of-range\n"
+      "  demand         materialize set %zu, cpuDirty %zu, tick %u\n",
+      poolPages_, (double)poolPages_ * kChunkVol * 4.0 / (1024.0 * 1024.0),
+      pagesInUse_, pagesHighWater_, (unsigned long long)pagesFreed_,
+      (unsigned long long)allocsMat_, (unsigned long long)allocsOvr_,
+      freePages_.size(), retire_.size(), oldestAge, kRetireTicks, a.resident,
+      a.sEmpty, a.sUniform, a.sJitter, a.sOther, a.lost, a.aliased,
+      a.outOfRange, materialized_.Size(), cpuDirty_.Size(), tick_);
+  // The one-line verdict, so the cause does not have to be re-derived from the
+  // table above every time this fires.
+  if (a.lost || a.aliased || a.outOfRange)
+    std::fprintf(stderr,
+                 "  VERDICT: PAGES LOST/ALIASED — an allocator bug, not a "
+                 "sizing problem. Raising kPoolPages only delays it.\n");
+  else if (a.resident != pagesInUse_)
+    std::fprintf(stderr,
+                 "  VERDICT: BOOKKEEPING LEAK — pagesInUse_ (%u) disagrees "
+                 "with the table's own resident count (%u).\n",
+                 pagesInUse_, a.resident);
+  else if (a.resident >= poolPages_)
+    std::fprintf(stderr,
+                 "  VERDICT: GENUINE DEMAND — every page is held by a live "
+                 "slot. The pool is too small for this window.\n");
+  else
+    std::fprintf(stderr,
+                 "  VERDICT: RETIRE STARVATION — %zu pages are parked in the "
+                 "retire queue while %u slots are still sentinels. The pool "
+                 "needs %zu pages of headroom over the window, not a bigger "
+                 "window budget.\n",
+                 retire_.size(), kNumChunks - a.resident, retire_.size());
+  std::fprintf(stderr,
+               "See docs/PLAN_page_table.md §3.8: exhaustion is a fatal error "
+               "in every mode, deliberately.\n");
+  std::fflush(stderr);
+  std::abort();
+}
+
+// ONE definition of the page accounting, read by the exhaustion report above
+// and by the per-tick invariant check below. Two copies of this walk would be
+// exactly the "two places must agree" bug the rest of this file is careful to
+// avoid, and the whole point of the check is that it is trustworthy.
+//
+// It recounts from the AUTHORITATIVE structures — the page table, the free
+// list, the retire queue — and never from pagesInUse_, which is the counter
+// under suspicion whenever this runs.
+PageTable::PageAudit PageTable::AuditPages() const {
+  PageAudit a;
+  const auto& t = world_->pageTableCpu();
+  // One byte per page: 1 = the table points at it, 2 = the free list holds it,
+  // 4 = the retire queue holds it. A page with 0 is LOST; a page with more
+  // than one bit set is ALIASED, which is worse than losing one — two slots
+  // would be sharing 16 KiB of storage and silently overwriting each other.
+  std::vector<uint8_t> owner(poolPages_, 0u);
+  auto mark = [&](uint32_t page, uint8_t bit) {
+    if (page >= poolPages_) { a.outOfRange++; return; }
+    owner[page] |= bit;
+  };
+  for (uint32_t s = 0; s < kNumChunks; s++) {
+    const uint32_t e = t[s];
+    if ((e & kPtSentinelBit) == 0u) { a.resident++; mark(e, 1u); continue; }
+    if (e == kPtEmpty) a.sEmpty++;
+    else if ((e & kPtJitterBit) != 0u) a.sJitter++;
+    else if ((e & kPtMatMask) != kMatAir) a.sUniform++;
+    else a.sOther++;
+  }
+  for (uint32_t p : freePages_) mark(p, 2u);
+  for (const Retired& r : retire_) mark(r.page, 4u);
+  for (uint8_t o : owner) {
+    if (o == 0u) a.lost++;
+    else if (o != 1u && o != 2u && o != 4u) a.aliased++;
+  }
+  return a;
+}
+
+// SANDVOX_PT_AUDIT=1: check the page-accounting invariant every tick and abort
+// on the FIRST violation.
+//
+// Why this exists rather than just reading the exhaustion report: a leak of a
+// few pages per window shift takes thousands of ticks to reach the bottom of a
+// 32,768-page pool, and by then the report describes the aftermath, not the
+// cause. This fires on the tick the accounting first breaks, with the tick
+// number, which is the difference between "something leaks" and "the shift at
+// tick N leaks". Off by default — it is an O(kNumChunks) walk per tick.
+void PageTable::AuditInvariant(const char* where) {
+  if (!paged_) return;
+  if (!auditEnabled_) return;
+  const PageAudit a = AuditPages();
+  const size_t accounted = (size_t)a.resident + freePages_.size() + retire_.size();
+  const bool bad = a.lost || a.aliased || a.outOfRange ||
+                   a.resident != pagesInUse_ || accounted != poolPages_;
+  if (!bad) return;
   std::fflush(stdout);
   std::fprintf(stderr,
-               "\nFATAL: page pool exhausted: %u pages needed, 0 free "
-               "(kPoolPages = %u, %u in use, high water %u).\n"
-               "The pool is mis-sized for this scenario — raise kPoolPages in "
-               "src/sim/world.h.\n"
-               "See docs/PLAN_page_table.md §3.8: exhaustion is a fatal error "
-               "in every mode, deliberately.\n",
-               pagesInUse_ + 1, poolPages_, pagesInUse_, pagesHighWater_);
+               "\nFATAL: page accounting broken at %s, tick %u.\n"
+               "  resident %u (pagesInUse_ says %u), free %zu, retired %zu, "
+               "sum %zu of %u\n"
+               "  lost %u, aliased %u, out-of-range %u\n"
+               "  sentinels: %u empty, %u uniform, %u jitter, %u other\n"
+               "This is an allocator bug. A bigger kPoolPages would only "
+               "postpone the exhaustion it causes.\n",
+               where, tick_, a.resident, pagesInUse_, freePages_.size(),
+               retire_.size(), accounted, poolPages_, a.lost, a.aliased,
+               a.outOfRange, a.sEmpty, a.sUniform, a.sJitter, a.sOther);
   std::fflush(stderr);
   std::abort();
 }
@@ -1144,11 +1314,54 @@ void PageTable::ResetStreaks(const std::vector<uint32_t>& slots) {
   for (uint32_t s : slots) zeroStreak_[s] = 0;
 }
 
-void PageTable::RetirePages(uint32_t tick) {
+// The drain itself, with no checks attached. Split out from RetirePages so
+// Alloc's last-chance drain cannot re-enter the accounting audit MID-
+// ALLOCATION: between a page leaving the free list and `t[slot]` receiving it
+// the books are legitimately unbalanced for a few instructions, and a debug
+// aid that aborts on that would be worse than the bug it hunts.
+void PageTable::DrainRetired(uint32_t tick) {
   while (!retire_.empty() && tick - retire_.front().tick >= kRetireTicks) {
     freePages_.push_back(retire_.front().page);
     retire_.pop_front();
   }
+}
+
+void PageTable::RetirePages(uint32_t tick) {
+  DrainRetired(tick);
+  // THE PREMISE kPoolPages IS SIZED AGAINST, CHECKED RATHER THAN ASSUMED.
+  //
+  // The pool exceeds kNumChunks by exactly kPageRetireCeiling, on the argument
+  // that at most kMaxFreeProbesPerTick pages are parked per tick and nothing
+  // stays parked longer than kRetireTicks. That argument is a reading of three
+  // constants and a call site — the same species of reasoning that produced a
+  // confident and wrong "exhaustion is structurally impossible" before the
+  // retire queue was accounted for. So it is asserted here, where a violation
+  // is one queue away from its cause, instead of being discovered later as an
+  // exhaustion abort that looks like a sizing problem all over again.
+  //
+  // The realistic way to break it is to make freeing burstier (raise the
+  // per-tick cap, add a second producer, free outside the probe path) or to
+  // drive the tick counter non-monotonically. Any of those wants the pool
+  // resized to match, and this is what says so.
+  if (retire_.size() > (size_t)kPageRetireCeiling) {
+    std::fflush(stdout);
+    std::fprintf(stderr,
+                 "\nFATAL: retire queue holds %zu pages, over the %u ceiling "
+                 "kPoolPages is sized against (tick %u, oldest age %u, "
+                 "kRetireTicks %u, cap %zu/tick).\n"
+                 "The pool's exhaustion guarantee assumed this could not "
+                 "happen. Raise kPageFreeProbesPerTick / kPageRetireTicks in "
+                 "world.h to match whatever now feeds this queue — kPoolPages "
+                 "follows them automatically.\n",
+                 retire_.size(), kPageRetireCeiling, tick,
+                 retire_.empty() ? 0u : (tick - retire_.front().tick),
+                 kRetireTicks, kMaxFreeProbesPerTick);
+    std::fflush(stderr);
+    std::abort();
+  }
+  // End of the tick's allocate/free/retire cycle — the one point where the
+  // accounting is required to balance, so the one right place to check it.
+  AuditInvariant("end of tick");
 }
 
 void PageTable::FlushTableWrites(const rhi::Queue& queue) {

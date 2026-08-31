@@ -1586,6 +1586,73 @@ can exhaust in normal play, the pool is mis-sized.** That is a bug in
 moment of detection, not to invent a graceful behaviour that hides it and
 mutates the world while doing so.
 
+#### Pool sized by DERIVATION, not measurement — [AS BUILT, 2026-08-30]
+
+The pool had been at `kNumChunks` (32,768 = 512 MiB = exactly dense) on the
+argument that dense IS the worst case, so nothing below it can be safe and
+nothing above it can be needed. The engine aborted twice in ordinary play
+anyway (`crash.log` 19:22:50 and 19:42:07, `Alloc` ← `Materialize`).
+
+**Every step of that argument is true and the conclusion is false**, which is
+what makes it worth recording. A slot holds at most one page, there are
+`kNumChunks` slots, so demand really cannot exceed `kNumChunks`. But **pages
+leave the free list by two doors and the argument counts one.** The retire
+queue parks freed pages for `kRetireTicks` against in-flight eviction copies,
+at up to `kMaxFreeProbesPerTick` per tick — up to **2,048 pages, 6.25% of the
+pool, out of circulation**. `Alloc()` fails when `resident + retired ==
+kPoolPages`, so the abort band opens at **93.75% residency**, which is exactly
+where every observed abort landed.
+
+So `kPoolPages` is now **derived**: `kNumChunks + kPageRetireCeiling` (34,816
+pages, 544 MiB at the 512 window, +33 MiB with `actVoxViz`). The guarantee is
+arithmetic rather than measured — `Alloc()` only runs for a *sentinel* slot, so
+`resident ≤ kNumChunks - 1`, hence `free ≥ 1` always. Both inputs live in
+`world.h` beside `kPoolPages`; `pagetable.h` aliases them and `static_assert`s
+the relationship, so the three cannot drift.
+
+Three things landed with it, in order of how much diagnosis time they save:
+
+- **`SANDVOX_PT_AUDIT=1`** — recounts resident/free/retired from the
+  authoritative structures every tick and aborts on the first imbalance, so a
+  leak is caught at the tick it happens rather than thousands of ticks later at
+  the bottom of the pool. It found nothing over a full `--selftest` and 1,200
+  `--autofly-hard` frames, which is what *excluded* the leak hypotheses and
+  left the retire queue as the only remaining mechanism.
+- **A verdict line at `Alloc()` failure** naming which of genuine-demand /
+  retire-starvation / bookkeeping-leak / lost-or-aliased-pages fired. The old
+  report printed `pagesInUse_` and nothing else, which is a bare count and buys
+  one hypothesis per reproduction (CLAUDE.md rule 6).
+- **A last-chance drain in `Alloc()`** before aborting, so the guarantee does
+  not also depend on call ORDER (`RetirePages` runs *after* `Materialize`, so a
+  page that aged out this tick is reusable but undrained).
+
+**Sizing input, corrected.** §3.7 sized the pool against `--autofly-hard`, and
+that harness peaks at **17,769 / 34,816 (54.2%)**; a full `--selftest` reaches
+**23,631 (67.9%)**. Neither comes near the abort band, because both stress
+**streaming**. What fills the pool is **activity** — `Materialize`'s set is
+`cpuDirty ∪ hasMatter ∪ opTargets ∪ particleChunks ∪ fluidChunks`, and smoke,
+fire and particles rising into open sky convert the `PT_EMPTY` sky sentinels
+(~half the window, and free) into real pages. **Size against a world-wide wake,
+not against flight.**
+
+**`ResetIdentity` had to change too**, and it is the reason a bare constant
+bump would have been a silent no-op: it seeds `t[i] = i` for `i < kNumChunks`
+and nothing else ever invents a page index, so pages `[kNumChunks, kPoolPages)`
+had to be pushed onto the free list explicitly or the headroom would be
+allocated in VRAM, counted by `kPoolPages`, and permanently unreachable on
+every path that starts from the identity map — worldgen and `LoadWorld`, i.e.
+all of them. The spot previously held a comment *asserting* there were no such
+pages, true only while the pool was capped at `kNumChunks`.
+
+**The window-size guard rail.** Because the pool now tracks `kWorldN`, a
+`static_assert` in `world.h` checks the derived buffer against Vulkan's
+`maxStorageBufferRange`, whose spec ceiling is `uint32_t` — 4 GiB − 1, not a
+property of any particular card. `kWorldN = 1024` yields 264,192 pages =
+**4.03 GiB in one binding and fails to compile**, which is the correct outcome:
+doubling the window needs the voxel buffer SPLIT across bindings first, and the
+compile error says so at the moment the constant changes rather than after a
+build and a crash.
+
 This replaces the first draft's three-tier priority-refusal scheme entirely.
 **That scheme is dead** — and it deserves a sentence on why, because it looked
 reasonable: it made exhaustion *survivable* at the cost of making it *silent*,

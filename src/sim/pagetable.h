@@ -344,6 +344,14 @@ class PageTable {
   // them to have completed (risk 5).
   void RetirePages(uint32_t tick);
 
+  // SANDVOX_PT_AUDIT=1: recount the page accounting from the page table, the
+  // free list and the retire queue, and abort on the first tick they do not
+  // add up to poolPages_. Off by default (an O(kNumChunks) walk per tick);
+  // `where` names the call site in the report. See the .cpp for why this is
+  // separate from the exhaustion report: a slow leak reaches the bottom of a
+  // 32,768-page pool thousands of ticks after the tick that caused it.
+  void AuditInvariant(const char* where);
+
   // ---- reporting ----
   uint32_t PagesInUse() const { return pagesInUse_; }
   // Debug attribution (SANDVOX_PT_DEBUG): allocations since BeginTick, split
@@ -371,9 +379,24 @@ class PageTable {
   void Free(uint32_t slot);
   void MarkTableDirty(uint32_t slot);
 
+  // Page accounting recounted from the authoritative structures — never from
+  // pagesInUse_, which is the counter under suspicion whenever this is read.
+  // ONE definition, shared by the exhaustion report and AuditInvariant.
+  struct PageAudit {
+    uint32_t resident = 0;   // slots holding a real page index
+    uint32_t sEmpty = 0, sUniform = 0, sJitter = 0, sOther = 0;
+    uint32_t lost = 0;       // pages in no structure at all — leaked
+    uint32_t aliased = 0;    // pages in two structures at once — corruption
+    uint32_t outOfRange = 0; // entries pointing past the pool
+  };
+  PageAudit AuditPages() const;
+  // The age-gated retire drain, with no checks attached — see the .cpp.
+  void DrainRetired(uint32_t tick);
+
   World* world_ = nullptr;
   uint32_t poolPages_ = kNumChunks;
   bool paged_ = false;
+  bool auditEnabled_ = false;             // SANDVOX_PT_AUDIT
 
   std::vector<uint32_t> freePages_;       // LIFO stack of page indices
   uint32_t pagesInUse_ = 0;
@@ -489,7 +512,12 @@ class PageTable {
   // lost ~1,140 pages every tick and paged play degraded to a p50 of 99 ms
   // against dense's 16 ms. A reclaim path must be able to outrun its
   // allocator; one that cannot is a leak with extra steps.
-  static constexpr size_t kMaxFreeProbesPerTick = 128;
+  //
+  // THE VALUE LIVES IN world.h, because kPoolPages is derived from it: the
+  // pool must exceed kNumChunks by this cap times kRetireTicks or the free
+  // list can empty while thousands of slots are still sentinels. Aliased here
+  // rather than restated so the two cannot drift.
+  static constexpr size_t kMaxFreeProbesPerTick = kPageFreeProbesPerTick;
 
   // THE RETIRE QUEUE (risk 5). The existing code is safe against
   // free-then-reallocate only because SLOTS NEVER MOVE: a slot's 16 KiB is at
@@ -508,9 +536,18 @@ class PageTable {
   //
   // §4.2's sentinel fast path sidesteps most of this entirely: a sentinel slot
   // is not copied at all, so it has no in-flight reference to have.
+  //
+  // Like kMaxFreeProbesPerTick, the VALUE lives in world.h next to kPoolPages,
+  // which is sized as kNumChunks + the product of the two. The static_assert
+  // below is the mechanical statement of that dependency: it fires if anyone
+  // ever sets kPoolPages independently of the queue that eats into it.
   struct Retired { uint32_t page; uint32_t tick; };
   std::deque<Retired> retire_;
-  static constexpr uint32_t kRetireTicks = 16;
+  static constexpr uint32_t kRetireTicks = kPageRetireTicks;
+  static_assert(kPoolPages >= kNumChunks + kMaxFreeProbesPerTick * kRetireTicks,
+                "page pool must cover one page per chunk slot PLUS every page "
+                "the retire queue can hold out of the free list; otherwise "
+                "Alloc() can abort while slots are still sentinels");
 
   uint32_t tick_ = 0;
   // First tick seen after a reset; -1 = reset happened, tick not yet known.

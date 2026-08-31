@@ -561,11 +561,59 @@ constexpr uint32_t kPtUnresident = 0xFFFFFFFFu;
 // anyone remembering a rule (§2.4).
 constexpr uint32_t kPtNoWord = 0xFFFFFFFFu;
 
-// Physical pages in the pool under --residency paged. 32,768 pages = 512 MiB,
-// which is EXACTLY the dense reservation. This constant is the RESERVED pool,
-// not resident content; conflating the two is how a phase claims a win it did
-// not get (§3.7). The paging win is now entirely a TYPICAL-case win — half the
-// resident set in ordinary play — and explicitly NOT a worst-case one.
+// ---- the retire headroom, and why the pool is not exactly kNumChunks -------
+//
+// A page freed by the hysteresis free probe does not go straight back on the
+// free list: it is PARKED for kPageRetireTicks so any in-flight eviction copy
+// referencing it can complete first (pagetable.h, "THE RETIRE QUEUE"). Freeing
+// is capped at kPageFreeProbesPerTick per tick, and the tick counter strictly
+// increments once per SubmitTick, so the queue holds at most the product.
+//
+// THAT PRODUCT IS WHY A POOL OF EXACTLY kNumChunks ABORTS, which cost two
+// crashes on 2026-08-30 and one wrong "structurally impossible" diagnosis.
+// The reasoning that fails is seductive and worth spelling out: a slot holds
+// at most one page and there are kNumChunks slots, so demand can never exceed
+// kNumChunks, so a pool of kNumChunks can never run dry. Every step is true
+// and the conclusion is false, because pages leave the free list by TWO doors
+// and that argument only counts one. Live slots hold up to kNumChunks, the
+// retire queue holds up to the ceiling below, and the free list is what is
+// left. Exhaustion therefore begins once residency passes
+// kNumChunks - kPageRetireCeiling — 93.75% at the 512 window, which is exactly
+// the "94-100% resident" band every observed abort has landed in.
+//
+// These two live HERE rather than in pagetable.h because kPoolPages is derived
+// from them and world.h cannot include pagetable.h (pagetable.h includes this
+// file). pagetable.h's kMaxFreeProbesPerTick / kRetireTicks alias these, so
+// there is still exactly one definition of each number.
+constexpr uint32_t kPageFreeProbesPerTick = 128;
+constexpr uint32_t kPageRetireTicks = 16;
+constexpr uint32_t kPageRetireCeiling = kPageFreeProbesPerTick * kPageRetireTicks;
+
+// Physical pages in the pool under --residency paged. DERIVED FROM kWorldN,
+// never a literal: one page per chunk slot in the window, plus the retire
+// headroom above.
+//
+// The derivation is what makes exhaustion impossible rather than merely
+// unlikely, and the proof is three lines:
+//
+//   - Alloc() is only ever reached for a SENTINEL slot, so at the moment of a
+//     request at most kNumChunks - 1 slots hold a page.
+//   - The retire queue holds at most kPageRetireCeiling.
+//   - freePages = kPoolPages - resident - retired >= 1. Always.
+//
+// It is not "headroom for an unbounded demand" — it is a pool that exceeds a
+// demand with a hard geometric ceiling. There cannot be a request for page
+// kNumChunks + 1 because there is no chunk slot to hand it to.
+//
+// CHANGE kWorldN AND THIS FOLLOWS, which is the point: the pool tracks the
+// window instead of being re-measured and re-guessed every time the window
+// moves. The static_assert below is the guard rail for that — see it for why
+// kWorldN = 1024 does NOT "just work" on current hardware.
+//
+// This constant is the RESERVED pool, not resident content; conflating the two
+// is how a phase claims a win it did not get (§3.7). The paging win is
+// entirely a TYPICAL-case win — half the resident set in ordinary play — and
+// explicitly NOT a worst-case one.
 //
 // SIZED FROM THE ADVERSARIAL TRAVERSAL, which is the only sizing input that
 // ever held up. The history is worth keeping because each number was honestly
@@ -585,12 +633,22 @@ constexpr uint32_t kPtNoWord = 0xFFFFFFFFu;
 //     genuine residency, not mirror dilation: underground there is no sky to
 //     sentinel away and nearly every slot needs a real page.
 //
-// THE STRUCTURAL CONCLUSION, which is why this is 32,768 and not 28,000: the
-// page table's worst case IS dense, so no pool below dense can make exhaustion
-// impossible, and any value in between only picks how unlucky the player has
-// to be. §3.8 keeps exhaustion fatal — with the pool at dense that abort
-// becomes a genuine assertion (an allocator bug) rather than a routine
-// outcome a fast descent can provoke.
+// THE STRUCTURAL CONCLUSION, which is why this is dense-sized and not 28,000:
+// the page table's worst case IS dense, so no pool below dense can make
+// exhaustion impossible, and any value in between only picks how unlucky the
+// player has to be. §3.8 keeps exhaustion fatal — with the pool at dense PLUS
+// the retire ceiling that abort becomes a genuine assertion (an allocator bug)
+// rather than a routine outcome a fast descent or a world-wide explosion can
+// provoke.
+//
+// A NOTE ON WHAT ACTUALLY FILLS IT, because the two adversarial harnesses do
+// not: --autofly-hard peaks at 17,769 of 32,768 (54.2%) and a full --selftest
+// at 23,631 (72.1%), yet the game aborted twice in ordinary play. Both
+// harnesses stress STREAMING (window shifts). What reaches the 94-100% band is
+// ACTIVITY: Materialize's set is cpuDirty u hasMatter u opTargets u
+// particleChunks u fluidChunks, and smoke/fire/particles rising into open sky
+// convert the PT_EMPTY sky sentinels — normally about half the window, and
+// free — into real pages. Size against a world-wide wake, not against flight.
 //
 // "Synthetic numbers lie", now twice over: measure with the GAME window AND an
 // adversarial path. `--autofly-hard` (main.cpp) is that path — diagonal strafe
@@ -604,7 +662,33 @@ constexpr uint32_t kPtNoWord = 0xFFFFFFFFu;
 // for the 5 cm / extended-radius target, where volume grows 8x and bulk
 // terrain gets MORE internally uniform, not less — sentinel compression
 // improves at finer resolution while sky compression stays flat.
-constexpr uint32_t kPoolPages = 32768;
+constexpr uint32_t kPoolPages = kNumChunks + kPageRetireCeiling;
+
+// THE WINDOW-SIZE GUARD RAIL. `voxels` is ONE storage buffer of kPoolPages
+// pages, and Vulkan's maxStorageBufferRange is a uint32_t — so 4 GiB - 1 is
+// not this machine's limit, it is the SPEC's absolute ceiling, and no driver
+// can offer more for a single binding. (Measured on the 3060 Ti: exactly
+// 4294967295. --vk-info prints it.)
+//
+// This is what stands between "change kWorldN and it just works" and a runtime
+// failure that would surface as a buffer-creation error or, worse, as silent
+// out-of-range addressing. Concretely, at the next power of two up:
+//
+//   kWorldN = 1024 -> kNumChunks = 262,144 -> kPoolPages = 264,192
+//                  -> voxels = 4,328,521,728 B = 4.03 GiB. DOES NOT FIT.
+//
+// So 1024 is not a one-constant change: the voxel buffer has to be SPLIT
+// across bindings (or the pool decoupled from dense) before the window can
+// double again. Note this bites at 1024 even ignoring VRAM — 4.03 GiB of pool
+// plus 1.0 GiB of farVox is 5 GiB on an 8 GiB card before render targets, so
+// the descriptor limit and the memory budget arrive at roughly the same place.
+//
+// A compile error here is the correct outcome: it names the real blocker at
+// the moment the constant changes, instead of after a build and a crash.
+static_assert((uint64_t)kPoolPages * kChunkVol * 4ull <= 0xFFFFFFFFull,
+              "voxels buffer exceeds the 4 GiB storage-binding ceiling: "
+              "kWorldN is too large for a single binding. Split the pool "
+              "across buffers, or reduce kWorldN.");
 
 // The word a sentinel chunk's cells read as. THIS IS THE HASH CONTRACT (§4.1):
 // it must be bit-identical to what a materialized page would hold, which is
