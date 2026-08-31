@@ -2610,12 +2610,46 @@ Status GateAiApproach(Ctx& c, std::string& detail) {
     }
     tick({}, wall);
   }
-  // The CPU mirror trails the GPU: the planner reads World::Cached, and a wall
-  // the mirror has not seen yet is a wall the navigator will walk into. Tick
-  // until the chunks come back, then ASSERT the mirror actually has it — a
-  // nav failure and a stale mirror are different bugs and this is the line
-  // that tells them apart.
-  for (int i = 0; i < 40; i++) tick();
+  // ---- get the wall into the mirror the NAVIGATOR reads --------------------
+  //
+  // Two different CPU mirrors exist and they are not interchangeable.
+  // `World::KindAt` reads the 3x3x3 SNAPSHOT; the ground probe, and therefore
+  // every question this planner asks, reads the CHUNK CACHE (`World::Cached`).
+  // The cache is only refreshed when a chunk is fetched — and a chunk another
+  // gate already pulled in stays at that version forever unless something asks
+  // again. So this gate PASSED standalone and FAILED in the suite: an earlier
+  // gate had cached these chunks before the wall existed, the navigator saw
+  // open ground, never planned a detour, and the mob strolled through a wall
+  // its own drive probe could not see either.
+  //
+  // Fetch explicitly, and then assert against the CACHE rather than against
+  // KindAt — record at the point the failure would actually happen.
+  auto cachedSolid = [&](IVec3 cell) {
+    const CachedChunk* cc = c.world.Cached({cell.x >> 4, cell.y >> 4, cell.z >> 4});
+    if (cc == nullptr || cc->voxels.size() != kChunkVol) return false;
+    const uint32_t m =
+        cc->voxels[(((uint32_t)cell.z & 15u) * kChunk + ((uint32_t)cell.y & 15u)) *
+                       kChunk +
+                   ((uint32_t)cell.x & 15u)] &
+        0xFFFu;
+    return m != 0;
+  };
+  {
+    const int wz = spot.z + gapVox / 2;
+    for (int i = 0; i < 60; i++) {
+      bool all = true;
+      for (int wx = spot.x - kWallHalfX; wx <= spot.x + kWallHalfX; wx += 4) {
+        const int wh = World::TerrainHeight(wx, wz, kDefaultSeed);
+        const IVec3 cell{wx, wh + 2, wz};
+        if (cachedSolid(cell)) continue;
+        all = false;
+        c.world.RequestChunkFetch({cell.x >> 4, cell.y >> 4, cell.z >> 4});
+        c.world.RequestChunkFetch({cell.x >> 4, cell.y >> 4, (cell.z + 1) >> 4});
+      }
+      if (all) break;
+      tick();
+    }
+  }
 
   // Spawn so the mob's CENTRE lands on the flat spot: Spawn takes the prefab's
   // min corner, and a humanoid's box is wide enough that ignoring that puts the
@@ -2638,20 +2672,17 @@ Status GateAiApproach(Ctx& c, std::string& detail) {
                         17.0f, true);
   for (int i = 0; i < 20; i++) tick();   // anchors fetch the chunks around the mob
 
-  // Does the mirror have the wall, and is it CONTINUOUS? Probed at every column
-  // the fence covers, not only at the sphere centres — the version that sampled
-  // centres reported a complete wall the mob then walked through. Sampled at
-  // the ground+2 the mob's own step-up limit cares about, through the same
-  // collision classes the navigator uses.
+  // Does the CHUNK CACHE have the wall, and is it CONTINUOUS? Every column, at
+  // the ground+2 the step-up limit cares about, read out of the same mirror the
+  // ground probe reads. Not KindAt: see the note above — the snapshot reported
+  // a complete wall the navigator could not see at all.
   int wallSeen = 0, wallCols = 0;
   {
-    const std::vector<uint32_t> classOf = BuildCollisionClasses(c.mats);
     const int wz = spot.z + gapVox / 2;
     for (int wx = spot.x - kWallHalfX; wx <= spot.x + kWallHalfX; wx++) {
       const int wh = World::TerrainHeight(wx, wz, kDefaultSeed);
       wallCols++;
-      if (c.world.KindAt(IVec3{wx, wh + 2, wz}, classOf) == CellKind::Solid)
-        wallSeen++;
+      if (cachedSolid(IVec3{wx, wh + 2, wz})) wallSeen++;
     }
   }
 
