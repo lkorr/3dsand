@@ -2258,8 +2258,8 @@ code: it calls `CarveLimbRadial` for flesh and `MeltBodyAt` for debris, the
 same two calls the laser splits between, and dismemberment stays geometric
 (a limb comes off when the cuts disconnect it, not when a counter hits zero).
 
-**The mouse is the swing.** Holding the attack button guards; the accumulated
-mouse velocity steers the guard and, past a threshold, commits a cut along the
+**The mouse is the swing.** Holding the attack button hands the weapon arm to
+the mouse, and past a speed threshold the blade commits a cut along the
 direction actually moved — a diagonal flick is a diagonal cut. Damage scales
 with the blade's measured tip speed, so the player's own motion is the damage
 roll: no cooldowns, no swing timer, no randomness, and being slow is punished
@@ -2267,6 +2267,33 @@ by being ineffective rather than by being locked out. The HUD prints the phase
 and the measured mouse speed, because an input this analogue has to be
 *falsifiable* — the player needs to tell "the game misread my flick" from "I
 misjudged the distance".
+
+**The mouse is a HAND, not a pointer** (rewritten 2026-08-30). What the button
+buys is *incremental control of where the arm is*: the hand keeps the pose the
+animation had it in, and from then on each mouse pixel is a fixed distance of
+hand travel, **integrated** — so the blade stays where it is put, a slow drag
+reaches as far as a fast one, and the only bound is the arm's own reach (read
+off the rig's bone lengths, not a constant). Two things follow that are worth
+stating because the first version had neither:
+
+- **Taking over an arm starts where the arm is.** `Mob::WeaponArmPose` is the
+  exact inverse of `SetWeaponPose`'s offset, so the driver reads the live hand
+  and hands the same value straight back: the first driven tick asks for the
+  pose the arm is already in, weight can go to 1, and nothing moves. The
+  original mapped mouse *velocity* to a lean off a fixed guard pose, so
+  clicking teleported the arm to that pose — reported, accurately, as "the
+  moment I click the arm shoots to the top right".
+- **A velocity map has no memory.** With the hand position a function of how
+  fast the mouse was moving *this instant*, the blade could not be aimed and
+  parked, any real flick saturated the clamp, and letting go of the mouse
+  dropped the arm back to guard. The cut arc is now an offset *added* to the
+  steered position and unwound over the recover, so a cut ends where the mouse
+  ended rather than springing back.
+
+`--gate swing` covers the mapping (CPU-only, milliseconds, its own fixtures);
+`arm-readback` inside `--gate mob` covers the inverse against a target the test
+chose, since a dropped yaw or a flipped x is invisible on a rig standing at
+heading 0 and mirrors the answer.
 
 **The arm swings; the blade does not steer.** The weapon keeps the grip angle
 its rig gives it, orthogonal to the forearm, and only the arm's IK chain is

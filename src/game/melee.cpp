@@ -467,6 +467,35 @@ void MeleeState::AddMouse(float dx, float dy) {
   mouseAccum_.y += dy;
 }
 
+void MeleeState::SetArm(const Vec3& handFromShoulder, float reach) {
+  armHand_ = handFromShoulder;
+  armReach_ = reach;
+  armValid_ = reach > 1e-3f;
+}
+
+void MeleeState::ClearArm() {
+  armValid_ = false;
+  armReach_ = 0;
+}
+
+float MeleeState::PoseWeight() const {
+  switch (phase_) {
+    case SwingPhase::Idle:
+      return 0.0f;
+    case SwingPhase::Recover: {
+      // Only the RELEASING recover fades: a recover between two cuts (the
+      // button is still down) is still the player's arm and handing it back
+      // mid-combination would drop the blade to the walk pose for a fifth of a
+      // second. `recoverHold_` is what the phase was entered for.
+      if (recoverHold_) return 1.0f;
+      float t = tuning.recoverTime > 1e-4f ? phaseTime_ / tuning.recoverTime : 1.0f;
+      return std::clamp(1.0f - t, 0.0f, 1.0f);
+    }
+    default:
+      return 1.0f;
+  }
+}
+
 void MeleeState::Reset() {
   phase_ = SwingPhase::Idle;
   phaseTime_ = 0;
@@ -474,7 +503,9 @@ void MeleeState::Reset() {
   mouseVel_ = Vec3{};
   mouseSpeed_ = 0;
   cutDir_ = Vec3{};
-  lean_ = Vec3{};
+  handCam_ = Vec3{};
+  swing_ = Vec3{};
+  recoverHold_ = false;
 }
 
 void MeleeState::Update(float dt, bool held, bool armed, const Vec3& right,
@@ -486,6 +517,7 @@ void MeleeState::Update(float dt, bool held, bool armed, const Vec3& right,
   // smooth. Draining it here (rather than in AddMouse) is what makes the
   // per-frame/per-tick split in melee.h work: several ticks may run per frame,
   // and only the first sees new motion.
+  const Vec3 pixels = mouseAccum_;   // THIS tick's raw travel, in pixels
   Vec3 instant{mouseAccum_.x / dt, mouseAccum_.y / dt, 0};
   mouseAccum_ = Vec3{};
   mouseVel_ = Lerp(mouseVel_, instant, SmoothAlpha(tuning.dirSmoothing, dt));
@@ -496,15 +528,24 @@ void MeleeState::Update(float dt, bool held, bool armed, const Vec3& right,
   // wrong produces a weapon that mirrors the player's hand, which reads as
   // broken long before anyone works out why.
   //
-  // The per-axis gains (melee.h) are applied HERE, to the pose input only —
-  // `mouseSpeed_` above stays the true pixel speed the commit test needs. The
-  // gained magnitude is kept in `poseSpeed` rather than being thrown away by
-  // the normalize, because a gain that only rotated the direction would change
-  // which way the blade goes without changing how far it gets.
-  Vec3 gained =
-      right * (mouseVel_.x * tuning.xGain) + up * (-mouseVel_.y * tuning.yGain);
-  float poseSpeed = gained.len();
-  Vec3 screenDir = poseSpeed > 1e-4f ? gained.normalized() : Vec3{};
+  // THE SAME MAPPING THE HAND MOVES BY, gains included, so the cut direction is
+  // by construction the direction the hand is already travelling. (It used to
+  // be a separate pair of gains with a mirrored X, from when the mouse aimed
+  // the blade instead of carrying the hand — see melee.h.) Built from the
+  // smoothed VELOCITY rather than this tick's pixels because one tick of raw
+  // delta is far too noisy to steer a cut with.
+  Vec3 gained = right * (mouseVel_.x * tuning.moveGainX) +
+                up * (-mouseVel_.y * tuning.moveGainY);
+  Vec3 screenDir = gained.len() > 1e-6f ? gained.normalized() : Vec3{};
+
+  // ---- the hand's own travel this tick --------------------------------------
+  // A DISPLACEMENT, not a target. `pixels` is what the mouse physically moved
+  // since the last tick (AddMouse accumulates per FRAME and this drains it), so
+  // integrating it is exactly "the hand went as far as the mouse went" — and it
+  // is immune to the frame/tick ratio: a frame with no tick leaves its pixels
+  // in the accumulator for the next one rather than losing or doubling them.
+  const Vec3 travel = right * (pixels.x * tuning.moveGainX) +
+                      up * (-pixels.y * tuning.moveGainY);
 
   if (!armed) {
     // Unarmed: collapse to idle and forget any half-built swing, so picking a
@@ -514,37 +555,40 @@ void MeleeState::Update(float dt, bool held, bool armed, const Vec3& right,
 
   phaseTime_ += dt;
 
+  // The seed of last resort: only reached when the rig cannot say where its own
+  // hand is (SetArm never called, or the arm is gone). Never a pose the live
+  // hand is pulled toward.
+  const Vec3 guard = fwd * tuning.guardForward + up * tuning.guardUp +
+                     right * tuning.guardSide;
+
   switch (phase_) {
     case SwingPhase::Idle:
       if (armed && held) {
+        // TAKE OVER FROM WHERE THE SWORD IS. The arm keeps the pose the walk
+        // cycle left it in, expressed in the camera frame so the mouse can
+        // push it from there. Because the seed round-trips through the same
+        // shoulder-relative convention the IK target uses (see
+        // Mob::WeaponArmPose), the first driven tick asks the solver for the
+        // pose it is ALREADY in — weight can go straight to 1 with nothing
+        // visible happening, which is the whole point.
+        const Vec3 seed = armValid_ ? armHand_ : guard;
+        handCam_ = Vec3{seed.dot(right), seed.dot(up), seed.dot(fwd)};
+        swing_ = Vec3{};
         phase_ = SwingPhase::Guard;
         phaseTime_ = 0;
-        lean_ = Vec3{};
       }
       break;
 
     case SwingPhase::Guard:
     case SwingPhase::Wind: {
       if (!held) {
-        // Released without committing: drop the guard.
+        // Released: unwind whatever follow-through is left and hand the arm
+        // back (PoseWeight fades over this phase).
+        recoverHold_ = false;
         phase_ = SwingPhase::Recover;
         phaseTime_ = 0;
         break;
       }
-      // Track the mouse. The lean is what makes the blade feel connected to
-      // the hand while merely aiming — it is the same input that will become
-      // the cut, shown before it fires, so committing never feels arbitrary.
-      // `poseSpeed`, not `mouseSpeed_`: the gains have to reach the hand, or
-      // the blade would merely point further without going further.
-      Vec3 want = screenDir * (poseSpeed * tuning.trackGain);
-      // Raised alongside the gains. At the old 2.4 the clamp bound long before
-      // a 5x vertical push did anything, so the extra sensitivity would have
-      // been invisible above roughly a fifth of the previous mouse travel —
-      // the exact complaint (having to look all the way up to raise the blade).
-      const float kMaxLean = 7.0f;
-      if (want.len() > kMaxLean) want = want.normalized() * kMaxLean;
-      lean_ = Lerp(lean_, want, SmoothAlpha(0.05f, dt));
-
       phase_ = mouseSpeed_ > tuning.commitSpeed * 0.35f ? SwingPhase::Wind
                                                         : SwingPhase::Guard;
       // COMMIT. The direction is frozen here and not touched again until the
@@ -552,8 +596,8 @@ void MeleeState::Update(float dt, bool held, bool armed, const Vec3& right,
       // like dragging the blade through treacle, and it also makes the sweep
       // curve, which the damage code would then have to chord.
       // screenDir is unit-or-zero, so this is the "there is a direction at
-      // all" guard; commitSpeed is still measured on TRUE mouse speed, which
-      // is what keeps the raised gains from turning a twitch into a cut.
+      // all" guard; commitSpeed is measured on TRUE mouse speed in pixels, so
+      // it means the same thing at every value of the move gains.
       if (mouseSpeed_ > tuning.commitSpeed && screenDir.len() > 0.5f) {
         cutDir_ = screenDir;
         phase_ = SwingPhase::Slash;
@@ -564,6 +608,7 @@ void MeleeState::Update(float dt, bool held, bool armed, const Vec3& right,
 
     case SwingPhase::Slash:
       if (phaseTime_ >= tuning.slashTime) {
+        recoverHold_ = armed && held;
         phase_ = SwingPhase::Recover;
         phaseTime_ = 0;
       }
@@ -573,73 +618,80 @@ void MeleeState::Update(float dt, bool held, bool armed, const Vec3& right,
       if (phaseTime_ >= tuning.recoverTime) {
         phase_ = (armed && held) ? SwingPhase::Guard : SwingPhase::Idle;
         phaseTime_ = 0;
-        lean_ = Vec3{};
+        swing_ = Vec3{};
       }
       break;
   }
 
-  // ---- pose ----------------------------------------------------------------
-  // The guard: blade up and slightly forward, on the weapon side.
-  const Vec3 guard = fwd * tuning.guardForward + up * tuning.guardUp +
-                     right * tuning.guardSide;
+  // ---- the hand ------------------------------------------------------------
+  // ONE control law for every live phase: the mouse moves the hand, and the
+  // hand stays where it was moved to. Nothing here reads a pose to return to,
+  // which is what makes the blade aimable — you can put it high on the right
+  // and leave it there, and the next push starts from there.
+  //
+  // Integration continues THROUGH the slash on purpose: the mouse is still
+  // moving during those 170 ms and the arc below is added on top, so a cut is
+  // the player's own travel plus a follow-through rather than a canned stroke
+  // that ignores the second half of the flick.
+  if (phase_ != SwingPhase::Idle) {
+    handCam_ += Vec3{travel.dot(right), travel.dot(up), travel.dot(fwd)};
+    // Clamp to what the arm can actually reach. The stored value is clamped —
+    // not just the target handed to the IK — so pushing into the limit does not
+    // bank travel that has to be wound back before the arm moves again.
+    const float reach =
+        (armValid_ ? armReach_ : tuning.fallbackReach) * tuning.reachFraction;
+    const float d = handCam_.len();
+    if (reach > 1e-3f && d > reach) handCam_ = handCam_ * (reach / d);
+  }
 
   switch (phase_) {
     case SwingPhase::Idle:
       // Let the arm hang; the walk cycle owns the pose. Decaying rather than
-      // snapping means sheathing mid-guard does not pop.
+      // snapping means a stale offset never re-enters as a jump.
       hand_ = Lerp(hand_, Vec3{}, SmoothAlpha(0.12f, dt));
-      bladeDir_ = up;
-      bladeUp_ = fwd;
-      break;
-
-    case SwingPhase::Guard:
-    case SwingPhase::Wind:
-      // The lean IS the tell: the whole hand shifts the way the mouse is
-      // moving, so the player can see which way the weapon is loaded without
-      // the blade twisting in the grip.
-      hand_ = Lerp(hand_, guard + lean_, SmoothAlpha(0.05f, dt));
-      bladeDir_ = up;
-      bladeUp_ = fwd;
       break;
 
     case SwingPhase::Slash: {
-      // The cut: the HAND travels from the far side of the cut direction,
-      // through the guard, out to the near side — so the weapon passes ACROSS
-      // the player's front rather than poking outward. `t` is eased so the
-      // middle of the stroke is the fast part, which is both how a real cut
-      // works and what makes the speed-scaled damage land at the middle of the
-      // arc where the player aimed.
+      // The cut, as an offset ADDED to the hand the player is steering: the
+      // blade travels from the near side of the cut direction, through where
+      // the hand is, out to the far side, so the weapon passes ACROSS the
+      // player's front rather than poking outward. `t` is eased so the middle
+      // of the stroke is the fast part, which is both how a real cut works and
+      // what makes the speed-scaled damage land at the middle of the arc where
+      // the player aimed.
       //
-      // The arc BOWS OUTWARD (the fwd term below) instead of being a straight
-      // slide: an arm swings about a shoulder, so the hand is furthest from
-      // the body at mid-stroke. That bulge is also what carries the blade
-      // through a target rather than past it.
+      // The arc BOWS OUTWARD (the fwd term) instead of being a straight slide:
+      // an arm swings about a shoulder, so the hand is furthest from the body
+      // at mid-stroke. That bulge is also what carries the blade through a
+      // target rather than past it.
       float t = std::clamp(phaseTime_ / std::max(tuning.slashTime, 1e-4f), 0.0f,
                            1.0f);
       float e = t * t * (3.0f - 2.0f * t);           // smoothstep
       float bow = 4.0f * e * (1.0f - e);             // 0 at the ends, 1 mid
-      Vec3 start = guard - cutDir_ * (tuning.swingReach * 0.5f);
-      hand_ = start + cutDir_ * (tuning.swingReach * e) +
-              fwd * (bow * tuning.swingReach * 0.28f);
-      // The blade is NOT re-aimed: it keeps the angle the fist holds it at,
-      // and the arm is what moves (see PlayerAvatar::SetWeaponPose). These are
-      // reported for the HUD only.
-      bladeDir_ = up;
-      bladeUp_ = fwd;
+      swing_ = cutDir_ * (tuning.swingReach * (e - 0.5f)) +
+               fwd * (bow * tuning.swingReach * 0.28f);
       break;
     }
 
-    case SwingPhase::Recover: {
-      float t = std::clamp(phaseTime_ / std::max(tuning.recoverTime, 1e-4f),
-                           0.0f, 1.0f);
-      Vec3 target = (armed && held) ? guard : Vec3{};
-      hand_ = Lerp(hand_, target, SmoothAlpha(0.07f, dt));
-      bladeDir_ = up;
-      bladeUp_ = fwd;
-      (void)t;
+    case SwingPhase::Recover:
+      // Unwind only the follow-through. The steered position is untouched, so a
+      // cut ENDS where the mouse ended — the arm does not spring back to a
+      // guard the player never asked for.
+      swing_ = Lerp(swing_, Vec3{}, SmoothAlpha(0.07f, dt));
       break;
-    }
+
+    default:
+      break;
   }
+
+  if (phase_ != SwingPhase::Idle) {
+    hand_ = right * handCam_.x + up * handCam_.y + fwd * handCam_.z + swing_;
+  }
+  // The blade is NOT re-aimed: it keeps the angle the fist holds it at, and the
+  // arm is what moves (see Mob::SetWeaponPose). These two are reported for the
+  // HUD only.
+  bladeDir_ = up;
+  bladeUp_ = fwd;
 
   if (bladeDir_.len() < 1e-4f) bladeDir_ = up;
   if (bladeUp_.len() < 1e-4f) bladeUp_ = fwd;

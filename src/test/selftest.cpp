@@ -42,6 +42,7 @@ const std::vector<Gate>& WorldIoGates();
 const std::vector<Gate>& VoxRegionGates();
 const std::vector<Gate>& SpellGates();
 const std::vector<Gate>& PlayerKitGates();
+const std::vector<Gate>& SwingGates();
 const std::vector<Gate>& EquipmentGates();
 
 // THE EXECUTION ORDER, and it is load-bearing.
@@ -82,6 +83,12 @@ const char* const kOrder[] = {
     // with the other cheap front-loaded checks rather than after them.
     "scale",
     "player-kit",
+    // And with them, for the same reason: `swing` is MeleeState alone — no
+    // world, no GPU, no assets, its own fixtures — so it costs milliseconds
+    // and disturbs nothing. It asserts the swing's INPUT MAPPING, which is the
+    // one part of melee no other gate can see (`mob`'s melee subtests drive
+    // SetWeaponPose directly and never touch the mouse).
+    "swing",
     // SECOND, and for the same reason: `tree-atlas` reads assets/trees/*.svtree
     // off disk and asserts on the bytes. No world, no GPU, no state left
     // behind -- and when the atlas is wrong every gate after it is measuring a
@@ -150,7 +157,8 @@ const std::vector<Gate>& Registry() {
                           &PlayerGates(),
                           &MobGates(), &BodyGates(), &WorldIoGates(), &AudioGates(),
                           &VoxRegionGates(),
-                          &SpellGates(), &PlayerKitGates(), &EquipmentGates()})
+                          &SpellGates(), &PlayerKitGates(), &SwingGates(),
+                          &EquipmentGates()})
       pool.insert(pool.end(), g->begin(), g->end());
 
     std::vector<Gate> v;

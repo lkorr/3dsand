@@ -170,9 +170,9 @@ class PlayerAvatar : public Mob {
   const std::vector<Footfall>& Footfalls() const { return footfalls_; }
   void ClearFootfalls() { footfalls_.clear(); }
 
-  // (EquipItem / HeldItem / HeldSlot / WeaponEdge / OwnsBody / SetWeaponPose
-  // are inherited from Mob — item holding is base-class scaffolding now, so a
-  // mob can wield a sword through the identical path.)
+  // (EquipItem / HeldItem / HeldSlot / WeaponEdge / WeaponArmPose / OwnsBody /
+  // SetWeaponPose are inherited from Mob — item holding is base-class
+  // scaffolding now, so a mob can wield a sword through the identical path.)
 
   // ---- damage / dismemberment ----
   // Damage(bodyHandle, ...) and Sever(limbIndex) are inherited from Mob:

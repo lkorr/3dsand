@@ -735,6 +735,14 @@ class Mob {
   // Swing pose, pushed in by the driver. Presentation only; consumed by the
   // driver's own animation pass.
   void SetWeaponPose(Vec3 handOffset, Vec3 bladeDir, Vec3 bladeUp, float weight);
+  // The INVERSE of SetWeaponPose's hand offset: where the weapon arm's hand is
+  // RIGHT NOW, shoulder-relative, in the same frame that call speaks, plus the
+  // arm's own reach (its two bone lengths). False when there is no weapon arm
+  // to read — no item held, no "arm" chain ending at that hand, or the pose has
+  // not been flattened yet. The point of it is that a driver can take control
+  // of the arm from wherever the animation had it instead of snapping it to a
+  // pose of its own (game/melee.h).
+  bool WeaponArmPose(Vec3& outHandFromShoulder, float& outReach) const;
 
   // ---- render plumbing (per creature; MobSystem chains these over its list) -
   // The Append* walks MUST visit slots in the same order: the slot a transform

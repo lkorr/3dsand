@@ -8239,8 +8239,9 @@ const ARCH_NODES={
 
   melee:{label:'Melee',tag:'cpu',
     desc:'Mouse-directed swinging: Guard -> Wind -> Slash -> Recover. The pose IS the hitbox — damage sweeps the blade’s edge segment from last tick’s position to this tick’s, so speed is damage.',
-    files:['src/game/melee.h','src/game/melee.cpp'],
-    sym:['MeleeState::Update','SwingPhase','EdgeSweep','MeleeTuning']},
+    details:'<b>The mouse is a HAND, not a pointer.</b> Holding the attack button takes over the weapon arm FROM ITS CURRENT POSE (<code>Mob::WeaponArmPose</code> is the exact inverse of <code>SetWeaponPose</code>’s offset, so the first driven tick asks for the pose the arm is already in and nothing moves). From there every mouse pixel is a fixed distance of hand travel, INTEGRATED: the blade stays where you put it, a slow drag reaches as far as a fast one, and the only bound is the arm’s own reach read off the rig’s bone lengths.<br><br>Until 2026-08-30 this was a VELOCITY map onto a lean off a fixed guard pose, which failed twice: clicking teleported the arm to the guard, and the hand position was a function of the instantaneous mouse speed, so the blade could not be aimed and parked and any real flick saturated its clamp. The cut arc is now an offset ADDED to the steered position and unwound over the recover, so a cut ends where the mouse ended.<br><br>Covered by <code>--gate swing</code> (CPU-only, milliseconds, own fixtures — the mapping) and by <code>arm-readback</code> in <code>--gate mob</code> (the inverse, against a target the test chose: a dropped yaw or a flipped x is invisible at heading 0).',
+    files:['src/game/melee.h','src/game/melee.cpp','src/test/selftest_swing.cpp'],
+    sym:['MeleeState::Update','MeleeState::SetArm','Mob::WeaponArmPose','SwingPhase','EdgeSweep','MeleeTuning']},
 
   itemSys:{label:'Items',tag:'cpu',
     desc:'The runtime side of items: a standalone .vox per item, a borrowed rig slot to wear it in, the grip transform, and the edge segment melee sweeps. Items are also droppable and pickable — a thing on the ground is an ordinary debris body plus a name.',
@@ -8391,7 +8392,7 @@ const ARCH_NODES={
     doc:['tests/BASELINE.md','tests/SMOKE_PROBES.md','CLAUDE.md'],
     rule:1,
     details:'<b>Verification is a BUDGET, not a reflex.</b> Before every run, answer "what claim does this establish that is not already established?" — a tree that did not change does not need re-testing, and running a gate AND the suite that contains it is pure waste. Full acceptance is an END-OF-WORK event, run once with <code>--suite acceptance</code>.<br><br><code>tests/baseline.json</code> records the pinned determinism hash, gate pass/fail status, AND the smoke probe tables (smokeQuiet/smokeLoud), so a rebaseline is a data edit, not a C++ rebuild. <code>--rebaseline</code> refuses if validation messages or page faults are present — you cannot rebaseline away a real regression.<br><br>Every run auto-dumps <code>build/last_run.json</code>; never re-run to re-read data.<br><br>WGSL-only edits need NO C++ rebuild — <code>LoadShader()</code> reads from disk at runtime and the SPIR-V cache keys on content hash.<br><br><b>Note:</b> <code>MobGates()</code> currently returns an EMPTY vector — <code>selftest_mob.cpp</code> builds a large gate body that is not registered, so no mob gate runs.',
-    children:['testTerrain','testSim','testRender','testPhys','testPlayer','testSpell','testWorldIO','testMob','checkers']},
+    children:['testTerrain','testSim','testRender','testPhys','testPlayer','testSpell','testWorldIO','testMob','testSwing','checkers']},
 
   voxelScale:{label:'Voxel Scale (metres)',tag:'inv',
     desc:'kVoxelMeters is a free parameter: halving it makes the world finer, not smaller. Everything authored declares the scale it was drawn at, so a 1.7 m player stays 1.7 m and a 7.5 m oak stays 7.5 m at 10 cm, 5 cm or 2.5 cm voxels.',
@@ -8451,11 +8452,17 @@ const ARCH_NODES={
     files:['src/test/selftest_worldio.cpp'],
     tst:['save-load','save-entities','region-store','streaming']},
 
-  testMob:{label:'Mob Gates (unregistered)',tag:'inv',
-    wip:'MobGates() returns empty — the gate body exists but is not registered, so no mob gate runs',
-    desc:'A large gait / dismemberment / melee gate body exists in selftest_mob.cpp, but MobGates() returns an empty vector — none of it runs. Treat mob behaviour as UNCOVERED by the suite.',
+  testMob:{label:'Mob Gates',tag:'inv',
+    desc:'Gait, dismemberment and melee: stand/walk/sever/death/settle, plus the weapon arm — arm-limits (a hostile target fan against the rig’s own authored shoulder ball and elbow hinge) and arm-readback (SetWeaponPose’s inverse actually inverts, which is what lets the swing take over an arm without moving it).',
     files:['src/test/selftest_mob.cpp'],
+    tst:['mob','mob-burn'],
     sym:['MobGates']},
+
+  testSwing:{label:'Swing Gate',tag:'inv',
+    desc:'The mouse-directed swing’s CONTROL LAW, CPU-only and asset-free (its own MeleeState fixtures, no world, no GPU, milliseconds): take-over is not a teleport, the mouse is a displacement rather than a rate, the blade stays where it was put, and the reach clamp banks no travel.',
+    files:['src/test/selftest_swing.cpp'],
+    tst:['swing'],
+    sym:['SwingGates']},
 
   checkers:{label:'Static Checkers',tag:'inv',
     desc:'The cheap checks that catch "two places must agree" bugs without a build or a GPU.',

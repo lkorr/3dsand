@@ -2456,6 +2456,55 @@ bool mobOk = false;
                   worstElbowHi, hingeLo, hingeHi, hingeEnforced ? 1 : 0,
                   worstOffHinge);
               mobOk = mobOk && armLimited;
+
+              // ---- arm-readback: SetWeaponPose's inverse actually inverts --
+              //
+              // Mob::WeaponArmPose reports where the weapon hand IS in the
+              // frame SetWeaponPose SPEAKS, and the mouse-directed swing uses
+              // it to take control of the arm without moving it (game/melee.h).
+              // The conversion has two chances to be silently wrong — the yaw,
+              // and the x negation the mirrored authoring needs — and BOTH are
+              // invisible on a rig standing at heading 0 facing the camera,
+              // which is exactly the case anybody would eyeball.
+              //
+              // So this asserts against a target the test chose, not against
+              // the value under test: drive the hand to a known legal offset,
+              // let it settle, and require the readback to agree. A dropped
+              // yaw or a flipped x mirrors the answer and this fails by
+              // roughly twice the offset.
+              if (armLen > 1e-3f) {
+                // Comfortably legal and comfortably reachable: forward, out to
+                // the weapon side and a little down, at 0.6 of the arm. Nothing
+                // here should be on a pose stop, or the settle below would
+                // converge somewhere other than the target for a legitimate
+                // reason and the comparison would mean nothing.
+                const Vec3 want =
+                    Vec3{0.35f, -0.45f, 0.60f}.normalized() * (armLen * 0.6f);
+                avatar.SetWeaponPose(want, Vec3{0, 0, 1}, Vec3{0, 1, 0}, 1.0f);
+                for (int i = 0; i < 12; i++) avTick();
+                Vec3 got{};
+                float gotReach = 0;
+                const bool read = avatar.WeaponArmPose(got, gotReach);
+                // Generous, and it has to be: the pose limits and one tick of
+                // lag both move the hand a little off an unconstrained solve.
+                // A sign error is a WHOLE-ARM error, so this catches those with
+                // room to spare while never asserting the IK is exact.
+                const float err = (got - want).len();
+                const float tol = std::max(0.35f * armLen, 0.5f);
+                const bool reachOk =
+                    std::fabs(gotReach - armLen) < 0.05f * armLen;
+                const bool roundTrip = read && err < tol && reachOk;
+                std::printf(
+                    "arm-readback: %s (asked (%.2f,%.2f,%.2f), read "
+                    "(%.2f,%.2f,%.2f), err %.2f vox vs tol %.2f; reach %.2f vs "
+                    "the rig's own %.2f)\n",
+                    roundTrip ? "PASS" : "FAIL", want.x, want.y, want.z, got.x,
+                    got.y, got.z, err, tol, gotReach, armLen);
+                mobOk = mobOk && roundTrip;
+                avatar.SetWeaponPose(Vec3{}, Vec3{0, 0, 1}, Vec3{0, 1, 0},
+                                     0.0f);
+                for (int i = 0; i < 4; i++) avTick();
+              }
             }
           }
         }

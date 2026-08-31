@@ -6263,6 +6263,49 @@ void Mob::SetWeaponPose(Vec3 handOffset, Vec3 bladeDir, Vec3 bladeUp,
   weaponWeight_ = weight < 0 ? 0 : (weight > 1 ? 1 : weight);
 }
 
+bool Mob::WeaponArmPose(Vec3& outHandFromShoulder, float& outReach) const {
+  // WHERE THE WEAPON ARM IS, in the frame SetWeaponPose SPEAKS — that is the
+  // only thing that makes this useful. The driver (melee.h) hands in a
+  // shoulder-relative offset in camera/world space and the animation pass turns
+  // it into an IK target by un-yawing it and negating x (the rigs are authored
+  // mirrored; see the long note at the weapon-arm solve in avatar.cpp). This
+  // runs that conversion BACKWARDS, so a caller can read the hand, hand the
+  // same value straight back through SetWeaponPose, and get the pose it already
+  // had. Taking control of an arm without moving it is exactly that round trip.
+  if (heldPartIndex_ < 0 || heldPartIndex_ >= (int)skel_.parts.size())
+    return false;
+  const int handPart = skel_.parts[heldPartIndex_].parent;
+  if (handPart < 0 || handPart >= (int)skel_.parts.size()) return false;
+  if ((size_t)handPart >= anim_.model.size()) return false;
+  for (const IkChain& ch : skel_.chains) {
+    if (ch.tag != "arm" || ch.effector != handPart) continue;
+    if (ch.parts.size() < 2) continue;
+    const int i0 = ch.parts[0], i1 = ch.parts[1];
+    if (i0 < 0 || i1 < 0 || (size_t)i0 >= anim_.model.size() ||
+        (size_t)i1 >= anim_.model.size())
+      continue;
+    // Prefab-absolute, measured from the chain root's anchor — the same pair
+    // the solve's target is built from (`shoulder + handRig`), so handRig is
+    // recovered exactly rather than approximately.
+    Vec3 handRig = anim_.model[handPart].pos - skel_.parts[i0].anchorLocal;
+    handRig.x = -handRig.x;                       // the mirrored-authoring flip
+    outHandFromShoulder = Rotate(AxisAngle({0, 1, 0}, heading_), handRig);
+    // Reach from the LIVE bone lengths rather than a constant: it follows the
+    // rig, and it follows kVoxelMeters, and it is the same L1+L2 the solver
+    // clamps its own annulus against — including the effector-is-the-lower-bone
+    // case, which AnimSolveTwoBone extends by the bone's rest length.
+    const Vec3 root = anim_.model[i0].pos;
+    const Vec3 joint = anim_.model[i1].pos;
+    const Vec3 tip =
+        (handPart == i1)
+            ? joint + QuatRotate(anim_.model[i1].rot, skel_.parts[i1].rest.pos)
+            : anim_.model[handPart].pos;
+    outReach = (joint - root).len() + (tip - joint).len();
+    return outReach > 1e-3f;
+  }
+  return false;
+}
+
 bool Mob::WeaponEdge(Vec3& outBase, Vec3& outTip, float& outHalfWidth) const {
   if (!def_ || heldPartIndex_ < 0) return false;
   if (heldPartIndex_ >= (int)limbDefs_.size()) return false;

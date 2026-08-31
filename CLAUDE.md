@@ -24,15 +24,10 @@ Same seed+tick+inputs → same world hash everywhere. Integer-only sim math (no 
 
 **THE INVARIANT IS DETERMINISM. THE PINNED HASH IS NOT THE INVARIANT.**
 
-The thing that must never break is *reproducibility*: two runs of the same seed+tick+inputs produce identical results. That is what the gate's twice-run comparison tests, and a failure there is a genuine stop-and-report bug.
-
-`determinismHash` in `tests/baseline.json` is a different and much weaker thing: a **change detector**. It answers "did the world I simulate differ from the one recorded last time", which is useful only because a sim that quietly does *less* stays perfectly self-consistent (the Vulkan port shipped a build where mutate and explode dispatched zero workgroups and the whole suite was green).
-
-So:
+The thing that must never break is *reproducibility*: two runs of the same seed+tick+inputs produce identical results. That is what the gate's twice-run comparison tests, and a failure there is a genuine stop-and-report bug. IT DOES NOT MATTER IF A HASH MOVES FROM AN IMPLEMENTATION. ALL THAT MATTERS IS THAT THERE IS DETERMINISM. 
 
 - **A moved hash is not a regression. It is a notification.** Every intentional change to hashed state moves it — a reaction chance, a material, a `sim.*` value, a worldgen tweak, a tree re-bake. That is the system working.
-- **If you changed hashed state on purpose, rebaseline it in the same commit and move on.** `--selftest --rebaseline`. Do not investigate it, do not A/B it, do not try to get the old number back, and do not report it as a finding. There is nothing to diagnose.
-- **Only chase it when you did NOT expect it to move.** Then it has told you something and the ladder in "When to run what" below applies.
+- **If you changed hashed state on purpose, rebaseline ONLY AT THE END when you commit and move on.** `--selftest --rebaseline`. Do not investigate it, do not A/B it, do not try to get the old number back, and do not report it as a finding. There is nothing to diagnose.
 - **Never explain a hash move by saying the sim broke** unless the twice-run comparison also failed. Those are separate claims and only the second one is about determinism.
 
 New numbers are fine. Reproducible numbers are mandatory. History of past moves and when to flip the pin: `tests/BASELINE.md`.

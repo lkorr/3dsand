@@ -4627,22 +4627,39 @@ int main(int argc, char** argv) {
         // submits the kinematic limb targets — a weapon pose pushed in after
         // it would be a frame late and the blade would trail the mouse.
         {
-          melee.Update(kTickDt, meleeHeld, meleeArmed, cam.Right(), cam.Up(),
-                       cam.Forward());
           if (avatar.Spawned()) {
             // Equip/unequip only on a CHANGE. EquipItem builds a body and a
             // joint, so calling it every tick with the same weapon would
             // rebuild the sword 60 times a second; comparing against what is
             // already in the hand keeps this a no-op in the common case.
+            //
+            // BEFORE melee.Update, not after: the arm read below needs the item
+            // in the hand to know WHICH arm is the weapon arm, and the tick the
+            // player selects the blade and clicks can be the same tick.
             const ItemDef* want = meleeArmed ? heldItem : nullptr;
             const std::string wantName = want ? want->name : std::string();
             if (avatar.HeldItem() != wantName) avatar.EquipItem(want);
-            // Weight rises while the weapon is up and falls to zero at rest,
-            // so the arm hands back to the walk cycle instead of being pinned
-            // by an IK solve that is no longer expressing anything.
-            const float w = melee.Phase() == SwingPhase::Idle ? 0.0f : 1.0f;
+            // WHERE THE ARM IS, so taking control of it is not a teleport: the
+            // swing seeds itself from the live pose and bounds itself by the
+            // rig's own reach (game/melee.h SetArm).
+            Vec3 handNow;
+            float reachNow = 0;
+            if (avatar.WeaponArmPose(handNow, reachNow))
+              melee.SetArm(handNow, reachNow);
+            else
+              melee.ClearArm();
+          } else {
+            melee.ClearArm();
+          }
+          melee.Update(kTickDt, meleeHeld, meleeArmed, cam.Right(), cam.Up(),
+                       cam.Forward());
+          if (avatar.Spawned()) {
+            // Weight rises while the weapon is up and FADES over the releasing
+            // recover, so the arm is handed back to the walk cycle across a
+            // couple of hundred ms instead of being dropped in one tick from
+            // wherever the player left it (melee.h PoseWeight).
             avatar.SetWeaponPose(melee.HandOffset(), melee.BladeDir(),
-                                 melee.BladeUp(), w);
+                                 melee.BladeUp(), melee.PoseWeight());
           }
         }
         // ---- ARMOUR: what the equipment says vs what the body wears --------
