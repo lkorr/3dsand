@@ -49,11 +49,35 @@ LEATHER = 53    # leather      — jerkin, bracers, boots, belt
 ART_SCALE = 4
 SKIN_UPSCALE = 2
 SCALE = ART_SCALE * SKIN_UPSCALE  # 8
-WORLD_H = 17
-MICRO_H = WORLD_H * SCALE  # 136
+# ---- THE SIZE CONTRACT IS METRES (DESIGN.md 3b) -----------------------------
+# HEIGHT_M is the physical fact; the lattice figures below are DERIVED from it
+# and from the art's own resolution. WORLD_H used to be a literal 17 "world
+# voxels head to toe", which fixed a real height only while kVoxelMeters was
+# 0.10 -- so when the engine moved to 0.05 the figure stayed 17 cells and
+# became 0.85 m: half the collision capsule it drives, with the art file
+# perfectly correct and nothing able to notice.
+#
+# ART_VOXELS_PER_METRE is what the sidecar declares and is now the ONLY scale
+# this generator needs. kVoxelMeters does not appear in the contract at all:
+# tuning.json's player.halfHeight is already metres, so the cross-check below
+# is metres against metres and this file no longer has to be regenerated when
+# the engine's voxel size changes.
+HEIGHT_M = 1.70                      # head to toe
+EYE_M = 1.50                         # first-person camera row
+ART_VOXELS_PER_METRE = 80            # shipped art resolution (the sidecar value)
+AUTHORED_VOXELS_PER_METRE = ART_VOXELS_PER_METRE // SKIN_UPSCALE   # 40
+# The scale the sidecar's WORLD-space rows (speed, severImpactSpeed, rideHeight,
+# bodyYOffset, clip pos) are written at. The loader rescales them from here to
+# the live kVoxelsPerMetre -- see mob.cpp's `sidecarVoxelsPerMetre`.
+SIDECAR_VOXELS_PER_METRE = 10
+WORLD_H = round(HEIGHT_M * AUTHORED_VOXELS_PER_METRE / ART_SCALE)
+MICRO_H = round(HEIGHT_M * ART_VOXELS_PER_METRE)
 
 SPRINT_SPEED_MPS = 6.0
-VOXEL_METERS = 0.10
+# VOXEL_METERS is GONE on purpose. Every number this file emits is now
+# either metres or a lattice figure derived from a declared
+# voxels-per-metre, so there is nothing left for the engine's voxel
+# size to change. Reintroducing it would reintroduce the coupling.
 
 
 # ---- .vox writing ----------------------------------------------------------
@@ -408,12 +432,9 @@ def main():
     # generator stays runnable after the tuner changes the sprint speed.
     with open(os.path.join(root, "assets", "materials", "tuning.json")) as tf:
         sprint = json.load(tf)["player"]["sprintSpeed"]
-    with open(os.path.join(root, "src", "sim", "world.h")) as wf:
-        m = re.search(r"kVoxelMeters\s*=\s*([0-9.]+)f", wf.read())
-    assert m, "could not find kVoxelMeters in src/sim/world.h"
-    assert abs(float(m.group(1)) - VOXEL_METERS) < 1e-9, (
-        f"world.h kVoxelMeters is {m.group(1)}, this file assumes "
-        f"{VOXEL_METERS} — update VOXEL_METERS and regenerate")
+    # No kVoxelMeters check: the contract below is metres against
+    # metres, so this generator is voxel-size independent by
+    # construction rather than by assertion.
 
     body = b""
     graph = b""
@@ -472,6 +493,14 @@ def main():
     def qz(deg):
         h = math.radians(deg) * 0.5
         return [0.0, 0.0, round(math.sin(h), 4), round(math.cos(h), 4)]
+
+    def qxz(dx, dz):
+        """X then Z, matching QuatFromEulerDeg's X->Y->Z order (anim.h)."""
+        a, b = math.radians(dx) * 0.5, math.radians(dz) * 0.5
+        sa, ca, sb, cb = math.sin(a), math.cos(a), math.sin(b), math.cos(b)
+        # q = qz * qx  (Z applied last, i.e. outermost)
+        return [round(sa * cb, 4), round(sa * sb, 4),
+                round(ca * sb, 4), round(ca * cb, 4)]
 
     ident = [0.0, 0.0, 0.0, 1.0]
 
@@ -625,6 +654,13 @@ def main():
             },
         }
 
+    # JUMPING. The legs TUCK, which on this rig is a NEGATIVE rotation about X:
+    # +X swings a hanging limb backward (verified against the selftest's own
+    # swingOf convention, where negative reads "behind the body"). The old +35
+    # / +25 keys therefore raked both legs out BEHIND the character, which is
+    # the reported "both back legs move behind him" -- and because the clip
+    # used to fire on any loss of ground contact, an ordinary step-down played
+    # it. It now fires only on Player::jumped, a real launch.
     clips["jump"] = {
         "durationMs": 500, "loop": False, "mode": "additive",
         "blendInMs": 60, "blendOutMs": 200,
@@ -634,31 +670,50 @@ def main():
                               {"t": 160, "q": qx(-10), "ease": "cubicInOut"},
                               {"t": 500, "q": qx(0)}]},
             "armU.L": {"rot": [{"t": 0, "q": qx(0), "ease": "cubicOut"},
-                               {"t": 200, "q": qx(-70), "ease": "cubicInOut"},
+                               {"t": 200, "q": qx(-42), "ease": "cubicInOut"},
                                {"t": 500, "q": qx(0)}]},
             "armU.R": {"rot": [{"t": 0, "q": qx(0), "ease": "cubicOut"},
-                               {"t": 200, "q": qx(-70), "ease": "cubicInOut"},
+                               {"t": 200, "q": qx(-42), "ease": "cubicInOut"},
                                {"t": 500, "q": qx(0)}]},
             "legU.L": {"rot": [{"t": 0, "q": qx(0), "ease": "cubicOut"},
-                               {"t": 220, "q": qx(35), "ease": "cubicInOut"},
+                               {"t": 220, "q": qx(-32), "ease": "cubicInOut"},
                                {"t": 500, "q": qx(0)}]},
             "legU.R": {"rot": [{"t": 0, "q": qx(0), "ease": "cubicOut"},
-                               {"t": 220, "q": qx(25), "ease": "cubicInOut"},
+                               {"t": 220, "q": qx(-22), "ease": "cubicInOut"},
                                {"t": 500, "q": qx(0)}]},
         },
     }
+    # FALLING. Authored NEAR-NATURAL and opened out by WEIGHT, not by being a
+    # single wide pose that switches on: avatar.cpp ramps this clip's weight
+    # over avatar.fallFlailDelay/fallFlailRamp seconds of air, so a step off a
+    # kerb plays a hint of it and only a genuine drop reaches the full shape.
+    #
+    # The old pose keyed both arms at -88 deg about X, which on this rig is 88
+    # degrees FORWARD (a positive X rotation swings a hanging limb backward, so
+    # negative swings it forward) -- both arms shot straight out in front, which
+    # is the reported look and is not what a falling body does anyway. Arms go
+    # OUT TO THE SIDES and trail slightly back; model +X is the character's
+    # LEFT on these rigs, so .L abducts with +Z and .R with -Z.
     clips["fall"] = {
-        "durationMs": 700, "loop": True, "mode": "additive",
+        "durationMs": 900, "loop": True, "mode": "additive",
         "blendInMs": 250, "blendOutMs": 250,
-        "mask": ["torso", "armU.L", "armU.R"],
+        "mask": ["torso", "armU.L", "armU.R", "armL.L", "armL.R"],
         "tracks": {
-            "torso": {"rot": [{"t": 0, "q": qx(6)}]},
-            "armU.L": {"rot": [{"t": 0, "q": qx(-88), "ease": "quadInOut"},
-                               {"t": 350, "q": qx(-100), "ease": "quadInOut"},
-                               {"t": 700, "q": qx(-88)}]},
-            "armU.R": {"rot": [{"t": 0, "q": qx(-88), "ease": "quadInOut"},
-                               {"t": 350, "q": qx(-100), "ease": "quadInOut"},
-                               {"t": 700, "q": qx(-88)}]},
+            "torso": {"rot": [{"t": 0, "q": qx(7), "ease": "quadInOut"},
+                              {"t": 450, "q": qx(11), "ease": "quadInOut"},
+                              {"t": 900, "q": qx(7)}]},
+            "armU.L": {"rot": [{"t": 0, "q": qxz(14, 52), "ease": "quadInOut"},
+                               {"t": 450, "q": qxz(4, 62), "ease": "quadInOut"},
+                               {"t": 900, "q": qxz(14, 52)}]},
+            "armU.R": {"rot": [{"t": 0, "q": qxz(4, -62), "ease": "quadInOut"},
+                               {"t": 450, "q": qxz(14, -52), "ease": "quadInOut"},
+                               {"t": 900, "q": qxz(4, -62)}]},
+            "armL.L": {"rot": [{"t": 0, "q": qx(-18), "ease": "quadInOut"},
+                               {"t": 450, "q": qx(-30), "ease": "quadInOut"},
+                               {"t": 900, "q": qx(-18)}]},
+            "armL.R": {"rot": [{"t": 0, "q": qx(-30), "ease": "quadInOut"},
+                               {"t": 450, "q": qx(-18), "ease": "quadInOut"},
+                               {"t": 900, "q": qx(-30)}]},
         },
     }
     clips["land"] = {
@@ -885,7 +940,7 @@ def main():
         "root": "hips",
         "skinScale": SCALE,
         "bleed": {"material": "blood", "perDamage": 2.5},
-        "speed": sprint / VOXEL_METERS,
+        "speed": sprint * SIDECAR_VOXELS_PER_METRE,
         "gait": {
             "groups": [["legU.L"], ["legU.R"]],
             "cadence": 8.0, "strideBias": 0.42, "leadTime": 0.10,

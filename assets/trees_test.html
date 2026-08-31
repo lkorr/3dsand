@@ -1,0 +1,299 @@
+<!doctype html>
+<!-- Headless harness for the Trees tab. Loaded by scripts/check_trees.sh
+     through Chrome; it prints PASS/FAIL lines into #out for --dump-dom.
+
+     WHAT IT COVERS THAT `node scripts/test_treegen.mjs` DOES NOT. The Node test
+     asserts the DATA: determinism, the .svtree round trip, preset sanity, and
+     that the committed atlases match their .json. What cannot be asserted from
+     Node is whether the tab MOUNTS — whether the module builds its panel,
+     whether WorldView's local-region path uploads and meshes what treegen
+     produced, whether anything reaches the framebuffer, and whether the save
+     routes accept what it writes. Every one of those can break without
+     touching a line of treegen.js.
+
+     IT DRIVES THE MODULE DIRECTLY rather than iframing tuner.html. An iframe
+     under --virtual-time-budget does not reliably reach `complete` (measured:
+     it never did), and a harness that flakes is worse than no harness. The
+     tuner's own WIRING is checked separately, by fetching the page and
+     asserting the five edits are present — cheap, and it catches the failure
+     an iframe was there to catch (a module that loads but is unreachable).
+
+     NEEDS NO BUILT EXE, unlike check_worldview.sh: nothing in this tab calls
+     the engine. That is a property of the tab worth asserting. -->
+<meta charset="utf-8">
+<title>trees harness</title>
+<body style="background:#111;color:#ddd;font:12px monospace">
+<div id="host" style="width:1100px;height:640px;display:flex"></div>
+<pre id="out">running</pre>
+<script src="worldview.js"></script>
+<script type="module">
+var log = [], fail = 0;
+function say(ok, msg){ log.push((ok?'PASS  ':'FAIL  ') + msg); if(!ok) fail++; }
+function done(){
+  document.getElementById('out').textContent =
+    log.join('\n') + '\n\nRESULT ' + (fail ? ('FAIL(' + fail + ')') : 'OK');
+  document.title = fail ? 'FAIL' : 'OK';
+}
+// THE POLL IS A FETCH, DELIBERATELY. Chrome's --virtual-time-budget
+// fast-forwards setTimeout to zero, so a timer poll spins thousands of times
+// and burns the whole budget in under a second of real work. Virtual time
+// PAUSES while a network fetch is outstanding, so polling through one makes
+// each iteration cost real time. (Hard-won in scripts/check_worldview.sh;
+// copied verbatim on purpose.)
+async function waitFor(pred, ms){
+  var t0 = performance.now();
+  while (performance.now() - t0 < (ms || 40000)) {
+    try { if (pred()) return true; } catch (e) {}
+    await fetch('/api/status').catch(function(){});
+  }
+  return false;
+}
+
+(async function(){
+  try {
+    say(typeof WorldView === 'function', 'worldview.js loaded');
+
+    // ---- 1. tuner.html is actually wired to this module -------------------
+    // The five edits the tab needs to be REACHABLE. A module that loads
+    // perfectly into a page with no button and no section is a tab nobody can
+    // open, and nothing else in the repo would notice.
+    var page = await (await fetch('/', {cache: 'no-store'})).text();
+    var wiring = [
+      ['nav button',      /data-tab="trees"/],
+      ['section',         /id="view-trees"/],
+      ['tab allowlist',   /'models','trees'/],
+      ['renderAll hook',  /activeTab==='trees'\)\{treesActivate/],
+      ['host bridge',     /__tunerRegisterTrees/],
+      ['module import',   /editor\/trees\.js/]
+    ];
+    wiring.forEach(function (w) {
+      say(w[1].test(page), 'tuner.html has the ' + w[0]);
+    });
+
+    // ---- 2. the module mounts ---------------------------------------------
+    var files = await (await fetch('/api/files', {cache: 'no-store'})).json();
+    var mats = JSON.parse(files.materials).materials;
+    say(mats.length > 50, 'materials.json: ' + mats.length + ' materials');
+
+    var toasts = [];
+    var hooks = {
+      el: function (tag, attrs) {
+        var e = document.createElement(tag);
+        for (var k in (attrs || {})) {
+          if (k === 'class') e.className = attrs[k];
+          else if (k in e && k !== 'style' && k !== 'title') e[k] = attrs[k];
+          else e.setAttribute(k, attrs[k]);
+        }
+        for (var i = 2; i < arguments.length; i++) {
+          var c = arguments[i];
+          if (c == null) continue;
+          e.append(c.nodeType ? c : document.createTextNode(String(c)));
+        }
+        return e;
+      },
+      toast: function (m, bad) { toasts.push((bad ? 'ERR ' : '') + m); },
+      materials: function () { return mats; },
+      onDirty: function () {},
+      section: document.getElementById('host')
+    };
+    var T = await import('./editor/trees.js');
+    T.attach(hooks);
+    // The tab's own render loop only draws while #view-trees is `active`; the
+    // harness has no tab bar, so give the host that class.
+    document.getElementById('host').id = 'view-trees';
+    document.getElementById('view-trees').classList.add('active');
+    say(!!document.querySelector('#view-trees canvas'), 'mounted a canvas');
+
+    T.activate();
+
+    // ---- 3. it lists and loads a species ----------------------------------
+    var sel = document.querySelector('#view-trees select');
+    var ok = await waitFor(function(){ return sel.options.length > 0; });
+    say(ok, 'species listed from /api/models: ' + sel.options.length +
+        ' (' + sel.value + ')');
+
+    var stats = document.querySelector('#view-trees .tgstats');
+    ok = await waitFor(function(){ return /voxels/.test(stats.textContent); });
+    say(ok, 'generated: ' + stats.textContent.replace(/\s+/g, ' ').slice(0, 130));
+    say(!/TRUNCATED|CLIPPED|materials\.json has no/.test(stats.textContent),
+        'no truncation, clipping or unresolved material');
+    // The panel is built when a species LOADS, not when the module attaches, so
+    // this belongs after the generation wait and not before it.
+    var rows = document.querySelectorAll('#view-trees .tgrow').length;
+    say(rows > 40, 'built ' + rows + ' parameter rows across the sections');
+
+    // ---- 4. it reaches the framebuffer ------------------------------------
+    // "No exception was thrown" is not the same as "something appeared", and a
+    // silently-empty preview is the failure this tab would ship with.
+    var cv = document.querySelector('#view-trees canvas');
+    var wv = T._view();
+    // DRAW, THEN READ, IN THE SAME TASK. The canvas has no
+    // preserveDrawingBuffer, so a readPixels at an arbitrary moment returns
+    // zeros however well the tab is working — which is why the tab exports a
+    // handle to its viewer for exactly this. (Same trap as check_worldview.sh's
+    // "render() before reading quad stats", one step further.)
+    var lit = 0, tot = 1, quads = 0;
+    ok = await waitFor(function(){
+      wv.render();
+      quads = wv.stats.quads;
+      var px = new Uint8Array(cv.width * cv.height * 4);
+      wv.gl.readPixels(0, 0, cv.width, cv.height, wv.gl.RGBA,
+                       wv.gl.UNSIGNED_BYTE, px);
+      lit = 0; tot = px.length / 4;
+      for (var i = 0; i < px.length; i += 4)
+        if (px[i] > 26 || px[i+1] > 30 || px[i+2] > 36) lit++;
+      return quads > 100 && lit > tot * 0.01;
+    }, 40000);
+    say(quads > 100, wv.stats.quads.toLocaleString() + ' quads meshed from the ' +
+        'generated cells');
+    say(lit > tot * 0.01, 'framebuffer: ' + (100 * lit / tot).toFixed(1) +
+        '% non-background pixels (' + cv.width + 'x' + cv.height + ')');
+    // ---- 5. UNDO, on a panel nothing else has touched ----------------------------------------------------------
+    // A drag fires `input` per pixel, so the thing that actually has to be
+    // asserted is that ONE drag is ONE undo step: the first version pushed a
+    // snapshot per event and Ctrl+Z looked broken because eight presses did
+    // not visibly move the tree.
+    var depth0 = T._undoDepth();
+    var moved = stats.textContent;
+    var rows = document.querySelectorAll('#view-trees .tgrng');
+    var r2 = rows[1];
+    var v0 = r2.value;
+    for (var d = 0; d < 6; d++) {
+      r2.value = String(Math.min(parseFloat(r2.max),
+                                 parseFloat(r2.value) + parseFloat(r2.step)));
+      r2.dispatchEvent(new Event('input', {bubbles: true}));
+    }
+    ok = await waitFor(function(){ return stats.textContent !== moved; }, 20000);
+    say(ok && r2.value !== v0, 'a six-step drag changed the tree (' + v0 +
+        ' -> ' + r2.value + ')');
+    document.dispatchEvent(new KeyboardEvent('keydown',
+      {key: 'z', ctrlKey: true, bubbles: true}));
+    // TWO CLAIMS, ASSERTED SEPARATELY. ANDing them is the same mistake the
+    // wind gate made: a compound that fails tells you nothing about which half
+    // moved. The one that matters is the STEP COUNT -- a six-event drag must
+    // cost exactly one undo -- because that is what "Ctrl+Z does nothing" felt
+    // like when every event pushed its own snapshot.
+    ok = await waitFor(function(){ return T._undoDepth() === depth0; }, 20000);
+    say(ok, 'ONE Ctrl+Z consumed exactly one undo step (a six-event drag is ' +
+        'one step, not six)');
+    say(r2.value !== '8.6' && parseFloat(r2.value) < parseFloat('8.6'),
+        'and the control moved back with it: 8.6 -> ' + r2.value +
+        ' (slider was showing ' + v0 + ')');
+    document.dispatchEvent(new KeyboardEvent('keydown',
+      {key: 'z', ctrlKey: true, shiftKey: true, bubbles: true}));
+    ok = await waitFor(function(){ return r2.value !== v0; }, 20000);
+    say(ok, 'Ctrl+Shift+Z redid it (' + r2.value + ')');
+
+    // ---- 5c. a slider moves the tree ---------------------------------------
+    var before = stats.textContent;
+    var rng = document.querySelector('#view-trees .tgrng');
+    rng.value = String(Math.min(parseFloat(rng.max),
+                                parseFloat(rng.value) + parseFloat(rng.step) * 3));
+    rng.dispatchEvent(new Event('input', {bubbles: true}));
+    ok = await waitFor(function(){ return stats.textContent !== before; }, 20000);
+    say(ok, 'a slider regenerates the tree');
+
+    // ---- 5d. the quad view -------------------------------------------------
+    // FOUR REGIONS, NOT ONE COMPOSITED GRID, is the design claim — so assert
+    // the region count, not just "the picture changed". A composite would show
+    // four trees and still be the thing this was written to avoid.
+    function rngByLabel(txt) {
+      var rows = document.querySelectorAll('#view-trees .tgrow');
+      for (var i = 0; i < rows.length; i++) {
+        var l = rows[i].querySelector('label');
+        if (l && l.textContent === txt) return rows[i].querySelector('.tgrng');
+      }
+      return null;
+    }
+    var oneRegion = wv.regions.size;
+    var quadBox = null;
+    document.querySelectorAll('#view-trees .tgbar label').forEach(function (l) {
+      if (/quad/.test(l.textContent)) quadBox = l.querySelector('input');
+    });
+    say(!!quadBox, 'the quad checkbox is on the toolbar');
+    var pre = stats.textContent;
+    quadBox.checked = true;
+    quadBox.dispatchEvent(new Event('change', {bubbles: true}));
+    ok = await waitFor(function(){ return /^quad /.test(stats.textContent); }, 30000);
+    say(ok, 'quad on: ' + stats.textContent.replace(/\s+/g, ' ').slice(0, 90));
+    say(wv.regions.size === 4, 'four separate regions, not one composited grid (' +
+        wv.regions.size + ')');
+    var ox = new Set();
+    wv.regions.forEach(function (r) { ox.add(r.origin.join(',')); });
+    say(ox.size === 4, 'four distinct origins (' + ox.size + ')');
+    // And it still REACHES THE FRAMEBUFFER — four regions that all mesh to
+    // nothing would pass every count above.
+    var qq = 0;
+    ok = await waitFor(function(){ wv.render(); qq = wv.stats.quads; return qq > 100; }, 40000);
+    say(ok, 'quad view meshed ' + qq.toLocaleString() + ' quads');
+    // ALL FOUR AT ONCE is the literal ask. `stats.regions` counts what BOTH
+    // finished meshing and survived the frustum, so it has to be waited on —
+    // the worker takes two at a time and asserting it one frame after the
+    // quad-count wait measures the mesh queue, not the camera.
+    ok = await waitFor(function(){ wv.render(); return wv.stats.regions === 4; }, 40000);
+    say(ok, 'all four draw at the framing distance (' + wv.stats.regions +
+        ' of 4, cam.dist ' + Math.round(wv.cam.dist) + ')');
+    // And the far plane is the reason, stated as a number: the streaming
+    // formula gives REGION_N*3 = 192 at levels=1, which is less than the
+    // corner distance of a stand and used to clip its back half.
+    say(wv.stats.farD >= wv.stats.farNeed,
+        'far plane covers the scene: ' + Math.round(wv.stats.farD) +
+        ' vs a farthest corner at ' + Math.round(wv.stats.farNeed) +
+        ' (the streaming-only value would have been 192)');
+    quadBox.checked = false;
+    quadBox.dispatchEvent(new Event('change', {bubbles: true}));
+    ok = await waitFor(function(){ return wv.regions.size === oneRegion; }, 30000);
+    say(ok, 'unchecking it goes back to ' + wv.regions.size + ' region');
+
+    // ---- 5e. foliage shape, and the leafy-level bound ----------------------
+    // `lowest leafy level` is bounded by `branch levels`: the deepest branch a
+    // tree HAS is levels-1, so a fixed 0..9 max made most of the slider mean
+    // "no leaves" and read as a broken control.
+    var lvl = rngByLabel('branch levels'), leafy = rngByLabel('lowest leafy level');
+    say(!!lvl && !!leafy, 'found the branch-levels and lowest-leafy-level rows');
+    say(leafy.max === lvl.value, 'lowest leafy level is capped at branch levels (' +
+        leafy.max + ' vs ' + lvl.value + ')');
+    var shp = rngByLabel('clump shape');
+    say(!!shp, 'the clump shape row exists (0 blob / 1 plate / 2 spray / 3 cone)');
+    before = stats.textContent;
+    shp.value = '2';
+    shp.dispatchEvent(new Event('input', {bubbles: true}));
+    ok = await waitFor(function(){ return stats.textContent !== before; }, 30000);
+    say(ok, 'clump shape 2 (spray) regenerated: ' +
+        stats.textContent.replace(/\s+/g, ' ').slice(0, 90));
+    say(!/NO FOLIAGE/.test(stats.textContent), 'and it still grew leaves');
+    shp.value = '0';
+    shp.dispatchEvent(new Event('input', {bubbles: true}));
+
+    // ---- 6. the save routes -----------------------------------------------
+    var src = await (await fetch('/api/model?path=trees/' + sel.value + '.json',
+                                 {cache:'no-store'})).text();
+    var w = await (await fetch('/api/model?path=trees/_harness.json',
+                               {method:'POST', body: src})).json();
+    say(!!w.ok, 'POST trees/_harness.json -> ' + JSON.stringify(w).slice(0, 80));
+    var back = await (await fetch('/api/model?path=trees/_harness.json',
+                                  {cache:'no-store'})).text();
+    say(back === src, '.json round-tripped byte-for-byte (' + back.length + ' bytes)');
+
+    // The .svtree magic gate: what stops a half-written atlas reaching an
+    // engine that ABORTS on one.
+    var bad = await (await fetch('/api/model?path=trees/_harness.svtree',
+                                 {method:'POST',
+                                  body: new Uint8Array([1,2,3,4])})).json();
+    say(bad.ok === false && /magic/.test(bad.error || ''),
+        'a non-.svtree payload is refused: ' + (bad.error || '(ACCEPTED)'));
+
+    // And a real one is not.
+    var TG = await import('./editor/treegen.js');
+    var atlas = TG.bakeAtlas(JSON.parse(src));
+    var good = await (await fetch('/api/model?path=trees/_harness.svtree',
+                                  {method:'POST', body: atlas.buf})).json();
+    say(!!good.ok, 'a real bake is accepted: ' + (good.bytes || good.error) +
+        ' bytes, ' + atlas.meta.variants + ' variants');
+  } catch (e) {
+    say(false, 'threw: ' + (e && e.stack || e));
+  }
+  done();
+})();
+</script>
+</body>

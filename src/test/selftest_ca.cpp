@@ -400,6 +400,13 @@ Status RunCaSlope(Ctx& c, std::string& detail, const SlopeArm& arm) {
   uint64_t sumEmitted = 0, sumDead = 0, sumRefused = 0;
   int divergeAt = -1;
   long long divergeBy = 0;
+  // IS THE LEFTOVER POOL STILL DRAINING, OR IS IT STUCK? The hybrid arm ends
+  // with live particles that are not in the basin, and "N particles at the end"
+  // cannot tell a slow drain from a permanent residue — which is the whole
+  // difference between "run it longer" and "rule 2 is violated, this pool never
+  // goes away". The count at four points does: falling means draining, flat
+  // means stuck. fa[7] is already read every tick for the ledger.
+  uint32_t liveAt[4] = {0, 0, 0, 0};
   for (int i = 0; i < kTicks; i++) {
     SubmitTick(ctx, world, sim, ++t, kDefaultSeed, {}, {},
                i == 0   ? build
@@ -417,6 +424,8 @@ Status RunCaSlope(Ctx& c, std::string& detail, const SlopeArm& arm) {
       sumEmitted += fa[9];    // FA_EMITTED: PARTICLES emitted (1 eighth each)
       sumDead += fa[8];       // FA_DEAD:    particles killed this tick
       sumRefused += fa[12];
+      const int q = (i + 1) * 4 / kTicks;  // quarter of the run, 1..4
+      if (q >= 1 && q <= 4) liveAt[q - 1] = std::min(fa[7], kFluidCap);
     }
     if (i >= 10 && i % 10 == 0) {
       ctx.WaitIdle();
@@ -489,7 +498,8 @@ Status RunCaSlope(Ctx& c, std::string& detail, const SlopeArm& arm) {
       "%llu of them in the basin), mass %s (%lld unaccounted; seam over the run: "
       "%llu excited -> %llu emitted, %llu settled, %llu dead, %llu refused, "
       "%llu binned, %llu eaten by reactions; ledger first parted at tick %d "
-      "by %lld), %u of "
+      "by %lld), live particles by quarter of the run %u/%u/%u/%u (flat means "
+      "the residue is permanent, not slow), %u of "
       "%zu structure chunks awake at tick %d (quiet from %d)",
       (unsigned long long)poured, drain * 100.0,
       (unsigned long long)basinE, (unsigned long long)rampE,
@@ -500,7 +510,7 @@ Status RunCaSlope(Ctx& c, std::string& detail, const SlopeArm& arm) {
       (unsigned long long)sumSettled, (unsigned long long)sumDead,
       (unsigned long long)sumRefused,
       (unsigned long long)sumBinned, (unsigned long long)sumConsumed,
-      divergeAt, divergeBy,
+      divergeAt, divergeBy, liveAt[0], liveAt[1], liveAt[2], liveAt[3],
       activeInBox, boxChunks.size(), kTicks, quietAt);
   return ok ? Status::Pass : Status::Fail;
 }

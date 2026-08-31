@@ -9,9 +9,59 @@
 #include "sim/voxload.h"  // kArtPaletteBase, mirrored into the WGSL prelude
 #include "sim/world.h"
 
+// ---- GPU buffer budget -----------------------------------------------------
+// Every storage/uniform/indirect buffer the engine owns is created through this
+// one function, so tallying here is exhaustive by construction rather than by a
+// list somebody has to remember to extend. Sizing questions ("what does the
+// window / the far field actually cost?") were previously answered by
+// re-deriving constants on paper, which is how ROADMAP_scale.md ended up with a
+// memory anchor that has never been checked against an allocation.
+// Diagnostics only: nothing reads the tally, and it is not in any hash.
+static std::vector<GpuBufferRecord>& BufferLog() {
+  static std::vector<GpuBufferRecord> log;
+  return log;
+}
+
 rhi::Buffer CreateBuffer(const rhi::Device& device, uint64_t size,
                          rhi::BufferUsage usage, const char* label) {
+  BufferLog().push_back({label ? label : "<unlabelled>", size});
   return device.CreateBuffer(size, usage, label);
+}
+
+uint64_t GpuBufferBytesTotal() {
+  uint64_t t = 0;
+  for (const auto& r : BufferLog()) t += r.bytes;
+  return t;
+}
+
+const std::vector<GpuBufferRecord>& GpuBufferRecords() { return BufferLog(); }
+
+void DumpGpuBufferBudget(const char* whenLabel) {
+  auto sorted = BufferLog();
+  std::stable_sort(sorted.begin(), sorted.end(),
+                   [](const GpuBufferRecord& a, const GpuBufferRecord& b) {
+                     return a.bytes > b.bytes;
+                   });
+  const double kMiB = 1024.0 * 1024.0;
+  uint64_t total = 0;
+  for (const auto& r : sorted) total += r.bytes;
+  printf("---- GPU buffer budget (%s): %llu buffers, %.2f MiB ----\n", whenLabel,
+         (unsigned long long)sorted.size(), (double)total / kMiB);
+  // Everything at or above 1 MiB, individually; the rest as one line. The tail
+  // is ~60 buffers of a few hundred bytes each and reading it teaches nothing.
+  uint64_t tail = 0;
+  size_t tailCount = 0;
+  for (const auto& r : sorted) {
+    if (r.bytes >= (1u << 20)) {
+      printf("  %-24s %10.2f MiB\n", r.label.c_str(), (double)r.bytes / kMiB);
+    } else {
+      tail += r.bytes;
+      tailCount++;
+    }
+  }
+  printf("  %-24s %10.2f MiB  (%llu buffers under 1 MiB)\n", "<small>",
+         (double)tail / kMiB, (unsigned long long)tailCount);
+  fflush(stdout);
 }
 
 static bool ReadFileText(const std::string& path, std::string& out) {

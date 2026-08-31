@@ -593,14 +593,31 @@ Status GateWindPrim(Ctx& c, std::string& detail) {
   const bool bounded = east.wakeMax <= budget && quiet.wakeMax == 0;
   // 8. THE WAKE. A settled, sleeping bed, woken by nothing but the fan.
   const double dDry = dry.sandX - dryNone.sandX;
+  // `dryNone.wakeActive == 0` was the fourth term, and it could not survive
+  // contact with a world that has anything in it: `wakeActive` is read off
+  // World::Snap().activeChunks, which is a WHOLE-WORLD count, while the
+  // sentence this gate is asserting is local ("a settled, sleeping bed, woken
+  // by nothing but the fan"). The project's own rest budget is 32 active
+  // chunks (CLAUDE.md rule 2, and the `sleep` gate), so a control run with 5
+  // awake somewhere in the world is a normal world and not a broken one -- it
+  // failed here the day the forest got denser, and the message blamed the wind
+  // footprint.
+  //
+  // What the claim actually needs is that the fan wakes MORE than the control,
+  // which is the comparison the rest of this gate is built on.
   const bool wakes = dDry > 0.5 && dry.sandCount == dryNone.sandCount &&
-                     dry.wakeActive > 0 && dryNone.wakeActive == 0;
+                     dry.wakeActive > dryNone.wakeActive;
 
   detail = Format(
       "fan 36 m/s, 2 m/s ambient | bed creeps %+.2f cells (maxX %+d) blowing "
       "+x, %+.2f blowing -x | fan WITHOUT the entrain licence: bed %s, air %s "
       "| smoke drifts %+.2f cells (unlicensed fan %+.2f) "
-      "| ASLEEP chamber, no smoke: %u chunks awake (0 with no fan), bed "
+      // `dryNone.wakeActive` was a hardcoded "0" here, which is the shape
+      // CLAUDE.md rule 6 warns about: `wakes` is a four-term AND and the line
+      // printed three of them, so a failure said "the footprint wake is not
+      // reaching the CA" while every number on screen looked right. Print the
+      // control.
+      "| ASLEEP chamber, no smoke: %u chunks awake (%u with no fan), bed "
       "creeps %+.2f "
       "| grains %u/%u/%u (dry %u vs %u) "
       "| wake %u of %u chunks (%u without the licence) "
@@ -608,7 +625,7 @@ Status GateWindPrim(Ctx& c, std::string& detail) {
       dEast, mEast, dWest, quietHeld ? "unmoved bitwise" : "MOVED",
       quietBlows ? "blowing" : "STILL",
       east.smokeX - none.smokeX, quiet.smokeX - none.smokeX, dry.wakeActive,
-      dDry,
+      dryNone.wakeActive, dDry,
       none.sandCount, east.sandCount,
       west.sandCount, dry.sandCount, dryNone.sandCount,
       east.wakeMax, budget, quiet.wakeMax, none.hash, east.hash,

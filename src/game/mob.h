@@ -1,4 +1,5 @@
 #pragma once
+#include "sim/scale.h"  // MetresToCells / MetresToCellsI
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -6,6 +7,7 @@
 #include <vector>
 
 #include "game/anim.h"
+#include "game/equipment.h"
 #include "math3d.h"
 #include "phys/debris.h"
 #include "phys/physics.h"
@@ -55,6 +57,26 @@ struct MobLimbDef {
   // between limb and parent when absent (anchorAuto)
   Vec3 anchor{};
   bool anchorAuto = true;
+  // ---- POSE-SPACE range of motion (sidecar "poseLimit"; optional) ----------
+  // THE LIMITS ABOVE DO NOT BIND AN ANIMATED LIMB. `minAngle`/`maxAngle` and
+  // the swing-twist cone are handed to Jolt, and Jolt only enforces them on a
+  // DYNAMIC body — a live limb is kinematic, re-posed every tick by the
+  // animation pipeline, so the IK could put a thigh anywhere it liked and no
+  // constraint in this struct had a word to say about it. "Legs raking out
+  // behind" and "legs folded up inside the torso" were both that.
+  //
+  // This is the animation's own range of motion, clamped on the solved pose
+  // (AnimClampPoseLimits) about the part's REST frame. Authored in DEGREES in
+  // the sidecar, stored in radians here like every other angle.
+  //
+  // Three shapes, because three joints: a bounded one-axis clamp (the knee and
+  // hip), a true one-DOF `hinge` (the elbow), and the ball form (the shoulder).
+  // AnimPart carries the same fields and anim.h documents what each one is for.
+  bool hasPoseLimit = false;
+  Vec3 poseAxis{1, 0, 0};
+  float poseMin = -3.14159265f, poseMax = 3.14159265f;
+  bool poseHinge = false;
+  PoseBallLimit poseBall;
   // walk-cycle swing (radians) about X through the joint anchor; phase in
   // half-turns so arm.L/leg.R can counter-swing arm.R/leg.L. Kept as the
   // no-IK fallback for rigs without `chains` (dummy.json) — it now runs as a
@@ -147,7 +169,35 @@ struct MobSocketDef {
 // with, so no existing creature's mass, contacts or ground probes move, while
 // leaving the skin free to go to 8. Raising this is a physics-budget decision,
 // not an art one.
-inline constexpr uint32_t kMaxPhysScale = 4;
+//
+// AND IT IS A PHYSICAL RESOLUTION, NOT A RATIO. `physScale` counts collider
+// voxels per WORLD voxel, so a fixed 4 means a different real cell size at
+// every kVoxelMeters: 40 collider voxels/metre at 10 cm, 80 at 5 cm, 160 at
+// 2.5 cm. Since the cost is cubic, holding the ratio would have handed the same
+// physical limb 8x the boxes each time the voxel halved — a physics budget
+// silently multiplied by an art-side decision, which is the exact coupling the
+// skin/collider split exists to break.
+//
+// So the ceiling is authored as a real cell size (2.5 cm collider voxels, the
+// resolution every current rig shipped at) and the ratio is derived. At 10 cm
+// this is 4 and nothing moves; at 5 cm it is 2 and a limb keeps the collider it
+// always had.
+// Mob locomotion budgets, authored in METRES and resolved to cells.
+//
+// The player's equivalents have been metres-derived since v0.2
+// (Player::kStepUpM, player.h:189); the mob's were bare cell counts, so at
+// 5 cm voxels a mob could step up half as far as it used to and probe half
+// as high for its own footing while the player was unaffected. Same world,
+// two different physics.
+inline constexpr int kMobStepUpCells = MetresToCellsI(0.20f);
+// How far above the mob's origin a ground probe starts looking down.
+inline constexpr int kMobProbeLiftCells = MetresToCellsI(0.30f);
+
+inline constexpr int kColliderVoxelsPerMetre = 40;
+inline constexpr uint32_t kMaxPhysScale = (uint32_t)(
+    kColliderVoxelsPerMetre / kVoxelsPerMetre < 1
+        ? 1
+        : kColliderVoxelsPerMetre / kVoxelsPerMetre);
 
 struct MobDef {
   std::string name;
@@ -175,6 +225,43 @@ struct MobDef {
   // conversion point, so the animation runtime and the gait code need no scale
   // awareness at all.
   uint32_t skinScale = 1;
+  // The AUTHORING resolution of the .vox art, in art voxels per METRE, and the
+  // thing that gives a grid of voxels a physical size at all. This is the field
+  // sidecars declare; `skinScale` above is DERIVED from it and kVoxelsPerMetre.
+  //
+  // A .vox is a bare lattice: 136 voxels tall is 1.7 m only because the art is
+  // 80 voxels/metre. That fact used to live nowhere — `skinScale: 8` was
+  // authored directly, meaning "8 art voxels per WORLD voxel", which silently
+  // encoded "and the world is 10 cm". So when kVoxelMeters went to 5 cm the
+  // human stayed 17 world voxels and became 0.85 m: exactly half the height of
+  // the collision capsule it drives, with no test anywhere asserting otherwise.
+  //
+  // Declaring the metre scale instead makes the derivation automatic and the
+  // art file untouched: human at 80 art vox/m is skinScale 8 at 10 cm, 4 at
+  // 5 cm, 2 at 2.5 cm — same 1.7 m every time, and the world-cell model simply
+  // gets finer. Re-authoring the art at a higher resolution later is then a
+  // pure data change: bump this number, change no code.
+  int artVoxelsPerMetre = 0;
+  // Block replication applied to the art grid at load, when the art is COARSER
+  // than the world (`artVoxelsPerMetre < kVoxelsPerMetre`) and no integer
+  // skinScale could exist. Exact and lossless — it preserves world size and
+  // adds no detail — so it is always safe in this direction.
+  //
+  // Authored offsets (anchors, sockets, cutting edges, clip keys) are in the
+  // ORIGINAL art grid and are NOT rescaled by it; they convert through
+  // ArtToWorld() below, which divides that out. Keeping them in the authored
+  // frame is what lets the upsample stay invisible to every sidecar.
+  uint32_t artUpsample = 1;
+  // Authored art units -> world voxels. The ONE conversion for every length a
+  // sidecar states in the art's lattice.
+  //
+  // Not simply `1/skinScale`: after an upsample the voxel grid is `artUpsample`
+  // times finer than the numbers in the JSON, and skinScale describes the
+  // GRID. This divides that back out, so `anchor * ArtToWorld()` is correct
+  // whether or not the art was replicated.
+  float ArtToWorld() const {
+    return (float)artUpsample / (float)(skinScale ? skinScale : 1u);
+  }
   // Collider resolution, in collider voxels per world voxel. DERIVED at load,
   // never authored: the finest of {8,4,2,1} whose limb extents still fit the
   // DebrisVoxel int8 bound of +-120. Always <= skinScale.
@@ -270,7 +357,16 @@ struct BodyBurnState {
   // Consecutive ticks with an empty front, so a body walking in and out of a
   // campfire does not rebuild its index every other tick.
   uint32_t quiet = 0;
-  bool Burning() const { return !front.empty(); }
+  // "This limb still carries burning matter", and the ONE piece of burn state
+  // that SURVIVES DropBurnIndex. `front` cannot: its entries are cells of the
+  // index box that was just thrown away. Every carve drops the index (the
+  // lattice compacted underneath it) and burning carves constantly, so without
+  // this the cheap gate at the top of BurnOneLimb — "nothing hot nearby and an
+  // empty front, so exit" — fired on the tick after the last flush and the
+  // limb's flesh_burning voxels never rolled their decay again. That is a
+  // character left permanently coated in flame that has nothing left to burn.
+  bool alight = false;
+  bool Burning() const { return !front.empty() || alight; }
 };
 
 // One limb or part, described in the terms the burn pass needs.
@@ -292,6 +388,52 @@ struct BurnLimbView {
   bool* carved = nullptr;      // latched when the brick becomes copy-on-write
   int* flipbook = nullptr;     // cleared on first damage; a frame swap heals
   BodyBurnState* burn = nullptr;
+
+  // ---- IS SOMETHING WORN IN THE WAY? --------------------------------------
+  //
+  // The burn pass reads the WORLD around a limb — to seed fire from contact,
+  // and to let a world neighbour's rule (acid) rewrite the limb. Neither
+  // knows about armour: a worn shell's voxels are in neither the grid nor
+  // this limb's lattice, so fire lapping at a sleeve reads to the arm
+  // underneath exactly as fire lapping at the arm.
+  //
+  // This closes that, and it is the ONE genuinely new mechanic armour needed.
+  // It returns the occluding shell's MATERIAL rather than a bool, which is
+  // what keeps the behaviour emergent: the flesh's neighbour simply becomes
+  // "cloth" instead of "fire", cloth-over-flesh semantics fall out of the
+  // ordinary authored table, and when the shell burns through the probe
+  // returns 0 there and the skin is exposed. No integrity threshold, no
+  // resist value, nothing to tune.
+  //
+  // A SEGMENT, NOT A POINT, and that distinction is the whole difference
+  // between this working and appearing to.
+  //
+  // The obvious test — "is the cell one lattice step outside this voxel inside
+  // a shell?" — reads correct and leaks completely, because a limb is a
+  // ROUNDED TUBE inside a garment cut to its box. On any diagonal there are
+  // several empty cells between the flesh and the cloth, so the point one step
+  // out lands in the gap, the probe says "nothing there", and fire walks
+  // straight through intact armour. Measured: a fully enclosed arm caught fire
+  // three ticks after the bare one beside it.
+  //
+  // So the question is asked as a RAY: is there anything worn between me and
+  // the world, within `dist` world voxels along `dir`. Marching costs one
+  // transform and a handful of array reads, because a shell rides its limb and
+  // therefore shares its rotation — the direction in the shell's lattice is
+  // fixed for the whole march.
+  //
+  // A raw function pointer and a context, NOT a std::function: this view is
+  // built per limb per tick, and a capturing std::function would heap-allocate
+  // once per limb per tick for a feature most creatures do not use. Null on
+  // anything that cannot be wearing armour (debris, a corpse).
+  using OccludeFn = uint32_t (*)(void* ctx, const Vec3& from, const Vec3& dir,
+                                 float dist);
+  OccludeFn occlude = nullptr;
+  void* occludeCtx = nullptr;
+  // dist 0 is a point test at `from`.
+  uint32_t WornAlong(const Vec3& from, const Vec3& dir, float dist) const {
+    return occlude ? occlude(occludeCtx, from, dir, dist) : 0u;
+  }
 
   size_t Size() const { return skin ? skin->size() : coll->size(); }
   IVec3 At(size_t i) const {
@@ -359,6 +501,20 @@ struct MobLimb {
   std::vector<PrefabVoxel> skinVoxels;
   bool HasFineSkin() const { return !skinVoxels.empty(); }
   int microModel = -1;       // -1 = cube path
+  // ---- LATTICE PITCH FOR A LIMB THAT IS NOT THE CREATURE'S OWN ART --------
+  // A body limb's voxels are authored in the def's skin lattice, so the def's
+  // skinScale/physScale describe them and there is nothing to store. A worn
+  // shell and a held item are not: they come out of an ITEM's .vox at the
+  // ITEM's scale, which need not be the wearer's — a scale-4 sword on a
+  // skinScale-8 human. Every scale-taking operation on a limb (burn, carve,
+  // re-skin, collider rebuild, drop-to-debris) has to use the lattice the
+  // voxels are ACTUALLY on, or it converts the geometry by the wrong divisor
+  // and the wound lands somewhere else on the item than where it was struck.
+  //
+  // 0 means "the def's", which is every authored body limb. Read through
+  // Mob::SkinScaleOf / PhysScaleOf, never directly.
+  uint32_t ownSkinScale = 0;
+  uint32_t ownPhysScale = 0;
   // Takes the SKIN scale: a MicroBodyRef is a render description.
   MicroBodyRef MicroRef(uint32_t skinScale) const {
     return microModel < 0 ? MicroBodyRef{}
@@ -389,12 +545,18 @@ struct MobLimb {
   bool carved = false;
   // Voxel count the limb was authored with, so damage is a FRACTION of it.
   uint32_t voxelsAtSpawn = 0;
+  // Voxel count the last carve already CHARGED to hp. `voxelsAtSpawn` is the
+  // denominator of the fraction; this is the previous numerator, and without it
+  // every carve re-charges everything the limb has ever lost — see the
+  // incremental-loss note in Mob::CarveLimb.
+  uint32_t voxelsCharged = 0;
   // Per-voxel burning / dissolution (see BodyBurnState above).
   BodyBurnState burn;
 };
 
 class MobSystem;
 struct ItemDef;
+struct ItemCover;
 
 // ============================================================================
 // ONE CREATURE. The base class of every articulated body in the game: NPCs
@@ -492,6 +654,80 @@ class Mob {
   bool EquipItem(const ItemDef* item, const char* context = "held_right");
   const std::string& HeldItem() const { return heldItem_; }
   int HeldSlot() const { return heldSlot_; }
+
+  // ---- WEARING an item (the same borrowed slot, N times) ------------------
+  // A worn piece appends one rig slot per ItemCover entry — a SHELL: parented
+  // to the covered limb by a fixed joint, tagged "worn", not vital, with its
+  // own hp, its own voxels and its own micro brick. Everything the held-item
+  // path already earns is inherited per shell: burning, dissolving, per-voxel
+  // carving, severing with the limb it is strapped to, dropping as debris,
+  // live-transform hitboxes, rendering.
+  //
+  // On the BASE class for the same reason EquipItem is: a goblin in a helmet
+  // is one WearItem call, and the player wears exactly the same way.
+  //
+  // `equipSlot` is an EquipSlotId as an int — the key the piece is later
+  // removed by, and the only thing tying a shell group back to the character
+  // screen. Pass a null item to UnwearItem's slot instead of here.
+  // `damage` puts a piece back on AS IT WAS. Null wears it as authored, which
+  // is the common case; passing a blob captured by CaptureWorn is what makes
+  // taking your boots off and putting them back on stop being a repair
+  // (game/equipment.h WornDamage).
+  bool WearItem(const ItemDef* item, int equipSlot,
+                const WornDamage* damage = nullptr);
+  bool UnwearItem(int equipSlot);
+  // Read what a worn piece has been through, in its item's cover order. Call
+  // it BEFORE UnwearItem: the shells are the only place the damage lives while
+  // the piece is on, and they are destroyed with the slots.
+  bool CaptureWorn(int equipSlot, WornDamage& out) const;
+  // The item name worn in a slot, or empty. By NAME because library indices
+  // are file-order and die on an R reload (item.h's index hazard).
+  const std::string& WornItem(int equipSlot) const;
+  int WornPieceCount() const { return (int)worn_.size(); }
+  // HOW MUCH OF THE PIECE IS STILL THERE, 0..1, summed over its shells and
+  // weighted by their volume — one hole in a pauldron must not read the same as
+  // a robe burnt to rags. 1 for a slot wearing nothing, so a caller that does
+  // not check can only be told "whole".
+  //
+  // Voxels, not hp, because voxels are what the armour mechanic is: protection
+  // here is a shell being geometrically IN THE WAY, so the fraction of it that
+  // is still in the way is the honest measure of condition. hp is a rig
+  // durability number that also falls to blunt trauma and is not what the
+  // occlusion probe reads.
+  //
+  // LIVE — off the shells themselves. The blob in PlayerKit::wornDamage is only
+  // written when a piece comes OFF, so asking that while wearing it reports the
+  // condition it was in the last time it was taken off.
+  float WornCondition(int equipSlot) const;
+  // Rig slots this piece occupies, for tests and for the occlusion probe.
+  const std::vector<int>& WornSlotsAt(int pieceIndex) const;
+  // Is `worldPos` inside a live voxel of any shell worn over `bodyLimb`?
+  // Reports the occluding shell's MATERIAL (0 = not occluded), because the
+  // burn pass does not want a bool — it wants to know what the flesh's
+  // neighbour actually is once a robe is in the way (see the call sites in
+  // BurnOneLimb).
+  //
+  // NON-CONST because it builds the per-shell occupancy index on first use;
+  // the index is derived data and the answer is a pure function of the
+  // lattice, so this is a cache fill, not a mutation of anything observable.
+  uint32_t WornOccludes(int bodyLimb, const Vec3& worldPos) {
+    return WornAlong(bodyLimb, worldPos, Vec3{0, 1, 0}, 0.0f);
+  }
+  // The same question asked along a SEGMENT: the first shell material met
+  // between `from` and `from + dir * dist`, stepping one shell-lattice cell at
+  // a time. `dist` 0 degenerates to the point test above.
+  //
+  // A ray rather than a point because a limb is a rounded tube inside a
+  // garment cut to its box — see the long note on BurnLimbView::occlude for
+  // what testing the point costs.
+  uint32_t WornAlong(int bodyLimb, const Vec3& from, const Vec3& dir,
+                     float dist);
+  // Does any shell cover this body limb at all? The cheap gate in front of the
+  // probe, so an undressed creature never even transforms a point.
+  bool LimbHasShells(int bodyLimb) const;
+  // Rig slots that are NOT part of the authored rig: worn shells and a held
+  // item, always at the tail. `LimbCount() - AppendedBase()` of them.
+  int AppendedBase() const { return baseLimbs_; }
   // The held weapon's cutting edge in WORLD voxels, from its live transform.
   bool WeaponEdge(Vec3& outBase, Vec3& outTip, float& outHalfWidth) const;
   // Is this Jolt body one of this creature's own parts?
@@ -543,6 +779,16 @@ class Mob {
   bool LimbAlive(int i) const {
     return i >= 0 && i < (int)anim_.partAlive.size() && anim_.partAlive[i] != 0;
   }
+  // THE LATTICE A LIMB'S VOXELS ARE ACTUALLY ON (see MobLimb::ownSkinScale).
+  // Every limb-scoped scale conversion goes through these two rather than
+  // reading def_->skinScale directly, so a shell or a weapon authored at its
+  // own resolution is converted by its own divisor.
+  uint32_t SkinScaleOf(const MobLimb& l) const {
+    return l.ownSkinScale ? l.ownSkinScale : (def_ ? def_->skinScale : 1u);
+  }
+  uint32_t PhysScaleOf(const MobLimb& l) const {
+    return l.ownPhysScale ? l.ownPhysScale : (def_ ? def_->physScale : 1u);
+  }
 
   // Build limbs/bodies/joints/anim state from the def at `origin` (min corner,
   // world voxels). Seeds the per-instance rig copy (skel_/limbDefs_). False =
@@ -552,9 +798,27 @@ class Mob {
   // ---- carving internals (docs/DESIGN.md §7) --------------------------------
   using LimbCarveKeep = std::function<bool(int, int, int)>;
   using LimbCarveFactory = std::function<LimbCarveKeep(float)>;
+  // ---- SPALL: let a hole grow into its own rim -----------------------------
+  // A predicate can only ask "should this voxel go", one voxel at a time, with
+  // no idea what is left around it. "Take more where matter is already missing"
+  // is a question about OCCUPANCY, and CarveLimb is the only place that knows
+  // it — it owns the limb's authoritative voxel list. So the growth lives here
+  // rather than in the crater predicate.
+  //
+  // Optional by construction: only the radial blast path fills one in, so the
+  // burn flush and the laser's clean kerf are untouched without either of them
+  // having to opt out.
+  struct CarveSpall {
+    Vec3 centerLocal{};   // blast centre in the limb's BODY frame, world voxels
+    float radius = 0;     // world voxels
+    float strength = 0;   // 0..1; 0 disables
+    int rounds = 0;       // passes; each can only remove
+    uint32_t seed = 0;    // same (mob, limb) key the crater noise uses
+  };
   bool CarveLimb(int limbIndex, World& world,
                  std::vector<ParticleSpawn>& spawns, bool eject,
-                 const LimbCarveFactory& carveAt);
+                 const LimbCarveFactory& carveAt,
+                 const CarveSpall* spall = nullptr);
   bool ReskinLimbMicro(MobLimb& limb, uint32_t skinScale, uint32_t physScale);
   bool RebuildLimbBody(int limbIndex);
   void EmitCarvedFragment(const MobLimb& src, uint32_t physScale,
@@ -567,6 +831,63 @@ class Mob {
   void DetachLimb(int limbIndex, bool adopt);
   // Tear down every body/joint/brick this rig still owns (despawn, reset).
   void ReleaseRig();
+
+  // ---- the APPENDED TAIL: shells and the held item -------------------------
+  //
+  // THE REMOVAL SEAM, and the one invariant everything about wearing rests on.
+  //
+  // Before armour there was exactly one appended slot and unequipping it was
+  // `pop_back` on four parallel vectors — index-parallel by construction,
+  // nothing to renumber. Several worn pieces plus a weapon break that: taking
+  // off the robe while the boots and the sword stay on removes a group from
+  // the MIDDLE of the tail.
+  //
+  // What this does is ERASE that range and FIX UP the indices that referred
+  // past it, rather than tearing the whole tail down and re-appending the
+  // survivors. Two reasons, and the second is the one that matters:
+  //
+  //   * An appended slot is never a PARENT. Shells hang off body limbs and a
+  //     held item off a hand, both of which live below baseLimbs_, so erasing
+  //     one can orphan nothing and no parent index inside the base rig moves.
+  //     Only the appended indices after the hole shift, and there are exactly
+  //     three kinds of reference to them: heldSlot_/heldPartIndex_ and each
+  //     WornPiece::slots. All three are fixed here.
+  //   * A survivor's LATTICE IS NOT REBUILT, because it is never let go of. A
+  //     re-append would have to carry the carved voxels, the owned brick index
+  //     and the current hp across by hand, and re-loading any one of them from
+  //     the def would silently HEAL a damaged pauldron — a bug that looks like
+  //     nothing until somebody notices their armour repairing itself when they
+  //     take off an unrelated piece. Moving the MobLimb wholesale makes that
+  //     unrepresentable instead of merely tested for.
+  //
+  // Destroys the joints and bodies of the removed range only. `count` slots
+  // starting at `first`, which must be a range wholly inside the tail.
+  void RemoveAppendedSlots(int first, int count);
+  // Append one shell of a worn piece over `bodyLimb`. Returns the new slot, or
+  // -1. Split out of WearItem so the per-cover loop reads as a list of shells
+  // rather than as one 200-line function.
+  int AppendWornShell(const ItemDef& item, const ItemCover& cover,
+                      int bodyLimb, const std::string& partName);
+  // Replace a shell's authoritative lattice with a saved one and re-derive
+  // everything downstream of it (collider, brick, Jolt body). The same three
+  // steps MobSystem::LoadState takes for a carved limb, and for the same
+  // reason: the lattice is the truth and the rest is derived from it.
+  void RestoreShellLattice(int slot, const WornShellDamage& d);
+  // Every appended vector is the same length, and several loops assume it.
+  // Cheap enough to assert after every structural change.
+  bool AppendedInvariantHolds() const;
+  // Binds Mob::WornOccludes to BurnLimbView's plain function-pointer hook.
+  // A struct rather than a lambda because the hook must be a raw pointer (see
+  // BurnLimbView::occlude) and the context has to outlive the call.
+  struct WornProbe {
+    Mob* mob;
+    int limb;
+    static uint32_t Call(void* ctx, const Vec3& from, const Vec3& dir,
+                         float dist) {
+      WornProbe* s = static_cast<WornProbe*>(ctx);
+      return s->mob->WornAlong(s->limb, from, dir, dist);
+    }
+  };
 
   // ---- burn internals -------------------------------------------------------
   BurnLimbView ViewOf(MobLimb& limb);
@@ -612,6 +933,22 @@ class Mob {
   Vec3 bodyUp_{0, 1, 0};       // foot-plane normal (slope tilt)
   float bodyY_ = 0;            // prefab MIN CORNER height (same frame as origin_.y)
   float restSoleY_ = 0;        // rest sole height above the min corner
+  // Rest height of the leg chain's ROOT (the hip anchor) above the min corner,
+  // measured off the rig in BuildRig beside restSoleY_. The pair of them is the
+  // rig's standing leg SPAN: `restHipY_ - restSoleY_` is how far the hip sits
+  // above the ankle in the authored pose, and comparing that against the
+  // chain's summed bone lengths is the only way to know how much reach a stride
+  // has left to spend. On this human it is 6.75 against a 6.79 chain — a
+  // standing figure's legs are all but straight, which is why the avatar has to
+  // crouch to walk at all (see the stance note in PlayerAvatar::UpdateGait).
+  float restHipY_ = 0;
+  // Horizontal distance from that hip anchor to its own ankle anchor in the
+  // REST pose. Not zero: this human's ankle sits 0.5 world voxels in front of
+  // its hip (the shank leans forward), and the gait's stance point inherits
+  // that offset — so the foot starts half a voxel into its own forward reach
+  // before the velocity lead adds anything. Left out of the stance crouch it
+  // consumed the entire reach reserve and the IK sat on its clamp.
+  float restFootAhead_ = 0;
   bool footInit_ = false;
 
   // The rig this instance actually animates: a COPY of def_->skel/limbs,
@@ -622,6 +959,47 @@ class Mob {
   AnimSkeleton skel_;
   std::vector<MobLimbDef> limbDefs_;
   std::vector<uint8_t> hidden_;      // per-limb render suppression
+
+  // How many slots the AUTHORED rig has. Everything at or past this index was
+  // APPENDED — a worn shell or a held item — and is the only thing
+  // RemoveAppendedSlots is allowed to touch. Recorded once in BuildRig rather
+  // than re-derived from def_->limbs.size() at each use, because a hot reload
+  // can swap the def under a live rig and the two would then disagree.
+  int baseLimbs_ = 0;
+
+  // ONE WORN PIECE: which equip slot it came from, what it is by name, and the
+  // appended rig slots it occupies (one per ItemCover entry that found a limb).
+  //
+  // By NAME, not by library index: item indices are file-order and every R
+  // hot-reload renumbers them (item.h's index hazard). The slot LIST is
+  // index-into-limbs_ and is fixed up by RemoveAppendedSlots whenever anything
+  // ahead of it in the appended tail goes away.
+  struct WornPiece {
+    int equipSlot = -1;
+    std::string item;
+    std::vector<int> slots;
+    // Which COVER ENTRY each slot came from, parallel to `slots`. Not the same
+    // as the slot's position in the list: a cover entry that finds no limb on
+    // this wearer is skipped, so a one-armed goblin's robe has three shells
+    // from cover entries 0, 1 and 4. Damage is indexed by cover entry, and
+    // without this the blob would be applied to the wrong shells.
+    std::vector<int> cover;
+    // ---- the occlusion index (one per shell, parallel to `slots`) ----------
+    // Dense material-by-cell over the shell's own lattice box, so
+    // WornOccludes is an O(1) transform-and-look-up rather than a walk of a
+    // few thousand voxels per probe. DERIVED and disposable: rebuilt whenever
+    // the shell's voxel count changes, which is the only thing that can move
+    // a hole into it (carve and burn both compact the lattice). Built LAZILY,
+    // so a dressed creature standing in a field costs nothing at all — the
+    // probe is only ever reached from the burn pass's `scanHot` branch.
+    struct ShellIndex {
+      IVec3 min{}, dims{};
+      std::vector<uint16_t> mat;   // 0 = no voxel here
+      size_t builtFor = (size_t)-1;  // voxel count the index was built from
+    };
+    std::vector<ShellIndex> index;
+  };
+  std::vector<WornPiece> worn_;
 
   // Held item state — ONE piece of entity<->slot sync, kept only in EquipItem.
   int heldSlot_ = -1;
@@ -639,6 +1017,31 @@ class Mob {
   // Re-entrancy guard: FlushBurn expresses itself as a CarveLimb, and
   // CarveLimb flushes before it reads the lattice.
   bool inBurnFlush_ = false;
+
+  // ---- IS THIS RIG SLOT A GARMENT? -------------------------------------------
+  //
+  // The one question the gore path has to ask and could not. Armour is "a set
+  // of borrowed rig slots" (DESIGN.md 8c), which is what makes a shell burn,
+  // dissolve, carve and sever through the body's own machinery with no armour
+  // code -- and is exactly why the body's own machinery then treated a robe
+  // burning off the shoulders as a shoulder coming off: CarveLimb charged a
+  // wound and a drip budget, and Sever armed an arterial gout on the PARENT
+  // limb. Three reported symptoms, one missing distinction:
+  //
+  //   * "fire burning clothes off triggers blood spurts/dismemberment"
+  //   * "clothes burning off launches the player" (the shell was handed to
+  //     DebrisSystem as a dynamic body overlapping the wearer's own capsule)
+  //   * a burning garment reading as an injury on the body HUD
+  //
+  // Asked by TAG, not by index: `ld.tag == "worn"` is what AppendWornShell
+  // stamps and what main.cpp's BodySlotFor already keys the HUD off, so there
+  // is one spelling of "this is wardrobe, not anatomy" rather than two. The
+  // held item (an appended slot with the item's own tag) is deliberately NOT
+  // worn -- a sword cut out of the hand is not a garment and never bled.
+  bool IsWornSlot(int limbIndex) const {
+    return limbIndex >= baseLimbs_ && limbIndex < (int)limbDefs_.size() &&
+           limbDefs_[limbIndex].tag == "worn";
+  }
 
   // how long a severed piece holds its last animated pose before ragdolling
   static constexpr float kSeverHoldSeconds = 0.25f;
@@ -680,7 +1083,11 @@ class MobSystem {
   void SetDayPhase(uint32_t phase) { dayPhase_ = phase; }
   void SetDefs(std::vector<MobDef> defs);           // hot reload
   const std::vector<MobDef>& Defs() const { return defs_; }
-  void Reset();                                      // world regen
+  // Tear down every mob. `rewindIds` also restarts the id counter, which is a
+  // TEST-ONLY seam: mob ids seed gore variance and the blast crater's noise, so
+  // rewinding them changes how the next creature bleeds and tears. See the note
+  // at the definition.
+  void Reset(bool rewindIds = false);                                      // world regen
 
   // Spawn def at a world cell (mob min corner; caller picks ground). 0 = fail.
   uint64_t Spawn(int defIndex, IVec3 atVoxel);
@@ -692,6 +1099,13 @@ class MobSystem {
   // equips one (the implementation is Mob::EquipItem, shared with the avatar).
   bool EquipItem(uint64_t mobId, const ItemDef* item,
                  const char* context = "held_right");
+  // The same scaffolding for ARMOUR: any creature can be dressed through the
+  // identical path the player uses (Mob::WearItem). Nothing calls these yet —
+  // AI that chooses to put a helmet on is out of scope — but the API is what
+  // makes "the goblin is wearing the helmet it dropped" content rather than a
+  // feature.
+  bool WearItem(uint64_t mobId, const ItemDef* item, int equipSlot);
+  bool UnwearItem(uint64_t mobId, int equipSlot);
 
   // Once per tick BEFORE debris.PreTick: kinematic walk drive, terrain
   // anchors, bleeding (bounded BrushOps into `ops`), despawn out-of-window.
@@ -872,6 +1286,25 @@ class MobSystem {
   }
   uint64_t LimbBody(uint64_t mobId, int limbIndex) const;
   bool IsAlive(uint64_t mobId) const;
+
+  // THE MOST INTACT LIMB ANY SEVER HAS TAKEN since the last clear, as a
+  // fraction of that limb's spawn volume, with its name. -1 = nothing severed.
+  //
+  // A limb is supposed to come off because it RAN OUT: the geometric floor is
+  // kLimbCollapseFraction (25% left) and the hp floor at
+  // kCarveDamagePerVolume 1.5 is 33% left. So a sever recorded well above
+  // those is by construction not a limb that was eaten — it is a damage rule
+  // over-charging, or the connectivity split giving the limb's identity to a
+  // fragment. Both of those shipped, and from outside both read only as "a
+  // limb came off". Sampling from a test is impossible without this: the
+  // instant is one tick wide, and if the limb was vital the whole limb list is
+  // gone by the time anyone could look.
+  float WorstSeverFraction() const { return worstSeverFrac_; }
+  const std::string& WorstSeverLimb() const { return worstSeverLimb_; }
+  void ClearSeverStats() {
+    worstSeverFrac_ = -1.0f;
+    worstSeverLimb_.clear();
+  }
   Vec3 MobOrigin(uint64_t mobId) const;
   // The mob's facing direction — the SAME `fwd` the kinematic walk translates
   // along and the same yaw the limb submit applies, so a test written against
@@ -916,6 +1349,15 @@ class MobSystem {
   // would silently measure nothing on exactly the rigs carving matters most on.
   uint32_t LimbVoxelCount(uint64_t mobId, int limbIndex) const;
   uint32_t LimbVoxelsAtSpawn(uint64_t mobId, int limbIndex) const;
+  // How many of a limb's surviving voxels have at least `minOpen` of their six
+  // face-neighbours missing — the roughness of what a carve LEFT BEHIND.
+  //
+  // A voxel count alone cannot tell a torn chunk from a fine sprinkle: remove
+  // the same number of voxels as white noise and as a correlated blob and the
+  // count is identical while the result looks nothing alike. Isolated spurs are
+  // what speckle leaves and what a chunk does not, so this is the shape of the
+  // crater expressed as a number the crater gate can assert on.
+  uint32_t LimbOpenFaceCount(uint64_t mobId, int limbIndex, int minOpen) const;
   // ---- per-voxel burning introspection ---------------------------------------
   // How many voxels of this limb are currently ALIGHT (carry a decay/emit rule).
   // This is the size of the active front, and it is the number the burn gate
@@ -957,6 +1399,28 @@ class MobSystem {
   // Returns true if anything changed. `frontBudget`/`opsBudget` are in/out and
   // shared across every body burning this tick (rule 2: bound the process, not
   // each participant).
+  // ---- WHAT THE ARMOUR ACTUALLY STOPPED, counted -------------------------
+  //
+  // Not diagnostics-in-passing: this is the reporter CLAUDE.md's rule 6 asks
+  // for. "The covered limb caught fire" has at least three causes — the shell
+  // is somewhere else, the probe's transform is wrong, or the burn pass
+  // samples past a shell that is exactly where it should be — and a boolean
+  // at the end of a 160-tick fire distinguishes none of them. These do, on one
+  // line, for the cost of three increments.
+  struct WornStats {
+    uint32_t seedsBlocked = 0;   // contact samples the coat refused
+    uint32_t seedsPassed = 0;    // ...and ones that reached the skin anyway
+    uint32_t nbrSubstituted = 0; // world neighbours replaced by cloth/steel
+    uint32_t nbrThreats = 0;     // ...out of this many that could have acted
+    // Misses a LONGER ray would have caught. Separates "the reach is too
+    // short" from "there is genuinely no shell in that direction", which is
+    // the one distinction a bare miss count cannot make and the one that
+    // decides whether the fix is a constant or a redesign.
+    uint32_t nbrMissInReach = 0;
+  };
+  const WornStats& Worn() const { return wornStats_; }
+  void ResetWornStats() { wornStats_ = WornStats{}; }
+
   bool BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey, World& world,
                    std::vector<CellOp>& cellOps, uint32_t& frontBudget,
                    uint32_t& opsBudget);
@@ -1058,6 +1522,7 @@ class MobSystem {
   std::vector<ReactionGpu> reactions_;
   std::vector<uint8_t> matSelfActive_;  // has decay/emit rules — i.e. is ALIGHT
   std::vector<uint8_t> matHasPair_;     // has pair rules — i.e. is ignitable
+  WornStats wornStats_{};
   std::vector<uint8_t> matHot_;         // carries tag:hot
   // Material has a pair rule that REWRITES ITS NEIGHBOUR. This is the inbound
   // half of the world coupling and it is what makes acid work with no
@@ -1095,6 +1560,10 @@ class MobSystem {
   // Drained by main.cpp each frame. Bounded by the same limits that bound
   // severing itself: a mob has a fixed limb count and kMaxMobs of them exist.
   std::vector<SeverEvent> severs_;
+  // See WorstSeverFraction. Written by Mob::Sever, cleared only on request —
+  // this is a high-water mark over a whole test, not a per-tick event queue.
+  float worstSeverFrac_ = -1.0f;
+  std::string worstSeverLimb_;
   std::vector<BleedSource> bleeds_;
   std::vector<VoiceEvent> voices_;
   // Push a creature voice, de-duplicating Hurt per mob per drain window (see
@@ -1125,6 +1594,13 @@ class MobSystem {
   // order 128 cells; this is the guard against a pathological pose, not a
   // budget anything normal comes near.
   static constexpr uint32_t kBurnScanCells = 4096;
+  // Face SAMPLES one limb may transform when seeding from world contact. A
+  // reactive cell touching the limb costs S*S of these (64 at skinScale 8), and
+  // the direction cull in BurnOneLimb means only faces that really do point at
+  // the limb spend any. Sized so a limb SUBMERGED in acid — a few hundred
+  // contact faces — seeds its whole wetted surface in one tick instead of a
+  // tenth of it, which is what it was doing while this shared kBurnScanCells.
+  static constexpr uint32_t kBurnSeedProbes = 32768;
   // Ticks a cold limb keeps its dense index before releasing it, so a limb
   // walking through a campfire does not rebuild the index every other tick.
   static constexpr uint32_t kBurnIndexGrace = 30;

@@ -264,7 +264,26 @@ struct Tuning {
     // without the player touching a setting.
     float speedFov = 0.06f;
     float speedFovHalflife = 0.35f;
+    // ---- wheel zoom ---------------------------------------------------------
+    // The boom length the player can dial for themselves, as a MULTIPLIER on
+    // `distance`/`shoulderDist` rather than as its own pair of distances: the
+    // two modes then keep their authored relationship (over-shoulder stays
+    // tighter than plain third) at every zoom level, and re-tuning either
+    // distance does not silently move where the player's zoom sits.
+    float zoomStep = 0.12f;   // multiplier change per wheel notch
+    float zoomMin = 0.35f;    // closest, as a fraction of the tuned boom
+    float zoomMax = 2.5f;     // farthest
   } thirdPerson;
+
+  // ---- gear condition ----
+  struct Gear {
+    // Below this fraction of its authored voxels a worn piece is RUINED — see
+    // GearRuined in game/equipment.h. Condition is measured in VOXELS STILL
+    // THERE, because that is what the armour mechanic reads: a shell protects
+    // by being geometrically in the way, so how much of it is in the way is
+    // what its condition means.
+    float ruinedCondition = 0.40f;
+  } gear;
 
   // ---- player avatar ----
   struct Avatar {
@@ -349,6 +368,25 @@ struct Tuning {
     // one tick; a bump crest never does. Too high and a genuine jump animates
     // late. 0 restores the old undebounced behaviour.
     float airDebounce = 0.12f;
+    // ---- what counts as a FALL, and how wild it looks -----------------------
+    // THE FLAIL IS RAMPED, NOT SWITCHED. `fall` used to be a single wide pose
+    // (both arms out in front, both legs raked behind) that started whole the
+    // moment airTime passed a threshold — so a step off a kerb played the same
+    // arms-out shape as a drop off a cliff, and the character seemed to be
+    // permanently falling while walking on rough ground. The clip is authored
+    // near-natural now and its WEIGHT ramps with how long the body has been in
+    // the air: a short drop never reaches the wide pose at all, and a genuine
+    // fall arrives at it over a beat instead of snapping into it.
+    //
+    // Seconds of air before the flail starts to come in, and seconds it takes
+    // to reach full once it does.
+    float fallFlailDelay = 0.35f;
+    float fallFlailRamp = 0.9f;
+    // Meters the body must have DROPPED below the height it last had support at
+    // before the fall clip may play at all. Air time alone is not a fall: a
+    // step-down clears any debounce, and so does cresting a bump at speed.
+    // Distance is the honest question, and it is the one a player would answer.
+    float fallMinDrop = 1.2f;
     // Damage/dismemberment feel.
     float severImpulse = 6.0f;   // extra shove given to a part as it comes off
     // How long the corpse's parts stay before the avatar can respawn, seconds.
@@ -673,6 +711,41 @@ struct Tuning {
     // that varies per mob makes the bleedBudgetCap bound unreadable.
     float bleedGain = 1.0f;
     Variance bleedGainVar;
+
+    // ========================================================================
+    // D. CRATER SHAPE — what a blast takes off a body, and in what size pieces
+    // ========================================================================
+    // The old crater was per-voxel WHITE NOISE against a `1 - t^2` radial
+    // falloff. Both halves work against concentration: `1 - t^2` is still 0.75
+    // at half the radius and 0.36 at 80% of it, so a large blast genuinely does
+    // sprinkle the whole body, and an independent coin flip per voxel has no
+    // feature size at all — what comes off is a fine speckle rather than a
+    // piece. That is the reported "thin scatter of voxels spread over the whole
+    // body".
+    //
+    // These four turn that into a torn chunk. carveChunkiness is the master
+    // slider and 0 reproduces the old behaviour EXACTLY (the noise lerps back
+    // to the same Hash3 draw, the falloff exponent lerps back to 1, and the
+    // spall pass is skipped) — that identity is asserted by the mob gate, so
+    // the knob is a genuine A/B rather than an approximation of one.
+    float carveChunkiness = 0.65f;
+    // Feature size of the correlated noise, in SKIN voxels. This is the size of
+    // the lumps that come off. Kept on the skin lattice for the same reason the
+    // rim jitter already is: the crater's shape must be a property of the ART,
+    // not of whichever collider resolution the engine happened to derive, or
+    // the same blast tears differently on two rigs that differ only in scale.
+    float carveBlobSize = 3.5f;
+    // Exponent on the radial falloff at full chunkiness. Higher concentrates
+    // the removal at the blast: at 3, the chance is 0.42 at half the radius and
+    // 0.047 at 80% of it, against 0.75 and 0.36 before.
+    float carveFalloff = 3.0f;
+    // How many SPALL rounds run after the radial pass. Each round takes
+    // surviving voxels that are inside the blast and already have enough
+    // missing face-neighbours — so a hole grows into its own rim instead of a
+    // second blast having to find fresh voxels. This is what makes damage
+    // accumulate in one place, and what makes a blast beside an arm take the
+    // arm. Bounded and small: each round is one pass over the limb's voxels.
+    int carveSpallRounds = 2;
   } gore;
 
   // ---- grenade ----
@@ -1425,6 +1498,62 @@ struct Tuning {
     bool iceMelts = true;
   } weather;
 
+  // ---- combustion: how long anything in the world stays alight ----
+  //
+  // The second group (after `weather`) that is consumed by the REACTION
+  // COMPILER rather than by a kernel, and for the same reason: it is cheaper
+  // and clearer to change what the table SAYS than to have every cell in the
+  // world re-derive it. LoadAssets reads this while compiling reactions.json —
+  // which is why LoadTuning must run before LoadAssets on every path that has
+  // both, including the F5 reload (see the note at the reload site in
+  // main.cpp).
+  //
+  // Nothing here reaches a shader, so there is no row in tuning_params.def and
+  // no TUNE_* constant. The multiplier is applied on the CPU in double and
+  // rounded ONCE into the same integer chance an authored value compiles to
+  // (rule 1) — the GPU cannot tell a scaled rule from a hand-authored one.
+  struct Combustion {
+    // Percent multiplier on how long a LIT voxel stays lit: 100 = exactly what
+    // reactions.json authors, 200 = twice as long, 50 = half.
+    //
+    // It divides the chance of every rule that carries "burnDuration": true,
+    // which is every rule belonging to the COMBUSTION CLOCK. Two kinds qualify.
+    // The rules that RETIRE a burning voxel — ember to ash/smoke/air,
+    // cloth/undercloth/hair/flesh burning to their charred or spent forms — are
+    // the feature. The RELIGHT rules (charred back to burning) are the subtler
+    // half: they are the only closed loop in the fire economy, its gain is
+    // (relight chance) x (how long a neighbour stays lit), and scaling only the
+    // retire side multiplies that gain by the same factor. That is a CEILING
+    // argument, not a fix for anything visible at the default: measured at
+    // 200%, scaling the relight rules moved `mob-burn`'s quiet corpse from 13
+    // voxels still alight to 15, i.e. not at all. At this knob's 800% the
+    // unscaled gain would cross 1.0 and the fire would never go out (rule 2).
+    // Scaling both holds the gain exactly where the author put it at every
+    // setting — the slider changes the fire's CLOCK and never its shape.
+    //
+    // Because it scales all of a material's branches by the same factor, the
+    // RATIOS between them are untouched: doubling the duration does not change
+    // what fraction of a burnt robe survives as ash.
+    //
+    // It deliberately does NOT touch three neighbouring things:
+    //   * IGNITION chances — how fast fire spreads through fuel is a separate
+    //     lever, and reactions.json says so at the top of its combustion
+    //     section. Turning this up still spreads fire FURTHER, though, because
+    //     a voxel that stays lit twice as long emits its upward fire twice as
+    //     many times over its life.
+    //   * EMIT chances — how much flame a lit voxel shows per tick. Scaling
+    //     these too would make a longer burn a dimmer one, which is the
+    //     opposite of what anyone reaches for this knob to get.
+    //   * EXTINGUISHER rules — water must beat the burn to the tick at any
+    //     setting.
+    //
+    // Default 200 (owner request, 2026-08-30): flammability had just been
+    // raised and bodies caught readily but went out again in well under a
+    // second, so a burning character neither spread the fire nor took much
+    // damage from it.
+    int burnDurationPct = 200;
+  } combustion;
+
   // ---- wind: the ambient field (docs/RESEARCH_wind.md, DESIGN.md §12) ----
   //
   // Wind is a PURE FUNCTION of (world position, time) — `windAt` in
@@ -2163,20 +2292,11 @@ struct Tuning {
     int shoreHorsetailChance = 10, shoreHorsetailHeight = 9;
     int shoreIrisChance = 34;
     int shoreMossChance = 3;         // 1-in-N wet stone faces wear moss
-    // Vines, climbers and hanging moss. Same shape as the pond vegetation and
-    // for the same reason: a 1-in-N roll per candidate COLUMN (never per cell,
-    // or the strands come out dashed), placing inert solids once at
-    // generation. Nothing here grows, so a settled forest still sleeps.
-    // The geometry is derived implicitly from the tree that hosts it — the
-    // canopy underside is solved in closed form from the crown parameters, so
-    // a strand costs one integer sqrt and no extra world scan.
-    int vineChance = 26;             // 1-in-N canopy columns carry a strand
-    int vineLenMin = 10, vineLenSpan = 26;   // strand length, voxels
-    int creeperFlowerChance = 9;     // 1-in-N strands are a flowering creeper
-    int mossChance = 14;             // 1-in-N columns carry a moss beard
-    int mossLenMin = 4, mossLenSpan = 9;
-    int ivyChance = 2;               // 1-in-N bole-shell cells grow ivy
-    int ivyTwist = 5;                // ivy rope spiral, 1/16 turn per voxel
+    // Tree vines, hanging moss and trunk ivy USED TO BE TUNED HERE. They were
+    // implicit decoration worldgen drew on top of a tree, which is exactly the
+    // kind of divergence the .svtree bake exists to end: the tuner's Trees tab
+    // is the only tree authoring surface now, so a decoration is either baked
+    // into the atlas or it does not exist. Wall ivy is not tree decoration.
     int wallIvyDensity = 3;          // 1..8, arena + ruin stone-wall coverage
     // ---- desert / pine highland / alpine ground cover ----
     // Percent of 2.5 m tiles in the desert that hold a cactus, and the percent

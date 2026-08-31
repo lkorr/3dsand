@@ -588,6 +588,8 @@ void DebrisSystem::PreTick(uint32_t tick, World& world, std::vector<CellOp>& cel
       // terrain under the blast changed: sleeping debris nearby must re-check
       Vec3 c{(float)(e.lo.x + e.hi.x) * 0.5f, (float)(e.lo.y + e.hi.y) * 0.5f,
              (float)(e.lo.z + e.hi.z) * 0.5f};
+      settle_.blastWakes++;
+      settle_.lastWakeTick = tick;
       phys_->WakeNear(c, (float)kMaxRegionCells);
     } else if ((events_.size() > 1 && tick > events_.front().tick + 120) ||
                tick > events_.front().tick + 300) {
@@ -667,7 +669,10 @@ void DebrisSystem::SettleBodies(uint32_t tick, World& world,
       b.inactiveTicks = 0;
       continue;
     }
-    if (++b.inactiveTicks < kSettleAfterTicks) continue;
+    ++b.inactiveTicks;
+    settle_.maxInactiveTicks =
+        std::max(settle_.maxInactiveTicks, b.inactiveTicks);
+    if (b.inactiveTicks < kSettleAfterTicks) continue;
     if (b.inactiveTicks % 30 != 0) continue;  // re-test alignment cheaply
 
     // rotation -> 3x3, then the nearest signed permutation. Reject when any
@@ -1465,6 +1470,10 @@ void DebrisSystem::ReleaseBody(Body& b) {
   // MicroBodyFree — only copy-on-write clones this body owns are reclaimed.
   if (b.micro.Valid() && microSet_) MicroBodyFree(*microSet_, b.micro.model);
   b.micro = MicroBodyRef{};
+  // Told BEFORE the handle is destroyed, so a listener may still ask physics
+  // about it. Every path that lets go of a body funnels through here, which is
+  // what makes one notification enough (see SetOnBodyGone).
+  if (b.handle && onBodyGone_) onBodyGone_(b.handle);
   if (b.handle) phys_->RemoveBody(b.handle);
   b.handle = 0;
 }
@@ -1914,6 +1923,38 @@ bool DebrisSystem::SplitBody(uint64_t handle, Vec3 planePointVoxel,
   return true;
 }
 
+bool DebrisSystem::DestroyBody(uint64_t handle) {
+  if (!handle) return false;
+  for (size_t i = 0; i < bodies_.size(); i++) {
+    if (bodies_[i].handle != handle) continue;
+    ReleaseBody(bodies_[i]);
+    bodies_.erase(bodies_.begin() + i);
+    instancesDirty_ = true;
+    return true;
+  }
+  return false;
+}
+
+bool DebrisSystem::BodyLatticeOf(uint64_t handle, std::vector<PrefabVoxel>& out,
+                                 uint32_t& outScale) const {
+  for (const Body& b : bodies_) {
+    if (b.handle != handle) continue;
+    out.clear();
+    if (b.HasFineSkin()) {
+      outScale = b.micro.skinScale;
+      out = b.skinVoxels;
+    } else {
+      outScale = b.physScale ? b.physScale : 1u;
+      out.reserve(b.voxels.size());
+      for (const DebrisVoxel& v : b.voxels)
+        out.push_back(PrefabVoxel{(int16_t)v.x, (int16_t)v.y, (int16_t)v.z,
+                                  v.payload, v.color});
+    }
+    return true;
+  }
+  return false;
+}
+
 void DebrisSystem::ManageTerrain(uint32_t tick, World& world) {
   const WorldSnapshot& snap = world.Snap();
 
@@ -2033,6 +2074,9 @@ void DebrisSystem::ManageTerrain(uint32_t tick, World& world) {
     t.builtVersion = cc->version;
     t.meshHash = h;
     // ground under sleeping debris may have moved: let them re-settle
+    settle_.terrainWakes++;
+    settle_.lastWakeTick = tick;
+    settle_.lastWakeChunk = wc;
     phys_->WakeNear(Vec3{(float)origin.x + 8, (float)origin.y + 8,
                          (float)origin.z + 8},
                     24.0f);
@@ -2247,6 +2291,10 @@ uint32_t DebrisSystem::ActiveBodyCount() const {
   for (const Body& b : bodies_)
     if (phys_->IsActive(b.handle)) n++;
   return n;
+}
+
+bool DebrisSystem::BodyActive(uint32_t i) const {
+  return i < bodies_.size() && phys_->IsActive(bodies_[i].handle);
 }
 
 // ---- persistence (entities.sve section 'DBRS') ------------------------------

@@ -1,0 +1,84 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>tuner tab isolation harness</title>
+<!--
+  tabs_test.html — does clicking a tab show THAT tab and nothing else?
+
+  WHY THIS EXISTS. tuner.html switches tabs with two CSS rules:
+
+      .view{display:none}          (0,1,0)
+      .view.active{display:block}  (0,2,0)
+
+  Every tab panel is styled by the tab's own module, and a module that writes a
+  bare `#view-<name>{...display:...}` rule wins on ID specificity (1,0,0) and
+  pins its panel visible on EVERY tab. That is invisible to `check_trees.sh`
+  and to every gate — the Trees tab itself works perfectly; it is the WIKI that
+  breaks — so nothing in the repo would have caught it. This harness asks the
+  only question that does: after clicking tab X, which panels have a computed
+  display other than `none`?
+
+  It drives the REAL tuner.html in an iframe against the real server, so the
+  modules that inject the styles have actually run.
+-->
+<style>body{background:#0e1116;color:#cfd8e3;font:13px/1.5 monospace;margin:0}
+pre#out{padding:12px;white-space:pre-wrap}
+iframe{position:absolute;left:-4000px;width:1280px;height:900px;border:0}</style>
+<pre id="out">running…</pre>
+<iframe id="f" src="tuner.html"></iframe>
+<script>
+const out = document.getElementById('out');
+const lines = [];
+function say(s) { lines.push(s); out.textContent = lines.join('\n'); }
+
+// REAL TIME, NOT TIMER TIME. Chrome's --virtual-time-budget fast-forwards
+// setTimeout, so a sleep-poll here completes instantly in virtual time and the
+// page is measured before the tab modules have injected their styles. A real
+// network round-trip is not fast-forwardable, which is why check_worldview.sh
+// polls the same way. Each call is ~1-3 ms against the local tuner server.
+async function sleep(ms) {
+  const t0 = Date.now();
+  do { try { await fetch('/api/status', {cache: 'no-store'}); } catch (e) { return; } }
+  while (Date.now() - t0 < ms);
+}
+
+(async () => {
+  const f = document.getElementById('f');
+  await new Promise(r => f.addEventListener('load', r, {once: true}));
+  const doc = f.contentDocument;
+
+  // The tab modules (Models, Trees) are dynamic imports that append their
+  // <style> AFTER load fires. Poll for the Trees stylesheet rather than
+  // sleeping a guess — the whole point is to test the page in its settled
+  // state, and a fixed sleep either flakes or wastes the time budget.
+  let ready = false;
+  for (let i = 0; i < 120 && !ready; i++) {
+    ready = !!doc.querySelector('#view-trees .tgbar, #view-trees .tgsliders');
+    if (!ready) await sleep(250);
+  }
+  say(ready ? 'trees module: initialised' : 'trees module: DID NOT INITIALISE (styles may not be injected)');
+
+  const buttons = [...doc.querySelectorAll('nav.tabs button[data-tab]')];
+  const views = [...doc.querySelectorAll('.view')];
+  say('tabs: ' + buttons.length + ', view panels: ' + views.length);
+  say('');
+
+  let bad = 0;
+  for (const b of buttons) {
+    const tab = b.dataset.tab;
+    b.click();
+    await sleep(60);
+    const shown = views
+      .filter(v => f.contentWindow.getComputedStyle(v).display !== 'none')
+      .map(v => v.id);
+    const want = 'view-' + tab;
+    const ok = shown.length === 1 && shown[0] === want;
+    if (!ok) bad++;
+    say((ok ? 'ok   ' : 'FAIL ') + tab.padEnd(10) +
+        ' visible: ' + (shown.join(', ') || '(none)'));
+  }
+
+  say('');
+  say(bad === 0 ? 'RESULT OK — every tab shows exactly its own panel'
+                : 'RESULT BAD — ' + bad + ' tab(s) show the wrong panel');
+})().catch(e => { say('HARNESS ERROR ' + e); say('RESULT BAD'); });
+</script>

@@ -505,6 +505,164 @@ grab("screenshot.bmp");
   return Status::Pass;
 }
 
+// ---- fire-depth: does a flame cover what is behind it? ------------------
+//
+// THE BUG. The raymarcher draws the world and then the raster passes draw
+// rigidbodies on top, sharing one reversed-Z depth buffer. Gas is not a
+// surface — trace() accumulates it and keeps marching — so the depth the
+// raymarcher wrote for a pixel full of fire was the depth of the SOLID BEHIND
+// the fire, or the far plane for a ray that crossed the plume and reached sky.
+// Every mob, every debris chunk and every dropped item therefore passed the
+// depth test against a flame it was genuinely behind and drew straight over
+// it. Fire never composited in front of a rigidbody at any distance, at any
+// density: a burning creature had its own flames painted behind it.
+//
+// THE FIX is a depth for the volume — the point where the gas becomes half
+// opaque (Hit.gasHalfT). BOTH HALVES ARE THE CLAIM, which is why this gate
+// renders two arms rather than one: putting depth at the plume's FIRST cell
+// would also pass "the fire hides what is behind it" while wrecking the case
+// that already worked, so an arm that only checks the fix is not a test.
+//
+// Deliberately no Jolt and no DebrisSystem: the four body buffers are just
+// buffers, so the fixture writes one slot's worth of cubes directly. The
+// question is entirely about depth ordering between two draws, and a physics
+// body that settles, sleeps or falls out of frame is a second thing that can
+// break the picture.
+Status GateFireDepth(Ctx& c, std::string& detail) {
+  GpuContext& ctx = c.ctx;
+  World& world = c.world;
+  Simulation& sim = c.sim;
+  const uint32_t W = c.width, H = c.height;
+
+  auto matId = [&](const char* n) -> uint32_t {
+    for (size_t i = 0; i < c.mats.size(); i++)
+      if (c.mats[i].name == n) return (uint32_t)i;
+    return 0;
+  };
+  const uint32_t mFire = matId("fire"), mStone = matId("stone");
+  if (!mFire || !mStone) {
+    detail = "fire or stone missing from materials.json";
+    return Status::Fail;
+  }
+
+  SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+  ctx.WaitIdle();
+
+  // Open air well above the canopy, so the background is SKY. Against terrain
+  // both arms would also be measuring the terrain shading behind the slab.
+  const int gx = 300, gz = 300;
+  const int y0 = World::TerrainHeight(gx, gz, kDefaultSeed) + 60;
+  const IVec3 pchunk{gx / 16, y0 / 16, gz / 16};
+
+  // A SLAB, not a puff: the ray has to cross enough fire to reach half
+  // opacity (~1.8 cells at fire's authored opacity 150/255), and one sim tick
+  // of a gas rearranges it. Six deep leaves margin for both.
+  std::vector<CellOp> fireOps;
+  for (int dx = 0; dx < 6; dx++)
+    for (int dy = -6; dy <= 6; dy++)
+      for (int dz = -6; dz <= 6; dz++) {
+        const IVec3 cc{gx + dx, y0 + dy, gz + dz};
+        if (!world.CellInWindow(cc)) continue;
+        fireOps.push_back({World::SlotCellIndex(cc), PackVoxNew(mFire, 7u)});
+      }
+  uint32_t t = 40000;
+  SubmitTick(ctx, world, sim, ++t, kDefaultSeed, {}, {}, fireOps, false, pchunk,
+             false, false);
+  ctx.WaitIdle();
+
+  // Camera on the -X side looking along +X straight through the slab.
+  Camera cam;
+  cam.yaw = 0.0f;    // atan2(look.z, look.x) == 0 is +X
+  cam.pitch = 0.0f;
+  const Vec3 eye{(float)gx - 34.0f, (float)y0 + 0.5f, (float)gz + 0.5f};
+
+  // One slot of cube instances: a 7^3 block of stone at a given min corner.
+  auto renderWithBlock = [&](const Vec3* corner, std::vector<uint8_t>& out) {
+    std::vector<BodyVoxInst> inst;
+    std::vector<BodyXformGpu> xf;
+    if (corner) {
+      // Packed by hand rather than through rigrender: that header uses math3d
+      // names unqualified at namespace scope, so it only compiles after a
+      // `using namespace sandvox`, and one include in the wrong order here is
+      // a wall of errors inside a file this gate has no business touching.
+      // Slot 0, no art colour — see BodyVoxInst in phys/debris.h.
+      for (int x = 0; x < 7; x++)
+        for (int y = 0; y < 7; y++)
+          for (int z = 0; z < 7; z++)
+            inst.push_back({(float)x, (float)y, (float)z, mStone});
+      BodyXformGpu m{};
+      m.pos[0] = corner->x; m.pos[1] = corner->y; m.pos[2] = corner->z;
+      m.quat[3] = 1.0f;
+      xf.push_back(m);
+      ctx.queue.WriteBuffer(world.bodyInstances, 0, inst.data(),
+                            inst.size() * sizeof(BodyVoxInst));
+      ctx.queue.WriteBuffer(world.bodyXforms, 0, xf.data(),
+                            xf.size() * sizeof(BodyXformGpu));
+    }
+    WriteRenderParams(ctx.queue, world, eye, cam, (float)W / H, true, 0.0f,
+                      kFarFogDensity, 1080.0f, t);
+    rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
+    rhi::RenderPass rp = sim.BeginRenderPass(
+        enc, c.view, rhi::TextureFormat::RGBA8Unorm, W, H);
+    sim.DrawWorld(rp);
+    sim.DrawBodies(rp, (uint32_t)inst.size());
+    rp.End();
+    rhi::Buffer shot =
+        CreateBuffer(ctx.device, (uint64_t)W * H * 4,
+                     rhi::BufferUsage::MapRead | rhi::BufferUsage::CopyDst,
+                     "fireDepthShot");
+    rhi::TexelCopyTexture srcT{};
+    srcT.texture = c.offscreen;
+    rhi::TexelCopyBuffer dstB{};
+    dstB.buffer = shot;
+    dstB.bytesPerRow = W * 4;
+    dstB.rowsPerImage = H;
+    rhi::Extent3D ext{W, H, 1};
+    enc.CopyTextureToBuffer(srcT, dstB, ext);
+    ctx.queue.Submit(enc.Finish());
+    out.assign((size_t)W * H * 4, 0);
+    return rhi::ReadBufferBlocking(ctx.device, shot, 0, out.data(), out.size());
+  };
+
+  std::vector<uint8_t> flameOnly, behindPx, frontPx;
+  const Vec3 behind{(float)gx + 14.0f, (float)y0 - 3.0f, (float)gz - 3.0f};
+  const Vec3 front{(float)gx - 16.0f, (float)y0 - 3.0f, (float)gz - 3.0f};
+  const bool got = renderWithBlock(nullptr, flameOnly) &&
+                   renderWithBlock(&behind, behindPx) &&
+                   renderWithBlock(&front, frontPx);
+  if (!got) {
+    detail = "readback failed";
+    return Status::Fail;
+  }
+
+  auto changed = [&](const std::vector<uint8_t>& a) {
+    uint32_t n = 0;
+    for (size_t i = 0; i + 3 < a.size(); i += 4) {
+      const int d = std::max({std::abs((int)a[i] - (int)flameOnly[i]),
+                              std::abs((int)a[i + 1] - (int)flameOnly[i + 1]),
+                              std::abs((int)a[i + 2] - (int)flameOnly[i + 2])});
+      if (d > 8) n++;
+    }
+    return n;
+  };
+  const uint32_t behindShown = changed(behindPx);
+  const uint32_t frontShown = changed(frontPx);
+
+  // The block subtends the same solid angle in both arms (same size, mirrored
+  // offset), so the two counts are directly comparable and no pixel budget has
+  // to be hardcoded. In FRONT it must be plainly visible; BEHIND, the flame
+  // must swallow nearly all of it. A tenth is loose on purpose: fire is a
+  // volume with soft edges and its silhouette is not the block's.
+  const bool frontOk = frontShown > 2000;
+  const bool behindOk = behindShown * 10 < frontShown;
+  const bool ok = frontOk && behindOk;
+  std::printf("fire depth: %s (block behind the flame paints %u px, same block "
+              "in front paints %u px; behind must be under a tenth of front)\n",
+              ok ? "PASS" : "FAIL", behindShown, frontShown);
+  detail = Format("behind %u px, front %u px", behindShown, frontShown);
+  return ok ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& RenderGates() {
@@ -516,6 +674,7 @@ const std::vector<Gate>& RenderGates() {
       // far-downsample exercise the far-field cascades through compute and a
       // one-word readback, and never touch the offscreen target.
       {"screenshots", "render", {}, false, GateScreenshots, /*needsRender=*/true},
+      {"fire-depth", "render", {}, false, GateFireDepth, /*needsRender=*/true},
   };
   return g;
 }

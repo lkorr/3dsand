@@ -154,7 +154,27 @@ W_MBPOOL=$((1 << W_MBSHIFT))
 W_WBCAP="$(cpp_const kWaterBodyCap)"
 W_WBWORDS="$(cpp_const kWaterBodyWords)"
 W_WBSTATE="$(cpp_const kWaterBodyStateWords)"
+# Present in ShaderConstantPrelude() but missing here, so every check_shaders.sh
+# run reported sim_waterbody.wgsl as broken while the real build compiled it
+# fine -- exactly the "add it to BOTH" gap CLAUDE.md names.
+W_WDRAINOPS="$(cpp_const kWaterDrainOpsPerBody)"
 W_WCHUNKCAP="$(cpp_const kWaterChunkCap)"
+# The sweep/curve block (world.h kWaterCurveBase). These landed in
+# ShaderConstantPrelude() without landing here, which left common.wgsl unable to
+# resolve WATER_SWEEP_HEADER and failed ALL 17 shaders — the checker was dead for
+# every caller, not just water. CLAUDE.md's rule: a new generated constant goes
+# in BOTH places in the same commit.
+W_WSPLITGRID="$(cpp_const kWaterSplitGrid)"
+W_WSPLITCELLS="$(cpp_const kWaterSplitCells)"
+W_WSPLITWORDS="$(cpp_const kWaterSplitWords)"
+W_WCURVEMAXY="$(cpp_const kWaterCurveMaxY)"
+W_WSWEEPHDR="$(cpp_const kWaterSweepHeaderWords)"
+W_WCURVEWORDS="$(cpp_const kWaterCurveWords)"
+W_WSCRATCHWORDS="$(cpp_const kWaterSweepScratchWords)"
+# Derived in world.h from the caps above, so derive them the same way rather
+# than scraping a comment.
+W_WCURVEBASE=$((W_WBCAP * W_WBSTATE))
+W_WSCRATCHBASE=$((W_WCURVEBASE + W_WBCAP * W_WCURVEWORDS))
 if [ -z "$W_WBCAP" ] || [ -z "$W_WBWORDS" ] || [ -z "$W_WBSTATE" ] \
    || [ -z "$W_WCHUNKCAP" ]; then
   echo "check_shaders: cannot parse kWaterBody*/kWaterChunkCap from $WORLD_H" >&2
@@ -219,7 +239,16 @@ PRELUDE_TEXT="$(printf '%s\n' \
   "const WATERBODY_CAP : u32 = ${W_WBCAP}u;" \
   "const WATERBODY_WORDS : u32 = ${W_WBWORDS}u;" \
   "const WATERBODY_STATE_WORDS : u32 = ${W_WBSTATE}u;" \
+  "const WATER_DRAIN_OPS : u32 = ${W_WDRAINOPS}u;" \
   "const WATER_CHUNK_CAP : u32 = ${W_WCHUNKCAP}u;" \
+  "const WATER_SPLIT_GRID : u32 = ${W_WSPLITGRID}u;" \
+  "const WATER_SPLIT_CELLS : u32 = ${W_WSPLITCELLS}u;" \
+  "const WATER_SPLIT_WORDS : u32 = ${W_WSPLITWORDS}u;" \
+  "const WATER_CURVE_MAXY : u32 = ${W_WCURVEMAXY}u;" \
+  "const WATER_SWEEP_HEADER : u32 = ${W_WSWEEPHDR}u;" \
+  "const WATER_CURVE_WORDS : u32 = ${W_WCURVEWORDS}u;" \
+  "const WATER_CURVE_BASE : u32 = ${W_WCURVEBASE}u;" \
+  "const WATER_SCRATCH_BASE : u32 = ${W_WSCRATCHBASE}u;" \
   "const FAR_LEVELS : u32 = ${W_FAR}u;" \
   "const FAR_N : u32 = ${W_FARN}u;" \
   "const FAR_NCHUNK : u32 = ${W_FARNCHUNK}u;" \

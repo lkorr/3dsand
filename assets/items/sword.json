@@ -1,11 +1,11 @@
 {
-  "comment": "The sword as a standalone item: its own art, its own origin. Held by BORROWING a rig slot (see src/game/item.cpp), so it is a real rig Part while worn and severs, drops, burns and carves exactly like a limb. Regenerate with scripts/gen_sword_item.py \u2014 the edge block is emitted from the same constants that build the mesh, so the hitbox cannot drift from the art.",
+  "comment": "The sword as a standalone item: its own art, its own origin. Held by BORROWING a rig slot (see src/game/item.cpp), so it is a real rig Part while worn and severs, drops, burns and carves exactly like a limb. Regenerate with scripts/gen_sword_item.py — the edge block is emitted from the same constants that build the mesh, so the hitbox cannot drift from the art.",
   "name": "sword",
   "model": "sword",
-  "scale": 4,
+  "artVoxelsPerMetre": 40,
   "hp": 30,
   "severable": true,
-  "severImpactSpeed": 7.0,
+  "severImpactSpeed": 7,
   "grip": {
     "held_right": {
       "translation": [
@@ -18,7 +18,7 @@
         -90,
         0
       ],
-      "scale": 1.0
+      "scale": 1
     }
   },
   "hilt": {

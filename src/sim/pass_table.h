@@ -107,6 +107,13 @@ enum class Buf : uint8_t {
   // the four sim_waterbody.wgsl entry points and read by nothing else on the
   // tick path, which is what lets it be one buffer with one barrier class.
   WaterBodyState,
+  // The baked tree atlas (src/sim/treeatlas.h). READ-ONLY, dispatch-invariant
+  // asset data uploaded once at load, exactly like Materials -- worldgen samples
+  // it instead of evaluating implicit tree shapes per cell. It never appears on
+  // a write side, so it generates no barriers; it is in the table because a
+  // read that the table does not know about is the failure mode this file
+  // exists to make impossible.
+  TreeAtlas,
   kCount,
 };
 

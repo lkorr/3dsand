@@ -1,5 +1,7 @@
 #include "game/avatar.h"
 
+#include "sim/scale.h"  // MetresToCells
+
 #include "phys/lattice.h"
 
 #include <algorithm>
@@ -63,6 +65,56 @@ constexpr float kMinSwingSeconds = 0.09f;
 // than exactly at full extension (a foot that lands at maximum reach is a
 // straight, locked leg — the pose we are trying to avoid).
 constexpr float kSwingTravelFrac = 0.7f;
+
+// THE STANCE RESERVE — how much of the leg's reach is kept in hand.
+//
+// A two-bone chain asked for exactly L1 + L2 is a locked, straight leg, and
+// AnimSolveTwoBone clamps at dMax = L1 + L2 - eps, so a target at or past full
+// extension produces the SAME pose for every target beyond it. Solving at 97%
+// leaves a real bend at the knee in the neutral stance and keeps the solve away
+// from the numerically nasty end of the acos.
+constexpr float kStanceReachFrac = 0.97f;
+
+// Ceiling on the stance crouch, in leg lengths. The crouch below is derived
+// from the geometry and is well-behaved, but `strideBias` is authored data —
+// a rig that asks for a stride longer than its own leg would otherwise drive
+// the pelvis into the floor rather than simply failing to reach.
+constexpr float kMaxCrouchLegLengths = 0.30f;
+
+// Half-life on the stance crouch. Short on purpose: the crouch demand
+// oscillates once per STEP now (see the stance note in UpdateGait), and a
+// half-life anywhere near the step period averages that oscillation away and
+// gives back the permanent half-crouch it replaced.
+constexpr float kCrouchHalflife = 0.05f;
+
+// How long the GAIT keeps its footing after `grounded` drops, and how far the
+// body may have left the ground it last stood on while it does.
+//
+// These are not the clips' `avatar.airDebounce`, and deliberately longer than
+// it: the clips only have to avoid firing a one-shot, whereas losing the gait
+// re-plants both feet from scratch (UpdateAirPose clears footInit_) and fades
+// the leg IK out to the rest hang, so every flicker of `grounded` snapped the
+// legs to a standing pose mid-stride. On microvoxel terrain that is most steps
+// — Player::grounded is a 0.1-voxel positional probe, and a one-voxel step-down
+// at walk pace is genuinely airborne for ~0.14 s, longer than the 0.12 s the
+// clips debounce with.
+//
+// The DISTANCE is what keeps this from swallowing a real jump: air time alone
+// cannot tell a kerb from a launch, but a jump has left the floor by half a leg
+// within about three ticks, and once the body is that far up there is no
+// footing to keep.
+constexpr float kGaitCoyoteSeconds = 0.30f;
+constexpr float kGaitCoyoteLegLengths = 0.5f;
+
+// Stride-clock lock. `kStrideSyncGain` is how much of the phase error is taken
+// out at each touchdown: 1 snaps (and pops the bob), 0 never locks. Half
+// converges inside two steps while keeping every correction sub-visible once
+// locked. `kStepPeriodHalflife` smooths the measured step period so one long
+// stride over a ledge does not slew the whole clock.
+constexpr float kStrideSyncGain = 0.5f;
+constexpr float kStepPeriodHalflife = 0.25f;
+// A step slower than this is not a gait — the clock parks rather than crawling.
+constexpr float kMaxStepPeriod = 1.2f;
 
 ParticleSpawn MakeDroplet(Vec3 posVoxel, Vec3 vel, uint32_t material,
                           bool micro, int lifeTicks, int microScale) {
@@ -311,6 +363,58 @@ void PlayerAvatar::UpdateGait(float dt, World& world) {
   float speedFactor =
       std::clamp(speedNow_ / std::max(def_->speed, 0.01f), 0.0f, 1.5f);
 
+  // Stride clock: the time since the last touchdown, which the sync at the
+  // bottom of the swing turns into a measured step period. Advanced here so it
+  // keeps counting through a stride where no foot happens to land.
+  sinceTouchdown_ += dt;
+
+  // ---- THE STANCE CROUCH: where the stride's reach actually comes from -----
+  //
+  // The avatar pins bodyY_ to the player's AABB sole (see the body-height note
+  // at the end of this function), so the hip sits at a FIXED height above the
+  // ground. That is the whole stride budget, and on a rig authored standing it
+  // is essentially zero: this human's hip is 7.50 above the min corner and its
+  // ankle 0.75, a 6.75 span against a 6.79-voxel chain. A foot placed on the
+  // ground `s` voxels fore or aft of the hip is sqrt(6.75^2 + s^2) away, so the
+  // leg runs out of reach at s = 0.7 VOXELS. Every step longer than that lands
+  // on AnimSolveTwoBone's reach clamp, which produces one identical straight-leg
+  // pose for every target beyond it — the stride stops existing and the leg just
+  // rotates. That is "the legs don't swing enough", and it is geometry, not
+  // tuning: no cadence, threshold or amplitude can buy reach the leg has not got.
+  //
+  // A real walker buys it by bending the knees, so do that.
+  //
+  // BUT ONLY WHILE THE LEG IS ACTUALLY OUT AT THE END OF ITS STRIDE. The first
+  // version of this solved for the WORST-CASE excursion — the far end of the
+  // stride the gait was about to ask for — and then held that crouch for the
+  // whole cycle. That is the wrong shape, and backwards from a real walk: a
+  // walking pelvis is LOWEST at double support, when the feet are apart, and
+  // HIGHEST at midstance, when the supporting leg is vertical and straight.
+  // Holding the double-support height through midstance means the leg is at its
+  // most bent exactly where it should be straightest. Measured on this rig at
+  // walk pace it pinned 0.77 voxels of crouch permanently — 88% leg extension,
+  // ~56 degrees of knee, held every tick — which is the reported "the character
+  // walks on flat ground in a kneeling pose". At a sprint it sat on the
+  // kMaxCrouchLegLengths clamp (2.04 voxels) from the first step to the last.
+  //
+  // So the demand is measured per FOOT, per tick, against where that foot
+  // actually is: the highest hip that can still reach it, taken over the legs.
+  // At midstance the supporting foot is under the hip and the demand collapses
+  // to the reach reserve alone; at touchdown it rises to cover the outstretched
+  // leg. The pelvis then falls and rises once per step on its own, out of the
+  // geometry, with no oscillator to keep in phase with anything.
+  //
+  // This is still NOT the feedback path the body-height note warns about, and
+  // the reason is worth stating because it now DOES read a foot. Exactly ONE
+  // thing is taken from `f.planted`: its HORIZONTAL offset from the hip, which
+  // descends from origin_.x/z and the velocity lead and is not a function of
+  // bodyY_. The vertical stays the rig's own authored span. The per-leg block
+  // below says what happens if you take the foot's height as well.
+  //
+  // Accumulated by the per-leg block at the bottom of the foot loop below.
+  float crouchNeed = 0.0f;
+  float crouchLegLength = 0.0f;
+
   // Exactly ONE gait group may swing at a time — that single constraint IS the
   // gait state machine, and it degrades gracefully when a leg is severed (the
   // survivors simply take their turns sooner).
@@ -369,6 +473,13 @@ void PlayerAvatar::UpdateGait(float dt, World& world) {
     Quat yaw = AxisAngle({0, 1, 0}, heading_);
     Vec3 stance = Vec3{origin_.x, bodyY_, origin_.z} + pivot +
                   Rotate(yaw, stancePrefab - pivot);
+    // This chain's HIP, in world XZ. anchorLocal is the prefab-absolute joint
+    // anchor (mob.cpp builds rest.pos as the delta between two of them), so
+    // this is the same frame `stance` above is in. Only the HORIZONTAL is used
+    // — see the crouch block at the bottom of the loop for why the vertical
+    // deliberately is not.
+    const Vec3 hipXZ = origin_ + pivot +
+                       Rotate(yaw, sk.parts[ch.parts[0]].anchorLocal - pivot);
     // Lead the target by the current velocity so the foot lands where the body
     // is GOING, not where it was — without this a walk always trails.
     //
@@ -393,13 +504,32 @@ void PlayerAvatar::UpdateGait(float dt, World& world) {
     // the height feed itself — see the body-height note at the end of this
     // function. origin_.y is player-owned and cannot be perturbed from here,
     // so the fallback is a fixed reference rather than a feedback path.
+    // THE IK EFFECTOR IS THE ANKLE, NOT THE SOLE.
+    //
+    // GroundHeightAt returns the SURFACE (the top face of the solid, `y + 1`),
+    // which is the plane the player's AABB and the art's min corner both rest
+    // on. The chain this goal becomes a target for ends at the ankle JOINT, and
+    // on this rig that joint sits `restSoleY_` (0.75 world voxels) above the min
+    // corner in the authored pose. Handing the solver the surface therefore asks
+    // for the full hip-to-min-corner drop — 7.50 voxels out of a 6.79-voxel
+    // chain — so AnimSolveTwoBone clamped to its reach annulus on EVERY tick of
+    // every walk, and a clamped solve returns one fixed straight-leg pose no
+    // matter what the gait computed. Every subtlety upstream (the lead, the
+    // re-target, the landing ease) was being thrown away at this one line.
+    //
+    // restSoleY_ is measured off the rig in Mob::BuildRig, so this is exact for
+    // any character rather than a per-def trim. `footTrim` rides here too — the
+    // probe and the pose have to agree about where the foot is, and applying it
+    // only at draw time meant the IK solved for one contact point and the art
+    // showed another.
+    const float ankleRise = restSoleY_ + CurrentTuning().avatar.footTrim;
     int gy = 0;
     uint32_t gmat = 0;
     if (GroundHeightAt(world, ifloor(goal.x), ifloor(goal.z),
                        ifloor(origin_.y) + 2, gy, &gmat))
-      goal.y = (float)gy;
+      goal.y = (float)gy + ankleRise;
     else
-      goal.y = origin_.y;
+      goal.y = origin_.y + ankleRise;
 
     if (!footInit_) {
       f.planted = goal;
@@ -465,6 +595,8 @@ void PlayerAvatar::UpdateGait(float dt, World& world) {
         ff.speed = speedNow_;
         ff.foot = (int)c;
         if (ff.mat != 0) footfalls_.push_back(ff);
+        // ...and the stride clock's only input. See SyncStrideClock.
+        SyncStrideClock((int)c);
       } else {
         // RE-TARGET THE SWING WHILE IT IS IN THE AIR. Freezing swingTo at
         // lift-off is what actually starved the gait: the body travels
@@ -513,6 +645,40 @@ void PlayerAvatar::UpdateGait(float dt, World& world) {
         bestMat = gmat;  // surface this step is aimed at, for the footfall
       }
     }
+    // ---- this leg's share of the stance crouch (see the note at the top) ----
+    // How far the hip must come down to reach THIS foot at THIS excursion: the
+    // horizontal separation is spent out of the leg's reach, and what is left
+    // over is the vertical the hip may keep. Whichever leg wants the lowest hip
+    // wins, since one pelvis has to satisfy them all.
+    //
+    // ONLY THE HORIZONTAL COMES FROM THE FOOT; THE VERTICAL IS THE RIG'S OWN
+    // `span`. Using the foot's world height instead is the obvious version and
+    // it is wrong twice. It makes the crouch a function of the gap between the
+    // body's sole and the surface the probe found — so anything that floats or
+    // sinks the body relative to its footing (the mob gate's walk fixture does
+    // exactly this, by two voxels) is answered by burying the pelvis instead of
+    // by the IK clamping one leg, measured: crouch pinned at the 2.04 clamp for
+    // the whole walk with the knees at their REST angle, which is the pose this
+    // change exists to remove wearing a different mask. And it would put
+    // bodyY_ downstream of a height the probe supplies, which is the feedback
+    // path the body-height note at the end of this function is about.
+    //
+    // The horizontal is safe on both counts: `planted` descends from origin_.x/z
+    // and the velocity lead, so no term of it is a function of bodyY_.
+    //
+    // A SWINGING foot still contributes — its excursion is real and its leg has
+    // to cover it — but its lift is ignored for the same reason, which costs
+    // nothing here because the arc is a fraction of a voxel.
+    {
+      const float reach = f.legLength * kStanceReachFrac;
+      const float dx = hipXZ.x - f.planted.x;
+      const float dz = hipXZ.z - f.planted.z;
+      const float vert =
+          std::sqrt(std::max(reach * reach - (dx * dx + dz * dz), 0.0f));
+      crouchNeed = std::max(crouchNeed, (restHipY_ - restSoleY_) - vert);
+      crouchLegLength = std::max(crouchLegLength, f.legLength);
+    }
+
     // Collected for the SLOPE only (see the body-height note below): the
     // lowest and highest planted feet give the tilt of the ground under the
     // character, which the player's axis-aligned AABB cannot express.
@@ -537,6 +703,24 @@ void PlayerAvatar::UpdateGait(float dt, World& world) {
     bf.swingMat = bestMat;
   }
 
+  // ---- commit the crouch ---------------------------------------------------
+  // Clamped because `legLength` and the foot targets are both authored data in
+  // the end: a rig asking for a stride longer than its own leg would otherwise
+  // drive the pelvis into the floor rather than simply failing to reach.
+  crouchNeed = std::clamp(crouchNeed, 0.0f,
+                          kMaxCrouchLegLengths * crouchLegLength);
+  // Eased, not assigned — but on a SHORT half-life, which the per-foot form
+  // above is what makes safe. The old speed-derived crouch was a step function
+  // of speedFactor and needed heavy smoothing to keep a change of pace from
+  // putting a vertical jolt through the whole rig; this one is continuous by
+  // construction (the feet move continuously, and the landing ease makes even
+  // touchdown continuous), so the filter only has to take the corners off. It
+  // must stay short: the demand now oscillates ONCE PER STEP, and a half-life
+  // near the step period would low-pass exactly the rise-and-fall this change
+  // exists to produce — averaging it back into the constant crouch it replaced.
+  stanceCrouch_ += (crouchNeed - stanceCrouch_) *
+                   (1.0f - std::pow(0.5f, dt / kCrouchHalflife));
+
   // BODY HEIGHT COMES FROM THE PLAYER, NOT FROM THE FEET.
   //
   // This is the one place the avatar must NOT copy MobSystem. A mob derives
@@ -555,7 +739,14 @@ void PlayerAvatar::UpdateGait(float dt, World& world) {
   // So: the player owns the height, and the feet only supply the SLOPE (the
   // foot-plane tilt below), which is the part the player AABB genuinely does
   // not know.
-  bodyY_ = origin_.y;
+  //
+  // The CROUCH is subtracted here and nowhere else. It is a function of the rig
+  // and of the player's own speed (see the stance note at the top of this
+  // function), so it stays outside the feedback loop this paragraph is about —
+  // and because the leg IK targets are WORLD points, lowering the pelvis pushes
+  // the bend into the knees and leaves the feet exactly where the gait put them,
+  // which is what a crouch is.
+  bodyY_ = origin_.y - stanceCrouch_;
 
   // The body stays upright. A real foot-plane tilt needs the horizontal
   // separation between the feet as well as their height difference (the lean
@@ -589,8 +780,73 @@ void PlayerAvatar::UpdateGait(float dt, World& world) {
 // legs simply relax to the rest hang the flatten pass already produced, and the
 // foot states are parked so the first grounded tick re-plants from scratch
 // rather than resuming a swing that began before the jump.
+// ---- the stride clock ------------------------------------------------------
+//
+// TWO CLOCKS IS THE BUG. The feet step on a DRIFT THRESHOLD — a foot unplants
+// once the body has walked far enough past it — while the pelvis bob, sway and
+// roll ran off `gaitPhase += dt * cadence * speedFactor`, a free-running
+// oscillator that knows nothing about any of that. On this rig at walk pace the
+// runtime's own step model gives 3.09 footfalls/s (a 1.54 Hz stride), against
+// cadence 8 x speedFactor 0.508 = 4.06 Hz of sway and bobFreqMul 2 -> 8.13 Hz
+// of bob. The bob is 2.6x the real footfall rate, and at a 30 Hz tick 8.13 Hz is
+// under four samples a cycle — which is precisely "the body sways left and right
+// really fast and it's jittery". It cannot be tuned out, because the two clocks
+// disagree by a ratio that itself moves with speed.
+//
+// So there is one clock now and the FEET own it. The phase still advances
+// smoothly (the bob must not step), but its RATE is the measured stride rate and
+// its PHASE is pulled onto a half-turn boundary at every touchdown. bobFreqMul 2
+// then means "once per footfall" and swayAmp "once per stride" by construction,
+// which is what those names have always claimed.
+//
+// A partial correction rather than a snap: once locked the residual is a few
+// milliseconds and invisible, whereas snapping would put a step into the bob
+// twice per stride — trading one visible artifact for another.
+void PlayerAvatar::SyncStrideClock(int chain) {
+  const AnimSkeleton& sk = skel_;
+  // Which leg is this, among the leg chains? Ordinal, not chain index: a rig
+  // whose arm chains are interleaved with its legs must still split the stride
+  // evenly between the legs that actually step.
+  int legOrdinal = 0, nLegs = 0, mine = 0;
+  for (size_t c = 0; c < sk.chains.size(); c++) {
+    if (sk.chains[c].tag != "leg") continue;
+    if ((int)c == chain) mine = legOrdinal;
+    legOrdinal++;
+    nLegs++;
+  }
+  if (nLegs <= 0) return;
+
+  const float elapsed = sinceTouchdown_;
+  sinceTouchdown_ = 0.0f;
+  // A first touchdown, or one after a stop/jump, has no period to measure —
+  // adopt the boundary outright and wait for the next step to time the rate.
+  const bool haveStep = lastFootDown_ >= 0 && elapsed > 1e-3f &&
+                        elapsed < kMaxStepPeriod;
+  lastFootDown_ = chain;
+  if (haveStep) {
+    const float k = 1.0f - std::pow(0.5f, elapsed / kStepPeriodHalflife);
+    stepPeriod_ += (elapsed - stepPeriod_) * k;
+    // A stride is nLegs steps (two, for a biped): every leg lands once.
+    const float stride = stepPeriod_ * (float)nLegs;
+    if (stride > 1e-3f) strideRate_ = 1.0f / stride;
+  } else {
+    stepPeriod_ = 0.0f;
+  }
+
+  // Pull the phase onto this leg's boundary. Error taken the short way round so
+  // a clock running a hair fast is nudged back rather than dragged forward
+  // through a whole cycle.
+  const float want = (float)mine / (float)nLegs;
+  float err = want - anim_.gaitPhase;
+  err -= std::floor(err + 0.5f);
+  anim_.gaitPhase += err * (haveStep ? kStrideSyncGain : 1.0f);
+  anim_.gaitPhase -= std::floor(anim_.gaitPhase);
+}
+
 void PlayerAvatar::UpdateAirPose(float dt) {
-  (void)dt;
+  // The crouch is a WALKING pose; ease it out while there is no ground under
+  // the feet, so landing does not have to unwind a stance the air never used.
+  stanceCrouch_ *= std::pow(0.5f, dt / 0.12f);
   for (FootState& f : anim_.feet) {
     f.swinging = false;
     f.swingT = 0;
@@ -599,7 +855,12 @@ void PlayerAvatar::UpdateAirPose(float dt) {
   // measure drift against a plant left over from before take-off — anywhere in
   // the world — and immediately fire a bogus step (and a bogus footstep sound).
   footInit_ = false;
-  bodyY_ = origin_.y;
+  // A landing must re-time the stride from scratch: the elapsed time across a
+  // jump is not a step period, and adopting it would slew the clock to a rate
+  // the feet never ran at.
+  lastFootDown_ = -1;
+  sinceTouchdown_ = 0.0f;
+  bodyY_ = origin_.y - stanceCrouch_;
   bodyUp_ = (bodyUp_ * 0.85f + Vec3{0, 1, 0} * 0.15f).normalized();
   if (bodyUp_.len() < 0.5f) bodyUp_ = {0, 1, 0};
 }
@@ -649,8 +910,33 @@ void PlayerAvatar::UpdateAnimation(float dt, World& world, bool grounded,
       std::clamp(speedNow_ / std::max(def_->speed, 0.01f), 0.0f, 1.5f);
 
   const GaitDef& g = sk.gait;
-  st.gaitPhase += dt * (g.present ? g.cadence : 2.2f) * speedFactor;
-  if (st.gaitPhase > 1.0f) st.gaitPhase -= std::floor(st.gaitPhase);
+  // ONE CLOCK, AND THE FEET OWN IT — see SyncStrideClock for why the old
+  // `cadence * speedFactor` oscillator ran at 2.6x the real footfall rate and
+  // read on screen as a fast, jittery sway. The rate is measured between
+  // touchdowns; the phase is corrected at each one. Until the first two steps
+  // have been timed `strideRate_` is zero and the pelvis simply holds still,
+  // which is the honest answer for a body that has not taken a stride yet.
+  //
+  // The rig with NO leg chains (dummy.json) keeps the oscillator: it never
+  // plants a foot, so there is nothing to lock to. MobSystem::UpdateAnimation
+  // is the other holder of that fallback and states it the same way.
+  const bool haveLegs = [&] {
+    for (const IkChain& ch : sk.chains)
+      if (ch.tag == "leg") return true;
+    return false;
+  }();
+  if (haveLegs) {
+    // Park the clock when the feet stop reporting: a body standing still takes
+    // no steps, and a rate left running would keep the (speed-scaled, so
+    // invisible) bob accumulating phase to land on an arbitrary value the
+    // moment it moves again.
+    if (sinceTouchdown_ > kMaxStepPeriod)
+      strideRate_ *= std::pow(0.5f, dt / 0.15f);
+    st.gaitPhase += dt * strideRate_;
+  } else {
+    st.gaitPhase += dt * (g.present ? g.cadence : 2.2f) * speedFactor;
+  }
+  st.gaitPhase -= std::floor(st.gaitPhase);
 
   // ---- dismemberment locomotion state ----
   // Polled every frame rather than only on Sever: partAlive changes in several
@@ -860,6 +1146,9 @@ void PlayerAvatar::UpdateAnimation(float dt, World& world, bool grounded,
   } else if (gaitActive) {
     UpdateGait(dt, world);
   } else {
+    // An authored clip owns the pose (crawl, etc.): it keys the same pelvis the
+    // crouch moves, so unwind the crouch rather than composing the two.
+    stanceCrouch_ *= std::pow(0.5f, dt / 0.12f);
     float targetY = origin_.y + (loco ? loco->bodyYOffset : 0.0f);
     bodyY_ += std::clamp(targetY - bodyY_, -0.4f, 0.4f);
     footInit_ = true;
@@ -1034,8 +1323,13 @@ void PlayerAvatar::UpdateAnimation(float dt, World& world, bool grounded,
     // rig — do not have to spend.
     const float aheadRaw = ((float)hangLipW_.x + 0.5f - cx) * dir.x +
                            ((float)hangLipW_.z + 0.5f - cz) * dir.z;
-    const float ahead = std::clamp(aheadRaw - 0.55f, Player::kHalfXZ * 0.6f,
-                                   Player::kHalfXZ + 1.2f);
+    // The two bare terms were world voxels sitting either side of a
+    // metres-derived kHalfXZ — a mixed-unit clamp, so at 5 cm the 5.5 cm
+    // setback and the 12 cm overhang both halved while the capsule they bound
+    // did not, and the palm stopped landing on the lip.
+    const float ahead = std::clamp(aheadRaw - MetresToCells(0.055f),
+                                   Player::kHalfXZ * 0.6f,
+                                   Player::kHalfXZ + MetresToCells(0.12f));
     for (size_t c = 0; c < sk.chains.size(); c++) {
       const IkChain& ch = sk.chains[c];
       if (ch.tag != "arm" || ch.parts.empty() || ch.effector < 0) continue;
@@ -1044,7 +1338,8 @@ void PlayerAvatar::UpdateAnimation(float dt, World& world, bool grounded,
       const Vec3 shoulder = sk.parts[ch.parts[0]].anchorLocal;
       const float latM = shoulder.x - pivot.x;  // this arm's own spread
       // Palm rest point on the lip: fingers just over the top surface.
-      Vec3 palmW{cx + leftW.x * latM + dir.x * ahead, lipTopY + 0.2f,
+      Vec3 palmW{cx + leftW.x * latM + dir.x * ahead,
+                 lipTopY + MetresToCells(0.02f),
                  cz + leftW.z * latM + dir.z * ahead};
       Vec3 rel = palmW - bodyOrigin - pivot;
       Vec3 palmPrefab = RotateInv(yaw, rel) + pivot;
@@ -1113,9 +1408,12 @@ void PlayerAvatar::UpdateAnimation(float dt, World& world, bool grounded,
       // a real dead hang stretches them. Bounded, weight-faded, and ZERO for
       // any rig whose arms genuinely reach: long-armed models never shrug.
       if (shortBy > 0.0f && toT.len() > 1e-4f) {
-        constexpr float kShrugCapVox = 2.5f;
+        // 25 cm of shoulder shrug. In metres because it is bounded against a
+        // real arm's shortfall: a bare 2.5 cells would let the shoulder travel
+        // half as far at 5 cm and the hang would stop reaching the ledge.
+        const float kShrugCap = MetresToCells(0.25f);
         const Vec3 shift =
-            toT * (std::min(shortBy, kShrugCapVox) / toT.len() * weight);
+            toT * (std::min(shortBy, kShrugCap) / toT.len() * weight);
         st.model[i0].pos += shift;
         st.model[i1].pos += shift;
         if (ie != i1) st.model[ie].pos += shift;
@@ -1130,6 +1428,20 @@ void PlayerAvatar::UpdateAnimation(float dt, World& world, bool grounded,
       AnimSolveTwoBone(sk, st, ch, palmPrefab - palmOff, weight);
     }
   }
+
+  // ---- stage 6: the pose has to be anatomically possible ------------------
+  //
+  // LAST, after every solver on this path — the leg gait, the weapon arm and
+  // the ledge hang all write st.model[] and any of them can push a joint past
+  // its range. Clamping between them would let a later solve undo the clamp,
+  // which is the same reason the IK itself is a post-process rather than a
+  // layer.
+  //
+  // This is where "the legs rake out behind" and "the legs invert into the
+  // torso" stop being things a gate has to notice after the fact and become
+  // unrepresentable: the hip simply cannot reach those angles, whatever target
+  // the solver was handed. Rigs that author no `poseLimit` pay one bool test.
+  AnimClampPoseLimits(sk, st);
 }
 
 // ---- per-tick ---------------------------------------------------------------
@@ -1167,7 +1479,44 @@ void PlayerAvatar::PreTick(uint32_t tick, const Player& player, float heading,
       hangLipW_ = player.hangLip;
       hangDirW_ = player.hangDir;
     }
-    UpdateAnimation(dt, world, player.grounded, player.vel);
+    // ---- air bookkeeping, BEFORE the pose ----
+    // The debounce below used to live after UpdateAnimation and feed the CLIPS
+    // only, with the gait deliberately taking the raw `grounded` bit. That was
+    // the wrong half to protect. See kGaitCoyoteSeconds: losing the gait for a
+    // tick is not a subtle artifact, it re-plants both feet and fades the leg
+    // IK out to the rest hang, so the legs snap to standing in the middle of a
+    // stride — the reported "his animation resets every time he goes up a voxel
+    // or is off the ground for a fraction of a second, which is all the time".
+    // So it is computed here and both consumers read it.
+    const float debounce = CurrentTuning().avatar.airDebounce;
+    // A hanging body and a mantling one are SUPPORTED, not airborne: the
+    // hands (or the committed climb) hold the weight, so neither may trigger
+    // the jump/fall clips nor a landing when it ends. Without the mantle
+    // half, every water climb-out and ledge pull-up fired "jump" mid-climb
+    // the moment the debounce elapsed.
+    const bool hangingNow = player.hanging;
+    const bool mantling = player.mantleTimer > 0.0f;
+    const bool supported = player.grounded || hangingNow || mantling;
+    if (supported) airOffTime_ = 0.0f;
+    else airOffTime_ += dt;
+    const bool airborneNow = airOffTime_ > debounce;
+
+    // THE GAIT'S OWN VIEW OF THE GROUND — longer than the clips' debounce, and
+    // bounded by DISTANCE rather than by time alone. A hang or a mantle is
+    // support for the clips but not for the gait: the feet are nowhere near a
+    // floor in either, and IK-ing them to one is the pose those states exist to
+    // replace.
+    float gaitLegLength = 0.0f;
+    for (size_t c = 0; c < skel_.chains.size() && c < anim_.feet.size(); c++)
+      if (skel_.chains[c].tag == "leg")
+        gaitLegLength = std::max(gaitLegLength, anim_.feet[c].legLength);
+    const bool gaitGrounded =
+        player.grounded ||
+        (!hangingNow && !mantling && airOffTime_ < kGaitCoyoteSeconds &&
+         std::fabs(origin_.y - supportY_) <
+             kGaitCoyoteLegLengths * gaitLegLength);
+
+    UpdateAnimation(dt, world, gaitGrounded, player.vel);
 
     // ---- air state clips ----
     // Grounded transitions drive jump/land; sustained air drives fall. Kept
@@ -1189,21 +1538,17 @@ void PlayerAvatar::PreTick(uint32_t tick, const Player& player, float heading,
     // So the transition runs on SUSTAINED air, not on the raw bit: you must be
     // off the ground for airDebounce seconds before the body believes it is
     // airborne. A real jump clears that in one tick of upward travel; a bump
-    // crest never does. Note this deliberately does not touch `grounded` itself
-    // — the gait still wants the instantaneous value, and the footfall/landing
-    // logic below keys off this debounced view instead.
-    const float debounce = CurrentTuning().avatar.airDebounce;
-    // A hanging body and a mantling one are SUPPORTED, not airborne: the
-    // hands (or the committed climb) hold the weight, so neither may trigger
-    // the jump/fall clips nor a landing when it ends. Without the mantle
-    // half, every water climb-out and ledge pull-up fired "jump" mid-climb
-    // the moment the debounce elapsed.
-    const bool hangingNow = player.hanging;
-    const bool supported =
-        player.grounded || hangingNow || player.mantleTimer > 0.0f;
-    if (supported) airOffTime_ = 0.0f;
-    else airOffTime_ += dt;
-    const bool airborneNow = airOffTime_ > debounce;
+    // crest never does. `supported` / `airOffTime_` / `airborneNow` are all
+    // computed above the pose now, because the GAIT needs the same protection
+    // (and rather more of it) — see the note at the UpdateAnimation call.
+    //
+    // RISING EDGE of the jump latch, not the latch itself. `player.jumped` is
+    // sticky until main.cpp drains it after the whole tick batch, so on a frame
+    // that fires four ticks the raw flag reads true in all four — and
+    // PlayClipIndex REWINDS a one-shot on retrigger, which would pin the jump
+    // clip at t=0 for the frame and play nothing at all.
+    const bool jumpLatched_ = player.jumped && !prevJumpLatch_;
+    prevJumpLatch_ = player.jumped;
 
     // `wasGrounded_` now tracks the DEBOUNCED state, so these edges fire once
     // per real takeoff/landing rather than once per bump.
@@ -1231,13 +1576,48 @@ void PlayerAvatar::PreTick(uint32_t tick, const Player& player, float heading,
       }
       airTime_ = 0;
     } else {
-      if (wasGrounded_ && !wasHanging_) PlayClip("jump");
+      // A JUMP IS A LAUNCH, NOT A LOSS OF CONTACT.
+      //
+      // This fired on the `wasGrounded_ -> airborne` edge, which any downward
+      // step produces: walking at 16 voxels/s a one-voxel drop is airborne for
+      // longer than the 0.12 s debounce, so ordinary broken ground retriggered
+      // an arms-up one-shot over and over. `player.jumped` is set where the
+      // jump impulse is actually applied and is sticky across the tick batch
+      // (see Player::jumped), so it says what the edge could not.
+      if (jumpLatched_ && !wasHanging_) PlayClip("jump");
       airTime_ += dt;
-      if (airTime_ > 0.45f) PlayClip("fall");
+      // ...AND A FALL IS A DROP. Air time alone says nothing about height:
+      // `supportY_` records where the body last had something under it, so the
+      // clip waits for real distance to have been given up. A step-down never
+      // qualifies no matter how long the debounce takes to clear.
+      const float dropped = supportY_ - origin_.y;
+      const float minDrop = CurrentTuning().avatar.fallMinDrop / kVoxelMeters;
+      if (airTime_ > 0.45f && dropped > minDrop) PlayClip("fall");
       // Remember how fast we are falling; the landing tick needs it after the
       // sweep has already cancelled the velocity.
       lastFallSpeed_ = player.vel.y < 0 ? -player.vel.y : 0.0f;
     }
+    // THE FLAIL RAMPS IN; IT DOES NOT SWITCH ON.
+    //
+    // The clip itself is authored near-natural now, and this weight is what
+    // opens it out into the wide arms-out pose. So a short drop plays a barely
+    // perceptible shape and only a sustained fall reaches the full one — the
+    // difference between "the character keeps dropping into a falling pose"
+    // and a fall that reads as a fall. Applied to the running instance's
+    // requested weight, which AnimSampleAndBlend already multiplies through
+    // its blend-in fade, so the two compose instead of fighting.
+    {
+      const auto& av = CurrentTuning().avatar;
+      const float ramp = std::max(av.fallFlailRamp, 1e-3f);
+      const float w =
+          std::clamp((airTime_ - av.fallFlailDelay) / ramp, 0.0f, 1.0f);
+      for (ClipInstance& inst : anim_.clips)
+        if (inst.clip == locoClips_.fall) inst.weight = w;
+    }
+    // Where the body last had something under it. Sampled while SUPPORTED, so
+    // it survives the whole of the following fall; a hang or a mantle counts,
+    // because releasing one is a fall from there and not from the last floor.
+    if (supported) supportY_ = origin_.y;
     // The DEBOUNCED state, not the raw bit: storing the raw one would put the
     // edge detection straight back on the flickering signal this block exists
     // to filter, and the jump clip would retrigger on every bump again.
@@ -1327,6 +1707,30 @@ void PlayerAvatar::PreTick(uint32_t tick, const Player& player, float heading,
                       ? locoClips_.hang
                       : moving ? (running ? locoClips_.run : locoClips_.walk)
                                : locoClips_.idle);
+
+    // ---- lock the arm swing to the feet --------------------------------
+    // The walk and run clips are authored at ONE speed each (the arm cycle is
+    // derived from the runtime's own step model at walk pace and at sprint
+    // pace). Every speed between them — which is most of them — plays an arm
+    // cycle the feet do not share, and the arms slide in and out of phase with
+    // the legs over a few strides. Re-rating the instance to the live stride
+    // makes one authored cycle span one stride at any pace, so the derivation
+    // in gen_human.py stops being a special case and becomes the value the
+    // rate is 1.0 at.
+    //
+    // Only the locomotion pair: `idle`, `fall`, `hang`, `jump` and `land` are
+    // not stride-locked motions and must keep their authored timing.
+    if (strideRate_ > 1e-4f) {
+      for (ClipInstance& inst : anim_.clips) {
+        if (inst.clip != locoClips_.walk && inst.clip != locoClips_.run)
+          continue;
+        if (inst.clip < 0 || inst.clip >= (int)skel_.clips.size()) continue;
+        const float durS = (float)skel_.clips[inst.clip].durationMs * 0.001f;
+        if (durS <= 1e-4f) continue;
+        // rate 1 == the clip's authored period equals one stride.
+        inst.rate = std::clamp(strideRate_ * durS, 0.25f, 3.0f);
+      }
+    }
 
     // ---- submit kinematic targets (shared Mob path, held item included) ----
     // writeXf=true: the held-item placement and the camera read the hand's
@@ -1421,7 +1825,10 @@ void PlayerAvatar::SelfDestruct(Vec3 atWorldVoxel, float radiusVox,
     if (!PartAlive((int)i) || !limbs_[i].body) continue;
     const MobLimbDef& ld = limbDefs_[i];
     if ((int)i == def_->rootLimb || ld.vital || !ld.severable) continue;
-    if ((limbs_[i].xf.pos - atWorldVoxel).len() <= radiusVox + 2.0f)
+    // 20 cm of margin past the blast radius, so the limb sweep covers the same
+    // real shell at any voxel size.
+    if ((limbs_[i].xf.pos - atWorldVoxel).len() <=
+        radiusVox + MetresToCells(0.2f))
       hits.push_back((int)i);
   }
   for (int i : hits)
@@ -1600,7 +2007,14 @@ void PlayerAvatar::BurnParts(uint32_t tick, World& world,
   // of burning NPCs starve the fire on the character the camera is pointed
   // at. The PASS underneath (Mob::BurnTick -> MobSystem::BurnOneLimb) is the
   // shared one.
-  uint32_t frontBudget = 4096;
+  // 4096 was sized for FIRE, whose front is a 2D flame edge a few hundred
+  // voxels wide. DISSOLUTION is not a front — acid attacks the whole wetted
+  // surface at once, and at skinScale 8 a submerged human is order 25k exposed
+  // sub-voxels, so the pass was sampling about a sixth of the body per tick and
+  // the character came apart over a minute instead of over seconds. Raised for
+  // the player only, in the same spirit the separate budget exists at all: this
+  // is one creature, and it is the one the camera is pointed at.
+  uint32_t frontBudget = 16384;
   uint32_t opsBudget = 48;
   BurnTick(tick, world, cellOps, spawns, frontBudget, opsBudget);
 }

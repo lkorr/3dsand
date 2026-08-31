@@ -348,6 +348,21 @@ limb kills (`MobLimbDef::vital`, `mob.h:35`).
 
 ### Package D — armour and clothing
 
+**LANDED 2026-08-29.** Built as `docs/PLAN_items_equipment.md`, which supersedes
+this section; DESIGN.md §8c is the architecture of record. The prediction below
+held: a shell is a rig part, so per-voxel burning and dissolving arrived with no
+armour-specific fire code, and `--gate armor-react` measures 114 skin voxels
+lost bare against 0 under a steel plate purely from `steel` not carrying
+`tag:dissolvable`.
+
+One thing this section did NOT anticipate, and it is the interesting part. "The
+world reaches the body" is a question the burn pass asks about the WORLD, and a
+shell is in neither the grid nor the body's lattice — so fire lapping at a
+sleeve read to the arm underneath exactly as fire lapping at the arm. Occlusion
+(`Mob::WornAlong`) is the one genuinely new mechanic armour needed, it has to be
+asked along a segment rather than at a point, and it only works for limbs
+thicker than a grid cell. See §8c.
+
 **Do this last. It is genuinely modular and it genuinely benefits from being
 second.**
 
@@ -465,3 +480,112 @@ geometry. Package B alone gets that, with no armour system at all.
    (CLAUDE.md rule 7, `kOrder` in `src/test/selftest.cpp`). A new `mob-burn`
    gate that emits fire into the world must be placed where it does not poison
    later gates, and must be measured at the same scope in both arms of any A/B.
+
+---
+
+## 10. Landed after the fact: the combustion clock, and what §3.5 actually cost
+*(2026-08-30, on owner report that a burning character went out too quickly to
+spread the fire or take much damage from it.)*
+
+**Burn duration is now one slider, `combustion.burnDurationPct`, default 200.**
+It is read by the reaction COMPILER, not by a kernel — `LoadAssets` divides the
+chance of every rule marked `"burnDuration": true` in `reactions.json` by it, so
+the scaled value is rounded into the same integer an authored chance compiles to
+and the GPU cannot tell the two apart. Nothing reaches a shader, there is no
+`TUNE_*` constant, and the world costs the same to run at any setting. Tuner tab
+"Combustion", next to Weather, which is the other tab the reaction compiler owns.
+
+Two classes of rule carry the mark, and the second is the one worth writing
+down:
+
+* the rules that **retire** a burning voxel (ember → ash/smoke/air; burning
+  cloth, undercloth, hair and flesh → their charred or spent forms). Halving
+  these is the feature.
+* the **relight** rules (charred → burning). These are the only rules in the
+  file that put matter back into a burning state, so they are the only closed
+  loop in the fire economy, and its gain is (relight chance) × (how long a
+  neighbour stays lit). Scaling only the retire side multiplies that gain by the
+  same factor. **This is a ceiling argument, not a fix for anything observed at
+  the default** — measured at 200%, scaling the relight rules moved the
+  `mob-burn` corpse from 13 voxels still alight to 15 — but at the slider's 800%
+  the unscaled gain would cross 1.0 and a fire would never go out (rule 2).
+
+Ignition, emit and extinguisher rules are deliberately NOT scaled. Ignition is
+how fast fire spreads and is a separate lever the file already argues about at
+length; leaving it alone is also what makes a longer burn spread *further*,
+since a voxel that stays lit twice as long emits its upward flame twice as many
+times. Emit is left alone so a longer burn is a brighter one rather than a
+dimmer one spread thin. Dousing must beat the burn to the tick at any setting.
+
+### §3.5 was right about the mechanism and wrong about the symptom
+
+Risk 5 predicted "charring will appear to do nothing on painted surfaces". What
+actually shipped is the opposite and worse: every reaction that rewrites a body
+voxel **clears** its art colour (`BurnLimbView::Set`), deliberately, because the
+burn chain's whole visual account of itself is the material it turns into. So
+charring is perfectly visible — and the PAINT is what is lost.
+
+That is invisible on a creature painted in shades of its own flesh, and it is
+severe on one where the paint is carrying an identity the material is not. The
+base `human` model wore its linen as art colour over `skin` voxels: a lick of
+flame cooked them to `flesh_cooked`, the paint went, and **the player read as
+naked rather than as scorched**.
+
+The fix is where the rest of the burn model lives — in the material table.
+`undercloth` / `undercloth_burning` / `undercloth_charred` is a near-copy of the
+cloth chain with the becomes-air branch deleted, so the linen burns for exactly
+as long as a robe does and responds to the slider identically, but cannot
+disappear. `undercloth_charred` authors no rules at all: it is the terminus, so
+a torched character keeps a blackened garment and the chunk it sits in sleeps.
+The 3,712 painted voxels in `assets/mobs/human.vox` (hips and upper thighs) were
+repainted to the new id; the art layer is untouched, so an unburnt character
+looks exactly as it did.
+
+**The general rule this establishes: if paint is the only thing distinguishing
+two parts of a body, fire will erase the distinction. Anything that must survive
+a burn has to be a material.**
+
+### Deep char
+
+`flesh_cinder` is one stage past `flesh_charred` — near-black, crisp, and inert
+— reached from charred under a three-face front, so one pass of flame leaves a
+body dark brown and a sustained torching leaves it black. It is a state rather
+than a palette jitter because it has different rules: **none**. That makes the
+char chain CONVERGE under fire instead of cycling charred → burning → charred,
+which is strictly better for rule 2 than the relight rule alone — the terminus
+is an inert material rather than a coin flip that never ends.
+
+### What asserts all of this, and for how much
+
+Three subtests were added to `--gate mob-burn`, and all three are **table-only**:
+no fixture, no ticks, no GPU, microseconds each.
+
+* `burn duration knob` compiles `materials.json` + `reactions.json` twice, at
+  100% and 200%, and asserts that every rule whose chance moved moved by exactly
+  the factor and that nothing but the chance moved. The second half is the one
+  worth having: it is what would catch the knob quietly rescaling an ignition or
+  an emit rule, which would look like a working feature and play like a
+  different game. (`--sweep` cannot reach this knob — it only reloads shaders.)
+* `linen chars, never bares` walks the reachability closure from `undercloth`
+  and asserts no rule in it produces air, that the closure stays inside the
+  three linen materials, and that the terminus is inert. Stated as reachability
+  rather than as "undercloth_burning has no air branch" because the hole could
+  be opened by any of the three, or by a fourth added between them later.
+* `deep char` asserts charred → cinder is authored and that cinder is inert.
+
+### Two things the gate itself had to learn
+
+* **A quiet window is a DURATION and must scale with the clock.** Subtest H gave
+  a corpse 630 ticks to go out. That number was chosen against the chances
+  `reactions.json` authors, which is exactly what this slider multiplies — so
+  the literal was a deadline that silently tightened every time the slider went
+  up, and at 200% it failed with 13 voxels still alight. "The fire takes twice
+  as long to go out and you gave it the same wall clock" is the feature working.
+  It is now `630 * burnDurationPct / 100`.
+* **A bare count bought one hypothesis; attribution bought all of them**
+  (CLAUDE.md rule 6, again). "13 still alight" is consistent with a long tail
+  and with a relight loop stuck at gain 1.0, and those are completely different
+  bugs. Splitting the count by material and re-probing after a further half
+  window printed the whole answer on one line — `15 cloth + 0 flesh; 0 after 315
+  further quiet ticks (still falling)` — in the run that would otherwise have
+  been the first of a series of eliminations.

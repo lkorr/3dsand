@@ -327,6 +327,9 @@ add_executable(sandvox
   # analytically, the wind field applied to water (plan component 8).
   src/sim/currentprim.cpp
   src/sim/voxload.cpp
+  # The baked tree atlas: assets/trees/*.svtree -> one storage buffer that
+  # worldgen samples instead of evaluating implicit tree shapes per cell.
+  src/sim/treeatlas.cpp
   src/sim/microvox.cpp
   src/sim/microbody.cpp
   src/game/player.cpp
@@ -353,6 +356,8 @@ add_executable(sandvox
   src/test/selftest.cpp
   src/test/selftest_voxregion.cpp
   src/test/selftest_terrain.cpp
+  src/test/selftest_trees.cpp
+  src/test/selftest_scale.cpp
   src/test/selftest_sim.cpp
   src/test/selftest_ca.cpp
   src/test/selftest_wind.cpp
@@ -363,6 +368,8 @@ add_executable(sandvox
   src/test/selftest_mob.cpp
   src/test/selftest_worldio.cpp
   src/test/selftest_spell.cpp
+  src/test/selftest_playerkit.cpp
+  src/test/selftest_equipment.cpp
   src/test/selftest_audio.cpp
   src/audio/device.cpp
   src/audio/library.cpp
@@ -389,6 +396,11 @@ add_executable(sandvox
   src/phys/debris.cpp
   src/phys/marching_cubes.cpp
   src/ui/overlay.cpp
+  # The character screen (I): the panel armour, pickups and spell acquisition
+  # land into. theme.cpp owns the ImGui style + the pixel-art chrome atlas;
+  # inventory_ui.cpp is a pure drawing function over UIState.
+  src/ui/theme.cpp
+  src/ui/inventory_ui.cpp
   src/telemetry.cpp
 )
 # src/audio is on the path so the VENDORED engine's own `#include "xyzpan/..."`
@@ -445,6 +457,19 @@ if(MSVC)
   target_compile_options(sandvox PRIVATE $<$<CONFIG:Release>:/Zi>)
   target_link_options(sandvox PRIVATE
     $<$<CONFIG:Release>:/DEBUG /OPT:REF /OPT:ICF>)
+  # /arch:AVX2 is LOAD-BEARING and used to be an ACCIDENT. sim/scan.h and
+  # sim/rng_simd.h compile their vector paths under __AVX2__, which MSVC
+  # predefines only under this flag — and until now the flag reached this
+  # target solely as a side effect of Jolt's PUBLIC compile options
+  # (Jolt.cmake: target_compile_options(Jolt PUBLIC /arch:AVX2)). A Jolt bump,
+  # a USE_AVX2=OFF, or dropping the physics dependency would have silently
+  # reverted PageTable::Classify's hot loop to scalar with no diagnostic and no
+  # test failure — only a ~4x slower paged path. State it here instead.
+  #
+  # This changes nothing about the current build; it only stops the flag from
+  # being someone else's to remove. NOT /fp:fast — see the deliberate note on
+  # the Jolt options above; relaxed float must never reach the sim.
+  target_compile_options(sandvox PRIVATE /arch:AVX2)
 endif()
 
 # ---------------------------------------------------------------------------

@@ -23,7 +23,10 @@
 
 namespace sandvox {
 
-const char* kAvatarDefName = "mina";
+// Must track tuning.json player.model — the avatar gates exist to test the
+// character the GAME plays, and one pinned to the old name goes on passing
+// against a character nobody plays (see the note at the avatar gate itself).
+const char* kAvatarDefName = "human";
 
 // Time of day used by --shot, as a 0..1 fraction of the cycle (0 = midnight,
 // 0.5 = noon). Set by `--time`; see RunShots.

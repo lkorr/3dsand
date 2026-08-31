@@ -44,40 +44,91 @@
       "becomes": "water"
     },
     {
-      "note": "-------- combustion: each flammable defines its burn character --------"
+      "note": "-------- combustion: each flammable defines its burn character --------\nTHE IGNITION CHANCE IS HOW FAST FIRE SPREADS THROUGH THE FUEL; the decay rules further down are how long a lit voxel takes to be consumed. They are separate levers and this note exists because they are easy to confuse. Wood/bark were slowed 1.5x here (18 -> 12, birch 22 -> 15, staff 16 -> 11) so a fire creeps up a trunk instead of running it; the ember decays below are UNCHANGED, so a lit log still burns out on the same schedule it always did."
     },
     {
       "self": "wood",
       "neighbor": "tag:hot",
-      "chance": 18,
+      "chance": 12,
       "selfBecomes": "ember"
     },
     {
       "self": "birch_wood",
       "neighbor": "tag:hot",
-      "chance": 22,
+      "chance": 15,
       "selfBecomes": "ember"
     },
     {
-      "note": "foliage flashes to fire and is CONSUMED (no ember stage): a burning canopy should vanish in flame, not decay into thousands of ash voxels raining through the crown. Chances are high because leaves are thin fuel; the burn is bounded by the canopy itself (fire decays in ~6 ticks and leaves nothing that grows)."
+      "note": "foliage flashes to fire and is CONSUMED (no ember stage): a burning canopy should vanish in flame, not decay into thousands of ash voxels raining through the crown. Chances are high because leaves are thin fuel; the burn is bounded by the canopy itself (fire decays in ~6 ticks and leaves nothing that grows). ALL FOLIAGE CHANCES WERE CUT 3x on owner report that a crown went up too readily (leaves 225->75->25, needles 380->127, autumn 400->133): a tree should catch and take a while about it rather than flashing over the instant an ember touches it. The RATIOS between the three fuels are preserved -- dry needles and dead autumn leaf still catch several times faster than green leaves, which is the read that makes a pine forest frightening and an oak wood merely flammable."
     },
     {
       "self": "leaves",
       "neighbor": "tag:hot",
-      "chance": 75,
+      "chance": 25,
       "selfBecomes": "fire"
     },
     {
       "self": "pine_needles",
       "neighbor": "tag:hot",
-      "chance": 380,
+      "chance": 127,
       "selfBecomes": "fire"
     },
     {
       "self": "autumn_leaves",
       "neighbor": "tag:hot",
-      "chance": 400,
+      "chance": 133,
       "selfBecomes": "fire"
+    },
+    {
+      "note": "THE SHADE RAMPS BURN LIKE WHAT THEY ARE. assets/editor/treegen.js bakes each foliage and bark family as a three-material ramp (dark / plain / lit) so a crown has form; combustion in this file is authored BY NAME, not by tag, so a ramp member with no rule of its own is a leaf that will not catch. Same chance as its plain sibling in every case -- these are lighting tiers, not different fuels, and a canopy that burned in stripes would be worse than one that did not burn at all."
+    },
+    {
+      "self": "leaves_dark",
+      "neighbor": "tag:hot",
+      "chance": 25,
+      "selfBecomes": "fire"
+    },
+    {
+      "self": "leaves_lit",
+      "neighbor": "tag:hot",
+      "chance": 25,
+      "selfBecomes": "fire"
+    },
+    {
+      "self": "pine_dark",
+      "neighbor": "tag:hot",
+      "chance": 127,
+      "selfBecomes": "fire"
+    },
+    {
+      "self": "pine_lit",
+      "neighbor": "tag:hot",
+      "chance": 127,
+      "selfBecomes": "fire"
+    },
+    {
+      "self": "autumn_dark",
+      "neighbor": "tag:hot",
+      "chance": 133,
+      "selfBecomes": "fire"
+    },
+    {
+      "self": "autumn_lit",
+      "neighbor": "tag:hot",
+      "chance": 133,
+      "selfBecomes": "fire"
+    },
+    {
+      "self": "bark_dark",
+      "neighbor": "tag:hot",
+      "chance": 12,
+      "selfBecomes": "ember"
+    },
+    {
+      "self": "bark_light",
+      "neighbor": "tag:hot",
+      "chance": 12,
+      "selfBecomes": "ember"
     },
     {
       "self": "grass",
@@ -164,20 +215,26 @@
       "note": "The ember stage IS the burn: wood ignites to ember on contact with tag:hot, then smolders here until one of these decay rules retires it. Their SUM is the death rate, so scaling all three together sets burn DURATION without touching how fire spreads (that is the wood+tag:hot ignition rule above, deliberately left fast). Total 7 per-mille vs the old 27 = wood takes ~4x longer to be consumed, ~140 ticks mean. Within that budget ash is ~1/4 of decays and smoke is doubled relative to the old 20:7 ash:smoke split, so a burnt-out fire leaves a scatter of ash rather than a floor of it. Embers also live 4x longer, so each one emits its upward fire ~4x more over its life: fire persists longer without spreading faster."
     },
     {
+      "note": "\"burnDuration\": true MARKS A RULE AS PART OF THE COMBUSTION CLOCK. Every marked chance is divided by combustion.burnDurationPct at load (src/sim/materials.cpp), so the Combustion tab is one slider over how long anything in the world stays alight, authored once here rather than by hand-editing eighteen chances that have to keep their ratios.\n\nTwo kinds of rule carry it, and the second is not obvious. The first is every rule that RETIRES a burning voxel -- ember to ash, smoke or air; burning cloth, undercloth, hair and flesh to their spent forms. Halving those is the feature.\n\nThe second is every RELIGHT rule (charred back to burning). Those are the only rules in the file that put matter BACK into a burning state, so they are the only closed loop in the fire economy, and its gain is (relight chance per tick) x (how long a neighbour stays lit). Scaling the burn duration without scaling these multiplies that gain by the same factor, which is fine at 200% -- measured, the difference at the `mob-burn` corpse was 13 voxels still alight versus 15, i.e. nothing -- and is not fine at the top of the slider, where an unscaled gain would cross 1.0 and the fire would never go out (CLAUDE.md rule 2). This is a CEILING argument, not a fix for anything observed at the default: dividing the relight rules too holds the gain exactly where the author put it at every setting, so the slider changes the CLOCK of the fire and never its shape. A corpse in lava re-flares half as often and stays lit twice as long, which is the same corpse running at half speed.\n\nIt is NOT on the ignition rules, the emit rules or the extinguisher rules, and each exclusion is a decision: ignition is how fast fire SPREADS (a separate lever -- see the combustion note at the top of this file -- and leaving it alone is what makes a longer burn also spread further, since a voxel that stays lit twice as long emits its upward flame twice as many times), emit is how much flame a lit voxel SHOWS, and dousing must beat the burn to the tick at any setting."
+    },
+    {
       "self": "ember",
       "decay": true,
+      "burnDuration": true,
       "chance": 1,
       "becomes": "ash"
     },
     {
       "self": "ember",
       "decay": true,
+      "burnDuration": true,
       "chance": 4,
       "becomes": "smoke"
     },
     {
       "self": "ember",
       "decay": true,
+      "burnDuration": true,
       "chance": 3,
       "becomes": "air"
     },
@@ -234,6 +291,13 @@
       "neighbor": "gravel",
       "chance": 30,
       "neighborBecomes": "sand"
+    },
+    {
+      "note": "ACID EATS MEAT FAR FASTER THAN IT EATS ROCK, and this is the rule that says so. Ordered BEFORE the generic tag:dissolvable rule below, per the file's specific-before-generic convention, so mineral erosion keeps its old slow chain and only organics get the fast one.\n\nWHY IT MATTERS OUT OF PROPORTION TO ITS SIZE: this rule reaches a BODY. mob.cpp's inbound pass evaluates acid's own rules FROM the grid cell ONTO each body voxel it touches (the same direction the GPU evaluates them), so skin, flesh, bone, cloth and leather -- all tag:organic -- are eaten by this line and by nothing that had to be written for them. At the old shared 45 per-mille a limb at skinScale 8 lost about 4.5% of ONE sub-voxel layer per tick, roughly two seconds per layer and the better part of a minute for an arm, which is what 'acid does not do nearly enough damage' actually was. At 250 a layer goes in about ten ticks.\n\nSteel is unaffected because `steel` carries no tag:organic and no tag:dissolvable -- armour still protects, and still for the reason equipment.h states: not a resist number, an absence of the tag.",
+      "self": "acid",
+      "neighbor": "tag:organic",
+      "chance": 250,
+      "neighborBecomes": "air"
     },
     {
       "self": "acid",
@@ -583,6 +647,22 @@
       "minLight": 235,
       "chance": 60,
       "selfBecomes": "fire"
+    },    {
+      "self": "pine_dark",
+      "neighbor": "glass",
+      "needsSky": true,
+      "when": "day",
+      "minLight": 235,
+      "chance": 60,
+      "selfBecomes": "fire"
+    },    {
+      "self": "pine_lit",
+      "neighbor": "glass",
+      "needsSky": true,
+      "when": "day",
+      "minLight": 235,
+      "chance": 60,
+      "selfBecomes": "fire"
     },
     {
       "self": "grass",
@@ -659,18 +739,21 @@
     {
       "self": "cloth_burning",
       "decay": true,
+      "burnDuration": true,
       "chance": 26.67,
       "becomes": "air"
     },
     {
       "self": "cloth_burning",
       "decay": true,
+      "burnDuration": true,
       "chance": 12,
       "becomes": "cloth_charred"
     },
     {
       "self": "cloth_burning",
       "decay": true,
+      "burnDuration": true,
       "chance": 0.33,
       "becomes": "ash"
     },
@@ -680,6 +763,7 @@
     {
       "self": "cloth_charred",
       "decay": true,
+      "burnDuration": true,
       "chance": 10,
       "becomes": "cloth_burning",
       "scaleByNeighbors": {
@@ -712,11 +796,40 @@
     {
       "self": "hair_burning",
       "decay": true,
+      "burnDuration": true,
       "chance": 180,
       "becomes": "air"
     },
     {
-      "note": "FLESH: sears on contact, ignites only under a WIDE front. skin -> flesh_cooked is a plain pair rule, so a single lick of flame cooks the surface and a creature can be seared without being destroyed. Ignition is the scaled decay below."
+      "note": "-------- UNDERCLOTH: the base human's linen, which BLACKENS AND STAYS --------\nA near-copy of the cloth chain above with one branch deleted, and the deletion is the mechanic. cloth_burning is CONSUMED (26.67 of its 39 per-mille go to air), which is right for a robe -- a burnt robe should hang in rags. It is wrong for the one garment the character is wearing UNDER everything: burning it away undresses them, and 'the player caught fire and is now naked' is a worse read than any amount of scorching.\n\nSo undercloth_burning has exactly one decay branch and it lands on undercloth_charred, which authors no rules at all. Same 39 per-mille total, so it burns for the same LENGTH of time as a robe and responds to the burn-duration slider identically; only the destination moved. It still catches at cloth's rate, still emits fire upward while alight, so it still spreads a fire and still cooks the flesh underneath through the ordinary table -- what it cannot do is disappear."
+    },
+    {
+      "self": "undercloth",
+      "neighbor": "tag:hot",
+      "chance": 200,
+      "selfBecomes": "undercloth_burning"
+    },
+    {
+      "self": "undercloth_burning",
+      "neighbor": "tag:extinguisher",
+      "chance": 450,
+      "selfBecomes": "undercloth_charred"
+    },
+    {
+      "self": "undercloth_burning",
+      "emit": "fire",
+      "dir": "up",
+      "chance": 120
+    },
+    {
+      "self": "undercloth_burning",
+      "decay": true,
+      "burnDuration": true,
+      "chance": 39,
+      "becomes": "undercloth_charred"
+    },
+    {
+      "note": "FLESH: sears on contact, ignites only under a WIDE front. skin -> flesh_cooked is a plain pair rule, so a single lick of flame cooks the surface and a creature can be seared without being destroyed. Ignition is the scaled decay below.\n\nIGNITION WAS RAISED 9.75x IN TWO PASSES (40 -> 130 -> 390) on owner report that a body was not flammable enough. THE SEAR WAS NOT, and the attempt to raise it is worth recording because it was wrong for a reason that is easy to repeat: skin -> flesh_cooked is a COLOUR CHANGE, not combustion, so raising it makes a body look cooked faster without making it any more likely to catch. It also broke the one comparison this whole section is built on -- at sear 220 vs cloth's 200 the flesh reacted to a single hot face MORE eagerly than the cloth over it, which inverts 'cloth catches at about 8x flesh's rate' -- and the mob-burn gate caught it as cloth and skin halving on the same tick. Flammability is the decay below; the sear stays at 90. THE MINCOUNT DID NOT MOVE and must not: 3 is the reason a lone ember on a shoulder gutters out, and it is provable rather than tuned (see the next note). At 390 with scaleMax 4 the scaled chance is 858 per-mille at the minCount-3 threshold and saturates at 1000 under a full six-face front, i.e. cooked flesh under a real fire ignites within a tick or two -- the SEAR (90) is now what paces a body catching alight, not the ignition. Raising the chance makes a real fire take hold quickly; lowering the count would make ANY spark take hold, which is a different and much worse game."
     },
     {
       "note": "minCount 3 is deliberate and provable: a lone burning voxel plus the single fire cell it emits reach 2, so one ignited voxel cannot restart itself no matter how the dice fall. Three simultaneously hot faces means a real fire -- or burning cloth lying against the skin, which is exactly how a clothing layer is supposed to kill you."
@@ -730,7 +843,7 @@
     {
       "self": "flesh_cooked",
       "decay": true,
-      "chance": 40,
+      "chance": 390,
       "becomes": "flesh_burning",
       "scaleByNeighbors": {
         "neighbor": "tag:hot",
@@ -756,14 +869,30 @@
     {
       "self": "flesh_burning",
       "decay": true,
+      "burnDuration": true,
       "chance": 49.47,
       "becomes": "flesh_charred"
     },
     {
       "self": "flesh_burning",
       "decay": true,
+      "burnDuration": true,
       "chance": 0.53,
       "becomes": "ash"
+    },
+    {
+      "note": "DEEP CHAR. flesh_charred is what one pass of flame leaves: dark, but still brown and still meat. Fire that KEEPS coming takes it one stage further to flesh_cinder -- near-black, crisp, and inert. That is the difference between 'this body was in a fire' and 'this body was torched', and it is a stage rather than a palette jitter because it has different RULES: cinder authors none at all, so it can neither re-ignite nor be driven further, and a corpse burned this far is permanently black and permanently settled.\n\nIt sits ABOVE the relight rule on purpose. Both roll every tick on the same voxel and the first to fire wins, so at 20 vs 8 a body under a sustained blaze cinders about two and a half times more often than it flares back up. That makes the char chain CONVERGE under fire instead of cycling charred -> burning -> charred, which is strictly better for rule 2 than the relight rule alone: the terminus is an inert material rather than a coin flip that never ends.\n\nminCount 3 rather than the relight rule's 4 because this is a much smaller claim -- 'the fire is still on me', not 'the fire is hot enough to restart spent fuel' -- and because a lone ember still cannot reach 3 (see the minCount note above). Not marked burnDuration: nothing here is alight, so the burn-duration slider has no business in it."
+    },
+    {
+      "self": "flesh_charred",
+      "decay": true,
+      "chance": 20,
+      "becomes": "flesh_cinder",
+      "scaleByNeighbors": {
+        "neighbor": "tag:hot",
+        "minCount": 3,
+        "scaleMax": 3.0
+      }
     },
     {
       "note": "Charred flesh relights only under a full four-face front, which in practice means lava or a sustained blaze. Without that floor a burnt corpse is a permanent low-grade emitter and its chunk never sleeps (CLAUDE.md rule 2)."
@@ -771,6 +900,7 @@
     {
       "self": "flesh_charred",
       "decay": true,
+      "burnDuration": true,
       "chance": 8,
       "becomes": "flesh_burning",
       "scaleByNeighbors": {
@@ -785,7 +915,7 @@
     {
       "self": "staff_wood",
       "neighbor": "tag:hot",
-      "chance": 16,
+      "chance": 11,
       "selfBecomes": "ember"
     }
   ]

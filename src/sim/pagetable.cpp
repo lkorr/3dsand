@@ -6,6 +6,8 @@
 #include <cstdlib>
 
 #include "sim/pass_table.h"  // pass::Buf::Voxels for the tracked page fills
+#include "sim/rng_simd.h"    // rng::Pcg8 — the JITTER verify is 80% of Classify
+#include "sim/scan.h"        // scan::AllEqualMasked — the whole-chunk predicates
 #include "sim/tuning.h"      // TUNE_PART_MAX_VEL, for the spawn-ring radius
 
 namespace {
@@ -259,12 +261,10 @@ uint32_t PageTable::Classify(uint32_t slot, const uint32_t* words) const {
   // no-op act, and every neighbour state-nibble read is behind a same-material
   // guard; the stamp byte is save-stripped anyway): the free-path comment in
   // ConsumeOccupancy carries the line-level citations.
-  {
-    bool air = true;
-    for (uint32_t i = 0; i < kChunkVol; i++)
-      if ((words[i] & kAirDemoteMask) != 0u) { air = false; break; }
-    if (air) return kPtEmpty;
-  }
+  // ONE definition of the stainless-air predicate, shared with the hysteresis
+  // free probe below — these were two verbatim copies of the same loop.
+  if (scan::AllEqualMasked(words, kChunkVol, kAirDemoteMask, 0u))
+    return kPtEmpty;
   // UNIFORM: whole-WORD equality, never material equality (§2.3, risk 3). A
   // UNIFORM sentinel carries only 12 bits of material, so a chunk of one
   // material whose cells differ in their state nibble cannot be represented —
@@ -273,10 +273,7 @@ uint32_t PageTable::Classify(uint32_t slot, const uint32_t* words) const {
   // chunks of 32,768 are whole-word uniform, against 2,115 that are one
   // material with mixed state.
   const uint32_t w0 = words[0];
-  bool allSame = true;
-  for (uint32_t i = 1; i < kChunkVol; i++)
-    if (words[i] != w0) { allSame = false; break; }
-  if (allSame) {
+  if (scan::AllEqual(words + 1, kChunkVol - 1, w0)) {
     // Only promote to UNIFORM when the word is EXACTLY what synthWord would
     // produce for it. A chunk of one word that carries a live tick stamp or a
     // stain cannot round-trip through a 12-bit sentinel, and promoting it would
@@ -344,21 +341,62 @@ uint32_t PageTable::Classify(uint32_t slot, const uint32_t* words) const {
   // at ~25 us each, 36.6 s of the 130 s paged frame budget over one run — the
   // single largest CPU item after eviction's synth+RLE.
   const uint32_t wantMat = mat;
-  for (uint32_t i = 0; i < kChunkVol; i++)
-    if ((words[i] & kPtMatMask) != wantMat) return kNeedsPage;
+  if (!scan::AllEqualMasked(words, kChunkVol, kPtMatMask, wantMat))
+    return kNeedsPage;
   const uint32_t stampBits = kStampNever << kStampShift;
+  // THE HOT LOOP OF THE PAGED PATH. Measured before this pass: 6,007 ms over
+  // 425,890 chunks in one --autofly-hard run (14.1 us each), of which the two
+  // remaining PCG rounds per cell are ~80% — the masked scans around it are
+  // ~6%. kChunk is 16, so a row is exactly two 8-lane vectors and the inner
+  // loop has NO TAIL; that is the whole reason this vectorizes cleanly.
+#if defined(__AVX2__)
+  {
+    const __m256i lane0 = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
+    const __m256i lane8 = _mm256_setr_epi32(8, 9, 10, 11, 12, 13, 14, 15);
+    const __m256i bxv = _mm256_set1_epi32(base.x);
+    const __m256i x0 = _mm256_add_epi32(bxv, lane0);
+    const __m256i x1 = _mm256_add_epi32(bxv, lane8);
+    const __m256i vmat = _mm256_set1_epi32((int)(wantMat | stampBits));
+    uint32_t i = 0;
+    for (int lz = 0; lz < (int)kChunk; lz++)
+      for (int ly = 0; ly < (int)kChunk; ly++, i += kChunk) {
+        const uint32_t rowSeed = JitterRowSeed(base.y + ly, base.z + lz, seed_);
+        const __m256i s0 = rng::JitterStateInRow8(rowSeed, x0, seed_);
+        const __m256i s1 = rng::JitterStateInRow8(rowSeed, x1, seed_);
+        const __m256i w0v =
+            _mm256_or_si256(vmat, _mm256_slli_epi32(s0, 12));
+        const __m256i w1v =
+            _mm256_or_si256(vmat, _mm256_slli_epi32(s1, 12));
+        const __m256i g0 = _mm256_loadu_si256((const __m256i*)(words + i));
+        const __m256i g1 = _mm256_loadu_si256((const __m256i*)(words + i + 8));
+        // Whole-row test. The return value is a classification, not a
+        // position, so coarsening the early exit from 1 cell to 16 changes
+        // nothing observable — and every load stays inside the row that was
+        // going to be read anyway.
+        const __m256i ne = _mm256_or_si256(_mm256_xor_si256(g0, w0v),
+                                           _mm256_xor_si256(g1, w1v));
+        if (!_mm256_testz_si256(ne, ne)) return kNeedsPage;
+      }
+    return entry;
+  }
+#else
   uint32_t i = 0;
   for (int lz = 0; lz < (int)kChunk; lz++)
     for (int ly = 0; ly < (int)kChunk; ly++) {
       const uint32_t rowSeed = JitterRowSeed(base.y + ly, base.z + lz, seed_);
+      // Accumulate per row and test once, mirroring the vector path's
+      // granularity so the two are structurally the same comparison.
+      uint32_t bad = 0;
       for (int lx = 0; lx < (int)kChunk; lx++, i++) {
         const uint32_t want =
             wantMat | (JitterStateInRow(rowSeed, base.x + lx, seed_) << 12) |
             stampBits;
-        if (words[i] != want) return kNeedsPage;
+        bad |= words[i] ^ want;
       }
+      if (bad) return kNeedsPage;
     }
   return entry;
+#endif
 }
 
 // ---- the §3.2 recurrence --------------------------------------------------
@@ -1049,16 +1087,15 @@ void PageTable::ConsumeOccupancy(const std::vector<uint32_t>& occupancy,
                 pendingProbeKeys_[ci])
           continue;
         const uint32_t* words = freeProbe_.data() + ci * (size_t)kChunkVol;
-        bool demotable = true;
-        for (uint32_t i = 0; i < kChunkVol; i++)
-          if ((words[i] & kAirDemoteMask) != 0u) { demotable = false; break; }
-        if (!demotable) {
+        // Same stainless-air predicate as Classify's EMPTY test — one
+        // definition now, and the index the debug print wants comes back from
+        // the same call instead of a second hand-rolled rescan.
+        const size_t at = scan::FirstIndexWhereMasked(words, kChunkVol,
+                                                      kAirDemoteMask, 0u);
+        if (at != kChunkVol) {
           if (ptDbg) {
-            uint32_t w = 0, at = 0;
-            for (uint32_t i = 0; i < kChunkVol; i++)
-              if ((words[i] & kAirDemoteMask) != 0u) { w = words[i]; at = i; break; }
             std::printf("[pt] tick %u free REFUSED slot %u: word %08x at %u\n",
-                        tick_, s, w, at);
+                        tick_, s, words[at], (uint32_t)at);
           }
           zeroStreak_[s] = 0;
           continue;

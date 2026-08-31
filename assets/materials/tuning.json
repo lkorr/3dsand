@@ -1,7 +1,7 @@
 {
   "comment": "Look-and-feel parameters, edited with assets/tuner.html (Tuning tabs). Render values are compiled into every shader as TUNE_* constants by TuningWgslBlock() (src/sim/tuning.cpp) and picked up by F5 'reload shaders' with no rebuild. Player/camera/physics/debris/grenade/tools values are read directly by the C++ systems and apply on the same F5. The 'sim' group is DETERMINISM-CRITICAL (CLAUDE.md rule 1): integer-only, feeds voxel state, and changing anything there changes the world hash - re-run --selftest after touching it. The 'worldgen' group only takes effect on a new world (regen world / new seed). Anything omitted from this file keeps its compiled-in default, so a partial file is valid.",
   "player": {
-    "model": "mina",
+    "model": "human",
     "flySpeed": 13.75,
     "flySprint": 32.5,
     "walkSpeed": 1.6,
@@ -10,7 +10,7 @@
     "jumpSpeed": 5.25,
     "swimUp": 17.5,
     "swimDown": 7.5,
-    "maxFall": 30,
+    "maxFall": 53.5,
     "fallDamageSpeed": 8,
     "fallSplatSpeed": 25,
     "fallDamageScale": 0.75,
@@ -66,7 +66,13 @@
     "pitchLift": 0.35,
     "stateFollow": 0.75,
     "speedFov": 0.06,
-    "speedFovHalflife": 0.35
+    "speedFovHalflife": 0.35,
+    "zoomStep": 0.12,
+    "zoomMin": 0.35,
+    "zoomMax": 2.5
+  },
+  "gear": {
+    "ruinedCondition": 0.4
   },
   "avatar": {
     "enabled": true,
@@ -82,6 +88,9 @@
     "headLookRecenterHalflife": 0.35,
     "ikBlendHalflife": 0.08,
     "airDebounce": 0.12,
+    "fallFlailDelay": 0.35,
+    "fallFlailRamp": 0.9,
+    "fallMinDrop": 1.2,
     "firstPersonArms": true,
     "footTrim": 0,
     "severImpulse": 6,
@@ -181,6 +190,10 @@
     "severVoxelSpeed": 6,
     "severGobbetVoxels": 1,
     "severGobbetSpread": 0.6,
+    "carveChunkiness": 0.65,
+    "carveBlobSize": 3.5,
+    "carveFalloff": 3,
+    "carveSpallRounds": 2,
     "bleedGain": 1,
     "bleedGainVar": {
       "dist": "gaussian",
@@ -763,15 +776,6 @@
     "shoreHorsetailHeight": 9,
     "shoreIrisChance": 34,
     "shoreMossChance": 3,
-    "vineChance": 26,
-    "vineLenMin": 10,
-    "vineLenSpan": 26,
-    "creeperFlowerChance": 9,
-    "mossChance": 14,
-    "mossLenMin": 4,
-    "mossLenSpan": 9,
-    "ivyChance": 2,
-    "ivyTwist": 5,
     "wallIvyDensity": 3,
     "cactusChance": 26,
     "saguaroFraction": 22,
@@ -818,6 +822,9 @@
   "weather": {
     "waterFreezes": false,
     "iceMelts": false
+  },
+  "combustion": {
+    "burnDurationPct": 200
   },
   "wind": {
     "windSpeed": 6,

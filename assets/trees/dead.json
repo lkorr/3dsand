@@ -1,0 +1,131 @@
+{
+  "name": "dead",
+  "displayName": "Dead tree",
+  "variants": 2,
+  "shape": 2,
+  "baseSize": 0.3,
+  "scale": 6.5,
+  "scaleV": 1.6,
+  "levels": 3,
+  "ratio": 0.03,
+  "ratioPower": 1.3,
+  "flare": 0.9,
+  "attractionUp": 0.5,
+  "whorlCount": 0,
+  "lobes": 4,
+  "lobeDepth": 0.12,
+  "barkNoise": 0.11,
+  "levelsData": [
+    {
+      "length": 1,
+      "lengthV": 0.1,
+      "taper": 0.75,
+      "branches": 0,
+      "downAngle": 60,
+      "downAngleV": 0,
+      "rotate": 137.5,
+      "rotateV": 12,
+      "curve": 12,
+      "curveBack": 0,
+      "curveV": 90,
+      "curveRes": 7,
+      "segSplits": 0.4,
+      "splitAngle": 30,
+      "splitAngleV": 8
+    },
+    {
+      "length": 0.5,
+      "lengthV": 0.34,
+      "taper": 1,
+      "branches": 8,
+      "downAngle": 52,
+      "downAngleV": -40,
+      "rotate": 137.5,
+      "rotateV": 40,
+      "curve": -20,
+      "curveBack": 0,
+      "curveV": 110,
+      "curveRes": 5,
+      "segSplits": 0,
+      "splitAngle": 20,
+      "splitAngleV": 8
+    },
+    {
+      "length": 0.42,
+      "lengthV": 0.4,
+      "taper": 1,
+      "branches": 5,
+      "downAngle": 46,
+      "downAngleV": 30,
+      "rotate": 137.5,
+      "rotateV": 50,
+      "curve": 0,
+      "curveBack": 0,
+      "curveV": 120,
+      "curveRes": 3,
+      "segSplits": 0,
+      "splitAngle": 20,
+      "splitAngleV": 8
+    },
+    {
+      "length": 0.4,
+      "lengthV": 0.1,
+      "taper": 1,
+      "branches": 3,
+      "downAngle": 45,
+      "downAngleV": 0,
+      "rotate": 137.5,
+      "rotateV": 12,
+      "curve": 0,
+      "curveBack": 0,
+      "curveV": 40,
+      "curveRes": 2,
+      "segSplits": 0,
+      "splitAngle": 20,
+      "splitAngleV": 8
+    }
+  ],
+  "foliage": {
+    "startLevel": 3,
+    "clumpsPerStem": 0,
+    "tipBias": 0.45,
+    "radius": 0.1,
+    "radiusV": 0.18,
+    "elongation": 0.65,
+    "droop": 0.25,
+    "density": 0.88,
+    "noiseScale": 0.26,
+    "sminK": 0.25,
+    "canopyShadeMix": 0.5,
+    "depthShade": 0.75
+  },
+  "bark": [
+    "bark_dark",
+    "wood",
+    "bark_light"
+  ],
+  "leaf": [
+    "leaves_dark",
+    "leaves",
+    "leaves_lit"
+  ],
+  "autumnLeaf": [
+    "autumn_dark",
+    "autumn_leaves",
+    "autumn_lit"
+  ],
+  "autumnChance": 0,
+  "placement": {
+    "biomes": {
+      "forest": 4,
+      "meadow": 3,
+      "pine": 4,
+      "desert": 10
+    },
+    "minY": -1,
+    "maxY": -1,
+    "maxSlope": 700,
+    "sparsity": 1,
+    "shade": 0
+  }
+}

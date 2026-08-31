@@ -1,0 +1,131 @@
+{
+  "name": "birch",
+  "displayName": "Birch",
+  "variants": 3,
+  "shape": 5,
+  "baseSize": 0.34,
+  "scale": 9,
+  "scaleV": 1.6,
+  "levels": 3,
+  "ratio": 0.017,
+  "ratioPower": 1.35,
+  "flare": 0.4,
+  "attractionUp": -0.18,
+  "whorlCount": 0,
+  "lobes": 0,
+  "lobeDepth": 0.1,
+  "barkNoise": 0.04,
+  "levelsData": [
+    {
+      "length": 1,
+      "lengthV": 0.1,
+      "taper": 0.85,
+      "branches": 0,
+      "downAngle": 60,
+      "downAngleV": 0,
+      "rotate": 137.5,
+      "rotateV": 12,
+      "curve": 4,
+      "curveBack": 0,
+      "curveV": 40,
+      "curveRes": 10,
+      "segSplits": 0.15,
+      "splitAngle": 14,
+      "splitAngleV": 8
+    },
+    {
+      "length": 0.52,
+      "lengthV": 0.24,
+      "taper": 0.9,
+      "branches": 11,
+      "downAngle": 44,
+      "downAngleV": -32,
+      "rotate": 137.5,
+      "rotateV": 26,
+      "curve": 22,
+      "curveBack": 0,
+      "curveV": 60,
+      "curveRes": 6,
+      "segSplits": 0,
+      "splitAngle": 20,
+      "splitAngleV": 8
+    },
+    {
+      "length": 0.52,
+      "lengthV": 0.3,
+      "taper": 0.95,
+      "branches": 5,
+      "downAngle": 36,
+      "downAngleV": 26,
+      "rotate": 137.5,
+      "rotateV": 34,
+      "curve": 38,
+      "curveBack": 0,
+      "curveV": 75,
+      "curveRes": 4,
+      "segSplits": 0,
+      "splitAngle": 20,
+      "splitAngleV": 8
+    },
+    {
+      "length": 0.4,
+      "lengthV": 0.1,
+      "taper": 1,
+      "branches": 4,
+      "downAngle": 40,
+      "downAngleV": 0,
+      "rotate": 137.5,
+      "rotateV": 12,
+      "curve": 0,
+      "curveBack": 0,
+      "curveV": 60,
+      "curveRes": 3,
+      "segSplits": 0,
+      "splitAngle": 20,
+      "splitAngleV": 8
+    }
+  ],
+  "foliage": {
+    "startLevel": 2,
+    "clumpsPerStem": 1.2,
+    "tipBias": 0.45,
+    "radius": 0.4,
+    "radiusV": 0.14,
+    "elongation": 0.85,
+    "droop": 0.35,
+    "density": 0.68,
+    "noiseScale": 0.24,
+    "sminK": 0.16,
+    "canopyShadeMix": 0.4,
+    "depthShade": 0.7
+  },
+  "bark": [
+    "wood",
+    "birch_wood",
+    "birch_wood"
+  ],
+  "leaf": [
+    "leaves_dark",
+    "leaves",
+    "leaves_lit"
+  ],
+  "autumnLeaf": [
+    "autumn_dark",
+    "autumn_leaves",
+    "autumn_lit"
+  ],
+  "autumnChance": 4,
+  "placement": {
+    "biomes": {
+      "forest": 18,
+      "meadow": 30,
+      "pine": 8,
+      "desert": 0
+    },
+    "minY": -1,
+    "maxY": 22,
+    "maxSlope": 460,
+    "sparsity": 1,
+    "shade": 95
+  }
+}

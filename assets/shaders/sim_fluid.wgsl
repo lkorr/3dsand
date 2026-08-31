@@ -564,17 +564,45 @@ fn p2g1(@builtin(global_invocation_id) gid : vec3<u32>) {
   if (!inWindow(cell, T.origin)) { return; }
   let ax = axisOf(p.px); let ay = axisOf(p.py); let az = axisOf(p.pz);
 
+  // ---- loop-invariant work, lifted out of the 27 taps ----------------------
+  // Every term below was recomputed inside the innermost body, 27 times, for
+  // values that vary over at most 3 or 9 distinct inputs. dpos is SEPARABLE —
+  // dx depends only on i, dy only on j, dz only on k — so each axis was being
+  // evaluated 9x more often than it has values, and `p.p* - FLUID_HALF` (fully
+  // invariant) 27 times.
+  //
+  // The weight split is the same trick and the one place to be careful: `mq`
+  // TRUNCATES (common.wgsl), so it is NOT associative and the tree may not be
+  // rebracketed. Precomputing the (i,j) product preserves the exact expression
+  // `mq(mq(ax.w[i], ay.w[j]), az.w[k])` — same operands, same order, same
+  // rounding — and takes the mq count from 54 to 36. Rebracketing to
+  // mq(ax.w[i], mq(ay.w[j], az.w[k])) would be a different number and would
+  // move the world hash.
+  let pcx = p.px - FLUID_HALF;
+  let pcy = p.py - FLUID_HALF;
+  let pcz = p.pz - FLUID_HALF;
+  var dxs : array<i32, 3>; var dys : array<i32, 3>; var dzs : array<i32, 3>;
+  for (var a = 0; a < 3; a++) {
+    dxs[a] = ((ax.base + a) << 16u) - pcx;
+    dys[a] = ((ay.base + a) << 16u) - pcy;
+    dzs[a] = ((az.base + a) << 16u) - pcz;
+  }
+  var wxy : array<i32, 9>;
+  for (var j = 0; j < 3; j++) {
+    for (var i = 0; i < 3; i++) { wxy[j * 3 + i] = mq(ax.w[i], ay.w[j]); }
+  }
+
   for (var k = 0; k < 3; k++) {
     for (var j = 0; j < 3; j++) {
       for (var i = 0; i < 3; i++) {
         let nc = vec3<i32>(ax.base + i, ay.base + j, az.base + k);
         let bm = nodeBlock(nc);
         if (bm == 0u) { continue; }
-        let w = mq(mq(ax.w[i], ay.w[j]), az.w[k]);   // Q16.16 <= 0.42
+        let w = mq(wxy[j * 3 + i], az.w[k]);   // Q16.16 <= 0.42
         // dpos = node - particle, Q16.16 in [-1.5, 1.5] per axis.
-        let dx = (nc.x << 16u) - (p.px - FLUID_HALF);
-        let dy = (nc.y << 16u) - (p.py - FLUID_HALF);
-        let dz = (nc.z << 16u) - (p.pz - FLUID_HALF);
+        let dx = dxs[i];
+        let dy = dys[j];
+        let dz = dzs[k];
         var vex = p.vx + mq(p.c00, dx) + mq(p.c01, dy) + mq(p.c02, dz);
         var vey = p.vy + mq(p.c10, dx) + mq(p.c11, dy) + mq(p.c12, dz);
         var vez = p.vz + mq(p.c20, dx) + mq(p.c21, dy) + mq(p.c22, dz);
@@ -615,6 +643,15 @@ fn p2g2(@builtin(global_invocation_id) gid : vec3<u32>) {
   if (!inWindow(cell, T.origin)) { return; }
   let ax = axisOf(p.px); let ay = axisOf(p.py); let az = axisOf(p.pz);
 
+  // The (i,j) weight product, hoisted out of BOTH 27-tap loops below — see the
+  // note in p2g1. mq truncates and is not associative, so this precomputes the
+  // inner bracket rather than rebracketing the expression. p2g2 runs the
+  // 3x3x3 walk TWICE, so the 18 saved mq are saved twice per particle.
+  var wxy : array<i32, 9>;
+  for (var j = 0; j < 3; j++) {
+    for (var i = 0; i < 3; i++) { wxy[j * 3 + i] = mq(ax.w[i], ay.w[j]); }
+  }
+
   // Gather rho and same-species rho (Q16.16 particle masses per cell).
   var rho : i32 = 0;
   var same : i32 = 0;
@@ -624,7 +661,7 @@ fn p2g2(@builtin(global_invocation_id) gid : vec3<u32>) {
         let nc = vec3<i32>(ax.base + i, ay.base + j, az.base + k);
         let bm = nodeBlock(nc);
         if (bm == 0u) { continue; }
-        let w = mq(mq(ax.w[i], ay.w[j]), az.w[k]);
+        let w = mq(wxy[j * 3 + i], az.w[k]);
         let ni = nodeWordBase(bm, nc);
         let m = atomicLoad(&fluidGrid[ni + 0u]);
         let m1 = atomicLoad(&fluidGrid[ni + 4u]);
@@ -693,16 +730,28 @@ fn p2g2(@builtin(global_invocation_id) gid : vec3<u32>) {
   let m02 = clamp(-mq(vs, p.c02 + p.c20), -FLUID_VEFF_MAX, FLUID_VEFF_MAX);
   let m12 = clamp(-mq(vs, p.c12 + p.c21), -FLUID_VEFF_MAX, FLUID_VEFF_MAX);
 
+  // Same separable dpos hoist as p2g1: dx varies only with i, dy with j, dz
+  // with k, and `p.p* - FLUID_HALF` is invariant across all 27.
+  let pcx = p.px - FLUID_HALF;
+  let pcy = p.py - FLUID_HALF;
+  let pcz = p.pz - FLUID_HALF;
+  var dxs : array<i32, 3>; var dys : array<i32, 3>; var dzs : array<i32, 3>;
+  for (var a = 0; a < 3; a++) {
+    dxs[a] = ((ax.base + a) << 16u) - pcx;
+    dys[a] = ((ay.base + a) << 16u) - pcy;
+    dzs[a] = ((az.base + a) << 16u) - pcz;
+  }
+
   for (var k = 0; k < 3; k++) {
     for (var j = 0; j < 3; j++) {
       for (var i = 0; i < 3; i++) {
         let nc = vec3<i32>(ax.base + i, ay.base + j, az.base + k);
         let bm = nodeBlock(nc);
         if (bm == 0u) { continue; }
-        let w = mq(mq(ax.w[i], ay.w[j]), az.w[k]);
-        let dx = (nc.x << 16u) - (p.px - FLUID_HALF);
-        let dy = (nc.y << 16u) - (p.py - FLUID_HALF);
-        let dz = (nc.z << 16u) - (p.pz - FLUID_HALF);
+        let w = mq(wxy[j * 3 + i], az.w[k]);
+        let dx = dxs[i];
+        let dy = dys[j];
+        let dz = dzs[k];
         let fx = clamp(mq(m00, dx) + mq(m01, dy) + mq(m02, dz),
                        -FLUID_VEFF_MAX, FLUID_VEFF_MAX);
         let fy = clamp(mq(m01, dx) + mq(m11, dy) + mq(m12, dz),
@@ -950,20 +999,36 @@ fn g2p(@builtin(global_invocation_id) gid : vec3<u32>) {
   // it turns across the neighbourhood) the curvature that flags a wave crest.
   var grad = vec3<i32>(0, 0, 0);
   var massSum : i32 = 0;
+  // Same two hoists as p2g1/p2g2 — the separable dpos and the (i,j) weight
+  // bracket. This is the heaviest of the four 27-tap loops (it also does the
+  // foam gather), so it is where they matter most.
+  let pcx = p.px - FLUID_HALF;
+  let pcy = p.py - FLUID_HALF;
+  let pcz = p.pz - FLUID_HALF;
+  var dxs : array<i32, 3>; var dys : array<i32, 3>; var dzs : array<i32, 3>;
+  for (var a = 0; a < 3; a++) {
+    dxs[a] = ((ax.base + a) << 16u) - pcx;
+    dys[a] = ((ay.base + a) << 16u) - pcy;
+    dzs[a] = ((az.base + a) << 16u) - pcz;
+  }
+  var wxy : array<i32, 9>;
+  for (var j = 0; j < 3; j++) {
+    for (var i = 0; i < 3; i++) { wxy[j * 3 + i] = mq(ax.w[i], ay.w[j]); }
+  }
   for (var k = 0; k < 3; k++) {
     for (var j = 0; j < 3; j++) {
       for (var i = 0; i < 3; i++) {
         let nc = vec3<i32>(ax.base + i, ay.base + j, az.base + k);
         let bm = nodeBlock(nc);
         if (bm == 0u) { continue; }
-        let w = mq(mq(ax.w[i], ay.w[j]), az.w[k]);
+        let w = mq(wxy[j * 3 + i], az.w[k]);
         let ni = nodeWordBase(bm, nc);
         let nv = vec3<i32>(atomicLoad(&fluidGrid[ni + 1u]),
                            atomicLoad(&fluidGrid[ni + 2u]),
                            atomicLoad(&fluidGrid[ni + 3u]));
-        let dx = (nc.x << 16u) - (p.px - FLUID_HALF);
-        let dy = (nc.y << 16u) - (p.py - FLUID_HALF);
-        let dz = (nc.z << 16u) - (p.pz - FLUID_HALF);
+        let dx = dxs[i];
+        let dy = dys[j];
+        let dz = dzs[k];
         let tx = mq(w, nv.x); let ty = mq(w, nv.y); let tz = mq(w, nv.z);
         v += vec3<i32>(tx, ty, tz);
         // C = 4 * sum(w * v_node * dpos^T)  (D^-1 = 4 for quadratic splines)

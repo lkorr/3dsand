@@ -465,7 +465,8 @@
     // moving the camera, so a camera-only signature would freeze the view mid
     // brush stroke.
     this.editRev = 0;
-    this.stats = {regions: 0, quads: 0, draws: 0, fetches: 0, bytes: 0, ms: 0};
+    this.stats = {regions: 0, quads: 0, draws: 0, fetches: 0, bytes: 0, ms: 0,
+                  farD: 0, farNeed: 0};
 
     this.view = {
       mode: 'material',           // material | class | height
@@ -648,7 +649,70 @@
     return want;
   };
 
+  // ---- a LOCAL region, with no server behind it ---------------------------
+  //
+  // Everything above streams: _desired() decides what should be resident, the
+  // queue fetches it from /api/voxregion, the worker decodes and meshes it.
+  // The Trees tab has no terrain and no server request to make — it has a
+  // Uint16Array that assets/editor/treegen.js just produced in this same tab,
+  // and it wants it drawn.
+  //
+  // This is the seam for that: the same region record the `decoded` worker
+  // branch builds, handed straight to the same upload and mesh path. The
+  // viewer's AO, slice, isolate, palette, orbit camera, screenshot and picking
+  // all work on it unchanged, which is the whole reason the Trees tab reuses
+  // WorldView instead of growing a second WebGL renderer that would drift.
+  //
+  // `opts.streaming === false` (set by that tab) is what stops update() from
+  // asking a server that is not there for regions that do not exist.
+  // SEVERAL authored grids at once, each with its own size and world offset.
+  // The Trees tab's quad view is four separate trees rather than one composited
+  // grid on purpose: a 2x2 layout of great oaks in a single array is
+  // (2*231)^2*150 = 32M cells of which the trees occupy an eighth, and both the
+  // Uint16Array and the R16UI texture pay for all of it. Four regions pay for
+  // four trees.
+  //
+  // Keys are 'local0..N' and every entry keeps rx/ry/rz = 0, so _neighborSlabs
+  // (which looks up by regionKey) finds nothing for any of them — which is what
+  // we want: a missing neighbour meshes as OPAQUE and would otherwise weld the
+  // facing sides of two adjacent trees shut.
+  WorldView.prototype.setLocalRegions = function (list) {
+    var self = this;
+    this.regions.forEach(function (r) { self._freeRegion(r); });
+    this.regions.clear();
+    this.gen++;
+    var out = [];
+    for (var i = 0; i < list.length; i++) {
+      var e = list[i];
+      var o = e.origin || [0, 0, 0];
+      var r = {
+        key: 'local' + i, level: 0, rx: 0, ry: 0, rz: 0,
+        lod: 1, nx: e.nx, ny: e.ny, nz: e.nz,
+        origin: [o[0], o[1], o[2]],
+        cells: e.cells, tex: null, op: null, fl: null, meshing: false,
+        dirty: true, gen: this.gen, rev: 0
+      };
+      this.regions.set(r.key, r);
+      this._uploadTex(r);
+      out.push(r);
+    }
+    // _meshPass takes at most two in flight and _onWorker pumps the rest as
+    // each finishes, so two priming calls drain the whole list.
+    this._meshPass();
+    this._meshPass();
+    return out;
+  };
+
+  WorldView.prototype.setLocalRegion = function (cells, nx, ny, nz, origin) {
+    return this.setLocalRegions(
+        [{cells: cells, nx: nx, ny: ny, nz: nz, origin: origin}])[0];
+  };
+
   WorldView.prototype.update = function () {
+    // A local region is authored, not streamed: there is nothing to want and
+    // nothing to evict, and running the streamer would delete the one region
+    // the tab is showing on its first frame.
+    if (this.opts.streaming === false) return;
     var want = this._desired();
     var live = new Set();
     for (var i = 0; i < want.length; i++) {
@@ -782,8 +846,8 @@
     var eye = this.camEye();
     this.regions.forEach(function (r) {
       if (!r.dirty || r.meshing || !r.cells) return;
-      var ext = r.nx * r.lod;
-      var cx = r.origin[0] + ext / 2, cy = r.origin[1] + ext / 2, cz = r.origin[2] + ext / 2;
+      var cx = r.origin[0] + r.nx * r.lod / 2, cy = r.origin[1] + r.ny * r.lod / 2,
+          cz = r.origin[2] + r.nz * r.lod / 2;
       var pri = r.level * 1e6 + Math.hypot(cx - eye[0], cy - eye[1], cz - eye[2]);
       if (pri < bestPri) { bestPri = pri; pick = r; }
     });
@@ -839,6 +903,24 @@
   WorldView.prototype._uploadTex = function (r) {
     var gl = this.gl;
     if (!r.tex) r.tex = gl.createTexture();
+    // UNPACK_ALIGNMENT 1, and it is load-bearing for any region that is not
+    // 64 wide. The default is 4: GL then expects every row of the upload to be
+    // padded to a 4-byte boundary, so a 16-bit region whose width is not even
+    // (75 * 2 = 150 bytes) needs 152 bytes per row and the source array is
+    // short — the whole texImage3D FAILS with INVALID_OPERATION and the
+    // texture keeps whatever it had, which is nothing.
+    //
+    // Every streamed region is REGION_N = 64 wide (128 bytes, divisible by 4),
+    // so this was invisible until the Trees tab handed setLocalRegion a grid
+    // sized to a tree. The symptom was a black canvas with a correct mesh,
+    // 13,474 quads drawn and no error at draw time — the error had been raised
+    // one upload earlier and cleared by the next getError.
+    //
+    // Explicit unit, for the same class of reason: this used to inherit
+    // whatever activeTexture the last render() happened to leave, which was
+    // TEXTURE0 by luck rather than by contract.
+    gl.activeTexture(gl.TEXTURE0);
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
     gl.bindTexture(gl.TEXTURE_3D, r.tex);
     gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
     gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
@@ -1006,7 +1088,34 @@
     var eye = this.camEye(), fwd = this.camForward();
     // The far plane follows the coarsest resident level; a fixed one either
     // clips the horizon or wastes the whole depth range on the near field.
+    //
+    // BUT THE LEVEL SIZE IS A STREAMING FACT, and an AUTHORED region has
+    // nothing to do with REGION_N. The Trees tab runs at levels = 1, which
+    // yields 192 voxels of depth — fine for one oak, and less than half of what
+    // a 2x2 stand of great oaks needs, so the back of the quad was clipped away
+    // and pulling the camera back only deleted more of it. Even a lone great
+    // oak (211x169x184) framed past it.
+    //
+    // So the streaming value is a FLOOR now, not the answer: grow it to reach
+    // the farthest corner of everything actually resident. In streaming mode
+    // the coarsest shell's corner is ~2.6*ext against a 3*ext floor, so the
+    // floor still wins and nothing there changes.
     var farD = this._levelExtent(this.view.levels - 1) * 3;
+    var need = 0;
+    this.regions.forEach(function (r) {
+      var o = r.origin;
+      var dx = Math.max(Math.abs(o[0] - eye[0]), Math.abs(o[0] + r.nx * r.lod - eye[0]));
+      var dy = Math.max(Math.abs(o[1] - eye[1]), Math.abs(o[1] + r.ny * r.lod - eye[1]));
+      var dz = Math.max(Math.abs(o[2] - eye[2]), Math.abs(o[2] + r.nz * r.lod - eye[2]));
+      var d = Math.sqrt(dx * dx + dy * dy + dz * dz);
+      if (d > need) need = d;
+    });
+    farD = Math.max(farD, need * 1.05 + 8);
+    // Reported because "the back of the scene is missing" is otherwise
+    // indistinguishable from "it has not meshed yet": one is this number being
+    // too small and the other is a worker still running.
+    this.stats.farD = farD;
+    this.stats.farNeed = need;
     var proj = m4persp(this.fov(), dw / dh, 0.4, farD);
     var viewM = m4look(eye[0], eye[1], eye[2],
                        eye[0] + fwd[0], eye[1] + fwd[1], eye[2] + fwd[2], 0, 1, 0);
@@ -1040,8 +1149,8 @@
     this.regions.forEach(function (r) {
       if (!r.op && !r.fl) return;
       if (!self._visible(r, mvp)) return;
-      var ext = r.nx * r.lod;
-      var cx = r.origin[0] + ext / 2, cy = r.origin[1] + ext / 2, cz = r.origin[2] + ext / 2;
+      var cx = r.origin[0] + r.nx * r.lod / 2, cy = r.origin[1] + r.ny * r.lod / 2,
+          cz = r.origin[2] + r.nz * r.lod / 2;
       list.push({r: r, d: Math.hypot(cx - eye[0], cy - eye[1], cz - eye[2])});
     });
     list.sort(function (a, b) { return a.d - b.d; });
@@ -1080,11 +1189,15 @@
   // under your feet. A box is out only when all eight corners fail the SAME
   // clip plane.
   WorldView.prototype._visible = function (r, mvp) {
-    var ext = r.nx * r.lod;
+    // PER AXIS, not r.nx three times. A streamed region is a cube so the two
+    // agree there, but an AUTHORED one is whatever shape it was handed: a tree
+    // is far taller than it is wide, and testing its box as nx^3 culls the
+    // crown the moment the camera looks up at it.
+    var ex = r.nx * r.lod, ey = r.ny * r.lod, ez = r.nz * r.lod;
     var o = r.origin;
     var all = 63;
     for (var i = 0; i < 8; i++) {
-      var x = o[0] + (i & 1 ? ext : 0), y = o[1] + (i & 2 ? ext : 0), z = o[2] + (i & 4 ? ext : 0);
+      var x = o[0] + (i & 1 ? ex : 0), y = o[1] + (i & 2 ? ey : 0), z = o[2] + (i & 4 ? ez : 0);
       var cx = mvp[0] * x + mvp[4] * y + mvp[8] * z + mvp[12];
       var cy = mvp[1] * x + mvp[5] * y + mvp[9] * z + mvp[13];
       var cz = mvp[2] * x + mvp[6] * y + mvp[10] * z + mvp[14];
@@ -1105,7 +1218,7 @@
     // than by editing: it is how you look inside a hill without carving it.
     if (this.view.sliceEnabled) {
       var ax = this.view.sliceAxis;
-      var lo = r.origin[ax], hi = lo + r.nx * r.lod;
+      var lo = r.origin[ax], hi = lo + [r.nx, r.ny, r.nz][ax] * r.lod;
       if (lo > this.view.slicePos) return;
       if (this.view.sliceThick > 0 && hi < this.view.slicePos - this.view.sliceThick) return;
     }
@@ -1184,6 +1297,17 @@
       var m = this.tool.measure;
       pushLine(a, m.a[0] + 0.5, m.a[1] + 0.5, m.a[2] + 0.5,
                m.b[0] + 0.5, m.b[1] + 0.5, m.b[2] + 0.5, [1, 0.6, 0.2, 1]);
+    }
+    // Host overlay. One callback, so a tab can draw its own lines in world
+    // space without a second GL program or a second pass — the Trees tab uses
+    // it for the branch skeleton, which is where a wrong-looking tree is
+    // usually actually wrong (the voxels hide the angle that caused it).
+    if (this.onOverlay) {
+      var self = this;
+      this.onOverlay(function (x0, y0, z0, x1, y1, z1, col) {
+        pushLine(a, x0, y0, z0, x1, y1, z1, col || [1, 1, 1, 1]);
+      });
+      void self;
     }
     if (!a.length) return;
     var gl = this.gl;

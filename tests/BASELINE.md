@@ -14,9 +14,29 @@ before blaming your change". That took ~15 minutes of rebuild. This takes none.
 
 ## `determinismHash` — the golden world hash
 
+> **READ THIS FIRST: A MOVED HASH IS NOT A BROKEN SIM.**
+>
+> `determinismHash` is a **change detector**, not the determinism invariant. The
+> invariant is that the same seed+tick+inputs reproduce bit-identically, and it
+> is tested by the gate's *twice-run comparison* — which is a separate check
+> that keeps passing while this value moves.
+>
+> **All we require is determinism. New numbers are fine.** If you changed hashed
+> state on purpose (a reaction chance, a material, a `sim.*` value, a re-baked
+> asset), the hash was always going to move; that is the mechanism working, not
+> a finding. Run `--selftest --rebaseline`, commit the new value with the
+> change, and move on. Do not investigate it, do not A/B it, do not try to
+> restore the old number, and do not describe it as "the sim moved" or "I broke
+> determinism" — determinism passed.
+>
+> The gate still turns the run red on a mismatch, and deliberately so: that is
+> the only way an *unintended* change gets noticed. Red here means "confirm you
+> meant this", not "something is wrong".
+
 `"determinismHash": "7cfa2420"` pins what the determinism gate must actually
 produce, and it is checked separately from the pass/fail entries: a mismatch is
-a **REGRESSION** and turns the run red even though the gate is marked `"pass"`.
+reported as a **PIN MOVED** and turns the run red even though the gate is marked
+`"pass"`, so that an unexpected one cannot slip by unnoticed.
 
 It exists because the gate's own check is weaker than it looks. It runs the sim
 twice and compares the two hash sequences — that proves the sim is
@@ -34,12 +54,15 @@ new value, and update the key **in the same commit as the change**, the same
 discipline as flipping a known-failure to `"pass"`:
 
 ```bash
-./build/Release/sandvox.exe --selftest --gate determinism
-# determinism: FAIL (final hash 91ab00de over 200 ticks)
-#   GOLDEN HASH MISMATCH: baseline says 7cfa2420, ...
+./build/Release/sandvox.exe --selftest --rebaseline
+# determinism: PIN MOVED (final hash 91ab00de over 200 ticks, sim reproduces
+#   itself; only the recorded value differs - rebaseline if you meant it)
+# *** determinismHash: 7cfa2420 -> 91ab00de ***
 ```
 
-then set `"determinismHash": "91ab00de"`. The commit message should say what
+That is the WHOLE procedure: one command, which both re-measures and records.
+Reaching for `--gate determinism` first and then hand-editing the key is two
+runs and a file edit for the same result. The commit message should say what
 content changed and why the hash moved — a flip with no explanation is
 indistinguishable from someone silencing a real regression, which is the one way
 this key can make things worse than not having it.

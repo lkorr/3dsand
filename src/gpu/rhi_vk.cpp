@@ -670,6 +670,11 @@ VkCommandBuffer NativeCmd(const RenderPass& p) {
   return p ? static_cast<VkrRenderPass*>(p.Get())->cmd : VK_NULL_HANDLE;
 }
 
+VkImageView NativeImageView(const TextureView& v) {
+  vk::Image* img = NI(v);
+  return img ? img->view : VK_NULL_HANDLE;
+}
+
 }  // namespace vkr
 
 // RecordTableVulkan lives in namespace rhi (declared in rhi_record.h).

@@ -186,6 +186,48 @@ struct Flipbook {
   std::vector<FlipbookFrame> frames;
 };
 
+// ---- ball-joint pose limit (the shoulder) -----------------------------------
+//
+// WHAT A SHOULDER ACTUALLY IS. The one-axis clamp below (`poseAxis`/`poseMin`/
+// `poseMax`) is the right shape for a knee and the wrong shape for a shoulder:
+// it bounds ONE component of the rotation and leaves the other two free, so a
+// mouse-driven arm could still be raked straight back or folded across the
+// chest and through the ribs as long as its X component stayed legal. A cone
+// is not right either — the reachable set of a real shoulder is very nearly
+// "the whole sphere MINUS the region behind the torso MINUS a wedge across the
+// midline", and no cone centred anywhere describes that without also refusing
+// the arm-straight-out-to-the-side pose, which is ordinary.
+//
+// So the limit is stated as what it is: HALF-SPACES ON WHERE THE BONE MAY
+// POINT, plus a bound on how far the bone may roll about itself.
+//
+//   reachNormal[k] / reachSin[k]:  (bone direction) . normal <= sin(limit)
+//                                  "no more than <limit> degrees past this
+//                                   plane", authored in degrees.
+//   twistMin/twistMax:             roll about the bone itself. Load-bearing
+//                                  even though the IK barely twists on its
+//                                  own: the shoulder's roll is what aims the
+//                                  ELBOW's hinge plane, so an unbounded roll
+//                                  puts a correctly-hinged forearm into the
+//                                  ribs.
+//
+// EXACTLY TWO NORMALS, AND THEY MUST BE PERPENDICULAR. The nearest legal point
+// on the sphere has a closed form when the constraint normals are orthonormal
+// (clamp each component, complete the third from the unit-length identity) and
+// does not when they are not — sequential projection onto two tilted planes
+// re-violates the plane it just left. Two perpendicular planes say "not behind"
+// and "not across", which is the whole anatomical claim; the loader rejects a
+// non-perpendicular pair rather than silently solving the wrong problem.
+struct PoseBallLimit {
+  bool has = false;
+  Vec3 bone{0, -1, 0};           // bone direction in the part's own rest frame
+  int reachCount = 0;            // 0..2
+  Vec3 reachNormal[2]{};         // unit, rest frame, mutually perpendicular
+  float reachSin[2]{};           // sin of the authored degrees
+  bool hasTwist = false;
+  float twistMin = 0, twistMax = 0;  // radians about `bone`, 0 = rest
+};
+
 // One rigged part. Mirrors MobLimbDef's rig half; mob.cpp owns the Jolt half.
 struct AnimPart {
   std::string name;
@@ -198,6 +240,41 @@ struct AnimPart {
   // legacy no-IK fallback (dummy.json): sinusoidal swing about `axis`
   Vec3 axis{1, 0, 0};
   float swingAmp = 0, swingPhase = 0;
+  // ---- POSE-SPACE joint limit (optional; sidecar "poseLimit") --------------
+  // A RANGE OF MOTION FOR THE ANIMATION, which is a different thing from the
+  // ragdoll limits next to it in MobLimbDef. `minAngle`/`maxAngle` and the
+  // swing-twist cone are Jolt constraints: they bound a DYNAMIC body, and a
+  // live limb is KINEMATIC — the pose pipeline writes its transform every tick
+  // and the solver never sees a constraint at all. So nothing whatsoever
+  // stopped the IK from raking a thigh out behind the body or folding it up
+  // through the pelvis; the only guard was a selftest noticing afterwards.
+  //
+  // This clamps the SOLVED pose instead, about the part's own REST frame, so
+  // an anatomically impossible leg is unrepresentable rather than merely
+  // untested. Authored in degrees, stored in radians. Applied after the IK and
+  // before the pose is submitted (AnimClampPoseLimits).
+  bool hasPoseLimit = false;
+  Vec3 poseAxis{1, 0, 0};        // in the part's own rest frame
+  float poseMin = -3.14159265f;  // radians, about poseAxis, 0 = rest
+  float poseMax = 3.14159265f;
+  // HINGE: one degree of freedom, not one BOUNDED degree of freedom.
+  //
+  // Without this the clamp above bounds the component about `poseAxis` and
+  // leaves the swing off that axis untouched — which is what a knee wants (the
+  // solver never puts much there and a hard projection would fight it) and
+  // emphatically not what an elbow wants. The two-bone IK bends about an axis
+  // it derives in MODEL space from the chain's pole vector, and that axis only
+  // coincides with the forearm's own hinge axis while the shoulder is in pure
+  // flexion or pure abduction; at any blend of the two the solver opens the
+  // elbow sideways, which is the "arm folds through itself" pose.
+  //
+  // With it, the part's rotation relative to its parent is forced to be a pure
+  // rotation about `poseAxis` in [poseMin, poseMax] — the off-axis swing is
+  // DISCARDED, not clamped. The hand then misses the IK target by however much
+  // the solver's plane disagreed with the joint's, which is the correct trade:
+  // an elbow is a hinge, and a reach it cannot make is a reach it cannot make.
+  bool poseHinge = false;
+  PoseBallLimit poseBall;
 };
 
 // The whole rig, shared by all instances of a def (immutable after load).
@@ -227,6 +304,19 @@ struct ClipInstance {
   float weight = 1.0f;           // requested weight before blend in/out
   bool stopping = false;         // blending out, remove at weight 0
   float fade = 0;                // current blend-in/out factor 0..1
+  // PLAYBACK RATE, multiplied into the playhead only — never into `ageMs`.
+  //
+  // A clip's authored period is right for exactly ONE speed. The walk and run
+  // arm swings are derived from the runtime's step model at walk pace and at
+  // sprint pace (scripts/gen_human.py arm_cycle_ms), which leaves every speed
+  // BETWEEN them — most of the speeds actually played — with arms cycling at a
+  // rate the feet do not share, so they drift in and out of phase. The avatar
+  // sets this from the live stride rate so one authored cycle spans one stride
+  // at any pace.
+  //
+  // `ageMs` is deliberately excluded: it is the blend-in's clock and a blend is
+  // measured in real seconds, not in stride fractions.
+  float rate = 1.0f;
 };
 
 struct FootState {
@@ -292,6 +382,20 @@ void AnimFlatten(const AnimSkeleton& sk, AnimState& st);
 // `targetModel` is the desired effector position in model space.
 void AnimSolveTwoBone(const AnimSkeleton& sk, AnimState& st, const IkChain& chain,
                       Vec3 targetModel, float weight);
+
+// Stage 6. Clamp every part carrying a `poseLimit` back inside its authored
+// range of motion, then re-flatten the affected subtrees so children follow.
+// Runs AFTER all IK, because the IK is what puts a joint outside its range;
+// running it before would clamp a pose the solver is about to overwrite.
+//
+// Works purely in st.model[], the frame the IK writes, and deliberately does
+// NOT write st.local[] — stage 1 reseeds every local from the rest pose on the
+// next frame, so anything stored there would be discarded unread. This is the
+// same reason AnimSolveTwoBone leaves local alone.
+//
+// Parts with no limit are untouched, so this is a no-op on every rig that
+// authors none.
+void AnimClampPoseLimits(const AnimSkeleton& sk, AnimState& st);
 
 // Holden spring integration for one part's local rotation offset.
 void AnimSpringStep(const SpringDef& def, SpringState& s, Vec3 goal, float dt);

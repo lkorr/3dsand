@@ -6,6 +6,9 @@
 
 #include <nlohmann/json.hpp>
 
+#include "sim/scale.h"    // SkinScaleFor / NeededArtUpsample / kLegacyAuthoring*
+#include "sim/voxload.h"  // UpsamplePrefab
+
 // See melee.h for what this is and why. This file is only the motion: the
 // damage side lives in main.cpp's tick loop, which owns the ray casts and the
 // spawn/op lists a carve has to reach.
@@ -43,24 +46,154 @@ bool LoadItemAsset(const std::string& dir, size_t materialCount,
   }
   errors += vwarn;
 
-  d.scale = s.value("scale", 1u);
-  if (d.scale < 1) d.scale = 1;
-  const std::string modelName = s.value("model", d.name);
-  int mi = -1;
-  for (size_t i = 0; i < d.prefab.models.size(); i++)
-    if (d.prefab.models[i].name == modelName) mi = (int)i;
-  // A single-model .vox with an unnamed model is still perfectly usable; only
-  // complain when there is genuinely nothing to draw.
-  if (mi < 0 && d.prefab.models.size() == 1) mi = 0;
-  if (mi < 0) {
-    errors += "items: \"" + d.name + "\" has no model named \"" + modelName +
-              "\" in " + base + ".vox\n";
+  // ART COLOURS ARE FILE-LOCAL AND THE PALETTE IS SHARED.
+  //
+  // A ".col" layer's bytes are slots in THIS .vox's own palette; the renderer
+  // indexes ONE merged table that every def and every item resolves against.
+  // Fold this file into it and rewrite its voxels NOW, before anything copies
+  // them into a shell or a brick — exactly what LoadMobDefs does, and for
+  // exactly the same reason.
+  //
+  // Skipping it does not fail to render: it renders the item in whatever
+  // colours the MOBS happened to put at those slot numbers. A gold sash came
+  // out the same near-black as the robe over it, which reads as a lighting
+  // problem rather than as an un-remapped palette. Items load AFTER mobs into
+  // the same set (main.cpp), and LoadMobDefs clears the table, so this must
+  // stay on that side of the ordering.
+  if (!d.prefab.artColors.empty()) {
+    const std::vector<uint8_t> remap =
+        MicroBodyMergeArt(micro, d.prefab.artColors, "item/" + d.name, errors);
+    for (PrefabModel& pm : d.prefab.models)
+      for (PrefabVoxel& v : pm.voxels)
+        if (v.color) v.color = remap[v.color];
+  }
+
+  // ---- ART SCALE (DESIGN.md §3b) --------------------------------------------
+  // Authored as voxels/METRE; the micro-per-world `scale` is derived. Legacy
+  // sidecars said `scale` directly, which silently meant "and the world is
+  // 10 cm" — see ItemDef::artVoxelsPerMetre.
+  if (s.contains("artVoxelsPerMetre")) {
+    d.artVoxelsPerMetre = s.value("artVoxelsPerMetre", 0);
+  } else {
+    const uint32_t legacy = std::max(1u, s.value("scale", 1u));
+    d.artVoxelsPerMetre = (int)legacy * kLegacyAuthoringVoxelsPerMetre;
+    errors += "items: \"" + d.name + "\" has no \"artVoxelsPerMetre\"; " +
+              "reading legacy scale " + std::to_string(legacy) + " as " +
+              std::to_string(d.artVoxelsPerMetre) + " art voxels/metre\n";
+  }
+  if (d.artVoxelsPerMetre <= 0) {
+    errors += "items: \"" + d.name + "\" artVoxelsPerMetre must be positive\n";
+    d.artVoxelsPerMetre = kVoxelsPerMetre;
+  }
+  d.artUpsample = NeededArtUpsample(d.artVoxelsPerMetre);
+  d.scale = SkinScaleFor(d.artVoxelsPerMetre * (int)d.artUpsample);
+  if (d.scale != 1 && d.scale != 2 && d.scale != 4 && d.scale != 8) {
+    errors += "items: \"" + d.name + "\" artVoxelsPerMetre " +
+              std::to_string(d.artVoxelsPerMetre) + " gives scale " +
+              std::to_string(d.scale) + " at " + std::to_string(kVoxelsPerMetre) +
+              " world voxels/metre — must be 1, 2, 4 or 8. Using 1; this item " +
+              "will be the wrong physical size.\n";
+    d.scale = 1;
+    d.artUpsample = 1;
+  }
+  if (d.artUpsample > 1) UpsamplePrefab(d.prefab, d.artUpsample);
+
+  auto findModel = [&](const std::string& want) -> int {
+    for (size_t i = 0; i < d.prefab.models.size(); i++)
+      if (d.prefab.models[i].name == want) return (int)i;
+    return -1;
+  };
+
+  // ---- WORN ITEMS ARE MULTI-MODEL ------------------------------------------
+  // A robe is a torso panel, two sleeves and a skirt, and each one has to move
+  // with a different limb — so an armour .vox is shaped like a MOB's .vox
+  // (one named model per part) rather than like the sword's single blade. The
+  // cover list is the schema for that; see ItemCover in game/item.h.
+  //
+  // Parsed BEFORE the single-model block below, because a worn piece has no
+  // one model to be: `d.voxels` stays empty and the geometry lives per shell.
+  const bool worn = ItemKindIsWorn(d.kind);
+  // Authored art units -> world voxels; divides out any upsample.
+  const float invScale = d.ArtToWorld();
+  if (s.contains("cover") && s["cover"].is_array()) {
+    auto vec3Of = [](const json& j, Vec3 dflt) {
+      if (!j.is_array() || j.size() != 3) return dflt;
+      return Vec3{j[0].get<float>(), j[1].get<float>(), j[2].get<float>()};
+    };
+    for (const json& c : s["cover"]) {
+      if (!c.is_object()) continue;
+      ItemCover cv;
+      cv.part = c.value("part", "");
+      cv.model = c.value("model", cv.part);
+      if (cv.part.empty()) {
+        errors += "items: \"" + d.name +
+                  "\" has a cover entry with no \"part\" — skipped\n";
+        continue;
+      }
+      // Micro -> world voxels, the same conversion every other length in this
+      // sidecar takes. `fitBox` is a SIZE and `offset` is a displacement, so
+      // both scale and neither is rebased on the model origin: they are
+      // measured against the WEARER's limb box, not against the item's art.
+      cv.offset = vec3Of(c.contains("offset") ? c["offset"] : json(), Vec3{}) *
+                  invScale;
+      cv.fitBox = vec3Of(c.contains("fitBox") ? c["fitBox"] : json(), Vec3{}) *
+                  invScale;
+      cv.hp = c.value("hp", 10.0f);
+      const int ci = findModel(cv.model);
+      if (ci < 0) {
+        errors += "items: \"" + d.name + "\" cover \"" + cv.part +
+                  "\" names no model \"" + cv.model + "\" in " + base +
+                  ".vox — skipped\n";
+        continue;
+      }
+      const PrefabModel& cm = d.prefab.models[ci];
+      cv.size = cm.size;
+      cv.modelOffset = cm.offset;
+      cv.voxels = cm.voxels;
+      // Same shared pool the rigs and the held item use: a shell is drawn by
+      // the borrowed slot's own micro path, so it must live where that path
+      // looks.
+      if (d.scale > 1) {
+        cv.microModel = MicroBodyPack(micro, cv.voxels, cv.size, d.scale,
+                                      "item/" + d.name + "/" + cv.part, errors);
+        if (cv.microModel < 0)
+          errors += "items: \"" + d.name + "\" shell \"" + cv.part +
+                    "\" has no micro brick and will not render\n";
+      }
+      d.cover.push_back(std::move(cv));
+    }
+  }
+  if (worn && d.cover.empty()) {
+    // An armour item with no shells would equip into its slot and then be
+    // invisible and inert, which reads as a broken game rather than as the
+    // missing JSON key it is.
+    errors += "items: \"" + d.name +
+              "\" is a worn kind but declares no \"cover\" entries — it would "
+              "be invisible on the body\n";
     return false;
   }
-  const PrefabModel& m = d.prefab.models[mi];
-  d.size = m.size;
-  d.offset = m.offset;
-  d.voxels = m.voxels;
+
+  // The HELD half of an item: one model, one grip, one hilt, one edge. Null
+  // for a worn piece, and every block below that needs a single model is
+  // written against this pointer rather than against a `worn` test — so a
+  // future kind that is both held and worn is one flag, not a re-shuffle.
+  const PrefabModel* held = nullptr;
+  if (!worn) {
+    const std::string modelName = s.value("model", d.name);
+    int mi = findModel(modelName);
+    // A single-model .vox with an unnamed model is still perfectly usable;
+    // only complain when there is genuinely nothing to draw.
+    if (mi < 0 && d.prefab.models.size() == 1) mi = 0;
+    if (mi < 0) {
+      errors += "items: \"" + d.name + "\" has no model named \"" + modelName +
+                "\" in " + base + ".vox\n";
+      return false;
+    }
+    held = &d.prefab.models[mi];
+    d.size = held->size;
+    d.offset = held->offset;
+    d.voxels = held->voxels;
+  }
 
   d.hp = s.value("hp", 30.0f);
   d.severable = s.value("severable", true);
@@ -119,8 +252,15 @@ bool LoadItemAsset(const std::string& dir, size_t materialCount,
   // So bias the negated component by one cell to reach the face. Written per
   // axis rather than as a blanket `+1` because only z is flipped by the
   // (x, z, -y) map; x and y need the index as it stands.
-  const Vec3 modelOrigin{(float)m.sceneMin.x * inv, (float)m.sceneMin.y * inv,
-                         (float)(m.sceneMin.z - 1) * inv};
+  //
+  // A WORN piece has none of this: no single model to measure a scene origin
+  // against, no fist to close on it, no blade. Its placement is the cover
+  // list's `offset` against the limb it covers, which is measured in the
+  // wearer's frame and so needs no rebase at all.
+  const Vec3 modelOrigin =
+      held ? Vec3{(float)held->sceneMin.x * inv, (float)held->sceneMin.y * inv,
+                  (float)(held->sceneMin.z - 1) * inv}
+           : Vec3{};
 
   // ---- grip contexts ------------------------------------------------------
   // Every context is read whole: no key inherits from another (see item.h).
@@ -140,7 +280,11 @@ bool LoadItemAsset(const std::string& dir, size_t materialCount,
       d.grip[it.key()] = gr;
     }
   }
-  if (d.grip.empty())
+  // A worn piece is never held, so silence here is correct for it; for
+  // anything else, no grip means an item that parks at the wearer's origin
+  // sticking out of their navel, which reads as a physics glitch rather than
+  // as the missing JSON key it is (item.h).
+  if (d.grip.empty() && !worn)
     errors += "items: \"" + d.name +
               "\" declares no grip contexts — it cannot be held\n";
 
@@ -240,8 +384,9 @@ bool LoadItemAsset(const std::string& dir, size_t materialCount,
   }
 
   // Micro brick, packed into the SAME pool the rigs use — a held item is drawn
-  // by the borrowed slot's own render path.
-  if (d.scale > 1) {
+  // by the borrowed slot's own render path. A worn piece packed one brick PER
+  // SHELL up in the cover block; there is no whole-item model to pack here.
+  if (d.scale > 1 && held) {
     d.microModel =
         MicroBodyPack(micro, d.voxels, d.size, d.scale, "item/" + d.name,
                       errors);
@@ -277,17 +422,22 @@ bool LoadItems(const std::string& dir, size_t materialCount,
       errors += "items: an entry has no \"id\" — skipped\n";
       continue;
     }
+    // Kind by NAME, through the one table in game/item.h. An unknown kind is
+    // skipped loudly rather than defaulting to None, which would be an item
+    // that loads, appears in the pack, and then goes into no slot at all.
     const std::string kind = it.value("kind", "");
-    if (kind == "melee") {
-      d.kind = ItemKind::Melee;
-    } else {
+    d.kind = ItemKindFromName(kind);
+    if (d.kind == ItemKind::None) {
       errors += "items: \"" + d.name + "\" has unknown kind \"" + kind +
                 "\" — skipped\n";
       continue;
     }
     d.damage = it.value("damage", 12.0f);
     d.carveBonus = it.value("carveBonus", 0.0f);
-    d.reach = it.value("reach", 9.0f);
+    // items.json authors reach in world voxels at the legacy 10 vox/m
+    // baseline; rescale so the same number means the same distance.
+    d.reach = it.value("reach", 9.0f) *
+              ((float)kVoxelsPerMetre / (float)kLegacyAuthoringVoxelsPerMetre);
     // A broken item is skipped, never fatal: one bad asset must not cost the
     // player their whole hotbar (DESIGN.md §6, the same rule mob defs follow).
     if (!LoadItemAsset(dir, materialCount, micro, d, errors)) continue;

@@ -1,4 +1,5 @@
 #pragma once
+#include "sim/scale.h"  // MetresToCells / MetresPerSecToCells
 #include <cstdint>
 #include <vector>
 
@@ -72,19 +73,21 @@ struct MeleeTuning {
   // enough that an intentional flick always fires, high enough that aiming
   // while guarding does not.
   float commitSpeed = 900.0f;
-  // How far the hand travels from guard, in world voxels, over a full cut.
-  float swingReach = 5.5f;
+  // How far the hand travels from guard over a full cut. METRES at the call
+  // site, cells in the field: a reach is a physical fact about an arm, and a
+  // bare 5.5 would have become 27 cm the moment kVoxelMeters halved.
+  float swingReach = MetresToCells(0.55f);
   // Seconds the committed slash takes. Short: a cut is a snap, not a wind-up.
   float slashTime = 0.17f;
   float recoverTime = 0.22f;
   // Blade tip speed (world voxels/sec) at and above which a hit does full
   // damage; below it damage falls off linearly to zero. This is what makes a
   // committed cut different from waving the weapon around.
-  float fullSpeed = 34.0f;
-  float minSpeed = 9.0f;
+  float fullSpeed = MetresPerSecToCells(3.4f);
+  float minSpeed = MetresPerSecToCells(0.9f);
   // How strongly the guard pose follows the mouse, in world voxels per
   // (pixel/sec). Small — this is a lean, not a teleport.
-  float trackGain = 0.0038f;
+  float trackGain = MetresToCells(0.00038f);
   // Per-axis gain on the mouse BEFORE it becomes a cut direction and a lean.
   // These shape the *pose*, not the commit test: `commitSpeed` is still
   // compared against true mouse speed, so raising these makes the blade travel
@@ -102,8 +105,9 @@ struct MeleeTuning {
   // makes a rightward flick cut rightward through what you are looking at.
   float xGain = -2.0f;
   float yGain = 5.0f;
-  // Guard-pose offsets from the shoulder, world voxels.
-  float guardForward = 2.2f, guardUp = 2.6f, guardSide = 1.6f;
+  // Guard-pose offsets from the shoulder, authored in METRES.
+  float guardForward = MetresToCells(0.22f), guardUp = MetresToCells(0.26f),
+        guardSide = MetresToCells(0.16f);
   // Seconds of mouse history the swing direction is averaged over. One tick of
   // raw delta is far too noisy to steer a cut with.
   float dirSmoothing = 0.06f;

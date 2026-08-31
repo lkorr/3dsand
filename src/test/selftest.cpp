@@ -27,6 +27,8 @@ namespace selftest {
 
 // Each domain file exposes its gates through one of these.
 const std::vector<Gate>& TerrainGates();
+const std::vector<Gate>& TreeGates();
+const std::vector<Gate>& ScaleGates();
 const std::vector<Gate>& SimGates();
 const std::vector<Gate>& CaGates();
 const std::vector<Gate>& WindGates();
@@ -39,6 +41,8 @@ const std::vector<Gate>& AudioGates();
 const std::vector<Gate>& WorldIoGates();
 const std::vector<Gate>& VoxRegionGates();
 const std::vector<Gate>& SpellGates();
+const std::vector<Gate>& PlayerKitGates();
+const std::vector<Gate>& EquipmentGates();
 
 // THE EXECUTION ORDER, and it is load-bearing.
 //
@@ -57,6 +61,32 @@ const char* const kOrder[] = {
     // property every later gate's fixture placement silently assumes. It also
     // has to run before anything moves the window, and it leaves the origin
     // exactly where `determinism` (which does not set it) needs it.
+    // FIRST OF ALL, and it costs nothing to put it there: `player-kit` is
+    // pure CPU with its own fixtures — no world, no GPU, no assets — so it can
+    // neither disturb the pristine worldgen `terrain` needs nor be disturbed
+    // by anything. Running it before the expensive gates also means a broken
+    // equipment model is reported in the first second of a full run.
+    // FIRST OF ALL, for the same reason player-kit is early and then some:
+    // `simd` is pure arithmetic — no world, no GPU, no assets, no fixtures —
+    // so it can neither disturb pristine worldgen nor be disturbed. It asserts
+    // that sim/scan.h and sim/rng_simd.h compute what their scalar definitions
+    // compute, which is a precondition for trusting ANY later gate's page
+    // table: PageTable::Classify decides sentinel promotion with them.
+    "simd",
+    // THIRD, and for the same reasons: `scale` is pure CPU over the loaded
+    // defs and the atlas files -- no world, no GPU, no fixtures. It asserts
+    // that everything authored is the PHYSICAL size it claims, which every
+    // other gate in the suite is blind to (they measure art-lattice counts,
+    // which are identical on a world where everything is half-size). A
+    // wrong-scale world makes every later gate meaningless, so it belongs
+    // with the other cheap front-loaded checks rather than after them.
+    "scale",
+    "player-kit",
+    // SECOND, and for the same reason: `tree-atlas` reads assets/trees/*.svtree
+    // off disk and asserts on the bytes. No world, no GPU, no state left
+    // behind -- and when the atlas is wrong every gate after it is measuring a
+    // forest nobody authored, so it belongs before them rather than after.
+    "tree-atlas",
     "terrain",
     // SECOND, and it wants the same thing `terrain` does: pristine worldgen at
     // an unmoved origin. Its whole subject is the ANALYTIC basin registry, and
@@ -76,16 +106,32 @@ const char* const kOrder[] = {
     "blood-stain", "flung-liquid", "fluid-det",     "fluid-settle",
     "fluid-excite", "fluid-onwater", "fluid-stain", "fluid-react", "far-fog",  "far-downsample",
     "far-persist",
-    "screenshots", "player-walk", "player-waterjump", "player-ledgegrab",
+    "screenshots", "fire-depth", "player-walk", "player-waterjump", "player-ledgegrab",
     "player-plants", "debris",
     "audio-impact", "audio-mob-voice", "audio-ambience",
-    "prefab",      "settle-back",    "player-body", "ragdoll-joints",
+    // "mob" restored to its original slot (it sat between prefab and
+    // settle-back until ec764e8 dropped it from both here and MobGates()).
+    // The position matters: gates share one World and several depend on what
+    // an earlier one left behind, so re-adding it anywhere else would be a
+    // different test.
+    "prefab",      "mob",            "settle-back", "player-body",
+    // Wearing things. After `mob` because it spawns the avatar def on real
+    // terrain and carves a shell, which wants the same standing world the
+    // body gates run in; before `ragdoll-joints` because it leaves the rig
+    // undressed and MobSystem reset, which is what that gate expects to find.
+    "armor-wear", "item-ground", "armor-fit",
+    "ragdoll-joints",
     "save-load",   "save-entities", "region-store", "streaming",     "spells",
     "page-roundtrip", "daylight-boundary",
     // Per-voxel body reactivity. Late, and it must be: it lights real fires and
     // pours real acid at absolute coordinates, and it regenerates the world on
     // the way out so the gates after it still find pristine terrain (rule 7).
     "mob-burn",
+    // Armour reactivity, right after `mob-burn` and for the same reasons: it
+    // lights real fires and pours real acid at absolute coordinates, and it
+    // regenerates the world on the way out so the gates after it still find
+    // pristine terrain (rule 7).
+    "armor-react",
     // LAST of the world-touching gates, and it must be: BuildVoxRegion moves
     // the residency window and resets the page table, which is the state every
     // other gate's fixture placement assumes. It restores both before it
@@ -98,13 +144,13 @@ const char* const kOrder[] = {
 const std::vector<Gate>& Registry() {
   static std::vector<Gate> all = [] {
     std::vector<Gate> pool;
-    for (const auto* g : {&TerrainGates(),
+    for (const auto* g : {&TerrainGates(), &TreeGates(), &ScaleGates(),
                           &SimGates(), &CaGates(), &WindGates(), &WaterGates(),
                           &RenderGates(),
                           &PlayerGates(),
                           &MobGates(), &BodyGates(), &WorldIoGates(), &AudioGates(),
                           &VoxRegionGates(),
-                          &SpellGates()})
+                          &SpellGates(), &PlayerKitGates(), &EquipmentGates()})
       pool.insert(pool.end(), g->begin(), g->end());
 
     std::vector<Gate> v;

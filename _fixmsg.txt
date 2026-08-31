@@ -1,0 +1,22 @@
+Anchor the equipment fixtures to the window, not to a column
+
+armor-wear and armor-fit spawned at absolute (150,150) and (160,160). Both
+passed, and both were the trap selftest.h's ordering note describes: by the time
+they run in a full suite, earlier gates have walked the residency window along
+x, so a hardcoded column is a fixture standing somewhere nobody chose.
+
+It surfaced the moment main's locomotion commits merged in. Those move the
+avatar, which moves the window, which moved these two fixtures -- and mob-burn,
+which runs after them and inherits whatever they leave, went from
+"93% cloth vs 46% skin, skin never halves" to "100% vs 100%, creature consumed".
+
+Worth recording how nearly this was misattributed. mob-burn passed on this
+branch before the merge and passes standalone after it, and the only delta in
+between was three commits from main -- which is a complete and convincing case
+that the regression was somebody else's. It was not: the delta from main moved
+the WINDOW, and these fixtures were the thing that could not cope with that.
+"My code is innocent" and "my fixtures are innocent" are two claims, and only
+the first one had evidence.
+
+mob-burn is back to 93% / 46% with the anchoring in. Nothing here writes to the
+world, which is exactly why it would have gone on rotting quietly.

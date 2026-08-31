@@ -105,6 +105,31 @@ class DebrisSystem {
                  std::vector<PrefabVoxel> skinVoxels = {},
                  uint32_t bleedMat = 0);
 
+  // TAKE A BODY OUT OF THE WORLD. Not damage and not a cull: the thing has
+  // been picked up, and it stops existing as matter. Goes through the same
+  // ReleaseBody every other disposal does, so the brick is freed and the
+  // "gone" notification fires exactly once (see SetOnBodyGone) — which is what
+  // keeps the ground-item registry from outliving the handle it names.
+  bool DestroyBody(uint64_t handle);
+
+  // A body's AUTHORITATIVE lattice, by handle — the skin where it has one, the
+  // collider where it does not, promoted to PrefabVoxel so the caller does not
+  // have to know which. `outScale` is the units that lattice is in.
+  //
+  // For the ground-item save (game/persist.cpp 'ITMS'): a dropped robe that
+  // has burned through has to come back burnt, and the only copy of those
+  // holes is the body's own lattice. Reading the DERIVED side instead would
+  // save something the next re-derive overwrites (phys/lattice.h).
+  bool BodyLatticeOf(uint64_t handle, std::vector<PrefabVoxel>& out,
+                     uint32_t& outScale) const;
+
+  // Per-material density, as every body-creating call here already takes it.
+  // Exposed so a caller that builds a body and hands it straight over (a
+  // dropped item — game/worlditems.h) uses the SAME table this system does,
+  // rather than threading a second copy through from wherever materials were
+  // loaded and having the two disagree after an R reload.
+  const std::vector<float>& DensityOf() const { return densityOf_; }
+
   // Laser body cut (PLAN §C2): partition a body's voxels by the world-space
   // plane (point, normal), destroy it, spawn both halves at the same pose
   // with inherited velocity. False when the cut misses or a half is too
@@ -146,6 +171,21 @@ class DebrisSystem {
   // Micro bodies must allocate out of the same set the renderer uploads, so
   // the owner hands it over once at startup. Not owned.
   void SetMicroSet(MicroBodySet* set) { microSet_ = set; }
+  // ---- "this body is gone" -------------------------------------------------
+  //
+  // Called for every body this system releases, whatever released it: culled
+  // out of the window, burned to nothing, blown apart, or reset. It exists for
+  // ONE caller — the dropped-item registry (game/worlditems.h), which maps a
+  // body handle to an item name and must not outlive the handle. Jolt reuses
+  // handles, so a stale entry would eventually re-match a NEW body and hand
+  // the player a sword they picked up off a rock.
+  //
+  // A callback rather than the registry being a member here: DebrisSystem has
+  // no business knowing what an item is, and this way "a burned robe on the
+  // ground is GONE" needs no code on this side to be true.
+  void SetOnBodyGone(std::function<void(uint64_t)> cb) {
+    onBodyGone_ = std::move(cb);
+  }
   // This tick's integer day phase, so a day/night-gated reaction behaves the
   // same on a body as it does in the grid (sim/reactcpu.h). Set it wherever the
   // tick's dayPhase is already computed; leaving it unset means night.
@@ -180,6 +220,24 @@ class DebrisSystem {
       n += (uint32_t)(b.HasFineSkin() ? b.skinVoxels.size() : b.voxels.size());
     return n;
   }
+  // Voxels of ONE material across every body, on the same authoritative
+  // lattice TotalBodyVoxels counts. "Is anything in the world still on fire"
+  // is a question about MATERIAL, and after a creature dies its limbs are
+  // bodies here rather than limbs on a mob — so a burn test that only censused
+  // the mob would go quiet the moment the mob did.
+  uint32_t TotalBodyMaterial(uint32_t mat) const {
+    uint32_t n = 0;
+    for (const Body& b : bodies_) {
+      if (b.HasFineSkin()) {
+        for (const PrefabVoxel& v : b.skinVoxels)
+          if ((v.material & 0xFFFu) == (mat & 0xFFFu)) n++;
+      } else {
+        for (const DebrisVoxel& v : b.voxels)
+          if ((v.payload & 0xFFFu) == (mat & 0xFFFu)) n++;
+      }
+    }
+    return n;
+  }
   // Physics handle of body `i`. Damage rebuilds a body's collider, which
   // REPLACES its handle, so anything holding one across a damage call (the
   // selftest's repeated laser kerf) must re-read it here. 0 if out of range.
@@ -187,8 +245,44 @@ class DebrisSystem {
     return i < bodies_.size() ? bodies_[i].handle : 0;
   }
   uint32_t ActiveBodyCount() const;
+  // Per-body identity, for a test that has to say WHICH body is left rather
+  // than how many. "1 still a body" is the same bare count as "1 awake": the
+  // useful question is whether it is the body the test made (same size, same
+  // place) or one that appeared from somewhere else, and those have completely
+  // different fixes.
+  Vec3 BodyPosition(uint32_t i) const {
+    return i < bodies_.size() ? bodies_[i].xf.pos : Vec3{};
+  }
+  uint32_t BodyVoxelCount(uint32_t i) const {
+    if (i >= bodies_.size()) return 0;
+    const Body& b = bodies_[i];
+    return (uint32_t)(b.HasFineSkin() ? b.skinVoxels.size() : b.voxels.size());
+  }
+  bool BodyActive(uint32_t i) const;
   uint32_t PendingEvents() const { return (uint32_t)events_.size(); }
   uint32_t SettledBack() const { return settledBack_; }
+
+  // ---- why a body did not sleep (CLAUDE.md rule 6) ------------------------
+  //
+  // "N bodies awake" is a bare count, and it is exactly the shape of number
+  // that rule 6 says not to bisect: the `debris` and `settle-back` gates were
+  // handed over as known-failing with a paragraph of ruled-out hypotheses and
+  // no cause, after the terrain overhaul spent a dozen elimination runs on
+  // them. A body cannot sleep through a terrain patch rebuilding under it —
+  // ManageTerrain wakes everything within 24 voxels whenever a chunk's
+  // collision SURFACE changes, and SettleBodies needs 60 CONSECUTIVE inactive
+  // ticks — so record the wake WHERE IT HAPPENS, name the chunk that did it,
+  // and the question stops needing a bisect. Two counters and an IVec3; no
+  // allocation, no readback, nothing that costs anything when nothing wakes.
+  struct SettleProbe {
+    uint32_t terrainWakes = 0;      // ManageTerrain: collision surface moved
+    uint32_t blastWakes = 0;        // PreTick: an island event fired
+    uint32_t lastWakeTick = 0;      // the most recent of either
+    IVec3 lastWakeChunk{};          // ...and the chunk whose mesh changed
+    uint32_t maxInactiveTicks = 0;  // longest quiet run ANY body managed
+  };
+  const SettleProbe& Settle() const { return settle_; }
+  void ResetSettleProbe() { settle_ = SettleProbe{}; }
 
   // ---- persistence (sim/worldio.h, entities.sve section 'DBRS') -----------
   // Everything a body IS travels: collider + skin lattices, transform, scales,
@@ -379,6 +473,7 @@ class DebrisSystem {
   // culled, settled, dissolved or split without freeing its brick leaks pool
   // words that nothing will ever reclaim, and the pool is a hard ceiling.
   void ReleaseBody(Body& b);
+  std::function<void(uint64_t)> onBodyGone_;
   // Settle-back (PLAN §B6): a long-asleep, near-axis-aligned body converts
   // its voxels to CellOps (fill-air-only: grid content wins deterministically
   // on the GPU) and frees its body. At most one body per tick.
@@ -426,6 +521,7 @@ class DebrisSystem {
   bool instancesDirty_ = false;
   uint32_t instanceCount_ = 0;
   uint32_t settledBack_ = 0;
+  SettleProbe settle_{};
   // Drained by main.cpp each frame; bounded by the same per-tick body budget
   // that bounds island creation, so this cannot grow without limit.
   std::vector<BreakEvent> breaks_;

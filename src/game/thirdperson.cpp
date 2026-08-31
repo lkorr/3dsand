@@ -78,6 +78,17 @@ float ResolveAvatarHeading(CameraMode mode, float camHeading, float heading,
   return out;
 }
 
+void ThirdPersonRig::Zoom(float notches) {
+  const auto& t = CurrentTuning().thirdPerson;
+  if (t.zoomStep <= 0.0f) return;
+  // MULTIPLICATIVE, not additive. A fixed step in metres is coarse when you are
+  // close and imperceptible when you are far; a fixed step in FRACTION gives
+  // the same felt increment at every distance, which is what makes a zoom feel
+  // like one control rather than two.
+  zoom_ *= std::pow(1.0f + t.zoomStep, -notches);
+  zoom_ = std::clamp(zoom_, t.zoomMin, t.zoomMax);
+}
+
 void ThirdPersonRig::Update(float dt, CameraMode mode, const Camera& cam,
                             Vec3 focusWorld, const AvatarLocomotion& loco,
                             const World& world,
@@ -118,7 +129,11 @@ void ThirdPersonRig::Update(float dt, CameraMode mode, const Camera& cam,
 
   // ---- boom direction and requested length ----
   const bool shoulder = mode == CameraMode::OverShoulder;
-  distGoal_ = (shoulder ? t.shoulderDist : t.distance) * m2v;
+  // The wheel's factor rides on the AUTHORED boom, and only on the boom: the
+  // side offset and the pitch lift are framing decisions about where the
+  // character sits in shot, and scaling them with zoom would swing the subject
+  // across the screen every time the player rolled the wheel.
+  distGoal_ = (shoulder ? t.shoulderDist : t.distance) * m2v * zoom_;
   float side = (shoulder ? t.shoulderOffset : t.sideOffset) * m2v;
 
   Vec3 fwd = cam.Forward();

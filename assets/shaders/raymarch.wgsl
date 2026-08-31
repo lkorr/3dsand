@@ -35,6 +35,11 @@
 @group(0) @binding(10) var<storage, read> fluidBlockMapR : array<u32>;
 @group(0) @binding(11) var<storage, read> fluidGridR : array<i32>;
 @group(0) @binding(12) var<storage, read> dirtyViz : array<u32>;
+@group(0) @binding(13) var<storage, read> actVoxViz : array<u32>;
+
+fn isVoxActive(idx : u32) -> bool {
+  return (actVoxViz[idx >> 5u] & (1u << (idx & 31u))) != 0u;
+}
 
 struct VSOut {
   @builtin(position) pos : vec4f,
@@ -575,27 +580,40 @@ fn dayWeight() -> f32 {
   return R.sunUp * (1.0 - eclipseDim());
 }
 
-fn skyAirglow(rdIn : vec3f) -> vec3f {
-  let rd = normalize(rdIn);
-  let dayW = dayWeight();
+// ---- the tiers, split so the chain does its shared work ONCE ---------------
+// The three public entry points below stack: skyColor -> skyColorNoBodies ->
+// skyAirglow. Written as three self-contained functions, each re-normalized
+// the direction and each called dayWeight() — so ONE sky pixel paid three
+// normalize() and three pow() (dayWeight -> eclipseDim) for two values that
+// cannot differ between the levels. These *U variants take the unit direction
+// and the day weight as arguments; the wrappers keep the old signatures, so
+// every existing call site is unchanged and the ones that already pass
+// normalize(...) are not made to pay for it twice.
+fn skyAirglowU(rd : vec3f, dayW : f32) -> vec3f {
   var c = daySky(rd) * dayW;
   if (dayW < 0.999) { c += nightGlow(rd) * (1.0 - dayW); }
   return max(c, vec3f(0.0));
 }
 
-fn skyColorNoBodies(rdIn : vec3f) -> vec3f {
-  let rd = normalize(rdIn);
-  let dayW = dayWeight();
-  var c = skyAirglow(rd);
+fn skyColorNoBodiesU(rd : vec3f, dayW : f32) -> vec3f {
+  var c = skyAirglowU(rd, dayW);
   // Stars fade out under daylight rather than popping off.
   if (dayW < 0.999) { c += starField(rd) * (1.0 - dayW); }
   return max(c, vec3f(0.0));
 }
 
+fn skyAirglow(rdIn : vec3f) -> vec3f {
+  return skyAirglowU(normalize(rdIn), dayWeight());
+}
+
+fn skyColorNoBodies(rdIn : vec3f) -> vec3f {
+  return skyColorNoBodiesU(normalize(rdIn), dayWeight());
+}
+
 fn skyColor(rdIn : vec3f) -> vec3f {
   let rd = normalize(rdIn);
   let dayW = dayWeight();
-  var c = skyColorNoBodies(rd);
+  var c = skyColorNoBodiesU(rd, dayW);
   // The moons fade in as the sky darkens — including when it darkens because
   // one of them is in front of the sun. During totality the occulter is at
   // full strength, which is exactly what puts a black disc on the sun.
@@ -661,6 +679,12 @@ const MEDIA_ABSORB : f32 = TUNE_MEDIA_ABSORB;
 // Optical depth past which the background is invisible (exp(-6) ~ 0.25%):
 // stop marching instead of walking the rest of a smoke plume voxel-by-voxel.
 const MEDIA_TAU_MAX : f32 = TUNE_MEDIA_TAU_MAX;
+// Optical depth at which a gas is HALF opaque: ln(2). Not a taste value — it is
+// the definition of the median depth of a volume, which is the depth a volume
+// gets to report to the raster passes (see Hit.gasHalfT and the MEDIA DEPTH
+// block in fs()). At fire's authored opacity 150/255 this is ~1.8 voxels of
+// flame; at smoke's 70/255, ~4.
+const MEDIA_HALF_TAU : f32 = 0.6931472;
 
 struct Hit {
   hit      : bool,
@@ -680,6 +704,13 @@ struct Hit {
   mediaSurf: f32,     // fullness (0..1) of the first media cell — surface term
   fireGlow : f32,     // flicker- and transmittance-weighted emissive path
   fireMat  : u32,     // first emissive media material (palette for the ramp)
+  // Where the GAS in front of the ray becomes half-opaque, or 0 if it never
+  // does. This is the volume's best single depth: raster geometry beyond it is
+  // more hidden by the plume than visible through it, and geometry in front of
+  // it is untouched. See the MEDIA DEPTH block in fs() for why a volume needs a
+  // depth at all. Liquids are excluded — they have a real interface (liqT) and
+  // already report it.
+  gasHalfT : f32,
 
   // ---- water surface (see shadeWater) ----
   // A translucent liquid is BOTH a surface and a volume. The media fields above
@@ -1225,6 +1256,7 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool) -> Hit {
   out.mediaSurf = 0.0;
   out.fireGlow = 0.0;
   out.fireMat = 0u;
+  out.gasHalfT = 0.0;
   out.liqT = 0.0;
   out.liqCell = vec3<i32>(0);
   out.liqAxis = 1;
@@ -1367,7 +1399,6 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool) -> Hit {
   //
   // 0xFFFFFFFF is not a valid chunk index (they are < NUM_CHUNKS), so the first
   // iteration always misses and no separate priming step is needed.
-  var cchIdx = 0xFFFFFFFFu;
   var cchOcc = 0u;
   var cchPt = 0u;
   var cchMask0 = 0u;
@@ -1380,13 +1411,26 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool) -> Hit {
   // so an off build pays nothing for the experiment being kept.
   let subLoad = SUBOCC_SKIP;
 
+  // Window bounds as a plain integer box, hoisted. inBounds() -> inWindow()
+  // re-reads R.origin and recomputes `originChunk * CHUNK` on EVERY step of
+  // EVERY ray in the frame — and `wloI` above is that exact expression, three
+  // lines up. Same test, same result, no uniform load and no multiply per step.
+  let wloHi = wloI + vec3<i32>(i32(WORLD_N));
+  // Chunk-change detection on the CHUNK COORD rather than the linear index.
+  // chunkIndexW() costs 2 integer multiplies and 2 adds on top of the mask and
+  // shift, per step, to produce a value used only as an equality key — and the
+  // key only actually changes on ~1 step in 16. Compare the shifted coord (3
+  // shifts + a vec3 compare) and pay for the linear index inside the miss.
+  var cchC = vec3<i32>(0x7FFFFFFF);
+
   for (var i = 0; i < 4096; i++) {
     if (i >= maxSteps) { break; }
-    if (!inBounds(cell)) { break; }
+    if (any(cell < wloI) || any(cell >= wloHi)) { break; }
 
-    let chIdx = chunkIndexW(cell);
-    if (chIdx != cchIdx) {
-      cchIdx = chIdx;
+    let cc = cell >> vec3<u32>(CHUNK_SHIFT);
+    if (any(cc != cchC)) {
+      cchC = cc;
+      let chIdx = chunkIndexW(cell);
       cchOcc = occupancy[chIdx];
       cchPt = pageEntryOf(chIdx);
       if (subLoad) {
@@ -1612,11 +1656,12 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool) -> Hit {
           cellTint = (unpackColor(materials[mat].color0) +
                       unpackColor(materials[mat].color1)) * 0.5;
           if ((R.flags & 2u) != 0u) {
-            let gs = chunkSlotIndex(worldChunkOf(cell));
-            let snapTick = dirtyViz[gs];
-            if (snapTick != 0u) {
-              let st = voxStamp(w);
-              if (st == stampFor(snapTick, 0u) || st == stampFor(snapTick, 1u)) {
+            let gs = vec3<u32>(cell & vec3<i32>(WORLD_MASK));
+            let ge = pageTable[chunkIndexOf(gs)];
+            if ((ge & PT_SENTINEL_BIT) == 0u) {
+              let glo = gs % CHUNK;
+              let gi = ge * CHUNK_VOL + (glo.z * CHUNK + glo.y) * CHUNK + glo.x;
+              if (isVoxActive(gi)) {
                 cellTint = vec3f(1.0, 0.05, 0.05);
                 cellOp = 1.0;
               }
@@ -1807,7 +1852,14 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool) -> Hit {
       let dTau = seg * cellOp;
       out.mediaTau += dTau;
       out.mediaTint += cellTint * dTau;
-      if (cellLiq == 0.0) { gasTau += dTau; }
+      if (cellLiq == 0.0) {
+        gasTau += dTau;
+        // First crossing of half opacity: latched once, never revised.
+        if (out.gasHalfT == 0.0 &&
+            gasTau * VOXEL_METERS * MEDIA_ABSORB > MEDIA_HALF_TAU) {
+          out.gasHalfT = tCur;
+        }
+      }
     }
     // Media early-out: fs() will mix the background in at exp(-tau); once
     // that is ~0 the rest of the march (often hundreds of per-voxel steps
@@ -3166,7 +3218,11 @@ fn phaseHG(cosTheta : f32, g : f32) -> f32 {
   let d = 1.0 + g2 - 2.0 * g * cosTheta;
   // d can reach 0 only at g = 1, which LoadTuning clamps away from; the max()
   // is belt-and-braces against a hand-edited prelude.
-  return (1.0 - g2) / (4.0 * 3.14159265 * pow(max(d, 1e-4), 1.5));
+  // d^1.5 as d*sqrt(d), matching phaseMie() at the top of this file — the same
+  // function, written the cheap way there and with a pow() here. pow lowers to
+  // log2+mul+exp2 (three transcendental slots); this is one sqrt and one mul.
+  let dc = max(d, 1e-4);
+  return (1.0 - g2) / (4.0 * 3.14159265 * (dc * sqrt(dc)));
 }
 
 // ---- volumetric light shafts ----
@@ -4572,9 +4628,18 @@ fn heatSpill(cell : vec3<i32>, n : vec3f) -> vec3f {
     // up-facing rims sample sideways into the pool and glow pink.
     let c = cell + vec3<i32>(floor(n * s + vec3f(0.5)));
     if (!inBounds(c)) { break; }
+    // ONE address translation for both reads. chunkOcc() and voxWordAt() each
+    // recompute chunkIndexOf(c & WORLD_MASK) independently, so a tap that
+    // survives the reject paid for the same index twice — and voxWordAt then
+    // makes its voxels[] address DEPEND on its own pageTable[] load, which
+    // serialises two round trips. Hoisting the index and handing the entry to
+    // voxWordAtEntry is exactly what trace()'s DDA already does, and for the
+    // same reason (common.wgsl, "Hoisting the entry turns that into one
+    // independent load"). Same words read, same order, same result.
+    let ci = chunkIndexW(c);
     // chunk-level reject first: an empty or lava-free chunk costs one read
-    if (occTotal(chunkOcc(c)) == 0u) { continue; }
-    let mm = materials[voxMat(voxWordAt(c))];
+    if (occTotal(occupancy[ci]) == 0u) { continue; }
+    let mm = materials[voxMat(voxWordAtEntry(pageEntryOf(ci), c))];
     if (mm.klass == CLASS_LIQUID && (mm.flags & MATF_OPAQUE) != 0u &&
         mm.emission > 0u) {
       // inverse-square-ish falloff, normalised so a touching cell gives ~1
@@ -4822,20 +4887,37 @@ fn fluidNodeBase(c : vec3<i32>) -> i32 {
 // allowed to push its surface through its own ceiling. The blob model never
 // looked above 1 either (iso <= 1), so nothing there changes.
 fn fluidCellAt(c : vec3<i32>) -> vec3f {
+  // ---- ONE address translation for both halves of the cell ----------------
+  // This used to call fluidNodeBase(c) AND voxWordAt(c), which derive the SAME
+  // chunk slot by two different routes: chunkSlotIndex(worldChunkOf(c)) is
+  // ((c >> 4) & 31) and chunkIndexOf(c & WORLD_MASK) is ((c & 511) >> 4) —
+  // the same five bits of c. So the pair recomputed one index twice and, worse,
+  // ran two independent dependent-load chains (map -> grid, table -> voxels).
+  //
+  // This is the hottest tap in the water path: fluidRowAt takes 4 of these,
+  // fluidFieldAt 2-3 rows, and fluidNormalAt 4 fields — ~32 per water-pixel
+  // normal, on top of the march's own budget. Same words read, same order.
+  let wc = worldChunkOf(c);
+  let slot = chunkSlotIndex(wc);
   var m = 0.0;
   var vy = 0.0;
-  let b = fluidNodeBase(c);
-  if (b >= 0) {
-    m = f32(fluidGridR[u32(b)]) * (1.0 / 1024.0);   // Q10 -> particle masses
-    // Word 2 is the node's post-BC Y velocity, Q16.16 cells/tick; x30 for the
-    // tick rate puts it in voxels/second, the unit fluidSettleEps is authored
-    // in. It comes off the same grid row as the mass one word away, so in
-    // practice it is not a second fetch.
-    vy = abs(f32(fluidGridR[u32(b) + 2u])) * (30.0 / 65536.0);
+  if (chunkInWindow(wc, R.origin)) {
+    let bm = fluidBlockMapR[slot];
+    if (bm != 0u) {
+      let lo = vec3<u32>(c & vec3<i32>(CHUNK_MASK));
+      let b = ((bm - 1u) * CHUNK_VOL + (lo.z * CHUNK + lo.y) * CHUNK + lo.x) *
+              FLUID_GW;
+      m = f32(fluidGridR[b]) * (1.0 / 1024.0);   // Q10 -> particle masses
+      // Word 2 is the node's post-BC Y velocity, Q16.16 cells/tick; x30 for the
+      // tick rate puts it in voxels/second, the unit fluidSettleEps is authored
+      // in. It comes off the same grid row as the mass one word away, so in
+      // practice it is not a second fetch.
+      vy = abs(f32(fluidGridR[b + 2u])) * (30.0 / 65536.0);
+    }
   }
   var fill = m / max(TUNE_FLUID_REST_DENSITY, 1.0);
   var blocker = 0.0;
-  let w = voxWordAt(c);
+  let w = voxWordAtEntry(pageEntryOf(slot), c);
   let mat = voxMat(w);
   if (mat != MAT_AIR) {
     let k = materials[mat].klass;
@@ -5921,7 +6003,12 @@ fn shadeMpmFluid(ro : vec3f, rd : vec3f, fh : FluidHit, caMat : u32,
   // ---- Fresnel (Schlick, F0 from the tuner's IOR) ----
   let ior = max(TUNE_FLUID_IOR, 1.01);
   let f0 = ((ior - 1.0) / (ior + 1.0)) * ((ior - 1.0) / (ior + 1.0));
-  var fres = f0 + (1.0 - f0) * pow(1.0 - cosI, 5.0);
+  // Schlick's fifth power as a 3-multiply chain. A literal integer exponent
+  // through pow() is log2+mul+exp2 AND carries a relative error; x2*x2*x is
+  // exact and cheaper.
+  let sx = 1.0 - cosI;
+  let sx2 = sx * sx;
+  var fres = f0 + (1.0 - f0) * (sx2 * sx2 * sx);
   // A film thinner than a couple of cells is not a coherent mirror. Measured on
   // the COLUMN, not on the march's own thickness: a one-cell excited film on a
   // deep lake is the surface of that lake and reflects like one.
@@ -5943,7 +6030,10 @@ fn shadeMpmFluid(ro : vec3f, rd : vec3f, fh : FluidHit, caMat : u32,
   let refr = refract(rd, n, 1.0 / ior);
   var behind = sceneBehind;
   let refrW = 1.0 - caFrac;
-  if (colVox > 0.75 && refrW > 0.02 && length(refr) > 0.5) {
+  // dot > 0.25 rather than length > 0.5: sqrt is correctly rounded and
+  // monotone and both constants are exact, so this is the SAME predicate
+  // without the square root.
+  if (colVox > 0.75 && refrW > 0.02 && dot(refr, refr) > 0.25) {
     behind = mix(sceneBehind,
                  traceRefraction(hitP + refr * 0.75, refr, colVox, sceneBehind),
                  refrW);
@@ -6106,13 +6196,28 @@ fn fs(in : VSOut) -> FSOut {
   // to pick a side: putting it at the interface is right, because that is
   // where the pixel's reflection and specular come from.
   //
-  // KNOWN LIMIT — thin gas. Fire and smoke that never reach the saturation
-  // early-out still write far-plane depth, so debris inside a WISPY plume is
-  // not occluded by it. That is deliberate: a thin plume is genuinely
-  // see-through, and writing depth at its first cell would hard-CLIP any body
-  // standing in smoke instead of letting it show through — a worse artifact
-  // than the one it fixes. Dense plumes already resolve via `saturated`.
-  // Doing better needs order-independent transparency, not a depth tweak.
+  // ---- GAS: THE MEDIAN DEPTH, NOT THE FIRST CELL ----
+  // Gas used to report depth ONLY when the march saturated (optical depth 6,
+  // i.e. 99.75% opaque). Everything short of that wrote the depth of the SOLID
+  // BEHIND the plume, so a mob, a debris chunk or a dropped item drew straight
+  // over any flame in front of it: burning bodies had their own fire painted
+  // behind them, and fire NEVER composited in front of a rigidbody at any
+  // distance, which reads as the flames being stuck to the far side of the
+  // world. That is the failure this replaces.
+  //
+  // The old note here rejected "write depth at the plume's first cell" — and it
+  // was right to: at the first cell a single wisp of smoke hard-CLIPS a body
+  // standing behind it, which is worse than the bug. But first-cell and
+  // saturation are not the only choices. `gasHalfT` is where the gas crossed
+  // HALF opacity, which is the honest single depth for a volume:
+  //   - a wisp never reaches it, so gasHalfT stays 0 and nothing changes;
+  //   - real flame reaches it in ~2 cells, and geometry BEHIND that point is
+  //     more hidden than shown, so the plume covering it is the better answer;
+  //   - geometry IN FRONT of it still wins the reversed-Z test and draws over
+  //     the fire, which is the half this must not break.
+  // Depth is one value per pixel, so a volume has to pick a side; the median is
+  // the side that is wrong least often. Ordering geometry INSIDE a plume still
+  // needs order-independent transparency.
   var tDepth = -1.0;
   if (h.hit || h.saturated) {
     tDepth = h.t;
@@ -6131,6 +6236,12 @@ fn fs(in : VSOut) -> FSOut {
   // draws over it — which is exactly what a splash should do.
   if (mf.hit && mf.t > 0.05 && (tDepth < 0.0 || mf.t < tDepth)) {
     tDepth = mf.t;
+  }
+  // Half-opaque gas: same nearest-wins rule as the two interfaces above, and
+  // the same "> 0.05" skip for a camera already inside the plume — there is no
+  // covering volume in front of you when you are standing in it.
+  if (h.gasHalfT > 0.05 && (tDepth < 0.0 || h.gasHalfT < tDepth)) {
+    tDepth = h.gasHalfT;
   }
   var depth = 0.0;  // sky = far
   if (tDepth >= 0.0) {
@@ -6443,13 +6554,14 @@ fn fs(in : VSOut) -> FSOut {
     // color, which is exactly the haze that hides the bottom.
     if (h.liqT <= 0.0) { color = applyAerial(color, rd, h.t); }
 
-    // ---- dirty-voxel debug highlight (dev panel toggle) ----
+    // ---- active-voxel debug highlight (dev panel toggle) ----
     if ((R.flags & 2u) != 0u) {
-      let chSlot = chunkSlotIndex(worldChunkOf(h.cell));
-      let snapTick = dirtyViz[chSlot];
-      if (snapTick != 0u) {
-        let stamp = voxStamp(h.word);
-        if (stamp == stampFor(snapTick, 0u) || stamp == stampFor(snapTick, 1u)) {
+      let avs = vec3<u32>(h.cell & vec3<i32>(WORLD_MASK));
+      let ave = pageTable[chunkIndexOf(avs)];
+      if ((ave & PT_SENTINEL_BIT) == 0u) {
+        let avlo = avs % CHUNK;
+        let avi = ave * CHUNK_VOL + (avlo.z * CHUNK + avlo.y) * CHUNK + avlo.x;
+        if (isVoxActive(avi)) {
           let ed = min(uv, 1.0 - uv);
           let me = min(ed.x, ed.y);
           if (me < 0.08) {
