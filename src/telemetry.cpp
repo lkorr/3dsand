@@ -126,8 +126,14 @@ bool Telemetry::Start(uint16_t port) {
     std::fprintf(stderr, "telemetry: socket() failed\n");
     return false;
   }
-  int opt = 1;
-  setsockopt(s, SOL_SOCKET, SO_REUSEADDR, (const char*)&opt, sizeof(opt));
+  // NO SO_REUSEADDR. On Windows it does not mean "reuse a TIME_WAIT port", it
+  // means "bind even though another live socket already has this one" — so a
+  // second sandvox would bind 8080 while the first still owned it, and which
+  // process a browser then reached was indeterminate. That is the whole failure
+  // mode this port has: the tuner's /api/play appends to its process list and
+  // never kills a prior launch, so stale games accumulate holding the port.
+  // Refusing to bind is strictly better than silently sharing it, because a
+  // refusal can be printed and a share cannot.
   SetNonBlocking(s);
 
   sockaddr_in addr{};
@@ -135,13 +141,36 @@ bool Telemetry::Start(uint16_t port) {
   addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
   addr.sin_port = htons(port);
   if (bind(s, (sockaddr*)&addr, sizeof(addr)) != 0) {
-    std::fprintf(stderr, "telemetry: bind(:%d) failed\n", port);
+    // LOUD, on stdout as well as stderr. A one-line stderr note scrolls past in
+    // the hundreds of lines of asset loading, and the result is a game that
+    // looks completely normal while telemetry is silently off — the Performance
+    // tab then sits at "waiting for the first frame" with nothing anywhere
+    // saying why. This banner is the single most useful line in that situation.
+    std::fprintf(stderr,
+                 "\n*** telemetry: bind(:%d) FAILED — port already in use ***\n"
+                 "*** Another sandvox.exe is almost certainly still running "
+                 "and holding it.\n"
+                 "*** LIVE TELEMETRY IS OFF for this process; the tuner's "
+                 "Performance tab will\n"
+                 "*** attach to the OTHER process instead. Close it "
+                 "(taskkill /F /IM sandvox.exe)\n"
+                 "*** or pass --telemetry-port <n> to use a different port.\n\n",
+                 port);
+    std::printf("telemetry: bind(:%d) FAILED — port in use, telemetry OFF "
+                "(another sandvox is holding it)\n", port);
+    std::fflush(stdout);
     CloseSocket(s);
     return false;
   }
   listen(s, 4);
   listen_ = (intptr_t)s;
   std::printf("telemetry -> ws://127.0.0.1:%d/\n", port);
+  // FLUSH. Redirected stdout is block-buffered, so this banner — the one line
+  // that says whether live telemetry came up — sat in a 4 KiB buffer until the
+  // process exited. Anything reading the log while the game is still running
+  // (the harness does exactly that) saw an empty file and concluded telemetry
+  // was off on a run where it was working.
+  std::fflush(stdout);
   return true;
 }
 

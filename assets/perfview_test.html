@@ -41,14 +41,51 @@ document.getElementById('f').src =
 const out = document.getElementById('out');
 const lines = [];
 let fails = 0;
+// A harness that throws leaves the page reading "running…", which the shell
+// reports as FAIL with no reason — the least useful possible output, and worse
+// than the bug it was built to find. Any escaped exception becomes a verdict.
+window.addEventListener('error', e => {
+  lines.push('  FAIL  harness threw: ' + e.message
+             + ' @ ' + (e.filename||'?') + ':' + (e.lineno||'?'));
+  fails++;
+  done();
+});
+// Same for a hang: if nothing has reported by the deadline, say what the state
+// was rather than timing out into silence.
+setTimeout(() => {
+  if (out.textContent === 'running…'){
+    // Even the backstop reports STATE, not just "stuck". A watchdog that says
+    // only that it fired tells you nothing you did not already know.
+    let s = '(page state unavailable)';
+    try {
+      const f = document.getElementById('f');
+      const L = f.contentWindow.pvState().live;
+      s = L.raw + ' messages seen, ' + L.samples.length + ' v2, ' + L.nonV2
+        + ' non-v2, connected=' + L.connected + ', status="' + L.status + '"';
+    } catch(e){ s = '(could not read page state: ' + e.message + ')'; }
+    lines.push('  FAIL  harness never reported — stuck before done(); ' + s);
+    fails++;
+    done();
+  }
+}, 40000);
 function check(name, cond, detail){
   if (!cond) fails++;
   lines.push((cond ? '  PASS  ' : '  FAIL  ') + name + (detail ? '   ' + detail : ''));
 }
+let reported = false;
 function done(){
+  if (reported) return;              // the error hook and the poll can race
+  reported = true;
+  const verdict = lines.join('\n') + '\n\n'
+    + (fails ? 'RESULT FAIL (' + fails + ')' : 'RESULT OK');
   out.innerHTML = lines.join('\n') + '\n\n'
     + (fails ? '<span class="bad">RESULT FAIL (' + fails + ')</span>'
              : '<span class="ok">RESULT OK</span>');
+  // Also POST it. The live arm runs without --virtual-time-budget (that flag
+  // never delivers WebSocket events to JS — measured: a peer streamed 600
+  // samples while onopen never fired), and without it --dump-dom fires at the
+  // load event, before any sample exists. So the shell waits on this instead.
+  try { fetch('/api/testresult', { method:'POST', body: verdict }); } catch(e){}
 }
 
 const f = document.getElementById('f');
@@ -61,6 +98,74 @@ f.addEventListener('load', () => {
 
   // Poll for the data rather than sleeping a guess: perf.json is fetched at
   // window load and the tab renders from it.
+  // LIVE ARM (?live=1): the game is already running with --telemetry; drive the
+  // page's own connect path and assert samples actually land in pvLive. This is
+  // the half that check_telemetry.py cannot see -- it proves the SERVER sends,
+  // and a page that filters every message still shows "waiting for the first
+  // frame" forever.
+  if (new URLSearchParams(location.search).get('live') === '1'){
+    const WANT = 30;
+    // Deadline in REAL time, not iterations. Under --virtual-time-budget the
+    // clock Chrome shows a setTimeout chain runs far ahead of the wall, and a
+    // loop that counts its own ticks will burn its whole budget before a single
+    // WebSocket frame has crossed the loopback. performance.now() is virtual
+    // too, so the only honest referee is the server's own sent-count, which the
+    // harness prints alongside ours for exactly that comparison.
+    let n = 0;
+    const t0 = Date.now();
+    // Report WHICH hook is missing. `pvSetScenario`/`pvConnect` are exported by
+    // perfview.js purely for this harness; if the export is dropped the failure
+    // is a bare ReferenceError with no hint that a one-line export is the cause.
+    check('page exports pvSetScenario', typeof W.pvSetScenario === 'function');
+    check('page exports pvConnect', typeof W.pvConnect === 'function');
+    check('page exports pvState', typeof W.pvState === 'function');
+    if (typeof W.pvConnect !== 'function'){ done(); return; }
+    W.pvSetScenario('__live__');
+    W.pvConnect(0);
+    const poll = () => {
+      const st = W.pvState();
+      const L = st.live;
+      const got = L.samples.length;
+      // 200 x 100 ms = 20 s, deliberately INSIDE the 40 s watchdog below. The
+      // first version polled for 60 s, so the watchdog always won and every
+      // live failure reported "stuck before done()" instead of the counts that
+      // say which of the three parts broke.
+      if (got < WANT && ++n < 200){ setTimeout(poll, 100); return; }
+      // `root` is resolved HERE, not captured from the recorded arm's scope.
+      // Referencing an undefined `root` threw a ReferenceError out of this
+      // callback, which skipped done() and left the page reading "running…" --
+      // a FAIL with no output at all, for a live path that may have been fine.
+      const root = D.getElementById('view-performance');
+      const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
+      lines.push('  ---- page saw: ' + L.raw + ' messages, ' + got + ' v2, '
+                 + L.nonV2 + ' non-v2, after ' + n + ' polls / ' + elapsed
+                 + 's of page clock');
+      check('socket connected', L.connected, L.status);
+      check('the peer sent anything at all', L.raw > 0,
+            L.raw + ' messages; if 0, the peer accepted the socket and went '
+            + 'quiet -- game not at its frame loop, or no --telemetry');
+      check('what arrived was v2', L.raw === 0 || L.sawV2,
+            L.nonV2 + ' non-v2 of ' + L.raw + '; all-non-v2 means an OLDER '
+            + 'sandvox is holding the port');
+      check('v2 samples reached the page', got >= WANT, got + ' samples');
+      if (got){
+        const s0 = L.samples[got-1];
+        check('samples carry wallMs', s0.wallMs > 0, (s0.wallMs||0).toFixed(2)+' ms');
+        check('samples carry GPU components',
+              Object.keys(s0.gpu||{}).length >= 1,
+              Object.keys(s0.gpu||{}).join(', ') || 'none');
+        check('live view renders charts',
+              !!root && !!root.querySelector('.pv-hero') &&
+              root.querySelectorAll('.pv-svg').length >= 2,
+              (root ? root.querySelectorAll('.pv-svg').length : 0) + ' charts');
+      }
+      check('no page errors', errs.length === 0, errs.join(' | '));
+      done();
+    };
+    setTimeout(poll, 300);
+    return;
+  }
+
   let tries = 0;
   const tick = () => {
     const root = D.getElementById('view-performance');
@@ -119,6 +224,71 @@ function run(W, D, root, errs){
   const sparks = root.querySelectorAll('.pv-spark');
   check('counter sparklines rendered', sparks.length >= 3, sparks.length + ' counters');
 
+  // ---- percentile plot ----
+  const toggles = root.querySelectorAll('.pv-toggle[data-pctl]');
+  check('percentile toggles rendered', toggles.length === 4,
+        toggles.length + ' toggles');
+  check('p50/p95/p99 are all offered',
+        ['p50','p95','p99'].every(k =>
+          root.querySelector('.pv-toggle[data-pctl="' + k + '"]')));
+  check('percentile window control rendered',
+        !!root.querySelector('#pv-pctl-win'),
+        (root.querySelector('#pv-pctl-win')||{}).textContent || '');
+  const plines = root.querySelectorAll('.pv-pctl-line');
+  check('percentile lines drawn', plines.length === 3,
+        plines.length + ' lines (p50/p95/p99 on, raw off by default)');
+  // A line with one point is a dot: assert the path actually has a run of
+  // segments, or a broken rolling-window loop would still "render".
+  let shortPath = 0;
+  plines.forEach(p => {
+    if ((p.getAttribute('d')||'').split('L').length < 10) shortPath++;
+  });
+  check('percentile lines have real paths', shortPath === 0,
+        shortPath + ' with under 10 segments');
+
+  // ---- summed rows ----
+  // The sum is the one number on this page that can be checked against the
+  // others, so check it rather than merely asserting the row exists.
+  const totalRows = root.querySelectorAll('.pv-bar-row.total');
+  check('summed rows rendered (GPU + CPU)', totalRows.length === 2,
+        totalRows.length + ' total rows');
+  const barGroups = root.querySelectorAll('.pv-bars');
+  let sumMismatch = [];
+  barGroups.forEach(grp => {
+    const rows = [...grp.querySelectorAll('.pv-bar-row')];
+    const tot = rows.find(r => r.classList.contains('total'));
+    if (!tot) return;
+    const val = r => parseFloat(r.querySelector('.pv-bar-val').textContent) || 0;
+    // Exclude the total itself AND the dimmed wait row: the CPU sum
+    // deliberately omits the present wait, and summing it back in here would
+    // encode the very mistake the page exists to avoid.
+    const parts = rows.filter(r => r !== tot && !r.classList.contains('dim'))
+                      .reduce((a, r) => a + val(r), 0);
+    if (Math.abs(parts - val(tot)) > 0.05 * Math.max(parts, 1))
+      sumMismatch.push(tot.querySelector('.pv-bar-label').textContent.trim()
+                       + ': rows=' + parts.toFixed(2) + ' total=' + val(tot));
+  });
+  check('summed row equals the sum of its rows', sumMismatch.length === 0,
+        sumMismatch.join(' | '));
+
+  // ---- hover explanations ----
+  let untipped = [];
+  root.querySelectorAll('.pv-bar-row').forEach(r => {
+    if (!r.title || r.title.length < 20)
+      untipped.push(r.querySelector('.pv-bar-label').textContent.trim());
+  });
+  check('every component bar has a hover explanation', untipped.length === 0,
+        untipped.join(', '));
+  let tilesNoTip = 0;
+  root.querySelectorAll('.pv-tile').forEach(t => { if (!t.title) tilesNoTip++; });
+  check('every stat tile has a hover explanation', tilesNoTip === 0,
+        tilesNoTip + ' untipped');
+  // The CPU rows must be explained by SCOPE, not by the architecture node they
+  // roll up to — that distinction is the whole point of the scope notes.
+  const scopeKeys = root.querySelectorAll('.pv-scope-key');
+  check('CPU bars name the scope they timed', scopeKeys.length >= 4,
+        [...scopeKeys].map(s => s.textContent).join(', '));
+
   const heat = root.querySelectorAll('.pv-heat tbody tr');
   check('scenario heatmap rendered', heat.length >= 3, heat.length + ' rows');
 
@@ -155,6 +325,33 @@ function run(W, D, root, errs){
   let flat = 0;
   areas.forEach(s => { if (s.getBoundingClientRect().height < 20) flat++; });
   check('charts have height', flat === 0, flat + ' zero-height');
+
+  // ---- the toggles actually toggle ----
+  // LAST, because it mutates state and re-renders; the layout checks above must
+  // measure the default view. Asserting the control EXISTS proves nothing about
+  // whether clicking it does anything, which is the failure a user would hit.
+  const reroot = () => D.getElementById('view-performance');
+  const nLines = () => reroot().querySelectorAll('.pv-pctl-line').length;
+  const before = nLines();
+  W.pvTogglePctl('p99');
+  const off = nLines();
+  check('turning p99 off removes exactly one line', off === before - 1,
+        before + ' -> ' + off);
+  W.pvTogglePctl('p99');
+  check('turning p99 back on restores it', nLines() === before,
+        before + ' -> ' + nLines());
+  W.pvTogglePctl('raw');
+  const withRaw = nLines();
+  check('the raw frame-time series can be added', withRaw === before + 1,
+        before + ' -> ' + withRaw);
+  W.pvTogglePctl('raw');
+  // All four off must not throw or render a broken chart.
+  ['p50','p95','p99'].forEach(k => W.pvTogglePctl(k));
+  check('hiding every series is handled', !!reroot().querySelector('.pv-empty'),
+        'expected an empty-state message, got '
+        + reroot().querySelectorAll('.pv-pctl-line').length + ' lines');
+  ['p50','p95','p99'].forEach(k => W.pvTogglePctl(k));
+  check('no page errors after toggling', errs.length === 0, errs.join(' | '));
 }
 </script>
 </body>

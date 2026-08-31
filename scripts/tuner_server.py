@@ -966,6 +966,37 @@ class Handler(BaseHTTPRequestHandler):
             # Browsers request this unprompted; answering keeps a spurious 404
             # out of the page's console.
             return self._send(204, b"", "image/x-icon")
+        if p == "/api/testresult":
+            # Read back whatever perfview_test.html last posted. See the POST
+            # side for why the harness reports through the server rather than
+            # through --dump-dom.
+            try:
+                with open(os.path.join(ROOT, "build", "perfview_result.txt"),
+                          encoding="utf-8") as f:
+                    return self._send(200, f.read(), "text/plain")
+            except FileNotFoundError:
+                return self._send(404, "", "text/plain")
+        if p == "/api/sleep":
+            # THE HEADLESS PACER. Chrome's --virtual-time-budget advances its
+            # clock as fast as the main thread goes idle, and it only pauses for
+            # pending network FETCHES -- not for WebSocket frames. So a test that
+            # waits on a socket with setTimeout burns its entire budget in a few
+            # real milliseconds and reports "nothing arrived" about a peer that
+            # was streaming fine. (Measured: a probe reported `timeout (8000ms)`
+            # on all three loopback spellings while the server log showed a
+            # client attached and a sample sent.)
+            #
+            # An in-flight fetch to this endpoint is the one thing that DOES hold
+            # virtual time, so the harness paces its poll loop through here and
+            # the loop then advances in real time. Only ever used by
+            # perfview_test.html; capped so it cannot wedge a real server.
+            try:
+                q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                ms = int(q.get("ms", ["100"])[0])
+            except ValueError:
+                ms = 100
+            time.sleep(max(0, min(ms, 2000)) / 1000.0)
+            return self._json(200, {"ok": True, "ms": ms})
         if p == "/api/files":
             out = {}
             # The writable three, then the read-only Wiki sources. Same shape on
@@ -1143,6 +1174,19 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         p = self.path.split("?")[0]
+        if p == "/api/testresult":
+            # perfview_test.html reports its verdict HERE rather than through
+            # Chrome's --dump-dom, because the live arm cannot use
+            # --virtual-time-budget (see /api/sleep) and without that flag
+            # --dump-dom fires at the load event, long before any WebSocket
+            # sample has arrived. Posting the verdict lets the harness run in
+            # real time and lets the shell wait for a definite finish instead of
+            # guessing a sleep.
+            raw = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+            os.makedirs(os.path.join(ROOT, "build"), exist_ok=True)
+            with open(os.path.join(ROOT, "build", "perfview_result.txt"), "wb") as f:
+                f.write(raw)
+            return self._json(200, {"ok": True})
         if p == "/api/save":
             body = self._body()
             written = []

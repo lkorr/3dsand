@@ -611,6 +611,13 @@
   }
   .pv-bar-row:last-child{border-bottom:0}
   .pv-bar-row.dim{opacity:.72}
+  /* The summed row. A rule above it and a heavier weight, because it is a
+     different KIND of number from the rows above -- their sum, not a peer. */
+  .pv-bar-row.total{border-top:1px solid var(--line);background:var(--bg)}
+  .pv-bar-row.total .pv-bar-label,
+  .pv-bar-row.total .pv-bar-val{font-weight:600;color:var(--fg)}
+  .pv-scope-key{font:10px/1 var(--mono);color:var(--faint);background:var(--bg);
+                padding:2px 4px;border-radius:3px;border:1px solid var(--line)}
   .pv-bar-label{display:flex;align-items:center;gap:7px;font-size:12.5px;color:var(--fg);
                 white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .pv-side{font:9px/1 var(--mono);padding:2px 4px;border-radius:3px;
@@ -621,6 +628,28 @@
   .pv-bar-pct{font:11px/1 var(--mono);color:var(--faint);text-align:right}
   .pv-bar-why{font:11px/1.35 var(--mono);color:var(--dim);
               white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+
+  /* Percentile toggles. Chips rather than checkboxes so the swatch can carry
+     the series colour -- the control and the line are then the same object. */
+  .pv-toggles{display:flex;flex-wrap:wrap;align-items:center;gap:7px;margin:10px 0 12px}
+  .pv-toggle{display:inline-flex;align-items:center;gap:6px;cursor:pointer;
+             font:11.5px/1 var(--sans);color:var(--dim);background:var(--card);
+             border:1px solid var(--line);border-radius:999px;padding:6px 11px}
+  .pv-toggle:hover{border-color:var(--dim);color:var(--fg)}
+  /* OFF is the state that must look off: dim text and a hollow swatch. A
+     toggle whose two states differ only in saturation reads as one state. */
+  .pv-toggle .pv-sw{opacity:.28}
+  .pv-toggle.on{color:var(--fg);border-color:var(--dim);background:var(--bg)}
+  .pv-toggle.on .pv-sw{opacity:1}
+  .pv-toggle-win{font-family:var(--mono);font-size:11px}
+  .pv-toggle-gap{flex:1 1 auto}
+  .pv-warn-line{font:11.5px/1.45 var(--sans);color:var(--warn,#c98500);margin:8px 0 0}
+  .pv-pctl-line{pointer-events:stroke}
+  /* Hover affordance. A tooltip nobody knows is there is not a tooltip. */
+  .pv-help{cursor:help}
+  .pv-legend-item.pv-help>span:nth-child(2),
+  .pv-tile.pv-help .pv-tile-label{text-decoration:underline dotted var(--faint);
+                                  text-underline-offset:3px}
 
   .pv-spark-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:10px}
   .pv-spark{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:10px 12px}
@@ -8495,9 +8524,9 @@ const ARCH_NODES={
 
   telemetrySys:{label:'Telemetry Stream',tag:'cpu',
     desc:'A localhost-only WebSocket server streaming one JSON object per FRAME to this page. Two formats on one socket: v1 stage chips for this tab, v2 full per-component samples for the Performance tab. Zero cost when nobody is attached.',
-    files:['src/telemetry.h','src/telemetry.cpp','src/measure/perfnodes.h'],
+    files:['src/telemetry.h','src/telemetry.cpp','src/measure/perfnodes.h','scripts/fake_telemetry.py'],
     sym:['Telemetry::Start','Telemetry::Broadcast','Telemetry::BroadcastSample','TelemetryStage'],
-    details:'Start the game with <code>--telemetry</code> (port via <code>--telemetry-port</code>, default 8080), then press <b>connect</b> in the bar at the top of this page.<br><br>Wire format: <code>{"tick":N,"stages":{"ca":{"ms":0.18},...}}</code>. <b>Stage keys match the <code>data-eng-stage</code> attributes below</b>, so adding a stage needs no page changes beyond a new block. The frame loop currently broadcasts <code>stream</code>, <code>submit</code>, <code>physics</code>, <code>post</code> per tick and <code>render</code> per frame.<br><br><b>v2 (the Performance tab).</b> The same message also carries <code>{"v":2,"wallMs":..,"cpu":{..},"gpu":{..},"counters":{..}}</code> — one <code>PerfSample</code> (src/measure/perfnodes.h) per RENDERED FRAME, which is the same struct <code>--perf</code> records, so a live session and a recorded run draw with the same code. GPU pass times ride a fence ring and arrive two or three frames late, tagged with the frame that produced them; nothing in the frame path ever waits on a timestamp. Zeros are dropped from the wire — a settled world has one non-zero GPU node out of twenty-five.'},
+    details:'Start the game with <code>--telemetry</code> (port via <code>--telemetry-port</code>, default 8080), then press <b>connect</b> in the bar at the top of this page.<br><br>Wire format: <code>{"tick":N,"stages":{"ca":{"ms":0.18},...}}</code>. <b>Stage keys match the <code>data-eng-stage</code> attributes below</b>, so adding a stage needs no page changes beyond a new block. The frame loop currently broadcasts <code>stream</code>, <code>submit</code>, <code>physics</code>, <code>post</code> per tick and <code>render</code> per frame.<br><br><b>v2 (the Performance tab).</b> The same message also carries <code>{"v":2,"wallMs":..,"cpu":{..},"gpu":{..},"counters":{..}}</code> — one <code>PerfSample</code> (src/measure/perfnodes.h) per RENDERED FRAME, which is the same struct <code>--perf</code> records, so a live session and a recorded run draw with the same code. GPU pass times ride a fence ring and arrive two or three frames late, tagged with the frame that produced them; nothing in the frame path ever waits on a timestamp. Zeros are dropped from the wire — a settled world has one non-zero GPU node out of twenty-five.<br><br><b>Verifying the live path.</b> <code>bash scripts/check_perfview.sh --live</code> launches the game and asserts v2 samples reach the page; <code>--fake</code> does the same against <code>scripts/fake_telemetry.py</code>, which replays a recorded scenario in the exact wire format with no GPU, no run mutex and no boot, so a failure there is the PAGE and nothing else. <code>--fake-v1</code> replays a stale peer speaking only v1, which the page must diagnose rather than sit on. <b>The live arm cannot use Chrome <code>--virtual-time-budget</code></b>: that flag never delivers WebSocket events to JS, so the page reports nothing received while the peer log shows hundreds of samples streamed. It runs Chrome in real time and waits for the page to POST its verdict to <code>/api/testresult</code>.<br><br><b>The port is single-owner.</b> <code>Start()</code> deliberately does NOT set <code>SO_REUSEADDR</code> — on Windows that means &ldquo;bind even though a live socket already holds this port&rdquo;, which let a second sandvox share 8080 and made which process the browser reached indeterminate. A failed bind now prints a loud banner and flushes it, because redirected stdout is block-buffered and the one line saying telemetry is off used to sit in the buffer until exit.'},
 
   perfSuite:{label:'Performance Suite',tag:'cpu',
     desc:'`--perf`, and the tuner tab that reads it. Five scenarios \u2014 idle, a burning tree, a streaming flythrough, an explosion storm and a draining lake \u2014 each recorded frame by frame with per-component CPU scopes, per-PASS GPU timestamps and the counters that explain them. Answers one question: where did my frame go, and which part of the engine do I fix.',

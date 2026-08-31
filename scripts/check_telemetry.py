@@ -42,8 +42,13 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 EXE = os.path.join(ROOT, "build", "Release", "sandvox.exe")
 
 
-def ws_connect(port, timeout=30.0):
-    """Minimal RFC6455 client handshake. Enough to receive text frames."""
+def ws_connect(port, timeout=120.0):
+    """Minimal RFC6455 client handshake. Enough to receive text frames.
+
+    The budget is generous because a COLD SPIR-V cache makes the game take well
+    over a minute to reach its frame loop, and a client that gives up at 30 s
+    reports "never connected" about a server that was always going to come up.
+    """
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
@@ -131,7 +136,14 @@ def main():
     argv = [EXE, "--telemetry", "--telemetry-port", str(a.port),
             "--frames", str(a.frames), "--noaudio"]
     print("launching:", " ".join(argv[1:]))
-    proc = subprocess.Popen(argv, cwd=ROOT, env=env)
+    # The game's own stdout is hundreds of lines of asset loading and would bury
+    # this tool's verdict; it goes to build/telemetry_game.log so it is still
+    # there when a check fails and you want to know what the game thought.
+    os.makedirs(os.path.join(ROOT, "build"), exist_ok=True)
+    logpath = os.path.join(ROOT, "build", "telemetry_game.log")
+    log = open(logpath, "wb")
+    proc = subprocess.Popen(argv, cwd=ROOT, env=env, stdout=log,
+                            stderr=subprocess.STDOUT)
     try:
         sock, rest = ws_connect(a.port)
         if not sock:
@@ -147,6 +159,8 @@ def main():
             proc.wait(timeout=20)
         except subprocess.TimeoutExpired:
             proc.kill()
+        log.close()
+        print("game output: build/telemetry_game.log")
 
     fails = []
 
