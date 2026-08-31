@@ -684,7 +684,8 @@ Quat ClampBall(const Quat& q, const PoseBallLimit& lim) {
 
 }  // namespace
 
-void AnimClampPoseLimits(const AnimSkeleton& sk, AnimState& st) {
+void AnimClampPoseLimits(const AnimSkeleton& sk, AnimState& st,
+                         const PoseAxisOverride* overrides, int overrideCount) {
   const size_t n = sk.parts.size();
   if (st.model.size() < n) return;
   bool any = false;
@@ -735,9 +736,33 @@ void AnimClampPoseLimits(const AnimSkeleton& sk, AnimState& st) {
         delta = ClampBall(delta, p.poseBall);
         moved = true;
       } else if (p.hasPoseLimit) {
-        const float len = p.poseAxis.len();
+        Vec3 raw = p.poseAxis;
+        // THE PLANE MAY BE STEERED; THE RANGE MAY NOT (anim.h
+        // PoseAxisOverride). Blended toward the authored axis rather than
+        // switched, so a weapon take-over and a hand-back are ramps.
+        for (int k = 0; k < overrideCount; k++) {
+          const PoseAxisOverride& ov = overrides[k];
+          if (ov.part != (int)i || ov.blend <= 0.0f) continue;
+          const float b = ov.blend > 1.0f ? 1.0f : ov.blend;
+          const Vec3 a = raw.normalized();
+          const Vec3 o = ov.axis.normalized();
+          // SIGN-FIX THE AUTHORED AXIS TOWARD THE OVERRIDE, never the other way
+          // round. Either sense names the same plane, but only one of them
+          // makes the joint's authored [min, max] describe the bend it is
+          // actually in — and the caller has already MEASURED which one that
+          // is (see the note at ApplyWeaponArm's sign block). Flipping the
+          // override to match the authored axis instead would undo that
+          // measurement and clamp a legitimately-bent elbow straight.
+          //
+          // The flip is only ever applied while blending; at blend 1 the
+          // authored axis drops out entirely.
+          const Vec3 as = a.dot(o) < 0.0f ? a * -1.0f : a;
+          raw = as + (o - as) * b;
+          break;
+        }
+        const float len = raw.len();
         if (len > 1e-5f) {
-          const Vec3 axis = p.poseAxis * (1.0f / len);
+          const Vec3 axis = raw * (1.0f / len);
           delta = p.poseHinge ? ClampHinge(delta, axis, p.poseMin, p.poseMax)
                               : ClampTwist(delta, axis, p.poseMin, p.poseMax);
           moved = true;

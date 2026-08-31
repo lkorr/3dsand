@@ -8,6 +8,7 @@
 
 #include "game/anim.h"
 #include "game/equipment.h"
+#include "game/melee.h"   // WeaponPose: the stroke driver's command to the rig
 #include "math3d.h"
 #include "phys/debris.h"
 #include "phys/physics.h"
@@ -100,6 +101,12 @@ struct MobLimbDef {
   bool hasEdge = false;
   Vec3 edgeFrom{}, edgeTo{};   // base (ricasso) and tip, local
   float edgeHalfWidth = 0;     // carve radius at the blade, world voxels
+  // Normal of the blade's cutting plane, same local frame, unit. See the long
+  // note on ItemDef::edgeFlat — this is the rig-part half of the same field,
+  // so a blade that IS a limb (a claw, a mandible) rolls and scores the same
+  // way a held sword does.
+  bool hasEdgeFlat = false;
+  Vec3 edgeFlat{0, 1, 0};
   // Index into the shared micro-body model pool (sim/microbody.h), or -1 for
   // the cube path. Only ever set for defs with skinScale > 1; a limb whose
   // model failed to pack keeps -1 and simply does not render (cube instances
@@ -729,12 +736,33 @@ class Mob {
   // item, always at the tail. `LimbCount() - AppendedBase()` of them.
   int AppendedBase() const { return baseLimbs_; }
   // The held weapon's cutting edge in WORLD voxels, from its live transform.
-  bool WeaponEdge(Vec3& outBase, Vec3& outTip, float& outHalfWidth) const;
+  // `outFlat`, when asked for, is the normal of the blade's cutting plane in
+  // world space — how edge-on a cut was is a property of the pose, so it is
+  // read off the same live transform the segment is.
+  bool WeaponEdge(Vec3& outBase, Vec3& outTip, float& outHalfWidth,
+                  Vec3* outFlat = nullptr) const;
   // Is this Jolt body one of this creature's own parts?
   bool OwnsBody(uint64_t bodyHandle) const;
-  // Swing pose, pushed in by the driver. Presentation only; consumed by the
-  // driver's own animation pass.
-  void SetWeaponPose(Vec3 handOffset, Vec3 bladeDir, Vec3 bladeUp, float weight);
+  // WHERE A LIMB'S JOINT IS, in world voxels, off its LIVE transform.
+  //
+  // `xf.pos` alone is the limb's min CORNER, which is not the joint and which
+  // swings around it as the limb rotates — so anything that used the corner as
+  // a centre of rotation would read a pure rotation as a translation. This runs
+  // the same `xf.pos + rot * anchorLimb` composition the kinematic submit path
+  // inverts, which is the joint itself. The `swing-plane` gate measures the
+  // sword's arc about the shoulder with it.
+  bool PartJointWorld(int part, Vec3& out) const;
+  // THE STROKE DRIVER'S COMMAND TO THE RIG (game/melee.h). Presentation only;
+  // consumed by the driver's own animation pass through ApplyWeaponArm.
+  void SetWeaponPose(const WeaponPose& pose);
+  // The legacy form: drive the arm at a bare point and leave the blade at
+  // whatever grip angle the fist gives it. Kept because that IS the right
+  // contract for a caller with no opinion about the weapon — the pose-limit
+  // gates aim the hand at hostile targets and must not have a blade steering
+  // the wrist underneath them — and because it is the behaviour every mob had
+  // before the stroke driver existed.
+  void SetWeaponPose(Vec3 handOffset, Vec3 bladeDir, Vec3 bladeFlat,
+                     float weight);
   // The INVERSE of SetWeaponPose's hand offset: where the weapon arm's hand is
   // RIGHT NOW, shoulder-relative, in the same frame that call speaks, plus the
   // arm's own reach (its two bone lengths). False when there is no weapon arm
@@ -743,6 +771,44 @@ class Mob {
   // of the arm from wherever the animation had it instead of snapping it to a
   // pose of its own (game/melee.h).
   bool WeaponArmPose(Vec3& outHandFromShoulder, float& outReach) const;
+  // THE WHOLE SEED THE STROKE DRIVER NEEDS, in one read and in one frame.
+  //
+  // WeaponArmPose's inverse round-trip, extended to the blade: the point and
+  // the flat as well as the hand, all expressed in the frame SetWeaponPose
+  // speaks. The driver steers the TIP, so a take-over that only knew where the
+  // HAND was would still have to guess the blade's own orientation — and
+  // guessing it is a visible pop at the instant of the click, which is the one
+  // thing the take-over model exists to prevent.
+  //
+  // Derived from the MODEL pose rather than from the physics transform on
+  // purpose: WeaponEdge reads the submitted kinematic body, which is a tick
+  // behind and in world space, whereas this has to agree exactly with the
+  // target the IK will be handed on the very next tick.
+  bool WeaponStrokePose(Vec3& outHandFromShoulder, Vec3& outTipFromShoulder,
+                        Vec3& outFlat, float& outReach) const;
+
+  // WHY THE SWORD IS NOT WHERE THE STROKE ASKED, in four numbers.
+  //
+  // There are three independent ways for a weapon pose to come out wrong — the
+  // IK cannot reach the hand, the wrist cannot take the blade angle, or the
+  // pose-limit clamp undoes the solve — and every one of them shows up
+  // downstream as the same thing: a sword somewhere else. Chasing that with A/B
+  // elimination costs one hypothesis per run (CLAUDE.md rule 6); recording the
+  // three at the point of failure costs nothing and prints the answer on one
+  // line. `swing-plane`'s follow pass reads exactly this.
+  struct WeaponArmDiag {
+    bool ran = false;
+    float ikMiss = 0;        // hand target -> solved hand, world voxels
+    float wristWant = 0;     // radians the blade asked the wrist to travel
+    float wristApplied = 0;  // ...and what the wrist limit allowed
+    float clampMove = 0;     // radians AnimClampPoseLimits then took back
+    float clampShift = 0;    // ...and how far it moved the HAND, world voxels
+    float shoulderClamp = 0; // radians the ball limit took off the shoulder
+    float elbowClamp = 0;    // radians the hinge took off the elbow
+    float roundTrip = 0;     // commanded hand -> WeaponArmPose's read of it
+    Vec3 cmdHand{}, gotHand{};  // the two ends of that comparison
+  };
+  const WeaponArmDiag& WeaponArmDiagnostics() const { return weaponDiag_; }
 
   // ---- render plumbing (per creature; MobSystem chains these over its list) -
   // The Append* walks MUST visit slots in the same order: the slot a transform
@@ -764,6 +830,27 @@ class Mob {
   static GoreProfile MakeGoreProfile(uint64_t id);
 
  protected:
+  // ---- THE WEAPON ARM, for BOTH animation drivers --------------------------
+  //
+  // Stage 5.5 of the pose pipeline: run on the FLATTENED pose, after the gait's
+  // leg IK and before AnimClampPoseLimits. Aims the weapon arm's two-bone chain
+  // at the driver's hand target with the driver's own bend pole, then orients
+  // the HAND so the blade points where the stroke says. Returns the elbow's
+  // hinge-axis override for the clamp that follows (anim.h PoseAxisOverride);
+  // `ov.part` is -1 when there is nothing to override.
+  //
+  // SHARED, not duplicated, and that is the point: the avatar and an NPC swing
+  // through one implementation, so a mob driven by an authored stroke curve
+  // (Phase C) gets exactly the arm the player gets, and a fix to one is a fix
+  // to both. It lives on Mob rather than on PlayerAvatar for the same reason
+  // SetWeaponPose does.
+  void ApplyWeaponArm(const AnimSkeleton& sk, AnimState& st,
+                      PoseAxisOverride& ov) const;
+  // Called by both drivers straight after AnimClampPoseLimits: fills in
+  // WeaponArmDiag::clampMove, the one piece of attribution that cannot be
+  // collected inside ApplyWeaponArm because the clamp has not run yet.
+  void RecordWeaponClamp(const AnimSkeleton& sk, const AnimState& st) const;
+
   // ---- THE EXPLICIT-EXCEPTION SEAM ------------------------------------------
   // Everything the avatar does differently from an NPC goes through one of
   // these. Adding avatar behaviour anywhere else in the shared mechanics is
@@ -1016,8 +1103,12 @@ class Mob {
   int heldPartIndex_ = -1;
   Vec3 gripBody_{};            // grip point in the item's BODY frame
   // Swing pose pushed in by the driver (SetWeaponPose). Pure presentation.
-  Vec3 weaponHand_{}, weaponDir_{0, 1, 0}, weaponUp_{0, 0, 1};
-  float weaponWeight_ = 0;
+  WeaponPose weapon_{};
+  float weaponWeight_ = 0;     // weapon_.weight, clamped once on the way in
+  mutable WeaponArmDiag weaponDiag_{};
+  mutable Quat weaponHandPreClamp_{}, weaponUpPreClamp_{}, weaponLoPreClamp_{};
+  mutable Vec3 weaponHandPosPreClamp_{};
+  mutable int weaponHandPart_ = -1, weaponUpPart_ = -1, weaponLoPart_ = -1;
 
   // Particles authored outside the tick (Sever is reached from damage handling
   // all over the frame); drained by the driver's PreTick.

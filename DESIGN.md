@@ -2269,39 +2269,76 @@ and the measured mouse speed, because an input this analogue has to be
 misjudged the distance".
 
 **The mouse is a HAND, not a pointer** (rewritten 2026-08-30). What the button
-buys is *incremental control of where the arm is*: the hand keeps the pose the
-animation had it in, and from then on each mouse pixel is a fixed distance of
-hand travel, **integrated** — so the blade stays where it is put, a slow drag
-reaches as far as a fast one, and the only bound is the arm's own reach (read
-off the rig's bone lengths, not a constant). Two things follow that are worth
-stating because the first version had neither:
+buys is *incremental control*: the arm keeps the pose the animation had it in,
+and from then on each mouse pixel is a fixed amount of travel, **integrated** —
+so the blade stays where it is put, a slow drag reaches as far as a fast one,
+and the only bound is the arm's own reach (read off the rig's bone lengths, not
+a constant). Two things follow that are worth stating because the first version
+had neither:
 
-- **Taking over an arm starts where the arm is.** `Mob::WeaponArmPose` is the
-  exact inverse of `SetWeaponPose`'s offset, so the driver reads the live hand
-  and hands the same value straight back: the first driven tick asks for the
-  pose the arm is already in, weight can go to 1, and nothing moves. The
-  original mapped mouse *velocity* to a lean off a fixed guard pose, so
+- **Taking over an arm starts where the arm is.** `Mob::WeaponStrokePose` is the
+  exact inverse of `SetWeaponPose`, so the driver reads the live hand AND the
+  live point and hands the same values straight back: the first driven tick asks
+  for the pose the blade is already in, weight can go to 1, and nothing moves.
+  The original mapped mouse *velocity* to a lean off a fixed guard pose, so
   clicking teleported the arm to that pose — reported, accurately, as "the
   moment I click the arm shoots to the top right".
-- **A velocity map has no memory.** With the hand position a function of how
-  fast the mouse was moving *this instant*, the blade could not be aimed and
-  parked, any real flick saturated the clamp, and letting go of the mouse
-  dropped the arm back to guard. The cut arc is now an offset *added* to the
-  steered position and unwound over the recover, so a cut ends where the mouse
-  ended rather than springing back.
+- **A velocity map has no memory.** With the pose a function of how fast the
+  mouse was moving *this instant*, the blade could not be aimed and parked, any
+  real flick saturated the clamp, and letting go dropped the arm back to guard.
+
+**The mouse steers the POINT, not the fist** (rewritten 2026-08-31). Integrating
+into a *hand position* fixed the input and left the geometry wrong. A hand
+offset is three numbers fed to a two-bone solver with a fixed pole and a
+strict-hinge elbow: shoulder roll, forearm pronation and the wrist have no
+channel at all, and the blade's own orientation was computed, passed, stored and
+then deliberately never applied. The sweep plane was therefore whatever the
+elbow's authored hinge happened to allow, and pushing the mouse forward came out
+as an elbow jab. The control surface is now the **blade tip on a reach surface
+around the shoulder**, in the camera's frame:
+
+    mouse x  ->  AZIMUTH of the point     mouse y  ->  ELEVATION of the point
+    a separate bounded RADIAL channel  ->  thrust and draw-back
+
+and everything else is derived from it. **Both mouse axes are angular on
+purpose**: spending one on reach is what made forward mouse a jab, and a
+right-to-left drag stops being a flat arc the moment the vertical axis does
+double duty. The hand is the point minus a blade; the blade's angle to the
+shoulder-to-point line is a **law of cosines**, not a taste constant, so the
+derived hand is always somewhere the arm can be (a fixed lean put the hand at
+the shoulder — this sword is longer than this arm). The flat of the blade faces
+out of the stroke plane, so the edge leads the cut, and the damage sweep scales
+by that alignment with a floor, so a flat still bruises.
+
+**The arm serves the blade.** The weapon arm's IK is handed the driver's own
+bend pole, built from the HAND's travel — a plane is only defined relative to
+the chain that bends in it, and the point's tangent is a different direction
+entirely for a long blade. The elbow stays a one-degree-of-freedom hinge with
+its authored 0..130 range; what is steered is which PLANE that freedom lives in
+(`anim.h` `PoseAxisOverride`), which is what shoulder roll buys in a real arm
+and is invisible on a near-cylindrical upper arm. A horizontal cut then reads as
+shoulder rotation plus elbow extension in the horizontal plane.
+
+**The blade is steered by the WRIST, never by rotating the held part.** The
+sword is a rigid child of the fist and rides the existing
+`itemQ = handQ * gripRot` composition, so the only way to aim it is to aim the
+hand. An early version re-aimed the held part directly; it looked like the sword
+swivelling in the fist, and because the override wrote into the flattened pose
+it also fought the animation pipeline and widened the walk until the legs failed
+their own upright assertion — a "leg bug" whose cause was the thing the
+character was holding.
+
+**One driver, two consumers.** `MeleeState` consumes abstract control deltas
+(`Feed(dx, dy)` / `FeedReach(dr)` / `Step(StrokeSample)`), not a mouse, and
+`Mob::ApplyWeaponArm` is shared by the avatar's animation pass and the NPC one.
+An authored attack is the same driver replayed from a polyline of deltas, so a
+mob swings with the player's arm rather than an approximation of it.
 
 `--gate swing` covers the mapping (CPU-only, milliseconds, its own fixtures);
-`arm-readback` inside `--gate mob` covers the inverse against a target the test
-chose, since a dropped yaw or a flipped x is invisible on a rig standing at
-heading 0 and mirrors the answer.
-
-**The arm swings; the blade does not steer.** The weapon keeps the grip angle
-its rig gives it, orthogonal to the forearm, and only the arm's IK chain is
-driven. An early version re-aimed the held part at the cut direction every
-tick; it looked like the sword swivelling in the fist, and because the override
-wrote into the flattened pose it also fought the animation pipeline and widened
-the walk until the legs failed their own upright assertion — a "leg bug" whose
-cause was the thing the character was holding.
+`--gate swing-plane` drives the same driver through the real rig and asserts on
+the sword's own world trajectory; `arm-readback` inside `--gate mob` covers the
+inverse against a target the test chose, since a dropped yaw or a flipped x is
+invisible on a rig standing at heading 0 and mirrors the answer.
 
 **A held item is a rig part, not an object.** Equipping BORROWS A RIG SLOT: the
 item's own geometry fills a real `MobLimb` parented to the socket's limb, so

@@ -6,12 +6,14 @@
 
 #include <nlohmann/json.hpp>
 
+#include "game/mob.h"     // MobSystem/Mob: the sweep carves live limbs
+#include "phys/debris.h"  // DebrisSystem: ...and melts loose ones
+#include "phys/physics.h"
 #include "sim/scale.h"    // SkinScaleFor / NeededArtUpsample / kLegacyAuthoring*
 #include "sim/voxload.h"  // UpsamplePrefab
 
-// See melee.h for what this is and why. This file is only the motion: the
-// damage side lives in main.cpp's tick loop, which owns the ray casts and the
-// spawn/op lists a carve has to reach.
+// See melee.h for what this is and why. Three halves, in file order: the item
+// library, the damage sweep, and the stroke driver.
 
 using nlohmann::json;
 
@@ -381,6 +383,22 @@ bool LoadItemAsset(const std::string& dir, size_t materialCount,
     d.edgeFrom = axEngine * (e.value("from", 0.0f) * inv);
     d.edgeTo = axEngine * (e.value("to", 0.0f) * inv);
     d.edgeHalfWidth = e.value("halfWidth", 1.0f) * inv;
+    // THE FLAT, through the same scene(Z-up) -> engine(Y-up) map as `axis`.
+    // A DIRECTION, so no `inv` scaling: this says which way the blade's face
+    // points, not how big it is. Orthogonalized against the edge, because two
+    // separately-authored axes that are nearly-but-not-quite perpendicular
+    // would give the roll a slow shear nobody would ever trace back here.
+    if (e.contains("flat") && e["flat"].size() == 3) {
+      Vec3 fl{e["flat"][0].get<float>(), e["flat"][1].get<float>(),
+              e["flat"][2].get<float>()};
+      Vec3 flEngine{fl.x, fl.z, -fl.y};
+      const Vec3 along = axEngine.normalized();
+      flEngine = flEngine - along * along.dot(flEngine);
+      if (flEngine.len() > 1e-4f) {
+        d.edgeFlat = flEngine.normalized();
+        d.hasEdgeFlat = true;
+      }
+    }
   }
 
   // Micro brick, packed into the SAME pool the rigs use — a held item is drawn
@@ -460,15 +478,185 @@ float SmoothAlpha(float halflife, float dt) {
 
 Vec3 Lerp(const Vec3& a, const Vec3& b, float t) { return a + (b - a) * t; }
 
-}  // namespace
-
-void MeleeState::AddMouse(float dx, float dy) {
-  mouseAccum_.x += dx;
-  mouseAccum_.y += dy;
+// Basis coords -> world, and back. The pair below is the only place the two
+// frames meet: everything the stroke driver remembers is in the BASIS frame
+// (x = right, y = up, z = fwd), because the basis turns with the view every
+// tick and a world-space memory would read that turn as blade motion.
+Vec3 ToWorld(const Vec3& l, const Vec3& right, const Vec3& up, const Vec3& fwd) {
+  return right * l.x + up * l.y + fwd * l.z;
+}
+Vec3 ToBasis(const Vec3& w, const Vec3& right, const Vec3& up, const Vec3& fwd) {
+  return Vec3{w.dot(right), w.dot(up), w.dot(fwd)};
 }
 
-void MeleeState::SetArm(const Vec3& handFromShoulder, float reach) {
+// A unit vector perpendicular to `d`, chosen consistently. Only reached when
+// the rig cannot say which way the flat of the blade faces.
+Vec3 AnyPerp(const Vec3& d) {
+  const Vec3 alt = std::fabs(d.y) < 0.9f ? Vec3{0, 1, 0} : Vec3{1, 0, 0};
+  const Vec3 p = alt - d * d.dot(alt);
+  return p.len() > 1e-5f ? p.normalized() : Vec3{1, 0, 0};
+}
+
+}  // namespace
+
+// =============================================================================
+// THE STROKE DRIVER
+// =============================================================================
+//
+// Read melee.h first; this half of the file is only the arithmetic. The one
+// thing worth restating next to the code is the SHAPE of the state, because
+// everything else falls out of it:
+//
+//   az_, el_, radius_        the tip, on a sphere about the shoulder. PURE
+//                            INTEGRAL of the control input. Nothing decays it,
+//                            nothing pulls it toward a pose, and the clamps act
+//                            on the STORED value so pushing into one banks
+//                            nothing that has to be wound back.
+//   swingAz_/El_/Out_        the committed cut's follow-through, ADDED to the
+//                            above. This is the only thing that decays.
+//   bladeDirL_/FlatL_/poleL_ derived, smoothed, in the basis frame.
+//
+// Azimuth is measured from +z (`fwd`) toward +x (`right`), so 0 is straight
+// ahead and positive is the basis's right; elevation is the angle above the
+// x/z plane. World space is entered only at the bottom of Update.
+
+// =============================================================================
+// THE DAMAGE SWEEP
+// =============================================================================
+//
+// Lifted verbatim out of main.cpp's tick loop when the NPC and the gate needed
+// it too; the only behavioural addition is the edge-alignment scale below.
+EdgeSweepResult MeleeSweepDamage(const EdgeSweep& s, const MeleeTuning& t,
+                                 const Mob& wielder, Physics& phys,
+                                 MobSystem& mobs, DebrisSystem& debris,
+                                 World& world,
+                                 std::vector<ParticleSpawn>& spawns) {
+  EdgeSweepResult out;
+  if (!s.valid || s.dt <= 1e-6f) return out;
+  // Tip speed is what scales the damage: the base of a blade barely moves in a
+  // swing that whips the point through, and a cut should reflect that. Measured
+  // over the tick, in world voxels/sec.
+  const Vec3 travel = s.bNow - s.bPrev;
+  out.tipSpeed = travel.len() / s.dt;
+  if (out.tipSpeed <= t.minSpeed) return out;
+  out.power = std::clamp(
+      (out.tipSpeed - t.minSpeed) / std::max(t.fullSpeed - t.minSpeed, 1e-3f),
+      0.0f, 1.0f);
+  // THE EDGE HAS TO LEAD. A blade travelling in its own flat is a club: the
+  // same speed through the same point does a fraction of the damage, and the
+  // difference is the entire reason the stroke driver bothers to roll the
+  // weapon. `edgeFloor` is what keeps a flat from being free — a flat still
+  // bruises, and still breaks what it lands on.
+  out.edgeAlign = MeleeEdgeAlign(s.flatNow, travel, t.edgeFloor);
+  const float power = out.power * out.edgeAlign;
+  const float radius = s.halfWidth + s.carveBonus;
+
+  // Sample along the blade AND across the sweep, so a fast cut does not tunnel
+  // between ticks. Both counts are bounded and scale with how far the blade
+  // actually moved (CLAUDE.md rule 2): a stationary blade costs one probe, and
+  // no swing can cost more than kMaxSteps * kMaxAlong however fast it is
+  // flicked.
+  const float sweepLen = travel.len();
+  const int kMaxSteps = 6, kMaxAlong = 5;
+  const int steps = std::clamp(
+      (int)std::ceil(sweepLen / std::max(radius, 0.5f)), 1, kMaxSteps);
+  const int along = std::clamp(
+      (int)std::ceil((s.bNow - s.aNow).len() / std::max(radius, 0.5f)), 1,
+      kMaxAlong);
+  // One hit per body per swing tick: without this the same limb is carved once
+  // per probe and a single cut removes a whole arm.
+  std::vector<uint64_t> hitBodies;
+  for (int step = 1; step <= steps && (int)hitBodies.size() < 8; step++) {
+    const float u = (float)step / (float)steps;
+    const Vec3 a = s.aPrev + (s.aNow - s.aPrev) * u;
+    const Vec3 b = s.bPrev + (s.bNow - s.bPrev) * u;
+    for (int k = 0; k <= along; k++) {
+      const float v = (float)k / (float)along;
+      const Vec3 p = a + (b - a) * v;
+      // A short ray along the blade's own length is what finds what the edge is
+      // passing through. Using the segment the blade occupies (rather than a
+      // point test) is what lets a thin fast blade hit at all.
+      const Vec3 seg = b - a;
+      const float segLen = seg.len();
+      if (segLen < 1e-4f) continue;
+      float frac = 1.0f;
+      const float probe = std::max(radius * 2.0f, 0.6f);
+      const uint64_t hb = phys.CastRayBody(p, seg.normalized(), probe, frac);
+      if (!hb) continue;
+      bool seen = false;
+      for (uint64_t h : hitBodies) seen |= (h == hb);
+      if (seen) continue;
+      // A weapon must not cut its wielder. The wielder's own parts are
+      // permanently inside the swing arc — the blade starts in its own hand —
+      // so without this every guard would saw through the arm holding it.
+      if (wielder.OwnsBody(hb)) continue;
+      hitBodies.push_back(hb);
+      const Vec3 at = p + seg.normalized() * (frac * probe);
+      // LIVE FLESH CARVES; DEBRIS MELTS. The same two populations the laser
+      // splits on, through the same two calls — a mob limb loses voxels exactly
+      // where the edge crossed it, which is what makes dismemberment geometric
+      // rather than a threshold (DESIGN.md §7 "Carving living bodies").
+      const float dmg = s.damage * power;
+      // Everything severed inside this scope is a BLADE cut, and gets the wet
+      // dismember sound on top of the creature's own cry. Both calls below can
+      // sever several frames deep — Damage() at zero hp or over the impact
+      // threshold, CarveLimbRadial() when the limb collapses — so the cause is
+      // marked around them rather than passed down through a chain the laser
+      // and explosions also use.
+      MobSystem::BladeCutScope blade(mobs, power);
+      if (mobs.Damage(hb, dmg, at, out.tipSpeed)) {
+        mobs.CarveLimbRadial(hb, at, radius * (0.6f + 0.4f * power),
+                             true /*ragged*/, true /*eject*/, world, spawns);
+      } else {
+        debris.MeltBodyAt(hb, at, radius, world, spawns);
+      }
+    }
+  }
+  out.bodiesHit = (int)hitBodies.size();
+  return out;
+}
+
+float MeleeEdgeAlign(const Vec3& flat, const Vec3& travel, float floorFrac) {
+  const float fl = flat.len(), tl = travel.len();
+  // No roll reported, or a blade that is not moving: neither is evidence of a
+  // BAD angle, so neither may be punished. A stationary blade is already doing
+  // no damage — `minSpeed` sees to that — and scaling it a second time here
+  // would double-count the same fact.
+  if (fl < 1e-6f || tl < 1e-6f) return 1.0f;
+  // |cos| between the flat's normal and the travel: 1 is a pure slap with the
+  // side, 0 is a perfectly edge-on cut. Absolute because a blade cuts equally
+  // well on either face — this is a double-edged sword and, more to the point,
+  // the sign only says which way the flat happens to be pointing.
+  const float c = std::fabs(flat.dot(travel) / (fl * tl));
+  const float align = 1.0f - std::clamp(c, 0.0f, 1.0f);
+  const float floorF = std::clamp(floorFrac, 0.0f, 1.0f);
+  return floorF + (1.0f - floorF) * align;
+}
+
+void MeleeState::Feed(float dx, float dy) {
+  inputAccum_.x += dx;
+  inputAccum_.y += dy;
+}
+
+void MeleeState::FeedReach(float dr) { inputAccum_.z += dr; }
+
+void MeleeState::Step(const StrokeSample& s, float dt, bool armed,
+                      const Vec3& right, const Vec3& up, const Vec3& fwd) {
+  Feed(s.dx, s.dy);
+  FeedReach(s.dReach);
+  Update(dt, s.held, armed, right, up, fwd);
+}
+
+void MeleeState::SetStroke(const Vec3& handFromShoulder,
+                           const Vec3& tipFromShoulder, const Vec3& flat,
+                           float reach) {
   armHand_ = handFromShoulder;
+  armTip_ = tipFromShoulder;
+  armFlat_ = flat;
+  // THE BLADE LENGTH IS MEASURED, NEVER AUTHORED HERE. It is the rigid
+  // hand-to-point distance of whatever is in the fist this tick, so a dagger
+  // and a greatsword steer the same way and neither needs a tuning row.
+  bladeLen_ = (tipFromShoulder - handFromShoulder).len();
   armReach_ = reach;
   armValid_ = reach > 1e-3f;
 }
@@ -476,6 +664,8 @@ void MeleeState::SetArm(const Vec3& handFromShoulder, float reach) {
 void MeleeState::ClearArm() {
   armValid_ = false;
   armReach_ = 0;
+  bladeLen_ = 0;
+  armFlat_ = Vec3{};
 }
 
 float MeleeState::PoseWeight() const {
@@ -488,7 +678,8 @@ float MeleeState::PoseWeight() const {
       // mid-combination would drop the blade to the walk pose for a fifth of a
       // second. `recoverHold_` is what the phase was entered for.
       if (recoverHold_) return 1.0f;
-      float t = tuning.recoverTime > 1e-4f ? phaseTime_ / tuning.recoverTime : 1.0f;
+      float t =
+          tuning.recoverTime > 1e-4f ? phaseTime_ / tuning.recoverTime : 1.0f;
       return std::clamp(1.0f - t, 0.0f, 1.0f);
     }
     default:
@@ -496,56 +687,286 @@ float MeleeState::PoseWeight() const {
   }
 }
 
+WeaponPose MeleeState::Pose() const {
+  WeaponPose p;
+  p.hand = hand_;
+  p.bladeDir = bladeDir_;
+  p.bladeFlat = bladeFlat_;
+  p.bendPole = bendPole_;
+  p.weight = PoseWeight();
+  p.wristMaxAngle = tuning.wristMaxAngle;
+  // The driver ALWAYS steers the blade. The flag exists for the other caller:
+  // Mob::SetWeaponPose's legacy four-argument form, which the pose-limit gates
+  // use to drive the arm at a bare point with no opinion about the weapon.
+  p.steerBlade = true;
+  return p;
+}
+
 void MeleeState::Reset() {
   phase_ = SwingPhase::Idle;
   phaseTime_ = 0;
-  mouseAccum_ = Vec3{};
+  inputAccum_ = Vec3{};
   mouseVel_ = Vec3{};
   mouseSpeed_ = 0;
   cutDir_ = Vec3{};
-  handCam_ = Vec3{};
-  swing_ = Vec3{};
+  cutAz_ = cutEl_ = 0;
+  az_ = el_ = radius_ = 0;
+  swingAz_ = swingEl_ = swingOut_ = 0;
+  tipPrev_ = Vec3{};
+  tipVel_ = Vec3{};
+  tangent_ = Vec3{};
+  extendLive_ = 0;
+  framePrimed_ = false;
   recoverHold_ = false;
+}
+
+// ---- the derived half -------------------------------------------------------
+//
+// Given the integrated stroke, produce the tip, the blade frame, the bend pole
+// and finally the hand. Everything is in BASIS coordinates until the last four
+// lines; nothing here reads the input.
+void MeleeState::RadiusBand(float& lo, float& hi, float& handRadius) const {
+  const float handReach =
+      (armValid_ ? armReach_ : tuning.fallbackReach) * tuning.reachFraction;
+  // THE LIVE extension, not the tuning target: a take-over starts the arm
+  // wherever the animation had it and eases from there, and a band computed
+  // from the target would refuse the pose the arm is actually in.
+  handRadius = std::clamp(extendLive_ > 1e-4f ? extendLive_
+                                              : handReach * tuning.handExtend,
+                          0.05f, handReach);
+  const float L = bladeLen_;
+  if (L < 1e-4f) {
+    // No blade: the point IS the hand, so the band is simply the arm.
+    lo = handReach * 0.15f;
+    hi = handReach;
+    return;
+  }
+  // The reach annulus of a one-link chain of length L pinned at radius
+  // handRadius. Margins keep the ends off the degenerate cases: at `hi` the
+  // blade lies exactly along the arm's own line (nothing left to lean) and at
+  // `lo` it doubles back on it.
+  const float margin = std::min(0.25f, std::max(L, handRadius) * 0.05f);
+  lo = std::fabs(L - handRadius) + margin;
+  hi = L + handRadius - margin;
+  if (hi <= lo) {           // degenerate: the two lengths coincide
+    lo = std::max(handRadius * 0.4f, 0.05f);
+    hi = handRadius + L;
+  }
+}
+
+void MeleeState::RebuildFrame(float dt, const Vec3& right, const Vec3& up,
+                              const Vec3& fwd) {
+  float rLo = 0, rHi = 0, rHand = 0;
+  RadiusBand(rLo, rHi, rHand);
+
+  // THE TOTAL, clamped: the steered stroke plus the cut's follow-through. az_
+  // and el_ were already clamped as they were integrated (that is what banks
+  // nothing); this second clamp is on the SUM, because a follow-through must
+  // not carry the point past vertical or through the far shoulder either.
+  const float azHi = handSign_ > 0 ? tuning.azOut : tuning.azAcross;
+  const float azLo = handSign_ > 0 ? -tuning.azAcross : -tuning.azOut;
+  const float az = std::clamp(az_ + swingAz_, azLo, azHi);
+  const float el = std::clamp(el_ + swingEl_, tuning.elMin, tuning.elMax);
+  const float r = std::clamp(radius_ + swingOut_, rLo, rHi);
+
+  const float ce = std::cos(el), se = std::sin(el);
+  const Vec3 tipL{r * ce * std::sin(az), r * se, r * ce * std::cos(az)};
+
+  // ---- how fast the point is moving, and which way ------------------------
+  // Measured in BASIS coordinates on purpose. In world space, turning the view
+  // moves the tip without the player having moved the blade at all, and the
+  // edge would roll to lead a "travel" that is really the camera panning.
+  const Vec3 inst =
+      (framePrimed_ && dt > 1e-6f) ? (tipL - tipPrev_) * (1.0f / dt) : Vec3{};
+  tipPrev_ = tipL;
+  tipVel_ = framePrimed_
+                ? Lerp(tipVel_, inst, SmoothAlpha(tuning.bladeSmoothing, dt))
+                : Vec3{};
+
+  const Vec3 radial = tipL.len() > 1e-5f ? tipL.normalized() : Vec3{0, 0, 1};
+  // The TANGENTIAL part of the travel is the stroke: the radial part is a
+  // thrust, and a thrust has no sweep plane to speak of. Held from the last
+  // tick when there is nothing to read, so a blade brought to a stop keeps the
+  // roll it was cutting with instead of snapping to an arbitrary one.
+  {
+    const Vec3 t = tipVel_ - radial * radial.dot(tipVel_);
+    if (t.len() > 1e-3f) tangent_ = t.normalized();
+  }
+
+  // ---- HOW FAR THE BLADE LEANS OFF THE RADIUS -----------------------------
+  //
+  // NOT A TASTE CONSTANT — a law of cosines. The point is at radius `r`, the
+  // blade is a rigid `bladeLen_` long, and the hand is to be held at `rHand`:
+  // that triangle has exactly one interior angle at the point, so the blade's
+  // angle to the shoulder-to-point line is DETERMINED. Solving it here instead
+  // of picking a lean is what guarantees the derived hand is somewhere the arm
+  // can actually be. The first version leaned a fixed amount off the radius
+  // and, with a 1.1 m sword on a 1.0 m arm, put the hand AT the shoulder and
+  // folded the whole chain into the chest — measured through the rig, the sword
+  // then missed its commanded point by up to 19.8 voxels on an 11.2 voxel
+  // stroke, which is the arm not following the mouse at all.
+  //
+  // WHICH SIDE it leans to is the only free choice, and `handLead` makes it:
+  // +1 puts the hand AHEAD of the point along the travel, which is a sabre cut.
+  //
+  // THE ARM SETTLES, THE PLANE TURNS, AND THE BLADE IS REBUILT FROM BOTH. The
+  // two smoothed quantities are `extendLive_` (how far the hand is held from
+  // the shoulder) and `perpL_` (which way the lean goes); the direction itself
+  // is recomputed exactly every tick, so |tip - hand| is bladeLen_ and |hand|
+  // is extendLive_ at EVERY instant, transients included. Smoothing the
+  // direction instead put the hand at the shoulder on every reversal — see the
+  // note on perpL_ in melee.h.
+  const float handReachNow =
+      (armValid_ ? armReach_ : tuning.fallbackReach) * tuning.reachFraction;
+  extendLive_ = extendLive_ > 1e-4f ? extendLive_ : rHand;
+  extendLive_ +=
+      (std::clamp(handReachNow * tuning.handExtend, 0.05f, handReachNow) -
+       extendLive_) *
+      SmoothAlpha(tuning.extendSmoothing, dt);
+
+  // WHICH WAY THE LEAN GOES: with the travel (so the hand leads the point), or
+  // against it. Rotated toward the target ABOUT THE RADIUS at a bounded rate,
+  // which is the only way to cross a reversal without passing through the
+  // degenerate middle. With nothing travelling the plane simply holds.
+  {
+    Vec3 want = tangent_;
+    if (want.len() < 1e-3f) want = perpL_;
+    want = want - radial * radial.dot(want);
+    if (want.len() < 1e-4f) want = AnyPerp(radial);
+    want = want.normalized();
+    // Re-project the stored plane onto the CURRENT radius first: the radius
+    // moved this tick, and a perpendicular to last tick's is not one to this.
+    Vec3 cur = perpL_ - radial * radial.dot(perpL_);
+    if (cur.len() < 1e-4f) cur = AnyPerp(radial);
+    cur = cur.normalized();
+    const float c = std::clamp(cur.dot(want), -1.0f, 1.0f);
+    const float sgn = cur.cross(want).dot(radial) < 0.0f ? -1.0f : 1.0f;
+    float turn = std::acos(c) * sgn;
+    const float maxTurn = std::max(tuning.leanTurnRate, 0.0f) * dt;
+    turn = std::clamp(turn, -maxTurn, maxTurn);
+    // Rodrigues about the radius; `cur` is already perpendicular to it, so the
+    // axial term drops out.
+    perpL_ = cur * std::cos(turn) + radial.cross(cur) * std::sin(turn);
+    perpL_ = perpL_.len() > 1e-5f ? perpL_.normalized() : cur;
+  }
+
+  Vec3 wantDir = radial;
+  if (bladeLen_ > 1e-4f && r > 1e-4f) {
+    const float cosT = std::clamp((r * r + bladeLen_ * bladeLen_ -
+                                   extendLive_ * extendLive_) /
+                                      (2.0f * bladeLen_ * r),
+                                  -1.0f, 1.0f);
+    const float sinT = std::sqrt(std::max(0.0f, 1.0f - cosT * cosT));
+    const float s = tuning.handLead >= 0.0f ? 1.0f : -1.0f;
+    wantDir = radial * cosT - perpL_ * (sinT * s);
+  }
+  if (wantDir.len() < 1e-5f) wantDir = radial;
+  wantDir = wantDir.normalized();
+  // THE FLAT FACES OUT OF THE STROKE PLANE, which is the same statement as
+  // "the edge leads the travel": the cutting plane is spanned by the blade and
+  // by where it is going, so its normal is their cross product.
+  Vec3 wantFlat = wantDir.cross(tangent_);
+  if (wantFlat.len() < 1e-3f) wantFlat = bladeFlatL_;   // no travel: hold the roll
+  if (wantFlat.len() < 1e-3f) wantFlat = AnyPerp(wantDir);
+  wantFlat = wantFlat.normalized();
+  const float a = SmoothAlpha(tuning.bladeSmoothing, dt);
+  // NOT SMOOTHED — see above. The smoothing that makes this continuous lives in
+  // `extendLive_` and `perpL_`, both of which the direction is exactly derived
+  // from, so the hand-to-point constraint holds on every tick instead of only
+  // in the steady state.
+  bladeDirL_ = wantDir;
+  bladeFlatL_ = Lerp(bladeFlatL_, wantFlat, a);
+  // Re-orthogonalize every tick: two independently smoothed unit vectors drift
+  // out of square, and a "flat normal" that is not perpendicular to the blade
+  // is not a frame — the hand orientation built from it would shear.
+  bladeFlatL_ = bladeFlatL_ - bladeDirL_ * bladeDirL_.dot(bladeFlatL_);
+  bladeFlatL_ = bladeFlatL_.len() > 1e-5f ? bladeFlatL_.normalized()
+                                          : AnyPerp(bladeDirL_);
+
+  // THE HAND IS THE TIP MINUS A BLADE. Not the other way round — that
+  // inversion IS this rewrite. The residual clamp below is a safety net; the
+  // thing that actually keeps the arm in reach is `extendLive_`, which the
+  // blade's own angle is solved against, so nothing banks.
+  Vec3 handL = tipL - bladeDirL_ * bladeLen_;
+  const float handReach =
+      (armValid_ ? armReach_ : tuning.fallbackReach) * tuning.reachFraction;
+  const float hd = handL.len();
+  if (handReach > 1e-3f && hd > handReach) handL = handL * (handReach / hd);
+
+  // THE ELBOW TRAILS THE HAND — and it is the HAND'S OWN travel that says so,
+  // not the point's. The pole names the plane the two-bone solver bends in, and
+  // a plane is only defined relative to the chain it bends: the solver
+  // immediately orthogonalizes whatever it is given against the shoulder-to-
+  // HAND direction. The first version handed it the tip's tangent, which for a
+  // long blade is a completely different direction — measured mid-sweep, the
+  // tip tangent came out at 153 degrees to the arm, so 89% of the pole was the
+  // useless component the solver throws away and the bend plane was decided by
+  // the 11% that survived. Building it from the hand's travel keeps it
+  // perpendicular to the arm by construction.
+  //
+  // With no travel it falls back to straight behind, which is these rigs' own
+  // authored arm pole ([0,0,-1]) and the pose a resting elbow is in.
+  {
+    const Vec3 handVel =
+        (framePrimed_ && dt > 1e-6f) ? (handL - handPrev_) * (1.0f / dt)
+                                     : Vec3{};
+    handPrev_ = handL;
+    handVel_ = framePrimed_ ? Lerp(handVel_, handVel, a) : Vec3{};
+    const Vec3 handDir = handL.len() > 1e-4f ? handL.normalized() : Vec3{0, 0, 1};
+    Vec3 along = handVel_ - handDir * handDir.dot(handVel_);
+    Vec3 wantPole = along.len() > 1e-2f ? along.normalized() * -1.0f
+                                        : Vec3{0, 0, -1};
+    // ...orthogonalized here too, so the value handed across is already a plane
+    // rather than a hint the solver has to rescue.
+    wantPole = wantPole - handDir * handDir.dot(wantPole);
+    if (wantPole.len() < 1e-3f) {
+      wantPole = Vec3{0, 0, -1};
+      wantPole = wantPole - handDir * handDir.dot(wantPole);
+    }
+    if (wantPole.len() < 1e-3f) wantPole = AnyPerp(handDir);
+    poleL_ = Lerp(poleL_, wantPole.normalized(), a);
+    poleL_ = poleL_ - handDir * handDir.dot(poleL_);
+    poleL_ = poleL_.len() > 1e-5f ? poleL_.normalized() : AnyPerp(handDir);
+  }
+
+  tip_ = ToWorld(tipL, right, up, fwd);
+  hand_ = ToWorld(handL, right, up, fwd);
+  bladeDir_ = ToWorld(bladeDirL_, right, up, fwd);
+  bladeFlat_ = ToWorld(bladeFlatL_, right, up, fwd);
+  bendPole_ = ToWorld(poleL_, right, up, fwd);
+  framePrimed_ = true;
 }
 
 void MeleeState::Update(float dt, bool held, bool armed, const Vec3& right,
                         const Vec3& up, const Vec3& fwd) {
   if (dt <= 0) return;
 
-  // ---- mouse velocity ------------------------------------------------------
-  // The accumulator holds this frame's raw pixels; convert to px/sec and
-  // smooth. Draining it here (rather than in AddMouse) is what makes the
+  // ---- input velocity ------------------------------------------------------
+  // The accumulator holds this frame's raw deltas; convert to units/sec and
+  // smooth. Draining it here (rather than in Feed) is what makes the
   // per-frame/per-tick split in melee.h work: several ticks may run per frame,
   // and only the first sees new motion.
-  const Vec3 pixels = mouseAccum_;   // THIS tick's raw travel, in pixels
-  Vec3 instant{mouseAccum_.x / dt, mouseAccum_.y / dt, 0};
-  mouseAccum_ = Vec3{};
+  const Vec3 delta = inputAccum_;    // THIS tick's raw travel
+  const Vec3 instant{inputAccum_.x / dt, inputAccum_.y / dt, 0};
+  inputAccum_ = Vec3{};
   mouseVel_ = Lerp(mouseVel_, instant, SmoothAlpha(tuning.dirSmoothing, dt));
   mouseSpeed_ = std::sqrt(mouseVel_.x * mouseVel_.x + mouseVel_.y * mouseVel_.y);
 
-  // Screen motion -> a direction in the camera plane. Screen +y is DOWN, so it
-  // maps to -up: a downward flick must cut downward, and getting this sign
-  // wrong produces a weapon that mirrors the player's hand, which reads as
-  // broken long before anyone works out why.
+  // Screen motion -> a direction in CONTROL space (azimuth, elevation). Screen
+  // +y is DOWN, so it maps to -elevation: a downward flick must cut downward,
+  // and getting this sign wrong produces a weapon that mirrors the player's
+  // hand, which reads as broken long before anyone works out why.
   //
-  // THE SAME MAPPING THE HAND MOVES BY, gains included, so the cut direction is
-  // by construction the direction the hand is already travelling. (It used to
-  // be a separate pair of gains with a mirrored X, from when the mouse aimed
-  // the blade instead of carrying the hand — see melee.h.) Built from the
-  // smoothed VELOCITY rather than this tick's pixels because one tick of raw
-  // delta is far too noisy to steer a cut with.
-  Vec3 gained = right * (mouseVel_.x * tuning.moveGainX) +
-                up * (-mouseVel_.y * tuning.moveGainY);
-  Vec3 screenDir = gained.len() > 1e-6f ? gained.normalized() : Vec3{};
-
-  // ---- the hand's own travel this tick --------------------------------------
-  // A DISPLACEMENT, not a target. `pixels` is what the mouse physically moved
-  // since the last tick (AddMouse accumulates per FRAME and this drains it), so
-  // integrating it is exactly "the hand went as far as the mouse went" — and it
-  // is immune to the frame/tick ratio: a frame with no tick leaves its pixels
-  // in the accumulator for the next one rather than losing or doubling them.
-  const Vec3 travel = right * (pixels.x * tuning.moveGainX) +
-                      up * (-pixels.y * tuning.moveGainY);
+  // THE SAME MAPPING THE STROKE MOVES BY, gains included, so the cut direction
+  // is by construction the direction the point is already travelling. Built
+  // from the smoothed VELOCITY rather than this tick's raw delta because one
+  // tick is far too noisy to steer a cut with.
+  const float gAz = mouseVel_.x * tuning.aimGainX;
+  const float gEl = -mouseVel_.y * tuning.aimGainY;
+  const float gLen = std::sqrt(gAz * gAz + gEl * gEl);
+  const bool haveDir = gLen > 1e-9f;
+  const float dirAz = haveDir ? gAz / gLen : 0.0f;
+  const float dirEl = haveDir ? gEl / gLen : 0.0f;
 
   if (!armed) {
     // Unarmed: collapse to idle and forget any half-built swing, so picking a
@@ -555,25 +976,111 @@ void MeleeState::Update(float dt, bool held, bool armed, const Vec3& right,
 
   phaseTime_ += dt;
 
+  float rLo = 0, rHi = 0, rHand = 0;
+  RadiusBand(rLo, rHi, rHand);
+  const float tipReach = rHi;
+  const float azHi = handSign_ > 0 ? tuning.azOut : tuning.azAcross;
+  const float azLo = handSign_ > 0 ? -tuning.azAcross : -tuning.azOut;
+
   // The seed of last resort: only reached when the rig cannot say where its own
-  // hand is (SetArm never called, or the arm is gone). Never a pose the live
-  // hand is pulled toward.
+  // blade is (SetStroke never called, or the arm is gone). Never a pose the
+  // live hand is pulled toward.
   const Vec3 guard = fwd * tuning.guardForward + up * tuning.guardUp +
                      right * tuning.guardSide;
+
+  bool seededThisTick = false;
 
   switch (phase_) {
     case SwingPhase::Idle:
       if (armed && held) {
-        // TAKE OVER FROM WHERE THE SWORD IS. The arm keeps the pose the walk
-        // cycle left it in, expressed in the camera frame so the mouse can
-        // push it from there. Because the seed round-trips through the same
-        // shoulder-relative convention the IK target uses (see
-        // Mob::WeaponArmPose), the first driven tick asks the solver for the
-        // pose it is ALREADY in — weight can go straight to 1 with nothing
-        // visible happening, which is the whole point.
-        const Vec3 seed = armValid_ ? armHand_ : guard;
-        handCam_ = Vec3{seed.dot(right), seed.dot(up), seed.dot(fwd)};
-        swing_ = Vec3{};
+        // TAKE OVER FROM WHERE THE SWORD IS. The stroke starts at the blade's
+        // ACTUAL point, expressed in the basis frame, so the arm keeps the pose
+        // the walk cycle left it in and the player pushes it from there.
+        // Because the seed round-trips through the same shoulder-relative
+        // convention the IK target uses (Mob::WeaponStrokePose), the first
+        // driven tick asks the solver for the pose it is ALREADY in — weight
+        // can go straight to 1 with nothing visible happening, which is the
+        // whole point.
+        const Vec3 seedTip = armValid_ ? armTip_ : guard;
+        const Vec3 seedHand = armValid_ ? armHand_ : guard;
+        Vec3 tipL = ToBasis(seedTip, right, up, fwd);
+        // THE ARM STARTS AS EXTENDED AS IT ACTUALLY IS. `extendLive_` is what
+        // the whole blade geometry is solved against, so seeding it from the
+        // live hand is what makes the take-over exact: the law of cosines then
+        // reproduces the blade's real angle rather than the tuning's, and the
+        // arm eases out to `handExtend` over the following fifth of a second.
+        extendLive_ = std::max(ToBasis(seedHand, right, up, fwd).len(), 0.05f);
+        radius_ = tipL.len();
+        // The band has to be recomputed against that seeded extension, or the
+        // clamp below would judge the pose the arm is IN against the pose the
+        // tuning wants it in and move the blade on the take-over tick.
+        RadiusBand(rLo, rHi, rHand);
+        if (radius_ < 1e-4f) {
+          tipL = Vec3{0, 0, tipReach};
+          radius_ = tipReach;
+        }
+        el_ = std::asin(std::clamp(tipL.y / radius_, -1.0f, 1.0f));
+        az_ = std::atan2(tipL.x, tipL.z);
+        // Clamped like any other stroke state. A rig whose rest pose sat
+        // outside the window would be moved by this — the window is authored
+        // wide enough that a hanging arm is inside it, and elMin's comment in
+        // melee.h says so.
+        az_ = std::clamp(az_, azLo, azHi);
+        el_ = std::clamp(el_, tuning.elMin, tuning.elMax);
+        radius_ = std::clamp(radius_, rLo, rHi);
+        swingAz_ = swingEl_ = swingOut_ = 0;
+
+        // SEED THE DERIVED FRAME FROM THE BLADE ITSELF, and skip this tick's
+        // rebuild entirely. One tick of smoothing toward the commanded frame
+        // would already move the hand by ~19% of the difference, which is a
+        // pop — small, but exactly the pop take-over exists to avoid.
+        const Vec3 handL = ToBasis(seedHand, right, up, fwd);
+        const Vec3 bd = tipL - handL;
+        bladeDirL_ = bd.len() > 1e-4f
+                         ? bd.normalized()
+                         : (tipL.len() > 1e-5f ? tipL.normalized()
+                                               : Vec3{0, 0, 1});
+        Vec3 fl = ToBasis(armFlat_, right, up, fwd);
+        fl = fl - bladeDirL_ * bladeDirL_.dot(fl);
+        bladeFlatL_ = fl.len() > 1e-3f ? fl.normalized() : AnyPerp(bladeDirL_);
+        // AND THE LEAN PLANE FROM THE BLADE'S OWN ANGLE. Inverting the law of
+        // cosines' own form: the blade is `radial * cos - perp * sin * s`, so
+        // the perpendicular is what is left of it once the radial part is
+        // taken out, negated by the lead's sign. Seeded this way, the first
+        // rebuilt tick reproduces the seed exactly instead of rotating the
+        // sword to whichever side the tuning happens to prefer.
+        {
+          const Vec3 rad = tipL.len() > 1e-5f ? tipL.normalized() : Vec3{0, 0, 1};
+          Vec3 pc = bladeDirL_ - rad * rad.dot(bladeDirL_);
+          const float s = tuning.handLead >= 0.0f ? 1.0f : -1.0f;
+          if (pc.len() > 1e-4f) {
+            perpL_ = pc.normalized() * -s;
+          } else {
+            // A blade that starts along its own radius says nothing about which
+            // way it will lean, and the fallback matters: `AnyPerp` picks the
+            // VERTICAL perpendicular, which starts every stroke leaning
+            // downward and takes a fifth of a second to rotate out. A sword is
+            // swung sideways far more often than it is dropped, so the
+            // horizontal perpendicular is the better prior — and it is the one
+            // a horizontal cut is already asking for.
+            const Vec3 h = rad.cross(Vec3{0, 1, 0});
+            perpL_ = h.len() > 1e-3f ? h.normalized() : AnyPerp(rad);
+          }
+        }
+        poleL_ = Vec3{0, 0, -1};
+        tangent_ = Vec3{};
+        tipVel_ = Vec3{};
+        tipPrev_ = tipL;
+        handPrev_ = handL;
+        handVel_ = Vec3{};
+        framePrimed_ = true;
+        tip_ = ToWorld(tipL, right, up, fwd);
+        hand_ = ToWorld(handL, right, up, fwd);
+        bladeDir_ = ToWorld(bladeDirL_, right, up, fwd);
+        bladeFlat_ = ToWorld(bladeFlatL_, right, up, fwd);
+        bendPole_ = ToWorld(poleL_, right, up, fwd);
+        seededThisTick = true;
+
         phase_ = SwingPhase::Guard;
         phaseTime_ = 0;
       }
@@ -591,15 +1098,16 @@ void MeleeState::Update(float dt, bool held, bool armed, const Vec3& right,
       }
       phase_ = mouseSpeed_ > tuning.commitSpeed * 0.35f ? SwingPhase::Wind
                                                         : SwingPhase::Guard;
-      // COMMIT. The direction is frozen here and not touched again until the
-      // slash ends: a cut that keeps steering with the mouse mid-swing feels
-      // like dragging the blade through treacle, and it also makes the sweep
-      // curve, which the damage code would then have to chord.
-      // screenDir is unit-or-zero, so this is the "there is a direction at
-      // all" guard; commitSpeed is measured on TRUE mouse speed in pixels, so
-      // it means the same thing at every value of the move gains.
-      if (mouseSpeed_ > tuning.commitSpeed && screenDir.len() > 0.5f) {
-        cutDir_ = screenDir;
+      // COMMIT. The ARC's direction is frozen here and not touched again until
+      // the slash ends: a cut whose own arc keeps re-steering mid-swing feels
+      // like dragging the blade through treacle. (The player's steering is NOT
+      // frozen — az_/el_ keep integrating underneath, which is the
+      // follow-through melee.h promises.) commitSpeed is measured on TRUE input
+      // speed, so it means the same thing at every value of the aim gains.
+      if (mouseSpeed_ > tuning.commitSpeed && haveDir) {
+        cutAz_ = dirAz;
+        cutEl_ = dirEl;
+        cutDir_ = (right * dirAz + up * dirEl).normalized();
         phase_ = SwingPhase::Slash;
         phaseTime_ = 0;
       }
@@ -608,6 +1116,20 @@ void MeleeState::Update(float dt, bool held, bool armed, const Vec3& right,
 
     case SwingPhase::Slash:
       if (phaseTime_ >= tuning.slashTime) {
+        // FOLD THE ARC INTO THE STROKE. A cut ENDS WHERE IT WENT: after a full
+        // sweep the sword really is across your body, and the player steers it
+        // back from there. Unwinding the arc over the recover instead — which
+        // the previous law did, because its arc was centred on the hand and
+        // only half of it was follow-through — would drag the blade two
+        // radians backwards through the target it had just passed through.
+        //
+        // Continuous by construction: at e = 1 the arc is exactly `swingAz_`,
+        // so moving it from one accumulator to the other changes no geometry.
+        // `swingOut_` is deliberately NOT folded — the mid-stroke bulge is a
+        // shape, not a destination, and it belongs back at the steered radius.
+        az_ = std::clamp(az_ + swingAz_, azLo, azHi);
+        el_ = std::clamp(el_ + swingEl_, tuning.elMin, tuning.elMax);
+        swingAz_ = swingEl_ = 0;
         recoverHold_ = armed && held;
         phase_ = SwingPhase::Recover;
         phaseTime_ = 0;
@@ -618,14 +1140,14 @@ void MeleeState::Update(float dt, bool held, bool armed, const Vec3& right,
       if (phaseTime_ >= tuning.recoverTime) {
         phase_ = (armed && held) ? SwingPhase::Guard : SwingPhase::Idle;
         phaseTime_ = 0;
-        swing_ = Vec3{};
+        swingAz_ = swingEl_ = swingOut_ = 0;
       }
       break;
   }
 
-  // ---- the hand ------------------------------------------------------------
-  // ONE control law for every live phase: the mouse moves the hand, and the
-  // hand stays where it was moved to. Nothing here reads a pose to return to,
+  // ---- integrate the stroke ------------------------------------------------
+  // ONE control law for every live phase: the input moves the point, and the
+  // point stays where it was moved to. Nothing here reads a pose to return to,
   // which is what makes the blade aimable — you can put it high on the right
   // and leave it there, and the next push starts from there.
   //
@@ -633,66 +1155,73 @@ void MeleeState::Update(float dt, bool held, bool armed, const Vec3& right,
   // moving during those 170 ms and the arc below is added on top, so a cut is
   // the player's own travel plus a follow-through rather than a canned stroke
   // that ignores the second half of the flick.
-  if (phase_ != SwingPhase::Idle) {
-    handCam_ += Vec3{travel.dot(right), travel.dot(up), travel.dot(fwd)};
-    // Clamp to what the arm can actually reach. The stored value is clamped —
-    // not just the target handed to the IK — so pushing into the limit does not
-    // bank travel that has to be wound back before the arm moves again.
-    const float reach =
-        (armValid_ ? armReach_ : tuning.fallbackReach) * tuning.reachFraction;
-    const float d = handCam_.len();
-    if (reach > 1e-3f && d > reach) handCam_ = handCam_ * (reach / d);
+  //
+  // THE CLAMPS ARE ON THE STORED VALUE, not on a target derived from it. That
+  // is what stops a sustained push into a stop from banking travel that has to
+  // be wound back before the blade moves again.
+  if (phase_ != SwingPhase::Idle && !seededThisTick) {
+    az_ = std::clamp(az_ + delta.x * tuning.aimGainX, azLo, azHi);
+    el_ =
+        std::clamp(el_ - delta.y * tuning.aimGainY, tuning.elMin, tuning.elMax);
+    radius_ = std::clamp(radius_ + delta.z * tuning.reachGain, rLo, rHi);
   }
 
   switch (phase_) {
-    case SwingPhase::Idle:
-      // Let the arm hang; the walk cycle owns the pose. Decaying rather than
-      // snapping means a stale offset never re-enters as a jump.
-      hand_ = Lerp(hand_, Vec3{}, SmoothAlpha(0.12f, dt));
-      break;
-
     case SwingPhase::Slash: {
-      // The cut, as an offset ADDED to the hand the player is steering: the
-      // blade travels from the near side of the cut direction, through where
-      // the hand is, out to the far side, so the weapon passes ACROSS the
-      // player's front rather than poking outward. `t` is eased so the middle
-      // of the stroke is the fast part, which is both how a real cut works and
-      // what makes the speed-scaled damage land at the middle of the arc where
-      // the player aimed.
+      // THE CUT, as an arc ADDED to the stroke the player is steering: the
+      // point travels from the near side of the cut direction, through where
+      // the player has it aimed, out to the far side — so the blade passes
+      // ACROSS the wielder's front rather than poking outward. `t` is eased so
+      // the middle of the stroke is the fast part, which is both how a real cut
+      // works and what makes the speed-scaled damage land at the middle of the
+      // arc where the player aimed.
       //
-      // The arc BOWS OUTWARD (the fwd term) instead of being a straight slide:
-      // an arm swings about a shoulder, so the hand is furthest from the body
-      // at mid-stroke. That bulge is also what carries the blade through a
-      // target rather than past it.
-      float t = std::clamp(phaseTime_ / std::max(tuning.slashTime, 1e-4f), 0.0f,
-                           1.0f);
-      float e = t * t * (3.0f - 2.0f * t);           // smoothstep
-      float bow = 4.0f * e * (1.0f - e);             // 0 at the ends, 1 mid
-      swing_ = cutDir_ * (tuning.swingReach * (e - 0.5f)) +
-               fwd * (bow * tuning.swingReach * 0.28f);
+      // The arc BOWS OUTWARD (swingOut_) instead of holding one radius: an arm
+      // swings about a shoulder and is furthest from the body at mid-stroke.
+      // That bulge is also what carries the blade through a target rather than
+      // past it, and it is the radial channel earning its keep.
+      const float t =
+          std::clamp(phaseTime_ / std::max(tuning.slashTime, 1e-4f), 0.0f, 1.0f);
+      const float e = t * t * (3.0f - 2.0f * t);   // smoothstep
+      const float bow = 4.0f * e * (1.0f - e);     // 0 at the ends, 1 mid
+      // The anticipation rides on the same bow, so it is zero at both ends:
+      // no pop on the tick that commits, and the arc still finishes at exactly
+      // one `swingArc` for the fold above to absorb.
+      const float drive = e - tuning.swingAnticipate * bow;
+      swingAz_ = cutAz_ * tuning.swingArc * drive;
+      swingEl_ = cutEl_ * tuning.swingArc * drive;
+      swingOut_ = bow * tuning.swingExtend * tipReach;
       break;
     }
 
-    case SwingPhase::Recover:
-      // Unwind only the follow-through. The steered position is untouched, so a
-      // cut ENDS where the mouse ended — the arm does not spring back to a
+    case SwingPhase::Recover: {
+      // Unwind only the follow-through. The steered stroke is untouched, so a
+      // cut ENDS where the mouse ended — the blade does not spring back to a
       // guard the player never asked for.
-      swing_ = Lerp(swing_, Vec3{}, SmoothAlpha(0.07f, dt));
+      const float k = SmoothAlpha(0.07f, dt);
+      swingAz_ += (0.0f - swingAz_) * k;
+      swingEl_ += (0.0f - swingEl_) * k;
+      swingOut_ += (0.0f - swingOut_) * k;
       break;
+    }
 
     default:
       break;
   }
 
-  if (phase_ != SwingPhase::Idle) {
-    hand_ = right * handCam_.x + up * handCam_.y + fwd * handCam_.z + swing_;
+  if (phase_ == SwingPhase::Idle) {
+    // Let the arm hang; the walk cycle owns the pose. Decaying rather than
+    // snapping means a stale offset never re-enters as a jump.
+    const float k = SmoothAlpha(0.12f, dt);
+    hand_ = Lerp(hand_, Vec3{}, k);
+    tip_ = Lerp(tip_, Vec3{}, k);
+    framePrimed_ = false;
+  } else if (!seededThisTick) {
+    RebuildFrame(dt, right, up, fwd);
   }
-  // The blade is NOT re-aimed: it keeps the angle the fist holds it at, and the
-  // arm is what moves (see Mob::SetWeaponPose). These two are reported for the
-  // HUD only.
-  bladeDir_ = up;
-  bladeUp_ = fwd;
 
   if (bladeDir_.len() < 1e-4f) bladeDir_ = up;
-  if (bladeUp_.len() < 1e-4f) bladeUp_ = fwd;
+  if (bladeFlat_.len() < 1e-4f) bladeFlat_ = fwd;
+  if (bendPole_.len() < 1e-4f) bendPole_ = fwd * -1.0f;
 }
+

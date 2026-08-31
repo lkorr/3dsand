@@ -291,6 +291,13 @@ def main():
             "from": SWORD_GRIP + SWORD_GUARD,
             "to": SWORD_LEN,
             "axis": [1, 0, 0],
+            # WHICH WAY THE FLAT FACES. sword_vox builds the blade wide in y
+            # and THIN IN Z, so +z is the face — the same constant the mesh is
+            # cut from, for the same reason `from`/`to` are emitted here rather
+            # than measured by eye in C++. The stroke driver rolls the blade so
+            # the edge leads the cut and the damage sweep scales a hit by how
+            # edge-on it was; both read this, and neither can derive it.
+            "flat": [0, 0, 1],
             "halfWidth": SWORD_HALF_W,
         },
         # Jiggle, carried over from the rig prop: a held weapon that is welded

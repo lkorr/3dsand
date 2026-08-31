@@ -1242,76 +1242,25 @@ void PlayerAvatar::UpdateAnimation(float dt, World& world, bool grounded,
     }
   }
 
-  // ---- weapon arm (game/melee.h) -------------------------------------------
+  // ---- stage 5.5: the weapon arm (game/melee.h) ---------------------------
   // The swing is driven by aiming the WEAPON ARM's IK chain at a point derived
-  // from the mouse. Doing it through the existing chain rather than as a
-  // bespoke clip is what makes it compose with everything else: the legs keep
+  // from the stroke driver. Doing it through the existing chain rather than as
+  // a bespoke clip is what makes it compose with everything else: the legs keep
   // walking, the gait keeps running, dismemberment still disables the chain (a
-  // severed arm simply stops solving and the sword falls), and a mob could
-  // swing the same way through the same call.
+  // severed arm simply stops solving and the sword falls), and a mob swings the
+  // same way through the same call.
   //
-  // THE BLADE IS NOT AIMED — THE ARM IS. The sword keeps the orientation its
-  // rig gives it, fixed relative to the hand, so it stays orthogonal to the
-  // forearm through the whole swing exactly as a gripped weapon does. Clicking
-  // buys you CONTROL OF THE ARM, not a blade that re-points itself.
+  // THE IMPLEMENTATION IS ON Mob, NOT HERE. It used to be inline in this pass,
+  // which meant the avatar could swing and an NPC could not — and Phase C's
+  // attacking mobs would have had to grow a second copy that drifted. The long
+  // notes about the mirrored-authoring x flip, about what the pole does, and
+  // about why nothing may rotate the held part after the flatten now live next
+  // to the code they describe, in Mob::ApplyWeaponArm.
   //
-  // An earlier version rotated the held part toward the cut direction every
-  // tick. That was wrong twice over: the sword swivelled in the fist (pointing
-  // "directly out" mid-swing instead of holding its grip angle), and because
-  // the override wrote model[] after the flatten, it fought the pose pipeline
-  // and dragged the walk off its authored stride — which read as a leg bug,
-  // not a weapon one.
-  //
-  // POST-PROCESS, LIKE THE LEGS. Same rule as the note above: IK is applied to
-  // the flattened pose, never blended as a layer. `weaponWeight_` fades the
-  // solve itself, which AnimSolveTwoBone already supports.
-  if (weaponWeight_ > 0.0f && heldPartIndex_ >= 0 && !sk.chains.empty()) {
-    Quat yaw = AxisAngle({0, 1, 0}, heading_);
-    // The weapon arm is the one whose hand is this prop's ancestor. Deriving it
-    // from the rig rather than hardcoding "arm.R" means a left-handed rig, or
-    // a second weapon, needs no change here.
-    int handPart = sk.parts[heldPartIndex_].parent;
-    for (size_t c = 0; c < sk.chains.size(); c++) {
-      const IkChain& ch = sk.chains[c];
-      if (ch.tag != "arm" || ch.effector != handPart) continue;
-      float weight = ch.weight * weaponWeight_;
-      if (weight <= 0) continue;
-      // The shoulder in model space is the chain root's anchor; the target is
-      // the mouse-driven offset from it. The offset arrives in WORLD space
-      // (main.cpp built it from the camera basis), so it is un-yawed into the
-      // rig's frame here — the same conversion the legs do one block up.
-      //
-      // THEN X IS NEGATED, and that is not a fudge — but the reason is the ART,
-      // not the loader. (An earlier note here blamed the .vox -> engine map
-      // (x, z, -y) for "flipping handedness". It does not: that matrix has
-      // determinant +1 and voxload.cpp says so at the conversion — chirality is
-      // preserved. Believing otherwise invites "fixing" the legs one block up
-      // by adding a matching negation, which would be wrong.)
-      //
-      // The real cause is that these rigs are AUTHORED mirrored: every def puts
-      // .L at the HIGHER engine x and .R at the lower (asha: armU.L x=28 vs
-      // armU.R x=4, legU.L x=21 vs legU.R x=11), so model +X is the character's
-      // LEFT. Un-yawing alone therefore lands camera-RIGHT on the model's LEFT:
-      // measured at six yaws, RotateInv(yaw, camera Right) is model +X every
-      // time. Without this flip the mouse drives the weapon arm to the mirrored
-      // side — you could reach across your chest but not out to the side you
-      // were actually pointing at. Z (forward) is unaffected: the toe of the
-      // shoe sits at model +Z, which is where camera-forward lands.
-      //
-      // The target is prefab-absolute, like the legs: `shoulder` is anchorLocal
-      // and st.model[] already carries the root offset, so nothing is rebased.
-      Vec3 shoulder = sk.parts[ch.parts[0]].anchorLocal;
-      Vec3 handRig = RotateInv(yaw, weaponHand_);
-      handRig.x = -handRig.x;
-      Vec3 targetLocal = shoulder + handRig;
-      AnimSolveTwoBone(sk, st, ch, targetLocal, weight);
-      break;
-    }
-    // NOTHING ROTATES THE BLADE HERE, deliberately — see the note above. The
-    // sword is a child of the hand and AnimFlatten has already composed it
-    // against whatever the arm solve produced, so it rides the fist with its
-    // authored grip angle intact.
-  }
+  // POST-PROCESS, LIKE THE LEGS: applied to the flattened pose, never blended
+  // as a layer. `weaponWeight_` fades the solve itself.
+  PoseAxisOverride weaponHinge;
+  ApplyWeaponArm(sk, st, weaponHinge);
 
   // ---- ledge-hang arms: pin the PALMS to the held lip ----------------------
   //
@@ -1476,7 +1425,22 @@ void PlayerAvatar::UpdateAnimation(float dt, World& world, bool grounded,
   // torso" stop being things a gate has to notice after the fact and become
   // unrepresentable: the hip simply cannot reach those angles, whatever target
   // the solver was handed. Rigs that author no `poseLimit` pay one bool test.
-  AnimClampPoseLimits(sk, st);
+  //
+  // The weapon arm hands in ONE exception, and only while a stroke is live: the
+  // elbow's hinge PLANE is steered into the plane of the cut. Its RANGE is not
+  // touched, so the joint stays exactly as impossible to hyperextend as it was
+  // — see anim.h PoseAxisOverride for why a steered plane is the anatomically
+  // honest answer and not a loophole.
+  //
+  // FORGETTING THE OVERRIDE HERE IS SILENT AND EXPENSIVE. It was, for four
+  // measured runs: the solve reached its target (`ikMiss 0.00` every tick) and
+  // the clamp then discarded the whole off-plane component of the elbow, so the
+  // arm arrived up to 2.9 voxels from where the stroke asked with every
+  // in-pipeline probe reporting success. Mob::RecordWeaponClamp is what makes
+  // that visible now, and it only runs if it is called — which is why it sits
+  // on the same line.
+  AnimClampPoseLimits(sk, st, &weaponHinge, 1);
+  RecordWeaponClamp(sk, st);
 }
 
 // ---- per-tick ---------------------------------------------------------------

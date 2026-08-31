@@ -438,6 +438,20 @@ bool LoadMobDefs(const std::string& dir, const std::vector<MaterialDef>& mats,
         ld.edgeFrom = axEngine * e.value("from", 0.0f);
         ld.edgeTo = axEngine * e.value("to", 0.0f);
         ld.edgeHalfWidth = e.value("halfWidth", 1.0f);
+        // The flat, through the same axis map. A DIRECTION, so it takes no
+        // art-to-world scaling below; orthogonalized against the edge so two
+        // nearly-perpendicular authored axes cannot shear the roll.
+        if (e.contains("flat") && e["flat"].size() == 3) {
+          Vec3 fl{e["flat"][0].get<float>(), e["flat"][1].get<float>(),
+                  e["flat"][2].get<float>()};
+          Vec3 flEngine{fl.x, fl.z, -fl.y};
+          const Vec3 along = axEngine.normalized();
+          flEngine = flEngine - along * along.dot(flEngine);
+          if (flEngine.len() > 1e-4f) {
+            ld.edgeFlat = flEngine.normalized();
+            ld.hasEdgeFlat = true;
+          }
+        }
       }
       if (l.contains("spring") && l["spring"].is_object()) {
         ld.hasSpring = true;
@@ -2210,10 +2224,18 @@ void MobSystem::UpdateAnimation(Mob& mob, const MobDef& def, World& world,
     }
   }
 
+  // ---- stage 5.5: the weapon arm (game/melee.h) ----
+  // THE SAME CALL THE AVATAR MAKES. An NPC swings by being handed a WeaponPose
+  // — from an authored stroke curve, or from anything else that can produce
+  // one — and gets the player's arm, not an approximation of it.
+  PoseAxisOverride weaponHinge;
+  mob.ApplyWeaponArm(sk, st, weaponHinge);
+
   // ---- stage 6: the pose has to be anatomically possible ----
   // After every solve, never between them: the IK is what puts a joint out of
   // range, so clamping earlier would only clamp a pose about to be replaced.
-  AnimClampPoseLimits(sk, st);
+  AnimClampPoseLimits(sk, st, &weaponHinge, 1);
+  mob.RecordWeaponClamp(sk, st);
 
   // ---- flipbooks: integer frame index from elapsed ms ----
   if (st.flipbook.book >= 0 && st.flipbook.book < (int)sk.flipbooks.size()) {
@@ -5487,6 +5509,8 @@ bool Mob::EquipItem(const ItemDef* item, const char* context) {
   ld.edgeFrom = item->edgeFrom;
   ld.edgeTo = item->edgeTo;
   ld.edgeHalfWidth = item->edgeHalfWidth;
+  ld.hasEdgeFlat = item->hasEdgeFlat;
+  ld.edgeFlat = item->edgeFlat;
   ld.microModel = item->microModel;
 
   AnimPart& ap = skel_.parts[slot];
@@ -6342,17 +6366,332 @@ uint32_t Mob::WornAlong(int bodyLimb, const Vec3& from, const Vec3& dir,
   return 0;
 }
 
-void Mob::SetWeaponPose(Vec3 handOffset, Vec3 bladeDir, Vec3 bladeUp,
+// ---- the weapon arm, shared by both animation drivers -----------------------
+//
+// THE ARM SERVES THE BLADE. Three things happen here and they are in this order
+// for a reason:
+//
+//   1. THE CHAIN IS SOLVED AT THE HAND, with the driver's own BEND POLE rather
+//      than the chain's authored one. The pole is what picks the bend plane, so
+//      handing it the stroke's tangent is what makes the elbow extend THROUGH
+//      the cut instead of bulging in a fixed direction the cut knows nothing
+//      about.
+//   2. THE ELBOW'S HINGE PLANE FOLLOWS. The forearm is a strict hinge about an
+//      axis fixed in the upper arm's frame, and stage 6 DISCARDS whatever swing
+//      leaves that plane — so a bend plane the hinge disagrees with is a solve
+//      thrown away, and the hand lands short. The plane is reported to the
+//      clamp as an override (anim.h PoseAxisOverride); the RANGE is untouched.
+//   3. THE HAND IS ORIENTED so the blade points along the stroke. This is the
+//      channel that never existed: the sword is a rigid child of the fist, so
+//      the ONLY way to aim it is to aim the hand.
+//
+// AND NOTHING ROTATES THE HELD PART. That bug has shipped once already: an
+// earlier version re-aimed the sword by writing its model transform after the
+// flatten, which made it swivel in the fist AND fought the pose pipeline hard
+// enough to drag the walk cycle off its stride — a weapon bug that read as a
+// leg bug. The blade is steered by the WRIST, through the same
+// `itemQ = handQ * gripRot` composition that has always placed it, and the
+// wrist's travel away from a rigidly-following hand is clamped so it stays a
+// wrist rather than becoming a ball joint.
+void Mob::ApplyWeaponArm(const AnimSkeleton& sk, AnimState& st,
+                         PoseAxisOverride& ov) const {
+  ov = PoseAxisOverride{};
+  weaponDiag_ = WeaponArmDiag{};
+  if (weaponWeight_ <= 0.0f || heldPartIndex_ < 0 || sk.chains.empty()) return;
+  if ((size_t)heldPartIndex_ >= sk.parts.size()) return;
+  // The weapon arm is the one whose hand is this prop's ancestor. Deriving it
+  // from the rig rather than hardcoding "arm.R" means a left-handed rig, or a
+  // second weapon, needs no change here.
+  const int handPart = sk.parts[heldPartIndex_].parent;
+  if (handPart < 0 || (size_t)handPart >= st.model.size()) return;
+  const IkChain* chain = nullptr;
+  for (const IkChain& ch : sk.chains)
+    if (ch.tag == "arm" && ch.effector == handPart && ch.parts.size() >= 2) {
+      chain = &ch;
+      break;
+    }
+  if (!chain) return;
+  const float weight = chain->weight * weaponWeight_;
+  if (weight <= 0.0f) return;
+
+  const Quat yaw = AxisAngle({0, 1, 0}, heading_);
+  // WORLD/CAMERA -> RIG. The offset arrives in the basis the driver was handed
+  // (main.cpp builds it from the camera), so it is un-yawed into the rig's
+  // frame — the same conversion the legs do.
+  //
+  // THEN X IS NEGATED, and that is not a fudge — but the reason is the ART, not
+  // the loader. (An earlier note here blamed the .vox -> engine map (x, z, -y)
+  // for "flipping handedness". It does not: that matrix has determinant +1 and
+  // voxload.cpp says so at the conversion — chirality is preserved. Believing
+  // otherwise invites "fixing" the legs by adding a matching negation, which
+  // would be wrong.)
+  //
+  // The real cause is that these rigs are AUTHORED mirrored: every def puts .L
+  // at the HIGHER engine x and .R at the lower (asha: armU.L x=28 vs armU.R
+  // x=4), so model +X is the character's LEFT. Un-yawing alone therefore lands
+  // camera-RIGHT on the model's LEFT: measured at six yaws, RotateInv(yaw,
+  // camera Right) is model +X every time. Without this flip the mouse drives
+  // the weapon arm to the mirrored side — you could reach across your chest but
+  // not out to the side you were actually pointing at. Z (forward) is
+  // unaffected: the toe of the shoe sits at model +Z, which is where
+  // camera-forward lands.
+  //
+  // IT IS A REFLECTION, so a FRAME cannot be mapped axis by axis: three mapped
+  // basis vectors come out left-handed and the rotation built from them would
+  // be a mirror, not a rotation. Directions are mapped; the third axis of every
+  // frame below is rebuilt with a cross product ON THE RIG SIDE.
+  auto toRig = [&](Vec3 v) {
+    Vec3 r = RotateInv(yaw, v);
+    r.x = -r.x;
+    return r;
+  };
+
+  // THE LIVE SHOULDER, not the rest anchor. `anchorLocal` is where the joint
+  // sits in the BIND pose, and the two are not the same point once anything
+  // above the arm has moved: this rig leans its spine to the look direction and
+  // bobs its pelvis with the gait, so the real shoulder wanders a couple of
+  // voxels from its authored anchor every stride.
+  //
+  // That mattered because AnimSolveTwoBone measures its own reach from
+  // `st.model[i0].pos` — the live joint — while the target was being built from
+  // the static one. The solve then landed the hand exactly where it was asked,
+  // in a frame two voxels off the one the caller was speaking, and a gate
+  // measuring the blade about the ACTUAL shoulder read a 3-voxel miss with
+  // every in-pipeline probe reporting zero. Both ends use the live joint now,
+  // and Mob::WeaponArmPose inverts against the same one.
+  //
+  // It is also the better contract: a stroke is an arc about the shoulder you
+  // have, so leaning the torso carries the blade with it instead of sliding it
+  // off the arc.
+  const int i0 = chain->parts[0], i1 = chain->parts[1];
+  const Vec3 shoulder = st.model[i0].pos;
+  const Vec3 targetLocal = shoulder + toRig(weapon_.hand);
+
+  IkChain steer = *chain;
+  if (weapon_.steerBlade && weapon_.bendPole.len() > 1e-4f) {
+    const Vec3 p = toRig(weapon_.bendPole);
+    if (p.len() > 1e-4f) steer.pole = p;
+  }
+  AnimSolveTwoBone(sk, st, steer, targetLocal, weight);
+  weaponDiag_.ran = true;
+  if (chain->effector >= 0 && (size_t)chain->effector < st.model.size())
+    weaponDiag_.ikMiss = (st.model[chain->effector].pos - targetLocal).len();
+
+  if (!weapon_.steerBlade) return;
+  if ((size_t)i0 >= st.model.size() || (size_t)i1 >= st.model.size()) return;
+
+  // ---- 2. the elbow's hinge plane follows the bend --------------------------
+  {
+    const AnimPart& fore = sk.parts[i1];
+    const int forePar = fore.parent;
+    if (fore.hasPoseLimit && fore.poseHinge && forePar >= 0 &&
+        (size_t)forePar < st.model.size()) {
+      // THE PLANE FROM THE SOLVER'S OWN INPUTS, not from the bones it produced.
+      //
+      // The obvious source is `upper x lower`, and it is the wrong one: at a
+      // nearly straight elbow that cross product is short and its DIRECTION is
+      // almost pure noise, so the clamp projects the forearm onto a plane
+      // chosen at random — which reads as the arm snapping to a different pose
+      // the instant the elbow nears extension. Guarding on the bend angle only
+      // moves the problem: below the guard the AUTHORED axis takes over, and
+      // that one is not the solve's plane either, so the clamp discards the
+      // whole off-plane swing and drags the hand three voxels off its target.
+      // (Measured: `clampRot 1.23 shift 2.88` on exactly the ticks where the
+      // arm passed through extension.)
+      //
+      // The two-bone solver derives its bend plane from the POLE and the
+      // shoulder-to-target line, and that pair is well conditioned at every
+      // bend — including none — because the pole is built perpendicular to the
+      // arm in the first place. Same two vectors, same cross product, same
+      // order as AnimSolveTwoBone's `bendAxis`.
+      const Vec3 toTarget = targetLocal - st.model[i0].pos;
+      Vec3 n{};
+      if (toTarget.len() > 1e-4f) {
+        const Vec3 dirTarget = toTarget.normalized();
+        Vec3 pole = steer.pole.normalized();
+        Vec3 polePerp = pole - dirTarget * dirTarget.dot(pole);
+        if (polePerp.len() > 1e-4f)
+          n = polePerp.normalized().cross(dirTarget);
+      }
+      if (n.len() > 1e-3f) {
+        n = n.normalized();
+        // Into the frame the clamp states its axis in: parent-relative, then
+        // rest-relative. `delta = conj(rest) * conj(model[par]) * model[i]`, so
+        // a right-multiplied rotation about model axis n is a rotation about
+        // inv(model[par] * rest) * n.
+        const Quat frame = QuatMul(st.model[forePar].rot, fore.rest.rot);
+        Vec3 axis = QuatRotateInv(frame, n.normalized());
+        // AND ITS SIGN IS NOT FREE. A hinge's range is authored [0, 130], so an
+        // axis whose sense makes the SOLVED bend negative is clamped straight
+        // to zero — a 70-degree correction that throws the arm across the room.
+        // Either sense names the same plane, so pick the one the elbow is
+        // actually bent about by measuring, not by matching the authored axis:
+        // when the pole swings round, the solver's plane genuinely flips
+        // relative to the authored one and matching would choose the wrong half
+        // every time. (Measured as `clampRot 1.23 shift 2.88`, on exactly the
+        // ticks where the stroke crossed the arm's own line.)
+        {
+          const Quat delta =
+              QuatNormalize(QuatMul(QuatConj(fore.rest.rot),
+                                    QuatMul(QuatConj(st.model[forePar].rot),
+                                            st.model[i1].rot)));
+          const Vec3 v{delta.x, delta.y, delta.z};
+          const float d = v.dot(axis);
+          const float mag = std::sqrt(d * d + delta.w * delta.w);
+          if (mag > 1e-5f) {
+            const float ang = 2.0f * std::atan2(d / mag, delta.w / mag);
+            if (ang < 0.0f) axis = axis * -1.0f;
+          }
+        }
+        ov.part = i1;
+        ov.axis = axis;
+        ov.blend = weight;
+      }
+    }
+  }
+
+  // ---- 3. the hand carries the blade ---------------------------------------
+  //
+  // The blade's own axes in the HAND's frame are rig facts, not constants:
+  // `rest.rot` on the held slot is the authored grip rotation, and the edge
+  // block says which way the blade and its flat run in the item's own box. The
+  // composition below is the same one the submit path uses to place the item
+  // (itemQ = handQ * gripRot), read backwards.
+  if (heldPartIndex_ >= (int)limbDefs_.size()) return;
+  const MobLimbDef& ld = limbDefs_[heldPartIndex_];
+  if (!ld.hasEdge) return;
+  const Quat gripRot = sk.parts[heldPartIndex_].rest.rot;
+  Vec3 bladeHand = QuatRotate(gripRot, (ld.edgeTo - ld.edgeFrom));
+  if (bladeHand.len() < 1e-4f) return;
+  bladeHand = bladeHand.normalized();
+  Vec3 flatHand = ld.hasEdgeFlat ? QuatRotate(gripRot, ld.edgeFlat) : Vec3{};
+  flatHand = flatHand - bladeHand * bladeHand.dot(flatHand);
+  const bool haveFlat = flatHand.len() > 1e-4f;
+  if (haveFlat) flatHand = flatHand.normalized();
+
+  Vec3 wantDir = toRig(weapon_.bladeDir);
+  if (wantDir.len() < 1e-4f) return;
+  wantDir = wantDir.normalized();
+  Vec3 wantFlat = toRig(weapon_.bladeFlat);
+  wantFlat = wantFlat - wantDir * wantDir.dot(wantFlat);
+
+  // Aim the blade first, then ROLL about it. Two steps rather than a
+  // frame-to-quaternion because only the first is always well-posed: a blade
+  // with no authored flat has no roll to match, and the roll term simply drops
+  // out instead of the whole solve becoming degenerate.
+  Quat want = QuatFromTo(bladeHand, wantDir);
+  if (haveFlat && wantFlat.len() > 1e-4f) {
+    wantFlat = wantFlat.normalized();
+    const Vec3 cur = QuatRotate(want, flatHand);
+    const float s = cur.cross(wantFlat).dot(wantDir);
+    const float c = cur.dot(wantFlat);
+    if (std::fabs(s) > 1e-6f || std::fabs(c) > 1e-6f)
+      want = QuatMul(QuatAxisAngle(wantDir, std::atan2(s, c)), want);
+  }
+
+  // THE WRIST IS A WRIST. `want` is the orientation the blade needs; the hand
+  // is only allowed to travel so far from the one the solved forearm gives it
+  // for free. Without this the "wrist" quietly becomes a ball joint and the
+  // fist can end up facing backwards down its own arm — humanly impossible, and
+  // the sort of thing that reads as the sword having come loose.
+  const Quat rigid = st.model[handPart].rot;
+  Quat delta = QuatNormalize(QuatMul(want, QuatConj(rigid)));
+  {
+    const float wAbs = std::fabs(delta.w) > 1.0f ? 1.0f : std::fabs(delta.w);
+    const float ang = 2.0f * std::acos(wAbs);
+    const float lim = std::max(weapon_.wristMaxAngle, 0.0f);
+    weaponDiag_.wristWant = ang;
+    weaponDiag_.wristApplied = std::min(ang, lim);
+    if (ang > lim && ang > 1e-4f)
+      delta = QuatSlerp(Quat{0, 0, 0, 1}, delta, lim / ang);
+  }
+  const Quat handRot = QuatNormalize(QuatMul(delta, rigid));
+  st.model[handPart].rot = QuatSlerp(rigid, handRot, weight);
+  weaponHandPreClamp_ = st.model[handPart].rot;
+  weaponHandPosPreClamp_ = st.model[handPart].pos;
+  weaponUpPreClamp_ = st.model[i0].rot;
+  weaponLoPreClamp_ = st.model[i1].rot;
+  weaponHandPart_ = handPart;
+  weaponUpPart_ = i0;
+  weaponLoPart_ = i1;
+
+  // Everything hanging off the hand — the sword, a gauntlet shell — follows
+  // rigidly. Parents-first storage makes this one linear sweep: a part is
+  // re-flattened exactly when its parent was, so a grandchild is carried too.
+  static thread_local std::vector<uint8_t> moved;
+  moved.assign(sk.parts.size(), 0);
+  moved[handPart] = 1;
+  for (size_t k = (size_t)handPart + 1; k < sk.parts.size(); k++) {
+    const int par = sk.parts[k].parent;
+    if (par < 0 || !moved[par]) continue;
+    moved[k] = 1;
+    if (k >= st.model.size() || k >= st.local.size()) continue;
+    st.model[k].rot = QuatNormalize(QuatMul(st.model[par].rot, st.local[k].rot));
+    st.model[k].pos =
+        st.model[par].pos + QuatRotate(st.model[par].rot, st.local[k].pos);
+  }
+}
+
+void Mob::RecordWeaponClamp(const AnimSkeleton& sk, const AnimState& st) const {
+  (void)sk;
+  if (!weaponDiag_.ran || weaponHandPart_ < 0) return;
+  if ((size_t)weaponHandPart_ >= st.model.size()) return;
+  auto turn = [](const Quat& a, const Quat& b) {
+    const Quat d = QuatNormalize(QuatMul(a, QuatConj(b)));
+    return 2.0f * std::acos(std::min(1.0f, std::fabs(d.w)));
+  };
+  weaponDiag_.clampMove =
+      turn(st.model[weaponHandPart_].rot, weaponHandPreClamp_);
+  weaponDiag_.clampShift =
+      (st.model[weaponHandPart_].pos - weaponHandPosPreClamp_).len();
+  if (weaponUpPart_ >= 0 && (size_t)weaponUpPart_ < st.model.size())
+    weaponDiag_.shoulderClamp =
+        turn(st.model[weaponUpPart_].rot, weaponUpPreClamp_);
+  if (weaponLoPart_ >= 0 && (size_t)weaponLoPart_ < st.model.size())
+    weaponDiag_.elbowClamp = turn(st.model[weaponLoPart_].rot, weaponLoPreClamp_);
+  // AND THE ROUND TRIP, at the end of the pass: WeaponArmPose's own arithmetic
+  // run against the pose that is about to be submitted. A caller reading a hand
+  // that disagrees with the one the solve reached has to be able to tell WHICH
+  // of the two is lying, and only a probe on this side of the pass can say.
+  if (weaponUpPart_ >= 0) {
+    Vec3 handRig =
+        st.model[weaponHandPart_].pos - st.model[weaponUpPart_].pos;
+    handRig.x = -handRig.x;
+    const Vec3 got = QuatRotate(QuatAxisAngle({0, 1, 0}, heading_), handRig);
+    weaponDiag_.cmdHand = weapon_.hand;
+    weaponDiag_.gotHand = got;
+    weaponDiag_.roundTrip = (got - weapon_.hand).len();
+  }
+}
+
+void Mob::SetWeaponPose(const WeaponPose& pose) {
+  weapon_ = pose;
+  // Normalize ONCE, on the way in, rather than at each of the four places the
+  // animation pass reads them. A zero vector keeps the previous value: a
+  // driver that has nothing to say about the roll this tick must not blank it.
+  if (pose.bladeDir.len() > 1e-4f) weapon_.bladeDir = pose.bladeDir.normalized();
+  if (pose.bladeFlat.len() > 1e-4f)
+    weapon_.bladeFlat = pose.bladeFlat.normalized();
+  if (pose.bendPole.len() > 1e-4f) weapon_.bendPole = pose.bendPole.normalized();
+  weaponWeight_ = pose.weight < 0 ? 0 : (pose.weight > 1 ? 1 : pose.weight);
+  weapon_.weight = weaponWeight_;
+}
+
+void Mob::SetWeaponPose(Vec3 handOffset, Vec3 bladeDir, Vec3 bladeFlat,
                         float weight) {
-  weaponHand_ = handOffset;
-  // bladeDir/bladeUp are accepted but NOT applied to the held part: the blade
-  // keeps its grip angle and only the ARM is driven (the weapon-arm block in
-  // the driver's animation pass). Kept in the signature because the caller
-  // computes them anyway, and a weapon that genuinely does re-aim in the hand
-  // — a levelled spear, a raised shield — would want them.
-  if (bladeDir.len() > 1e-4f) weaponDir_ = bladeDir.normalized();
-  if (bladeUp.len() > 1e-4f) weaponUp_ = bladeUp.normalized();
-  weaponWeight_ = weight < 0 ? 0 : (weight > 1 ? 1 : weight);
+  // THE LEGACY CONTRACT, preserved exactly: drive the arm at `handOffset` and
+  // leave the blade at whatever grip angle the fist gives it. `steerBlade`
+  // false is what says so, and it also leaves the elbow on its AUTHORED hinge
+  // axis — which is why the pose-limit gates, whose whole subject is that
+  // authored axis, must keep using this form rather than the stroke driver's.
+  WeaponPose p;
+  p.hand = handOffset;
+  p.bladeDir = bladeDir;
+  p.bladeFlat = bladeFlat;
+  p.bendPole = Vec3{};        // keep whatever is there; nothing steers it
+  p.weight = weight;
+  p.steerBlade = false;
+  SetWeaponPose(p);
 }
 
 bool Mob::WeaponArmPose(Vec3& outHandFromShoulder, float& outReach) const {
@@ -6376,10 +6715,12 @@ bool Mob::WeaponArmPose(Vec3& outHandFromShoulder, float& outReach) const {
     if (i0 < 0 || i1 < 0 || (size_t)i0 >= anim_.model.size() ||
         (size_t)i1 >= anim_.model.size())
       continue;
-    // Prefab-absolute, measured from the chain root's anchor — the same pair
-    // the solve's target is built from (`shoulder + handRig`), so handRig is
-    // recovered exactly rather than approximately.
-    Vec3 handRig = anim_.model[handPart].pos - skel_.parts[i0].anchorLocal;
+    // Measured from the chain root's LIVE joint — the same point the solve's
+    // target is built from (`shoulder + handRig`), so handRig is recovered
+    // exactly rather than approximately. It was the rest anchor until a
+    // leaning spine put the two a couple of voxels apart; see the long note at
+    // ApplyWeaponArm for what that cost.
+    Vec3 handRig = anim_.model[handPart].pos - anim_.model[i0].pos;
     handRig.x = -handRig.x;                       // the mirrored-authoring flip
     outHandFromShoulder = Rotate(AxisAngle({0, 1, 0}, heading_), handRig);
     // Reach from the LIVE bone lengths rather than a constant: it follows the
@@ -6398,7 +6739,52 @@ bool Mob::WeaponArmPose(Vec3& outHandFromShoulder, float& outReach) const {
   return false;
 }
 
-bool Mob::WeaponEdge(Vec3& outBase, Vec3& outTip, float& outHalfWidth) const {
+bool Mob::WeaponStrokePose(Vec3& outHandFromShoulder, Vec3& outTipFromShoulder,
+                           Vec3& outFlat, float& outReach) const {
+  // The hand and the reach come from the existing inverse; everything below is
+  // the BLADE half, and it is derived from the same anim_.model[] pose so the
+  // two ends of the seed are in one frame.
+  if (!WeaponArmPose(outHandFromShoulder, outReach)) return false;
+  outTipFromShoulder = outHandFromShoulder;
+  outFlat = Vec3{};
+  if (heldPartIndex_ < 0 || heldPartIndex_ >= (int)limbDefs_.size())
+    return true;   // an empty fist still has an arm to steer
+  const MobLimbDef& ld = limbDefs_[heldPartIndex_];
+  if (!ld.hasEdge) return true;
+  if ((size_t)heldPartIndex_ >= anim_.model.size()) return true;
+  const int handPart = skel_.parts[heldPartIndex_].parent;
+  if (handPart < 0 || (size_t)handPart >= anim_.model.size()) return true;
+
+  // THE ITEM'S BODY ORIGIN IN MODEL SPACE. The submit path places the item at
+  // `socket - itemQ * gripBody_` and the authored edge is measured from that
+  // same origin (see WeaponEdge below), so the point in model space is
+  //     model[item].pos + model[item].rot * (edgeTo - gripBody_)
+  // and nothing needs rebasing. Deriving it rather than reading limb.xf is
+  // what keeps this one tick fresher than the physics body.
+  const Quat iq = anim_.model[heldPartIndex_].rot;
+  const Vec3 itemPos = anim_.model[heldPartIndex_].pos;
+  const Vec3 tipModel = itemPos + QuatRotate(iq, ld.edgeTo - gripBody_);
+  const Vec3 handModel = anim_.model[handPart].pos;
+
+  // Into the frame SetWeaponPose speaks: the tip is expressed RELATIVE TO THE
+  // HAND and then added to the hand offset the inverse already produced. Doing
+  // it that way rather than re-running the shoulder subtraction means the two
+  // ends cannot disagree about which shoulder anchor they used.
+  Vec3 rel = tipModel - handModel;
+  rel.x = -rel.x;                       // the mirrored-authoring flip
+  const Quat yaw = AxisAngle({0, 1, 0}, heading_);
+  outTipFromShoulder = outHandFromShoulder + Rotate(yaw, rel);
+
+  if (ld.hasEdgeFlat) {
+    Vec3 fl = QuatRotate(iq, ld.edgeFlat);
+    fl.x = -fl.x;
+    outFlat = Rotate(yaw, fl);
+  }
+  return true;
+}
+
+bool Mob::WeaponEdge(Vec3& outBase, Vec3& outTip, float& outHalfWidth,
+                     Vec3* outFlat) const {
   if (!def_ || heldPartIndex_ < 0) return false;
   if (heldPartIndex_ >= (int)limbDefs_.size()) return false;
   const MobLimbDef& ld = limbDefs_[heldPartIndex_];
@@ -6414,6 +6800,21 @@ bool Mob::WeaponEdge(Vec3& outBase, Vec3& outTip, float& outHalfWidth) const {
   outBase = p.xf.pos + QuatRotate(q, ld.edgeFrom);
   outTip = p.xf.pos + QuatRotate(q, ld.edgeTo);
   outHalfWidth = ld.edgeHalfWidth;
+  // The flat, through the SAME live transform — how edge-on a hit is is a fact
+  // about the pose the renderer just drew, exactly as the segment is. An item
+  // whose art never said which face is the flat reports a zero vector, and
+  // MeleeEdgeAlign reads that as "no evidence" rather than as a bad angle.
+  if (outFlat)
+    *outFlat = ld.hasEdgeFlat ? QuatRotate(q, ld.edgeFlat) : Vec3{};
+  return true;
+}
+
+bool Mob::PartJointWorld(int part, Vec3& out) const {
+  if (part < 0 || part >= (int)limbs_.size()) return false;
+  const MobLimb& l = limbs_[part];
+  if (!l.body) return false;
+  const Quat q{l.xf.quat[0], l.xf.quat[1], l.xf.quat[2], l.xf.quat[3]};
+  out = l.xf.pos + QuatRotate(q, l.anchorLimb);
   return true;
 }
 
