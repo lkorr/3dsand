@@ -559,6 +559,19 @@ struct MobLimb {
   int gushTicks = 0;
   Vec3 gushLocal{};
   Vec3 gushDir{0, 1, 0};
+  // HIT FLASH: a briefly-lit limb, in LINEAR HDR units, added on top of the
+  // material's own emission by the micro-body pass at shade time.
+  //
+  // PRESENTATION ONLY, and it lives here for the same reason `gushTicks` does:
+  // the thing that knows a limb was struck is the limb. Set in Damage() and in
+  // Sever(), decayed once per frame by DecayHitFlash() (frame time, not ticks —
+  // a flash is a length of time the player perceives, not a number of
+  // simulation steps), and read by AppendMicroInsts, which packs it into the
+  // spare word the GPU instance already had (sim/microbody.h
+  // MicroBodyInstGpu::pad0). Nothing in the sim reads it, it is not in the
+  // voxel word (there are no spare bits), it is not saved, and it is not
+  // hashed.
+  float hitFlash = 0;
   // A severed part is handed to DebrisSystem immediately but holds its last
   // animated pose KINEMATICALLY for a beat before flipping dynamic.
   uint64_t holdBody = 0;
@@ -1543,6 +1556,26 @@ class MobSystem {
     float intensity = 0;   // 0..1 of the bleed budget cap
   };
   const std::vector<BleedSource>& BleedSources() const { return bleeds_; }
+
+  // ---- hit flash ----------------------------------------------------------
+  // Decay every limb's hit flash by REAL elapsed time. Called once per FRAME
+  // from main.cpp, deliberately not from PreTick:
+  //
+  //   * a flash is a length of time the player perceives, so it must not run
+  //     at a different rate when the tick loop happens to run 0, 1 or 4 times
+  //     this frame — which it does, constantly, and which hit-stop makes worse
+  //     on purpose (sim/tuning.h Tuning::CombatFx);
+  //   * it is presentation state, so a tick has no business touching it.
+  //
+  // Exponential, with the halflife from combatfx.flashHalflife. Cost when
+  // nothing has been hit is one float compare per limb, and it early-outs on
+  // the whole system as soon as every flash has decayed to zero.
+  void DecayHitFlash(float dt);
+  // Light one limb up, by BODY HANDLE — the same key Damage() resolves, so a
+  // caller that already knows which body it hit does not have to find the limb
+  // a second way. Peak-held: a bigger flash arriving while a smaller one is
+  // still lit wins, and a smaller one never shortens a bigger one.
+  void FlashBody(uint64_t bodyHandle, float amount);
 
   // Render plumbing: limbs append after the debris bodies' slots.
   bool InstancesDirty() const { return instancesDirty_; }

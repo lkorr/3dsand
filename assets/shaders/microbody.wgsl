@@ -44,8 +44,14 @@ struct BodyXform {
 // bodyXf, and the model index. Compacted on the CPU so the draw's instance
 // count is exactly the number of micro bodies — zero of them means zero
 // instances and the pass is skipped entirely (rule 2).
+// `flash_bits` is the HIT FLASH as a float bit pattern (game/mob.h
+// MobLimb::hitFlash, packed by Mob::AppendMicroInsts). A reused padding word,
+// not a widened struct: the CPU mirror is sim/microbody.h MicroBodyInstGpu and
+// its 16-byte static_assert is the only mechanical guard the pair has — nothing
+// checks this layout, so the struct must not grow. 0 bitcasts to 0.0, which is
+// what debris bodies keep passing.
 struct MicroBodyInst {
-  slot : u32, model : u32, _a : u32, _b : u32,
+  slot : u32, model : u32, flash_bits : u32, _b : u32,
 };
 @group(1) @binding(3) var<storage, read> insts : array<MicroBodyInst>;
 
@@ -75,6 +81,11 @@ struct VSOut {
   @location(4) @interpolate(flat) base : u32,       // pool word offset
   @location(5) @interpolate(flat) scale : f32,      // micro voxels per world voxel
   @location(6) @interpolate(flat) slot : u32,       // ember flicker phase key
+  // Hit flash, linear HDR, added after lighting. FLAT and carried on the
+  // vertex output for the same reason everything else here is: refetching
+  // insts[] per fragment is a dependent storage load on every pixel a limb
+  // covers, for a value that is constant across the whole instance.
+  @location(7) @interpolate(flat) flash : f32,
 };
 
 // vi in 0..35 -> a corner of the unit box. Every face must wind the SAME way
@@ -145,6 +156,7 @@ fn vs(@builtin(vertex_index) vi : u32,
   out.base = m.base;
   out.scale = scale;
   out.slot = slot;
+  out.flash = bitcast<f32>(insts[inst].flash_bits);
   return out;
 }
 
@@ -284,7 +296,26 @@ fn fs(in : VSOut) -> FSOut {
   // and like the cube path's — one shared definition, in common.wgsl
   let fh = pcg(u32(c.x * 2917 + c.y * 131 + c.z * 7919) + in.slot * 977u);
   let emis = emberFlicker(f32(mat.emission) / 255.0, fh, R.time);
-  let col = litColor(albedo, n, worldPos, emis, R);
+  var col = litColor(albedo, n, worldPos, emis, R);
+
+  // ---- THE HIT FLASH -------------------------------------------------------
+  // ADDITIVE, and BEFORE the tonemap, because litColor's output is linear HDR
+  // and the tonemap below has to match the cube path's exactly (see the note on
+  // out.color) — adding after it would brighten this pass on a curve the
+  // severed limb beside it is not on.
+  //
+  // A WARM WHITE rather than pure white: a blow reads as a bright bloom shot
+  // through with the colour of what is being hit, and a flat vec3f(flash) on a
+  // dark limb reads as a lighting bug instead. The albedo term is what carries
+  // that — it is added on TOP of a constant, so a black limb still flashes.
+  //
+  // Nothing is done when flash is 0, which is every micro body in the world
+  // except the ones struck in the last fifth of a second. The branch is
+  // uniform across the instance (the value is flat-interpolated), so it costs
+  // nothing on the ones that skip it.
+  if (in.flash > 0.0) {
+    col += (vec3f(1.0, 0.86, 0.78) + albedo) * in.flash;
+  }
 
   // ---- reversed-Z depth, EXACTLY raymarch.wgsl's convention ----
   // dot(rdWorld, camFwd) is the fragment's view-space Z at t = 1, so scaling it

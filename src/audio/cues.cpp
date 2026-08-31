@@ -126,6 +126,15 @@ const std::map<std::string, std::string> Cues::kSlotPrefix = {
     // wet bed. Keeping it out of mobs/ is what lets one set serve all of them
     // without pretending it is any one creature's voice.
     {"bleed", "gore"},
+    // Melee combat (the `combat` owner in sound_schema.js). One owner apiece,
+    // like the world beds below: the SET NAME is fixed in code (CombatSetId
+    // concatenates prefix + slot, so the sets are melee/whoosh, melee/flesh
+    // and melee/clang) and what is authored is the combatfx tuning. They live
+    // under melee/ rather than mobs/ for the reason `bleed` lives under gore/:
+    // a whoosh is the sound of a WEAPON MOVING, not of any one creature, and
+    // filing it under a creature would be a claim the fallback chain cannot
+    // honour.
+    {"whoosh", "melee"},       {"flesh", "melee"},     {"clang", "melee"},
     // World beds (see the `world` owner in sound_schema.js). One owner, so the
     // set name is fixed in code; the slot exists here so the tuner and the
     // wiki can describe it.
@@ -279,6 +288,16 @@ void Cues::RebuildMaterialTable(const std::vector<MaterialDef>& mats) {
 
   if ((int)lastVariant_.size() < lib_.Count()) lastVariant_.assign((size_t)lib_.Count(), -1);
   for (const std::string& w : warnings_) std::printf("[audio] %s\n", w.c_str());
+}
+
+int Cues::ScanLibrary(const std::string& soundDir, double sampleRate) {
+  soundDir_ = soundDir;
+  const int loaded = lib_.Init(sampleRate, soundDir);
+  // Warnings are NOT printed here, unlike Init/RescanSounds. This runs in the
+  // selftest, where a gate's output is read line by line, and a library scan
+  // that is not the subject of the gate should not push it off the screen.
+  // Lib().Warnings() is still there for a caller that wants them.
+  return loaded;
 }
 
 int Cues::RescanSounds(const std::vector<MaterialDef>& mats) {
@@ -464,6 +483,84 @@ void Cues::Break(uint32_t matId, const Vec3& posVox, int sizeVoxels) {
     stats_.breaks++;
   else
     stats_.dropped++;
+}
+
+// ---- melee combat ----------------------------------------------------------
+//
+// See cues.h for what each cue is. One owner apiece, so the set name is
+// prefix + slot and there is nothing to author.
+namespace {
+const char* CombatSlotName(Cues::CombatCue c) {
+  switch (c) {
+    case Cues::CombatCue::Whoosh: return "whoosh";
+    case Cues::CombatCue::Flesh:  return "flesh";
+    case Cues::CombatCue::Clang:  return "clang";
+  }
+  return "whoosh";
+}
+}  // namespace
+
+int Cues::CombatSetId(CombatCue cue) const {
+  const char* slot = CombatSlotName(cue);
+  // `.at()` would throw on an unknown slot, which is right for the authored
+  // path (a typo in a mob sidecar is a content bug worth a crash) and wrong
+  // here: the slot is a compile-time constant, so a miss means kSlotPrefix and
+  // this enum have drifted, and a headless gate should REPORT that rather than
+  // terminate the suite.
+  auto it = kSlotPrefix.find(slot);
+  if (it == kSlotPrefix.end()) return -1;
+  return lib_.Find(it->second + "/" + std::string(slot));
+}
+
+void Cues::Combat(CombatCue cue, const Vec3& posVox, float power) {
+  // COUNTED BEFORE THE DEVICE CHECK. See Stats::combat — this is the only
+  // signal a headless gate has that the game asked for the right sound at the
+  // right moment, and putting it after `enabled_` would freeze it at 0 in
+  // exactly the runs that need it.
+  stats_.combat++;
+  if (!enabled_) return;
+  const int setId = CombatSetId(cue);
+  if (setId < 0) return;   // nothing recorded for this slot: silent, not loud
+  const Tuning::CombatFx& t = CurrentTuning().combatfx;
+  const float k = std::clamp(power, 0.0f, 1.0f);
+
+  float gain = 0.0f, rate = 1.0f;
+  switch (cue) {
+    case CombatCue::Whoosh:
+      // The pitch ramp is authored as two endpoints rather than a centre and a
+      // spread, because the two ends mean different things to the player: the
+      // slow one is a wave and the fast one is a cut.
+      gain = t.whooshVolume * (0.30f + 0.90f * k);
+      rate = t.whooshRateSlow + (t.whooshRateFast - t.whooshRateSlow) * k;
+      break;
+    case CombatCue::Flesh:
+      // Lower for a heavier blow — the same shape Impact uses, so a sword and
+      // a falling rock landing on the same body do not contradict each other.
+      gain = t.fleshVolume * (0.40f + 0.80f * k);
+      rate = 1.12f - 0.30f * k;
+      break;
+    case CombatCue::Clang:
+      // HIGHER for a faster blow, the opposite of flesh and deliberately so:
+      // a hard parry rings, it does not thud.
+      gain = t.clangVolume * (0.40f + 0.85f * k);
+      rate = 0.92f + 0.32f * k;
+      break;
+  }
+
+  if ((int)lastVariant_.size() <= setId)
+    lastVariant_.assign((size_t)lib_.Count(), -1);
+  const std::vector<float>* buf = PickStep(setId, lastVariant_[(size_t)setId]);
+
+  VoiceConfig cfg;
+  cfg.gain = gain;
+  cfg.audibleRadius = t.cueRadius;
+  cfg.verbWet = CurrentTuning().audio.reverbWet;
+  // Doppler off: the blade is moving fast, but the SOUND is made at a place and
+  // the listener is usually the one holding it. A doppler shift on your own
+  // swing reads as a pitch bug.
+  cfg.doppler = false;
+  cfg.rate = std::clamp(rate, 0.25f, 4.0f);
+  if (!world_.PlayOneShot(buf, posVox, cfg)) stats_.dropped++;
 }
 
 int Cues::MobSetId(const MobDef& def, MobEvent ev) const {

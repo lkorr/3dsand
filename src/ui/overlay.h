@@ -258,6 +258,39 @@ struct UIState {
   // wheel in every scrollable panel. Nothing in this engine installs one, this
   // panel does not need one (an ImGui child region scrolls by itself), and
   // that is the correct amount.
+  // ---- the Combat panel (melee.* / combatfx.* / gore.* in tuning.json) -----
+  //
+  // FIVE FIELDS, NOT FIFTY, AND THE DEVIATION IS DELIBERATE. Every other panel
+  // here mirrors each knob into a UIState float and lets main.cpp write it
+  // through, because that keeps the overlay from owning game state. The Combat
+  // panel instead edits the tuning SINGLETON in place (overlay.cpp reads
+  // CurrentTuning(), runs the sliders on a copy, and SetCurrentTuning()s it
+  // back), for three reasons that all point the same way:
+  //
+  //   * it is ~60 knobs across three groups. Sixty mirrors is sixty chances
+  //     for a name to drift from the tuning field it shadows, with nothing
+  //     checking the correspondence — the failure mode being a slider that
+  //     silently edits nothing.
+  //   * a mirror needs a RESEAT path (the AI panel's aiProfileReseat) so F5
+  //     and the browser tuner do not leave the sliders showing stale numbers.
+  //     Reading the live tuning every frame has no stale state to reseat.
+  //   * `CurrentTuning`/`SetCurrentTuning` are a process-global that tuning.h
+  //     exports on purpose and that eight other systems already read straight
+  //     from. It is not main.cpp's private state in the way MobSystem is.
+  //
+  // What still crosses through main.cpp is everything that is NOT a tuning
+  // value: the dirty latch (MeleeState caches its MeleeTuning by value, so it
+  // has to be told), the save request, and the readout below.
+  bool combatWindowOpen = false;
+  bool combatTuningDirty = false;  // a slider moved: re-apply to MeleeState
+  bool combatSave = false;         // one-shot: write melee.*/combatfx.* to JSON
+  std::string combatSaveStatus;    // last save result, shown by the button
+  // Live hit-stop multiplier, for the panel's readout. 1 = running normally.
+  // A READOUT and not a control: the panel exists partly so "is hit-stop
+  // firing at all" is answerable without a frame counter, since a 60 ms dip is
+  // exactly the sort of thing you cannot tell you are seeing.
+  float hitStopScale = 1.0f;
+
   bool aiWindowOpen = false;
   bool aiSpawnDummy = false;      // one-shot: spawn ahead of the crosshair
   bool aiSpawnStatic = false;

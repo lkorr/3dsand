@@ -75,7 +75,26 @@ static_assert(sizeof(MicroBodyModelGpu) == 16,
 struct MicroBodyInstGpu {
   uint32_t slot;
   uint32_t model;
-  uint32_t pad0 = 0, pad1 = 0;
+  // HIT FLASH, as the BIT PATTERN of a float (WGSL reads it with
+  // `bitcast<f32>`). Additive, in linear HDR, applied at shade time on top of
+  // the material's own emission — game/mob.h MobLimb::hitFlash is where the
+  // value comes from and what decays it.
+  //
+  // A REUSED PADDING WORD, not a wider struct, and the two static_asserts below
+  // are why that mattered: the instance buffer is sized by `sizeof` in two
+  // places (simulation.cpp) but the WGSL side is a hand-written mirror that
+  // nothing checks — check_invariants.py's check_gpu_structs only reads
+  // sim/world.h and only matches structs whose names are IDENTICAL, so
+  // MicroBodyInst/MicroBodyInstGpu are invisible to it. Staying at 16 bytes
+  // keeps the one guard that does exist meaningful.
+  //
+  // A BIT PATTERN rather than a fixed-point integer on purpose: a scale factor
+  // would be a magic number that has to agree in two files with no checker
+  // between them, which is exactly the class of bug the note above describes.
+  // 0 bitcasts to 0.0f, so the default is "no flash" for free — which is what
+  // debris (phys/debris.cpp) keeps passing.
+  uint32_t flashBits = 0;
+  uint32_t pad1 = 0;
 };
 static_assert(sizeof(MicroBodyInstGpu) == 16,
               "must match microbody.wgsl MicroBodyInst");

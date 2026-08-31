@@ -678,6 +678,54 @@ EdgeSweepResult MeleeSweepDamage(const EdgeSweep& s, const MeleeTuning& t,
   return out;
 }
 
+// =============================================================================
+// THE TUNING BRIDGE
+// =============================================================================
+//
+// tuning.json's `melee.*` -> MeleeTuning, once at startup and once per F5.
+//
+// THE FOUR CONVERSIONS ARE THE WHOLE REASON THIS IS A FUNCTION and not a memcpy
+// of a struct that happens to have the same shape. MeleeTuning stores world
+// VOXELS for everything with a physical size, because that is the unit the
+// stroke integrates in; tuning.json stores METRES, because a JSON file that
+// stored voxels would silently change what it means the next time kVoxelMeters
+// moves — which has happened, and which cost the sword its own hilt once
+// (item.h ItemDef::scale). The key names carry the unit (`fullSpeedMps`,
+// `guardUpM`) so the conversion is visible at the authoring end too.
+void ApplyMeleeTuning(MeleeTuning& dst, const Tuning& t) {
+  const Tuning::Melee& m = t.melee;
+  dst.commitSpeed = m.commitSpeed;
+  dst.slashTime = m.slashTime;
+  dst.recoverTime = m.recoverTime;
+  dst.fullSpeed = MetresPerSecToCells(m.fullSpeedMps);   // m/s -> voxels/s
+  dst.minSpeed = MetresPerSecToCells(m.minSpeedMps);
+  dst.aimGainX = m.aimGainX;
+  dst.aimGainY = m.aimGainY;
+  dst.reachGain = MetresToCells(m.reachGainM);           // m -> voxels
+  dst.azOut = m.azOut;
+  dst.azAcross = m.azAcross;
+  dst.elMin = m.elMin;
+  dst.elMax = m.elMax;
+  dst.handExtend = m.handExtend;
+  dst.extendSmoothing = m.extendSmoothing;
+  dst.leanTurnRate = m.leanTurnRate;
+  dst.handLead = m.handLead;
+  dst.fallbackReach = MetresToCells(m.fallbackReachM);
+  dst.reachFraction = m.reachFraction;
+  dst.guardForward = MetresToCells(m.guardForwardM);
+  dst.guardUp = MetresToCells(m.guardUpM);
+  dst.guardSide = MetresToCells(m.guardSideM);
+  dst.dirSmoothing = m.dirSmoothing;
+  dst.swingArc = m.swingArc;
+  dst.swingAnticipate = m.swingAnticipate;
+  dst.swingExtend = m.swingExtend;
+  dst.bladeSmoothing = m.bladeSmoothing;
+  dst.wristMaxAngle = m.wristMaxAngle;
+  dst.edgeFloor = m.edgeFloor;
+}
+
+void ApplyMeleeTuning(MeleeTuning& dst) { ApplyMeleeTuning(dst, CurrentTuning()); }
+
 float MeleeEdgeAlign(const Vec3& flat, const Vec3& travel, float floorFrac) {
   const float fl = flat.len(), tl = travel.len();
   // No roll reported, or a blade that is not moving: neither is evidence of a

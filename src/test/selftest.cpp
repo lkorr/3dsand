@@ -45,6 +45,7 @@ const std::vector<Gate>& PlayerKitGates();
 const std::vector<Gate>& SwingGates();
 const std::vector<Gate>& EquipmentGates();
 const std::vector<Gate>& WoundGates();
+const std::vector<Gate>& CombatGates();
 
 // THE EXECUTION ORDER, and it is load-bearing.
 //
@@ -90,6 +91,15 @@ const char* const kOrder[] = {
     // one part of melee no other gate can see (`mob`'s melee subtests drive
     // SetWeaponPose directly and never touch the mouse).
     "swing",
+    // AND WITH THEM, for the third time and the same reason: `combat-tuning`
+    // and `combat-cues` are pure CPU over tuning.json and the sound library —
+    // no world, no GPU, no fixtures, nothing left behind (the one temp file
+    // each writes is next to the asset it probes and is removed before the
+    // gate returns). Front-loaded rather than appended with the other combat
+    // work because a tuning group that stopped reaching its struct makes every
+    // later melee gate measure the wrong numbers silently, and it is better
+    // reported in the first second than in the fiftieth.
+    "combat-tuning", "combat-cues",
     // SECOND, and for the same reason: `tree-atlas` reads assets/trees/*.svtree
     // off disk and asserts on the bytes. No world, no GPU, no state left
     // behind -- and when the atlas is wrong every gate after it is measuring a
@@ -207,7 +217,7 @@ const std::vector<Gate>& Registry() {
                           &MobGates(), &BodyGates(), &WorldIoGates(), &AudioGates(),
                           &VoxRegionGates(),
                           &SpellGates(), &PlayerKitGates(), &SwingGates(),
-                          &EquipmentGates(), &WoundGates()})
+                          &EquipmentGates(), &WoundGates(), &CombatGates()})
       pool.insert(pool.end(), g->begin(), g->end());
 
     std::vector<Gate> v;

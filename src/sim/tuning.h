@@ -851,6 +851,137 @@ struct Tuning {
     float woundImpactSeverScale = 4.0f;
   } gore;
 
+  // ---- melee: the stroke driver's feel ---------------------------------------
+  //
+  // THE VALUES BEHIND MeleeTuning (game/melee.h), AND NOTHING ELSE. That struct
+  // stays exactly where it is and keeps exactly its fields — MeleeState holds
+  // one, MeleeSweepDamage takes one by const reference, and both the NPC driver
+  // and the gates read `t.commitSpeed` style. What moved is only where the
+  // NUMBERS come from: `ApplyMeleeTuning` (game/melee.h) copies this group into
+  // a MeleeTuning at startup and on every F5, so the whole feel loop is a JSON
+  // edit rather than a rebuild. Its header said this would happen:
+  //
+  //   "Lives here rather than in tuning.json for the first pass because these
+  //    are the knobs being *designed*, not the ones being dialled; once the
+  //    feel settles they belong in tuning.json like everything else."
+  //
+  // CPU-ONLY, so there is no tuning_params.def row and no WGSL constant — same
+  // as `gore` above. Nothing in a shader reads a melee number, and nothing here
+  // may ever reach one: the sim must not see presentation state (rule 1).
+  //
+  // UNITS. Where MeleeTuning stores WORLD VOXELS derived from a physical size
+  // (MetresPerSecToCells / MetresToCells in its initialisers), the key here is
+  // the PHYSICAL number with the unit in its name — `fullSpeedMps`, not
+  // `fullSpeed`. Storing the post-conversion voxel figure would bake the
+  // current kVoxelMeters into the JSON, and the sword has already been bitten
+  // once by exactly that (item.h ItemDef::scale). Angles, fractions and
+  // seconds are unitless-in-voxels and carry their MeleeTuning name unchanged.
+  struct Melee {
+    // ---- the control law ----------------------------------------------------
+    float commitSpeed = 900.0f;      // mouse px/s that commits a guard to a cut
+    float slashTime = 0.17f;         // seconds the committed slash takes
+    float recoverTime = 0.22f;       // seconds of follow-through
+    float fullSpeedMps = 3.4f;       // tip speed for full damage
+    float minSpeedMps = 0.9f;        // tip speed below which a hit does nothing
+    float aimGainX = 0.0050f;        // radians of tip azimuth per mouse pixel
+    float aimGainY = 0.0067f;        // radians of tip elevation per mouse pixel
+    float reachGainM = 0.0030f;      // metres of tip reach per dReach unit
+    // ---- where the point may go --------------------------------------------
+    float azOut = 2.36f;             // radians, to the weapon side
+    float azAcross = 1.40f;          // radians, across the body
+    float elMin = -1.50f;            // radians, arm hanging at the side
+    float elMax = 1.48f;             // radians, overhead
+    // ---- how the arm holds it ----------------------------------------------
+    float handExtend = 0.78f;        // fraction of arm reach
+    float extendSmoothing = 0.18f;   // seconds halflife
+    float leanTurnRate = 18.0f;      // radians/sec on the lean plane
+    float handLead = 1.0f;           // SIGN only: +1 hand leads, -1 point leads
+    float fallbackReachM = 0.60f;    // metres, only when the rig cannot say
+    float reachFraction = 0.94f;     // fraction of arm reach the hand may use
+    float guardForwardM = 0.22f;     // metres — the seed of last resort
+    float guardUpM = 0.26f;
+    float guardSideM = 0.16f;
+    float dirSmoothing = 0.06f;      // seconds of mouse history
+    // ---- the committed arc --------------------------------------------------
+    float swingArc = 2.0f;           // radians the cut carries the point
+    float swingAnticipate = 0.35f;   // fraction of the arc pulled back first
+    float swingExtend = 0.16f;       // fraction of reach the arc bows out by
+    float bladeSmoothing = 0.055f;   // seconds halflife on the blade frame
+    // HOW FAR THE WRIST MAY TAKE THE BLADE from what the solved forearm gives
+    // it for free, radians. 1.5 is a wrist. It was 2.80 — 160 degrees, which is
+    // a ball joint — for one structural reason that no longer holds: the
+    // authored grip held the blade PERPENDICULAR to the forearm, so about 90
+    // degrees of the budget was spent undoing the grip before any steering
+    // happened. assets/items/{sword,cleaver}.json now rotate [0,0,-90] instead
+    // of [0,-90,0], which puts a neutral blade along the arm's own line, and
+    // the budget is free to be a wrist again.
+    float wristMaxAngle = 1.50f;
+    float edgeFloor = 0.35f;         // damage floor for a flat-on slap
+  } melee;
+
+  // ---- combat feel: hit-stop, hit flash, combat cues --------------------------
+  //
+  // PRESENTATION ONLY, and the distinction is load-bearing rather than tidy.
+  //
+  // HIT-STOP changes how many fixed 30 Hz ticks the FRAME LOOP runs, never what
+  // a tick computes. main.cpp's accumulator already runs the tick loop 0..4
+  // times a frame depending on frame time; a dip scales the rate that
+  // accumulator fills at, so the sim sees exactly the tick stream it would have
+  // seen on a slower machine. No sim value is touched, no hashed state moves,
+  // and the headless/selftest paths never execute that loop at all.
+  //
+  // HIT FLASH is one float per micro-body limb, packed into a word that was
+  // already padding (sim/microbody.h MicroBodyInstGpu::pad0) and added at shade
+  // time. It is not a material, not a stain, and not in the voxel word — the
+  // word is full (CLAUDE.md) and a flash is over in a fifth of a second.
+  struct CombatFx {
+    // ---- hit-stop -----------------------------------------------------------
+    // OFF is a real setting, not a debug escape: some players hate it.
+    bool hitStop = true;
+    // Three tiers, weakest first. `Scale` is the multiplier on the rate the
+    // tick accumulator fills at (0.15 = the world runs at 15% speed); `Ms` is
+    // how long the dip lasts in REAL milliseconds, so it is the same length of
+    // held breath whatever the frame rate.
+    //
+    // A CHIP is the blade finding something that is not live flesh — debris, a
+    // dropped item, another weapon. FLESH is a mob that voiced being hurt.
+    // SEVER is a limb coming off. They are strictly ordered because the dip is
+    // peak-held: a sever landing in the same frame as a chip must not be
+    // shortened by it.
+    float hitStopChipScale = 0.45f;
+    float hitStopChipMs = 55.0f;
+    float hitStopFleshScale = 0.22f;
+    float hitStopFleshMs = 95.0f;
+    float hitStopSeverScale = 0.10f;
+    float hitStopSeverMs = 140.0f;
+    // ---- hit flash ----------------------------------------------------------
+    // Peak additive intensity per tier, in LINEAR HDR before the tonemap (the
+    // micro-body pass tonemaps to match the cube path exactly, so the flash has
+    // to be added on the linear side or the two paths diverge).
+    float flashChip = 0.35f;
+    float flashFlesh = 0.85f;
+    float flashSever = 1.60f;
+    // Seconds of halflife on the decay. Short: a flash the player can still see
+    // when the next blow lands stops reading as a hit and starts reading as a
+    // shader bug.
+    float flashHalflife = 0.075f;
+    // ---- combat cues --------------------------------------------------------
+    // Volumes are the same 0..N trim every other cue group uses; radius is the
+    // audible radius in METRES, matching Tuning::Audio.
+    float whooshVolume = 0.55f;
+    // Mouse px/s below which a committed stroke gets no whoosh at all. A cut
+    // that barely moved should not sound like one; this is the audio half of
+    // the same "speed is the damage" law the sweep runs on.
+    float whooshMinSpeed = 300.0f;
+    // Rate multipliers at min speed and at commitSpeed. A faster cut is a
+    // higher, tighter whoosh, so the LOW value belongs to the slow stroke.
+    float whooshRateSlow = 0.82f;
+    float whooshRateFast = 1.25f;
+    float fleshVolume = 0.90f;
+    float clangVolume = 0.85f;
+    float cueRadius = 22.0f;   // metres
+  } combatfx;
+
   // ---- grenade ----
   struct Grenade {
     float throwSpeed = 20.0f;   // m/s
@@ -2442,6 +2573,26 @@ struct Tuning {
 // Returns false only on unreadable/unparseable JSON; per-field problems are
 // clamped and reported through out.warnings.
 bool LoadTuning(const std::string& path, Tuning& out);
+
+// ---- writing the combat groups back ----------------------------------------
+//
+// SURGICAL TEXT PATCH, NOT A RE-SERIALIZE. Rewrites only the value literals of
+// the keys in the `melee`, `combatfx` and `gore` objects, in the file's own
+// text, leaving every other key, every prose "comment" string and the browser
+// tuner's formatting exactly as they were. Same choice and same mechanism as
+// LabPatchTuningJson (src/lab/lab.h) makes for the fluid look knobs, and it is
+// what lets the in-game Combat panel and the browser tuner both own this file
+// without either flattening the other's work.
+//
+// SCOPED TO THE GROUP, which the lab's version is not: that one searches for a
+// bare `"key"` anywhere in the file, which is safe for eight uniquely-named
+// keys and wrong in general — two groups may reasonably both have a `gain`.
+// This finds the group object first and patches only inside its braces.
+//
+// ALL OR NOTHING. Returns false with `err` set, having written nothing, if a
+// group or a key is missing. A half-patched tuning.json is worse than an
+// unpatched one, because the half that landed looks like it worked.
+bool SaveCombatTuning(const std::string& path, const Tuning& t, std::string& err);
 
 // WGSL `const` declarations for every shader-visible value above, prepended to
 // each shader by LoadShader() right after ShaderConstantPrelude(). Shaders

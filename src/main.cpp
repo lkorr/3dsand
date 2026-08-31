@@ -3114,6 +3114,11 @@ int main(int argc, char** argv) {
   // Player or PlayerAvatar — main.cpp holds them and pushes the resulting pose
   // into the avatar, exactly as it already does for heading.
   MeleeState melee;
+  // The feel numbers come from tuning.json's `melee.*` group (sim/tuning.h
+  // Tuning::Melee, applied by game/melee.cpp ApplyMeleeTuning). Seeded here and
+  // re-applied in the F5 block, which is the whole point of the migration: the
+  // stroke's feel is a JSON edit and a keypress rather than a rebuild.
+  ApplyMeleeTuning(melee.tuning);
   Inventory hotbar;
   // The rest of the kit: worn/sheathed/quick slots and the pack
   // (game/equipment.h). Held beside the hotbar rather than inside it because
@@ -3256,6 +3261,97 @@ int main(int argc, char** argv) {
   std::vector<MicroBodyInstGpu> microInsts;
   double lastTime = NowSeconds();
   double accumulator = 0;
+  // ---- HIT-STOP (sim/tuning.h Tuning::CombatFx) ----------------------------
+  //
+  // WHAT IT DOES TO THE SIM: nothing. The dip scales the rate the tick
+  // ACCUMULATOR fills at, so for a fifteenth of a second the world advances
+  // fewer 30 Hz ticks per frame. That is a stream the sim already has to be
+  // correct under — this loop runs it 0..4 times per frame depending on frame
+  // time, and does so on every machine — so the world sees exactly what it
+  // would have seen on a slower one. No tick computes anything different, no
+  // hashed state is touched, and `--selftest` never executes this loop at all
+  // (the gates drive SubmitTick directly through src/test/support.cpp).
+  //
+  // A STICKY LATCH WITH PEAK-HOLD, and that is not a style choice. The tick
+  // loop below runs ZERO times on most frames at any frame rate over 30, so a
+  // frame-local "was there a hit" bool is discarded unread most of the time —
+  // the exact bug that made RMB casting fire one try in nine (see castQueued's
+  // note). `pendScale`/`pendMs` are written INSIDE the tick loop, peak-held so
+  // a sever landing in the same frame as a chip keeps the sever's dip, and
+  // drained by the frame loop once, at the top, before the accumulator fills.
+  //
+  // PEAK-HOLD IS min ON THE SCALE AND max ON THE DURATION. They are peaks of
+  // the same quantity — "how much stop" — expressed in units that run opposite
+  // ways, and combining them with the same operator is how you get a sever
+  // that stops hard for 55 ms because a chip landed in the same frame.
+  struct HitStop {
+    float pendScale = 1.0f;   // requested this frame; 1 = nothing requested
+    float pendMs = 0.0f;
+    float timeLeft = 0.0f;    // REAL seconds remaining in the live dip
+    float scale = 1.0f;       // the live dip's multiplier
+    void Request(float s, float ms) {
+      if (ms <= 0.0f || s >= 1.0f) return;
+      pendScale = std::min(pendScale, s);
+      pendMs = std::max(pendMs, ms);
+    }
+  } hitStop;
+  // ---- COMBAT CUES: the same latch shape, for the same reason ---------------
+  //
+  // A cue raised inside the tick loop cannot be played there: audio drains once
+  // per frame (down in the `audioCues.Enabled()` block), and the loop above it
+  // may have run four times or none. So each combat cue is a one-shot request
+  // with PEAK-HOLD ON POWER — a frame in which the blade crossed a body on
+  // three consecutive ticks is ONE blow to the ear, and it should be the
+  // hardest of the three rather than three overlapping copies of nearly the
+  // same sample. `at` travels with it because a killing blow can despawn its
+  // victim before the frame drains, exactly as MobSystem::VoiceEvent carries
+  // its own defIndex for that reason.
+  struct CombatCueRequest {
+    bool pending = false;
+    float power = 0.0f;   // 0..1
+    Vec3 at{};
+  };
+  CombatCueRequest combatWhooshCue, combatFleshCue, combatClangCue;
+  // The swing whoosh fires on the EDGE into Slash, not while Slash is held:
+  // committing is a moment, and a per-tick test would play the sample five
+  // times over one cut. Remembered across frames, so the edge survives a frame
+  // that ran no ticks at all.
+  SwingPhase meleePhasePrev = SwingPhase::Idle;
+  // ---- THE BLOCK HOOK, for phase C's BlockEvent ----------------------------
+  //
+  // `clang` is "a cut stopped by something that is not flesh". Two things
+  // produce that, and only the first exists today:
+  //
+  //   1. THE SWEEP hitting a non-flesh body — debris, a dropped item, a
+  //      weapon held in someone else's fist. Wired above, at the sweep.
+  //   2. A DELIBERATE BLOCK — an NPC raising a guard and the blade stopping on
+  //      it. That is phase C's BlockEvent, which is being written in another
+  //      worktree as this lands.
+  //
+  // Named and defined here so the merge is one call site rather than a design
+  // decision: whoever drains BlockEvents calls `CombatBlockCue(at, power)` in
+  // the same frame-level block the sever drain lives in, and everything below
+  // it — the latch, the peak-hold, the volume law, the slot — is already done.
+  // Deliberately takes the two things a block has and nothing else; it must
+  // not need a Mob, because a parry between two NPCs has no player in it.
+  auto CombatBlockCue = [&](const Vec3& at, float power) {
+    const float pw = std::clamp(power, 0.0f, 1.0f);
+    if (!combatClangCue.pending || pw > combatClangCue.power) {
+      combatClangCue.power = pw;
+      combatClangCue.at = at;
+    }
+    combatClangCue.pending = true;
+    // A block is a hit that did not land, and it should still stop time —
+    // being parried is information, and information the player does not feel
+    // is information they miss. The chip tier: something happened, but nothing
+    // came off.
+    const Tuning::CombatFx& fx = CurrentTuning().combatfx;
+    hitStop.Request(fx.hitStopChipScale, fx.hitStopChipMs);
+  };
+  // Nothing calls it until phase C's BlockEvent lands. Referenced here so the
+  // build does not warn it unused, and so the fact that it is a PENDING SEAM
+  // is visible in the code rather than only in a merge note.
+  (void)CombatBlockCue;
   float fpsSmooth = 0, frameMsSmooth = 0, tickMsSmooth = 0, frameMsWorst = 0;
   float frameMsP95 = 0, frameMsP99 = 0;
   double fpsWinStart = lastTime, fpsWinWorst = 0;
@@ -3547,6 +3643,29 @@ int main(int argc, char** argv) {
     // mouse is sampled at; the tick loop below runs 0..4 times per frame and
     // integrating it there would multiply-count a fast flick into a much
     // faster one.
+    //
+    // UNDER HIT-STOP THE STROKE INTEGRATES IN SIM TIME, and that is the
+    // decision rather than an oversight. During a dip the tick loop runs less
+    // often, so the same frame's pixels sit in MeleeState's accumulator across
+    // more frames and are delivered to fewer Update() calls. Two consequences,
+    // and they pull opposite ways:
+    //
+    //   * THE TIP DISPLACEMENT IS EXACT. az/el are integrated from the raw
+    //     delta at a fixed radians-per-pixel gain, so total pixels -> total
+    //     arc is preserved bit for bit however the ticks are spaced. This is
+    //     the property the `swing` gate states ("a displacement, not a rate")
+    //     and the one the player actually feels; nothing here may perturb it,
+    //     which rules out scaling the fed pixels.
+    //   * THE DERIVED SPEED READS HIGH, by 1/scale, because Update divides by
+    //     kTickDt and a tick now covers more real time than that. It is
+    //     bounded and it is nearly unreachable: `commitSpeed` is only
+    //     consulted in Guard, and a dip can only have been caused by a hit,
+    //     which can only happen in Slash. By the time the longest dip (140 ms)
+    //     has run out, a 170 ms slash is into its follow-through.
+    //
+    // Fixing the second would mean giving Update a second dt (real vs sim),
+    // widening a signature three callers and the NPC driver share, to correct
+    // a number that is not read in the window where it is wrong.
     if (captured) melee.Feed((float)(mx - mx0), (float)(my - my0));
     mx0 = mx;
     my0 = my;
@@ -3881,6 +4000,14 @@ int main(int argc, char** argv) {
         // spawn. Same id -> same draw, so a mob keeps its identity unless the
         // variance settings themselves changed.
         mobs.RefreshGoreProfiles();
+        // THE STROKE'S FEEL, re-applied from the freshly-loaded `melee.*`
+        // group. This is the whole reason MeleeTuning's values moved into
+        // tuning.json: MeleeState holds a MeleeTuning by value, so without
+        // this line an edit to a swing knob would need a rebuild — which is
+        // the loop the migration exists to close (game/melee.h
+        // ApplyMeleeTuning). `combatfx.*` needs no equivalent: nothing caches
+        // it, every reader goes through CurrentTuning() at the point of use.
+        ApplyMeleeTuning(melee.tuning);
         // The weather switches decide which reaction rules COMPILE, and the
         // reaction table is built by LoadAssets — which F5 does not otherwise
         // run. Fall through into the materials reload so a freeze/melt
@@ -4212,8 +4339,58 @@ int main(int argc, char** argv) {
     }
     ui.fly = player.fly;
 
+    // ---- HIT-STOP: drain the latch, then age the live dip -------------------
+    //
+    // ORDER MATTERS AND THIS IS THE ONLY PLACE IT IS RIGHT: the drain must
+    // happen after the tick loop that WROTE the request (last frame) and before
+    // the accumulator that READS the dip (three lines down). A request made on
+    // frame N therefore lands on frame N+1 — one frame, ~16 ms, which is under
+    // the shortest dip and well under the perceptual threshold for "did the
+    // game react to my hit".
+    //
+    // BYPASSED WHOLESALE by the deterministic harnesses. `--autofly*` pins a
+    // FIXED TICK SCHEDULE on purpose (CLAUDE.md: it is how residency is sized,
+    // and both the page-pool numbers and the traversal measurements depend on
+    // the tick count per frame being what the harness says it is). Nothing in
+    // those runs swings a sword today, so this is a guard rather than a fix —
+    // but a measurement harness silently dilated by a gameplay effect is
+    // exactly the kind of thing that costs a session, and the check is free.
+    // `--selftest` needs no guard at all: it never reaches this loop.
+    {
+      const Tuning::CombatFx& fx = CurrentTuning().combatfx;
+      const bool allowed = fx.hitStop && !g_autoflySurface && !g_autoflyHard;
+      if (hitStop.pendMs > 0.0f && allowed) {
+        hitStop.timeLeft = std::max(hitStop.timeLeft, hitStop.pendMs * 0.001f);
+        hitStop.scale = std::min(hitStop.scale, hitStop.pendScale);
+      }
+      hitStop.pendScale = 1.0f;
+      hitStop.pendMs = 0.0f;
+      if (hitStop.timeLeft > 0.0f) {
+        // Aged in REAL time (`dt`), never in ticks — the dip is a length of
+        // held breath the player perceives, and a dip measured in the ticks it
+        // is itself suppressing would last however long it felt like.
+        hitStop.timeLeft -= (float)dt;
+        if (hitStop.timeLeft <= 0.0f) {
+          hitStop.timeLeft = 0.0f;
+          hitStop.scale = 1.0f;
+        }
+      }
+      if (!allowed) {
+        hitStop.timeLeft = 0.0f;
+        hitStop.scale = 1.0f;
+      }
+    }
+    ui.hitStopScale = hitStop.timeLeft > 0.0f ? hitStop.scale : 1.0f;
+
     // ---- fixed-tick simulation ----
-    accumulator += dt;
+    // THE DIP IS APPLIED HERE AND NOWHERE ELSE. Scaling the accumulator's FILL
+    // RATE is the whole mechanism: fewer whole ticks clear the `>= kTickDt`
+    // test below, so the world runs slower without any tick running
+    // differently. Deliberately not `kTickDt * k` (which would change what a
+    // tick MEANS to everything downstream that uses it as a dt) and not a
+    // sleep (which would stall rendering too, so the hit would freeze rather
+    // than slow).
+    accumulator += dt * (double)(hitStop.timeLeft > 0.0f ? hitStop.scale : 1.0f);
     // Cap the tick backlog: with no cap, any stretch where 30 Hz can't be met
     // (heavy fire, worldgen, a save) accrues unbounded debt and the loop runs
     // 4 ticks/frame long after the load has passed. Drop the excess instead.
@@ -4828,6 +5005,37 @@ int main(int argc, char** argv) {
           }
           melee.Update(kTickDt, meleeHeld, meleeArmed, cam.Right(), cam.Up(),
                        cam.Forward());
+          // ---- THE SWING WHOOSH, on the EDGE into Slash --------------------
+          // A commit is a moment, so this fires once per cut rather than on
+          // every tick the slash is live. Latched (not played here) because
+          // this is inside the tick loop and audio drains once per frame.
+          //
+          // THE VOLUME AND PITCH COME OFF THE SPEED THE GAME ACTUALLY READ,
+          // not off the tuning's threshold, so a whoosh is the audible half of
+          // "speed is the damage" (melee.h note 2): the player hears the same
+          // number the damage curve used, and a lazy wave under
+          // combatfx.whooshMinSpeed makes no sound at all rather than a quiet
+          // one — which is the honest report that it was not a cut.
+          if (melee.Phase() == SwingPhase::Slash &&
+              meleePhasePrev != SwingPhase::Slash) {
+            const Tuning::CombatFx& fx = CurrentTuning().combatfx;
+            const float lo = fx.whooshMinSpeed;
+            const float hi = std::max(melee.tuning.commitSpeed, lo + 1.0f);
+            const float sp = melee.MouseSpeed();
+            if (sp > lo) {
+              combatWhooshCue.pending = true;
+              combatWhooshCue.power = std::clamp((sp - lo) / (hi - lo), 0.0f, 1.0f);
+              // AT THE HAND, not at the tip: the sound is air moving past the
+              // whole blade, and putting it at the point makes a long weapon's
+              // whoosh pan away from the player who swung it.
+              Vec3 eb, et, ef;
+              float ehw = 0;
+              combatWhooshCue.at = avatar.WeaponEdge(eb, et, ehw, &ef)
+                                       ? eb
+                                       : player.pos;
+            }
+          }
+          meleePhasePrev = melee.Phase();
           if (avatar.Spawned()) {
             // Weight rises while the weapon is up and FADES over the releasing
             // recover, so the arm is handed back to the walk cycle across a
@@ -5173,8 +5381,60 @@ int main(int argc, char** argv) {
             }
             sw.tick = tick;
             sw.valid = true;
-            MeleeSweepDamage(sw, melee.tuning, avatar, phys, mobs, debris,
-                             world, spawns);
+            // ---- WHAT THE BLOW WAS, MEASURED FROM WHAT IT LEFT BEHIND ------
+            //
+            // The sweep reports how many bodies it hit and how hard, but not
+            // WHAT it hit. Rather than widen EdgeSweepResult — which would put
+            // the answer inside MeleeSweepDamage, where two people are working
+            // — the tier is read off the two event queues the sweep already
+            // fills as a side effect, by differencing them across the call:
+            //
+            //   severs grew  -> a limb came off. The biggest of everything.
+            //   voices grew  -> a LIVE creature was hurt: flesh.
+            //   neither, but bodiesHit -> debris, a dropped item, a held
+            //                             weapon. A chip.
+            //
+            // Both queues are frame-drained (down in the audio block), so the
+            // sizes only ever grow within a frame and a difference is exactly
+            // "what this call added". No new plumbing, no shared struct.
+            //
+            // KNOWN AND ACCEPTED: Hurt voices de-duplicate per mob per drain
+            // window (MobSystem::PushVoice), so a SECOND cut into the same
+            // creature in the same frame reads as a chip rather than as flesh.
+            // The blow still flashes and still hurts — only the tier of the
+            // dip and the choice of cue are affected, and only for a repeat
+            // inside 16 ms. The alternative is a per-call "did I hurt live
+            // flesh" flag threaded out of the sweep, which is the shared
+            // surface this is avoiding.
+            const size_t sev0 = mobs.SeverEvents().size();
+            const size_t voi0 = mobs.VoiceEvents().size();
+            const EdgeSweepResult res = MeleeSweepDamage(
+                sw, melee.tuning, avatar, phys, mobs, debris, world, spawns);
+            if (res.bodiesHit > 0) {
+              const bool severed = mobs.SeverEvents().size() > sev0;
+              const bool flesh = mobs.VoiceEvents().size() > voi0;
+              const Tuning::CombatFx& fx = CurrentTuning().combatfx;
+              // LATCHED, not acted on. This is inside the tick loop, which
+              // runs 0..4 times a frame; the frame loop drains it at the top
+              // of the next frame (see HitStop's note).
+              if (severed)
+                hitStop.Request(fx.hitStopSeverScale, fx.hitStopSeverMs);
+              else if (flesh)
+                hitStop.Request(fx.hitStopFleshScale, fx.hitStopFleshMs);
+              else
+                hitStop.Request(fx.hitStopChipScale, fx.hitStopChipMs);
+              // The impact cue, latched for the same reason and peak-held on
+              // power so one frame carrying four tick-hits plays the hardest
+              // of them once rather than four overlapping copies of nearly the
+              // same sound.
+              CombatCueRequest& q = flesh ? combatFleshCue : combatClangCue;
+              const float pw = res.power * res.edgeAlign;
+              if (!q.pending || pw > q.power) {
+                q.power = pw;
+                q.at = (sw.aNow + sw.bNow) * 0.5f;
+              }
+              q.pending = true;
+            }
           }
           lastEdgeBase = eb;
           lastEdgeTip = et;
@@ -5534,6 +5794,33 @@ int main(int argc, char** argv) {
           }
         }
 
+        // ---- MELEE COMBAT (assets/sound_schema.js, the `combat` owner) -----
+        //
+        // Three sounds a fight makes that belong to no material and no
+        // creature. Drained here rather than fired at the point of the event
+        // for the reason the whole block exists: the events happen inside the
+        // tick loop, which runs 0..4 times a frame, and audio is a per-frame
+        // job.
+        //
+        // A SWORD BLOW CAN LEGITIMATELY MAKE FOUR SOUNDS: `whoosh` when the
+        // cut committed, `flesh` when it landed, then the creature's own
+        // `hurt` (or `sever` + `dismember` if a limb came off) from the blocks
+        // below. They are four different facts about one event and a fight is
+        // less readable without any of them — but the FIRST TWO are what tell
+        // the player about their own action, so they go first.
+        if (combatWhooshCue.pending) {
+          audioCues.Combat(audio::Cues::CombatCue::Whoosh, combatWhooshCue.at,
+                           combatWhooshCue.power);
+        }
+        if (combatFleshCue.pending) {
+          audioCues.Combat(audio::Cues::CombatCue::Flesh, combatFleshCue.at,
+                           combatFleshCue.power);
+        }
+        if (combatClangCue.pending) {
+          audioCues.Combat(audio::Cues::CombatCue::Clang, combatClangCue.at,
+                           combatClangCue.power);
+        }
+
         // Limbs that came off this frame. The creature's cry fires for every
         // sever; the wet CUT only for one made by a blade, because an
         // explosion that takes the same arm off did not saw through anything.
@@ -5609,6 +5896,17 @@ int main(int argc, char** argv) {
       debris.ClearImpactEvents();
       mobs.ClearSeverEvents();
       mobs.ClearVoiceEvents();
+      // OUTSIDE the audio block, exactly like the queues above and for the
+      // same reason stated there: a request that only clears when audio
+      // happens to be on is a stuck flag on a silent machine, and the next
+      // frame with audio would play a whoosh for a cut made minutes ago.
+      combatWhooshCue.pending = false;
+      combatFleshCue.pending = false;
+      combatClangCue.pending = false;
+      // The hit flash decays in REAL time, once per frame — see
+      // MobSystem::DecayHitFlash for why not per tick. Unconditional for the
+      // same reason: it is not an audio effect and must not depend on one.
+      mobs.DecayHitFlash((float)dt);
       // Adaptive fog: pin the fade to whatever cascade radius is actually
       // filled, so a backlogged refill (spawn, load, teleport, sprinting past
       // a level's hysteresis) fogs out the pending bands instead of showing
@@ -6003,6 +6301,34 @@ int main(int argc, char** argv) {
         t.sim.windPartScale = ui.windPartScale;
         t.sim.windDragRef = ui.windDragRef;
         SetCurrentTuning(t);
+      }
+
+      // ---- the Combat panel ------------------------------------------------
+      //
+      // The panel already wrote the tuning itself (see UIState::
+      // combatWindowOpen for why that one deviates from the mirror pattern),
+      // so there is nothing to copy here. TWO THINGS still have to happen on
+      // this side, and neither is a tuning value:
+      //
+      //   * MeleeState caches its MeleeTuning BY VALUE, so a `melee.*` edit is
+      //     invisible to the live stroke until it is re-applied. This is the
+      //     same class of thing as RefreshGoreProfiles in the F5 block: state
+      //     drawn from the tuning at some earlier moment has to be told.
+      //     `combatfx.*` and `gore.*` need no equivalent — every reader of
+      //     those goes through CurrentTuning() at the point of use.
+      //   * Save is a file write, which the overlay has no business doing.
+      if (ui.combatTuningDirty) {
+        ui.combatTuningDirty = false;
+        ApplyMeleeTuning(melee.tuning);
+      }
+      if (ui.combatSave) {
+        ui.combatSave = false;
+        std::string serr;
+        ui.combatSaveStatus =
+            SaveCombatTuning(assetDir + "/materials/tuning.json",
+                             CurrentTuning(), serr)
+                ? "saved"
+                : ("FAILED: " + serr);
       }
 
       // ---- NPC behaviour profile editing -----------------------------------

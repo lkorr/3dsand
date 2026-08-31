@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <fstream>
 #include <sstream>
 
@@ -805,6 +806,162 @@ bool LoadTuning(const std::string& path, Tuning& out) {
       out.warnings.push_back(at + ".severGobbetSpread < 0; clamped to 0");
       e.severGobbetSpread = 0.0f;
     }
+  }
+
+  // ---- melee: the stroke driver's feel (game/melee.h MeleeTuning) -----------
+  // Read straight into Tuning::Melee; game/melee.cpp ApplyMeleeTuning is what
+  // turns this into a MeleeTuning (and what does the metres -> world voxel
+  // conversion for the four keys whose names carry a unit).
+  if (const json* g = Find(j, "melee")) {
+    auto& e = out.melee;
+    const std::string at = "melee";
+    ReadF(*g, "commitSpeed", e.commitSpeed, out, at);
+    ReadF(*g, "slashTime", e.slashTime, out, at);
+    ReadF(*g, "recoverTime", e.recoverTime, out, at);
+    ReadF(*g, "fullSpeedMps", e.fullSpeedMps, out, at);
+    ReadF(*g, "minSpeedMps", e.minSpeedMps, out, at);
+    ReadF(*g, "aimGainX", e.aimGainX, out, at);
+    ReadF(*g, "aimGainY", e.aimGainY, out, at);
+    ReadF(*g, "reachGainM", e.reachGainM, out, at);
+    ReadF(*g, "azOut", e.azOut, out, at);
+    ReadF(*g, "azAcross", e.azAcross, out, at);
+    ReadF(*g, "elMin", e.elMin, out, at);
+    ReadF(*g, "elMax", e.elMax, out, at);
+    ReadF(*g, "handExtend", e.handExtend, out, at);
+    ReadF(*g, "extendSmoothing", e.extendSmoothing, out, at);
+    ReadF(*g, "leanTurnRate", e.leanTurnRate, out, at);
+    ReadF(*g, "handLead", e.handLead, out, at);
+    ReadF(*g, "fallbackReachM", e.fallbackReachM, out, at);
+    ReadF(*g, "reachFraction", e.reachFraction, out, at);
+    ReadF(*g, "guardForwardM", e.guardForwardM, out, at);
+    ReadF(*g, "guardUpM", e.guardUpM, out, at);
+    ReadF(*g, "guardSideM", e.guardSideM, out, at);
+    ReadF(*g, "dirSmoothing", e.dirSmoothing, out, at);
+    ReadF(*g, "swingArc", e.swingArc, out, at);
+    ReadF(*g, "swingAnticipate", e.swingAnticipate, out, at);
+    ReadF(*g, "swingExtend", e.swingExtend, out, at);
+    ReadF(*g, "bladeSmoothing", e.bladeSmoothing, out, at);
+    ReadF(*g, "wristMaxAngle", e.wristMaxAngle, out, at);
+    ReadF(*g, "edgeFloor", e.edgeFloor, out, at);
+
+    // ---- BOUNDS, not taste ---------------------------------------------------
+    // Every clamp here protects a STRUCTURAL property of the stroke rather than
+    // an opinion about how it should feel, and each one is a thing a slider
+    // dragged to its end can otherwise break outright:
+    //
+    //   * a zero or negative time divides in SlashProgress and in the phase
+    //     machine's own normalisation;
+    //   * a zero speed BAND makes the damage ramp `(v - min) / (full - min)`
+    //     singular, and the sweep's own `max(..., 1e-3f)` would then quietly
+    //     turn every touch into a full-power hit;
+    //   * a smoothing halflife of 0 is a step function, which is what the lean
+    //     plane's rate limit exists to avoid (melee.h: the interpolation
+    //     between two opposite leans passes through the degenerate radius);
+    //   * an aim gain of 0 disconnects the mouse, which reads as a hung game
+    //     rather than as a setting.
+    e.commitSpeed = std::max(e.commitSpeed, 1.0f);
+    e.slashTime = std::clamp(e.slashTime, 0.02f, 2.0f);
+    e.recoverTime = std::clamp(e.recoverTime, 0.02f, 2.0f);
+    e.fullSpeedMps = std::clamp(e.fullSpeedMps, 0.05f, 60.0f);
+    e.minSpeedMps = std::clamp(e.minSpeedMps, 0.0f, 60.0f);
+    if (e.minSpeedMps >= e.fullSpeedMps) {
+      out.warnings.push_back(at +
+                             ".minSpeedMps >= fullSpeedMps; the damage ramp "
+                             "has no band. Pulling min down to 0.5x full.");
+      e.minSpeedMps = e.fullSpeedMps * 0.5f;
+    }
+    e.aimGainX = std::clamp(e.aimGainX, 0.0002f, 0.10f);
+    e.aimGainY = std::clamp(e.aimGainY, 0.0002f, 0.10f);
+    e.reachGainM = std::clamp(e.reachGainM, 0.0f, 0.2f);
+    // The azimuth stops are asymmetric because an arm is (melee.h), but both
+    // have to leave a window the seed can live in: a walk cycle parks the
+    // weapon arm near the bottom of the elevation range, and a window that
+    // could not represent it would move the blade on the take-over tick — the
+    // one thing the whole design forbids.
+    e.azOut = std::clamp(e.azOut, 0.20f, 3.10f);
+    e.azAcross = std::clamp(e.azAcross, 0.20f, 3.10f);
+    e.elMin = std::clamp(e.elMin, -1.55f, -0.10f);
+    e.elMax = std::clamp(e.elMax, 0.10f, 1.55f);
+    e.handExtend = std::clamp(e.handExtend, 0.15f, 1.0f);
+    e.extendSmoothing = std::clamp(e.extendSmoothing, 0.005f, 2.0f);
+    e.leanTurnRate = std::clamp(e.leanTurnRate, 0.5f, 120.0f);
+    // ONLY THE SIGN IS READ (melee.h), so normalise it here rather than letting
+    // a 0 in the JSON become an unreadable "the hand neither leads nor trails".
+    e.handLead = e.handLead < 0.0f ? -1.0f : 1.0f;
+    e.fallbackReachM = std::clamp(e.fallbackReachM, 0.05f, 4.0f);
+    // Strictly under 1: a fully straight two-bone chain is a locked elbow, and
+    // AnimSolveTwoBone clamps to its own annulus anyway — a target outside the
+    // reach costs mouse travel to wind back before the arm visibly moves, which
+    // is exactly the "the input went dead" feel integration exists to avoid.
+    e.reachFraction = std::clamp(e.reachFraction, 0.20f, 0.99f);
+    e.guardForwardM = std::clamp(e.guardForwardM, -2.0f, 2.0f);
+    e.guardUpM = std::clamp(e.guardUpM, -2.0f, 2.0f);
+    e.guardSideM = std::clamp(e.guardSideM, -2.0f, 2.0f);
+    e.dirSmoothing = std::clamp(e.dirSmoothing, 0.005f, 1.0f);
+    e.swingArc = std::clamp(e.swingArc, 0.0f, 3.10f);
+    e.swingAnticipate = std::clamp(e.swingAnticipate, 0.0f, 1.0f);
+    e.swingExtend = std::clamp(e.swingExtend, 0.0f, 1.0f);
+    e.bladeSmoothing = std::clamp(e.bladeSmoothing, 0.005f, 1.0f);
+    // Past ~pi the "wrist" is a ball joint and the fist can end up facing
+    // backwards down its own arm (game/mob.cpp applies this as a slerp limit).
+    e.wristMaxAngle = std::clamp(e.wristMaxAngle, 0.0f, 3.14f);
+    e.edgeFloor = std::clamp(e.edgeFloor, 0.0f, 1.0f);
+  }
+
+  // ---- combat feel: hit-stop, hit flash, combat cues ------------------------
+  if (const json* g = Find(j, "combatfx")) {
+    auto& e = out.combatfx;
+    const std::string at = "combatfx";
+    ReadB(*g, "hitStop", e.hitStop, out, at);
+    ReadF(*g, "hitStopChipScale", e.hitStopChipScale, out, at);
+    ReadF(*g, "hitStopChipMs", e.hitStopChipMs, out, at);
+    ReadF(*g, "hitStopFleshScale", e.hitStopFleshScale, out, at);
+    ReadF(*g, "hitStopFleshMs", e.hitStopFleshMs, out, at);
+    ReadF(*g, "hitStopSeverScale", e.hitStopSeverScale, out, at);
+    ReadF(*g, "hitStopSeverMs", e.hitStopSeverMs, out, at);
+    ReadF(*g, "flashChip", e.flashChip, out, at);
+    ReadF(*g, "flashFlesh", e.flashFlesh, out, at);
+    ReadF(*g, "flashSever", e.flashSever, out, at);
+    ReadF(*g, "flashHalflife", e.flashHalflife, out, at);
+    ReadF(*g, "whooshVolume", e.whooshVolume, out, at);
+    ReadF(*g, "whooshMinSpeed", e.whooshMinSpeed, out, at);
+    ReadF(*g, "whooshRateSlow", e.whooshRateSlow, out, at);
+    ReadF(*g, "whooshRateFast", e.whooshRateFast, out, at);
+    ReadF(*g, "fleshVolume", e.fleshVolume, out, at);
+    ReadF(*g, "clangVolume", e.clangVolume, out, at);
+    ReadF(*g, "cueRadius", e.cueRadius, out, at);
+
+    // ---- BOUNDS ---------------------------------------------------------------
+    // THE DIP MAY NOT REACH ZERO AND MAY NOT LAST. A scale of 0 stops the tick
+    // accumulator filling at all, which is a hang the player cannot get out of
+    // by any input, since every input is consumed inside the tick loop. A
+    // duration in whole seconds is the same hang with a timer on it. 0.02 and
+    // 400 ms are both well past anything that reads as impact and comfortably
+    // short of anything that reads as broken.
+    e.hitStopChipScale = std::clamp(e.hitStopChipScale, 0.02f, 1.0f);
+    e.hitStopFleshScale = std::clamp(e.hitStopFleshScale, 0.02f, 1.0f);
+    e.hitStopSeverScale = std::clamp(e.hitStopSeverScale, 0.02f, 1.0f);
+    e.hitStopChipMs = std::clamp(e.hitStopChipMs, 0.0f, 400.0f);
+    e.hitStopFleshMs = std::clamp(e.hitStopFleshMs, 0.0f, 400.0f);
+    e.hitStopSeverMs = std::clamp(e.hitStopSeverMs, 0.0f, 400.0f);
+    // The flash is added to a LINEAR HDR colour before the tonemap. Past about
+    // 4 the tonemap has nothing left to give and every tier looks identical, so
+    // the ceiling is where the knob stops doing anything rather than where it
+    // starts looking bad.
+    e.flashChip = std::clamp(e.flashChip, 0.0f, 4.0f);
+    e.flashFlesh = std::clamp(e.flashFlesh, 0.0f, 4.0f);
+    e.flashSever = std::clamp(e.flashSever, 0.0f, 4.0f);
+    // A zero halflife would never decay (the per-frame factor is
+    // exp2(-dt/halflife), which is 0/0 at 0), leaving every struck limb lit for
+    // the rest of the session.
+    e.flashHalflife = std::clamp(e.flashHalflife, 0.01f, 2.0f);
+    e.whooshVolume = std::clamp(e.whooshVolume, 0.0f, 4.0f);
+    e.whooshMinSpeed = std::max(e.whooshMinSpeed, 0.0f);
+    e.whooshRateSlow = std::clamp(e.whooshRateSlow, 0.25f, 4.0f);
+    e.whooshRateFast = std::clamp(e.whooshRateFast, 0.25f, 4.0f);
+    e.fleshVolume = std::clamp(e.fleshVolume, 0.0f, 4.0f);
+    e.clangVolume = std::clamp(e.clangVolume, 0.0f, 4.0f);
+    e.cueRadius = std::clamp(e.cueRadius, 1.0f, 400.0f);
   }
 
   if (const json* g = Find(j, "grenade")) {
@@ -2312,6 +2469,198 @@ std::string WorldgenDefaultsJson() {
   s("editLayer", w.editLayer);
   o << "\n  }\n}\n";
   return o.str();
+}
+
+// ============================================================================
+// WRITING THE COMBAT GROUPS BACK — see SaveCombatTuning's note in tuning.h.
+// ============================================================================
+namespace {
+
+// The byte span of `"<group>": { ... }` at the top level, or (npos, npos).
+// Brace-counted rather than regexed because the gore group contains nested
+// objects (the `<key>Var` siblings) and a first-closing-brace search would stop
+// inside the first of them.
+std::pair<size_t, size_t> JsonGroupSpan(const std::string& text,
+                                        const char* group) {
+  const std::string needle = std::string("\"") + group + "\"";
+  const size_t k = text.find(needle);
+  if (k == std::string::npos) return {std::string::npos, std::string::npos};
+  const size_t open = text.find('{', k);
+  if (open == std::string::npos) return {std::string::npos, std::string::npos};
+  int depth = 0;
+  for (size_t i = open; i < text.size(); i++) {
+    if (text[i] == '{') depth++;
+    else if (text[i] == '}' && --depth == 0) return {open, i};
+  }
+  return {std::string::npos, std::string::npos};
+}
+
+// Replace the VALUE of `"key"` inside [lo, hi) with `value`. Returns false —
+// changing nothing — if the key is absent or the value is not a literal we
+// recognise, so the caller can refuse the whole write.
+bool PatchJsonValue(std::string& text, size_t lo, size_t hi, const char* key,
+                    const std::string& value) {
+  const std::string needle = std::string("\"") + key + "\"";
+  const size_t k = text.find(needle, lo);
+  if (k == std::string::npos || k >= hi) return false;
+  size_t c = text.find(':', k + needle.size());
+  if (c == std::string::npos || c >= hi) return false;
+  size_t b = c + 1;
+  while (b < hi && (text[b] == ' ' || text[b] == '\t')) b++;
+  // The value runs to the next separator. A string value would need quote
+  // handling; nothing in these three groups has one, so a value that starts
+  // with a quote is refused rather than mangled.
+  if (b >= hi || text[b] == '"' || text[b] == '{' || text[b] == '[') return false;
+  size_t e = b;
+  while (e < hi && text[e] != ',' && text[e] != '\n' && text[e] != '}') e++;
+  // Trim trailing space so a value written into `1 ,` does not grow one.
+  size_t trimmed = e;
+  while (trimmed > b && (text[trimmed - 1] == ' ' || text[trimmed - 1] == '\r'))
+    trimmed--;
+  text.replace(b, trimmed - b, value);
+  return true;
+}
+
+std::string NumLit(float v) {
+  // %g so an integral value stays integral in the file (`18`, not `18.000000`)
+  // and the diff after a Save is only the knobs that actually moved. 9 digits
+  // is exactly round-trippable for a float, which matters because the panel
+  // Saves values it just read back out of this same file.
+  char buf[40];
+  std::snprintf(buf, sizeof(buf), "%.9g", (double)v);
+  return buf;
+}
+
+}  // namespace
+
+bool SaveCombatTuning(const std::string& path, const Tuning& t,
+                      std::string& err) {
+  std::ifstream in(path, std::ios::binary);
+  if (!in) {
+    err = "cannot read " + path;
+    return false;
+  }
+  std::string text((std::istreambuf_iterator<char>(in)),
+                   std::istreambuf_iterator<char>());
+  in.close();
+
+  // Patch into a COPY and only commit if every key landed. See the all-or-
+  // nothing note in tuning.h: a partial write is the failure mode that looks
+  // like a success.
+  std::string outText = text;
+  std::string missing;
+  auto group = [&](const char* name, size_t& lo, size_t& hi) {
+    const auto span = JsonGroupSpan(outText, name);
+    lo = span.first;
+    hi = span.second;
+    if (lo == std::string::npos) missing += std::string(" ") + name;
+    return lo != std::string::npos;
+  };
+
+  size_t lo = 0, hi = 0;
+  auto put = [&](const char* key, float v) {
+    if (lo == std::string::npos) return;
+    if (!PatchJsonValue(outText, lo, hi, key, NumLit(v)))
+      missing += std::string(" ") + key;
+  };
+  auto putI = [&](const char* key, int v) {
+    if (lo == std::string::npos) return;
+    if (!PatchJsonValue(outText, lo, hi, key, std::to_string(v)))
+      missing += std::string(" ") + key;
+  };
+  auto putB = [&](const char* key, bool v) {
+    if (lo == std::string::npos) return;
+    if (!PatchJsonValue(outText, lo, hi, key, v ? "true" : "false"))
+      missing += std::string(" ") + key;
+  };
+
+  if (group("melee", lo, hi)) {
+    const Tuning::Melee& m = t.melee;
+    put("commitSpeed", m.commitSpeed);
+    put("slashTime", m.slashTime);
+    put("recoverTime", m.recoverTime);
+    put("fullSpeedMps", m.fullSpeedMps);
+    put("minSpeedMps", m.minSpeedMps);
+    put("aimGainX", m.aimGainX);
+    put("aimGainY", m.aimGainY);
+    put("reachGainM", m.reachGainM);
+    put("azOut", m.azOut);
+    put("azAcross", m.azAcross);
+    put("elMin", m.elMin);
+    put("elMax", m.elMax);
+    put("handExtend", m.handExtend);
+    put("extendSmoothing", m.extendSmoothing);
+    put("leanTurnRate", m.leanTurnRate);
+    put("handLead", m.handLead);
+    put("fallbackReachM", m.fallbackReachM);
+    put("reachFraction", m.reachFraction);
+    put("guardForwardM", m.guardForwardM);
+    put("guardUpM", m.guardUpM);
+    put("guardSideM", m.guardSideM);
+    put("dirSmoothing", m.dirSmoothing);
+    put("swingArc", m.swingArc);
+    put("swingAnticipate", m.swingAnticipate);
+    put("swingExtend", m.swingExtend);
+    put("bladeSmoothing", m.bladeSmoothing);
+    put("wristMaxAngle", m.wristMaxAngle);
+    put("edgeFloor", m.edgeFloor);
+  }
+  if (group("combatfx", lo, hi)) {
+    const Tuning::CombatFx& f = t.combatfx;
+    putB("hitStop", f.hitStop);
+    put("hitStopChipScale", f.hitStopChipScale);
+    put("hitStopChipMs", f.hitStopChipMs);
+    put("hitStopFleshScale", f.hitStopFleshScale);
+    put("hitStopFleshMs", f.hitStopFleshMs);
+    put("hitStopSeverScale", f.hitStopSeverScale);
+    put("hitStopSeverMs", f.hitStopSeverMs);
+    put("flashChip", f.flashChip);
+    put("flashFlesh", f.flashFlesh);
+    put("flashSever", f.flashSever);
+    put("flashHalflife", f.flashHalflife);
+    put("whooshVolume", f.whooshVolume);
+    put("whooshMinSpeed", f.whooshMinSpeed);
+    put("whooshRateSlow", f.whooshRateSlow);
+    put("whooshRateFast", f.whooshRateFast);
+    put("fleshVolume", f.fleshVolume);
+    put("clangVolume", f.clangVolume);
+    put("cueRadius", f.cueRadius);
+  }
+  // GORE TOO, because the Combat panel's Damage tab edits it. A Save button
+  // that silently declined to save one of its own three tabs is the worst kind
+  // of bug: the work is gone and nothing said so. Only the keys that tab
+  // exposes are written — the rest of gore.* belongs to the browser tuner and
+  // must not be re-emitted from a struct the panel never showed.
+  if (group("gore", lo, hi)) {
+    const Tuning::Gore& g = t.gore;
+    put("cutDepth", g.cutDepth);
+    put("cutDepthPower", g.cutDepthPower);
+    put("cutLength", g.cutLength);
+    put("cutWidth", g.cutWidth);
+    putI("cutSpallRounds", g.cutSpallRounds);
+    put("cutSpallStrength", g.cutSpallStrength);
+    put("woundSeverFraction", g.woundSeverFraction);
+    put("woundNeckRadius", g.woundNeckRadius);
+    put("woundNeckFraction", g.woundNeckFraction);
+    put("woundImpactSeverScale", g.woundImpactSeverScale);
+    put("woundHeftRef", g.woundHeftRef);
+    put("woundHeftMax", g.woundHeftMax);
+    put("woundStainRadius", g.woundStainRadius);
+    put("woundStainDensity", g.woundStainDensity);
+    put("bleedGain", g.bleedGain);
+  }
+
+  if (!missing.empty()) {
+    err = "tuning.json is missing:" + missing;
+    return false;
+  }
+  std::ofstream outF(path, std::ios::binary | std::ios::trunc);
+  if (!outF) {
+    err = "cannot write " + path;
+    return false;
+  }
+  outF << outText;
+  return true;
 }
 
 std::string TuningWgslBlock(const Tuning& t) {

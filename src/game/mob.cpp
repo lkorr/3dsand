@@ -2948,6 +2948,23 @@ bool Mob::Damage(uint64_t bodyHandle, float amount, Vec3 hitWorldVoxel,
                               impactSpeed >= impactBar;
     limb.hp -= amount;
     limb.woundLocal = RotateInv(q, hitWorldVoxel - limb.xf.pos);
+    // ---- THE HIT FLASH ------------------------------------------------------
+    // Set HERE rather than at the melee sweep, so it fires for every cause —
+    // blade, beam, blast, a thrown rock — and so the melee sweep does not have
+    // to be the one place that knows what a hit looks like.
+    //
+    // TWO TIERS, and the split is free because the limb already knows which it
+    // is: a BORROWED ITEM SLOT (a held sword, a shield) gets the chip flash,
+    // live flesh gets the flesh one. That is the "blocked / item hit vs flesh
+    // hit" distinction, made where the information is rather than reconstructed
+    // downstream. Peak-held for the same reason the audio's severity is: two
+    // probes of one sweep land on the same limb in the same tick, and the
+    // second must not dim the first.
+    {
+      const Tuning::CombatFx& fx = CurrentTuning().combatfx;
+      const float want = (ld.tag == "item") ? fx.flashChip : fx.flashFlesh;
+      limb.hitFlash = std::max(limb.hitFlash, want);
+    }
     limb.bleedBudget =
         AddBleedBudget(limb.bleedBudget, amount * def_->bleedPerDamage);
     if (impactSevers || (limb.hp <= 0 && HpZeroSevers((int)i))) {
@@ -5542,6 +5559,13 @@ void Mob::Sever(int limbIndex) {
           // independent of the order limbs happened to be damaged in.
           parent.gushTicks = gore_.severDecayTicks;
           parent.gushLocal = parent.woundLocal;
+          // The stump takes the SEVER flash, on top of whatever flesh flash
+          // the blow that caused it already put there. On the parent rather
+          // than on the piece that came off, for exactly the reason the gout
+          // is: the piece is on its way to the debris system and will not be
+          // in this rig's instance walk next frame.
+          parent.hitFlash =
+              std::max(parent.hitFlash, CurrentTuning().combatfx.flashSever);
           // Spray along the stump: from the parent's centre out through the
           // wound, so a cut arm sprays away from the torso instead of into it.
           Vec3 out = anchorW - parent.xf.pos;
@@ -5810,6 +5834,37 @@ void Mob::AppendDebugBoxes(std::vector<DebugBox>& out, size_t limit,
   }
 }
 
+// ---- hit flash -------------------------------------------------------------
+//
+// See MobSystem::DecayHitFlash's note in mob.h for why this is FRAME time and
+// not tick time. The system-wide early-out is what makes it free in a world
+// where nothing is being hit, which is nearly always (rule 2).
+void MobSystem::DecayHitFlash(float dt) {
+  if (dt <= 0.0f) return;
+  const float halflife = std::max(CurrentTuning().combatfx.flashHalflife, 0.01f);
+  const float k = std::exp2(-dt / halflife);
+  for (Mob& mob : mobs_)
+    for (MobLimb& limb : mob.limbs_) {
+      if (limb.hitFlash <= 0.0f) continue;
+      limb.hitFlash *= k;
+      // Snap the tail to zero rather than letting it asymptote: an exponential
+      // never reaches 0, and a limb left holding 1e-12 forever would keep this
+      // loop doing multiplications for the rest of the session for a value no
+      // display can show.
+      if (limb.hitFlash < 0.002f) limb.hitFlash = 0.0f;
+    }
+}
+
+void MobSystem::FlashBody(uint64_t bodyHandle, float amount) {
+  if (!bodyHandle || amount <= 0.0f) return;
+  for (Mob& mob : mobs_)
+    for (MobLimb& limb : mob.limbs_)
+      if (limb.body == bodyHandle) {
+        limb.hitFlash = std::max(limb.hitFlash, amount);
+        return;
+      }
+}
+
 void MobSystem::AppendMicroInsts(std::vector<MicroBodyInstGpu>& out,
                                  uint32_t slotBase) const {
   uint32_t slot = slotBase;
@@ -5825,8 +5880,15 @@ uint32_t Mob::AppendMicroInsts(std::vector<MicroBodyInstGpu>& out,
     const MobLimb& limb = limbs_[i];
     if (!limb.body) continue;
     if (slot >= kMaxBodySlots) return slot;
-    if (limb.microModel >= 0 && !LimbHidden((int)i))
-      out.push_back({slot, (uint32_t)limb.microModel, 0, 0});
+    if (limb.microModel >= 0 && !LimbHidden((int)i)) {
+      // The flash rides the spare word as a float bit pattern; 0 stays 0.
+      // memcpy rather than a reinterpret_cast because the latter is a
+      // strict-aliasing violation the optimiser is allowed to act on, and this
+      // is a render path that runs once per limb per frame.
+      uint32_t bits = 0;
+      if (limb.hitFlash > 0.0f) std::memcpy(&bits, &limb.hitFlash, 4);
+      out.push_back({slot, (uint32_t)limb.microModel, bits, 0});
+    }
     slot++;
   }
   return slot;

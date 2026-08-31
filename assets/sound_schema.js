@@ -175,6 +175,51 @@ const SOUND_SCHEMA = {
        gain:'audio.nightVolume, eased in and out across dusk/dawn'},
     ],
   },
+
+  // ---- melee combat -----------------------------------------------------
+  // The three sounds a fight makes that belong to no material and no creature:
+  // the AIR a blade moves, the BLOW landing on a body, and STEEL stopping
+  // steel. Owned like the night bed (store 'none'): there is exactly one set
+  // per slot, fixed in audio/cues.cpp, and what you author is the TUNING —
+  // the combatfx group carries each one's volume, the whoosh's speed window
+  // and its pitch ramp.
+  //
+  // WHY NOT PER-ITEM. A sword and a cleaver want different whooshes, and this
+  // is deliberately not that: the binding would belong on ItemDef, which means
+  // a fourth authoring surface and a fallback chain, for a difference nobody
+  // can currently hear. When items DO get voices, these three stay as the
+  // fallback and the item's own key overrides them — the same shape `step`
+  // has against `footstep` above.
+  combat: {
+    store: 'none',
+    title: 'Melee combat',
+    icon: '⚔',
+    blurb: 'Swinging, hitting and being stopped. One owner, so the set names ' +
+           'are fixed in code; the combatfx tuning group is where the volume, ' +
+           'the pitch ramp and the speed threshold live.',
+    slots: [
+      {k:'whoosh', n:'swing (air)', prefix:'melee',
+       d:'The blade moving. Fires ONCE on the tick a guard commits to a cut, not while it is being aimed — a stroke you are steering has not happened yet. Both the volume and the pitch come off the stroke speed the game actually read from the mouse, so a lazy wave is quiet and low and a real flick is loud and tight; a stroke under combatfx.whooshMinSpeed makes no sound at all, which is the audio half of melee’s “speed is the damage” law.',
+       fires:'audio::Cues::Combat(Whoosh) — main.cpp, off a MeleeState phase edge into Slash',
+       fallback:'silent.',
+       gain:'combatfx.whooshVolume, scaled by stroke speed',
+       pitch:'combatfx.whooshRateSlow..whooshRateFast across the speed window'},
+
+      {k:'flesh', n:'blow lands (body)', prefix:'melee',
+       d:'The edge going into a living body — the THUD of the blow, as distinct from `dismember`, which is the wet parting of a limb that comes off, and from the creature’s own cry, which is `hurt`. All three can fire for one sword blow and they are not the same sound: this one fires for EVERY landed cut, including the dozen that never sever anything.',
+       fires:'audio::Cues::Combat(Flesh) — main.cpp, when the melee sweep hurts a live mob',
+       fallback:'silent.',
+       gain:'combatfx.fleshVolume, scaled by the blow’s power (speed x edge alignment)',
+       pitch:'lower for a heavier blow, the same shape Impact uses'},
+
+      {k:'clang', n:'blocked (steel)', prefix:'melee',
+       d:'A cut stopped by something that is not flesh: a parry, a shield, a blade caught on a held weapon. Deliberately a separate slot from `flesh` rather than a variant of it, because the two carry opposite information to the player — one says the blow landed, the other says it did not, and a fight is unreadable if they sound alike.',
+       fires:'audio::Cues::Combat(Clang) — main.cpp, from CombatBlockCue(). Wired for the melee sweep hitting a non-flesh body; the BLOCK proper (an NPC raising a guard) lands with phase C’s BlockEvent, which calls the same hook.',
+       fallback:'silent.',
+       gain:'combatfx.clangVolume, scaled by the blow’s power',
+       pitch:'higher for a faster blow'},
+    ],
+  },
 };
 
 // Every namespace a slot can bind into, for the set browser's grouping and for

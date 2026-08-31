@@ -130,9 +130,19 @@ enum class SwingPhase : uint8_t {
   Recover,    // the cut's follow-through unwinds; the arm is handed back
 };
 
-// Tunable feel. Lives here rather than in tuning.json for the first pass
-// because these are the knobs being *designed*, not the ones being dialled;
-// once the feel settles they belong in tuning.json like everything else.
+// Tunable feel.
+//
+// THE VALUES NOW COME FROM tuning.json (`melee.*`, sim/tuning.h Tuning::Melee),
+// applied through ApplyMeleeTuning below. The struct stayed exactly where it
+// was and kept exactly its fields, because it is what MeleeState holds, what
+// MeleeSweepDamage takes by const reference, and what every gate reads — moving
+// the numbers is a different change from moving the type, and only the first
+// one was wanted. The initialisers below are still the DEFAULTS in the strict
+// sense: they are what you get when the JSON is missing, and tuning.json ships
+// values identical to them, so behaviour at defaults is unchanged.
+//
+// The one number that DID move is `wristMaxAngle` (2.80 -> 1.50), and it moved
+// because the grip it was compensating for was re-authored — see its own note.
 struct MeleeTuning {
   // Mouse pixels per second past which a guarded blade commits to a cut. Low
   // enough that an intentional flick always fires, high enough that aiming
@@ -260,21 +270,31 @@ struct MeleeTuning {
   // How far the wrist may take the blade away from the orientation the solved
   // arm would give it for free, radians.
   //
-  // IT IS NOT ALL WRIST, and that is why the number is so large. This rig's
-  // authored grip holds the blade PERPENDICULAR to the forearm (sword.json's
-  // -90 degree grip rotation, and gen_sword_item.py says so in as many words),
-  // which was right when the sword was never re-aimed. A cut wants the blade
-  // roughly along the arm's own line, so about 90 degrees of this budget is
-  // spent undoing the authored grip before any steering happens at all —
-  // measured, the stroke asked for 2.0 to 3.0 radians and an 85-degree cap
-  // clipped every tick of it, which showed up as the blade pointing up to 100
-  // degrees away from the cut.
+  // IT USED TO BE 2.80 — 160 degrees, which is a ball joint and not a wrist —
+  // and the reason was structural rather than a taste for loose wrists. The
+  // authored grip held the blade PERPENDICULAR to the forearm (sword.json's
+  // `[0, -90, 0]`, and gen_sword_item.py said so in as many words), which was
+  // right back when the sword was never re-aimed. A cut wants the blade roughly
+  // along the arm's own line, so about 90 degrees of the budget was spent
+  // undoing the authored grip before any steering happened at all — measured,
+  // the stroke asked for 2.0 to 3.0 radians and an 85-degree cap clipped every
+  // tick of it, which showed up as the blade pointing up to 100 degrees away
+  // from the cut.
   //
-  // The structural fix is to re-author the grip so a neutral wrist already
-  // holds the blade along the arm; that changes how a sheathed sword looks in
-  // every screenshot, so it belongs with the rest of the tuning promotion
-  // rather than here. Until then this bounds the STEERING and not the grip.
-  float wristMaxAngle = 2.80f;
+  // THE GRIP IS NOW RE-AUTHORED, which is what makes this number honest.
+  // assets/items/{sword,cleaver}.json rotate `[0, 0, -90]`: the blade is built
+  // along the item's +x, the arm extends along the rig's -y, and a -90 about Z
+  // carries +x onto -y, so a NEUTRAL wrist already holds the blade down the
+  // arm's own line. Verified rather than reasoned, which is the rule for every
+  // rotation in this repo:
+  //
+  //   python scripts/geometry.py rotate_point 0 0 1 -90 -- 1 0 0
+  //   -> [0, -1, 0]                    (blade +x lands on -y, along the arm)
+  //
+  // With the 90 degrees of grip compensation gone, this bounds STEERING only,
+  // and 1.5 rad (86 degrees) is about what a wrist has. Lives in tuning.json as
+  // `melee.wristMaxAngle`, so the number is a JSON edit rather than a rebuild.
+  float wristMaxAngle = 1.50f;
   // ---- the edge leads the cut ---------------------------------------------
   // Damage multiplier for a cut whose travel lies exactly in the FLAT of the
   // blade — a slap with the side. 1.0 disables edge alignment entirely; 0 makes
@@ -283,6 +303,30 @@ struct MeleeTuning {
   // cut worth doing.
   float edgeFloor = 0.35f;
 };
+
+// ---- WHERE THE NUMBERS COME FROM -------------------------------------------
+//
+// Fills a MeleeTuning from the `melee.*` group of tuning.json (sim/tuning.h
+// Tuning::Melee). Call it at startup and again on every F5, which is the whole
+// point: the feel loop is a JSON edit and a keypress, not a rebuild.
+//
+// A FREE FUNCTION taking the MeleeTuning by reference, rather than a
+// constructor or a member on MeleeState, for two reasons that are both about
+// the merge surface rather than about style:
+//
+//   * MeleeTuning is consumed by three callers (the player's tick, the NPC
+//     driver, the gates) as a plain aggregate, and giving it a non-trivial
+//     constructor would change how every one of them may declare one;
+//   * a gate that wants the AUTHORED feel calls this, and a gate that wants a
+//     fixture with one knob moved builds a default MeleeTuning and assigns the
+//     field — neither has to know that tuning.json exists.
+//
+// `Tuning` is forward-declared: this header is included by mob.h, and pulling
+// sim/tuning.h in here would put the whole tuning surface into every rig TU.
+struct Tuning;
+void ApplyMeleeTuning(MeleeTuning& dst, const Tuning& t);
+// Same, from CurrentTuning(). The form every caller outside a gate wants.
+void ApplyMeleeTuning(MeleeTuning& dst);
 
 // HOW MUCH OF A CUT LANDS, given the blade's roll. `flat` is the normal of the
 // blade's cutting plane (the flat's outward direction) and `travel` is where
@@ -375,8 +419,8 @@ struct WeaponPose {
   // from a tuning struct in the rig code because Mob has no MeleeState and must
   // not grow one: the driver owns the feel, the rig owns the anatomy, and this
   // is the one number that crosses. (Default mirrors MeleeTuning's; see the
-  // long note there for why it is not 90 degrees.)
-  float wristMaxAngle = 2.80f;
+  // long note there for why it is what it is, and why it used to be 2.80.)
+  float wristMaxAngle = 1.50f;
   // False is the legacy contract: drive the arm at `hand` and leave the blade
   // at whatever grip angle the fist gives it. True is the stroke driver: the
   // hand is ORIENTED so the blade points along bladeDir with its flat facing

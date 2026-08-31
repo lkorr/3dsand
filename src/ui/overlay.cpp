@@ -15,6 +15,7 @@
 // The ImGui_ImplWGPU_* half was deleted with Dawn (2026-08-22).
 #include "gpu/rhi_vk.h"
 #include "gpu/rhi_vulkan.h"
+#include "sim/tuning.h"  // the Combat panel edits melee/combatfx/gore live
 #include "sim/world.h"   // kWindPrimCap for the primitive panel
 #include "ui/inventory_ui.h"
 #include "ui/theme.h"
@@ -775,6 +776,18 @@ void Overlay::Draw(UIState& s) {
     ImGui::SameLine();
     ImGui::TextDisabled("%d live", (int)s.aiMobIds.size());
   }
+  // Off the MELEE tool, which is the one context where every knob in the panel
+  // is about what you are currently doing. Deliberately not off the mob tool
+  // beside the AI button: the two panels are used together, and a fight is
+  // tuned from the weapon's end.
+  if (s.tool == UIState::kToolMelee) {
+    if (ImGui::Button("Combat...")) s.combatWindowOpen = !s.combatWindowOpen;
+    ImGui::SameLine();
+    if (s.hitStopScale < 0.999f)
+      ImGui::TextDisabled("HIT-STOP %.2fx", s.hitStopScale);
+    else
+      ImGui::TextDisabled("stroke / gore / feel");
+  }
   if (s.tool == UIState::kToolBrush) {
     ImGui::TextDisabled("LMB paint  RMB erase  1-8 / combo below");
   } else if (s.tool == UIState::kToolLaser) {
@@ -1178,6 +1191,227 @@ void Overlay::Draw(UIState& s) {
           ImGui::EndTabItem();
         }
         ImGui::EndTabBar();
+      }
+    }
+    ImGui::End();
+  }
+
+  // ---- Combat window (game/melee.h, sim/tuning.h melee/combatfx/gore) ------
+  //
+  // THE FEEL LOOP, in one place: how the stroke is steered, what the edge does
+  // when it lands, and what the player is told about it. The three tabs are the
+  // three tuning groups behind a fight, and they are together here because they
+  // are only ever judged together — a swing that reads badly is as often the
+  // wound as the arc, and as often the hit-stop as either.
+  //
+  // LIVE, WITH NO MIRRORS. Unlike every other panel in this file, the sliders
+  // run on a copy of the tuning singleton and write it straight back, so there
+  // is nothing to reseat after an F5 or a browser-tuner save and no shadow copy
+  // of sixty knobs to drift. See the long note on UIState::combatWindowOpen for
+  // why this one deviates. `combatTuningDirty` still crosses to main.cpp,
+  // because MeleeState caches its MeleeTuning by value and has to be told.
+  //
+  // Scrolling is ImGui's own (child regions inside the tabs) — see overlay.h on
+  // why installing a GLFW scroll callback here would freeze the wheel
+  // everywhere.
+  if (s.combatWindowOpen) {
+    ImGui::SetNextWindowPos(ImVec2(1130, 12), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(420, 720), ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("Combat", &s.combatWindowOpen)) {
+      Tuning t = CurrentTuning();
+      bool moved = false;
+      // The AI panel's idiom exactly: the slider's own return value is the
+      // latch. No Apply button, because nothing here recompiles a shader — the
+      // melee and combatfx groups are CPU-only and gore is read per event, so
+      // every one of these lands on the next tick.
+      auto f = [&moved](const char* label, float* v, float lo, float hi,
+                        const char* fmt = "%.3f") {
+        if (ImGui::SliderFloat(label, v, lo, hi, fmt)) moved = true;
+      };
+      auto i32 = [&moved](const char* label, int* v, int lo, int hi) {
+        if (ImGui::SliderInt(label, v, lo, hi)) moved = true;
+      };
+      auto b = [&moved](const char* label, bool* v) {
+        if (ImGui::Checkbox(label, v)) moved = true;
+      };
+
+      if (ImGui::Button("Save")) s.combatSave = true;
+      ImGui::SameLine();
+      ImGui::TextDisabled("patches melee/combatfx/gore in tuning.json");
+      if (!s.combatSaveStatus.empty()) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("%s", s.combatSaveStatus.c_str());
+      }
+      ImGui::TextDisabled("sliders are LIVE. F5 reloads the file over them.");
+      ImGui::Separator();
+
+      if (ImGui::BeginTabBar("##combattabs")) {
+        // ---- Stroke: how the blade is steered ---------------------------
+        if (ImGui::BeginTabItem("Stroke")) {
+          ImGui::BeginChild("##strokescroll", ImVec2(0, 0), false);
+          Tuning::Melee& m = t.melee;
+          if (ImGui::CollapsingHeader("Aim", ImGuiTreeNodeFlags_DefaultOpen)) {
+            ImGui::TextDisabled("radians of tip travel per mouse pixel");
+            f("aim gain x", &m.aimGainX, 0.0005f, 0.02f, "%.4f");
+            f("aim gain y", &m.aimGainY, 0.0005f, 0.02f, "%.4f");
+            f("commit speed (px/s)", &m.commitSpeed, 100.0f, 3000.0f, "%.0f");
+            f("direction smoothing (s)", &m.dirSmoothing, 0.005f, 0.4f);
+            f("reach gain (m/unit)", &m.reachGainM, 0.0f, 0.02f, "%.4f");
+          }
+          if (ImGui::CollapsingHeader("Arc", ImGuiTreeNodeFlags_DefaultOpen)) {
+            f("swing arc (rad)", &m.swingArc, 0.0f, 3.1f, "%.2f");
+            f("anticipation", &m.swingAnticipate, 0.0f, 1.0f, "%.2f");
+            f("mid-stroke bow", &m.swingExtend, 0.0f, 0.6f, "%.2f");
+            f("slash time (s)", &m.slashTime, 0.03f, 0.6f);
+            f("recover time (s)", &m.recoverTime, 0.03f, 0.8f);
+          }
+          if (ImGui::CollapsingHeader("Where the point may go")) {
+            f("azimuth out (rad)", &m.azOut, 0.2f, 3.1f, "%.2f");
+            f("azimuth across (rad)", &m.azAcross, 0.2f, 3.1f, "%.2f");
+            f("elevation min (rad)", &m.elMin, -1.55f, -0.1f, "%.2f");
+            f("elevation max (rad)", &m.elMax, 0.1f, 1.55f, "%.2f");
+          }
+          if (ImGui::CollapsingHeader("Arm and wrist",
+                                      ImGuiTreeNodeFlags_DefaultOpen)) {
+            // The one number with a story. See MeleeTuning::wristMaxAngle.
+            f("wrist limit (rad)", &m.wristMaxAngle, 0.0f, 3.14f, "%.2f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "How far the wrist may take the blade from the orientation\n"
+                  "the solved forearm gives it for free.\n\n"
+                  "1.5 rad is about a wrist. It was 2.80 (a ball joint) only\n"
+                  "because the authored grip held the blade PERPENDICULAR to\n"
+                  "the forearm and ~90 degrees of the budget went on undoing\n"
+                  "that before any steering happened. The grip is now\n"
+                  "[0,0,-90] and a neutral wrist already points the blade\n"
+                  "down the arm, so this can be a wrist again.");
+            f("hand extension", &m.handExtend, 0.15f, 1.0f, "%.2f");
+            f("extension smoothing (s)", &m.extendSmoothing, 0.005f, 1.0f);
+            f("reach fraction", &m.reachFraction, 0.2f, 0.99f, "%.2f");
+            f("lean turn rate (rad/s)", &m.leanTurnRate, 0.5f, 60.0f, "%.1f");
+            f("blade smoothing (s)", &m.bladeSmoothing, 0.005f, 0.4f);
+            {
+              // Only the SIGN is read (melee.h), so this is a choice and not a
+              // slider. A slider here would let two knobs disagree about where
+              // the hand is.
+              bool handLeads = m.handLead >= 0.0f;
+              if (ImGui::Checkbox("hand leads the point (sabre cut)",
+                                  &handLeads)) {
+                m.handLead = handLeads ? 1.0f : -1.0f;
+                moved = true;
+              }
+            }
+          }
+          ImGui::EndChild();
+          ImGui::EndTabItem();
+        }
+
+        // ---- Damage: what the edge does when it lands -------------------
+        if (ImGui::BeginTabItem("Damage")) {
+          ImGui::BeginChild("##dmgscroll", ImVec2(0, 0), false);
+          Tuning::Gore& g = t.gore;
+          if (ImGui::CollapsingHeader("Speed is the damage",
+                                      ImGuiTreeNodeFlags_DefaultOpen)) {
+            ImGui::TextDisabled("tip speed, in m/s, at the two ends of the ramp");
+            f("full damage at (m/s)", &t.melee.fullSpeedMps, 0.1f, 20.0f, "%.2f");
+            f("nothing below (m/s)", &t.melee.minSpeedMps, 0.0f, 20.0f, "%.2f");
+            f("flat-on floor", &t.melee.edgeFloor, 0.0f, 1.0f, "%.2f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "Damage multiplier for a cut travelling in the blade's own\n"
+                  "FLAT — a slap with the side. 1.0 disables edge alignment\n"
+                  "entirely; 0 makes a flat hit free. A real flat still\n"
+                  "bruises and still breaks bone, so this is a floor rather\n"
+                  "than a gate, and it is what makes rolling the blade into\n"
+                  "the cut worth doing.");
+          }
+          if (ImGui::CollapsingHeader("The kerf",
+                                      ImGuiTreeNodeFlags_DefaultOpen)) {
+            ImGui::TextDisabled("a cut is a slot; dismemberment is what is");
+            ImGui::TextDisabled("left of the lattice afterwards");
+            f("bite, standing still (vox)", &g.cutDepth, 0.0f, 2.0f, "%.2f");
+            f("bite from speed (vox)", &g.cutDepthPower, 0.0f, 4.0f, "%.2f");
+            f("cut length (vox)", &g.cutLength, 0.1f, 8.0f, "%.2f");
+            f("cut width x blade", &g.cutWidth, 0.05f, 2.0f, "%.2f");
+            i32("spall rounds", &g.cutSpallRounds, 0, 4);
+            f("spall strength", &g.cutSpallStrength, 0.0f, 1.0f, "%.2f");
+          }
+          if (ImGui::CollapsingHeader("When a limb comes off")) {
+            f("sever fraction", &g.woundSeverFraction, 0.05f, 0.95f, "%.2f");
+            f("neck radius (vox)", &g.woundNeckRadius, 0.0f, 8.0f, "%.2f");
+            f("neck fraction", &g.woundNeckFraction, 0.0f, 0.95f, "%.2f");
+            f("impact-sever scale", &g.woundImpactSeverScale, 0.0f, 16.0f, "%.1f");
+          }
+          if (ImGui::CollapsingHeader("Heft (how much weapon)")) {
+            f("reference volume", &g.woundHeftRef, 0.01f, 40.0f, "%.2f");
+            f("heft ceiling", &g.woundHeftMax, 1.0f, 32.0f, "%.1f");
+          }
+          if (ImGui::CollapsingHeader("Blood")) {
+            f("stain radius (vox)", &g.woundStainRadius, 0.0f, 8.0f, "%.2f");
+            f("stain density", &g.woundStainDensity, 0.0f, 1.0f, "%.2f");
+            f("bleed gain (per mob)", &g.bleedGain, 0.0f, 8.0f, "%.2f");
+            ImGui::TextDisabled("the rest of gore.* is in the browser tuner");
+          }
+          ImGui::EndChild();
+          ImGui::EndTabItem();
+        }
+
+        // ---- Feel: what the player is TOLD a hit was --------------------
+        if (ImGui::BeginTabItem("Feel")) {
+          ImGui::BeginChild("##feelscroll", ImVec2(0, 0), false);
+          Tuning::CombatFx& fx = t.combatfx;
+          ImGui::Text("hit-stop now: %.2fx", s.hitStopScale);
+          ImGui::TextDisabled("1.00x = running normally");
+          ImGui::Separator();
+          if (ImGui::CollapsingHeader("Hit-stop",
+                                      ImGuiTreeNodeFlags_DefaultOpen)) {
+            b("hit-stop on", &fx.hitStop);
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "Dips the rate the fixed-tick accumulator fills at for a\n"
+                  "few tens of milliseconds after a hit. It changes how many\n"
+                  "ticks run per frame — which already varies 0..4 — and\n"
+                  "never what a tick computes, so the sim is untouched.");
+            ImGui::TextDisabled("chip: debris, a dropped item, a held weapon");
+            f("chip speed", &fx.hitStopChipScale, 0.02f, 1.0f, "%.2fx");
+            f("chip length (ms)", &fx.hitStopChipMs, 0.0f, 400.0f, "%.0f");
+            ImGui::TextDisabled("flesh: a live creature was hurt");
+            f("flesh speed", &fx.hitStopFleshScale, 0.02f, 1.0f, "%.2fx");
+            f("flesh length (ms)", &fx.hitStopFleshMs, 0.0f, 400.0f, "%.0f");
+            ImGui::TextDisabled("sever: a limb came off");
+            f("sever speed", &fx.hitStopSeverScale, 0.02f, 1.0f, "%.2fx");
+            f("sever length (ms)", &fx.hitStopSeverMs, 0.0f, 400.0f, "%.0f");
+          }
+          if (ImGui::CollapsingHeader("Hit flash",
+                                      ImGuiTreeNodeFlags_DefaultOpen)) {
+            ImGui::TextDisabled("additive, linear HDR, before the tonemap");
+            f("chip flash", &fx.flashChip, 0.0f, 4.0f, "%.2f");
+            f("flesh flash", &fx.flashFlesh, 0.0f, 4.0f, "%.2f");
+            f("sever flash", &fx.flashSever, 0.0f, 4.0f, "%.2f");
+            f("halflife (s)", &fx.flashHalflife, 0.01f, 0.6f);
+          }
+          if (ImGui::CollapsingHeader("Sound",
+                                      ImGuiTreeNodeFlags_DefaultOpen)) {
+            f("whoosh volume", &fx.whooshVolume, 0.0f, 3.0f, "%.2f");
+            f("whoosh silent below (px/s)", &fx.whooshMinSpeed, 0.0f, 2000.0f,
+              "%.0f");
+            f("whoosh pitch, slow", &fx.whooshRateSlow, 0.4f, 2.0f, "%.2f");
+            f("whoosh pitch, fast", &fx.whooshRateFast, 0.4f, 2.0f, "%.2f");
+            f("flesh impact volume", &fx.fleshVolume, 0.0f, 3.0f, "%.2f");
+            f("blade clang volume", &fx.clangVolume, 0.0f, 3.0f, "%.2f");
+            f("audible radius (m)", &fx.cueRadius, 1.0f, 120.0f, "%.0f");
+            ImGui::TextDisabled("assets are PLACEHOLDERS —");
+            ImGui::TextDisabled("scripts/gen_combat_sounds.py");
+          }
+          ImGui::EndChild();
+          ImGui::EndTabItem();
+        }
+        ImGui::EndTabBar();
+      }
+
+      if (moved) {
+        SetCurrentTuning(t);
+        s.combatTuningDirty = true;
       }
     }
     ImGui::End();

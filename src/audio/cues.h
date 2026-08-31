@@ -63,6 +63,20 @@ class Cues {
   // `world` may be null (headless), which disables the occlusion solve.
   void Update(float dt, const Vec3& listenerPosVox, float yaw, float pitch, World* world);
 
+  // Load the sound LIBRARY and nothing else — no device, no mixer, no voices.
+  //
+  // SPLIT OUT OF Init FOR THE SAME REASON ProbeAmbience IS: a headless run has
+  // no mixer but the question "does this slot resolve to a set that exists on
+  // disk" is answerable without one, and it is the question that actually goes
+  // wrong (a folder never created, a prefix that drifted between cues.cpp and
+  // sound_schema.js). A gate that had to call Init() to ask it would instead be
+  // asserting that the build machine has a sound card.
+  //
+  // `sampleRate` is what the buffers are resampled to at load. It does not
+  // matter to a caller that will never play them; pass the default.
+  // Returns the number of variant buffers loaded. Does NOT set `enabled_`.
+  int ScanLibrary(const std::string& soundDir, double sampleRate = 48000.0);
+
   // Re-resolve material -> sound after a materials.json hot-reload (R).
   void RebuildMaterialTable(const std::vector<MaterialDef>& mats);
   // Re-scan assets/sounds for newly added files, then re-resolve. Returns the
@@ -121,6 +135,28 @@ class Cues {
   // Resolve one mob slot to a library id, or -1. Exposed so callers can skip
   // building an event for a mob that binds nothing.
   int MobSetId(const MobDef& def, MobEvent ev) const;
+
+  // ---- melee combat -------------------------------------------------------
+  // The three sounds a fight makes that belong to no material and no creature:
+  // the air a blade moves (Whoosh), the blow landing on a body (Flesh), and
+  // steel stopping steel (Clang). See the `combat` owner in
+  // assets/sound_schema.js for what each one is for and how it differs from
+  // the creature slots that fire alongside it — a sword blow can legitimately
+  // produce `flesh` + `hurt` + `dismember` + `sever`, and they are four
+  // different facts about the same event.
+  //
+  // ONE OWNER, so there is nothing to author: the set name is prefix + slot
+  // (melee/whoosh, melee/flesh, melee/clang), fixed here exactly as the night
+  // bed's is. `power` in [0,1] is how hard the event was — stroke speed for a
+  // whoosh, the sweep's speed x edge-alignment for the other two — and drives
+  // gain and a pitch bend, the same shape Land and Impact use.
+  enum class CombatCue { Whoosh, Flesh, Clang };
+  void Combat(CombatCue cue, const Vec3& posVox, float power);
+
+  // Resolve one combat slot to a library id, or -1 when nothing is recorded.
+  // DEVICE-FREE, like MobSetId: it touches only the library, so a headless gate
+  // can assert that the slots resolve without opening an audio device.
+  int CombatSetId(CombatCue cue) const;
 
   // ---- bleeding -----------------------------------------------------------
   // A positioned wet loop for a creature losing a lot of blood, keyed by a
@@ -216,6 +252,20 @@ class Cues {
   struct Stats {
     uint32_t steps = 0, lands = 0, impacts = 0, breaks = 0, mobs = 0,
              bleeds = 0, dropped = 0;
+    // COMBAT IS COUNTED DIFFERENTLY FROM EVERY OTHER FIELD HERE, on purpose.
+    //
+    // The counters above are VOICES STARTED: each one is incremented only past
+    // the `enabled_` early-out and only on a successful PlayOneShot, so they
+    // answer "can I hear it". `combat` is REQUESTS MADE — incremented at the
+    // top of Combat(), before the device is consulted at all.
+    //
+    // The reason is that headless is silent by design (DESIGN.md §12b): a
+    // selftest never calls Init(), so `enabled_` is false and every other
+    // counter here is structurally frozen at 0 in exactly the runs that need
+    // to assert something. A gate cannot listen, so the only question it can
+    // ask is "did the game ASK for this sound at the moment it should have",
+    // and this is the field that answers it (--gate combat-cues).
+    uint32_t combat = 0;
   };
   const Stats& GetStats() const { return stats_; }
 

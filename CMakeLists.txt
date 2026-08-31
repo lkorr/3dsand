@@ -374,6 +374,7 @@ add_executable(sandvox
   src/test/selftest_spell.cpp
   src/test/selftest_playerkit.cpp
   src/test/selftest_swing.cpp
+  src/test/selftest_combat.cpp
   src/test/selftest_equipment.cpp
   src/test/selftest_wound.cpp
   src/test/selftest_audio.cpp
