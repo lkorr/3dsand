@@ -998,6 +998,33 @@ struct Tuning {
     float blockItemDamage = 0.35f;   // fraction of the blow the blade takes
     float blockNudgeAz = 0.30f;      // radians the defender's guard is beaten
     float blockNudgeEl = 0.18f;      //   open, azimuth and elevation, at power 1
+    // ---- DISCRETE STRIKES (the player's default control, 2026-09-01) --------
+    // 0 = discrete: a click fires an AUTHORED stroke program (the same
+    //     attack_styles.json entries the NPCs replay), direction picked by the
+    //     mouse flick at the press. THE DEFAULT.
+    // 1 = freeform: the original mouse-steers-the-tip experiment, kept live as
+    //     the one-JSON-edit A/B. Everything below the input layer is shared,
+    //     so flipping this changes what FEEDS MeleeState and nothing else.
+    // Read in ONE place — main.cpp's controller, straight off CurrentTuning()
+    // — and deliberately NOT copied into MeleeTuning: the driver's feel is
+    // mode-blind, and a cached copy would let the two disagree across an F5.
+    int controlMode = 0;
+    // Mouse px/s at the press below which a click has no direction: the strike
+    // alternates horizontal L/R instead. Same unit as commitSpeed, far lower —
+    // a flick is a read of intent, not a commitment gesture.
+    float pickMinSpeed = 250.0f;
+    // ---- the body serves the swing (game/melee.h WeaponPose torso fields) --
+    // Fractions of the stroke's own azimuth/elevation the torso carries, the
+    // way `avatar.headLookSpine` shares the look yaw into the chest. 0 = arm
+    // only (the pre-overhaul look, and the A/B).
+    float torsoShare = 0.35f;
+    float torsoPitch = 0.20f;
+    // ---- the blade stays out of the wielder's own face ----------------------
+    // Metres of clearance beyond the head's own radius the hand-to-tip segment
+    // is pushed out to (a rigid translate in RebuildFrame, after the
+    // frontal-plane clamp). 0 = clamp OFF — the A/B, same convention as
+    // elbowAxisCone's pi.
+    float headClearM = 0.06f;
   } melee;
 
   // ---- combat feel: hit-stop, hit flash, combat cues --------------------------

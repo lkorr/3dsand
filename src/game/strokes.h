@@ -102,8 +102,25 @@ struct AttackStyle {
   StrokeJitter jitter;
 };
 
+// THE PLAYER'S FLICK COMPASS (the `player` block of attack_styles.json): a
+// screen-space direction per style, quantized by max dot at the attack press.
+// Indices, not names — resolved against the library at load time (a sector
+// naming an unknown style is skipped LOUDLY, the loader's convention), and
+// rebuilt with the library on every R so hot-reload renumbering cannot bite.
+// It lives ON the StyleLibrary because it is meaningless apart from one.
+struct PlayerStrikeMap {
+  struct Sector {
+    float x = 0, y = 0;   // unit-ish, screen space: +x right, +y DOWN
+    int style = -1;
+  };
+  std::vector<Sector> sectors;
+  int neutral[2] = {-1, -1};   // the directionless click alternates these
+  bool Usable() const { return !sectors.empty() || neutral[0] >= 0; }
+};
+
 struct StyleLibrary {
   std::vector<AttackStyle> styles;
+  PlayerStrikeMap player;
   int Find(const std::string& n) const {
     for (size_t i = 0; i < styles.size(); i++)
       if (styles[i].name == n) return (int)i;
@@ -115,6 +132,15 @@ struct StyleLibrary {
   bool empty() const { return styles.empty(); }
 };
 
+// The flick (screen space, +y down) -> a style index by max dot over the
+// sectors; -1 when the map has none. The caller decides what a -1 means
+// (fall back to NeutralStrike, or don't swing).
+int QuantizeStrike(const StyleLibrary& lib, float dx, float dy);
+// The directionless click: one of the two neutral entries, `right` picking
+// which. Returns the other one when the asked-for side is unresolved, and -1
+// when neither is.
+int NeutralStrike(const StyleLibrary& lib, bool right);
+
 // Load assets/mobs/attack_styles.json. Follows every other loader here: a bad
 // entry is skipped LOUDLY into `log` and is never fatal, and an unknown key is
 // ignored so a newer authored file still loads on an older binary.
@@ -122,13 +148,14 @@ bool LoadAttackStyles(const std::string& path, StyleLibrary& out,
                       std::string& log);
 
 // ---------------------------------------------------------------------------
-// THE RUNTIME: one live swing.
-//
-// Owned by the Mob (one per creature), pure presentation state, never saved and
-// never hashed. It holds its own MeleeState because that IS the stroke driver —
-// an NPC that computed its own poses would be a second implementation of the
-// feel, which is the thing melee.h's input surface exists to prevent.
-struct NpcStroke {
+// THE PROGRAM STATE of one live stroke, split from the NPC's swing (below)
+// because TWO callers now replay authored programs through a MeleeState: a
+// Mob's NpcStroke, and main.cpp's discrete player attacks (melee.controlMode
+// 0), which own a bare cursor beside the player's own MeleeState. The split is
+// exactly "what the stroke runner needs" — targets, edge memory and damage
+// bookkeeping stay on NpcStroke, because the player's caller already owns
+// those concerns its own way (main.cpp's sweep block and lastEdge* memory).
+struct StrokeCursor {
   // GUARD is a WINDUP THAT NEVER ENDS: the same closed-loop, under-commitSpeed
   // drive to a stated pose, held indefinitely. It exists because "hold your
   // sword across this line" is a POSE and not an attack, and there was no way
@@ -138,21 +165,35 @@ struct NpcStroke {
   // because a guard is not aimed at anything.
   enum class Phase : uint8_t { Idle = 0, Guard, Windup, Cut, Recover };
 
-  MeleeState melee;
   Phase phase = Phase::Idle;
   int style = -1;
   int phaseTick = 0;         // ticks spent in the current phase
   int windupTicks = 0;       // after tempo jitter
   int cutTicks = 0;
   int recoverTicks = 0;
-  uint64_t targetId = 0;
-  Vec3 targetPoint{};        // world voxels, where the blow was aimed
-  uint32_t seed = 0;         // mobId ^ salt ^ startTick; every draw keys off it
+  uint32_t seed = 0;         // wielder ^ salt ^ startTick; every draw keys off it
   // The aim, resolved ONCE at the end of the windup and never refreshed.
   float aimAz = 0, aimEl = 0;
   bool aimed = false;
-  // Where the windup is steering to, in the mob's basis.
+  // Where the windup is steering to, in the wielder's basis.
   float wantAz = 0, wantEl = 0, wantReach = 0;
+
+  bool Active() const { return phase != Phase::Idle; }
+  bool Cutting() const { return phase == Phase::Cut; }
+  void Reset() { *this = StrokeCursor{}; }
+};
+
+// ---------------------------------------------------------------------------
+// THE RUNTIME: one live NPC swing.
+//
+// Owned by the Mob (one per creature), pure presentation state, never saved and
+// never hashed. It holds its own MeleeState because that IS the stroke driver —
+// an NPC that computed its own poses would be a second implementation of the
+// feel, which is the thing melee.h's input surface exists to prevent.
+struct NpcStroke : StrokeCursor {
+  MeleeState melee;
+  uint64_t targetId = 0;
+  Vec3 targetPoint{};        // world voxels, where the blow was aimed
   // The blade's edge as it was last tick, for the damage sweep. Not valid on
   // the first cut tick — there is no previous position to sweep from, and
   // inventing one is a free hit at the start of every swing.
@@ -173,8 +214,8 @@ struct NpcStroke {
   int bodiesHit = 0;     // summed over those ticks
   float topTipSpeed = 0; // fastest the edge went, world voxels/sec
 
-  bool Active() const { return phase != Phase::Idle; }
-  bool Cutting() const { return phase == Phase::Cut; }
+  // Shadows StrokeCursor::Reset on purpose: an NPC reset clears the whole
+  // swing (melee state, edge memory, damage tallies), not just the program.
   void Reset() { *this = NpcStroke{}; }
 };
 
@@ -184,4 +225,46 @@ struct NpcStroke {
 int PickAttackStyle(const StyleLibrary& lib,
                     const std::vector<std::string>& names, uint64_t mobId,
                     uint32_t tick);
+
+// ---------------------------------------------------------------------------
+// THE SHARED STROKE-PROGRAM RUNNER.
+//
+// The phase machine that turns an authored AttackStyle into per-tick
+// StrokeSamples, extracted from MobSystem::StepStroke so the player's discrete
+// attacks (main.cpp, melee.controlMode 0) replay the same programs through
+// their own MeleeState. Neither caller owns a copy of the feel: this is the
+// only place a windup, a cut or a recover is stepped, exactly as melee.cpp is
+// the only place a stroke is integrated.
+
+// Fill a cursor's program fields for one swing: style index, seed, the
+// tempo-jittered tick counts, phase = Windup. The CALLER resets its own
+// container first (an NpcStroke also clears its target/edge/tally fields; the
+// player's bare cursor has nothing else) and owns re-seeding/re-tuning the
+// MeleeState the program will drive — see MobSystem::BeginStroke for why the
+// tuning is re-applied per swing.
+void BeginStrokeProgram(StrokeCursor& cur, const AttackStyle& sty,
+                        int styleIndex, uint32_t seed);
+
+// What one tick of the program did, so the caller knows whether to push a
+// pose. Split three ways rather than a bool because the two "no pose" cases
+// are different acts: Idle stepped nothing, Finished is the one tick where
+// the caller must drop its pose claim (the NPC resets and pushes an empty
+// WeaponPose; the player lets its MeleeState idle out).
+enum class StrokeStepResult : uint8_t { Idle = 0, Live, Finished };
+
+// One tick: synthesize the StrokeSample the current phase wants and Step the
+// driver with it. `sty` may be null only for a Guard (a pose has no style).
+// `liveAz`/`liveEl` are the aim's CURRENT bearing about the wielder's shoulder
+// in the given basis — the NPC re-derives them from its target every tick and
+// the windup tracks them until the commit freezes the aim; a player attack
+// passes (0, 0), because the camera IS the aim. `dt` is the caller's tick.
+StrokeStepResult StepStrokeProgram(StrokeCursor& cur, const AttackStyle* sty,
+                                   MeleeState& m, float liveAz, float liveEl,
+                                   float dt, const Vec3& right, const Vec3& up,
+                                   const Vec3& fwd);
+
+// An authored reach offset -> a radius the arm can actually serve. Public
+// because the gates state their expectations in the same band positions the
+// styles are authored in.
+float StrokeReachIn(const MeleeState& m, float offset);
 

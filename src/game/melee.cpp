@@ -799,6 +799,12 @@ void ApplyMeleeTuning(MeleeTuning& dst, const Tuning& t) {
   dst.blockItemDamage = m.blockItemDamage;
   dst.blockNudgeAz = m.blockNudgeAz;
   dst.blockNudgeEl = m.blockNudgeEl;
+  dst.torsoShare = m.torsoShare;
+  dst.torsoPitch = m.torsoPitch;
+  dst.headClear = MetresToCells(m.headClearM);           // m -> voxels
+  // `controlMode`/`pickMinSpeed` are DELIBERATELY not copied: they are the
+  // controller's switch, read off CurrentTuning() at the one site in main.cpp,
+  // and a cached copy here could disagree with it across an F5 (tuning.h).
 }
 
 void ApplyMeleeTuning(MeleeTuning& dst) { ApplyMeleeTuning(dst, CurrentTuning()); }
@@ -897,6 +903,18 @@ WeaponPose MeleeState::Pose() const {
   // Mob::SetWeaponPose's legacy four-argument form, which the pose-limit gates
   // use to drive the arm at a bare point with no opinion about the weapon.
   p.steerBlade = true;
+  // THE TORSO'S SHARE OF THE STROKE, off the SMOOTHED integrals so the
+  // wind-back and the drive-through arrive on the arm's own clock, and scaled
+  // by the same weight that owns the arm so the chest untwists exactly as the
+  // claim fades. Clamped in radians because a share of a deep azimuth stop
+  // (1.83 rad) is not a pose a spine has; the caps are the anatomy, the
+  // tuning fractions are the taste. Pitch clamps tighter downward — the arm
+  // legitimately hangs at -1.5 rad in a low guard, and a chest that followed
+  // it there would read as a bow, not a stance.
+  p.torsoTwist =
+      std::clamp(azLive_ * tuning.torsoShare, -0.5f, 0.5f) * p.weight;
+  p.torsoPitch =
+      std::clamp(elLive_ * tuning.torsoPitch, -0.22f, 0.35f) * p.weight;
   return p;
 }
 
@@ -1016,7 +1034,11 @@ void MeleeState::RebuildFrame(float dt, const Vec3& right, const Vec3& up,
   const float az = azLive_, el = elLive_, r = radLive_;
 
   const float ce = std::cos(el), se = std::sin(el);
-  const Vec3 tipL{r * ce * std::sin(az), r * se, r * ce * std::cos(az)};
+  // Mutable for ONE writer: the head keep-out's rigid translate far below,
+  // which runs AFTER everything derived from the commanded tip (velocity,
+  // radial, lean, hand) has been computed — so the stroke's own state keeps
+  // the commanded geometry and only the posed segment is carried clear.
+  Vec3 tipL{r * ce * std::sin(az), r * se, r * ce * std::cos(az)};
 
   // ---- how fast the point is moving, and which way ------------------------
   // Measured in BASIS coordinates on purpose. In world space, turning the view
@@ -1167,6 +1189,39 @@ void MeleeState::RebuildFrame(float dt, const Vec3& right, const Vec3& up,
         bladeFlatL_ = bladeFlatL_.len() > 1e-5f ? bladeFlatL_.normalized()
                                                 : AnyPerp(bladeDirL_);
       }
+    }
+  }
+
+  // ---- AND THE BLADE STAYS OUT OF THE WIELDER'S OWN FACE ------------------
+  //
+  // The window and the plane clamp above bound the stroke against the body's
+  // FRONT; nothing there knows the head exists, and a high wind-up or a
+  // freeform drag legitimately asks for a segment right through it. The fix
+  // is a RIGID TRANSLATE: closest point of the hand->tip segment to the head
+  // sphere (SetKeepOut, fed by the rig each tick), both endpoints pushed out
+  // along the deficit — |tip - hand| is preserved exactly, so unlike the
+  // plane clamp there is no re-aim, the blade just carries its ask a little
+  // further from the skull. Runs LAST among the position clamps on purpose:
+  // a face-slice is the one outcome none of the earlier bounds may undo.
+  // `tuning.headClear` 0 is the off switch (the one-JSON-edit A/B), and a rig
+  // that cannot report a head (severed) cleared the sphere already.
+  if (keepR_ > 0.0f && tuning.headClear > 0.0f) {
+    const Vec3 cL{keepC_.dot(right), keepC_.dot(up), keepC_.dot(fwd)};
+    const float R = keepR_ + tuning.headClear;
+    const Vec3 ab = tipL - handL;
+    const float ab2 = ab.dot(ab);
+    const float t =
+        ab2 > 1e-6f ? std::clamp((cL - handL).dot(ab) / ab2, 0.0f, 1.0f) : 0.0f;
+    const Vec3 close = handL + ab * t;
+    Vec3 away = close - cL;
+    const float d = away.len();
+    if (d < R) {
+      // Dead-centre has no outward direction; straight forward is always
+      // away from a head that sits on the shoulder line.
+      away = d > 1e-4f ? away * (1.0f / d) : Vec3{0, 0, 1};
+      const Vec3 push = away * (R - d);
+      handL += push;
+      tipL += push;
     }
   }
 

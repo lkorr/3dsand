@@ -531,6 +531,7 @@ void Overlay::Draw(UIState& s) {
     ImGui::Text("swing %s", s.swingPhase);
     ImGui::SameLine();
     ImGui::TextDisabled("  mouse %.0f px/s", s.swingSpeed);
+    if (!s.swingStyle.empty()) ImGui::TextDisabled("%s", s.swingStyle.c_str());
   }
   ImGui::Separator();
 
@@ -1257,6 +1258,39 @@ void Overlay::Draw(UIState& s) {
         if (ImGui::BeginTabItem("Stroke")) {
           ImGui::BeginChild("##strokescroll", ImVec2(0, 0), false);
           Tuning::Melee& m = t.melee;
+          if (ImGui::CollapsingHeader("Discrete strikes",
+                                      ImGuiTreeNodeFlags_DefaultOpen)) {
+            // Two modes exist, so this is a choice and not a slider —
+            // handLead's convention below.
+            bool freeform = m.controlMode == 1;
+            if (ImGui::Checkbox("freeform mouse melee (the A/B)", &freeform)) {
+              m.controlMode = freeform ? 1 : 0;
+              moved = true;
+            }
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "OFF = discrete (default): a click fires an authored strike\n"
+                  "from attack_styles.json, direction read from the flick at\n"
+                  "the press. ON = the original hold-and-steer mouse melee.\n"
+                  "Everything below the input layer is shared.");
+            f("flick threshold (px/s)", &m.pickMinSpeed, 1.0f, 1500.0f, "%.0f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "Below this, a click has no direction and the strike\n"
+                  "alternates horizontal left/right instead.");
+            f("torso twist share", &m.torsoShare, 0.0f, 1.0f, "%.2f");
+            f("torso pitch share", &m.torsoPitch, 0.0f, 1.0f, "%.2f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "Fractions of the stroke's azimuth/elevation the torso\n"
+                  "carries, like the head-look's spine share. 0 = arm only.");
+            f("head keep-out (m)", &m.headClearM, 0.0f, 0.5f, "%.2f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "Clearance beyond the head's own radius the hand-to-tip\n"
+                  "segment is held out to, so no stroke sweeps the blade\n"
+                  "through the wielder's own face. 0 = clamp off.");
+          }
           if (ImGui::CollapsingHeader("Aim", ImGuiTreeNodeFlags_DefaultOpen)) {
             ImGui::TextDisabled("radians of tip travel per mouse pixel");
             f("aim gain x", &m.aimGainX, 0.0005f, 0.02f, "%.4f");

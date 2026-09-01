@@ -1946,17 +1946,10 @@ void MobSystem::BeginStroke(Mob& mob, const ai::AttackRequest& req,
   st.style = si;
   st.targetId = req.targetId;
   st.targetPoint = req.targetPoint;
-  // ONE SEED PER SWING, mixing who and when. Every draw below indexes off it,
-  // so the whole stroke — its style, its start bow, its tempo — replays from
-  // the same (mob, tick) and nothing reads a clock.
-  st.seed = rng::Hash3((uint32_t)mob.id_, tick, 0x5747u);
-  const float tempo =
-      1.0f + sty.jitter.tempo * rng::SignedUnit(rng::Hash3(st.seed, 1, 0));
-  st.windupTicks = std::max(2, (int)std::lround(sty.windup.ticks * tempo));
-  st.cutTicks = std::max(2, (int)std::lround(sty.cut.ticks * tempo));
-  st.recoverTicks = std::max(1, sty.recoverTicks);
-  st.phase = NpcStroke::Phase::Windup;
-  st.phaseTick = 0;
+  // ONE SEED PER SWING, mixing who and when. Every draw in the runner indexes
+  // off it, so the whole stroke — its style, its start bow, its tempo —
+  // replays from the same (mob, tick) and nothing reads a clock.
+  BeginStrokeProgram(st, sty, si, rng::Hash3((uint32_t)mob.id_, tick, 0x5747u));
   st.melee.Reset();
   st.melee.SetHandSign(mob.HandSign());
   // THE NPC'S BLADE OBEYS THE SAME SLIDERS AS THE PLAYER'S. Applied at every
@@ -1983,15 +1976,8 @@ bool MobSystem::ForceAttack(uint64_t mobId, const std::string& style,
   const AttackStyle& sty = *styles_.At(si);
   NpcStroke& st = m->stroke_;
   st = NpcStroke{};
-  st.style = si;
   st.targetPoint = targetPoint;
-  st.seed = rng::Hash3((uint32_t)mobId, tick, 0x5747u);
-  const float tempo =
-      1.0f + sty.jitter.tempo * rng::SignedUnit(rng::Hash3(st.seed, 1, 0));
-  st.windupTicks = std::max(2, (int)std::lround(sty.windup.ticks * tempo));
-  st.cutTicks = std::max(2, (int)std::lround(sty.cut.ticks * tempo));
-  st.recoverTicks = std::max(1, sty.recoverTicks);
-  st.phase = NpcStroke::Phase::Windup;
+  BeginStrokeProgram(st, sty, si, rng::Hash3((uint32_t)mobId, tick, 0x5747u));
   st.melee.Reset();
   st.melee.SetHandSign(m->HandSign());
   ApplyMeleeTuning(st.melee.tuning);   // BeginStroke says why
@@ -2028,31 +2014,6 @@ void MobSystem::ClearGuard(uint64_t mobId) {
   m->stroke_.phase = NpcStroke::Phase::Recover;
   m->stroke_.phaseTick = 0;
   m->stroke_.recoverTicks = 8;
-}
-
-// WHERE AN ARM SITS WHEN IT IS NEITHER CHAMBERED NOR EXTENDED, as a position
-// WITHIN THE REACH BAND (MeleeState::ReachBand) rather than as a fraction of
-// the arm. Every authored `reach` in a style is an offset from this, so a style
-// that says nothing about reach holds a normal guard and a thrust's -0.45/+0.85
-// pair reads as "chamber a little, then drive to full extension" on any rig.
-//
-// THE BAND AND THE ARM ARE NOT THE SAME LENGTH, which is the whole reason this
-// is stated here. The point rides a blade's length off a hand that is itself
-// most of an arm out, so the two lengths largely cancel: measured on the human
-// rig the arm is ~7 voxels and the band the driver can serve is [3.8, 6.5].
-// Authored against the ARM, every chamber and lunge in the library landed
-// outside that and was clamped — the commanded radius moved 0.15 voxels on a
-// stroke asking for four, and a thrust read as a twitch.
-//
-// A little past the middle, because a guard is held forward of centre.
-constexpr float kNeutralReach = 0.60f;
-
-// An authored reach offset -> a radius the arm can actually serve.
-static float ReachIn(const MeleeState& m, float offset) {
-  float lo = 0, hi = 0;
-  m.ReachBand(lo, hi);
-  const float span = hi > lo ? hi - lo : 0.0f;
-  return std::clamp(lo + (kNeutralReach + offset) * span, lo, hi);
 }
 
 // The mob's own frame, which is the BASIS the stroke is expressed in (melee.h
@@ -2160,6 +2121,16 @@ void MobSystem::StepStroke(Mob& mob, uint32_t tick, World& world,
     st.melee.SetStroke(hand, tipPose, flatPose, reach);
   else
     st.melee.ClearArm();
+  // ...and where its own head is, so no authored windup sweeps through it
+  // (melee.h SetKeepOut; the clamp lives in RebuildFrame for both drivers).
+  {
+    Vec3 kc;
+    float kr = 0;
+    if (mob.HeadKeepOut(kc, kr))
+      st.melee.SetKeepOut(kc, kr);
+    else
+      st.melee.ClearKeepOut();
+  }
   const float armReach = reach > 1e-3f ? reach : MetresToCells(0.60f);
 
   // ---- 3. THE AIM: the target's bearing about THIS mob's shoulder ----------
@@ -2189,120 +2160,20 @@ void MobSystem::StepStroke(Mob& mob, uint32_t tick, World& world,
   const float liveAz = std::atan2(local.x, local.z);
   const float liveEl = std::asin(std::clamp(local.y / lr, -1.0f, 1.0f));
 
-  // ---- 4. drive the phase --------------------------------------------------
-  // The start bow: a deterministic wobble on where the windup lands, so ten
-  // swings do not look stamped. Zero for a guard, which has no style behind it.
-  const float bowAz =
-      sty ? sty->jitter.az * rng::SignedUnit(rng::Hash3(st.seed, 2, 0)) : 0.0f;
-  const float bowEl =
-      sty ? sty->jitter.el * rng::SignedUnit(rng::Hash3(st.seed, 3, 0)) : 0.0f;
-  StrokeSample smp;
-  smp.held = true;
-  // THE CLOSED-LOOP, UNDER-COMMIT DRIVE, shared by Guard and Windup because
-  // they are the same motion: steer the stored stroke toward a stated pose
-  // slowly enough that `commitSpeed` never fires. 16 units/tick is 480 px/s
-  // against a 900 px/s threshold, so the driver stays in Guard however far it
-  // has to travel — which is what makes a windup a readable telegraph rather
-  // than an instant snap.
-  auto steerTo = [&](float wantAz, float wantEl, float wantR) {
-    const MeleeTuning& t = st.melee.tuning;
-    smp.dx = std::clamp((wantAz - st.melee.StrokeAz()) / t.aimGainX, -16.0f,
-                        16.0f);
-    smp.dy = std::clamp(-(wantEl - st.melee.StrokeEl()) / t.aimGainY, -16.0f,
-                        16.0f);
-    smp.dReach = std::clamp(
-        (wantR - st.melee.StrokeRadius()) / std::max(t.reachGain, 1e-4f),
-        -18.0f, 18.0f);
-    st.melee.Step(smp, 1.0f / 30.0f, true, right, up, fwd);
-  };
-
-  switch (st.phase) {
-    case NpcStroke::Phase::Guard: {
-      // ABSOLUTE, not aim-relative: a guard is a pose, not a blow. `wantReach`
-      // is a FRACTION here (MobSystem::SetGuard) and is resolved against the
-      // live arm, so the same guard is the same guard on any rig.
-      // `wantReach` is a BAND POSITION (0 = as drawn back as this arm goes,
-      // 1 = fully extended), resolved against the live arm so the same guard is
-      // the same guard on any rig.
-      {
-        float lo = 0, hi = 0;
-        st.melee.ReachBand(lo, hi);
-        steerTo(st.wantAz, st.wantEl,
-                std::clamp(lo + st.wantReach * (hi - lo), lo, hi));
-      }
-      break;
-    }
-    case NpcStroke::Phase::Windup: {
-      if (sty == nullptr) break;
-      // THE CUT IS CENTRED ON THE AIM, so the windup lands HALF A CUT SHORT of
-      // it: `aim - cut/2 + windup offset`. A stroke that started at the aim
-      // would cut the air behind the target every time — the blade only ever
-      // travels away from where it began.
-      st.wantAz = liveAz - 0.5f * sty->cut.az + sty->windup.az + bowAz;
-      st.wantEl = liveEl - 0.5f * sty->cut.el + sty->windup.el + bowEl;
-      // AGAINST A NEUTRAL EXTENSION, not against the live radius. Computing
-      // this as `StrokeRadius() + offset` every windup tick is a RUNAWAY: each
-      // tick re-targets a further offset from wherever the last one landed, so
-      // a thrust's rear chamber walked the point straight into the bottom of
-      // the arm's reach band and stayed there — measured, the cut that followed
-      // then extended 1.07 voxels instead of nine and spent its travel flailing
-      // 1.13 rad of elevation instead. `kNeutralReach` is what an arm sits at
-      // when it is neither chambered nor extended, so an authored `reach` of 0
-      // is "wherever a guard holds it" and the offsets are readable as what
-      // they are.
-      st.wantReach = ReachIn(st.melee, sty->windup.reach);
-      steerTo(st.wantAz, st.wantEl, st.wantReach);
-      if (++st.phaseTick >= st.windupTicks) {
-        // ---- COMMIT. The aim is frozen HERE and never refreshed: a target
-        // that steps offline after this instant is missed, which is what makes
-        // the windup a real telegraph rather than decoration.
-        st.aimAz = liveAz;
-        st.aimEl = liveEl;
-        st.aimed = true;
-        st.phase = NpcStroke::Phase::Cut;
-        st.phaseTick = 0;
-      }
-      break;
-    }
-    case NpcStroke::Phase::Cut: {
-      if (sty == nullptr) break;
-      // FROM WHERE THE BLADE ACTUALLY IS, THROUGH THE AIM, TO HALF A CUT PAST
-      // IT. Derived per tick from the live stroke state rather than baked at
-      // commit, so a windup that could not quite reach its pose (a clamped
-      // shoulder, a short arm) still produces a cut through the target instead
-      // of one displaced by however much the arm fell short.
-      const float toAz = st.aimAz + 0.5f * sty->cut.az;
-      const float toEl = st.aimEl + 0.5f * sty->cut.el;
-      const float toR = ReachIn(st.melee, sty->windup.reach + sty->cut.reach);
-      const int left = std::max(1, st.cutTicks - st.phaseTick);
-      const MeleeTuning& t = st.melee.tuning;
-      smp.dx = ((toAz - st.melee.StrokeAz()) / (float)left) / t.aimGainX;
-      smp.dy = -((toEl - st.melee.StrokeEl()) / (float)left) / t.aimGainY;
-      smp.dReach =
-          ((toR - st.melee.StrokeRadius()) / (float)left) /
-          std::max(t.reachGain, 1e-4f);
-      st.melee.Step(smp, 1.0f / 30.0f, true, right, up, fwd);
-      if (++st.phaseTick >= st.cutTicks) {
-        st.phase = NpcStroke::Phase::Recover;
-        st.phaseTick = 0;
-      }
-      break;
-    }
-    case NpcStroke::Phase::Recover: {
-      // Button RELEASED: the driver's own recover ramps PoseWeight down and
-      // hands the arm back to the walk cycle, which is the same hand-back the
-      // player gets and the reason nothing snaps here.
-      smp.held = false;
-      st.melee.Step(smp, 1.0f / 30.0f, true, right, up, fwd);
-      if (++st.phaseTick >= st.recoverTicks) {
-        st.Reset();
-        mob.SetWeaponPose(WeaponPose{});
-        return;
-      }
-      break;
-    }
-    default:
+  // ---- 4. drive the phase — the SHARED runner (game/strokes.cpp) -----------
+  // Everything feel-shaped lives in StepStrokeProgram, which the player's
+  // discrete attacks also call; this caller only owns what to do when the
+  // program ends (drop the pose claim) and the NPC's fixed 30 Hz dt.
+  switch (StepStrokeProgram(st, sty, st.melee, liveAz, liveEl, 1.0f / 30.0f,
+                            right, up, fwd)) {
+    case StrokeStepResult::Finished:
+      st.Reset();
+      mob.SetWeaponPose(WeaponPose{});
       return;
+    case StrokeStepResult::Idle:
+      return;
+    case StrokeStepResult::Live:
+      break;
   }
   mob.SetWeaponPose(st.melee.Pose());
 }
@@ -2839,6 +2710,13 @@ void MobSystem::UpdateAnimation(Mob& mob, const MobDef& def, World& world,
                                   QuatAxisAngle({0, 0, 1}, s.z)));
     st.local[i].rot = QuatNormalize(QuatMul(st.local[i].rot, jiggle));
   }
+
+  // ---- stage 3.5: the torso serves a live swing (anim.h) ----
+  // The pose's torso fields are already weight-scaled by the driver, so an
+  // idle mob (weight 0) and every legacy gate pose (fields default 0) are
+  // untouched; an NPC mid-stroke leans exactly as the avatar does.
+  AnimApplySpineTwist(sk, st, mob.weapon_.torsoTwist, mob.weapon_.torsoPitch,
+                      def.rootLimb);
 
   // ---- stage 4: flatten to model space ----
   AnimFlatten(sk, st);
@@ -8379,6 +8257,46 @@ bool Mob::WeaponStrokePose(Vec3& outHandFromShoulder, Vec3& outTipFromShoulder,
     outFlat = Rotate(yaw, fl);
   }
   return true;
+}
+
+bool Mob::HeadKeepOut(Vec3& outCenterFromShoulder, float& outRadius) const {
+  // The head, by def tag, off the LIVE anim pose — deliberately the SAME
+  // model space, shoulder anchor and yaw WeaponStrokePose uses, so the sphere
+  // and the stroke seed cannot disagree by a leaning spine's worth of voxels.
+  int head = -1;
+  for (size_t i = 0; i < limbDefs_.size(); i++)
+    if (limbDefs_[i].tag == "head") {
+      head = (int)i;
+      break;
+    }
+  if (head < 0 || (size_t)head >= anim_.model.size() ||
+      (size_t)head >= limbs_.size())
+    return false;
+  if (!LimbAlive(head)) return false;  // a headless body has nothing to clear
+  if (heldPartIndex_ < 0 || heldPartIndex_ >= (int)skel_.parts.size())
+    return false;
+  const int handPart = skel_.parts[heldPartIndex_].parent;
+  if (handPart < 0) return false;
+  for (const IkChain& ch : skel_.chains) {
+    if (ch.tag != "arm" || ch.effector != handPart) continue;
+    if (ch.parts.size() < 2) continue;
+    const int i0 = ch.parts[0];
+    if (i0 < 0 || (size_t)i0 >= anim_.model.size()) continue;
+    const MobLimb& l = limbs_[head];
+    // Half the model box, on the lattice the voxels are actually on
+    // (MobLimb::ownSkinScale's note — the SKIN is the visible head, and
+    // "don't sweep through the face" is a claim about what is visible).
+    const float ss = std::max((float)SkinScaleOf(l), 1.0f);
+    const Vec3 half = Vec3{(float)l.size.x, (float)l.size.y, (float)l.size.z} *
+                      (0.5f / ss);
+    const Vec3 centerModel =
+        anim_.model[head].pos + QuatRotate(anim_.model[head].rot, half);
+    const Vec3 rel = centerModel - anim_.model[i0].pos;
+    outCenterFromShoulder = Rotate(AxisAngle({0, 1, 0}, heading_), rel);
+    outRadius = std::max(half.x, std::max(half.y, half.z));
+    return true;
+  }
+  return false;
 }
 
 bool Mob::WeaponEdge(Vec3& outBase, Vec3& outTip, float& outHalfWidth,

@@ -919,6 +919,14 @@ class Mob {
   // target the IK will be handed on the very next tick.
   bool WeaponStrokePose(Vec3& outHandFromShoulder, Vec3& outTipFromShoulder,
                         Vec3& outFlat, float& outReach) const;
+  // THE WIELDER'S OWN HEAD as a keep-out sphere for the stroke driver
+  // (MeleeState::SetKeepOut): centre relative to the weapon arm's LIVE chain
+  // root (the same shoulder anchor WeaponStrokePose speaks, same anim_.model
+  // frame, same yaw), radius = half the head model's largest axis in world
+  // voxels. Composed HERE because the head limb's size and skin scale are the
+  // rig's protected facts. False when there is no head to clear (severed, no
+  // tag, no weapon arm) — the caller Clears rather than clamping stale.
+  bool HeadKeepOut(Vec3& outCenterFromShoulder, float& outRadius) const;
 
   // WHY THE SWORD IS NOT WHERE THE STROKE ASKED, in four numbers.
   //

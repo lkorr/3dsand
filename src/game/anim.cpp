@@ -394,6 +394,33 @@ void AnimSampleAndBlend(const AnimSkeleton& sk, AnimState& st, float dt) {
   }
 }
 
+// ---- stage 3.5: the torso serves the swing ----------------------------------
+
+void AnimApplySpineTwist(const AnimSkeleton& sk, AnimState& st, float yawRight,
+                         float pitchUp, int rootLimb) {
+  if (std::fabs(yawRight) < 1e-4f && std::fabs(pitchUp) < 1e-4f) return;
+  int nSpine = 0;
+  for (size_t i = 0; i < sk.parts.size(); i++)
+    if (sk.parts[i].tag == "spine" && (int)i != rootLimb) nSpine++;
+  if (nSpine == 0) return;
+  // Model-space signs. Pitch is the head-look's verified one: a positive
+  // rotation about +X pitches the nose DOWN (avatar.cpp quotes the
+  // geometry.py check), so "chest up" is the negative angle. Yaw is derived
+  // the same way: a positive rotation about +Y takes +Z (the rig's forward)
+  // to +X, and the basis right is fwd x up = -X, so "toward the right" is
+  // also the negative angle. If a rig ever reads mirrored, the A/B is
+  // melee.torsoShare = 0, not a sign hunt across callers — both live here.
+  const float yawPer = -yawRight / (float)nSpine;
+  const float pitchPer = -pitchUp / (float)nSpine;
+  const Quat d = QuatMul(QuatAxisAngle({0, 1, 0}, yawPer),
+                         QuatAxisAngle({1, 0, 0}, pitchPer));
+  for (size_t i = 0; i < sk.parts.size(); i++) {
+    if (sk.parts[i].tag != "spine" || (int)i == rootLimb) continue;
+    if (i < st.partAlive.size() && !st.partAlive[i]) continue;
+    st.local[i].rot = QuatNormalize(QuatMul(st.local[i].rot, d));
+  }
+}
+
 // ---- stage 4: flatten -------------------------------------------------------
 
 void AnimFlatten(const AnimSkeleton& sk, AnimState& st) {

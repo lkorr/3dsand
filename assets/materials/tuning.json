@@ -273,7 +273,12 @@
     "blockGapM": 0.22,
     "blockItemDamage": 0.35,
     "blockNudgeAz": 0.3,
-    "blockNudgeEl": 0.18
+    "blockNudgeEl": 0.18,
+    "controlMode": 0,
+    "pickMinSpeed": 250,
+    "torsoShare": 0.35,
+    "torsoPitch": 0.2,
+    "headClearM": 0.06
   },
   "combatfx": {
     "hitStop": true,

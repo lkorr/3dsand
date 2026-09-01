@@ -1139,6 +1139,14 @@ void PlayerAvatar::UpdateAnimation(float dt, World& world, bool grounded,
     }
   }
 
+  // ---- the torso serves a live swing (anim.h AnimApplySpineTwist) ----------
+  // Composes additively with the head-look's share above — both are bounded
+  // small rotations on the same spine locals. The pose's torso fields are
+  // already weight-scaled by the melee driver, so this is a no-op outside a
+  // stroke and fades exactly with the arm claim.
+  AnimApplySpineTwist(sk, st, weapon_.torsoTwist, weapon_.torsoPitch,
+                      def_->rootLimb);
+
   AnimFlatten(sk, st);
 
   // `grounded` is part of the gate, not just an input to it: a gait with no

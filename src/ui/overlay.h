@@ -223,6 +223,11 @@ struct UIState {
   int itemSelected = 0;
   const char* swingPhase = "";          // melee state, for the HUD readout
   float swingSpeed = 0;                 // mouse speed driving the swing
+  // The authored strike a discrete click resolved to (its label), "" outside
+  // discrete mode or between swings. Same falsifiability job as swingPhase:
+  // the player must be able to tell "the game misread my flick" from "I
+  // misjudged the cut" — main.cpp fills it, the overlay only draws it.
+  std::string swingStyle;
 
   // Ledge-grab readout (dev panel). main.cpp composes the text from the
   // player's per-frame probe so a refused grab says WHICH latch gate refused;

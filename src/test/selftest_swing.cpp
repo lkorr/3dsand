@@ -61,6 +61,7 @@
 #include "game/avatar.h"
 #include "game/melee.h"
 #include "game/player.h"
+#include "game/strokes.h"
 #include "test/selftest.h"
 #include "test/support.h"
 
@@ -2098,6 +2099,331 @@ Status GateSwingPlane(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ============================================================================
+// player-styles — THE DISCRETE STRIKES, each authored style replayed through
+// the PLAYER'S OWN PATH (StepStrokeProgram driving a MeleeState with the
+// camera basis, exactly main.cpp's melee.controlMode 0 tick) on the real
+// avatar rig, and asserted AGAINST ITS OWN AUTHORED NUMBERS — the npc-styles
+// contract, so a new style entry inherits every check without naming one.
+//
+// Per style: it spent real ticks cutting; the POSED sword moved; the driver
+// COMMITTED a Slash at least once (the whoosh's and the damage sweep's shared
+// precondition — a style whose cut drive never crosses commitSpeed swings and
+// can never hurt anything); the commanded arcs are dominant in the authored
+// channel (stated on the COMMAND, not the posed sword — human.json's shoulder
+// serves a vertical chop by going round; npc-styles says why at length); and
+// THE BLADE NEVER ENTERS THE WIELDER'S OWN HEAD — measured INDEPENDENTLY of
+// the driver's keep-out inputs (the circular-probe rule): the physics
+// WeaponEdge segment against the head limb's own joint, neither of which the
+// clamp in RebuildFrame ever sees.
+//
+// Aimed at OPEN AIR, no target, no damage sweep: the gate emits zero
+// mutations, so it cannot move the world hash by construction.
+// ============================================================================
+Status GatePlayerStyles(Ctx& c, std::string& detail) {
+  // Thresholds in tests/baseline.json (playerStyles.*), seeded from the
+  // npcStyles values; --rebaseline records the observed head clearance.
+  const float dominanceMin =
+      (float)BaselineNumber("playerStyles.dominanceMin", 1.3);
+  const float minSweep = (float)BaselineNumber("playerStyles.minSweepRad", 0.25);
+  const float minReach = (float)BaselineNumber("playerStyles.minThrustVox", 1.0);
+  const float diagRatioMax =
+      (float)BaselineNumber("playerStyles.diagRatioMax", 4.0);
+  const float thrustSwingMax =
+      (float)BaselineNumber("playerStyles.thrustSwingMax", 1.0);
+  const float headClearMin =
+      (float)BaselineNumber("playerStyles.headClearMin", 1.0);
+
+  bool ok = true;
+  int checks = 0;
+  auto check = [&](bool cond, const std::string& what) {
+    checks++;
+    if (!cond) {
+      ok = false;
+      std::printf("player-styles: FAILED %s\n", what.c_str());
+    }
+  };
+
+  GpuContext& ctx = c.ctx;
+  World& world = c.world;
+  Simulation& sim = c.sim;
+  Physics& phys = c.phys;
+  DebrisSystem& debris = c.debris;
+  MobSystem& mobs = c.mobs;
+  const ItemLibrary& items = c.items;
+
+  const int swordDef = items.Find("sword");
+  const ItemDef* sword = items.At(swordDef);
+  int avDef = -1;
+  for (size_t i = 0; i < mobs.Defs().size(); i++)
+    if (mobs.Defs()[i].name == kAvatarDefName) avDef = (int)i;
+  if (!sword || avDef < 0) {
+    detail = "no sword item or no avatar def";
+    std::printf("player-styles: SKIP (%s)\n", detail.c_str());
+    return Status::Skip;
+  }
+
+  const StyleLibrary& lib = mobs.AttackStyles();
+  // The flick compass must resolve, or a click in the shipped game swings
+  // nothing — the loader skips bad sectors LOUDLY but only this asserts.
+  check(lib.player.Usable(), "attack_styles.json ships a usable player map");
+  check(lib.player.sectors.size() >= 4,
+        "the flick compass has at least four directions");
+  check(lib.player.neutral[0] >= 0 && lib.player.neutral[1] >= 0,
+        "both neutral-alternate strikes resolve");
+
+  IdCounterScope idScope(mobs);
+  debris.Reset();
+  mobs.Reset();
+  SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+  ctx.WaitIdle();
+
+  // The swing-plane fixture exactly: axis basis (camera chirality), window-
+  // anchored spawn in the right UNITS (chunk centre first, convert once).
+  const Vec3 kR{-1, 0, 0}, kU{0, 1, 0}, kF{0, 0, 1};
+  const IVec3 wo = world.WindowOrigin();
+  const int gx = (wo.x + (int)kNChunk / 2) * (int)kChunk;
+  const int gz = (wo.z + (int)kNChunk / 2) * (int)kChunk;
+  const int gh = World::TerrainHeight(gx, gz, kDefaultSeed);
+  uint32_t t = 23000;
+
+  PlayerAvatar avatar;
+  avatar.Init(&phys, &world, &debris, c.mats, &mobs);
+  avatar.SetDefs(&mobs.Defs(), kAvatarDefName);
+  Player pl;
+  pl.fly = false;
+  pl.grounded = true;
+  pl.pos = Vec3{(float)gx + 0.5f, (float)(gh + 2) + Player::kHalfY,
+                (float)gz + 0.5f};
+  if (!avatar.Spawn(pl, 0.0f)) {
+    detail = "avatar spawn failed";
+    std::printf("player-styles: SKIP (%s)\n", detail.c_str());
+    return Status::Skip;
+  }
+  check(avatar.EquipItem(sword), "the sword equips into the avatar's hand");
+
+  auto avTick = [&]() {
+    std::vector<BrushOp> ops;
+    std::vector<ParticleSpawn> spawns;
+    std::vector<CellOp> cellOps;
+    avatar.PreTick(t + 1, pl, 0.0f, kTickDt, world, ops, cellOps, spawns);
+    mobs.PreTick(t + 1, world, ops, cellOps, spawns);
+    debris.QueueSupportEvents(world.Snap());
+    debris.PreTick(t + 1, world, cellOps, spawns);
+    ++t;
+    const IVec3 pc{ifloor(pl.pos.x) >> 4, ifloor(pl.pos.y) >> 4,
+                   ifloor(pl.pos.z) >> 4};
+    SubmitTick(ctx, world, sim, t, kDefaultSeed, ops, {}, cellOps, false, pc,
+               true, false, spawns);
+    ctx.WaitIdle();
+    ctx.ProcessEvents();
+    phys.Step(kTickDt);
+    debris.PostStep();
+    mobs.PostStep();
+    avatar.PostStep();
+  };
+  for (int i = 0; i < 10; i++) avTick();
+
+  // The INDEPENDENT head probe: the head limb's joint off the live physics
+  // transform — the keep-out clamp never sees this composition, so agreement
+  // here is evidence rather than an identity.
+  const int headPart = avatar.PartIndex("head");
+  check(headPart >= 0, "the avatar rig has a part named \"head\"");
+  auto segPointDist = [](const Vec3& a, const Vec3& b, const Vec3& p) {
+    const Vec3 ab = b - a;
+    const float len2 = ab.dot(ab);
+    const float u =
+        len2 > 1e-6f ? std::clamp((p - a).dot(ab) / len2, 0.0f, 1.0f) : 0.0f;
+    return (a + ab * u - p).len();
+  };
+  // The posed tip about the shoulder, swing-plane's readBlade coordinates.
+  const int shoulderPart = avatar.PartIndex("armU.R");
+  auto shoulderWorld = [&]() -> Vec3 {
+    Vec3 j;
+    if (shoulderPart >= 0 && avatar.PartJointWorld(shoulderPart, j)) return j;
+    return avatar.Origin();
+  };
+
+  MeleeState melee;
+  // LIVE tuning, deliberately NOT pinned (contrast swing-plane): the subject
+  // is the SHIPPED strike — the authored program composed with the shipped
+  // smoothing and the shipped keep-out — because that is what a click fires.
+  ApplyMeleeTuning(melee.tuning);
+  melee.SetHandSign(avatar.HandSign());
+
+  float headMinOverall = 1e9f;
+  for (size_t si = 0; si < lib.styles.size(); si++) {
+    const AttackStyle& sty = lib.styles[si];
+    melee.Reset();
+    ApplyMeleeTuning(melee.tuning);
+    melee.SetHandSign(avatar.HandSign());
+    StrokeCursor cur;
+    // Fixed seed: reproducible, and the player styles author jitter 0 anyway.
+    BeginStrokeProgram(cur, sty, (int)si, 0x504C1u + (uint32_t)si);
+
+    float azArc = 0, elArc = 0, prevAz = 0, prevEl = 0;
+    bool havePrev = false;
+    float cmdAzArc = 0, cmdElArc = 0, cPrevAz = 0, cPrevEl = 0;
+    bool cHavePrev = false;
+    float rMin = 1e9f, rMax = -1e9f;
+    int cutTicks = 0;
+    bool sawSlash = false;
+    float headMin = 1e9f;
+
+    for (int i = 0; i < 90 && cur.Active(); i++) {
+      // main.cpp's discrete tick, in its order: seed the driver from the rig,
+      // feed the keep-out, step the program, push the pose, step the world.
+      Vec3 hand, tip, flat;
+      float reach = 0;
+      if (avatar.WeaponStrokePose(hand, tip, flat, reach))
+        melee.SetStroke(hand, tip, flat, reach);
+      else
+        melee.ClearArm();
+      {
+        Vec3 kc;
+        float kr = 0;
+        if (avatar.HeadKeepOut(kc, kr))
+          melee.SetKeepOut(kc, kr);
+        else
+          melee.ClearKeepOut();
+      }
+      const StrokeStepResult r =
+          StepStrokeProgram(cur, &sty, melee, 0.0f, 0.0f, kTickDt, kR, kU, kF);
+      if (r == StrokeStepResult::Finished) cur.Reset();
+      avatar.SetWeaponPose(melee.Pose());
+      avTick();
+
+      if (melee.Phase() == SwingPhase::Slash) sawSlash = true;
+      if (cur.Cutting()) {
+        cutTicks++;
+        // Posed sword, wrapped-arc accumulation (npc-styles' law: |dAz| is
+        // weighted by cos(el) so it is the ARC travelled, not an angle span).
+        Vec3 h2, fs, fl2;
+        float rr = 0;
+        if (avatar.WeaponStrokePose(h2, fs, fl2, rr) && fs.len() > 1e-4f) {
+          const float paz = std::atan2(-fs.x, fs.z);
+          const float pel =
+              std::asin(std::clamp(fs.y / fs.len(), -1.0f, 1.0f));
+          if (havePrev) {
+            float dAz = paz - prevAz;
+            while (dAz > 3.14159265f) dAz -= 6.28318531f;
+            while (dAz <= -3.14159265f) dAz += 6.28318531f;
+            azArc += std::fabs(dAz) * std::cos(std::clamp(pel, -1.5f, 1.5f));
+            elArc += std::fabs(pel - prevEl);
+          }
+          prevAz = paz;
+          prevEl = pel;
+          havePrev = true;
+        }
+        const float cr = melee.StrokeRadius();
+        rMin = std::min(rMin, cr);
+        rMax = std::max(rMax, cr);
+        const float ca = melee.StrokeAz(), ce = melee.StrokeEl();
+        if (cHavePrev) {
+          cmdAzArc +=
+              std::fabs(ca - cPrevAz) * std::cos(std::clamp(ce, -1.5f, 1.5f));
+          cmdElArc += std::fabs(ce - cPrevEl);
+        }
+        cPrevAz = ca;
+        cPrevEl = ce;
+        cHavePrev = true;
+      }
+      // Head clearance on EVERY tick the arm is claimed, windup included — a
+      // windup through the face is exactly as wrong as a cut through it.
+      if (melee.PoseWeight() > 0.05f && headPart >= 0) {
+        Vec3 eb, et, ef, neck;
+        float ehw = 0;
+        if (avatar.WeaponEdge(eb, et, ehw, &ef) &&
+            avatar.PartJointWorld(headPart, neck))
+          headMin = std::min(headMin, segPointDist(eb, et, neck));
+      }
+    }
+    // Hand the arm back before the next style, exactly as main.cpp idles the
+    // driver between strikes, so every style starts from a settled take-over.
+    for (int i = 0; i < 12; i++) {
+      Vec3 hand, tip, flat;
+      float reach = 0;
+      if (avatar.WeaponStrokePose(hand, tip, flat, reach))
+        melee.SetStroke(hand, tip, flat, reach);
+      else
+        melee.ClearArm();
+      melee.Update(kTickDt, false, true, kR, kU, kF);
+      avatar.SetWeaponPose(melee.Pose());
+      avTick();
+    }
+
+    // ---- the style's own claims (npc-styles' branch logic) -----------------
+    const float wantAz = std::fabs(sty.cut.az);
+    const float wantEl = std::fabs(sty.cut.el);
+    const float wantR = std::fabs(sty.cut.reach);
+    const float dr = rMax > rMin ? rMax - rMin : 0.0f;
+    const std::string n = "\"" + sty.name + "\"";
+    check(cutTicks >= 2, "style " + n + " spent time cutting");
+    // THE COMMIT IS DEMANDED ONLY WHERE THE AUTHORED NUMBERS DEMAND IT. The
+    // damage sweep keys on the CURSOR's cut (main.cpp mirrors MobSystem), so
+    // Slash is not the damage precondition any more — what it still buys is
+    // full wrist alignment, i.e. edge crispness, i.e. damage through
+    // MeleeEdgeAlign. A style whose cut drives the angular channels well past
+    // commitSpeed must therefore still commit; a thrust rides the radial
+    // channel, which the commit test never sees, and is exempt by its own
+    // arithmetic rather than by name.
+    const float cutPx = (wantAz / melee.tuning.aimGainX +
+                         wantEl / melee.tuning.aimGainY) /
+                        (float)std::max(sty.cut.ticks, 1) / kTickDt;
+    if (cutPx > melee.tuning.commitSpeed * 1.5f)
+      check(sawSlash, "style " + n +
+                          " committed Slash (its authored cut speed demands "
+                          "it; edge alignment rides on the commit)");
+    check(azArc + elArc > minSweep,
+          "style " + n + ": the SWORD moved, not just the stroke");
+    if (wantR > wantAz && wantR > wantEl) {
+      check(dr > minReach, "style " + n + " (thrust) extended its reach");
+      // Commanded arcs, npc-styles' restated claim (see _npcStyles_about):
+      // the posed sword always sweeps some arc serving a straight-line ask,
+      // and the torso lean moves the very shoulder that arc is measured
+      // about. "It stayed a thrust" is a claim about the STROKE.
+      check(cmdAzArc < thrustSwingMax && cmdElArc < thrustSwingMax,
+            "style " + n + " (thrust) did not turn into a swing");
+    } else if (wantAz > wantEl * dominanceMin) {
+      check(cmdAzArc > minSweep, "style " + n + " swept azimuth");
+      check(cmdAzArc > cmdElArc,
+            "style " + n + " is azimuth-DOMINANT, as authored");
+    } else if (wantEl > wantAz * dominanceMin) {
+      check(cmdElArc > minSweep, "style " + n + " swept elevation");
+      check(cmdElArc > cmdAzArc,
+            "style " + n + " is elevation-DOMINANT, as authored");
+    } else {
+      check(cmdAzArc > minSweep && cmdElArc > minSweep,
+            "style " + n + " (diagonal) swept BOTH channels");
+      const float ratio = std::max(cmdAzArc / std::max(cmdElArc, 1e-3f),
+                                   cmdElArc / std::max(cmdAzArc, 1e-3f));
+      check(ratio < diagRatioMax, "style " + n + " is genuinely diagonal");
+    }
+    check(headMin >= headClearMin,
+          "style " + n + " kept the blade clear of the wielder's own head");
+    headMinOverall = std::min(headMinOverall, headMin);
+    std::printf(
+        "player-styles %-20s cmd arc az %.2f el %.2f, posed az %.2f el %.2f, "
+        "dr %.2f vox over %d cut ticks, slash %d, head clearance %.2f vox\n",
+        sty.name.c_str(), cmdAzArc, cmdElArc, azArc, elArc, dr, cutTicks,
+        (int)sawSlash, headMin >= 1e9f ? -1.0f : headMin);
+  }
+  RecordObserved("playerStyles.headClearObserved",
+                 headMinOverall >= 1e9f ? -1.0 : (double)headMinOverall);
+
+  // Pristine terrain for whoever runs next, the world-touching convention
+  // (rule 7): this gate carved nothing, but ~500 driven ticks settle sand.
+  avatar.Despawn();
+  mobs.Reset();
+  debris.Reset();
+  SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+  ctx.WaitIdle();
+
+  detail = Format("%d checks", checks);
+  std::printf("player-styles: %s (%d checks)\n", ok ? "PASS" : "FAIL", checks);
+  return ok ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& SwingGates() {
@@ -2109,6 +2435,10 @@ const std::vector<Gate>& SwingGates() {
       // Expensive, so it runs LATE in kOrder with the other world-touching
       // gates and regenerates worldgen on the way out (CLAUDE.md rule 7).
       {"swing-plane", "player", {}, false, GateSwingPlane},
+      // The discrete strikes: every authored style through the player's own
+      // runner on the real rig, plus the head keep-out. World-touching like
+      // swing-plane and placed beside it in kOrder.
+      {"player-styles", "player", {}, false, GatePlayerStyles},
   };
   return g;
 }

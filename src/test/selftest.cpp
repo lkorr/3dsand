@@ -166,6 +166,10 @@ const char* const kOrder[] = {
     // real bodies at absolute coordinates, and it regenerates worldgen on the
     // way out so the gates after it still find pristine terrain (rule 7).
     "swing-plane",
+    // The discrete strikes on the same fixture: every authored style through
+    // the player's runner, plus the head keep-out. Regenerates on the way out
+    // like its neighbour, so it slots directly after it.
+    "player-styles",
     // NPC AI. After the world-restoring gates above because all of them want
     // pristine terrain to place a fixture on and each regenerates on its way
     // out; before voxregion because ai-approach writes a real stone wall and

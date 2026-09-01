@@ -175,6 +175,13 @@ Status GateCombatTuning(Ctx& c, std::string& detail) {
       {"melee", "blockItemDamage", 0.61f, [](const Tuning& t) { return t.melee.blockItemDamage; }},
       {"melee", "blockNudgeAz", 0.41f, [](const Tuning& t) { return t.melee.blockNudgeAz; }},
       {"melee", "blockNudgeEl", 0.31f, [](const Tuning& t) { return t.melee.blockNudgeEl; }},
+      // controlMode is an int read by ReadI; 1.0f streams as the literal `1`,
+      // which is the only non-default value the [0,1] clamp band has.
+      {"melee", "controlMode", 1.0f, [](const Tuning& t) { return (float)t.melee.controlMode; }},
+      {"melee", "pickMinSpeed", 333.0f, [](const Tuning& t) { return t.melee.pickMinSpeed; }},
+      {"melee", "torsoShare", 0.51f, [](const Tuning& t) { return t.melee.torsoShare; }},
+      {"melee", "torsoPitch", 0.31f, [](const Tuning& t) { return t.melee.torsoPitch; }},
+      {"melee", "headClearM", 0.11f, [](const Tuning& t) { return t.melee.headClearM; }},
       {"combatfx", "hitStopChipScale", 0.61f, [](const Tuning& t) { return t.combatfx.hitStopChipScale; }},
       {"combatfx", "hitStopChipMs", 71.0f, [](const Tuning& t) { return t.combatfx.hitStopChipMs; }},
       {"combatfx", "hitStopFleshScale", 0.41f, [](const Tuning& t) { return t.combatfx.hitStopFleshScale; }},
@@ -1426,7 +1433,14 @@ Status GateNpcStyles(Ctx& c, std::string& detail) {
       // VOXELS (a radius) against radians, so the two are asserted separately
       // rather than compared — comparing them would be comparing units.
       check(dr > minReach, "style " + n + " (thrust) extended its reach");
-      check(posedAz < thrustSwingMax && posedEl < thrustSwingMax,
+      // ON THE COMMANDED ARCS, like every other dominance claim here — the
+      // restatement _npcStyles_about prescribed (2026-09-01, done when the
+      // torso lean moved the posed number past the old absolute cap). A
+      // shoulder that cannot push a point out without going round it will
+      // always sweep some POSED azimuth, and the lean now moves the very
+      // shoulder the arc is measured about; whether the STROKE stayed a
+      // thrust is a claim about the command, and it is scope-stable.
+      check(az < thrustSwingMax && el < thrustSwingMax,
             "style " + n + " (thrust) did not turn into a swing");
     } else if (wantAz > wantEl * domMin) {
       check(az > minSweep, "style " + n + " swept azimuth");

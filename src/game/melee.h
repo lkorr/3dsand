@@ -6,7 +6,18 @@
 #include "game/item.h"
 #include "math3d.h"
 
-// MOUSE-DIRECTED MELEE (the "half sword" experiment).
+// THE STROKE DRIVER — one control law, three feeders (2026-09-01).
+//
+// The prose below describes the FREEFORM mouse-steer experiment, which is now
+// the `melee.controlMode = 1` path (tuning.h): the SHIPPED default is 0,
+// DISCRETE STRIKES — a click fires an authored stroke program from
+// attack_styles.json, direction picked by the flick at the press
+// (game/strike_pick.h), replayed through this same driver by the same
+// StepStrokeProgram the NPCs use (game/strokes.h). Everything below the input
+// layer — the tip-on-a-reach-sphere control law, the derived blade frame, the
+// damage sweep, parry, block — is shared by all three feeders and unchanged.
+//
+// MOUSE-DIRECTED MELEE (the "half sword" experiment; controlMode = 1).
 //
 // THE IDEA. A swing is not an animation you trigger, it is a motion you make.
 // Hold the attack button and you TAKE OVER THE BLADE: the sword stays exactly
@@ -460,6 +471,19 @@ struct MeleeTuning {
   // a floor rather than a gate, and it is what makes rolling the blade into the
   // cut worth doing.
   float edgeFloor = 0.35f;
+  // ---- the body serves the swing -------------------------------------------
+  // Fractions of the SMOOTHED stroke's azimuth/elevation the torso carries
+  // (WeaponPose::torsoTwist/torsoPitch), the way avatar.headLookSpine shares
+  // the look into the chest. Scaled by PoseWeight inside Pose(), so the lean
+  // fades exactly with the arm claim and 0 is the arm-only A/B.
+  float torsoShare = 0.35f;
+  float torsoPitch = 0.20f;
+  // ---- the blade stays out of the wielder's own face ------------------------
+  // World voxels of clearance beyond the head's own radius the hand->tip
+  // segment is held out to (RebuildFrame, after the handBackFrac clamp). The
+  // keep-out sphere itself arrives per tick via SetKeepOut, because only the
+  // rig knows where its head is. 0 = clamp OFF, the one-JSON-edit A/B.
+  float headClear = MetresToCells(0.06f);
 };
 
 // ---- WHERE THE NUMBERS COME FROM -------------------------------------------
@@ -627,6 +651,15 @@ struct WeaponPose {
   // one, radians. The rig takes the tighter of this and the shoulder's own
   // authored twist range. See MeleeTuning::elbowAxisCone.
   float elbowAxisCone = 1.31f;
+  // THE TORSO'S SHARE OF THE STROKE, radians: twist toward the wielder's
+  // right, chest pitch up. Same seam-crossing rule as wristMaxAngle above —
+  // the DRIVER knows the stroke (Pose() fills these from the smoothed az/el,
+  // scaled by tuning.torsoShare/torsoPitch AND by PoseWeight, so they fade
+  // with the arm claim), the RIG knows how to twist a spine
+  // (AnimApplySpineTwist, the head-look's distribution law). 0/0 — the
+  // default every fabricated gate pose gets — is exactly the old behaviour.
+  float torsoTwist = 0;
+  float torsoPitch = 0;
   // False is the legacy contract: drive the arm at `hand` and leave the blade
   // at whatever grip angle the fist gives it. True is the stroke driver: the
   // hand is ORIENTED so the blade points along bladeDir with its flat facing
@@ -678,6 +711,17 @@ class MeleeState {
     SetStroke(handFromShoulder, handFromShoulder, Vec3{}, reach);
   }
   void ClearArm();
+  // THE WIELDER'S OWN HEAD, as a keep-out sphere: centre relative to the
+  // shoulder in the same world frame SetStroke's offsets are in, radius in
+  // world voxels (the head's own half-size; tuning.headClear rides on top).
+  // Pushed per tick beside SetStroke by both drivers (Mob::HeadKeepOut);
+  // Clear when the rig cannot say (no head, severed), which turns the clamp
+  // off rather than clamping against a stale sphere.
+  void SetKeepOut(const Vec3& centerFromShoulder, float radius) {
+    keepC_ = centerFromShoulder;
+    keepR_ = radius;
+  }
+  void ClearKeepOut() { keepR_ = 0; }
   // +1 = the weapon is on the basis's RIGHT (a right-handed wielder), -1 = its
   // left. Only the asymmetric azimuth limits read it: "across the body" is a
   // different stop from "out to the weapon side".
@@ -882,6 +926,10 @@ class MeleeState {
   Vec3 armHand_{}, armTip_{}, armFlat_{};
   float armReach_ = 0, bladeLen_ = 0;
   bool armValid_ = false;
+  // The head keep-out sphere (SetKeepOut). World-frame offset from the
+  // shoulder; 0 radius = no sphere = clamp off.
+  Vec3 keepC_{};
+  float keepR_ = 0;
   float handSign_ = 1.0f;
   // Was the button still down when this recover started? A recover between two
   // cuts keeps the arm; a recover after the release hands it back (PoseWeight).

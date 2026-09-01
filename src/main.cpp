@@ -30,6 +30,8 @@
 #include "game/melee.h"
 #include "game/mob.h"
 #include "game/spell.h"
+#include "game/strike_pick.h"
+#include "sim/rng.h"
 #include "game/player.h"
 #include "game/prefab.h"
 #include "game/thirdperson.h"
@@ -3155,6 +3157,18 @@ int main(int argc, char** argv) {
   // re-applied in the F5 block, which is the whole point of the migration: the
   // stroke's feel is a JSON edit and a keypress rather than a rebuild.
   ApplyMeleeTuning(melee.tuning);
+  // ---- DISCRETE STRIKES (melee.controlMode 0, the default) -----------------
+  // The player's authored-attack state: a bare StrokeCursor stepped by the
+  // same StepStrokeProgram the NPCs use (game/strokes.h), driving the SAME
+  // `melee` above — so the sweep, the whoosh, the Arrest and the Nudge blocks
+  // below never learn which mode fed the driver. The picker owns the flick
+  // read; the two ints are the press latches (see the sticky-flag note at the
+  // click edges: the tick loop runs 0..4x a frame, so an unlatched click is
+  // dropped ~8 frames of 9).
+  StrikePicker strikePicker;
+  StrokeCursor playerStrike;
+  int strikeQueued = -1;    // style index latched at the press, -1 = none
+  int strikeBuffered = -1;  // ONE strike banked mid-swing, fired at recover
   Inventory hotbar;
   // The rest of the kit: worn/sheathed/quick slots and the pack
   // (game/equipment.h). Held beside the hotbar rather than inside it because
@@ -3687,7 +3701,12 @@ int main(int argc, char** argv) {
     // the tick loop below) and imperceptibly so.
     {
       const auto& ct = CurrentTuning().camera;
-      const bool bladeUp = melee.Phase() != SwingPhase::Idle;
+      // FREEFORM ONLY (controlMode 1): the damping exists because the mouse
+      // steers the blade and the view at once. A discrete strike never reads
+      // the mouse mid-stroke, so damping the look there would just make the
+      // camera feel sticky for the length of every swing.
+      const bool bladeUp = CurrentTuning().melee.controlMode == 1 &&
+                           melee.Phase() != SwingPhase::Idle;
       const float want = bladeUp ? ct.meleeSensitivity : 1.0f;
       const float hl = ct.meleeSensHalflife;
       const float k = hl > 1e-4f ? 1.0f - std::pow(0.5f, dt / hl) : 1.0f;
@@ -3727,7 +3746,17 @@ int main(int argc, char** argv) {
     // Fixing the second would mean giving Update a second dt (real vs sim),
     // widening a signature three callers and the NPC driver share, to correct
     // a number that is not read in the window where it is wrong.
-    if (captured) melee.Feed((float)(mx - mx0), (float)(my - my0));
+    //
+    // MODE SPLIT (D10 of the discrete-strikes plan): in discrete mode the
+    // driver is fed by the stroke program in the tick loop, so raw pixels go
+    // to the PICKER instead — feeding both would double-integrate the same
+    // motion into the accumulator and bend every authored cut.
+    if (captured) {
+      if (CurrentTuning().melee.controlMode == 1)
+        melee.Feed((float)(mx - mx0), (float)(my - my0));
+      else
+        strikePicker.Feed((float)(mx - mx0), (float)(my - my0), dt);
+    }
     mx0 = mx;
     my0 = my;
 
@@ -4525,6 +4554,29 @@ int main(int argc, char** argv) {
     const bool meleeArmed = ui.tool == UIState::kToolMelee && !ui.magicMode &&
                             heldItem && heldItem->kind == ItemKind::Melee;
     const bool meleeHeld = meleeArmed && mouseL;
+    // DISCRETE STRIKES (melee.controlMode 0): the click is the whole input,
+    // LATCHED like castQueued above and for the same reason. The direction is
+    // read HERE, at the press edge, because the flick is freshest at the
+    // instant of intent — a strike fired from the buffer later still cuts the
+    // direction that was flicked, aimed wherever the camera is THEN (the
+    // aim is resolved at the windup's end, like every stroke).
+    if (mouseLClick && meleeArmed && CurrentTuning().melee.controlMode == 0) {
+      const StyleLibrary& styleLib = mobs.AttackStyles();
+      float fx = 0, fy = 0;
+      int si = -1;
+      if (strikePicker.Pick(CurrentTuning().melee.pickMinSpeed, fx, fy))
+        si = QuantizeStrike(styleLib, fx, fy);
+      if (si < 0) {
+        // No flick: alternate the two horizontals so plain clicking is a
+        // usable L/R rhythm rather than the same cut stamped.
+        si = NeutralStrike(styleLib, strikePicker.altRight);
+        strikePicker.altRight = !strikePicker.altRight;
+      }
+      if (si >= 0) strikeQueued = si;
+    }
+    // Same pause rule as the cast: a click made while paused is dropped, not
+    // banked to fire at whatever is under the crosshair on unpause.
+    if (ui.paused && !ui.stepOnce) strikeQueued = -1;
     // Scroll and the number row pick a hotbar slot while the melee tool is up,
     // which is the one context where the number row is otherwise unclaimed
     // (the brush owns it normally, glyphs own it in magic mode).
@@ -5099,11 +5151,106 @@ int main(int argc, char** argv) {
               melee.SetStroke(handNow, tipNow, flatNow, reachNow);
             else
               melee.ClearArm();
+            // ...and where the avatar's own head is, so neither an authored
+            // windup nor a freeform drag sweeps the blade through it
+            // (melee.h SetKeepOut; the clamp lives in RebuildFrame).
+            {
+              Vec3 kc;
+              float kr = 0;
+              if (avatar.HeadKeepOut(kc, kr))
+                melee.SetKeepOut(kc, kr);
+              else
+                melee.ClearKeepOut();
+            }
+            // The NPC driver always did this and the player's never had —
+            // without it the asymmetric azimuth window (azOut on the weapon
+            // side) assumes a right-handed rig whatever the avatar holds.
+            melee.SetHandSign(avatar.HandSign());
           } else {
             melee.ClearArm();
           }
-          melee.Update(kTickDt, meleeHeld, meleeArmed, cam.Right(), cam.Up(),
-                       cam.Forward());
+          // ---- WHICH MODE FEEDS THE DRIVER (melee.controlMode; tuning.h) ---
+          // Read HERE and nowhere else. Downstream, the pose push, Arrest and
+          // Nudge are mode-blind; the sweep and the whoosh key on
+          // `melee.Cutting() || playerStrike.Cutting()`, which needs no mode
+          // read because a freeform tick keeps the cursor Idle.
+          const int meleeMode = CurrentTuning().melee.controlMode;
+          // The program entered its cut THIS tick (the discrete whoosh edge —
+          // see the whoosh block below for why Slash cannot be the trigger).
+          bool strikeCutEdge = false;
+          if (meleeMode == 1) {
+            // FREEFORM: the original law, untouched. A mode flip mid-swing
+            // (F5) drops any live program rather than leaving it half-run.
+            playerStrike.Reset();
+            strikeQueued = strikeBuffered = -1;
+            melee.Update(kTickDt, meleeHeld, meleeArmed, cam.Right(), cam.Up(),
+                         cam.Forward());
+          } else {
+            // DISCRETE: consume the press latch, then step the program. Begin
+            // and first step land on the SAME tick, exactly as the NPC's
+            // BeginStroke/StepStroke pair does.
+            if (!meleeArmed || !avatar.Spawned()) {
+              // Weapon stowed (or body gone) mid-swing: drop the claim the
+              // same way MobSystem's teardown guard does.
+              playerStrike.Reset();
+              strikeBuffered = -1;
+            }
+            if (strikeQueued >= 0 && meleeArmed && avatar.Spawned()) {
+              if (!playerStrike.Active()) {
+                if (const AttackStyle* sty =
+                        mobs.AttackStyles().At(strikeQueued)) {
+                  // Fresh sliders per swing — MobSystem::BeginStroke says why
+                  // (MeleeTuning is a copy; F5 has to reach the next cut).
+                  ApplyMeleeTuning(melee.tuning);
+                  // The seed is (who, when), like the NPC's; the player's
+                  // styles author jitter 0, so it only matters if an author
+                  // turns jitter back on — and then it still replays.
+                  BeginStrokeProgram(playerStrike, *sty, strikeQueued,
+                                     rng::Hash3(0x504Cu, tick, 0x5747u));
+                }
+              } else if (playerStrike.phase == StrokeCursor::Phase::Cut ||
+                         playerStrike.phase == StrokeCursor::Phase::Recover) {
+                // ONE strike banks mid-swing (last click wins); a click during
+                // the windup is dropped — the windup IS the commitment.
+                strikeBuffered = strikeQueued;
+              }
+              strikeQueued = -1;
+            }
+            bool stepped = false;
+            if (playerStrike.Active()) {
+              const AttackStyle* sty = mobs.AttackStyles().At(playerStrike.style);
+              if (sty == nullptr) {
+                // The style library reloaded out from under a live swing.
+                playerStrike.Reset();
+              } else {
+                // liveAz/liveEl = (0, 0): the camera IS the aim, so every
+                // strike's mid-travel passes through the crosshair line.
+                const bool wasCutting = playerStrike.Cutting();
+                const StrokeStepResult r = StepStrokeProgram(
+                    playerStrike, sty, melee, 0.0f, 0.0f, kTickDt, cam.Right(),
+                    cam.Up(), cam.Forward());
+                stepped = r != StrokeStepResult::Idle;
+                strikeCutEdge = playerStrike.Cutting() && !wasCutting;
+                if (r == StrokeStepResult::Finished) {
+                  playerStrike.Reset();
+                  // Chain the banked strike: promoted to the latch, so it
+                  // begins on the next tick through the same door as a fresh
+                  // click (one tick of gap, invisible at 30 Hz).
+                  if (strikeBuffered >= 0) {
+                    strikeQueued = strikeBuffered;
+                    strikeBuffered = -1;
+                  }
+                }
+              }
+            }
+            if (!stepped) {
+              // No program stepped the driver this tick: it idles/unwinds
+              // exactly as a released button always did, so the arm hands
+              // back over the usual ramp. ONE advance per tick either way.
+              melee.Update(kTickDt, false, meleeArmed, cam.Right(), cam.Up(),
+                           cam.Forward());
+            }
+          }
           // ---- THE SWING WHOOSH, on the EDGE into Slash --------------------
           // A commit is a moment, so this fires once per cut rather than on
           // every tick the slash is live. Latched (not played here) because
@@ -5115,8 +5262,17 @@ int main(int argc, char** argv) {
           // number the damage curve used, and a lazy wave under
           // combatfx.whooshMinSpeed makes no sound at all rather than a quiet
           // one — which is the honest report that it was not a cut.
-          if (melee.Phase() == SwingPhase::Slash &&
-              meleePhasePrev != SwingPhase::Slash) {
+          //
+          // TWO TRIGGERS, ONE PER MODE, never both: freeform commits Slash by
+          // mouse speed, but an authored THRUST drives mostly the radial
+          // channel, which commitSpeed never sees — it can finish its whole
+          // cut without ever entering Slash (the player-styles gate found
+          // exactly this), so in discrete mode the cue keys on the PROGRAM's
+          // own cut edge instead. OR-ing the two would whoosh a committed
+          // discrete cut twice, one tick apart.
+          const bool slashEdge = melee.Phase() == SwingPhase::Slash &&
+                                 meleePhasePrev != SwingPhase::Slash;
+          if (meleeMode == 0 ? strikeCutEdge : slashEdge) {
             const Tuning::CombatFx& fx = CurrentTuning().combatfx;
             const float lo = fx.whooshMinSpeed;
             const float hi = std::max(melee.tuning.commitSpeed, lo + 1.0f);
@@ -5458,7 +5614,14 @@ int main(int argc, char** argv) {
         Vec3 eb, et, ef;
         float ehw = 0;
         if (avatar.WeaponEdge(eb, et, ehw, &ef)) {
-          if (lastEdgeValid && melee.Cutting()) {
+          // EITHER cut counts, and no mode read is needed: a freeform tick
+          // keeps the cursor Idle, and a discrete one may cut without ever
+          // committing Slash — an authored THRUST drives mostly the radial
+          // channel, which commitSpeed never sees, so gating on the driver
+          // alone made thrusts free actions (the player-styles gate caught
+          // it). This is the NPC's own contract: MobSystem::StepStroke sweeps
+          // on the CURSOR's cut, and tip speed still scales the damage.
+          if (lastEdgeValid && (melee.Cutting() || playerStrike.Cutting())) {
             EdgeSweep sw;
             sw.aPrev = lastEdgeBase;
             sw.bPrev = lastEdgeTip;
@@ -5521,7 +5684,16 @@ int main(int argc, char** argv) {
             // reaching into whichever driver happens to own this swing
             // (melee.h EdgeSweepResult). The player's cut stops here: no
             // follow-through, no second bite past the blade that stopped it.
-            if (res.arrested) melee.Arrest();
+            if (res.arrested) {
+              melee.Arrest();
+              // The program mirrors the driver, exactly as the NPC's stroke
+              // does on a parry (MobSystem::StepStroke): the remaining cut
+              // ticks are abandoned and the recover starts now.
+              if (playerStrike.Cutting()) {
+                playerStrike.phase = StrokeCursor::Phase::Recover;
+                playerStrike.phaseTick = 0;
+              }
+            }
             if (res.bodiesHit > 0) {
               const bool severed = mobs.SeverEvents().size() > sev0;
               const bool flesh = mobs.VoiceEvents().size() > voi0;
@@ -6269,6 +6441,18 @@ int main(int argc, char** argv) {
         case SwingPhase::Recover: ui.swingPhase = "recover"; break;
       }
       ui.swingSpeed = melee.MouseSpeed();
+      // Which authored strike is running (discrete mode): the label, so the
+      // flick's read-back is on screen while the swing is. A banked follow-up
+      // is shown too — it is the answer to "did my mid-swing click register".
+      ui.swingStyle.clear();
+      if (playerStrike.Active()) {
+        if (const AttackStyle* sty = mobs.AttackStyles().At(playerStrike.style))
+          ui.swingStyle = sty->label;
+        if (strikeBuffered >= 0) {
+          if (const AttackStyle* nxt = mobs.AttackStyles().At(strikeBuffered))
+            ui.swingStyle += "  (next: " + nxt->label + ")";
+        }
+      }
       ui.playerPos[0] = player.pos.x;
       ui.playerPos[1] = player.pos.y;
       ui.playerPos[2] = player.pos.z;

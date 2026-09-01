@@ -1,9 +1,62 @@
 {
-  "comment": "NPC ATTACK STYLES. A style is a named STROKE PROGRAM: a windup that raises the blade into a stance, then a cut that drives it through the target line. It is fed to the SAME driver the player's mouse feeds (game/melee.h MeleeState, via StrokeSample), so an NPC swing is a motion a person could make and a fix to the feel is a fix to both. Hot-reloads on R alongside materials, behaviours, glyphs and items. The full schema, and the reasoning behind every field, is at the top of src/game/strokes.h.",
+  "comment": "ATTACK STYLES. A style is a named STROKE PROGRAM: a windup that raises the blade into a stance, then a cut that drives it through the target line. It is fed to the SAME driver the player's mouse feeds (game/melee.h MeleeState, via StrokeSample), so an NPC swing is a motion a person could make and a fix to the feel is a fix to both. The player_* entries are the PLAYER'S discrete strikes (melee.controlMode 0), replayed through the same runner with the camera as the basis -- shorter windups because a click must feel owned, jitter 0 because a strike must go exactly where it was flicked. Hot-reloads on R alongside materials, behaviours, glyphs and items. The full schema, and the reasoning behind every field, is at the top of src/game/strokes.h.",
 
   "notes": "ANGLES ARE RADIANS in the mob's own facing basis: azimuth 0 is straight ahead and positive is the mob's right; elevation 0 is level. REACH is a fraction of the arm's own reach band, so a thrust is the same lunge on a long arm and a short one. TICKS are 30 Hz sim ticks -- a windup of 12 is 0.40 s of visible blade raise, which IS the telegraph (there is no UI indicator). The cut is CENTRED on the aim point: the windup lands at aim minus half the cut's own travel, so the blade passes through where it was aimed rather than starting there.",
 
+  "player_notes": "The `player` block maps the FLICK at the attack press to a style: `dir` is a unit-ish direction in SCREEN space (+x right, +y DOWN, raw mouse), quantized by max dot product, so adding a sector is adding a line here. Mount & Blade's compass: right flick = cut from the right, up = overhead, down = thrust, up-right = the descending diagonal (it chambers at the right shoulder). A click with no flick (below melee.pickMinSpeed) alternates the two `neutralAlternate` entries.",
+
+  "player": {
+    "sectors": [
+      { "dir": [1.0, 0.0], "style": "player_horizontal_r" },
+      { "dir": [-1.0, 0.0], "style": "player_horizontal_l" },
+      { "dir": [0.0, -1.0], "style": "player_overhead" },
+      { "dir": [0.0, 1.0], "style": "player_thrust" },
+      { "dir": [0.7, -0.7], "style": "player_diagonal" }
+    ],
+    "neutralAlternate": ["player_horizontal_r", "player_horizontal_l"]
+  },
+
   "styles": [
+    {
+      "name": "player_horizontal_r",
+      "label": "Horizontal cut from the right",
+      "windup": { "ticks": 8, "az": 0.30, "el": 0.05, "reach": -0.05 },
+      "cut": { "ticks": 7, "az": -2.30, "el": 0.00, "reach": 0.10 },
+      "recover": { "ticks": 8 },
+      "jitter": { "az": 0.0, "el": 0.0, "tempo": 0.0 }
+    },
+    {
+      "name": "player_horizontal_l",
+      "label": "Backhand cut from the left",
+      "windup": { "ticks": 8, "az": -0.25, "el": 0.04, "reach": -0.05 },
+      "cut": { "ticks": 7, "az": 2.10, "el": 0.00, "reach": 0.10 },
+      "recover": { "ticks": 8 },
+      "jitter": { "az": 0.0, "el": 0.0, "tempo": 0.0 }
+    },
+    {
+      "name": "player_overhead",
+      "label": "Overhead chop",
+      "windup": { "ticks": 11, "az": 0.06, "el": 0.55, "reach": -0.10 },
+      "cut": { "ticks": 6, "az": -0.15, "el": -1.90, "reach": 0.14 },
+      "recover": { "ticks": 9 },
+      "jitter": { "az": 0.0, "el": 0.0, "tempo": 0.0 }
+    },
+    {
+      "name": "player_diagonal",
+      "label": "Descending diagonal, shoulder to hip",
+      "windup": { "ticks": 7, "az": 0.35, "el": 0.45, "reach": -0.08 },
+      "cut": { "ticks": 7, "az": -1.60, "el": -1.40, "reach": 0.12 },
+      "recover": { "ticks": 8 },
+      "jitter": { "az": 0.0, "el": 0.0, "tempo": 0.0 }
+    },
+    {
+      "name": "player_thrust",
+      "label": "Chamber and thrust",
+      "windup": { "ticks": 6, "az": 0.28, "el": 0.05, "reach": -0.45 },
+      "cut": { "ticks": 5, "az": -0.20, "el": 0.00, "reach": 0.85 },
+      "recover": { "ticks": 9 },
+      "jitter": { "az": 0.0, "el": 0.0, "tempo": 0.0 }
+    },
     {
       "name": "horizontal_r",
       "label": "Horizontal cut, weapon side across",

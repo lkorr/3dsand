@@ -2308,6 +2308,32 @@ A hotbar and a sword, built as the melee counterpart to the spell system: the
 same division of labour (main.cpp owns the player's inventory, the systems are
 player-agnostic) and the same refusal to add a parallel damage path.
 
+**DISCRETE STRIKES ARE THE DEFAULT NOW (2026-09-01; `melee.controlMode`).**
+The mouse-steer experiment below is preserved intact as `controlMode = 1`, but
+what ships is `0`: a click fires an **authored stroke program** — the same
+`attack_styles.json` entries the NPCs replay, new `player_*` rows with short
+windups and zero jitter — through the same `MeleeState`, with the **camera as
+the basis and (az 0, el 0) as the aim**, so every strike's mid-travel passes
+through the crosshair line. Direction is picked by the **flick at the press**
+(`game/strike_pick.h`, quantized against the JSON `player` sector map; a
+still-mouse click alternates the two horizontals), one strike buffers during
+a live cut, and a click mid-windup is dropped — the windup is the commitment.
+The phase machine itself was extracted to `StepStrokeProgram`
+(`game/strokes.cpp`) so MobSystem and main.cpp step the identical runner:
+**one driver, three feeders** (mouse, NPC program, player program), and
+everything below the input layer — blade frame, damage sweep, parry, block,
+Arrest/Nudge — is shared and unchanged. Two things the port surfaced, both
+now structural: the **damage sweep keys on the program's cut phase, not on
+the driver's Slash commit** (a thrust drives the radial channel, which
+`commitSpeed` never sees — the NPC path always worked this way), and the
+whole body got two long-wanted looks passes: a **torso lean** riding
+`WeaponPose` (`torsoTwist`/`torsoPitch`, applied by `AnimApplySpineTwist`
+pre-flatten, so NPCs inherit it) and a **head keep-out** clamp in the driver
+(`melee.headClearM`; the blade's hand→tip segment is rigidly carried clear of
+the wielder's own head, in both modes). The `player-styles` gate replays
+every authored style through the player path on the real rig and asserts each
+style's claims from its own authored numbers, head clearance included.
+
 **The pose is the hitbox.** A swing does not switch on a hitbox during an
 animation window and it does not test a cone in front of the crosshair. The
 blade's authored `edge` segment is read through its **live** transform and

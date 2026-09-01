@@ -855,6 +855,11 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadF(*g, "blockItemDamage", e.blockItemDamage, out, at);
     ReadF(*g, "blockNudgeAz", e.blockNudgeAz, out, at);
     ReadF(*g, "blockNudgeEl", e.blockNudgeEl, out, at);
+    ReadI(*g, "controlMode", e.controlMode, out, at);
+    ReadF(*g, "pickMinSpeed", e.pickMinSpeed, out, at);
+    ReadF(*g, "torsoShare", e.torsoShare, out, at);
+    ReadF(*g, "torsoPitch", e.torsoPitch, out, at);
+    ReadF(*g, "headClearM", e.headClearM, out, at);
 
     // ---- BOUNDS, not taste ---------------------------------------------------
     // Every clamp here protects a STRUCTURAL property of the stroke rather than
@@ -975,6 +980,13 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     e.blockItemDamage = std::clamp(e.blockItemDamage, 0.0f, 1.0f);
     e.blockNudgeAz = std::clamp(e.blockNudgeAz, 0.0f, 1.0f);
     e.blockNudgeEl = std::clamp(e.blockNudgeEl, 0.0f, 1.0f);
+    // An out-of-range mode is a typo, not a request: clamp to the two that
+    // exist so nothing downstream needs a default arm (handLead's convention).
+    e.controlMode = std::clamp(e.controlMode, 0, 1);
+    e.pickMinSpeed = std::max(e.pickMinSpeed, 1.0f);
+    e.torsoShare = std::clamp(e.torsoShare, 0.0f, 1.0f);
+    e.torsoPitch = std::clamp(e.torsoPitch, 0.0f, 1.0f);
+    e.headClearM = std::clamp(e.headClearM, 0.0f, 0.5f);
   }
 
   // ---- combat feel: hit-stop, hit flash, combat cues ------------------------
@@ -2685,6 +2697,11 @@ bool SaveCombatTuning(const std::string& path, const Tuning& t,
     put("blockItemDamage", m.blockItemDamage);
     put("blockNudgeAz", m.blockNudgeAz);
     put("blockNudgeEl", m.blockNudgeEl);
+    putI("controlMode", m.controlMode);
+    put("pickMinSpeed", m.pickMinSpeed);
+    put("torsoShare", m.torsoShare);
+    put("torsoPitch", m.torsoPitch);
+    put("headClearM", m.headClearM);
   }
   if (group("combatfx", lo, hi)) {
     const Tuning::CombatFx& f = t.combatfx;

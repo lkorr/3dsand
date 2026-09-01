@@ -376,6 +376,19 @@ void AnimSampleAndBlend(const AnimSkeleton& sk, AnimState& st, float dt);
 // Stage 4. One linear parent-before-child pass; requires sk.ParentsFirst().
 void AnimFlatten(const AnimSkeleton& sk, AnimState& st);
 
+// THE TORSO SERVES THE SWING (stage 3.5 — writes st.local, so it must run
+// BEFORE AnimFlatten). Twists the spine `yawRight` radians toward the rig's
+// own RIGHT and raises the chest by `pitchUp`, split across the parts tagged
+// "spine" excluding `rootLimb` — the head-look's distribution law exactly,
+// and for the head-look's reason (rotating the root yaws the whole rig, legs
+// and all; see avatar.cpp's mina note). Both drivers call it with the
+// WeaponPose's torso fields, which the melee driver has already scaled by the
+// pose weight, so 0/0 — every fabricated gate pose — is a no-op. The
+// weapon-arm solve downstream picks the moved shoulder up for free because it
+// solves against the LIVE chain-root joint.
+void AnimApplySpineTwist(const AnimSkeleton& sk, AnimState& st, float yawRight,
+                         float pitchUp, int rootLimb);
+
 // Stage 5. Two-bone analytic IK in MODEL space, run as a POST-PROCESS on the
 // flattened pose — never as a blended layer, because blending IK results
 // destroys the exact end-effector placement that is the whole point of IK.
