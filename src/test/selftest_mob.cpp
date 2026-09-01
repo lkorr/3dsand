@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <unordered_set>
 #include <string>
 #include <vector>
@@ -56,6 +57,36 @@ bool mobOk = false;
   if (mobs.Defs().empty()) {
     std::printf("mob: FAIL (no mob defs — run scripts/gen_test_mob.py)\n");
   } else {
+    // ---- the shared clip library (assets/anims/*.json) -------------------
+    // Data-driven: every file there must have compiled onto the human rig
+    // under its file stem (mob.cpp "THE SHARED CLIP LIBRARY"), because that
+    // is the name an attack style's `clip` field uses. Zero files is a pass
+    // that says so; a file the human does not have is the pipeline broken
+    // between the tuner's "-> library" button and Mob::PlayClip.
+    {
+      const MobDef* human = nullptr;
+      for (const MobDef& md : mobs.Defs())
+        if (md.name == "human") human = &md;
+      int files = 0, missing = 0;
+      std::string missingNames;
+      std::error_code ec;
+      for (auto& e : std::filesystem::directory_iterator(
+               AssetDir() + "/anims", ec)) {
+        if (!e.is_regular_file() || e.path().extension() != ".json") continue;
+        files++;
+        const std::string stem = e.path().stem().string();
+        if (human == nullptr || human->skel.FindClip(stem) < 0) {
+          missing++;
+          missingNames += (missingNames.empty() ? "" : ", ") + stem;
+        }
+      }
+      const bool libOk = missing == 0;
+      std::printf("mob clip library: %s (%d file(s) in assets/anims, %d not on "
+                  "the human%s%s)\n",
+                  libOk ? "PASS" : "FAIL", files, missing,
+                  missing ? ": " : "", missingNames.c_str());
+      mobOk = mobOk && libOk;
+    }
     // Select the dummy BY NAME and resolve limb indices by name too: mob
     // defs load in filename order, so adding assets/mobs/critter.* would
     // otherwise silently re-point this fixture at a different rig. The
@@ -2096,6 +2127,76 @@ bool mobOk = false;
             "140 deg dragged to %.1f (cone 70))\n",
             faceOk ? "PASS" : "FAIL", runErr3, driftErr, standDeg, farDeg);
         mobOk = mobOk && faceOk;
+
+        // ---- swing aim policy (ResolveSwingYaw / ResolveSwingBasis) ----
+        // The sword's copy of the neck rule. Same shape as the head-look
+        // assertions above: inside the cone the camera is the basis; past it
+        // the offset pins at the cone; across the rear band it releases to
+        // the body's forward from BOTH signs, so the +180/-180 wrap is
+        // seamless. Pure, so it is driven directly. Tuned values: melee.aimYaw
+        // 70, aimReleaseYaw 50 (band begins at 130).
+        {
+          const float kRad = 1.0f / 57.29578f;
+          const float swIn = degOf(ResolveSwingYaw(30.0f * kRad));
+          const float swPin = degOf(ResolveSwingYaw(100.0f * kRad));
+          const float swEdge = degOf(ResolveSwingYaw(125.0f * kRad));
+          const float swNegPin = degOf(ResolveSwingYaw(-100.0f * kRad));
+          const float swBehind = degOf(ResolveSwingYaw(179.0f * kRad));
+          const float swBehindNeg = degOf(ResolveSwingYaw(-179.0f * kRad));
+          // 200 deg unwrapped must read as -160, on the far side of the band.
+          const float swUnwrapped = degOf(ResolveSwingYaw(200.0f * kRad));
+          const bool yawOk = std::fabs(swIn - 30.0f) < 0.05f &&
+                             std::fabs(swPin - 70.0f) < 0.05f &&
+                             std::fabs(swEdge - 70.0f) < 0.05f &&
+                             std::fabs(swNegPin + 70.0f) < 0.05f &&
+                             std::fabs(swBehind) < 1.0f &&
+                             std::fabs(swBehindNeg) < 1.0f &&
+                             swUnwrapped < -20.0f && swUnwrapped > -70.05f;
+
+          // The basis: a pitched camera 100 deg round from the body. The
+          // output must face body+70 in yaw, keep the camera's pitch exactly,
+          // and stay an orthonormal right-handed frame; inside the cone the
+          // inputs come back bit-for-bit.
+          auto headingBasis = [](float h, float pitch, Vec3& r, Vec3& u,
+                                 Vec3& f) {
+            const float cp = std::cos(pitch);
+            f = Vec3{std::sin(h) * cp, std::sin(pitch), std::cos(h) * cp};
+            r = f.cross(Vec3{0, 1, 0}).normalized();
+            u = r.cross(f).normalized();
+          };
+          const float body = 0.4f, pitch = -0.3f;
+          Vec3 cr, cu, cf, r, u, f;
+          headingBasis(body + 100.0f * kRad, pitch, cr, cu, cf);
+          ResolveSwingBasis(body + 100.0f * kRad, body, cr, cu, cf, r, u, f);
+          const float outHeadErr =
+              std::fabs(wrapDeg(degOf(std::atan2(f.x, f.z) - body) - 70.0f));
+          const float pitchErr = std::fabs(f.y - cf.y);
+          // |r x u . f| = 1, not r x u = f: Camera::Right is fwd x up, so the
+          // engine's basis has right x up = -forward, and a rigid rotation
+          // must preserve whichever handedness it was given.
+          const float orthoErr = std::fabs(r.dot(f)) + std::fabs(u.dot(f)) +
+                                 std::fabs(r.dot(u)) +
+                                 std::fabs(std::fabs(r.cross(u).dot(f)) - 1.0f);
+          Vec3 r2, u2, f2;
+          headingBasis(body + 20.0f * kRad, pitch, cr, cu, cf);
+          ResolveSwingBasis(body + 20.0f * kRad, body, cr, cu, cf, r2, u2, f2);
+          const bool identity = r2.x == cr.x && r2.y == cr.y && r2.z == cr.z &&
+                                u2.x == cu.x && u2.y == cu.y && u2.z == cu.z &&
+                                f2.x == cf.x && f2.y == cf.y && f2.z == cf.z;
+          const bool basisOk = outHeadErr < 0.1f && pitchErr < 1e-5f &&
+                               orthoErr < 1e-4f && identity;
+          const bool swingOk = yawOk && basisOk;
+          std::printf(
+              "avatar swing cone: %s (yaw 30 -> %+.1f, 100 -> %+.1f, 125 -> "
+              "%+.1f, -100 -> %+.1f pinned; rear release 179 -> %+.1f, -179 "
+              "-> %+.1f, 200 unwrapped -> %+.1f; basis 100 deg round: faces "
+              "body+70 err %.2f deg, pitch err %.1e, ortho err %.1e, "
+              "in-cone identity %s)\n",
+              swingOk ? "PASS" : "FAIL", swIn, swPin, swEdge, swNegPin,
+              swBehind, swBehindNeg, swUnwrapped, outHeadErr, pitchErr,
+              orthoErr, identity ? "yes" : "NO");
+          mobOk = mobOk && swingOk;
+        }
 
         // Reported separately from `avatar` so a gait-look regression and a
         // footstep-plumbing regression never hide behind one another.

@@ -78,6 +78,51 @@ float ResolveAvatarHeading(CameraMode mode, float camHeading, float heading,
   return out;
 }
 
+float ResolveSwingYaw(float yawRel) {
+  const auto& m = CurrentTuning().melee;
+  const float kDeg = 3.14159265f / 180.0f;
+  while (yawRel > 3.14159265f) yawRel -= 6.2831853f;
+  while (yawRel < -3.14159265f) yawRel += 6.2831853f;
+  const float cone = m.aimYaw * kDeg;
+  // The rear release, verbatim from PlayerAvatar::SetLook: scale the offset to
+  // nothing across the last `aimReleaseYaw` degrees before straight-behind.
+  // Smoothstep so it is flat at both ends — no crease where the band begins,
+  // and a genuine zone (not a single angle) where it is fully released.
+  float release = 1.0f;
+  const float band = m.aimReleaseYaw * kDeg;
+  if (band > 1e-4f) {
+    const float t =
+        std::clamp((3.14159265f - std::fabs(yawRel)) / band, 0.0f, 1.0f);
+    release = t * t * (3.0f - 2.0f * t);
+  }
+  return std::clamp(yawRel, -cone, cone) * release;
+}
+
+void ResolveSwingBasis(float camHeading, float bodyHeading, Vec3 camRight,
+                       Vec3 camUp, Vec3 camFwd, Vec3& right, Vec3& up,
+                       Vec3& fwd) {
+  float rel = camHeading - bodyHeading;
+  while (rel > 3.14159265f) rel -= 6.2831853f;
+  while (rel < -3.14159265f) rel += 6.2831853f;
+  const float delta = ResolveSwingYaw(rel) - rel;
+  if (std::fabs(delta) < 1e-6f) {
+    right = camRight;
+    up = camUp;
+    fwd = camFwd;
+    return;
+  }
+  // Rotate about +Y by `delta` in the HEADING sense (forward is
+  // (sin h, ., cos h), so a positive delta turns (sin h, cos h) into
+  // (sin(h+d), cos(h+d))): x' = x cos d + z sin d, z' = -x sin d + z cos d.
+  const float c = std::cos(delta), s = std::sin(delta);
+  auto rot = [c, s](Vec3 v) {
+    return Vec3{v.x * c + v.z * s, v.y, -v.x * s + v.z * c};
+  };
+  right = rot(camRight);
+  up = rot(camUp);
+  fwd = rot(camFwd);
+}
+
 void ThirdPersonRig::Zoom(float notches) {
   const auto& t = CurrentTuning().thirdPerson;
   if (t.zoomStep <= 0.0f) return;

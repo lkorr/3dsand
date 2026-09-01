@@ -53,6 +53,40 @@ const char* CameraModeName(CameraMode m);
 float ResolveAvatarHeading(CameraMode mode, float camHeading, float heading,
                            Vec3 planarVel, float dt);
 
+// ---- swing aim policy ------------------------------------------------------
+// The sword's version of the neck rule above. The melee driver (game/melee.h)
+// is fed a BASIS to express the stroke in, and for the player that was the raw
+// camera — so with the body facing its travel direction in third person, a
+// camera swung round behind the character made every strike cut backwards at
+// the lens, or sideways at nothing. The body cannot turn to follow (that would
+// make every glance a turn again), so the SWING is bound to the body instead:
+//
+//   - inside `melee.aimYaw` degrees of the body's facing the camera IS the
+//     basis, unchanged — a strike goes where you look;
+//   - past the cone the basis is pinned at the cone's edge (the yaw excess is
+//     removed, pitch kept), so aiming further round your own shoulder does not
+//     put the blade behind you;
+//   - across the last `melee.aimReleaseYaw` degrees before straight-behind the
+//     offset smoothsteps to zero, so looking at the character's face swings
+//     the way the character faces — as if you were looking forward again. The
+//     smoothstep is what makes the +180/-180 wrap a non-event (both signs
+//     reach zero there), exactly as PlayerAvatar::SetLook argues.
+//
+// `yawRel` is camera heading minus body heading, radians, any range (wrapped
+// here). Returns the yaw offset the swing basis should actually have, radians
+// in [-cone, cone]. Pure; a few hundred calls cost nothing, so it is gated.
+float ResolveSwingYaw(float yawRel);
+
+// Rotates the camera basis about world +Y so its heading becomes
+// `bodyHeading + ResolveSwingYaw(camHeading - bodyHeading)`. Right/up/forward
+// are carried together as one rigid frame, so the stroke's own geometry (a
+// diagonal cut, an overhead) is untouched — only the direction the whole thing
+// faces moves, and only in yaw. With the offset inside the cone this returns
+// the inputs bit-for-bit.
+void ResolveSwingBasis(float camHeading, float bodyHeading, Vec3 camRight,
+                       Vec3 camUp, Vec3 camFwd, Vec3& right, Vec3& up,
+                       Vec3& fwd);
+
 class ThirdPersonRig {
  public:
   // Advances the rig one frame. `focusWorld` is the point the boom orbits —

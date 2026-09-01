@@ -182,8 +182,9 @@ export function defaultMeleeTuning() {
 /**
  * melee.cpp:760 ApplyMeleeTuning — tuning.json's `melee` block -> MeleeTuning.
  *
- * `controlMode`/`pickMinSpeed` are DELIBERATELY not copied, exactly as in the
- * engine: they are the controller's switch, read at the one site in main.cpp,
+ * `controlMode`/`pickMinSpeed`/`aimYaw`/`aimReleaseYaw` are DELIBERATELY not
+ * copied, exactly as in the engine: they are the controller's switches and the
+ * swing-basis cone, read at the one site in main.cpp,
  * and a cached copy here could disagree across an F5. The Attacks panel reads
  * them straight off the tuning document instead.
  */
@@ -1079,6 +1080,9 @@ export function parseStyleLibrary(json) {
         el: Number.isFinite(+jt.el) ? +jt.el : 0,
         tempo: Number.isFinite(+jt.tempo) ? +jt.tempo : 0,
       },
+      // strokes.h AttackStyle::clip — the body animation played WITH the
+      // stroke, by library name (assets/anims/<name>.json). '' = none.
+      clip: typeof s.clip === 'string' ? s.clip : '',
       raw: s,                      // the object the editor mutates in place
     });
   }

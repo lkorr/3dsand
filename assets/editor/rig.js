@@ -3197,6 +3197,19 @@ const kStrokeTrailMax = 90;
 // which is the same reason MeleeSweepDamage measures them off the rig.
 let strokeTipSpeed = 0, strokeEdgeAlign = 1;
 let strokeTipPrev = null;
+// WHAT THE PROGRAM ASKED FOR VERSUS WHAT THE ARM DID — the numbers that turn
+// "the elevation wanders" into a cause. `strokeStart` is the pose the driver
+// SEEDED from (the arm as it hung when the swing began: a stroke starts from
+// wherever the blade IS, melee.cpp's take-over), `strokeCommit` the residual
+// between the windup's target and the pose actually reached when the aim was
+// frozen. A windup shorter than the raise it has to make shows up here as a
+// residual the cut then spends its own ticks closing.
+let strokeStart = null;       // {az, el, radius} after the first driven tick
+let strokeCommit = null;      // {dAz, dEl, dR} at the windup -> cut edge
+// SOLO: hold the pose at the end of the chosen segment for a beat instead of
+// running on, and burst through the segments before it. See weaponTick.
+let strokeHoldTicks = 0;
+const kSoloHoldTicks = 24;    // 0.8 s of holding the segment's end pose
 // The rig parts the driver needs. -1 until weaponRebuild() finds them.
 let wpHandPart = -1, wpChain = -1, wpHeadPart = -1;
 
@@ -3445,10 +3458,38 @@ function weaponTick() {
   const sty = (lib && strokeStyle >= 0) ? lib.styles[strokeStyle] : null;
   if (!sty) dbgNoStyle++;
   if (!strokeLive()) { melee.update(kStrokeDt, false, !!sty, right, up, fwd); return; }
+  // SOLO HOLD: the segment under study has ended; keep the pose it ended in
+  // on screen (no step, so the driver's pose is unchanged) for a beat, then
+  // run the program again from the start.
+  if (strokeHoldTicks > 0) {
+    if (--strokeHoldTicks === 0) {
+      if (ATK.looping()) { ATK.nextSwing(); beginStroke(strokeStyle); }
+      else stopStroke();
+    }
+    return;
+  }
   const aim = ATK.currentAim();
+  const P = MELEE.STROKE_PHASE;
+  const phaseBefore = strokeCur.phase;
   const r = MELEE.stepStrokeProgram(strokeCur, sty, melee, aim.az, aim.el,
                                     kStrokeDt, right, up, fwd);
   strokeTick++;
+  if (strokeTick === 1)
+    strokeStart = { az: melee.strokeAz(), el: melee.strokeEl(), radius: melee.strokeRadius() };
+  if (phaseBefore === P.Windup && strokeCur.phase === P.Cut)
+    strokeCommit = { dAz: strokeCur.wantAz - melee.strokeAz(),
+                     dEl: strokeCur.wantEl - melee.strokeEl(),
+                     dR: strokeCur.wantReach - melee.strokeRadius() };
+  const solo = ATK.soloSegment?.() || 'all';
+  if (solo !== 'all') {
+    const want = solo === 'windup' ? P.Windup : solo === 'cut' ? P.Cut : P.Recover;
+    if (r === MELEE.STEP.Finished || strokeCur.phase > want) {
+      // Past the segment: freeze here. The cursor is left where it is so the
+      // readout still names the phase that just ended.
+      strokeHoldTicks = kSoloHoldTicks;
+      return;
+    }
+  }
   if (r === MELEE.STEP.Finished) {
     if (ATK.looping()) { ATK.nextSwing(); beginStroke(strokeStyle); }
     else stopStroke();
@@ -3485,10 +3526,28 @@ function beginStroke(styleIndex) {
   MELEE.beginStrokeProgram(strokeCur, sty, styleIndex,
                            Math.imul(ATK.swingNumber() + 1, 2654435761) >>> 0);
   strokeAccum = 0;
+  strokeStart = null;
+  strokeCommit = null;
+  strokeHoldTicks = 0;
+  // SOLO cut / recover: BURST through the segments before the one under
+  // study, so the preview opens on that segment's first tick. The burst runs
+  // the same ticks the engine would — seed from the rig, step the program —
+  // it just does not wait a frame between them, so the rig pose the seed
+  // reads is one frame stale for the burst's duration, which is the engine's
+  // own one-tick latency and not a different swing.
+  const solo = ATK.soloSegment?.() || 'all';
+  if (solo === 'cut' || solo === 'recover') {
+    const P = MELEE.STROKE_PHASE;
+    const want = solo === 'cut' ? P.Cut : P.Recover;
+    for (let guard = 0; guard < 400 && strokeLive() && strokeCur.phase < want &&
+                        strokeHoldTicks === 0; guard++)
+      weaponTick();
+  }
 }
 
 function stopStroke() {
   strokeCur = MELEE.newStrokeCursor();
+  strokeHoldTicks = 0;
   if (melee) melee.reset();
   strokeTrail.length = 0;
   strokeTipPrev = null;
@@ -3611,6 +3670,7 @@ function bindAttacks() {
       phase: MELEE.STROKE_PHASE_NAME[strokeCur?.phase ?? 0],
       phaseTick: strokeCur?.phaseTick ?? 0,
       tick: strokeTick,
+      holding: strokeHoldTicks > 0,
       meleePhase: melee ? melee.phaseName() : 'idle',
       az: melee?.strokeAz() ?? 0,
       el: melee?.strokeEl() ?? 0,
@@ -3618,6 +3678,23 @@ function bindAttacks() {
       weight: melee?.poseWeight() ?? 0,
       tipSpeed: strokeTipSpeed,
       edgeAlign: strokeEdgeAlign,
+      // the program's own numbers (strokes.cpp StepStrokeProgram): where the
+      // windup is steering to, and the aim it froze
+      wantAz: strokeCur?.wantAz ?? 0,
+      wantEl: strokeCur?.wantEl ?? 0,
+      wantReach: strokeCur?.wantReach ?? 0,
+      aimAz: strokeCur?.aimAz ?? 0,
+      aimEl: strokeCur?.aimEl ?? 0,
+      aimed: !!strokeCur?.aimed,
+      windupTicks: strokeCur?.windupTicks ?? 0,
+      cutTicks: strokeCur?.cutTicks ?? 0,
+      start: strokeStart,
+      commit: strokeCommit,
+      // the closed-loop steering cap, radians per tick: 16 units x the aim
+      // gain (strokes.cpp steerTo). A raise bigger than cap x windupTicks
+      // cannot finish inside the windup.
+      capAz: 16 * (melee?.tuning?.aimGainX ?? 0),
+      capEl: 16 * (melee?.tuning?.aimGainY ?? 0),
     }),
     armInfo: () => {
       if (!skel) return { chain: -1 };
@@ -4083,6 +4160,105 @@ function keyTimes(track) {
   return [...t].sort((a, b) => a - b);
 }
 
+/* ---- the clip library: assets/anims/<name>.json ---------------------------
+ * Same /api/model route the sidecars use ("anims" is a MODEL_DIRS entry in
+ * tuner_server.py). One clip per file, the clip-lane schema plus `name` and
+ * `sidecarVoxelsPerMetre` — the same world-length stamp a sidecar carries,
+ * because pos keys are world voxels and mob.cpp scales them by it. */
+let libraryClips = null;          // [{name, path}] or null until fetched
+let libraryFetching = false;
+
+async function refreshLibraryClips() {
+  if (libraryFetching) return;
+  libraryFetching = true;
+  try {
+    const r = await fetch('/api/models', { cache: 'no-store' });
+    const j = await r.json();
+    libraryClips = (j.files || []).filter(f => f.dir === 'anims' && /\.json$/i.test(f.name))
+      .map(f => ({ name: f.name.replace(/\.json$/i, ''), path: f.path }));
+  } catch {
+    libraryClips = [];
+  } finally {
+    libraryFetching = false;
+  }
+}
+
+/** The clip's file form: what the engine's LoadClipLibrary reads. */
+function libraryClipDoc(name, clip) {
+  const s = sc();
+  const vpm = Number.isFinite(+s.sidecarVoxelsPerMetre) ? +s.sidecarVoxelsPerMetre : 10;
+  return Object.assign({ name, sidecarVoxelsPerMetre: vpm }, clip);
+}
+
+async function saveClipToLibrary(name) {
+  const C = clips();
+  const c = C[name];
+  if (!c) return;
+  const file = prompt('library clip name (assets/anims/<name>.json)', name);
+  if (!file) return;
+  if (!/^[A-Za-z0-9_\-]+$/.test(file))
+    return toast('clip file names are letters, digits, _ and - only', true);
+  if (!libraryClips) await refreshLibraryClips();
+  if ((libraryClips || []).some(l => l.name === file) &&
+      !confirm(`assets/anims/${file}.json exists — overwrite it?`)) return;
+  try {
+    const body = JSON.stringify(libraryClipDoc(file, c), null, 2) + '\n';
+    const r = await fetch('/api/model?path=' + encodeURIComponent('anims/' + file + '.json'), {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body,
+    });
+    const j = await r.json().catch(() => ({ ok: false }));
+    if (!j.ok) throw new Error(j.error || ('HTTP ' + r.status));
+    await refreshLibraryClips();
+    toast(`saved anims/${file}.json — name it in an attack style\'s clip field; ` +
+          'press R in the game to hot-reload');
+    renderClipLane();
+  } catch (e) {
+    toast('library save failed: ' + (e.message || e), true);
+  }
+}
+
+async function importClipFromLibrary(name) {
+  const C = clips();
+  if (C[name] && !confirm(`this rig already has a clip "${name}" — replace it ` +
+                          'with the library copy?')) return;
+  try {
+    const r = await fetch('/api/model?path=' + encodeURIComponent('anims/' + name + '.json'),
+                          { cache: 'no-store' });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const doc = await r.json();
+    const clip = Object.assign({}, doc);
+    delete clip.name; delete clip.sidecarVoxelsPerMetre;
+    if (!clip.tracks || typeof clip.tracks !== 'object') clip.tracks = {};
+    C[name] = clip;
+    touched();
+    activeClip = name; clipCursorMs = 0; selectedKey = null;
+    reseedPose();
+    toast(`imported anims/${name}.json into this rig\'s clips (save the model to keep it)`);
+    renderAllPanels();
+  } catch (e) {
+    toast('library import failed: ' + (e.message || e), true);
+  }
+}
+
+/** A <select> of the library, or nothing while it is still unknown. */
+function libraryClipPicker() {
+  if (!libraryClips) { refreshLibraryClips().then(() => renderClipLane()); return null; }
+  const sel = el('select', {
+    class: 'small',
+    title: 'bring a clip in from the shared library (assets/anims/) — it is ' +
+      'copied into this rig\'s sidecar so you can edit it here, then → library ' +
+      'writes it back',
+  });
+  sel.append(el('option', { value: '' },
+    libraryClips.length ? '← library…' : '← library (empty)'));
+  for (const l of libraryClips) sel.append(el('option', { value: l.name }, l.name));
+  sel.addEventListener('change', () => {
+    const n = sel.value; sel.value = '';
+    if (n) importClipFromLibrary(n);
+  });
+  return sel;
+}
+
 function renderClipLane() {
   if (!clipWrap) return;
   clipWrap.innerHTML = '';
@@ -4147,6 +4323,22 @@ function renderClipLane() {
         activeClip = n; touched(); renderAllPanels();
       },
     }, 'rename') : null,
+    // ---- THE CLIP LIBRARY (assets/anims/<name>.json) ----------------------
+    // A clip lives in ONE sidecar until it is put here. The library is what an
+    // attack style names (attack_styles.json `clip`, strokes.h
+    // AttackStyle::clip): LoadMobDefs compiles every library clip onto every
+    // rig whose part names it fits, so a swing animation authored once on the
+    // human plays on every human-shaped creature. Saving the MODEL still saves
+    // the sidecar's own copy; this is the extra file.
+    activeClip ? el('button', {
+      class: 'small primary',
+      title: 'save this clip to the shared library as assets/anims/<name>.json ' +
+        '— the file an attack style can name in its `clip` field. The rig\'s ' +
+        'own copy stays in the sidecar; a sidecar clip of the same name wins ' +
+        'over the library on that rig.',
+      onclick: () => saveClipToLibrary(activeClip),
+    }, '→ library') : null,
+    libraryClipPicker(),
     el('span', { class: 'spacer' }),
     activeClip ? el('button', {
       class: 'small' + (autoKey ? ' on' : ''),

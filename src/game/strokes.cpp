@@ -68,6 +68,9 @@ bool LoadAttackStyles(const std::string& path, StyleLibrary& out,
       // error rather than a character choice.
       st.jitter.tempo = std::clamp(q.value("tempo", 0.0f), 0.0f, 0.6f);
     }
+    // The optional body animation (strokes.h AttackStyle::clip). Whether a
+    // rig HAS it is a mob-load question, answered there with a loader line.
+    st.clip = s.value("clip", std::string());
     // A CUT THAT GOES NOWHERE IS NOT A CUT. It would pose the blade, commit
     // nothing, and hand back a stroke that could never damage anything — and
     // the only symptom would be an NPC that swings and never hits, which is

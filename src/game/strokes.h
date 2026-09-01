@@ -100,6 +100,16 @@ struct AttackStyle {
   StrokeSegment cut;
   int recoverTicks = 10;
   StrokeJitter jitter;
+  // AN AUTHORED BODY ANIMATION TO PLAY WITH THE STROKE, by name (empty = none).
+  // The stroke program drives the WEAPON ARM through the melee driver; this is
+  // everything else — the step, the shoulder drop, the off hand — keyframed in
+  // the tuner's clip lane and saved to assets/anims/<name>.json, from where
+  // LoadMobDefs compiles it onto every rig whose part names it fits (mob.cpp,
+  // "THE SHARED CLIP LIBRARY"). Started by Mob::PlayClip at BeginStroke, so it
+  // runs on the ordinary clip layer (mask, blend, mode) and the driver's arm
+  // claim still wins on the arm. A name no rig knows is a loud loader line,
+  // not a crash: PlayClip no-ops on a miss.
+  std::string clip;
 };
 
 // THE PLAYER'S FLICK COMPASS (the `player` block of attack_styles.json): a

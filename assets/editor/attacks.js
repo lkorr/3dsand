@@ -79,6 +79,16 @@ let swingNo = 0;
 let trailOn = true;
 let flick = { x: 1, y: 0 }; // the compass pad's test flick
 const folds = { limbs: false, compass: false, help: false };
+// SOLO: which segment the preview isolates — 'all' runs the program as the
+// game does; 'windup' / 'cut' / 'recover' burst through the segments before
+// the chosen one, play it at speed, then HOLD its end pose for a beat before
+// looping. It exists because a stroke is three motions that each depend on
+// where the previous one left the arm, and watching all three at once is how
+// "windup az" gets blamed for what the seeded start pose did.
+let solo = 'all';
+// The shared clip library (assets/anims/*.json), for the program card's clip
+// picker. null until fetched; [] when the server has none.
+let libClips = null;
 
 const num = (v, d = 0) => (Number.isFinite(+v) ? +v : d);
 const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
@@ -103,7 +113,17 @@ export const looping = () => loop;
 export const trailEnabled = () => trailOn;
 export const swingNumber = () => swingNo;
 export const isDirty = () => dirty;
+export const soloSegment = () => solo;
 export function nextSwing() { swingNo = (swingNo + 1) >>> 0; }
+
+async function refreshLibClips() {
+  try {
+    const r = await fetch('/api/models', { cache: 'no-store' });
+    const j = await r.json();
+    libClips = (j.files || []).filter(f => f.dir === 'anims' && /\.json$/i.test(f.name))
+      .map(f => f.name.replace(/\.json$/i, ''));
+  } catch { libClips = []; }
+}
 /** Select a style by index — for the test seam, so it can drive a real box. */
 export function selectStyle(i) {
   if (!lib || i < 0 || i >= lib.styles.length || i === selected) return;
@@ -127,6 +147,7 @@ export async function load(force) {
     lib = MELEE.parseStyleLibrary(raw);
     err = '';
     dirty = false;
+    await refreshLibClips();
     if (selected < 0 && lib.styles.length) selected = 0;
   } catch (e) {
     // file:// degradation, exactly as the item list and the audio tab do it.
@@ -522,6 +543,43 @@ function programCard(sty) {
   seg.append(el('div', {}));
   card.append(seg);
 
+  // ---- THE BODY ANIMATION (strokes.h AttackStyle::clip) -----------------
+  // The program above drives the WEAPON ARM. Everything else the swing does
+  // with the body — the step, the shoulder, the off hand — is a CLIP,
+  // keyframed in the clip lane, saved to the library with "→ library", and
+  // named here. The engine starts it with the stroke (Mob::PlayClip at
+  // BeginStroke, both drivers) and the arm claim still wins on the arm.
+  {
+    const row = el('div', { class: 'atkrow' });
+    const sel = el('select', { class: 'small',
+      title: 'a clip from assets/anims/ (the "→ library" button in the clip ' +
+        'lane puts one there) played on the body WITH this stroke. The stroke ' +
+        'keeps the weapon arm; the clip is the rest of the body. Empty = none. ' +
+        'A rig without the clip\'s parts simply does not play it.' });
+    const cur = typeof r.clip === 'string' ? r.clip : '';
+    sel.append(el('option', { value: '' }, '(no body clip)'));
+    const names = new Set(libClips || []);
+    const rigClips = Object.keys(host?.sidecar?.()?.clips || {});
+    for (const n of names) sel.append(el('option', { value: n }, n));
+    for (const n of rigClips)
+      if (!names.has(n)) sel.append(el('option', { value: n }, n + ' (this rig only)'));
+    if (cur && !names.has(cur) && !rigClips.includes(cur))
+      sel.append(el('option', { value: cur }, cur + ' (not found)'));
+    sel.value = cur;
+    sel.addEventListener('change', () => {
+      const v = sel.value;
+      if (v === cur) return;
+      editStyles('clip', () => { if (v) r.clip = v; else delete r.clip; });
+    });
+    row.append(el('label', { title: 'body animation played with the stroke' }, 'clip'), sel,
+      el('button', { class: 'small', title: 're-read assets/anims/',
+        onclick: async () => { await refreshLibClips(); render(); } }, '↻'));
+    if (libClips && !libClips.length && !rigClips.length)
+      row.append(el('span', { class: 'hint' },
+        'none yet — key one in the clip lane, then "→ library"'));
+    card.append(row);
+  }
+
   card.append(derivedLine(sty));
   return card;
 }
@@ -599,6 +657,30 @@ function previewCard(sty) {
     }, `jitter draw #${swingNo} — the next deterministic draw, the same ` +
        'sequence the game walks'));
   card.append(t1);
+
+  // ---- SOLO: one segment at a time --------------------------------------
+  const t3 = el('div', { class: 'atkrow' });
+  t3.append(el('label', { title: 'isolate one segment of the program' }, 'solo'));
+  const soloTips = {
+    all: 'the whole program, as the game runs it',
+    windup: 'ONLY the windup: from wherever the arm hangs, steer to the windup ' +
+      'pose (aim − ½cut + windup) and HOLD there. This is the pose the cut ' +
+      'starts from — if the readout\'s "commit" residual is not ~0, the ' +
+      'windup ran out of ticks before it got there.',
+    cut: 'ONLY the cut: the windup is run through instantly, then the travel ' +
+      'from the pose it reached, through the aim, to ½cut past it, then HOLD ' +
+      'at the end.',
+    recover: 'ONLY the recover: windup and cut run through instantly, then the ' +
+      'hand-back — no input, the driver\'s follow-through unwinds and the arm ' +
+      'claim fades over melee.recoverTime.',
+  };
+  for (const k of ['all', 'windup', 'cut', 'recover'])
+    t3.append(chip(k, solo === k, () => {
+      solo = k;
+      if (host?.state?.().live) host?.begin?.(selected);
+      render();
+    }, soloTips[k]));
+  card.append(t3);
 
   // ---- THE SWORD BUTTON. A blade is not decoration here: the driver MEASURES
   // hand-to-point and solves the whole reach band against it, so an empty hand
@@ -702,11 +784,27 @@ function readout() {
     return s;
   };
   box.append(
-    line('phase', st.phase || 'idle', 'the STROKE PROGRAM\'s phase'),
+    line('phase', phaseText(st), 'the STROKE PROGRAM\'s phase'),
     line('driver', st.meleePhase || 'idle',
       'MeleeState: guard / wind / slash / recover. A windup deliberately stays ' +
       'in GUARD — that is what "under commitSpeed" means.'),
     line('az/el', `${fmt(st.az)} / ${fmt(st.el)}`, 'the live stroke, radians'),
+    line('start', startText(st),
+      'WHERE THE SWING BEGAN: the driver seeds its stroke from wherever the ' +
+      'blade IS (melee.cpp take-over), so an arm hanging at the side starts ' +
+      'a swing at el ≈ −1.3 whatever the style says. The windup has to climb ' +
+      'from here.'),
+    line('target', targetText(st),
+      'what the windup is steering TO: aim − ½cut + windup (az / el, radians) ' +
+      'and the band position; then, once committed, the frozen aim'),
+    line('commit', commitText(st),
+      'target minus reached, at the instant the aim froze. Not ~0 means the ' +
+      'windup ran out of ticks — see "fit" — and the cut spends its own ticks ' +
+      'closing the gap, which reads as the blade wandering in elevation.'),
+    line('fit', fitText(st),
+      'the closed loop is capped at 16 units/tick × the aim gain (strokes.cpp ' +
+      'steerTo), so a raise of Δel needs Δel ÷ cap ticks. More than the windup ' +
+      'has = the pose is not reached before the cut.'),
     line('radius', fmt(st.radius), 'commanded tip radius, voxels'),
     line('tip', fmt(st.tipSpeed, 1) + ' v/s',
       'SPEED IS THE DAMAGE. Below melee.minSpeedMps the sweep does nothing.'),
@@ -719,6 +817,29 @@ function readout() {
     line('band', `${fmt(a.bandLo)}–${fmt(a.bandHi)}`,
       'the annulus of tip radii this arm can serve with that blade'));
   return box;
+}
+
+// The readout's derived strings, shared by the first render and tickUI.
+const phaseText = st => (st.phase || 'idle') + (st.holding ? ' (held)' : '');
+const startText = st => st.start
+  ? `${fmt(st.start.az)} / ${fmt(st.start.el)}` : '—';
+function targetText(st) {
+  if (!st.live) return '—';
+  if (st.phase === 'windup')
+    return `${fmt(st.wantAz)} / ${fmt(st.wantEl)} @ ${fmt(st.wantReach, 1)}v`;
+  if (st.aimed) return `aim ${fmt(st.aimAz)} / ${fmt(st.aimEl)}`;
+  return '—';
+}
+const commitText = st => st.commit
+  ? `${fmt(st.commit.dAz)} / ${fmt(st.commit.dEl)} / ${fmt(st.commit.dR, 1)}v`
+  : '—';
+function fitText(st) {
+  if (!st.start || !st.capEl) return '—';
+  const dEl = Math.abs(st.wantEl - st.start.el);
+  const dAz = Math.abs(st.wantAz - st.start.az);
+  const need = Math.ceil(Math.max(dEl / st.capEl, dAz / (st.capAz || 1)));
+  const have = st.windupTicks || 0;
+  return `${need} of ${have} ticks` + (need > have ? ' ⚠ short' : '');
 }
 
 /**
@@ -737,9 +858,13 @@ export function tickUI() {
       const s = box.querySelector(`[data-k="${k}"] b`);
       if (s) s.textContent = v;
     };
-    set('phase', st.phase || 'idle');
+    set('phase', phaseText(st));
     set('driver', st.meleePhase || 'idle');
     set('az/el', `${fmt(st.az)} / ${fmt(st.el)}`);
+    set('start', startText(st));
+    set('target', targetText(st));
+    set('commit', commitText(st));
+    set('fit', fitText(st));
     set('radius', fmt(st.radius));
     set('tip', fmt(st.tipSpeed, 1) + ' v/s');
     set('edge', fmt(st.edgeAlign));
@@ -1081,6 +1206,28 @@ function helpBody() {
   const d = el('div', { class: 'atkhelp' });
   const p = (...k) => d.append(el('p', {}, ...k));
   const b = t => el('b', {}, t);
+  p(b('AZ AND EL ARE BEARINGS ABOUT THE SHOULDER, in the body\'s facing frame. '),
+    'Azimuth 0 is straight ahead of the wielder, positive to their right; ' +
+    'elevation 0 is level with the shoulder, positive up. They are not ' +
+    'screen angles and not joint angles: they say where the POINT of the ' +
+    'blade is, and the arm is solved to put it there. The AIM is the ' +
+    'target\'s bearing in the same frame — the sliders here; in the game it ' +
+    'is the camera line for the player and the target\'s position for an ' +
+    'NPC — and every windup value is an OFFSET from it.');
+  p(b('A SWING STARTS FROM WHEREVER THE ARM IS. '),
+    'The driver seeds its stroke from the blade\'s live position, so with ' +
+    'the arm hanging the stroke opens at el ≈ −1.3 rad however the style ' +
+    'is authored, and the WINDUP is what climbs out of that. The climb is a ' +
+    'closed loop capped at 16 units × the aim gain per tick (≈ 0.1 rad/tick ' +
+    'on the shipped gains): the "fit" line says how many ticks the climb ' +
+    'needs against how many the windup has. Short, and the cut inherits ' +
+    'the leftover — which is the blade "moving around in elevation" with ' +
+    'every el authored 0. Give the windup the ticks, or set solo ▸ windup ' +
+    'and watch where it actually gets to.');
+  p(b('SOLO shows one segment. '),
+    'windup: from the seeded start to the windup pose, then hold. cut: the ' +
+    'windup is run through instantly, then the travel, then hold. recover: ' +
+    'both run through, then the hand-back. Hold is 0.8 s, then it loops.');
   p(b('THE CUT IS CENTRED ON THE AIM. '),
     'The windup lands at aim minus half the cut\'s own travel, so the blade ' +
     'passes THROUGH where it was aimed rather than starting there — a stroke ' +

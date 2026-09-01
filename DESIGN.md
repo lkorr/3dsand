@@ -2799,6 +2799,35 @@ target every time.
 `rng::Hash3(mobId ^ salt, tick, index)`, so ten swings differ and the fight
 replays.
 
+**A style can name a BODY CLIP, and clips have a shared library** (2026-09-01;
+`AttackStyle::clip`, `assets/anims/`). The stroke program drives the weapon
+arm; everything else the swing does with the body — the step, the shoulder
+drop, the off hand — is an ordinary keyframed clip, started by `Mob::PlayClip`
+at `BeginStroke` on both drivers (NPC `MobSystem::BeginStroke`, player
+`main.cpp`), so it rides the clip layer's own mask/blend/mode and the arm claim
+still wins on the arm. Clips used to exist only inside one creature's sidecar;
+`assets/anims/<name>.json` is one clip per file in the clip-lane schema plus
+`name` and `sidecarVoxelsPerMetre`, and `LoadMobDefs` compiles every file onto
+every rig whose part names it fits (a sidecar clip of the same name wins on
+that rig; a file with no usable track is skipped silently, because a critter
+has no `armU.R`). The tuner's clip lane writes the library ("→ library") and
+reads it back ("← library" copies a file into the open sidecar for editing);
+the Attacks lane's `clip` picker lists it. The `mob` gate asserts every library
+file compiled onto the human under its stem — that is the name a style uses.
+
+**The player's swing is bound to the body like the head is** (2026-09-01;
+`melee.aimYaw` / `aimReleaseYaw`, `ResolveSwingBasis` in `game/thirdperson.*`).
+The stroke basis handed to the driver was the raw camera, so in third person —
+where the body faces its travel direction — a camera orbited behind the
+character made every strike cut backwards at the lens. Now the camera basis is
+yawed back toward the body by the neck's own law: the camera may lead the body
+by `aimYaw` degrees, past that the swing pins at the cone's edge, and across
+the last `aimReleaseYaw` degrees before straight-behind the offset smoothsteps
+to zero so a front-on camera swings the way the character faces. Pitch is never
+touched, and the whole right/up/forward frame rotates rigidly so a diagonal is
+still a diagonal. First person never reaches the cone (`ResolveAvatarHeading`
+drags the body first). Gated in `mob` ("avatar swing cone").
+
 **Blocking is EMERGENT: a blade physically in the path stops the blow.** No
 block button, no block state, no defensive intent — an NPC's blade stops a cut
 when a windup stance happens to put it in the way, and the player's blade does

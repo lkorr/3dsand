@@ -148,7 +148,8 @@ def readable():
 # `prefabs` is here so the Trees tab can export a .vox of a generated tree for
 # hand-placement with the in-game prefab tool. Read-write like the rest -- the
 # containment check in _model_path() is what keeps that safe.
-MODEL_DIRS = ("models", "mobs", "microvox", "items", "limbs", "trees", "prefabs")
+MODEL_DIRS = ("models", "mobs", "microvox", "items", "limbs", "trees", "prefabs",
+              "anims")
 MODEL_EXTS = (".vox", ".json", ".svtree")
 # The one MODEL_DIRS entry with a delete route (/api/limb/delete). Named here
 # so that route cannot be pointed at another directory by editing one string.

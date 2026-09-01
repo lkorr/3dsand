@@ -857,6 +857,14 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadF(*g, "blockNudgeEl", e.blockNudgeEl, out, at);
     ReadI(*g, "controlMode", e.controlMode, out, at);
     ReadF(*g, "pickMinSpeed", e.pickMinSpeed, out, at);
+    ReadF(*g, "aimYaw", e.aimYaw, out, at);
+    // 180 is meaningful: the swing follows the camera wherever it looks (the
+    // pre-cone behaviour). 0 pins every swing to the body's facing.
+    e.aimYaw = std::clamp(e.aimYaw, 0.0f, 180.0f);
+    ReadF(*g, "aimReleaseYaw", e.aimReleaseYaw, out, at);
+    // Same ceiling law as avatar.headLookReleaseYaw: a band wider than the
+    // reach past the cone would fade a swing that never reached its stop.
+    e.aimReleaseYaw = std::clamp(e.aimReleaseYaw, 0.0f, 180.0f - e.aimYaw);
     ReadF(*g, "torsoShare", e.torsoShare, out, at);
     ReadF(*g, "torsoPitch", e.torsoPitch, out, at);
     ReadF(*g, "headClearM", e.headClearM, out, at);

@@ -5132,6 +5132,18 @@ int main(int argc, char** argv) {
         // submits the kinematic limb targets — a weapon pose pushed in after
         // it would be a frame late and the blade would trail the mouse.
         {
+          // THE BASIS THE STROKE IS EXPRESSED IN is the camera's, yawed back
+          // toward the body by the neck's own law (melee.aimYaw /
+          // aimReleaseYaw; game/thirdperson.h ResolveSwingBasis). Without
+          // this, a third-person camera orbited behind the character made
+          // every strike cut backwards at the lens. Resolved once per tick
+          // off the heading the policy above just produced, so the swing and
+          // the head agree about where "behind" is. No body (fly mode): the
+          // raw camera, as before.
+          Vec3 swRight = cam.Right(), swUp = cam.Up(), swFwd = cam.Forward();
+          if (avatar.Spawned())
+            ResolveSwingBasis(camHeading, avatarHeading, cam.Right(), cam.Up(),
+                              cam.Forward(), swRight, swUp, swFwd);
           if (avatar.Spawned()) {
             // Equip/unequip only on a CHANGE. EquipItem builds a body and a
             // joint, so calling it every tick with the same weapon would
@@ -5186,8 +5198,7 @@ int main(int argc, char** argv) {
             // (F5) drops any live program rather than leaving it half-run.
             playerStrike.Reset();
             strikeQueued = strikeBuffered = -1;
-            melee.Update(kTickDt, meleeHeld, meleeArmed, cam.Right(), cam.Up(),
-                         cam.Forward());
+            melee.Update(kTickDt, meleeHeld, meleeArmed, swRight, swUp, swFwd);
           } else {
             // DISCRETE: consume the press latch, then step the program. Begin
             // and first step land on the SAME tick, exactly as the NPC's
@@ -5210,6 +5221,9 @@ int main(int argc, char** argv) {
                   // turns jitter back on — and then it still replays.
                   BeginStrokeProgram(playerStrike, *sty, strikeQueued,
                                      rng::Hash3(0x504Cu, tick, 0x5747u));
+                  // ...and the style's body animation, exactly as the NPC's
+                  // BeginStroke does (strokes.h AttackStyle::clip).
+                  if (!sty->clip.empty()) avatar.PlayClip(sty->clip);
                 }
               } else if (playerStrike.phase == StrokeCursor::Phase::Cut ||
                          playerStrike.phase == StrokeCursor::Phase::Recover) {
@@ -5230,8 +5244,8 @@ int main(int argc, char** argv) {
                 // strike's mid-travel passes through the crosshair line.
                 const bool wasCutting = playerStrike.Cutting();
                 const StrokeStepResult r = StepStrokeProgram(
-                    playerStrike, sty, melee, 0.0f, 0.0f, kTickDt, cam.Right(),
-                    cam.Up(), cam.Forward());
+                    playerStrike, sty, melee, 0.0f, 0.0f, kTickDt, swRight,
+                    swUp, swFwd);
                 stepped = r != StrokeStepResult::Idle;
                 strikeCutEdge = playerStrike.Cutting() && !wasCutting;
                 if (r == StrokeStepResult::Finished) {
@@ -5250,8 +5264,7 @@ int main(int argc, char** argv) {
               // No program stepped the driver this tick: it idles/unwinds
               // exactly as a released button always did, so the arm hands
               // back over the usual ramp. ONE advance per tick either way.
-              melee.Update(kTickDt, false, meleeArmed, cam.Right(), cam.Up(),
-                           cam.Forward());
+              melee.Update(kTickDt, false, meleeArmed, swRight, swUp, swFwd);
             }
           }
           // ---- THE SWING WHOOSH, on the EDGE into Slash --------------------

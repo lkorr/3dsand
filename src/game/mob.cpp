@@ -237,6 +237,137 @@ JointLimits DefaultJointLimits(const std::string& tag) {
 
 // ---- sidecar + .vox pairing -------------------------------------------------
 
+// ---- one clip, from JSON onto a skeleton ------------------------------------
+// The sidecar's `clips` entries and the shared library (assets/anims/*.json)
+// are the SAME schema; this is the one place it is read. `log` may be null:
+// the library is compiled against every rig, and a part a critter does not
+// have is not an error there (see LoadMobDefs).
+static void ParseClipJson(const AnimSkeleton& sk, const std::string& where,
+                          const std::string& name, const json& c,
+                          float worldLen, std::string* log, AnimClip& clip) {
+  clip.name = name;
+  clip.durationMs = c.value("durationMs", 0);
+  clip.loop = c.value("loop", false);
+  clip.mode = c.value("mode", std::string("override")) == "additive"
+                  ? ClipMode::Additive
+                  : ClipMode::Override;
+  clip.blendInMs = c.value("blendInMs", 0);
+  clip.blendOutMs = c.value("blendOutMs", 0);
+  if (c.contains("mask") && c["mask"].is_array()) {
+    clip.mask.assign(sk.parts.size(), 0);
+    for (const auto& nm : c["mask"]) {
+      int pi = sk.FindPart(nm.get<std::string>());
+      if (pi >= 0) clip.mask[pi] = 1;
+    }
+  }
+  if (!c.contains("tracks") || !c["tracks"].is_object()) return;
+  for (auto t = c["tracks"].begin(); t != c["tracks"].end(); ++t) {
+    int pi = sk.FindPart(t.key());
+    if (pi < 0) {
+      if (log)
+        *log += where + ": clip \"" + clip.name + "\" track for unknown part \"" +
+                t.key() + "\"\n";
+      continue;
+    }
+    AnimTrack tr;
+    tr.part = pi;
+    // fuse the rot and pos key lists by time (the plan doc's fused
+    // keyframe model: one key carries both channels)
+    std::vector<AnimKey> keys;
+    auto upsert = [&](int32_t tMs) -> AnimKey& {
+      for (AnimKey& k : keys)
+        if (k.tMs == tMs) return k;
+      keys.push_back(AnimKey{});
+      keys.back().tMs = tMs;
+      return keys.back();
+    };
+    for (const auto& k : t.value().value("rot", json::array())) {
+      AnimKey& key = upsert(k.value("t", 0));
+      key.rot = JsonQuat(k.contains("q") ? k["q"] : json());
+      key.hasRot = true;
+      if (k.contains("ease")) key.ease = ParseEase(k["ease"].get<std::string>());
+    }
+    // NOT art units, and so NOT subject to the art upsample: a clip's
+    // position track is a DELTA added straight onto `rest.pos`
+    // (anim.cpp:385), which is world voxels. Multiplying these by
+    // artUpsample the way the anchors are would displace every keyed
+    // translation of an upsampled rig.
+    //
+    // They are world voxels rather than metres, though, which makes
+    // them a voxel-size dependency of their own — scaled with the rest of
+    // the sidecar's world-space lengths (`worldLen`, from the file's own
+    // sidecarVoxelsPerMetre).
+    for (const auto& k : t.value().value("pos", json::array())) {
+      AnimKey& key = upsert(k.value("t", 0));
+      key.pos = JsonVec3(k.contains("v") ? k["v"] : json(), {}) * worldLen;
+      key.hasPos = true;
+      if (k.contains("ease")) key.ease = ParseEase(k["ease"].get<std::string>());
+    }
+    std::sort(keys.begin(), keys.end(),
+              [](const AnimKey& a, const AnimKey& b) { return a.tMs < b.tMs; });
+    tr.keys = std::move(keys);
+    if (!tr.keys.empty()) clip.tracks.push_back(std::move(tr));
+  }
+}
+
+// ---- THE SHARED CLIP LIBRARY, read once per load ---------------------------
+// assets/anims/<name>.json, one clip per file, the clip-lane schema plus an
+// optional "name" (default: the file stem) and "sidecarVoxelsPerMetre" (the
+// same world-length stamp a sidecar carries, so a library clip's position
+// keys scale with the voxel size like everything else authored in voxels).
+// Read here as parsed JSON and compiled per rig in LoadMobDefs, because a
+// track is a PART INDEX and the same file means a different track on each
+// skeleton.
+struct ClipLibraryEntry {
+  std::string name;
+  std::string path;
+  json doc;
+  float worldLen = 1.0f;
+};
+
+static std::vector<ClipLibraryEntry> LoadClipLibrary(const std::string& dir,
+                                                     std::string& log) {
+  std::vector<ClipLibraryEntry> lib;
+  std::error_code ec;
+  std::vector<std::string> paths;
+  for (auto& e : std::filesystem::directory_iterator(dir, ec))
+    if (e.is_regular_file() && e.path().extension() == ".json")
+      paths.push_back(e.path().string());
+  if (ec) return lib;  // no library: nothing to add, and nothing to say
+  std::sort(paths.begin(), paths.end());
+  for (const std::string& p : paths) {
+    std::ifstream f(p);
+    if (!f) continue;
+    ClipLibraryEntry le;
+    try {
+      le.doc = json::parse(f);
+    } catch (const std::exception& e) {
+      log += p + ": JSON parse error: " + e.what() + "\n";
+      continue;
+    }
+    if (!le.doc.is_object()) {
+      log += p + ": not a clip object — skipped\n";
+      continue;
+    }
+    le.path = p;
+    le.name = le.doc.value("name", std::filesystem::path(p).stem().string());
+    if (le.name.empty()) {
+      log += p + ": clip with an empty name — skipped\n";
+      continue;
+    }
+    const int vpm =
+        le.doc.value("sidecarVoxelsPerMetre", kLegacyAuthoringVoxelsPerMetre);
+    le.worldLen =
+        (float)kVoxelsPerMetre / (float)(vpm > 0 ? vpm : kVoxelsPerMetre);
+    for (const ClipLibraryEntry& o : lib)
+      if (o.name == le.name)
+        log += p + ": duplicate library clip \"" + le.name + "\" (also " +
+               o.path + ") — last wins\n";
+    lib.push_back(std::move(le));
+  }
+  return lib;
+}
+
 bool LoadMobDefs(const std::string& dir, const std::vector<MaterialDef>& mats,
                  std::vector<MobDef>& out, MicroBodySet& micro,
                  std::string& log) {
@@ -257,6 +388,11 @@ bool LoadMobDefs(const std::string& dir, const std::vector<MaterialDef>& mats,
       voxPaths.push_back(e.path().string());
   if (ec) return true;  // no mob dir: nothing to load
   std::sort(voxPaths.begin(), voxPaths.end());
+  // The shared clip library lives BESIDE the mob dir (assets/anims/), not in
+  // it: it is authored per clip, not per creature, and the tuner writes it
+  // through its own /api/model route.
+  const std::vector<ClipLibraryEntry> clipLib = LoadClipLibrary(
+      (std::filesystem::path(dir).parent_path() / "anims").string(), log);
 
   for (const std::string& vp : voxPaths) {
     MobDef def;
@@ -932,71 +1068,29 @@ bool LoadMobDefs(const std::string& dir, const std::vector<MaterialDef>& mats,
       const json clipsJson =
           j.contains("clips") && j["clips"].is_object() ? j["clips"] : json::object();
       for (auto it = clipsJson.begin(); it != clipsJson.end(); ++it) {
-        const json& c = it.value();
         AnimClip clip;
-        clip.name = it.key();
-        clip.durationMs = c.value("durationMs", 0);
-        clip.loop = c.value("loop", false);
-        clip.mode = c.value("mode", std::string("override")) == "additive"
-                        ? ClipMode::Additive
-                        : ClipMode::Override;
-        clip.blendInMs = c.value("blendInMs", 0);
-        clip.blendOutMs = c.value("blendOutMs", 0);
-        if (c.contains("mask") && c["mask"].is_array()) {
-          clip.mask.assign(sk.parts.size(), 0);
-          for (const auto& nm : c["mask"]) {
-            int pi = sk.FindPart(nm.get<std::string>());
-            if (pi >= 0) clip.mask[pi] = 1;
-          }
-        }
-        if (c.contains("tracks") && c["tracks"].is_object()) {
-          for (auto t = c["tracks"].begin(); t != c["tracks"].end(); ++t) {
-            int pi = sk.FindPart(t.key());
-            if (pi < 0) {
-              log += jp + ": clip \"" + clip.name + "\" track for unknown part \"" +
-                     t.key() + "\"\n";
-              continue;
-            }
-            AnimTrack tr;
-            tr.part = pi;
-            // fuse the rot and pos key lists by time (the plan doc's fused
-            // keyframe model: one key carries both channels)
-            std::vector<AnimKey> keys;
-            auto upsert = [&](int32_t tMs) -> AnimKey& {
-              for (AnimKey& k : keys)
-                if (k.tMs == tMs) return k;
-              keys.push_back(AnimKey{});
-              keys.back().tMs = tMs;
-              return keys.back();
-            };
-            for (const auto& k : t.value().value("rot", json::array())) {
-              AnimKey& key = upsert(k.value("t", 0));
-              key.rot = JsonQuat(k.contains("q") ? k["q"] : json());
-              key.hasRot = true;
-              if (k.contains("ease")) key.ease = ParseEase(k["ease"].get<std::string>());
-            }
-            // NOT art units, and so NOT subject to the art upsample: a clip's
-            // position track is a DELTA added straight onto `rest.pos`
-            // (anim.cpp:385), which is world voxels. Multiplying these by
-            // artUpsample the way the anchors are would displace every keyed
-            // translation of an upsampled rig.
-            //
-            // They are world voxels rather than metres, though, which makes
-            // them a voxel-size dependency of their own — scaled below with the
-            // rest of the sidecar's world-space lengths.
-            for (const auto& k : t.value().value("pos", json::array())) {
-              AnimKey& key = upsert(k.value("t", 0));
-              key.pos = JsonVec3(k.contains("v") ? k["v"] : json(), {}) *
-                        worldLen;
-              key.hasPos = true;
-              if (k.contains("ease")) key.ease = ParseEase(k["ease"].get<std::string>());
-            }
-            std::sort(keys.begin(), keys.end(),
-                      [](const AnimKey& a, const AnimKey& b) { return a.tMs < b.tMs; });
-            tr.keys = std::move(keys);
-            if (!tr.keys.empty()) clip.tracks.push_back(std::move(tr));
-          }
-        }
+        // The sidecar's own clips: a track for a part this rig does not have
+        // is a content error and says so.
+        ParseClipJson(sk, jp, it.key(), it.value(), worldLen, &log, clip);
+        sk.clips.push_back(std::move(clip));
+      }
+
+      // ---- THE SHARED CLIP LIBRARY (assets/anims/*.json) -------------------
+      // Clips authored in the tuner's clip lane and saved OUT of a sidecar so
+      // an attack style can name one (strokes.h AttackStyle::clip) and every
+      // rig with the right part names plays it. Compiled per rig, exactly as
+      // a sidecar clip is, against THIS skeleton's parts; a sidecar clip of
+      // the same name wins, so a rig can still override the library. A
+      // library clip with no track this rig can use is skipped silently — the
+      // library is shared across every creature and a critter has no
+      // "armU.R" — but a clip that fits PARTLY is kept, because that is what
+      // a mask is for.
+      for (const ClipLibraryEntry& le : clipLib) {
+        if (sk.FindClip(le.name) >= 0) continue;
+        AnimClip clip;
+        ParseClipJson(sk, le.path, le.name, le.doc, le.worldLen, nullptr,
+                      clip);
+        if (clip.tracks.empty()) continue;
         sk.clips.push_back(std::move(clip));
       }
 
@@ -1963,6 +2057,10 @@ void MobSystem::BeginStroke(Mob& mob, const ai::AttackRequest& req,
   // notice.
   ApplyMeleeTuning(st.melee.tuning);
   NpcStrokeSmoothing(st.melee.tuning);
+  // The style's body animation, if it names one (strokes.h AttackStyle::clip).
+  // Same clip layer as a flinch or a jump; the arm claim below still wins on
+  // the weapon arm, so the clip is the rest of the body joining the swing.
+  if (!sty.clip.empty()) mob.PlayClip(sty.clip);
 }
 
 bool MobSystem::ForceAttack(uint64_t mobId, const std::string& style,

@@ -385,7 +385,10 @@ for (const nm of ['horizontal_r', 'horizontal_l', 'diagonal', 'overhead']) {
   // Every key the C++ ApplyMeleeTuning copies must be reachable, or a knob the
   // Tuning tab shows would silently do nothing in the preview.
   const missing = Object.keys(tj.melee).filter(k => {
-    if (k === 'controlMode' || k === 'pickMinSpeed') return false;   // by design
+    // by design: the controller's switches and the swing-basis cone (main.cpp
+    // ResolveSwingBasis), read off the tuning document, never by the driver
+    if (k === 'controlMode' || k === 'pickMinSpeed' ||
+        k === 'aimYaw' || k === 'aimReleaseYaw') return false;
     const base = k.replace(/(M|Mps)$/, '');
     return !(base in t);
   });
