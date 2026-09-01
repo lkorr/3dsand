@@ -1061,6 +1061,9 @@ void PerfRunner::RenderFrame(Scene& s, FrameClock& fc, uint32_t frame) {
   // Bracket AROUND BeginRenderPass/End, not inside: a timestamp write is not
   // legal inside a dynamic-rendering scope on the ALL_COMMANDS path.
   if (timed) enc.WriteTimestamp(renderTimer_.NativeQuerySet(), rb, false);
+  // Inside the bracket: the resolve is part of what a shadow costs, so leaving
+  // it out would flatter the cache in the very table that judges it.
+  sim_.EncodeShadowResolve(enc);
   {
     rhi::RenderPass rp = sim_.BeginRenderPass(
         enc, view_, rhi::TextureFormat::RGBA8Unorm, opt_.width, opt_.height);
@@ -1477,6 +1480,26 @@ const RenderArm kRenderArms[] = {
        t.render.fluidReflect = 0.0f;
      },
      true, 1, "reflection ray TRAVERSAL only, with the code still resident"},
+    // ---- the voxel-keyed shadow cache (world.h kShadowCacheBuckets) ----
+    // `nocache` is THE A/B for the whole feature: it recompiles raymarch.wgsl
+    // with the old inline shadow ray and turns the resolve pass off, so
+    // baseline - nocache is what the cache is worth, in one process, against
+    // the identical world and camera.
+    {"nocache", "shadow cache off (inline per-pixel ray, the old path)",
+     [](Tuning& t) { t.render.shadowCache = 0; }, true, 1,
+     "the whole shadow cache: rays deduplicated PLUS the trace() call site "
+     "removed from the fragment shader"},
+    // The granularity curve. Patch size is a quality knob, but it is also what
+    // decides how much dedup there IS: a patch finer than a pixel dedupes
+    // nothing, and at 1080p a 10 cm voxel is already only ~6.5 px across at the
+    // 24 m fine-march limit, so subdiv 4 makes patches sub-pixel over most of an
+    // overlook frame. These arms measure that instead of arguing about it.
+    {"cachesub1", "shadow patch subdiv 4 -> 1 (whole voxel face)",
+     [](Tuning& t) { t.render.shadowCacheSubdiv = 1; }, true, 1,
+     "how much of the resolve pass's cost is patches finer than a pixel"},
+    {"cachesub2", "shadow patch subdiv 4 -> 2",
+     [](Tuning& t) { t.render.shadowCacheSubdiv = 2; }, true, 1,
+     "the same, at the midpoint"},
     {"shadow32", "shadowSteps 384 -> 32",
      [](Tuning& t) { t.render.shadowSteps = 32; }, true, 1,
      "shadow march past 32 steps"},
@@ -1576,6 +1599,7 @@ class RenderBudgetRunner {
       uint32_t rb = 0, re = 0;
       const bool timed = timer_.AllocPassPair("render", rb, re);
       if (timed) enc.WriteTimestamp(timer_.NativeQuerySet(), rb, false);
+      sim_.EncodeShadowResolve(enc);
       {
         rhi::RenderPass rp = sim_.BeginRenderPass(
             enc, view, rhi::TextureFormat::RGBA8Unorm, W, H);
@@ -1791,6 +1815,32 @@ int RunRenderBudget(GpuContext& ctx, World& world, Simulation& sim,
   SetCurrentTuning(base);
   sim.ReloadShaders(ctx.device);
   runner.Shot(scene, "build/render_budget.bmp");
+
+  // ---- shadow cache attribution (CLAUDE.md rule 6) ----------------------
+  // A bare "the resolve pass costs 3.9 ms" is the kind of number that invites
+  // one elimination run per hypothesis. The two numbers that actually decide
+  // between them — how many patches were asked for, and how many were REFUSED
+  // because the request list was full — are two words the shader already
+  // maintains, so read them instead of guessing. The Shot above rendered a
+  // frame with the baseline tuning, so these describe that frame.
+  if (sim.ShadowCacheOn()) {
+    rhi::Buffer stage =
+        CreateBuffer(ctx.device, 16,
+                     rhi::BufferUsage::MapRead | rhi::BufferUsage::CopyDst,
+                     "shadowStatsRead");
+    rhi::CommandEncoder senc = ctx.device.CreateCommandEncoder();
+    senc.CopyBufferToBuffer(world.shadowReq, 0, stage, 0, 16);
+    ctx.queue.Submit(senc.Finish());
+    uint32_t w[4] = {0, 0, 0, 0};
+    if (rhi::ReadBufferBlocking(ctx.device, stage, 0, w, sizeof(w))) {
+      const double px = (double)opt.width * opt.height;
+      std::printf(
+          "\n  shadow cache: %u patches requested, %u resolved (cap %u), %u "
+          "refused\n            %.2f patches per 100 px — under 100 is real "
+          "dedup, at the cap it is truncation\n",
+          w[2], w[1], kShadowReqCap, w[3], 100.0 * (double)w[2] / px);
+    }
+  }
 
   // ---- the table the run exists to print --------------------------------
   const double b = out.empty() || !out[0].ok ? 0.0 : out[0].gpuP50;

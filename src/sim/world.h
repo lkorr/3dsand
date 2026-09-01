@@ -505,6 +505,97 @@ constexpr uint32_t kSubOccStride = kSubOccWords * 2;      // total words, then b
 static_assert(kSubOccDim * kSubOccDim * kSubOccDim <= kSubOccWords * 32,
               "sub-chunk block grid does not fit in kSubOccWords");
 
+// ---- the voxel-keyed shadow cache -----------------------------------------
+// RENDER-ONLY, DERIVED, DISPOSABLE. Not hashed, not saved, not replicated, and
+// the sim never reads it — the same standing as the far-field cascades. A
+// determinism hash that MOVES when this changes is a bug in this code, not a
+// rebaseline (CLAUDE.md rule 1 scopes to sim state).
+//
+// WHY IT EXISTS. sunShadowAt cast one full trace() per lit pixel. At
+// kVoxelMeters = 0.10 and 1080p/70deg a voxel face spans ~157/d pixels — 31 px
+// across at 5 m, 6.5 px at the 24 m fine-march limit — so the same shadow
+// answer was being computed 40-1000x per frame. Measured with --render-budget
+// on an RTX 3060 Ti, overlook camera, 1920x1080, 2026-09-01:
+//
+//   baseline  everything on                        14.56 ms
+//   noshadow  shadows off, call site resident      12.27 ms   -2.29
+//   shadow0   shadowSteps 384 -> 0, const-folded     8.68 ms   -5.88
+//
+// THE SECOND ROW IS THE INTERESTING ONE AND IT IS WHY THIS IS NOT JUST A CACHE.
+// The shadow call site's REGISTER FOOTPRINT is 5.88 - 2.29 = 3.59 ms, 1.6x
+// larger than all the traversal it performs. So deduplicating rays while
+// leaving an inline fallback in the fragment shader would win a fraction of
+// 2.29 ms and forfeit 3.59. The shadow trace() must be ABSENT from the compiled
+// fragment shader, which is what makes SHADOW_CACHE a compile-time const and
+// not a runtime branch, and what forces the miss policy below.
+//
+// THE STRUCTURE. One shadow factor per SURFACE PATCH — a voxel face subdivided
+// kShadowSubdivMax-ways per axis. A lossy, direct-mapped, hash-keyed table:
+// collisions overwrite, nothing is probed, and a miss is always safe. A compute
+// pass (shadow_resolve.wgsl) resolves each requested patch exactly once per
+// frame; the fragment shader only reads and re-registers.
+//
+// STALENESS IS ONE FRAME, AND ONLY IN THE REQUEST SET. Values are cast fresh
+// every frame, so destruction re-lights immediately and there is NO
+// invalidation machinery — no per-chunk generation, no dirty-list coupling. The
+// one-frame lag is in WHICH patches were asked for, so a newly disoccluded
+// patch misses for exactly one frame.
+//
+// WHY A COMPUTE PASS IS LOAD-BEARING rather than an optimisation: a fragment
+// shader cannot elect one pixel per patch to do the work. Without it, "valid
+// only if written last frame" degenerates into hit/miss on alternating frames.
+// Declared as a SHIFT with the count derived, not as a bare `1u << 20`:
+// scripts/check_shaders.sh scrapes world.h for literals and redoes the
+// arithmetic itself, so an expression here would be unscrapable — the same
+// reason kSubOccShift/kSubOccWords are the literals and kSubOccStride is
+// derived.
+constexpr uint32_t kShadowCacheShift = 20;
+constexpr uint32_t kShadowCacheBuckets = 1u << kShadowCacheShift;   // 1,048,576
+constexpr uint32_t kShadowCacheWords = 2;            // key, then packed state
+constexpr uint64_t kShadowCacheBytes =
+    (uint64_t)kShadowCacheBuckets * kShadowCacheWords * 4;   // 8 MiB
+// Two ADJACENT words per bucket, not two parallel arrays: they land in one
+// cache line, so reading the state word after the key word is very nearly free.
+// That is what buys the full 32-bit key instead of the packed-tag arithmetic a
+// single-word bucket would need — and a 32-bit key is what keeps hash-collision
+// false hits down to ~5 patches per frame at a 200k working set.
+//
+// Load factor at the ~200k patches an overlook frame resolves is under 20%.
+constexpr uint32_t kShadowReqHeaderWords = 4;   // [0] atomic count, [1] saved count, [2..3] stats
+constexpr uint32_t kShadowReqWords = 4;         // key, bucket, packed cell, packed face+sub
+constexpr uint32_t kShadowReqCapShift = 18;
+constexpr uint32_t kShadowReqCap = 1u << kShadowReqCapShift;  // 262,144 per frame
+constexpr uint64_t kShadowReqBytes =
+    (uint64_t)(kShadowReqHeaderWords + kShadowReqCap * kShadowReqWords) * 4;
+// Overflow is GRACEFUL and silent by design: past the cap a patch simply is not
+// registered, so it misses next frame and shades from the stale/unshadowed
+// default. It is reported in the stats words rather than being an abort,
+// because the failure is a slightly wrong pixel, not a lost voxel.
+//
+// GRANULARITY IS THE KNOB, exactly as it is for kSubOccShift above, and it is a
+// QUALITY knob rather than a speed one. The win saturates early: at subdiv 4
+// the ~200k resolved patches cost ~0.34 ms of traversal against a 2.29 ms
+// budget, so coarsening further buys almost nothing while making shadow edges
+// blockier. 4 gives 2.5 cm patches — ~8 px at 5 m, ~2 px at 20 m. Runtime knob
+// is render.shadowCacheSubdiv; this is the ceiling the packing allows.
+constexpr uint32_t kShadowSubdivMax = 8;        // 3 bits per axis in the request word
+// The request record packs a window-relative cell as three log2(kWorldN)-wide
+// fields plus a 3-bit face, all in one u32 (common.wgsl shadowPackCell). At the
+// 512 window that is 9+9+9+3 = 30 bits. Doubling the window to 1024 makes it 33
+// and the record silently truncates — the same class of overflow the kFarSlot
+// note in this file records having already been paid for once, so it is a
+// static_assert here rather than a comment there.
+constexpr uint32_t kWorldShift = [] {
+  uint32_t s = 0;
+  while ((1u << s) < kWorldN) s++;
+  return s;
+}();
+static_assert(kWorldShift * 3 + 3 <= 32,
+              "shadowPackCell: cell+face no longer fits a u32 at this kWorldN — "
+              "widen the request record to two words");
+// And the sub-patch indices share the other word at 3 bits each.
+static_assert(kShadowSubdivMax <= 8, "shadowPackSub gives each axis 3 bits");
+
 // ---- the software page table (docs/PLAN_page_table.md) ---------------------
 // DERIVED DATA ONLY: the page table is a physical-layout index, not world
 // state. It is not hashed, not persisted, and not replicated. It is rebuilt
@@ -1691,6 +1782,26 @@ struct RenderParams {
   uint32_t waveImpactCount = 0;
   uint32_t pad_wi0 = 0, pad_wi1 = 0, pad_wi2 = 0;
   float waveImpacts[kWaveImpactCap * 4] = {};
+
+  // ---- the shadow cache's clock (must match RenderParams in common.wgsl) --
+  // The RENDER frame counter, and deliberately not `tick` or `time`. `tick` is
+  // the 30 Hz sim clock and the renderer runs uncapped, so several frames share
+  // one tick — keying cache entries on it would make an entry live for however
+  // many frames the machine happened to fit into a tick, i.e. a staleness bound
+  // that changes with frame rate. `time` is a float animation clock and cannot
+  // be compared for exact equality at all.
+  //
+  // Only the low 4 bits are ever compared (the bucket's resolvedFrame field),
+  // so wraparound at 16 is fine and intended: an entry 16 frames stale is
+  // indistinguishable from a fresh one, but nothing keeps an entry that long —
+  // the resolve pass rewrites every registered patch every frame.
+  uint32_t frameIdx = 0;
+  // Live subdivision of a voxel face per axis (render.shadowCacheSubdiv,
+  // clamped to kShadowSubdivMax). Passed rather than const-folded so the
+  // quality knob hot-reloads on F5 like every other render tuning value; the
+  // CACHE ITSELF is const-gated, but its granularity is not.
+  uint32_t shadowSubdiv = 4;
+  uint32_t pad_sc0 = 0, pad_sc1 = 0;
 };
 static_assert(sizeof(RenderParams) % 16 == 0,
               "RenderParams must be a whole number of std140 rows");
@@ -2270,6 +2381,18 @@ class World {
   rhi::Buffer renderUBO;   // RenderParams
   rhi::Buffer dirtyViz;    // kNumChunks u32, CPU-uploaded snapshot for debug overlay
   rhi::Buffer actVoxViz;   // per-voxel activity bits (packed u32), debug overlay
+  // ---- shadow cache (the kShadowCacheBuckets block above) ----
+  // The ONLY buffer a fragment shader writes. Render-only derived data: never
+  // hashed, never saved, and zeroed rather than restored on load — a cold cache
+  // costs one frame of stale shadows, which is the same thing a teleport costs.
+  rhi::Buffer shadowCache;    // kShadowCacheBuckets * 2 u32 (8 MiB)
+  rhi::Buffer shadowReq;      // header + kShadowReqCap * 4 u32 request records
+  // The resolve's dispatch size, in the two-buffer stage+copy shape argsStage /
+  // dispatchArgs and fluidArgsStage / fluidDispatchArgs already use: the
+  // compute pass WRITES the stage (so it must be bindable storage) and the
+  // indirect read comes from a buffer that is in no bind group at all.
+  rhi::Buffer shadowArgsStage;  // 4 u32 — prepare kernel writes (x = groups, y = z = 1)
+  rhi::Buffer shadowArgs;       // 4 u32 — indirect-only copy of shadowArgsStage
   rhi::Buffer pick;        // 8 u32
 
   // ---- the water-body ledger (docs/PLAN_water_master.md components 3-5) ----

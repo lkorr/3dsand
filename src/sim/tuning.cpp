@@ -1775,6 +1775,8 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadF(*g, "shadowSoftFar", r.shadowSoftFar, out, at);
     ReadF(*g, "shadowLift", r.shadowLift, out, at);
     ReadF(*g, "shadowFarLift", r.shadowFarLift, out, at);
+    ReadI(*g, "shadowCache", r.shadowCache, out, at);
+    ReadI(*g, "shadowCacheSubdiv", r.shadowCacheSubdiv, out, at);
     ReadF(*g, "grainBroadScale", r.grainBroadScale, out, at);
     ReadF(*g, "grainFineScale", r.grainFineScale, out, at);
     ReadF(*g, "grainMix", r.grainMix, out, at);
@@ -2079,6 +2081,17 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     if (r.microSwayAmp > 2.0f) { r.microSwayAmp = 2.0f; }
     if (r.microSwaySpeed < 0.0f) { r.microSwaySpeed = 0.0f; }
     if (r.shadowSteps < 0) { r.shadowSteps = 0; }
+    // Subdivision must be >= 1 and within the 3 bits the shadow request record
+    // gives each sub-index (world.h kShadowSubdivMax). A 0 here would divide by
+    // zero in shadowPatchCentre; anything over the max would alias two patches
+    // onto one key, which reads as shadows flickering between neighbours.
+    if (r.shadowCacheSubdiv < 1) { r.shadowCacheSubdiv = 1; }
+    // 8 is world.h's kShadowSubdivMax, restated rather than included: this TU
+    // does not pull in world.h, and the shader clamps to SHADOW_SUBDIV_MAX
+    // independently, so an over-large value here is bounded twice over. The
+    // clamp exists so the tuner slider cannot silently alias two patches onto
+    // one key, not as the load-bearing guard.
+    if (r.shadowCacheSubdiv > 8) { r.shadowCacheSubdiv = 8; }
     if (r.reflectionSteps < 0) { r.reflectionSteps = 0; }
     if (r.farSteps < 1) { r.farSteps = 1; }
     // A zero/negative reach would clamp to the 8-step floor everywhere and

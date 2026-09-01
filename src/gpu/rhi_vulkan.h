@@ -130,6 +130,24 @@ struct Caps {
   // down-convert every scope, and a silently weaker barrier is precisely the
   // failure mode rule 1 cannot tolerate.
   bool synchronization2 = false;
+
+  // --- fragment-stage storage writes (the shadow cache) ---
+  // The render bind group was entirely ReadOnlyStorage until the voxel-keyed
+  // shadow cache, which is the first buffer a FRAGMENT shader writes. This is a
+  // Vulkan 1.0 core feature and universally supported on desktop, but it is
+  // OPTIONAL, and a storage write from a fragment shader on a device that did
+  // not enable it is undefined behaviour rather than an error — the same class
+  // of silent failure the synchronization2 note above refuses to accept.
+  //
+  // Unlike synchronization2 this one does NOT refuse to initialise. The cache
+  // is selected by a COMPILE-TIME const in the shader prelude, so a device
+  // without the feature compiles the original inline-shadow-ray variant of
+  // raymarch.wgsl and loses performance, not correctness. That is also why the
+  // toggle cannot be a runtime branch: the whole point of the cache is that the
+  // shadow trace() call site is ABSENT from the compiled fragment shader
+  // (measured 3.59 ms of register footprint), and a runtime branch would keep
+  // it resident and give back most of the win.
+  bool fragmentStoresAndAtomics = false;
 };
 
 // -------------------------------------------------------------- buffer ----

@@ -15,6 +15,7 @@
 #include "game/brush.h"
 #include "game/camera.h"
 #include "gpu/resources.h"
+#include "sim/celestial.h"
 #include "sim/faredits.h"
 #include "sim/farfield.h"
 #include "test/selftest.h"
@@ -663,6 +664,213 @@ Status GateFireDepth(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---------------------------------------------------------------------------
+// shadow-cache: the voxel-keyed shadow cache agrees with the ray it replaced.
+//
+// WHY THIS GATE EXISTS. The cache does not reuse trace(). It cannot: trace()
+// lives in raymarch.wgsl and the resolve pass is a compute shader, so
+// shadow_resolve.wgsl carries its own media-blind DDA (shadowMarch). That is
+// two implementations of one question, which is the shape this repo has a
+// checker for everywhere else and had none for here. A comment claiming they
+// agree is worth nothing; this runs both.
+//
+// THREE ARMS, NOT TWO, and the third is the point. Comparing "cache on" with
+// "cache off" and finding them equal proves nothing on its own — a scene with
+// no shadows in it at all would pass that test perfectly, and so would a cache
+// that returns 1.0 for everything IF the reference had also stopped casting.
+// The `noshadow` arm establishes that this frame HAS shadows worth agreeing
+// about, so the small A-B difference is a real agreement rather than two blank
+// pages matching. (See the "a hash-identity test needs three arms" note.)
+Status GateShadowCache(Ctx& c, std::string& detail) {
+  GpuContext& ctx = c.ctx;
+  World& world = c.world;
+  Simulation& sim = c.sim;
+  const uint32_t W = c.width, H = c.height;
+
+  // SELF-SUFFICIENT ON PURPOSE, and this is the half that matters most.
+  // Gates share one World and most of them inherit terrain from whatever ran
+  // before (CLAUDE.md rule 7), but a gate that only works inside the full suite
+  // cannot be iterated on with `--gate shadow-cache` — which is exactly how
+  // this one will be used. So it generates its own world and paints its own
+  // blocker. Measured: without the SubmitWorldgen below, all three arms
+  // rendered empty sky and every difference was 0.00.
+  const uint32_t mStone = [&]() -> uint32_t {
+    for (size_t i = 0; i < c.mats.size(); i++)
+      if (c.mats[i].name == "stone") return (uint32_t)i;
+    return 0;
+  }();
+  if (!mStone) {
+    detail = "stone missing from materials.json";
+    return Status::Fail;
+  }
+  SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+  ctx.WaitIdle();
+
+  // A slab floating over open ground. Terrain alone would probably cast usable
+  // shadows, but "probably" is how a gate becomes a coin flip on the next
+  // worldgen tweak: an authored blocker at a known height guarantees the
+  // reference frame has a large, unambiguous shadow in it, which is what the
+  // third arm below has to be able to see.
+  const int gx = 300, gz = 300;
+  const int ground = World::TerrainHeight(gx, gz, kDefaultSeed);
+  const int slabY = ground + 10;
+  const IVec3 pchunk{gx / 16, slabY / 16, gz / 16};
+  std::vector<CellOp> slab;
+  for (int dx = -18; dx <= 18; dx++)
+    for (int dy = 0; dy < 2; dy++)
+      for (int dz = -18; dz <= 18; dz++) {
+        const IVec3 cc{gx + dx, slabY + dy, gz + dz};
+        if (!world.CellInWindow(cc)) continue;
+        slab.push_back({World::SlotCellIndex(cc), PackVoxNew(mStone, 0u)});
+      }
+  uint32_t tick = 40000;
+  SubmitTick(ctx, world, sim, ++tick, kDefaultSeed, {}, {}, slab, false, pchunk,
+             false, false);
+  ctx.WaitIdle();
+
+  // Looking down at the ground the slab shades, from off to one side so the
+  // slab does not fill the frame.
+  // Low and close, pitched well down: the quantity under test is the SHADOWED
+  // GROUND, so it has to fill the frame. A high wide shot is mostly sky and
+  // distant terrain, and the shadow gets averaged into irrelevance — measured,
+  // the first framing here put the shadows-on/off difference at 1.57 against an
+  // agreement of 0.33, a margin too thin to call either way.
+  const Vec3 eye{(float)gx - 22.0f, (float)ground + 7.0f, (float)gz - 22.0f};
+  Camera cam;
+  cam.yaw = 0.785f;    // toward +X+Z, i.e. at the slab
+  cam.pitch = -0.30f;
+
+  const Tuning base = CurrentTuning();
+
+  // BUDGET UNDER THE LIGHTING THE GAME IS PLAYED IN. WriteRenderParams derives
+  // the sun from the celestial cycle, not from its `time` argument, and at an
+  // arbitrary tick the sun can be below the horizon — where sunShadowAt is
+  // never reached at all because `lambert > 0.0` fails. Measured: at tick 0
+  // this gate saw a shadows-on/shadows-off difference of 0.41, i.e. a frame
+  // with essentially no sunlight to block. Scanned rather than hardcoded for
+  // the same reason --render-budget scans: cycleMinutes is a tuning value, so
+  // any constant here becomes the wrong time of day the first time it moves.
+  uint32_t noonTick = 0;
+  {
+    float bestUp = -2.0f;
+    for (uint32_t t = 0; t < 200000u; t += 64u) {
+      const float up = ComputeSky(base, (double)t).sunDir[1];
+      if (up > bestUp) { bestUp = up; noonTick = t; }
+    }
+  }
+
+  // Render `frames` frames and return the last one. The count matters for the
+  // cache arm and only for it: the cache is empty on the first frame, every
+  // patch misses and shades unshadowed, and it takes ONE further frame for the
+  // resolve pass to fill in what that frame registered. Anything less than 2 is
+  // measuring the cold-start miss, not the cache.
+  auto render = [&](bool shadows, uint32_t frames,
+                    std::vector<uint8_t>& out) -> bool {
+    rhi::Buffer shot =
+        CreateBuffer(ctx.device, (uint64_t)W * H * 4,
+                     rhi::BufferUsage::MapRead | rhi::BufferUsage::CopyDst,
+                     "shadowCacheShot");
+    for (uint32_t f = 0; f < frames; f++) {
+      // Fresh render params per frame: WriteRenderParams is what advances the
+      // cache's frame counter, so reusing one upload would leave every entry
+      // looking stale and every lookup missing.
+      WriteRenderParams(ctx.queue, world, eye, cam, (float)W / H, shadows, 0.0f,
+                        kFarFogDensity, (float)H, noonTick);
+      rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
+      sim.EncodeShadowResolve(enc);
+      rhi::RenderPass rp = sim.BeginRenderPass(
+          enc, c.view, rhi::TextureFormat::RGBA8Unorm, W, H);
+      sim.DrawWorld(rp);
+      rp.End();
+      if (f + 1 == frames) {
+        rhi::TexelCopyTexture srcT{};
+        srcT.texture = c.offscreen;
+        rhi::TexelCopyBuffer dstB{};
+        dstB.buffer = shot;
+        dstB.bytesPerRow = W * 4;
+        dstB.rowsPerImage = H;
+        rhi::Extent3D ext{W, H, 1};
+        enc.CopyTextureToBuffer(srcT, dstB, ext);
+      }
+      ctx.queue.Submit(enc.Finish());
+    }
+    out.assign((size_t)W * H * 4, 0);
+    return rhi::ReadBufferBlocking(ctx.device, shot, 0, out.data(), out.size());
+  };
+
+  // Mean absolute luminance difference over the frame, in 0..255 units.
+  auto meanDiff = [&](const std::vector<uint8_t>& a,
+                      const std::vector<uint8_t>& b) {
+    if (a.size() != b.size() || a.empty()) return 1e9;
+    double acc = 0.0;
+    size_t n = 0;
+    for (size_t i = 0; i + 3 < a.size(); i += 4) {
+      const double la = 0.299 * a[i] + 0.587 * a[i + 1] + 0.114 * a[i + 2];
+      const double lb = 0.299 * b[i] + 0.587 * b[i + 1] + 0.114 * b[i + 2];
+      acc += std::fabs(la - lb);
+      n++;
+    }
+    return n ? acc / (double)n : 1e9;
+  };
+
+  auto arm = [&](int cacheOn, bool shadows, uint32_t frames,
+                 std::vector<uint8_t>& out) -> bool {
+    Tuning t = base;
+    t.render.shadowCache = cacheOn;
+    SetCurrentTuning(t);
+    // The F5 path: SHADOW_CACHE is const-folded, so the arm does not exist
+    // until the shader is recompiled with it.
+    if (!sim.ReloadShaders(ctx.device)) return false;
+    return render(shadows, frames, out);
+  };
+
+  std::vector<uint8_t> refPx, cachePx, noShadowPx;
+  const bool got = arm(0, true, 1, refPx) &&        // per-pixel rays (reference)
+                   arm(1, true, 4, cachePx) &&      // the cache, warmed
+                   arm(0, false, 1, noShadowPx);    // no shadows at all
+  SetCurrentTuning(base);
+  const bool restored = sim.ReloadShaders(ctx.device);
+  if (!got || !restored) {
+    detail = got ? "shader restore failed" : "render/readback failed";
+    return Status::Fail;
+  }
+
+  // LEAVE THE WORLD AS THIS GATE FOUND IT. Gates share one World and 42 of
+  // them run after this one (selftest.cpp kOrder), so the 37x2x37 stone slab
+  // painted above is not this gate's private fixture — it is a permanent edit
+  // every later gate would inherit, in a suite whose whole ordering discipline
+  // is about not doing that. Regenerating costs a second and removes the entire
+  // class of question.
+  SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+  ctx.WaitIdle();
+
+  const double agree = meanDiff(refPx, cachePx);
+  const double signal = meanDiff(refPx, noShadowPx);
+
+  // AGREEMENT IS NOT EQUALITY, and must not be asserted as such: the cache
+  // answers per PATCH, so a shadow edge lands on a patch boundary rather than a
+  // pixel boundary and the two frames legitimately differ along every edge.
+  //
+  // THE TEST IS A RATIO, NOT AN ABSOLUTE, and that is deliberate. An absolute
+  // millilumen threshold silently encodes this camera, this slab and this
+  // worldgen; move any of them and it becomes either unfailable or a coin flip.
+  // The claim worth asserting is scale-free — the cache is MUCH closer to the
+  // per-pixel reference than dropping shadows entirely is — so that is what is
+  // written down. kSignalMin keeps the ratio honest by refusing a frame with no
+  // shadows in it, where both differences are ~0 and the ratio is meaningless.
+  const double kSignalMin = 1.0;
+  const double kAgreeFrac = 0.25;
+  const bool ok = signal > kSignalMin && agree < signal * kAgreeFrac;
+  std::printf("shadow cache: %s (cache vs per-pixel rays: mean |dL| %.2f; "
+              "per-pixel rays vs no shadows: %.2f, must exceed %.1f; agreement "
+              "must be under %.0f%% of that, i.e. %.2f)\n",
+              ok ? "PASS" : "FAIL", agree, signal, kSignalMin,
+              kAgreeFrac * 100.0, signal * kAgreeFrac);
+  detail = Format("agree %.2f, signal %.2f, budget %.2f", agree, signal,
+                  signal * kAgreeFrac);
+  return ok ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& RenderGates() {
@@ -675,6 +883,7 @@ const std::vector<Gate>& RenderGates() {
       // one-word readback, and never touch the offscreen target.
       {"screenshots", "render", {}, false, GateScreenshots, /*needsRender=*/true},
       {"fire-depth", "render", {}, false, GateFireDepth, /*needsRender=*/true},
+      {"shadow-cache", "render", {}, false, GateShadowCache, /*needsRender=*/true},
   };
   return g;
 }

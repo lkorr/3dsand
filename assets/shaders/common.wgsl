@@ -1028,6 +1028,14 @@ struct RenderParams {
   _pwi1 : u32,
   _pwi2 : u32,
   waveImpacts : array<vec4f, 16>,   // WAVE_IMPACT_CAP
+  // ---- shadow cache (must match RenderParams in world.h) ----
+  // frameIdx is the RENDER frame counter, not `tick` (30 Hz, several frames per
+  // tick) and not `time` (a float that cannot be compared for equality). Only
+  // its low 4 bits are ever used.
+  frameIdx : u32,
+  shadowSubdiv : u32,   // voxel-face subdivision per axis, <= SHADOW_SUBDIV_MAX
+  _psc0 : u32,
+  _psc1 : u32,
 };
 
 // Reversed-Z depth (clear 0, compare GreaterEqual): depth = KNEAR / viewZ.
@@ -2879,6 +2887,118 @@ fn subOccBitOfLocalIdx(i : u32) -> u32 {
 // ones are never tested, so setting them costs nothing and keeps the constant
 // free of a per-word special case.
 fn subOccAllOnes() -> u32 { return 0xFFFFFFFFu; }
+
+// ---- VOXEL-KEYED SHADOW CACHE (src/sim/world.h kShadowCacheBuckets) --------
+// The identity and packing shared by the two halves of the cache:
+// raymarch.wgsl READS a patch's shadow factor and REGISTERS the patch, and
+// shadow_resolve.wgsl CASTS the ray and writes the value back. They must agree
+// bit for bit about what a patch IS and where it lives, so the derivation lives
+// here and in exactly one place.
+//
+// A PATCH is one face of one voxel, subdivided `subdiv` ways per axis. The
+// granularity is a QUALITY knob, not a speed one — see the world.h block for
+// why the win saturates long before the patch gets coarse.
+//
+// FACE ENCODING: axis * 2 + (normal points along +axis). 0..5, three bits.
+fn shadowFaceOf(axis : i32, nPositive : bool) -> u32 {
+  return u32(axis) * 2u + select(0u, 1u, nPositive);
+}
+fn shadowFaceNormal(face : u32) -> vec3f {
+  let axis = face >> 1u;
+  let s = select(-1.0, 1.0, (face & 1u) != 0u);
+  var n = vec3f(0.0);
+  n[axis] = s;
+  return n;
+}
+// The two in-face axes. Fixed order (a+1, a+2) so the sub-patch indices mean
+// the same thing on both sides.
+fn shadowFaceTangents(face : u32) -> vec2<u32> {
+  let axis = face >> 1u;
+  return vec2<u32>((axis + 1u) % 3u, (axis + 2u) % 3u);
+}
+// Which sub-patch of the face a world-space hit point lands in.
+fn shadowSubOf(hp : vec3f, cell : vec3<i32>, face : u32, subdiv : u32) -> vec2<u32> {
+  let t = shadowFaceTangents(face);
+  let f = hp - vec3f(cell);
+  let m = f32(subdiv);
+  // Clamped, not wrapped: a hit point can sit a hair outside its own cell after
+  // the DDA's epsilon nudges, and a wrap would put it on a neighbouring patch.
+  return vec2<u32>(u32(clamp(floor(f[t.x] * m), 0.0, m - 1.0)),
+                   u32(clamp(floor(f[t.y] * m), 0.0, m - 1.0)));
+}
+// The centre of a patch, in world voxel coords — the point the resolve pass
+// casts from. Quantising the ray origin to this centre IS the approximation the
+// whole cache rests on: every pixel on the patch gets the answer computed here.
+fn shadowPatchCentre(cell : vec3<i32>, face : u32, sx : u32, sy : u32,
+                     subdiv : u32) -> vec3f {
+  let axis = face >> 1u;
+  let t = shadowFaceTangents(face);
+  let inv = 1.0 / f32(subdiv);
+  var p = vec3f(cell);
+  p[axis] += select(0.0, 1.0, (face & 1u) != 0u);
+  p[t.x] += (f32(sx) + 0.5) * inv;
+  p[t.y] += (f32(sy) + 0.5) * inv;
+  return p;
+}
+
+// ---- the request record ----
+// Three WORLD_SHIFT-wide cell fields plus a 3-bit face in one word. The cell is
+// stored WINDOW-RELATIVE so it fits; both passes recover the world cell with
+// the same R.origin, which is sound because they run in the same frame off the
+// same uniform. world.h static_asserts that this packing fits a u32.
+fn shadowPackCell(relCell : vec3<i32>, face : u32) -> u32 {
+  let c = vec3<u32>(relCell);
+  return c.x | (c.y << WORLD_SHIFT) | (c.z << (WORLD_SHIFT * 2u)) |
+         (face << (WORLD_SHIFT * 3u));
+}
+fn shadowPackSub(sx : u32, sy : u32) -> u32 { return sx | (sy << 3u); }
+
+// ---- the key and its bucket ----
+// A 32-bit hash of the ~36-bit patch identity. Hashed rather than stored whole
+// because the identity does not fit, and the residual risk is understood and
+// bounded: at a ~200k working set the birthday count is ~5 fully-colliding
+// pairs per frame, i.e. ~5 patches that take a neighbour's shadow for ONE
+// frame. Self-correcting, and cheaper than the third word a 64-bit key costs.
+//
+// Key 0 is reserved for "empty bucket" — the buffer is zero-filled, and a
+// patch that legitimately hashed to 0 would match every untouched bucket.
+//
+// WHAT A COLLISION ACTUALLY COSTS, since it is not "a wrong shadow": two
+// patches sharing a bucket alternate ownership frame by frame (the loser sees a
+// key mismatch, re-registers, and evicts the winner next frame), so each shows
+// the miss default — unshadowed — on the frames it loses. ~5 patches of 2.5 cm
+// flickering out of ~200k. If that ever reads on screen the fix is a 64-bit
+// key, i.e. a third word per bucket, not a bigger table.
+fn shadowPatchKey(packedCell : u32, packedSub : u32) -> u32 {
+  let k = pcg(packedCell ^ pcg(packedSub * 0x9E3779B9u + 1u));
+  return select(k, 1u, k == 0u);
+}
+// Direct-mapped: no probing, collisions overwrite. A miss is always SAFE (the
+// reader falls back to the miss default), so there is nothing to resolve.
+fn shadowBucketOf(key : u32) -> u32 { return key & (SHADOW_CACHE_BUCKETS - 1u); }
+
+// ---- the bucket's state word ----
+// value 0..255 | resolvedFrame (4) | requestedFrame (4) | valid (1).
+//
+// TWO SEPARATE FRAME FIELDS, and that is load-bearing: registration must stamp
+// `requested` WITHOUT disturbing the value other pixels are still reading this
+// frame, so one field cannot serve both roles.
+//
+// THE VALID BIT IS NOT REDUNDANT WITH resolvedFrame, which is the subtle part.
+// The buffer is zero-filled, so an untouched bucket reads resolvedFrame == 0
+// and value == 0 — and on frames where frameIdx & 15 happens to be 0 that is
+// indistinguishable from "resolved this frame, fully shadowed". Every sixteenth
+// frame would then paint newly-registered patches black. One bit removes the
+// whole class: nothing but the resolve pass ever sets it.
+fn shadowPackState(value : u32, resolvedFrame : u32, requestedFrame : u32,
+                   valid : bool) -> u32 {
+  return (value & 0xFFu) | ((resolvedFrame & 15u) << 8u) |
+         ((requestedFrame & 15u) << 12u) | select(0u, 0x10000u, valid);
+}
+fn shadowStateValue(s : u32) -> f32 { return f32(s & 0xFFu) * (1.0 / 255.0); }
+fn shadowStateResolved(s : u32) -> u32 { return (s >> 8u) & 15u; }
+fn shadowStateRequested(s : u32) -> u32 { return (s >> 12u) & 15u; }
+fn shadowStateValid(s : u32) -> bool { return (s & 0x10000u) != 0u; }
 
 // Voxel word: bits 0..11 material, 12..15 state, 16..18 tick-stamp,
 //             19..23 FREE, 24..27 stain amount, 28..30 stain type,

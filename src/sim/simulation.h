@@ -63,6 +63,22 @@ class Simulation {
   // genList. Recorded at the HEAD of the tick's command buffer by
   // PageTable::DrainFills, alongside the one-pattern fills.
   void EncodePageFill(const rhi::CommandEncoder& enc, uint32_t count);
+
+  // ---- the voxel-keyed shadow cache (world.h kShadowCacheBuckets) ----------
+  // Resolves the patches last frame's raymarch asked for, so DrawWorld can read
+  // their shadow factors instead of casting a ray per lit pixel.
+  //
+  // CALL IT ONCE PER FRAME, ON THE SAME ENCODER, BEFORE BeginRenderPass. It
+  // cannot live inside DrawWorld: that takes a RenderPass and a render pass
+  // cannot host a compute dispatch. It also must not be skipped on a frame that
+  // draws — the fragment shader registers into a list this pass is the only
+  // consumer of, so a draw without a preceding resolve leaves every patch stale
+  // for a frame and lets the request list fill to its cap.
+  //
+  // No-ops when the cache is compiled out (render.shadowCache = 0 or the device
+  // lacks fragmentStoresAndAtomics), which is the ONE place that is decided.
+  void EncodeShadowResolve(const rhi::CommandEncoder& enc);
+  bool ShadowCacheOn() const { return shadowCacheOn_; }
   // Standalone whole-world hash pass (save/load verification): caller writes
   // TickParams with hashEnable=1 first, reads world.hash after submit.
   void EncodeHashOnly(const rhi::CommandEncoder& enc);
@@ -327,9 +343,9 @@ class Simulation {
   // pipelines pair it with particleBGL_ to stay under the 16-storage-buffer
   // per-stage pipeline-layout limit (Dawn counts layout entries, not usage).
   rhi::BindGroupLayout simBGL_, simSlimBGL_, particleBGL_, renderBGL_, renderPartBGL_,
-      farBGL_, microBodyBGL_, fluidBGL_, fluidSeamBGL_;
+      farBGL_, microBodyBGL_, fluidBGL_, fluidSeamBGL_, shadowBGL_;
   rhi::PipelineLayout simPL_, simPL2_, renderPL_, farPL_, microBodyPL_, fluidPL_,
-      fluidSeamPL_;
+      fluidSeamPL_, shadowPL_;
   rhi::ComputePipeline worldgen_, worldgenList_, mutate_, mutateCells_, compact_,
       compactNext_, step_, occupancy_, occupancyDirty_, pick_;
   // Wind primitive footprint wake (sim_mutate.wgsl `windWake`) — see
@@ -339,6 +355,19 @@ class Simulation {
       pArgs2_, pResolve_;
   rhi::ComputePipeline farFill_, farDown_;
   rhi::ComputePipeline pageFill_;   // JITTER page materialization (world.h)
+  // Shadow cache (shadow_resolve.wgsl): `prepare` turns last frame's request
+  // count into a dispatch size, `resolve` casts one media-blind shadow ray per
+  // requested patch. Render-path passes, encoded by EncodeShadowResolve rather
+  // than on the tick table — they run per FRAME, not per tick.
+  rhi::ComputePipeline shadowPrepare_, shadowResolve_;
+  rhi::ShaderModule shadowModule_;
+  // Whether the cache is live this run. Recomputed in Init and ReloadShaders
+  // from (device capability AND render.shadowCache), so F5 flips it with the
+  // shader recompile that changes raymarch.wgsl's SHADOW_CACHE const — the two
+  // MUST move together, or the fragment shader registers patches nothing
+  // resolves (all shadows stale) or the resolve pass runs against a shader that
+  // never asks (wasted dispatch, and a request list that never drains).
+  bool shadowCacheOn_ = false;
   // Water bodies (sim_waterbody.wgsl): quiescence probe, drain ledger,
   // adoption reduce, surface shave — docs/PLAN_water_master.md components 3-5.
   rhi::ComputePipeline waterQuiet_, waterLedger_, waterReduce_, waterShave_;
@@ -381,7 +410,7 @@ class Simulation {
   // fluidSeamBG_ additionally binds fluidParticles[page] as the compaction
   // source.
   rhi::BindGroup renderBG_, renderPartBG_[2], farBG_, microBodyBG_, fluidBG_[2],
-      fluidSeamBG_[2];
+      fluidSeamBG_[2], shadowBG_;
   int page_ = 0;
 
   // ---- settled-tick skip state (§3.4) -------------------------------------

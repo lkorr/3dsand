@@ -28,6 +28,7 @@ namespace {
 #define PT_FLUIDSEAM  Table::FluidSeam
 #define PT_FLUIDSETTLE Table::FluidSettle
 #define PT_PAGEFILL   Table::PageFill
+#define PT_SHADOWCACHE Table::ShadowCache
 
 #define PIPE_NONE            Pipe::None
 #define PIPE_WORLDGEN        Pipe::Worldgen
@@ -51,6 +52,8 @@ namespace {
 #define PIPE_PAGEFILL        Pipe::PageFill
 #define PIPE_FAR_FILL        Pipe::FarFill
 #define PIPE_FAR_DOWN        Pipe::FarDown
+#define PIPE_SHADOW_PREPARE  Pipe::ShadowPrepare
+#define PIPE_SHADOW_RESOLVE  Pipe::ShadowResolve
 #define PIPE_FLUID_SPAWN     Pipe::FluidSpawn
 #define PIPE_FLUID_MARK      Pipe::FluidMark
 #define PIPE_FLUID_ALLOC     Pipe::FluidAlloc
@@ -96,6 +99,7 @@ namespace {
 #define GRP_SLIM_FAR   Groups::SlimFar
 #define GRP_SLIM_FLUID Groups::SlimFluid
 #define GRP_SLIM_FLUIDSEAM Groups::SlimFluidSeam
+#define GRP_SHADOW     Groups::Shadow
 
 #define DYN_NONE Dyn::None
 #define DYN_ZERO Dyn::Zero
@@ -138,6 +142,7 @@ namespace {
 #define D_WATERCHUNKS     (uint32_t)DispatchSel::WaterChunks
 #define D_WATERCHUNKS64   (uint32_t)DispatchSel::WaterChunks64
 #define D_WATERDRAIN      (uint32_t)DispatchSel::WaterDrainSel
+#define IND_SHADOWARGS    (uint32_t)DispatchSel::IndShadowArgs
 
 // ---- expansion 1: the rows -----------------------------------------------
 #define R(b)  Use{Buf::b, Acc::StorageRead},

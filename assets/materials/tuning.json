@@ -517,6 +517,8 @@
     "shadowSoftFar": 9,
     "shadowLift": 0.45,
     "shadowFarLift": 0.3,
+    "shadowCache": 1,
+    "shadowCacheSubdiv": 4,
     "grainBroadScale": 11,
     "grainFineScale": 2.5,
     "grainMix": 0.68,

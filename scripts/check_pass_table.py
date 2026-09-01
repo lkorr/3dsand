@@ -106,6 +106,8 @@ PIPE_TO_MEMBER = {
     "PIPE_P_RESOLVE": "pResolve_",
     "PIPE_FAR_FILL": "farFill_",
     "PIPE_FAR_DOWN": "farDown_",
+    "PIPE_SHADOW_PREPARE": "shadowPrepare_",
+    "PIPE_SHADOW_RESOLVE": "shadowResolve_",
     "PIPE_FLUID_SPAWN": "fluidSpawn_",
     "PIPE_FLUID_MARK": "fluidMark_",
     "PIPE_FLUID_ALLOC": "fluidAlloc_",
@@ -161,6 +163,14 @@ BUF_TO_WGSL = {
     "Occupancy": {"occupancy"},
     "Hash": {"worldHash"},
     "Pick": {"pick"},
+    # Voxel-keyed shadow cache (world.h kShadowCacheBuckets). ShadowArgs is
+    # indirect-only and never bound, like DispatchArgs, so it maps to no WGSL
+    # binding name -- the empty set is what says "declared, but nothing in a
+    # shader should name it".
+    "ShadowCache": {"shadowCache"},
+    "ShadowReq": {"shadowReq"},
+    "ShadowArgsStage": {"shadowArgs"},
+    "ShadowArgs": set(),
     "RenderUBO": {"R"},
     "Reactions": {"reactions"},
     "DirtyList": {"dirtyList", "farDirty"},

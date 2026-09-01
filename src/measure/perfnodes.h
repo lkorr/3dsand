@@ -181,6 +181,12 @@ inline constexpr PerfNodeDef kPerfNodes[] = {
     {"renderPass", "Rendering", nullptr, PerfSide::Both, PerfScope::RenderCpu,
      "", "CPU here is draw-call encode and instance uploads only. The GPU cost "
      "of the frame is the raymarch row."},
+    {"shadowCache", "Shadow Cache", "renderPass", PerfSide::Gpu,
+     PerfScope::Count, "shadow_prepare;shadow_resolve",
+     "One media-blind shadow ray per visible surface PATCH, instead of one per "
+     "lit pixel inside the raymarch. Its cost belongs next to raymarch, not "
+     "inside it: this row going up while raymarch goes down by more is the "
+     "trade working (world.h kShadowCacheBuckets)."},
     {"raymarch", "Raymarch (GPU frame)", "renderPass", PerfSide::Gpu,
      PerfScope::Count, "",
      "The whole render pass, measured as one GPU span. Usually the largest "

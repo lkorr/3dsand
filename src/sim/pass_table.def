@@ -519,6 +519,44 @@ PASS(farFill, "farFill", PT_FARFILL, PIPE_FAR_FILL, K_COMPUTE, D_FARCOUNT,1,1,
      USES(R(Materials) U(TickUBO) R(FarList) U(FarUBO) R(FarPatch)
           A(FarVox) A(FarOcc) R(TreeAtlas)))
 
+// ====================================================== PT_SHADOWCACHE =====
+// Simulation::EncodeShadowResolve — the voxel-keyed shadow cache's resolve
+// (assets/shaders/shadow_resolve.wgsl, src/sim/world.h kShadowCacheBuckets).
+//
+// THIS TABLE IS PER-FRAME, NOT PER-TICK, and it is the only one that is. The
+// sim runs at 30 Hz and the renderer uncapped, so this is recorded from the
+// frame loop immediately before the render pass that reads its output — see
+// EncodeShadowResolve's own note.
+//
+// WHY IT IS ON THE TABLE AT ALL, given nothing here touches sim state: the
+// COMPUTE -> FRAGMENT hop on ShadowCache has no other source of
+// synchronisation in this engine. vk_record generates barriers from these rows
+// and from nothing else, so a resolve pass recorded outside the table would
+// have its writes read by the raymarcher with no barrier between — a race whose
+// symptom is a frame of stale or torn shadows, and one that would show up on
+// some GPUs and not others. The file header's rule ("barriers are GENERATED
+// from this table and never hand-written at a call site") is the whole reason
+// this is three rows instead of a vkCmdPipelineBarrier next to the dispatch.
+//
+// ShadowReq carries a genuine intra-table RAW that is easy to misread as a
+// self-hazard: `prepare` moves the count into the saved slot and reopens the
+// list at zero, then `resolve` reads that saved count. Both rows declare it
+// A(ShadowReq) — atomics on one buffer still need a real barrier between the
+// dispatch that writes and the dispatch that reads (§3.8).
+PASS(shadow_prepare, "shadowPrepare", PT_SHADOWCACHE, PIPE_SHADOW_PREPARE, K_COMPUTE, 1,1,1,
+     GRP_SHADOW, DYN_NONE, C_ALWAYS, 1,
+     USES(A(ShadowReq) W(ShadowArgsStage)))
+PASS(copy_shadowArgs, nullptr, PT_SHADOWCACHE, PIPE_NONE, K_COPY, 0,0,12, GRP_NONE, DYN_NONE, C_ALWAYS, 1,
+     USES(TR(ShadowArgsStage) TW(ShadowArgs)))
+// The dispatch size is a GPU-side quantity, so this is the one indirect row
+// whose count no CPU field mirrors. R(Voxels)/R(Occupancy)/R(PageTable) are the
+// march; U(RenderUBO) is the sun direction, the window origin and the frame
+// counter the bucket is stamped with.
+PASS(shadow_resolve, "shadowResolve", PT_SHADOWCACHE, PIPE_SHADOW_RESOLVE, K_INDIRECT, IND_SHADOWARGS,1,1,
+     GRP_SHADOW, DYN_NONE, C_ALWAYS, 1,
+     USES(R(Voxels) R(Occupancy) R(Materials) U(RenderUBO) R(PageTable)
+          A(ShadowCache) A(ShadowReq) I(ShadowArgs)))
+
 // =========================================================== PT_FLUID ======
 // ONE MLS-MPM SUBSTEP (docs/PLAN_mpm_fluids.md; sim_fluid.wgsl). Recorded
 // kFluidSubsteps times per tick from EncodeTick, into the TICK's command

@@ -122,12 +122,14 @@ struct Bindings {
   VkPipelineLayout slimFarLayout = VK_NULL_HANDLE;  // GRP_SLIM_FAR: slim + far
   VkPipelineLayout slimFluidLayout = VK_NULL_HANDLE;// GRP_SLIM_FLUID: slim + fluid
   VkPipelineLayout slimFluidSeamLayout = VK_NULL_HANDLE; // GRP_SLIM_FLUIDSEAM
+  VkPipelineLayout shadowLayout = VK_NULL_HANDLE;   // GRP_SHADOW: one set
   VkDescriptorSet simSet = VK_NULL_HANDLE;          // simBG_[page]
   VkDescriptorSet slimSet = VK_NULL_HANDLE;         // simSlimBG_[page]
   VkDescriptorSet particleSet = VK_NULL_HANDLE;     // particleBG_[page]
   VkDescriptorSet farSet = VK_NULL_HANDLE;          // farBG_
   VkDescriptorSet fluidSet = VK_NULL_HANDLE;        // fluidBG_
   VkDescriptorSet fluidSeamSet = VK_NULL_HANDLE;    // fluidSeamBG_[page]
+  VkDescriptorSet shadowSet = VK_NULL_HANDLE;       // shadowBG_
 };
 
 // Per-buffer last-access state. barrier_graph §3.1: the standard minimal

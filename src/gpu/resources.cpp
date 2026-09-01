@@ -77,6 +77,17 @@ static bool ReadFileText(const std::string& path, std::string& out) {
 // mismatch was silent: kVoxelMeters drifting from VOXEL_METERS just meant the
 // renderer lit the world at a different physical scale than the one the player
 // walked in. Anything derived from world.h belongs here, not in common.wgsl.
+
+// The one exception, and it is flagged rather than hidden: a DEVICE CAPABILITY,
+// not a world constant — see resources.h. Defaults true so every prelude
+// consumer that has no device (--vk-info, check_shaders.sh) assembles the
+// shipping variant of raymarch.wgsl rather than a fallback one nobody runs.
+static bool g_fragmentStoresAvailable = true;
+void SetFragmentStoresAvailable(bool available) {
+  g_fragmentStoresAvailable = available;
+}
+bool FragmentStoresAvailable() { return g_fragmentStoresAvailable; }
+
 std::string ShaderConstantPrelude() {
   std::ostringstream o;
   o << "// GENERATED from src/sim/world.h by ShaderConstantPrelude() — do not\n"
@@ -104,6 +115,26 @@ std::string ShaderConstantPrelude() {
   o << "const SUBOCC_WORDS : u32 = " << kSubOccWords << "u;\n";
   o << "const SUBOCC_STRIDE : u32 = " << kSubOccStride << "u;\n";
   o << "const SUBOCC_BASE : u32 = " << kNumChunks << "u;\n";
+  // log2(kWorldN): the shadow request record packs a window-relative cell as
+  // three fields of this width plus a 3-bit face, so it is the constant that
+  // decides whether that record still fits in a u32 (world.h static_asserts it).
+  {
+    uint32_t ws = 0;
+    while ((1u << ws) < kWorldN) ws++;
+    o << "const WORLD_SHIFT : u32 = " << ws << "u;\n";
+  }
+  // Voxel-keyed shadow cache (world.h's kShadowCacheBuckets block). Shared by
+  // raymarch.wgsl (reads + registers) and shadow_resolve.wgsl (casts + writes),
+  // which is exactly why these are generated here rather than written into
+  // either shader: two copies of a layout constant is the failure this prelude
+  // exists to prevent.
+  o << "const SHADOW_CACHE_AVAILABLE : bool = "
+    << (g_fragmentStoresAvailable ? "true" : "false") << ";\n";
+  o << "const SHADOW_CACHE_BUCKETS : u32 = " << kShadowCacheBuckets << "u;\n";
+  o << "const SHADOW_REQ_HEADER : u32 = " << kShadowReqHeaderWords << "u;\n";
+  o << "const SHADOW_REQ_WORDS : u32 = " << kShadowReqWords << "u;\n";
+  o << "const SHADOW_REQ_CAP : u32 = " << kShadowReqCap << "u;\n";
+  o << "const SHADOW_SUBDIV_MAX : u32 = " << kShadowSubdivMax << "u;\n";
   // Software page table (docs/PLAN_page_table.md §2.2). One u32 per chunk SLOT:
   // bit 31 clear = a page index into the physical pool, bit 31 set = a sentinel
   // carrying a material id in bits 0..11. EMPTY is UNIFORM(air), so there is

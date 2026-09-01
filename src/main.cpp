@@ -774,6 +774,7 @@ int RunShots(GpuContext& ctx, World& world, Simulation& sim) {
     WriteRenderParams(ctx.queue, world, eye, c, (float)W / H, true, kShotTime,
                       kFarFogDensity, 1080.0f, shotTick);
     rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
+    sim.EncodeShadowResolve(enc);
     rhi::RenderPass rp =
         sim.BeginRenderPass(enc, view, rhi::TextureFormat::RGBA8Unorm, W, H);
     sim.DrawWorld(rp);
@@ -1464,6 +1465,7 @@ int RunFluidShot(GpuContext& ctx, World& world, Simulation& sim,
     WriteRenderParams(ctx.queue, world, eye, c, (float)W / H, true, 11.7f,
                       kFarFogDensity, 1080.0f, shotTick, fluidCount);
     rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
+    sim.EncodeShadowResolve(enc);
     rhi::RenderPass rp =
         sim.BeginRenderPass(enc, view, rhi::TextureFormat::RGBA8Unorm, W, H);
     sim.DrawWorld(rp);
@@ -1768,6 +1770,7 @@ int RunMobShot(GpuContext& ctx, World& world, Simulation& sim, Physics& phys,
     // Upload BEFORE the render pass opens (barrier graph §4.6).
     uint32_t microCount = sim.UploadMicroBodyInsts(ctx.queue, microInsts);
     rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
+    sim.EncodeShadowResolve(enc);
     rhi::RenderPass rp = sim.BeginRenderPass(
         enc, tex.CreateView(), rhi::TextureFormat::RGBA8Unorm, W, H);
     sim.DrawWorld(rp);
@@ -7201,6 +7204,10 @@ int main(int argc, char** argv) {
           liveRenderTimer.AllocPassPair("render", liveRb, liveRe);
       if (liveRenderTimed)
         enc.WriteTimestamp(liveRenderTimer.NativeQuerySet(), liveRb, false);
+      // INSIDE the timestamp bracket on purpose: the resolve pass is part of
+      // what a shadow costs, so a "render" number that excluded it would flatter
+      // the cache by moving its work out of the measurement.
+      sim.EncodeShadowResolve(enc);
       rhi::RenderPass rp = sim.BeginRenderPass(enc, target, ctx.surfaceFormat,
                                                        ctx.width, ctx.height);
       sim.DrawWorld(rp);
@@ -7249,6 +7256,7 @@ int main(int argc, char** argv) {
             rhi::TextureUsage::RenderAttachment | rhi::TextureUsage::CopySrc,
             "inventoryShot");
         rhi::CommandEncoder senc = ctx.device.CreateCommandEncoder();
+        sim.EncodeShadowResolve(senc);
         rhi::RenderPass srp = sim.BeginRenderPass(
             senc, shotTex.CreateView(), ctx.surfaceFormat, W, H);
         sim.DrawWorld(srp);

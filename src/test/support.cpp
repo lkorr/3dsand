@@ -89,6 +89,16 @@ void WriteRenderParams(const rhi::Queue& queue, const World& world,
   rp.aspect = aspect;
   rp.time = time;
   rp.flags = (shadows ? 1u : 0u) | extraFlags;
+  // ---- the shadow cache's clock (world.h kShadowCacheBuckets) ----
+  // ONE CALL HERE IS ONE RENDERED FRAME, which is exactly the clock the cache
+  // needs and the reason the counter lives in this function rather than in the
+  // frame loop: every path that draws (the game loop, --shot, the lab, the perf
+  // harness, the character portrait) writes render params first, so none of
+  // them can forget to advance it. Wraps at 2^32 and only the low 4 bits are
+  // compared, so the wrap is a non-event.
+  static uint32_t renderFrame = 0;
+  rp.frameIdx = ++renderFrame;
+  rp.shadowSubdiv = (uint32_t)CurrentTuning().render.shadowCacheSubdiv;
   // ~41 deg elevation: low enough that terrain and canopy cast readable
   // shadows (near field AND the far-field cascade shadow march), high enough
   // that valleys aren't pits. The old 0.78 y put the sun ~52 deg up and

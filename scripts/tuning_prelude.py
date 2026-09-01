@@ -127,6 +127,8 @@ SPEC = [
     ("render", "shadowSoftFar", "TUNE_SHADOW_SOFT_FAR", "f", 9.0),
     ("render", "shadowLift", "TUNE_SHADOW_LIFT", "f", 0.45),
     ("render", "shadowFarLift", "TUNE_SHADOW_FAR_LIFT", "f", 0.3),
+    ("render", "shadowCache", "TUNE_SHADOW_CACHE", "i", 1),
+    ("render", "shadowCacheSubdiv", "TUNE_SHADOW_CACHE_SUBDIV", "i", 4),
 
     # grain
     ("render", "grainBroadScale", "TUNE_GRAIN_BROAD_SCALE", "f", 11.0),

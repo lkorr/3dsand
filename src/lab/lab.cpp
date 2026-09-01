@@ -1062,6 +1062,7 @@ int RunFluidBench(GpuContext& ctx, World& world, Simulation& sim,
       WriteRenderParams(ctx.queue, world, eye, cam, (float)W / H, true, 11.7f,
                         kFarFogDensity, (float)H, skyTick, liveEst);
       rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
+      sim.EncodeShadowResolve(enc);
       rhi::RenderPass rp =
           sim.BeginRenderPass(enc, view, rhi::TextureFormat::RGBA8Unorm, W, H);
       sim.DrawWorld(rp);
@@ -1092,6 +1093,7 @@ int RunFluidBench(GpuContext& ctx, World& world, Simulation& sim,
           WriteRenderParams(ctx.queue, world, eye, cam, (float)W / H, true,
                             11.7f, kFarFogDensity, (float)H, skyTick, 0);
           rhi::CommandEncoder aenc = ctx.device.CreateCommandEncoder();
+          sim.EncodeShadowResolve(aenc);
           rhi::RenderPass arp = sim.BeginRenderPass(
               aenc, view, rhi::TextureFormat::RGBA8Unorm, W, H);
           sim.DrawWorld(arp);

@@ -73,12 +73,16 @@ struct TableBindings {
   PipelineLayout slimFarLayout;   // GRP_SLIM_FAR (farPL_)
   PipelineLayout slimFluidLayout; // GRP_SLIM_FLUID (fluidPL_)
   PipelineLayout slimFluidSeamLayout; // GRP_SLIM_FLUIDSEAM (fluidSeamPL_)
+  PipelineLayout shadowLayout;    // GRP_SHADOW (shadowPL_) — ONE set, unlike
+                                  // every Slim* pair above: the resolve pass
+                                  // shares no buffer with the sim groups.
   BindGroup simSet;               // simBG_[page]
   BindGroup slimSet;              // simSlimBG_[page]
   BindGroup particleSet;          // particleBG_[page]
   BindGroup farSet;               // farBG_
   BindGroup fluidSet;             // fluidBG_
   BindGroup fluidSeamSet;         // fluidSeamBG_[page]
+  BindGroup shadowSet;            // shadowBG_
 };
 
 // Record one table through the encoder's generated-barrier recorder. This is

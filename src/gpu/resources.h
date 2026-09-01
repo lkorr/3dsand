@@ -38,6 +38,20 @@ void DumpGpuBufferBudget(const char* whenLabel);
 // a constant means adding it there too.
 std::string ShaderConstantPrelude();
 
+// Whether this device enabled fragmentStoresAndAtomics, which the shadow cache
+// needs because raymarch.wgsl WRITES its bucket table (world.h
+// kShadowCacheBuckets). Set once from GpuContext::Init and emitted by the
+// prelude above as `SHADOW_CACHE_AVAILABLE`.
+//
+// A CAPABILITY, NOT A PREFERENCE, and the two are deliberately separate
+// constants: this one says the hardware can, `TUNE_SHADOW_CACHE` says we want
+// to. raymarch.wgsl ANDs them, so either can turn the cache off and only the
+// tuning one is hot-reloadable. Defaults true so --vk-info, check_shaders.sh
+// and any other consumer that assembles the prelude without a device still
+// compiles the shipping variant of the shader.
+void SetFragmentStoresAvailable(bool available);
+bool FragmentStoresAvailable();
+
 // Loads assets/shaders/common.wgsl + the named file, concatenated behind the
 // generated world-constant + tuning preludes, and compiles the result. Returns
 // an invalid module on read failure.

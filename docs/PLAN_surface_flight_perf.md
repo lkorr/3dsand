@@ -661,6 +661,39 @@ altitude curve is gone. What is left in the surface frame is **render + CA**, no
 
 Ranked, for whoever picks this up:
 
+0. **ANSWERED (2026-09-01): the second lever in the A3 note — "cast fewer of
+   them" — was taken, and it is the voxel-keyed shadow cache** (`src/sim/world.h`
+   kShadowCacheBuckets, `assets/shaders/shadow_resolve.wgsl`). Item 1 below says
+   a future renderer win "has to come from somewhere this plan never named"; in
+   fact it came from a lever this plan DID name and never tried.
+
+   Measured, `--render-budget`, RTX 3060 Ti, overlook cam, 1080p, one process:
+
+   ```
+   nocache (inline per-pixel shadow ray, the old path)   14.61 ms
+   baseline (shadow cache on)                            12.84 ms   -1.77, ~12%
+   ```
+
+   **The interesting half is why it is a third of the predicted win.** The
+   attribution that decided it is now permanent in `--render-budget`'s output:
+   *177,703 patches requested for 2,073,600 pixels — 8.57 per 100 px, 0 refused.*
+   So the deduplication works exactly as designed (11.7x fewer rays) and the
+   request cap is not binding. What changed is the COST PER RAY: 1.35M rays cost
+   2.29 ms inside the fragment shader (1.7 ns each), 177k cost ~3.9 ms in the
+   compute pass (22 ns each).
+
+   **Moving the rays out of the fragment shader made them incoherent.** Adjacent
+   pixels cast adjacent rays; a request list built by `atomicAdd` in shading
+   order does not. A wavefront that used to march one neighbourhood now marches
+   64 unrelated ones. Cutting the ray count further buys almost nothing (subdiv
+   4 -> 1 is 0.55 ms), which is the signature of a pass bound by locality rather
+   than by work — so the next step is a Morton sort of the request list, not a
+   coarser patch.
+
+   What the cache DID recover is the register footprint this plan's Correction 6
+   identified: `noshadow` went from -2.29 ms to -0.42 ms, i.e. the fragment
+   shader has essentially stopped caring about shadows at all.
+
 1. ~~**Part A (renderer).** A2's sub-chunk occupancy bitmask and A6's column-probe
    hoist, against a ~9-10 ms offscreen budget.~~ **PART A IS CLOSED — see Correction 6.**
    The offscreen budget is ~6 ms, not 9-10; the entire in-window fine primary march is

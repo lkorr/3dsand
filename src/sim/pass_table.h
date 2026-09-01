@@ -114,6 +114,18 @@ enum class Buf : uint8_t {
   // read that the table does not know about is the failure mode this file
   // exists to make impossible.
   TreeAtlas,
+  // ---- the voxel-keyed shadow cache (world.h kShadowCacheBuckets) ----
+  // RENDER-side buffers, on the table for the same reason TreeAtlas is: a
+  // hazard the table does not know about generates no barrier. The resolve
+  // compute pass WRITES ShadowCache and the fragment shader READS it in the
+  // same command buffer, which is the exact compute->fragment hop that has no
+  // other source of synchronisation in this engine.
+  //
+  // ShadowArgs is indirect-only and never bound, like DispatchArgs.
+  ShadowCache,
+  ShadowReq,
+  ShadowArgsStage,
+  ShadowArgs,
   kCount,
 };
 
@@ -175,11 +187,20 @@ enum class Pipe : uint8_t {
   // M5: the scheduled container sweep and its split labelling.
   WaterSweep, WaterSplit,
   FarFill, FarDown,
+  // Voxel-keyed shadow cache (shadow_resolve.wgsl). AFTER FarDown, which the
+  // note at the fluid block says must stay last — so the copy loop's bound in
+  // Simulation::RecordTable moves to ShadowResolve with these. Both are render
+  // -path passes: they run once per FRAME from EncodeShadowResolve, not on the
+  // tick table.
+  ShadowPrepare, ShadowResolve,
 };
 
 // Bind-group set. GRP_SIM also carries the dynamic passUBO offset.
 enum class Groups : uint8_t { None, Sim, SlimPart, SlimFar, SlimFluid,
-                              SlimFluidSeam };
+                              SlimFluidSeam,
+                              // shadowBGL_ — voxels/occupancy/materials/
+                              // renderUBO/pageTable plus the cache's own three.
+                              Shadow };
 
 // Dynamic passUBO offset selector.
 //   None  no dynamic offset (the row's groups have none)
@@ -261,7 +282,11 @@ enum class Cond : uint8_t {
 // (grid WAW against the next clear, particle RAW into the next mark) are
 // generated exactly like intra-table ones.
 enum class Table : uint8_t { Tick, Worldgen, GenList, LoadReset, HashOnly, FarFill,
-                             FluidMap, Fluid, FluidSeam, FluidSettle, PageFill };
+                             FluidMap, Fluid, FluidSeam, FluidSettle, PageFill,
+                             // Per-FRAME, not per-tick: recorded by
+                             // EncodeShadowResolve immediately before the
+                             // render pass that consumes it.
+                             ShadowCache };
 
 // Dispatch extents. Values >= kDynBase are selectors resolved at record time
 // from the tick's counts; anything below is a literal extent. Indirect rows put
@@ -294,6 +319,12 @@ enum class DispatchSel : uint32_t {
   // to be written every tick it exists — a slot the pass skipped keeps a
   // stale particle that spawnAppend would hand back to the pool as live.
   WaterDrainSel,     // (waterDrainBodies * kWaterDrainOpsPerBody + 63) / 64
+  // ---- shadow cache ----
+  // Indirect: world.shadowArgs @ 0. The count is a GPU-side quantity (the
+  // fragment shader appended it last frame), so the dispatch size cannot come
+  // from a TableCtx field the way farCount does — nothing on the CPU knows it,
+  // and asking would mean a readback in the frame path.
+  IndShadowArgs,
 };
 
 // Max `uses` entries on any row. Asserted against the widest row at compile

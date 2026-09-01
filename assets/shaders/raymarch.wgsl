@@ -36,6 +36,36 @@
 @group(0) @binding(11) var<storage, read> fluidGridR : array<i32>;
 @group(0) @binding(12) var<storage, read> dirtyViz : array<u32>;
 @group(0) @binding(13) var<storage, read> actVoxViz : array<u32>;
+// ---- the voxel-keyed shadow cache (world.h kShadowCacheBuckets) ----
+// THE ONLY BUFFERS THIS SHADER WRITES, and the only fragment-stage storage
+// writes in the engine (they need Caps::fragmentStoresAndAtomics). The
+// "renderer never writes" rule this bind group is otherwise built on is about
+// WORLD state: these two are render-private scratch the renderer produced
+// itself, invisible to the sim and to the world hash.
+@group(0) @binding(14) var<storage, read_write> shadowCache : array<atomic<u32>>;
+@group(0) @binding(15) var<storage, read_write> shadowReq : array<atomic<u32>>;
+
+// Is the cache compiled in at all? Both halves must say yes:
+//   SHADOW_CACHE_AVAILABLE — the device enabled fragmentStoresAndAtomics
+//                            (gpu/resources.h; a capability)
+//   TUNE_SHADOW_CACHE      — render.shadowCache in tuning.json (a preference,
+//                            hot-reloadable on F5, and the A/B arm)
+//
+// A CONST AND NOT A RUNTIME BRANCH, which is the entire point. --render-budget
+// on an RTX 3060 Ti (overlook cam, 1080p, 2026-09-01) separates the two halves
+// of what a shadow costs:
+//
+//   noshadow  shadows off via the RenderParams bit, call site still compiled
+//             in                                        -2.29 ms
+//   shadow0   shadowSteps 384 -> 0, so Tint folds the whole call away
+//                                                       -5.88 ms
+//
+// The difference, 3.59 ms, is the REGISTER FOOTPRINT of the trace() call site
+// existing in this shader at all — 1.6x the cost of every shadow ray it casts.
+// A runtime `if (cacheHit)` around an inline trace() would keep that footprint
+// and hand back the larger half of the win, so the miss path below casts no ray
+// and the call site disappears from the compiled fragment shader.
+const SHADOW_CACHE : bool = SHADOW_CACHE_AVAILABLE && TUNE_SHADOW_CACHE != 0;
 
 fn isVoxActive(idx : u32) -> bool {
   return (actVoxViz[idx >> 5u] & (1u << (idx & 31u))) != 0u;
@@ -2530,6 +2560,83 @@ fn sunShadowAt(hp : vec3f, n : vec3f, px : vec2f, camDistFine : f32) -> f32 {
 // reflection budget) keep the full-quality near shadow.
 fn sunShadow(hp : vec3f, n : vec3f, px : vec2f) -> f32 {
   return sunShadowAt(hp, n, px, 0.0);
+}
+
+// ---- THE CACHED SHADOW (world.h kShadowCacheBuckets) -----------------------
+// Reads one shadow factor for the PATCH this hit lands on, and registers that
+// patch so shadow_resolve.wgsl casts its ray at the head of the next frame.
+//
+// NOTE WHAT IS ABSENT: there is no trace() here and no fallback ray. That is
+// the design, not an omission — see the SHADOW_CACHE const at the top of this
+// file for the 3.59 ms of register footprint an inline fallback would cost.
+//
+// THE PATCH, NOT THE PIXEL, IS THE UNIT. Every pixel landing on the same
+// (voxel, face, sub-patch) gets the identical answer, which is what turns
+// ~1.35M shadow rays per frame into ~200k. The quantisation that buys is
+// R.shadowSubdiv-controlled and is a quality knob (world.h).
+//
+// Takes the hit's axis and sign rather than the shading normal: `n` at the call
+// site may be perturbed, and the face this patch belongs to must be the
+// geometric one or two pixels on one face would key to different patches.
+fn shadowCached(hp : vec3f, cell : vec3<i32>, axis : i32, sgn : f32) -> f32 {
+  let subdiv = clamp(R.shadowSubdiv, 1u, SHADOW_SUBDIV_MAX);
+  // The DDA reports sgn = sign(rd[axis]), so the outward face normal points the
+  // other way: a ray travelling -x enters through the +x face.
+  let face = shadowFaceOf(axis, sgn < 0.0);
+  let sub = shadowSubOf(hp, cell, face, subdiv);
+  let packedCell = shadowPackCell(cell - R.origin * i32(CHUNK), face);
+  let packedSub = shadowPackSub(sub.x, sub.y);
+  let key = shadowPatchKey(packedCell, packedSub);
+  let bucket = shadowBucketOf(key);
+  let curFrame = R.frameIdx & 15u;
+
+  // Read BOTH words before touching anything: this is the state the answer is
+  // taken from, and registration below must not be able to change it underfoot.
+  let prevKey = atomicLoad(&shadowCache[bucket * 2u]);
+  let state = atomicLoad(&shadowCache[bucket * 2u + 1u]);
+  let mine = (prevKey == key);
+  let fresh = mine && shadowStateValid(state) &&
+              shadowStateResolved(state) == curFrame;
+
+  // ---- registration ----
+  // Re-register on EVERY frame, hit or miss: the resolve pass recomputes every
+  // requested patch every frame, which is what keeps staleness to the request
+  // set alone and means destruction re-lights immediately with no invalidation
+  // machinery anywhere.
+  //
+  // One appender per patch per frame, elected by the atomicExchange: every
+  // pixel of a fresh patch swaps the current frame stamp in, and only the one
+  // that got back a STALE stamp appends. Without this election a 1000-pixel
+  // patch would enqueue 1000 identical requests on the frame it appears.
+  if (!mine || shadowStateRequested(state) != curFrame) {
+    // Stealing the bucket invalidates it. Keeping our own preserves the value
+    // other pixels are still reading this frame.
+    let claimed = atomicExchange(
+        &shadowCache[bucket * 2u + 1u],
+        shadowPackState(select(0u, state & 0xFFu, mine),
+                        select(0u, shadowStateResolved(state), mine), curFrame,
+                        mine && shadowStateValid(state)));
+    if (shadowStateRequested(claimed) != curFrame) {
+      atomicStore(&shadowCache[bucket * 2u], key);
+      let slot = atomicAdd(&shadowReq[0], 1u);
+      // Over the cap the patch is simply not registered: it misses next frame
+      // and shades unshadowed. Counted in prepare()'s stats words, never fatal
+      // — the failure is a slightly wrong patch, not a lost voxel.
+      if (slot < SHADOW_REQ_CAP) {
+        let base = SHADOW_REQ_HEADER + slot * SHADOW_REQ_WORDS;
+        atomicStore(&shadowReq[base], key);
+        atomicStore(&shadowReq[base + 1u], bucket);
+        atomicStore(&shadowReq[base + 2u], packedCell);
+        atomicStore(&shadowReq[base + 3u], packedSub);
+      }
+    }
+  }
+
+  // MISS DEFAULT: unshadowed. A patch with no fresh value has never been
+  // resolved — first frame, a disocclusion, or a collision evicted it — and the
+  // alternative, a stale neighbour's value, would be a WRONG shadow rather than
+  // a missing one. Bright for one frame, then correct.
+  return select(1.0, shadowStateValue(state), fresh);
 }
 
 // ============================================================================
@@ -6416,7 +6523,22 @@ fn fs(in : VSOut) -> FSOut {
     if (lambert > 0.0 && (R.flags & 1u) != 0u) {
       // h.t is the receiver's distance from the camera in fine voxels, which
       // is what picks the near (per-voxel) or cascade shadow — see sunShadowAt.
-      lambert *= sunShadowAt(R.camPos + rd * (h.t - 1e-3), n, in.pos.xy, h.t);
+      let hitP = R.camPos + rd * (h.t - 1e-3);
+      // THE CACHE COVERS THE FINE PATH ONLY. Past TUNE_SHADOW_MAX_DIST the
+      // receiver is served by the cascade (farShadowed), which reads farVox /
+      // farOcc — buffers the resolve pass does not bind, and does not need to:
+      // that branch is dead at the shipped 999 m and exists for the A3
+      // experiment. Leaving it on the direct path keeps that experiment
+      // re-runnable and keeps the cache out of a code path it cannot answer.
+      //
+      // This IS the one remaining trace-shaped call site in the shader, but it
+      // is farShadowed's own cascade march, not trace() — a much smaller
+      // register footprint, and it was already here.
+      if (SHADOW_CACHE && h.t * VOXEL_METERS <= TUNE_SHADOW_MAX_DIST) {
+        lambert *= shadowCached(hitP, h.cell, h.axis, h.sgn);
+      } else {
+        lambert *= sunShadowAt(hitP, n, in.pos.xy, h.t);
+      }
     }
     // Direct sun + hemisphere ambient. Ambient is occluded by AO (it is sky
     // light, and AO measures how much sky the point can see); direct sun is

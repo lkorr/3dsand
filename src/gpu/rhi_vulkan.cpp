@@ -472,6 +472,7 @@ void Backend::QueryCaps() {
   ifn_.GetPhysicalDeviceFeatures(phys_, &f);
   caps_.sparseBinding = f.sparseBinding != 0;
   caps_.sparseResidencyBuffer = f.sparseResidencyBuffer != 0;
+  caps_.fragmentStoresAndAtomics = f.fragmentStoresAndAtomics != 0;
 
   // maxMemoryAllocationSize is a Vulkan 1.1 (maintenance3) property.
   if (ifn_.GetPhysicalDeviceProperties2) {
@@ -496,6 +497,10 @@ bool Backend::CreateLogicalDevice(std::string& err) {
   VkPhysicalDeviceFeatures want{};
   want.sparseBinding = caps_.sparseBinding;
   want.sparseResidencyBuffer = caps_.sparseResidencyBuffer;
+  // The shadow cache is the only fragment-stage storage write in the engine.
+  // Requested when present rather than demanded: see the cap's note in
+  // rhi_vulkan.h for why absence downgrades the renderer instead of failing it.
+  want.fragmentStoresAndAtomics = caps_.fragmentStoresAndAtomics;
 
   // SYNCHRONIZATION2 IS MANDATORY FOR PHASE 3b, and asking for it is not
   // optional decoration: vkCmdPipelineBarrier2 is core in Vulkan 1.3, which

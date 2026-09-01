@@ -160,6 +160,8 @@ TP_F(render, shadowSoftNear, TUNE_SHADOW_SOFT_NEAR, 0.6f)
 TP_F(render, shadowSoftFar, TUNE_SHADOW_SOFT_FAR, 9.0f)
 TP_F(render, shadowLift, TUNE_SHADOW_LIFT, 0.45f)
 TP_F(render, shadowFarLift, TUNE_SHADOW_FAR_LIFT, 0.3f)
+TP_I(render, shadowCache, TUNE_SHADOW_CACHE, 1)
+TP_I(render, shadowCacheSubdiv, TUNE_SHADOW_CACHE_SUBDIV, 4)
 
 // ---- grain ----
 TP_F(render, grainBroadScale, TUNE_GRAIN_BROAD_SCALE, 11.0f)

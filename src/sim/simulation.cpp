@@ -298,6 +298,18 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         entry(11, T::ReadOnlyStorage, S::Fragment),              // fluidGrid
         entry(12, T::ReadOnlyStorage, S::Fragment),              // dirtyViz
         entry(13, T::ReadOnlyStorage, S::Fragment),  // actVoxViz
+        // THE ONE WRITABLE ENTRY IN THE RENDER BIND GROUP, and the invariant
+        // stated above still holds: "the renderer must never write THE WORLD".
+        // shadowCache is render-PRIVATE derived data (world.h) — not sim state,
+        // not hashed, not saved, and the sim has no binding for it, so the
+        // sim -> render arrow is unchanged. What flows the other way is a
+        // render-only value the renderer itself produced last frame.
+        //
+        // Needs Caps::fragmentStoresAndAtomics, which is requested at device
+        // creation; the SHADOW_CACHE prelude const is false without it, and
+        // then this entry is bound but never written.
+        entry(14, T::Storage, S::Fragment),  // shadowCache
+        entry(15, T::Storage, S::Fragment),  // shadowReq (the append list)
     };
     renderBGL_ = device.CreateBindGroupLayout(entries, std::size(entries));
 
@@ -470,8 +482,52 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         b(11, world_->fluidGrid),
         b(12, world_->dirtyViz),
         b(13, world_->actVoxViz),
+        b(14, world_->shadowCache),
+        b(15, world_->shadowReq),
     };
     renderBG_ = device.CreateBindGroup(renderBGL_, entries, std::size(entries), "renderBG");
+  }
+  // ---- the shadow-cache resolve pass (shadow_resolve.wgsl) ----
+  // Its OWN layout rather than a reuse of renderBGL_ with widened visibility:
+  // this is a COMPUTE pass, and adding S::Compute to thirteen fragment-only
+  // render entries to serve one kernel would relax the stage mask on every
+  // buffer the renderer reads. The overlap (voxels, occupancy, materials,
+  // renderUBO, pageTable, shadowCache) is six bindings, and a buffer being in
+  // two bind groups is free.
+  {
+    auto entry = [](uint32_t binding, rhi::BufferBindingType type) {
+      rhi::BindGroupLayoutEntry e{};
+      e.binding = binding;
+      e.visibility = rhi::ShaderStage::Compute;
+      e.type = type;
+      return e;
+    };
+    using T = rhi::BufferBindingType;
+    rhi::BindGroupLayoutEntry entries[] = {
+        entry(0, T::ReadOnlyStorage),  // voxels
+        entry(1, T::ReadOnlyStorage),  // occupancy
+        entry(2, T::ReadOnlyStorage),  // materials
+        entry(3, T::Uniform),          // renderUBO
+        entry(4, T::ReadOnlyStorage),  // pageTable
+        entry(5, T::Storage),          // shadowCache
+        entry(6, T::Storage),          // shadowReq
+        entry(7, T::Storage),          // shadowArgsStage
+    };
+    shadowBGL_ = device.CreateBindGroupLayout(entries, std::size(entries));
+
+    rhi::BindGroupEntry bges[] = {
+        b(0, world_->voxels),
+        b(1, world_->occupancy),
+        b(2, materialBuf_),
+        b(3, world_->renderUBO),
+        b(4, world_->pageTable),
+        b(5, world_->shadowCache),
+        b(6, world_->shadowReq),
+        b(7, world_->shadowArgsStage),
+    };
+    shadowBG_ = device.CreateBindGroup(shadowBGL_, bges, std::size(bges), "shadowBG");
+    rhi::BindGroupLayout shadowGroups[] = {shadowBGL_};
+    shadowPL_ = device.CreatePipelineLayout(shadowGroups, 1);
   }
   {
     rhi::BindGroupEntry entries[] = {
@@ -686,6 +742,10 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   rhi::ShaderModule mStep = mod("sim_step.wgsl");
   rhi::ShaderModule mOcc = mod("sim_occupancy.wgsl");
   rhi::ShaderModule mPick = mod("sim_pick.wgsl");
+  // The shadow cache's resolve. A RENDER-path module living among the sim ones
+  // because BuildPipelines is the single place F5 recompiles, and the cache's
+  // enable flag has to be recomputed in lockstep with raymarch.wgsl's const.
+  rhi::ShaderModule mShadow = mod("shadow_resolve.wgsl");
   rhi::ShaderModule mExplode = mod("sim_explode.wgsl");
   rhi::ShaderModule mParticle = mod("sim_particle.wgsl");
   rhi::ShaderModule mFluid = mod("sim_fluid.wgsl");
@@ -712,6 +772,19 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   pageFill_ = MakeComputePipeline(device, simPL_, mWorldgen, "pagefill", "pageFill");
   farFill_ = MakeComputePipeline(device, farPL_, mWorldgen, "far", "farFill");
   farDown_ = MakeComputePipeline(device, farPL_, mWorldgen, "fardown", "farDown");
+  // The shadow cache's two render-path kernels. Loaded unconditionally even
+  // when the cache is compiled out of raymarch.wgsl: the pipelines are cheap,
+  // and EncodeShadowResolve is what decides whether they ever run, so the
+  // enable path is ONE test in one place rather than a load-time fork.
+  shadowPrepare_ = MakeComputePipeline(device, shadowPL_, mShadow, "prepare", "shadowPrepare");
+  shadowResolve_ = MakeComputePipeline(device, shadowPL_, mShadow, "resolve", "shadowResolve");
+  // Decided HERE, in the function that also compiles raymarch.wgsl, and from the
+  // same two inputs its SHADOW_CACHE const is built from. That co-location is
+  // the point: the pass and the shader must agree, and F5 recompiles both
+  // through this function, so a tuning flip cannot leave one side switched.
+  shadowCacheOn_ = FragmentStoresAvailable() &&
+                   CurrentTuning().render.shadowCache != 0 &&
+                   (bool)shadowPrepare_ && (bool)shadowResolve_;
   mutate_ = MakeComputePipeline(device, simPL_, mMutate, "main", "mutate");
   mutateCells_ = MakeComputePipeline(device, simPL_, mMutate, "cells", "mutateCells");
   // The wind primitive footprint wake — same module, third entry point. It
@@ -947,6 +1020,10 @@ const rhi::Buffer& Simulation::PassBuffer(pass::Buf b) const {
     case B::FluidCellScratch:    return world_->fluidCellScratch;
     case B::FluidMirror:         return world_->fluidMirror;
     case B::ActVoxViz:           return world_->actVoxViz;
+    case B::ShadowCache:         return world_->shadowCache;
+    case B::ShadowReq:           return world_->shadowReq;
+    case B::ShadowArgsStage:     return world_->shadowArgsStage;
+    case B::ShadowArgs:          return world_->shadowArgs;
     case B::WaterBodyState:      return world_->waterBodyState;
     case B::TreeAtlas:           return treeAtlasBuf_;
     default:                return world_->voxels;
@@ -977,6 +1054,8 @@ const rhi::ComputePipeline& Simulation::PassPipeline(pass::Pipe p) const {
     case P::PResolve:       return pResolve_;
     case P::FarFill:        return farFill_;
     case P::FarDown:        return farDown_;
+    case P::ShadowPrepare:  return shadowPrepare_;
+    case P::ShadowResolve:  return shadowResolve_;
     case P::FluidSpawn:     return fluidSpawn_;
     case P::FluidMark:      return fluidMark_;
     case P::FluidAlloc:     return fluidAlloc_;
@@ -1056,19 +1135,24 @@ void Simulation::RecordTable(const rhi::CommandEncoder& enc, pass::Table which,
   rhi::TableBindings tb{};
   for (int i = 0; i < (int)pass::Buf::kCount; i++)
     tb.buffers[i] = PassBuffer((pass::Buf)i);
-  for (int i = 1; i < (int)pass::Pipe::FarDown + 1; i++)
+  // Bound by the LAST enumerator, which is what the note in pass_table.h's
+  // Pipe block is about: a pipeline added past this bound is silently never
+  // handed to the recorder, which reads as a skipped row rather than a crash.
+  for (int i = 1; i < (int)pass::Pipe::ShadowResolve + 1; i++)
     tb.pipelines[i] = PassPipeline((pass::Pipe)i);
   tb.simLayout = simPL_;
   tb.slimPartLayout = simPL2_;
   tb.slimFarLayout = farPL_;
   tb.slimFluidLayout = fluidPL_;
   tb.slimFluidSeamLayout = fluidSeamPL_;
+  tb.shadowLayout = shadowPL_;
   tb.simSet = simBG_[page_];
   tb.slimSet = simSlimBG_[page_];
   tb.particleSet = particleBG_[page_];
   tb.farSet = farBG_;
   tb.fluidSet = fluidBG_[page_];
   tb.fluidSeamSet = fluidSeamBG_[page_];
+  tb.shadowSet = shadowBG_;
 
   rhi::RecordTableVulkan(enc, which, tc, tb,
                          passTimer_ && passTimer_->Valid() ? passTimer_ : nullptr);
@@ -1101,6 +1185,12 @@ void Simulation::EncodeFarFill(const rhi::CommandEncoder& enc, uint32_t count) {
   RecordCtx cx{};
   cx.farCount = count;
   RecordTable(enc, pass::Table::FarFill, &cx);
+}
+
+void Simulation::EncodeShadowResolve(const rhi::CommandEncoder& enc) {
+  if (!shadowCacheOn_) return;
+  RecordCtx cx{};
+  RecordTable(enc, pass::Table::ShadowCache, &cx);
 }
 
 // Materialize `count` JITTER pages from the (slot, entry) pairs the caller has

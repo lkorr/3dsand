@@ -63,8 +63,7 @@
   "ai-dummy": "pass",
   "ai-face": "pass",
   "ai-approach": "pass",
-
-  "_ai_about": "Thresholds for the NPC AI gates (game/ai_behavior.h). Ranges are WORLD VOXELS centre-to-centre, times are 30 Hz sim TICKS. aiDummyMaxDriftVox/aiDummyMaxTurnRad are effectively zero on purpose: the `dummy` profile authorizes no drive and no turn at all, so anything above float noise is a code path that ignored the data rather than a tuning question. aiFaceToleranceRad is the facing error a static swordsman may settle at — it is a CONVERGENCE bound, checked after the turn has had aiFaceSettleTicks to finish, not a per-tick one. aiApproachOutOfBandTicks allows a few ticks outside the band over the whole hold window: a duelist that has just committed an attack deliberately gives ground, and the disengage step can graze the outer edge. The gate also records aiApproachArriveTick and aiFlatSpotRelief, which are MEASUREMENTS (how long the detour took, how flat the fixture's ground actually was) rather than bounds — a jump in either is what says 'the terrain moved' instead of 'the AI broke'.",
+  "_ai_about": "Thresholds for the NPC AI gates (game/ai_behavior.h). Ranges are WORLD VOXELS centre-to-centre, times are 30 Hz sim TICKS. aiDummyMaxDriftVox/aiDummyMaxTurnRad are effectively zero on purpose: the `dummy` profile authorizes no drive and no turn at all, so anything above float noise is a code path that ignored the data rather than a tuning question. aiFaceToleranceRad is the facing error a static swordsman may settle at \u00e2\u20ac\u201d it is a CONVERGENCE bound, checked after the turn has had aiFaceSettleTicks to finish, not a per-tick one. aiApproachOutOfBandTicks allows a few ticks outside the band over the whole hold window: a duelist that has just committed an attack deliberately gives ground, and the disengage step can graze the outer edge. The gate also records aiApproachArriveTick and aiFlatSpotRelief, which are MEASUREMENTS (how long the detour took, how flat the fixture's ground actually was) rather than bounds \u00e2\u20ac\u201d a jump in either is what says 'the terrain moved' instead of 'the AI broke'.",
   "aiDummyTicks": "90",
   "aiDummyMaxDriftVox": "0.001",
   "aiDummyMaxTurnRad": "0.001",
@@ -79,8 +78,7 @@
   "aiApproachMinClearVox": "3.0",
   "aiApproachOutOfBandTicks": "12",
   "aiApproachMinAttacks": "2",
-
-  "_waterbody_about": "Thresholds for the `waterbody` gate (docs/PLAN_water_master.md M1). The *TolPct and *Max keys are BOUNDS the gate fails against; the gate also records what it MEASURED through --rebaseline (waterbodyVolErrPct, waterbodyAreaErrPct, waterbodyBowlColumnErrPct, waterbodySurfaceSpread, waterbodyAwakeChunks). As of the M1 landing every measured error is EXACTLY 0.00% — the analytic container curve reproduces the authored lake's 2,782,656 eighths and 14,493 surface cells cell for cell, and the parabolic bowl's level-walk matches its column-walk at 128,214 cells on a real r54 tarn. The tolerance is 2% rather than 0 because the WORLD is not obliged to stay that way: pond life replaces water cells with kelp and reeds, and a ruin or a cave could intrude. A non-zero number here is not automatically a bug, but it IS a number that wants explaining before M2's ledger is built on the curve.",
+  "_waterbody_about": "Thresholds for the `waterbody` gate (docs/PLAN_water_master.md M1). The *TolPct and *Max keys are BOUNDS the gate fails against; the gate also records what it MEASURED through --rebaseline (waterbodyVolErrPct, waterbodyAreaErrPct, waterbodyBowlColumnErrPct, waterbodySurfaceSpread, waterbodyAwakeChunks). As of the M1 landing every measured error is EXACTLY 0.00% \u00e2\u20ac\u201d the analytic container curve reproduces the authored lake's 2,782,656 eighths and 14,493 surface cells cell for cell, and the parabolic bowl's level-walk matches its column-walk at 128,214 cells on a real r54 tarn. The tolerance is 2% rather than 0 because the WORLD is not obliged to stay that way: pond life replaces water cells with kelp and reeds, and a ruin or a cave could intrude. A non-zero number here is not automatically a bug, but it IS a number that wants explaining before M2's ledger is built on the curve.",
   "waterbodyVolTolPct": "2.0",
   "waterbodyAreaTolPct": "2.0",
   "waterbodyAwakeMax": "32",
@@ -121,7 +119,6 @@
   "terrain.localReliefObserved": "129",
   "terrain.farReliefObserved": "958",
   "terrain.settleProxyObserved": "0",
-
   "_swingPlaneStatus_about": "swing-plane PASSES as of the combat phase C+D merge (2026-08-31, branch combat-final). THREE prior reports quoted three different sets of numbers for this gate because each measured a different tree; this key states what the MERGED tree measures and how it got there. PHASE C repaired the fixture, three faults, none of them the residency window the pre-C text blamed. (1) THE TARGET WALKED: the dummy is a 'human', human.json declares no 'behavior', so MobSystem::DecideIntent fell through to the legacy wander and a human walks 31.5 vox/s -- spawned at z 261, read at z 269.4 eight ticks later, and the sweep swept where it used to be. Fixed as DATA: the fixture asks for the 'dummy' behaviour profile by name. (2) THE ANCHOR MIXED UNITS: World::WindowOrigin() is in CHUNKS and the gate added kWorldN/2 VOXELS to it -- a no-op at the origin, which is why it read as a suite-only failure, and 44 voxels outside the window once 'streaming' had shifted it. (3) THE READY DROVE INTO THE AZIMUTH STOP: the open-loop ready pushed rightward from a hanging arm; it is closed-loop on the stroke state now. Underneath all three sat a REAL bug only the repaired fixture could see: Mob::ApplyWeaponArm carried its own copy of the hinge-angle projection and did not wrap it into (-pi, pi] the way ClampHinge does, so a forearm in the far quaternion hemisphere read as +4.89 rad there and -1.39 rad here, and the elbow clamp threw 1.39 rad of a good solve away on every committed horizontal cut. Both now call anim.h AnimHingeAngleAbout. PHASE D re-authored the grip: assets/items/{sword,cleaver}.json rotate [0,0,-90] instead of [0,-90,0], which puts a neutral blade down the arm's own line instead of across it, and dropped melee.wristMaxAngle 2.80 -> 1.50 on the strength of an A/B run against the OLD fixture. THE MERGE FOUND ONE INTERACTION, and it was that wrist cap. The blade asks the wrist for a FULL orientation delta -- direction AND ROLL -- and the neutral grip stands about pi of roll away from what a committed cut wants, so what STEERING gets is the cap minus that standing tax. Old grip at 2.80 left ~1.2 rad free, which is what phase C measured against; new grip at 1.50 left ~0.0 and the arm line reported 'wrist 1.50/3.00' -- pegged -- in every single pass. The cap is 3.10 now, leaving ~1.1 rad free, i.e. the same steering budget phase C had. MEASURED ON THE MERGED TREE, cap 1.50 -> 3.10: follow residual 3.66 -> 0.34 vox (bound 4.30); A commanded->posed residual 8.65 -> 5.51, posed az sweep 2.96 -> 2.23 against a commanded 2.38; B az drift 2.28 -> 0.09, out-of-plane 0.88 -> 0.19, residual 7.31 -> 0.26; C ratio 4.39 -> 2.21, travel agreement 0.952 -> 1.000, residual 6.84 -> 0.25. Five failing checks became zero. THE GATE ALSO HAD A MEASUREMENT BUG, found the same way and fixed here: pass D summed RAW atan2 deltas, so one crossing of the +-pi branch behind the shoulder turned +2.25 rad of rightward travel into -4.03 and reported 'steady rightward mouse carries the tip LEFT'. Azimuth is unwrapped before it is ranged now, in pass D and in runStroke's az min/max and backstep counters, and the wrap count is printed. Same bug, third instance on this branch, after ApplyWeaponArm's hinge and npc-styles' arc accumulator. STILL OPEN, and it is content rather than code: the standing ~pi of wrist roll is a GRIP question. Authoring the neutral roll into the item JSONs would let wristMaxAngle come back down to a real wrist; the naive attempt ([180,0,-90]) makes the follow residual worse (8.08), so it is a piece of work, not a sign flip. Also still true: human.json bounds the right upper arm to 30 degrees past the midline, so the last third of a committed horizontal cut sits on that stop -- which is why planarity is stated on the COMMANDED arc and the rig's deviation is bounded separately via rigResidualFrac, with a printed attribution line naming which joint limit spent it.",
   "swing-plane": "pass",
   "_swingPlane_about": "swing-plane thresholds. The gate measures the SWORD'S world trajectory about the live shoulder joint, through the whole IK/clamp/physics pipeline, so every bound here is in radians of tip arc or in fractions of the tip's own radius -- never in voxels, which would move with kVoxelMeters. Retune by editing this file; nothing here costs a rebuild, and as of the phase C/D merge the gate also calls ApplyMeleeTuning, so melee.* in tuning.json reaches it too (before that it ran on the compiled melee.h initialisers, and a JSON edit moved every OTHER melee gate while leaving this one byte-identical -- which reads as 'the wrist is not the constraint' and really means 'the knob is not connected'). azSweepMin/elSweepMin are how much arc a committed flick must actually produce; elDevMax/azDevMax are how much of the OTHER angle it may leak into; planarMaxFrac bounds how far the sweep may wander out of the plane its own first and last radii span; frontMinFrac is the most-backward the tip may get, as a fraction of its radius (negative = a little behind the shoulder is tolerated, the arm does swing past); diagRatioMax keeps a diagonal diagonal; hitFarFrac is how much further the far limb must be than the near one for the wound-placement pair to mean anything; edgeGainMin is how much better an edge-on cut must rate than a flat-on one. rigResidualFrac is how far the POSED sword may sit from the COMMANDED tip as a fraction of the commanded radius -- that gap is human.json's authored joint limits, NOT a swing property, so it is loose on purpose and is paired with the arm-diagnostic line that names the limit; sweepTrackMax is the strict one, radians of commanded ARC the physical sword is allowed to lose. steerBackMax was a literal in selftest_swing.cpp until the merge and is here now for the usual reason (a bound in source costs a rebuild to tune). It is how many of pass D's 22 equal mouse steps may send the tip backwards; the merged tree measures 4 with the atan2 unwrap in place, and the bound is 4. That is TIGHT ON PURPOSE -- it is the one check that says the blade can be aimed at all -- but it is also the number to look at first if pass D ever flakes, because 4 of 22 has no headroom left.",
@@ -184,31 +181,104 @@
   "duel.awakeChunksMax": "900",
   "_smoke_about": "Pinned hash sequences for --vk-smoke and --vk-smoke-loud. Each entry is [tick, hash]. tick 0 = worldgen. Re-record with --rebaseline.",
   "smokeQuiet": [
-    [0, "f769ea17"],
-    [1, "3753c7e1"],
-    [15, "bcc09952"],
-    [30, "768bfa07"],
-    [50, "c321fd60"]
+    [
+      0,
+      "f769ea17"
+    ],
+    [
+      1,
+      "3753c7e1"
+    ],
+    [
+      15,
+      "bcc09952"
+    ],
+    [
+      30,
+      "768bfa07"
+    ],
+    [
+      50,
+      "c321fd60"
+    ]
   ],
   "smokeLoud": [
-    [0, "f769ea17"],
-    [15, "ee388210"],
-    [30, "584de416"],
-    [45, "e20f1d25"],
-    [46, "503f95c5"],
-    [47, "22ca9338"],
-    [52, "553ee48e"],
-    [53, "db066f8d"],
-    [60, "ce0e82c9"],
-    [75, "8f81d625"],
-    [76, "8447d771"],
-    [84, "c5fd49c9"],
-    [85, "6ac782c9"],
-    [86, "49d368e2"],
-    [87, "7d86a4bc"],
-    [88, "c0962bde"],
-    [90, "3f285d49"],
-    [105, "d12d9222"],
-    [120, "572d8c8d"]
-  ]
+    [
+      0,
+      "f769ea17"
+    ],
+    [
+      15,
+      "ee388210"
+    ],
+    [
+      30,
+      "584de416"
+    ],
+    [
+      45,
+      "e20f1d25"
+    ],
+    [
+      46,
+      "503f95c5"
+    ],
+    [
+      47,
+      "22ca9338"
+    ],
+    [
+      52,
+      "553ee48e"
+    ],
+    [
+      53,
+      "db066f8d"
+    ],
+    [
+      60,
+      "ce0e82c9"
+    ],
+    [
+      75,
+      "8f81d625"
+    ],
+    [
+      76,
+      "8447d771"
+    ],
+    [
+      84,
+      "c5fd49c9"
+    ],
+    [
+      85,
+      "6ac782c9"
+    ],
+    [
+      86,
+      "49d368e2"
+    ],
+    [
+      87,
+      "7d86a4bc"
+    ],
+    [
+      88,
+      "c0962bde"
+    ],
+    [
+      90,
+      "3f285d49"
+    ],
+    [
+      105,
+      "d12d9222"
+    ],
+    [
+      120,
+      "572d8c8d"
+    ]
+  ],
+  "shadow-cache": "pass"
 }

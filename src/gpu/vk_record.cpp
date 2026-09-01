@@ -495,6 +495,13 @@ void Recorder::RecordTable(pass::Table which, const RecordCtx& cx) {
         sets[1] = bind_.fluidSeamSet;
         setCount = 2;
         break;
+      case pass::Groups::Shadow:
+        // One set, not a slim pair: the shadow resolve reads the world through
+        // its own bind group and shares nothing with the sim's.
+        layout = bind_.shadowLayout;
+        sets[0] = bind_.shadowSet;
+        setCount = 1;
+        break;
       default:
         break;
     }
@@ -545,6 +552,9 @@ void Recorder::RecordTable(pass::Table which, const RecordCtx& cx) {
             break;
           case pass::DispatchSel::IndFluidPArgs:
             args = bind_.buffers[(int)pass::Buf::FluidPDispatchArgs];
+            break;
+          case pass::DispatchSel::IndShadowArgs:
+            args = bind_.buffers[(int)pass::Buf::ShadowArgs];
             break;
           default:
             args = bind_.buffers[(int)pass::Buf::DispatchArgs];

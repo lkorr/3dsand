@@ -84,6 +84,26 @@ fi
 W_SUBDIM=$((W_CHUNK >> W_SUBSHIFT))
 W_SUBSTRIDE=$((W_SUBWORDS * 2))
 
+# Shadow cache (world.h kShadowCacheBuckets block). Same treatment as the
+# sub-occupancy pair above: the two SIZES are shifts in world.h precisely so
+# they can be scraped as literals here, with the shift redone rather than the
+# expression parsed.
+W_SHADOWSHIFT="$(cpp_const kShadowCacheShift)"
+W_SHADOWREQSHIFT="$(cpp_const kShadowReqCapShift)"
+W_SHADOWREQHDR="$(cpp_const kShadowReqHeaderWords)"
+W_SHADOWREQW="$(cpp_const kShadowReqWords)"
+W_SHADOWSUBMAX="$(cpp_const kShadowSubdivMax)"
+if [ -z "$W_SHADOWSHIFT" ] || [ -z "$W_SHADOWREQSHIFT" ] ||
+   [ -z "$W_SHADOWREQHDR" ] || [ -z "$W_SHADOWREQW" ] ||
+   [ -z "$W_SHADOWSUBMAX" ]; then
+  echo "check_shaders: cannot parse the kShadow* constants from $WORLD_H" >&2
+  exit 1
+fi
+W_SHADOWBUCKETS=$((1 << W_SHADOWSHIFT))
+W_SHADOWREQCAP=$((1 << W_SHADOWREQSHIFT))
+W_WORLDSHIFT=0
+while [ $((1 << W_WORLDSHIFT)) -lt "$W_N" ]; do W_WORLDSHIFT=$((W_WORLDSHIFT + 1)); done
+
 # Voxels per metre (world.h kVoxelsPerMetre -> prelude VOXELS_PER_M). Integer,
 # and DERIVED from kVoxelMeters on both sides -- worldgen's every metre-authored
 # size converts through it, and the hand-written duplicate it replaced had
@@ -228,6 +248,13 @@ PRELUDE_TEXT="$(printf '%s\n' \
   "const SUBOCC_WORDS : u32 = ${W_SUBWORDS}u;" \
   "const SUBOCC_STRIDE : u32 = ${W_SUBSTRIDE}u;" \
   "const SUBOCC_BASE : u32 = $((W_NCHUNK * W_NCHUNK * W_NCHUNK))u;" \
+  "const WORLD_SHIFT : u32 = ${W_WORLDSHIFT}u;" \
+  "const SHADOW_CACHE_AVAILABLE : bool = true;" \
+  "const SHADOW_CACHE_BUCKETS : u32 = ${W_SHADOWBUCKETS}u;" \
+  "const SHADOW_REQ_HEADER : u32 = ${W_SHADOWREQHDR}u;" \
+  "const SHADOW_REQ_WORDS : u32 = ${W_SHADOWREQW}u;" \
+  "const SHADOW_REQ_CAP : u32 = ${W_SHADOWREQCAP}u;" \
+  "const SHADOW_SUBDIV_MAX : u32 = ${W_SHADOWSUBMAX}u;" \
   "const LAB_SLAB_Y : i32 = ${W_LABY};" \
   "const PT_SENTINEL_BIT : u32 = ${W_PTSENT}u;" \
   "const PT_JITTER_BIT : u32 = ${W_PTJIT}u;" \

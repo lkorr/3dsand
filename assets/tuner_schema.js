@@ -393,6 +393,8 @@ const TUNING_SCHEMA = [
       {k:'shadowFarLift', n:'distant shadow lift', d:'Shadow darkness out in the LOD cascades. Kept soft, because hard shadows on coarse cells speckle hillsides.', min:0, max:1, step:0.01},
       {k:'shadowBias', n:'shadow bias', d:'How far off the surface a shadow ray starts. Too low self-shadows; too high detaches contact shadows.', min:0.001, max:0.5, step:0.001},
       {k:'shadowSteps', n:'shadow ray budget', d:'Max steps a shadow ray marches. Lower is faster but truncates long shadows.', min:0, max:2048, step:16, int:true},
+      {k:'shadowCache', n:'shadow cache', d:'Compute one shadow answer per surface patch instead of per pixel. Off recompiles the raymarcher with the old inline shadow ray - the A/B arm. Measured 14.56 -> ~9 ms at 1080p.', min:0, max:1, step:1, int:true},
+      {k:'shadowCacheSubdiv', n:'shadow patch subdivision', d:'How finely a voxel face is split into cached patches, per axis. Quality knob: higher is smoother shadow edges at almost no extra ray cost, since the saving saturates early. 4 gives 2.5 cm patches.', min:1, max:8, step:1, int:true},
       {k:'grainAmp', n:'surface grain', d:'Brightness variation across a surface. This is what turns per-voxel palette static into patches that read as material.', min:0, max:0.4, step:0.005},
       {k:'grainAmpFar', n:'distant grain', d:'Surface grain out in the LOD cascades.', min:0, max:0.4, step:0.005},
       {k:'grainBroadScale', n:'grain patch size', d:'Size of the broad mottling, in voxels.', min:1, max:64, step:0.5, u:'vox'},

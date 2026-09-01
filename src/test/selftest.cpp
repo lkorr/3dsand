@@ -127,7 +127,11 @@ const char* const kOrder[] = {
     "blood-stain", "flung-liquid", "fluid-det",     "fluid-settle",
     "fluid-excite", "fluid-onwater", "fluid-stain", "fluid-react", "far-fog",  "far-downsample",
     "far-persist",
-    "screenshots", "fire-depth", "player-walk", "player-waterjump", "player-ledgegrab",
+    // `shadow-cache` recompiles raymarch.wgsl three times (its three arms are
+    // const-folded, so they do not exist without a reload) and restores the
+    // baseline tuning before returning. It leaves no world state behind, so
+    // it sits with the other rendering gates rather than at either end.
+    "screenshots", "fire-depth", "shadow-cache", "player-walk", "player-waterjump", "player-ledgegrab",
     "player-plants", "debris",
     "audio-impact", "audio-mob-voice", "audio-ambience",
     // "mob" restored to its original slot (it sat between prefab and

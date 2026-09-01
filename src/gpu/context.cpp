@@ -5,6 +5,7 @@
 
 #include "gpu/rhi_vk.h"
 #include "gpu/rhi_vulkan.h"
+#include "gpu/resources.h"
 
 // After the Vulkan headers (via rhi_vulkan.h) so glfw3.h sees VK_VERSION_1_0
 // and declares glfwCreateWindowSurface / glfwGetRequiredInstanceExtensions.
@@ -76,6 +77,13 @@ bool GpuContext::Init(GLFWwindow* window, uint32_t w, uint32_t h,
   }
   const vk::Caps& caps = back_->vk->GetCaps();
   std::printf("adapter: %s (backend vulkan)\n", caps.deviceName.c_str());
+  // The shadow cache is the one fragment-stage storage write in the engine, and
+  // it is compiled in or out rather than branched on (world.h). Tell the shader
+  // prelude before anything loads a shader.
+  SetFragmentStoresAvailable(caps.fragmentStoresAndAtomics);
+  if (!caps.fragmentStoresAndAtomics)
+    std::printf("  fragmentStoresAndAtomics: ABSENT — shadow cache disabled, "
+                "raymarch falls back to the inline shadow ray\n");
   if (caps.validationEnabled)
     std::printf("  validation layer: ENABLED   sync validation: %s\n",
                 caps.syncValidationEnabled ? "ENABLED" : "off");

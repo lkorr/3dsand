@@ -2175,6 +2175,15 @@ struct Tuning {
     int shadowSteps = 384;
     float shadowSoftNear = 0.6f, shadowSoftFar = 9.0f, shadowLift = 0.45f;
     float shadowFarLift = 0.3f;
+    // Voxel-keyed shadow cache (world.h kShadowCacheBuckets). `shadowCache` is
+    // the A/B toggle and is const-folded, so flipping it in tuning.json + F5
+    // recompiles raymarch.wgsl WITHOUT the shadow trace() call site — which is
+    // the whole point, since that call site costs 3.59 ms of register footprint
+    // against 2.29 ms of traversal (--render-budget, 2026-09-01).
+    // `shadowCacheSubdiv` is the patch granularity per voxel-face axis: a
+    // QUALITY knob, since the ray saving saturates well before it gets coarse.
+    int shadowCache = 1;
+    int shadowCacheSubdiv = 4;
 
     // grain
     float grainBroadScale = 11.0f, grainFineScale = 2.5f;
