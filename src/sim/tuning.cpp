@@ -2630,29 +2630,39 @@ bool SaveCombatTuning(const std::string& path, const Tuning& t,
   // like a success.
   std::string outText = text;
   std::string missing;
+  const char* curGroup = nullptr;
   auto group = [&](const char* name, size_t& lo, size_t& hi) {
     const auto span = JsonGroupSpan(outText, name);
     lo = span.first;
     hi = span.second;
+    curGroup = lo != std::string::npos ? name : nullptr;
     if (lo == std::string::npos) missing += std::string(" ") + name;
     return lo != std::string::npos;
   };
 
+  // EVERY PATCH RE-DERIVES ITS GROUP'S SPAN. PatchJsonValue edits outText in
+  // place and a replaced literal rarely keeps its length — NumLit prints the
+  // float that actually ships (`%.9g`, so `0.005` becomes `0.00499999989`) —
+  // so a span computed once per group DRIFTS: enough growth early in a long
+  // group pushes its tail keys past the stale `hi`, and the save then refuses
+  // a file that plainly contains them. Measured on the shipped tuning.json:
+  // the Combat panel's Save reported blockItemDamage through headClearM (the
+  // melee tail) and fleshVolume/clangVolume/cueRadius (the combatfx tail)
+  // missing. Re-deriving is a substring search over ~22 KB per key, which is
+  // nothing against a button press, and it makes the span correct BY
+  // CONSTRUCTION rather than correct until the group grows again.
   size_t lo = 0, hi = 0;
-  auto put = [&](const char* key, float v) {
-    if (lo == std::string::npos) return;
-    if (!PatchJsonValue(outText, lo, hi, key, NumLit(v)))
+  auto patchIn = [&](const char* key, const std::string& value) {
+    if (curGroup == nullptr) return;   // group() already reported the group
+    const auto span = JsonGroupSpan(outText, curGroup);
+    if (span.first == std::string::npos ||
+        !PatchJsonValue(outText, span.first, span.second, key, value))
       missing += std::string(" ") + key;
   };
-  auto putI = [&](const char* key, int v) {
-    if (lo == std::string::npos) return;
-    if (!PatchJsonValue(outText, lo, hi, key, std::to_string(v)))
-      missing += std::string(" ") + key;
-  };
+  auto put = [&](const char* key, float v) { patchIn(key, NumLit(v)); };
+  auto putI = [&](const char* key, int v) { patchIn(key, std::to_string(v)); };
   auto putB = [&](const char* key, bool v) {
-    if (lo == std::string::npos) return;
-    if (!PatchJsonValue(outText, lo, hi, key, v ? "true" : "false"))
-      missing += std::string(" ") + key;
+    patchIn(key, v ? "true" : "false");
   };
 
   if (group("melee", lo, hi)) {

@@ -404,6 +404,58 @@ Status GateCombatTuning(Ctx& c, std::string& detail) {
     check(drift == 0, "shipped tuning.json matches the compiled defaults");
   }
 
+  // ---- E. THE PANEL'S SAVE ROUND-TRIPS -------------------------------------
+  //
+  // SaveCombatTuning is a TEXT PATCH of value literals into the shipped file,
+  // and it is all-or-nothing: one key it cannot find refuses the whole write.
+  // Nothing above exercises it, and it shipped a real refusal: the byte span
+  // of each group was computed ONCE, every patched literal changes the text's
+  // length (`%.9g` prints the float that ships, not the hand-written
+  // `0.005`), and by the tail of the melee group the keys had drifted past
+  // the stale span end — the Combat panel's Save reported eleven keys
+  // "missing" from a file that contained every one of them. This check is
+  // the reproduction: save onto a COPY of the real file with every panel
+  // value MOVED (so every literal changes length), demand success, then load
+  // the copy back and demand a head, a middle and a tail key of each group
+  // actually landed.
+  {
+    const std::string savePath =
+        sandvox::AssetDir() + "/materials/tuning.combatsave.json";
+    {
+      std::ifstream in(tuningPath, std::ios::binary);
+      std::ofstream out(savePath, std::ios::binary);
+      out << in.rdbuf();
+    }
+    Tuning moved = shipped;
+    // Nudges chosen to survive every clamp and to never print back to the
+    // same literal the file holds.
+    moved.melee.commitSpeed = 1111.5f;                       // melee head
+    moved.melee.dirSmoothing = 0.077f;                       // melee middle
+    moved.melee.headClearM = 0.123f;                         // melee TAIL
+    moved.combatfx.hitStopChipMs = 77.5f;                    // combatfx head
+    moved.combatfx.cueRadius = 44.5f;                        // combatfx TAIL
+    moved.gore.cutDepth = 0.505f;                            // gore head
+    moved.gore.bleedGain = 1.115f;                           // gore TAIL
+    std::string err;
+    const bool saved = SaveCombatTuning(savePath, moved, err);
+    if (!saved)
+      std::printf("combat-tuning: SaveCombatTuning refused: %s\n", err.c_str());
+    check(saved, "SaveCombatTuning patches the shipped file whole");
+    Tuning back;
+    check(LoadTuning(savePath, back), "the saved file still parses");
+    check(Near(back.melee.commitSpeed, moved.melee.commitSpeed) &&
+              Near(back.melee.dirSmoothing, moved.melee.dirSmoothing) &&
+              Near(back.melee.headClearM, moved.melee.headClearM),
+          "melee head/middle/tail keys round-trip through Save");
+    check(Near(back.combatfx.hitStopChipMs, moved.combatfx.hitStopChipMs) &&
+              Near(back.combatfx.cueRadius, moved.combatfx.cueRadius),
+          "combatfx head/tail keys round-trip through Save");
+    check(Near(back.gore.cutDepth, moved.gore.cutDepth) &&
+              Near(back.gore.bleedGain, moved.gore.bleedGain),
+          "gore head/tail keys round-trip through Save");
+    std::remove(savePath.c_str());
+  }
+
   detail = Format("%d checks, %d keys wired", checks, wired);
   std::printf("combat-tuning: %s (%d checks, %d keys wired)\n",
               ok ? "PASS" : "FAIL", checks, wired);
