@@ -150,8 +150,7 @@ bool LoadPinnedFromJson(const std::string& path, const char* key,
     // back to the stale hardcoded tables in silence, failing every probe
     // against numbers the JSON had long since moved past.
     auto ws = [&](char c) {
-      return c == ' ' || c == '
-' || c == '' || c == '	';
+      return c == ' ' || c == '\n' || c == '\r' || c == '\t';
     };
     while (pos < text.size() && ws(text[pos])) pos++;
     uint32_t tick = 0;
