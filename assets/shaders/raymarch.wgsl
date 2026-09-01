@@ -6260,9 +6260,13 @@ fn fs(in : VSOut) -> FSOut {
       // palette jitter at a FIXED world frequency (~0.5 m patches) instead of
       // per level cell: coarse cells otherwise flatten into single-color slabs
       // and the texture contrast visibly drops at every LOD handoff.
+      //
+      // paletteJitter, NOT paletteColor: a far cascade cell has no voxel word,
+      // so `jit` is a hash and never a state nibble. paletteColor() would read
+      // it as a MATF_TINTED material's dye index (common.wgsl).
       let jc = (far.cell << vec3<u32>(farCellShift(far.level))) >> vec3<u32>(3u);
       let jit = pcg(u32(jc.x * 7 + jc.y * 131 + jc.z * 2917));
-      var albedo = paletteColor(m, jit, &materials);
+      var albedo = paletteJitter(m, jit);
       var n = vec3f(0.0);
       n[far.axis] = -far.sgn;
       if (m.klass == CLASS_LIQUID) {
@@ -6323,10 +6327,19 @@ fn fs(in : VSOut) -> FSOut {
     // Palette variant: a micro voxel has no state nibble of its own, so key it
     // on the sub-voxel's material and the cell, which keeps a tuft's blades
     // from all landing on the same palette entry while staying stable in time.
-    let paletteState = select(voxState(h.word),
-                              hash3(R.seed, 1u, cellIndexW(h.cell) ^ h.micMat),
-                              isMicro);
-    var albedo = paletteColor(m, paletteState, &materials);
+    //
+    // The two arms take DIFFERENT decodes and cannot be a `select` over one
+    // `paletteState`, which is what they were: the micro arm's key is a HASH,
+    // and paletteColor() would read it as a MATF_TINTED material's dye index
+    // (common.wgsl). The cell arm's key is a real nibble and must keep reaching
+    // the dye run, or a tinted grid voxel loses the colour the whole feature
+    // exists to give it.
+    var albedo : vec3f;
+    if (isMicro) {
+      albedo = paletteJitter(m, hash3(R.seed, 1u, cellIndexW(h.cell) ^ h.micMat));
+    } else {
+      albedo = paletteColor(m, voxState(h.word), &materials);
+    }
     if (m.klass == CLASS_LIQUID) {
       // liquid state nibble is fullness, not a palette variant: fuller = deeper
       let fullness = f32(voxState(h.word) + 1u) / 8.0;

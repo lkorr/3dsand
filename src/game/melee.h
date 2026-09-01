@@ -186,7 +186,18 @@ struct MeleeTuning {
   // the weapon side has a whole sweep behind it, the far side runs out at the
   // midline. `handSign` in MeleeState says which side is which. These bound the
   // STORED state, so pushing into one banks nothing.
-  float azOut = 2.36f;      // 135 deg to the weapon side
+  //
+  // azOut WAS 2.36 (135 degrees), and that is BEHIND THE CHARACTER. The stroke
+  // is an arc about the shoulder measured from the basis's forward, so 135
+  // degrees to the weapon side puts the commanded point past the frontal plane
+  // and parks the shoulder ball on its authored `reach` stop (`normal
+  // [0,0,-1], max 50` on every humanoid def — 50 degrees past the back plane
+  // and no further). What the player sees is the arm driven behind the body
+  // and then stuck there, which was reported as exactly that. 1.83 rad is 105
+  // degrees: the whole front, plus fifteen degrees past side-on so a
+  // right-to-left sweep still starts from a real wind-up rather than from the
+  // shoulder line.
+  float azOut = 1.83f;      // 105 deg to the weapon side: front + a little past
   float azAcross = 1.40f;   // 80 deg across the body
   // Elevation runs almost to straight down because THE SEED HAS TO FIT: a
   // walk cycle leaves the weapon arm hanging at roughly -85 degrees, and a
@@ -270,36 +281,90 @@ struct MeleeTuning {
   // How far the wrist may take the blade away from the orientation the solved
   // arm would give it for free, radians.
   //
-  // IT USED TO BE 2.80 — 160 degrees, which is a ball joint and not a wrist —
-  // and the reason was structural rather than a taste for loose wrists. The
-  // authored grip held the blade PERPENDICULAR to the forearm (sword.json's
-  // `[0, -90, 0]`, and gen_sword_item.py said so in as many words), which was
-  // right back when the sword was never re-aimed. A cut wants the blade roughly
-  // along the arm's own line, so about 90 degrees of the budget was spent
-  // undoing the authored grip before any steering happened at all — measured,
-  // the stroke asked for 2.0 to 3.0 radians and an 85-degree cap clipped every
-  // tick of it, which showed up as the blade pointing up to 100 degrees away
-  // from the cut.
+  // IT USED TO BE 2.80, then 1.50, and the number chased a GRIP that has since
+  // moved back. The history is worth keeping because the reasoning failed the
+  // same way twice.
   //
-  // THE GRIP IS NOW RE-AUTHORED, which is what makes this number honest.
-  // assets/items/{sword,cleaver}.json rotate `[0, 0, -90]`: the blade is built
-  // along the item's +x, the arm extends along the rig's -y, and a -90 about Z
-  // carries +x onto -y, so a NEUTRAL wrist already holds the blade down the
-  // arm's own line. Verified rather than reasoned, which is the rule for every
-  // rotation in this repo:
+  // The overhaul re-authored assets/items/{sword,cleaver}.json from
+  // `[0, -90, 0]` to `[0, 0, -90]` so that a NEUTRAL wrist laid the blade down
+  // the arm's own line, on the theory that a cut wants a radial blade and the
+  // wrist should not spend its budget undoing the grip. The budget argument
+  // did not survive contact: measured on the repaired swing-plane fixture, the
+  // wrist asks for 2.6..3.1 rad WHICHEVER grip is authored (the ask is
+  // dominated by ROLL, not by direction), so the cap ended at 3.10 anyway and
+  // the grip change bought nothing it was authored for.
   //
-  //   python scripts/geometry.py rotate_point 0 0 1 -90 -- 1 0 0
-  //   -> [0, -1, 0]                    (blade +x lands on -y, along the arm)
+  // What it COST was the pose the player looks at for 99% of a session. At
+  // Idle the item renders at `handQ * gripRot` with no steering at all (Mob::
+  // ApplyWeaponArm returns at weight 0), so an along-the-arm grip is a hilt
+  // buried in the fist and a blade lying down the forearm — reported as "the
+  // hilt sticks through the hand". THE GRIP IS BACK TO `[0, -90, 0]`, verified
+  // rather than reasoned:
   //
-  // It does NOT bound steering only, and assuming it did was the phase C/D
-  // merge's one real interaction bug — the full note, with the three measured
-  // budgets, is on Tuning::Melee::wristMaxAngle in sim/tuning.h. Short form:
-  // the blade asks for direction AND ROLL, the neutral grip stands about pi of
-  // roll away from a committed cut, and what the steering gets is this number
-  // MINUS that. 3.10 leaves ~1.1 rad free, which is the wrist; 1.50 left none
-  // and clamped half of every real cut. Lives in tuning.json as
-  // `melee.wristMaxAngle`, so the number is a JSON edit rather than a rebuild.
+  //   python scripts/geometry.py euler_to_quat 0 -90 0   (blade is item +x)
+  //   -> blade +x lands on hand +z (forward, out of the fist)
+  //   -> with the arm out in front, that same +z is world UP: a ready guard
+  //
+  // 3.10 is kept because the ask is unchanged: the blade wants direction AND
+  // roll, the neutral grip stands about pi of roll away from a committed cut,
+  // and the STEERING gets this number minus that standing tax (~1.1 rad free).
+  // Lives in tuning.json as `melee.wristMaxAngle`, so it is a JSON edit rather
+  // than a rebuild.
   float wristMaxAngle = 3.10f;
+  // ---- HOW MUCH OF THE WRIST'S ALIGNMENT IS ACTUALLY APPLIED --------------
+  //
+  // THE WRIST RAMPS WITH COMMITMENT. `wristMaxAngle` above is a CEILING; this
+  // pair is the throttle, and it exists because a ceiling alone cannot express
+  // the difference between a cut and a hold.
+  //
+  // RebuildFrame always commands the blade along the law-of-cosines direction,
+  // which is mostly radial — correct for a cut, and wrong for standing still,
+  // because it wrenches the fist round to lay the blade along the shoulder-to-
+  // point line whatever the player is doing. Holding a guard out in front then
+  // pointed the sword straight down the radius instead of up out of the fist,
+  // which is what "the sword points vertically DOWN" was.
+  //
+  // So the applied alignment is scaled by the TIP'S OWN SPEED: a still blade
+  // keeps the orientation the solved forearm gives it for free (the authored
+  // grip: blade out of the fist, up when the arm is forward), and a moving one
+  // is aligned to the stroke. Both ends are real poses and the ramp between
+  // them is smoothed, so there is no tick where the blade jumps.
+  //
+  // Speeds are TIP speed in world voxels/sec, the same quantity the damage
+  // ramp is stated on. Committed phases (Wind/Slash/Recover) bypass the ramp
+  // entirely — a cut is a cut even at the moment it reverses through zero.
+  float steerSpeedLo = MetresPerSecToCells(0.25f);   // below: grip pose
+  float steerSpeedHi = MetresPerSecToCells(1.10f);   // above: full alignment
+  // What is applied at and below `steerSpeedLo`. Not zero: a guard that shares
+  // NOTHING with the stroke reads as the weapon having been let go of, and the
+  // take-over seed (SetStroke reads the rig's real blade every tick) is
+  // smoother when the two poses are near neighbours.
+  float steerFloor = 0.15f;
+  // ---- WHAT THE ARM MAY DO WHILE IT SERVES THE BLADE ----------------------
+  //
+  // THE ELBOW IS A ONE-WAY HINGE AND THE BEND PLANE IS NOT FREE. The stroke
+  // hands the rig a bend pole (the plane the elbow bulges in) and the rig
+  // turns it into a hinge-axis override, and BOTH were unbounded: any pole
+  // direction was legal, so the solve plane could point anywhere, and
+  // ApplyWeaponArm then sign-flipped the override so the measured bend was
+  // always positive — which turns an authored `[0, 130]` hinge into a rubber
+  // stamp that legalises a backwards elbow. Reported as "the elbow bends both
+  // ways" and "the shoulder rolls freely", which are the same fact seen twice.
+  //
+  // `elbowPoleCone` bounds the POLE, here, in the driver's own basis frame:
+  // radians away from straight-back ([0,0,-1], which is these rigs' authored
+  // arm pole and where a resting elbow points). 1.75 rad is 100 degrees — the
+  // elbow may bulge down, up or out to either side, and may not come forward.
+  //
+  // `elbowAxisCone` would bound the OVERRIDE AXIS in the rig, as radians away
+  // from the forearm's AUTHORED hinge axis. IT DEFAULTS TO pi, i.e. OFF, and
+  // the long note in mob.cpp says why: penning the axis makes the pose clamp
+  // LOSSY (it keeps only the component about the axis it is given), and a
+  // horizontal cut legitimately wants a bend plane 90 degrees off the resting
+  // axis. Measured at 75 degrees it cost pass A of swing-plane 1.76 rad of
+  // elbow clamp and 4.42 voxels of hand. It stays as the one-JSON-edit A/B.
+  float elbowPoleCone = 1.75f;
+  float elbowAxisCone = 3.14f;   // pi = off; see game/mob.cpp for why
   // ---- the edge leads the cut ---------------------------------------------
   // ---- BLOCKING IS EMERGENT (Phase C) --------------------------------------
   //
@@ -320,11 +385,19 @@ struct MeleeTuning {
   // couple of centimetres of a raised sword has been stopped by it, and a
   // player who watched that go through would be right to call it a bug.
   //
-  // 0.14 m -> 0.22 m at the phase C/D merge, and the cause is geometric rather
-  // than a retune: the re-authored grip lays the blade ALONG the arm, so the
-  // same guard pose leaves the defender's edge further from its own fist and a
-  // crossing parry closes on it with more slack. Measured on `npc-block`, the
-  // two swept edges pass within 2.42 voxels where the old grip gave 0.86.
+  // 0.14 m -> 0.22 m at the phase C/D merge, on the reasoning that the
+  // along-the-arm grip left a defender's edge further from its own fist so a
+  // crossing parry closed on it with more slack (measured then: 2.42 voxels
+  // where the old grip gave 0.86).
+  //
+  // THE GRIP CAME BACK AND THE NUMBER DID NOT, and that is deliberate rather
+  // than an oversight. Re-measured on `npc-block` with the restored
+  // `[0,-90,0]` grip, the two swept edges close to 2.18 voxels — so 0.22 m
+  // (2.20 voxels) is sized for the geometry that SHIPS, and it is sized by 1%.
+  // The 0.86 figure belonged to a guard pose two rewrites ago and reverting to
+  // 0.14 on the strength of it would make every parry in the game miss. If
+  // `npc-block` starts flapping, this is the knob; measure the closing
+  // distance the gate prints before touching it.
   float blockGap = MetresToCells(0.22f);
   // Fraction of the blow's own damage the BLOCKING WEAPON takes as item hp.
   // Items have hp and are severable (item.h ItemDef::hp/severable), so this
@@ -497,7 +570,22 @@ struct WeaponPose {
   // not grow one: the driver owns the feel, the rig owns the anatomy, and this
   // is the one number that crosses. (Default mirrors MeleeTuning's; see the
   // long note there for why it is what it is, and why it used to be 2.80.)
-  float wristMaxAngle = 1.50f;
+  float wristMaxAngle = 3.10f;
+  // HOW MUCH OF THAT ALIGNMENT TO ACTUALLY APPLY, 0..1. Same crossing, same
+  // reason: the DRIVER knows whether this is a cut or a hold (it owns the tip
+  // speed and the phase) and the RIG knows how to apply a wrist, and neither
+  // may reach into the other. At 0 the hand keeps the orientation the solved
+  // forearm gives it and the blade sits at its authored grip angle — a natural
+  // ready. At 1 the blade is laid along `bladeDir` up to `wristMaxAngle`.
+  //
+  // 1 is the DEFAULT because the legacy four-argument SetWeaponPose and every
+  // gate that fabricates a pose mean "apply what I asked for"; only
+  // MeleeState::Pose() ramps it. See MeleeTuning::steerSpeedLo.
+  float steerAmount = 1.0f;
+  // How far the elbow's steered hinge axis may sit from the forearm's AUTHORED
+  // one, radians. The rig takes the tighter of this and the shoulder's own
+  // authored twist range. See MeleeTuning::elbowAxisCone.
+  float elbowAxisCone = 1.31f;
   // False is the legacy contract: drive the arm at `hand` and leave the blade
   // at whatever grip angle the fist gives it. True is the stroke driver: the
   // hand is ORIENTED so the blade points along bladeDir with its flat facing
@@ -620,6 +708,12 @@ class MeleeState {
   // recover instead of being switched off. Coming IN needs no fade — control
   // starts at the arm's own current pose, so weight 1 changes nothing visible.
   float PoseWeight() const;
+  // HOW COMMITTED THIS STROKE IS, 0..1, and therefore how much of the blade's
+  // commanded orientation the wrist should actually apply (WeaponPose::
+  // steerAmount). Smoothed inside RebuildFrame on the blade's own halflife, so
+  // reading it is free and the value never steps. Exposed for the gate that
+  // measures the guard pose and for the HUD.
+  float SteerAmount() const { return steerLive_; }
 
   SwingPhase Phase() const { return phase_; }
   bool Cutting() const { return phase_ == SwingPhase::Slash; }
@@ -717,6 +811,13 @@ class MeleeState {
   // ticks every time the player changed direction.
   Vec3 perpL_{0, 1, 0};       // unit, perpendicular to the radius
   float extendLive_ = 0;      // the hand's distance from the shoulder, eased
+  // HOW MUCH WRIST ALIGNMENT IS BEING APPLIED, smoothed. A THIRD smoothed
+  // quantity beside those two and for the same reason: the target is a step
+  // function of the phase (a cut commits on one tick) and a step in the amount
+  // of applied alignment is a step in the blade's orientation. Seeded to the
+  // floor rather than to 1 so a take-over on a still mouse starts at the pose
+  // the blade is really in.
+  float steerLive_ = 0;
   bool framePrimed_ = false;
   // The live arm, from SetStroke. `armReach_` is a bone length, not a tuning;
   // `bladeLen_` is the rig's own hand-to-point distance.

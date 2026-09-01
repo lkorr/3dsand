@@ -842,6 +842,11 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadF(*g, "swingExtend", e.swingExtend, out, at);
     ReadF(*g, "bladeSmoothing", e.bladeSmoothing, out, at);
     ReadF(*g, "wristMaxAngle", e.wristMaxAngle, out, at);
+    ReadF(*g, "steerSpeedLoMps", e.steerSpeedLoMps, out, at);
+    ReadF(*g, "steerSpeedHiMps", e.steerSpeedHiMps, out, at);
+    ReadF(*g, "steerFloor", e.steerFloor, out, at);
+    ReadF(*g, "elbowPoleCone", e.elbowPoleCone, out, at);
+    ReadF(*g, "elbowAxisCone", e.elbowAxisCone, out, at);
     ReadF(*g, "edgeFloor", e.edgeFloor, out, at);
     ReadF(*g, "blockGapM", e.blockGapM, out, at);
     ReadF(*g, "blockItemDamage", e.blockItemDamage, out, at);
@@ -909,6 +914,34 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     // Past ~pi the "wrist" is a ball joint and the fist can end up facing
     // backwards down its own arm (game/mob.cpp applies this as a slerp limit).
     e.wristMaxAngle = std::clamp(e.wristMaxAngle, 0.0f, 3.14f);
+    // ---- THE STEER RAMP, and what each bound is protecting -------------------
+    //
+    //   * the two speeds are a BAND, so an inverted or zero-width one makes the
+    //     ramp `(v - lo) / (hi - lo)` singular. `steerSpeedHiMps` is pushed
+    //     above the low end rather than the pair being swapped: the low end is
+    //     the one a player tunes ("how still is still?") and swapping would
+    //     silently redefine the knob they just dragged.
+    //   * steerFloor at 1 disables the ramp entirely and restores the previous
+    //     always-align behaviour, which is a legitimate setting and the A/B for
+    //     the whole change. 0 is legitimate too: a guard that shares nothing
+    //     with the stroke.
+    e.steerSpeedLoMps = std::clamp(e.steerSpeedLoMps, 0.0f, 20.0f);
+    e.steerSpeedHiMps = std::clamp(e.steerSpeedHiMps, 0.0f, 40.0f);
+    if (e.steerSpeedHiMps <= e.steerSpeedLoMps) {
+      out.warnings.push_back(at +
+                             ".steerSpeedHiMps <= steerSpeedLoMps; the wrist "
+                             "ramp has no band. Pushing high to 2x low.");
+      e.steerSpeedHiMps = std::max(e.steerSpeedLoMps * 2.0f, 0.05f);
+    }
+    e.steerFloor = std::clamp(e.steerFloor, 0.0f, 1.0f);
+    // ---- THE ELBOW/SHOULDER CONES -------------------------------------------
+    // Both are half-angles, so pi is "unbounded" and restores the old free
+    // behaviour for an A/B. The floors are not zero: a cone of exactly 0 pins
+    // the bend plane to the authored one, which is a stiff arm rather than a
+    // wrong one, and is worth being able to ask for — but a NEGATIVE one would
+    // make `acos(c) > cone` true on every tick including the aligned case.
+    e.elbowPoleCone = std::clamp(e.elbowPoleCone, 0.05f, 3.14f);
+    e.elbowAxisCone = std::clamp(e.elbowAxisCone, 0.0f, 3.14f);
     e.edgeFloor = std::clamp(e.edgeFloor, 0.0f, 1.0f);
     // ---- THE BLOCK KNOBS, and what each clamp is protecting ------------------
     //
@@ -2628,6 +2661,11 @@ bool SaveCombatTuning(const std::string& path, const Tuning& t,
     put("swingExtend", m.swingExtend);
     put("bladeSmoothing", m.bladeSmoothing);
     put("wristMaxAngle", m.wristMaxAngle);
+    put("steerSpeedLoMps", m.steerSpeedLoMps);
+    put("steerSpeedHiMps", m.steerSpeedHiMps);
+    put("steerFloor", m.steerFloor);
+    put("elbowPoleCone", m.elbowPoleCone);
+    put("elbowAxisCone", m.elbowAxisCone);
     put("edgeFloor", m.edgeFloor);
     put("blockGapM", m.blockGapM);
     put("blockItemDamage", m.blockItemDamage);

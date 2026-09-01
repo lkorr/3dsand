@@ -756,13 +756,22 @@ void AnimClampPoseLimits(const AnimSkeleton& sk, AnimState& st,
           const float b = ov.blend > 1.0f ? 1.0f : ov.blend;
           const Vec3 a = raw.normalized();
           const Vec3 o = ov.axis.normalized();
-          // SIGN-FIX THE AUTHORED AXIS TOWARD THE OVERRIDE, never the other way
-          // round. Either sense names the same plane, but only one of them
-          // makes the joint's authored [min, max] describe the bend it is
-          // actually in — and the caller has already MEASURED which one that
-          // is (see the note at ApplyWeaponArm's sign block). Flipping the
-          // override to match the authored axis instead would undo that
-          // measurement and clamp a legitimately-bent elbow straight.
+          // A DEFENSIVE SIGN FIX, and as of 2026-09-01 a no-op for the one
+          // caller that exists. Mob::ApplyWeaponArm now bounds its override to
+          // a CONE about this very axis (the shoulder's authored twist range),
+          // so `a.dot(o)` is positive by construction there and `as == a`.
+          //
+          // It stays because this is a public interface and the invariant it
+          // protects is not one a future caller can be assumed to know: the
+          // two senses name the same PLANE but only one makes the joint's
+          // authored [min, max] describe the bend it is actually in, and
+          // blending an axis against its own negation passes through zero,
+          // where `len > 1e-5f` below silently drops the clamp entirely.
+          //
+          // It was previously the OTHER half of a scheme in which the caller
+          // re-signed its override to force a positive bend; that turned the
+          // elbow's one-way `[0, 130]` hinge into a rubber stamp and is the
+          // reported "the elbow bends both ways". See ApplyWeaponArm.
           //
           // The flip is only ever applied while blending; at blend 1 the
           // authored axis drops out entirely.

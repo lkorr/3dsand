@@ -786,6 +786,11 @@ void ApplyMeleeTuning(MeleeTuning& dst, const Tuning& t) {
   dst.swingExtend = m.swingExtend;
   dst.bladeSmoothing = m.bladeSmoothing;
   dst.wristMaxAngle = m.wristMaxAngle;
+  dst.steerSpeedLo = MetresPerSecToCells(m.steerSpeedLoMps);
+  dst.steerSpeedHi = MetresPerSecToCells(m.steerSpeedHiMps);
+  dst.steerFloor = m.steerFloor;
+  dst.elbowPoleCone = m.elbowPoleCone;
+  dst.elbowAxisCone = m.elbowAxisCone;
   dst.edgeFloor = m.edgeFloor;
   dst.blockGap = MetresToCells(m.blockGapM);             // m -> voxels
   dst.blockItemDamage = m.blockItemDamage;
@@ -874,6 +879,12 @@ WeaponPose MeleeState::Pose() const {
   p.bendPole = bendPole_;
   p.weight = PoseWeight();
   p.wristMaxAngle = tuning.wristMaxAngle;
+  // THE THROTTLE, not the ceiling. Computed here rather than in the rig
+  // because the phase and the tip speed are the driver's own state, and the
+  // WeaponPose::wristMaxAngle precedent says which side of the seam a number
+  // like this belongs on: the driver owns the feel, the rig owns the anatomy.
+  p.steerAmount = steerLive_;
+  p.elbowAxisCone = tuning.elbowAxisCone;
   // The driver ALWAYS steers the blade. The flag exists for the other caller:
   // Mob::SetWeaponPose's legacy four-argument form, which the pose-limit gates
   // use to drive the arm at a bare point with no opinion about the weapon.
@@ -923,6 +934,7 @@ void MeleeState::Reset() {
   tipVel_ = Vec3{};
   tangent_ = Vec3{};
   extendLive_ = 0;
+  steerLive_ = std::clamp(tuning.steerFloor, 0.0f, 1.0f);
   framePrimed_ = false;
   recoverHold_ = false;
 }
@@ -1134,6 +1146,85 @@ void MeleeState::RebuildFrame(float dt, const Vec3& right, const Vec3& up,
     poleL_ = Lerp(poleL_, wantPole.normalized(), a);
     poleL_ = poleL_ - handDir * handDir.dot(poleL_);
     poleL_ = poleL_.len() > 1e-5f ? poleL_.normalized() : AnyPerp(handDir);
+    // ---- AND THE ELBOW MAY NOT COME FORWARD ------------------------------
+    //
+    // The pole above is built from the HAND'S TRAVEL, so it points wherever
+    // the hand happens to be going — including straight out in front of the
+    // character, which asks the solver for an elbow bulging forward past the
+    // fist. A human elbow does not do that: it trails down, back or out, and
+    // the plane it bends in is bounded by the shoulder rather than free.
+    //
+    // Bounded HERE rather than in the rig because this is where the plane is
+    // chosen; the rig's own bound (mob.cpp, the hinge-axis cone) is the second
+    // half of the same constraint and the two are deliberately independent —
+    // an unbounded pole handed to a bounded axis is a solve the clamp then has
+    // to throw away, which is the 'clampRot 1.23 shift 2.88' snap.
+    //
+    // The reference is straight back in the DRIVER'S basis, which is the same
+    // [0,0,-1] the no-travel fallback already uses and these rigs' authored
+    // arm pole. A cone rather than a half-space so the bound is continuous:
+    // clamping a direction to a plane leaves it free to slide along that
+    // plane, and the elbow would still swing through 180 degrees inside it.
+    {
+      const Vec3 ref{0, 0, -1};
+      const float cone = std::clamp(tuning.elbowPoleCone, 0.05f, 3.10f);
+      const float c = std::clamp(poleL_.dot(ref), -1.0f, 1.0f);
+      if (std::acos(c) > cone) {
+        // Rotate `ref` toward the wanted pole by exactly `cone`, in the plane
+        // the two span. Degenerate only when they are antiparallel, and then
+        // any perpendicular does: the answer is `cone` off the reference and
+        // the direction within the cone's rim is arbitrary by construction.
+        Vec3 perp = poleL_ - ref * c;
+        if (perp.len() < 1e-4f) perp = AnyPerp(ref);
+        perp = perp.normalized();
+        poleL_ = ref * std::cos(cone) + perp * std::sin(cone);
+        // Re-orthogonalize against the arm, as above: a pole with a component
+        // along the chain is a hint the solver has to rescue.
+        poleL_ = poleL_ - handDir * handDir.dot(poleL_);
+        poleL_ = poleL_.len() > 1e-5f ? poleL_.normalized() : AnyPerp(handDir);
+      }
+    }
+  }
+
+  // ---- HOW COMMITTED THIS IS, AND THEREFORE HOW MUCH WRIST TO SPEND -------
+  //
+  // See MeleeTuning::steerSpeedLo. The target is a step function of the phase
+  // and a ramp on the tip's speed; `steerLive_` eases onto it so that a commit
+  // does not snap the fist.
+  //
+  // TWO CHOICES HERE ARE NOT COSMETIC, and both are measured on swing-plane
+  // rather than reasoned:
+  //
+  //   1. THE SPEED IS THE INSTANTANEOUS ONE, not `tipVel_`. `tipVel_` is a
+  //      smoothed VECTOR, so its magnitude COLLAPSES through a direction
+  //      reversal — the two halves of the average cancel — and a player
+  //      dragging the mouse right and then left is moving the blade fastest at
+  //      exactly the tick that average calls "still". The blade relaxed to its
+  //      grip angle mid-drag: pass 0 read a 13.16-voxel worst residual against
+  //      a 3.92 bound, on a mean of 4.08.
+  //   2. THE ENVELOPE IS ASYMMETRIC. Rising fast is what lands a commit inside
+  //      one tick instead of four; falling slow is what stops a momentary lull
+  //      inside a stroke from dropping the alignment. Symmetric on the blade
+  //      halflife cost pass A 0.62 rad of extra swept arc and pass B 0.36 —
+  //      the ramp transient being measured as swing.
+  //
+  // The two halflives are DERIVED from `bladeSmoothing` rather than being two
+  // more knobs: this envelope is the same continuity mechanism as the blade
+  // frame's, and a pair that could be set to disagree with it would only ever
+  // be set wrong. Attack is half that halflife, release four times it.
+  {
+    float want = 1.0f;
+    if (phase_ == SwingPhase::Idle || phase_ == SwingPhase::Guard) {
+      const float floorF = std::clamp(tuning.steerFloor, 0.0f, 1.0f);
+      const float lo = std::max(tuning.steerSpeedLo, 0.0f);
+      const float hi = std::max(tuning.steerSpeedHi, lo + 1e-3f);
+      const float v = inst.len();
+      const float k = std::clamp((v - lo) / (hi - lo), 0.0f, 1.0f);
+      want = floorF + (1.0f - floorF) * k;
+    }
+    const float ease = SmoothAlpha(
+        tuning.bladeSmoothing * (want > steerLive_ ? 0.5f : 4.0f), dt);
+    steerLive_ = framePrimed_ ? steerLive_ + (want - steerLive_) * ease : want;
   }
 
   tip_ = ToWorld(tipL, right, up, fwd);

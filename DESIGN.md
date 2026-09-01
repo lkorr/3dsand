@@ -2389,6 +2389,33 @@ it also fought the animation pipeline and widened the walk until the legs failed
 their own upright assertion — a "leg bug" whose cause was the thing the
 character was holding.
 
+**...and the wrist RAMPS with commitment** (2026-09-01, four owner-reported
+regressions). The stroke always commands the blade along its law-of-cosines
+direction, which is mostly radial — correct for a cut, and wrong for a hold,
+because it wrenches the fist round to lay the sword along the shoulder-to-point
+line whatever the player is doing. A stroke seeded from a hanging arm then had
+that radius aimed at the floor, and holding a guard pointed the sword straight
+down. So `WeaponPose::steerAmount` (0..1) throttles the applied alignment on the
+tip's own speed: still is the authored GRIP pose, moving is full alignment,
+committed phases bypass the ramp. The DRIVER owns it (it knows the phase and the
+speed) and the RIG applies it, the same seam `WeaponPose::wristMaxAngle` already
+crosses. Take-over stays continuous because `SetStroke` re-seeds from the rig's
+actual blade every tick.
+
+Two facts underneath it are worth keeping because both were got wrong first:
+the GRIP is `[0,-90,0]` — blade out of the fist, perpendicular to the forearm,
+and world-up when the arm is forward — and the along-the-arm `[0,0,-90]` grip
+that replaced it briefly bought nothing (the wrist ask is 2.6..3.1 rad either
+way) while costing the idle pose, which is what the player looks at for most of
+a session. And **"the elbow bends both ways" is a fact about the POLE, not
+about the hinge axis**: a two-bone solve has no backwards, since an elbow
+"bending the wrong way" in plane P is the same arm SHAPE as one bending the
+right way in the plane rotated by pi. What is wrong is which side the elbow
+bulges to, so the bound is on the bend plane (`MeleeTuning::elbowPoleCone` —
+down, up or out, never forward) and the hinge-axis override goes on reporting
+the solve plane faithfully, which is what keeps `ClampHinge` from discarding
+real solve.
+
 **One driver, two consumers.** `MeleeState` consumes abstract control deltas
 (`Feed(dx, dy)` / `FeedReach(dr)` / `Step(StrokeSample)`), not a mouse, and
 `Mob::ApplyWeaponArm` is shared by the avatar's animation pass and the NPC one.

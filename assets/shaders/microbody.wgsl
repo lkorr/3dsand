@@ -277,11 +277,17 @@ fn fs(in : VSOut) -> FSOut {
   // colour identically and index 1 means the same colour in each. It used to be
   // a raw .vox palette slot rebased by ART_SLOT_MIN, which capped the merged
   // palette at 128 for no reason but the rebasing (see world.h).
+  //
+  // paletteJitter, NOT paletteColor: `c` is a brick cell, and a brick cell has
+  // no state nibble at all — the number below is a positional hash this shader
+  // invents for texture. paletteColor() would read it as a MATF_TINTED
+  // material's DYE INDEX, which is what made a steel blade and every
+  // one-material-per-colour mob draw as a zebra (common.wgsl).
   var albedo : vec3f;
   if (hitArt != 0u) {
     albedo = unpackColor(materials[ART_PALETTE_BASE + (hitArt - 1u)].color0);
   } else {
-    albedo = paletteColor(mat, u32(c.x * 7 + c.y * 13 + c.z * 29), &materials);
+    albedo = paletteJitter(mat, u32(c.x * 7 + c.y * 13 + c.z * 29));
   }
 
   // `tCur` is already the parameter along the UNNORMALIZED camera-to-fragment

@@ -887,7 +887,11 @@ struct Tuning {
     float aimGainY = 0.0067f;        // radians of tip elevation per mouse pixel
     float reachGainM = 0.0030f;      // metres of tip reach per dReach unit
     // ---- where the point may go --------------------------------------------
-    float azOut = 2.36f;             // radians, to the weapon side
+    // 2.36 (135 deg) drove the commanded point BEHIND the character and parked
+    // the shoulder ball on its authored 50-degrees-past-the-back-plane stop.
+    // 1.83 is 105 deg: the whole front plus a little past side-on. The full
+    // note is on MeleeTuning::azOut in game/melee.h.
+    float azOut = 1.83f;             // radians, to the weapon side
     float azAcross = 1.40f;          // radians, across the body
     float elMin = -1.50f;            // radians, arm hanging at the side
     float elMax = 1.48f;             // radians, overhead
@@ -930,12 +934,42 @@ struct Tuning {
     // and its az/el tracking, planarity and diagonal ratio all fall inside
     // their bounds instead of outside them.
     //
-    // OWNER ITEM, and the reason this is not simply "the wrist is 160 degrees":
-    // the standing ~pi is a GRIP question. Authoring the neutral roll into
-    // {sword,cleaver}.json would let this come back down to a real wrist. The
-    // naive attempt ([180,0,-90]) makes the follow residual worse (8.08), so
-    // it is a piece of work rather than a sign flip.
+    // AND THE GRIP THE MIDDLE ROW WAS AUTHORED FOR IS GONE (2026-09-01). The
+    // `[0,0,-90]` along-the-arm grip was landed to buy budget here, and the
+    // measurement above is the proof it never did: the ask is 2.6..3.1 rad
+    // WHICHEVER grip is authored, so the cap ended at 3.10 either way. What
+    // the grip cost instead was the idle pose — at weight 0 nothing steers and
+    // the blade simply lay down the forearm, hilt through the fist. The grip
+    // is back to `[0,-90,0]` and this number is unchanged, which is the whole
+    // evidence that it was never the grip's number.
+    //
+    // OWNER ITEM: the standing ~pi of roll is still a GRIP question, and
+    // authoring the neutral roll into {sword,cleaver}.json would let this come
+    // down to a real wrist. The naive attempt ([180,0,-90]) made the follow
+    // residual worse (8.08), so it is a piece of work rather than a sign flip.
     float wristMaxAngle = 3.10f;
+    // ---- HOW MUCH OF THAT IS APPLIED, AND WHEN -----------------------------
+    // The wrist RAMPS with commitment. Above is the ceiling; this is the
+    // throttle. A blade held still keeps the orientation the solved forearm
+    // gives it (the authored grip: blade out of the fist, and UP when the arm
+    // is forward), and a moving one is aligned to the stroke. Without it a
+    // motionless guard was still wrenched round to lay the blade along the
+    // shoulder-to-point radius, which is "the sword points vertically down".
+    //
+    // Tip speed in m/s, converted to world voxels/sec by ApplyMeleeTuning like
+    // the damage ramp beside it. Committed phases bypass the ramp entirely.
+    float steerSpeedLoMps = 0.25f;   // below: the grip pose
+    float steerSpeedHiMps = 1.10f;   // above: full alignment to the stroke
+    float steerFloor = 0.15f;        // applied at and below the low speed
+    // ---- WHAT THE ARM MAY DO WHILE IT SERVES THE BLADE ---------------------
+    // Radians. `elbowPoleCone` bounds the bend PLANE the driver asks for, off
+    // straight-back in its own basis; `elbowAxisCone` caps how far the rig's
+    // hinge-axis override may sit from the forearm's AUTHORED axis, and the
+    // rig takes the tighter of it and the shoulder's own authored twist range.
+    // Both exist because an unbounded override turned a one-way elbow into a
+    // joint that bent either way — see game/melee.h and game/mob.cpp.
+    float elbowPoleCone = 1.75f;     // 100 deg: down, up or out, never forward
+    float elbowAxisCone = 3.14f;     // pi = OFF; an A/B knob, see game/mob.cpp
     float edgeFloor = 0.35f;         // damage floor for a flat-on slap
     // ---- BLADE ON BLADE (game/melee.h MeleeSweepDamage's parry block) -------
     // The four knobs a parry has. They are `melee.*` rather than `combatfx.*`

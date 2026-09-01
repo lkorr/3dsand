@@ -6429,19 +6429,27 @@ void Mob::AppendDebugBoxes(std::vector<DebugBox>& out, size_t limit,
 // The system-wide early-out is what makes it free in a world where nothing has
 // been hit, which is nearly always (rule 2).
 void MobSystem::DecayHitFlash(float dt) {
+  for (Mob& mob : mobs_) mob.DecayHitFlash(dt);
+}
+
+// The per-creature half, so the avatar — a Mob that main.cpp owns OUTSIDE
+// mobs_ — can age its own flashes. Before the split it could not: any sever
+// on the player set flashSever on the stump's parent and nothing ever decayed
+// it, so the surviving limb glowed at full brightness for the rest of the
+// session, whatever caused the amputation.
+void Mob::DecayHitFlash(float dt) {
   if (dt <= 0.0f) return;
   const float halflife = std::max(CurrentTuning().combatfx.flashHalflife, 0.01f);
   const float k = std::exp2(-dt / halflife);
-  for (Mob& mob : mobs_)
-    for (MobLimb& limb : mob.limbs_) {
-      if (limb.hitFlash <= 0.0f) continue;
-      limb.hitFlash *= k;
-      // Snap the tail to zero rather than letting it asymptote: an exponential
-      // never reaches 0, and a limb left holding 1e-12 forever would keep this
-      // loop doing multiplications for the rest of the session for a value no
-      // display can show.
-      if (limb.hitFlash < 0.002f) limb.hitFlash = 0.0f;
-    }
+  for (MobLimb& limb : limbs_) {
+    if (limb.hitFlash <= 0.0f) continue;
+    limb.hitFlash *= k;
+    // Snap the tail to zero rather than letting it asymptote: an exponential
+    // never reaches 0, and a limb left holding 1e-12 forever would keep this
+    // loop doing multiplications for the rest of the session for a value no
+    // display can show.
+    if (limb.hitFlash < 0.002f) limb.hitFlash = 0.0f;
+  }
 }
 
 void MobSystem::FlashBody(uint64_t bodyHandle, float amount) {
@@ -7979,15 +7987,44 @@ void Mob::ApplyWeaponArm(const AnimSkeleton& sk, AnimState& st,
         // inv(model[par] * rest) * n.
         const Quat frame = QuatMul(st.model[forePar].rot, fore.rest.rot);
         Vec3 axis = QuatRotateInv(frame, n.normalized());
-        // AND ITS SIGN IS NOT FREE. A hinge's range is authored [0, 130], so an
-        // axis whose sense makes the SOLVED bend negative is clamped straight
-        // to zero — a 70-degree correction that throws the arm across the room.
-        // Either sense names the same plane, so pick the one the elbow is
-        // actually bent about by measuring, not by matching the authored axis:
-        // when the pole swings round, the solver's plane genuinely flips
-        // relative to the authored one and matching would choose the wrong half
-        // every time. (Measured as `clampRot 1.23 shift 2.88`, on exactly the
-        // ticks where the stroke crossed the arm's own line.)
+        // ---- AND ITS SIGN, AND WHY THE ANATOMY IS NOT ENFORCED HERE ---------
+        //
+        // "THE ELBOW BENDS BOTH WAYS" IS A FACT ABOUT THE POLE, NOT ABOUT THIS
+        // AXIS, and that is the correction 2026-09-01 made. The obvious repair
+        // for the report was to stop re-signing the override (below) and to
+        // pen the axis into a cone about the forearm's AUTHORED one, on the
+        // theory that re-aiming an elbow's bend plane is physically a shoulder
+        // twist and the rigs author `twist: [-75, 75]`. It was tried, measured
+        // and is wrong twice over:
+        //
+        //   * GEOMETRICALLY there is no such thing as a backwards two-bone
+        //     solve. An elbow "bending the other way" in plane P is the same
+        //     ARM SHAPE as one bending the correct way in the plane rotated by
+        //     pi. What is wrong when a player sees a backwards elbow is WHICH
+        //     SIDE the elbow bulges to — and that is chosen entirely by the
+        //     POLE, which is now bounded where it is built (game/melee.cpp,
+        //     MeleeTuning::elbowPoleCone: down, up or out, never forward).
+        //   * MECHANICALLY, penning the axis makes the clamp LOSSY. ClampHinge
+        //     keeps only the component about the axis it is given and discards
+        //     the rest, so an axis that is not the plane the arm actually bends
+        //     in throws away real solve. Measured on `swing-plane` with a 75
+        //     degree cone: pass A's elbow clamp went from ~0 to 1.76 rad and
+        //     dragged the hand 4.42 voxels off target, taking A, B and C down
+        //     with it. A horizontal cut legitimately wants a bend plane whose
+        //     normal is vertical, which is 90 degrees off the resting axis.
+        //
+        // So the override REPORTS the solve plane faithfully and the sign is
+        // chosen by measuring, which keeps the clamp lossless:
+        //
+        // Either sense names the same plane, but a hinge's range is authored
+        // [0, 130], so an axis whose sense makes the SOLVED bend negative is
+        // clamped straight to zero — a 70-degree correction that throws the arm
+        // across the room. Pick the one the elbow is actually bent about by
+        // measuring, not by matching the authored axis: when the pole swings
+        // round, the solver's plane genuinely flips relative to the authored
+        // one and matching would choose the wrong half every time. (Measured as
+        // `clampRot 1.23 shift 2.88`, on exactly the ticks where the stroke
+        // crossed the arm's own line.)
         //
         // MEASURED WITH THE CLAMP'S OWN FUNCTION, and that is the whole of the
         // fix. This block used to carry its own copy of the projection, and the
@@ -8002,7 +8039,36 @@ void Mob::ApplyWeaponArm(const AnimSkeleton& sk, AnimState& st,
         // driver's arc as planar to 1.09 voxels and the posed sword as 10.58
         // voxels off it, 1.52 rad out of level — "the swing wanders". One
         // shared function, one wrap, both readings agree.
-        {
+        const Vec3 authored = fore.poseAxis.len() > 1e-5f
+                                  ? fore.poseAxis.normalized()
+                                  : Vec3{1, 0, 0};
+        // THE CONE IS KEPT AS A KNOB AND DEFAULTS TO OFF (pi). It is the A/B
+        // for everything above — one `melee.elbowAxisCone` edit in tuning.json,
+        // no rebuild, and the swing-plane arm line reports what it cost. A rig
+        // whose solver is later taught to twist its shoulder onto the authored
+        // hinge would want it back on.
+        float cone = std::max(weapon_.elbowAxisCone, 0.0f);
+        const PoseBallLimit& ball = sk.parts[i0].poseBall;
+        if (ball.has && ball.hasTwist)
+          cone = std::min(cone, std::max(std::fabs(ball.twistMin),
+                                         std::fabs(ball.twistMax)));
+        const bool bounded = weapon_.elbowAxisCone < 3.13f;
+        if (bounded) {
+          // Nearer sense to the authored axis, then pen it. Deliberately NOT
+          // the measured-bend rule: inside a cone this narrow the authored
+          // sense is what makes the authored [min, max] mean what it says.
+          if (axis.dot(authored) < 0.0f) axis = axis * -1.0f;
+          const float c = std::clamp(axis.dot(authored), -1.0f, 1.0f);
+          if (std::acos(c) > cone) {
+            Vec3 perp = axis - authored * c;
+            if (perp.len() < 1e-4f) {
+              axis = authored;
+            } else {
+              perp = perp.normalized();
+              axis = authored * std::cos(cone) + perp * std::sin(cone);
+            }
+          }
+        } else {
           const Quat delta =
               QuatNormalize(QuatMul(QuatConj(fore.rest.rot),
                                     QuatMul(QuatConj(st.model[forePar].rot),
@@ -8014,6 +8080,8 @@ void Mob::ApplyWeaponArm(const AnimSkeleton& sk, AnimState& st,
         ov.part = i1;
         ov.axis = axis;
         ov.blend = weight;
+        weaponDiag_.elbowAxisTurn = std::acos(std::clamp(
+            axis.normalized().dot(authored), -1.0f, 1.0f));
       }
     }
   }
@@ -8068,10 +8136,23 @@ void Mob::ApplyWeaponArm(const AnimSkeleton& sk, AnimState& st,
     const float wAbs = std::fabs(delta.w) > 1.0f ? 1.0f : std::fabs(delta.w);
     const float ang = 2.0f * std::acos(wAbs);
     const float lim = std::max(weapon_.wristMaxAngle, 0.0f);
-    weaponDiag_.wristWant = ang;
-    weaponDiag_.wristApplied = std::min(ang, lim);
+    // A CEILING AND A THROTTLE, in that order, and the order is the whole
+    // point. `wristMaxAngle` says how far a wrist CAN go; `steerAmount` says
+    // how much of the alignment this stroke is asking for — near 0 while the
+    // blade is merely being held, 1 through a committed cut (melee.h
+    // MeleeTuning::steerSpeedLo). Clamping first and scaling second means the
+    // throttle interpolates between two poses the wrist can actually reach:
+    // the grip pose the solved forearm gives for free, and the legal limit of
+    // the commanded one. Scaling first would let a huge illegal ask survive as
+    // a small legal-looking fraction of itself, which is a different pose
+    // entirely and moves as the ask does rather than as the stroke does.
     if (ang > lim && ang > 1e-4f)
       delta = QuatSlerp(Quat{0, 0, 0, 1}, delta, lim / ang);
+    const float steer = std::clamp(weapon_.steerAmount, 0.0f, 1.0f);
+    if (steer < 1.0f) delta = QuatSlerp(Quat{0, 0, 0, 1}, delta, steer);
+    weaponDiag_.wristWant = ang;
+    weaponDiag_.wristApplied = std::min(ang, lim) * steer;
+    weaponDiag_.steerAmount = steer;
   }
   const Quat handRot = QuatNormalize(QuatMul(delta, rigid));
   st.model[handPart].rot = QuatSlerp(rigid, handRot, weight);

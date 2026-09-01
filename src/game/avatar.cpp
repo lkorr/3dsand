@@ -1463,6 +1463,11 @@ void PlayerAvatar::PreTick(uint32_t tick, const Player& player, float heading,
   // OnBodyReleasedToWorld override).
   DrainPendingSpawns(world, spawns);
   TickSeveredHolds(dt);
+  // ...and the hit flash, which is the same kind of thing: per-limb state that
+  // MobSystem::PreTick ages for every NPC and that nothing else ages for the
+  // avatar. Without this line a severed player limb leaves its stump lit at
+  // combatfx.flashSever forever (the reported permanent glow).
+  DecayHitFlash(dt);
 
   if (alive_) {
     // The body follows the PLAYER, which is the whole difference from a mob.

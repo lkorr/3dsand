@@ -743,6 +743,12 @@ class Mob {
   // ---- per-tick body upkeep (called by the driver) --------------------------
   void TickSeveredHolds(float dt);
   void DrainPendingSpawns(World& world, std::vector<ParticleSpawn>& spawns);
+  // Age THIS creature's hit flashes (MobLimb::hitFlash). Split out of
+  // MobSystem::DecayHitFlash because the avatar is a Mob that lives OUTSIDE
+  // mobs_ (main.cpp owns it directly): the system loop never reached it, so a
+  // severed player limb left its stump lit at combatfx.flashSever forever.
+  // Every driver that runs the other upkeep above must run this beside it.
+  void DecayHitFlash(float dt);
   // Bleeding: decaying wound budgets, dismemberment gouts, bounded ops.
   // `bleedOps` is the shared per-tick drip budget counter.
   void BleedTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
@@ -927,7 +933,16 @@ class Mob {
     bool ran = false;
     float ikMiss = 0;        // hand target -> solved hand, world voxels
     float wristWant = 0;     // radians the blade asked the wrist to travel
-    float wristApplied = 0;  // ...and what the wrist limit allowed
+    float wristApplied = 0;  // ...and what the limit AND the throttle allowed
+    // 0..1, WeaponPose::steerAmount as the rig received it. The two above are
+    // uninterpretable without it: `wristWant 2.9, wristApplied 0.4` is a wrist
+    // clamped to nothing when the throttle is 1 and a blade correctly resting
+    // at its grip angle when the throttle is 0.15.
+    float steerAmount = 1;
+    // Radians the steered elbow hinge axis ended up from the forearm's
+    // AUTHORED one, after the shoulder-twist cone (mob.cpp step 2). At the
+    // cone it is the bound binding; well inside it the plane is free.
+    float elbowAxisTurn = 0;
     float clampMove = 0;     // radians AnimClampPoseLimits then took back
     float clampShift = 0;    // ...and how far it moved the HAND, world voxels
     float shoulderClamp = 0; // radians the ball limit took off the shoulder

@@ -433,7 +433,8 @@ Status GateSwing(Ctx& c, std::string& detail) {
     // supposed to be NEGATIVE, and a max() seeded at zero can only ever report
     // zero — a check that passes and fails for the same reason.
     float worstFlat = 0, worstPole = -1e9f, worstBlade = 0;
-    int samples = 0;
+    float worstOffTrail = -1e9f, worstOffCone = 0;
+    int samples = 0, offTrail = 0;
     for (int i = 0; i < 50; i++) {
       m.SetStroke(m.HandOffset(), m.TipOffset(), m.BladeFlat(), kRestReach);
       Step(m, -kNoCommitPx * 0.6f, 0);
@@ -447,9 +448,33 @@ Status GateSwing(Ctx& c, std::string& detail) {
       if (i < 32) continue;
       samples++;
       worstFlat = std::max(worstFlat, std::fabs(m.BladeFlat().dot(dir)));
-      // The pole is where the ELBOW bulges, and it must be opposite the travel:
-      // that is what puts the arm's bend plane IN the plane of the cut.
-      worstPole = std::max(worstPole, m.BendPole().dot(dir));
+      // ---- THE POLE TRAILS THE TRAVEL, OR IT IS PINNED AT THE ANATOMY -----
+      //
+      // The pole is where the ELBOW bulges, and opposite the travel is what
+      // puts the arm's bend plane IN the plane of the cut. It is no longer the
+      // whole claim, and the reason is a real bound rather than a slipped
+      // number: `MeleeTuning::elbowPoleCone` (2026-09-01) stops the elbow
+      // coming FORWARD of the body, because "the elbow bends both ways" turned
+      // out to be a fact about which side it bulges to and not about the hinge
+      // (see game/mob.cpp). Late in a sweep across the body, "opposite the
+      // travel" IS forward, and the two genuinely disagree.
+      //
+      // So the assertion is a disjunction, per tick: either the pole trails
+      // the travel, or it is sitting on the cone RIM — the nearest legal
+      // direction to trailing. What it may never be is somewhere else, which
+      // is what an unbounded pole or a botched clamp would produce. Measured
+      // with the bound off, this loop reports -0.99; with it on, -0.16 and
+      // every off-trail tick pinned at the rim.
+      const float opp = m.BendPole().dot(dir);
+      worstPole = std::max(worstPole, opp);
+      const float coneNow =
+          std::acos(std::clamp(m.BendPole().dot(kFwd * -1.0f), -1.0f, 1.0f));
+      const bool pinned = coneNow >= t.elbowPoleCone - 0.03f;
+      if (opp >= -0.5f && !pinned) {
+        offTrail++;
+        worstOffTrail = std::max(worstOffTrail, opp);
+        worstOffCone = coneNow;
+      }
       // ...and the hand is still the tip minus a blade.
       worstBlade = std::max(
           worstBlade,
@@ -457,8 +482,11 @@ Status GateSwing(Ctx& c, std::string& detail) {
     }
     std::printf(
         "swing block 9: worst |flat.travel| %.3f, worst pole.travel %.3f, "
-        "worst blade-length drift %.3f vox\n",
-        worstFlat, worstPole, worstBlade);
+        "worst blade-length drift %.3f vox; %d ticks off-trail and not pinned "
+        "at the elbow cone (worst %.3f at %.2f rad of %.2f)\n",
+        worstFlat, worstPole, worstBlade, offTrail,
+        offTrail ? worstOffTrail : 0.0f, offTrail ? worstOffCone : 0.0f,
+        t.elbowPoleCone);
     // SAMPLES > 0 IS NOT PEDANTRY. `worstPole` is a max() over a quantity that
     // is supposed to be NEGATIVE, so a run that took no samples at all leaves it
     // at -infinity and every check below passes for the worst possible reason.
@@ -468,9 +496,9 @@ Status GateSwing(Ctx& c, std::string& detail) {
     check(samples > 8, "the settled part of the stroke was actually measured");
     check(worstFlat < 0.2f,
           "the blade's FLAT stays square to the travel, i.e. the edge leads");
-    check(worstPole < -0.5f,
+    check(offTrail == 0,
           "the elbow trails the hand along the stroke (the bend plane IS the "
-          "cut plane)");
+          "cut plane) - or is pinned at its anatomical cone, never elsewhere");
     check(worstBlade < 0.35f,
           "the hand stays exactly one blade behind the point");
   }
@@ -1139,10 +1167,29 @@ Status GateSwingPlane(Ctx& c, std::string& detail) {
   // reach, or the wrist clamp is fighting, or the pose limits are eating the
   // solve — and the sweeps below are then measuring the rig, not the mapping.
   {
+    // ---- AND THE FIRST TWO TICKS ARE NOT PART OF THE CLAIM -----------------
+    //
+    // TAKE-OVER IS A RAMP BY DESIGN, and since the wrist steer throttle landed
+    // (melee.h MeleeTuning::steerSpeedLo) it is a ramp in ORIENTATION as well
+    // as in position. Control starts at the blade's actual pose — which, on a
+    // still mouse, is the pose the authored GRIP gives it — and eases into the
+    // commanded alignment over the envelope's attack as soon as the stroke is
+    // moving. The first tick or two of any stroke therefore have the sword
+    // where the grip put it rather than where the stroke asks, on purpose, and
+    // it is the same continuity property the whole take-over design is built
+    // on: nothing may pop on the tick the player clicks.
+    //
+    // So the ASSERTION is on the settled residual and the transient is
+    // reported beside it, rather than the bound being loosened to swallow
+    // both. Measured here: worst 4.40 vox over all 24 ticks, 1.02 from tick 3
+    // on, against a 3.92 bound at r 11.20.
     melee.Reset();
     drive(0, 0, true);
-    float worst = 0, mean = 0, gapWorst = 0;
-    int n = 0;
+    float worst = 0, worstSettled = 0, mean = 0, gapWorst = 0;
+    float worstSteer = 1.0f;
+    int n = 0, worstTick = -1;
+    Mob::WeaponArmDiag worstFollowDiag{};
+    const int kSettleTicks = 3;
     for (int i = 0; i < 24; i++) {
       drive(i < 12 ? 12.0f : -12.0f, 0, true);
       const BladeRead b = readBlade();
@@ -1150,7 +1197,18 @@ Status GateSwingPlane(Ctx& c, std::string& detail) {
       const Vec3 want = melee.TipOffset();
       const float err = (b.fromShoulder - want).len();
       gapWorst = std::max(gapWorst, b.physGap);
-      worst = std::max(worst, err);
+      if (err > worst) {
+        // WHY, at the point of failure. A bare "worst residual 4.40" names
+        // none of the four things that produce it (CLAUDE.md rule 6), and the
+        // throttle added a fifth: a blade that is deliberately NOT aligned
+        // because the stroke is not committed reads exactly like a wrist that
+        // could not reach.
+        worst = err;
+        worstTick = i;
+        worstSteer = melee.SteerAmount();
+        worstFollowDiag = avatar.WeaponArmDiagnostics();
+      }
+      if (i >= kSettleTicks) worstSettled = std::max(worstSettled, err);
       mean += err;
       n++;
     }
@@ -1159,14 +1217,262 @@ Status GateSwingPlane(Ctx& c, std::string& detail) {
     const float followMax = (float)BaselineNumber("swingPlane.followMaxFrac", 0.35);
     const float rNow = std::max(melee.StrokeRadius(), 1e-3f);
     check(n > 18, "the blade stayed readable through the follow test");
-    check(worst < followMax * rNow,
+    check(worstSettled < followMax * rNow,
           "the SWORD goes where the stroke says it goes (if this fails, every "
           "sweep below is measuring the rig and not the mapping)");
     RecordObserved("swingPlane.followWorstObserved", worst);
+    RecordObserved("swingPlane.followSettledObserved", worstSettled);
     std::printf(
-        "swing-plane 0 (follow): worst residual %.2f vox, mean %.2f, over "
-        "%d ticks at r %.2f (max %.2f)\n",
-        worst, mean, n, rNow, followMax * rNow);
+        "swing-plane 0 (follow): worst residual %.2f vox over all ticks, %.2f "
+        "from tick %d on, mean %.2f, over %d ticks at r %.2f (max %.2f)\n"
+        "swing-plane 0 (at worst): tick %d, steer %.2f, wrist %.2f/%.2f rad, "
+        "ikMiss %.2f, clamp %.2f rad (%.2f vox), shoulder %.2f, elbow %.2f\n",
+        worst, worstSettled, kSettleTicks, mean, n, rNow, followMax * rNow,
+        worstTick, worstSteer, worstFollowDiag.wristApplied,
+        worstFollowDiag.wristWant, worstFollowDiag.ikMiss,
+        worstFollowDiag.clampMove, worstFollowDiag.clampShift,
+        worstFollowDiag.shoulderClamp, worstFollowDiag.elbowClamp);
+  }
+
+  // ---- R/G. WHERE THE SWORD POINTS WHEN NOBODY IS SWINGING IT -------------
+  //
+  // Every other pass in this gate measures a MOVING blade, and the whole set
+  // of them was green while the sword looked wrong for 99% of a session. Four
+  // owner reports, all about a blade that is not being swung:
+  //
+  //   "the hilt sticks through the hand instead of jutting out of the fist"
+  //   "the wrist only aligns while actively swinging"
+  //   "holding the hand out in front, the sword points vertically DOWN"
+  //   "I want it pointing outward in front at rest, and UP with the arm out"
+  //
+  // Two poses, two properties, and neither is a swing:
+  //
+  //   R (REST). Idle: `weaponWeight_` is 0, ApplyWeaponArm returns before it
+  //     steers anything, and the item renders at `handQ * gripRot`. So this
+  //     measures the AUTHORED GRIP and nothing else. A grip that lays the
+  //     blade along the forearm passes every dynamic assertion in this file
+  //     and is a hilt buried in a fist.
+  //   G (GUARD, HELD STILL). The button is down and the mouse is not moving.
+  //     The stroke still commands the blade along its (mostly radial)
+  //     law-of-cosines direction, so with the wrist applied at full strength
+  //     the fist is wrenched round to lay the sword along the shoulder-to-
+  //     point line — pointing DOWN the arm rather than up out of it. The
+  //     steer ramp (melee.h MeleeTuning::steerSpeedLo) is what makes this a
+  //     grip pose again, and this pass is what says so.
+  //
+  // MEASURED ON THE PHYSICS EDGE, like passes E and F: the hitbox off the
+  // kinematic body, which is what the player is looking at. Angles rather than
+  // voxels so nothing here moves with kVoxelMeters.
+  {
+    const int elbowPart = avatar.PartIndex("armL.R");
+    const int wristPart = avatar.PartIndex("hand.R");
+    auto bladeAndArm = [&](Vec3& blade, Vec3& fore) -> bool {
+      Vec3 base, tip, e, w;
+      float hw = 0;
+      if (!avatar.WeaponEdge(base, tip, hw, nullptr)) return false;
+      blade = tip - base;
+      if (blade.len() < 1e-4f) return false;
+      blade = blade.normalized();
+      if (elbowPart < 0 || wristPart < 0) return false;
+      if (!avatar.PartJointWorld(elbowPart, e)) return false;
+      if (!avatar.PartJointWorld(wristPart, w)) return false;
+      fore = w - e;
+      if (fore.len() < 1e-4f) return false;
+      fore = fore.normalized();
+      return true;
+    };
+    auto deg = [](float c) {
+      return std::acos(std::clamp(c, -1.0f, 1.0f)) * 57.2957795f;
+    };
+
+    // ---- R: hand down at the side, no claim on the arm --------------------
+    melee.Reset();
+    avatar.SetWeaponPose(WeaponPose{});   // weight 0: Idle, the walk cycle owns it
+    for (int i = 0; i < 24; i++) avTick();
+    Vec3 rBlade, rFore;
+    const bool rOk = bladeAndArm(rBlade, rFore);
+    const float restVsArm = rOk ? deg(rBlade.dot(rFore)) : 0.0f;
+    const float restVsFwd = rOk ? deg(rBlade.dot(kF)) : 0.0f;
+    const float restVsDown = rOk ? deg(rBlade.dot(kU * -1.0f)) : 0.0f;
+    const float restAcrossMin =
+        (float)BaselineNumber("swingPlane.restBladeAcrossArmMinDeg", 55.0);
+    const float restFwdMax =
+        (float)BaselineNumber("swingPlane.restBladeFwdMaxDeg", 55.0);
+    check(rOk, "the resting sword and the forearm are both readable");
+    check(!rOk || restVsArm > restAcrossMin,
+          "AT REST THE BLADE JUTS OUT OF THE FIST rather than lying down the "
+          "forearm (the hilt-through-the-hand grip)");
+    check(!rOk || restVsFwd < restFwdMax,
+          "...and it points outward IN FRONT of the character");
+    RecordObserved("swingPlane.restBladeAcrossArmObservedDeg", restVsArm);
+    RecordObserved("swingPlane.restBladeFwdObservedDeg", restVsFwd);
+    std::printf(
+        "swing-plane R (rest grip): blade (%.2f,%.2f,%.2f) — %.1f deg off the "
+        "forearm (min %.0f), %.1f deg off forward (max %.0f), %.1f off down\n",
+        rBlade.x, rBlade.y, rBlade.z, restVsArm, restAcrossMin, restVsFwd,
+        restFwdMax, restVsDown);
+
+    // ---- G: THE BLADE IS RAISED AND THEN NOTHING HAPPENS ------------------
+    //
+    // The literal shape of the report, and the strongest discriminator in this
+    // gate: click, and then hold perfectly still. The stroke is seeded from
+    // the arm the walk cycle left HANGING, so its azimuth/elevation are down
+    // at the bottom of the window and its (mostly radial) commanded blade
+    // direction points AT THE FLOOR. Applied at full strength that is exactly
+    // "the sword points vertically down"; ramped down it is the grip pose,
+    // which is the same forward-out-of-the-fist blade pass R just measured.
+    //
+    // Sixty still ticks rather than five: the ramp's release eases over four
+    // blade halflives and a reading taken mid-decay measures the transient.
+    //
+    // Measured on this fixture, the two arms of that A/B are 1.80 rad of wrist
+    // applied against 0.26, with the steer amount at 1.00 against 0.15.
+    melee.Reset();
+    const bool gReady = true;   // no ready: taking over IS the pose
+    for (int i = 0; i < 60; i++) drive(0, 0, true);
+    Vec3 gBlade, gFore;
+    const bool gOk = bladeAndArm(gBlade, gFore);
+    const float guardVsUp = gOk ? deg(gBlade.dot(kU)) : 180.0f;
+    const float guardVsArm = gOk ? deg(gBlade.dot(gFore)) : 0.0f;
+    const Mob::WeaponArmDiag gd = avatar.WeaponArmDiagnostics();
+    // THE CLAIM IS "NOT DOWN", not "exactly up", and the difference is a
+    // measurement rather than a softening. The report is "holding the hand out
+    // in front, the sword points vertically DOWN": with the wrist applied at
+    // full strength a motionless guard lays the blade along the shoulder-to-
+    // point radius, and a stroke seeded from a hanging arm has that radius
+    // aimed at the floor. What the grip pose gives instead is measured below
+    // and asserted as an ELEVATION FLOOR on the blade's own y, which is the
+    // axis the complaint is about. An exact "up" is a property of the solved
+    // hand's ROLL, which the two-bone solver picks from the pole and does not
+    // promise; asserting it would be asserting something this pipeline does
+    // not offer, and the honest number is printed next to the bound.
+    const float guardUpMin =
+        (float)BaselineNumber("swingPlane.guardBladeUpMinY", -0.20);
+    const float guardArmMin =
+        (float)BaselineNumber("swingPlane.guardBladeAcrossArmMinDeg", 45.0);
+    check(gReady && melee.Phase() == SwingPhase::Guard,
+          "holding the button with a still mouse stays in Guard");
+    check(gOk, "the guarding sword and the forearm are both readable");
+    check(!gOk || gBlade.y > guardUpMin,
+          "A MOTIONLESS GUARD DOES NOT DROP THE POINT AT THE FLOOR (the blade "
+          "keeps its grip angle instead of being laid along the radius)");
+    check(!gOk || guardVsArm > guardArmMin,
+          "...and it is still out of the fist rather than laid along the arm");
+    check(melee.SteerAmount() < 0.5f,
+          "a motionless guard has ramped the wrist steering down (if this "
+          "fails the two above are measuring a fully-steered blade)");
+    RecordObserved("swingPlane.guardBladeUpObservedY", gBlade.y);
+    RecordObserved("swingPlane.guardBladeAcrossArmObservedDeg", guardVsArm);
+    RecordObserved("swingPlane.guardSteerObserved", melee.SteerAmount());
+    std::printf(
+        "swing-plane G (guard hold): blade (%.2f,%.2f,%.2f) y >= %.2f, %.1f "
+        "deg off UP; forearm (%.2f,%.2f,%.2f), %.1f deg off it (min %.0f); "
+        "steer %.2f, wrist want %.2f applied %.2f, elbow axis %.2f rad\n",
+        gBlade.x, gBlade.y, gBlade.z, guardUpMin, guardVsUp, gFore.x, gFore.y,
+        gFore.z, guardVsArm, guardArmMin, melee.SteerAmount(), gd.wristWant,
+        gd.wristApplied, gd.elbowAxisTurn);
+    for (int i = 0; i < 20; i++) drive(0, 0, false);
+  }
+
+  // ---- H. THE ARM STAYS IN FRONT AND THE ELBOW BENDS ONE WAY --------------
+  //
+  // The other two reports, and they are one measurement each. Both are stated
+  // on the ANATOMY rather than on the stroke, because both were caused by the
+  // rig's authored limits being bypassed rather than by the driver asking for
+  // anything unreasonable:
+  //
+  //   "the arm can be driven BEHIND the player"   -> azOut was 2.36 rad (135
+  //      degrees), which commands a point past the frontal plane, so the
+  //      shoulder sat on its authored 50-degrees-past-the-back stop.
+  //   "the elbow can bend both ways"              -> ApplyWeaponArm re-signed
+  //      the hinge-axis override until the measured bend was positive, which
+  //      makes the authored [0, 130] hinge accept either direction.
+  //
+  // Driven INTO both stops on purpose (60 ticks of hard rightward mouse is far
+  // past `azOut` at any gain), because a limit is only a limit where it binds.
+  {
+    melee.Reset();
+    drive(0, 0, true);
+    const int elbowPart = avatar.PartIndex("armL.R");
+    const int wristPart = avatar.PartIndex("hand.R");
+    // THE POINT, not the fist, and that distinction is the whole measurement.
+    // `azOut` bounds the TIP's azimuth, and the hand is a blade-length in
+    // front of the tip — so at 135 degrees the POINT is most of a blade behind
+    // the shoulder while the hand has barely moved. A check written on the
+    // hand reports almost nothing about the knob it is testing.
+    float worstBack = 1e9f;       // most-backward TIP, shoulder-relative z
+    float worstHandBack = 1e9f;   // ...and the hand, for the record
+    float worstElbowFwd = -1e9f;  // most-FORWARD elbow bulge, -1..1
+    int n = 0;
+    for (int i = 0; i < 60; i++) {
+      // Under the commit threshold, so this is a steer into the stop and not
+      // a cut: what is being measured is where the arm may be PUT.
+      drive(i < 30 ? 14.0f : -14.0f, i < 30 ? -6.0f : 6.0f, true);
+      Vec3 hand, tip, flat;
+      float reach = 0;
+      if (!avatar.WeaponStrokePose(hand, tip, flat, reach)) continue;
+      n++;
+      worstBack = std::min(worstBack, tip.z);
+      worstHandBack = std::min(worstHandBack, hand.z);
+      // WHICH SIDE THE ELBOW BULGES TO, from the three joints in world space.
+      //
+      // "THE ELBOW BENDS BOTH WAYS" IS A SIDE, NOT AN ANGLE, and the first
+      // version of this check measured the angle and therefore measured
+      // nothing. A three-point chain has no notion of hyperextension: the
+      // shoulder-elbow-wrist angle of an elbow bent 40 degrees "backwards" is
+      // identical to one bent 40 degrees forwards with the elbow on the other
+      // side of the arm. What a player calls a backwards elbow is the joint
+      // POINTING THE WRONG WAY, which is entirely the two-bone solver's pole.
+      //
+      // So: project the elbow off the shoulder-to-wrist line and ask which way
+      // that offset faces. A human elbow trails DOWN, BACK or OUT; one that
+      // leads out in FRONT of its own arm is the bug.
+      Vec3 sh, el, wr;
+      if (elbowPart < 0 || wristPart < 0) continue;
+      if (!avatar.PartJointWorld(shoulderPart, sh)) continue;
+      if (!avatar.PartJointWorld(elbowPart, el)) continue;
+      if (!avatar.PartJointWorld(wristPart, wr)) continue;
+      Vec3 line = wr - sh;
+      if (line.len() < 1e-3f) continue;
+      line = line.normalized();
+      const Vec3 rel = el - sh;
+      Vec3 off = rel - line * rel.dot(line);
+      // A degenerate offset is a STRAIGHT arm, which has no side and cannot be
+      // the wrong one. Skipping it is not skipping a failure.
+      if (off.len() < 0.15f) continue;
+      worstElbowFwd = std::max(worstElbowFwd, off.normalized().dot(kF));
+    }
+    for (int i = 0; i < 20; i++) drive(0, 0, false);
+    // A HAND behind the shoulder plane is the report. Stated as a fraction of
+    // the arm's own reach so it does not move with kVoxelMeters, and generous:
+    // some rearward travel is a wind-up, a hand a third of an arm behind the
+    // shoulder is the arm being driven round the back.
+    const float backMinFrac =
+        (float)BaselineNumber("swingPlane.armBehindMinFrac", -0.34);
+    const float armReach = std::max(melee.StrokeRadius(), 1e-3f);
+    // ...and the elbow. +1 is an elbow bulging straight forward out of its own
+    // arm, -1 is one trailing straight back. Some forward lead is real (a
+    // raised guard puts the elbow slightly ahead of the shoulder-wrist line),
+    // so the bound is not 0; an elbow more than halfway to leading its own arm
+    // is the joint pointing the wrong way.
+    const float elbowFwdMax =
+        (float)BaselineNumber("swingPlane.elbowForwardMax", 0.50);
+    check(n > 40, "the arm stayed readable through the drive into the stops");
+    check(n == 0 || worstBack > backMinFrac * armReach,
+          "THE BLADE IS NOT DRIVEN BEHIND THE PLAYER even when the stroke is "
+          "pushed into its azimuth stop");
+    check(worstElbowFwd < -1e8f || worstElbowFwd < elbowFwdMax,
+          "THE ELBOW TRAILS THE ARM rather than leading it: no pose in the "
+          "drive put the joint out in front of its own shoulder-to-wrist line");
+    RecordObserved("swingPlane.armBehindObservedVox", worstBack);
+    RecordObserved("swingPlane.handBehindObservedVox", worstHandBack);
+    RecordObserved("swingPlane.elbowForwardObserved", worstElbowFwd);
+    std::printf(
+        "swing-plane H (limits): tip reached z %.2f vox behind the shoulder "
+        "(min %.2f at r %.2f; hand %.2f), elbow bulged forward at most %.3f "
+        "(max %.2f), over %d ticks\n",
+        worstBack, backMinFrac * armReach, armReach, worstHandBack,
+        worstElbowFwd, elbowFwdMax, n);
   }
 
   // ---- A. right to left is a horizontal sweep in front --------------------

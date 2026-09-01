@@ -1272,8 +1272,19 @@ void Overlay::Draw(UIState& s) {
             f("slash time (s)", &m.slashTime, 0.03f, 0.6f);
             f("recover time (s)", &m.recoverTime, 0.03f, 0.8f);
           }
-          if (ImGui::CollapsingHeader("Where the point may go")) {
+          if (ImGui::CollapsingHeader("Where the point may go",
+                                      ImGuiTreeNodeFlags_DefaultOpen)) {
             f("azimuth out (rad)", &m.azOut, 0.2f, 3.1f, "%.2f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "How far round to the weapon side the point may go,\n"
+                  "measured from straight ahead.\n\n"
+                  "2.36 (135 deg) is BEHIND the character: it drove the\n"
+                  "commanded point past the frontal plane and parked the\n"
+                  "shoulder on its authored 50-deg-past-the-back stop, so\n"
+                  "the arm ended up behind the body and stuck there.\n"
+                  "1.83 is 105 deg: the whole front plus a little past\n"
+                  "side-on, which is still a real wind-up.");
             f("azimuth across (rad)", &m.azAcross, 0.2f, 3.1f, "%.2f");
             f("elevation min (rad)", &m.elMin, -1.55f, -0.1f, "%.2f");
             f("elevation max (rad)", &m.elMax, 0.1f, 1.55f, "%.2f");
@@ -1284,14 +1295,69 @@ void Overlay::Draw(UIState& s) {
             f("wrist limit (rad)", &m.wristMaxAngle, 0.0f, 3.14f, "%.2f");
             if (ImGui::IsItemHovered())
               ImGui::SetTooltip(
-                  "How far the wrist may take the blade from the orientation\n"
-                  "the solved forearm gives it for free.\n\n"
-                  "1.5 rad is about a wrist. It was 2.80 (a ball joint) only\n"
-                  "because the authored grip held the blade PERPENDICULAR to\n"
-                  "the forearm and ~90 degrees of the budget went on undoing\n"
-                  "that before any steering happened. The grip is now\n"
-                  "[0,0,-90] and a neutral wrist already points the blade\n"
-                  "down the arm, so this can be a wrist again.");
+                  "CEILING on how far the wrist may take the blade from the\n"
+                  "orientation the solved forearm gives it for free.\n\n"
+                  "A GROSS budget, not an anatomical angle: the blade asks\n"
+                  "for direction AND roll, and the neutral grip stands about\n"
+                  "pi of roll away from a committed cut, so the STEERING\n"
+                  "gets this minus that tax. 3.10 leaves ~1.1 rad free.\n\n"
+                  "Measured, the ask is 2.6..3.1 rad whichever grip is\n"
+                  "authored — which is why the along-the-arm grip the\n"
+                  "overhaul tried bought nothing and cost the idle pose.\n"
+                  "The grip is back to [0,-90,0]: blade out of the fist.");
+            // ---- THE THROTTLE, and why it is next to the ceiling ---------
+            // Same joint, two different questions, and separating them is
+            // the fix: "how far CAN a wrist go" and "how much of that does
+            // this stroke want". See MeleeTuning::steerSpeedLo.
+            f("wrist steer at rest", &m.steerFloor, 0.0f, 1.0f, "%.2f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "How much of that alignment is applied when the blade is\n"
+                  "NOT moving.\n\n"
+                  "The stroke always commands the blade along the shoulder-\n"
+                  "to-point radius. Right for a cut, wrong for a hold: at\n"
+                  "1.0 a motionless guard is still wrenched round to lay\n"
+                  "the sword along the radius, which is what \"it points\n"
+                  "straight down when I hold it out in front\" was.\n\n"
+                  "At 0.15 a still blade keeps its own grip pose (out of\n"
+                  "the fist, UP with the arm forward) and slides into full\n"
+                  "alignment as it moves. 1.0 is the old behaviour.");
+            f("steer ramp: still below (m/s)", &m.steerSpeedLoMps, 0.0f, 6.0f,
+              "%.2f");
+            f("steer ramp: committed above (m/s)", &m.steerSpeedHiMps, 0.05f,
+              12.0f, "%.2f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "Blade TIP speed at the two ends of the ramp. Between\n"
+                  "them the applied alignment interpolates, smoothed on the\n"
+                  "blade halflife so a commit never snaps the fist.\n\n"
+                  "Wind / slash / recover bypass the ramp entirely: a cut\n"
+                  "is a cut even at the instant it reverses through zero.");
+            f("elbow bend plane (rad)", &m.elbowPoleCone, 0.05f, 3.14f, "%.2f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "How far the elbow may be steered off straight-back.\n\n"
+                  "The stroke picks the plane the arm bends in — that is\n"
+                  "what makes a horizontal cut read as shoulder rotation\n"
+                  "plus elbow extension — but the plane is built from the\n"
+                  "hand's travel and was free to point ANYWHERE, forward\n"
+                  "past the fist included.\n\n"
+                  "1.75 rad is 100 deg: down, up or out to either side,\n"
+                  "never forward. Pi is unbounded (the old behaviour).");
+            f("elbow hinge cone (rad)", &m.elbowAxisCone, 0.0f, 3.14f, "%.2f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "CAP on how far the steered elbow hinge axis may sit from\n"
+                  "the forearm's AUTHORED one. DEFAULTS TO pi = OFF.\n\n"
+                  "That default is measured, not an oversight: the pose\n"
+                  "clamp keeps only the component about the axis it is\n"
+                  "given and discards the rest, so penning the axis makes\n"
+                  "it LOSSY — and a horizontal cut legitimately wants a\n"
+                  "bend plane 90 deg off the resting axis. At 75 deg it\n"
+                  "cost the swing-plane gate 1.76 rad of elbow clamp and\n"
+                  "4.42 voxels of hand.\n\n"
+                  "The anatomy is enforced on the BEND PLANE above, where\n"
+                  "it is free. This is left as the A/B.");
             f("hand extension", &m.handExtend, 0.15f, 1.0f, "%.2f");
             f("extension smoothing (s)", &m.extendSmoothing, 0.005f, 1.0f);
             f("reach fraction", &m.reachFraction, 0.2f, 0.99f, "%.2f");

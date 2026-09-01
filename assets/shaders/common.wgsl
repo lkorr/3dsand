@@ -1059,11 +1059,47 @@ fn unpackColor(c : u32) -> vec3f {
   return vec3f(f32(c & 0xFFu), f32((c >> 8u) & 0xFFu), f32((c >> 16u) & 0xFFu)) / 255.0;
 }
 
+// The COSMETIC 3-variant decode, keyed on an arbitrary number rather than on a
+// voxel's state nibble. Every ordinary material's texture is this: `% 3` over
+// the three authored `colors`.
+//
+// It is a SEPARATE function from paletteColor() below, and the split is the
+// whole point. A caller has one of two things in hand and they are not
+// interchangeable:
+//
+//   * a real STATE NIBBLE, read off a voxel word — paletteColor()
+//   * a positional JITTER HASH it invented, because the thing it is shading has
+//     no nibble of its own (a micro-body brick cell, a far-cascade LOD cell, a
+//     sub-voxel strand) — paletteJitter()
+//
+// paletteColor() reads a MATF_TINTED material's nibble as a DYE INDEX, so
+// handing it a hash dithers the surface across the material's entire dye run,
+// voxel by voxel — plus, past the authored count, across the unwritten black
+// entries of that run. Measured the day tints were first authored: 90.6% of
+// sword.vox is steel, and every one of those voxels drew one of 16 dyes with
+// 49.4% of them landing on a black entry. A held sword and every legacy mob
+// (asha/mina/wizard: one material per colour, so `hitArt == 0` for 66-76% of
+// their voxels) rendered as a zebra.
+//
+// A hash is not a state. A dyed material still has its three cosmetic variants
+// and this is what asks for them, so an unpainted tinted voxel textures exactly
+// as it did before tints existed.
+fn paletteJitter(m : Material, jitter : u32) -> vec3f {
+  switch (jitter % 3u) {
+    case 0u: { return unpackColor(m.color0); }
+    case 1u: { return unpackColor(m.color1); }
+    default: { return unpackColor(m.color2); }
+  }
+}
+
 // The state-nibble palette is a property of Material (declared above), so its
 // decode belongs here rather than being re-derived by each render path. There
 // are TWO decodes and the material picks which: the 3-variant cosmetic jitter
 // every ordinary material uses, and the 16-entry TINT run a MATF_TINTED one
 // uses instead (sim/materials.h).
+//
+// `state` MUST be a real state nibble — see paletteJitter() above for the one
+// that takes a hash, and for what feeding one to this function costs.
 //
 // `pal` is the material table itself, threaded in as a pointer because a tinted
 // material resolves against the reserved tint run and common.wgsl is prepended
@@ -1082,11 +1118,7 @@ fn paletteColor(m : Material, state : u32,
     let base = (m.flags >> MATF_TINT_BASE_SHIFT) & MATF_TINT_BASE_MASK;
     return unpackColor((*pal)[TINT_PALETTE_BASE + base + (state & 0xFu)].color0);
   }
-  switch (state % 3u) {
-    case 0u: { return unpackColor(m.color0); }
-    case 1u: { return unpackColor(m.color1); }
-    default: { return unpackColor(m.color2); }
-  }
+  return paletteJitter(m, state);
 }
 
 // ---- shared day/night lighting ---------------------------------------------
