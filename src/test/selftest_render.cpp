@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -681,6 +682,22 @@ Status GateFireDepth(Ctx& c, std::string& detail) {
 // The `noshadow` arm establishes that this frame HAS shadows worth agreeing
 // about, so the small A-B difference is a real agreement rather than two blank
 // pages matching. (See the "a hash-identity test needs three arms" note.)
+// The request list's header after a frame has drawn and before the next
+// prepare() has moved it: [0] is the raw count of patches the fragment shader
+// asked for in the frame just rendered. Read here so the gate names the number
+// itself — a flicker with no count attached invites an elimination run per
+// hypothesis (CLAUDE.md rule 6), and the cap is the first one.
+bool ReadShadowReqHeader(GpuContext& ctx, World& world, uint32_t out[4]) {
+  rhi::Buffer stage =
+      CreateBuffer(ctx.device, 16,
+                   rhi::BufferUsage::MapRead | rhi::BufferUsage::CopyDst,
+                   "shadowReqHeaderRead");
+  rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
+  enc.CopyBufferToBuffer(world.shadowReq, 0, stage, 0, 16);
+  ctx.queue.Submit(enc.Finish());
+  return rhi::ReadBufferBlocking(ctx.device, stage, 0, out, 16);
+}
+
 Status GateShadowCache(Ctx& c, std::string& detail) {
   GpuContext& ctx = c.ctx;
   World& world = c.world;
@@ -764,12 +781,24 @@ Status GateShadowCache(Ctx& c, std::string& detail) {
   // patch misses and shades unshadowed, and it takes ONE further frame for the
   // resolve pass to fill in what that frame registered. Anything less than 2 is
   // measuring the cold-start miss, not the cache.
+  //
+  // `prev`, when given, receives the frame BEFORE the last one. Two consecutive
+  // warmed frames of a static camera must be the same picture: the cache's
+  // first version passed the single-frame agreement below while ~28k patches
+  // per frame alternated lit/shadowed through bucket contention, because a
+  // flicker averaged over one frame is just a little disagreement. Comparing
+  // frame N-1 against N is what sees it.
   auto render = [&](bool shadows, uint32_t frames,
-                    std::vector<uint8_t>& out) -> bool {
+                    std::vector<uint8_t>& out,
+                    std::vector<uint8_t>* prev) -> bool {
     rhi::Buffer shot =
         CreateBuffer(ctx.device, (uint64_t)W * H * 4,
                      rhi::BufferUsage::MapRead | rhi::BufferUsage::CopyDst,
                      "shadowCacheShot");
+    rhi::Buffer shotPrev =
+        CreateBuffer(ctx.device, (uint64_t)W * H * 4,
+                     rhi::BufferUsage::MapRead | rhi::BufferUsage::CopyDst,
+                     "shadowCacheShotPrev");
     for (uint32_t f = 0; f < frames; f++) {
       // Fresh render params per frame: WriteRenderParams is what advances the
       // cache's frame counter, so reusing one upload would leave every entry
@@ -782,11 +811,13 @@ Status GateShadowCache(Ctx& c, std::string& detail) {
           enc, c.view, rhi::TextureFormat::RGBA8Unorm, W, H);
       sim.DrawWorld(rp);
       rp.End();
-      if (f + 1 == frames) {
+      const bool last = (f + 1 == frames);
+      const bool beforeLast = prev && frames >= 2 && (f + 2 == frames);
+      if (last || beforeLast) {
         rhi::TexelCopyTexture srcT{};
         srcT.texture = c.offscreen;
         rhi::TexelCopyBuffer dstB{};
-        dstB.buffer = shot;
+        dstB.buffer = last ? shot : shotPrev;
         dstB.bytesPerRow = W * 4;
         dstB.rowsPerImage = H;
         rhi::Extent3D ext{W, H, 1};
@@ -795,7 +826,13 @@ Status GateShadowCache(Ctx& c, std::string& detail) {
       ctx.queue.Submit(enc.Finish());
     }
     out.assign((size_t)W * H * 4, 0);
-    return rhi::ReadBufferBlocking(ctx.device, shot, 0, out.data(), out.size());
+    bool ok = rhi::ReadBufferBlocking(ctx.device, shot, 0, out.data(), out.size());
+    if (ok && prev) {
+      prev->assign((size_t)W * H * 4, 0);
+      ok = rhi::ReadBufferBlocking(ctx.device, shotPrev, 0, prev->data(),
+                                   prev->size());
+    }
+    return ok;
   };
 
   // Mean absolute luminance difference over the frame, in 0..255 units.
@@ -814,19 +851,34 @@ Status GateShadowCache(Ctx& c, std::string& detail) {
   };
 
   auto arm = [&](int cacheOn, bool shadows, uint32_t frames,
-                 std::vector<uint8_t>& out) -> bool {
+                 std::vector<uint8_t>& out,
+                 std::vector<uint8_t>* prev = nullptr) -> bool {
     Tuning t = base;
     t.render.shadowCache = cacheOn;
     SetCurrentTuning(t);
     // The F5 path: SHADOW_CACHE is const-folded, so the arm does not exist
     // until the shader is recompiled with it.
     if (!sim.ReloadShaders(ctx.device)) return false;
-    return render(shadows, frames, out);
+    return render(shadows, frames, out, prev);
   };
 
-  std::vector<uint8_t> refPx, cachePx, noShadowPx;
-  const bool got = arm(0, true, 1, refPx) &&        // per-pixel rays (reference)
-                   arm(1, true, 4, cachePx) &&      // the cache, warmed
+  // The reference arm renders TWO frames so its own frame-to-frame difference
+  // is on the record: anything that legitimately changes between frames of a
+  // pinned scene (a far cascade still converging, say) shows up there first,
+  // and the cache's flicker is only meaningful against that floor.
+  std::vector<uint8_t> refPx, refPrevPx, cachePx, cachePrevPx, noShadowPx;
+  uint32_t reqStats[4] = {0, 0, 0, 0};
+  // SANDVOX_SHADOW_GATE_FRAMES overrides the cache arm's warm-up length (4):
+  // a flicker that vanishes at 12 frames was convergence, one that persists is
+  // steady-state contention, and that distinction is one run, not a debate.
+  uint32_t cacheFrames = 4;
+  if (const char* e = std::getenv("SANDVOX_SHADOW_GATE_FRAMES")) {
+    const int v = std::atoi(e);
+    if (v >= 2) cacheFrames = (uint32_t)v;
+  }
+  const bool got = arm(0, true, 2, refPx, &refPrevPx) &&  // per-pixel rays (reference)
+                   arm(1, true, cacheFrames, cachePx, &cachePrevPx) &&  // the cache, warmed
+                   ReadShadowReqHeader(ctx, world, reqStats) &&
                    arm(0, false, 1, noShadowPx);    // no shadows at all
   SetCurrentTuning(base);
   const bool restored = sim.ReloadShaders(ctx.device);
@@ -858,16 +910,57 @@ Status GateShadowCache(Ctx& c, std::string& detail) {
   // per-pixel reference than dropping shadows entirely is — so that is what is
   // written down. kSignalMin keeps the ratio honest by refusing a frame with no
   // shadows in it, where both differences are ~0 and the ratio is meaningless.
+  //
+  // FLICKER IS THE THIRD CLAIM and the one the first version of this gate could
+  // not make: a static camera's warmed frames 3 and 4 must be the same picture.
+  // Nothing in the scene moves (time is pinned, the sun is pinned), so any
+  // difference is the cache changing its mind — contention, a steal, a miss
+  // default painted over a value. Held to 2% of the shadow signal rather than
+  // zero so a handful of genuinely racing duplicate claims cannot fail it, but
+  // the number expected with the set-associative cache is 0.00.
+  const double flicker = meanDiff(cachePrevPx, cachePx);
+  const double refFlicker = meanDiff(refPrevPx, refPx);
+  // Record at the point of failure: the two warmed frames and a diff image
+  // (white where luminance moved by more than 2/255), plus a count of moved
+  // pixels, so a flicker number comes with WHERE and HOW MANY attached.
+  size_t movedPx = 0;
+  {
+    std::vector<uint8_t> diff((size_t)W * H * 4, 255);
+    for (size_t i = 0; i + 3 < cachePx.size() && i + 3 < cachePrevPx.size(); i += 4) {
+      const double la = 0.299 * cachePx[i] + 0.587 * cachePx[i + 1] + 0.114 * cachePx[i + 2];
+      const double lb = 0.299 * cachePrevPx[i] + 0.587 * cachePrevPx[i + 1] + 0.114 * cachePrevPx[i + 2];
+      const bool moved = std::fabs(la - lb) > 2.0;
+      movedPx += moved ? 1 : 0;
+      const uint8_t v = moved ? 255 : 0;
+      diff[i] = v; diff[i + 1] = v; diff[i + 2] = v;
+    }
+    WriteBmpFile("build/shadow_cache_prev.bmp", cachePrevPx, W, H);
+    WriteBmpFile("build/shadow_cache_last.bmp", cachePx, W, H);
+    WriteBmpFile("build/shadow_cache_diff.bmp", diff, W, H);
+  }
   const double kSignalMin = 1.0;
   const double kAgreeFrac = 0.25;
-  const bool ok = signal > kSignalMin && agree < signal * kAgreeFrac;
+  const double kFlickerFrac = 0.02;
+  const bool ok = signal > kSignalMin && agree < signal * kAgreeFrac &&
+                  flicker < signal * kFlickerFrac;
   std::printf("shadow cache: %s (cache vs per-pixel rays: mean |dL| %.2f; "
               "per-pixel rays vs no shadows: %.2f, must exceed %.1f; agreement "
-              "must be under %.0f%% of that, i.e. %.2f)\n",
+              "must be under %.0f%% of that, i.e. %.2f; frame-to-frame flicker "
+              "%.3f, must be under %.0f%% of the signal, i.e. %.2f; reference "
+              "arm's own frame-to-frame difference %.3f)\n"
+              "              last cache frame (%u warmed): %u patches requested, "
+              "cap %u, %u refused; %zu px moved > 2/255 between the last two "
+              "frames (build/shadow_cache_{prev,last,diff}.bmp)\n",
               ok ? "PASS" : "FAIL", agree, signal, kSignalMin,
-              kAgreeFrac * 100.0, signal * kAgreeFrac);
-  detail = Format("agree %.2f, signal %.2f, budget %.2f", agree, signal,
-                  signal * kAgreeFrac);
+              kAgreeFrac * 100.0, signal * kAgreeFrac, flicker,
+              kFlickerFrac * 100.0, signal * kFlickerFrac, refFlicker,
+              cacheFrames, reqStats[0], kShadowReqCap,
+              reqStats[0] > kShadowReqCap ? reqStats[0] - kShadowReqCap : 0u,
+              movedPx);
+  detail = Format("agree %.2f, signal %.2f, budget %.2f, flicker %.3f (ref "
+                  "%.3f), %u requested",
+                  agree, signal, signal * kAgreeFrac, flicker, refFlicker,
+                  reqStats[0]);
   return ok ? Status::Pass : Status::Fail;
 }
 

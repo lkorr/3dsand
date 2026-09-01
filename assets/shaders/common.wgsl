@@ -2916,16 +2916,6 @@ fn shadowFaceTangents(face : u32) -> vec2<u32> {
   let axis = face >> 1u;
   return vec2<u32>((axis + 1u) % 3u, (axis + 2u) % 3u);
 }
-// Which sub-patch of the face a world-space hit point lands in.
-fn shadowSubOf(hp : vec3f, cell : vec3<i32>, face : u32, subdiv : u32) -> vec2<u32> {
-  let t = shadowFaceTangents(face);
-  let f = hp - vec3f(cell);
-  let m = f32(subdiv);
-  // Clamped, not wrapped: a hit point can sit a hair outside its own cell after
-  // the DDA's epsilon nudges, and a wrap would put it on a neighbouring patch.
-  return vec2<u32>(u32(clamp(floor(f[t.x] * m), 0.0, m - 1.0)),
-                   u32(clamp(floor(f[t.y] * m), 0.0, m - 1.0)));
-}
 // The centre of a patch, in world voxel coords — the point the resolve pass
 // casts from. Quantising the ray origin to this centre IS the approximation the
 // whole cache rests on: every pixel on the patch gets the answer computed here.
@@ -2953,52 +2943,92 @@ fn shadowPackCell(relCell : vec3<i32>, face : u32) -> u32 {
 }
 fn shadowPackSub(sx : u32, sy : u32) -> u32 { return sx | (sy << 3u); }
 
-// ---- the key and its bucket ----
-// A 32-bit hash of the ~36-bit patch identity. Hashed rather than stored whole
-// because the identity does not fit, and the residual risk is understood and
-// bounded: at a ~200k working set the birthday count is ~5 fully-colliding
-// pairs per frame, i.e. ~5 patches that take a neighbour's shadow for ONE
-// frame. Self-correcting, and cheaper than the third word a 64-bit key costs.
+// ---- the key, its verifier, and the SET it lives in ----
+// A patch's identity is ~36 bits (cell, face, sub) and does not fit one word,
+// so it is split across the two words of a slot: a 32-bit hash in the KEY word
+// and a second, independent 15-bit hash (the VERIFIER) in the state word. A
+// slot is a patch's only if both agree — 47 bits of identity, which at a ~200k
+// working set is ~1e-4 false matches per frame, i.e. none. The first version of
+// this cache keyed on the 32-bit hash alone and accepted ~5 colliding pairs
+// per frame as "self-correcting"; they were not — a pair that shares a key
+// alternates ownership frame by frame and the loser's patch flickers.
 //
-// Key 0 is reserved for "empty bucket" — the buffer is zero-filled, and a
-// patch that legitimately hashed to 0 would match every untouched bucket.
-//
-// WHAT A COLLISION ACTUALLY COSTS, since it is not "a wrong shadow": two
-// patches sharing a bucket alternate ownership frame by frame (the loser sees a
-// key mismatch, re-registers, and evicts the winner next frame), so each shows
-// the miss default — unshadowed — on the frames it loses. ~5 patches of 2.5 cm
-// flickering out of ~200k. If that ever reads on screen the fix is a 64-bit
-// key, i.e. a third word per bucket, not a bigger table.
+// Key 0 is reserved for "empty slot" — the buffer is zero-filled, and a patch
+// that legitimately hashed to 0 would match every untouched slot.
 fn shadowPatchKey(packedCell : u32, packedSub : u32) -> u32 {
   let k = pcg(packedCell ^ pcg(packedSub * 0x9E3779B9u + 1u));
   return select(k, 1u, k == 0u);
 }
-// Direct-mapped: no probing, collisions overwrite. A miss is always SAFE (the
-// reader falls back to the miss default), so there is nothing to resolve.
-fn shadowBucketOf(key : u32) -> u32 { return key & (SHADOW_CACHE_BUCKETS - 1u); }
+fn shadowPatchVerifier(packedCell : u32, packedSub : u32) -> u32 {
+  return pcg(packedSub ^ pcg(packedCell * 0x85EBCA6Bu + 7u)) & SHADOW_VERIFIER_MASK;
+}
 
-// ---- the bucket's state word ----
-// value 0..255 | resolvedFrame (4) | requestedFrame (4) | valid (1).
+// SET-ASSOCIATIVE, NOT DIRECT-MAPPED. This is the fix for the "shadow pixels
+// that spasm and fly across the ground": the first version mapped a key to one
+// bucket and let collisions overwrite. At ~200k patches in 1M buckets that is
+// not rare — about 16% of every frame's patches shared a bucket with another
+// VISIBLE patch, so ~28k patches per frame took turns evicting each other and
+// each showed the miss default (fully lit) on the frames it lost. Worse, the
+// steal happened MID-FRAME, so pixels of one patch shaded lit or shadowed by
+// GPU fragment order.
+//
+// Now a key selects a SET of SHADOW_WAYS consecutive slots — 8 slots x 2 words
+// = 64 bytes, one cache line, so probing the whole set costs about what one
+// probe did. A patch finds its own slot anywhere in the set, or claims a slot
+// nobody LIVE holds (raymarch.wgsl shadowCached: live = requested this frame or
+// last). A live slot is never stolen, so two patches that share a set coexist
+// and nothing alternates. Overflow (nine live patches in one set) is a miss for
+// the ninth, and at a 20% load the Poisson tail past 8 is ~1e-5 of patches.
+const SHADOW_WAYS : u32 = 8u;
+fn shadowSetOf(key : u32) -> u32 {
+  // The set index is a slice of the key, which is fine: the verifier hashes
+  // the same inputs through a different mix, and the independence of THOSE two
+  // is what the 47-bit identity claim rests on.
+  return key & (SHADOW_CACHE_BUCKETS - 1u) & ~(SHADOW_WAYS - 1u);
+}
+
+// ---- the slot's state word ----
+// value 8 | resolvedFrame 4 | requestedFrame 4 | valid 1 | verifier 15.
 //
 // TWO SEPARATE FRAME FIELDS, and that is load-bearing: registration must stamp
 // `requested` WITHOUT disturbing the value other pixels are still reading this
-// frame, so one field cannot serve both roles.
+// frame, so one field cannot serve both roles. `requested` is also what makes
+// a slot LIVE (see shadowSetOf) and therefore unstealable.
 //
-// THE VALID BIT IS NOT REDUNDANT WITH resolvedFrame, which is the subtle part.
-// The buffer is zero-filled, so an untouched bucket reads resolvedFrame == 0
-// and value == 0 — and on frames where frameIdx & 15 happens to be 0 that is
-// indistinguishable from "resolved this frame, fully shadowed". Every sixteenth
-// frame would then paint newly-registered patches black. One bit removes the
-// whole class: nothing but the resolve pass ever sets it.
+// THE VALID BIT is set by nothing but the resolve pass. A freshly claimed slot
+// is zero-valued and invalid, and the reader treats invalid as "no opinion"
+// (weight 0 in the bilinear blend), never as "black".
+//
+// resolvedFrame is NOT compared by the reader any more. The first version only
+// trusted a value resolved THIS frame and shaded everything else lit, which
+// made every patch newly exposed by camera motion sparkle bright for one frame
+// along the whole disocclusion fringe. A slot's value is by construction the
+// right PATCH's answer (47-bit identity), and it is recast every frame the
+// patch is on screen, so the only way it can be stale is that the patch just
+// came back into view — and a shadow from a few frames ago is a far smaller
+// error than a bright hole. It stays in the word for --render-budget's
+// inspection and for the one-frame-old diagnosis it makes possible.
+const SHADOW_VERIFIER_SHIFT : u32 = 17u;
+const SHADOW_VERIFIER_MASK : u32 = 0x7FFFu;
 fn shadowPackState(value : u32, resolvedFrame : u32, requestedFrame : u32,
-                   valid : bool) -> u32 {
+                   valid : bool, verifier : u32) -> u32 {
   return (value & 0xFFu) | ((resolvedFrame & 15u) << 8u) |
-         ((requestedFrame & 15u) << 12u) | select(0u, 0x10000u, valid);
+         ((requestedFrame & 15u) << 12u) | select(0u, 0x10000u, valid) |
+         ((verifier & SHADOW_VERIFIER_MASK) << SHADOW_VERIFIER_SHIFT);
 }
 fn shadowStateValue(s : u32) -> f32 { return f32(s & 0xFFu) * (1.0 / 255.0); }
 fn shadowStateResolved(s : u32) -> u32 { return (s >> 8u) & 15u; }
 fn shadowStateRequested(s : u32) -> u32 { return (s >> 12u) & 15u; }
 fn shadowStateValid(s : u32) -> bool { return (s & 0x10000u) != 0u; }
+fn shadowStateVerifier(s : u32) -> u32 {
+  return (s >> SHADOW_VERIFIER_SHIFT) & SHADOW_VERIFIER_MASK;
+}
+// Was this slot asked for this frame or last? Modulo-16 arithmetic on the
+// 4-bit stamp: a slot last requested exactly 15 or 16 frames ago reads as live
+// for one frame and is simply skipped, which costs a probe, not a wrong value.
+fn shadowSlotLive(s : u32, curFrame : u32) -> bool {
+  return ((curFrame - shadowStateRequested(s)) & 15u) <= 1u;
+}
 
 // Voxel word: bits 0..11 material, 12..15 state, 16..18 tick-stamp,
 //             19..23 FREE, 24..27 stain amount, 28..30 stain type,

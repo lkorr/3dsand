@@ -297,20 +297,18 @@ fn resolve(@builtin(global_invocation_id) gid : vec3<u32>) {
               TUNE_SHADOW_LIFT, 0.0, 1.0);
   }
 
-  // Publish. The key is rewritten here as well as at registration so a bucket
-  // stolen by a colliding patch between the two is left consistent rather than
-  // holding one patch's key and another's value.
-  // The key is rewritten here as well as at registration so a bucket stolen by
-  // a colliding patch between the two is left holding one patch's key AND that
-  // same patch's value, never a mix.
-  //
-  // Guarded on the key still being ours: if a colliding patch took the bucket
-  // after this request was queued, writing here would stamp our value under its
-  // key — precisely the "wrong shadow" the miss default exists to avoid. Losing
-  // the write instead just costs this patch one unshadowed frame.
+  // Publish, guarded on the slot still being OURS — key AND verifier. A slot
+  // can only change hands once it has gone stale (raymarch.wgsl shadowSlotRead
+  // never steals a live one), but a duplicate claim or a set that turned over
+  // in the frame since this request was queued would otherwise stamp our value
+  // under another patch's identity — precisely the "wrong shadow" the blend's
+  // zero weight exists to avoid. Losing the write instead costs this patch one
+  // frame with no opinion. `requested` and the verifier ride through unchanged.
+  let ver = shadowPatchVerifier(packedCell, packedSub);
   if (atomicLoad(&shadowCache[bucket * 2u]) != key) { return; }
   let old = atomicLoad(&shadowCache[bucket * 2u + 1u]);
+  if (shadowStateVerifier(old) != ver) { return; }
   atomicStore(&shadowCache[bucket * 2u + 1u],
               shadowPackState(u32(v * 255.0 + 0.5), R.frameIdx & 15u,
-                              shadowStateRequested(old), true));
+                              shadowStateRequested(old), true, ver));
 }

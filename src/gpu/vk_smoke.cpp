@@ -144,12 +144,20 @@ bool LoadPinnedFromJson(const std::string& path, const char* key,
     if (pos >= text.size() || text[pos] == ']') break;
     if (text[pos] != '[') return false;
     pos++;
-    // parse tick number
-    while (pos < text.size() && (text[pos] == ' ')) pos++;
+    // parse tick number. Whitespace here and before the hash includes
+    // NEWLINES: --rebaseline writes the file through a pretty-printer that puts
+    // each element on its own line, and a parser that only skipped spaces fell
+    // back to the stale hardcoded tables in silence, failing every probe
+    // against numbers the JSON had long since moved past.
+    auto ws = [&](char c) {
+      return c == ' ' || c == '
+' || c == '' || c == '	';
+    };
+    while (pos < text.size() && ws(text[pos])) pos++;
     uint32_t tick = 0;
     while (pos < text.size() && text[pos] >= '0' && text[pos] <= '9')
       tick = tick * 10 + (text[pos++] - '0');
-    while (pos < text.size() && (text[pos] == ' ' || text[pos] == ',')) pos++;
+    while (pos < text.size() && (ws(text[pos]) || text[pos] == ',')) pos++;
     // parse "hexhash"
     if (pos >= text.size() || text[pos] != '"') return false;
     pos++;

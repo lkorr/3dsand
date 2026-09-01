@@ -530,16 +530,37 @@ static_assert(kSubOccDim * kSubOccDim * kSubOccDim <= kSubOccWords * 32,
 // not a runtime branch, and what forces the miss policy below.
 //
 // THE STRUCTURE. One shadow factor per SURFACE PATCH — a voxel face subdivided
-// kShadowSubdivMax-ways per axis. A lossy, direct-mapped, hash-keyed table:
-// collisions overwrite, nothing is probed, and a miss is always safe. A compute
-// pass (shadow_resolve.wgsl) resolves each requested patch exactly once per
-// frame; the fragment shader only reads and re-registers.
+// kShadowSubdivMax-ways per axis. A lossy, hash-keyed, 8-WAY SET-ASSOCIATIVE
+// table (common.wgsl shadowSetOf): a key picks a set of 8 adjacent slots (one
+// cache line), a patch finds its own slot in the set or claims one no LIVE
+// patch holds, and a live slot — requested this frame or last — is never
+// stolen. A compute pass (shadow_resolve.wgsl) resolves each requested patch
+// exactly once per frame; the fragment shader only reads and re-registers.
+//
+// WHY NOT DIRECT-MAPPED, which is what shipped first. At ~200k patches in 1M
+// buckets, ~16% of a frame's patches shared a bucket with another visible
+// patch — ~28k of them — and "collisions overwrite" meant each pair evicted
+// the other every frame and shaded lit on the frames it lost, mid-frame, in
+// fragment order. On screen that was shadow pixels spasming across the ground.
+// Identity is 47 bits (32-bit key word + 15-bit verifier in the state word),
+// so a same-identity false match is ~1e-4 per frame rather than the ~5
+// flickering pairs the 32-bit key alone allowed.
+//
+// THE READER FILTERS. A patch's value is the answer at its CENTRE, and the
+// fragment shader blends the four nearest centres bilinearly (raymarch.wgsl
+// shadowCached), rolling into the neighbour cell's same face past an edge.
+// That is what turns a 2.5 cm staircase into a one-patch ramp, and it is why
+// subdiv 4 is enough. Taps with no resolved value carry weight 0 and the rest
+// renormalise; a value that IS resolved is trusted even if a few frames old,
+// because it is by construction the right patch's answer and it is recast on
+// every frame the patch is on screen. "Lit until resolved" — the first
+// version's miss policy — sparkled along every disocclusion fringe.
 //
 // STALENESS IS ONE FRAME, AND ONLY IN THE REQUEST SET. Values are cast fresh
 // every frame, so destruction re-lights immediately and there is NO
 // invalidation machinery — no per-chunk generation, no dirty-list coupling. The
 // one-frame lag is in WHICH patches were asked for, so a newly disoccluded
-// patch misses for exactly one frame.
+// patch has no opinion for one frame and blends from its neighbours.
 //
 // WHY A COMPUTE PASS IS LOAD-BEARING rather than an optimisation: a fragment
 // shader cannot elect one pixel per patch to do the work. Without it, "valid
@@ -554,13 +575,15 @@ constexpr uint32_t kShadowCacheBuckets = 1u << kShadowCacheShift;   // 1,048,576
 constexpr uint32_t kShadowCacheWords = 2;            // key, then packed state
 constexpr uint64_t kShadowCacheBytes =
     (uint64_t)kShadowCacheBuckets * kShadowCacheWords * 4;   // 8 MiB
-// Two ADJACENT words per bucket, not two parallel arrays: they land in one
-// cache line, so reading the state word after the key word is very nearly free.
-// That is what buys the full 32-bit key instead of the packed-tag arithmetic a
-// single-word bucket would need — and a 32-bit key is what keeps hash-collision
-// false hits down to ~5 patches per frame at a 200k working set.
+// Two ADJACENT words per slot, not two parallel arrays, and 8 slots per set:
+// 64 bytes, one cache line, so probing a whole set costs about what one bucket
+// read did. The key word holds the 32-bit key; the state word holds value,
+// two 4-bit frame stamps, the valid bit and the 15-bit verifier
+// (common.wgsl shadowPackState).
 //
-// Load factor at the ~200k patches an overlook frame resolves is under 20%.
+// Load factor at the ~200k patches an overlook frame resolves is under 20%,
+// and with the bilinear taps' neighbour ring somewhat above; the Poisson tail
+// past 8 live patches in one set is ~1e-5 of patches at 20% load.
 constexpr uint32_t kShadowReqHeaderWords = 4;   // [0] atomic count, [1] saved count, [2..3] stats
 constexpr uint32_t kShadowReqWords = 4;         // key, bucket, packed cell, packed face+sub
 constexpr uint32_t kShadowReqCapShift = 18;
@@ -568,9 +591,9 @@ constexpr uint32_t kShadowReqCap = 1u << kShadowReqCapShift;  // 262,144 per fra
 constexpr uint64_t kShadowReqBytes =
     (uint64_t)(kShadowReqHeaderWords + kShadowReqCap * kShadowReqWords) * 4;
 // Overflow is GRACEFUL and silent by design: past the cap a patch simply is not
-// registered, so it misses next frame and shades from the stale/unshadowed
-// default. It is reported in the stats words rather than being an abort,
-// because the failure is a slightly wrong pixel, not a lost voxel.
+// registered, so it has no opinion next frame and blends from its neighbours.
+// It is reported in the stats words rather than being an abort, because the
+// failure is a slightly wrong pixel, not a lost voxel.
 //
 // GRANULARITY IS THE KNOB, exactly as it is for kSubOccShift above, and it is a
 // QUALITY knob rather than a speed one. The win saturates early: at subdiv 4

@@ -2563,8 +2563,8 @@ fn sunShadow(hp : vec3f, n : vec3f, px : vec2f) -> f32 {
 }
 
 // ---- THE CACHED SHADOW (world.h kShadowCacheBuckets) -----------------------
-// Reads one shadow factor for the PATCH this hit lands on, and registers that
-// patch so shadow_resolve.wgsl casts its ray at the head of the next frame.
+// Reads the shadow factor for the PATCHES this hit lands between, and registers
+// them so shadow_resolve.wgsl casts their rays at the head of the next frame.
 //
 // NOTE WHAT IS ABSENT: there is no trace() here and no fallback ray. That is
 // the design, not an omission — see the SHADOW_CACHE const at the top of this
@@ -2575,28 +2575,89 @@ fn sunShadow(hp : vec3f, n : vec3f, px : vec2f) -> f32 {
 // ~1.35M shadow rays per frame into ~200k. The quantisation that buys is
 // R.shadowSubdiv-controlled and is a quality knob (world.h).
 //
-// Takes the hit's axis and sign rather than the shading normal: `n` at the call
-// site may be perturbed, and the face this patch belongs to must be the
-// geometric one or two pixels on one face would key to different patches.
-fn shadowCached(hp : vec3f, cell : vec3<i32>, axis : i32, sgn : f32) -> f32 {
-  let subdiv = clamp(R.shadowSubdiv, 1u, SHADOW_SUBDIV_MAX);
-  // The DDA reports sgn = sign(rd[axis]), so the outward face normal points the
-  // other way: a ray travelling -x enters through the +x face.
-  let face = shadowFaceOf(axis, sgn < 0.0);
-  let sub = shadowSubOf(hp, cell, face, subdiv);
-  let packedCell = shadowPackCell(cell - R.origin * i32(CHUNK), face);
-  let packedSub = shadowPackSub(sub.x, sub.y);
+// One slot lookup: find the patch's slot in its set, or claim one. Returns
+// (value, weight) — weight 0 means "no opinion", which the bilinear blend below
+// renormalises away rather than painting lit OR black. See shadowSetOf in
+// common.wgsl for why this probes a set instead of hitting one bucket.
+fn shadowSlotRead(packedCell : u32, packedSub : u32, curFrame : u32) -> vec2f {
   let key = shadowPatchKey(packedCell, packedSub);
-  let bucket = shadowBucketOf(key);
-  let curFrame = R.frameIdx & 15u;
+  let ver = shadowPatchVerifier(packedCell, packedSub);
+  let setBase = shadowSetOf(key);
 
-  // Read BOTH words before touching anything: this is the state the answer is
-  // taken from, and registration below must not be able to change it underfoot.
-  let prevKey = atomicLoad(&shadowCache[bucket * 2u]);
-  let state = atomicLoad(&shadowCache[bucket * 2u + 1u]);
-  let mine = (prevKey == key);
-  let fresh = mine && shadowStateValid(state) &&
-              shadowStateResolved(state) == curFrame;
+  // ---- find ours ----
+  var slot = 0xFFFFFFFFu;
+  var state = 0u;
+  for (var w = 0u; w < SHADOW_WAYS; w++) {
+    let b = setBase + w;
+    if (atomicLoad(&shadowCache[b * 2u]) != key) { continue; }
+    let s = atomicLoad(&shadowCache[b * 2u + 1u]);
+    if (shadowStateVerifier(s) == ver) { slot = b; state = s; break; }
+  }
+
+  if (slot == 0xFFFFFFFFu) {
+    // ---- claim a slot nobody live holds ----
+    // A LIVE slot (requested this frame or last) is never stolen: that is the
+    // whole difference between this and the direct-mapped version that
+    // flickered.
+    //
+    // THE CLAIM IS ONE CAS ON THE STATE WORD, AND THE KEY IS STORED LAST. The
+    // first version CAS'd the key and then stored the state, and in the gap a
+    // second patch could read the slot as (our key, stale state), judge it
+    // unowned, and take it — leaving one patch's key over the other's
+    // verifier, a slot the resolve pass refuses for both, and a patch with no
+    // opinion for another frame. --gate shadow-cache saw it as a 0.03 mean
+    // |dL| between warmed frames 3 and 4 of a pinned scene, run-to-run
+    // varying, with the reference arm at exactly 0.000. Swapping the state
+    // word first makes the slot LIVE (this frame's stamp) in the same atomic
+    // that takes it, so every later prober skips it, and until the key lands
+    // nobody matches it either: it is nobody's, then ours, never mixed.
+    //
+    // A SIBLING'S CLAIM IS OURS. On the frame a patch first appears, EVERY one
+    // of its pixels arrives here — there is no slot to find yet — and without
+    // this check each would take its own empty slot: a 1000-pixel patch filled
+    // its whole set with duplicates, they stayed live for two frames, and every
+    // other patch in that set was starved of a slot until frame 3 and first
+    // shaded in frame 4. That was the residual 0.03 flicker between warmed
+    // frames 3 and 4 in --gate shadow-cache, unchanged by fixing the claim
+    // race above. So a live slot whose verifier is ours — a sibling pixel's
+    // claim, possibly with the key store still in flight — ends the search:
+    // the sibling appended the request, and this frame has no opinion either
+    // way. A foreign patch with the same 15-bit verifier in the same set is a
+    // one-frame missed claim, self-correcting next frame when the key test in
+    // the find loop above fails.
+    for (var w = 0u; w < SHADOW_WAYS; w++) {
+      let b = setBase + w;
+      let k = atomicLoad(&shadowCache[b * 2u]);
+      let s = atomicLoad(&shadowCache[b * 2u + 1u]);
+      if (k != 0u && shadowSlotLive(s, curFrame)) {
+        if (shadowStateVerifier(s) == ver) { return vec2f(0.0); }
+        continue;
+      }
+      let r = atomicCompareExchangeWeak(
+          &shadowCache[b * 2u + 1u], s,
+          shadowPackState(0u, 0u, curFrame, false, ver));
+      if (!r.exchanged) {
+        // THE LOSER RE-CHECKS THE SLOT IT LOST. A warp is 32 pixels of usually
+        // ONE patch executing this loop in lockstep: all 32 load the slot
+        // empty, all 32 CAS, one wins — and the other 31 have already passed
+        // the live-slot check above for THIS slot, so without this they march
+        // on to the next empty slot and repeat, one warp taking a whole set
+        // for one patch. The CAS hands back the word that beat us, so the
+        // sibling test costs no load: it was --gate shadow-cache's remaining
+        // 5,620 moved pixels between warmed frames 3 and 4 (starved patches
+        // claiming once the duplicates went stale), 0 at 12 frames.
+        if (shadowStateVerifier(r.old_value) == ver &&
+            shadowSlotLive(r.old_value, curFrame)) { return vec2f(0.0); }
+        continue;
+      }
+      atomicStore(&shadowCache[b * 2u], key);
+      shadowAppendRequest(key, b, packedCell, packedSub);
+      return vec2f(0.0);
+    }
+    // Set full of live patches. A miss, counted nowhere: at a 20% load the
+    // Poisson tail past 8 is ~1e-5 of patches, and the blend covers it.
+    return vec2f(0.0);
+  }
 
   // ---- registration ----
   // Re-register on EVERY frame, hit or miss: the resolve pass recomputes every
@@ -2604,39 +2665,133 @@ fn shadowCached(hp : vec3f, cell : vec3<i32>, axis : i32, sgn : f32) -> f32 {
   // set alone and means destruction re-lights immediately with no invalidation
   // machinery anywhere.
   //
-  // One appender per patch per frame, elected by the atomicExchange: every
-  // pixel of a fresh patch swaps the current frame stamp in, and only the one
-  // that got back a STALE stamp appends. Without this election a 1000-pixel
-  // patch would enqueue 1000 identical requests on the frame it appears.
-  if (!mine || shadowStateRequested(state) != curFrame) {
-    // Stealing the bucket invalidates it. Keeping our own preserves the value
-    // other pixels are still reading this frame.
-    let claimed = atomicExchange(
-        &shadowCache[bucket * 2u + 1u],
-        shadowPackState(select(0u, state & 0xFFu, mine),
-                        select(0u, shadowStateResolved(state), mine), curFrame,
-                        mine && shadowStateValid(state)));
-    if (shadowStateRequested(claimed) != curFrame) {
-      atomicStore(&shadowCache[bucket * 2u], key);
-      let slot = atomicAdd(&shadowReq[0], 1u);
-      // Over the cap the patch is simply not registered: it misses next frame
-      // and shades unshadowed. Counted in prepare()'s stats words, never fatal
-      // — the failure is a slightly wrong patch, not a lost voxel.
-      if (slot < SHADOW_REQ_CAP) {
-        let base = SHADOW_REQ_HEADER + slot * SHADOW_REQ_WORDS;
-        atomicStore(&shadowReq[base], key);
-        atomicStore(&shadowReq[base + 1u], bucket);
-        atomicStore(&shadowReq[base + 2u], packedCell);
-        atomicStore(&shadowReq[base + 3u], packedSub);
-      }
+  // One appender per patch per frame, elected by the CAS: every pixel of the
+  // patch tries to swap the current frame stamp in over the state it read, and
+  // only the one that succeeds appends. Without this election a 1000-pixel
+  // patch would enqueue 1000 identical requests on the frame it appears. The
+  // value, valid bit and verifier ride through unchanged, so pixels still
+  // reading this frame see exactly what they would have.
+  //
+  // A CAS AND NOT AN EXCHANGE, for the same reason as the claim above: a slot
+  // that went stale while its patch was off screen can be in the middle of
+  // being taken by another patch at the very moment the patch returns. An
+  // exchange would stamp our verifier over the thief's claim; a CAS that
+  // fails means the word moved under us, and the one re-read below says
+  // whether it was our own patch's pixel (already registered — fine) or a
+  // thief (not ours any more — no opinion this frame).
+  if (shadowStateRequested(state) != curFrame) {
+    let r = atomicCompareExchangeWeak(
+        &shadowCache[slot * 2u + 1u], state,
+        shadowPackState(state & 0xFFu, shadowStateResolved(state), curFrame,
+                        shadowStateValid(state), ver));
+    if (r.exchanged) {
+      shadowAppendRequest(key, slot, packedCell, packedSub);
+    } else if (shadowStateVerifier(r.old_value) != ver) {
+      return vec2f(0.0);
     }
   }
+  // A slot that has never been resolved (claimed this frame, or last frame
+  // with the resolve still to come) has no opinion. One that has is trusted
+  // even if its value is a few frames old — see the state-word comment in
+  // common.wgsl for why "lit until proven otherwise" was the sparkle.
+  return select(vec2f(0.0), vec2f(shadowStateValue(state), 1.0),
+                shadowStateValid(state));
+}
 
-  // MISS DEFAULT: unshadowed. A patch with no fresh value has never been
-  // resolved — first frame, a disocclusion, or a collision evicted it — and the
-  // alternative, a stale neighbour's value, would be a WRONG shadow rather than
-  // a missing one. Bright for one frame, then correct.
-  return select(1.0, shadowStateValue(state), fresh);
+fn shadowAppendRequest(key : u32, slot : u32, packedCell : u32, packedSub : u32) {
+  let n = atomicAdd(&shadowReq[0], 1u);
+  // Over the cap the patch is simply not registered: it misses next frame and
+  // blends from its neighbours. Counted in prepare()'s stats words, never fatal
+  // — the failure is a slightly wrong patch, not a lost voxel.
+  if (n < SHADOW_REQ_CAP) {
+    let base = SHADOW_REQ_HEADER + n * SHADOW_REQ_WORDS;
+    atomicStore(&shadowReq[base], key);
+    atomicStore(&shadowReq[base + 1u], slot);
+    atomicStore(&shadowReq[base + 2u], packedCell);
+    atomicStore(&shadowReq[base + 3u], packedSub);
+  }
+}
+
+// Takes the hit's axis and sign rather than the shading normal: `n` at the call
+// site may be perturbed, and the face this patch belongs to must be the
+// geometric one or two pixels on one face would key to different patches.
+//
+// BILINEAR ACROSS THE FOUR NEAREST PATCH CENTRES, not the one patch the pixel
+// is inside. A patch's value is the answer at its CENTRE; treating it as flat
+// across the patch is what made every shadow edge a 2.5 cm staircase. Blending
+// the four surrounding centres by the pixel's position between them turns the
+// edge into a one-patch-wide ramp — the same filtering a lightmap texel gets —
+// at the cost of four slot reads instead of one, all cache-line hits. Taps that
+// fall past the face's edge belong to the NEIGHBOUR cell's same face, which is
+// what keeps the ramp continuous across voxel boundaries; a neighbour that is
+// buried resolves to a contact-dark patch, which is the right answer for the
+// floor-meets-wall seam. Taps with no opinion drop out and the rest
+// renormalise; only a pixel with NO resolved neighbour shades fully lit.
+//
+// BUT ONLY WHERE A PATCH IS AT LEAST A PIXEL WIDE. Over most of an overlook
+// frame a 2.5 cm patch is SUB-pixel, and there the four taps of adjacent pixels
+// land on four different patches instead of sharing: measured with
+// --render-budget, unconditional bilinear took the overlook's request count
+// from 177k to 491k, past the 262k cap, and the refused set changed every
+// frame. A sub-pixel staircase cannot be seen, so a sub-pixel patch takes the
+// single nearest tap — same request count as before filtering existed — and
+// the blend switches on exactly where its cost buys something visible.
+// `camDistFine` is the receiver's camera distance in fine voxels (h.t).
+fn shadowCached(hp : vec3f, cell : vec3<i32>, axis : i32, sgn : f32,
+                camDistFine : f32) -> f32 {
+  let subdiv = clamp(R.shadowSubdiv, 1u, SHADOW_SUBDIV_MAX);
+  // The DDA reports sgn = sign(rd[axis]), so the outward face normal points the
+  // other way: a ray travelling -x enters through the +x face.
+  let face = shadowFaceOf(axis, sgn < 0.0);
+  let t = shadowFaceTangents(face);
+  let m = f32(subdiv);
+  let curFrame = R.frameIdx & 15u;
+  let winLo = R.origin * i32(CHUNK);
+
+  // Continuous patch coordinates, centred: a pixel at a patch centre gets that
+  // patch alone. Clamped, not wrapped, because a hit point can sit a hair
+  // outside its own cell after the DDA's epsilon nudges.
+  let f = clamp(hp - vec3f(cell), vec3f(0.0), vec3f(1.0));
+  var u = f[t.x] * m - 0.5;
+  var v = f[t.y] * m - 0.5;
+  // A face-on patch's width in pixels: (1/m) voxels at distance d, against a
+  // pixel's angular size of 2*tanHalfFov/viewPx. Foreshortening only shrinks
+  // it, which only makes the staircase less visible, so face-on is the
+  // conservative side.
+  let patchPx = R.viewPx / (2.0 * R.tanHalfFov * m * max(camDistFine, 1.0));
+  if (patchPx < 1.0) {
+    // Nearest: an integer coordinate makes the +1 taps' weights exactly zero,
+    // and the loop below skips them.
+    u = min(floor(f[t.x] * m), m - 1.0);
+    v = min(floor(f[t.y] * m), m - 1.0);
+  }
+  let i0 = i32(floor(u));
+  let j0 = i32(floor(v));
+  let wu = u - f32(i0);
+  let wv = v - f32(j0);
+  let sd = i32(subdiv);
+
+  var acc = 0.0;
+  var wsum = 0.0;
+  for (var k = 0u; k < 4u; k++) {
+    let dx = i32(k & 1u);
+    let dy = i32(k >> 1u);
+    let w = select(1.0 - wu, wu, dx == 1) * select(1.0 - wv, wv, dy == 1);
+    if (w <= 1e-4) { continue; }
+    // Sub index past either edge of the face rolls into the neighbour cell.
+    var ix = i0 + dx;
+    var iy = j0 + dy;
+    var c = cell;
+    if (ix < 0) { ix += sd; c[t.x] -= 1; } else if (ix >= sd) { ix -= sd; c[t.x] += 1; }
+    if (iy < 0) { iy += sd; c[t.y] -= 1; } else if (iy >= sd) { iy -= sd; c[t.y] += 1; }
+    let rel = c - winLo;
+    if (any(rel < vec3<i32>(0)) || any(rel >= vec3<i32>(i32(WORLD_N)))) { continue; }
+    let r = shadowSlotRead(shadowPackCell(rel, face),
+                           shadowPackSub(u32(ix), u32(iy)), curFrame);
+    acc += r.x * r.y * w;
+    wsum += r.y * w;
+  }
+  return select(1.0, acc / wsum, wsum > 1e-4);
 }
 
 // ============================================================================
@@ -6535,7 +6690,7 @@ fn fs(in : VSOut) -> FSOut {
       // is farShadowed's own cascade march, not trace() — a much smaller
       // register footprint, and it was already here.
       if (SHADOW_CACHE && h.t * VOXEL_METERS <= TUNE_SHADOW_MAX_DIST) {
-        lambert *= shadowCached(hitP, h.cell, h.axis, h.sgn);
+        lambert *= shadowCached(hitP, h.cell, h.axis, h.sgn, h.t);
       } else {
         lambert *= sunShadowAt(hitP, n, in.pos.xy, h.t);
       }
