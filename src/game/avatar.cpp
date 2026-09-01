@@ -1277,9 +1277,11 @@ void PlayerAvatar::UpdateAnimation(float dt, World& world, bool grounded,
   // grab and a release are exactly the ones that must blend, and a hard
   // switch snaps the arms between the solved reach and whatever pose the
   // clips left. Targets are WORLD points un-yawed the way the legs un-yaw
-  // `planted` (no x negation — that flip is for CAMERA-space offsets, see the
-  // weapon note above), so if the camera yaws the body inside its hold cone
-  // the hands stay planted on the lip and the shoulders turn under them.
+  // `planted` — a pure un-yaw, which is now also what the weapon arm does
+  // (the camera-offset x flip it used to carry was a mirror; see the toRig
+  // note in Mob::ApplyWeaponArm). If the camera yaws the body inside its
+  // hold cone the hands stay planted on the lip and the shoulders turn
+  // under them.
   {
     const float hl = CurrentTuning().avatar.ikBlendHalflife;
     const float want = hangActive_ ? 1.0f : 0.0f;

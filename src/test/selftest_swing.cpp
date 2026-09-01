@@ -69,22 +69,29 @@ using namespace sandvox;
 namespace selftest {
 namespace {
 
-// The camera basis the game hands in: +X right, +Y up, +Z forward. Deliberately
-// axis-aligned so a failure prints a number that can be read by eye.
-const Vec3 kRight{1, 0, 0}, kUp{0, 1, 0}, kFwd{0, 0, 1};
+// The camera basis the game hands in, at heading 0 (facing +Z): right is
+// Camera::Right() = Forward x up = -X. THE SIGN IS THE CAMERA'S CHIRALITY and
+// it is load-bearing (2026-09-01): the renderer maps exactly this vector to
+// screen-right, the rigs author their .R limbs on the model side it names,
+// and the world->rig conversion is a pure un-yaw — so a gate that hands the
+// mirror basis (+X) drives every stroke to the wrong side of the body and
+// measures the authored ACROSS stops where the game enjoys the weapon-side
+// window. Axis-aligned still, so failures print readable numbers; world
+// azimuths below are read with atan2(-x, z) to stay in this basis.
+const Vec3 kRight{-1, 0, 0}, kUp{0, 1, 0}, kFwd{0, 0, 1};
 
 // A shoulder-relative hand pose that is nothing like the guard fallback: down
 // and slightly back, which is roughly where a walk cycle leaves an arm. If this
 // ever coincided with `guard*` the take-over check would be vacuous, so the
 // gate asserts they differ before relying on it.
-const Vec3 kRestHand{0.4f, -3.0f, -0.3f};
+const Vec3 kRestHand{-0.4f, -3.0f, -0.3f};   // x mirrored with the basis
 const float kRestReach = 6.0f;
 
 // A second fixture, out in front and level, for the arc blocks. The hanging
 // rest pose above sits at ~127 degrees of azimuth, which is most of the way to
 // the weapon-side stop — an arc measured from there would be measuring the
 // clamp. Nothing about the mapping depends on which of the two is used.
-const Vec3 kFrontHand{1.0f, 0.0f, 3.0f};
+const Vec3 kFrontHand{-1.0f, 0.0f, 3.0f};    // x mirrored with the basis
 
 const float kDt = 1.0f / 60.0f;
 
@@ -100,14 +107,29 @@ void Step(MeleeState& m, float dx, float dy, bool held = true) {
   m.Update(kDt, held, true, kRight, kUp, kFwd);
 }
 
+// THE GATE'S SUBJECT IS THE CONTROL LAW, so the presentation smoothing is OFF
+// in every fixture (2026-09-01, when `melee.armSmoothing` landed). With it on,
+// "the hand is exactly where the integral says" is false by design — the eased
+// stroke is still converging on the integral whenever the mouse just moved —
+// and two arms given the same pixels over different tick counts differ by
+// their settling, which is lag, not a mapping bug. At 0 the eased copy equals
+// the integral every tick, bit for bit, and every assertion below means what
+// it says. The knob's reachability is combat-tuning's job, not this gate's.
+void SmoothingOff(MeleeState& m) {
+  m.tuning.armSmoothing = 0.0f;
+  m.tuning.wristSmoothing = 0.0f;
+}
+
 MeleeState MakeSeeded() {
   MeleeState m;
+  SmoothingOff(m);
   m.SetArm(kRestHand, kRestReach);
   return m;
 }
 
 MeleeState MakeFront() {
   MeleeState m;
+  SmoothingOff(m);
   m.SetArm(kFrontHand, kRestReach);
   return m;
 }
@@ -149,6 +171,7 @@ Status GateSwing(Ctx& c, std::string& detail) {
     // fallback instead. Without this, check 2 above would also pass on a build
     // that ignored SetStroke and happened to guard where the fixture rests.
     MeleeState blind;
+    SmoothingOff(blind);
     blind.ClearArm();
     blind.Feed(0, 0);
     blind.Update(kDt, true, true, kRight, kUp, kFwd);
@@ -161,8 +184,9 @@ Status GateSwing(Ctx& c, std::string& detail) {
     // that only knew where the HAND was would have to guess the blade's
     // orientation, and a guess is a visible pop at the instant of the click.
     // Fed a real hand/tip pair, BOTH ends must be exactly where they were.
-    const Vec3 tip = kRestHand + Vec3{0.6f, 0.2f, 2.4f};   // a blade, at an angle
+    const Vec3 tip = kRestHand + Vec3{-0.6f, 0.2f, 2.4f};  // a blade, at an angle
     MeleeState bladed;
+    SmoothingOff(bladed);
     bladed.SetStroke(kRestHand, tip, Vec3{0, 1, 0}, kRestReach);
     bladed.Feed(0, 0);
     bladed.Update(kDt, true, true, kRight, kUp, kFwd);
@@ -217,8 +241,10 @@ Status GateSwing(Ctx& c, std::string& detail) {
     // is an ARC and not a slide across a plane.
     check(std::fabs(slow.StrokeAz() - (az0 + kPx * t.aimGainX)) < 1e-4f,
           "rightward mouse turns the stroke right, by pixels x gain");
-    check(slow.TipOffset().x > kFrontHand.x + 0.5f,
-          "and rightward really is to the RIGHT in world terms");
+    check(slow.TipOffset().x < kFrontHand.x - 0.5f,
+          "and rightward really is to the RIGHT in world terms (which is "
+          "world -x: the render maps camRight = Forward x up to screen "
+          "right)");
 
     MeleeState upward = MakeFront();
     Step(upward, 0, 0);
@@ -310,8 +336,9 @@ Status GateSwing(Ctx& c, std::string& detail) {
     for (int i = 0; i < 6; i++) Step(m, 40.0f, -40.0f);
     check(m.Phase() == SwingPhase::Slash, "a fast flick commits a cut");
     const Vec3 cut = m.CutDir();
-    check(cut.x > 0.3f && cut.y > 0.3f,
-          "the cut goes the way the mouse went (right and up)");
+    check(cut.x < -0.3f && cut.y > 0.3f,
+          "the cut goes the way the mouse went (right and up; screen right "
+          "is world -x)");
     // NO POP ON THE COMMITTING TICK. The previous law's arc was centred on the
     // hand, so it jumped half a swing backwards the instant it fired; this one
     // anticipates on a bow that is zero at both ends.
@@ -360,7 +387,7 @@ Status GateSwing(Ctx& c, std::string& detail) {
       Step(m, -25.0f, 0);
       fired = fired || m.Phase() == SwingPhase::Slash;
       const Vec3 tip = m.TipOffset();
-      const float az = std::atan2(tip.x, tip.z);
+      const float az = std::atan2(-tip.x, tip.z);   // basis az (right=-X)
       const float el = std::asin(std::clamp(tip.y / std::max(tip.len(), 1e-4f),
                                             -1.0f, 1.0f));
       azMin = std::min(azMin, az);
@@ -403,7 +430,7 @@ Status GateSwing(Ctx& c, std::string& detail) {
     check(m.TipOffset().y > tip0.y + 1.0f, "forward mouse RAISES the point");
     check(std::fabs(m.StrokeRadius() - r0) < 1e-4f,
           "...and does not extend it: the reach is untouched");
-    check(std::fabs(m.StrokeAz() - std::atan2(tip0.x, tip0.z)) < 1e-4f,
+    check(std::fabs(m.StrokeAz() - std::atan2(-tip0.x, tip0.z)) < 1e-4f,
           "...nor does it swing the point sideways");
 
     // The radial channel exists, is bounded, and is the ONLY thing that moves
@@ -425,6 +452,7 @@ Status GateSwing(Ctx& c, std::string& detail) {
     const Vec3 tip = kFrontHand + Vec3{0.0f, 0.0f, 2.5f};
     const float bladeLen = (tip - kFrontHand).len();
     MeleeState m;
+    SmoothingOff(m);
     m.SetStroke(kFrontHand, tip, Vec3{0, 1, 0}, kRestReach);
     m.Feed(0, 0);
     m.Update(kDt, true, true, kRight, kUp, kFwd);
@@ -433,8 +461,8 @@ Status GateSwing(Ctx& c, std::string& detail) {
     // supposed to be NEGATIVE, and a max() seeded at zero can only ever report
     // zero — a check that passes and fails for the same reason.
     float worstFlat = 0, worstPole = -1e9f, worstBlade = 0;
-    float worstOffTrail = -1e9f, worstOffCone = 0;
-    int samples = 0, offTrail = 0;
+    float worstOffTrail = -1e9f, worstOffCone = 0, worstPinAim = 0;
+    int samples = 0, offTrail = 0, pinnedFront = 0;
     for (int i = 0; i < 50; i++) {
       m.SetStroke(m.HandOffset(), m.TipOffset(), m.BladeFlat(), kRestReach);
       Step(m, -kNoCommitPx * 0.6f, 0);
@@ -475,16 +503,33 @@ Status GateSwing(Ctx& c, std::string& detail) {
         worstOffTrail = std::max(worstOffTrail, opp);
         worstOffCone = coneNow;
       }
-      // ...and the hand is still the tip minus a blade.
-      worstBlade = std::max(
-          worstBlade,
-          std::fabs((m.TipOffset() - m.HandOffset()).len() - bladeLen));
+      // ...and the hand is still the tip minus a blade — EXCEPT on ticks the
+      // front-plane clamp holds it (2026-09-01, MeleeTuning::handBackFrac):
+      // there the hand is pinned at the plane, |tip - hand| is legitimately
+      // short of a blade, and the contract is instead that the blade is still
+      // AIMED at the commanded point from the pinned hand. Asserting exact
+      // length through the clamp would be asserting the clamp off.
+      {
+        const Vec3 handNow = m.HandOffset();
+        const float backLim =
+            -m.tuning.handBackFrac * kRestReach * m.tuning.reachFraction;
+        const Vec3 toTip = m.TipOffset() - handNow;
+        if (handNow.z > backLim + 0.05f) {
+          worstBlade =
+              std::max(worstBlade, std::fabs(toTip.len() - bladeLen));
+        } else if (toTip.len() > 1e-4f) {
+          pinnedFront++;
+          worstPinAim = std::max(
+              worstPinAim, 1.0f - toTip.normalized().dot(m.BladeDir()));
+        }
+      }
     }
     std::printf(
         "swing block 9: worst |flat.travel| %.3f, worst pole.travel %.3f, "
-        "worst blade-length drift %.3f vox; %d ticks off-trail and not pinned "
-        "at the elbow cone (worst %.3f at %.2f rad of %.2f)\n",
-        worstFlat, worstPole, worstBlade, offTrail,
+        "worst blade-length drift %.3f vox (%d ticks pinned at the front "
+        "plane, worst aim error there %.4f); %d ticks off-trail and not "
+        "pinned at the elbow cone (worst %.3f at %.2f rad of %.2f)\n",
+        worstFlat, worstPole, worstBlade, pinnedFront, worstPinAim, offTrail,
         offTrail ? worstOffTrail : 0.0f, offTrail ? worstOffCone : 0.0f,
         t.elbowPoleCone);
     // SAMPLES > 0 IS NOT PEDANTRY. `worstPole` is a max() over a quantity that
@@ -501,6 +546,9 @@ Status GateSwing(Ctx& c, std::string& detail) {
           "cut plane) - or is pinned at its anatomical cone, never elsewhere");
     check(worstBlade < 0.35f,
           "the hand stays exactly one blade behind the point");
+    check(worstPinAim < 0.01f,
+          "...and on front-plane-pinned ticks the blade is still aimed at "
+          "the commanded point");
   }
 
   // ---- 10. the driver is not player-specific -------------------------------
@@ -754,10 +802,11 @@ Status GateSwingPlane(Ctx& c, std::string& detail) {
   ctx.WaitIdle();
 
   // ---- the fixture: an avatar with the blade drawn, facing +Z --------------
-  // Heading 0 and an axis-aligned basis, so every number printed by a failure
-  // can be read by eye: +X is the camera's right, +Y up, +Z the way the
-  // character faces.
-  const Vec3 kR{1, 0, 0}, kU{0, 1, 0}, kF{0, 0, 1};
+  // Heading 0 and an axis-aligned basis: -X is the camera's right (the note
+  // on kRight at the top of this file — the camera's chirality, which is what
+  // the game hands melee.Update and what the renderer calls screen-right),
+  // +Y up, +Z the way the character faces.
+  const Vec3 kR{-1, 0, 0}, kU{0, 1, 0}, kF{0, 0, 1};
   // ANCHORED TO THE RESIDENCY WINDOW, never to an absolute coordinate, and
   // ANCHORED IN THE RIGHT UNITS — which is the whole of the bug this gate was
   // landed known-failing for.
@@ -918,6 +967,36 @@ Status GateSwingPlane(Ctx& c, std::string& detail) {
   // really "the knob is not connected". CLAUDE.md's cheap-to-verify rule: a
   // threshold that lives in source costs a rebuild to tune.
   ApplyMeleeTuning(melee.tuning);
+  // ...AND THEN THE FEEL KNOBS ARE PINNED (2026-09-01), because this gate's
+  // subject is the COMMAND -> POSE MAPPING and the shipped feel deliberately
+  // stopped tracking the command tick-exactly:
+  //
+  //   * armSmoothing / wristSmoothing ease the stroke and the wrist's chase.
+  //     Lag measured against the command reads as residual, and the residual
+  //     bounds here would then be asserting a halflife, not the mapping.
+  //   * The steer band moved to 0.6..3.0 m/s and only Slash bypasses it — the
+  //     gate's driven sweeps are deliberately UNDER the commit cap (Guard/
+  //     Wind), so at live values they run at partial alignment BY DESIGN
+  //     (steer 0.52 mid-sweep, residual 13.35 vox, all of it intentional
+  //     grip-pose blend). The pin is steerFloor = 1 — the documented A/B that
+  //     restores always-align — and NOT a saturated speed band: a band still
+  //     dips to the floor on the one tick of every REVERSAL (the tip passes
+  //     through zero speed), and with the envelope's smoothing also pinned
+  //     off, that dip is a snap. Measured: pass A's el drift went 0.34 ->
+  //     1.38 rad from exactly those ticks (wrist applied 0.55 of a wanted
+  //     2.69 mid-sweep), which is a flop to the grip pose in the middle of
+  //     the arc the pass is measuring.
+  //
+  // Pass G tests the live floor semantics, so the pin is LIFTED around it
+  // (search steerFloorLive below).
+  //
+  // What ships is the mapping measured here COMPOSED WITH those knobs; the
+  // knobs' reachability is combat-tuning's assertion, and their feel is the
+  // player's own Combat panel.
+  const float steerFloorLive = melee.tuning.steerFloor;
+  melee.tuning.armSmoothing = 0.0f;
+  melee.tuning.wristSmoothing = 0.0f;
+  melee.tuning.steerFloor = 1.0f;
   auto readBlade = [&]() -> BladeRead {
     BladeRead b;
     float hw = 0;
@@ -928,7 +1007,7 @@ Status GateSwingPlane(Ctx& c, std::string& detail) {
     b.physGap = ((b.tip - shoulderWorld()) - b.fromShoulder).len();
     b.r = b.fromShoulder.len();
     if (b.r < 1e-4f) return b;
-    b.az = std::atan2(b.fromShoulder.x, b.fromShoulder.z);
+    b.az = std::atan2(-b.fromShoulder.x, b.fromShoulder.z);  // basis az
     b.el = std::asin(std::clamp(b.fromShoulder.y / b.r, -1.0f, 1.0f));
     b.valid = true;
     return b;
@@ -1031,7 +1110,7 @@ Status GateSwingPlane(Ctx& c, std::string& detail) {
       {
         const Vec3 w = melee.TipOffset();
         const float wr = std::max(w.len(), 1e-4f);
-        const float waz = std::atan2(w.x, w.z);
+        const float waz = std::atan2(-w.x, w.z);   // basis az (right=-X)
         const float wel = std::asin(std::clamp(w.y / wr, -1.0f, 1.0f));
         if (!haveCmdPrev) {
           cmdAzAcc = waz;
@@ -1327,6 +1406,10 @@ Status GateSwingPlane(Ctx& c, std::string& detail) {
     //
     // Measured on this fixture, the two arms of that A/B are 1.80 rad of wrist
     // applied against 0.26, with the steer amount at 1.00 against 0.15.
+    //
+    // THE LIVE FLOOR, not the gate's always-align pin: this pass IS the ramp's
+    // own test, so it runs at the shipped semantics and re-pins afterwards.
+    melee.tuning.steerFloor = steerFloorLive;
     melee.Reset();
     const bool gReady = true;   // no ready: taking over IS the pose
     for (int i = 0; i < 60; i++) drive(0, 0, true);
@@ -1372,6 +1455,7 @@ Status GateSwingPlane(Ctx& c, std::string& detail) {
         gFore.z, guardVsArm, guardArmMin, melee.SteerAmount(), gd.wristWant,
         gd.wristApplied, gd.elbowAxisTurn);
     for (int i = 0; i < 20; i++) drive(0, 0, false);
+    melee.tuning.steerFloor = 1.0f;   // back to the mapping pin (see the top)
   }
 
   // ---- H. THE ARM STAYS IN FRONT AND THE ELBOW BENDS ONE WAY --------------
@@ -1556,13 +1640,15 @@ Status GateSwingPlane(Ctx& c, std::string& detail) {
     // Readied high and to the weapon side; the flick then goes left AND down.
     const StrokeStats s = runStroke(1.00f, 0.80f, -26.0f, 26.0f, 16);
     check(s.readied, "the ready reached its start pose without committing");
-    const float dAz = s.last.x - s.first.x;   // world x: leftward is negative
+    // world x: LEFTWARD IS POSITIVE — screen-left is -camRight, and camRight
+    // is world -X at this heading (the kRight note at the top of the file).
+    const float dAz = s.last.x - s.first.x;
     const float dEl = s.last.y - s.first.y;   // world y: downward is negative
     const float ratio = std::fabs(dAz) > 1e-4f && std::fabs(dEl) > 1e-4f
                             ? std::max(std::fabs(dAz) / std::fabs(dEl),
                                        std::fabs(dEl) / std::fabs(dAz))
                             : 1e9f;
-    check(dAz < 0.0f, "a top-right to bottom-left flick takes the point LEFT");
+    check(dAz > 0.0f, "a top-right to bottom-left flick takes the point LEFT");
     check(dEl < 0.0f, "...and DOWN");
     check(ratio < diagRatioMax,
           "...in comparable measure, i.e. genuinely diagonal rather than a "
@@ -1863,6 +1949,21 @@ Status GateSwingPlane(Ctx& c, std::string& detail) {
           "swept ticks, tip box (%.1f,%.1f,%.1f)..(%.1f,%.1f,%.1f)\n",
           hitNear, wounded, nearVox, farLost, farTotal, sweptTicks, lo.x, lo.y,
           lo.z, hi.x, hi.y, hi.z);
+      // HOW CLOSE THE EDGE ACTUALLY CAME, when nothing was wounded. "0 of 0"
+      // alone cannot distinguish a geometric miss (fixture/arc fault) from
+      // probes that passed through the body without hitting it (sweep fault),
+      // and the distances are already computed — print the three closest.
+      if (wounded == 0) {
+        std::vector<std::pair<float, int>> close;
+        for (size_t i = 0; i < dd.limbs.size(); i++)
+          if (before[i]) close.push_back({beforePos[i], (int)i});
+        std::sort(close.begin(), close.end());
+        std::printf("swing-plane E (miss attribution): edge-to-limb closest");
+        for (size_t i = 0; i < close.size() && i < 3; i++)
+          std::printf(" | %s %.2f vox",
+                      dd.limbs[close[i].second].name.c_str(), close[i].first);
+        std::printf("\n");
+      }
       mobs.Reset();
     }
   }

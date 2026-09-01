@@ -2490,10 +2490,12 @@ bool mobOk = false;
               // Mob::WeaponArmPose reports where the weapon hand IS in the
               // frame SetWeaponPose SPEAKS, and the mouse-directed swing uses
               // it to take control of the arm without moving it (game/melee.h).
-              // The conversion has two chances to be silently wrong — the yaw,
-              // and the x negation the mirrored authoring needs — and BOTH are
-              // invisible on a rig standing at heading 0 facing the camera,
-              // which is exactly the case anybody would eyeball.
+              // The yaw half of that conversion is invisible on a rig standing
+              // at heading 0 facing the camera — exactly the case anybody
+              // would eyeball. NOTE this is a ROUND TRIP, so it can only
+              // assert the two directions AGREE, not that either is right:
+              // the toRig x-mirror (removed 2026-09-01, see mob.cpp) passed
+              // here for a month because its inverse rode in WeaponArmPose.
               //
               // So this asserts against a target the test chose, not against
               // the value under test: drive the hand to a known legal offset,

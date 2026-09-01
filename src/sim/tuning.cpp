@@ -845,6 +845,9 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadF(*g, "steerSpeedLoMps", e.steerSpeedLoMps, out, at);
     ReadF(*g, "steerSpeedHiMps", e.steerSpeedHiMps, out, at);
     ReadF(*g, "steerFloor", e.steerFloor, out, at);
+    ReadF(*g, "armSmoothing", e.armSmoothing, out, at);
+    ReadF(*g, "wristSmoothing", e.wristSmoothing, out, at);
+    ReadF(*g, "handBackFrac", e.handBackFrac, out, at);
     ReadF(*g, "elbowPoleCone", e.elbowPoleCone, out, at);
     ReadF(*g, "elbowAxisCone", e.elbowAxisCone, out, at);
     ReadF(*g, "edgeFloor", e.edgeFloor, out, at);
@@ -934,6 +937,14 @@ bool LoadTuning(const std::string& path, Tuning& out) {
       e.steerSpeedHiMps = std::max(e.steerSpeedLoMps * 2.0f, 0.05f);
     }
     e.steerFloor = std::clamp(e.steerFloor, 0.0f, 1.0f);
+    // ---- PER-JOINT SMOOTHING + THE HAND'S FRONTAL PLANE ---------------------
+    // Halflives: 0 is a legitimate off switch (SmoothAlpha returns 1); the
+    // ceilings only stop a fat-fingered "2" from turning the arm into taffy.
+    // handBackFrac at 0 pins the hand to the plane exactly; past ~0.5 the
+    // clamp stops meaning "in front" at all.
+    e.armSmoothing = std::clamp(e.armSmoothing, 0.0f, 1.0f);
+    e.wristSmoothing = std::clamp(e.wristSmoothing, 0.0f, 1.0f);
+    e.handBackFrac = std::clamp(e.handBackFrac, 0.0f, 0.5f);
     // ---- THE ELBOW/SHOULDER CONES -------------------------------------------
     // Both are half-angles, so pi is "unbounded" and restores the old free
     // behaviour for an A/B. The floors are not zero: a cone of exactly 0 pins
@@ -2664,6 +2675,9 @@ bool SaveCombatTuning(const std::string& path, const Tuning& t,
     put("steerSpeedLoMps", m.steerSpeedLoMps);
     put("steerSpeedHiMps", m.steerSpeedHiMps);
     put("steerFloor", m.steerFloor);
+    put("armSmoothing", m.armSmoothing);
+    put("wristSmoothing", m.wristSmoothing);
+    put("handBackFrac", m.handBackFrac);
     put("elbowPoleCone", m.elbowPoleCone);
     put("elbowAxisCone", m.elbowAxisCone);
     put("edgeFloor", m.edgeFloor);

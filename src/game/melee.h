@@ -331,15 +331,56 @@ struct MeleeTuning {
   // them is smoothed, so there is no tick where the blade jumps.
   //
   // Speeds are TIP speed in world voxels/sec, the same quantity the damage
-  // ramp is stated on. Committed phases (Wind/Slash/Recover) bypass the ramp
-  // entirely — a cut is a cut even at the moment it reverses through zero.
-  float steerSpeedLo = MetresPerSecToCells(0.25f);   // below: grip pose
-  float steerSpeedHi = MetresPerSecToCells(1.10f);   // above: full alignment
+  // ramp is stated on. ONLY SLASH bypasses the ramp — a cut is a cut even at
+  // the moment it reverses through zero. Wind and Recover used to bypass it
+  // too, and that was the owner-reported "overhead strikes just rotate the
+  // wrist at the cursor": raising the sword is Wind (moderate speed, held),
+  // so the raise itself wrenched the blade onto the radius instead of letting
+  // it ride the grip (up out of the fist). The band is also wider now
+  // (0.6..3.0 m/s, up from 0.25..1.10) for the same reason: a deliberate
+  // raise moves the tip at 1-2 m/s and should mostly keep the grip pose;
+  // only near-cut speeds earn full alignment, and a committed Slash gets it
+  // regardless.
+  float steerSpeedLo = MetresPerSecToCells(0.6f);    // below: grip pose
+  float steerSpeedHi = MetresPerSecToCells(3.0f);    // above: full alignment
   // What is applied at and below `steerSpeedLo`. Not zero: a guard that shares
   // NOTHING with the stroke reads as the weapon having been let go of, and the
   // take-over seed (SetStroke reads the rig's real blade every tick) is
   // smoother when the two poses are near neighbours.
   float steerFloor = 0.15f;
+  // ---- PER-JOINT SMOOTHING, both halflives in seconds ---------------------
+  //
+  // Two knobs because the two joints have different jobs and different
+  // tolerances for lag. The ARM carrying the hand can lag the mouse a little
+  // and read as weight; the WRIST lagging a committed cut misaligns the edge
+  // and costs real damage (MeleeEdgeAlign), so the two must be tunable apart.
+  //
+  // `armSmoothing` eases the integrated stroke (az/el/radius, follow-through
+  // included) before the tip is built from it, so everything derived — hand,
+  // bend pole, blade — inherits the same lag and stays one rigid assembly.
+  // 0 is off (the pre-knob behaviour, bit for bit).
+  float armSmoothing = 0.04f;
+  // `wristSmoothing` owns BOTH halves of the wrist's motion: the commitment
+  // envelope (attack = half this, release = four times it — the asymmetry is
+  // measured, see RebuildFrame) and the chase of the commanded blade
+  // orientation itself. The orientation chase runs 3x faster through a Slash
+  // so a cut still lays the edge in crisply. Replaces the old derivation from
+  // bladeSmoothing, which conflated the wrist's feel with the internal frame
+  // continuity mechanism.
+  float wristSmoothing = 0.10f;
+  // ---- THE HAND STAYS IN FRONT OF THE BODY --------------------------------
+  //
+  // How far BEHIND the shoulder's frontal plane the hand may sit, as a
+  // fraction of arm reach. The tip window (azOut 105 deg) already keeps the
+  // COMMANDED POINT essentially in front, but the hand is the tip minus a
+  // whole blade (RebuildFrame: `handL = tipL - bladeDir * bladeLen`) plus the
+  // lean term, and nothing bounded THAT — measured, it sat several voxels
+  // behind the plane at the azimuth stops, which is "the upper arm goes
+  // behind him and sticks there". The clamp holds the hand at the plane and
+  // re-aims the blade at the commanded tip from the clamped hand, so a
+  // wind-up still angles the blade back while the arm stays in front (the
+  // note in RebuildFrame has the A/B against keeping the solved lean).
+  float handBackFrac = 0.05f;
   // ---- WHAT THE ARM MAY DO WHILE IT SERVES THE BLADE ----------------------
   //
   // THE ELBOW IS A ONE-WAY HINGE AND THE BEND PLANE IS NOT FREE. The stroke
@@ -774,6 +815,9 @@ class MeleeState {
   float cutAz_ = 0, cutEl_ = 0;
   Vec3 tip_{}, hand_{}, bladeDir_{0, 1, 0}, bladeFlat_{0, 0, 1},
       bendPole_{0, 0, -1};
+  // The wrist's eased blade frame in world space (see wristDirL_ below);
+  // Pose() hands THESE to the rig, never the exact pair above.
+  Vec3 wristDir_{0, 1, 0}, wristFlat_{0, 0, 1};
   // THE INTEGRATED STROKE, in the basis's frame: azimuth about `up` measured
   // from `fwd` toward `right`, elevation above the fwd/right plane, and the
   // tip's distance from the shoulder. Stored as angles rather than as a point
@@ -781,6 +825,13 @@ class MeleeState {
   // drag is an ARC in front of the character rather than a slide across a
   // plane — the difference between a sweep and a jab.
   float az_ = 0, el_ = 0, radius_ = 0;
+  // THE SMOOTHED STROKE the frame is actually built from — az/el/radius eased
+  // toward the clamped (steered + follow-through) sums on the armSmoothing
+  // halflife. Kept beside az_/el_/radius_ rather than replacing them because
+  // the RAW integral is what the clamps bank against and what a take-over
+  // seeds; the eased copy is presentation. At armSmoothing 0 these equal the
+  // sums every tick and nothing changes.
+  float azLive_ = 0, elLive_ = 0, radLive_ = 0;
   // The cut's own follow-through, ADDED to az_/el_ rather than replacing them:
   // the player keeps steering through the slash and the arc rides on top of
   // wherever they have steered to. Decays over Recover, which is what makes a
@@ -800,6 +851,13 @@ class MeleeState {
   // turns with the view every tick, and a world-space memory would read that
   // turn as blade motion and roll the edge into it.
   Vec3 bladeDirL_{0, 0, 1}, bladeFlatL_{0, 1, 0}, poleL_{0, 0, -1};
+  // WHAT THE WRIST IS ASKED TO CHASE — the blade frame again, but eased on
+  // the wristSmoothing halflife. bladeDirL_ must stay exact (the hand is
+  // derived from it and |tip - hand| = bladeLen has to hold every tick), so
+  // the wrist's own lag lives in this separate copy: the ARM is placed off
+  // the exact frame, the POSE reports this one. That split is the whole
+  // "unique smoothing per joint" mechanism.
+  Vec3 wristDirL_{0, 0, 1}, wristFlatL_{0, 1, 0};
   // THE LEAN PLANE, and how extended the arm is being held. These two are the
   // smoothed state, and the blade direction is REBUILT from them every tick
   // rather than being smoothed itself — see RebuildFrame. Smoothing a direction

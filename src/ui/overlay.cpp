@@ -1330,9 +1330,37 @@ void Overlay::Draw(UIState& s) {
               ImGui::SetTooltip(
                   "Blade TIP speed at the two ends of the ramp. Between\n"
                   "them the applied alignment interpolates, smoothed on the\n"
-                  "blade halflife so a commit never snaps the fist.\n\n"
-                  "Wind / slash / recover bypass the ramp entirely: a cut\n"
-                  "is a cut even at the instant it reverses through zero.");
+                  "wrist halflife so a commit never snaps the fist.\n\n"
+                  "ONLY a committed slash bypasses the ramp: a cut is a cut\n"
+                  "even at the instant it reverses through zero. Wind and\n"
+                  "recover used to bypass it too, which is why raising the\n"
+                  "sword for an overhead wrenched the wrist at the cursor.");
+            f("arm smoothing (s)", &m.armSmoothing, 0.0f, 0.4f);
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "Halflife easing the WHOLE stroke (azimuth, elevation,\n"
+                  "reach, follow-through included) before the arm is built\n"
+                  "from it — hand, elbow plane and blade lag together as\n"
+                  "one rigid assembly. 0 is off (tick-exact tracking).");
+            f("wrist smoothing (s)", &m.wristSmoothing, 0.0f, 0.5f);
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "Halflife on the WRIST alone: the commitment envelope\n"
+                  "(attack at half this, release at 4x it) and the chase of\n"
+                  "the commanded blade orientation, which runs 3x faster\n"
+                  "through a slash so the edge still lays in crisply.\n\n"
+                  "Separate knobs because the joints tolerate lag\n"
+                  "differently: a lagging arm reads as weight, a lagging\n"
+                  "wrist mid-cut costs edge alignment and damage.");
+            f("hand behind limit", &m.handBackFrac, 0.0f, 0.5f, "%.2f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "How far behind the shoulder's frontal plane the HAND may\n"
+                  "sit, as a fraction of arm reach. The azimuth window\n"
+                  "bounds the commanded POINT, but the hand is that point\n"
+                  "minus a whole blade — unbounded it sat voxels behind the\n"
+                  "plane at the stops, which is \"the arm goes behind him\".\n"
+                  "0 pins the hand to the plane exactly.");
             f("elbow bend plane (rad)", &m.elbowPoleCone, 0.05f, 3.14f, "%.2f");
             if (ImGui::IsItemHovered())
               ImGui::SetTooltip(

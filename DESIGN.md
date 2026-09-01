@@ -2396,11 +2396,38 @@ because it wrenches the fist round to lay the sword along the shoulder-to-point
 line whatever the player is doing. A stroke seeded from a hanging arm then had
 that radius aimed at the floor, and holding a guard pointed the sword straight
 down. So `WeaponPose::steerAmount` (0..1) throttles the applied alignment on the
-tip's own speed: still is the authored GRIP pose, moving is full alignment,
-committed phases bypass the ramp. The DRIVER owns it (it knows the phase and the
-speed) and the RIG applies it, the same seam `WeaponPose::wristMaxAngle` already
-crosses. Take-over stays continuous because `SetStroke` re-seeds from the rig's
-actual blade every tick.
+tip's own speed: still is the authored GRIP pose, moving is full alignment, and
+**only a committed Slash bypasses the ramp** (2026-09-01; Wind and Recover used
+to as well, which made raising the sword for an overhead wrench the wrist round
+to point the blade at the cursor — a raise IS Wind). The DRIVER owns it (it
+knows the phase and the speed) and the RIG applies it, the same seam
+`WeaponPose::wristMaxAngle` already crosses. Take-over stays continuous because
+`SetStroke` re-seeds from the rig's actual blade every tick.
+
+**Each joint smooths on its own clock** (2026-09-01). `melee.armSmoothing` eases
+the integrated stroke (az/el/radius, follow-through included) before the tip is
+built, so hand, bend pole and blade lag together as one rigid assembly;
+`melee.wristSmoothing` owns the wrist's commitment envelope and its chase of the
+commanded blade orientation (3x faster through a Slash, because edge alignment
+is damage). Split because the joints tolerate lag differently: a lagging arm
+reads as weight, a lagging wrist mid-cut costs the cut. The exact blade frame
+still places the hand — the eased copy is only what the rig's wrist chases — so
+`|tip − hand| = bladeLen` holds whatever the knobs say. And **the hand may not
+go behind the body** (`melee.handBackFrac`): the azimuth window bounds the
+commanded point, but the hand is that point minus a whole blade plus the lean,
+and unbounded it sat voxels behind the shoulder's frontal plane at the stops —
+the arm visibly behind the torso. The clamp holds the hand at the plane and
+re-aims the blade at the commanded point from the clamped hand.
+
+**World→rig is a pure un-yaw** (2026-09-01). `Mob::ApplyWeaponArm` carried an x
+negation ("the rigs are authored mirrored") from the overhaul until it was
+worked through on paper: camera-right un-yaws to model −X, which is where the
+`.R` limbs are authored and what the raymarcher draws screen-right, so the
+negation was a net MIRROR — mouse-right drove the rendered arm screen-left, and
+azOut's generous weapon-side window was spent across the body. No gate saw it
+because `WeaponArmPose` carried the matching inverse: every round-trip probe was
+self-consistent whichever sign the pair had. The one in-code tell was the
+ledge-hang solve, which un-yaws world palm targets with no negation and lands.
 
 Two facts underneath it are worth keeping because both were got wrong first:
 the GRIP is `[0,-90,0]` — blade out of the fist, perpendicular to the forearm,

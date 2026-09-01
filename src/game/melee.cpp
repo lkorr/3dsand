@@ -789,6 +789,9 @@ void ApplyMeleeTuning(MeleeTuning& dst, const Tuning& t) {
   dst.steerSpeedLo = MetresPerSecToCells(m.steerSpeedLoMps);
   dst.steerSpeedHi = MetresPerSecToCells(m.steerSpeedHiMps);
   dst.steerFloor = m.steerFloor;
+  dst.armSmoothing = m.armSmoothing;
+  dst.wristSmoothing = m.wristSmoothing;
+  dst.handBackFrac = m.handBackFrac;
   dst.elbowPoleCone = m.elbowPoleCone;
   dst.elbowAxisCone = m.elbowAxisCone;
   dst.edgeFloor = m.edgeFloor;
@@ -874,8 +877,13 @@ float MeleeState::PoseWeight() const {
 WeaponPose MeleeState::Pose() const {
   WeaponPose p;
   p.hand = hand_;
-  p.bladeDir = bladeDir_;
-  p.bladeFlat = bladeFlat_;
+  // The WRIST'S eased frame, not the exact one. The exact bladeDir_ placed
+  // the hand (RebuildFrame keeps |tip - hand| = bladeLen against it); what
+  // the rig's wrist is asked to chase is the copy smoothed on its own
+  // wristSmoothing halflife, which is what stops a whipping tip from
+  // wrenching the fist tick to tick.
+  p.bladeDir = wristDir_;
+  p.bladeFlat = wristFlat_;
   p.bendPole = bendPole_;
   p.weight = PoseWeight();
   p.wristMaxAngle = tuning.wristMaxAngle;
@@ -929,6 +937,7 @@ void MeleeState::Reset() {
   cutDir_ = Vec3{};
   cutAz_ = cutEl_ = 0;
   az_ = el_ = radius_ = 0;
+  azLive_ = elLive_ = radLive_ = 0;
   swingAz_ = swingEl_ = swingOut_ = 0;
   tipPrev_ = Vec3{};
   tipVel_ = Vec3{};
@@ -984,9 +993,27 @@ void MeleeState::RebuildFrame(float dt, const Vec3& right, const Vec3& up,
   // not carry the point past vertical or through the far shoulder either.
   const float azHi = handSign_ > 0 ? tuning.azOut : tuning.azAcross;
   const float azLo = handSign_ > 0 ? -tuning.azAcross : -tuning.azOut;
-  const float az = std::clamp(az_ + swingAz_, azLo, azHi);
-  const float el = std::clamp(el_ + swingEl_, tuning.elMin, tuning.elMax);
-  const float r = std::clamp(radius_ + swingOut_, rLo, rHi);
+  const float azSum = std::clamp(az_ + swingAz_, azLo, azHi);
+  const float elSum = std::clamp(el_ + swingEl_, tuning.elMin, tuning.elMax);
+  const float rSum = std::clamp(radius_ + swingOut_, rLo, rHi);
+
+  // ---- THE ARM'S OWN SMOOTHING, before anything is built ------------------
+  // Eased HERE, on the clamped sums, so the whole derived assembly — tip,
+  // blade, hand, bend pole — lags together and stays rigid. Easing any one
+  // derived piece instead (the hand, say) would let |tip - hand| drift off
+  // bladeLen during the lag, which is the constraint this file exists to
+  // hold. The raw az_/el_/radius_ stay untouched: the clamps bank against
+  // them and a take-over reads them, so the lag is presentation only.
+  {
+    const float aArm = framePrimed_ ? SmoothAlpha(tuning.armSmoothing, dt) : 1.0f;
+    azLive_ += (azSum - azLive_) * aArm;
+    elLive_ += (elSum - elLive_) * aArm;
+    radLive_ += (rSum - radLive_) * aArm;
+    // The band moved with extendLive_ this tick; an eased radius from last
+    // tick's band may sit just outside this one.
+    radLive_ = std::clamp(radLive_, rLo, rHi);
+  }
+  const float az = azLive_, el = elLive_, r = radLive_;
 
   const float ce = std::cos(el), se = std::sin(el);
   const Vec3 tipL{r * ce * std::sin(az), r * se, r * ce * std::cos(az)};
@@ -1112,6 +1139,58 @@ void MeleeState::RebuildFrame(float dt, const Vec3& right, const Vec3& up,
   const float hd = handL.len();
   if (handReach > 1e-3f && hd > handReach) handL = handL * (handReach / hd);
 
+  // ---- AND THE HAND MAY NOT GO BEHIND THE BODY ----------------------------
+  //
+  // The tip window keeps the COMMANDED POINT in front (azOut's note), but the
+  // hand is that point minus a whole blade plus the lean, and nothing above
+  // bounds where THAT lands: at the azimuth stops it sat several voxels
+  // behind the shoulder's frontal plane, which drives the upper arm behind
+  // the torso — the reported "his arm still goes behind him". Clamp the
+  // hand to the plane and RE-AIM the blade at the commanded tip from the
+  // clamped hand: a wind-up still angles the blade back over the shoulder
+  // line while the arm itself stays in front. |tip - hand| stops being
+  // exactly bladeLen on the clamped ticks, which is fine — the rig consumes
+  // hand + direction, never the tip (melee.h WeaponPose), so the sword stays
+  // rigid in the fist and only the geometry of the ask changes. (Keeping the
+  // solved lean instead was tried: it shortens the POSED sweep by the whole
+  // pinned region — swing-plane A lost 0.26 rad of arc — and buys the tip
+  // nothing, since the deep-stop tip position is set by the rig's own pose
+  // clamps either way.)
+  {
+    const float backLim = -std::max(tuning.handBackFrac, 0.0f) * handReach;
+    if (handL.z < backLim) {
+      handL.z = backLim;
+      const Vec3 bd = tipL - handL;
+      if (bd.len() > 1e-4f) {
+        bladeDirL_ = bd.normalized();
+        bladeFlatL_ = bladeFlatL_ - bladeDirL_ * bladeDirL_.dot(bladeFlatL_);
+        bladeFlatL_ = bladeFlatL_.len() > 1e-5f ? bladeFlatL_.normalized()
+                                                : AnyPerp(bladeDirL_);
+      }
+    }
+  }
+
+  // ---- THE WRIST CHASES THE FRAME ON ITS OWN CLOCK ------------------------
+  //
+  // The exact bladeDirL_/bladeFlatL_ above place the HAND; this eased copy is
+  // what the rig's wrist is asked to align the blade to (Pose()). Separate on
+  // purpose — "unique smoothing per joint": a whipping tip may re-aim the
+  // exact frame in a couple of ticks, and passing that straight to the wrist
+  // is the reported fist-twitch. Chasing 3x faster through a Slash keeps a
+  // committed cut's edge crisp (edge alignment is damage, MeleeEdgeAlign).
+  {
+    const float hl =
+        tuning.wristSmoothing * (phase_ == SwingPhase::Slash ? 0.35f : 1.0f);
+    const float aw = framePrimed_ ? SmoothAlpha(hl, dt) : 1.0f;
+    wristDirL_ = Lerp(wristDirL_, bladeDirL_, aw);
+    wristDirL_ =
+        wristDirL_.len() > 1e-5f ? wristDirL_.normalized() : bladeDirL_;
+    wristFlatL_ = Lerp(wristFlatL_, bladeFlatL_, aw);
+    wristFlatL_ = wristFlatL_ - wristDirL_ * wristDirL_.dot(wristFlatL_);
+    wristFlatL_ = wristFlatL_.len() > 1e-5f ? wristFlatL_.normalized()
+                                            : AnyPerp(wristDirL_);
+  }
+
   // THE ELBOW TRAILS THE HAND — and it is the HAND'S OWN travel that says so,
   // not the point's. The pole names the plane the two-bone solver bends in, and
   // a plane is only defined relative to the chain it bends: the solver
@@ -1213,8 +1292,14 @@ void MeleeState::RebuildFrame(float dt, const Vec3& right, const Vec3& up,
   // frame's, and a pair that could be set to disagree with it would only ever
   // be set wrong. Attack is half that halflife, release four times it.
   {
+    // ONLY SLASH FORCES FULL ALIGNMENT. Wind and Recover used to as well,
+    // and that was the overhead-strike wrist wrench: raising the sword IS
+    // Wind, so the raise itself laid the blade onto the radius. Everywhere
+    // outside a committed cut the wrist earns alignment from tip speed alone
+    // and otherwise rides the grip — blade up out of the fist, which is the
+    // "generally point upwards" a held sword should do.
     float want = 1.0f;
-    if (phase_ == SwingPhase::Idle || phase_ == SwingPhase::Guard) {
+    if (phase_ != SwingPhase::Slash) {
       const float floorF = std::clamp(tuning.steerFloor, 0.0f, 1.0f);
       const float lo = std::max(tuning.steerSpeedLo, 0.0f);
       const float hi = std::max(tuning.steerSpeedHi, lo + 1e-3f);
@@ -1222,8 +1307,10 @@ void MeleeState::RebuildFrame(float dt, const Vec3& right, const Vec3& up,
       const float k = std::clamp((v - lo) / (hi - lo), 0.0f, 1.0f);
       want = floorF + (1.0f - floorF) * k;
     }
+    // The envelope rides the WRIST's halflife now, not the blade frame's:
+    // this is wrist feel, and it has its own knob (melee.h wristSmoothing).
     const float ease = SmoothAlpha(
-        tuning.bladeSmoothing * (want > steerLive_ ? 0.5f : 4.0f), dt);
+        tuning.wristSmoothing * (want > steerLive_ ? 0.5f : 4.0f), dt);
     steerLive_ = framePrimed_ ? steerLive_ + (want - steerLive_) * ease : want;
   }
 
@@ -1231,6 +1318,8 @@ void MeleeState::RebuildFrame(float dt, const Vec3& right, const Vec3& up,
   hand_ = ToWorld(handL, right, up, fwd);
   bladeDir_ = ToWorld(bladeDirL_, right, up, fwd);
   bladeFlat_ = ToWorld(bladeFlatL_, right, up, fwd);
+  wristDir_ = ToWorld(wristDirL_, right, up, fwd);
+  wristFlat_ = ToWorld(wristFlatL_, right, up, fwd);
   bendPole_ = ToWorld(poleL_, right, up, fwd);
   framePrimed_ = true;
 }
@@ -1326,6 +1415,12 @@ void MeleeState::Update(float dt, bool held, bool armed, const Vec3& right,
         az_ = std::clamp(az_, azLo, azHi);
         el_ = std::clamp(el_, tuning.elMin, tuning.elMax);
         radius_ = std::clamp(radius_, rLo, rHi);
+        // The eased stroke starts exactly where the raw one does, or the
+        // first rebuilt tick would ease from wherever the LAST wield left
+        // off — a visible drag from a stale pose.
+        azLive_ = az_;
+        elLive_ = el_;
+        radLive_ = radius_;
         swingAz_ = swingEl_ = swingOut_ = 0;
 
         // SEED THE DERIVED FRAME FROM THE BLADE ITSELF, and skip this tick's
@@ -1366,6 +1461,11 @@ void MeleeState::Update(float dt, bool held, bool armed, const Vec3& right,
           }
         }
         poleL_ = Vec3{0, 0, -1};
+        // The wrist's eased frame seeds to the blade's real one for the same
+        // reason everything else here does: the first driven tick must ask
+        // for the pose the arm is already in.
+        wristDirL_ = bladeDirL_;
+        wristFlatL_ = bladeFlatL_;
         tangent_ = Vec3{};
         tipVel_ = Vec3{};
         tipPrev_ = tipL;
@@ -1376,6 +1476,8 @@ void MeleeState::Update(float dt, bool held, bool armed, const Vec3& right,
         hand_ = ToWorld(handL, right, up, fwd);
         bladeDir_ = ToWorld(bladeDirL_, right, up, fwd);
         bladeFlat_ = ToWorld(bladeFlatL_, right, up, fwd);
+        wristDir_ = bladeDir_;
+        wristFlat_ = bladeFlat_;
         bendPole_ = ToWorld(poleL_, right, up, fwd);
         seededThisTick = true;
 
@@ -1520,6 +1622,8 @@ void MeleeState::Update(float dt, bool held, bool armed, const Vec3& right,
 
   if (bladeDir_.len() < 1e-4f) bladeDir_ = up;
   if (bladeFlat_.len() < 1e-4f) bladeFlat_ = fwd;
+  if (wristDir_.len() < 1e-4f) wristDir_ = bladeDir_;
+  if (wristFlat_.len() < 1e-4f) wristFlat_ = bladeFlat_;
   if (bendPole_.len() < 1e-4f) bendPole_ = fwd * -1.0f;
 }
 

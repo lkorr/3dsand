@@ -956,11 +956,29 @@ struct Tuning {
     // motionless guard was still wrenched round to lay the blade along the
     // shoulder-to-point radius, which is "the sword points vertically down".
     //
-    // Tip speed in m/s, converted to world voxels/sec by ApplyMeleeTuning like
-    // the damage ramp beside it. Committed phases bypass the ramp entirely.
-    float steerSpeedLoMps = 0.25f;   // below: the grip pose
-    float steerSpeedHiMps = 1.10f;   // above: full alignment to the stroke
+    // Tip speed in m/s, converted to world voxels/sec by ApplyMeleeTuning
+    // like the damage ramp beside it. ONLY the committed Slash bypasses the
+    // ramp (2026-09-01; Wind and Recover used to as well, which made raising
+    // the sword for an overhead wrench the wrist onto the radius — the band
+    // is wider for the same reason, so a deliberate 1-2 m/s raise mostly
+    // keeps the grip pose and the blade stays generally UP).
+    float steerSpeedLoMps = 0.6f;    // below: the grip pose
+    float steerSpeedHiMps = 3.0f;    // above: full alignment to the stroke
     float steerFloor = 0.15f;        // applied at and below the low speed
+    // ---- PER-JOINT SMOOTHING (seconds of halflife) -------------------------
+    // Two knobs because the joints tolerate lag differently: the ARM lagging
+    // the mouse reads as weight, the WRIST lagging a cut misaligns the edge.
+    // `armSmoothing` eases the integrated stroke before the tip is built
+    // (0 = off, bit for bit the old behaviour); `wristSmoothing` owns the
+    // wrist's commitment envelope AND its chase of the commanded blade
+    // orientation (3x faster through a Slash). See game/melee.h.
+    float armSmoothing = 0.04f;
+    float wristSmoothing = 0.10f;
+    // How far BEHIND the shoulder's frontal plane the hand may sit, as a
+    // fraction of arm reach. The azimuth window bounds the commanded POINT;
+    // the hand is that point minus a whole blade, and unbounded it sat
+    // voxels behind the plane at the stops — "the arm goes behind him".
+    float handBackFrac = 0.05f;
     // ---- WHAT THE ARM MAY DO WHILE IT SERVES THE BLADE ---------------------
     // Radians. `elbowPoleCone` bounds the bend PLANE the driver asks for, off
     // straight-back in its own basis; `elbowAxisCone` caps how far the rig's

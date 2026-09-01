@@ -1901,6 +1901,21 @@ bool AiLineOfSight(void* ctx, Vec3 from, Vec3 to) {
 // — under `MeleeTuning::commitSpeed`, so the driver stays in Guard — which is
 // what makes it a visible blade raise the player can read and step away from.
 // The cut is the only part that damages anything.
+// THE SMOOTHING KNOBS ARE MOUSE FILTERS, AND AN NPC HAS NO MOUSE (2026-09-01).
+// `melee.armSmoothing`/`wristSmoothing` exist to soften a human hand's jitter;
+// an NPC stroke is driven by authored style curves that are already smooth, so
+// inheriting them only subtracts from the stroke — measured on `npc-styles`,
+// the thrust's posed radial drive fell to 2.76 vox of a commanded 5.19 inside
+// its six cut ticks, the lag eating half the lunge before the phase ended.
+// Every other `melee.*` slider still reaches the NPC exactly as authored.
+static void NpcStrokeSmoothing(MeleeTuning& t) {
+  t.armSmoothing = 0.0f;
+  // wristSmoothing is KEPT: it shapes the posed blade's orientation chase,
+  // and npc-block's parry geometry (blockGap sized by 1%) was measured with
+  // it live — zeroing it moved the attacker's closing path from a meeting
+  // to a 4.59 vox miss. Only the stroke-position lag is the mouse filter.
+}
+
 void MobSystem::BeginStroke(Mob& mob, const ai::AttackRequest& req,
                             uint32_t tick) {
   NpcStroke& st = mob.stroke_;
@@ -1954,6 +1969,7 @@ void MobSystem::BeginStroke(Mob& mob, const ai::AttackRequest& req,
   // right answer anyway: retuning mid-swing is not a thing a swing should
   // notice.
   ApplyMeleeTuning(st.melee.tuning);
+  NpcStrokeSmoothing(st.melee.tuning);
 }
 
 bool MobSystem::ForceAttack(uint64_t mobId, const std::string& style,
@@ -1979,6 +1995,7 @@ bool MobSystem::ForceAttack(uint64_t mobId, const std::string& style,
   st.melee.Reset();
   st.melee.SetHandSign(m->HandSign());
   ApplyMeleeTuning(st.melee.tuning);   // BeginStroke says why
+  NpcStrokeSmoothing(st.melee.tuning);
   return true;
 }
 
@@ -1995,6 +2012,7 @@ bool MobSystem::SetGuard(uint64_t mobId, float az, float el, float reachFrac) {
     st.melee.Reset();
     st.melee.SetHandSign(m->HandSign());
     ApplyMeleeTuning(st.melee.tuning);   // BeginStroke says why
+    NpcStrokeSmoothing(st.melee.tuning);
     st.phase = NpcStroke::Phase::Guard;
   }
   st.wantAz = az;
@@ -2038,17 +2056,26 @@ static float ReachIn(const MeleeState& m, float offset) {
 }
 
 // The mob's own frame, which is the BASIS the stroke is expressed in (melee.h
-// Update: "the camera for a player, the body's own facing for an NPC"). Right
-// is up x fwd, so at heading 0 — facing +Z — right is +X and every printed
-// number reads the way the camera's would.
+// Update: "the camera for a player, the body's own facing for an NPC").
+//
+// RIGHT IS fwd x up — THE CAMERA'S CHIRALITY, NOT up x fwd (2026-09-01). The
+// player's basis is Camera::Right() = Forward x up, and the raymarcher maps
+// exactly that vector to screen-right; the rigs author their .R limbs on the
+// model side that same chirality calls "right". Since the world->rig
+// conversion is now a pure un-yaw (the toRig note above), the DRIVER'S basis
+// is the only place handedness enters — so every caller must hand the SAME
+// chirality, or handSign's asymmetric azimuth windows (azOut on the weapon
+// side) land on the wrong side of the body for that caller. This function
+// briefly used up x fwd, which is the mirror: an NPC's generous weapon-side
+// window sat across its chest.
 static void MobBasis(const Mob& mob, Vec3& right, Vec3& up, Vec3& fwd) {
   up = Vec3{0, 1, 0};
   fwd = mob.Facing();
   if (fwd.len() < 1e-4f) fwd = Vec3{0, 0, 1};
   fwd = Vec3{fwd.x, 0, fwd.z};
   fwd = fwd.len() > 1e-4f ? fwd.normalized() : Vec3{0, 0, 1};
-  right = up.cross(fwd);
-  right = right.len() > 1e-4f ? right.normalized() : Vec3{1, 0, 0};
+  right = fwd.cross(up);
+  right = right.len() > 1e-4f ? right.normalized() : Vec3{-1, 0, 0};
 }
 
 void MobSystem::StepStroke(Mob& mob, uint32_t tick, World& world,
@@ -7881,36 +7908,32 @@ void Mob::ApplyWeaponArm(const AnimSkeleton& sk, AnimState& st,
   if (weight <= 0.0f) return;
 
   const Quat yaw = AxisAngle({0, 1, 0}, heading_);
-  // WORLD/CAMERA -> RIG. The offset arrives in the basis the driver was handed
-  // (main.cpp builds it from the camera), so it is un-yawed into the rig's
-  // frame — the same conversion the legs do.
+  // WORLD/CAMERA -> RIG is a PURE UN-YAW, exactly the conversion the legs and
+  // the ledge-hang arms use. The submit path (SyncLimbs and the flatten) maps
+  // model -> world with the plain yaw and nothing else, so the plain inverse
+  // is the only map that makes the rig reproduce a world-space command.
   //
-  // THEN X IS NEGATED, and that is not a fudge — but the reason is the ART, not
-  // the loader. (An earlier note here blamed the .vox -> engine map (x, z, -y)
-  // for "flipping handedness". It does not: that matrix has determinant +1 and
-  // voxload.cpp says so at the conversion — chirality is preserved. Believing
-  // otherwise invites "fixing" the legs by adding a matching negation, which
-  // would be wrong.)
+  // THERE USED TO BE AN X NEGATION HERE (2026-08 combat overhaul through
+  // 2026-09-01), justified by a note claiming "these rigs are authored
+  // mirrored" and a measurement that camera-right un-yaws to model +X. Worked
+  // through on paper at heading 0 (camera behind, both facing +Z): camera
+  // Right() is Forward x up = world -X, which un-yaws to model -X, not +X —
+  // and model -X is where every def authors its .R limbs (asha armU.R x=4 vs
+  // armU.L x=28) and what the raymarcher draws on SCREEN RIGHT (ray dir uses
+  // camRight for +ndc.x). So the un-yaw alone already lands camera-right on
+  // the right hand's own side, and the negation was a net MIRROR: mouse-right
+  // drove the rendered arm screen-LEFT, and the generous weapon-side azimuth
+  // stop (azOut) was spent on the across-the-body side. Reported as exactly
+  // that, twice ("moving my mouse right moves the arm left").
   //
-  // The real cause is that these rigs are AUTHORED mirrored: every def puts .L
-  // at the HIGHER engine x and .R at the lower (asha: armU.L x=28 vs armU.R
-  // x=4), so model +X is the character's LEFT. Un-yawing alone therefore lands
-  // camera-RIGHT on the model's LEFT: measured at six yaws, RotateInv(yaw,
-  // camera Right) is model +X every time. Without this flip the mouse drives
-  // the weapon arm to the mirrored side — you could reach across your chest but
-  // not out to the side you were actually pointing at. Z (forward) is
-  // unaffected: the toe of the shoe sits at model +Z, which is where
-  // camera-forward lands.
-  //
-  // IT IS A REFLECTION, so a FRAME cannot be mapped axis by axis: three mapped
-  // basis vectors come out left-handed and the rotation built from them would
-  // be a mirror, not a rotation. Directions are mapped; the third axis of every
-  // frame below is rebuilt with a cross product ON THE RIG SIDE.
-  auto toRig = [&](Vec3 v) {
-    Vec3 r = RotateInv(yaw, v);
-    r.x = -r.x;
-    return r;
-  };
+  // WHY NO GATE EVER SAW IT: WeaponArmPose and RecordWeaponClamp applied the
+  // matching inverse flip, so every round-trip probe — arm-readback included
+  // — was self-consistent whichever sign this line had. A circular probe
+  // asserts nothing (the memory file says so in general); the one independent
+  // witness was the screen. The ledge-hang solve two stages up was the tell
+  // in code: it un-yaws WORLD palm targets with no negation and the palms
+  // land on the lip.
+  auto toRig = [&](Vec3 v) { return RotateInv(yaw, v); };
 
   // THE LIVE SHOULDER, not the rest anchor. `anchorLocal` is where the joint
   // sits in the BIND pose, and the two are not the same point once anything
@@ -8203,9 +8226,8 @@ void Mob::RecordWeaponClamp(const AnimSkeleton& sk, const AnimState& st) const {
   // that disagrees with the one the solve reached has to be able to tell WHICH
   // of the two is lying, and only a probe on this side of the pass can say.
   if (weaponUpPart_ >= 0) {
-    Vec3 handRig =
+    const Vec3 handRig =
         st.model[weaponHandPart_].pos - st.model[weaponUpPart_].pos;
-    handRig.x = -handRig.x;
     const Vec3 got = QuatRotate(QuatAxisAngle({0, 1, 0}, heading_), handRig);
     weaponDiag_.cmdHand = weapon_.hand;
     weaponDiag_.gotHand = got;
@@ -8227,9 +8249,11 @@ float Mob::HandSign() const {
   // name means a left-handed def, or a rig whose right-hand socket is called
   // something else, needs no second spelling of the same fact.
   //
-  // These rigs are authored MIRRORED (see the long note in ApplyWeaponArm):
-  // ".L" is the character's left in the NAME whatever the model x says, and the
-  // name is what the stroke's asymmetric azimuth limits want.
+  // ".L" is the character's left in the NAME, and the name is what the
+  // stroke's asymmetric azimuth limits want. (The names are honest: .R limbs
+  // sit at low model x, which the plain-yaw submit path puts on the side the
+  // camera renders screen-right when viewed from behind. See ApplyWeaponArm's
+  // toRig note for the mirror that used to confuse this.)
   if (heldPartIndex_ < 0 || heldPartIndex_ >= (int)skel_.parts.size())
     return 1.0f;
   const int hand = skel_.parts[heldPartIndex_].parent;
@@ -8272,8 +8296,8 @@ bool Mob::WeaponArmPose(Vec3& outHandFromShoulder, float& outReach) const {
   // WHERE THE WEAPON ARM IS, in the frame SetWeaponPose SPEAKS — that is the
   // only thing that makes this useful. The driver (melee.h) hands in a
   // shoulder-relative offset in camera/world space and the animation pass turns
-  // it into an IK target by un-yawing it and negating x (the rigs are authored
-  // mirrored; see the long note at the weapon-arm solve in avatar.cpp). This
+  // it into an IK target by un-yawing it (a pure un-yaw; see the note at
+  // ApplyWeaponArm's toRig for the x negation that used to ride along). This
   // runs that conversion BACKWARDS, so a caller can read the hand, hand the
   // same value straight back through SetWeaponPose, and get the pose it already
   // had. Taking control of an arm without moving it is exactly that round trip.
@@ -8294,8 +8318,10 @@ bool Mob::WeaponArmPose(Vec3& outHandFromShoulder, float& outReach) const {
     // exactly rather than approximately. It was the rest anchor until a
     // leaning spine put the two a couple of voxels apart; see the long note at
     // ApplyWeaponArm for what that cost.
-    Vec3 handRig = anim_.model[handPart].pos - anim_.model[i0].pos;
-    handRig.x = -handRig.x;                       // the mirrored-authoring flip
+    // The plain yaw, matching ApplyWeaponArm's plain un-yaw. (An x negation
+    // rode along here while toRig carried one — the pair was self-consistent
+    // and jointly wrong; see the note at toRig.)
+    const Vec3 handRig = anim_.model[handPart].pos - anim_.model[i0].pos;
     outHandFromShoulder = Rotate(AxisAngle({0, 1, 0}, heading_), handRig);
     // Reach from the LIVE bone lengths rather than a constant: it follows the
     // rig, and it follows kVoxelMeters, and it is the same L1+L2 the solver
@@ -8344,14 +8370,12 @@ bool Mob::WeaponStrokePose(Vec3& outHandFromShoulder, Vec3& outTipFromShoulder,
   // HAND and then added to the hand offset the inverse already produced. Doing
   // it that way rather than re-running the shoulder subtraction means the two
   // ends cannot disagree about which shoulder anchor they used.
-  Vec3 rel = tipModel - handModel;
-  rel.x = -rel.x;                       // the mirrored-authoring flip
+  const Vec3 rel = tipModel - handModel;
   const Quat yaw = AxisAngle({0, 1, 0}, heading_);
   outTipFromShoulder = outHandFromShoulder + Rotate(yaw, rel);
 
   if (ld.hasEdgeFlat) {
-    Vec3 fl = QuatRotate(iq, ld.edgeFlat);
-    fl.x = -fl.x;
+    const Vec3 fl = QuatRotate(iq, ld.edgeFlat);
     outFlat = Rotate(yaw, fl);
   }
   return true;
