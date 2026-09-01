@@ -47,20 +47,28 @@ enum class PerfSide : uint8_t { Cpu, Gpu, Both };
 // ORDER IS THE DISPLAY ORDER inside a frame — keep it in tick order, because
 // the stacked frame-timeline chart draws the bands in this sequence and a
 // scrambled order makes a readable chart into a plate of spaghetti.
+// A SCOPE MUST BE MEASURED, NEVER DERIVED. `Input` used to be the frame's
+// residual (wallMs minus everything else), which meant every unmeasured span in
+// the engine reported as input polling — see the header comment in
+// measure/perfscope.h. If a span is not on the clock it belongs in `Other`,
+// which is the ONE row here that is allowed to be a subtraction and is named so
+// that reading it as a system is impossible.
 enum class PerfScope : uint8_t {
   Input,        // input sampling, camera, UI intent
   Stream,       // toroidal window shift, chunk fetch/evict, page fills
   GameLogic,    // brush/spell/melee/item drivers that emit ops for this tick
   WaterBody,    // WaterBodySystem::Tick (CPU half of the lake registry)
   Upload,       // op-stream assembly + WriteBuffer of the MutationQueue
+  PageTableCpu, // the CPU half of the page table: the dirty mirror, materialize
   Encode,       // Simulation::EncodeTick — walking the pass table
-  Submit,       // queue submit + present-queue bookkeeping
+  Submit,       // command-buffer Finish + queue submit
   Physics,      // Jolt step
   PostStep,     // debris/mob/avatar post-step, player push-out
   Readback,     // snapshot map callbacks, mirror rebuild
   Audio,        // cue dispatch + spatializer feed
   RenderCpu,    // render-pass encode: draw calls, instance buffers, overlay
   Present,      // AcquireFrame + Present (this is where vsync waits land)
+  Other,        // THE RESIDUAL: frame time no scope above claimed. Not a system.
   Count
 };
 constexpr int kPerfScopeCount = (int)PerfScope::Count;
@@ -159,8 +167,10 @@ inline constexpr PerfNodeDef kPerfNodes[] = {
     {"worldgen", "Worldgen", "worldStorage", PerfSide::Gpu, PerfScope::Count,
      "worldgen;worldgenList", "Per-cell pure function. Cost is per chunk "
      "generated, and only on the frames that generate one."},
-    {"pageTable", "Page Table", "worldStorage", PerfSide::Gpu, PerfScope::Count,
-     "pageFill", "Page fills issued when a sentinel chunk materializes. Page "
+    {"pageTable", "Page Table", "worldStorage", PerfSide::Both,
+     PerfScope::PageTableCpu,
+     "pageFill", "CPU is the dirty-mirror recurrence + materialize, which runs "
+     "EVERY tick over the window; GPU is the fills a sentinel chunk needs. Page "
      "FAULTS are a bug, not a cost — the page shows them as a red counter."},
     {"farField", "Far-Field Cascades", "worldStorage", PerfSide::Gpu,
      PerfScope::Count, "farDown;farFill",
@@ -186,8 +196,8 @@ inline constexpr PerfNodeDef kPerfNodes[] = {
      "", "Brush, spells, melee, held items, camera — everything that turns "
      "input into ops for the next tick."},
     {"player", "Player + Input", "gameSystems", PerfSide::Cpu, PerfScope::Input,
-     "", "Movement integration and the voxel collision sweep against the CPU "
-     "mirror."},
+     "", "Key/mouse sampling, camera update, movement integration and the voxel "
+     "collision sweep against the CPU mirror. Per FRAME, not per tick."},
     {"postStep", "Post-step", "gameSystems", PerfSide::Cpu, PerfScope::PostStep,
      "", "Mob steering, animation, avatar pose and player push-out, after Jolt "
      "has moved everything."},
@@ -202,8 +212,16 @@ inline constexpr PerfNodeDef kPerfNodes[] = {
 
     // ---- backend ----
     {"gpuBackend", "GPU / RHI", nullptr, PerfSide::Cpu, PerfScope::Submit, "",
-     "Command-buffer submit and the generated barriers. Large here means the "
-     "CPU is bottlenecked recording, not the GPU running."},
+     "CommandEncoder::Finish plus vkQueueSubmit only — the pass-table walk that "
+     "produced the buffer is `encode`. Large here is the driver, not us."},
+
+    // NOTE: PerfScope::Other has NO ROW HERE, deliberately. It is the residual
+    // — frame time no scope claimed — and it is not a system, so it is not a
+    // box on the Engine map. `PerfNodeIndexForScope` returns -1 for it, the
+    // JSON carries `"node": null`, and the page falls back to the scope key.
+    // Giving it an ARCH_NODES entry would put an orphan "Unattributed" box on
+    // the architecture diagram, which is exactly the category error the row
+    // exists to prevent.
 };
 constexpr int kPerfNodeCount = (int)(sizeof(kPerfNodes) / sizeof(kPerfNodes[0]));
 
@@ -231,6 +249,7 @@ enum class PerfCounter : uint8_t {
   DrawCalls,         // draw calls in the render pass
   VoxelsNonAir,      // non-air voxels in the residency window
   WaterBodies,       // registered lakes
+  SnapshotStalls,    // paged staleness fallbacks: a BLOCKING WaitIdle per count
   Count
 };
 constexpr int kPerfCounterCount = (int)PerfCounter::Count;
@@ -257,6 +276,11 @@ inline constexpr PerfCounterDef kPerfCounters[] = {
     {"drawCalls", "draw calls", "renderPass", false},
     {"voxelsNonAir", "non-air voxels", "worldStorage", false},
     {"waterBodies", "water bodies", "waterBodies", false},
+    // A BUG counter, like page faults, and for the same reason: CLAUDE.md says
+    // never add a synchronous readback to the frame path, and each of these is
+    // a full-device WaitIdle that got there anyway. It is the denominator that
+    // turns "readback 12 ms" into "readback 12 ms over 2 stalls".
+    {"snapshotStalls", "SNAPSHOT STALLS", "readback", true},
 };
 static_assert((int)(sizeof(kPerfCounters) / sizeof(kPerfCounters[0])) ==
                   kPerfCounterCount,
@@ -299,8 +323,8 @@ inline double PerfGpuTotal(const PerfSample& s) {
 // Scope key strings, for the wire format and the JSON. Indexed by PerfScope.
 inline constexpr const char* kPerfScopeKeys[] = {
     "input", "stream", "gameLogic", "waterBody", "upload",
-    "encode", "submit", "physics", "postStep", "readback",
-    "audio", "renderCpu", "present",
+    "pageTableCpu", "encode", "submit", "physics", "postStep",
+    "readback", "audio", "renderCpu", "present", "other",
 };
 static_assert((int)(sizeof(kPerfScopeKeys) / sizeof(kPerfScopeKeys[0])) ==
                   kPerfScopeCount,

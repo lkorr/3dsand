@@ -63,6 +63,7 @@
 #include "measure/measure.h"
 #include "measure/perfsuite.h"
 #include "measure/perfnodes.h"
+#include "measure/perfscope.h"
 #include "gpu/passtimer.h"
 #include "test/support.h"
 #include "ui/overlay.h"
@@ -165,6 +166,20 @@ std::vector<double> g_frameMsLow, g_frameMsHigh;
 // genChunk just generated with matter), so it needs its own reading.
 std::vector<double> g_activeChunks;
 double g_harnessRenderMs = 0.0;
+// --frames: the SAME CPU scope attribution the Performance tab shows, summed
+// over the run, plus the per-frame series for each scope so a spike can be
+// reported as a max and not just as a mean.
+//
+// It lives here because the tab needs a telemetry client attached and the
+// windowed harness has none — which meant the one path that reproduces the
+// user-visible spikes (fly around, watch a bar jump to 30 ms) was the one path
+// with no way to record them. `--frames 600 --autofly-hard` now prints the
+// whole table, so "which scope spiked" is a single non-interactive run.
+double g_frameScopeSum[sandvox::kPerfScopeCount] = {};
+double g_frameScopeMax[sandvox::kPerfScopeCount] = {};
+std::vector<double> g_frameScopeSeries[sandvox::kPerfScopeCount];
+uint64_t g_frameSnapStalls = 0;      // total paged-staleness WaitIdle stalls
+uint64_t g_frameSnapStallFrames = 0; // frames that paid at least one
 
 // ---- --autofly-park: the active-chunk DECAY probe ---------------------------
 //
@@ -3342,6 +3357,23 @@ int main(int argc, char** argv) {
     double now = NowSeconds();
     float dt = (float)(now - lastTime);
     lastTime = now;
+    // Scope timing is a branch on a bool unless someone is watching, and the
+    // flag is re-read every frame because a client can attach mid-session.
+    // `--frames` also opts in: it is the only non-interactive way to reproduce
+    // the spikes the Performance tab shows, so it must record the same table.
+    sandvox::PerfScopesEnable(telemetry.HasClient() || g_harnessFrames > 0);
+    // ---- INPUT: everything from here to the fixed-tick loop ---------------
+    // Key and mouse edge detection, the camera, the character screen and
+    // hotbar, tool selection, and player.Update — movement integration plus the
+    // voxel collision sweep against the CPU mirror. Per FRAME, not per tick.
+    //
+    // This span is the reason the row exists. `input` used to be
+    // `wallMs - sum(everything else)`, so it was not a measurement of anything:
+    // it was the frame's UNATTRIBUTED remainder wearing the name of the one
+    // system that is genuinely cheap. Flying spiked it to 30 ms because the
+    // toroidal window shift is 900 lines further down and had no timer on it.
+    // The residual still exists — it is `other` now, and it says so.
+    sandvox::PerfSpan spanInput(sandvox::PerfScope::Input);
     // Presented rate = frames / wall-clock over a window. An EMA of the
     // instantaneous 1/dt over-weights the fast frames whenever the CPU races
     // ahead of a GPU-bound present queue (several ~5 ms loops, one long
@@ -4232,6 +4264,7 @@ int main(int argc, char** argv) {
         if (captured && eGlyph[i].Pressed(key(k))) hotbar.Select(i);
       }
     }
+    spanInput.Close();
     while (accumulator >= kTickDt && ticksThisFrame < 4) {
       accumulator -= kTickDt;
       if (ui.paused && !ui.stepOnce) break;
@@ -4263,17 +4296,38 @@ int main(int argc, char** argv) {
       // moves on. It is called before the tick that will CONSUME the snapshot,
       // so a fence that signalled during the previous tick's GPU work is
       // observed on the very next tick instead of a frame later.
-      ctx.ProcessEvents();
+      {
+        // The map-callback pump. Billed to `readback` because that is what it
+        // pumps — the snapshot fences and the 3x3x3 CPU mirror rebuild — and
+        // because it runs PER TICK here, so a 4-tick catch-up frame pays for
+        // four of them. It is non-blocking by construction; if this row is ever
+        // large, the mirror copy is the reason, not a stall.
+        sandvox::PerfSpan spanRb(sandvox::PerfScope::Readback);
+        ctx.ProcessEvents();
+      }
       if (g_autoflyPark) ParkProbe(world, mats, tick);
 
       // recenter the residency window on the player (between ticks only; at
       // most one 1-chunk shift per axis)
       IVec3 playerChunkNow{ifloor(player.pos.x) >> 4, ifloor(player.pos.y) >> 4,
                            ifloor(player.pos.z) >> 4};
-      stream.Update(playerChunkNow, tick);
-      // far-field cascades track the player the same way (render-only)
-      far.Update(playerChunkNow);
-      uint32_t farCount = far.PrepareTick(ctx.queue);
+      uint32_t farCount = 0;
+      {
+        // ---- STREAM: the row that flying lights up --------------------
+        // The toroidal window shift, chunk fetch/evict and the far-field
+        // cascade recentre. THIS is the cost the Performance tab was reporting
+        // as "input" — it had no timer, so it fell into the residual, and the
+        // residual was billed to the input row.
+        sandvox::PerfSpan spanStream(sandvox::PerfScope::Stream);
+        stream.Update(playerChunkNow, tick);
+        // far-field cascades track the player the same way (render-only)
+        far.Update(playerChunkNow);
+        farCount = far.PrepareTick(ctx.queue);
+      }
+      // ---- GAME LOGIC: the rest of the tick body up to the submit ---------
+      // Brush, laser, melee, spells, mob/avatar/debris PreTick, explosions.
+      // Closed at `t0` below, where the submit sequence starts.
+      sandvox::PerfSpan spanGame(sandvox::PerfScope::GameLogic);
 
       std::vector<BrushOp> ops;
       brush.radius = ui.brushRadius;
@@ -5170,6 +5224,7 @@ int main(int argc, char** argv) {
       IVec3 pc{ifloor(player.pos.x) / (int)kChunk, ifloor(player.pos.y) / (int)kChunk,
                ifloor(player.pos.z) / (int)kChunk};
       double t0 = NowSeconds();
+      spanGame.Close();
       // ---- the celestial clock (sim/world.h) -----------------------------
       // Advanced exactly ONCE per sim tick, here, immediately before the
       // submit that reads it. The dev overlay's time-speed slider scales it,
@@ -5237,12 +5292,21 @@ int main(int argc, char** argv) {
       // A frame may run 0..4 ticks, and a chart whose x axis is FRAMES has to
       // show what the frame cost — sending per tick made a 4-tick frame look
       // like four cheap frames and a 0-tick frame look like a gap.
-      if (telemetry.HasClient()) {
+      {
         using sandvox::PerfScope;
-        liveSample.cpuMs[(int)PerfScope::Stream] += (tSubmit0 - t0) * 1000.0;
-        liveSample.cpuMs[(int)PerfScope::Submit] += (tSubmit1 - tSubmit0) * 1000.0;
-        liveSample.cpuMs[(int)PerfScope::Physics] += (tPhys1 - tSubmit1) * 1000.0;
-        liveSample.cpuMs[(int)PerfScope::PostStep] += (tEnd - tPhys1) * 1000.0;
+        // t0..tSubmit0 is the celestial clock, the authored edit-layer drain
+        // and MovePlayerBody — game logic, not streaming. It was billed to
+        // `stream` and it is one of the reasons that row never matched what the
+        // window shift actually cost.
+        //
+        // tSubmit0..tSubmit1 is NOT billed here any more: SubmitTick bills
+        // ITSELF, in five spans (upload / waterBody / pageTableCpu / encode /
+        // submit), because "submit spiked to 30 ms" was never a diagnosis. The
+        // spans go into the process-global accumulator and are drained into
+        // this sample at the bottom of the frame.
+        sandvox::PerfScopeAdd(PerfScope::GameLogic, t0, tSubmit0);
+        sandvox::PerfScopeAdd(PerfScope::Physics, tSubmit1, tPhys1);
+        sandvox::PerfScopeAdd(PerfScope::PostStep, tPhys1, tEnd);
         liveSample.tick = tick;
       }
       if (liveTimed) liveTimer.KickDeferred(ctx, liveFrameNo);
@@ -5384,6 +5448,7 @@ int main(int argc, char** argv) {
       // Footfalls are drained here rather than inside the tick loop because
       // that loop runs up to 4 times per frame; firing from inside it would
       // put several steps at the same instant.
+      sandvox::PerfSpan spanAudio(sandvox::PerfScope::Audio);
       if (audioCues.Enabled()) {
         for (const PlayerAvatar::Footfall& ff : avatar.Footfalls()) {
           if (ff.landing)
@@ -5505,6 +5570,7 @@ int main(int argc, char** argv) {
       debris.ClearImpactEvents();
       mobs.ClearSeverEvents();
       mobs.ClearVoiceEvents();
+      spanAudio.Close();
       // Adaptive fog: pin the fade to whatever cascade radius is actually
       // filled, so a backlogged refill (spawn, load, teleport, sprinting past
       // a level's hysteresis) fogs out the pending bands instead of showing
@@ -6294,25 +6360,66 @@ int main(int argc, char** argv) {
 
       ctx.Present();
       if (liveRenderTimed) liveRenderTimer.KickDeferred(ctx, liveFrameNo);
-      if (telemetry.HasClient()) {
+      {
         using sandvox::PerfScope;
+        // Through the same accumulator as every other scope, rather than
+        // straight into liveSample: `--frames` collects the identical table
+        // with no telemetry client attached, and two write paths into one
+        // sample is how the two stopped agreeing in the first place.
+        //
         // Encode only — the acquire wait above is not in this span.
-        liveSample.cpuMs[(int)PerfScope::RenderCpu] +=
-            (tPresent0 - tRender0) * 1000.0;
+        sandvox::PerfScopeAdd(PerfScope::RenderCpu, tRender0, tPresent0);
         // The swapchain wait (AcquireFrame) plus the present itself. Under FIFO
         // this is the whole vsync/GPU-completion stall and is normally the
         // largest CPU row on the page; that is the frame finishing early, not
         // the CPU being busy.
-        liveSample.cpuMs[(int)PerfScope::Present] +=
-            ((tRender0 - tAcquire0) + (NowSeconds() - tPresent0)) * 1000.0;
+        sandvox::PerfScopeAdd(PerfScope::Present, tAcquire0, tRender0);
+        sandvox::PerfScopeAdd(PerfScope::Present, tPresent0, NowSeconds());
       }
     }
     // tAcquire0, not tRender0: this harness number has always been "acquire +
     // encode + present", and the scope split above must not silently redefine
     // it into encode-only.
     if (g_harnessFrames > 0) g_harnessRenderMs += (NowSeconds() - tAcquire0) * 1000.0;
-    ctx.ProcessEvents();  // pumps MapAsync callbacks (mirror updates)
+    {
+      sandvox::PerfSpan spanRb(sandvox::PerfScope::Readback);
+      ctx.ProcessEvents();  // pumps MapAsync callbacks (mirror updates)
+    }
     telemetry.Poll();
+
+    // ---- CLOSE THE FRAME'S CPU ACCOUNTING -------------------------------
+    //
+    // ONE drain, ONE residual, and both consumers read the same array. The
+    // Performance tab and the `--frames` harness used to be two write paths
+    // into two different pictures of the same frame; they are one now, which
+    // is the only reason a non-interactive run can answer "which bar spiked".
+    double frameScope[sandvox::kPerfScopeCount] = {};
+    uint32_t frameStalls = 0;
+    const double frameWallMs = (NowSeconds() - now) * 1000.0;
+    if (sandvox::PerfScopesOn()) {
+      // Zeroes as it copies, so a span straddling this point cannot be counted
+      // into two frames.
+      sandvox::PerfScopesDrain(frameScope);
+      double sum = 0;
+      for (int i = 0; i < sandvox::kPerfScopeCount; i++) sum += frameScope[i];
+      // THE RESIDUAL, and it is named as one now. Whatever wall clock no span
+      // claimed goes to `other`. This used to be added to `input`, which turned
+      // every unmeasured span in the engine into a report that the player was
+      // polling the keyboard too hard. A large or spiky `other` is a TODO —
+      // add a span where the time is going — not a system to go optimise.
+      frameScope[(int)sandvox::PerfScope::Other] +=
+          std::max(0.0, frameWallMs - sum);
+      frameStalls = TakeSnapshotStalls();
+    }
+    if (g_harnessFrames > 0 && frameCounter > 60) {
+      for (int i = 0; i < sandvox::kPerfScopeCount; i++) {
+        g_frameScopeSum[i] += frameScope[i];
+        if (frameScope[i] > g_frameScopeMax[i]) g_frameScopeMax[i] = frameScope[i];
+        g_frameScopeSeries[i].push_back(frameScope[i]);
+      }
+      g_frameSnapStalls += frameStalls;
+      if (frameStalls) g_frameSnapStallFrames++;
+    }
 
     // ---- LIVE TELEMETRY: close the frame and send it --------------------
     //
@@ -6324,9 +6431,10 @@ int main(int argc, char** argv) {
     if (telemetry.HasClient()) {
       using sandvox::PerfScope;
       liveSample.frame = liveFrameNo;
-      liveSample.wallMs = (NowSeconds() - now) * 1000.0;
-      liveSample.cpuMs[(int)PerfScope::Input] +=
-          std::max(0.0, liveSample.wallMs - sandvox::PerfCpuTotal(liveSample));
+      liveSample.wallMs = frameWallMs;
+      // The drain and the residual already happened above, for both consumers.
+      for (int i = 0; i < sandvox::kPerfScopeCount; i++)
+        liveSample.cpuMs[i] += frameScope[i];
       // Counters, from the snapshot the pump above may just have landed.
       const WorldSnapshot& lsn = world.Snap();
       auto ctr = [&](sandvox::PerfCounter c, double v) {
@@ -6341,6 +6449,9 @@ int main(int argc, char** argv) {
       }
       if (world.pages)
         ctr(sandvox::PerfCounter::PagesResident, world.pages->PagesInUse());
+      // Read-and-cleared above, so a frame that ran four ticks reports all four
+      // of their stalls and the next frame starts at zero.
+      ctr(sandvox::PerfCounter::SnapshotStalls, (double)frameStalls);
       livePending.push_back({liveFrameNo, liveSample});
 
       // Harvest whatever has landed and post it to the frame it belongs to.
@@ -6407,6 +6518,78 @@ int main(int argc, char** argv) {
                 pct(0.50), pct(0.95), pct(0.99),
                 g_frameMs.empty() ? 0.0 : g_frameMs.back(), over33,
                 100.0 * over33 / (double)g_frameMs.size(), over100);
+    // ---- THE CPU SCOPE TABLE, same attribution as the Performance tab ------
+    //
+    // A mean alone cannot describe the thing the user reported ("usually 0.2 ms,
+    // sometimes 30"), so every scope carries p99 and max beside it. That is the
+    // whole point: a scope whose mean is 0.1 and whose max is 30 is a STALL,
+    // and a scope whose mean is 3 and whose max is 4 is a COST. They need
+    // opposite fixes and the mean cannot tell them apart.
+    {
+      using sandvox::kPerfScopeCount;
+      using sandvox::kPerfScopeKeys;
+      const size_t n = g_frameScopeSeries[0].size();
+      if (n > 0) {
+        std::printf("--frames harness: CPU scope attribution over %zu frames "
+                    "(ms/frame)\n", n);
+        std::printf("    %-14s %8s %8s %8s %8s %7s\n",
+                    "scope", "mean", "p50", "p99", "max", "%busy");
+        // Rank by mean, because the reader wants "what costs the most" first
+        // and can then scan the max column for what SPIKES the most.
+        int order[kPerfScopeCount];
+        for (int i = 0; i < kPerfScopeCount; i++) order[i] = i;
+        std::sort(order, order + kPerfScopeCount, [&](int a, int b) {
+          return g_frameScopeSum[a] > g_frameScopeSum[b];
+        });
+        // `present` is the vsync wait, not work — excluded from the busy
+        // denominator for the same reason the page excludes it.
+        double busy = 0;
+        for (int i = 0; i < kPerfScopeCount; i++)
+          if (i != (int)sandvox::PerfScope::Present) busy += g_frameScopeSum[i];
+        for (int oi = 0; oi < kPerfScopeCount; oi++) {
+          const int i = order[oi];
+          if (g_frameScopeSum[i] <= 0.0) continue;
+          std::vector<double>& v = g_frameScopeSeries[i];
+          std::sort(v.begin(), v.end());
+          const bool wait = i == (int)sandvox::PerfScope::Present;
+          std::printf("    %-14s %8.3f %8.3f %8.3f %8.3f %7s\n",
+                      kPerfScopeKeys[i], g_frameScopeSum[i] / (double)n,
+                      v[(size_t)(0.50 * (v.size() - 1))],
+                      v[(size_t)(0.99 * (v.size() - 1))], g_frameScopeMax[i],
+                      wait ? "(wait)"
+                           : (busy > 0 ? [&] {
+                               static char b[16];
+                               std::snprintf(b, sizeof b, "%.1f%%",
+                                             100.0 * g_frameScopeSum[i] / busy);
+                               return b;
+                             }()
+                                       : "-"));
+        }
+        // The bug counter, printed whether or not it fired — "0 stalls" is a
+        // result and a missing line is not.
+        std::printf("    snapshot stalls (blocking WaitIdle on the frame path):"
+                    " %llu over %llu frames (%.1f%% of frames)\n",
+                    (unsigned long long)g_frameSnapStalls,
+                    (unsigned long long)n,
+                    100.0 * (double)g_frameSnapStallFrames / (double)n);
+        // ---- and one level down into `stream`, which is where it all is ----
+        // The scope table says streaming dominates; this says which PART of a
+        // window shift. Denominated PER SHIFT, because a shift is the unit the
+        // cost comes in — a per-frame mean of an all-or-nothing 40 ms stall
+        // describes nothing that happens.
+        const Stream::Timing& st = stream.Timings();
+        if (st.shifts > 0) {
+          const double per = 1.0 / (double)st.shifts;
+          std::printf("    window shift breakdown: %u shifts, %.2f ms each "
+                      "| evict %.2f  fill-store %.2f  fill-gen %.2f  demote "
+                      "%.2f || per-tick: harvest %.3f  dirty-fold %.3f\n",
+                      st.shifts, st.totalMs * per, st.evictMs * per,
+                      st.fillStoreMs * per, st.fillGenMs * per,
+                      st.demoteMs * per, st.harvestMs / (double)n,
+                      st.dirtyFoldMs / (double)n);
+        }
+      }
+    }
     // Which half of the CA cost model this run lived in (see g_activeChunks).
     if (!g_activeChunks.empty()) {
       std::sort(g_activeChunks.begin(), g_activeChunks.end());

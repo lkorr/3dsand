@@ -170,6 +170,81 @@ let pvPctlOn = { p50:true, p95:true, p99:true, raw:false };
 const PV_PCTL_WINS = [60, 120, 300, 600];
 let pvPctlWin = 120;
 
+/* ---- WHICH STATISTIC THE COMPONENT BREAKDOWN REPORTS -----------------------
+ *
+ * The breakdown was mean-only, and a mean is the wrong tool for the thing the
+ * page is most often opened to answer. Streaming is the standing example: its
+ * mean is 7.9 ms, its median is 0.00 ms and its p99 is 42 ms, because a window
+ * shift is all-or-nothing and lands on ONE frame. The mean of that is a number
+ * describing no frame that ever happened, and it makes a violent stall look
+ * like a moderate constant cost.
+ *
+ * The rule the tail exposes, which the mean cannot: a component with mean 0.1
+ * and p99 30 is a STALL; one with mean 3 and p99 4 is a COST. They need
+ * opposite fixes.
+ *
+ * Module state, so it survives the DOM rebuild every live redraw does.
+ */
+const PV_STATS = [
+  { key:'mean', label:'mean',
+    tip:'The arithmetic mean over the window. Right for "what does this cost '
+      + 'me per second"; wrong for anything bursty, because a stall on one '
+      + 'frame in a hundred is divided by a hundred.' },
+  { key:'p50', label:'p50',
+    tip:'The median — half the frames were cheaper, half dearer. This is the '
+      + 'TYPICAL frame. A component whose p50 is 0.00 and whose mean is large '
+      + 'does nothing on most frames and something violent on a few.' },
+  { key:'p95', label:'p95',
+    tip:'The worst frame in twenty. Roughly once a second at 60 fps, so this '
+      + 'is the tier you actually feel as roughness rather than as a number.' },
+  { key:'p99', label:'p99',
+    tip:'The worst frame in a hundred. This is the hitch — the one that reads '
+      + 'as a stutter while the average looks fine. Needs a window of at least '
+      + '100 frames to mean anything; below that it is just the maximum.' },
+];
+let pvStat = 'mean';
+const pvStatDef = () => PV_STATS.find(s => s.key === pvStat) || PV_STATS[0];
+
+// Apply the selected statistic to a per-frame series.
+function pvStatOf(arr, stat){
+  stat = stat || pvStat;
+  if (!arr || !arr.length) return 0;
+  if (stat === 'mean') return pvMean(arr);
+  return pvPctl(arr, stat === 'p50' ? 0.50 : stat === 'p95' ? 0.95 : 0.99);
+}
+// Same, over the frames whose GPU queries actually resolved. A pending frame
+// carries a zero, and under a PERCENTILE a batch of zeros does not merely drag
+// the number down the way it does under a mean — it shifts the rank, so a p50
+// can land inside the pending block and report 0.00 for a pass that never
+// stopped running.
+function pvGpuStatOf(V, arr, stat){
+  if (!arr || !arr.length) return 0;
+  const gv = (V && V.gpuValid) || [];
+  if (!gv.length) return pvStatOf(arr, stat);
+  const keep = [];
+  for (let i = 0; i < arr.length; i++) if (gv[i]) keep.push(arr[i]);
+  return keep.length ? pvStatOf(keep, stat) : 0;
+}
+// PERCENTILES DO NOT ADD UP, and the summed rows have to be honest about it.
+// The p99 of a total is NOT the sum of the components' p99s: that would assume
+// every component has its worst frame on the SAME frame, which for streaming
+// vs the raymarch is close to never. So a summed row is the statistic of the
+// PER-FRAME SUM — build the sum series first, then take the percentile of it.
+// Under `mean` the two agree exactly (the mean is linear), which is why this
+// was invisible while the page was mean-only.
+function pvSumSeries(series, keys, gvFilter, V){
+  let n = 0;
+  for (const k of keys) n = Math.max(n, (series[k] || []).length);
+  const out = [];
+  for (let i = 0; i < n; i++){
+    if (gvFilter && V && V.gpuValid && V.gpuValid.length && !V.gpuValid[i]) continue;
+    let s = 0;
+    for (const k of keys) s += (series[k] || [])[i] || 0;
+    out.push(s);
+  }
+  return out;
+}
+
 /* ---- what each CPU scope actually IS ---------------------------------------
  *
  * The bars are labelled with ARCHITECTURE node names ("Render Pass"), because
@@ -186,8 +261,13 @@ let pvPctlWin = 120;
  * `--perf` re-record before a typo fix showed up.
  */
 const PV_SCOPE_NOTE = {
-  input:     'Input sampling, camera update and UI intent. Effectively free; '
-           + 'if this is ever visible, something is polling in a loop.',
+  input:     'Key/mouse edge detection, the camera, the character screen and '
+           + 'hotbar, and player.Update — movement integration plus the voxel '
+           + 'collision sweep against the CPU mirror. Per FRAME, not per tick. '
+           + 'This row used to be the frame RESIDUAL rather than a measurement, '
+           + 'so every unmeasured span in the engine reported here: flying spiked '
+           + 'it to 30 ms because the toroidal window shift had no timer. The '
+           + 'residual is `other` now.',
   stream:    'Toroidal window shift, chunk fetch/evict and page fills. Costs '
            + 'nothing standing still and everything while flying — this is the '
            + 'row that moves when you cross a chunk boundary.',
@@ -196,13 +276,27 @@ const PV_SCOPE_NOTE = {
   waterBody: 'The CPU half of the lake registry (WaterBodySystem::Tick). Costs '
            + 'per BODY, not per water voxel, and records nothing at all while '
            + 'sim.waterBodyMode is 0.',
-  upload:    'Assembling the MutationQueue op stream and WriteBuffer-ing it. '
-           + 'Scales with the number of ops; the budget is <1 MB/tick.',
+  upload:    'Assembling the MutationQueue op stream — TickParams, the wind and '
+           + 'current primitives — and WriteBuffer-ing it. Scales with the '
+           + 'number of ops; the budget is <1 MB/tick.',
+  pageTableCpu:
+             'The CPU half of the page table, inside SubmitTick: the conservative '
+           + 'dirty mirror (BeginTick, the op contributors, TightenFromSnapshot), '
+           + 'Materialize — which is Classify plus the allocator — then '
+           + 'ConsumeOccupancy and RetirePages. Unlike the CA this does NOT '
+           + 'sleep: it runs every tick whether or not anything moved, so it is '
+           + 'the block that can be expensive on a frame where you are standing '
+           + 'still. It also contains the free-confirmation probe, which issues '
+           + 'its own vkQueueSubmit and memcpys up to 2 MiB out of a mapped '
+           + 'staging buffer.',
   encode:    'Simulation::EncodeTick — walking the pass table and recording '
-           + 'dispatches. This is CPU time spent describing GPU work, so it '
-           + 'grows with the number of PASSES, not with how much they do.',
-  submit:    'Queue submit and present-queue bookkeeping. A large number here '
-           + 'usually means driver-side validation, not engine work.',
+           + 'dispatches, plus the readback copies. This is CPU time spent '
+           + 'describing GPU work, so it grows with the number of PASSES, not '
+           + 'with how much they do.',
+  submit:    'CommandEncoder::Finish (which runs the barrier generator over the '
+           + 'recorded rows) and vkQueueSubmit. NOTHING ELSE — this row used to '
+           + 'be the whole of SubmitTick, which is why it could read 30 ms on an '
+           + 'idle frame with no way to tell which of its seven parts moved.',
   physics:   'The Jolt step: rigid bodies, ragdolls, character controllers. '
            + 'Scales with awake body count — sleeping bodies are free.',
   postStep:  'Debris, mob and avatar post-step plus player push-out. Runs after '
@@ -218,6 +312,11 @@ const PV_SCOPE_NOTE = {
   present:   'AcquireFrame and Present. THIS IS WHERE VSYNC WAITS LAND, so it '
            + 'is a wait and not work: it is excluded from CPU busy and drawn '
            + 'separately. Large here means the GPU is the limit.',
+  other:     'THE RESIDUAL — frame wall clock that no scope above claimed. Not a '
+           + 'system, and it has no box on the Engine map on purpose. A few '
+           + 'tenths is measurement overhead. A large or spiky value means real '
+           + 'work is running outside every timer, and the fix is to add a span '
+           + 'where it is running, not to guess which system it belongs to.',
 };
 function pvScopeNote(key){ return PV_SCOPE_NOTE[key] || ''; }
 
@@ -261,7 +360,24 @@ for (const s of PV_PCTL_SERIES) if (s.p != null) PV_TILE_NOTE[s.key] = s.tip;
 window.pvState = () => ({ PERF, scenario: pvScenario, live: pvLive,
                           connected: pvLive.connected,
                           pctlOn: pvPctlOn, pctlWin: pvPctlWin,
-                          winSec: pvWinSec });
+                          winSec: pvWinSec, stat: pvStat,
+                          tipVisible: !!(pvTipEl && pvTipEl.style.display === 'block') });
+// Harness/console hook: switch the component breakdown's statistic and report
+// what it now reads, so a test can assert that p99 actually differs from the
+// mean rather than merely that the button exists.
+window.pvSetStat = k => {
+  if (!PV_STATS.some(s => s.key === k)) return null;
+  pvStat = k;
+  renderPerformance();
+  const V = pvView();
+  if (!V) return null;
+  const W = pvRecent(V, pvWinSec);
+  const T = pvTotals(W, pvStat);
+  return { stat: pvStat, wallMs: T.wallMs, gpuMs: T.gpuMs,
+           cpuBusyMs: T.cpuBusyMs, waitMs: T.waitMs,
+           cpu: T.cpuBusy.map(c => ({ scope:c.scope, ms:c.ms })),
+           gpu: T.gpu.map(g => ({ id:g.id, ms:g.ms })) };
+};
 window.pvSetScenario = id => { pvScenario = id; renderPerformance(); };
 // Harness/console hook: flip a percentile series without synthesising a click.
 window.pvTogglePctl = k => { pvPctlOn[k] = !pvPctlOn[k]; renderPerformance(); };
@@ -324,7 +440,15 @@ function pvPct(v){ return (v*100).toFixed(v >= 0.1 ? 0 : 1) + '%'; }
 
 function pvNodes(){ return (PERF && PERF.nodes) || []; }
 function pvNodeById(id){ return pvNodes().find(n => n.id === id) || null; }
-function pvNodeLabel(id){ const n = pvNodeById(id); return n ? n.label : id; }
+// Labels for the scopes that deliberately have NO architecture node — right
+// now just the residual. `other` is not a system, so giving it an ARCH_NODES
+// entry would put an orphan box on the Engine map; it still needs a bar label
+// that reads as English rather than as a JSON key.
+const PV_NODELESS_LABEL = { other: 'Unattributed' };
+function pvNodeLabel(id){
+  const n = pvNodeById(id);
+  return n ? n.label : (PV_NODELESS_LABEL[id] || id);
+}
 function pvScopeNode(key){
   const s = ((PERF && PERF.scopes) || []).find(x => x.key === key);
   return s ? s.node : null;
@@ -468,30 +592,42 @@ function pvGpuMean(V, arr){
   return n ? s / n : 0;
 }
 
-// Mean ms per frame for every GPU node and every CPU scope, plus the two
-// totals the verdict rests on. `V` is already windowed by the caller.
-function pvTotals(V){
+// Per-frame ms for every GPU node and every CPU scope under the chosen
+// statistic, plus the totals. `V` is already windowed by the caller.
+//
+// `stat` defaults to 'mean' rather than to the selected one ON PURPOSE: the
+// VERDICT panel calls this too, and a bottleneck judgement must rest on typical
+// behaviour, not on the tail. Reading "the GPU is the bottleneck" off a p99
+// would let one hitch a second relabel a CPU-bound engine.
+function pvTotals(V, stat){
+  stat = stat || 'mean';
   const gpu = [], cpuBusy = [];
-  let gpuMs = 0, cpuBusyMs = 0, waitMs = 0;
+  let waitMs = 0;
+  const gpuKeys = [], cpuKeys = [];
   for (const k in (V.gpu||{})){
-    const m = pvGpuMean(V, V.gpu[k]);
+    const m = pvGpuStatOf(V, V.gpu[k], stat);
     if (m <= 0) continue;
     gpu.push({ id: k, label: pvNodeLabel(k), ms: m });
-    gpuMs += m;
+    gpuKeys.push(k);
   }
   for (const k in (V.cpu||{})){
-    const m = pvMean(V.cpu[k]);
+    const m = pvStatOf(V.cpu[k], stat);
     if (m <= 0) continue;
     // `present` is the wait, not work. Kept out of the busy total on purpose —
     // see the header comment.
     if (k === 'present'){ waitMs += m; continue; }
     cpuBusy.push({ id: pvScopeNode(k) || k, scope: k,
                    label: pvNodeLabel(pvScopeNode(k) || k), ms: m });
-    cpuBusyMs += m;
+    cpuKeys.push(k);
   }
   gpu.sort((a,b)=>b.ms-a.ms);
   cpuBusy.sort((a,b)=>b.ms-a.ms);
-  return { gpu, cpuBusy, gpuMs, cpuBusyMs, waitMs, wallMs: pvMean(V.wall) };
+  // Statistic of the per-frame SUM, never the sum of the statistics — see
+  // pvSumSeries. Identical to the old behaviour under 'mean'.
+  const gpuMs = pvStatOf(pvSumSeries(V.gpu||{}, gpuKeys, true, V), stat);
+  const cpuBusyMs = pvStatOf(pvSumSeries(V.cpu||{}, cpuKeys, false, V), stat);
+  return { gpu, cpuBusy, gpuMs, cpuBusyMs, waitMs, stat,
+           wallMs: pvStatOf(V.wall, stat) };
 }
 
 // THE VERDICT. Deliberately a rule with a stated threshold rather than a feel:
@@ -796,6 +932,39 @@ function pvTooltip(){
   }
   return pvTipEl;
 }
+// THE ORPHANED TOOLTIP, and why it needed a second exit.
+//
+// The tip is ONE element parented to document.body, deliberately — it has to
+// escape the chart's clip and stacking context. But it is only ever hidden by
+// the `mouseleave` of the SVG hit rect that showed it, and in live mode the
+// whole panel is rebuilt several times a second. Rebuild the DOM while the
+// pointer is inside a chart and that hit rect is discarded with its listener
+// still armed: the mouseleave never fires, the tip is left parented to a body
+// that no longer contains the chart, and it hangs at the last mouse position
+// until you happen to enter and leave a chart again. That is exactly the
+// reported "box won't go away until I move back over the source window and off
+// it slowly".
+//
+// So: an explicit hide at the top of every render (the rebuild is the event
+// that orphans it), plus a document-level fallback for the other route to the
+// same state — the pointer leaving the window, or the chart scrolling out from
+// under a stationary cursor. `pv-tip` is already pointer-events:none, so the
+// tip can never be the thing under the mouse and the fallback cannot fight it.
+function pvTipHide(){ if (pvTipEl) pvTipEl.style.display = 'none'; }
+if (typeof document !== 'undefined' && !window.__pvTipGuard){
+  window.__pvTipGuard = true;
+  // Capture phase: the chart's own mousemove runs after this and re-shows the
+  // tip, so a move INSIDE a chart is unaffected and a move anywhere else hides.
+  document.addEventListener('mousemove', ev => {
+    if (!pvTipEl || pvTipEl.style.display === 'none') return;
+    const overChart = ev.target && ev.target.closest
+                      && ev.target.closest('.pv-sec svg');
+    if (!overChart) pvTipHide();
+  }, true);
+  document.addEventListener('mouseleave', pvTipHide);
+  window.addEventListener('blur', pvTipHide);
+  window.addEventListener('scroll', pvTipHide, true);
+}
 function pvTipShow(tip, ev, head, rows, total, warn){
   tip.innerHTML = '';
   tip.append(pvEl('div', { class:'pv-tip-head' }, head));
@@ -1045,6 +1214,9 @@ function pvTile(label, value, unit, sub, tone){
 function renderPerformance(){
   const root = document.getElementById('view-performance');
   if (!root) return;
+  // Before the rebuild, not after: every chart's mouseleave listener is about
+  // to be thrown away with the node that owns it. See pvTipHide.
+  pvTipHide();
   root.innerHTML = '';
   root.append(pvHeader());
 
@@ -1350,21 +1522,55 @@ function pvPercentileSection(V, T){
  * The list the page exists for. Sorted by cost, GPU and CPU kept apart, each
  * bar carrying the counter that explains it.
  */
-function pvBreakdownSection(V, T, W){
+function pvBreakdownSection(V, Tmean, W){
   W = W || V;
   const sec = pvEl('section', { class:'pv-sec' });
   sec.append(pvEl('h3', {}, 'Cost by engine component'));
+
+  // The breakdown reads whichever statistic is selected; the verdict panel
+  // above keeps the mean (see pvTotals).
+  const T = pvStat === 'mean' ? Tmean : pvTotals(W, pvStat);
+  const sd = pvStatDef();
+
+  const chips = pvEl('div', { class:'pv-toggles' });
+  for (const s of PV_STATS){
+    const on = pvStat === s.key;
+    chips.append(pvEl('button', {
+      class:'pv-toggle pv-toggle-win' + (on ? ' on' : ''),
+      type:'button', title:s.tip, 'data-stat':s.key,
+      'aria-pressed': on ? 'true' : 'false',
+      onclick: () => { pvStat = s.key; renderPerformance(); } }, s.label));
+  }
+  sec.append(chips);
+
   sec.append(pvEl('p', { class:'note' },
-    'Mean milliseconds per frame over the ' + pvWinLabel(W) + '. The '
-    + 'right-hand column is the work that produced it — a duration with no '
-    + 'denominator says a component is slow without saying why. Component '
-    + 'names are the same boxes as the Engine tab’s architecture map.'));
+    (pvStat === 'mean' ? 'Mean' : sd.label) + ' milliseconds per frame over the '
+    + pvWinLabel(W) + '. ' + sd.tip + ' The right-hand column is the work that '
+    + 'produced it — a duration with no denominator says a component is slow '
+    + 'without saying why. Component names are the same boxes as the Engine '
+    + 'tab’s architecture map.'));
+  if (pvStat !== 'mean')
+    sec.append(pvEl('p', { class:'note' },
+      'THE PARTS DO NOT ADD TO THE TOTAL under a percentile, and that is '
+      + 'arithmetic rather than a bug: each component’s worst frame is a '
+      + 'DIFFERENT frame, so adding their ' + sd.label + 's would describe a '
+      + 'frame on which everything went wrong at once. The summed rows are the '
+      + sd.label + ' of the per-frame sum, which is the real one.'));
+  if (pvStat === 'p99' && (W.wall||[]).length < 100)
+    sec.append(pvEl('p', { class:'pv-warn-line' },
+      'Only ' + (W.wall||[]).length + ' frames in this window: 1% of that is '
+      + 'less than one frame, so p99 here is simply the maximum. Widen the '
+      + 'averaging window to read it as a percentile.'));
 
   // The counters come from the SAME window as the ms figures beside them. A
   // one-second raymarch mean explained by a twenty-second chunk count is two
   // different measurements sharing a sentence.
+  //
+  // They follow the SELECTED statistic too: explaining a p99 raymarch with a
+  // mean chunk count is the same category error one level down — the frame
+  // that cost 42 ms is the frame that had the chunks.
   const cmean = {};
-  for (const k in (W.counters||{})) cmean[k] = pvMean(W.counters[k]);
+  for (const k in (W.counters||{})) cmean[k] = pvStatOf(W.counters[k]);
   const whyFor = id => {
     const parts = [];
     for (const c of ((PERF && PERF.counters) || [])){
@@ -1376,7 +1582,7 @@ function pvBreakdownSection(V, T, W){
     // The per-chunk number is what the compute budget is denominated in, so it
     // is derived here rather than left for the reader to divide.
     if (id === 'caLoop' && cmean.activeChunks > 0){
-      const per = (pvGpuMean(W, W.gpu.caLoop||[]) * 1000) / cmean.activeChunks;
+      const per = (pvGpuStatOf(W, W.gpu.caLoop||[]) * 1000) / cmean.activeChunks;
       parts.push(pvNum(per,2) + ' µs/chunk');
     }
     return parts.join(' · ');

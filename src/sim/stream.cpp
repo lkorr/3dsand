@@ -202,12 +202,19 @@ void Stream::OnMaterialsReloaded(const std::vector<MaterialDef>& mats) {
 }
 
 void Stream::Update(IVec3 playerChunk, uint32_t tick) {
+  // Unconditional, not behind PtDbg(): see the Timing comment in stream.h.
+  // Six clock reads against a pass whose p99 is 42 ms is not a measurement
+  // cost, and gating them on an env var is what let the prose about this
+  // function's cost go 8x stale without anyone noticing.
+  const double uT0 = PtNowMs();
   lastTick_ = tick;
   // harvest evictions whose readback completed since last tick (non-blocking)
   while (!pending_.empty() && pending_.front().map.Ready())
     CompleteOldest(/*discard=*/false);
   // harvest completed shift-demote batches (non-blocking; see HarvestDemotes)
   HarvestDemotes(tick);
+  const double uT1 = PtNowMs();
+  timing_.harvestMs += uT1 - uT0;
 
   // sticky modified set from the latest snapshot (slot-indexed, ~2 ticks
   // latent; see the accepted-race note in stream.h)
@@ -215,6 +222,7 @@ void Stream::Update(IVec3 playerChunk, uint32_t tick) {
   if (snap.valid) {
     for (uint32_t i = 0; i < kNumChunks; i++) modified_[i] |= snap.dirtyFlags[i];
   }
+  timing_.dirtyFoldMs += PtNowMs() - uT1;
 
   IVec3 o = world_->WindowOrigin();
   int half = (int)kNChunk / 2;
@@ -242,6 +250,7 @@ void Stream::Update(IVec3 playerChunk, uint32_t tick) {
     if (mag > bestMag) { bestMag = mag; best = a; }
   }
   if (best >= 0) ShiftAxis(best, d[best] > 0 ? 1 : -1);
+  timing_.totalMs += PtNowMs() - uT0;
 }
 
 void Stream::MarkModifiedBox(IVec3 lo, IVec3 hi) {
@@ -276,7 +285,9 @@ void Stream::ShiftAxis(int axis, int dir) {
   if (shiftEvicted_.size() != kNumChunks) shiftEvicted_.assign(kNumChunks, 0);
   for (uint32_t s : slots) shiftEvicted_[s] = 1;
 
+  const double sT0 = PtNowMs();
   EvictSlots(slots, /*filter=*/true);
+  timing_.evictMs += PtNowMs() - sT0;
 
   IVec3 no = o;
   if (axis == 0) no.x += dir;
@@ -290,6 +301,7 @@ void Stream::ShiftAxis(int axis, int dir) {
   // edge). Scoping the exemption to one shift keeps that case correct.
   for (uint32_t s : slots) shiftEvicted_[s] = 0;
   shifts_++;
+  timing_.shifts++;
 }
 
 void Stream::EvictSlots(const std::vector<uint32_t>& slots, bool filter) {
@@ -581,6 +593,7 @@ void Stream::DrainEvictions(bool discard) {
 }
 
 void Stream::FillSlots(const std::vector<uint32_t>& slots) {
+  const double fT0 = PtNowMs();
   if (world_->residency == World::Residency::Paged)
     world_->pages->ResetStreaks(slots);
   std::vector<uint32_t> data(kChunkVol);
@@ -709,6 +722,12 @@ void Stream::FillSlots(const std::vector<uint32_t>& slots) {
       genSlots.push_back(s);
     }
   }
+  // The store-hit branch is everything above: RLE decode, Classify, and up to
+  // five deferred WriteBuffer calls per slot. Split from the gen path because
+  // the two scale with different things — store hits with how much of the
+  // plane the player has visited before, gen with how much is new.
+  const double fT1 = PtNowMs();
+  timing_.fillStoreMs += fT1 - fT0;
   if (!genSlots.empty()) {
     // genChunk overwrites the WHOLE chunk of every slot in the list, so every
     // one of them needs a page before the dispatch — a kernel cannot allocate
@@ -811,9 +830,10 @@ void Stream::FillSlots(const std::vector<uint32_t>& slots) {
     // ~7 fps while moving. Batching into kEvictBatch-sized copies (the bound
     // the eviction path already uses for exactly this reason, 4 MB of staging)
     // makes it one submit and one map per 256 chunks.
+    timing_.fillGenMs += PtNowMs() - fT1;
     if (world_->residency == World::Residency::Paged) {
       const bool dbg = PtDbg();
-      const double dT0 = dbg ? PtNowMs() : 0.0;
+      const double dT0 = PtNowMs();
       double occMs = 0.0;
 
       // ---- PREFILTER ON OCCUPANCY, so the voxel read is sized to the ANSWER --
@@ -853,15 +873,39 @@ void Stream::FillSlots(const std::vector<uint32_t>& slots) {
       // genChunk's submit, which is the dependency that matters (reading early
       // returns the PREVIOUS contents and would demote every generated chunk).
       // ---- WHY THIS WAIT IS STILL HERE (PLAN_surface_flight_perf.md B2) ----
-      // Measured under --autofly-surface with SANDVOX_PT_DEBUG=1, this is THE
-      // remaining cost of the surface band and it is not close:
+      // This map wait is still the largest single CPU item in the live frame.
+      // Re-measured 2026-08-31 with Stream::Timing (stream.h), 347 shifts under
+      // `--frames 900 --autofly-hard`:
       //
-      //   [pt-time] shift demote: gen=1024 cands=815 total 39.78 ms (occ 39.55)
+      //   window shift: 24.54 ms each | evict 0.07  fill-store 0.04
+      //                                 fill-gen 0.39  demote 18.23
       //
-      // 39.55 of 39.78 ms is this map wait, against materialize 0.3-0.4 ms,
-      // freeprobe 1-6 ms and evict harvest 4-6 ms. It is a fence behind a
-      // saturated queue on a band where the CA has real work, so it is
-      // absorbing that work rather than adding its own.
+      // so 74% of a shift is this wait, and streaming as a whole is 92% of the
+      // frame's CPU busy (p50 0.00 ms, p99 42 ms — it is all-or-nothing and it
+      // lands on one frame).
+      //
+      // WHAT IT IS WAITING FOR, because the two readings need opposite fixes
+      // and the earlier note here got this wrong by 8x. With SANDVOX_PT_DEBUG=1
+      // the `pre` drain above empties the backlog first, and the same pass then
+      // reports `occ 2.1-9.1 ms`. So of the 18.2 ms, only ~2-9 is genChunk and
+      // its copy; the rest is a fence behind whatever was already queued — the
+      // frame's render and the previous ticks' submits. That is why making the
+      // COPY cheaper (it reads the whole 128 KiB occupancy buffer for <= 1,024
+      // entries) buys nothing: the cost is the synchronisation point, not the
+      // bytes.
+      //
+      // The previous version of this comment quoted `occ 39.55 ms` and called
+      // it "THE remaining cost of the surface band, and it is not close". It
+      // was measured with the debug pre-drain semantics of the time and it is
+      // 8x stale. Left recorded rather than deleted because it is the exact
+      // trap CLAUDE.md rule 6 warns about in its other direction: prose about a
+      // cost goes stale silently, and a session that trusts it spends its
+      // budget optimising a pass that is already cheap. Re-run the one command
+      // above before believing any number in this block.
+      //
+      // The harvest side, for scale (SANDVOX_PT_DEBUG=1, per shift):
+      //   demote harvest: batches=4 demoted=1024 (memcpy 1.4 ms, classify 4.1)
+      // Classify is at its post-SIMD 4.08 us/chunk, so that half is done.
       //
       // The obvious fix -- defer the wait a shift and filter on last shift's
       // occupancy -- was analysed and is UNSAFE, for a reason worth writing
@@ -1079,6 +1123,7 @@ void Stream::FillSlots(const std::vector<uint32_t>& slots) {
       for (uint32_t gs : paged)
         keys.push_back(World::PackChunkKey(world_->SlotToWorldChunk(gs)));
       IssueDemoteCopies(paged, keys, lastTick_);
+      timing_.demoteMs += PtNowMs() - dT0;
       if (dbg)
         std::printf("[pt-time] shift demote: gen=%zu cands=%zu sky=%u issued "
                     "total %.2f ms (pre %.2f, occ %.2f)\n",
