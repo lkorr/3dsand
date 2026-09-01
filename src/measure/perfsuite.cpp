@@ -19,6 +19,7 @@
 #include "gpu/resources.h"
 #include "math3d.h"
 #include "measure/perfnodes.h"
+#include "measure/perfscope.h"
 #include "sim/celestial.h"
 #include "sim/materials.h"
 #include "sim/pagetable.h"
@@ -1162,6 +1163,13 @@ Run PerfRunner::Record(const Scenario& sc) {
     const uint32_t lt = recording ? i - sc.warmTicks : 0;
     const double frameT0 = NowSeconds();
     FrameClock fc;
+    // Fold in whatever the spans below the harness billed on the PREVIOUS
+    // iteration but after its drain — in practice nothing, since the drain is
+    // the last thing a frame does, but a leftover silently misattributed to
+    // this frame is exactly the kind of accounting bug this page exists to
+    // catch, so the accumulator starts each frame empty by construction.
+    PerfScopesDrain(fc.ms);
+    for (int k = 0; k < kPerfScopeCount; k++) fc.ms[k] = 0;
 
     TickOps ops;
     {
@@ -1179,17 +1187,20 @@ Run PerfRunner::Record(const Scenario& sc) {
                                 {e.x + e.radius, e.y + e.radius, e.z + e.radius});
     }
 
-    {
-      // Upload + encode + submit are one call (SubmitTick), so they share one
-      // scope. Splitting them would mean a second copy of SubmitTick, which is
-      // exactly the drift test/support.h exists to prevent — better one honest
-      // bar labelled `submit` than three invented ones.
-      ScopeTimer sc3(fc, PerfScope::Submit);
-      SubmitTick(ctx_, world_, sim_, tick, kDefaultSeed, ops.ops, ops.exps,
-                 ops.cells, /*hashEnable=*/tick % 15 == 0, playerChunk,
-                 /*wantReadback=*/true, ops.particlesActive, ops.spawns,
-                 /*farCount=*/0, ops.fluidSpawns, s.fluidLive);
-    }
+    // SubmitTick BILLS ITSELF now (measure/perfscope.h), in five spans —
+    // upload / waterBody / pageTableCpu / encode / submit — which land in the
+    // process-global accumulator and are drained into `fc` at the bottom of
+    // this frame. This used to be one ScopeTimer labelled `submit`, with a
+    // comment arguing that splitting it would mean a second copy of SubmitTick
+    // and that one honest bar beat three invented ones. That was right about
+    // the copy and wrong about the conclusion: the fix is for the function to
+    // measure its own parts, not for the caller to guess or to give up. The
+    // live path made the same bundle and it is what made "submit spiked to
+    // 30 ms while idle" undiagnosable.
+    SubmitTick(ctx_, world_, sim_, tick, kDefaultSeed, ops.ops, ops.exps,
+               ops.cells, /*hashEnable=*/tick % 15 == 0, playerChunk,
+               /*wantReadback=*/true, ops.particlesActive, ops.spawns,
+               /*farCount=*/0, ops.fluidSpawns, s.fluidLive);
     if (haveTimer_) timer_.KickDeferred(ctx_, i);
 
     RenderFrame(s, fc, i);
@@ -1207,11 +1218,20 @@ Run PerfRunner::Record(const Scenario& sc) {
     const WorldSnapshot& sn = world_.Snap();
     if (sn.valid) s.fluidLive = sn.fluidLive;
 
+    // SubmitTick's five spans, drained into this frame's clock. Done here, one
+    // statement before the sample is built, so the spans and the ScopeTimers
+    // above are one accounting.
+    PerfScopesDrain(fc.ms);
+
     if (recording) {
       PerfSample smp;
       smp.tick = tick;
       smp.frame = i;
       for (int k = 0; k < kPerfScopeCount; k++) smp.cpuMs[k] = fc.ms[k];
+      // The residual: harness wall clock no scope claimed. Same row and same
+      // meaning as the live path's, and it is what proves the bars add up.
+      smp.cpuMs[(int)PerfScope::Other] += std::max(
+          0.0, (NowSeconds() - frameT0) * 1000.0 - PerfCpuTotal(smp));
       smp.counters[(int)PerfCounter::ActiveChunks] =
           sn.valid ? (double)sn.activeChunks : 0.0;
       smp.counters[(int)PerfCounter::Particles] =
@@ -1998,6 +2018,10 @@ int RunPerf(GpuContext& ctx, World& world, Simulation& sim,
     std::printf("\nrun one:  sandvox --perf --scenario <id>\n");
     return 0;
   }
+
+  // Turn on the spans SubmitTick and the page table bill themselves with. Off
+  // by default, so a selftest gate that shares SubmitTick pays a branch.
+  PerfScopesEnable(true);
 
   std::printf("=== sandvox --perf: engine performance suite ===\n");
   std::printf("adapter: %s\n", ctx.DeviceName().c_str());

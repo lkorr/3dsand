@@ -416,6 +416,78 @@ function run(W, D, root, errs){
         'expected an empty-state message, got '
         + reroot().querySelectorAll('.pv-pctl-line').length + ' lines');
   ['p50','p95','p99'].forEach(k => W.pvTogglePctl(k));
+
+  // ---- the component breakdown's statistic selector ----
+  //
+  // The mean is the wrong tool for a bursty component and the page now offers
+  // the tail instead. What is worth asserting is not that four buttons exist —
+  // it is that switching actually MOVES THE NUMBERS, because a selector wired
+  // to nothing renders identically to one that works.
+  const statBtns = reroot().querySelectorAll('.pv-toggle[data-stat]');
+  check('breakdown statistic buttons rendered', statBtns.length === 4,
+        [...statBtns].map(b => b.textContent.trim()).join(', '));
+  check('mean/p50/p95/p99 are all offered',
+        ['mean','p50','p95','p99'].every(k =>
+          reroot().querySelector('.pv-toggle[data-stat="' + k + '"]')));
+
+  const sMean = W.pvSetStat('mean');
+  const sP50  = W.pvSetStat('p50');
+  const sP99  = W.pvSetStat('p99');
+  check('the statistic selector reports the statistic it applied',
+        sP99 && sP99.stat === 'p99', sP99 ? sP99.stat : 'null');
+  // A percentile is monotone: p99 >= p50 for the same series, always. If the
+  // wiring silently fell back to the mean these would be equal.
+  check('p99 frame time is at or above p50',
+        sP99.wallMs >= sP50.wallMs,
+        'p50 ' + sP50.wallMs.toFixed(2) + ' vs p99 ' + sP99.wallMs.toFixed(2));
+  // Matched by SCOPE, not by position: both lists are sorted by cost and the
+  // ordering itself changes between statistics, which is half the point.
+  const meanByScope = {};
+  for (const c of sMean.cpu) meanByScope[c.scope] = c.ms;
+  check('p99 differs from the mean somewhere in the breakdown',
+        sP99.wallMs > sMean.wallMs + 1e-6
+          || sP99.cpu.some(c => Math.abs(c.ms - (meanByScope[c.scope]||0)) > 1e-6),
+        'mean ' + sMean.wallMs.toFixed(3) + ' vs p99 ' + sP99.wallMs.toFixed(3));
+  // NON-ADDITIVITY, stated on the page rather than left for the reader to
+  // notice. Under a percentile the parts genuinely do not sum to the total —
+  // each component's worst frame is a different frame — and the summed row is
+  // the percentile of the per-frame SUM. A page that quietly showed
+  // sum-of-percentiles would look right and be wrong.
+  check('a percentile warns that the parts do not add up',
+        [...reroot().querySelectorAll('.pv-sec .note')]
+          .some(p => /do not add/i.test(p.textContent)));
+  const sumOfParts = sP99.cpu.reduce((a, c) => a + c.ms, 0);
+  check('the summed CPU row is not the sum of the parts under p99',
+        sumOfParts >= sP99.cpuBusyMs - 1e-6,
+        'parts ' + sumOfParts.toFixed(2) + ' vs summed ' + sP99.cpuBusyMs.toFixed(2));
+  // ...and switching back restores the additive mean the check above relies on.
+  W.pvSetStat('mean');
+  check('the mean has no non-additivity warning',
+        ![...reroot().querySelectorAll('.pv-sec .note')]
+          .some(p => /do not add/i.test(p.textContent)));
+
+  // ---- the orphaned tooltip ----
+  //
+  // The tip is one element on document.body, hidden only by the mouseleave of
+  // the chart that showed it. A live redraw discards that chart mid-hover, the
+  // mouseleave never fires, and the box hangs at the last mouse position until
+  // you re-enter and leave a chart. Reproduce it by showing the tip and then
+  // rebuilding, which is exactly what a live frame does.
+  const chartSvg = reroot().querySelector('.pv-sec svg');
+  if (chartSvg){
+    const box = chartSvg.getBoundingClientRect();
+    // The hit target is the plot interior rect, not the marks; aim at the
+    // middle of the chart.
+    const hit = chartSvg.querySelector('rect[fill="transparent"]') || chartSvg;
+    hit.dispatchEvent(new MouseEvent('mousemove', {
+      clientX: box.left + box.width/2, clientY: box.top + box.height/2,
+      bubbles:true }));
+    check('hovering a chart shows the tooltip', !!W.pvState().tipVisible);
+    W.pvSetScenario(W.pvState().scenario);   // a rebuild, as a live frame does
+    check('a redraw does not orphan the tooltip', !W.pvState().tipVisible,
+          'tooltip survived the DOM rebuild that discarded its mouseleave');
+  }
+
   check('no page errors after toggling', errs.length === 0, errs.join(' | '));
 }
 </script>

@@ -14,6 +14,7 @@
 #include <cstdlib>
 
 #include "gpu/resources.h"
+#include "measure/perfscope.h"
 #include "sim/farfield.h"
 #include "sim/wind.h"
 #include "sim/worldedit.h"
@@ -27,6 +28,10 @@ namespace sandvox {
 // character the GAME plays, and one pinned to the old name goes on passing
 // against a character nobody plays (see the note at the avatar gate itself).
 const char* kAvatarDefName = "human";
+
+// Read-and-cleared once per frame by the telemetry path. See TakeSnapshotStalls
+// in support.h for why this exists and what a nonzero value means.
+namespace { uint32_t g_snapshotStalls = 0; }
 
 // Time of day used by --shot, as a 0..1 fraction of the cycle (0 = midnight,
 // 0.5 = noon). Set by `--time`; see RunShots.
@@ -229,6 +234,23 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
                 uint32_t fluidLive,
                 const uint32_t* fluidSplashMat,
                 bool vizActive) {
+  // ---- HOW THIS FUNCTION IS BILLED ---------------------------------------
+  //
+  // SubmitTick used to be ONE bar on the Performance tab, called "submit", with
+  // the tooltip "command-buffer submit and the generated barriers". It is not:
+  // it is TickParams assembly, the wind and water registries, six op-stream
+  // uploads, the entire CPU half of the page table (including a second
+  // vkQueueSubmit inside the free probe), the pass-table walk, and only then a
+  // submit. A user watching that bar jump from 0.2 ms to 30 ms on an idle frame
+  // had no way to tell which of those seven things moved.
+  //
+  // So the function bills itself, in five non-overlapping spans, and they are
+  // deliberately NOT nested — PerfSpan has no child-subtraction and a nested
+  // pair would double-count. Where a span has to yield to an inner one it is
+  // Close()d and a fresh one opened after.
+  //
+  // Every span is a branch on a bool unless --telemetry or --perf is live.
+  sandvox::PerfSpan spanHead(PerfScope::Upload);
   particlesActive = particlesActive || !exps.empty() || !spawns.empty();
   uint32_t cellCount = std::min((uint32_t)cells.size(), kMaxCellOpsPerTick);
   uint32_t spawnCount = std::min((uint32_t)spawns.size(), kMaxParticleSpawnsPerTick);
@@ -402,8 +424,12 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
       for (const ExplosionOp& e : exps)
         touch({e.x >> 4, e.y >> 4, e.z >> 4}, {e.x, e.y, e.z});
     }
-    wb.Tick(world, seed, tick, wt.sim.waterBodyMode, wt.sim.waterBodyTestDrain,
-            wt.sim.drainMaxEighthsPerTick, worldEdited, editCell);
+    spanHead.Close();
+    {
+      sandvox::PerfSpan spanWb(PerfScope::WaterBody);
+      wb.Tick(world, seed, tick, wt.sim.waterBodyMode, wt.sim.waterBodyTestDrain,
+              wt.sim.drainMaxEighthsPerTick, worldEdited, editCell);
+    }
     const WaterBodyGpu& g = wb.Gpu();
     waterGpu = &g;
     tp.waterBodyMode = (uint32_t)wt.sim.waterBodyMode;
@@ -519,6 +545,11 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
       {playerChunk.x - 1, playerChunk.y - 1, playerChunk.z - 1});
   tp.mirrorBase[0] = mb.x; tp.mirrorBase[1] = mb.y; tp.mirrorBase[2] = mb.z;
   tp.vizActive = vizActive ? 1u : 0u;
+  // ---- UPLOAD: the MutationQueue op stream reaching the GPU ---------------
+  // The second half of the Upload span (the first ran from function entry to
+  // the water registry). Ends before the day/night wake below, which records a
+  // dispatch and is therefore an ENCODE, not an upload.
+  sandvox::PerfSpan spanUpload(PerfScope::Upload);
   ctx.queue.WriteBuffer(world.tickUBO, 0, &tp, sizeof(tp));
   if (!ops.empty())
     ctx.queue.WriteBuffer(world.opsBuf, 0, ops.data(), ops.size() * sizeof(BrushOp));
@@ -567,6 +598,7 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
     bool isDay = DaylightStrengthCpu(tp.dayPhase) > 0;
     if (wasDay != isDay) sim.EncodeWakeAll(ctx.queue);
   }
+  spanUpload.Close();
 
   // ---- the page table: MATERIALIZE BEFORE THE ENCODER (§3) ----------------
   //
@@ -588,6 +620,19 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
   // fix 1: the wake IS a dirty-set mutation and the two must be ONE operation,
   // not two that must agree).
   PageTable& pt = *world.pages;
+  // ---- PAGE TABLE, CPU HALF -----------------------------------------------
+  // Everything from here to RetirePages: BeginTick, the AddOp* contributors,
+  // UpdateSpawnRing/UpdateFluidChunks, TightenFromSnapshot, Materialize (which
+  // is Classify + the allocator), ConsumeOccupancy and RetirePages. This runs
+  // EVERY tick whether or not anything moved, so unlike the CA it does not
+  // sleep — which makes it the one block in SubmitTick that can be expensive on
+  // a frame where the player is doing nothing at all.
+  //
+  // It also contains the free-confirmation probe, which issues its OWN
+  // vkQueueSubmit and memcpys up to kMaxFreeProbesPerTick x 16 KiB out of a
+  // mapped staging buffer. That is a second submit hiding inside what the page
+  // called "queue submit", and it was invisible.
+  sandvox::PerfSpan spanPt(PerfScope::PageTableCpu);
   // Install the free-confirmation probe once (see SetChunkProbe): a page is
   // only released when the chunk's WORDS say empty, because occupancy does not
   // see the stain layer and the hash does.
@@ -786,7 +831,14 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
   // genList — every JITTER page materialized as zeros and 2,114 chunks of stone
   // silently became air.
   const uint32_t jitterFills = pt.UploadJitterFills(ctx.queue);
+  spanPt.Close();
 
+  // ---- ENCODE: describing the tick's GPU work -----------------------------
+  // The pass-table walk plus the readback copies. This is CPU time spent
+  // TALKING about GPU work, so it grows with the number of recorded rows, not
+  // with how much they do — which is why it is worth separating from the
+  // submit it used to be bundled with.
+  sandvox::PerfSpan spanEnc(PerfScope::Encode);
   rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
   // The fills go in at the HEAD of the command buffer, before any row (§5.4):
   // FillTracked declares TransferWrite on Voxels, and the first row with
@@ -877,9 +929,17 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
                                    1 - sim.Page(), tick);
     if (doCopy) world.EncodeDirtyCopy(enc, sim.DirtyNext());
   }
-  ctx.queue.Submit(enc.Finish());
-  sim.FlipPage();
-  if (doCopy) world.KickReadback();
+  spanEnc.Close();
+  {
+    // ---- SUBMIT, and now it really is only the submit ---------------------
+    // Finish() runs the barrier generator over the recorded rows and
+    // vkQueueSubmit hands the buffer to the driver. Both are real CPU costs
+    // and both belong to the RHI; nothing else does.
+    sandvox::PerfSpan spanSub(PerfScope::Submit);
+    ctx.queue.Submit(enc.Finish());
+    sim.FlipPage();
+    if (doCopy) world.KickReadback();
+  }
   // Wait for the submit's fence, then pump — which is what a game frame does
   // for free by having real time elapse between the two. Taken by the harness
   // drain (SetHarnessSnapshotDrain, off by default) and by paged mode's
@@ -895,9 +955,25 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
   // tick straight through the pool (materialize allocations 35 → 3,447/tick
   // over 13 ticks, no tighten ever running).
   if (HarnessSnapshotDrain() || snapshotStale) {
+    // Billed to Readback, and it is the one place on this path that BLOCKS.
+    // On the game loop `snapshotStale` is the hitch fallback, so a spike here
+    // is the frame paying for a snapshot cadence it let slip — which is a
+    // sentence the page could not previously say, because this WaitIdle was
+    // inside the bar labelled "queue submit".
+    //
+    // Counted separately from the harness drain: only the STALENESS arm is a
+    // surprise, and only on the game path. See TakeSnapshotStalls.
+    if (snapshotStale && !HarnessSnapshotDrain()) g_snapshotStalls++;
+    sandvox::PerfSpan spanWait(PerfScope::Readback);
     ctx.WaitIdle();
     ctx.ProcessEvents();
   }
+}
+
+uint32_t TakeSnapshotStalls() {
+  const uint32_t n = g_snapshotStalls;
+  g_snapshotStalls = 0;
+  return n;
 }
 
 namespace {

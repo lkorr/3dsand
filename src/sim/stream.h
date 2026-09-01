@@ -114,6 +114,38 @@ class Stream {
   uint32_t ShiftCount() const { return shifts_; }
   size_t PendingEvictions() const { return pending_.size(); }
 
+  // ---- WHERE A WINDOW SHIFT'S TIME GOES ------------------------------------
+  //
+  // Streaming is by a wide margin the largest CPU item in the live frame — 93%
+  // of CPU busy under --autofly-hard, p50 0.00 ms and p99 42 ms, because a
+  // shift is all-or-nothing and lands on one frame. Until this struct existed
+  // the whole of it was ONE number on the Performance tab, and that number was
+  // not even labelled `stream`: Update runs inside the tick body, which had no
+  // timer, so it fell into the frame residual and the residual was billed to
+  // `input`. The user-visible symptom was "input spikes to 30 ms when flying".
+  //
+  // One number for a 40 ms stall is the failure CLAUDE.md rule 6 names, and it
+  // had already cost a wrong answer here: the comment at the demote map wait in
+  // FillSlots records `occ 39.55 ms` and calls it "THE remaining cost of the
+  // surface band, and it is not close". Re-measured with the same
+  // SANDVOX_PT_DEBUG=1 probe, that pass is now 2.4-9.3 ms. The cost MOVED and
+  // the prose did not, so a session reading it would have spent its budget
+  // optimising a pass that is already 8x cheaper than advertised.
+  //
+  // Accumulated always (a handful of clock reads against a 40 ms stall) and
+  // reported by `--frames`, so re-checking it is one non-interactive command.
+  struct Timing {
+    double evictMs = 0;    // EvictSlots: RLE encode, store insert, copy encode
+    double fillStoreMs = 0;// FillSlots' store-hit branch: decode + per-slot uploads
+    double fillGenMs = 0;  // genList upload + EncodeGenList + submit
+    double demoteMs = 0;   // the post-genChunk occupancy map wait + candidate scan
+    double harvestMs = 0;  // HarvestDemotes + CompleteOldest at the top of Update
+    double dirtyFoldMs = 0;// the per-tick kNumChunks fold of snapshot dirty flags
+    double totalMs = 0;    // the whole of Update, so the parts can be checked
+    uint32_t shifts = 0;
+  };
+  const Timing& Timings() const { return timing_; }
+
  private:
   // One in-flight eviction batch: a staging buffer whose map has been kicked
   // but not yet consumed. The ticket owns its own completion state on the heap,
@@ -197,6 +229,7 @@ class Stream {
   Simulation* sim_ = nullptr;
   uint32_t seed_ = 0;
   uint32_t shifts_ = 0;
+  Timing timing_;
   ChunkStore store_;
   // Fed by the same eviction path that fills store_, and reconstructible from
   // it (FarEdits::RebuildFromStore). Owned here rather than by World because

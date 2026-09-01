@@ -117,6 +117,23 @@ void SubmitWorldgen(GpuContext& ctx, World& world, Simulation& sim,
 void SetHarnessSnapshotDrain(bool on);
 bool HarnessSnapshotDrain();
 
+// THE PAGED SNAPSHOT-STALENESS STALL, counted.
+//
+// SubmitTick's paged self-defence (see the long comment at its tail) runs
+// `ctx.WaitIdle(); ctx.ProcessEvents();` when the snapshot in hand is older
+// than `kPagedSnapshotMaxGap` ticks. On a harness that is a sanctioned sync
+// point. On the GAME frame path it is a full-device stall — it waits for the
+// render of the frame in front of it as well as the tick — and it is the one
+// place the frame loop can block for milliseconds without any system looking
+// busy. It fires from a CADENCE, not from anything the player did, which is
+// exactly why it reads as "submit spikes randomly while I do nothing".
+//
+// So it is counted rather than argued about. Read-and-clear, per frame, and
+// the Performance tab shows it as the denominator of the `readback` bar:
+// "readback 12.4 ms over 2 snapshot stalls" is a diagnosis, "readback 12.4 ms"
+// is not (CLAUDE.md rule 6).
+uint32_t TakeSnapshotStalls();
+
 // Body render plumbing moved to game/bodyreg.h: BodyRegistry owns the ONE
 // definition of the debris | mob | avatar slot walk, and all three parallel
 // arrays (xforms, cube instances, micro insts) are built through it. The free
