@@ -144,6 +144,7 @@ struct DeviceImpl {
   virtual void PushValidationScope() = 0;
   virtual bool PopValidationScopeBlocking() = 0;
   virtual void ProcessEvents() = 0;
+  virtual bool WaitOldestPendingMap() = 0;
   virtual void WaitIdle() = 0;
   // The blocking read of a MapRead buffer whose producing work is submitted.
   virtual bool ReadBufferBlocking(const Buffer& src, uint64_t offset, void* out,

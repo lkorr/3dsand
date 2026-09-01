@@ -2379,6 +2379,12 @@ class World {
   // and null-checked by FarField (a fill with no index is the old behavior).
   class FarEdits* farEdits = nullptr;
 
+  // Depth of the snapshot readback ring. Public because it is the bound on how
+  // many deliveries a caller draining toward a FRESH snapshot can ever need —
+  // SubmitTick's paged staleness fallback loops against it. The slots
+  // themselves stay private.
+  static constexpr int kReadbackSlots = 3;
+
  private:
   struct Slot {
     rhi::Buffer buf;
@@ -2394,7 +2400,7 @@ class World {
     std::vector<uint32_t> fetchSentinel;
     std::array<uint32_t, 27> mirrorSentinel{};
   };
-  static constexpr int kSlots = 3;
+  static constexpr int kSlots = kReadbackSlots;
   Slot slots_[kSlots];
   int lastSlot_ = -1;
   WorldSnapshot snap_;

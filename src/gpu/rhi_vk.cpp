@@ -502,6 +502,29 @@ struct VkrDevice final : DeviceImpl {
     FirePendingMaps();
   }
 
+  // The targeted half of ProcessEvents: block on ONE submit's fence rather than
+  // draining the device. See the contract note on rhi::Device.
+  //
+  // st->maps is append-ordered and FirePendingMaps erases in place, so index 0
+  // is the oldest outstanding map — the earliest submit still owed a delivery,
+  // which is the one whose completion advances the snapshot furthest.
+  bool WaitOldestPendingMap() override {
+    if (st->maps.empty()) return false;
+    const VkFence f = st->maps.front().fence;
+    if (f != VK_NULL_HANDLE) {
+      // Retained by MapReadAsync and not released until its callback fires, so
+      // the handle cannot have been recycled under us (the RetainFence contract
+      // in rhi_vulkan.h). WaitFence failing is a lost device; PollFences +
+      // FirePendingMaps below still runs so the caller sees a consistent state
+      // and falls back to its own WaitIdle path.
+      std::string err;
+      st->be->WaitFence(f, err);
+    }
+    st->be->PollFences();
+    FirePendingMaps();
+    return true;
+  }
+
   void WaitIdle() override {
     // §4.9: a drain must not strand deferred uploads. If FillSlots (or any
     // QueueWrite) enqueued writes and nothing recorded a command buffer since,

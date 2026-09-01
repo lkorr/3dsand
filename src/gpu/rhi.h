@@ -477,6 +477,26 @@ class Device {
   // Pump async callbacks (the World readback ring maps with a
   // process-events callback and lands here).
   void ProcessEvents() const;
+
+  // Block until the OLDEST outstanding MapReadAsync can be delivered, then
+  // deliver every map that is ready. Returns false if none was outstanding
+  // (nothing to wait for), true if one was waited on and fired.
+  //
+  // THE POINT IS WHAT IT DOES NOT WAIT FOR. Each pending map retains the fence
+  // of the submit that produced its contents (VkrState::PendingMap), so this is
+  // one vkWaitForFences on that ONE submit — not WaitIdle, which additionally
+  // waits on the frame's render, the present, and every tick queued behind it.
+  // On the game path those unrelated waits were the whole cost: the paged
+  // snapshot-staleness fallback in SubmitTick measured ~93 ms of WaitIdle for a
+  // readback that was a few ms from landing.
+  //
+  // Only the World snapshot ring uses MapReadAsync (world.cpp KickReadback is
+  // the sole caller), so "the oldest pending map" is "the oldest in-flight
+  // snapshot readback". If that ever stops being true, this becomes a wait on
+  // an unrelated map and the caller's loop must re-check its own predicate —
+  // which the SubmitTick caller already does.
+  bool WaitOldestPendingMap() const;
+
   // Block until all submitted GPU work has completed.
   void WaitIdle() const;
 

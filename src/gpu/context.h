@@ -46,6 +46,9 @@ class GpuContext {
   rhi::TextureView AcquireFrame();
   void Present();
   void ProcessEvents();
+  // Blocks on the oldest outstanding snapshot readback only — see the contract
+  // on rhi::Device::WaitOldestPendingMap. False = nothing was in flight.
+  bool WaitOldestPendingMap();
   // Blocks until all submitted GPU work completes (selftest timing / shutdown).
   void WaitIdle();
 

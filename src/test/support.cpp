@@ -913,6 +913,25 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
   // Shot paths WaitIdle every tick anyway, so the added pump costs nothing
   // there. Dense mode takes none of this — the identity map has no mirror to
   // starve.
+  //
+  // RAISING THIS TO BUY FEWER STALLS IS A TRAP, and it was the first half of a
+  // plan that got as far as being approved before the arithmetic was checked.
+  // The reasoning was "the pool is window-sized now, so a bigger mirror is
+  // survivable" — true about the ABORT, and irrelevant to the COST. The
+  // tightening at pagetable.cpp's TightenFromSnapshot ends in
+  //     cpuDirty.IntersectWith(snap); cpuDirty.UnionWith(snap);
+  // which is (A n S) u S == S: after a tighten the mirror IS the snapshot's
+  // dirty set dilated one N26 ring per tick of gap. So this constant is the
+  // EXPONENT on the materialization set, not a latency knob. At the measured
+  // ~2.3x/ring that makes gap 8 order-100x the pages of gap 4, and the fatal
+  // precedent (main.cpp's pump note: 23.4k of 24,576 pages while sprint-flying)
+  // is that exact shape. A bigger pool turns that from an abort into tens of
+  // thousands of page fills plus an O(window) walk every tick — a far worse
+  // spike than the stall it was meant to remove.
+  //
+  // The honest way to raise it is to measure first: SANDVOX_PT_DEBUG=1 prints
+  // `cpuDirty=` per tick, so run a hitch-heavy flight and look at what the
+  // mirror actually reaches at gap 4 before granting it more rings.
   constexpr uint32_t kPagedSnapshotMaxGap = 4;
   const bool paged = world.residency == World::Residency::Paged;
   const uint32_t maxGap =
@@ -954,19 +973,52 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
   // --shot's oil-slick scene as a snapshot-starved mirror dilating a ring per
   // tick straight through the pool (materialize allocations 35 → 3,447/tick
   // over 13 ticks, no tighten ever running).
-  if (HarnessSnapshotDrain() || snapshotStale) {
-    // Billed to Readback, and it is the one place on this path that BLOCKS.
-    // On the game loop `snapshotStale` is the hitch fallback, so a spike here
-    // is the frame paying for a snapshot cadence it let slip — which is a
-    // sentence the page could not previously say, because this WaitIdle was
-    // inside the bar labelled "queue submit".
-    //
-    // Counted separately from the harness drain: only the STALENESS arm is a
-    // surprise, and only on the game path. See TakeSnapshotStalls.
-    if (snapshotStale && !HarnessSnapshotDrain()) g_snapshotStalls++;
+  if (HarnessSnapshotDrain()) {
+    // THE HARNESS ARM IS UNCHANGED AND STAYS A FULL DRAIN. Gates read the world
+    // through blocking hash/occupancy reads either side of this, and several
+    // depend on every submit having retired before they look (selftest.h's
+    // ordering note). Narrowing it would be a behaviour change to the test
+    // harness in a commit whose entire point is that the harness must NOT move.
     sandvox::PerfSpan spanWait(PerfScope::Readback);
     ctx.WaitIdle();
     ctx.ProcessEvents();
+  } else if (snapshotStale) {
+    // ---- THE GAME-PATH HITCH FALLBACK, AND WHY IT IS NO LONGER A WaitIdle ---
+    //
+    // Billed to Readback, and it is the one place on this path that BLOCKS. A
+    // spike here is the frame paying for a snapshot cadence it let slip.
+    // Counted, because only this arm is a surprise. See TakeSnapshotStalls.
+    //
+    // What is needed is ONE snapshot, fresh enough for §3.2's tightening. What
+    // ctx.WaitIdle() waited for was the whole device: the render of the frame
+    // in front, its present, and every tick queued behind — none of which
+    // produce a snapshot. Measured at ~93 ms on the frame it fired, which is
+    // why the row read as "async readback" spiking with nothing happening.
+    //
+    // WaitOldestPendingMap blocks on the single submit that owes the oldest
+    // in-flight snapshot and then delivers it. Looping re-checks the ACTUAL
+    // predicate — freshness — after each delivery, so it stops the moment the
+    // gap is covered instead of over-waiting: with a copy kicked for `tick`
+    // just above, the worst case is draining the 3-slot ring, and the common
+    // case is one wait on a readback that was already nearly done.
+    g_snapshotStalls++;
+    sandvox::PerfSpan spanWait(PerfScope::Readback);
+    auto fresh = [&] {
+      return world.Snap().valid && tick <= world.Snap().tick + maxGap;
+    };
+    // Bounded by the ring depth: each iteration retires one slot, and a slot
+    // cannot be re-armed from here (no submit happens inside the loop), so this
+    // terminates on WaitOldestPendingMap returning false at the latest.
+    for (int i = 0; i < World::kReadbackSlots && !fresh(); i++)
+      if (!ctx.WaitOldestPendingMap()) break;
+    // Still stale means no in-flight map could supply it — the ring declined a
+    // copy this tick, or a map failed. Fall back to the old behaviour rather
+    // than letting the mirror dilate unchecked: correctness first, and this is
+    // strictly rarer than the case above.
+    if (!fresh()) {
+      ctx.WaitIdle();
+      ctx.ProcessEvents();
+    }
   }
 }
 
