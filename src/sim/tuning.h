@@ -908,15 +908,44 @@ struct Tuning {
     float swingExtend = 0.16f;       // fraction of reach the arc bows out by
     float bladeSmoothing = 0.055f;   // seconds halflife on the blade frame
     // HOW FAR THE WRIST MAY TAKE THE BLADE from what the solved forearm gives
-    // it for free, radians. 1.5 is a wrist. It was 2.80 — 160 degrees, which is
-    // a ball joint — for one structural reason that no longer holds: the
-    // authored grip held the blade PERPENDICULAR to the forearm, so about 90
-    // degrees of the budget was spent undoing the grip before any steering
-    // happened. assets/items/{sword,cleaver}.json now rotate [0,0,-90] instead
-    // of [0,-90,0], which puts a neutral blade along the arm's own line, and
-    // the budget is free to be a wrist again.
-    float wristMaxAngle = 1.50f;
+    // it for free, radians. THIS IS A GROSS BUDGET, NOT AN ANATOMICAL ANGLE,
+    // and reading it as the latter is what cost the phase C/D merge its only
+    // real interaction bug.
+    //
+    // The blade asks the wrist for a FULL orientation delta — direction AND
+    // roll — and the neutral grip is about pi of roll away from what a
+    // committed cut wants. Measured on the repaired swing-plane fixture, every
+    // pass reports wristWant 2.6..3.1 rad whichever grip is authored. So the
+    // budget the STEERING actually gets is `wristMaxAngle` minus that standing
+    // tax, and it is the difference that has to be a wrist:
+    //
+    //   old grip, cap 2.80 -> ~1.2 rad free   (what phase C measured against)
+    //   new grip, cap 1.50 -> ~0.0 rad free   (pegged in every pass; the bug)
+    //   new grip, cap 3.10 -> ~1.1 rad free   (what ships)
+    //
+    // 1.50 was set from an A/B on the OLD swing-plane fixture, whose open-loop
+    // ready never drove the arm into the poses a committed cut reaches, so the
+    // cap read as non-binding there and clamped half of every real cut here.
+    // With 3.10 the gate's follow residual is 0.34 vox where 1.50 gave 3.66,
+    // and its az/el tracking, planarity and diagonal ratio all fall inside
+    // their bounds instead of outside them.
+    //
+    // OWNER ITEM, and the reason this is not simply "the wrist is 160 degrees":
+    // the standing ~pi is a GRIP question. Authoring the neutral roll into
+    // {sword,cleaver}.json would let this come back down to a real wrist. The
+    // naive attempt ([180,0,-90]) makes the follow residual worse (8.08), so
+    // it is a piece of work rather than a sign flip.
+    float wristMaxAngle = 3.10f;
     float edgeFloor = 0.35f;         // damage floor for a flat-on slap
+    // ---- BLADE ON BLADE (game/melee.h MeleeSweepDamage's parry block) -------
+    // The four knobs a parry has. They are `melee.*` rather than `combatfx.*`
+    // because a block is MECHANICS — it stops a cut, it costs the blocking
+    // weapon hp, and it shoves the defender's guard — where combatfx is
+    // presentation that can be switched off without changing an outcome.
+    float blockGapM = 0.22f;         // metres of slack around the two segments
+    float blockItemDamage = 0.35f;   // fraction of the blow the blade takes
+    float blockNudgeAz = 0.30f;      // radians the defender's guard is beaten
+    float blockNudgeEl = 0.18f;      //   open, azimuth and elevation, at power 1
   } melee;
 
   // ---- combat feel: hit-stop, hit flash, combat cues --------------------------

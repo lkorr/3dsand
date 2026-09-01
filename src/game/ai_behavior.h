@@ -188,10 +188,19 @@ struct Movement {
 };
 
 struct AttackTuning {
-  // Authored style id, passed through to the stroke system untouched. THIS
-  // LAYER MUST NOT KNOW WHAT STYLES EXIST — that is Phase C's vocabulary, and
-  // baking a list here is exactly the closed-ended system rule 4 forbids.
-  std::string style = "slash";
+  // AUTHORED STYLE IDS, passed through to the stroke system untouched. THIS
+  // LAYER MUST NOT KNOW WHAT STYLES EXIST — that is the stroke system's
+  // vocabulary (game/strokes.h), and baking a list here is exactly the
+  // closed-ended system rule 4 forbids.
+  //
+  // A LIST, not one id, and that is a character decision rather than a
+  // convenience: a creature that answers every opening with the same cut is a
+  // creature the player solves once. One is drawn per attack by
+  // `PickAttackStyle`, counter-based on (mobId, tick), so ten swings vary and
+  // the sequence still replays. `"style": "x"` and `"styles": ["x"]` are the
+  // same profile — the loader folds the singular into the list — so a profile
+  // written before styles were plural is unchanged.
+  std::vector<std::string> styles;
   // World voxels, centre-to-centre, inside which a blow can land. Distinct from
   // rangeMax on purpose: a creature that only attacks at the very edge of its
   // footwork band feels timid, one that attacks from anywhere in the band feels

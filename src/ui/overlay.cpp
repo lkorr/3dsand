@@ -1039,7 +1039,14 @@ void Overlay::Draw(UIState& s) {
                                              ? "(none yet)"
                                              : s.aiLastAttack.c_str());
           ImGui::TextDisabled("the AI decides WHEN and WHERE; the stroke");
-          ImGui::TextDisabled("system (phase C) consumes these requests");
+          ImGui::TextDisabled("program (game/strokes.h) swings them");
+          ImGui::Separator();
+          ImGui::Text("parries: %d", s.aiBlockCount);
+          ImGui::TextWrapped("last: %s", s.aiLastBlock.empty()
+                                             ? "(none yet)"
+                                             : s.aiLastBlock.c_str());
+          ImGui::TextDisabled("blocking is EMERGENT: a blade in the path");
+          ImGui::TextDisabled("stops the blow. There is no block button.");
           ImGui::EndTabItem();
         }
 
@@ -1324,6 +1331,39 @@ void Overlay::Draw(UIState& s) {
                   "bruises and still breaks bone, so this is a floor rather\n"
                   "than a gate, and it is what makes rolling the blade into\n"
                   "the cut worth doing.");
+          }
+          // ---- BLADE ON BLADE ------------------------------------------
+          // On the DAMAGE tab and not on Combat feel, because a parry is
+          // mechanics: it ends the stroke, it costs the blocking blade hp,
+          // and it shoves the defender's guard. Turning combat feel off
+          // must not change who wins a fight; turning these off does.
+          if (ImGui::CollapsingHeader("Blade on blade",
+                                      ImGuiTreeNodeFlags_DefaultOpen)) {
+            ImGui::TextDisabled("a cut stopped by another creature's WEAPON");
+            ImGui::TextDisabled("(worn armour is not a parry — it takes the cut)");
+            f("parry reach (m)", &t.melee.blockGapM, 0.0f, 0.5f, "%.3f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "How close the blades must come for the block to fire, on\n"
+                  "top of the attacking blade's own half-width.\n\n"
+                  "Not zero: a sword is about a quarter of a voxel thick and\n"
+                  "two swept segments never intersect exactly. Past ~0.3 m\n"
+                  "the defender parries blows that passed a foot away, which\n"
+                  "reads as an invincible AI rather than as a bad number.");
+            f("wear on the blade", &t.melee.blockItemDamage, 0.0f, 1.0f,
+              "%.2f");
+            f("guard beaten · az (rad)", &t.melee.blockNudgeAz, 0.0f, 1.0f,
+              "%.2f");
+            f("guard beaten · el (rad)", &t.melee.blockNudgeEl, 0.0f, 1.0f,
+              "%.2f");
+            if (ImGui::IsItemHovered())
+              ImGui::SetTooltip(
+                  "How far a blocked blow shoves the DEFENDER'S stroke.\n"
+                  "Blocking must not be free — a heavy blow caught on the\n"
+                  "blade opens the guard and the next one has somewhere to\n"
+                  "go. Only the SIGN is drawn, counter-based on the two ids,\n"
+                  "so both sides of an exchange shove the same way in every\n"
+                  "replay of the same fight.");
           }
           if (ImGui::CollapsingHeader("The kerf",
                                       ImGuiTreeNodeFlags_DefaultOpen)) {

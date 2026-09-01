@@ -843,6 +843,10 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadF(*g, "bladeSmoothing", e.bladeSmoothing, out, at);
     ReadF(*g, "wristMaxAngle", e.wristMaxAngle, out, at);
     ReadF(*g, "edgeFloor", e.edgeFloor, out, at);
+    ReadF(*g, "blockGapM", e.blockGapM, out, at);
+    ReadF(*g, "blockItemDamage", e.blockItemDamage, out, at);
+    ReadF(*g, "blockNudgeAz", e.blockNudgeAz, out, at);
+    ReadF(*g, "blockNudgeEl", e.blockNudgeEl, out, at);
 
     // ---- BOUNDS, not taste ---------------------------------------------------
     // Every clamp here protects a STRUCTURAL property of the stroke rather than
@@ -906,6 +910,27 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     // backwards down its own arm (game/mob.cpp applies this as a slerp limit).
     e.wristMaxAngle = std::clamp(e.wristMaxAngle, 0.0f, 3.14f);
     e.edgeFloor = std::clamp(e.edgeFloor, 0.0f, 1.0f);
+    // ---- THE BLOCK KNOBS, and what each clamp is protecting ------------------
+    //
+    //   * blockGapM is the slack in the segment-vs-segment test. NEGATIVE would
+    //     mean the two blades must overlap to register, which no real pair of
+    //     sweeps does, and a parry that can never fire is indistinguishable
+    //     from the feature being absent. The ceiling is the other failure and
+    //     the more insidious one: a gap of half a metre parries blows that
+    //     passed a foot from the defender's blade, which reads as "the AI is
+    //     invincible" rather than as a bad number.
+    //   * blockItemDamage above 1 makes the blocking weapon take MORE than the
+    //     blow carried, so parrying is worse than being cut, which inverts the
+    //     mechanic. 0 is allowed on purpose — a world where blades never wear.
+    //   * the two nudges are radians of stroke angle at full power, applied
+    //     every parry. Past ~1 rad a single block spins the defender's guard
+    //     most of the way across its own azimuth stops, and a fast exchange
+    //     turns into the guard oscillating instead of guarding. 0 is allowed:
+    //     that is "blocking is free", a legitimate setting, not a broken one.
+    e.blockGapM = std::clamp(e.blockGapM, 0.0f, 0.5f);
+    e.blockItemDamage = std::clamp(e.blockItemDamage, 0.0f, 1.0f);
+    e.blockNudgeAz = std::clamp(e.blockNudgeAz, 0.0f, 1.0f);
+    e.blockNudgeEl = std::clamp(e.blockNudgeEl, 0.0f, 1.0f);
   }
 
   // ---- combat feel: hit-stop, hit flash, combat cues ------------------------
@@ -2604,6 +2629,10 @@ bool SaveCombatTuning(const std::string& path, const Tuning& t,
     put("bladeSmoothing", m.bladeSmoothing);
     put("wristMaxAngle", m.wristMaxAngle);
     put("edgeFloor", m.edgeFloor);
+    put("blockGapM", m.blockGapM);
+    put("blockItemDamage", m.blockItemDamage);
+    put("blockNudgeAz", m.blockNudgeAz);
+    put("blockNudgeEl", m.blockNudgeEl);
   }
   if (group("combatfx", lo, hi)) {
     const Tuning::CombatFx& f = t.combatfx;

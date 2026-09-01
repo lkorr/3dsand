@@ -260,8 +260,12 @@
     "swingAnticipate": 0.35,
     "swingExtend": 0.16,
     "bladeSmoothing": 0.055,
-    "wristMaxAngle": 1.5,
-    "edgeFloor": 0.35
+    "wristMaxAngle": 3.1,
+    "edgeFloor": 0.35,
+    "blockGapM": 0.22,
+    "blockItemDamage": 0.35,
+    "blockNudgeAz": 0.3,
+    "blockNudgeEl": 0.18
   },
   "combatfx": {
     "hitStop": true,

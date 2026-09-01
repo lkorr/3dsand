@@ -2679,6 +2679,103 @@ not walk through, then arrival *and residence* inside the band, no occupation of
 the target's space, and swings actually issued. Thresholds are in
 `tests/baseline.json`.
 
+### NPCs swinging, and blades meeting blades (2026-08-31; `game/strokes.*`, `assets/mobs/attack_styles.json`)
+
+The AI decides *when* and *where*; this is what turns that into a sword moving
+through the world. **There is no second melee implementation.** An NPC's swing
+runs through the same `MeleeState` the player's mouse drives, the same
+`Mob::ApplyWeaponArm`, and the same `MeleeSweepDamage`; the only difference is
+what feeds the deltas. `melee.h` was built for this — "the control law never
+sees a mouse, it consumes abstract control deltas" — and an attack style is the
+authored curve that fills them.
+
+**An attack style is DATA** (`assets/mobs/attack_styles.json`, hot-reloaded on
+R). A style is a stroke program in three segments: a **windup** — a pose,
+driven closed-loop and deliberately under `commitSpeed` so the driver stays in
+Guard — then a **cut**, a travel fast enough to commit, then a **recover** with
+no input while the follow-through unwinds. Angles are radians in the mob's own
+facing basis; reach is a position within the arm's own **reach band**
+(`MeleeState::ReachBand`), not a fraction of the arm, because the band is where
+the driver can actually put the point and the two are nothing like the same
+length. There is no `enum SwingKind` anywhere: a profile lists opaque style ids,
+`PickAttackStyle` draws one per attack, and a name the library has never heard
+of gets a loud skip rather than a crash. Shipped: `horizontal_r`,
+`horizontal_l`, `overhead`, `diagonal`, `thrust`.
+
+**The windup IS the telegraph.** There is no UI indicator by design: a style's
+windup is 10–14 ticks of visible blade raise, and `npc-strike` asserts its
+*length* precisely because an attack that resolved in two ticks would be
+unreadable and unavoidable.
+
+**The cut is centred on the aim, and the aim is taken once.** At the end of the
+windup the target's bearing about *this mob's own shoulder* is frozen and never
+refreshed, so a target that steps offline after the blade is moving is missed —
+that is what makes a telegraph mean something. The windup's own target is
+`aim − cut/2`, so the middle of the travel passes through the aim rather than
+the beginning; a stroke aimed at its own start point cuts the air behind the
+target every time.
+
+**Variation is deterministic.** Style pick, start bow and tempo are all
+`rng::Hash3(mobId ^ salt, tick, index)`, so ten swings differ and the fight
+replays.
+
+**Blocking is EMERGENT: a blade physically in the path stops the blow.** No
+block button, no block state, no defensive intent — an NPC's blade stops a cut
+when a windup stance happens to put it in the way, and the player's blade does
+the same by being where the player left it. A parry arrests the stroke (the
+remaining cut ticks are abandoned and the driver drops into Recover with no
+follow-through), charges the blocking weapon real item hp — items already carry
+hp and `severImpactSpeed`, so a sword wears down and a badly-timed catch is
+knocked out of the hand — nudges the defender's own stroke open by a bounded,
+hash-seeded amount, and reports a `BlockEvent` out of the sweep for the audio
+and FX to consume.
+
+Two things about it are load-bearing and were both learned the hard way:
+
+* **The parry is GEOMETRIC, not a ray cast.** `MeleeSweepDamage` finds bodies by
+  casting rays along the swinging blade's own axis, which is exactly right for a
+  torso and useless against another blade: a sword's collider is the item's own
+  art at the item's own scale, about a **quarter of a voxel** thick, and a
+  zero-radius ray through that is a coincidence rather than a test. Measured:
+  two edges passing within 0.28 voxels, seven sweeps, zero hits — and a ray
+  fired deliberately down the defender's own edge came back empty too. So
+  `MobSystem::FindParry` asks the question of the two **edge segments**, which
+  are the authoritative hitboxes anyway.
+* **Armour is not a parry.** The three-way classification is the rig's own: a
+  slot below `AppendedBase()` is flesh, one at or above it tagged `worn` is a
+  garment, and the one at `HeldSlot()` is a weapon. A shell is strapped to the
+  limb it covers and stopping a blow with it is what armour is *for*, so it
+  keeps taking the cut it always did.
+
+While fixing the sweep for this, one real defect surfaced in it: the damage
+probes **sampled** the blade instead of **tiling** it — `along + 1` rays of a
+fixed ~1 voxel from points 1.6 voxels apart, so 40% of the edge probed nothing.
+Invisible on a torso, fatal on a sword. Each ray now runs exactly to the next
+sample point plus the blade's own half-thickness.
+
+**The player is a target.** `PlayerAvatar` is a `Mob` but is not in
+`MobSystem`'s list, so the handle-keyed lookups could not find it and an NPC's
+sweep melted the player's limbs as debris instead of wounding them.
+`MobSystem::SetAvatar` registers it, and `FindLimb`/`FindOwner`/`Damage`/
+`CutLimb`/`CarveLimbRadial` consult it **after** the mob list — every existing
+caller that already checked the avatar first is bit-identical. Death is what it
+already was: the parts are handed to `DebrisSystem`, the corpse settles like any
+other debris, and `main.cpp` revives after `player.respawnDelay`.
+
+Four gates (`selftest_combat.cpp`, at the end of the mob group):
+`npc-strike` (the AI's own request becomes a windup, a cut and lost voxels; then
+three scripted strikes of one style all land); `npc-block` (a guard across the
+line arrests the stroke, takes the item hp, and leaves the defender's flesh a
+graze at most against the *total* loss `npc-strike` measures unblocked);
+`npc-styles` (every authored style sweeps the channel its own JSON claims —
+the gate that keeps the content honest as it grows, and it names no style);
+`duel` (two AI duelists, opposed factions, both engaging and both cutting).
+
+Open, and the owner's calls: NPCs do not yet *choose* to parry, so blocking is
+luck of the stance; and a committed sword cut through a torso severs it, so
+whoever lands first usually ends the fight — measured, the duel is decided in
+one exchange.
+
 - **Bleeding:** wound budgets, capped per tick, emitted as radius-1 brush ops;
   blood is a real material (organic tags → burns/reacts for free) with a
   subcritical dry-to-air decay so pools go back to sleep (rule #2).
@@ -2692,6 +2789,84 @@ the target's space, and swings actually issued. Thresholds are in
   as teleport-slicing and let camera orientation, rather than the carved
   geometry, decide what fell off. `SplitBody` survives for that plane-cut case
   but is no longer on the laser path.
+
+### Combat feel: hit-stop, hit flash, and the three melee cues (2026-08-31; `sim/tuning.h` `Tuning::CombatFx`, `audio/cues.*`, `assets/shaders/microbody.wgsl`)
+
+**Everything in this section is PRESENTATION, and the separation is
+load-bearing rather than tidy.** None of it changes what a blow does — the
+damage is §8's melee sweep and the wound model above — and all of it changes
+whether the blow *lands* for the person holding the sword. Three channels, kept
+apart because they fail apart: TIME (a dip after a landed cut), LIGHT (a struck
+limb flashes), SOUND (three slots). Every value is in `tuning.json` under
+`combatfx.*`, hot-reloads on F5, and has a row in the in-game **Combat…** panel
+and in `tuner_schema.js`.
+
+**Hit-stop is not a sim change, and it must not be read as one.** The engine
+runs a fixed 30 Hz tick off a frame-loop accumulator that already runs 0..4
+ticks per frame depending on frame time. A dip scales the RATE that accumulator
+fills at, so for a fifteenth of a second the world advances fewer ticks. No tick
+computes anything different, nothing hashed moves, and the headless paths never
+execute that loop at all — `--selftest`, `--shot` and both autofly harnesses are
+structurally exempt, which is why no gate had to be taught about it.
+
+**THREE TIERS, STRICTLY ORDERED, because the dip is peak-held:** a SEVER (a limb
+came off) beats FLESH (a live creature voiced being hurt) beats CHIP (debris, a
+dropped item, a weapon caught on a weapon). The peak-hold is `min` on the scale
+and `max` on the duration — they are two spellings of "how much stop" that run
+opposite ways, and combining them with one operator is how a sever ends up
+stopping hard for a chip's 55 ms.
+
+**The tier is read off the event queues, not carried on a return value.** The
+melee sweep already fills `SeverEvents` and `VoiceEvents` as a side effect, both
+frame-drained, so differencing their sizes across the call says exactly what
+this blow added without widening `EdgeSweepResult` — which is the shared surface
+two phases were writing at the time. Known and accepted: hurt voices
+de-duplicate per mob per drain window, so a second cut into the same creature in
+the same 16 ms reads as a chip.
+
+**A PARRY IS THE FOURTH PRODUCER AND IT IS NOT ONE OF THOSE TIERS.** An arrested
+sweep returns before any probe runs, so `bodiesHit` is 0 and the tiering above
+never fires; the clang and the chip-tier dip for a blocked blow come off the
+`BlockEvent` queue instead, at the drain below the AI readout, which is the only
+place that knows a block from a chip. One blow, one cue, whichever way it ended.
+That drain sits below the audio drain, so a parry's clang voices at the top of
+the next frame — the same one-frame latency the hit-stop has from *every*
+producer, so the two halves of a blocked blow stay together.
+
+**The flash on a blocking weapon is not wired separately, on purpose.** The
+sweep already charges a parry to the blocking item's own rig slot, and
+`Mob::Damage` sets the flash for every cause with a two-tier split that an
+`item`-tagged limb resolves to the chip flash. Flashing again from the block
+drain would be a second writer of one fact. The ATTACKER's blade does not flash:
+it takes no damage from being stopped and the event carries no handle for it.
+
+**The flash rides a word the render path already had.** `MobLimb::hitFlash` is
+packed into a reused padding word of `MicroBodyInstGpu` and read at
+`@location(7)` in `microbody.wgsl`, added to the material's own emission — no
+new buffer, no new binding, and 0 stays 0 so an unstruck limb is bit-identical
+to before. It decays on the TICK, inside `MobSystem::PreTick`, not on the frame
+clock: a frame-driven decay is never called by the selftest, so a flash raised
+in a headless gate would stay lit forever and the probe two subtests later would
+compare a different image. Ageing on the tick also means the flash slows down
+with the world under hit-stop, which is what you want, since the two effects
+describe the same blow.
+
+**Cues are latched, never played where they are raised.** Audio drains once per
+frame and the tick loop above it may have run four times or none, so each cue is
+a one-shot request with PEAK-HOLD ON POWER — a frame in which the blade crossed
+a body on three consecutive ticks is one blow to the ear, and it should be the
+hardest of the three rather than three overlapping copies of nearly the same
+sample. The position travels with the request because a killing blow can despawn
+its victim before the frame drains. The three slots (`melee whoosh`, `melee
+flesh`, `melee clang`) are declared in BOTH `assets/sound_schema.js` and
+`Cues::kSlotPrefix`, which is the standing invariant for sound slots; the
+`combat-cues` gate asserts they resolve to real sets and that
+`Cues::Stats::combat` counts REQUESTS before the device is consulted, which is
+the only half a silent headless run has.
+
+**Whoosh fires on the EDGE into Slash, not while Slash is held** — committing is
+a moment, and a per-tick test plays the sample five times over one cut. The edge
+is remembered across frames so it survives a frame that ran no ticks at all.
 
 ### Animation pipeline (2026-08-20; `game/anim`, docs/PLAN_voxel_editor.md §B)
 

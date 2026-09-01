@@ -432,6 +432,28 @@ void AnimClampPoseLimits(const AnimSkeleton& sk, AnimState& st,
                          const PoseAxisOverride* overrides = nullptr,
                          int overrideCount = 0);
 
+// THE SIGNED ANGLE OF `q` ABOUT `axis`, WRAPPED INTO (-pi, pi]. False when
+// there is no recoverable angle (q is a half turn about something
+// perpendicular to `axis`).
+//
+// PUBLIC BECAUSE TWO PLACES MUST AGREE ABOUT IT, which is the "two places that
+// must agree" rule in CLAUDE.md with a bug attached. The hinge clamp reads a
+// joint's bend with it; `Mob::ApplyWeaponArm` reads the SAME bend to decide
+// which sense of the steered hinge axis makes the authored [min, max] describe
+// it. Those were two copies of the arithmetic and they differed in exactly one
+// respect: this one wraps and the other did not.
+//
+// A quaternion in the far hemisphere (`w < 0`) makes `2 * atan2(...)` come out
+// above pi, so the un-wrapped copy read a bend of +4.89 rad as POSITIVE and
+// kept the axis, while the clamp wrapped the same rotation to -1.39 rad, found
+// it below the elbow's authored `min` of 0, and clamped it straight — throwing
+// the forearm 1.39 rad off the solve on exactly the ticks a committed
+// horizontal cut passed through. Measured in `swing-plane` A: the DRIVER'S arc
+// was planar to 1.09 voxels while the posed sword was 10.58 voxels off it and
+// 1.52 rad out of level, which reads as "the swing wanders" and is really one
+// missing wrap.
+bool AnimHingeAngleAbout(const Quat& q, const Vec3& axis, float* out);
+
 // Holden spring integration for one part's local rotation offset.
 void AnimSpringStep(const SpringDef& def, SpringState& s, Vec3 goal, float dt);
 

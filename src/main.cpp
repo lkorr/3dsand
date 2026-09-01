@@ -2516,6 +2516,10 @@ int main(int argc, char** argv) {
           std::string blog;
           ai::LoadBehaviors(ad + "/mobs/behaviors.json", beh, blog);
           stMobs.SetBehaviors(std::move(beh));
+          StyleLibrary sty;
+          LoadAttackStyles(ad + "/mobs/attack_styles.json", sty, blog);
+          stMobs.SetAttackStyles(std::move(sty));
+          stMobs.SetItems(&stItems);
         }
         Stream stStream;
         stStream.Init(&stCtx, &stWorld, &stSim, kDefaultSeed);
@@ -2766,8 +2770,18 @@ int main(int argc, char** argv) {
     std::string blog;
     if (ai::LoadBehaviors(assetDir + "/mobs/behaviors.json", beh, blog))
       std::printf("loaded %zu behaviour profiles\n", beh.profiles.size());
+    // ...and the authored ATTACK STYLES they swing with (game/strokes.h). Same
+    // contract: a missing file is content, not an error — the AI still issues
+    // attack requests and the log says why nothing swings.
+    StyleLibrary sty;
+    if (LoadAttackStyles(assetDir + "/mobs/attack_styles.json", sty, blog))
+      std::printf("loaded %zu attack styles\n", sty.styles.size());
     if (!blog.empty()) std::fprintf(stderr, "%s", blog.c_str());
     mobs.SetBehaviors(std::move(beh));
+    mobs.SetAttackStyles(std::move(sty));
+    // The item library, so an NPC's sweep can read the damage and HEFT of
+    // whatever is in its fist. By pointer, because items reload on R.
+    mobs.SetItems(&items);
   }
   Stream stream;
   stream.Init(&ctx, &world, &sim, kDefaultSeed);
@@ -3018,6 +3032,13 @@ int main(int argc, char** argv) {
   PlayerAvatar avatar;
   avatar.Init(&phys, &world, &debris, mats, &mobs);
   avatar.SetDefs(&mobs.Defs(), avatarDefName);
+  // THE PLAYER IS A TARGET. The avatar is a Mob but it is not in MobSystem's
+  // list, so the handle-keyed lookups could not find it and an NPC's sweep
+  // melted the player's limbs as debris instead of wounding them
+  // (MobSystem::SetAvatar has the whole argument). Registered ONCE here, for
+  // the whole session: it is a pointer to a member of this frame, and
+  // Despawn/Revive rebuild the rig behind it without moving the object.
+  mobs.SetAvatar(&avatar);
   ThirdPersonRig tpRig;
   CameraMode camMode = CameraMode::First;
   float avatarHeading = 0.0f;   // body facing, radians about +Y
@@ -3317,21 +3338,20 @@ int main(int argc, char** argv) {
   // times over one cut. Remembered across frames, so the edge survives a frame
   // that ran no ticks at all.
   SwingPhase meleePhasePrev = SwingPhase::Idle;
-  // ---- THE BLOCK HOOK, for phase C's BlockEvent ----------------------------
+  // ---- THE BLOCK HOOK (game/melee.h BlockEvent) ----------------------------
   //
   // `clang` is "a cut stopped by something that is not flesh". Two things
-  // produce that, and only the first exists today:
+  // produce that, and BOTH exist now:
   //
   //   1. THE SWEEP hitting a non-flesh body — debris, a dropped item, a
   //      weapon held in someone else's fist. Wired above, at the sweep.
-  //   2. A DELIBERATE BLOCK — an NPC raising a guard and the blade stopping on
-  //      it. That is phase C's BlockEvent, which is being written in another
-  //      worktree as this lands.
+  //   2. A DELIBERATE BLOCK — a guard raised and the blade stopping on it.
+  //      That is the BlockEvent queue, drained below the AI readout, which is
+  //      this lambda's only caller.
   //
-  // Named and defined here so the merge is one call site rather than a design
-  // decision: whoever drains BlockEvents calls `CombatBlockCue(at, power)` in
-  // the same frame-level block the sever drain lives in, and everything below
-  // it — the latch, the peak-hold, the volume law, the slot — is already done.
+  // A lambda rather than inline code at the drain because the two producers
+  // must agree on the latch, the peak-hold, the volume law and the slot, and
+  // a second copy of any of those is a second thing to keep in step.
   // Deliberately takes the two things a block has and nothing else; it must
   // not need a Mob, because a parry between two NPCs has no player in it.
   auto CombatBlockCue = [&](const Vec3& at, float power) {
@@ -3347,11 +3367,20 @@ int main(int argc, char** argv) {
     // came off.
     const Tuning::CombatFx& fx = CurrentTuning().combatfx;
     hitStop.Request(fx.hitStopChipScale, fx.hitStopChipMs);
+    //
+    // THE FLASH ON THE BLOCKING WEAPON IS NOT HERE, and that is not an
+    // omission. MeleeSweepDamage already charges the parry to the blocking
+    // item's own slot (`mobs.Damage(blockBody, ...)` in melee.cpp), and
+    // Mob::Damage sets the hit flash for every cause with the two-tier split
+    // an `item`-tagged limb resolves to `combatfx.flashChip` — the chip tier,
+    // which is exactly what a parry is. Flashing again from here would be a
+    // second writer of one fact, and it would double nothing but the risk of
+    // the two drifting.
+    //
+    // The ATTACKER's blade does not flash: it takes no damage from being
+    // stopped, and BlockEvent carries no handle for it. A feel item, not a
+    // bug — see the merge report's checklist.
   };
-  // Nothing calls it until phase C's BlockEvent lands. Referenced here so the
-  // build does not warn it unused, and so the fact that it is a PENDING SEAM
-  // is visible in the code rather than only in a merge note.
-  (void)CombatBlockCue;
   float fpsSmooth = 0, frameMsSmooth = 0, tickMsSmooth = 0, frameMsWorst = 0;
   float frameMsP95 = 0, frameMsP99 = 0;
   double fpsWinStart = lastTime, fpsWinWorst = 0;
@@ -4165,6 +4194,13 @@ int main(int argc, char** argv) {
           ai::LoadBehaviors(assetDir + "/mobs/behaviors.json", beh, blog);
           if (!blog.empty()) std::fprintf(stderr, "%s", blog.c_str());
           mobs.SetBehaviors(std::move(beh));
+          // Attack styles reload with them, for the same reason: retuning a
+          // windup and hitting R must be visible on the duelists already
+          // fighting you.
+          StyleLibrary sty;
+          LoadAttackStyles(assetDir + "/mobs/attack_styles.json", sty, blog);
+          if (!blog.empty()) std::fprintf(stderr, "%s", blog.c_str());
+          mobs.SetAttackStyles(std::move(sty));
           ui.aiProfileNames.clear();
           for (const ai::Profile& p : mobs.Behaviors().profiles)
             ui.aiProfileNames.push_back(p.name);
@@ -5406,10 +5442,23 @@ int main(int argc, char** argv) {
             // inside 16 ms. The alternative is a per-call "did I hurt live
             // flesh" flag threaded out of the sweep, which is the shared
             // surface this is avoiding.
+            //
+            // A PARRY IS NOT ONE OF THESE TIERS, and deliberately so: an
+            // arrested sweep returns before any probe runs, so `bodiesHit` is
+            // 0 and none of this fires. The clang and the dip for a blocked
+            // blow come off the BlockEvent queue instead (the drain below the
+            // AI readout), which is the only place that knows a block from a
+            // chip. One blow, one cue, whichever way it ended.
             const size_t sev0 = mobs.SeverEvents().size();
             const size_t voi0 = mobs.VoiceEvents().size();
             const EdgeSweepResult res = MeleeSweepDamage(
                 sw, melee.tuning, avatar, phys, mobs, debris, world, spawns);
+            // PARRIED BY AN NPC'S BLADE. The sweep reports; ending the stroke
+            // is the caller's job, because MeleeSweepDamage has no business
+            // reaching into whichever driver happens to own this swing
+            // (melee.h EdgeSweepResult). The player's cut stops here: no
+            // follow-through, no second bite past the blade that stopped it.
+            if (res.arrested) melee.Arrest();
             if (res.bodiesHit > 0) {
               const bool severed = mobs.SeverEvents().size() > sev0;
               const bool flesh = mobs.VoiceEvents().size() > voi0;
@@ -6016,6 +6065,56 @@ int main(int argc, char** argv) {
         ui.aiAttackCount++;
       }
       mobs.ClearAttackRequests();
+      // ---- BLADE ON BLADE (game/melee.h BlockEvent) -----------------------
+      //
+      // Drained here for the same reason the attack requests above are: they
+      // accumulate across the frame's 0..4 sub-ticks, and a per-frame read of a
+      // per-tick event otherwise drops three of every four.
+      //
+      // THE CUE AND THE DIP, wired here (phase D's `CombatBlockCue`, defined up
+      // with the hit-stop latch). `ev.at`/`ev.power` are on the event for
+      // exactly this, and the lambda owns the latch, the peak-hold and the
+      // `melee clang` slot, so this is one call rather than a policy.
+      //
+      // ONE FRAME LATE, KNOWINGLY. This drain sits below the audio drain, so a
+      // clang raised here voices at the top of the next frame (~16 ms). That
+      // is the same latency the hit-stop already has from EVERY producer — the
+      // stop latch is drained above the tick loop, so the sweep's own requests
+      // are next-frame too — so the two halves of a blocked blow stay together,
+      // which is what matters. Hoisting the drain above the audio block would
+      // make the sound early relative to its own dip, not less late.
+      //
+      // STILL MISSING: the spark burst. It wants `ev.at` and a particle spawn
+      // list this block does not have.
+      for (const BlockEvent& ev : mobs.BlockEvents()) {
+        char line[160];
+        std::snprintf(line, sizeof line,
+                      "#%llu blocked by #%llu at (%.0f,%.0f,%.0f) power %.2f",
+                      (unsigned long long)ev.attackerId,
+                      (unsigned long long)ev.blockerId, ev.at.x, ev.at.y,
+                      ev.at.z, ev.power);
+        ui.aiLastBlock = line;
+        ui.aiBlockCount++;
+        // Every parry rings and every parry stops time a little, whoever threw
+        // it and whoever caught it — a fight between two NPCs across the yard
+        // is as audible as one in your face, at the volume the distance gives
+        // it (audio::Cues::Combat spatializes on `ev.at`).
+        CombatBlockCue(ev.at, ev.power);
+        // THE PLAYER'S OWN GUARD IS BEATEN OPEN HERE and not in MobSystem,
+        // because this MeleeState is main.cpp's: MobSystem::PushBlockEvent
+        // nudges its own mobs and deliberately leaves the avatar to its owner.
+        // Same counter-based draw, so both sides of an exchange shove the same
+        // way (CLAUDE.md rule 1).
+        if (avatar.Spawned() && ev.blockerId == avatar.Id()) {
+          const uint32_t h = rng::Hash3((uint32_t)ev.blockerId ^ 0xB10Cu,
+                                        (uint32_t)ev.attackerId, 0);
+          melee.Nudge((h & 1u ? 1.0f : -1.0f) * melee.tuning.blockNudgeAz *
+                          ev.power,
+                      (h & 2u ? 1.0f : -1.0f) * melee.tuning.blockNudgeEl *
+                          ev.power);
+        }
+      }
+      mobs.ClearBlockEvents();
       // Ledge-grab readout: the probe result plus every latch gate, so "why
       // didn't it grab" is readable in the panel rather than inferred. The
       // gates mirror the latch condition in Player::Update exactly.

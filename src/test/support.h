@@ -196,4 +196,29 @@ std::vector<BrushOp> SelftestOps(uint32_t tick, uint32_t seed);
 std::vector<ExplosionOp> SelftestExps(uint32_t tick, uint32_t seed);
 bool SelftestParticlesActive(uint32_t tick);
 
+// ---- LEAVE THE SUITE'S RANDOMNESS AS YOU FOUND IT --------------------------
+//
+// A mob id is not just a handle: it seeds the entity-scoped gore variance
+// (Mob::MakeGoreProfile), the blast crater's noise and the per-limb RNG key the
+// burn/dissolve pass draws against. Gates share ONE MobSystem, so a gate that
+// merely SPAWNS creatures re-rolls every id-keyed draw in every gate after it.
+//
+// Measured (selftest.cpp's kOrder note): inserting four spawning gates ahead of
+// `armor-react` made its acid bath dissolve 0 skin voxels in 120 ticks where it
+// had dissolved 18, and nothing about acid had changed. Restoring the counter is
+// the honest fix; MobSystem::Reset(rewindIds=true) is not — setting it to 1 is a
+// DIFFERENT perturbation rather than the absence of one, and mob.cpp records a
+// gate that moved when somebody tried exactly that.
+//
+// Lives here rather than in one gate's .cpp because five gates across three
+// files now need it and a copy per file is five things to keep true.
+struct IdCounterScope {
+  MobSystem& sys;
+  uint64_t saved;
+  explicit IdCounterScope(MobSystem& s) : sys(s), saved(s.NextIdCounter()) {}
+  ~IdCounterScope() { sys.SetNextIdCounter(saved); }
+  IdCounterScope(const IdCounterScope&) = delete;
+  IdCounterScope& operator=(const IdCounterScope&) = delete;
+};
+
 }  // namespace sandvox

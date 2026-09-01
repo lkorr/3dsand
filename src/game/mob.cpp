@@ -1261,6 +1261,7 @@ void MobSystem::Reset(bool rewindIds) {
   // a Reset simply drops them (game/mob.h AttackRequests).
   attacks_.clear();
   actors_.clear();
+  blocks_.clear();
   // THE ID COUNTER IS DELIBERATELY NOT REWOUND BY DEFAULT.
   //
   // A mob id is not just a handle: it seeds the entity-scoped gore variance
@@ -1865,6 +1866,419 @@ bool AiLineOfSight(void* ctx, Vec3 from, Vec3 to) {
 }
 
 }  // namespace
+
+// ============================================================================
+// EXECUTING AN ATTACK — the AI asked, this swings (game/strokes.h)
+// ============================================================================
+//
+// WHERE THIS SITS, and why it is not a second melee implementation.
+//
+// `ai_behavior.cpp` decides WHEN and WHERE and emits an AttackRequest; it never
+// poses anything. `melee.cpp` owns the control law and the damage formula; it
+// has never known what a mob is. This is the join: it reads a request, replays
+// an authored stroke program through the SAME MeleeState the player's mouse
+// drives, pushes the resulting WeaponPose at the SAME Mob::ApplyWeaponArm the
+// avatar uses, and sweeps damage through the SAME MeleeSweepDamage.
+//
+// There is deliberately no NPC copy of any of those. An NPC swing that felt
+// different from the player's would mean two feels to tune and two damage
+// curves to keep in step, and melee.h's whole input surface exists to make one
+// serve both.
+//
+// THE ORDER WITHIN A TICK, which matters:
+//
+//   1. SWEEP FIRST, off the blade's own previous and current WORLD edge. Both
+//      are reads of Mob::WeaponEdge, which reports the kinematic body as Jolt
+//      left it — so consecutive reads are the true per-tick motion of the
+//      hitbox, exactly as main.cpp's player sweep is. Doing this BEFORE the new
+//      pose is set is what keeps prev/now one tick apart rather than zero.
+//   2. THEN advance the stroke and push the pose, so PreTick's UpdateAnimation
+//      (a few lines below) flattens and submits it this same tick. A pose
+//      pushed after the submit would be a tick late and the blade would trail
+//      the swing.
+//
+// A WINDUP IS A TELEGRAPH AND NOTHING ELSE. It is driven CLOSED-LOOP and slowly
+// — under `MeleeTuning::commitSpeed`, so the driver stays in Guard — which is
+// what makes it a visible blade raise the player can read and step away from.
+// The cut is the only part that damages anything.
+void MobSystem::BeginStroke(Mob& mob, const ai::AttackRequest& req,
+                            uint32_t tick) {
+  NpcStroke& st = mob.stroke_;
+  // A creature with nothing in its fist has nothing to swing. The request is
+  // dropped rather than queued: the AI's attack clock has already advanced
+  // (ai_behavior.cpp says why), so an unarmed mob simply misses its turn
+  // instead of banking swings to fire the moment somebody hands it a sword.
+  if (mob.HeldSlot() < 0) return;
+  const ai::Profile* pr = behaviors_.At(mob.ai_.profile);
+  if (pr == nullptr) return;
+  // The profile's authored list; `style` is the single-entry spelling of the
+  // same thing (ai_behavior.cpp's loader folds one into the other), so a
+  // profile written before styles were plural still works.
+  const int si = PickAttackStyle(styles_, pr->attack.styles, mob.id_, tick);
+  if (si < 0) {
+    // LOUD, ONCE PER ATTEMPT, and not a crash: a profile naming a style the
+    // library does not have is a content error whose only other symptom is a
+    // creature that requests attacks forever and never swings.
+    std::printf(
+        "mob: \"%s\" asked for attack style \"%s\" and no such style is "
+        "loaded — not swinging\n",
+        pr->name.c_str(),
+        pr->attack.styles.empty() ? "" : pr->attack.styles[0].c_str());
+    return;
+  }
+  const AttackStyle& sty = *styles_.At(si);
+  st = NpcStroke{};
+  st.style = si;
+  st.targetId = req.targetId;
+  st.targetPoint = req.targetPoint;
+  // ONE SEED PER SWING, mixing who and when. Every draw below indexes off it,
+  // so the whole stroke — its style, its start bow, its tempo — replays from
+  // the same (mob, tick) and nothing reads a clock.
+  st.seed = rng::Hash3((uint32_t)mob.id_, tick, 0x5747u);
+  const float tempo =
+      1.0f + sty.jitter.tempo * rng::SignedUnit(rng::Hash3(st.seed, 1, 0));
+  st.windupTicks = std::max(2, (int)std::lround(sty.windup.ticks * tempo));
+  st.cutTicks = std::max(2, (int)std::lround(sty.cut.ticks * tempo));
+  st.recoverTicks = std::max(1, sty.recoverTicks);
+  st.phase = NpcStroke::Phase::Windup;
+  st.phaseTick = 0;
+  st.melee.Reset();
+  st.melee.SetHandSign(mob.HandSign());
+  // THE NPC'S BLADE OBEYS THE SAME SLIDERS AS THE PLAYER'S. Applied at every
+  // stroke start rather than held once, because tuning.json hot-reloads on F5
+  // and a MeleeTuning is a COPY (see selftest_combat.cpp's header): without
+  // this the whole `melee.*` group -- the arc, the wrist, the damage ramp, the
+  // parry gap -- would reach main.cpp's MeleeState and stop there, and every
+  // knob would silently mean 'the player only'. A stroke already in flight
+  // keeps the numbers it started with, which is under a second and is the
+  // right answer anyway: retuning mid-swing is not a thing a swing should
+  // notice.
+  ApplyMeleeTuning(st.melee.tuning);
+}
+
+bool MobSystem::ForceAttack(uint64_t mobId, const std::string& style,
+                            Vec3 targetPoint, uint32_t tick) {
+  Mob* m = FindMobById(mobId);
+  if (m == nullptr || m->HeldSlot() < 0) return false;
+  const int si = styles_.Find(style);
+  if (si < 0) return false;
+  if (m->stroke_.Active() && m->stroke_.phase != NpcStroke::Phase::Guard)
+    return false;
+  const AttackStyle& sty = *styles_.At(si);
+  NpcStroke& st = m->stroke_;
+  st = NpcStroke{};
+  st.style = si;
+  st.targetPoint = targetPoint;
+  st.seed = rng::Hash3((uint32_t)mobId, tick, 0x5747u);
+  const float tempo =
+      1.0f + sty.jitter.tempo * rng::SignedUnit(rng::Hash3(st.seed, 1, 0));
+  st.windupTicks = std::max(2, (int)std::lround(sty.windup.ticks * tempo));
+  st.cutTicks = std::max(2, (int)std::lround(sty.cut.ticks * tempo));
+  st.recoverTicks = std::max(1, sty.recoverTicks);
+  st.phase = NpcStroke::Phase::Windup;
+  st.melee.Reset();
+  st.melee.SetHandSign(m->HandSign());
+  ApplyMeleeTuning(st.melee.tuning);   // BeginStroke says why
+  return true;
+}
+
+bool MobSystem::SetGuard(uint64_t mobId, float az, float el, float reachFrac) {
+  Mob* m = FindMobById(mobId);
+  if (m == nullptr || m->HeldSlot() < 0) return false;
+  NpcStroke& st = m->stroke_;
+  // A guard REPLACES an idle arm or another guard, never a live swing: a
+  // creature mid-cut has already committed and the whole point of committing
+  // is that nothing takes it back.
+  if (st.Active() && st.phase != NpcStroke::Phase::Guard) return false;
+  if (st.phase != NpcStroke::Phase::Guard) {
+    st.Reset();
+    st.melee.Reset();
+    st.melee.SetHandSign(m->HandSign());
+    ApplyMeleeTuning(st.melee.tuning);   // BeginStroke says why
+    st.phase = NpcStroke::Phase::Guard;
+  }
+  st.wantAz = az;
+  st.wantEl = el;
+  st.wantReach = reachFrac;   // a FRACTION here; resolved against the live arm
+  return true;
+}
+
+void MobSystem::ClearGuard(uint64_t mobId) {
+  Mob* m = FindMobById(mobId);
+  if (m == nullptr) return;
+  if (m->stroke_.phase != NpcStroke::Phase::Guard) return;
+  m->stroke_.phase = NpcStroke::Phase::Recover;
+  m->stroke_.phaseTick = 0;
+  m->stroke_.recoverTicks = 8;
+}
+
+// WHERE AN ARM SITS WHEN IT IS NEITHER CHAMBERED NOR EXTENDED, as a position
+// WITHIN THE REACH BAND (MeleeState::ReachBand) rather than as a fraction of
+// the arm. Every authored `reach` in a style is an offset from this, so a style
+// that says nothing about reach holds a normal guard and a thrust's -0.45/+0.85
+// pair reads as "chamber a little, then drive to full extension" on any rig.
+//
+// THE BAND AND THE ARM ARE NOT THE SAME LENGTH, which is the whole reason this
+// is stated here. The point rides a blade's length off a hand that is itself
+// most of an arm out, so the two lengths largely cancel: measured on the human
+// rig the arm is ~7 voxels and the band the driver can serve is [3.8, 6.5].
+// Authored against the ARM, every chamber and lunge in the library landed
+// outside that and was clamped — the commanded radius moved 0.15 voxels on a
+// stroke asking for four, and a thrust read as a twitch.
+//
+// A little past the middle, because a guard is held forward of centre.
+constexpr float kNeutralReach = 0.60f;
+
+// An authored reach offset -> a radius the arm can actually serve.
+static float ReachIn(const MeleeState& m, float offset) {
+  float lo = 0, hi = 0;
+  m.ReachBand(lo, hi);
+  const float span = hi > lo ? hi - lo : 0.0f;
+  return std::clamp(lo + (kNeutralReach + offset) * span, lo, hi);
+}
+
+// The mob's own frame, which is the BASIS the stroke is expressed in (melee.h
+// Update: "the camera for a player, the body's own facing for an NPC"). Right
+// is up x fwd, so at heading 0 — facing +Z — right is +X and every printed
+// number reads the way the camera's would.
+static void MobBasis(const Mob& mob, Vec3& right, Vec3& up, Vec3& fwd) {
+  up = Vec3{0, 1, 0};
+  fwd = mob.Facing();
+  if (fwd.len() < 1e-4f) fwd = Vec3{0, 0, 1};
+  fwd = Vec3{fwd.x, 0, fwd.z};
+  fwd = fwd.len() > 1e-4f ? fwd.normalized() : Vec3{0, 0, 1};
+  right = up.cross(fwd);
+  right = right.len() > 1e-4f ? right.normalized() : Vec3{1, 0, 0};
+}
+
+void MobSystem::StepStroke(Mob& mob, uint32_t tick, World& world,
+                           std::vector<ParticleSpawn>& spawns) {
+  NpcStroke& st = mob.stroke_;
+  if (!st.Active()) return;
+  const AttackStyle* sty = styles_.At(st.style);
+  // A GUARD HAS NO STYLE, and that is not a missing one. `SetGuard` is a pose,
+  // not an attack (game/strokes.h Phase::Guard), so it leaves `style` at -1 —
+  // and requiring a style here meant every guard was torn down on the very tick
+  // it was taken, silently, with the arm handed straight back to the walk
+  // cycle. The symptom was a defender standing with its sword exactly where the
+  // animation had left it while the gate reported that its guard was set.
+  const bool guarding = st.phase == NpcStroke::Phase::Guard;
+  if ((sty == nullptr && !guarding) || mob.HeldSlot() < 0 || !mob.alive_) {
+    // The sword was cut out of the hand, the creature died, or the style
+    // library reloaded out from under a live swing. Drop the pose claim rather
+    // than freezing the arm mid-cut.
+    st.Reset();
+    mob.SetWeaponPose(WeaponPose{});
+    return;
+  }
+
+  Vec3 right, up, fwd;
+  MobBasis(mob, right, up, fwd);
+
+  // ---- 1. THE SWEEP, from the blade's own two most recent world positions --
+  Vec3 base, tip, flat;
+  float halfWidth = 0;
+  const bool haveEdge = mob.WeaponEdge(base, tip, halfWidth, &flat);
+  if (haveEdge && st.edgeValid && st.Cutting() && phys_ != nullptr &&
+      debris_ != nullptr) {
+    // THE ITEM, BY NAME. Mob keeps `heldItem_` as a string precisely because
+    // library indices are file-order and every R reload renumbers them
+    // (item.h's index hazard), so the resolve happens here, per swing.
+    const ItemDef* item =
+        items_ != nullptr ? items_->At(items_->Find(mob.HeldItem())) : nullptr;
+    EdgeSweep sw;
+    sw.aPrev = st.edgeBase;
+    sw.bPrev = st.edgeTip;
+    sw.aNow = base;
+    sw.bNow = tip;
+    sw.flatNow = flat;
+    sw.dt = 1.0f / 30.0f;
+    sw.halfWidth = halfWidth;
+    sw.damage = item ? item->damage : 12.0f;
+    sw.carveBonus = item ? item->carveBonus : 0.0f;
+    if (item) {
+      const auto& g = CurrentTuning().gore;
+      sw.heft = item->HeftFactor(g.woundHeftRef, g.woundHeftMax);
+    }
+    sw.tick = tick;
+    sw.valid = true;
+    const EdgeSweepResult res =
+        MeleeSweepDamage(sw, st.melee.tuning, mob, *phys_, *this, *debris_,
+                         world, spawns);
+    st.sweeps++;
+    st.bodiesHit += res.bodiesHit;
+    st.topTipSpeed = std::max(st.topTipSpeed, res.tipSpeed);
+    if (res.arrested) {
+      // PARRIED. The cut is over: the remaining cut ticks are abandoned and
+      // the stroke drops into its recover, which is what makes a block read as
+      // the blow being checked rather than as the animation finishing anyway.
+      st.arrested = true;
+      st.melee.Arrest();
+      st.phase = NpcStroke::Phase::Recover;
+      st.phaseTick = 0;
+    }
+  }
+  if (haveEdge) {
+    st.edgeBase = base;
+    st.edgeTip = tip;
+    st.edgeValid = true;
+  } else {
+    st.edgeValid = false;
+  }
+
+  // ---- 2. WHERE THE BLADE IS NOW, so the driver steers from the truth ------
+  Vec3 hand, tipPose, flatPose;
+  float reach = 0;
+  if (mob.WeaponStrokePose(hand, tipPose, flatPose, reach))
+    st.melee.SetStroke(hand, tipPose, flatPose, reach);
+  else
+    st.melee.ClearArm();
+  const float armReach = reach > 1e-3f ? reach : MetresToCells(0.60f);
+
+  // ---- 3. THE AIM: the target's bearing about THIS mob's shoulder ----------
+  //
+  // Taken in the mob's own basis so it is the same coordinate the stroke is
+  // integrated in, and about the SHOULDER rather than the mob's origin — an
+  // offset centre smears azimuth into elevation exactly as it does in the
+  // swing-plane gate, and this is the number a cut is aimed with.
+  Vec3 shoulder{};
+  bool haveShoulder = false;
+  if (mob.heldPartIndex_ >= 0 &&
+      mob.heldPartIndex_ < (int)mob.skel_.parts.size()) {
+    const int handPart = mob.skel_.parts[mob.heldPartIndex_].parent;
+    // Two joints up from the item: hand -> forearm -> upper arm, whose joint
+    // IS the shoulder.
+    int p = handPart;
+    for (int k = 0; k < 2 && p >= 0; k++) p = mob.skel_.parts[p].parent;
+    if (p >= 0) haveShoulder = mob.PartJointWorld(p, shoulder);
+  }
+  if (!haveShoulder) {
+    const Vec3 ws = mob.def_->worldSize;
+    shoulder = mob.origin_ + Vec3{ws.x * 0.5f, ws.y * 0.82f, ws.z * 0.5f};
+  }
+  const Vec3 toTarget = st.targetPoint - shoulder;
+  const Vec3 local{toTarget.dot(right), toTarget.dot(up), toTarget.dot(fwd)};
+  const float lr = std::max(local.len(), 1e-4f);
+  const float liveAz = std::atan2(local.x, local.z);
+  const float liveEl = std::asin(std::clamp(local.y / lr, -1.0f, 1.0f));
+
+  // ---- 4. drive the phase --------------------------------------------------
+  // The start bow: a deterministic wobble on where the windup lands, so ten
+  // swings do not look stamped. Zero for a guard, which has no style behind it.
+  const float bowAz =
+      sty ? sty->jitter.az * rng::SignedUnit(rng::Hash3(st.seed, 2, 0)) : 0.0f;
+  const float bowEl =
+      sty ? sty->jitter.el * rng::SignedUnit(rng::Hash3(st.seed, 3, 0)) : 0.0f;
+  StrokeSample smp;
+  smp.held = true;
+  // THE CLOSED-LOOP, UNDER-COMMIT DRIVE, shared by Guard and Windup because
+  // they are the same motion: steer the stored stroke toward a stated pose
+  // slowly enough that `commitSpeed` never fires. 16 units/tick is 480 px/s
+  // against a 900 px/s threshold, so the driver stays in Guard however far it
+  // has to travel — which is what makes a windup a readable telegraph rather
+  // than an instant snap.
+  auto steerTo = [&](float wantAz, float wantEl, float wantR) {
+    const MeleeTuning& t = st.melee.tuning;
+    smp.dx = std::clamp((wantAz - st.melee.StrokeAz()) / t.aimGainX, -16.0f,
+                        16.0f);
+    smp.dy = std::clamp(-(wantEl - st.melee.StrokeEl()) / t.aimGainY, -16.0f,
+                        16.0f);
+    smp.dReach = std::clamp(
+        (wantR - st.melee.StrokeRadius()) / std::max(t.reachGain, 1e-4f),
+        -18.0f, 18.0f);
+    st.melee.Step(smp, 1.0f / 30.0f, true, right, up, fwd);
+  };
+
+  switch (st.phase) {
+    case NpcStroke::Phase::Guard: {
+      // ABSOLUTE, not aim-relative: a guard is a pose, not a blow. `wantReach`
+      // is a FRACTION here (MobSystem::SetGuard) and is resolved against the
+      // live arm, so the same guard is the same guard on any rig.
+      // `wantReach` is a BAND POSITION (0 = as drawn back as this arm goes,
+      // 1 = fully extended), resolved against the live arm so the same guard is
+      // the same guard on any rig.
+      {
+        float lo = 0, hi = 0;
+        st.melee.ReachBand(lo, hi);
+        steerTo(st.wantAz, st.wantEl,
+                std::clamp(lo + st.wantReach * (hi - lo), lo, hi));
+      }
+      break;
+    }
+    case NpcStroke::Phase::Windup: {
+      if (sty == nullptr) break;
+      // THE CUT IS CENTRED ON THE AIM, so the windup lands HALF A CUT SHORT of
+      // it: `aim - cut/2 + windup offset`. A stroke that started at the aim
+      // would cut the air behind the target every time — the blade only ever
+      // travels away from where it began.
+      st.wantAz = liveAz - 0.5f * sty->cut.az + sty->windup.az + bowAz;
+      st.wantEl = liveEl - 0.5f * sty->cut.el + sty->windup.el + bowEl;
+      // AGAINST A NEUTRAL EXTENSION, not against the live radius. Computing
+      // this as `StrokeRadius() + offset` every windup tick is a RUNAWAY: each
+      // tick re-targets a further offset from wherever the last one landed, so
+      // a thrust's rear chamber walked the point straight into the bottom of
+      // the arm's reach band and stayed there — measured, the cut that followed
+      // then extended 1.07 voxels instead of nine and spent its travel flailing
+      // 1.13 rad of elevation instead. `kNeutralReach` is what an arm sits at
+      // when it is neither chambered nor extended, so an authored `reach` of 0
+      // is "wherever a guard holds it" and the offsets are readable as what
+      // they are.
+      st.wantReach = ReachIn(st.melee, sty->windup.reach);
+      steerTo(st.wantAz, st.wantEl, st.wantReach);
+      if (++st.phaseTick >= st.windupTicks) {
+        // ---- COMMIT. The aim is frozen HERE and never refreshed: a target
+        // that steps offline after this instant is missed, which is what makes
+        // the windup a real telegraph rather than decoration.
+        st.aimAz = liveAz;
+        st.aimEl = liveEl;
+        st.aimed = true;
+        st.phase = NpcStroke::Phase::Cut;
+        st.phaseTick = 0;
+      }
+      break;
+    }
+    case NpcStroke::Phase::Cut: {
+      if (sty == nullptr) break;
+      // FROM WHERE THE BLADE ACTUALLY IS, THROUGH THE AIM, TO HALF A CUT PAST
+      // IT. Derived per tick from the live stroke state rather than baked at
+      // commit, so a windup that could not quite reach its pose (a clamped
+      // shoulder, a short arm) still produces a cut through the target instead
+      // of one displaced by however much the arm fell short.
+      const float toAz = st.aimAz + 0.5f * sty->cut.az;
+      const float toEl = st.aimEl + 0.5f * sty->cut.el;
+      const float toR = ReachIn(st.melee, sty->windup.reach + sty->cut.reach);
+      const int left = std::max(1, st.cutTicks - st.phaseTick);
+      const MeleeTuning& t = st.melee.tuning;
+      smp.dx = ((toAz - st.melee.StrokeAz()) / (float)left) / t.aimGainX;
+      smp.dy = -((toEl - st.melee.StrokeEl()) / (float)left) / t.aimGainY;
+      smp.dReach =
+          ((toR - st.melee.StrokeRadius()) / (float)left) /
+          std::max(t.reachGain, 1e-4f);
+      st.melee.Step(smp, 1.0f / 30.0f, true, right, up, fwd);
+      if (++st.phaseTick >= st.cutTicks) {
+        st.phase = NpcStroke::Phase::Recover;
+        st.phaseTick = 0;
+      }
+      break;
+    }
+    case NpcStroke::Phase::Recover: {
+      // Button RELEASED: the driver's own recover ramps PoseWeight down and
+      // hands the arm back to the walk cycle, which is the same hand-back the
+      // player gets and the reason nothing snaps here.
+      smp.held = false;
+      st.melee.Step(smp, 1.0f / 30.0f, true, right, up, fwd);
+      if (++st.phaseTick >= st.recoverTicks) {
+        st.Reset();
+        mob.SetWeaponPose(WeaponPose{});
+        return;
+      }
+      break;
+    }
+    default:
+      return;
+  }
+  mob.SetWeaponPose(st.melee.Pose());
+}
 
 void MobSystem::DecideIntent(Mob& mob, const MobDef& def,
                              const GroundSense& sense, uint32_t tick,
@@ -2580,9 +2994,26 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
       // THIS is the NPC driver — the block the avatar replaces with player
       // input; everything else in this loop is shared Mob mechanics.
       GroundSense sense = SenseGround(mob, def, world);
+      const size_t attacksBefore = attacks_.size();
       DecideIntent(mob, def, sense, tick, dt);
       float align = Steer(mob, def, dt);
       DriveLocomotion(mob, def, sense, align, dt);
+
+      // ---- EXECUTE THE SWING (game/strokes.h, MobSystem::StepStroke) -------
+      //
+      // Started from the request the line above may just have issued, so a
+      // stroke begins on the SAME tick the AI committed to it — the arbiter has
+      // pinned this mob to FaceTarget for `commitTicks` starting now, and a
+      // one-tick lag here would spend the first of them not swinging.
+      //
+      // A request that arrives while a stroke is already live is DROPPED, not
+      // queued: the attack cadence is much longer than a stroke, so the only
+      // way to get here is a profile authored with a cadence shorter than its
+      // own swing, and queueing would turn that into an unbounded backlog
+      // (rule 2) rather than into the visible content error it is.
+      if (attacks_.size() > attacksBefore && !mob.stroke_.Active())
+        BeginStroke(mob, attacks_.back(), tick);
+      StepStroke(mob, tick, world, spawns);
 
       // ---- stages 1-5: pose the rig (float presentation state) ----
       UpdateAnimation(mob, def, world, dt);
@@ -2897,6 +3328,9 @@ void MobSystem::PostStep() {
   for (Mob& mob : mobs_) mob.PostStep();
 }
 
+// THE AVATAR IS SEARCHED LAST, EVERYWHERE. See MobSystem::SetAvatar for why it
+// is searched at all; the ORDER is what keeps every existing caller identical,
+// because the frame loop already asks the avatar first at its own call sites.
 bool MobSystem::FindLimb(uint64_t bodyHandle, uint64_t& mobId,
                          int& limbIndex) const {
   for (const Mob& mob : mobs_)
@@ -2906,13 +3340,133 @@ bool MobSystem::FindLimb(uint64_t bodyHandle, uint64_t& mobId,
         limbIndex = (int)i;
         return true;
       }
+  if (avatar_ != nullptr)
+    for (size_t i = 0; i < avatar_->limbs_.size(); i++)
+      if (avatar_->limbs_[i].body == bodyHandle) {
+        mobId = avatar_->id_;
+        limbIndex = (int)i;
+        return true;
+      }
   return false;
+}
+
+Mob* MobSystem::FindOwner(uint64_t bodyHandle, int* outLimbIndex) {
+  auto scan = [&](Mob& m) -> bool {
+    for (size_t i = 0; i < m.limbs_.size(); i++)
+      if (m.limbs_[i].body == bodyHandle) {
+        if (outLimbIndex) *outLimbIndex = (int)i;
+        return true;
+      }
+    return false;
+  };
+  for (Mob& mob : mobs_)
+    if (scan(mob)) return &mob;
+  if (avatar_ != nullptr && scan(*avatar_)) return avatar_;
+  if (outLimbIndex) *outLimbIndex = -1;
+  return nullptr;
+}
+
+const NpcStroke* MobSystem::MobStroke(uint64_t mobId) const {
+  for (const Mob& mob : mobs_)
+    if (mob.id_ == mobId) return &mob.stroke_;
+  if (avatar_ != nullptr && avatar_->id_ == mobId) return &avatar_->stroke_;
+  return nullptr;
+}
+
+namespace {
+
+// Closest approach between two segments, sampled. A closed form exists and is
+// not worth it here: the sweep is already an approximation of a moving quad,
+// the counts are fixed, and a sampled minimum is bit-reproducible on every
+// machine while a degenerate-case branch in a closed form is one more thing to
+// get wrong. `outOnA` is where on the first segment the minimum sat.
+float SegSegDist(const Vec3& a0, const Vec3& a1, const Vec3& b0, const Vec3& b1,
+                 Vec3& outOnA) {
+  constexpr int kN = 8;
+  float best = 1e9f;
+  outOnA = a0;
+  for (int i = 0; i <= kN; i++) {
+    const Vec3 p = a0 + (a1 - a0) * ((float)i / (float)kN);
+    // Point-to-segment, exactly, for the inner one: half the sampling error for
+    // none of the cost, and it is the segment that does not move.
+    const Vec3 ab = b1 - b0;
+    const float len2 = ab.dot(ab);
+    const float t = len2 > 1e-6f
+                        ? std::clamp((p - b0).dot(ab) / len2, 0.0f, 1.0f)
+                        : 0.0f;
+    const float d = (b0 + ab * t - p).len();
+    if (d < best) {
+      best = d;
+      outOnA = p;
+    }
+  }
+  return best;
+}
+
+}  // namespace
+
+bool MobSystem::FindParry(const Mob& wielder, const Vec3& aPrev,
+                          const Vec3& bPrev, const Vec3& aNow, const Vec3& bNow,
+                          float gap, Mob*& outBlocker, uint64_t& outBody,
+                          Vec3& outAt) {
+  outBlocker = nullptr;
+  outBody = 0;
+  float best = gap;
+  auto test = [&](Mob& m) {
+    if (&m == &wielder || !m.alive_ || m.HeldSlot() < 0) return;
+    Vec3 db, dt, dflat;
+    float dhw = 0;
+    if (!m.WeaponEdge(db, dt, dhw, &dflat)) return;
+    // THE SWEPT QUAD, not just the blade's final position: a fast cut covers
+    // several voxels between ticks and a blade it passed THROUGH is a blade it
+    // was stopped by. Sampled the same way the damage probes step the sweep.
+    constexpr int kSteps = 4;
+    for (int s = 1; s <= kSteps; s++) {
+      const float u = (float)s / (float)kSteps;
+      const Vec3 a = aPrev + (aNow - aPrev) * u;
+      const Vec3 b = bPrev + (bNow - bPrev) * u;
+      Vec3 at;
+      const float d = SegSegDist(a, b, db, dt, at);
+      if (d < best) {
+        best = d;
+        outBlocker = &m;
+        outBody = m.limbs_[m.HeldSlot()].body;
+        outAt = at;
+      }
+    }
+  };
+  for (Mob& m : mobs_) test(m);
+  if (avatar_ != nullptr) test(*avatar_);
+  return outBlocker != nullptr && outBody != 0;
+}
+
+void MobSystem::PushBlockEvent(const BlockEvent& ev, const MeleeTuning& t) {
+  // BOUNDED (rule 2): one parry per sweep, and a sweep runs at most once per
+  // attacker per tick, so this can hold at most kMaxMobs entries between
+  // drains. The cap is the belt to that brace for a frame that never drains.
+  if (blocks_.size() < kMaxMobs * 2) blocks_.push_back(ev);
+  // ...AND THE DEFENDER'S GUARD IS BEATEN OPEN. Counter-based on (blocker,
+  // attacker, power) so the shove is a pure function of the exchange: two runs
+  // of the same fight beat the same guard the same way. Only the SIGN comes
+  // from the hash — the size is the authored knob times the blow's power, so a
+  // light tap moves nothing and a committed cut moves the full amount.
+  Mob* def = FindMobById(ev.blockerId);
+  if (def == nullptr) return;   // the player's own MeleeState is main.cpp's
+  const uint32_t h = rng::Hash3((uint32_t)ev.blockerId ^ 0xB10Cu,
+                                (uint32_t)ev.attackerId, 0);
+  const float sx = (h & 1u) ? 1.0f : -1.0f;
+  const float sy = (h & 2u) ? 1.0f : -1.0f;
+  def->stroke_.melee.Nudge(sx * t.blockNudgeAz * ev.power,
+                           sy * t.blockNudgeEl * ev.power);
 }
 
 bool MobSystem::Damage(uint64_t bodyHandle, float amount, Vec3 hitWorldVoxel,
                        float impactSpeed) {
   for (Mob& mob : mobs_)
     if (mob.Damage(bodyHandle, amount, hitWorldVoxel, impactSpeed)) return true;
+  if (avatar_ != nullptr &&
+      avatar_->Damage(bodyHandle, amount, hitWorldVoxel, impactSpeed))
+    return true;
   return false;
 }
 
@@ -2985,7 +3539,13 @@ bool Mob::Damage(uint64_t bodyHandle, float amount, Vec3 hitWorldVoxel,
       // binds no sever take, so voicing both would double it. (The avatar's
       // hurt slot is simply unbound today, so this stays silent for the
       // player with no exception needed.)
-      if (sys_)
+      //
+      // ...UNLESS WHAT WAS HIT IS LUGGAGE. A sword parrying a blow and a robe
+      // taking a cut are both damage to an APPENDED rig slot, and neither is
+      // the creature being hurt: a clang is not a cry. Same distinction
+      // Mob::StainWound already draws when it refuses to bleed a held item —
+      // a slot at or past baseLimbs_ is wardrobe or weaponry, not anatomy.
+      if (sys_ && (int)i < baseLimbs_)
         sys_->PushVoice(*this, MobSystem::VoiceKind::Hurt, hitWorldVoxel,
                         ld.hp > 0 ? amount / ld.hp : 1.0f);
     }
@@ -3177,6 +3737,12 @@ bool MobSystem::CutLimb(uint64_t bodyHandle, const BladeCut& cut, World& world,
                         std::vector<ParticleSpawn>& spawns) {
   for (Mob& mob : mobs_)
     if (mob.CutLimb(bodyHandle, cut, world, spawns)) return true;
+  // AND THE PLAYER BLEEDS TOO. Without this line an NPC's sweep found the
+  // avatar's arm, failed to recognise it as live flesh, and fell through to
+  // DebrisSystem::MeltBodyAt — the player was hittable only in the sense that
+  // their limbs quietly evaporated with no wound, no stain and no sever.
+  if (avatar_ != nullptr && avatar_->CutLimb(bodyHandle, cut, world, spawns))
+    return true;
   return false;
 }
 
@@ -5268,6 +5834,10 @@ bool MobSystem::CarveLimbRadial(uint64_t bodyHandle, Vec3 centerWorldVoxel,
     if (mob.CarveLimbRadial(bodyHandle, centerWorldVoxel, radiusVoxels, ragged,
                             eject, world, spawns))
       return true;
+  if (avatar_ != nullptr &&
+      avatar_->CarveLimbRadial(bodyHandle, centerWorldVoxel, radiusVoxels,
+                               ragged, eject, world, spawns))
+    return true;
   return false;
 }
 
@@ -5934,11 +6504,11 @@ Vec3 MobSystem::MobOrigin(uint64_t mobId) const {
 }
 
 Vec3 MobSystem::MobFacing(uint64_t mobId) const {
-  // Must stay byte-identical to the `fwd` in the walk step and to
-  // AxisAngle({0,1,0}, heading) applied to +Z — one convention, one formula.
+  // Mob::Facing holds the formula; this is only the id-keyed lookup in front of
+  // it. Two copies of "which way is forward" is exactly the sort of thing that
+  // rots when the rotation convention moves.
   for (const Mob& mob : mobs_)
-    if (mob.id_ == mobId)
-      return Vec3{std::sin(mob.heading_), 0, std::cos(mob.heading_)};
+    if (mob.id_ == mobId) return mob.Facing();
   return {0, 0, 1};
 }
 
@@ -5958,6 +6528,15 @@ float MobSystem::MobTurnVel(uint64_t mobId) const {
   for (const Mob& mob : mobs_)
     if (mob.id_ == mobId) return mob.turnVel_;
   return 0;
+}
+
+void MobSystem::SetHeading(uint64_t mobId, float radians) {
+  for (Mob& mob : mobs_)
+    if (mob.id_ == mobId) {
+      mob.heading_ = radians;
+      mob.desiredHeading_ = radians;
+      return;
+    }
 }
 
 void MobSystem::SetDesiredHeading(uint64_t mobId, float radians) {
@@ -7409,18 +7988,28 @@ void Mob::ApplyWeaponArm(const AnimSkeleton& sk, AnimState& st,
         // relative to the authored one and matching would choose the wrong half
         // every time. (Measured as `clampRot 1.23 shift 2.88`, on exactly the
         // ticks where the stroke crossed the arm's own line.)
+        //
+        // MEASURED WITH THE CLAMP'S OWN FUNCTION, and that is the whole of the
+        // fix. This block used to carry its own copy of the projection, and the
+        // copy did not WRAP the angle into (-pi, pi] the way AnimClampPoseLimits'
+        // does. A forearm whose delta-from-rest landed in the far hemisphere
+        // then read as +4.89 rad here (positive: keep the axis) and as -1.39 rad
+        // there (below the elbow's authored min of 0: clamp it straight), so the
+        // clamp threw away 1.39 rad of a perfectly good solve on exactly the
+        // ticks a committed horizontal cut passed through its own arm's line.
+        //
+        // The symptom was entirely somewhere else: `swing-plane` A measured the
+        // driver's arc as planar to 1.09 voxels and the posed sword as 10.58
+        // voxels off it, 1.52 rad out of level — "the swing wanders". One
+        // shared function, one wrap, both readings agree.
         {
           const Quat delta =
               QuatNormalize(QuatMul(QuatConj(fore.rest.rot),
                                     QuatMul(QuatConj(st.model[forePar].rot),
                                             st.model[i1].rot)));
-          const Vec3 v{delta.x, delta.y, delta.z};
-          const float d = v.dot(axis);
-          const float mag = std::sqrt(d * d + delta.w * delta.w);
-          if (mag > 1e-5f) {
-            const float ang = 2.0f * std::atan2(d / mag, delta.w / mag);
-            if (ang < 0.0f) axis = axis * -1.0f;
-          }
+          float ang = 0;
+          if (AnimHingeAngleAbout(delta, axis, &ang) && ang < 0.0f)
+            axis = axis * -1.0f;
         }
         ov.part = i1;
         ov.axis = axis;
@@ -7541,6 +8130,31 @@ void Mob::RecordWeaponClamp(const AnimSkeleton& sk, const AnimState& st) const {
     weaponDiag_.gotHand = got;
     weaponDiag_.roundTrip = (got - weapon_.hand).len();
   }
+}
+
+Vec3 Mob::Facing() const {
+  // Must stay byte-identical to the `fwd` in the walk step and to
+  // AxisAngle({0,1,0}, heading) applied to +Z — one convention, one formula.
+  // MobSystem::MobFacing is the id-keyed wrapper and forwards to exactly this.
+  return Vec3{std::sin(heading_), 0, std::cos(heading_)};
+}
+
+float Mob::HandSign() const {
+  // OFF THE RIG, not off the equip context string. `EquipItem(item,
+  // "held_right")` names a SOCKET, and the socket names a PART; which side of
+  // the body that part is on is a fact about the skeleton. Reading the part
+  // name means a left-handed def, or a rig whose right-hand socket is called
+  // something else, needs no second spelling of the same fact.
+  //
+  // These rigs are authored MIRRORED (see the long note in ApplyWeaponArm):
+  // ".L" is the character's left in the NAME whatever the model x says, and the
+  // name is what the stroke's asymmetric azimuth limits want.
+  if (heldPartIndex_ < 0 || heldPartIndex_ >= (int)skel_.parts.size())
+    return 1.0f;
+  const int hand = skel_.parts[heldPartIndex_].parent;
+  if (hand < 0 || hand >= (int)limbDefs_.size()) return 1.0f;
+  const std::string& n = limbDefs_[hand].name;
+  return n.size() >= 2 && n.compare(n.size() - 2, 2, ".L") == 0 ? -1.0f : 1.0f;
 }
 
 void Mob::SetWeaponPose(const WeaponPose& pose) {
