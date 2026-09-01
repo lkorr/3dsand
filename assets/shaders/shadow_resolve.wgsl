@@ -273,13 +273,12 @@ fn resolve(@builtin(global_invocation_id) gid : vec3<u32>) {
   let packedSub = atomicLoad(&shadowReq[base + 3u]);
 
   // Reconstruct the patch's world-space centre and normal. The request stores
-  // the cell WINDOW-RELATIVE (9 bits per axis at WORLD_N 512), so this pass and
-  // the fragment shader must be reading the same R.origin — they are, since
-  // both run in the same frame off the same uniform.
-  let rel = vec3<i32>(vec3<u32>(packedCell, packedCell >> WORLD_SHIFT,
-                                packedCell >> (WORLD_SHIFT * 2u)) &
-                      vec3<u32>(u32(WORLD_MASK)));
-  let cell = R.origin * i32(CHUNK) + rel;
+  // the cell TOROIDAL (9 bits per axis at WORLD_N 512), so it means the same
+  // patch whether or not the window moved between the frame that queued it
+  // and this one — shadowPackCell in common.wgsl says why that matters — and
+  // it is unwrapped into the window that is current NOW, which is the window
+  // the fragment shader reading the answer will be looking through.
+  let cell = shadowUnwrapCell(packedCell, R.origin * i32(CHUNK));
   let face = (packedCell >> (WORLD_SHIFT * 3u)) & 7u;
   let hp = shadowPatchCentre(cell, face, packedSub & 7u, (packedSub >> 3u) & 7u,
                              R.shadowSubdiv);
@@ -291,6 +290,23 @@ fn resolve(@builtin(global_invocation_id) gid : vec3<u32>) {
   // penumbra is taken from how far the ray travelled before being blocked, so a
   // contact shadow stays crisp and a distant blocker's shadow lifts.
   var v = 1.0;
+  // A BURIED PATCH HAS NO OPINION. The ray starts TUNE_SHADOW_BIAS off the
+  // face; a hit within a twentieth of a voxel of that means the cell in front
+  // of the patch is itself solid — the patch is not a surface anyone can see,
+  // it is the top face of the block UNDER a terrace step, or the side face
+  // of one INSIDE the hill. No pixel is ever on such a patch, but the reader's
+  // bilinear taps roll into the neighbour cell's same face past a face edge
+  // (raymarch.wgsl shadowCached), and at every step of a terraced hillside
+  // that neighbour is buried. Resolving it to a contact-black value painted a
+  // one-pixel dark line along every voxel edge of the terrain, sun or no sun
+  // — --gate shadow-cache's walk arm counted them as ~15-21k "phantom" pixels
+  // a frame, every one on a step edge. Marking the slot INVALID instead makes
+  // the tap drop out of the blend (weight 0) and the pixel shade from its own
+  // face's patches, which is the ordinary patch-quantised edge and nothing
+  // more. The slot stays claimed and live, so it is re-requested each frame
+  // (one ray that terminates in its first cell) and never reclaimed by a
+  // foreign patch mid-frame.
+  let buried = s.hit && s.t < 0.05;
   if (s.hit) {
     let dM = s.t * VOXEL_METERS;
     v = clamp(smoothstep(TUNE_SHADOW_SOFT_NEAR, TUNE_SHADOW_SOFT_FAR, dM) *
@@ -310,5 +326,5 @@ fn resolve(@builtin(global_invocation_id) gid : vec3<u32>) {
   if (shadowStateVerifier(old) != ver) { return; }
   atomicStore(&shadowCache[bucket * 2u + 1u],
               shadowPackState(u32(v * 255.0 + 0.5), R.frameIdx & 15u,
-                              shadowStateRequested(old), true, ver));
+                              shadowStateRequested(old), !buried, ver));
 }
