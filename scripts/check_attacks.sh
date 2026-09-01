@@ -70,9 +70,13 @@ COMMON=(--headless=new --disable-gpu --use-angle=swiftshader-webgl
         --enable-unsafe-swiftshader "--user-data-dir=$PROF" --no-first-run
         --virtual-time-budget=180000 --window-size=1440,1000)
 
+# --shot uses the harness's SHOT MODE, which puts the iframe on screen and
+# stops at the open Attacks lane. Without it the picture is of an offscreen
+# iframe, i.e. of nothing.
 if [ -n "$SHOT" ]; then
-  "$CHROME" "${COMMON[@]}" --screenshot="$SHOT" "$URL" 2>/dev/null || true
+  "$CHROME" "${COMMON[@]}" --screenshot="$SHOT" "$URL?shot=1" 2>/dev/null || true
   echo "check_attacks: wrote $SHOT"
+  [ -n "${SHOT_ONLY:-}" ] && exit 0
 fi
 
 OUT="$("$CHROME" "${COMMON[@]}" --dump-dom "$URL" 2>/dev/null |

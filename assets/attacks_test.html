@@ -28,7 +28,9 @@
 -->
 <style>body{background:#0e1116;color:#cfd8e3;font:13px/1.5 monospace;margin:0}
 pre#out{padding:12px;white-space:pre-wrap}
-iframe{position:absolute;left:-4000px;width:1400px;height:980px;border:0}</style>
+iframe{position:absolute;left:-4000px;width:1400px;height:980px;border:0}
+body.shot pre#out{display:none}
+body.shot iframe{position:static;left:0;width:1400px;height:1000px}</style>
 <pre id="out">running…</pre>
 <iframe id="f" src="tuner.html"></iframe>
 <script>
@@ -87,6 +89,14 @@ const btn = (root, text) =>
   [...root.querySelectorAll('button')].find(b => b.textContent.trim() === text);
 const btnLike = (root, sub) =>
   [...root.querySelectorAll('button')].find(b => b.textContent.includes(sub));
+
+// SHOT MODE (?shot=1): boot the page, open the Attacks lane on the human rig,
+// and stop — with the iframe ON SCREEN so --screenshot captures the real panel.
+// The measuring path deliberately parks the iframe offscreen, which made
+// `check_attacks.sh --shot` produce a picture of an empty <pre>. "The UI is
+// awful" is not a claim any assertion in this file can check; it needs a look.
+const SHOT = new URLSearchParams(location.search).has('shot');
+if (SHOT) document.body.classList.add('shot');
 
 (async () => {
 try {
@@ -152,6 +162,20 @@ try {
   say(loaded, 'human.vox loaded with its rig sidecar');
   if (!loaded) return done();
 
+  if (SHOT) {
+    const lane = btn(view, 'attacks');
+    if (lane) lane.click();
+    await until(() => !!btnLike(view, '▶ swing'));
+    await sleep(800);
+    // Scroll the LANE into view — it lives under the viewport and the palette,
+    // which is most of a 1000px window, so an unscrolled shot is a picture of
+    // the model list.
+    const tl = view.querySelector('.edtimeline');
+    if (tl) tl.scrollIntoView({block: 'start'});
+    await sleep(900);                // let the panel settle and the rig draw
+    return;                          // no verdict: this mode is for the eye
+  }
+
   /* ====================================================================
      1. THE WALK PREVIEW — the reported bug.
      ==================================================================== */
@@ -206,13 +230,25 @@ try {
     const m = c && c.match(/×([\d.]+)/);
     return m ? +m[1] : 1;
   };
-  // Wait for the clock: the rate is MEASURED between touchdowns, so it is 0
-  // until two steps have been timed. Asserting before then reads the default.
-  await until(() => api.strideRate() > 1e-3, 8000, 150);
+  // WAIT FOR REAL STEPS, not for the rate to be non-zero.
+  //
+  // The step period is an EMA seeded at zero (avatar.cpp kStepPeriodHalflife)
+  // and its FIRST sample is garbage: at startup both legs are already past the
+  // drift threshold, so they step almost together and the clock times that
+  // 0.04 s gap instead of a stride. On this rig a real step is ~0.9 s apart —
+  // stepThreshold 0.3 x a 54-voxel leg, against a body moving 18 vox/s — so a
+  // poll that waits for "settled" finds a value that is merely STUCK: two
+  // touchdowns had happened in total and nothing was updating it. Waiting on
+  // the touchdown COUNT is waiting on the thing the clock is made of.
+  await until(() => {
+    const td = api.gaitDebug().touchdowns || {};
+    return Object.values(td).reduce((a, b) => a + b, 0) >= 8;
+  }, 40000, 300);
   const wr = rateOf('walk');
   say(wr > 0.26 && wr < 2.99,
     'the walk clip is stride-rate locked, not pinned at the clamp',
-    'rate ×' + wr.toFixed(2) + ', stride ' + api.strideRate().toFixed(2) + '/s');
+    'rate ×' + wr.toFixed(2) + ', stride ' + api.strideRate().toFixed(2) +
+    '/s  ' + JSON.stringify(api.gaitDebug()));
 
   // ---- DO THE ARMS ACTUALLY MOVE? --------------------------------------
   // The whole report in one measurement. Sample each limb's posed rotation
@@ -288,6 +324,64 @@ try {
 
   // The compass pad is a canvas the panel PAINTS by sampling QuantizeStrike.
   // A blank one means the partition never ran.
+  // ---- the sword button ------------------------------------------------
+  // A blade is not decoration: the driver MEASURES hand-to-point and solves
+  // the whole reach band against it, so "armed" and "empty fist" are different
+  // numbers rather than the same swing with a prop.
+  const swordBtn = btnLike(view, '+ sword');
+  say(!!swordBtn, 'the Attacks lane offers a one-click sword');
+  if (swordBtn) {
+    const bandBefore = api.armInfo().bandHi || 0;
+    swordBtn.click();
+    await until(() => !!api.armInfo().item, 15000, 200);
+    say(!!api.armInfo().item, 'it equips an item without picking a socket first',
+      'item "' + api.armInfo().item + '" on socket "' + api.armInfo().socket + '"');
+    // The blade has to reach the DRIVER, not just the renderer: SetStroke
+    // measures hand-to-point every tick off the posed item.
+    await until(() => (api.armInfo().bladeLen || 0) > 0.5, 15000, 200);
+    const armed = api.armInfo();
+    say((armed.bladeLen || 0) > 0.5,
+      'the driver MEASURES the blade it is now holding',
+      'bladeLen ' + (armed.bladeLen || 0).toFixed(2) + ' vox, band ' +
+      (armed.bandLo || 0).toFixed(2) + '-' + (armed.bandHi || 0).toFixed(2));
+    // ...and the reach band must have MOVED with it. That is the whole reason
+    // the preview needs a real weapon rather than a picture of one: an empty
+    // fist is a different set of numbers, not the same swing undressed.
+    say((armed.bandHi || 0) > bandBefore + 1,
+      'the reach band grew to account for the blade',
+      'band hi ' + bandBefore.toFixed(2) + ' -> ' + (armed.bandHi || 0).toFixed(2) + ' vox');
+  }
+
+  // ---- undo ------------------------------------------------------------
+  // Every edit in this lane writes a document that is NOT the model, through
+  // the editor's own single undo stack. The point of the test is that Ctrl+Z
+  // reaches them at all.
+  {
+    const before = api.styleTicks('horizontal_r').windup;
+    api.setStyleTicksUI('horizontal_r', 'windup', before + 4);
+    await sleep(120);
+    const mid = api.styleTicks('horizontal_r').windup;
+    say(mid === before + 4, 'a style edit lands', `${before} -> ${mid}`);
+    doc.dispatchEvent(new win.KeyboardEvent('keydown',
+      {key: 'z', ctrlKey: true, bubbles: true}));
+    await sleep(200);
+    const after = api.styleTicks('horizontal_r').windup;
+    say(after === before, 'Ctrl+Z undoes a style edit', `${mid} -> ${after}`);
+    doc.dispatchEvent(new win.KeyboardEvent('keydown',
+      {key: 'z', ctrlKey: true, shiftKey: true, bubbles: true}));
+    await sleep(200);
+    say(api.styleTicks('horizontal_r').windup === before + 4,
+      'Ctrl+Shift+Z redoes it', String(api.styleTicks('horizontal_r').windup));
+    doc.dispatchEvent(new win.KeyboardEvent('keydown',
+      {key: 'z', ctrlKey: true, bubbles: true}));
+    await sleep(200);
+  }
+
+  // ---- the compass, which now lives behind a fold ----------------------
+  const compassFold = [...view.querySelectorAll('.atkfold > summary')]
+    .find(x => x.textContent.includes('compass'));
+  say(!!compassFold, 'the compass is behind a collapsible fold');
+  if (compassFold) { compassFold.click(); await sleep(300); }
   // BY ID, not `querySelector('canvas')` — #view-models already contains the
   // editor's own WebGL viewport canvas, and it comes first in the DOM.
   const pad = view.querySelector('#atkCompass');
@@ -324,9 +418,12 @@ try {
   // four separable causes and this names which one fired.
   say(d('preview') > 0, 'the preview loop is running while a stroke is live',
     d('preview') + ' stepPreview calls');
-  say(d('weaponTicks') >= d('preview'),
-    'the stroke driver receives at least one 30 Hz tick per preview step',
-    d('weaponTicks') + ' driver ticks over ' + d('preview') + ' steps');
+  // The preview sub-steps at 60 Hz and the stroke driver at 30, so roughly one
+  // driver tick per two preview steps. Asserting one-per-step was right only
+  // while the preview ran on the raw frame delta.
+  say(d('weaponTicks') >= Math.floor(d('preview') / 2) - 1 && d('weaponTicks') > 0,
+    'the stroke driver receives its 30 Hz ticks under the 60 Hz preview',
+    d('weaponTicks') + ' driver ticks over ' + d('preview') + ' preview steps');
   say(d('noStyle') === 0,
     'every tick had a style to run',
     d('noStyle') + ' ticks with no style, strokeStyle=' + c1.strokeStyle +
@@ -361,15 +458,35 @@ try {
   }
   btnLike(view, '■ stop')?.click();
 
-  // ---- editing a style must not need a reload --------------------------
-  const before = api.styleTicks('horizontal_r');
-  api.setStyleTicks('horizontal_r', 'windup', (before?.windup || 12) + 3);
-  await sleep(100);
-  const after = api.styleTicks('horizontal_r');
-  say(after && after.windup === before.windup + 3,
-    'editing a style is live (no reload, no re-parse round trip)',
-    `windup ${before?.windup} -> ${after?.windup}`);
-  api.setStyleTicks('horizontal_r', 'windup', before.windup);   // put it back
+
+  // ---- LAYOUT, which is the other half of the report --------------------
+  // "The boxes are full screen wide and needlessly large" and "numbers are cut
+  // off by the size of the box they're in" are both measurable, so measure
+  // them rather than trusting a screenshot to be looked at again later.
+  {
+    const panel = view.querySelector('.atk');
+    say(!!panel, 'the panel uses the attacks grid, not the side-panel classes');
+    if (panel) {
+      const w = panel.getBoundingClientRect().width;
+      say(w <= 1200, 'the panel is capped, not full-bleed', Math.round(w) + 'px');
+    }
+    // Every number box must be able to SHOW its value. scrollWidth > clientWidth
+    // is the browser telling us the text does not fit — which is exactly what
+    // `0.30` for 0.300 and `-2.3` for -2.30 were.
+    const boxes = [...view.querySelectorAll('input.atknum')];
+    say(boxes.length > 6, 'the fields render as atknum boxes', boxes.length + ' found');
+    const clipped = boxes.filter(b => b.scrollWidth > b.clientWidth + 1);
+    say(clipped.length === 0, 'no number is clipped by its box',
+      clipped.slice(0, 4).map(b => `"${b.value}" ${b.clientWidth}<${b.scrollWidth}px`).join(', '));
+    // The whole style editor should fit in a screen, not scroll for a page.
+    const tl = view.querySelector('.edtimeline');
+    // 700px is a screenful next to the viewport. The version this replaced
+    // ran past 1000px for ONE style with both folds shut, because every field
+    // was a full-width row with its explanation on a line of its own.
+    if (tl) say(tl.getBoundingClientRect().height < 700,
+      'the lane fits on screen instead of scrolling for a page',
+      Math.round(tl.getBoundingClientRect().height) + 'px tall');
+  }
 
   // ---- the pose clamp is running ---------------------------------------
   // Stage 6 exists in both engine drivers and in neither preview until now.

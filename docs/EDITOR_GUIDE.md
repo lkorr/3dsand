@@ -324,8 +324,11 @@ result. The only way to author one is next to a rig that is swinging it.
    **recover**, and **jitter**. Angles show radians and degrees side by side;
    ticks show their duration at 30 Hz; `reach` shows where it lands in this
    arm's band and warns when it would be clamped.
-3. **Load an item** in the Held item panel first — the driver *measures* the
-   blade, so with an empty fist the point is the hand.
+3. **`+ sword`** arms the rig in one click — it picks the socket for you. Do
+   this first: the driver *measures* the blade and solves the whole reach band
+   against it, so an empty fist is a different set of numbers, not the same
+   swing undressed. (Same button sits in the Held item panel; that one also
+   lets you choose which weapon.)
 4. **▶ swing** runs the program at 30 Hz. The **aim** sliders set the target's
    bearing: the cut is centred on the aim, so the windup lands half a cut short
    of it and the blade passes *through* where it was aimed. **trail** draws the
@@ -345,7 +348,15 @@ result. The only way to author one is next to a rig that is swinging it.
    tiling it — so adding one can swallow another, and the panel says so when a
    style has become unreachable.
 
-Save writes the JSON; press **R** in the running game to hot-reload it.
+Every edit in this lane — style fields, pose limits, the `melee.*` knobs, the
+compass — goes on the editor's own undo stack, so **Ctrl+Z / Ctrl+Y** work
+across all of it in the order you made the changes. Save writes the JSON; press
+**R** in the running game to hot-reload it.
+
+Angles are **authored in degrees** and stored as radians (the value the file
+holds is printed under each box). `ticks` show their duration at 30 Hz, and
+`reach` shows where that band position lands in voxels *on the arm currently
+previewing* — with a `⚠` when it would be clamped.
 
 ## 6. Micro detail — finer than one world voxel
 

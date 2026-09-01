@@ -602,6 +602,7 @@ function dispatchUndo(e) {
   else if (e.type === 'grow') applyGrowSnapshot(e.data, 'before');
   else if (e.type === 'move') applyMoveEntry(e.data, 'before');
   else if (e.type === 'sidecar') applySidecarSnapshot(e.data.before);
+  else if (e.type === 'external') e.data.undo();
   else if (e.type === 'structure')
     applyStructureSnapshot(e.data.before, e.data.label, 'undo');
 }
@@ -611,8 +612,35 @@ function dispatchRedo(e) {
   else if (e.type === 'grow') applyGrowSnapshot(e.data, 'after');
   else if (e.type === 'move') applyMoveEntry(e.data, 'after');
   else if (e.type === 'sidecar') applySidecarSnapshot(e.data.after);
+  else if (e.type === 'external') e.data.redo();
   else if (e.type === 'structure')
     applyStructureSnapshot(e.data.after, e.data.label, 'redo');
+}
+
+/**
+ * Push an undo entry owned by ANOTHER module, onto THIS stack.
+ *
+ * There is one Ctrl+Z on this tab and it has to mean one thing. The Attacks
+ * lane edits three documents that are not the model — attack_styles.json,
+ * tuning.json and the rig sidecar — and giving it a second stack would make
+ * the shortcut's behaviour depend on which panel the pointer happened to be
+ * over, which is the worst of both. So it hands its own before/after restores
+ * here instead, and the ordinary undo walks them in the same LIFO order as
+ * everything else.
+ *
+ * `undo`/`redo` are closures the caller owns; they must be idempotent and must
+ * restore CONTENT rather than swap references, because other objects (a parsed
+ * style library, a live clip instance) hold pointers into those documents.
+ */
+export function pushUndoEntry(label, undoFn, redoFn) {
+  commitSidecarUndo();          // flush anything pending from BEFORE this edit
+  undoStack.push({ type: 'external', data: { label, undo: undoFn, redo: redoFn } });
+  redoStack.length = 0;
+  // Deliberately NOT markDirty(): `docDirty` means "this MODEL has unsaved
+  // changes" and drives the save pill and the discard prompt. An external
+  // entry by definition edits another document, and its owner marks that one
+  // dirty itself. Saying the model changed because a style did would make both
+  // the pill and the prompt lie.
 }
 
 function undo() {
@@ -620,7 +648,9 @@ function undo() {
   if (!e) { hooks.toast('nothing to undo'); return; }
   dispatchUndo(e);
   redoStack.push(e);
-  markDirty();
+  // See pushUndoEntry: an external entry's document is not this model, so
+  // walking one must not claim the model changed.
+  if (e.type !== 'external') markDirty();
 }
 
 function redo() {
@@ -628,7 +658,7 @@ function redo() {
   if (!e) { hooks.toast('nothing to redo'); return; }
   dispatchRedo(e);
   undoStack.push(e);
-  markDirty();
+  if (e.type !== 'external') markDirty();
 }
 
 function markDirty() { docDirty = true; hooks.onDirty(true); updateStatus(); }

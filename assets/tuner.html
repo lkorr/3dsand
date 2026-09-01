@@ -1370,6 +1370,99 @@
   .ckey:hover{background:#9ec8ff}
   .ckey.on{background:var(--amber);border-color:#a5751f;box-shadow:0 0 6px var(--amber)}
 
+  /* ---------- attacks lane ----------
+
+     Its own vocabulary rather than .clipprops/.rigf, because those two are
+     built for a 260px SIDE PANEL and this lane is a full-width strip. Reusing
+     them is what made the first version unusable: `.rigf>span{min-width:104px}`
+     gives every label a 104px column, `.rigf>i{flex:1 1 100%}` puts every hint
+     on its own line indented 110px, and `.clipprops{flex-wrap:wrap}` then lets
+     one four-field row eat 120px of height and the full window width. Twelve
+     fields rendered as a thousand-pixel column of prose.
+
+     The rules here are: fields sit in a GRID with the label above the box, the
+     boxes are wide enough for their contents, explanation lives in `title=`
+     rather than in the layout, and the whole panel is capped so it reads as a
+     panel instead of as a page. */
+  .atk{display:flex;flex-wrap:wrap;gap:10px;align-items:flex-start;max-width:1180px}
+  .atkcard{
+    flex:1 1 340px;min-width:0;background:#12161e;border:1px solid #262e3c;
+    border-radius:6px;padding:7px 9px;
+  }
+  .atkcard.wide{flex:1 1 100%}
+  .atkcard>h5{
+    margin:0 0 6px;font-size:10px;letter-spacing:.09em;text-transform:uppercase;
+    color:var(--faint);font-weight:600;display:flex;align-items:center;gap:6px;
+  }
+  .atkcard>h5 .spacer{flex:1}
+  /* The segment table: one row per segment, one column per field. This is the
+     shape the data already has (windup/cut/recover x ticks/az/el/reach) and
+     seeing them ALIGNED is most of what makes a style readable. */
+  .atkseg{display:grid;grid-template-columns:auto repeat(4,minmax(0,1fr));
+    gap:3px 7px;align-items:center}
+  .atkseg>.lbl{
+    font-size:11px;color:var(--dim);text-align:right;padding-right:2px;
+    font-family:var(--mono);
+  }
+  .atkseg>.hdr{
+    font-size:9.5px;color:var(--faint);text-transform:uppercase;letter-spacing:.06em;
+    text-align:center;
+  }
+  /* A number box that FITS ITS NUMBER. `input.cell.num` is 64px, right-aligned,
+     with the browser's spinner overlapping the last ~16px of it — which is why
+     an azimuth of 0.300 rendered as `0.30` with the tail under the arrows, and
+     -2.30 as `-2.3`. The spinners go (nobody nudges a radian by 1), the text
+     centres, and the box gets room for a sign, four digits and a point. */
+  input.atknum{
+    width:100%;min-width:58px;box-sizing:border-box;text-align:center;
+    font-family:var(--mono);font-size:11.5px;padding:3px 4px;
+    background:var(--card2);border:1px solid #2a3240;border-radius:4px;color:var(--fg);
+  }
+  input.atknum::-webkit-outer-spin-button,
+  input.atknum::-webkit-inner-spin-button{-webkit-appearance:none;margin:0}
+  input.atknum{-moz-appearance:textfield}
+  input.atknum:focus{outline:none;border-color:var(--acc)}
+  input.atknum.wide{text-align:left}
+  /* The secondary unit under a field: the radians behind a degrees box, the
+     voxels behind a band position. Small, dim, and never a layout row of its
+     own — the pair is one cell. */
+  .atkcell{display:flex;flex-direction:column;gap:1px;min-width:0}
+  .atkcell>em{
+    font-style:normal;font-size:9px;color:var(--faint);text-align:center;
+    font-family:var(--mono);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+  }
+  .atkrow{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:4px 0}
+  .atkrow>label{font-size:11px;color:var(--dim);display:flex;align-items:center;gap:4px}
+  /* One derived line per style instead of a paragraph per field. */
+  .atkderived{
+    font-family:var(--mono);font-size:10.5px;color:var(--dim);margin-top:6px;
+    line-height:1.6;
+  }
+  .atkderived b{color:var(--fg);font-weight:600}
+  .atkreadout{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:1px 10px;
+    font-family:var(--mono);font-size:10.5px}
+  .atkreadout>span{display:flex;justify-content:space-between;gap:6px;
+    color:var(--dim);white-space:nowrap;overflow:hidden}
+  .atkreadout>span>b{color:var(--fg);font-weight:600;text-overflow:ellipsis;overflow:hidden}
+  .atkwarn{color:var(--amber)}
+  /* Collapsed by default: the per-limb table and the compass are reference,
+     not the thing you touch every edit. */
+  .atkfold>summary{
+    cursor:pointer;font-size:10px;letter-spacing:.09em;text-transform:uppercase;
+    color:var(--faint);font-weight:600;padding:3px 0;list-style:none;
+  }
+  .atkfold>summary::-webkit-details-marker{display:none}
+  .atkfold>summary::before{content:'\25B8';color:var(--dim);margin-right:5px}
+  .atkfold[open]>summary::before{content:'\25BE'}
+  .atkfold{border-top:1px solid #1e2531;margin-top:6px;padding-top:2px}
+  .atklimb{display:grid;grid-template-columns:76px 46px 1fr auto;gap:4px 8px;
+    align-items:center;font-size:11px;margin:3px 0}
+  .atklimb .nm{font-family:var(--mono);color:var(--dim);overflow:hidden;
+    text-overflow:ellipsis;white-space:nowrap}
+  .atkhelp{font-size:11px;line-height:1.55;color:var(--dim);max-width:900px}
+  .atkhelp b{color:var(--fg)}
+  .atkhelp p{margin:0 0 6px}
+
   /* ================= wiki ================= */
   /* Two panes: a persistent index on the left, the assembled dossier on the
      right. The index stays put while you read so lateral moves between
@@ -8181,6 +8274,13 @@ const ARCH_NODES={
     tst:['screenshots'],
     details:'<b>RENDER_PATHS in <code>assets/tuner.html</code> must match the shader predicates in <code>common.wgsl</code></b> — they are two lists that have to agree.<br><br><b>Where the time goes:</b> <code>bash scripts/run.sh ./build/Release/sandvox.exe --render-budget</code> prints the raymarch’s own breakdown — one settled world, one daylight overlook camera, one arm per cost centre, all in a single process, plus the frame it measured as <code>build/render_budget.bmp</code>. It exists because <code>--perf</code> reports this pass as ONE number and the only way forward from a bare number is the feature-by-feature elimination CLAUDE.md rule 6 forbids.<br><br><b>What it found (2026-08-30, RTX 3060 Ti, 1080p, 14.7 ms baseline):</b> HALF the frame is not traversal at all. Turning the shadow ray off at RUNTIME (a RenderParams bit, call site still compiled) saves 2.3 ms; const-folding it away saves 6.0 ms. Gating every reflection call site off saves 0.1 ms; const-folding <code>reflectionSteps</code> to 0 saves 3.6 ms. Neither pair casts a single ray in either arm, so the 3.7 + 3.5 ms difference is the REGISTER FOOTPRINT of two extra inlined copies of the 700-line <code>trace()</code>, paid by every pixel in the frame. <code>Hit</code> has 23 fields; a shadow ray uses two of them. A slim opaque-only trace for secondary rays is the single biggest win available here.<br><br>Two older traps also live here. Routing NEAR shadows through the far cascade is ~48x SLOWER, because a fine ray terminates on its first blocker while a cascade ray must cross the whole reach. And per-channel Reinhard desaturates warm emissives to gold — tonemap luminance, not channels.'},
 
+  shadowCache:{label:'Shadow Cache',tag:'render',
+    desc:'One media-blind shadow ray per visible surface PATCH per frame, instead of one per lit pixel inside the raymarch. A lossy direct-mapped hash table keyed on (voxel, face, sub-patch), resolved by a compute pass that runs immediately before the render pass that reads it.',
+    files:['assets/shaders/shadow_resolve.wgsl','assets/shaders/raymarch.wgsl','assets/shaders/common.wgsl','src/sim/world.h'],
+    cst:['world.h  kShadowCacheBuckets','pass_table.def  PT_SHADOWCACHE'],
+    tst:['shadow-cache'],
+    details:'<b>Why it is not just a cache.</b> <code>--render-budget</code> splits what a shadow costs in two: turning the ray off at runtime saves 2.29 ms, const-folding the call away saves 5.88 ms. The 3.59 ms difference is the REGISTER FOOTPRINT of the <code>trace()</code> call site existing in the fragment shader at all — 1.6x the cost of every ray it casts. So deduplicating rays while leaving an inline fallback would chase the smaller half and forfeit the larger one. <code>SHADOW_CACHE</code> is therefore a compile-time const, not a runtime branch, and a miss casts NO ray.<br><br><b>Staleness is one frame, and only in the REQUEST SET.</b> Values are recast every frame, so destruction re-lights immediately and there is no invalidation machinery anywhere — no per-chunk generation, no dirty-list coupling. A newly disoccluded patch misses for exactly one frame and shades unshadowed.<br><br><b>Why a compute pass is load-bearing rather than an optimisation:</b> a fragment shader cannot elect one pixel per patch to do the work, so an in-shader cache degenerates into hit/miss on alternating frames.<br><br><b>Two DDAs that must agree.</b> <code>shadowMarch</code> is a purpose-built media-blind march, not <code>trace()</code> — which lives in raymarch.wgsl and cannot be reached from a compute shader. Its hit condition is <code>isRayBlocker</code> exactly: gas and translucent liquid fall through, micro falls through, ice and glass do NOT. <code>--gate shadow-cache</code> casts both at sampled points and asserts they agree, because a comment could not.<br><br><b>Granularity is a QUALITY knob, not a speed one</b> (<code>render.shadowCacheSubdiv</code>): the ray saving saturates long before the patch gets coarse, so spend it on smoother shadow edges. 4 gives 2.5 cm patches, about 8 px at 5 m.'},
+
   sky:{label:'Sky & Celestial',tag:'render',
     desc:'A real orbital simulation, not a phase ramp: the planet orbits a star on a Keplerian ellipse, spins on a tilted axis and carries two moons on their own inclined ellipses. Seasons, lunar phase, the moon beat and eclipses are consequences of that geometry.',
     files:['src/sim/celestial.h','src/sim/celestial.cpp','assets/shaders/raymarch.wgsl'],
@@ -8572,7 +8672,7 @@ const ARCH_NODES={
     // verified by two STANDALONE scripts (named in `details`) because neither
     // question it answers is reachable from C++.
     files:['assets/editor/editor.js','assets/editor/rig.js','assets/editor/anim.js','assets/editor/melee.js','assets/editor/attacks.js','scripts/test_melee.mjs','scripts/check_attacks.sh','docs/EDITOR_GUIDE.md'],
-    details:'Loaded as an ES module with a vendored three.js; every failure path is caught, so a browser without WebGL or a missing vendor file leaves the other tabs untouched.<br><br><b>THE PREVIEW IS THE ENGINE\'S OWN PIPELINE, AND IT HAD DRIFTED (fixed 2026-09-01).</b> <code>anim.js</code> is a port of <code>anim.cpp</code> and <code>melee.js</code> is a port of <code>melee.cpp</code> + <code>strokes.cpp</code>; both are line-cited and must follow the C++, never lead it. Five real divergences were found and closed, and the reported symptom — "the tuner\'s walk is outdated, the game swings both arms" — was FOUR of them at once: (1) the LOCOMOTION CLIP FAMILY was never started, and the gait layer only places FEET, so the preview showed IK legs and rest arms; (2) the gait clock ran the NPC free oscillator (<code>cadence * speedFactor</code>) while <code>avatar.cpp</code> measures it BETWEEN TOUCHDOWNS — 4.6 strides/s against a real ~1.8, so any stride-locked clip pinned at its rate clamp; (3) <code>mob.cpp</code>\'s gait treats an ARM chain as a foot and <code>avatar.cpp</code> does not ("arm chains never step"), so previewing the human under the NPC rule PLANTED BOTH HANDS — measured, hand.R tracked foot.R at a correlation of -1.00 and the authored 26&deg; arm swing was reduced to 6&deg; of IK residue; (4) <code>clipFade</code>\'s blend-in read the wrapping playhead instead of <code>ageMs</code>, so a looping walk re-faded to zero weight three times a second. Also: the spring goal was on the pre-normalisation form, and stages 3.5 (<code>AnimApplySpineTwist</code>) and 6 (<code>AnimClampPoseLimits</code>) existed in both engine drivers and in neither preview. <i>Note (3) is a live question about the ENGINE, not the editor: whether mob.cpp should adopt the filter is about every NPC with an arm chain.</i><br><br><b>The ATTACKS lane</b> edits <code>assets/mobs/attack_styles.json</code> next to a rig that is swinging it, because a style\'s four numbers per segment are not a pose: the reach is a BAND POSITION resolved against that rig\'s bones, the hand is the tip minus a MEASURED blade, and three clamps can each move the result. It runs the real <code>StepStrokeProgram</code> at 30 Hz, draws the swept edge coloured by phase, reports tip speed and edge alignment (the two inputs the damage formula scales by), and paints the player flick compass by SAMPLING <code>QuantizeStrike</code> rather than drawing wedges — a max-dot partition is not the wedges you would guess, and guessing is how a sector ends up unreachable. It also surfaces the per-limb half of "how does this attack work on this limb": each arm part\'s <code>poseLimit</code> (rig sidecar) beside <code>melee.torsoShare</code> / <code>elbowPoleCone</code> / <code>headClearM</code> (tuning.json), each field saying which file it writes.<br><br><b>Verify:</b> <code>node scripts/test_melee.mjs</code> (~1 s, the ports against the C++ they transcribe — hash vectors against an independent oracle, the cut passing through its aim, the azimuth window, determinism) and <code>bash scripts/check_attacks.sh</code> (real Chrome, real server: walks the human and MEASURES whether the arms swing and oppose). The split matters — every function in <code>anim.js</code> was individually correct while the walk preview showed rest arms, because nothing called them.<br><br>The limb shelf has TWO sources and one pair of verbs (swap / add). <b>Saved parts</b> are the ones you put in <code>assets/limbs/</code>, created on first save. <b>Other creatures</b> needs no curation at all: it lists every limb of every other mob file, filtered by default to the tag of the limb you have selected, and lifts one straight out — a creature file is already a limb library, being the same named <code>.vox</code> models plus the same <code>limbs[]</code> sidecar one rung up the hierarchy. Both run the same <code>limblib.js</code> code path, so the incoming joint lands on the outgoing one either way. The open creature is on that list too, marked <i>as last saved</i> and sorted first — once you have swapped an arm OUT, the file on disk is the only place the original still exists. Both need the tuner server (a <code>file://</code> page cannot list assets).<br><br><b>Undo covers structural edits</b> (add / duplicate / delete / split / 2×/÷2 / limb swap / rename), which used to call <code>clearUndo()</code> and bin the whole history. The voxel log addresses cells by MODEL INDEX and a splice renumbers them — but it does not have to SURVIVE the renumbering, only be correct once the structural entry above it is undone, and undo is strictly LIFO. So each one is a before/after snapshot of the model list plus the sidecar (<code>beginStructural</code>/<code>endStructural</code>, which nest and collapse anything pushed inside them). The art palette is deliberately NOT rolled back: it is append-only, so leaving it is always correct and truncating it could strip a colour a later redo needs.<br><br><b>Solo</b> (the <code>S</code> on a model row) is exclusive and self-cancelling: clicking a lit <code>S</code> always brings the whole body back. Shift-click accumulates, for comparing two limbs.'},
+    details:'Loaded as an ES module with a vendored three.js; every failure path is caught, so a browser without WebGL or a missing vendor file leaves the other tabs untouched.<br><br><b>THE PREVIEW IS THE ENGINE\'S OWN PIPELINE, AND IT HAD DRIFTED (fixed 2026-09-01).</b> <code>anim.js</code> is a port of <code>anim.cpp</code> and <code>melee.js</code> is a port of <code>melee.cpp</code> + <code>strokes.cpp</code>; both are line-cited and must follow the C++, never lead it. Five real divergences were found and closed, and the reported symptom — "the tuner\'s walk is outdated, the game swings both arms" — was FOUR of them at once: (1) the LOCOMOTION CLIP FAMILY was never started, and the gait layer only places FEET, so the preview showed IK legs and rest arms; (2) the gait clock ran the NPC free oscillator (<code>cadence * speedFactor</code>) while <code>avatar.cpp</code> measures it BETWEEN TOUCHDOWNS — 4.6 strides/s against a real ~1.8, so any stride-locked clip pinned at its rate clamp; (3) <code>mob.cpp</code>\'s gait treats an ARM chain as a foot and <code>avatar.cpp</code> does not ("arm chains never step"), so previewing the human under the NPC rule PLANTED BOTH HANDS — measured, hand.R tracked foot.R at a correlation of -1.00 and the authored 26&deg; arm swing was reduced to 6&deg; of IK residue; (4) <code>clipFade</code>\'s blend-in read the wrapping playhead instead of <code>ageMs</code>, so a looping walk re-faded to zero weight three times a second. Also: the spring goal was on the pre-normalisation form, and stages 3.5 (<code>AnimApplySpineTwist</code>) and 6 (<code>AnimClampPoseLimits</code>) existed in both engine drivers and in neither preview. <i>Note (3) is a live question about the ENGINE, not the editor: whether mob.cpp should adopt the filter is about every NPC with an arm chain.</i><br><br><b>The ATTACKS lane</b> edits <code>assets/mobs/attack_styles.json</code> next to a rig that is swinging it, because a style\'s four numbers per segment are not a pose: the reach is a BAND POSITION resolved against that rig\'s bones, the hand is the tip minus a MEASURED blade, and three clamps can each move the result. It runs the real <code>StepStrokeProgram</code> at 30 Hz, draws the swept edge coloured by phase, reports tip speed and edge alignment (the two inputs the damage formula scales by), and paints the player flick compass by SAMPLING <code>QuantizeStrike</code> rather than drawing wedges — a max-dot partition is not the wedges you would guess, and guessing is how a sector ends up unreachable. It also surfaces the per-limb half of "how does this attack work on this limb": each arm part\'s <code>poseLimit</code> (rig sidecar) beside <code>melee.torsoShare</code> / <code>elbowPoleCone</code> / <code>headClearM</code> (tuning.json), each field saying which file it writes. <b>One click arms the rig</b> (<code>+ sword</code>) because a blade is not a prop here — <code>SetStroke</code> MEASURES hand-to-point and the reach band is solved against it, so an empty fist previews a different swing. <b>Every edit is undoable</b> through the editor\'s own Ctrl+Z: the lane writes three documents that are not the model and hands each restore to <code>editor.js</code>\'s <code>pushUndoEntry</code>, rather than keeping a second stack, so the shortcut means one thing wherever the pointer is. The layout is its own <code>.atk*</code> vocabulary and not <code>.rigf</code>/<code>.clipprops</code>: those are built for a 260px side panel, and inheriting them gave every field a 104px label column and its own full-width row — twelve numbers rendered as a thousand-pixel column of prose with the values clipped inside 52px boxes.<br><br><b>Verify:</b> <code>node scripts/test_melee.mjs</code> (~1 s, the ports against the C++ they transcribe — hash vectors against an independent oracle, the cut passing through its aim, the azimuth window, determinism) and <code>bash scripts/check_attacks.sh</code> (real Chrome, real server: walks the human and MEASURES whether the arms swing and oppose). The split matters — every function in <code>anim.js</code> was individually correct while the walk preview showed rest arms, because nothing called them.<br><br>The limb shelf has TWO sources and one pair of verbs (swap / add). <b>Saved parts</b> are the ones you put in <code>assets/limbs/</code>, created on first save. <b>Other creatures</b> needs no curation at all: it lists every limb of every other mob file, filtered by default to the tag of the limb you have selected, and lifts one straight out — a creature file is already a limb library, being the same named <code>.vox</code> models plus the same <code>limbs[]</code> sidecar one rung up the hierarchy. Both run the same <code>limblib.js</code> code path, so the incoming joint lands on the outgoing one either way. The open creature is on that list too, marked <i>as last saved</i> and sorted first — once you have swapped an arm OUT, the file on disk is the only place the original still exists. Both need the tuner server (a <code>file://</code> page cannot list assets).<br><br><b>Undo covers structural edits</b> (add / duplicate / delete / split / 2×/÷2 / limb swap / rename), which used to call <code>clearUndo()</code> and bin the whole history. The voxel log addresses cells by MODEL INDEX and a splice renumbers them — but it does not have to SURVIVE the renumbering, only be correct once the structural entry above it is undone, and undo is strictly LIFO. So each one is a before/after snapshot of the model list plus the sidecar (<code>beginStructural</code>/<code>endStructural</code>, which nest and collapse anything pushed inside them). The art palette is deliberately NOT rolled back: it is append-only, so leaving it is always correct and truncating it could strip a colour a later redo needs.<br><br><b>Solo</b> (the <code>S</code> on a model row) is exclusive and self-cancelling: clicking a lit <code>S</code> always brings the whole body back. Shift-click accumulates, for comparing two limbs.'},
 
   telemetrySys:{label:'Telemetry Stream',tag:'cpu',
     desc:'A localhost-only WebSocket server streaming one JSON object per FRAME to this page. Two formats on one socket: v1 stage chips for this tab, v2 full per-component samples for the Performance tab. Zero cost when nobody is attached.',

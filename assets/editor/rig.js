@@ -271,6 +271,53 @@ async function loadHeldItem(id) {
   renderAllPanels();
 }
 
+/**
+ * ARM THE RIG, in one click.
+ *
+ * Previewing a stroke needs a blade in the fist — the driver MEASURES the
+ * hand-to-point distance and solves the whole reach band against it, so an
+ * empty hand is not "the same swing without a sword", it is a different set of
+ * numbers (the point becomes the hand and the band collapses to the bare arm).
+ * Getting there used to be four steps in two panels: find the socket, select
+ * it, open the item dropdown, pick one. This is the shortcut.
+ *
+ * `id` defaults to the first sword-ish item the catalogue offers, so a project
+ * that renames `sword` still gets a weapon rather than a silent no-op.
+ */
+async function equipWeapon(id) {
+  const list = await ensureItemList();
+  if (!list || !list.length) {
+    toast('no items to equip — the item list needs the tuner server', true);
+    return false;
+  }
+  const want = id
+    || list.find(it => it.id === 'sword')?.id
+    || list.find(it => /sword|blade|cleaver|axe/i.test(it.id))?.id
+    || list[0].id;
+  // The grip context has to name a socket this rig actually publishes, or the
+  // item resolves no grip and draws nowhere. Prefer the socket's own name.
+  const sock = weaponSocket();
+  if (!sock) {
+    toast('this rig publishes no socket — add one in the Parts panel first ' +
+          '(select the hand, then "+ socket")', true);
+    return false;
+  }
+  if (sock.name) gripCtx = sock.name;
+  await loadHeldItem(want);
+  if (itemErr) { toast('could not equip ' + want + ': ' + itemErr, true); return false; }
+  // loadHeldItem re-points gripCtx at a context the ITEM declares if this one
+  // is not among them; say so rather than leaving a sword hanging off nothing.
+  if (!itemSc?.grip?.[gripCtx])
+    toast(`"${want}" declares no grip for "${gripCtx}" — it will not be held`, true);
+  else toast(`equipped ${want} on ${sock.part || sock.name}`);
+  rebuildSkeleton();
+  ed.invalidate();
+  renderAllPanels();
+  return true;
+}
+
+const weaponEquipped = () => !!(itemDoc && itemSc && heldItemId);
+
 /** Write the item's sidecar back. Separate from the rig save: different file. */
 async function saveHeldItem() {
   if (!itemSc || !heldItemId) return;
@@ -729,7 +776,14 @@ function socketFrame(sock) {
  * Returns null when there is nothing to place.
  */
 function heldItemTransform() {
-  const sock = activeSocket();
+  // THE SOCKET DOES NOT HAVE TO BE SELECTED. This used to be `activeSocket()`,
+  // which is the socket the GIZMO is on — so loading an item and not clicking
+  // its socket in the rig list drew nothing at all, and the Attacks lane's
+  // readout said "no item held" on a rig that was holding one. Selection is
+  // about what you are dragging; where the sword hangs is a fact about the
+  // grip context. `weaponSocket()` prefers the socket named for that context
+  // and still falls back to the selection.
+  const sock = weaponSocket();
   if (!sock || !itemDoc || !itemSc) return null;
   const grip = itemSc.grip?.[gripCtx];
   if (!grip) return null;                 // item cannot be held this way
@@ -2306,7 +2360,13 @@ function renderHeldItem() {
         loadHeldItem(sel.value || null);
       });
       return sel;
-    })()));
+    })(),
+    // The same one-click arm the Attacks lane offers, here because this is
+    // where you look for it. Picking the socket is the step people miss.
+    !heldItemId ? el('button', {
+      class: 'small primary', title: 'put a sword in this rig\'s hand',
+      onclick: () => equipWeapon(),
+    }, '+ sword') : null));
 
   if (!heldItemId) {
     sideEl.append(el('div', { class: 'rignote' },
@@ -2766,7 +2826,10 @@ function rebuildSkeleton() {
   // avatar.cpp:634 calls SyncStrideClock from the touchdown inside its own
   // UpdateGait; anim.js's updateGait is the NPC transcription, which does not,
   // so the avatar's half is installed as a hook rather than baked in.
-  anim.onTouchdown = c => AN.animSyncStrideClock(skel, anim, c);
+  anim.onTouchdown = c => {
+    dbgTouchdowns[c] = (dbgTouchdowns[c] || 0) + 1;
+    AN.animSyncStrideClock(skel, anim, c);
+  };
   previewOrigin = { x: 0, y: 0, z: 0 };
   previewCtx = {
     origin: AN.v3(), heading: 0, speedNow: 0,
@@ -2783,6 +2846,16 @@ function rebuildSkeleton() {
   AN.animSampleAndBlend(skel, rest, 0);
   AN.animFlatten(skel, rest);
   restModel = rest.model;
+  // SEED THE LIVE POSE TOO, at rest. anim.model[] is what everything asks the
+  // rig about — where the shoulder is, how long the arm is, where the held
+  // blade's edge runs — and it was EMPTY until the first preview step, which
+  // only runs while something is animating. So equipping a sword on a still
+  // rig left the Attacks readout showing a 0-voxel blade and a bare-arm reach
+  // band until you pressed swing, and the driver was handed ClearArm on every
+  // tick in between. The engine has no such gap: anim_.model is populated from
+  // the first tick and stays populated.
+  AN.animSampleAndBlend(skel, anim, 0);
+  AN.animFlatten(skel, anim);
   weaponRebuild();
 }
 
@@ -2809,7 +2882,38 @@ function applyPoseEdit() {
  * react to — without it every foot stays planted and nothing moves, which is
  * correct engine behaviour (mob.cpp:608) but useless as a preview.
  */
-function stepPreview(dt) {
+/**
+ * THE PREVIEW RUNS ON A FIXED STEP, like the engine, not on the frame's dt.
+ *
+ * `UpdateAnimation` is called from the sim tick, so every duration in a gait
+ * block is measured against a constant. Feeding it the raw frame delta makes
+ * the foot state machine frame-rate dependent, and it degenerates outright
+ * once the frame is longer than `stepDuration`: at 10 fps against the human's
+ * 0.1 s swing, `swingT += dt/stepDuration` reaches 1 in a SINGLE frame, so
+ * every foot lands and re-steps every frame and the measured stride rate is
+ * really the frame rate. Measured in the headless harness: stepPeriod 0.085 s
+ * against a 0.085 s frame, giving 5.9 strides/s on a rig walking at 0.55.
+ *
+ * Sub-stepping costs nothing at 60 fps (one step per frame) and keeps a slow
+ * or backgrounded tab honest. Capped so a stalled tab does not try to catch up
+ * a hundred steps at once — the same bound weaponStep uses for the same reason.
+ */
+const kPreviewDt = 1 / 60;
+let previewAccum = 0, previewPrimed = false;
+
+function stepPreview(dtFrame) {
+  if (!skel || !anim) return;
+  previewAccum += dtFrame;
+  let n = Math.min(Math.floor(previewAccum / kPreviewDt), 6);
+  previewAccum -= n * kPreviewDt;
+  // The first call must produce a pose even if the frame was short, or nothing
+  // is drawn until the accumulator fills.
+  if (n <= 0 && !previewPrimed) n = 1;
+  previewPrimed = true;
+  while (n-- > 0) stepPreviewFixed(kPreviewDt);
+}
+
+function stepPreviewFixed(dt) {
   if (!skel || !anim) return;
   dbgPreviewSteps++;
   const sidecar = ed.getSidecar() || {};
@@ -3149,6 +3253,9 @@ function weaponRebuild() {
   // name is what the stroke's asymmetric azimuth limits want.
   const hn = wpHandPart >= 0 ? (skel.parts[wpHandPart].name || '') : '';
   melee.setHandSign(hn.endsWith('.L') ? -1 : 1);
+  // ...and what it is holding, so a still rig reports a real blade and a real
+  // band rather than the empty-fist defaults. See weaponSeedFromRig.
+  weaponSeedFromRig();
 }
 
 // tuning.json's melee block, live off the HOST'S OWN tuning document — the
@@ -3299,16 +3406,33 @@ function weaponStep(dtFrame) {
 // arm, the program has no style to read, or the driver is refusing the input —
 // and from outside all four are the same frozen phase (CLAUDE.md rule 6).
 let dbgPreviewSteps = 0, dbgWeaponTicks = 0, dbgNoStyle = 0;
+const dbgTouchdowns = {};
 
-function weaponTick() {
-  dbgWeaponTicks++;
-  // ---- 1. WHERE THE BLADE IS NOW ---------------------------------------
+/**
+ * Tell the driver what arm and blade it has, from the CURRENT pose.
+ *
+ * Split out of weaponTick because it is also the answer to "what would this
+ * stroke do" on a rig that is standing still. `bladeLen_` and therefore the
+ * whole reach band live inside the MeleeState and are only written here, so
+ * before this was called at rest the Attacks readout showed a 0-voxel blade
+ * and a bare-arm band on a rig that was visibly holding a sword — and the
+ * `reach` field of an authored segment, which is a position in that band,
+ * was being previewed against the wrong annulus.
+ */
+function weaponSeedFromRig() {
+  if (!melee) return;
   const seed = weaponArmSeed();
   if (seed) melee.setStroke(seed.hand, seed.tip, seed.flat, seed.reach);
   else melee.clearArm();
   const keep = headKeepOut();
   if (keep) melee.setKeepOut(keep.center, keep.radius);
   else melee.clearKeepOut();
+}
+
+function weaponTick() {
+  dbgWeaponTicks++;
+  // ---- 1. WHERE THE BLADE IS NOW ---------------------------------------
+  weaponSeedFromRig();
 
   // ---- 2. the basis. Heading is 0 and the rig is authored in its own frame,
   // so this is the rig's facing basis: fwd = +Z, up = +Y, and right = fwd x up
@@ -3440,8 +3564,17 @@ function applyWeaponArm() {
     const bend = AN.animHingeAngleAbout(delta, axis);
     if (bend !== null && bend < 0) axis = AN.vmul(axis, -1);
   }
-  return { part: i1, axis, blend: clamp(pose.steerAmount, 0, 1) };
+  lastElbowOverride = { part: i1, axis, blend: clamp(pose.steerAmount, 0, 1) };
+  return lastElbowOverride;
 }
+
+// The override the stage-6 clamp was last handed, kept for the test seam.
+// Measuring the elbow's bend about its AUTHORED axis while the driver is
+// steering the plane reads a different quantity — mob.cpp:7918 is the whole
+// note on why the two senses name one plane but only one makes the authored
+// [0, 130] describe the bend. A probe that used the wrong one reported -64
+// degrees on a perfectly legal arm.
+let lastElbowOverride = null;
 
 /**
  * THE SEAM attacks.js is given. Everything the panel needs from the rig is
@@ -3456,9 +3589,19 @@ function bindAttacks() {
     rerender: () => renderTimeline(),
     limbByName,
     sidecarName: () => ed.getDocName?.() || '<mob>.json',
+    sidecar: () => sc(),
     touchSidecar: () => touched(),
     tuning: () => tuningDoc(),
     touchTuning: () => tuningTouch(),
+    // ONE Ctrl+Z for the whole tab. The Attacks lane edits three documents
+    // that are not the model, and a second undo stack would make the shortcut
+    // mean different things depending on where the pointer was.
+    pushUndo: (label, undoFn, redoFn) => ed.pushUndoEntry?.(label, undoFn, redoFn),
+    equipWeapon: (id, off) => (off ? loadHeldItem(null).then(() => {
+      rebuildSkeleton(); ed.invalidate(); renderAllPanels(); return true;
+    }) : equipWeapon(id)),
+    weaponEquipped,
+    weaponName: () => heldItemId || '',
     onTuningChanged: () => { if (melee) melee.tuning = meleeTuning(); },
     onStylesChanged: () => { /* a live swing keeps running on the edited data */ },
     onTrailToggled: () => { strokeTrail.length = 0; ed.setStrokeTrail?.(null); },
@@ -4606,6 +4749,29 @@ function installTestSeam() {
     },
     setPreviewSpeed: v => { gaitSpeedScale = +v || 0; renderGaitReadout(); },
     strideRate: () => anim?.strideRate ?? 0,
+    gaitDebug: () => {
+      if (!skel || !anim) return {};
+      const legs = skel.chains.map((c, i) => [c, i]).filter(([c]) => c.tag === 'leg');
+      return {
+        touchdowns: {...dbgTouchdowns},
+        swinging: anim.feet.map(f => f.swinging ? 1 : (f.valid ? 0 : -1)),
+        chainTags: skel.chains.map(c => c.tag),
+        stepPeriod: +(anim.stepPeriod ?? 0).toFixed(4),
+        strideRate: +(anim.strideRate ?? 0).toFixed(3),
+        legLength: +(anim.feet[legs[0]?.[1]]?.legLength ?? 0).toFixed(2),
+        stepDuration: skel.gait.stepDuration,
+        stepThresholdVox: +((skel.gait.stepThreshold *
+          (anim.feet[legs[0]?.[1]]?.legLength ?? 0)).toFixed(2)),
+        speedNow: +(previewCtx?.speedNow ?? 0).toFixed(2),
+        defSpeed: +(previewCtx?.defSpeed ?? 0).toFixed(2),
+        // NO `drift` FIELD. The obvious one — |planted - origin| — is the hip
+        // offset plus the stride bias and NOT what updateGait thresholds on,
+        // and reporting it read ~30 against a threshold of 16 and pointed at a
+        // stepping bug that did not exist. The number that actually explains
+        // the clock is the TOUCHDOWN COUNT above: two of them means the EMA is
+        // still on its garbage first sample, not that the feet are stuck.
+      };
+    },
     counters: () => ({ preview: dbgPreviewSteps, weaponTicks: dbgWeaponTicks,
                        noStyle: dbgNoStyle, chain: wpChain,
                        hasMelee: !!melee, strokeStyle,
@@ -4613,15 +4779,24 @@ function installTestSeam() {
                        accum: +strokeAccum.toFixed(4) }),
     autoLoco: () => autoLoco,
     styleNames: () => (ATK.library()?.styles || []).map(s => s.name),
+    // The SAME fields the panel's own armInfo reports, so the harness and the
+    // readout cannot disagree about whether a blade is in the fist. They were
+    // two different shapes for one tick and the sword assertion read undefined
+    // as zero, which is the "bare count" failure in miniature.
     armInfo: () => {
       const ch = (skel && wpChain >= 0) ? skel.chains[wpChain] : null;
       const seed = weaponArmSeed();
+      const band = melee ? melee.reachBand() : { lo: 0, hi: 0 };
       return {
         chain: wpChain,
         handPart: wpHandPart >= 0 ? skel?.parts[wpHandPart]?.name : '',
         armName: ch ? ch.parts.map(i => skel.parts[i]?.name).join(' → ') : '',
         reach: seed?.reach ?? 0,
+        bladeLen: melee?.bladeLen_ ?? 0,
+        bandLo: band.lo, bandHi: band.hi,
+        blade: !!bladeSegmentModel(),
         socket: weaponSocket()?.name ?? '',
+        item: heldItemId || '',
       };
     },
     strokeState: () => {
@@ -4642,13 +4817,20 @@ function installTestSeam() {
       return s ? { windup: s.windup.ticks, cut: s.cut.ticks,
                    recover: s.recoverTicks } : null;
     },
-    setStyleTicks: (name, seg, ticks) => {
-      const s = ATK.library()?.styles.find(x => x.name === name);
-      if (!s) return false;
-      s.raw[seg] = s.raw[seg] || {};
-      s.raw[seg].ticks = ticks;
-      s[seg === 'recover' ? 'recoverTicks' : seg].ticks = ticks;
-      if (seg === 'recover') s.recoverTicks = ticks;
+    // Drives the box the AUTHOR drives, so the undo entry the panel pushes is
+    // the one under test. A seam that wrote the JSON directly would prove the
+    // data is mutable and nothing about whether Ctrl+Z reaches it.
+    setStyleTicksUI: (name, seg, ticks) => {
+      const i = ATK.library()?.styles.findIndex(x => x.name === name);
+      if (i === undefined || i < 0) return false;
+      ATK.selectStyle(i);
+      const box = [...(timelineEl?.querySelectorAll('.atkseg input.atknum') || [])];
+      // Column order is ticks, az, el, reach; rows are windup, cut, recover.
+      const row = { windup: 0, cut: 4, recover: 8 }[seg];
+      const inp = box[row];
+      if (!inp) return false;
+      inp.value = String(ticks);
+      inp.dispatchEvent(new Event('change', { bubbles: true }));
       return true;
     },
     // Stage 6 is only meaningful if the rig authors a limit for it to enforce.
@@ -4660,7 +4842,13 @@ function installTestSeam() {
       if (!p?.hasPoseLimit || p.parent < 0) return null;
       const delta = AN.qmul(AN.qconj(p.rest.rot),
         AN.qmul(AN.qconj(anim.model[p.parent].rot), anim.model[i1].rot));
-      const ang = AN.animHingeAngleAbout(delta, AN.vnorm(p.poseAxis));
+      // About the axis the CLAMP used, not the authored one — while the driver
+      // steers the bend plane those are different questions. See the note on
+      // lastElbowOverride.
+      const ov = (lastElbowOverride && lastElbowOverride.part === i1 &&
+                  lastElbowOverride.blend > 0) ? lastElbowOverride : null;
+      const axis = ov ? AN.vnorm(ov.axis) : AN.vnorm(p.poseAxis);
+      const ang = AN.animHingeAngleAbout(delta, axis);
       return ang === null ? null : ang * 180 / Math.PI;
     },
   };
