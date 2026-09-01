@@ -207,13 +207,23 @@ export function sampleTrack(track, tMs) {
   };
 }
 
-// anim.cpp:185 ClipFade
-export function clipFade(clip, tMs, stopping, stopFade) {
+/**
+ * anim.cpp:215 ClipFade.
+ *
+ * THE BLEND-IN READS `ageMs`, NOT `tMs`. Time since the instance STARTED does
+ * not wrap, so a looping clip fades in once instead of re-fading at the top of
+ * every cycle — which is what a `tMs` blend-in does, and what this port did
+ * until 2026-09-01: an 180 ms blend-in on a 600 ms looping walk re-dipped the
+ * arms to zero weight three times a second in the preview and never in the
+ * game. Callers that have no age (a one-shot scrub) pass tMs for both, which
+ * is exactly what the pre-ageMs engine did.
+ */
+export function clipFade(clip, tMs, ageMs, stopping, stopFade) {
   let f = 1;
-  if (clip.blendInMs > 0) f = Math.min(f, tMs / clip.blendInMs);       // :187
-  if (!clip.loop && clip.blendOutMs > 0 && clip.durationMs > 0)        // :188
+  if (clip.blendInMs > 0) f = Math.min(f, ageMs / clip.blendInMs);     // :218
+  if (!clip.loop && clip.blendOutMs > 0 && clip.durationMs > 0)        // :219
     f = Math.min(f, (clip.durationMs - tMs) / clip.blendOutMs);
-  if (stopping) f = Math.min(f, stopFade);                             // :190
+  if (stopping) f = Math.min(f, stopFade);                             // :221
   return clamp(f, 0, 1);
 }
 
@@ -250,16 +260,24 @@ export function animSampleAndBlend(sk, st, dt) {
     }
     const c = sk.clips[inst.clip];
 
-    inst.timeMs += dt * 1000;                                  // :225
-    if (c.loop && c.durationMs > 0) {                          // :226
+    // THE PLAYHEAD CARRIES THE INSTANCE'S RATE; THE AGE DOES NOT (anim.h:307).
+    // Clamped positive so a bad rate can stall a clip but never run it
+    // backwards through its own blend. `rate` is how the avatar locks one
+    // authored arm cycle to one live stride at any pace — see strideRateFor.
+    if (!Number.isFinite(inst.rate)) inst.rate = 1;
+    if (!Number.isFinite(inst.ageMs)) inst.ageMs = inst.timeMs || 0;
+    inst.timeMs += dt * 1000 * Math.max(inst.rate, 0);         // :301
+    inst.ageMs += dt * 1000;                                   // :302
+    if (c.loop && c.durationMs > 0) {                          // :303
       while (inst.timeMs >= c.durationMs) inst.timeMs -= c.durationMs;
-    } else if (c.durationMs > 0 && inst.timeMs >= c.durationMs) {  // :228
+    } else if (c.durationMs > 0 && inst.timeMs >= c.durationMs) {  // :305
       inst.timeMs = c.durationMs;
       inst.stopping = true;
     }
-    if (inst.stopping) inst.fade = Math.max(0, inst.fade - dt * 6);  // :232
+    if (inst.stopping) inst.fade = Math.max(0, inst.fade - dt * 6);  // :309
     else inst.fade = 1;
-    const w = inst.weight * clipFade(c, inst.timeMs, inst.stopping, inst.fade);  // :234
+    const w = inst.weight *
+      clipFade(c, inst.timeMs, inst.ageMs, inst.stopping, inst.fade);  // :312
     if (inst.stopping && w <= 0) { st.clips.splice(ci, 1); continue; }  // :235
     ci++;
     if (w <= 0) continue;                                      // :240
@@ -484,6 +502,9 @@ export function animFlipbookFrame(fb, elapsedMs) {
    ========================================================================== */
 
 export const TWO_PI = 6.2831853;
+// anim.h:485. Quoted, not re-derived: it is the constant both engine drivers
+// scale their normalized spring goal by.
+export const kSpringVelScale = 0.6;
 
 /**
  * Advance the foot state machine one step. Mirrors UpdateGait.
@@ -496,6 +517,35 @@ export const TWO_PI = 6.2831853;
 export function updateGait(sk, st, ctx, dt) {
   const g = sk.gait;
   if (!sk.chains.length) return;                               // mob.cpp:605
+
+  /* ---- WHICH CHAINS STEP: the one place the two engine drivers DISAGREE ----
+   *
+   * avatar.cpp:479 skips every chain whose tag is not "leg" — "arm chains
+   * never step" — and avatar.cpp:310 marks their FootState invalid outright.
+   * mob.cpp's UpdateGait (2448) has no such filter: it walks `sk.chains` whole
+   * and treats an arm chain as a foot, planting the hand on the ground and
+   * scheduling steps for it. An arm chain matches none of the gait's leg
+   * `groups`, so the one-group-swinging rule gives it a group of its own and
+   * it steps freely alongside the legs.
+   *
+   * That is not a transcription choice, it is a real difference between the
+   * two drivers, and it is visible: previewing the shipped human (an avatar
+   * rig, two leg chains and two arm chains) under the NPC rule planted both
+   * HANDS like feet. Measured, hand.R tracked foot.R at a correlation of
+   * -1.00 and the arms' own authored 13-degree walk swing was reduced to about
+   * 6 degrees of IK residue — which is most of "the tuner's walk looks
+   * nothing like the game".
+   *
+   * The editor follows the AVATAR, because the rigs authored here are
+   * humanoids whose hands must not step, and because the human rig IS the
+   * player avatar. `ctx.armChainsStep` opts back into the NPC rule for anyone
+   * who needs to see it.
+   *
+   * NOT FIXED IN THE ENGINE HERE. Whether mob.cpp should adopt the filter is a
+   * question about every NPC with an arm chain, not about the editor.
+   */
+  const steps = c => ctx.armChainsStep || sk.chains[c].tag === 'leg' ||
+                     !sk.chains.some(x => x.tag === 'leg');
 
   const fwd = v3(Math.sin(ctx.heading), 0, Math.cos(ctx.heading));  // :607
   const speedFactor = clamp(ctx.speedNow / Math.max(ctx.defSpeed, 0.01), 0, 1.5);  // :612
@@ -518,6 +568,11 @@ export function updateGait(sk, st, ctx, dt) {
   for (let c = 0; c < sk.chains.length && c < st.feet.length; c++) {
     const ch = sk.chains[c];
     const f = st.feet[c];
+
+    // avatar.cpp:310 — a non-stepping chain's FootState is invalid, not merely
+    // unscheduled, so the caller's IK loop (which gates on `valid`) leaves the
+    // arm to the clips and the weapon driver.
+    if (!steps(c)) { f.valid = false; f.swinging = false; continue; }
 
     let alive = true;                                          // :640
     for (const p of ch.parts)
@@ -550,6 +605,11 @@ export function updateGait(sk, st, ctx, dt) {
         f.swingT = 0;
         f.swinging = false;
         f.planted = { ...f.swingTo };
+        // TOUCHDOWN. avatar.cpp:634 calls SyncStrideClock from exactly here
+        // and mob.cpp does not — the NPC path keeps a free oscillator. The
+        // hook keeps that split visible instead of picking one for both: a
+        // caller that wants the avatar's behaviour installs it.
+        if (st.onTouchdown) st.onTouchdown(c);
       } else {
         const flat = vadd(f.swingFrom, vmul(vsub(f.swingTo, f.swingFrom), f.swingT));  // :683
         // :685 sin(t*pi) arc: zero lift at both ends, peak at mid-swing
@@ -659,14 +719,25 @@ export function applyProceduralLayer(sk, st, ctx, dt) {
     }
   }
 
-  // ---- springs, mob.cpp:824 ----
+  // ---- springs, mob.cpp:2694 ----
+  //
+  // VELOCITY IS NORMALIZED BY THE DEF'S OWN TOP SPEED, so `gain` means
+  // "radians of lag at full speed" for every def regardless of how fast that
+  // def moves. This port used RAW voxels/second times a bare 0.05 until
+  // 2026-09-01, which is what mob.cpp and avatar.cpp both did before the
+  // avatar's 60-voxel/s top speed pegged every spring at maxAngle permanently
+  // and they were unified on the normalized form. Three drivers must agree
+  // here or a def's springs mean something different depending on which one
+  // is animating it — and the editor was the third.
+  const speedRef = Math.max(ctx.defSpeed, 0.01);
   for (let i = 0; i < sk.parts.length; i++) {
     const p = sk.parts[i];
-    if (!p.hasSpring) continue;                                // :828
+    if (!p.hasSpring) continue;                                // :2697
     const gain = p.spring.gain ?? 1;
     const maxAngle = p.spring.maxAngle ?? 0.7;
-    const goal = v3(-st.velocity.z * gain * 0.05, 0, st.velocity.x * gain * 0.05);  // :829
-    goal.x = clamp(goal.x, -maxAngle, maxAngle);               // :831
+    const goal = v3(-st.velocity.z / speedRef * gain * kSpringVelScale, 0,
+                    st.velocity.x / speedRef * gain * kSpringVelScale);  // :2702
+    goal.x = clamp(goal.x, -maxAngle, maxAngle);               // :2704
     goal.z = clamp(goal.z, -maxAngle, maxAngle);
     if (!st.springs[i]) st.springs[i] = { x: v3(), v: v3() };
     animSpringStep(p.spring, st.springs[i], goal, dt);         // :833
@@ -690,6 +761,75 @@ export function applyProceduralLayer(sk, st, ctx, dt) {
    the model-centre fallback and the UI says so. That is the one documented
    divergence in the rig build.
    ========================================================================== */
+
+/**
+ * mob.cpp:505-580 — the sidecar's `poseLimit` block into the three shapes
+ * AnimClampPoseLimits understands. BALL FORM is selected by the presence of
+ * `bone`, because the bone direction is the thing the axis form has no use for
+ * and the ball form cannot work without.
+ *
+ * The loader's perpendicularity check on `reach` normals is reproduced: the
+ * closed-form projection in clampDirHalfSpaces is only the NEAREST legal
+ * direction when the planes are perpendicular, so a tilted pair is a load
+ * error in the engine and is reported (not silently solved) here.
+ */
+function parsePoseLimit(pl) {
+  const off = {
+    hasPoseLimit: false, poseAxis: v3(1, 0, 0), poseMin: 0, poseMax: 0,
+    poseHinge: false,
+    poseBall: { has: false, bone: v3(0, -1, 0), reachCount: 0,
+                reachNormal: [v3(), v3()], reachSin: [0, 0],
+                hasTwist: false, twistMin: 0, twistMax: 0 },
+    poseLimitWarn: '',
+  };
+  if (!pl || typeof pl !== 'object') return off;
+  const kDeg = 3.14159265 / 180;
+  const vec = (key, dflt) => (Array.isArray(pl[key]) && pl[key].length === 3)
+    ? v3(+pl[key][0], +pl[key][1], +pl[key][2]) : dflt;
+  const out = { ...off, poseBall: { ...off.poseBall, reachNormal: [v3(), v3()], reachSin: [0, 0] } };
+  if (pl.bone !== undefined) {
+    const b = out.poseBall;
+    b.has = true;
+    b.bone = vec('bone', v3(0, -1, 0));
+    if (vlen(b.bone) < 1e-5) { out.poseLimitWarn = 'poseLimit.bone is zero'; b.has = false; }
+    else b.bone = vnorm(b.bone);
+    if (Array.isArray(pl.reach)) {
+      for (const r of pl.reach) {
+        if (b.reachCount >= 2) {
+          out.poseLimitWarn = 'poseLimit.reach takes at most 2 planes';
+          break;
+        }
+        let nrm = (r && Array.isArray(r.normal) && r.normal.length === 3)
+          ? v3(+r.normal[0], +r.normal[1], +r.normal[2]) : v3(0, 0, 1);
+        if (vlen(nrm) < 1e-5) { out.poseLimitWarn = 'poseLimit.reach normal is zero'; continue; }
+        nrm = vnorm(nrm);
+        if (b.reachCount === 1 && Math.abs(vdot(nrm, b.reachNormal[0])) > 1e-3)
+          out.poseLimitWarn = 'poseLimit.reach normals must be perpendicular';
+        b.reachNormal[b.reachCount] = nrm;
+        // "at most N degrees past this plane" — the plane itself is 0.
+        b.reachSin[b.reachCount] =
+          Math.sin(clamp(Number.isFinite(+r?.max) ? +r.max : 0, -90, 90) * kDeg);
+        b.reachCount++;
+      }
+    }
+    if (pl.twist && typeof pl.twist === 'object') {
+      b.hasTwist = true;
+      b.twistMin = (Number.isFinite(+pl.twist.min) ? +pl.twist.min : -180) * kDeg;
+      b.twistMax = (Number.isFinite(+pl.twist.max) ? +pl.twist.max : 180) * kDeg;
+      if (b.twistMin > b.twistMax) { const t = b.twistMin; b.twistMin = b.twistMax; b.twistMax = t; }
+    }
+  } else {
+    out.hasPoseLimit = true;
+    out.poseAxis = vec('axis', v3(1, 0, 0));
+    out.poseMin = (Number.isFinite(+pl.min) ? +pl.min : -180) * kDeg;
+    out.poseMax = (Number.isFinite(+pl.max) ? +pl.max : 180) * kDeg;
+    if (out.poseMin > out.poseMax) { const t = out.poseMin; out.poseMin = out.poseMax; out.poseMax = t; }
+    // A hinge is one DOF, not one bounded DOF: it also DISCARDS the off-axis
+    // swing (anim.h, AnimPart::poseHinge).
+    out.poseHinge = !!pl.hinge;
+  }
+  return out;
+}
 
 export function buildSkeleton(sidecar, models) {
   const rawLimbs = Array.isArray(sidecar?.limbs) ? sidecar.limbs : [];
@@ -731,6 +871,9 @@ export function buildSkeleton(sidecar, models) {
       swingPhase: +l.swingPhase || 0,
       hasSpring: !!l.spring,
       spring: l.spring || { halflife: 0.15, gain: 1, maxAngle: 0.7 },
+      // POSE-SPACE joint limits (anim.h:243, parsed at mob.cpp:508). Degrees
+      // in, radians out, exactly where the engine converts them.
+      ...parsePoseLimit(l.poseLimit),
       rest: { rot: qid(), pos: v3() },
       anchorLocal: v3(),
       anchorAuto: !(Array.isArray(l.anchor) && l.anchor.length === 3),
@@ -896,6 +1039,387 @@ export function buildSkeleton(sidecar, models) {
   };
 }
 
+/* ============================================================================
+   Stage 3.5 — the torso serves a live swing. anim.cpp:399 AnimApplySpineTwist.
+
+   Runs between the procedural layer and the flatten, in BOTH engine drivers
+   (mob.cpp:2718, avatar.cpp:1147). The editor's preview omitted it entirely
+   until 2026-09-01, so a rig posed mid-stroke stood square while the game
+   leaned its chest into the cut.
+   ========================================================================== */
+
+export function animApplySpineTwist(sk, st, yawRight, pitchUp, rootLimb) {
+  if (Math.abs(yawRight) < 1e-4 && Math.abs(pitchUp) < 1e-4) return;
+  let nSpine = 0;
+  for (let i = 0; i < sk.parts.length; i++)
+    if (sk.parts[i].tag === 'spine' && i !== rootLimb) nSpine++;
+  if (nSpine === 0) return;
+  // Model-space signs, both verified in the engine against geometry.py: a
+  // positive rotation about +X pitches the nose DOWN, so "chest up" is the
+  // negative angle; a positive rotation about +Y takes +Z (the rig's forward)
+  // to +X and the basis right is fwd x up = -X, so "toward the right" is also
+  // the negative angle. If a rig ever reads mirrored the A/B is
+  // melee.torsoShare = 0, not a sign hunt across callers.
+  const yawPer = -yawRight / nSpine;
+  const pitchPer = -pitchUp / nSpine;
+  const d = qmul(qaxisangle(v3(0, 1, 0), yawPer),
+                 qaxisangle(v3(1, 0, 0), pitchPer));
+  for (let i = 0; i < sk.parts.length; i++) {
+    if (sk.parts[i].tag !== 'spine' || i === rootLimb) continue;
+    if (i < (st.partAlive?.length ?? 0) && !st.partAlive[i]) continue;
+    st.local[i].rot = qnorm(qmul(st.local[i].rot, d));
+  }
+}
+
+/* ============================================================================
+   Stage 6 — the pose has to be anatomically possible.
+   anim.cpp:585-830 ClampTwist / TwistAngleAboutImpl / ClampHinge /
+   ClampDirHalfSpaces / ClampBall / AnimClampPoseLimits.
+
+   Runs AFTER all IK, because the IK is what puts a joint outside its range;
+   running it before would clamp a pose the solver is about to overwrite.
+   Works purely in st.model[] and deliberately does NOT write st.local[].
+   ========================================================================== */
+
+// anim.cpp:592 ClampTwist — swing-twist decomposition, clamp the twist,
+// recompose. The swing is left ALONE, which is what makes a one-axis limit
+// useful on a ball joint.
+function clampTwist(q, axis, lo, hi) {
+  const d = q.x * axis.x + q.y * axis.y + q.z * axis.z;
+  let tw = { x: axis.x * d, y: axis.y * d, z: axis.z * d, w: q.w };
+  const mag = Math.sqrt(tw.x * tw.x + tw.y * tw.y + tw.z * tw.z + tw.w * tw.w);
+  // Degenerate: `q` is a half turn about an axis perpendicular to ours, so the
+  // projection carries no information. Inventing an angle would snap the joint.
+  if (mag < 1e-5) return q;
+  tw = { x: tw.x / mag, y: tw.y / mag, z: tw.z / mag, w: tw.w / mag };
+  const s = tw.x * axis.x + tw.y * axis.y + tw.z * axis.z;
+  let ang = 2 * Math.atan2(s, tw.w);
+  // Wrap into (-pi, pi] BEFORE clamping: an angle past a half turn is nearer
+  // the opposite stop, and clamping unwrapped drives the joint the long way.
+  while (ang > 3.14159265) ang -= TWO_PI;
+  while (ang <= -3.14159265) ang += TWO_PI;
+  const clamped = clamp(ang, lo, hi);
+  if (Math.abs(clamped - ang) < 1e-6) return q;        // already legal
+  const swing = qmul(q, qconj(tw));
+  return qnorm(qmul(swing, qaxisangle(axis, clamped)));
+}
+
+/**
+ * anim.cpp:629 TwistAngleAboutImpl, exported as AnimHingeAngleAbout — THE
+ * SIGNED ANGLE OF `q` ABOUT `axis`, WRAPPED INTO (-pi, pi].
+ *
+ * PUBLIC because two places must agree about it: the hinge clamp reads a
+ * joint's bend with it, and the weapon arm reads the SAME bend one stage
+ * earlier to decide which sense of its steered hinge axis makes the authored
+ * [min, max] describe it. Those were two copies in the engine and they
+ * differed in exactly the wrap.
+ */
+export function animHingeAngleAbout(q, axis) {
+  const d = q.x * axis.x + q.y * axis.y + q.z * axis.z;
+  let t = { x: axis.x * d, y: axis.y * d, z: axis.z * d, w: q.w };
+  const mag = Math.sqrt(t.x * t.x + t.y * t.y + t.z * t.z + t.w * t.w);
+  if (mag < 1e-5) return null;
+  t = { x: t.x / mag, y: t.y / mag, z: t.z / mag, w: t.w / mag };
+  let ang = 2 * Math.atan2(t.x * axis.x + t.y * axis.y + t.z * axis.z, t.w);
+  while (ang > 3.14159265) ang -= TWO_PI;
+  while (ang <= -3.14159265) ang += TWO_PI;
+  return ang;
+}
+
+// anim.cpp:647 ClampHinge — ONE degree of freedom: a pure rotation about
+// `axis` by the clamped angle, with the off-axis swing DISCARDED.
+function clampHinge(q, axis, lo, hi) {
+  // No recoverable angle: the nearest legal HINGE is the one the joint is
+  // already closest to, and with no angle to read that is the rest end.
+  const ang = animHingeAngleAbout(q, axis) ?? 0;
+  return qaxisangle(axis, clamp(ang, lo, hi));
+}
+
+/**
+ * anim.cpp:659 ClampDirHalfSpaces — clamp the unit direction `d` into the
+ * intersection of up to two half-spaces `d . n[k] <= s[k]`, NEAREST legal
+ * direction. The normals are mutually perpendicular (the loader enforces it),
+ * so completing them to an orthonormal frame turns the projection into three
+ * independent components and the unit-length identity supplies the third.
+ */
+function clampDirHalfSpaces(d, n, s, count) {
+  if (count <= 0) return d;
+  const n0 = n[0];
+  let n1 = count >= 2 ? n[1] : (Math.abs(n0.x) < 0.9 ? v3(1, 0, 0) : v3(0, 1, 0));
+  n1 = vsub(n1, vmul(n0, vdot(n0, n1)));
+  if (vlen(n1) < 1e-5) return d;
+  n1 = vnorm(n1);
+  const n2 = vcross(n0, n1);
+  const c0 = vdot(d, n0), c1 = vdot(d, n1), c2 = vdot(d, n2);
+  const w0 = Math.min(c0, s[0]);
+  const w1 = count >= 2 ? Math.min(c1, s[1]) : c1;
+  if (w0 === c0 && w1 === c1) return d;      // already legal, bit-for-bit
+  const rem = 1 - w0 * w0 - w1 * w1;
+  if (rem <= 0) {
+    // Both stops pinned so hard no unit vector satisfies them: give back the
+    // closest thing that exists rather than a NaN.
+    const v = vadd(vmul(n0, w0), vmul(n1, w1));
+    return vlen(v) > 1e-5 ? vnorm(v) : d;
+  }
+  // The third component keeps its sign — taking it from the INPUT makes the
+  // choice vary continuously everywhere except one measure-zero corner.
+  const s2 = Math.sqrt(rem) * (c2 < 0 ? -1 : 1);
+  return vnorm(vadd(vadd(vmul(n0, w0), vmul(n1, w1)), vmul(n2, s2)));
+}
+
+/**
+ * anim.cpp:702 ClampBall — swing-twist for a ball joint: bound where the bone
+ * POINTS, then bound how far it rolls about itself. The decomposition is exact
+ * rather than approximate.
+ */
+function clampBall(q, lim) {
+  const bone = lim.bone;
+  const dOld = qrot(q, bone);
+  const dNew = clampDirHalfSpaces(dOld, lim.reachNormal, lim.reachSin, lim.reachCount);
+  const swing = qfromto(bone, dOld);
+  let twist = qnorm(qmul(qconj(swing), q));
+  if (lim.hasTwist) twist = clampTwist(twist, bone, lim.twistMin, lim.twistMax);
+  const swingNew = (dNew.x === dOld.x && dNew.y === dOld.y && dNew.z === dOld.z)
+    ? swing : qfromto(bone, dNew);
+  return qnorm(qmul(swingNew, twist));
+}
+
+/**
+ * anim.cpp:724 AnimClampPoseLimits.
+ *
+ * `overrides` is a list of { part, axis, blend } — anim.h PoseAxisOverride, A
+ * HINGE WHOSE PLANE IS STEERED. The weapon arm supplies one: the stroke driver
+ * rotates the elbow's bend plane into the plane of the cut, and an authored
+ * axis fixed in the upper arm's frame no longer coincides with it. The RANGE
+ * is never touched, only which plane the one degree of freedom lives in.
+ */
+export function animClampPoseLimits(sk, st, overrides) {
+  const n = sk.parts.length;
+  if ((st.model?.length ?? 0) < n) return;
+  let any = false;
+  for (let i = 0; i < n; i++) any = any || sk.parts[i].hasPoseLimit || sk.parts[i].poseBall.has;
+  if (!any) return;              // the common case: nothing authored to pay for
+
+  // SNAPSHOT THE POSE AS THE IK LEFT IT, expressed parent-relative. st.local[]
+  // cannot be used: the IK writes st.model[] directly and never updates local,
+  // so local still holds the PRE-IK pose. Re-deriving from the model pair is
+  // what lets a clamp on the hip carry the knee with it while KEEPING the
+  // knee's own solved bend.
+  const eff = new Array(n);
+  for (let i = 0; i < n; i++) {
+    const par = sk.parts[i].parent;
+    if (par < 0 || par >= n) { eff[i] = { rot: st.model[i].rot, pos: st.model[i].pos }; continue; }
+    const inv = qconj(st.model[par].rot);
+    eff[i] = {
+      rot: qnorm(qmul(inv, st.model[i].rot)),
+      pos: qrot(inv, vsub(st.model[i].pos, st.model[par].pos)),
+    };
+  }
+
+  // Parents-first, which the topological part order guarantees: a child
+  // recomposes against a parent that has already been clamped, so the
+  // correction propagates down the limb in one pass with no second flatten.
+  for (let i = 0; i < n; i++) {
+    const p = sk.parts[i];
+    const par = p.parent;
+    if (p.hasPoseLimit || p.poseBall.has) {
+      // Measured against REST, not against the parent: "0 degrees" has to mean
+      // the pose the art was drawn in.
+      const rest = p.rest.rot;
+      let delta = qmul(qconj(rest), eff[i].rot);
+      let moved = false;
+      // BALL FIRST, THEN THE AXIS FORM. No rig authors both, and running the
+      // ball last would make "which won" depend on the order, not the data.
+      if (p.poseBall.has) {
+        delta = clampBall(delta, p.poseBall);
+        moved = true;
+      } else if (p.hasPoseLimit) {
+        let raw = p.poseAxis;
+        // THE PLANE MAY BE STEERED; THE RANGE MAY NOT.
+        for (const ov of (overrides || [])) {
+          if (ov.part !== i || ov.blend <= 0) continue;
+          const b = Math.min(ov.blend, 1);
+          const a = vnorm(raw);
+          const o = vnorm(ov.axis);
+          // A defensive sign fix: the two senses name the same PLANE but only
+          // one makes the authored [min, max] describe the bend the joint is
+          // in, and blending an axis against its own negation passes through
+          // zero, where the length guard below silently drops the clamp.
+          const as = vdot(a, o) < 0 ? vmul(a, -1) : a;
+          raw = vadd(as, vmul(vsub(o, as), b));
+          break;
+        }
+        const len = vlen(raw);
+        if (len > 1e-5) {
+          const axis = vmul(raw, 1 / len);
+          delta = p.poseHinge ? clampHinge(delta, axis, p.poseMin, p.poseMax)
+                              : clampTwist(delta, axis, p.poseMin, p.poseMax);
+          moved = true;
+        }
+      }
+      if (moved) eff[i].rot = qnorm(qmul(rest, delta));
+    }
+    if (par < 0 || par >= n) {
+      st.model[i] = eff[i];
+    } else {
+      st.model[i] = {
+        rot: qnorm(qmul(st.model[par].rot, eff[i].rot)),
+        pos: vadd(st.model[par].pos, qrot(st.model[par].rot, eff[i].pos)),
+      };
+    }
+  }
+}
+
+/* ============================================================================
+   The LOCOMOTION CLIP FAMILY — avatar.cpp:1651-1740.
+
+   NOT part of anim.cpp: this is the AVATAR's clip selection, and it is the
+   reason the editor's walk preview looked nothing like the game. The gait
+   layer places FEET; the arms swing because `walk` (or `run`) is PLAYING over
+   it, and nothing in the editor ever started one. A rig previewed with K
+   showed IK legs and rest arms, which is not a pose the engine ever produces
+   while moving.
+
+   The three details that are not obvious and are all load-bearing:
+
+     * THE FAMILY IS EXCLUSIVE. idle / walk / run / fall / hang are keyed on
+       the same arms and spine, and `idle` was started-but-never-retired in the
+       engine for a while: it kept composing with the walk forever and dragged
+       an authored 14-degree arm swing down to about 4. That near-motionless
+       pose is the reported "arms outstretched like a zombie".
+     * THE WALK/RUN SPLIT IS NOT AT HALF SPEED. `def.speed` is the SPRINT
+       reference, so a plain walk already sits at ~0.58 of it — right on top of
+       a 0.55 threshold, and the selection then flipped every frame with
+       neither clip getting past a fraction of its 180 ms blend-in. Split at
+       0.80/0.70 with hysteresis instead.
+     * `moving` IS 0.4 VOXELS/S, not "velocity is nonzero".
+   ========================================================================== */
+
+/**
+ * Which clip of the family should be playing, by NAME, or '' for none.
+ * `st` carries the running/latched flag so the hysteresis survives across
+ * calls, exactly as avatar.cpp's `running_` member does.
+ */
+export function pickLocoClip(sk, st, speedNow, defSpeed, opts) {
+  const o = opts || {};
+  const has = n => sk.clips.some(c => c.name === n);
+  const moving = speedNow > 0.4 && !o.airborne;
+  const runOn = defSpeed * 0.80;
+  const runOff = defSpeed * 0.70;
+  st.running = st.running ? (speedNow > runOff) : (speedNow > runOn);
+  if (o.hanging && has('hang')) return 'hang';
+  if (o.airborne && has('fall')) return 'fall';
+  if (!moving) return has('idle') ? 'idle' : '';
+  if (st.running && has('run')) return 'run';
+  return has('walk') ? 'walk' : (has('idle') ? 'idle' : '');
+}
+
+/* ============================================================================
+   THE STRIDE CLOCK — avatar.cpp:840 SyncStrideClock and :945.
+
+   ONE CLOCK, AND THE FEET OWN IT. This is the second half of why the editor's
+   walk looked nothing like the game, and it is a bigger divergence than the
+   missing clip: the preview advanced `gaitPhase` from `cadence * speedFactor`,
+   which is the NPC oscillator — and avatar.cpp abandoned that because on the
+   avatar the two clocks disagree by about 2.6x. Measured on the shipped human
+   at a walk, the oscillator wanted 4.6 strides/s and the feet were taking
+   about 1.8, so an arm cycle rated against it came out pinned at the rate
+   clamp's ceiling of 3.0 and the arms cycled at nearly twice the legs.
+
+   The rate is MEASURED between touchdowns; the phase is CORRECTED at each one.
+   Until two steps have been timed the rate is zero and the pelvis holds still,
+   which is the honest answer for a body that has not taken a stride yet.
+
+   A rig with no leg chains (dummy.json) keeps the oscillator: it never plants
+   a foot, so there is nothing to lock to. Both engine drivers state that
+   fallback the same way and so does this.
+   ========================================================================== */
+
+// avatar.cpp:114-117. Quoted, not chosen.
+export const kStrideSyncGain = 0.5;
+export const kStepPeriodHalflife = 0.25;
+export const kMaxStepPeriod = 1.2;
+
+/** avatar.cpp:840 SyncStrideClock — call from the touchdown hook. */
+export function animSyncStrideClock(sk, st, chain) {
+  // Which leg is this, among the LEG chains? Ordinal, not chain index: a rig
+  // whose arm chains are interleaved with its legs must still split the
+  // stride evenly between the legs that actually step.
+  let legOrdinal = 0, nLegs = 0, mine = 0;
+  for (let c = 0; c < sk.chains.length; c++) {
+    if (sk.chains[c].tag !== 'leg') continue;
+    if (c === chain) mine = legOrdinal;
+    legOrdinal++; nLegs++;
+  }
+  if (nLegs <= 0) return;
+
+  const elapsed = st.sinceTouchdown ?? 0;
+  st.sinceTouchdown = 0;
+  // A first touchdown, or one after a stop, has no period to measure — adopt
+  // the boundary outright and wait for the next step to time the rate.
+  const haveStep = (st.lastFootDown ?? -1) >= 0 && elapsed > 1e-3 &&
+                   elapsed < kMaxStepPeriod;
+  st.lastFootDown = chain;
+  if (haveStep) {
+    const k = 1 - Math.pow(0.5, elapsed / kStepPeriodHalflife);
+    st.stepPeriod = (st.stepPeriod ?? 0) + (elapsed - (st.stepPeriod ?? 0)) * k;
+    // A stride is nLegs steps (two, for a biped): every leg lands once.
+    const stride = st.stepPeriod * nLegs;
+    if (stride > 1e-3) st.strideRate = 1 / stride;
+  } else {
+    st.stepPeriod = 0;
+  }
+
+  // Pull the phase onto this leg's boundary. Error taken the short way round
+  // so a clock running a hair fast is nudged back rather than dragged forward
+  // through a whole cycle.
+  const want = mine / nLegs;
+  let err = want - st.gaitPhase;
+  err -= Math.floor(err + 0.5);
+  st.gaitPhase += err * (haveStep ? kStrideSyncGain : 1.0);
+  st.gaitPhase -= Math.floor(st.gaitPhase);
+}
+
+/**
+ * avatar.cpp:945 — advance gaitPhase, from the FEET when the rig has legs and
+ * from the oscillator when it does not. Returns the live stride rate
+ * (strides/sec), which is what the locomotion clips are re-rated against.
+ */
+export function animAdvanceGaitPhase(sk, st, ctx, dt) {
+  const g = sk.gait;
+  st.sinceTouchdown = (st.sinceTouchdown ?? 0) + dt;
+  const haveLegs = (sk.chains || []).some(ch => ch.tag === 'leg');
+  if (haveLegs) {
+    // Park the clock when the feet stop reporting: a body standing still takes
+    // no steps, and a rate left running would keep accumulating phase to land
+    // on an arbitrary value the moment it moves again.
+    if (st.sinceTouchdown > kMaxStepPeriod)
+      st.strideRate = (st.strideRate ?? 0) * Math.pow(0.5, dt / 0.15);
+    st.gaitPhase += dt * (st.strideRate ?? 0);
+  } else {
+    const speedFactor = clamp(ctx.speedNow / Math.max(ctx.defSpeed, 0.01), 0, 1.5);
+    st.gaitPhase += dt * (g.present ? g.cadence : 2.2) * speedFactor;
+  }
+  st.gaitPhase -= Math.floor(st.gaitPhase);
+  return st.strideRate ?? 0;
+}
+
+/**
+ * avatar.cpp:1737 — RE-RATE the locomotion pair to the LIVE STRIDE.
+ *
+ * `walk` and `run` are each authored at ONE speed (the arm cycle is derived
+ * from the runtime's own step model at walk pace and at sprint pace). Every
+ * speed between them plays an arm cycle the feet do not share, and the arms
+ * slide in and out of phase with the legs over a few strides. One authored
+ * cycle spans one stride at any pace once the instance is re-rated.
+ *
+ * rate 1 == the clip's authored period equals one stride. Only the pair:
+ * idle / fall / hang / jump / land are not stride-locked motions and must keep
+ * their authored timing.
+ */
+export const clipRateForStride = (strideRate, durationMs) =>
+  clamp(strideRate * (durationMs * 0.001), 0.25, 3.0);
+
 /**
  * Dismemberment state selection — anim.cpp AnimSelectState: first rule whose
  * predicate holds against st.partAlive, or -1. A chain counts as lost when ANY
@@ -974,6 +1498,27 @@ export function restSoleY(sk) {
      animSelectState (chain-lost test, empty-predicate skip, first match)
                                        anim.cpp AnimSelectState
      chainLegLength                    mob.cpp:541-549
+     animApplySpineTwist (stage 3.5)   anim.cpp:399-424
+     animClampPoseLimits (stage 6) +   anim.cpp:585-830
+       clampTwist/clampHinge/clampBall/clampDirHalfSpaces, the steered-plane
+       PoseAxisOverride, and animHingeAngleAbout (the ONE place a hinge bend
+       is measured — two engine copies disagreed about the wrap)
+     parsePoseLimit (axis / hinge / ball forms, degrees -> radians)
+                                       mob.cpp:505-580
+     pickLocoClip + strideRateFor      avatar.cpp:1651-1747
+
+   ADDED 2026-09-01, and each closed a REAL divergence the preview was showing:
+
+     * clipFade's blend-in now reads `ageMs`, not `timeMs`. A looping clip
+       re-faded to zero weight at the top of every cycle in the editor and
+       once in the game (anim.h:300, anim.cpp:218).
+     * ClipInstance carries `rate`, multiplied into the playhead only. Without
+       it the walk/run arm cycle cannot be locked to the live stride and the
+       arms drift out of phase with the feet over a few strides (anim.h:307).
+     * The spring goal is normalized by the def's top speed (mob.cpp:2702).
+       This port had the pre-2026-08 raw-velocity form, so a def's springs
+       meant a different thing in the editor than in either engine driver.
+     * Stages 3.5 and 6 existed in both engine drivers and in neither preview.
 
    APPROXIMATED (documented, not silently):
      GroundHeightAt      -> flat plane y=0 (the editor has no World)
@@ -987,9 +1532,10 @@ export function restSoleY(sk) {
    anim.cpp and then follow it.
 
      A. blendInMs > 0 makes the clip's FIRST frame weigh exactly 0
-        (anim.cpp:187, f = tMs/blendInMs at tMs=0), and a zero-weight clip is
-        skipped outright (anim.cpp:240). The first sampled frame never reaches
-        the accumulator.
+        (anim.cpp:218, f = ageMs/blendInMs at ageMs=0), and a zero-weight clip
+        is skipped outright (anim.cpp:318). The first sampled frame never
+        reaches the accumulator. Since 2026-09-01 this is keyed on the AGE, so
+        it happens once per instance rather than once per loop.
      B. The blend-OUT ramp is a pure function of time vs durationMs, so it
         applies to any non-looping clip whether or not it is stopping
         (anim.cpp:188). Looping clips never fade out.

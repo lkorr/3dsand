@@ -208,13 +208,46 @@ verbatim, so hand-edited extras survive. Spawn the mob in-game to see it.
 
 ## 5. Animation
 
-Three layers, same as the engine, and they compose:
+The timeline has **two lanes**, picked with the tabs above it:
 
-1. **Gait** — procedural locomotion from the rig + gait block (§4.3). You
-   don't keyframe walking.
-2. **Clips** — keyframed poses layered on top (attacks, flinches, idles).
-3. **Flipbooks** — per-part model swapping (blinking faces, mouth shapes,
+- **animation** — flipbook frames and keyframed clips (§5.1–5.2). This is the
+  pose data in *this rig's own sidecar*.
+- **attacks** — the stroke programs in `assets/mobs/attack_styles.json` (§5.3),
+  previewed on this rig through the real melee driver.
+
+Four layers compose in the preview, same as the engine, in this order:
+
+1. **Clips** — the locomotion family plus anything you have open. **This is
+   where the arm swing comes from.**
+2. **Gait** — procedural foot placement from the rig + gait block (§4.3). It
+   places *feet*; it does not move arms. You don't keyframe walking.
+3. **The weapon arm** — a live stroke takes over the arm the weapon socket
+   names (§5.3).
+4. **Flipbooks** — per-part model swapping (blinking faces, mouth shapes,
    crumbling states) — the voxel equivalent of sprite frames.
+
+### 5.0 What "walk [K]" actually shows
+
+Press **K** and the preview does what the *player avatar* does, not what an
+NPC does — the two engine drivers differ and the rigs you author here are
+avatars:
+
+- **auto-loco** (on by default) starts one clip of the locomotion family —
+  `idle`, `walk`, `run`, `fall`, `hang` — and retires the rest. These five are
+  **reserved names**: the engine resolves them by string, so a clip called
+  `walk2` will never play by itself. The clip list marks them with `◆`.
+- The **preview speed** slider is a fraction of the sidecar's `speed`, and
+  `speed` is the **sprint** reference — so 1.0 is a sprint, not a walk. It
+  defaults to 0.58, where a plain walk sits. Past 0.80 the family switches to
+  `run` (with hysteresis down to 0.70, so speeds near the boundary pick one
+  and stay there).
+- The **stride clock is measured between footfalls**, not derived from the
+  slider, and the `walk`/`run` clip is re-rated so one authored arm cycle spans
+  one live stride at any pace. The readout under the sliders shows the live
+  stride rate and exactly which clips are playing at what weight and rate — if
+  the arms look wrong, read that line first.
+- Turn **auto-loco off** while authoring a clip: then the preview plays the
+  clip you have open instead of whatever the family picked.
 
 ### 5.1 Clips (the keyframe lane)
 
@@ -235,6 +268,14 @@ Three layers, same as the engine, and they compose:
    the key), or delete it (`Del`).
 7. **P** plays the clip. The preview samples with the engine's own
    nlerp/fused-key code, so what you see is what ships.
+8. **all parts** shows a lane for every rigged part, not just the keyed ones —
+   what you want while blocking out a new clip, when nothing has keys yet.
+   **+ / −** zoom the lane; the default 0.45 px/ms makes a 2-second clip
+   unreadable.
+9. **copy** / **paste** / **mirror →** on a selected key. Mirror pastes onto
+   the opposite limb (`.L` ↔ `.R`) reflected about the model's X axis — a walk
+   cycle is one arm authored twice, half a period apart, and doing that by hand
+   is where sign errors come from.
 
 ### 5.2 Flipbooks (the frame strip)
 
@@ -264,6 +305,47 @@ in the same box, and play steps through them one at a time. Create a tag if
 you want per-frame durations.
 
 ---
+
+### 5.3 Attacks (the stroke programs)
+
+The **attacks** lane edits `assets/mobs/attack_styles.json`: the swings both
+the NPCs and the player's discrete strikes replay. It is a lane in the model
+editor rather than a row in the Tuning tab because a style's numbers are not a
+pose — `reach` is a position in *this arm's* reach band, the hand is the tip
+minus the *measured* blade in the fist, and three clamps can each move the
+result. The only way to author one is next to a rig that is swinging it.
+
+1. Pick a style chip. They are grouped: `player` (the discrete strikes, short
+   windups and jitter 0 so a strike goes exactly where it was flicked) and
+   `npc` (longer telegraphs, jittered so ten swings don't look stamped).
+2. Edit **windup** (a *pose*, relative to the aim — its length **is** the
+   telegraph, there is no UI indicator), **cut** (a *travel*: how far the point
+   goes and how fast — this is what does damage, and speed is damage),
+   **recover**, and **jitter**. Angles show radians and degrees side by side;
+   ticks show their duration at 30 Hz; `reach` shows where it lands in this
+   arm's band and warns when it would be clamped.
+3. **Load an item** in the Held item panel first — the driver *measures* the
+   blade, so with an empty fist the point is the hand.
+4. **▶ swing** runs the program at 30 Hz. The **aim** sliders set the target's
+   bearing: the cut is centred on the aim, so the windup lands half a cut short
+   of it and the blade passes *through* where it was aimed. **trail** draws the
+   swept edge, blue for the telegraph and amber for the cut.
+5. The readout names the arm the rig resolved, the reach band, the blade
+   length, both phase machines, and the **tip speed** and **edge alignment** —
+   the two things the damage formula scales by. "The attack doesn't hit hard"
+   has four separable causes and those numbers tell them apart.
+6. **per-limb**: each arm part's `poseLimit` (its range of motion — a *pose*
+   stage, not a physics constraint; Jolt's joint limits say nothing about an
+   IK-driven pose) beside the body-wide `melee.*` knobs for how much the torso,
+   elbow and head join in. Each field says which file it writes: the pose
+   limits go to the rig sidecar, the knobs to `assets/materials/tuning.json`.
+7. **player flick compass**: the screen-space direction that picks each strike.
+   Drag the pad to test a flick. The partition is drawn by asking the engine's
+   own quantizer, and sectors *compete* for the circle by max dot rather than
+   tiling it — so adding one can swallow another, and the panel says so when a
+   style has become unreachable.
+
+Save writes the JSON; press **R** in the running game to hot-reload it.
 
 ## 6. Micro detail — finer than one world voxel
 

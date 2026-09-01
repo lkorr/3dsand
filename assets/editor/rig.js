@@ -29,6 +29,8 @@
 
 import * as ed from './editor.js';
 import * as AN from './anim.js';
+import * as MELEE from './melee.js';
+import * as ATK from './attacks.js';
 import * as VOX from './vox.js';
 import * as LIB from './limblib.js';
 
@@ -114,7 +116,13 @@ let gripCtx = 'held_right';   // which grip context is being edited
 let gaitOn = false;
 // NB: the gait phase itself lives in anim.gaitPhase (the AnimState mirror),
 // not here — it is runtime state the transcribed pipeline owns.
-let gaitSpeedScale = 1;
+// A FRACTION OF THE DEF'S TOP SPEED, and it defaults to a plain WALK rather
+// than to 1.0 for the same reason avatar.cpp splits walk from run at 0.80 and
+// not at 0.50: `speed` in the sidecar is the SPRINT reference. Previewing at
+// 1.0 is previewing a sprint, which is not what the button next to it says —
+// and with the locomotion family now driving the clips, it visibly picked
+// `run`. 0.58 is where a plain walk sits (avatar.cpp quotes "35 of 60").
+let gaitSpeedScale = 0.58;
 
 let playing = false;
 let frameIndex = 0;
@@ -726,13 +734,16 @@ function heldItemTransform() {
   const grip = itemSc.grip?.[gripCtx];
   if (!grip) return null;                 // item cannot be held this way
 
-  const itemScale = +itemSc.scale > 0 ? +itemSc.scale : 1;
-  const rigScale = +(sc().skinScale ?? sc().scale) || 1;
+  // DERIVED FROM `artVoxelsPerMetre`, not read off a `scale` key. Both are
+  // honoured (skinScaleOf), but no shipped asset states `scale` any more: the
+  // human is 80 vox/m and the sword 40, so the true ratio is 8/4 = 2 and the
+  // old `+itemSc.scale || 1` read 1/1 and drew every blade at half length.
+  // See skinScaleOf for why a wrong blade length is not cosmetic.
+  const itemScale = skinScaleOf(itemSc);
+  const rs = rigScale();
   // The viewport unit is one RIG file voxel. One item file voxel covers
-  // (rigScale / itemScale) viewport units — so a sword at scale 4 on a rig at
-  // skinScale 8 draws each item voxel as a 2-unit cube, matching the real size
-  // ratio the engine applies.
-  const voxRatio = rigScale / itemScale * (+grip.scale > 0 ? +grip.scale : 1);
+  // (rigScale / itemScale) viewport units.
+  const voxRatio = rs / itemScale * (+grip.scale > 0 ? +grip.scale : 1);
 
   const frame = socketFrame(sock);
   const sockRot = Array.isArray(sock.rotation) && sock.rotation.length === 3
@@ -2135,7 +2146,20 @@ function renderRigTail() {
       el('button', {
         class: 'small' + (gaitOn ? ' on' : ''),
         onclick: () => { setGait(!gaitOn); renderAllPanels(); },
-      }, gaitOn ? 'stop [K]' : 'walk [K]')));
+      }, gaitOn ? 'stop [K]' : 'walk [K]'),
+      // AUTO-LOCO is what makes the preview match the game, and it is a toggle
+      // rather than a hardcoded behaviour for one reason: while AUTHORING a
+      // clip you want to see THAT clip, not whichever one the family picked.
+      // On for the walk preview (where "does this match" is the question), off
+      // the moment the clip lane is driving.
+      el('button', {
+        class: 'small' + (autoLoco ? ' on' : ''),
+        title: 'play the locomotion CLIP FAMILY while walking (idle / walk / ' +
+          'run, exclusive, stride-rate locked) exactly as avatar.cpp does. ' +
+          'This is the arm swing: the gait layer only places FEET. Off pins ' +
+          'the clip you have open in the clip lane instead.',
+        onclick: () => { autoLoco = !autoLoco; ed.invalidate(); renderAllPanels(); },
+      }, 'auto-loco')));
 
   const g = gait();
   const hasGait = !!(ed.getSidecar()?.gait);
@@ -2495,8 +2519,31 @@ function renderGaitReadout() {
     if (!gaitOn) { st.textContent = ''; return; }
     const sw = anim.feet.map((f, i) =>
       (f.swinging ? '▲' : f.valid ? '▼' : '·')).join(' ');
-    st.textContent = `phase ${anim.gaitPhase.toFixed(2)}  bodyY ${anim.bodyY.toFixed(2)}  ` +
-      `feet ${sw}   (▲ swinging ▼ planted · gone)`;
+    // WHICH CLIP IS DRIVING, and at what rate. Without this line the two ways
+    // the preview can be wrong — "the family picked idle because the speed
+    // slider is at 0.05" and "this rig has no walk clip at all" — look
+    // identical, which is the bare-number failure CLAUDE.md rule 6 is about.
+    let clips = '';
+    if (anim.clips.length) {
+      clips = anim.clips.map(i => {
+        const c = skel.clips[i.clip];
+        if (!c) return '?';
+        const r = Math.abs(i.rate - 1) > 0.01 ? `×${i.rate.toFixed(2)}` : '';
+        return `${c.name}${r}${i.stopping ? '↓' : ''}` +
+               `@${(i.weight * (i.fade ?? 1)).toFixed(2)}`;
+      }).join(' + ');
+    } else {
+      clips = autoLoco
+        ? (skel.clips.length ? 'none — no idle/walk/run clip in this rig'
+                             : 'none — this rig has no clips at all')
+        : 'none (auto-loco off)';
+    }
+    st.textContent =
+      `phase ${anim.gaitPhase.toFixed(2)}  bodyY ${anim.bodyY.toFixed(2)}  ` +
+      `stride ${anim.strideRate.toFixed(2)}/s  feet ${sw}` +
+      `   (▲ swinging ▼ planted · gone)\n` +
+      `clips: ${clips}`;
+    st.style.whiteSpace = 'pre-line';
   }
 }
 
@@ -2660,11 +2707,23 @@ function renderAnchorFields(v) {
    stage order the engine runs, and hand the resulting model-space transforms
    back to editor.js for rendering.
 
-   Engine stage order (mob.cpp:756-865 UpdateAnimation):
-     velocity smoothing -> gaitPhase advance -> AnimSampleAndBlend (1-3)
+   Engine stage order (mob.cpp:2577-2830 UpdateAnimation, avatar.cpp:903 for
+   the player's own copy — the two agree stage for stage):
+     velocity smoothing -> gaitPhase advance -> LOCOMOTION CLIP SELECTION
+     -> AnimSampleAndBlend (1-3)
      -> procedural layer (legacy swing, bob/sway/roll/spine, springs)
+     -> AnimApplySpineTwist (3.5)
      -> AnimFlatten (4) -> UpdateGait -> AnimSolveTwoBone per chain (5)
-   Stage 6 (physics/ragdoll blend) is omitted: it needs Jolt.
+     -> ApplyWeaponArm (5.5) -> AnimClampPoseLimits (6)
+   Physics/ragdoll blending is the one omitted stage: it needs Jolt.
+
+   THE LOCOMOTION CLIP SELECTION WAS MISSING UNTIL 2026-09-01, and it is the
+   whole of the reported "the tuner's walk is outdated". The gait layer places
+   FEET; the arms swing because `walk` is PLAYING over it, and this preview
+   only ever ran the clip the author had explicitly opened. Pressing K
+   therefore showed IK legs and rest arms — a pose the engine never produces
+   while moving. See anim.js pickLocoClip for the three details (exclusivity,
+   the 0.80/0.70 hysteresis split, the stride re-rate) that are load-bearing.
    ========================================================================== */
 
 let skel = null;              // built by rebuildSkeleton()
@@ -2672,6 +2731,11 @@ let anim = null;              // AnimState mirror
 let previewCtx = null;
 let previewOrigin = { x: 0, y: 0, z: 0 };
 let restModel = null;         // model-space rest pose, for the delta transform
+// AUTO-LOCO: let the family drive the clips while walking, instead of pinning
+// the one the author has open. Off while a clip is being AUTHORED (that is
+// what the clip lane is for); on by default for the gait preview, which is
+// where "does this match the game" is the question being asked.
+let autoLoco = true;
 
 // Rebuild the runtime skeleton from the CURRENT sidecar + models. Called
 // whenever either changes; cheap enough to do on every edit.
@@ -2692,7 +2756,17 @@ function rebuildSkeleton() {
     velocity: AN.v3(),
     bodyY: 0,
     bodyUp: AN.v3(0, 1, 0),
+    // ---- the stride clock (avatar.cpp SyncStrideClock) ----
+    // Zero until two steps have been TIMED, which is the honest answer for a
+    // body that has not taken a stride yet — and is why the pelvis holds still
+    // for the first step of a preview instead of guessing a rate.
+    strideRate: 0, stepPeriod: 0, sinceTouchdown: 0, lastFootDown: -1,
+    running: false,          // the walk/run hysteresis latch
   };
+  // avatar.cpp:634 calls SyncStrideClock from the touchdown inside its own
+  // UpdateGait; anim.js's updateGait is the NPC transcription, which does not,
+  // so the avatar's half is installed as a hook rather than baked in.
+  anim.onTouchdown = c => AN.animSyncStrideClock(skel, anim, c);
   previewOrigin = { x: 0, y: 0, z: 0 };
   previewCtx = {
     origin: AN.v3(), heading: 0, speedNow: 0,
@@ -2709,6 +2783,7 @@ function rebuildSkeleton() {
   AN.animSampleAndBlend(skel, rest, 0);
   AN.animFlatten(skel, rest);
   restModel = rest.model;
+  weaponRebuild();
 }
 
 function setGait(on) {
@@ -2736,26 +2811,72 @@ function applyPoseEdit() {
  */
 function stepPreview(dt) {
   if (!skel || !anim) return;
+  dbgPreviewSteps++;
   const sidecar = ed.getSidecar() || {};
   previewCtx.defSpeed = num(sidecar.speed, 5);
   previewCtx.prefabSize = ed.getDoc()?.size || { x: 1, y: 1, z: 1 };
   previewCtx.rootLimb = skel.rootLimb;
 
-  // Pin the runtime clip instance to the editor's cursor every step.
-  // animSampleAndBlend is the ENGINE's own loop and advances timeMs by
-  // dt*1000 itself, so pre-compensate: after its advance the sample lands
-  // exactly on clipCursorMs — paused (the pose must not drift off the scrub
-  // cursor), scrubbing, or playing (tick() owns the cursor) alike. This also
-  // survives rebuildSkeleton(), which resets anim.clips on every rig edit.
-  {
-    const ci = activeClip ? skel.clips.findIndex(k => k.name === activeClip) : -1;
-    anim.clips = ci >= 0
-      ? [{ clip: ci, timeMs: clipCursorMs - dt * 1000, weight: 1,
-           stopping: false, fade: 1 }]
-      : [];
-  }
+  // ---- the stroke driver, BEFORE the animation pass (mob.cpp:1895) -------
+  // "Advance the stroke and push the pose, so the animation pass sees THIS
+  // tick's pose rather than last tick's." Runs on the sim's own 30 Hz clock.
+  weaponStep(dt);
 
   const speed = previewCtx.defSpeed * gaitSpeedScale;
+
+  // ---- WHICH CLIPS ARE PLAYING ------------------------------------------
+  //
+  // Two mutually exclusive drivers, because the tab answers two questions:
+  //
+  //   AUTHORING a clip (the clip lane is open): the runtime instance is
+  //   PINNED to the editor's cursor every step. animSampleAndBlend is the
+  //   ENGINE's own loop and advances timeMs by dt*1000*rate itself, so
+  //   pre-compensate — after its advance the sample lands exactly on
+  //   clipCursorMs, paused / scrubbing / playing alike. `ageMs` is pinned
+  //   past the blend-in for the same reason: a scrub is not a fade-in, and
+  //   showing one would dim every pose the author is trying to judge.
+  //
+  //   PREVIEWING the gait (K, no clip open, or auto-loco on): the LOCOMOTION
+  //   FAMILY drives it exactly as avatar.cpp does — one clip of
+  //   idle/walk/run, exclusive, stride-rate-locked. This is the arm swing.
+  const authoring = !!activeClip && !(autoLoco && gaitOn);
+  if (authoring) {
+    const ci = skel.clips.findIndex(k => k.name === activeClip);
+    anim.clips = ci >= 0
+      ? [{ clip: ci, timeMs: clipCursorMs - dt * 1000, ageMs: 1e6, rate: 1,
+           weight: 1, stopping: false, fade: 1 }]
+      : [];
+  } else if (gaitOn) {
+    const want = AN.pickLocoClip(skel, anim, speed, previewCtx.defSpeed, {});
+    const family = ['idle', 'walk', 'run', 'fall', 'hang'];
+    const famIdx = new Set(family
+      .map(n => skel.clips.findIndex(c => c.name === n)).filter(i => i >= 0));
+    // THE FAMILY IS EXCLUSIVE (avatar.cpp:1679): every member that is not the
+    // wanted one is retired. Leaving `idle` running under a walk is what
+    // dragged an authored 14-degree arm swing down to about 4 in the engine,
+    // and it would do exactly the same here.
+    const wantIdx = want ? skel.clips.findIndex(c => c.name === want) : -1;
+    for (const inst of anim.clips)
+      if (famIdx.has(inst.clip) && inst.clip !== wantIdx) inst.stopping = true;
+    if (wantIdx >= 0 && !anim.clips.some(i => i.clip === wantIdx && !i.stopping))
+      anim.clips.push({ clip: wantIdx, timeMs: 0, ageMs: 0, rate: 1,
+                        weight: 1, stopping: false, fade: 1 });
+    // ---- lock the arm swing to the feet (avatar.cpp:1737) ----------------
+    // Against the MEASURED stride rate, not the oscillator — see the note at
+    // the gait clock below, and anim.js's animSyncStrideClock.
+    if (anim.strideRate > 1e-4) {
+      const wi = skel.clips.findIndex(c => c.name === 'walk');
+      const ri = skel.clips.findIndex(c => c.name === 'run');
+      for (const inst of anim.clips) {
+        if (inst.clip !== wi && inst.clip !== ri) continue;
+        const dur = skel.clips[inst.clip]?.durationMs || 0;
+        if (dur <= 0.1) continue;
+        inst.rate = AN.clipRateForStride(anim.strideRate, dur);
+      }
+    }
+  } else {
+    anim.clips = [];
+  }
 
   if (gaitOn) {
     // Walk along +Z with heading 0 (APPROXIMATION: the engine's heading comes
@@ -2770,12 +2891,15 @@ function stepPreview(dt) {
     previewCtx.speedNow = 0;
   }
 
-  // mob.cpp:773 — gaitPhase advance, wrapped to [0,1)
+  // ---- the gait clock (avatar.cpp:945 animAdvanceGaitPhase) --------------
+  // ONE CLOCK, AND THE FEET OWN IT. This used to be the NPC oscillator
+  // (`cadence * speedFactor`), which on the shipped human wanted 4.6 strides/s
+  // at a walk while the feet were taking about 1.8 — so the pelvis swayed at
+  // 2.6x the footfall rate and any clip rated against it pinned at the rate
+  // clamp. avatar.cpp abandoned that for exactly this reason and the preview
+  // has to follow, because the rig being previewed IS the player avatar.
   const g = skel.gait;
-  const speedFactor = Math.min(Math.max(previewCtx.speedNow /
-    Math.max(previewCtx.defSpeed, 0.01), 0), 1.5);
-  anim.gaitPhase += dt * (g.present ? g.cadence : 2.2) * speedFactor;
-  if (anim.gaitPhase > 1) anim.gaitPhase -= Math.floor(anim.gaitPhase);
+  const strideRate = AN.animAdvanceGaitPhase(skel, anim, previewCtx, dt);
 
   // stages 1-3
   AN.animSampleAndBlend(skel, anim, dt);
@@ -2786,6 +2910,15 @@ function stepPreview(dt) {
   applyPoseEdit();
   // procedural layer (legacy swing + bob/sway/roll/spine + springs)
   AN.applyProceduralLayer(skel, anim, previewCtx, dt);
+  // ---- stage 3.5: the torso serves a live swing (anim.h) ----------------
+  // The pose's torso fields are already weight-scaled by the driver, so an
+  // idle rig (weight 0) is untouched and a rig mid-stroke leans exactly as
+  // the avatar does. Runs BEFORE the flatten in both engine drivers.
+  {
+    const wp = weaponPose();
+    if (wp) AN.animApplySpineTwist(skel, anim, wp.torsoTwist, wp.torsoPitch,
+                                   skel.rootLimb);
+  }
   // stage 4
   AN.animFlatten(skel, anim);
   // gait + stage 5 IK
@@ -2809,7 +2942,41 @@ function stepPreview(dt) {
       AN.animSolveTwoBone(skel, anim, skel.chains[c], prefabPt, weight);
     }
   }
+  // ---- stage 5.5: the weapon arm (game/melee.h) ------------------------
+  // THE SAME CALL BOTH ENGINE DRIVERS MAKE. Returns the steered hinge plane
+  // for the clamp below, exactly as Mob::ApplyWeaponArm fills a
+  // PoseAxisOverride for AnimClampPoseLimits.
+  const weaponHinge = applyWeaponArm();
+  // ---- stage 6: the pose has to be anatomically possible ---------------
+  // After every solve, never between them: the IK is what puts a joint out of
+  // range, so clamping earlier would only clamp a pose about to be replaced.
+  AN.animClampPoseLimits(skel, anim, weaponHinge ? [weaponHinge] : null);
+  // The blade's swept edge, recorded AFTER the pose is final — the item rides
+  // the hand's animated transform, so anything sampled earlier is a tick stale.
+  recordStrokeTrail();
+  pushStrokeTrail();
   ed.invalidate();
+}
+
+/**
+ * Hand the recorded sweep to the viewport. Windup is dim amber (the telegraph),
+ * the cut is hot white-orange (the part that damages), the recover fades out.
+ * Older ticks fade so the direction of travel is readable from a still.
+ */
+function pushStrokeTrail() {
+  if (!strokeTrail.length) { ed.setStrokeTrail?.(null); return; }
+  const n = strokeTrail.length;
+  const segs = strokeTrail.map((s, i) => {
+    const age = (i + 1) / n;                       // 0 oldest .. 1 newest
+    const cut = s.phase === MELEE.STROKE_PHASE.Cut;
+    return {
+      a: [s.base.x, s.base.y, s.base.z],
+      b: [s.tip.x, s.tip.y, s.tip.z],
+      color: cut ? 0xffd08a : 0x6aa9ff,
+      alpha: (cut ? 0.35 : 0.14) + age * (cut ? 0.65 : 0.3),
+    };
+  });
+  ed.setStrokeTrail?.(segs);
 }
 
 /**
@@ -2855,9 +3022,515 @@ function modelTransform(modelIndex) {
 }
 
 // The preview runs whenever something wants a posed rig: the gait walk, clip
-// playback, or simply having a clip open (so scrubbing and ring-dragging show
-// their result on a paused rig).
-const previewActive = () => gaitOn || clipPlaying || !!activeClip;
+// playback, simply having a clip open (so scrubbing and ring-dragging show
+// their result on a paused rig), or a live stroke.
+const previewActive = () => gaitOn || clipPlaying || !!activeClip || strokeLive();
+
+/* ==========================================================================
+   5b. THE WEAPON ARM — the real stroke driver, in the preview
+
+   editor/melee.js is a line-cited port of MeleeState and the shared stroke
+   program runner; this section is the CALLER, and it mirrors the three engine
+   sites that make an authored attack move an arm:
+
+     Mob::WeaponStrokePose (mob.cpp:8220)  where the blade is NOW, so the
+       driver steers from the truth rather than from a guess
+     Mob::HeadKeepOut      (mob.cpp:8262)  and where the wielder's own head is
+     Mob::ApplyWeaponArm   (mob.cpp:7767)  the IK target, the steered pole and
+       the hinge plane the stage-6 clamp is handed
+
+   UNITS ARE THE ONE THING THIS SEAM OWNS. The driver speaks WORLD voxels
+   (every constant in melee.h is a converted metre); the editor's model space
+   is FILE voxels, `skinScale` of them per world voxel. Everything handed IN is
+   divided by that and everything handed BACK is multiplied by it, in this
+   file, once — melee.js carries no scale so its constants stay byte-identical
+   to the header's.
+   ========================================================================== */
+
+// sim/scale.h:100 — the world's own resolution. 1 / kVoxelMeters.
+const kVoxelsPerMetre = 10;
+
+/**
+ * sim/scale.h:114 SkinScaleFor — file voxels per WORLD voxel, from the asset's
+ * own authored density.
+ *
+ * `skinScale`/`scale` are the LEGACY keys and are honoured first because a
+ * hand-written test rig may still carry one; every shipped asset states
+ * `artVoxelsPerMetre` instead and the engine derives the factor from it.
+ * Deriving it here too is what fixed the held-item preview: the human is
+ * authored at 80 vox/m (skinScale 8) and the sword at 40 (scale 4), so one
+ * sword voxel is TWO human voxels — and with both keys absent the old
+ * `rigScale / itemScale` read 1/1 and drew the blade at half length. A blade
+ * length that is wrong is not cosmetic here: `MeleeState::SetStroke` MEASURES
+ * it, and the whole reach band is solved against it.
+ */
+function skinScaleOf(doc) {
+  const legacy = +(doc?.skinScale ?? doc?.scale);
+  if (Number.isFinite(legacy) && legacy > 0) return legacy;
+  const a = +doc?.artVoxelsPerMetre;
+  if (Number.isFinite(a) && a > 0 && a % kVoxelsPerMetre === 0)
+    return a / kVoxelsPerMetre;
+  return 1;
+}
+
+const rigScale = () => skinScaleOf(sc());
+
+// --- live stroke state ----------------------------------------------------
+//
+// THE STYLE DOCUMENT LIVES IN attacks.js, not here. This file owns the RIG and
+// the driver; that one owns attack_styles.json and the panel. The seam is the
+// object registered with ATK.bind() below, and it is the only thing either
+// file knows about the other.
+let melee = null;             // MELEE.MeleeState for the armed hand, or null
+let strokeCur = null;         // MELEE.newStrokeCursor()
+let strokeStyle = -1;         // the style the live program is running
+let strokeTick = 0;           // ticks into the current program
+let strokeTrail = [];         // [{base,tip,phase}] the swept edge, FILE voxels
+const kStrokeTrailMax = 90;
+// The blade tip's speed and edge alignment, for the panel's readout. Measured
+// here rather than in melee.js because they are a property of the POSED blade
+// (the item riding the animated hand), not of the driver's internal frame —
+// which is the same reason MeleeSweepDamage measures them off the rig.
+let strokeTipSpeed = 0, strokeEdgeAlign = 1;
+let strokeTipPrev = null;
+// The rig parts the driver needs. -1 until weaponRebuild() finds them.
+let wpHandPart = -1, wpChain = -1, wpHeadPart = -1;
+
+// THE SIM RUNS AT 30 Hz AND SO DOES A STROKE. `ticks` in attack_styles.json
+// are sim ticks, and StepStrokeProgram advances exactly one per call, so the
+// preview must step on the same clock or a 12-tick windup would not be 0.40 s.
+const kStrokeDt = 1 / 30;
+
+const strokeLive = () =>
+  !!(strokeCur && strokeCur.phase !== MELEE.STROKE_PHASE.Idle);
+
+/**
+ * The socket the weapon hangs from. Prefers the one NAMED for the grip context
+ * being edited, so the arm the panel drives does not change when the author
+ * clicks a different socket in the rig list; falls back to the selection and
+ * then to the first socket, so a rig with one unnamed socket still works.
+ */
+function weaponSocket() {
+  const SK = sockets();
+  const byCtx = SK.find(s => s.name === gripCtx);
+  if (byCtx) return byCtx;
+  return activeSocket() || SK[0] || null;
+}
+
+/**
+ * Re-derive which parts the weapon arm is made of. Called from
+ * rebuildSkeleton(), so it follows every rig edit.
+ *
+ * DERIVED FROM THE RIG, NEVER HARDCODED — mob.cpp:7774 says why: "a
+ * left-handed rig, or a second weapon, needs no change here". The hand is the
+ * socket's part and the arm is the chain tagged `arm` whose effector IS that
+ * hand.
+ */
+function weaponRebuild() {
+  wpHandPart = wpChain = wpHeadPart = -1;
+  if (!skel) return;
+  const sock = weaponSocket();
+  if (sock && sock.part) wpHandPart = skel.findPart(sock.part);
+  if (wpHandPart < 0) {
+    // No socket yet: fall back to the arm chain the author is most likely to
+    // mean, so the Attacks tab is useful before a socket exists.
+    const arm = (skel.chains || []).find(c => c.tag === 'arm' && c.effector >= 0);
+    if (arm) wpHandPart = arm.effector;
+  }
+  wpChain = (skel.chains || []).findIndex(
+    c => c.tag === 'arm' && c.effector === wpHandPart && c.parts.length >= 2);
+  wpHeadPart = skel.parts.findIndex(p => p.tag === 'head');
+  if (!melee) {
+    melee = new MELEE.MeleeState(meleeTuning());
+    strokeCur = MELEE.newStrokeCursor();
+  }
+  melee.tuning = meleeTuning();
+  // mob.cpp:8123 HandSign — ".L" is the character's LEFT in the NAME, and the
+  // name is what the stroke's asymmetric azimuth limits want.
+  const hn = wpHandPart >= 0 ? (skel.parts[wpHandPart].name || '') : '';
+  melee.setHandSign(hn.endsWith('.L') ? -1 : 1);
+}
+
+// tuning.json's melee block, live off the HOST'S OWN tuning document — the
+// same object the Tuning tab edits, so one number has one home and a knob
+// moved there is visible in the very next previewed swing. Supplied through
+// __tunerModelsHooks (tuner.html) rather than fetched, because the page may
+// have unsaved edits and re-reading the file would silently preview the
+// version on disk instead of the one on screen.
+let tuningGet = null, tuningTouchFn = null;
+const tuningDoc = () => (tuningGet ? tuningGet() : null);
+const tuningTouch = () => { tuningTouchFn?.(); };
+const meleeTuning = () => MELEE.meleeTuningFrom(tuningDoc());
+
+/**
+ * mob.cpp:8173 WeaponArmPose + :8220 WeaponStrokePose — where the blade is
+ * NOW, in the frame SetStroke speaks: shoulder-relative, WORLD voxels.
+ *
+ * Returns null when the rig cannot say (no arm chain, no live pose yet), which
+ * is exactly the case the engine answers with ClearArm.
+ */
+function weaponArmSeed() {
+  if (!skel || !anim || !anim.model.length || wpChain < 0) return null;
+  const ch = skel.chains[wpChain];
+  const i0 = ch.parts[0], i1 = ch.parts[1];
+  if (i0 < 0 || i1 < 0 || !anim.model[i0] || !anim.model[i1]) return null;
+  const S = rigScale();
+  const shoulder = anim.model[i0].pos;
+  const handModel = anim.model[wpHandPart].pos;
+  // Heading is 0 in the editor, so Rotate(yaw, .) is the identity and the
+  // model-space difference IS the shoulder-relative offset.
+  const handFromShoulder = AN.vmul(AN.vsub(handModel, shoulder), 1 / S);
+  // Reach from the LIVE bone lengths rather than a constant: it follows the
+  // rig, and it is the same L1+L2 the solver clamps its own annulus against —
+  // including the effector-IS-the-lower-bone case, which animSolveTwoBone
+  // extends by the bone's rest length (mob.cpp:8204).
+  const root = anim.model[i0].pos, joint = anim.model[i1].pos;
+  const tipJoint = (wpHandPart === i1)
+    ? AN.vadd(joint, AN.qrot(anim.model[i1].rot, skel.parts[i1].rest.pos))
+    : anim.model[wpHandPart].pos;
+  const reach = (AN.vlen(AN.vsub(joint, root)) +
+                 AN.vlen(AN.vsub(tipJoint, joint))) / S;
+  if (!(reach > 1e-3)) return null;
+
+  // ---- the BLADE half, off the same live pose so the two ends of the seed
+  // cannot disagree by a leaning spine's worth of voxels.
+  let tipFromShoulder = handFromShoulder, flat = AN.v3();
+  const blade = bladeSegmentModel();
+  if (blade) {
+    // Expressed RELATIVE TO THE HAND and then added to the hand offset the
+    // inverse already produced (mob.cpp:8250), rather than re-running the
+    // shoulder subtraction.
+    const rel = AN.vmul(AN.vsub(blade.tip, handModel), 1 / S);
+    tipFromShoulder = AN.vadd(handFromShoulder, rel);
+    flat = blade.flat;
+  }
+  return { hand: handFromShoulder, tip: tipFromShoulder, flat, reach, shoulder, S };
+}
+
+/**
+ * The held item's cutting edge in the editor's MODEL space (file voxels), off
+ * the item's own live transform — the same derivation updateHiltBox() uses for
+ * the hilt box, so the segment the driver measures and the segment the author
+ * sees drawn cannot drift.
+ *
+ * The sidecar authors `from`/`to` as DISTANCES along `axis` in item micro
+ * units, in the art's own Z-up frame; melee.cpp:374 maps that to the engine's
+ * Y-up with (x, z, -y) and does NOT rebase on the model origin (they already
+ * lie on it). Both are reproduced here.
+ */
+function bladeSegmentModel() {
+  const xf = heldItemTransform();
+  const e = itemSc?.edge;
+  if (!xf || !e) return null;
+  const ax = Array.isArray(e.axis) && e.axis.length === 3
+    ? { x: +e.axis[0] || 0, y: +e.axis[1] || 0, z: +e.axis[2] || 0 }
+    : { x: 0, y: 0, z: 1 };
+  const axE = AN.vnorm(AN.v3(ax.x, ax.z, -ax.y));      // Z-up -> Y-up
+  const at = d => {
+    const p = AN.qrot(xf.quat, AN.vmul(axE, d * xf.scale));
+    return AN.vadd(xf.pos, p);
+  };
+  const seg = { base: at(+e.from || 0), tip: at(+e.to || 0) };
+  // THE FLAT, through the same map. A DIRECTION, so no scale; orthogonalized
+  // against the edge because two separately-authored axes that are
+  // nearly-but-not-quite perpendicular give the roll a slow shear.
+  let flat = AN.v3();
+  if (Array.isArray(e.flat) && e.flat.length === 3) {
+    const f = { x: +e.flat[0] || 0, y: +e.flat[1] || 0, z: +e.flat[2] || 0 };
+    let fe = AN.v3(f.x, f.z, -f.y);
+    fe = AN.vsub(fe, AN.vmul(axE, AN.vdot(axE, fe)));
+    if (AN.vlen(fe) > 1e-4) flat = AN.qrot(xf.quat, AN.vnorm(fe));
+  }
+  seg.flat = flat;
+  return seg;
+}
+
+/**
+ * mob.cpp:8262 HeadKeepOut — the wielder's own head, so no authored windup
+ * sweeps through it. Shoulder-relative, WORLD voxels, off the LIVE pose.
+ */
+function headKeepOut() {
+  if (wpHeadPart < 0 || wpChain < 0 || !anim?.model?.length) return null;
+  const m = anim.model[wpHeadPart];
+  const model = skel.parts[wpHeadPart]._model;
+  if (!m || !model) return null;
+  const S = rigScale();
+  // Half the model box. The engine divides by the SKIN scale because its model
+  // space is world voxels; here the box is already in file voxels and the
+  // whole result is converted once, at the end.
+  const half = AN.v3(model.dim.x * 0.5, model.dim.y * 0.5, model.dim.z * 0.5);
+  const center = AN.vadd(m.pos, AN.qrot(m.rot, half));
+  const rel = AN.vsub(center, anim.model[skel.chains[wpChain].parts[0]].pos);
+  return {
+    center: AN.vmul(rel, 1 / S),
+    radius: Math.max(half.x, Math.max(half.y, half.z)) / S,
+  };
+}
+
+/** The WeaponPose the rig consumes, or null when nothing claims the arm. */
+function weaponPose() {
+  if (!melee || wpChain < 0) return null;
+  const p = melee.pose();
+  return p.weight > 0 ? p : null;
+}
+
+/**
+ * mob.cpp:1895 — the ORDER matters and is the engine's: seed the driver from
+ * where the blade actually is, THEN advance the program, so the pose the
+ * animation pass reads this tick is the one the program just produced.
+ *
+ * Called from stepPreview BEFORE animSampleAndBlend, on the sim's own 30 Hz
+ * tick rather than the browser's frame — a stroke authored in ticks must be
+ * previewed in ticks or every duration in the panel is a lie.
+ */
+let strokeAccum = 0;
+function weaponStep(dtFrame) {
+  if (!melee || wpChain < 0) return;
+  strokeAccum += dtFrame;
+  // Bounded catch-up: a backgrounded tab must not run four hundred ticks in
+  // one frame and finish the swing before it is drawn.
+  let steps = Math.min(Math.floor(strokeAccum / kStrokeDt), 4);
+  strokeAccum -= steps * kStrokeDt;
+  while (steps-- > 0) weaponTick();
+}
+
+// Counters, for the harness. A stroke that does not advance has at least four
+// causes — the preview loop is not running, weaponStep is bailing on a missing
+// arm, the program has no style to read, or the driver is refusing the input —
+// and from outside all four are the same frozen phase (CLAUDE.md rule 6).
+let dbgPreviewSteps = 0, dbgWeaponTicks = 0, dbgNoStyle = 0;
+
+function weaponTick() {
+  dbgWeaponTicks++;
+  // ---- 1. WHERE THE BLADE IS NOW ---------------------------------------
+  const seed = weaponArmSeed();
+  if (seed) melee.setStroke(seed.hand, seed.tip, seed.flat, seed.reach);
+  else melee.clearArm();
+  const keep = headKeepOut();
+  if (keep) melee.setKeepOut(keep.center, keep.radius);
+  else melee.clearKeepOut();
+
+  // ---- 2. the basis. Heading is 0 and the rig is authored in its own frame,
+  // so this is the rig's facing basis: fwd = +Z, up = +Y, and right = fwd x up
+  // = -X, which is the sign anim.cpp:404 states and the side every def's `.R`
+  // limbs are authored on.
+  const right = AN.v3(-1, 0, 0), up = AN.v3(0, 1, 0), fwd = AN.v3(0, 0, 1);
+
+  // ---- 3. drive the phase — the SHARED runner (editor/melee.js) ---------
+  const lib = ATK.library();
+  const sty = (lib && strokeStyle >= 0) ? lib.styles[strokeStyle] : null;
+  if (!sty) dbgNoStyle++;
+  if (!strokeLive()) { melee.update(kStrokeDt, false, !!sty, right, up, fwd); return; }
+  const aim = ATK.currentAim();
+  const r = MELEE.stepStrokeProgram(strokeCur, sty, melee, aim.az, aim.el,
+                                    kStrokeDt, right, up, fwd);
+  strokeTick++;
+  if (r === MELEE.STEP.Finished) {
+    if (ATK.looping()) { ATK.nextSwing(); beginStroke(strokeStyle); }
+    else stopStroke();
+  }
+}
+
+/**
+ * Start one swing. Mirrors MobSystem::BeginStroke: reset the container, re-tune
+ * the MeleeState (tuning.json hot-reloads and a swing must use the current
+ * values), then fill the program fields.
+ *
+ * THE SEED IS `wielder ^ salt ^ startTick` in the engine; here it is the swing
+ * NUMBER, so "swing again" walks the same deterministic jitter sequence the
+ * game would and the author can see all of it rather than one draw.
+ */
+function beginStroke(styleIndex) {
+  const lib = ATK.library();
+  if (!melee || !lib) return;
+  const sty = lib.styles[styleIndex];
+  if (!sty) return;
+  strokeStyle = styleIndex;
+  strokeCur = MELEE.newStrokeCursor();
+  melee.tuning = meleeTuning();
+  melee.reset();
+  strokeTick = 0;
+  strokeTrail.length = 0;
+  strokeTipPrev = null;
+  strokeTipSpeed = 0;
+  strokeEdgeAlign = 1;
+  // Knuth's multiplicative hash of the swing number, standing in for the
+  // engine's `wielder ^ salt ^ startTick`: any injective map does, because
+  // what the seed has to be is DIFFERENT PER SWING and reproducible, not any
+  // particular value.
+  MELEE.beginStrokeProgram(strokeCur, sty, styleIndex,
+                           Math.imul(ATK.swingNumber() + 1, 2654435761) >>> 0);
+  strokeAccum = 0;
+}
+
+function stopStroke() {
+  strokeCur = MELEE.newStrokeCursor();
+  if (melee) melee.reset();
+  strokeTrail.length = 0;
+  strokeTipPrev = null;
+  strokeAccum = 0;
+  ed.setStrokeTrail?.(null);
+}
+
+/**
+ * mob.cpp:7767 Mob::ApplyWeaponArm — stage 5.5.
+ *
+ * Returns the PoseAxisOverride for the stage-6 clamp (anim.h), or null. Only
+ * the pieces the editor can honour are here: the IK target, the steered pole,
+ * and the elbow's hinge plane. What is NOT ported is the diagnostic block
+ * (WeaponArmDiag) and the wrist alignment, which needs the item's own
+ * transform chain rather than the rig's.
+ */
+function applyWeaponArm() {
+  const pose = weaponPose();
+  if (!pose || wpChain < 0 || !anim?.model?.length) return null;
+  const ch = skel.chains[wpChain];
+  const weight = ch.weight * pose.weight;
+  if (weight <= 0) return null;
+  const S = rigScale();
+  const i0 = ch.parts[0], i1 = ch.parts[1];
+
+  // THE LIVE SHOULDER, not the rest anchor: the spine leans and the pelvis
+  // bobs, so the real shoulder wanders a couple of voxels from its authored
+  // anchor every stride, and AnimSolveTwoBone measures its own reach from the
+  // live joint. Both ends must use the same one (mob.cpp:7820).
+  const shoulder = anim.model[i0].pos;
+  // Heading 0 => toRig is the identity. World voxels back to file voxels here,
+  // which is the only place the conversion happens on this side.
+  const targetLocal = AN.vadd(shoulder, AN.vmul(pose.hand, S));
+
+  const steer = { ...ch };
+  if (pose.steerBlade && AN.vlen(pose.bendPole) > 1e-4) steer.pole = pose.bendPole;
+  AN.animSolveTwoBone(skel, anim, steer, targetLocal, weight);
+
+  if (!pose.steerBlade) return null;
+  // ---- the elbow's hinge plane follows the bend (mob.cpp:7850) ----------
+  const fore = skel.parts[i1];
+  const forePar = fore.parent;
+  if (!fore.hasPoseLimit || !fore.poseHinge || forePar < 0) return null;
+  // THE PLANE FROM THE SOLVER'S OWN INPUTS, not from the bones it produced: at
+  // a nearly straight elbow `upper x lower` is short and its direction is
+  // almost pure noise, so the clamp would project the forearm onto a plane
+  // chosen at random. The pole and the shoulder-to-target line are well
+  // conditioned at every bend.
+  const toTarget = AN.vsub(targetLocal, anim.model[i0].pos);
+  let n = AN.v3();
+  if (AN.vlen(toTarget) > 1e-4) {
+    const dirTarget = AN.vnorm(toTarget);
+    const pole = AN.vnorm(steer.pole);
+    const polePerp = AN.vsub(pole, AN.vmul(dirTarget, AN.vdot(dirTarget, pole)));
+    if (AN.vlen(polePerp) > 1e-4) n = AN.vcross(AN.vnorm(polePerp), dirTarget);
+  }
+  if (AN.vlen(n) <= 1e-3) return null;
+  n = AN.vnorm(n);
+  // Into the frame the clamp states its axis in: parent-relative, then
+  // rest-relative.
+  const frame = AN.qmul(anim.model[forePar].rot, fore.rest.rot);
+  let axis = AN.qrotinv(frame, n);
+  // AND ITS SIGN, MEASURED WITH THE CLAMP'S OWN FUNCTION. Either sense names
+  // the same plane, but a hinge's range is authored [0, 130], so an axis whose
+  // sense makes the SOLVED bend negative is clamped straight to zero — a
+  // 70-degree correction that throws the arm across the room. Matching the
+  // authored axis instead chooses the wrong half every time the pole swings
+  // round (mob.cpp:7918).
+  {
+    const par = anim.model[forePar];
+    const delta = AN.qmul(AN.qconj(fore.rest.rot),
+                          AN.qmul(AN.qconj(par.rot), anim.model[i1].rot));
+    const bend = AN.animHingeAngleAbout(delta, axis);
+    if (bend !== null && bend < 0) axis = AN.vmul(axis, -1);
+  }
+  return { part: i1, axis, blend: clamp(pose.steerAmount, 0, 1) };
+}
+
+/**
+ * THE SEAM attacks.js is given. Everything the panel needs from the rig is
+ * behind this object, so that file never touches the skeleton and this one
+ * never parses a style.
+ */
+function bindAttacks() {
+  ATK.bind({
+    el, toast,
+    begin: beginStroke,
+    stop: stopStroke,
+    rerender: () => renderTimeline(),
+    limbByName,
+    sidecarName: () => ed.getDocName?.() || '<mob>.json',
+    touchSidecar: () => touched(),
+    tuning: () => tuningDoc(),
+    touchTuning: () => tuningTouch(),
+    onTuningChanged: () => { if (melee) melee.tuning = meleeTuning(); },
+    onStylesChanged: () => { /* a live swing keeps running on the edited data */ },
+    onTrailToggled: () => { strokeTrail.length = 0; ed.setStrokeTrail?.(null); },
+    rebuild: () => { rebuildSkeleton(); ed.invalidate(); },
+    state: () => ({
+      live: strokeLive(),
+      phase: MELEE.STROKE_PHASE_NAME[strokeCur?.phase ?? 0],
+      phaseTick: strokeCur?.phaseTick ?? 0,
+      tick: strokeTick,
+      meleePhase: melee ? melee.phaseName() : 'idle',
+      az: melee?.strokeAz() ?? 0,
+      el: melee?.strokeEl() ?? 0,
+      radius: melee?.strokeRadius() ?? 0,
+      weight: melee?.poseWeight() ?? 0,
+      tipSpeed: strokeTipSpeed,
+      edgeAlign: strokeEdgeAlign,
+    }),
+    armInfo: () => {
+      if (!skel) return { chain: -1 };
+      const ch = wpChain >= 0 ? skel.chains[wpChain] : null;
+      const seed = weaponArmSeed();
+      const band = melee ? melee.reachBand() : { lo: 0, hi: 0 };
+      return {
+        chain: wpChain,
+        armName: ch ? ch.parts.map(i => skel.parts[i]?.name).join(' → ') : '',
+        armParts: ch ? ch.parts.map(i => skel.parts[i]).filter(Boolean) : [],
+        handSign: melee ? melee.handSign_ : 1,
+        reach: seed?.reach ?? 0,
+        bladeLen: melee?.bladeLen_ ?? 0,
+        blade: !!bladeSegmentModel(),
+        bandLo: band.lo, bandHi: band.hi,
+      };
+    },
+  });
+}
+
+/**
+ * The swept edge, recorded per TICK, in file voxels — the shape of the attack
+ * and the only way to see whether a style's cut passes through where it was
+ * aimed or behind it. Coloured by phase so the telegraph is visibly separate
+ * from the cut.
+ */
+function recordStrokeTrail() {
+  if (!strokeLive()) return;
+  const blade = bladeSegmentModel();
+  if (!blade) return;
+  // ---- the two numbers the damage formula scales by ---------------------
+  // TIP SPEED, in WORLD voxels/sec, because melee.minSpeedMps and
+  // fullSpeedMps are: a rig-voxel figure would read 8x high on the human and
+  // silently pass a threshold it should not. Measured across the whole frame
+  // rather than one sim tick — the sweep does the same.
+  const S = rigScale();
+  if (strokeTipPrev)
+    strokeTipSpeed = AN.vlen(AN.vsub(blade.tip, strokeTipPrev)) / S / kStrokeDt;
+  // EDGE ALIGNMENT (melee.cpp:812 MeleeEdgeAlign): |cos| between the flat's
+  // normal and the travel, floored by melee.edgeFloor. 1 is edge-on, the floor
+  // is a pure slap with the side. Absolute because a double-edged blade cuts
+  // equally well on either face.
+  if (strokeTipPrev && AN.vlen(blade.flat) > 1e-6) {
+    const travel = AN.vsub(blade.tip, strokeTipPrev);
+    const tl = AN.vlen(travel);
+    if (tl > 1e-6) {
+      const c = Math.abs(AN.vdot(blade.flat, travel) / (AN.vlen(blade.flat) * tl));
+      const floorF = clamp(meleeTuning().edgeFloor, 0, 1);
+      strokeEdgeAlign = floorF + (1 - floorF) * (1 - clamp(c, 0, 1));
+    }
+  }
+  strokeTipPrev = blade.tip;
+  if (!ATK.trailEnabled()) { strokeTrail.length = 0; return; }
+  strokeTrail.push({ base: blade.base, tip: blade.tip, phase: strokeCur.phase });
+  while (strokeTrail.length > kStrokeTrailMax) strokeTrail.shift();
+}
 
 /* ==========================================================================
    6. timeline + flipbook frames
@@ -3002,9 +3675,44 @@ function viewPlan() {
   return null;
 }
 
+/**
+ * THE TIMELINE AREA HAS TWO LANES, and they are separate tabs rather than two
+ * stacked panels because the Attacks lane needs the full width: it carries a
+ * per-limb table and a compass pad, and squeezed under the frame strip and the
+ * clip rows it was a column of single characters — the same failure the `.rigf>i`
+ * note in tuner.html describes, one panel over.
+ */
+let laneTab = 'animation';    // 'animation' | 'attacks'
+
 function renderTimeline() {
   if (!timelineEl) return;
   timelineEl.innerHTML = '';
+
+  const tabs = el('div', { class: 'tagbar' });
+  const laneBtn = (id, label, title) => el('button', {
+    class: 'small' + (laneTab === id ? ' on' : ''), title,
+    onclick: () => { laneTab = id; renderTimeline(); },
+  }, label);
+  tabs.append(
+    laneBtn('animation', 'animation',
+      'flipbook frames and keyframed clips — the pose data in this rig\'s own sidecar'),
+    laneBtn('attacks', 'attacks',
+      'the stroke programs in assets/mobs/attack_styles.json, previewed on ' +
+      'this rig through the real melee driver'),
+    el('span', { class: 'spacer' }),
+    el('span', { class: 'hint' },
+      laneTab === 'animation'
+        ? 'K walks · space plays the flipbook · P plays the clip · I keys'
+        : 'the swing runs the SAME driver the game does — melee.js is a port ' +
+          'of melee.cpp, not a second implementation'));
+  timelineEl.append(tabs);
+
+  if (laneTab === 'attacks') {
+    const atkWrap = el('div', { class: 'clipwrap' });
+    timelineEl.append(atkWrap);
+    ATK.render(atkWrap);
+    return;
+  }
 
   const fb = flipbooks();
   const tags = Object.keys(fb);
@@ -3195,7 +3903,18 @@ function renderTimeline() {
    the cursor scrubs, and each rigged part gets a row of key diamonds.
    ========================================================================== */
 
-const CLIP_PX_PER_MS = 0.45;      // lane zoom; 420ms clip ≈ 190px
+let CLIP_PX_PER_MS = 0.45;        // lane zoom; 420ms clip ≈ 190px
+// avatar.cpp's AvatarLocoClips: five names the engine resolves by STRING and
+// drives exclusively. Kept here so the lane can mark them — see the note where
+// it does.
+const LOCO_FAMILY = ['idle', 'walk', 'run', 'fall', 'hang'];
+// Show every rigged part's row, not just the keyed ones. Off by default (a
+// 15-limb rig is a wall of empty lanes) but essential while BLOCKING OUT a
+// clip, when by definition nothing has keys yet — the old lane showed exactly
+// one row in that state and gave no way to see the others.
+let clipShowAll = false;
+// One copied key, for paste and mirror-paste.
+let clipboardKey = null;          // { rot, pos, hasRot, hasPos, ease }
 
 function clipObj() {
   const C = clips();
@@ -3229,8 +3948,19 @@ function renderClipLane() {
 
   const bar = el('div', { class: 'tagbar' }, el('span', { class: 'hint' }, 'clips'));
   for (const n of names) {
+    // THE LOCOMOTION FAMILY IS FIVE RESERVED NAMES, and nothing in the schema
+    // says so — avatar.cpp resolves `idle` / `walk` / `run` / `fall` / `hang`
+    // by string and drives them exclusively, so a clip called `walk` behaves
+    // completely differently from one called `walk2`. Marking them is the
+    // cheapest way to stop an author renaming one and losing the arm swing.
+    const loco = LOCO_FAMILY.includes(n);
     bar.append(el('button', {
       class: 'small' + (activeClip === n ? ' on' : ''),
+      title: loco
+        ? `"${n}" is a LOCOMOTION clip: the engine (and the gait preview) ` +
+          'starts it by name and retires the rest of the family. Renaming it ' +
+          'silently stops it ever playing.'
+        : 'a plain clip: something has to PlayClip it by name',
       onclick: () => {
         activeClip = activeClip === n ? null : n;
         clipCursorMs = 0; selectedKey = null;
@@ -3238,7 +3968,7 @@ function renderClipLane() {
         reseedPose();
         renderAllPanels();
       },
-    }, n));
+    }, loco ? '◆ ' + n : n));
   }
   bar.append(
     el('button', {
@@ -3287,7 +4017,24 @@ function renderClipLane() {
     activeClip ? el('button', {
       class: 'small' + (clipPlaying ? ' on' : ''),
       onclick: () => { clipPlaying = !clipPlaying; reseedPose(); renderClipLane(); },
-    }, clipPlaying ? '■ stop [P]' : '▶ play [P]') : null);
+    }, clipPlaying ? '■ stop [P]' : '▶ play [P]') : null,
+    activeClip ? el('button', {
+      class: 'small' + (clipShowAll ? ' on' : ''),
+      title: 'show a row for EVERY rigged part, not just the keyed ones — what ' +
+        'you want while blocking out a new clip, when nothing has keys yet',
+      onclick: () => { clipShowAll = !clipShowAll; renderClipLane(); },
+    }, 'all parts') : null,
+    activeClip ? el('button', {
+      class: 'small', title: 'zoom the lane out',
+      onclick: () => { CLIP_PX_PER_MS = Math.max(0.08, CLIP_PX_PER_MS / 1.5);
+                       renderClipLane(); },
+    }, '−') : null,
+    activeClip ? el('button', {
+      class: 'small', title: 'zoom the lane in — a 2 s clip is unreadable at ' +
+        'the default 0.45 px/ms',
+      onclick: () => { CLIP_PX_PER_MS = Math.min(4, CLIP_PX_PER_MS * 1.5);
+                       renderClipLane(); },
+    }, '+') : null);
   clipWrap.append(bar);
 
   const c = clipObj();
@@ -3376,7 +4123,8 @@ function renderClipLane() {
   for (const limb of L) {
     const tr = c.tracks?.[limb.name];
     const times = keyTimes(tr);
-    if (!times.length && limb.name !== selectedPart) continue;   // keep it tight
+    // Keep it tight by default; "all parts" is for blocking out a new clip.
+    if (!times.length && limb.name !== selectedPart && !clipShowAll) continue;
     const row = el('div', { class: 'cliprow' + (limb.name === selectedPart ? ' on' : '') });
     row.append(el('span', {
       class: 'cliplbl',
@@ -3437,6 +4185,31 @@ function renderClipLane() {
 
     box.append(el('div', { class: 'rigbtns' },
       el('button', {
+        class: 'small',
+        title: 'copy this key\'s pose',
+        onclick: () => {
+          clipboardKey = {
+            rot: rk?.q ? [...rk.q] : null,
+            pos: pk?.v ? [...pk.v] : null,
+            ease: rk?.ease || pk?.ease || 'linear',
+          };
+          toast(`copied ${selectedKey.part} @ ${selectedKey.tMs}ms`);
+          renderClipLane();
+        },
+      }, 'copy'),
+      clipboardKey ? el('button', {
+        class: 'small',
+        title: 'paste onto the SELECTED part at the cursor',
+        onclick: () => pasteKey(false),
+      }, 'paste') : null,
+      clipboardKey ? el('button', {
+        class: 'small',
+        title: 'paste MIRRORED onto the opposite limb (.L <-> .R) at the ' +
+          'cursor. A walk cycle is one arm authored twice, half a period ' +
+          'apart, and doing that by hand is where sign errors come from.',
+        onclick: () => pasteKey(true),
+      }, 'mirror →') : null,
+      el('button', {
         class: 'small danger',
         onclick: () => {
           if (tr?.rot) tr.rot = tr.rot.filter(k => (+k.t || 0) !== selectedKey.tMs);
@@ -3454,7 +4227,57 @@ function renderClipLane() {
   clipWrap.append(el('div', { class: 'hint' },
     'click a lane to scrub · I key (no ring drag = holds the sampled pose) · ' +
     'P play clip · select a part then drag the rotation rings to pose · ' +
-    'auto-key writes on release'));
+    'auto-key writes on release · ± zooms the lane'));
+}
+
+/**
+ * Paste the copied key at the cursor, optionally MIRRORED to the opposite limb.
+ *
+ * THE MIRROR IS ABOUT THE MODEL'S X AXIS, which is the plane every one of
+ * these rigs is built symmetric about (`.L` limbs sit at high model x and `.R`
+ * at low — mob.cpp:8130 says so where it derives HandSign from the name). For
+ * a quaternion that reflection is (x, -y, -z, w): the x component survives
+ * because a rotation ABOUT the mirror axis is unchanged by it, and the other
+ * two flip because their axes do.
+ *
+ * The target limb is the same name with .L and .R swapped; with no such limb
+ * it pastes onto the selected part and says so, rather than silently doing
+ * nothing.
+ */
+function pasteKey(mirror) {
+  const c = clipObj();
+  if (!c || !clipboardKey) return;
+  let part = selectedPart;
+  if (mirror && part) {
+    const other = part.endsWith('.L') ? part.slice(0, -2) + '.R'
+                : part.endsWith('.R') ? part.slice(0, -2) + '.L' : null;
+    if (other && limbByName(other)) part = other;
+    else toast(`no mirror of "${selectedPart}" in this rig — pasted in place`, true);
+  }
+  if (!part || !limbByName(part)) return toast('select a part first', true);
+  const t = Math.round(clipCursorMs);
+  const tr = trackFor(part);
+  const q = clipboardKey.rot;
+  const v = clipboardKey.pos;
+  if (q) {
+    const m = mirror ? [q[0], -q[1], -q[2], q[3]] : [...q];
+    tr.rot = (tr.rot || []).filter(k => (+k.t || 0) !== t);
+    tr.rot.push({ t, q: m, ease: clipboardKey.ease });
+  }
+  if (v) {
+    // A POSITION mirrors on the axis itself, not on the rotation's rule: the
+    // reflection negates x and leaves y and z, which is the opposite pattern
+    // to the quaternion above and is the easiest thing here to get backwards.
+    const m = mirror ? [-v[0], v[1], v[2]] : [...v];
+    tr.pos = (tr.pos || []).filter(k => (+k.t || 0) !== t);
+    tr.pos.push({ t, v: m, ease: clipboardKey.ease });
+  }
+  sortTrack(tr);
+  selectedKey = { part, tMs: t };
+  selectedPart = part;
+  touched();
+  bindGizmo();
+  renderAllPanels();
 }
 
 // Playback-rate UI updates: move the cursor marker and the ms label without
@@ -3705,6 +4528,11 @@ function tick(dt) {
     stepPreview(dt);
     renderGaitReadout();
   }
+  // The Attacks lane's live numbers move every tick and its inputs must not be
+  // rebuilt under the author's cursor, so it refreshes the readout IN PLACE —
+  // the same split the clip lane makes between updateClipCursorUI() and a full
+  // renderClipLane().
+  if (laneTab === 'attacks') ATK.tickUI();
 }
 
 function renderAllPanels() {
@@ -3716,14 +4544,126 @@ function renderAllPanels() {
 export function attach(opts) {
   el = opts.el;
   toast = opts.toast || (() => {});
+  // The HOST'S live tuning document, not a fetch: the page may have unsaved
+  // melee edits and previewing the version on disk instead of the one on
+  // screen is exactly the drift this whole lane exists to remove. Optional —
+  // a host that supplies neither leaves the Attacks lane on melee.h's own
+  // defaults and says so.
+  tuningGet = opts.tuning || null;
+  tuningTouchFn = opts.touchTuning || null;
   const p = ed.panels();
   sideEl = p.side;
   timelineEl = p.timeline;
+  bindAttacks();
+  installTestSeam();
   rebuildSkeleton();
   renderAllPanels();
   // The shelf itself is scanned by the onActivate hook, which fires on every
   // tab entry including the first — doing it here as well would double every
   // page load's listing for nothing.
+}
+
+/* ==========================================================================
+   THE TEST SEAM (assets/attacks_test.html, scripts/check_attacks.sh)
+
+   Everything a headless harness needs to ASK QUESTIONS about the preview, and
+   nothing it needs to break it. It exists because the two claims that matter
+   here cannot be reached any other way:
+
+     "when the preview walks, do the arms swing"  is a fact about posed
+       transforms over time, which no unit test of anim.js can see — every
+       function in that file was individually correct while the preview showed
+       rest arms, because nothing ever STARTED a walk clip.
+     "does the Attacks lane drive a real swing"   is a fact about a button
+       reaching a driver through three modules and a rAF loop.
+
+   Read-only apart from setPreviewSpeed / setStyleTicks, both of which the
+   harness restores. Attached to `window` rather than exported because the
+   harness drives tuner.html in an iframe and cannot import a module out of it.
+   ========================================================================== */
+function installTestSeam() {
+  if (typeof window === 'undefined') return;
+  window.__tunerRigForTest = {
+    // Which clip instances are live, formatted as the gait readout formats
+    // them ("walk×1.24@0.87"). The bare name is the prefix before × or @.
+    playingClips: () => (anim?.clips || []).map(i => {
+      const c = skel?.clips?.[i.clip];
+      if (!c) return '?';
+      const r = Math.abs((i.rate ?? 1) - 1) > 0.01 ? `×${i.rate.toFixed(2)}` : '';
+      return `${c.name}${r}${i.stopping ? '↓' : ''}@${(i.weight * (i.fade ?? 1)).toFixed(2)}`;
+    }),
+    // The POSED model-space rotation of a limb — what the viewport draws, not
+    // an internal that might not reach it.
+    limbRot: name => {
+      if (!skel || !anim?.model?.length) return null;
+      const i = skel.findPart(name);
+      return i >= 0 && anim.model[i] ? { ...anim.model[i].rot } : null;
+    },
+    limbPos: name => {
+      if (!skel || !anim?.model?.length) return null;
+      const i = skel.findPart(name);
+      return i >= 0 && anim.model[i] ? { ...anim.model[i].pos } : null;
+    },
+    setPreviewSpeed: v => { gaitSpeedScale = +v || 0; renderGaitReadout(); },
+    strideRate: () => anim?.strideRate ?? 0,
+    counters: () => ({ preview: dbgPreviewSteps, weaponTicks: dbgWeaponTicks,
+                       noStyle: dbgNoStyle, chain: wpChain,
+                       hasMelee: !!melee, strokeStyle,
+                       libStyles: ATK.library()?.styles.length ?? -1,
+                       accum: +strokeAccum.toFixed(4) }),
+    autoLoco: () => autoLoco,
+    styleNames: () => (ATK.library()?.styles || []).map(s => s.name),
+    armInfo: () => {
+      const ch = (skel && wpChain >= 0) ? skel.chains[wpChain] : null;
+      const seed = weaponArmSeed();
+      return {
+        chain: wpChain,
+        handPart: wpHandPart >= 0 ? skel?.parts[wpHandPart]?.name : '',
+        armName: ch ? ch.parts.map(i => skel.parts[i]?.name).join(' → ') : '',
+        reach: seed?.reach ?? 0,
+        socket: weaponSocket()?.name ?? '',
+      };
+    },
+    strokeState: () => {
+      const s = ATK.library();
+      return {
+        live: strokeLive(),
+        phase: MELEE.STROKE_PHASE_NAME[strokeCur?.phase ?? 0],
+        meleePhase: melee ? melee.phaseName() : 'idle',
+        az: melee?.strokeAz() ?? 0,
+        el: melee?.strokeEl() ?? 0,
+        radius: melee?.strokeRadius() ?? 0,
+        weight: melee?.poseWeight() ?? 0,
+        style: strokeStyle >= 0 ? s?.styles[strokeStyle]?.name : null,
+      };
+    },
+    styleTicks: name => {
+      const s = ATK.library()?.styles.find(x => x.name === name);
+      return s ? { windup: s.windup.ticks, cut: s.cut.ticks,
+                   recover: s.recoverTicks } : null;
+    },
+    setStyleTicks: (name, seg, ticks) => {
+      const s = ATK.library()?.styles.find(x => x.name === name);
+      if (!s) return false;
+      s.raw[seg] = s.raw[seg] || {};
+      s.raw[seg].ticks = ticks;
+      s[seg === 'recover' ? 'recoverTicks' : seg].ticks = ticks;
+      if (seg === 'recover') s.recoverTicks = ticks;
+      return true;
+    },
+    // Stage 6 is only meaningful if the rig authors a limit for it to enforce.
+    clampRan: () => !!skel?.parts.some(p => p.hasPoseLimit || p.poseBall.has),
+    elbowBendDeg: () => {
+      if (!skel || !anim?.model?.length || wpChain < 0) return null;
+      const i1 = skel.chains[wpChain].parts[1];
+      const p = skel.parts[i1];
+      if (!p?.hasPoseLimit || p.parent < 0) return null;
+      const delta = AN.qmul(AN.qconj(p.rest.rot),
+        AN.qmul(AN.qconj(anim.model[p.parent].rot), anim.model[i1].rot));
+      const ang = AN.animHingeAngleAbout(delta, AN.vnorm(p.poseAxis));
+      return ang === null ? null : ang * 180 / Math.PI;
+    },
+  };
 }
 
 /** The hooks editor.js consumes. */

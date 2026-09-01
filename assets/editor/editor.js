@@ -145,6 +145,12 @@ let socketAxes = null;
 let gridHelper = null, axes = null;
 let selectionOutline = null;
 let hiltBox = null;            // wireframe outline of the item's hilt region
+// The swept blade of a previewed attack: one line per recorded tick, coloured
+// by the stroke phase so the telegraph reads apart from the cut. A generic
+// coloured-segment overlay rather than a stroke-specific object, because "draw
+// me these lines" is the only thing rig.js needs and a second consumer should
+// not need a second mesh.
+let strokeTrail = null;
 let resizeHandles = [];        // 6 spheres, one per bounding-box face
 let canvas = null, host = null;
 let initialised = false, initFailed = false;
@@ -1458,6 +1464,17 @@ function buildScene() {
   hiltBox.visible = false;
   scene.add(hiltBox);
 
+  // Stroke trail: vertex-coloured line segments, rebuilt per frame while a
+  // swing plays. Depth test OFF so a blade passing behind the torso still
+  // draws its own arc — the point of the overlay is the SHAPE of the sweep.
+  strokeTrail = new THREE.LineSegments(
+    new THREE.BufferGeometry(),
+    new THREE.LineBasicMaterial({ vertexColors: true, transparent: true,
+                                  opacity: 0.9, depthTest: false }));
+  strokeTrail.renderOrder = 1000;
+  strokeTrail.visible = false;
+  scene.add(strokeTrail);
+
   // Resize handles: 6 spheres on each face of the active model's bounding box.
   const FACE_DEFS = [
     { axis: 0, sign: +1 }, { axis: 0, sign: -1 },
@@ -2235,6 +2252,41 @@ export function setHiltBox(state) {
   hiltBox.scale.set(state.size[0], state.size[1], state.size[2]);
   const q = state.quat || { x: 0, y: 0, z: 0, w: 1 };
   hiltBox.quaternion.set(q.x, q.y, q.z, q.w).normalize();
+}
+
+/**
+ * Draw a list of coloured line segments in viewport space, or hide the overlay.
+ *
+ * `segs` is [{ a:[x,y,z], b:[x,y,z], color:0xRRGGBB, alpha? }]. Rebuilt whole
+ * on every call: a stroke trail is at most a hundred short lines and a
+ * per-frame rebuild of that is cheaper than the bookkeeping to update one in
+ * place — the same trade the frame strip's thumbnails make.
+ */
+export function setStrokeTrail(segs) {
+  if (!strokeTrail) return;
+  if (!segs || !segs.length) { strokeTrail.visible = false; return; }
+  const pos = new Float32Array(segs.length * 6);
+  const col = new Float32Array(segs.length * 6);
+  for (let i = 0; i < segs.length; i++) {
+    const s = segs[i], o = i * 6;
+    pos[o] = s.a[0]; pos[o + 1] = s.a[1]; pos[o + 2] = s.a[2];
+    pos[o + 3] = s.b[0]; pos[o + 4] = s.b[1]; pos[o + 5] = s.b[2];
+    // Alpha rides the COLOUR, not the material: one material draws the whole
+    // trail, so a per-segment fade has to be baked into rgb against the dark
+    // viewport background.
+    const k = s.alpha === undefined ? 1 : Math.max(0, Math.min(1, s.alpha));
+    const c = s.color | 0;
+    col[o] = ((c >> 16) & 255) / 255 * k;
+    col[o + 1] = ((c >> 8) & 255) / 255 * k;
+    col[o + 2] = (c & 255) / 255 * k;
+    col[o + 3] = col[o]; col[o + 4] = col[o + 1]; col[o + 5] = col[o + 2];
+  }
+  strokeTrail.geometry.dispose();
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  g.setAttribute('color', new THREE.BufferAttribute(col, 3));
+  strokeTrail.geometry = g;
+  strokeTrail.visible = true;
 }
 
 function updateRotRings() {

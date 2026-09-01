@@ -1,0 +1,463 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>attacks lane + walk preview harness</title>
+<!--
+  attacks_test.html — does the Models tab's animation preview show what the
+  GAME shows, and does the Attacks lane drive a real swing?
+
+  WHY THIS EXISTS, and what `node scripts/test_melee.mjs` cannot answer.
+  That test covers the PORT: melee.js against the C++ it transcribes, anim.js's
+  new stages against the invariants anim.cpp states. All of it is pure
+  arithmetic and none of it touches a rig, a clip, three.js or the DOM. The two
+  questions this file asks are exactly the ones that live on the other side of
+  that line:
+
+    1. WHEN THE PREVIEW WALKS, DO THE ARMS SWING? This is the reported bug.
+       The gait layer only places FEET; the arms swing because `walk` is
+       PLAYING over it, and until 2026-09-01 nothing in the editor ever started
+       one. A rig previewed with K showed IK legs and rest arms — which no
+       amount of unit-testing anim.js would notice, because every function in
+       it was individually correct. So the harness walks the real human rig and
+       MEASURES whether the shoulder actually moves.
+
+    2. DOES THE ATTACKS LANE RUN A SWING? Same argument one lane over: the
+       panel can render perfectly while the driver never receives a tick.
+
+  It drives the REAL tuner.html in an iframe against the real server, exactly
+  as tabs_test.html does, so every module has actually run.
+-->
+<style>body{background:#0e1116;color:#cfd8e3;font:13px/1.5 monospace;margin:0}
+pre#out{padding:12px;white-space:pre-wrap}
+iframe{position:absolute;left:-4000px;width:1400px;height:980px;border:0}</style>
+<pre id="out">running…</pre>
+<iframe id="f" src="tuner.html"></iframe>
+<script>
+const out = document.getElementById('out');
+const log = [];
+let fail = 0;
+function say(ok, msg, detail) {
+  log.push((ok ? 'PASS  ' : 'FAIL  ') + msg + (detail ? '\n        ' + detail : ''));
+  if (!ok) fail++;
+  out.textContent = log.join('\n');
+}
+function note(msg) { log.push('      ' + msg); out.textContent = log.join('\n'); }
+function done() {
+  out.textContent = log.join('\n') + '\n\nRESULT ' + (fail ? 'FAIL(' + fail + ')' : 'OK');
+  document.title = fail ? 'FAIL' : 'OK';
+}
+
+// REAL TIME, NOT TIMER TIME. --virtual-time-budget fast-forwards setTimeout,
+// so a sleep-poll completes instantly in virtual time and measures the page
+// before it has settled. A network round-trip is not fast-forwardable. Same
+// note as tabs_test.html and check_worldview.sh.
+async function sleep(ms) {
+  const t0 = Date.now();
+  do { try { await fetch('/api/status', {cache: 'no-store'}); } catch (e) { return; } }
+  while (Date.now() - t0 < ms);
+}
+
+// WAIT IN THE PREVIEW'S OWN FRAMES, NOT IN MILLISECONDS.
+//
+// Everything this harness measures is motion produced by the iframe's rAF
+// loop, and under a virtual-time budget that loop and this polling share one
+// scheduler: headless delivered anywhere from 0 to 12 stepPreview calls in the
+// same 400 ms window across consecutive runs, so every wall-clock assertion
+// here was a coin flip. Waiting on the preview's OWN step counter removes the
+// frame rate from the question entirely — "after 30 preview steps" means the
+// same thing at 6 fps and at 60. Yielding an rAF between fetches was tried
+// first and is worse: it deadlocks outright on a throttled iframe, and racing
+// it against a timer spends the budget the preview needs.
+let rigApi = null;
+async function frames(n, capMs = 20000) {
+  if (!rigApi) return sleep(n * 16);
+  const start = rigApi.counters().preview;
+  const t0 = Date.now();
+  while (rigApi.counters().preview - start < n && Date.now() - t0 < capMs)
+    await sleep(30);
+  return rigApi.counters().preview - start;
+}
+
+async function until(pred, ms = 30000, step = 200) {
+  const t0 = Date.now();
+  while (Date.now() - t0 < ms) { if (pred()) return true; await sleep(step); }
+  return pred();
+}
+
+const btn = (root, text) =>
+  [...root.querySelectorAll('button')].find(b => b.textContent.trim() === text);
+const btnLike = (root, sub) =>
+  [...root.querySelectorAll('button')].find(b => b.textContent.includes(sub));
+
+(async () => {
+try {
+  const f = document.getElementById('f');
+  await new Promise(r => f.addEventListener('load', r, {once: true}));
+  const doc = f.contentDocument;
+  const win = f.contentWindow;
+
+  // AN EXCEPTION INSIDE THE rAF LOOP IS SILENT FROM OUT HERE, and it is the
+  // failure mode this harness is most likely to hit: the preview simply stops
+  // advancing and every measurement reads a frozen pose, which looks exactly
+  // like "the feature does nothing". Capture them so the verdict names the
+  // cause instead of the symptom (CLAUDE.md rule 6).
+  const errors = [];
+  win.addEventListener('error', e =>
+    errors.push((e.message || 'error') + ' @ ' + (e.filename || '?') + ':' + e.lineno));
+  win.addEventListener('unhandledrejection', e =>
+    errors.push('unhandled rejection: ' + (e.reason && e.reason.message || e.reason)));
+  const reportErrors = () => {
+    if (!errors.length) return;
+    say(false, 'the page threw while the preview was running',
+      [...new Set(errors)].slice(0, 6).join('\n        '));
+    errors.length = 0;
+  };
+
+  // ---- get onto the Models tab and wait for the editor to boot ----------
+  const modelsTab = [...doc.querySelectorAll('nav.tabs button[data-tab]')]
+    .find(b => b.dataset.tab === 'models');
+  if (!modelsTab) { say(false, 'the tuner has a Models tab'); return done(); }
+  modelsTab.click();
+  const view = doc.querySelector('#view-models');
+  const ready = await until(() => !!view.querySelector('.edtimeline'));
+  say(ready, 'the Models tab booted (three.js + editor.js + rig.js)');
+  if (!ready) return done();
+
+  // ---- load the shipped human rig --------------------------------------
+  // It is the asset the report is about: 15 limbs, two IK chains, a gait
+  // block, and the walk/run/idle clips gen_human.py derives.
+  // The picker is filled by an async /api/models fetch that fires on tab
+  // ACTIVATE, so it is empty for a beat after .edtimeline exists. Poll for the
+  // option rather than snapshotting once — and search every select in the
+  // document, because "the first select in #view-models" is a layout detail.
+  let picker = null, human = null;
+  await until(() => {
+    for (const s of doc.querySelectorAll('select')) {
+      const o = [...s.options].find(o => /mobs\/human\.vox$/.test(o.value));
+      if (o) { picker = s; human = o; return true; }
+    }
+    return false;
+  });
+  if (!human) {
+    const all = [...doc.querySelectorAll('select')]
+      .flatMap(s => [...s.options].map(o => o.value)).filter(Boolean);
+    say(false, 'assets/mobs/human.vox is in the model picker',
+      'options seen: ' + (all.slice(0, 10).join(', ') || '(none)'));
+    return done();
+  }
+  say(true, 'the model picker listed the shipped mobs');
+  picker.value = human.value;
+  picker.dispatchEvent(new win.Event('change', {bubbles: true}));
+  const loaded = await until(() =>
+    [...view.querySelectorAll('*')].some(e => e.textContent === 'armU.R'));
+  say(loaded, 'human.vox loaded with its rig sidecar');
+  if (!loaded) return done();
+
+  /* ====================================================================
+     1. THE WALK PREVIEW — the reported bug.
+     ==================================================================== */
+  note('');
+  note('--- the walk preview ---');
+
+  // Sample a limb's posed transform through the rig hooks. `modelTransform`
+  // is exactly what the viewport applies, so measuring it measures what is
+  // DRAWN rather than an internal that might not reach the screen.
+  const api = win.__tunerRigForTest;
+  rigApi = api;                       // frames() waits on the preview's own clock
+  if (!api) {
+    say(false, 'rig.js exposes its test seam (window.__tunerRigForTest)');
+    return done();
+  }
+
+  const walkBtn = btnLike(view, 'walk [K]');
+  say(!!walkBtn, 'the gait preview has a walk button');
+  if (!walkBtn) return done();
+  walkBtn.click();
+  await sleep(400);
+
+  // playingClips() formats each instance as the gait readout does
+  // ("walk×1.24↓0.40"), so compare on the bare NAME. A trailing
+  // ↓ marks an instance that is BLENDING OUT — a crossfade, not a
+  // selection, and counting it as one made a correct hand-over look like a
+  // flicker in the first version of this harness.
+  const fam = ['idle', 'walk', 'run', 'fall', 'hang'];
+  const bare = c => c.replace(/[↓×@].*$/, '');
+  const chosen = () => api.playingClips()
+    .filter(c => !c.includes('↓')).map(bare).filter(c => fam.includes(c));
+
+  const clips1 = api.playingClips();
+  say(chosen().length > 0,
+    'walking starts a locomotion clip (the family drives the preview)',
+    'playing: ' + (clips1.join(', ') || '(nothing)'));
+  say(chosen().includes('walk'),
+    'at the default preview speed the family picks WALK, not run or idle',
+    'playing: ' + (clips1.join(', ') || '(nothing)'));
+
+  // ...and only ONE of the family. Leaving `idle` running under a walk is what
+  // dragged an authored 14-degree arm swing down to about 4 in the engine.
+  say(chosen().length === 1, 'exactly ONE member of the locomotion family is live',
+    'playing: ' + clips1.join(', '));
+
+  // THE ARM CYCLE IS LOCKED TO THE FEET. rate 1 means the clip's authored
+  // period equals one stride; anything pinned at the clamp's 0.25 or 3.0 means
+  // the clock driving it is not the one the feet are on, which is exactly what
+  // the NPC oscillator did here (4.6 strides/s against a real ~1.8).
+  const rateOf = n => {
+    const c = api.playingClips().find(x => bare(x) === n);
+    const m = c && c.match(/×([\d.]+)/);
+    return m ? +m[1] : 1;
+  };
+  // Wait for the clock: the rate is MEASURED between touchdowns, so it is 0
+  // until two steps have been timed. Asserting before then reads the default.
+  await until(() => api.strideRate() > 1e-3, 8000, 150);
+  const wr = rateOf('walk');
+  say(wr > 0.26 && wr < 2.99,
+    'the walk clip is stride-rate locked, not pinned at the clamp',
+    'rate ×' + wr.toFixed(2) + ', stride ' + api.strideRate().toFixed(2) + '/s');
+
+  // ---- DO THE ARMS ACTUALLY MOVE? --------------------------------------
+  // The whole report in one measurement. Sample each limb's posed rotation
+  // over a couple of seconds of walking and record how far it travelled.
+  const sweep = await measureSweep(api, ['armU.L', 'armU.R', 'legU.L', 'legU.R', 'torso']);
+  for (const [name, deg] of Object.entries(sweep))
+    note(`  ${name.padEnd(8)} swept ${deg.toFixed(1)}°`);
+  say(sweep['legU.L'] > 5 && sweep['legU.R'] > 5,
+    'the LEGS move while walking (the gait IK)',
+    `L ${sweep['legU.L'].toFixed(1)}° R ${sweep['legU.R'].toFixed(1)}°`);
+  say(sweep['armU.L'] > 5 && sweep['armU.R'] > 5,
+    'BOTH ARMS swing while walking — the reported bug',
+    `L ${sweep['armU.L'].toFixed(1)}° R ${sweep['armU.R'].toFixed(1)}°`);
+  // They must swing in OPPOSITION, which is what an authored walk cycle does
+  // and what a stale rest pose cannot fake. Measured on the HANDS' fore/aft
+  // position rather than on a quaternion component: `q.x` is not a pitch, and
+  // on a mirrored .L/.R pair it is not even the same quantity — the first
+  // version of this check read a correlation of exactly 0.00 on arms that were
+  // demonstrably sweeping 14 degrees.
+  const opposed = await measureOpposition(api, ['hand.L', 'armU.L'], ['hand.R', 'armU.R']);
+  say(opposed.r < -0.2, 'the two arms swing in OPPOSITION (correlation < -0.2)',
+    'fore/aft correlation ' + opposed.r.toFixed(2) + ' over ' + opposed.n +
+    ' samples, travel ' + opposed.pa.toFixed(2) + ' / ' + opposed.pb.toFixed(2) +
+    ' vox');
+
+  // Faster than 0.80 of the def's top speed the family must switch to `run`,
+  // and NOT flicker: the 0.55 threshold it used to have sat right on a plain
+  // walk and neither clip ever got past a fraction of its blend-in. Note that
+  // 1.0 IS a sprint — `speed` in the sidecar is the sprint reference — which
+  // is why the preview slider defaults to 0.58 and not to 1.
+  api.setPreviewSpeed(1.0);
+  // THE STRIDE CLOCK NEEDS TWO STEPS TO RE-TIME after a speed change — it is
+  // measured between touchdowns, not derived from the slider — so poll for the
+  // hand-over rather than sleeping a guess. A fixed wait here reported the
+  // walk still playing at its old rate and called it a failure.
+  await until(() => chosen().includes('run'), 8000, 150);
+  say(chosen().includes('run'), 'past the runOn threshold the family picks RUN',
+    'playing: ' + api.playingClips().join(', '));
+  let flips = 0, prev = null;
+  for (let i = 0; i < 12; i++) {
+    const now = chosen().sort().join(',');
+    if (prev !== null && now !== prev) flips++;
+    prev = now; await sleep(100);
+  }
+  say(flips === 0, 'the walk/run choice does not flicker at a steady speed',
+    flips + ' changes in 1.2 s');
+  api.setPreviewSpeed(0.58);
+  walkBtn.click();                       // stop walking
+  await sleep(200);
+
+  /* ====================================================================
+     2. THE ATTACKS LANE
+     ==================================================================== */
+  note('');
+  note('--- the attacks lane ---');
+
+  const laneBtn = btn(view, 'attacks');
+  say(!!laneBtn, 'the timeline has an "attacks" lane tab');
+  if (!laneBtn) return done();
+  laneBtn.click();
+  const panelUp = await until(() => !!btnLike(view, '▶ swing'));
+  say(panelUp, 'the Attacks panel rendered');
+  if (!panelUp) { note('panel text: ' + view.querySelector('.edtimeline').textContent.slice(0, 300)); return done(); }
+
+  // Every shipped style must have a chip, or the author cannot reach it.
+  const styles = api.styleNames();
+  say(styles.length >= 10, 'every style in attack_styles.json is listed',
+    styles.length + ': ' + styles.join(', '));
+  const chips = [...view.querySelectorAll('.tagbar button')].map(b => b.textContent);
+  const missing = styles.filter(s => !chips.includes(s.replace(/^player_/, '')));
+  say(missing.length === 0, 'each style has a chip in the bar',
+    'missing: ' + missing.join(', '));
+
+  // The compass pad is a canvas the panel PAINTS by sampling QuantizeStrike.
+  // A blank one means the partition never ran.
+  // BY ID, not `querySelector('canvas')` — #view-models already contains the
+  // editor's own WebGL viewport canvas, and it comes first in the DOM.
+  const pad = view.querySelector('#atkCompass');
+  say(!!pad, 'the player flick compass pad is present');
+  if (pad) {
+    const g = pad.getContext('2d');
+    const px = g.getImageData(0, 0, pad.width, pad.height).data;
+    let colours = new Set();
+    for (let i = 0; i < px.length; i += 4 * 37)
+      if (px[i + 3] > 0) colours.add((px[i] << 16) | (px[i + 1] << 8) | px[i + 2]);
+    say(colours.size >= 4,
+      'the compass draws a real max-dot partition (several sectors visible)',
+      colours.size + ' distinct colours sampled');
+  }
+
+  // ---- RUN A SWING -----------------------------------------------------
+  // A sword is needed for a real blade; without one the point IS the hand,
+  // which the panel says and which still exercises the whole driver.
+  const arm = api.armInfo();
+  say(arm.chain >= 0, 'the rig resolved a weapon arm for the driver to steer',
+    'chain ' + arm.chain + ' hand "' + arm.handPart + '" parts [' +
+    (arm.armName || '') + '] reach ' + (arm.reach || 0).toFixed(2));
+
+  const swing = btnLike(view, '▶ swing');
+  const c0 = api.counters();
+  swing.click();
+  const ran = await frames(12);
+  const st0 = api.strokeState();
+  const c1 = api.counters();
+  const d = k => c1[k] - c0[k];
+  say(st0.live, 'clicking ▶ swing starts the program',
+    'phase ' + st0.phase + ' driver ' + st0.meleePhase);
+  // ATTRIBUTION, not a bare frozen phase: a stroke that does not advance has
+  // four separable causes and this names which one fired.
+  say(d('preview') > 0, 'the preview loop is running while a stroke is live',
+    d('preview') + ' stepPreview calls');
+  say(d('weaponTicks') >= d('preview'),
+    'the stroke driver receives at least one 30 Hz tick per preview step',
+    d('weaponTicks') + ' driver ticks over ' + d('preview') + ' steps');
+  say(d('noStyle') === 0,
+    'every tick had a style to run',
+    d('noStyle') + ' ticks with no style, strokeStyle=' + c1.strokeStyle +
+    ' of ' + c1.libStyles);
+  reportErrors();
+  if (st0.live) {
+    // Walk the program and record which phases it passed through. This is the
+    // end-to-end claim: the panel's button reaches the ported driver, the
+    // driver receives 30 Hz ticks, and the phase machine advances.
+    const seen = new Set();
+    const azs = [];
+    const start = api.counters().preview;
+    const t0 = Date.now();
+    while (api.counters().preview - start < 80 && Date.now() - t0 < 25000) {
+      const s = api.strokeState();
+      seen.add(s.phase);
+      azs.push(s.az);
+      await sleep(30);
+    }
+    say(seen.has('windup') && seen.has('cut'),
+      'the program advances through windup and cut',
+      'phases seen: ' + [...seen].join(', '));
+    const span = Math.max(...azs) - Math.min(...azs);
+    say(span > 0.3, 'the stroke actually moves the blade',
+      'azimuth swept ' + span.toFixed(2) + ' rad');
+    reportErrors();
+    // And the arm follows it: the weapon arm is a real IK solve, not a readout.
+    const armSweep = await measureSweep(api, ['armU.R', 'armL.R'], 25);
+    say(armSweep['armU.R'] > 3 || armSweep['armL.R'] > 3,
+      'the weapon ARM follows the stroke (stage 5.5 ran)',
+      `armU.R ${armSweep['armU.R'].toFixed(1)}°  armL.R ${armSweep['armL.R'].toFixed(1)}°`);
+  }
+  btnLike(view, '■ stop')?.click();
+
+  // ---- editing a style must not need a reload --------------------------
+  const before = api.styleTicks('horizontal_r');
+  api.setStyleTicks('horizontal_r', 'windup', (before?.windup || 12) + 3);
+  await sleep(100);
+  const after = api.styleTicks('horizontal_r');
+  say(after && after.windup === before.windup + 3,
+    'editing a style is live (no reload, no re-parse round trip)',
+    `windup ${before?.windup} -> ${after?.windup}`);
+  api.setStyleTicks('horizontal_r', 'windup', before.windup);   // put it back
+
+  // ---- the pose clamp is running ---------------------------------------
+  // Stage 6 exists in both engine drivers and in neither preview until now.
+  // The human's elbow is authored [0, 130] degrees; the preview must respect
+  // it however the weapon arm is steered.
+  say(api.clampRan(), 'stage 6 (AnimClampPoseLimits) is wired into the preview');
+  const bend = api.elbowBendDeg();
+  say(bend === null || (bend >= -1 && bend <= 131),
+    'the elbow stays inside its authored [0, 130] hinge range',
+    bend === null ? 'no measurable bend' : bend.toFixed(1) + '°');
+
+} catch (e) {
+  say(false, 'harness threw: ' + (e && e.stack || e));
+}
+done();
+
+/** Peak-to-peak rotation of each named limb over `ms` of preview, in degrees. */
+async function measureSweep(api, names, nFrames = 60) {
+  const samples = {};
+  for (const n of names) samples[n] = [];
+  const start = api.counters().preview;
+  const t0 = Date.now();
+  while (api.counters().preview - start < nFrames && Date.now() - t0 < 25000) {
+    for (const n of names) {
+      const q = api.limbRot(n);
+      if (q) samples[n].push(q);
+    }
+    await sleep(30);
+  }
+  const outv = {};
+  for (const n of names) {
+    let worst = 0;
+    const s = samples[n];
+    for (let i = 0; i < s.length; i++)
+      for (let j = i + 1; j < s.length; j++) {
+        // angle between two unit quats = 2*acos(|dot|)
+        const d = Math.abs(s[i].x * s[j].x + s[i].y * s[j].y +
+                           s[i].z * s[j].z + s[i].w * s[j].w);
+        worst = Math.max(worst, 2 * Math.acos(Math.min(1, d)));
+      }
+    outv[n] = worst * 180 / Math.PI;
+  }
+  return outv;
+}
+
+/**
+ * Correlation between two limbs' pitch over time. A walk swings the arms in
+ * OPPOSITION, so this must be negative — and a pair of limbs frozen at rest
+ * produces no signal at all, which is the case being ruled out.
+ */
+/**
+ * Correlation between two limbs' fore/aft travel, each measured RELATIVE TO
+ * ITS OWN ROOT JOINT.
+ *
+ * The subtraction is the whole point and it took three tries to get here. A
+ * hand's absolute model-space Z carries the pelvis's own sway and bob, which
+ * is COMMON MODE to both arms and swamps the differential swing — measured
+ * across three runs of this harness the same rig reported +0.71, -1.00 and
+ * 0.00 for the identical, correct animation. Against the shoulder there is no
+ * common mode left, so the number means what it says. (An earlier version
+ * correlated a raw quaternion component, which is not a pitch at all and on a
+ * mirrored .L/.R pair is not even the same quantity.)
+ *
+ * Returns the correlation plus the sample count and each limb's peak-to-peak
+ * travel, so a zero is attributable instead of bare.
+ */
+async function measureOpposition(api, [aTip, aRoot], [bTip, bRoot]) {
+  const A = [], B = [];
+  const start = api.counters().preview;
+  const t0 = Date.now();
+  while (api.counters().preview - start < 90 && Date.now() - t0 < 25000) {
+    const at = api.limbPos(aTip), ar = api.limbPos(aRoot);
+    const bt = api.limbPos(bTip), br = api.limbPos(bRoot);
+    if (at && ar && bt && br) { A.push(at.z - ar.z); B.push(bt.z - br.z); }
+    await sleep(30);
+  }
+  const pp = v => v.length ? Math.max(...v) - Math.min(...v) : 0;
+  const outv = {n: A.length, pa: pp(A), pb: pp(B), r: 0};
+  if (A.length < 8) return outv;
+  const mean = v => v.reduce((s, x) => s + x, 0) / v.length;
+  const ma = mean(A), mb = mean(B);
+  let num = 0, da = 0, db = 0;
+  for (let i = 0; i < A.length; i++) {
+    num += (A[i] - ma) * (B[i] - mb);
+    da += (A[i] - ma) ** 2; db += (B[i] - mb) ** 2;
+  }
+  outv.r = (da < 1e-12 || db < 1e-12) ? 0 : num / Math.sqrt(da * db);
+  return outv;
+}
+})();
+</script>
