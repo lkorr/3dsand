@@ -5501,6 +5501,86 @@ schedule and writes two frames — `screenshot_inventory.bmp` (gear) and
 at, so the harness that judges it produces a picture; it prints the image's
 pixel sum, because "wrote the file" is true of an all-black rectangle too.
 
+## 9d. Biomes and water-body presets — the Environment tab (added 2026-09-01)
+
+> **A biome SELECTS from component libraries and says how often and where.
+> Species and water presets are edited once, in their library; a biome edits
+> the row.** Plan and research: `docs/PLAN_biomes.md`.
+
+### The shape of the thing
+
+Three kinds of file, one owner per fact:
+
+| File | Owns | Edited in |
+|---|---|---|
+| `assets/trees/<species>.json` (+ `.svtree`) | what a tree LOOKS like; what ground it physically tolerates (altitude band, slope, shade) | Environment → Trees |
+| `assets/water/<preset>.json` | the SHAPE of a body of water: footprint, bathymetry curve, fill, berm, bed, shore + aquatic vegetation by depth; its default tile/rarity | Environment → Water bodies |
+| `assets/biomes/<biome>.json` | WHICH species and presets appear in the biome, at what weight / rarity, under what extra conditions; ground cover; cave bands; terrain overrides; climate coordinates | Environment → *biome* |
+
+Every feature row of every stack carries the same **placement chain**: a rarity
+(a weight for trees, 1-in-N tiles for water, 1-in-N columns for cover — one
+form authored, the others shown read-only beside it: percent, per hectare, per
+km²) and **conditions** (`minY`, `maxY`, `maxSlope` in Q8, `nearWaterMin/Max`
+in metres, `patchThreshold`). This is Minecraft's placed-feature modifier list,
+the one model modders already read (PLAN_biomes.md §2 has the survey).
+
+### What is live and what is scaffold — stated where the user can see it
+
+* **LIVE: tree species and weights.** The `.svtree` header bakes per-biome
+  weights in `treegen.js BIOME_ORDER` order. Those words are now DERIVED from
+  the biome files: the biome page's Save rewrites nothing in the species file
+  by itself, **Sync atlas** writes `placement.biomes` into every species file
+  and re-bakes the changed atlases (`node scripts/seed_environment.mjs --sync`
+  headlessly). The species file keeps the mirror because the bake reads one
+  file per species; the biome file is where it is EDITED. The `biomes` gate and
+  `check_invariants.py` (`biome order`) assert the mirror is current and that
+  worldgen's `B_*` ids, `treeatlas.h kBiomeCount`, `treegen.js BIOME_ORDER`,
+  `biomegen.js ENGINE_BIOMES` and `biomes.cpp kEngineBiomes` agree.
+* **LIVE: the biome band strip** on the climate section — the three worldgen
+  thresholds (`meadowThreshold` / `pineThreshold` / `desertThreshold`) as one
+  draggable bar writing `tuning.json`.
+* **AUTHORED, VALIDATED, PREVIEWED, NOT YET READ BY WORLDGEN:** cover plants,
+  water features, cave features, terrain overrides, tree-row conditions,
+  climate coordinates. The `biomes` gate (`src/sim/biomes.*`,
+  `selftest_biomes.cpp`) loads every file and refuses an unknown species,
+  preset or material, a biome `index` that is not worldgen's id for its name,
+  a stale species mirror, a preset whose berm exceeds its shore lift. The
+  swatch on the biome page composes all of it. The pages say "authored, not
+  yet read" in their section notes, on purpose.
+
+### The generators are the preview AND the future truth
+
+`assets/editor/watergen.js` and `biomegen.js` are pure modules (no DOM, hash
+RNG keyed on the column, Node-runnable) in the treegen.js mould. A water body
+is a superellipse footprint (`squareness` is the Lamé exponent) with an fBm
+domain warp, optional smooth-min'd lobes and subtracted islands; a **depth
+profile curve** over the normalised radius (monotone cubic through authored
+points — parabola, bathtub, littoral shelf, cone and flat are the presets);
+a fill material and level; the engine's structural berm; bed materials by
+depth; a shore band with distance-ordered plants; and emergent / floating /
+submerged bands by water depth. Band WIDTHS are consequences of the
+bathymetry, not knobs — a steep kettle gets a one-cell reed fringe, a marsh is
+all fringe — which is what limnology says and what keeps the parameter count
+sane. `columnAt()` is the one answer to "what is at (x, z) of this body"; the
+standalone preview and the biome swatch both call it.
+
+The engine's pond today is still `pondAt`'s parabolic disc, inside the
+CPU-mirrored `height` block. PLAN_biomes.md §5 orders the wiring seams by
+risk: cover blocks and `treeInfoAt` chances first (outside every mirror), then
+`biomeAt` reading a table, then pond geometry last (it needs a C++ twin of the
+table under the mirror's token compare).
+
+### Verify
+
+`node scripts/test_environment.mjs` (data: determinism of both generators,
+preset sanity, biome validity, the species mirror, the swatch),
+`bash scripts/check_environment.sh` (the tab in real Chrome: mount, sidebar,
+three pages, WebGL meshing, framebuffer, plan/profile canvases, undo, deep
+links, save routes), `--selftest --gate biomes` (the engine's side),
+`python scripts/check_invariants.py` (biome order). `check_tabs.sh` and
+`check_trees.sh` still pass: the tree editor mounts into a `div#view-trees`
+inside the Environment section, without class `view`.
+
 ## 10. Networking (design now, build later)
 
 With the determinism discipline of §2/§4, **both** classic models are viable, and

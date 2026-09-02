@@ -282,7 +282,10 @@ hashes are identical, the parameter doesn't reach the kernel at those values.
 | `assets/sound_schema.js` | only list of sound slots; must match `Cues::kSlotPrefix` in `audio/cues.cpp` |
 | `assets/spells/glyphs.json` | glyph content, materials by name, hot-reloads with R |
 | `assets/trees/` | `<species>.json` = authored tree params (the truth), `<species>.svtree` = the baked voxel atlas the engine loads. Voxelized ONLY by `assets/editor/treegen.js`; re-bake with `node scripts/bake_trees.mjs`, which MOVES THE WORLD HASH |
-| `assets/editor/treegen.js` + `trees.js` | the tree generator (pure, Node-runnable) + the tuner's Trees tab |
+| `assets/editor/treegen.js` + `trees.js` | the tree generator (pure, Node-runnable) + the Trees PAGE of the Environment tab |
+| `assets/biomes/` | one `<name>.json` per biome: cover / tree / water / cave feature stacks with rarity + conditions. Tree WEIGHTS are edited here and mirrored into each species' `placement.biomes` by the biome page's Save + Sync atlas (or `node scripts/seed_environment.mjs --sync`). Validated by the `biomes` gate; read by worldgen only through the atlas mirror so far (docs/PLAN_biomes.md §5) |
+| `assets/water/` | one `<name>.json` per body-of-water preset (tarn, kettle, marsh, oasis, playa, …): footprint, bathymetry curve, fill, berm, bed, shore + aquatic vegetation. Authored in metres; not yet read by worldgen |
+| `assets/editor/environment.js` + `biome.js`, `water.js`, `envui.js` | the Environment tab: sidebar of biomes + component pages; `biomegen.js` and `watergen.js` are the pure generators (Node-runnable). `scripts/test_environment.mjs` is the data gate, `scripts/check_environment.sh` the browser one |
 | `assets/prefabs/`, `assets/mobs/` | `.vox` art + mob `.json` sidecars |
 | `assets/anims/` | the shared clip library: one keyframed clip per `.json`, written by the clip lane's "→ library", compiled onto every rig it fits by `LoadMobDefs`, named by `attack_styles.json`'s `clip` |
 
