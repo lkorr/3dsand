@@ -171,6 +171,14 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         // share common.wgsl, and the far-cascade pipelines (farPL_, on the slim
         // group) call genCell and therefore call the tree sampler.
         entry(26, T::ReadOnlyStorage), // treeAtlas
+        // The openness grid (world.h kOpenFaces, docs/PLAN_gi.md §2). Written
+        // by sim_openness.wgsl and by nothing else; here rather than in a
+        // group of its own because sim_openness already needs occupancy (7),
+        // dirtyList (12), pageTable (17) and TickParams (4), i.e. most of this
+        // layout — a private group would have to re-bind five buffers to save
+        // two descriptors on pipelines that never name them.
+        entry(27, T::Storage),         // openness (per block-face bytes)
+        entry(28, T::Storage),         // opennessGen (per-slot world stamp)
     };
     simBGL_ = device.CreateBindGroupLayout(entries, std::size(entries));
 
@@ -314,6 +322,16 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         // the layout is one layout; written only when the prelude const is
         // true, and never by the shipping shader.
         entry(16, T::Storage, S::Fragment),  // renderStats
+        // The openness grid (world.h kOpenFaces, docs/PLAN_gi.md §2).
+        // READ-ONLY here and read_write only in the sim group: the arrow is
+        // sim-side-pass -> render, exactly like occupancy at binding 1.
+        //
+        // In THIS layout rather than in raymarch's alone because microBodyBGL_
+        // and the debris/sprite pipelines share renderBGL_ as group 0, and
+        // ambientAtP has to reach the same bytes or a mob glows in a cave
+        // (PLAN_gi.md §1, last bullet).
+        entry(17, T::ReadOnlyStorage, S::Fragment),   // openness
+        entry(18, T::ReadOnlyStorage, S::Fragment),   // opennessGen
     };
     renderBGL_ = device.CreateBindGroupLayout(entries, std::size(entries));
 
@@ -427,6 +445,8 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         b(24, world_->waterBodyState),
         b(25, world_->fluidSpawnOps),
         b(26, treeAtlasBuf_),
+        b(27, world_->openness),
+        b(28, world_->opennessGen),
     };
     simBG_[page] = device.CreateBindGroup(simBGL_, entries, std::size(entries), "simBG");
 
@@ -489,6 +509,8 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         b(14, world_->shadowCache),
         b(15, world_->shadowReq),
         b(16, world_->renderStats),
+        b(17, world_->openness),
+        b(18, world_->opennessGen),
     };
     renderBG_ = device.CreateBindGroup(renderBGL_, entries, std::size(entries), "renderBG");
   }
@@ -747,6 +769,11 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   rhi::ShaderModule mStep = mod("sim_step.wgsl");
   rhi::ShaderModule mOcc = mod("sim_occupancy.wgsl");
   rhi::ShaderModule mPick = mod("sim_pick.wgsl");
+  // The openness grid's writer (docs/PLAN_gi.md §2). A RENDER-path module among
+  // the sim ones for shadow_resolve.wgsl's reason: BuildPipelines is the single
+  // place F5 recompiles, and the pass and the raymarch's reader must be
+  // rebuilt together or one of them is a tick behind the other's layout.
+  rhi::ShaderModule mOpenness = mod("sim_openness.wgsl");
   // The shadow cache's resolve. A RENDER-path module living among the sim ones
   // because BuildPipelines is the single place F5 recompiles, and the cache's
   // enable flag has to be recomputed in lockstep with raymarch.wgsl's const.
@@ -763,6 +790,7 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   rhi::ShaderModule mDebugWind = mod("debug_wind.wgsl");
   rhi::ShaderModule mDebugCur = mod("debug_current.wgsl");
   if (!mWorldgen || !mMutate || !mCompact || !mStep || !mOcc || !mPick ||
+      !mOpenness ||
       !mExplode || !mParticle || !mFluid || !mFluidSeam || !mWaterBody ||
       !mRay || !mDebris ||
       !mMicroBody || !mDebugLines || !mDebugWind || !mDebugCur) {
@@ -801,6 +829,10 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   step_ = MakeComputePipeline(device, simPL_, mStep, "main", "step");
   occupancy_ = MakeComputePipeline(device, simPL_, mOcc, "main", "occupancy");
   occupancyDirty_ = MakeComputePipeline(device, simPL_, mOcc, "mainDirty", "occupancyDirty");
+  opennessDirty_ =
+      MakeComputePipeline(device, simPL_, mOpenness, "dirty", "opennessDirty");
+  opennessRefresh_ =
+      MakeComputePipeline(device, simPL_, mOpenness, "refresh", "opennessRefresh");
   pick_ = MakeComputePipeline(device, simPL_, mPick, "main", "pick");
 
   explodeMark_ = MakeComputePipeline(device, simPL2_, mExplode, "mark", "explodeMark");
@@ -942,6 +974,11 @@ struct RecordCtx {
   // for "none" — which is every tick of a basin nobody has dug into, and is
   // what leaves both sweep rows unrecorded (C_WATERSWEEP).
   uint32_t waterSweepSlot = kWaterBodyCap;
+  // Chunks the openness refresh walks this tick (docs/PLAN_gi.md §2). Derived
+  // from render.opennessChunksPerFrame and gated on render.opennessStrength, so
+  // a zero here is C_OPENNESS false and NOTHING recorded -- which is what makes
+  // the `noopenness` --render-budget arm measure the pass as well as the reads.
+  uint32_t opennessChunks = 0;
   bool hashEnable = false;
   bool particlesActive = false;
   // False under --residency paged: worldgen's whole-world dispatch is replaced
@@ -1029,6 +1066,8 @@ const rhi::Buffer& Simulation::PassBuffer(pass::Buf b) const {
     case B::ShadowReq:           return world_->shadowReq;
     case B::ShadowArgsStage:     return world_->shadowArgsStage;
     case B::ShadowArgs:          return world_->shadowArgs;
+    case B::Openness:            return world_->openness;
+    case B::OpennessGen:         return world_->opennessGen;
     case B::WaterBodyState:      return world_->waterBodyState;
     case B::TreeAtlas:           return treeAtlasBuf_;
     default:                return world_->voxels;
@@ -1059,6 +1098,8 @@ const rhi::ComputePipeline& Simulation::PassPipeline(pass::Pipe p) const {
     case P::PResolve:       return pResolve_;
     case P::FarFill:        return farFill_;
     case P::FarDown:        return farDown_;
+    case P::OpennessDirty:   return opennessDirty_;
+    case P::OpennessRefresh: return opennessRefresh_;
     case P::ShadowPrepare:  return shadowPrepare_;
     case P::ShadowResolve:  return shadowResolve_;
     case P::FluidSpawn:     return fluidSpawn_;
@@ -1131,6 +1172,7 @@ void Simulation::RecordTable(const rhi::CommandEncoder& enc, pass::Table which,
   tc.waterChunkCount = cx.waterChunkCount;
   tc.waterDrainBodies = cx.waterDrainBodies;
   tc.waterSweepSlot = cx.waterSweepSlot;
+  tc.opennessChunks = cx.opennessChunks;
   tc.hashEnable = cx.hashEnable;
   tc.particlesActive = cx.particlesActive;
   tc.denseWorldgen = cx.denseWorldgen;
@@ -1420,6 +1462,19 @@ void Simulation::EncodeTick(const rhi::CommandEncoder& enc, uint32_t opsCount,
   cx.hashEnable = hashEnable;
   cx.particlesActive = particlesActive;
   cx.vizActive = vizActive;
+  // The openness grid's rolling refresh budget (docs/PLAN_gi.md §2). Read from
+  // tuning HERE rather than passed in, because it is a KNOB and not a count of
+  // this tick's work — every caller of EncodeTick would otherwise have to
+  // forward a value none of them owns. Zero when the feature is off, which is
+  // what leaves both rows unrecorded (C_OPENNESS).
+  {
+    const Tuning& tn = CurrentTuning();
+    cx.opennessChunks =
+        tn.render.opennessStrength > 0.0f
+            ? (uint32_t)std::min<int>(std::max(tn.render.opennessChunksPerFrame, 0),
+                                      (int)kNumChunks)
+            : 0u;
+  }
 
   // §3.4. The counts are re-tested here as a BACKSTOP, not as the primary
   // signal: NoteTickInputs is the declaration and a caller that forgets it

@@ -1537,6 +1537,16 @@ const RenderArm kRenderArms[] = {
     {"cachesub2", "shadow patch subdiv 4 -> 2",
      [](Tuning& t) { t.render.shadowCacheSubdiv = 2; }, true, 1,
      "the same, at the midpoint"},
+    // ---- the openness (sky-visibility) grid (docs/PLAN_gi.md §2) ----
+    // THE A/B FOR THE WHOLE FEATURE, and it is an exact off switch on both
+    // halves: render.opennessStrength = 0 const-folds opennessScale() to 1.0 in
+    // the fragment shader AND makes C_OPENNESS false, so neither the dirty walk
+    // nor the rolling refresh is recorded. baseline - noopenness is therefore
+    // the pass plus the reads, in one number, on one world.
+    {"noopenness", "openness grid off (pass unrecorded + reads const-folded)",
+     [](Tuning& t) { t.render.opennessStrength = 0.0f; }, true, 1,
+     "the whole openness grid: the compute pass that builds it AND the "
+     "per-hit bilinear read in the raymarch"},
     {"shadow32", "shadowSteps 384 -> 32",
      [](Tuning& t) { t.render.shadowSteps = 32; }, true, 1,
      "shadow march past 32 steps"},

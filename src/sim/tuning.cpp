@@ -2052,6 +2052,10 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadF(*g, "lodHandoffDist", r.lodHandoffDist, out, at);
     ReadF(*g, "shadowMaxDist", r.shadowMaxDist, out, at);
     ReadF(*g, "shadowCoarseDist", r.shadowCoarseDist, out, at);
+    ReadF(*g, "opennessReach", r.opennessReach, out, at);
+    ReadI(*g, "opennessChunksPerFrame", r.opennessChunksPerFrame, out, at);
+    ReadF(*g, "opennessStrength", r.opennessStrength, out, at);
+    ReadI(*g, "opennessBilinear", r.opennessBilinear, out, at);
     // Zero step budgets compile fine and render nothing; a zero white point or
     // gamma divides by zero in the tonemap. Guard the ones that break the
     // image rather than merely change it.
@@ -2172,6 +2176,13 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     // its first cell, which is what god rays ask for explicitly and no shadow
     // ray should get by accident.
     if (r.shadowCoarseDist < 0.0f) { r.shadowCoarseDist = 0.0f; }
+    // A negative reach would make every ray report "blocked at t < 0" and
+    // paint the world black; a negative strength would brighten the ambient
+    // past the sky value. Clamp rather than warn -- neither is expressible as
+    // an intent, and both are one keystroke away in the tuner.
+    if (r.opennessReach < 0.0f) { r.opennessReach = 0.0f; }
+    r.opennessStrength = std::clamp(r.opennessStrength, 0.0f, 1.0f);
+    if (r.opennessChunksPerFrame < 0) { r.opennessChunksPerFrame = 0; }
   }
 
   if (const json* g = Find(j, "worldgen")) {

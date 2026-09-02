@@ -505,6 +505,70 @@ constexpr uint32_t kSubOccStride = kSubOccWords * 2;      // total words, then b
 static_assert(kSubOccDim * kSubOccDim * kSubOccDim <= kSubOccWords * 32,
               "sub-chunk block grid does not fit in kSubOccWords");
 
+// ---- the OPENNESS (sky-visibility) grid (docs/PLAN_gi.md §2, W3 P0) --------
+// RENDER-ONLY DERIVED DATA, exactly like the shadow cache and the far-field
+// cascades: never hashed, never saved, the sim has no binding for it, and a
+// determinism hash that moves when this changes is a bug in this code rather
+// than a rebaseline.
+//
+// WHAT IT HOLDS. One byte per (chunk SLOT, 4^3 sub-occupancy block, face):
+// 0..255 = the unblocked fraction of that face's hemisphere within
+// `render.opennessReach` metres, measured by marching the BLOCKERS-class 4^3
+// mask (the same mask traceOpaque's coarse mode reads). `ambientAt` scales the
+// hemisphere ambient by it, so a cave floor stops being lit as brightly as a
+// meadow. Nothing finer would fit: a per-VOXEL byte is 134 MB in-window before
+// faces, and the voxel word has no spare bits (the kExciteScratchBits note).
+//
+// SIX VALUES PER BLOCK, NOT ONE. This world is full of one-voxel walls, floors
+// and trunks; a scalar per block would average the lit side of a wall with the
+// dark side. A receiver reads only the face that faces it, which is the same
+// (axis, sgn) pair the shadow cache already keys on.
+//
+// WHY A SEPARATE BUFFER, unlike the sub-occupancy mask which rides in the tail
+// of `occupancy`: the mask is written by every producer of the occupancy
+// counts and read by everything that reads them, so one buffer is one hazard.
+// This grid is written by ONE pass and read by the render path only; folding it
+// into `occupancy` would put a 12 MiB render-only payload behind every sim
+// barrier that touches occupancy, and make `--gate openness`'s readback a
+// readback of the world's occupancy.
+//
+// LAYOUT is byte index ((slot * blocks + block) * 6 + face), viewed through an
+// array<u32>. 6 bytes per block does not divide a word, which is deliberate:
+// the WRITER owns one WHOLE WORD per thread (4 consecutive (block, face) pairs,
+// which may straddle a block boundary) and stores it with a plain store. The
+// alternative — a thread per (block, face) — would be a read-modify-write of a
+// word three other threads are also writing, i.e. a race, and the only cures
+// are atomics or 25% padding. A packing that costs a `% 6` in the writer and
+// two shifts in the reader is cheaper than either.
+constexpr uint32_t kOpenFaces = 6;
+constexpr uint32_t kOpenBlocksPerChunk = kSubOccDim * kSubOccDim * kSubOccDim;
+constexpr uint32_t kOpenBytesPerChunk = kOpenBlocksPerChunk * kOpenFaces;
+static_assert(kOpenBytesPerChunk % 4 == 0,
+              "openness bytes per chunk must be a whole number of words");
+constexpr uint32_t kOpenWordsPerChunk = kOpenBytesPerChunk / 4;
+constexpr uint64_t kOpennessBytes =
+    (uint64_t)kNumChunks * kOpenWordsPerChunk * 4;          // 12 MiB at 512^3
+constexpr uint64_t kOpennessGenBytes = (uint64_t)kNumChunks * 4;   // 128 KiB
+
+// The residency window is toroidal, so a slot is reused by a new chunk as the
+// window walks. Its 384 openness bytes then describe geometry that is no longer
+// there, and the reader has no way to tell — the grid is not dirty-tracked the
+// way the voxels are. So every write stamps the slot with a hash of the WORLD
+// CHUNK COORD it was computed for, and every read compares. A mismatch reads as
+// "unknown" and falls back to the plain n.y hemisphere lerp, which is exactly
+// the pre-P0 look — the safe direction, and the same policy the shadow cache's
+// verifier uses one level down.
+//
+// MUST MATCH `opennessStamp` in common.wgsl. `--gate openness` is the check:
+// it computes the stamp here and asserts the GPU wrote the same word.
+// 0 is reserved for "never written" (the buffer is zeroed at creation), so a
+// hash that lands on 0 is bumped to 1.
+inline uint32_t OpennessStamp(int cx, int cy, int cz) {
+  const uint32_t h = (uint32_t)cx * 73856093u ^ (uint32_t)cy * 19349663u ^
+                     (uint32_t)cz * 83492791u;
+  return h == 0u ? 1u : h;
+}
+
 // ---- the voxel-keyed shadow cache -----------------------------------------
 // RENDER-ONLY, DERIVED, DISPOSABLE. Not hashed, not saved, not replicated, and
 // the sim never reads it — the same standing as the far-field cascades. A
@@ -2440,6 +2504,13 @@ class World {
   // costs one frame of stale shadows, which is the same thing a teleport costs.
   rhi::Buffer shadowCache;    // kShadowCacheBuckets * 2 u32 (8 MiB)
   rhi::Buffer shadowReq;      // header + kShadowReqCap * 4 u32 request records
+  // ---- openness grid (the kOpenFaces block above) ----
+  // Same standing as the shadow cache: render-only, derived, disposable, never
+  // hashed or saved. CopySrc so `--gate openness` can read a block-face back;
+  // CopyDst so both can be zeroed at creation (an unzeroed generation word
+  // would read as a valid stamp for whatever garbage the driver left).
+  rhi::Buffer openness;       // kNumChunks * kOpenWordsPerChunk u32 (12 MiB)
+  rhi::Buffer opennessGen;    // kNumChunks u32 — the world-chunk stamp per slot
   // The second buffer a fragment shader writes, and the same argument applies:
   // measurement-only counters (kRenderStat* above), read back by the telemetry
   // path through rhi::CommandEncoder::CopyRenderWritten. 4 KiB.

@@ -119,6 +119,11 @@ std::string ShaderConstantPrelude() {
   o << "const SUBOCC_WORDS : u32 = " << kSubOccWords << "u;\n";
   o << "const SUBOCC_STRIDE : u32 = " << kSubOccStride << "u;\n";
   o << "const SUBOCC_BASE : u32 = " << kNumChunks << "u;\n";
+  // Openness grid (world.h kOpenFaces block). Its own buffer, so what the
+  // shaders need is the per-chunk WORD stride and the face count; the block
+  // count is SUBOCC_DIM^3, already above.
+  o << "const OPEN_FACES : u32 = " << kOpenFaces << "u;\n";
+  o << "const OPEN_WORDS_PER_CHUNK : u32 = " << kOpenWordsPerChunk << "u;\n";
   // log2(kWorldN): the shadow request record packs a window-relative cell as
   // three fields of this width plus a 3-bit face, so it is the constant that
   // decides whether that record still fits in a u32 (world.h static_asserts it).

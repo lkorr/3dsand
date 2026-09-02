@@ -204,6 +204,18 @@ inline constexpr PerfNodeDef kPerfNodes[] = {
      "lit pixel inside the raymarch. Its cost belongs next to raymarch, not "
      "inside it: this row going up while raymarch goes down by more is the "
      "trade working (world.h kShadowCacheBuckets)."},
+    // Billed to `renderPass` and not to `simTick`, even though its two rows are
+    // recorded on the TICK command buffer. The bill follows what the cost is
+    // FOR: nothing in the sim reads this grid, and turning off
+    // render.opennessStrength is what makes the number go away. Put under
+    // simTick it would read as the simulation getting slower when a lighting
+    // knob moved.
+    {"openness", "Openness Grid", "renderPass", PerfSide::Gpu, PerfScope::Count,
+     "opennessDirty;opennessRefresh",
+     "Per (4^3 block, face) sky visibility, marched over the blockers mask. The "
+     "dirty half is per EDIT, the refresh half is a flat "
+     "render.opennessChunksPerFrame slots per tick. Zero when "
+     "render.opennessStrength is 0 -- neither row is recorded at all."},
     // THE RENDER PASS IS SEVEN SPANS NOW, NOT ONE. It used to be a single
     // timestamp pair around BeginRenderPass..End billed here, which said "the
     // GPU frame is the render pass" and nothing else — a bare count in exactly

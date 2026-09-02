@@ -1,0 +1,245 @@
+// sim_openness.wgsl — the openness (sky-visibility) grid, phase 0 of indirect
+// light (docs/PLAN_gi.md §2; src/sim/world.h, the kOpenFaces block).
+//
+// WHAT PROBLEM THIS SOLVES. Shading is `albedo * face * (ambientAt(n) * ao +
+// sun)` and `ambientAt` is a hemisphere lerp on n.y — a pure function of the
+// NORMAL, with no spatial term anywhere in it. So a cave floor is lit exactly
+// as brightly as a meadow, a room is as bright as the field outside its door,
+// and grass under a canopy is as bright as grass beside it. `voxelAO` is three
+// taps in the plane of the face and cannot see a ceiling 3 m up. This pass is
+// the missing term: for every 4^3 block face that has matter behind it, how
+// much of that face's hemisphere is unblocked within render.opennessReach.
+//
+// WHAT IT WRITES. One BYTE per (chunk slot, 4^3 block, face), byte index
+// ((slot * SUBOCC_DIM^3 + block) * OPEN_FACES + face), plus one stamp word per
+// slot in `opennessGen`. Render-only derived data: the sim has no binding for
+// either buffer, neither is hashed or saved, and `--gate determinism` is the
+// cheapest proof that stayed true.
+//
+// THE MARCH IS traceOpaque, NOT A NEW DDA, and that is the load-bearing choice
+// here. common.wgsl already carries one media-blind opaque DDA that every
+// secondary ray in the engine shares (W2-A), and it already has a COARSE mode
+// that steps 4^3 blocks over the blockers-class sub-occupancy mask instead of
+// voxels — which is exactly, to the bit, the traversal this pass wants. Passing
+// `coarseFromT = 0` makes it coarse from the first step. Writing a second
+// block-stepping DDA here would be the classic two-implementations-of-one-
+// question bug that file's header exists to warn about, and it would have to be
+// kept in agreement with the shadow ray forever for no gain.
+//
+// WHY ONE WHOLE WORD PER THREAD. 6 bytes per block does not divide a u32, so a
+// thread that owned one (block, face) would have to read-modify-write a word
+// three other threads are also writing. The cures are atomics (a workgroup's
+// worth of contention for a pure store) or 25% padding (16.7 MiB instead of
+// 12). Instead a thread owns one WORD — four consecutive (block, face) pairs,
+// which may straddle a block boundary — computes all four values and does one
+// plain store. `% OPEN_FACES` in the writer buys a race-free grid.
+//
+// THE WORKGROUP IS OPEN_WORDS_PER_CHUNK THREADS (96 at kSubOccShift = 2, three
+// full warps), so the mapping is thread -> word with no loop and no imbalance.
+// It follows kSubOccShift automatically; at shift 3 it would be 12 threads,
+// which is small but correct.
+
+// `> voxels` with EXACTLY ONE SPACE, and that is not cosmetic: LoadShader
+// (gpu/resources.cpp BodyAddressesVoxels) decides whether to keep or strip
+// common.wgsl's page-table block by searching this body for that literal, and
+// traceOpaque lives inside that block. Aligned columns here cost the whole
+// march with an `unresolved call target` a hundred lines later.
+@group(0) @binding(0) var<storage, read> voxels : array<u32>;
+@group(0) @binding(3) var<storage, read> materials : array<Material>;
+@group(0) @binding(4) var<uniform> T : TickParams;
+@group(0) @binding(7) var<storage, read> occupancy : array<u32>;
+@group(0) @binding(12) var<storage, read> dirtyList : array<u32>;
+@group(0) @binding(17) var<storage, read> pageTable : array<u32>;
+@group(0) @binding(27) var<storage, read_write> openness    : array<u32>;
+@group(0) @binding(28) var<storage, read_write> opennessGen : array<u32>;
+
+// ------------------------------------------------------------------ rays ----
+// FIVE directions in the face's hemisphere: the normal, and four at 45 degrees
+// toward the hemisphere's tangents. The normal is weighted DOUBLE (total weight
+// 6), because a face whose straight-out view is blocked is in shade no matter
+// how open its grazing directions are, and the opposite is not true.
+//
+// Five is a deliberate floor, not a placeholder. The values are quantised to a
+// byte, read through a bilinear filter over 40 cm blocks, and multiplied into an
+// ambient term — the eye reads the LOW-frequency field, and more rays per face
+// would refine a signal the filter is about to smooth anyway. If this ever needs
+// to be finer, spend it on more FACES or smaller BLOCKS, not more rays.
+const OPEN_RAYS : u32 = 5u;
+const OPEN_WEIGHT_TOTAL : f32 = 6.0;
+
+// The face encoding, shared with the shadow cache: face = axis * 2 + (sgn > 0).
+// Stated once here because the writer and the two readers (raymarch's
+// `ambientAt` arm and common.wgsl's `opennessScaleAt`) must agree about it, and
+// `shadowFaceNormal` in common.wgsl is the same function.
+fn openFaceNormal(face : u32) -> vec3f {
+  let axis = face >> 1u;
+  let s = select(-1.0, 1.0, (face & 1u) != 0u);
+  return vec3f(select(0.0, s, axis == 0u), select(0.0, s, axis == 1u),
+               select(0.0, s, axis == 2u));
+}
+
+// "Does the 4^3 block containing this world cell hold any ray blocker?" One
+// word read against the blockers class — the same bit traceOpaque's coarse mode
+// tests, so this pre-test and the march can never disagree about a block.
+fn openBlockBlocked(c : vec3<i32>) -> bool {
+  let idx = chunkIndexW(c);
+  let lo = vec3<u32>(c & vec3<i32>(i32(CHUNK) - 1));
+  let sbit = subOccBitLocal(lo);
+  return (occupancy[subOccIndex(idx, 1u, sbit >> 5u)] & (1u << (sbit & 31u))) != 0u;
+}
+
+// The slot's world CHUNK coord, and a cell inside it, from an origin the caller
+// read ONCE. common.wgsl has worldCellOfSlotLocal for this, but it reaches the
+// window origin through the per-shader GENERATED accessor ptOrigin() — which
+// check_pass_table.py's rooted walk cannot see, so a row that (correctly)
+// declares U(TickUBO) for it gets reported as a spurious barrier. Reading
+// T.origin here makes the dependency visible to the checker AND hoists a
+// uniform read out of 384 call sites per workgroup, so the honest version is
+// also the faster one.
+fn openWorldChunk(slot : u32, origin : vec3<i32>) -> vec3<i32> {
+  let sc = vec3<i32>(i32(slot % NCHUNK), i32((slot / NCHUNK) % NCHUNK),
+                     i32(slot / (NCHUNK * NCHUNK)));
+  return slotToWorldChunk(sc, origin);
+}
+
+// The openness of one (block, face), as a 0..255 byte.
+//
+// `blockMin` is the block's minimum world cell. The block is known to hold at
+// least one blocker (the caller tested the bit), which is what makes this a
+// SURFACE face worth measuring rather than a face of empty air.
+fn openValueAt(blockMin : vec3<i32>, face : u32) -> u32 {
+  let n = openFaceNormal(face);
+  let half = f32(SUBOCC_BLOCK) * 0.5;
+  let centre = vec3f(blockMin) + vec3f(half);
+  // Half a voxel past the block's face plane, i.e. inside the NEIGHBOUR block.
+  // Not on the plane itself: a ray starting exactly on a block boundary floors
+  // into whichever side float noise picks, which is the same leak traceOpaque's
+  // "force the crossing on the exit axis" rule exists to prevent one level up.
+  let ro = centre + n * (half + 0.5);
+
+  // THE EARLY OUT, and its VALUE is the single most important decision in this
+  // file. If the neighbour block holds any blocker, all five rays would
+  // terminate in their first coarse step, so the march is skipped — that part
+  // is pure cost saving, and it is why a chunk costs a few dozen marches
+  // instead of 384.
+  //
+  // BUT IT RETURNS "NO OPINION" (255), NOT "FULLY ENCLOSED" (0), and the first
+  // version of this pass returned 0. At 40 cm blocks against 10 cm voxels the
+  // mask CANNOT distinguish "this face is buried inside rock" from "there is a
+  // one-voxel terrace step in front of it" — both set the neighbour block's
+  // bit. Terrain here is a staircase of one-voxel steps, so returning 0 painted
+  // every riser on every hillside hard black: measured on the tall-grass
+  // terrace shot, mean luminance -12.5/255 with 43% of pixels moved, and by eye
+  // it was exactly the "harsh horizontal banding" that wrapDiffuse
+  // (raymarch.wgsl) exists to remove. Openness put it back in one line.
+  //
+  // 255 says "this face has no measurement" and the reader's opennessScale
+  // leaves it at the pre-P0 lerp. The conservative direction is the one that
+  // never darkens something wrongly, because a wrong darkening is a black band
+  // across a hillside and a missed darkening is the look we already shipped.
+  // Nothing real is lost: the faces P0 exists to darken — a cave floor, a room
+  // floor, the ground under an overhang — all have AIR in the block in front of
+  // them, so they march.
+  if (openBlockBlocked(vec3<i32>(floor(ro)))) { return 255u; }
+
+  // Tangents of the face, as unit axes. A 45-degree ray is normalize(n +- t).
+  let axis = face >> 1u;
+  let t0 = vec3f(select(0.0, 1.0, axis == 1u), select(0.0, 1.0, axis == 2u),
+                 select(0.0, 1.0, axis == 0u));
+  let t1 = vec3f(select(0.0, 1.0, axis == 2u), select(0.0, 1.0, axis == 0u),
+                 select(0.0, 1.0, axis == 1u));
+
+  let reachVox = TUNE_OPENNESS_REACH / VOXEL_METERS;
+  // One coarse step covers SUBOCC_BLOCK voxels on an axis and up to
+  // sqrt(3) * SUBOCC_BLOCK on a diagonal, so a step budget alone is a sloppy
+  // distance bound in both directions. The budget stops a ray that would
+  // otherwise cross the whole window; the `t` test below is what makes the
+  // reach EXACT, and it is the one the knob's units promise.
+  let maxSteps = i32(reachVox / f32(SUBOCC_BLOCK)) + 4;
+
+  var openW = 0.0;
+  for (var r = 0u; r < OPEN_RAYS; r++) {
+    var d = n;
+    if (r == 1u) { d = normalize(n + t0); }
+    else if (r == 2u) { d = normalize(n - t0); }
+    else if (r == 3u) { d = normalize(n + t1); }
+    else if (r == 4u) { d = normalize(n - t1); }
+    // coarseFromT = 0: block steps from the very first iteration. The voxel
+    // read inside traceOpaque is unreachable on this path, which is why this
+    // pass costs 4 words per chunk of traffic instead of 16 KiB.
+    let s = traceOpaque(ro, d, maxSteps, 0.0, &occupancy, &materials);
+    let blocked = s.hit && (s.t * VOXEL_METERS) <= TUNE_OPENNESS_REACH;
+    let w = select(1.0, 2.0, r == 0u);
+    if (!blocked) { openW += w; }
+  }
+  return u32(clamp(openW / OPEN_WEIGHT_TOTAL, 0.0, 1.0) * 255.0 + 0.5);
+}
+
+// One chunk slot. `li` is both the thread index and the WORD index within the
+// chunk's OPEN_WORDS_PER_CHUNK-word run.
+fn openChunk(slot : u32, li : u32, origin : vec3<i32>) {
+  let wc = openWorldChunk(slot, origin);
+  let chunkMin = wc * i32(CHUNK);
+  // The stamp first, from thread 0. Written unconditionally, including for a
+  // chunk with no matter in it at all: "computed, and the answer is open" is a
+  // different statement from "never computed", and only the stamp carries it.
+  if (li == 0u) { opennessGen[slot] = opennessStamp(wc); }
+
+  var packed = 0u;
+  for (var k = 0u; k < 4u; k++) {
+    let byteIdx = li * 4u + k;
+    let block = byteIdx / OPEN_FACES;
+    let face = byteIdx % OPEN_FACES;
+
+    // No blocker anywhere in this block: there is no surface here, so no reader
+    // will ever look at this byte (a reader indexes the block of a cell it just
+    // HIT, which by construction has one). 255 rather than 0 so that if one
+    // ever does — a bilinear tap rolling off the edge of a wall — it reads as
+    // open air, which is what a block with nothing in it is.
+    let bx = block % SUBOCC_DIM;
+    let by = (block / SUBOCC_DIM) % SUBOCC_DIM;
+    let bz = block / (SUBOCC_DIM * SUBOCC_DIM);
+    let sw = occupancy[subOccIndex(slot, 1u, block >> 5u)];
+    var v = 255u;
+    if ((sw & (1u << (block & 31u))) != 0u) {
+      let blockMin = chunkMin + vec3<i32>(i32(bx), i32(by), i32(bz)) *
+                                    i32(SUBOCC_BLOCK);
+      v = openValueAt(blockMin, face);
+    }
+    packed |= v << (k * 8u);
+  }
+  openness[slot * OPEN_WORDS_PER_CHUNK + li] = packed;
+}
+
+// ---------------------------------------------------------------- passes ----
+
+// dirty: the chunks written this tick, indirect over the compacted dirty list —
+// the same list and the same args `occupancyDirty` rides, recorded immediately
+// after it so the blockers mask this pass marches is the one that tick just
+// rewrote. This is the half that makes an edit visible: dig a hole in a roof
+// and the floor under it brightens on the next tick, with no invalidation
+// machinery anywhere.
+@compute @workgroup_size(OPEN_WORDS_PER_CHUNK)
+fn dirty(@builtin(workgroup_id) wg : vec3<u32>,
+         @builtin(local_invocation_index) li : u32) {
+  openChunk(dirtyList[wg.x], li, T.origin);
+}
+
+// refresh: a flat TUNE_OPENNESS_CHUNKS slots per tick, round robin. The cursor
+// is derived from T.tick rather than stored in a params word, which costs
+// nothing and cannot go stale: tick * budget advances by exactly one budget per
+// tick by construction, and a tick the pass was not recorded on simply skips
+// its slice — the next pass over that slot is at most kNumChunks / budget ticks
+// away either way.
+//
+// The dirty walk above covers every EDIT, so this exists for the two cases it
+// cannot see: the cold start (a slot whose stamp is still 0) and a chunk that
+// streamed into a slot some other chunk's bytes are still sitting in. Neither
+// is urgent — a stale-stamped slot reads as "unknown" and shades from the old
+// hemisphere lerp until this reaches it.
+@compute @workgroup_size(OPEN_WORDS_PER_CHUNK)
+fn refresh(@builtin(workgroup_id) wg : vec3<u32>,
+           @builtin(local_invocation_index) li : u32) {
+  let cursor = (T.tick * u32(max(TUNE_OPENNESS_CHUNKS, 1))) % NUM_CHUNKS;
+  openChunk((cursor + wg.x) % NUM_CHUNKS, li, T.origin);
+}

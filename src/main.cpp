@@ -1175,6 +1175,72 @@ int RunShots(GpuContext& ctx, World& world, Simulation& sim) {
            -0.32f, "screenshot_lava_spatter.bmp");
   }
 
+
+  // ---- openness: a roofed interior lit only through its doorway ----------
+  // docs/PLAN_gi.md §2. The P0 grid's whole claim is that enclosure darkens
+  // and open sky does not, and no camera in this harness could see either:
+  // every existing frame is outdoors under an unobstructed hemisphere, which
+  // is exactly the case the grid leaves BIT-IDENTICAL. So the subject is built
+  // here, the same way the lava-spatter and blood scenes above are built.
+  //
+  // A SHELTER, NOT A CAVE. There is a cave band under this window (worldgen
+  // caveBands), but its floor is tens of metres down and its location is a
+  // noise threshold — a camera aimed at it would be a coordinate that goes
+  // stale the first time a cave knob moves, which is the trap the water shots
+  // above document at length. A stamped room has a doorway in a known wall, a
+  // roof at a known height and open ground right outside it, so one frame
+  // holds the dark interior, the lit doorway wedge and the untouched meadow
+  // and the three can be compared against each other rather than against
+  // memory.
+  {
+    const int gx = 240, gz = 160;
+    const int gh = World::TerrainHeight(gx, gz, kDefaultSeed);
+    const int kR = 14;     // interior half-extent, voxels
+    const int kH = 22;     // interior height to the underside of the roof
+    std::vector<CellOp> room;
+    auto put = [&](int x, int y, int z) {
+      IVec3 c{x, y, z};
+      if (!world.CellInWindow(c)) return;
+      room.push_back({World::SlotCellIndex(c), PackVoxNew(kMatStone, 0u)});
+    };
+    for (int x = -kR; x <= kR; x++)
+      for (int z = -kR; z <= kR; z++) {
+        // roof, two voxels thick so a ray cannot slip between layers
+        put(gx + x, gh + kH, gz + z);
+        put(gx + x, gh + kH + 1, gz + z);
+      }
+    for (int y = 1; y < kH; y++)
+      for (int t = -kR; t <= kR; t++) {
+        // Four walls, with a doorway punched in the -Z wall: the wedge of light
+        // it throws on the floor is the thing to look at, because a grid that
+        // only knows "indoors" would light the whole floor equally.
+        const bool door = (t >= -3 && t <= 3 && y <= 12);
+        if (!door) put(gx + t, gh + y, gz - kR);
+        put(gx + t, gh + y, gz + kR);
+        put(gx - kR, gh + y, gz + t);
+        put(gx + kR, gh + y, gz + t);
+      }
+    for (uint32_t t = 131; t <= 140; t++)
+      SubmitTick(ctx, world, sim, t, kDefaultSeed, {}, {},
+                 t == 131 ? room : std::vector<CellOp>{}, false, {8, 3, 8},
+                 false, false);
+    ctx.WaitIdle();
+    // From outside, past the doorway: the lit meadow, the shaded outer wall and
+    // the dark interior in one frame. This is the frame that would show open
+    // ground WRONGLY darkening next to a wall, if it did.
+    render({(float)(gx - 4), (float)(gh + 8), (float)(gz - 40)}, 1.5708f, -0.10f,
+           "screenshot_openness_out.bmp");
+    // From inside, looking at the doorway. The floor gradient from the doorway
+    // to the back wall is the P0 term and nothing else — there is no bounce
+    // light in the engine yet, so anything visible here is openness.
+    render({(float)gx, (float)(gh + 9), (float)(gz + kR - 4)}, -1.5708f, -0.12f,
+           "screenshot_openness_in.bmp");
+    // Straight down at the doorway floor from inside, where the 40 cm block
+    // quantisation would show as tiling if the bilinear filter were not on.
+    render({(float)gx, (float)(gh + kH - 3), (float)(gz - kR + 6)}, -1.5708f,
+           -0.85f, "screenshot_openness_floor.bmp");
+  }
+
   // ---- blood: the spatter case AND the pooled case, in one frame ----
   // Blood's whole shading problem is that it is usually NOT a still pool: it
   // comes out of NPCs as droplets, runs and thin trails. shadeViscous blends

@@ -1259,10 +1259,19 @@ fn tonemapHdr(colorIn : vec3f) -> vec3f {
 // geometry, in the same linear HDR space as the terrain. Callers MUST run the
 // result through tonemapHdr() — bare gamma clips the highlights and drifts
 // from the raymarched look in both directions.
-fn litColor(albedo : vec3f, n : vec3f, worldPos : vec3f, emission : f32,
-            R : RenderParams) -> vec3f {
+// litColor with the openness (sky-visibility) multiplier applied to the AMBIENT
+// term only — never to the key light, which has its own occlusion, exactly as
+// the raymarcher's `ambientAt(n) * ao + sun` split does. `openScale` comes from
+// opennessScaleAtBody() at the call site, because only the caller has the
+// `openness`/`opennessGen` bindings in scope (see the pointer note above).
+//
+// A SEPARATE ENTRY POINT rather than a widened litColor: debug_lines.wgsl and
+// several sprite paths want the plain version, and 1.0 here is bit-identical to
+// what they had.
+fn litColorO(albedo : vec3f, n : vec3f, worldPos : vec3f, emission : f32,
+             R : RenderParams, openScale : f32) -> vec3f {
   let lambert = max(dot(n, keyLightDirP(R)), 0.0);
-  var c = albedo * (ambientAtP(n, R) + keyLightColorP(R) * lambert);
+  var c = albedo * (ambientAtP(n, R) * openScale + keyLightColorP(R) * lambert);
   c += albedo * emission * 1.7;
   let dist = length(worldPos - R.camPos);
   let fog = 1.0 - exp(-dist * VOXEL_METERS * 0.0128);
@@ -1276,6 +1285,13 @@ fn litColor(albedo : vec3f, n : vec3f, worldPos : vec3f, emission : f32,
   let fogTint = vec3f(0.55, 0.65, 0.85) *
                 mix(0.015 + 0.05 * moonLit, 1.0, eclipseDayWeightP(R));
   return mix(c, fogTint, fog);
+}
+
+// The plain form: no spatial term, bit-identical to what every raster path had
+// before the openness grid landed.
+fn litColor(albedo : vec3f, n : vec3f, worldPos : vec3f, emission : f32,
+            R : RenderParams) -> vec3f {
+  return litColorO(albedo, n, worldPos, emission, R, 1.0);
 }
 
 // Emissive voxels (embers on burning debris, lava) pulse rather than sitting at
@@ -2916,6 +2932,175 @@ fn subOccBitOfLocalIdx(i : u32) -> u32 {
 // ones are never tested, so setting them costs nothing and keeps the constant
 // free of a per-word special case.
 fn subOccAllOnes() -> u32 { return 0xFFFFFFFFu; }
+
+// ---- THE OPENNESS (SKY-VISIBILITY) GRID (docs/PLAN_gi.md §2, W3 P0) --------
+// One byte per (chunk SLOT, 4^3 block, face) = the unblocked fraction of that
+// face's hemisphere within render.opennessReach metres, written by
+// sim_openness.wgsl and read here. See the kOpenFaces block in world.h for the
+// layout argument; what lives in this file is everything the WRITER and the two
+// READERS must agree about bit for bit — the stamp, the byte index, the face
+// encoding and the filter.
+//
+// `openness` and `opennessGen` are declared per shader (binding 27/28 in the
+// sim group, 17/18 in the render group), so these take POINTERS for exactly
+// traceOpaque's reason: common.wgsl is prepended before any shader declares a
+// binding, and a function here cannot name one.
+const OPEN_BLOCKS : u32 = SUBOCC_DIM * SUBOCC_DIM * SUBOCC_DIM;
+
+// The per-slot stamp: a hash of the WORLD CHUNK COORD the slot's bytes were
+// computed for. The residency window is toroidal, so a slot is silently reused
+// by a different chunk as the window walks, and this is the only thing that
+// tells a reader its bytes describe geometry that has gone. A mismatch reads as
+// "unknown" and the caller falls back to the plain n.y lerp.
+//
+// MUST MATCH sandvox::OpennessStamp (src/sim/world.h) — `--gate openness`
+// computes it on the CPU and asserts the GPU wrote the same word, so the two
+// cannot drift silently. 0 means "never computed" (the buffer is zeroed), so a
+// hash landing on 0 is bumped to 1.
+fn opennessStamp(wc : vec3<i32>) -> u32 {
+  let h = (bitcast<u32>(wc.x) * 73856093u) ^ (bitcast<u32>(wc.y) * 19349663u) ^
+          (bitcast<u32>(wc.z) * 83492791u);
+  return select(h, 1u, h == 0u);
+}
+
+// face = axis * 2 + (normal sign > 0) — the same encoding the shadow cache
+// packs into its request record, and the same one openFaceNormal inverts in
+// sim_openness.wgsl. Taken from the NORMAL rather than from a DDA's (axis, sgn)
+// pair on purpose: the raymarcher's `sgn` is the RAY's direction sign and the
+// face normal is its opposite, which is one negation nobody would notice
+// getting wrong (every face would read its neighbour's openness, and terrain
+// would still look plausible). The raster paths only have a normal anyway.
+fn openFaceOfNormal(n : vec3f) -> u32 {
+  let a = abs(n);
+  var axis = 0u;
+  if (a.y >= a.x && a.y >= a.z) { axis = 1u; }
+  else if (a.z >= a.x) { axis = 2u; }
+  // Selected, not indexed: a dynamic index into a vector spills it to scratch
+  // for the whole function, and this is called from the fragment shader's
+  // hottest path (the by-value-uniform gotcha, one level down).
+  let sv = select(select(n.x, n.y, axis == 1u), n.z, axis == 2u);
+  return axis * 2u + select(0u, 1u, sv > 0.0);
+}
+
+// The byte for (world cell, face), or -1 when this slot's stamp does not match
+// the cell's world chunk (never computed, or computed for a chunk that has
+// since streamed out).
+fn opennessByteAt(c : vec3<i32>, face : u32,
+                  op : ptr<storage, array<u32>, read>,
+                  og : ptr<storage, array<u32>, read>) -> i32 {
+  let slot = chunkIndexW(c);
+  if ((*og)[slot] != opennessStamp(worldChunkOf(c))) { return -1; }
+  let lo = vec3<u32>(c & vec3<i32>(i32(CHUNK) - 1));
+  let bi = (slot * OPEN_BLOCKS + subOccBitLocal(lo)) * OPEN_FACES + face;
+  return i32(((*op)[bi >> 2u] >> ((bi & 3u) * 8u)) & 0xFFu);
+}
+
+// Openness at a surface point, 0..1, or -1 for "unknown, use the old lerp".
+//
+// NEAREST vs BILINEAR. Blocks are 40 cm and the value is an ambient MULTIPLIER,
+// so nearest-only paints a visible 4-voxel checker across any flat wall — the
+// discontinuity is not at a geometric edge, which is where the eye forgives
+// quantisation, but in the middle of a smooth surface, where it does not. The
+// filter blends the four blocks in the FACE PLANE (never across the face's own
+// axis: the block in front is air and the one behind is solid, and neither has
+// anything to say about this face). Taps whose stamp does not match drop out
+// with weight 0 rather than contributing a default, so a wall at the edge of
+// the residency window fades to its own value instead of to a guess.
+fn opennessAt(cell : vec3<i32>, p : vec3f, n : vec3f,
+              op : ptr<storage, array<u32>, read>,
+              og : ptr<storage, array<u32>, read>) -> f32 {
+  let face = openFaceOfNormal(n);
+  let axis = face >> 1u;
+  if (TUNE_OPENNESS_BILINEAR == 0) {
+    let b = opennessByteAt(cell, face, op, og);
+    return select(-1.0, f32(b) * (1.0 / 255.0), b >= 0);
+  }
+  // Unit vectors of the face axis and its two tangents, as integer masks. Built
+  // by comparison rather than by rotation so no component is ever read with a
+  // dynamic index.
+  let ea = vec3<i32>(select(0, 1, axis == 0u), select(0, 1, axis == 1u),
+                     select(0, 1, axis == 2u));
+  let eu = vec3<i32>(select(0, 1, axis == 1u), select(0, 1, axis == 2u),
+                     select(0, 1, axis == 0u));
+  let ev = vec3<i32>(select(0, 1, axis == 2u), select(0, 1, axis == 0u),
+                     select(0, 1, axis == 1u));
+  let blk = f32(SUBOCC_BLOCK);
+  // Position within the block grid, shifted half a block so the samples are
+  // block CENTRES and the weights are symmetric about them.
+  let fu = dot(p, vec3f(eu)) / blk - 0.5;
+  let fv = dot(p, vec3f(ev)) / blk - 0.5;
+  let bu = floor(fu);
+  let bv = floor(fv);
+  let wu = fu - bu;
+  let wv = fv - bv;
+  let half = i32(SUBOCC_BLOCK) / 2;
+  // The tap cell: this cell's component on the face axis (stay in the same
+  // slab), the two tangent components snapped to the lower block's centre.
+  let base = cell * ea + eu * (i32(bu) * i32(SUBOCC_BLOCK) + half) +
+             ev * (i32(bv) * i32(SUBOCC_BLOCK) + half);
+  let du = eu * i32(SUBOCC_BLOCK);
+  let dv = ev * i32(SUBOCC_BLOCK);
+  let b00 = opennessByteAt(base, face, op, og);
+  let b10 = opennessByteAt(base + du, face, op, og);
+  let b01 = opennessByteAt(base + dv, face, op, og);
+  let b11 = opennessByteAt(base + du + dv, face, op, og);
+  let w00 = (1.0 - wu) * (1.0 - wv);
+  let w10 = wu * (1.0 - wv);
+  let w01 = (1.0 - wu) * wv;
+  let w11 = wu * wv;
+  var acc = 0.0;
+  var wsum = 0.0;
+  if (b00 >= 0) { acc += f32(b00) * w00; wsum += w00; }
+  if (b10 >= 0) { acc += f32(b10) * w10; wsum += w10; }
+  if (b01 >= 0) { acc += f32(b01) * w01; wsum += w01; }
+  if (b11 >= 0) { acc += f32(b11) * w11; wsum += w11; }
+  if (wsum <= 0.0) { return -1.0; }
+  return acc / (wsum * 255.0);
+}
+
+// The ambient MULTIPLIER: 1.0 where the sky is fully visible (and therefore
+// bit-identical to the pre-P0 shading), down toward 0 where it is not.
+//
+// A MULTIPLY, WHERE PLAN_gi.md §2 SAID `mix(ambGround, ambSky, openness)`.
+// That form makes a fully enclosed surface read as TUNE_AMB_GROUND — which is
+// the ambient a downward-facing surface ALREADY gets in open daylight, so a
+// cave floor would come out exactly as bright as the underside of an overhang
+// outdoors and "caves get dark" would simply not be true. It also throws away
+// the n.y term entirely, so a cave wall and a cave floor would shade
+// identically and lose the sky/ground split that gives voxel terrain its shape.
+// Multiplying keeps the hue and the shape and makes enclosure actually darken,
+// which is the sentence the phase is judged by.
+fn opennessScale(o : f32) -> f32 {
+  return select(1.0, mix(1.0, o, TUNE_OPENNESS_STRENGTH), o >= 0.0);
+}
+
+// The raster paths' version. A BODY is not in the voxel grid, so the block it
+// stands in is air and has no measurement — reading it would report 255 ("open
+// sky") for a mob in the middle of a cave, which is the exact failure
+// PLAN_gi.md §1 names. So walk DOWN from the fragment until a block that holds
+// matter and take its UP face: a mob is lit like the ground it stands on, which
+// is both cheap and about right for a diffuse body under a sky.
+//
+// Six blocks (2.4 m) is the reach. Past that the body is airborne over a hole
+// and the old lerp is as good an answer as any.
+fn opennessScaleAtBody(worldPos : vec3f,
+                       occ : ptr<storage, array<u32>, read>,
+                       op : ptr<storage, array<u32>, read>,
+                       og : ptr<storage, array<u32>, read>) -> f32 {
+  if (TUNE_OPENNESS_STRENGTH <= 0.0) { return 1.0; }
+  var c = vec3<i32>(floor(worldPos));
+  for (var i = 0u; i < 6u; i++) {
+    let idx = chunkIndexW(c);
+    let lo = vec3<u32>(c & vec3<i32>(i32(CHUNK) - 1));
+    let sbit = subOccBitLocal(lo);
+    if (((*occ)[subOccIndex(idx, 1u, sbit >> 5u)] & (1u << (sbit & 31u))) != 0u) {
+      let b = opennessByteAt(c, 3u, op, og);   // face 3 = +Y
+      return opennessScale(select(-1.0, f32(b) * (1.0 / 255.0), b >= 0));
+    }
+    c.y -= i32(SUBOCC_BLOCK);
+  }
+  return 1.0;
+}
 
 // ---- VOXEL-KEYED SHADOW CACHE (src/sim/world.h kShadowCacheBuckets) --------
 // The identity and packing shared by the two halves of the cache:

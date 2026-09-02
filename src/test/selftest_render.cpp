@@ -729,6 +729,165 @@ Status GateFireDepth(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+
+// ---------------------------------------------------------------------------
+// openness: the sky-visibility grid knows a roof from an open field.
+//
+// WHAT IS UNDER TEST. sim_openness.wgsl writes one byte per (chunk slot, 4^3
+// block, face) — the unblocked fraction of that face's hemisphere within
+// render.opennessReach — and `ambientAt` multiplies the hemisphere ambient by
+// it. The claim the whole phase rests on is that the number MEANS something:
+// a face under a roof reads low, a face under open sky reads high. This gate
+// reads the buffer back and asserts exactly that, in ranges, because the refresh
+// order is not deterministic across GPUs and does not need to be.
+//
+// TWO FACES OF ONE FIXTURE, not two places in the world. `a` is the +Y face of
+// the ground block under the centre of an authored slab; `b` is the +Y face of
+// the slab's own top block. Same stone, same tick, 1.4 m apart, and the ONLY
+// difference between them is that one has a roof over it. A second site
+// somewhere "open" in the terrain would have been a worse control: rolling
+// ground puts a hillside inside 12 m of most surfaces, and the gate would then
+// be measuring worldgen relief rather than the grid.
+//
+// WHY THE SLAB IS WIDE AND LOW. The five rays are the normal plus four at 45
+// degrees, so a roof only reads as cover if its HALF-EXTENT exceeds its HEIGHT
+// above the receiver — otherwise the four diagonals escape past its edge and
+// the face reads 4/6 = 0.67, which is "mostly open" and correct. A 12x12 slab
+// 3 m up (the first sketch of this fixture) measures the slab's edge, not its
+// cover. 4.4 m of half-extent at 1.4 m of height clears it with room.
+//
+// SELF-SUFFICIENT: it generates its own world and stamps its own blocker, so
+// `--gate openness` alone is a valid run (CLAUDE.md's "a new gate must be
+// verifiable with --gate <name> alone").
+//
+// THE SECOND TICK IS LOAD-BEARING AND IT DOCUMENTS A REAL LIMIT. An edit
+// dirties the chunks it WRITES, and the openness dirty walk follows that list.
+// The slab is 14 voxels above the ground, which is a different chunk, so
+// stamping the slab does NOT re-walk the floor it now shades — the floor's
+// openness only changes when the rolling refresh reaches it, up to
+// kNumChunks / render.opennessChunksPerFrame ticks later. Tick B writes one
+// voxel into the floor's own chunk to put it on the dirty list. If that
+// latency is ever a visible problem the fix is a bigger refresh budget, not a
+// dilated dirty list: a 12 m reach dilates to a 15^3 chunk neighbourhood.
+uint32_t OpennessByteAt(GpuContext& ctx, World& world, IVec3 c, uint32_t face,
+                        bool* stampOk) {
+  const IVec3 wc{c.x >> 4, c.y >> 4, c.z >> 4};
+  const uint32_t slot = World::SlotChunkIndex(wc);
+  const uint32_t lx = (uint32_t)(c.x & 15), ly = (uint32_t)(c.y & 15),
+                 lz = (uint32_t)(c.z & 15);
+  // subOccBitLocal, mirrored: (bz * DIM + by) * DIM + bx.
+  const uint32_t bx = lx >> kSubOccShift, by = ly >> kSubOccShift,
+                 bz = lz >> kSubOccShift;
+  const uint32_t block = (bz * kSubOccDim + by) * kSubOccDim + bx;
+  const uint64_t bi =
+      ((uint64_t)slot * kOpenBlocksPerChunk + block) * kOpenFaces + face;
+
+  rhi::Buffer stage =
+      CreateBuffer(ctx.device, 8,
+                   rhi::BufferUsage::MapRead | rhi::BufferUsage::CopyDst,
+                   "opennessRead");
+  rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
+  enc.CopyBufferToBuffer(world.openness, (bi & ~3ull), stage, 0, 4);
+  enc.CopyBufferToBuffer(world.opennessGen, (uint64_t)slot * 4, stage, 4, 4);
+  ctx.queue.Submit(enc.Finish());
+  uint32_t two[2] = {0, 0};
+  if (!rhi::ReadBufferBlocking(ctx.device, stage, 0, two, 8)) {
+    if (stampOk) *stampOk = false;
+    return 0;
+  }
+  // THE STAMP IS COMPARED AGAINST THE C++ MIRROR, which is the whole reason
+  // sandvox::OpennessStamp exists as a function rather than as a comment: it and
+  // common.wgsl's opennessStamp are two places that must agree, and this is the
+  // check. A mismatch here means either the slot was never walked or the two
+  // hashes have drifted, and both are failures of this gate.
+  if (stampOk) *stampOk = (two[1] == OpennessStamp(wc.x, wc.y, wc.z));
+  return (two[0] >> ((bi & 3ull) * 8)) & 0xFFu;
+}
+
+Status GateOpenness(Ctx& c, std::string& detail) {
+  GpuContext& ctx = c.ctx;
+  World& world = c.world;
+  Simulation& sim = c.sim;
+
+  const uint32_t mStone = [&]() -> uint32_t {
+    for (size_t i = 0; i < c.mats.size(); i++)
+      if (c.mats[i].name == "stone") return (uint32_t)i;
+    return 0;
+  }();
+  if (!mStone) {
+    detail = "stone missing from materials.json";
+    return Status::Fail;
+  }
+  if (CurrentTuning().render.opennessStrength <= 0.0f) {
+    detail = "render.opennessStrength is 0 — the pass is not recorded";
+    return Status::Fail;
+  }
+
+  SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+  ctx.WaitIdle();
+
+  const int gx = 300, gz = 300;
+  const int ground = World::TerrainHeight(gx, gz, kDefaultSeed);
+  const int kHalf = 22;            // slab half-extent, voxels (2.2 m)
+  const int kLift = 14;            // slab underside above ground, voxels (1.4 m)
+  const int slabY = ground + kLift;
+  const IVec3 pchunk{gx / 16, slabY / 16, gz / 16};
+
+  std::vector<CellOp> slab;
+  for (int dx = -kHalf; dx <= kHalf; dx++)
+    for (int dy = 0; dy < 2; dy++)
+      for (int dz = -kHalf; dz <= kHalf; dz++) {
+        const IVec3 cc{gx + dx, slabY + dy, gz + dz};
+        if (!world.CellInWindow(cc)) continue;
+        slab.push_back({World::SlotCellIndex(cc), PackVoxNew(mStone, 0u)});
+      }
+  if (slab.empty()) {
+    detail = "slab site is outside the residency window";
+    return Status::Fail;
+  }
+
+  uint32_t tick = 60000;
+  SubmitTick(ctx, world, sim, ++tick, kDefaultSeed, {}, {}, slab, false, pchunk,
+             false, false);
+  ctx.WaitIdle();
+
+  // Tick B: one voxel in the FLOOR's chunk, so the floor is re-walked now that
+  // the roof exists. Written as stone into a cell that is already solid ground,
+  // so the geometry the measurement depends on does not move.
+  const IVec3 floorCell{gx, ground, gz};
+  if (!world.CellInWindow(floorCell)) {
+    detail = "floor site is outside the residency window";
+    return Status::Fail;
+  }
+  std::vector<CellOp> poke{
+      {World::SlotCellIndex(floorCell), PackVoxNew(mStone, 0u)}};
+  SubmitTick(ctx, world, sim, ++tick, kDefaultSeed, {}, {}, poke, false, pchunk,
+             false, false);
+  ctx.WaitIdle();
+
+  bool okA = false, okB = false;
+  const uint32_t roofByte = OpennessByteAt(ctx, world, floorCell, 3u, &okA);
+  const IVec3 topCell{gx, slabY + 1, gz};
+  const uint32_t openByte = OpennessByteAt(ctx, world, topCell, 3u, &okB);
+
+  const double a = roofByte / 255.0;
+  const double b = openByte / 255.0;
+  const double aMax = BaselineNumber("openness.roofedMax", 0.30);
+  const double bMin = BaselineNumber("openness.openMin", 0.75);
+  const bool ok = okA && okB && a < aMax && b > bMin;
+
+  std::printf(
+      "openness: %s (ground under a %dx%d slab %.1f m up: %.2f, must be < %.2f;"
+      " the slab's own top face: %.2f, must be > %.2f; stamps %s/%s, %zu slab "
+      "cells at (%d,%d) ground y=%d)\n",
+      ok ? "PASS" : "FAIL", kHalf * 2 + 1, kHalf * 2 + 1,
+      kLift * (double)kVoxelMeters, a, aMax, b, bMin, okA ? "ok" : "STALE",
+      okB ? "ok" : "STALE", slab.size(), gx, gz, ground);
+  detail = Format("roofed %.2f (< %.2f), open %.2f (> %.2f), stamps %s/%s", a,
+                  aMax, b, bMin, okA ? "ok" : "stale", okB ? "ok" : "stale");
+  return ok ? Status::Pass : Status::Fail;
+}
+
 // ---------------------------------------------------------------------------
 // shadow-cache: the voxel-keyed shadow cache agrees with the ray it replaced.
 //
@@ -1287,6 +1446,9 @@ const std::vector<Gate>& RenderGates() {
       {"screenshots", "render", {}, false, GateScreenshots, /*needsRender=*/true},
       {"fire-depth", "render", {}, false, GateFireDepth, /*needsRender=*/true},
       {"shadow-cache", "render", {}, false, GateShadowCache, /*needsRender=*/true},
+      // No render pass: it reads a compute-written buffer back, like the far
+      // gates above and unlike the three that draw.
+      {"openness", "render", {}, false, GateOpenness},
   };
   return g;
 }

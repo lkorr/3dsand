@@ -103,6 +103,17 @@ void World::Init(const rhi::Device& device) {
   // the CPU differences consecutive reads.
   renderStats = CreateBuffer(device, kRenderStatBytes,
                              U::Storage | U::CopySrc | U::CopyDst, "renderStats");
+  // Openness grid (world.h kOpenFaces block). Zero-initialized allocation is
+  // load-bearing for `opennessGen` and only for it: a zero stamp is "this slot
+  // was never computed", so every reader falls back to the plain hemisphere
+  // lerp until the pass has walked the chunk. `openness` itself needs no
+  // initial value — no reader looks at a byte whose stamp does not match. Same
+  // reliance farVox already has ("zero-initialized = air"), and EncodeLoadReset
+  // re-clears the stamps so a new world cannot inherit the old one's.
+  openness = CreateBuffer(device, kOpennessBytes,
+                          U::Storage | U::CopySrc | U::CopyDst, "openness");
+  opennessGen = CreateBuffer(device, kOpennessGenBytes,
+                             U::Storage | U::CopySrc | U::CopyDst, "opennessGen");
   shadowArgsStage = CreateBuffer(device, 16, U::Storage | U::CopySrc | U::CopyDst,
                                  "shadowArgsStage");
   // Indirect ONLY, and out of every bind group — same rule as dispatchArgs.
