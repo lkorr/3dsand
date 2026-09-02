@@ -88,6 +88,9 @@ svlock_release() {
   local dir=$1
   if [ -n "${SVLOCK_HB[$dir]:-}" ]; then
     kill "${SVLOCK_HB[$dir]}" 2>/dev/null || true
+    # Reap it here, or bash reports "Terminated ( while true; do ..." into
+    # the caller's output on the next prompt.
+    wait "${SVLOCK_HB[$dir]}" 2>/dev/null || true
     unset 'SVLOCK_HB[$dir]'
   fi
   if [ "$(cat "$dir/pid" 2>/dev/null)" = "$$" ]; then
