@@ -480,7 +480,7 @@ const TUNING_SCHEMA = [
       {k:'godRayAniso', n:'god ray focus', d:'Forward-scattering asymmetry. High values make shafts far brighter looking toward the sun than away from it, which is what makes them read as beams rather than uniform haze.', min:-0.95, max:0.95, step:0.01},
       {k:'godRayRange', n:'god ray range', d:'Metres the shaft march covers. Past this the scatter has saturated anyway.', min:0.1, max:60, step:0.5, u:'m'},
       {k:'godRaySteps', n:'god ray samples', d:'Samples along the view ray. A direct frame-time multiplier on submerged pixels only. 0 disables shafts entirely.', min:0, max:64, step:1, int:true},
-      {k:'godRayShadowSteps', n:'god ray shadow budget', d:'Steps each sample’s occlusion ray gets. This is what makes shafts break around the shore instead of passing through terrain — but steps × samples is the real cost.', min:0, max:64, step:1, int:true},
+      {k:'godRayShadowSteps', n:'god ray shadow budget', d:'Steps each sample’s occlusion ray gets. This is what makes shafts break around the shore instead of passing through terrain — but steps × samples is the real cost. Since W2-B these are BLOCK steps (4 voxels each, on the 4^3 blocker mask) rather than voxel steps, so 8 reaches further than the old 20 did.', min:0, max:64, step:1, int:true},
       {k:'siltDensity', n:'silt density', d:'Drifting motes suspended in the water. They are most of why footage reads as underwater — the shafts need something to catch.', min:0, max:4, step:0.02},
       {k:'siltBrightness', n:'silt brightness', d:'How brightly those motes catch the light.', min:0, max:4, step:0.02},
       {k:'siltDrift', n:'silt drift', d:'How fast the particulate drifts. Very slow is correct; fast reads as snow.', min:0, max:1, step:0.005},

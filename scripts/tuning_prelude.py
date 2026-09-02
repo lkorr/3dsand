@@ -214,7 +214,7 @@ SPEC = [
     ("render", "godRayStrength", "TUNE_GODRAY_STRENGTH", "f", 0.55),
     ("render", "godRayAniso", "TUNE_GODRAY_ANISO", "f", 0.62),
     ("render", "godRayRange", "TUNE_GODRAY_RANGE", "f", 14.0),
-    ("render", "godRayShadowSteps", "TUNE_GODRAY_SHADOW_STEPS", "i", 20),
+    ("render", "godRayShadowSteps", "TUNE_GODRAY_SHADOW_STEPS", "i", 8),
     ("render", "shadowCoarseDist", "TUNE_SHADOW_COARSE_DIST", "f", 8.0),
 
     # drifting particulate (silt)

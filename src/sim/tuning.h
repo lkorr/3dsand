@@ -2347,7 +2347,7 @@ struct Tuning {
     // rather than as a uniform brightening of the whole volume.
     float godRayAniso = 0.62f;
     float godRayRange = 14.0f;      // metres the shaft march covers
-    int godRayShadowSteps = 20;     // steps for the per-sample occlusion ray
+    int godRayShadowSteps = 8;      // BLOCK steps for the per-sample occ ray
     // Metres past which a shadow-class ray terminates on the 4^3 blocker mask
     // instead of the voxel (traceOpaque in common.wgsl). 0 = off, and 0 is
     // also bit-identical to the pre-W2-B tracer by construction.

@@ -3430,6 +3430,45 @@ fn waterAbove(p : vec3f) -> f32 {
   return n * VOXEL_METERS;
 }
 
+// ---- the same walk, but reporting WHERE the surface is ---------------------
+// waterAbove answers "how much water is over this point", which every caller
+// but one wants. godRays wants it for FOURTEEN points on one view ray, and
+// paying a 41-read column walk fourteen times per pixel made the walk, not the
+// shadow rays, the second-largest term in the submerged frame.
+//
+// This returns the column's TOP instead — the world y of the liquid surface
+// above p, or a large negative sentinel if p is not under liquid — from which
+// any point in the SAME column gets its depth by one subtraction:
+//
+//     waterAbove(p) == (waterTopAbove(p) - p.y) * VOXEL_METERS
+//
+// and that identity is EXACT, not approximate, whenever every cell between the
+// two is full (fullness 8/8). Work it through: waterAbove's first term is
+// `fullness - fract(p.y)` and its last is the top cell's fullness, so the sum
+// telescopes to `topCell.y + topFullness - p.y`, which is this function's
+// return minus p.y. A partial cell in the MIDDLE of a column is the only case
+// where they differ, and a liquid column with a half-full cell under a full
+// one is a transient the CA is in the middle of resolving.
+//
+// The approximation godRays then makes is a different one and it is named at
+// the call site: it reuses the EYE's column for every sample on the ray, which
+// is exact for a flat surface and wrong under an overhang.
+fn waterTopAbove(p : vec3f) -> f32 {
+  let cell = vec3<i32>(floor(p));
+  var top = -1e9;
+  for (var i = 0; i <= SUB_DEPTH_STEPS; i++) {
+    let c = cell + vec3<i32>(0, i, 0);
+    if (!inBounds(c)) { break; }
+    let w = voxWordAt(c);
+    let mt = voxMat(w);
+    if (mt == MAT_AIR) { break; }
+    let m = materials[mt];
+    if (m.klass != CLASS_LIQUID || (m.flags & MATF_OPAQUE) != 0u) { break; }
+    top = f32(c.y) + f32(voxState(w) + 1u) / 8.0;
+  }
+  return top;
+}
+
 // ---- the caustic web itself ----
 // Same physical idea as the caustic term in shadeWater — the intensity tracks
 // the CONVERGENCE of rays refracted through the wave surface, which for a
@@ -3565,6 +3604,23 @@ fn godRays(ro : vec3f, rd : vec3f, maxDistVox : f32, px : vec2f) -> f32 {
   // Forward-scattering phase, constant along the ray (the sun is directional).
   let phase = phaseHG(dot(rd, kd), TUNE_GODRAY_ANISO);
 
+  // ONE column walk for the whole march, not one per sample. Each sample needs
+  // how much water is above it, which used to be a 41-read walk UP from that
+  // sample — 14 of them per submerged pixel, and the second-largest term in
+  // the frame after the occlusion rays themselves. The surface height is what
+  // that walk was really finding, so find it once, at the eye, and subtract.
+  //
+  // THE APPROXIMATION, stated plainly: every sample is treated as being under
+  // the eye's column. It is EXACT for a flat surface (see waterTopAbove), and
+  // the shipped authored pools are flat basins; it is wrong for a sample under
+  // a different surface height, i.e. beyond a shore or under an overhang, and
+  // those samples are usually inside rock and skipped by the medium test
+  // below before they ever ask. What it drives is the caustic WEIGHT on the
+  // shaft (a +-0.6 modulation that fades out with depth anyway), never whether
+  // a shaft exists — that is the occlusion ray's job and it is still cast per
+  // sample against real geometry.
+  let surfY = waterTopAbove(ro);
+
   var acc = 0.0;
   for (var i = 0; i < steps; i++) {
     let t = (f32(i) + jitter) * dt;
@@ -3580,12 +3636,28 @@ fn godRays(ro : vec3f, rd : vec3f, maxDistVox : f32, px : vec2f) -> f32 {
     let m = materials[mt];
     if (m.klass != CLASS_LIQUID || (m.flags & MATF_OPAQUE) != 0u) { continue; }
 
-    // Occlusion: can the sun reach this point? Short budget on purpose — this
-    // ray only has to find the surface just above or a nearby blocker, and
-    // traceOpaque's chunk-skip covers open water in a few steps. This is the
-    // call W2-B converts to coarse-terminate-from-zero: a volumetric sample
-    // wants the pre-integrated answer anyway, and it aliases less.
-    let s = traceOpaque(p, kd, TUNE_GODRAY_SHADOW_STEPS, 1e30,
+    // Occlusion: can the sun reach this point? COARSE FROM THE FIRST STEP —
+    // the 0.0 is `coarseFromT`, so this ray never tests a voxel at all, only
+    // the 4^3 blockers mask. Three reasons, in the order they matter:
+    //
+    //   1. A VOLUMETRIC SAMPLE WANTS THE PRE-INTEGRATED ANSWER. This is not a
+    //      surface asking "am I in shadow"; it is a point in a medium asking
+    //      how much light arrives, and the honest answer is an average over
+    //      the neighbourhood the sample represents. A per-voxel test through a
+    //      leaf lattice or a lily pad gives a binary answer that flips on
+    //      sub-pixel camera motion, which is what made the shafts crawl.
+    //   2. It is a quarter of the iterations, on a buffer 1,024x smaller than
+    //      the page pool, so the loads stay in cache where the voxel reads
+    //      missed.
+    //   3. The step budget below is therefore in BLOCKS now, not voxels: 8 of
+    //      them reach 3.2 m where the old 20 voxel steps reached 2.0 m.
+    //
+    // The one thing it costs: a sample within 4 voxels of the bed shares its
+    // block with the bed and reads as shadowed, so a shaft stops up to 40 cm
+    // short of the floor. That is the same direction as every other coarse
+    // hit — more occluded, never less — and it is under the bed caustic,
+    // which is a separate term and is not affected.
+    let s = traceOpaque(p, kd, TUNE_GODRAY_SHADOW_STEPS, 0.0,
                         &occupancy, &materials);
     if (s.hit) { continue; }
 
@@ -3594,7 +3666,7 @@ fn godRays(ro : vec3f, rd : vec3f, maxDistVox : f32, px : vec2f) -> f32 {
     // moving structure as the caustics on the bed — the beams and the web on
     // the floor are the same light, and having them animate independently is
     // an immediate tell.
-    let dAbove = waterAbove(p);
+    let dAbove = max(surfY - p.y, 0.0) * VOXEL_METERS;
     let shaft = 1.0 + bedCaustic(p, kd, dAbove) * 0.6;
     acc += shaft * dt;
   }

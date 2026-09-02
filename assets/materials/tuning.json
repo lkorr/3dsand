@@ -654,7 +654,7 @@
     "godRayStrength": 0.55,
     "godRayAniso": 0.62,
     "godRayRange": 14,
-    "godRayShadowSteps": 20,
+    "godRayShadowSteps": 8,
     "siltDensity": 0.55,
     "siltBrightness": 0.5,
     "siltDrift": 0.05,
