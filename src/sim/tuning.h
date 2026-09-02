@@ -2633,7 +2633,7 @@ struct Tuning {
     int curveDesert0 = -16384, curveDesert1 = -12288, curveDesert2 = -8192,
         curveDesert3 = -4096, curveDesert4 = 0, curveDesert5 = 4096,
         curveDesert6 = 8192, curveDesert7 = 12288, curveDesert8 = 16384;
-    int biomeBlend = 12;
+    int biomeBlend = 18;
     int treeTile = 144;
     int treeChanceForest = 78, treeChancePine = 70;
     int treeChanceMeadow = 22, treeChanceDesert = 6;

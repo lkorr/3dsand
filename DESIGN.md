@@ -1627,11 +1627,44 @@ ceiling on the difference between two *adjacent* biomes' knots** — which is wh
 the shipped defaults use. Non-adjacent pairs are unconstrained: the band order is
 meadow | forest | pine | desert, so meadow and desert never meet.
 
-This is why the shipped set is a ±22% slope spread and not a dramatic one. To go
-further you have to widen the biome field itself (`worldgen.biomeLog2`) or spread
-the thresholds — `biomeBlend` is already clamped to half the smallest threshold
-gap, because two boundaries inside one crossfade would silently drop a biome
-from the blend.
+`biomeBlend` defaults to 18 — the largest the clamp allows, since it is capped at
+half the smallest threshold gap; two boundaries inside one crossfade would
+silently drop a biome from the blend. To go further than the ceiling you have to
+widen the biome field itself (`worldgen.biomeLog2`) or spread the thresholds.
+
+###### The shipped defaults are the identity, and that is a measurement
+
+A set at that ceiling was authored, measured, and **reverted**. It works: over a
+409.6 m map at (4096, 4096), `--heightmap` against the identity arm gives
+
+| biome | curve | columns | relief (sd) identity → curved | mean move |
+|---|---|---:|---|---:|
+| forest | identity | 25,532 | 260.0 → 259.3 | 3.0 vox |
+| meadow | flatter | 26,791 | 236.0 → **219.8** (−6.9%) | 26.6 vox |
+| pine | steeper | 7,660 | 228.5 → **243.2** (+6.4%) | 20.6 vox |
+| desert | lower | 5,553 | 174.1 → 186.7 | 11.9 vox |
+
+(forest's 3.0 voxels is only its neighbours' curves bleeding in across the
+crossfade; the largest single-column move anywhere was 54 voxels.)
+
+**What it also does is break `armor-react`.** That gate plants its acid
+differential at `WindowOrigin + 250` and `+ 262` on *raw procgen ground*, and
+the window is wherever the gates before it left it. With the authored set the
+acid stopped reaching the control creature entirely and the dressed one died:
+
+| both arms, FULL SUITE scope | steel stops acid | dressed | bare | death |
+|---|---|---:|---:|---|
+| identity knots | PASS | 16/6057 | 357 | neither |
+| authored knots | **FAIL** | 5/6057 | **0** | dressed, t17 |
+
+Scope is load-bearing here (CLAUDE.md rule 7): the *same* gate PASSES under
+`--gate armor-react` with the authored set, because the window sits elsewhere.
+
+So the mechanism ships live and authorable and the **default stays neutral**.
+The fix is not a milder curve — any global worldgen default can move that
+ground. It is for that gate to stand on a levelled pad the way the fixture
+columns at (60,60)…(140,140) already do (`onFixturePad`), instead of on whatever
+procgen puts under `WindowOrigin + 250`.
 
 **Tree sizes are metre-true again.** `VOX_PER_M` in `worldgen.wgsl` was a
 hardcoded 16 — correct when a voxel was 6.25 cm, and left behind when `world.h`

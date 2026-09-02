@@ -866,7 +866,7 @@
     "curveDesert6": 8192,
     "curveDesert7": 12288,
     "curveDesert8": 16384,
-    "biomeBlend": 12,
+    "biomeBlend": 18,
     "treeTile": 144,
     "treeChanceForest": 78,
     "treeChancePine": 70,

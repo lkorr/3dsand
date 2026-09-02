@@ -421,6 +421,10 @@ SPEC = [
     ("worldgen", "meadowThreshold", "TUNE_MEADOW_THRESHOLD", "u", 92),
 
     # per-biome height curves (13.3.3)
+
+    # THE CEILING ON HOW FAR TWO ADJACENT BIOMES MAY DIFFER
+
+    # AND WHY THE SHIPPED SET IS STILL THE IDENTITY
     ("worldgen", "curveForest0", "TUNE_CURVE_FOREST0", "i", -16384),
     ("worldgen", "curveForest1", "TUNE_CURVE_FOREST1", "i", -12288),
     ("worldgen", "curveForest2", "TUNE_CURVE_FOREST2", "i", -8192),
@@ -457,7 +461,7 @@ SPEC = [
     ("worldgen", "curveDesert6", "TUNE_CURVE_DESERT6", "i", 8192),
     ("worldgen", "curveDesert7", "TUNE_CURVE_DESERT7", "i", 12288),
     ("worldgen", "curveDesert8", "TUNE_CURVE_DESERT8", "i", 16384),
-    ("worldgen", "biomeBlend", "TUNE_BIOME_BLEND", "i", 12),
+    ("worldgen", "biomeBlend", "TUNE_BIOME_BLEND", "i", 18),
     ("worldgen", "treeTile", "TUNE_TREE_TILE", "i", 144),
     ("worldgen", "treeChanceForest", "TUNE_TREE_CHANCE_FOREST", "u", 78),
     ("worldgen", "treeChancePine", "TUNE_TREE_CHANCE_PINE", "u", 70),

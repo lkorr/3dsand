@@ -666,6 +666,44 @@ TP_U(worldgen, meadowThreshold, TUNE_MEADOW_THRESHOLD, 92)
 // landform and never the texture on it. Its own slope scales the accumulated
 // gradient the finer rungs are attenuated against, which is why a flattened
 // biome also stops attenuating its hills as though the mountains were there.
+//
+// ---- THE CEILING ON HOW FAR TWO ADJACENT BIOMES MAY DIFFER ----
+// The crossfade below can only be as wide as the biome field's own edge, and
+// that is what bounds the whole feature. Measured at seed 1337:
+// |d(band)/dcolumn| is mean 0.30, p95 1, MAX 2 -- so a +-18 blend is 36
+// columns typically and 18 columns at worst. A knot delta of D Q14 units is
+// D/25.6 voxels of height, so it ramps at D/25.6/18 voxels per column, and the
+// CA's angle of repose is 1 voxel per column.
+//
+// 900 units (35 voxels, ~2 voxels/column at the worst boundary and ~1 at a
+// typical one) is therefore about the ceiling, and it is what the set below
+// uses -- a +-22% slope spread rather than a dramatic one. That is an honest
+// limit of a 512-voxel biome cell, not a timidity: to go further you have to
+// widen worldgen.biomeLog2 or spread the thresholds.
+//
+// Only ADJACENT pairs are constrained. The band runs meadow | forest | pine |
+// desert, so meadow and desert never meet and their curves may differ freely.
+//
+// ---- AND WHY THE SHIPPED SET IS STILL THE IDENTITY ----
+// A set at that ceiling was authored, measured and then REVERTED, because the
+// selftest suite cannot survive a global worldgen default moving:
+// `armor-react` plants its acid differential at WindowOrigin + 250 and + 262 on
+// raw procgen ground, and the window is wherever the gates before it left it.
+// With the authored set that pair straddled ground the curve had moved, the
+// acid stopped reaching the control creature entirely (bare limb lost 0 skin
+// against 357 with the identity set) and the dressed one died at tick 17.
+//
+// Measured, both arms at FULL SUITE scope, which is the only scope the
+// comparison is valid at (CLAUDE.md rule 7 -- the same gate PASSES under
+// `--gate armor-react` with the authored set, because the window is elsewhere):
+//   identity knots : steel stops acid PASS, dressed 16/6057, bare 357, no death
+//   authored knots : steel stops acid FAIL, dressed  5/6057, bare   0, died t17
+//
+// So the mechanism ships live and authorable and the DEFAULT stays neutral.
+// What has to happen before a non-identity default can land is not a milder
+// curve -- it is that gate standing on a levelled pad the way the fixture
+// columns at (60,60)..(140,140) do (`onFixturePad`), instead of on whatever
+// procgen puts under WindowOrigin + 250.
 TP_I(worldgen, curveForest0, TUNE_CURVE_FOREST0, -16384)
 TP_I(worldgen, curveForest1, TUNE_CURVE_FOREST1, -12288)
 TP_I(worldgen, curveForest2, TUNE_CURVE_FOREST2, -8192)
@@ -708,7 +746,7 @@ TP_I(worldgen, curveDesert8, TUNE_CURVE_DESERT8, 16384)
 // curve reshapes rungs whose amplitude is 100 m, so two different curves
 // meeting on a contour is a step of tens of voxels. Keep it under half the
 // smallest gap between thresholds.
-TP_I(worldgen, biomeBlend, TUNE_BIOME_BLEND, 12)
+TP_I(worldgen, biomeBlend, TUNE_BIOME_BLEND, 18)
 TP_I(worldgen, treeTile, TUNE_TREE_TILE, 144)
 TP_U(worldgen, treeChanceForest, TUNE_TREE_CHANCE_FOREST, 78)
 TP_U(worldgen, treeChancePine, TUNE_TREE_CHANCE_PINE, 70)
