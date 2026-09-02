@@ -874,6 +874,9 @@
     "ruinChance": 5,
     "ruinPadMargin": 20,
     "ruinMaxSlope": 20,
+    "caveMushroomChance": 26,
+    "caveCrystalChance": 9,
+    "mossFace": 0,
     "caveThreshold1": 150,
     "caveThreshold2": 148,
     "editLayer": ""

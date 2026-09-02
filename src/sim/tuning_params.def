@@ -790,6 +790,22 @@ TP_U(worldgen, ruinChance, TUNE_RUIN_CHANCE, 5)
 // (see ruinFloorAt) so a refused site looks like an old foundation.
 TP_I(worldgen, ruinPadMargin, TUNE_RUIN_PAD_MARGIN, 20)
 TP_I(worldgen, ruinMaxSlope, TUNE_RUIN_MAX_SLOPE, 20)
+// ---- cave flora + the shaded face (13.3.4) ----
+// 1-in-N per column, INSIDE the relevant patch mask, on the one cell that is
+// the cave's floor or its ceiling. Mushrooms go on the shallow band's floor
+// (the caverns you walk into from a hillside); crystal goes on the deep band's
+// floor and ceiling (the ones you only reach by digging), never within
+// CAVE_LAVA_MARGIN of the magma table.
+//
+// Both are SPARSER than they look: the patch masks already cut the eligible
+// area to about a third, and only one y per column is eligible at all, so these
+// are the density WITHIN a seam rather than over the cavern.
+TP_U(worldgen, caveMushroomChance, TUNE_CAVE_MUSHROOM_CHANCE, 26)
+TP_U(worldgen, caveCrystalChance, TUNE_CAVE_CRYSTAL_CHANCE, 9)
+// Which wall face wears moss: 0 = -Z, 1 = +X, 2 = +Z, 3 = -X. Worldgen has no
+// sun and no compass, so a shaded face is a CONVENTION rather than a
+// measurement, and this is the knob that declares it. -Z is "north".
+TP_U(worldgen, mossFace, TUNE_MOSS_FACE, 0)
 TP_U(worldgen, caveThreshold1, TUNE_CAVE_THRESHOLD1, 150)
 TP_U(worldgen, caveThreshold2, TUNE_CAVE_THRESHOLD2, 148)
 

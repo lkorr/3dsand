@@ -2718,6 +2718,22 @@
         "organic"
       ],
       "molten": "fire"
+    },
+    {
+      "//": "THE ONLY LIGHT UNDER THE WORLD THAT IS NOT LAVA. Worldgen has no sun direction and a cave has no sky, so Lin 13.3.4's \"place plants by how open the sky is\" bottoms out down here as \"place what grows in the dark\". caveBands (worldgen.wgsl) gives a deep cavern's floor and ceiling in CLOSED FORM per column, so a seam can be hung off either without a march.\n\nemission 120 is deliberately under lava's 255: a crystal seam should let you SEE the cavern you are standing in, not light it like a furnace, and the magma table at LAVA_LEVEL stays the thing that reads as heat. Placement keeps a margin above that level so a seam never grows into the lava it is lighting.\n\nINERT, and that is load-bearing (CLAUDE.md rule 2): no reaction names it as `self` or as an emit, it is not flammable and it does not melt, so a cavern full of it generates AT REST and its chunks sleep on the first tick exactly as the stone around them does.\n\nhardness 6 is above stone's, so a seam survives the blast that opens the rock around it and reads as a vein rather than as coloured gravel.",
+      "id": "crystal",
+      "class": "solid",
+      "density": 2600,
+      "hardness": 6,
+      "emission": 120,
+      "colors": [
+        "#6fd8e8",
+        "#3f9fc4",
+        "#a8f0f4"
+      ],
+      "tags": [
+        "mineral"
+      ]
     }
   ]
 }

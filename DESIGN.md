@@ -1732,6 +1732,44 @@ predicate and does not know about the refusal. That is the choice: an old
 foundation with nothing standing on it, rather than a hillside carrying a bald
 5.6 m square for no reason.
 
+###### Openness placement (2026-09-01, Lin 13.3.4)
+
+"Place plants by how open the sky is" — but worldgen has **no sun direction**,
+and above ground the only overhangs are trees, whose canopy cover already drives
+`undergrowthSite`. So the feature is what was actually missing, in three parts,
+and each one is a **closed form** — no column march, no neighbour voxel read:
+
+* **A ruin floor is swept.** `Col.ruinFloor` (one `hash3` per column) takes the
+  footprint out of the tall light-loving layer entirely and gives it the shade
+  set's two lowest members instead — moss and leaf litter. It also rejects tree
+  trunks in `treeInfoAt`. Without it the stalk pass grows flower stems through
+  the walls, and a hut standing in hip-high meadow reads as a decal on a field.
+* **Cave flora, from `caveBands`.** The bands give a cavern's floor and ceiling
+  per column in closed form, so "standing on the floor" and "hanging from the
+  ceiling" are comparisons. Mushrooms go on the **shallow** band's floor (the
+  caverns you walk into from a hillside); a new emissive `crystal` material goes
+  on the **deep** band's floor and ceiling, in seams shaped by a patch mask,
+  never within `CAVE_LAVA_MARGIN` of the magma table. Both are inert, so a
+  cavern full of them still generates at rest.
+  <br>**The band is carved from `f1` UPWARD**, so `f1` is the lowest *air* cell
+  and the stone under it is `f1-1`. The plan's `f1+1` would have floated every
+  mushroom one voxel above its own floor — the same bug as the ruin wall.
+* **Moss on a shaded face** of a ruin wall, chosen by `worldgen.mossFace`
+  (0 = −Z, default). Worldgen has no compass, so this is a **convention**, not a
+  measurement, and it says so rather than pretending to derive one. It is a skin
+  swap on a wall cell that already exists — `ruinShellAt` re-evaluated at the
+  neighbour, the same predicate trick the ivy pass uses — and the material is
+  `wet_moss`, **not** the ground `moss_patch`: `moss_patch` is `passable`, and
+  swapping a wall cell for a passable material punches a walkable hole through
+  the building.
+
+**Trunks are out of scope, and the reason is architectural rather than
+budgetary.** A trunk's −Z neighbour lives in a *different column's*
+`TreeCands`, which costs the 25-tile scan; and decorating a baked tree from
+worldgen is the exact divergence the `.svtree` bake exists to end (the tree vine
+and hanging-moss knobs were deleted for it). A trunk that wants moss grows it in
+`treegen.js`.
+
 There used to be a fourth height function, `surfHeightAt`, which hand-copied
 this arithmetic for the far-field skin lookup and had already drifted (it never
 took the lab branch). It is gone; `farSurfaceMat` takes the column.

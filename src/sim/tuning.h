@@ -2690,6 +2690,13 @@ struct Tuning {
     // bounds.
     int ruinPadMargin = 20, ruinMaxSlope = 20;
     int caveThreshold1 = 150, caveThreshold2 = 148;
+    // Cave flora: 1-in-N per column on the one cell that is the band's floor
+    // (mushrooms, shallow band) or its floor and ceiling (crystal, deep band),
+    // inside a patch mask. mossFace picks which wall face wears moss --
+    // 0 = -Z, 1 = +X, 2 = +Z, 3 = -X -- because worldgen has no sun and a
+    // shaded face here is a convention, not a measurement.
+    int caveMushroomChance = 26, caveCrystalChance = 9;
+    int mossFace = 0;
     // ---- the authored edit layer (src/sim/worldedit.h) ---------------------
     // Names assets/worldedits/<editLayer>.svedit, the hand-built patch the
     // Worldgen tab's voxel view writes. Applied through the MutationQueue to

@@ -2252,6 +2252,9 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadWgCount(*g, "ruinChance", w.ruinChance, out, at);
     ReadWgLen(*g, "ruinPadMargin", w.ruinPadMargin, out, at);
     ReadWgLen(*g, "ruinMaxSlope", w.ruinMaxSlope, out, at);
+    ReadWgCount(*g, "caveMushroomChance", w.caveMushroomChance, out, at);
+    ReadWgCount(*g, "caveCrystalChance", w.caveCrystalChance, out, at);
+    ReadWgCount(*g, "mossFace", w.mossFace, out, at);
     ReadWgCount(*g, "caveThreshold1", w.caveThreshold1, out, at);
     ReadWgCount(*g, "caveThreshold2", w.caveThreshold2, out, at);
     // A NAME, never a path: worldedit.cpp joins it under assets/worldedits/,
@@ -2449,6 +2452,16 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     // columns one voxel OUTSIDE the footprint, so the margin has to reach them.
     atLeast("ruinPadMargin", w.ruinPadMargin, 2);
     atLeast("ruinMaxSlope", w.ruinMaxSlope, 0);
+    // Both are the divisor of a `% chance == 0` roll.
+    atLeast("caveMushroomChance", w.caveMushroomChance, 1);
+    atLeast("caveCrystalChance", w.caveCrystalChance, 1);
+    // mossFace is masked to 0..3 in the shader; clamp here so the tuner's
+    // number and the wall agree instead of wrapping silently.
+    if (w.mossFace < 0 || w.mossFace > 3) {
+      out.warnings.push_back(
+          "worldgen.mossFace must be 0..3 (-Z, +X, +Z, -X); clamped");
+      w.mossFace = w.mossFace & 3;
+    }
     // A margin of 32 or more would push a pad out of its own tile, and
     // landColumn only ever looks at the column's own tile (worldgen.wgsl, the
     // RUIN SITES block). 31 is the largest value that keeps that true.
@@ -2583,6 +2596,9 @@ std::string WorldgenDefaultsJson() {
   n("ruinChance", w.ruinChance);
   n("ruinPadMargin", w.ruinPadMargin);
   n("ruinMaxSlope", w.ruinMaxSlope);
+  n("caveMushroomChance", w.caveMushroomChance);
+  n("caveCrystalChance", w.caveCrystalChance);
+  n("mossFace", w.mossFace);
   n("caveThreshold1", w.caveThreshold1);
   n("caveThreshold2", w.caveThreshold2);
   s("editLayer", w.editLayer);

@@ -174,6 +174,34 @@ const M_SAPLING   : u32 = 92u;
 const M_BRAMBLE   : u32 = 93u;
 const M_LITTER    : u32 = 94u;
 
+// ---- cave flora (materials.json id 116) ----
+// The only light under the world that is not lava. Placed by caveFloraAt on the
+// deep band's floor and ceiling; see the note in materials.json for why it is
+// inert and why its emission is under lava's.
+const M_CRYSTAL   : u32 = 116u;
+
+// ---- CAVE / RUIN PLACEMENT CONSTANTS ----
+// Plain WGSL consts, same reasoning as the UG_* block above: these are
+// PLACEMENT CONTENT, not look/feel. The three DENSITIES are TUNE_* knobs
+// (worldgen.caveMushroomChance / caveCrystalChance / mossFace) because those
+// are the numbers an author reaches for; the patch masks and the margins are
+// structure.
+//
+// Crystal grows in SEAMS, not as an even sprinkle: the same device the fern and
+// moss patches use on the surface, at a cavern's scale. Without it a cavern
+// reads as a texture rather than as a place with a find in it.
+const CAVE_CRYSTAL_PATCH_CELL : i32 = 40 * HSCALE;
+const CAVE_CRYSTAL_PATCH      : i32 = 168;   // vnoise 0..255; ~35% of the area
+const CAVE_SHROOM_PATCH_CELL  : i32 = 22 * HSCALE;
+const CAVE_SHROOM_PATCH       : i32 = 128;
+// Keep-out above the magma table. A crystal seam growing into the lava it is
+// lighting is the same class of mistake as a ruin sunk into a hillside.
+const CAVE_LAVA_MARGIN : i32 = (6 * VLEN_NUM) / VLEN_DEN;
+// Moss on a ruin wall thins with height the way the ivy does, and out of the
+// same reasoning: a north face is damp at the ground and dry at the eaves.
+const RUIN_MOSS_SPREAD : u32 = 24u;
+const RUIN_MOSS_GAIN   : i32 = 16;
+
 // Undergrowth placement constants. Plain WGSL consts rather than TUNE_* knobs,
 // following the TREE_TILE / TREE_SCAN / POND_RIM precedent in this file: these
 // are PLACEMENT CONTENT (which plant grows where), not look/feel, and the
@@ -1154,6 +1182,10 @@ fn treeInfoAt(s : TreeSite, land : Land, seed : u32) -> Tree {
   // No trees on snowfields, in ponds, or over the selftest fixture sites.
   if (h >= TREELINE) { return t; }
   if (pondAt(t.wx, t.wz, seed).y >= 0) { return t; }
+  // ...and nothing takes root through a stone floor. One hash3 per candidate:
+  // this is why ruinFloorAt is the cheap tile predicate and not the pad, which
+  // costs four column samples and could not be afforded here.
+  if (ruinFloorAt(t.wx, t.wz, seed)) { return t; }
   // (The spawn clearing is checked AFTER the species draw, where the crown's
   // real width is known — see the note at that test.)
 
@@ -2092,6 +2124,68 @@ fn caveAt(x : i32, y : i32, z : i32, h : i32, seed : u32) -> i32 {
   return caveIn(caveBands(x, z, h, seed), y);
 }
 
+// ---- CAVE FLORA: openness placement where openness is a closed form --------
+//
+// Lin 13.3.4 asks for plants placed by how open the sky is. Above ground that
+// is already what `undergrowthSite`'s canopy cover does, and there is no other
+// overhang in the world. Below ground there is no sky at all, so the question
+// becomes "what grows in the dark", and the cave bands answer the two structural
+// halves of it — where the FLOOR is and where the CEILING is — per column, in
+// closed form, with no march and no neighbour lookup.
+//
+// ONE THING THE PLAN GOT WRONG, and it is worth writing down because it is the
+// same class of bug as the floating ruin wall: `caveIn` carves from f1 UPWARD
+// (`y >= b.f1`), so **f1 is the lowest AIR cell** and the stone it stands on is
+// f1-1. A mushroom at f1+1 — as planned — would float one voxel above its own
+// floor. It goes AT f1.
+//
+// Every test below also asks whether the neighbouring cell is carved, because
+// the two bands overlap: band 2 can undercut band 1's floor, and band 1 can eat
+// band 2's ceiling. `caveIn` is the authority for both and costs comparisons.
+//
+// Returns MAT_AIR for "leave the cave open".
+fn caveFloraAt(b : CaveBands, x : i32, y : i32, z : i32, seed : u32) -> u32 {
+  // Never in the flooded band, and never within reach of it.
+  if (y <= LAVA_LEVEL + CAVE_LAVA_MARGIN) { return MAT_AIR; }
+
+  // ---- SHALLOW BAND FLOOR: mushrooms ----
+  // The near-surface caverns are the ones a player walks into from a hillside,
+  // so they get the soft, findable thing. Only where the cell below is really
+  // solid: a mushroom over a hole is the floating decoration this whole package
+  // is about.
+  if (b.on1 && y == b.f1 && caveIn(b, y - 1) == 0) {
+    if (vnoise(x, z, CAVE_SHROOM_PATCH_CELL, seed ^ 0x5CA9u) >
+        CAVE_SHROOM_PATCH) {
+      let hm = hash3(seed ^ 0x5A18u, bitcast<u32>(x), bitcast<u32>(z));
+      if ((hm % TUNE_CAVE_MUSHROOM_CHANCE) == 0u) {
+        // Same red/pale split the forest floor uses, and gated on the SAME roll
+        // so this only picks WHICH mushroom, never adds more of them.
+        return select(M_TOADSTOOL, M_MUSHROOM, ((hm >> 13u) % 4u) == 0u);
+      }
+    }
+  }
+
+  // ---- DEEP BAND: crystal on the ceiling and the floor ----
+  // The deep caverns are the ones you only reach by digging, so they get the
+  // light. `top2` is the deep band's extra cap, so its topmost carved cell is
+  // min(c2, top2) — the ceiling — and f2 is its floor.
+  if (b.on2) {
+    let ceil2 = min(b.c2, b.top2);
+    let atCeiling = y == ceil2 && caveIn(b, y + 1) == 0;
+    let atFloor = y == b.f2 && caveIn(b, y - 1) == 0;
+    if ((atCeiling || atFloor) &&
+        vnoise(x, z, CAVE_CRYSTAL_PATCH_CELL, seed ^ 0xC275u) >
+        CAVE_CRYSTAL_PATCH) {
+      // Its own salt, never a bit-slice of the mushroom hash — see the long
+      // note in the pond-life block about what correlated slices do to a
+      // scatter. A seam and a mushroom bank must be different places.
+      let hc = hash3(seed ^ 0xC17Au, bitcast<u32>(x), bitcast<u32>(z));
+      if ((hc % TUNE_CAVE_CRYSTAL_CHANCE) == 0u) { return M_CRYSTAL; }
+    }
+  }
+  return MAT_AIR;
+}
+
 // ---- THE COLUMN HALF, hoisted out of the per-cell path --------------------
 //
 // Everything from baseHeight down to the shore band is a pure function of
@@ -2118,6 +2212,7 @@ struct Col {
   inRim       : bool,
   shore       : Shore,
   ruin        : Ruin,        // the accepted ruin whose pad covers this column
+  ruinFloor   : bool,        // inside a ruin's footprint: a swept stone floor
 };
 
 // ---- THE HEIGHT CONTRACT ---------------------------------------------------
@@ -2224,6 +2319,37 @@ struct Ruin {
   rz      : i32,
   y       : i32,    // pad height: the floor, and the shell's base course
 };
+
+// Does the building's STONE occupy this cell? Factored out of genCellIn because
+// the moss skin needs to ask it about a NEIGHBOUR — the same closed-form
+// predicate re-evaluated at an offset that the ivy pass and the arena wall
+// already use, rather than a voxel lookup worldgen cannot do.
+fn ruinShellAt(R : Ruin, x : i32, y : i32, z : i32) -> bool {
+  if (!R.present) { return false; }
+  if (x < R.rx || x >= R.rx + RUIN_W) { return false; }
+  if (z < R.rz || z >= R.rz + RUIN_W) { return false; }
+  if (y < R.y || y >= R.y + RUIN_HT) { return false; }
+  let shellXZ = x < R.rx + 4 || x >= R.rx + RUIN_W - 4 ||
+                z < R.rz + 4 || z >= R.rz + RUIN_W - 4;
+  let shellY = y >= R.y + RUIN_HT - 4;
+  let door = y < R.y + 32 && abs(z - (R.rz + RUIN_W / 2)) <= 12 &&
+             x < R.rx + 4;
+  return (shellXZ || shellY) && !door;
+}
+
+// ---- WHICH FACE IS "NORTH" -------------------------------------------------
+// Worldgen has no sun and no compass, so a shaded face is a CONVENTION, not a
+// measurement — `worldgen.mossFace` picks which one and -Z is the default. This
+// is the honest version of Lin 13.3.4's "moss on the shady side": the engine
+// cannot know which side is shady, so it declares one and is consistent about
+// it, rather than pretending to derive it.
+fn mossFaceDelta() -> vec2<i32> {
+  let f = TUNE_MOSS_FACE & 3u;
+  if (f == 0u) { return vec2<i32>(0, -1); }
+  if (f == 1u) { return vec2<i32>(1, 0); }
+  if (f == 2u) { return vec2<i32>(0, 1); }
+  return vec2<i32>(-1, 0);
+}
 
 struct LandCol {
   h           : i32,         // GROUND. The contract above.
@@ -2515,6 +2641,7 @@ fn genColumn(x : i32, z : i32, seed : u32) -> Col {
     lab.ruin.rx = 0;
     lab.ruin.rz = 0;
     lab.ruin.y = 0;
+    lab.ruinFloor = false;
     return lab;
   }
   // THE GROUND, and everything derived from it, in one call. This is the same
@@ -2571,6 +2698,11 @@ fn genColumn(x : i32, z : i32, seed : u32) -> Col {
   col.inRim = L.inRim;
   col.shore = shore;
   col.ruin = L.ruin;
+  // ONE hash3 per column, and the CHEAP predicate rather than L.ruin.present:
+  // a site the flatness gate refused still reads as a swept floor, so the
+  // clearing and the building agree about their edges whether or not the
+  // building got built. See ruinFloorAt.
+  col.ruinFloor = ruinFloorAt(x, z, seed);
   return col;
 }
 
@@ -2609,6 +2741,7 @@ fn genCellIn(col : Col,
   let inPoolFloor = col.inPoolFloor;
   let inRim = col.inRim;
   let shore = col.shore;
+  let ruinFloor = col.ruinFloor;
   var mat = MAT_AIR;
 
   if (y <= h) {
@@ -2690,10 +2823,20 @@ fn genCellIn(col : Col,
     // a cave breaching a rim column drains the pool through the tunnel system
     // and the world never settles.
     if (mat == M_STONE && !inRim) {
-      var cv = 0;
-      if (caveValid) { cv = caveIn(*cave, y); }
-      else { cv = caveAt(x, y, z, h, seed); }
-      if (cv == 1) { mat = MAT_AIR; }
+      // The bands, not just the answer: caveFloraAt needs f1/f2/c2 to ask where
+      // the floor and the ceiling of THIS cavern are. `caveAt` was exactly
+      // `caveIn(caveBands(...))`, so the one-shot arm below is the same
+      // arithmetic in the same order and produces the same words.
+      var cb : CaveBands;
+      if (caveValid) { cb = *cave; } else { cb = caveBands(x, z, h, seed); }
+      let cv = caveIn(cb, y);
+      if (cv == 1) {
+        mat = MAT_AIR;
+        // Cave flora fills the carved cell it stands in — no extra voxel, no
+        // extra occupancy, nothing new for the CA to look at, and everything it
+        // places is inert (rule 2).
+        mat = caveFloraAt(cb, x, y, z, seed);
+      }
       else if (cv == 2) { mat = M_LAVA; }
     }
     // WET MOSS on the rock at the waterline. A SKIN SWAP on a surface cell that
@@ -2888,7 +3031,33 @@ fn genCellIn(col : Col,
   // through a reed bed are what would give away that the marsh is a decal on
   // ordinary ground instead of a different place — the same reason the shore
   // ground skin is mud rather than a tinted grass.
-  if (mat == MAT_AIR && y == h + 1 && !inRim && pond < 0 && h < TREELINE &&
+  // ---- A RUIN FLOOR IS SWEPT ------------------------------------------------
+  // Inside the footprint the ground is a stone floor with a building on it, so
+  // the tall light-loving layer is wrong twice over: a meadow of hip-high
+  // flowers inside a hut reads as the building being a decal on the field, and
+  // the stalk block below would push flower stems straight through the walls.
+  // What DOES belong is the shade set's two lowest members — moss on the damp
+  // stone and leaf litter blown in through the door — so this is the same rolls
+  // at the same rates with everything taller removed.
+  //
+  // It runs BEFORE the general block and takes the column out of it, rather
+  // than adding a fifth term to that block's already long guard, and it skips
+  // `undergrowthSite` entirely: the 25-tile canopy scan is the most expensive
+  // thing on a surface column and a swept floor has no use for its answer.
+  if (mat == MAT_AIR && y == h + 1 && ruinFloor && !inRim && pond < 0 &&
+      h < TREELINE && !onFixturePad(x, z) && !shore.onShore) {
+    let hMossR = hash3(seed ^ 0x3C0Bu, bitcast<u32>(x), bitcast<u32>(z));
+    let hLitR  = hash3(seed ^ 0x0B8Fu, bitcast<u32>(x), bitcast<u32>(z));
+    let mossPatchR = vnoise(x, z, 14 * HSCALE, seed ^ 0x3C00u);
+    if ((hMossR % UG_MOSS_CHANCE) == 0u && mossPatchR > UG_MOSS_PATCH) {
+      mat = M_MOSS;
+    } else if ((hLitR % UG_LITTER_CHANCE) == 0u) {
+      mat = M_LITTER;
+    }
+  }
+
+  if (mat == MAT_AIR && y == h + 1 && !ruinFloor &&
+      !inRim && pond < 0 && h < TREELINE &&
       biome != B_DESERT && !onFixturePad(x, z) && !shore.onShore) {
     let fr = hash3(seed ^ 0xF10Eu, bitcast<u32>(x), bitcast<u32>(z));
     // ONE 25-tile scan answers both "how shaded is this column" and "how far to
@@ -3021,7 +3190,11 @@ fn genCellIn(col : Col,
   // Y range is bounded by the tallest flower (FLOWER_MAX_H), so a column pays
   // at most that many extra evaluations and a settled world still costs nothing
   // (rule 2 — nothing here is reactive).
-  if (mat == MAT_AIR && y > h + 1 && y <= h + FLOWER_MAX_H &&
+  // `!ruinFloor` for the same reason the base block has it, and it has to be
+  // repeated here rather than inferred: this branch RE-DERIVES the species from
+  // flowerAt instead of reading the base cell, so a guard the base block took
+  // and this one did not would grow a headless stalk out of a stone floor.
+  if (mat == MAT_AIR && y > h + 1 && y <= h + FLOWER_MAX_H && !ruinFloor &&
       !inRim && pond < 0 && h < TREELINE &&
       biome != B_DESERT && !onFixturePad(x, z) && !shore.onShore) {
     let fl = flowerAt(x, z, seed, UG_COVER_EDGE);
@@ -3292,10 +3465,35 @@ fn genCellIn(col : Col,
         if (y >= ry && y < ry + rht) {
           let shellXZ = x < rx + 4 || x >= rx + rw - 4 ||
                         z < rz + 4 || z >= rz + rw - 4;
-          let shellY = y >= ry + rht - 4;
-          // doorway: 2 m tall, 1.5 m wide, centred on the -x wall
-          let door = y < ry + 32 && abs(z - (rz + rw / 2)) <= 12 && x < rx + 4;
-          if ((shellXZ || shellY) && !door) { mat = M_STONE; }
+          if (ruinShellAt(R, x, y, z)) {
+            mat = M_STONE;
+            // ---- MOSS ON THE SHADED FACE ----
+            // A SKIN SWAP on a wall cell that already exists — the same free
+            // move the waterline's wet moss makes, and the same
+            // predicate-re-evaluation trick the ivy uses: `ruinShellAt` asked
+            // about the neighbour, not a voxel read, because worldgen has none.
+            //
+            // Applies to any wall face pointing at open air on the chosen side,
+            // which is the OUTSIDE of the -Z wall and the INSIDE of the +Z one.
+            // Damp at the ground, gone at the eaves.
+            let mf = mossFaceDelta();
+            if (!ruinShellAt(R, x + mf.x, y, z + mf.y)) {
+              let climb = y - ry;
+              let hmo = hash3(seed ^ 0x0553u,
+                              bitcast<u32>(x) ^ (bitcast<u32>(z) << 12u),
+                              bitcast<u32>(y));
+              if (i32(hmo % RUIN_MOSS_SPREAD) * rht <
+                  (rht - climb) * RUIN_MOSS_GAIN) {
+                // WET MOSS, not the ground moss_patch, and the difference is
+                // load-bearing: moss_patch is `passable`, and swapping a WALL
+                // cell for a passable material punches a walkable hole through
+                // the building. wet_moss is the one moss authored as a solid
+                // SKIN on stone -- it is what the waterline already uses for
+                // exactly this move -- so the wall stays a wall.
+                mat = M_WET_MOSS;
+              }
+            }
+          }
           else if (!shellXZ) { mat = select(mat, MAT_AIR, y > ry); }  // hollow
         }
       }
