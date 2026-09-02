@@ -159,11 +159,11 @@ uint64_t g_harnessFrames = 0;
 // the PROCESS CPU seconds (every thread, user + kernel) since the previous
 // mark. The CPU column is the one that NAMES a stall: a phase that costs 90 s
 // of wall and 2 s of CPU is waiting (GPU, a fence, a lock); one that costs 90 s
-// of wall and 1,000 s of CPU is a driver thread pool compiling something � the
+// of wall and 1,000 s of CPU is a driver thread pool compiling something � the
 // NVIDIA pipeline compiler is the only multi-threaded work this process does
 // before the first tick (Jolt's pool has nothing to step yet). Always on: it is
 // ~15 lines per launch, and the one time it mattered (a multi-minute white
-// window on a fresh build, docs/PLAN_lin_followups.md �6 T1) nobody had timed
+// window on a fresh build, docs/PLAN_lin_followups.md �6 T1) nobody had timed
 // a launch before and after the week's landings, and three plausible causes
 // were argued from what had changed instead of from a clock.
 void StartupMark(const char* phase) {
@@ -775,6 +775,23 @@ int RunShots(GpuContext& ctx, World& world, Simulation& sim) {
     sim.EncodeFarFill(enc, n);
     ctx.queue.Submit(enc.Finish());
   }
+  // THE SUN BEFORE THE SETTLE TICKS. The openness walk (sim_openness.wgsl)
+  // reads RenderParams for the key light when it deposits its off-screen
+  // irradiance sample (docs/PLAN_gi.md §3), and 120 ticks of refresh cover
+  // 30,720 of the window's 32,768 slots — so written here, the settle loop
+  // is also what lights the grid for every frame below. Written after the
+  // tick loop, every shot would have shown P1 from the resolve pass alone,
+  // i.e. only what each camera's own patches had deposited. Any camera does;
+  // the sun is what the walk reads.
+  {
+    const Tuning& tn = CurrentTuning();
+    const uint32_t tpd = TicksPerDay(tn);
+    const uint32_t sunTick =
+        (uint32_t)((double)g_shotTimeOfDay * (double)tpd) % tpd;
+    Camera c0;
+    WriteRenderParams(ctx.queue, world, Vec3{128, 240, 128}, c0, 16.0f / 9.0f,
+                      true, 11.7f, kFarFogDensity, 1080.0f, sunTick);
+  }
   for (uint32_t t = 1; t <= 120; t++)  // powders settle so shots match play
     SubmitTick(ctx, world, sim, t, kDefaultSeed, {}, {}, {}, false, {8, 3, 8},
                false, false);
@@ -825,27 +842,37 @@ int RunShots(GpuContext& ctx, World& world, Simulation& sim) {
     Camera c;
     c.yaw = yaw;
     c.pitch = pitch;
-    WriteRenderParams(ctx.queue, world, eye, c, (float)W / H, true, kShotTime,
-                      kFarFogDensity, 1080.0f, shotTick);
-    rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
-    sim.EncodeShadowResolve(enc);
-    rhi::RenderPass rp =
-        sim.BeginRenderPass(enc, view, rhi::TextureFormat::RGBA8Unorm, W, H);
-    sim.DrawWorld(rp);
-    // Wind slope-field arrows, off unless wind.dbgWindField asks for them.
-    // Headless cannot press F4, and the overlay's whole job is to be LOOKED
-    // at — so the tuning bool is how a screenshot run reaches it, and the
-    // wind block below is what uses that.
-    sim.DrawWindField(rp, CurrentTuning().wind.dbgWindField
-                              ? WindDebugArrowCount(CurrentTuning())
-                              : 0u);
-    // The CURRENT field's arrows, reached the same way and for the same
-    // reason (water plan component 8).
-    sim.DrawCurrentField(rp, CurrentTuning().render.dbgCurrentField
-                                 ? CurrentDebugArrowCount()
-                                 : 0u);
-    rp.End();
-    ctx.queue.Submit(enc.Finish());
+    // FOUR FRAMES, GRAB THE LAST. The shadow cache resolves a patch one frame
+    // after a pixel first asks for it, and since P1 the resolve pass is also
+    // what deposits the irradiance grid (docs/PLAN_gi.md §3) — so a single
+    // frame per camera showed every shot with cold shadows and no bounce from
+    // anything the camera itself was the first to see. Three warm frames at
+    // ~10 ms each cost nothing against the readback. Fresh RenderParams per
+    // frame: the frame counter inside them is what the cache's stamps advance
+    // on.
+    for (int f = 0; f < 4; f++) {
+      WriteRenderParams(ctx.queue, world, eye, c, (float)W / H, true, kShotTime,
+                        kFarFogDensity, 1080.0f, shotTick);
+      rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
+      sim.EncodeShadowResolve(enc);
+      rhi::RenderPass rp =
+          sim.BeginRenderPass(enc, view, rhi::TextureFormat::RGBA8Unorm, W, H);
+      sim.DrawWorld(rp);
+      // Wind slope-field arrows, off unless wind.dbgWindField asks for them.
+      // Headless cannot press F4, and the overlay's whole job is to be LOOKED
+      // at — so the tuning bool is how a screenshot run reaches it, and the
+      // wind block below is what uses that.
+      sim.DrawWindField(rp, CurrentTuning().wind.dbgWindField
+                                ? WindDebugArrowCount(CurrentTuning())
+                                : 0u);
+      // The CURRENT field's arrows, reached the same way and for the same
+      // reason (water plan component 8).
+      sim.DrawCurrentField(rp, CurrentTuning().render.dbgCurrentField
+                                   ? CurrentDebugArrowCount()
+                                   : 0u);
+      rp.End();
+      ctx.queue.Submit(enc.Finish());
+    }
     ctx.WaitIdle();
     grab(path);
   };

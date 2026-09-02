@@ -109,6 +109,23 @@ across GPUs, and it need not be). `--render-budget` gains an `noopenness` arm
 (`opennessStrength=0`); the baseline delta is the cost, state it. `--shot` a cave mouth, a
 ruin interior, and under a canopy; judge by eye. `determinismHash` unmoved.
 
+### Verdict (2026-09-02, `--shot` frames `openness_out/in/floor`, `ground`, `tallgrass_eye`; GI off, so this is P0 alone)
+
+Caves and rooms read dark: the stamped room's interior goes to near-black away from the door,
+with a plausible gradient across the floor from the sunlit wedge back to the far wall, and the
+`openness_floor` frame (straight down at the doorway from inside) shows that gradient as a
+smooth ramp with no visible 40 cm tiling — the bilinear filter is doing its job. Nothing wrong
+darkens: the meadow right up against the room's outer wall in `openness_out` is bit-identical
+to the pre-P0 look, the terrace risers beside it shade as they did (the "no opinion" rule is
+what keeps them so), and the `ground` frame's ruin walls and arch are unchanged where they
+face open sky. The one honest criticism is the interior: at `opennessStrength = 1.0` a room
+with a 7-voxel doorway is TOO dark — the ceiling and back wall are essentially black, which is
+correct for a sky-visibility term and wrong for a lit room, and it is exactly the gap P1 was
+specified to fill. The default stays at 1.0: the fix for a black room is bounce light, not a
+weaker sky term that would also brighten every cave. `debris.wgsl` is wired (per-vertex,
+`opennessScaleAtBody` from the cube's position, `occupancy`/`openness`/`opennessGen` widened
+to the vertex stage), so an ember in a cave no longer glows at full sky ambient.
+
 **Consumers beyond lighting** (not built here, but the buffer is theirs too): worldgen
 openness placement is a different thing (a generation-time closed form, W1-C); audio's "can I
 hear the sky" (research §9) and the wind emitter at the cave mouth read this grid at the
@@ -146,6 +163,73 @@ reflections (research §2.8, distance-widened blur) are a later use of the same 
 **Verify.** `--gate gi-bounce`: a lit green floor next to a white wall in shade; the wall's
 gathered term has G > R. `--render-budget` `nogi` arm. `--shot` the lake shore at noon and a
 ruin interior with one doorway. Hash unmoved.
+
+### P1 status — DONE 2026-09-02, branch `lin-followups` (DESIGN.md §9.y is the binding summary)
+
+What was built, and where it departs from the sketch above:
+
+| Sketch | Built | Why |
+|---|---|---|
+| `atomicAdd` sum + weight word | ONE RGB9E5 word per block-face, blended (EMA: 1/16 per resolve deposit, 1/2 per walk sample), `irrDeposit` in `common.wgsl` | 256 patches per block-face per frame overflow any bounded count in a handful of frames; a per-frame reset needs a frame stamp the word has no room for. The blend converges within a frame where deposits are dense and is bounded by construction. 48 MiB dense (`kIrradianceBytes`, derived). |
+| `irradiance *= 1-k` on the walk | the walk deposits ONE coarse sun sample per face it marches (`openSunSample`: a `traceOpaque` block ray from the face centre, albedo from the first blocker voxel under the centre), zeroes faces of blocks with no surface, and fades only the faces it cannot march by `giDecay` per visit | a blend toward a fresh sample IS the sun-awareness; a plain decay would leave an off-screen face dark until something looked at it. The walk reads `RenderParams` (binding 10 of the sim group, already there for `sim_pick`) for the key light. |
+| 3 directions, `cos θ / d²`, openness-gated | 9 coarse `traceOpaque` rays (normal + 4 tangent diagonals + 4 corners) from a point pushed clear of the receiver's block, solid-angle weights (0.25 / 0.09375), no distance term, no openness gate | stored values are RADIANCE (no falloff, no emitter cosine); an unlit face reads 0 and gates itself. Three rays is asymmetric on every axis-aligned face, five leaves a wall's floor to one ray. |
+
+**Two lessons `--gate gi-bounce` taught**, both now in the code and its comments: (1) the
+gather origin must LEAVE the receiver's own 4³ block along the normal — a wall's block column
+reaches three voxels in front of its face, and a ray starting on the face reported the wall as
+its own emitter on every direction leaning toward the column; (2) the emitter face must come
+from the ray's DIRECTION, not from the block-entry axis — a 45° ray enters a floor block through
+its side as often as its top, and a floor block's side face holds no surface. The first
+version (five rays, cosine × 1/d, entry face) lit a wall beside a sunlit floor at 6% of the
+floor's radiance and then at exactly 0; the true form factor is 0.5, the nine-ray quadrature
+lands at 0.28, and `giStrength` carries the rest. The gate also had to put its floor IN THE
+FRAME (the resolve pass deposits only for requested patches) and write the sun BEFORE the
+ticks that exercise the walk.
+
+**Numbers (RTX 3060 Ti, 1080p, 2026-09-02, one `--render-budget` boot, `SANDVOX_RUN_EXCLUSIVE=1`, no stray process):**
+
+| | noon | dusk |
+|---|---|---|
+| baseline | 11.48 ms | 13.67 ms |
+| `nogi` (gather + both injection paths const-folded) | 10.28 ms | — |
+| P1 cost | **1.20 ms (10.5%)** | — |
+| `noopenness` (same boot) | 11.47 ms | — |
+| `halfres` | 3.31 ms | 3.93 ms |
+
+`--shader-stats`, `raymarch` FS: 128 registers before and after (the cap), spill 64 → 80
+B/thread, binary 1,969 → 1,981 KB. `shadowResolve` 53 → 58 registers, the openness kernels
+40 → 56. `--gate gi-bounce` PASS (wall delta R +2.26, G +5.80, B +1.01 /255; floor word
+(0.085, 0.189, 0.062)); `openness`, `sleep`, `shadow-cache` PASS; `determinism` 01dc3219
+UNMOVED; `--vk-smoke-loud --vk-validation` 19/19, clean. The `shadow-cache` gate pins
+`giStrength = 0` for its arms — its reference arm has no resolve pass and therefore no
+injection, and the bounce (1.87 mean |dL|, 45k pixels still converging between warm frames 3
+and 4) was otherwise the whole disagreement.
+
+**Open, deliberately:** the flicker budget of the EMA at shadow edges (α × the lit/unlit
+spread per face) is not measured by any gate; the walk's coarse sample and the resolve pass's
+fine one disagree by construction on a half-shadowed face and the resolve wins within the
+frame only for faces on screen. The verdict below is what the eye says about both.
+
+**Verdict (2026-09-02, `--shot` GI-off vs GI-on pairs, `build/shots_cmp/*_x2.png`).** The
+`--shot` harness had to change first: one frame per camera showed no bounce at all (the
+resolve pass deposits a frame after it is asked), and the settle ticks ran before any sun was
+written (so the walk deposited nothing) — it renders four frames per camera now and writes the
+sun before the ticks. At `giStrength = 1.0` the effect was there and too soft to matter: the
+ruin's walls beside the meadow in `ground` did not change to the eye (mean delta 0.19/255).
+At **2.0, the shipped default**, the room's outer wall in `openness_out` picks up a warm green
+from the meadow along its lower half and its shaded face reads warmer rather than flat grey;
+in `openness_floor` the wall beside the doorway shows a soft green patch thrown by the sunlit
+floor wedge — the first thing in the engine that looks like light arriving from somewhere;
+the ruin walls in `ground` tint faintly toward the grass. Nothing wrongly brightens: open
+meadow, water, the far cascade and both lava frames are bit-identical between arms (P1 is a
+near-field term and lava is emissive, not sun-lit). The criticisms: the bounce patch on the
+room wall has a visible straight edge where the 4³ emitter faces quantise — a bilinear over
+the emitter faces would soften it, at 4× the reads; and the room interior is still mostly
+dark, because a 7-voxel doorway lights a small floor wedge and one bounce of a small patch is
+a small thing — that is P2's write-back. Per-frame deltas (mean |Δ| per channel /255,
+pixels moved > 2): `openness_out` (1.56, 3.36, 0.77) 29.5%; `openness_floor` (1.94, 2.69,
+1.30) 25.4%; `openness_in` (0.71, 1.00, 0.41) 7.7%; `ground` (0.24, 0.37, 0.11) 4.0%;
+`tallgrass_eye` (0.40, 0.86, 0.13) 9.4%; `pond`/`water`/`far`/`lava*` ≤ 0.16, ≤ 1.2%.
 
 ## 4. P2 — write-back (multi-bounce)
 

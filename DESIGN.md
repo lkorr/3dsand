@@ -4311,13 +4311,77 @@ computed on the CPU — which is what keeps that hash and `common.wgsl`'s
 
 **What P0 does not do.** There is no bounce: a sealed room goes to zero ambient
 and stays there, which is honest for a sky-visibility term and is what P1's
-one-bounce gather is for. Debris cubes and sprites (`debris.wgsl`) still shade
-with the plain lerp — they light per VERTEX, and reaching the grid from a vertex
-shader would mean widening `occupancy`'s stage mask for a per-cube ambient.
+one-bounce gather (below) is for. Debris cubes and sprites (`debris.wgsl`) read
+the grid since 2026-09-02 too: one `opennessScaleAtBody` walk per VERTEX from
+the cube's position, with `occupancy`/`openness`/`opennessGen` widened to the
+vertex stage in `renderBGL_` — a burning ember in a cave no longer glows at
+full sky ambient.
 
-- Later: P1 (direct injection + one-bounce gather), P2 (write-back), P3
-  (emissives, deleting `heatSpill`) — all in `docs/PLAN_gi.md`. Volumetrics for
-  gases.
+### 9.y The irradiance grid — one bounce of direct light (added 2026-09-02)
+
+Plan of record: **`docs/PLAN_gi.md`** §3 (phase P1). Binding summary:
+
+**The data.** `irradiance`: one RGB9E5 word per (chunk slot, 4³ block, face) at
+the SAME index as the openness byte (`irrIndex` in `common.wgsl`), under the
+SAME per-slot stamp (`opennessGen`), `kIrradianceBytes` = 48 MiB. The value is
+the direct-lit RADIANCE leaving that block-face: albedo × sun colour × Lambert
+× lit, averaged over what has been seen of it. Render-only derived data with
+exactly the openness grid's standing — never hashed, never saved, the sim has
+no binding for it — and `determinismHash` unmoved is P1's cheapest proof.
+
+**Two writers, one blend.** The shadow resolve pass (`shadow_resolve.wgsl`)
+deposits for every patch it publishes — it already knows the patch's cell, face
+and shadow term, and one voxel-word read gives the albedo — so anything on
+screen is injected every frame. The openness walk (`sim_openness.wgsl`)
+deposits ONE coarse sun sample per face it marches (a `traceOpaque` block ray
+from the face centre, the first blocker voxel under the centre for albedo), so
+faces nobody is looking at follow the sun within `kNumChunks /
+opennessChunksPerFrame` ticks; a face it cannot march (a blocker in front)
+fades by `render.giDecay` per visit, and a block with no surface reads 0.
+Both blend into the word with an EMA (`irrDeposit`: 1/16 per resolve deposit,
+1/2 per walk sample) rather than summing — 256 patches per block-face per
+frame overflow any bounded sum-and-count, and a per-frame reset needs a frame
+stamp the word has no room for. The blend converges within a frame where
+deposits are dense, over a few frames where they are sparse, is bounded by
+construction, and its races (plain read-modify-write between patches of one
+face) cost at most a lost sample. A slot the window has reused starts its
+blend from zero (the stamp read in the resolve pass is for that).
+
+**The reader** is `giGather` in `raymarch.wgsl`, at every near-field hit:
+nine `traceOpaque` block rays from a point pushed clear of the receiver's own
+4³ block along the normal (the normal, four 45° tangent diagonals, four
+corners), each stopping at the first blocker block, whose faces that face the
+receiver are read (one per axis the direction leans on, weighted by that
+axis's share) and summed with cosine-weighted solid-angle weights (0.25 for
+the normal's 30° cone, 0.09375 for each ring ray). The result is a mean
+radiance of what the surface sees; `albedo × ao × gathered × render.giStrength`
+is added to the shade. Two lessons the gate taught, both now in the code: the
+origin MUST leave the receiver's block (a wall's block column reaches three
+voxels in front of its face, and a ray starting on the face reports the wall
+as its own emitter), and the emitter face MUST be chosen from the direction,
+not the block-entry axis (a 45° ray enters a floor block through its side as
+often as its top). Five rays weighted by cosine and distance gave a wall beside
+a sunlit floor 6% of the floor's radiance; the nine-ray quadrature gives 0.28
+against a true form factor of 0.5, and `giStrength` carries the rest.
+
+**Knobs** (`render.*`): `giStrength` (2.0 — at 1.0 the ruin walls beside the meadow did
+not change to the eye, and the quadrature's 0.28 against a form factor of 0.5 is the
+reason; 0 is an exact off switch — gather,
+resolve deposit and walk sample all const-fold, the `nogi` `--render-budget`
+arm), `giDecay` (0.25), `giFeedback` (0, P2; `LoadTuning` keeps it strictly
+below `giDecay`), `giGatherBlocks` (3).
+
+**Verified by** `--selftest --gate gi-bounce`: a white `bone` wall on the -X
+edge of a floating 41×41 `leaves` slab at noon; the wall's +X face rendered
+with `giStrength` at its default and at 0 differs by R +2.26, G +5.80,
+B +1.01 per 255 over the middle of the frame (G ≥ 2.0 and G − R ≥ 1.0 from
+`tests/baseline.json`), and the slab's own +Y word reads green-led. The
+`shadow-cache` gate pins `giStrength = 0` for its arms: its reference arm has
+no resolve pass and so no injection, and the bounce would otherwise be the
+whole disagreement.
+
+- Later: P2 (write-back) and P3 (emissives, deleting `heatSpill`) — in
+  `docs/PLAN_gi.md`. Volumetrics for gases.
 
 ## 9b. Wind (added 2026-08-25)
 

@@ -278,7 +278,10 @@ bool Simulation::Init(const rhi::Device& device, World& world,
     using S = rhi::ShaderStage;
     rhi::BindGroupLayoutEntry entries[] = {
         entry(0, T::ReadOnlyStorage, S::Fragment),               // voxels
-        entry(1, T::ReadOnlyStorage, S::Fragment),               // occupancy
+        // occupancy is VERTEX-visible too since P0's debris wiring: debris.wgsl
+        // lights per vertex and opennessScaleAtBody walks the blockers mask
+        // down to the ground under the cube (docs/PLAN_gi.md §2 verdict).
+        entry(1, T::ReadOnlyStorage, S::Fragment | S::Vertex),   // occupancy
         entry(2, T::ReadOnlyStorage, S::Fragment | S::Vertex),   // materials
         entry(3, T::Uniform, S::Fragment | S::Vertex),           // RenderParams
         entry(4, T::ReadOnlyStorage, S::Fragment),               // farVox
@@ -335,8 +338,8 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         // and the debris/sprite pipelines share renderBGL_ as group 0, and
         // ambientAtP has to reach the same bytes or a mob glows in a cave
         // (PLAN_gi.md §1, last bullet).
-        entry(17, T::ReadOnlyStorage, S::Fragment),   // openness
-        entry(18, T::ReadOnlyStorage, S::Fragment),   // opennessGen
+        entry(17, T::ReadOnlyStorage, S::Fragment | S::Vertex),   // openness
+        entry(18, T::ReadOnlyStorage, S::Fragment | S::Vertex),   // opennessGen
         // The irradiance grid (docs/PLAN_gi.md §3). Storage, not ReadOnly, so
         // P2's write-back (the receiver's gathered term feeds its own face)
         // needs no layout change; P1's raymarch declares it `read`.

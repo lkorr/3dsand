@@ -2365,7 +2365,7 @@ struct Tuning {
     // ---- one-bounce indirect light (docs/PLAN_gi.md §3) ----
     // The irradiance grid: injected by the shadow resolve pass and the
     // openness walk, gathered at every near-field hit. Render-only.
-    float giStrength = 1.0f;            // 0 = everything const-folded away
+    float giStrength = 2.0f;            // 0 = everything const-folded away
     float giDecay = 0.25f;              // per-visit fade of unmeasurable faces
     float giFeedback = 0.0f;            // P2 write-back weight, < giDecay
     int giGatherBlocks = 3;             // blocks per gather ray

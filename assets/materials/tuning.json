@@ -703,7 +703,7 @@
     "opennessChunksPerFrame": 256,
     "opennessStrength": 1,
     "opennessBilinear": 1,
-    "giStrength": 1,
+    "giStrength": 2,
     "giDecay": 0.25,
     "giFeedback": 0,
     "giGatherBlocks": 3,

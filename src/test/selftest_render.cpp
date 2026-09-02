@@ -1226,7 +1226,17 @@ Status GateShadowCache(Ctx& c, std::string& detail) {
   cam.yaw = 0.785f;    // toward +X+Z, i.e. at the slab
   cam.pitch = -0.30f;
 
-  const Tuning base = CurrentTuning();
+  // THE BOUNCE IS NOT UNDER TEST HERE, and it cannot be in the picture: the
+  // reference arm has no resolve pass, and since P1 (docs/PLAN_gi.md §3) the
+  // resolve pass is also what injects the irradiance grid, so with GI on the
+  // cache arm is lit by bounce the reference arm never receives — measured
+  // 1.87 mean |dL| of pure indirect light, and 45k pixels moving between warm
+  // frames 3 and 4 as the grid's blend converged. Every arm below runs with
+  // giStrength 0 so the only difference left is the shadow term; `orig` is
+  // what gets restored.
+  const Tuning orig = CurrentTuning();
+  Tuning base = orig;
+  base.render.giStrength = 0.0f;
 
   // BUDGET UNDER THE LIGHTING THE GAME IS PLAYED IN. WriteRenderParams derives
   // the sun from the celestial cycle, not from its `time` argument, and at an
@@ -1563,7 +1573,7 @@ Status GateShadowCache(Ctx& c, std::string& detail) {
     WriteBmpFile("build/shadow_walk_diff.bmp", diff, W, H);
   }
   got = got && walkOk;
-  SetCurrentTuning(base);
+  SetCurrentTuning(orig);
   const bool restored = sim.ReloadShaders(ctx.device);
   if (!got || !restored) {
     detail = got ? "shader restore failed" : "render/readback failed";

@@ -314,7 +314,7 @@ TP_I(render, opennessBilinear, TUNE_OPENNESS_BILINEAR, 1)
 // off switch: the gather, the resolve-pass injection and the walk's sun
 // sample all const-fold away, which is what the `nogi` --render-budget arm
 // measures.
-TP_F(render, giStrength, TUNE_GI_STRENGTH, 1.0f)
+TP_F(render, giStrength, TUNE_GI_STRENGTH, 2.0f)
 // Fraction of a face's irradiance the openness walk forgets per visit when it
 // cannot re-measure the face (its front block holds a blocker, so no sun ray
 // can be cast from it) -- how fast light deposited under an old sun fades

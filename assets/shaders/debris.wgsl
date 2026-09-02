@@ -7,8 +7,17 @@
 // ambient + emissive), matching the terrain's look closely enough that flying
 // voxels read as the same material.
 
+// The blockers mask and the openness grid (docs/PLAN_gi.md §2), so a cube is
+// lit like the ground under it — opennessScaleAtBody in common.wgsl, the same
+// read microbody.wgsl makes per fragment, made here per VERTEX from the cube's
+// centre (eight reads per cube; the raster stage is nowhere near the frame's
+// cost). Without it a burning ember or a thrown grenade glowed at full sky
+// ambient in the middle of a cave.
+@group(0) @binding(1) var<storage, read> occupancy : array<u32>;
 @group(0) @binding(2) var<storage, read> materials : array<Material>;
 @group(0) @binding(3) var<uniform> R : RenderParams;
+@group(0) @binding(17) var<storage, read> openness    : array<u32>;
+@group(0) @binding(18) var<storage, read> opennessGen : array<u32>;
 
 @group(1) @binding(0) var<storage, read> particles : array<Particle>;
 
@@ -119,7 +128,8 @@ fn vsParticle(@builtin(vertex_index) vi : u32,
 
   var out : VSOut;
   out.pos = projectView(world - R.camPos, R);
-  out.color = litColor(albedo, n, world, f32(m.emission) / 255.0, R);
+  out.color = litColorO(albedo, n, world, f32(m.emission) / 255.0, R,
+                        opennessScaleAtBody(world, &occupancy, &openness, &opennessGen));
   return out;
 }
 
@@ -154,7 +164,8 @@ fn vsBody(@builtin(vertex_index) vi : u32,
   // counterparts in raymarch.wgsl — same rate, per-voxel phase
   let fh = pcg(inst * 2917u + (b.packed >> 16u) * 131u);
   let emis = emberFlicker(f32(m.emission) / 255.0, fh, R.time);
-  out.color = litColor(albedo, wn, world, emis, R);
+  out.color = litColorO(albedo, wn, world, emis, R,
+                        opennessScaleAtBody(world, &occupancy, &openness, &opennessGen));
   return out;
 }
 
@@ -210,7 +221,8 @@ fn vsFluid(@builtin(vertex_index) vi : u32,
   albedo = mix(albedo, vec3f(0.92, 0.95, 0.98), foam);
   var out : VSOut;
   out.pos = projectView(world - R.camPos, R);
-  out.color = litColor(albedo, n, world, 0.0, R);
+  out.color = litColorO(albedo, n, world, 0.0, R,
+                        opennessScaleAtBody(world, &occupancy, &openness, &opennessGen));
   return out;
 }
 
@@ -223,7 +235,8 @@ fn vsSprite(@builtin(vertex_index) vi : u32,
   let world = s.pos + off;
   var out : VSOut;
   out.pos = projectView(world - R.camPos, R);
-  out.color = litColor(unpackColor(s.color), n, world, s.emission, R);
+  out.color = litColorO(unpackColor(s.color), n, world, s.emission, R,
+                        opennessScaleAtBody(world, &occupancy, &openness, &opennessGen));
   return out;
 }
 
