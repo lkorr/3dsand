@@ -38,6 +38,7 @@ JSONs).
 ```
 [ATTACH] [Attach|Erase|Paint] [Voxel|Box|Face|Select] [Mirror X]   [Undo][Redo][?]
 [open ▾][↻][new… ▾][Save][Save as…]        ■ material name     status line
+anatomy [Peel −] 0 [Peel +] [Unpeel]  [Fill layer] [Apply recipe]
 [palette swatches]
 ┌────────────────────────────────┐ ┌──────────────┐
 │                                │ │ Models        │
@@ -198,7 +199,38 @@ inline.
   phase and each foot's state (▲ swinging ▼ planted). The preview-speed
   slider sweeps the same speed factor the engine derives from velocity.
 
-### 4.4 Save
+### 4.4 What is under the skin (the anatomy row)
+
+A limb is solid, and the engine keeps every enclosed voxel — a cut, a burn or a
+severed joint shows whatever is inside. The **anatomy** toolbar row is how you
+author that inside without digging:
+
+- **Peel + / Peel −** (`PageDown` / `PageUp`) hide the outermost layer of
+  *every* limb, one depth layer at a time. Depth is measured from the surface
+  over the whole assembled creature, so the face where a thigh meets the hips
+  counts as interior and gets bone like the rest. Peeled voxels are not drawn
+  and not picked: the brushes, the noise brush and the eyedropper all work on
+  the layer you can see. The status line says what is exposed
+  (`PEEL 2/7 exposed 1240: muscle 91% blood 6% bone 3%`).
+- **Fill layer** paints the whole exposed layer of the active model (every
+  visible model in Whole mode) with the active material. Art colour is
+  cleared unless a brush colour is set — an interior voxel wearing the skin's
+  paint would show the paint, not the material, in-game. One `Ctrl+Z`.
+- **Apply recipe** rewrites the entire interior by depth from the sidecar's
+  `"anatomy"` block (see `assets/mobs/human.json`: skin kept, flesh, muscle
+  speckled with blood, bone core; a bone skull around a flesh brain for the
+  head; `garments` name surface materials that are clothes so skin goes under
+  them). A sidecar with no recipe gets the stock human one written in. The
+  painted surface is never touched. One `Ctrl+Z`.
+
+The loop the row is built for: peel once, look, change the material of what
+shows (Fill layer, or a brush), peel again, repeat, **Unpeel**, Save. The same
+recipe bakes from the command line — `node scripts/anatomize_mob.mjs <mob>`
+— and `node scripts/test_anatomy.mjs` asserts the committed human matches
+its own recipe. A creature made of steel under a painted shell is a different
+recipe in its sidecar, not a different tool.
+
+### 4.5 Save
 
 Save to `mobs/name.vox`; the sidecar `mobs/name.json` is written next to it
 with all rig data. Fields this editor doesn't know about are preserved
@@ -401,6 +433,7 @@ Three routes, all engine-supported:
 | `Ctrl+Z` / `Ctrl+Y` | anywhere | undo / redo |
 | `Ctrl+S` | anywhere | save model (+ sidecar) |
 | `Esc` | viewport | clear selection |
+| `PageDown` / `PageUp` | viewport | peel / unpeel one depth layer (anatomy row) |
 | `Space` | timeline | play / stop flipbook |
 | `[` / `]` | timeline | step frame |
 | `D` | timeline | duplicate frame |

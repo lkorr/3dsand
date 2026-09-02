@@ -879,11 +879,17 @@ Status GateArmorReact(Ctx& c, std::string& detail) {
   int diedDressed = -1, diedBare = -1;
 
   // One arm of the differential. Returns the fraction of the covered limb's
-  // skin lost on each creature.
+  // skin lost on each creature, and -- since the human grew an interior
+  // (DESIGN.md §7 "What is under the skin") -- the covered limb's WHOLE voxel
+  // count and how many of those voxels went, whatever they were made of.
+  // Skin is now a one-voxel shell (1,619 of the 6,057-voxel torso), so a
+  // fraction "of the skin" is four times as jumpy as the same leak measured
+  // against the limb.
   auto bath = [&](const ItemDef& piece, int slot, uint32_t soakMat, int soakUp,
                   int ticks, int inset, uint32_t& lostDressed,
                   uint32_t& lostBare, uint32_t& shellStart, uint32_t& shellEnd,
-                  uint32_t& dressedSkin0, int* firstDressed, int* firstBare) {
+                  uint32_t& dressedSkin0, uint32_t& dressedVox0,
+                  uint32_t& lostVoxDressed, int* firstDressed, int* firstBare) {
     debris.Reset();
     mobs.Reset();
     SubmitWorldgen(ctx, world, sim, kDefaultSeed);
@@ -946,6 +952,9 @@ Status GateArmorReact(Ctx& c, std::string& detail) {
     const uint32_t a0 = limbMat(a, coveredIdx, mSkin);
     const uint32_t b0 = limbMat(b, controlIdx, mSkin);
     dressedSkin0 = a0;
+    const uint32_t v0 = mobs.LimbArtVoxelCount(a, coveredIdx);
+    dressedVox0 = v0;
+    uint32_t liveVoxA = v0;
     // SAMPLED EVERY TICK, never read only at the end. A creature held in a
     // blaze dies, at which point every census reads zero and an end-state
     // comparison reports "100% gone" for both and proves nothing.
@@ -965,6 +974,7 @@ Status GateArmorReact(Ctx& c, std::string& detail) {
       if (!mobs.IsAlive(a) || !mobs.IsAlive(b)) break;
       liveSkinA = limbMat(a, coveredIdx, mSkin);
       liveSkinB = limbMat(b, controlIdx, mSkin);
+      liveVoxA = mobs.LimbArtVoxelCount(a, coveredIdx);
       liveShell = limbMat(a, shell, mSteel) + limbMat(a, shell, mCloth);
       if (firstDressed && *firstDressed < 0 && liveSkinA < a0)
         *firstDressed = i;
@@ -975,15 +985,17 @@ Status GateArmorReact(Ctx& c, std::string& detail) {
     }
     lostDressed = a0 - liveSkinA;
     lostBare = b0 - liveSkinB;
+    lostVoxDressed = v0 - liveVoxA;
     shellEnd = liveShell;
     return true;
   };
 
   // ---- a + b. cloth in fire -----------------------------------------------
   {
-    uint32_t lostA = 0, lostB = 0, s0 = 0, s1 = 0, skin0 = 0;
+    uint32_t lostA = 0, lostB = 0, s0 = 0, s1 = 0, skin0 = 0, vox0 = 0,
+             lostVox = 0;
     if (!bath(cloak, cloakSlot, mFire, 18, 120, 200, lostA, lostB, s0, s1,
-              skin0, &coveredFirstLoss, &controlFirstLoss)) {
+              skin0, vox0, lostVox, &coveredFirstLoss, &controlFirstLoss)) {
       detail = "could not dress the rig for the fire arm";
       return Status::Fail;
     }
@@ -1047,9 +1059,10 @@ Status GateArmorReact(Ctx& c, std::string& detail) {
 
   // ---- c. steel in acid ----------------------------------------------------
   {
-    uint32_t lostA = 0, lostB = 0, s0 = 0, s1 = 0, skin0 = 0;
+    uint32_t lostA = 0, lostB = 0, s0 = 0, s1 = 0, skin0 = 0, vox0 = 0,
+             lostVox = 0;
     if (!bath(plate, plateSlot, mAcid, 4, 120, 250, lostA, lostB, s0, s1,
-              skin0, nullptr, nullptr)) {
+              skin0, vox0, lostVox, nullptr, nullptr)) {
       detail = "could not plate the rig for the acid arm";
       return Status::Fail;
     }
@@ -1110,15 +1123,26 @@ Status GateArmorReact(Ctx& c, std::string& detail) {
     // and `lostB > 0` is all that is needed from the other arm to know the
     // bath was really acid. Same lesson as the fire arm above -- assert the
     // mechanic, not the arithmetic between two uncontrolled baths.
-    const bool spared = skin0 > 0 && (uint64_t)lostA * 100u < (uint64_t)skin0;
+    // Skin lost, measured against the LIMB rather than against its skin.
+    // When this was written the two were the same number (a limb was skin
+    // all the way through); since the human has an interior the skin is a
+    // one-voxel shell, and the same ~19-voxel joint leak that was 0.3% of a
+    // 6,057-voxel torso is 1.2% of its 1,619-voxel shell. The plate protects
+    // the limb, so the limb is the denominator; the numerator stays the skin
+    // count so the claim is the one it always was. The whole-voxel figure is
+    // printed beside it because acid on a body CONVERTS the contact voxel
+    // rather than deleting it (17 skin gone, 0 voxels gone) -- a reader who
+    // sees only the second number would call the plate perfect.
+    const bool spared = vox0 > 0 && (uint64_t)lostA * 100u < (uint64_t)vox0;
     const bool cOk = lostB > 0 && s0 > 0 && s1 == s0 && spared;
     const int ticksA = diedDressed < 0 ? 120 : std::max(1, diedDressed);
     std::printf(
-        "  steel stops acid: %s (plate %u -> %u steel; plated limb lost %u of "
-        "%u skin = %.2f%% in %d ticks, bare lost %u; died dressed %s bare "
-        "%s)\n",
-        cOk ? "PASS" : "FAIL", s0, s1, lostA, skin0,
-        skin0 ? 100.0f * (float)lostA / (float)skin0 : 0.0f, ticksA, lostB,
+        "  steel stops acid: %s (plate %u -> %u steel; plated limb lost %u "
+        "skin of its %u voxels = %.2f%% (%u of %u skin, %u voxels removed) in "
+        "%d ticks, bare lost %u skin; died dressed %s bare %s)\n",
+        cOk ? "PASS" : "FAIL", s0, s1, lostA, vox0,
+        vox0 ? 100.0f * (float)lostA / (float)vox0 : 0.0f, lostA, skin0,
+        lostVox, ticksA, lostB,
         diedDressed < 0 ? "no" : std::to_string(diedDressed).c_str(),
         diedBare < 0 ? "no" : std::to_string(diedBare).c_str());
     ok = ok && cOk;

@@ -2734,6 +2734,44 @@
       "tags": [
         "mineral"
       ]
+    },
+    {
+      "//": "ANATOMY (assets/editor/anatomy.js; DESIGN.md §7 'What is under the skin'). The human is no longer skin all the way through: a sidecar recipe paints its interior by depth -- skin, then this, then muscle, then bone -- so a cut face, a burn-through or a peeled limb in the tuner shows layers instead of more skin. Subcutaneous flesh: the pale layer one voxel under the skin. Enters the SAME burn chain as skin (reactions.json, 'flesh + tag:hot -> flesh_cooked') so a body burns through its layers on one clock; bone has no fire rules and survives by construction.",
+      "id": "flesh",
+      "class": "solid",
+      "density": 950,
+      "hardness": 6,
+      "rubble": "blood",
+      "colors": [
+        "#e0a090",
+        "#d08f7f",
+        "#ebb0a0"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable"
+      ],
+      "molten": "fire"
+    },
+    {
+      "//": "The red layer under the flesh and the bulk of a limb (see `flesh`). Denser and a little harder than skin so the derived collider's mass reads as meat, not fat; the anatomy recipe speckles it with `blood` so a cross-section is not one flat red.",
+      "id": "muscle",
+      "class": "solid",
+      "density": 1060,
+      "hardness": 10,
+      "rubble": "blood",
+      "colors": [
+        "#8f2a2a",
+        "#7a2222",
+        "#a33636"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable"
+      ],
+      "molten": "fire"
     }
   ]
 }

@@ -150,6 +150,9 @@ a corrupted bystander — and the counter is asserted zero by every gate.
 A creature is `meat` everywhere — that is what the CA reacts to, what a severed
 limb becomes when it lands in the grid, what a fire spreads through — but its
 skin is *painted per voxel*: different colours for eyes, tongue, claws, belly.
+(Since 2026-09-02 the human is meat only on the OUTSIDE — §7 "What is under
+the skin" — but the split this section describes is unchanged: material is
+what a voxel *is*, paint is what its surface *shows*.)
 Material and colour are therefore two independent facts about a skin voxel, and
 they live in two separate channels.
 
@@ -2297,6 +2300,77 @@ touch a creature with a sword, lose a limb, anywhere, every time.
 
 Gated by `wound-chip` / `wound-accumulate` / `wound-heft` / `wound-bleed`, with
 the hit-count BAND (not an exact count) in `tests/baseline.json`.
+
+### What is under the skin (2026-09-02; `assets/editor/anatomy.js`, sidecar `anatomy`, `scripts/anatomize_mob.mjs`)
+
+Every limb was skin all the way through. A cut face showed skin, a burn-through
+showed skin, and the "paint an organ as a distinct material" answer the carving
+section above gives had no organs to point at. The human now has an interior:
+skin one voxel deep, `flesh` under it, `muscle` under that (speckled with
+`blood`), and `bone` at the core; the head is a two-voxel bone skull around a
+flesh brain.
+
+**This is authoring, not engine.** Every runtime consumer was already per
+voxel: `voxload` keeps enclosed cells, the micro brick is dense and its march
+stops at the first solid cell (an interior costs memory and nothing else until
+a carve exposes it), `CarveLimb` / `CutLimb` / the burn front / gib particles /
+settle-back all read the voxel's own material. So the interior is baked into
+`human.vox` as ordinary per-voxel materials and nothing in C++ learned a new
+concept. What was added:
+
+- **A depth field.** `unionDepth` measures depth-from-surface over the UNION
+  of every limb at its prefab offset — not per limb — so the joint faces
+  where a thigh meets the hips read as interior and a severed limb shows bone
+  and muscle on its cut face instead of a skin cap. Depth 0 is any voxel with
+  an empty 6-neighbour; depth *n* is *n* 6-connected steps in.
+- **A recipe, in the sidecar, by name.** `human.json` → `"anatomy"`: an
+  outermost-first list of `{material, depth}` layers with an open-ended core,
+  optional per-limb overrides (`limbs.head`), `garments` (surface voxels that
+  are clothes — the voxel under the linen shorts is skin, not flesh; the
+  deeper schedule is unchanged so the bone core does not move), and a
+  `speckle` on any layer (a hash fraction of it swapped for another material;
+  the hash is on prefab coordinates so applying the recipe twice is a no-op).
+  Layer 0 is `keep: true`: the recipe never touches the painted surface, and
+  every voxel it does write has its art slot CLEARED, because a nonzero art
+  slot overrides the material colour in `microbody.wgsl` and painted flesh
+  would show the skin's paint. A cyborg is a different recipe over the same
+  tool (`{steel}` under a `{skin}` shell, or `{chrome}` at depth 0 without
+  `keep`), never a different tool — design guideline 4.
+- **Two materials and two rules.** `flesh` (117) and `muscle` (118) enter the
+  skin's burn chain by the same `tag:hot → flesh_cooked` entry rule at the
+  same chance, so a limb burns through its layers on one clock. `bone` has
+  no fire rules and survives by construction, as the flesh chain's note
+  always said it would. Mob voxel material ids must stay ≤ 127 — the art
+  palette owns 128..255 — which leaves nine slots after these two.
+- **The tuner's peel.** The Models tab has an *anatomy* row: **Peel** hides
+  the outermost depth layer of every limb (PageDown / PageUp), peeled voxels
+  are neither drawn nor picked so every brush lands on what the peel
+  exposes, **Fill layer** paints the whole exposed layer with the active
+  material, and **Apply recipe** runs `planAnatomy` through the undo log (a
+  sidecar without a recipe gets the stock human one written into it). The
+  depth field is a snapshot taken when peeling starts, not re-derived per
+  stroke: depth is measured from the surface, so re-measuring after every
+  erase would make the hole you just cut re-skin its own walls and vanish
+  under the peel.
+
+What the interior changes at runtime, all of it a consequence of materials
+already being per voxel: the derived collider's plurality blocks take flesh
+/ muscle / bone materials inside a limb, so limb MASS follows the recipe
+(`densityOfMat` in `CreateDebrisBodyXf`); a gibbed or settled limb puts bone
+and muscle in the world grid; the burn gate's body census counts flesh and
+muscle as body and as charrable flesh (bone in neither). What it does NOT do
+yet, stated so nobody infers it from a screenshot: hp per carved voxel is
+still pure volume (`kCarveDamagePerVolume`) — bone costs what skin costs;
+`StainWound` soaks any material inside its sphere, bone included; and
+severing (`Sever`) still does nothing to the cross-section, which is now
+exactly why it needs nothing.
+
+Verified by `node scripts/test_anatomy.mjs` (the depth field on a two-model
+block whose seam must read interior, the schedule, garments, speckle,
+idempotence, an unknown material refused; then the committed `human.vox`
+must match its own recipe, every limb must have a bone core, and no paint
+may sit below depth 0) and by the existing `mob-burn` / wound / armour gates
+running over the baked model.
 
 ---
 

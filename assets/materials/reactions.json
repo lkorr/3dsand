@@ -997,6 +997,21 @@
       "neighbor": "tag:hot",
       "chance": 11,
       "selfBecomes": "ember"
+    },
+    {
+      "note": "ANATOMY. `flesh` and `muscle` are the interior layers the human's anatomy recipe bakes under its skin (assets/editor/anatomy.js). They enter the skin's burn chain at the same chance, on the same entry rule, so once fire has charred the skin off a limb the layer it exposes cooks on the same clock rather than sitting there pink and inert. Bone deliberately has NO rule here -- see the note above the flesh_cooked chain."
+    },
+    {
+      "self": "flesh",
+      "neighbor": "tag:hot",
+      "chance": 90,
+      "selfBecomes": "flesh_cooked"
+    },
+    {
+      "self": "muscle",
+      "neighbor": "tag:hot",
+      "chance": 90,
+      "selfBecomes": "flesh_cooked"
     }
   ]
 }

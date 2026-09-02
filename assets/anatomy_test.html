@@ -1,0 +1,201 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>anatomy peel harness</title>
+<!--
+  anatomy_test.html — does the Models tab's ANATOMY row do what its buttons
+  say, on the real page?
+
+  `node scripts/test_anatomy.mjs` covers the arithmetic (assets/editor/anatomy.js
+  is pure). What it cannot see is the half that lives in editor.js and the DOM:
+  that a peel actually removes cubes from the InstancedMesh, that the exposed
+  layer is what "Fill layer" paints, that one Undo takes the fill back, that
+  "Apply recipe" restores the committed interior, and that none of it throws
+  inside the rAF loop (which is silent from outside). So this drives the real
+  tuner.html in an iframe against the real server, the way attacks_test.html
+  does, and measures.
+-->
+<style>body{background:#0e1116;color:#cfd8e3;font:13px/1.5 monospace;margin:0}
+pre#out{padding:12px;white-space:pre-wrap}
+iframe{position:absolute;left:-4000px;width:1400px;height:980px;border:0}
+body.shot pre#out{display:none}
+body.shot iframe{position:static;left:0;width:1400px;height:1000px}</style>
+<pre id="out">running…</pre>
+<iframe id="f" src="tuner.html"></iframe>
+<script>
+const out = document.getElementById('out');
+const log = [];
+let fail = 0;
+// Every line is POSTed as it lands, so a run that never reaches done() still
+// leaves its last words in build/perfview_result.txt for the shell to show.
+function post() {
+  try { fetch('/api/testresult', { method: 'POST', body: log.join('\n') }); } catch (e) {}
+}
+function say(ok, msg, detail) {
+  log.push((ok ? 'PASS  ' : 'FAIL  ') + msg + (detail ? '\n        ' + detail : ''));
+  if (!ok) fail++;
+  out.textContent = log.join('\n');
+  post();
+}
+function note(msg) { log.push('      ' + msg); out.textContent = log.join('\n'); post(); }
+function done() {
+  const text = log.join('\n') + '\n\nRESULT ' + (fail ? 'FAIL(' + fail + ')' : 'OK');
+  out.textContent = text;
+  document.title = fail ? 'FAIL' : 'OK';
+  // The verdict goes to the server, not to --dump-dom: the Models tab's rAF
+  // loop never lets a virtual clock run out (see scripts/check_anatomy.sh).
+  try { fetch('/api/testresult', { method: 'POST', body: text }); } catch (e) {}
+}
+// Real time, not timer time (see attacks_test.html): a network round-trip is
+// the one thing --virtual-time-budget cannot fast-forward.
+// Plain timers: this harness runs in REAL time (no --virtual-time-budget, see
+// scripts/check_anatomy.sh), so setTimeout means what it says. Polling the
+// server instead, the attacks harness's trick for a virtual clock, is what
+// hung here: under swiftshader each fetch callback waits behind a 26k-cube
+// render, and a poll-count bound became a half-hour wait.
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+async function until(pred, ms = 30000, step = 200) {
+  const t0 = Date.now();
+  while (Date.now() - t0 < ms) { if (pred()) return true; await sleep(step); }
+  return pred();
+}
+const btn = (root, text) =>
+  [...root.querySelectorAll('button')].find(b => b.textContent.trim() === text);
+
+const SHOT = new URLSearchParams(location.search).has('shot');
+if (SHOT) document.body.classList.add('shot');
+
+(async () => {
+try {
+  const f = document.getElementById('f');
+  await new Promise(r => f.addEventListener('load', r, {once: true}));
+  const doc = f.contentDocument;
+  const win = f.contentWindow;
+  const errors = [];
+  win.addEventListener('error', e =>
+    errors.push((e.message || 'error') + ' @ ' + (e.filename || '?') + ':' + e.lineno));
+  win.addEventListener('unhandledrejection', e =>
+    errors.push('unhandled rejection: ' + (e.reason && e.reason.message || e.reason)));
+
+  // ---- boot the Models tab, open the human ------------------------------
+  const modelsTab = [...doc.querySelectorAll('nav.tabs button[data-tab]')]
+    .find(b => b.dataset.tab === 'models');
+  if (!modelsTab) { say(false, 'the tuner has a Models tab'); return done(); }
+  note('tuner loaded; opening the Models tab');
+  modelsTab.click();
+  const view = doc.querySelector('#view-models');
+  const ready = await until(() => !!view.querySelector('.edtimeline'));
+  say(ready, 'the Models tab booted (three.js + editor.js + rig.js)');
+  if (!ready) return done();
+
+  let picker = null, human = null;
+  await until(() => {
+    for (const s of doc.querySelectorAll('select')) {
+      const o = [...s.options].find(o => /mobs\/human\.vox$/.test(o.value));
+      if (o) { picker = s; human = o; return true; }
+    }
+    return false;
+  });
+  if (!human) { say(false, 'assets/mobs/human.vox is in the model picker'); return done(); }
+  note('picker lists ' + human.value + '; opening it');
+  picker.value = human.value;
+  picker.dispatchEvent(new win.Event('change', {bubbles: true}));
+  note('change dispatched; waiting for the rig rows');
+  const loaded = await until(() =>
+    [...view.querySelectorAll('*')].some(e => e.textContent === 'armU.R'));
+  say(loaded, 'human.vox loaded with its rig sidecar');
+  if (!loaded) return done();
+
+  // The same module instances the page runs: an ES module is cached per
+  // realm by URL, so importing from inside the iframe hands back the live
+  // editor, not a second copy with its own empty document.
+  const ED = await win.eval("import('./editor/editor.js')");
+  const ANA = await win.eval("import('./editor/anatomy.js')");
+  const d = ED.getDoc();
+  const total = d.models.reduce((n, m) => n + m.grid.data.reduce((a, v) => a + (v ? 1 : 0), 0), 0);
+  await until(() => ED.drawnInstances() === total, 8000);
+  say(ED.drawnInstances() === total, `unpeeled, every voxel is drawn (${ED.drawnInstances()} of ${total})`);
+
+  // ---- the anatomy row exists --------------------------------------------
+  const peelPlus = btn(view, 'Peel +'), peelMinus = btn(view, 'Peel −');
+  const unpeel = btn(view, 'Unpeel'), fill = btn(view, 'Fill layer');
+  const apply = btn(view, 'Apply recipe'), undo = btn(view, 'Undo');
+  say(!!(peelPlus && peelMinus && unpeel && fill && apply && undo), 'the anatomy row has its buttons');
+  if (!(peelPlus && fill && apply && undo && unpeel)) return done();
+
+  // ---- peel 1: the skin comes off -----------------------------------------
+  const field = ANA.unionDepth(d);
+  const deeperThan = k => d.models.reduce((n, m) => {
+    let c = 0;
+    for (let z = 0; z < m.dim.z; z++) for (let y = 0; y < m.dim.y; y++) for (let x = 0; x < m.dim.x; x++)
+      if (m.grid.data[x + y * m.dim.x + z * m.dim.x * m.dim.y] && ANA.depthAt(field, m, x, y, z) >= k) c++;
+    return n + c;
+  }, 0);
+  peelPlus.click();
+  const want1 = deeperThan(1);
+  await until(() => ED.drawnInstances() === want1, 8000);
+  say(ED.peelLevel() === 1, 'Peel + set peel 1');
+  say(ED.drawnInstances() === want1,
+    `peel 1 draws exactly the voxels at depth >= 1 (${ED.drawnInstances()} drawn, ${want1} expected, ${total - want1} hidden)`);
+  const status = view.querySelector('.edstatus');
+  say(!!status && /PEEL 1\/\d+ exposed \d+/.test(status.textContent),
+    'the status line reports the peel', status && status.textContent.slice(-90));
+
+  peelPlus.click();
+  const want2 = deeperThan(2);
+  await until(() => ED.drawnInstances() === want2, 8000);
+  say(ED.peelLevel() === 2 && ED.drawnInstances() === want2,
+    `peel 2 draws depth >= 2 (${ED.drawnInstances()} of ${want2})`);
+  peelMinus.click();
+  await until(() => ED.drawnInstances() === want1, 8000);
+  say(ED.peelLevel() === 1 && ED.drawnInstances() === want1, 'Peel − steps back to 1');
+
+  // ---- fill the exposed layer of the active model with steel --------------
+  const mi = ED.getActiveModel();
+  const m = d.models[mi];
+  const before = Uint8Array.from(m.grid.data);
+  const beforeCol = m.grid.color ? Uint8Array.from(m.grid.color) : null;
+  const swatch = [...view.querySelectorAll('.edpalette *')].find(e => /^\d+\. steel(\s|$)/.test(e.title || ''));
+  say(!!swatch, 'the palette has a steel swatch');
+  if (!swatch) return done();
+  swatch.click();
+  const steel = +swatch.title.split('.')[0];
+  const layer = ANA.layerCells(field, m, 1);
+  fill.click();
+  await sleep(200);
+  let allSteel = layer.cells.length > 0, touchedOther = 0;
+  for (const i of layer.cells) if (m.grid.data[i] !== steel) allSteel = false;
+  for (let i = 0; i < before.length; i++)
+    if (before[i] !== m.grid.data[i] && !layer.cells.includes(i)) touchedOther++;
+  say(allSteel, `Fill layer painted all ${layer.cells.length} exposed voxels of ${m.name} steel`);
+  say(touchedOther === 0, 'and touched nothing else', touchedOther ? touchedOther + ' other voxels changed' : '');
+  say(layer.cells.every(i => !m.grid.color || m.grid.color[i] === 0), 'the filled layer carries no art colour');
+
+  // ---- one Undo takes the fill back -------------------------------------
+  undo.click();
+  await sleep(200);
+  const same = (a, b) => (!a && !b) || (a && b && a.length === b.length && a.every((v, i) => v === b[i]));
+  say(same(before, m.grid.data) && same(beforeCol, m.grid.color), 'one Undo restored the layer exactly');
+
+  // ---- Apply recipe restores the committed interior after a fill ----------
+  fill.click();
+  await sleep(200);
+  apply.click();
+  await sleep(400);
+  const side = await (await fetch('/api/model?path=mobs/human.json', {cache: 'no-store'})).json();
+  const plan = ANA.planAnatomy(d, side.anatomy, ANA.materialIds(win.__tunerModelsHooks.materials()));
+  say(plan.report.total === 0, `Apply recipe brought the interior back to the sidecar recipe (${plan.report.total} voxels differ)`);
+  say(same(before, m.grid.data), 'and the hips match their committed voxels again');
+
+  // ---- unpeel ---------------------------------------------------------------
+  unpeel.click();
+  await until(() => ED.drawnInstances() === total, 8000);
+  say(ED.peelLevel() === 0 && ED.drawnInstances() === total, 'Unpeel draws everything again');
+
+  say(errors.length === 0, 'the page threw nothing', [...new Set(errors)].slice(0, 6).join('\n        '));
+  if (SHOT) { peelPlus.click(); await sleep(1500); }
+} catch (e) {
+  say(false, 'harness threw: ' + (e && e.stack || e));
+}
+done();
+})();
+</script>

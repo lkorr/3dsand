@@ -44,6 +44,7 @@ import {
   paletteFromMaterials, gridColorGet, gridColorSet, gridColorLayer,
   ArtPalette, ART_SLOTS, isArtIndex, paletteColor,
 } from './vox.js';
+import * as ANA from './anatomy.js';
 
 // Editable box cap, matching what the .vox format allows.
 //
@@ -247,14 +248,20 @@ function inBounds(x, y, z) {
 
 // Material at an EDIT-SPACE cell (model-local, or prefab-space in whole mode).
 function cellGet(x, y, z) {
-  if (!wholeMode) return gridGet(grid, x, y, z);
+  if (!wholeMode) {
+    const v = gridGet(grid, x, y, z);
+    // A peeled voxel is not there as far as picking goes: the brush must
+    // land on the layer the peel exposes.
+    return v && peeled(doc.models[activeModel], x, y, z) ? 0 : v;
+  }
   for (let mi = 0; mi < doc.models.length; mi++) {
     // Hidden limbs are transparent to the raycast too, so you can click
     // through a hidden torso onto the arm behind it.
     if (!modelVisible(mi)) continue;
     const m = doc.models[mi];
-    const v = gridGet(m.grid, x - m.offset.x, y - m.offset.y, z - m.offset.z);
-    if (v) return v;
+    const lx = x - m.offset.x, ly = y - m.offset.y, lz = z - m.offset.z;
+    const v = gridGet(m.grid, lx, ly, lz);
+    if (v && !peeled(m, lx, ly, lz)) return v;
   }
   return 0;
 }
@@ -1384,6 +1391,7 @@ function newModel(dx, dy, dz, name = 'untitled') {
   activeModel = 0;
   grid = doc.models[0].grid;
   docPath = null; docName = name; sidecar = null; sidecarPath = null;
+  resetPeel();
   clearUndo();               // also resets any open structural transaction
   setSelection(null);
   // Art indices are document-scoped, so a new document starts with an empty
@@ -1751,6 +1759,179 @@ let cappedWarned = false;
 let hiddenModels = new Set();
 let soloModels = new Set();
 
+/* ---- Peel: hide the outermost depth layers -------------------------------
+   View state like hide/solo, one level deeper: `peel` is how many layers of
+   depth-from-surface (assets/editor/anatomy.js) are hidden, so peel 1 takes
+   the skin off every limb and shows what the anatomy recipe put under it,
+   peel 2 takes that off too. Peeled voxels are neither drawn nor picked, so a
+   brush lands on the layer you can see — that is what turns "peel, repaint
+   the exposed layer, peel again" into an editing loop instead of a viewer.
+
+   The depth field is a SNAPSHOT taken when peeling starts (refreshed when a
+   model's box moves or grows), not re-derived per stroke: depth is measured
+   from the surface, so recomputing it after every erase would make the hole
+   you just cut re-skin its own walls and disappear under the peel. */
+let peel = 0;
+let depthField = null;
+let depthSig = '';
+const layoutSig = () => !doc ? '' :
+  `${doc.size.x},${doc.size.y},${doc.size.z}|` + doc.models.map(m =>
+    `${m.offset.x},${m.offset.y},${m.offset.z},${m.dim.x},${m.dim.y},${m.dim.z}`).join(';');
+
+function refreshDepthField(force = false) {
+  if (!doc) { depthField = null; return null; }
+  const sig = layoutSig();
+  if (force || !depthField || sig !== depthSig) {
+    depthField = ANA.unionDepth(doc);
+    depthSig = sig;
+  }
+  return depthField;
+}
+
+/** True when this model-local voxel is hidden by the current peel. */
+function peeled(m, lx, ly, lz) {
+  return peel > 0 && depthField !== null && !!m.offset &&
+         ANA.depthAt(depthField, m, lx, ly, lz) < peel;
+}
+
+export const peelLevel = () => peel;
+
+export function setPeel(n) {
+  if (!doc) return;
+  const f = refreshDepthField(peel === 0);   // a fresh snapshot each time peeling starts
+  const max = ANA.maxDepth(f);
+  const next = Math.max(0, Math.min(max, n | 0));
+  if (next === peel && (n | 0) !== next)
+    hooks.toast(next === 0 ? 'nothing is peeled' : `deepest layer is ${max} — nothing under it to show`, true);
+  peel = next;
+  if (peel === 0) depthField = null;
+  needsRebuild = true;
+  renderToolbar();
+  updateStatus();
+}
+
+function resetPeel() { peel = 0; depthField = null; depthSig = ''; }
+
+/**
+ * Write model-LOCAL cell indices straight into one model, recording the same
+ * undo tuples applyOps does. No mirror expansion and no ownership routing:
+ * this is for edits that already know exactly which voxels they mean (a
+ * whole exposed layer, an anatomy plan), and it lets one stroke span every
+ * model so a single Ctrl+Z takes the whole operation back. `value` is a
+ * material id, KEEP_MAT, or an array-like of per-cell ids; `color` follows
+ * applyOps' contract (undefined / 0 / index / per-cell function).
+ */
+function writeModelCells(mi, cells, value, color) {
+  if (!stroke) beginStroke();
+  const g = doc.models[mi].grid;
+  const perCell = typeof value !== 'number';
+  let n = 0;
+  for (let k = 0; k < cells.length; k++) {
+    const i = cells[k];
+    const old = g.data[i];
+    const want = perCell ? value[k] : value;
+    const val = want === KEEP_MAT ? old : want;
+    if (!val && want === KEEP_MAT) continue;
+    const oldArt = g.color ? g.color[i] : 0;
+    let art = oldArt;
+    if (val === 0) art = 0;
+    else if (typeof color === 'function') art = color(old, oldArt) | 0;
+    else if (color !== undefined) art = color | 0;
+    if (old === val && art === oldArt) continue;
+    g.data[i] = val;
+    if (art !== oldArt) gridColorLayer(g)[i] = art;
+    stroke.push(mi, i, old, val, oldArt, art);
+    n++;
+  }
+  return n;
+}
+
+/** The models a layer operation covers: the active one, or every visible
+ *  one in Whole mode (the same scope brushes have). */
+const layerTargets = () => wholeMode
+  ? doc.models.map((m, i) => i).filter(i => modelVisible(i))
+  : [activeModel];
+
+/**
+ * Paint every voxel the current peel exposes with the active material. The
+ * art colour is CLEARED unless a brush colour is set — an interior voxel
+ * carrying the skin's paint would show that paint, not its material, in
+ * microbody.wgsl, which is the one way to make flesh look like skin.
+ */
+export function fillExposedLayer() {
+  if (!doc) return;
+  if (peel === 0) {
+    hooks.toast('peel a layer first (PageDown) — Fill layer paints what the peel exposes', true);
+    return;
+  }
+  const f = refreshDepthField();
+  const color = artColor !== null ? colorForBrush() : 0;
+  beginStroke();
+  let n = 0;
+  for (const mi of layerTargets()) {
+    const { cells } = ANA.layerCells(f, doc.models[mi], peel);
+    n += writeModelCells(mi, cells, activeMat, color);
+  }
+  endStroke();
+  needsRebuild = true;
+  updateStatus();
+  const nm = materials[activeMat - 1]?.id || ('#' + activeMat);
+  hooks.toast(n ? `layer ${peel}: ${n} voxel${n === 1 ? '' : 's'} → ${nm}`
+                : `layer ${peel} is already ${nm}`);
+}
+
+/**
+ * Rewrite the interior by depth from the sidecar's `anatomy` recipe — the
+ * same planAnatomy the bake script runs, through the undo log instead of
+ * straight into the file. A sidecar with no recipe gets the stock human one
+ * written into it, so what was applied is what gets saved.
+ */
+export function applyAnatomyRecipe() {
+  if (!doc) return;
+  let recipe = sidecar && sidecar.anatomy;
+  const fromDefault = !recipe;
+  if (fromDefault) recipe = JSON.parse(JSON.stringify(ANA.DEFAULT_ANATOMY));
+  const plan = ANA.planAnatomy(doc, recipe, ANA.materialIds(materials));
+  if (plan.report.unresolved.length) {
+    hooks.toast('anatomy recipe names materials that do not exist: ' +
+      plan.report.unresolved.join(', '), true);
+    return;
+  }
+  if (!plan.report.total) { hooks.toast('interior already matches the recipe'); return; }
+  if (fromDefault) {
+    if (!sidecar) sidecar = {};
+    touchSidecar();
+    sidecar.anatomy = recipe;
+  }
+  beginStroke();
+  for (const e of plan.edits) writeModelCells(e.mi, e.cells, e.mats, 0);
+  endStroke();                                   // commits the sidecar change too
+  needsRebuild = true;
+  updateStatus();
+  if (fromDefault) hooks.onSidecarChanged?.();
+  const totals = {};
+  for (const h of Object.values(plan.report.perLimb))
+    for (const [m, c] of Object.entries(h)) totals[m] = (totals[m] || 0) + c;
+  hooks.toast(`anatomy: ${plan.report.total} voxels rewritten (` +
+    Object.entries(totals).map(([m, c]) => `${m} ${c}`).join(', ') + ')' +
+    (fromDefault ? ' — stock human recipe, now in the sidecar as "anatomy"' : ''));
+}
+
+/** "exposed 1,240: muscle 91% blood 6% bone 3%" for the status line. */
+function peelSummary() {
+  if (peel === 0 || !doc) return '';
+  const f = refreshDepthField();
+  const hist = {};
+  let total = 0;
+  for (const mi of layerTargets()) {
+    const { hist: h } = ANA.layerCells(f, doc.models[mi], peel);
+    for (const [id, c] of Object.entries(h)) { hist[id] = (hist[id] || 0) + c; total += c; }
+  }
+  const parts = Object.entries(hist).sort((a, b) => b[1] - a[1]).slice(0, 4)
+    .map(([id, c]) => `${materials[id - 1]?.id || '#' + id} ${Math.round(100 * c / total)}%`);
+  return `  ·  PEEL ${peel}/${ANA.maxDepth(f)} exposed ${total}` + (total ? ': ' + parts.join(' ') : '');
+}
+
 /** True when this model should be drawn and picked. */
 function modelVisible(mi) {
   const m = doc?.models[mi];
@@ -1874,6 +2055,7 @@ function rebuildInstances() {
         for (let x = 0; x < d.x; x++) {
           const v = data[row + x];
           if (!v || n >= cap) continue;
+          if (peel > 0 && peeled(m, x, y, z)) continue;
           if (xf) {
             // Rotate about the joint anchor, then translate — the same
             // composition the engine applies (see gait preview in rig.js).
@@ -3057,6 +3239,8 @@ function onKeyDown(ev) {
   else if (k === 'w') { setWholeMode(!wholeMode); ev.preventDefault(); }
   else if (k === 'c') { toggleArtWheel(); ev.preventDefault(); }
   else if (k === 'm') { mirror.x = !mirror.x; updateMirrorPlane(); renderToolbar(); ev.preventDefault(); }
+  else if (k === 'pagedown') { setPeel(peel + 1); ev.preventDefault(); }
+  else if (k === 'pageup') { setPeel(peel - 1); ev.preventDefault(); }
   else if (k === 'escape') { setSelection(null); ev.preventDefault(); }
   else if (k === 'delete') { deleteSelection(); ev.preventDefault(); }
   else if (k >= '1' && k <= '9') {
@@ -3128,6 +3312,11 @@ function renderToolbar() {
   ui.mirrorBtn.classList.toggle('on', mirror.x);
   ui.wholeBtn.classList.toggle('on', wholeMode);
   ui.modeInd.textContent = (wholeMode ? 'WHOLE·' : '') + mode.toUpperCase();
+  if (ui.peelVal) {
+    ui.peelVal.textContent = peel > 0 && depthField
+      ? `${peel}/${ANA.maxDepth(depthField)}` : '0';
+    ui.peelVal.classList.toggle('on', peel > 0);
+  }
   ui.modeInd.className = 'medind ' + mode;
 }
 
@@ -3683,7 +3872,8 @@ function updateStatus() {
     `  ·  ${filled} voxel${filled === 1 ? '' : 's'}  ·  ${undoStack.length} undo` +
     // Say it out loud: a hidden limb looks exactly like deleted geometry.
     (soloModels.size ? `  ·  SOLO ${soloModels.size}` : '') +
-    (hiddenModels.size ? `  ·  ${hiddenModels.size} hidden` : '');
+    (hiddenModels.size ? `  ·  ${hiddenModels.size} hidden` : '') +
+    peelSummary();
 }
 
 /** Panel mounts for rig.js. */
@@ -3811,6 +4001,39 @@ function buildUI(section) {
     el('span', { class: 'hsep' }), ui.artChip, artLabel,
     el('span', { class: 'hsep' }), ui.status);
 
+  // --- toolbar row 3: anatomy — peel depth layers, repaint what shows ---
+  ui.peelVal = el('span', { class: 'hint edslideval', title: 'layers hidden / deepest layer' }, '0');
+  ui.anatomyBar = el('div', { class: 'toolbar edbar' },
+    el('span', { class: 'hint' }, 'anatomy'),
+    mkBtn('Peel −', {
+      title: 'show one more layer again [PageUp]',
+      onclick: () => setPeel(peel - 1),
+    }),
+    ui.peelVal,
+    mkBtn('Peel +', {
+      title: 'hide the outermost layer of every limb (depth from the surface, ' +
+        'measured over the whole assembled creature so joint faces count as ' +
+        'interior) [PageDown]. Peeled voxels are not drawn and not picked: ' +
+        'brushes land on what the peel exposes',
+      onclick: () => setPeel(peel + 1),
+    }),
+    mkBtn('Unpeel', { title: 'show everything again', onclick: () => setPeel(0) }),
+    el('span', { class: 'hsep' }),
+    mkBtn('Fill layer', {
+      title: 'paint every voxel the peel exposes (active model; every visible ' +
+        'model in Whole mode) with the active material. Art colour is cleared ' +
+        'unless a brush colour is set. One Ctrl+Z takes it back',
+      onclick: fillExposedLayer,
+    }),
+    mkBtn('Apply recipe', {
+      title: 'rewrite the whole interior by depth from the sidecar\'s "anatomy" ' +
+        'recipe (skin → flesh → muscle → bone for the stock human; a sidecar ' +
+        'without one gets the stock recipe). The painted surface is never ' +
+        'touched. One Ctrl+Z takes it all back. Same code as ' +
+        'scripts/anatomize_mob.mjs',
+      onclick: applyAnatomyRecipe,
+    }));
+
   // --- palette: materials on top, art colours under them ---
   ui.palette = el('div', { class: 'edpalette' });
   ui.artRow = el('div', { class: 'edpalette edartpal' });
@@ -3827,7 +4050,7 @@ function buildUI(section) {
     'Ctrl+A select all · Ctrl+C/V/X copy/paste/cut · Del delete · ' +
     'Ctrl+Shift+F fill · Ctrl+Z/Y undo · ? cheat sheet');
 
-  section.append(bar1, bar2, ui.help, buildWheelPanel(), buildArtPanel(),
+  section.append(bar1, bar2, ui.anatomyBar, ui.help, buildWheelPanel(), buildArtPanel(),
     ui.palette, ui.artRow,
     el('div', { class: 'edmain' }, host, ui.grip, ui.side),
     ui.timeline, ui.note);
@@ -3953,6 +4176,16 @@ function buildHelpPanel() {
       'moving the head and arms too. The move itself is not on the undo ' +
       'stack — drag it back rather than Ctrl+Z — but your paint history ' +
       'survives it.'),
+    row('anatomy', 'PageDown peels the outermost layer off every limb ' +
+      '(depth from the surface over the whole creature, so a joint face is ' +
+      'interior); PageUp puts it back. Peeled voxels are not drawn and not ' +
+      'picked, so brushes and the noise brush work on the exposed layer. ' +
+      '"Fill layer" paints the whole exposed layer with the active material ' +
+      '(art colour cleared unless a brush colour is set); "Apply recipe" ' +
+      'rewrites the interior from the sidecar\'s "anatomy" block — skin, ' +
+      'flesh, muscle, bone for the human; a cyborg is a different recipe, not ' +
+      'a different tool. Both are one undo step. The surface layer is never ' +
+      'touched by the recipe: it is the painted character.'),
     row('walk', 'K toggles the gait preview (it walks the exported data, not ' +
       'an editor imitation). Legs need a two-bone IK chain (+ chain with the ' +
       'LOWER bone selected) and a gait block; leg groups define the gait ' +
@@ -4024,6 +4257,7 @@ async function openPath(path) {
     activeModel = 0;
     grid = doc.models[0].grid;
     docPath = path;
+    resetPeel();
     docName = path.split('/').pop().replace(/\.vox$/i, '');
     clearUndo();             // also resets any open structural transaction
     setSelection(null);
@@ -4332,6 +4566,9 @@ export function saveFromHost() { return save(false); }
 /* ---- API consumed by rig.js -------------------------------------------- */
 
 export const getDoc = () => doc;
+// How many cubes the viewport is drawing right now — what a peel actually
+// hides, for the browser harness (assets/anatomy_test.html).
+export const drawnInstances = () => (cubes ? cubes.count : -1);
 export const getActiveModel = () => activeModel;
 export const getModels = () => (doc ? doc.models : []);
 /** File stem of the open document — a saved limb records where it came from. */

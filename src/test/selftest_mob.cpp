@@ -2696,13 +2696,22 @@ Status GateMobBurn(Ctx& c, std::string& detail) {
                  mBurning = matId("flesh_burning"), mBlood = matId("blood"),
                  mCinder = matId("flesh_cinder"), mUnder = matId("linen"),
                  mUnderBurn = matId("linen_burning"),
-                 mUnderChar = matId("linen_charred");
+                 mUnderChar = matId("linen_charred"),
+                 // The anatomy layers under the skin (assets/editor/anatomy.js):
+                 // body mass the fire has to get through, and flesh that can
+                 // char. Bone is deliberately in neither census -- it has no
+                 // fire rules, so counting it would only dilute both ratios.
+                 mFlesh = matId("flesh"), mMuscle = matId("muscle");
   if (!mFire || !mAcid || !mCloth || !mSkin || !mCooked || !mBurning) {
     detail = "body-reactivity materials missing from materials.json";
     return Status::Fail;
   }
   if (!mCinder || !mUnder || !mUnderBurn || !mUnderChar) {
     detail = "linen / flesh_cinder missing from materials.json";
+    return Status::Fail;
+  }
+  if (!mFlesh || !mMuscle) {
+    detail = "anatomy materials flesh / muscle missing from materials.json";
     return Status::Fail;
   }
 
@@ -3472,7 +3481,8 @@ Status GateMobBurn(Ctx& c, std::string& detail) {
     uint32_t idleFront = 0, body0 = 0, cloth0 = 0, peakAlight = 0, peakChar = 0;
     float bodyLost = 0;
     auto avBody = [&]() {
-      return avCensus(mCloth) + avCensus(mUnder) + avCensus(mSkin);
+      return avCensus(mCloth) + avCensus(mUnder) + avCensus(mSkin) +
+             avCensus(mFlesh) + avCensus(mMuscle);
     };
     if (spawned) {
       for (int i = 0; i < 10; i++) avTick(0);
@@ -3541,7 +3551,8 @@ Status GateMobBurn(Ctx& c, std::string& detail) {
       // all on the convex edges of the limbs; after, 23.7%, spread over the
       // surface. The floor is set between those two, so this fails if the ramp
       // ever stops reaching a body's flat faces again.
-      const uint32_t flesh = avCensus(mSkin) + avCensus(mCooked) +
+      const uint32_t flesh = avCensus(mSkin) + avCensus(mFlesh) +
+                             avCensus(mMuscle) + avCensus(mCooked) +
                              avCensus(mBurning) + avCensus(mCharred) +
                              avCensus(mCinder);
       const uint32_t past = avCensus(mCharred) + avCensus(mCinder);

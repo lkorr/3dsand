@@ -5,6 +5,56 @@
     "material": "blood",
     "perDamage": 2.5
   },
+  "anatomy": {
+    "//": "What is under the skin, by depth from the surface, baked into human.vox by `node scripts/anatomize_mob.mjs human` or the tuner's Apply recipe button (assets/editor/anatomy.js documents the format). Materials by NAME. `keep` leaves the painted surface alone; `garments` are surface voxels that are clothes, so the voxel under them is skin. Head override: a bone skull two deep around a flesh brain.",
+    "layers": [
+      {
+        "material": "skin",
+        "depth": 1,
+        "keep": true
+      },
+      {
+        "material": "flesh",
+        "depth": 1
+      },
+      {
+        "material": "muscle",
+        "depth": 1,
+        "speckle": {
+          "material": "blood",
+          "fraction": 0.06
+        }
+      },
+      {
+        "material": "bone"
+      }
+    ],
+    "garments": [
+      "linen"
+    ],
+    "limbs": {
+      "head": {
+        "layers": [
+          {
+            "material": "skin",
+            "depth": 1,
+            "keep": true
+          },
+          {
+            "material": "flesh",
+            "depth": 1
+          },
+          {
+            "material": "bone",
+            "depth": 2
+          },
+          {
+            "material": "flesh"
+          }
+        ]
+      }
+    }
+  },
   "speed": 31.5,
   "gait": {
     "groups": [
