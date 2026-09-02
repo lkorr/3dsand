@@ -277,8 +277,18 @@ TP_F(render, godRayAniso, TUNE_GODRAY_ANISO, 0.62f)
 // Metres the shaft march covers. Beyond this the scatter has saturated anyway.
 TP_F(render, godRayRange, TUNE_GODRAY_RANGE, 14.0f)
 // Steps the per-sample occlusion ray gets. Short on purpose: it only has to
-// find the surface or a nearby blocker, not resolve distant geometry.
-TP_I(render, godRayShadowSteps, TUNE_GODRAY_SHADOW_STEPS, 20)
+// find the surface or a nearby blocker, not resolve distant geometry. Since
+// W2-B these are BLOCK steps (the ray is coarse from t=0), so 8 of them reach
+// 3.2 m where the old 20 voxel steps reached 2.0 m.
+TP_I(render, godRayShadowSteps, TUNE_GODRAY_SHADOW_STEPS, 8)
+
+// ---- coarse-terminate for secondary rays (PLAN_lin_followups.md W2-B) ------
+// Metres past which traceOpaque stops asking the voxel and asks the 4^3
+// blockers-class sub-occupancy mask instead: a clear block is skipped whole
+// (exact), a set block stops the ray (conservative). 0 disables it and the
+// const-folded 1e30 deletes the code. It lives next to the god-ray rows
+// because god rays pass 0 for it — they are coarse from the first step.
+TP_F(render, shadowCoarseDist, TUNE_SHADOW_COARSE_DIST, 8.0f)
 
 // ---- drifting particulate (silt) ----
 // Render-only motes in the water volume. This is what gives the shafts

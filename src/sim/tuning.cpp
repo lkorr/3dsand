@@ -2050,6 +2050,7 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadF(*g, "farShadowReach", r.farShadowReach, out, at);
     ReadF(*g, "lodHandoffDist", r.lodHandoffDist, out, at);
     ReadF(*g, "shadowMaxDist", r.shadowMaxDist, out, at);
+    ReadF(*g, "shadowCoarseDist", r.shadowCoarseDist, out, at);
     // Zero step budgets compile fine and render nothing; a zero white point or
     // gamma divides by zero in the tonemap. Guard the ones that break the
     // image rather than merely change it.
@@ -2157,6 +2158,11 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     // 0 is meaningful here (all shadows go through the cascade), so only
     // negatives are refused.
     if (r.shadowMaxDist < 0.0f) { r.shadowMaxDist = 0.0f; }
+    // 0 is the OFF value (the shader const-folds the coarse march away), so
+    // only negatives are refused — a negative would make every ray coarse from
+    // its first cell, which is what god rays ask for explicitly and no shadow
+    // ray should get by accident.
+    if (r.shadowCoarseDist < 0.0f) { r.shadowCoarseDist = 0.0f; }
   }
 
   if (const json* g = Find(j, "worldgen")) {

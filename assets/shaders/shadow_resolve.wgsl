@@ -128,12 +128,16 @@ fn resolve(@builtin(global_invocation_id) gid : vec3<u32>) {
                              R.shadowSubdiv);
   let n3 = shadowFaceNormal(face);
 
-  // 1e30 is `coarseFromT`: accepted and ignored until W2-B teaches the march
-  // to terminate on the 4^3 blocker mask past a distance. This pass will be the
-  // first caller to pass a real one. The two pointers are how a function in
-  // common.wgsl reaches bindings declared after it (see traceOpaque).
+  // shadowCoarseFromT() is `coarseFromT` (W2-B): past that distance the march
+  // terminates on the 4^3 blockers mask instead of the voxel. It MUST be the
+  // same expression sunShadowAt passes — the gate casts this ray and that one
+  // at the same surface point and asserts they agree — which is why it is a
+  // function in common.wgsl and not a knob read twice. The two pointers are
+  // how a function in common.wgsl reaches bindings declared after it (see
+  // traceOpaque).
   let s = traceOpaque(hp + n3 * TUNE_SHADOW_BIAS, keyLightDirP(R),
-                      TUNE_SHADOW_STEPS, 1e30, &occupancy, &materials);
+                      TUNE_SHADOW_STEPS, shadowCoarseFromT(),
+                      &occupancy, &materials);
   // The softening law is sunShadowAt's, verbatim, and must stay that way: the
   // penumbra is taken from how far the ray travelled before being blocked, so a
   // contact shadow stays crisp and a distant blocker's shadow lifts.
