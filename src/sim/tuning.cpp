@@ -2048,6 +2048,7 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadI(*g, "primarySteps", r.primarySteps, out, at);
     ReadI(*g, "farSteps", r.farSteps, out, at);
     ReadF(*g, "farShadowReach", r.farShadowReach, out, at);
+    ReadI(*g, "farBlockerHitLevel", r.farBlockerHitLevel, out, at);
     ReadF(*g, "lodHandoffDist", r.lodHandoffDist, out, at);
     ReadF(*g, "shadowMaxDist", r.shadowMaxDist, out, at);
     ReadF(*g, "shadowCoarseDist", r.shadowCoarseDist, out, at);
@@ -2148,6 +2149,14 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     // A zero/negative reach would clamp to the 8-step floor everywhere and
     // silently drop far shadows; keep it positive.
     if (r.farShadowReach < 1.0f) { r.farShadowReach = 1.0f; }
+    // A level cap, so the legal range is 0 (off) .. kFarLevels. Out-of-range
+    // values are not merely useless here: the shader compares it against a
+    // 1-based level, so a negative would read as "off" by accident rather
+    // than by intent and anything past the top level is a lie about coverage.
+    if (r.farBlockerHitLevel < 0) { r.farBlockerHitLevel = 0; }
+    if (r.farBlockerHitLevel > (int)kFarLevels) {
+      r.farBlockerHitLevel = (int)kFarLevels;
+    }
     // The LOD handoff must not land in front of the near clip: a zero here
     // would hand EVERY ray to the cascade at t=0 and render the world as
     // 40 cm blocks from the camera outward. Floored at 2 m, which is still

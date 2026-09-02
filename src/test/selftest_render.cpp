@@ -72,6 +72,70 @@ void DrainFullRefill(GpuContext& ctx, World& world, Simulation& sim,
   ctx.WaitIdle();
 }
 
+// ---- the conservative blocker flag, bit 7 of the far cell byte -----------
+// (13.2.2 / W2-D; common.wgsl FAR_BLOCKER_BIT)
+//
+// This rides on `far-fog` rather than on `far-downsample` for one reason: this
+// gate does its own `FullRefill` and drains it, so it is the only far gate
+// whose cascade data is real when run as `--gate far-fog` alone. `farVox` is
+// zero-initialised, so a flag check against an UNFILLED cascade reads "no flag
+// anywhere" and passes for the wrong reason forever.
+//
+// Two claims, and neither is the trivial one:
+//
+//   ORDER. In every column, the highest cell carrying the flag is at or above
+//   the highest cell carrying MATERIAL. The flag is "the surface reaches into
+//   this cell" and the material byte is "the cell's centre sample was solid",
+//   and the centre is half a cell above the floor — so the flag can only ever
+//   extend the column upward. A flag BELOW the material top would mean the two
+//   writers disagree about where the ground is.
+//
+//   RECOVERY. At least one column has a cell with the flag and NO material.
+//   That cell is the entire point of the feature: the half of every surface
+//   cell whose ground landed in its lower half, which the centre sample calls
+//   air. Without this line the flag could be a synonym for `mat != 0` and
+//   nothing would say so.
+//
+// The knob (`render.farBlockerHitLevel`) ships at 0, so NOTHING ELSE in the
+// suite or in any screenshot would notice if the writers stopped emitting the
+// flag: the shadow half is a shading difference no assertion covers.
+static bool CheckFarBlockerFlag(GpuContext& ctx, World& world) {
+  constexpr uint32_t kBlockerBit = 0x80u;
+  constexpr uint32_t kMatMask = 0x7Fu;
+  const int shift1 = (int)(1 + kFarShiftBase);
+  int columns = 0, recovered = 0, disordered = 0;
+  // Eight columns spread across the level-1 box, well inside it (its
+  // half-extent is kFarN/2 cells) and away from the two paint sites the other
+  // far gates use.
+  for (int i = 0; i < 8; i++) {
+    const int wx = 200 + i * 24, wz = 200 + i * 17;
+    const int h = World::TerrainHeight(wx, wz, kDefaultSeed);
+    const int cx = wx >> shift1, cz = wz >> shift1;
+    // twelve cells straddling the surface: eight below it, four above
+    const int cy0 = ((h - 8 * (1 << shift1)) >> shift1);
+    int topMat = INT32_MIN, topFlag = INT32_MIN;
+    bool flagOnly = false;
+    for (int k = 0; k < 12; k++) {
+      const uint32_t b = FarVoxByte(ctx, world, 1, {cx, cy0 + k, cz});
+      if ((b & kMatMask) != 0) topMat = cy0 + k;
+      if ((b & kBlockerBit) != 0) {
+        topFlag = cy0 + k;
+        if ((b & kMatMask) == 0) flagOnly = true;
+      }
+    }
+    if (topMat == INT32_MIN && topFlag == INT32_MIN) continue;  // all sky
+    columns++;
+    if (topFlag < topMat) disordered++;
+    if (flagOnly) recovered++;
+  }
+  const bool ok = columns >= 4 && disordered == 0 && recovered >= 1;
+  std::printf("far blocker flag: %s (%d columns sampled, %d with a flagged cell "
+              "the centre sample called air, %d where the flag sits below the "
+              "material top)\n",
+              ok ? "PASS" : "FAIL", columns, recovered, disordered);
+  return ok;
+}
+
 // ---- far-fog -----------------------------------------------------------
 Status GateFarFog(Ctx& c, std::string& detail) {
   GpuContext& ctx = c.ctx;
@@ -138,8 +202,8 @@ bool fogOk = false;
               fogOk ? "PASS" : "FAIL", coldR, prevR, monotone ? 1 : 0);
 }
 
-  // Verdict: the flag the moved body already computed.
-  return fogOk ? Status::Pass : Status::Fail;
+  // Verdict: the flag the moved body already computed, plus the blocker bit.
+  return (fogOk && CheckFarBlockerFlag(ctx, world)) ? Status::Pass : Status::Fail;
 }
 
 // ---- far-downsample ----------------------------------------------------

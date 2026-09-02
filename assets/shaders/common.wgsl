@@ -2782,6 +2782,35 @@ fn farOccIndex(level : u32, c : vec3<i32>) -> u32 {
   return (level - 1u) * FAR_NUM_CHUNKS + farChunkIndexG(c);
 }
 
+// ---- THE FAR CELL BYTE: 7 bits of material + 1 CONSERVATIVE BLOCKER BIT ----
+// (13.2.2, docs/PLAN_lin_followups.md W2-D)
+//
+// A far cell used to be a whole byte of raw material id, clamped to 255. It is
+// now SEVEN bits of material and one flag, because the byte is the only spare
+// storage the cascade has and the material id never needed all eight: there
+// are 117 materials, `LoadMaterials` REFUSES a table that would put an id past
+// 127, and `check_invariants.py` refuses a materials.json that would grow one.
+// Both of those exist solely to keep this split legal — if either is deleted
+// the far field silently starts painting the wrong material AND claiming a
+// blocker wherever an id has bit 7 set.
+//
+// The flag means: "somewhere inside this cell's fine-voxel footprint, pristine
+// worldgen puts something a ray would stop on." It is CONSERVATIVE — it may be
+// set where the cell's own centre sample found air (that is the entire point:
+// the centre sample loses ridge crests, the top row of every terrace, and any
+// wall thinner than a cell) and it deliberately ignores caves, because a cell
+// below the ground surface counts as blocked whether or not a cave hollows it.
+//
+// It is a pure function of (coords, seed) — see `farBlockerBitAt` in
+// worldgen.wgsl — which is what lets the sieve (`far`, pristine procgen) and
+// the downsample (`fardown`, live grid) write byte-identical flags at their
+// shared boundary, the same argument `farSurfaceMat` makes for the colour.
+// The corollary is that the flag knows nothing about EDITS: a player-built
+// wall in mid-air gets no blocker bit, only the material byte the downsample
+// writes for it.
+const FAR_MAT_MASK    : u32 = 0x7Fu;   // material id, 0 = air
+const FAR_BLOCKER_BIT : u32 = 0x80u;
+
 // ---- per-chunk occupancy packing ----
 // Low 16 bits: total non-air voxels (chunk-skip for media-aware rays, CPU
 // streaming/save-worthiness). High 16 bits: ray BLOCKERS — voxels that stop a

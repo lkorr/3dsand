@@ -3556,8 +3556,8 @@ world hash.
   path. Adopt once bodies carry their voxel payloads (M6).
 - **Far-field cascades (implemented 2026-08-19; docs/PLAN_far_field_cascades.md):**
   view distance beyond the residency window comes from kFarLevels nested
-  toroidal kFarN³ (512³ since 2026-08-29; was 256³) volumes centered on the player, one material byte per
-  cell. The far grid is DECOUPLED from the window size (phase 5, when the
+  toroidal kFarN³ (512³ since 2026-08-29; was 256³) volumes centered on the player, one byte per
+  cell (7 bits of material id + 1 conservative blocker flag; see below). The far grid is DECOUPLED from the window size (phase 5, when the
   window went 512³): level k cells span 2^(k + kFarShiftBase) fine voxels with
   the shift base chosen so level k's box edge is always 2^k WINDOW edges —
   cascade distances scale with the window at constant memory (1024 MiB total at
@@ -3685,6 +3685,31 @@ world hash.
   aerial perspective: `applyAerial` converges surfaces exactly to
   `skyColor(rd)` (the old ×0.9 target left everything hanging slightly darker
   than the sky it should dissolve into, which read as a gray veil).
+  **The far cell byte is 7 + 1, not 8 (13.2.2, 2026-09-01):** bit 7 of every
+  far cell is a CONSERVATIVE BLOCKER FLAG — "pristine worldgen puts something a
+  ray would stop on somewhere inside this cell's fine footprint" — and the
+  material id lives in the low seven (`FAR_MAT_MASK` / `FAR_BLOCKER_BIT`,
+  common.wgsl; every reader masks). The id fits because there are 117
+  materials, and it KEEPS fitting because `LoadMaterials` refuses a table past
+  128 entries and `check_invariants.py` refuses a materials.json that would
+  grow one; nothing else in the engine would notice, since a 129th material
+  would merely paint the wrong colour at distance and claim a blocker wherever
+  bit 7 landed. The flag is a pure function of (coords, seed)
+  (`farBlockerBitAt` in worldgen.wgsl) for the same reason `farSurfaceMat` is:
+  the sieve has no live grid, so a flag derived from real voxels in the
+  downsample would disagree with it at their shared boundary. Its cost is one
+  comparison for all but ONE cell per column — the surface band, where the four
+  corner columns are sampled — and its blind spot is edits, which reach the far
+  field only through the material byte. `farShadowed` treats it as a blocker at
+  every level; a primary ray only up to `render.farBlockerHitLevel`, which
+  ships at **0**. That default is a measured kill-criterion result, not
+  timidity: at 2 the visible half does what it was built for (the half of every
+  surface cell whose centre sampled air comes back, so a 60 m snow patch stops
+  being a dithered smear) but the same one-cell lift buries the single-cell
+  ground cover standing on that slope and paints flat facets where a cell hits
+  on the flag alone. The distant ridge is not the casualty — the sky silhouette
+  is pixel-identical at 0 and 2, because levels ≥ 3 never take the flag.
+
   **Transition polish (phase 3):** each handoff — the window→level-1 one and
   every level→level one — is pulled NEARER by a per-pixel hash of the fragment
   coordinate, up to half a cell of the outer level at that seam

@@ -695,6 +695,7 @@
     "primarySteps": 4096,
     "farSteps": 384,
     "farShadowReach": 60,
+    "farBlockerHitLevel": 0,
     "lodHandoffDist": 24,
     "shadowMaxDist": 999,
     "shadowCoarseDist": 8,

@@ -299,6 +299,7 @@ SPEC = [
     ("render", "primarySteps", "TUNE_PRIMARY_STEPS", "i", 4096),
     ("render", "farSteps", "TUNE_FAR_STEPS", "i", 384),
     ("render", "farShadowReach", "TUNE_FAR_SHADOW_REACH", "f", 60.0),
+    ("render", "farBlockerHitLevel", "TUNE_FAR_BLOCKER_HIT_LEVEL", "i", 0),
 
     # in-window LOD handoff (PLAN_surface_flight_perf.md A1)
     ("render", "lodHandoffDist", "TUNE_LOD_HANDOFF_DIST", "f", 24.0),
