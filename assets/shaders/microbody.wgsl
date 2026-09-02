@@ -261,8 +261,7 @@ fn fs(in : VSOut) -> FSOut {
 
   // ---- shading ----
   // Object-space face normal from the last-stepped axis, back to world space.
-  var nLocal = vec3f(0.0);
-  nLocal[axis] = -f32(stepv[axis]);
+  let nLocal = axisVec(axis, -f32(axisPickI(stepv, axis)));
   let n = quatRotate(in.quat, nLocal);
 
   let mat = materials[hitMat];

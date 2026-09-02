@@ -2899,6 +2899,44 @@ fn subOccAllOnes() -> u32 { return 0xFFFFFFFFu; }
 // granularity is a QUALITY knob, not a speed one — see the world.h block for
 // why the win saturates long before the patch gets coarse.
 //
+// ---- RUNTIME AXIS SELECTION WITHOUT A DYNAMIC INDEX -----------------------
+// (docs/PLAN_lin_followups.md W2-B, 13.1.3.)
+//
+// `v[axis]` where `axis` is a runtime value is legal WGSL and is a trap in a
+// shader that cares about registers. A vector lives in registers only while
+// every component reference is a literal; index one with a value the compiler
+// cannot fold and the whole vector is spilled to scratch memory for the
+// lifetime of the function, and on NVIDIA that shows up as non-zero "Local
+// Memory Size" in --shader-stats. It is the same failure as the by-value
+// uniform gotcha one level down: the cost is not the access, it is that the
+// DATA had to move.
+//
+// So: four functions, no indices. `axisVec`/`axisVecI` BUILD a basis vector
+// (the `var n = vec3f(0.0); n[axis] = s;` idiom, which is most of the sites);
+// `axisPick`/`axisPickI` READ one component. Both forms are exact — the built
+// vector's off-axis components are literal +0.0 rather than a `mask * s`
+// product that would make them -0.0 for negative s, and the read is a select
+// chain rather than a dot, so no inf or NaN component can leak through a
+// multiply by zero.
+//
+// The `tMax[a]` sites inside `for (var a = 0; a < 3; a++)` loops are NOT this
+// bug and are deliberately left alone: a constant-trip loop unrolls and the
+// index becomes a literal.
+fn axisVec(a : i32, s : f32) -> vec3f {
+  return vec3f(select(0.0, s, a == 0), select(0.0, s, a == 1),
+               select(0.0, s, a == 2));
+}
+fn axisVecI(a : i32, s : i32) -> vec3<i32> {
+  return vec3<i32>(select(0, s, a == 0), select(0, s, a == 1),
+                   select(0, s, a == 2));
+}
+fn axisPick(v : vec3f, a : i32) -> f32 {
+  return select(select(v.x, v.y, a == 1), v.z, a == 2);
+}
+fn axisPickI(v : vec3<i32>, a : i32) -> i32 {
+  return select(select(v.x, v.y, a == 1), v.z, a == 2);
+}
+
 // FACE ENCODING: axis * 2 + (normal points along +axis). 0..5, three bits.
 fn shadowFaceOf(axis : i32, nPositive : bool) -> u32 {
   return u32(axis) * 2u + select(0u, 1u, nPositive);
@@ -2906,9 +2944,7 @@ fn shadowFaceOf(axis : i32, nPositive : bool) -> u32 {
 fn shadowFaceNormal(face : u32) -> vec3f {
   let axis = face >> 1u;
   let s = select(-1.0, 1.0, (face & 1u) != 0u);
-  var n = vec3f(0.0);
-  n[axis] = s;
-  return n;
+  return axisVec(i32(axis), s);
 }
 // The two in-face axes. Fixed order (a+1, a+2) so the sub-patch indices mean
 // the same thing on both sides.
@@ -2925,9 +2961,9 @@ fn shadowPatchCentre(cell : vec3<i32>, face : u32, sx : u32, sy : u32,
   let t = shadowFaceTangents(face);
   let inv = 1.0 / f32(subdiv);
   var p = vec3f(cell);
-  p[axis] += select(0.0, 1.0, (face & 1u) != 0u);
-  p[t.x] += (f32(sx) + 0.5) * inv;
-  p[t.y] += (f32(sy) + 0.5) * inv;
+  p += axisVec(i32(axis), select(0.0, 1.0, (face & 1u) != 0u));
+  p += axisVec(i32(t.x), (f32(sx) + 0.5) * inv);
+  p += axisVec(i32(t.y), (f32(sy) + 0.5) * inv);
   return p;
 }
 
