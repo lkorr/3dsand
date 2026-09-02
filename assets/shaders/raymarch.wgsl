@@ -7177,6 +7177,17 @@ fn fs(in : VSOut) -> FSOut {
     // range completely empty. Two disjoint populations interleaved at voxel
     // frequency is what the eye reports as "noise on the floor"; there was no
     // gradient between them to read as slope. Widening the wrap fills that gap.
+    // The openness byte for this hit, read ONCE here because two terms need
+    // it: the ambient multiplier below (its original and documented use) and
+    // the cap on the shadow lift inside the sun branch. The micro rule
+    // (sample the ground a tuft grows from) is explained at the ambient site.
+    var openCell = h.cell;
+    var openN = n;
+    if (isMicro) {
+      openCell = h.cell - vec3<i32>(0, 1, 0);
+      openN = vec3f(0.0, 1.0, 0.0);
+    }
+    let openRaw = opennessAt(openCell, hp, openN, &openness, &opennessGen);
     var lambert = wrapDiffuse(dot(n, keyLightDir()), TUNE_DIFFUSE_WRAP);
     if (lambert > 0.0 && (R.flags & 1u) != 0u) {
       // h.t is the receiver's distance from the camera in fine voxels, which
@@ -7192,11 +7203,17 @@ fn fs(in : VSOut) -> FSOut {
       // This IS the one remaining trace-shaped call site in the shader, but it
       // is farShadowed's own cascade march, not trace() — a much smaller
       // register footprint, and it was already here.
+      var sh = 1.0;
       if (SHADOW_CACHE && h.t * VOXEL_METERS <= TUNE_SHADOW_MAX_DIST) {
-        lambert *= shadowCached(hitP, h.cell, h.axis, h.sgn, h.t);
+        sh = shadowCached(hitP, h.cell, h.axis, h.sgn, h.t);
       } else {
-        lambert *= sunShadowAt(hitP, n, in.pos.xy, h.t);
+        sh = sunShadowAt(hitP, n, in.pos.xy, h.t);
       }
+      // The distance-softened LIFT cannot reach a face that cannot see the
+      // sky (shadowLiftCap, common.wgsl): a cave floor under a 10 m roof got
+      // 45% sun through the rock before this. `openRaw` is read above, once,
+      // for the ambient term below.
+      lambert *= shadowLiftCap(sh, openRaw);
     }
     let sun = keyLightColor() * lambert;
     // ---- the openness (sky-visibility) grid, phase 0 of indirect light ----
@@ -7227,14 +7244,7 @@ fn fs(in : VSOut) -> FSOut {
     // below is the dirt the tuft stands in, and its +Y face is what the tuft is
     // actually lit by: measured, this is the difference between grass inside a
     // roofed room staying meadow-bright and going dark with the floor.
-    var openCell = h.cell;
-    var openN = n;
-    if (isMicro) {
-      openCell = h.cell - vec3<i32>(0, 1, 0);
-      openN = vec3f(0.0, 1.0, 0.0);
-    }
-    let openAmb =
-        opennessScale(opennessAt(openCell, hp, openN, &openness, &opennessGen));
+    let openAmb = opennessScale(openRaw);
     // Direct sun + hemisphere ambient. Ambient is occluded by AO (it is sky
     // light, and AO measures how much sky the point can see); direct sun is
     // NOT — it already has its own shadow ray, and multiplying it by AO too

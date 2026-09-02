@@ -2985,6 +2985,19 @@ fn openFaceOfNormal(n : vec3f) -> u32 {
 // The byte for (world cell, face), or -1 when this slot's stamp does not match
 // the cell's world chunk (never computed, or computed for a chunk that has
 // since streamed out).
+// THE BYTE'S RANGE IS 0..OPEN_MAX, AND 255 IS "NOT MEASURED". The pass writes
+// 255 for a block with no surface in it AND for a face it could not march
+// (a blocker in the neighbouring block). The first version of the reader
+// took 255 at face value, as fully open sky, and that was the splotch
+// mechanism on every cave wall (2026-09-02): a wall face with one protruding
+// voxel in front of it lit up at full daylight, a wall edge next to an
+// empty-air block smeared daylight along the wall through the filter, and
+// the nearest-block arm of the openness_in shot showed them as floor-to-
+// ceiling bright strips. Returning -1 here makes both drop out of the
+// bilinear with weight 0, so an unmeasured face INHERITS its measured
+// neighbours; only when no tap has a measurement does the reader fall back
+// to the pre-P0 lerp.
+const OPEN_MAX : f32 = 254.0;
 fn opennessByteAt(c : vec3<i32>, face : u32,
                   op : ptr<storage, array<u32>, read>,
                   og : ptr<storage, array<u32>, read>) -> i32 {
@@ -2992,7 +3005,8 @@ fn opennessByteAt(c : vec3<i32>, face : u32,
   if ((*og)[slot] != opennessStamp(worldChunkOf(c))) { return -1; }
   let lo = vec3<u32>(c & vec3<i32>(i32(CHUNK) - 1));
   let bi = (slot * OPEN_BLOCKS + subOccBitLocal(lo)) * OPEN_FACES + face;
-  return i32(((*op)[bi >> 2u] >> ((bi & 3u) * 8u)) & 0xFFu);
+  let b = i32(((*op)[bi >> 2u] >> ((bi & 3u) * 8u)) & 0xFFu);
+  return select(b, -1, b == 255);
 }
 
 // Openness at a surface point, 0..1, or -1 for "unknown, use the old lerp".
@@ -3013,7 +3027,7 @@ fn opennessAt(cell : vec3<i32>, p : vec3f, n : vec3f,
   let axis = face >> 1u;
   if (TUNE_OPENNESS_BILINEAR == 0) {
     let b = opennessByteAt(cell, face, op, og);
-    return select(-1.0, f32(b) * (1.0 / 255.0), b >= 0);
+    return select(-1.0, f32(b) * (1.0 / OPEN_MAX), b >= 0);
   }
   // Unit vectors of the face axis and its two tangents, as integer masks. Built
   // by comparison rather than by rotation so no component is ever read with a
@@ -3055,7 +3069,7 @@ fn opennessAt(cell : vec3<i32>, p : vec3f, n : vec3f,
   if (b01 >= 0) { acc += f32(b01) * w01; wsum += w01; }
   if (b11 >= 0) { acc += f32(b11) * w11; wsum += w11; }
   if (wsum <= 0.0) { return -1.0; }
-  return acc / (wsum * 255.0);
+  return acc / (wsum * OPEN_MAX);
 }
 
 // The ambient MULTIPLIER: 1.0 where the sky is fully visible (and therefore
@@ -3072,6 +3086,34 @@ fn opennessAt(cell : vec3<i32>, p : vec3f, n : vec3f,
 // which is the sentence the phase is judged by.
 fn opennessScale(o : f32) -> f32 {
   return select(1.0, mix(1.0, o, TUNE_OPENNESS_STRENGTH), o >= 0.0);
+}
+
+// THE SHADOW LIFT CANNOT ENTER AN ENCLOSED SPACE. The penumbra law in
+// shadow_resolve.wgsl / sunShadowAt lifts a shadow toward TUNE_SHADOW_LIFT
+// (0.45 of full sun) by the DISTANCE to the blocker, on the argument that a
+// distant blocker only partially covers the solar disc. That argument holds
+// for a canopy or a fence; it says nothing about WHAT the blocker is, so a
+// cave floor whose ray hits the roof 10 m up got 45% direct sun through 10 m
+// of rock, and P1 then gathered that light onto the walls. Measured by eye
+// (2026-09-02): every cave chamber taller than shadowSoftFar glowed warm in
+// daylight, and the glow followed ceiling height.
+//
+// The disc's edge is only visible from a point that can see the sky, and the
+// openness byte is exactly that measurement. So the LIFTED part of the
+// shadow is scaled by openness while a fully lit face (v = 1, the ray hit
+// nothing) is untouched: a canyon floor in direct sun stays in full sun, a
+// meadow under a tree keeps its soft canopy shadow, a cave gets none.
+// Continuous across the blend between a lit and a lifted patch. `o < 0`
+// (no measurement) leaves the value alone, the pre-P0 look.
+//
+// Applied at every site that turns a shadow-ray distance into light: the
+// fragment shader's read (both the cache and its fallback), the resolve
+// pass's P1 deposit, and the openness walk's own sun sample. Not to the
+// PUBLISHED cache value, which stays the pure ray answer the shadow-cache
+// gate compares against the fragment-stage ray.
+fn shadowLiftCap(v : f32, o : f32) -> f32 {
+  if (o < 0.0) { return v; }
+  return v * mix(o, 1.0, smoothstep(min(TUNE_SHADOW_LIFT, 0.99), 1.0, v));
 }
 
 // The raster paths' version. A BODY is not in the voxel grid, so the block it
@@ -3095,7 +3137,7 @@ fn opennessScaleAtBody(worldPos : vec3f,
     let sbit = subOccBitLocal(lo);
     if (((*occ)[subOccIndex(idx, 1u, sbit >> 5u)] & (1u << (sbit & 31u))) != 0u) {
       let b = opennessByteAt(c, 3u, op, og);   // face 3 = +Y
-      return opennessScale(select(-1.0, f32(b) * (1.0 / 255.0), b >= 0));
+      return opennessScale(select(-1.0, f32(b) * (1.0 / OPEN_MAX), b >= 0));
     }
     c.y -= i32(SUBOCC_BLOCK);
   }

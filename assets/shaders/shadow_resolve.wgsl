@@ -83,6 +83,13 @@
 // a slot the window has reused starts its blend from zero.
 @group(0) @binding(8) var<storage, read_write> irradiance  : array<u32>;
 @group(0) @binding(9) var<storage, read>       opennessGen : array<u32>;
+// The openness byte grid itself, read so the P1 deposit can cap the shadow
+// LIFT by sky visibility (shadowLiftCap, common.wgsl): without it a cave
+// floor under a tall roof deposited 45% sun into the grid every frame and the
+// gather lit the cave with it. The published cache value is NOT capped here;
+// the fragment shader caps at its read, so the cache stays the pure ray
+// answer --gate shadow-cache compares against the fragment-stage ray.
+@group(0) @binding(10) var<storage, read>      openness    : array<u32>;
 
 // --------------------------------------------------------------- passes ----
 
@@ -184,7 +191,9 @@ fn resolve(@builtin(global_invocation_id) gid : vec3<u32>) {
     let pw = voxWordAt(cell);
     let pm = materials[voxMat(pw)];
     let albedo = paletteColor(pm, voxState(pw), &materials);
-    let sample = irrSample(albedo, n3, keyLightDirP(R), keyLightColorP(R), v,
+    let ob = opennessByteAt(cell, face, &openness, &opennessGen);
+    let lit = shadowLiftCap(v, select(-1.0, f32(ob) * (1.0 / OPEN_MAX), ob >= 0));
+    let sample = irrSample(albedo, n3, keyLightDirP(R), keyLightColorP(R), lit,
                            f32(pm.emission) / 255.0);
     let stampOk = opennessGen[chunkIndexW(cell)] == opennessStamp(worldChunkOf(cell));
     irrDeposit(irrIndexOfCell(cell, face), sample, GI_RESOLVE_ALPHA, stampOk,

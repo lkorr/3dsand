@@ -126,6 +126,38 @@ weaker sky term that would also brighten every cave. `debris.wgsl` is wired (per
 `opennessScaleAtBody` from the cube's position, `occupancy`/`openness`/`opennessGen` widened
 to the vertex stage), so an ember in a cave no longer glows at full sky ambient.
 
+### Cave verdict (2026-09-02, later, from a real cave, not the stamped room)
+
+The room frames passed and the caves were wrong anyway: daylight-grey walls with soft dark
+splotches, and warm glowing patches once the sun came up, all fully underground. Three
+mechanisms, each fixed in the same commit and each visible in the `openness_in` A/B arms
+(`build/openness_in_{nogi,nearest}.png` during the session; GI off changed nothing, nearest-
+block openness showed the truth under the filter):
+
+1. **"Unblocked within reach" is not "sees the sky".** A chamber wider than
+   `opennessReach` read as open. Now a ray that clears the reach casts one straight-UP coarse
+   ray from where it stopped; blocked there means under something, and the ray does not
+   count. Overhangs and canopies still shade (the sideways endpoints clear them); a hill does
+   not leak.
+2. **255 meant "no measurement" to the writer and "fully open" to the reader.** Every wall
+   face with a blocker in the block in front of it (a protruding voxel, a stalactite) lit at
+   full daylight, and every wall edge next to an empty-air block smeared daylight along the
+   wall through the bilinear filter. Now the byte's range is 0..254 (`OPEN_MAX`), 255 is a
+   sentinel `opennessByteAt` returns -1 for, and an unmeasured tap drops out of the filter
+   with weight 0 so the face inherits its measured neighbours. The terrace-riser argument
+   for "no opinion" still holds: a riser between two measured hillside faces takes their
+   value instead of full sky.
+3. **The shadow lift went through rock.** The distance-only penumbra gave any face whose
+   blocker is past `shadowSoftFar` 45% direct sun, including a cave floor under 10 m of
+   roof, and P1 then bounced it onto the walls. `shadowLiftCap` (common.wgsl) scales the
+   LIFTED part of a shadow by the face's openness at every site that turns a ray distance
+   into light: the fragment shader's read, the resolve pass's deposit (which now binds the
+   openness bytes) and the walk's sun sample. The published cache value stays the pure ray
+   answer, so `shadow-cache` still compares like with like.
+
+Hash unmoved (all render data); `openness`, `gi-bounce`, `shadow-cache`, `determinism` pass.
+Not yet re-judged by eye in the cave that reported it — that is the next look.
+
 **Consumers beyond lighting** (not built here, but the buffer is theirs too): worldgen
 openness placement is a different thing (a generation-time closed form, W1-C); audio's "can I
 hear the sky" (research §9) and the wind emitter at the cave mouth read this grid at the

@@ -142,10 +142,13 @@ fn openValueAt(blockMin : vec3<i32>, face : u32) -> u32 {
   // it was exactly the "harsh horizontal banding" that wrapDiffuse
   // (raymarch.wgsl) exists to remove. Openness put it back in one line.
   //
-  // 255 says "this face has no measurement" and the reader's opennessScale
-  // leaves it at the pre-P0 lerp. The conservative direction is the one that
-  // never darkens something wrongly, because a wrong darkening is a black band
-  // across a hillside and a missed darkening is the look we already shipped.
+  // 255 says "this face has no measurement" and the reader (opennessByteAt,
+  // common.wgsl) DROPS it from its bilinear filter, so the face inherits its
+  // measured neighbours and only falls back to the pre-P0 lerp when nothing
+  // around it was measured either. (It used to READ as fully open sky, which
+  // lit every such face at full daylight inside caves -- the splotches.) The
+  // conservative direction is still the one that never darkens something
+  // wrongly: a riser between two measured hillside faces takes their value.
   // Nothing real is lost: the faces P0 exists to darken — a cave floor, a room
   // floor, the ground under an overhang — all have AIR in the block in front of
   // them, so they march.
@@ -169,6 +172,18 @@ fn openValueAt(blockMin : vec3<i32>, face : u32) -> u32 {
   // reach EXACT, and it is the one the knob's units promise.
   let maxSteps = i32(reachVox / f32(SUBOCC_BLOCK)) + 4;
 
+  // AN UNBLOCKED RAY IS NOT SKY. "Nothing within opennessReach" was the whole
+  // test at first, and a cave chamber wider than 12 m read as full daylight:
+  // every face of it sat at 255 while the faces near a pillar darkened, which
+  // by eye was daylight-grey walls with soft dark splotches on them
+  // (2026-09-02). So a ray that clears the reach asks one more question from
+  // where it stopped: a straight-UP coarse march to the top of the window.
+  // Blocked there means the endpoint is under something -- a roof, a hill, a
+  // canopy -- and the ray did not find the sky. Under an overhang or a tree
+  // the sideways rays' endpoints are past the edge and still count as open;
+  // inside a hill every endpoint is under rock and nothing does. The up-ray
+  // is bounded by the window height (WORLD_N / SUBOCC_BLOCK coarse steps).
+  let upSteps = i32(WORLD_N / SUBOCC_BLOCK) + 4;
   var openW = 0.0;
   for (var r = 0u; r < OPEN_RAYS; r++) {
     var d = n;
@@ -180,11 +195,19 @@ fn openValueAt(blockMin : vec3<i32>, face : u32) -> u32 {
     // read inside traceOpaque is unreachable on this path, which is why this
     // pass costs 4 words per chunk of traffic instead of 16 KiB.
     let s = traceOpaque(ro, d, maxSteps, 0.0, &occupancy, &materials);
-    let blocked = s.hit && (s.t * VOXEL_METERS) <= TUNE_OPENNESS_REACH;
+    var blocked = s.hit && (s.t * VOXEL_METERS) <= TUNE_OPENNESS_REACH;
+    if (!blocked) {
+      let e = ro + d * reachVox;
+      let up = traceOpaque(e, vec3f(0.0, 1.0, 0.0), upSteps, 0.0,
+                           &occupancy, &materials);
+      blocked = up.hit;
+    }
     let w = select(1.0, 2.0, r == 0u);
     if (!blocked) { openW += w; }
   }
-  return u32(clamp(openW / OPEN_WEIGHT_TOTAL, 0.0, 1.0) * 255.0 + 0.5);
+  // 0..OPEN_MAX (254): 255 is the reader's "not measured" sentinel
+  // (opennessByteAt, common.wgsl), never a measurement.
+  return u32(clamp(openW / OPEN_WEIGHT_TOTAL, 0.0, 1.0) * OPEN_MAX + 0.5);
 }
 
 // ---- P1: the walk's coarse sun sample (docs/PLAN_gi.md §3) -----------------
@@ -200,7 +223,7 @@ fn openValueAt(blockMin : vec3<i32>, face : u32) -> u32 {
 // face centre holds no blocker at all (a block with one voxel in a corner):
 // then the walk has no albedo to speak of and leaves the word alone rather than
 // pulling a real deposit toward zero.
-fn openSunSample(blockMin : vec3<i32>, face : u32) -> vec4f {
+fn openSunSample(blockMin : vec3<i32>, face : u32, open : f32) -> vec4f {
   let n = openFaceNormal(face);
   let L = keyLightDirP(R);
   let half = f32(SUBOCC_BLOCK) * 0.5;
@@ -241,6 +264,9 @@ fn openSunSample(blockMin : vec3<i32>, face : u32) -> vec4f {
       lit = clamp(smoothstep(TUNE_SHADOW_SOFT_NEAR, TUNE_SHADOW_SOFT_FAR, dM) *
                   TUNE_SHADOW_LIFT, 0.0, 1.0);
     }
+    // The lift cannot enter an enclosed space (shadowLiftCap, common.wgsl);
+    // `open` is the openness this same visit just measured for the face.
+    lit = shadowLiftCap(lit, open);
   }
   return vec4f(irrSample(albedo, n, L, keyLightColorP(R), lit, emis), 1.0);
 }
@@ -284,6 +310,9 @@ fn openChunk(slot : u32, li : u32, origin : vec3<i32>) {
       let blockMin = chunkMin + vec3<i32>(i32(bx), i32(by), i32(bz)) *
                                     i32(SUBOCC_BLOCK);
       let ov = openValueAt(blockMin, face);
+      // Measured values are already <= OPEN_MAX; 256 ("no opinion") lands on
+      // 255, which the reader drops from its filter rather than reading as
+      // open sky -- the splotch fix, see opennessByteAt.
       v = min(ov, 255u);
       // ---- P1: keep the face's irradiance word honest ----
       // Marched: blend in one coarse sun sample. Could not march (a blocker
@@ -292,7 +321,7 @@ fn openChunk(slot : u32, li : u32, origin : vec3<i32>) {
       // pass re-deposits it every frame while any patch of it is on screen.
       if (TUNE_GI_STRENGTH > 0.0) {
         if (ov < 256u) {
-          let smp = openSunSample(blockMin, face);
+          let smp = openSunSample(blockMin, face, f32(ov) * (1.0 / OPEN_MAX));
           if (smp.w > 0.0) {
             irrDeposit(idx, smp.xyz, GI_WALK_ALPHA, stampOk, &irradiance);
           }

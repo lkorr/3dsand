@@ -558,6 +558,9 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         // slot stamp so a reused slot starts its blend from zero.
         entry(8, T::Storage),          // irradiance
         entry(9, T::ReadOnlyStorage),  // opennessGen
+        // The openness bytes, so the deposit can cap the shadow lift by sky
+        // visibility (shadowLiftCap in common.wgsl; see shadow_resolve.wgsl).
+        entry(10, T::ReadOnlyStorage), // openness
     };
     shadowBGL_ = device.CreateBindGroupLayout(entries, std::size(entries));
 
@@ -572,6 +575,7 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         b(7, world_->shadowArgsStage),
         b(8, world_->irradiance),
         b(9, world_->opennessGen),
+        b(10, world_->openness),
     };
     shadowBG_ = device.CreateBindGroup(shadowBGL_, bges, std::size(bges), "shadowBG");
     rhi::BindGroupLayout shadowGroups[] = {shadowBGL_};

@@ -615,7 +615,8 @@ PASS(copy_shadowArgs, nullptr, PT_SHADOWCACHE, PIPE_NONE, K_COPY, 0,0,12, GRP_NO
 PASS(shadow_resolve, "shadowResolve", PT_SHADOWCACHE, PIPE_SHADOW_RESOLVE, K_INDIRECT, IND_SHADOWARGS,1,1,
      GRP_SHADOW, DYN_NONE, C_ALWAYS, 1,
      USES(R(Voxels) R(Occupancy) R(Materials) U(RenderUBO) R(PageTable)
-          A(ShadowCache) A(ShadowReq) I(ShadowArgs) W(Irradiance) R(OpennessGen)))
+          A(ShadowCache) A(ShadowReq) I(ShadowArgs) W(Irradiance) R(OpennessGen)
+          R(Openness)))
 
 // =========================================================== PT_FLUID ======
 // ONE MLS-MPM SUBSTEP (docs/PLAN_mpm_fluids.md; sim_fluid.wgsl). Recorded
