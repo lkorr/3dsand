@@ -59,6 +59,7 @@ bash scripts/build.sh --configure       # force cmake reconfigure
 ./build/Release/sandvox.exe --suite acceptance            # one-process full acceptance (selftest + both smokes + validation)
 ./build/Release/sandvox.exe --sweep sim.windDragRef=6,40  # in-process parameter differential
 ./build/Release/sandvox.exe --frames 400                  # windowed N frames then exit
+./build/Release/sandvox.exe --shader-stats                # per-shader registers/spills from the driver -> build/shader_stats.json
 SANDVOX_PT_DEBUG=1 ./build/Release/sandvox.exe --frames 1200 --autofly-hard   # page-pool sizing: adversarial traversal (see below)
 bash scripts/check_shaders.sh                             # validate WGSL without rebuild
 python scripts/check_invariants.py                        # "two places must agree" checks

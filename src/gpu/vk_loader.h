@@ -193,6 +193,13 @@ struct DeviceFns {
   PFN_vkCmdWriteTimestamp2 CmdWriteTimestamp2 = nullptr;
   PFN_vkCmdCopyQueryPoolResults CmdCopyQueryPoolResults = nullptr;
   PFN_vkGetQueryPoolResults GetQueryPoolResults = nullptr;
+
+  // VK_KHR_pipeline_executable_properties (`--shader-stats`). Null unless the
+  // device enabled the extension, and every caller must check: the whole point
+  // of that mode is that a driver which cannot report register pressure SAYS
+  // SO, rather than letting us keep guessing at spills.
+  PFN_vkGetPipelineExecutablePropertiesKHR GetPipelineExecutablePropertiesKHR = nullptr;
+  PFN_vkGetPipelineExecutableStatisticsKHR GetPipelineExecutableStatisticsKHR = nullptr;
 };
 
 // Open vulkan-1.dll and resolve the global tier. Returns false with `err` set
