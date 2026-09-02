@@ -47,8 +47,14 @@ let seed = 1;
 let framed = false;
 let libs = {water: {}, trees: {}};
 let treeCache = new Map();
-let view = {trees: true, water: true, cover: true, showcase: true, sizeM: 24};
+let view = {trees: true, water: true, cover: true, showcase: true, sizeM: 96};
 let lastSwatch = null;
+// The swatch is composed in swatch_worker.js (see there for why). One request
+// in flight; a request made while one is running waits as `queued` and
+// replaces any earlier waiter, so a slider drag costs at most one extra
+// compose. `null` = not tried yet, `false` = the worker could not be built and
+// the page composes inline as it did before.
+let swatchWorker = null, swatchReq = 0, swatchBusy = false, swatchQueued = null;
 
 const vpm = () => (H.voxelsPerMetre && H.voxelsPerMetre()) || BG.DEFAULT_VOX_PER_M;
 
@@ -74,6 +80,7 @@ async function loadLibs() {
   }
   libs = out;
   treeCache = new Map();
+  if (swatchWorker) swatchWorker.postMessage({cmd: 'libs', libs});
   return libs;
 }
 
@@ -105,47 +112,103 @@ async function readBiome(name) {
 /* ===========================================================================
  * the swatch
  * ======================================================================== */
+function ensureWorker() {
+  if (swatchWorker !== null) return swatchWorker;
+  try {
+    const w = new Worker(new URL('./swatch_worker.js', import.meta.url), {type: 'module'});
+    w.onmessage = (e) => onSwatch(e.data);
+    // A module worker that fails to LOAD reports here, not in the constructor;
+    // fall back to composing inline and answer the request that was waiting.
+    w.onerror = (e) => {
+      console.error('biome: swatch worker failed, composing inline', e && e.message);
+      if (swatchWorker === w) { swatchWorker = false; swatchBusy = false; }
+      const q = swatchQueued; swatchQueued = null;
+      if (q) composeInline(q);
+    };
+    w.postMessage({cmd: 'libs', libs});
+    swatchWorker = w;
+  } catch (e) {
+    console.error('biome: no swatch worker, composing inline', e);
+    swatchWorker = false;
+  }
+  return swatchWorker;
+}
+
+function composeInline(req) {
+  // Yield a frame so the status paints before a multi-second tree bake.
+  setTimeout(() => {
+    const t0 = performance.now();
+    try {
+      const res = BG.generateSwatch(req.biome, libs, req.seed, Object.assign({treeCache}, req.opts));
+      const missing = BG.remapToMaterials(res, req.matIds);
+      onSwatch({cmd: 'swatch', id: req.id, res, missing, ms: performance.now() - t0});
+    } catch (e) {
+      onSwatch({cmd: 'error', id: req.id, error: String(e && e.stack || e)});
+    }
+  }, 0);
+}
+
+function requestSwatch() {
+  if (!biome) return;
+  const req = {
+    cmd: 'swatch', id: ++swatchReq, biome, seed,
+    matIds: (H.materials() || []).map(m => m.id),
+    opts: {vpm: BG.swatchScale(view.sizeM, vpm()), sizeM: view.sizeM, showcase: view.showcase,
+           noTrees: !view.trees, noWater: !view.water, noCover: !view.cover}
+  };
+  els.stats.innerHTML = '<span class="warn">composing…</span>';
+  const w = ensureWorker();
+  if (!w) { composeInline(req); return; }
+  if (swatchBusy) { swatchQueued = req; return; }
+  swatchBusy = true;
+  w.postMessage(req);
+}
+
+function onSwatch(m) {
+  if (m.cmd === 'progress') {
+    if (m.id === swatchReq) els.stats.innerHTML = '<span class="warn">composing… ' + m.text + '</span>';
+    return;
+  }
+  swatchBusy = false;
+  const q = swatchQueued; swatchQueued = null;
+  if (q && swatchWorker) { swatchBusy = true; swatchWorker.postMessage(q); }
+  if (m.id !== swatchReq) return;            // superseded while it ran
+  if (m.cmd === 'error') {
+    els.stats.textContent = 'swatch failed: ' + m.error;
+    console.error(m.error);
+    return;
+  }
+  const res = m.res;
+  lastSwatch = res;
+  const full = vpm();
+  const lod = full / res.vpm;                // bake cells -> world voxels
+  if (wv) {
+    wv.setLocalRegions([{cells: res.cells, nx: res.dim.x, ny: res.dim.y, nz: res.dim.z,
+                         origin: [0, 0, 0], lod}]);
+    if (!framed) {
+      UI.frame(wv, {x: res.dim.x * lod, y: res.dim.y * lod, z: res.dim.z * lod}, [0, 0, 0], 0.3);
+      wv.cam.pitch = -0.6; framed = true;
+    }
+  }
+  const mt = res.meta;
+  const fmt = (o) => Object.entries(o).map(([k, v]) => k + ' ' + v).join(', ') || '—';
+  const scale = res.vpm === full ? '1:1' : `1:${(full / res.vpm).toFixed(full % res.vpm ? 1 : 0)}`;
+  els.stats.innerHTML =
+    `<b>${res.dim.x}×${res.dim.y}×${res.dim.z}</b> cells · ${view.sizeM} m at ${res.vpm} vpm (${scale}, ` +
+    `${Math.round(100 / res.vpm)} cm cells) · ${mt.voxels.toLocaleString()} voxels · ${Math.round(m.ms)} ms` +
+    (mt.clipped ? ' · <span class="warn">HEIGHT CLIPPED</span>' : '') +
+    `<br>trees: ${fmt(mt.trees)}` + (mt.skipped.trees ? ` <span class="warn">(${mt.skipped.trees} gated out)</span>` : '') +
+    `<br>water: ${fmt(mt.water)}` + (view.showcase && mt.waterBodies ? ' <span class="warn">(showcase — one of each, not true rarity)</span>' : '') +
+    `<br>cover: ${fmt(mt.cover)}` +
+    (m.missing.length ? '<br><span class="warn">materials.json has no ' + m.missing.join(', ') + '</span>' : '');
+  validateInto(els.valid);
+}
+
+// 150 ms and not the 400 it used to be: composing no longer blocks the page,
+// and a request that lands mid-compose just waits its turn (requestSwatch).
 function regenerate(now) {
   clearTimeout(genTimer);
-  const run = () => {
-    if (!biome) return;
-    els.stats.innerHTML = '<span class="warn">composing…</span>';
-    // Yield a frame so the status paints before a multi-second tree bake.
-    setTimeout(() => {
-      const t0 = performance.now();
-      let res;
-      try {
-        res = BG.generateSwatch(biome, libs, seed, {
-          vpm: vpm(), treeCache, sizeM: view.sizeM, showcase: view.showcase,
-          noTrees: !view.trees, noWater: !view.water, noCover: !view.cover
-        });
-      } catch (e) {
-        els.stats.textContent = 'swatch failed: ' + (e && e.message || e);
-        console.error(e);
-        return;
-      }
-      lastSwatch = res;
-      const mats = H.materials() || [];
-      const missing = [];
-      if (wv) {
-        wv.setLocalRegions([{cells: UI.toViewerCells(res, mats, missing), nx: res.dim.x, ny: res.dim.y,
-                             nz: res.dim.z, origin: [0, 0, 0]}]);
-        if (!framed) { UI.frame(wv, res.dim, [0, 0, 0], 0.3); wv.cam.pitch = -0.6; framed = true; }
-      }
-      const m = res.meta;
-      const fmt = (o) => Object.entries(o).map(([k, v]) => k + ' ' + v).join(', ') || '—';
-      els.stats.innerHTML =
-        `<b>${res.dim.x}×${res.dim.y}×${res.dim.z}</b> (${view.sizeM} m) · ${m.voxels.toLocaleString()} voxels · ` +
-        `${Math.round(performance.now() - t0)} ms` +
-        (m.clipped ? ' · <span class="warn">HEIGHT CLIPPED</span>' : '') +
-        `<br>trees: ${fmt(m.trees)}` + (m.skipped.trees ? ` <span class="warn">(${m.skipped.trees} gated out)</span>` : '') +
-        `<br>water: ${fmt(m.water)}` + (view.showcase && m.waterBodies ? ' <span class="warn">(showcase — one of each, not true rarity)</span>' : '') +
-        `<br>cover: ${fmt(m.cover)}` +
-        (missing.length ? '<br><span class="warn">materials.json has no ' + missing.join(', ') + '</span>' : '');
-      validateInto(els.valid);
-    }, 0);
-  };
-  if (now) run(); else genTimer = setTimeout(run, 400);
+  if (now) requestSwatch(); else genTimer = setTimeout(requestSwatch, 150);
 }
 
 function validateInto(host) {
@@ -737,9 +800,14 @@ export function attach(hooks) {
   els.stats = el('div', {class: CLS + 'stats'}, 'loading…');
   els.valid = el('div', {class: CLS + 'valid'});
   els.seed = el('input', {type: 'number', class: CLS + 'num', value: '1', style: 'width:56px', min: '0', max: '9999'});
-  els.size = el('select', {class: CLS + 'num', style: 'width:70px', title: 'swatch side'});
-  [16, 24, 32].forEach(m => els.size.append(el('option', {value: m}, m + ' m')));
-  els.size.value = '24';
+  els.size = el('select', {class: CLS + 'num', style: 'width:110px',
+                            title: 'Swatch side. Up to 32 m the swatch is 1:1 with the engine; bigger swatches bake ' +
+                                   'coarser (the cell size shown) so a whole biome fits — see biomegen.swatchScale.'});
+  BG.SWATCH_SIZES_M.forEach(m => {
+    const v = BG.swatchScale(m, vpm());
+    els.size.append(el('option', {value: m}, m + ' m · ' + (v === vpm() ? '1:1' : Math.round(100 / v) + ' cm')));
+  });
+  els.size.value = String(view.sizeM);
   const tog = (key, label, title) => {
     const b = el('button', {class: view[key] ? 'on' : '', title}, label);
     b.addEventListener('click', () => { view[key] = !view[key]; b.classList.toggle('on', view[key]); regenerate(true); });
@@ -779,7 +847,7 @@ export function attach(hooks) {
          tog('trees', 'trees', 'compose the tree stack'),
          tog('water', 'water', 'compose the water stack'),
          tog('cover', 'cover', 'compose the ground cover'),
-         tog('showcase', 'showcase water', 'ON: one of every water row, centred — judge the shoreline. OFF: true tile + rarity, which on a 24 m swatch is usually nothing.')),
+         tog('showcase', 'showcase water', 'ON: one of every water row, centred — judge the shoreline. OFF: true tile + rarity — on a 24 m swatch usually nothing, on a 96–128 m swatch the real picture.')),
       cv, els.stats));
 
   wv = UI.makeView(cv, H.materials() || [], () => root.classList.contains('active') && H.isVisible(),

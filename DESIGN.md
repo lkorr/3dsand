@@ -5570,10 +5570,47 @@ risk: cover blocks and `treeInfoAt` chances first (outside every mirror), then
 `biomeAt` reading a table, then pond geometry last (it needs a C++ twin of the
 table under the mirror's token compare).
 
+### The swatch is a scale ladder, composed off the main thread (2026-09-01)
+
+The biome page's swatch runs from 16 m to 128 m on a side. Up to 32 m it is
+1:1 with the engine (10 vpm). Past that it does NOT get a bigger grid: it
+bakes COARSER, at the finest INTEGER vpm that keeps the side inside
+`MAX_SWATCH` = 384 cells (`biomegen.swatchScale`: 8 vpm at 48 m, 6 at 64,
+4 at 96, 3 at 128), and the viewer draws the one region at `lod = 10 / vpm`
+so it lands in world metres. The reason is the dense volume: a swatch is one
+`nx*ny*nz` Uint16 array copied twice more on the way to the screen (the
+viewer's cells, the mesher's lent copy) and once into a 3D texture, and a
+96 m forest at 10 vpm would be 16x the 24 m swatch's 32 MB per copy — over
+2 GB in flight before the mesher ran. Integer vpm because treegen bakes at
+integer vpm only, so every species goes through the real generator at the
+ground's scale and the composition stays exact rather than resampled; the
+tree cache is keyed on vpm, so the first swatch at a new scale bakes every
+species it places (seconds), reported as progress, and later ones do not.
+
+Composition runs in `assets/editor/swatch_worker.js`, a module worker that
+owns the libraries and the tree cache and returns the cells as one
+transferred buffer already remapped to engine material ids
+(`biomegen.remapToMaterials`). One request in flight; a request made while
+one runs waits as the single queued one, so a slider drag costs at most one
+extra compose and the page never stops answering. If the worker cannot be
+built the page composes inline as it did before.
+
+The viewer side is `worldview.js`'s greedy mesher, rewritten the same day:
+occupancy through a 4096-entry LUT built once per palette, both draw layers
+in one sweep, each plane read from the volume once (the x and y sweeps are
+strided gathers), the merge bounded to the rows and columns that hold a
+face, quads into growable typed arrays. Byte-identical quads to the first
+mesher, with and without neighbour slabs, at 5–6x the speed (a 16M-cell
+swatch: 2.2–3.6 s → ~0.45 s). Vertex positions are Uint16 now; the first
+mesher packed them as bytes, which folded every region past 255 cells on a
+side back over itself — the 320-cell 32 m swatch and any water body wider
+than 25 m drew wrong, with no error anywhere.
+
 ### Verify
 
 `node scripts/test_environment.mjs` (data: determinism of both generators,
-preset sanity, biome validity, the species mirror, the swatch),
+preset sanity, biome validity, the species mirror, the swatch, the scale
+ladder and the in-place remap),
 `bash scripts/check_environment.sh` (the tab in real Chrome: mount, sidebar,
 three pages, WebGL meshing, framebuffer, plan/profile canvases, undo, deep
 links, save routes), `--selftest --gate biomes` (the engine's side),

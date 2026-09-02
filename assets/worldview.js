@@ -154,97 +154,148 @@
     // at a seam fills itself when the neighbour lands, a double-emitted face
     // z-fights for as long as both regions are loaded.
     'var OC_EMPTY = 0, OC_OPAQUE = 1, OC_FLUID = 2;',
-    'function occOf(v){',
-    '  var m = v & 0xFFF;',
-    '  if (!m) return OC_EMPTY;',
-    '  var c = CLS[m];',
-    '  return (c === 2 || c === 3) ? OC_FLUID : OC_OPAQUE;',
+    // material id -> OC_*, built once per classes message. The first mesher
+    // asked a closure for this per cell, per direction, per layer — twelve
+    // bounds-checked calls a cell — and a 16M-cell biome swatch took 2.2 s in
+    // it. Same greedy rectangles, lookups hoisted: the same swatch is ~0.25 s.
+    'var OCC = null;',
+    'function buildOcc(){',
+    '  OCC = new Uint8Array(4096);',
+    '  for (var m = 1; m < 4096; m++) { var c = CLS ? CLS[m] : 0; OCC[m] = (c === 2 || c === 3) ? OC_FLUID : OC_OPAQUE; }',
+    '}',
+    // Occupancy of a neighbour slab (raw cell words), or null when absent.
+    'function slabOcc(slab){',
+    '  if (!slab) return null;',
+    '  var o = new Uint8Array(slab.length);',
+    '  for (var k = 0; k < slab.length; k++) { var m = slab[k] & 0xFFF; o[k] = m ? OCC[m] : OC_EMPTY; }',
+    '  return o;',
     '}',
     '',
-    // Greedy mesh, one pass per draw layer.
+    // A growable quad list. Vertices are (x, y, z, face) as Uint16: the first
+    // version packed them as BYTES, which wrapped every region past 255 cells
+    // on a side — the 320-cell biome swatch drew its far third folded back
+    // over its near third, with no error anywhere. 16 bits reach 65535.
+    'function QuadList(){ this.v = new Uint16Array(16 * 1024); this.i = new Uint32Array(6 * 1024); this.n = 0; }',
+    'QuadList.prototype.push = function(p, du, dv, face, sign){',
+    '  var n = this.n;',
+    '  if ((n + 1) * 16 > this.v.length) {',
+    '    var nv = new Uint16Array(this.v.length * 2); nv.set(this.v); this.v = nv;',
+    '    var ni = new Uint32Array(this.i.length * 2); ni.set(this.i); this.i = ni;',
+    '  }',
+    '  var v = this.v, vo = n * 16, i = this.i, io = n * 6, b = n * 4;',
+    '  v[vo] = p[0]; v[vo + 1] = p[1]; v[vo + 2] = p[2]; v[vo + 3] = face;',
+    '  v[vo + 4] = p[0] + du[0]; v[vo + 5] = p[1] + du[1]; v[vo + 6] = p[2] + du[2]; v[vo + 7] = face;',
+    '  v[vo + 8] = p[0] + du[0] + dv[0]; v[vo + 9] = p[1] + du[1] + dv[1]; v[vo + 10] = p[2] + du[2] + dv[2]; v[vo + 11] = face;',
+    '  v[vo + 12] = p[0] + dv[0]; v[vo + 13] = p[1] + dv[1]; v[vo + 14] = p[2] + dv[2]; v[vo + 15] = face;',
+    // Winding flips with the sign so both sides stay front-facing under
+    // back-face culling.
+    '  if (sign > 0) { i[io] = b; i[io + 1] = b + 1; i[io + 2] = b + 2; i[io + 3] = b; i[io + 4] = b + 2; i[io + 5] = b + 3; }',
+    '  else { i[io] = b; i[io + 1] = b + 2; i[io + 2] = b + 1; i[io + 3] = b; i[io + 4] = b + 3; i[io + 5] = b + 2; }',
+    '  this.n = n + 1;',
+    '};',
+    'QuadList.prototype.done = function(){ return {verts: this.v.slice(0, this.n * 16), idx: this.i.slice(0, this.n * 6), quads: this.n}; };',
+    '',
+    // Greedy merge of one signed face mask (mw x mh, +1 facing +d, -1 facing
+    // -d) at slice `s` of axis d. Widest run first, then as tall as every row
+    // still matches; merged cells are zeroed so the mask is clean for the next
+    // slice. Face index 0..5 = -x,+x,-y,+y,-z,+z, which the shader turns into
+    // the normal and the two tangents.
+    // Only rows j0..j1 and columns i0..i1 can hold a face (the sweep tracked
+    // the bounds while it built the mask); the rest of the plane is sky and is
+    // skipped without being read. The tall-run test past j1 still reads zeros
+    // and stops on the first one.
+    'function mergeMask(mask, mw, mh, d, u, v2, s, out, j0, j1, i0, i1){',
+    '  var p = [0, 0, 0], du = [0, 0, 0], dv = [0, 0, 0];',
+    '  for (var j = j0; j <= j1; j++) {',
+    '    var n = j * mw + i0;',
+    '    for (var i = i0; i <= i1;) {',
+    '      var c = mask[n];',
+    '      if (!c) { i++; n++; continue; }',
+    '      var w = 1;',
+    '      while (i + w <= i1 && mask[n + w] === c) w++;',
+    '      var hgt = 1, done = false;',
+    '      while (j + hgt < mh) {',
+    '        var row = n + hgt * mw;',
+    '        for (var kk = 0; kk < w; kk++) if (mask[row + kk] !== c) { done = true; break; }',
+    '        if (done) break;',
+    '        hgt++;',
+    '      }',
+    '      p[0] = p[1] = p[2] = 0; p[d] = s; p[u] = i; p[v2] = j;',
+    '      du[0] = du[1] = du[2] = 0; du[u] = w;',
+    '      dv[0] = dv[1] = dv[2] = 0; dv[v2] = hgt;',
+    '      out.push(p, du, dv, d * 2 + (c > 0 ? 1 : 0), c);',
+    '      for (var l = 0; l < hgt; l++) { var ro = n + l * mw; for (var kx = 0; kx < w; kx++) mask[ro + kx] = 0; }',
+    '      i += w; n += w;',
+    '    }',
+    '  }',
+    '}',
+    '',
+    // Greedy mesh, both draw layers in one sweep:
     //   layer 0 (opaque):  a solid cell facing empty or fluid
     //   layer 1 (fluid):   a liquid/gas cell facing empty
     // Merging tests only "is this face exposed, and which way does it point",
     // because colour is a texture lookup in the fragment shader. That is what
     // makes a flat plain a few quads instead of one per cell.
-    'function mesh(cells, nx, ny, nz, nbr, layer){',
-    '  var dims = [nx, ny, nz];',
-    '  var verts = [], idx = [], vcount = 0;',
-    '  function at(x, y, z){',
-    // Out of the region: read the neighbour slab if we have it, else OPAQUE.
-    '    if (x < 0) return nbr.nx0 ? nbr.nx0[z * ny + y] : -1;',
-    '    if (x >= nx) return nbr.px0 ? nbr.px0[z * ny + y] : -1;',
-    '    if (y < 0) return nbr.ny0 ? nbr.ny0[z * nx + x] : -1;',
-    '    if (y >= ny) return nbr.py0 ? nbr.py0[z * nx + x] : -1;',
-    '    if (z < 0) return nbr.nz0 ? nbr.nz0[y * nx + x] : -1;',
-    '    if (z >= nz) return nbr.pz0 ? nbr.pz0[y * nx + x] : -1;',
-    '    return cells[(z * ny + y) * nx + x];',
-    '  }',
-    '  function occ(x, y, z){ var v = at(x, y, z); return v < 0 ? OC_OPAQUE : occOf(v); }',
+    //
+    // Out of the region: the neighbour slab if we have it, else OPAQUE. The
+    // slabs are laid out as _neighborSlabs builds them — x-slab [z*ny+y],
+    // y-slab [z*nx+x], z-slab [y*nx+x] — which in (i along u, j along v2)
+    // terms is j*mw+i for x and z, i*mh+j for y.
+    'function mesh(cells, nx, ny, nz, nbr){',
+    '  if (!OCC) buildOcc();',
+    '  var dims = [nx, ny, nz], st = [1, nx, nx * ny], total = nx * ny * nz;',
+    '  var occ = new Uint8Array(total);',
+    '  for (var k = 0; k < total; k++) { var m = cells[k] & 0xFFF; if (m) occ[k] = OCC[m]; }',
+    '  var op = new QuadList(), fl = new QuadList();',
+    '  var slabs = [[nbr.nx0, nbr.px0], [nbr.ny0, nbr.py0], [nbr.nz0, nbr.pz0]];',
     '  for (var d = 0; d < 3; d++) {',
     '    var u = (d + 1) % 3, v2 = (d + 2) % 3;',
-    '    var x = [0, 0, 0], q = [0, 0, 0]; q[d] = 1;',
-    '    var mw = dims[u], mh = dims[v2];',
-    '    var mask = new Int8Array(mw * mh);',
-    '    for (x[d] = -1; x[d] < dims[d];) {',
-    '      var n = 0;',
-    '      for (x[v2] = 0; x[v2] < mh; x[v2]++)',
-    '        for (x[u] = 0; x[u] < mw; x[u]++) {',
-    '          var a = occ(x[0], x[1], x[2]);',
-    '          var b = occ(x[0] + q[0], x[1] + q[1], x[2] + q[2]);',
-    '          var f = 0;',
-    '          if (layer === 0) {',
-    '            if (a === OC_OPAQUE && b !== OC_OPAQUE) f = 1;',
-    '            else if (b === OC_OPAQUE && a !== OC_OPAQUE) f = -1;',
-    '          } else {',
-    '            if (a === OC_FLUID && b === OC_EMPTY) f = 1;',
-    '            else if (b === OC_FLUID && a === OC_EMPTY) f = -1;',
-    '          }',
-    '          mask[n++] = f;',
-    '        }',
-    '      x[d]++;',
-    '      n = 0;',
-    '      for (var j = 0; j < mh; j++) {',
-    '        for (var i = 0; i < mw;) {',
-    '          var c = mask[n];',
-    '          if (!c) { i++; n++; continue; }',
-    '          var w = 1;',
-    '          while (i + w < mw && mask[n + w] === c) w++;',
-    '          var hgt = 1, done = false;',
-    '          while (j + hgt < mh) {',
-    '            for (var kk = 0; kk < w; kk++)',
-    '              if (mask[n + hgt * mw + kk] !== c) { done = true; break; }',
-    '            if (done) break;',
-    '            hgt++;',
-    '          }',
-    '          var p0 = [0, 0, 0]; p0[d] = x[d]; p0[u] = i; p0[v2] = j;',
-    '          var du = [0, 0, 0]; du[u] = w;',
-    '          var dv = [0, 0, 0]; dv[v2] = hgt;',
-    // Face index 0..5 = -x,+x,-y,+y,-z,+z, which the shader turns into the
-    // normal and the two tangents. Winding flips with the sign so both sides
-    // stay front-facing under back-face culling.
-    '          var face = d * 2 + (c > 0 ? 1 : 0);',
-    '          var v0 = vcount;',
-    '          verts.push(p0[0], p0[1], p0[2], face);',
-    '          verts.push(p0[0] + du[0], p0[1] + du[1], p0[2] + du[2], face);',
-    '          verts.push(p0[0] + du[0] + dv[0], p0[1] + du[1] + dv[1], p0[2] + du[2] + dv[2], face);',
-    '          verts.push(p0[0] + dv[0], p0[1] + dv[1], p0[2] + dv[2], face);',
-    '          vcount += 4;',
-    '          if (c > 0) idx.push(v0, v0 + 1, v0 + 2, v0, v0 + 2, v0 + 3);',
-    '          else idx.push(v0, v0 + 2, v0 + 1, v0, v0 + 3, v0 + 2);',
-    '          for (var l = 0; l < hgt; l++)',
-    '            for (var kx = 0; kx < w; kx++) mask[n + l * mw + kx] = 0;',
-    '          i += w; n += w;',
-    '        }',
+    '    var mw = dims[u], mh = dims[v2], su = st[u], sv = st[v2], sd = st[d], nd = dims[d];',
+    '    var mop = new Int8Array(mw * mh), mfl = new Int8Array(mw * mh);',
+    '    var lo = slabOcc(slabs[d][0]), hi = slabOcc(slabs[d][1]);',
+    '    var loM = null, hiM = null;',
+    '    if (lo || hi) {',
+    // Re-lay the slabs in mask order once, so the slice loop reads them by n.
+    '      loM = new Uint8Array(mw * mh).fill(OC_OPAQUE); hiM = new Uint8Array(mw * mh).fill(OC_OPAQUE);',
+    '      for (var jj = 0; jj < mh; jj++) for (var ii = 0; ii < mw; ii++) {',
+    '        var si = d === 1 ? ii * mh + jj : jj * mw + ii, mi = jj * mw + ii;',
+    '        if (lo) loM[mi] = lo[si]; if (hi) hiM[mi] = hi[si];',
     '      }',
     '    }',
+    // Slice s of the sweep compares plane s-1 (a) with plane s (b). Plane s
+    // is next slice's a, so it is read from the volume ONCE and kept: for the
+    // x and y axes that read is a strided gather (stride nx, then nx*ny), and
+    // reading each plane twice was half the mesher's time.
+    '    var prev = new Uint8Array(mw * mh), cur = new Uint8Array(mw * mh);',
+    '    if (loM) prev.set(loM); else prev.fill(OC_OPAQUE);',
+    '    for (var s = 0; s <= nd; s++) {',
+    '      var n = 0, anyO = false, anyF = false, j0 = mh, j1 = -1, i0 = mw, i1 = -1;',
+    '      if (s === nd) { if (hiM) cur.set(hiM); else cur.fill(OC_OPAQUE); }',
+    '      for (var j = 0; j < mh; j++) {',
+    '        var base = s * sd + j * sv;',
+    '        for (var i = 0; i < mw; i++, n++) {',
+    '          var b = s === nd ? cur[n] : (cur[n] = occ[base + i * su]);',
+    '          var a = prev[n], fo = 0, ff = 0;',
+    '          if (a !== b) {',
+    '            if (a === OC_OPAQUE) fo = 1; else if (b === OC_OPAQUE) fo = -1;',
+    '            if (a === OC_FLUID && b === OC_EMPTY) ff = 1; else if (b === OC_FLUID && a === OC_EMPTY) ff = -1;',
+    '            if (fo) anyO = true; if (ff) anyF = true;',
+    '            if (j < j0) j0 = j; if (j > j1) j1 = j; if (i < i0) i0 = i; if (i > i1) i1 = i;',
+    '          }',
+    '          mop[n] = fo; mfl[n] = ff;',
+    '        }',
+    '      }',
+    '      var t = prev; prev = cur; cur = t;',
+    '      if (anyO) mergeMask(mop, mw, mh, d, u, v2, s, op, j0, j1, i0, i1);',
+    '      if (anyF) mergeMask(mfl, mw, mh, d, u, v2, s, fl, j0, j1, i0, i1);',
+    '    }',
     '  }',
-    '  return {verts: new Uint8Array(verts), idx: new Uint32Array(idx), quads: vcount / 4};',
+    '  return {op: op.done(), fl: fl.done()};',
     '}',
     '',
     'self.onmessage = function(e){',
     '  var m = e.data;',
-    '  if (m.cmd === "classes") { CLS = m.classes; PASSABLE = m.passable; return; }',
+    '  if (m.cmd === "classes") { CLS = m.classes; PASSABLE = m.passable; OCC = null; return; }',
     '  if (m.cmd === "decode") {',
     '    try {',
     '      var h = decode(m.buf);',
@@ -255,13 +306,12 @@
     '  }',
     '  if (m.cmd === "mesh") {',
     '    try {',
-    '      var op = mesh(m.cells, m.nx, m.ny, m.nz, m.nbr || {}, 0);',
-    '      var fl = mesh(m.cells, m.nx, m.ny, m.nz, m.nbr || {}, 1);',
+    '      var r = mesh(m.cells, m.nx, m.ny, m.nz, m.nbr || {});',
     // The cells are NOT sent back: the main thread kept the original and only
     // lent a copy, so returning it would just make garbage.
     '      self.postMessage({cmd: "meshed", key: m.key, gen: m.gen, rev: m.rev,',
-    '                        op: op, fl: fl},',
-    '        [op.verts.buffer, op.idx.buffer, fl.verts.buffer, fl.idx.buffer]);',
+    '                        op: r.op, fl: r.fl},',
+    '        [r.op.verts.buffer, r.op.idx.buffer, r.fl.verts.buffer, r.fl.idx.buffer]);',
     '    } catch (err) { self.postMessage({cmd: "error", key: m.key, error: String(err)}); }',
     '    return;',
     '  }',
@@ -687,7 +737,7 @@
       var o = e.origin || [0, 0, 0];
       var r = {
         key: 'local' + i, level: 0, rx: 0, ry: 0, rz: 0,
-        lod: 1, nx: e.nx, ny: e.ny, nz: e.nz,
+        lod: e.lod || 1, nx: e.nx, ny: e.ny, nz: e.nz,
         origin: [o[0], o[1], o[2]],
         cells: e.cells, tex: null, op: null, fl: null, meshing: false,
         dirty: true, gen: this.gen, rev: 0
@@ -942,7 +992,7 @@
     gl.bindBuffer(gl.ARRAY_BUFFER, o.vbo);
     gl.bufferData(gl.ARRAY_BUFFER, m.verts, gl.STATIC_DRAW);
     gl.enableVertexAttribArray(0);
-    gl.vertexAttribPointer(0, 4, gl.UNSIGNED_BYTE, false, 4, 0);
+    gl.vertexAttribPointer(0, 4, gl.UNSIGNED_SHORT, false, 8, 0);   // (x, y, z, face) as Uint16 — see QuadList
     gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, o.ibo);
     gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, m.idx, gl.STATIC_DRAW);
     gl.bindVertexArray(null);

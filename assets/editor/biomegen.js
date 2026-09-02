@@ -42,8 +42,61 @@ import * as TG from './treegen.js';
 import * as WG from './watergen.js';
 
 export const DEFAULT_VOX_PER_M = 10;
-export const MAX_SWATCH = 320;      // cells per side
+export const MAX_SWATCH = 384;      // cells per side
 export const MAX_SWATCH_H = 320;     // a great oak is ~270 cells tall at 10 vpm
+
+/** The swatch sizes the biome page offers, metres. Up to 32 m the swatch is
+ *  1:1 with the engine (10 vpm); past that it bakes COARSER — see
+ *  swatchScale — so a whole biome fits the cell budget. */
+export const SWATCH_SIZES_M = [16, 24, 32, 48, 64, 96, 128];
+
+/** The bake scale (voxels per metre) for a swatch `sizeM` metres on a side:
+ *  the finest INTEGER vpm that keeps the side within MAX_SWATCH cells.
+ *
+ *  WHY A SCALE LADDER AND NOT A BIGGER GRID. The swatch is one dense
+ *  nx*ny*nz Uint16 volume, copied twice more on the way to the screen (the
+ *  viewer's own cells and the mesher's lent copy) and once into a 3D texture.
+ *  At 10 vpm a 24 m forest swatch is 240x280x240 = 16M cells = 32 MB per copy;
+ *  the 96 m view the tab exists to give would be 16x that per copy, over
+ *  2 GB in flight, before the mesher touched it. Baking at 4 vpm instead puts
+ *  96 m into 384 cells and the same ~30M-cell budget as the old 32 m
+ *  swatch. INTEGER because treegen bakes at integer vpm only (it rounds), so
+ *  every species goes through the real generator at the same scale the
+ *  ground does and the composition stays exact rather than resampled. The
+ *  viewer draws the region with lod = 10 / vpm, so it lands in world metres.
+ *
+ *  10 vpm: 16, 24, 32 m; 8: 48 m; 6: 64 m; 4: 96 m; 3: 128 m. */
+export function swatchScale(sizeM, vpmFull) {
+  const full = Math.max(1, Math.round(vpmFull || DEFAULT_VOX_PER_M));
+  let v = full;
+  while (v > 1 && Math.round(sizeM * v) > MAX_SWATCH) v--;
+  return v;
+}
+
+/** Rewrite a swatch's cells IN PLACE from its local palette to engine
+ *  material ids, by NAME, as the C++ loaders do (`matIds` = materials.json
+ *  ids in order; air is 0, the first material is 1). Unknown names become
+ *  air and are returned. After this `res.names` no longer describes
+ *  `res.cells`; `res.remapped` says so. Lives here rather than in envui.js so
+ *  the swatch worker, which has no DOM, can do it before the transfer. */
+export function remapToMaterials(res, matIds) {
+  const idOf = new Map();
+  (matIds || []).forEach((id, i) => idOf.set(id, i + 1));
+  const missing = [];
+  const remap = new Uint16Array(res.names.length + 1);
+  res.names.forEach((n, i) => {
+    const id = idOf.get(n);
+    if (id === undefined) missing.push(n);
+    remap[i + 1] = id || 0;
+  });
+  const cells = res.cells;
+  for (let i = 0; i < cells.length; i++) {
+    const w = cells[i];
+    if (w) cells[i] = (remap[w & 0xFFF] & 0xFFF) | (w & 0xF000);
+  }
+  res.remapped = true;
+  return missing;
+}
 
 /** worldgen.wgsl's B_* ids, in id order. treegen.js BIOME_ORDER is the same
  *  list; scripts/check_invariants.py asserts all three agree with the files. */
@@ -279,8 +332,13 @@ function compactTree(res) {
  * @param biome  normalised biome
  * @param libs   {water: {name: presetParams}, trees: {name: speciesParams}}
  * @param seed   integer
- * @param opts   {vpm, treeCache: Map, sizeM, noTrees, noWater, noCover}
- * @returns {dim, cells, names, anchor, meta, plan}
+ * @param opts   {vpm, treeCache: Map, sizeM, noTrees, noWater, noCover, onTreeBake}
+ *               `vpm` is the BAKE SCALE (see swatchScale); the caller draws the
+ *               result at lod = engine vpm / opts.vpm. `onTreeBake(species,
+ *               variant, vpm)` is called before each tree the cache does not
+ *               have — the first swatch at a new scale bakes every species it
+ *               places, seconds of work the page wants to name.
+ * @returns {dim, cells, names, anchor, meta, vpm, plan}
  */
 export function generateSwatch(biome, libs, seed, opts) {
   opts = opts || {};
@@ -395,6 +453,7 @@ export function generateSwatch(biome, libs, seed, opts) {
     const key = species + '#' + variant + '@' + vpm;
     let t = treeCache.get(key);
     if (!t) {
+      if (opts.onTreeBake) opts.onTreeBake(species, variant, vpm);
       const res = TG.generateTree(treeLib[species], variant, {vpm});
       t = compactTree(res);
       treeCache.set(key, t);
@@ -408,7 +467,17 @@ export function generateSwatch(biome, libs, seed, opts) {
   const cells = new Uint16Array(N * ny * N);
   const at = (x, y, z) => (z * ny + y) * N + x;
   const put = (x, y, z, w) => { if (y >= 0 && y < ny && x >= 0 && x < N && z >= 0 && z < N) cells[at(x, y, z)] = w; };
-  const solid = (id, x, z) => id ? (id | ((hashN(seed, x, z, 0x33) % 3) << 12)) : 0;
+  const jitterOf = (x, z) => (hashN(seed, x, z, 0x33) % 3) << 12;
+  const solid = (id, x, z) => id ? (id | jitterOf(x, z)) : 0;
+  // The ground fill is most of the swatch's cells and the jitter depends on
+  // the column alone, so a column is one hash and one strided run of stores
+  // rather than one bounds-checked put() and one hash per cell — that was
+  // 313 ms of a 360 ms swatch. Same words in the same cells as solid()+put().
+  const fillCol = (x, z, y0, y1, id, jit) => {
+    const w = id ? id | jit : 0;   // an unresolved name writes AIR, exactly as solid() does
+    y0 = Math.max(0, y0); y1 = Math.min(ny - 1, y1);
+    for (let i = (z * ny + y0) * N + x, y = y0; y <= y1; y++, i += N) cells[i] = w;
+  };
 
   const skin = nameId(B.cover.skin), subsoil = nameId(B.cover.subsoil), rock = nameId('stone');
   const skinDepth = Math.max(1, B.cover.skinDepth | 0);
@@ -427,21 +496,29 @@ export function generateSwatch(biome, libs, seed, opts) {
         const c = WG.columnAt(b.P, b.I, b.M, (x - b.cx) * cellM, (z - b.cz) * cellM, natural, b.surf, x, z, b.seed);
         if (c) { col = c; body = b; break; }
       }
-      const rockTo = (yTop) => { for (let y = 0; y < Math.min(rockV, yTop + 1); y++) put(x, y, z, solid(rock, x, z)); };
+      const jit = jitterOf(x, z);
+      const rockTo = (yTop) => fillCol(x, z, 0, Math.min(rockV, yTop + 1) - 1, rock, jit);
+      // rock from rockV up to yEnd (exclusive), with the top soilV cells below
+      // `ref` as subsoil — the band hangs off the SURFACE, not off the skin's
+      // underside, which differs whenever skinDepth > 1 (the desert's sand).
+      const groundTo = (yEnd, ref) => {
+        fillCol(x, z, rockV, Math.min(yEnd, ref - soilV) - 1, rock, jit);
+        fillCol(x, z, Math.max(rockV, ref - soilV), yEnd - 1, subsoil, jit);
+      };
       if (!col) {
         rockTo(natural);
-        for (let y = rockV; y < natural - skinDepth + 1; y++) put(x, y, z, solid(y >= natural - soilV ? subsoil : rock, x, z));
-        for (let y = Math.max(rockV, natural - skinDepth + 1); y <= natural; y++) put(x, y, z, solid(skin, x, z));
+        groundTo(natural - skinDepth + 1, natural);
+        fillCol(x, z, Math.max(rockV, natural - skinDepth + 1), natural, skin, jit);
         top[pi] = natural;
         continue;
       }
       zone[pi] = col.zone || 1;
       if (col.floor >= 0) {
         rockTo(col.bedBottom);
-        for (let y = rockV; y < col.bedBottom; y++) put(x, y, z, solid(body.M.substrate, x, z));
-        for (let y = Math.max(rockV, col.bedBottom); y <= col.floor; y++) put(x, y, z, solid(col.bed, x, z));
+        fillCol(x, z, rockV, col.bedBottom - 1, body.M.substrate, jit);
+        fillCol(x, z, Math.max(rockV, col.bedBottom), col.floor, col.bed, jit);
         if (col.waterTop >= 0) {
-          for (let y = col.floor + 1; y <= col.waterTop; y++) put(x, y, z, body.M.fill | (WG.LIQ_FULL << 12));
+          fillCol(x, z, col.floor + 1, col.waterTop, body.M.fill, WG.LIQ_FULL << 12);
           if (col.surfSkin) put(x, col.waterTop, z, solid(col.surfSkin, x, z));
           nearWater[pi] = 0;
         }
@@ -449,7 +526,7 @@ export function generateSwatch(biome, libs, seed, opts) {
         meta.water[body.preset] = (meta.water[body.preset] || 0) + (col.waterTop >= 0 ? 1 : 0);
       } else {
         rockTo(col.top);
-        for (let y = rockV; y < col.top; y++) put(x, y, z, solid(y >= col.top - soilV ? subsoil : rock, x, z));
+        groundTo(col.top, col.top);
         // The body's own skin (mud, moss) wins on its fringe; plain land keeps the biome skin.
         const sk = (col.skin && col.skin !== body.M.skin) ? col.skin : skin;
         put(x, col.top, z, solid(sk, x, z));
@@ -457,7 +534,7 @@ export function generateSwatch(biome, libs, seed, opts) {
         nearWater[pi] = Math.max(0, (col.u - 1) * body.I.R);
       }
       for (const pl of col.plants) {
-        for (let y = pl.y0; y <= pl.y1; y++) put(x, y, z, solid(pl.id, x, z));
+        fillCol(x, z, pl.y0, pl.y1, pl.id, jit);
         if (pl.y1 >= pl.y0) meta.cover[pl.name] = (meta.cover[pl.name] || 0) + 1;
       }
     }
@@ -572,7 +649,7 @@ export function generateSwatch(biome, libs, seed, opts) {
   for (let i = 0; i < cells.length; i++) if (cells[i]) voxels++;
   meta.voxels = voxels;
   meta.dim = {x: N, y: ny, z: N};
-  return {dim: {x: N, y: ny, z: N}, cells, names, anchor: {x: N >> 1, y: base, z: N >> 1}, meta,
+  return {dim: {x: N, y: ny, z: N}, cells, names, anchor: {x: N >> 1, y: base, z: N >> 1}, meta, vpm,
           plan: {zone, top, nearWater, slope, N}};
 }
 

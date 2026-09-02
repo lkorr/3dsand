@@ -173,6 +173,34 @@ console.log('\n-- swatch --');
   }
   const rs = BG.rarityStats(44.8, 4);
   ok(Math.abs(rs.pct - 25) < 1e-9 && Math.abs(rs.perKm2 - 124.6) < 0.1, 'rarity 1-in-4 of 44.8 m tiles = 25% = ' + rs.perKm2.toFixed(1) + ' per km2');
+
+  // The scale ladder: every offered size fits MAX_SWATCH at an integer vpm,
+  // the 1:1 sizes stay 1:1, and a big swatch composes at its coarser scale
+  // with the scale recorded on the result (the page draws it at lod = 10/vpm).
+  const ladder = BG.SWATCH_SIZES_M.map(m => m + 'm@' + BG.swatchScale(m, 10));
+  ok(BG.SWATCH_SIZES_M.every(m => Math.round(m * BG.swatchScale(m, 10)) <= BG.MAX_SWATCH &&
+                                  Number.isInteger(BG.swatchScale(m, 10))),
+     'swatch scale ladder: ' + ladder.join(' '));
+  ok(BG.swatchScale(24, 10) === 10 && BG.swatchScale(32, 10) === 10 && BG.swatchScale(96, 10) < 10,
+     'up to 32 m is 1:1, 96 m bakes coarser (' + BG.swatchScale(96, 10) + ' vpm)');
+  if (forest) {
+    const v = BG.swatchScale(96, 10);
+    const big = BG.generateSwatch(forest, lib, 7, {treeCache: cache, sizeM: 96, showcase: false, vpm: v});
+    ok(big.vpm === v && big.dim.x === Math.round(96 * v) && big.dim.x <= BG.MAX_SWATCH,
+       '96 m forest at ' + v + ' vpm -> ' + big.dim.x + 'x' + big.dim.y + 'x' + big.dim.z + ', ' + big.meta.treesPlaced + ' trees, ' + big.meta.waterBodies + ' bodies (true rarity)');
+    // remapToMaterials is in place, by name, and keeps the state nibble.
+    const before = big.cells.slice(), names = big.names.slice();
+    const ids = MATS.materials.map(m => m.id);
+    const missing = BG.remapToMaterials(big, ids);
+    let okRemap = big.remapped === true && missing.length === 0;
+    for (let i = 0; okRemap && i < before.length; i += 997) {
+      const w = before[i];
+      if (!w) { if (big.cells[i] !== 0) okRemap = false; continue; }
+      const want = (ids.indexOf(names[(w & 0xFFF) - 1]) + 1) | (w & 0xF000);
+      if (big.cells[i] !== want) okRemap = false;
+    }
+    ok(okRemap, 'remapToMaterials: in place, by name, state nibble kept, nothing missing');
+  }
 }
 
 console.log('\n' + (fails ? `${fails} of ${count} checks FAILED` : `all ${count} checks passed`));
