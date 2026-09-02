@@ -1568,6 +1568,104 @@ about it are not obvious and both were measured:
 `--sweep worldgen.sedSlope=0,96` a one-invocation proof that the knob reaches
 the kernel.
 
+##### Per-biome height curves (2026-09-01, Lin 13.3.3)
+
+"This biome is flat plains, that one is jagged mountains", authored as nine
+numbers per biome instead of a hand-tuned noise ladder. `biomeCurve` reshapes
+**the coarse sum only** — `o0.dev + o1.dev`, the continental and range rungs
+that decide where the mountains and the basins are — and leaves hill, detail and
+grain alone. A biome changes the *landform*; it never changes the texture on it.
+That is the same split `Land.slope` already makes for the sediment wedge.
+
+* **Nine knots, not eight.** Eight knots is *seven* intervals, so the identity
+  curve's values are `-16384 + i·32768/7` — not integers, so an identity curve
+  could not be authored at all and "the default moves nothing" would be
+  unprovable. Nine knots is eight intervals and the identity is
+  `-16384 + i·4096` exactly, which is what all four biomes default to.
+* **The domain is half what it looks like.** `octave` returns
+  `((n − 8192)·amp) >> 14` and `n − 8192` is ±8192, so one rung spans ±amp/2 and
+  the coarse pair spans ±`(contAmplitude + rangeAmplitude)/2`. Authoring against
+  the full sum would leave the outer knots unreachable at every seed.
+* **The identity is bit-exact, by three separate pieces of arithmetic.** (1) The
+  Hermite basis is summed *before* the shift: `h00+h01` is exactly 4096 and
+  `h10+h11+h01` is exactly `t` in integers, whatever the rounding of t² and t³,
+  so a straight line evaluates to `k0 + t` with no residue. (2) The result is
+  applied as a **delta against the identity**, whose value at the same parameter
+  is exactly `p − 16384`, so the Q14→voxel round trip (a floor, which would bias
+  every column down by one) never happens for an identity curve. (3) `dv/dp` is
+  exactly 4096 for the identity, so the Q8 gradient scale is exactly 256 and
+  `(g·256) >> 8 == g`.
+* **The gradient is scaled, not just the value.** iq's attenuation divides each
+  finer rung by `1 + fbmAtten·|g|²`; if `g` still described the pre-curve ladder
+  then a biome that flattened its landform would keep attenuating its hills as
+  though the mountains were still there. `cv.y` is the curve's own slope in Q8
+  and it multiplies the accumulated gradient.
+* **Interpolation is Fritsch–Carlson** (the harmonic mean of the two secants,
+  zero at a local extremum), so an authored plateau is flat and an authored ramp
+  has no crease. Catmull-Rom would overshoot both, and an overshoot here is a
+  hill nobody put there.
+* **`CURVE_IDENT_ALL` is a module const**, so with the default knots Tint folds
+  the whole feature — including its two extra `vnoise2d` samples — out of the
+  shader. A world that does not use a curve pays nothing for it.
+
+###### The ceiling on how far two biomes may differ
+
+`curveBiomePair` crossfades the two nearest biomes over ±`worldgen.biomeBlend`
+band units, because a hard switch puts a **cliff** along every biome edge: the
+curve reshapes octaves whose amplitude is 100 m. But the crossfade can only be
+as wide as the biome field's own edge, and that is the binding constraint:
+
+| measured (seed 1337) | |
+|---|---|
+| `\|d(band)/dcolumn\|` | mean 0.30, p95 **1**, max **2** |
+| blend at ±18 band units | 36 columns typical, **18 columns worst case** |
+| ⇒ a delta of *D* Q14 units | ramps at `D/25.6/18` voxels per column |
+
+The CA's angle of repose is 1 voxel per column and the world's ambient p99.9
+adjacent step is already 2, so **~900 Q14 units (≈35 voxels) is about the
+ceiling on the difference between two *adjacent* biomes' knots** — which is what
+the shipped defaults use. Non-adjacent pairs are unconstrained: the band order is
+meadow | forest | pine | desert, so meadow and desert never meet.
+
+`biomeBlend` defaults to 18 — the largest the clamp allows, since it is capped at
+half the smallest threshold gap; two boundaries inside one crossfade would
+silently drop a biome from the blend. To go further than the ceiling you have to
+widen the biome field itself (`worldgen.biomeLog2`) or spread the thresholds.
+
+###### The shipped defaults are the identity, and that is a measurement
+
+A set at that ceiling was authored, measured, and **reverted**. It works: over a
+409.6 m map at (4096, 4096), `--heightmap` against the identity arm gives
+
+| biome | curve | columns | relief (sd) identity → curved | mean move |
+|---|---|---:|---|---:|
+| forest | identity | 25,532 | 260.0 → 259.3 | 3.0 vox |
+| meadow | flatter | 26,791 | 236.0 → **219.8** (−6.9%) | 26.6 vox |
+| pine | steeper | 7,660 | 228.5 → **243.2** (+6.4%) | 20.6 vox |
+| desert | lower | 5,553 | 174.1 → 186.7 | 11.9 vox |
+
+(forest's 3.0 voxels is only its neighbours' curves bleeding in across the
+crossfade; the largest single-column move anywhere was 54 voxels.)
+
+**What it also does is break `armor-react`.** That gate plants its acid
+differential at `WindowOrigin + 250` and `+ 262` on *raw procgen ground*, and
+the window is wherever the gates before it left it. With the authored set the
+acid stopped reaching the control creature entirely and the dressed one died:
+
+| both arms, FULL SUITE scope | steel stops acid | dressed | bare | death |
+|---|---|---:|---:|---|
+| identity knots | PASS | 16/6057 | 357 | neither |
+| authored knots | **FAIL** | 5/6057 | **0** | dressed, t17 |
+
+Scope is load-bearing here (CLAUDE.md rule 7): the *same* gate PASSES under
+`--gate armor-react` with the authored set, because the window sits elsewhere.
+
+So the mechanism ships live and authorable and the **default stays neutral**.
+The fix is not a milder curve — any global worldgen default can move that
+ground. It is for that gate to stand on a levelled pad the way the fixture
+columns at (60,60)…(140,140) already do (`onFixturePad`), instead of on whatever
+procgen puts under `WindowOrigin + 250`.
+
 **Tree sizes are metre-true again.** `VOX_PER_M` in `worldgen.wgsl` was a
 hardcoded 16 — correct when a voxel was 6.25 cm, and left behind when `world.h`
 moved to `kVoxelMeters = 0.10`. For that whole interval every tree in the game
@@ -1674,8 +1772,9 @@ empty seven. Save, Bake and Export still act on the first tree.
 
 The CPU mirror is not "roughly the terrain" and it is not "the topmost solid
 voxel". It is the **ground**: the terrain octaves, the authored pool floors and
-rims, the pond bowl carve, and the tarn berm — everything `landColumn()` in
-`worldgen.wgsl` applies to `h`, in that order. Literal topmost-solid would
+rims, the pond bowl carve, the tarn berm, and the **ruin pad** — everything
+`landColumn()` in `worldgen.wgsl` applies to `h`, in that order. Literal
+topmost-solid would
 include canopy, ruin walls, grass tufts and the arena deck, and it cannot be
 mirrored cheaply (it needs `treeAt`'s tile scan in a tick path); every one of
 TerrainHeight's ~30 callers is asking where the ground is so it can stand
@@ -1692,10 +1791,82 @@ Enforcement is threefold and none of it is a comment: `scripts/check_invariants.
 token-compares the `MIRROR-BEGIN noise` / `MIRROR-BEGIN height` blocks in
 `worldgen.wgsl` and `world.cpp`, and compares the `landheight` blocks' authored
 constants; the `terrain` gate's pass C1 compares CPU and GPU **per voxel** over
-9,409 columns of pristine procgen. The cost is ~25 `hash3` per call, which is
-fine at O(1) per frame (spawn placement, fixture anchoring, a mob ground probe)
-and is forbidden in a per-voxel loop — the GPU has `genColumn` for that, hoisted
-once per column.
+9,409 columns of pristine procgen. The cost is ~25 `hash3` per call — and five
+times that on the ~1.5% of columns inside a ruin's pad margin, which sample four
+corner columns as well — which is fine at O(1) per frame (spawn placement,
+fixture anchoring, a mob ground probe) and is forbidden in a per-voxel loop: the
+GPU has `genColumn` for that, hoisted once per column.
+
+###### Ruin pads: the ground yields to the building (2026-09-01, Lin 13.3.2)
+
+A ruin used to be stamped in the **cell** half at `baseHeight(centre)` — the raw
+octave ladder, missing the pond bowl, the pool floors, the berm and the wedge —
+with no gate on how steep its ground was. On a hillside that floated one wall a
+metre in the air and buried the opposite one; beside a tarn it put the floor
+under the water table. The site decision moves into `landColumn`, next to the
+ponds, and splits in three:
+
+* `ruinTileAt` — **one hash3**, the tile's jittered footprint, no height at all.
+  Cheap enough for the tree and ground-cover rules to ask "is this column a ruin
+  floor?" per candidate.
+* `ruinPad` — four `landColumnBare` heights at the footprint corners, **after**
+  pond and pool composition. Pad height is their **median** (mean of the two
+  middle values, floored by an arithmetic shift so both sides agree on
+  negatives). Refused if the spread exceeds `worldgen.ruinMaxSlope`, or if any
+  corner stands in water. Four corners are a *complete* pond test, not a sample:
+  the footprint's half-diagonal is 39 voxels and `pondRadiusMin` is 48, so a
+  disc overlapping the footprint must contain a corner.
+* `landColumn` — flattens the footprint to the pad, zeroes the sediment wedge
+  there, and ramps back to the terrain over `worldgen.ruinPadMargin` columns.
+
+The two knobs are a **pair**: the apron's own column-to-column step is about
+`ruinMaxSlope / (2·ruinPadMargin)` and the angle of repose is 1 voxel per
+column, so `ruinMaxSlope` must stay under twice the margin. `landColumnBare` is
+the split that makes the corner sampling possible — a `landColumn` that called
+itself would not be a function.
+
+A **refused** site still reads as a clearing, because `ruinFloorAt` is the cheap
+predicate and does not know about the refusal. That is the choice: an old
+foundation with nothing standing on it, rather than a hillside carrying a bald
+5.6 m square for no reason.
+
+###### Openness placement (2026-09-01, Lin 13.3.4)
+
+"Place plants by how open the sky is" — but worldgen has **no sun direction**,
+and above ground the only overhangs are trees, whose canopy cover already drives
+`undergrowthSite`. So the feature is what was actually missing, in three parts,
+and each one is a **closed form** — no column march, no neighbour voxel read:
+
+* **A ruin floor is swept.** `Col.ruinFloor` (one `hash3` per column) takes the
+  footprint out of the tall light-loving layer entirely and gives it the shade
+  set's two lowest members instead — moss and leaf litter. It also rejects tree
+  trunks in `treeInfoAt`. Without it the stalk pass grows flower stems through
+  the walls, and a hut standing in hip-high meadow reads as a decal on a field.
+* **Cave flora, from `caveBands`.** The bands give a cavern's floor and ceiling
+  per column in closed form, so "standing on the floor" and "hanging from the
+  ceiling" are comparisons. Mushrooms go on the **shallow** band's floor (the
+  caverns you walk into from a hillside); a new emissive `crystal` material goes
+  on the **deep** band's floor and ceiling, in seams shaped by a patch mask,
+  never within `CAVE_LAVA_MARGIN` of the magma table. Both are inert, so a
+  cavern full of them still generates at rest.
+  <br>**The band is carved from `f1` UPWARD**, so `f1` is the lowest *air* cell
+  and the stone under it is `f1-1`. The plan's `f1+1` would have floated every
+  mushroom one voxel above its own floor — the same bug as the ruin wall.
+* **Moss on a shaded face** of a ruin wall, chosen by `worldgen.mossFace`
+  (0 = −Z, default). Worldgen has no compass, so this is a **convention**, not a
+  measurement, and it says so rather than pretending to derive one. It is a skin
+  swap on a wall cell that already exists — `ruinShellAt` re-evaluated at the
+  neighbour, the same predicate trick the ivy pass uses — and the material is
+  `wet_moss`, **not** the ground `moss_patch`: `moss_patch` is `passable`, and
+  swapping a wall cell for a passable material punches a walkable hole through
+  the building.
+
+**Trunks are out of scope, and the reason is architectural rather than
+budgetary.** A trunk's −Z neighbour lives in a *different column's*
+`TreeCands`, which costs the 25-tile scan; and decorating a baked tree from
+worldgen is the exact divergence the `.svtree` bake exists to end (the tree vine
+and hanging-moss knobs were deleted for it). A trunk that wants moss grows it in
+`treegen.js`.
 
 There used to be a fourth height function, `surfHeightAt`, which hand-copied
 this arithmetic for the far-field skin lookup and had already drifted (it never

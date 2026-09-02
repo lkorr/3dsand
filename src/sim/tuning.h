@@ -2622,6 +2622,30 @@ struct Tuning {
     int sedSlope = 96, sedMax = 32, sedTopsoil = 4;
     int biomeLog2 = 9;
     int desertThreshold = 214, pineThreshold = 176, meadowThreshold = 92;
+    // ---- per-biome height curves ----
+    // Nine knots per biome on a uniform input grid spanning the coarse
+    // octaves' full swing, +-(contAmplitude + rangeAmplitude)/2, with values in
+    // Q14 over the same range. The default is the IDENTITY, -16384 + i*4096,
+    // which is exactly representable precisely because there are nine knots and
+    // not eight -- see the long note in tuning_params.def. biomeBlend is the
+    // crossfade width in biome-band units.
+    // LoadTuning clamps every knot to +-16384; curveTangent's i32 multiply
+    // depends on that bound. THIRTY-SIX SCALARS and not four arrays:
+    // check_invariants.py requires every tuning_params.def row to name a
+    // plain member, because TuningWgslBlock expands to `t.worldgen.<member>`.
+    int curveForest0 = -16384, curveForest1 = -12288, curveForest2 = -8192,
+        curveForest3 = -4096, curveForest4 = 0, curveForest5 = 4096,
+        curveForest6 = 8192, curveForest7 = 12288, curveForest8 = 16384;
+    int curvePine0 = -16384, curvePine1 = -12288, curvePine2 = -8192,
+        curvePine3 = -4096, curvePine4 = 0, curvePine5 = 4096,
+        curvePine6 = 8192, curvePine7 = 12288, curvePine8 = 16384;
+    int curveMeadow0 = -16384, curveMeadow1 = -12288, curveMeadow2 = -8192,
+        curveMeadow3 = -4096, curveMeadow4 = 0, curveMeadow5 = 4096,
+        curveMeadow6 = 8192, curveMeadow7 = 12288, curveMeadow8 = 16384;
+    int curveDesert0 = -16384, curveDesert1 = -12288, curveDesert2 = -8192,
+        curveDesert3 = -4096, curveDesert4 = 0, curveDesert5 = 4096,
+        curveDesert6 = 8192, curveDesert7 = 12288, curveDesert8 = 16384;
+    int biomeBlend = 18;
     int treeTile = 144;
     int treeChanceForest = 78, treeChancePine = 70;
     int treeChanceMeadow = 22, treeChanceDesert = 6;
@@ -2694,7 +2718,21 @@ struct Tuning {
     // undo the intent of the whole alpine band by being made generous.
     int alpineChance = 40;
     int ruinChance = 5;
+    // Ruin pads: the footprint is flattened to the median of its four corner
+    // column heights and ramped back to the terrain over ruinPadMargin columns;
+    // a site whose corners disagree by more than ruinMaxSlope is refused.
+    // Keep ruinMaxSlope under 2*ruinPadMargin — see the note in
+    // tuning_params.def, the apron's own step is what the angle of repose
+    // bounds.
+    int ruinPadMargin = 20, ruinMaxSlope = 20;
     int caveThreshold1 = 150, caveThreshold2 = 148;
+    // Cave flora: 1-in-N per column on the one cell that is the band's floor
+    // (mushrooms, shallow band) or its floor and ceiling (crystal, deep band),
+    // inside a patch mask. mossFace picks which wall face wears moss --
+    // 0 = -Z, 1 = +X, 2 = +Z, 3 = -X -- because worldgen has no sun and a
+    // shaded face here is a convention, not a measurement.
+    int caveMushroomChance = 26, caveCrystalChance = 9;
+    int mossFace = 0;
     // ---- the authored edit layer (src/sim/worldedit.h) ---------------------
     // Names assets/worldedits/<editLayer>.svedit, the hand-built patch the
     // Worldgen tab's voxel view writes. Applied through the MutationQueue to
@@ -2757,7 +2795,17 @@ void SetCurrentTuning(const Tuning& t);
 // Set a sim.* field by name (e.g. "windDragRef"). Returns false if the name
 // is unknown. For --sweep: lets you test parameter reachability without editing
 // tuning.json. Handles both int and float sim fields.
+// SUPERSEDED by SetTuningField below, and kept only because deleting a
+// 60-row hand-kept table out of tuning.cpp is a merge conflict against
+// every concurrent session for no behavioural gain. It has no callers.
+// Do not add rows to it -- add them to tuning_params.def, which is where
+// SetTuningField reads from and where the WGSL constants come from too.
 bool SetSimField(Tuning& t, const std::string& name, float value);
+// Any group, by the tuning_params.def name. This is what --sweep uses, so a new
+// row is sweepable the moment it exists. Returns false for an unknown group or
+// member, and for TP_V3 rows (a vec3 has no single float to sweep).
+bool SetTuningField(Tuning& t, const std::string& group,
+                    const std::string& name, float value);
 
 // ---- gore: adding to a wound's whole-voxel budget ---------------------------
 // One helper for every site that grows a bleed budget (mob damage, limb carve,
