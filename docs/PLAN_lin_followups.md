@@ -211,6 +211,14 @@ Written by the orchestrator from the verified facts (see §5 below), before W3 s
 
 Depends on W2-A (the tracer) and W1-A/W1-B (the numbers).
 
+**W1-B measured (2026-09-02, 1080p, RTX 3060 Ti, `build/render_budget.json`):** noon
+baseline 14.15 ms; dusk 16.30 ms (shadow ray +32% at a 7.9° sun); **submerged 68.65 ms —
+4.85x noon. `nogodray` saves 49.99 ms (72.8% of the frame); `godshadow0` saves 28.75 ms
+(41.9%)**, so the per-step shadow ray is 28.75 ms and the march + `waterAbove` walk is the
+other 21.2 ms. The underwater frame is a god-ray march with a raymarch attached. Success
+criterion for step 2 below: `godshadow0`'s saving falls under 3 ms, and the submerged
+baseline under 25 ms; if `waterAbove` is what remains, it is in scope after all.
+
 1. **Coarse terminate (13.2.1).** In `traceOpaque`, once `t > coarseFromT` and the current
    chunk has blockers, test the 4³ **blockers-class** bit for the current cell's block
    (`common.wgsl:2838-2889` accessors); set → hit at the block entry. Knob
@@ -310,7 +318,33 @@ scheduled here.
 
 ---
 
-## 6. Schedule and hand-offs
+## 6. Status log
+
+| Package | Status | Branch / commit | Headline |
+|---|---|---|---|
+| W1-A `--shader-stats` | DONE 2026-09-02 00:34Z, in `lin-followups` | `worktree-agent-a75ea11d4c3d0ea52` e642786+75e1f5d | `raymarch` FS = 128 regs (cap), spill +144 B/thread; only 3 of 74 executables spill. Driver reports a constant "Local Memory Size" floor; the tool subtracts it. |
+| W1-B cameras + look | DONE 00:13Z, in `lin-followups` | `worktree-agent-af226d9935678bb96` 04c7412 | Submerged 68.65 ms vs noon 14.15; god rays 72.8% of it. Also fixed: `halfres` had been measured with `shadowSteps=32` leaking from the previous arm. Look test in `PLAN_gi.md` §0. |
+| W2-A slim tracer | DONE 01:36Z, in `lin-followups` | `worktree-agent-a84fbff99e663b77f` 22f69c4+0c74fff | Noon 14.58 → 10.45 ms (−28%); spill 144 → 64 B; the cache-off `sunShadowAt` fallback WAS compiled into every pixel (runtime distance term defeated folding). `shadowResolve` SPIR-V byte-identical. |
+| W1-C worldgen ×3 | DONE 04:00Z, in `lin-followups` @ db3c17c | `worktree-agent-a1fede51c94001943` 7410865, 1bd8d99, 87fe7ee, fb38d91 | Ruin pads: median of 4 corner columns, 1,936 pad columns flat to the voxel, new terrain pass A8. Cave flora: 249 crystals (new material id 116) deep band, 44 mushrooms shallow band, 0 at surface; ruin footprint suppresses grass; wet_moss on −Z ruin faces (trunk moss dropped: baked trees are not decorated by worldgen). Hash f7ca2a1c → 01dc3219 (step 2 only). Curves: 9 knots (not 8 — identity must be authorable), domain ±(cont+range)/2, integer Hermite, identity bit-exact; ships IDENTITY defaults because the authored set moved `armor-react`'s fixture ground at full-suite scope. `--sweep` now takes any tuning group. |
+| W2-C waterfall mist | DONE 03:55Z, in `lin-followups` @ 6edf2c6 | `worktree-agent-a20678bb3a7715d00` | `--shot-waterfall` fixture (MutationQueue CellOps, reproducible census 3,173 cells); fallCueAt/mistVeil/waterfallMist; reads as a waterfall via aeration whitening; per-face, no bloom past the silhouette (a dilation pass is a different package). Hash unmoved; noon +0.44 ms = contention noise. |
+| W2-B coarse-terminate, god rays, axis sites | DONE 04:16Z, in `lin-followups` | `worktree-agent-af9a5a3e1030b8083` cdfcbdd, 1ac1372, 26840c3 | Submerged 43.01 → 30.18 ms (−30%); god-ray march (the `waterAbove` walk, now once per eye via `waterTopAbove`) 7.23 → 0.61 ms; god-ray shadow 18.36 → 7.93 ms (`godRayShadowSteps` now a block budget, default 8). Criteria NOT met: submerged < 25 and `godshadow0` < 3 — what remains is 14 occlusion rays per pixel; fewer rays is the next lever. `shadowCoarseDist` (8 m) changes the noon image by less than the cache's own race — the path fires (at 1 m the image moves 900x more) but overlook shadow rays rarely travel 8 m. **13.1.3 is refuted on this driver:** the listed sites do not move the spill; hoisting `sign(rd[axis])` in `trace()`/`traceFar()` removes it (spill 0) at 128 → 168 registers and +3.5 ms from lost occupancy — reverted, measurement left in a comment at `trace()`. Hash unmoved. |
+| W2-D far blocker bit | launched ~04:10Z from db3c17c | | |
+| Infra | main @ a460282 | | `build.sh` heartbeats the lock; both scripts release only as owner. |
+
+**Wave 1 + W2-A/B/C acceptance (2026-09-02 ~05:20Z, `lin-followups` @ c3d9337 + smoke re-pin):**
+`--suite acceptance` → selftest 77 gates, known-failing carried (`ca-slope-hybrid`, `debris`,
+`mob`), one regression `page-roundtrip` — which also fails on the main checkout's own binary
+(built 18:04 local from the other session's tree) run standalone, so it is pre-existing on this
+machine and CLAUDE.md's "passes standalone" note is stale. Smoke tables mismatched from
+`worldgen` onward because W1-C re-pinned the selftest hash (01dc3219) but not the smoke probes;
+re-pinned with `--vk-smoke --rebaseline` and `--vk-smoke-loud --rebaseline`, 0 page faults.
+`check_invariants.py` OK, `check_shaders.sh` 18/18.
+
+Pre-existing, not ours, someone owns it: `check_pass_table.py` fails on `sim_fluid.wgsl:g2p`
+(`fluidG2p`, 4 missing R/W) on main; `--vk-info` exits 1 because its phase-3a shader list
+predates the page table; `page-roundtrip` fails standalone on this machine.
+
+## 7. Schedule and hand-offs
 
 ```
 W1-A shader-stats ─┐

@@ -15,8 +15,21 @@ four taps along the normal, molten cells only, ~6 voxels reach. Nothing knows a 
 a room is lit by its window, or that grass under a canopy is in shade. That is the largest
 visual gap in the engine.
 
-*(W1-B's zero-jitter look test paragraph goes here when it lands: does the world read flat
-without palette variety and grain, i.e. is colour speckle doing the job lighting should?)*
+**Look test (W1-B, 2026-09-02, four `--shot`s of the mid-morning overlook: stock,
+`grainAmp=grainAmpFar=0`, `paletteJitter` forced to `color0`, both; `build/look_*.bmp`).**
+The two knobs are not equal partners: killing the grain moves the mean pixel by 0.39/255
+(never more than 3/255) — invisible; flattening the palette moves it by 2.8 with peaks of
+96/255. "Colour speckle" in practice means `paletteJitter`; `grainAmp`'s default does
+almost nothing. Turning both off barely changes contrast where there is geometry (near-grass
+crop σ 20.6→20.1, distant ridge 24.1→24.2, tree crown 36.4→36.2): on broken, vegetated,
+multi-material ground the variety is carried by face normals, AO, micro strands and the
+material mix, and the palette is a garnish. It reads catastrophically flatter in exactly one
+place: **any large single-material flat surface** — a table top becomes a dead-uniform brown
+polygon with one hard edge and no gradient, same for bare dirt or a clean wall. Verdict: the
+colour variety is not hiding missing lighting across the landscape at large; it is hiding it
+completely on every flat unbroken face, which is where indirect light would be the only thing
+giving the surface shape. Flat single-material faces are where P0/P1 must prove themselves,
+and `paletteJitter` is what would become redundant if they succeed.
 
 ## 1. Verified constraints that shape the design
 
