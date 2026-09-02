@@ -564,6 +564,12 @@ target_link_libraries(sandvox_core PRIVATE ${SANDVOX_LINK_LIBS})
 # whose dependencies always are.
 add_custom_target(sandvox_compile)
 add_dependencies(sandvox_compile sandvox_core)
+# The tint CLI too: scripts/check_shaders.sh validates WGSL with it, it links
+# the Tint libraries the compile phase just built, and in the shared
+# dependency root it is built once for every worktree.
+if(TARGET tint_cmd_tint_cmd)
+  add_dependencies(sandvox_compile tint_cmd_tint_cmd)
+endif()
 foreach(_lib IN LISTS SANDVOX_LINK_LIBS)
   if(TARGET ${_lib})
     get_target_property(_type ${_lib} TYPE)
