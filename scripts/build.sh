@@ -19,6 +19,7 @@
 #   bash scripts/build.sh --selftest            # build + run selftest
 #   bash scripts/build.sh --config Debug        # build Debug
 #   bash scripts/build.sh --configure           # cmake configure first
+#   bash scripts/build.sh --fresh               # configure from an empty cache
 #   bash scripts/build.sh --target sandvox      # explicit target
 #   bash scripts/build.sh --gen vs|ninja        # force a generator (see below)
 #
@@ -46,12 +47,14 @@ TARGET="sandvox"
 RUN_SELFTEST=false
 RUN_CONFIGURE=false
 GEN_WANT="${SANDVOX_GENERATOR:-auto}"   # auto | ninja | vs
+WANT_FRESH=false                        # --fresh: drop CMakeCache.txt first
 EXTRA_ARGS=()
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --selftest)     RUN_SELFTEST=true; shift ;;
     --configure)    RUN_CONFIGURE=true; shift ;;
+    --fresh)        RUN_CONFIGURE=true; WANT_FRESH=true; shift ;;
     --config)       CONFIG="$2"; shift 2 ;;
     --target)       TARGET="$2"; shift 2 ;;
     --gen)          GEN_WANT="$2"; shift 2 ;;
@@ -99,6 +102,7 @@ CACHE="$ROOT/build/CMakeCache.txt"
 HAVE_GEN=""
 [ -f "$CACHE" ] && HAVE_GEN="$(sed -n 's/^CMAKE_GENERATOR:INTERNAL=//p' "$CACHE" | tr -d '\r')"
 FRESH=()
+[ "$WANT_FRESH" = true ] && FRESH=(--fresh)
 if [ -n "$HAVE_GEN" ] && [ "$HAVE_GEN" != "$GEN" ]; then
   echo "build.sh: build/ was configured with '$HAVE_GEN'; switching to '$GEN' (cmake --fresh, one cold build)"
   RUN_CONFIGURE=true

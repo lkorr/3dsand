@@ -85,8 +85,18 @@ if(NOT DEFINED CACHE{FETCHCONTENT_BASE_DIR})
   # those are generator-specific: MSBuild and Ninja lay out objects, depfiles
   # and per-target CMakeFiles differently, and two generators generating into
   # one tree step on each other's bookkeeping. Ninja builds (the sccache path,
-  # scripts/build.sh) therefore get a sibling root; the SOURCE checkouts are
-  # reused from the canonical one by sv_reuse_shared_source below.
+  # scripts/build.sh) therefore get a sibling root, SHARED by every Ninja
+  # worktree; the SOURCE checkouts are reused from the canonical root by
+  # sv_reuse_shared_source below.
+  #
+  # Shared, not per-worktree, and that was measured rather than assumed
+  # (2026-09-02): Tint's compiles embed the generated-header paths under this
+  # dir, so a per-worktree root turned 421 of 526 objects into cache MISSES —
+  # the cache stops paying for the one thing it exists to pay for. The cost of
+  # sharing is that a fresh worktree's ninja, having no log of the shared
+  # generator commands, re-runs them and dirties every other worktree's Tint
+  # objects: ~50 s of cache re-fetches on their next build. Fifty seconds
+  # beats three minutes.
   set(_sv_deps "${SV_DEPS_ROOT}")
   if(CMAKE_GENERATOR MATCHES "Ninja")
     set(_sv_deps "${SV_DEPS_ROOT}/ninja")
