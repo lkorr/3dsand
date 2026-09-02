@@ -56,6 +56,11 @@ struct PerfOptions {
   uint32_t width = 1920, height = 1080;
   // List the scenarios and exit.
   bool list = false;
+  // `--render-budget` only: comma-separated camera ids from the --render-budget
+  // camera table (`noon,dusk,submerged`). Empty = all of them. Ignored when
+  // `only` names a --perf scenario, which selects a single borrowed camera and
+  // bypasses the table.
+  std::string cams;
 };
 
 // Returns 0 on success. Prints a human-readable summary as it goes — the JSON
@@ -75,8 +80,15 @@ int RunPerf(GpuContext& ctx, World& world, Simulation& sim,
 //
 // It exists so that diagnosing the render never becomes the feature-by-feature
 // elimination sequence CLAUDE.md's rule 6 forbids: the whole table is one run.
-// `opt.only` picks the camera (any --perf scenario id, default `idle`);
-// `opt.width/height` set the resolution. Prints a table; writes no JSON.
+// THREE CAMERAS, not one. `noon` is the historical overlook and is unchanged to
+// the digit; `dusk` is the same eye with the sun ~8 deg up (long shadow rays,
+// raked terrain); `submerged` puts the eye inside the authored lake, which is
+// the only way to reach shadeSubmerged — god rays, caustics, Snell's window —
+// because the medium is derived from the ray, not from a render flag. Select
+// with `opt.cams` ("noon,dusk"); empty runs all three. `opt.only` still picks a
+// single camera borrowed from a --perf scenario and bypasses the table.
+// `opt.width/height` set the resolution. Prints one table per camera and writes
+// build/render_budget.json plus one BMP per camera.
 int RunRenderBudget(GpuContext& ctx, World& world, Simulation& sim,
                     const std::vector<MaterialDef>& mats,
                     const PerfOptions& opt);
