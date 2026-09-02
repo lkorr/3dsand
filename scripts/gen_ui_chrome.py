@@ -27,17 +27,21 @@ import os
 import struct
 
 # ---- palette ---------------------------------------------------------------
-INK      = (18, 16, 30)      # near-black indigo: outlines, the hard edge
-DEEP     = (34, 30, 56)      # panel field
-MID      = (48, 42, 78)      # riveted metal band
-HI       = (68, 60, 104)     # top/left bevel
-LOW      = (26, 23, 44)      # bottom/right bevel
-GOLD     = (201, 164, 74)    # inlay, the accent that says "this is worn"
-GOLD_HI  = (240, 214, 140)
-GOLD_DIM = (120, 96, 42)
-PARCH    = (216, 205, 180)   # engraving strokes
-PARCH_D  = (150, 140, 118)
-BLOOD    = (168, 46, 46)
+# Obsidian, gold leaf and aged papyrus (xyzpan's "Alchemy Gold" family), with
+# the dark end pulled toward indigo so the frame still belongs to mina's robe.
+# MIRRORED in src/ui/theme.h (ColInk .. ColParchDim); change both.
+INK      = (9, 8, 14)        # obsidian: outlines, the hard edge
+DEEP     = (20, 17, 28)      # panel field
+MID      = (38, 32, 52)      # riveted metal band
+HI       = (60, 52, 82)      # top/left bevel
+LOW      = (14, 12, 20)      # bottom/right bevel
+BRONZE   = (85, 74, 55)      # the quiet border colour
+GOLD     = (201, 168, 76)    # gold leaf: inlay, the accent that says "worn"
+GOLD_HI  = (217, 190, 110)
+GOLD_DIM = (166, 139, 58)
+PARCH    = (200, 184, 138)   # aged papyrus: engraving strokes
+PARCH_D  = (168, 154, 112)
+BLOOD    = (139, 58, 58)     # cinnabar
 CLEAR    = None              # transparent
 
 
@@ -135,9 +139,16 @@ def panel(size=24, border=8, gold_corners=True, hollow=False):
 
 
 def slot(size=22, edge=INK, face=None, accent=None, inset=True):
-    """One item slot: a sunken square with a bevel and an optional accent."""
+    """One item slot: a sunken square's RIM — bevel, edge, optional accent.
+
+    The face is TRANSPARENT unless `face` is given: since 2026-09-02 the
+    recess itself (banded gradient, grain, inner shadow, the hover glow) is
+    drawn in code by ui::SlotSurface underneath this sprite, so the sprite
+    owns only the pixels that have to be pixels — the 1 px rim and bevel.
+    """
     im = Img(size, size)
-    im.rect(1, 1, size - 2, size - 2, face if face else (24, 21, 40))
+    if face:
+        im.rect(1, 1, size - 2, size - 2, face)
     im.frame(0, 0, size, size, edge)
     if inset:
         for i in range(1, size - 1):          # sunken: dark top, light bottom
@@ -249,7 +260,7 @@ def engraving(kind, size=16):
     elif kind == "unknown":       # anything the panel has no icon for
         fill([(4, 5, 10), (5, 4, 11), (6, 4, 11), (7, 4, 11), (8, 4, 11),
               (9, 4, 11), (10, 5, 10)])
-        fill([(6, 6, 9), (7, 6, 9), (8, 6, 9)], (24, 21, 40))
+        fill([(6, 6, 9), (7, 6, 9), (8, 6, 9)], INK)
     elif kind == "bag":           # the general storage mark
         fill([(4, 6, 9), (5, 4, 11), (6, 3, 12), (7, 3, 12), (8, 3, 12),
               (9, 3, 12), (10, 3, 12), (11, 4, 11)])
@@ -269,15 +280,17 @@ def build():
         sprites[name] = (im, border)
         order.append(name)
 
-    add("panel", panel(24, 8), [8, 8, 8, 8])
-    # HOLLOW: this one frames a picture (the avatar portrait), so its middle
-    # slice must not exist. See panel()'s docstring.
+    # BOTH HOLLOW: the panel body (ui::PanelBody — banded metallic gradient,
+    # grain, drop shadow) is drawn in code under the frame, and panel_inner
+    # frames the avatar portrait. See panel()'s docstring for what an opaque
+    # middle slice does to whatever is under it.
+    add("panel", panel(24, 8, hollow=True), [8, 8, 8, 8])
     add("panel_inner", panel(16, 5, gold_corners=False, hollow=True),
         [5, 5, 5, 5])
     add("slot", slot(22))
-    add("slot_hover", slot(22, edge=GOLD_DIM, face=(38, 33, 60), accent=GOLD))
-    add("slot_filled", slot(22, face=(30, 27, 50), accent=GOLD_DIM))
-    add("slot_refuse", slot(22, edge=BLOOD, face=(48, 22, 26), accent=BLOOD))
+    add("slot_hover", slot(22, edge=GOLD_DIM, accent=GOLD))
+    add("slot_filled", slot(22, accent=GOLD_DIM))
+    add("slot_refuse", slot(22, edge=BLOOD, accent=BLOOD))
     for k in ("head", "chest", "legs", "boots", "shoulders", "hands", "belt",
               "trinket", "sheath", "quick"):
         add("slot_" + k, engraving(k))

@@ -11,7 +11,17 @@
 
 #include "ui/theme.h"
 
+// HOW THIS IS DRAWN (2026-09-02). Every panel is three layers in a fixed
+// order: ui::PanelBody (the lit, grained metal — drop shadow, base, bronze
+// wash, sheen, ridge, inset, grain), then ui::Draw9 "panel" (the pixel-art
+// riveted frame, HOLLOW so the body shows through), then the contents. Slots
+// are the same idea one level down: ui::SlotSurface (recess + glow) under the
+// hollow slot sprite under the engraving. See ui/theme.h for why the layers
+// are banded and stepped instead of smooth.
+
 namespace {
+
+using ui::Fade;
 
 // ---- geometry ---------------------------------------------------------------
 // Every number here is a multiple of the 2x chrome scale, so nothing lands on
@@ -19,6 +29,9 @@ namespace {
 constexpr float kSlot = 44.0f;
 constexpr float kSlotGap = 8.0f;
 constexpr float kPad = 16.0f;
+// The panel frame sprite's border is 8 source px = 16 screen px; content sits
+// inside it by kPad, so the header bar is flush with the frame's inner edge.
+constexpr float kFrame = 16.0f;
 // Fallback portrait size, used only before main.cpp has created the offscreen
 // target (or if it failed to). The REAL size is UIState::portraitW/H, mirrored
 // out of the texture that was actually made — the image is displayed 1:1, so
@@ -34,22 +47,6 @@ constexpr float kPortraitHFallback = 448.0f;
 constexpr const char* kPayloadItem = "SVKIT";
 constexpr const char* kPayloadGlyph = "SVGLY";
 
-ImU32 Fade(ImU32 c, float a) {
-  const ImU32 keep = c & ~IM_COL32_A_MASK;
-  const int alpha = (int)(((c >> IM_COL32_A_SHIFT) & 0xFF) * a);
-  return keep | ((ImU32)std::clamp(alpha, 0, 255) << IM_COL32_A_SHIFT);
-}
-
-// A heading in gold small caps, with a rule under it. Used for every region so
-// the three panels read as one document.
-void Heading(ImDrawList* dl, ImVec2 at, float width, const char* text) {
-  dl->AddText(ImVec2(at.x + 1, at.y + 1), ui::ColInk(), text);
-  dl->AddText(at, ui::ColGoldHi(), text);
-  const float y = at.y + ImGui::GetTextLineHeight() + 3.0f;
-  dl->AddLine(ImVec2(at.x, y), ImVec2(at.x + width, y),
-              Fade(ui::ColGoldDim(), 0.8f), 1.0f);
-}
-
 // Which chrome sprite carries an item of this kind.
 const char* ItemIcon(const std::string& kind) {
   if (kind == "melee") return "item_melee";
@@ -62,6 +59,35 @@ const char* GlyphIcon(int type) {
     case 2: return "glyph_modifier";
     default: return "glyph_element";
   }
+}
+
+// The frame sprite over a slot's recess, or a crisp outline when the atlas is
+// missing. The recess itself is ui::SlotSurface; this is the rim.
+void SlotRim(ImDrawList* dl, ImVec2 at, ui::SlotLook look) {
+  const char* frame = look == ui::SlotLook::Refuse   ? "slot_refuse"
+                      : look == ui::SlotLook::Hover  ? "slot_hover"
+                      : look == ui::SlotLook::Filled ? "slot_filled"
+                                                     : "slot";
+  if (ui::Chrome(frame)) {
+    ui::DrawSprite(dl, frame, at);
+    return;
+  }
+  const ImU32 edge = look == ui::SlotLook::Refuse  ? ui::ColBlood()
+                     : look == ui::SlotLook::Hover ? ui::ColGold()
+                                                   : ui::ColBronze();
+  dl->AddRect(at, ImVec2(at.x + kSlot, at.y + kSlot), edge);
+}
+
+// A panel: body, frame, and the header bar inside it. Returns the y where
+// content starts (under the header, with a gap).
+float PanelChrome(ImDrawList* dl, ImVec2 wp, ImVec2 ws, const char* title,
+                  const char* right, const ui::PanelStyle& st) {
+  const ImVec2 wb(wp.x + ws.x, wp.y + ws.y);
+  ui::PanelBody(dl, wp, wb, st);
+  ui::Draw9(dl, "panel", wp, wb);
+  const float hb = ui::HeaderBar(dl, ImVec2(wp.x + kFrame, wp.y + kFrame),
+                                 ws.x - kFrame * 2, title, right);
+  return hb + 14;
 }
 
 // ---- one item slot ----------------------------------------------------------
@@ -96,43 +122,34 @@ void ItemSlot(UIState& s, const char* id, ImVec2 at,
       refusing = true;
   }
 
-  const char* frame = refusing      ? "slot_refuse"
-                      : hovered     ? "slot_hover"
-                      : filled      ? "slot_filled"
-                                    : "slot";
-  if (!ui::Chrome(frame)) {
-    dl->AddRectFilled(at, ImVec2(at.x + kSlot, at.y + kSlot),
-                      refusing ? IM_COL32(70, 26, 30, 255) : ui::ColInk());
-    dl->AddRect(at, ImVec2(at.x + kSlot, at.y + kSlot),
-                refusing  ? ui::ColBlood()
-                : hovered ? ui::ColGold()
-                          : ui::ColGoldDim());
-  } else {
-    ui::DrawSprite(dl, frame, at);
-  }
+  const ui::SlotLook look = refusing  ? ui::SlotLook::Refuse
+                            : hovered ? ui::SlotLook::Hover
+                            : filled  ? ui::SlotLook::Filled
+                                      : ui::SlotLook::Empty;
+  ui::SlotSurface(dl, at, kSlot, look, selected);
+  SlotRim(dl, at, look);
   const ImVec2 mid(at.x + kSlot * 0.5f, at.y + kSlot * 0.5f);
 
   if (filled) {
+    // A soft pool of gold light under the icon: it is what makes a filled
+    // slot read as "an object sitting in a recess" rather than a decal.
+    dl->AddRectFilled(ImVec2(mid.x - 12, mid.y - 8), ImVec2(mid.x + 12, mid.y + 14),
+                      Fade(ui::ColGold(), 0.08f));
+    dl->AddRectFilled(ImVec2(mid.x - 8, mid.y - 4), ImVec2(mid.x + 8, mid.y + 12),
+                      Fade(ui::ColGold(), 0.08f));
+    ui::DrawSpriteCentered(dl, ItemIcon(item.kind), ImVec2(mid.x + 1, mid.y + 1),
+                           Fade(ui::ColInk(), 0.7f));   // pixel drop shadow
     ui::DrawSpriteCentered(dl, ItemIcon(item.kind), mid);
     if (item.count > 1) {
       char buf[16];
       std::snprintf(buf, sizeof buf, "%d", item.count);
-      const ImVec2 ts = ImGui::CalcTextSize(buf);
-      const ImVec2 tp(at.x + kSlot - ts.x - 3, at.y + kSlot - ts.y - 2);
-      dl->AddText(ImVec2(tp.x + 1, tp.y + 1), ui::ColInk(), buf);
-      dl->AddText(tp, ui::ColParch(), buf);
+      ui::CountBadge(dl, ImVec2(at.x + kSlot - 2, at.y + kSlot - 2), buf);
     }
   } else if (emptyIcon && *emptyIcon) {
     // The engraving sits BEHIND whatever lands here, dim enough to read as a
     // label rather than as contents.
-    ui::DrawSpriteCentered(dl, emptyIcon, mid, Fade(IM_COL32_WHITE, 0.34f));
-  }
-  // The selection ring is the hotbar's "this is in my hand" marker, and it is
-  // the same ring the in-game strip shows.
-  if (selected) {
-    dl->AddRect(ImVec2(at.x - 2, at.y - 2), ImVec2(at.x + kSlot + 2,
-                                                   at.y + kSlot + 2),
-                ui::ColGoldHi(), 0.0f, 0, 2.0f);
+    ui::DrawSpriteCentered(dl, emptyIcon, mid,
+                           Fade(IM_COL32_WHITE, hovered ? 0.5f : 0.30f));
   }
 
   if (filled && ImGui::BeginDragDropSource(ImGuiDragDropFlags_None)) {
@@ -176,7 +193,7 @@ void ItemSlot(UIState& s, const char* id, ImVec2 at,
         ImGui::TextDisabled("condition %.0f%%", item.condition * 100.0f);
         if (item.ruined) {
           ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(
-                                                   ui::ColBlood()));
+                                                   ui::ColBloodHi()));
           ImGui::TextUnformatted("RUINED - too little left to mend");
           ImGui::PopStyleColor();
         }
@@ -201,6 +218,30 @@ const UIState::KitSlotUI& SlotOr(const std::vector<UIState::KitSlotUI>& v,
   return (i >= 0 && i < (int)v.size()) ? v[i] : kEmpty;
 }
 
+// A glyph in a cell: its colour as a pool of light under the engraving, not
+// as a flat swatch — the swatch was the one thing on the old screen that
+// looked like a debug readout.
+void GlyphContents(ImDrawList* dl, ImVec2 at, const UIState::GlyphUI& g) {
+  const ImVec2 mid(at.x + kSlot * 0.5f, at.y + kSlot * 0.5f);
+  if (g.color) {
+    const ImU32 sw = IM_COL32((g.color) & 0xFF, (g.color >> 8) & 0xFF,
+                              (g.color >> 16) & 0xFF, 255);
+    // Three nested rects at rising alpha: a stepped radial glow.
+    dl->AddRectFilled(ImVec2(at.x + 4, at.y + 4), ImVec2(at.x + kSlot - 4, at.y + kSlot - 4),
+                      Fade(sw, 0.16f));
+    dl->AddRectFilled(ImVec2(at.x + 8, at.y + 8), ImVec2(at.x + kSlot - 8, at.y + kSlot - 8),
+                      Fade(sw, 0.22f));
+    dl->AddRectFilled(ImVec2(at.x + 12, at.y + 12), ImVec2(at.x + kSlot - 12, at.y + kSlot - 12),
+                      Fade(sw, 0.30f));
+    // And a 2 px strip of the pure colour along the bottom: the tag.
+    dl->AddRectFilled(ImVec2(at.x + 6, at.y + kSlot - 6), ImVec2(at.x + kSlot - 6, at.y + kSlot - 4),
+                      Fade(sw, 0.9f));
+  }
+  ui::DrawSpriteCentered(dl, GlyphIcon(g.type), ImVec2(mid.x + 1, mid.y + 1),
+                         Fade(ui::ColInk(), 0.7f));
+  ui::DrawSpriteCentered(dl, GlyphIcon(g.type), mid);
+}
+
 // ---- the live portrait ------------------------------------------------------
 //
 // The image is whatever main.cpp rendered into the offscreen target this
@@ -214,7 +255,8 @@ void Portrait(UIState& s, ImVec2 at, ImVec2 size) {
   // colour from the portrait pass's clear (main.cpp kPortraitClear): when the
   // two matched, "the texture is not being sampled" and "the pass drew nothing
   // but its clear" produced pixel-identical results and cost a diagnosis.
-  dl->AddRectFilled(at, br, IM_COL32(26, 20, 34, 255));
+  dl->AddRectFilled(at, br, IM_COL32(16, 12, 22, 255));
+  ui::InnerShadow(dl, at, br, 10.0f, 0.5f);
 
   ImGui::SetCursorScreenPos(at);
   ImGui::InvisibleButton("##portrait", size);
@@ -231,6 +273,10 @@ void Portrait(UIState& s, ImVec2 at, ImVec2 size) {
                        at.y + (size.y - ts.y) * 0.5f),
                 Fade(ui::ColParchDim(), 0.6f), msg);
   }
+  // A recess vignette OVER the picture: the portrait is a window into a
+  // lit box, and the edges of a lit box are darker than its middle.
+  ui::InnerShadow(dl, at, br, 16.0f, 0.55f);
+  ui::Grain(dl, at, br, 0.035f);
 
   // ORBIT. The drag turns the portrait camera; pitch is clamped well short of
   // the poles because a camera that can pass over the head gimbals and the
@@ -256,12 +302,13 @@ void Portrait(UIState& s, ImVec2 at, ImVec2 size) {
                                    1.0f);
   }
 
+  if (hovered) ui::Glow(dl, at, br, ui::ColGold(), 6.0f, 0.22f);
   ui::Draw9(dl, "panel_inner", at, br);
   if (hovered && !dragging) {
     const char* hint = "drag to turn";
     const ImVec2 ts = ImGui::CalcTextSize(hint);
-    dl->AddText(ImVec2(br.x - ts.x - 10, br.y - ts.y - 8),
-                Fade(ui::ColParchDim(), 0.55f), hint);
+    ui::ShadowText(dl, ImVec2(br.x - ts.x - 12, br.y - ts.y - 10),
+                   Fade(ui::ColParchDim(), 0.7f), hint);
   }
 }
 
@@ -293,7 +340,7 @@ void InspectOverlay(const UIState& s, ImVec2 at, ImVec2 size) {
     else if (b.bleeding)
       col = Fade(ui::ColBloodHi(), 0.45f + 0.55f * flash);
     else
-      col = Fade(ui::ColBlood(), 0.35f + 0.45f * (1.0f - worst));
+      col = Fade(ui::ColBloodHi(), 0.35f + 0.45f * (1.0f - worst));
     const ImVec2 p0(at.x + b.projMin[0] * size.x, at.y + b.projMin[1] * size.y);
     const ImVec2 p1(at.x + b.projMax[0] * size.x, at.y + b.projMax[1] * size.y);
     // Corner ticks rather than a full box: a closed rectangle over a character
@@ -303,8 +350,15 @@ void InspectOverlay(const UIState& s, ImVec2 at, ImVec2 size) {
     const ImVec2 cs[4] = {p0, ImVec2(p1.x, p0.y), ImVec2(p0.x, p1.y), p1};
     const float sx[4] = {1, -1, 1, -1}, sy[4] = {1, 1, -1, -1};
     for (int k = 0; k < 4; k++) {
-      dl->AddLine(cs[k], ImVec2(cs[k].x + t * sx[k], cs[k].y), col, 2.0f);
-      dl->AddLine(cs[k], ImVec2(cs[k].x, cs[k].y + t * sy[k]), col, 2.0f);
+      // Filled 2 px strips, not AddLine: pixels, not anti-aliased strokes.
+      const float x0 = std::min(cs[k].x, cs[k].x + t * sx[k]);
+      const float x1 = std::max(cs[k].x, cs[k].x + t * sx[k]);
+      const float y0 = std::min(cs[k].y, cs[k].y + t * sy[k]);
+      const float y1 = std::max(cs[k].y, cs[k].y + t * sy[k]);
+      dl->AddRectFilled(ImVec2(x0, cs[k].y - (sy[k] < 0 ? 2 : 0)),
+                        ImVec2(x1, cs[k].y + (sy[k] > 0 ? 2 : 0)), col);
+      dl->AddRectFilled(ImVec2(cs[k].x - (sx[k] < 0 ? 2 : 0), y0),
+                        ImVec2(cs[k].x + (sx[k] > 0 ? 2 : 0), y1), col);
     }
   }
 }
@@ -323,16 +377,17 @@ void InjuryRow(const UIState::BodyPartUI& b) {
   const float kBarX = 190.0f;
   const float kBarW = 130.0f;
 
-  ImGui::PushStyleColor(ImGuiCol_Text,
-                        ImGui::ColorConvertU32ToFloat4(
-                            b.severed ? ui::ColBlood() : ui::ColParch()));
-  ImGui::TextUnformatted(b.label);
-  ImGui::PopStyleColor();
+  {
+    const ImVec2 p = ImGui::GetCursorScreenPos();
+    ui::ShadowText(dl, p, b.severed ? ui::ColBloodHi() : ui::ColParch(),
+                   b.label);
+    ImGui::Dummy(ImVec2(0, ImGui::GetTextLineHeight()));
+  }
 
   if (b.severed) {
     ImGui::SameLine(kBarX);
     ImGui::PushStyleColor(ImGuiCol_Text,
-                          ImGui::ColorConvertU32ToFloat4(ui::ColBlood()));
+                          ImGui::ColorConvertU32ToFloat4(ui::ColBloodHi()));
     ImGui::TextUnformatted("SEVERED");
     ImGui::PopStyleColor();
     ImGui::Dummy(ImVec2(0, 4));
@@ -350,20 +405,16 @@ void InjuryRow(const UIState::BodyPartUI& b) {
     ImGui::SameLine(kBarX);
     const ImVec2 a = ImGui::GetCursorScreenPos();
     const float h = ImGui::GetTextLineHeight();
-    const ImVec2 p0(a.x, a.y + (h - 8.0f) * 0.5f);
-    const ImVec2 p1(p0.x + kBarW, p0.y + 8.0f);
-    dl->AddRectFilled(p0, p1, IM_COL32(20, 18, 32, 255));
-    dl->AddRectFilled(p0,
-                      ImVec2(p0.x + kBarW * std::clamp(frac, 0.0f, 1.0f), p1.y),
-                      fill);
-    dl->AddRect(p0, p1, Fade(ui::ColGoldDim(), 0.7f));
+    const ImVec2 p0(a.x, std::floor(a.y + (h - 10.0f) * 0.5f));
+    const ImVec2 p1(p0.x + kBarW, p0.y + 10.0f);
+    ui::ValueBar(dl, p0, p1, frac, fill, false);
     ImGui::Dummy(ImVec2(kBarW, h));
   };
   char cap[48];
   std::snprintf(cap, sizeof cap, "%.0f / %.0f hp", b.hp, b.hpMax);
-  bar(b.hpFrac, ui::ColBlood(), cap);
+  bar(b.hpFrac, ui::ColBloodHi(), cap);
   std::snprintf(cap, sizeof cap, "%.0f%% intact", b.voxelFrac * 100.0f);
-  bar(b.voxelFrac, IM_COL32(120, 132, 160, 255), cap);
+  bar(b.voxelFrac, ui::ColSteel(), cap);
 
   // State chips, in the order they matter to somebody deciding what to do next.
   bool any = false;
@@ -376,16 +427,28 @@ void InjuryRow(const UIState::BodyPartUI& b) {
     if (any) ImGui::SameLine();
     else ImGui::Indent(12.0f);
     any = true;
+    // A chip: the word in its colour on a dark tab with a coloured underline.
+    const ImVec2 p = ImGui::GetCursorScreenPos();
+    const ImVec2 ts = ImGui::CalcTextSize(buf);
+    dl->AddRectFilled(ImVec2(p.x - 4, p.y), ImVec2(p.x + ts.x + 4, p.y + ts.y),
+                      Fade(ui::ColInk(), 0.7f));
+    dl->AddRectFilled(ImVec2(p.x - 4, p.y + ts.y - 2),
+                      ImVec2(p.x + ts.x + 4, p.y + ts.y), Fade(col, 0.8f));
     ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(col));
     ImGui::TextUnformatted(buf);
     ImGui::PopStyleColor();
+    ImGui::SameLine();
+    ImGui::Dummy(ImVec2(4, 0));
   };
   if (b.bleeding) chip(ui::ColBloodHi(), "BLEEDING");
   if (b.burningVoxels > 0) chip(ui::ColEmber(), "BURNING %u", b.burningVoxels);
   if (b.charredFrac > 0.02f)
     chip(ui::ColEmber(), "CHARRED %.0f%%", b.charredFrac * 100.0f);
-  if (any) ImGui::Unindent(12.0f);
-  ImGui::Dummy(ImVec2(0, 4));
+  if (any) {
+    ImGui::NewLine();
+    ImGui::Unindent(12.0f);
+  }
+  ImGui::Dummy(ImVec2(0, 6));
 }
 
 }  // namespace
@@ -397,8 +460,9 @@ void DrawInventoryScreen(UIState& s) {
 
   // The world stays visible and stays RUNNING behind this — you can watch the
   // fire you set spread while you rummage. Dimmed only enough that the panels
-  // are the thing being read.
-  bg->AddRectFilled(ImVec2(0, 0), disp, IM_COL32(6, 5, 12, 140));
+  // are the thing being read, and vignetted so the eye is pulled in off the
+  // edges of the screen onto them.
+  ui::ScreenDim(bg, disp, 0.5f, 0.55f);
 
   // ---- layout ---------------------------------------------------------------
   const float kPortraitW =
@@ -407,9 +471,10 @@ void DrawInventoryScreen(UIState& s) {
       s.portraitH > 0 ? (float)s.portraitH : kPortraitHFallback;
   const float leftW = kPad * 2 + kSlot * 2 + kSlotGap * 2 + kPortraitW + 8;
   const float top = 28.0f;
-  const float bottom = std::max(top + 200.0f, disp.y - 28.0f);
+  // Room under the panels for the footer hint's tab.
+  const float bottom = std::max(top + 200.0f, disp.y - 46.0f);
   const float leftX = 28.0f;
-  const float rightX = leftX + leftW + 20.0f;
+  const float rightX = leftX + leftW + 24.0f;
   // The right column is CAPPED, not stretched to the window. A 4x8 grid in a
   // 1000-pixel panel is a grid floating in a sea of frame; the panel should be
   // the size of what is in it. The cap is the widest of the two things that
@@ -428,6 +493,20 @@ void DrawInventoryScreen(UIState& s) {
       ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoSavedSettings |
       ImGuiWindowFlags_NoBringToFrontOnFocus;
 
+  // Each panel is lit a little differently — the same trick xyzpan's paint()
+  // uses so a row of panels reads as three objects and not one wallpaper.
+  ui::PanelStyle stChar;
+  stChar.darkMix = 0.30f;
+  stChar.sheenPeak = 0.42f;
+  ui::PanelStyle stArsenal;
+  stArsenal.darkMix = 0.38f;
+  stArsenal.sheenPeak = 0.58f;
+  stArsenal.bronzeAlpha = 0.09f;
+  ui::PanelStyle stBag;
+  stBag.darkMix = 0.34f;
+  stBag.sheenPeak = 0.35f;
+  stBag.bronzeAlpha = 0.12f;
+
   // ==========================================================================
   // LEFT: the character panel
   // ==========================================================================
@@ -438,18 +517,18 @@ void DrawInventoryScreen(UIState& s) {
     ImDrawList* dl = ImGui::GetWindowDrawList();
     const ImVec2 wp = ImGui::GetWindowPos();
     const ImVec2 ws = ImGui::GetWindowSize();
-    ui::Draw9(dl, "panel", wp, ImVec2(wp.x + ws.x, wp.y + ws.y));
-
-    float y = wp.y + kPad + 6;
-    Heading(dl, ImVec2(wp.x + kPad, y), ws.x - kPad * 2,
-            s.inspectMode ? "CONDITION" : "CHARACTER");
-    // The toggle sits on the heading's own line, right-aligned.
+    float y = PanelChrome(dl, wp, ws, s.inspectMode ? "CONDITION" : "CHARACTER",
+                          nullptr, stChar);
+    // The toggle sits on the header bar, right-aligned.
     {
       const char* label = s.inspectMode ? "gear" : "health";
       const ImVec2 ts = ImGui::CalcTextSize(label);
-      ImGui::SetCursorScreenPos(
-          ImVec2(wp.x + ws.x - kPad - ts.x - 16, y - 3));
-      if (ImGui::Button(label)) s.inspectMode = !s.inspectMode;
+      const float bw = std::max(96.0f, ts.x + 24);
+      if (ui::Button("##mode",
+                     ImVec2(wp.x + ws.x - kFrame - 10 - bw,
+                            wp.y + kFrame + std::floor((ui::kHeaderH - ts.y - 8) * 0.5f)),
+                     label, s.inspectMode, bw))
+        s.inspectMode = !s.inspectMode;
       if (ImGui::IsItemHovered())
         ImGui::SetTooltip(
             s.inspectMode
@@ -459,7 +538,6 @@ void DrawInventoryScreen(UIState& s) {
                   "what came off. The two are different measurements - a\n"
                   "laser can bore a limb hollow without hurting it much.");
     }
-    y += ImGui::GetTextLineHeight() + 16;
 
     // The portrait, with a column of slots on each side.
     const float colL = wp.x + kPad;
@@ -494,12 +572,14 @@ void DrawInventoryScreen(UIState& s) {
         }
       }
     }
-    y = portY + kPortraitH + 14;
+    y = portY + kPortraitH + 16;
 
     if (s.inspectMode) {
       // The injury list, worst first. `order` is rebuilt every frame — it is
       // 15 entries and the sort key changes as the body takes damage, so
       // caching it would only buy a stale list.
+      y = ui::Subheading(dl, ImVec2(wp.x + kPad, y), ws.x - kPad * 2, "INJURIES");
+      y += 4;
       ImGui::SetCursorScreenPos(ImVec2(wp.x + kPad, y));
       ImGui::PushClipRect(ImVec2(wp.x + kPad, y),
                           ImVec2(wp.x + ws.x - kPad, wp.y + ws.y - kPad), true);
@@ -535,10 +615,9 @@ void DrawInventoryScreen(UIState& s) {
       ImGui::PopClipRect();
     } else {
       // Sheath + quick slots: what is on your person but not in your hand.
-      ImDrawList* d2 = ImGui::GetWindowDrawList();
-      d2->AddText(ImVec2(wp.x + kPad, y), Fade(ui::ColParchDim(), 0.9f),
-                  "ON YOUR PERSON");
-      y += ImGui::GetTextLineHeight() + 6;
+      y = ui::Subheading(dl, ImVec2(wp.x + kPad, y), ws.x - kPad * 2,
+                         "ON YOUR PERSON");
+      y += 2;
       for (int k = 0; k < 5; k++) {
         const int idx = 8 + k;  // Sheath, Quick0..3
         const UIState::EquipSlotUI& d =
@@ -551,38 +630,37 @@ void DrawInventoryScreen(UIState& s) {
                  SlotOr(s.equipSlots, idx), KitRef{KitSpace::Equip, idx},
                  d.icon.c_str(), d.acceptsAnything, d.why.c_str(), false);
       }
-      y += kSlot + 14;
+      y += kSlot + 18;
 
       // Health + mana, the same two pools the HUD shows, so the screen and the
       // corner never disagree about how close you are to dead.
       const float barW = ws.x - kPad * 2;
       auto pool = [&](int32_t cur, int32_t max, ImU32 fill, const char* name) {
-        const ImVec2 a(wp.x + kPad, y), b(a.x + barW, y + 16);
-        d2->AddRectFilled(a, b, IM_COL32(20, 18, 32, 255));
-        if (max > 0) {
-          const float f = std::clamp((float)cur / (float)max, 0.0f, 1.0f);
-          d2->AddRectFilled(a, ImVec2(a.x + barW * f, b.y), fill);
-        }
-        d2->AddRect(a, b, Fade(ui::ColGoldDim(), 0.85f));
+        const ImVec2 a(wp.x + kPad, y), b(a.x + barW, y + 22);
+        const float f =
+            max > 0 ? std::clamp((float)cur / (float)max, 0.0f, 1.0f) : 0.0f;
+        ui::ValueBar(dl, a, b, f, fill, true);
         char buf[64];
-        std::snprintf(buf, sizeof buf, "%s  %d / %d", name, cur < 0 ? 0 : cur,
-                      max);
+        std::snprintf(buf, sizeof buf, "%d / %d", cur < 0 ? 0 : cur, max);
         const ImVec2 ts = ImGui::CalcTextSize(buf);
-        const ImVec2 tp(a.x + 8, a.y + (16 - ts.y) * 0.5f);
-        d2->AddText(ImVec2(tp.x + 1, tp.y + 1), ui::ColInk(), buf);
-        d2->AddText(tp, ui::ColParch(), buf);
-        y += 20;
+        const float ty = std::floor(a.y + (22 - ts.y) * 0.5f);
+        ui::TrackedText(dl, ImVec2(a.x + 9, ty + 1), Fade(ui::ColInk(), 0.9f),
+                        name, 2.0f);
+        ui::TrackedText(dl, ImVec2(a.x + 8, ty), ui::ColGoldPale(), name, 2.0f);
+        ui::ShadowText(dl, ImVec2(b.x - ts.x - 8, ty), ui::ColParch(), buf);
+        y += 30;
       };
-      pool(s.health, s.healthMax, ui::ColBlood(), "HEALTH");
-      pool(s.mana, s.manaMax, IM_COL32(70, 120, 230, 255), "MANA");
+      pool(s.health, s.healthMax, ui::ColBloodHi(), "HEALTH");
+      pool(s.mana, s.manaMax, ui::ColMana(), "MANA");
       // The locomotion state is the one-line answer to "what is this damage
       // actually costing me", which no bar can give: "crawling" says more
       // about a pair of lost legs than two empty hp bars do.
       if (!s.playerAlive) {
-        d2->AddText(ImVec2(wp.x + kPad, y + 2), ui::ColBloodHi(), "DEAD");
+        ui::TrackedText(dl, ImVec2(wp.x + kPad, y + 2), ui::ColBloodHi(), "DEAD",
+                        2.0f);
       } else if (!s.locoState.empty()) {
-        d2->AddText(ImVec2(wp.x + kPad, y + 2), Fade(ui::ColParchDim(), 0.9f),
-                    s.locoState.c_str());
+        ui::ShadowText(dl, ImVec2(wp.x + kPad, y + 2),
+                       Fade(ui::ColParchDim(), 0.9f), s.locoState.c_str());
       }
     }
   }
@@ -591,7 +669,7 @@ void DrawInventoryScreen(UIState& s) {
   // ==========================================================================
   // TOP RIGHT: the arsenal
   // ==========================================================================
-  const float arsenalH = std::min(360.0f, (bottom - top) * 0.46f);
+  const float arsenalH = std::min(380.0f, (bottom - top) * 0.46f);
   ImGui::SetNextWindowPos(ImVec2(rightX, top));
   ImGui::SetNextWindowSize(ImVec2(rightW, arsenalH));
   ImGui::Begin("##arsenal", nullptr, kPanelFlags);
@@ -599,20 +677,13 @@ void DrawInventoryScreen(UIState& s) {
     ImDrawList* dl = ImGui::GetWindowDrawList();
     const ImVec2 wp = ImGui::GetWindowPos();
     const ImVec2 ws = ImGui::GetWindowSize();
-    ui::Draw9(dl, "panel", wp, ImVec2(wp.x + ws.x, wp.y + ws.y));
-
-    float y = wp.y + kPad + 6;
-    Heading(dl, ImVec2(wp.x + kPad, y), ws.x - kPad * 2, "ARSENAL");
-    {
-      const char* hint = "drag a glyph onto a key";
-      const ImVec2 ts = ImGui::CalcTextSize(hint);
-      dl->AddText(ImVec2(wp.x + ws.x - kPad - ts.x, y + 2),
-                  Fade(ui::ColParchDim(), 0.7f), hint);
-    }
-    y += ImGui::GetTextLineHeight() + 14;
+    float y = PanelChrome(dl, wp, ws, "ARSENAL", "drag a glyph onto a key",
+                          stArsenal);
 
     // The bound row FIRST: it is the thing that matters, and it is literally
     // the number row the game is listening to.
+    y = ui::Subheading(dl, ImVec2(wp.x + kPad, y), ws.x - kPad * 2, "BOUND");
+    y += 2;
     const float glyphSlot = kSlot;
     for (int i = 0; i < (int)s.glyphSlots.size(); i++) {
       const float gx = wp.x + kPad + i * (glyphSlot + 6);
@@ -622,31 +693,23 @@ void DrawInventoryScreen(UIState& s) {
       ImGui::PushID(1000 + i);
       ImGui::InvisibleButton("##gs", ImVec2(glyphSlot, glyphSlot));
       const bool hov = ImGui::IsItemHovered();
-      ui::DrawSprite(dl, hov ? "slot_hover" : (id.empty() ? "slot"
-                                                          : "slot_filled"),
-                     ImVec2(gx, y));
-      const ImVec2 mid(gx + glyphSlot * 0.5f, y + glyphSlot * 0.5f);
       // The glyph in this slot, looked up in the owned list so the icon and
       // swatch come from one place.
       const UIState::GlyphUI* g = nullptr;
       for (const UIState::GlyphUI& c : s.glyphsOwned)
         if (c.id == id) g = &c;
-      if (g) {
-        if (g->color) {
-          const ImU32 sw = IM_COL32((g->color) & 0xFF, (g->color >> 8) & 0xFF,
-                                    (g->color >> 16) & 0xFF, 255);
-          dl->AddRectFilled(ImVec2(gx + 6, y + 6),
-                            ImVec2(gx + glyphSlot - 6, y + glyphSlot - 6), sw);
-        }
-        ui::DrawSpriteCentered(dl, GlyphIcon(g->type), mid);
-      }
+      const ui::SlotLook look = hov ? ui::SlotLook::Hover
+                                : g ? ui::SlotLook::Filled
+                                    : ui::SlotLook::Empty;
+      ui::SlotSurface(dl, ImVec2(gx, y), glyphSlot, look, false);
+      SlotRim(dl, ImVec2(gx, y), look);
+      if (g) GlyphContents(dl, ImVec2(gx, y), *g);
       // The key that speaks it. 1..9 then 0, matching the HUD strip and the
       // GLFW binding in main.cpp.
       {
         char k[4];
         std::snprintf(k, sizeof k, "%d", (i + 1) % 10);
-        dl->AddText(ImVec2(gx + 3, y + 1), ui::ColInk(), k);
-        dl->AddText(ImVec2(gx + 2, y), ui::ColGoldHi(), k);
+        ui::KeyBadge(dl, ImVec2(gx + 2, y + 2), k);
       }
       if (ImGui::BeginDragDropTarget()) {
         if (const ImGuiPayload* p =
@@ -667,7 +730,10 @@ void DrawInventoryScreen(UIState& s) {
       if (hov) {
         ImGui::BeginTooltip();
         if (g) {
+          ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(
+                                                   ui::ColGoldHi()));
           ImGui::TextUnformatted(g->id.c_str());
+          ImGui::PopStyleColor();
           if (!g->desc.empty()) ImGui::TextDisabled("%s", g->desc.c_str());
           ImGui::TextDisabled("right-click to unbind");
         } else {
@@ -677,10 +743,10 @@ void DrawInventoryScreen(UIState& s) {
       }
       ImGui::PopID();
     }
-    y += glyphSlot + 14;
+    y += glyphSlot + 18;
 
-    dl->AddText(ImVec2(wp.x + kPad, y), Fade(ui::ColParchDim(), 0.9f), "KNOWN");
-    y += ImGui::GetTextLineHeight() + 6;
+    y = ui::Subheading(dl, ImVec2(wp.x + kPad, y), ws.x - kPad * 2, "KNOWN");
+    y += 2;
 
     ImGui::SetCursorScreenPos(ImVec2(wp.x + kPad, y));
     ImGui::BeginChild("##known",
@@ -703,16 +769,10 @@ void DrawInventoryScreen(UIState& s) {
         ImGui::PushID(2000 + i);
         ImGui::InvisibleButton("##kg", ImVec2(glyphSlot, glyphSlot));
         const bool hov = ImGui::IsItemHovered();
-        ui::DrawSprite(cd, hov ? "slot_hover" : "slot_filled", ImVec2(gx, gy));
-        if (g.color) {
-          const ImU32 sw = IM_COL32((g.color) & 0xFF, (g.color >> 8) & 0xFF,
-                                    (g.color >> 16) & 0xFF, 255);
-          cd->AddRectFilled(ImVec2(gx + 6, gy + 6),
-                            ImVec2(gx + glyphSlot - 6, gy + glyphSlot - 6), sw);
-        }
-        ui::DrawSpriteCentered(cd, GlyphIcon(g.type),
-                               ImVec2(gx + glyphSlot * 0.5f,
-                                      gy + glyphSlot * 0.5f));
+        const ui::SlotLook look = hov ? ui::SlotLook::Hover : ui::SlotLook::Filled;
+        ui::SlotSurface(cd, ImVec2(gx, gy), glyphSlot, look, false);
+        SlotRim(cd, ImVec2(gx, gy), look);
+        GlyphContents(cd, ImVec2(gx, gy), g);
         if (ImGui::BeginDragDropSource()) {
           char buf[64] = {};
           std::snprintf(buf, sizeof buf, "%s", g.id.c_str());
@@ -759,7 +819,7 @@ void DrawInventoryScreen(UIState& s) {
   // ==========================================================================
   // BOTTOM RIGHT: bag + hotbar
   // ==========================================================================
-  const float bagY = top + arsenalH + 16;
+  const float bagY = top + arsenalH + 20;
   ImGui::SetNextWindowPos(ImVec2(rightX, bagY));
   ImGui::SetNextWindowSize(ImVec2(rightW, std::max(200.0f, bottom - bagY)));
   ImGui::Begin("##bag", nullptr, kPanelFlags);
@@ -767,11 +827,7 @@ void DrawInventoryScreen(UIState& s) {
     ImDrawList* dl = ImGui::GetWindowDrawList();
     const ImVec2 wp = ImGui::GetWindowPos();
     const ImVec2 ws = ImGui::GetWindowSize();
-    ui::Draw9(dl, "panel", wp, ImVec2(wp.x + ws.x, wp.y + ws.y));
-
-    float y = wp.y + kPad + 6;
-    Heading(dl, ImVec2(wp.x + kPad, y), ws.x - kPad * 2, "PACK");
-    y += ImGui::GetTextLineHeight() + 14;
+    float y = PanelChrome(dl, wp, ws, "PACK", "drag out to drop", stBag);
 
     for (int r = 0; r < s.bagRows; r++)
       for (int c = 0; c < s.bagCols; c++) {
@@ -784,11 +840,11 @@ void DrawInventoryScreen(UIState& s) {
         ItemSlot(s, id, ImVec2(gx, gy), SlotOr(s.bagSlots, idx),
                  KitRef{KitSpace::Bag, idx}, nullptr, true, nullptr, false);
       }
-    y += s.bagRows * (kSlot + kSlotGap) + 8;
+    y += s.bagRows * (kSlot + kSlotGap) + 10;
 
-    dl->AddText(ImVec2(wp.x + kPad, y), Fade(ui::ColParchDim(), 0.9f),
-                "IN HAND  (1-0)");
-    y += ImGui::GetTextLineHeight() + 6;
+    y = ui::Subheading(dl, ImVec2(wp.x + kPad, y), ws.x - kPad * 2,
+                       "IN HAND  1-0");
+    y += 2;
     for (int i = 0; i < (int)s.hotbarSlots.size(); i++) {
       const float gx = wp.x + kPad + i * (kSlot + 6);
       if (gx + kSlot > wp.x + ws.x - kPad) break;
@@ -799,18 +855,17 @@ void DrawInventoryScreen(UIState& s) {
                i == s.itemSelected);
       char k[4];
       std::snprintf(k, sizeof k, "%d", (i + 1) % 10);
-      dl->AddText(ImVec2(gx + 3, y + 1), ui::ColInk(), k);
-      dl->AddText(ImVec2(gx + 2, y), ui::ColGoldHi(), k);
+      ui::KeyBadge(dl, ImVec2(gx + 2, y + 2), k);
     }
-    y += kSlot + 10;
+    y += kSlot + 12;
 
     // The refusal flash. Fades over ~2.5 s rather than sticking: it is an
     // answer to something you just did, and an answer still on screen a minute
     // later reads as a persistent error state.
     if (!s.kitMessage.empty() && s.kitMessageAge < 2.5f) {
       const float a = std::clamp(1.6f - s.kitMessageAge * 0.7f, 0.0f, 1.0f);
-      dl->AddText(ImVec2(wp.x + kPad, y), Fade(ui::ColEmber(), a),
-                  s.kitMessage.c_str());
+      ui::ShadowText(dl, ImVec2(wp.x + kPad, y), Fade(ui::ColEmber(), a),
+                     s.kitMessage.c_str());
     }
   }
   ImGui::End();
@@ -837,11 +892,16 @@ void DrawInventoryScreen(UIState& s) {
     }
   }
 
-  // The one line of instruction, centred under everything.
+  // The one line of instruction, centred under everything, on a dark tab so
+  // it reads over whatever the world is doing down there.
   {
     const char* hint = "I or Esc to close   |   drag out to drop";
     const ImVec2 ts = ImGui::CalcTextSize(hint);
-    bg->AddText(ImVec2((disp.x - ts.x) * 0.5f, disp.y - ts.y - 8),
-                Fade(ui::ColParchDim(), 0.75f), hint);
+    const ImVec2 tp(std::floor((disp.x - ts.x) * 0.5f), disp.y - ts.y - 8);
+    bg->AddRectFilled(ImVec2(tp.x - 12, tp.y - 2), ImVec2(tp.x + ts.x + 12, disp.y),
+                      Fade(ui::ColInk(), 0.6f));
+    bg->AddRectFilled(ImVec2(tp.x - 12, tp.y - 2), ImVec2(tp.x + ts.x + 12, tp.y),
+                      Fade(ui::ColGoldDim(), 0.5f));
+    ui::ShadowText(bg, tp, Fade(ui::ColParchDim(), 0.85f), hint);
   }
 }
