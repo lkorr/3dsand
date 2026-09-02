@@ -872,6 +872,8 @@
     "heathPatch": 128,
     "alpineChance": 40,
     "ruinChance": 5,
+    "ruinPadMargin": 20,
+    "ruinMaxSlope": 20,
     "caveThreshold1": 150,
     "caveThreshold2": 148,
     "editLayer": ""

@@ -2250,6 +2250,8 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadWgCount(*g, "heathPatch", w.heathPatch, out, at);
     ReadWgCount(*g, "alpineChance", w.alpineChance, out, at);
     ReadWgCount(*g, "ruinChance", w.ruinChance, out, at);
+    ReadWgLen(*g, "ruinPadMargin", w.ruinPadMargin, out, at);
+    ReadWgLen(*g, "ruinMaxSlope", w.ruinMaxSlope, out, at);
     ReadWgCount(*g, "caveThreshold1", w.caveThreshold1, out, at);
     ReadWgCount(*g, "caveThreshold2", w.caveThreshold2, out, at);
     // A NAME, never a path: worldedit.cpp joins it under assets/worldedits/,
@@ -2443,6 +2445,19 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     if (w.shoreMudWidth > w.shoreBand) w.shoreMudWidth = w.shoreBand;
     if (w.shoreCattailReach > w.shoreBand) w.shoreCattailReach = w.shoreBand;
     atLeast("ruinChance", w.ruinChance, 1);
+    // The pad blend divides by the margin, and the ivy pass reads the ruin from
+    // columns one voxel OUTSIDE the footprint, so the margin has to reach them.
+    atLeast("ruinPadMargin", w.ruinPadMargin, 2);
+    atLeast("ruinMaxSlope", w.ruinMaxSlope, 0);
+    // A margin of 32 or more would push a pad out of its own tile, and
+    // landColumn only ever looks at the column's own tile (worldgen.wgsl, the
+    // RUIN SITES block). 31 is the largest value that keeps that true.
+    if (w.ruinPadMargin > 31) {
+      out.warnings.push_back(
+          "worldgen.ruinPadMargin > 31 would push a pad outside its own ruin "
+          "tile; clamped to 31");
+      w.ruinPadMargin = 31;
+    }
     atLeast("autumnFraction", w.autumnFraction, 1);
     // wallIvyDensity is the NUMERATOR of a coverage ramp (32/d and 48/d). At 0
     // it divides by zero; past 8 the integer division collapses to 4 and 6 and
@@ -2566,6 +2581,8 @@ std::string WorldgenDefaultsJson() {
   n("heathPatch", w.heathPatch);
   n("alpineChance", w.alpineChance);
   n("ruinChance", w.ruinChance);
+  n("ruinPadMargin", w.ruinPadMargin);
+  n("ruinMaxSlope", w.ruinMaxSlope);
   n("caveThreshold1", w.caveThreshold1);
   n("caveThreshold2", w.caveThreshold2);
   s("editLayer", w.editLayer);

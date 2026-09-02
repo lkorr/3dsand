@@ -1674,8 +1674,9 @@ empty seven. Save, Bake and Export still act on the first tree.
 
 The CPU mirror is not "roughly the terrain" and it is not "the topmost solid
 voxel". It is the **ground**: the terrain octaves, the authored pool floors and
-rims, the pond bowl carve, and the tarn berm — everything `landColumn()` in
-`worldgen.wgsl` applies to `h`, in that order. Literal topmost-solid would
+rims, the pond bowl carve, the tarn berm, and the **ruin pad** — everything
+`landColumn()` in `worldgen.wgsl` applies to `h`, in that order. Literal
+topmost-solid would
 include canopy, ruin walls, grass tufts and the arena deck, and it cannot be
 mirrored cheaply (it needs `treeAt`'s tile scan in a tick path); every one of
 TerrainHeight's ~30 callers is asking where the ground is so it can stand
@@ -1692,10 +1693,44 @@ Enforcement is threefold and none of it is a comment: `scripts/check_invariants.
 token-compares the `MIRROR-BEGIN noise` / `MIRROR-BEGIN height` blocks in
 `worldgen.wgsl` and `world.cpp`, and compares the `landheight` blocks' authored
 constants; the `terrain` gate's pass C1 compares CPU and GPU **per voxel** over
-9,409 columns of pristine procgen. The cost is ~25 `hash3` per call, which is
-fine at O(1) per frame (spawn placement, fixture anchoring, a mob ground probe)
-and is forbidden in a per-voxel loop — the GPU has `genColumn` for that, hoisted
-once per column.
+9,409 columns of pristine procgen. The cost is ~25 `hash3` per call — and five
+times that on the ~1.5% of columns inside a ruin's pad margin, which sample four
+corner columns as well — which is fine at O(1) per frame (spawn placement,
+fixture anchoring, a mob ground probe) and is forbidden in a per-voxel loop: the
+GPU has `genColumn` for that, hoisted once per column.
+
+###### Ruin pads: the ground yields to the building (2026-09-01, Lin 13.3.2)
+
+A ruin used to be stamped in the **cell** half at `baseHeight(centre)` — the raw
+octave ladder, missing the pond bowl, the pool floors, the berm and the wedge —
+with no gate on how steep its ground was. On a hillside that floated one wall a
+metre in the air and buried the opposite one; beside a tarn it put the floor
+under the water table. The site decision moves into `landColumn`, next to the
+ponds, and splits in three:
+
+* `ruinTileAt` — **one hash3**, the tile's jittered footprint, no height at all.
+  Cheap enough for the tree and ground-cover rules to ask "is this column a ruin
+  floor?" per candidate.
+* `ruinPad` — four `landColumnBare` heights at the footprint corners, **after**
+  pond and pool composition. Pad height is their **median** (mean of the two
+  middle values, floored by an arithmetic shift so both sides agree on
+  negatives). Refused if the spread exceeds `worldgen.ruinMaxSlope`, or if any
+  corner stands in water. Four corners are a *complete* pond test, not a sample:
+  the footprint's half-diagonal is 39 voxels and `pondRadiusMin` is 48, so a
+  disc overlapping the footprint must contain a corner.
+* `landColumn` — flattens the footprint to the pad, zeroes the sediment wedge
+  there, and ramps back to the terrain over `worldgen.ruinPadMargin` columns.
+
+The two knobs are a **pair**: the apron's own column-to-column step is about
+`ruinMaxSlope / (2·ruinPadMargin)` and the angle of repose is 1 voxel per
+column, so `ruinMaxSlope` must stay under twice the margin. `landColumnBare` is
+the split that makes the corner sampling possible — a `landColumn` that called
+itself would not be a function.
+
+A **refused** site still reads as a clearing, because `ruinFloorAt` is the cheap
+predicate and does not know about the refusal. That is the choice: an old
+foundation with nothing standing on it, rather than a hillside carrying a bald
+5.6 m square for no reason.
 
 There used to be a fourth height function, `surfHeightAt`, which hand-copied
 this arithmetic for the far-field skin lookup and had already drifted (it never

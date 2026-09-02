@@ -955,6 +955,42 @@ static bool sLabWorld = false;
 void World::SetLabWorld(bool on) { sLabWorld = on; }
 bool World::LabWorld() { return sLabWorld; }
 
+// worldgen.wgsl's RUIN SITES block, mirrored. These live OUTSIDE the tagged
+// region on purpose: check_invariants.py compares the landheight blocks by
+// INTEGER LITERAL, and a geometry constant that is named on both sides cannot
+// drift into that comparison as a bare number. HSCALE is 1 in worldgen.wgsl; if
+// it ever moves, kRuinTile moves with it and the `terrain` gate's per-voxel
+// pass C1 is what would catch a miss.
+static constexpr int kRuinTile = 256;    // 256 * HSCALE
+static constexpr int kRuinW = 56;        // 3.5 m footprint
+static constexpr int kRuinMargin = 32;   // inset that keeps it in its tile
+
+struct RuinTile {
+  bool present;
+  int rx;
+  int rz;
+};
+static RuinTile ruinTileAt(int x, int z, uint32_t seed) {
+  RuinTile r;
+  r.present = false; r.rx = 0; r.rz = 0;
+  const int tx = fdiv(x, kRuinTile);
+  const int tz = fdiv(z, kRuinTile);
+  if (tx == 0 && tz == 0) return r;
+  const uint32_t rh = hash3(seed ^ 0xA111CEu, (uint32_t)tx, (uint32_t)tz);
+  if (rh % (uint32_t)WG().ruinChance != 0u) return r;
+  const uint32_t jit =
+      (uint32_t)std::max(kRuinTile - kRuinW - kRuinMargin * 2, 1);
+  r.rx = tx * kRuinTile + kRuinMargin + (int)((rh >> 8u) % jit);
+  r.rz = tz * kRuinTile + kRuinMargin + (int)((rh >> 16u) % jit);
+  r.present = true;
+  return r;
+}
+static int ruinOutset(const RuinTile& t, int x, int z) {
+  const int dx = std::max(t.rx - x, x - (t.rx + kRuinW - 1));
+  const int dz = std::max(t.rz - z, z - (t.rz + kRuinW - 1));
+  return std::max(std::max(dx, dz), 0);
+}
+
 // MIRROR-BEGIN landheight
 // THE HEIGHT CONTRACT (DESIGN.md; landColumn in worldgen.wgsl):
 //
@@ -975,14 +1011,20 @@ bool World::LabWorld() { return sLabWorld; }
 // stale. The `terrain` gate's pass C1 is the per-voxel proof.
 //
 // COST: ~25 hash3 (two octaves, one pond tile, one pond centre, up to four
-// neighbour tiles, one more centre). That is fine at O(1) per frame — spawn
+// neighbour tiles, one more centre) for the bare column, and FIVE TIMES THAT on
+// the ~1.5% of columns that fall inside a ruin's pad margin, where four corner
+// columns are sampled as well. That is fine at O(1) per frame — spawn
 // placement, fixture anchoring, a mob ground probe. NEVER call it in a
 // per-voxel loop; the GPU has genColumn for that and it is hoisted per column.
-int World::TerrainHeight(int x, int z, uint32_t seed) {
-  // Lab slab: the same guard landColumn takes in worldgen.wgsl. Before the
-  // tuning reads on purpose — the lab surface must not move when worldgen
-  // knobs are tuned, or every scene's fixture heights drift.
-  if (sLabWorld) return kLabSlabY;
+//
+// The ground BEFORE the ruin pad, which is what a pad's corner samples want.
+// Mirrors landColumnBare in worldgen.wgsl; `wet` is the shader's
+// `pw.y >= 0 || inRim`, the pair of facts ruinPad refuses a site on.
+struct BareCol {
+  int h;
+  bool wet;
+};
+static BareCol landColumnBare(int x, int z, uint32_t seed) {
   const Land land = landAt(x, z, seed);
   const int bed = land.h - land.sed;
   // Authored origin-area set pieces, at their absolute world coordinates.
@@ -1042,9 +1084,72 @@ int World::TerrainHeight(int x, int z, uint32_t seed) {
   } else if (!inRim && near.onShore && near.past < WG().pondBermWidth) {
     h = bermLift(h, near.surf, near.past);
   }
-  return h;
+  BareCol b;
+  b.h = h;
+  b.wet = (pw.y >= 0 || inRim);
+  return b;
+}
+
+// The pad, mirroring ruinPad in worldgen.wgsl: four footprint-corner columns,
+// median for the height, spread for the refusal, and a refusal on any corner
+// standing in water. Returns false for a site that is not built.
+static bool ruinPad(const RuinTile& t, uint32_t seed, int* padY) {
+  const int far = kRuinW - 1;
+  const BareCol k0 = landColumnBare(t.rx, t.rz, seed);
+  const BareCol k1 = landColumnBare(t.rx + far, t.rz, seed);
+  const BareCol k2 = landColumnBare(t.rx, t.rz + far, seed);
+  const BareCol k3 = landColumnBare(t.rx + far, t.rz + far, seed);
+  if (k0.wet || k1.wet || k2.wet || k3.wet) return false;
+  int a = k0.h, b = k1.h, c = k2.h, d = k3.h;
+  if (a > b) std::swap(a, b);
+  if (c > d) std::swap(c, d);
+  if (a > c) std::swap(a, c);
+  if (b > d) std::swap(b, d);
+  if (b > c) std::swap(b, c);
+  if (d - a > WG().ruinMaxSlope) return false;
+  *padY = (b + c) >> 1;
+  return true;
+}
+
+int World::TerrainHeight(int x, int z, uint32_t seed) {
+  // Lab slab: the same guard landColumn takes in worldgen.wgsl. Before the
+  // tuning reads on purpose — the lab surface must not move when worldgen
+  // knobs are tuned, or every scene's fixture heights drift.
+  if (sLabWorld) return kLabSlabY;
+  const BareCol base = landColumnBare(x, z, seed);
+  const RuinTile t = ruinTileAt(x, z, seed);
+  if (!t.present) return base.h;
+  const int margin = std::max(WG().ruinPadMargin, 2);
+  const int d = ruinOutset(t, x, z);
+  if (d >= margin) return base.h;
+  int padY = 0;
+  if (!ruinPad(t, seed, &padY)) return base.h;
+  const int w = ((margin - d) * 256) / margin;
+  return base.h + (((padY - base.h) * w) >> 8);
 }
 // MIRROR-END landheight
+
+// ---- the terrain gate's only window onto a ruin pad ------------------------
+//
+// Pass C1 compares CPU and GPU per voxel, but only over x,z in [48,144], and a
+// ruin can NEVER be there: worldgen skips tile (0,0) outright. So the pad is
+// the one rule in landColumn that the per-voxel mirror proof structurally
+// cannot reach, and this is what the gate asserts the CPU half of instead.
+//
+// A free function with its prototype repeated in selftest_terrain.cpp rather
+// than a World:: member, deliberately: world.h is a hub header and a new
+// declaration there recompiles the whole engine to serve one assertion.
+bool RuinSiteForGate(int tileX, int tileZ, uint32_t seed, int* rx, int* rz,
+                     int* w, int* padY) {
+  const RuinTile t = ruinTileAt(tileX * kRuinTile + kRuinTile / 2,
+                                tileZ * kRuinTile + kRuinTile / 2, seed);
+  *rx = t.rx;
+  *rz = t.rz;
+  *w = kRuinW;
+  *padY = 0;
+  if (!t.present) return false;
+  return ruinPad(t, seed, padY);
+}
 
 // The map probe (world.h Column). Composed from the SAME functions the height
 // contract is built out of rather than re-deriving anything — `landAt` for the

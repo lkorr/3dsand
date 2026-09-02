@@ -467,6 +467,10 @@ SPEC = [
     ("worldgen", "heathPatch", "TUNE_HEATH_PATCH", "i", 128),
     ("worldgen", "alpineChance", "TUNE_ALPINE_CHANCE", "u", 40),
     ("worldgen", "ruinChance", "TUNE_RUIN_CHANCE", "u", 5),
+
+    # ruin pads (13.3.2)
+    ("worldgen", "ruinPadMargin", "TUNE_RUIN_PAD_MARGIN", "i", 20),
+    ("worldgen", "ruinMaxSlope", "TUNE_RUIN_MAX_SLOPE", "i", 20),
     ("worldgen", "caveThreshold1", "TUNE_CAVE_THRESHOLD1", "u", 150),
     ("worldgen", "caveThreshold2", "TUNE_CAVE_THRESHOLD2", "u", 148),
 

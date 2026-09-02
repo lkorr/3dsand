@@ -2117,6 +2117,7 @@ struct Col {
   inPoolFloor : bool,
   inRim       : bool,
   shore       : Shore,
+  ruin        : Ruin,        // the accepted ruin whose pad covers this column
 };
 
 // ---- THE HEIGHT CONTRACT ---------------------------------------------------
@@ -2142,6 +2143,88 @@ struct Col {
 // centre, up to four neighbour tiles) and it is called from CPU paths that run
 // at O(1) per frame — spawn placement, fixture anchoring, a mob probe. It must
 // never be called in a per-voxel loop on either side.
+// ---- RUIN SITES: decided in the COLUMN half, so the building gets a pad ----
+//
+// A ruin used to be stamped in the CELL half at `baseHeight(centre)` — the raw
+// five-octave ladder, with the pond bowl, the authored pool floors and the tarn
+// berm all missing from it — and with no gate at all on how steep the ground
+// under it was. On a hillside that left one wall floating a metre in the air
+// and buried the opposite one; beside a tarn it put the floor under the water
+// table. Both are the same bug: the site was decided against a height that is
+// not the height the world is actually built at.
+//
+// So the decision moves here, next to the ponds, and the site FLATTENS the
+// ground it stands on the way a foundation does — the terrain yields to the
+// building rather than the other way round. Three pieces:
+//
+//   * `ruinTileAt` is the CHEAP half: one tile hash and the same jittered
+//     footprint the cell half always used. It costs one hash3 and knows nothing
+//     about height, which is what lets the tree and ground-cover rules ask "is
+//     this column a ruin floor?" per candidate without paying for a pad.
+//   * `ruinPad` is the EXPENSIVE half: four column heights at the footprint
+//     corners, AFTER pond and pool composition. Median for the pad height,
+//     spread for the refusal. Only columns within `worldgen.ruinPadMargin` of
+//     the footprint ever evaluate it, which is ~1.5% of the world.
+//   * `landColumn` blends the pad out into the terrain over that margin.
+//
+// The footprint is always strictly inside its own tile (margin 32, width 56,
+// jitter <= 136, so rx - tx*256 is in [32, 167] and rx + 56 <= 223 < 256), so a
+// column only ever has to look at ITS OWN tile — which stays true as long as
+// the pad margin is under 32, and LoadTuning clamps it there.
+const RUIN_TILE   : i32 = 256 * HSCALE;
+const RUIN_W      : i32 = 56;    // 3.5 m footprint
+const RUIN_HT     : i32 = 48;    // 3 m to the roof
+const RUIN_MARGIN : i32 = 32;    // inset that keeps the footprint in its tile
+
+struct RuinTile {
+  present : bool,
+  rx      : i32,     // footprint min corner, world coords
+  rz      : i32,
+};
+
+// The candidate site on this column's tile, BEFORE the flatness gate. One hash.
+fn ruinTileAt(x : i32, z : i32, seed : u32) -> RuinTile {
+  var r : RuinTile;
+  r.present = false; r.rx = 0; r.rz = 0;
+  let tx = fdiv(x, RUIN_TILE);
+  let tz = fdiv(z, RUIN_TILE);
+  if (tx == 0 && tz == 0) { return r; }        // the authored origin tile
+  let rh = hash3(seed ^ 0xA111CEu, bitcast<u32>(tx), bitcast<u32>(tz));
+  if (rh % TUNE_RUIN_CHANCE != 0u) { return r; }
+  let jit = u32(max(RUIN_TILE - RUIN_W - RUIN_MARGIN * 2, 1));
+  r.rx = tx * RUIN_TILE + RUIN_MARGIN + i32((rh >> 8u) % jit);
+  r.rz = tz * RUIN_TILE + RUIN_MARGIN + i32((rh >> 16u) % jit);
+  r.present = true;
+  return r;
+}
+
+// Chebyshev distance from the footprint box; 0 for a column inside it.
+fn ruinOutset(t : RuinTile, x : i32, z : i32) -> i32 {
+  let dx = max(t.rx - x, x - (t.rx + RUIN_W - 1));
+  let dz = max(t.rz - z, z - (t.rz + RUIN_W - 1));
+  return max(max(dx, dz), 0);
+}
+
+// "Is this column the floor of a ruin?" — the clearing test the tree and
+// ground-cover rules use. Deliberately the CHEAP predicate, so it is true on a
+// site the flatness gate went on to REFUSE as well. That is a choice: a refused
+// site then reads as an old foundation with nothing left standing on it, rather
+// than as a hillside carrying a bald 5.6 m square of grass for no reason.
+fn ruinFloorAt(x : i32, z : i32, seed : u32) -> bool {
+  let t = ruinTileAt(x, z, seed);
+  return t.present && ruinOutset(t, x, z) == 0;
+}
+
+// An ACCEPTED site, as the cell half sees it. Carried through LandCol and Col
+// so `genCellIn` stamps the shell at a height the column half already committed
+// to, instead of re-deriving a different one from `baseHeight`.
+struct Ruin {
+  present : bool,   // an accepted ruin's pad reaches this column
+  rx      : i32,
+  rz      : i32,
+  y       : i32,    // pad height: the floor, and the shell's base course
+};
+
 struct LandCol {
   h           : i32,         // GROUND. The contract above.
   sed         : i32,         // loose wedge thickness INSIDE h, 0 where overridden
@@ -2152,16 +2235,23 @@ struct LandCol {
   inPoolFloor : bool,
   inRim       : bool,
   near        : Shore,       // nearest disc OUTSIDE this column, or none
+  ruin        : Ruin,        // the accepted ruin whose pad covers this column
 };
 
 // MIRROR-BEGIN landheight
-fn landColumn(x : i32, z : i32, seed : u32) -> LandCol {
+// THE GROUND BEFORE THE RUINS. Split out of landColumn because `ruinPad` has to
+// sample four of these at the footprint corners, and a landColumn that calls
+// itself is not a function. Everything the height contract is made of lives
+// here EXCEPT the pad, which is the one override that needs to know about
+// columns other than its own.
+fn landColumnBare(x : i32, z : i32, seed : u32) -> LandCol {
   var L : LandCol;
   L.pond = -1;
   L.pw = vec2<i32>(-1, -1);
   L.fluid = MAT_AIR;
   L.fluidTop = -1;
   L.near.onShore = false; L.near.past = 0; L.near.surf = -1;
+  L.ruin.present = false; L.ruin.rx = 0; L.ruin.rz = 0; L.ruin.y = 0;
   // The fluid lab's flat slab — the same guard genColumn takes below, taken
   // here as well so World::TerrainHeight sees the slab through the contract
   // rather than through a second copy of the constant.
@@ -2306,6 +2396,86 @@ fn landColumn(x : i32, z : i32, seed : u32) -> LandCol {
   L.sed = sed;
   return L;
 }
+
+// ---- THE PAD: four corner columns, a median, and two refusals --------------
+//
+// The corners are `landColumnBare` — NOT `baseHeight`, because the pond bowl,
+// the pool floors and the tarn berm are all part of the ground the building
+// stands on, and that omission is the whole bug this replaces.
+//
+// MEDIAN, not mean. With four samples a mean is dragged by the single corner
+// that happens to clip a gully, and a pad that follows a gully is the artifact
+// this feature exists to remove. The median of four is the mean of the two
+// middle values, FLOORED by an arithmetic shift so the CPU mirror agrees bit
+// for bit at negative heights too (C++20 defines >> on a negative signed value
+// as arithmetic, which is what WGSL's i32 >> already is).
+//
+// TWO REFUSALS, both structural rather than cosmetic:
+//
+//   * spread (max - min) over `worldgen.ruinMaxSlope`. Past that the pad is a
+//     cut-and-fill scar taller than the building, and the apron that blends it
+//     out would exceed the CA's angle of repose (1 voxel per column) —
+//     i.e. it would be a slope loose material can never come to rest on.
+//   * any corner standing in a tarn or on an authored pool rim. Four corners
+//     are a COMPLETE test for a disc pond, not a sample of one: the footprint's
+//     half-diagonal is 56*0.707 = 39 voxels and `worldgen.pondRadiusMin` is 48,
+//     so a disc that overlaps the footprint at all must contain a corner. That
+//     inequality is the argument; if pondRadiusMin is ever tuned below 40 this
+//     test needs the centre column as well.
+fn ruinPad(t : RuinTile, seed : u32) -> Ruin {
+  var r : Ruin;
+  r.present = false; r.rx = t.rx; r.rz = t.rz; r.y = 0;
+  let far = RUIN_W - 1;
+  let k0 = landColumnBare(t.rx,       t.rz,       seed);
+  let k1 = landColumnBare(t.rx + far, t.rz,       seed);
+  let k2 = landColumnBare(t.rx,       t.rz + far, seed);
+  let k3 = landColumnBare(t.rx + far, t.rz + far, seed);
+  if (k0.pw.y >= 0 || k1.pw.y >= 0 || k2.pw.y >= 0 || k3.pw.y >= 0) { return r; }
+  if (k0.inRim || k1.inRim || k2.inRim || k3.inRim) { return r; }
+  // A five-comparator sorting network, written out because a loop over a
+  // by-value array is the dynamic-index spill CLAUDE.md warns about.
+  var a = k0.h; var b = k1.h; var c = k2.h; var d = k3.h;
+  if (a > b) { let sw = a; a = b; b = sw; }
+  if (c > d) { let sw = c; c = d; d = sw; }
+  if (a > c) { let sw = a; a = c; c = sw; }
+  if (b > d) { let sw = b; b = d; d = sw; }
+  if (b > c) { let sw = b; b = c; c = sw; }
+  if (d - a > TUNE_RUIN_MAX_SLOPE) { return r; }
+  r.y = (b + c) >> 1;
+  r.present = true;
+  return r;
+}
+
+// The height contract's public face: the bare column with the ruin pad blended
+// into it. Everything else in this file and in World::TerrainHeight goes
+// through here.
+fn landColumn(x : i32, z : i32, seed : u32) -> LandCol {
+  var L = landColumnBare(x, z, seed);
+  if (T.labMode != 0u) { return L; }
+  let t = ruinTileAt(x, z, seed);
+  if (!t.present) { return L; }
+  let margin = max(TUNE_RUIN_PAD_MARGIN, 2);
+  let d = ruinOutset(t, x, z);
+  if (d >= margin) { return L; }        // the cheap gate: ~98.5% of the world
+  let R = ruinPad(t, seed);
+  if (!R.present) { return L; }
+  L.ruin = R;
+  // Q8 ramp: 256 on the footprint, 0 at the margin's outer edge. INSIDE the
+  // footprint the arithmetic is exact (h + (padY - h) == padY), so the floor is
+  // genuinely flat rather than nearly flat — a one-voxel ripple under a stone
+  // floor is a step the CA has to think about every time anything is dropped on
+  // it. Outside, the per-column step the ramp adds is bounded by
+  // (spread/2) / margin, which is what ties the ruinMaxSlope and ruinPadMargin
+  // defaults together: 20 and 20 keep it at half a voxel per column, well
+  // inside the angle of repose.
+  let w = ((margin - d) * 256) / margin;
+  L.h = L.h + (((R.y - L.h) * w) >> 8);
+  // The loose wedge goes with it. `sed` is POWDER and the pad is where the
+  // ground is cut and filled; leaving two metres of gravel under a stone floor
+  // is exactly the avalanche the pond-bank block above documents.
+  L.sed = (L.sed * (256 - w)) >> 8;
+  return L;
+}
 // MIRROR-END landheight
 
 // The contract, as a function. genColumn calls landColumn directly (it needs the
@@ -2341,6 +2511,10 @@ fn genColumn(x : i32, z : i32, seed : u32) -> Col {
     lab.shore.onShore = false;
     lab.shore.past = 0;
     lab.shore.surf = -1;
+    lab.ruin.present = false;
+    lab.ruin.rx = 0;
+    lab.ruin.rz = 0;
+    lab.ruin.y = 0;
     return lab;
   }
   // THE GROUND, and everything derived from it, in one call. This is the same
@@ -2396,6 +2570,7 @@ fn genColumn(x : i32, z : i32, seed : u32) -> Col {
   col.inPoolFloor = L.inPoolFloor;
   col.inRim = L.inRim;
   col.shore = shore;
+  col.ruin = L.ruin;
   return col;
 }
 
@@ -3096,21 +3271,24 @@ fn genCellIn(col : Col,
   // tile hash. Building halved with the world: ~3.5 m square, 3 m tall — a
   // hut, not a hall. The 2 m doorway is NOT halved: it has to clear the 1.7 m
   // player, which is exactly the mouse-hole mistake the first cut made.
-  let ruinTile = 256 * HSCALE;
-  let tx = fdiv(x, ruinTile); let tz = fdiv(z, ruinTile);
-  if (tx != 0 || tz != 0) {
-    let rh = hash3(seed ^ 0xA111CEu, bitcast<u32>(tx), bitcast<u32>(tz));
-    if (rh % TUNE_RUIN_CHANCE == 0u) {
-      let rw = 56;                        // 3.5 m footprint
-      let rht = 48;                       // 3 m to the roof
-      // keep the whole footprint inside the tile whatever HSCALE is
-      let margin = 32;
-      let jit = u32(max(ruinTile - rw - margin * 2, 1));
-      let rx = tx * ruinTile + margin + i32((rh >> 8u) % jit);
-      let rz = tz * ruinTile + margin + i32((rh >> 16u) % jit);
-      // box test in XZ first: baseHeight for the centre only when close
+  //
+  // THE SITE IS THE COLUMN'S, NOT A SECOND DERIVATION. This block used to redo
+  // the tile hash here and take its floor height from `baseHeight(centre)` — a
+  // height nothing else in the world uses, because it predates the pond bowl,
+  // the pool floors, the berm and the sediment wedge. `col.ruin` is the site
+  // `landColumn` already accepted and already flattened the ground to, so the
+  // shell now stands ON the pad by construction rather than by coincidence.
+  // See the RUIN SITES block above landColumn.
+  let R = col.ruin;
+  if (R.present) {
+    {
+      let rw = RUIN_W;
+      let rht = RUIN_HT;
+      let rx = R.rx;
+      let rz = R.rz;
+      // box test in XZ first: the pad reaches a margin past the footprint
       if (x >= rx && x < rx + rw && z >= rz && z < rz + rw) {
-        let ry = baseHeight(rx + rw / 2, rz + rw / 2, seed);
+        let ry = R.y;
         if (y >= ry && y < ry + rht) {
           let shellXZ = x < rx + 4 || x >= rx + rw - 4 ||
                         z < rz + 4 || z >= rz + rw - 4;
@@ -3130,7 +3308,7 @@ fn genCellIn(col : Col,
       // no neighbour sampling, just the same closed-form box at ±1.
       if (mat == MAT_AIR &&
           x >= rx - 1 && x < rx + rw + 1 && z >= rz - 1 && z < rz + rw + 1) {
-        let ry = baseHeight(rx + rw / 2, rz + rw / 2, seed);
+        let ry = R.y;
         let climb = y - ry;
         if (climb > 0 && climb < rht) {
           // faces: just outside the shell, or just inside it
