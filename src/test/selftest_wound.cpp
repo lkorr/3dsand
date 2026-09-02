@@ -933,6 +933,116 @@ Status GateBurnCap(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---------------------------------------------------------------------------
+// one-hit: a single sword blow never kills a healthy creature outright
+// ---------------------------------------------------------------------------
+//
+// Owner report, 2026-09-02, the day blood became hp: "I hit an NPC with a
+// sword and every single one of his limbs fell off" — which is a DEATH (only
+// Die() releases every limb at once), from one blow. Whatever the cause turns
+// out to be, this is the property: one committed swing that crosses several
+// limbs — exactly the sequence main.cpp's sweep runs, Damage() then CutLimb()
+// per limb hit — leaves the creature alive, with every limb attached, and
+// still alive after the wound has bled for five seconds.
+Status GateOneHit(Ctx& c, std::string& detail) {
+  MobSystem& mobs = c.mobs;
+  IdCounterScope idScope(mobs);
+  PrepareWorld(c);
+  const Target t = ChooseTarget(mobs, FixtureSite(c.world, 350));
+  if (!t.valid()) {
+    detail = "no loaded mob def has a severable non-vital limb that bleeds";
+    return Status::Fail;
+  }
+  IVec3 pchunk{};
+  const uint64_t id = SpawnTarget(c, t, 350, pchunk);
+  if (!id) {
+    detail = "spawn refused";
+    return Status::Fail;
+  }
+  const MobDef& def = mobs.Defs()[t.defIndex];
+  const int nLimbs = (int)def.limbs.size();
+  // The stock sword's damage at full commitment, and a committed tip speed
+  // (melee.fullSpeedMps 3.4 m/s = 34 vox/s) with headroom for the body's
+  // own motion.
+  const ItemDef* sword = c.items.At(c.items.Find("sword"));
+  const float dmg = sword ? sword->damage : 14.0f;
+  const float tipSpeed = 45.0f;
+  // Three limbs one swing can cross: the fixture limb, its parent, and the
+  // root. Hitting the root and a parent is what makes this a whole-body
+  // question rather than a thigh question.
+  std::vector<int> hits{t.limb};
+  for (int li = 0; li < nLimbs; li++)
+    if (def.limbs[li].name == def.limbs[t.limb].parent) hits.push_back(li);
+  if (def.rootLimb >= 0 && def.rootLimb != t.limb &&
+      std::find(hits.begin(), hits.end(), def.rootLimb) == hits.end())
+    hits.push_back(def.rootLimb);
+
+  const float hp0 = mobs.TotalHp(id);
+  std::vector<ParticleSpawn> spawns;
+  int landed = 0;
+  {
+    MobSystem::BladeCutScope blade(mobs, 1.0f);
+    for (int li : hits) {
+      const uint64_t body = mobs.LimbBody(id, li);
+      if (!body) continue;
+      const LimbAxis ax = MeasureLimb(mobs, id, li);
+      const Vec3 at = ax.anchor + ax.along * (ax.reach * 0.5f);
+      if (!mobs.Damage(body, dmg, at, tipSpeed)) continue;
+      landed++;
+      if (!mobs.IsAlive(id)) break;
+      CutOnce(mobs, c.world, id, li, ax, ax.reach * 0.5f, 1.0f, 1.0f,
+              0x0A11u + (uint32_t)li, spawns);
+      if (!mobs.IsAlive(id)) break;
+    }
+  }
+  const bool aliveAtBlow = mobs.IsAlive(id);
+  const float hpAfterBlow = aliveAtBlow ? mobs.TotalHp(id) : 0.0f;
+  const size_t severs = mobs.SeverEvents().size();
+  std::string cause = mobs.DeathCause(id);
+
+  // Then the wound bleeds for five seconds of game time.
+  uint32_t tick = 50000;
+  int deathTick = -1;
+  for (int i = 0; i < 150 && mobs.IsAlive(id); i++) {
+    std::vector<BrushOp> ops;
+    std::vector<ParticleSpawn> sp;
+    std::vector<CellOp> cellOps;
+    mobs.PreTick(tick++, c.world, ops, cellOps, sp);
+    if (!mobs.IsAlive(id)) {
+      deathTick = i;
+      cause = mobs.DeathCause(id);
+      break;
+    }
+    c.phys.Step(kTickDt);
+    mobs.PostStep();
+  }
+  const bool alive = mobs.IsAlive(id);
+  const float hpEnd = alive ? mobs.TotalHp(id) : 0.0f;
+  int attached = 0;
+  for (int li = 0; li < nLimbs; li++)
+    if (mobs.LimbBody(id, li)) attached++;
+  const bool intact = severs == 0 && alive && attached == nLimbs;
+  // Bounded: a blow across three limbs plus five seconds of bleeding takes
+  // well under half the creature. (Three limbs x 14 damage is 42 hp out of a
+  // human's 322; the bleed adds 3 x 21 voxels x 0.6 = 38 more.)
+  const bool bounded = hp0 > 0.0f && hpEnd > 0.5f * hp0;
+
+  RecordObserved("oneHitHpLostFraction",
+                 hp0 > 0.0f ? (double)(hp0 - hpEnd) / (double)hp0 : 1.0);
+  mobs.Reset();
+  c.debris.Reset();
+  const bool ok = landed > 0 && aliveAtBlow && intact && bounded;
+  detail = Format(
+      "%s: %d limbs hit with the sword (%.0f dmg, tip %.0f vox/s): alive at "
+      "the blow=%d (hp %.1f -> %.1f), severs=%zu, %d/%d limbs attached, alive "
+      "after 150 ticks=%d (hp %.1f, floor %.1f)%s%s",
+      t.defName.c_str(), landed, dmg, tipSpeed, aliveAtBlow ? 1 : 0, hp0,
+      hpAfterBlow, severs, attached, nLimbs, alive ? 1 : 0, hpEnd, 0.5f * hp0,
+      deathTick >= 0 ? Format(", died at tick %d", deathTick).c_str() : "",
+      cause.empty() ? "" : Format(" cause: %s", cause.c_str()).c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& WoundGates() {
@@ -943,6 +1053,7 @@ const std::vector<Gate>& WoundGates() {
       {"wound-bleed", "mob", {}, false, GateWoundBleed, false},
       {"bleed-out", "mob", {}, false, GateBleedOut, false},
       {"burn-cap", "mob", {}, false, GateBurnCap, false},
+      {"one-hit", "mob", {}, false, GateOneHit, false},
   };
   return g;
 }

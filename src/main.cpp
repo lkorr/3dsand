@@ -6835,6 +6835,12 @@ int main(int argc, char** argv) {
         for (const MobSystem::VoiceEvent& ve : mobs.VoiceEvents()) {
           if (ve.defIndex < 0 || ve.defIndex >= (int)mobs.Defs().size()) continue;
           const MobDef& md = mobs.Defs()[(size_t)ve.defIndex];
+          // Every NPC death names its cause on the console (Mob::DeathCause):
+          // four mechanisms end in the same ragdoll, and "he fell apart when I
+          // hit him" is otherwise unattributable from the game.
+          if (ve.kind == MobSystem::VoiceKind::Death)
+            std::printf("mob %s (id %llu) died: %s\n", md.name.c_str(),
+                        (unsigned long long)ve.mobId, mobs.DeathCause(ve.mobId));
           audioCues.MobSound(md,
                              ve.kind == MobSystem::VoiceKind::Death
                                  ? audio::Cues::MobEvent::Death

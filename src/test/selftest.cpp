@@ -231,6 +231,9 @@ const char* const kOrder[] = {
     // last phase stands the creature in a real fire and regenerates the world
     // on the way out, like mob-burn.
     "bleed-out", "burn-cap",
+    // one committed sword blow across three limbs never kills outright and
+    // takes nothing off (owner report 2026-09-02; CPU only, no tick).
+    "one-hit",
     // LAST of the world-touching gates, and it must be: BuildVoxRegion moves
     // the residency window and resets the page table, which is the state every
     // other gate's fixture placement assumes. It restores both before it
