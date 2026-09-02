@@ -1115,22 +1115,54 @@ Status GateGiBounce(Ctx& c, std::string& detail) {
   const double minOverRed = BaselineNumber("giBounce.minGreenOverRed", 1.0);
   const bool injected = floorRgb[1] > floorRgb[0] && floorRgb[1] > 0.0;
   const bool gathered = dG >= minGreen && (dG - dR) >= minOverRed;
-  const bool ok = injected && gathered;
+
+  // ---- P2: the write-back converges (docs/PLAN_gi.md §4) ----
+  // With giFeedback on, every frame blends each pixel's outgoing radiance into
+  // its own block-face and the next frame's gather reads it back: a fixed-point
+  // iteration whose gain is albedo × the gather's form factor × giStrength.
+  // The claim is that it CONVERGES — the wall's +X word after 600 frames is
+  // within giBounce.convergePct of its value after 500 — and never runs away.
+  // Sampled from the word itself rather than a pixel, so the tonemap cannot
+  // hide a slow climb.
+  bool converged = true;
+  double wall500[3] = {0, 0, 0}, wall600[3] = {0, 0, 0};
+  const double convergePct = BaselineNumber("giBounce.convergePct", 5.0);
+  if (base.render.giFeedback > 0.0f) {
+    std::vector<uint8_t> scratch;
+    Tuning t = base;
+    SetCurrentTuning(t);
+    bool okc = sim.ReloadShaders(ctx.device) && render(500, scratch);
+    const IVec3 wallCell{wallX, slabY + 2 + kWallH / 2, gz};
+    UnpackRgb9e5(IrradianceWordAt(ctx, world, wallCell, 1u), wall500);
+    okc = okc && render(100, scratch);
+    UnpackRgb9e5(IrradianceWordAt(ctx, world, wallCell, 1u), wall600);
+    SetCurrentTuning(base);
+    const double l500 = 0.299 * wall500[0] + 0.587 * wall500[1] + 0.114 * wall500[2];
+    const double l600 = 0.299 * wall600[0] + 0.587 * wall600[1] + 0.114 * wall600[2];
+    converged = okc && l500 > 0.0 && std::isfinite(l600) &&
+                std::fabs(l600 - l500) <= l500 * convergePct / 100.0;
+  }
+  const bool ok = injected && gathered && converged;
   std::printf(
       "gi-bounce: %s (white wall beside a sunlit green slab: bounce delta "
       "R %+.2f G %+.2f B %+.2f /255, G must be >= %.2f and exceed R by >= %.2f; "
       "the slab's own +Y irradiance word reads (%.3f, %.3f, %.3f), G must lead; "
-      "%zu fixture cells at (%d,%d) ground y=%d)\n",
+      "write-back at giFeedback %.2f: wall word luminance %.4f after 500 frames, "
+      "%.4f after 600, must agree within %.0f%%; %zu fixture cells at (%d,%d) "
+      "ground y=%d)\n",
       ok ? "PASS" : "FAIL", dR, dG, dB, minGreen, minOverRed, floorRgb[0],
-      floorRgb[1], floorRgb[2], fixture.size(), gx, gz, ground);
+      floorRgb[1], floorRgb[2], base.render.giFeedback,
+      0.299 * wall500[0] + 0.587 * wall500[1] + 0.114 * wall500[2],
+      0.299 * wall600[0] + 0.587 * wall600[1] + 0.114 * wall600[2], convergePct,
+      fixture.size(), gx, gz, ground);
   if (!ok) {
     WriteBmpFile("build/gi_bounce_on.bmp", onPx, W, H);
     WriteBmpFile("build/gi_bounce_off.bmp", offPx, W, H);
   }
   detail = Format("delta R %+.2f G %+.2f B %+.2f (G >= %.2f, G-R >= %.2f); floor "
-                  "word (%.3f, %.3f, %.3f)",
+                  "word (%.3f, %.3f, %.3f); write-back %s",
                   dR, dG, dB, minGreen, minOverRed, floorRgb[0], floorRgb[1],
-                  floorRgb[2]);
+                  floorRgb[2], converged ? "converged" : "DIVERGED");
   return ok ? Status::Pass : Status::Fail;
 }
 

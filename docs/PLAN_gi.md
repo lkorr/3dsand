@@ -239,6 +239,20 @@ Requires the decay from P1 to be the same clock, or the grid brightens without b
 `feedback < decay` must hold and be asserted in `LoadTuning`. Verify with the P1 gate run for
 600 frames: the wall's term converges (last 100 frames within 5%), never diverges.
 
+### P2 status — DONE 2026-09-02, `lin-followups`
+
+In `raymarch.wgsl` after the gather: the pixel's OUTGOING radiance (`albedo × sun + bounce`)
+is blended into its own block-face word at `render.giFeedback` (0.2 shipped) — the third
+buffer a fragment shader writes, `irradiance` bound `read_write` at render binding 19. Micro
+hits skip it (their cell is the ground below). `LoadTuning` keeps `giFeedback < giDecay`
+(warning + clamp, not a crash — a bad value is one keystroke away in the tuner) and, the bound
+that actually matters for divergence, clamps `giStrength ≤ 3` while feedback is on: each
+bounce is albedo × the gather's 0.28 × giStrength of the last, and the series converges only
+below 1. `--gate gi-bounce` grew the convergence arm: with feedback on it renders 500 frames,
+reads the wall's +X word, renders 100 more and reads again; luminance 0.0301 → 0.0301, within
+the 5% `giBounce.convergePct` allows. With feedback on the wall's bounce delta at
+`giStrength 2` is R +7.79, G +19.60, B +3.46 /255 (G-led by 2.5×).
+
 ## 5. P3 — emissives
 
 Lava and fire inject from the `sim_occupancy` dirty walk (`mainDirty`, indirect on the
@@ -247,6 +261,26 @@ compacted dirty list): for each block containing `emission > 0` cells, add
 gather and is **deleted** (with its `TUNE_HEAT_SPILL_*` rows and the occupancy probe gate at
 `raymarch.wgsl:6839`). Verify: `--shot` of the authored lava pool at night — the rim rock and
 the far wall are lit, and the `heatSpill` arm in `--render-budget` no longer exists.
+
+### P3 status — DONE 2026-09-02, `lin-followups` (built differently from the sketch)
+
+Not a third writer in `sim_occupancy`: emission is part of the ONE sample both injection
+paths already deposit (`irrSample` in `common.wgsl`: `albedo × (sun × Lambert × lit +
+emission × TUNE_EMISSIVE_STRENGTH)`). The shadow resolve pass deposits it for every visible
+lava/ember patch each frame; the openness walk deposits it for every marched face on every
+DIRTY chunk every tick (and a lava pool is dirty every tick) and on the rolling refresh for
+the rest — so a third pass would have re-deposited the same term into the same word. Faces
+turned from the sun now still run the walk's sample (they carry emission). `heatSpill` is
+DELETED: the function, its call site and the occupancy probe gate in `fs`, and
+`render.heatSpillStrength` in all five tuning places. Verdict frame:
+`screenshot_lava_spatter` at `--time 0` (night), GI on vs off — the meadow beside every lava
+voxel picks up a warm orange pool of light, mean |Δ| (1.15, 0.47, 0.06) /255 over 7.6% of
+the frame; nothing else in the frame moves. **The authored lava pool frames are a stale
+fixture**: `screenshot_lava/_down/_close` look at (220, 520, y 64..86) where the ground at
+this seed is y ≈ 211 — the cameras are buried, the frames are flat dark facets with GI on or
+off, and they have been since the window shrank to 512 (the section pinned the origin at 0,
+which put z 496..546 in the far cascade even before the pool moved). The section's origin is
+now z 8 chunks so the cameras are at least in-window; whoever re-authors the pool moves them.
 
 ## 6. Later
 

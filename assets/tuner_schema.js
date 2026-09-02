@@ -585,7 +585,6 @@ const TUNING_SCHEMA = [
       {k:'lavaEmissionGain', n:'lava glow', d:'Peak emissive intensity of the molten cracks.', min:0, max:8, step:0.05},
       {k:'lavaPulseAmp', n:'lava pulse depth', d:'Slow convection pulse — lava breathing.', min:0, max:0.5, step:0.005},
       {k:'lavaPulseRate', n:'lava pulse speed', d:'Speed of the convection pulse.', min:0, max:8, step:0.05, u:'Hz'},
-      {k:'heatSpillStrength', n:'heat spill', d:'Warm light lava casts onto nearby surfaces. Subtle by design — it is a contact cue.', min:0, max:2, step:0.01},
       {k:'emberBrightness', n:'ember brightness', d:'Brightness of the rising spark particles over lava.', min:0, max:12, step:0.05},
       {k:'emberDensity', n:'ember density', d:'Share of spark columns that emit, out of 255. Higher = more sparks.', min:0, max:255, step:1, int:true},
       {k:'emberRise', n:'ember rise height', d:'How high a spark climbs before dying, in voxels.', min:1, max:200, step:1, u:'vox'},

@@ -224,7 +224,7 @@ SPEC = [
     # one-bounce indirect light (docs/PLAN_gi.md §3, W3 P1)
     ("render", "giStrength", "TUNE_GI_STRENGTH", "f", 2.0),
     ("render", "giDecay", "TUNE_GI_DECAY", "f", 0.25),
-    ("render", "giFeedback", "TUNE_GI_FEEDBACK", "f", 0.0),
+    ("render", "giFeedback", "TUNE_GI_FEEDBACK", "f", 0.2),
     ("render", "giGatherBlocks", "TUNE_GI_GATHER_BLOCKS", "i", 3),
 
     # drifting particulate (silt)
@@ -290,7 +290,6 @@ SPEC = [
     ("render", "lavaEmissionGain", "TUNE_LAVA_EMISSION_GAIN", "f", 1.9),
     ("render", "lavaPulseAmp", "TUNE_LAVA_PULSE_AMP", "f", 0.06),
     ("render", "lavaPulseRate", "TUNE_LAVA_PULSE_RATE", "f", 0.9),
-    ("render", "heatSpillStrength", "TUNE_HEAT_SPILL_STRENGTH", "f", 0.16),
     ("render", "emberBrightness", "TUNE_EMBER_BRIGHTNESS", "f", 2.2),
     ("render", "emberRise", "TUNE_EMBER_RISE", "f", 26.0),
     ("render", "emberRate", "TUNE_EMBER_RATE", "f", 3.4),

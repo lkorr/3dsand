@@ -3178,14 +3178,21 @@ fn irrDeposit(idx : u32, sample : vec3f, alpha : f32, stampOk : bool,
   (*irr)[idx] = packRgb9e5(mix(old, sample, alpha));
 }
 
-// The direct-lit radiance a surface voxel sends out: what both injection paths
-// deposit. `lit` is the shadow term (the resolve pass's softened value or the
-// walk's coarse one), `L`/`sunCol` the key light from RenderParams. Plain
-// Lambert, not raymarch.wgsl's wrapDiffuse: the wrap is a shading cheat for the
-// terrace staircase, and light that is not there should not bounce.
-fn irrSample(albedo : vec3f, n : vec3f, L : vec3f, sunCol : vec3f, lit : f32)
-    -> vec3f {
-  return albedo * sunCol * (max(dot(n, L), 0.0) * lit);
+// The radiance a surface voxel sends out: what both injection paths deposit.
+// Direct sun — `lit` is the shadow term (the resolve pass's softened value or
+// the walk's coarse one), `L`/`sunCol` the key light from RenderParams; plain
+// Lambert, not raymarch.wgsl's wrapDiffuse, because the wrap is a shading
+// cheat for the terrace staircase and light that is not there should not
+// bounce — PLUS the voxel's own emission (P3, PLAN_gi.md §5): lava and embers
+// are emitters whether or not the sun is up, at the same strength the primary
+// hit shades them with, so a lava pool's rim rock is lit by the pool through
+// the same gather that lights a wall from a meadow. This replaced heatSpill,
+// a four-tap stand-in for exactly this that ran on every non-emissive surface
+// pixel in the world.
+fn irrSample(albedo : vec3f, n : vec3f, L : vec3f, sunCol : vec3f, lit : f32,
+             emission : f32) -> vec3f {
+  return albedo * (sunCol * (max(dot(n, L), 0.0) * lit) +
+                   vec3f(emission * TUNE_EMISSIVE_STRENGTH));
 }
 
 // ---- VOXEL-KEYED SHADOW CACHE (src/sim/world.h kShadowCacheBuckets) --------

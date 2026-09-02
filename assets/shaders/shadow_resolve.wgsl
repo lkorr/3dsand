@@ -184,7 +184,8 @@ fn resolve(@builtin(global_invocation_id) gid : vec3<u32>) {
     let pw = voxWordAt(cell);
     let pm = materials[voxMat(pw)];
     let albedo = paletteColor(pm, voxState(pw), &materials);
-    let sample = irrSample(albedo, n3, keyLightDirP(R), keyLightColorP(R), v);
+    let sample = irrSample(albedo, n3, keyLightDirP(R), keyLightColorP(R), v,
+                           f32(pm.emission) / 255.0);
     let stampOk = opennessGen[chunkIndexW(cell)] == opennessStamp(worldChunkOf(cell));
     irrDeposit(irrIndexOfCell(cell, face), sample, GI_RESOLVE_ALPHA, stampOk,
                &irradiance);

@@ -2367,7 +2367,7 @@ struct Tuning {
     // openness walk, gathered at every near-field hit. Render-only.
     float giStrength = 2.0f;            // 0 = everything const-folded away
     float giDecay = 0.25f;              // per-visit fade of unmeasurable faces
-    float giFeedback = 0.0f;            // P2 write-back weight, < giDecay
+    float giFeedback = 0.2f;            // P2 write-back weight, < giDecay
     int giGatherBlocks = 3;             // blocks per gather ray
 
     // drifting particulate. Render-only motes suspended in the water, which is
@@ -2507,7 +2507,6 @@ struct Tuning {
     float lavaWarmBias = 0.035f;
     float lavaEmissionGain = 1.9f;
     float lavaPulseAmp = 0.06f, lavaPulseRate = 0.9f;
-    float heatSpillStrength = 0.16f;
 
     // embers (sub-voxel points; see emberGlow in raymarch.wgsl for why the
     // splat radius is clamped to ~1/4 voxel and brightness is area-compensated)

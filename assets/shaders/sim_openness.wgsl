@@ -203,39 +203,46 @@ fn openValueAt(blockMin : vec3<i32>, face : u32) -> u32 {
 fn openSunSample(blockMin : vec3<i32>, face : u32) -> vec4f {
   let n = openFaceNormal(face);
   let L = keyLightDirP(R);
-  if (dot(n, L) <= 0.0) { return vec4f(0.0, 0.0, 0.0, 1.0); }   // faces away: unlit, and that IS the sample
   let half = f32(SUBOCC_BLOCK) * 0.5;
   let centre = vec3f(blockMin) + vec3f(half);
   // The first blocker voxel under the face centre, stepping inward from the
-  // face plane through at most the block's own depth.
+  // face plane through at most the block's own depth. Its albedo AND its
+  // emission (P3): a lava face deposits its glow here whether or not the sun
+  // is up, which is why a face turned away from the sun still runs this.
   let ni = vec3<i32>(round(n));
   var c = vec3<i32>(floor(centre + n * (half - 0.5)));
   var albedo = vec3f(0.0);
+  var emis = 0.0;
   var found = false;
   for (var i = 0u; i < SUBOCC_BLOCK; i++) {
     let w = voxWordAt(c);
     let m = materials[voxMat(w)];
     if (isRayBlocker(m)) {
       albedo = paletteColor(m, voxState(w), &materials);
+      emis = f32(m.emission) / 255.0;
       found = true;
       break;
     }
     c -= ni;
   }
   if (!found) { return vec4f(0.0); }
-  // The sun ray: the same origin the openness rays use (half a voxel into the
-  // air block in front), coarse from the first step, softened by distance to
-  // the blocker exactly as shadow_resolve.wgsl softens its ray, so the two
-  // injection paths agree about what "lit" means.
-  let ro = centre + n * (half + 0.5);
-  let s = traceOpaque(ro, L, TUNE_SHADOW_STEPS, 0.0, &occupancy, &materials);
-  var lit = 1.0;
-  if (s.hit) {
-    let dM = s.t * VOXEL_METERS;
-    lit = clamp(smoothstep(TUNE_SHADOW_SOFT_NEAR, TUNE_SHADOW_SOFT_FAR, dM) *
-                TUNE_SHADOW_LIFT, 0.0, 1.0);
+  // The sun ray, only for a face the sun can reach: the same origin the
+  // openness rays use (half a voxel into the air block in front), coarse from
+  // the first step, softened by distance to the blocker exactly as
+  // shadow_resolve.wgsl softens its ray, so the two injection paths agree
+  // about what "lit" means.
+  var lit = 0.0;
+  if (dot(n, L) > 0.0) {
+    let ro = centre + n * (half + 0.5);
+    let s = traceOpaque(ro, L, TUNE_SHADOW_STEPS, 0.0, &occupancy, &materials);
+    lit = 1.0;
+    if (s.hit) {
+      let dM = s.t * VOXEL_METERS;
+      lit = clamp(smoothstep(TUNE_SHADOW_SOFT_NEAR, TUNE_SHADOW_SOFT_FAR, dM) *
+                  TUNE_SHADOW_LIFT, 0.0, 1.0);
+    }
   }
-  return vec4f(irrSample(albedo, n, L, keyLightColorP(R), lit), 1.0);
+  return vec4f(irrSample(albedo, n, L, keyLightColorP(R), lit, emis), 1.0);
 }
 
 // One chunk slot. `li` is both the thread index and the WORD index within the

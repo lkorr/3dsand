@@ -80,9 +80,12 @@
 @group(0) @binding(18) var<storage, read> opennessGen : array<u32>;
 // The irradiance grid (docs/PLAN_gi.md §3; common.wgsl IRRADIANCE GRID): the
 // radiance leaving each block-face, deposited by shadow_resolve.wgsl and the
-// openness walk, gathered here at every near-field hit (giGather). Read-only
-// until P2's write-back.
-@group(0) @binding(19) var<storage, read> irradiance : array<u32>;
+// openness walk, gathered here at every near-field hit (giGather) — and, since
+// P2, written back to: the receiver's own outgoing radiance (direct + bounce)
+// is blended into its block-face at TUNE_GI_FEEDBACK so bounces compound. The
+// third buffer a fragment shader writes, with shadowCache's argument: render-
+// private derived data the renderer itself produced.
+@group(0) @binding(19) var<storage, read_write> irradiance : array<u32>;
 const RS_PX : u32 = 0u;          // sampled pixels (denominator)
 const RS_PRIMARY : u32 = 1u;     // trace() steps from fs's camera ray
 const RS_MEDIA : u32 = 2u;       // cells that accumulated media tau in trace()
@@ -5382,62 +5385,6 @@ fn crustCracks(pm : vec2f, t : f32) -> f32 {
 // ---- the full molten shade ----
 // Returns the emitted colour of a molten surface cell, in linear HDR (values
 // well above 1 are expected and are handled by the tonemap in fs()).
-// ---- heat spill ----
-// Molten surfaces are bright light sources, and before this the rock one voxel
-// from a lava pool was lit purely by the sun — the pool sat in its basin like
-// a decal, casting nothing. Nothing else in the scene betrays "this glow is
-// painted on" as fast as an unlit surround.
-//
-// Rather than a light-propagation volume (DESIGN.md's eventual GI plan), this
-// takes a handful of taps along the surface normal and counts molten cells:
-// cheap, local, and enough to warm a rim convincingly. It runs ONLY for
-// surfaces that pass a cheap chunk-level test, so a world with no lava in view
-// pays almost nothing — the "costs nothing when idle" rule (CLAUDE.md #2)
-// applies to render work too.
-//
-// Returns a linear HDR colour to ADD to the surface shade.
-fn heatSpill(cell : vec3<i32>, n : vec3f) -> vec3f {
-  var glow = vec3f(0.0);
-  // Step outward along the normal; a molten cell found near contributes more.
-  // 4 taps at ~1.6-voxel spacing reaches ~6 voxels. Measured: at 6 taps this
-  // function cost ~13 ms/frame of a 30 ms frame — it runs on EVERY
-  // non-emissive surface pixel in the world, so its per-tap cost is paid by
-  // terrain that will never see lava. Keep the loop short; the falloff makes
-  // the far taps nearly worthless anyway.
-  for (var i = 1; i <= 4; i++) {
-    let s = f32(i) * 1.6;
-    // floor(), not a bare cast: WGSL's f32->i32 conversion truncates toward
-    // zero, so a negative offset like -1.5 becomes -1 instead of -2 and the
-    // tap lands on the wrong side of the surface. That asymmetry made
-    // up-facing rims sample sideways into the pool and glow pink.
-    let c = cell + vec3<i32>(floor(n * s + vec3f(0.5)));
-    if (!inBounds(c)) { break; }
-    // ONE address translation for both reads. chunkOcc() and voxWordAt() each
-    // recompute chunkIndexOf(c & WORLD_MASK) independently, so a tap that
-    // survives the reject paid for the same index twice — and voxWordAt then
-    // makes its voxels[] address DEPEND on its own pageTable[] load, which
-    // serialises two round trips. Hoisting the index and handing the entry to
-    // voxWordAtEntry is exactly what trace()'s DDA already does, and for the
-    // same reason (common.wgsl, "Hoisting the entry turns that into one
-    // independent load"). Same words read, same order, same result.
-    let ci = chunkIndexW(c);
-    // chunk-level reject first: an empty or lava-free chunk costs one read
-    if (occTotal(occupancy[ci]) == 0u) { continue; }
-    let mm = materials[voxMat(voxWordAtEntry(pageEntryOf(ci), c))];
-    if (mm.klass == CLASS_LIQUID && (mm.flags & MATF_OPAQUE) != 0u &&
-        mm.emission > 0u) {
-      // inverse-square-ish falloff, normalised so a touching cell gives ~1
-      let fall = 1.0 / (1.0 + s * s * 0.55);
-      glow += unpackColor(mm.color0) * (f32(mm.emission) / 255.0) * fall;
-    }
-  }
-  // Deliberately subtle. Heat spill should read as a warm lick along the rim
-  // nearest the pool, not as a pink wash over every surface in the basin —
-  // this is a contact cue, and once it covers a broad flat area it stops
-  // looking like light and starts looking like the wrong albedo.
-  return glow * TUNE_HEAT_SPILL_STRENGTH;
-}
-
 // ---- how "pooled" is this molten cell? ----
 // Returns 0 for an isolated blob and 1 for the interior of a body of lava.
 //
@@ -7285,7 +7232,26 @@ fn fs(in : VSOut) -> FSOut {
     // case gathers from the ground the tuft grows in, like the openness read.
     // TUNE_GI_STRENGTH = 0 folds the whole call away (the `nogi` arm).
     if (TUNE_GI_STRENGTH > 0.0) {
-      color += albedo * ao * giGather(hp, openN, openCell) * TUNE_GI_STRENGTH;
+      let bounce = albedo * ao * giGather(hp, openN, openCell) * TUNE_GI_STRENGTH;
+      color += bounce;
+      // ---- P2 write-back (docs/PLAN_gi.md §4) ----
+      // This pixel's OUTGOING radiance — the direct term it just computed plus
+      // the bounce it just gathered — blended into its own block-face at
+      // TUNE_GI_FEEDBACK, so the next frame's gather at a neighbour sees light
+      // that has already bounced once: Lin's "unlimited bounces" as a
+      // fixed-point iteration over frames. Bounded: each bounce is albedo ×
+      // the gather's 0.28 × giStrength of the last, and LoadTuning keeps that
+      // below 1. Racy against the resolve pass's deposits by design (same
+      // word, same blend); a slot whose stamp does not match is left to the
+      // walk. Micro hits skip it — their cell is the ground below, and a tuft
+      // is not that surface.
+      if (TUNE_GI_FEEDBACK > 0.0 && !isMicro &&
+          opennessGen[chunkIndexW(h.cell)] == opennessStamp(worldChunkOf(h.cell))) {
+        let wi = irrIndexOfCell(h.cell, openFaceOfNormal(n));
+        let outgoing = albedo * sun + bounce;
+        irradiance[wi] =
+            packRgb9e5(mix(unpackRgb9e5(irradiance[wi]), outgoing, TUNE_GI_FEEDBACK));
+      }
     }
 
     // ---- caustics on a submerged surface ----
@@ -7394,27 +7360,11 @@ fn fs(in : VSOut) -> FSOut {
       let ch = pcg(u32(h.cell.x * 7 + h.cell.y * 131 + h.cell.z * 2917));
       let flick = TUNE_EMISSIVE_FLICKER_BASE + TUNE_EMISSIVE_FLICKER_AMP * sin(R.time * TUNE_EMISSIVE_FLICKER_RATE + f32(ch & 0xFFu) * 0.0245);
       color += albedo * emis * TUNE_EMISSIVE_STRENGTH * flick;
-    } else {
-      // Non-emissive surfaces pick up nearby molten light. heatSpill() itself
-      // rejects per tap on the chunk occupancy, and the loop breaks the moment
-      // it leaves the window, so a surface with no lava near it costs at most
-      // a few reads and no arithmetic. Cheap enough to run unconditionally,
-      // and any earlier gate would have to answer the same "is lava near"
-      // question the taps already answer.
-      // EARLY REJECT, and this gate is load-bearing: heatSpill runs on every
-      // non-emissive surface pixel, and measured unguarded it cost ~13 ms of a
-      // 30 ms frame — paid overwhelmingly by terrain nowhere near lava. Lava
-      // is a liquid, so it is counted in a chunk's total but NOT in its
-      // blocker count (isRayBlocker excludes non-opaque liquids... but lava IS
-      // opaque, so it does count). The cheap discriminator that survives both
-      // cases is simply: does the chunk one step along the normal hold
-      // anything at all? Open air above a grass field does not, so the common
-      // case is one buffer read and out.
-      let probe = h.cell + vec3<i32>(floor(n * 3.0 + vec3f(0.5)));
-      if (inBounds(probe) && occTotal(chunkOcc(probe)) != 0u) {
-        color += albedo * heatSpill(h.cell, n);
-      }
     }
+    // (heatSpill, the four-tap molten-light stand-in that used to live here,
+    // was deleted by P3 of docs/PLAN_gi.md: lava and embers deposit their
+    // emission into the irradiance grid through irrSample, and the gather above
+    // is what lights the rim rock now.)
 
     // distance fog (density per meter, so the look survives voxel-size
     // changes). Density is a uniform tracking the far field's currently

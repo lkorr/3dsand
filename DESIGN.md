@@ -3942,27 +3942,11 @@ world hash.
   falls between samples and vanishes, and a ceiling so a distant spark's
   linearly-growing pixel footprint does not inflate it into a fuzzy square.
 
-  Perf note: `heatSpill()` runs on every non-emissive surface pixel and cost
-  ~13 ms of a 30 ms frame unguarded — paid overwhelmingly by terrain nowhere
-  near lava. It is now gated on a one-read chunk-occupancy probe along the
-  normal and capped at 4 taps, which brings it to ~1 ms. Any future per-pixel
-  effect keyed on a *rare* material needs the same treatment.
-- **Sky: a scattering model, not a gradient (2026-08-20).** The sky used to be
-  a two-colour lerp with `pow(dot(rd, sun), 800)` added for the sun. That
-  cannot produce a sunset, cannot light the world differently at different
-  times of day, and reads as a painted backdrop. It is now a single-scattering
-  model, and every part of the look falls out of it:
-  - **Rayleigh** in-scatter with the real 1/λ⁴ coefficients (0.144/0.313/0.794)
-    makes the sky blue and the setting sun red *from the same numbers*.
-  - **Mie** in-scatter with a Henyey-Greenstein lobe puts the haze glow around
-    the sun, wavelength-neutral, so it turns orange only because the light
-    reaching it has.
-  - A **Kasten-Young air-mass curve** (1.0 at the zenith, ~38 at the horizon)
-    thickens both toward the horizon, which is what gives the pale horizon
-    band, the deep zenith, and the reddening of a low sun.
-  - The **sun disc** is drawn at its true 0.53° angular size (oversized 3× by
-    default because physically-correct is a pinprick at game FOV),
-    pixel-antialiased, with per-channel limb darkening so it reads as a sphere.
+  Perf note (historical): `heatSpill()`, the four-tap molten-light stand-in,
+  cost ~13 ms of a 30 ms frame unguarded and ~1 ms gated. It was DELETED on
+  2026-09-02 by P3 of `docs/PLAN_gi.md`: emission is part of the irradiance
+  sample both injection paths deposit (`irrSample`), and the one-bounce gather
+  (§9.y) lights the rim rock at no per-pixel cost beyond the gather itself.
 
   Two coefficient traps, both of which produced a *khaki* sky and both of
   which are easy to re-introduce:
@@ -4380,8 +4364,22 @@ B +1.01 per 255 over the middle of the frame (G ≥ 2.0 and G − R ≥ 1.0 from
 no resolve pass and so no injection, and the bounce would otherwise be the
 whole disagreement.
 
-- Later: P2 (write-back) and P3 (emissives, deleting `heatSpill`) — in
-  `docs/PLAN_gi.md`. Volumetrics for gases.
+**P2 write-back (2026-09-02).** After the gather, `fs` blends the pixel's outgoing
+radiance (`albedo × sun + bounce`) into its own block-face at `render.giFeedback`
+(0.2), so the next frame's gather at a neighbour sees light that has already
+bounced — multi-bounce as a fixed-point iteration over frames. `irradiance` is
+the third buffer a fragment shader writes. Bounded because each bounce is
+albedo × 0.28 × `giStrength` of the last; `LoadTuning` keeps `giFeedback <
+giDecay` and `giStrength ≤ 3` while feedback is on. `--gate gi-bounce`'s
+convergence arm reads the wall's word after 500 and 600 frames (0.0301 both).
+
+**P3 emissives (2026-09-02).** Emission is part of the one sample both injection
+paths deposit (`irrSample`), so lava and embers light their surroundings through
+the same gather that lights a wall from a meadow, on every dirty tick. `heatSpill`
+and `render.heatSpillStrength` are gone.
+
+- Later: volumetrics for gases; a bilinear over the emitter faces if the
+  block-scale edge of a bounce patch ever matters.
 
 ## 9b. Wind (added 2026-08-25)
 

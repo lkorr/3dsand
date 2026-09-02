@@ -324,7 +324,7 @@ TP_F(render, giDecay, TUNE_GI_DECAY, 0.25f)
 // into its block-face per frame, so bounces compound. 0 = one bounce only.
 // LoadTuning keeps it strictly below giDecay or the grid brightens without
 // bound.
-TP_F(render, giFeedback, TUNE_GI_FEEDBACK, 0.0f)
+TP_F(render, giFeedback, TUNE_GI_FEEDBACK, 0.2f)
 // 4^3 blocks each of the five gather rays steps through (3 = 1.2 m).
 TP_I(render, giGatherBlocks, TUNE_GI_GATHER_BLOCKS, 3)
 
@@ -417,7 +417,6 @@ TP_F(render, lavaWarmBias, TUNE_LAVA_WARM_BIAS, 0.035f)
 TP_F(render, lavaEmissionGain, TUNE_LAVA_EMISSION_GAIN, 1.9f)
 TP_F(render, lavaPulseAmp, TUNE_LAVA_PULSE_AMP, 0.06f)
 TP_F(render, lavaPulseRate, TUNE_LAVA_PULSE_RATE, 0.9f)
-TP_F(render, heatSpillStrength, TUNE_HEAT_SPILL_STRENGTH, 0.16f)
 TP_F(render, emberBrightness, TUNE_EMBER_BRIGHTNESS, 2.2f)
 TP_F(render, emberRise, TUNE_EMBER_RISE, 26.0f)
 TP_F(render, emberRate, TUNE_EMBER_RATE, 3.4f)

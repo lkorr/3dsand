@@ -2033,7 +2033,6 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadF(*g, "lavaEmissionGain", r.lavaEmissionGain, out, at);
     ReadF(*g, "lavaPulseAmp", r.lavaPulseAmp, out, at);
     ReadF(*g, "lavaPulseRate", r.lavaPulseRate, out, at);
-    ReadF(*g, "heatSpillStrength", r.heatSpillStrength, out, at);
     ReadF(*g, "emberBrightness", r.emberBrightness, out, at);
     ReadF(*g, "emberRise", r.emberRise, out, at);
     ReadF(*g, "emberRate", r.emberRate, out, at);
@@ -2204,6 +2203,16 @@ bool LoadTuning(const std::string& path, Tuning& out) {
       r.giFeedback = std::max(0.0f, r.giDecay * 0.5f);
     }
     r.giGatherBlocks = std::clamp(r.giGatherBlocks, 0, 8);
+    // Multi-bounce gain (P2): each bounce is albedo x the gather's 0.28 form
+    // factor x giStrength, and the series converges only while that is below
+    // 1 -- so with write-back on, giStrength above 3 can run away on a white
+    // room. Clamped, and said.
+    if (r.giFeedback > 0.0f && r.giStrength > 3.0f) {
+      out.warnings.push_back(
+          "render.giStrength above 3 with giFeedback on diverges (albedo x 0.28 "
+          "x strength must stay below 1); clamped to 3");
+      r.giStrength = 3.0f;
+    }
   }
 
   if (const json* g = Find(j, "worldgen")) {

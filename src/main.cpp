@@ -761,6 +761,19 @@ void ProjectBodyUI(const PlayerAvatar& av, Physics& phys, const PortraitCam& pc,
 // render/look changes can be judged in seconds instead of the full selftest.
 // Cameras deliberately match the selftest's so the two stay comparable.
 int RunShots(GpuContext& ctx, World& world, Simulation& sim) {
+  // THE WHOLE WINDOW PER TICK for the openness/irradiance refresh, in this
+  // harness only. The grid's rolling refresh covers 256 slots a tick and a
+  // worldgen zeroes every stamp, so a section that re-runs worldgen and
+  // settles 40 ticks (the lava pool) had a grid for slots 256..10,495 and
+  // nothing else — its rim rock gathered from unstamped blocks, i.e. from
+  // nothing, and the P3 frames came out bit-identical with GI on and off. In
+  // play the same 128-tick latency is four seconds after a load, which is
+  // fine; a frame that is the evidence for a lighting phase is not.
+  {
+    Tuning t = CurrentTuning();
+    t.render.opennessChunksPerFrame = (int)kNumChunks;
+    SetCurrentTuning(t);
+  }
   SubmitWorldgen(ctx, world, sim, kDefaultSeed);
   ctx.WaitIdle();
   FarField far;
@@ -1204,7 +1217,18 @@ int RunShots(GpuContext& ctx, World& world, Simulation& sim) {
     render({(float)(kLx - 14), (float)(kSurf + 4), (float)(kLz - 14)}, 0.785f,
            -0.16f, "screenshot_oil_slick.bmp");
 
-    world.SetWindowOrigin({0, 0, 0});
+    // NOT {0, 0, 0}: the lava cameras below sit at z 496..546, and with the
+    // window at 512 cells (it was 1024 when this section was written) an
+    // origin of 0 puts them in the FAR CASCADE. z origin 8 chunks (128..639)
+    // keeps them AND the sections after (the room at z 160, the blood scene
+    // at z 150) inside the window. KNOWN STALE FIXTURE, found 2026-09-02 while
+    // judging P3: the pool worldgen once authored at (220, 520) is not there
+    // at this seed any more — the ground is at y ~211 and the three cameras
+    // at y 70..86 are buried in rock, so the frames are flat dark facets with
+    // GI on or off. The live lava frame is screenshot_lava_spatter (stamped
+    // through the mutation queue on the surface); whoever re-authors the pool
+    // should move these cameras with it.
+    world.SetWindowOrigin({0, 0, 8});
     SubmitWorldgen(ctx, world, sim, kDefaultSeed);
     ctx.WaitIdle();
     for (uint32_t t = 1; t <= 40; t++)
