@@ -56,6 +56,19 @@ struct PerfOptions {
   uint32_t width = 1920, height = 1080;
   // List the scenarios and exit.
   bool list = false;
+  // --budget-arms a,b,c: run only these --render-budget arms (empty = all).
+  // What makes a one-boot --verify affordable: the full table is ~14 arms of
+  // 60 frames each, and a package usually has one suspect.
+  std::vector<std::string> arms;
+};
+
+// One --render-budget row, for callers that record rather than read the
+// terminal (--verify writes them into build/last_run.json).
+struct RenderBudgetRow {
+  std::string arm;
+  bool ok = false;
+  double gpuP50Ms = 0, gpuP95Ms = 0;
+  std::string why;  // when !ok
 };
 
 // Returns 0 on success. Prints a human-readable summary as it goes — the JSON
@@ -76,9 +89,12 @@ int RunPerf(GpuContext& ctx, World& world, Simulation& sim,
 // It exists so that diagnosing the render never becomes the feature-by-feature
 // elimination sequence CLAUDE.md's rule 6 forbids: the whole table is one run.
 // `opt.only` picks the camera (any --perf scenario id, default `idle`);
-// `opt.width/height` set the resolution. Prints a table; writes no JSON.
+// `opt.width/height` set the resolution; `opt.arms` picks a subset. Prints a
+// table; writes no JSON itself — `rows`, when given, receives one entry per
+// arm run so the caller can.
 int RunRenderBudget(GpuContext& ctx, World& world, Simulation& sim,
                     const std::vector<MaterialDef>& mats,
-                    const PerfOptions& opt);
+                    const PerfOptions& opt,
+                    std::vector<RenderBudgetRow>* rows = nullptr);
 
 }  // namespace sandvox

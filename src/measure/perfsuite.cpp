@@ -1712,8 +1712,23 @@ class RenderBudgetRunner {
 
 int RunRenderBudget(GpuContext& ctx, World& world, Simulation& sim,
                     const std::vector<MaterialDef>& mats,
-                    const PerfOptions& opt) {
+                    const PerfOptions& opt,
+                    std::vector<RenderBudgetRow>* rows) {
   std::printf("=== sandvox --render-budget: where inside the raymarch ===\n");
+  // An arm name that matches nothing is a typo, and a typo that silently runs
+  // the full table costs the minutes the subset was meant to save.
+  for (const std::string& want : opt.arms) {
+    bool known = false;
+    for (const RenderArm& arm : kRenderArms)
+      if (want == arm.id) known = true;
+    if (!known) {
+      std::fprintf(stderr, "--render-budget: no arm named '%s' (try: ",
+                   want.c_str());
+      for (const RenderArm& arm : kRenderArms) std::fprintf(stderr, "%s ", arm.id);
+      std::fprintf(stderr, ")\n");
+      return 1;
+    }
+  }
   std::printf("adapter: %s\n", ctx.DeviceName().c_str());
   if (!ctx.timestampsEnabled) {
     std::fprintf(stderr,
@@ -1803,12 +1818,27 @@ int RunRenderBudget(GpuContext& ctx, World& world, Simulation& sim,
 
   std::vector<ArmResult> out;
   for (const RenderArm& arm : kRenderArms) {
+    if (!opt.arms.empty()) {
+      bool wanted = false;
+      for (const std::string& want : opt.arms)
+        if (want == arm.id) wanted = true;
+      if (!wanted) continue;
+    }
     ArmResult r = runner.Measure(arm, base, scene, /*warm=*/12, /*frames=*/48);
     std::printf("  %-11s %-42s ", arm.id, arm.label);
     if (!r.ok) std::printf("SKIPPED — %s\n", r.why.c_str());
     else std::printf("%7.2f ms\n", r.gpuP50);
     std::fflush(stdout);
     out.push_back(r);
+    if (rows) {
+      RenderBudgetRow row;
+      row.arm = arm.id;
+      row.ok = r.ok;
+      row.gpuP50Ms = r.gpuP50;
+      row.gpuP95Ms = r.gpuP95;
+      row.why = r.why;
+      rows->push_back(std::move(row));
+    }
   }
   SetCurrentTuning(base);
   sim.ReloadShaders(ctx.device);
@@ -1841,7 +1871,11 @@ int RunRenderBudget(GpuContext& ctx, World& world, Simulation& sim,
   }
 
   // ---- the table the run exists to print --------------------------------
-  const double b = out.empty() || !out[0].ok ? 0.0 : out[0].gpuP50;
+  // The baseline is the arm named baseline, not out[0]: under --budget-arms
+  // the first row measured can be any arm, and a delta against it is noise.
+  double b = 0.0;
+  for (const ArmResult& r : out)
+    if (r.arm == &kRenderArms[0] && r.ok) b = r.gpuP50;
   std::printf("\n  baseline raymarch: %.2f ms at %ux%u\n\n", b, opt.width,
               opt.height);
   std::printf("  %-11s %9s %9s  %s\n", "arm", "ms", "saved", "what the saving is the cost of");
