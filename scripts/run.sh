@@ -39,7 +39,14 @@ cleanup_stale_lock() {
 REFRESH_PID=""
 release_lock() {
   [ -n "$REFRESH_PID" ] && kill "$REFRESH_PID" 2>/dev/null || true
-  rm -rf "$LOCK_DIR"
+  # Only the owner releases: if the lock was stolen from us, deleting it would
+  # take the NEW holder's lock with it (and the next build.sh would taskkill
+  # its live run).
+  if [ "$(cat "$LOCK_DIR/pid" 2>/dev/null)" = "$$" ]; then
+    rm -rf "$LOCK_DIR"
+  else
+    echo "run.sh: lock no longer ours (holder: $(cat "$LOCK_DIR/who" 2>/dev/null || echo '?')) - not releasing" >&2
+  fi
 }
 
 acquire_lock() {
@@ -67,7 +74,11 @@ acquire_lock
 
 # Refresh the lock timestamp while the command runs, so a legitimate long run
 # (full selftest, a 1200-frame harness) is not stolen as "stale" at 10 min.
-( while true; do sleep 60; date +%s > "$LOCK_DIR/ts" 2>/dev/null || exit 0; done ) &
+( while true; do
+    sleep 60
+    [ "$(cat "$LOCK_DIR/pid" 2>/dev/null)" = "$$" ] || exit 0
+    date +%s > "$LOCK_DIR/ts" 2>/dev/null || exit 0
+  done ) &
 REFRESH_PID=$!
 
 RUN_EXIT=0

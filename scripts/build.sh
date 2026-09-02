@@ -88,8 +88,17 @@ acquire_lock() {
   done
 }
 
+# Only the OWNER releases. A lock can be stolen as "stale" while we still hold
+# it (see the heartbeat below); releasing unconditionally then deletes the NEW
+# holder's lock, and the next build.sh's taskkill kills its live selftest.
+REFRESH_PID=""
 release_lock() {
-  rm -rf "$LOCK_DIR"
+  [ -n "$REFRESH_PID" ] && kill "$REFRESH_PID" 2>/dev/null || true
+  if [ "$(cat "$LOCK_DIR/pid" 2>/dev/null)" = "$$" ]; then
+    rm -rf "$LOCK_DIR"
+  else
+    echo "build.sh: lock no longer ours (holder: $(cat "$LOCK_DIR/who" 2>/dev/null || echo '?')) - not releasing" >&2
+  fi
 }
 
 # ── Configure if requested or needed ──────────────────────────────────────
@@ -103,6 +112,17 @@ fi
 # ── Build (serialized) ────────────────────────────────────────────────────
 acquire_lock
 echo "build.sh: building $TARGET ($CONFIG) with max $MAX_JOBS parallel jobs..."
+
+# Heartbeat: refresh the lock timestamp while we build (and selftest), exactly
+# as run.sh does for runs. Without it a >10 min build (a worktree's first
+# build is one) is stolen as "stale" mid-link. Refresh only while the pid file
+# is still ours, so a stolen lock is never kept alive by the loser.
+( while true; do
+    sleep 60
+    [ "$(cat "$LOCK_DIR/pid" 2>/dev/null)" = "$$" ] || exit 0
+    date +%s > "$LOCK_DIR/ts" 2>/dev/null || exit 0
+  done ) &
+REFRESH_PID=$!
 
 # Kill any running sandvox.exe INSIDE the lock. This used to run before
 # acquire_lock, which made it useless under the load it exists to handle: agent
