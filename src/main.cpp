@@ -37,7 +37,9 @@
 #include "game/thirdperson.h"
 #include "gpu/context.h"
 #include "gpu/resources.h"
+#include "gpu/rhi_vk.h"  // rhi::vkr::SetCaptureStats (--shader-stats)
 #include "gpu/vk_info.h"
+#include "gpu/vk_shader_stats.h"
 #include "gpu/vk_smoke.h"
 #include "lab/lab.h"
 #include "math3d.h"
@@ -2028,6 +2030,12 @@ int main(int argc, char** argv) {
   // reason: a windowed run measures the compositor as much as the engine.
   bool perf = false;
   bool renderBudget = false;
+  // --shader-stats: what the DRIVER says about each compiled shader (register
+  // count, spilled bytes, occupancy) via VK_KHR_pipeline_executable_properties.
+  // Headless and one-shot: it builds every pipeline once, prints, and exits.
+  // The renderer's cost model has been reasoning about register footprint from
+  // WGSL shape alone; this reads the number instead.
+  bool shaderStats = false;
   sandvox::PerfOptions perfOpt;
   bool rebaseline = false;  // --rebaseline: write observed values into baseline.json
   bool suiteAcceptance = false;  // --suite acceptance: one-process full acceptance
@@ -2122,7 +2130,9 @@ int main(int argc, char** argv) {
           "  --scenario <id>       One --perf scenario (idle|treeburn|flythrough|explosion|water)\n"
           "  --perf-out <path>     Where --perf writes its JSON\n"
           "  --perf-w/--perf-h <n> Offscreen render size for --perf/--render-budget\n"
-          "  --render-budget       Where INSIDE the raymarch the GPU frame went\n\n"
+          "  --render-budget       Where INSIDE the raymarch the GPU frame went\n"
+          "  --shader-stats        Per-shader registers/spills from the driver\n"
+          "                        -> build/shader_stats.json (headless)\n\n"
           "Residency:\n"
           "  --residency paged|dense  Voxel buffer residency mode (default: paged)\n\n"
           "Vulkan / debug:\n"
@@ -2219,6 +2229,10 @@ int main(int argc, char** argv) {
     // --scenario water` must budget the water camera, not run the water
     // scenario.
     else if (a == "--render-budget") renderBudget = true;
+    // `--shader-stats` must arm capture BEFORE Simulation::Init builds any
+    // pipeline (CAPTURE_STATISTICS is a create flag), which is why it is a
+    // plain bool read down where the device is made, not a runner argument.
+    else if (a == "--shader-stats") shaderStats = true;
     else if (a == "--perf-w") {
       if (i + 1 >= argc) { std::fprintf(stderr, "--perf-w requires a width\n"); return 1; }
       perfOpt.width = (uint32_t)std::atoi(argv[++i]);
@@ -2666,8 +2680,8 @@ int main(int argc, char** argv) {
   }
 
   GLFWwindow* window = nullptr;
-  if (!selftest && !shot && !measure && !perf && !fluidBench && shotMob.empty() &&
-      voxdumpArgs.empty() && !voxserve) {
+  if (!selftest && !shot && !measure && !perf && !fluidBench && !shaderStats &&
+      shotMob.empty() && voxdumpArgs.empty() && !voxserve) {
     if (!glfwInit()) return 1;
     glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
     window = glfwCreateWindow(1600, 900, "sandvox", nullptr, nullptr);
@@ -2684,6 +2698,13 @@ int main(int argc, char** argv) {
                 sledgehammer))
     return 1;
 
+  // ARM PIPELINE STATISTICS CAPTURE BEFORE THE FIRST PIPELINE EXISTS. This is
+  // the whole reason --shader-stats is a bool up here instead of a runner
+  // argument down at the dispatch: VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT
+  // is a CREATE flag, and Simulation::Init below builds every compute pipeline
+  // in the engine. Set it afterwards and the mode reports nothing, silently.
+  if (shaderStats) rhi::vkr::SetCaptureStats(ctx.device, true);
+
   Telemetry telemetry;
   if (telemetryEnabled) telemetry.Start(telemetryPort);
 
@@ -2695,6 +2716,17 @@ int main(int argc, char** argv) {
   if (!sim.Init(ctx.device, world, mats, reactions, micro, treeAtlas,
                 assetDir + "/shaders"))
     return 1;
+
+  // --shader-stats answers HERE, before a player, a physics world or a single
+  // tick exists: every pipeline in the engine has now been created, which is
+  // the only state it needs. The render pipelines are the exception — they are
+  // built lazily on the first draw — so force them into existence in the
+  // format the offscreen harnesses use, or the `raymarch` fragment row (the
+  // one the whole mode is for) would be missing from the table.
+  if (shaderStats) {
+    sim.ForceRenderPipelines(rhi::TextureFormat::RGBA8Unorm);
+    return sandvox::RunShaderStats(ctx.device, "build/shader_stats.json");
+  }
 
   // ---- LIVE PERFORMANCE TELEMETRY (--telemetry) ---------------------------
   //

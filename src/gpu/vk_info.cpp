@@ -169,6 +169,11 @@ void PrintCaps(const vk::Caps& c) {
   std::printf("\n=== measurement / validation ===\n");
   std::printf("  timestampQuery                : %s (period %.4f ns)\n",
               YesNo(c.timestampQuery), c.timestampPeriodNs);
+  std::printf("  pipelineExecutableProperties  : %s%s\n",
+              YesNo(c.pipelineExecutableProps),
+              c.pipelineExecutableProps
+                  ? "   (--shader-stats can report register/spill counts)"
+                  : "   <- --shader-stats has nothing to read; we keep guessing");
   std::printf("  validation layer available    : %s\n", YesNo(c.validationAvailable));
   std::printf("  validation enabled            : %s\n", YesNo(c.validationEnabled));
   std::printf("  synchronization validation    : %s\n", YesNo(c.syncValidationEnabled));

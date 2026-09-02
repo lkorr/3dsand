@@ -292,6 +292,16 @@ class Simulation {
     if (passTimer_) passTimer_->EncodeResolve(enc);
   }
 
+  // Build the render pipelines NOW rather than on the first BeginRenderPass.
+  // The one caller is `--shader-stats`: graphics pipelines are created lazily
+  // (BuildPipelines leaves targetFormat_ Undefined), so a mode that walks the
+  // pipeline list without drawing anything would find no `raymarch` — the row
+  // it exists to print. Format-keyed like the lazy path, so a subsequent draw
+  // in the same format is a no-op rather than a rebuild.
+  void ForceRenderPipelines(rhi::TextureFormat format) {
+    EnsureRenderPipelines(format);
+  }
+
  private:
   bool BuildPipelines(const rhi::Device& device, std::string* err);
   void EnsureDepth(uint32_t width, uint32_t height);

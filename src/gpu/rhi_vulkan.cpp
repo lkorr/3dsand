@@ -541,25 +541,58 @@ bool Backend::CreateLogicalDevice(std::string& err) {
   }
   feat13.dynamicRendering = VK_TRUE;
 
+  // The device extension list, enumerated ONCE. Both consumers below ask the
+  // same question of the same array; the enumeration used to live inside the
+  // swapchain branch, which meant a headless run never learned what the device
+  // offers.
+  uint32_t extCount = 0;
+  ifn_.EnumerateDeviceExtensionProperties(phys_, nullptr, &extCount, nullptr);
+  std::vector<VkExtensionProperties> extProps(extCount);
+  if (extCount)
+    ifn_.EnumerateDeviceExtensionProperties(phys_, nullptr, &extCount, extProps.data());
+  auto haveExt = [&extProps](const char* name) {
+    for (const VkExtensionProperties& p : extProps)
+      if (std::strcmp(p.extensionName, name) == 0) return true;
+    return false;
+  };
+
   // Windowed: VK_KHR_swapchain, verified present rather than assumed. A
   // headless run enables nothing — the device is unchanged from phase 3.
   std::vector<const char*> devExts;
   if (swapchainRequested_) {
-    bool have = false;
-    uint32_t n = 0;
-    ifn_.EnumerateDeviceExtensionProperties(phys_, nullptr, &n, nullptr);
-    std::vector<VkExtensionProperties> props(n);
-    if (n) {
-      ifn_.EnumerateDeviceExtensionProperties(phys_, nullptr, &n, props.data());
-      for (uint32_t i = 0; i < n; i++)
-        if (std::strcmp(props[i].extensionName, VK_KHR_SWAPCHAIN_EXTENSION_NAME) == 0)
-          have = true;
-    }
-    if (!have) {
+    if (!haveExt(VK_KHR_SWAPCHAIN_EXTENSION_NAME)) {
       err = "device does not support VK_KHR_swapchain (windowed --backend vulkan)";
       return false;
     }
     devExts.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
+  }
+
+  // VK_KHR_pipeline_executable_properties — the `--shader-stats` instrument.
+  // Enabled WHENEVER PRESENT, not only in that mode: the mode selects itself
+  // through SetCaptureStats (a create flag), and gating device creation on a
+  // CLI flag would mean the diagnostic runs on a device the game never uses.
+  // The extension on its own changes no behaviour — it only adds two query
+  // entry points and one create flag nobody sets by default. Absence is not
+  // fatal anywhere; `--shader-stats` reports it and exits 2.
+  VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR fePipeExec{
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR};
+  if (haveExt(VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME) &&
+      ifn_.GetPhysicalDeviceFeatures2) {
+    // Probe the FEATURE too, not just the extension string: an extension the
+    // driver advertises with its feature bit clear is unusable, and enabling it
+    // anyway is the kind of half-supported path that turns into an ICD crash
+    // with no validation layer running (the synchronization2 note above).
+    VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR probe{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR};
+    VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+    f2.pNext = &probe;
+    ifn_.GetPhysicalDeviceFeatures2(phys_, &f2);
+    if (probe.pipelineExecutableInfo) {
+      caps_.pipelineExecutableProps = true;
+      fePipeExec.pipelineExecutableInfo = VK_TRUE;
+      feat13.pNext = &fePipeExec;
+      devExts.push_back(VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME);
+    }
   }
 
   VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
@@ -1125,7 +1158,7 @@ VkPipelineLayout Backend::CreatePipelineLayout(const VkDescriptorSetLayout* sets
 }
 
 VkPipeline Backend::CreateComputePipeline(VkPipelineLayout layout, VkShaderModule module,
-                                          const char* entry, const char* /*label*/) {
+                                          const char* entry, const char* label) {
   if (!dfn_.CreateComputePipelines || layout == VK_NULL_HANDLE ||
       module == VK_NULL_HANDLE || !entry)
     return VK_NULL_HANDLE;
@@ -1138,12 +1171,16 @@ VkPipeline Backend::CreateComputePipeline(VkPipelineLayout layout, VkShaderModul
   VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
   ci.stage = stage;
   ci.layout = layout;
+  if (captureStats_) ci.flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
 
   VkPipeline p = VK_NULL_HANDLE;
-  if (dfn_.CreateComputePipelines(device_, pipelineCache_, 1, &ci, nullptr, &p) !=
-      VK_SUCCESS)
+  // A cache HIT hands back an object the driver did not compile this run, and
+  // it reports no statistics — so the stats mode compiles for real.
+  if (dfn_.CreateComputePipelines(device_,
+                                  captureStats_ ? VK_NULL_HANDLE : pipelineCache_, 1,
+                                  &ci, nullptr, &p) != VK_SUCCESS)
     return VK_NULL_HANDLE;
-  pipelines_.push_back(p);
+  pipelines_.push_back({p, label ? label : entry, /*compute=*/true});
   return p;
 }
 
@@ -1230,7 +1267,7 @@ VkPipeline Backend::CreateGraphicsPipeline(VkPipelineLayout layout, VkShaderModu
                                            const char* vsEntry, VkShaderModule fs,
                                            const char* fsEntry,
                                            const rhi::RenderPipelineDesc& d,
-                                           const char* /*label*/) {
+                                           const char* label) {
   if (!dfn_.CreateGraphicsPipelines || layout == VK_NULL_HANDLE ||
       vs == VK_NULL_HANDLE || fs == VK_NULL_HANDLE)
     return VK_NULL_HANDLE;
@@ -1329,13 +1366,134 @@ VkPipeline Backend::CreateGraphicsPipeline(VkPipelineLayout layout, VkShaderModu
   ci.pDynamicState = &dstate;
   ci.layout = layout;
   ci.renderPass = VK_NULL_HANDLE;  // dynamic rendering
+  if (captureStats_) ci.flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
 
   VkPipeline p = VK_NULL_HANDLE;
-  if (dfn_.CreateGraphicsPipelines(device_, pipelineCache_, 1, &ci, nullptr, &p) !=
-      VK_SUCCESS)
+  // See the compute path: the on-disk cache is bypassed under captureStats_
+  // because a cache hit is a pipeline the driver never compiled.
+  if (dfn_.CreateGraphicsPipelines(device_,
+                                   captureStats_ ? VK_NULL_HANDLE : pipelineCache_, 1,
+                                   &ci, nullptr, &p) != VK_SUCCESS)
     return VK_NULL_HANDLE;
-  pipelines_.push_back(p);
+  pipelines_.push_back({p, label ? label : "(unlabelled)", /*compute=*/false});
   return p;
+}
+
+// ---------------------------------------------------------------------------
+// `--shader-stats`: what the driver will tell us about its own compilation.
+//
+// The KHR API is open-ended BY DESIGN — each vendor reports whichever counters
+// it has, under its own names ("Register Count", "SGPRs", "Spill Count",
+// "Scratch Memory Size"...). Nothing here may recognise a name: the caller
+// prints every statistic generically and only the SORT reads names, by
+// substring. Adding a vendor table would silently drop counters on the next GPU
+// this repo runs on.
+// ---------------------------------------------------------------------------
+
+std::vector<PipelineExecutable> Backend::CollectPipelineStats() const {
+  std::vector<PipelineExecutable> out;
+  if (!caps_.pipelineExecutableProps || !dfn_.GetPipelineExecutablePropertiesKHR ||
+      !dfn_.GetPipelineExecutableStatisticsKHR)
+    return out;
+
+  auto stageName = [](VkShaderStageFlags s) {
+    std::string n;
+    auto add = [&n](const char* w) {
+      if (!n.empty()) n += "|";
+      n += w;
+    };
+    if (s & VK_SHADER_STAGE_VERTEX_BIT) add("vertex");
+    if (s & VK_SHADER_STAGE_FRAGMENT_BIT) add("fragment");
+    if (s & VK_SHADER_STAGE_COMPUTE_BIT) add("compute");
+    if (s & VK_SHADER_STAGE_GEOMETRY_BIT) add("geometry");
+    if (s & VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT) add("tessCtrl");
+    if (s & VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT) add("tessEval");
+    if (n.empty()) n = "?";
+    return n;
+  };
+
+  for (const PipelineRec& rec : pipelines_) {
+    if (rec.pipe == VK_NULL_HANDLE) continue;
+    VkPipelineInfoKHR pi{VK_STRUCTURE_TYPE_PIPELINE_INFO_KHR};
+    pi.pipeline = rec.pipe;
+    uint32_t execCount = 0;
+    if (dfn_.GetPipelineExecutablePropertiesKHR(device_, &pi, &execCount, nullptr) !=
+            VK_SUCCESS ||
+        execCount == 0)
+      continue;
+    std::vector<VkPipelineExecutablePropertiesKHR> props(execCount);
+    std::memset(props.data(), 0,
+                props.size() * sizeof(VkPipelineExecutablePropertiesKHR));
+    for (VkPipelineExecutablePropertiesKHR& p : props)
+      p.sType = VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_PROPERTIES_KHR;
+    if (dfn_.GetPipelineExecutablePropertiesKHR(device_, &pi, &execCount,
+                                                props.data()) != VK_SUCCESS)
+      continue;
+
+    for (uint32_t e = 0; e < execCount; e++) {
+      // Bounded: a driver string that forgot its terminator must not turn into
+      // a 256-byte overread. The arrays were memset above, so the bound is the
+      // only thing that can be wrong.
+      auto fixed = [](const char* s, size_t cap) {
+        return std::string(s, ::strnlen(s, cap));
+      };
+      PipelineExecutable pe;
+      pe.pipeline = rec.label;
+      pe.stage = stageName(props[e].stages);
+      pe.name = fixed(props[e].name, VK_MAX_DESCRIPTION_SIZE);
+      pe.description = fixed(props[e].description, VK_MAX_DESCRIPTION_SIZE);
+      pe.subgroupSize = props[e].subgroupSize;
+
+      VkPipelineExecutableInfoKHR ei{VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INFO_KHR};
+      ei.pipeline = rec.pipe;
+      ei.executableIndex = e;
+      uint32_t statCount = 0;
+      if (dfn_.GetPipelineExecutableStatisticsKHR(device_, &ei, &statCount, nullptr) ==
+              VK_SUCCESS &&
+          statCount) {
+        // ZERO THE WHOLE ARRAY BY HAND, and do not trust `{sType}` to do it.
+        // `value` is a UNION whose first member is a 4-byte VkBool32; aggregate
+        // initialisation leaves the other 4 bytes as whatever the heap held,
+        // and this driver writes only 32 bits for statistics whose real value
+        // fits in 32. Measured on an RTX 3060 Ti: every "Local Memory Size"
+        // came back as 0x10'00000000 + the true value, i.e. a stable 64 GiB of
+        // garbage in the high dword, which turned the mode's ONE headline
+        // ("does this shader spill?") into 74 identical nonsense numbers.
+        std::vector<VkPipelineExecutableStatisticKHR> stats(statCount);
+        std::memset(stats.data(), 0,
+                    stats.size() * sizeof(VkPipelineExecutableStatisticKHR));
+        for (VkPipelineExecutableStatisticKHR& s : stats)
+          s.sType = VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_STATISTIC_KHR;
+        if (dfn_.GetPipelineExecutableStatisticsKHR(device_, &ei, &statCount,
+                                                    stats.data()) == VK_SUCCESS) {
+          for (uint32_t s = 0; s < statCount; s++) {
+            PipelineStat ps;
+            ps.name = fixed(stats[s].name, VK_MAX_DESCRIPTION_SIZE);
+            ps.description = fixed(stats[s].description, VK_MAX_DESCRIPTION_SIZE);
+            switch (stats[s].format) {
+              case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_BOOL32_KHR:
+                ps.value = stats[s].value.b32 ? 1.0 : 0.0;
+                ps.isBool = true;
+                break;
+              case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_INT64_KHR:
+                ps.value = (double)stats[s].value.i64;
+                break;
+              case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_UINT64_KHR:
+                ps.value = (double)stats[s].value.u64;
+                break;
+              case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_FLOAT64_KHR:
+              default:
+                ps.value = stats[s].value.f64;
+                break;
+            }
+            pe.stats.push_back(std::move(ps));
+          }
+        }
+      }
+      out.push_back(std::move(pe));
+    }
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -1638,7 +1796,7 @@ void Backend::Shutdown() {
   std::string err;
   WaitIdle(err);
 
-  for (VkPipeline p : pipelines_) dfn_.DestroyPipeline(device_, p, nullptr);
+  for (const PipelineRec& p : pipelines_) dfn_.DestroyPipeline(device_, p.pipe, nullptr);
   pipelines_.clear();
   for (VkPipelineLayout l : pipeLayouts_) dfn_.DestroyPipelineLayout(device_, l, nullptr);
   pipeLayouts_.clear();
