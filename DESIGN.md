@@ -3355,10 +3355,26 @@ world hash.
   churn would dominate. Raymarch the voxel grid directly (DDA through chunks,
   `nonEmpty` flags for empty-space skipping — the same flags the physics uses).
   The sim already lives in GPU memory, so the renderer reads it for free.
-- Pipeline: fullscreen ray pass → G-buffer (albedo/normal/depth/material) →
-  deferred lighting. Voxel face normals from the hit axis; liquids take
-  smoothed normals from the fullness-field gradient instead (see the water
-  section below — implemented).
+- **Pipeline: one fullscreen fragment shader that traces and shades inline.
+  There is no G-buffer and no deferred lighting pass** — `raymarch.wgsl`'s `fs`
+  marches the primary ray and shades the hit in the same invocation, so albedo,
+  normal, depth and material never leave registers. (This bullet described a
+  deferred pipeline that was never built; the cost model that follows from the
+  real one is the reason W2-A exists — a fragment shader's occupancy is set by
+  its worst path, so an inlined secondary-ray tracer is paid by every pixel.)
+  Voxel face normals come from the hit axis; liquids take smoothed normals from
+  the fullness-field gradient instead (see the water section below).
+- **One `trace()` and one `traceOpaque()` (2026-09-01, W2-A).** The 26-field
+  media-aware `trace()` in `raymarch.wgsl` has exactly one call site: the
+  primary camera ray. Every SECONDARY ray — the shadow resolve pass, the
+  cache-off `sunShadowAt` fallback, `traceReflection`, `traceRefraction`, the
+  god-ray occlusion test — casts `traceOpaque()` in `common.wgsl`, a media-blind
+  DDA returning `{hit, t, cell, axis, sgn, word}`, which is the 6 fields those
+  callers actually read. `--render-budget` priced the difference: gating the
+  reflection at runtime saved 0.09 ms, const-folding it away saved 3.58 ms, so
+  the cost was never traversal — it was the register footprint of the inlined
+  copy. `--selftest --gate shadow-cache` asserts the compute-stage and
+  fragment-stage casts still agree.
 - Variant nibble → palette jitter in-shader (stable per-grain color, no reshuffling
   as grains move — exactly why the variant lives in the voxel).
 - Rigidbodies/debris: two options. v1 = raster their marching-cubes meshes,
