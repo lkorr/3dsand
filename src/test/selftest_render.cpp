@@ -876,10 +876,224 @@ Status GateShadowCache(Ctx& c, std::string& detail) {
     const int v = std::atoi(e);
     if (v >= 2) cacheFrames = (uint32_t)v;
   }
-  const bool got = arm(0, true, 2, refPx, &refPrevPx) &&  // per-pixel rays (reference)
-                   arm(1, true, cacheFrames, cachePx, &cachePrevPx) &&  // the cache, warmed
-                   ReadShadowReqHeader(ctx, world, reqStats) &&
-                   arm(0, false, 1, noShadowPx);    // no shadows at all
+  bool got = arm(0, true, 2, refPx, &refPrevPx) &&  // per-pixel rays (reference)
+             arm(1, true, cacheFrames, cachePx, &cachePrevPx) &&  // the cache, warmed
+             ReadShadowReqHeader(ctx, world, reqStats) &&
+             arm(0, false, 1, noShadowPx);    // no shadows at all
+
+  // ---- THE WALK: the same comparison under camera MOTION -------------------
+  // Everything the arms above can see is one picture: a warmed cache behind a
+  // pinned camera. The defects that motivated this arm — shadows that pulse
+  // while walking, that pop into existence a frame after their ground scrolls
+  // into view, and stray dark squares on open ground — are MOTION defects,
+  // and a pinned camera cannot register any of them: a patch that is on
+  // screen every frame is registered every frame, so its one-frame resolve
+  // latency, a window shift that renames every key, and a stale slot's
+  // leftover value all hide behind the frame before. So: kWalk poses along a
+  // walk-and-turn (0.6 voxel and ~1.4 deg of yaw per frame, a brisk walk
+  // turning at ~85 deg/s at 60 fps), each rendered by the per-pixel reference
+  // and by the cache running CONTINUOUSLY through them, with the residency
+  // window shifted one chunk halfway along — which is what walking 1.6 m does
+  // in play. Per frame: the agreement, and separately the pixels the cache
+  // shades LIT where the reference has shadow (a HOLE: "shadows pop in") and
+  // the pixels it shades DARK where the reference is lit (a PHANTOM: "tiny
+  // unconnected shadows"). A mean hides a one-frame event, so the worst frame
+  // and the shift frame are reported on their own, with images.
+  const uint32_t kWalk = 24;
+  const uint32_t kShiftAt = 12;
+  const double kEdgeL = 12.0;   // luminance step that counts as a hole/phantom
+  auto walkPose = [&](uint32_t f, Vec3& e, Camera& cm) {
+    cm = cam;
+    cm.yaw = cam.yaw - 0.30f + 0.025f * (float)f;
+    Vec3 fwd = cam.Forward();
+    fwd.y = 0.0f;
+    fwd = fwd.normalized();
+    e = eye + fwd * (0.6f * (float)f);
+  };
+  // One chunk of +x shift evicts the plane [ox*16, ox*16+16): only do it when
+  // that plane is nowhere near the slab, or the fixture walks off with it.
+  const IVec3 origin0 = world.WindowOrigin();
+  const int halfC = (int)kNChunk / 2;
+  const bool canShift =
+      origin0.x * (int)kChunk + (int)kChunk < gx - 20 &&
+      origin0.x * (int)kChunk + (int)kWorldN > gx + 20;
+  bool shifted = false;
+  auto shiftX = [&](int dir) -> bool {
+    const IVec3 o = world.WindowOrigin();
+    // kHysteresis is 2 chunks: a player 2 chunks off centre moves the window.
+    c.stream.Update({o.x + halfC + 2 * dir, o.y + halfC, o.z + halfC}, tick);
+    ctx.WaitIdle();
+    const bool moved = world.WindowOrigin().x == o.x + dir;
+    if (moved) shifted = !shifted;
+    return moved;
+  };
+  auto renderOne = [&](bool shadows, const Vec3& e, const Camera& cm,
+                       std::vector<uint8_t>* out) -> bool {
+    WriteRenderParams(ctx.queue, world, e, cm, (float)W / H, shadows, 0.0f,
+                      kFarFogDensity, (float)H, noonTick);
+    rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
+    sim.EncodeShadowResolve(enc);
+    rhi::RenderPass rp = sim.BeginRenderPass(
+        enc, c.view, rhi::TextureFormat::RGBA8Unorm, W, H);
+    sim.DrawWorld(rp);
+    rp.End();
+    rhi::Buffer shot;
+    if (out) {
+      shot = CreateBuffer(ctx.device, (uint64_t)W * H * 4,
+                          rhi::BufferUsage::MapRead | rhi::BufferUsage::CopyDst,
+                          "shadowWalkShot");
+      rhi::TexelCopyTexture srcT{};
+      srcT.texture = c.offscreen;
+      rhi::TexelCopyBuffer dstB{};
+      dstB.buffer = shot;
+      dstB.bytesPerRow = W * 4;
+      dstB.rowsPerImage = H;
+      rhi::Extent3D ext{W, H, 1};
+      enc.CopyTextureToBuffer(srcT, dstB, ext);
+    }
+    ctx.queue.Submit(enc.Finish());
+    if (!out) return true;
+    out->assign((size_t)W * H * 4, 0);
+    return rhi::ReadBufferBlocking(ctx.device, shot, 0, out->data(), out->size());
+  };
+  auto setCache = [&](int cacheOn) -> bool {
+    Tuning t = base;
+    t.render.shadowCache = cacheOn;
+    SetCurrentTuning(t);
+    return sim.ReloadShaders(ctx.device);
+  };
+  auto lumAt = [](const std::vector<uint8_t>& px, size_t i) {
+    return 0.299 * px[i] + 0.587 * px[i + 1] + 0.114 * px[i + 2];
+  };
+
+  // The reference walk, kept as one luminance byte per pixel per frame.
+  std::vector<std::vector<uint8_t>> refLum(kWalk);
+  std::vector<uint8_t> tmpPx;
+  bool walkOk = got && setCache(0);
+  for (uint32_t f = 0; walkOk && f < kWalk; f++) {
+    Vec3 e; Camera cm;
+    walkPose(f, e, cm);
+    if (f == kShiftAt && canShift && !shiftX(+1)) walkOk = false;
+    if (!renderOne(true, e, cm, &tmpPx)) { walkOk = false; break; }
+    refLum[f].resize((size_t)W * H);
+    for (size_t i = 0, j = 0; i + 3 < tmpPx.size(); i += 4, j++)
+      refLum[f][j] = (uint8_t)std::min(255.0, lumAt(tmpPx, i) + 0.5);
+  }
+  if (shifted) shiftX(-1);
+
+  // The cache walk: warmed at pose 0, then one frame per pose, continuously.
+  // Each pose is rendered TWICE by the cache: once arriving from the pose
+  // before (moving), then again standing still (settled). The settled frame
+  // is the cache's error at that pose with no motion in it — the patch
+  // quantisation the static arm already measures — so moving minus settled
+  // is the MOTION error on its own, which is the number the one-frame resolve
+  // latency shows up in and the number a pre-registration pass has to move.
+  struct WalkFrame {
+    double agree, agreeSettled;
+    size_t holes, phantoms, holesSettled, phantomsSettled;
+    uint32_t req, res;
+  };
+  std::vector<WalkFrame> walk(kWalk, {0.0, 0.0, 0, 0, 0, 0, 0, 0});
+  uint32_t worstF = 0;
+  std::vector<uint8_t> worstCachePx, worstRefLum;
+  walkOk = walkOk && setCache(1);
+  if (walkOk) {
+    Vec3 e; Camera cm;
+    walkPose(0, e, cm);
+    for (uint32_t w = 0; w < 3; w++) renderOne(true, e, cm, nullptr);
+  }
+  for (uint32_t f = 0; walkOk && f < kWalk; f++) {
+    Vec3 e; Camera cm;
+    walkPose(f, e, cm);
+    if (f == kShiftAt && canShift && !shiftX(+1)) walkOk = false;
+    if (!renderOne(true, e, cm, &tmpPx)) { walkOk = false; break; }
+    uint32_t hdr[4] = {0, 0, 0, 0};
+    ReadShadowReqHeader(ctx, world, hdr);
+    WalkFrame& wf = walk[f];
+    wf.req = hdr[0];
+    wf.res = hdr[1];
+    // Record at the point of failure (CLAUDE.md rule 6): around the shift
+    // frame, the cache's own state — how many slots hold a key, how many of
+    // those were resolved, how many are dark, and the histogram of their
+    // `requested` stamps — so a bad frame says WHICH half failed: the slots
+    // were not found (stamps stop at the frame before) or were found and
+    // held the wrong answer (stamps current, values lit).
+    if (canShift && f + 1 >= kShiftAt && f <= kShiftAt + 1) {
+      rhi::Buffer stage = CreateBuffer(
+          ctx.device, kShadowCacheBytes,
+          rhi::BufferUsage::MapRead | rhi::BufferUsage::CopyDst, "shadowCacheRead");
+      rhi::CommandEncoder cenc = ctx.device.CreateCommandEncoder();
+      cenc.CopyBufferToBuffer(world.shadowCache, 0, stage, 0, kShadowCacheBytes);
+      ctx.queue.Submit(cenc.Finish());
+      std::vector<uint32_t> cw(kShadowCacheBuckets * kShadowCacheWords);
+      if (rhi::ReadBufferBlocking(ctx.device, stage, 0, cw.data(),
+                                  cw.size() * 4)) {
+        size_t keyed = 0, valid = 0, dark = 0, stamps[16] = {};
+        for (uint32_t b = 0; b < kShadowCacheBuckets; b++) {
+          const uint32_t k = cw[b * 2], st = cw[b * 2 + 1];
+          if (!k) continue;
+          keyed++;
+          if (st & 0x10000u) { valid++; if ((st & 0xFFu) < 128u) dark++; }
+          stamps[(st >> 12) & 15u]++;
+        }
+        std::printf("              shift probe frame %u: %zu keyed slots, %zu "
+                    "valid, %zu dark; requested-stamp histogram:", f, keyed,
+                    valid, dark);
+        for (int i = 0; i < 16; i++) std::printf(" %zu", stamps[i]);
+        std::printf("\n");
+      }
+    }
+    double acc = 0.0;
+    for (size_t i = 0, j = 0; i + 3 < tmpPx.size(); i += 4, j++) {
+      const double d = lumAt(tmpPx, i) - (double)refLum[f][j];
+      acc += std::fabs(d);
+      if (d > kEdgeL) wf.holes++;
+      else if (d < -kEdgeL) wf.phantoms++;
+    }
+    wf.agree = acc / (double)((size_t)W * H);
+    if (f == 0 || wf.agree > walk[worstF].agree) {
+      worstF = f;
+      worstCachePx = tmpPx;
+      worstRefLum = refLum[f];
+    }
+    // The settled frame: same pose, one frame later.
+    if (!renderOne(true, e, cm, &tmpPx)) { walkOk = false; break; }
+    acc = 0.0;
+    for (size_t i = 0, j = 0; i + 3 < tmpPx.size(); i += 4, j++) {
+      const double d = lumAt(tmpPx, i) - (double)refLum[f][j];
+      acc += std::fabs(d);
+      if (d > kEdgeL) wf.holesSettled++;
+      else if (d < -kEdgeL) wf.phantomsSettled++;
+    }
+    wf.agreeSettled = acc / (double)((size_t)W * H);
+  }
+  if (shifted) shiftX(-1);
+  double walkMean = 0.0, settledMean = 0.0;
+  size_t holesMax = 0, phantomsMax = 0;
+  uint32_t holesF = 0, phantomsF = 0, reqMin = 0xFFFFFFFFu, reqMax = 0;
+  for (uint32_t f = 0; f < kWalk; f++) {
+    walkMean += walk[f].agree / (double)kWalk;
+    settledMean += walk[f].agreeSettled / (double)kWalk;
+    if (walk[f].holes > holesMax) { holesMax = walk[f].holes; holesF = f; }
+    if (walk[f].phantoms > phantomsMax) { phantomsMax = walk[f].phantoms; phantomsF = f; }
+    reqMin = std::min(reqMin, walk[f].req);
+    reqMax = std::max(reqMax, walk[f].req);
+  }
+  if (walkOk && !worstCachePx.empty()) {
+    std::vector<uint8_t> refImg((size_t)W * H * 4, 255), diff((size_t)W * H * 4, 255);
+    for (size_t i = 0, j = 0; i + 3 < refImg.size(); i += 4, j++) {
+      refImg[i] = refImg[i + 1] = refImg[i + 2] = worstRefLum[j];
+      const double d = lumAt(worstCachePx, i) - (double)worstRefLum[j];
+      // red = hole (cache lit, reference shadowed); blue = phantom (the reverse)
+      diff[i] = d > kEdgeL ? 255 : 0;
+      diff[i + 1] = 0;
+      diff[i + 2] = d < -kEdgeL ? 255 : 0;
+    }
+    WriteBmpFile("build/shadow_walk_ref.bmp", refImg, W, H);
+    WriteBmpFile("build/shadow_walk_cache.bmp", worstCachePx, W, H);
+    WriteBmpFile("build/shadow_walk_diff.bmp", diff, W, H);
+  }
+  got = got && walkOk;
   SetCurrentTuning(base);
   const bool restored = sim.ReloadShaders(ctx.device);
   if (!got || !restored) {
@@ -941,8 +1155,16 @@ Status GateShadowCache(Ctx& c, std::string& detail) {
   const double kSignalMin = 1.0;
   const double kAgreeFrac = 0.25;
   const double kFlickerFrac = 0.02;
+  // THE WALK IS HELD TO THE SAME AGREEMENT AS THE STANDING FRAME, on its mean
+  // and on its worst frame. The mean is the "shadows pulse while walking"
+  // claim; the worst frame is the "they pop in" one, and it is the one a mean
+  // over 24 frames would forgive. Both are ratios of the shadow signal for
+  // the reason the static agreement is.
+  const double kWalkWorstFrac = 0.40;
+  const bool walkPass = walkMean < signal * kAgreeFrac &&
+                        walk[worstF].agree < signal * kWalkWorstFrac;
   const bool ok = signal > kSignalMin && agree < signal * kAgreeFrac &&
-                  flicker < signal * kFlickerFrac;
+                  flicker < signal * kFlickerFrac && walkPass;
   std::printf("shadow cache: %s (cache vs per-pixel rays: mean |dL| %.2f; "
               "per-pixel rays vs no shadows: %.2f, must exceed %.1f; agreement "
               "must be under %.0f%% of that, i.e. %.2f; frame-to-frame flicker "
@@ -957,10 +1179,34 @@ Status GateShadowCache(Ctx& c, std::string& detail) {
               cacheFrames, reqStats[0], kShadowReqCap,
               reqStats[0] > kShadowReqCap ? reqStats[0] - kShadowReqCap : 0u,
               movedPx);
+  std::printf("              walk (%u frames, 0.6 vox + 1.4 deg each, window "
+              "shift at frame %u%s): mean |dL| %.2f moving, %.2f settled at "
+              "the same poses (must be under %.2f), worst moving frame %u at "
+              "%.2f (must be under %.2f); holes (cache lit, "
+              "reference shadowed, > %.0f/255) peak %zu px at frame %u; "
+              "phantoms (the reverse) peak %zu px at frame %u; shift frame "
+              "|dL| %.2f, %zu holes, %zu phantoms; requests %u..%u per frame "
+              "(cap %u) (build/shadow_walk_{ref,cache,diff}.bmp = frame %u)\n",
+              kWalk, kShiftAt, canShift ? "" : " SKIPPED (slab in the plane)",
+              walkMean, settledMean, signal * kAgreeFrac, worstF,
+              walk[worstF].agree, signal * kWalkWorstFrac, kEdgeL, holesMax,
+              holesF, phantomsMax,
+              phantomsF, walk[kShiftAt].agree, walk[kShiftAt].holes,
+              walk[kShiftAt].phantoms, reqMin, reqMax, kShadowReqCap, worstF);
+  std::printf("              per frame, moving|settled: |dL| / holes / "
+              "phantoms (and rays resolved):");
+  for (uint32_t f = 0; f < kWalk; f++)
+    std::printf("%s %u:%.2f|%.2f/%zu|%zu/%zu|%zu(%u)",
+                f % 4 == 0 ? "\n               " : "", f, walk[f].agree,
+                walk[f].agreeSettled, walk[f].holes, walk[f].holesSettled,
+                walk[f].phantoms, walk[f].phantomsSettled, walk[f].res);
+  std::printf("\n");
   detail = Format("agree %.2f, signal %.2f, budget %.2f, flicker %.3f (ref "
-                  "%.3f), %u requested",
+                  "%.3f), %u requested; walk mean %.2f (settled %.2f) worst "
+                  "%.2f@%u",
                   agree, signal, signal * kAgreeFrac, flicker, refFlicker,
-                  reqStats[0]);
+                  reqStats[0], walkMean, settledMean, walk[worstF].agree,
+                  worstF);
   return ok ? Status::Pass : Status::Fail;
 }
 

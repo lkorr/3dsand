@@ -2933,13 +2933,38 @@ fn shadowPatchCentre(cell : vec3<i32>, face : u32, sx : u32, sy : u32,
 
 // ---- the request record ----
 // Three WORLD_SHIFT-wide cell fields plus a 3-bit face in one word. The cell is
-// stored WINDOW-RELATIVE so it fits; both passes recover the world cell with
-// the same R.origin, which is sound because they run in the same frame off the
-// same uniform. world.h static_asserts that this packing fits a u32.
-fn shadowPackCell(relCell : vec3<i32>, face : u32) -> u32 {
-  let c = vec3<u32>(relCell);
+// stored TOROIDAL — `cell & WORLD_MASK` per axis, the same wrap the slot index
+// uses — so it fits, and so that a patch's identity does not depend on where
+// the residency window happens to sit. world.h static_asserts that this
+// packing fits a u32.
+//
+// NOT WINDOW-RELATIVE, and this was the shadow that flashed while walking.
+// The first version stored `cell - origin*CHUNK`. The window recentres one
+// chunk every time the player crosses a chunk boundary (stream.cpp ShiftAxis),
+// and on that frame every key in the cache renamed itself: the fragment shader
+// looked up patches by their NEW relative coords, found nothing, claimed
+// ~190k fresh slots and shaded the entire frame lit — --gate shadow-cache's
+// walk arm measured the shift frame at a mean |dL| of 10.13 against 0.6 for
+// its neighbours, with 382k lit-hole pixels, and the probe it dumps saw the
+// valid-slot count DROP by 69k on that frame (claims steal stale slots). Every
+// 1.6 m of walking, a one-frame flash of the whole scene's shadows. The
+// toroidal coord is invariant under the shift, and the resolve pass unwraps it
+// into whichever window is current (shadowUnwrapCell) — sound because a
+// visible patch is by construction inside the window, so its unwrap is unique.
+fn shadowPackCell(torCell : vec3<i32>, face : u32) -> u32 {
+  let c = vec3<u32>(torCell & vec3<i32>(i32(WORLD_MASK)));
   return c.x | (c.y << WORLD_SHIFT) | (c.z << (WORLD_SHIFT * 2u)) |
          (face << (WORLD_SHIFT * 3u));
+}
+// The toroidal cell back to a world cell inside the window whose low corner
+// (in voxels) is `winLo`: the unique representative of the residue class in
+// [winLo, winLo + WORLD_N). The i32 `&` is the right modulus for negative
+// window corners too (two's complement, WORLD_N a power of two).
+fn shadowUnwrapCell(packedCell : u32, winLo : vec3<i32>) -> vec3<i32> {
+  let tor = vec3<i32>(vec3<u32>(packedCell, packedCell >> WORLD_SHIFT,
+                                packedCell >> (WORLD_SHIFT * 2u)) &
+                      vec3<u32>(u32(WORLD_MASK)));
+  return winLo + ((tor - winLo) & vec3<i32>(i32(WORLD_MASK)));
 }
 fn shadowPackSub(sx : u32, sy : u32) -> u32 { return sx | (sy << 3u); }
 
@@ -2959,8 +2984,13 @@ fn shadowPatchKey(packedCell : u32, packedSub : u32) -> u32 {
   let k = pcg(packedCell ^ pcg(packedSub * 0x9E3779B9u + 1u));
   return select(k, 1u, k == 0u);
 }
+// Never 0, so that a claimed-but-unresolved slot's state word (value 0,
+// resolved 0, requested f, valid 0, verifier v) is nonzero even at f = 0 —
+// the claim loop in raymarch.wgsl tells "never claimed" from "mid-claim" by
+// the state word alone.
 fn shadowPatchVerifier(packedCell : u32, packedSub : u32) -> u32 {
-  return pcg(packedSub ^ pcg(packedCell * 0x85EBCA6Bu + 7u)) & SHADOW_VERIFIER_MASK;
+  let v = pcg(packedSub ^ pcg(packedCell * 0x85EBCA6Bu + 7u)) & SHADOW_VERIFIER_MASK;
+  return select(v, 1u, v == 0u);
 }
 
 // SET-ASSOCIATIVE, NOT DIRECT-MAPPED. This is the fix for the "shadow pixels

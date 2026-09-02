@@ -586,8 +586,16 @@ constexpr uint64_t kShadowCacheBytes =
 // past 8 live patches in one set is ~1e-5 of patches at 20% load.
 constexpr uint32_t kShadowReqHeaderWords = 4;   // [0] atomic count, [1] saved count, [2..3] stats
 constexpr uint32_t kShadowReqWords = 4;         // key, bucket, packed cell, packed face+sub
-constexpr uint32_t kShadowReqCapShift = 18;
-constexpr uint32_t kShadowReqCap = 1u << kShadowReqCapShift;  // 262,144 per frame
+// 2^20 records (16 MiB), not the 2^18 (4 MiB) it shipped with: a frame's
+// request count scales with PIXELS, not with the world — 1080p asks for
+// ~180-200k, so 262k was a ceiling 1.3x above the harness and BELOW a
+// maximised 1440p or 4K game window. Past the cap the refused set is whatever
+// appended last in fragment order, which changes every frame, and a refused
+// patch has no opinion, so the failure mode is a shimmer of lit patches that
+// never settles. The buffer costs memory only; the resolve pass is sized by
+// the count actually requested.
+constexpr uint32_t kShadowReqCapShift = 20;
+constexpr uint32_t kShadowReqCap = 1u << kShadowReqCapShift;  // 1,048,576 per frame
 constexpr uint64_t kShadowReqBytes =
     (uint64_t)(kShadowReqHeaderWords + kShadowReqCap * kShadowReqWords) * 4;
 // Overflow is GRACEFUL and silent by design: past the cap a patch simply is not

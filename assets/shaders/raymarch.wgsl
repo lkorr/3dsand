@@ -2627,9 +2627,18 @@ fn shadowSlotRead(packedCell : u32, packedSub : u32, curFrame : u32) -> vec2f {
     // the find loop above fails.
     for (var w = 0u; w < SHADOW_WAYS; w++) {
       let b = setBase + w;
-      let k = atomicLoad(&shadowCache[b * 2u]);
       let s = atomicLoad(&shadowCache[b * 2u + 1u]);
-      if (k != 0u && shadowSlotLive(s, curFrame)) {
+      // LIVE IS JUDGED FROM THE STATE WORD ALONE, never gated on the key: a
+      // claim writes the state first and the key last, so a slot mid-claim
+      // reads (key 0, live state). The first version tested `key != 0 &&
+      // live` and so treated exactly that slot as free, CAS'd over the
+      // claimer's state (which it had just read, so the CAS succeeded), and
+      // the claimer's key then landed over OUR verifier: a slot neither patch
+      // could match and the resolve refused for both. A never-claimed slot is
+      // state 0 (the buffer is zero-filled and the verifier is never 0), and
+      // that is the only word this test lets through as free without also
+      // being stale.
+      if (s != 0u && shadowSlotLive(s, curFrame)) {
         if (shadowStateVerifier(s) == ver) { return vec2f(0.0); }
         continue;
       }
@@ -2786,7 +2795,10 @@ fn shadowCached(hp : vec3f, cell : vec3<i32>, axis : i32, sgn : f32,
     if (iy < 0) { iy += sd; c[t.y] -= 1; } else if (iy >= sd) { iy -= sd; c[t.y] += 1; }
     let rel = c - winLo;
     if (any(rel < vec3<i32>(0)) || any(rel >= vec3<i32>(i32(WORLD_N)))) { continue; }
-    let r = shadowSlotRead(shadowPackCell(rel, face),
+    // Keyed on the WORLD cell (wrapped toroidally inside shadowPackCell), not
+    // on `rel`: see the pack function for the whole-frame flash that keying
+    // on the window-relative coord produced on every chunk crossing.
+    let r = shadowSlotRead(shadowPackCell(c, face),
                            shadowPackSub(u32(ix), u32(iy)), curFrame);
     acc += r.x * r.y * w;
     wsum += r.y * w;
