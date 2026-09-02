@@ -3270,6 +3270,254 @@ fn voxWordAtEntry(e : u32, c : vec3<i32>) -> u32 {
   return voxels[e * CHUNK_VOL + (lo.z * CHUNK + lo.y) * CHUNK + lo.x];
 }
 
+// ---- THE SLIM OPAQUE TRACER (docs/PLAN_lin_followups.md W2-A) --------------
+// ONE media-blind DDA, shared by every SECONDARY ray in the engine: the shadow
+// resolve pass (shadow_resolve.wgsl), sunShadowAt's cache-off fallback,
+// traceReflection, traceRefraction and the god-ray occlusion test. It was
+// shadow_resolve.wgsl's private `shadowMarch`; promoting it here and widening
+// its return by four fields is what let the last four trace() call sites in the
+// fragment shader go away.
+//
+// WHY IT EXISTS, AND WHY THE ANSWER IS "REGISTERS", NOT "STEPS".
+// --render-budget (RTX 3060 Ti, overlook cam, 1080p, 2026-08-30) removed the
+// reflection two different ways:
+//
+//   noreflect (reflectionSteps -> 0, const-folded)   -3.58 ms
+//   reflgate  (every call site gated at runtime)     -0.09 ms
+//
+// The traversal is 0.09 ms. The other 3.49 ms is the REGISTER FOOTPRINT of an
+// inlined copy of trace() — 26 Hit fields, media accumulation, the liquid and
+// the translucent-solid surface pairs, the nested micro-brick march — and it is
+// paid by EVERY pixel in the frame, including every pixel with no reflection in
+// it, because a fragment shader's occupancy is set by its worst path. The
+// shadow half measured the same shape (shadow0 5.98 ms vs noshadow 2.29 ms). So
+// the fix is not to skip the call at runtime; it is to make the call site carry
+// less. A secondary ray reads 6 of trace()'s 26 fields and nothing else, and
+// those 6 are this struct.
+//
+// EQUIVALENCE WITH trace(ro, rd, n, false) IS THE CONTRACT, not an aspiration.
+// Same axis nudge, same window clip, and NO LOD-HANDOFF CLAMP — trace() applies
+// that only for wantMedia, because a shadow ray that gave up at 18 m would
+// report "lit" for a receiver whose blocker is at 20 m, which unshadows terrain
+// rather than coarsening it. Chunk skip on occBlockers, so a chunk holding only
+// smoke or grass is as cheap as air for this ray class. The same three sentinel
+// fast paths. isRayBlocker as the per-cell hit test — which is exactly the
+// chain trace() walks with wantMedia false: a gas or a translucent liquid takes
+// the participating-media branch and accumulates nothing, a micro cell falls
+// through explicitly, ice and glass are CLASS_SOLID and so DO stop the ray,
+// everything else hits. Three consequences that are behaviour, not detail: a
+// secondary ray still marches THROUGH water to the bed, it still shows no grass
+// or strands (trace() already zeroed the micro budget for these rays), and a ray
+// that leaves the window reports no hit so its caller can take the sky.
+//
+// `--selftest --gate shadow-cache` casts the compute-stage ray and the
+// fragment-stage ray at sampled surface points and asserts they agree. With one
+// function that is now trivially true, which is the point: the classic silent
+// bug here is two DDAs that drift.
+//
+// `coarseFromT` IS ACCEPTED AND IGNORED. W2-B fills it in: past that distance
+// the march will test the 4^3 blockers-class sub-occupancy mask instead of the
+// voxel and stop at the block face. Threading it now means the five call sites
+// do not have to move again when it lands.
+//
+// `occ` and `mats` come in as POINTERS for exactly paletteColor's reason:
+// common.wgsl is prepended BEFORE any shader declares its bindings, so a
+// function here cannot name `occupancy` or `materials`. The page-table
+// accessors it calls (voxels, pageTable, ptSeed, ptOrigin) need no such
+// treatment — they live in this block, which exists only for the shaders that
+// address voxels.
+struct OpaqueHit {
+  hit  : bool,
+  t    : f32,          // fine-voxel units, distance to the blocker
+  cell : vec3<i32>,    // world cell of the hit
+  axis : i32,          // axis of the face the ray entered it through
+  sgn  : f32,          // ray direction sign on that axis
+  word : u32,          // that cell's voxel word (material, state, stain)
+}
+
+fn traceOpaque(ro : vec3f, rdIn : vec3f, maxSteps : i32, coarseFromT : f32,
+               occ : ptr<storage, array<u32>, read>,
+               mats : ptr<storage, array<Material>, read>) -> OpaqueHit {
+  // Accepted, deliberately unused until W2-B. A phony assignment says so in the
+  // language instead of in a comment the compiler cannot read.
+  _ = coarseFromT;
+
+  var out : OpaqueHit;
+  out.hit = false;
+  out.t = 0.0;
+  out.cell = vec3<i32>(0);
+  out.axis = 1;
+  out.sgn = -1.0;
+  out.word = 0u;
+
+  // Axis-aligned rays would divide by zero and produce inf tMax. Same nudge
+  // trace() applies, and it must stay identical or the two disagree on rays
+  // exactly along an axis — which is the common case here, since the sun is
+  // often near-vertical.
+  var rd = rdIn;
+  if (abs(rd.x) < 1e-6) { rd.x = select(-1e-6, 1e-6, rd.x >= 0.0); }
+  if (abs(rd.y) < 1e-6) { rd.y = select(-1e-6, 1e-6, rd.y >= 0.0); }
+  if (abs(rd.z) < 1e-6) { rd.z = select(-1e-6, 1e-6, rd.z >= 0.0); }
+  let inv = 1.0 / rd;
+  // sign(rd[axis]) WITHOUT a dynamic index. An indexed read of a vector forces
+  // it out of registers and into scratch for the whole function (the by-value
+  // uniform gotcha, one level down), and in a function whose entire reason to
+  // exist is register footprint that would be self-defeating. Computed once,
+  // selected on the hit path.
+  let sgn3 = sign(rd);
+
+  // Clip to the residency window AABB, in world coords. ptOrigin() is the
+  // per-shader generated accessor for the window origin in CHUNK units —
+  // R.origin in the renderer, T.origin in a sim kernel — which is the same
+  // value trace() reads directly.
+  let nf = f32(WORLD_N);
+  let wloI = ptOrigin() * i32(CHUNK);
+  let wlo = vec3f(wloI);
+  let tt0 = (wlo - ro) * inv;
+  let tt1 = (wlo + vec3f(nf) - ro) * inv;
+  let tmin = min(tt0, tt1);
+  let tmax = max(tt0, tt1);
+  let tEnter = max(max(tmin.x, tmin.y), max(tmin.z, 0.0));
+  let tExit = min(tmax.x, min(tmax.y, tmax.z));
+  if (tExit <= tEnter) { return out; }
+
+  var t = tEnter + 1e-4;
+  var p = ro + rd * t;
+  var cell = clamp(vec3<i32>(floor(p)), wloI, wloI + vec3<i32>(i32(WORLD_N) - 1));
+  let stepv = vec3<i32>(sign(rd));
+  let tDelta = abs(inv);
+  var tMax : vec3f;
+  for (var a = 0; a < 3; a++) {
+    let boundary = f32(cell[a]) + select(0.0, 1.0, rd[a] > 0.0);
+    tMax[a] = (boundary - ro[a]) * inv[a];
+  }
+
+  // WHICH FACE the ray entered the CURRENT cell through. `shadowMarch` did not
+  // track this — it returned {hit, t} and a shadow needs no normal — but a
+  // reflection shades the face it lands on, so the slim tracer carries trace()'s
+  // rule verbatim: the WINDOW entry face for the first cell, the stepped axis
+  // after a DDA step, and the BOX EXIT FACE after a chunk jump. That last one is
+  // the case that bites: a jump that left `axis` alone would report the window
+  // entry face as the normal of whatever the ray hits in the first cell after
+  // landing, which for a reflection skimming over open water is most of them.
+  var axis = 0;
+  if (tmin.y > tmin.x && tmin.y > tmin.z) { axis = 1; }
+  else if (tmin.z > tmin.x && tmin.z > tmin.y) { axis = 2; }
+
+  var tCur = t;
+
+  let wloHi = wloI + vec3<i32>(i32(WORLD_N));
+  // Per-chunk lookup cache, same as trace()'s: occupancy and the page entry are
+  // invariant while the ray stays in a chunk, which is 16-48 steps. Compared on
+  // the CHUNK COORD rather than the linear index so the miss test is three
+  // shifts and a vec3 compare instead of chunkIndexW's multiplies.
+  var cchOcc = 0u;
+  var cchPt = 0u;
+  var cchC = vec3<i32>(0x7FFFFFFF);
+
+  for (var i = 0; i < 4096; i++) {
+    if (i >= maxSteps) { break; }
+    if (any(cell < wloI) || any(cell >= wloHi)) { break; }
+
+    let cc = cell >> vec3<u32>(CHUNK_SHIFT);
+    if (any(cc != cchC)) {
+      cchC = cc;
+      let chIdx = chunkIndexW(cell);
+      cchOcc = (*occ)[chIdx];
+      cchPt = pageEntryOf(chIdx);
+    }
+
+    // Chunk skip on the BLOCKER count, never the total: a chunk holding only
+    // smoke or grass must be as cheap as air for this ray class.
+    var chunkSkip = (occBlockers(cchOcc) == 0u);
+    if ((cchPt & PT_SENTINEL_BIT) != 0u) {
+      let sMat = cchPt & PT_MAT_MASK;
+      if (sMat == MAT_AIR) {
+        chunkSkip = true;
+      } else if (isRayBlocker((*mats)[sMat])) {
+        // A uniform body of blocker material: this cell IS that material, so
+        // the answer is here. No isTranslucentSolid exclusion, unlike the
+        // primary ray's version of this branch in raymarch.wgsl — that
+        // exclusion exists so a PRIMARY ray keeps marching through glass to
+        // accumulate its Beer-Lambert path, and a secondary ray must stop.
+        // synthWordAt reproduces the word a materialized page would have held,
+        // JITTER variant included, so a reflection of a stone chunk shades with
+        // the same palette variant the primary ray would have found there.
+        out.hit = true;
+        out.t = tCur;
+        out.cell = cell;
+        out.axis = axis;
+        out.sgn = select(select(sgn3.x, sgn3.y, axis == 1), sgn3.z, axis == 2);
+        out.word = synthWordAt(cchPt, cell, ptSeed());
+        return out;
+      } else if (((*mats)[sMat].flags & MATF_MICRO) != 0u) {
+        chunkSkip = true;   // a whole chunk of grass casts no shadow
+      }
+    }
+
+    if (chunkSkip) {
+      // Jump to the chunk's exit face. Masking off the low bits is
+      // floor-to-corner for negative world coords too.
+      let blkLo = cell & vec3<i32>(~(i32(CHUNK) - 1));
+      let lo = vec3f(blkLo);
+      let hi = lo + f32(CHUNK);
+      let e0 = (lo - ro) * inv;
+      let e1 = (hi - ro) * inv;
+      let ex = max(e0, e1);
+      // max against tCur: a cell floored onto a shared face belongs to a box
+      // the ray is already exiting, so the raw exit t can be <= tCur and the
+      // march would stall in place.
+      let tOut = max(min(ex.x, min(ex.y, ex.z)), tCur);
+      t = tOut + 1e-4;
+      if (t >= tExit) { break; }
+      p = ro + rd * t;
+      var nc = vec3<i32>(floor(p));
+      // Force the crossing on the exit axis: float noise at a shared face can
+      // floor() back into the box just left, which reads as a shadow leak
+      // along chunk boundaries.
+      if (ex.x <= ex.y && ex.x <= ex.z) {
+        nc.x = select(blkLo.x - 1, blkLo.x + i32(CHUNK), rd.x > 0.0);
+        axis = 0;
+      } else if (ex.y <= ex.z) {
+        nc.y = select(blkLo.y - 1, blkLo.y + i32(CHUNK), rd.y > 0.0);
+        axis = 1;
+      } else {
+        nc.z = select(blkLo.z - 1, blkLo.z + i32(CHUNK), rd.z > 0.0);
+        axis = 2;
+      }
+      if (any(nc < wloI) || any(nc >= wloHi)) { break; }
+      cell = nc;
+      for (var a = 0; a < 3; a++) {
+        let boundary = f32(cell[a]) + select(0.0, 1.0, rd[a] > 0.0);
+        tMax[a] = (boundary - ro[a]) * inv[a];
+      }
+      tCur = t;
+      continue;
+    }
+
+    let w = voxWordAtEntry(cchPt, cell);
+    let mat = voxMat(w);
+    if (mat != MAT_AIR && isRayBlocker((*mats)[mat])) {
+      out.hit = true;
+      out.t = tCur;
+      out.cell = cell;
+      out.axis = axis;
+      out.sgn = select(select(sgn3.x, sgn3.y, axis == 1), sgn3.z, axis == 2);
+      out.word = w;
+      return out;
+    }
+
+    if (tMax.x < tMax.y && tMax.x < tMax.z) {
+      cell.x += stepv.x; tCur = tMax.x; tMax.x += tDelta.x; axis = 0;
+    } else if (tMax.y < tMax.z) {
+      cell.y += stepv.y; tCur = tMax.y; tMax.y += tDelta.y; axis = 1;
+    } else {
+      cell.z += stepv.z; tCur = tMax.z; tMax.z += tDelta.z; axis = 2;
+    }
+  }
+  return out;
+}
+
 // The chunk-linear READ: the word at (chunkSlot, localIdx), synthesized when
 // the chunk is a sentinel. A branch rather than a select, because select
 // evaluates both arms and voxels[PT_NO_WORD] is an out-of-bounds subscript.

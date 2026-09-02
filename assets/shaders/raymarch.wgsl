@@ -1275,6 +1275,24 @@ fn microNormalToWorld(n : vec3f, flags : u32, h : u32) -> vec3f {
 
 const SUBOCC_SKIP : bool = false;
 
+// ---- THERE IS EXACTLY ONE CALL TO THIS FUNCTION (W2-A) ---------------------
+// fs()'s primary camera ray, and it passes `wantMedia = true`. Every secondary
+// ray in the engine — shadow, reflection, refraction, god-ray occlusion —
+// casts traceOpaque() (common.wgsl) instead, because what those rays cost was
+// never the traversal: --render-budget priced the reflection at 0.09 ms of
+// marching and 3.49 ms of the REGISTER FOOTPRINT of an inlined copy of this
+// function, paid by every pixel in the frame including the ones with no
+// reflection in them.
+//
+// SO THE `wantMedia = false` ARMS BELOW ARE UNREACHABLE FROM THE SHIPPED
+// SHADER. They are kept, and the parameter with them, because they are the
+// DEFINITION traceOpaque is equivalent to — "a gas or a thin liquid takes the
+// media branch and accumulates nothing, a micro cell falls through, ice and
+// glass stop the ray, no LOD handoff clamp" is read off these branches, and
+// `--selftest --gate shadow-cache` asserts the two agree at sampled surface
+// points. With one call site and a literal argument, Tint and the driver fold
+// them away, so the fragment shader pays nothing for keeping them legible.
+// If you ever add a second call site, ask first whether traceOpaque answers it.
 fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool) -> Hit {
   var out : Hit;
   out.hit = false;
@@ -2539,7 +2557,12 @@ fn sunShadowAt(hp : vec3f, n : vec3f, px : vec2f, camDistFine : f32) -> f32 {
     if (farShadowed(lvl, hp + off)) { return TUNE_SHADOW_FAR_LIFT; }
     return 1.0;
   }
-  let s = trace(hp + n * TUNE_SHADOW_BIAS, keyLightDir(), TUNE_SHADOW_STEPS, false);
+  // traceOpaque, not trace(): identical answer for a media-blind ray (the
+  // shadow-cache gate asserts it against the compute-stage cast) and none of
+  // trace()'s 26-field register footprint, which for a fragment shader is paid
+  // by every pixel whether or not this branch runs. See common.wgsl.
+  let s = traceOpaque(hp + n * TUNE_SHADOW_BIAS, keyLightDir(),
+                      TUNE_SHADOW_STEPS, 1e30, &occupancy, &materials);
   if (!s.hit) { return 1.0; }
   // Distance from receiver to blocker, in metres. Near blockers (a voxel
   // resting on the ground) keep a hard, dark contact shadow; distant ones (a
@@ -3289,9 +3312,10 @@ fn traceReflection(p : vec3f, n : vec3f, rd : vec3f) -> vec3f {
   // whole 16-cell chunk per iteration. 96 steps therefore reaches well past
   // the far shore of any pond-sized body while capping the pathological case —
   // a reflection grazing INTO dense canopy, where every step is a real voxel
-  // step and the skip never fires. Media is off (`wantMedia = false`) so
-  // reflected rays skip on the blocker count and smoke costs them nothing.
-  let h = trace(p + n * 0.05, rr, TUNE_REFLECTION_STEPS, false);
+  // step and the skip never fires. traceOpaque skips on the blocker count, so
+  // smoke costs a reflected ray nothing.
+  let h = traceOpaque(p + n * 0.05, rr, TUNE_REFLECTION_STEPS, 1e30,
+                      &occupancy, &materials);
   if (!h.hit) { return reflectionSky(rr); }
 
   // Reflected geometry is seen across the water plus its own distance, so it
@@ -3306,7 +3330,7 @@ fn traceReflection(p : vec3f, n : vec3f, rd : vec3f) -> vec3f {
 // would double the cost). Shared by traceReflection above and the MPM fluid's
 // traced refraction — the two must not drift, or the same shore looks
 // different reflected off the surface vs seen through it.
-fn shadeSecondaryHit(h : Hit) -> vec3f {
+fn shadeSecondaryHit(h : OpaqueHit) -> vec3f {
   let m = materials[voxMat(h.word)];
   var albedo = paletteColor(m, voxState(h.word), &materials);
   if (m.klass == CLASS_LIQUID) { albedo = unpackColor(m.color0); }
@@ -3551,9 +3575,12 @@ fn godRays(ro : vec3f, rd : vec3f, maxDistVox : f32, px : vec2f) -> f32 {
     if (m.klass != CLASS_LIQUID || (m.flags & MATF_OPAQUE) != 0u) { continue; }
 
     // Occlusion: can the sun reach this point? Short budget on purpose — this
-    // ray only has to find the surface just above or a nearby blocker, and the
-    // chunk-skip in trace() covers open water in a few steps.
-    let s = trace(p, kd, TUNE_GODRAY_SHADOW_STEPS, false);
+    // ray only has to find the surface just above or a nearby blocker, and
+    // traceOpaque's chunk-skip covers open water in a few steps. This is the
+    // call W2-B converts to coarse-terminate-from-zero: a volumetric sample
+    // wants the pre-integrated answer anyway, and it aliases less.
+    let s = traceOpaque(p, kd, TUNE_GODRAY_SHADOW_STEPS, 1e30,
+                        &occupancy, &materials);
     if (s.hit) { continue; }
 
     // Reaching here means sunlight lands on this sample. Weight it by the
@@ -6094,7 +6121,8 @@ fn fluidMarchBlocky(ro : vec3f, rdIn : vec3f, tMax : f32,
 // film on dry rock (column ~1 voxel, bed metres away) is unchanged.
 fn traceRefraction(p : vec3f, rdr : vec3f, waterVox : f32,
                    fallback : vec3f) -> vec3f {
-  let h = trace(p, rdr, TUNE_REFLECTION_STEPS, false);
+  let h = traceOpaque(p, rdr, TUNE_REFLECTION_STEPS, 1e30,
+                      &occupancy, &materials);
   if (!h.hit) {
     if (rdr.y > 0.05) { return reflectionSky(rdr); }
     return fallback;
