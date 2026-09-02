@@ -216,6 +216,10 @@ SPEC = [
     ("render", "godRayRange", "TUNE_GODRAY_RANGE", "f", 14.0),
     ("render", "godRayShadowSteps", "TUNE_GODRAY_SHADOW_STEPS", "i", 8),
     ("render", "shadowCoarseDist", "TUNE_SHADOW_COARSE_DIST", "f", 8.0),
+    ("render", "opennessReach", "TUNE_OPENNESS_REACH", "f", 12.0),
+    ("render", "opennessChunksPerFrame", "TUNE_OPENNESS_CHUNKS", "i", 256),
+    ("render", "opennessStrength", "TUNE_OPENNESS_STRENGTH", "f", 1.0),
+    ("render", "opennessBilinear", "TUNE_OPENNESS_BILINEAR", "i", 1),
 
     # drifting particulate (silt)
     ("render", "siltDensity", "TUNE_SILT_DENSITY", "f", 0.55),

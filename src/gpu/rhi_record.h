@@ -51,6 +51,9 @@ struct TableCtx {
   // kWaterBodyCap for "none". A pure function of the tick (plan
   // section 3.4) and the whole condition on both sweep rows.
   uint32_t waterSweepSlot = 0xFFFFFFFFu;
+  // Openness refresh budget this tick (docs/PLAN_gi.md §2). 0 = the grid
+  // is off and neither openness row is recorded.
+  uint32_t opennessChunks = 0;
   bool hashEnable = false;
   bool particlesActive = false;
   // False under --residency paged (PLAN_page_table.md §3.5c).

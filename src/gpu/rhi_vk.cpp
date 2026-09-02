@@ -769,6 +769,7 @@ void RecordTableVulkan(const CommandEncoder& enc, pass::Table which, const Table
   cxv.waterChunkCount = cx.waterChunkCount;
   cxv.waterDrainBodies = cx.waterDrainBodies;
   cxv.waterSweepSlot = cx.waterSweepSlot;
+  cxv.opennessChunks = cx.opennessChunks;
   cxv.hashEnable = cx.hashEnable;
   cxv.particlesActive = cx.particlesActive;
   // Both of these were missing from this copy until ROADMAP §3.4 added

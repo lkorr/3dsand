@@ -364,6 +364,11 @@ class Simulation {
   rhi::ComputePipeline explodeMark_, explodeApply_, pArgs1_, pSpawn_, pIntegrate_,
       pArgs2_, pResolve_;
   rhi::ComputePipeline farFill_, farDown_;
+  // The openness grid (sim_openness.wgsl, docs/PLAN_gi.md §2): `dirty` walks
+  // the tick's compacted dirty list, `refresh` walks a rolling slice of the
+  // window. Render-path passes on the TICK table — see the .def rows for why
+  // they are not on the per-frame shadow table.
+  rhi::ComputePipeline opennessDirty_, opennessRefresh_;
   rhi::ComputePipeline pageFill_;   // JITTER page materialization (world.h)
   // Shadow cache (shadow_resolve.wgsl): `prepare` turns last frame's request
   // count into a dispatch size, `resolve` casts one media-blind shadow ray per

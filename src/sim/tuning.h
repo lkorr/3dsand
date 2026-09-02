@@ -2353,6 +2353,15 @@ struct Tuning {
     // also bit-identical to the pre-W2-B tracer by construction.
     float shadowCoarseDist = 8.0f;
 
+    // ---- the openness (sky-visibility) grid (docs/PLAN_gi.md §2) ----
+    // Per (4^3 block, face) sky visibility, marched over the blockers mask by
+    // sim_openness.wgsl and read by ambientAt / ambientAtP. Render-only: the
+    // sim has no binding for any of it and the world hash cannot move.
+    float opennessReach = 12.0f;        // metres a hemisphere ray looks
+    int opennessChunksPerFrame = 256;   // slots the rolling refresh walks/tick
+    float opennessStrength = 1.0f;      // 0 = old lerp AND the pass unrecorded
+    int opennessBilinear = 1;           // blend the 4 blocks in the face plane
+
     // drifting particulate. Render-only motes suspended in the water, which is
     // what gives the light shafts something visible to catch.
     float siltDensity = 0.55f;

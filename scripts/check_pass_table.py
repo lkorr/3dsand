@@ -106,6 +106,8 @@ PIPE_TO_MEMBER = {
     "PIPE_P_RESOLVE": "pResolve_",
     "PIPE_FAR_FILL": "farFill_",
     "PIPE_FAR_DOWN": "farDown_",
+    "PIPE_OPENNESS_DIRTY": "opennessDirty_",
+    "PIPE_OPENNESS_REFRESH": "opennessRefresh_",
     "PIPE_SHADOW_PREPARE": "shadowPrepare_",
     "PIPE_SHADOW_RESOLVE": "shadowResolve_",
     "PIPE_FLUID_SPAWN": "fluidSpawn_",
@@ -193,6 +195,12 @@ BUF_TO_WGSL = {
     "FarUBO": {"F"},
     "FarPatch": {"farPatch"},
     "PageTable": {"pageTable"},
+    # The openness (sky-visibility) grid, bindings 27/28 of simBGL_
+    # (docs/PLAN_gi.md 2). Written only by sim_openness.wgsl; the render
+    # group binds the same two buffers read-only at 17/18, which no table
+    # row covers because a fragment shader is not a table row.
+    "Openness": {"openness"},
+    "OpennessGen": {"opennessGen"},
     "PageFaults": {"pageFaults"},
     # MLS-MPM fluid (sim_fluid.wgsl + sim_fluid_seam.wgsl). The particle pair
     # is symbolic: the solver and every seam pass except the compaction source
@@ -257,6 +265,8 @@ _SIM_GROUP0 = {
     "treeAtlas",
     # The discharge's emission seam, binding 25 (M3).
     "waterSpawnOps",
+    # The openness grid, bindings 27/28.
+    "openness", "opennessGen",
 }
 # The slim group is 0..4 PLUS the two page buffers at 17/18 — not a dense
 # prefix any more. One WGSL identifier cannot carry two binding numbers
