@@ -106,6 +106,25 @@ constexpr uint64_t kDevFanOwner = 0xDEFA11Au;
 double g_scrollY = 0.0;
 void ScrollCallback(GLFWwindow*, double, double dy) { g_scrollY += dy; }
 
+// ---- --shot-frames: a subset of RunShots' frames, and a record of them ----
+//
+// RunShots writes ~33 BMPs, most of them for one feature each (the lava block,
+// the blood block, the wind block...). A package that touched one of them
+// wants that one, and --verify wants to record which files a launch produced
+// without parsing "wrote ..." off stdout. Names match with or without ".bmp".
+std::vector<std::string> g_shotOnly;
+struct ShotRecord { std::string file; bool ok; };
+std::vector<ShotRecord> g_shotResults;
+
+bool ShotWanted(const char* path) {
+  if (g_shotOnly.empty()) return true;
+  std::string p = path;
+  if (p.size() > 4 && p.compare(p.size() - 4, 4, ".bmp") == 0) p.resize(p.size() - 4);
+  for (const std::string& want : g_shotOnly)
+    if (want == p) return true;
+  return false;
+}
+
 // ---- --shot-inventory: the character screen as a reviewable image ----------
 //
 // The screen's whole job is to be LOOKED at, and the only thing that can judge
@@ -781,7 +800,9 @@ int RunShots(GpuContext& ctx, World& world, Simulation& sim) {
     std::vector<uint8_t> pixels(W * H * 4);
     bool got = false;
     got = rhi::ReadBufferBlocking(ctx.device, shot, 0, pixels.data(), (size_t)(pixels.size()));
-    if (got && WriteBmpFile(path, pixels, W, H)) std::printf("wrote %s\n", path);
+    const bool wrote = got && WriteBmpFile(path, pixels, W, H);
+    if (wrote) std::printf("wrote %s\n", path);
+    g_shotResults.push_back({path, wrote});
   };
   // Fixed, nonzero shot time: wave animation and flicker are driven by R.time,
   // so a time of 0 would show every shot at the one phase where the ripples
@@ -797,6 +818,10 @@ int RunShots(GpuContext& ctx, World& world, Simulation& sim) {
   uint32_t shotTick =
       (uint32_t)((double)g_shotTimeOfDay * (double)shotTicksPerDay) % shotTicksPerDay;
   auto render = [&](Vec3 eye, float yaw, float pitch, const char* path) {
+    // --shot-frames: the scene setup around a frame (a pour, a spawn, a
+    // window relocation) still runs — it is what the NEXT frames stand on —
+    // but the render and the readback, which are the expensive part, do not.
+    if (!ShotWanted(path)) return;
     Camera c;
     c.yaw = yaw;
     c.pitch = pitch;
@@ -2348,6 +2373,111 @@ int WriteHeightmap(const std::string& spec, const std::string& outPath) {
 
 }  // namespace
 
+// ---- --verify: the end-of-package check as ONE launch ----------------------
+//
+// Measured 2026-09-01/02: agents ran --gate X, --shot, --render-budget and
+// --shader-stats as four separate boots — four device + SPIR-V + worldgen
+// boots and four waits on the run lock, for one claim. Nothing in them needs
+// its own process. This runs the gates (selftest::Run, which writes its own
+// build/last_run.json), then the requested --shot frames, then the requested
+// --render-budget arms, on the one GpuContext the normal path already built,
+// and rewrites build/last_run.json with all three so the record of a
+// verification is one file. Nonzero exit if any part failed.
+int RunVerify(GpuContext& ctx, World& world, Simulation& sim,
+              std::vector<MaterialDef>& mats,
+              std::vector<ReactionGpu>& reactions, Physics& phys,
+              DebrisSystem& debris, MobSystem& mobs, Stream& stream,
+              ItemLibrary& items, const selftest::Options& stOpt,
+              const sandvox::PerfOptions& perfOpt, bool doShots,
+              bool doBudget) {
+  const double t0 = NowSeconds();
+  int failures = 0;
+  std::printf("=== sandvox --verify ===\n");
+
+  // The "gates" object selftest::Run wrote, kept verbatim: its writer owns
+  // that format (status/seconds/detail per gate) and this file must stay
+  // readable by whatever reads a plain --selftest run.
+  std::string gatesJson;
+  if (!stOpt.only.empty()) {
+    std::printf("\n--- verify: %zu gate(s) ---\n", stOpt.only.size());
+    selftest::Ctx sc{ctx,  world,  sim,  mats,   reactions,
+                     phys, debris, mobs, stream, items};
+    if (selftest::Run(sc, stOpt) != 0) failures++;
+    std::ifstream f("build/last_run.json");
+    std::string line;
+    while (std::getline(f, line)) gatesJson += line + "\n";
+  }
+
+  if (doShots) {
+    std::printf("\n--- verify: %zu shot frame(s) ---\n", g_shotOnly.size());
+    g_shotResults.clear();
+    if (RunShots(ctx, world, sim) != 0) failures++;
+    for (const std::string& want : g_shotOnly) {
+      bool seen = false;
+      for (const ShotRecord& r : g_shotResults) {
+        std::string p = r.file;
+        if (p.size() > 4 && p.compare(p.size() - 4, 4, ".bmp") == 0) p.resize(p.size() - 4);
+        if (p == want) seen = true;
+      }
+      // A frame name that matched nothing is the typo case: report it rather
+      // than let "0 frames written" read as a pass.
+      if (!seen) {
+        std::fprintf(stderr, "--verify: no --shot frame named '%s'\n", want.c_str());
+        g_shotResults.push_back({want + ".bmp", false});
+        failures++;
+      }
+    }
+  }
+
+  std::vector<sandvox::RenderBudgetRow> rows;
+  if (doBudget) {
+    std::printf("\n--- verify: %zu render-budget arm(s) ---\n", perfOpt.arms.size());
+    if (sandvox::RunRenderBudget(ctx, world, sim, mats, perfOpt, &rows) != 0)
+      failures++;
+  }
+
+  // One file. Splice the shots and the arms into the gates document (or an
+  // empty one) rather than emitting a second file nobody would look for.
+  {
+    std::string doc = gatesJson;
+    size_t close = doc.rfind('}');
+    if (close == std::string::npos) doc = "{\n  \"gates\": {}";
+    else doc = doc.substr(0, close);
+    while (!doc.empty() && (doc.back() == '\n' || doc.back() == ' ')) doc.pop_back();
+    auto esc = [](const std::string& s) {
+      std::string o;
+      for (char ch : s) {
+        if (ch == '"' || ch == '\\') o += '\\';
+        if (ch == '\n') { o += "\\n"; continue; }
+        o += ch;
+      }
+      return o;
+    };
+    doc += ",\n  \"mode\": \"verify\",\n  \"shots\": [";
+    for (size_t i = 0; i < g_shotResults.size(); i++)
+      doc += std::string(i ? ", " : "") + "{\"file\": \"" + esc(g_shotResults[i].file) +
+             "\", \"ok\": " + (g_shotResults[i].ok ? "true" : "false") + "}";
+    doc += "],\n  \"budget\": [";
+    for (size_t i = 0; i < rows.size(); i++) {
+      char num[96];
+      std::snprintf(num, sizeof(num), "\"gpuP50Ms\": %.3f, \"gpuP95Ms\": %.3f",
+                    rows[i].gpuP50Ms, rows[i].gpuP95Ms);
+      doc += std::string(i ? ", " : "") + "{\"cam\": \"" + esc(rows[i].cam) +
+             "\", \"arm\": \"" + esc(rows[i].arm) +
+             "\", \"ok\": " + (rows[i].ok ? "true" : "false") + ", " + num +
+             ", \"why\": \"" + esc(rows[i].why) + "\"}";
+    }
+    doc += "],\n  \"failures\": " + std::to_string(failures) + "\n}\n";
+    std::ofstream out("build/last_run.json");
+    if (out) { out << doc; std::printf("wrote build/last_run.json (gates + shots + budget)\n"); }
+    else std::fprintf(stderr, "--verify: cannot write build/last_run.json\n");
+  }
+
+  std::printf("\n=== verify %s (%d failure(s), %.1fs) ===\n",
+              failures == 0 ? "PASS" : "FAIL", failures, NowSeconds() - t0);
+  return failures == 0 ? 0 : 1;
+}
+
 int main(int argc, char** argv) {
   InstallCrashHandler();
   StartupMark("main");
@@ -2398,6 +2528,12 @@ int main(int argc, char** argv) {
   sandvox::PerfOptions perfOpt;
   bool rebaseline = false;  // --rebaseline: write observed values into baseline.json
   bool suiteAcceptance = false;  // --suite acceptance: one-process full acceptance
+  // --verify <gates>: one boot for the end-of-package check — those gates,
+  // then the --shot-frames, then the --budget-arms, all into
+  // build/last_run.json. See RunVerify.
+  bool verify = false;
+  bool shotFrames = false;   // --shot-frames given (implies --shot on its own)
+  bool budgetArms = false;   // --budget-arms given (implies --render-budget)
   std::string sweepParam;   // --sweep sim.X=a,b,c
   std::string sweepGate;    // --sweep-gate (default: determinism)
   // PAGED IS THE DEFAULT (2026-08-23, user decision): 4,975 resident pages =
@@ -2467,6 +2603,10 @@ int main(int argc, char** argv) {
           "  --baseline <path>     Selftest baseline file\n"
           "  --rebaseline          Write observed values into baseline.json\n"
           "  --suite acceptance    One-process selftest + both smokes + validation\n"
+          "  --verify a,b[,..]     ONE boot: those gates (or 'none'), then --shot-frames,\n"
+          "                        then --budget-arms; all recorded in build/last_run.json\n"
+          "  --shot-frames x,y     Only these --shot frames (names, .bmp optional)\n"
+          "  --budget-arms p,q     Only these --render-budget arms (e.g. baseline,noshadow)\n"
           "  --sweep sim.X=a,b,c   In-process parameter sweep (hash per value)\n"
           "  --sweep-gate <name>   Gate for --sweep (default: determinism)\n\n"
           "Shot / screenshot modes:\n"
@@ -2719,6 +2859,47 @@ int main(int argc, char** argv) {
     // the primary detector for a missing barrier (§6.2's detection ladder).
     else if (a == "--vk-validation") vkValidation = true;
     else if (a == "--rebaseline") rebaseline = true;
+    // `--verify a,b,c` — the gates; `--shot-frames x,y` and `--budget-arms p,q`
+    // add the frames and the arms to the same boot. Each of the last two also
+    // works alone, as a filter on --shot / --render-budget.
+    else if (a == "--verify") {
+      if (i + 1 >= argc) { std::fprintf(stderr, "--verify requires a gate list (or 'none')\n"); return 1; }
+      verify = true;
+      std::string list = argv[++i];
+      if (list != "none")
+        for (size_t p = 0; p < list.size();) {
+          size_t q = list.find(',', p);
+          if (q == std::string::npos) q = list.size();
+          if (q > p) stOpt.only.push_back(list.substr(p, q - p));
+          p = q + 1;
+        }
+    }
+    else if (a == "--shot-frames") {
+      if (i + 1 >= argc) { std::fprintf(stderr, "--shot-frames requires a frame list\n"); return 1; }
+      shotFrames = true;
+      std::string list = argv[++i];
+      for (size_t p = 0; p < list.size();) {
+        size_t q = list.find(',', p);
+        if (q == std::string::npos) q = list.size();
+        if (q > p) {
+          std::string f = list.substr(p, q - p);
+          if (f.size() > 4 && f.compare(f.size() - 4, 4, ".bmp") == 0) f.resize(f.size() - 4);
+          g_shotOnly.push_back(f);
+        }
+        p = q + 1;
+      }
+    }
+    else if (a == "--budget-arms") {
+      if (i + 1 >= argc) { std::fprintf(stderr, "--budget-arms requires an arm list\n"); return 1; }
+      budgetArms = true;
+      std::string list = argv[++i];
+      for (size_t p = 0; p < list.size();) {
+        size_t q = list.find(',', p);
+        if (q == std::string::npos) q = list.size();
+        if (q > p) perfOpt.arms.push_back(list.substr(p, q - p));
+        p = q + 1;
+      }
+    }
     else if (a == "--suite") {
       if (i + 1 >= argc) { std::fprintf(stderr, "--suite requires a name\n"); return 1; }
       std::string s = argv[++i];
@@ -3080,7 +3261,7 @@ int main(int argc, char** argv) {
   // the TimestampQuery device feature (per-pass GPU timings).
   if (!ctx.Init(window, 1600, 900, lowPowerAdapter,
                 /*wantTimestamps=*/measure || perf || renderBudget || fluidBench ||
-                    telemetryEnabled,
+                    budgetArms || telemetryEnabled,
                 backend, vkValidation,
                 sledgehammer))
     return 1;
@@ -3240,6 +3421,15 @@ int main(int argc, char** argv) {
   FarField far;
   far.Init(&world);
   StartupMark("physics, debris, mobs, far-field init");
+
+  // --verify first: it is the union of three modes below on this one context.
+  if (verify) {
+    if (rebaseline) stOpt.rebaseline = true;
+    return RunVerify(ctx, world, sim, mats, reactions, phys, debris, mobs,
+                     stream, items, stOpt, perfOpt, shotFrames, budgetArms);
+  }
+  if (shotFrames) shot = true;          // --shot-frames alone = filtered --shot
+  if (budgetArms) renderBudget = true;  // --budget-arms alone = filtered budget
 
   if (measure) return RunMeasure(ctx, world, sim, mats);
   if (renderBudget)

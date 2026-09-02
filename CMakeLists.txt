@@ -1,8 +1,53 @@
-cmake_minimum_required(VERSION 3.24)
+cmake_minimum_required(VERSION 3.25)
+
+# ---------------------------------------------------------------------------
+# Debug info goes INTO the .obj (/Z7), never into a compiler-written .pdb (/Zi).
+#
+# Two reasons, one of them new. The crash handler needs symbols (see the "DEBUG
+# INFO IN RELEASE" block on the sandvox target), and /Z7 gives the LINKER the
+# same information to write the same .pdb — nothing about symbolication
+# changes. What /Zi could not do is be CACHED: sccache refuses any compile
+# that writes a shared .pdb through mspdbsrv, so every one of our own TUs
+# would have been a permanent cache miss. CMP0141 (3.25) is what makes CMake
+# honour this variable instead of hard-coding /Zi into the config flags; it
+# has to be set before project() because that is when the flags are
+# initialised.
+# ---------------------------------------------------------------------------
+set(CMAKE_MSVC_DEBUG_INFORMATION_FORMAT "$<$<CONFIG:Debug,RelWithDebInfo>:Embedded>")
+
 project(sandvox LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# ---------------------------------------------------------------------------
+# Shared compiler cache (sccache), gated on the tool being on PATH.
+#
+# A worktree is a fresh checkout with an empty build/, and the shared
+# FetchContent cache below only shares SOURCES: every worktree still compiled
+# Tint and Jolt from scratch — measured 2026-09-01/02, four of seven agent
+# packages were WGSL-only and each paid that cold build anyway. Those sources
+# live at one path (C:/sv-deps) for every worktree, so their objects hash
+# identically and the second worktree gets them as cache hits. The cache dir
+# sits beside the source cache; scripts/build.sh exports SCCACHE_DIR so a
+# build outside the script lands in the same place.
+#
+# The Visual Studio generator IGNORES CMAKE_<LANG>_COMPILER_LAUNCHER — MSBuild
+# runs cl.exe itself — which is why scripts/build.sh configures with "Ninja
+# Multi-Config" when sccache is present. The exe path is unchanged either way
+# (build/Release/sandvox.exe). Set SANDVOX_NO_SCCACHE=1 to opt out.
+# ---------------------------------------------------------------------------
+find_program(SCCACHE_PROGRAM sccache)
+if(SCCACHE_PROGRAM AND NOT DEFINED ENV{SANDVOX_NO_SCCACHE})
+  if(CMAKE_GENERATOR MATCHES "Visual Studio")
+    message(STATUS "sandvox: sccache found but the ${CMAKE_GENERATOR} generator "
+                   "ignores compiler launchers; use scripts/build.sh (Ninja Multi-Config)")
+  else()
+    set(CMAKE_C_COMPILER_LAUNCHER   "${SCCACHE_PROGRAM}")
+    set(CMAKE_CXX_COMPILER_LAUNCHER "${SCCACHE_PROGRAM}")
+    message(STATUS "sandvox: compiler launcher = ${SCCACHE_PROGRAM}")
+  endif()
+endif()
 
 # ---------------------------------------------------------------------------
 # Shared dependency cache — MUST be set before include(FetchContent).
@@ -26,15 +71,35 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # never fires and every worktree silently gets a private cache. Guard on the
 # CACHE entry so an explicit -DFETCHCONTENT_BASE_DIR=... still wins.
 # ---------------------------------------------------------------------------
+if(DEFINED ENV{SANDVOX_DEPS})
+  set(SV_DEPS_ROOT "$ENV{SANDVOX_DEPS}")
+elseif(WIN32)
+  set(SV_DEPS_ROOT "C:/sv-deps")
+elseif(DEFINED ENV{HOME})
+  set(SV_DEPS_ROOT "$ENV{HOME}/.sandvox-deps")
+else()
+  set(SV_DEPS_ROOT "${CMAKE_BINARY_DIR}/_deps")  # last resort: per-build, as before
+endif()
 if(NOT DEFINED CACHE{FETCHCONTENT_BASE_DIR})
-  if(DEFINED ENV{SANDVOX_DEPS})
-    set(_sv_deps "$ENV{SANDVOX_DEPS}")
-  elseif(WIN32)
-    set(_sv_deps "C:/sv-deps")
-  elseif(DEFINED ENV{HOME})
-    set(_sv_deps "$ENV{HOME}/.sandvox-deps")
-  else()
-    set(_sv_deps "${CMAKE_BINARY_DIR}/_deps")  # last resort: per-build, as before
+  # The base dir holds the dependencies' BINARY dirs too (<name>-build), and
+  # those are generator-specific: MSBuild and Ninja lay out objects, depfiles
+  # and per-target CMakeFiles differently, and two generators generating into
+  # one tree step on each other's bookkeeping. Ninja builds (the sccache path,
+  # scripts/build.sh) therefore get a sibling root, SHARED by every Ninja
+  # worktree; the SOURCE checkouts are reused from the canonical root by
+  # sv_reuse_shared_source below.
+  #
+  # Shared, not per-worktree, and that was measured rather than assumed
+  # (2026-09-02): Tint's compiles embed the generated-header paths under this
+  # dir, so a per-worktree root turned 421 of 526 objects into cache MISSES —
+  # the cache stops paying for the one thing it exists to pay for. The cost of
+  # sharing is that a fresh worktree's ninja, having no log of the shared
+  # generator commands, re-runs them and dirties every other worktree's Tint
+  # objects: ~50 s of cache re-fetches on their next build. Fifty seconds
+  # beats three minutes.
+  set(_sv_deps "${SV_DEPS_ROOT}")
+  if(CMAKE_GENERATOR MATCHES "Ninja")
+    set(_sv_deps "${SV_DEPS_ROOT}/ninja")
   endif()
   set(FETCHCONTENT_BASE_DIR "${_sv_deps}" CACHE PATH
       "Shared FetchContent cache, so worktrees don't each rebuild Dawn")
@@ -42,6 +107,30 @@ endif()
 message(STATUS "sandvox: dependency cache = ${FETCHCONTENT_BASE_DIR}")
 
 include(FetchContent)
+
+# One SOURCE checkout per dependency, whatever the generator. The canonical
+# cache (SV_DEPS_ROOT/<name>-src) was populated by the MSBuild worktrees; a
+# Ninja worktree's FETCHCONTENT_BASE_DIR is the sibling root above, so its
+# population step would clone Dawn again. Point it at the checkout that exists
+# instead, which also skips the subbuild — and a subbuild is the other thing
+# that is generator-bound ("Does not match the generator used previously").
+# Only when the base dir is NOT the canonical root: in a canonical-root
+# configure the normal path runs, so a GIT_TAG bump still fetches. Bumping a
+# tag therefore means an MSBuild configure first (or delete <name>-src).
+function(sv_reuse_shared_source name)
+  string(TOLOWER "${name}" lc)
+  string(TOUPPER "${name}" uc)
+  set(src "${SV_DEPS_ROOT}/${lc}-src")
+  # FetchContent_Declare pre-defines FETCHCONTENT_SOURCE_DIR_<NAME> as an EMPTY
+  # cache entry, so test the value, not DEFINED — and FORCE the write.
+  if(FETCHCONTENT_SOURCE_DIR_${uc} OR FETCHCONTENT_BASE_DIR STREQUAL SV_DEPS_ROOT
+     OR NOT IS_DIRECTORY "${src}")
+    return()
+  endif()
+  set(FETCHCONTENT_SOURCE_DIR_${uc} "${src}" CACHE PATH
+      "Checkout reused from the canonical dependency cache" FORCE)
+  message(STATUS "sandvox: ${name}: reusing ${src}")
+endfunction()
 
 # ---------------------------------------------------------------------------
 # TINT — the WGSL compiler, fetched as part of the Dawn repository.
@@ -119,6 +208,7 @@ FetchContent_Declare(
   GIT_SHALLOW    TRUE
   GIT_SUBMODULES ""
 )
+sv_reuse_shared_source(dawn)
 FetchContent_MakeAvailable(dawn)
 
 # ---------------------------------------------------------------------------
@@ -204,6 +294,7 @@ FetchContent_Declare(
   GIT_TAG        v1.92.4
   GIT_SHALLOW    TRUE
 )
+sv_reuse_shared_source(imgui)
 FetchContent_MakeAvailable(imgui)
 
 add_library(imgui_lib STATIC
@@ -244,6 +335,7 @@ FetchContent_Declare(
   GIT_SHALLOW    TRUE
   SOURCE_SUBDIR  Build
 )
+sv_reuse_shared_source(JoltPhysics)
 FetchContent_MakeAvailable(JoltPhysics)
 
 # ---------------------------------------------------------------------------
@@ -255,6 +347,7 @@ FetchContent_Declare(
   GIT_TAG        v3.11.3
   GIT_SHALLOW    TRUE
 )
+sv_reuse_shared_source(nlohmann_json)
 FetchContent_MakeAvailable(nlohmann_json)
 
 # ---------------------------------------------------------------------------
@@ -271,6 +364,7 @@ FetchContent_Declare(
   GIT_TAG        0.11.21
   GIT_SHALLOW    TRUE
 )
+sv_reuse_shared_source(miniaudio)
 FetchContent_GetProperties(miniaudio)
 if(NOT miniaudio_POPULATED)
   FetchContent_Populate(miniaudio)
@@ -278,8 +372,18 @@ endif()
 
 # ---------------------------------------------------------------------------
 # sandvox
+#
+# Two targets, one program. `sandvox_core` is an OBJECT library holding every
+# TU; `sandvox` is the link of those objects and nothing else. The split exists
+# for scripts/build.sh, which compiles under one machine-global lock
+# (C:/sv-compile-lock, CPU) and links under another (C:/sv-gpu-lock, the one
+# every sandvox.exe run holds): a link overwrites build/Release/sandvox.exe and
+# must not race a live run (LNK1104), but a compile races nothing, and before
+# the split a --gate check queued behind five minutes of somebody else's
+# compile. `--target sandvox_compile` (below) is "compile everything, link
+# nothing".
 # ---------------------------------------------------------------------------
-add_executable(sandvox
+add_library(sandvox_core OBJECT
   src/main.cpp
   src/crash.cpp
   src/gpu/rhi.cpp
@@ -419,21 +523,24 @@ add_executable(sandvox
 # src/audio is on the path so the VENDORED engine's own `#include "xyzpan/..."`
 # resolves unmodified — the sandvox-side audio code uses "audio/xyzpan/..."
 # instead, matching the project's src-relative convention.
-target_include_directories(sandvox PRIVATE src src/audio ${miniaudio_SOURCE_DIR}
+target_include_directories(sandvox_core PRIVATE src src/audio ${miniaudio_SOURCE_DIR}
   ${CMAKE_SOURCE_DIR}/src/gpu/vma)
-target_compile_definitions(sandvox PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_compile_definitions(sandvox_core PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 # VK_NO_PROTOTYPES is load-bearing, not hygiene: it removes the vk* function
 # declarations from vulkan.h so every entry point MUST come through the
 # dynamically-loaded table in src/gpu/vk_loader.h. Without it, a typo'd direct
 # call compiles and then fails to LINK (no loader library) or, worse, silently
 # links against a stray import lib. VMA is told the same via
 # VMA_STATIC_VULKAN_FUNCTIONS=0, and gets its pointers from the same table.
-target_compile_definitions(sandvox PRIVATE
+target_compile_definitions(sandvox_core PRIVATE
   VK_NO_PROTOTYPES
   VMA_STATIC_VULKAN_FUNCTIONS=0
   VMA_DYNAMIC_VULKAN_FUNCTIONS=0
 )
-target_link_libraries(sandvox PRIVATE
+# The same list twice, on purpose: on the OBJECT library it is usage
+# requirements only (include dirs, defines — an object library has no link
+# step), on the executable it is the actual link line.
+set(SANDVOX_LINK_LIBS
   glfw
   imgui_lib
   nlohmann_json::nlohmann_json
@@ -447,9 +554,39 @@ target_link_libraries(sandvox PRIVATE
   tint_lang_wgsl_reader
   tint_lang_spirv_writer
 )
+target_link_libraries(sandvox_core PRIVATE ${SANDVOX_LINK_LIBS})
+# `sandvox_compile` = "compile everything sandvox links, link nothing". An
+# object library takes only USAGE requirements from what it "links", not a
+# build-order dependency on it: `--target sandvox_core` compiled our 100 TUs
+# and left Tint and Jolt for the link phase — under the GPU lock, which is
+# exactly where a six-minute compile must not be. And add_dependencies on the
+# object library itself does not reach them under Ninja (order-only inputs of
+# an up-to-date edge are not visited), so the umbrella is a custom target,
+# whose dependencies always are.
+add_custom_target(sandvox_compile)
+add_dependencies(sandvox_compile sandvox_core)
+# The tint CLI too: scripts/check_shaders.sh validates WGSL with it, it links
+# the Tint libraries the compile phase just built, and in the shared
+# dependency root it is built once for every worktree.
+if(TARGET tint_cmd_tint_cmd)
+  add_dependencies(sandvox_compile tint_cmd_tint_cmd)
+endif()
+foreach(_lib IN LISTS SANDVOX_LINK_LIBS)
+  if(TARGET ${_lib})
+    get_target_property(_type ${_lib} TYPE)
+    if(NOT _type STREQUAL "INTERFACE_LIBRARY")
+      add_dependencies(sandvox_compile ${_lib})
+    endif()
+  endif()
+endforeach()
+add_executable(sandvox $<TARGET_OBJECTS:sandvox_core>)
+target_link_libraries(sandvox PRIVATE ${SANDVOX_LINK_LIBS})
 
-# Run from any cwd: bake the asset dir absolute path for dev builds.
-target_compile_definitions(sandvox PRIVATE SANDVOX_ASSET_DIR="${CMAKE_SOURCE_DIR}/assets")
+# Run from any cwd: bake the asset dir absolute path for dev builds. The
+# SANDVOX_ASSET_DIR ENVIRONMENT variable overrides it at runtime (AssetDir() in
+# src/test/support.cpp) — that is how a WGSL-only worktree runs the main
+# checkout's exe against its own assets without a build.
+target_compile_definitions(sandvox_core PRIVATE SANDVOX_ASSET_DIR="${CMAKE_SOURCE_DIR}/assets")
 
 # ---------------------------------------------------------------------------
 # DEBUG INFO IN RELEASE. Not optional, and not a debugging convenience.
@@ -462,12 +599,15 @@ target_compile_definitions(sandvox PRIVATE SANDVOX_ASSET_DIR="${CMAKE_SOURCE_DIR
 # about which function faulted; the only fact recoverable from them was that
 # RIP - frame[0] was the same constant each time.
 #
-# /Zi costs nothing at runtime: it emits a side-car .pdb and does not change
-# code generation. /DEBUG makes the linker write it, and /OPT:REF /OPT:ICF
-# restore the folding that /DEBUG otherwise disables — without those two the
-# binary grows and the "Release" build stops being one.
+# /Z7 costs nothing at runtime: it embeds the debug records in each .obj and
+# does not change code generation (it was /Zi until 2026-09-02; see the note
+# on CMAKE_MSVC_DEBUG_INFORMATION_FORMAT at the top for why — /Zi is
+# uncacheable). /DEBUG makes the linker write the side-car .pdb from those
+# records, and /OPT:REF /OPT:ICF restore the folding that /DEBUG otherwise
+# disables — without those two the binary grows and the "Release" build stops
+# being one.
 if(MSVC)
-  target_compile_options(sandvox PRIVATE $<$<CONFIG:Release>:/Zi>)
+  target_compile_options(sandvox_core PRIVATE $<$<CONFIG:Release>:/Z7>)
   target_link_options(sandvox PRIVATE
     $<$<CONFIG:Release>:/DEBUG /OPT:REF /OPT:ICF>)
   # /arch:AVX2 is LOAD-BEARING and used to be an ACCIDENT. sim/scan.h and
@@ -482,7 +622,7 @@ if(MSVC)
   # This changes nothing about the current build; it only stops the flag from
   # being someone else's to remove. NOT /fp:fast — see the deliberate note on
   # the Jolt options above; relaxed float must never reach the sim.
-  target_compile_options(sandvox PRIVATE /arch:AVX2)
+  target_compile_options(sandvox_core PRIVATE /arch:AVX2)
 endif()
 
 # ---------------------------------------------------------------------------

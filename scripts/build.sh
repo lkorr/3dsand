@@ -1,40 +1,63 @@
 #!/usr/bin/env bash
-# Serialized build wrapper — only one build runs at a time across all worktrees.
+# Serialized build wrapper — one COMPILE at a time across all worktrees, and
+# the link (which overwrites sandvox.exe) excluded from every exe run.
 #
-# 5 agents running `cmake --build` simultaneously spawn 5 unbounded MSBuild
-# instances that saturate RAM and CPU. This script uses a mkdir-based mutex
-# so builds queue instead of fighting, and caps per-build parallelism.
+# 5 agents running `cmake --build` simultaneously spawn 5 unbounded builds that
+# saturate RAM and CPU. This script takes two mkdir-based mutexes
+# (scripts/svlock.sh) so builds queue instead of fighting, and caps per-build
+# parallelism:
+#
+#   compile   under C:/sv-compile-lock   — cl.exe over `sandvox_core`
+#   link      under C:/sv-gpu-lock       — taskkill sandvox.exe, then link
+#   selftest  under C:/sv-gpu-lock       — the only exe launch this script does
+#
+# A `--gate` check (run.sh, GPU lock only) therefore never waits for anybody's
+# compile phase; it waits for a link (seconds) or another run.
 #
 # Usage:
 #   bash scripts/build.sh                       # build sandvox (Release)
 #   bash scripts/build.sh --selftest            # build + run selftest
 #   bash scripts/build.sh --config Debug        # build Debug
 #   bash scripts/build.sh --configure           # cmake configure first
+#   bash scripts/build.sh --fresh               # configure from an empty cache
 #   bash scripts/build.sh --target sandvox      # explicit target
+#   bash scripts/build.sh --gen vs|ninja        # force a generator (see below)
 #
-# The lock is machine-global (lives in C:/sv-deps alongside the shared Dawn
-# cache). Agents keep editing and searching while waiting — only the
-# compile+link is serialized.
+# GENERATOR. With sccache on PATH (scoop install sccache) the build dir is
+# configured with "Ninja Multi-Config" + CMAKE_CXX_COMPILER_LAUNCHER=sccache,
+# because the Visual Studio generator ignores compiler launchers. Objects for
+# Tint and Jolt come out of the shared cache at C:/sv-deps/sccache — their
+# sources live at one path for every worktree, so the second worktree's cold
+# build is mostly hits. A build dir configured with the other generator is
+# re-configured in place (`cmake --fresh`) with a message; the exe path is
+# build/Release/sandvox.exe under both. SANDVOX_GENERATOR=vs (or --gen vs)
+# keeps MSBuild.
 set -eu
 
 # ── Configuration ──────────────────────────────────────────────────────────
 MAX_JOBS=6                       # cap cl.exe parallelism (half of 16 cores)
-LOCK_DIR="C:/sv-build-lock"      # mkdir-atomic mutex, outside any checkout
-LOCK_STALE_SEC=600               # 10 min — kill a stuck lock
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SVLOCK_TAG="build.sh"
+# shellcheck source=svlock.sh
+source "$SCRIPT_DIR/svlock.sh"
 
 # ── Parse arguments ────────────────────────────────────────────────────────
 CONFIG="Release"
 TARGET="sandvox"
 RUN_SELFTEST=false
 RUN_CONFIGURE=false
+GEN_WANT="${SANDVOX_GENERATOR:-auto}"   # auto | ninja | vs
+WANT_FRESH=false                        # --fresh: drop CMakeCache.txt first
 EXTRA_ARGS=()
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --selftest)     RUN_SELFTEST=true; shift ;;
     --configure)    RUN_CONFIGURE=true; shift ;;
+    --fresh)        RUN_CONFIGURE=true; WANT_FRESH=true; shift ;;
     --config)       CONFIG="$2"; shift 2 ;;
     --target)       TARGET="$2"; shift 2 ;;
+    --gen)          GEN_WANT="$2"; shift 2 ;;
     *)              EXTRA_ARGS+=("$1"); shift ;;
   esac
 done
@@ -49,117 +72,126 @@ else
   exit 1
 fi
 
-# ── Stale lock cleanup ────────────────────────────────────────────────────
-# If the lock dir exists and its timestamp file is older than LOCK_STALE_SEC,
-# the holder probably crashed. Remove it.
-cleanup_stale_lock() {
-  if [ -d "$LOCK_DIR" ] && [ -f "$LOCK_DIR/pid" ]; then
-    local ts
-    ts=$(cat "$LOCK_DIR/ts" 2>/dev/null || echo 0)
-    local now
-    now=$(date +%s)
-    local age=$(( now - ts ))
-    if [ "$age" -gt "$LOCK_STALE_SEC" ]; then
-      echo "build.sh: removing stale lock (age ${age}s, holder pid $(cat "$LOCK_DIR/pid" 2>/dev/null || echo '?'))"
-      rm -rf "$LOCK_DIR"
-    fi
-  fi
-}
-
-# ── Acquire lock ───────────────────────────────────────────────────────────
-acquire_lock() {
-  local waited=0
-  while true; do
-    cleanup_stale_lock
-    if mkdir "$LOCK_DIR" 2>/dev/null; then
-      echo $$ > "$LOCK_DIR/pid"
-      echo "$(basename "$ROOT")" > "$LOCK_DIR/who"
-      date +%s > "$LOCK_DIR/ts"
-      trap release_lock EXIT
-      return
-    fi
-    if [ "$waited" -eq 0 ]; then
-      local who
-      who=$(cat "$LOCK_DIR/who" 2>/dev/null || echo "unknown")
-      echo "build.sh: waiting for build lock (held by: $who)..."
-    fi
-    waited=$(( waited + 1 ))
-    sleep 2
-  done
-}
-
-# Only the OWNER releases. A lock can be stolen as "stale" while we still hold
-# it (see the heartbeat below); releasing unconditionally then deletes the NEW
-# holder's lock, and the next build.sh's taskkill kills its live selftest.
-REFRESH_PID=""
-release_lock() {
-  [ -n "$REFRESH_PID" ] && kill "$REFRESH_PID" 2>/dev/null || true
-  if [ "$(cat "$LOCK_DIR/pid" 2>/dev/null)" = "$$" ]; then
-    rm -rf "$LOCK_DIR"
+# ── Toolchain: generator + compiler cache ─────────────────────────────────
+GEN_VS="Visual Studio 17 2022"
+GEN_NINJA="Ninja Multi-Config"
+GEN=""
+if [ "$GEN_WANT" = "vs" ]; then
+  GEN="$GEN_VS"
+elif command -v sccache >/dev/null 2>&1 && [ -z "${SANDVOX_NO_SCCACHE:-}" ]; then
+  # Ninja needs cl.exe on PATH and INCLUDE/LIB in the environment, which the
+  # VS generator never did (MSBuild finds them itself). vsenv.sh captures a
+  # vcvarsall x64 environment once per VS install.
+  if source "$SCRIPT_DIR/vsenv.sh" && command -v ninja >/dev/null 2>&1; then
+    GEN="$GEN_NINJA"
+    export SCCACHE_DIR="${SCCACHE_DIR:-C:/sv-deps/sccache}"
+    export SCCACHE_CACHE_SIZE="${SCCACHE_CACHE_SIZE:-40G}"
   else
-    echo "build.sh: lock no longer ours (holder: $(cat "$LOCK_DIR/who" 2>/dev/null || echo '?')) - not releasing" >&2
+    echo "build.sh: sccache present but no MSVC env/ninja for it; using $GEN_VS" >&2
   fi
-}
-
-# ── Configure if requested or needed ──────────────────────────────────────
-# Outside the lock on purpose: configure only writes build system files, and
-# making every agent queue for it would serialize the cheap part too.
-if [ "$RUN_CONFIGURE" = true ] || [ ! -d "$ROOT/build" ]; then
-  echo "build.sh: configuring..."
-  cmake -S "$ROOT" -B "$ROOT/build" -G "Visual Studio 17 2022" -A x64
+fi
+if [ -z "$GEN" ]; then
+  [ "$GEN_WANT" = "ninja" ] && { echo "build.sh: --gen ninja needs sccache + ninja + VS on this machine" >&2; exit 1; }
+  GEN="$GEN_VS"
 fi
 
-# ── Build (serialized) ────────────────────────────────────────────────────
-acquire_lock
-echo "build.sh: building $TARGET ($CONFIG) with max $MAX_JOBS parallel jobs..."
-
-# Heartbeat: refresh the lock timestamp while we build (and selftest), exactly
-# as run.sh does for runs. Without it a >10 min build (a worktree's first
-# build is one) is stolen as "stale" mid-link. Refresh only while the pid file
-# is still ours, so a stolen lock is never kept alive by the loser.
-( while true; do
-    sleep 60
-    [ "$(cat "$LOCK_DIR/pid" 2>/dev/null)" = "$$" ] || exit 0
-    date +%s > "$LOCK_DIR/ts" 2>/dev/null || exit 0
-  done ) &
-REFRESH_PID=$!
-
-# Kill any running sandvox.exe INSIDE the lock. This used to run before
-# acquire_lock, which made it useless under the load it exists to handle: agent
-# A killed the exe, then waited minutes behind the mutex, and by the time it
-# linked, agent B had launched a fresh sandvox.exe — LNK1104 anyway, after the
-# full wait. Killing here means nothing can start an exe between the kill and
-# our link, because starting one requires this same lock (see the selftest
-# below). Our own --selftest is the only sanctioned launcher.
-taskkill //F //IM sandvox.exe 2>/dev/null || true
+# ── Configure if requested or needed ──────────────────────────────────────
+# Outside the locks on purpose: configure only writes build system files, and
+# making every agent queue for it would serialize the cheap part too.
+CACHE="$ROOT/build/CMakeCache.txt"
+HAVE_GEN=""
+[ -f "$CACHE" ] && HAVE_GEN="$(sed -n 's/^CMAKE_GENERATOR:INTERNAL=//p' "$CACHE" | tr -d '\r')"
+FRESH=()
+[ "$WANT_FRESH" = true ] && FRESH=(--fresh)
+if [ -n "$HAVE_GEN" ] && [ "$HAVE_GEN" != "$GEN" ]; then
+  echo "build.sh: build/ was configured with '$HAVE_GEN'; switching to '$GEN' (cmake --fresh, one cold build)"
+  RUN_CONFIGURE=true
+  FRESH=(--fresh)
+fi
+# The cache file appears at the START of a configure; the generator's own
+# build file only at the end, so a configure that died half-way (a failed
+# FetchContent step) is retried rather than handed to the build tool.
+GEN_FILE="$ROOT/build/build.ninja"
+[ "$GEN" = "$GEN_VS" ] && GEN_FILE="$ROOT/build/sandvox.sln"
+if [ "$RUN_CONFIGURE" = true ] || [ ! -f "$CACHE" ] || [ ! -f "$GEN_FILE" ]; then
+  echo "build.sh: configuring ($GEN)..."
+  if [ "$GEN" = "$GEN_VS" ]; then
+    cmake "${FRESH[@]+"${FRESH[@]}"}" -S "$ROOT" -B "$ROOT/build" -G "$GEN" -A x64
+  else
+    cmake "${FRESH[@]+"${FRESH[@]}"}" -S "$ROOT" -B "$ROOT/build" -G "$GEN"
+  fi
+fi
 
 export CMAKE_BUILD_PARALLEL_LEVEL=$MAX_JOBS
+T_START=$(date +%s)
+
+# ── Phase 1: compile (compile lock) ───────────────────────────────────────
+# For the `sandvox` target this builds `sandvox_compile` — every object file
+# plus the dependency libraries — and links nothing. Any other target
+# (movement_test, tint_cmd_tint_cmd) does not touch sandvox.exe, so it builds
+# AND links here.
+COMPILE_TARGET="$TARGET"
+[ "$TARGET" = "sandvox" ] && COMPILE_TARGET="sandvox_compile"
+
+svlock_acquire "$SVLOCK_COMPILE" "build:$(basename "$ROOT")"
+echo "build.sh: compiling $COMPILE_TARGET ($CONFIG, $GEN) with max $MAX_JOBS parallel jobs..."
+[ "$GEN" = "$GEN_NINJA" ] && sccache --zero-stats >/dev/null 2>&1 || true
 # `set -e` would abort the script here on a failed build, skipping the
 # diagnostics below, so the failure is captured rather than propagated.
 BUILD_EXIT=0
-cmake --build "$ROOT/build" --config "$CONFIG" --target "$TARGET" \
+cmake --build "$ROOT/build" --config "$CONFIG" --target "$COMPILE_TARGET" \
   "${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}" || BUILD_EXIT=$?
+if [ "$GEN" = "$GEN_NINJA" ]; then
+  # One line of cache attribution, so "was this build cold" is answered by
+  # the log instead of by re-running it.
+  sccache --show-stats 2>/dev/null \
+    | grep -E '^(Compile requests executed|Cache hits|Cache misses|Non-cacheable compilations)\s' \
+    | sed 's/  */ /g' | tr '\n' ';' | sed 's/^/build.sh: sccache /; s/;$/\n/' || true
+fi
+svlock_release "$SVLOCK_COMPILE"
+T_COMPILE=$(date +%s)
 
 if [ "$BUILD_EXIT" -ne 0 ]; then
-  release_lock
-  trap - EXIT
   echo "build.sh: BUILD FAILED (exit $BUILD_EXIT)" >&2
   exit "$BUILD_EXIT"
 fi
+if [ "$TARGET" != "sandvox" ]; then
+  echo "build.sh: $TARGET built in $(( T_COMPILE - T_START ))s."
+  exit 0
+fi
 
-echo "build.sh: build succeeded."
+# ── Phase 2: link (+ selftest) under the GPU lock ─────────────────────────
+svlock_acquire_gpu "link:$(basename "$ROOT")"
 
-# ── Selftest — runs while we STILL HOLD the lock ──────────────────────────
+# Kill any running sandvox.exe INSIDE the lock. Killing here means nothing can
+# start an exe between the kill and our link, because starting one requires
+# this same lock (run.sh, and the selftest below). This used to run before the
+# lock was taken, which made it useless under the load it exists to handle:
+# agent A killed the exe, then waited minutes behind the mutex, and by the time
+# it linked, agent B had launched a fresh sandvox.exe — LNK1104 anyway.
+taskkill //F //IM sandvox.exe 2>/dev/null || true
+
+echo "build.sh: linking sandvox ($CONFIG)..."
+LINK_EXIT=0
+cmake --build "$ROOT/build" --config "$CONFIG" --target sandvox \
+  "${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}" || LINK_EXIT=$?
+T_LINK=$(date +%s)
+if [ "$LINK_EXIT" -ne 0 ]; then
+  svlock_release_gpu
+  echo "build.sh: LINK FAILED (exit $LINK_EXIT)" >&2
+  exit "$LINK_EXIT"
+fi
+echo "build.sh: build succeeded (compile $(( T_COMPILE - T_START ))s, link $(( T_LINK - T_COMPILE ))s)."
+
+# ── Selftest — runs while we STILL HOLD the GPU lock ──────────────────────
 # The exe must not be live while another agent links, and this is the only
-# place the script starts one. Releasing the lock first (the old behaviour)
-# put every selftest run in direct competition with every other agent's link
-# step, which is the other half of the LNK1104 problem.
+# place the script starts one.
 SELFTEST_EXIT=0
 if [ "$RUN_SELFTEST" = true ]; then
   echo "build.sh: running selftest..."
   "$ROOT/build/$CONFIG/sandvox.exe" --selftest || SELFTEST_EXIT=$?
 fi
 
-release_lock
+svlock_release_gpu
 trap - EXIT
 exit "$SELFTEST_EXIT"

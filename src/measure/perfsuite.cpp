@@ -1968,8 +1968,23 @@ class RenderBudgetRunner {
 
 int RunRenderBudget(GpuContext& ctx, World& world, Simulation& sim,
                     const std::vector<MaterialDef>& mats,
-                    const PerfOptions& opt) {
+                    const PerfOptions& opt,
+                    std::vector<RenderBudgetRow>* rows) {
   std::printf("=== sandvox --render-budget: where inside the raymarch ===\n");
+  // An arm name that matches nothing is a typo, and a typo that silently runs
+  // the full table costs the minutes the subset was meant to save.
+  for (const std::string& want : opt.arms) {
+    bool known = false;
+    for (const RenderArm& arm : kRenderArms)
+      if (want == arm.id) known = true;
+    if (!known) {
+      std::fprintf(stderr, "--render-budget: no arm named '%s' (try: ",
+                   want.c_str());
+      for (const RenderArm& arm : kRenderArms) std::fprintf(stderr, "%s ", arm.id);
+      std::fprintf(stderr, ")\n");
+      return 1;
+    }
+  }
   std::printf("adapter: %s\n", ctx.DeviceName().c_str());
   if (!ctx.timestampsEnabled) {
     std::fprintf(stderr,
@@ -2064,6 +2079,14 @@ int RunRenderBudget(GpuContext& ctx, World& world, Simulation& sim,
     uint32_t cReq = 0, cRes = 0, cRef = 0;
   };
   std::vector<CamRun> runs;
+  // The baseline is the arm NAMED baseline, not arms[0]: under --budget-arms
+  // the first arm measured can be any arm, and a delta against it is noise.
+  // 0 when the subset left it out — every "saved" column then prints blank.
+  auto baselineOf = [](const CamRun& cr) {
+    for (const ArmResult& r : cr.arms)
+      if (r.arm == &kRenderArms[0] && r.ok) return r.gpuP50;
+    return 0.0;
+  };
 
   // The shadow-cache attribution, per camera (CLAUDE.md rule 6).
   //
@@ -2138,6 +2161,16 @@ int RunRenderBudget(GpuContext& ctx, World& world, Simulation& sim,
       }
     }
 
+    // --budget-arms: the caller's subset, applied on top of the camera's own
+    // arm list (validated against the full table at the top of the function).
+    if (!opt.arms.empty()) {
+      std::vector<const RenderArm*> kept;
+      for (const RenderArm* a : arms)
+        for (const std::string& want : opt.arms)
+          if (want == a->id) { kept.push_back(a); break; }
+      arms.swap(kept);
+    }
+
     std::printf("\n=== camera %s — %s ===\n", id, cr.label.c_str());
     std::printf("        %s\n", scene.note.c_str());
     std::printf("        eye (%.0f, %.0f, %.0f)  yaw %.2f  pitch %.2f\n",
@@ -2159,6 +2192,16 @@ int RunRenderBudget(GpuContext& ctx, World& world, Simulation& sim,
       if (!r.ok) std::printf("SKIPPED — %s\n", r.why.c_str());
       else std::printf("%7.2f ms\n", r.gpuP50);
       std::fflush(stdout);
+      if (rows) {
+        RenderBudgetRow row;
+        row.cam = id;
+        row.arm = arm->id;
+        row.ok = r.ok;
+        row.gpuP50Ms = r.gpuP50;
+        row.gpuP95Ms = r.gpuP95;
+        row.why = r.why;
+        rows->push_back(std::move(row));
+      }
       cr.arms.push_back(r);
     }
     runner.RestoreBase(base);
@@ -2169,8 +2212,7 @@ int RunRenderBudget(GpuContext& ctx, World& world, Simulation& sim,
     readCache(cr);
 
     // ---- the table this camera exists to print --------------------------
-    const double b =
-        cr.arms.empty() || !cr.arms[0].ok ? 0.0 : cr.arms[0].gpuP50;
+    const double b = baselineOf(cr);
     std::printf("\n  baseline raymarch: %.2f ms at %ux%u\n\n", b, opt.width,
                 opt.height);
     std::printf("  %-11s %9s %9s  %s\n", "arm", "ms", "saved",
@@ -2182,14 +2224,14 @@ int RunRenderBudget(GpuContext& ctx, World& world, Simulation& sim,
         std::printf("  %-11s   SKIPPED  %s\n", r.arm->id, r.why.c_str());
         continue;
       }
-      if (r.arm == cr.arms[0].arm) continue;
+      if (r.arm == &kRenderArms[0]) continue;
       const double saved = b - r.gpuP50;
       std::printf("  %-11s %9.2f %8.2f%s  %s\n", r.arm->id, r.gpuP50, saved,
                   b > 0 ? "" : " ", r.arm->means);
     }
     std::printf("\n  percentages of the %.2f ms baseline:\n", b);
     for (const ArmResult& r : cr.arms) {
-      if (!r.ok || r.arm == cr.arms[0].arm || b <= 0) continue;
+      if (!r.ok || r.arm == &kRenderArms[0] || b <= 0) continue;
       std::printf("    %-11s %5.1f%%\n", r.arm->id,
                   100.0 * (b - r.gpuP50) / b);
     }
@@ -2240,8 +2282,7 @@ int RunRenderBudget(GpuContext& ctx, World& world, Simulation& sim,
       std::fprintf(f, "\"cameras\":[\n");
       for (size_t ci = 0; ci < runs.size(); ci++) {
         const CamRun& cr = runs[ci];
-        const double b =
-            cr.arms.empty() || !cr.arms[0].ok ? 0.0 : cr.arms[0].gpuP50;
+        const double b = baselineOf(cr);
         std::fprintf(f, "%s{\"id\":%s,\"label\":%s,\"note\":%s,\"bmp\":%s,\n",
                      ci ? "," : "", JStr(cr.id).c_str(),
                      JStr(cr.label).c_str(), JStr(cr.note).c_str(),

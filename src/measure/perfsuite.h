@@ -56,11 +56,25 @@ struct PerfOptions {
   uint32_t width = 1920, height = 1080;
   // List the scenarios and exit.
   bool list = false;
+  // --budget-arms a,b,c: run only these --render-budget arms (empty = all).
+  // What makes a one-boot --verify affordable: the full table is ~14 arms of
+  // 60 frames each, and a package usually has one suspect.
+  std::vector<std::string> arms;
   // `--render-budget` only: comma-separated camera ids from the --render-budget
   // camera table (`noon,dusk,submerged`). Empty = all of them. Ignored when
   // `only` names a --perf scenario, which selects a single borrowed camera and
   // bypasses the table.
   std::string cams;
+};
+
+// One --render-budget row, for callers that record rather than read the
+// terminal (--verify writes them into build/last_run.json).
+struct RenderBudgetRow {
+  std::string cam;  // which camera of the table (or the borrowed scenario)
+  std::string arm;
+  bool ok = false;
+  double gpuP50Ms = 0, gpuP95Ms = 0;
+  std::string why;  // when !ok
 };
 
 // Returns 0 on success. Prints a human-readable summary as it goes — the JSON
@@ -87,10 +101,13 @@ int RunPerf(GpuContext& ctx, World& world, Simulation& sim,
 // because the medium is derived from the ray, not from a render flag. Select
 // with `opt.cams` ("noon,dusk"); empty runs all three. `opt.only` still picks a
 // single camera borrowed from a --perf scenario and bypasses the table.
-// `opt.width/height` set the resolution. Prints one table per camera and writes
-// build/render_budget.json plus one BMP per camera.
+// `opt.width/height` set the resolution; `opt.arms` picks an arm subset
+// (--budget-arms). Prints one table per camera and writes
+// build/render_budget.json plus one BMP per camera; `rows`, when given, also
+// receives one entry per (camera, arm) run so --verify can record them.
 int RunRenderBudget(GpuContext& ctx, World& world, Simulation& sim,
                     const std::vector<MaterialDef>& mats,
-                    const PerfOptions& opt);
+                    const PerfOptions& opt,
+                    std::vector<RenderBudgetRow>* rows = nullptr);
 
 }  // namespace sandvox

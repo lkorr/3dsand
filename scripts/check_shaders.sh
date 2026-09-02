@@ -26,7 +26,9 @@ find_tint() {
     "$ROOT/build/_deps/dawn-build/Release/tint.exe" \
     "$ROOT/build/_deps/dawn-build/src/tint/Release/tint.exe" \
     "$ROOT/build/_deps/dawn-build/src/tint/cmd/tint/Release/tint.exe" \
-    "$ROOT/build/Release/tint.exe"; do
+    "$ROOT/build/Release/tint.exe" \
+    "${SANDVOX_DEPS:-C:/sv-deps}/ninja/dawn-build/Release/tint.exe" \
+    "${SANDVOX_DEPS:-C:/sv-deps}/dawn-build/Release/tint.exe"; do
     [ -x "$c" ] && { echo "$c"; return 0; }
   done
   c="$(find "$ROOT/build" -name 'tint.exe' -type f 2>/dev/null | head -1)"

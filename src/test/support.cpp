@@ -40,12 +40,39 @@ uint32_t g_readbackDeclines = 0;
 // 0.5 = noon). Set by `--time`; see RunShots.
 float g_shotTimeOfDay = 0.34f;
 
+// The ONE place the asset tree is located. Every loader (materials, tuning,
+// shaders via LoadShader, prefabs, mobs, sounds, and tests/baseline.json next
+// to it) builds its path from this string, so overriding it here overrides all
+// of them at once.
+//
+// SANDVOX_ASSET_DIR in the ENVIRONMENT wins over the compiled-in path. That is
+// what lets a WGSL-only or tuning-only worktree run the MAIN checkout's
+// sandvox.exe against its own assets/ without a build of its own: the SPIR-V
+// cache keys on shader CONTENT, so an edited shader is recompiled on the first
+// run regardless of which binary loads it. Resolved once, printed once, so a
+// run that used the wrong tree says so in its first line rather than in a hash
+// that quietly matches the wrong baseline.
 std::string AssetDir() {
+  static const std::string resolved = [] {
+    std::string dir;
+    const char* from = "compiled-in";
+    if (const char* env = std::getenv("SANDVOX_ASSET_DIR"); env && *env) {
+      dir = env;
+      from = "SANDVOX_ASSET_DIR";
+    } else {
 #ifdef SANDVOX_ASSET_DIR
-  return SANDVOX_ASSET_DIR;
+      dir = SANDVOX_ASSET_DIR;
 #else
-  return "assets";
+      dir = "assets";
 #endif
+    }
+    while (dir.size() > 1 && (dir.back() == '/' || dir.back() == '\\'))
+      dir.pop_back();
+    std::printf("assets: %s (%s)\n", dir.c_str(), from);
+    std::fflush(stdout);
+    return dir;
+  }();
+  return resolved;
 }
 
 double NowSeconds() {
