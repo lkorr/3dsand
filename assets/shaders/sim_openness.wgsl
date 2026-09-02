@@ -118,59 +118,75 @@ fn openWorldChunk(slot : u32, origin : vec3<i32>) -> vec3<i32> {
 // SURFACE face worth measuring rather than a face of empty air.
 fn openValueAt(blockMin : vec3<i32>, face : u32) -> u32 {
   let n = openFaceNormal(face);
-  let half = f32(SUBOCC_BLOCK) * 0.5;
-  let centre = vec3f(blockMin) + vec3f(half);
-  // Half a voxel past the block's face plane, i.e. inside the NEIGHBOUR block.
-  // Not on the plane itself: a ray starting exactly on a block boundary floors
-  // into whichever side float noise picks, which is the same leak traceOpaque's
-  // "force the crossing on the exit axis" rule exists to prevent one level up.
-  let ro = centre + n * (half + 0.5);
-
-  // THE EARLY OUT, and its VALUE is the single most important decision in this
-  // file. If the neighbour block holds any blocker, all five rays would
-  // terminate in their first coarse step, so the march is skipped — that part
-  // is pure cost saving, and it is why a chunk costs a few dozen marches
-  // instead of 384.
-  //
-  // BUT IT RETURNS "NO OPINION" (255), NOT "FULLY ENCLOSED" (0), and the first
-  // version of this pass returned 0. At 40 cm blocks against 10 cm voxels the
-  // mask CANNOT distinguish "this face is buried inside rock" from "there is a
-  // one-voxel terrace step in front of it" — both set the neighbour block's
-  // bit. Terrain here is a staircase of one-voxel steps, so returning 0 painted
-  // every riser on every hillside hard black: measured on the tall-grass
-  // terrace shot, mean luminance -12.5/255 with 43% of pixels moved, and by eye
-  // it was exactly the "harsh horizontal banding" that wrapDiffuse
-  // (raymarch.wgsl) exists to remove. Openness put it back in one line.
-  //
-  // 255 says "this face has no measurement" and the reader (opennessByteAt,
-  // common.wgsl) DROPS it from its bilinear filter, so the face inherits its
-  // measured neighbours and only falls back to the pre-P0 lerp when nothing
-  // around it was measured either. (It used to READ as fully open sky, which
-  // lit every such face at full daylight inside caves -- the splotches.) The
-  // conservative direction is still the one that never darkens something
-  // wrongly: a riser between two measured hillside faces takes their value.
-  // Nothing real is lost: the faces P0 exists to darken — a cave floor, a room
-  // floor, the ground under an overhang — all have AIR in the block in front of
-  // them, so they march.
-  // 256, not 255, so the caller can tell "no opinion" from a face that marched
-  // and found the whole hemisphere open (a legitimate 255): P1's irradiance
-  // keeps a different word for each. The caller clamps it into the byte.
-  if (openBlockBlocked(vec3<i32>(floor(ro)))) { return 256u; }
-
-  // Tangents of the face, as unit axes. A 45-degree ray is normalize(n +- t).
+  let ni = vec3<i32>(round(n));
   let axis = face >> 1u;
+  // Tangents of the face, as unit axes. A 45-degree ray is normalize(n +- t).
   let t0 = vec3f(select(0.0, 1.0, axis == 1u), select(0.0, 1.0, axis == 2u),
                  select(0.0, 1.0, axis == 0u));
   let t1 = vec3f(select(0.0, 1.0, axis == 2u), select(0.0, 1.0, axis == 0u),
                  select(0.0, 1.0, axis == 1u));
+  let t0i = vec3<i32>(round(t0));
+  let t1i = vec3<i32>(round(t1));
+  let half = f32(SUBOCC_BLOCK) * 0.5;
+  let centre = vec3f(blockMin) + vec3f(half);
+
+  // THE ORIGIN IS AN EXPOSED AIR CELL, FOUND BY LOOKING, and that replaced the
+  // early-out that decided this file's first two versions. They started every
+  // ray half a voxel outside the block's face PLANE and, if the neighbouring
+  // block held any blocker at all, wrote "no opinion" -- because at 40 cm
+  // blocks against 10 cm voxels the mask cannot tell a buried face from one
+  // behind a one-voxel terrace step. That was right about the mask and wrong
+  // about the answer: "no opinion" reached the reader as either full daylight
+  // (v1) or a dropped tap (v2), and a dug tunnel -- every face of which has a
+  // rough wall in the block in front of it -- came out as hard-edged
+  // alternating slabs of full sky and pitch black (2026-09-02).
+  //
+  // So look at the voxels. Four columns of the face (the 2x2 sub-centres),
+  // each walked inward from the cell just outside the block: the first
+  // air-over-blocker transition is a surface somebody can see, and the air
+  // cell of it is where the rays start. At most 4 x (SUBOCC_BLOCK + 1) word
+  // reads, none for a block whose neighbour is open air (the old origin is
+  // exact then). Only a face with NO exposed column in those four is
+  // unmeasured (255), and that face is buried for every practical purpose.
+  let outer = blockMin + select(vec3<i32>(0), abs(ni) * (i32(SUBOCC_BLOCK) - 1),
+                                (face & 1u) != 0u);
+  var ro = centre + n * (half + 0.5);
+  if (openBlockBlocked(vec3<i32>(floor(ro)))) {
+    var found = false;
+    let q = i32(SUBOCC_BLOCK) / 4;
+    for (var ui = 0; ui < 2 && !found; ui++) {
+      for (var vi = 0; vi < 2 && !found; vi++) {
+        let u = q + ui * (i32(SUBOCC_BLOCK) / 2);
+        let v = q + vi * (i32(SUBOCC_BLOCK) / 2);
+        let c0 = outer + t0i * u + t1i * v + ni;   // just outside the block
+        var prevAir = !isRayBlocker(materials[voxMat(voxWordAt(c0))]);
+        for (var k = 1; k <= i32(SUBOCC_BLOCK); k++) {
+          let c = c0 - ni * k;
+          let blocker = isRayBlocker(materials[voxMat(voxWordAt(c))]);
+          if (blocker && prevAir) {
+            ro = vec3f(c + ni) + vec3f(0.5);
+            found = true;
+            break;
+          }
+          prevAir = !blocker;
+        }
+      }
+    }
+    // 256, not 255, so the caller can tell "no opinion" from a face that
+    // marched: P1's irradiance keeps a different word for each. The caller
+    // clamps it into the byte.
+    if (!found) { return 256u; }
+  }
 
   let reachVox = TUNE_OPENNESS_REACH / VOXEL_METERS;
-  // One coarse step covers SUBOCC_BLOCK voxels on an axis and up to
-  // sqrt(3) * SUBOCC_BLOCK on a diagonal, so a step budget alone is a sloppy
-  // distance bound in both directions. The budget stops a ray that would
-  // otherwise cross the whole window; the `t` test below is what makes the
-  // reach EXACT, and it is the one the knob's units promise.
-  let maxSteps = i32(reachVox / f32(SUBOCC_BLOCK)) + 4;
+  // FINE FOR THE FIRST TWO BLOCKS, COARSE AFTER. A ray that started inside a
+  // rough wall's own block would terminate on the block mask in its first
+  // coarse step no matter where it was going; voxel steps for the first
+  // 2 x SUBOCC_BLOCK cells let it thread the cavity it actually stands in.
+  // The step budget covers those fine cells on a diagonal (sqrt 3 each) plus
+  // the coarse remainder; the `t` test below is what makes reach exact.
+  let fineT = f32(SUBOCC_BLOCK) * 2.0;
+  let maxSteps = i32(fineT) * 2 + i32(reachVox / f32(SUBOCC_BLOCK)) + 8;
 
   // AN UNBLOCKED RAY IS NOT SKY. "Nothing within opennessReach" was the whole
   // test at first, and a cave chamber wider than 12 m read as full daylight:
@@ -184,6 +200,7 @@ fn openValueAt(blockMin : vec3<i32>, face : u32) -> u32 {
   // inside a hill every endpoint is under rock and nothing does. The up-ray
   // is bounded by the window height (WORLD_N / SUBOCC_BLOCK coarse steps).
   let upSteps = i32(WORLD_N / SUBOCC_BLOCK) + 4;
+  let up = vec3f(0.0, 1.0, 0.0);
   var openW = 0.0;
   for (var r = 0u; r < OPEN_RAYS; r++) {
     var d = n;
@@ -191,16 +208,22 @@ fn openValueAt(blockMin : vec3<i32>, face : u32) -> u32 {
     else if (r == 2u) { d = normalize(n - t0); }
     else if (r == 3u) { d = normalize(n + t1); }
     else if (r == 4u) { d = normalize(n - t1); }
-    // coarseFromT = 0: block steps from the very first iteration. The voxel
-    // read inside traceOpaque is unreachable on this path, which is why this
-    // pass costs 4 words per chunk of traffic instead of 16 KiB.
-    let s = traceOpaque(ro, d, maxSteps, 0.0, &occupancy, &materials);
+    // A VERTICAL FACE DOES NOT ASK THE GROUND. One of its four diagonals
+    // points 45 degrees DOWN and hits the ground it stands on within a
+    // metre, every time, on every step face of every hillside -- one sixth of
+    // the weight gone before the sky was consulted, and with the two
+    // horizontal rays stopped by any one-voxel rise inside reach the meadow's
+    // risers measured near zero and went black at night. The ground half of
+    // the hemisphere is the ambient's own ground-bounce term, not sky; so
+    // that ray is re-aimed steeply upward (63 degrees) and the fan samples
+    // the sky it exists to measure. Floors and ceilings keep the symmetric fan.
+    if (axis != 1u && d.y < -0.3) { d = normalize(n + up * 2.0); }
+    let s = traceOpaque(ro, d, maxSteps, fineT, &occupancy, &materials);
     var blocked = s.hit && (s.t * VOXEL_METERS) <= TUNE_OPENNESS_REACH;
     if (!blocked) {
       let e = ro + d * reachVox;
-      let up = traceOpaque(e, vec3f(0.0, 1.0, 0.0), upSteps, 0.0,
-                           &occupancy, &materials);
-      blocked = up.hit;
+      let u = traceOpaque(e, up, upSteps, 0.0, &occupancy, &materials);
+      blocked = u.hit;
     }
     let w = select(1.0, 2.0, r == 0u);
     if (!blocked) { openW += w; }

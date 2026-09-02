@@ -2437,6 +2437,7 @@ struct Tuning {
     // widening this band makes more liquids inherit water's look.
     float subClearLow = 0.62f, subClearHigh = 0.82f;
 
+    float opennessFloor = 0.3f;         // least ambient multiplier an enclosed face keeps
     // Faint directional glow toward the surface when submerged in a medium
     // too dense to see through. A near-opaque liquid gates off Snell's window,
     // and what that left was a featureless field of colour with no sense of up

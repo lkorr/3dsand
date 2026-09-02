@@ -3084,8 +3084,17 @@ fn opennessAt(cell : vec3<i32>, p : vec3f, n : vec3f,
 // identically and lose the sky/ground split that gives voxel terrain its shape.
 // Multiplying keeps the hue and the shape and makes enclosure actually darken,
 // which is the sentence the phase is judged by.
+// THE FLOOR. A measured 0 is "no sky visible", and multiplying the ambient by
+// 0 is pitch black -- which a dug tunnel two metres from its mouth and a step
+// face on a meadow (whose horizontal rays hit a one-voxel rise within reach)
+// both became on 2026-09-02. Real enclosed surfaces keep light from the
+// surfaces around them; until the bounce grid carries all of that, the
+// multiplier never drops below render.opennessFloor. The lift cap
+// (shadowLiftCap) deliberately reads the RAW openness, not this: direct sun
+// still cannot enter a cave.
 fn opennessScale(o : f32) -> f32 {
-  return select(1.0, mix(1.0, o, TUNE_OPENNESS_STRENGTH), o >= 0.0);
+  return select(1.0, mix(1.0, max(o, TUNE_OPENNESS_FLOOR), TUNE_OPENNESS_STRENGTH),
+                o >= 0.0);
 }
 
 // THE SHADOW LIFT CANNOT ENTER AN ENCLOSED SPACE. The penumbra law in

@@ -2815,7 +2815,11 @@ fn sunShadowAt(hp : vec3f, n : vec3f, px : vec2f, camDistFine : f32) -> f32 {
                       TUNE_SHADOW_STEPS, shadowCoarseFromT(),
                       &occupancy, &materials);
   rsAdd(RS_SHADOW, s.steps);
-  if (!s.hit) { return 1.0; }
+  // Out of steps underground is a far blocker, not daylight -- the same rule
+  // as shadow_resolve.wgsl, where the reason is written.
+  if (!s.hit) {
+    return select(1.0, TUNE_SHADOW_LIFT, s.steps > u32(TUNE_SHADOW_STEPS));
+  }
   // Distance from receiver to blocker, in metres. Near blockers (a voxel
   // resting on the ground) keep a hard, dark contact shadow; distant ones (a
   // tree canopy over a meadow) soften and lift, which is what stops every

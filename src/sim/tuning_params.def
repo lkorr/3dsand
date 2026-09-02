@@ -304,6 +304,7 @@ TP_I(render, opennessChunksPerFrame, TUNE_OPENNESS_CHUNKS, 256)
 // not recorded at all -- which is what the `noopenness` --render-budget arm
 // measures. 1 = full spatial attenuation.
 TP_F(render, opennessStrength, TUNE_OPENNESS_STRENGTH, 1.0f)
+TP_F(render, opennessFloor, TUNE_OPENNESS_FLOOR, 0.3f)
 // Bilinear over the four neighbouring blocks in the face plane. Nearest-only
 // tiles visibly on a flat wall at 40 cm blocks; this costs three more byte
 // reads on a hit that has already paid for a chunk lookup.

@@ -156,7 +156,25 @@ block openness showed the truth under the filter):
    answer, so `shadow-cache` still compares like with like.
 
 Hash unmoved (all render data); `openness`, `gi-bounce`, `shadow-cache`, `determinism` pass.
-Not yet re-judged by eye in the cave that reported it — that is the next look.
+
+**Second round, same day** (a dug tunnel alternating pitch black and full daylight in hard-
+edged slabs; meadow step faces black at night; daylight in sealed near-surface caves):
+
+4. **The writer measures from a real exposed cell.** The "blocker in the neighbouring block =
+   no opinion" early-out left every face of a rough tunnel unmeasured, and the fallback was
+   full daylight next to measured zeros. `openValueAt` now walks four columns of the face
+   inward from just outside the block, starts its rays at the first air-over-blocker cell it
+   finds, and marches FINE for the first two blocks before going coarse. Only a face with no
+   exposed column in those four is unmeasured.
+5. **A vertical face does not ask the ground.** One of its four diagonals pointed 45° down
+   into the ground it stood on, every time; re-aimed to 63° up. Floors and ceilings keep the
+   symmetric fan.
+6. **`render.opennessFloor` (0.3).** A measured 0 no longer multiplies the ambient to black.
+   The lift cap still reads the raw openness, so direct sun still cannot enter a cave.
+7. **Out of steps is not daylight.** With block termination off a shadow ray that exhausted
+   384 fine steps underground reported "lit". Exhaustion now takes the far blocker's lift
+   (capped by openness at the reader); `shadowCoarseDist` is back at 16 m so exhaustion is
+   rare outdoors.
 
 **Consumers beyond lighting** (not built here, but the buffer is theirs too): worldgen
 openness placement is a different thing (a generation-time closed form, W1-C); audio's "can I

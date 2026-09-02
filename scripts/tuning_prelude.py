@@ -219,6 +219,7 @@ SPEC = [
     ("render", "opennessReach", "TUNE_OPENNESS_REACH", "f", 12.0),
     ("render", "opennessChunksPerFrame", "TUNE_OPENNESS_CHUNKS", "i", 256),
     ("render", "opennessStrength", "TUNE_OPENNESS_STRENGTH", "f", 1.0),
+    ("render", "opennessFloor", "TUNE_OPENNESS_FLOOR", "f", 0.3),
     ("render", "opennessBilinear", "TUNE_OPENNESS_BILINEAR", "i", 1),
 
     # one-bounce indirect light (docs/PLAN_gi.md §3, W3 P1)

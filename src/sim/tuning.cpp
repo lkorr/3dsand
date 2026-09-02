@@ -2074,6 +2074,7 @@ bool LoadTuning(const std::string& path, Tuning& out) {
       out.warnings.push_back("render.gamma must be > 0; reset to 2.2");
       r.gamma = 2.2f;
     }
+    ReadF(*g, "opennessFloor", r.opennessFloor, out, at);
     // starSize divides in the star PSF, starDensity scales the direction grid,
     // and skyMieG at exactly +-1 makes the Henyey-Greenstein denominator
     // collapse.
@@ -2205,6 +2206,7 @@ bool LoadTuning(const std::string& path, Tuning& out) {
           "render.giFeedback must be below render.giDecay (multi-bounce would "
           "brighten without bound); clamped");
       r.giFeedback = std::max(0.0f, r.giDecay * 0.5f);
+    r.opennessFloor = std::clamp(r.opennessFloor, 0.0f, 1.0f);
     }
     r.giGatherBlocks = std::clamp(r.giGatherBlocks, 0, 8);
     // Multi-bounce gain (P2): each bounce is albedo x the gather's 0.28 form

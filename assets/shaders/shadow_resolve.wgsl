@@ -176,6 +176,16 @@ fn resolve(@builtin(global_invocation_id) gid : vec3<u32>) {
     let dM = s.t * VOXEL_METERS;
     v = clamp(smoothstep(TUNE_SHADOW_SOFT_NEAR, TUNE_SHADOW_SOFT_FAR, dM) *
               TUNE_SHADOW_LIFT, 0.0, 1.0);
+  } else if (s.steps > u32(TUNE_SHADOW_STEPS)) {
+    // RAN OUT OF STEPS, NOT OUT OF WORLD. Leaving the window is daylight (the
+    // sky is outside it); exhausting the budget underground is not, and
+    // "no hit = lit" put full sun on the floor of any cave deeper than the
+    // budget reaches along the sun (2026-09-02, with block termination off:
+    // 384 fine steps = 38 m). It is a blocker somewhere past the budget, so
+    // it takes the far blocker's lift, which the openness cap at the reader
+    // turns into nothing inside a cave and into the usual soft lift outdoors.
+    // Same rule in sunShadowAt (raymarch.wgsl); the gate compares them.
+    v = TUNE_SHADOW_LIFT;
   }
 
   // ---- P1 direct injection (docs/PLAN_gi.md §3) ----
