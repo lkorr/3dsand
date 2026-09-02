@@ -551,9 +551,9 @@
       "opacity": 200,
       "molten": "steam",
       "colors": [
-        "#a01818",
-        "#8c1414",
-        "#b42020"
+        "#5e0e0e",
+        "#3c0909",
+        "#741414"
       ],
       "stain": {
         "type": "blood",
