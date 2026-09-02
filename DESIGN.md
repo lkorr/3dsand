@@ -4171,8 +4171,128 @@ untouched: the pool, the model table and the draw list are bound to the
 microbody pipeline and to nothing else, and `--selftest` reports an unchanged
 world hash with a scale-2 critter walking through the scene.
 
-- Later: emissive materials feeding a cheap GI (light propagation volumes or
-  per-chunk flood lighting), volumetrics for gases.
+
+### 9.x The openness grid — the ambient's only spatial term (added 2026-09-02)
+
+Plan of record: **`docs/PLAN_gi.md`** §2 (phase P0 of indirect light). This is
+the binding summary.
+
+**The problem.** `ambientAt(n)` (raymarch.wgsl) and its raster twin
+`ambientAtP` (common.wgsl) are a hemisphere lerp on `n.y` between
+`TUNE_AMB_GROUND` and `TUNE_AMB_SKY`. Pure functions of the NORMAL: no term in
+either knows where the receiver is. So a cave floor was lit exactly as brightly
+as a meadow, a room exactly as brightly as the field outside its door, and
+`voxelAO`'s three in-plane taps cannot see a ceiling 3 m up. It was also the
+reason a large flat single-material face — a wall, a table top, bare dirt —
+rendered as a dead-uniform polygon with one hard edge and no gradient
+(`PLAN_gi.md` §0's look test).
+
+**The data.** `openness`: one BYTE per (chunk SLOT, 4³ sub-occupancy block,
+face) = `kNumChunks × 64 × 6` = 12 MiB, plus `opennessGen`, one word per slot
+(128 KiB). Byte index `((slot * blocks + block) * 6 + face)`, viewed through an
+`array<u32>`. The value is the unblocked fraction of that face's hemisphere
+within `render.opennessReach` metres.
+
+Six values per block, not one, because this world is full of one-voxel walls,
+floors and trunks and a scalar would average a wall's lit side with its dark
+one. A receiver reads only the face that faces it, keyed on the same
+`face = axis*2 + (sgn > 0)` the shadow cache uses.
+
+Render-only derived data, with exactly the standing of `shadowCache` and the
+far-field cascades: **never hashed, never saved, never read by the sim**, and
+`determinismHash` unmoved is P0's cheapest correctness proof.
+
+**The writer** is `sim_openness.wgsl`, two `pass_table.def` rows on the TICK
+table — `opennessDirty` (indirect over the tick's compacted dirty list,
+immediately after `occupancyDirty` so the mask it marches is the one that tick
+rewrote) and `opennessRefresh` (a flat `render.opennessChunksPerFrame` slots per
+tick, round robin from a cursor derived from `T.tick`). One workgroup per chunk,
+`OPEN_WORDS_PER_CHUNK` threads, one whole u32 per thread — four consecutive
+(block, face) pairs, computed and stored with a plain store, because 6 bytes per
+block does not divide a word and a thread per (block, face) would be a
+read-modify-write race.
+
+The march is **`traceOpaque` in coarse mode from t = 0**, i.e. the existing
+media-blind DDA stepping 4³ blocks over the blockers-class sub-occupancy mask.
+Not a new DDA: two block-steppers that must agree is the bug `common.wgsl`'s
+tracer block exists to prevent. Five directions per face (the normal, weighted
+double, plus four at 45° toward the tangents), so a face's value is
+`unblocked / 6`.
+
+**Why it is on the tick table and not the per-frame shadow table.** Its input is
+the tick's dirty list; recorded per frame it would re-walk the same chunks two
+or three times per tick for an identical answer, i.e. cost that scales with
+FRAMERATE. The compute → fragment hop still gets its barrier, from the global
+memory barrier every command buffer opens with (`vulkan_barrier_graph.md` §3.4).
+
+**Staleness has two clocks and both are one-sided toward the old look.**
+`opennessGen[slot]` holds a hash of the WORLD CHUNK COORD the bytes were
+computed for; the window is toroidal, so a slot is silently reused as it walks,
+and a reader whose stamp does not match falls back to the plain `n.y` lerp. And
+an edit only dirties the chunks it WRITES: a roof stamped 1.4 m above a floor
+does not re-walk the floor, which darkens when the rolling refresh reaches it
+(`kNumChunks / render.opennessChunksPerFrame` ticks). Dilating the dirty list
+instead is not available — a 12 m reach dilates to a 15³ chunk neighbourhood.
+
+**The readers.** `ambientAt`'s near-field terrain hit multiplies the hemisphere
+ambient by `opennessScale(opennessAt(...))`, alongside `ao` and never the sun
+(the sun has its own shadow ray). Far-cascade hits keep the plain lerp — the
+grid is keyed on residency slots and a cascade hit is outside the window by
+definition. Micro hits sample the cell BELOW with the +Y face, because a grass
+tuft is not a ray blocker and its own block has no entry. `microbody.wgsl` uses
+`opennessScaleAtBody`, which walks down at most six blocks to the ground the
+body stands on and takes that surface's value: a body is not in the voxel grid,
+so its own block would read "open sky" and a mob would glow in a cave. The
+sample is bilinear over the four blocks in the FACE PLANE; nearest-only tiles
+visibly at 40 cm blocks in the middle of a smooth wall.
+
+**A MULTIPLY, not `mix(ambGround, ambSky, openness)`.** The mix form makes a
+fully enclosed surface read as `TUNE_AMB_GROUND`, which is what a downward-facing
+surface already gets in open daylight — so a cave floor would come out exactly
+as bright as the underside of an outdoor overhang, and it throws away the `n.y`
+shape cue entirely. Multiplying keeps hue and shape, makes enclosure actually
+darken, and leaves a fully open face BIT-IDENTICAL to the pre-P0 image.
+
+**The resolution trap, and the rule that came out of it.** A face whose
+neighbouring block already holds a blocker skips the march — but it writes
+"no opinion" (255), NOT "fully enclosed" (0). At 40 cm blocks over 10 cm voxels
+the mask cannot tell "buried inside rock" from "there is a one-voxel terrace
+step in front of me", and this terrain is a staircase of one-voxel steps.
+Writing 0 painted every riser on every hillside hard black — measured on the
+tall-grass shot, mean luminance −12.5/255 with 43% of pixels moved, which is
+precisely the banding `wrapDiffuse` exists to remove. With 255 the same shot
+moves −1.2 with 17% of pixels, and nothing P0 exists to darken is lost: a cave
+floor, a room floor and the ground under an overhang all have AIR in the block
+in front of them, so they march. **The conservative direction for a lighting
+grid is the one that never darkens something wrongly.**
+
+**Knobs** (`render.*`): `opennessReach` (12 m), `opennessChunksPerFrame` (256
+slots/tick), `opennessStrength` (1.0 — and 0 is an EXACT off switch on both
+halves: it const-folds the reader and makes `C_OPENNESS` false so neither row is
+recorded), `opennessBilinear` (1).
+
+**Cost**, RTX 3060 Ti, 1080p, 2026-09-02. The compute pass, from `--perf`'s
+`openness` node: p50 0.015 ms idle, 0.008 ms flying (streaming does not light it
+up), 0.19–0.30 ms under explosions / water / a burning canopy. The per-hit read
+in the raymarch, from `--render-budget`'s `noopenness` arm at noon: 0.89 ms of a
+12.25 ms baseline (7.3%) — the reads dominate the pass by an order of magnitude,
+and `render.opennessBilinear = 0` is the lever if that ever needs to come down.
+
+**Verified by** `--selftest --gate openness`: the +Y face of the ground under a
+45×45 stone slab 1.4 m up reads 0.00 (bound 0.30) while the slab's own top face
+reads 1.00 (bound 0.75), and both slots' stamps match `sandvox::OpennessStamp`
+computed on the CPU — which is what keeps that hash and `common.wgsl`'s
+`opennessStamp` from drifting. Thresholds live in `tests/baseline.json`.
+
+**What P0 does not do.** There is no bounce: a sealed room goes to zero ambient
+and stays there, which is honest for a sky-visibility term and is what P1's
+one-bounce gather is for. Debris cubes and sprites (`debris.wgsl`) still shade
+with the plain lerp — they light per VERTEX, and reaching the grid from a vertex
+shader would mean widening `occupancy`'s stage mask for a per-cube ambient.
+
+- Later: P1 (direct injection + one-bounce gather), P2 (write-back), P3
+  (emissives, deleting `heatSpill`) — all in `docs/PLAN_gi.md`. Volumetrics for
+  gases.
 
 ## 9b. Wind (added 2026-08-25)
 

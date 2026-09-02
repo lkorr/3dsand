@@ -72,6 +72,12 @@
 // SLOT ORDER IS THE CONTRACT with perfnodes.h's PerfCounter::Rm* — slot 0 is
 // the sampled-pixel denominator, slots 1.. are RmPrimarySteps.. in order.
 @group(0) @binding(16) var<storage, read_write> renderStats : array<atomic<u32>>;
+// The openness (sky-visibility) grid — docs/PLAN_gi.md §2, written by
+// sim_openness.wgsl on the tick table, read here at the near-field terrain hit.
+// Read-only: this is the one derived buffer the renderer consumes and never
+// produces, unlike shadowCache above.
+@group(0) @binding(17) var<storage, read> openness    : array<u32>;
+@group(0) @binding(18) var<storage, read> opennessGen : array<u32>;
 const RS_PX : u32 = 0u;          // sampled pixels (denominator)
 const RS_PRIMARY : u32 = 1u;     // trace() steps from fs's camera ray
 const RS_MEDIA : u32 = 2u;       // cells that accumulated media tau in trace()
@@ -7073,12 +7079,48 @@ fn fs(in : VSOut) -> FSOut {
         lambert *= sunShadowAt(hitP, n, in.pos.xy, h.t);
       }
     }
+    let sun = keyLightColor() * lambert;
+    // ---- the openness (sky-visibility) grid, phase 0 of indirect light ----
+    // THE ONLY SPATIAL TERM IN THE AMBIENT. `ambientAt(n)` is a pure function
+    // of the normal, so before this line a cave floor was lit exactly as
+    // brightly as a meadow and a room exactly as brightly as the field outside
+    // its door. `opennessAt` reads the byte sim_openness.wgsl wrote for THIS
+    // cell's block and THIS face, filtered over the four blocks in the face
+    // plane, and `opennessScale` turns it into a multiplier that is exactly 1.0
+    // where the sky is fully visible — so open ground is bit-identical to what
+    // it was, and only enclosure darkens.
+    //
+    // It multiplies the AMBIENT only, alongside `ao` and for the same reason
+    // stated below: the sun has its own shadow ray, and scaling it here as well
+    // would double-darken. And it is the NEAR-FIELD hit only — a far-cascade
+    // hit (the `far.hit` branch above) keeps the plain lerp, because the grid
+    // is keyed on residency slots and a cascade hit is outside the window by
+    // definition.
+    //
+    // Unknown (a slot whose stamp does not match, i.e. never walked or streamed
+    // out from under us) returns 1.0, which is the pre-P0 look. The fallback is
+    // never a guess.
+    // A MICRO HIT SAMPLES THE GROUND IT GROWS FROM, not its own cell. A grass
+    // tuft is not a ray blocker (isRayBlocker excludes micro, deliberately —
+    // see the sub-occupancy block in common.wgsl), so its own block often has
+    // no measurement at all and would read 255, and its normal is a blade's
+    // model-space face rather than anything the grid has an entry for. The cell
+    // below is the dirt the tuft stands in, and its +Y face is what the tuft is
+    // actually lit by: measured, this is the difference between grass inside a
+    // roofed room staying meadow-bright and going dark with the floor.
+    var openCell = h.cell;
+    var openN = n;
+    if (isMicro) {
+      openCell = h.cell - vec3<i32>(0, 1, 0);
+      openN = vec3f(0.0, 1.0, 0.0);
+    }
+    let openAmb =
+        opennessScale(opennessAt(openCell, hp, openN, &openness, &opennessGen));
     // Direct sun + hemisphere ambient. Ambient is occluded by AO (it is sky
     // light, and AO measures how much sky the point can see); direct sun is
     // NOT — it already has its own shadow ray, and multiplying it by AO too
     // double-darkens contact regions into black smears.
-    let sun = keyLightColor() * lambert;
-    color = albedo * face * (ambientAt(n) * ao + sun);
+    color = albedo * face * (ambientAt(n) * ao * openAmb + sun);
 
     // ---- caustics on a submerged surface ----
     // The rippling web of focused sunlight on anything under water. This is

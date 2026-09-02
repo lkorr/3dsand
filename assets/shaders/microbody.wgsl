@@ -30,8 +30,17 @@
 //
 // DETERMINISM: render-only. These buffers are bound here and nowhere else.
 
+// The sub-chunk occupancy mask + the openness grid (docs/PLAN_gi.md §2). A
+// BODY is not in the voxel grid, so its own block has no openness entry; the
+// mask is what lets opennessScaleAtBody find the ground under the fragment and
+// take that surface's sky visibility. Without this a mob in a cave keeps full
+// daylight ambient while the cave around it goes dark, which is the failure
+// PLAN_gi.md §1 names by hand.
+@group(0) @binding(1) var<storage, read> occupancy : array<u32>;
 @group(0) @binding(2) var<storage, read> materials : array<Material>;
 @group(0) @binding(3) var<uniform> R : RenderParams;
+@group(0) @binding(17) var<storage, read> openness    : array<u32>;
+@group(0) @binding(18) var<storage, read> opennessGen : array<u32>;
 
 struct BodyXform {
   pos : vec3f, _p : f32,         // world voxels
@@ -301,7 +310,13 @@ fn fs(in : VSOut) -> FSOut {
   // and like the cube path's — one shared definition, in common.wgsl
   let fh = pcg(u32(c.x * 2917 + c.y * 131 + c.z * 7919) + in.slot * 977u);
   let emis = emberFlicker(f32(mat.emission) / 255.0, fh, R.time);
-  var col = litColor(albedo, n, worldPos, emis, R);
+  // The ambient's spatial term. One downward probe per FRAGMENT (at most six
+  // mask words), which is where a body's shading has to happen — the cube and
+  // sprite paths in debris.wgsl light per VERTEX and are deliberately left on
+  // the plain lerp (see the openness node in ARCH_NODES).
+  let openScale = opennessScaleAtBody(worldPos, &occupancy, &openness,
+                                      &opennessGen);
+  var col = litColorO(albedo, n, worldPos, emis, R, openScale);
 
   // ---- THE HIT FLASH -------------------------------------------------------
   // ADDITIVE, and BEFORE the tonemap, because litColor's output is linear HDR
