@@ -157,8 +157,10 @@ void Overlay::DrawHUD(const UIState& s) {
 
   // One bar: backdrop, fill, and an optional brighter "this is about to be
   // spent" segment eating right-to-left off the end of the fill.
+  // `cap` < max draws the span past it as CHARRED OFF — the burn cap
+  // (UIState::healthCap). -1 = no cap for this pool.
   auto bar = [&](float y, int32_t cur, int32_t max, int32_t pending,
-                 ImU32 fill, ImU32 spend, const char* label) {
+                 ImU32 fill, ImU32 spend, const char* label, int32_t cap) {
     const ImVec2 p(x, y), q(x + w, y + h);
     d->AddRectFilled(ImVec2(p.x - 2, p.y - 2), ImVec2(q.x + 2, q.y + 2),
                      IM_COL32(0, 0, 0, 110), 3.0f);          // outer scrim
@@ -169,6 +171,11 @@ void Overlay::DrawHUD(const UIState& s) {
       const float frac = (float)cur / (float)max;
       const float fx = p.x + w * frac;
       if (frac > 0) d->AddRectFilled(p, ImVec2(fx, q.y), fill, 2.0f);
+      if (cap >= 0 && cap < max) {
+        const float cx = p.x + w * ((float)cap / (float)max);
+        d->AddRectFilled(ImVec2(cx, p.y), q, IM_COL32(40, 30, 26, 235), 2.0f);
+        d->AddLine(ImVec2(cx, p.y), ImVec2(cx, q.y), IM_COL32(120, 60, 40, 255));
+      }
       // Pending cost: the part of the fill this pool is about to lose.
       if (pending > 0) {
         int32_t take = pending < cur ? pending : cur;
@@ -194,9 +201,9 @@ void Overlay::DrawHUD(const UIState& s) {
   const int32_t fromHealth = s.spellCost - fromMana;
 
   bar(yHealth, s.health, s.healthMax, fromHealth, IM_COL32(190, 55, 55, 235),
-      IM_COL32(255, 140, 60, 245), "hp");
+      IM_COL32(255, 140, 60, 245), "hp", s.healthCap);
   bar(yMana, s.mana, s.manaMax, fromMana, IM_COL32(70, 120, 230, 235),
-      IM_COL32(150, 200, 255, 245), "mp");
+      IM_COL32(150, 200, 255, 245), "mp", -1);
 
   // ---- body condition, sitting directly above the hp bar -------------------
   const float figureH = DrawBodyFigure(s, x, yHealth - gap);
@@ -1518,7 +1525,16 @@ void Overlay::Draw(UIState& s) {
             f("stain radius (vox)", &g.woundStainRadius, 0.0f, 8.0f, "%.2f");
             f("stain density", &g.woundStainDensity, 0.0f, 1.0f, "%.2f");
             f("bleed gain (per mob)", &g.bleedGain, 0.0f, 8.0f, "%.2f");
+            ImGui::TextDisabled("every drop is hp (Mob::DrainBlood)");
+            f("hp per blood voxel", &g.bleedHpPerVoxel, 0.0f, 5.0f, "%.2f");
+            ImGui::Checkbox("stumps never close", &g.stumpBleedsOpen);
             ImGui::TextDisabled("the rest of gore.* is in the browser tuner");
+          }
+          if (ImGui::CollapsingHeader("Burns cap health")) {
+            ImGui::TextDisabled("burnt fraction -> max hp, three knots");
+            f("burnt at mid knot", &g.burnCapMidFraction, 0.05f, 0.95f, "%.2f");
+            f("health at mid knot", &g.burnCapMidHealth, 0.0f, 1.0f, "%.2f");
+            f("burnt = death", &g.burnDeathFraction, 0.1f, 1.0f, "%.2f");
           }
           ImGui::EndChild();
           ImGui::EndTabItem();

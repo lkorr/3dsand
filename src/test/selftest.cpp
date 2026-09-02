@@ -224,6 +224,13 @@ const char* const kOrder[] = {
     // after even the wound gates. Each restores the id counter and regenerates
     // worldgen on the way out.
     "npc-strike", "npc-block", "npc-styles", "duel",
+    // ---- BLOOD IS HEALTH; BURNS CAP IT (Gore §F/§G, 2026-09-02) -----------
+    // Appended after the combat gates by the same rule again. Each spawns one
+    // creature inside the window and restores the id counter. bleed-out is
+    // CPU only (severs, lets the stump run, no tick submitted); burn-cap's
+    // last phase stands the creature in a real fire and regenerates the world
+    // on the way out, like mob-burn.
+    "bleed-out", "burn-cap",
     // LAST of the world-touching gates, and it must be: BuildVoxRegion moves
     // the residency window and resets the page table, which is the state every
     // other gate's fixture placement assumes. It restores both before it

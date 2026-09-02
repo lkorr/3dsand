@@ -733,6 +733,12 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadF(*g, "woundNeckRadius", e.woundNeckRadius, out, at);
     ReadF(*g, "woundNeckFraction", e.woundNeckFraction, out, at);
     ReadF(*g, "woundImpactSeverScale", e.woundImpactSeverScale, out, at);
+    // ---- F. blood is health / G. burns cap health (game/mob.h) -------------
+    ReadF(*g, "bleedHpPerVoxel", e.bleedHpPerVoxel, out, at);
+    ReadB(*g, "stumpBleedsOpen", e.stumpBleedsOpen, out, at);
+    ReadF(*g, "burnCapMidFraction", e.burnCapMidFraction, out, at);
+    ReadF(*g, "burnCapMidHealth", e.burnCapMidHealth, out, at);
+    ReadF(*g, "burnDeathFraction", e.burnDeathFraction, out, at);
     // BOUNDS, not taste. Each of these is a value that turns the wound model
     // into something other than a wound model at the ends of its range, and
     // the tuner offers a text box as well as a slider.
@@ -762,6 +768,16 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     e.woundNeckRadius = std::clamp(e.woundNeckRadius, 0.0f, 16.0f);
     e.woundNeckFraction = std::clamp(e.woundNeckFraction, 0.0f, 0.95f);
     e.woundImpactSeverScale = std::max(e.woundImpactSeverScale, 0.0f);
+    // A negative rate would make bleeding HEAL, which is not a tuning
+    // mistake anyone means; zero is a legitimate "blood is cosmetic again".
+    e.bleedHpPerVoxel = std::max(e.bleedHpPerVoxel, 0.0f);
+    // The burn curve must stay a curve: the mid knot strictly inside (0,
+    // death), the death knot at most 1 (a body cannot be more than all
+    // burnt), and the mid health inside [0, 1] so the cap is monotone.
+    e.burnDeathFraction = std::clamp(e.burnDeathFraction, 0.05f, 1.0f);
+    e.burnCapMidFraction =
+        std::clamp(e.burnCapMidFraction, 0.01f, e.burnDeathFraction - 0.01f);
+    e.burnCapMidHealth = std::clamp(e.burnCapMidHealth, 0.0f, 1.0f);
     // A negative or zero gain would silently disable bleeding rather than
     // reading as a tuning mistake, so floor it just above zero.
     if (e.bleedGain < 0.0f) {
@@ -3026,6 +3042,11 @@ bool SaveCombatTuning(const std::string& path, const Tuning& t,
     put("woundStainRadius", g.woundStainRadius);
     put("woundStainDensity", g.woundStainDensity);
     put("bleedGain", g.bleedGain);
+    put("bleedHpPerVoxel", g.bleedHpPerVoxel);
+    putB("stumpBleedsOpen", g.stumpBleedsOpen);
+    put("burnCapMidFraction", g.burnCapMidFraction);
+    put("burnCapMidHealth", g.burnCapMidHealth);
+    put("burnDeathFraction", g.burnDeathFraction);
   }
 
   if (!missing.empty()) {

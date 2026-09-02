@@ -2301,6 +2301,119 @@ touch a creature with a sword, lose a limb, anywhere, every time.
 Gated by `wound-chip` / `wound-accumulate` / `wound-heft` / `wound-bleed`, with
 the hit-count BAND (not an exact count) in `tests/baseline.json`.
 
+### Blood is health, and burns cap it (2026-09-02; `Mob::DrainBlood`, `Mob::RecountBurn`, `sim/tuning.h` §F/§G)
+
+The wound model above made a cut a *shape*. Two things were still pictures:
+the blood that followed it, and the char a fire left behind.
+
+**Every drop of blood is hp.** A wound carried a voxel budget and dripped it
+out, and hp moved only at the moment of the blow — a creature could lose an arm,
+stand in a puddle of its own blood for a minute, and be exactly as alive as the
+tick after the cut. Now there is ONE door out of a body for blood,
+`Mob::DrainBlood`, and every emitter goes through it: the drip (charged by the
+sphere volume of the clump it painted, the same figure the budget is debited
+by), the drip's spray, the arterial gout, and the whole voxels a sever throws.
+A whole voxel costs `gore.bleedHpPerVoxel`; a micro droplet costs
+`1/microScale³` of that, because that is the fraction of a voxel it is. The cost
+is spread across the live *authored* limbs in proportion to what each still has
+(the same spread `PlayerAvatar::SpendHealth` uses for an overcast, and for the
+same reason: draining the first limb to zero picks an arbitrary limb to ruin),
+so every limb reaches zero on the same tick and the creature dies through the
+ordinary `Die()` — systemic, the corpse keeps its limbs. Held items and worn
+shells have hp of their own and are not life, so `Mob::TotalHp` excludes them
+and "total reaches zero" cannot mean "the sword broke". The charge lands where
+the op is EMITTED, not where the CA lands it: a refused op cost nothing because
+no blood left the body, and the CA never has to see the blood for hp to move.
+
+**An amputation does not close.** `severStumpBudget` was the whole of what a
+lost limb bled, and it ran dry in seconds. With `gore.stumpBleedsOpen` the
+parent limb's wound (`MobLimb::stumpOpen`, set by `Sever()`) is topped back up
+to ONE clump every tick for as long as the creature lives, so a lost limb is a
+clock: the drip's own cadence and op budget bound the rate, `DrainBlood` turns
+it into hp, and death ends it. Bounded under rule 2 by the creature's own hp —
+at the defaults (30 Hz, a drip every 4 ticks, clump radius 0, 0.6 hp/voxel) a
+body bleeds out at 4.5 hp/s from one stump. Topped up to a clump rather than to
+the wound cap so a stump that cannot drip this tick (out of ops) does not bank
+blood for later; cleared by `DetachLimb` so a stump that is itself cut off does
+not drip forever at its rest-pose anchor from a body it is no longer on. Fire
+still cauterises: a limb that burns through arms no stump (`inBurnFlush_`).
+
+**Burns cap the health a body can hold.** Burning already charged hp for the
+voxels it removed, but a body that is COOKED rather than consumed lost nothing
+by that account — `flesh_cooked` and `flesh_charred` are still voxels, so a
+creature 60% charred and 100% present read as healthy. `Mob::RecountBurn` takes
+the burnt fraction of the body on the authoritative lattice as BURNT SURFACE
+OVER SURFACE — the body-surface-area grading burns get in the clinic: every
+burnt voxel at any depth (cooked/alight = ½, charred/ash/cinder = 1, a voxel
+fire removed = 1 via `BodyBurnState::burntAway`, which unlike `removed` is
+never reset) against the body's burnable voxels that had an open face when it
+was whole (`MobLimb::surfaceAtSpawn`, taken lazily on the first recount;
+burnable = `tag:flammable` or a burn stage, `MobSystem::BurnableOf`, so bone
+never counts; garments and items are not the body). A surface and not a
+volume for a mechanical reason: char is inert and shields what is under it.
+Measured, a human stood in a fire column for 1,200 ticks converged at 30% of
+its burnable VOLUME — 5,900 raw skin and 7,000 raw flesh voxels under a black
+shell, 29.3% at tick 400 and 30.1% at 1,200 — and would have stood there
+forever under any volume knot. Against its surface the same body reads burnt
+through, which is what it looks like. Then
+`Mob::ApplyBurnCap` clamps every live authored limb to `authored hp × cap`,
+where the cap is one piecewise-linear curve through three authored knots:
+intact → full, `burnCapMidFraction` → `burnCapMidHealth` (40% burnt → a third
+of full), `burnDeathFraction` → zero (70% burnt is death, whatever the hp was).
+hp is only ever clamped DOWN, nothing heals past the cap, and the HUD draws
+`[HealthCap, HealthMax]` as charred off (`UIState::healthCap`) so a burnt body
+reads as a permanently short bar rather than one that quietly rescaled. The
+recount is dirtied by the burn pass and by every carve and taken at most every
+`kBurnRecountTicks` (8) — a creature that is not changing costs nothing, one
+that is burning pays one pass over its body per cadence, never one per burn
+step (rule 2). The material list is `Mob::BurnStageOfMaterialName`, and
+main.cpp's per-limb HUD readout resolves through it, so the two cannot disagree
+about ash. Derived, not saved: a loaded avatar keeps its low hp but starts at
+cap 1 until it burns again.
+
+**The burn pass starved the legs.** Found by the gate's census, not by
+looking: `MobSystem::BurnLimbs` spends one shared front budget
+(`kBurnFrontPerTick`, 6,000 cells) per candidate cell, limb by limb in def
+order, and a torso standing in a fire offers thousands of candidates every
+tick. Measured on a human engulfed for 1,200 ticks: hips and torso burnt to
+nothing, the lower legs and feet kept 636 of 668 and 368 of 382 surface voxels
+RAW, and the right arm (later in the def) sat at 552 of 596 raw against the
+left arm's 241. No body could reach the death knot that way, and in play it
+read as "fire does not burn legs". `Mob::BurnTick` now starts from
+`tick mod limbs` and `BurnLimbs` from `tick mod mobs`, so each limb and each
+creature takes the head of the budget in turn — deterministic, since the tick
+is the key. The budget itself is unchanged.
+
+**A corpse says what killed it.** Four mechanisms now end in the same ragdoll
+(a vital limb destroyed, a vital limb burnt or dissolved away, blood loss, the
+burn cap), and a gate that found one could only guess. `Mob::DeathCause()` is
+a static string set at every `Die()` call site that knows, mirrored into
+`MobSystem` so it survives the husk sweep; `armor-react`'s acid bath prints it
+beside the tick, and it is what showed that bath's death was the hips' hp
+running out under the ordinary carve charge with the burn fraction at 0.0%.
+
+**Amputations, retuned.** The impact-sever exception was reachable by an
+ordinary swing: `severImpactSpeed` 9 on a lower leg × the scale of 4 was 36
+voxels/s, and `melee.fullSpeedMps` 3.4 is 34 — a committed cut at a shin severed
+on contact through the rule the structural model was supposed to have replaced.
+`woundImpactSeverScale` 4 → 8 puts the bar at 7.2 m/s and above; `woundSeverFraction`
+0.28 → 0.40 (the parted piece must be nearer half the limb) and
+`woundNeckFraction` 0.28 → 0.20 (the joint must be more thoroughly gone). All
+three are `tuning.json` edits and the band in `wound-accumulate` is where they
+are felt.
+
+Gated by `bleed-out` (the identity hp lost = blood emitted × rate over a whole
+bleed, the amputation killing within the time the rate predicts, and the SAME
+fixture surviving with the stump allowed to close — the differential that says
+the top-up is the mechanism) and `burn-cap` (the curve, the cap biting on a lit
+limb with every hp under it, and a body stood in a real fire dying with its
+fraction at the death knot rather than of a vital limb burning through).
+`bleed-out` is CPU-only (no tick submitted: the drain is charged where the op
+is emitted, so the CA never has to see the blood). `burn-cap`'s last phase has
+to be a world fire — direct ignition only lights surface voxels, and once the
+surface has charred the layer under it never sees three hot faces; measured,
+1500 ticks of forced ignition on every limb plateaued at 14% burnt.
+
 ### What is under the skin (2026-09-02; `assets/editor/anatomy.js`, sidecar `anatomy`, `scripts/anatomize_mob.mjs`)
 
 Every limb was skin all the way through. A cut face showed skin, a burn-through

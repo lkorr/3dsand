@@ -872,6 +872,63 @@ struct Tuning {
     // nothing below ever gets a chance to run. Scaling here rather than
     // rewriting every mob sidecar keeps it one knob and one rebuild-free edit.
     float woundImpactSeverScale = 4.0f;
+
+    // ========================================================================
+    // F. BLOOD IS HEALTH — every drop that leaves a body is hp leaving it
+    // ========================================================================
+    // Until 2026-09-02 blood was a VISUAL: a wound carried a voxel budget and
+    // dripped it out, and hp only ever moved at the moment of the blow. A
+    // creature could lose an arm, stand in a puddle of its own blood for a
+    // minute and be exactly as alive as the tick after the cut. Now the drip
+    // IS the damage (Mob::DrainBlood): every whole blood voxel a wound puts
+    // into the grid costs this much hp, spread across the creature's live
+    // limbs in proportion to what each still has, and a micro droplet costs
+    // 1/microScale^3 of it (a droplet is that fraction of a voxel). When the
+    // total reaches zero the creature dies of blood loss, through the same
+    // Die() a blow to the heart reaches.
+    //
+    // ONE knob, and it is a RATE per voxel rather than a time-to-death, so the
+    // same blood costs the same life on a critter and on a human: the small
+    // creature dies of less blood because it has less. Time to bleed out from
+    // a single open stump at the defaults (30 Hz, bleedDripTicks 4, clump
+    // radius 0) is hpTotal / (7.5 drips/s x 1 voxel x this).
+    float bleedHpPerVoxel = 0.6f;
+    // AN AMPUTATION DOES NOT CLOSE. The stump's authored severStumpBudget was
+    // the whole of what a lost limb bled, and it ran dry in seconds. With this
+    // on, the stump wound is topped back up to one clump every tick for as
+    // long as the creature lives, so a lost limb is a clock: the drip above
+    // takes hp at a bounded rate until nothing is left. Rule 2 still holds
+    // because the process is bounded by the creature's own hp — the drip ends
+    // at death, and a corpse does not bleed. Off restores the finite stump.
+    bool stumpBleedsOpen = true;
+
+    // ========================================================================
+    // G. BURNS CAP HEALTH — the more of the body is burnt, the less it can hold
+    // ========================================================================
+    // Burning already charges hp for the voxels it removes, but a body that is
+    // COOKED rather than consumed lost nothing by that account: flesh_cooked
+    // and flesh_charred are still voxels, so a creature 60% charred and 100%
+    // present read as healthy. Now the burnt FRACTION of the body sets a CAP
+    // on every limb's hp (Mob::ApplyBurnCap), authored as one piecewise-linear
+    // curve through three points: intact -> full; `burnCapMidFraction` burnt
+    // -> `burnCapMidHealth` of full; `burnDeathFraction` burnt -> zero, which
+    // is death. hp is clamped DOWN to the cap and nothing may ever heal past
+    // it, so a badly burnt body is a permanently short bar until it dies.
+    //
+    // The fraction is BURNT SURFACE OVER SURFACE, the body-surface-area grading
+    // burns get in the clinic: a cooked / burning voxel is half burnt, a
+    // charred / ash voxel is fully burnt, a voxel fire removed is fully burnt
+    // (BodyBurnState::burntAway), summed at any depth, against the body's
+    // burnable voxels that had an open face when it was whole
+    // (MobLimb::surfaceAtSpawn; burnable = tag:flammable or a burn stage, so
+    // bone never counts). A surface and not a volume because char is inert
+    // and shields what is under it — a human stood in a fire converged at 30%
+    // of its burnable volume with most of its skin raw under a black shell,
+    // and would have stood there forever. Garments and held items are not the
+    // body and are not counted (Mob::IsWornSlot).
+    float burnCapMidFraction = 0.40f;
+    float burnCapMidHealth = 0.333f;
+    float burnDeathFraction = 0.70f;
   } gore;
 
   // ---- melee: the stroke driver's feel ---------------------------------------

@@ -514,20 +514,17 @@ struct BurnMats {
 
 BurnMats ResolveBurnMats(const std::vector<MaterialDef>& mats) {
   BurnMats bm;
-  auto find = [&](const char* name, std::vector<uint32_t>& out) {
-    for (size_t i = 0; i < mats.size(); i++)
-      if (mats[i].name == name) {
-        out.push_back((uint32_t)i);
-        return;
-      }
-  };
-  // Named, never hardcoded by id (CLAUDE.md conventions). A name that is not
-  // in this content simply contributes nothing — the readout degrades to "not
-  // charred" rather than reporting a wrong material's count.
-  for (const char* n : {"flesh_cooked", "flesh_burning", "cloth_burning"})
-    find(n, bm.cooked);
-  for (const char* n : {"flesh_charred", "ash", "cloth_charred"})
-    find(n, bm.charred);
+  // Named, never hardcoded by id (CLAUDE.md conventions), and the NAME LIST
+  // lives in one place: Mob::BurnStageOfMaterialName is what the burn cap
+  // (sim/tuning.h Gore §G) counts with, so the HUD's per-limb readout and the
+  // creature's own health cap cannot disagree about what "burnt" is. A name
+  // not in this content simply contributes nothing — the readout degrades to
+  // "not charred" rather than reporting a wrong material's count.
+  for (size_t i = 0; i < mats.size(); i++) {
+    const uint8_t stage = Mob::BurnStageOfMaterialName(mats[i].name);
+    if (stage == 1) bm.cooked.push_back((uint32_t)i);
+    if (stage == 2) bm.charred.push_back((uint32_t)i);
+  }
   return bm;
 }
 
@@ -7104,6 +7101,7 @@ int main(int argc, char** argv) {
       ui.manaMax = caster.mana.EffectiveMax();
       ui.health = playerHealth.Get();
       ui.healthMax = avatar.HealthMax();
+      ui.healthCap = avatar.HealthCap();
       ui.playerAlive = avatar.IsAlive();
       // Body-condition readout: one figure slot per limb, keyed by the limb's
       // authored TAG and side suffix rather than by part name, so any humanoid

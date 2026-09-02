@@ -45,7 +45,15 @@ svlock_cleanup_stale() {
   local dir=$1
   if [ -d "$dir" ] && [ -f "$dir/pid" ]; then
     local ts now age
-    ts=$(cat "$dir/ts" 2>/dev/null || echo 0)
+    # A MISSING OR EMPTY ts IS NOT "AGE 1.7 BILLION SECONDS". It used to be
+    # read as 0, so a waiter that caught the holder between `mkdir` and its
+    # first `date > ts` (or the heartbeat mid-rewrite) declared a fresh lock
+    # stale, removed it, and build.sh's pre-link taskkill then killed the
+    # holder's run — three full acceptance suites died at exactly 10 min on
+    # 2026-09-02 that way, always with "age 1788378854s" in the killer's log.
+    # Fall back to the lock directory's own mtime, which exists from mkdir on.
+    ts=$(cat "$dir/ts" 2>/dev/null || true)
+    [ -n "$ts" ] || ts=$(stat -c %Y "$dir" 2>/dev/null || date +%s)
     now=$(date +%s)
     age=$(( now - ts ))
     if [ "$age" -gt "$SVLOCK_STALE_SEC" ]; then
@@ -62,16 +70,20 @@ svlock_acquire() {
   while true; do
     svlock_cleanup_stale "$dir"
     if mkdir "$dir" 2>/dev/null; then
-      echo $$ > "$dir/pid"
-      echo "$who" > "$dir/who"
+      # ts BEFORE pid: the stale check only looks at directories with a pid
+      # file, so the timestamp must already be there when it does.
       date +%s > "$dir/ts"
+      echo "$who" > "$dir/who"
+      echo $$ > "$dir/pid"
       trap svlock_release_all EXIT
       # Refresh only while the pid file is still ours, so a stolen lock is
-      # never kept alive by the loser.
+      # never kept alive by the loser. Written to a temp name and renamed so
+      # a reader never sees the truncated file `>` leaves mid-write.
       ( while true; do
           sleep 60
           [ "$(cat "$dir/pid" 2>/dev/null)" = "$$" ] || exit 0
-          date +%s > "$dir/ts" 2>/dev/null || exit 0
+          date +%s > "$dir/ts.new" 2>/dev/null || exit 0
+          mv -f "$dir/ts.new" "$dir/ts" 2>/dev/null || exit 0
         done ) &
       SVLOCK_HB[$dir]=$!
       return 0

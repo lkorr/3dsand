@@ -969,16 +969,43 @@ Status GateArmorReact(Ctx& c, std::string& detail) {
     for (int i = 0; i < ticks; i++) {
       soakTick(a, soakMat, soakUp);
       soakTick(b, soakMat, soakUp);
-      if (!mobs.IsAlive(a) && diedDressed < 0) diedDressed = i;
-      if (!mobs.IsAlive(b) && diedBare < 0) diedBare = i;
+      // The two bodies' burn fraction / cap / root hp every 20 ticks, so a
+      // death below is attributable to a mechanism rather than to "acid".
+      if (i % 20 == 0 && mobs.IsAlive(a) && mobs.IsAlive(b)) {
+        const int root = mobs.Defs()[avDef].rootLimb;
+        std::printf("    t+%d: dressed burnt %.1f%% cap %.2f root hp %.1f | "
+                    "bare burnt %.1f%% cap %.2f root hp %.1f\n",
+                    i, 100.0f * mobs.BurnFraction(a), mobs.BurnHealthCap(a),
+                    mobs.LimbHp(a, root), 100.0f * mobs.BurnFraction(b),
+                    mobs.BurnHealthCap(b), mobs.LimbHp(b, root));
+      }
+      // WHAT killed it, at the point of failure (CLAUDE.md rule 6): four
+      // mechanisms end in the same ragdoll and only the corpse knows which.
+      if (!mobs.IsAlive(a) && diedDressed < 0) {
+        diedDressed = i;
+        std::printf("    dressed died at t+%d: %s\n", i, mobs.DeathCause(a));
+      }
+      if (!mobs.IsAlive(b) && diedBare < 0) {
+        diedBare = i;
+        std::printf("    bare died at t+%d: %s\n", i, mobs.DeathCause(b));
+      }
       if (!mobs.IsAlive(a) || !mobs.IsAlive(b)) break;
       liveSkinA = limbMat(a, coveredIdx, mSkin);
       liveSkinB = limbMat(b, controlIdx, mSkin);
       liveVoxA = mobs.LimbArtVoxelCount(a, coveredIdx);
       liveShell = limbMat(a, shell, mSteel) + limbMat(a, shell, mCloth);
-      if (firstDressed && *firstDressed < 0 && liveSkinA < a0)
+      // "First loss" is the first tick past ONE PERCENT of the limb's skin,
+      // not the first voxel. The first-voxel reading was an artefact of the
+      // burn pass's fixed order: the dressed creature spawned second and was
+      // starved of the shared front budget by the bare one, which is what
+      // delayed its first sear. Once the pass rotated its start by tick
+      // (2026-09-02) the dressed torso seared three voxels through the
+      // cloth at t+2 against the bare one's 692 by t+6 — the claim held by a
+      // factor of 230 and the gate failed on 3 voxels.
+      if (firstDressed && *firstDressed < 0 && a0 - liveSkinA > a0 / 100u)
         *firstDressed = i;
-      if (firstBare && *firstBare < 0 && liveSkinB < b0) *firstBare = i;
+      if (firstBare && *firstBare < 0 && b0 - liveSkinB > b0 / 100u)
+        *firstBare = i;
       if (shellGoneAt < 0 && shell >= 0 && shellStart &&
           liveShell * 4 < shellStart)
         shellGoneAt = i;

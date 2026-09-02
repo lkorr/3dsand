@@ -363,6 +363,11 @@ struct UIState {
   // Authored ceiling for the HUD bar's denominator. Health does NOT regenerate,
   // so this is only ever a high-water mark the player moves away from.
   int32_t healthMax = 0;
+  // The most health the body can currently HOLD: healthMax x the burn cap
+  // (PlayerAvatar::HealthCap). The bar draws [healthCap, healthMax] as charred
+  // off, so a burnt body reads as a permanently short bar rather than as a
+  // bar that quietly rescaled itself.
+  int32_t healthCap = 0;
   bool playerAlive = true;
 
   // ---- body condition, drawn as a stick figure above the health bar -------

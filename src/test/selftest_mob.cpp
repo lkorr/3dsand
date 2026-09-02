@@ -813,6 +813,20 @@ bool mobOk = false;
         // run BACKWARDS as limbs come off: intact -1, one leg lost -> 3
         // (crawl.oneLeg), both legs -> 2 (crawl.legless), plus an arm -> 1
         // (crawl.oneArm), no arms -> 0 (prone, speedScale 0).
+        // BLOOD IS COSMETIC FOR THIS BLOCK. Since Gore §F (2026-09-02) an
+        // amputation opens a stump that drains hp until death, and a dummy
+        // with four stumps bleeds out inside the 300-odd ticks below — which
+        // turns "prone and still" into a ragdoll drifting 200 voxels and
+        // reads as a locomotion failure. The claim here is which loco state
+        // a maimed rig selects, not whether it survives its wounds
+        // (`bleed-out` owns that), so the rate is parked at zero and put
+        // back afterwards.
+        const Tuning savedGore = CurrentTuning();
+        {
+          Tuning tt = savedGore;
+          tt.gore.bleedHpPerVoxel = 0.0f;
+          SetCurrentTuning(tt);
+        }
         uint64_t did = mobs.Spawn(dummyDef, {137, h + 1, 139});
         for (int i = 0; i < 10; i++) mobTick({});
         int s0 = mobs.LocoState(did);
@@ -897,6 +911,7 @@ bool mobOk = false;
             dAlong2, dPath2, pPath, c1, c2, critClip ? 1 : 0, swingTicks,
             cAlong2, cPath2);
         mobOk = mobOk && stateOk;
+        SetCurrentTuning(savedGore);
       }
 
       debris.Reset();
@@ -3484,15 +3499,60 @@ Status GateMobBurn(Ctx& c, std::string& detail) {
       return avCensus(mCloth) + avCensus(mUnder) + avCensus(mSkin) +
              avCensus(mFlesh) + avCensus(mMuscle);
     };
+    // THE STAGE CENSUS IS TAKEN ON THE LAST LIVE TICK, not after the blaze.
+    // Since the burn cap (sim/tuning.h Gore §G, 2026-09-02) a body whose
+    // surface is 70% burnt dies of it, and this bonfire gets a human there
+    // inside its 90 ticks. Die() clears the skin lattice, so a census taken
+    // on the corpse falls through to the collider — which was never burnt —
+    // and reported "0.0% charred of 2528 flesh" against a body that had in
+    // fact charred through. What is being asserted is how far the chain got
+    // while there was a body to get it; that is a live reading.
+    struct StageCensus {
+      uint32_t skin = 0, flesh = 0, muscle = 0, cooked = 0, burning = 0,
+               charred = 0, cinder = 0, under = 0, underBurn = 0, underChar = 0;
+    } live;
+    auto takeCensus = [&]() {
+      live.skin = avCensus(mSkin);
+      live.flesh = avCensus(mFlesh);
+      live.muscle = avCensus(mMuscle);
+      live.cooked = avCensus(mCooked);
+      live.burning = avCensus(mBurning);
+      live.charred = avCensus(mCharred);
+      live.cinder = avCensus(mCinder);
+      live.under = avCensus(mUnder);
+      live.underBurn = avCensus(mUnderBurn);
+      live.underChar = avCensus(mUnderChar);
+    };
+    int avDeathTick = -1;
     if (spawned) {
+      // THE DEATH KNOT IS PARKED AT 100% FOR THIS FIXTURE. The claim here is
+      // how far the burn chain gets across a body over 90 ticks in a
+      // bonfire; with the knot at its shipped 70% the human died at t+50
+      // and the chain was measured over half the exposure it was written
+      // against (14.9% past the sear, against a floor of 15% set between
+      // 9.8% and 23.7% at 90 ticks). Death by burns has its own gate
+      // (`burn-cap`); this one wants the body to stay to be counted. The cap
+      // itself still applies, so hp is still clamped under it here.
+      const Tuning savedT = CurrentTuning();
+      {
+        Tuning tt = savedT;
+        tt.gore.burnDeathFraction = 1.0f;
+        SetCurrentTuning(tt);
+      }
       for (int i = 0; i < 10; i++) avTick(0);
       idleFront = avBurning();            // an idle player must cost nothing
       mobs.ResetBurnStats();  // count only what the BLAZE below asked of it
       cloth0 = avCensus(mCloth) + avCensus(mUnder);
       body0 = avBody();
       uint32_t lastBody = body0;
+      takeCensus();
       for (int i = 0; i < 90 && avatar.Spawned() && avatar.IsAlive(); i++) {
         avTick(mFire);
+        if (!avatar.IsAlive()) {
+          avDeathTick = i;
+          break;
+        }
+        takeCensus();
         const uint32_t bd = avBody();
         if (bd) lastBody = bd;
         peakAlight = std::max(peakAlight, avCensus(mClothBurn) +
@@ -3505,6 +3565,7 @@ Status GateMobBurn(Ctx& c, std::string& detail) {
                                           avCensus(mCinder));
       }
       bodyLost = body0 ? (float)(body0 - lastBody) / (float)body0 : 0.0f;
+      SetCurrentTuning(savedT);
     }
     const bool hOk = spawned && idleFront == 0 && body0 > 0 &&
                      bodyLost > 0.05f && peakAlight > 0 && peakChar > 0 &&
@@ -3534,11 +3595,15 @@ Status GateMobBurn(Ctx& c, std::string& detail) {
     // the fire is what is missing (MobSystem::BurnStats).
     if (spawned) {
       const MobSystem::BurnStats& bs = mobs.Burn();
-      std::printf("    stages: skin %u cooked %u burning %u charred %u "
-                  "cinder %u | linen %u burning %u charred %u\n",
-                  avCensus(mSkin), avCensus(mCooked), avCensus(mBurning),
-                  avCensus(mCharred), avCensus(mCinder), avCensus(mUnder),
-                  avCensus(mUnderBurn), avCensus(mUnderChar));
+      std::printf("    stages (last live tick%s): skin %u cooked %u burning "
+                  "%u charred %u cinder %u | linen %u burning %u charred %u\n",
+                  avDeathTick >= 0
+                      ? (", died of the burns at t+" +
+                         std::to_string(avDeathTick))
+                            .c_str()
+                      : "",
+                  live.skin, live.cooked, live.burning, live.charred,
+                  live.cinder, live.under, live.underBurn, live.underChar);
       // ---- FLESH REACHES CHAR, and this is the line that says so ----------
       //
       // The claim above is "the player is wired into the burn pass", and it
@@ -3551,11 +3616,10 @@ Status GateMobBurn(Ctx& c, std::string& detail) {
       // all on the convex edges of the limbs; after, 23.7%, spread over the
       // surface. The floor is set between those two, so this fails if the ramp
       // ever stops reaching a body's flat faces again.
-      const uint32_t flesh = avCensus(mSkin) + avCensus(mFlesh) +
-                             avCensus(mMuscle) + avCensus(mCooked) +
-                             avCensus(mBurning) + avCensus(mCharred) +
-                             avCensus(mCinder);
-      const uint32_t past = avCensus(mCharred) + avCensus(mCinder);
+      const uint32_t flesh = live.skin + live.flesh + live.muscle +
+                             live.cooked + live.burning + live.charred +
+                             live.cinder;
+      const uint32_t past = live.charred + live.cinder;
       const double charPct = flesh ? 100.0 * (double)past / (double)flesh : 0.0;
       const double floorPct = BaselineNumber("mobBurnFleshCharPctMin", 15.0);
       const bool charOk = charPct >= floorPct;

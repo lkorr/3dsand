@@ -545,6 +545,394 @@ Status GateWoundBleed(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---------------------------------------------------------------------------
+// bleed-out: every drop of blood is hp, and an amputation is fatal (Gore §F)
+// ---------------------------------------------------------------------------
+//
+// Two claims, and the second is the one the owner asked for in as many words:
+//   * IDENTITY. Across the whole life of a wound, hp lost equals blood emitted
+//     x gore.bleedHpPerVoxel, counting whole voxels at 1 and micro droplets at
+//     1/microScale^3. Not "hp goes down while bleeding" — that would pass on a
+//     drain that ignored the blood and ran on a timer.
+//   * AN OPEN STUMP KILLS. Sever a limb, tick without touching the wound, and
+//     the creature must die of it within the time the rate predicts; with
+//     gore.stumpBleedsOpen off, the SAME fixture must survive the same window
+//     and go dry. That differential is what proves the top-up is the
+//     mechanism and not a coincidence of the stump budget.
+//
+// CPU ONLY: PreTick / physics / PostStep, no tick submitted. The drain is
+// charged where the op is EMITTED, so the CA never has to see the blood for
+// hp to move, and a gate that ran the sim for two thousand ticks to watch a
+// number fall would be paying for a claim it is not making.
+Status GateBleedOut(Ctx& c, std::string& detail) {
+  MobSystem& mobs = c.mobs;
+  IdCounterScope idScope(mobs);
+  PrepareWorld(c);
+  const Target t = ChooseTarget(mobs, FixtureSite(c.world, 290));
+  if (!t.valid()) {
+    detail = "no loaded mob def has a severable non-vital limb that bleeds";
+    return Status::Fail;
+  }
+  const Tuning saved = CurrentTuning();
+  const auto& gore = saved.gore;
+  const uint32_t bleedMat = mobs.Defs()[t.defIndex].bleedMat;
+  const int ms = std::max(2, gore.microScale);
+  const double dropletVox = 1.0 / (double)(ms * ms * ms);
+  const int opCap = std::max(1, gore.bleedOpsPerTick);
+
+  // One amputation, then the clock. `stumpOpen` decides whether it stops.
+  struct Run {
+    float hp0 = 0, hpBefore = 0;  // before the sever / after it (baseline)
+    double counted = 0;           // whole-voxel equivalents emitted since hpBefore
+    double countedAtLast = 0;     // ...as of the last tick the creature lived
+    float hpAtLast = 0;
+    int deathTick = -1;
+    int lastBleedTick = -1;
+    uint32_t worstTickOps = 0;
+    bool monotone = true;
+    int ticks = 0;
+    float bloodLost = 0;
+  };
+  auto run = [&](bool stumpOpen, int inset, int window) {
+    Run r;
+    Tuning tt = saved;
+    tt.gore.stumpBleedsOpen = stumpOpen;
+    SetCurrentTuning(tt);
+    IVec3 pchunk{};
+    const uint64_t id = SpawnTarget(c, t, inset, pchunk);
+    if (!id) { SetCurrentTuning(saved); return r; }
+    r.hp0 = mobs.TotalHp(id);
+    mobs.Sever(id, t.limb);
+    // The thrown sever voxels are charged INSIDE Sever(); the baseline is
+    // taken after it so the identity below is over what the ticks emit.
+    r.hpBefore = mobs.TotalHp(id);
+    r.hpAtLast = r.hpBefore;
+    uint32_t tick = 30000;
+    for (int i = 0; i < window; i++) {
+      std::vector<BrushOp> ops;
+      std::vector<ParticleSpawn> spawns;
+      std::vector<CellOp> cellOps;
+      mobs.PreTick(tick++, c.world, ops, cellOps, spawns);
+      uint32_t tickOps = 0;
+      double emitted = 0;
+      for (const BrushOp& op : ops)
+        if (op.material == bleedMat) {
+          tickOps++;
+          emitted += (double)BleedClumpVoxels(op.radius);
+        }
+      for (const ParticleSpawn& s : spawns)
+        if ((s.payload & 0xFFFu) == bleedMat && (s.flags & kPFlagMicro))
+          emitted += dropletVox;
+      // Whole-voxel spawns (the sever's thrown gobbets, drained through
+      // pendingSpawns_ on this first tick) were charged before the baseline
+      // and are deliberately not counted here.
+      r.counted += emitted;
+      r.worstTickOps = std::max(r.worstTickOps, tickOps);
+      if (tickOps || emitted > 0) r.lastBleedTick = i;
+      r.ticks = i + 1;
+      if (!mobs.IsAlive(id)) { r.deathTick = i; break; }
+      const float hp = mobs.TotalHp(id);
+      if (hp > r.hpAtLast + 1e-3f) r.monotone = false;
+      r.hpAtLast = hp;
+      r.countedAtLast = r.counted;
+      r.bloodLost = mobs.BloodLost(id);
+      c.phys.Step(kTickDt);
+      mobs.PostStep();
+    }
+    mobs.Reset();
+    c.debris.Reset();
+    SetCurrentTuning(saved);
+    return r;
+  };
+
+  // How long the rate says a full bleed-out takes, from the knobs alone: one
+  // clump every bleedDripTicks at bleedHpPerVoxel per voxel. The window is
+  // three times that plus a margin, so "never died" and "died late" are
+  // different failures rather than the same timeout.
+  const float clumpVox = (float)BleedClumpVoxels(std::max(0, gore.bleedClumpRadius));
+  const float hpPerDrip = clumpVox * gore.bleedHpPerVoxel;
+  const int dripTicks = std::max(1, gore.bleedDripTicks);
+  // hp0 is only known after a spawn; size the window off the def's authored
+  // total instead, which is what the creature starts with.
+  float authored = 0;
+  for (const MobLimbDef& ld : mobs.Defs()[t.defIndex].limbs) authored += ld.hp;
+  const int expected =
+      hpPerDrip > 0 ? (int)std::ceil(authored / hpPerDrip) * dripTicks : 0;
+  const int window = expected * 3 + 300;
+
+  const Run open = run(true, 290, window);
+  const Run shut = run(false, 290, window);
+
+  // A. the identity, over the last tick the creature lived. The tick it dies
+  // on overshoots by construction (the drain that kills takes more than is
+  // left), so the comparison stops one tick short.
+  const double lostHp = (double)open.hpBefore - (double)open.hpAtLast;
+  const double owedHp = open.countedAtLast * (double)gore.bleedHpPerVoxel;
+  const double tol = 0.25 + 1e-4 * (double)open.hpBefore;
+  const bool identity = gore.bleedHpPerVoxel > 0.0f && open.countedAtLast > 0 &&
+                        std::fabs(lostHp - owedHp) <= tol;
+  // B. the amputation kills, in the time the rate predicts, and it never
+  // outran the drip budget doing it.
+  const bool fatal = open.deathTick >= 0 && open.deathTick <= expected * 3 + 60;
+  const bool bounded = open.worstTickOps <= (uint32_t)opCap;
+  // C. with the stump allowed to close, the same cut is survivable and goes
+  // dry — the old finite stump. The differential is the proof the knob is
+  // the mechanism.
+  const bool survivable = shut.deathTick < 0 && shut.lastBleedTick >= 0 &&
+                          shut.lastBleedTick < shut.ticks - 1;
+  const bool ok = identity && fatal && bounded && open.monotone && survivable &&
+                  open.hpBefore > 0.0f;
+
+  RecordObserved("bleedOutTicks", (double)open.deathTick);
+  RecordObserved("bleedOutIdentityErr", std::fabs(lostHp - owedHp));
+  RecordObserved("bleedOutShutLastTick", (double)shut.lastBleedTick);
+
+  detail = Format(
+      "%s/%s: hp %.1f -> %.1f at sever, %.2f blood vox = %.2f hp owed vs %.2f "
+      "lost (tol %.2f), died at tick %d (expected ~%d), worst tick %u/%d, "
+      "monotone=%d; stump shut: alive=%d, dry at tick %d of %d",
+      t.defName.c_str(), t.limbName.c_str(), open.hp0, open.hpBefore,
+      open.countedAtLast, owedHp, lostHp, tol, open.deathTick, expected,
+      open.worstTickOps, opCap, open.monotone ? 1 : 0,
+      shut.deathTick < 0 ? 1 : 0, shut.lastBleedTick, shut.ticks);
+  return ok ? Status::Pass : Status::Fail;
+}
+
+// ---------------------------------------------------------------------------
+// burn-cap: the burnt fraction of a body caps what it can hold (Gore §G)
+// ---------------------------------------------------------------------------
+//
+//   A. the CURVE, with no fixture: intact = full, mid knot = authored, death
+//      knot = zero, and never rising in between.
+//   B. the REAL PATH: light a creature and let the burn pass run. The cap it
+//      reports must be the curve of the fraction it reports, every live limb's
+//      hp must sit under its authored max x that cap, and the cap must have
+//      actually bitten (< 1) — a cap that stays at 1 while the body chars is
+//      the count wired to nothing.
+//   C. DEATH BY BURNS: stand the creature in a real fire and it must die,
+//      with the fraction at (or past) the death knot — not because a vital
+//      limb burnt through, which was already possible and is mob-burn's
+//      subject, but because the cap reached zero.
+//
+// A and B are CPU only: ignition through MobSystem::IgniteLimb and the burn
+// pass through PreTick, no tick submitted. C has to be a world fire (see the
+// note at the phase) and regenerates the world on the way out.
+Status GateBurnCap(Ctx& c, std::string& detail) {
+  MobSystem& mobs = c.mobs;
+  IdCounterScope idScope(mobs);
+  if (!mobs.BurnTablesReady()) {
+    detail = "burn tables not loaded";
+    return Status::Fail;
+  }
+  const auto& gore = CurrentTuning().gore;
+
+  // A. the curve.
+  bool curve = std::fabs(Mob::BurnHealthCapFor(0.0f) - 1.0f) < 1e-6f &&
+               std::fabs(Mob::BurnHealthCapFor(gore.burnCapMidFraction) -
+                         gore.burnCapMidHealth) < 1e-5f &&
+               Mob::BurnHealthCapFor(gore.burnDeathFraction) == 0.0f &&
+               Mob::BurnHealthCapFor(1.0f) == 0.0f;
+  {
+    float prev = 2.0f;
+    for (int i = 0; i <= 100; i++) {
+      const float v = Mob::BurnHealthCapFor((float)i / 100.0f);
+      if (v > prev + 1e-6f) curve = false;
+      prev = v;
+    }
+  }
+
+  PrepareWorld(c);
+  const Target t = ChooseTarget(mobs, FixtureSite(c.world, 320));
+  if (!t.valid()) {
+    detail = "no loaded mob def has a severable non-vital limb that bleeds";
+    return Status::Fail;
+  }
+  const MobDef& def = mobs.Defs()[t.defIndex];
+  const int nLimbs = (int)def.limbs.size();
+  IVec3 pchunk{};
+  const uint64_t id = SpawnTarget(c, t, 320, pchunk);
+  if (!id) {
+    detail = "spawn refused";
+    return Status::Fail;
+  }
+  auto tickOnce = [&](uint32_t tick) {
+    std::vector<BrushOp> ops;
+    std::vector<ParticleSpawn> spawns;
+    std::vector<CellOp> cellOps;
+    mobs.PreTick(tick, c.world, ops, cellOps, spawns);
+    c.phys.Step(kTickDt);
+    mobs.PostStep();
+  };
+
+  // B. light the fixture limb only, run the pass, read the cap.
+  uint32_t tick = 40000;
+  const uint32_t lit = mobs.IgniteLimb(id, t.limb, 400, 0);
+  for (int i = 0; i < 240 && mobs.IsAlive(id); i++) tickOnce(tick++);
+  const float fracB = mobs.BurnFraction(id);
+  const float capB = mobs.BurnHealthCap(id);
+  const bool aliveB = mobs.IsAlive(id);
+  bool underCap = aliveB;
+  float worstOver = 0.0f;
+  if (aliveB)
+    for (int li = 0; li < nLimbs; li++) {
+      if (!mobs.LimbBody(id, li)) continue;
+      const float hp = mobs.LimbHp(id, li);
+      const float capHp = def.limbs[li].hp * capB;
+      if (hp > capHp + 1e-3f) {
+        underCap = false;
+        worstOver = std::max(worstOver, hp - capHp);
+      }
+    }
+  const bool bit = lit > 0 && aliveB && fracB > 0.0f && capB < 1.0f &&
+                   std::fabs(Mob::BurnHealthCapFor(fracB) - capB) < 1e-5f;
+
+  // C. now a REAL FIRE, until it dies of it.
+  //
+  // Direct ignition cannot burn a body through: it lights SURFACE voxels, and
+  // once the surface has charred the layer under it never sees three hot
+  // faces (reactions.json's minCount note) — measured, 1500 ticks of forced
+  // ignition on every limb plateaued at 14% burnt. What burns a body is a
+  // fire in the WORLD, whose tangential cells the burn pass reads as a wide
+  // front, so this phase soaks a column of fire around the creature every
+  // tick exactly as mob-burn's fixture does, and submits real ticks for it.
+  // The world is regenerated on the way out (rule 7).
+  uint32_t mFire = 0;
+  for (size_t i = 0; i < c.mats.size(); i++)
+    if (c.mats[i].name == "fire") mFire = (uint32_t)i;
+  const int rootLimb = def.rootLimb;
+  int deathTick = -1;
+  float fracAtDeath = -1.0f, capAtDeath = -1.0f, lastFrac = fracB;
+  float fracAt[2] = {-1.0f, -1.0f};  // at 400 and 800 ticks: is it climbing?
+  uint32_t simTick = 41000;
+  if (mFire && rootLimb >= 0) {
+    for (int i = 0; i < 1200; i++) {
+      std::vector<BrushOp> ops;
+      std::vector<ParticleSpawn> spawns;
+      std::vector<CellOp> cellOps;
+      mobs.PreTick(simTick + 1, c.world, ops, cellOps, spawns);
+      if (mobs.LimbBody(id, rootLimb)) {
+        const Vec3 at = mobs.LimbVoxelPos(id, rootLimb, 0);
+        const IVec3 b{ifloor(at.x), ifloor(at.y), ifloor(at.z)};
+        // Wider than mob-burn's column (+-3): the human's arms hang at about
+        // +-4 and half its surface stayed raw skin at +-3 — measured, 5,883
+        // of 10,899 surface voxels never cooked in 1,200 ticks. A body in a
+        // BONFIRE, not beside one.
+        // ...and ENGULFED, not merely standing in it. With `kCellOpIfAir`
+        // the lower legs and feet stayed raw (legL.L 636 of 668 surface
+        // voxels, foot.L 368 of 382, after 1,200 ticks in the column): the
+        // cells beside a standing body's shins are the ground's own cover,
+        // not air, so the flag never put flame there. Every cell above the
+        // terrain is overwritten with fire instead; the terrain itself is
+        // left alone so the body has something to stand on.
+        for (int dy = -8; dy <= 20; dy++)
+          for (int dz = -6; dz <= 6; dz++)
+            for (int dx = -6; dx <= 6; dx++) {
+              const IVec3 cc{b.x + dx, b.y + dy, b.z + dz};
+              if (!c.world.CellInWindow(cc)) continue;
+              if (cellOps.size() >= kMaxCellOpsPerTick) break;
+              const bool aboveGround =
+                  cc.y > World::TerrainHeight(cc.x, cc.z, kDefaultSeed);
+              cellOps.push_back(
+                  {World::SlotCellIndex(cc),
+                   PackVoxNew(mFire, 7u) | (aboveGround ? 0u : kCellOpIfAir)});
+            }
+      }
+      c.debris.QueueSupportEvents(c.world.Snap());
+      c.debris.PreTick(simTick + 1, c.world, cellOps, spawns);
+      ++simTick;
+      SubmitTick(c.ctx, c.world, c.sim, simTick, kDefaultSeed, ops, {}, cellOps,
+                 false, pchunk, true, false, spawns);
+      c.ctx.WaitIdle();
+      c.ctx.ProcessEvents();
+      c.phys.Step(kTickDt);
+      c.debris.PostStep();
+      mobs.PostStep();
+      if (!mobs.IsAlive(id)) {
+        deathTick = i;
+        break;
+      }
+      lastFrac = mobs.BurnFraction(id);
+      if (i == 399) fracAt[0] = lastFrac;
+      if (i == 799) fracAt[1] = lastFrac;
+    }
+  }
+  // ATTRIBUTION, not a bare number (CLAUDE.md rule 6): what the body is made
+  // of when the phase ends, so "died at tick -1 with 23% burnt" names the
+  // material fire could not reach instead of leaving the next reader to
+  // guess between bone, interior flesh and a fire that never took.
+  std::string census;
+  if (mobs.IsAlive(id)) {
+    const char* names[] = {"skin",          "flesh",        "muscle",
+                           "bone",          "linen",        "flesh_cooked",
+                           "flesh_burning", "flesh_charred", "flesh_cinder",
+                           "linen_burning", "linen_charred", "ash"};
+    for (const char* nm : names) {
+      uint32_t mat = 0;
+      for (size_t i = 0; i < c.mats.size(); i++)
+        if (c.mats[i].name == nm) mat = (uint32_t)i;
+      if (!mat) continue;
+      uint32_t n = 0;
+      for (int li = 0; li < nLimbs; li++)
+        if (mobs.LimbBody(id, li)) n += mobs.LimbMaterialCount(id, li, mat);
+      if (n) census += Format("%s %u ", nm, n);
+    }
+    uint32_t live = 0, spawn = 0, surface = 0;
+    for (int li = 0; li < nLimbs; li++) {
+      spawn += mobs.LimbVoxelsAtSpawn(id, li);
+      surface += mobs.LimbSurfaceAtSpawn(id, li);
+      if (mobs.LimbBody(id, li)) live += mobs.LimbArtVoxelCount(id, li);
+    }
+    census += Format("| %u of %u voxels present, surface %u | raw skin by "
+                     "limb:",
+                     live, spawn, surface);
+    uint32_t mSkin = 0;
+    for (size_t i = 0; i < c.mats.size(); i++)
+      if (c.mats[i].name == "skin") mSkin = (uint32_t)i;
+    for (int li = 0; li < nLimbs && mSkin; li++)
+      if (mobs.LimbBody(id, li))
+        census += Format(" %s %u/%u", def.limbs[li].name.c_str(),
+                         mobs.LimbMaterialCount(id, li, mSkin),
+                         mobs.LimbSurfaceAtSpawn(id, li));
+  }
+  // The fraction is read before the tick that killed, since Die() drops the
+  // limb list and the readout with it; a body one recount short of the death
+  // knot is the closest observable, so allow one cadence of burning.
+  fracAtDeath = lastFrac;
+  capAtDeath = Mob::BurnHealthCapFor(lastFrac);
+  const bool died = deathTick >= 0;
+  // Dead OF THE BURNS: the last fraction seen was inside one recount of the
+  // death knot (the pass recounts every Mob::kBurnRecountTicks ticks and
+  // burning is fast under forced ignition, so the last live reading can sit a
+  // little under it). A creature that died with 30% of it burnt died of
+  // something else — a vital limb burning through — and that is not this cap.
+  const bool ofBurns = died && fracAtDeath >= gore.burnDeathFraction - 0.12f;
+
+  RecordObserved("burnCapFractionB", (double)fracB);
+  RecordObserved("burnCapB", (double)capB);
+  RecordObserved("burnCapDeathTick", (double)deathTick);
+  RecordObserved("burnCapFractionAtDeath", (double)fracAtDeath);
+
+  mobs.Reset();
+  c.debris.Reset();
+  // LEAVE THE WORLD AS THIS GATE FOUND IT: phase C lit a real fire at
+  // absolute coordinates inside the window (the same restore mob-burn and
+  // wound-bleed do, for the same reason).
+  SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+  c.ctx.WaitIdle();
+  const bool ok = curve && bit && underCap && died && ofBurns;
+  detail = Format(
+      "%s/%s: curve %s; lit %u -> %.1f%% burnt, cap %.3f (curve says %.3f), "
+      "limbs under cap=%d (worst over %.2f hp), alive=%d; in a fire: died "
+      "at tick %d with %.1f%% burnt (death knot %.0f%%, cap %.3f; %.1f%% at "
+      "400, %.1f%% at 800) %s",
+      t.defName.c_str(), t.limbName.c_str(), curve ? "ok" : "WRONG", lit,
+      fracB * 100.0f, capB, Mob::BurnHealthCapFor(fracB), underCap ? 1 : 0,
+      worstOver, aliveB ? 1 : 0, deathTick, fracAtDeath * 100.0f,
+      gore.burnDeathFraction * 100.0f, capAtDeath, fracAt[0] * 100.0f,
+      fracAt[1] * 100.0f, census.c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& WoundGates() {
@@ -553,6 +941,8 @@ const std::vector<Gate>& WoundGates() {
       {"wound-accumulate", "mob", {}, false, GateWoundAccumulate, false},
       {"wound-heft", "mob", {}, false, GateWoundHeft, false},
       {"wound-bleed", "mob", {}, false, GateWoundBleed, false},
+      {"bleed-out", "mob", {}, false, GateBleedOut, false},
+      {"burn-cap", "mob", {}, false, GateBurnCap, false},
   };
   return g;
 }

@@ -191,6 +191,11 @@ class PlayerAvatar : public Mob {
   // NEVER regenerates; deliberately not lowered by severing, so a lost limb
   // reads as a permanently short bar.
   int32_t HealthMax() const;
+  // HealthMax() x the burn cap (Mob::BurnHealthCap): the most health this body
+  // can HOLD in its current state. Equal to HealthMax() unburnt; the HUD bar
+  // draws the span between the two as charred off, and nothing may heal past
+  // it (sim/tuning.h Gore §G).
+  int32_t HealthCap() const;
   // Spend health across live parts, proportionally to what each still has.
   // Parts driven to zero are severed through the ordinary Sever() path, so an
   // overcast dismembers you with no new gore code.

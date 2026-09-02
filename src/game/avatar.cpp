@@ -327,6 +327,30 @@ bool PlayerAvatar::Spawn(const Player& player, float headingRad) {
   if (restore_.valid && restore_.defName == defName_) {
     const size_t n = std::min(restore_.parts.size(), limbs_.size());
     for (size_t i = 0; i < n; i++) limbs_[i].hp = restore_.parts[i].hp;
+    // A SAVED AMPUTATION IS STILL AN OPEN STUMP (sim/tuning.h Gore §F). The
+    // wound is not in the file and does not need to be: it is DERIVED from
+    // what is — a severed part whose parent is still on the body reopens the
+    // parent's stump, placed at the joint exactly as Sever() places it. The
+    // rig was just built at rest (BuildRig writes every limb's xf), so the
+    // anchor arithmetic is the same one Sever() runs on a live pose. A loss
+    // that fire cauterised is indistinguishable here and reopens too; that
+    // is the conservative side of a bleed.
+    for (size_t i = 0; i < n; i++) {
+      if (restore_.parts[i].alive || !limbs_[i].body) continue;
+      const MobLimb& cut = limbs_[i];
+      const Quat cq{cut.xf.quat[0], cut.xf.quat[1], cut.xf.quat[2],
+                    cut.xf.quat[3]};
+      const Vec3 anchorW = cut.xf.pos + Rotate(cq, cut.anchorLimb);
+      for (size_t k = 0; k < limbDefs_.size() && k < limbs_.size(); k++) {
+        if (limbDefs_[k].name != limbDefs_[i].parent || !limbs_[k].body)
+          continue;
+        MobLimb& parent = limbs_[k];
+        const Quat pq{parent.xf.quat[0], parent.xf.quat[1], parent.xf.quat[2],
+                      parent.xf.quat[3]};
+        parent.woundLocal = RotateInv(pq, anchorW - parent.xf.pos);
+        parent.stumpOpen = true;
+      }
+    }
     for (size_t i = 0; i < n; i++)
       if (!restore_.parts[i].alive && limbs_[i].body) DetachLimb((int)i, false);
   }
@@ -1816,6 +1840,11 @@ int32_t PlayerAvatar::HealthMax() const {
   for (const MobLimbDef& ld : limbDefs_)
     if (ld.hp > 0) sum += ld.hp;
   return sum <= 0 ? 0 : (int32_t)sum;
+}
+
+int32_t PlayerAvatar::HealthCap() const {
+  const float cap = (float)HealthMax() * BurnHealthCap();
+  return cap <= 0.0f ? 0 : (int32_t)cap;
 }
 
 void PlayerAvatar::SpendHealth(int32_t amount) {

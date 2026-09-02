@@ -1211,6 +1211,16 @@ void MobSystem::OnMaterialsReloaded(const std::vector<MaterialDef>& mats,
   matAttacksBody_.clear();
   ignitedForm_.clear();
   reactions_ = reactions;
+  // How burnt each material reads, for the body's burnt fraction (Gore §G).
+  burnStage_.assign(mats.size(), 0u);
+  burnable_.assign(mats.size(), 0u);
+  for (size_t i = 0; i < mats.size(); i++) {
+    burnStage_[i] = Mob::BurnStageOfMaterialName(mats[i].name);
+    bool flammable = burnStage_[i] != 0;
+    for (const auto& t : mats[i].tags)
+      if (t == "flammable") flammable = true;
+    burnable_[i] = flammable ? 1u : 0u;
+  }
   // The tag bit for "hot" is looked up ONCE, by name, from whatever material
   // declares it — there is no hardcoded id and no hardcoded bit. A material
   // becomes a heat source by carrying the tag, which is the same contract the
@@ -3189,6 +3199,12 @@ void Mob::BleedTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
   auto bodyFrame = [&](Vec3 prefabOffset) {
     return bodyOriginNow + Rotate(bodyRotNow, prefabOffset);
   };
+  // EVERY DROP IS HP (DrainBlood). A micro droplet is one micro voxel, i.e.
+  // this fraction of a whole one; the per-limb totals below are charged in
+  // whole-voxel equivalents so the drip, its spray and the gout all pay by
+  // the same measure. microScale is clamped to 2..6 at load.
+  const int ms = std::max(2, gore.microScale);
+  const float dropletVox = 1.0f / (float)(ms * ms * ms);
   for (size_t li = 0; li < limbs_.size(); li++) {
     MobLimb& limb = limbs_[li];
     Quat lq{limb.xf.quat[0], limb.xf.quat[1], limb.xf.quat[2],
@@ -3215,6 +3231,7 @@ void Mob::BleedTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
                                : bodyFrame(limb.anchorRoot);
       Vec3 axis = limb.body ? Rotate(lq, limb.gushDir)
                             : Rotate(bodyRotNow, limb.gushDir);
+      int gushed = 0;
       for (int k = 0; k < want; k++) {
         if (spawns.size() >= kMaxParticleSpawnsPerTick) break;
         uint32_t h = Hash3((uint32_t)id_ * 2654435761u + (uint32_t)li,
@@ -3241,8 +3258,27 @@ void Mob::BleedTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
           break;
         spawns.push_back(MakeDroplet(gOrigin, dir * sp, def.bleedMat, true,
                                      life, gore.microScale));
+        gushed++;
       }
       limb.gushTicks--;
+      // The gout is blood, so it is hp. Charged per droplet actually spawned
+      // (not per `want`): a droplet the spawn budget refused never left the
+      // body. DrainBlood may kill the creature and reshape limbs_, after which
+      // `limb` is a dangling reference and nothing below may run.
+      if (gushed && !DrainBlood((float)gushed * dropletVox)) return;
+    }
+
+    // ---- THE STUMP THAT NEVER CLOSES (gore.stumpBleedsOpen) ----
+    // A lost limb is a clock. Top the wound back up to one clump so the drip
+    // below always has something to spend, for as long as the creature is
+    // alive: the drip's own cadence and op budget bound the RATE, DrainBlood
+    // turns it into hp, and death is what ends it. Capped at one clump rather
+    // than at the wound cap so a stump that cannot drip this tick (out of
+    // ops) does not bank blood for later.
+    if (limb.stumpOpen && alive_ && gore.stumpBleedsOpen) {
+      const float clumpVox =
+          (float)BleedClumpVoxels(std::max(0, gore.bleedClumpRadius));
+      if (limb.bleedBudget < clumpVox) limb.bleedBudget = clumpVox;
     }
 
     // Report the wound for audio BEFORE the budget/op-rate early-outs
@@ -3286,7 +3322,8 @@ void Mob::BleedTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
     // bound on matter entering the CA once clump size leaves 0 (rule 2).
     ops.push_back({ifloor(w.x), ifloor(w.y), ifloor(w.z), clumpR,
                    def.bleedMat, 0 /*paint into air*/, 0, 0});
-    limb.bleedBudget -= (float)BleedClumpVoxels(clumpR);
+    const float clumpVox = (float)BleedClumpVoxels(clumpR);
+    limb.bleedBudget -= clumpVox;
     bleedOps++;
 
     // ---- the spray that accompanies the drip ----
@@ -3300,8 +3337,10 @@ void Mob::BleedTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
         EventVar(gore_.bleedSprayPerDrip, gore.bleedSprayPerDripVar, es,
                  tick, 0u));
     if (sprayN < 0) sprayN = 0;
+    int sprayed = 0;
     for (int k = 0; k < sprayN; k++) {
       if (spawns.size() >= kMaxParticleSpawnsPerTick) break;
+      sprayed++;
       uint32_t h = Hash3((uint32_t)id_ * 40503u + (uint32_t)li,
                          tick ^ 0xB1005u, (uint32_t)k * 2246822519u);
       float cone = EventVar(gore_.bleedSprayCone, gore.bleedSprayConeVar,
@@ -3319,7 +3358,237 @@ void Mob::BleedTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
       spawns.push_back(MakeDroplet(w, dir * sp, def.bleedMat, true, life,
                                    gore.microScale));
     }
+    // The drip and its spray, as hp. Last thing in the iteration for the
+    // reason given at the gout: a kill here invalidates `limb`.
+    if (!DrainBlood(clumpVox + (float)sprayed * dropletVox)) return;
   }
+}
+
+// ---- blood is health --------------------------------------------------------
+
+float Mob::TotalHp() const {
+  if (!alive_) return 0.0f;
+  float sum = 0.0f;
+  const int n = std::min(baseLimbs_, (int)limbs_.size());
+  for (int i = 0; i < n; i++)
+    if (limbs_[i].body && limbs_[i].hp > 0.0f) sum += limbs_[i].hp;
+  return sum;
+}
+
+bool Mob::DrainBlood(float voxels) {
+  if (!alive_ || !def_ || voxels <= 0.0f) return alive_;
+  bloodLost_ += voxels;
+  const float cost = voxels * CurrentTuning().gore.bleedHpPerVoxel;
+  if (cost <= 0.0f) return true;
+  const float total = TotalHp();
+  if (total <= cost) {
+    // Bled white. Straight to Die() rather than to Sever() on whichever limb
+    // reached zero first: blood loss is systemic, and the corpse should keep
+    // its limbs (a creature that dies of a cut arm does not fall to pieces).
+    deathCause_ = "blood loss";
+    Die();
+    return false;
+  }
+  // In proportion to what each limb still has, exactly as
+  // PlayerAvatar::SpendHealth spreads an overcast: draining the first limb to
+  // zero would pick an arbitrary limb to ruin, and a ruined limb from bleeding
+  // reads as a bug. Proportional means every limb reaches zero on the same
+  // tick, which is the tick above.
+  const float frac = cost / total;
+  const int n = std::min(baseLimbs_, (int)limbs_.size());
+  for (int i = 0; i < n; i++) {
+    MobLimb& l = limbs_[i];
+    if (!l.body || l.hp <= 0.0f) continue;
+    l.hp -= l.hp * frac;
+  }
+  return true;
+}
+
+// ---- burns cap health -------------------------------------------------------
+
+float Mob::BurnHealthCapFor(float f) {
+  const auto& g = CurrentTuning().gore;
+  if (f <= 0.0f) return 1.0f;
+  if (f >= g.burnDeathFraction) return 0.0f;
+  if (f <= g.burnCapMidFraction)
+    return 1.0f + (g.burnCapMidHealth - 1.0f) * (f / g.burnCapMidFraction);
+  const float t = (f - g.burnCapMidFraction) /
+                  std::max(1e-4f, g.burnDeathFraction - g.burnCapMidFraction);
+  return g.burnCapMidHealth * (1.0f - t);
+}
+
+uint8_t Mob::BurnStageOfMaterialName(const std::string& n) {
+  // Named, never by id (CLAUDE.md conventions), and mirrored nowhere: main.cpp
+  // resolves the HUD's readout through this same function. A name not in the
+  // content contributes nothing, so a rig that burns into materials this list
+  // has never heard of reads as "not burnt" rather than as a wrong count.
+  if (n == "flesh_cooked" || n == "flesh_burning" || n == "cloth_burning" ||
+      n == "linen_burning")
+    return 1;
+  if (n == "flesh_charred" || n == "flesh_cinder" || n == "ash" ||
+      n == "cloth_charred" || n == "linen_charred")
+    return 2;
+  return 0;
+}
+
+uint32_t Mob::SurfaceCount(const MobLimb& limb) const {
+  if (!sys_) return 0;
+  // Occupancy by 64-bit key: skin coords are int16 and a mina limb runs past
+  // 127 micro voxels, so CarveLimb's 8-bit-per-axis key would alias here.
+  auto key = [](int x, int y, int z) {
+    return (uint64_t)(uint32_t)(x + 32768) |
+           ((uint64_t)(uint32_t)(y + 32768) << 16) |
+           ((uint64_t)(uint32_t)(z + 32768) << 32);
+  };
+  std::unordered_set<uint64_t> occ;
+  const bool fine = limb.HasFineSkin();
+  const size_t n = fine ? limb.skinVoxels.size() : limb.voxels.size();
+  occ.reserve(n * 2);
+  for (size_t i = 0; i < n; i++) {
+    const int x = fine ? limb.skinVoxels[i].x : limb.voxels[i].x;
+    const int y = fine ? limb.skinVoxels[i].y : limb.voxels[i].y;
+    const int z = fine ? limb.skinVoxels[i].z : limb.voxels[i].z;
+    occ.insert(key(x, y, z));
+  }
+  const int d[6][3] = {{1, 0, 0},  {-1, 0, 0}, {0, 1, 0},
+                       {0, -1, 0}, {0, 0, 1},  {0, 0, -1}};
+  uint32_t surface = 0;
+  for (size_t i = 0; i < n; i++) {
+    const uint32_t m = fine ? (limb.skinVoxels[i].material & 0xFFFu)
+                            : (limb.voxels[i].payload & 0xFFFu);
+    if (!sys_->BurnableOf(m)) continue;
+    const int x = fine ? limb.skinVoxels[i].x : limb.voxels[i].x;
+    const int y = fine ? limb.skinVoxels[i].y : limb.voxels[i].y;
+    const int z = fine ? limb.skinVoxels[i].z : limb.voxels[i].z;
+    for (const auto& dd : d)
+      if (!occ.count(key(x + dd[0], y + dd[1], z + dd[2]))) {
+        surface++;
+        break;
+      }
+  }
+  return surface;
+}
+
+void Mob::RecountBurn(uint32_t tick, bool force) {
+  if (!burnFracDirty_ || !alive_ || !def_ || !sys_) return;
+  if (!force && tick - burnRecountTick_ < kBurnRecountTicks &&
+      burnRecountTick_ != 0)
+    return;
+  burnFracDirty_ = false;
+  burnRecountTick_ = tick ? tick : 1u;
+  // BURNT SURFACE OVER SURFACE — the body-surface-area grading burns get in
+  // the clinic, and here for a mechanical reason as much as a readable one.
+  //
+  // Half-units so a cooked voxel is 1 and a charred one is 2 (the weighting
+  // the HUD's per-limb readout has always used, so the two agree), summed over
+  // EVERY burnt voxel at any depth plus what fire removed outright
+  // (burntAway), against 2 per voxel of the limb's SURFACE at spawn — the
+  // burnable voxels with an open face (MobLimb::surfaceAtSpawn). Not the
+  // volume: fire chars the outer layer and char is inert, so it shields the
+  // rest, and a human stood in a fire converged at 30% of its burnable volume
+  // with most of its skin raw under a black shell. Against the surface the
+  // same body reads burnt through, which is what it looks like. The numerator
+  // can exceed the denominator (a second layer cooking under the first, or a
+  // cut exposing flesh that then chars), so it is clamped: past "all of the
+  // surface" there is nothing more to say than dead. Only BURNABLE voxels
+  // count on either side (MobSystem::BurnableOf: tag:flammable or already a
+  // burn stage) — bone is neither and no fire moves it. Counted on the
+  // authoritative lattice (the skin when there is one); see
+  // PlayerAvatar::PartVoxelCount for why mixing the two lattices scales the
+  // fraction by (skin/phys)^3.
+  uint64_t burnt2 = 0, surface = 0;
+  const int n = std::min(baseLimbs_, (int)limbs_.size());
+  for (int i = 0; i < n; i++) {
+    MobLimb& l = limbs_[i];
+    burnt2 += 2ull * l.burn.burntAway;
+    // The surface is taken ONCE, lazily, before this limb burns much: the
+    // first recount happens on the first burn tick, when the lattice is
+    // still whole enough to count. A limb whose count was never taken (it
+    // was severed before anything burned) contributes nothing either way.
+    if (l.body && l.surfaceAtSpawn == 0)
+      l.surfaceAtSpawn = std::max(1u, SurfaceCount(l));
+    surface += l.surfaceAtSpawn;
+    if (!l.body) continue;  // severed: its matter is gone, its burntAway stays
+    if (l.HasFineSkin()) {
+      for (const PrefabVoxel& v : l.skinVoxels)
+        burnt2 += sys_->BurnStageOf(v.material & 0xFFFu);
+    } else {
+      for (const DebrisVoxel& v : l.voxels)
+        burnt2 += sys_->BurnStageOf(v.payload & 0xFFFu);
+    }
+  }
+  burnFrac_ = surface ? std::clamp((float)burnt2 / (float)(2ull * surface),
+                                   0.0f, 1.0f)
+                      : 0.0f;
+  burnCap_ = BurnHealthCapFor(burnFrac_);
+  ApplyBurnCap();
+}
+
+void Mob::ApplyBurnCap() {
+  if (!alive_ || !def_) return;
+  if (burnCap_ <= 0.0f) {
+    deathCause_ = "burnt past the death knot";
+    Die();  // burnt past burnDeathFraction: dead of the burns, whatever the hp
+    return;
+  }
+  if (burnCap_ >= 1.0f) return;
+  const int n = std::min(baseLimbs_, (int)limbs_.size());
+  bool vitalGone = false;
+  for (int i = 0; i < n; i++) {
+    MobLimb& l = limbs_[i];
+    if (!l.body) continue;
+    const float capHp = limbDefs_[i].hp * burnCap_;
+    if (l.hp > capHp) l.hp = capHp;
+    // A cap above zero leaves every authored limb some hp, so this only fires
+    // for a limb that was ALREADY at zero from damage — in which case the
+    // ordinary rule applies: a root or vital limb at zero is a death.
+    if (l.hp <= 0.0f &&
+        (i == def_->rootLimb || limbDefs_[i].vital || !limbDefs_[i].severable))
+      vitalGone = true;
+  }
+  if (vitalGone) {
+    deathCause_ = "vital limb at zero under the burn cap";
+    Die();
+  }
+}
+
+float MobSystem::TotalHp(uint64_t mobId) const {
+  for (const Mob& m : mobs_)
+    if (m.id_ == mobId) return m.TotalHp();
+  return -1.0f;
+}
+float MobSystem::LimbHp(uint64_t mobId, int limbIndex) const {
+  for (const Mob& m : mobs_)
+    if (m.id_ == mobId) return m.LimbHpAt(limbIndex);
+  return -1.0f;
+}
+const char* MobSystem::DeathCause(uint64_t mobId) const {
+  for (const Mob& m : mobs_)
+    if (m.id_ == mobId) return m.DeathCause();
+  return mobId && mobId == lastDeathId_ ? lastDeathCause_ : "";
+}
+uint32_t MobSystem::LimbSurfaceAtSpawn(uint64_t mobId, int limbIndex) const {
+  for (const Mob& m : mobs_)
+    if (m.id_ == mobId)
+      return limbIndex >= 0 && limbIndex < (int)m.limbs_.size()
+                 ? m.limbs_[limbIndex].surfaceAtSpawn
+                 : 0u;
+  return 0u;
+}
+float MobSystem::BloodLost(uint64_t mobId) const {
+  for (const Mob& m : mobs_)
+    if (m.id_ == mobId) return m.BloodLost();
+  return -1.0f;
+}
+float MobSystem::BurnFraction(uint64_t mobId) const {
+  for (const Mob& m : mobs_)
+    if (m.id_ == mobId) return m.BurnFraction();
+  return -1.0f;
+}
+float MobSystem::BurnHealthCap(uint64_t mobId) const {
+  for (const Mob& m : mobs_)
+    if (m.id_ == mobId) return m.BurnHealthCap();
+  return -1.0f;
 }
 
 void Mob::PostStep() {
@@ -4640,6 +4909,9 @@ bool Mob::CarveLimb(int limbIndex, World& world,
     LimbVoxelsToParticles(limb, PhysScaleOf(limb), removed, world, spawns);
   }
   MarkInstancesDirty();
+  // The lattice changed, so the burnt fraction may have (a cut can take
+  // charred flesh off). Recounted by BurnTick at its own cadence.
+  burnFracDirty_ = true;
 
   // A carved limb must stop flipbooking: a frame swap re-points rendering at an
   // intact authored model, which would heal every wound on screen.
@@ -5456,6 +5728,7 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
     const size_t i = vi - 1;
     const IVec3 p = v.At(i);
     const uint32_t pm = prod & 0xFFFu;
+    const uint32_t was = v.Mat(i) & 0xFFFu;
     ensureOwnedBrick();
     const bool solid = pm != 0 && pm < matGpu_.size() &&
                        matGpu_[pm].klass == CLASS_SOLID;
@@ -5482,6 +5755,12 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
       v.Set(i, 0, 0);      // tombstone; FlushBurn compacts it away
       st.idx[cell] = 0;  // gone NOW, so neighbours see through it
       st.removed++;
+      // For life, and for the burn cap (Mob::RecountBurn) — but only if what
+      // left was BURNING. This pass also runs dissolution, and acid eating raw
+      // skin off a body is not a burn: counted, it made a dressed creature in
+      // an acid bath die of "burns" (armor-react) while its plate held. A
+      // voxel that leaves from a burn stage (flesh_burning -> ash) is fire's.
+      if (BurnStageOf(was)) st.burntAway++;
       if (v.carved && *v.carved && v.microModel && *v.microModel >= 0 && microSet_)
         MicroBodyPoke(*microSet_, (uint32_t)(*v.microModel), p.x, p.y, p.z,
                       0, 0);
@@ -5785,8 +6064,13 @@ void MobSystem::BurnLimbs(uint32_t tick, World& world,
   if (!BurnTablesReady() || mobs_.empty()) return;
   uint32_t frontBudget = kBurnFrontPerTick;
   uint32_t opsBudget = kBurnOpsPerTick;
-  for (size_t mi = 0; mi < mobs_.size() && frontBudget; mi++)
-    mobs_[mi].BurnTick(tick, world, cellOps, spawns, frontBudget, opsBudget);
+  // Rotate the start creature by tick, for the reason Mob::BurnTick rotates
+  // its start limb: a shared budget spent in a fixed order starves the tail.
+  const size_t nm = mobs_.size();
+  const size_t start = (size_t)(tick % (uint32_t)nm);
+  for (size_t k = 0; k < nm && frontBudget; k++)
+    mobs_[(start + k) % nm].BurnTick(tick, world, cellOps, spawns, frontBudget,
+                                     opsBudget);
 }
 
 void Mob::BurnTick(uint32_t tick, World& world, std::vector<CellOp>& cellOps,
@@ -5806,7 +6090,20 @@ void Mob::BurnTick(uint32_t tick, World& world, std::vector<CellOp>& cellOps,
   // for the whole call. `limb` is rewritten per iteration; BurnOneLimb runs
   // synchronously and never keeps the pointer, so one instance is enough.
   WornProbe probe{this, -1};
-  for (int li = 0; li < (int)limbs_.size(); li++) {
+  // ROTATE THE START LIMB BY TICK. The front budget is spent per candidate
+  // cell, and a torso standing in a fire offers thousands of them every tick,
+  // so a fixed order starved every limb after it: measured on a human
+  // engulfed for 1,200 ticks, hips and torso burnt to nothing while the lower
+  // legs and feet kept 636 of 668 and 368 of 382 surface voxels RAW, and the
+  // right arm (later in the def) sat at 552 of 596 against the left arm's 241.
+  // No body could reach the burn cap's death knot that way, and it read as
+  // "fire does not burn legs". Starting from (tick mod limbs) hands each limb
+  // the head of the budget in turn — deterministic, since the tick is the
+  // key, and the same fairness the mob loop applies across creatures.
+  const int nl = (int)limbs_.size();
+  const int start = nl > 0 ? (int)(tick % (uint32_t)nl) : 0;
+  for (int k = 0; k < nl; k++) {
+    const int li = (start + k) % nl;
     if (frontBudget == 0) break;
     if (!limbs_[li].body) continue;
     BurnLimbView v = ViewOf(limbs_[li]);
@@ -5819,14 +6116,20 @@ void Mob::BurnTick(uint32_t tick, World& world, std::vector<CellOp>& cellOps,
       v.occludeCtx = &probe;
     }
     const uint32_t key = mobKey + (uint32_t)li * 2654435761u;
-    if (sys_->BurnOneLimb(v, tick, key, world, cellOps, frontBudget, opsBudget))
+    if (sys_->BurnOneLimb(v, tick, key, world, cellOps, frontBudget, opsBudget)) {
       MarkInstancesDirty();
+      burnFracDirty_ = true;
+    }
     // Batched maintenance. May sever the limb or kill the creature, in which
     // case the limb list has been reshaped and nothing below may touch it --
     // including the rest of this loop.
     if (limbs_[li].burn.removed && !FlushBurn(li, world, spawns, false))
-      break;
+      return;
   }
+  // The burn cap (Gore §G). Recounted at a bounded cadence while the lattice
+  // is changing and not at all while it is not; may kill the creature, and is
+  // last here for the same reason FlushBurn returns above.
+  RecountBurn(tick);
 }
 
 bool MobSystem::CarveLimbRadial(uint64_t bodyHandle, Vec3 centerWorldVoxel,
@@ -6051,6 +6354,8 @@ void Mob::Sever(int limbIndex) {
     }
   }
   if (limbIndex == def.rootLimb || ld.vital || !ld.severable) {
+    deathCause_ = inBurnFlush_ ? "vital limb burnt/dissolved away"
+                               : "vital limb destroyed";
     Die();
   } else {
       // The cut point in WORLD space, captured BEFORE DetachLimb: the joint
@@ -6129,6 +6434,9 @@ void Mob::Sever(int limbIndex) {
           // this is the puddle that keeps forming under a fresh amputation.
           parent.bleedBudget =
               AddBleedBudget(parent.bleedBudget, gore.severStumpBudget);
+          // ...and it never closes (BleedTick tops it up while
+          // gore.stumpBleedsOpen), so the amputation bleeds the creature out.
+          parent.stumpOpen = true;
 
           // Arm the gout. PreTick drains it over severDecayTicks; arming state
           // here rather than emitting now keeps every particle this frame
@@ -6199,6 +6507,13 @@ void Mob::Sever(int limbIndex) {
                   MakeDroplet(at, dir * sp, def.bleedMat, false, 0, 0));
             }
           }
+          // The thrown voxels are whole blood and leave the body NOW, so
+          // they are charged now (every drop is hp: Mob::DrainBlood). Last
+          // in the loop and unconditionally last in Sever(): a kill here
+          // reshapes limbs_ and `parent` may not be touched after it. Every
+          // caller of Sever() already treats it as possibly-fatal.
+          if (thrown > 0) DrainBlood((float)thrown);
+          break;
         }
   }
 }
@@ -6206,6 +6521,11 @@ void Mob::Sever(int limbIndex) {
 void Mob::DetachLimb(int limbIndex, bool adopt) {
   MobLimb& limb = limbs_[limbIndex];
   if (!limb.body) return;
+  // Whatever was still dripping from THIS limb leaves with it: a stump that
+  // is itself cut off has no wound left on this body (its parent's does, and
+  // Sever() opens that one), and a detached limb that kept `stumpOpen` would
+  // drip forever at its rest-pose anchor from a body it is no longer on.
+  limb.stumpOpen = false;
   // The lattice is about to leave this system for DebrisSystem::AdoptBody, and
   // a material-0 tombstone from an unflushed burn must not go with it.
   StripBurnTombstones(limb);
@@ -6281,6 +6601,13 @@ void MobSystem::PushVoice(const Mob& mob, VoiceKind kind, Vec3 posVoxel,
 void Mob::Die() {
   if (!alive_) return;
   alive_ = false;
+  // The cause outlives the husk: an NPC corpse is swept out of mobs_ on the
+  // next PreTick, and a gate that asks "why did it die" one tick later would
+  // otherwise find nobody to ask (MobSystem::DeathCause falls back to this).
+  if (sys_) {
+    sys_->lastDeathId_ = id_;
+    sys_->lastDeathCause_ = deathCause_;
+  }
   // The death cry, BEFORE the limb list is dismantled below — the root limb's
   // live transform is where the creature actually is, and `mob.origin_` is only
   // the spawn corner (the trap called out in Sever()). Reported even if the

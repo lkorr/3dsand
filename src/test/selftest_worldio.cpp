@@ -184,11 +184,16 @@ Status GateSaveEntities(Ctx& c, std::string& detail) {
     if (avSevered >= 0) avatar.Sever(avSevered);
     avatar.SpendHealth(10);  // distributed hp damage, so hp round-trips too
     avLiveBefore = avatar.LivePartCount();
-    avHealthBefore = avatar.TotalHealth();
   }
 
   // Let severed pieces land so the save is not full of mid-air bodies.
   for (int i = 0; i < 45; i++) entTick();
+  // The hp reading is taken HERE, after the settle ticks and immediately
+  // before the save: the severed arm left an open stump and the overcast a
+  // bleed budget, and since blood is hp (sim/tuning.h Gore §F) those 45 ticks
+  // drain it. What must round-trip is what was saved, not what the avatar had
+  // before it bled for a second and a half.
+  if (haveAvatar) avHealthBefore = avatar.TotalHealth();
 
   const uint32_t debrisBefore = debris.BodyCount();
   limbBodiesBefore = mobs.LimbBodyCount();

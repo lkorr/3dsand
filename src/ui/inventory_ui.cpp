@@ -635,11 +635,21 @@ void DrawInventoryScreen(UIState& s) {
       // Health + mana, the same two pools the HUD shows, so the screen and the
       // corner never disagree about how close you are to dead.
       const float barW = ws.x - kPad * 2;
-      auto pool = [&](int32_t cur, int32_t max, ImU32 fill, const char* name) {
+      // `cap` < max is the burn cap (UIState::healthCap): the span past it is
+      // drawn charred off. -1 = no cap for this pool.
+      auto pool = [&](int32_t cur, int32_t max, ImU32 fill, const char* name,
+                      int32_t cap) {
         const ImVec2 a(wp.x + kPad, y), b(a.x + barW, y + 22);
         const float f =
             max > 0 ? std::clamp((float)cur / (float)max, 0.0f, 1.0f) : 0.0f;
         ui::ValueBar(dl, a, b, f, fill, true);
+        if (max > 0 && cap >= 0 && cap < max) {
+          const float cf = std::clamp((float)cap / (float)max, 0.0f, 1.0f);
+          const float cx = std::floor(a.x + (b.x - a.x) * cf);
+          dl->AddRectFilled(ImVec2(cx, a.y), b, IM_COL32(40, 30, 26, 235));
+          dl->AddLine(ImVec2(cx, a.y), ImVec2(cx, b.y),
+                      IM_COL32(120, 60, 40, 255));
+        }
         char buf[64];
         std::snprintf(buf, sizeof buf, "%d / %d", cur < 0 ? 0 : cur, max);
         const ImVec2 ts = ImGui::CalcTextSize(buf);
@@ -650,8 +660,8 @@ void DrawInventoryScreen(UIState& s) {
         ui::ShadowText(dl, ImVec2(b.x - ts.x - 8, ty), ui::ColParch(), buf);
         y += 30;
       };
-      pool(s.health, s.healthMax, ui::ColBloodHi(), "HEALTH");
-      pool(s.mana, s.manaMax, ui::ColMana(), "MANA");
+      pool(s.health, s.healthMax, ui::ColBloodHi(), "HEALTH", s.healthCap);
+      pool(s.mana, s.manaMax, ui::ColMana(), "MANA", -1);
       // The locomotion state is the one-line answer to "what is this damage
       // actually costing me", which no bar can give: "crawling" says more
       // about a pair of lost legs than two empty hp bars do.

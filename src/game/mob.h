@@ -382,6 +382,14 @@ struct BodyBurnState {
   // Voxels burnt away since the last collider rebuild. That rebuild is the most
   // expensive single operation in the feature, so it is batched hard.
   uint32_t removed = 0;
+  // Voxels fire has taken off this limb over its WHOLE life. Never reset:
+  // `removed` is a flush counter and goes to zero every rebuild, and a limb's
+  // burnt fraction (Mob::RecountBurn) needs the matter that is no longer there
+  // to count as burnt — a limb burnt to a stub is more burnt, not less, for
+  // having fewer charred voxels left to count. Survives DropBurnIndex like
+  // `alight`, and for the same reason: it is a fact about the lattice, not an
+  // index into it.
+  uint32_t burntAway = 0;
   // Consecutive ticks with an empty front, so a body walking in and out of a
   // campfire does not rebuild its index every other tick.
   uint32_t quiet = 0;
@@ -553,6 +561,11 @@ struct MobLimb {
   Vec3 anchorLimb{};         // joint anchor in limb-local coords
   BodyTransform xf{};
   float bleedBudget = 0;
+  // A child of this limb was cut off and the stump was never closed: the
+  // wound at `woundLocal` is topped back up every tick (gore.stumpBleedsOpen)
+  // so it drips hp until the creature is dead. Set on the PARENT by Sever(),
+  // cleared when this limb itself comes off (its own parent opens instead).
+  bool stumpOpen = false;
   Vec3 woundLocal{};
   // Dismemberment gout: counts DOWN from gore.severDecayTicks, emission
   // proportional to it, so the burst is front-loaded and tails off. Lives on
@@ -606,6 +619,17 @@ struct MobLimb {
   // count — which is CONSERVATIVE (a lower denominator makes the sever harder,
   // never easier), so it fails safe.
   uint32_t neckAtSpawn = 0;
+  // ---- HOW MUCH SKIN THIS LIMB HAS ------------------------------------------
+  // Burnable voxels with at least one open face, on the authoritative lattice,
+  // taken lazily on the first burn recount (0 = not yet taken; floored at 1).
+  // The DENOMINATOR of the burnt fraction (Mob::RecountBurn), and a surface
+  // rather than a volume for the reason burns are graded by body-surface area
+  // in the first place: fire chars the outer layer and the char is inert, so
+  // it shields everything under it — measured, a human stood in a fire for
+  // 1200 ticks converged at 30% of its burnable VOLUME with 5,900 raw skin and
+  // 7,000 raw flesh voxels left under a black shell, and would have stood
+  // there forever. Against its surface that same body is burnt through.
+  uint32_t surfaceAtSpawn = 0;
   // Per-voxel burning / dissolution (see BodyBurnState above).
   BodyBurnState burn;
 };
@@ -678,6 +702,11 @@ class Mob {
 
   uint64_t Id() const { return id_; }
   bool Alive() const { return alive_; }
+  // WHY it died, as a static string, or "" while alive. Set at every Die()
+  // call site that knows (a vital limb lost, blood loss, the burn cap), so a
+  // gate that finds a corpse can say what killed it instead of guessing
+  // between four mechanisms that all end in the same ragdoll.
+  const char* DeathCause() const { return deathCause_; }
   const MobDef* Def() const { return def_; }
   Vec3 Origin() const { return origin_; }
   float BodyY() const { return bodyY_; }
@@ -692,6 +721,38 @@ class Mob {
   float LimbHpAt(int i) const {
     return i >= 0 && i < (int)limbs_.size() ? limbs_[i].hp : -1.0f;
   }
+
+  // ---- blood is health; burns cap it (sim/tuning.h Gore §F/§G) -------------
+  // Summed hp of the creature's live AUTHORED limbs — the thing that bleeds
+  // out and the thing the burn cap clamps. A held item or a worn shell has hp
+  // of its own (a parry charges it) and is not life, so it is excluded, which
+  // is what makes "total hp reaches zero" mean "dead" and not "sword broke".
+  float TotalHp() const;
+  // Blood that has left this body in its life, in whole-voxel equivalents
+  // (a micro droplet is 1/microScale^3 of one). Diagnostic and gate readout.
+  float BloodLost() const { return bloodLost_; }
+  // Take `voxels` of blood out of the creature: charges
+  // voxels * gore.bleedHpPerVoxel across the live authored limbs in proportion
+  // to what each still has, and kills the creature through Die() when the
+  // total is gone. Returns false if it died. Every caller that emits blood —
+  // the drip, its spray, the arterial gout, the thrown sever voxels — goes
+  // through here, and NOTHING else may: "every drop is hp" is only true if
+  // there is one door.
+  bool DrainBlood(float voxels);
+  // Burnt fraction of the body (0..1) as last recounted, and the health cap it
+  // sets (1 = unburnt, 0 = dead of burns). Both derived from the lattice by
+  // RecountBurn; neither is saved.
+  float BurnFraction() const { return burnFrac_; }
+  float BurnHealthCap() const { return burnCap_; }
+  // The curve itself, exposed so a gate can assert the arithmetic without a
+  // fixture and the HUD can draw it: piecewise-linear through (0, 1),
+  // (burnCapMidFraction, burnCapMidHealth), (burnDeathFraction, 0).
+  static float BurnHealthCapFor(float burntFraction);
+  // How burnt a MATERIAL reads, by name: 0 = intact, 1 = half (cooked /
+  // alight), 2 = whole (charred / ash / cinder). The one list every consumer
+  // of "is this voxel burnt" reads — MobSystem's per-id table, and the HUD's
+  // limb readout in main.cpp — so the two cannot disagree about ash.
+  static uint8_t BurnStageOfMaterialName(const std::string& name);
 
   // ---- damage / dismemberment (shared; see MobSystem for the id-keyed API) --
   // Damage a limb by physics body handle. Returns true if the handle belonged
@@ -1176,6 +1237,28 @@ class Mob {
   const MobDef* def_ = nullptr;
   bool alive_ = true;
   GoreProfile gore_;           // this creature's own bleed character
+  // ---- blood loss and the burn cap (see the public block above) -----------
+  float bloodLost_ = 0.0f;
+  float burnFrac_ = 0.0f;
+  float burnCap_ = 1.0f;
+  // The lattice changed since burnFrac_ was taken. Set by the burn pass and by
+  // every carve; consumed by RecountBurn at a bounded cadence (rule 2: a
+  // creature that is not changing costs nothing, one that is burning pays one
+  // pass over its body every kBurnRecountTicks, never one per burn step).
+  bool burnFracDirty_ = false;
+  uint32_t burnRecountTick_ = 0;
+  const char* deathCause_ = "";
+  static constexpr uint32_t kBurnRecountTicks = 8;
+  // One pass over the authored limbs' lattices -> burnFrac_/burnCap_, then
+  // ApplyBurnCap. `force` ignores the cadence (a sever or a gate wants the
+  // answer now).
+  void RecountBurn(uint32_t tick, bool force = false);
+  // Burnable voxels of a limb with at least one open face, on its
+  // authoritative lattice. One hash pass; taken once per limb (surfaceAtSpawn).
+  uint32_t SurfaceCount(const MobLimb& limb) const;
+  // Clamp every live authored limb's hp to its authored max x burnCap_, and
+  // die if the cap is gone or a vital limb has nothing left under it.
+  void ApplyBurnCap();
 
   // ---- steering: intent vs actuation (NPC driver state; the avatar writes
   // heading_ directly from the camera and ignores the rest) ------------------
@@ -1880,6 +1963,31 @@ class MobSystem {
   // "cooked, then burnt" is visible as counts moving between slots rather than
   // as a state nobody can see.
   uint32_t LimbMaterialCount(uint64_t mobId, int limbIndex, uint32_t mat) const;
+  // ---- blood is health; burns cap it (Mob::TotalHp and friends, by id) ----
+  // -1 for an unknown id, so a gate cannot mistake "no such creature" for
+  // "dead", which is the one confusion these readouts exist to prevent.
+  float TotalHp(uint64_t mobId) const;
+  float LimbHp(uint64_t mobId, int limbIndex) const;
+  float BloodLost(uint64_t mobId) const;
+  // MobLimb::surfaceAtSpawn (0 until the first burn recount takes it).
+  uint32_t LimbSurfaceAtSpawn(uint64_t mobId, int limbIndex) const;
+  // Mob::DeathCause by id; "" for a live or unknown creature.
+  const char* DeathCause(uint64_t mobId) const;
+  float BurnFraction(uint64_t mobId) const;
+  float BurnHealthCap(uint64_t mobId) const;
+  // How burnt a material reads (0 intact / 1 half / 2 whole), by id, from the
+  // table OnMaterialsReloaded builds off Mob::BurnStageOfMaterialName.
+  uint8_t BurnStageOf(uint32_t mat) const {
+    return mat < burnStage_.size() ? burnStage_[mat] : 0u;
+  }
+  // Can this material burn at all — tag:flammable, or already a burn stage.
+  // The DENOMINATOR of the burnt fraction: bone carries no `flammable` and no
+  // fire will ever move it, so a body counted over every voxel could never
+  // reach the death knot however black it was. Read off the tags, so a new
+  // material joins the count by being authored flammable, not by being named.
+  bool BurnableOf(uint32_t mat) const {
+    return mat < burnable_.size() && burnable_[mat] != 0;
+  }
   // Set fire to up to `count` of a limb's SURFACE voxels and return how many
   // took. The product is resolved from the reaction table (the first rule whose
   // product is tag:hot), so a material with no path to burning — bone, steel —
@@ -2074,6 +2182,14 @@ class MobSystem {
   // anywhere in the burn path, so "flesh chars" and "cloth catches easily" stay
   // facts about assets/materials/*.json and not about this file.
   std::vector<MaterialGpu> matGpu_;
+  // Per-material burn stage (BurnStageOf) and burnability (BurnableOf),
+  // rebuilt with the rest on reload.
+  std::vector<uint8_t> burnStage_;
+  std::vector<uint8_t> burnable_;
+  // The most recent death's id and cause, so DeathCause(id) can answer for a
+  // husk that PreTick has already swept out of mobs_ (Mob::Die writes it).
+  uint64_t lastDeathId_ = 0;
+  const char* lastDeathCause_ = "";
   std::vector<ReactionGpu> reactions_;
   std::vector<uint8_t> matSelfActive_;  // has decay/emit rules — i.e. is ALIGHT
   std::vector<uint8_t> matHasPair_;     // has pair rules — i.e. is ignitable
