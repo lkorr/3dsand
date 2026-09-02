@@ -129,6 +129,9 @@ std::string JsonEscape(const std::string& s) {
   return o;
 }
 
+// %.17g, not %.6g: these are exact integers (register counts, byte sizes) and
+// a JSON file whose whole purpose is "never re-run the binary to read a number"
+// must not round 2194048 to 2.19405e+06.
 void WriteJson(const std::string& path,
                const std::vector<vk::PipelineExecutable>& rows,
                const std::map<std::string, double>& floors) {
@@ -142,11 +145,11 @@ void WriteJson(const std::string& path,
     const vk::PipelineExecutable& e = rows[i];
     std::fprintf(f,
                  "  {\"pipeline\": \"%s\", \"stage\": \"%s\", \"executable\": \"%s\",\n"
-                 "   \"subgroupSize\": %u, \"pressure\": %.6g, \"stats\": {",
+                 "   \"subgroupSize\": %u, \"pressure\": %.17g, \"stats\": {",
                  JsonEscape(e.pipeline).c_str(), JsonEscape(e.stage).c_str(),
                  JsonEscape(e.name).c_str(), e.subgroupSize, PressureKey(e, floors));
     for (size_t k = 0; k < e.stats.size(); k++)
-      std::fprintf(f, "%s\"%s\": %.6g", k ? ", " : "",
+      std::fprintf(f, "%s\"%s\": %.17g", k ? ", " : "",
                    JsonEscape(e.stats[k].name).c_str(), e.stats[k].value);
     std::fprintf(f, "}}%s\n", i + 1 < rows.size() ? "," : "");
   }
