@@ -5,6 +5,7 @@
 #include "crash.h"
 
 #include <csignal>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
@@ -309,6 +310,15 @@ void OnInvalidParameter(const wchar_t*, const wchar_t*, const wchar_t*,
 void OnPureCall() { WriteCrashReport(nullptr, "pure virtual function call"); }
 
 }  // namespace
+
+double ProcessCpuSeconds() {
+  FILETIME c, e, k, u;
+  if (!GetProcessTimes(GetCurrentProcess(), &c, &e, &k, &u)) return 0.0;
+  auto toSec = [](const FILETIME& f) {
+    return (double)(((uint64_t)f.dwHighDateTime << 32) | f.dwLowDateTime) * 1e-7;
+  };
+  return toSec(k) + toSec(u);
+}
 
 void InstallCrashHandler() {
   SetUnhandledExceptionFilter(CrashFilter);

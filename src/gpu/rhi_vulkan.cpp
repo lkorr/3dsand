@@ -1785,6 +1785,49 @@ bool Backend::PopValidationScope(std::string& messages) {
   return any;
 }
 
+// Persist the driver's pipeline cache to disk NOW, not only at Shutdown.
+//
+// WHY THIS IS CALLED FROM THE FRAME LOOP. Measured 2026-09-02 (startup
+// timeline, main.cpp StartupMark): every phase of a windowed launch totals
+// ~5 s except the FIRST DRAW, where the lazily created graphics pipelines cost
+// 45-52 s of single-threaded driver compile (the 7,500-line raymarch fragment
+// shader at the register cap) — the multi-minute white window the tuner's Play
+// button showed. The cache that would skip that compile was written only from
+// Shutdown, and the processes that pay the compile are exactly the ones that
+// never reach Shutdown: build.sh taskkills every live sandvox.exe before it
+// links, and the tuner's Play instances are killed that way several times an
+// hour. So the on-disk cache lagged the shaders by days (main's file was 12 h
+// stale with dozens of launches in between) and every launch after every
+// build paid the full compile again. Saving right after the expensive create
+// makes the SECOND launch fast whatever happens to the first.
+//
+// Cheap to call repeatedly: vkGetPipelineCacheData is a memcpy of the blob and
+// the file is a few MiB. Callers (Simulation::EnsureRenderPipelines through
+// rhi::vkr::SavePipelineCache) only call it when they actually built something.
+void Backend::SavePipelineCache() {
+  if (!device_ || !pipelineCache_ || !dfn_.GetPipelineCacheData ||
+      pipelineCachePath_.empty())
+    return;
+  size_t sz = 0;
+  if (dfn_.GetPipelineCacheData(device_, pipelineCache_, &sz, nullptr) != VK_SUCCESS ||
+      sz == 0)
+    return;
+  std::vector<uint8_t> blob(sz);
+  if (dfn_.GetPipelineCacheData(device_, pipelineCache_, &sz, blob.data()) != VK_SUCCESS)
+    return;
+  // Write-then-rename, so a process killed mid-write (the whole reason this
+  // function exists) cannot leave a truncated cache for the next launch to
+  // hand the driver.
+  const std::string tmp = pipelineCachePath_ + ".tmp";
+  FILE* f = std::fopen(tmp.c_str(), "wb");
+  if (!f) return;
+  const size_t wrote = std::fwrite(blob.data(), 1, sz, f);
+  std::fclose(f);
+  if (wrote != sz) { std::remove(tmp.c_str()); return; }
+  std::remove(pipelineCachePath_.c_str());
+  std::rename(tmp.c_str(), pipelineCachePath_.c_str());
+}
+
 void Backend::Shutdown() {
   if (!device_) {
     if (instance_ && ifn_.DestroyInstance) {
@@ -1806,20 +1849,7 @@ void Backend::Shutdown() {
   for (auto& kv : moduleCache_) dfn_.DestroyShaderModule(device_, kv.second, nullptr);
   moduleCache_.clear();
 
-  if (pipelineCache_ && dfn_.GetPipelineCacheData && !pipelineCachePath_.empty()) {
-    size_t sz = 0;
-    if (dfn_.GetPipelineCacheData(device_, pipelineCache_, &sz, nullptr) == VK_SUCCESS &&
-        sz > 0) {
-      std::vector<uint8_t> blob(sz);
-      if (dfn_.GetPipelineCacheData(device_, pipelineCache_, &sz, blob.data()) ==
-          VK_SUCCESS) {
-        if (FILE* f = std::fopen(pipelineCachePath_.c_str(), "wb")) {
-          std::fwrite(blob.data(), 1, sz, f);
-          std::fclose(f);
-        }
-      }
-    }
-  }
+  SavePipelineCache();
   if (pipelineCache_) {
     dfn_.DestroyPipelineCache(device_, pipelineCache_, nullptr);
     pipelineCache_ = VK_NULL_HANDLE;

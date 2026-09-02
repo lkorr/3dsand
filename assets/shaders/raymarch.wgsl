@@ -78,6 +78,11 @@
 // produces, unlike shadowCache above.
 @group(0) @binding(17) var<storage, read> openness    : array<u32>;
 @group(0) @binding(18) var<storage, read> opennessGen : array<u32>;
+// The irradiance grid (docs/PLAN_gi.md §3; common.wgsl IRRADIANCE GRID): the
+// radiance leaving each block-face, deposited by shadow_resolve.wgsl and the
+// openness walk, gathered here at every near-field hit (giGather). Read-only
+// until P2's write-back.
+@group(0) @binding(19) var<storage, read> irradiance : array<u32>;
 const RS_PX : u32 = 0u;          // sampled pixels (denominator)
 const RS_PRIMARY : u32 = 1u;     // trace() steps from fs's camera ray
 const RS_MEDIA : u32 = 2u;       // cells that accumulated media tau in trace()
@@ -2443,6 +2448,112 @@ fn ambientAt(n : vec3f) -> vec3f {
   let b = moonContribP(R.moon2Dir, R.moon2Phase, TUNE_MOON2_LIGHT_INTENSITY) * inv;
   let moonAmt = 0.30 * step(0.001, a + b) + 1.40 * (a + b) * 0.5;
   return mix(nightAmb * (0.45 + moonAmt), base, eclipseDayWeightP(R));
+}
+
+// ---- one-bounce gather over the irradiance grid (docs/PLAN_gi.md §3) -------
+// The second spatial term in the shade, after P0's openness. `irradiance` holds
+// the direct-lit radiance LEAVING every surface block-face (common.wgsl
+// IRRADIANCE GRID); this walks the 4^3 block grid from the hit along five
+// directions of the normal hemisphere — the normal and four 45-degree
+// diagonals, the same fan sim_openness.wgsl measures openness with — and for
+// the first blocker block each ray lands in, reads the face(s) of that block
+// that face back toward the receiver, weighted by the receiver's cosine, the
+// emitter's cosine and a mild distance falloff. Normalised by the fan's total
+// weight, so the result is a cosine-weighted MEAN radiance of what the surface
+// sees, and `albedo × gathered` is the receiver's own bounce at giStrength 1.
+//
+// A QUADRATURE OVER SOLID ANGLE, NOT A SUM OF SAMPLES. The stored value is
+// RADIANCE, which does not fall off with distance and carries no emitter
+// cosine of its own, so the estimator is E = Σ w_i L_i with w_i the
+// cosine-weighted solid angle each ray stands for (Σ w_i = 1): the normal
+// owns the cone within 30° (sin² 30° = 0.25) and the eight ring rays split the
+// rest (0.09375 each). The first sketch of this weighted five rays by cosine
+// and a 1/d falloff and gave a wall beside a sunlit floor 6% of the floor's
+// radiance; the true form factor for a wall over a large floor is 0.5, and
+// with nine rays three of them look down at it, which lands at 0.28 — the
+// remaining shortfall is what render.giStrength is for.
+//
+// NINE DIRECTIONS: the normal, four at 45° toward the tangents and four
+// toward the tangent corners. Three is asymmetric on every axis-aligned face
+// (a floor would see the walls on two of its four sides) and five leaves the
+// canonical case — a wall lit by the floor below it — to a single ray.
+//
+// WHICH FACE OF THE EMITTER. Along the normal there is one answer, the face
+// opposite ours. Along a leaning ray every axis it leans on names a face, so
+// each is read and weighted by that axis's share of the direction — a face
+// that holds no surface reads zero and drops out by itself, and an inside
+// corner (floor meeting wall in one block) contributes both, which is right.
+//
+// THE RECEIVER'S OWN BLOCK IS NEVER AN EMITTER. A one-voxel wall lives in one
+// block with both its faces; reading that block's far face from the near side
+// would be light leaking straight through the wall. Skipping it (and marching
+// on) is the whole difference between a lit room and a lit cave.
+//
+// REGISTERS. This sits in fs, which is at the 128-register cap and spills; the
+// loop state is kept to the accumulator, the direction and two block coords,
+// with no dynamic vector indexing (select chains only, common.wgsl axisVec).
+// The cost is measured by --render-budget's `nogi` arm.
+const GI_W_NORMAL : f32 = 0.25;
+const GI_W_RING : f32 = 0.09375;
+fn giGather(p : vec3f, n : vec3f, cell : vec3<i32>) -> vec3f {
+  let face = openFaceOfNormal(n);
+  let axis = i32(face >> 1u);
+  let t0 = vec3f(select(0.0, 1.0, axis == 1), select(0.0, 1.0, axis == 2),
+                 select(0.0, 1.0, axis == 0));
+  let t1 = vec3f(select(0.0, 1.0, axis == 2), select(0.0, 1.0, axis == 0),
+                 select(0.0, 1.0, axis == 1));
+  // THE ORIGIN IS PUSHED CLEAR OF THE RECEIVER'S OWN BLOCK along the normal.
+  // traceOpaque's coarse march tests the block it starts in, and a wall's
+  // block column reaches up to three voxels in front of its face, so a ray
+  // starting on the face would report the wall itself as the first emitter on
+  // every direction that leans toward its column — the first version of this
+  // function lit a wall beside a sunlit floor at 6% of the floor, and that
+  // was why. Half a voxel past the block's far plane: the same "never start on
+  // a boundary" rule sim_openness.wgsl's rays follow.
+  let ci = axisPickI(cell, axis);
+  let b0 = (ci >> SUBOCC_SHIFT) << SUBOCC_SHIFT;
+  let plane = f32(ci) + select(0.0, 1.0, (face & 1u) != 0u);
+  let dOut = select(plane - f32(b0), f32(b0 + i32(SUBOCC_BLOCK)) - plane,
+                    (face & 1u) != 0u) + 0.5;
+  let ro = p + n * dOut;
+  let maxSteps = TUNE_GI_GATHER_BLOCKS + 1;
+  var acc = vec3f(0.0);
+  for (var r = 0u; r < 9u; r++) {
+    // r = 0 the normal; 1..4 the tangent diagonals; 5..8 the corners.
+    let su = select(select(0.0, 1.0, r == 1u || r == 5u || r == 6u), -1.0,
+                    r == 2u || r == 7u || r == 8u);
+    let sv = select(select(0.0, 1.0, r == 3u || r == 5u || r == 7u), -1.0,
+                    r == 4u || r == 6u || r == 8u);
+    let d = normalize(n + t0 * su + t1 * sv);
+    let w = select(GI_W_RING, GI_W_NORMAL, r == 0u);
+    // Coarse from the first step: block steps over the blockers mask, the same
+    // march the openness pass and the shadow rays use, so a gather ray can
+    // never see through a wall the shadow ray cannot.
+    let s = traceOpaque(ro, d, maxSteps, 0.0, &occupancy, &materials);
+    if (!s.hit) { continue; }
+    let slot = chunkIndexW(s.cell);
+    // An emitter's light is only meaningful under a matching stamp.
+    if (opennessGen[slot] != opennessStamp(worldChunkOf(s.cell))) { continue; }
+    let lo = vec3<u32>(s.cell & vec3<i32>(i32(CHUNK) - 1));
+    let base = irrIndex(slot, subOccBitLocal(lo), 0u);
+    // EVERY FACE THE RAY LEANS ON, not the one it entered through. A 45-degree
+    // ray into a floor block enters through the block's SIDE as often as its
+    // top, and a floor block's side face holds no surface — the first version
+    // read the entry face alone and gathered exactly nothing from a floor.
+    // Each axis the direction has a component on names the face whose normal
+    // opposes it (face = axis*2 + (normal sign > 0)); they are weighted by the
+    // direction's share on that axis, so a face with no surface reads zero and
+    // drops out, and an inside corner contributes both of its faces.
+    let ax = abs(d.x);
+    let ay = abs(d.y);
+    let az = abs(d.z);
+    var e = vec3f(0.0);
+    if (ax > 0.1) { e += unpackRgb9e5(irradiance[base + 0u + select(0u, 1u, d.x < 0.0)]) * ax; }
+    if (ay > 0.1) { e += unpackRgb9e5(irradiance[base + 2u + select(0u, 1u, d.y < 0.0)]) * ay; }
+    if (az > 0.1) { e += unpackRgb9e5(irradiance[base + 4u + select(0u, 1u, d.z < 0.0)]) * az; }
+    acc += e * (w / (ax + ay + az));
+  }
+  return acc;
 }
 
 // ---- diffuse response ----
@@ -7165,6 +7276,17 @@ fn fs(in : VSOut) -> FSOut {
     // NOT — it already has its own shadow ray, and multiplying it by AO too
     // double-darkens contact regions into black smears.
     color = albedo * face * (ambientAt(n) * ao * openAmb + sun);
+    // ---- one-bounce indirect light, phase P1 (docs/PLAN_gi.md §3) ----
+    // What P0 could not do: a sealed room went to zero ambient and stayed
+    // there. giGather reads the direct-lit radiance the surrounding block-faces
+    // are sending this way and adds the receiver's bounce of it, occluded by
+    // the same `ao` as the sky term (bounce light does not reach into a crease
+    // either) and never by the openness scale, which measures SKY. The micro
+    // case gathers from the ground the tuft grows in, like the openness read.
+    // TUNE_GI_STRENGTH = 0 folds the whole call away (the `nogi` arm).
+    if (TUNE_GI_STRENGTH > 0.0) {
+      color += albedo * ao * giGather(hp, openN, openCell) * TUNE_GI_STRENGTH;
+    }
 
     // ---- caustics on a submerged surface ----
     // The rippling web of focused sunlight on anything under water. This is

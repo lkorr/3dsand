@@ -2362,6 +2362,14 @@ struct Tuning {
     float opennessStrength = 1.0f;      // 0 = old lerp AND the pass unrecorded
     int opennessBilinear = 1;           // blend the 4 blocks in the face plane
 
+    // ---- one-bounce indirect light (docs/PLAN_gi.md §3) ----
+    // The irradiance grid: injected by the shadow resolve pass and the
+    // openness walk, gathered at every near-field hit. Render-only.
+    float giStrength = 1.0f;            // 0 = everything const-folded away
+    float giDecay = 0.25f;              // per-visit fade of unmeasurable faces
+    float giFeedback = 0.0f;            // P2 write-back weight, < giDecay
+    int giGatherBlocks = 3;             // blocks per gather ray
+
     // drifting particulate. Render-only motes suspended in the water, which is
     // what gives the light shafts something visible to catch.
     float siltDensity = 0.55f;

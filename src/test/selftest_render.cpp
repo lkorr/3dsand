@@ -889,6 +889,252 @@ Status GateOpenness(Ctx& c, std::string& detail) {
 }
 
 // ---------------------------------------------------------------------------
+// gi-bounce: sunlit green ground tints the white wall standing beside it.
+//
+// WHAT IS UNDER TEST (docs/PLAN_gi.md §3, W3 P1). Two halves and both are
+// asserted: INJECTION — the shadow resolve pass deposits each lit patch's
+// albedo × sun into its block-face's irradiance word, so the green floor's +Y
+// face must read GREEN (G > R in the word itself); and the GATHER — the
+// raymarch reads the faces around a hit and adds the receiver's bounce, so a
+// white wall facing that floor must come out greener with giStrength = 1 than
+// with 0, on the same frame, from the same camera. The second claim is the one
+// the phase is judged by ("a window lights up the room it looks into"), and it
+// is measured as a DELTA between the two arms so the wall's own direct light
+// and ambient — which are identical in both — cancel exactly.
+//
+// THE FIXTURE floats: a 41x41 slab of `leaves` (plain solid, green, not micro
+// — a micro material is not a ray blocker and has no block-face entry) with
+// its top 0.9 m over the terrain at (300,300), and a `bone` wall (white) at
+// its -X edge whose +X face looks across the whole slab. Floating, because
+// rolling procgen ground under a wall would put its own light in the frame
+// and the assertion would then depend on what worldgen happens to grow there.
+//
+// WHY SIX FRAMES. Frame 1 registers the patches; the resolve pass deposits at
+// frame 2 (256 deposits per block-face at 1/16 each converge within it); the
+// gather reads the result from frame 3. Six leaves room for the far cascade
+// to settle so the two arms' skies are the same.
+//
+// THE REGION is the middle of the frame — the wall fills it at this distance
+// and the slab and sky only enter at the edges — so the assertion is about
+// the wall and not about the floor's own (smaller, whiter) bounce off it.
+uint32_t IrradianceWordAt(GpuContext& ctx, World& world, IVec3 c, uint32_t face) {
+  const IVec3 wc{c.x >> 4, c.y >> 4, c.z >> 4};
+  const uint32_t slot = World::SlotChunkIndex(wc);
+  const uint32_t lx = (uint32_t)(c.x & 15), ly = (uint32_t)(c.y & 15),
+                 lz = (uint32_t)(c.z & 15);
+  const uint32_t bx = lx >> kSubOccShift, by = ly >> kSubOccShift,
+                 bz = lz >> kSubOccShift;
+  const uint32_t block = (bz * kSubOccDim + by) * kSubOccDim + bx;
+  const uint64_t idx =
+      ((uint64_t)slot * kOpenBlocksPerChunk + block) * kOpenFaces + face;
+  rhi::Buffer stage =
+      CreateBuffer(ctx.device, 4,
+                   rhi::BufferUsage::MapRead | rhi::BufferUsage::CopyDst,
+                   "irradianceRead");
+  rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
+  enc.CopyBufferToBuffer(world.irradiance, idx * 4, stage, 0, 4);
+  ctx.queue.Submit(enc.Finish());
+  uint32_t w = 0;
+  if (!rhi::ReadBufferBlocking(ctx.device, stage, 0, &w, 4)) return 0;
+  return w;
+}
+
+// RGB9E5 decode, mirroring common.wgsl unpackRgb9e5 (bias 15, 9-bit mantissa).
+static void UnpackRgb9e5(uint32_t w, double out[3]) {
+  const int e = (int)(w >> 27);
+  const double scale = std::ldexp(1.0, e - 15 - 9);
+  out[0] = (double)(w & 511u) * scale;
+  out[1] = (double)((w >> 9) & 511u) * scale;
+  out[2] = (double)((w >> 18) & 511u) * scale;
+}
+
+Status GateGiBounce(Ctx& c, std::string& detail) {
+  GpuContext& ctx = c.ctx;
+  World& world = c.world;
+  Simulation& sim = c.sim;
+  const uint32_t W = c.width, H = c.height;
+
+  auto matNamed = [&](const char* name) -> uint32_t {
+    for (size_t i = 0; i < c.mats.size(); i++)
+      if (c.mats[i].name == name) return (uint32_t)i;
+    return 0;
+  };
+  const uint32_t mGreen = matNamed("leaves");
+  const uint32_t mWhite = matNamed("bone");
+  if (!mGreen || !mWhite) {
+    detail = "leaves/bone missing from materials.json";
+    return Status::Fail;
+  }
+  const Tuning base = CurrentTuning();
+  if (base.render.giStrength <= 0.0f) {
+    detail = "render.giStrength is 0 — the gather is compiled out";
+    return Status::Fail;
+  }
+
+  SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+  ctx.WaitIdle();
+
+  const int gx = 300, gz = 300;
+  const int ground = World::TerrainHeight(gx, gz, kDefaultSeed);
+  const int kHalf = 20;              // slab half-extent (2.0 m)
+  const int slabY = ground + 8;      // slab bottom; its top is slabY + 1
+  const int wallX = gx - kHalf;      // the wall stands on the slab's -X edge
+  const int kWallH = 14;             // wall height above the slab top
+  const IVec3 pchunk{gx / 16, slabY / 16, gz / 16};
+  std::vector<CellOp> fixture;
+  auto put = [&](int x, int y, int z, uint32_t m) {
+    const IVec3 cc{x, y, z};
+    if (!world.CellInWindow(cc)) return;
+    fixture.push_back({World::SlotCellIndex(cc), PackVoxNew(m, 0u)});
+  };
+  for (int dx = -kHalf; dx <= kHalf; dx++)
+    for (int dz = -kHalf; dz <= kHalf; dz++) {
+      put(gx + dx, slabY, gz + dz, mGreen);
+      put(gx + dx, slabY + 1, gz + dz, mGreen);
+    }
+  for (int dz = -kHalf; dz <= kHalf; dz++)
+    for (int y = 2; y < 2 + kWallH; y++) {
+      put(wallX, slabY + y, gz + dz, mWhite);
+      put(wallX - 1, slabY + y, gz + dz, mWhite);
+    }
+  if (fixture.empty()) {
+    detail = "fixture site is outside the residency window";
+    return Status::Fail;
+  }
+  uint32_t tick = 70000;
+  SubmitTick(ctx, world, sim, ++tick, kDefaultSeed, {}, {}, fixture, false,
+             pchunk, false, false);
+  ctx.WaitIdle();
+
+  // Noon, scanned rather than hardcoded (the shadow-cache gate says why).
+  uint32_t noonTick = 0;
+  {
+    float bestUp = -2.0f;
+    for (uint32_t t = 0; t < 200000u; t += 64u) {
+      const float up = ComputeSky(base, (double)t).sunDir[1];
+      if (up > bestUp) { bestUp = up; noonTick = t; }
+    }
+  }
+
+  // Facing the wall's +X face from over the middle of the slab, pitched down
+  // so the slab is IN THE FRAME: the resolve pass deposits only for patches
+  // somebody requested, and a floor nobody can see lights nothing on screen.
+  const Vec3 eye{(float)wallX + 14.0f, (float)(slabY + 2 + kWallH / 2),
+                 (float)gz};
+  Camera cam;
+  cam.yaw = 3.14159265f;   // -X
+  cam.pitch = -0.25f;
+
+  // The off-screen injection path, exercised on purpose: with the sun written
+  // (WriteRenderParams below is what the walk reads it from), two ticks that
+  // poke one slab cell put the slab's chunk on the dirty list, and the
+  // openness walk deposits its coarse sun sample into every face it marches
+  // there — the same faces the wall's rays will land on. Without this the
+  // gate would only ever measure what the camera can see, which is the
+  // narrower of the two halves.
+  WriteRenderParams(ctx.queue, world, eye, cam, (float)W / H, true, 0.0f,
+                    kFarFogDensity, (float)H, noonTick);
+  for (int i = 0; i < 2; i++) {
+    std::vector<CellOp> poke{
+        {World::SlotCellIndex(IVec3{gx, slabY, gz}), PackVoxNew(mGreen, 0u)}};
+    SubmitTick(ctx, world, sim, ++tick, kDefaultSeed, {}, {}, poke, false,
+               pchunk, false, false);
+  }
+  ctx.WaitIdle();
+
+  auto render = [&](uint32_t frames, std::vector<uint8_t>& out) -> bool {
+    rhi::Buffer shot =
+        CreateBuffer(ctx.device, (uint64_t)W * H * 4,
+                     rhi::BufferUsage::MapRead | rhi::BufferUsage::CopyDst,
+                     "giBounceShot");
+    for (uint32_t f = 0; f < frames; f++) {
+      WriteRenderParams(ctx.queue, world, eye, cam, (float)W / H, true, 0.0f,
+                        kFarFogDensity, (float)H, noonTick);
+      rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
+      sim.EncodeShadowResolve(enc);
+      rhi::RenderPass rp = sim.BeginRenderPass(
+          enc, c.view, rhi::TextureFormat::RGBA8Unorm, W, H);
+      sim.DrawWorld(rp);
+      rp.End();
+      if (f + 1 == frames) {
+        rhi::TexelCopyTexture srcT{};
+        srcT.texture = c.offscreen;
+        rhi::TexelCopyBuffer dstB{};
+        dstB.buffer = shot;
+        dstB.bytesPerRow = W * 4;
+        dstB.rowsPerImage = H;
+        rhi::Extent3D ext{W, H, 1};
+        enc.CopyTextureToBuffer(srcT, dstB, ext);
+      }
+      ctx.queue.Submit(enc.Finish());
+    }
+    out.assign((size_t)W * H * 4, 0);
+    return rhi::ReadBufferBlocking(ctx.device, shot, 0, out.data(), out.size());
+  };
+  auto arm = [&](float strength, std::vector<uint8_t>& out) -> bool {
+    Tuning t = base;
+    t.render.giStrength = strength;
+    SetCurrentTuning(t);
+    // The F5 path: TUNE_GI_STRENGTH is const-folded in three shaders.
+    if (!sim.ReloadShaders(ctx.device)) return false;
+    return render(6, out);
+  };
+
+  std::vector<uint8_t> onPx, offPx;
+  const bool got = arm(base.render.giStrength, onPx) && arm(0.0f, offPx);
+  // Injection, read straight from the word the resolve pass wrote for the
+  // slab top's +Y face at the foot of the wall — a cell that is IN THE FRAME,
+  // because the resolve pass only ever sees patches somebody requested, and
+  // the first version of this gate probed a cell below the bottom edge of the
+  // picture and read a clean zero. Read while the GI arm's deposits are still
+  // in the buffer (giStrength 0 folds the deposit away but never clears it).
+  double floorRgb[3] = {0, 0, 0};
+  UnpackRgb9e5(IrradianceWordAt(ctx, world, IVec3{wallX + 3, slabY + 1, gz}, 3u),
+               floorRgb);
+  SetCurrentTuning(base);
+  const bool restored = sim.ReloadShaders(ctx.device);
+  if (!got || !restored) {
+    detail = got ? "shader restore failed" : "render/readback failed";
+    return Status::Fail;
+  }
+
+  // Mean per-channel delta (on - off) over the middle of the frame.
+  double dR = 0, dG = 0, dB = 0;
+  size_t n = 0;
+  for (uint32_t y = H * 3 / 10; y < H * 6 / 10; y++)
+    for (uint32_t x = W * 3 / 10; x < W * 7 / 10; x++) {
+      const size_t i = ((size_t)y * W + x) * 4;
+      dR += (double)onPx[i] - offPx[i];
+      dG += (double)onPx[i + 1] - offPx[i + 1];
+      dB += (double)onPx[i + 2] - offPx[i + 2];
+      n++;
+    }
+  if (n) { dR /= (double)n; dG /= (double)n; dB /= (double)n; }
+
+  const double minGreen = BaselineNumber("giBounce.minGreenDelta", 2.0);
+  const double minOverRed = BaselineNumber("giBounce.minGreenOverRed", 1.0);
+  const bool injected = floorRgb[1] > floorRgb[0] && floorRgb[1] > 0.0;
+  const bool gathered = dG >= minGreen && (dG - dR) >= minOverRed;
+  const bool ok = injected && gathered;
+  std::printf(
+      "gi-bounce: %s (white wall beside a sunlit green slab: bounce delta "
+      "R %+.2f G %+.2f B %+.2f /255, G must be >= %.2f and exceed R by >= %.2f; "
+      "the slab's own +Y irradiance word reads (%.3f, %.3f, %.3f), G must lead; "
+      "%zu fixture cells at (%d,%d) ground y=%d)\n",
+      ok ? "PASS" : "FAIL", dR, dG, dB, minGreen, minOverRed, floorRgb[0],
+      floorRgb[1], floorRgb[2], fixture.size(), gx, gz, ground);
+  if (!ok) {
+    WriteBmpFile("build/gi_bounce_on.bmp", onPx, W, H);
+    WriteBmpFile("build/gi_bounce_off.bmp", offPx, W, H);
+  }
+  detail = Format("delta R %+.2f G %+.2f B %+.2f (G >= %.2f, G-R >= %.2f); floor "
+                  "word (%.3f, %.3f, %.3f)",
+                  dR, dG, dB, minGreen, minOverRed, floorRgb[0], floorRgb[1],
+                  floorRgb[2]);
+  return ok ? Status::Pass : Status::Fail;
+}
+
+// ---------------------------------------------------------------------------
 // shadow-cache: the voxel-keyed shadow cache agrees with the ray it replaced.
 //
 // WHY THIS GATE EXISTS. The cache does not reuse trace(). It cannot: trace()
@@ -1449,6 +1695,8 @@ const std::vector<Gate>& RenderGates() {
       // No render pass: it reads a compute-written buffer back, like the far
       // gates above and unlike the three that draw.
       {"openness", "render", {}, false, GateOpenness},
+      // Draws (two arms of a fixture frame) AND reads a word back.
+      {"gi-bounce", "render", {}, false, GateGiBounce, /*needsRender=*/true},
   };
   return g;
 }

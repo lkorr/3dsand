@@ -3102,6 +3102,92 @@ fn opennessScaleAtBody(worldPos : vec3f,
   return 1.0;
 }
 
+// ---- IRRADIANCE GRID (src/sim/world.h kIrradianceBytes, PLAN_gi.md §3) -----
+// Phase P1 of indirect light. One RGB9E5 word per (slot, 4^3 block, face) at
+// the SAME index the openness byte uses and under the SAME per-slot stamp
+// (opennessGen): the radiance LEAVING that block-face, i.e. albedo × sun ×
+// lambert × lit averaged over what has been seen of it. Two writers deposit
+// into it — shadow_resolve.wgsl for every patch it publishes (on-screen, per
+// frame) and sim_openness.wgsl's walk for one coarse sun sample per surface
+// face it marches (off-screen, per tick) — and raymarch.wgsl's giGather reads
+// it at every near-field hit. What lives here is what all three must agree on:
+// the index, the packing and the blend.
+//
+// THE BLEND IS AN EMA, NOT A SUM. A face can receive 256 deposits a frame (16
+// voxel faces × 16 patches at subdiv 4), so any bounded sum-and-count overflows
+// in a handful of frames and a per-frame reset needs a frame stamp the word
+// has no room for. Blending each sample in at a fixed rate needs only the
+// value: with dense deposits it converges within the frame, with sparse ones it
+// converges over a few, it is bounded by construction, and the races between
+// patches of one face (plain read-modify-write, by design) cost at most a lost
+// sample. At a shadow edge the value hovers at the mean of the lit and unlit
+// patches ± alpha × their spread, which is the flicker budget alpha buys.
+// Per-sample blend rates. RESOLVE: 256 deposits a frame at 1/16 converge fully
+// each frame (0.94^256 ≈ 0), four a frame (a distant face) in ~12 frames; the
+// flicker at a half-lit face is 1/16 of its spread. WALK: one coarse sample per
+// visit, 128 ticks apart (kNumChunks / opennessChunksPerFrame), so it has to
+// count for something or a face the camera never sees takes a minute to notice
+// the sun moved; for a visible face the resolve pass's deposits land in the
+// same frame's command stream AFTER the tick's walk and pull it back before
+// the draw reads it.
+const GI_RESOLVE_ALPHA : f32 = 1.0 / 16.0;
+const GI_WALK_ALPHA : f32 = 0.5;
+
+fn irrIndex(slot : u32, block : u32, face : u32) -> u32 {
+  return (slot * OPEN_BLOCKS + block) * OPEN_FACES + face;
+}
+fn irrIndexOfCell(c : vec3<i32>, face : u32) -> u32 {
+  let lo = vec3<u32>(c & vec3<i32>(i32(CHUNK) - 1));
+  return irrIndex(chunkIndexW(c), subOccBitLocal(lo), face);
+}
+
+// RGB9E5: three 9-bit mantissas under one 5-bit exponent (bias 15), the
+// GL_EXT_texture_shared_exponent layout. Chosen over three fixed-point lanes
+// because a noon deposit (~1.5) and a moonlit one (~0.004) differ by 400x and
+// the TINT of the bounce is the whole point — fixed point would keep one and
+// quantise the other to a single step. Negative input is clamped to 0; the
+// carry that rounding can push to 512 bumps the exponent rather than wrapping.
+const RGB9E5_MAX : f32 = 65408.0;
+fn packRgb9e5(cIn : vec3f) -> u32 {
+  let c = clamp(cIn, vec3f(0.0), vec3f(RGB9E5_MAX));
+  let maxc = max(max(c.r, c.g), c.b);
+  if (maxc < 1e-9) { return 0u; }
+  var e = clamp(i32(floor(log2(maxc))) + 1 + 15, 0, 31);
+  var scale = exp2(f32(e - 15 - 9));
+  var m = vec3<u32>(floor(c / scale + vec3f(0.5)));
+  if (max(max(m.r, m.g), m.b) > 511u) {
+    e = min(e + 1, 31);
+    scale = exp2(f32(e - 15 - 9));
+    m = min(vec3<u32>(floor(c / scale + vec3f(0.5))), vec3<u32>(511u));
+  }
+  return m.r | (m.g << 9u) | (m.b << 18u) | (u32(e) << 27u);
+}
+fn unpackRgb9e5(w : u32) -> vec3f {
+  let scale = exp2(f32(i32(w >> 27u) - 15 - 9));
+  return vec3f(f32(w & 511u), f32((w >> 9u) & 511u), f32((w >> 18u) & 511u)) *
+         scale;
+}
+
+// Blend one radiance sample into a block-face word. `stampOk` false means the
+// slot's stamp does not name the chunk this sample came from — the window has
+// reused the slot — so the blend starts from zero rather than from the light of
+// a chunk that is no longer there.
+fn irrDeposit(idx : u32, sample : vec3f, alpha : f32, stampOk : bool,
+              irr : ptr<storage, array<u32>, read_write>) {
+  let old = select(vec3f(0.0), unpackRgb9e5((*irr)[idx]), stampOk);
+  (*irr)[idx] = packRgb9e5(mix(old, sample, alpha));
+}
+
+// The direct-lit radiance a surface voxel sends out: what both injection paths
+// deposit. `lit` is the shadow term (the resolve pass's softened value or the
+// walk's coarse one), `L`/`sunCol` the key light from RenderParams. Plain
+// Lambert, not raymarch.wgsl's wrapDiffuse: the wrap is a shading cheat for the
+// terrace staircase, and light that is not there should not bounce.
+fn irrSample(albedo : vec3f, n : vec3f, L : vec3f, sunCol : vec3f, lit : f32)
+    -> vec3f {
+  return albedo * sunCol * (max(dot(n, L), 0.0) * lit);
+}
+
 // ---- VOXEL-KEYED SHADOW CACHE (src/sim/world.h kShadowCacheBuckets) --------
 // The identity and packing shared by the two halves of the cache:
 // raymarch.wgsl READS a patch's shadow factor and REGISTERS the patch, and

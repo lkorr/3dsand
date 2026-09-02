@@ -134,6 +134,31 @@ constexpr uint64_t kShotInvCaptureFrame = 240;  // -> ..._health.bmp; last frame
 
 // --frames N (phase 4b D3): windowed verification harness. 0 = play normally.
 uint64_t g_harnessFrames = 0;
+
+// ---- STARTUP TIMELINE ------------------------------------------------------
+// One stderr line per startup phase: wall seconds since main(), the wall and
+// the PROCESS CPU seconds (every thread, user + kernel) since the previous
+// mark. The CPU column is the one that NAMES a stall: a phase that costs 90 s
+// of wall and 2 s of CPU is waiting (GPU, a fence, a lock); one that costs 90 s
+// of wall and 1,000 s of CPU is a driver thread pool compiling something — the
+// NVIDIA pipeline compiler is the only multi-threaded work this process does
+// before the first tick (Jolt's pool has nothing to step yet). Always on: it is
+// ~15 lines per launch, and the one time it mattered (a multi-minute white
+// window on a fresh build, docs/PLAN_lin_followups.md §6 T1) nobody had timed
+// a launch before and after the week's landings, and three plausible causes
+// were argued from what had changed instead of from a clock.
+void StartupMark(const char* phase) {
+  static const double t0 = NowSeconds();
+  static double tPrev = t0;
+  static double cPrev = ProcessCpuSeconds();
+  const double t = NowSeconds();
+  const double c = ProcessCpuSeconds();
+  std::fprintf(stderr, "[startup %7.2fs | +%7.2fs wall  +%8.2fs cpu] %s\n",
+               t - t0, t - tPrev, c - cPrev, phase);
+  std::fflush(stderr);
+  tPrev = t;
+  cPrev = c;
+}
 bool g_autofly = false;
 bool g_autoflyHard = false;  // --autofly-hard: adversarial traversal for pool sizing
 // --autofly-surface: the RENDERER's adversarial traversal, the complement of
@@ -2325,6 +2350,7 @@ int WriteHeightmap(const std::string& spec, const std::string& outPath) {
 
 int main(int argc, char** argv) {
   InstallCrashHandler();
+  StartupMark("main");
 
   // --crash-test: fault on purpose, so the crash REPORTER is verifiable.
   // The handler is the one piece of code whose correctness cannot be observed
@@ -3039,6 +3065,7 @@ int main(int argc, char** argv) {
     window = glfwCreateWindow(1600, 900, "sandvox", nullptr, nullptr);
     if (!window) return 1;
   }
+  StartupMark("assets loaded (materials, micro, trees), window created");
 
   // RENDER_STATS (gpu/resources.h): the raymarch's per-call-site step
   // counters compile in only for the consumer that reads them back â€” the live
@@ -3057,6 +3084,7 @@ int main(int argc, char** argv) {
                 backend, vkValidation,
                 sledgehammer))
     return 1;
+  StartupMark("device + swapchain");
 
   // ARM PIPELINE STATISTICS CAPTURE BEFORE THE FIRST PIPELINE EXISTS. This is
   // the whole reason --shader-stats is a bool up here instead of a runner
@@ -3072,10 +3100,12 @@ int main(int argc, char** argv) {
   world.residency =
       residencyPaged ? World::Residency::Paged : World::Residency::Dense;
   world.Init(ctx.device);
+  StartupMark("world buffers (page pool, far cascades)");
   Simulation sim;
   if (!sim.Init(ctx.device, world, mats, reactions, micro, treeAtlas,
                 assetDir + "/shaders"))
     return 1;
+  StartupMark("sim init: every compute shader through Tint + the driver");
 
   // --shader-stats answers HERE, before a player, a physics world or a single
   // tick exists: every pipeline in the engine has now been created, which is
@@ -3209,6 +3239,7 @@ int main(int argc, char** argv) {
   stream.OnMaterialsReloaded(mats);
   FarField far;
   far.Init(&world);
+  StartupMark("physics, debris, mobs, far-field init");
 
   if (measure) return RunMeasure(ctx, world, sim, mats);
   if (renderBudget)
@@ -3332,6 +3363,7 @@ int main(int argc, char** argv) {
   // A failed init is not an error anywhere â€” the game runs silent.
   audio::Cues audioCues;
   if (!noAudio) audioCues.Init(assetDir + "/sounds", mats);
+  StartupMark("imgui overlay + audio");
 
   UIState ui;
   // The wind overlay's authored initial state (F4 toggles from here). Seeded
@@ -3448,6 +3480,7 @@ int main(int argc, char** argv) {
   std::vector<uint32_t> classOf = BuildCollisionClasses(mats);
 
   SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+  StartupMark("worldgen submitted");
 
   Camera cam;
   Player player;
@@ -3511,6 +3544,7 @@ int main(int argc, char** argv) {
   // drains at kFarListCap level-chunks per tick through SubmitTick)
   far.FullRefill({ifloor(player.pos.x) >> 4, ifloor(player.pos.y) >> 4,
                   ifloor(player.pos.z) >> 4});
+  StartupMark("far-field refill queued");
   // kinematic capsule proxy so debris collides with (and is shoved by) the
   // player; terrain collision stays in the AABB controller
   uint64_t playerBody = phys.CreatePlayerBody(Player::kHalfXZ, Player::kHalfY);
@@ -3859,6 +3893,8 @@ int main(int argc, char** argv) {
   // cleanly through the normal shutdown â€” so "window opens, world renders,
   // reload works, clean exit" is checkable without a human at the keyboard.
   uint64_t frameCounter = 0;
+  StartupMark("frame loop entered");
+  uint64_t startupFrame = 0;
   while (!glfwWindowShouldClose(window)) {
     if (g_harnessFrames > 0) {
       frameCounter++;
@@ -7824,6 +7860,16 @@ int main(int argc, char** argv) {
     uint32_t frameStalls = 0;
     uint32_t frameDeclines = 0;
     const double frameWallMs = (NowSeconds() - now) * 1000.0;
+    // The tail of the startup timeline: the first frames are where the lazily
+    // created graphics pipelines, the far-field drain and the first ticks land.
+    startupFrame++;
+    if (startupFrame <= 3 || startupFrame == 10 || startupFrame == 30 ||
+        startupFrame == 60) {
+      char buf[64];
+      std::snprintf(buf, sizeof buf, "frame %llu presented",
+                    (unsigned long long)startupFrame);
+      StartupMark(buf);
+    }
     if (sandvox::PerfScopesOn()) {
       // Zeroes as it copies, so a span straddling this point cannot be counted
       // into two frames.

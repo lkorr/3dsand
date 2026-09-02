@@ -550,6 +550,28 @@ constexpr uint64_t kOpennessBytes =
     (uint64_t)kNumChunks * kOpenWordsPerChunk * 4;          // 12 MiB at 512^3
 constexpr uint64_t kOpennessGenBytes = (uint64_t)kNumChunks * 4;   // 128 KiB
 
+// ---- the IRRADIANCE grid (docs/PLAN_gi.md §3, W3 P1) -----------------------
+// One u32 per (slot, 4^3 block, face) — the SAME identity the openness byte
+// has, so the two grids share a stamp (`opennessGen`) and a face encoding —
+// holding the RGB9E5-packed radiance LEAVING that block-face: albedo × sun ×
+// lambert × lit, averaged over the patches the shadow resolve pass has seen
+// there. Render-only derived data with exactly the openness grid's standing:
+// never hashed, never saved, the sim has no binding for it, and it is written
+// by two render-path passes (shadow_resolve.wgsl on publish, sim_openness.wgsl
+// on the dirty/refresh walk) and read by the raymarch's one-bounce gather.
+//
+// WHY ONE PACKED WORD AND NOT SUM + COUNT. An atomic sum needs a count to
+// divide by, and 256 patches per block-face per frame (16 voxel faces × 16
+// patches at subdiv 4) overflow any bounded count in a handful of frames; a
+// count that resets per frame needs a frame stamp the word has no room for.
+// The writer instead blends toward each new sample (an EMA, sim_openness.wgsl
+// says the rates), which needs nothing but the value, converges within a frame
+// where deposits are dense and is bounded by construction. RGB9E5 rather than
+// three fixed-point lanes because the sun-lit day value and a moonlit night
+// value differ by ~400x and the tint of the bounce is the whole point.
+constexpr uint64_t kIrradianceBytes =
+    (uint64_t)kNumChunks * kOpenBlocksPerChunk * kOpenFaces * 4;   // 48 MiB at 512^3
+
 // The residency window is toroidal, so a slot is reused by a new chunk as the
 // window walks. Its 384 openness bytes then describe geometry that is no longer
 // there, and the reader has no way to tell — the grid is not dirty-tracked the
@@ -2511,6 +2533,11 @@ class World {
   // would read as a valid stamp for whatever garbage the driver left).
   rhi::Buffer openness;       // kNumChunks * kOpenWordsPerChunk u32 (12 MiB)
   rhi::Buffer opennessGen;    // kNumChunks u32 — the world-chunk stamp per slot
+  // ---- irradiance grid (the kIrradianceBytes block above) ----
+  // Written by the shadow resolve pass (compute, per frame) and the openness
+  // walk (compute, per tick), read by the raymarch's gather; keyed like
+  // `openness` and stamped by `opennessGen`. CopySrc for `--gate gi-bounce`.
+  rhi::Buffer irradiance;     // kNumChunks * blocks * faces u32 (48 MiB)
   // The second buffer a fragment shader writes, and the same argument applies:
   // measurement-only counters (kRenderStat* above), read back by the telemetry
   // path through rhi::CommandEncoder::CopyRenderWritten. 4 KiB.

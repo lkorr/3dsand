@@ -201,6 +201,9 @@ BUF_TO_WGSL = {
     # row covers because a fragment shader is not a table row.
     "Openness": {"openness"},
     "OpennessGen": {"opennessGen"},
+    # The irradiance grid (PLAN_gi.md 3): binding 29 of simBGL_, 8 of the
+    # shadow group, 19 of the render group.
+    "Irradiance": {"irradiance"},
     "PageFaults": {"pageFaults"},
     # MLS-MPM fluid (sim_fluid.wgsl + sim_fluid_seam.wgsl). The particle pair
     # is symbolic: the solver and every seam pass except the compaction source
@@ -267,6 +270,8 @@ _SIM_GROUP0 = {
     "waterSpawnOps",
     # The openness grid, bindings 27/28.
     "openness", "opennessGen",
+    # The irradiance grid, binding 29.
+    "irradiance",
 }
 # The slim group is 0..4 PLUS the two page buffers at 17/18 — not a dense
 # prefix any more. One WGSL identifier cannot carry two binding numbers

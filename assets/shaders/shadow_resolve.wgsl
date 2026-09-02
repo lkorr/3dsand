@@ -77,6 +77,12 @@
 @group(0) @binding(5) var<storage, read_write> shadowCache : array<atomic<u32>>;
 @group(0) @binding(6) var<storage, read_write> shadowReq : array<atomic<u32>>;
 @group(0) @binding(7) var<storage, read_write> shadowArgs : array<u32>;
+// P1 direct injection (docs/PLAN_gi.md §3; common.wgsl IRRADIANCE GRID): every
+// patch this pass publishes also deposits its lit radiance into its block-face.
+// `opennessGen` is the per-slot stamp shared with the openness grid, read so
+// a slot the window has reused starts its blend from zero.
+@group(0) @binding(8) var<storage, read_write> irradiance  : array<u32>;
+@group(0) @binding(9) var<storage, read>       opennessGen : array<u32>;
 
 // --------------------------------------------------------------- passes ----
 
@@ -163,6 +169,25 @@ fn resolve(@builtin(global_invocation_id) gid : vec3<u32>) {
     let dM = s.t * VOXEL_METERS;
     v = clamp(smoothstep(TUNE_SHADOW_SOFT_NEAR, TUNE_SHADOW_SOFT_FAR, dM) *
               TUNE_SHADOW_LIFT, 0.0, 1.0);
+  }
+
+  // ---- P1 direct injection (docs/PLAN_gi.md §3) ----
+  // The patch is a lit (or shadowed) piece of a real surface and this pass is
+  // the one place that knows its cell, its face and its shadow term at once, so
+  // it deposits albedo × sun × lambert × lit into the block-face word here —
+  // one voxel-word read on top of the ray. Not guarded by the cache publish
+  // below: a slot that changed hands is a cache-identity problem and the light
+  // is still real. Buried patches (the cell in front is solid) deposit nothing
+  // — no surface anyone sees, and a bilinear reader would never ask. Racy
+  // against the other patches of the same face by design; see irrDeposit.
+  if (TUNE_GI_STRENGTH > 0.0 && !buried) {
+    let pw = voxWordAt(cell);
+    let pm = materials[voxMat(pw)];
+    let albedo = paletteColor(pm, voxState(pw), &materials);
+    let sample = irrSample(albedo, n3, keyLightDirP(R), keyLightColorP(R), v);
+    let stampOk = opennessGen[chunkIndexW(cell)] == opennessStamp(worldChunkOf(cell));
+    irrDeposit(irrIndexOfCell(cell, face), sample, GI_RESOLVE_ALPHA, stampOk,
+               &irradiance);
   }
 
   // Publish, guarded on the slot still being OURS — key AND verifier. A slot

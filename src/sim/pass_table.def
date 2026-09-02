@@ -409,10 +409,14 @@ PASS(farDown, "farDown", PT_TICK, PIPE_FAR_DOWN, K_INDIRECT, IND_DISPATCHARGS,0,
 // No W(Voxels), no A(DirtyOut), no A(PageFaults): the kernel writes nothing but
 // its own two buffers and cannot wake a chunk. That is the whole of its claim
 // to being render-only, and it is checkable — `--gate sleep` would notice.
+// W(Irradiance) since P1 (docs/PLAN_gi.md §3): the same walk that writes a
+// face's openness byte now also decays its irradiance word and, for a face it
+// marches, blends in one coarse sun sample — the off-screen half of direct
+// injection. Its other writer is shadow_resolve on the per-frame table.
 PASS(opennessDirty, "openness", PT_TICK, PIPE_OPENNESS_DIRTY, K_INDIRECT, IND_DISPATCHARGS,0,0,
      GRP_SIM, DYN_ZERO, C_OPENNESS, 1,
-     USES(R(Voxels) R(Materials) U(TickUBO) R(Occupancy) R(DirtyList)
-          I(DispatchArgs) R(PageTable) W(Openness) W(OpennessGen)))
+     USES(R(Voxels) R(Materials) U(TickUBO) U(RenderUBO) R(Occupancy) R(DirtyList)
+          I(DispatchArgs) R(PageTable) W(Openness) W(OpennessGen) W(Irradiance)))
 // The rolling refresh: render.opennessChunksPerFrame slots per tick, round
 // robin from a cursor derived from T.tick, so the whole window revisits in
 // kNumChunks / budget ticks. The dirty walk above covers every EDIT; this
@@ -424,8 +428,8 @@ PASS(opennessDirty, "openness", PT_TICK, PIPE_OPENNESS_DIRTY, K_INDIRECT, IND_DI
 // skipped, and this one is the only thing keeping the grid alive across it.
 PASS(opennessRefresh, "openness", PT_TICK, PIPE_OPENNESS_REFRESH, K_COMPUTE, D_OPENCHUNKS,1,1,
      GRP_SIM, DYN_ZERO, C_OPENNESS, 1,
-     USES(R(Voxels) R(Materials) U(TickUBO) R(Occupancy) R(PageTable)
-          W(Openness) W(OpennessGen)))
+     USES(R(Voxels) R(Materials) U(TickUBO) U(RenderUBO) R(Occupancy) R(PageTable)
+          W(Openness) W(OpennessGen) W(Irradiance)))
 
 // (The MLS-MPM spawn row moved into PT_FLUIDSEAM: with settle deleting
 // particles and excite creating them GPU-side, appends go through the seam's
@@ -600,10 +604,18 @@ PASS(copy_shadowArgs, nullptr, PT_SHADOWCACHE, PIPE_NONE, K_COPY, 0,0,12, GRP_NO
 // whose count no CPU field mirrors. R(Voxels)/R(Occupancy)/R(PageTable) are the
 // march; U(RenderUBO) is the sun direction, the window origin and the frame
 // counter the bucket is stamped with.
+// W(Irradiance) + R(OpennessGen) since P1 (docs/PLAN_gi.md §3): on publish
+// the pass also blends the patch's lit radiance into its block-face's
+// irradiance word — direct injection, the on-screen half. The stamp read is
+// what lets a slot the window has reused start its blend from zero rather
+// than from the previous chunk's light. The write is a plain read-modify-
+// write that races between patches of one face by design (render-only, the
+// result is an average either way); W rather than A because it is not
+// atomic and the barrier mapping is the same.
 PASS(shadow_resolve, "shadowResolve", PT_SHADOWCACHE, PIPE_SHADOW_RESOLVE, K_INDIRECT, IND_SHADOWARGS,1,1,
      GRP_SHADOW, DYN_NONE, C_ALWAYS, 1,
      USES(R(Voxels) R(Occupancy) R(Materials) U(RenderUBO) R(PageTable)
-          A(ShadowCache) A(ShadowReq) I(ShadowArgs)))
+          A(ShadowCache) A(ShadowReq) I(ShadowArgs) W(Irradiance) R(OpennessGen)))
 
 // =========================================================== PT_FLUID ======
 // ONE MLS-MPM SUBSTEP (docs/PLAN_mpm_fluids.md; sim_fluid.wgsl). Recorded

@@ -248,6 +248,9 @@ class Backend {
             const char* const* instanceExts = nullptr, uint32_t instanceExtCount = 0,
             bool wantSwapchain = false);
   void Shutdown();
+  // Persist the driver pipeline cache to disk now (see the definition for why
+  // Shutdown is the wrong only-place). Safe to call any time after Init.
+  void SavePipelineCache();
 
   const Caps& GetCaps() const { return caps_; }
 

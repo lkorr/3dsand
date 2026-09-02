@@ -2056,6 +2056,10 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadI(*g, "opennessChunksPerFrame", r.opennessChunksPerFrame, out, at);
     ReadF(*g, "opennessStrength", r.opennessStrength, out, at);
     ReadI(*g, "opennessBilinear", r.opennessBilinear, out, at);
+    ReadF(*g, "giStrength", r.giStrength, out, at);
+    ReadF(*g, "giDecay", r.giDecay, out, at);
+    ReadF(*g, "giFeedback", r.giFeedback, out, at);
+    ReadI(*g, "giGatherBlocks", r.giGatherBlocks, out, at);
     // Zero step budgets compile fine and render nothing; a zero white point or
     // gamma divides by zero in the tonemap. Guard the ones that break the
     // image rather than merely change it.
@@ -2183,6 +2187,23 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     if (r.opennessReach < 0.0f) { r.opennessReach = 0.0f; }
     r.opennessStrength = std::clamp(r.opennessStrength, 0.0f, 1.0f);
     if (r.opennessChunksPerFrame < 0) { r.opennessChunksPerFrame = 0; }
+    // Indirect light (PLAN_gi.md §3-4). A negative strength would subtract
+    // light; a decay outside [0,1] is meaningless; and the P2 write-back must
+    // stay strictly below the decay or every bounce adds more than the walk
+    // forgets and the grid brightens without bound. That last one is the
+    // assertion PLAN_gi.md §4 asks for, expressed as a warning plus a clamp
+    // because a bad value is one keystroke away in the tuner and must not
+    // take the game down.
+    if (r.giStrength < 0.0f) { r.giStrength = 0.0f; }
+    r.giDecay = std::clamp(r.giDecay, 0.0f, 1.0f);
+    r.giFeedback = std::clamp(r.giFeedback, 0.0f, 1.0f);
+    if (r.giFeedback > 0.0f && r.giFeedback >= r.giDecay) {
+      out.warnings.push_back(
+          "render.giFeedback must be below render.giDecay (multi-bounce would "
+          "brighten without bound); clamped");
+      r.giFeedback = std::max(0.0f, r.giDecay * 0.5f);
+    }
+    r.giGatherBlocks = std::clamp(r.giGatherBlocks, 0, 8);
   }
 
   if (const json* g = Find(j, "worldgen")) {

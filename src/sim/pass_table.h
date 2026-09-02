@@ -133,6 +133,12 @@ enum class Buf : uint8_t {
   // table does not know about generates no barrier.
   Openness,
   OpennessGen,
+  // ---- the irradiance grid (world.h kIrradianceBytes, PLAN_gi.md §3) ----
+  // Same standing; written by shadow_resolve (per frame) AND the openness walk
+  // (per tick), so it carries a write in two tables and the recorder's
+  // per-command-buffer tracker plus the global barrier every buffer opens with
+  // are what order them.
+  Irradiance,
   kCount,
 };
 

@@ -309,6 +309,25 @@ TP_F(render, opennessStrength, TUNE_OPENNESS_STRENGTH, 1.0f)
 // reads on a hit that has already paid for a chunk lookup.
 TP_I(render, opennessBilinear, TUNE_OPENNESS_BILINEAR, 1)
 
+// ---- one-bounce indirect light (docs/PLAN_gi.md §3, W3 P1) ----
+// Weight of the gathered bounce added at every near-field hit. 0 is an EXACT
+// off switch: the gather, the resolve-pass injection and the walk's sun
+// sample all const-fold away, which is what the `nogi` --render-budget arm
+// measures.
+TP_F(render, giStrength, TUNE_GI_STRENGTH, 1.0f)
+// Fraction of a face's irradiance the openness walk forgets per visit when it
+// cannot re-measure the face (its front block holds a blocker, so no sun ray
+// can be cast from it) -- how fast light deposited under an old sun fades
+// once no patch of that face is on screen to re-deposit it.
+TP_F(render, giDecay, TUNE_GI_DECAY, 0.25f)
+// P2 (PLAN_gi.md §4): fraction of a receiver's own gathered term blended back
+// into its block-face per frame, so bounces compound. 0 = one bounce only.
+// LoadTuning keeps it strictly below giDecay or the grid brightens without
+// bound.
+TP_F(render, giFeedback, TUNE_GI_FEEDBACK, 0.0f)
+// 4^3 blocks each of the five gather rays steps through (3 = 1.2 m).
+TP_I(render, giGatherBlocks, TUNE_GI_GATHER_BLOCKS, 3)
+
 // ---- drifting particulate (silt) ----
 // Render-only motes in the water volume. This is what gives the shafts
 // something to catch, and it is most of why footage reads as underwater.

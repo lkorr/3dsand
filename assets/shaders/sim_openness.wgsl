@@ -50,8 +50,17 @@
 @group(0) @binding(7) var<storage, read> occupancy : array<u32>;
 @group(0) @binding(12) var<storage, read> dirtyList : array<u32>;
 @group(0) @binding(17) var<storage, read> pageTable : array<u32>;
+// The key light, for P1's off-screen injection (below): the same RenderParams
+// the sim group already carries for sim_pick.wgsl, so a compute pass on the
+// tick table can ask which way the sun points without a second uniform.
+@group(0) @binding(10) var<uniform> R : RenderParams;
 @group(0) @binding(27) var<storage, read_write> openness    : array<u32>;
 @group(0) @binding(28) var<storage, read_write> opennessGen : array<u32>;
+// P1 (docs/PLAN_gi.md §3; common.wgsl IRRADIANCE GRID): the same walk that
+// measures a face's openness now also keeps its irradiance word honest — zero
+// where there is no surface, decayed where it cannot look, one coarse sun
+// sample where it can.
+@group(0) @binding(29) var<storage, read_write> irradiance  : array<u32>;
 
 // ------------------------------------------------------------------ rays ----
 // FIVE directions in the face's hemisphere: the normal, and four at 45 degrees
@@ -140,7 +149,10 @@ fn openValueAt(blockMin : vec3<i32>, face : u32) -> u32 {
   // Nothing real is lost: the faces P0 exists to darken — a cave floor, a room
   // floor, the ground under an overhang — all have AIR in the block in front of
   // them, so they march.
-  if (openBlockBlocked(vec3<i32>(floor(ro)))) { return 255u; }
+  // 256, not 255, so the caller can tell "no opinion" from a face that marched
+  // and found the whole hemisphere open (a legitimate 255): P1's irradiance
+  // keeps a different word for each. The caller clamps it into the byte.
+  if (openBlockBlocked(vec3<i32>(floor(ro)))) { return 256u; }
 
   // Tangents of the face, as unit axes. A 45-degree ray is normalize(n +- t).
   let axis = face >> 1u;
@@ -175,21 +187,81 @@ fn openValueAt(blockMin : vec3<i32>, face : u32) -> u32 {
   return u32(clamp(openW / OPEN_WEIGHT_TOTAL, 0.0, 1.0) * 255.0 + 0.5);
 }
 
+// ---- P1: the walk's coarse sun sample (docs/PLAN_gi.md §3) -----------------
+// The off-screen half of direct injection. The shadow resolve pass deposits
+// light only for patches somebody is looking at; a face nobody has seen since
+// the sun moved would keep yesterday's light forever. So a face this walk
+// MARCHES (its front block is air, so a ray can leave it) also gets ONE coarse
+// sun ray from its centre and the first blocker voxel behind its plane, and
+// blends that into its word at GI_WALK_ALPHA. Coarse in both senses — a block
+// mask shadow and one voxel's albedo for a 16-voxel face — which is why the
+// resolve pass's fine deposits outrank it wherever they exist (they land later
+// in the same frame's command stream). Returns w = 0 when the column under the
+// face centre holds no blocker at all (a block with one voxel in a corner):
+// then the walk has no albedo to speak of and leaves the word alone rather than
+// pulling a real deposit toward zero.
+fn openSunSample(blockMin : vec3<i32>, face : u32) -> vec4f {
+  let n = openFaceNormal(face);
+  let L = keyLightDirP(R);
+  if (dot(n, L) <= 0.0) { return vec4f(0.0, 0.0, 0.0, 1.0); }   // faces away: unlit, and that IS the sample
+  let half = f32(SUBOCC_BLOCK) * 0.5;
+  let centre = vec3f(blockMin) + vec3f(half);
+  // The first blocker voxel under the face centre, stepping inward from the
+  // face plane through at most the block's own depth.
+  let ni = vec3<i32>(round(n));
+  var c = vec3<i32>(floor(centre + n * (half - 0.5)));
+  var albedo = vec3f(0.0);
+  var found = false;
+  for (var i = 0u; i < SUBOCC_BLOCK; i++) {
+    let w = voxWordAt(c);
+    let m = materials[voxMat(w)];
+    if (isRayBlocker(m)) {
+      albedo = paletteColor(m, voxState(w), &materials);
+      found = true;
+      break;
+    }
+    c -= ni;
+  }
+  if (!found) { return vec4f(0.0); }
+  // The sun ray: the same origin the openness rays use (half a voxel into the
+  // air block in front), coarse from the first step, softened by distance to
+  // the blocker exactly as shadow_resolve.wgsl softens its ray, so the two
+  // injection paths agree about what "lit" means.
+  let ro = centre + n * (half + 0.5);
+  let s = traceOpaque(ro, L, TUNE_SHADOW_STEPS, 0.0, &occupancy, &materials);
+  var lit = 1.0;
+  if (s.hit) {
+    let dM = s.t * VOXEL_METERS;
+    lit = clamp(smoothstep(TUNE_SHADOW_SOFT_NEAR, TUNE_SHADOW_SOFT_FAR, dM) *
+                TUNE_SHADOW_LIFT, 0.0, 1.0);
+  }
+  return vec4f(irrSample(albedo, n, L, keyLightColorP(R), lit), 1.0);
+}
+
 // One chunk slot. `li` is both the thread index and the WORD index within the
 // chunk's OPEN_WORDS_PER_CHUNK-word run.
 fn openChunk(slot : u32, li : u32, origin : vec3<i32>) {
   let wc = openWorldChunk(slot, origin);
   let chunkMin = wc * i32(CHUNK);
-  // The stamp first, from thread 0. Written unconditionally, including for a
-  // chunk with no matter in it at all: "computed, and the answer is open" is a
+  let stamp = opennessStamp(wc);
+  // P1: every thread decides from the OLD stamp whether the irradiance words it
+  // owns describe this chunk (blend into them) or a chunk that has since
+  // streamed out of this slot (start from zero). Read by all before thread 0
+  // stores the new one, with the barrier between, so no thread can see its own
+  // workgroup's store.
+  let stampOk = opennessGen[slot] == stamp;
+  workgroupBarrier();
+  // The stamp, from thread 0. Written unconditionally, including for a chunk
+  // with no matter in it at all: "computed, and the answer is open" is a
   // different statement from "never computed", and only the stamp carries it.
-  if (li == 0u) { opennessGen[slot] = opennessStamp(wc); }
+  if (li == 0u) { opennessGen[slot] = stamp; }
 
   var packed = 0u;
   for (var k = 0u; k < 4u; k++) {
     let byteIdx = li * 4u + k;
     let block = byteIdx / OPEN_FACES;
     let face = byteIdx % OPEN_FACES;
+    let idx = irrIndex(slot, block, face);
 
     // No blocker anywhere in this block: there is no surface here, so no reader
     // will ever look at this byte (a reader indexes the block of a cell it just
@@ -204,7 +276,29 @@ fn openChunk(slot : u32, li : u32, origin : vec3<i32>) {
     if ((sw & (1u << (block & 31u))) != 0u) {
       let blockMin = chunkMin + vec3<i32>(i32(bx), i32(by), i32(bz)) *
                                     i32(SUBOCC_BLOCK);
-      v = openValueAt(blockMin, face);
+      let ov = openValueAt(blockMin, face);
+      v = min(ov, 255u);
+      // ---- P1: keep the face's irradiance word honest ----
+      // Marched: blend in one coarse sun sample. Could not march (a blocker
+      // in front — a terrace riser, or buried rock): nothing here can measure
+      // it, so its light fades at TUNE_GI_DECAY per visit, and the resolve
+      // pass re-deposits it every frame while any patch of it is on screen.
+      if (TUNE_GI_STRENGTH > 0.0) {
+        if (ov < 256u) {
+          let smp = openSunSample(blockMin, face);
+          if (smp.w > 0.0) {
+            irrDeposit(idx, smp.xyz, GI_WALK_ALPHA, stampOk, &irradiance);
+          }
+        } else {
+          let old = select(vec3f(0.0), unpackRgb9e5(irradiance[idx]), stampOk);
+          irradiance[idx] = packRgb9e5(old * (1.0 - TUNE_GI_DECAY));
+        }
+      }
+    } else if (TUNE_GI_STRENGTH > 0.0) {
+      // No surface in the block: no light leaves it. Zero, so a gather ray
+      // that lands here (a block that just lost its last blocker) reads dark
+      // rather than the light of whatever stood here before.
+      irradiance[idx] = 0u;
     }
     packed |= v << (k * 8u);
   }

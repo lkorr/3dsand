@@ -1,6 +1,7 @@
 #include "sim/simulation.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 
@@ -8,6 +9,7 @@
 #include "sim/pagetable.h"
 #include "sim/tuning.h"      // fluidExciteMode gates the seam recording
 #include "gpu/rhi_record.h"  // the Vulkan table-recording bridge (phase 4a)
+#include "gpu/rhi_vk.h"      // rhi::vkr::SavePipelineCache (EnsureRenderPipelines)
 
 // kPassStride (the passUBO dynamic-offset slice stride) moved to pass_table.h
 // when the Vulkan recorder became a second consumer of it — see the note there.
@@ -179,6 +181,9 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         // two descriptors on pipelines that never name them.
         entry(27, T::Storage),         // openness (per block-face bytes)
         entry(28, T::Storage),         // opennessGen (per-slot world stamp)
+        // The irradiance grid (world.h kIrradianceBytes, docs/PLAN_gi.md §3):
+        // the openness walk decays it and deposits the off-screen sun sample.
+        entry(29, T::Storage),         // irradiance (per block-face RGB9E5)
     };
     simBGL_ = device.CreateBindGroupLayout(entries, std::size(entries));
 
@@ -332,6 +337,10 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         // (PLAN_gi.md §1, last bullet).
         entry(17, T::ReadOnlyStorage, S::Fragment),   // openness
         entry(18, T::ReadOnlyStorage, S::Fragment),   // opennessGen
+        // The irradiance grid (docs/PLAN_gi.md §3). Storage, not ReadOnly, so
+        // P2's write-back (the receiver's gathered term feeds its own face)
+        // needs no layout change; P1's raymarch declares it `read`.
+        entry(19, T::Storage, S::Fragment),           // irradiance
     };
     renderBGL_ = device.CreateBindGroupLayout(entries, std::size(entries));
 
@@ -447,6 +456,7 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         b(26, treeAtlasBuf_),
         b(27, world_->openness),
         b(28, world_->opennessGen),
+        b(29, world_->irradiance),
     };
     simBG_[page] = device.CreateBindGroup(simBGL_, entries, std::size(entries), "simBG");
 
@@ -511,6 +521,7 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         b(16, world_->renderStats),
         b(17, world_->openness),
         b(18, world_->opennessGen),
+        b(19, world_->irradiance),
     };
     renderBG_ = device.CreateBindGroup(renderBGL_, entries, std::size(entries), "renderBG");
   }
@@ -539,6 +550,11 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         entry(5, T::Storage),          // shadowCache
         entry(6, T::Storage),          // shadowReq
         entry(7, T::Storage),          // shadowArgsStage
+        // P1 direct injection (docs/PLAN_gi.md §3): the resolve pass blends each
+        // published patch's lit radiance into its block-face, and reads the
+        // slot stamp so a reused slot starts its blend from zero.
+        entry(8, T::Storage),          // irradiance
+        entry(9, T::ReadOnlyStorage),  // opennessGen
     };
     shadowBGL_ = device.CreateBindGroupLayout(entries, std::size(entries));
 
@@ -551,6 +567,8 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         b(5, world_->shadowCache),
         b(6, world_->shadowReq),
         b(7, world_->shadowArgsStage),
+        b(8, world_->irradiance),
+        b(9, world_->opennessGen),
     };
     shadowBG_ = device.CreateBindGroup(shadowBGL_, bges, std::size(bges), "shadowBG");
     rhi::BindGroupLayout shadowGroups[] = {shadowBGL_};
@@ -1068,6 +1086,7 @@ const rhi::Buffer& Simulation::PassBuffer(pass::Buf b) const {
     case B::ShadowArgs:          return world_->shadowArgs;
     case B::Openness:            return world_->openness;
     case B::OpennessGen:         return world_->opennessGen;
+    case B::Irradiance:          return world_->irradiance;
     case B::WaterBodyState:      return world_->waterBodyState;
     case B::TreeAtlas:           return treeAtlasBuf_;
     default:                return world_->voxels;
@@ -1582,6 +1601,10 @@ void Simulation::EnsureAuxDepth(uint32_t width, uint32_t height) {
 void Simulation::EnsureRenderPipelines(rhi::TextureFormat format) {
   if (format == targetFormat_) return;
   targetFormat_ = format;
+  // Part of the startup timeline (main.cpp StartupMark): the graphics
+  // pipelines are created lazily on the first draw, which puts the driver's
+  // compile of the raymarch fragment shader INSIDE the first frame.
+  const auto tRp0 = std::chrono::steady_clock::now();
 
   rhi::DepthState dsAlways{};
   dsAlways.format = kDepthFormat;
@@ -1726,6 +1749,14 @@ void Simulation::EnsureRenderPipelines(rhi::TextureFormat format) {
     d.depth = dsTest;
     microBodyDraw_ = device_.CreateRenderPipeline(d);
   }
+  std::fprintf(stderr, "[startup] render pipelines built in %.2f s\n",
+               std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                             tRp0).count());
+  // Persist the driver's pipeline cache RIGHT HERE, not only at shutdown: this
+  // is the 45-52 s compile (vk::Backend::SavePipelineCache has the numbers),
+  // and the processes that pay it are the ones build.sh taskkills before any
+  // shutdown path runs. Also covers the F5 rebuild, which lands here too.
+  rhi::vkr::SavePipelineCache(device_);
 }
 
 rhi::RenderPass Simulation::BeginRenderPass(const rhi::CommandEncoder& enc,

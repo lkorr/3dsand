@@ -690,6 +690,10 @@ void SetCaptureStats(const Device& d, bool on) {
   if (vk::Backend* be = NativeBackend(d)) be->SetCaptureStats(on);
 }
 
+void SavePipelineCache(const Device& d) {
+  if (vk::Backend* be = NativeBackend(d)) be->SavePipelineCache();
+}
+
 TextureView WrapSwapchainImage(vk::Image* img) {
   if (!img) return {};
   auto v = std::make_shared<VkrTextureView>();

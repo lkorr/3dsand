@@ -54,6 +54,13 @@ Stats LastStats(const Device& d);
 // whose driver lacks VK_KHR_pipeline_executable_properties.
 void SetCaptureStats(const Device& d, bool on);
 
+// Write the driver's pipeline cache to disk now. Called by the frame loop right
+// after the graphics pipelines are first built (and after every F5 rebuild):
+// that compile is 45-52 s on this machine and the processes that pay it are
+// routinely taskkilled before Shutdown would have saved it (vk::Backend::
+// SavePipelineCache has the measurement). No-op on a non-Vulkan device.
+void SavePipelineCache(const Device& d);
+
 // ---- windowed path (phase 4b D3) ------------------------------------------
 
 // Wrap an acquired swapchain image (vk::Backend::AcquireSwapchainImage) into a

@@ -1547,6 +1547,14 @@ const RenderArm kRenderArms[] = {
      [](Tuning& t) { t.render.opennessStrength = 0.0f; }, true, 1,
      "the whole openness grid: the compute pass that builds it AND the "
      "per-hit bilinear read in the raymarch"},
+    // ---- one-bounce indirect light (docs/PLAN_gi.md §3) ----
+    // giStrength = 0 const-folds the per-hit gather out of the raymarch, the
+    // deposit out of the resolve pass and the sun sample out of the openness
+    // walk, so baseline - nogi is the whole feature on one world.
+    {"nogi", "one-bounce GI off (gather, injection and walk sample folded)",
+     [](Tuning& t) { t.render.giStrength = 0.0f; }, true, 1,
+     "the irradiance gather at every near-field hit plus both injection "
+     "paths"},
     {"shadow32", "shadowSteps 384 -> 32",
      [](Tuning& t) { t.render.shadowSteps = 32; }, true, 1,
      "shadow march past 32 steps"},

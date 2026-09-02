@@ -114,6 +114,13 @@ void World::Init(const rhi::Device& device) {
                           U::Storage | U::CopySrc | U::CopyDst, "openness");
   opennessGen = CreateBuffer(device, kOpennessGenBytes,
                              U::Storage | U::CopySrc | U::CopyDst, "opennessGen");
+  // Irradiance grid (world.h kIrradianceBytes). Zero = "no light has been seen
+  // leaving this face", which is what an unlit face should read as, so the
+  // zeroed allocation is the correct cold start and no reset path is needed:
+  // a slot whose stamp does not match is skipped by the gather, and the walk
+  // rewrites every word of a chunk it visits.
+  irradiance = CreateBuffer(device, kIrradianceBytes,
+                            U::Storage | U::CopySrc | U::CopyDst, "irradiance");
   shadowArgsStage = CreateBuffer(device, 16, U::Storage | U::CopySrc | U::CopyDst,
                                  "shadowArgsStage");
   // Indirect ONLY, and out of every bind group — same rule as dispatchArgs.

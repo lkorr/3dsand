@@ -221,6 +221,12 @@ SPEC = [
     ("render", "opennessStrength", "TUNE_OPENNESS_STRENGTH", "f", 1.0),
     ("render", "opennessBilinear", "TUNE_OPENNESS_BILINEAR", "i", 1),
 
+    # one-bounce indirect light (docs/PLAN_gi.md §3, W3 P1)
+    ("render", "giStrength", "TUNE_GI_STRENGTH", "f", 1.0),
+    ("render", "giDecay", "TUNE_GI_DECAY", "f", 0.25),
+    ("render", "giFeedback", "TUNE_GI_FEEDBACK", "f", 0.0),
+    ("render", "giGatherBlocks", "TUNE_GI_GATHER_BLOCKS", "i", 3),
+
     # drifting particulate (silt)
     ("render", "siltDensity", "TUNE_SILT_DENSITY", "f", 0.55),
     ("render", "siltBrightness", "TUNE_SILT_BRIGHTNESS", "f", 0.5),
