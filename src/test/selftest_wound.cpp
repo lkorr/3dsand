@@ -1043,6 +1043,154 @@ Status GateOneHit(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---------------------------------------------------------------------------
+// corpse-intact: a corpse stays in one piece when the blade keeps going
+// ---------------------------------------------------------------------------
+//
+// Owner report, 2026-09-02, after one-hit landed and did not reproduce it:
+// "when killing an NPC duelist with a sword, every single one of his limbs
+// pops off all together." one-hit could not see it because it stops at the
+// blow. The sweep does not: MeleeSweepDamage keeps probing for the rest of
+// the stroke, the creature's limbs are DEBRIS from the tick it died (Die()
+// hands every body to DebrisSystem with its joints on), and a probe that
+// finds one of them goes MeltBodyAt -> DamageBody -> RebuildCollider, which
+// built a new Jolt body and REMOVED the old one — and Physics::RemoveBody
+// destroys every joint on the body it removes. One nick to the torso took the
+// neck, both shoulders and both hips off in the same call.
+//
+// The property: the joints Die() leaves on the corpse survive the corpse
+// being carved. Kill the fixture the way the sword does (root limb to zero,
+// which Sever() routes to Die()), melt its torso where the swing crosses it
+// for three ticks, let it settle. The torso body must have been REBUILT (or
+// the gate proves nothing), the joint count must not have moved by one, and
+// every body the creature was made of must still have a joint on it.
+Status GateCorpseIntact(Ctx& c, std::string& detail) {
+  MobSystem& mobs = c.mobs;
+  IdCounterScope idScope(mobs);
+  PrepareWorld(c);
+  const Target t = ChooseTarget(mobs, FixtureSite(c.world, 380));
+  if (!t.valid()) {
+    detail = "no loaded mob def has a severable non-vital limb that bleeds";
+    return Status::Fail;
+  }
+  IVec3 pchunk{};
+  const uint64_t id = SpawnTarget(c, t, 380, pchunk);
+  if (!id) {
+    detail = "spawn refused";
+    return Status::Fail;
+  }
+  const MobDef& def = mobs.Defs()[t.defIndex];
+  const int nLimbs = (int)def.limbs.size();
+  const int root = def.rootLimb;
+  const uint64_t torso = root >= 0 ? mobs.LimbBody(id, root) : 0;
+  if (!torso) {
+    detail = "fixture has no root limb body";
+    return Status::Fail;
+  }
+  int attached = 0;
+  for (int li = 0; li < nLimbs; li++)
+    if (mobs.LimbBody(id, li)) attached++;
+  const uint32_t jointsAlive = c.phys.JointCount();
+  // Where the swing crosses the torso: mid-limb, measured off the live body
+  // before it dies, because a corpse has no limbs to measure.
+  const LimbAxis ax = MeasureLimb(mobs, id, root);
+  const Vec3 mid = ax.anchor + ax.along * (ax.reach * 0.5f);
+
+  // The killing blow. The root limb at zero hp is a death, not an amputation
+  // (Mob::HpZeroSevers), and the corpse keeps every joint (Mob::Die).
+  {
+    MobSystem::BladeCutScope blade(mobs, 1.0f);
+    mobs.Damage(torso, 1.0e6f, mid, 45.0f);
+  }
+  if (mobs.IsAlive(id)) {
+    detail = Format("%s: root limb at zero hp did not kill", t.defName.c_str());
+    mobs.Reset();
+    c.debris.Reset();
+    return Status::Fail;
+  }
+  const std::string cause = mobs.DeathCause(id);
+  const uint32_t jointsDead = c.phys.JointCount();
+
+  auto indexOf = [&](uint64_t h) -> int {
+    for (uint32_t i = 0; i < c.debris.BodyCount(); i++)
+      if (c.debris.BodyHandle(i) == h) return (int)i;
+    return -1;
+  };
+  uint64_t cur = torso;
+  int idx = indexOf(cur);
+  if (idx < 0) {
+    detail = Format("%s: the torso was not adopted as debris on death",
+                    t.defName.c_str());
+    mobs.Reset();
+    c.debris.Reset();
+    return Status::Fail;
+  }
+  const uint32_t vox0 = c.debris.BodyVoxelCount((uint32_t)idx);
+
+  uint32_t tick = 52000;
+  auto step = [&]() {
+    std::vector<BrushOp> ops;
+    std::vector<ParticleSpawn> sp;
+    std::vector<CellOp> cellOps;
+    mobs.PreTick(tick++, c.world, ops, cellOps, sp);
+    c.phys.Step(kTickDt);
+    mobs.PostStep();
+    c.debris.PostStep();
+  };
+  // The rest of the stroke: three ticks of the edge crossing the torso at the
+  // sword's own kerf width (halfWidth + carveBonus is about a voxel), exactly
+  // what MeleeSweepDamage does with a debris hit.
+  const float radius = 1.0f;
+  std::vector<ParticleSpawn> spawns;
+  int melts = 0;
+  for (int i = 0; i < 3 && idx >= 0; i++) {
+    if (c.debris.MeltBodyAt(cur, mid, radius, c.world, spawns)) melts++;
+    spawns.clear();
+    cur = c.debris.BodyHandle((uint32_t)idx);  // a rebuild changes the handle
+    step();
+    idx = indexOf(cur);
+  }
+  const uint32_t jointsCarved = c.phys.JointCount();
+  const uint32_t vox1 = idx >= 0 ? c.debris.BodyVoxelCount((uint32_t)idx) : 0;
+  const bool rebuilt = cur != torso && idx >= 0;
+
+  // Then it settles for two seconds.
+  for (int i = 0; i < 60; i++) step();
+  const uint32_t jointsSettled = c.phys.JointCount();
+  int jointed = 0, bodies = 0;
+  for (uint32_t i = 0; i < c.debris.BodyCount(); i++) {
+    bodies++;
+    if (c.phys.JointCount(c.debris.BodyHandle(i)) > 0) jointed++;
+  }
+  // How far the corpse spread: the largest distance from the torso to any
+  // other body of it. Recorded, not asserted — a settling ragdoll spreads
+  // legitimately, and the joint account above is the claim.
+  float spread = 0.0f;
+  if (idx >= 0) {
+    const Vec3 tp = c.debris.BodyPosition((uint32_t)idx);
+    for (uint32_t i = 0; i < c.debris.BodyCount(); i++)
+      spread = std::max(spread, (c.debris.BodyPosition(i) - tp).len());
+  }
+  RecordObserved("corpseSpreadVox", (double)spread);
+
+  const bool jointsKept = jointsAlive > 0 && jointsDead == jointsAlive &&
+                          jointsCarved == jointsAlive &&
+                          jointsSettled == jointsAlive;
+  const bool ok = melts > 0 && rebuilt && vox1 < vox0 && jointsKept &&
+                  jointed == attached;
+  mobs.Reset();
+  c.debris.Reset();
+  detail = Format(
+      "%s: died of '%s' with %d/%d limbs on, %u joints; torso melted %d ticks "
+      "(%u -> %u voxels, rebuilt=%d): joints %u after the kill, %u after the "
+      "carve, %u after settling; %d of %d debris bodies still jointed, spread "
+      "%.1f vox",
+      t.defName.c_str(), cause.c_str(), attached, nLimbs, jointsAlive, melts,
+      vox0, vox1, rebuilt ? 1 : 0, jointsDead, jointsCarved, jointsSettled,
+      jointed, bodies, spread);
+  return ok ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& WoundGates() {
@@ -1054,6 +1202,7 @@ const std::vector<Gate>& WoundGates() {
       {"bleed-out", "mob", {}, false, GateBleedOut, false},
       {"burn-cap", "mob", {}, false, GateBurnCap, false},
       {"one-hit", "mob", {}, false, GateOneHit, false},
+      {"corpse-intact", "mob", {}, false, GateCorpseIntact, false},
   };
   return g;
 }

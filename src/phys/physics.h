@@ -152,6 +152,23 @@ class Physics {
   // destroyed automatically when that body is removed.
   uint64_t CreateJoint(uint64_t bodyA, uint64_t bodyB, const JointDesc& desc);
   void DestroyJoint(uint64_t joint);  // <- this is dismemberment
+  // Everything that referenced `oldHandle` now references `newHandle`, then
+  // the old body is removed. Every joint on the old body is rebuilt against
+  // the new one under the SAME joint handle, with the same rest-frame limits,
+  // anchored where the OTHER body still says the anchor is; the collision
+  // group (one mob's exclusion set) and the object layer (the avatar's
+  // exemption) are copied across.
+  //
+  // For collider rebuilds. RemoveBody destroys attached joints because Jolt
+  // asserts otherwise, and every rebuild path — DebrisSystem::RebuildCollider,
+  // the burn shrink, the fragment parent — did CreateBody + RemoveBody, so a
+  // corpse's torso that lost a sword's worth of voxels lost its neck, both
+  // shoulders and both hips in the same call (gate `corpse-intact`). A body
+  // comes apart only where something cuts it apart.
+  void ReplaceBody(uint64_t oldHandle, uint64_t newHandle);
+  // Joints currently attached to one body / alive in the whole system.
+  uint32_t JointCount(uint64_t handle) const;
+  uint32_t JointCount() const;
   // How far body B currently sits from the REST direction its ball joint was
   // built around, in radians (0 when the joint is not a ball joint or is
   // dead). The limit test in selftest_mob.cpp asks this rather than
@@ -298,4 +315,7 @@ class Physics {
   std::unique_ptr<JointImpls> joints_;
   uint64_t nextJointId_ = 1;
   uint32_t nextCollisionGroup_ = 1;
+  // ReplaceBody's per-joint step: rebuild `joint` with `newBody` standing in
+  // for `oldBody` on whichever side it was. False if nothing was rebuilt.
+  bool RetargetJoint(uint64_t joint, uint64_t oldBody, uint64_t newBody);
 };

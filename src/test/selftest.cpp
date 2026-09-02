@@ -234,6 +234,9 @@ const char* const kOrder[] = {
     // one committed sword blow across three limbs never kills outright and
     // takes nothing off (owner report 2026-09-02; CPU only, no tick).
     "one-hit",
+    // ...and the corpse stays in one piece when the stroke keeps going
+    // through it (same report, the half one-hit could not see; CPU only).
+    "corpse-intact",
     // LAST of the world-touching gates, and it must be: BuildVoxRegion moves
     // the residency window and resets the page table, which is the state every
     // other gate's fixture placement assumes. It restores both before it

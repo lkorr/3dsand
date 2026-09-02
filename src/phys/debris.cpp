@@ -1294,7 +1294,9 @@ void DebrisSystem::BurnBodies(uint32_t tick, World& world,
           b.voxels, b.xf, densityOf_, false,
           1.0f / (float)std::max(1u, b.physScale));
       if (nh != 0) {
-        phys_->RemoveBody(b.handle);
+        // ReplaceBody, never RemoveBody: a corpse's joints ride to the new
+        // handle (see RebuildCollider).
+        phys_->ReplaceBody(b.handle, nh);
         b.handle = nh;
         phys_->SetBodyVelocities(nh, lin, ang);
         b.burnedSinceRebuild = 0;
@@ -1476,7 +1478,7 @@ void DebrisSystem::ShatterBody(Body& b, World& world, std::vector<Body>& fragmen
     uint64_t nh = phys_->CreateDebrisBodyXf(b.voxels, b.xf, densityOf_,
                                             /*allowKinematic=*/false, pitch);
     if (nh != 0) {
-      phys_->RemoveBody(b.handle);
+      phys_->ReplaceBody(b.handle, nh);  // joints ride along (RebuildCollider)
       b.handle = nh;
       phys_->SetBodyVelocities(nh, lin, ang);
       b.burnedSinceRebuild = 0;
@@ -1635,7 +1637,19 @@ bool DebrisSystem::RebuildCollider(Body& b) {
   const float pitch = 1.0f / (float)std::max(1u, b.physScale);
   uint64_t nh = phys_->CreateDebrisBodyXf(b.voxels, b.xf, densityOf_, false, pitch);
   if (nh == 0) return false;
-  phys_->RemoveBody(b.handle);
+  // REPLACE, NOT REMOVE. A corpse is a set of debris bodies that Die() left
+  // JOINTED (game/mob.cpp: "joints stay so the corpse hangs together"), and
+  // Physics::RemoveBody destroys every joint on the body it removes. This
+  // used to be CreateBody + RemoveBody, so the first sword probe to land on a
+  // corpse's torso after the killing blow — MeleeSweepDamage keeps probing
+  // for the rest of the stroke, and a dead limb is debris that MeltBodyAt
+  // carves — rebuilt the torso and took the neck, both shoulders and both
+  // hips off in one call. That was "every single one of his limbs pops off"
+  // (owner, 2026-09-02). ReplaceBody rebuilds each joint against the new
+  // handle and carries the collision group over, so a body comes apart only
+  // where the carve actually disconnects it (ShatterBody). Gate:
+  // corpse-intact.
+  phys_->ReplaceBody(b.handle, nh);
   b.handle = nh;
   phys_->SetBodyVelocities(nh, lin, ang);
   b.burnedSinceRebuild = 0;

@@ -2392,6 +2392,31 @@ a static string set at every `Die()` call site that knows, mirrored into
 beside the tick, and it is what showed that bath's death was the hips' hp
 running out under the ordinary carve charge with the burn fraction at 0.0%.
 
+**A corpse comes apart only where it is cut.** The one-blow dismemberment the
+owner reported ("every single one of his limbs pops off all together") was not
+in the blow: `one-hit` reproduces the blow and found nothing. It was in the
+rest of the stroke. `MeleeSweepDamage` keeps probing after the killing tick,
+the creature's limbs are debris from the moment `Die()` hands them over (with
+their joints on, so the corpse hangs together), and a probe that lands on one
+of them goes `MeltBodyAt` → `DamageBody` → `RebuildCollider`, which built a new
+Jolt body and **removed** the old one — and `Physics::RemoveBody` destroys every
+joint on the body it removes, because Jolt asserts on a constraint that
+outlives a body. One nick to the torso took the neck, both shoulders and both
+hips off in the same call; the burn shrink and the fragment parent rebuilt the
+same way. Every collider rebuild in `DebrisSystem` now goes through
+`Physics::ReplaceBody(old, new)`: each joint on the old body is rebuilt against
+the new one under the same joint handle from the stored `JointDesc` (rest-frame
+limits, so nothing re-centres), anchored where the **other** body still says
+the anchor is (a rebuild may rebase the body's origin, so the replaced side's
+own local anchor means nothing), and the collision group and object layer are
+copied across, so a rebuilt torso neither collides with its own limbs nor
+starts pushing the player. A body separates only when the carve actually
+disconnects it (`ShatterBody`'s fragments have no joints, which is right: they
+are the piece that came off). Gate `corpse-intact`: kill the fixture through
+the root limb, melt the torso for three ticks at the sword's kerf width, settle;
+the torso must have been rebuilt, the joint count must not have moved by one,
+and every body of the corpse must still carry a joint.
+
 **Amputations, retuned.** The impact-sever exception was reachable by an
 ordinary swing: `severImpactSpeed` 9 on a lower leg × the scale of 4 was 36
 voxels/s, and `melee.fullSpeedMps` 3.4 is 34 — a committed cut at a shin severed

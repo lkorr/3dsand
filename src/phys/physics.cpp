@@ -229,6 +229,13 @@ struct Physics::JointImpls {
     // JointSwingAngle can measure against the same line the cone is built on
     // without re-deriving it. Zero for hinge/fixed.
     JPH::Vec3 boneAxis = JPH::Vec3::sZero();
+    // Enough to build the constraint AGAIN against a replacement body
+    // (ReplaceBody): the desc as given, and the anchor in each body's own
+    // frame (metres) — the body that is NOT being replaced is the one that
+    // still knows where the joint is.
+    Physics::JointDesc desc;
+    JPH::Vec3 anchorLocalA = JPH::Vec3::sZero();
+    JPH::Vec3 anchorLocalB = JPH::Vec3::sZero();
   };
   std::unordered_map<uint64_t, Entry> joints;                 // handle -> entry
   std::unordered_map<uint64_t, std::vector<uint64_t>> byBody; // body -> joints
@@ -570,20 +577,26 @@ Vec3 Physics::PlayerPushOut(uint64_t handle, Vec3 centerVoxel) const {
   return Vec3{push.GetX(), push.GetY(), push.GetZ()} * (1.0f / kVoxelMeters);
 }
 
-uint64_t Physics::CreateJoint(uint64_t bodyA, uint64_t bodyB,
-                              const JointDesc& d) {
-  if (!system_ || bodyA == 0 || bodyB == 0) return 0;
-  // TwoBodyConstraintSettings::Create wants Body&: lock both bodies
-  const JPH::BodyLockInterface& bli = system_->GetBodyLockInterface();
-  JPH::BodyID ids[2] = {ToBodyID(bodyA), ToBodyID(bodyB)};
-  JPH::BodyLockMultiWrite lock(bli, ids, 2);
-  JPH::Body* a = lock.GetBody(0);
-  JPH::Body* b = lock.GetBody(1);
-  if (!a || !b) return 0;
+// A world anchor expressed in one body's frame, metres. What ReplaceBody
+// reads back when the OTHER body is rebuilt and the anchor has to be found
+// again from something that did not move.
+static JPH::Vec3 AnchorLocal(const JPH::Body& body, JPH::RVec3Arg anchor) {
+  return body.GetRotation().Conjugated() *
+         JPH::Vec3(anchor - body.GetPosition());
+}
 
-  JPH::RVec3 anchor(VoxToM(d.anchorVoxel.x), VoxToM(d.anchorVoxel.y),
-                    VoxToM(d.anchorVoxel.z));
-
+// The constraint itself, from two LOCKED bodies and a world anchor in metres.
+// One function for CreateJoint and ReplaceBody, so a joint rebuilt against a
+// replacement body is the same joint with the same limits, not a second
+// reading of the desc.
+static JPH::Ref<JPH::Constraint> BuildConstraint(JPH::Body& bodyA,
+                                                 JPH::Body& bodyB,
+                                                 const Physics::JointDesc& d,
+                                                 JPH::RVec3Arg anchor,
+                                                 JPH::Vec3& boneOut) {
+  using JointType = Physics::JointType;
+  JPH::Body* a = &bodyA;
+  JPH::Body* b = &bodyB;
   // REST FRAME -> WORLD, per body. Jolt's settings are world-space and it
   // immediately converts them back through each body's rotation, so feeding it
   // `bodyRotation * restDirection` lands the constraint's local frame exactly
@@ -593,7 +606,7 @@ uint64_t Physics::CreateJoint(uint64_t bodyA, uint64_t bodyB,
   const JPH::Quat rb = b->GetRotation();
 
   JPH::Ref<JPH::Constraint> constraint;
-  JPH::Vec3 boneOut = JPH::Vec3::sZero();
+  boneOut = JPH::Vec3::sZero();
   switch (d.type) {
     case JointType::Fixed: {
       JPH::FixedConstraintSettings s;
@@ -661,14 +674,131 @@ uint64_t Physics::CreateJoint(uint64_t bodyA, uint64_t bodyB,
       break;
     }
   }
+  return constraint;
+}
+
+uint64_t Physics::CreateJoint(uint64_t bodyA, uint64_t bodyB,
+                              const JointDesc& d) {
+  if (!system_ || bodyA == 0 || bodyB == 0) return 0;
+  // TwoBodyConstraintSettings::Create wants Body&: lock both bodies
+  const JPH::BodyLockInterface& bli = system_->GetBodyLockInterface();
+  JPH::BodyID ids[2] = {ToBodyID(bodyA), ToBodyID(bodyB)};
+  JPH::BodyLockMultiWrite lock(bli, ids, 2);
+  JPH::Body* a = lock.GetBody(0);
+  JPH::Body* b = lock.GetBody(1);
+  if (!a || !b) return 0;
+
+  JPH::RVec3 anchor(VoxToM(d.anchorVoxel.x), VoxToM(d.anchorVoxel.y),
+                    VoxToM(d.anchorVoxel.z));
+  JPH::Vec3 boneOut = JPH::Vec3::sZero();
+  JPH::Ref<JPH::Constraint> constraint =
+      BuildConstraint(*a, *b, d, anchor, boneOut);
   if (!constraint) return 0;
   system_->AddConstraint(constraint);
 
   uint64_t h = nextJointId_++;
-  joints_->joints[h] = {constraint, bodyA, bodyB, boneOut};
+  JointImpls::Entry e;
+  e.constraint = constraint;
+  e.bodyA = bodyA;
+  e.bodyB = bodyB;
+  e.boneAxis = boneOut;
+  e.desc = d;
+  e.anchorLocalA = AnchorLocal(*a, anchor);
+  e.anchorLocalB = AnchorLocal(*b, anchor);
+  joints_->joints[h] = e;
   joints_->byBody[bodyA].push_back(h);
   joints_->byBody[bodyB].push_back(h);
   return h;
+}
+
+bool Physics::RetargetJoint(uint64_t joint, uint64_t oldBody,
+                            uint64_t newBody) {
+  auto it = joints_->joints.find(joint);
+  if (it == joints_->joints.end()) return false;
+  JointImpls::Entry& e = it->second;
+  const bool aMoves = e.bodyA == oldBody;
+  const bool bMoves = e.bodyB == oldBody;
+  if (aMoves == bMoves) return false;  // not on this body, or self-jointed
+  const uint64_t newA = aMoves ? newBody : e.bodyA;
+  const uint64_t newB = bMoves ? newBody : e.bodyB;
+  const JPH::BodyLockInterface& bli = system_->GetBodyLockInterface();
+  JPH::BodyID ids[2] = {ToBodyID(newA), ToBodyID(newB)};
+  JPH::BodyLockMultiWrite lock(bli, ids, 2);
+  JPH::Body* a = lock.GetBody(0);
+  JPH::Body* b = lock.GetBody(1);
+  if (!a || !b) return false;
+  // THE ANCHOR COMES FROM THE SIDE THAT DID NOT CHANGE. A rebuilt collider
+  // may sit at a rebased origin (DebrisSystem::RebaseVoxels shifts the
+  // transform so the voxels stay put), so the replaced body's own local
+  // anchor means nothing any more; the other body has not moved and still
+  // holds the joint exactly where it was.
+  const JPH::Body& keeper = aMoves ? *b : *a;
+  const JPH::Vec3 local = aMoves ? e.anchorLocalB : e.anchorLocalA;
+  const JPH::RVec3 anchor =
+      keeper.GetPosition() + keeper.GetRotation() * local;
+  JPH::Vec3 boneOut = JPH::Vec3::sZero();
+  JPH::Ref<JPH::Constraint> c = BuildConstraint(*a, *b, e.desc, anchor, boneOut);
+  if (!c) return false;
+  system_->RemoveConstraint(e.constraint);
+  system_->AddConstraint(c);
+  e.constraint = c;
+  e.boneAxis = boneOut;
+  e.bodyA = newA;
+  e.bodyB = newB;
+  e.anchorLocalA = AnchorLocal(*a, anchor);
+  e.anchorLocalB = AnchorLocal(*b, anchor);
+  auto bit = joints_->byBody.find(oldBody);
+  if (bit != joints_->byBody.end()) {
+    auto& v = bit->second;
+    v.erase(std::remove(v.begin(), v.end(), joint), v.end());
+    if (v.empty()) joints_->byBody.erase(bit);
+  }
+  joints_->byBody[newBody].push_back(joint);
+  return true;
+}
+
+void Physics::ReplaceBody(uint64_t oldHandle, uint64_t newHandle) {
+  if (!system_ || oldHandle == 0 || newHandle == 0 ||
+      oldHandle == newHandle)
+    return;
+  JPH::BodyInterface& bi = system_->GetBodyInterface();
+  const JPH::BodyLockInterface& bli = system_->GetBodyLockInterface();
+  const JPH::BodyID oldId = ToBodyID(oldHandle), newId = ToBodyID(newHandle);
+  if (bi.IsAdded(oldId) && bi.IsAdded(newId)) {
+    // Body state, not shape state, so a fresh body starts without it: the
+    // exclusion set that stops one mob's limbs fighting their own joints
+    // (DisableCollisionsAmong) and the avatar layer (SetBodyAvatarLayer).
+    JPH::CollisionGroup group;
+    {
+      JPH::BodyLockRead lock(bli, oldId);
+      if (lock.Succeeded()) group = lock.GetBody().GetCollisionGroup();
+    }
+    {
+      JPH::BodyLockWrite lock(bli, newId);
+      if (lock.Succeeded()) lock.GetBody().SetCollisionGroup(group);
+    }
+    bi.SetObjectLayer(newId, bi.GetObjectLayer(oldId));
+  }
+  if (joints_) {
+    auto bit = joints_->byBody.find(oldHandle);
+    if (bit != joints_->byBody.end()) {
+      const std::vector<uint64_t> attached = bit->second;  // Retarget mutates
+      for (uint64_t j : attached) RetargetJoint(j, oldHandle, newHandle);
+    }
+  }
+  // Whatever could not be moved (a joint whose other body is gone) dies with
+  // the old body, as it always did.
+  RemoveBody(oldHandle);
+}
+
+uint32_t Physics::JointCount(uint64_t handle) const {
+  if (!joints_ || handle == 0) return 0;
+  auto it = joints_->byBody.find(handle);
+  return it == joints_->byBody.end() ? 0u : (uint32_t)it->second.size();
+}
+
+uint32_t Physics::JointCount() const {
+  return joints_ ? (uint32_t)joints_->joints.size() : 0u;
 }
 
 bool Physics::JointSwingAngle(uint64_t joint, float& outRadians) const {
