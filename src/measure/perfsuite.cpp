@@ -1555,6 +1555,14 @@ const RenderArm kRenderArms[] = {
      [](Tuning& t) { t.render.giStrength = 0.0f; }, true, 1,
      "the irradiance gather at every near-field hit plus both injection "
      "paths"},
+    // ---- waterfall mist on opaque hits (Lin follow-ups T5.3) ----
+    // mistDensity = 0 folds the liquid-pixel veil AND the three-cell probe
+    // every opaque near-field pixel now makes toward a neighbouring fall.
+    {"nomist", "waterfall mist off (mistDensity 0, folds the opaque-hit probe)",
+     [](Tuning& t) { t.render.mistDensity = 0.0f; t.render.sprayDensity = 0.0f; },
+     true, 1,
+     "the mist veil on liquid pixels plus the three-voxel probe on every "
+     "opaque near-field pixel"},
     {"shadow32", "shadowSteps 384 -> 32",
      [](Tuning& t) { t.render.shadowSteps = 32; }, true, 1,
      "shadow march past 32 steps"},

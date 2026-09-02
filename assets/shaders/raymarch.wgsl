@@ -3880,6 +3880,18 @@ fn godRays(ro : vec3f, rd : vec3f, maxDistVox : f32, px : vec2f) -> f32 {
   // sample against real geometry.
   let surfY = waterTopAbove(ro);
 
+  // ONE OCCLUSION RAY PER 4^3 BLOCK, not per sample (Lin follow-ups T5.2,
+  // 2026-09-02). The occlusion march below is coarse from its first step —
+  // it only ever tests the 4^3 blockers mask — so two samples that lie in the
+  // same block start in the same mask cell and walk the same sequence of
+  // blocks toward the sun: the same answer, computed twice. With 14 samples
+  // over a march that usually ends at the bed a few metres away, dt is 2-4
+  // voxels and neighbouring samples share a block about half the time.
+  // Deterministic per pixel and time-free, like the jitter above: nothing new
+  // to band or crawl, just the same ray not cast again.
+  var occBlock = vec3<i32>(0x7FFFFFFF);
+  var occHit = false;
+
   var acc = 0.0;
   for (var i = 0; i < steps; i++) {
     rsAdd(RS_GODRAY, 1u);
@@ -3917,10 +3929,15 @@ fn godRays(ro : vec3f, rd : vec3f, maxDistVox : f32, px : vec2f) -> f32 {
     // short of the floor. That is the same direction as every other coarse
     // hit — more occluded, never less — and it is under the bed caustic,
     // which is a separate term and is not affected.
-    let s = traceOpaque(p, kd, TUNE_GODRAY_SHADOW_STEPS, 0.0,
-                        &occupancy, &materials);
-    rsAdd(RS_GODRAY, s.steps);
-    if (s.hit) { continue; }
+    let blk = c >> vec3<u32>(SUBOCC_SHIFT);
+    if (any(blk != occBlock)) {
+      let s = traceOpaque(p, kd, TUNE_GODRAY_SHADOW_STEPS, 0.0,
+                          &occupancy, &materials);
+      rsAdd(RS_GODRAY, s.steps);
+      occBlock = blk;
+      occHit = s.hit;
+    }
+    if (occHit) { continue; }
 
     // Reaching here means sunlight lands on this sample. Weight it by the
     // ripple curvature at the surface above, so the shafts inherit the same
@@ -7504,6 +7521,14 @@ fn fs(in : VSOut) -> FSOut {
       }
     }
   }
+  // (Lin follow-ups T5.3, tried and REMOVED 2026-09-02: an opaque hit probing
+  // three cells along its normal for a neighbouring fall, to carry the mist
+  // past the water's silhouette. It worked by eye — the veil continued onto
+  // the cliff face beside the column — and cost 0.96 ms of 11.90 at noon,
+  // because it ran on every opaque pixel in the frame: there is no cheap
+  // "near water" gate, since a meadow chunk's grass makes its occupancy word
+  // read as holding non-blocker cells everywhere. --render-budget's `nomist`
+  // arm is the instrument that measured it and stays.)
 
   // ---- translucent solid surface (ice, glass) ----
   // Applied AFTER water on purpose. Compositing here runs back-to-front, and a

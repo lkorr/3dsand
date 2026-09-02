@@ -890,9 +890,51 @@ Status GateArmorReact(Ctx& c, std::string& detail) {
     ctx.WaitIdle();
     const IVec3 sa = fixture(inset);
     const IVec3 sb = fixture(inset + 12);
-    const int ha = World::TerrainHeight(sa.x, sa.z, kDefaultSeed);
-    const int hb = World::TerrainHeight(sb.x, sb.z, kDefaultSeed);
+    // A LEVELLED PAD UNDER BOTH CREATURES, the way worldgen's fixture columns
+    // at (60,60)..(140,140) are levelled (`onFixturePad`), stamped here through
+    // the mutation queue because this fixture is anchored to the live window
+    // and cannot stand on those columns. Without it the two creatures stood on
+    // raw procgen ground at WindowOrigin + 250 and + 262, and the acid
+    // differential became a function of the terrain between them: the first
+    // authored set of per-biome height curves (tuning_params.def, the curve
+    // block) moved that ground, the acid stopped reaching the bare control
+    // (0 skin lost against 357) and the dressed one died at tick 17 — so the
+    // curves shipped as the identity. The pad is two voxels of stone flush
+    // above the highest terrain column under it, with everything above it
+    // cleared to air, so both creatures stand at the same height on the same
+    // flat floor whatever worldgen puts there, and the world hash of the
+    // suite no longer decides whether this gate can measure.
+    std::vector<CellOp> pad;
+    int padTop = 0;
+    {
+      const uint32_t mStone = matId("stone");
+      const int x0 = std::min(sa.x, sb.x) - 8, x1 = std::max(sa.x, sb.x) + 8;
+      const int z0 = sa.z - 8, z1 = sa.z + 8;
+      int hMax = 0;
+      for (int x = x0; x <= x1; x++)
+        for (int z = z0; z <= z1; z++)
+          hMax = std::max(hMax, World::TerrainHeight(x, z, kDefaultSeed));
+      padTop = hMax + 2;
+      for (int x = x0; x <= x1; x++)
+        for (int z = z0; z <= z1; z++) {
+          for (int y = padTop - 1; y <= padTop; y++) {
+            const IVec3 cc{x, y, z};
+            if (world.CellInWindow(cc))
+              pad.push_back({World::SlotCellIndex(cc), PackVoxNew(mStone, 0u)});
+          }
+          for (int y = padTop + 1; y <= padTop + 16; y++) {
+            const IVec3 cc{x, y, z};
+            if (world.CellInWindow(cc))
+              pad.push_back({World::SlotCellIndex(cc), PackVoxNew(0u, 0u)});
+          }
+        }
+    }
+    const int ha = padTop;
+    const int hb = padTop;
     pchunk = IVec3{sa.x >> 4, ha >> 4, sa.z >> 4};
+    SubmitTick(ctx, world, sim, ++t, kDefaultSeed, {}, {}, pad, false, pchunk,
+               false, false);
+    ctx.WaitIdle();
     const uint64_t a = mobs.Spawn(avDef, {sa.x, ha + 1, sa.z});
     const uint64_t b = mobs.Spawn(avDef, {sb.x, hb + 1, sb.z});
     Mob* ma = mobs.FindMobById(a);

@@ -765,6 +765,19 @@ TP_U(worldgen, meadowThreshold, TUNE_MEADOW_THRESHOLD, 92)
 // curve -- it is that gate standing on a levelled pad the way the fixture
 // columns at (60,60)..(140,140) do (`onFixturePad`), instead of on whatever
 // procgen puts under WindowOrigin + 250.
+//
+// 2026-09-02: THAT GATE NOW STANDS ON A PAD (selftest_equipment.cpp, `bath`
+// stamps a levelled stone pad under both creatures). An authored set was then
+// tried again (meadow x0.85, pine an S-curve, desert x0.95) and REVERTED FOR
+// A DIFFERENT REASON: with non-identity knots the driver's compile of the
+// worldgen pipelines ran past 15 minutes at 11.5 GB of host memory and was
+// killed (the launch sat at "sim init" with the worldgen SPIR-V freshly
+// written). With the identity knots the integer Hermite folds away at compile
+// time; with authored ones the already enormous kernel stops folding. Before
+// any non-identity default can ship, the curve has to stop being a compile-
+// time constant of that kernel -- a uniform (a 9-knot table per biome in
+// TickParams or a small knot buffer) -- and `--shader-stats`/the startup
+// timeline are how to prove the compile is back to seconds.
 TP_I(worldgen, curveForest0, TUNE_CURVE_FOREST0, -16384)
 TP_I(worldgen, curveForest1, TUNE_CURVE_FOREST1, -12288)
 TP_I(worldgen, curveForest2, TUNE_CURVE_FOREST2, -8192)
