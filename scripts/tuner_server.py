@@ -404,8 +404,10 @@ def _next_variant_name(setdir, setname, ext):
     return None
 
 
-BUILD_CMD = ["cmake", "--build", "build", "--config", "Release",
-             "--target", "sandvox"]
+# Through scripts/build.sh, never raw cmake: the script owns the generator
+# choice (Ninja + sccache needs the MSVC environment it captures), the compile
+# and GPU locks, and the taskkill before the link.
+BUILD_CMD = ["bash", os.path.join(ROOT, "scripts", "build.sh")]
 EXE = os.path.join(ROOT, "build", "Release", "sandvox.exe")
 
 # Build state, shared with the poller. Guarded because ThreadingHTTPServer
@@ -451,8 +453,10 @@ WORLDEDIT_EXT = ".svedit"
 # ---- the machine-global run mutex, in Python -------------------------------
 #
 # CLAUDE.md: every sandvox.exe launch goes through scripts/run.sh, which is a
-# `mkdir C:/sv-build-lock` mutex shared with build.sh — concurrent GPU
-# processes throttle the machine and poison every measured number.
+# `mkdir C:/sv-gpu-lock` mutex (scripts/svlock.sh) shared with build.sh's LINK
+# step — concurrent GPU processes throttle the machine and poison every
+# measured number. Not the compile lock: a region request has no quarrel with
+# somebody's cl.exe.
 #
 # A persistent server cannot hold that lock for its whole life: it would block
 # every build in every worktree for the length of a tuner session. But it also
@@ -463,7 +467,7 @@ WORLDEDIT_EXT = ".svedit"
 #
 # Mirrors run.sh exactly, including the 10-minute stale sweep, because two
 # implementations of one mutex that disagree about staleness is not a mutex.
-RUNLOCK_DIR = "C:/sv-build-lock"
+RUNLOCK_DIR = "C:/sv-gpu-lock"
 RUNLOCK_STALE_SEC = 600
 
 
