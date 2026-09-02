@@ -1164,6 +1164,65 @@ def check_run_word_layout():
             f"overlap or waste the word")
 
 
+# ------------------------------------------------------- far cell material bits
+def check_far_material_bits():
+    """A far cascade cell is 7 bits of material id + 1 blocker flag (13.2.2).
+
+    Three places have to agree that a material id fits in seven bits:
+    common.wgsl's FAR_MAT_MASK (what every reader masks with), materials.cpp's
+    load-time refusal, and the size of materials.json itself. Nothing crashes
+    when they stop agreeing -- the 128th material simply renders as a different
+    colour at distance and claims a blocker wherever bit 7 falls -- so this is
+    the only thing that would ever say so. The JSON side is checked HERE rather
+    than only in the loader because adding a material is a data edit that needs
+    no build, and a data edit that silently breaks the horizon should fail at
+    the same moment it is made.
+    """
+    wgsl, cpp = read("assets/shaders/common.wgsl"), read("src/sim/materials.cpp")
+    js = read("assets/materials/materials.json")
+    if not wgsl or not cpp or not js:
+        return
+    checked.append("far cell material bits")
+
+    m = re.search(r"FAR_MAT_MASK\s*:\s*u32\s*=\s*0x([0-9A-Fa-f]+)u", wgsl)
+    if not m:
+        problems.append("far cell material bits: common.wgsl has no FAR_MAT_MASK "
+                        "-- the 7-bit split cannot be checked")
+        return
+    mask = int(m.group(1), 16)
+    if mask != 0x7F:
+        problems.append(f"far cell material bits: FAR_MAT_MASK is 0x{mask:X}, not "
+                        "0x7F -- bit 7 is the blocker flag (FAR_BLOCKER_BIT)")
+
+    # the SECOND `mats.size() > N` refusal in the file; the first is the
+    # 12-bit voxel-word limit (4096) and is a different fact.
+    lims = [int(x) for x in re.findall(r"mats\.size\(\) > (\d+)\)", cpp)]
+    limit = min(lims) if lims else None
+    want = mask + 1                       # ids 0..mask, so mask+1 entries
+    if limit is None:
+        problems.append("far cell material bits: materials.cpp has no "
+                        "`mats.size() > N` refusal for the 7-bit far id -- a "
+                        "128th material would corrupt the far field silently")
+    elif limit != want:
+        problems.append(
+            f"far cell material bits: materials.cpp refuses past {limit} "
+            f"materials but FAR_MAT_MASK 0x{mask:X} allows {want} (ids 0..{mask})")
+
+    # The JSON does not list air; the loader prepends it at id 0.
+    try:
+        import json as _json
+        rows = _json.loads(js).get("materials", [])
+    except Exception as e:                                    # noqa: BLE001
+        problems.append(f"far cell material bits: materials.json will not parse ({e})")
+        return
+    if len(rows) + 1 > want:
+        problems.append(
+            f"far cell material bits: materials.json declares {len(rows)} "
+            f"materials, {len(rows) + 1} with the implicit air -- the far "
+            f"cascade stores an id in 7 bits and holds at most {want} "
+            f"(ids 0..{mask}). Widen the far cell or drop a material.")
+
+
 ALL = {
     "worldgen": check_worldgen_mirror,
     "treeatlas": check_tree_atlas,
@@ -1182,6 +1241,7 @@ ALL = {
     "windprim": check_wind_prims,
     "curprim": check_current_prims,
     "counts": check_tick_counts,
+    "farbits": check_far_material_bits,
 }
 
 # The hook passes the edited file; run only the checks that file can break.
@@ -1195,7 +1255,8 @@ RELEVANT = {
     "assets/tuner.html": ["render", "arch", "perfnodes"],
     "assets/perfview.js": ["perfscopes"],
     "src/measure/perfnodes.h": ["perfnodes", "perfscopes"],
-    "src/sim/materials.cpp": ["render"],
+    "src/sim/materials.cpp": ["render", "farbits"],
+    "assets/materials/materials.json": ["farbits"],
     "src/gpu/resources.cpp": ["world"],
     "src/test/selftest.cpp": ["arch"],
     "src/sim/world.h": ["world", "params", "substeps", "windprim",

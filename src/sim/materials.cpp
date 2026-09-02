@@ -438,6 +438,25 @@ static bool LoadMaterialsJson(const std::string& path, std::vector<MaterialDef>&
   }
 
   if (mats.size() > 4096) errors += path + ": more than 4095 materials (12-bit ID limit)\n";
+  // ---- THE FAR-FIELD CASCADE OWNS BIT 7 OF ITS MATERIAL BYTE --------------
+  // A far cell is ONE byte: seven bits of material id and one conservative
+  // "something is here" flag (common.wgsl FAR_BLOCKER_BIT, 13.2.2). That split
+  // is only legal while every id fits in seven bits, and nothing else in the
+  // engine would notice if it stopped: the 118th material would simply start
+  // painting the wrong colour at distance and claiming a blocker wherever bit
+  // 7 landed, with no crash and no failing gate to name it. So the loader
+  // refuses, here, where the table is built and the number is known.
+  //
+  // `mats` includes the implicit air at index 0, so 128 entries is ids 0..127
+  // and exactly fills the field. scripts/check_invariants.py refuses a
+  // materials.json that would cross the same line without a build.
+  if (mats.size() > 128)
+    errors += path + ": " + std::to_string(mats.size()) +
+              " materials (including the implicit air at id 0), but the far-field"
+              " cascade packs a material id into SEVEN bits of its per-cell byte"
+              " and bit 7 is the conservative blocker flag -- the maximum id is"
+              " 127, i.e. 128 materials. Widen the far cell (farVox is already"
+              " 1 GiB) or drop a material; do NOT raise this limit alone.\n";
   return true;
 }
 

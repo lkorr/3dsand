@@ -2535,6 +2535,28 @@ struct Tuning {
     // is the same world distance at every cascade level (a raw step count is
     // not: it scales with the level's cell size — see the comment there).
     float farShadowReach = 60.0f;
+    // Highest cascade level at which the conservative "any blocker" flag
+    // (common.wgsl FAR_BLOCKER_BIT) may terminate a PRIMARY ray. Shadows use
+    // it at every level unconditionally; the visible surface only up to here,
+    // because the flag is set for any cell whose floor reaches the ground, so
+    // honouring it lifts terrain by up to one cell — 0.4 m at level 1, 51 m at
+    // level 8. 0 is the material-only hit test the cascade shipped with.
+    //
+    // DEFAULT 0 IS A MEASURED RESULT, NOT A PLACEHOLDER (13.2.2's kill
+    // criterion, `--shot` pair 2026-09-01). At 2 the visible half genuinely
+    // does what it was built for — a snow patch at 60 m stops being a
+    // dithered smear of half-missing cells and becomes one solid streak, and
+    // the whole 25..205 m slope reads as a ramp instead of a checkerboard —
+    // but the same one-cell lift BURIES the single-cell ground cover standing
+    // on that slope (scrub, flowers, litter simply vanish under the risen
+    // ground), and a cell that hits on the flag alone shades from the nearest
+    // material below it, which paints occasional flat single-colour facets on
+    // an otherwise textured hillside. The distant ridge line is NOT the
+    // casualty: the sky silhouette is pixel-identical at 0 and 2 (levels >= 3
+    // never take the flag), and the change is confined to the bottom 40% of
+    // the frame. Raise it to 2 to see the trade; it is one tuning edit and no
+    // rebuild.
+    int farBlockerHitLevel = 0;
 
     // ---- in-window LOD handoff (PLAN_surface_flight_perf.md A1) ----
     // Distance in METERS past which the PRIMARY march stops resolving fine

@@ -3919,6 +3919,91 @@ fn farSurfaceMat(col : Col, mat : u32, fine : vec3<i32>, shift : u32,
   return skin;
 }
 
+// ---- the conservative "any blocker" bit (13.2.2) --------------------------
+//
+// `farSurfaceMat` above decides a far cell's COLOUR; this decides whether the
+// cell counts as OCCUPIED even when its single centre sample missed. See the
+// FAR_BLOCKER_BIT block in common.wgsl for what the flag means and why it has
+// to be a pure function of (coords, seed).
+//
+// THE TOP OF A COLUMN, as the far field sees it: the ground contract, plus the
+// two things that stand on top of it and are not in `h`. Kept beside
+// `farSurfaceMat` because it makes the SAME three exceptions that function
+// makes — standing fluid keeps its id and renders opaque at distance, a ruin
+// is a stone box the height contract only pads the ground for, and the arena
+// deck is a material override in genCellIn that `col.h` deliberately does not
+// know about.
+//
+// The ruin term is a BOUNDING BOX, not `ruinShellAt`: the shell is hollow and
+// a conservative bit is allowed to fill an interior a 3.5 m building could
+// never show at cascade range. That box is also the one feature in here that
+// the goal line names — "lets thin walls cast shadows in the distance".
+//
+// TREES ARE DELIBERATELY ABSENT. `treeCanopyAt` is an XZ mask with no height,
+// and the only vertical bound available for it is `treeMaxAbove()` (~17.5 m),
+// which is WIDER than a level-5 cell — flagging that band would turn every
+// forested column into the column of solid cubes 13.2.2 warns about. The
+// canopy is already carried at distance by `farSurfaceMat`'s flattening, which
+// paints crown colour onto the surface cell at shift >= 5.
+fn farColTopFrom(h : i32, fluidTop : i32, ruin : Ruin,
+                 x : i32, z : i32, seed : u32) -> i32 {
+  var top = max(h, fluidTop);
+  if (ruin.present) { top = max(top, ruin.y + RUIN_HT); }
+  if (T.labMode == 0u && abs(x - 180) <= 32 && abs(z - 110) <= 32) {
+    top = max(top, baseHeight(180, 110, seed) + 16);
+  }
+  return top;
+}
+// The same for a column the caller does not already hold. `landColumn`, not
+// `genColumn`: the top needs the height contract and the ruin pad and nothing
+// else, and the biome/shore/undergrowth half of a Col is pure cost here.
+fn farColTop(x : i32, z : i32, seed : u32) -> i32 {
+  let L = landColumn(x, z, seed);
+  return farColTopFrom(L.h, L.fluidTop, L.ruin, x, z, seed);
+}
+
+// The flag for one level cell. `topC` is `farColTopFrom` at the cell's CENTRE
+// column — free at both call sites, because both already hold that column for
+// the colour lookup.
+//
+// THREE BANDS, and the middle one is the only one that costs anything:
+//
+//   y0 <= topC              the cell's floor is at or below the centre
+//                           column's top: it is at or under the surface. Set,
+//                           no further samples. (Caves included on purpose.)
+//   y0 - topC >= step       more than a whole cell of air under the cell's
+//                           floor: clear, no further samples.
+//   otherwise               THE SURFACE BAND — exactly ONE cell per column,
+//                           the one whose centre sampled air but whose span
+//                           straddles the ground. Here, and only here, the
+//                           four corner columns are evaluated.
+//
+// That band is where the missing half of every surface cell lives: the centre
+// sample calls a cell solid when `centre <= h`, and `centre` is `y0 + step/2`,
+// so a cell holding the ground in its lower half reads as air today. It is
+// also where a ridge crest that passes between two cell centres goes.
+//
+// WHAT IT IS NOT is a supremum over the footprint. Five samples bound the
+// footprint exactly at level 1 (4 fine voxels, corners 3 apart) and only
+// approximately at level 8 (512 fine voxels): a spire strictly between the
+// corners, or more than one cell taller than the centre column, is still lost.
+// A tighter bound needs either marching or a stored min/max pyramid, and this
+// is an experiment with a kill criterion, not a mipmap.
+fn farBlockerBitAt(topC : i32, cc : vec3<i32>, shift : u32, seed : u32) -> u32 {
+  let step = 1 << shift;
+  let y0 = cc.y << shift;               // the cell's bottom fine voxel
+  if (y0 <= topC) { return FAR_BLOCKER_BIT; }
+  if (y0 - topC >= step) { return 0u; }
+  let x0 = cc.x << shift; let x1 = x0 + step - 1;
+  let z0 = cc.z << shift; let z1 = z0 + step - 1;
+  var top = topC;
+  top = max(top, farColTop(x0, z0, seed));
+  top = max(top, farColTop(x1, z0, seed));
+  top = max(top, farColTop(x0, z1, seed));
+  top = max(top, farColTop(x1, z1, seed));
+  return select(0u, FAR_BLOCKER_BIT, y0 <= top);
+}
+
 var<workgroup> wgCount : atomic<u32>;
 var<workgroup> wgBlock : atomic<u32>;
 // Cells in this chunk that can ACT (matCanAct, common.wgsl). Third counter
@@ -4227,10 +4312,15 @@ fn far(@builtin(workgroup_id) wg : vec3<u32>,
   let zi = li / 4u;              // this thread's z within the level chunk
   let x0 = (li % 4u) * 4u;       // and the first of its four x
   var cols : array<Col, 4>;
+  // Column tops for the blocker bit, hoisted out of the y loop for the same
+  // reason the columns themselves are: they depend on (x, z) alone.
+  var tops : array<i32, 4>;
   for (var b = 0u; b < 4u; b++) {
     let cc = base + vec3<i32>(i32(x0 + b), 0, i32(zi));
     let fine = (cc << vec3<u32>(shift)) + vec3<i32>(1 << (shift - 1u));
     cols[b] = genColumn(fine.x, fine.z, T.seed);
+    tops[b] = farColTopFrom(cols[b].h, cols[b].fluidTop, cols[b].ruin,
+                            fine.x, fine.z, T.seed);
   }
   let planeBase = ((level - 1u) * FAR_VOX + slot * CHUNK_VOL) / 4u;
   for (var yi = 0u; yi < CHUNK; yi++) {
@@ -4241,12 +4331,17 @@ fn far(@builtin(workgroup_id) wg : vec3<u32>,
       let fine = (cc << vec3<u32>(shift)) + vec3<i32>(1 << (shift - 1u));
       let col = cols[b];
       let mat = genCellCol(col, fine, T.seed) & 0xFFFu;
-      var byteV = 0u;
+      // The conservative flag first: it is what a cell keeps when the centre
+      // sample found nothing (common.wgsl FAR_BLOCKER_BIT).
+      var byteV = farBlockerBitAt(tops[b], cc, shift, T.seed);
       if (mat != MAT_AIR && materials[mat].klass != CLASS_GAS) {
         // shape from the center sample, color from the surface skin (phase 4)
-        byteV = min(farSurfaceMat(col, mat, fine, shift, T.seed), 255u);
-        count += 1u;
+        byteV |= min(farSurfaceMat(col, mat, fine, shift, T.seed), FAR_MAT_MASK);
       }
+      // farOcc counts NON-EMPTY cells, which now includes blocker-only ones —
+      // it gates empty-space skipping for every far reader, and a reader that
+      // hits on the flag must not have its chunk skipped out from under it.
+      if (byteV != 0u) { count += 1u; }
       word |= byteV << (b * 8u);
     }
     // The cell index in this level chunk is x + y*CHUNK + z*CHUNK*CHUNK (see the
@@ -4298,16 +4393,20 @@ fn far(@builtin(workgroup_id) wg : vec3<u32>,
                                  ci / (CHUNK * CHUNK)));
     let pcc = base + pl;
     let pfine = (pcc << vec3<u32>(shift)) + vec3<i32>(1 << (shift - 1u));
-    var byteV = 0u;
+    // Its own genColumn: a patch cell is an arbitrary cell of this level
+    // chunk, so it shares no column with the thread's four. Patches are rare
+    // (only cells the player edited), so this is the one place in the kernel
+    // that still pays a column per cell — and now it pays it unconditionally,
+    // because the blocker flag is a property of the TERRAIN under the patch
+    // and has to survive a patch that clears the cell's material.
+    let pcol = genColumn(pfine.x, pfine.z, T.seed);
+    var byteV = farBlockerBitAt(
+        farColTopFrom(pcol.h, pcol.fluidTop, pcol.ruin, pfine.x, pfine.z, T.seed),
+        pcc, shift, T.seed);
     if (pmat != MAT_AIR && materials[pmat].klass != CLASS_GAS) {
-      // Its own genColumn: a patch cell is an arbitrary cell of this level
-      // chunk, so it shares no column with the thread's four. Patches are rare
-      // (only cells the player edited), so this is the one place in the kernel
-      // that still pays a column per cell.
-      byteV = min(farSurfaceMat(genColumn(pfine.x, pfine.z, T.seed), pmat,
-                                pfine, shift, T.seed), 255u);
-      pnz += 1u;
+      byteV |= min(farSurfaceMat(pcol, pmat, pfine, shift, T.seed), FAR_MAT_MASK);
     }
+    if (byteV != 0u) { pnz += 1u; }
     let bi = (level - 1u) * FAR_VOX + slot * CHUNK_VOL + ci;
     let bsh = (bi & 3u) * 8u;
     atomicAnd(&farVox[bi >> 2u], ~(0xFFu << bsh));
@@ -4398,9 +4497,27 @@ fn fardown(@builtin(workgroup_id) wg : vec3<u32>,
       let cc = fine >> vec3<u32>(shift);
       if (!farInBox(cc, origin)) { continue; }   // outside this cascade level
 
+      // THE BLOCKER FLAG IS PRISTINE ON BOTH SIDES, and that is the whole
+      // reason it is computed from the procgen COLUMN here rather than from
+      // the live grid this entry otherwise reads. `far` has no live grid to consult —
+      // it fills from procgen — so a flag derived from real voxels here would
+      // differ from the flag `far` writes for the same cell, and the seam
+      // between a refilled plane and a downsampled chunk would show it. Same
+      // function, same arguments, same answer: the argument `farSurfaceMat`
+      // already makes for the colour. The cost is that an EDIT never sets or
+      // clears the flag — only the material byte below records it, which is
+      // the behaviour every reader had before the flag existed.
+      //
+      // The column is now HOISTED out of the material branch and shared by the
+      // two, so a cell pays ONE genColumn instead of one for the flag and
+      // another for the skin. That makes an air cell dearer than it was (it
+      // used to pay none) and a solid cell exactly as dear as it was.
+      let pcol = genColumn(fine.x, fine.z, T.seed);
+      var byteV = farBlockerBitAt(
+          farColTopFrom(pcol.h, pcol.fluidTop, pcol.ruin, fine.x, fine.z, T.seed),
+          cc, shift, T.seed);
       // live grid (the sample point is inside this chunk, hence resident)
       let mat = voxWordAt(fine) & 0xFFFu;
-      var byteV = 0u;
       if (mat != MAT_AIR && materials[mat].klass != CLASS_GAS) {
         // Same skin rule as the sieve — the skin is looked up from PRISTINE
         // procgen (genCell), so a pristine chunk downsamples bit-identically
@@ -4413,13 +4530,12 @@ fn fardown(@builtin(workgroup_id) wg : vec3<u32>,
         // a downsampled chunk byte-identical to a refilled one at their shared
         // boundary, and it is why farSurfaceMat takes the column rather than
         // deriving a height of its own (surfHeightAt used to, and drifted).
-        byteV = min(farSurfaceMat(genColumn(fine.x, fine.z, T.seed), mat, fine,
-                                  shift, T.seed), 255u);
+        byteV |= min(farSurfaceMat(pcol, mat, fine, shift, T.seed), FAR_MAT_MASK);
       }
       let bi = farVoxByteIndex(level, cc);
-      let shift = (bi & 3u) * 8u;
-      atomicAnd(&farVox[bi >> 2u], ~(0xFFu << shift));
-      atomicOr(&farVox[bi >> 2u], byteV << shift);
+      let bsh = (bi & 3u) * 8u;
+      atomicAnd(&farVox[bi >> 2u], ~(0xFFu << bsh));
+      atomicOr(&farVox[bi >> 2u], byteV << bsh);
       if (byteV != 0u) {
         atomicMax(&farOcc[farOccIndex(level, cc)], 1u);
       }

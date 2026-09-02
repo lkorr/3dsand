@@ -2009,9 +2009,23 @@ struct FarHit {
   level : u32,         // which cascade level the hit lives in (shadow march)
 };
 
-fn farMatAt(level : u32, c : vec3<i32>) -> u32 {
+// The raw far cell byte: 7 bits of material id plus the conservative blocker
+// flag (common.wgsl FAR_BLOCKER_BIT). EVERY reader of farVox goes through one
+// of the three functions below — an unmasked byte read would treat a flagged
+// air cell as material 128.
+fn farByteAt(level : u32, c : vec3<i32>) -> u32 {
   let bi = farVoxByteIndex(level, c);
   return (farVox[bi >> 2u] >> ((bi & 3u) * 8u)) & 0xFFu;
+}
+fn farMatAt(level : u32, c : vec3<i32>) -> u32 {
+  return farByteAt(level, c) & FAR_MAT_MASK;
+}
+// "Would a ray stop here?" — the flag OR a real material. A cell can carry
+// material without the flag (an edit downsampled into mid-air) and the flag
+// without material (the surface band, a cave, anything the centre sample
+// missed), so this is a union and not either one alone.
+fn farBlockerAt(level : u32, c : vec3<i32>) -> bool {
+  return farByteAt(level, c) != 0u;
 }
 
 fn traceFar(ro : vec3f, rdIn : vec3f, tStart : f32, px : vec2f) -> FarHit {
@@ -2099,7 +2113,33 @@ fn traceFar(ro : vec3f, rdIn : vec3f, tStart : f32, px : vec2f) -> FarHit {
         continue;
       }
 
-      let mat = farMatAt(level, cell);
+      let cellByte = farByteAt(level, cell);
+      var mat = cellByte & FAR_MAT_MASK;
+      // THE BLOCKER FLAG AS A PRIMARY HIT, behind render.farBlockerHitLevel.
+      //
+      // Shadows take the flag at every level (farShadowed) because a shadow
+      // that is half a cell too tall on the horizon costs nothing. The VISIBLE
+      // surface cannot: the flag is set for every cell whose floor is at or
+      // below the ground, so honouring it raises the terrain by up to one cell
+      // EVERYWHERE — 0.4 m at level 1, 51 m at level 8. Past the knob the
+      // horizon stops being a ridge and becomes the staircase 13.2.2 predicted,
+      // which is why this is a level cap and not a boolean. 0 is exactly the
+      // behaviour before this flag existed and const-folds the block away.
+      if (mat == 0u && (cellByte & FAR_BLOCKER_BIT) != 0u &&
+          i32(level) <= TUNE_FAR_BLOCKER_HIT_LEVEL) {
+        // The flag carries no material of its own, so take the nearest one
+        // below in this column. NEVER shade air: an unbacked flag (a cave roof
+        // with nothing under it in this level, a cell at the bottom edge of the
+        // box) falls through and the march continues, which is the old
+        // behaviour and the safe direction.
+        var probe = cell;
+        for (var d = 0; d < 3; d++) {
+          probe.y -= 1;
+          if (!farInBox(probe, org)) { break; }
+          let below = farMatAt(level, probe);
+          if (below != 0u) { mat = below; break; }
+        }
+      }
       if (mat != 0u) {
         out.hit = true;
         out.t = tCur * s;   // back to fine-voxel units
@@ -2237,7 +2277,11 @@ fn farShadowed(level : u32, roFine : vec3f) -> bool {
       tCur = t;
       continue;
     }
-    if (farMatAt(level, cell) != 0u) { return true; }
+    // The conservative flag at EVERY level: a shadow caster that is half a
+    // cell too tall reads as terrain on the horizon, and the cells this
+    // recovers — terrace tops, ridge crests, a ruin wall thinner than a cell —
+    // are exactly the ones whose shadows were missing.
+    if (farBlockerAt(level, cell)) { return true; }
     if (tMax.x < tMax.y && tMax.x < tMax.z) {
       cell.x += stepv.x; tCur = tMax.x; tMax.x += tDelta.x;
     } else if (tMax.y < tMax.z) {
