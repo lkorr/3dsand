@@ -167,6 +167,12 @@ void LoadDevice(const InstanceFns& i, VkDevice dev, DeviceFns& o) {
   VKL_D(DestroyImageView);
   VKL_D(CreateGraphicsPipelines);
 
+  // VK_KHR_pipeline_executable_properties: null unless the device enabled it
+  // (`--shader-stats` only; Backend::CreateLogicalDevice enables it when the
+  // driver offers it, and caps_.pipelineExecutableProps records the answer).
+  VKL_D(GetPipelineExecutablePropertiesKHR);
+  VKL_D(GetPipelineExecutableStatisticsKHR);
+
   // VK_KHR_swapchain: null unless the device enabled it (windowed only).
   VKL_D(CreateSwapchainKHR);
   VKL_D(DestroySwapchainKHR);
