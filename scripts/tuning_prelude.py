@@ -221,6 +221,14 @@ SPEC = [
     ("render", "siltBrightness", "TUNE_SILT_BRIGHTNESS", "f", 0.5),
     ("render", "siltDrift", "TUNE_SILT_DRIFT", "f", 0.05),
 
+    # waterfall mist and spray
+    ("render", "mistDensity", "TUNE_MIST_DENSITY", "f", 1.0),
+    ("render", "mistBrightness", "TUNE_MIST_BRIGHTNESS", "f", 0.9),
+    ("render", "mistRadius", "TUNE_MIST_RADIUS", "f", 10.0),
+    ("render", "mistFallSpeed", "TUNE_MIST_FALL_SPEED", "f", 2.2),
+    ("render", "sprayDensity", "TUNE_SPRAY_DENSITY", "f", 1.3),
+    ("render", "sprayRadius", "TUNE_SPRAY_RADIUS", "f", 14.0),
+
     # surface-from-below
     ("render", "subSurfaceRipple", "TUNE_SUB_SURFACE_RIPPLE", "f", 1.6),
 

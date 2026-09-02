@@ -1361,6 +1361,271 @@ int RunShots(GpuContext& ctx, World& world, Simulation& sim) {
   return ctx.ReportVkValidation("--shot") > 0 ? 1 : 0;
 }
 
+// --shot-waterfall: the fixture the render-only waterfall mist (13.3.1) is
+// judged on.
+//
+// THERE IS NO WATERFALL IN THE SHIPPED WORLD, and that is why this exists.
+// Every authored pool is a flat stone basin and every generated tarn is a bowl,
+// so "liquid with air under it" - the one cue the mist detector fires on - is
+// never true for more than a tick anywhere in --shot's forty frames. A look
+// feature with no frame that contains its subject is a feature nobody can
+// review, so this builds the subject: a stone terrace with a spout cut in its
+// rim, a plunge basin at its foot, and a water source in the trough behind the
+// lip, poured for long enough that a column is falling AND the pool below it
+// has formed.
+//
+// EVERYTHING here enters the world through the MutationQueue as CellOps
+// (CLAUDE.md rule 3) - the same op stream a brush or a spell uses. Nothing
+// writes the voxel buffer directly and nothing here runs under --selftest, so
+// the fixture cannot move a gate or the world hash.
+int RunWaterfallShot(GpuContext& ctx, World& world, Simulation& sim) {
+  // ---- where. Inside the origin residency window on purpose: a liquid
+  // outside it shades through the far-field cascade as flat colour, with no
+  // surface, no fullness gradient and therefore no falling column to detect
+  // (the same trap the oil and pond frames in --shot document).
+  const int cx = 120, cz = 200;   // the fall's XZ: lip at cx-1, water at cx
+  const int kBack = 8;            // terrace depth in -X
+  // CLEARED AIR IN +X, AND IT IS A FRAMING NUMBER, NOT A SCENERY ONE. The
+  // first cut of this scene cleared 36 voxels, which put the only legal camera
+  // 3 m from a 4 m cliff: the frame was one flat white wall, the fall was a
+  // 20 cm ribbon against it, and the shot could not be read at all. The eye
+  // has to get far enough back that the terrace has SKY behind its top.
+  const int kFront = 60;
+  // Half the box width in Z, and it has to clear the CAMERA, not just the
+  // subject: at 14 the only legal eye sat two voxels inside the +Z edge and
+  // a live trunk just outside the excavation stood in the middle of the
+  // frame.
+  const int kHalfZ = 18;
+  const int kDrop = 40;           // voxels of fall (4.0 m at kVoxelMeters=0.10)
+  const int kRim = 4;             // trough wall height on the terrace top
+  const int kPit = 16;            // plunge basin depth below the plaza
+  const int x0 = cx - kBack, x1 = cx + kFront - 1;
+  const int z0 = cz - kHalfZ, z1 = cz + kHalfZ - 1;
+
+  SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+  ctx.WaitIdle();
+  FarField far;
+  far.Init(&world);
+  far.FullRefill({8, 3, 8});
+  uint32_t nfar;
+  while ((nfar = far.PrepareTick(ctx.queue)) > 0) {
+    TickParams tp{0, kDefaultSeed, 0, 0};
+    tp.farCount = nfar;
+    ctx.queue.WriteBuffer(world.tickUBO, 0, &tp, sizeof(tp));
+    rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
+    sim.EncodeFarFill(enc, nfar);
+    ctx.queue.Submit(enc.Finish());
+  }
+
+  // The plaza sits one voxel above the HIGHEST terrain in the footprint, so
+  // nothing native can poke through the floor of the frame. Derived, never
+  // written down: spawnPlainY has moved once already and every literal height
+  // in this file that predated the move was rendering from inside rock.
+  int floorY = INT32_MIN;
+  for (int z = z0; z <= z1; z++)
+    for (int x = x0; x <= x1; x++)
+      floorY = std::max(floorY, World::TerrainHeight(x, z, kDefaultSeed));
+  floorY += 1;
+  const int cliffTop = floorY + kDrop;
+  const int yLo = floorY - kPit - 2, yHi = cliffTop + kRim + 4;
+  // Plunge basin: open at the cliff face so the column drops straight into it.
+  const int bx0 = cx, bx1 = cx + 22, bz0 = cz - 11, bz1 = cz + 11;
+  const int pitFloor = floorY - kPit;
+  // The trough on the terrace top, open only at the lip.
+  const int tz0 = cz - 4, tz1 = cz + 3, tx0 = x0 + 2;
+
+  // ONE op per cell, decided once. Emitting "air here, stone there" as two
+  // passes would put two ops on the same cell in the same tick, and sim_mutate
+  // applies a tick's ops in parallel - two writers to one cell is exactly the
+  // scheduling-dependent outcome rule 1 forbids.
+  auto desired = [&](int x, int y, int z) -> uint32_t {
+    if (y <= floorY) {
+      if (x >= bx0 && x <= bx1 && z >= bz0 && z <= bz1) {
+        if (y > pitFloor) return kMatAir;    // the basin
+        // A DRAIN, so the scene is BOUNDED (CLAUDE.md rule 2). A source with
+        // no sink fills the basin, tops the plaza and then runs out over live
+        // terrain, which is an unbounded wet region and hundreds of chunks
+        // that never sleep. Void is the engine's authored liquid sink; a small
+        // patch of it in the basin floor lets the pool find a level instead.
+        if (y == pitFloor && x >= bx1 - 4 && x <= bx1 - 2 &&
+            z >= cz - 1 && z <= cz + 1)
+          return kMatVoid;
+      }
+      return kMatStone;                      // solid tub, whatever worldgen left
+    }
+    if (x < cx) {                            // the terrace / cliff column
+      if (y <= cliffTop) return kMatStone;
+      if (y <= cliffTop + kRim)
+        return (z >= tz0 && z <= tz1 && x >= tx0) ? kMatAir : kMatStone;
+    }
+    return kMatAir;                          // open air in front and above
+  };
+
+  std::vector<CellOp> build;
+  build.reserve((size_t)(x1 - x0 + 1) * (size_t)(z1 - z0 + 1) *
+                (size_t)(yHi - yLo + 1));
+  for (int z = z0; z <= z1; z++)
+    for (int x = x0; x <= x1; x++)
+      for (int y = yLo; y <= yHi; y++) {
+        const uint32_t m = desired(x, y, z);
+        build.push_back({World::SlotCellIndex({x, y, z}),
+                         m == kMatAir ? 0u : PackVoxNew(m, 0u)});
+      }
+
+  // The source: full water cells rewritten at the back of the trough every
+  // tick. A CellOp overwrite is a cheaper and more predictable source than a
+  // source_water block (whose emit is a per-tick reaction chance), and it is
+  // the same op stream, so the fixture stays inside rule 3 either way.
+  // AT THE LIP, NOT AT THE BACK OF THE TROUGH, and that is the whole
+  // difference between a waterfall and a damp stain. Poured at the back, the
+  // stream that actually leaves the spout is whatever the CA's lateral
+  // equalisation delivers over the lip - measured here, about one cell a tick,
+  // a 20 cm ribbon that is invisible against lit stone. Writing the source
+  // cells straddling the lip instead makes the SHEET the authored quantity: one
+  // fresh row a tick, which is also the rate the column falls, so it stays
+  // dense all the way down.
+  std::vector<CellOp> pour;
+  for (int z = cz - 3; z <= cz + 2; z++)
+    for (int x = cx - 3; x <= cx + 1; x++)
+      pour.push_back({World::SlotCellIndex({x, cliffTop + 1, z}),
+                      (kMatWater & 0xFFFu) | (7u << 12)});   // 8/8 fullness
+
+  // Build first (chunked under the per-tick op cap), then pour long enough for
+  // BOTH halves of the subject to exist: a column in flight the whole height of
+  // the cliff, and a plunge pool deep enough to shade as water rather than as a
+  // wet floor.
+  const size_t kOpsPerTick = 60000;
+  uint32_t tick = 0;
+  const IVec3 pchunk{cx / (int)kChunk, floorY / (int)kChunk, cz / (int)kChunk};
+  for (size_t off = 0; off < build.size(); off += kOpsPerTick) {
+    const size_t n = std::min(kOpsPerTick, build.size() - off);
+    std::vector<CellOp> slice(build.begin() + (ptrdiff_t)off,
+                              build.begin() + (ptrdiff_t)(off + n));
+    SubmitTick(ctx, world, sim, ++tick, kDefaultSeed, {}, {}, slice, false,
+               pchunk, false, false);
+  }
+  for (int i = 0; i < 260; i++)
+    SubmitTick(ctx, world, sim, ++tick, kDefaultSeed, {}, {}, pour, false,
+               pchunk, false, false);
+  ctx.WaitIdle();
+
+  // ---- CENSUS, not a guess ------------------------------------------------
+  // A look fixture whose subject silently failed to build is a frame nobody can
+  // interpret: is the water missing, or is the camera pointed at the back of a
+  // wall? One readback separates those two forever, and it is the difference
+  // between reading the next shot and re-running the harness to find out.
+  {
+    std::vector<uint32_t> cbuf((size_t)kChunkVol);
+    uint32_t nWater = 0;
+    int wMinY = INT32_MAX, wMaxY = INT32_MIN;
+    for (int qz = z0 >> 4; qz <= (z1 >> 4); qz++)
+      for (int qy = yLo >> 4; qy <= (yHi >> 4); qy++)
+        for (int qx = x0 >> 4; qx <= (x1 >> 4); qx++) {
+          ReadVoxelsSync(ctx, world, World::SlotChunkIndex({qx, qy, qz}), 1,
+                         cbuf.data(), "waterfallCensus");
+          for (uint32_t k = 0; k < kChunkVol; k++) {
+            if ((cbuf[k] & 0xFFFu) != kMatWater) continue;
+            const int wy = (int)((k / kChunk) % kChunk) + qy * (int)kChunk;
+            nWater++;
+            wMinY = std::min(wMinY, wy);
+            wMaxY = std::max(wMaxY, wy);
+          }
+        }
+    std::printf("--shot-waterfall: %u water cells, y %d..%d "
+                "(basin floor %d, plaza %d, lip %d)\n",
+                nWater, wMinY, wMaxY, pitFloor, floorY, cliffTop);
+  }
+
+  const uint32_t W = 1920, H = 1080;
+  rhi::Texture offscreen = ctx.device.CreateTexture(
+      {W, H, 1}, rhi::TextureFormat::RGBA8Unorm,
+      rhi::TextureUsage::RenderAttachment | rhi::TextureUsage::CopySrc,
+      "offscreen");
+  rhi::TextureView view = offscreen.CreateView();
+  const Tuning& shotTun = CurrentTuning();
+  const uint32_t ticksPerDay = TicksPerDay(shotTun);
+  const uint32_t shotTick =
+      (uint32_t)((double)g_shotTimeOfDay * (double)ticksPerDay) % ticksPerDay;
+  auto render = [&](Vec3 eye, float yaw, float pitch, const char* path) {
+    Camera c;
+    c.yaw = yaw;
+    c.pitch = pitch;
+    WriteRenderParams(ctx.queue, world, eye, c, (float)W / H, true, 11.7f,
+                      kFarFogDensity, 1080.0f, shotTick);
+    rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
+    sim.EncodeShadowResolve(enc);
+    rhi::RenderPass rp =
+        sim.BeginRenderPass(enc, view, rhi::TextureFormat::RGBA8Unorm, W, H);
+    sim.DrawWorld(rp);
+    rp.End();
+    ctx.queue.Submit(enc.Finish());
+    ctx.WaitIdle();
+    rhi::Buffer shot = CreateBuffer(
+        ctx.device, (uint64_t)W * H * 4,
+        rhi::BufferUsage::MapRead | rhi::BufferUsage::CopyDst, "screenshot");
+    rhi::CommandEncoder enc2 = ctx.device.CreateCommandEncoder();
+    rhi::TexelCopyTexture srcT{};
+    srcT.texture = offscreen;
+    rhi::TexelCopyBuffer dstB{};
+    dstB.buffer = shot;
+    dstB.bytesPerRow = W * 4;
+    dstB.rowsPerImage = H;
+    enc2.CopyTextureToBuffer(srcT, dstB, {W, H, 1});
+    ctx.queue.Submit(enc2.Finish());
+    std::vector<uint8_t> pixels((size_t)W * H * 4);
+    if (rhi::ReadBufferBlocking(ctx.device, shot, 0, pixels.data(),
+                                pixels.size()) &&
+        WriteBmpFile(path, pixels, W, H))
+      std::printf("wrote %s\n", path);
+  };
+
+  // SUN BEHIND THE CAMERA, asked for rather than written down. Both cameras
+  // have to approach from +X (the cliff walls off -X), so the only freedom is
+  // which side in Z, and the sun's own azimuth picks it: standing so the light
+  // comes over your shoulder is what puts the mist between the sun and the eye
+  // without turning the column into a silhouette.
+  const SkyState ss = SkyForTick(shotTun, shotTick);
+  const float zs = ss.sunDir[2] >= 0.0f ? 1.0f : -1.0f;
+  auto aim = [&](Vec3 eye, Vec3 at) {
+    const float dx = at.x - eye.x, dy = at.y - eye.y, dz = at.z - eye.z;
+    const float hd = std::sqrt(dx * dx + dz * dz);
+    // Camera::Forward() is (cos yaw, sin pitch, sin yaw) - atan2(z, x).
+    return std::pair<float, float>{std::atan2(dz, dx), std::atan2(dy, hd)};
+  };
+  {
+    // _waterfall_over: the whole fixture from outside and above. Not a look
+    // frame - it is the one that says the TERRACE, the SPOUT and the BASIN are
+    // where the code thinks they are, which is the question every unreadable
+    // close-up leaves open.
+    const Vec3 eye{(float)(cx + 52), (float)(floorY + 62),
+                   (float)cz + zs * 46.0f};
+    const Vec3 at{(float)(cx + 2), (float)(floorY + 14), (float)cz};
+    const auto ya = aim(eye, at);
+    render(eye, ya.first, ya.second, "screenshot_waterfall_over.bmp");
+  }
+  {
+    // _waterfall: the whole column, from the side and slightly above, with the
+    // cliff behind it and the plunge pool in the lower third of the frame.
+    const Vec3 eye{(float)(cx + 52), (float)(floorY + 16),
+                   (float)cz + zs * 9.0f};
+    const Vec3 at{(float)(cx + 1), (float)(floorY + 22), (float)cz};
+    const auto ya = aim(eye, at);
+    render(eye, ya.first, ya.second, "screenshot_waterfall.bmp");
+  }
+  {
+    // _waterfall_base: the impact point, close and low. This is the frame the
+    // SPRAY term is judged on - the mist above is barely in it.
+    const Vec3 eye{(float)(cx + 24), (float)(floorY + 6),
+                   (float)cz + zs * 10.0f};
+    const Vec3 at{(float)(cx + 3), (float)(floorY - 6), (float)cz + zs * 1.0f};
+    const auto ya = aim(eye, at);
+    render(eye, ya.first, ya.second, "screenshot_waterfall_base.bmp");
+  }
+  std::printf("--shot-waterfall: floorY=%d cliffTop=%d, %zu build ops\n",
+              floorY, cliffTop, build.size());
+  return ctx.ReportVkValidation("--shot-waterfall") > 0 ? 1 : 0;
+}
+
 // --shot-fluid: the MPM water counterpart of --shot. Worldgen, pour a pool of
 // MLS-MPM fluid onto open terrain with the same spawn-op shape the game's mpm
 // tool emits, let it slosh, then keep a narrow stream falling and write
@@ -2066,6 +2331,11 @@ int main(int argc, char** argv) {
   uint16_t telemetryPort = 8080;
   std::string shotMob;  // --shot-mob <def>[:limb,...] (mob pose look iteration)
   bool shotFluid = false;  // --shot-fluid (MPM water look iteration)
+  // --shot-waterfall: the CA falling-column fixture. Its own flag rather
+  // than a frame inside --shot because it BUILDS a scene (a terrace, a
+  // spout and a plunge basin) and pours for 300 ticks, and paying that on
+  // every look-iteration run of the other forty frames is the wrong trade.
+  bool shotWaterfall = false;
   // --shot-fluid-pond: the same harness aimed into a generated pond, so the
   // MPM isosurface has to share the frame with deep SETTLED water. Separate
   // process rather than an extra block in --shot-fluid because the scene moves
@@ -2108,6 +2378,7 @@ int main(int argc, char** argv) {
           "Shot / screenshot modes:\n"
           "  --shot                Screenshot-only look iteration\n"
           "  --shot-fluid          MPM fluid screenshot mode\n"
+          "  --shot-waterfall      Waterfall mist/spray fixture (CA liquid)\n"
           "  --shot-fluid-pond     MPM fluid poured into a generated pond\n"
           "                        (the MPM/settled-water seam)\n"
           "  --shot-mob <def>      Mob pose look iteration (def[:limb,...])\n"
@@ -2176,6 +2447,7 @@ int main(int argc, char** argv) {
     }
     else if (a == "--shot") shot = true;
     else if (a == "--shot-fluid") shotFluid = true;
+    else if (a == "--shot-waterfall") shotWaterfall = true;
     else if (a == "--shot-fluid-pond") shotFluidPond = true;
     // Fluid lab modes. The scene argument is optional (it must not start
     // with '-' or it is the next flag).
@@ -2691,7 +2963,8 @@ int main(int argc, char** argv) {
   }
 
   GLFWwindow* window = nullptr;
-  if (!selftest && !shot && !measure && !perf && !fluidBench && !shaderStats &&
+  if (!selftest && !shot && !shotWaterfall && !measure && !perf &&
+      !fluidBench && !shaderStats &&
       shotMob.empty() && voxdumpArgs.empty() && !voxserve) {
     if (!glfwInit()) return 1;
     glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
@@ -2864,6 +3137,7 @@ int main(int argc, char** argv) {
     return RunVoxDump(ctx, world, sim, mats, voxdumpArgs, voxdumpOut);
   if (voxserve) return RunVoxServe(ctx, world, sim, mats);
   if (shot) return RunShots(ctx, world, sim);
+  if (shotWaterfall) return RunWaterfallShot(ctx, world, sim);
   if (shotFluid || shotFluidPond)
     return RunFluidShot(ctx, world, sim, mats, shotFluidPond);
   if (fluidBench)

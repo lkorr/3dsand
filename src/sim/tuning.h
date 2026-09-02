@@ -2355,6 +2355,18 @@ struct Tuning {
     float siltBrightness = 0.50f;
     float siltDrift = 0.05f;
 
+    // ---- waterfall mist and spray ----
+    // Render-only overlay on a FALLING CA liquid column and on its impact
+    // site, both derived per pixel from the cells under/over a liquid hit
+    // (raymarch.wgsl fallCueAt). No particle, no buffer, nothing hashed.
+    // mistDensity <= 0 removes the whole term at shader-compile time.
+    float mistDensity = 1.0f;
+    float mistBrightness = 0.9f;
+    float mistRadius = 10.0f;     // voxels the veil wraps around the column
+    float mistFallSpeed = 2.2f;   // m/s the vapour field drifts DOWN
+    float sprayDensity = 1.3f;
+    float sprayRadius = 14.0f;    // voxels the impact puff reaches
+
     // how strongly the underside of the surface ripples the view of the sky
     float subSurfaceRipple = 1.6f;
 

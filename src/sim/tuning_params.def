@@ -287,6 +287,19 @@ TP_F(render, siltDensity, TUNE_SILT_DENSITY, 0.55f)
 TP_F(render, siltBrightness, TUNE_SILT_BRIGHTNESS, 0.5f)
 TP_F(render, siltDrift, TUNE_SILT_DRIFT, 0.05f)
 
+// ---- waterfall mist and spray ----
+// Render-only. "Liquid with air under it" is not a field in the voxel word, so
+// the renderer derives a falling column from ONE read of the cell below a
+// liquid hit and overlays procedural slabs on it -- no particle, no buffer, no
+// sim state, nothing hashed. mistDensity <= 0 deletes the whole term at
+// shader-compile time, which is why the dry overlook pays nothing for it.
+TP_F(render, mistDensity, TUNE_MIST_DENSITY, 1.0f)
+TP_F(render, mistBrightness, TUNE_MIST_BRIGHTNESS, 0.9f)
+TP_F(render, mistRadius, TUNE_MIST_RADIUS, 10.0f)
+TP_F(render, mistFallSpeed, TUNE_MIST_FALL_SPEED, 2.2f)
+TP_F(render, sprayDensity, TUNE_SPRAY_DENSITY, 1.3f)
+TP_F(render, sprayRadius, TUNE_SPRAY_RADIUS, 14.0f)
+
 // ---- surface-from-below ----
 // How much the underside of the water surface ripples the view of the sky.
 TP_F(render, subSurfaceRipple, TUNE_SUB_SURFACE_RIPPLE, 1.6f)

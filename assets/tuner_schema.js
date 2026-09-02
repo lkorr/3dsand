@@ -484,6 +484,12 @@ const TUNING_SCHEMA = [
       {k:'siltDensity', n:'silt density', d:'Drifting motes suspended in the water. They are most of why footage reads as underwater — the shafts need something to catch.', min:0, max:4, step:0.02},
       {k:'siltBrightness', n:'silt brightness', d:'How brightly those motes catch the light.', min:0, max:4, step:0.02},
       {k:'siltDrift', n:'silt drift', d:'How fast the particulate drifts. Very slow is correct; fast reads as snow.', min:0, max:1, step:0.005},
+      {k:'mistDensity', n:'waterfall mist density', d:'Render-only vapour wrapped around a FALLING liquid column. The renderer finds the column by reading the cell under a liquid hit — no particle, no sim state. 0 removes the whole effect at shader-compile time.', min:0, max:4, step:0.02},
+      {k:'mistBrightness', n:'waterfall mist brightness', d:'How brightly that vapour catches the sun. Mist is white because it is aerated, so this is most of what makes falling water read as falling water.', min:0, max:4, step:0.02},
+      {k:'mistRadius', n:'waterfall mist radius', d:'Voxels the mist veil wraps around the column, along the view ray.', min:0.5, max:48, step:0.5},
+      {k:'mistFallSpeed', n:'waterfall mist fall speed', d:'Metres per second the vapour field drifts downward. Fast enough to read as motion, slow enough not to read as rain.', min:0, max:12, step:0.05},
+      {k:'sprayDensity', n:'waterfall spray density', d:'The brighter, finer burst at the foot of the fall, where the column hits the plunge pool.', min:0, max:4, step:0.02},
+      {k:'sprayRadius', n:'waterfall spray radius', d:'Voxels the impact puff reaches along the view ray.', min:0.5, max:48, step:0.5},
     ],
   },
 

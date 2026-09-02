@@ -1890,6 +1890,22 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     r.siltDensity = std::clamp(r.siltDensity, 0.0f, 4.0f);
     ReadF(*g, "siltBrightness", r.siltBrightness, out, at);
     ReadF(*g, "siltDrift", r.siltDrift, out, at);
+
+    // ---- waterfall mist / spray ----
+    // Clamped at 0 on the low side so `mistDensity <= 0` stays the ONE off
+    // switch the shader const-folds on, and generously on the high side
+    // because these are look knobs with no stability hazard behind them.
+    ReadF(*g, "mistDensity", r.mistDensity, out, at);
+    r.mistDensity = std::clamp(r.mistDensity, 0.0f, 4.0f);
+    ReadF(*g, "mistBrightness", r.mistBrightness, out, at);
+    r.mistBrightness = std::clamp(r.mistBrightness, 0.0f, 4.0f);
+    ReadF(*g, "mistRadius", r.mistRadius, out, at);
+    r.mistRadius = std::clamp(r.mistRadius, 0.5f, 48.0f);
+    ReadF(*g, "mistFallSpeed", r.mistFallSpeed, out, at);
+    ReadF(*g, "sprayDensity", r.sprayDensity, out, at);
+    r.sprayDensity = std::clamp(r.sprayDensity, 0.0f, 4.0f);
+    ReadF(*g, "sprayRadius", r.sprayRadius, out, at);
+    r.sprayRadius = std::clamp(r.sprayRadius, 0.5f, 48.0f);
     ReadF(*g, "subSurfaceRipple", r.subSurfaceRipple, out, at);
 
     // ---- generic per-liquid submerged profile ----

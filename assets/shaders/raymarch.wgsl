@@ -3633,6 +3633,156 @@ fn siltMotes(ro : vec3f, rd : vec3f, maxDistVox : f32, lit : f32) -> f32 {
 }
 
 // ============================================================================
+// WATERFALL MIST AND SPRAY — render-only, derived, nothing stored
+// ============================================================================
+// Falling water reads as falling water because it is AERATED. A column in
+// flight is half air: it goes white, it loses its mirror, and it drags a plume
+// of vapour that the sun lights from the side. None of that is in the sim and
+// none of it needs to be — "this liquid cell has air under it" is ONE voxel
+// read away, and everything past that is the siltMotes recipe (fixed slabs
+// along the view ray, value noise thresholded hard, time drift, distance
+// falloff) pointed at a different subject.
+//
+// WHY NOT PARTICLES. The MPM liquid already spawns real splash and foam
+// particles and they are hashed sim state. A CA waterfall paying that cost
+// would put a pure look feature inside the determinism argument for nothing:
+// this draws over the frame, reads no buffer the primary ray did not already
+// read, and writes nothing at all. TUNE_MIST_DENSITY <= 0 removes it at
+// shader-compile time, which is why a dry frame pays exactly zero for it.
+//
+// WHAT IT DELIBERATELY DOES NOT DO. The overlay only covers pixels whose own
+// hit carries the cue, so the plume does not bloom out past the column's
+// silhouette the way a real one does. Widening it would mean probing the
+// neighbourhood of every pixel in the frame — which is the cost this whole
+// approach exists to avoid — or a screen-space dilation pass, which is a
+// different package.
+
+// What a liquid hit says about the column it belongs to.
+//   fall   the cell is IN FLIGHT (air under it); 1 in a column, less alone
+//   impact this pixel is at the FOOT of a fall — the plunge site
+struct FallCue {
+  fall : f32,
+  impact : f32,
+}
+
+// A non-opaque liquid. Molten rock is a liquid too, and lava throws no water
+// vapour — MATF_OPAQUE is the flag that says "this one shades as a surface",
+// and it is the one liquid the whole block has to leave alone.
+fn mistLiquidAt(c : vec3<i32>) -> bool {
+  if (!inBounds(c)) { return false; }
+  let mt = voxMat(voxWordAt(c));
+  return mt != MAT_AIR && materials[mt].klass == CLASS_LIQUID
+         && (materials[mt].flags & MATF_OPAQUE) == 0u;
+}
+
+// Out of the window reads as air on purpose: a column leaving the residency
+// window is still falling as far as anyone looking at it is concerned, and the
+// alternative (treating unknown as solid) makes the mist stop at a chunk edge.
+fn mistAirAt(c : vec3<i32>) -> bool {
+  if (!inBounds(c)) { return true; }
+  return voxMat(voxWordAt(c)) == MAT_AIR;
+}
+
+// THREE voxel reads worst case, and only on a pixel that already resolved a CA
+// liquid surface. The branches are exclusive because the second question is a
+// different question in each: a cell either has air under it or it does not.
+fn fallCueAt(cell : vec3<i32>) -> FallCue {
+  var cue : FallCue;
+  cue.fall = 0.0;
+  cue.impact = 0.0;
+  if (mistAirAt(cell + vec3<i32>(0, -1, 0))) {
+    // In flight. Liquid directly above means a continuous column, which is the
+    // strong signal; a lone cell with air on both sides is one droplet and is
+    // worth proportionally less veil.
+    cue.fall = select(0.55, 1.0, mistLiquidAt(cell + vec3<i32>(0, 1, 0)));
+    // And if something solid is within two cells under it, this cell IS the
+    // foot of the fall — the spray belongs here as much as at the pool.
+    cue.impact = select(1.0, 0.0, mistAirAt(cell + vec3<i32>(0, -2, 0)));
+  } else {
+    // At rest: a pool surface. It is a plunge site only if there is DETACHED
+    // liquid coming down onto it — an air gap, then water.
+    if (mistAirAt(cell + vec3<i32>(0, 1, 0))) {
+      cue.impact = select(0.0, 1.0, mistLiquidAt(cell + vec3<i32>(0, 2, 0)));
+    }
+  }
+  return cue;
+}
+
+// The overlay. Four slabs stacked along the view ray IN FRONT of the hit —
+// vapour is between the eye and the water, so sampling behind the surface would
+// put the plume on the wrong side of its own subject — with the noise field
+// scrolling in world space and a lateral billow so it curls rather than rains.
+//
+// `drift` is metres per second and POSITIVE means the pattern falls: sampling
+// the field progressively HIGHER makes what you see move down.
+fn mistVeil(ro : vec3f, rd : vec3f, tHit : f32, radius : f32, fieldScale : f32,
+            lo : f32, hi : f32, drift : f32) -> f32 {
+  var acc = 0.0;
+  for (var i = 0; i < 4; i++) {
+    let t = tHit - radius * (0.10 + 0.30 * f32(i));
+    if (t <= 0.05) { continue; }
+    var p = ro + rd * t;
+    p.y += R.time * drift / VOXEL_METERS;
+    p.x += sin(R.time * 0.9 + p.y * 0.10) * 1.8;
+    p.z += cos(R.time * 0.8 + p.y * 0.13) * 1.8;
+    let nz = valueNoise(p, fieldScale);
+    acc += smoothstep(lo, hi, nz) / (1.0 + t * VOXEL_METERS * 0.12);
+  }
+  return acc * 0.55;
+}
+
+// The one entry point `fs` calls. Returns `base` untouched when the knobs are
+// off or the cue is cold, so the cost on a frame with no falling water is the
+// three reads plus a branch — and none at all when mistDensity is 0, because
+// the early-out const-folds the body away.
+fn waterfallMist(base : vec3f, hitP : vec3f, rd : vec3f, tHit : f32,
+                 cell : vec3<i32>, mat : u32) -> vec3f {
+  if (TUNE_MIST_DENSITY <= 0.0 && TUNE_SPRAY_DENSITY <= 0.0) { return base; }
+  let cue = fallCueAt(cell);
+  if (cue.fall <= 0.0 && cue.impact <= 0.0) { return base; }
+
+  // ONE sun ray for the whole overlay rather than one per slab. Lit mist is the
+  // brightest thing in a waterfall frame and shadowed mist is nearly invisible,
+  // so the term earns its place — but the plume is a few voxels across and
+  // resolving its self-shadowing slab by slab would buy nothing at four times
+  // the price. Started 1.5 voxels sunward so the ray does not hit the very
+  // water surface it is standing on.
+  let kd = keyLightDir();
+  var lit = 0.0;
+  if (kd.y > 0.02) {
+    let s = traceOpaque(hitP + kd * 1.5, kd, 24, 1e30, &occupancy, &materials);
+    lit = select(1.0, 0.0, s.hit);
+  }
+  // Vapour has no albedo — there is no material here — so it is lit like a
+  // cloud: sky ambient from above plus whatever sun reaches it. It keeps a
+  // little of the parent liquid's colour, because aerated blood is pink foam
+  // and aerated oil is brown foam; nothing here names a material.
+  let lmc = (unpackColor(materials[mat].color0) +
+             unpackColor(materials[mat].color1)) * 0.5;
+  let tint = mix(vec3f(1.0), lmc, 0.35);
+  let col = (ambientAt(vec3f(0.0, 1.0, 0.0)) + keyLightColor() * lit)
+            * (0.25 + 0.75 * lit) * tint * TUNE_MIST_BRIGHTNESS;
+
+  var out = base;
+  if (TUNE_MIST_DENSITY > 0.0 && cue.fall > 0.0) {
+    let v = mistVeil(R.camPos, rd, tHit, TUNE_MIST_RADIUS, 5.0, 0.30, 0.72,
+                     TUNE_MIST_FALL_SPEED)
+            * TUNE_MIST_DENSITY * cue.fall;
+    out = mix(out, col, clamp(v, 0.0, 0.92));
+  }
+  if (TUNE_SPRAY_DENSITY > 0.0 && cue.impact > 0.0) {
+    // Spray is the same recipe with every dial turned the other way: finer
+    // grain, a harder threshold so it reads as discrete droplets instead of
+    // fog, a wider reach, brighter, and it goes UP.
+    let v = mistVeil(R.camPos, rd, tHit, TUNE_SPRAY_RADIUS, 2.0, 0.44, 0.86,
+                     -TUNE_MIST_FALL_SPEED * 1.6)
+            * TUNE_SPRAY_DENSITY * cue.impact;
+    out = mix(out, col * 1.35, clamp(v, 0.0, 0.95));
+  }
+  return out;
+}
+
+// ============================================================================
 // THE SUBMERGED PROFILE — what being inside ANY liquid looks like
 // ============================================================================
 // Every liquid a body can be inside gets a complete submerged treatment for
@@ -6993,6 +7143,17 @@ fn fs(in : VSOut) -> FSOut {
         caShadedLiquid = true;
       }
       // mpmOwned && !viscous && !underwater: the MPM path below will shade it.
+
+      // ---- waterfall mist and spray (render-only, 13.3.1) ----
+      // AFTER the surface shade and its aerial fog, because vapour hangs in
+      // the air BETWEEN the eye and that surface: compositing it earlier would
+      // let the water paint over its own plume. Only ever reached on a pixel
+      // that resolved a CA liquid, where it costs three voxel reads and one
+      // short sun ray; every other pixel in the frame pays nothing, and with
+      // render.mistDensity at 0 so does this one.
+      if (!underwater && caShadedLiquid) {
+        color = waterfallMist(color, hitP, rd, h.liqT, h.liqCell, lm);
+      }
     }
   }
 
