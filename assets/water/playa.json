@@ -1,0 +1,111 @@
+{
+  "name": "playa",
+  "displayName": "Playa (dry bed)",
+  "kind": "dry",
+  "footprint": {
+    "radius": 8,
+    "radiusV": 4,
+    "aspect": 1,
+    "squareness": 1.8,
+    "rotation": 0,
+    "rotationRandom": true,
+    "warpAmp": 0.2,
+    "warpFreq": 1.8,
+    "warpOctaves": 3,
+    "lobes": 0,
+    "lobeRadius": 0.55,
+    "lobeSpread": 0.75,
+    "lobeWeld": 0.35,
+    "islands": 0,
+    "islandRadius": 0.22,
+    "islandHeight": 0.6
+  },
+  "bathymetry": {
+    "depth": 0.5,
+    "rimDepth": 0.05,
+    "profile": [
+      [
+        0,
+        1
+      ],
+      [
+        0.6,
+        0.98
+      ],
+      [
+        1,
+        0
+      ]
+    ],
+    "floorNoise": 0.02,
+    "floorNoiseFreq": 3
+  },
+  "fill": {
+    "material": "none",
+    "level": 0,
+    "surfaceMaterial": ""
+  },
+  "berm": {
+    "height": 0,
+    "width": 0.5,
+    "coreFrac": 0.25
+  },
+  "bed": {
+    "shallow": "ash",
+    "deep": "ash",
+    "shallowDepth": 3,
+    "thickness": 0.2,
+    "substrate": "sand"
+  },
+  "ground": {
+    "skin": "sand",
+    "soil": "sand",
+    "soilDepth": 1,
+    "rock": "stone",
+    "relief": 0.25,
+    "reliefFreq": 1.2
+  },
+  "shore": {
+    "band": 0,
+    "lift": 1.2,
+    "mudWidth": 1,
+    "mudMaterial": "shore_mud",
+    "mossChance": 3,
+    "mossMaterial": "wet_moss",
+    "plants": []
+  },
+  "aquatic": {
+    "emergent": {
+      "material": "reed",
+      "chance": 0,
+      "minDepth": 0.4,
+      "maxDepth": 1.4,
+      "height": 1.6
+    },
+    "floating": {
+      "material": "lilypad",
+      "flower": "lily_flower",
+      "chance": 0,
+      "flowerChance": 5,
+      "minDepth": 1,
+      "maxDepth": 3
+    },
+    "submerged": {
+      "material": "kelp",
+      "chance": 0,
+      "minDepth": 1.6,
+      "height": 1,
+      "clearance": 0.4
+    }
+  },
+  "placement": {
+    "tile": 128,
+    "rarity": 5,
+    "maxSlope": 24,
+    "minY": -1,
+    "maxY": -1
+  },
+  "preview": {
+    "margin": 1
+  }
+}

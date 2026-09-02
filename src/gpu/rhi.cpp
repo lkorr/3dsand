@@ -80,6 +80,11 @@ void CommandEncoder::CopyTracked(pass::Buf srcId, const Buffer& src, uint64_t sr
                                  uint64_t size) const {
   p_->CopyTracked(srcId, src, srcOffset, dst, dstOffset, size);
 }
+void CommandEncoder::CopyRenderWritten(const Buffer& src, uint64_t srcOffset,
+                                       const Buffer& dst, uint64_t dstOffset,
+                                       uint64_t size) const {
+  p_->CopyRenderWritten(src, srcOffset, dst, dstOffset, size);
+}
 
 void CommandEncoder::FillTracked(pass::Buf id, const Buffer& b) const {
   p_->FillTracked(id, b);

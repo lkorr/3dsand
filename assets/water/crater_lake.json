@@ -1,0 +1,115 @@
+{
+  "name": "crater_lake",
+  "displayName": "Crater lake",
+  "kind": "lake",
+  "footprint": {
+    "radius": 7,
+    "radiusV": 2,
+    "aspect": 1,
+    "squareness": 2,
+    "rotation": 0,
+    "rotationRandom": true,
+    "warpAmp": 0.05,
+    "warpFreq": 2.2,
+    "warpOctaves": 3,
+    "lobes": 0,
+    "lobeRadius": 0.55,
+    "lobeSpread": 0.75,
+    "lobeWeld": 0.35,
+    "islands": 0,
+    "islandRadius": 0.22,
+    "islandHeight": 0.6
+  },
+  "bathymetry": {
+    "depth": 3.4,
+    "rimDepth": 1.2,
+    "profile": [
+      [
+        0,
+        1
+      ],
+      [
+        0.7,
+        0.96
+      ],
+      [
+        0.9,
+        0.5
+      ],
+      [
+        1,
+        0
+      ]
+    ],
+    "floorNoise": 0.15,
+    "floorNoiseFreq": 3
+  },
+  "fill": {
+    "material": "water",
+    "level": 0,
+    "surfaceMaterial": ""
+  },
+  "berm": {
+    "height": 1.6,
+    "width": 3,
+    "coreFrac": 0.3
+  },
+  "bed": {
+    "shallow": "gravel",
+    "deep": "stone",
+    "shallowDepth": 0.5,
+    "thickness": 0.3,
+    "substrate": "stone"
+  },
+  "ground": {
+    "skin": "gravel",
+    "soil": "stone",
+    "soilDepth": 0.5,
+    "rock": "stone",
+    "relief": 0.25,
+    "reliefFreq": 1.2
+  },
+  "shore": {
+    "band": 0.8,
+    "lift": 2,
+    "mudWidth": 0,
+    "mudMaterial": "shore_mud",
+    "mossChance": 0,
+    "mossMaterial": "wet_moss",
+    "plants": []
+  },
+  "aquatic": {
+    "emergent": {
+      "material": "reed",
+      "chance": 0,
+      "minDepth": 0.4,
+      "maxDepth": 1.4,
+      "height": 1.6
+    },
+    "floating": {
+      "material": "lilypad",
+      "flower": "lily_flower",
+      "chance": 0,
+      "flowerChance": 5,
+      "minDepth": 1,
+      "maxDepth": 3
+    },
+    "submerged": {
+      "material": "kelp",
+      "chance": 200,
+      "minDepth": 2,
+      "height": 0.8,
+      "clearance": 0.4
+    }
+  },
+  "placement": {
+    "tile": 102.4,
+    "rarity": 12,
+    "maxSlope": 128,
+    "minY": -1,
+    "maxY": -1
+  },
+  "preview": {
+    "margin": 1
+  }
+}

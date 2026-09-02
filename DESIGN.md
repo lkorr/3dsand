@@ -5688,6 +5688,123 @@ schedule and writes two frames — `screenshot_inventory.bmp` (gear) and
 at, so the harness that judges it produces a picture; it prints the image's
 pixel sum, because "wrote the file" is true of an all-black rectangle too.
 
+## 9d. Biomes and water-body presets — the Environment tab (added 2026-09-01)
+
+> **A biome SELECTS from component libraries and says how often and where.
+> Species and water presets are edited once, in their library; a biome edits
+> the row.** Plan and research: `docs/PLAN_biomes.md`.
+
+### The shape of the thing
+
+Three kinds of file, one owner per fact:
+
+| File | Owns | Edited in |
+|---|---|---|
+| `assets/trees/<species>.json` (+ `.svtree`) | what a tree LOOKS like; what ground it physically tolerates (altitude band, slope, shade) | Environment → Trees |
+| `assets/water/<preset>.json` | the SHAPE of a body of water: footprint, bathymetry curve, fill, berm, bed, shore + aquatic vegetation by depth; its default tile/rarity | Environment → Water bodies |
+| `assets/biomes/<biome>.json` | WHICH species and presets appear in the biome, at what weight / rarity, under what extra conditions; ground cover; cave bands; terrain overrides; climate coordinates | Environment → *biome* |
+
+Every feature row of every stack carries the same **placement chain**: a rarity
+(a weight for trees, 1-in-N tiles for water, 1-in-N columns for cover — one
+form authored, the others shown read-only beside it: percent, per hectare, per
+km²) and **conditions** (`minY`, `maxY`, `maxSlope` in Q8, `nearWaterMin/Max`
+in metres, `patchThreshold`). This is Minecraft's placed-feature modifier list,
+the one model modders already read (PLAN_biomes.md §2 has the survey).
+
+### What is live and what is scaffold — stated where the user can see it
+
+* **LIVE: tree species and weights.** The `.svtree` header bakes per-biome
+  weights in `treegen.js BIOME_ORDER` order. Those words are now DERIVED from
+  the biome files: the biome page's Save rewrites nothing in the species file
+  by itself, **Sync atlas** writes `placement.biomes` into every species file
+  and re-bakes the changed atlases (`node scripts/seed_environment.mjs --sync`
+  headlessly). The species file keeps the mirror because the bake reads one
+  file per species; the biome file is where it is EDITED. The `biomes` gate and
+  `check_invariants.py` (`biome order`) assert the mirror is current and that
+  worldgen's `B_*` ids, `treeatlas.h kBiomeCount`, `treegen.js BIOME_ORDER`,
+  `biomegen.js ENGINE_BIOMES` and `biomes.cpp kEngineBiomes` agree.
+* **LIVE: the biome band strip** on the climate section — the three worldgen
+  thresholds (`meadowThreshold` / `pineThreshold` / `desertThreshold`) as one
+  draggable bar writing `tuning.json`.
+* **AUTHORED, VALIDATED, PREVIEWED, NOT YET READ BY WORLDGEN:** cover plants,
+  water features, cave features, terrain overrides, tree-row conditions,
+  climate coordinates. The `biomes` gate (`src/sim/biomes.*`,
+  `selftest_biomes.cpp`) loads every file and refuses an unknown species,
+  preset or material, a biome `index` that is not worldgen's id for its name,
+  a stale species mirror, a preset whose berm exceeds its shore lift. The
+  swatch on the biome page composes all of it. The pages say "authored, not
+  yet read" in their section notes, on purpose.
+
+### The generators are the preview AND the future truth
+
+`assets/editor/watergen.js` and `biomegen.js` are pure modules (no DOM, hash
+RNG keyed on the column, Node-runnable) in the treegen.js mould. A water body
+is a superellipse footprint (`squareness` is the Lamé exponent) with an fBm
+domain warp, optional smooth-min'd lobes and subtracted islands; a **depth
+profile curve** over the normalised radius (monotone cubic through authored
+points — parabola, bathtub, littoral shelf, cone and flat are the presets);
+a fill material and level; the engine's structural berm; bed materials by
+depth; a shore band with distance-ordered plants; and emergent / floating /
+submerged bands by water depth. Band WIDTHS are consequences of the
+bathymetry, not knobs — a steep kettle gets a one-cell reed fringe, a marsh is
+all fringe — which is what limnology says and what keeps the parameter count
+sane. `columnAt()` is the one answer to "what is at (x, z) of this body"; the
+standalone preview and the biome swatch both call it.
+
+The engine's pond today is still `pondAt`'s parabolic disc, inside the
+CPU-mirrored `height` block. PLAN_biomes.md §5 orders the wiring seams by
+risk: cover blocks and `treeInfoAt` chances first (outside every mirror), then
+`biomeAt` reading a table, then pond geometry last (it needs a C++ twin of the
+table under the mirror's token compare).
+
+### The swatch is a scale ladder, composed off the main thread (2026-09-01)
+
+The biome page's swatch runs from 16 m to 128 m on a side. Up to 32 m it is
+1:1 with the engine (10 vpm). Past that it does NOT get a bigger grid: it
+bakes COARSER, at the finest INTEGER vpm that keeps the side inside
+`MAX_SWATCH` = 384 cells (`biomegen.swatchScale`: 8 vpm at 48 m, 6 at 64,
+4 at 96, 3 at 128), and the viewer draws the one region at `lod = 10 / vpm`
+so it lands in world metres. The reason is the dense volume: a swatch is one
+`nx*ny*nz` Uint16 array copied twice more on the way to the screen (the
+viewer's cells, the mesher's lent copy) and once into a 3D texture, and a
+96 m forest at 10 vpm would be 16x the 24 m swatch's 32 MB per copy — over
+2 GB in flight before the mesher ran. Integer vpm because treegen bakes at
+integer vpm only, so every species goes through the real generator at the
+ground's scale and the composition stays exact rather than resampled; the
+tree cache is keyed on vpm, so the first swatch at a new scale bakes every
+species it places (seconds), reported as progress, and later ones do not.
+
+Composition runs in `assets/editor/swatch_worker.js`, a module worker that
+owns the libraries and the tree cache and returns the cells as one
+transferred buffer already remapped to engine material ids
+(`biomegen.remapToMaterials`). One request in flight; a request made while
+one runs waits as the single queued one, so a slider drag costs at most one
+extra compose and the page never stops answering. If the worker cannot be
+built the page composes inline as it did before.
+
+The viewer side is `worldview.js`'s greedy mesher, rewritten the same day:
+occupancy through a 4096-entry LUT built once per palette, both draw layers
+in one sweep, each plane read from the volume once (the x and y sweeps are
+strided gathers), the merge bounded to the rows and columns that hold a
+face, quads into growable typed arrays. Byte-identical quads to the first
+mesher, with and without neighbour slabs, at 5–6x the speed (a 16M-cell
+swatch: 2.2–3.6 s → ~0.45 s). Vertex positions are Uint16 now; the first
+mesher packed them as bytes, which folded every region past 255 cells on a
+side back over itself — the 320-cell 32 m swatch and any water body wider
+than 25 m drew wrong, with no error anywhere.
+
+### Verify
+
+`node scripts/test_environment.mjs` (data: determinism of both generators,
+preset sanity, biome validity, the species mirror, the swatch, the scale
+ladder and the in-place remap),
+`bash scripts/check_environment.sh` (the tab in real Chrome: mount, sidebar,
+three pages, WebGL meshing, framebuffer, plan/profile canvases, undo, deep
+links, save routes), `--selftest --gate biomes` (the engine's side),
+`python scripts/check_invariants.py` (biome order). `check_tabs.sh` and
+`check_trees.sh` still pass: the tree editor mounts into a `div#view-trees`
+inside the Environment section, without class `view`.
+
 ## 10. Networking (design now, build later)
 
 With the determinism discipline of §2/§4, **both** classic models are viable, and
@@ -5827,6 +5944,48 @@ session and a recorded run with the same code. GPU pass times come back through
 arrive two or three frames late **tagged with the frame that produced them**;
 the frame path never waits on a timestamp, and a frame whose queries have not
 landed is marked rather than drawn as a GPU that cost nothing.
+
+**The render pass is seven spans, and the raymarch has an inside (2026-09-01).**
+The whole render pass used to be ONE timestamp pair billed to `raymarch`, which
+on the idle scenario is the entire GPU frame — a bare count. The frame loop now
+writes a pair around each draw inside the dynamic-rendering scope (legal; only
+the query reset and resolve must stay outside) and bills them through
+`kPerfRenderSpans` in `perfnodes.h` to the boxes that issue them: `raymarch`
+(the fullscreen shader alone), `drawParticles`, `drawBodies`, `drawMicro`,
+`drawSprites`, `drawDebug`, `uiOverlay`. Both ends of a span are ALL_COMMANDS
+stamps, because draws overlap in the pipeline and a top-of-pipe start can land
+before the previous draw's fragments retire. The shadow-cache resolve runs before
+the pass and is timed by its own table rows, so it is no longer counted twice.
+
+Inside the world draw nothing can be timestamped — it is one fragment shader — so
+`raymarch.wgsl` counts instead. Under the `RENDER_STATS` prelude const
+(`gpu/resources.h`, on only for `--telemetry`) every trace call site adds its DDA
+steps and every shading path its pixels into `World::renderStats`, a 4 KiB
+striped `atomic<u32>` buffer (`world.h kRenderStat*`), on a 1-in-16 pixel
+sample; the shipping shader compiles all of it out, because `trace()` is
+register-footprint bound and a live flag would keep the accumulators resident.
+The counters are MONOTONIC and differenced on the CPU (`measure/renderstats.h`),
+which keeps a clear and its barrier out of the frame. They reach the page as the
+`rm*` counters and the tab draws them as an ESTIMATED millisecond split of the
+raymarch span (step share x span) with the estimate labelled as one; the exact
+per-feature answer stays `--render-budget`. The copy-out goes through
+`rhi::CommandEncoder::CopyRenderWritten`, the one place a render-domain write is
+declared to the barrier tracker (`barrier_graph` §2.6 otherwise assumes draws are
+read-only): it sets the buffer's last writer to the fragment stage and derives
+the fragment->transfer barrier from that, exactly as `CopyTracked` derives its
+own.
+
+**`readback` and `readbackStall` are two rows (2026-09-01).** The async readback
+row used to hold both the non-blocking map pump and the paged mirror's staleness
+fallback in `SubmitTick` — a fence wait on the oldest in-flight readback when the
+newest snapshot is more than `kPagedSnapshotMaxGap` ticks old. After a lake was
+disturbed the row read as "async readback spiking for a long time"; the pump
+never blocks, and what spiked was the fallback, firing every tick while the GPU
+was more than a frame behind and the loop was catching up at 4 ticks/frame. That
+is a relabelled GPU wait — the CPU would have spent the same time in `present` —
+so it now has its own row and its own two counters: `snapshotStalls` (the waits)
+and `readbackDeclined` (readback requests the 3-slot ring refused). Declines
+without stalls mean the ring is the limit; stalls with declines mean the GPU is.
 
 **Verify the page, not just the numbers.** `scripts/check_perfview.sh` drives the
 real tab in real headless Chrome and asserts both content (charts built from the

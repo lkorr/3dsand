@@ -315,7 +315,9 @@ void Telemetry::BroadcastSample(const sandvox::PerfSample& s) {
   // counters, each about 24 bytes of key and number, is under 1.3 KiB even with
   // nothing dropped. The snprintf bound is still checked at every append —
   // a truncated JSON object is a page that stops updating with no error.
-  char j[4096];
+  // 8 KiB: the RENDER_STATS counters added fifteen keys. Still checked at
+  // every append (below).
+  char j[8192];
   int p = std::snprintf(j, sizeof j,
                         "{\"v\":2,\"tick\":%u,\"frame\":%u,\"wallMs\":%.3f,"
                         "\"gpuValid\":%s",
@@ -359,7 +361,10 @@ void Telemetry::BroadcastSample(const sandvox::PerfSample& s) {
                      s.cpuMs[(int)PerfScope::Physics],
                      s.cpuMs[(int)PerfScope::PostStep],
                      s.cpuMs[(int)PerfScope::RenderCpu],
-                     s.cpuMs[(int)PerfScope::Readback]);
+                     // The v1 chip means "readback, all of it"; it keeps that
+                     // meaning across the pump/stall split.
+                     s.cpuMs[(int)PerfScope::Readback] +
+                         s.cpuMs[(int)PerfScope::ReadbackStall]);
   if (p >= (int)sizeof(j)) return;   // truncated: send nothing rather than junk
   SendAll(j, p);
 }

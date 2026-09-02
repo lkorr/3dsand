@@ -88,6 +88,10 @@ void SetFragmentStoresAvailable(bool available) {
 }
 bool FragmentStoresAvailable() { return g_fragmentStoresAvailable; }
 
+static bool g_renderStatsEnabled = false;
+void SetRenderStatsEnabled(bool on) { g_renderStatsEnabled = on; }
+bool RenderStatsEnabled() { return g_renderStatsEnabled; }
+
 std::string ShaderConstantPrelude() {
   std::ostringstream o;
   o << "// GENERATED from src/sim/world.h by ShaderConstantPrelude() — do not\n"
@@ -135,6 +139,14 @@ std::string ShaderConstantPrelude() {
   o << "const SHADOW_REQ_WORDS : u32 = " << kShadowReqWords << "u;\n";
   o << "const SHADOW_REQ_CAP : u32 = " << kShadowReqCap << "u;\n";
   o << "const SHADOW_SUBDIV_MAX : u32 = " << kShadowSubdivMax << "u;\n";
+  // The raymarch's step counters (world.h kRenderStat* block). ANDed with the
+  // fragment-stores cap in the shader, like the shadow cache: the counters are
+  // atomics from a fragment shader and need the same device feature.
+  o << "const RENDER_STATS : bool = "
+    << ((g_renderStatsEnabled && g_fragmentStoresAvailable) ? "true" : "false")
+    << ";\n";
+  o << "const RENDER_STATS_SLOTS : u32 = " << kRenderStatSlots << "u;\n";
+  o << "const RENDER_STATS_STRIPES : u32 = " << kRenderStatStripes << "u;\n";
   // Software page table (docs/PLAN_page_table.md §2.2). One u32 per chunk SLOT:
   // bit 31 clear = a page index into the physical pool, bit 31 set = a sentinel
   // carrying a material id in bits 0..11. EMPTY is UNIFORM(air), so there is

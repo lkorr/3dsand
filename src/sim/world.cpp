@@ -98,6 +98,11 @@ void World::Init(const rhi::Device& device) {
   // count and the overflow after a frame. Diagnostics, never the frame path.
   shadowReq = CreateBuffer(device, kShadowReqBytes,
                            U::Storage | U::CopySrc | U::CopyDst, "shadowReq");
+  // RENDER_STATS counters (world.h kRenderStat*). CopySrc for the telemetry
+  // readback; CopyDst so a reset path can zero it, though nothing needs to —
+  // the CPU differences consecutive reads.
+  renderStats = CreateBuffer(device, kRenderStatBytes,
+                             U::Storage | U::CopySrc | U::CopyDst, "renderStats");
   shadowArgsStage = CreateBuffer(device, 16, U::Storage | U::CopySrc | U::CopyDst,
                                  "shadowArgsStage");
   // Indirect ONLY, and out of every bind group — same rule as dispatchArgs.

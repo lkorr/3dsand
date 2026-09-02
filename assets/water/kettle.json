@@ -1,0 +1,130 @@
+{
+  "name": "kettle",
+  "displayName": "Kettle pond",
+  "kind": "pond",
+  "footprint": {
+    "radius": 4,
+    "radiusV": 1.5,
+    "aspect": 1,
+    "squareness": 2.4,
+    "rotation": 0,
+    "rotationRandom": true,
+    "warpAmp": 0.08,
+    "warpFreq": 1.6,
+    "warpOctaves": 3,
+    "lobes": 0,
+    "lobeRadius": 0.55,
+    "lobeSpread": 0.75,
+    "lobeWeld": 0.35,
+    "islands": 0,
+    "islandRadius": 0.22,
+    "islandHeight": 0.6
+  },
+  "bathymetry": {
+    "depth": 3.2,
+    "rimDepth": 0.6,
+    "profile": [
+      [
+        0,
+        1
+      ],
+      [
+        0.55,
+        0.97
+      ],
+      [
+        0.8,
+        0.7
+      ],
+      [
+        1,
+        0
+      ]
+    ],
+    "floorNoise": 0.08,
+    "floorNoiseFreq": 3
+  },
+  "fill": {
+    "material": "water",
+    "level": 0,
+    "surfaceMaterial": ""
+  },
+  "berm": {
+    "height": 0.5,
+    "width": 1.4,
+    "coreFrac": 0.25
+  },
+  "bed": {
+    "shallow": "gravel",
+    "deep": "shore_mud",
+    "shallowDepth": 0.6,
+    "thickness": 0.3,
+    "substrate": "stone"
+  },
+  "ground": {
+    "skin": "grass",
+    "soil": "dirt",
+    "soilDepth": 1.2,
+    "rock": "stone",
+    "relief": 0.25,
+    "reliefFreq": 1.2
+  },
+  "shore": {
+    "band": 1.4,
+    "lift": 1.2,
+    "mudWidth": 0.5,
+    "mudMaterial": "shore_mud",
+    "mossChance": 3,
+    "mossMaterial": "wet_moss",
+    "plants": [
+      {
+        "material": "horsetail",
+        "head": "",
+        "chance": 8,
+        "reach": 1,
+        "height": 0.9
+      },
+      {
+        "material": "marsh_grass",
+        "head": "",
+        "chance": 5,
+        "reach": 1.4,
+        "height": 0.3
+      }
+    ]
+  },
+  "aquatic": {
+    "emergent": {
+      "material": "reed",
+      "chance": 0,
+      "minDepth": 0.4,
+      "maxDepth": 1.4,
+      "height": 1.6
+    },
+    "floating": {
+      "material": "lilypad",
+      "flower": "lily_flower",
+      "chance": 40,
+      "flowerChance": 5,
+      "minDepth": 1.2,
+      "maxDepth": 2.6
+    },
+    "submerged": {
+      "material": "kelp",
+      "chance": 60,
+      "minDepth": 1.4,
+      "height": 1.2,
+      "clearance": 0.4
+    }
+  },
+  "placement": {
+    "tile": 38.4,
+    "rarity": 6,
+    "maxSlope": 64,
+    "minY": -1,
+    "maxY": -1
+  },
+  "preview": {
+    "margin": 1
+  }
+}

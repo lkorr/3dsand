@@ -89,6 +89,9 @@ struct CommandEncoderImpl {
                                   uint64_t dstOffset, uint64_t size) = 0;
   virtual void CopyTracked(pass::Buf srcId, const Buffer& src, uint64_t srcOffset,
                            const Buffer& dst, uint64_t dstOffset, uint64_t size) = 0;
+  virtual void CopyRenderWritten(const Buffer& src, uint64_t srcOffset,
+                                 const Buffer& dst, uint64_t dstOffset,
+                                 uint64_t size) = 0;
   virtual void FillTracked(pass::Buf id, const Buffer& b) = 0;
   virtual void FillTrackedRange(pass::Buf id, const Buffer& b, uint64_t offset,
                                 uint64_t size, uint32_t pattern) = 0;

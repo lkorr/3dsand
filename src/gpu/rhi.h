@@ -373,6 +373,20 @@ class CommandEncoder {
   // between them is visible at the call site.
   void CopyTracked(pass::Buf srcId, const Buffer& src, uint64_t srcOffset,
                    const Buffer& dst, uint64_t dstOffset, uint64_t size) const;
+  // THE ONE RENDER-DOMAIN WRITE THE TRACKER IS TOLD ABOUT. barrier_graph §2.6
+  // assumes draws are read-only over every buffer, and the recorder's
+  // BeginRendering flush is built on it. RENDER_STATS' counters
+  // (raymarch.wgsl, World::renderStats) are the exception: a fragment shader
+  // atomically adds into a buffer no pass-table row names, and the frame loop
+  // wants it copied out in the SAME command buffer. This declares `src` as
+  // written by the fragment stage of the render pass just recorded, derives
+  // the fragment->transfer barrier from that state exactly as CopyTracked
+  // derives its own, and copies. Record it AFTER RenderPass::End(). A buffer
+  // that IS a pass-table row must not come through here — its state lives in
+  // the table slot, not the extras list, and a second copy of it would be the
+  // drift the tracker exists to prevent.
+  void CopyRenderWritten(const Buffer& src, uint64_t srcOffset, const Buffer& dst,
+                         uint64_t dstOffset, uint64_t size) const;
   // vkCmdFillBuffer(0) / ClearBuffer over a tracked table buffer (whole buffer).
   void FillTracked(pass::Buf id, const Buffer& b) const;
   // Ranged variant with a 32-bit pattern, for page-table materialization

@@ -1,0 +1,285 @@
+{
+  "name": "forest",
+  "displayName": "Forest",
+  "index": 0,
+  "climate": {
+    "temperature": 0.55,
+    "moisture": 0.65,
+    "notes": "The default band of the biome noise: between meadowThreshold and pineThreshold."
+  },
+  "terrain": {
+    "overrides": {}
+  },
+  "cover": {
+    "skin": "grass",
+    "skinDepth": 1,
+    "subsoil": "dirt",
+    "patch": {
+      "threshold": 0,
+      "cellLog2": 5
+    },
+    "plants": [
+      {
+        "material": "fern",
+        "head": "",
+        "chance": 16,
+        "height": 0.4,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0
+        }
+      },
+      {
+        "material": "flower_bluebell",
+        "head": "",
+        "chance": 40,
+        "height": 0.2,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0
+        }
+      },
+      {
+        "material": "mushroom_cluster",
+        "head": "",
+        "chance": 90,
+        "height": 0.2,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0
+        }
+      },
+      {
+        "material": "bramble",
+        "head": "",
+        "chance": 60,
+        "height": 0.4,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0
+        }
+      },
+      {
+        "material": "grass_tuft",
+        "head": "",
+        "chance": 9,
+        "height": 0.2,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0
+        }
+      }
+    ]
+  },
+  "trees": {
+    "tile": 14.4,
+    "density": 78,
+    "species": [
+      {
+        "species": "oak",
+        "weight": 42,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0
+        }
+      },
+      {
+        "species": "great_oak",
+        "weight": 12,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0
+        }
+      },
+      {
+        "species": "birch",
+        "weight": 18,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0
+        }
+      },
+      {
+        "species": "pine",
+        "weight": 14,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0
+        }
+      },
+      {
+        "species": "spruce",
+        "weight": 4,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0
+        }
+      },
+      {
+        "species": "redwood",
+        "weight": 3,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0
+        }
+      },
+      {
+        "species": "willow",
+        "weight": 6,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "maxSlope": 1024,
+          "nearWaterMax": 6,
+          "nearWaterMin": 0,
+          "patchThreshold": 0
+        }
+      },
+      {
+        "species": "eucalyptus",
+        "weight": 5,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0
+        }
+      },
+      {
+        "species": "bush",
+        "weight": 16,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0
+        }
+      },
+      {
+        "species": "dead",
+        "weight": 4,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0
+        }
+      }
+    ]
+  },
+  "water": {
+    "features": [
+      {
+        "preset": "tarn",
+        "tile": 44.8,
+        "rarity": 4,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "maxSlope": 96,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0
+        }
+      },
+      {
+        "preset": "spring_pool",
+        "tile": 25.6,
+        "rarity": 12,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "maxSlope": 160,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0
+        }
+      }
+    ]
+  },
+  "caves": {
+    "features": [
+      {
+        "preset": "near_surface",
+        "threshold": 150,
+        "rarity": 1,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0
+        }
+      },
+      {
+        "preset": "deep",
+        "threshold": 140,
+        "rarity": 1,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0
+        }
+      }
+    ]
+  },
+  "swatch": {
+    "sizeM": 24,
+    "reliefM": 1.6,
+    "reliefFreq": 1
+  }
+}

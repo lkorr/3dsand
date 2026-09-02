@@ -3403,6 +3403,7 @@ struct OpaqueHit {
   axis : i32,          // axis of the face the ray entered it through
   sgn  : f32,          // ray direction sign on that axis
   word : u32,          // that cell's voxel word (material, state, stain)
+  steps : u32,         // DDA iterations spent (RENDER_STATS attribution only)
 }
 
 fn traceOpaque(ro : vec3f, rdIn : vec3f, maxSteps : i32, coarseFromT : f32,
@@ -3482,7 +3483,9 @@ fn traceOpaque(ro : vec3f, rdIn : vec3f, maxSteps : i32, coarseFromT : f32,
   var cchIdx = 0u;   // the SLOT index, which is what subOccIndex keys on
   var cchC = vec3<i32>(0x7FFFFFFF);
 
+  var steps = 0u;
   for (var i = 0; i < 4096; i++) {
+    steps += 1u;
     if (i >= maxSteps) { break; }
     if (any(cell < wloI) || any(cell >= wloHi)) { break; }
 
@@ -3516,6 +3519,7 @@ fn traceOpaque(ro : vec3f, rdIn : vec3f, maxSteps : i32, coarseFromT : f32,
         out.axis = axis;
         out.sgn = select(select(sgn3.x, sgn3.y, axis == 1), sgn3.z, axis == 2);
         out.word = synthWordAt(cchPt, cell, ptSeed());
+        out.steps = steps;
         return out;
       } else if (((*mats)[sMat].flags & MATF_MICRO) != 0u) {
         chunkSkip = true;   // a whole chunk of grass casts no shadow
@@ -3551,6 +3555,7 @@ fn traceOpaque(ro : vec3f, rdIn : vec3f, maxSteps : i32, coarseFromT : f32,
         out.axis = axis;
         out.sgn = select(select(sgn3.x, sgn3.y, axis == 1), sgn3.z, axis == 2);
         out.word = 0u;   // UNDEFINED for a coarse hit — see the header
+        out.steps = steps;
         return out;
       }
       skipEdge = i32(SUBOCC_BLOCK);
@@ -3605,6 +3610,7 @@ fn traceOpaque(ro : vec3f, rdIn : vec3f, maxSteps : i32, coarseFromT : f32,
       out.axis = axis;
       out.sgn = select(select(sgn3.x, sgn3.y, axis == 1), sgn3.z, axis == 2);
       out.word = w;
+      out.steps = steps;
       return out;
     }
 
@@ -3616,6 +3622,7 @@ fn traceOpaque(ro : vec3f, rdIn : vec3f, maxSteps : i32, coarseFromT : f32,
       cell.z += stepv.z; tCur = tMax.z; tMax.z += tDelta.z; axis = 2;
     }
   }
+  out.steps = steps;
   return out;
 }
 

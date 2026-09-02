@@ -268,15 +268,12 @@ const FOLIAGE_ROWS = [
    d: 'How much deep-inside-a-clump goes to the dark tier of the leaf ramp.'}
 ];
 
+// The per-biome WEIGHTS are not here any more. They are owned by the biome
+// files (assets/biomes/<biome>.json, the Environment tab's Biome page) and
+// mirrored into `placement.biomes` on save + "Sync atlas", because "which
+// trees grow in the forest" is a property of the forest, not of the oak. The
+// Placement section below shows the mirrored values read-only with a link.
 const PLACEMENT_ROWS = [
-  {k: 'biomes.forest', n: 'weight: forest', min: 0, max: 100, step: 1, int: true,
-   d: 'Relative weight against every other species in this biome. Zero means ' +
-      '"never here". The engine normalises across whatever is loaded, so ' +
-      'adding a species dilutes the others rather than needing every table ' +
-      'rewritten.'},
-  {k: 'biomes.meadow', n: 'weight: meadow', min: 0, max: 100, step: 1, int: true, d: ''},
-  {k: 'biomes.pine', n: 'weight: pine', min: 0, max: 100, step: 1, int: true, d: ''},
-  {k: 'biomes.desert', n: 'weight: desert', min: 0, max: 100, step: 1, int: true, d: ''},
   {k: 'sparsity', n: 'rarity divisor', min: 1, max: 12, step: 1, int: true,
    d: 'Divides the weights above. 4 makes this species a quarter as common ' +
       'everywhere without retyping four numbers.'},
@@ -601,9 +598,30 @@ function buildPanel() {
   });
   col.append(s.wrap);
 
-  s = section('Placement', 'Where this species grows. Read by the ENGINE, not ' +
-              'by the voxelizer — it rides along in the baked .svtree so ' +
-              'that adding a tree touches one file.');
+  s = section('Placement', 'What ground this species tolerates. Read by the ' +
+              'ENGINE, not by the voxelizer — it rides along in the baked ' +
+              '.svtree so that adding a tree touches one file. WHICH biomes ' +
+              'it grows in, and how much, is the biome\'s decision: see below.');
+  {
+    // The mirrored per-biome weights, read-only, with the way to the owner.
+    const b = (params.placement && params.placement.biomes) || {};
+    const keys = TG.BIOME_ORDER;
+    const line = el('div', {class: 'tgrow', title: 'Mirrored from assets/biomes/*.json by the biome page\'s Save + Sync atlas. Not editable here.'},
+                    el('label', {}, 'biome weights'),
+                    el('span', {class: 'tghint', style: 'margin:0'},
+                       keys.map(k => k + ' ' + (b[k] | 0)).join(' · ')));
+    s.body.append(line);
+    widgets.push(() => {
+      const bb = (params.placement && params.placement.biomes) || {};
+      line.lastChild.textContent = keys.map(k => k + ' ' + (bb[k] | 0)).join(' · ');
+    });
+    if (H.openPage) {
+      const a = el('a', {href: '#', class: 'tghint', style: 'display:block;margin:0 0 6px;color:#5aa9e6'},
+                   'edit in the biome pages →');
+      a.addEventListener('click', (e) => { e.preventDefault(); H.openPage('biome'); });
+      s.body.append(a);
+    }
+  }
   PLACEMENT_ROWS.forEach(r => row(s.body, r, r.root ? '' : 'placement'));
   col.append(s.wrap);
 }
@@ -927,6 +945,15 @@ export function activate() {
 
 /** Ctrl+S on this tab saves the species file, not the JSON trio. */
 export function saveFromHost() { if (speciesName) saveSpecies(); }
+
+/** Open a named species (the biome page's "edit species →" link). Refuses,
+ *  like the dropdown does, while there are unsaved edits. */
+export async function open(name) {
+  if (dirty && !confirm('Discard unsaved changes to ' + speciesName + '?')) return;
+  await loadSpecies(name);
+  await refreshList(name);
+}
+export function currentName() { return speciesName; }
 export function isDirty() { return dirty; }
 
 /** The WorldView instance, for assets/trees_test.html.
