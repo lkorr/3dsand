@@ -2209,12 +2209,16 @@ Status GatePageRoundtrip(Ctx& c, std::string& detail) {
       }
   }
 
-  // Standalone (--gate) the world is the untouched identity map: every pool
-  // page is claimed by ResetIdentity and the free list is EMPTY, so the paint
-  // below would hit §3.8's fatal-exhaustion abort before testing anything.
-  // In-suite the previous gates have long since generated and demoted, so
-  // this never fires there.
-  if (paged && pt.PagesInUse() == pt.PoolPages()) {
+  // Standalone (--gate) the world is the untouched identity map: every CHUNK
+  // SLOT holds a real page (ResetIdentity claims kNumChunks of them) and there
+  // is no sentinel anywhere, so the sky walk below finds no EMPTY chunk. This
+  // used to compare against PoolPages(), which was kNumChunks until
+  // 2026-08-30; the pool is kNumChunks + kPageRetireCeiling since, so the
+  // test never fired and the gate failed standalone with "no EMPTY chunk in
+  // the column" — the identity map, not a page-pool problem. In-suite the
+  // previous gates have long since generated and demoted, so this never
+  // fires there.
+  if (paged && pt.PagesInUse() >= kNumChunks) {
     SubmitWorldgen(ctx, world, sim, kDefaultSeed);
     ctx.WaitIdle();
   }

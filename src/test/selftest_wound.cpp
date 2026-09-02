@@ -48,6 +48,8 @@
 #include <cmath>
 #include <cstdio>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "game/item.h"
@@ -1191,6 +1193,223 @@ Status GateCorpseIntact(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---- corpse-bleed ----------------------------------------------------------
+//
+// The owner's second look at the anatomy (2026-09-02), as claims:
+//   A. a wound is SEEN. The soak lands on exposed voxels at a higher rate
+//      than on buried ones, and never on a material that is not tissue
+//      (bone stays bone in the hole: MobDef::tissue).
+//   B. a decapitation takes the head off as its OWN body (no joint left), and
+//      both pieces, the head and the torso's neck stump, carry an open wound.
+//   C. those wounds pay out from where each piece is (blood attributed to the
+//      nearer of the two wounds), and then close: a corpse does not pump.
+//   D. a cut on the corpse afterwards opens a wound again.
+// CPU only: no tick is submitted. The debris system's own PreTick drains the
+// wounds, exactly as main.cpp calls it.
+Status GateCorpseBleed(Ctx& c, std::string& detail) {
+  MobSystem& mobs = c.mobs;
+  IdCounterScope idScope(mobs);
+  PrepareWorld(c);
+  const Target t = ChooseTarget(mobs, FixtureSite(c.world, 440));
+  if (!t.valid()) {
+    detail = "no loaded mob def has a severable non-vital limb that bleeds";
+    return Status::Fail;
+  }
+  const MobDef& def = mobs.Defs()[t.defIndex];
+  int head = -1, neck = -1;
+  for (size_t li = 0; li < def.limbs.size(); li++)
+    if (def.limbs[li].vital && def.limbs[li].severable &&
+        (int)li != def.rootLimb) {
+      head = (int)li;
+      break;
+    }
+  if (head >= 0)
+    for (size_t li = 0; li < def.limbs.size(); li++)
+      if (def.limbs[li].name == def.limbs[head].parent) neck = (int)li;
+  if (head < 0 || neck < 0) {
+    detail = Format("%s has no vital severable limb with a parent",
+                    t.defName.c_str());
+    return Status::Skip;
+  }
+  IVec3 pchunk{};
+  const uint64_t id = SpawnTarget(c, t, 440, pchunk);
+  if (!id) {
+    detail = "spawn refused";
+    return Status::Fail;
+  }
+  const uint32_t bleedMat = def.bleedMat, woundMat = def.woundMat;
+
+  // ---- A. the soak is on what is exposed, and never on bone ---------------
+  const std::vector<PrefabVoxel> L0 = mobs.LimbLattice(id, t.limb);
+  const LimbAxis ax = MeasureLimb(mobs, id, t.limb);
+  std::vector<ParticleSpawn> spawns;
+  const bool hit = CutOnce(mobs, c.world, id, t.limb, ax, ax.reach * 0.5f,
+                           0.5f, 1.0f, 0xC0B5u, spawns);
+  spawns.clear();
+  const std::vector<PrefabVoxel> L1 = mobs.LimbLattice(id, t.limb);
+  auto keyOf = [](int x, int y, int z) {
+    return ((uint64_t)(uint16_t)x << 32) | ((uint64_t)(uint16_t)y << 16) |
+           (uint64_t)(uint16_t)z;
+  };
+  std::unordered_map<uint64_t, uint16_t> was;
+  was.reserve(L0.size() * 2);
+  for (const PrefabVoxel& v : L0) was[keyOf(v.x, v.y, v.z)] = v.material & 0xFFFu;
+  std::unordered_set<uint64_t> occ;
+  occ.reserve(L1.size() * 2);
+  for (const PrefabVoxel& v : L1) occ.insert(keyOf(v.x, v.y, v.z));
+  auto exposed = [&](const PrefabVoxel& v) {
+    return !occ.count(keyOf(v.x - 1, v.y, v.z)) || !occ.count(keyOf(v.x + 1, v.y, v.z)) ||
+           !occ.count(keyOf(v.x, v.y - 1, v.z)) || !occ.count(keyOf(v.x, v.y + 1, v.z)) ||
+           !occ.count(keyOf(v.x, v.y, v.z - 1)) || !occ.count(keyOf(v.x, v.y, v.z + 1));
+  };
+  uint32_t nExposed = 0, nBuried = 0, stainedExposed = 0, stainedBuried = 0,
+           nonTissueStained = 0;
+  for (const PrefabVoxel& v : L1) {
+    const bool ex = exposed(v);
+    (ex ? nExposed : nBuried)++;
+    if ((v.material & 0xFFFu) != (woundMat & 0xFFFu)) continue;
+    const auto it = was.find(keyOf(v.x, v.y, v.z));
+    if (it == was.end() || it->second == (woundMat & 0xFFFu)) continue;
+    const uint16_t m0 = it->second;
+    if (!def.tissue.empty() && (m0 >= def.tissue.size() || !def.tissue[m0]))
+      nonTissueStained++;
+    (ex ? stainedExposed : stainedBuried)++;
+  }
+  const double rateExposed = nExposed ? (double)stainedExposed / nExposed : 0.0;
+  const double rateBuried = nBuried ? (double)stainedBuried / nBuried : 0.0;
+  const bool soakOk = hit && stainedExposed > 0 && rateExposed > rateBuried &&
+                      nonTissueStained == 0 && mobs.IsAlive(id);
+  RecordObserved("corpseBleedSoakExposedRate", rateExposed);
+  RecordObserved("corpseBleedSoakBuriedRate", rateBuried);
+
+  // ---- B. decapitation: the head is its own body, both pieces wounded -----
+  const uint64_t headBody = mobs.LimbBody(id, head);
+  uint64_t neckBody = mobs.LimbBody(id, neck);  // re-read after the melt
+  mobs.Sever(id, head);
+  const bool died = !mobs.IsAlive(id);
+  const std::string cause = mobs.DeathCause(id);
+  auto indexOf = [&](uint64_t h) -> int {
+    for (uint32_t i = 0; i < c.debris.BodyCount(); i++)
+      if (c.debris.BodyHandle(i) == h) return (int)i;
+    return -1;
+  };
+  const int hi0 = indexOf(headBody), ni0 = indexOf(neckBody);
+  const bool headOff = hi0 >= 0 && c.phys.JointCount(headBody) == 0;
+  const bool bothWounded = hi0 >= 0 && ni0 >= 0 &&
+                           c.debris.BodyWoundOpen((uint32_t)hi0) &&
+                           c.debris.BodyWoundOpen((uint32_t)ni0);
+  const float headBudget0 = hi0 >= 0 ? c.debris.BodyWoundBudget((uint32_t)hi0) : 0.0f;
+  const float neckBudget0 = ni0 >= 0 ? c.debris.BodyWoundBudget((uint32_t)ni0) : 0.0f;
+  const uint32_t wounded0 = c.debris.WoundedBodyCount();
+
+  // ---- C. each piece bleeds from where it is, then the wounds close -------
+  uint32_t tick = 61000;
+  double bloodHead = 0.0, bloodNeck = 0.0;
+  int closedTick = -1, closedAgainTick = -1;
+  bool melted = false, reopened = false, cutSkipped = false;
+  // WHERE THE BODIES WENT, so a wound that "closed" early names its cause: a
+  // body that left is not a wound that paid out.
+  int neckGoneTick = -1, headGoneTick = -1;
+  Vec3 neckLast{}, neckFirst{};
+  float neckBudgetAtGone = -1.0f;
+  const int window = 700;
+  for (int i = 0; i < window; i++) {
+    std::vector<BrushOp> ops;
+    std::vector<ParticleSpawn> sp;
+    std::vector<CellOp> cellOps;
+    mobs.PreTick(tick + 1, c.world, ops, cellOps, sp);  // sweeps the husk
+    const size_t fromMobs = sp.size();
+    const int hi = indexOf(headBody), ni = indexOf(neckBody);
+    const Vec3 hw = hi >= 0 ? c.debris.BodyWoundWorld((uint32_t)hi) : Vec3{};
+    const Vec3 nw = ni >= 0 ? c.debris.BodyWoundWorld((uint32_t)ni) : Vec3{};
+    if (ni >= 0) {
+      neckLast = c.debris.BodyPosition((uint32_t)ni);
+      if (i == 0) neckFirst = neckLast;
+      neckBudgetAtGone = c.debris.BodyWoundBudget((uint32_t)ni);
+    } else if (neckGoneTick < 0) {
+      neckGoneTick = i;
+    }
+    if (hi < 0 && headGoneTick < 0) headGoneTick = i;
+    c.debris.QueueSupportEvents(c.world.Snap());
+    c.debris.PreTick(tick + 1, c.world, cellOps, sp);
+    for (size_t k = fromMobs; k < sp.size(); k++) {
+      const ParticleSpawn& p = sp[k];
+      if ((p.payload & 0xFFFu) != (bleedMat & 0xFFFu)) continue;
+      const Vec3 at{(float)p.px / 256.0f, (float)p.py / 256.0f,
+                    (float)p.pz / 256.0f};
+      const float dh = hi >= 0 ? (at - hw).len() : 1e9f;
+      const float dn = ni >= 0 ? (at - nw).len() : 1e9f;
+      if (dh < dn) bloodHead += 1.0; else bloodNeck += 1.0;
+    }
+    // A REAL TICK, because the corpse needs ground: debris terrain meshes are
+    // built from the chunk cache the tick's readback fills (ManageTerrain
+    // requests a fetch and waits), and without one the whole ragdoll fell
+    // 225 voxels out of the window at t+66 with 24 voxels of budget unspent.
+    ++tick;
+    SubmitTick(c.ctx, c.world, c.sim, tick, kDefaultSeed, ops, {}, cellOps,
+               false, pchunk, true, true, sp);
+    c.ctx.WaitIdle();
+    c.ctx.ProcessEvents();
+    c.phys.Step(kTickDt);
+    c.debris.PostStep();
+    mobs.PostStep();
+    if (closedTick < 0 && c.debris.WoundedBodyCount() == 0) {
+      closedTick = i;
+      // ---- D. a cut on the corpse opens a wound again ----------------------
+      // The moment every wound has paid out (a settled body has folded into
+      // the grid and cannot be cut), at the neck's own wound point (a point
+      // ON the body), the sword's kerf. MeltBodyAt rebuilds the collider,
+      // which replaces the handle; the INDEX survives unless the body was
+      // destroyed, so the wound is read back by index.
+      const int ni1 = indexOf(neckBody);
+      if (ni1 < 0) {
+        cutSkipped = true;
+      } else {
+        const Vec3 at = c.debris.BodyWoundWorld((uint32_t)ni1);
+        melted = c.debris.MeltBodyAt(neckBody, at, 1.5f, c.world, spawns);
+        spawns.clear();
+        reopened = melted && c.debris.BodyWoundOpen((uint32_t)ni1) &&
+                   c.debris.BodyWoundBudget((uint32_t)ni1) > 0.0f;
+        neckBody = c.debris.BodyHandle((uint32_t)ni1);  // the rebuild replaced it
+      }
+    } else if (closedTick >= 0 && closedAgainTick < 0 &&
+               c.debris.WoundedBodyCount() == 0) {
+      closedAgainTick = i;
+    }
+  }
+  const bool drained = bloodHead > 0.0 && bloodNeck > 0.0;
+  const bool closes = closedTick >= 0;
+  RecordObserved("corpseBleedHeadSpawns", bloodHead);
+  RecordObserved("corpseBleedNeckSpawns", bloodNeck);
+
+  const bool ok = soakOk && died && headOff && bothWounded && drained &&
+                  closes && (cutSkipped || (reopened && closedAgainTick >= 0));
+  const uint32_t bodiesAtEnd = c.debris.BodyCount();
+  mobs.Reset();
+  c.debris.Reset();
+  // Real blood went into the world at absolute coordinates: leave the world
+  // as this gate found it, the same restore wound-bleed and mob-burn do.
+  SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+  c.ctx.WaitIdle();
+  detail = Format(
+      "%s: soak on %s: %u exposed (rate %.3f) vs %u buried (rate %.3f), %u "
+      "non-tissue stained; died of '%s', head off=%d, head wound=%d (%.0f vox) "
+      "neck wound=%d (%.0f vox), %u wounded bodies; over %d ticks the head "
+      "shed %.0f blood spawns and the neck %.0f, wounds closed at t+%d; corpse "
+      "cut %s, closed again at t+%d; neck body gone at t+%d (budget %.0f left, "
+      "moved %.1f vox, last y %.1f), head body gone at t+%d, %u bodies at end",
+      t.defName.c_str(), t.limbName.c_str(), stainedExposed, rateExposed,
+      stainedBuried, rateBuried, nonTissueStained, cause.c_str(),
+      headOff ? 1 : 0, hi0 >= 0 ? 1 : 0,
+      headBudget0, ni0 >= 0 ? 1 : 0, neckBudget0, wounded0, window, bloodHead,
+      bloodNeck, closedTick,
+      cutSkipped ? "skipped (the torso had settled into the grid)"
+                 : (reopened ? "reopened the wound" : "did NOT reopen the wound"),
+      closedAgainTick, neckGoneTick, neckBudgetAtGone,
+      (neckLast - neckFirst).len(), neckLast.y, headGoneTick, bodiesAtEnd);
+  return ok ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& WoundGates() {
@@ -1203,6 +1422,7 @@ const std::vector<Gate>& WoundGates() {
       {"burn-cap", "mob", {}, false, GateBurnCap, false},
       {"one-hit", "mob", {}, false, GateOneHit, false},
       {"corpse-intact", "mob", {}, false, GateCorpseIntact, false},
+      {"corpse-bleed", "mob", {}, false, GateCorpseBleed, false},
   };
   return g;
 }

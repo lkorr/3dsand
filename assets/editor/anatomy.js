@@ -9,13 +9,18 @@
  * the tuner's Models tab calls it for the "Apply recipe" button and
  * scripts/anatomize_mob.mjs calls it to bake a committed asset.
  *
- * DEPTH is measured over the UNION of every model in the prefab, not per limb.
- * Limbs abut at their joints (the top of a thigh sits against the hips) and a
- * per-limb measure would call that joint face "surface" and skin it; the
- * union calls it interior, so a severed limb shows bone and muscle on its cut
- * face, which is the point of the whole exercise. Depth 0 is any solid voxel
- * with an empty 6-neighbour (outside the prefab box counts as empty); depth n
- * is n 6-connected steps in from there.
+ * DEPTH is measured over the UNION of every model in the prefab, EXCEPT that
+ * a limb's own faces are always depth 0. Limbs abut at their joints (the top
+ * of a thigh sits against the hips, the head sits on the torso) and the union
+ * alone calls that joint face interior — which put vertebrae on the top of
+ * the neck and a shoulder socket on the arm, both on show the moment the rig
+ * turned a head or raised an arm. So: depth 0 is any solid voxel with an
+ * empty 6-neighbour in ITS OWN MODEL (outside the model box counts as empty),
+ * which makes every limb skin all the way round; everything else takes the
+ * union's depth, n 6-connected steps in from a union-exposed face, so the
+ * bone core still runs through the joint and a cut through the middle of a
+ * limb shows the schedule. A joint that is severed shows its skin cap and the
+ * blood the wound soaks into it (Mob::StainWound), not an anatomy plate.
  *
  * A RECIPE is data in the mob sidecar (`"anatomy": {...}`), materials by NAME
  * (CLAUDE.md design guideline 4: author by name, resolve at load), so a cyborg
@@ -35,7 +40,11 @@
  *
  *  - `keep` leaves the voxels of that layer exactly as they are — material AND
  *    art colour. The surface layer is the painted character (eyes, mouth, the
- *    shading rows) and a recipe must never repaint it.
+ *    shading rows) and a recipe must never repaint it. The one exception: a
+ *    kept voxel whose material is one the recipe puts UNDER the surface
+ *    (flesh, bone, the speckle) is not paint, it is a face this recipe once
+ *    baked as interior (the joint faces before own-face depth existed), and
+ *    it is rewritten to the layer's own material with its art cleared.
  *  - Every rewritten voxel has its art colour CLEARED. Art overrides the
  *    material colour in microbody.wgsl, so a painted interior would show the
  *    skin's paint on the flesh it exposes.
@@ -107,7 +116,7 @@ export function unionDepth(prefab, visible = null) {
       }
   });
 
-  // Seeds: solid cells with an empty (or out-of-box) 6-neighbour.
+  // Seeds: solid cells with an empty (or out-of-box) 6-neighbour in the UNION.
   const queue = new Int32Array(n);
   let head = 0, tail = 0;
   for (let z = 0; z < dim.z; z++)
@@ -139,6 +148,29 @@ export function unionDepth(prefab, visible = null) {
     if (z > 0) step(i - sz);
     if (z < dim.z - 1) step(i + sz);
   }
+
+  // A LIMB'S OWN FACES ARE SURFACE. Applied after the BFS rather than seeded
+  // into it on purpose: seeding would measure the rows under a joint face
+  // from that face too, and a neck five voxels tall would then be skin /
+  // flesh / muscle / flesh / skin with no bone in it. Overriding only the
+  // face keeps the union's depth underneath, so the core is continuous
+  // through the joint and only the face itself changes.
+  prefab.models.forEach((m, mi) => {
+    if (visible && !visible(mi)) return;
+    const d = m.dim, data = m.grid.data, o = m.offset;
+    const at = (x, y, z) =>
+      x < 0 || y < 0 || z < 0 || x >= d.x || y >= d.y || z >= d.z
+        ? 0 : data[x + y * d.x + z * d.x * d.y];
+    for (let z = 0; z < d.z; z++)
+      for (let y = 0; y < d.y; y++)
+        for (let x = 0; x < d.x; x++) {
+          if (!at(x, y, z)) continue;
+          if (!at(x - 1, y, z) || !at(x + 1, y, z) ||
+              !at(x, y - 1, z) || !at(x, y + 1, z) ||
+              !at(x, y, z - 1) || !at(x, y, z + 1))
+            depth[(x + o.x) + (y + o.y) * sy + (z + o.z) * sz] = 0;
+        }
+  });
   return { dim, depth };
 }
 
@@ -269,6 +301,16 @@ export function planAnatomy(prefab, recipe, matId) {
     const ids = layers.map(l => resolve(l.material));
     const speck = layers.map(l => l.speckle ? resolve(l.speckle.material) : 0);
     const surfaceId = ids[0];
+    // What this recipe puts under the surface. A `keep` voxel made of one of
+    // these is a face that was once baked as interior, not the painted
+    // character, and it gets the kept layer's material back (see the module
+    // comment on `keep`).
+    const interior = new Set();
+    layers.forEach((l, li) => {
+      if (l.keep) return;
+      if (ids[li]) interior.add(ids[li]);
+      if (speck[li]) interior.add(speck[li]);
+    });
     const d = m.dim, data = m.grid.data, color = m.grid.color, o = m.offset;
     const cells = [], mats = [];
     const hist = {};
@@ -284,7 +326,7 @@ export function planAnatomy(prefab, recipe, matId) {
           const li = layerIndexAt(layers, depth);
           if (li < 0) continue;
           const L = layers[li];
-          if (L.keep) continue;
+          if (L.keep && !interior.has(cur)) continue;
           let mat = ids[li], label = L.material;
           // Skin under the shorts: the first layer's material, one cell deep.
           if (depth === 1 && surfaceId && garmentIds.size && underGarment(px, py, pz)) {

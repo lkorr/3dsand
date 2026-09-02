@@ -122,6 +122,20 @@ int FindMaterialId(const std::vector<MaterialDef>& mats, const std::string& name
   return -1;
 }
 
+// A limb's wound, as the debris system will carry it once the limb is a body
+// of its own (DebrisSystem::BodyWound; same frame, same units). The gout's
+// point wins over the drip's when both are armed: they are the same joint
+// whenever Sever() set them, and the gout is the one that is visible.
+DebrisSystem::BodyWound WoundOf(const MobLimb& l) {
+  DebrisSystem::BodyWound w;
+  w.open = l.bleedBudget >= 1.0f || l.gushTicks > 0;
+  w.local = l.gushTicks > 0 ? l.gushLocal : l.woundLocal;
+  w.dir = l.gushDir;
+  w.budget = l.bleedBudget;
+  w.gushTicks = l.gushTicks;
+  return w;
+}
+
 int FindModel(const Prefab& pf, const std::string& name) {
   for (size_t i = 0; i < pf.models.size(); i++)
     if (pf.models[i].name == name) return (int)i;
@@ -451,6 +465,21 @@ bool LoadMobDefs(const std::string& dir, const std::vector<MaterialDef>& mats,
           def.woundMat = (uint32_t)wid;
       }
       if (def.woundMat == 0) def.woundMat = def.bleedMat;
+      // Tissue = crumbles to this creature's blood (see MobDef::tissue).
+      if (def.bleedMat != 0) {
+        def.tissue.assign(mats.size(), 0);
+        bool any = false;
+        for (size_t mi = 0; mi < mats.size(); mi++) {
+          const bool crumblesToBlood =
+              !mats[mi].rubble.empty() &&
+              FindMaterialId(mats, mats[mi].rubble) == (int)def.bleedMat;
+          if (crumblesToBlood || mi == def.woundMat) {
+            def.tissue[mi] = 1;
+            any = true;
+          }
+        }
+        if (!any) def.tissue.clear();
+      }
       // NOT rescaled: this is a COUNT of voxels a wound may still owe, i.e.
       // a volume budget, and volume goes as the cube of the voxel scale. It
       // is gore rate rather than size or shape, so it is left as authored
@@ -3904,7 +3933,8 @@ uint32_t Mob::StainWound(int limbIndex, Vec3 centreLocal, float radiusWorld,
   if (!stain || radiusWorld <= 0.0f) return 0;
   const auto& gt = CurrentTuning().gore;
   const float density = std::clamp(gt.woundStainDensity, 0.0f, 1.0f);
-  if (density <= 0.0f) return 0;
+  const float surface = std::clamp(gt.woundStainSurface, 0.0f, 1.0f);
+  if (density <= 0.0f && surface <= 0.0f) return 0;
 
   MobLimb& limb = limbs_[limbIndex];
   const bool fine = limb.HasFineSkin();
@@ -3913,6 +3943,48 @@ uint32_t Mob::StainWound(int limbIndex, Vec3 centreLocal, float radiusWorld,
   const Vec3 c = centreLocal * scale;
   const float r = radiusWorld * scale;
   const float r2 = r * r;
+
+  // WHAT IS EXPOSED. A wound is what you can see of it: the walls of the hole
+  // the blade opened and the skin around its mouth take the blood, and a voxel
+  // buried under intact skin mostly does not (it only shows if a later cut
+  // reaches it, and a soaked interior would hide the anatomy under a uniform
+  // red). "Exposed" is having an empty 6-neighbour in this limb's own lattice,
+  // read off an occupancy bitmap over the limb's box built here, on the hit
+  // tick only — the same O(voxels) bound the loop below already pays.
+  int16_t lo[3] = {INT16_MAX, INT16_MAX, INT16_MAX};
+  int16_t hi[3] = {INT16_MIN, INT16_MIN, INT16_MIN};
+  auto grow = [&](int x, int y, int z) {
+    lo[0] = (int16_t)std::min<int>(lo[0], x); hi[0] = (int16_t)std::max<int>(hi[0], x);
+    lo[1] = (int16_t)std::min<int>(lo[1], y); hi[1] = (int16_t)std::max<int>(hi[1], y);
+    lo[2] = (int16_t)std::min<int>(lo[2], z); hi[2] = (int16_t)std::max<int>(hi[2], z);
+  };
+  if (fine)
+    for (const PrefabVoxel& v : limb.skinVoxels) grow(v.x, v.y, v.z);
+  else
+    for (const DebrisVoxel& v : limb.voxels) grow(v.x, v.y, v.z);
+  if (lo[0] > hi[0]) return 0;  // no voxels left to soak
+  const int dx = hi[0] - lo[0] + 1, dy = hi[1] - lo[1] + 1, dz = hi[2] - lo[2] + 1;
+  std::vector<uint8_t> occ((size_t)dx * dy * dz, 0);
+  auto occAt = [&](int x, int y, int z) -> bool {
+    x -= lo[0]; y -= lo[1]; z -= lo[2];
+    if (x < 0 || y < 0 || z < 0 || x >= dx || y >= dy || z >= dz) return false;
+    return occ[(size_t)x + (size_t)y * dx + (size_t)z * dx * dy] != 0;
+  };
+  auto occSet = [&](int x, int y, int z) {
+    occ[(size_t)(x - lo[0]) + (size_t)(y - lo[1]) * dx +
+        (size_t)(z - lo[2]) * dx * dy] = 1;
+  };
+  if (fine)
+    for (const PrefabVoxel& v : limb.skinVoxels)
+      if (v.material != 0) occSet(v.x, v.y, v.z);
+  else
+    for (const DebrisVoxel& v : limb.voxels)
+      if (v.payload != 0) occSet(v.x, v.y, v.z);
+  auto exposed = [&](int x, int y, int z) -> bool {
+    return !occAt(x - 1, y, z) || !occAt(x + 1, y, z) || !occAt(x, y - 1, z) ||
+           !occAt(x, y + 1, z) || !occAt(x, y, z - 1) || !occAt(x, y, z + 1);
+  };
+  const std::vector<uint8_t>& tissue = def_->tissue;
 
   // THE BRICK MUST BE OWNED BEFORE IT CAN BE POKED. Every instance of a def
   // shares one packed model until something damages a particular body; poking
@@ -3942,6 +4014,9 @@ uint32_t Mob::StainWound(int limbIndex, Vec3 centreLocal, float radiusWorld,
   auto consider = [&](float lx, float ly, float lz, uint32_t mat,
                       auto&& apply) {
     if (mat == 0 || mat == (stain & 0xFFFu)) return;  // tombstone, or already
+    // Bone stays bone (MobDef::tissue): the hole shows it, the blood is
+    // around it.
+    if (!tissue.empty() && (mat >= tissue.size() || !tissue[mat])) return;
     const Vec3 d{lx + 0.5f - c.x, ly + 0.5f - c.y, lz + 0.5f - c.z};
     const float d2 = d.dot(d);
     if (d2 >= r2) return;
@@ -3950,8 +4025,15 @@ uint32_t Mob::StainWound(int limbIndex, Vec3 centreLocal, float radiusWorld,
     // that has bled over itself. Weighted by 1 - t so the rim is only
     // speckled, and keyed on the LATTICE position so a replay stains the same
     // voxels and a second cut in the same place deepens the same soak.
+    //
+    // Two densities: the exposed cells (the hole's walls, the skin round its
+    // mouth) take `woundStainSurface`, near-certain at the cut so the wound
+    // reads as a splash of blood with the anatomy showing through it; the
+    // buried cells take `woundStainDensity`, low, so what a later cut exposes
+    // is meat that has bled a little, not a red interior.
     const float t = std::sqrt(d2 / r2);
-    const float chance = density * (1.0f - t * t);
+    const bool onSurface = exposed((int)lx, (int)ly, (int)lz);
+    const float chance = (onSurface ? surface : density) * (1.0f - t * t);
     const uint32_t h = Hash3(seed, (uint32_t)((int)lx * 73856093),
                              (uint32_t)((int)ly * 19349663) ^
                                  (uint32_t)((int)lz * 83492791));
@@ -4688,8 +4770,17 @@ void Mob::EmitCarvedFragment(const MobLimb& src, uint32_t physScale,
   float len = away.len();
   away = len > 1e-3f ? away * (1.0f / len) : Vec3{0, 1, 0};
   phys_->SetBodyVelocities(h, away * 2.5f + Vec3{0, 1.5f, 0}, Vec3{});
+  const float partWorldVox =
+      (float)part.size() / (float)(physScale * physScale * physScale);
   debris_->AdoptBody(h, std::move(part), xf, micro, 0, {},
                      def_->bleedMat);
+  // A lump of live flesh oozes from the face it was cut on: the wound sits on
+  // the gobbet's voxel nearest the limb it came off, budgeted like a corpse
+  // carve of the same volume. No gout; a gobbet is not an amputation.
+  if (def_->bleedMat != 0)
+    debris_->WoundBody(h, src.xf.pos,
+                       partWorldVox * CurrentTuning().gore.corpseBleedPerVoxel,
+                       0);
 }
 
 bool Mob::CarveLimb(int limbIndex, World& world,
@@ -6353,11 +6444,23 @@ void Mob::Sever(int limbIndex) {
       sys_->worstSeverLimb_ = ld.name;
     }
   }
-  if (limbIndex == def.rootLimb || ld.vital || !ld.severable) {
+  if (limbIndex == def.rootLimb || !ld.severable) {
     deathCause_ = inBurnFlush_ ? "vital limb burnt/dissolved away"
                                : "vital limb destroyed";
     Die();
   } else {
+    // A VITAL LIMB THAT IS SEVERABLE COMES OFF, AND THEN THE CREATURE DIES OF
+    // IT. Routing a decapitation straight to Die() (as this did until
+    // 2026-09-02) left the head jointed to the corpse and, worse, never opened
+    // a wound: Die() hands every limb to the debris system as it stands, and
+    // a stump nobody armed is a stump that does not bleed. So the head leaves
+    // like any severed limb below (its own body, its own wound at the neck),
+    // the torso's stump is armed exactly as for an arm, and only then does the
+    // corpse take over, wounds and all (Die -> AdoptBody(WoundOf)).
+    const bool fatal = ld.vital;
+    if (fatal)
+      deathCause_ = inBurnFlush_ ? "vital limb burnt/dissolved away"
+                                 : "vital limb destroyed";
       // The cut point in WORLD space, captured BEFORE DetachLimb: the joint
       // anchor expressed through the severed limb's own live transform.
       //
@@ -6411,6 +6514,33 @@ void Mob::Sever(int limbIndex) {
       // to fall off, so there should be no body at all. Rags cut loose by a
       // blade still drop, because that is a piece of gear hitting the floor.
       const bool adopt = !(worn && inBurnFlush_);
+      if (gore && adopt) {
+        // THE PIECE BLEEDS TOO, from its own end of the cut: a head on the
+        // floor bleeds from its neck. Armed on the limb here so DetachLimb's
+        // AdoptBody hands it over with the body (WoundOf), with the same
+        // budget and gout its stump gets below. Blood leaves the piece from
+        // its centre out through the joint, tilted up like the stump's.
+        MobLimb& piece = limbs_[limbIndex];
+        const auto& gt = CurrentTuning().gore;
+        Vec3 centre{};
+        if (!piece.voxels.empty()) {
+          for (const DebrisVoxel& v : piece.voxels)
+            centre += Vec3{(float)v.x + 0.5f, (float)v.y + 0.5f, (float)v.z + 0.5f};
+          centre = centre * (1.0f / ((float)piece.voxels.size() *
+                                     (float)std::max(1u, PhysScaleOf(piece))));
+        }
+        Vec3 outW = Rotate(cq, piece.anchorLimb - centre);
+        float olen = outW.len();
+        outW = olen > 1e-3f ? outW * (1.0f / olen) : Vec3{0, -1, 0};
+        outW.y += 0.5f;
+        olen = outW.len();
+        piece.woundLocal = piece.anchorLimb;
+        piece.gushLocal = piece.anchorLimb;
+        piece.gushDir = RotateInv(cq, olen > 1e-3f ? outW * (1.0f / olen)
+                                                    : Vec3{0, 1, 0});
+        piece.gushTicks = std::max(piece.gushTicks, gore_.severDecayTicks);
+        piece.bleedBudget = AddBleedBudget(piece.bleedBudget, gt.severStumpBudget);
+      }
       DetachLimb(limbIndex, adopt);
       if (!adopt) {
         // Burnt to nothing: make the lattice say so, or CaptureWorn (which
@@ -6421,7 +6551,10 @@ void Mob::Sever(int limbIndex) {
         gone.voxels.clear();
         gone.hp = 0.0f;
       }
-      if (!gore) return;
+      if (!gore) {
+        if (fatal) Die();
+        return;
+      }
       // the stump bleeds: wound at the joint on the PARENT side
       for (size_t k = 0; k < limbDefs_.size(); k++)
         if (limbDefs_[k].name == ld.parent) {
@@ -6512,9 +6645,15 @@ void Mob::Sever(int limbIndex) {
           // in the loop and unconditionally last in Sever(): a kill here
           // reshapes limbs_ and `parent` may not be touched after it. Every
           // caller of Sever() already treats it as possibly-fatal.
-          if (thrown > 0) DrainBlood((float)thrown);
+          //
+          // Not charged on a fatal sever: the creature is dying of the limb,
+          // not of the blood, and DrainBlood would rename the cause.
+          if (thrown > 0 && !fatal) DrainBlood((float)thrown);
           break;
         }
+    // The vital limb is off and its stump is armed: now the creature dies of
+    // it, and the corpse inherits the wounds.
+    if (fatal && alive_) Die();
   }
 }
 
@@ -6563,11 +6702,16 @@ void Mob::DetachLimb(int limbIndex, bool adopt) {
     // would visibly coarsen at the moment it came off.
     debris_->AdoptBody(limb.body, limb.voxels, limb.xf,
                        limb.MicroRef(SkinScaleOf(limb)), PhysScaleOf(limb),
-                       std::move(limb.skinVoxels), def.bleedMat);
+                       std::move(limb.skinVoxels), def.bleedMat, WoundOf(limb));
     limb.skinVoxels.clear();
     limb.carved = false;
     limb.holdBody = limb.body;
     limb.holdSeconds = kSeverHoldSeconds;
+    // The wound went with the body. Left here it would go on paying out of
+    // the husk entry: BleedTick's bodyless fallback drips at the rest-pose
+    // anchor of a limb that is no longer on this creature.
+    limb.bleedBudget = 0.0f;
+    limb.gushTicks = 0;
   } else {
     // Not adopted: nothing downstream will ever free this limb's brick, so it
     // must be returned here.
@@ -6631,9 +6775,12 @@ void Mob::Die() {
     StripBurnTombstones(limb);
     DropBurnIndex(limb.burn);
     phys_->SetBodyKinematic(limb.body, false);
+    // ...wounds included: a stump that was bleeding goes on bleeding from the
+    // corpse, from where it is (BodyWound), until it has paid out.
     debris_->AdoptBody(limb.body, limb.voxels, limb.xf,
                        limb.MicroRef(SkinScaleOf(limb)), PhysScaleOf(limb),
-                       std::move(limb.skinVoxels), def_->bleedMat);
+                       std::move(limb.skinVoxels), def_->bleedMat,
+                       WoundOf(limb));
     // NOTE THE ABSENT OnBodyReleasedToWorld. A limb that is SEVERED gets its
     // avatar-layer exemption stripped, but only after kSeverHoldSeconds
     // (TickSeveredHolds) — by then it has swung clear of the capsule it grew
@@ -7023,6 +7170,23 @@ uint32_t MobSystem::LimbMaterialCount(uint64_t mobId, int limbIndex,
     return n;
   }
   return 0;
+}
+
+std::vector<PrefabVoxel> MobSystem::LimbLattice(uint64_t mobId,
+                                                int limbIndex) const {
+  std::vector<PrefabVoxel> out;
+  for (const Mob& mob : mobs_) {
+    if (mob.id_ != mobId || limbIndex < 0 || limbIndex >= (int)mob.limbs_.size())
+      continue;
+    const MobLimb& l = mob.limbs_[limbIndex];
+    if (l.HasFineSkin()) return l.skinVoxels;
+    out.reserve(l.voxels.size());
+    for (const DebrisVoxel& v : l.voxels)
+      out.push_back(PrefabVoxel{(int16_t)v.x, (int16_t)v.y, (int16_t)v.z,
+                                (uint16_t)(v.payload & 0xFFFu), v.color});
+    return out;
+  }
+  return out;
 }
 
 uint32_t MobSystem::LimbVoxelsAtSpawn(uint64_t mobId, int limbIndex) const {

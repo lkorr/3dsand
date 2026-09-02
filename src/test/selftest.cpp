@@ -237,6 +237,11 @@ const char* const kOrder[] = {
     // ...and the corpse stays in one piece when the stroke keeps going
     // through it (same report, the half one-hit could not see; CPU only).
     "corpse-intact",
+    // ...and every piece of it bleeds from its own end of the cut, the soak
+    // lands on what is exposed, and bone stays bone (owner report 2026-09-02).
+    // Ticks the world (the corpse needs ground to lie on) and regenerates it
+    // on the way out, like wound-bleed.
+    "corpse-bleed",
     // LAST of the world-touching gates, and it must be: BuildVoxRegion moves
     // the residency window and resets the page table, which is the state every
     // other gate's fixture placement assumes. It restores both before it

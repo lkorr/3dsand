@@ -682,6 +682,7 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadF(*g, "bleedVoxelGain", e.bleedVoxelGain, out, at);
     ReadF(*g, "bleedBudgetCap", e.bleedBudgetCap, out, at);
     ReadF(*g, "severStumpBudget", e.severStumpBudget, out, at);
+    ReadF(*g, "corpseBleedPerVoxel", e.corpseBleedPerVoxel, out, at);
     ReadI(*g, "bleedDripTicks", e.bleedDripTicks, out, at);
     ReadI(*g, "bleedOpsPerTick", e.bleedOpsPerTick, out, at);
     ReadI(*g, "bleedClumpRadius", e.bleedClumpRadius, out, at);
@@ -728,6 +729,7 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadF(*g, "woundHeftRef", e.woundHeftRef, out, at);
     ReadF(*g, "woundHeftMax", e.woundHeftMax, out, at);
     ReadF(*g, "woundStainRadius", e.woundStainRadius, out, at);
+    ReadF(*g, "woundStainSurface", e.woundStainSurface, out, at);
     ReadF(*g, "woundStainDensity", e.woundStainDensity, out, at);
     ReadF(*g, "woundSeverFraction", e.woundSeverFraction, out, at);
     ReadF(*g, "woundNeckRadius", e.woundNeckRadius, out, at);
@@ -760,6 +762,7 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     }
     e.woundHeftMax = std::clamp(e.woundHeftMax, 1.0f, 32.0f);
     e.woundStainRadius = std::clamp(e.woundStainRadius, 0.0f, 16.0f);
+    e.woundStainSurface = std::clamp(e.woundStainSurface, 0.0f, 1.0f);
     e.woundStainDensity = std::clamp(e.woundStainDensity, 0.0f, 1.0f);
     // A sever fraction of 0 severs on the first disconnected speck — that is
     // the straggler bug in Mob::CarveLimb wearing a slider — and 1 can never
@@ -824,6 +827,7 @@ bool LoadTuning(const std::string& path, Tuning& out) {
       out.warnings.push_back(at + ".bleedBudgetCap < 0; clamped to 0");
       e.bleedBudgetCap = 0.0f;
     }
+    if (e.corpseBleedPerVoxel < 0.0f) e.corpseBleedPerVoxel = 0.0f;
     if (e.severStumpBudget < 0.0f) {
       out.warnings.push_back(at + ".severStumpBudget < 0; clamped to 0");
       e.severStumpBudget = 0.0f;
@@ -3040,7 +3044,9 @@ bool SaveCombatTuning(const std::string& path, const Tuning& t,
     put("woundHeftRef", g.woundHeftRef);
     put("woundHeftMax", g.woundHeftMax);
     put("woundStainRadius", g.woundStainRadius);
+    put("woundStainSurface", g.woundStainSurface);
     put("woundStainDensity", g.woundStainDensity);
+    put("corpseBleedPerVoxel", g.corpseBleedPerVoxel);
     put("bleedGain", g.bleedGain);
     put("bleedHpPerVoxel", g.bleedHpPerVoxel);
     putB("stumpBleedsOpen", g.stumpBleedsOpen);

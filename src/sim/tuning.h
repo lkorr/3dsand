@@ -673,6 +673,14 @@ struct Tuning {
     // Voxels added to the stump's budget when a limb comes off, on top of the
     // thrown sever voxels below. This is the puddle under a fresh amputation.
     float severStumpBudget = 40.0f;
+    // A CORPSE BLEEDS FROM WHERE IT IS CUT. Every debris body that was once
+    // flesh carries a wound of its own (DebrisSystem::BodyWound): the neck
+    // stump on the torso and the head that came off it each drip from their
+    // own place. Blood voxels a corpse owes per WORLD voxel carved off it,
+    // through the same cap as a live wound; a cut that takes a piece off also
+    // arms the sever gout and the stump budget above on BOTH pieces, so a
+    // dismembered corpse bleeds like a dismembered creature, minus the hp.
+    float corpseBleedPerVoxel = 1.5f;
 
     // ---- B2. how fast that budget leaves the wound, and in what size lumps ----
     // Rate is a PERIOD, not a chance, because bleeding must stay bounded per
@@ -844,8 +852,14 @@ struct Tuning {
     // Radius around the cut in world voxels, and the fraction of the voxels in
     // range that take the stain — below 1 so the soak is mottled rather than a
     // uniform repaint, which reads as a red limb rather than a wound.
-    float woundStainRadius = 0.60f;
-    float woundStainDensity = 0.55f;
+    // Two densities since 2026-09-02: `woundStainSurface` is the chance on an
+    // EXPOSED voxel (the hole's walls and the skin round its mouth — what the
+    // wound looks like), `woundStainDensity` on a BURIED one (what a later cut
+    // finds). Bone is never soaked (MobDef::tissue), so the hole shows it
+    // through the blood instead of one more red voxel.
+    float woundStainRadius = 0.90f;
+    float woundStainSurface = 0.90f;
+    float woundStainDensity = 0.30f;
 
     // ---- E4. when a cut becomes a dismemberment -----------------------------
     // Both rules are STRUCTURAL and both fire only on a blade cut (a burn's

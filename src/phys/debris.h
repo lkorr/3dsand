@@ -99,11 +99,33 @@ class DebrisSystem {
   // coincide. A body whose skin is FINER than its collider passes the coarser
   // value here and hands over `skinVoxels` — the fine lattice, in skinScale
   // units — which then becomes the authoritative shape for carving.
+  // A WOUND ON A BODY. Debris that was once flesh bleeds from the place it
+  // was cut, not from nowhere: a corpse's neck stump, the head that came off
+  // it, and the stump left on a carved corpse each carry one of these, and
+  // BleedBodies drains it every tick from wherever the body has rolled to.
+  // `local` and `dir` are in WORLD-voxel units in the body frame (the same
+  // convention MobLimb::woundLocal uses, so a limb's wound hands over as is).
+  // `budget` is whole blood voxels the wound still owes (the drip, under
+  // gore.bleedBudgetCap); `gushTicks` counts the dismemberment gout down from
+  // gore.severDecayTicks. A corpse does not pump: nothing tops the budget up,
+  // and a wound that has paid out closes. TRANSIENT: not saved, not loaded.
+  struct BodyWound {
+    bool open = false;
+    Vec3 local{};
+    Vec3 dir{0, 1, 0};
+    float budget = 0.0f;
+    int gushTicks = 0;
+  };
+
   void AdoptBody(uint64_t handle, std::vector<DebrisVoxel> voxels,
                  const BodyTransform& xf, MicroBodyRef micro = {},
                  uint32_t physScale = 0,
                  std::vector<PrefabVoxel> skinVoxels = {},
-                 uint32_t bleedMat = 0);
+                 uint32_t bleedMat = 0, BodyWound wound = {});
+  // Open a wound on an adopted body at its voxel nearest `woundW` (world),
+  // owing `budget` blood voxels, with `gushTicks` of dismemberment gout.
+  // False when no such body, or it has no blood.
+  bool WoundBody(uint64_t handle, Vec3 woundW, float budget, int gushTicks);
 
   // TAKE A BODY OUT OF THE WORLD. Not damage and not a cull: the thing has
   // been picked up, and it stops existing as matter. Goes through the same
@@ -282,6 +304,20 @@ class DebrisSystem {
   Vec3 BodyPosition(uint32_t i) const {
     return i < bodies_.size() ? bodies_[i].xf.pos : Vec3{};
   }
+  // ---- corpse wounds, for a gate that has to say WHICH piece is bleeding ----
+  uint32_t WoundedBodyCount() const {
+    uint32_t n = 0;
+    for (const Body& b : bodies_)
+      if (b.wound.open) n++;
+    return n;
+  }
+  bool BodyWoundOpen(uint32_t i) const {
+    return i < bodies_.size() && bodies_[i].wound.open;
+  }
+  float BodyWoundBudget(uint32_t i) const {
+    return i < bodies_.size() ? bodies_[i].wound.budget : 0.0f;
+  }
+  Vec3 BodyWoundWorld(uint32_t i) const;  // the wound, in world voxels
   uint32_t BodyVoxelCount(uint32_t i) const {
     if (i >= bodies_.size()) return 0;
     const Body& b = bodies_[i];
@@ -404,6 +440,7 @@ class DebrisSystem {
       return !skinVoxels.empty() && micro.skinScale > physScale;
     }
     uint32_t bleedMat = 0;       // nonzero => body bleeds when carved
+    BodyWound wound;             // where, and how much (see BodyWound)
     uint32_t inactiveTicks = 0;  // settle-back countdown (PLAN §B6)
     // Impact cue bookkeeping. `domMat` is this body's most common material,
     // cached because it is the fallback the impact cue reaches for when the
@@ -442,6 +479,17 @@ class DebrisSystem {
   void BurnBodies(uint32_t tick, World& world, std::vector<CellOp>& cellOps,
                   std::vector<ParticleSpawn>& spawns);
   void RecountBurn(Body& b) const;
+  // Corpse bleeding: every body with an open wound drips and gouts from it,
+  // on the live wound's own tuning (gore.sever* for the gout, gore.bleed* for
+  // the drip). Idle bodies cost two field reads.
+  void BleedBodies(uint32_t tick, World& world,
+                   std::vector<ParticleSpawn>& spawns);
+  // Open (or deepen) a wound at the body voxel nearest `woundW` (world), with
+  // blood leaving along `dirW` when the body's own shape gives no direction.
+  // Reads b.xf as it stands, so call it AFTER any rebase. `budget` goes
+  // through AddBleedBudget; `gushTicks` is a max.
+  void ArmWound(Body& b, Vec3 woundW, Vec3 dirW, float budget,
+                int gushTicks) const;
   bool AnyDirtyNear(const Body& b, const WorldSnapshot& snap, World& world) const;
   // Break a body whose voxels no longer form one 6-connected component: the
   // largest piece keeps the body, fragments >= `minFragment` voxels become

@@ -13,6 +13,27 @@
 
 namespace {
 
+// One ballistic blood particle, world voxels in, the particle system's fixed
+// 24.8 voxels/tick out at the sim's 30 Hz (the twin of Mob's MakeDroplet).
+// `micro` is sub-voxel spray that stains and dies; otherwise a real voxel.
+ParticleSpawn BloodSpawn(Vec3 posVoxel, Vec3 vel, uint32_t material,
+                         bool micro, int lifeTicks, int microScale) {
+  ParticleSpawn s{};
+  s.px = (int32_t)std::lround(posVoxel.x * 256.0f);
+  s.py = (int32_t)std::lround(posVoxel.y * 256.0f);
+  s.pz = (int32_t)std::lround(posVoxel.z * 256.0f);
+  s.vx = (int32_t)std::lround(vel.x * 256.0f / 30.0f);
+  s.vy = (int32_t)std::lround(vel.y * 256.0f / 30.0f);
+  s.vz = (int32_t)std::lround(vel.z * 256.0f / 30.0f);
+  s.payload = (uint16_t)(material & 0xFFFu);
+  s.flags = kPFlagAlive;
+  if (micro) {
+    const int life = lifeTicks < 1 ? 1 : (lifeTicks > 255 ? 255 : lifeTicks);
+    s.flags |= kPFlagMicro | ParticleMicroBits(microScale, life);
+  }
+  return s;
+}
+
 constexpr int kMaxRegionCells = 80;      // <= 5 chunks per axis (bounded fill)
 constexpr uint32_t kMaxIslandVoxels = 32000;  // DESIGN.md §7 abort threshold
 constexpr uint32_t kTerrainEvictTicks = 300;
@@ -696,6 +717,7 @@ void DebrisSystem::PreTick(uint32_t tick, World& world, std::vector<CellOp>& cel
     }
   }
   BurnBodies(tick, world, cellOps, spawns);
+  BleedBodies(tick, world, spawns);
   SettleBodies(tick, world, cellOps);
   ManageTerrain(tick, world);
 }
@@ -777,6 +799,11 @@ void DebrisSystem::SettleBodies(uint32_t tick, World& world,
     settle_.maxInactiveTicks =
         std::max(settle_.maxInactiveTicks, b.inactiveTicks);
     if (b.inactiveTicks < kSettleAfterTicks) continue;
+    // A BLEEDING BODY IS NOT SETTLED. Settling folds the body into the grid
+    // and its wound with it, and measured on the corpse-bleed fixture that
+    // happened at t+72 of a 160-tick drip. Bounded: a corpse never tops a
+    // wound up, so this waits out one budget and no more.
+    if (b.wound.open) continue;
     if (b.inactiveTicks % 30 != 0) continue;  // re-test alignment cheaply
 
     // rotation -> 3x3, then the nearest signed permutation. Reject when any
@@ -1556,10 +1583,16 @@ void DebrisSystem::AdoptBody(uint64_t handle, std::vector<DebrisVoxel> voxels,
                              const BodyTransform& xf, MicroBodyRef micro,
                              uint32_t physScale,
                              std::vector<PrefabVoxel> skinVoxels,
-                             uint32_t bleedMat) {
+                             uint32_t bleedMat, BodyWound wound) {
   if (handle == 0 || voxels.empty()) return;
   Body body;
   body.handle = handle;
+  // The limb's wound comes with it (a severed head bleeds from its neck; a
+  // corpse's stump keeps dripping). Only a wound with something left to pay
+  // stays open, and only on a body that has blood to pay it with.
+  body.wound = wound;
+  body.wound.open = wound.open && bleedMat != 0 &&
+                    (wound.budget >= 1.0f || wound.gushTicks > 0);
   body.voxels = std::move(voxels);
   body.xf = xf;
   IVec3 mn{127, 127, 127}, mx{-128, -128, -128};
@@ -1764,56 +1797,22 @@ bool DebrisSystem::DamageBody(size_t bi, World& world,
   phys_->GetBodyVelocities(b.handle, lin, ang);
   if (eject) VoxelsToParticles(b, removed, lin, ang, world, spawns);
 
-  // Corpse bleeding: a body that was once flesh emits blood when carved.
-  if (b.bleedMat != 0 && !removed.empty()) {
+  // CORPSE BLEEDING is a WOUND, not a puff: the cut is remembered on every
+  // piece it leaves (the surviving body and each fragment ShatterBody splits
+  // off) and BleedBodies drains it from wherever that piece is. Armed at the
+  // bottom of this function, after the rebase, because a wound is a body-
+  // local point and the frame is about to move. The world position of the
+  // cut and how much came off are what survive to that point.
+  Vec3 woundW{};
+  float carvedWorldVox = 0.0f;
+  if (b.bleedMat != 0) {
     const float ps = (float)std::max(1u, b.physScale);
     Vec3 centroid{};
     for (const DebrisVoxel& v : removed)
       centroid += Vec3{(float)v.x + 0.5f, (float)v.y + 0.5f, (float)v.z + 0.5f};
     centroid = centroid * (1.0f / (float)removed.size());
-    Vec3 woundW = b.xf.pos + QuatRot(b.xf.quat, centroid * (1.0f / ps));
-
-    const uint32_t nRemoved = (uint32_t)removed.size();
-    // Micro spray: 2 droplets per removed voxel, capped.
-    const uint32_t sprayN = std::min(nRemoved * 2u, 60u);
-    for (uint32_t k = 0; k < sprayN; k++) {
-      if (spawns.size() >= kMaxParticleSpawnsPerTick) break;
-      uint32_t h = rng::Hash3(b.serial * 0x9E3779B9u, (uint32_t)k, nRemoved);
-      Vec3 dir{rng::SignedUnit(h) * 0.7f,
-               0.4f + 0.6f * std::fabs(rng::SignedUnit(rng::Pcg(h ^ 0x51u))),
-               rng::SignedUnit(rng::Pcg(h ^ 0xB0u)) * 0.7f};
-      float sp = 3.5f * (0.6f + 0.8f * rng::Unit01(rng::Pcg(h ^ 0x1234u)));
-      ParticleSpawn s{};
-      s.px = (int32_t)std::lround(woundW.x * 256.0f);
-      s.py = (int32_t)std::lround(woundW.y * 256.0f);
-      s.pz = (int32_t)std::lround(woundW.z * 256.0f);
-      s.vx = (int32_t)std::lround(dir.x * sp * 256.0f / 30.0f);
-      s.vy = (int32_t)std::lround(dir.y * sp * 256.0f / 30.0f);
-      s.vz = (int32_t)std::lround(dir.z * sp * 256.0f / 30.0f);
-      s.payload = b.bleedMat & 0xFFFu;
-      s.flags = kPFlagAlive | kPFlagMicro | ParticleMicroBits(4, 70);
-      spawns.push_back(s);
-    }
-    // Whole-voxel blood: 1 per 4 removed voxels, capped. These pool and persist.
-    const uint32_t bloodN = std::min((nRemoved + 3u) / 4u, 8u);
-    for (uint32_t k = 0; k < bloodN; k++) {
-      if (spawns.size() >= kMaxParticleSpawnsPerTick) break;
-      uint32_t h = rng::Hash3(b.serial * 0x51A17u, (uint32_t)k, nRemoved ^ 0xB100Du);
-      Vec3 dir{rng::SignedUnit(h) * 0.5f,
-               0.3f + 0.5f * std::fabs(rng::SignedUnit(rng::Pcg(h ^ 0x77u))),
-               rng::SignedUnit(rng::Pcg(h ^ 0xC0FFu)) * 0.5f};
-      float sp = 2.5f * (0.5f + rng::Unit01(rng::Pcg(h ^ 0x9Eu)));
-      ParticleSpawn s{};
-      s.px = (int32_t)std::lround(woundW.x * 256.0f);
-      s.py = (int32_t)std::lround(woundW.y * 256.0f);
-      s.pz = (int32_t)std::lround(woundW.z * 256.0f);
-      s.vx = (int32_t)std::lround(dir.x * sp * 256.0f / 30.0f);
-      s.vy = (int32_t)std::lround(dir.y * sp * 256.0f / 30.0f);
-      s.vz = (int32_t)std::lround(dir.z * sp * 256.0f / 30.0f);
-      s.payload = b.bleedMat & 0xFFFu;
-      s.flags = kPFlagAlive;
-      spawns.push_back(s);
-    }
+    woundW = b.xf.pos + QuatRot(b.xf.quat, centroid * (1.0f / ps));
+    carvedWorldVox = (float)removed.size() / (ps * ps * ps);
   }
 
   if (fine) {
@@ -1853,6 +1852,7 @@ bool DebrisSystem::DamageBody(size_t bi, World& world,
   // pieces". Fresh blast damage uses the ISLAND floor (8), not the much higher
   // burn-fragment floor — a body blown apart by an explosion is a one-off
   // event, not the every-few-ticks re-fragmentation that forced burn's bar up.
+  const size_t fragmentsBefore = fragments.size();
   ShatterBody(b, world, fragments, spawns, kMinBodyVoxels, newBodyBudget);
 
   // Rebase AFTER shatter (which rebases fragments itself) so the surviving
@@ -1875,7 +1875,169 @@ bool DebrisSystem::DamageBody(size_t bi, World& world,
   b.radiusVoxels = r / (float)std::max(1u, b.physScale) + 2.0f;
   b.burnCursor = b.voxels.empty() ? 0 : b.burnCursor % (uint32_t)b.voxels.size();
   RecountBurn(b);
+
+  // Arm the wound(s), now that every frame is final. A cut that took a piece
+  // off is an amputation and gets what Mob::Sever gives one (the gout, the
+  // stump budget and a throw of whole blood voxels) on the stump AND on the
+  // piece, each at its own end of the cut: blood comes from each of the
+  // rigidbodies that are dismembered, at their own locations. A cut that
+  // only carved gets the drip, in proportion to the flesh it took.
+  if (b.bleedMat != 0 && carvedWorldVox > 0.0f) {
+    const auto& gore = CurrentTuning().gore;
+    const bool amputation = fragments.size() > fragmentsBefore;
+    const float drip = carvedWorldVox * gore.corpseBleedPerVoxel +
+                       (amputation ? gore.severStumpBudget : 0.0f);
+    const int gush = amputation ? std::max(1, gore.severDecayTicks) : 0;
+    ArmWound(b, woundW, Vec3{0, 1, 0}, drip, gush);
+    for (size_t fi = fragmentsBefore; fi < fragments.size(); fi++)
+      ArmWound(fragments[fi], woundW, Vec3{0, 1, 0}, drip, gush);
+    if (amputation) {
+      // The conserved voxels a dismemberment throws (gore.severVoxels): few,
+      // and they are the lasting mess. Thrown from the cut, up and outward.
+      const int nVox = std::max(0, gore.severVoxels);
+      const float sprd = gore.severGobbetSpread;
+      for (int k = 0; k < nVox; k++) {
+        if (spawns.size() >= kMaxParticleSpawnsPerTick) break;
+        const uint32_t h = rng::Hash3(b.serial * 22695477u, (uint32_t)k, 0x5EEDu);
+        Vec3 dir{rng::SignedUnit(h) * 0.7f,
+                 0.5f + 0.5f * std::fabs(rng::SignedUnit(rng::Pcg(h ^ 0x31u))),
+                 rng::SignedUnit(rng::Pcg(h ^ 0x9Fu)) * 0.7f};
+        const float sp = gore.severVoxelSpeed *
+                         (0.6f + 0.8f * rng::Unit01(rng::Pcg(h ^ 0x77u)));
+        const Vec3 at{woundW.x + rng::SignedUnit(rng::Pcg(h ^ 0x2A5u)) * sprd,
+                      woundW.y + rng::SignedUnit(rng::Pcg(h ^ 0xB77u)) * sprd,
+                      woundW.z + rng::SignedUnit(rng::Pcg(h ^ 0xC3Du)) * sprd};
+        spawns.push_back(BloodSpawn(at, dir * sp, b.bleedMat, false, 0, 0));
+      }
+    }
+  }
   return true;
+}
+
+Vec3 DebrisSystem::BodyWoundWorld(uint32_t i) const {
+  if (i >= bodies_.size()) return Vec3{};
+  const Body& b = bodies_[i];
+  return b.xf.pos + QuatRot(b.xf.quat, b.wound.local);
+}
+
+bool DebrisSystem::WoundBody(uint64_t handle, Vec3 woundW, float budget,
+                             int gushTicks) {
+  if (!phys_) return false;
+  for (Body& b : bodies_)
+    if (b.handle == handle) {
+      if (b.bleedMat == 0) return false;
+      phys_->GetTransform(b.handle, b.xf);
+      ArmWound(b, woundW, Vec3{0, 1, 0}, budget, gushTicks);
+      return true;
+    }
+  return false;
+}
+
+void DebrisSystem::ArmWound(Body& b, Vec3 woundW, Vec3 dirW, float budget,
+                            int gushTicks) const {
+  if (b.voxels.empty()) return;
+  const float ps = (float)std::max(1u, b.physScale);
+  const float qi[4] = {-b.xf.quat[0], -b.xf.quat[1], -b.xf.quat[2], b.xf.quat[3]};
+  const Vec3 pl = QuatRot(qi, woundW - b.xf.pos) * ps;  // collider units
+  // The wound sits ON the body: its voxel nearest the cut, so a piece that
+  // was split off far from the cut's centroid still bleeds from its own end
+  // of it rather than from a point in mid-air. One pass; hit ticks only.
+  float best = 1e30f;
+  Vec3 bestC = pl, centroid{};
+  for (const DebrisVoxel& v : b.voxels) {
+    const Vec3 c{(float)v.x + 0.5f, (float)v.y + 0.5f, (float)v.z + 0.5f};
+    centroid += c;
+    const Vec3 d = c - pl;
+    const float d2 = d.dot(d);
+    if (d2 < best) { best = d2; bestC = c; }
+  }
+  centroid = centroid * (1.0f / (float)b.voxels.size());
+  b.wound.open = true;
+  b.wound.local = bestC * (1.0f / ps);
+  // Blood leaves outward through the wound: from the piece's own centre out
+  // through the cut, tilted up so the spray lands on something (the same
+  // construction Mob::Sever uses for the stump). `dirW` only breaks a tie.
+  Vec3 out = (bestC - centroid) * (1.0f / ps);
+  if (out.len() < 0.5f) out = dirW;
+  float len = out.len();
+  out = len > 1e-3f ? out * (1.0f / len) : Vec3{0, 1, 0};
+  out.y += 0.5f;
+  len = out.len();
+  b.wound.dir = QuatRot(qi, len > 1e-3f ? out * (1.0f / len) : Vec3{0, 1, 0});
+  b.wound.budget = AddBleedBudget(b.wound.budget, budget);
+  b.wound.gushTicks = std::max(b.wound.gushTicks, gushTicks);
+}
+
+void DebrisSystem::BleedBodies(uint32_t tick, World& world,
+                               std::vector<ParticleSpawn>& spawns) {
+  if (!phys_ || bodies_.empty()) return;
+  const auto& gore = CurrentTuning().gore;
+  const int ms = std::max(2, gore.microScale);
+  int drips = 0;  // gore.bleedOpsPerTick bounds the corpses' drips too
+  for (Body& b : bodies_) {
+    BodyWound& w = b.wound;
+    if (!w.open) continue;
+    if (b.bleedMat == 0 || (w.gushTicks <= 0 && w.budget < 1.0f)) {
+      w.open = false;  // paid out: a corpse does not pump
+      continue;
+    }
+    phys_->GetTransform(b.handle, b.xf);
+    const Vec3 at = b.xf.pos + QuatRot(b.xf.quat, w.local);
+    const Vec3 axis = QuatRot(b.xf.quat, w.dir);
+    if (!world.CellInWindow({(int)std::floor(at.x), (int)std::floor(at.y),
+                             (int)std::floor(at.z)}))
+      continue;  // streamed out: the wound waits
+
+    // ---- the dismemberment gout: front-loaded, every tick (Mob::BleedTick)
+    if (w.gushTicks > 0) {
+      const int decay = std::max(1, gore.severDecayTicks);
+      const float frac = (float)w.gushTicks / (float)decay;
+      const int want = (int)std::lround(2.0f * (float)gore.severSpray * frac /
+                                        (float)decay);
+      for (int k = 0; k < want; k++) {
+        if (spawns.size() >= kMaxParticleSpawnsPerTick) break;
+        const uint32_t h = rng::Hash3(b.serial * 2654435761u, tick,
+                                      (uint32_t)k * 0x9E3779B9u);
+        const float cone = gore.severSprayCone;
+        Vec3 dir{axis.x + rng::SignedUnit(h) * cone,
+                 axis.y + rng::SignedUnit(rng::Pcg(h ^ 0x51A17u)) * cone,
+                 axis.z + rng::SignedUnit(rng::Pcg(h ^ 0xB0011u)) * cone};
+        const float sp = gore.severSpraySpeed *
+                         (0.75f + 0.5f * rng::Unit01(rng::Pcg(h ^ 0x1234u)));
+        spawns.push_back(BloodSpawn(at, dir * sp, b.bleedMat, true,
+                                    gore.microLifeTicks, ms));
+      }
+      w.gushTicks--;
+    }
+
+    // ---- the drip: one whole voxel per gore.bleedDripTicks, and its spray
+    if (w.budget < 1.0f || drips >= gore.bleedOpsPerTick) continue;
+    if (tick % (uint32_t)std::max(1, gore.bleedDripTicks) != 0) continue;
+    {
+      // A body is not in the grid, so the drop is a ballistic voxel released
+      // just outside the wound, drifting out along it; it lands wherever the
+      // corpse is lying. That is the corpse's puddle.
+      const uint32_t h = rng::Hash3(b.serial * 40503u, tick ^ 0xB1005u, 0u);
+      Vec3 dir{axis.x + rng::SignedUnit(h) * 0.3f, axis.y,
+               axis.z + rng::SignedUnit(rng::Pcg(h ^ 0x77u)) * 0.3f};
+      spawns.push_back(BloodSpawn(at + axis * 0.6f, dir * 1.5f, b.bleedMat,
+                                  false, 0, 0));
+      w.budget -= 1.0f;
+      drips++;
+    }
+    const int sprayN = std::max(0, (int)std::lround(gore.bleedSprayPerDrip));
+    for (int k = 0; k < sprayN; k++) {
+      if (spawns.size() >= kMaxParticleSpawnsPerTick) break;
+      const uint32_t h = rng::Hash3(b.serial * 40503u, tick ^ 0xB1005u,
+                                    (uint32_t)(k + 1) * 2246822519u);
+      const float cone = gore.bleedSprayCone;
+      Vec3 dir{rng::SignedUnit(h) * cone,
+               0.6f + 0.4f * std::fabs(rng::SignedUnit(rng::Pcg(h ^ 0x77u))),
+               rng::SignedUnit(rng::Pcg(h ^ 0xC0FFEEu)) * cone};
+      spawns.push_back(BloodSpawn(at, dir * gore.bleedSpraySpeed, b.bleedMat,
+                                  true, gore.microLifeTicks, ms));
+    }
+  }
 }
 
 void DebrisSystem::DamageBodiesRadial(Vec3 centerVoxel, float radiusVoxels,

@@ -225,6 +225,15 @@ struct MobDef {
   // (BurnLimbView::Set says so), so a stain carried as paint would be
   // invisible on exactly the clothed limbs it matters most on.
   uint32_t woundMat = 0;
+  // WHICH MATERIALS ARE TISSUE, per material id: the ones a wound soaks. A
+  // material is tissue when its `rubble` is this creature's blood (skin, flesh
+  // and muscle all crumble to blood in materials.json; bone crumbles to dust),
+  // or when it already is the wound material. Bone is left as bone so the hole
+  // a blade opens shows it through the blood around it, instead of turning
+  // into one more red voxel. Empty when nothing qualifies (a mob whose blood
+  // no material crumbles to), which StainWound reads as "soak everything",
+  // the pre-anatomy behaviour.
+  std::vector<uint8_t> tissue;
   float bleedPerDamage = 1.5f; // wound budget voxels per point of damage
   float speed = 4.0f;          // voxels/sec walk speed
   // Micro-voxel AUTHORING scale (docs/PLAN_voxel_editor.md §C): 1 = the legacy
@@ -1963,6 +1972,11 @@ class MobSystem {
   // "cooked, then burnt" is visible as counts moving between slots rather than
   // as a state nobody can see.
   uint32_t LimbMaterialCount(uint64_t mobId, int limbIndex, uint32_t mat) const;
+  // The limb's AUTHORITATIVE lattice (the skin when it is finer, else the
+  // collider re-expressed as PrefabVoxels), copied out for a gate that has
+  // to ask WHICH voxels changed rather than how many (corpse-bleed asks where
+  // the blood soak landed). Empty when there is no such limb.
+  std::vector<PrefabVoxel> LimbLattice(uint64_t mobId, int limbIndex) const;
   // ---- blood is health; burns cap it (Mob::TotalHp and friends, by id) ----
   // -1 for an unknown id, so a gate cannot mistake "no such creature" for
   // "dead", which is the one confusion these readouts exist to prevent.

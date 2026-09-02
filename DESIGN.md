@@ -2439,6 +2439,75 @@ to be a world fire — direct ignition only lights surface voxels, and once the
 surface has charred the layer under it never sees three hot faces; measured,
 1500 ticks of forced ignition on every limb plateaued at 14% burnt.
 
+### A wound is seen, and a corpse bleeds from where it is cut (2026-09-02; `Mob::StainWound`, `DebrisSystem::BodyWound`)
+
+Two more pictures that were not yet mechanisms, both found the moment the
+human had an inside.
+
+**The soak follows what is exposed.** `StainWound` swapped a hash fraction of
+EVERY voxel in a sphere for blood, buried or not, bone included. With a real
+interior that read as a red sphere with the anatomy under it erased, and the
+walls of the hole — the one place a wound is actually looked at — were only as
+red as the rim. Now the pass builds an occupancy bitmap over the limb's box on
+the hit tick (the same O(voxels) bound it already paid) and asks each voxel
+whether it has an empty 6-neighbour in its own lattice. Exposed voxels (the
+hole's walls and the skin round its mouth) take `gore.woundStainSurface`
+(0.9), buried ones `gore.woundStainDensity` (0.3), both falling off as
+`1 - t²` from a centre half a cut-depth in. And **bone is never soaked**:
+`MobDef::tissue` marks, per material id, what crumbles to this creature's
+blood (`rubble` in `materials.json` — skin, flesh and muscle do; bone crumbles
+to dust), and `StainWound` leaves the rest alone, so a hole that reaches bone
+shows bone through a splash of blood instead of one more red voxel. A mob
+whose blood no material crumbles to gets the pre-anatomy soak-everything.
+Radius up 0.6 → 0.9 world voxels so the splash reaches the skin around the
+mouth of the cut.
+
+**Every dismembered body bleeds from its own end of the cut.** Bleeding lived
+on `MobLimb` only. A corpse carve emitted a one-shot puff of ≤60 droplets and
+≤8 voxels and remembered nothing; a decapitation went straight to `Die()`,
+which handed every limb to the debris system as it stood — the torso's neck
+was never armed, the head stayed jointed to the corpse, and the sum was "an
+amputated head leads to no bleeding". Now a debris body carries a
+`DebrisSystem::BodyWound` — a body-local point and direction (world-voxel
+units in the body frame, the same convention as `MobLimb::woundLocal`), a drip
+budget under `gore.bleedBudgetCap`, and a gout countdown — and
+`DebrisSystem::BleedBodies` (in `PreTick`, after `BurnBodies`) drains it every
+tick from wherever that body has rolled to, on the live wound's own tuning:
+the front-loaded gout over `severDecayTicks`, one whole voxel per
+`bleedDripTicks` under `bleedOpsPerTick` (a ballistic voxel released just
+outside the wound, since a body is not in the grid), and `bleedSprayPerDrip`
+droplets with it. Three doors arm one:
+
+- **`DamageBody`** (a sword, a laser or a blast on a corpse): the cut's
+  centroid is captured in world space BEFORE the rebase, and after every frame
+  is final the wound is opened on the surviving body AND on each fragment
+  `ShatterBody` split off, each at its own voxel nearest the cut
+  (`ArmWound`) — the owner's spec in one line, *blood should come from each
+  of the rigidbodies that are dismembered and their locations*. Budget is
+  `gore.corpseBleedPerVoxel` per world voxel carved; a cut that made a
+  fragment is an amputation and adds what `Sever` gives one: the gout,
+  `severStumpBudget`, and a throw of `severVoxels` whole voxels from the cut.
+- **`Sever` on a vital, severable limb.** It no longer short-circuits to
+  `Die()`: the head leaves like any severed limb (its own body, `DetachLimb`),
+  the piece's wound is armed at its own neck (`anchorLimb`, blood leaving from
+  the piece's centre out through the joint), the torso's stump is armed
+  exactly as for an arm, and only THEN does `Die()` run. `DetachLimb` and
+  `Die` both hand the limb's wound over through `AdoptBody(…, WoundOf(limb))`,
+  and `DetachLimb` zeroes it on the husk entry — left there it dripped from
+  `BleedTick`'s bodyless fallback at the rest-pose anchor of a limb no longer
+  on the creature. The thrown voxels of a fatal sever are not charged to
+  `DrainBlood` (the creature is dying of the limb, and the charge would
+  rename the cause).
+- **`EmitCarvedFragment`** (a gobbet cut off a live limb): `WoundBody` opens a
+  small drip on the lump's face nearest the limb it came off. No gout.
+
+A corpse does not pump: nothing tops a `BodyWound` up (`stumpBleedsOpen` is a
+live creature's clock, bounded by its hp), and a wound that has paid out
+closes. The wound is transient — not in `SaveState`, and a body that settles
+back into the grid takes it with it. Rule 2: `bleedOpsPerTick` bounds the
+corpses' drips as it does the creatures', the gout shares
+`kMaxParticleSpawnsPerTick`, and an idle body costs two field reads.
+
 ### What is under the skin (2026-09-02; `assets/editor/anatomy.js`, sidecar `anatomy`, `scripts/anatomize_mob.mjs`)
 
 Every limb was skin all the way through. A cut face showed skin, a burn-through
@@ -2457,10 +2526,21 @@ settle-back all read the voxel's own material. So the interior is baked into
 concept. What was added:
 
 - **A depth field.** `unionDepth` measures depth-from-surface over the UNION
-  of every limb at its prefab offset — not per limb — so the joint faces
-  where a thigh meets the hips read as interior and a severed limb shows bone
-  and muscle on its cut face instead of a skin cap. Depth 0 is any voxel with
-  an empty 6-neighbour; depth *n* is *n* 6-connected steps in.
+  of every limb at its prefab offset, EXCEPT that a limb's own faces are
+  always depth 0. The first version measured the union alone, so the joint
+  faces where a thigh meets the hips read as interior — which put vertebrae
+  on the top of the neck and a shoulder socket on the arm, on show the moment
+  the rig turned a head or raised an arm (2026-09-02, the owner's first
+  complaint). Now a voxel with an empty 6-neighbour in its OWN model is
+  surface (every limb is skin all the way round); everything under it keeps
+  the union's depth, applied after the BFS rather than seeded into it, so the
+  bone core still runs through the joint (a neck five voxels tall measured
+  per limb would be skin / flesh / muscle / flesh / skin). A severed joint
+  shows its skin cap and the blood the wound soaks into it, not an anatomy
+  plate; a cut through the middle of a limb shows the schedule. `keep` on the
+  skin layer repairs a kept voxel made of an interior material back to skin
+  (that is what the old bake left on every joint face), so re-applying the
+  recipe migrated `human.vox` in place.
 - **A recipe, in the sidecar, by name.** `human.json` → `"anatomy"`: an
   outermost-first list of `{material, depth}` layers with an open-ended core,
   optional per-limb overrides (`limbs.head`), `garments` (surface voxels that
@@ -2499,12 +2579,13 @@ and muscle in the world grid; the burn gate's body census counts flesh and
 muscle as body and as charrable flesh (bone in neither). What it does NOT do
 yet, stated so nobody infers it from a screenshot: hp per carved voxel is
 still pure volume (`kCarveDamagePerVolume`) — bone costs what skin costs;
-`StainWound` soaks any material inside its sphere, bone included; and
 severing (`Sever`) still does nothing to the cross-section, which is now
-exactly why it needs nothing.
+exactly why it needs nothing. (`StainWound` stopped soaking bone the same
+day — see "A wound is seen" above.)
 
 Verified by `node scripts/test_anatomy.mjs` (the depth field on a two-model
-block whose seam must read interior, the schedule, garments, speckle,
+block whose seam faces must read surface and the row under them union
+depth, a kept bone face repaired to skin, the schedule, garments, speckle,
 idempotence, an unknown material refused; then the committed `human.vox`
 must match its own recipe, every limb must have a bone core, and no paint
 may sit below depth 0) and by the existing `mob-burn` / wound / armour gates
