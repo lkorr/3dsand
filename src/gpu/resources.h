@@ -52,6 +52,17 @@ std::string ShaderConstantPrelude();
 void SetFragmentStoresAvailable(bool available);
 bool FragmentStoresAvailable();
 
+// RENDER_STATS — raymarch.wgsl's per-call-site step counters (World::
+// renderStats, perfnodes.h's `rm*` counters). A prelude CONST, not a uniform
+// flag, so the shipping shader compiles the counters out entirely: trace() is
+// register-footprint bound and a live "if (statsOn)" would keep the
+// accumulators resident whether or not they were read. Set from main.cpp when
+// --telemetry or --perf is on, BEFORE the first LoadShader; default false so
+// every other path compiles the shipping variant. Flipping it after pipelines
+// exist needs the F5 reload path, exactly like a TUNE_* constant.
+void SetRenderStatsEnabled(bool on);
+bool RenderStatsEnabled();
+
 // Loads assets/shaders/common.wgsl + the named file, concatenated behind the
 // generated world-constant + tuning preludes, and compiles the result. Returns
 // an invalid module on read failure.

@@ -679,6 +679,44 @@ void Recorder::CopyTracked(pass::Buf srcId, Buffer* src, uint64_t srcOffset, Buf
   if (dst->mapped) hostWritten_.push_back(dst);
 }
 
+void Recorder::CopyRenderWritten(Buffer* src, uint64_t srcOffset, Buffer* dst,
+                                 uint64_t dstOffset, uint64_t size) {
+  if (!src || !src->buf || !dst || !dst->buf) return;
+  // Declare the fragment-stage write. Find-or-create the extras entry the same
+  // way TouchExtra does, but SET the state rather than derive a barrier from
+  // it: the write already happened inside the render pass, where no barrier
+  // could have been placed, and BeginRendering's flush ordered everything
+  // earlier in this recording ahead of it. Storage READ is in the access mask
+  // because an atomicAdd is a read-modify-write.
+  BufState* s = nullptr;
+  for (auto& e : extra_)
+    if (e.first == src) s = &e.second;
+  if (!s) {
+    extra_.push_back({src, BufState{}});
+    s = &extra_.back().second;
+  }
+  s->lastWriteStage = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+  s->lastWriteAccess =
+      VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+  s->readStagesSince = 0;
+  s->readAccessSince = 0;
+  // From here it is an ordinary tracked transfer read of an extras buffer.
+  TouchExtra(src, pass::Acc::TransferRead);
+  if (mode_ == BarrierMode::Sledgehammer) {
+    pending_.clear();
+    Sledgehammer();
+  } else {
+    FlushPending(/*global=*/false);
+  }
+  VkBufferCopy region{};
+  region.srcOffset = srcOffset;
+  region.dstOffset = dstOffset;
+  region.size = size;
+  be_.Fns().CmdCopyBuffer(cmd_, src->buf, dst->buf, 1, &region);
+  stats_.copies++;
+  if (dst->mapped) hostWritten_.push_back(dst);
+}
+
 void Recorder::FillTracked(pass::Buf id, Buffer* dst) {
   Buffer* b = dst ? dst : bind_.buffers[(int)id];
   if (!b || !b->buf) return;

@@ -310,6 +310,10 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         // then this entry is bound but never written.
         entry(14, T::Storage, S::Fragment),  // shadowCache
         entry(15, T::Storage, S::Fragment),  // shadowReq (the append list)
+        // RENDER_STATS step counters (world.h kRenderStat*). Bound always so
+        // the layout is one layout; written only when the prelude const is
+        // true, and never by the shipping shader.
+        entry(16, T::Storage, S::Fragment),  // renderStats
     };
     renderBGL_ = device.CreateBindGroupLayout(entries, std::size(entries));
 
@@ -484,6 +488,7 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         b(13, world_->actVoxViz),
         b(14, world_->shadowCache),
         b(15, world_->shadowReq),
+        b(16, world_->renderStats),
     };
     renderBG_ = device.CreateBindGroup(renderBGL_, entries, std::size(entries), "renderBG");
   }

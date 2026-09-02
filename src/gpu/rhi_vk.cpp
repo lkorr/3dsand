@@ -225,6 +225,10 @@ struct VkrEncoder final : CommandEncoderImpl {
                    const Buffer& dst, uint64_t dstOffset, uint64_t size) override {
     rec->CopyTracked(srcId, NB(src), srcOffset, NB(dst), dstOffset, size);
   }
+  void CopyRenderWritten(const Buffer& src, uint64_t srcOffset, const Buffer& dst,
+                         uint64_t dstOffset, uint64_t size) override {
+    rec->CopyRenderWritten(NB(src), srcOffset, NB(dst), dstOffset, size);
+  }
   void FillTracked(pass::Buf id, const Buffer& b) override {
     rec->FillTracked(id, NB(b));
   }

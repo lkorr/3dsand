@@ -594,6 +594,28 @@ constexpr uint32_t kShadowReqWords = 4;         // key, bucket, packed cell, pac
 // patch has no opinion, so the failure mode is a shimmer of lit patches that
 // never settles. The buffer costs memory only; the resolve pass is sized by
 // the count actually requested.
+// ---- RENDER_STATS: the raymarch's step counters (measurement only) ---------
+// A tiny buffer of atomic<u32> the raymarch fragment shader adds into when the
+// RENDER_STATS prelude const is true (--telemetry / --perf; gpu/resources.h).
+// Layout: kRenderStatStripes rows of kRenderStatSlots counters. STRIPED so the
+// whole screen is not contending on sixteen addresses: a pixel adds into the
+// stripe its screen position hashes to, and the CPU sums the stripes. The
+// shader records on a 1-in-16 pixel sample (every fourth pixel on both axes)
+// and the CPU scales by 16, so a slot reads as a per-frame total. Slot 0 is
+// the sampled-pixel count (the denominator); slots 1.. are perfnodes.h's
+// PerfCounter::RmPrimarySteps.. in order — raymarch.wgsl's RS_* names are
+// that same order and the page's labels come from kPerfCounters, so the ONE
+// place the meaning of a slot is written is the counter table.
+// MONOTONIC: never cleared. The CPU differences consecutive readbacks in u32
+// arithmetic, which removes the clear (and its barrier) from the frame path
+// and makes a missed readback a gap rather than a corruption.
+// Render-only, never hashed, never saved; the buffer exists whether or not the
+// const is true so the render bind group has one layout.
+constexpr uint32_t kRenderStatSlots = 16;
+constexpr uint32_t kRenderStatStripes = 64;
+constexpr uint32_t kRenderStatWords = kRenderStatSlots * kRenderStatStripes;
+constexpr uint64_t kRenderStatBytes = (uint64_t)kRenderStatWords * 4;
+constexpr uint32_t kRenderStatSample = 16;   // 1 in 16 pixels; the CPU's scale
 constexpr uint32_t kShadowReqCapShift = 20;
 constexpr uint32_t kShadowReqCap = 1u << kShadowReqCapShift;  // 1,048,576 per frame
 constexpr uint64_t kShadowReqBytes =
@@ -2418,6 +2440,10 @@ class World {
   // costs one frame of stale shadows, which is the same thing a teleport costs.
   rhi::Buffer shadowCache;    // kShadowCacheBuckets * 2 u32 (8 MiB)
   rhi::Buffer shadowReq;      // header + kShadowReqCap * 4 u32 request records
+  // The second buffer a fragment shader writes, and the same argument applies:
+  // measurement-only counters (kRenderStat* above), read back by the telemetry
+  // path through rhi::CommandEncoder::CopyRenderWritten. 4 KiB.
+  rhi::Buffer renderStats;    // kRenderStatWords atomic<u32>
   // The resolve's dispatch size, in the two-buffer stage+copy shape argsStage /
   // dispatchArgs and fluidArgsStage / fluidDispatchArgs already use: the
   // compute pass WRITES the stage (so it must be bindable storage) and the

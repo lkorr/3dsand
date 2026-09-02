@@ -45,6 +45,61 @@
 @group(0) @binding(14) var<storage, read_write> shadowCache : array<atomic<u32>>;
 @group(0) @binding(15) var<storage, read_write> shadowReq : array<atomic<u32>>;
 
+// ---- RENDER_STATS: where inside this shader the frame went ------------------
+//
+// The GPU timestamp around the world draw says the raymarch cost N ms and
+// nothing else — every trace in this file is ONE fragment shader and cannot be
+// timestamped apart. These counters are the attribution inside it: each trace
+// call site counts its own DDA steps, each shading path counts its pixels, and
+// the Performance tab turns the shares into an estimated split of that N ms
+// (perfnodes.h `rm*`; the exact per-feature ms is --render-budget).
+//
+// A prelude CONST, so the shipping shader compiles all of it out: with
+// RENDER_STATS false every rsAdd() is dead, gRs is unreferenced and the driver
+// drops it — trace() is register-footprint bound (this file's header) and a
+// live flag would keep the accumulators resident on every pixel.
+//
+// COST WHEN ON. Counting is per pixel and in registers; only the FLUSH at the
+// bottom of fs() touches memory, and only on a 1-in-16 pixel sample (every
+// fourth pixel on both axes), striped across RENDER_STATS_STRIPES rows by
+// screen position so 130k pixels are not serialised on sixteen addresses.
+// ~2M atomics per 1080p frame, spread over 1,024 words. The CPU sums the
+// stripes and scales by 16 (world.h kRenderStatSample).
+//
+// MONOTONIC: never cleared. The CPU differences consecutive readbacks in u32
+// arithmetic, so a wrap is harmless and a missed frame is a gap, not garbage.
+//
+// SLOT ORDER IS THE CONTRACT with perfnodes.h's PerfCounter::Rm* — slot 0 is
+// the sampled-pixel denominator, slots 1.. are RmPrimarySteps.. in order.
+@group(0) @binding(16) var<storage, read_write> renderStats : array<atomic<u32>>;
+const RS_PX : u32 = 0u;          // sampled pixels (denominator)
+const RS_PRIMARY : u32 = 1u;     // trace() steps from fs's camera ray
+const RS_MEDIA : u32 = 2u;       // cells that accumulated media tau in trace()
+const RS_SHADOW : u32 = 3u;      // trace() steps from sunShadowAt
+const RS_SC_TAPS : u32 = 4u;     // shadowCached() calls (pixels served by the cache)
+const RS_SC_REQS : u32 = 5u;     // shadowAppendRequest() calls (misses)
+const RS_FAR : u32 = 6u;         // traceFar steps
+const RS_FAR_SHADOW : u32 = 7u;  // farShadowed steps
+const RS_MICRO : u32 = 8u;       // traceMicro + traceStrands steps
+const RS_REFLECT : u32 = 9u;     // trace() steps from reflection / refraction
+const RS_FLUID : u32 = 10u;      // MPM surface march steps (smooth + blocky + refine)
+const RS_GODRAY : u32 = 11u;     // godRays samples + their shadow trace steps
+const RS_PX_SKY : u32 = 12u;     // pixels that hit nothing, near or far
+const RS_PX_FAR : u32 = 13u;     // pixels resolved by the far cascades
+const RS_PX_WATER : u32 = 14u;   // pixels through shadeWater
+const RS_PX_SUB : u32 = 15u;     // pixels through shadeSubmerged
+var<private> gRs : array<u32, 16>;
+// Whether THIS pixel is on the sample. Set once at the top of fs(); every
+// rsAdd is predicated on it so the 15-in-16 unsampled pixels do no counting.
+var<private> gRsOn : bool = false;
+// trace()'s own step count. A call site zeroes it, calls, and bills the delta
+// to its slot — cheaper than a parameter through a function that is inlined
+// into six places and whose signature is load-bearing for register pressure.
+var<private> gRsTraceSteps : u32 = 0u;
+fn rsAdd(slot : u32, n : u32) {
+  if (RENDER_STATS && gRsOn) { gRs[slot] += n; }
+}
+
 // Is the cache compiled in at all? Both halves must say yes:
 //   SHADOW_CACHE_AVAILABLE — the device enabled fragmentStoresAndAtomics
 //                            (gpu/resources.h; a capability)
@@ -1049,6 +1104,7 @@ fn traceMicro(b : MicroBrick, cell : vec3<i32>, entry : vec3f, rd : vec3f,
   // jitter plus up to two sub-voxels of wind shear on the entry point.
   let maxSteps = 3 * S + 8;
   for (var i = 0; i < maxSteps; i++) {
+    rsAdd(RS_MICRO, 1u);
     if (c.x >= 0 && c.y >= 0 && c.z >= 0 && c.x < S && c.y < S && c.z < S) {
       let m = microVoxAt(b, frame, c);
       if (m != 0u) {
@@ -1180,6 +1236,7 @@ fn traceStrands(b : MicroBrick, cell : vec3<i32>, entry : vec3f, rd : vec3f)
 
   var bestT = 1e9;
   for (var s = 0u; s < count; s++) {
+    rsAdd(RS_MICRO, 1u);
     let hs = hash3(colH, s, 0x57A4Du);
     // This strand's own height: a fraction of the plant, so a stand's top is
     // ragged per-blade rather than sheared flat at the column height.
@@ -1456,6 +1513,7 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool) -> Hit {
   for (var i = 0; i < 4096; i++) {
     if (i >= maxSteps) { break; }
     if (any(cell < wloI) || any(cell >= wloHi)) { break; }
+    if (RENDER_STATS && gRsOn) { gRsTraceSteps += 1u; }
 
     let cc = cell >> vec3<u32>(CHUNK_SHIFT);
     if (any(cc != cchC)) {
@@ -1881,6 +1939,7 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool) -> Hit {
       }
       let dTau = seg * cellOp;
       out.mediaTau += dTau;
+      rsAdd(RS_MEDIA, 1u);
       out.mediaTint += cellTint * dTau;
       if (cellLiq == 0.0) {
         gasTau += dTau;
@@ -2050,6 +2109,7 @@ fn traceFar(ro : vec3f, rdIn : vec3f, tStart : f32, px : vec2f) -> FarHit {
     var tCur = t;
 
     for (var i = 0; i < TUNE_FAR_STEPS; i++) {
+      rsAdd(RS_FAR, 1u);
       if (!farInBox(cell, org)) { break; }
       if (farOcc[farOccIndex(level, cell)] == 0u) {
         // empty level chunk: jump to its exit face (same seam-safe jump as
@@ -2190,6 +2250,7 @@ fn farShadowed(level : u32, roFine : vec3f) -> bool {
   var tCur = 0.0;
   let steps = farShadowSteps(level);
   for (var i = 0; i < steps; i++) {
+    rsAdd(RS_FAR_SHADOW, 1u);
     if (!farInBox(cell, org)) { return false; }
     if (farOcc[farOccIndex(level, cell)] == 0u) {
       // empty level chunk: jump to its exit face (seam-safe, as in traceFar)
@@ -2539,7 +2600,9 @@ fn sunShadowAt(hp : vec3f, n : vec3f, px : vec2f, camDistFine : f32) -> f32 {
     if (farShadowed(lvl, hp + off)) { return TUNE_SHADOW_FAR_LIFT; }
     return 1.0;
   }
+  if (RENDER_STATS) { gRsTraceSteps = 0u; }
   let s = trace(hp + n * TUNE_SHADOW_BIAS, keyLightDir(), TUNE_SHADOW_STEPS, false);
+  rsAdd(RS_SHADOW, gRsTraceSteps);
   if (!s.hit) { return 1.0; }
   // Distance from receiver to blocker, in metres. Near blockers (a voxel
   // resting on the ground) keep a hard, dark contact shadow; distant ones (a
@@ -2708,6 +2771,7 @@ fn shadowSlotRead(packedCell : u32, packedSub : u32, curFrame : u32) -> vec2f {
 }
 
 fn shadowAppendRequest(key : u32, slot : u32, packedCell : u32, packedSub : u32) {
+  rsAdd(RS_SC_REQS, 1u);
   let n = atomicAdd(&shadowReq[0], 1u);
   // Over the cap the patch is simply not registered: it misses next frame and
   // blends from its neighbours. Counted in prepare()'s stats words, never fatal
@@ -2748,6 +2812,7 @@ fn shadowAppendRequest(key : u32, slot : u32, packedCell : u32, packedSub : u32)
 // `camDistFine` is the receiver's camera distance in fine voxels (h.t).
 fn shadowCached(hp : vec3f, cell : vec3<i32>, axis : i32, sgn : f32,
                 camDistFine : f32) -> f32 {
+  rsAdd(RS_SC_TAPS, 1u);
   let subdiv = clamp(R.shadowSubdiv, 1u, SHADOW_SUBDIV_MAX);
   // The DDA reports sgn = sign(rd[axis]), so the outward face normal points the
   // other way: a ray travelling -x enters through the +x face.
@@ -3291,7 +3356,9 @@ fn traceReflection(p : vec3f, n : vec3f, rd : vec3f) -> vec3f {
   // a reflection grazing INTO dense canopy, where every step is a real voxel
   // step and the skip never fires. Media is off (`wantMedia = false`) so
   // reflected rays skip on the blocker count and smoke costs them nothing.
+  if (RENDER_STATS) { gRsTraceSteps = 0u; }
   let h = trace(p + n * 0.05, rr, TUNE_REFLECTION_STEPS, false);
+  rsAdd(RS_REFLECT, gRsTraceSteps);
   if (!h.hit) { return reflectionSky(rr); }
 
   // Reflected geometry is seen across the water plus its own distance, so it
@@ -3537,6 +3604,7 @@ fn godRays(ro : vec3f, rd : vec3f, maxDistVox : f32, px : vec2f) -> f32 {
 
   var acc = 0.0;
   for (var i = 0; i < steps; i++) {
+    rsAdd(RS_GODRAY, 1u);
     let t = (f32(i) + jitter) * dt;
     let p = ro + rd * t;
     // Is this sample still inside water? A view ray under water can leave the
@@ -3553,7 +3621,9 @@ fn godRays(ro : vec3f, rd : vec3f, maxDistVox : f32, px : vec2f) -> f32 {
     // Occlusion: can the sun reach this point? Short budget on purpose — this
     // ray only has to find the surface just above or a nearby blocker, and the
     // chunk-skip in trace() covers open water in a few steps.
+    if (RENDER_STATS) { gRsTraceSteps = 0u; }
     let s = trace(p, kd, TUNE_GODRAY_SHADOW_STEPS, false);
+    rsAdd(RS_GODRAY, gRsTraceSteps);
     if (s.hit) { continue; }
 
     // Reaching here means sunlight lands on this sample. Weight it by the
@@ -5738,6 +5808,7 @@ fn fluidMarch(ro : vec3f, rdIn : vec3f, tMax : f32) -> FluidHit {
     // close. A budget miss renders no surface for one frame of one pixel —
     // invisible — rather than a hitch.
     for (var i = 0; i < 320; i++) {
+      rsAdd(RS_FLUID, 1u);
       if (t >= tEnd) { break; }
       let p = ro + rd * t;
       let c = vec3<i32>(floor(p));
@@ -5937,6 +6008,7 @@ fn fluidRefineSubCell(ro : vec3f, rd : vec3f, inv : vec3f, tFrom : f32,
   var tNext = (bound - ro) * inv;
   let tStep = abs(inv) * invSub;
   for (var i = 0; i < FLUID_REFINE_STEPS; i++) {
+    rsAdd(RS_FLUID, 1u);
     if (t > tTo) { break; }
     if (fluidFieldAt((vec3f(q) + vec3f(0.5)) * invSub) >= iso) {
       let e = fluidSubCellEntry(ro, rd, inv, q, invSub);
@@ -6015,6 +6087,7 @@ fn fluidMarchBlocky(ro : vec3f, rdIn : vec3f, tMax : f32,
     var heldYMask : u32 = 0u;
 
     for (var i = 0; i < FLUID_BLOCKY_STEPS; i++) {
+      rsAdd(RS_FLUID, 1u);
       if (t >= tEnd) { break; }
       let p = ro + rd * t;
       let c = vec3<i32>(floor(p));
@@ -6094,7 +6167,9 @@ fn fluidMarchBlocky(ro : vec3f, rdIn : vec3f, tMax : f32,
 // film on dry rock (column ~1 voxel, bed metres away) is unchanged.
 fn traceRefraction(p : vec3f, rdr : vec3f, waterVox : f32,
                    fallback : vec3f) -> vec3f {
+  if (RENDER_STATS) { gRsTraceSteps = 0u; }
   let h = trace(p, rdr, TUNE_REFLECTION_STEPS, false);
+  rsAdd(RS_REFLECT, gRsTraceSteps);
   if (!h.hit) {
     if (rdr.y > 0.05) { return reflectionSky(rdr); }
     return fallback;
@@ -6398,12 +6473,20 @@ fn shadeMpmFluid(ro : vec3f, rd : vec3f, fh : FluidHit, caMat : u32,
 
 @fragment
 fn fs(in : VSOut) -> FSOut {
+  if (RENDER_STATS) {
+    // The 1-in-16 sample: every fourth pixel on both axes. Decided once here;
+    // rsAdd() reads the flag on every count.
+    let spx = vec2<u32>(in.pos.xy);
+    gRsOn = (spx.x & 3u) == 0u && (spx.y & 3u) == 0u;
+  }
   let ndc = in.uv;
   let rd = normalize(R.camFwd
                    + R.camRight * (ndc.x * R.tanHalfFov * R.aspect)
                    + R.camUp    * (ndc.y * R.tanHalfFov));
 
+  if (RENDER_STATS) { gRsTraceSteps = 0u; }
   let h = trace(R.camPos, rd, TUNE_PRIMARY_STEPS, true);
+  rsAdd(RS_PRIMARY, gRsTraceSteps);
 
   // Rays that leave the window without a surface hit (and weren't absorbed by
   // media) continue into the far-field cascades from the window's exit point.
@@ -6493,6 +6576,10 @@ fn fs(in : VSOut) -> FSOut {
   // the side that is wrong least often. Ordering geometry INSIDE a plume still
   // needs order-independent transparency.
   var tDepth = -1.0;
+  if (RENDER_STATS && gRsOn) {
+    if (far.hit) { gRs[RS_PX_FAR] += 1u; }
+    else if (!h.hit && !h.saturated) { gRs[RS_PX_SKY] += 1u; }
+  }
   if (h.hit || h.saturated) {
     tDepth = h.t;
   } else if (far.hit) {
@@ -6948,6 +7035,7 @@ fn fs(in : VSOut) -> FSOut {
 
       if (underwater && !mpmOwned) {
         let sawSky = !h.hit && !h.saturated && !far.hit;
+        rsAdd(RS_PX_SUB, 1u);
         color = shadeSubmerged(R.camPos, rd, lm, h.liqPath, color, in.pos.xy,
                                sawSky);
         caShadedLiquid = true;
@@ -6958,6 +7046,7 @@ fn fs(in : VSOut) -> FSOut {
         color = applyAerial(color, rd, h.liqT);
         caShadedLiquid = true;
       } else if (!mpmOwned) {
+        rsAdd(RS_PX_WATER, 1u);
         color = shadeWater(hitP, rd, lm, h.liqCell, h.liqAxis, h.liqSgn,
                            h.liqPath, max(h.mediaSurf, 0.125), color,
                            h.liqT, underwater);
@@ -7081,6 +7170,19 @@ fn fs(in : VSOut) -> FSOut {
   // because the raster body paths must compress through the SAME curve or
   // debris brightness drifts from the terrain it landed on.
   color = tonemapHdr(color);
+  // ---- RENDER_STATS flush: the only memory traffic the counters cost ----
+  // One atomicAdd per non-zero slot, for the sampled pixel only, into the
+  // stripe this pixel's screen position hashes to (see the block at the top).
+  if (RENDER_STATS && gRsOn) {
+    let fpx = vec2<u32>(in.pos.xy);
+    let stripe = ((fpx.x >> 2u) * 7u + (fpx.y >> 2u) * 13u)
+                 & (RENDER_STATS_STRIPES - 1u);
+    let base = stripe * RENDER_STATS_SLOTS;
+    atomicAdd(&renderStats[base + RS_PX], 1u);
+    for (var k = 1u; k < RENDER_STATS_SLOTS; k++) {
+      if (gRs[k] != 0u) { atomicAdd(&renderStats[base + k], gRs[k]); }
+    }
+  }
   var out : FSOut;
   out.color = vec4f(color, 1.0);
   out.depth = depth;

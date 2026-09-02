@@ -1269,12 +1269,10 @@ Run PerfRunner::Record(const Scenario& sc) {
       if (si < 0) return;   // a warmup frame: its numbers are not recorded
       PerfSample& dst = r.samples[(size_t)si];
       for (const PassSample& ps : t.LastFrame()) {
-        int node = isRender ? -2 : PerfNodeForPass(ps.name);
-        if (node == -2) {
-          // The render span bills to `raymarch`.
-          for (int n = 0; n < kPerfNodeCount; n++)
-            if (std::strcmp(kPerfNodes[n].node, "raymarch") == 0) { node = n; break; }
-        }
+        // Render spans go through kPerfRenderSpans — the same table the live
+        // path in main.cpp uses, so "render" bills to the same row on both.
+        int node = isRender ? PerfNodeForRenderSpan(ps.name)
+                            : PerfNodeForPass(ps.name);
         if (node < 0) {
           r.unattributedNs += ps.ns;
           bool seen = false;

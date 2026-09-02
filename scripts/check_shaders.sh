@@ -93,6 +93,8 @@ W_SHADOWREQSHIFT="$(cpp_const kShadowReqCapShift)"
 W_SHADOWREQHDR="$(cpp_const kShadowReqHeaderWords)"
 W_SHADOWREQW="$(cpp_const kShadowReqWords)"
 W_SHADOWSUBMAX="$(cpp_const kShadowSubdivMax)"
+W_RSSLOTS="$(cpp_const kRenderStatSlots)"
+W_RSSTRIPES="$(cpp_const kRenderStatStripes)"
 if [ -z "$W_SHADOWSHIFT" ] || [ -z "$W_SHADOWREQSHIFT" ] ||
    [ -z "$W_SHADOWREQHDR" ] || [ -z "$W_SHADOWREQW" ] ||
    [ -z "$W_SHADOWSUBMAX" ]; then
@@ -255,6 +257,9 @@ PRELUDE_TEXT="$(printf '%s\n' \
   "const SHADOW_REQ_WORDS : u32 = ${W_SHADOWREQW}u;" \
   "const SHADOW_REQ_CAP : u32 = ${W_SHADOWREQCAP}u;" \
   "const SHADOW_SUBDIV_MAX : u32 = ${W_SHADOWSUBMAX}u;" \
+  "const RENDER_STATS : bool = true;" \
+  "const RENDER_STATS_SLOTS : u32 = ${W_RSSLOTS}u;" \
+  "const RENDER_STATS_STRIPES : u32 = ${W_RSSTRIPES}u;" \
   "const LAB_SLAB_Y : i32 = ${W_LABY};" \
   "const PT_SENTINEL_BIT : u32 = ${W_PTSENT}u;" \
   "const PT_JITTER_BIT : u32 = ${W_PTJIT}u;" \

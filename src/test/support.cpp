@@ -31,7 +31,10 @@ const char* kAvatarDefName = "human";
 
 // Read-and-cleared once per frame by the telemetry path. See TakeSnapshotStalls
 // in support.h for why this exists and what a nonzero value means.
-namespace { uint32_t g_snapshotStalls = 0; }
+namespace {
+uint32_t g_snapshotStalls = 0;
+uint32_t g_readbackDeclines = 0;
+}
 
 // Time of day used by --shot, as a 0..1 fraction of the cycle (0 = midnight,
 // 0.5 = noon). Set by `--time`; see RunShots.
@@ -957,6 +960,9 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
                                    {playerChunk.x - 1, playerChunk.y - 1, playerChunk.z - 1},
                                    1 - sim.Page(), tick);
     if (doCopy) world.EncodeDirtyCopy(enc, sim.DirtyNext());
+    // A refusal is the ring reporting that the GPU still owes every slot a
+    // delivery. Counted so the stall above has its denominator on the page.
+    if (!doCopy) g_readbackDeclines++;
   }
   spanEnc.Close();
   {
@@ -989,7 +995,7 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
     // depend on every submit having retired before they look (selftest.h's
     // ordering note). Narrowing it would be a behaviour change to the test
     // harness in a commit whose entire point is that the harness must NOT move.
-    sandvox::PerfSpan spanWait(PerfScope::Readback);
+    sandvox::PerfSpan spanWait(PerfScope::ReadbackStall);
     ctx.WaitIdle();
     ctx.ProcessEvents();
   } else if (snapshotStale) {
@@ -1012,7 +1018,12 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
     // just above, the worst case is draining the 3-slot ring, and the common
     // case is one wait on a readback that was already nearly done.
     g_snapshotStalls++;
-    sandvox::PerfSpan spanWait(PerfScope::Readback);
+    // ReadbackStall, NOT Readback: this is the one blocking wait on the path,
+    // and it shared a row with the non-blocking pump until the row read as
+    // "async readback spiked" after a lake was disturbed. The pump is a poll
+    // and a memcpy; this is a fence wait on a GPU that is behind. Separate
+    // rows, because they need opposite fixes (perfnodes.h says the same).
+    sandvox::PerfSpan spanWait(PerfScope::ReadbackStall);
     auto fresh = [&] {
       return world.Snap().valid && tick <= world.Snap().tick + maxGap;
     };
@@ -1035,6 +1046,12 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
 uint32_t TakeSnapshotStalls() {
   const uint32_t n = g_snapshotStalls;
   g_snapshotStalls = 0;
+  return n;
+}
+
+uint32_t TakeReadbackDeclines() {
+  const uint32_t n = g_readbackDeclines;
+  g_readbackDeclines = 0;
   return n;
 }
 

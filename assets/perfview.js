@@ -90,9 +90,9 @@ const PV_HUE_CPU = [
   'postStep',
   'renderPass',    // draw-call encode
   'readback',
+  'readbackStall', // the blocking fallback, split out of readback
   'worldStorage',  // streaming
   'gameSystems',
-  'player',
 ];
 function pvHue(nodeId, side){
   const list = side === 'cpu' ? PV_HUE_CPU : PV_HUE_GPU;
@@ -302,8 +302,18 @@ const PV_SCOPE_NOTE = {
   postStep:  'Debris, mob and avatar post-step plus player push-out. Runs after '
            + 'physics because it reads the solved transforms.',
   readback:  'Snapshot map callbacks and CPU-mirror rebuild. One tick latent by '
-           + 'design; if this blocks, the frame path has grown a sync read and '
-           + 'that is a bug, not a cost.',
+           + 'design and NON-BLOCKING by construction: this is a fence status '
+           + 'poll plus a ~0.5 MB memcpy. The blocking wait that used to hide in '
+           + 'this row is `readbackStall` now.',
+  readbackStall:
+             'BLOCKING. The paged mirror refuses to tick on a snapshot more than '
+           + '4 ticks old (its dirty set dilates a ring per tick of gap) and '
+           + 'waits on the oldest in-flight readback fence instead. It fires '
+           + 'when the GPU is more than a frame behind while the loop catches '
+           + 'up at 4 ticks/frame, so it is almost always a relabelled GPU '
+           + 'wait — the CPU would have spent the same time in `present`. Read '
+           + 'the GPU bars for the cause; the `snapshot stalls` and `readback '
+           + 'ring full` counters say whether the ring or the GPU was the limit.',
   audio:     'Cue dispatch and feeding the spatializer. Fixed small cost; '
            + 'silent in headless.',
   renderCpu: 'Encoding the render pass: draw calls, instance buffers and the '
@@ -426,6 +436,17 @@ function pvInt(v){
   return Math.round(v).toLocaleString('en-US');
 }
 function pvPct(v){ return (v*100).toFixed(v >= 0.1 ? 0 : 1) + '%'; }
+// Magnitude with a suffix, for COUNTS rather than durations. The raymarch's
+// step counters run to tens of millions per frame, and pvInt renders that as
+// eleven characters of digits and commas in a column that has to be readable
+// at a glance -- "12.4 M" is the same number and is one token.
+function pvMag(v){
+  if (!isFinite(v)) return '—';
+  const a = Math.abs(v);
+  if (a >= 1e6) return pvNum(v/1e6, a/1e6 >= 100 ? 0 : 1) + ' M';
+  if (a >= 1e3) return pvNum(v/1e3, a/1e3 >= 100 ? 0 : 1) + ' k';
+  return pvInt(v);
+}
 
 /* ================= data model =================
  *
@@ -445,9 +466,27 @@ function pvNodeById(id){ return pvNodes().find(n => n.id === id) || null; }
 // entry would put an orphan box on the Engine map; it still needs a bar label
 // that reads as English rather than as a JSON key.
 const PV_NODELESS_LABEL = { other: 'Unattributed' };
+// Labels for nodes that DO exist in perfnodes.h but may be missing from the
+// `nodes` table this page was handed. That table is baked into build/perf.json
+// at record time, so a perf.json recorded before a node was split out -- or a
+// live session attached while perf.json is stale -- arrives with ids the table
+// has never heard of, and the bar renders with a camelCase key for a label.
+// These are a FALLBACK only: the recorded table always wins, so this map can
+// never fight the source of truth, it can only cover for its absence.
+const PV_NODE_FALLBACK = {
+  raymarch:      'World raymarch',
+  drawParticles: 'Particles + fluid cubes',
+  drawBodies:    'Debris bodies',
+  drawMicro:     'Micro bodies',
+  drawSprites:   'Sprites',
+  drawDebug:     'Debug draws',
+  uiOverlay:     'Overlay + swapchain wait',
+  readbackStall: 'Snapshot Stall',
+};
 function pvNodeLabel(id){
   const n = pvNodeById(id);
-  return n ? n.label : (PV_NODELESS_LABEL[id] || id);
+  return n ? n.label
+           : (PV_NODELESS_LABEL[id] || PV_NODE_FALLBACK[id] || id);
 }
 function pvScopeNode(key){
   const s = ((PERF && PERF.scopes) || []).find(x => x.key === key);
@@ -1518,6 +1557,171 @@ function pvPercentileSection(V, T){
   return sec;
 }
 
+/* ---- the raymarch's step census -------------------------------------------
+ *
+ * WHY THIS IS NOT JUST MORE BARS. Every other row on this page is a timestamp
+ * around a dispatch. The raymarch cannot be: the primary march, the sun shadow
+ * ray, the far cascade, the micro bricks and the reflections all run inside ONE
+ * fragment shader invocation, and there is nowhere to put a query between them.
+ * So the shader counts STEPS instead -- one DDA cell advance -- over a 1-in-16
+ * pixel sample, and this section divides the single span it does have by that
+ * census.
+ *
+ * Every row is therefore an ESTIMATE and says so on screen. The known error is
+ * in one direction: the shader's fixed per-pixel cost -- the register footprint
+ * every trace() call site carries whether or not it ever steps -- is not a
+ * step, so it is spread across these rows in proportion to steps rather than
+ * sitting in one honest row of its own.
+ *
+ * The tips answer "so what do I do about it" rather than restating the label:
+ * what the trace is, and what makes it get expensive.
+ */
+const PV_RM_STEPS = [
+  { key:'rmPrimarySteps', short:'primary', label:'Primary DDA',
+    tip:'The camera ray walking the voxel grid one cell at a time until '
+      + 'something opaque stops it. Scales with how far the eye can see before '
+      + 'it hits: an open view across a valley is the expensive case, a wall in '
+      + 'your face is free. Every other row below is a ray that starts where '
+      + 'this one stopped, so shortening this shortens all of them.' },
+  { key:'rmMediaCells', short:'media', label:'Media (fire/smoke/water)',
+    tip:'Cells that accumulated optical depth for fire, smoke or water instead '
+      + 'of terminating the ray. These MULTIPLY the march rather than adding to '
+      + 'it -- a translucent cell is a step the primary ray did not get to stop '
+      + 'on -- which is why a screen full of smoke costs far more than a screen '
+      + 'full of stone at the same depth.' },
+  { key:'rmShadowSteps', short:'shadow', label:'Sun shadow rays',
+    tip:'A second full trace from the hit point toward the sun, per lit pixel. '
+      + 'This is the row that DOUBLES the shader: it costs roughly what the '
+      + 'primary march cost, over the same geometry. The shadow cache in the '
+      + 'denominators below exists to stop most pixels ever issuing one.' },
+  { key:'rmFarSteps', short:'far', label:'Far cascade',
+    tip:'The coarse cascade march that takes over where the near window runs '
+      + 'out. Scales with horizon pixels -- ridge lines, distant ground, '
+      + 'anything the near grid cannot reach -- so it moves with where the '
+      + 'camera is LOOKING far more than with what is in the world.' },
+  { key:'rmFarShadowSteps', short:'far shadow', label:'Far cascade shadows',
+    tip:'Shadow rays marched through the coarse cascade. Watch this one: the '
+      + 'far cascade has no early-out, so a NEAR shadow that ends up routed '
+      + 'through here is dramatically dearer per step than the same shadow '
+      + 'taken in the near grid.' },
+  { key:'rmMicroSteps', short:'micro', label:'Micro bricks / grass',
+    tip:'Sub-voxel detail -- micro-brick bodies and grass strand lattices -- '
+      + 'marched at a finer step INSIDE a single voxel. Costs per screen area '
+      + 'of grass rather than per blade, so it is a function of how much of the '
+      + 'view is near ground, not of how much grass the world holds.' },
+  { key:'rmReflectSteps', short:'reflect', label:'Reflections + refraction',
+    tip:'Secondary rays off water and other reflective surfaces, plus the '
+      + 'refracted ray continuing under a surface. Each is another trace from a '
+      + 'hit point, so this row is close to "how much of the screen is water '
+      + 'you can see across or into".' },
+  { key:'rmFluidSteps', short:'MPM water', label:'MPM water surface',
+    tip:'The march over the MLS-MPM fluid surface. It is zero while no fluid '
+      + 'particles are live, so it appears and disappears with the water rather '
+      + 'than scaling smoothly -- a jump in this row is a splash starting, not '
+      + 'the renderer getting slower.' },
+  { key:'rmGodraySteps', short:'god rays', label:'God rays / silt',
+    tip:'Sun-shaft samples along the view ray, and the underwater silt samples '
+      + 'that share the loop. A fixed sample count per qualifying pixel, so '
+      + 'this scales with RESOLUTION and with how much of the screen qualifies '
+      + '-- never with world content.' },
+];
+
+// The step census over the window, biggest first, or null when this run
+// predates the counters. Gating on the WINDOW rather than the whole ring is
+// deliberate: if the last second of a live session took no steps there is no
+// split to draw, and a section of empty bars is worse than no section.
+//
+// THE SHARE IS BUILT FROM THE MEAN even when the bars are showing p99, because
+// a share is a ratio of parts to a whole and percentiles do not partition. The
+// breakdown above already says this one level up about summing components:
+// each counter's worst frame is a DIFFERENT frame, so dividing p99s by the sum
+// of the p99s would describe a frame on which every trace peaked at once.
+function pvRmSteps(W){
+  const c = (W && W.counters) || {};
+  const rows = [];
+  let total = 0;
+  for (const d of PV_RM_STEPS){
+    const n = pvMean(c[d.key]);
+    if (!(n > 0)) continue;        // a trace that never ran is not a 0% row
+    rows.push({ key:d.key, short:d.short, label:d.label, tip:d.tip, n });
+    total += n;
+  }
+  if (!rows.length || !(total > 0)) return null;
+  for (const r of rows) r.share = r.n / total;
+  rows.sort((a,b) => b.n - a.n);
+  return { rows, total };
+}
+
+// The denominators line: what those steps were spent ON. Same shape as the
+// counters panel's foot -- one quiet mono line, no chart -- because these are
+// context for the bars above rather than series in their own right.
+function pvRmDenoms(W){
+  const c = (W && W.counters) || {};
+  const px = pvMean(c.rmPixels);
+  const cls = [['rmPxSky','sky'], ['rmPxFar','far'], ['rmPxWater','water'],
+               ['rmPxSubmerged','submerged']];
+  const have = cls.some(k => pvMean(c[k[0]]) > 0);
+  const taps = pvMean(c.rmShadowCacheTaps), reqs = pvMean(c.rmShadowCacheReqs);
+  if (!(px > 0) && !have && !(taps > 0) && !(reqs > 0)) return null;
+
+  const parts = [];
+  if (px > 0) parts.push(pvMag(px) + ' pixels shaded/frame');
+  if (have){
+    // Percentages of the pixels actually shaded when there IS a denominator,
+    // raw counts when there is not. A percentage with no denominator is the
+    // trap this whole page is written against, so it is not offered.
+    parts.push(cls.map(k => k[1] + ' '
+                            + (px > 0 ? pvPct(pvMean(c[k[0]]) / px)
+                                      : pvMag(pvMean(c[k[0]])))).join(', '));
+  }
+  if (taps > 0){
+    // Hit rate, not miss count: a request IS a miss (it appends work for the
+    // cache to fill later), so the number worth reading is the fraction of taps
+    // that never had to ask. Clamped because taps and requests are two counters
+    // and a frame boundary can land between them.
+    const hit = Math.max(0, Math.min(1, 1 - reqs / taps));
+    parts.push('shadow cache ' + pvMag(taps) + ' taps/frame, ' + pvPct(hit)
+               + ' hit rate');
+  } else if (reqs > 0){
+    parts.push('shadow cache ' + pvMag(reqs) + ' requests/frame, no taps');
+  }
+  return parts.join(' - ');
+}
+
+// Appended INTO the breakdown's GPU half rather than made a section of its own:
+// this is a drill-down under one bar, and hoisting it to the page's top level
+// would imply it is a peer of the CPU/GPU split.
+function pvRmSection(W, rm, rmMs){
+  const box = pvEl('div', { class:'pv-rm' });
+  box.append(pvEl('h4', { class:'pv-h4' }, 'Raymarch breakdown (estimated)'));
+  box.append(pvEl('p', { class:'note' },
+    'The raymarch bar above is ONE fragment shader -- the shadow ray, the far '
+    + 'cascade and the reflections all run inside it, and no timestamp can be '
+    + 'put between them. These rows split that single span by the STEPS each '
+    + 'trace took, counted in the shader over a 1-in-16 pixel sample and scaled '
+    + 'back up. The millisecond column is therefore an ESTIMATE -- raymarch ms '
+    + 'times that trace’s share of all steps -- and it is wrong in a known '
+    + 'direction, because the shader’s fixed per-pixel cost is not a step '
+    + 'and so gets spread across every row. For the exact per-feature '
+    + 'millisecond, use --render-budget, which removes one feature at a time '
+    + 'and measures the whole frame.'));
+  if (pvStat !== 'mean')
+    box.append(pvEl('p', { class:'note' },
+      'The shares below stay on the MEAN while the bars show '
+      + pvStatDef().label + ': a share is a ratio of parts to a whole, and '
+      + 'percentiles do not partition. Only the raymarch millisecond they are '
+      + 'multiplied by follows the selected statistic.'));
+
+  const rows = rm.rows.map(r => ({
+    label: r.label, ms: rmMs * r.share, col: PV_SEQ[3], tip: r.tip,
+    why: pvMag(r.n) + ' steps/frame - ' + pvPct(r.share) + ' of steps' }));
+  box.append(pvBars(rows, { total: rmMs }));
+
+  const den = pvRmDenoms(W);
+  if (den) box.append(pvEl('div', { class:'pv-spark-foot' }, den));
+  return box;
+}
+
 /* ---- component breakdown --------------------------------------------------
  * The list the page exists for. Sorted by cost, GPU and CPU kept apart, each
  * bar carrying the counter that explains it.
@@ -1571,14 +1775,31 @@ function pvBreakdownSection(V, Tmean, W){
   // that cost 42 ms is the frame that had the chunks.
   const cmean = {};
   for (const k in (W.counters||{})) cmean[k] = pvStatOf(W.counters[k]);
+  // The raymarch's step census, built once: the GPU row below reads it for a
+  // one-line hint and the breakdown under the bars reads it for the split.
+  // Null on any run recorded before the counters existed, and every use of it
+  // has to survive that.
+  const rm = pvRmSteps(W);
   const whyFor = id => {
     const parts = [];
     for (const c of ((PERF && PERF.counters) || [])){
       if (c.node !== id) continue;
+      // The sixteen rm* counters are the raymarch breakdown's own denominators,
+      // spread over six nodes. Dumped raw into a `why` column they push the
+      // number that matters off the end of the line, so once the section that
+      // owns them is rendering, it owns them here too.
+      if (rm && c.key.startsWith('rm')) continue;
       const m = cmean[c.key];
       if (m == null || m <= 0) continue;
       parts.push(pvInt(m) + ' ' + c.label);
     }
+    // One span, many traces: the raymarch's useful `why` is not a counter but
+    // WHICH TRACE ate the steps. Two names, because a third does not change
+    // what you would go and look at and the column is one line.
+    if (id === 'raymarch' && rm)
+      parts.push(rm.rows.slice(0, 2)
+                        .map(r => r.short + ' ' + pvPct(r.share)).join(' / ')
+                 + ' of steps');
     // The per-chunk number is what the compute budget is denominated in, so it
     // is derived here rather than left for the reader to divide.
     if (id === 'caLoop' && cmean.activeChunks > 0){
@@ -1603,6 +1824,15 @@ function pvBreakdownSection(V, Tmean, W){
       + 'queue, so this sum IS the GPU time in the frame. Compare it with the '
       + 'frame time: if it fills the frame, the GPU is the limit.' });
   sec.append(pvBars(gpuRows, { total:T.wallMs }));
+
+  // The raymarch drill-down sits under the bar it explains, not at the bottom
+  // of the page: it is the only row up there whose cost cannot be subdivided by
+  // a timestamp, so the split has to be adjacent to the number it splits.
+  // Absent entirely on a perf.json recorded before the counters landed.
+  if (rm){
+    const rmGpu = T.gpu.find(g => g.id === 'raymarch');
+    sec.append(pvRmSection(W, rm, rmGpu ? rmGpu.ms : 0));
+  }
 
   sec.append(pvEl('h4', { class:'pv-h4' }, 'CPU'));
   const cpuRows = T.cpuBusy.map(c => ({

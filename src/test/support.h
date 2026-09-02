@@ -133,6 +133,12 @@ bool HarnessSnapshotDrain();
 // "readback 12.4 ms over 2 snapshot stalls" is a diagnosis, "readback 12.4 ms"
 // is not (CLAUDE.md rule 6).
 uint32_t TakeSnapshotStalls();
+// Ticks since the last call whose readback REQUEST was refused because every
+// slot of World's ring was still in flight (EncodeReadbacks returned false).
+// The other half of the stall diagnosis: stalls WITH declines mean the GPU is
+// behind and a deeper ring would not help; declines WITHOUT stalls mean the
+// ring itself is the limit. Read-and-cleared like TakeSnapshotStalls.
+uint32_t TakeReadbackDeclines();
 
 // Body render plumbing moved to game/bodyreg.h: BodyRegistry owns the ONE
 // definition of the debris | mob | avatar slot walk, and all three parallel

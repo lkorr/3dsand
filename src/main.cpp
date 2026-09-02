@@ -67,6 +67,7 @@
 #include "measure/perfnodes.h"
 #include "measure/perfscope.h"
 #include "gpu/passtimer.h"
+#include "measure/renderstats.h"
 #include "test/support.h"
 #include "ui/overlay.h"
 #include "crash.h"
@@ -182,6 +183,7 @@ double g_frameScopeMax[sandvox::kPerfScopeCount] = {};
 std::vector<double> g_frameScopeSeries[sandvox::kPerfScopeCount];
 uint64_t g_frameSnapStalls = 0;      // total paged-staleness WaitIdle stalls
 uint64_t g_frameSnapStallFrames = 0; // frames that paid at least one
+uint64_t g_frameRbDeclines = 0;      // readback requests the 3-slot ring refused
 
 // ---- --autofly-park: the active-chunk DECAY probe ---------------------------
 //
@@ -2674,6 +2676,14 @@ int main(int argc, char** argv) {
     if (!window) return 1;
   }
 
+  // RENDER_STATS (gpu/resources.h): the raymarch's per-call-site step
+  // counters compile in only for the consumer that reads them back — the live
+  // Performance tab. Decided BEFORE the device and the first LoadShader,
+  // because it is a prelude const, not a flag. NOT for --perf: the harness
+  // does not harvest them yet (perfsuite.cpp), and a counter nobody reads
+  // would still perturb the raymarch number it reports.
+  SetRenderStatsEnabled(telemetryEnabled);
+
   GpuContext ctx;
   // Timestamps: --measure and --fluid-bench are the only modes that request
   // the TimestampQuery device feature (per-pass GPU timings).
@@ -2712,14 +2722,23 @@ int main(int argc, char** argv) {
   // later, tagged with the frame it belongs to.
   PassTimer liveTimer, liveRenderTimer;
   bool liveTimed = false;
+  // The raymarch's inside (measure/renderstats.h): only with telemetry, and
+  // only if the RENDER_STATS const actually compiled in (fragment atomics).
+  sandvox::RenderStatsRing liveStats;
+  bool liveStatsOn = false;
   if (telemetryEnabled) {
     if (liveTimer.Init(ctx, 192)) {
       liveTimer.SetRowGranularity(true);
       sim.SetPassTimer(&liveTimer);
-      liveTimed = liveRenderTimer.Init(ctx, 2);
+      // Seven spans per render command buffer (kPerfRenderSpans), not one.
+      liveTimed = liveRenderTimer.Init(ctx, 16);
     }
-    std::printf("telemetry: live on port %u, GPU pass timings %s\n",
-                telemetryPort, liveTimed ? "ON" : "unavailable (no timestamps)");
+    liveStatsOn = RenderStatsEnabled() && FragmentStoresAvailable() &&
+                  liveStats.Init(ctx);
+    std::printf("telemetry: live on port %u, GPU pass timings %s, raymarch "
+                "step counters %s\n",
+                telemetryPort, liveTimed ? "ON" : "unavailable (no timestamps)",
+                liveStatsOn ? "ON" : "off");
   }
   // The frame being accumulated, and the map from a frame number to the sample
   // still waiting for its GPU numbers. Three deep: a deferred timestamp map
@@ -7206,49 +7225,105 @@ int main(int argc, char** argv) {
       }
 
       rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
-      // --telemetry: bracket the whole render pass with a GPU timestamp pair,
-      // OUTSIDE the pass (a write at ALL_COMMANDS is not legal inside a
-      // dynamic-rendering scope). This is the only way the Performance tab can
-      // say "the GPU is the bottleneck and it is the raymarch" rather than
-      // inferring it from how long the CPU spent waiting in Present.
-      uint32_t liveRb = 0, liveRe = 0;
-      const bool liveRenderTimed =
-          liveTimed && telemetry.HasClient() &&
-          liveRenderTimer.AllocPassPair("render", liveRb, liveRe);
-      if (liveRenderTimed)
-        enc.WriteTimestamp(liveRenderTimer.NativeQuerySet(), liveRb, false);
-      // INSIDE the timestamp bracket on purpose: the resolve pass is part of
-      // what a shadow costs, so a "render" number that excluded it would flatter
-      // the cache by moving its work out of the measurement.
+      // --telemetry: a GPU timestamp pair around EACH DRAW of the render pass,
+      // billed through kPerfRenderSpans (perfnodes.h) to the box that issued
+      // it. This used to be ONE pair around the whole pass, which told the
+      // Performance tab "the GPU frame is the render pass" and nothing else.
+      //
+      // Written INSIDE the dynamic-rendering scope, which is legal: the spec
+      // allows vkCmdWriteTimestamp2 inside a render pass instance. What is
+      // not allowed inside one is vkCmdResetQueryPool and
+      // vkCmdCopyQueryPoolResults — the query set is reset at creation and by
+      // EncodeResolve after each read, both outside — so the old comment's
+      // "not legal inside a render pass" was about the resolve, not the write.
+      //
+      // Both ends of a span are ALL_COMMANDS (`bottom`), not TOP_OF_PIPE for
+      // the start: draws in one pass overlap in the pipeline, and a
+      // top-of-pipe start stamp can land before the PREVIOUS draw's fragments
+      // have retired. Stamping when all prior commands complete makes span k
+      // "from the end of draw k-1 to the end of draw k", which is the only
+      // sequential attribution a shared pipeline can honestly give.
+      //
+      // The shadow-cache resolve runs BEFORE the pass and is timed by the pass
+      // table (its `shadowCache` row); it is no longer inside the raymarch
+      // number, so the two rows no longer double-count it.
+      const bool liveRenderTimed = liveTimed && telemetry.HasClient();
+      struct LiveSpan { uint32_t b = 0, e = 0; bool on = false; };
+      auto spanBegin = [&](const char* name) {
+        LiveSpan sp;
+        if (liveRenderTimed &&
+            liveRenderTimer.AllocPassPair(name, sp.b, sp.e)) {
+          sp.on = true;
+          enc.WriteTimestamp(liveRenderTimer.NativeQuerySet(), sp.b, true);
+        }
+        return sp;
+      };
+      auto spanEnd = [&](const LiveSpan& sp) {
+        if (sp.on) enc.WriteTimestamp(liveRenderTimer.NativeQuerySet(), sp.e, true);
+      };
       sim.EncodeShadowResolve(enc);
       rhi::RenderPass rp = sim.BeginRenderPass(enc, target, ctx.surfaceFormat,
                                                        ctx.width, ctx.height);
-      sim.DrawWorld(rp);
-      sim.DrawParticles(rp);
-      // Cube-debug mode only: in surface mode (the default) the raymarcher
-      // draws the fluid as a real water surface and the cubes would z-fight it.
-      if (CurrentTuning().render.fluidSurface < 0.5f)
-        sim.DrawFluid(rp, fluidCount);
-      sim.DrawBodies(rp, bodyInstCount);
-      sim.DrawMicroBodies(rp, microCount);
-      sim.DrawSprites(rp, (uint32_t)sprv.size());
-      sim.DrawDebugBoxes(rp, debugBoxCount);
-      // Wind arrows LAST of the world draws so they composite over everything
-      // they annotate. Nothing is uploaded for them — the count is the only
-      // CPU work, and at zero the draw is skipped outright (rule 2's shape,
-      // applied to a debug view: off is not "cheap", it is nothing).
-      sim.DrawWindField(rp, ui.showWindField
-                                ? WindDebugArrowCount(CurrentTuning())
-                                : 0u);
-      sim.DrawCurrentField(rp, CurrentTuning().render.dbgCurrentField
-                                   ? CurrentDebugArrowCount()
-                                   : 0u);
-      overlay.Render(rp);
-      rp.End();
-      if (liveRenderTimed) {
-        enc.WriteTimestamp(liveRenderTimer.NativeQuerySet(), liveRe, true);
-        liveRenderTimer.EncodeResolve(enc);
+      {
+        const LiveSpan sp = spanBegin("rm_world");
+        sim.DrawWorld(rp);
+        spanEnd(sp);
       }
+      {
+        const LiveSpan sp = spanBegin("rm_particles");
+        sim.DrawParticles(rp);
+        // Cube-debug mode only: in surface mode (the default) the raymarcher
+        // draws the fluid as a real water surface and the cubes would z-fight
+        // it.
+        if (CurrentTuning().render.fluidSurface < 0.5f)
+          sim.DrawFluid(rp, fluidCount);
+        spanEnd(sp);
+      }
+      {
+        const LiveSpan sp = spanBegin("rm_bodies");
+        sim.DrawBodies(rp, bodyInstCount);
+        spanEnd(sp);
+      }
+      {
+        const LiveSpan sp = spanBegin("rm_micro");
+        sim.DrawMicroBodies(rp, microCount);
+        spanEnd(sp);
+      }
+      {
+        const LiveSpan sp = spanBegin("rm_sprites");
+        sim.DrawSprites(rp, (uint32_t)sprv.size());
+        spanEnd(sp);
+      }
+      {
+        const LiveSpan sp = spanBegin("rm_debug");
+        sim.DrawDebugBoxes(rp, debugBoxCount);
+        // Wind arrows LAST of the world draws so they composite over
+        // everything they annotate. Nothing is uploaded for them — the count
+        // is the only CPU work, and at zero the draw is skipped outright
+        // (rule 2's shape, applied to a debug view: off is not "cheap", it is
+        // nothing).
+        sim.DrawWindField(rp, ui.showWindField
+                                  ? WindDebugArrowCount(CurrentTuning())
+                                  : 0u);
+        sim.DrawCurrentField(rp, CurrentTuning().render.dbgCurrentField
+                                     ? CurrentDebugArrowCount()
+                                     : 0u);
+        spanEnd(sp);
+      }
+      {
+        const LiveSpan sp = spanBegin("rm_overlay");
+        overlay.Render(rp);
+        spanEnd(sp);
+      }
+      rp.End();
+      if (liveRenderTimed && liveRenderTimer.PassesThisBuffer() > 0)
+        liveRenderTimer.EncodeResolve(enc);
+      // The raymarch's step counters, copied out behind the pass that wrote
+      // them (measure/renderstats.h). Only with a page listening: the counters
+      // accumulate regardless, and a frame nobody harvests is just a gap.
+      const bool liveStatsEncoded =
+          liveStatsOn && telemetry.HasClient() &&
+          liveStats.Encode(enc, world, liveFrameNo);
       double tPresent0 = NowSeconds();
       ctx.queue.Submit(enc.Finish());
 
@@ -7321,6 +7396,7 @@ int main(int argc, char** argv) {
 
       ctx.Present();
       if (liveRenderTimed) liveRenderTimer.KickDeferred(ctx, liveFrameNo);
+      if (liveStatsEncoded) liveStats.Kick(ctx);
       {
         using sandvox::PerfScope;
         // Through the same accumulator as every other scope, rather than
@@ -7356,6 +7432,7 @@ int main(int argc, char** argv) {
     // is the only reason a non-interactive run can answer "which bar spiked".
     double frameScope[sandvox::kPerfScopeCount] = {};
     uint32_t frameStalls = 0;
+    uint32_t frameDeclines = 0;
     const double frameWallMs = (NowSeconds() - now) * 1000.0;
     if (sandvox::PerfScopesOn()) {
       // Zeroes as it copies, so a span straddling this point cannot be counted
@@ -7371,6 +7448,7 @@ int main(int argc, char** argv) {
       frameScope[(int)sandvox::PerfScope::Other] +=
           std::max(0.0, frameWallMs - sum);
       frameStalls = TakeSnapshotStalls();
+      frameDeclines = TakeReadbackDeclines();
     }
     if (g_harnessFrames > 0 && frameCounter > 60) {
       for (int i = 0; i < sandvox::kPerfScopeCount; i++) {
@@ -7380,6 +7458,7 @@ int main(int argc, char** argv) {
       }
       g_frameSnapStalls += frameStalls;
       if (frameStalls) g_frameSnapStallFrames++;
+      g_frameRbDeclines += frameDeclines;
     }
 
     // ---- LIVE TELEMETRY: close the frame and send it --------------------
@@ -7413,6 +7492,7 @@ int main(int argc, char** argv) {
       // Read-and-cleared above, so a frame that ran four ticks reports all four
       // of their stalls and the next frame starts at zero.
       ctr(sandvox::PerfCounter::SnapshotStalls, (double)frameStalls);
+      ctr(sandvox::PerfCounter::ReadbackDeclined, (double)frameDeclines);
       livePending.push_back({liveFrameNo, liveSample});
 
       // Harvest whatever has landed and post it to the frame it belongs to.
@@ -7421,15 +7501,10 @@ int main(int argc, char** argv) {
         for (LivePending& lp : livePending) {
           if (lp.frame != tag) continue;
           for (const PassSample& ps : t.LastFrame()) {
-            int node = -1;
-            if (isRender) {
-              for (int n = 0; n < sandvox::kPerfNodeCount; n++)
-                if (std::strcmp(sandvox::kPerfNodes[n].node, "raymarch") == 0) {
-                  node = n; break;
-                }
-            } else {
-              node = sandvox::PerfNodeForPass(ps.name);
-            }
+            // Render spans and pass rows are two namespaces with two tables;
+            // both live in perfnodes.h so the --perf harness bills the same.
+            const int node = isRender ? sandvox::PerfNodeForRenderSpan(ps.name)
+                                      : sandvox::PerfNodeForPass(ps.name);
             if (node < 0) continue;
             lp.s.gpuMs[node] += (double)ps.ns / 1e6;
             lp.s.gpuValid = true;
@@ -7437,6 +7512,25 @@ int main(int argc, char** argv) {
           break;
         }
       };
+      // The raymarch's step counters land on the same fence as the render
+      // spans (same command buffer), so harvest them FIRST: the sample is sent
+      // the moment gpuValid flips, and a counter arriving one poll later would
+      // be posted to a frame already gone.
+      if (liveStatsOn) {
+        sandvox::RenderStatsRing::Frame rf;
+        while (liveStats.Poll(rf)) {
+          for (LivePending& lp : livePending) {
+            if (lp.frame != rf.frame) continue;
+            // Slot k is PerfCounter::RmPixels + k: slot 0 the pixel
+            // denominator, slots 1.. the step / pixel-class rows in order
+            // (world.h kRenderStat* and perfnodes.h say the same thing).
+            for (uint32_t k = 0; k < kRenderStatSlots; k++)
+              lp.s.counters[(int)sandvox::PerfCounter::RmPixels + k] =
+                  rf.counters[k];
+            break;
+          }
+        }
+      }
       if (liveTimed && liveTimer.PollDeferred(ctx) > 0) post(liveTimer, false);
       if (liveTimed && liveRenderTimer.PollDeferred(ctx) > 0)
         post(liveRenderTimer, true);
@@ -7529,10 +7623,12 @@ int main(int argc, char** argv) {
         // The bug counter, printed whether or not it fired — "0 stalls" is a
         // result and a missing line is not.
         std::printf("    snapshot stalls (blocking WaitIdle on the frame path):"
-                    " %llu over %llu frames (%.1f%% of frames)\n",
+                    " %llu over %llu frames (%.1f%% of frames) | readback "
+                    "requests the ring refused: %llu\n",
                     (unsigned long long)g_frameSnapStalls,
                     (unsigned long long)n,
-                    100.0 * (double)g_frameSnapStallFrames / (double)n);
+                    100.0 * (double)g_frameSnapStallFrames / (double)n,
+                    (unsigned long long)g_frameRbDeclines);
         // ---- and one level down into `stream`, which is where it all is ----
         // The scope table says streaming dominates; this says which PART of a
         // window shift. Denominated PER SHIFT, because a shift is the unit the

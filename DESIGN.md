@@ -5641,6 +5641,48 @@ arrive two or three frames late **tagged with the frame that produced them**;
 the frame path never waits on a timestamp, and a frame whose queries have not
 landed is marked rather than drawn as a GPU that cost nothing.
 
+**The render pass is seven spans, and the raymarch has an inside (2026-09-01).**
+The whole render pass used to be ONE timestamp pair billed to `raymarch`, which
+on the idle scenario is the entire GPU frame — a bare count. The frame loop now
+writes a pair around each draw inside the dynamic-rendering scope (legal; only
+the query reset and resolve must stay outside) and bills them through
+`kPerfRenderSpans` in `perfnodes.h` to the boxes that issue them: `raymarch`
+(the fullscreen shader alone), `drawParticles`, `drawBodies`, `drawMicro`,
+`drawSprites`, `drawDebug`, `uiOverlay`. Both ends of a span are ALL_COMMANDS
+stamps, because draws overlap in the pipeline and a top-of-pipe start can land
+before the previous draw's fragments retire. The shadow-cache resolve runs before
+the pass and is timed by its own table rows, so it is no longer counted twice.
+
+Inside the world draw nothing can be timestamped — it is one fragment shader — so
+`raymarch.wgsl` counts instead. Under the `RENDER_STATS` prelude const
+(`gpu/resources.h`, on only for `--telemetry`) every trace call site adds its DDA
+steps and every shading path its pixels into `World::renderStats`, a 4 KiB
+striped `atomic<u32>` buffer (`world.h kRenderStat*`), on a 1-in-16 pixel
+sample; the shipping shader compiles all of it out, because `trace()` is
+register-footprint bound and a live flag would keep the accumulators resident.
+The counters are MONOTONIC and differenced on the CPU (`measure/renderstats.h`),
+which keeps a clear and its barrier out of the frame. They reach the page as the
+`rm*` counters and the tab draws them as an ESTIMATED millisecond split of the
+raymarch span (step share x span) with the estimate labelled as one; the exact
+per-feature answer stays `--render-budget`. The copy-out goes through
+`rhi::CommandEncoder::CopyRenderWritten`, the one place a render-domain write is
+declared to the barrier tracker (`barrier_graph` §2.6 otherwise assumes draws are
+read-only): it sets the buffer's last writer to the fragment stage and derives
+the fragment->transfer barrier from that, exactly as `CopyTracked` derives its
+own.
+
+**`readback` and `readbackStall` are two rows (2026-09-01).** The async readback
+row used to hold both the non-blocking map pump and the paged mirror's staleness
+fallback in `SubmitTick` — a fence wait on the oldest in-flight readback when the
+newest snapshot is more than `kPagedSnapshotMaxGap` ticks old. After a lake was
+disturbed the row read as "async readback spiking for a long time"; the pump
+never blocks, and what spiked was the fallback, firing every tick while the GPU
+was more than a frame behind and the loop was catching up at 4 ticks/frame. That
+is a relabelled GPU wait — the CPU would have spent the same time in `present` —
+so it now has its own row and its own two counters: `snapshotStalls` (the waits)
+and `readbackDeclined` (readback requests the 3-slot ring refused). Declines
+without stalls mean the ring is the limit; stalls with declines mean the GPU is.
+
 **Verify the page, not just the numbers.** `scripts/check_perfview.sh` drives the
 real tab in real headless Chrome and asserts both content (charts built from the
 data, passes attributed, nothing unattributed) and layout (nothing overflows its

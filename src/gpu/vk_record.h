@@ -277,6 +277,15 @@ class Recorder {
   void CopyTracked(pass::Buf srcId, Buffer* src, uint64_t srcOffset, Buffer* dst,
                    uint64_t dstOffset, uint64_t size);
 
+  // rhi::CommandEncoder::CopyRenderWritten — see the contract there. `src` is
+  // an EXTRAS buffer (never a table slot): its state is set to "last written
+  // by the fragment stage" and the transfer read is then derived through
+  // TouchExtra like any other access. The write itself is never declared at
+  // draw time because a fragment atomic has no row to declare it from; this is
+  // the one place the render pass's single write enters the tracker.
+  void CopyRenderWritten(Buffer* src, uint64_t srcOffset, Buffer* dst,
+                         uint64_t dstOffset, uint64_t size);
+
   // vkCmdFillBuffer over a tracked table buffer, off-table. This exists for
   // exactly one caller: `EncodeReadbacks`' support clear immediately after
   // copying support out (barrier_graph §7.4's T76 -> T77). That pair is a
