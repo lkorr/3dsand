@@ -58,14 +58,22 @@ async function waitFor(pred, ms){
     // perfectly into a page with no button and no section is a tab nobody can
     // open, and nothing else in the repo would notice.
     var page = await (await fetch('/', {cache: 'no-store'})).text();
+    // Since the Environment tab landed, the tree editor is a PAGE inside it:
+    // environment.js imports trees.js and mounts it into a div#view-trees of
+    // its own. So the wiring that makes trees reachable is the Environment
+    // tab's wiring plus environment.js naming trees.js — which is what these
+    // regexes now assert (the last one against the module, not the page).
+    var envSrc = await (await fetch('/editor/environment.js', {cache: 'no-store'})).text();
     var wiring = [
-      ['nav button',      /data-tab="trees"/],
-      ['section',         /id="view-trees"/],
-      ['tab allowlist',   /'models','trees'/],
-      ['renderAll hook',  /activeTab==='trees'\)\{treesActivate/],
-      ['host bridge',     /__tunerRegisterTrees/],
-      ['module import',   /editor\/trees\.js/]
+      ['nav button',      /data-tab="environment"/],
+      ['section',         /id="view-environment"/],
+      ['tab allowlist',   /'models','environment'/],
+      ['renderAll hook',  /activeTab==='environment'\)\{envActivate/],
+      ['host bridge',     /__tunerRegisterEnv/],
+      ['module import',   /editor\/environment\.js/]
     ];
+    say(/import \* as Trees from '\.\/trees\.js'/.test(envSrc) && /id="view-trees"|'view-trees'/.test(envSrc),
+        'environment.js imports trees.js and mounts it as #view-trees');
     wiring.forEach(function (w) {
       say(w[1].test(page), 'tuner.html has the ' + w[0]);
     });

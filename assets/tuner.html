@@ -1819,7 +1819,7 @@
   <button data-tab="worldgen">Worldgen</button>
   <button data-tab="items">Items</button>
   <button data-tab="models">Models</button>
-  <button data-tab="trees">Trees</button>
+  <button data-tab="environment">Environment</button>
   <button data-tab="audio">Audio</button>
   <span class="tabsep"></span>
   <button data-tab="wiki">Wiki</button>
@@ -2148,8 +2148,11 @@
   <!-- MODELS (voxel editor; assets/editor/editor.js fills this in) -->
   <section class="view" id="view-models"></section>
 
-  <!-- TREES (algorithmic tree editor; assets/editor/trees.js fills this in) -->
-  <section class="view" id="view-trees"></section>
+  <!-- ENVIRONMENT (biomes + the components a biome is built from: trees, water
+       bodies, caves, ground cover; assets/editor/environment.js fills this in.
+       The tree editor, assets/editor/trees.js, mounts into a child div with
+       id="view-trees" inside it — the id its CSS and render loop key on.) -->
+  <section class="view" id="view-environment"></section>
 
   <!-- AUDIO — sound sets on the left, the thing they are bound to on the right -->
   <section class="view" id="view-audio">
@@ -2362,7 +2365,7 @@ function updatePills(){
   $('#btnReload').disabled=!(server||(matHandle&&rxHandle));
 }
 window.addEventListener('beforeunload',e=>{
-  if(dirty.mat||dirty.rx||dirty.tune||modelsDirty||treesDirty){e.preventDefault();e.returnValue='';}
+  if(dirty.mat||dirty.rx||dirty.tune||modelsDirty||envDirty){e.preventDefault();e.returnValue='';}
 });
 
 /* ================= file I/O ================= */
@@ -2614,7 +2617,7 @@ document.querySelectorAll('nav.tabs button').forEach(b=>{
     document.querySelectorAll('nav.tabs button').forEach(x=>x.classList.toggle('active',x===b));
     document.querySelectorAll('.view').forEach(v=>v.classList.toggle('active',v.id==='view-'+activeTab));
     // wiki and notes render with whatever is loaded, including nothing.
-    if((mat&&rx)||['tuning','worldgen','models','trees','wiki','notes','engine'].includes(activeTab))renderAll();
+    if((mat&&rx)||['tuning','worldgen','models','environment','wiki','notes','engine'].includes(activeTab))renderAll();
   });
 });
 // DEEP LINK: ?tab=worldgen&voxels=1 opens a tab, and optionally drops straight
@@ -5269,10 +5272,12 @@ function renderAll(){
   // hand it the tab-activation edge. It renders fine with no materials loaded
   // (the palette is simply empty), so it returns before the mat/rx guard.
   if(activeTab==='models'){modelsActivate();return;}
-  // Trees owns its own DOM and its own render loop, exactly like Models, and
-  // renders with nothing but materials.json loaded (the palette) — so it
-  // returns before the mat/rx guard too.
-  if(activeTab==='trees'){treesActivate();return;}
+  // Environment (biomes, trees, water bodies) owns its own DOM and its own
+  // render loops, exactly like Models, and renders with nothing but
+  // materials.json loaded (the palette) — so it returns before the mat/rx
+  // guard too. Its Caves / Ground cover pages want tuning.json as well and
+  // degrade to a notice without it.
+  if(activeTab==='environment'){envActivate();return;}
   // Notes are independent of every JSON file; the Wiki degrades gracefully
   // (it can still show tuning groups and shaders with no materials loaded).
   if(activeTab==='notes'){renderNotes();return;}
@@ -7927,29 +7932,39 @@ document.addEventListener('keydown',e=>{
    It shares __tunerModelsHooks' vocabulary (el, toast, materials, onDirty,
    section) rather than inventing a second one — the two tabs want exactly the
    same four things from the host.                                           */
-let treesApi=null;
-let treesPending=false;
-let treesDirty=false;
+let envApi=null;
+let envPending=false;
+let envDirty=false;
 
-function treesSetDirty(d){
-  treesDirty=!!d;
+function envSetDirty(d){
+  envDirty=!!d;
   updatePills();
 }
-function treesActivate(){
-  if(treesApi)treesApi.activate();
-  else treesPending=true;
+function envActivate(){
+  if(envApi)envApi.activate();
+  else envPending=true;
 }
-window.__tunerRegisterTrees=api=>{
-  treesApi=api;
-  if(treesPending){treesPending=false;api.activate();}
+window.__tunerRegisterEnv=api=>{
+  envApi=api;
+  if(envPending){envPending=false;api.activate();}
 };
-window.__tunerTreesHooks={
-  el, toast, materials:modelsMaterials, onDirty:treesSetDirty,
-  section:$('#view-trees'),
+/* The Environment tab gets the Models/Trees vocabulary plus three things a
+   biome page needs that a species editor did not: the TUNING plumbing (so its
+   Caves / Ground cover pages and the biome band strip build the Worldgen tab's
+   own rows through tuneRow and write tuning.json through touchTune), the
+   engine's voxel scale (the heightmap header carries it; 10 until one has been
+   fetched), and a way to save tuning from Ctrl+S on a knob page. */
+window.__tunerEnvHooks={
+  el, toast, materials:modelsMaterials, onDirty:envSetDirty,
+  section:$('#view-environment'),
+  tuning:()=>({schema:(typeof TUNING_SCHEMA!=='undefined')?TUNING_SCHEMA:null,
+               tune, tuneBase, tuneRow, paramGroup, touchTune}),
+  voxelsPerMetre:()=>(typeof wgData!=='undefined'&&wgData&&wgData.vpm)||10,
+  saveTuning:()=>saveAll(),
 };
 document.addEventListener('keydown',e=>{
-  if((e.ctrlKey||e.metaKey)&&e.key==='s'&&activeTab==='trees'&&treesApi){
-    e.preventDefault();e.stopImmediatePropagation();treesApi.saveFromHost();
+  if((e.ctrlKey||e.metaKey)&&e.key==='s'&&activeTab==='environment'&&envApi){
+    e.preventDefault();e.stopImmediatePropagation();envApi.saveFromHost();
   }
 },true);
 
@@ -8180,7 +8195,7 @@ const ARCH_NODES={
     sym:['Simulation::EncodeWorldgen','Simulation::EncodeGenList','Simulation::EncodePageFill','caveFill','landColumn','colHeightAt','World::TerrainHeight','vnoise2d','caveBands','treeCandsInto'],
     doc:['DESIGN.md','docs/RESEARCH_worldgen.md'],
     rule:1,
-    children:['voxView','trees'],
+    children:['voxView','trees','biomes'],
     wip:'Terrain overhaul packages D-H: a global sea level with a LAVA_LID, domain-warped mountain ranges, 3D caves behind a province mask, and the fixed-compass climate.',
     details:'Purity is what lets a chunk be evicted without saving and regenerated identically later — and what lets the JITTER sentinel stand in for a whole chunk of never-touched terrain. A chunk the player has DUG is not representable by any sentinel and must go to a real page.<br><br><b>THE HEIGHT CONTRACT:</b> <code>World::TerrainHeight(x,z,seed)</code> &equiv; <code>genColumn(x,z,seed).h</code>, exactly. The GROUND — octaves, authored pool floors and rims, the pond bowl carve, the tarn berm — not the topmost solid voxel, which would include canopy and ruin walls and cannot be mirrored cheaply. <code>surfHeightAt</code> was a fourth height function that hand-copied this and had already drifted; it is gone. <code>check_invariants.py</code> token-compares the <code>MIRROR-BEGIN</code> blocks in the shader and in world.cpp, and the <code>terrain</code> gate&rsquo;s pass C1 compares CPU and GPU per voxel.<br><br><b>Q14 noise:</b> <code>vnoise2d</code> takes its cell as a LOG2 SHIFT, so <code>fdiv</code> becomes <code>&gt;&gt;</code> and <code>fmodp</code> becomes <code>&amp;</code> — zero integer divides where the legacy <code>vnoise</code> did five, and 14 bits of value instead of 8 (at a 1024-voxel amplitude an 8-bit LSB is a FOUR-VOXEL terrace). The legacy noise stays for the 14 decorative fields that call it. <code>&gt;&gt;</code> on a negative signed int is arithmetic in WGSL and in C++20 alike — that is the one place the two languages could have diverged.<br><br><b>Column hoists:</b> cave bands and tree candidates are pure in (x,z) and are computed once per column in <code>genChunk</code>, not once per cell. A buried column was recomputing <code>caveAt</code> 16 times (~93% of a buried chunk&rsquo;s worldgen cost), and <code>treeAt</code>&rsquo;s world-wide <code>TREE_MAX_TOP</code> reject became <code>cands.top</code>, a correct LOCAL ceiling that survives a wider terrain band. The <code>far</code> cascade sieve is column-major too: one thread owns one z row and four x, so 256 columns replace 4096.<br><br><b>Lava at rest (12c187c):</b> <code>caveFill(y)</code> routes every carve: lava at/below <code>LAVA_LEVEL=-80</code>, air above. The lateral boundary is stone at every level, so the only lava/air interface is one flat plane. This cut active-chunk count under flight from 521 → 23 (p50) and pool high-water by 11%.<br><br><b>Perched tarns:</b> a pond&rsquo;s waterline comes from its own CENTRE column and the annulus outside the disc is FORCED to <code>surf + pondBerm</code>, so containment is STRUCTURAL rather than a rim-sampling density — and 192 hashes per pond OR shore column become 8. Two rule-2 traps came with it, both reported by <code>ca-skip</code> rather than by anything near worldgen: the parabolic bowl is steepest at its rim, so <code>pondDepth</code> is now clamped against <code>pondRadiusMin</code> or the sand bed sits over the angle of repose and avalanches forever; and snow is a POWDER, so the authored pool rims now suppress it (<code>!inRim</code>) or it slides onto the lava and <code>snow + tag:hot &rarr; water</code> lights a front that never goes out.<br><br><b>THE OCTAVE LADDER (package C):</b> five rungs, lacunarity 4, persistence 1/4, so every rung has the SAME amplitude/wavelength ratio of 0.5 — detail without extra slope. Octaves are CENTRED deviations, which is what makes <code>baseHeight</code> the world&rsquo;s MEAN and leaves as much room below the datum for basins as above it for mountains. iq&rsquo;s derivative attenuation divides each rung by <code>1 + fbmAtten*|g|&sup2;</code> against the gradient accumulated above it: that is a rule-2 mechanism, not a look knob, because plain fBm sums five 0.5 slopes into 2.5 and puts the entire world above the CA&rsquo;s angle of repose.<br><br><b>The calm home area</b> fades only the two COARSE octaves toward the origin — fading the whole deviation would pin spawn to an exact plane 64 m across. The fade WIDTH is load-bearing: a ramp of magnitude A over width W adds slope up to 1.5&middot;A/W, and the <code>terrain</code> gate&rsquo;s pass A4 measures it so nobody has to guess.<br><br><b>The sediment wedge</b> puts metres of dirt over gravel on low flat ground and none on ridges. Both powders, so its slope gate reads the LANDFORM gradient (through the hill octave) rather than the full one: d(slope)/dcolumn for the grain octave is 96 Q8 — the whole gate range in ONE step — which turns a 24-voxel wedge into a 24-voxel cliff. Gated on the landform instead, 108 chunks still awake at tick 120 became 8.<br><br><b>Trees are metre-true again:</b> <code>VOX_PER_M</code> was a hardcoded 16, correct when a voxel was 6.25 cm and left behind when the world moved to 10 cm. Every tree was 1.6&times; its own table&rsquo;s documented size for that whole interval.'},
 
@@ -8581,6 +8596,15 @@ const ARCH_NODES={
     doc:['DESIGN.md'],
     details:'<b>The rule:</b> no authored quantity representing a physical length may be expressed in CELLS without also recording the cells-per-metre it was authored at.<br><br><b>Why it was needed.</b> <code>kVoxelMeters</code> had not moved since v0.2. When it went 0.10 &rarr; 0.05 the player controller was fine (<code>player.h</code> has said <code>0.85f / kVoxelMeters</code> forever) and everything AUTHORED halved: the human became 0.85 m <i>inside a 1.7 m capsule</i>, every tree halved, and the entire selftest suite stayed green &mdash; because every existing assertion is a count in the asset&rsquo;s own lattice, and those ratios all held.<br><br><b>Three classes.</b> Procedural assets (trees) are re-baked at the engine&rsquo;s scale and the file records it. Hand-authored .vox declares <code>artVoxelsPerMetre</code> and <code>skinScale</code> is DERIVED &mdash; the human is 80 art vox/m, so skinScale is 8 at 10 cm and 4 at 5 cm with the art file untouched and the collider getting finer for free. Scalar constants are metres in source, converted at use.<br><br><b>Two lattices meet at the rig.</b> <code>ld.anchor</code> is authored; <code>AutoAnchor</code> is measured off the (possibly block-replicated) prefab. They need different divisors &mdash; using one for both collapses an upsampled rig toward its own origin while the art still looks correct.<br><br><b>The gate is deliberately non-circular.</b> Most size checks reduce algebraically to <code>box / artVoxelsPerMetre</code> and would agree with themselves at any scale. <code>scale</code> compares the avatar&rsquo;s art height against <code>Player::kHalfY</code>, which comes from a different place entirely, and validates metre pins recorded at one voxel size against another.<br><br><b>Not yet covered:</b> worldgen&rsquo;s POI literals (arena/platform/ruins never took <code>vlen()</code>), explosion and spell radii, <code>gore.*</code>, <code>debris.min*Voxels</code> and the <code>sim.*</code> integer rows. At 5 cm those are what the remaining gate failures are.'},
 
+  biomes:{label:'Biomes + water presets (Environment tab)',tag:'gen',
+    desc:'A biome is a JSON file that SELECTS from component libraries — tree species, water-body presets, ground cover, cave bands — and says how often and where, one placement chain (rarity + conditions) per row. assets/water/*.json are body-of-water presets with a superellipse footprint, a depth-profile curve and vegetation by depth. The tuner\'s Environment tab hosts the biome pages and the Trees / Water bodies / Caves / Ground cover component pages.',
+    files:['assets/editor/environment.js','assets/editor/biome.js','assets/editor/water.js','assets/editor/envui.js','assets/editor/biomegen.js','assets/editor/watergen.js','assets/biomes/','assets/water/','src/sim/biomes.h','src/sim/biomes.cpp','src/test/selftest_biomes.cpp','scripts/seed_environment.mjs','scripts/test_environment.mjs','scripts/check_environment.sh','assets/environment_test.html','scripts/check_invariants.py','docs/PLAN_biomes.md'],
+    sym:['generateWaterBody','columnAt','profileAt','generateSwatch','speciesWeightsFrom','validateBiome','LoadBiomeSet','ValidateBiomeSet'],
+    tst:['biomes'],
+    doc:['DESIGN.md','docs/PLAN_biomes.md'],
+    rule:1,
+    wip:'Worldgen does not read the biome table yet: cover, water and cave stacks are authored, validated and previewed; only the tree weights reach the engine (through the .svtree mirror). PLAN_biomes.md §5 orders the seams.',
+    details:'<b>One owner per fact.</b> A species file owns what a tree looks like and what ground it tolerates; a water preset owns the shape of a body of water; a biome owns WHICH of them appear and how often. The tree WEIGHTS moved: they are edited on the biome page and mirrored into each species&rsquo; <code>placement.biomes</code> by <b>Sync atlas</b> (which re-bakes the changed <code>.svtree</code>s, so the world hash moves) or by <code>node scripts/seed_environment.mjs --sync</code>. The <code>biomes</code> gate and <code>check_invariants.py</code>&rsquo;s <code>biome order</code> hold the mirror and the five copies of the engine biome list together.<br><br><b>The placement chain.</b> Every feature row carries rarity + conditions (<code>minY</code>, <code>maxY</code>, <code>maxSlope</code> Q8, <code>nearWaterMin/Max</code> m, <code>patchThreshold</code>) &mdash; Minecraft&rsquo;s placed-feature model, chosen because it is the one modders already read. Rarity is authored in ONE form per stack and the others are shown read-only beside it (percent, per hectare, per km&sup2;), because &ldquo;1 in 4 of 44.8 m tiles&rdquo; is not a number anyone can picture.<br><br><b>watergen.js</b> is the one body-of-water shaper: superellipse footprint (<code>squareness</code> = the Lam&eacute; exponent) + fBm domain warp + smooth-min lobes + subtracted islands; a monotone-cubic depth PROFILE over the normalised radius (parabola / bathtub / shelf / cone / flat presets, editable by dragging points on the section canvas); fill + level; the engine&rsquo;s structural berm; bed by depth; a distance-ordered shore plant stack; emergent / floating / submerged bands by depth. Band widths are consequences of the bathymetry, not knobs. <code>columnAt()</code> is the one answer to &ldquo;what is at (x,z)&rdquo;, shared by the preset preview and the biome swatch.<br><br><b>biomegen.js</b> composes a swatch: a heightfield, the biome&rsquo;s water rows stamped through <code>columnAt</code> (showcase mode: one of each, centred &mdash; true rarity on a 24 m square is usually nothing), cover plants behind the patch mask, trees by weighted draw + conditions using the real treegen atlas cells. Deterministic: same files + seed = same cells, asserted by <code>test_environment.mjs</code>.<br><br><b>Engine today:</b> <code>src/sim/biomes.cpp</code> loads and validates; worldgen still runs its four hardcoded biome blocks and <code>pondAt</code>&rsquo;s one parabolic tarn. The wiring order (PLAN_biomes.md &sect;5): cover blocks and tree chances first (outside every CPU mirror), <code>biomeAt</code> from a table, pond geometry last.'},
   trees:{label:'Trees (baked atlas)',tag:'gen',
     desc:'Every tree voxel in the game is baked offline by assets/editor/treegen.js and sampled by worldgen from one storage buffer. The editor is the ONLY voxelizer: there is deliberately no C++ or WGSL copy of the generation algorithm, so what the tuner Trees tab shows is byte-for-byte what the world grows.',
     files:['assets/editor/treegen.js','assets/editor/trees.js','src/sim/treeatlas.h','src/sim/treeatlas.cpp','assets/shaders/worldgen.wgsl','scripts/bake_trees.mjs','scripts/test_treegen.mjs','scripts/shot_tree.mjs','scripts/check_trees.sh','assets/trees_test.html','src/test/selftest_trees.cpp','scripts/check_tabs.sh','assets/tabs_test.html'],
@@ -10254,6 +10278,7 @@ function renderEngine(){
   const recentSec=el('div',{class:'status-section'});
   recentSec.appendChild(el('h4',{},'Recently Landed'));
   const recentItems=[
+    {label:'The Environment tab: biomes, and the components a biome is built from',desc:'The Trees tab became one PAGE of a new Environment tab, beside a Water bodies library, the engine&rsquo;s Caves and Ground cover knobs, and one page per biome. A biome (<code>assets/biomes/*.json</code>) SELECTS from the libraries and says how often and where: every row of every stack &mdash; cover plants, tree species, water presets, cave bands &mdash; carries one placement chain (rarity + conditions), Minecraft&rsquo;s placed-feature model. Tree WEIGHTS moved to the biome files and are mirrored into each species&rsquo; <code>placement.biomes</code> by Sync atlas, which the <code>biomes</code> gate asserts. Water presets (<code>assets/water/*.json</code>: tarn, kettle, marsh, spring pool, oasis, playa, crater lake, lava pool, the spawn lake) are shaped by <code>watergen.js</code> &mdash; superellipse + fBm warp + lobes + islands, a draggable depth-profile curve, fill, berm, bed, shore and aquatic vegetation by depth &mdash; with a 3D view, a plan and a section. The biome page composes a swatch from the real tree atlas cells and the water presets. Worldgen does not read the biome table yet; <code>src/sim/biomes.cpp</code> validates it and docs/PLAN_biomes.md orders the seams. Verify: <code>node scripts/test_environment.mjs</code>, <code>bash scripts/check_environment.sh</code>, <code>--selftest --gate biomes</code>'},
     {label:'The shadows stopped spasming: a set for every key, a ramp for every edge',desc:'The shadow cache shipped direct-mapped and it showed: ~28k patches a frame shared a bucket with another visible patch and took turns evicting each other, so shadow pixels flickered across the ground and every newly revealed patch flashed lit for a frame. Now a key selects an 8-way SET (one cache line), a live slot is never stolen, the claim is a single CAS with the key stored last, and a losing SIMD lane adopts its sibling&rsquo;s slot instead of marching on to fill the set. The reader blends the four nearest patch centres bilinearly where a patch spans a pixel, so the 2.5 cm staircase is a ramp, and a returning patch keeps its last value instead of going bright. <code>--gate shadow-cache</code> grew a frame-to-frame flicker arm with the reference arm&rsquo;s own difference, the request count against the cap, a moved-pixel count and three dumped frames — each residual (0.030, 0.024, 5,620 px) was attributed by that output, not by elimination runs. Flicker: 0.000.'},
     {label:'The sword stops following the camera behind the body, and a swing can carry a body clip',desc:'Three fixes from one session. (1) The player&rsquo;s stroke basis was the raw camera, so in third person a camera orbited behind the character cut backwards at the lens; <code>ResolveSwingBasis</code> now yaws it back into a cone about the body like the neck (<code>melee.aimYaw</code> / <code>aimReleaseYaw</code>), pinned past the cone and released across the rear band, pitch untouched. (2) Clips can leave a sidecar: <code>assets/anims/&lt;name&gt;.json</code> is a shared library written by the clip lane&rsquo;s &ldquo;&rarr; library&rdquo;, compiled onto every rig it fits by <code>LoadMobDefs</code>, and an attack style&rsquo;s new <code>clip</code> field plays one with the stroke on both drivers. (3) The Attacks lane grew SOLO chips (windup / cut / recover, hold at the end) and a readout that names the seeded start pose, the windup target, the commit residual and the steering fit &mdash; the answer to &ldquo;every el is 0 and the blade still wanders&rdquo; is a windup shorter than the climb from a hanging arm.'},
     {label:'The tuner walks the way the game walks, and swings the way it swings',desc:'The Models tab grew an <b>ATTACKS</b> lane over <code>assets/mobs/attack_styles.json</code>, and the animation preview stopped disagreeing with the engine. The report was "the tuner’s walk is outdated — in game the legs move and both arms swing"; it was FOUR separate divergences stacked, and no unit test would ever have found any of them, because every function involved was individually correct.<br><br><b>(1) Nothing ever started a walk clip.</b> The gait layer places FEET; the arms swing because <code>walk</code> is PLAYING over it, and <code>avatar.cpp</code>’s exclusive locomotion family (idle/walk/run/fall/hang, 0.80/0.70 hysteresis, one live at a time) had no counterpart in the editor. Pressing K showed IK legs and rest arms — a pose the engine never produces while moving. <b>(2) The gait clock was the wrong one.</b> The preview ran the NPC free oscillator <code>cadence * speedFactor</code>; <code>avatar.cpp</code> measures the stride BETWEEN TOUCHDOWNS and corrects the phase at each. On the shipped human that is 4.6 strides/s against a real ~1.8, so the pelvis swayed at 2.6x the footfall rate and the stride-locked arm cycle pinned at its rate clamp of 3.0. <b>(3) The preview planted the HANDS.</b> <code>avatar.cpp</code> skips every chain not tagged <code>leg</code> ("arm chains never step"); <code>mob.cpp</code>’s NPC gait has no such filter and walks <code>sk.chains</code> whole, and the editor was transcribing the NPC path onto an avatar rig. Measured: hand.R tracked foot.R at a correlation of <b>-1.00</b> and the authored 26&deg; arm swing was reduced to 6&deg; of IK residue. <b>(4) A looping clip re-faded every cycle</b>, because <code>clipFade</code>’s blend-in read the wrapping playhead instead of <code>ageMs</code> — three dips a second on a 647 ms walk. Plus the spring goal on the pre-normalisation form, and stages 3.5 and 6 (spine twist, pose-limit clamp) present in both engine drivers and in neither preview.<br><br><b>(3) is a live question about the ENGINE.</b> The editor follows the avatar because the rigs authored here are humanoids whose hands must not step; whether <code>mob.cpp</code> should adopt the filter is about every NPC with an arm chain and was left alone.<br><br><b>The Attacks lane runs the real driver</b> — <code>assets/editor/melee.js</code> is a line-cited port of <code>melee.cpp</code> + <code>strokes.cpp</code>, not a curve plot, because a style’s authored angles are not where the blade goes: the reach is a BAND POSITION resolved against that rig’s own bones, the hand is the tip minus a MEASURED blade solved by a law of cosines, and the azimuth window, the hand-back plane and the head keep-out can each move the result. It steps at 30 Hz, draws the swept edge coloured by phase, and reports tip speed and edge alignment rather than inventing a second damage formula. The player flick compass is painted by SAMPLING <code>QuantizeStrike</code>, and the panel warns when a sector has become unreachable — sectors compete for the circle by max dot, so adding one can silently swallow another.<br><br><b>Two verifications, and the split is the point.</b> <code>node scripts/test_melee.mjs</code> (~1 s, 309 checks) covers the PORTS: hash vectors against an independent oracle, every style’s cut sweeping through its aim, the windup never committing the driver, the azimuth window, determinism, and every <code>tuning.json</code> melee key reaching the kernel. <code>bash scripts/check_attacks.sh</code> drives real Chrome against the real server and MEASURES the walk — that arms sweep, that they oppose (-1.00 against their own shoulders), that exactly one family member is live. Only the second one could have caught any of the four.<br><br>One incidental fix: the held-item preview derived its scale from a <code>scale</code> key no shipped asset states any more, so <code>rigScale / itemScale</code> read 1/1 instead of 8/4 and drew every blade at HALF LENGTH — which is not cosmetic here, because <code>SetStroke</code> measures the blade and the whole reach band is solved against it.'},
@@ -10314,6 +10339,7 @@ function renderEngine(){
   const plannedSec=el('div',{class:'status-section'});
   plannedSec.appendChild(el('h4',{},'Planned / Needed'));
   const plannedItems=[
+    {label:'Worldgen reads the biome table',badge:'needed',desc:'The Environment tab authors cover plants, water presets, cave bands and terrain overrides per biome, and the engine only validates them. Wiring order by risk (docs/PLAN_biomes.md &sect;5): (1) the per-biome cover blocks and <code>treeInfoAt</code>&rsquo;s tree chance read a BiomeSet storage buffer at binding 27 &mdash; all outside the CPU-mirrored blocks; (2) <code>biomeAt</code> picks from a table (or the planned climateAt grid) instead of three thresholds; (3) pond geometry from the water presets, which needs a C++ twin of the preset table under check_invariants&rsquo; token compare. Every step moves the hash once; none moves determinism'},
     {label:'Terrain overhaul packages C–H',badge:'planned',desc:'The scale pass (five-octave ladder with derivative attenuation, calm home-area ramp, datum to ~y200, slope-gated sediment wedge), then a global sea level with its LAVA_LID, sine-of-contours mountain ranges, 3D caves behind a province mask, and fixed-compass climate. Today the world has 5.6 m of relief while the far cascades render to 6.6 km at 51.2 m per cell — levels 6–8 are drawing a flat plane. Package B landed the foundations; docs/RESEARCH_worldgen.md is the decision record'},
     {label:'Wind primitives (phase 2)',badge:'needed',desc:'Fans and spell gusts as parametric objects on the op stream, with a bounded footprint wake through the mutation path. Now blocking two things at once: player-interactable wind, and switching settled-powder entrainment on — the footprint is what makes the wind rule-2 clean AND what tells the page table which chunks a wind-moved grain can land in'},
     {label:'2048³ window + 5 cm voxels',badge:'planned',desc:'Grow kWorldN from 512 to 2048, retune kVoxelMeters 0.10 → 0.05 — needs occupancy re-measurement first'},
@@ -10478,19 +10504,21 @@ try{
   if(s)s.textContent='the model editor failed to load: '+(e.message||e);
 }
 </script>
-<!-- The algorithmic tree editor. Its OWN try/catch and its own script block:
-     it shares no code with the voxel editor above (no three.js, no import map
-     — it draws through assets/worldview.js, which is a plain script), so a
-     failure in either must not take the other down. -->
+<!-- The Environment tab: biomes + trees + water bodies. Its OWN try/catch and
+     its own script block: it shares no code with the voxel editor above (no
+     three.js, no import map — it draws through assets/worldview.js, which is a
+     plain script), so a failure in either must not take the other down.
+     environment.js imports editor/trees.js, editor/water.js and
+     editor/biome.js itself. -->
 <script type="module">
 try{
-  const trees=await import('./editor/trees.js');
-  trees.attach(window.__tunerTreesHooks);
-  window.__tunerRegisterTrees(trees);
+  const env=await import('./editor/environment.js');
+  env.attach(window.__tunerEnvHooks);
+  window.__tunerRegisterEnv(env);
 }catch(e){
-  console.error('trees tab failed to initialise',e);
-  const s=document.querySelector('#view-trees');
-  if(s)s.textContent='the tree editor failed to load: '+(e.message||e);
+  console.error('environment tab failed to initialise',e);
+  const s=document.querySelector('#view-environment');
+  if(s)s.textContent='the environment editor failed to load: '+(e.message||e);
 }
 </script>
 <script>

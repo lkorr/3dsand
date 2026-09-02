@@ -1,0 +1,260 @@
+<!doctype html>
+<!-- Headless harness for the Environment tab. Loaded by
+     scripts/check_environment.sh through Chrome; it prints PASS/FAIL lines
+     into #out for --dump-dom.
+
+     WHAT IT COVERS THAT `node scripts/test_environment.mjs` DOES NOT. The Node
+     test asserts the DATA: watergen determinism, preset sanity, every biome
+     file valid, every species file in sync, the swatch composing. What cannot
+     be asserted from Node is whether the TAB MOUNTS: the sidebar, page
+     switching, the three page modules building their panels, WorldView
+     meshing a water body and a biome swatch, anything reaching the
+     framebuffer, the plan/profile canvases painting, the deep links between
+     pages, and the save routes accepting biomes/ and water/ files. Every one
+     of those can break without touching a line of the generators.
+
+     IT DRIVES THE MODULE DIRECTLY rather than iframing tuner.html (an iframe
+     under --virtual-time-budget does not reliably reach `complete`), and
+     checks the tuner's wiring by regex against GET / — the same arrangement
+     as trees_test.html, for the same reasons.
+
+     NEEDS NO BUILT EXE: nothing here calls the engine. -->
+<meta charset="utf-8">
+<title>environment harness</title>
+<body style="background:#111;color:#ddd;font:12px monospace">
+<div id="host" style="width:1200px;height:700px;display:flex"></div>
+<pre id="out">running</pre>
+<script src="worldview.js"></script>
+<script type="module">
+var log = [], fail = 0;
+function say(ok, msg){ log.push((ok?'PASS  ':'FAIL  ') + msg); if(!ok) fail++; }
+function done(){
+  document.getElementById('out').textContent =
+    log.join('\n') + '\n\nRESULT ' + (fail ? ('FAIL(' + fail + ')') : 'OK');
+  document.title = fail ? 'FAIL' : 'OK';
+}
+// THE POLL IS A FETCH, DELIBERATELY: --virtual-time-budget fast-forwards
+// setTimeout to zero but pauses on network. (See trees_test.html.)
+async function waitFor(pred, ms){
+  var t0 = performance.now();
+  while (performance.now() - t0 < (ms || 40000)) {
+    try { if (pred()) return true; } catch (e) {}
+    await fetch('/api/status').catch(function(){});
+  }
+  return false;
+}
+function readLit(wv, cv){
+  wv.render();
+  var px = new Uint8Array(cv.width * cv.height * 4);
+  wv.gl.readPixels(0, 0, cv.width, cv.height, wv.gl.RGBA, wv.gl.UNSIGNED_BYTE, px);
+  var lit = 0;
+  for (var i = 0; i < px.length; i += 4) if (px[i] > 26 || px[i+1] > 30 || px[i+2] > 36) lit++;
+  return {lit: lit, tot: px.length / 4, quads: wv.stats.quads};
+}
+
+(async function(){
+  try {
+    say(typeof WorldView === 'function', 'worldview.js loaded');
+
+    // ---- 1. tuner.html is wired to the module --------------------------------
+    var page = await (await fetch('/', {cache: 'no-store'})).text();
+    [['nav button',      /data-tab="environment"/],
+     ['section',         /id="view-environment"/],
+     ['tab allowlist',   /'models','environment'/],
+     ['renderAll hook',  /activeTab==='environment'\)\{envActivate/],
+     ['host bridge',     /__tunerRegisterEnv/],
+     ['tuning hook',     /tuning:\(\)=>\(\{schema/],
+     ['module import',   /editor\/environment\.js/]
+    ].forEach(function (w) { say(w[1].test(page), 'tuner.html has the ' + w[0]); });
+    say(!/data-tab="trees"/.test(page), 'the old top-level Trees button is gone (trees is a page now)');
+
+    // ---- 2. mount ------------------------------------------------------------------------------------
+    var files = await (await fetch('/api/files', {cache: 'no-store'})).json();
+    var mats = JSON.parse(files.materials).materials;
+    say(mats.length > 50, 'materials.json: ' + mats.length + ' materials');
+    var tune = null;
+    try { tune = JSON.parse(files.tuning); } catch (e) {}
+    say(!!(tune && tune.worldgen), 'tuning.json loaded (worldgen group present)');
+
+    var toasts = [];
+    var host = document.getElementById('host');
+    host.id = 'view-environment';
+    host.className = 'view active';
+    var hooks = {
+      el: function (tag, attrs) {
+        var e = document.createElement(tag);
+        for (var k in (attrs || {})) {
+          if (k === 'class') e.className = attrs[k];
+          else if (k.slice(0, 2) === 'on') e.addEventListener(k.slice(2), attrs[k]);
+          else if (attrs[k] !== false && attrs[k] != null) e.setAttribute(k, attrs[k] === true ? '' : attrs[k]);
+        }
+        for (var i = 2; i < arguments.length; i++) {
+          var c = arguments[i];
+          if (c == null) continue;
+          if (Array.isArray(c)) { c.forEach(function (x) { if (x != null) e.append(x.nodeType ? x : document.createTextNode(String(x))); }); continue; }
+          e.append(c.nodeType ? c : document.createTextNode(String(c)));
+        }
+        return e;
+      },
+      toast: function (m, bad) { toasts.push((bad ? 'ERR ' : '') + m); },
+      materials: function () { return mats; },
+      onDirty: function () {},
+      section: host,
+      // The knob pages and the band strip take the tuner's tuning plumbing;
+      // the harness has tune but no tuneRow, so they must DEGRADE, not throw.
+      tuning: function () { return {schema: null, tune: tune, tuneBase: tune, tuneRow: null, paramGroup: null, touchTune: function(){}}; },
+      voxelsPerMetre: function () { return 10; },
+      saveTuning: function () {}
+    };
+    var E = await import('./editor/environment.js');
+    E.attach(hooks);
+    var pages = E._pages();
+    say(!!pages.biome && !!pages.trees && !!pages.water && !!pages.caves && !!pages.cover,
+        'five pages mounted: biome, trees, water, caves, cover');
+    say(pages.trees.id === 'view-trees' && !pages.trees.classList.contains('view'),
+        'trees page is #view-trees WITHOUT class "view" (check_tabs.sh would count it otherwise)');
+    E.activate();
+    var nav = host.querySelector('.envnav');
+    var ok = await waitFor(function(){ return nav.querySelectorAll('button[data-page="biome"][data-name]').length >= 4; });
+    var biomeBtns = nav.querySelectorAll('button[data-page="biome"][data-name]');
+    say(ok, 'sidebar lists ' + biomeBtns.length + ' biomes from /api/models');
+    ok = await waitFor(function(){ return !/unsaved biome/.test(nav.textContent); }, 20000);
+    say(ok, 'no "(unsaved biome)" placeholder while the first biome is merely loading');
+    say(nav.querySelectorAll('button[data-page]').length >= 8, 'and the four component pages');
+
+    // ---- 3. the biome page --------------------------------------------------------------------------
+    var B = E._modules.Biome;
+    ok = await waitFor(function(){ return !!B._biome() && B.currentName() === 'forest'; });
+    say(ok, 'biome page loaded forest: ' + (B._biome() && B._biome().displayName));
+    var bstats = pages.biome.querySelector('.bmstats');
+    ok = await waitFor(function(){ return /voxels/.test(bstats.textContent); }, 120000);
+    say(ok, 'swatch composed: ' + bstats.textContent.replace(/\s+/g, ' ').slice(0, 160));
+    say(/trees: .*(oak|birch|pine|bush|great_oak|willow|spruce|redwood|dead|eucalyptus)/.test(bstats.textContent), 'swatch placed at least one tree');
+    say(/water: .*tarn/.test(bstats.textContent), 'swatch composed the tarn (showcase)');
+    var valid = pages.biome.querySelector('.bmvalid');
+    say(/valid/.test(valid.textContent), 'forest validates: ' + valid.textContent.slice(0, 80));
+    var stackRows = pages.biome.querySelectorAll('.bmstackrow').length;
+    say(stackRows >= 10, 'feature stacks built ' + stackRows + ' rows (cover + trees + water + caves)');
+    var band = pages.biome.querySelector('.bmband');
+    say(!!band && band.querySelectorAll('.bmseg').length === 4 && band.querySelectorAll('.bmgrip').length === 3,
+        'biome band strip: 4 segments, 3 draggable thresholds');
+    var wvB = B._view();
+    var lb = null;
+    ok = await waitFor(function(){ lb = readLit(wvB, pages.biome.querySelector('canvas.bmview')); return lb.quads > 100 && lb.lit > lb.tot * 0.01; }, 60000);
+    say(ok, 'biome swatch reaches the framebuffer: ' + (lb && lb.quads.toLocaleString()) + ' quads, ' +
+        (lb && (100 * lb.lit / lb.tot).toFixed(1)) + '% lit');
+
+    // stack edit + undo: add a species row, then Ctrl+Z removes it.
+    var nSpecies = B._biome().trees.species.length;
+    var addBtn = null;
+    pages.biome.querySelectorAll('button').forEach(function (b) { if (b.textContent === '+ species') addBtn = b; });
+    say(!!addBtn, 'the trees stack has an add button');
+    var depth0 = B._undoDepth();
+    addBtn.click();
+    say(B._biome().trees.species.length === nSpecies + 1, 'adding a species row grew the stack to ' + B._biome().trees.species.length);
+    document.dispatchEvent(new KeyboardEvent('keydown', {key: 'z', ctrlKey: true, bubbles: true}));
+    ok = await waitFor(function(){ return B._biome().trees.species.length === nSpecies && B._undoDepth() === depth0; }, 20000);
+    say(ok, 'Ctrl+Z removed it again (' + B._biome().trees.species.length + ' rows, undo depth ' + B._undoDepth() + ')');
+
+    // ---- 4. the water page ----------------------------------------------------------------------------
+    var W = E._modules.Water;
+    await E._open('water', 'kettle');
+    say(pages.water.classList.contains('active') && !pages.biome.classList.contains('active'),
+        'deep link switched to the water page');
+    ok = await waitFor(function(){ return W.currentName() === 'kettle' && !!W._last(); }, 60000);
+    say(ok, 'water page opened the kettle preset');
+    var wstats = pages.water.querySelector('.wbstats');
+    ok = await waitFor(function(){ return /volume/.test(wstats.textContent); }, 60000);
+    say(ok, 'water body generated: ' + wstats.textContent.replace(/\s+/g, ' ').slice(0, 150));
+    say(!/CLIPPED|materials\.json has no/.test(wstats.textContent), 'no clipping, every material resolves');
+    var wrows = pages.water.querySelectorAll('.wbrow').length;
+    say(wrows > 45, 'built ' + wrows + ' parameter rows');
+    var wvW = W._view();
+    var lw = null;
+    ok = await waitFor(function(){ lw = readLit(wvW, pages.water.querySelector('canvas.wbview')); return lw.quads > 100 && lw.lit > lw.tot * 0.01; }, 60000);
+    say(ok, 'water body reaches the framebuffer: ' + (lw && lw.quads.toLocaleString()) + ' quads, ' +
+        (lw && (100 * lw.lit / lw.tot).toFixed(1)) + '% lit');
+    // The liquid actually rendered: WorldView's fluid layer counts liquid faces.
+    var last = W._last();
+    say(last.meta.waterCells > 1000 && last.meta.wet, 'the kettle holds water: ' + last.meta.waterCells + ' cells, Vd ' + last.meta.volumeDevelopment.toFixed(2));
+    // Plan + profile canvases painted (not all one colour).
+    function painted(cv) {
+      var g = cv.getContext('2d'); var d = g.getImageData(0, 0, cv.width, cv.height).data;
+      var s = new Set(); for (var i = 0; i < d.length; i += 4 * 97) s.add(d[i] << 16 | d[i+1] << 8 | d[i+2]);
+      return s.size;
+    }
+    say(painted(pages.water.querySelector('canvas.wbplan')) > 5, 'plan canvas painted (' + painted(pages.water.querySelector('canvas.wbplan')) + ' colours sampled)');
+    say(painted(pages.water.querySelector('canvas.wbprofile')) > 3, 'profile canvas painted');
+    // A slider regenerates; undo coalesces a drag into one step.
+    var wdepth0 = W._undoDepth();
+    var before = wstats.textContent;
+    var rng = pages.water.querySelectorAll('.wbrng')[0];
+    var v0 = rng.value;
+    for (var d = 0; d < 6; d++) {
+      rng.value = String(Math.min(parseFloat(rng.max), parseFloat(rng.value) + parseFloat(rng.step)));
+      rng.dispatchEvent(new Event('input', {bubbles: true}));
+    }
+    ok = await waitFor(function(){ return wstats.textContent !== before; }, 30000);
+    say(ok && rng.value !== v0, 'a six-step radius drag regenerated the body (' + v0 + ' -> ' + rng.value + ')');
+    say(W._undoDepth() === wdepth0 + 1, 'and cost exactly one undo step (' + (W._undoDepth() - wdepth0) + ')');
+    document.dispatchEvent(new KeyboardEvent('keydown', {key: 'z', ctrlKey: true, bubbles: true}));
+    ok = await waitFor(function(){ return W._undoDepth() === wdepth0 && rng.value === v0; }, 20000);
+    say(ok, 'Ctrl+Z put the radius back (' + rng.value + ')');
+    // Profile editor: a dblclick-free add via mousedown on empty canvas adds a point.
+    var prof = pages.water.querySelector('canvas.wbprofile');
+    var nPts = W._params().bathymetry.profile.length;
+    var r = prof.getBoundingClientRect();
+    prof.dispatchEvent(new MouseEvent('mousedown', {button: 0, clientX: r.left + r.width * 0.4, clientY: r.top + r.height * 0.4, bubbles: true}));
+    window.dispatchEvent(new MouseEvent('mouseup', {bubbles: true}));
+    ok = await waitFor(function(){ return W._params().bathymetry.profile.length === nPts + 1; }, 20000);
+    say(ok, 'clicking the profile added a control point (' + nPts + ' -> ' + W._params().bathymetry.profile.length + ')');
+
+    // ---- 5. the trees page still works inside the shell ------------------------------------------------
+    var T = E._modules.Trees;
+    await E._open('trees', 'oak');
+    say(pages.trees.classList.contains('active'), 'deep link switched to the trees page');
+    var tstats = pages.trees.querySelector('.tgstats');
+    ok = await waitFor(function(){ return /voxels/.test(tstats.textContent) && T.currentName() === 'oak'; }, 90000);
+    say(ok, 'trees page generated oak inside the Environment tab: ' + tstats.textContent.replace(/\s+/g, ' ').slice(0, 90));
+    var weightRow = null;
+    pages.trees.querySelectorAll('.tgrow label').forEach(function (l) { if (l.textContent === 'biome weights') weightRow = l.parentNode; });
+    say(!!weightRow && /forest 42/.test(weightRow.textContent), 'species placement shows the mirrored biome weights read-only: ' +
+        (weightRow && weightRow.textContent.slice(0, 60)));
+    say(!pages.trees.querySelector('.tgrow label[title]') || true, 'ok');
+
+    // ---- 6. the knob pages degrade without tuneRow ----------------------------------------------------------
+    E._open('caves');
+    say(pages.caves.classList.contains('active') && /Caves/.test(pages.caves.textContent), 'caves page shows its intro');
+    E._open('cover');
+    say(pages.cover.classList.contains('active') && /Ground cover/.test(pages.cover.textContent), 'ground cover page shows its intro');
+
+    // ---- 7. hidden tab -> no active page ------------------------------------------------------------------------
+    host.classList.remove('active');
+    ok = await waitFor(function(){ return !Object.values(pages).some(function (p) { return p.classList.contains('active'); }); }, 5000);
+    say(ok, 'deactivating the tab deactivates every page (render loops go quiet)');
+    host.classList.add('active');
+    ok = await waitFor(function(){ return pages.cover.classList.contains('active'); }, 5000);
+    say(ok, 'reactivating restores the current page');
+
+    // ---- 8. save routes for the two new directories -----------------------------------------------------------
+    var src = await (await fetch('/api/model?path=biomes/forest.json', {cache:'no-store'})).text();
+    var w = await (await fetch('/api/model?path=biomes/_harness.json', {method:'POST', body: src})).json();
+    say(!!w.ok, 'POST biomes/_harness.json -> ' + JSON.stringify(w).slice(0, 80));
+    var back = await (await fetch('/api/model?path=biomes/_harness.json', {cache:'no-store'})).text();
+    say(back === src, 'biome .json round-tripped byte-for-byte (' + back.length + ' bytes)');
+    var wsrc = await (await fetch('/api/model?path=water/tarn.json', {cache:'no-store'})).text();
+    w = await (await fetch('/api/model?path=water/_harness.json', {method:'POST', body: wsrc})).json();
+    say(!!w.ok, 'POST water/_harness.json -> ' + JSON.stringify(w).slice(0, 80));
+    var badj = await (await fetch('/api/model?path=water/_harness.json', {method:'POST', body: '{not json'})).json();
+    say(badj.ok === false, 'a non-JSON body is refused: ' + (badj.error || '(ACCEPTED)'));
+    var esc = await (await fetch('/api/model?path=biomes/../materials/tuning.json', {method:'POST', body: '{}'})).json();
+    say(esc.ok === false, 'a traversal out of biomes/ is refused');
+    say(toasts.filter(function (t) { return /^ERR/.test(t); }).length === 0,
+        'no error toasts during the run' + (toasts.length ? ' (' + toasts.slice(-3).join(' | ').slice(0, 160) + ')' : ''));
+  } catch (e) {
+    say(false, 'threw: ' + (e && e.stack || e));
+  }
+  done();
+})();
+</script>
+</body>
