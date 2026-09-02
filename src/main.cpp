@@ -2122,7 +2122,8 @@ int main(int argc, char** argv) {
           "  --scenario <id>       One --perf scenario (idle|treeburn|flythrough|explosion|water)\n"
           "  --perf-out <path>     Where --perf writes its JSON\n"
           "  --perf-w/--perf-h <n> Offscreen render size for --perf/--render-budget\n"
-          "  --render-budget       Where INSIDE the raymarch the GPU frame went\n\n"
+          "  --render-budget       Where INSIDE the raymarch the GPU frame went\n"
+          "  --budget-cams <list>  --render-budget cameras (noon,dusk,submerged; default all)\n\n"
           "Residency:\n"
           "  --residency paged|dense  Voxel buffer residency mode (default: paged)\n\n"
           "Vulkan / debug:\n"
@@ -2231,6 +2232,16 @@ int main(int argc, char** argv) {
       if (i + 1 >= argc) { std::fprintf(stderr, "--scenario requires a scenario id\n"); return 1; }
       perfOpt.only = argv[++i];
       perf = true;
+    }
+    // `--budget-cams noon,dusk,submerged` picks which of --render-budget's
+    // cameras run (default: all three). It does NOT imply --render-budget —
+    // unlike --scenario, which has to imply --perf because that is the only
+    // harness it means anything to. This one is a modifier on a mode you
+    // already asked for, and silently turning a 3-camera budget on because
+    // somebody named a camera would be a surprise.
+    else if (a == "--budget-cams") {
+      if (i + 1 >= argc) { std::fprintf(stderr, "--budget-cams requires a comma-separated camera list\n"); return 1; }
+      perfOpt.cams = argv[++i];
     }
     else if (a == "--perf-out") {
       if (i + 1 >= argc) { std::fprintf(stderr, "--perf-out requires a path\n"); return 1; }
