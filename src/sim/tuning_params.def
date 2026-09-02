@@ -644,6 +644,71 @@ TP_U(worldgen, biomeLog2, TUNE_BIOME_LOG2, 9)
 TP_U(worldgen, desertThreshold, TUNE_DESERT_THRESHOLD, 214)
 TP_U(worldgen, pineThreshold, TUNE_PINE_THRESHOLD, 176)
 TP_U(worldgen, meadowThreshold, TUNE_MEADOW_THRESHOLD, 92)
+// ---- per-biome height curves (13.3.3) ----
+// NINE knots per biome, on a UNIFORM input grid spanning the full swing of the
+// two coarse octaves, +-(contAmplitude + rangeAmplitude)/2. Values are Q14 over
+// the same range: -16384 is the bottom of the swing, +16384 the top.
+//
+// NINE, not eight, because eight knots is SEVEN intervals and the identity
+// curve's values would be -16384 + i*32768/7 -- not integers, so an identity
+// curve could not be authored and "the default moves nothing" could not be
+// proved. Nine is eight intervals and the identity is -16384 + i*4096 exactly,
+// which is what all four biomes default to below. With those defaults the whole
+// feature const-folds out of the shader (worldgen.wgsl CURVE_IDENT_ALL) and the
+// world hash does not move.
+//
+// Reading a row: knot i is the ground height the biome has where the raw
+// landform sits at input i. Below the diagonal is FLATTER than natural, above
+// it is STEEPER; a run of equal values is a plateau; the interpolation is a
+// monotone cubic, so a plateau is flat and a ramp has no crease.
+//
+// The curve is applied to the CONTINENTAL and RANGE rungs only, so it moves the
+// landform and never the texture on it. Its own slope scales the accumulated
+// gradient the finer rungs are attenuated against, which is why a flattened
+// biome also stops attenuating its hills as though the mountains were there.
+TP_I(worldgen, curveForest0, TUNE_CURVE_FOREST0, -16384)
+TP_I(worldgen, curveForest1, TUNE_CURVE_FOREST1, -12288)
+TP_I(worldgen, curveForest2, TUNE_CURVE_FOREST2, -8192)
+TP_I(worldgen, curveForest3, TUNE_CURVE_FOREST3, -4096)
+TP_I(worldgen, curveForest4, TUNE_CURVE_FOREST4, 0)
+TP_I(worldgen, curveForest5, TUNE_CURVE_FOREST5, 4096)
+TP_I(worldgen, curveForest6, TUNE_CURVE_FOREST6, 8192)
+TP_I(worldgen, curveForest7, TUNE_CURVE_FOREST7, 12288)
+TP_I(worldgen, curveForest8, TUNE_CURVE_FOREST8, 16384)
+TP_I(worldgen, curvePine0, TUNE_CURVE_PINE0, -16384)
+TP_I(worldgen, curvePine1, TUNE_CURVE_PINE1, -12288)
+TP_I(worldgen, curvePine2, TUNE_CURVE_PINE2, -8192)
+TP_I(worldgen, curvePine3, TUNE_CURVE_PINE3, -4096)
+TP_I(worldgen, curvePine4, TUNE_CURVE_PINE4, 0)
+TP_I(worldgen, curvePine5, TUNE_CURVE_PINE5, 4096)
+TP_I(worldgen, curvePine6, TUNE_CURVE_PINE6, 8192)
+TP_I(worldgen, curvePine7, TUNE_CURVE_PINE7, 12288)
+TP_I(worldgen, curvePine8, TUNE_CURVE_PINE8, 16384)
+TP_I(worldgen, curveMeadow0, TUNE_CURVE_MEADOW0, -16384)
+TP_I(worldgen, curveMeadow1, TUNE_CURVE_MEADOW1, -12288)
+TP_I(worldgen, curveMeadow2, TUNE_CURVE_MEADOW2, -8192)
+TP_I(worldgen, curveMeadow3, TUNE_CURVE_MEADOW3, -4096)
+TP_I(worldgen, curveMeadow4, TUNE_CURVE_MEADOW4, 0)
+TP_I(worldgen, curveMeadow5, TUNE_CURVE_MEADOW5, 4096)
+TP_I(worldgen, curveMeadow6, TUNE_CURVE_MEADOW6, 8192)
+TP_I(worldgen, curveMeadow7, TUNE_CURVE_MEADOW7, 12288)
+TP_I(worldgen, curveMeadow8, TUNE_CURVE_MEADOW8, 16384)
+TP_I(worldgen, curveDesert0, TUNE_CURVE_DESERT0, -16384)
+TP_I(worldgen, curveDesert1, TUNE_CURVE_DESERT1, -12288)
+TP_I(worldgen, curveDesert2, TUNE_CURVE_DESERT2, -8192)
+TP_I(worldgen, curveDesert3, TUNE_CURVE_DESERT3, -4096)
+TP_I(worldgen, curveDesert4, TUNE_CURVE_DESERT4, 0)
+TP_I(worldgen, curveDesert5, TUNE_CURVE_DESERT5, 4096)
+TP_I(worldgen, curveDesert6, TUNE_CURVE_DESERT6, 8192)
+TP_I(worldgen, curveDesert7, TUNE_CURVE_DESERT7, 12288)
+TP_I(worldgen, curveDesert8, TUNE_CURVE_DESERT8, 16384)
+// How wide, in biome-band units (the same 0..255 scale the three THRESHOLD
+// knobs are authored in), the two neighbouring biomes' curves are crossfaded
+// across a boundary. A hard switch puts a CLIFF along every biome edge: the
+// curve reshapes rungs whose amplitude is 100 m, so two different curves
+// meeting on a contour is a step of tens of voxels. Keep it under half the
+// smallest gap between thresholds.
+TP_I(worldgen, biomeBlend, TUNE_BIOME_BLEND, 12)
 TP_I(worldgen, treeTile, TUNE_TREE_TILE, 144)
 TP_U(worldgen, treeChanceForest, TUNE_TREE_CHANCE_FOREST, 78)
 TP_U(worldgen, treeChancePine, TUNE_TREE_CHANCE_PINE, 70)

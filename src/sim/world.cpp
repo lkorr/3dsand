@@ -747,6 +747,180 @@ struct IV2 {
 };
 static IV2 iv2(int a, int b) { IV2 v; v.x = a; v.y = b; return v; }
 
+// ---- the biome field and the per-biome height curves, mirrored -------------
+//
+// OUTSIDE the tagged region on purpose. check_invariants.py TOKEN-COMPARES the
+// `height` blocks, and this body cannot be spelled identically in both
+// languages -- WGSL's knots come from a select chain over 36 TUNE_* consts and
+// C++'s from an indexed array. What IS token-compared is the CALL, one line
+// inside landAt, which is the part that could silently stop happening. The
+// `terrain` gate's pass C1 compares the two implementations per voxel over
+// 9,409 columns, and that is the proof this block is right.
+//
+// See the long note over the same functions in worldgen.wgsl for why there are
+// nine knots and not eight, why the domain is HALF what the plan said, and the
+// three separate things that make the identity curve bit-exact.
+constexpr int kBForest = 0, kBMeadow = 1, kBPine = 2, kBDesert = 3;
+constexpr int kCurveKnots = 9;
+constexpr int kCurveSegs = 8;
+
+static int biomeBand(int x, int z, uint32_t seed) {
+  const uint32_t cs = (uint32_t)WG().biomeLog2;
+  return (vnoise2d(x, z, cs, seed ^ 0x1Bu).n >> 6)
+       + (((vnoise2d(x, z, cs - 2u, seed ^ 0x1Cu).n >> 6) - 128) / 3);
+}
+
+static int biomeFromBand(int b) {
+  if (b > WG().desertThreshold) return kBDesert;
+  if (b > WG().pineThreshold) return kBPine;
+  if (b < WG().meadowThreshold) return kBMeadow;
+  return kBForest;
+}
+
+static bool curveIdentAll() {
+  return WG().curveForest0 == -16384 &&
+         WG().curveForest1 == -12288 &&
+         WG().curveForest2 == -8192 &&
+         WG().curveForest3 == -4096 &&
+         WG().curveForest4 == 0 &&
+         WG().curveForest5 == 4096 &&
+         WG().curveForest6 == 8192 &&
+         WG().curveForest7 == 12288 &&
+         WG().curveForest8 == 16384 &&
+         WG().curvePine0 == -16384 &&
+         WG().curvePine1 == -12288 &&
+         WG().curvePine2 == -8192 &&
+         WG().curvePine3 == -4096 &&
+         WG().curvePine4 == 0 &&
+         WG().curvePine5 == 4096 &&
+         WG().curvePine6 == 8192 &&
+         WG().curvePine7 == 12288 &&
+         WG().curvePine8 == 16384 &&
+         WG().curveMeadow0 == -16384 &&
+         WG().curveMeadow1 == -12288 &&
+         WG().curveMeadow2 == -8192 &&
+         WG().curveMeadow3 == -4096 &&
+         WG().curveMeadow4 == 0 &&
+         WG().curveMeadow5 == 4096 &&
+         WG().curveMeadow6 == 8192 &&
+         WG().curveMeadow7 == 12288 &&
+         WG().curveMeadow8 == 16384 &&
+         WG().curveDesert0 == -16384 &&
+         WG().curveDesert1 == -12288 &&
+         WG().curveDesert2 == -8192 &&
+         WG().curveDesert3 == -4096 &&
+         WG().curveDesert4 == 0 &&
+         WG().curveDesert5 == 4096 &&
+         WG().curveDesert6 == 8192 &&
+         WG().curveDesert7 == 12288 &&
+         WG().curveDesert8 == 16384;
+}
+
+static int pick9(int i, int a0, int a1, int a2, int a3, int a4, int a5, int a6,
+                 int a7, int a8) {
+  int v = a0;
+  if (i == 1) v = a1;
+  if (i == 2) v = a2;
+  if (i == 3) v = a3;
+  if (i == 4) v = a4;
+  if (i == 5) v = a5;
+  if (i == 6) v = a6;
+  if (i == 7) v = a7;
+  if (i == 8) v = a8;
+  return v;
+}
+
+static int curveKnot(int b, int i) {
+  const int j = std::clamp(i, 0, kCurveKnots - 1);
+  if (b == kBForest)
+    return pick9(j, WG().curveForest0, WG().curveForest1, WG().curveForest2, WG().curveForest3, WG().curveForest4, WG().curveForest5, WG().curveForest6, WG().curveForest7, WG().curveForest8);
+  if (b == kBPine)
+    return pick9(j, WG().curvePine0, WG().curvePine1, WG().curvePine2, WG().curvePine3, WG().curvePine4, WG().curvePine5, WG().curvePine6, WG().curvePine7, WG().curvePine8);
+  if (b == kBMeadow)
+    return pick9(j, WG().curveMeadow0, WG().curveMeadow1, WG().curveMeadow2, WG().curveMeadow3, WG().curveMeadow4, WG().curveMeadow5, WG().curveMeadow6, WG().curveMeadow7, WG().curveMeadow8);
+  return pick9(j, WG().curveDesert0, WG().curveDesert1, WG().curveDesert2, WG().curveDesert3, WG().curveDesert4, WG().curveDesert5, WG().curveDesert6, WG().curveDesert7, WG().curveDesert8);
+}
+
+static int curveTangent(int dPrev, int dNext) {
+  if (dPrev * dNext <= 0) return 0;
+  return (2 * dPrev * dNext) / (dPrev + dNext);
+}
+
+static int curveHi() {
+  return (WG().contAmplitude + WG().rangeAmplitude) / 2;
+}
+
+// (value in voxels, d(value)/d(input) in Q8), as the shader's vec2<i32>.
+static IV2 curveOne(int b, int u) {
+  const int hi = std::max(curveHi(), 1);
+  const int uc = std::clamp(u, -hi, hi);
+  const int p = std::clamp(((uc + hi) * (kCurveSegs << 12)) / (2 * hi), 0,
+                           kCurveSegs << 12);
+  const int seg = std::min(p >> 12, kCurveSegs - 1);
+  const int t = p - (seg << 12);
+  const int km = curveKnot(b, seg - 1);
+  const int k0 = curveKnot(b, seg);
+  const int k1 = curveKnot(b, seg + 1);
+  const int k2 = curveKnot(b, seg + 2);
+  const int d0 = k1 - k0;
+  const int m0 = (seg == 0) ? d0 : curveTangent(k0 - km, d0);
+  const int m1 = (seg == kCurveSegs - 1) ? d0 : curveTangent(d0, k2 - k1);
+
+  const int t2 = (t * t) >> 12;
+  const int t3 = (t2 * t) >> 12;
+  const int h00 = 2 * t3 - 3 * t2 + 4096;
+  const int h10 = t3 - 2 * t2 + t;
+  const int h01 = 3 * t2 - 2 * t3;
+  const int h11 = t3 - t2;
+  const int v = (k0 * h00 + m0 * h10 + k1 * h01 + m1 * h11) >> 12;
+
+  const int g00 = 6 * t2 - 6 * t;
+  const int g10 = 3 * t2 - 4 * t + 4096;
+  const int g01 = 6 * t - 6 * t2;
+  const int g11 = 3 * t2 - 2 * t;
+  const int dv = (k0 * g00 + m0 * g10 + k1 * g01 + m1 * g11) >> 12;
+
+  return iv2(uc + (((v - (p - 16384)) * hi) >> 14),
+             std::clamp(dv >> 4, 0, 4096));
+}
+
+// (loBiome, hiBiome, Q8 weight of hi) -- the shader's vec3<i32>, unpacked.
+static void curveBiomePair(int band, int* lo, int* hi, int* w) {
+  const int hard = biomeFromBand(band);
+  *lo = hard; *hi = hard; *w = 0;
+  const int bw = std::max(WG().biomeBlend, 0);
+  if (bw <= 0) return;
+  const int tm = WG().meadowThreshold;
+  const int tp = WG().pineThreshold;
+  const int td = WG().desertThreshold;
+  if (band > tm - bw && band <= tm + bw) {
+    *lo = kBMeadow; *hi = kBForest;
+    *w = ((band - (tm - bw)) * 256) / (2 * bw);
+    return;
+  }
+  if (band > tp - bw && band <= tp + bw) {
+    *lo = kBForest; *hi = kBPine;
+    *w = ((band - (tp - bw)) * 256) / (2 * bw);
+    return;
+  }
+  if (band > td - bw && band <= td + bw) {
+    *lo = kBPine; *hi = kBDesert;
+    *w = ((band - (td - bw)) * 256) / (2 * bw);
+    return;
+  }
+}
+
+static IV2 biomeCurve(int x, int z, int u, uint32_t seed) {
+  if (curveIdentAll()) return iv2(u, 256);
+  int bl = 0, bh = 0, w = 0;
+  curveBiomePair(biomeBand(x, z, seed), &bl, &bh, &w);
+  const IV2 lo = curveOne(bl, u);
+  if (w <= 0) return lo;
+  const IV2 hg = curveOne(bh, u);
+  return iv2(lo.x + (((hg.x - lo.x) * w) >> 8),
+             lo.y + (((hg.y - lo.y) * w) >> 8));
+}
+
 // MIRROR-BEGIN height
 // The height chain, mirrored. Everything here is a pure function of (x, z,
 // seed) and of the worldgen tuning; nothing reads a material id, which is what
@@ -782,8 +956,13 @@ static Land landAt(int x, int z, uint32_t seed) {
   Oct o0 = octave(x, z, WG().contLog2, WG().contAmplitude, 0, 0, seed ^ 1u);
   Oct o1 = octave(x, z, WG().rangeLog2, WG().rangeAmplitude,
                   o0.gx, o0.gz, seed ^ 2u);
-  int g1x = o0.gx + o1.gx;
-  int g1z = o0.gz + o1.gz;
+  // The per-biome height curve, on the two COARSE rungs only. cv.y is the
+  // curve's own slope in Q8 and it scales the accumulated gradient rather than
+  // the deviation, so iq's attenuation of hill/detail/grain keeps describing
+  // the ground it is actually attenuating against. See worldgen.wgsl.
+  const IV2 cv = biomeCurve(x, z, o0.dev + o1.dev, seed);
+  int g1x = ((o0.gx + o1.gx) * cv.y) >> 8;
+  int g1z = ((o0.gz + o1.gz) * cv.y) >> 8;
   Oct o2 = octave(x, z, WG().hillLog2, WG().hillAmplitude,
                   g1x, g1z, seed ^ 3u);
   int g2x = g1x + o2.gx;
@@ -801,7 +980,7 @@ static Land landAt(int x, int z, uint32_t seed) {
     w = (std::max(d, 0) * 16384) / WG().spawnPlainFade;
   }
   int ws = vsmooth(w << 1) >> 1;
-  int coarse = WG().baseHeight + o0.dev + o1.dev - WG().spawnPlainY;
+  int coarse = WG().baseHeight + cv.x - WG().spawnPlainY;
   int bed = WG().spawnPlainY + o2.dev + o3.dev + o4.dev
           + ((coarse * ws) >> 14);
 

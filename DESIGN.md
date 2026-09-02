@@ -1568,6 +1568,71 @@ about it are not obvious and both were measured:
 `--sweep worldgen.sedSlope=0,96` a one-invocation proof that the knob reaches
 the kernel.
 
+##### Per-biome height curves (2026-09-01, Lin 13.3.3)
+
+"This biome is flat plains, that one is jagged mountains", authored as nine
+numbers per biome instead of a hand-tuned noise ladder. `biomeCurve` reshapes
+**the coarse sum only** — `o0.dev + o1.dev`, the continental and range rungs
+that decide where the mountains and the basins are — and leaves hill, detail and
+grain alone. A biome changes the *landform*; it never changes the texture on it.
+That is the same split `Land.slope` already makes for the sediment wedge.
+
+* **Nine knots, not eight.** Eight knots is *seven* intervals, so the identity
+  curve's values are `-16384 + i·32768/7` — not integers, so an identity curve
+  could not be authored at all and "the default moves nothing" would be
+  unprovable. Nine knots is eight intervals and the identity is
+  `-16384 + i·4096` exactly, which is what all four biomes default to.
+* **The domain is half what it looks like.** `octave` returns
+  `((n − 8192)·amp) >> 14` and `n − 8192` is ±8192, so one rung spans ±amp/2 and
+  the coarse pair spans ±`(contAmplitude + rangeAmplitude)/2`. Authoring against
+  the full sum would leave the outer knots unreachable at every seed.
+* **The identity is bit-exact, by three separate pieces of arithmetic.** (1) The
+  Hermite basis is summed *before* the shift: `h00+h01` is exactly 4096 and
+  `h10+h11+h01` is exactly `t` in integers, whatever the rounding of t² and t³,
+  so a straight line evaluates to `k0 + t` with no residue. (2) The result is
+  applied as a **delta against the identity**, whose value at the same parameter
+  is exactly `p − 16384`, so the Q14→voxel round trip (a floor, which would bias
+  every column down by one) never happens for an identity curve. (3) `dv/dp` is
+  exactly 4096 for the identity, so the Q8 gradient scale is exactly 256 and
+  `(g·256) >> 8 == g`.
+* **The gradient is scaled, not just the value.** iq's attenuation divides each
+  finer rung by `1 + fbmAtten·|g|²`; if `g` still described the pre-curve ladder
+  then a biome that flattened its landform would keep attenuating its hills as
+  though the mountains were still there. `cv.y` is the curve's own slope in Q8
+  and it multiplies the accumulated gradient.
+* **Interpolation is Fritsch–Carlson** (the harmonic mean of the two secants,
+  zero at a local extremum), so an authored plateau is flat and an authored ramp
+  has no crease. Catmull-Rom would overshoot both, and an overshoot here is a
+  hill nobody put there.
+* **`CURVE_IDENT_ALL` is a module const**, so with the default knots Tint folds
+  the whole feature — including its two extra `vnoise2d` samples — out of the
+  shader. A world that does not use a curve pays nothing for it.
+
+###### The ceiling on how far two biomes may differ
+
+`curveBiomePair` crossfades the two nearest biomes over ±`worldgen.biomeBlend`
+band units, because a hard switch puts a **cliff** along every biome edge: the
+curve reshapes octaves whose amplitude is 100 m. But the crossfade can only be
+as wide as the biome field's own edge, and that is the binding constraint:
+
+| measured (seed 1337) | |
+|---|---|
+| `\|d(band)/dcolumn\|` | mean 0.30, p95 **1**, max **2** |
+| blend at ±18 band units | 36 columns typical, **18 columns worst case** |
+| ⇒ a delta of *D* Q14 units | ramps at `D/25.6/18` voxels per column |
+
+The CA's angle of repose is 1 voxel per column and the world's ambient p99.9
+adjacent step is already 2, so **~900 Q14 units (≈35 voxels) is about the
+ceiling on the difference between two *adjacent* biomes' knots** — which is what
+the shipped defaults use. Non-adjacent pairs are unconstrained: the band order is
+meadow | forest | pine | desert, so meadow and desert never meet.
+
+This is why the shipped set is a ±22% slope spread and not a dramatic one. To go
+further you have to widen the biome field itself (`worldgen.biomeLog2`) or spread
+the thresholds — `biomeBlend` is already clamped to half the smallest threshold
+gap, because two boundaries inside one crossfade would silently drop a biome
+from the blend.
+
 **Tree sizes are metre-true again.** `VOX_PER_M` in `worldgen.wgsl` was a
 hardcoded 16 — correct when a voxel was 6.25 cm, and left behind when `world.h`
 moved to `kVoxelMeters = 0.10`. For that whole interval every tree in the game

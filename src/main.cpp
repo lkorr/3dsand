@@ -2841,6 +2841,7 @@ int main(int argc, char** argv) {
       std::fprintf(stderr, "--sweep wants sim.field=val1,val2,...\n");
       return 1;
     }
+    std::string group = sweepParam.substr(0, dot);
     std::string field = sweepParam.substr(dot + 1, eq - dot - 1);
     std::string valStr = sweepParam.substr(eq + 1);
     std::vector<float> vals;
@@ -2856,21 +2857,26 @@ int main(int argc, char** argv) {
     if (vals.empty()) { std::fprintf(stderr, "--sweep: no values\n"); return 1; }
 
     Tuning baseTuning = CurrentTuning();
-    if (!SetSimField(baseTuning, field, vals[0])) {
-      std::fprintf(stderr, "--sweep: unknown sim field '%s'\n", field.c_str());
+    // ANY group, not just sim: worldgen knobs are exactly the ones CLAUDE.md
+    // asks you to prove with --sweep, and they were the ones it could not
+    // reach. SetTuningField is generated from tuning_params.def.
+    if (!SetTuningField(baseTuning, group, field, vals[0])) {
+      std::fprintf(stderr, "--sweep: unknown field '%s.%s'\n", group.c_str(),
+                   field.c_str());
       return 1;
     }
 
     std::string gate = sweepGate.empty() ? "determinism" : sweepGate;
     constexpr int kSweepTicks = 100;
-    std::printf("=== sweep sim.%s over %zu values, gate %s, %d ticks ===\n",
-                field.c_str(), vals.size(), gate.c_str(), kSweepTicks);
+    std::printf("=== sweep %s.%s over %zu values, gate %s, %d ticks ===\n",
+                group.c_str(), field.c_str(), vals.size(), gate.c_str(),
+                kSweepTicks);
 
     SetHarnessSnapshotDrain(true);
     std::vector<uint32_t> hashes;
     for (size_t vi = 0; vi < vals.size(); vi++) {
       Tuning t = baseTuning;
-      SetSimField(t, field, vals[vi]);
+      SetTuningField(t, group, field, vals[vi]);
       SetCurrentTuning(t);
       sim.ReloadShaders(ctx.device);
       SubmitWorldgen(ctx, world, sim, kDefaultSeed);
@@ -2883,7 +2889,8 @@ int main(int argc, char** argv) {
       }
       uint32_t h = ReadHashSync(ctx, world);
       hashes.push_back(h);
-      std::printf("  sim.%s = %.4g  →  hash %08x\n", field.c_str(), vals[vi], h);
+      std::printf("  %s.%s = %.4g  →  hash %08x\n", group.c_str(),
+                  field.c_str(), vals[vi], h);
     }
     SetCurrentTuning(baseTuning);
 

@@ -461,6 +461,259 @@ const HSCALE : i32 = 1;
 // the band moves.
 const TREELINE : i32 = TUNE_TREELINE;
 
+// ---- the biome FIELD, split from the biome DECISION ------------------------
+//
+// One low-frequency noise picks the biome, a second breaks up the boundary so
+// biomes interlock instead of meeting on a smooth contour. Desert is gated to
+// the top of the range (~12% of the field) so it reads as a rare destination
+// you walk to rather than the default world. Height still overrides at the top:
+// snow caps above TREELINE regardless of biome (handled in genCellIn).
+// The biome cell is a LOG2 EXPONENT (9 = 512 voxels = 51.2 m) — deliberately
+// NOT halved with the rest of the third scale pass. Trees kept their size and
+// their 9 m spacing, so a biome region has to stay many tree-tiles wide or a
+// "meadow" holds one bush and the field reads as per-tree noise. The break-up
+// octave is two exponents down (128 voxels) so edges stay proportionally
+// ragged. The Q14 samples are shifted back down to the 0..255 band the four
+// THRESHOLD knobs are authored in, so the primitive swap does not silently
+// re-scale them.
+//
+// The BAND and the DECISION are separate functions because the height curve
+// below needs the band's CONTINUOUS value — a thresholded biome id has no
+// "how close to the edge am I", and a curve that switches on the id alone puts
+// a cliff along every biome boundary. Everything above still calls biomeAt and
+// sees exactly what it always did.
+// Package G retires this noise entirely for the compass climate.
+fn biomeBand(x : i32, z : i32, seed : u32) -> i32 {
+  return (vnoise2d(x, z, TUNE_BIOME_LOG2, seed ^ 0x1Bu).n >> 6)
+       + (((vnoise2d(x, z, TUNE_BIOME_LOG2 - 2u, seed ^ 0x1Cu).n >> 6) - 128) / 3);
+}
+
+fn biomeFromBand(b : i32) -> u32 {
+  if (b > i32(TUNE_DESERT_THRESHOLD)) { return B_DESERT; }
+  if (b > i32(TUNE_PINE_THRESHOLD)) { return B_PINE; }
+  if (b < i32(TUNE_MEADOW_THRESHOLD))  { return B_MEADOW; }
+  return B_FOREST;
+}
+
+// ---- PER-BIOME HEIGHT CURVES (Lin 13.3.3) ---------------------------------
+//
+// "This biome is flat plains, that one is jagged mountains", authored as nine
+// numbers instead of a hand-tuned noise ladder. The curve reshapes the COARSE
+// SUM only — the continental and range rungs, the two that decide where the
+// mountains and the basins are — and leaves hill/detail/grain alone. So a
+// biome changes the LANDFORM and never the texture on it, which is the same
+// split `Land.slope` already makes for the sediment wedge.
+//
+// ---- NINE KNOTS, NOT EIGHT, AND WHY ---------------------------------------
+// The plan asked for eight. Eight knots is SEVEN intervals, so the identity
+// curve's knot values are -16384 + i*32768/7 — not integers. An identity curve
+// could then not be AUTHORED at all, only approximated, and "the default curve
+// moves nothing" would be unprovable rather than merely untested. Nine knots is
+// eight intervals and the identity values are -16384 + i*4096 exactly, which is
+// what all four biomes default to. Four extra rows buys the proof.
+//
+// ---- THE DOMAIN -----------------------------------------------------------
+// The plan said the input spans +-(contAmp + rangeAmp). It does not: `octave`
+// returns `((n - 8192) * amp) >> 14` and `n - 8192` is +-8192, so ONE rung
+// spans +-amp/2 and the two together span +-(contAmp + rangeAmp)/2. Authoring
+// against the doubled range would have left the outer two knots at each end
+// unreachable at every seed.
+//
+// ---- WHY THE IDENTITY IS BIT-EXACT ----------------------------------------
+// Three separate pieces of the arithmetic, and all three are load-bearing:
+//
+//  1. The Hermite basis is summed BEFORE the shift, not per term. h00+h01 is
+//     exactly 4096 and h10+h11+h01 is exactly `t`, in integers, whatever the
+//     rounding of t^2 and t^3 — so a straight line through the knots evaluates
+//     to k0 + t with no residue. Shifting each of the four products separately
+//     would floor four times and leak up to 3 units.
+//  2. The result is applied as a DELTA against the identity, whose value at the
+//     same parameter is exactly `p - 16384`. An identity curve therefore adds
+//     exactly zero, so the round trip out of Q14 back into voxels — which is a
+//     floor, and would bias every column down by one — never happens at all.
+//  3. The gradient scale falls out the same way: dv/dp is exactly 4096 for the
+//     identity, so the Q8 slope is exactly 256 and `(g * 256) >> 8 == g`.
+//
+// On top of that, `CURVE_IDENT_ALL` is a MODULE CONST — four biomes' worth of
+// comparisons between two consts — so with the default knots Tint folds the
+// whole feature, including its two extra vnoise2d samples, out of the shader.
+// A default world pays nothing for a curve it does not use.
+const CURVE_KNOTS : i32 = 9;
+const CURVE_SEGS  : i32 = 8;
+const CURVE_HI : i32 = (TUNE_CONT_AMPLITUDE + TUNE_RANGE_AMPLITUDE) / 2;
+
+const CURVE_IDENT_ALL : bool =
+    (TUNE_CURVE_FOREST0 == -16384 &&
+     TUNE_CURVE_FOREST1 == -12288 &&
+     TUNE_CURVE_FOREST2 == -8192 &&
+     TUNE_CURVE_FOREST3 == -4096 &&
+     TUNE_CURVE_FOREST4 == 0 &&
+     TUNE_CURVE_FOREST5 == 4096 &&
+     TUNE_CURVE_FOREST6 == 8192 &&
+     TUNE_CURVE_FOREST7 == 12288 &&
+     TUNE_CURVE_FOREST8 == 16384 &&
+     TUNE_CURVE_PINE0 == -16384 &&
+     TUNE_CURVE_PINE1 == -12288 &&
+     TUNE_CURVE_PINE2 == -8192 &&
+     TUNE_CURVE_PINE3 == -4096 &&
+     TUNE_CURVE_PINE4 == 0 &&
+     TUNE_CURVE_PINE5 == 4096 &&
+     TUNE_CURVE_PINE6 == 8192 &&
+     TUNE_CURVE_PINE7 == 12288 &&
+     TUNE_CURVE_PINE8 == 16384 &&
+     TUNE_CURVE_MEADOW0 == -16384 &&
+     TUNE_CURVE_MEADOW1 == -12288 &&
+     TUNE_CURVE_MEADOW2 == -8192 &&
+     TUNE_CURVE_MEADOW3 == -4096 &&
+     TUNE_CURVE_MEADOW4 == 0 &&
+     TUNE_CURVE_MEADOW5 == 4096 &&
+     TUNE_CURVE_MEADOW6 == 8192 &&
+     TUNE_CURVE_MEADOW7 == 12288 &&
+     TUNE_CURVE_MEADOW8 == 16384 &&
+     TUNE_CURVE_DESERT0 == -16384 &&
+     TUNE_CURVE_DESERT1 == -12288 &&
+     TUNE_CURVE_DESERT2 == -8192 &&
+     TUNE_CURVE_DESERT3 == -4096 &&
+     TUNE_CURVE_DESERT4 == 0 &&
+     TUNE_CURVE_DESERT5 == 4096 &&
+     TUNE_CURVE_DESERT6 == 8192 &&
+     TUNE_CURVE_DESERT7 == 12288 &&
+     TUNE_CURVE_DESERT8 == 16384);
+
+fn pick9(i : i32, a0 : i32, a1 : i32, a2 : i32, a3 : i32, a4 : i32,
+         a5 : i32, a6 : i32, a7 : i32, a8 : i32) -> i32 {
+  var v = a0;
+  v = select(v, a1, i == 1);
+  v = select(v, a2, i == 2);
+  v = select(v, a3, i == 3);
+  v = select(v, a4, i == 4);
+  v = select(v, a5, i == 5);
+  v = select(v, a6, i == 6);
+  v = select(v, a7, i == 7);
+  v = select(v, a8, i == 8);
+  return v;
+}
+
+// A SELECT CHAIN, never a runtime-indexed array: CLAUDE.md's note about a
+// dynamic index into a by-value uniform spilling the whole struct to scratch
+// applies to any indexable aggregate, and this is read four times per column.
+fn curveKnot(b : u32, i : i32) -> i32 {
+  let j = clamp(i, 0, CURVE_KNOTS - 1);
+  if (b == B_FOREST) {
+    return pick9(j, TUNE_CURVE_FOREST0, TUNE_CURVE_FOREST1, TUNE_CURVE_FOREST2,
+               TUNE_CURVE_FOREST3, TUNE_CURVE_FOREST4, TUNE_CURVE_FOREST5,
+               TUNE_CURVE_FOREST6, TUNE_CURVE_FOREST7, TUNE_CURVE_FOREST8);
+  }
+  if (b == B_PINE) {
+    return pick9(j, TUNE_CURVE_PINE0, TUNE_CURVE_PINE1, TUNE_CURVE_PINE2,
+               TUNE_CURVE_PINE3, TUNE_CURVE_PINE4, TUNE_CURVE_PINE5,
+               TUNE_CURVE_PINE6, TUNE_CURVE_PINE7, TUNE_CURVE_PINE8);
+  }
+  if (b == B_MEADOW) {
+    return pick9(j, TUNE_CURVE_MEADOW0, TUNE_CURVE_MEADOW1, TUNE_CURVE_MEADOW2,
+               TUNE_CURVE_MEADOW3, TUNE_CURVE_MEADOW4, TUNE_CURVE_MEADOW5,
+               TUNE_CURVE_MEADOW6, TUNE_CURVE_MEADOW7, TUNE_CURVE_MEADOW8);
+  }
+  return pick9(j, TUNE_CURVE_DESERT0, TUNE_CURVE_DESERT1, TUNE_CURVE_DESERT2,
+               TUNE_CURVE_DESERT3, TUNE_CURVE_DESERT4, TUNE_CURVE_DESERT5,
+               TUNE_CURVE_DESERT6, TUNE_CURVE_DESERT7, TUNE_CURVE_DESERT8);
+}
+
+// Fritsch-Carlson, for uniformly spaced knots: the harmonic mean of the two
+// secants, and zero at a local extremum. That is what makes an authored plateau
+// FLAT and an authored ramp crease-free — a Catmull-Rom tangent would overshoot
+// both, and an overshoot here is a hill the author did not put there.
+//
+// The multiply is safe in i32 because it only happens when the two secants
+// share a sign: knot values are clamped to +-16384 by LoadTuning, so a secant
+// of +32768 forces its neighbour negative and takes the early return.
+fn curveTangent(dPrev : i32, dNext : i32) -> i32 {
+  if (dPrev * dNext <= 0) { return 0; }
+  return (2 * dPrev * dNext) / (dPrev + dNext);
+}
+
+// One biome's curve. Returns (value in voxels, d(value)/d(input) in Q8).
+fn curveOne(b : u32, u : i32) -> vec2<i32> {
+  let hi = max(CURVE_HI, 1);
+  let uc = clamp(u, -hi, hi);
+  // Parameter across the eight segments, Q12 within a segment. The identity's
+  // value at this parameter is exactly `p - 16384`, which is what (2) above
+  // subtracts.
+  let p = clamp(((uc + hi) * (CURVE_SEGS << 12)) / (2 * hi), 0, CURVE_SEGS << 12);
+  let seg = min(p >> 12, CURVE_SEGS - 1);
+  let t = p - (seg << 12);
+  let km = curveKnot(b, seg - 1);
+  let k0 = curveKnot(b, seg);
+  let k1 = curveKnot(b, seg + 1);
+  let k2 = curveKnot(b, seg + 2);
+  let d0 = k1 - k0;
+  let m0 = select(curveTangent(k0 - km, d0), d0, seg == 0);
+  let m1 = select(curveTangent(d0, k2 - k1), d0, seg == CURVE_SEGS - 1);
+
+  let t2 = (t * t) >> 12;
+  let t3 = (t2 * t) >> 12;
+  let h00 = 2 * t3 - 3 * t2 + 4096;
+  let h10 = t3 - 2 * t2 + t;
+  let h01 = 3 * t2 - 2 * t3;
+  let h11 = t3 - t2;
+  // ONE shift over the whole sum -- see (1) above.
+  let v = (k0 * h00 + m0 * h10 + k1 * h01 + m1 * h11) >> 12;
+
+  // The Hermite basis differentiated, same trick, same reason.
+  let g00 = 6 * t2 - 6 * t;
+  let g10 = 3 * t2 - 4 * t + 4096;
+  let g01 = 6 * t - 6 * t2;
+  let g11 = 3 * t2 - 2 * t;
+  let dv = (k0 * g00 + m0 * g10 + k1 * g01 + m1 * g11) >> 12;
+
+  return vec2<i32>(uc + (((v - (p - 16384)) * hi) >> 14),
+                   clamp(dv >> 4, 0, 4096));
+}
+
+// Which two biomes this column sits between, and how far across. Returns
+// (loBiome, hiBiome, Q8 weight of hi). A hard switch on `biomeFromBand` would
+// put a CLIFF along every biome edge -- the curve is applied to the coarse rungs
+// whose amplitude is 100 m, so two different curves meeting on a contour is a
+// step of tens of voxels, not a texture seam.
+fn curveBiomePair(band : i32) -> vec3<i32> {
+  let hard = i32(biomeFromBand(band));
+  let bw = max(TUNE_BIOME_BLEND, 0);
+  if (bw <= 0) { return vec3<i32>(hard, hard, 0); }
+  // The three boundaries of the band, low side to high side. LoadTuning keeps
+  // the thresholds more than 2*biomeBlend apart, so at most one can be in
+  // range and the order of the tests does not matter.
+  let tm = i32(TUNE_MEADOW_THRESHOLD);   // below it: meadow, above: forest
+  let tp = i32(TUNE_PINE_THRESHOLD);     // below it: forest, above: pine
+  let td = i32(TUNE_DESERT_THRESHOLD);   // below it: pine,   above: desert
+  if (band > tm - bw && band <= tm + bw) {
+    return vec3<i32>(i32(B_MEADOW), i32(B_FOREST),
+                     ((band - (tm - bw)) * 256) / (2 * bw));
+  }
+  if (band > tp - bw && band <= tp + bw) {
+    return vec3<i32>(i32(B_FOREST), i32(B_PINE),
+                     ((band - (tp - bw)) * 256) / (2 * bw));
+  }
+  if (band > td - bw && band <= td + bw) {
+    return vec3<i32>(i32(B_PINE), i32(B_DESERT),
+                     ((band - (td - bw)) * 256) / (2 * bw));
+  }
+  return vec3<i32>(hard, hard, 0);
+}
+
+// The curve, blended across the biome edge. `u` is the coarse sum; the result
+// is (reshaped sum, Q8 slope) and BOTH are used -- the slope multiplies the
+// accumulated gradient so the iq attenuation of hill/detail/grain still sees
+// the ground it is actually attenuating against.
+fn biomeCurve(x : i32, z : i32, u : i32, seed : u32) -> vec2<i32> {
+  if (CURVE_IDENT_ALL) { return vec2<i32>(u, 256); }
+  let pr = curveBiomePair(biomeBand(x, z, seed));
+  let lo = curveOne(u32(pr.x), u);
+  if (pr.z <= 0) { return lo; }
+  let hg = curveOne(u32(pr.y), u);
+  return vec2<i32>(lo.x + (((hg.x - lo.x) * pr.z) >> 8),
+                   lo.y + (((hg.y - lo.y) * pr.z) >> 8));
+}
+
 // MIRROR-BEGIN height
 // The terrain, and how steep it is there. THE SLOPE IS NOT DECORATION: this
 // CA's angle of repose is exactly 1 voxel per column (sim_step.wgsl slides a
@@ -532,8 +785,21 @@ fn landAt(x : i32, z : i32, seed : u32) -> Land {
   let o0 = octave(x, z, TUNE_CONT_LOG2,   TUNE_CONT_AMPLITUDE,   0, 0, seed ^ 1u);
   let o1 = octave(x, z, TUNE_RANGE_LOG2,  TUNE_RANGE_AMPLITUDE,
                   o0.gx, o0.gz, seed ^ 2u);
-  let g1x = o0.gx + o1.gx;
-  let g1z = o0.gz + o1.gz;
+  // ---- THE PER-BIOME HEIGHT CURVE (13.3.3) ----
+  // HERE, and only here: the two coarse rungs are the landform, and the three
+  // fine ones are the texture on it. Reshaping the sum of the coarse pair is
+  // what lets a meadow be flat plains and a pine highland be jagged without
+  // either one changing how the ground FEELS underfoot.
+  //
+  // `cv.y` is the curve's own slope in Q8 and it scales the accumulated
+  // gradient, not the deviation: iq's attenuation divides each finer rung by
+  // 1 + atten*|g|^2, and if `g` still described the pre-curve ladder then a
+  // biome that flattened its landform would keep the hill octave attenuated as
+  // though the mountains were still there. Identity gives exactly 256, so
+  // (g * 256) >> 8 == g and nothing moves.
+  let cv = biomeCurve(x, z, o0.dev + o1.dev, seed);
+  let g1x = ((o0.gx + o1.gx) * cv.y) >> 8;
+  let g1z = ((o0.gz + o1.gz) * cv.y) >> 8;
   let o2 = octave(x, z, TUNE_HILL_LOG2,   TUNE_HILL_AMPLITUDE,
                   g1x, g1z, seed ^ 3u);
   let g2x = g1x + o2.gx;
@@ -564,7 +830,7 @@ fn landAt(x : i32, z : i32, seed : u32) -> Land {
     w = (max(d, 0) * 16384) / TUNE_SPAWN_PLAIN_FADE;
   }
   let ws = vsmooth(w << 1) >> 1;                    // Q14 smoothstep of the ramp
-  let coarse = TUNE_BASE_HEIGHT + o0.dev + o1.dev - TUNE_SPAWN_PLAIN_Y;
+  let coarse = TUNE_BASE_HEIGHT + cv.x - TUNE_SPAWN_PLAIN_Y;
   let bed = TUNE_SPAWN_PLAIN_Y + o2.dev + o3.dev + o4.dev
           + ((coarse * ws) >> 14);
 
@@ -624,27 +890,12 @@ fn baseHeight(x : i32, z : i32, seed : u32) -> i32 {
 // MIRROR-END height
 
 // ---- biome field ----
-// One low-frequency noise picks the biome, a second breaks up the boundary so
-// biomes interlock instead of meeting on a smooth contour. Desert is gated to
-// the top of the range (~12% of the field) so it reads as a rare destination
-// you walk to rather than the default world. Height still overrides at the top:
-// snow caps above 80 regardless of biome (handled in genCell).
-// The biome cell is a LOG2 EXPONENT now (9 = 512 voxels = 51.2 m, up from the
-// old 384) — deliberately NOT halved with the rest of the third scale pass.
-// Trees kept their size and their 9 m spacing, so a biome region has to stay
-// many tree-tiles wide or a "meadow" holds one bush and the field reads as
-// per-tree noise. The break-up octave is two exponents down (128 voxels) so
-// edges stay proportionally ragged.
-// The Q14 samples are shifted back down to the 0..255 band the four THRESHOLD
-// knobs are authored in, so the primitive swap does not silently re-scale them.
-// Package G retires this function's noise entirely for the compass climate.
+// The field and the thresholds moved up above landAt (see `biomeBand` /
+// `biomeFromBand`), because the height curve needs the band's continuous value.
+// Same two noise samples, same shifts, same salts, same thresholds, same order:
+// this is one function split in two, not a new one.
 fn biomeAt(x : i32, z : i32, seed : u32) -> u32 {
-  let b = (vnoise2d(x, z, TUNE_BIOME_LOG2, seed ^ 0x1Bu).n >> 6)
-        + (((vnoise2d(x, z, TUNE_BIOME_LOG2 - 2u, seed ^ 0x1Cu).n >> 6) - 128) / 3);   // edge break-up
-  if (b > i32(TUNE_DESERT_THRESHOLD)) { return B_DESERT; }
-  if (b > i32(TUNE_PINE_THRESHOLD)) { return B_PINE; }
-  if (b < i32(TUNE_MEADOW_THRESHOLD))  { return B_MEADOW; }
-  return B_FOREST;
+  return biomeFromBand(biomeBand(x, z, seed));
 }
 
 // ---- the spawn clearing ----
