@@ -440,7 +440,11 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadF(*g, "ledgeSettleSpeed", p.ledgeSettleSpeed, out, at);
     ReadF(*g, "ledgeShimmySpeed", p.ledgeShimmySpeed, out, at);
     ReadF(*g, "ledgePullDelay", p.ledgePullDelay, out, at);
-    ReadF(*g, "halfWidth", p.halfWidth, out, at);
+    ReadF(*g, "collisionWidth", p.collisionWidth, out, at);
+    ReadF(*g, "collisionHeight", p.collisionHeight, out, at);
+    ReadF(*g, "crouchHeight", p.crouchHeight, out, at);
+    ReadF(*g, "crouchSpeedScale", p.crouchSpeedScale, out, at);
+    ReadF(*g, "crouchKneeDrop", p.crouchKneeDrop, out, at);
     ReadF(*g, "halfHeight", p.halfHeight, out, at);
     ReadF(*g, "eyeOffset", p.eyeOffset, out, at);
     ReadF(*g, "viewSmoothHalflife", p.viewSmoothHalflife, out, at);

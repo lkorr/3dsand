@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "game/player.h"
+#include "sim/tuning.h"
 #include "test/selftest.h"
 #include "test/support.h"
 
@@ -632,6 +633,111 @@ Status GatePlayerPlants(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---- player-crouch -----------------------------------------------------
+//
+// The collision box is NOT the figure (Player::Box): a small box on the
+// figure's sole, and Ctrl shrinks it. Same synthetic-lambda world as the
+// ledge gate — the fixture is a floor at y=100 and, from x=150 on, a
+// corridor with an exact number of free rows under a solid ceiling. Every
+// height here is read off the live tuning so the gate follows the knobs.
+//
+// Four claims, and the first one is the reason the box exists: a corridor
+// exactly as tall as the STANDING box admits the body even though the
+// 17-row figure would not fit. Then: a corridor as tall as the CROUCH box
+// refuses the standing body, admits it crouched, keeps it crouched when
+// Ctrl is released under the ceiling, and stands it up once it walks out.
+// Then the crouch walk is slower by crouchSpeedScale, and the eye drops with
+// the box and never rises above it.
+Status GatePlayerCrouch(Ctx&, std::string& detail) {
+  const Tuning::Player& tp = CurrentTuning().player;
+  const int standRows = (int)std::ceil(tp.collisionHeight / kVoxelMeters - 1e-3f);
+  const int crouchRows = (int)std::ceil(tp.crouchHeight / kVoxelMeters - 1e-3f);
+  const int figureRows = (int)std::lround(2.0f * Player::kHalfY);
+  auto corridor = [](int headroom) -> Player::KindFn {
+    return [headroom](IVec3 c) {
+      if (c.y < 100) return CellKind::Solid;
+      if (c.x >= 150 && c.y >= 100 + headroom) return CellKind::Solid;
+      return CellKind::Air;
+    };
+  };
+  const Vec3 fwd{1, 0, 0}, right{0, 0, 1};
+  const float dt = 1.0f / 60.0f;
+  auto make = [&]() {
+    Player p;
+    p.fly = false;
+    p.pos = Vec3{140.0f, 100.0f + Player::kHalfY, 200.5f};
+    return p;
+  };
+  auto frames = [&](Player& p, const Player::KindFn& k, PlayerInput in,
+                    int n) {
+    for (int i = 0; i < n; i++) p.Update(dt, in, fwd, right, fwd, k);
+  };
+  PlayerInput walk;
+  walk.forward = 1.0f;
+  PlayerInput crawl = walk;
+  crawl.down = true;
+  PlayerInput back;
+  back.forward = -1.0f;
+  PlayerInput rest;
+
+  // (a) a corridor exactly standRows tall admits the standing body.
+  const Player::KindFn tall = corridor(standRows);
+  Player a = make();
+  frames(a, tall, walk, 240);
+  const bool aIn = a.pos.x > 156.0f && !a.crouching;
+  const bool aTighterThanFigure = standRows < figureRows;
+
+  // (b) a corridor crouchRows tall: refused standing, admitted crouched,
+  // crouch sticks under the ceiling, stands up after walking out.
+  const Player::KindFn low = corridor(crouchRows);
+  Player b = make();
+  frames(b, low, walk, 180);
+  const float bBlockedX = b.pos.x;
+  const bool bRefused = bBlockedX < 150.0f;
+  frames(b, low, crawl, 300);
+  const float bInX = b.pos.x;
+  const bool bAdmitted = b.crouching && bInX > 156.0f;
+  frames(b, low, rest, 30);
+  const bool bStuck = b.crouching;  // Ctrl released, ceiling still there
+  frames(b, low, back, 420);
+  const bool bStood = !b.crouching && b.pos.x < 148.0f;
+
+  // (c) crouch speed on open floor: distance over the same window.
+  const Player::KindFn open = corridor(64);
+  Player c1 = make(), c2 = make();
+  frames(c1, open, walk, 90);
+  const float x1 = c1.pos.x;
+  frames(c1, open, walk, 60);
+  const float standDist = c1.pos.x - x1;
+  frames(c2, open, crawl, 90);
+  const float x2 = c2.pos.x;
+  frames(c2, open, crawl, 60);
+  const float crouchDist = c2.pos.x - x2;
+  const float ratio = standDist > 1e-3f ? crouchDist / standDist : -1.0f;
+  const bool cOk = std::abs(ratio - tp.crouchSpeedScale) < 0.1f;
+
+  // (d) the eye drops with the box and stays inside it.
+  const float eyeStand = c1.EyePos().y - (c1.pos.y - Player::kHalfY);
+  const float eyeCrouch = c2.EyePos().y - (c2.pos.y - Player::kHalfY);
+  const bool dOk = c2.crouching && eyeStand - eyeCrouch > 1.0f &&
+                   eyeCrouch < c2.BoxHeight() && eyeStand < c1.BoxHeight();
+
+  const bool ok = aIn && aTighterThanFigure && bRefused && bAdmitted &&
+                  bStuck && bStood && cOk && dOk;
+  char buf[360];
+  std::snprintf(buf, sizeof(buf),
+                "rows stand=%d crouch=%d figure=%d; tall corridor x=%.1f "
+                "(want>156); low: standing x=%.1f (want<150) crouched x=%.1f "
+                "(want>156) stuck=%d stood=%d x=%.1f (want<148); speed ratio "
+                "%.2f (want %.2f); eye stand=%.1f crouch=%.1f",
+                standRows, crouchRows, figureRows, a.pos.x, bBlockedX, bInX,
+                bStuck ? 1 : 0, bStood ? 1 : 0, b.pos.x, ratio,
+                tp.crouchSpeedScale, eyeStand, eyeCrouch);
+  detail = buf;
+  std::printf("player crouch: %s (%s)\n", ok ? "PASS" : "FAIL", buf);
+  return ok ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& PlayerGates() {
@@ -639,6 +745,7 @@ const std::vector<Gate>& PlayerGates() {
       {"player-walk", "player", {}, false, GatePlayerWalk},
       {"player-waterjump", "player", {}, false, GatePlayerWaterJump},
       {"player-ledgegrab", "player", {}, false, GatePlayerLedgeGrab},
+      {"player-crouch", "player", {}, false, GatePlayerCrouch},
       {"player-plants", "player", {}, false, GatePlayerPlants},
   };
   return g;

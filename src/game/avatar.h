@@ -351,6 +351,8 @@ class PlayerAvatar : public Mob {
   // question — "how far in is it" is.
   float ClipWeight(const char* name) const {
     if (!def_) return 0.0f;
+  // The held (Ctrl) crouch's pelvis drop, world voxels; 0 when standing.
+  float CrouchHold() const { return crouchHold_; }
     const int c = skel_.FindClip(name);
     if (c < 0) return 0.0f;
     for (const ClipInstance& inst : anim_.clips)
@@ -480,5 +482,13 @@ class PlayerAvatar : public Mob {
   // actually posed at. Two of them so the head EASES onto the mouse rather
   // than stepping with it — the same reason the body yaw has a half-life.
   float lookYawGoal_ = 0, lookPitchGoal_ = 0;
+  // The HELD crouch (Ctrl): Player::crouching mirrored in each PreTick, and
+  // the eased pelvis drop it drives, world voxels. Kept apart from
+  // stanceCrouch_ on purpose — that is the gait's own reach budget, oscillates
+  // per step and is what the mob gate measures; this is a pose the player
+  // asked for. Both subtract from bodyY_, and because the leg IK targets are
+  // world points the drop lands in the knees with the feet where they were.
+  bool crouchWant_ = false;
+  float crouchHold_ = 0.0f;
   float lookYaw_ = 0, lookPitch_ = 0;
 };

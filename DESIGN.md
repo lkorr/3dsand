@@ -2470,6 +2470,27 @@ relation between three casts rather than as absolute counts, because a gate
 that only checked "more words ⇒ more output" would pass a linear ramp too, and
 because measuring the relation is what caught the off-by-one above. The first
 version of the gate folded the impact op into the trail total and reported 343
+- **The collision box is not the figure** (2026-09-02, `Player::Box`).
+  `Player::pos` stays the centre of the NOMINAL 1.7 m figure box
+  (`kHalfXZ`/`kHalfY`: the art contract, the Jolt proxy, the mob sense actor,
+  every `feet = pos.y - kHalfY`), but the box the sweeps use is a smaller one
+  standing on that same sole — `player.collisionWidth` (0.4 m) wide and
+  `player.collisionHeight` (1.5 m) tall, both live tuning — and movement is
+  decided by it alone. Shoulders, arms and the top of the head overhang it
+  and clip terrain by exactly that overhang, on purpose: a corridor a
+  head-clip lower than the figure still admits the figure, and a doorway the
+  elbows brush does not catch. Every sweep/probe in `player.cpp` takes the
+  box as a parameter (`Player::BoxFor` is the one place its shape is
+  decided). The first-person eye is the LOWER of the figure's face row and
+  just under the box top, because only the box is guaranteed clear.
+  **Crouch (Ctrl):** the box shrinks to `player.crouchHeight` (1.15 m), speed
+  scales by `player.crouchSpeedScale` and sprint is off; releasing Ctrl only
+  stands up once the standing box is clear where the body is, so a
+  crawl-space cannot wedge you. The eye change is banked into `viewYOffset`
+  like a step-up. The avatar mirrors `Player::crouching` into a held pelvis
+  drop (`player.crouchKneeDrop`, `PlayerAvatar::crouchHold_`, capped in leg
+  lengths) kept separate from the gait's per-step `stanceCrouch_`; the leg IK
+  turns the drop into a knee bend with the feet where the gait put them.
 voxels against a 64 budget, where the budget was fine and the measurement was
 wrong.
 

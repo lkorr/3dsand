@@ -33,15 +33,22 @@ constexpr float kSkin = 1.0f / 512.0f;
 // the rule reads the same as everywhere else.
 constexpr float kMinWalkNormalY = 0.7f;
 
-// Does the AABB centered at p overlap any solid voxel?
-bool Collides(const Vec3& p, const Player::KindFn& kindAt) {
-  const float hx = Player::kHalfXZ - kSkin, hy = Player::kHalfY - kSkin;
+// Does the collision box `b` placed at p overlap any solid voxel?
+//
+// `b` is the LIVE box (Player::CurrentBox): narrower and shorter than the
+// figure, standing on the figure's sole. Every sweep and probe in this file
+// takes it as a parameter rather than reading Player constants, because the
+// box changes shape while crouched and the one place that decides the shape
+// is Player::BoxFor.
+bool Collides(const Vec3& p, const Player::Box& b,
+              const Player::KindFn& kindAt) {
+  const float hx = b.hx - kSkin;
   int x0 = ifloor(p.x - hx), x1 = ifloor(p.x + hx);
-  int y0 = ifloor(p.y - hy), y1 = ifloor(p.y + hy);
+  int y0 = ifloor(p.y + b.yLo + kSkin), y1 = ifloor(p.y + b.yHi - kSkin);
   int z0 = ifloor(p.z - hx), z1 = ifloor(p.z + hx);
   // Feet upward: ground is the overwhelmingly common blocker, and the body
-  // spans kHalfY*2/kVoxelMeters rows (34 at 0.05 m voxels), so finding the hit
-  // on the first row instead of the last is most of the cost.
+  // spans collisionHeight/kVoxelMeters rows (30 at 0.05 m voxels), so finding
+  // the hit on the first row instead of the last is most of the cost.
   for (int y = y0; y <= y1; y++)
     for (int z = z0; z <= z1; z++)
       for (int x = x0; x <= x1; x++)
@@ -57,7 +64,8 @@ bool Collides(const Vec3& p, const Player::KindFn& kindAt) {
 // voxel-sized substep makes the AABB test count blow up with 1/kVoxelMeters.
 // Past the cap we take longer strides — tunneling there is bounded by the
 // same physical distance regardless of voxel size.
-bool SweepAxis(Vec3& pos, float delta, int axis, const Player::KindFn& kindAt) {
+bool SweepAxis(Vec3& pos, float delta, int axis, const Player::Box& b,
+               const Player::KindFn& kindAt) {
   if (delta == 0) return false;
   float* c = axis == 0 ? &pos.x : axis == 1 ? &pos.y : &pos.z;
   float target = *c + delta;
@@ -71,8 +79,24 @@ bool SweepAxis(Vec3& pos, float delta, int axis, const Player::KindFn& kindAt) {
     float prev = *c;
     float next = (i == n - 1) ? target : prev + step;
     *c = next;
-    if (Collides(pos, kindAt)) {
-      *c = prev;
+    if (Collides(pos, b, kindAt)) {
+      // Land FLUSH on the face that stopped us, not on the last free
+      // substep. The substep is up to 0.45 voxel long, so "last free" left
+      // the body hovering anywhere inside that above a floor (and short of
+      // a wall) — a hidden fraction of a voxel that every headroom test then
+      // paid for: a 15-row box needed a 16-row corridor. On an axis-aligned
+      // grid the stopping face is the integer boundary the box's leading
+      // edge crossed during this substep, so the flush position is exact,
+      // and kSkin is what makes flush contact read as free. The re-check
+      // covers the float edge cases; if it trips we keep the old answer.
+      const float lo = axis == 1 ? b.yLo : -b.hx;
+      const float hi = axis == 1 ? b.yHi : b.hx;
+      const float flush = delta < 0 ? std::floor(prev + lo) - lo
+                                    : std::ceil(prev + hi) - hi;
+      const bool inRange = delta < 0 ? (flush <= prev && flush >= next)
+                                     : (flush >= prev && flush <= next);
+      *c = flush;
+      if (!inRange || Collides(pos, b, kindAt)) *c = prev;
       return true;
     }
   }
@@ -140,9 +164,10 @@ namespace {
 // — jumping, step-up, ground friction — then strobes with it. Asking the
 // positional question instead ("is there floor under me right now") is stable
 // because it does not care whether this particular frame happened to touch.
-float GroundProbe(const Vec3& pos, float reach, const Player::KindFn& kindAt) {
+float GroundProbe(const Vec3& pos, float reach, const Player::Box& b,
+                  const Player::KindFn& kindAt) {
   Vec3 test = pos;
-  if (!SweepAxis(test, -reach, 1, kindAt)) return -1.0f;  // fell the whole way
+  if (!SweepAxis(test, -reach, 1, b, kindAt)) return -1.0f;  // fell the whole way
   return pos.y - test.y;
 }
 
@@ -166,13 +191,14 @@ float GroundProbe(const Vec3& pos, float reach, const Player::KindFn& kindAt) {
 // real state the world can put you in, and teleporting out of it would be a
 // worse bug than being stuck). The cap is a caller's policy decision, not a
 // constant here.
-float UnstickRise(const Vec3& pos, float maxRise, const Player::KindFn& kindAt) {
-  if (!Collides(pos, kindAt)) return -1.0f;  // not stuck: nothing to do
+float UnstickRise(const Vec3& pos, float maxRise, const Player::Box& b,
+                  const Player::KindFn& kindAt) {
+  if (!Collides(pos, b, kindAt)) return -1.0f;  // not stuck: nothing to do
   const float kProbeStep = 0.5f;
   for (float rise = kProbeStep; rise <= maxRise + 1e-4f; rise += kProbeStep) {
     Vec3 test = pos;
     test.y += rise;
-    if (!Collides(test, kindAt)) return rise;
+    if (!Collides(test, b, kindAt)) return rise;
   }
   return -1.0f;  // buried deeper than the cap allows: leave them in it
 }
@@ -217,10 +243,11 @@ float UnstickRise(const Vec3& pos, float maxRise, const Player::KindFn& kindAt) 
 // the same point the fit test below validates, handed back so the caller does
 // not have to re-derive it (and cannot derive it differently).
 bool WaterLedgeAhead(const Vec3& pos, const Vec3& dir, float surfaceY,
-                     const Player::KindFn& kindAt, Vec3* out) {
+                     const Player::Box& b, const Player::KindFn& kindAt,
+                     Vec3* out) {
   // How far ahead to probe: just past the AABB face, so we are asking about
   // the voxel we are pressed against, not one we are merely near.
-  const float kProbeAhead = Player::kHalfXZ + 0.6f;
+  const float kProbeAhead = b.hx + 0.6f;
   const float ax = pos.x + dir.x * kProbeAhead;
   const float az = pos.z + dir.z * kProbeAhead;
 
@@ -246,7 +273,7 @@ bool WaterLedgeAhead(const Vec3& pos, const Vec3& dir, float surfaceY,
   const float maxLip = lipY + (float)Player::kMaxStepUpVoxels;
   for (float top = lipY; top <= maxLip + 1e-4f; top += 1.0f) {
     Vec3 stand{ax, top + Player::kHalfY, az};
-    if (!Collides(stand, kindAt)) {
+    if (!Collides(stand, b, kindAt)) {
       if (out) *out = stand;
       return true;
     }
@@ -287,7 +314,7 @@ struct LedgeHit {
   Vec3 anchor;  // where the body settles while dangling (hands on lip)
   Vec3 stand;   // standing position on top of the lip, validated at pull-up
 };
-bool LedgeGrabAhead(const Vec3& pos, const Vec3& dir,
+bool LedgeGrabAhead(const Vec3& pos, const Vec3& dir, const Player::Box& b,
                     const Player::KindFn& kindAt, LedgeHit* out) {
   if (T().ledgeReach <= 0.0f) return false;  // knob at 0 disables grabbing
   const Vec3 perp{-dir.z, 0.0f, dir.x};
@@ -297,7 +324,10 @@ bool LedgeGrabAhead(const Vec3& pos, const Vec3& dir,
   // a full arm-plus-torso downward, which reads as the wall swallowing you.
   const int yLo = ifloor(pos.y + 0.5f * Player::kHalfY);
   const int yHi = ifloor(pos.y + Player::kHalfY + reachUp);
-  const float depths[2] = {Player::kHalfXZ + 0.6f, Player::kHalfXZ + 1.4f};
+  // Depths from the COLLISION box face (that is what is pressed against the
+  // wall); lateral hand columns at the FIGURE's shoulder width, since the
+  // hands are art and reach past the box.
+  const float depths[2] = {b.hx + 0.6f, b.hx + 1.4f};
   const float lats[3] = {0.0f, -0.6f * Player::kHalfXZ, 0.6f * Player::kHalfXZ};
 
   bool found = false;
@@ -359,15 +389,16 @@ bool LedgeGrabAhead(const Vec3& pos, const Vec3& dir,
 // that it landed on something standable, so it will climb the side of a
 // one-voxel spike; and by retrying only the blocked axis it drops wall-sliding
 // at the exact moment it steps, which reads as catching on every corner.
-float StepSlide(Vec3& pos, float dx, float dz, const Player::KindFn& kindAt) {
+float StepSlide(Vec3& pos, float dx, float dz, const Player::Box& b,
+                const Player::KindFn& kindAt) {
   const Vec3 start = pos;
 
   // (A) the flat slide. Each axis is swept independently, so a blocked X still
   // permits the full Z — that is the sliding behaviour, and it must happen
   // before any decision about stepping.
   Vec3 flat = start;
-  bool blockedX = SweepAxis(flat, dx, 0, kindAt);
-  bool blockedZ = SweepAxis(flat, dz, 2, kindAt);
+  bool blockedX = SweepAxis(flat, dx, 0, b, kindAt);
+  bool blockedZ = SweepAxis(flat, dz, 2, b, kindAt);
   if (!blockedX && !blockedZ) {  // nothing in the way: no step needed at all
     pos = flat;
     return 0.0f;
@@ -376,15 +407,15 @@ float StepSlide(Vec3& pos, float dx, float dz, const Player::KindFn& kindAt) {
   // (B) lift, slide, settle.
   const float lift = (float)Player::kMaxStepUpVoxels;
   Vec3 up = start;
-  SweepAxis(up, lift, 1, kindAt);  // partial lift is fine (low ceiling)
+  SweepAxis(up, lift, 1, b, kindAt);  // partial lift is fine (low ceiling)
   float lifted = up.y - start.y;
   float climbed = -1.0f;
   if (lifted > 1e-4f) {
-    SweepAxis(up, dx, 0, kindAt);
-    SweepAxis(up, dz, 2, kindAt);
+    SweepAxis(up, dx, 0, b, kindAt);
+    SweepAxis(up, dz, 2, b, kindAt);
     // Press back down by the distance actually achieved, not the nominal step
     // height (Quake 3's stepSize fix — matters under a low ceiling).
-    bool landed = SweepAxis(up, -lifted, 1, kindAt);
+    bool landed = SweepAxis(up, -lifted, 1, b, kindAt);
     // The settle must land on real floor. If we fell the whole way back down
     // we merely hopped over nothing; if we ended above where we started
     // without landing, we are wedged. Either way the step is not valid.
@@ -407,11 +438,46 @@ float StepSlide(Vec3& pos, float dx, float dz, const Player::KindFn& kindAt) {
 
 }  // namespace
 
+Player::Box Player::BoxFor(bool crouched) const {
+  const float h =
+      (crouched ? T().crouchHeight : T().collisionHeight) / kVoxelMeters;
+  return Box{0.5f * T().collisionWidth / kVoxelMeters, -kHalfY,
+             -kHalfY + std::max(h, 1.0f)};
+}
+
 void Player::Update(float dt, const PlayerInput& in, const Vec3& flatFwd,
                     const Vec3& right, const Vec3& lookFwd, const KindFn& kindAt) {
   dt = std::min(dt, 0.05f);
   ledgeGrabbed = false;  // one-frame flag; set again below if a grab latches
   ledgeInReach = false;  // recomputed below (hang block or the walk probe)
+
+  // ---- crouch: decide the box BEFORE anything sweeps with it ----
+  //
+  // Ctrl is descend in fly and swim-down in liquid, and while hanging or
+  // mantling the body is a scripted shape, so the crouch only means anything
+  // on foot. Going DOWN is always allowed (a smaller box fits wherever the
+  // bigger one did). Coming back UP is gated on the standing box being clear
+  // where the body is right now: a body that let go of Ctrl in a crawl-space
+  // stays crouched until it walks out, instead of standing into the ceiling
+  // and being welded there for UnstickRise to dig out.
+  //
+  // The eye rides the box top, so a change of box is a change of eye height.
+  // Banked into viewYOffset exactly like a step-up, so the camera glides
+  // down and up over viewSmoothHalflife instead of stepping.
+  {
+    const bool wantCrouch =
+        in.down && !fly && !inLiquid && !hanging && mantleTimer <= 0.0f;
+    const float eyeBefore = EyeOffsetNow();
+    if (fly) {
+      crouching = false;
+    } else if (wantCrouch) {
+      crouching = true;
+    } else if (crouching && !Collides(pos, BoxFor(false), kindAt)) {
+      crouching = false;
+    }
+    viewYOffset -= EyeOffsetNow() - eyeBefore;
+  }
+  const Box b = CurrentBox();
 
   // Decay the render-only step-smoothing offset toward zero (frame-rate
   // independent: a fixed half-life, so the eye covers half the remaining
@@ -442,7 +508,7 @@ void Player::Update(float dt, const PlayerInput& in, const Vec3& flatFwd,
   // jumps.
   if (!fly) {
     const float maxRise = T().unstickMaxDepth / kVoxelMeters;
-    float rise = UnstickRise(pos, maxRise, kindAt);
+    float rise = UnstickRise(pos, maxRise, b, kindAt);
     if (rise > 0.0f) {
       float step = std::min(rise, (T().unstickSpeed / kVoxelMeters) * dt);
       pos.y += step;
@@ -571,15 +637,15 @@ void Player::Update(float dt, const PlayerInput& in, const Vec3& flatFwd,
       const float rise = (mantleSpeed / kVoxelMeters) * dt;
       float yBefore = pos.y;
       if (d.y > 1e-3f) {
-        SweepAxis(pos, std::min(d.y, rise), 1, kindAt);
+        SweepAxis(pos, std::min(d.y, rise), 1, b, kindAt);
       } else {
         // At height: cross onto the bank. Only now, so the horizontal press
         // cannot start until there is somewhere to press onto.
         float remain = std::sqrt(d.x * d.x + d.z * d.z);
         if (remain > 1e-3f) {
           float s = std::min(1.0f, rise / remain);
-          SweepAxis(pos, d.x * s, 0, kindAt);
-          SweepAxis(pos, d.z * s, 2, kindAt);
+          SweepAxis(pos, d.x * s, 0, b, kindAt);
+          SweepAxis(pos, d.z * s, 2, b, kindAt);
         }
       }
       // Bank the climb into the view offset like a step-up, so the camera glides
@@ -651,7 +717,7 @@ void Player::Update(float dt, const PlayerInput& in, const Vec3& flatFwd,
       // again, and the next lip up catches. Grab, boost, grab is how a noisy
       // wall becomes climbable, which is exactly what this feature is for.
       hanging = false;
-      if (!Collides(hangStand, kindAt)) {
+      if (!Collides(hangStand, b, kindAt)) {
         mantleTarget = hangStand;
         mantleSpeed = T().ledgeMantleSpeed;
         mantleTimer = T().ledgeMantleTime;
@@ -688,10 +754,10 @@ void Player::Update(float dt, const PlayerInput& in, const Vec3& flatFwd,
         const float step =
             (T().ledgeShimmySpeed / kVoxelMeters) * dt * in.strafe;
         const Vec3 before = pos;
-        SweepAxis(pos, rightW.x * step, 0, kindAt);
-        SweepAxis(pos, rightW.z * step, 2, kindAt);
+        SweepAxis(pos, rightW.x * step, 0, b, kindAt);
+        SweepAxis(pos, rightW.z * step, 2, b, kindAt);
         LedgeHit hit;
-        if (LedgeGrabAhead(pos, hangDir, kindAt, &hit)) {
+        if (LedgeGrabAhead(pos, hangDir, b, kindAt, &hit)) {
           // The grip follows: lip, anchor and the pull-up spot all track the
           // new position, so a pull-up after a traverse climbs where you are.
           hangLip = hit.lip;
@@ -707,12 +773,12 @@ void Player::Update(float dt, const PlayerInput& in, const Vec3& flatFwd,
       const float step = (T().ledgeSettleSpeed / kVoxelMeters) * dt;
       const float yBefore = pos.y;
       if (std::abs(d.y) > 1e-3f)
-        SweepAxis(pos, std::clamp(d.y, -step, step), 1, kindAt);
+        SweepAxis(pos, std::clamp(d.y, -step, step), 1, b, kindAt);
       const float remain = std::sqrt(d.x * d.x + d.z * d.z);
       if (remain > 1e-3f) {
         const float s = std::min(1.0f, step / remain);
-        SweepAxis(pos, d.x * s, 0, kindAt);
-        SweepAxis(pos, d.z * s, 2, kindAt);
+        SweepAxis(pos, d.x * s, 0, b, kindAt);
+        SweepAxis(pos, d.z * s, 2, b, kindAt);
       }
       // Bank the settle into the view offset like every other scripted
       // vertical move, so the eye eases down to the dead hang.
@@ -746,7 +812,7 @@ void Player::Update(float dt, const PlayerInput& in, const Vec3& flatFwd,
     // keeps us attached walking down a rough slope instead of bouncing off it.
     bool rising = vel.y > nonJumpSpeed;
     float reach = grounded ? 0.1f + (float)kMaxStepUpVoxels : 0.1f;
-    float drop = rising ? -1.0f : GroundProbe(pos, reach, kindAt);
+    float drop = rising ? -1.0f : GroundProbe(pos, reach, b, kindAt);
     bool onGround = drop >= 0.0f && !inLiquid;
     if (onGround) coyoteTimer = T().coyoteTime;
 
@@ -763,8 +829,13 @@ void Player::Update(float dt, const PlayerInput& in, const Vec3& flatFwd,
     // slow you, chest-deep should be the authored liquidSpeedScale.
     float wade =
         inLiquid ? (1.0f + (T().liquidSpeedScale - 1.0f) * submersion) : 1.0f;
-    float speed = ((in.sprint ? T().sprintSpeed : T().walkSpeed) / kVoxelMeters) *
-                  wade * (speedScale > 0.0f ? speedScale : 0.0f);
+    // Crouched: no sprint, and the walk scaled down. A crouch is a deliberate
+    // slow-and-low, and letting Shift sprint through it would make the box
+    // shrink for free.
+    const bool sprint = in.sprint && !crouching;
+    float speed = ((sprint ? T().sprintSpeed : T().walkSpeed) / kVoxelMeters) *
+                  wade * (speedScale > 0.0f ? speedScale : 0.0f) *
+                  (crouching ? T().crouchSpeedScale : 1.0f);
     Vec3 wish = flatFwd * in.forward + right * in.strafe;
     wish.y = 0;
     if (wish.len() > 1e-3f) wish = wish.normalized() * speed;
@@ -831,7 +902,7 @@ void Player::Update(float dt, const PlayerInput& in, const Vec3& flatFwd,
           jumpScale > 0.0f && haveSurface && dir.len() > 1e-3f) {
         dir = dir.normalized();
         Vec3 target;
-        if (WaterLedgeAhead(pos, dir, waterSurfaceY, kindAt, &target)) {
+        if (WaterLedgeAhead(pos, dir, waterSurfaceY, b, kindAt, &target)) {
           mantleTarget = target;
           mantleSpeed = T().waterMantleSpeed;
           mantleTimer = T().waterMantleTime;
@@ -872,12 +943,12 @@ void Player::Update(float dt, const PlayerInput& in, const Vec3& flatFwd,
     const Vec3 velBeforeSweep = vel;
 
     // ---- vertical move ----
-    bool blockedY = SweepAxis(pos, vel.y * dt, 1, kindAt);
+    bool blockedY = SweepAxis(pos, vel.y * dt, 1, b, kindAt);
     if (blockedY) vel.y = 0;
 
     // ---- horizontal move, with step-up ----
     float climbed =
-        onGround ? StepSlide(pos, vel.x * dt, vel.z * dt, kindAt) : 0.0f;
+        onGround ? StepSlide(pos, vel.x * dt, vel.z * dt, b, kindAt) : 0.0f;
     // The climb is an instantaneous vertical snap of the BODY; cancel it in
     // the view offset so the eye stays put this frame and glides up as the
     // offset decays. Horizontal motion is untouched — stays 1:1.
@@ -894,8 +965,8 @@ void Player::Update(float dt, const PlayerInput& in, const Vec3& flatFwd,
       // 30 m/s, and it is why a horizontal slam registered no impact at all.
       // The staircase case it protected is already airborne, so step-up is off
       // and the riser stops you either way until you land.
-      bool blockedX = SweepAxis(pos, vel.x * dt, 0, kindAt);
-      bool blockedZ = SweepAxis(pos, vel.z * dt, 2, kindAt);
+      bool blockedX = SweepAxis(pos, vel.x * dt, 0, b, kindAt);
+      bool blockedZ = SweepAxis(pos, vel.z * dt, 2, b, kindAt);
       if (blockedX) vel.x = 0;
       if (blockedZ) vel.z = 0;
     }
@@ -905,10 +976,10 @@ void Player::Update(float dt, const PlayerInput& in, const Vec3& flatFwd,
     // *down* rough ground from a series of little falls into contact motion,
     // and it is why grounded stays true across noise. Skipped while rising.
     if (onGround && !launched && vel.y <= nonJumpSpeed) {
-      float snap = GroundProbe(pos, 0.1f + (float)kMaxStepUpVoxels, kindAt);
+      float snap = GroundProbe(pos, 0.1f + (float)kMaxStepUpVoxels, b, kindAt);
       if (snap > 0.0f) {
         float yBefore = pos.y;
-        SweepAxis(pos, -snap, 1, kindAt);
+        SweepAxis(pos, -snap, 1, b, kindAt);
         // Downward twin of the step-up compensation: the snap teleports the
         // body onto the lower surface, so bank the drop (positive) into the
         // view offset and let the eye follow it down over the half-life.
@@ -928,7 +999,7 @@ void Player::Update(float dt, const PlayerInput& in, const Vec3& flatFwd,
     // Re-probe after the move so `grounded` reported to the rest of the frame
     // reflects where we ended up, not where we started.
     grounded = !rising && !inLiquid &&
-               GroundProbe(pos, 0.1f, kindAt) >= 0.0f;
+               GroundProbe(pos, 0.1f, b, kindAt) >= 0.0f;
     if (grounded) coyoteTimer = T().coyoteTime;
 
     // ---- ledge grab latch (see the hanging block above) ----
@@ -948,7 +1019,7 @@ void Player::Update(float dt, const PlayerInput& in, const Vec3& flatFwd,
       if (dir.len() > 1e-3f) {
         dir = dir.normalized();
         LedgeHit hit;
-        if (LedgeGrabAhead(pos, dir, kindAt, &hit)) {
+        if (LedgeGrabAhead(pos, dir, b, kindAt, &hit)) {
           ledgeInReach = true;
           ledgeLip = hit.lip;
           if (!grounded && !inLiquid && in.up && !in.down &&
@@ -979,7 +1050,10 @@ void Player::Update(float dt, const PlayerInput& in, const Vec3& flatFwd,
     // Cap the view offset at one step height. Anything bigger than a step is
     // not a step — a long fall resolved by the ground snap, a spawn, a shove —
     // and smearing the camera across it reads as lag, not smoothness.
-    const float maxOff = (float)kMaxStepUpVoxels;
+    // The crouch's eye drop goes through here too, so the cap must admit it
+    // as well as a step: whichever of the two is larger.
+    const float maxOff = std::max((float)kMaxStepUpVoxels,
+                                  BoxFor(false).yHi - BoxFor(true).yHi);
     viewYOffset = std::clamp(viewYOffset, -maxOff, maxOff);
   }
 
@@ -997,9 +1071,10 @@ void Player::ApplyPush(Vec3 push, const KindFn& kindAt) {
   // of ejecting the camera across the map in one frame.
   const float kMaxPush = 2.0f * kHalfXZ;
   if (len > kMaxPush) push = push * (kMaxPush / len);
-  SweepAxis(pos, push.x, 0, kindAt);
-  SweepAxis(pos, push.y, 1, kindAt);
-  SweepAxis(pos, push.z, 2, kindAt);
+  const Box b = CurrentBox();
+  SweepAxis(pos, push.x, 0, b, kindAt);
+  SweepAxis(pos, push.y, 1, b, kindAt);
+  SweepAxis(pos, push.z, 2, b, kindAt);
   if (push.y > 0.01f && vel.y < 0.0f) {
     // supported from below by a body: standing (and jumping) on debris works
     // even though the voxel ground probe can't see rigidbodies

@@ -1,4 +1,5 @@
 #pragma once
+#include <algorithm>
 #include <functional>
 
 #include "math3d.h"
@@ -30,19 +31,68 @@ class Player {
   // standing on debris works.
   void ApplyPush(Vec3 push, const KindFn& kindAt);
 
-  Vec3 EyePos() const { return pos + Vec3{0, kEyeOffset, 0}; }
+  // ---- THE COLLISION BOX IS NOT THE FIGURE -------------------------------
+  //
+  // `pos` is the centre of the NOMINAL 1.7 m figure box (kHalfXZ x kHalfY):
+  // the sole is `pos.y - kHalfY`, the avatar art hangs off that, and every
+  // test and caller that says "feet = pos.y - kHalfY" keeps being right. But
+  // the box the SWEEPS use is a smaller one standing on that same sole —
+  // tuning.json player.collisionWidth wide and player.collisionHeight tall
+  // (player.crouchHeight while crouched) — and it decides movement alone.
+  // The shoulders, arms and the top of the head overhang it and are allowed
+  // to clip terrain by exactly that overhang.
+  //
+  // Why: a corridor whose ceiling was a head-clip above the figure refused
+  // the figure, and a doorway the shoulders brushed refused it too. What
+  // the player experiences as "where I am" is where the feet go, so the box
+  // is sized from the feet up and the limbs are cosmetic. A rig with arms
+  // out or a hat on does not change how it fits through a gap.
+  struct Box {
+    float hx;   // half-width, voxels
+    float yLo;  // bottom relative to pos.y (the sole: -kHalfY)
+    float yHi;  // top relative to pos.y
+  };
+  Box BoxFor(bool crouched) const;
+  Box CurrentBox() const { return BoxFor(crouching); }
+  // Height of the live collision box above the sole, voxels.
+  float BoxHeight() const {
+    const Box b = CurrentBox();
+    return b.yHi - b.yLo;
+  }
+
+  // The first-person eye rides at the FIGURE's face row (kEyeOffset) or just
+  // under the top of the live collision box, whichever is lower. The box is
+  // what is guaranteed to be clear of terrain; the face row is not, and a
+  // camera inside a ceiling voxel is the one thing the head-clip must not
+  // buy. Crouching drops it with the box.
+  float EyeOffsetNow() const {
+    const Box b = CurrentBox();
+    return std::min(kEyeOffset, b.yHi - kEyeBelowTopM / kVoxelMeters);
+  }
+  Vec3 EyePos() const { return pos + Vec3{0, EyeOffsetNow(), 0}; }
 
   // Render-only eye position: EyePos plus a vertical offset that cancels the
   // instantaneous pop when the body steps up/down a voxel ledge, then decays
   // to zero (tuning.json player.viewSmoothHalflife). The raymarch camera is
   // its ONLY consumer — physics, picking rays and everything that can feed the
   // sim keep using EyePos()/pos, so the world hash cannot be affected.
-  Vec3 ViewEyePos() const { return pos + Vec3{0, kEyeOffset + viewYOffset, 0}; }
+  // A crouch's eye drop is banked into the same offset, so the camera eases
+  // down and up instead of stepping by the box-height change.
+  Vec3 ViewEyePos() const {
+    return pos + Vec3{0, EyeOffsetNow() + viewYOffset, 0};
+  }
 
-  Vec3 pos{128, 100, 140};  // AABB center
+  Vec3 pos{128, 100, 140};  // centre of the nominal figure box (see Box)
   Vec3 vel{0, 0, 0};
   bool fly = true;          // start in fly mode until the first mirror arrives
   bool grounded = false;
+  // Ctrl held on the ground (or in the air; not while swimming, hanging or
+  // mantling). The collision box is crouchHeight tall while this holds and
+  // ground speed is scaled by crouchSpeedScale. STICKY under a low ceiling:
+  // releasing Ctrl only stands the body up once the standing box fits, so
+  // a crawl-space cannot wedge you by letting go at the wrong moment. The
+  // avatar reads it for the knee bend. Fly mode clears it (Ctrl is descend).
+  bool crouching = false;
   bool inLiquid = false;
   // Fraction of the body under liquid, 0..1. Every liquid effect (drag,
   // buoyancy, wade speed) scales with this rather than switching on the first
@@ -173,9 +223,17 @@ class Player {
   // launch.
   bool jumped = false;
 
+  // The NOMINAL figure box: what the art is drawn to (gen_human.py asserts
+  // it), what the Jolt player proxy and the mob sense actor are sized from,
+  // and the frame every "feet = pos.y - kHalfY" expression lives in. NOT the
+  // collision box the sweeps use — see Box above.
   static constexpr float kHalfXZ = 0.30f / kVoxelMeters;     // 0.6 m wide
   static constexpr float kHalfY = 0.85f / kVoxelMeters;      // 1.7 m tall
-  static constexpr float kEyeOffset = 0.65f / kVoxelMeters;  // eyes near the top
+  static constexpr float kEyeOffset = 0.65f / kVoxelMeters;  // the face row
+  // How far under the live box top the eye sits when the box is what limits
+  // it (EyeOffsetNow). Over half a voxel so the eye's cell is the box's top
+  // cell, which the sweeps keep clear, and never the ceiling above it.
+  static constexpr float kEyeBelowTopM = 0.06f;
 
   // Tallest ledge walked over without jumping, in meters. Because it is
   // physical, shrinking kVoxelMeters turns the same real-world ledge into more

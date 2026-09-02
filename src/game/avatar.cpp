@@ -87,6 +87,15 @@ constexpr float kMaxCrouchLegLengths = 0.30f;
 // gives back the permanent half-crouch it replaced.
 constexpr float kCrouchHalflife = 0.05f;
 
+// The HELD crouch (Ctrl, tuning.json player.crouchKneeDrop): its ceiling in
+// leg lengths and its half-life. The ceiling keeps an authored drop from
+// folding the leg past what the two-bone solve can pose; the half-life is
+// longer than the stance crouch's because this is a deliberate change of
+// pose, not a per-step oscillation — it should read as sinking into the
+// knees, not snapping.
+constexpr float kMaxHeldCrouchLegLengths = 0.55f;
+constexpr float kHeldCrouchHalflife = 0.08f;
+
 // How long the GAIT keeps its footing after `grounded` drops, and how far the
 // body may have left the ground it last stood on while it does.
 //
@@ -781,7 +790,7 @@ void PlayerAvatar::UpdateGait(float dt, World& world) {
   // and because the leg IK targets are WORLD points, lowering the pelvis pushes
   // the bend into the knees and leaves the feet exactly where the gait put them,
   // which is what a crouch is.
-  bodyY_ = origin_.y - stanceCrouch_;
+  bodyY_ = origin_.y - stanceCrouch_ - crouchHold_;
 
   // The body stays upright. A real foot-plane tilt needs the horizontal
   // separation between the feet as well as their height difference (the lean
@@ -895,7 +904,7 @@ void PlayerAvatar::UpdateAirPose(float dt) {
   // the feet never ran at.
   lastFootDown_ = -1;
   sinceTouchdown_ = 0.0f;
-  bodyY_ = origin_.y - stanceCrouch_;
+  bodyY_ = origin_.y - stanceCrouch_ - crouchHold_;
   bodyUp_ = (bodyUp_ * 0.85f + Vec3{0, 1, 0} * 0.15f).normalized();
   if (bodyUp_.len() < 0.5f) bodyUp_ = {0, 1, 0};
 }
@@ -1152,6 +1161,26 @@ void PlayerAvatar::UpdateAnimation(float dt, World& world, bool grounded,
   // `grounded` is part of the gate, not just an input to it: a gait with no
   // floor under it has no meaningful foot target (see UpdateAirPose).
   const bool gaitActive = g.present && !clipOwnsPose && grounded;
+
+  // ---- the held crouch (Ctrl) ----
+  // Eased toward the authored knee drop while the player crouches, toward 0
+  // otherwise, and off entirely while a clip owns the pelvis (crawl, squirm):
+  // those key the same pelvis and composing the two would double-drop it.
+  // Capped in leg lengths off the rig's own chain so an authored metre value
+  // cannot ask more bend than the solve can pose. Runs in the air too — a
+  // crouch-jump keeps its tuck, and the landing does not have to re-sink.
+  {
+    float legLen = 0.0f;
+    for (const FootState& f : st.feet) legLen = std::max(legLen, f.legLength);
+    float want = (crouchWant_ && !clipOwnsPose)
+                     ? MetresToCells(CurrentTuning().player.crouchKneeDrop)
+                     : 0.0f;
+    if (legLen > 0.0f)
+      want = std::min(want, kMaxHeldCrouchLegLengths * legLen);
+    crouchHold_ += (want - crouchHold_) *
+                   (1.0f - std::pow(0.5f, dt / kHeldCrouchHalflife));
+    if (crouchHold_ < 1e-3f) crouchHold_ = 0.0f;
+  }
 
   // THE IK FADES IN AND OUT; IT DOES NOT SWITCH.
   //
@@ -1489,6 +1518,7 @@ void PlayerAvatar::PreTick(uint32_t tick, const Player& player, float heading,
     // Mirror the hang state for the arm-IK block; UpdateAnimation itself
     // stays player-free by design.
     hangActive_ = player.hanging;
+    crouchWant_ = player.crouching;
     if (player.hanging) {
       hangLipW_ = player.hangLip;
       hangDirW_ = player.hangDir;

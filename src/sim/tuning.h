@@ -184,7 +184,30 @@ struct Tuning {
     // the mantle fires on the first hang frame and the catch never appears on
     // screen. 0 restores instant pull-up.
     float ledgePullDelay = 0.25f;
-    float halfWidth = 0.30f, halfHeight = 0.85f, eyeOffset = 0.65f;
+    // ---- the collision box (Player::Box) ----
+    // The player's collision box is NOT the figure. It is a small box centred
+    // on where the feet go — collisionWidth wide, collisionHeight tall from
+    // the sole — and the arms, shoulders and the top of the head are allowed
+    // to clip terrain by however much the 1.7 m art overhangs it. Movement
+    // is decided by this box alone: a corridor one head-clip lower than the
+    // figure still admits the figure. Metres; converted at use.
+    float collisionWidth = 0.40f;
+    float collisionHeight = 1.50f;
+    // Ctrl. The box shrinks to this height while crouched (and stays crouched
+    // under a ceiling the standing box would not fit back under), speed is
+    // scaled by crouchSpeedScale, and the avatar bends its knees by
+    // crouchKneeDrop — the pelvis drops that far and the leg IK, whose foot
+    // targets are world points, turns the drop into a bend.
+    float crouchHeight = 1.15f;
+    float crouchSpeedScale = 0.5f;
+    float crouchKneeDrop = 0.35f;
+    // The FIGURE contract, not collision: gen_human.py / gen_mina.py /
+    // gen_asha.py read these out of tuning.json and assert that the art they
+    // draw is halfHeight*2 tall with the face at halfHeight+eyeOffset. The
+    // controller does not read them (it has Player::kHalfY/kEyeOffset for the
+    // same 1.7 m / 1.5 m numbers); they are here so the file stays the one
+    // place the figure's size is written down.
+    float halfHeight = 0.85f, eyeOffset = 0.65f;
     // Camera step smoothing: half-life (seconds) of the render-only eye
     // offset that cancels the vertical pop when the body steps up/down a
     // ledge (Player::ViewEyePos). 0 disables. CPU/render only — the physics
