@@ -52,6 +52,8 @@ namespace {
 #define PIPE_PAGEFILL        Pipe::PageFill
 #define PIPE_FAR_FILL        Pipe::FarFill
 #define PIPE_FAR_DOWN        Pipe::FarDown
+#define PIPE_OPENNESS_DIRTY   Pipe::OpennessDirty
+#define PIPE_OPENNESS_REFRESH Pipe::OpennessRefresh
 #define PIPE_SHADOW_PREPARE  Pipe::ShadowPrepare
 #define PIPE_SHADOW_RESOLVE  Pipe::ShadowResolve
 #define PIPE_FLUID_SPAWN     Pipe::FluidSpawn
@@ -123,6 +125,7 @@ namespace {
 #define C_WATERBODY Cond::WaterBody
 #define C_WATERDRAIN Cond::WaterDrain
 #define C_WATERSWEEP Cond::WaterSweep
+#define C_OPENNESS  Cond::Openness
 
 #define D_WINDWAKE  (uint32_t)DispatchSel::WindWakeSel
 #define D_OPS       (uint32_t)DispatchSel::Ops
@@ -139,6 +142,7 @@ namespace {
 #define D_FLUIDSPAWN      (uint32_t)DispatchSel::FluidSpawnSel
 #define IND_FLUIDARGS     (uint32_t)DispatchSel::IndFluidArgs
 #define IND_FLUIDPARGS    (uint32_t)DispatchSel::IndFluidPArgs
+#define D_OPENCHUNKS      (uint32_t)DispatchSel::OpennessChunks
 #define D_WATERCHUNKS     (uint32_t)DispatchSel::WaterChunks
 #define D_WATERCHUNKS64   (uint32_t)DispatchSel::WaterChunks64
 #define D_WATERDRAIN      (uint32_t)DispatchSel::WaterDrainSel

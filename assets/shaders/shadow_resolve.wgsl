@@ -18,16 +18,23 @@
 //      The trace() call site has to be ABSENT from the compiled fragment
 //      shader, which means the ray must be cast somewhere else. Here.
 //
-// THE RAY CAST HERE IS NOT trace(). trace() lives in raymarch.wgsl and is not
-// reachable from a compute shader; moving it into common.wgsl would prepend
-// 800 lines to all 17 shaders. shadowMarch below is a purpose-built MEDIA-BLIND
-// DDA instead — no media accumulation, no water surface, no micro bricks, no
-// reflection — which is also why it is cheaper per ray than trace(..., false)
-// was: it carries none of those registers.
+// THE RAY CAST HERE IS NOT trace(). trace() lives in raymarch.wgsl, carries 26
+// Hit fields and is not reachable from a compute shader anyway. This pass casts
+// traceOpaque() (common.wgsl) — a purpose-built MEDIA-BLIND DDA with no media
+// accumulation, no water surface, no micro bricks and no reflection, which is
+// also why it is cheaper per ray than trace(..., false) was: it carries none of
+// those registers.
 //
-// TWO DDAs THAT MUST AGREE IS THE CLASSIC SILENT BUG, so it is not left to a
-// comment: `--selftest --gate shadow-cache` casts both at sampled surface
-// points and asserts they return the same answer.
+// IT USED TO LIVE HERE, as a private `shadowMarch` returning {hit, t}. W2-A
+// (docs/PLAN_lin_followups.md) moved it into common.wgsl and widened the return
+// to {hit, t, cell, axis, sgn, word}, because the same march answers every
+// SECONDARY ray in the engine — this pass, sunShadowAt's cache-off fallback,
+// traceReflection, traceRefraction and the god-ray occlusion test. TWO DDAs
+// THAT MUST AGREE IS THE CLASSIC SILENT BUG and one function is the only
+// structural cure; `--selftest --gate shadow-cache` still casts the
+// compute-stage ray and the fragment-stage ray at sampled surface points and
+// asserts they agree, which is now a statement about the two CALL SITES rather
+// than about two copies of a DDA.
 //
 // ---- WHAT THIS ACTUALLY BOUGHT, AND THE COST NOBODY BUDGETED FOR ----------
 // Measured with --render-budget (RTX 3060 Ti, overlook cam, 1080p, 2026-09-01),
@@ -70,169 +77,6 @@
 @group(0) @binding(5) var<storage, read_write> shadowCache : array<atomic<u32>>;
 @group(0) @binding(6) var<storage, read_write> shadowReq : array<atomic<u32>>;
 @group(0) @binding(7) var<storage, read_write> shadowArgs : array<u32>;
-
-// ---------------------------------------------------------------- march ----
-
-struct ShadowHit {
-  hit : bool,
-  t   : f32,   // fine-voxel units, distance to the blocker
-}
-
-// The media-blind march. Structurally the same DDA as trace()'s — same window
-// clip, same per-chunk lookup cache, same chunk-skip jump geometry — with every
-// branch a media-aware ray needs deleted.
-//
-// WHAT COUNTS AS A HIT, and why it is exactly isRayBlocker(): walking trace()'s
-// per-cell chain for wantMedia = false, a gas or translucent liquid takes the
-// participating-media branch and accumulates nothing; a micro cell falls
-// through explicitly (raymarch.wgsl, "shadow / reflection ray meets a micro
-// cell"); everything else hits — INCLUDING translucent solids, because ice
-// casts a solid shadow and the sim's seesSky already believes that. Solid,
-// powder, opaque liquid, no micro: that is isRayBlocker's definition verbatim,
-// which is the same equivalence the sub-chunk occupancy block in common.wgsl
-// relies on.
-fn shadowMarch(ro : vec3f, rdIn : vec3f, maxSteps : i32) -> ShadowHit {
-  var out : ShadowHit;
-  out.hit = false;
-  out.t = 0.0;
-
-  // Axis-aligned rays would divide by zero and produce inf tMax. Same nudge
-  // trace() applies, and it must stay identical or the two disagree on rays
-  // exactly along an axis — which is the common case here, since the sun is
-  // often near-vertical.
-  var rd = rdIn;
-  if (abs(rd.x) < 1e-6) { rd.x = select(-1e-6, 1e-6, rd.x >= 0.0); }
-  if (abs(rd.y) < 1e-6) { rd.y = select(-1e-6, 1e-6, rd.y >= 0.0); }
-  if (abs(rd.z) < 1e-6) { rd.z = select(-1e-6, 1e-6, rd.z >= 0.0); }
-  let inv = 1.0 / rd;
-
-  // Clip to the residency window AABB, in world coords.
-  //
-  // NO LOD HANDOFF CLAMP HERE, deliberately. trace() shortens tExit to
-  // TUNE_LOD_HANDOFF_DIST for media-AWARE rays only, and the comment there
-  // says why a shadow ray must be excluded: one that gave up at 18 m would
-  // report "lit" for a receiver whose blocker is at 20 m, which unshadows
-  // terrain rather than coarsening it.
-  let nf = f32(WORLD_N);
-  let wloI = R.origin * i32(CHUNK);
-  let wlo = vec3f(wloI);
-  let tt0 = (wlo - ro) * inv;
-  let tt1 = (wlo + vec3f(nf) - ro) * inv;
-  let tmin = min(tt0, tt1);
-  let tmax = max(tt0, tt1);
-  let tEnter = max(max(tmin.x, tmin.y), max(tmin.z, 0.0));
-  let tExit = min(tmax.x, min(tmax.y, tmax.z));
-  if (tExit <= tEnter) { return out; }
-
-  var t = tEnter + 1e-4;
-  var p = ro + rd * t;
-  var cell = clamp(vec3<i32>(floor(p)), wloI, wloI + vec3<i32>(i32(WORLD_N) - 1));
-  let stepv = vec3<i32>(sign(rd));
-  let tDelta = abs(inv);
-  var tMax : vec3f;
-  for (var a = 0; a < 3; a++) {
-    let boundary = f32(cell[a]) + select(0.0, 1.0, rd[a] > 0.0);
-    tMax[a] = (boundary - ro[a]) * inv[a];
-  }
-  var tCur = t;
-
-  let wloHi = wloI + vec3<i32>(i32(WORLD_N));
-  // Per-chunk lookup cache, same as trace()'s: occupancy and the page entry are
-  // invariant while the ray stays in a chunk, which is 16-48 steps. Compared on
-  // the CHUNK COORD rather than the linear index so the miss test is three
-  // shifts and a vec3 compare instead of chunkIndexW's multiplies.
-  var cchOcc = 0u;
-  var cchPt = 0u;
-  var cchC = vec3<i32>(0x7FFFFFFF);
-
-  for (var i = 0; i < 4096; i++) {
-    if (i >= maxSteps) { break; }
-    if (any(cell < wloI) || any(cell >= wloHi)) { break; }
-
-    let cc = cell >> vec3<u32>(CHUNK_SHIFT);
-    if (any(cc != cchC)) {
-      cchC = cc;
-      let chIdx = chunkIndexW(cell);
-      cchOcc = occupancy[chIdx];
-      cchPt = pageEntryOf(chIdx);
-    }
-
-    // Chunk skip on the BLOCKER count, never the total: a chunk holding only
-    // smoke or grass must be as cheap as air for this ray class.
-    var chunkSkip = (occBlockers(cchOcc) == 0u);
-    if ((cchPt & PT_SENTINEL_BIT) != 0u) {
-      let sMat = cchPt & PT_MAT_MASK;
-      if (sMat == MAT_AIR) {
-        chunkSkip = true;
-      } else if (isRayBlocker(materials[sMat])) {
-        // A uniform body of blocker material: this cell IS that material, so
-        // the answer is here. No isTranslucentSolid exclusion, unlike the
-        // primary ray's version of this branch in raymarch.wgsl — that
-        // exclusion exists so a PRIMARY ray keeps marching through glass to
-        // accumulate its Beer-Lambert path, and a shadow ray must stop.
-        out.hit = true;
-        out.t = tCur;
-        return out;
-      } else if ((materials[sMat].flags & MATF_MICRO) != 0u) {
-        chunkSkip = true;   // a whole chunk of grass casts no shadow
-      }
-    }
-
-    if (chunkSkip) {
-      // Jump to the chunk's exit face. Masking off the low bits is
-      // floor-to-corner for negative world coords too.
-      let blkLo = cell & vec3<i32>(~(i32(CHUNK) - 1));
-      let lo = vec3f(blkLo);
-      let hi = lo + f32(CHUNK);
-      let e0 = (lo - ro) * inv;
-      let e1 = (hi - ro) * inv;
-      let ex = max(e0, e1);
-      // max against tCur: a cell floored onto a shared face belongs to a box
-      // the ray is already exiting, so the raw exit t can be <= tCur and the
-      // march would stall in place.
-      let tOut = max(min(ex.x, min(ex.y, ex.z)), tCur);
-      t = tOut + 1e-4;
-      if (t >= tExit) { break; }
-      p = ro + rd * t;
-      var nc = vec3<i32>(floor(p));
-      // Force the crossing on the exit axis: float noise at a shared face can
-      // floor() back into the box just left, which reads as a shadow leak
-      // along chunk boundaries.
-      if (ex.x <= ex.y && ex.x <= ex.z) {
-        nc.x = select(blkLo.x - 1, blkLo.x + i32(CHUNK), rd.x > 0.0);
-      } else if (ex.y <= ex.z) {
-        nc.y = select(blkLo.y - 1, blkLo.y + i32(CHUNK), rd.y > 0.0);
-      } else {
-        nc.z = select(blkLo.z - 1, blkLo.z + i32(CHUNK), rd.z > 0.0);
-      }
-      if (any(nc < wloI) || any(nc >= wloHi)) { break; }
-      cell = nc;
-      for (var a = 0; a < 3; a++) {
-        let boundary = f32(cell[a]) + select(0.0, 1.0, rd[a] > 0.0);
-        tMax[a] = (boundary - ro[a]) * inv[a];
-      }
-      tCur = t;
-      continue;
-    }
-
-    let w = voxWordAtEntry(cchPt, cell);
-    let mat = voxMat(w);
-    if (mat != MAT_AIR && isRayBlocker(materials[mat])) {
-      out.hit = true;
-      out.t = tCur;
-      return out;
-    }
-
-    if (tMax.x < tMax.y && tMax.x < tMax.z) {
-      cell.x += stepv.x; tCur = tMax.x; tMax.x += tDelta.x;
-    } else if (tMax.y < tMax.z) {
-      cell.y += stepv.y; tCur = tMax.y; tMax.y += tDelta.y;
-    } else {
-      cell.z += stepv.z; tCur = tMax.z; tMax.z += tDelta.z;
-    }
-  }
-  return out;
-}
 
 // --------------------------------------------------------------- passes ----
 
@@ -284,8 +128,16 @@ fn resolve(@builtin(global_invocation_id) gid : vec3<u32>) {
                              R.shadowSubdiv);
   let n3 = shadowFaceNormal(face);
 
-  let s = shadowMarch(hp + n3 * TUNE_SHADOW_BIAS, keyLightDirP(R),
-                      TUNE_SHADOW_STEPS);
+  // shadowCoarseFromT() is `coarseFromT` (W2-B): past that distance the march
+  // terminates on the 4^3 blockers mask instead of the voxel. It MUST be the
+  // same expression sunShadowAt passes — the gate casts this ray and that one
+  // at the same surface point and asserts they agree — which is why it is a
+  // function in common.wgsl and not a knob read twice. The two pointers are
+  // how a function in common.wgsl reaches bindings declared after it (see
+  // traceOpaque).
+  let s = traceOpaque(hp + n3 * TUNE_SHADOW_BIAS, keyLightDirP(R),
+                      TUNE_SHADOW_STEPS, shadowCoarseFromT(),
+                      &occupancy, &materials);
   // The softening law is sunShadowAt's, verbatim, and must stay that way: the
   // penumbra is taken from how far the ray travelled before being blocked, so a
   // contact shadow stays crisp and a distant blocker's shadow lifts.

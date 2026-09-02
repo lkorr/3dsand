@@ -174,6 +174,34 @@ const M_SAPLING   : u32 = 92u;
 const M_BRAMBLE   : u32 = 93u;
 const M_LITTER    : u32 = 94u;
 
+// ---- cave flora (materials.json id 116) ----
+// The only light under the world that is not lava. Placed by caveFloraAt on the
+// deep band's floor and ceiling; see the note in materials.json for why it is
+// inert and why its emission is under lava's.
+const M_CRYSTAL   : u32 = 116u;
+
+// ---- CAVE / RUIN PLACEMENT CONSTANTS ----
+// Plain WGSL consts, same reasoning as the UG_* block above: these are
+// PLACEMENT CONTENT, not look/feel. The three DENSITIES are TUNE_* knobs
+// (worldgen.caveMushroomChance / caveCrystalChance / mossFace) because those
+// are the numbers an author reaches for; the patch masks and the margins are
+// structure.
+//
+// Crystal grows in SEAMS, not as an even sprinkle: the same device the fern and
+// moss patches use on the surface, at a cavern's scale. Without it a cavern
+// reads as a texture rather than as a place with a find in it.
+const CAVE_CRYSTAL_PATCH_CELL : i32 = 40 * HSCALE;
+const CAVE_CRYSTAL_PATCH      : i32 = 168;   // vnoise 0..255; ~35% of the area
+const CAVE_SHROOM_PATCH_CELL  : i32 = 22 * HSCALE;
+const CAVE_SHROOM_PATCH       : i32 = 128;
+// Keep-out above the magma table. A crystal seam growing into the lava it is
+// lighting is the same class of mistake as a ruin sunk into a hillside.
+const CAVE_LAVA_MARGIN : i32 = (6 * VLEN_NUM) / VLEN_DEN;
+// Moss on a ruin wall thins with height the way the ivy does, and out of the
+// same reasoning: a north face is damp at the ground and dry at the eaves.
+const RUIN_MOSS_SPREAD : u32 = 24u;
+const RUIN_MOSS_GAIN   : i32 = 16;
+
 // Undergrowth placement constants. Plain WGSL consts rather than TUNE_* knobs,
 // following the TREE_TILE / TREE_SCAN / POND_RIM precedent in this file: these
 // are PLACEMENT CONTENT (which plant grows where), not look/feel, and the
@@ -433,6 +461,259 @@ const HSCALE : i32 = 1;
 // the band moves.
 const TREELINE : i32 = TUNE_TREELINE;
 
+// ---- the biome FIELD, split from the biome DECISION ------------------------
+//
+// One low-frequency noise picks the biome, a second breaks up the boundary so
+// biomes interlock instead of meeting on a smooth contour. Desert is gated to
+// the top of the range (~12% of the field) so it reads as a rare destination
+// you walk to rather than the default world. Height still overrides at the top:
+// snow caps above TREELINE regardless of biome (handled in genCellIn).
+// The biome cell is a LOG2 EXPONENT (9 = 512 voxels = 51.2 m) — deliberately
+// NOT halved with the rest of the third scale pass. Trees kept their size and
+// their 9 m spacing, so a biome region has to stay many tree-tiles wide or a
+// "meadow" holds one bush and the field reads as per-tree noise. The break-up
+// octave is two exponents down (128 voxels) so edges stay proportionally
+// ragged. The Q14 samples are shifted back down to the 0..255 band the four
+// THRESHOLD knobs are authored in, so the primitive swap does not silently
+// re-scale them.
+//
+// The BAND and the DECISION are separate functions because the height curve
+// below needs the band's CONTINUOUS value — a thresholded biome id has no
+// "how close to the edge am I", and a curve that switches on the id alone puts
+// a cliff along every biome boundary. Everything above still calls biomeAt and
+// sees exactly what it always did.
+// Package G retires this noise entirely for the compass climate.
+fn biomeBand(x : i32, z : i32, seed : u32) -> i32 {
+  return (vnoise2d(x, z, TUNE_BIOME_LOG2, seed ^ 0x1Bu).n >> 6)
+       + (((vnoise2d(x, z, TUNE_BIOME_LOG2 - 2u, seed ^ 0x1Cu).n >> 6) - 128) / 3);
+}
+
+fn biomeFromBand(b : i32) -> u32 {
+  if (b > i32(TUNE_DESERT_THRESHOLD)) { return B_DESERT; }
+  if (b > i32(TUNE_PINE_THRESHOLD)) { return B_PINE; }
+  if (b < i32(TUNE_MEADOW_THRESHOLD))  { return B_MEADOW; }
+  return B_FOREST;
+}
+
+// ---- PER-BIOME HEIGHT CURVES (Lin 13.3.3) ---------------------------------
+//
+// "This biome is flat plains, that one is jagged mountains", authored as nine
+// numbers instead of a hand-tuned noise ladder. The curve reshapes the COARSE
+// SUM only — the continental and range rungs, the two that decide where the
+// mountains and the basins are — and leaves hill/detail/grain alone. So a
+// biome changes the LANDFORM and never the texture on it, which is the same
+// split `Land.slope` already makes for the sediment wedge.
+//
+// ---- NINE KNOTS, NOT EIGHT, AND WHY ---------------------------------------
+// The plan asked for eight. Eight knots is SEVEN intervals, so the identity
+// curve's knot values are -16384 + i*32768/7 — not integers. An identity curve
+// could then not be AUTHORED at all, only approximated, and "the default curve
+// moves nothing" would be unprovable rather than merely untested. Nine knots is
+// eight intervals and the identity values are -16384 + i*4096 exactly, which is
+// what all four biomes default to. Four extra rows buys the proof.
+//
+// ---- THE DOMAIN -----------------------------------------------------------
+// The plan said the input spans +-(contAmp + rangeAmp). It does not: `octave`
+// returns `((n - 8192) * amp) >> 14` and `n - 8192` is +-8192, so ONE rung
+// spans +-amp/2 and the two together span +-(contAmp + rangeAmp)/2. Authoring
+// against the doubled range would have left the outer two knots at each end
+// unreachable at every seed.
+//
+// ---- WHY THE IDENTITY IS BIT-EXACT ----------------------------------------
+// Three separate pieces of the arithmetic, and all three are load-bearing:
+//
+//  1. The Hermite basis is summed BEFORE the shift, not per term. h00+h01 is
+//     exactly 4096 and h10+h11+h01 is exactly `t`, in integers, whatever the
+//     rounding of t^2 and t^3 — so a straight line through the knots evaluates
+//     to k0 + t with no residue. Shifting each of the four products separately
+//     would floor four times and leak up to 3 units.
+//  2. The result is applied as a DELTA against the identity, whose value at the
+//     same parameter is exactly `p - 16384`. An identity curve therefore adds
+//     exactly zero, so the round trip out of Q14 back into voxels — which is a
+//     floor, and would bias every column down by one — never happens at all.
+//  3. The gradient scale falls out the same way: dv/dp is exactly 4096 for the
+//     identity, so the Q8 slope is exactly 256 and `(g * 256) >> 8 == g`.
+//
+// On top of that, `CURVE_IDENT_ALL` is a MODULE CONST — four biomes' worth of
+// comparisons between two consts — so with the default knots Tint folds the
+// whole feature, including its two extra vnoise2d samples, out of the shader.
+// A default world pays nothing for a curve it does not use.
+const CURVE_KNOTS : i32 = 9;
+const CURVE_SEGS  : i32 = 8;
+const CURVE_HI : i32 = (TUNE_CONT_AMPLITUDE + TUNE_RANGE_AMPLITUDE) / 2;
+
+const CURVE_IDENT_ALL : bool =
+    (TUNE_CURVE_FOREST0 == -16384 &&
+     TUNE_CURVE_FOREST1 == -12288 &&
+     TUNE_CURVE_FOREST2 == -8192 &&
+     TUNE_CURVE_FOREST3 == -4096 &&
+     TUNE_CURVE_FOREST4 == 0 &&
+     TUNE_CURVE_FOREST5 == 4096 &&
+     TUNE_CURVE_FOREST6 == 8192 &&
+     TUNE_CURVE_FOREST7 == 12288 &&
+     TUNE_CURVE_FOREST8 == 16384 &&
+     TUNE_CURVE_PINE0 == -16384 &&
+     TUNE_CURVE_PINE1 == -12288 &&
+     TUNE_CURVE_PINE2 == -8192 &&
+     TUNE_CURVE_PINE3 == -4096 &&
+     TUNE_CURVE_PINE4 == 0 &&
+     TUNE_CURVE_PINE5 == 4096 &&
+     TUNE_CURVE_PINE6 == 8192 &&
+     TUNE_CURVE_PINE7 == 12288 &&
+     TUNE_CURVE_PINE8 == 16384 &&
+     TUNE_CURVE_MEADOW0 == -16384 &&
+     TUNE_CURVE_MEADOW1 == -12288 &&
+     TUNE_CURVE_MEADOW2 == -8192 &&
+     TUNE_CURVE_MEADOW3 == -4096 &&
+     TUNE_CURVE_MEADOW4 == 0 &&
+     TUNE_CURVE_MEADOW5 == 4096 &&
+     TUNE_CURVE_MEADOW6 == 8192 &&
+     TUNE_CURVE_MEADOW7 == 12288 &&
+     TUNE_CURVE_MEADOW8 == 16384 &&
+     TUNE_CURVE_DESERT0 == -16384 &&
+     TUNE_CURVE_DESERT1 == -12288 &&
+     TUNE_CURVE_DESERT2 == -8192 &&
+     TUNE_CURVE_DESERT3 == -4096 &&
+     TUNE_CURVE_DESERT4 == 0 &&
+     TUNE_CURVE_DESERT5 == 4096 &&
+     TUNE_CURVE_DESERT6 == 8192 &&
+     TUNE_CURVE_DESERT7 == 12288 &&
+     TUNE_CURVE_DESERT8 == 16384);
+
+fn pick9(i : i32, a0 : i32, a1 : i32, a2 : i32, a3 : i32, a4 : i32,
+         a5 : i32, a6 : i32, a7 : i32, a8 : i32) -> i32 {
+  var v = a0;
+  v = select(v, a1, i == 1);
+  v = select(v, a2, i == 2);
+  v = select(v, a3, i == 3);
+  v = select(v, a4, i == 4);
+  v = select(v, a5, i == 5);
+  v = select(v, a6, i == 6);
+  v = select(v, a7, i == 7);
+  v = select(v, a8, i == 8);
+  return v;
+}
+
+// A SELECT CHAIN, never a runtime-indexed array: CLAUDE.md's note about a
+// dynamic index into a by-value uniform spilling the whole struct to scratch
+// applies to any indexable aggregate, and this is read four times per column.
+fn curveKnot(b : u32, i : i32) -> i32 {
+  let j = clamp(i, 0, CURVE_KNOTS - 1);
+  if (b == B_FOREST) {
+    return pick9(j, TUNE_CURVE_FOREST0, TUNE_CURVE_FOREST1, TUNE_CURVE_FOREST2,
+               TUNE_CURVE_FOREST3, TUNE_CURVE_FOREST4, TUNE_CURVE_FOREST5,
+               TUNE_CURVE_FOREST6, TUNE_CURVE_FOREST7, TUNE_CURVE_FOREST8);
+  }
+  if (b == B_PINE) {
+    return pick9(j, TUNE_CURVE_PINE0, TUNE_CURVE_PINE1, TUNE_CURVE_PINE2,
+               TUNE_CURVE_PINE3, TUNE_CURVE_PINE4, TUNE_CURVE_PINE5,
+               TUNE_CURVE_PINE6, TUNE_CURVE_PINE7, TUNE_CURVE_PINE8);
+  }
+  if (b == B_MEADOW) {
+    return pick9(j, TUNE_CURVE_MEADOW0, TUNE_CURVE_MEADOW1, TUNE_CURVE_MEADOW2,
+               TUNE_CURVE_MEADOW3, TUNE_CURVE_MEADOW4, TUNE_CURVE_MEADOW5,
+               TUNE_CURVE_MEADOW6, TUNE_CURVE_MEADOW7, TUNE_CURVE_MEADOW8);
+  }
+  return pick9(j, TUNE_CURVE_DESERT0, TUNE_CURVE_DESERT1, TUNE_CURVE_DESERT2,
+               TUNE_CURVE_DESERT3, TUNE_CURVE_DESERT4, TUNE_CURVE_DESERT5,
+               TUNE_CURVE_DESERT6, TUNE_CURVE_DESERT7, TUNE_CURVE_DESERT8);
+}
+
+// Fritsch-Carlson, for uniformly spaced knots: the harmonic mean of the two
+// secants, and zero at a local extremum. That is what makes an authored plateau
+// FLAT and an authored ramp crease-free — a Catmull-Rom tangent would overshoot
+// both, and an overshoot here is a hill the author did not put there.
+//
+// The multiply is safe in i32 because it only happens when the two secants
+// share a sign: knot values are clamped to +-16384 by LoadTuning, so a secant
+// of +32768 forces its neighbour negative and takes the early return.
+fn curveTangent(dPrev : i32, dNext : i32) -> i32 {
+  if (dPrev * dNext <= 0) { return 0; }
+  return (2 * dPrev * dNext) / (dPrev + dNext);
+}
+
+// One biome's curve. Returns (value in voxels, d(value)/d(input) in Q8).
+fn curveOne(b : u32, u : i32) -> vec2<i32> {
+  let hi = max(CURVE_HI, 1);
+  let uc = clamp(u, -hi, hi);
+  // Parameter across the eight segments, Q12 within a segment. The identity's
+  // value at this parameter is exactly `p - 16384`, which is what (2) above
+  // subtracts.
+  let p = clamp(((uc + hi) * (CURVE_SEGS << 12)) / (2 * hi), 0, CURVE_SEGS << 12);
+  let seg = min(p >> 12, CURVE_SEGS - 1);
+  let t = p - (seg << 12);
+  let km = curveKnot(b, seg - 1);
+  let k0 = curveKnot(b, seg);
+  let k1 = curveKnot(b, seg + 1);
+  let k2 = curveKnot(b, seg + 2);
+  let d0 = k1 - k0;
+  let m0 = select(curveTangent(k0 - km, d0), d0, seg == 0);
+  let m1 = select(curveTangent(d0, k2 - k1), d0, seg == CURVE_SEGS - 1);
+
+  let t2 = (t * t) >> 12;
+  let t3 = (t2 * t) >> 12;
+  let h00 = 2 * t3 - 3 * t2 + 4096;
+  let h10 = t3 - 2 * t2 + t;
+  let h01 = 3 * t2 - 2 * t3;
+  let h11 = t3 - t2;
+  // ONE shift over the whole sum -- see (1) above.
+  let v = (k0 * h00 + m0 * h10 + k1 * h01 + m1 * h11) >> 12;
+
+  // The Hermite basis differentiated, same trick, same reason.
+  let g00 = 6 * t2 - 6 * t;
+  let g10 = 3 * t2 - 4 * t + 4096;
+  let g01 = 6 * t - 6 * t2;
+  let g11 = 3 * t2 - 2 * t;
+  let dv = (k0 * g00 + m0 * g10 + k1 * g01 + m1 * g11) >> 12;
+
+  return vec2<i32>(uc + (((v - (p - 16384)) * hi) >> 14),
+                   clamp(dv >> 4, 0, 4096));
+}
+
+// Which two biomes this column sits between, and how far across. Returns
+// (loBiome, hiBiome, Q8 weight of hi). A hard switch on `biomeFromBand` would
+// put a CLIFF along every biome edge -- the curve is applied to the coarse rungs
+// whose amplitude is 100 m, so two different curves meeting on a contour is a
+// step of tens of voxels, not a texture seam.
+fn curveBiomePair(band : i32) -> vec3<i32> {
+  let hard = i32(biomeFromBand(band));
+  let bw = max(TUNE_BIOME_BLEND, 0);
+  if (bw <= 0) { return vec3<i32>(hard, hard, 0); }
+  // The three boundaries of the band, low side to high side. LoadTuning keeps
+  // the thresholds more than 2*biomeBlend apart, so at most one can be in
+  // range and the order of the tests does not matter.
+  let tm = i32(TUNE_MEADOW_THRESHOLD);   // below it: meadow, above: forest
+  let tp = i32(TUNE_PINE_THRESHOLD);     // below it: forest, above: pine
+  let td = i32(TUNE_DESERT_THRESHOLD);   // below it: pine,   above: desert
+  if (band > tm - bw && band <= tm + bw) {
+    return vec3<i32>(i32(B_MEADOW), i32(B_FOREST),
+                     ((band - (tm - bw)) * 256) / (2 * bw));
+  }
+  if (band > tp - bw && band <= tp + bw) {
+    return vec3<i32>(i32(B_FOREST), i32(B_PINE),
+                     ((band - (tp - bw)) * 256) / (2 * bw));
+  }
+  if (band > td - bw && band <= td + bw) {
+    return vec3<i32>(i32(B_PINE), i32(B_DESERT),
+                     ((band - (td - bw)) * 256) / (2 * bw));
+  }
+  return vec3<i32>(hard, hard, 0);
+}
+
+// The curve, blended across the biome edge. `u` is the coarse sum; the result
+// is (reshaped sum, Q8 slope) and BOTH are used -- the slope multiplies the
+// accumulated gradient so the iq attenuation of hill/detail/grain still sees
+// the ground it is actually attenuating against.
+fn biomeCurve(x : i32, z : i32, u : i32, seed : u32) -> vec2<i32> {
+  if (CURVE_IDENT_ALL) { return vec2<i32>(u, 256); }
+  let pr = curveBiomePair(biomeBand(x, z, seed));
+  let lo = curveOne(u32(pr.x), u);
+  if (pr.z <= 0) { return lo; }
+  let hg = curveOne(u32(pr.y), u);
+  return vec2<i32>(lo.x + (((hg.x - lo.x) * pr.z) >> 8),
+                   lo.y + (((hg.y - lo.y) * pr.z) >> 8));
+}
+
 // MIRROR-BEGIN height
 // The terrain, and how steep it is there. THE SLOPE IS NOT DECORATION: this
 // CA's angle of repose is exactly 1 voxel per column (sim_step.wgsl slides a
@@ -504,8 +785,21 @@ fn landAt(x : i32, z : i32, seed : u32) -> Land {
   let o0 = octave(x, z, TUNE_CONT_LOG2,   TUNE_CONT_AMPLITUDE,   0, 0, seed ^ 1u);
   let o1 = octave(x, z, TUNE_RANGE_LOG2,  TUNE_RANGE_AMPLITUDE,
                   o0.gx, o0.gz, seed ^ 2u);
-  let g1x = o0.gx + o1.gx;
-  let g1z = o0.gz + o1.gz;
+  // ---- THE PER-BIOME HEIGHT CURVE (13.3.3) ----
+  // HERE, and only here: the two coarse rungs are the landform, and the three
+  // fine ones are the texture on it. Reshaping the sum of the coarse pair is
+  // what lets a meadow be flat plains and a pine highland be jagged without
+  // either one changing how the ground FEELS underfoot.
+  //
+  // `cv.y` is the curve's own slope in Q8 and it scales the accumulated
+  // gradient, not the deviation: iq's attenuation divides each finer rung by
+  // 1 + atten*|g|^2, and if `g` still described the pre-curve ladder then a
+  // biome that flattened its landform would keep the hill octave attenuated as
+  // though the mountains were still there. Identity gives exactly 256, so
+  // (g * 256) >> 8 == g and nothing moves.
+  let cv = biomeCurve(x, z, o0.dev + o1.dev, seed);
+  let g1x = ((o0.gx + o1.gx) * cv.y) >> 8;
+  let g1z = ((o0.gz + o1.gz) * cv.y) >> 8;
   let o2 = octave(x, z, TUNE_HILL_LOG2,   TUNE_HILL_AMPLITUDE,
                   g1x, g1z, seed ^ 3u);
   let g2x = g1x + o2.gx;
@@ -536,7 +830,7 @@ fn landAt(x : i32, z : i32, seed : u32) -> Land {
     w = (max(d, 0) * 16384) / TUNE_SPAWN_PLAIN_FADE;
   }
   let ws = vsmooth(w << 1) >> 1;                    // Q14 smoothstep of the ramp
-  let coarse = TUNE_BASE_HEIGHT + o0.dev + o1.dev - TUNE_SPAWN_PLAIN_Y;
+  let coarse = TUNE_BASE_HEIGHT + cv.x - TUNE_SPAWN_PLAIN_Y;
   let bed = TUNE_SPAWN_PLAIN_Y + o2.dev + o3.dev + o4.dev
           + ((coarse * ws) >> 14);
 
@@ -596,27 +890,12 @@ fn baseHeight(x : i32, z : i32, seed : u32) -> i32 {
 // MIRROR-END height
 
 // ---- biome field ----
-// One low-frequency noise picks the biome, a second breaks up the boundary so
-// biomes interlock instead of meeting on a smooth contour. Desert is gated to
-// the top of the range (~12% of the field) so it reads as a rare destination
-// you walk to rather than the default world. Height still overrides at the top:
-// snow caps above 80 regardless of biome (handled in genCell).
-// The biome cell is a LOG2 EXPONENT now (9 = 512 voxels = 51.2 m, up from the
-// old 384) — deliberately NOT halved with the rest of the third scale pass.
-// Trees kept their size and their 9 m spacing, so a biome region has to stay
-// many tree-tiles wide or a "meadow" holds one bush and the field reads as
-// per-tree noise. The break-up octave is two exponents down (128 voxels) so
-// edges stay proportionally ragged.
-// The Q14 samples are shifted back down to the 0..255 band the four THRESHOLD
-// knobs are authored in, so the primitive swap does not silently re-scale them.
-// Package G retires this function's noise entirely for the compass climate.
+// The field and the thresholds moved up above landAt (see `biomeBand` /
+// `biomeFromBand`), because the height curve needs the band's continuous value.
+// Same two noise samples, same shifts, same salts, same thresholds, same order:
+// this is one function split in two, not a new one.
 fn biomeAt(x : i32, z : i32, seed : u32) -> u32 {
-  let b = (vnoise2d(x, z, TUNE_BIOME_LOG2, seed ^ 0x1Bu).n >> 6)
-        + (((vnoise2d(x, z, TUNE_BIOME_LOG2 - 2u, seed ^ 0x1Cu).n >> 6) - 128) / 3);   // edge break-up
-  if (b > i32(TUNE_DESERT_THRESHOLD)) { return B_DESERT; }
-  if (b > i32(TUNE_PINE_THRESHOLD)) { return B_PINE; }
-  if (b < i32(TUNE_MEADOW_THRESHOLD))  { return B_MEADOW; }
-  return B_FOREST;
+  return biomeFromBand(biomeBand(x, z, seed));
 }
 
 // ---- the spawn clearing ----
@@ -1154,6 +1433,10 @@ fn treeInfoAt(s : TreeSite, land : Land, seed : u32) -> Tree {
   // No trees on snowfields, in ponds, or over the selftest fixture sites.
   if (h >= TREELINE) { return t; }
   if (pondAt(t.wx, t.wz, seed).y >= 0) { return t; }
+  // ...and nothing takes root through a stone floor. One hash3 per candidate:
+  // this is why ruinFloorAt is the cheap tile predicate and not the pad, which
+  // costs four column samples and could not be afforded here.
+  if (ruinFloorAt(t.wx, t.wz, seed)) { return t; }
   // (The spawn clearing is checked AFTER the species draw, where the crown's
   // real width is known — see the note at that test.)
 
@@ -2092,6 +2375,68 @@ fn caveAt(x : i32, y : i32, z : i32, h : i32, seed : u32) -> i32 {
   return caveIn(caveBands(x, z, h, seed), y);
 }
 
+// ---- CAVE FLORA: openness placement where openness is a closed form --------
+//
+// Lin 13.3.4 asks for plants placed by how open the sky is. Above ground that
+// is already what `undergrowthSite`'s canopy cover does, and there is no other
+// overhang in the world. Below ground there is no sky at all, so the question
+// becomes "what grows in the dark", and the cave bands answer the two structural
+// halves of it — where the FLOOR is and where the CEILING is — per column, in
+// closed form, with no march and no neighbour lookup.
+//
+// ONE THING THE PLAN GOT WRONG, and it is worth writing down because it is the
+// same class of bug as the floating ruin wall: `caveIn` carves from f1 UPWARD
+// (`y >= b.f1`), so **f1 is the lowest AIR cell** and the stone it stands on is
+// f1-1. A mushroom at f1+1 — as planned — would float one voxel above its own
+// floor. It goes AT f1.
+//
+// Every test below also asks whether the neighbouring cell is carved, because
+// the two bands overlap: band 2 can undercut band 1's floor, and band 1 can eat
+// band 2's ceiling. `caveIn` is the authority for both and costs comparisons.
+//
+// Returns MAT_AIR for "leave the cave open".
+fn caveFloraAt(b : CaveBands, x : i32, y : i32, z : i32, seed : u32) -> u32 {
+  // Never in the flooded band, and never within reach of it.
+  if (y <= LAVA_LEVEL + CAVE_LAVA_MARGIN) { return MAT_AIR; }
+
+  // ---- SHALLOW BAND FLOOR: mushrooms ----
+  // The near-surface caverns are the ones a player walks into from a hillside,
+  // so they get the soft, findable thing. Only where the cell below is really
+  // solid: a mushroom over a hole is the floating decoration this whole package
+  // is about.
+  if (b.on1 && y == b.f1 && caveIn(b, y - 1) == 0) {
+    if (vnoise(x, z, CAVE_SHROOM_PATCH_CELL, seed ^ 0x5CA9u) >
+        CAVE_SHROOM_PATCH) {
+      let hm = hash3(seed ^ 0x5A18u, bitcast<u32>(x), bitcast<u32>(z));
+      if ((hm % TUNE_CAVE_MUSHROOM_CHANCE) == 0u) {
+        // Same red/pale split the forest floor uses, and gated on the SAME roll
+        // so this only picks WHICH mushroom, never adds more of them.
+        return select(M_TOADSTOOL, M_MUSHROOM, ((hm >> 13u) % 4u) == 0u);
+      }
+    }
+  }
+
+  // ---- DEEP BAND: crystal on the ceiling and the floor ----
+  // The deep caverns are the ones you only reach by digging, so they get the
+  // light. `top2` is the deep band's extra cap, so its topmost carved cell is
+  // min(c2, top2) — the ceiling — and f2 is its floor.
+  if (b.on2) {
+    let ceil2 = min(b.c2, b.top2);
+    let atCeiling = y == ceil2 && caveIn(b, y + 1) == 0;
+    let atFloor = y == b.f2 && caveIn(b, y - 1) == 0;
+    if ((atCeiling || atFloor) &&
+        vnoise(x, z, CAVE_CRYSTAL_PATCH_CELL, seed ^ 0xC275u) >
+        CAVE_CRYSTAL_PATCH) {
+      // Its own salt, never a bit-slice of the mushroom hash — see the long
+      // note in the pond-life block about what correlated slices do to a
+      // scatter. A seam and a mushroom bank must be different places.
+      let hc = hash3(seed ^ 0xC17Au, bitcast<u32>(x), bitcast<u32>(z));
+      if ((hc % TUNE_CAVE_CRYSTAL_CHANCE) == 0u) { return M_CRYSTAL; }
+    }
+  }
+  return MAT_AIR;
+}
+
 // ---- THE COLUMN HALF, hoisted out of the per-cell path --------------------
 //
 // Everything from baseHeight down to the shore band is a pure function of
@@ -2117,6 +2462,8 @@ struct Col {
   inPoolFloor : bool,
   inRim       : bool,
   shore       : Shore,
+  ruin        : Ruin,        // the accepted ruin whose pad covers this column
+  ruinFloor   : bool,        // inside a ruin's footprint: a swept stone floor
 };
 
 // ---- THE HEIGHT CONTRACT ---------------------------------------------------
@@ -2142,6 +2489,119 @@ struct Col {
 // centre, up to four neighbour tiles) and it is called from CPU paths that run
 // at O(1) per frame — spawn placement, fixture anchoring, a mob probe. It must
 // never be called in a per-voxel loop on either side.
+// ---- RUIN SITES: decided in the COLUMN half, so the building gets a pad ----
+//
+// A ruin used to be stamped in the CELL half at `baseHeight(centre)` — the raw
+// five-octave ladder, with the pond bowl, the authored pool floors and the tarn
+// berm all missing from it — and with no gate at all on how steep the ground
+// under it was. On a hillside that left one wall floating a metre in the air
+// and buried the opposite one; beside a tarn it put the floor under the water
+// table. Both are the same bug: the site was decided against a height that is
+// not the height the world is actually built at.
+//
+// So the decision moves here, next to the ponds, and the site FLATTENS the
+// ground it stands on the way a foundation does — the terrain yields to the
+// building rather than the other way round. Three pieces:
+//
+//   * `ruinTileAt` is the CHEAP half: one tile hash and the same jittered
+//     footprint the cell half always used. It costs one hash3 and knows nothing
+//     about height, which is what lets the tree and ground-cover rules ask "is
+//     this column a ruin floor?" per candidate without paying for a pad.
+//   * `ruinPad` is the EXPENSIVE half: four column heights at the footprint
+//     corners, AFTER pond and pool composition. Median for the pad height,
+//     spread for the refusal. Only columns within `worldgen.ruinPadMargin` of
+//     the footprint ever evaluate it, which is ~1.5% of the world.
+//   * `landColumn` blends the pad out into the terrain over that margin.
+//
+// The footprint is always strictly inside its own tile (margin 32, width 56,
+// jitter <= 136, so rx - tx*256 is in [32, 167] and rx + 56 <= 223 < 256), so a
+// column only ever has to look at ITS OWN tile — which stays true as long as
+// the pad margin is under 32, and LoadTuning clamps it there.
+const RUIN_TILE   : i32 = 256 * HSCALE;
+const RUIN_W      : i32 = 56;    // 3.5 m footprint
+const RUIN_HT     : i32 = 48;    // 3 m to the roof
+const RUIN_MARGIN : i32 = 32;    // inset that keeps the footprint in its tile
+
+struct RuinTile {
+  present : bool,
+  rx      : i32,     // footprint min corner, world coords
+  rz      : i32,
+};
+
+// The candidate site on this column's tile, BEFORE the flatness gate. One hash.
+fn ruinTileAt(x : i32, z : i32, seed : u32) -> RuinTile {
+  var r : RuinTile;
+  r.present = false; r.rx = 0; r.rz = 0;
+  let tx = fdiv(x, RUIN_TILE);
+  let tz = fdiv(z, RUIN_TILE);
+  if (tx == 0 && tz == 0) { return r; }        // the authored origin tile
+  let rh = hash3(seed ^ 0xA111CEu, bitcast<u32>(tx), bitcast<u32>(tz));
+  if (rh % TUNE_RUIN_CHANCE != 0u) { return r; }
+  let jit = u32(max(RUIN_TILE - RUIN_W - RUIN_MARGIN * 2, 1));
+  r.rx = tx * RUIN_TILE + RUIN_MARGIN + i32((rh >> 8u) % jit);
+  r.rz = tz * RUIN_TILE + RUIN_MARGIN + i32((rh >> 16u) % jit);
+  r.present = true;
+  return r;
+}
+
+// Chebyshev distance from the footprint box; 0 for a column inside it.
+fn ruinOutset(t : RuinTile, x : i32, z : i32) -> i32 {
+  let dx = max(t.rx - x, x - (t.rx + RUIN_W - 1));
+  let dz = max(t.rz - z, z - (t.rz + RUIN_W - 1));
+  return max(max(dx, dz), 0);
+}
+
+// "Is this column the floor of a ruin?" — the clearing test the tree and
+// ground-cover rules use. Deliberately the CHEAP predicate, so it is true on a
+// site the flatness gate went on to REFUSE as well. That is a choice: a refused
+// site then reads as an old foundation with nothing left standing on it, rather
+// than as a hillside carrying a bald 5.6 m square of grass for no reason.
+fn ruinFloorAt(x : i32, z : i32, seed : u32) -> bool {
+  let t = ruinTileAt(x, z, seed);
+  return t.present && ruinOutset(t, x, z) == 0;
+}
+
+// An ACCEPTED site, as the cell half sees it. Carried through LandCol and Col
+// so `genCellIn` stamps the shell at a height the column half already committed
+// to, instead of re-deriving a different one from `baseHeight`.
+struct Ruin {
+  present : bool,   // an accepted ruin's pad reaches this column
+  rx      : i32,
+  rz      : i32,
+  y       : i32,    // pad height: the floor, and the shell's base course
+};
+
+// Does the building's STONE occupy this cell? Factored out of genCellIn because
+// the moss skin needs to ask it about a NEIGHBOUR — the same closed-form
+// predicate re-evaluated at an offset that the ivy pass and the arena wall
+// already use, rather than a voxel lookup worldgen cannot do.
+fn ruinShellAt(R : Ruin, x : i32, y : i32, z : i32) -> bool {
+  if (!R.present) { return false; }
+  if (x < R.rx || x >= R.rx + RUIN_W) { return false; }
+  if (z < R.rz || z >= R.rz + RUIN_W) { return false; }
+  if (y < R.y || y >= R.y + RUIN_HT) { return false; }
+  let shellXZ = x < R.rx + 4 || x >= R.rx + RUIN_W - 4 ||
+                z < R.rz + 4 || z >= R.rz + RUIN_W - 4;
+  let shellY = y >= R.y + RUIN_HT - 4;
+  let door = y < R.y + 32 && abs(z - (R.rz + RUIN_W / 2)) <= 12 &&
+             x < R.rx + 4;
+  return (shellXZ || shellY) && !door;
+}
+
+// ---- WHICH FACE IS "NORTH" -------------------------------------------------
+// Worldgen has no sun and no compass, so a shaded face is a CONVENTION, not a
+// measurement — `worldgen.mossFace` picks which one and -Z is the default. This
+// is the honest version of Lin 13.3.4's "moss on the shady side": the engine
+// cannot know which side is shady, so it declares one and is consistent about
+// it, rather than pretending to derive it.
+fn mossFaceDelta() -> vec2<i32> {
+  let f = TUNE_MOSS_FACE & 3u;
+  if (f == 0u) { return vec2<i32>(0, -1); }
+  if (f == 1u) { return vec2<i32>(1, 0); }
+  if (f == 2u) { return vec2<i32>(0, 1); }
+  return vec2<i32>(-1, 0);
+}
+
 struct LandCol {
   h           : i32,         // GROUND. The contract above.
   sed         : i32,         // loose wedge thickness INSIDE h, 0 where overridden
@@ -2152,16 +2612,23 @@ struct LandCol {
   inPoolFloor : bool,
   inRim       : bool,
   near        : Shore,       // nearest disc OUTSIDE this column, or none
+  ruin        : Ruin,        // the accepted ruin whose pad covers this column
 };
 
 // MIRROR-BEGIN landheight
-fn landColumn(x : i32, z : i32, seed : u32) -> LandCol {
+// THE GROUND BEFORE THE RUINS. Split out of landColumn because `ruinPad` has to
+// sample four of these at the footprint corners, and a landColumn that calls
+// itself is not a function. Everything the height contract is made of lives
+// here EXCEPT the pad, which is the one override that needs to know about
+// columns other than its own.
+fn landColumnBare(x : i32, z : i32, seed : u32) -> LandCol {
   var L : LandCol;
   L.pond = -1;
   L.pw = vec2<i32>(-1, -1);
   L.fluid = MAT_AIR;
   L.fluidTop = -1;
   L.near.onShore = false; L.near.past = 0; L.near.surf = -1;
+  L.ruin.present = false; L.ruin.rx = 0; L.ruin.rz = 0; L.ruin.y = 0;
   // The fluid lab's flat slab — the same guard genColumn takes below, taken
   // here as well so World::TerrainHeight sees the slab through the contract
   // rather than through a second copy of the constant.
@@ -2306,6 +2773,86 @@ fn landColumn(x : i32, z : i32, seed : u32) -> LandCol {
   L.sed = sed;
   return L;
 }
+
+// ---- THE PAD: four corner columns, a median, and two refusals --------------
+//
+// The corners are `landColumnBare` — NOT `baseHeight`, because the pond bowl,
+// the pool floors and the tarn berm are all part of the ground the building
+// stands on, and that omission is the whole bug this replaces.
+//
+// MEDIAN, not mean. With four samples a mean is dragged by the single corner
+// that happens to clip a gully, and a pad that follows a gully is the artifact
+// this feature exists to remove. The median of four is the mean of the two
+// middle values, FLOORED by an arithmetic shift so the CPU mirror agrees bit
+// for bit at negative heights too (C++20 defines >> on a negative signed value
+// as arithmetic, which is what WGSL's i32 >> already is).
+//
+// TWO REFUSALS, both structural rather than cosmetic:
+//
+//   * spread (max - min) over `worldgen.ruinMaxSlope`. Past that the pad is a
+//     cut-and-fill scar taller than the building, and the apron that blends it
+//     out would exceed the CA's angle of repose (1 voxel per column) —
+//     i.e. it would be a slope loose material can never come to rest on.
+//   * any corner standing in a tarn or on an authored pool rim. Four corners
+//     are a COMPLETE test for a disc pond, not a sample of one: the footprint's
+//     half-diagonal is 56*0.707 = 39 voxels and `worldgen.pondRadiusMin` is 48,
+//     so a disc that overlaps the footprint at all must contain a corner. That
+//     inequality is the argument; if pondRadiusMin is ever tuned below 40 this
+//     test needs the centre column as well.
+fn ruinPad(t : RuinTile, seed : u32) -> Ruin {
+  var r : Ruin;
+  r.present = false; r.rx = t.rx; r.rz = t.rz; r.y = 0;
+  let far = RUIN_W - 1;
+  let k0 = landColumnBare(t.rx,       t.rz,       seed);
+  let k1 = landColumnBare(t.rx + far, t.rz,       seed);
+  let k2 = landColumnBare(t.rx,       t.rz + far, seed);
+  let k3 = landColumnBare(t.rx + far, t.rz + far, seed);
+  if (k0.pw.y >= 0 || k1.pw.y >= 0 || k2.pw.y >= 0 || k3.pw.y >= 0) { return r; }
+  if (k0.inRim || k1.inRim || k2.inRim || k3.inRim) { return r; }
+  // A five-comparator sorting network, written out because a loop over a
+  // by-value array is the dynamic-index spill CLAUDE.md warns about.
+  var a = k0.h; var b = k1.h; var c = k2.h; var d = k3.h;
+  if (a > b) { let sw = a; a = b; b = sw; }
+  if (c > d) { let sw = c; c = d; d = sw; }
+  if (a > c) { let sw = a; a = c; c = sw; }
+  if (b > d) { let sw = b; b = d; d = sw; }
+  if (b > c) { let sw = b; b = c; c = sw; }
+  if (d - a > TUNE_RUIN_MAX_SLOPE) { return r; }
+  r.y = (b + c) >> 1;
+  r.present = true;
+  return r;
+}
+
+// The height contract's public face: the bare column with the ruin pad blended
+// into it. Everything else in this file and in World::TerrainHeight goes
+// through here.
+fn landColumn(x : i32, z : i32, seed : u32) -> LandCol {
+  var L = landColumnBare(x, z, seed);
+  if (T.labMode != 0u) { return L; }
+  let t = ruinTileAt(x, z, seed);
+  if (!t.present) { return L; }
+  let margin = max(TUNE_RUIN_PAD_MARGIN, 2);
+  let d = ruinOutset(t, x, z);
+  if (d >= margin) { return L; }        // the cheap gate: ~98.5% of the world
+  let R = ruinPad(t, seed);
+  if (!R.present) { return L; }
+  L.ruin = R;
+  // Q8 ramp: 256 on the footprint, 0 at the margin's outer edge. INSIDE the
+  // footprint the arithmetic is exact (h + (padY - h) == padY), so the floor is
+  // genuinely flat rather than nearly flat — a one-voxel ripple under a stone
+  // floor is a step the CA has to think about every time anything is dropped on
+  // it. Outside, the per-column step the ramp adds is bounded by
+  // (spread/2) / margin, which is what ties the ruinMaxSlope and ruinPadMargin
+  // defaults together: 20 and 20 keep it at half a voxel per column, well
+  // inside the angle of repose.
+  let w = ((margin - d) * 256) / margin;
+  L.h = L.h + (((R.y - L.h) * w) >> 8);
+  // The loose wedge goes with it. `sed` is POWDER and the pad is where the
+  // ground is cut and filled; leaving two metres of gravel under a stone floor
+  // is exactly the avalanche the pond-bank block above documents.
+  L.sed = (L.sed * (256 - w)) >> 8;
+  return L;
+}
 // MIRROR-END landheight
 
 // The contract, as a function. genColumn calls landColumn directly (it needs the
@@ -2341,6 +2888,11 @@ fn genColumn(x : i32, z : i32, seed : u32) -> Col {
     lab.shore.onShore = false;
     lab.shore.past = 0;
     lab.shore.surf = -1;
+    lab.ruin.present = false;
+    lab.ruin.rx = 0;
+    lab.ruin.rz = 0;
+    lab.ruin.y = 0;
+    lab.ruinFloor = false;
     return lab;
   }
   // THE GROUND, and everything derived from it, in one call. This is the same
@@ -2396,6 +2948,12 @@ fn genColumn(x : i32, z : i32, seed : u32) -> Col {
   col.inPoolFloor = L.inPoolFloor;
   col.inRim = L.inRim;
   col.shore = shore;
+  col.ruin = L.ruin;
+  // ONE hash3 per column, and the CHEAP predicate rather than L.ruin.present:
+  // a site the flatness gate refused still reads as a swept floor, so the
+  // clearing and the building agree about their edges whether or not the
+  // building got built. See ruinFloorAt.
+  col.ruinFloor = ruinFloorAt(x, z, seed);
   return col;
 }
 
@@ -2434,6 +2992,7 @@ fn genCellIn(col : Col,
   let inPoolFloor = col.inPoolFloor;
   let inRim = col.inRim;
   let shore = col.shore;
+  let ruinFloor = col.ruinFloor;
   var mat = MAT_AIR;
 
   if (y <= h) {
@@ -2515,10 +3074,20 @@ fn genCellIn(col : Col,
     // a cave breaching a rim column drains the pool through the tunnel system
     // and the world never settles.
     if (mat == M_STONE && !inRim) {
-      var cv = 0;
-      if (caveValid) { cv = caveIn(*cave, y); }
-      else { cv = caveAt(x, y, z, h, seed); }
-      if (cv == 1) { mat = MAT_AIR; }
+      // The bands, not just the answer: caveFloraAt needs f1/f2/c2 to ask where
+      // the floor and the ceiling of THIS cavern are. `caveAt` was exactly
+      // `caveIn(caveBands(...))`, so the one-shot arm below is the same
+      // arithmetic in the same order and produces the same words.
+      var cb : CaveBands;
+      if (caveValid) { cb = *cave; } else { cb = caveBands(x, z, h, seed); }
+      let cv = caveIn(cb, y);
+      if (cv == 1) {
+        mat = MAT_AIR;
+        // Cave flora fills the carved cell it stands in — no extra voxel, no
+        // extra occupancy, nothing new for the CA to look at, and everything it
+        // places is inert (rule 2).
+        mat = caveFloraAt(cb, x, y, z, seed);
+      }
       else if (cv == 2) { mat = M_LAVA; }
     }
     // WET MOSS on the rock at the waterline. A SKIN SWAP on a surface cell that
@@ -2713,7 +3282,33 @@ fn genCellIn(col : Col,
   // through a reed bed are what would give away that the marsh is a decal on
   // ordinary ground instead of a different place — the same reason the shore
   // ground skin is mud rather than a tinted grass.
-  if (mat == MAT_AIR && y == h + 1 && !inRim && pond < 0 && h < TREELINE &&
+  // ---- A RUIN FLOOR IS SWEPT ------------------------------------------------
+  // Inside the footprint the ground is a stone floor with a building on it, so
+  // the tall light-loving layer is wrong twice over: a meadow of hip-high
+  // flowers inside a hut reads as the building being a decal on the field, and
+  // the stalk block below would push flower stems straight through the walls.
+  // What DOES belong is the shade set's two lowest members — moss on the damp
+  // stone and leaf litter blown in through the door — so this is the same rolls
+  // at the same rates with everything taller removed.
+  //
+  // It runs BEFORE the general block and takes the column out of it, rather
+  // than adding a fifth term to that block's already long guard, and it skips
+  // `undergrowthSite` entirely: the 25-tile canopy scan is the most expensive
+  // thing on a surface column and a swept floor has no use for its answer.
+  if (mat == MAT_AIR && y == h + 1 && ruinFloor && !inRim && pond < 0 &&
+      h < TREELINE && !onFixturePad(x, z) && !shore.onShore) {
+    let hMossR = hash3(seed ^ 0x3C0Bu, bitcast<u32>(x), bitcast<u32>(z));
+    let hLitR  = hash3(seed ^ 0x0B8Fu, bitcast<u32>(x), bitcast<u32>(z));
+    let mossPatchR = vnoise(x, z, 14 * HSCALE, seed ^ 0x3C00u);
+    if ((hMossR % UG_MOSS_CHANCE) == 0u && mossPatchR > UG_MOSS_PATCH) {
+      mat = M_MOSS;
+    } else if ((hLitR % UG_LITTER_CHANCE) == 0u) {
+      mat = M_LITTER;
+    }
+  }
+
+  if (mat == MAT_AIR && y == h + 1 && !ruinFloor &&
+      !inRim && pond < 0 && h < TREELINE &&
       biome != B_DESERT && !onFixturePad(x, z) && !shore.onShore) {
     let fr = hash3(seed ^ 0xF10Eu, bitcast<u32>(x), bitcast<u32>(z));
     // ONE 25-tile scan answers both "how shaded is this column" and "how far to
@@ -2846,7 +3441,11 @@ fn genCellIn(col : Col,
   // Y range is bounded by the tallest flower (FLOWER_MAX_H), so a column pays
   // at most that many extra evaluations and a settled world still costs nothing
   // (rule 2 — nothing here is reactive).
-  if (mat == MAT_AIR && y > h + 1 && y <= h + FLOWER_MAX_H &&
+  // `!ruinFloor` for the same reason the base block has it, and it has to be
+  // repeated here rather than inferred: this branch RE-DERIVES the species from
+  // flowerAt instead of reading the base cell, so a guard the base block took
+  // and this one did not would grow a headless stalk out of a stone floor.
+  if (mat == MAT_AIR && y > h + 1 && y <= h + FLOWER_MAX_H && !ruinFloor &&
       !inRim && pond < 0 && h < TREELINE &&
       biome != B_DESERT && !onFixturePad(x, z) && !shore.onShore) {
     let fl = flowerAt(x, z, seed, UG_COVER_EDGE);
@@ -3096,28 +3695,56 @@ fn genCellIn(col : Col,
   // tile hash. Building halved with the world: ~3.5 m square, 3 m tall — a
   // hut, not a hall. The 2 m doorway is NOT halved: it has to clear the 1.7 m
   // player, which is exactly the mouse-hole mistake the first cut made.
-  let ruinTile = 256 * HSCALE;
-  let tx = fdiv(x, ruinTile); let tz = fdiv(z, ruinTile);
-  if (tx != 0 || tz != 0) {
-    let rh = hash3(seed ^ 0xA111CEu, bitcast<u32>(tx), bitcast<u32>(tz));
-    if (rh % TUNE_RUIN_CHANCE == 0u) {
-      let rw = 56;                        // 3.5 m footprint
-      let rht = 48;                       // 3 m to the roof
-      // keep the whole footprint inside the tile whatever HSCALE is
-      let margin = 32;
-      let jit = u32(max(ruinTile - rw - margin * 2, 1));
-      let rx = tx * ruinTile + margin + i32((rh >> 8u) % jit);
-      let rz = tz * ruinTile + margin + i32((rh >> 16u) % jit);
-      // box test in XZ first: baseHeight for the centre only when close
+  //
+  // THE SITE IS THE COLUMN'S, NOT A SECOND DERIVATION. This block used to redo
+  // the tile hash here and take its floor height from `baseHeight(centre)` — a
+  // height nothing else in the world uses, because it predates the pond bowl,
+  // the pool floors, the berm and the sediment wedge. `col.ruin` is the site
+  // `landColumn` already accepted and already flattened the ground to, so the
+  // shell now stands ON the pad by construction rather than by coincidence.
+  // See the RUIN SITES block above landColumn.
+  let R = col.ruin;
+  if (R.present) {
+    {
+      let rw = RUIN_W;
+      let rht = RUIN_HT;
+      let rx = R.rx;
+      let rz = R.rz;
+      // box test in XZ first: the pad reaches a margin past the footprint
       if (x >= rx && x < rx + rw && z >= rz && z < rz + rw) {
-        let ry = baseHeight(rx + rw / 2, rz + rw / 2, seed);
+        let ry = R.y;
         if (y >= ry && y < ry + rht) {
           let shellXZ = x < rx + 4 || x >= rx + rw - 4 ||
                         z < rz + 4 || z >= rz + rw - 4;
-          let shellY = y >= ry + rht - 4;
-          // doorway: 2 m tall, 1.5 m wide, centred on the -x wall
-          let door = y < ry + 32 && abs(z - (rz + rw / 2)) <= 12 && x < rx + 4;
-          if ((shellXZ || shellY) && !door) { mat = M_STONE; }
+          if (ruinShellAt(R, x, y, z)) {
+            mat = M_STONE;
+            // ---- MOSS ON THE SHADED FACE ----
+            // A SKIN SWAP on a wall cell that already exists — the same free
+            // move the waterline's wet moss makes, and the same
+            // predicate-re-evaluation trick the ivy uses: `ruinShellAt` asked
+            // about the neighbour, not a voxel read, because worldgen has none.
+            //
+            // Applies to any wall face pointing at open air on the chosen side,
+            // which is the OUTSIDE of the -Z wall and the INSIDE of the +Z one.
+            // Damp at the ground, gone at the eaves.
+            let mf = mossFaceDelta();
+            if (!ruinShellAt(R, x + mf.x, y, z + mf.y)) {
+              let climb = y - ry;
+              let hmo = hash3(seed ^ 0x0553u,
+                              bitcast<u32>(x) ^ (bitcast<u32>(z) << 12u),
+                              bitcast<u32>(y));
+              if (i32(hmo % RUIN_MOSS_SPREAD) * rht <
+                  (rht - climb) * RUIN_MOSS_GAIN) {
+                // WET MOSS, not the ground moss_patch, and the difference is
+                // load-bearing: moss_patch is `passable`, and swapping a WALL
+                // cell for a passable material punches a walkable hole through
+                // the building. wet_moss is the one moss authored as a solid
+                // SKIN on stone -- it is what the waterline already uses for
+                // exactly this move -- so the wall stays a wall.
+                mat = M_WET_MOSS;
+              }
+            }
+          }
           else if (!shellXZ) { mat = select(mat, MAT_AIR, y > ry); }  // hollow
         }
       }
@@ -3130,7 +3757,7 @@ fn genCellIn(col : Col,
       // no neighbour sampling, just the same closed-form box at ±1.
       if (mat == MAT_AIR &&
           x >= rx - 1 && x < rx + rw + 1 && z >= rz - 1 && z < rz + rw + 1) {
-        let ry = baseHeight(rx + rw / 2, rz + rw / 2, seed);
+        let ry = R.y;
         let climb = y - ry;
         if (climb > 0 && climb < rht) {
           // faces: just outside the shell, or just inside it
@@ -3290,6 +3917,91 @@ fn farSurfaceMat(col : Col, mat : u32, fine : vec3<i32>, shift : u32,
   // hollow ruin interiors can return air at y == h; keep the body mat then
   if (skin == MAT_AIR || materials[skin].klass == CLASS_GAS) { return mat; }
   return skin;
+}
+
+// ---- the conservative "any blocker" bit (13.2.2) --------------------------
+//
+// `farSurfaceMat` above decides a far cell's COLOUR; this decides whether the
+// cell counts as OCCUPIED even when its single centre sample missed. See the
+// FAR_BLOCKER_BIT block in common.wgsl for what the flag means and why it has
+// to be a pure function of (coords, seed).
+//
+// THE TOP OF A COLUMN, as the far field sees it: the ground contract, plus the
+// two things that stand on top of it and are not in `h`. Kept beside
+// `farSurfaceMat` because it makes the SAME three exceptions that function
+// makes — standing fluid keeps its id and renders opaque at distance, a ruin
+// is a stone box the height contract only pads the ground for, and the arena
+// deck is a material override in genCellIn that `col.h` deliberately does not
+// know about.
+//
+// The ruin term is a BOUNDING BOX, not `ruinShellAt`: the shell is hollow and
+// a conservative bit is allowed to fill an interior a 3.5 m building could
+// never show at cascade range. That box is also the one feature in here that
+// the goal line names — "lets thin walls cast shadows in the distance".
+//
+// TREES ARE DELIBERATELY ABSENT. `treeCanopyAt` is an XZ mask with no height,
+// and the only vertical bound available for it is `treeMaxAbove()` (~17.5 m),
+// which is WIDER than a level-5 cell — flagging that band would turn every
+// forested column into the column of solid cubes 13.2.2 warns about. The
+// canopy is already carried at distance by `farSurfaceMat`'s flattening, which
+// paints crown colour onto the surface cell at shift >= 5.
+fn farColTopFrom(h : i32, fluidTop : i32, ruin : Ruin,
+                 x : i32, z : i32, seed : u32) -> i32 {
+  var top = max(h, fluidTop);
+  if (ruin.present) { top = max(top, ruin.y + RUIN_HT); }
+  if (T.labMode == 0u && abs(x - 180) <= 32 && abs(z - 110) <= 32) {
+    top = max(top, baseHeight(180, 110, seed) + 16);
+  }
+  return top;
+}
+// The same for a column the caller does not already hold. `landColumn`, not
+// `genColumn`: the top needs the height contract and the ruin pad and nothing
+// else, and the biome/shore/undergrowth half of a Col is pure cost here.
+fn farColTop(x : i32, z : i32, seed : u32) -> i32 {
+  let L = landColumn(x, z, seed);
+  return farColTopFrom(L.h, L.fluidTop, L.ruin, x, z, seed);
+}
+
+// The flag for one level cell. `topC` is `farColTopFrom` at the cell's CENTRE
+// column — free at both call sites, because both already hold that column for
+// the colour lookup.
+//
+// THREE BANDS, and the middle one is the only one that costs anything:
+//
+//   y0 <= topC              the cell's floor is at or below the centre
+//                           column's top: it is at or under the surface. Set,
+//                           no further samples. (Caves included on purpose.)
+//   y0 - topC >= step       more than a whole cell of air under the cell's
+//                           floor: clear, no further samples.
+//   otherwise               THE SURFACE BAND — exactly ONE cell per column,
+//                           the one whose centre sampled air but whose span
+//                           straddles the ground. Here, and only here, the
+//                           four corner columns are evaluated.
+//
+// That band is where the missing half of every surface cell lives: the centre
+// sample calls a cell solid when `centre <= h`, and `centre` is `y0 + step/2`,
+// so a cell holding the ground in its lower half reads as air today. It is
+// also where a ridge crest that passes between two cell centres goes.
+//
+// WHAT IT IS NOT is a supremum over the footprint. Five samples bound the
+// footprint exactly at level 1 (4 fine voxels, corners 3 apart) and only
+// approximately at level 8 (512 fine voxels): a spire strictly between the
+// corners, or more than one cell taller than the centre column, is still lost.
+// A tighter bound needs either marching or a stored min/max pyramid, and this
+// is an experiment with a kill criterion, not a mipmap.
+fn farBlockerBitAt(topC : i32, cc : vec3<i32>, shift : u32, seed : u32) -> u32 {
+  let step = 1 << shift;
+  let y0 = cc.y << shift;               // the cell's bottom fine voxel
+  if (y0 <= topC) { return FAR_BLOCKER_BIT; }
+  if (y0 - topC >= step) { return 0u; }
+  let x0 = cc.x << shift; let x1 = x0 + step - 1;
+  let z0 = cc.z << shift; let z1 = z0 + step - 1;
+  var top = topC;
+  top = max(top, farColTop(x0, z0, seed));
+  top = max(top, farColTop(x1, z0, seed));
+  top = max(top, farColTop(x0, z1, seed));
+  top = max(top, farColTop(x1, z1, seed));
+  return select(0u, FAR_BLOCKER_BIT, y0 <= top);
 }
 
 var<workgroup> wgCount : atomic<u32>;
@@ -3600,10 +4312,15 @@ fn far(@builtin(workgroup_id) wg : vec3<u32>,
   let zi = li / 4u;              // this thread's z within the level chunk
   let x0 = (li % 4u) * 4u;       // and the first of its four x
   var cols : array<Col, 4>;
+  // Column tops for the blocker bit, hoisted out of the y loop for the same
+  // reason the columns themselves are: they depend on (x, z) alone.
+  var tops : array<i32, 4>;
   for (var b = 0u; b < 4u; b++) {
     let cc = base + vec3<i32>(i32(x0 + b), 0, i32(zi));
     let fine = (cc << vec3<u32>(shift)) + vec3<i32>(1 << (shift - 1u));
     cols[b] = genColumn(fine.x, fine.z, T.seed);
+    tops[b] = farColTopFrom(cols[b].h, cols[b].fluidTop, cols[b].ruin,
+                            fine.x, fine.z, T.seed);
   }
   let planeBase = ((level - 1u) * FAR_VOX + slot * CHUNK_VOL) / 4u;
   for (var yi = 0u; yi < CHUNK; yi++) {
@@ -3614,12 +4331,17 @@ fn far(@builtin(workgroup_id) wg : vec3<u32>,
       let fine = (cc << vec3<u32>(shift)) + vec3<i32>(1 << (shift - 1u));
       let col = cols[b];
       let mat = genCellCol(col, fine, T.seed) & 0xFFFu;
-      var byteV = 0u;
+      // The conservative flag first: it is what a cell keeps when the centre
+      // sample found nothing (common.wgsl FAR_BLOCKER_BIT).
+      var byteV = farBlockerBitAt(tops[b], cc, shift, T.seed);
       if (mat != MAT_AIR && materials[mat].klass != CLASS_GAS) {
         // shape from the center sample, color from the surface skin (phase 4)
-        byteV = min(farSurfaceMat(col, mat, fine, shift, T.seed), 255u);
-        count += 1u;
+        byteV |= min(farSurfaceMat(col, mat, fine, shift, T.seed), FAR_MAT_MASK);
       }
+      // farOcc counts NON-EMPTY cells, which now includes blocker-only ones —
+      // it gates empty-space skipping for every far reader, and a reader that
+      // hits on the flag must not have its chunk skipped out from under it.
+      if (byteV != 0u) { count += 1u; }
       word |= byteV << (b * 8u);
     }
     // The cell index in this level chunk is x + y*CHUNK + z*CHUNK*CHUNK (see the
@@ -3671,16 +4393,20 @@ fn far(@builtin(workgroup_id) wg : vec3<u32>,
                                  ci / (CHUNK * CHUNK)));
     let pcc = base + pl;
     let pfine = (pcc << vec3<u32>(shift)) + vec3<i32>(1 << (shift - 1u));
-    var byteV = 0u;
+    // Its own genColumn: a patch cell is an arbitrary cell of this level
+    // chunk, so it shares no column with the thread's four. Patches are rare
+    // (only cells the player edited), so this is the one place in the kernel
+    // that still pays a column per cell — and now it pays it unconditionally,
+    // because the blocker flag is a property of the TERRAIN under the patch
+    // and has to survive a patch that clears the cell's material.
+    let pcol = genColumn(pfine.x, pfine.z, T.seed);
+    var byteV = farBlockerBitAt(
+        farColTopFrom(pcol.h, pcol.fluidTop, pcol.ruin, pfine.x, pfine.z, T.seed),
+        pcc, shift, T.seed);
     if (pmat != MAT_AIR && materials[pmat].klass != CLASS_GAS) {
-      // Its own genColumn: a patch cell is an arbitrary cell of this level
-      // chunk, so it shares no column with the thread's four. Patches are rare
-      // (only cells the player edited), so this is the one place in the kernel
-      // that still pays a column per cell.
-      byteV = min(farSurfaceMat(genColumn(pfine.x, pfine.z, T.seed), pmat,
-                                pfine, shift, T.seed), 255u);
-      pnz += 1u;
+      byteV |= min(farSurfaceMat(pcol, pmat, pfine, shift, T.seed), FAR_MAT_MASK);
     }
+    if (byteV != 0u) { pnz += 1u; }
     let bi = (level - 1u) * FAR_VOX + slot * CHUNK_VOL + ci;
     let bsh = (bi & 3u) * 8u;
     atomicAnd(&farVox[bi >> 2u], ~(0xFFu << bsh));
@@ -3771,9 +4497,27 @@ fn fardown(@builtin(workgroup_id) wg : vec3<u32>,
       let cc = fine >> vec3<u32>(shift);
       if (!farInBox(cc, origin)) { continue; }   // outside this cascade level
 
+      // THE BLOCKER FLAG IS PRISTINE ON BOTH SIDES, and that is the whole
+      // reason it is computed from the procgen COLUMN here rather than from
+      // the live grid this entry otherwise reads. `far` has no live grid to consult —
+      // it fills from procgen — so a flag derived from real voxels here would
+      // differ from the flag `far` writes for the same cell, and the seam
+      // between a refilled plane and a downsampled chunk would show it. Same
+      // function, same arguments, same answer: the argument `farSurfaceMat`
+      // already makes for the colour. The cost is that an EDIT never sets or
+      // clears the flag — only the material byte below records it, which is
+      // the behaviour every reader had before the flag existed.
+      //
+      // The column is now HOISTED out of the material branch and shared by the
+      // two, so a cell pays ONE genColumn instead of one for the flag and
+      // another for the skin. That makes an air cell dearer than it was (it
+      // used to pay none) and a solid cell exactly as dear as it was.
+      let pcol = genColumn(fine.x, fine.z, T.seed);
+      var byteV = farBlockerBitAt(
+          farColTopFrom(pcol.h, pcol.fluidTop, pcol.ruin, fine.x, fine.z, T.seed),
+          cc, shift, T.seed);
       // live grid (the sample point is inside this chunk, hence resident)
       let mat = voxWordAt(fine) & 0xFFFu;
-      var byteV = 0u;
       if (mat != MAT_AIR && materials[mat].klass != CLASS_GAS) {
         // Same skin rule as the sieve — the skin is looked up from PRISTINE
         // procgen (genCell), so a pristine chunk downsamples bit-identically
@@ -3786,13 +4530,12 @@ fn fardown(@builtin(workgroup_id) wg : vec3<u32>,
         // a downsampled chunk byte-identical to a refilled one at their shared
         // boundary, and it is why farSurfaceMat takes the column rather than
         // deriving a height of its own (surfHeightAt used to, and drifted).
-        byteV = min(farSurfaceMat(genColumn(fine.x, fine.z, T.seed), mat, fine,
-                                  shift, T.seed), 255u);
+        byteV |= min(farSurfaceMat(pcol, mat, fine, shift, T.seed), FAR_MAT_MASK);
       }
       let bi = farVoxByteIndex(level, cc);
-      let shift = (bi & 3u) * 8u;
-      atomicAnd(&farVox[bi >> 2u], ~(0xFFu << shift));
-      atomicOr(&farVox[bi >> 2u], byteV << shift);
+      let bsh = (bi & 3u) * 8u;
+      atomicAnd(&farVox[bi >> 2u], ~(0xFFu << bsh));
+      atomicOr(&farVox[bi >> 2u], byteV << bsh);
       if (byteV != 0u) {
         atomicMax(&farOcc[farOccIndex(level, cc)], 1u);
       }

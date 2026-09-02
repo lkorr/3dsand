@@ -198,6 +198,32 @@ void EmitV3(std::ostringstream& o, const char* name, const float v[3]) {
 const Tuning& CurrentTuning() { return g_current; }
 void SetCurrentTuning(const Tuning& t) { g_current = t; }
 
+// --sweep's setter, for ANY group, generated from the same X-macro table that
+// emits the WGSL constants. Written this way rather than as another hand-kept
+// list because the hand-kept list is what limited --sweep to `sim.*` -- and
+// CLAUDE.md tells you to prove a new knob reaches the kernel with --sweep, which
+// no worldgen knob could ever do. A row in tuning_params.def is now sweepable
+// the moment it exists, with nothing else to remember.
+//
+// TP_V3 is skipped: a vec3 has no single float to sweep, and --sweep's grammar
+// has no place to say which component.
+bool SetTuningField(Tuning& t, const std::string& group,
+                    const std::string& name, float value) {
+#define TP_F(g, m, n, d) \
+  if (group == #g && name == #m) { t.g.m = value; return true; }
+#define TP_I(g, m, n, d) \
+  if (group == #g && name == #m) { t.g.m = (int)value; return true; }
+#define TP_U(g, m, n, d) \
+  if (group == #g && name == #m) { t.g.m = (int)value; return true; }
+#define TP_V3(g, m, n, ...)
+#include "sim/tuning_params.def"
+#undef TP_V3
+#undef TP_U
+#undef TP_I
+#undef TP_F
+  return false;
+}
+
 bool SetSimField(Tuning& t, const std::string& name, float value) {
   auto& s = t.sim;
   // Integer sim fields
@@ -1890,6 +1916,22 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     r.siltDensity = std::clamp(r.siltDensity, 0.0f, 4.0f);
     ReadF(*g, "siltBrightness", r.siltBrightness, out, at);
     ReadF(*g, "siltDrift", r.siltDrift, out, at);
+
+    // ---- waterfall mist / spray ----
+    // Clamped at 0 on the low side so `mistDensity <= 0` stays the ONE off
+    // switch the shader const-folds on, and generously on the high side
+    // because these are look knobs with no stability hazard behind them.
+    ReadF(*g, "mistDensity", r.mistDensity, out, at);
+    r.mistDensity = std::clamp(r.mistDensity, 0.0f, 4.0f);
+    ReadF(*g, "mistBrightness", r.mistBrightness, out, at);
+    r.mistBrightness = std::clamp(r.mistBrightness, 0.0f, 4.0f);
+    ReadF(*g, "mistRadius", r.mistRadius, out, at);
+    r.mistRadius = std::clamp(r.mistRadius, 0.5f, 48.0f);
+    ReadF(*g, "mistFallSpeed", r.mistFallSpeed, out, at);
+    ReadF(*g, "sprayDensity", r.sprayDensity, out, at);
+    r.sprayDensity = std::clamp(r.sprayDensity, 0.0f, 4.0f);
+    ReadF(*g, "sprayRadius", r.sprayRadius, out, at);
+    r.sprayRadius = std::clamp(r.sprayRadius, 0.5f, 48.0f);
     ReadF(*g, "subSurfaceRipple", r.subSurfaceRipple, out, at);
 
     // ---- generic per-liquid submerged profile ----
@@ -2006,8 +2048,14 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadI(*g, "primarySteps", r.primarySteps, out, at);
     ReadI(*g, "farSteps", r.farSteps, out, at);
     ReadF(*g, "farShadowReach", r.farShadowReach, out, at);
+    ReadI(*g, "farBlockerHitLevel", r.farBlockerHitLevel, out, at);
     ReadF(*g, "lodHandoffDist", r.lodHandoffDist, out, at);
     ReadF(*g, "shadowMaxDist", r.shadowMaxDist, out, at);
+    ReadF(*g, "shadowCoarseDist", r.shadowCoarseDist, out, at);
+    ReadF(*g, "opennessReach", r.opennessReach, out, at);
+    ReadI(*g, "opennessChunksPerFrame", r.opennessChunksPerFrame, out, at);
+    ReadF(*g, "opennessStrength", r.opennessStrength, out, at);
+    ReadI(*g, "opennessBilinear", r.opennessBilinear, out, at);
     // Zero step budgets compile fine and render nothing; a zero white point or
     // gamma divides by zero in the tonemap. Guard the ones that break the
     // image rather than merely change it.
@@ -2105,6 +2153,14 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     // A zero/negative reach would clamp to the 8-step floor everywhere and
     // silently drop far shadows; keep it positive.
     if (r.farShadowReach < 1.0f) { r.farShadowReach = 1.0f; }
+    // A level cap, so the legal range is 0 (off) .. kFarLevels. Out-of-range
+    // values are not merely useless here: the shader compares it against a
+    // 1-based level, so a negative would read as "off" by accident rather
+    // than by intent and anything past the top level is a lie about coverage.
+    if (r.farBlockerHitLevel < 0) { r.farBlockerHitLevel = 0; }
+    if (r.farBlockerHitLevel > (int)kFarLevels) {
+      r.farBlockerHitLevel = (int)kFarLevels;
+    }
     // The LOD handoff must not land in front of the near clip: a zero here
     // would hand EVERY ray to the cascade at t=0 and render the world as
     // 40 cm blocks from the camera outward. Floored at 2 m, which is still
@@ -2115,6 +2171,18 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     // 0 is meaningful here (all shadows go through the cascade), so only
     // negatives are refused.
     if (r.shadowMaxDist < 0.0f) { r.shadowMaxDist = 0.0f; }
+    // 0 is the OFF value (the shader const-folds the coarse march away), so
+    // only negatives are refused — a negative would make every ray coarse from
+    // its first cell, which is what god rays ask for explicitly and no shadow
+    // ray should get by accident.
+    if (r.shadowCoarseDist < 0.0f) { r.shadowCoarseDist = 0.0f; }
+    // A negative reach would make every ray report "blocked at t < 0" and
+    // paint the world black; a negative strength would brighten the ambient
+    // past the sky value. Clamp rather than warn -- neither is expressible as
+    // an intent, and both are one keystroke away in the tuner.
+    if (r.opennessReach < 0.0f) { r.opennessReach = 0.0f; }
+    r.opennessStrength = std::clamp(r.opennessStrength, 0.0f, 1.0f);
+    if (r.opennessChunksPerFrame < 0) { r.opennessChunksPerFrame = 0; }
   }
 
   if (const json* g = Find(j, "worldgen")) {
@@ -2208,6 +2276,43 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadWgCount(*g, "desertThreshold", w.desertThreshold, out, at);
     ReadWgCount(*g, "pineThreshold", w.pineThreshold, out, at);
     ReadWgCount(*g, "meadowThreshold", w.meadowThreshold, out, at);
+    ReadWgCount(*g, "curveForest0", w.curveForest0, out, at);
+    ReadWgCount(*g, "curveForest1", w.curveForest1, out, at);
+    ReadWgCount(*g, "curveForest2", w.curveForest2, out, at);
+    ReadWgCount(*g, "curveForest3", w.curveForest3, out, at);
+    ReadWgCount(*g, "curveForest4", w.curveForest4, out, at);
+    ReadWgCount(*g, "curveForest5", w.curveForest5, out, at);
+    ReadWgCount(*g, "curveForest6", w.curveForest6, out, at);
+    ReadWgCount(*g, "curveForest7", w.curveForest7, out, at);
+    ReadWgCount(*g, "curveForest8", w.curveForest8, out, at);
+    ReadWgCount(*g, "curvePine0", w.curvePine0, out, at);
+    ReadWgCount(*g, "curvePine1", w.curvePine1, out, at);
+    ReadWgCount(*g, "curvePine2", w.curvePine2, out, at);
+    ReadWgCount(*g, "curvePine3", w.curvePine3, out, at);
+    ReadWgCount(*g, "curvePine4", w.curvePine4, out, at);
+    ReadWgCount(*g, "curvePine5", w.curvePine5, out, at);
+    ReadWgCount(*g, "curvePine6", w.curvePine6, out, at);
+    ReadWgCount(*g, "curvePine7", w.curvePine7, out, at);
+    ReadWgCount(*g, "curvePine8", w.curvePine8, out, at);
+    ReadWgCount(*g, "curveMeadow0", w.curveMeadow0, out, at);
+    ReadWgCount(*g, "curveMeadow1", w.curveMeadow1, out, at);
+    ReadWgCount(*g, "curveMeadow2", w.curveMeadow2, out, at);
+    ReadWgCount(*g, "curveMeadow3", w.curveMeadow3, out, at);
+    ReadWgCount(*g, "curveMeadow4", w.curveMeadow4, out, at);
+    ReadWgCount(*g, "curveMeadow5", w.curveMeadow5, out, at);
+    ReadWgCount(*g, "curveMeadow6", w.curveMeadow6, out, at);
+    ReadWgCount(*g, "curveMeadow7", w.curveMeadow7, out, at);
+    ReadWgCount(*g, "curveMeadow8", w.curveMeadow8, out, at);
+    ReadWgCount(*g, "curveDesert0", w.curveDesert0, out, at);
+    ReadWgCount(*g, "curveDesert1", w.curveDesert1, out, at);
+    ReadWgCount(*g, "curveDesert2", w.curveDesert2, out, at);
+    ReadWgCount(*g, "curveDesert3", w.curveDesert3, out, at);
+    ReadWgCount(*g, "curveDesert4", w.curveDesert4, out, at);
+    ReadWgCount(*g, "curveDesert5", w.curveDesert5, out, at);
+    ReadWgCount(*g, "curveDesert6", w.curveDesert6, out, at);
+    ReadWgCount(*g, "curveDesert7", w.curveDesert7, out, at);
+    ReadWgCount(*g, "curveDesert8", w.curveDesert8, out, at);
+    ReadWgCount(*g, "biomeBlend", w.biomeBlend, out, at);
     ReadWgLen(*g, "treeTile", w.treeTile, out, at);
     ReadWgCount(*g, "treeChanceForest", w.treeChanceForest, out, at);
     ReadWgCount(*g, "treeChancePine", w.treeChancePine, out, at);
@@ -2250,6 +2355,11 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadWgCount(*g, "heathPatch", w.heathPatch, out, at);
     ReadWgCount(*g, "alpineChance", w.alpineChance, out, at);
     ReadWgCount(*g, "ruinChance", w.ruinChance, out, at);
+    ReadWgLen(*g, "ruinPadMargin", w.ruinPadMargin, out, at);
+    ReadWgLen(*g, "ruinMaxSlope", w.ruinMaxSlope, out, at);
+    ReadWgCount(*g, "caveMushroomChance", w.caveMushroomChance, out, at);
+    ReadWgCount(*g, "caveCrystalChance", w.caveCrystalChance, out, at);
+    ReadWgCount(*g, "mossFace", w.mossFace, out, at);
     ReadWgCount(*g, "caveThreshold1", w.caveThreshold1, out, at);
     ReadWgCount(*g, "caveThreshold2", w.caveThreshold2, out, at);
     // A NAME, never a path: worldedit.cpp joins it under assets/worldedits/,
@@ -2443,6 +2553,67 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     if (w.shoreMudWidth > w.shoreBand) w.shoreMudWidth = w.shoreBand;
     if (w.shoreCattailReach > w.shoreBand) w.shoreCattailReach = w.shoreBand;
     atLeast("ruinChance", w.ruinChance, 1);
+    // The pad blend divides by the margin, and the ivy pass reads the ruin from
+    // columns one voxel OUTSIDE the footprint, so the margin has to reach them.
+    atLeast("ruinPadMargin", w.ruinPadMargin, 2);
+    atLeast("ruinMaxSlope", w.ruinMaxSlope, 0);
+    // Both are the divisor of a `% chance == 0` roll.
+    atLeast("caveMushroomChance", w.caveMushroomChance, 1);
+    atLeast("caveCrystalChance", w.caveCrystalChance, 1);
+    // Every curve knot is Q14 over the coarse swing, and curveTangent's
+    // i32 multiply is only safe inside that bound (worldgen.wgsl).
+    {
+      int* knots[] = {
+        &w.curveForest0, &w.curveForest1, &w.curveForest2, &w.curveForest3,
+        &w.curveForest4, &w.curveForest5, &w.curveForest6, &w.curveForest7,
+        &w.curveForest8, &w.curvePine0, &w.curvePine1, &w.curvePine2,
+        &w.curvePine3, &w.curvePine4, &w.curvePine5, &w.curvePine6,
+        &w.curvePine7, &w.curvePine8, &w.curveMeadow0, &w.curveMeadow1,
+        &w.curveMeadow2, &w.curveMeadow3, &w.curveMeadow4, &w.curveMeadow5,
+        &w.curveMeadow6, &w.curveMeadow7, &w.curveMeadow8, &w.curveDesert0,
+        &w.curveDesert1, &w.curveDesert2, &w.curveDesert3, &w.curveDesert4,
+        &w.curveDesert5, &w.curveDesert6, &w.curveDesert7, &w.curveDesert8,
+      };
+      for (int* k : knots) {
+        if (*k < -16384 || *k > 16384) {
+          out.warnings.push_back(
+              "worldgen.curve* knots are Q14 over the coarse swing; "
+              "clamped to +-16384");
+          *k = std::clamp(*k, -16384, 16384);
+        }
+      }
+    }
+    // A blend wider than half the smallest threshold gap would put two
+    // boundaries inside one crossfade, and curveBiomePair takes the first
+    // match -- which would silently drop a biome from the blend.
+    {
+      const int gap = std::min(w.pineThreshold - w.meadowThreshold,
+                               w.desertThreshold - w.pineThreshold);
+      const int cap = std::max(gap / 2 - 1, 0);
+      if (w.biomeBlend > cap) {
+        out.warnings.push_back(
+            "worldgen.biomeBlend is wider than half the smallest biome "
+            "threshold gap; clamped");
+        w.biomeBlend = cap;
+      }
+      if (w.biomeBlend < 0) w.biomeBlend = 0;
+    }
+    // mossFace is masked to 0..3 in the shader; clamp here so the tuner's
+    // number and the wall agree instead of wrapping silently.
+    if (w.mossFace < 0 || w.mossFace > 3) {
+      out.warnings.push_back(
+          "worldgen.mossFace must be 0..3 (-Z, +X, +Z, -X); clamped");
+      w.mossFace = w.mossFace & 3;
+    }
+    // A margin of 32 or more would push a pad out of its own tile, and
+    // landColumn only ever looks at the column's own tile (worldgen.wgsl, the
+    // RUIN SITES block). 31 is the largest value that keeps that true.
+    if (w.ruinPadMargin > 31) {
+      out.warnings.push_back(
+          "worldgen.ruinPadMargin > 31 would push a pad outside its own ruin "
+          "tile; clamped to 31");
+      w.ruinPadMargin = 31;
+    }
     atLeast("autumnFraction", w.autumnFraction, 1);
     // wallIvyDensity is the NUMERATOR of a coverage ramp (32/d and 48/d). At 0
     // it divides by zero; past 8 the integer division collapses to 4 and 6 and
@@ -2524,6 +2695,43 @@ std::string WorldgenDefaultsJson() {
   n("desertThreshold", w.desertThreshold);
   n("pineThreshold", w.pineThreshold);
   n("meadowThreshold", w.meadowThreshold);
+  n("curveForest0", w.curveForest0);
+  n("curveForest1", w.curveForest1);
+  n("curveForest2", w.curveForest2);
+  n("curveForest3", w.curveForest3);
+  n("curveForest4", w.curveForest4);
+  n("curveForest5", w.curveForest5);
+  n("curveForest6", w.curveForest6);
+  n("curveForest7", w.curveForest7);
+  n("curveForest8", w.curveForest8);
+  n("curvePine0", w.curvePine0);
+  n("curvePine1", w.curvePine1);
+  n("curvePine2", w.curvePine2);
+  n("curvePine3", w.curvePine3);
+  n("curvePine4", w.curvePine4);
+  n("curvePine5", w.curvePine5);
+  n("curvePine6", w.curvePine6);
+  n("curvePine7", w.curvePine7);
+  n("curvePine8", w.curvePine8);
+  n("curveMeadow0", w.curveMeadow0);
+  n("curveMeadow1", w.curveMeadow1);
+  n("curveMeadow2", w.curveMeadow2);
+  n("curveMeadow3", w.curveMeadow3);
+  n("curveMeadow4", w.curveMeadow4);
+  n("curveMeadow5", w.curveMeadow5);
+  n("curveMeadow6", w.curveMeadow6);
+  n("curveMeadow7", w.curveMeadow7);
+  n("curveMeadow8", w.curveMeadow8);
+  n("curveDesert0", w.curveDesert0);
+  n("curveDesert1", w.curveDesert1);
+  n("curveDesert2", w.curveDesert2);
+  n("curveDesert3", w.curveDesert3);
+  n("curveDesert4", w.curveDesert4);
+  n("curveDesert5", w.curveDesert5);
+  n("curveDesert6", w.curveDesert6);
+  n("curveDesert7", w.curveDesert7);
+  n("curveDesert8", w.curveDesert8);
+  n("biomeBlend", w.biomeBlend);
   n("treeTile", w.treeTile);
   n("treeChanceForest", w.treeChanceForest);
   n("treeChancePine", w.treeChancePine);
@@ -2566,6 +2774,11 @@ std::string WorldgenDefaultsJson() {
   n("heathPatch", w.heathPatch);
   n("alpineChance", w.alpineChance);
   n("ruinChance", w.ruinChance);
+  n("ruinPadMargin", w.ruinPadMargin);
+  n("ruinMaxSlope", w.ruinMaxSlope);
+  n("caveMushroomChance", w.caveMushroomChance);
+  n("caveCrystalChance", w.caveCrystalChance);
+  n("mossFace", w.mossFace);
   n("caveThreshold1", w.caveThreshold1);
   n("caveThreshold2", w.caveThreshold2);
   s("editLayer", w.editLayer);

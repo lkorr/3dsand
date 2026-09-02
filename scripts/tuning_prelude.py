@@ -214,12 +214,25 @@ SPEC = [
     ("render", "godRayStrength", "TUNE_GODRAY_STRENGTH", "f", 0.55),
     ("render", "godRayAniso", "TUNE_GODRAY_ANISO", "f", 0.62),
     ("render", "godRayRange", "TUNE_GODRAY_RANGE", "f", 14.0),
-    ("render", "godRayShadowSteps", "TUNE_GODRAY_SHADOW_STEPS", "i", 20),
+    ("render", "godRayShadowSteps", "TUNE_GODRAY_SHADOW_STEPS", "i", 8),
+    ("render", "shadowCoarseDist", "TUNE_SHADOW_COARSE_DIST", "f", 8.0),
+    ("render", "opennessReach", "TUNE_OPENNESS_REACH", "f", 12.0),
+    ("render", "opennessChunksPerFrame", "TUNE_OPENNESS_CHUNKS", "i", 256),
+    ("render", "opennessStrength", "TUNE_OPENNESS_STRENGTH", "f", 1.0),
+    ("render", "opennessBilinear", "TUNE_OPENNESS_BILINEAR", "i", 1),
 
     # drifting particulate (silt)
     ("render", "siltDensity", "TUNE_SILT_DENSITY", "f", 0.55),
     ("render", "siltBrightness", "TUNE_SILT_BRIGHTNESS", "f", 0.5),
     ("render", "siltDrift", "TUNE_SILT_DRIFT", "f", 0.05),
+
+    # waterfall mist and spray
+    ("render", "mistDensity", "TUNE_MIST_DENSITY", "f", 1.0),
+    ("render", "mistBrightness", "TUNE_MIST_BRIGHTNESS", "f", 0.9),
+    ("render", "mistRadius", "TUNE_MIST_RADIUS", "f", 10.0),
+    ("render", "mistFallSpeed", "TUNE_MIST_FALL_SPEED", "f", 2.2),
+    ("render", "sprayDensity", "TUNE_SPRAY_DENSITY", "f", 1.3),
+    ("render", "sprayRadius", "TUNE_SPRAY_RADIUS", "f", 14.0),
 
     # surface-from-below
     ("render", "subSurfaceRipple", "TUNE_SUB_SURFACE_RIPPLE", "f", 1.6),
@@ -290,6 +303,7 @@ SPEC = [
     ("render", "primarySteps", "TUNE_PRIMARY_STEPS", "i", 4096),
     ("render", "farSteps", "TUNE_FAR_STEPS", "i", 384),
     ("render", "farShadowReach", "TUNE_FAR_SHADOW_REACH", "f", 60.0),
+    ("render", "farBlockerHitLevel", "TUNE_FAR_BLOCKER_HIT_LEVEL", "i", 0),
 
     # in-window LOD handoff (PLAN_surface_flight_perf.md A1)
     ("render", "lodHandoffDist", "TUNE_LOD_HANDOFF_DIST", "f", 24.0),
@@ -419,6 +433,49 @@ SPEC = [
     ("worldgen", "desertThreshold", "TUNE_DESERT_THRESHOLD", "u", 214),
     ("worldgen", "pineThreshold", "TUNE_PINE_THRESHOLD", "u", 176),
     ("worldgen", "meadowThreshold", "TUNE_MEADOW_THRESHOLD", "u", 92),
+
+    # per-biome height curves (13.3.3)
+
+    # THE CEILING ON HOW FAR TWO ADJACENT BIOMES MAY DIFFER
+
+    # AND WHY THE SHIPPED SET IS STILL THE IDENTITY
+    ("worldgen", "curveForest0", "TUNE_CURVE_FOREST0", "i", -16384),
+    ("worldgen", "curveForest1", "TUNE_CURVE_FOREST1", "i", -12288),
+    ("worldgen", "curveForest2", "TUNE_CURVE_FOREST2", "i", -8192),
+    ("worldgen", "curveForest3", "TUNE_CURVE_FOREST3", "i", -4096),
+    ("worldgen", "curveForest4", "TUNE_CURVE_FOREST4", "i", 0),
+    ("worldgen", "curveForest5", "TUNE_CURVE_FOREST5", "i", 4096),
+    ("worldgen", "curveForest6", "TUNE_CURVE_FOREST6", "i", 8192),
+    ("worldgen", "curveForest7", "TUNE_CURVE_FOREST7", "i", 12288),
+    ("worldgen", "curveForest8", "TUNE_CURVE_FOREST8", "i", 16384),
+    ("worldgen", "curvePine0", "TUNE_CURVE_PINE0", "i", -16384),
+    ("worldgen", "curvePine1", "TUNE_CURVE_PINE1", "i", -12288),
+    ("worldgen", "curvePine2", "TUNE_CURVE_PINE2", "i", -8192),
+    ("worldgen", "curvePine3", "TUNE_CURVE_PINE3", "i", -4096),
+    ("worldgen", "curvePine4", "TUNE_CURVE_PINE4", "i", 0),
+    ("worldgen", "curvePine5", "TUNE_CURVE_PINE5", "i", 4096),
+    ("worldgen", "curvePine6", "TUNE_CURVE_PINE6", "i", 8192),
+    ("worldgen", "curvePine7", "TUNE_CURVE_PINE7", "i", 12288),
+    ("worldgen", "curvePine8", "TUNE_CURVE_PINE8", "i", 16384),
+    ("worldgen", "curveMeadow0", "TUNE_CURVE_MEADOW0", "i", -16384),
+    ("worldgen", "curveMeadow1", "TUNE_CURVE_MEADOW1", "i", -12288),
+    ("worldgen", "curveMeadow2", "TUNE_CURVE_MEADOW2", "i", -8192),
+    ("worldgen", "curveMeadow3", "TUNE_CURVE_MEADOW3", "i", -4096),
+    ("worldgen", "curveMeadow4", "TUNE_CURVE_MEADOW4", "i", 0),
+    ("worldgen", "curveMeadow5", "TUNE_CURVE_MEADOW5", "i", 4096),
+    ("worldgen", "curveMeadow6", "TUNE_CURVE_MEADOW6", "i", 8192),
+    ("worldgen", "curveMeadow7", "TUNE_CURVE_MEADOW7", "i", 12288),
+    ("worldgen", "curveMeadow8", "TUNE_CURVE_MEADOW8", "i", 16384),
+    ("worldgen", "curveDesert0", "TUNE_CURVE_DESERT0", "i", -16384),
+    ("worldgen", "curveDesert1", "TUNE_CURVE_DESERT1", "i", -12288),
+    ("worldgen", "curveDesert2", "TUNE_CURVE_DESERT2", "i", -8192),
+    ("worldgen", "curveDesert3", "TUNE_CURVE_DESERT3", "i", -4096),
+    ("worldgen", "curveDesert4", "TUNE_CURVE_DESERT4", "i", 0),
+    ("worldgen", "curveDesert5", "TUNE_CURVE_DESERT5", "i", 4096),
+    ("worldgen", "curveDesert6", "TUNE_CURVE_DESERT6", "i", 8192),
+    ("worldgen", "curveDesert7", "TUNE_CURVE_DESERT7", "i", 12288),
+    ("worldgen", "curveDesert8", "TUNE_CURVE_DESERT8", "i", 16384),
+    ("worldgen", "biomeBlend", "TUNE_BIOME_BLEND", "i", 18),
     ("worldgen", "treeTile", "TUNE_TREE_TILE", "i", 144),
     ("worldgen", "treeChanceForest", "TUNE_TREE_CHANCE_FOREST", "u", 78),
     ("worldgen", "treeChancePine", "TUNE_TREE_CHANCE_PINE", "u", 70),
@@ -467,6 +524,15 @@ SPEC = [
     ("worldgen", "heathPatch", "TUNE_HEATH_PATCH", "i", 128),
     ("worldgen", "alpineChance", "TUNE_ALPINE_CHANCE", "u", 40),
     ("worldgen", "ruinChance", "TUNE_RUIN_CHANCE", "u", 5),
+
+    # ruin pads (13.3.2)
+    ("worldgen", "ruinPadMargin", "TUNE_RUIN_PAD_MARGIN", "i", 20),
+    ("worldgen", "ruinMaxSlope", "TUNE_RUIN_MAX_SLOPE", "i", 20),
+
+    # cave flora + the shaded face (13.3.4)
+    ("worldgen", "caveMushroomChance", "TUNE_CAVE_MUSHROOM_CHANCE", "u", 26),
+    ("worldgen", "caveCrystalChance", "TUNE_CAVE_CRYSTAL_CHANCE", "u", 9),
+    ("worldgen", "mossFace", "TUNE_MOSS_FACE", "u", 0),
     ("worldgen", "caveThreshold1", "TUNE_CAVE_THRESHOLD1", "u", 150),
     ("worldgen", "caveThreshold2", "TUNE_CAVE_THRESHOLD2", "u", 148),
 

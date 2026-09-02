@@ -60,11 +60,17 @@ struct PerfOptions {
   // What makes a one-boot --verify affordable: the full table is ~14 arms of
   // 60 frames each, and a package usually has one suspect.
   std::vector<std::string> arms;
+  // `--render-budget` only: comma-separated camera ids from the --render-budget
+  // camera table (`noon,dusk,submerged`). Empty = all of them. Ignored when
+  // `only` names a --perf scenario, which selects a single borrowed camera and
+  // bypasses the table.
+  std::string cams;
 };
 
 // One --render-budget row, for callers that record rather than read the
 // terminal (--verify writes them into build/last_run.json).
 struct RenderBudgetRow {
+  std::string cam;  // which camera of the table (or the borrowed scenario)
   std::string arm;
   bool ok = false;
   double gpuP50Ms = 0, gpuP95Ms = 0;
@@ -88,10 +94,17 @@ int RunPerf(GpuContext& ctx, World& world, Simulation& sim,
 //
 // It exists so that diagnosing the render never becomes the feature-by-feature
 // elimination sequence CLAUDE.md's rule 6 forbids: the whole table is one run.
-// `opt.only` picks the camera (any --perf scenario id, default `idle`);
-// `opt.width/height` set the resolution; `opt.arms` picks a subset. Prints a
-// table; writes no JSON itself — `rows`, when given, receives one entry per
-// arm run so the caller can.
+// THREE CAMERAS, not one. `noon` is the historical overlook and is unchanged to
+// the digit; `dusk` is the same eye with the sun ~8 deg up (long shadow rays,
+// raked terrain); `submerged` puts the eye inside the authored lake, which is
+// the only way to reach shadeSubmerged — god rays, caustics, Snell's window —
+// because the medium is derived from the ray, not from a render flag. Select
+// with `opt.cams` ("noon,dusk"); empty runs all three. `opt.only` still picks a
+// single camera borrowed from a --perf scenario and bypasses the table.
+// `opt.width/height` set the resolution; `opt.arms` picks an arm subset
+// (--budget-arms). Prints one table per camera and writes
+// build/render_budget.json plus one BMP per camera; `rows`, when given, also
+// receives one entry per (camera, arm) run so --verify can record them.
 int RunRenderBudget(GpuContext& ctx, World& world, Simulation& sim,
                     const std::vector<MaterialDef>& mats,
                     const PerfOptions& opt,

@@ -90,6 +90,10 @@ struct RecordCtx {
   // kWaterBodyCap for "none". A pure function of the tick (plan
   // section 3.4) and the whole condition on both sweep rows.
   uint32_t waterSweepSlot = 0xFFFFFFFFu;
+  // Chunks the openness refresh walks this tick (render.opennessChunksPerFrame,
+  // clamped). Zero suppresses the row entirely, which is what makes
+  // `opennessChunksPerFrame = 0` an exact "off" rather than a cheap path.
+  uint32_t opennessChunks = 0;
   bool hashEnable = false;
   bool particlesActive = false;
   // False under --residency paged: worldgen's whole-world dispatch is

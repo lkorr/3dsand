@@ -148,6 +148,36 @@ struct Caps {
   // (measured 3.59 ms of register footprint), and a runtime branch would keep
   // it resident and give back most of the win.
   bool fragmentStoresAndAtomics = false;
+
+  // --- VK_KHR_pipeline_executable_properties (`--shader-stats`) ------------
+  // The instrument, not a feature the engine runs on. With it, the driver will
+  // report per-executable statistics — register count, spill/scratch bytes,
+  // occupancy — for a pipeline created with CAPTURE_STATISTICS, which is the
+  // difference between MEASURING register pressure and guessing at it. Wholly
+  // optional: absent, `--shader-stats` prints one line saying so and exits 2,
+  // and nothing else in the engine notices.
+  bool pipelineExecutableProps = false;
+};
+
+// One statistic the driver reports for one pipeline executable. Values are kept
+// as a double plus the driver's own name/description: the KHR API is
+// deliberately open-ended (every vendor names its own counters) so this must
+// never grow a list of known statistic names — see vk_shader_stats.cpp.
+struct PipelineStat {
+  std::string name;
+  std::string description;
+  double value = 0.0;
+  bool isBool = false;  // format was BOOL32; print YES/no rather than 1/0
+};
+
+// One executable (a stage's compiled ISA) of one pipeline.
+struct PipelineExecutable {
+  std::string pipeline;    // the engine's label: "raymarch", "sim_step", ...
+  std::string stage;       // "compute", "fragment", "vertex", "vertex|fragment"
+  std::string name;        // the driver's name for the executable
+  std::string description;
+  uint32_t subgroupSize = 0;
+  std::vector<PipelineStat> stats;
 };
 
 // -------------------------------------------------------------- buffer ----
@@ -220,6 +250,23 @@ class Backend {
   void Shutdown();
 
   const Caps& GetCaps() const { return caps_; }
+
+  // ---- `--shader-stats` (VK_KHR_pipeline_executable_properties) ----
+  //
+  // MUST BE SET BEFORE THE FIRST PIPELINE IS CREATED — i.e. before
+  // Simulation::Init — because CAPTURE_STATISTICS is a CREATE flag, and a
+  // pipeline already built without it reports no statistics at all. Setting it
+  // also bypasses the on-disk pipeline cache for every subsequent create: a
+  // cache hit hands back an object the driver never compiled, so there is
+  // nothing for it to report. Both costs are paid once, in a headless
+  // diagnostic mode nothing else runs.
+  void SetCaptureStats(bool on) { captureStats_ = on; }
+  bool CaptureStats() const { return captureStats_; }
+  // Every pipeline created on this device, with its engine label, walked
+  // through vkGetPipelineExecutable{Properties,Statistics}KHR. Empty when the
+  // extension is absent or SetCaptureStats was never called.
+  std::vector<PipelineExecutable> CollectPipelineStats() const;
+
   VkDevice Device() const { return device_; }
   const vkl::DeviceFns& Fns() const { return dfn_; }
   // For the windowed path + imgui_impl_vulkan (src/ui/overlay.cpp via rhi_vk.h).
@@ -516,7 +563,18 @@ class Backend {
   std::string pipelineCachePath_;
   std::vector<VkDescriptorSetLayout> setLayouts_;
   std::vector<VkPipelineLayout> pipeLayouts_;
-  std::vector<VkPipeline> pipelines_;
+  // Pipelines keep their ENGINE LABEL. They used to be bare handles — both
+  // creates took a `const char* /*label*/` and dropped it — which made a
+  // per-pipeline readout impossible to attribute: `--shader-stats` would have
+  // printed 30 anonymous rows. The label costs one std::string per pipeline,
+  // built once at startup.
+  struct PipelineRec {
+    VkPipeline pipe = VK_NULL_HANDLE;
+    std::string label;
+    bool compute = false;
+  };
+  std::vector<PipelineRec> pipelines_;
+  bool captureStats_ = false;
 
   std::vector<std::string> validationMsgs_;
   bool validationScopeOpen_ = false;

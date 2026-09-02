@@ -46,6 +46,14 @@ struct Stats {
 };
 Stats LastStats(const Device& d);
 
+// Arm VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR for every pipeline this
+// device creates FROM NOW ON (`--shader-stats`). Must be called before
+// Simulation::Init: capture is a create flag, so a pipeline that already exists
+// reports nothing. Also bypasses the on-disk pipeline cache, since a cache hit
+// is an object the driver never compiled. No-op on a non-Vulkan device or one
+// whose driver lacks VK_KHR_pipeline_executable_properties.
+void SetCaptureStats(const Device& d, bool on);
+
 // ---- windowed path (phase 4b D3) ------------------------------------------
 
 // Wrap an acquired swapchain image (vk::Backend::AcquireSwapchainImage) into a

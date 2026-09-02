@@ -292,6 +292,16 @@ class Simulation {
     if (passTimer_) passTimer_->EncodeResolve(enc);
   }
 
+  // Build the render pipelines NOW rather than on the first BeginRenderPass.
+  // The one caller is `--shader-stats`: graphics pipelines are created lazily
+  // (BuildPipelines leaves targetFormat_ Undefined), so a mode that walks the
+  // pipeline list without drawing anything would find no `raymarch` — the row
+  // it exists to print. Format-keyed like the lazy path, so a subsequent draw
+  // in the same format is a no-op rather than a rebuild.
+  void ForceRenderPipelines(rhi::TextureFormat format) {
+    EnsureRenderPipelines(format);
+  }
+
  private:
   bool BuildPipelines(const rhi::Device& device, std::string* err);
   void EnsureDepth(uint32_t width, uint32_t height);
@@ -354,6 +364,11 @@ class Simulation {
   rhi::ComputePipeline explodeMark_, explodeApply_, pArgs1_, pSpawn_, pIntegrate_,
       pArgs2_, pResolve_;
   rhi::ComputePipeline farFill_, farDown_;
+  // The openness grid (sim_openness.wgsl, docs/PLAN_gi.md §2): `dirty` walks
+  // the tick's compacted dirty list, `refresh` walks a rolling slice of the
+  // window. Render-path passes on the TICK table — see the .def rows for why
+  // they are not on the per-frame shadow table.
+  rhi::ComputePipeline opennessDirty_, opennessRefresh_;
   rhi::ComputePipeline pageFill_;   // JITTER page materialization (world.h)
   // Shadow cache (shadow_resolve.wgsl): `prepare` turns last frame's request
   // count into a dispatch size, `resolve` casts one media-blind shadow ray per

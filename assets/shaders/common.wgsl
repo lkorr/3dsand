@@ -1259,10 +1259,19 @@ fn tonemapHdr(colorIn : vec3f) -> vec3f {
 // geometry, in the same linear HDR space as the terrain. Callers MUST run the
 // result through tonemapHdr() — bare gamma clips the highlights and drifts
 // from the raymarched look in both directions.
-fn litColor(albedo : vec3f, n : vec3f, worldPos : vec3f, emission : f32,
-            R : RenderParams) -> vec3f {
+// litColor with the openness (sky-visibility) multiplier applied to the AMBIENT
+// term only — never to the key light, which has its own occlusion, exactly as
+// the raymarcher's `ambientAt(n) * ao + sun` split does. `openScale` comes from
+// opennessScaleAtBody() at the call site, because only the caller has the
+// `openness`/`opennessGen` bindings in scope (see the pointer note above).
+//
+// A SEPARATE ENTRY POINT rather than a widened litColor: debug_lines.wgsl and
+// several sprite paths want the plain version, and 1.0 here is bit-identical to
+// what they had.
+fn litColorO(albedo : vec3f, n : vec3f, worldPos : vec3f, emission : f32,
+             R : RenderParams, openScale : f32) -> vec3f {
   let lambert = max(dot(n, keyLightDirP(R)), 0.0);
-  var c = albedo * (ambientAtP(n, R) + keyLightColorP(R) * lambert);
+  var c = albedo * (ambientAtP(n, R) * openScale + keyLightColorP(R) * lambert);
   c += albedo * emission * 1.7;
   let dist = length(worldPos - R.camPos);
   let fog = 1.0 - exp(-dist * VOXEL_METERS * 0.0128);
@@ -1276,6 +1285,13 @@ fn litColor(albedo : vec3f, n : vec3f, worldPos : vec3f, emission : f32,
   let fogTint = vec3f(0.55, 0.65, 0.85) *
                 mix(0.015 + 0.05 * moonLit, 1.0, eclipseDayWeightP(R));
   return mix(c, fogTint, fog);
+}
+
+// The plain form: no spatial term, bit-identical to what every raster path had
+// before the openness grid landed.
+fn litColor(albedo : vec3f, n : vec3f, worldPos : vec3f, emission : f32,
+            R : RenderParams) -> vec3f {
+  return litColorO(albedo, n, worldPos, emission, R, 1.0);
 }
 
 // Emissive voxels (embers on burning debris, lava) pulse rather than sitting at
@@ -2782,6 +2798,35 @@ fn farOccIndex(level : u32, c : vec3<i32>) -> u32 {
   return (level - 1u) * FAR_NUM_CHUNKS + farChunkIndexG(c);
 }
 
+// ---- THE FAR CELL BYTE: 7 bits of material + 1 CONSERVATIVE BLOCKER BIT ----
+// (13.2.2, docs/PLAN_lin_followups.md W2-D)
+//
+// A far cell used to be a whole byte of raw material id, clamped to 255. It is
+// now SEVEN bits of material and one flag, because the byte is the only spare
+// storage the cascade has and the material id never needed all eight: there
+// are 117 materials, `LoadMaterials` REFUSES a table that would put an id past
+// 127, and `check_invariants.py` refuses a materials.json that would grow one.
+// Both of those exist solely to keep this split legal — if either is deleted
+// the far field silently starts painting the wrong material AND claiming a
+// blocker wherever an id has bit 7 set.
+//
+// The flag means: "somewhere inside this cell's fine-voxel footprint, pristine
+// worldgen puts something a ray would stop on." It is CONSERVATIVE — it may be
+// set where the cell's own centre sample found air (that is the entire point:
+// the centre sample loses ridge crests, the top row of every terrace, and any
+// wall thinner than a cell) and it deliberately ignores caves, because a cell
+// below the ground surface counts as blocked whether or not a cave hollows it.
+//
+// It is a pure function of (coords, seed) — see `farBlockerBitAt` in
+// worldgen.wgsl — which is what lets the sieve (`far`, pristine procgen) and
+// the downsample (`fardown`, live grid) write byte-identical flags at their
+// shared boundary, the same argument `farSurfaceMat` makes for the colour.
+// The corollary is that the flag knows nothing about EDITS: a player-built
+// wall in mid-air gets no blocker bit, only the material byte the downsample
+// writes for it.
+const FAR_MAT_MASK    : u32 = 0x7Fu;   // material id, 0 = air
+const FAR_BLOCKER_BIT : u32 = 0x80u;
+
 // ---- per-chunk occupancy packing ----
 // Low 16 bits: total non-air voxels (chunk-skip for media-aware rays, CPU
 // streaming/save-worthiness). High 16 bits: ray BLOCKERS — voxels that stop a
@@ -2888,6 +2933,175 @@ fn subOccBitOfLocalIdx(i : u32) -> u32 {
 // free of a per-word special case.
 fn subOccAllOnes() -> u32 { return 0xFFFFFFFFu; }
 
+// ---- THE OPENNESS (SKY-VISIBILITY) GRID (docs/PLAN_gi.md §2, W3 P0) --------
+// One byte per (chunk SLOT, 4^3 block, face) = the unblocked fraction of that
+// face's hemisphere within render.opennessReach metres, written by
+// sim_openness.wgsl and read here. See the kOpenFaces block in world.h for the
+// layout argument; what lives in this file is everything the WRITER and the two
+// READERS must agree about bit for bit — the stamp, the byte index, the face
+// encoding and the filter.
+//
+// `openness` and `opennessGen` are declared per shader (binding 27/28 in the
+// sim group, 17/18 in the render group), so these take POINTERS for exactly
+// traceOpaque's reason: common.wgsl is prepended before any shader declares a
+// binding, and a function here cannot name one.
+const OPEN_BLOCKS : u32 = SUBOCC_DIM * SUBOCC_DIM * SUBOCC_DIM;
+
+// The per-slot stamp: a hash of the WORLD CHUNK COORD the slot's bytes were
+// computed for. The residency window is toroidal, so a slot is silently reused
+// by a different chunk as the window walks, and this is the only thing that
+// tells a reader its bytes describe geometry that has gone. A mismatch reads as
+// "unknown" and the caller falls back to the plain n.y lerp.
+//
+// MUST MATCH sandvox::OpennessStamp (src/sim/world.h) — `--gate openness`
+// computes it on the CPU and asserts the GPU wrote the same word, so the two
+// cannot drift silently. 0 means "never computed" (the buffer is zeroed), so a
+// hash landing on 0 is bumped to 1.
+fn opennessStamp(wc : vec3<i32>) -> u32 {
+  let h = (bitcast<u32>(wc.x) * 73856093u) ^ (bitcast<u32>(wc.y) * 19349663u) ^
+          (bitcast<u32>(wc.z) * 83492791u);
+  return select(h, 1u, h == 0u);
+}
+
+// face = axis * 2 + (normal sign > 0) — the same encoding the shadow cache
+// packs into its request record, and the same one openFaceNormal inverts in
+// sim_openness.wgsl. Taken from the NORMAL rather than from a DDA's (axis, sgn)
+// pair on purpose: the raymarcher's `sgn` is the RAY's direction sign and the
+// face normal is its opposite, which is one negation nobody would notice
+// getting wrong (every face would read its neighbour's openness, and terrain
+// would still look plausible). The raster paths only have a normal anyway.
+fn openFaceOfNormal(n : vec3f) -> u32 {
+  let a = abs(n);
+  var axis = 0u;
+  if (a.y >= a.x && a.y >= a.z) { axis = 1u; }
+  else if (a.z >= a.x) { axis = 2u; }
+  // Selected, not indexed: a dynamic index into a vector spills it to scratch
+  // for the whole function, and this is called from the fragment shader's
+  // hottest path (the by-value-uniform gotcha, one level down).
+  let sv = select(select(n.x, n.y, axis == 1u), n.z, axis == 2u);
+  return axis * 2u + select(0u, 1u, sv > 0.0);
+}
+
+// The byte for (world cell, face), or -1 when this slot's stamp does not match
+// the cell's world chunk (never computed, or computed for a chunk that has
+// since streamed out).
+fn opennessByteAt(c : vec3<i32>, face : u32,
+                  op : ptr<storage, array<u32>, read>,
+                  og : ptr<storage, array<u32>, read>) -> i32 {
+  let slot = chunkIndexW(c);
+  if ((*og)[slot] != opennessStamp(worldChunkOf(c))) { return -1; }
+  let lo = vec3<u32>(c & vec3<i32>(i32(CHUNK) - 1));
+  let bi = (slot * OPEN_BLOCKS + subOccBitLocal(lo)) * OPEN_FACES + face;
+  return i32(((*op)[bi >> 2u] >> ((bi & 3u) * 8u)) & 0xFFu);
+}
+
+// Openness at a surface point, 0..1, or -1 for "unknown, use the old lerp".
+//
+// NEAREST vs BILINEAR. Blocks are 40 cm and the value is an ambient MULTIPLIER,
+// so nearest-only paints a visible 4-voxel checker across any flat wall — the
+// discontinuity is not at a geometric edge, which is where the eye forgives
+// quantisation, but in the middle of a smooth surface, where it does not. The
+// filter blends the four blocks in the FACE PLANE (never across the face's own
+// axis: the block in front is air and the one behind is solid, and neither has
+// anything to say about this face). Taps whose stamp does not match drop out
+// with weight 0 rather than contributing a default, so a wall at the edge of
+// the residency window fades to its own value instead of to a guess.
+fn opennessAt(cell : vec3<i32>, p : vec3f, n : vec3f,
+              op : ptr<storage, array<u32>, read>,
+              og : ptr<storage, array<u32>, read>) -> f32 {
+  let face = openFaceOfNormal(n);
+  let axis = face >> 1u;
+  if (TUNE_OPENNESS_BILINEAR == 0) {
+    let b = opennessByteAt(cell, face, op, og);
+    return select(-1.0, f32(b) * (1.0 / 255.0), b >= 0);
+  }
+  // Unit vectors of the face axis and its two tangents, as integer masks. Built
+  // by comparison rather than by rotation so no component is ever read with a
+  // dynamic index.
+  let ea = vec3<i32>(select(0, 1, axis == 0u), select(0, 1, axis == 1u),
+                     select(0, 1, axis == 2u));
+  let eu = vec3<i32>(select(0, 1, axis == 1u), select(0, 1, axis == 2u),
+                     select(0, 1, axis == 0u));
+  let ev = vec3<i32>(select(0, 1, axis == 2u), select(0, 1, axis == 0u),
+                     select(0, 1, axis == 1u));
+  let blk = f32(SUBOCC_BLOCK);
+  // Position within the block grid, shifted half a block so the samples are
+  // block CENTRES and the weights are symmetric about them.
+  let fu = dot(p, vec3f(eu)) / blk - 0.5;
+  let fv = dot(p, vec3f(ev)) / blk - 0.5;
+  let bu = floor(fu);
+  let bv = floor(fv);
+  let wu = fu - bu;
+  let wv = fv - bv;
+  let half = i32(SUBOCC_BLOCK) / 2;
+  // The tap cell: this cell's component on the face axis (stay in the same
+  // slab), the two tangent components snapped to the lower block's centre.
+  let base = cell * ea + eu * (i32(bu) * i32(SUBOCC_BLOCK) + half) +
+             ev * (i32(bv) * i32(SUBOCC_BLOCK) + half);
+  let du = eu * i32(SUBOCC_BLOCK);
+  let dv = ev * i32(SUBOCC_BLOCK);
+  let b00 = opennessByteAt(base, face, op, og);
+  let b10 = opennessByteAt(base + du, face, op, og);
+  let b01 = opennessByteAt(base + dv, face, op, og);
+  let b11 = opennessByteAt(base + du + dv, face, op, og);
+  let w00 = (1.0 - wu) * (1.0 - wv);
+  let w10 = wu * (1.0 - wv);
+  let w01 = (1.0 - wu) * wv;
+  let w11 = wu * wv;
+  var acc = 0.0;
+  var wsum = 0.0;
+  if (b00 >= 0) { acc += f32(b00) * w00; wsum += w00; }
+  if (b10 >= 0) { acc += f32(b10) * w10; wsum += w10; }
+  if (b01 >= 0) { acc += f32(b01) * w01; wsum += w01; }
+  if (b11 >= 0) { acc += f32(b11) * w11; wsum += w11; }
+  if (wsum <= 0.0) { return -1.0; }
+  return acc / (wsum * 255.0);
+}
+
+// The ambient MULTIPLIER: 1.0 where the sky is fully visible (and therefore
+// bit-identical to the pre-P0 shading), down toward 0 where it is not.
+//
+// A MULTIPLY, WHERE PLAN_gi.md §2 SAID `mix(ambGround, ambSky, openness)`.
+// That form makes a fully enclosed surface read as TUNE_AMB_GROUND — which is
+// the ambient a downward-facing surface ALREADY gets in open daylight, so a
+// cave floor would come out exactly as bright as the underside of an overhang
+// outdoors and "caves get dark" would simply not be true. It also throws away
+// the n.y term entirely, so a cave wall and a cave floor would shade
+// identically and lose the sky/ground split that gives voxel terrain its shape.
+// Multiplying keeps the hue and the shape and makes enclosure actually darken,
+// which is the sentence the phase is judged by.
+fn opennessScale(o : f32) -> f32 {
+  return select(1.0, mix(1.0, o, TUNE_OPENNESS_STRENGTH), o >= 0.0);
+}
+
+// The raster paths' version. A BODY is not in the voxel grid, so the block it
+// stands in is air and has no measurement — reading it would report 255 ("open
+// sky") for a mob in the middle of a cave, which is the exact failure
+// PLAN_gi.md §1 names. So walk DOWN from the fragment until a block that holds
+// matter and take its UP face: a mob is lit like the ground it stands on, which
+// is both cheap and about right for a diffuse body under a sky.
+//
+// Six blocks (2.4 m) is the reach. Past that the body is airborne over a hole
+// and the old lerp is as good an answer as any.
+fn opennessScaleAtBody(worldPos : vec3f,
+                       occ : ptr<storage, array<u32>, read>,
+                       op : ptr<storage, array<u32>, read>,
+                       og : ptr<storage, array<u32>, read>) -> f32 {
+  if (TUNE_OPENNESS_STRENGTH <= 0.0) { return 1.0; }
+  var c = vec3<i32>(floor(worldPos));
+  for (var i = 0u; i < 6u; i++) {
+    let idx = chunkIndexW(c);
+    let lo = vec3<u32>(c & vec3<i32>(i32(CHUNK) - 1));
+    let sbit = subOccBitLocal(lo);
+    if (((*occ)[subOccIndex(idx, 1u, sbit >> 5u)] & (1u << (sbit & 31u))) != 0u) {
+      let b = opennessByteAt(c, 3u, op, og);   // face 3 = +Y
+      return opennessScale(select(-1.0, f32(b) * (1.0 / 255.0), b >= 0));
+    }
+    c.y -= i32(SUBOCC_BLOCK);
+  }
+  return 1.0;
+}
+
 // ---- VOXEL-KEYED SHADOW CACHE (src/sim/world.h kShadowCacheBuckets) --------
 // The identity and packing shared by the two halves of the cache:
 // raymarch.wgsl READS a patch's shadow factor and REGISTERS the patch, and
@@ -2899,6 +3113,44 @@ fn subOccAllOnes() -> u32 { return 0xFFFFFFFFu; }
 // granularity is a QUALITY knob, not a speed one — see the world.h block for
 // why the win saturates long before the patch gets coarse.
 //
+// ---- RUNTIME AXIS SELECTION WITHOUT A DYNAMIC INDEX -----------------------
+// (docs/PLAN_lin_followups.md W2-B, 13.1.3.)
+//
+// `v[axis]` where `axis` is a runtime value is legal WGSL and is a trap in a
+// shader that cares about registers. A vector lives in registers only while
+// every component reference is a literal; index one with a value the compiler
+// cannot fold and the whole vector is spilled to scratch memory for the
+// lifetime of the function, and on NVIDIA that shows up as non-zero "Local
+// Memory Size" in --shader-stats. It is the same failure as the by-value
+// uniform gotcha one level down: the cost is not the access, it is that the
+// DATA had to move.
+//
+// So: four functions, no indices. `axisVec`/`axisVecI` BUILD a basis vector
+// (the `var n = vec3f(0.0); n[axis] = s;` idiom, which is most of the sites);
+// `axisPick`/`axisPickI` READ one component. Both forms are exact — the built
+// vector's off-axis components are literal +0.0 rather than a `mask * s`
+// product that would make them -0.0 for negative s, and the read is a select
+// chain rather than a dot, so no inf or NaN component can leak through a
+// multiply by zero.
+//
+// The `tMax[a]` sites inside `for (var a = 0; a < 3; a++)` loops are NOT this
+// bug and are deliberately left alone: a constant-trip loop unrolls and the
+// index becomes a literal.
+fn axisVec(a : i32, s : f32) -> vec3f {
+  return vec3f(select(0.0, s, a == 0), select(0.0, s, a == 1),
+               select(0.0, s, a == 2));
+}
+fn axisVecI(a : i32, s : i32) -> vec3<i32> {
+  return vec3<i32>(select(0, s, a == 0), select(0, s, a == 1),
+                   select(0, s, a == 2));
+}
+fn axisPick(v : vec3f, a : i32) -> f32 {
+  return select(select(v.x, v.y, a == 1), v.z, a == 2);
+}
+fn axisPickI(v : vec3<i32>, a : i32) -> i32 {
+  return select(select(v.x, v.y, a == 1), v.z, a == 2);
+}
+
 // FACE ENCODING: axis * 2 + (normal points along +axis). 0..5, three bits.
 fn shadowFaceOf(axis : i32, nPositive : bool) -> u32 {
   return u32(axis) * 2u + select(0u, 1u, nPositive);
@@ -2906,9 +3158,7 @@ fn shadowFaceOf(axis : i32, nPositive : bool) -> u32 {
 fn shadowFaceNormal(face : u32) -> vec3f {
   let axis = face >> 1u;
   let s = select(-1.0, 1.0, (face & 1u) != 0u);
-  var n = vec3f(0.0);
-  n[axis] = s;
-  return n;
+  return axisVec(i32(axis), s);
 }
 // The two in-face axes. Fixed order (a+1, a+2) so the sub-patch indices mean
 // the same thing on both sides.
@@ -2925,9 +3175,9 @@ fn shadowPatchCentre(cell : vec3<i32>, face : u32, sx : u32, sy : u32,
   let t = shadowFaceTangents(face);
   let inv = 1.0 / f32(subdiv);
   var p = vec3f(cell);
-  p[axis] += select(0.0, 1.0, (face & 1u) != 0u);
-  p[t.x] += (f32(sx) + 0.5) * inv;
-  p[t.y] += (f32(sy) + 0.5) * inv;
+  p += axisVec(i32(axis), select(0.0, 1.0, (face & 1u) != 0u));
+  p += axisVec(i32(t.x), (f32(sx) + 0.5) * inv);
+  p += axisVec(i32(t.y), (f32(sy) + 0.5) * inv);
   return p;
 }
 
@@ -3268,6 +3518,341 @@ fn voxWordAtEntry(e : u32, c : vec3<i32>) -> u32 {
   if ((e & PT_SENTINEL_BIT) != 0u) { return synthWordAt(e, c, ptSeed()); }
   let lo = vec3<u32>(c & vec3<i32>(CHUNK_MASK));
   return voxels[e * CHUNK_VOL + (lo.z * CHUNK + lo.y) * CHUNK + lo.x];
+}
+
+// ---- THE SLIM OPAQUE TRACER (docs/PLAN_lin_followups.md W2-A) --------------
+// ONE media-blind DDA, shared by every SECONDARY ray in the engine: the shadow
+// resolve pass (shadow_resolve.wgsl), sunShadowAt's cache-off fallback,
+// traceReflection, traceRefraction and the god-ray occlusion test. It was
+// shadow_resolve.wgsl's private `shadowMarch`; promoting it here and widening
+// its return by four fields is what let the last four trace() call sites in the
+// fragment shader go away.
+//
+// WHY IT EXISTS, AND WHY THE ANSWER IS "REGISTERS", NOT "STEPS".
+// --render-budget (RTX 3060 Ti, overlook cam, 1080p, 2026-08-30) removed the
+// reflection two different ways:
+//
+//   noreflect (reflectionSteps -> 0, const-folded)   -3.58 ms
+//   reflgate  (every call site gated at runtime)     -0.09 ms
+//
+// The traversal is 0.09 ms. The other 3.49 ms is the REGISTER FOOTPRINT of an
+// inlined copy of trace() — 26 Hit fields, media accumulation, the liquid and
+// the translucent-solid surface pairs, the nested micro-brick march — and it is
+// paid by EVERY pixel in the frame, including every pixel with no reflection in
+// it, because a fragment shader's occupancy is set by its worst path. The
+// shadow half measured the same shape (shadow0 5.98 ms vs noshadow 2.29 ms). So
+// the fix is not to skip the call at runtime; it is to make the call site carry
+// less. A secondary ray reads 6 of trace()'s 26 fields and nothing else, and
+// those 6 are this struct.
+//
+// EQUIVALENCE WITH trace(ro, rd, n, false) IS THE CONTRACT, not an aspiration.
+// Same axis nudge, same window clip, and NO LOD-HANDOFF CLAMP — trace() applies
+// that only for wantMedia, because a shadow ray that gave up at 18 m would
+// report "lit" for a receiver whose blocker is at 20 m, which unshadows terrain
+// rather than coarsening it. Chunk skip on occBlockers, so a chunk holding only
+// smoke or grass is as cheap as air for this ray class. The same three sentinel
+// fast paths. isRayBlocker as the per-cell hit test — which is exactly the
+// chain trace() walks with wantMedia false: a gas or a translucent liquid takes
+// the participating-media branch and accumulates nothing, a micro cell falls
+// through explicitly, ice and glass are CLASS_SOLID and so DO stop the ray,
+// everything else hits. Three consequences that are behaviour, not detail: a
+// secondary ray still marches THROUGH water to the bed, it still shows no grass
+// or strands (trace() already zeroed the micro budget for these rays), and a ray
+// that leaves the window reports no hit so its caller can take the sky.
+//
+// `--selftest --gate shadow-cache` casts the compute-stage ray and the
+// fragment-stage ray at sampled surface points and asserts they agree. With one
+// function that is now trivially true, which is the point: the classic silent
+// bug here is two DDAs that drift.
+//
+// `coarseFromT` IS THE COARSE-TERMINATE DISTANCE, IN FINE VOXELS (the same
+// units as `OpaqueHit.t`, not metres — the call sites divide the metre knob by
+// VOXEL_METERS, see shadowCoarseFromT below). Past it the march stops asking
+// the voxel and asks the 4^3 BLOCKERS-CLASS sub-occupancy mask instead:
+//
+//   bit clear -> NO blocker cell anywhere in this 4x4x4 block. Skipping it is
+//                EXACT, not conservative: the mask's producer runs the same
+//                isRayBlocker test this loop does, cell by cell, on every dirty
+//                walk (sim_occupancy.wgsl), and a sentinel chunk writes ones
+//                for a blocker material and zeros for air or a liquid — the
+//                same split occBlockers() already makes one level up. So the
+//                block DDA past coarseFromT costs a quarter of the iterations
+//                for the same answer wherever the mask is clear.
+//   bit set   -> at least one blocker SOMEWHERE in the block. The march
+//                terminates here and reports a hit at the current cell rather
+//                than finding which of the 64 cells it was. THIS is the
+//                approximation, and it is one-sided: a coarse hit can only
+//                ever be MORE occluded than the fine answer, never less. For a
+//                distant shadow that reads as a canopy going opaque at 4-voxel
+//                granularity, which is both cheaper and CALMER — the fine ray
+//                through a leaf lattice flickers between lit and shadowed on
+//                sub-pixel motion, and this is exactly the aliasing that
+//                averaging over a block removes.
+//
+// `coarseFromT = 1e30` therefore means "never coarse", and the whole block
+// below is unreachable: the compare is against a finite tCur. That is the
+// bit-identity guarantee the reflection and refraction call sites rely on, and
+// with the knob at 0 the const-folded 1e30 lets the compiler delete the code
+// outright (shadowResolve's SPIR-V binary size is unchanged at 0, which is how
+// it was checked).
+//
+// `word` IS UNDEFINED (zero) ON A COARSE HIT. A block has no material — it has
+// up to 64 of them — so there is nothing honest to return. Callers that read
+// `word` (traceReflection, traceRefraction, and shadeSecondaryHit behind them)
+// must therefore pass 1e30, and they do; the callers that pass a finite value
+// (the shadow resolve pass, sunShadowAt, godRays) read only `hit` and `t`.
+// That is asserted by construction rather than by a flag: there are five call
+// sites in the engine and they are all in this comment.
+//
+// `occ` and `mats` come in as POINTERS for exactly paletteColor's reason:
+// common.wgsl is prepended BEFORE any shader declares its bindings, so a
+// function here cannot name `occupancy` or `materials`. The page-table
+// accessors it calls (voxels, pageTable, ptSeed, ptOrigin) need no such
+// treatment — they live in this block, which exists only for the shaders that
+// address voxels.
+struct OpaqueHit {
+  hit  : bool,
+  t    : f32,          // fine-voxel units, distance to the blocker
+  cell : vec3<i32>,    // world cell of the hit
+  axis : i32,          // axis of the face the ray entered it through
+  sgn  : f32,          // ray direction sign on that axis
+  word : u32,          // that cell's voxel word (material, state, stain)
+  steps : u32,         // DDA iterations spent (RENDER_STATS attribution only)
+}
+
+fn traceOpaque(ro : vec3f, rdIn : vec3f, maxSteps : i32, coarseFromT : f32,
+               occ : ptr<storage, array<u32>, read>,
+               mats : ptr<storage, array<Material>, read>) -> OpaqueHit {
+  var out : OpaqueHit;
+  out.hit = false;
+  out.t = 0.0;
+  out.cell = vec3<i32>(0);
+  out.axis = 1;
+  out.sgn = -1.0;
+  out.word = 0u;
+
+  // Axis-aligned rays would divide by zero and produce inf tMax. Same nudge
+  // trace() applies, and it must stay identical or the two disagree on rays
+  // exactly along an axis — which is the common case here, since the sun is
+  // often near-vertical.
+  var rd = rdIn;
+  if (abs(rd.x) < 1e-6) { rd.x = select(-1e-6, 1e-6, rd.x >= 0.0); }
+  if (abs(rd.y) < 1e-6) { rd.y = select(-1e-6, 1e-6, rd.y >= 0.0); }
+  if (abs(rd.z) < 1e-6) { rd.z = select(-1e-6, 1e-6, rd.z >= 0.0); }
+  let inv = 1.0 / rd;
+  // sign(rd[axis]) WITHOUT a dynamic index. An indexed read of a vector forces
+  // it out of registers and into scratch for the whole function (the by-value
+  // uniform gotcha, one level down), and in a function whose entire reason to
+  // exist is register footprint that would be self-defeating. Computed once,
+  // selected on the hit path.
+  let sgn3 = sign(rd);
+
+  // Clip to the residency window AABB, in world coords. ptOrigin() is the
+  // per-shader generated accessor for the window origin in CHUNK units —
+  // R.origin in the renderer, T.origin in a sim kernel — which is the same
+  // value trace() reads directly.
+  let nf = f32(WORLD_N);
+  let wloI = ptOrigin() * i32(CHUNK);
+  let wlo = vec3f(wloI);
+  let tt0 = (wlo - ro) * inv;
+  let tt1 = (wlo + vec3f(nf) - ro) * inv;
+  let tmin = min(tt0, tt1);
+  let tmax = max(tt0, tt1);
+  let tEnter = max(max(tmin.x, tmin.y), max(tmin.z, 0.0));
+  let tExit = min(tmax.x, min(tmax.y, tmax.z));
+  if (tExit <= tEnter) { return out; }
+
+  var t = tEnter + 1e-4;
+  var p = ro + rd * t;
+  var cell = clamp(vec3<i32>(floor(p)), wloI, wloI + vec3<i32>(i32(WORLD_N) - 1));
+  let stepv = vec3<i32>(sign(rd));
+  let tDelta = abs(inv);
+  var tMax : vec3f;
+  for (var a = 0; a < 3; a++) {
+    let boundary = f32(cell[a]) + select(0.0, 1.0, rd[a] > 0.0);
+    tMax[a] = (boundary - ro[a]) * inv[a];
+  }
+
+  // WHICH FACE the ray entered the CURRENT cell through. `shadowMarch` did not
+  // track this — it returned {hit, t} and a shadow needs no normal — but a
+  // reflection shades the face it lands on, so the slim tracer carries trace()'s
+  // rule verbatim: the WINDOW entry face for the first cell, the stepped axis
+  // after a DDA step, and the BOX EXIT FACE after a chunk jump. That last one is
+  // the case that bites: a jump that left `axis` alone would report the window
+  // entry face as the normal of whatever the ray hits in the first cell after
+  // landing, which for a reflection skimming over open water is most of them.
+  var axis = 0;
+  if (tmin.y > tmin.x && tmin.y > tmin.z) { axis = 1; }
+  else if (tmin.z > tmin.x && tmin.z > tmin.y) { axis = 2; }
+
+  var tCur = t;
+
+  let wloHi = wloI + vec3<i32>(i32(WORLD_N));
+  // Per-chunk lookup cache, same as trace()'s: occupancy and the page entry are
+  // invariant while the ray stays in a chunk, which is 16-48 steps. Compared on
+  // the CHUNK COORD rather than the linear index so the miss test is three
+  // shifts and a vec3 compare instead of chunkIndexW's multiplies.
+  var cchOcc = 0u;
+  var cchPt = 0u;
+  var cchIdx = 0u;   // the SLOT index, which is what subOccIndex keys on
+  var cchC = vec3<i32>(0x7FFFFFFF);
+
+  var steps = 0u;
+  for (var i = 0; i < 4096; i++) {
+    steps += 1u;
+    if (i >= maxSteps) { break; }
+    if (any(cell < wloI) || any(cell >= wloHi)) { break; }
+
+    let cc = cell >> vec3<u32>(CHUNK_SHIFT);
+    if (any(cc != cchC)) {
+      cchC = cc;
+      cchIdx = chunkIndexW(cell);
+      cchOcc = (*occ)[cchIdx];
+      cchPt = pageEntryOf(cchIdx);
+    }
+
+    // Chunk skip on the BLOCKER count, never the total: a chunk holding only
+    // smoke or grass must be as cheap as air for this ray class.
+    var chunkSkip = (occBlockers(cchOcc) == 0u);
+    if ((cchPt & PT_SENTINEL_BIT) != 0u) {
+      let sMat = cchPt & PT_MAT_MASK;
+      if (sMat == MAT_AIR) {
+        chunkSkip = true;
+      } else if (isRayBlocker((*mats)[sMat])) {
+        // A uniform body of blocker material: this cell IS that material, so
+        // the answer is here. No isTranslucentSolid exclusion, unlike the
+        // primary ray's version of this branch in raymarch.wgsl — that
+        // exclusion exists so a PRIMARY ray keeps marching through glass to
+        // accumulate its Beer-Lambert path, and a secondary ray must stop.
+        // synthWordAt reproduces the word a materialized page would have held,
+        // JITTER variant included, so a reflection of a stone chunk shades with
+        // the same palette variant the primary ray would have found there.
+        out.hit = true;
+        out.t = tCur;
+        out.cell = cell;
+        out.axis = axis;
+        out.sgn = select(select(sgn3.x, sgn3.y, axis == 1), sgn3.z, axis == 2);
+        out.word = synthWordAt(cchPt, cell, ptSeed());
+        out.steps = steps;
+        return out;
+      } else if (((*mats)[sMat].flags & MATF_MICRO) != 0u) {
+        chunkSkip = true;   // a whole chunk of grass casts no shadow
+      }
+    }
+
+    // The box the ray is about to jump over, edge in voxels, 0 for "no jump".
+    // ONE jump, two edge sizes: the whole chunk when the chunk holds no
+    // blocker at all, or one 4^3 sub-block when the coarse march is on and
+    // that block's blockers bit is clear. Both boxes are power-of-two aligned
+    // so the same mask-and-floor arithmetic serves either, and writing it once
+    // is not tidiness — the chunk jump's "force the crossing on the exit axis"
+    // rule is the fix for a float-noise shadow leak along box faces, and a
+    // second hand-copied jump would be a second place to forget it.
+    var skipEdge = 0;
+    if (chunkSkip) {
+      skipEdge = i32(CHUNK);
+    } else if (tCur > coarseFromT) {
+      // ---- COARSE TERMINATE (docs/PLAN_lin_followups.md W2-B, 13.2.1) ----
+      // Past coarseFromT the unit of traversal is the 4^3 block, not the
+      // voxel. Cost per iteration is the same shape as the fine path (one u32
+      // load, one test) but each iteration covers 4 voxels instead of 1, and
+      // the mask is 4 words per chunk against 4,096 for the page, so the loads
+      // hit cache where the voxel reads miss. See the header for why a set bit
+      // may stop the ray early and a clear bit may not.
+      let lo = vec3<u32>(cell & vec3<i32>(i32(CHUNK) - 1));
+      let sbit = subOccBitLocal(lo);
+      let sw = (*occ)[subOccIndex(cchIdx, 1u, sbit >> 5u)];
+      if ((sw & (1u << (sbit & 31u))) != 0u) {
+        out.hit = true;
+        out.t = tCur;
+        out.cell = cell;
+        out.axis = axis;
+        out.sgn = select(select(sgn3.x, sgn3.y, axis == 1), sgn3.z, axis == 2);
+        out.word = 0u;   // UNDEFINED for a coarse hit — see the header
+        out.steps = steps;
+        return out;
+      }
+      skipEdge = i32(SUBOCC_BLOCK);
+    }
+
+    if (skipEdge != 0) {
+      // Jump to the box's exit face. Masking off the low bits is
+      // floor-to-corner for negative world coords too.
+      let blkLo = cell & vec3<i32>(~(skipEdge - 1));
+      let lo = vec3f(blkLo);
+      let hi = lo + f32(skipEdge);
+      let e0 = (lo - ro) * inv;
+      let e1 = (hi - ro) * inv;
+      let ex = max(e0, e1);
+      // max against tCur: a cell floored onto a shared face belongs to a box
+      // the ray is already exiting, so the raw exit t can be <= tCur and the
+      // march would stall in place.
+      let tOut = max(min(ex.x, min(ex.y, ex.z)), tCur);
+      t = tOut + 1e-4;
+      if (t >= tExit) { break; }
+      p = ro + rd * t;
+      var nc = vec3<i32>(floor(p));
+      // Force the crossing on the exit axis: float noise at a shared face can
+      // floor() back into the box just left, which reads as a shadow leak
+      // along box boundaries.
+      if (ex.x <= ex.y && ex.x <= ex.z) {
+        nc.x = select(blkLo.x - 1, blkLo.x + skipEdge, rd.x > 0.0);
+        axis = 0;
+      } else if (ex.y <= ex.z) {
+        nc.y = select(blkLo.y - 1, blkLo.y + skipEdge, rd.y > 0.0);
+        axis = 1;
+      } else {
+        nc.z = select(blkLo.z - 1, blkLo.z + skipEdge, rd.z > 0.0);
+        axis = 2;
+      }
+      if (any(nc < wloI) || any(nc >= wloHi)) { break; }
+      cell = nc;
+      for (var a = 0; a < 3; a++) {
+        let boundary = f32(cell[a]) + select(0.0, 1.0, rd[a] > 0.0);
+        tMax[a] = (boundary - ro[a]) * inv[a];
+      }
+      tCur = t;
+      continue;
+    }
+
+    let w = voxWordAtEntry(cchPt, cell);
+    let mat = voxMat(w);
+    if (mat != MAT_AIR && isRayBlocker((*mats)[mat])) {
+      out.hit = true;
+      out.t = tCur;
+      out.cell = cell;
+      out.axis = axis;
+      out.sgn = select(select(sgn3.x, sgn3.y, axis == 1), sgn3.z, axis == 2);
+      out.word = w;
+      out.steps = steps;
+      return out;
+    }
+
+    if (tMax.x < tMax.y && tMax.x < tMax.z) {
+      cell.x += stepv.x; tCur = tMax.x; tMax.x += tDelta.x; axis = 0;
+    } else if (tMax.y < tMax.z) {
+      cell.y += stepv.y; tCur = tMax.y; tMax.y += tDelta.y; axis = 1;
+    } else {
+      cell.z += stepv.z; tCur = tMax.z; tMax.z += tDelta.z; axis = 2;
+    }
+  }
+  out.steps = steps;
+  return out;
+}
+
+// The coarse-terminate distance every SHADOW-class caller passes to
+// traceOpaque, in FINE VOXELS. One function so the metres->voxels conversion
+// and the "0 disables" convention cannot drift between the resolve pass and
+// sunShadowAt — the two halves of the shadow cache, which --gate shadow-cache
+// asserts agree ray for ray, so a disagreement here would be a gate failure
+// with a very confusing message.
+//
+// 1e30 rather than a bool, because that is the value the compare
+// `tCur > coarseFromT` can never be true for, which is what lets the whole
+// coarse block const-fold away when the knob is 0.
+fn shadowCoarseFromT() -> f32 {
+  return select(TUNE_SHADOW_COARSE_DIST / VOXEL_METERS, 1e30,
+                TUNE_SHADOW_COARSE_DIST <= 0.0);
 }
 
 // The chunk-linear READ: the word at (chunkSlot, localIdx), synthesized when

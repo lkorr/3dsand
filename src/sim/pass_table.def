@@ -388,6 +388,45 @@ PASS(farDown, "farDown", PT_TICK, PIPE_FAR_DOWN, K_INDIRECT, IND_DISPATCHARGS,0,
      USES(R(Voxels) R(Materials) U(TickUBO) U(FarUBO) R(DirtyList) I(DispatchArgs)
           A(FarVox) A(FarOcc) R(PageTable) R(TreeAtlas)))
 
+// ---- phase 5c: the openness (sky-visibility) grid -------------------------
+// docs/PLAN_gi.md §2. RENDER-ONLY DERIVED DATA written on the TICK table, which
+// is the same standing farDown above has and for the same two reasons:
+//
+//   1. Its input is the tick's compacted dirty list. Recorded on the per-FRAME
+//      shadow table it would re-walk the same chunks two or three times per
+//      tick (the sim runs at 30 Hz and the renderer uncapped) for an identical
+//      answer — cost that scales with FRAMERATE, which rule 2 exists to forbid.
+//   2. The COMPUTE -> FRAGMENT hop still gets its barrier: every command buffer
+//      opens with a global memory barrier (barrier_graph §3.4), so a write here
+//      is visible to the frame's raymarch without a per-row edge.
+//
+// AFTER occupancyDirty, not before: this pass marches the 4^3 BLOCKERS mask
+// that occupancyDirty has just rewritten for these very chunks, so running it
+// first would measure last tick's geometry in exactly the chunks that moved.
+// The R(Occupancy) here against occupancyDirty's W(Occupancy) is what the
+// recorder turns into that edge.
+//
+// No W(Voxels), no A(DirtyOut), no A(PageFaults): the kernel writes nothing but
+// its own two buffers and cannot wake a chunk. That is the whole of its claim
+// to being render-only, and it is checkable — `--gate sleep` would notice.
+PASS(opennessDirty, "openness", PT_TICK, PIPE_OPENNESS_DIRTY, K_INDIRECT, IND_DISPATCHARGS,0,0,
+     GRP_SIM, DYN_ZERO, C_OPENNESS, 1,
+     USES(R(Voxels) R(Materials) U(TickUBO) R(Occupancy) R(DirtyList)
+          I(DispatchArgs) R(PageTable) W(Openness) W(OpennessGen)))
+// The rolling refresh: render.opennessChunksPerFrame slots per tick, round
+// robin from a cursor derived from T.tick, so the whole window revisits in
+// kNumChunks / budget ticks. The dirty walk above covers every EDIT; this
+// covers the two things it cannot — the cold start (a slot whose stamp is 0)
+// and a chunk that streamed into a slot whose old bytes are still there.
+//
+// Deliberately NOT conditioned on C_DIRTYTICK: a hash tick takes the whole
+// world occupancy branch and compacts no dirty list, so the row above is
+// skipped, and this one is the only thing keeping the grid alive across it.
+PASS(opennessRefresh, "openness", PT_TICK, PIPE_OPENNESS_REFRESH, K_COMPUTE, D_OPENCHUNKS,1,1,
+     GRP_SIM, DYN_ZERO, C_OPENNESS, 1,
+     USES(R(Voxels) R(Materials) U(TickUBO) R(Occupancy) R(PageTable)
+          W(Openness) W(OpennessGen)))
+
 // (The MLS-MPM spawn row moved into PT_FLUIDSEAM: with settle deleting
 // particles and excite creating them GPU-side, appends go through the seam's
 // compaction-owned count, not a CPU base.)
@@ -484,6 +523,15 @@ PASS(lr_fill_fluidBlockMap, nullptr, PT_LOADRESET, PIPE_NONE, K_FILL, 0,0,0, GRP
      USES(TW(FluidBlockMap)))
 PASS(lr_fill_drawArgs, nullptr, PT_LOADRESET, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE, DYN_NONE, C_ALWAYS, 1,
      USES(TW(DrawArgs)))
+// The openness grid's per-slot STAMPS (world.h kOpenFaces). A load replaces
+// every chunk in the window, so every slot's 384 bytes now describe a world
+// that is gone. Zeroing the stamps is what makes the reader treat them as
+// "unknown" and fall back to the n.y lerp until the refresh walk has been
+// round; the 12 MiB of VALUES need no clear, because no reader looks at a byte
+// whose stamp does not match. C_ALWAYS rather than C_OPENNESS: turning the grid
+// off must not leave stale stamps behind for the moment it is turned back on.
+PASS(lr_fill_opennessGen, nullptr, PT_LOADRESET, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE, DYN_NONE, C_ALWAYS, 1,
+     USES(TW(OpennessGen)))
 PASS(lr_occupancyFull, "occupancyFull(loadReset)", PT_LOADRESET, PIPE_OCCUPANCY, K_COMPUTE, D_CHUNKS,1,1,
      GRP_SIM, DYN_ZERO, C_ALWAYS, 1,
      USES(R(Voxels) R(Materials) U(TickUBO) W(Occupancy) A(Hash) R(PageTable)))

@@ -2347,13 +2347,38 @@ struct Tuning {
     // rather than as a uniform brightening of the whole volume.
     float godRayAniso = 0.62f;
     float godRayRange = 14.0f;      // metres the shaft march covers
-    int godRayShadowSteps = 20;     // steps for the per-sample occlusion ray
+    int godRayShadowSteps = 8;      // BLOCK steps for the per-sample occ ray
+    // Metres past which a shadow-class ray terminates on the 4^3 blocker mask
+    // instead of the voxel (traceOpaque in common.wgsl). 0 = off, and 0 is
+    // also bit-identical to the pre-W2-B tracer by construction.
+    float shadowCoarseDist = 8.0f;
+
+    // ---- the openness (sky-visibility) grid (docs/PLAN_gi.md §2) ----
+    // Per (4^3 block, face) sky visibility, marched over the blockers mask by
+    // sim_openness.wgsl and read by ambientAt / ambientAtP. Render-only: the
+    // sim has no binding for any of it and the world hash cannot move.
+    float opennessReach = 12.0f;        // metres a hemisphere ray looks
+    int opennessChunksPerFrame = 256;   // slots the rolling refresh walks/tick
+    float opennessStrength = 1.0f;      // 0 = old lerp AND the pass unrecorded
+    int opennessBilinear = 1;           // blend the 4 blocks in the face plane
 
     // drifting particulate. Render-only motes suspended in the water, which is
     // what gives the light shafts something visible to catch.
     float siltDensity = 0.55f;
     float siltBrightness = 0.50f;
     float siltDrift = 0.05f;
+
+    // ---- waterfall mist and spray ----
+    // Render-only overlay on a FALLING CA liquid column and on its impact
+    // site, both derived per pixel from the cells under/over a liquid hit
+    // (raymarch.wgsl fallCueAt). No particle, no buffer, nothing hashed.
+    // mistDensity <= 0 removes the whole term at shader-compile time.
+    float mistDensity = 1.0f;
+    float mistBrightness = 0.9f;
+    float mistRadius = 10.0f;     // voxels the veil wraps around the column
+    float mistFallSpeed = 2.2f;   // m/s the vapour field drifts DOWN
+    float sprayDensity = 1.3f;
+    float sprayRadius = 14.0f;    // voxels the impact puff reaches
 
     // how strongly the underside of the surface ripples the view of the sky
     float subSurfaceRipple = 1.6f;
@@ -2523,6 +2548,28 @@ struct Tuning {
     // is the same world distance at every cascade level (a raw step count is
     // not: it scales with the level's cell size — see the comment there).
     float farShadowReach = 60.0f;
+    // Highest cascade level at which the conservative "any blocker" flag
+    // (common.wgsl FAR_BLOCKER_BIT) may terminate a PRIMARY ray. Shadows use
+    // it at every level unconditionally; the visible surface only up to here,
+    // because the flag is set for any cell whose floor reaches the ground, so
+    // honouring it lifts terrain by up to one cell — 0.4 m at level 1, 51 m at
+    // level 8. 0 is the material-only hit test the cascade shipped with.
+    //
+    // DEFAULT 0 IS A MEASURED RESULT, NOT A PLACEHOLDER (13.2.2's kill
+    // criterion, `--shot` pair 2026-09-01). At 2 the visible half genuinely
+    // does what it was built for — a snow patch at 60 m stops being a
+    // dithered smear of half-missing cells and becomes one solid streak, and
+    // the whole 25..205 m slope reads as a ramp instead of a checkerboard —
+    // but the same one-cell lift BURIES the single-cell ground cover standing
+    // on that slope (scrub, flowers, litter simply vanish under the risen
+    // ground), and a cell that hits on the flag alone shades from the nearest
+    // material below it, which paints occasional flat single-colour facets on
+    // an otherwise textured hillside. The distant ridge line is NOT the
+    // casualty: the sky silhouette is pixel-identical at 0 and 2 (levels >= 3
+    // never take the flag), and the change is confined to the bottom 40% of
+    // the frame. Raise it to 2 to see the trade; it is one tuning edit and no
+    // rebuild.
+    int farBlockerHitLevel = 0;
 
     // ---- in-window LOD handoff (PLAN_surface_flight_perf.md A1) ----
     // Distance in METERS past which the PRIMARY march stops resolving fine
@@ -2610,6 +2657,30 @@ struct Tuning {
     int sedSlope = 96, sedMax = 32, sedTopsoil = 4;
     int biomeLog2 = 9;
     int desertThreshold = 214, pineThreshold = 176, meadowThreshold = 92;
+    // ---- per-biome height curves ----
+    // Nine knots per biome on a uniform input grid spanning the coarse
+    // octaves' full swing, +-(contAmplitude + rangeAmplitude)/2, with values in
+    // Q14 over the same range. The default is the IDENTITY, -16384 + i*4096,
+    // which is exactly representable precisely because there are nine knots and
+    // not eight -- see the long note in tuning_params.def. biomeBlend is the
+    // crossfade width in biome-band units.
+    // LoadTuning clamps every knot to +-16384; curveTangent's i32 multiply
+    // depends on that bound. THIRTY-SIX SCALARS and not four arrays:
+    // check_invariants.py requires every tuning_params.def row to name a
+    // plain member, because TuningWgslBlock expands to `t.worldgen.<member>`.
+    int curveForest0 = -16384, curveForest1 = -12288, curveForest2 = -8192,
+        curveForest3 = -4096, curveForest4 = 0, curveForest5 = 4096,
+        curveForest6 = 8192, curveForest7 = 12288, curveForest8 = 16384;
+    int curvePine0 = -16384, curvePine1 = -12288, curvePine2 = -8192,
+        curvePine3 = -4096, curvePine4 = 0, curvePine5 = 4096,
+        curvePine6 = 8192, curvePine7 = 12288, curvePine8 = 16384;
+    int curveMeadow0 = -16384, curveMeadow1 = -12288, curveMeadow2 = -8192,
+        curveMeadow3 = -4096, curveMeadow4 = 0, curveMeadow5 = 4096,
+        curveMeadow6 = 8192, curveMeadow7 = 12288, curveMeadow8 = 16384;
+    int curveDesert0 = -16384, curveDesert1 = -12288, curveDesert2 = -8192,
+        curveDesert3 = -4096, curveDesert4 = 0, curveDesert5 = 4096,
+        curveDesert6 = 8192, curveDesert7 = 12288, curveDesert8 = 16384;
+    int biomeBlend = 18;
     int treeTile = 144;
     int treeChanceForest = 78, treeChancePine = 70;
     int treeChanceMeadow = 22, treeChanceDesert = 6;
@@ -2682,7 +2753,21 @@ struct Tuning {
     // undo the intent of the whole alpine band by being made generous.
     int alpineChance = 40;
     int ruinChance = 5;
+    // Ruin pads: the footprint is flattened to the median of its four corner
+    // column heights and ramped back to the terrain over ruinPadMargin columns;
+    // a site whose corners disagree by more than ruinMaxSlope is refused.
+    // Keep ruinMaxSlope under 2*ruinPadMargin — see the note in
+    // tuning_params.def, the apron's own step is what the angle of repose
+    // bounds.
+    int ruinPadMargin = 20, ruinMaxSlope = 20;
     int caveThreshold1 = 150, caveThreshold2 = 148;
+    // Cave flora: 1-in-N per column on the one cell that is the band's floor
+    // (mushrooms, shallow band) or its floor and ceiling (crystal, deep band),
+    // inside a patch mask. mossFace picks which wall face wears moss --
+    // 0 = -Z, 1 = +X, 2 = +Z, 3 = -X -- because worldgen has no sun and a
+    // shaded face here is a convention, not a measurement.
+    int caveMushroomChance = 26, caveCrystalChance = 9;
+    int mossFace = 0;
     // ---- the authored edit layer (src/sim/worldedit.h) ---------------------
     // Names assets/worldedits/<editLayer>.svedit, the hand-built patch the
     // Worldgen tab's voxel view writes. Applied through the MutationQueue to
@@ -2745,7 +2830,17 @@ void SetCurrentTuning(const Tuning& t);
 // Set a sim.* field by name (e.g. "windDragRef"). Returns false if the name
 // is unknown. For --sweep: lets you test parameter reachability without editing
 // tuning.json. Handles both int and float sim fields.
+// SUPERSEDED by SetTuningField below, and kept only because deleting a
+// 60-row hand-kept table out of tuning.cpp is a merge conflict against
+// every concurrent session for no behavioural gain. It has no callers.
+// Do not add rows to it -- add them to tuning_params.def, which is where
+// SetTuningField reads from and where the WGSL constants come from too.
 bool SetSimField(Tuning& t, const std::string& name, float value);
+// Any group, by the tuning_params.def name. This is what --sweep uses, so a new
+// row is sweepable the moment it exists. Returns false for an unknown group or
+// member, and for TP_V3 rows (a vec3 has no single float to sweep).
+bool SetTuningField(Tuning& t, const std::string& group,
+                    const std::string& name, float value);
 
 // ---- gore: adding to a wound's whole-voxel budget ---------------------------
 // One helper for every site that grows a bleed budget (mob damage, limb carve,

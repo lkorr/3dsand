@@ -86,6 +86,13 @@ fi
 W_SUBDIM=$((W_CHUNK >> W_SUBSHIFT))
 W_SUBSTRIDE=$((W_SUBWORDS * 2))
 
+# Openness grid (world.h kOpenFaces block): its own buffer, so what the
+# shaders need is the face count and the per-chunk WORD stride. Both derive
+# from kSubOccDim in world.h, so redo that arithmetic here rather than parse
+# the expression -- the same treatment kSubOccStride gets above.
+W_OPENFACES=6
+W_OPENWORDS=$(( (W_SUBDIM * W_SUBDIM * W_SUBDIM * W_OPENFACES) / 4 ))
+
 # Shadow cache (world.h kShadowCacheBuckets block). Same treatment as the
 # sub-occupancy pair above: the two SIZES are shifts in world.h precisely so
 # they can be scraped as literals here, with the shift redone rather than the
@@ -252,6 +259,8 @@ PRELUDE_TEXT="$(printf '%s\n' \
   "const SUBOCC_WORDS : u32 = ${W_SUBWORDS}u;" \
   "const SUBOCC_STRIDE : u32 = ${W_SUBSTRIDE}u;" \
   "const SUBOCC_BASE : u32 = $((W_NCHUNK * W_NCHUNK * W_NCHUNK))u;" \
+  "const OPEN_FACES : u32 = ${W_OPENFACES}u;" \
+  "const OPEN_WORDS_PER_CHUNK : u32 = ${W_OPENWORDS}u;" \
   "const WORLD_SHIFT : u32 = ${W_WORLDSHIFT}u;" \
   "const SHADOW_CACHE_AVAILABLE : bool = true;" \
   "const SHADOW_CACHE_BUCKETS : u32 = ${W_SHADOWBUCKETS}u;" \

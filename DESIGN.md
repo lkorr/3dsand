@@ -1568,6 +1568,104 @@ about it are not obvious and both were measured:
 `--sweep worldgen.sedSlope=0,96` a one-invocation proof that the knob reaches
 the kernel.
 
+##### Per-biome height curves (2026-09-01, Lin 13.3.3)
+
+"This biome is flat plains, that one is jagged mountains", authored as nine
+numbers per biome instead of a hand-tuned noise ladder. `biomeCurve` reshapes
+**the coarse sum only** — `o0.dev + o1.dev`, the continental and range rungs
+that decide where the mountains and the basins are — and leaves hill, detail and
+grain alone. A biome changes the *landform*; it never changes the texture on it.
+That is the same split `Land.slope` already makes for the sediment wedge.
+
+* **Nine knots, not eight.** Eight knots is *seven* intervals, so the identity
+  curve's values are `-16384 + i·32768/7` — not integers, so an identity curve
+  could not be authored at all and "the default moves nothing" would be
+  unprovable. Nine knots is eight intervals and the identity is
+  `-16384 + i·4096` exactly, which is what all four biomes default to.
+* **The domain is half what it looks like.** `octave` returns
+  `((n − 8192)·amp) >> 14` and `n − 8192` is ±8192, so one rung spans ±amp/2 and
+  the coarse pair spans ±`(contAmplitude + rangeAmplitude)/2`. Authoring against
+  the full sum would leave the outer knots unreachable at every seed.
+* **The identity is bit-exact, by three separate pieces of arithmetic.** (1) The
+  Hermite basis is summed *before* the shift: `h00+h01` is exactly 4096 and
+  `h10+h11+h01` is exactly `t` in integers, whatever the rounding of t² and t³,
+  so a straight line evaluates to `k0 + t` with no residue. (2) The result is
+  applied as a **delta against the identity**, whose value at the same parameter
+  is exactly `p − 16384`, so the Q14→voxel round trip (a floor, which would bias
+  every column down by one) never happens for an identity curve. (3) `dv/dp` is
+  exactly 4096 for the identity, so the Q8 gradient scale is exactly 256 and
+  `(g·256) >> 8 == g`.
+* **The gradient is scaled, not just the value.** iq's attenuation divides each
+  finer rung by `1 + fbmAtten·|g|²`; if `g` still described the pre-curve ladder
+  then a biome that flattened its landform would keep attenuating its hills as
+  though the mountains were still there. `cv.y` is the curve's own slope in Q8
+  and it multiplies the accumulated gradient.
+* **Interpolation is Fritsch–Carlson** (the harmonic mean of the two secants,
+  zero at a local extremum), so an authored plateau is flat and an authored ramp
+  has no crease. Catmull-Rom would overshoot both, and an overshoot here is a
+  hill nobody put there.
+* **`CURVE_IDENT_ALL` is a module const**, so with the default knots Tint folds
+  the whole feature — including its two extra `vnoise2d` samples — out of the
+  shader. A world that does not use a curve pays nothing for it.
+
+###### The ceiling on how far two biomes may differ
+
+`curveBiomePair` crossfades the two nearest biomes over ±`worldgen.biomeBlend`
+band units, because a hard switch puts a **cliff** along every biome edge: the
+curve reshapes octaves whose amplitude is 100 m. But the crossfade can only be
+as wide as the biome field's own edge, and that is the binding constraint:
+
+| measured (seed 1337) | |
+|---|---|
+| `\|d(band)/dcolumn\|` | mean 0.30, p95 **1**, max **2** |
+| blend at ±18 band units | 36 columns typical, **18 columns worst case** |
+| ⇒ a delta of *D* Q14 units | ramps at `D/25.6/18` voxels per column |
+
+The CA's angle of repose is 1 voxel per column and the world's ambient p99.9
+adjacent step is already 2, so **~900 Q14 units (≈35 voxels) is about the
+ceiling on the difference between two *adjacent* biomes' knots** — which is what
+the shipped defaults use. Non-adjacent pairs are unconstrained: the band order is
+meadow | forest | pine | desert, so meadow and desert never meet.
+
+`biomeBlend` defaults to 18 — the largest the clamp allows, since it is capped at
+half the smallest threshold gap; two boundaries inside one crossfade would
+silently drop a biome from the blend. To go further than the ceiling you have to
+widen the biome field itself (`worldgen.biomeLog2`) or spread the thresholds.
+
+###### The shipped defaults are the identity, and that is a measurement
+
+A set at that ceiling was authored, measured, and **reverted**. It works: over a
+409.6 m map at (4096, 4096), `--heightmap` against the identity arm gives
+
+| biome | curve | columns | relief (sd) identity → curved | mean move |
+|---|---|---:|---|---:|
+| forest | identity | 25,532 | 260.0 → 259.3 | 3.0 vox |
+| meadow | flatter | 26,791 | 236.0 → **219.8** (−6.9%) | 26.6 vox |
+| pine | steeper | 7,660 | 228.5 → **243.2** (+6.4%) | 20.6 vox |
+| desert | lower | 5,553 | 174.1 → 186.7 | 11.9 vox |
+
+(forest's 3.0 voxels is only its neighbours' curves bleeding in across the
+crossfade; the largest single-column move anywhere was 54 voxels.)
+
+**What it also does is break `armor-react`.** That gate plants its acid
+differential at `WindowOrigin + 250` and `+ 262` on *raw procgen ground*, and
+the window is wherever the gates before it left it. With the authored set the
+acid stopped reaching the control creature entirely and the dressed one died:
+
+| both arms, FULL SUITE scope | steel stops acid | dressed | bare | death |
+|---|---|---:|---:|---|
+| identity knots | PASS | 16/6057 | 357 | neither |
+| authored knots | **FAIL** | 5/6057 | **0** | dressed, t17 |
+
+Scope is load-bearing here (CLAUDE.md rule 7): the *same* gate PASSES under
+`--gate armor-react` with the authored set, because the window sits elsewhere.
+
+So the mechanism ships live and authorable and the **default stays neutral**.
+The fix is not a milder curve — any global worldgen default can move that
+ground. It is for that gate to stand on a levelled pad the way the fixture
+columns at (60,60)…(140,140) already do (`onFixturePad`), instead of on whatever
+procgen puts under `WindowOrigin + 250`.
+
 **Tree sizes are metre-true again.** `VOX_PER_M` in `worldgen.wgsl` was a
 hardcoded 16 — correct when a voxel was 6.25 cm, and left behind when `world.h`
 moved to `kVoxelMeters = 0.10`. For that whole interval every tree in the game
@@ -1674,8 +1772,9 @@ empty seven. Save, Bake and Export still act on the first tree.
 
 The CPU mirror is not "roughly the terrain" and it is not "the topmost solid
 voxel". It is the **ground**: the terrain octaves, the authored pool floors and
-rims, the pond bowl carve, and the tarn berm — everything `landColumn()` in
-`worldgen.wgsl` applies to `h`, in that order. Literal topmost-solid would
+rims, the pond bowl carve, the tarn berm, and the **ruin pad** — everything
+`landColumn()` in `worldgen.wgsl` applies to `h`, in that order. Literal
+topmost-solid would
 include canopy, ruin walls, grass tufts and the arena deck, and it cannot be
 mirrored cheaply (it needs `treeAt`'s tile scan in a tick path); every one of
 TerrainHeight's ~30 callers is asking where the ground is so it can stand
@@ -1692,10 +1791,82 @@ Enforcement is threefold and none of it is a comment: `scripts/check_invariants.
 token-compares the `MIRROR-BEGIN noise` / `MIRROR-BEGIN height` blocks in
 `worldgen.wgsl` and `world.cpp`, and compares the `landheight` blocks' authored
 constants; the `terrain` gate's pass C1 compares CPU and GPU **per voxel** over
-9,409 columns of pristine procgen. The cost is ~25 `hash3` per call, which is
-fine at O(1) per frame (spawn placement, fixture anchoring, a mob ground probe)
-and is forbidden in a per-voxel loop — the GPU has `genColumn` for that, hoisted
-once per column.
+9,409 columns of pristine procgen. The cost is ~25 `hash3` per call — and five
+times that on the ~1.5% of columns inside a ruin's pad margin, which sample four
+corner columns as well — which is fine at O(1) per frame (spawn placement,
+fixture anchoring, a mob ground probe) and is forbidden in a per-voxel loop: the
+GPU has `genColumn` for that, hoisted once per column.
+
+###### Ruin pads: the ground yields to the building (2026-09-01, Lin 13.3.2)
+
+A ruin used to be stamped in the **cell** half at `baseHeight(centre)` — the raw
+octave ladder, missing the pond bowl, the pool floors, the berm and the wedge —
+with no gate on how steep its ground was. On a hillside that floated one wall a
+metre in the air and buried the opposite one; beside a tarn it put the floor
+under the water table. The site decision moves into `landColumn`, next to the
+ponds, and splits in three:
+
+* `ruinTileAt` — **one hash3**, the tile's jittered footprint, no height at all.
+  Cheap enough for the tree and ground-cover rules to ask "is this column a ruin
+  floor?" per candidate.
+* `ruinPad` — four `landColumnBare` heights at the footprint corners, **after**
+  pond and pool composition. Pad height is their **median** (mean of the two
+  middle values, floored by an arithmetic shift so both sides agree on
+  negatives). Refused if the spread exceeds `worldgen.ruinMaxSlope`, or if any
+  corner stands in water. Four corners are a *complete* pond test, not a sample:
+  the footprint's half-diagonal is 39 voxels and `pondRadiusMin` is 48, so a
+  disc overlapping the footprint must contain a corner.
+* `landColumn` — flattens the footprint to the pad, zeroes the sediment wedge
+  there, and ramps back to the terrain over `worldgen.ruinPadMargin` columns.
+
+The two knobs are a **pair**: the apron's own column-to-column step is about
+`ruinMaxSlope / (2·ruinPadMargin)` and the angle of repose is 1 voxel per
+column, so `ruinMaxSlope` must stay under twice the margin. `landColumnBare` is
+the split that makes the corner sampling possible — a `landColumn` that called
+itself would not be a function.
+
+A **refused** site still reads as a clearing, because `ruinFloorAt` is the cheap
+predicate and does not know about the refusal. That is the choice: an old
+foundation with nothing standing on it, rather than a hillside carrying a bald
+5.6 m square for no reason.
+
+###### Openness placement (2026-09-01, Lin 13.3.4)
+
+"Place plants by how open the sky is" — but worldgen has **no sun direction**,
+and above ground the only overhangs are trees, whose canopy cover already drives
+`undergrowthSite`. So the feature is what was actually missing, in three parts,
+and each one is a **closed form** — no column march, no neighbour voxel read:
+
+* **A ruin floor is swept.** `Col.ruinFloor` (one `hash3` per column) takes the
+  footprint out of the tall light-loving layer entirely and gives it the shade
+  set's two lowest members instead — moss and leaf litter. It also rejects tree
+  trunks in `treeInfoAt`. Without it the stalk pass grows flower stems through
+  the walls, and a hut standing in hip-high meadow reads as a decal on a field.
+* **Cave flora, from `caveBands`.** The bands give a cavern's floor and ceiling
+  per column in closed form, so "standing on the floor" and "hanging from the
+  ceiling" are comparisons. Mushrooms go on the **shallow** band's floor (the
+  caverns you walk into from a hillside); a new emissive `crystal` material goes
+  on the **deep** band's floor and ceiling, in seams shaped by a patch mask,
+  never within `CAVE_LAVA_MARGIN` of the magma table. Both are inert, so a
+  cavern full of them still generates at rest.
+  <br>**The band is carved from `f1` UPWARD**, so `f1` is the lowest *air* cell
+  and the stone under it is `f1-1`. The plan's `f1+1` would have floated every
+  mushroom one voxel above its own floor — the same bug as the ruin wall.
+* **Moss on a shaded face** of a ruin wall, chosen by `worldgen.mossFace`
+  (0 = −Z, default). Worldgen has no compass, so this is a **convention**, not a
+  measurement, and it says so rather than pretending to derive one. It is a skin
+  swap on a wall cell that already exists — `ruinShellAt` re-evaluated at the
+  neighbour, the same predicate trick the ivy pass uses — and the material is
+  `wet_moss`, **not** the ground `moss_patch`: `moss_patch` is `passable`, and
+  swapping a wall cell for a passable material punches a walkable hole through
+  the building.
+
+**Trunks are out of scope, and the reason is architectural rather than
+budgetary.** A trunk's −Z neighbour lives in a *different column's*
+`TreeCands`, which costs the 25-tile scan; and decorating a baked tree from
+worldgen is the exact divergence the `.svtree` bake exists to end (the tree vine
+and hanging-moss knobs were deleted for it). A trunk that wants moss grows it in
+`treegen.js`.
 
 There used to be a fourth height function, `surfHeightAt`, which hand-copied
 this arithmetic for the far-field skin lookup and had already drifted (it never
@@ -3355,10 +3526,26 @@ world hash.
   churn would dominate. Raymarch the voxel grid directly (DDA through chunks,
   `nonEmpty` flags for empty-space skipping — the same flags the physics uses).
   The sim already lives in GPU memory, so the renderer reads it for free.
-- Pipeline: fullscreen ray pass → G-buffer (albedo/normal/depth/material) →
-  deferred lighting. Voxel face normals from the hit axis; liquids take
-  smoothed normals from the fullness-field gradient instead (see the water
-  section below — implemented).
+- **Pipeline: one fullscreen fragment shader that traces and shades inline.
+  There is no G-buffer and no deferred lighting pass** — `raymarch.wgsl`'s `fs`
+  marches the primary ray and shades the hit in the same invocation, so albedo,
+  normal, depth and material never leave registers. (This bullet described a
+  deferred pipeline that was never built; the cost model that follows from the
+  real one is the reason W2-A exists — a fragment shader's occupancy is set by
+  its worst path, so an inlined secondary-ray tracer is paid by every pixel.)
+  Voxel face normals come from the hit axis; liquids take smoothed normals from
+  the fullness-field gradient instead (see the water section below).
+- **One `trace()` and one `traceOpaque()` (2026-09-01, W2-A).** The 26-field
+  media-aware `trace()` in `raymarch.wgsl` has exactly one call site: the
+  primary camera ray. Every SECONDARY ray — the shadow resolve pass, the
+  cache-off `sunShadowAt` fallback, `traceReflection`, `traceRefraction`, the
+  god-ray occlusion test — casts `traceOpaque()` in `common.wgsl`, a media-blind
+  DDA returning `{hit, t, cell, axis, sgn, word}`, which is the 6 fields those
+  callers actually read. `--render-budget` priced the difference: gating the
+  reflection at runtime saved 0.09 ms, const-folding it away saved 3.58 ms, so
+  the cost was never traversal — it was the register footprint of the inlined
+  copy. `--selftest --gate shadow-cache` asserts the compute-stage and
+  fragment-stage casts still agree.
 - Variant nibble → palette jitter in-shader (stable per-grain color, no reshuffling
   as grains move — exactly why the variant lives in the voxel).
 - Rigidbodies/debris: two options. v1 = raster their marching-cubes meshes,
@@ -3369,8 +3556,8 @@ world hash.
   path. Adopt once bodies carry their voxel payloads (M6).
 - **Far-field cascades (implemented 2026-08-19; docs/PLAN_far_field_cascades.md):**
   view distance beyond the residency window comes from kFarLevels nested
-  toroidal kFarN³ (512³ since 2026-08-29; was 256³) volumes centered on the player, one material byte per
-  cell. The far grid is DECOUPLED from the window size (phase 5, when the
+  toroidal kFarN³ (512³ since 2026-08-29; was 256³) volumes centered on the player, one byte per
+  cell (7 bits of material id + 1 conservative blocker flag; see below). The far grid is DECOUPLED from the window size (phase 5, when the
   window went 512³): level k cells span 2^(k + kFarShiftBase) fine voxels with
   the shift base chosen so level k's box edge is always 2^k WINDOW edges —
   cascade distances scale with the window at constant memory (1024 MiB total at
@@ -3498,6 +3685,31 @@ world hash.
   aerial perspective: `applyAerial` converges surfaces exactly to
   `skyColor(rd)` (the old ×0.9 target left everything hanging slightly darker
   than the sky it should dissolve into, which read as a gray veil).
+  **The far cell byte is 7 + 1, not 8 (13.2.2, 2026-09-01):** bit 7 of every
+  far cell is a CONSERVATIVE BLOCKER FLAG — "pristine worldgen puts something a
+  ray would stop on somewhere inside this cell's fine footprint" — and the
+  material id lives in the low seven (`FAR_MAT_MASK` / `FAR_BLOCKER_BIT`,
+  common.wgsl; every reader masks). The id fits because there are 117
+  materials, and it KEEPS fitting because `LoadMaterials` refuses a table past
+  128 entries and `check_invariants.py` refuses a materials.json that would
+  grow one; nothing else in the engine would notice, since a 129th material
+  would merely paint the wrong colour at distance and claim a blocker wherever
+  bit 7 landed. The flag is a pure function of (coords, seed)
+  (`farBlockerBitAt` in worldgen.wgsl) for the same reason `farSurfaceMat` is:
+  the sieve has no live grid, so a flag derived from real voxels in the
+  downsample would disagree with it at their shared boundary. Its cost is one
+  comparison for all but ONE cell per column — the surface band, where the four
+  corner columns are sampled — and its blind spot is edits, which reach the far
+  field only through the material byte. `farShadowed` treats it as a blocker at
+  every level; a primary ray only up to `render.farBlockerHitLevel`, which
+  ships at **0**. That default is a measured kill-criterion result, not
+  timidity: at 2 the visible half does what it was built for (the half of every
+  surface cell whose centre sampled air comes back, so a 60 m snow patch stops
+  being a dithered smear) but the same one-cell lift buries the single-cell
+  ground cover standing on that slope and paints flat facets where a cell hits
+  on the flag alone. The distant ridge is not the casualty — the sky silhouette
+  is pixel-identical at 0 and 2, because levels ≥ 3 never take the flag.
+
   **Transition polish (phase 3):** each handoff — the window→level-1 one and
   every level→level one — is pulled NEARER by a per-pixel hash of the fragment
   coordinate, up to half a cell of the outer level at that seam
@@ -3984,8 +4196,128 @@ untouched: the pool, the model table and the draw list are bound to the
 microbody pipeline and to nothing else, and `--selftest` reports an unchanged
 world hash with a scale-2 critter walking through the scene.
 
-- Later: emissive materials feeding a cheap GI (light propagation volumes or
-  per-chunk flood lighting), volumetrics for gases.
+
+### 9.x The openness grid — the ambient's only spatial term (added 2026-09-02)
+
+Plan of record: **`docs/PLAN_gi.md`** §2 (phase P0 of indirect light). This is
+the binding summary.
+
+**The problem.** `ambientAt(n)` (raymarch.wgsl) and its raster twin
+`ambientAtP` (common.wgsl) are a hemisphere lerp on `n.y` between
+`TUNE_AMB_GROUND` and `TUNE_AMB_SKY`. Pure functions of the NORMAL: no term in
+either knows where the receiver is. So a cave floor was lit exactly as brightly
+as a meadow, a room exactly as brightly as the field outside its door, and
+`voxelAO`'s three in-plane taps cannot see a ceiling 3 m up. It was also the
+reason a large flat single-material face — a wall, a table top, bare dirt —
+rendered as a dead-uniform polygon with one hard edge and no gradient
+(`PLAN_gi.md` §0's look test).
+
+**The data.** `openness`: one BYTE per (chunk SLOT, 4³ sub-occupancy block,
+face) = `kNumChunks × 64 × 6` = 12 MiB, plus `opennessGen`, one word per slot
+(128 KiB). Byte index `((slot * blocks + block) * 6 + face)`, viewed through an
+`array<u32>`. The value is the unblocked fraction of that face's hemisphere
+within `render.opennessReach` metres.
+
+Six values per block, not one, because this world is full of one-voxel walls,
+floors and trunks and a scalar would average a wall's lit side with its dark
+one. A receiver reads only the face that faces it, keyed on the same
+`face = axis*2 + (sgn > 0)` the shadow cache uses.
+
+Render-only derived data, with exactly the standing of `shadowCache` and the
+far-field cascades: **never hashed, never saved, never read by the sim**, and
+`determinismHash` unmoved is P0's cheapest correctness proof.
+
+**The writer** is `sim_openness.wgsl`, two `pass_table.def` rows on the TICK
+table — `opennessDirty` (indirect over the tick's compacted dirty list,
+immediately after `occupancyDirty` so the mask it marches is the one that tick
+rewrote) and `opennessRefresh` (a flat `render.opennessChunksPerFrame` slots per
+tick, round robin from a cursor derived from `T.tick`). One workgroup per chunk,
+`OPEN_WORDS_PER_CHUNK` threads, one whole u32 per thread — four consecutive
+(block, face) pairs, computed and stored with a plain store, because 6 bytes per
+block does not divide a word and a thread per (block, face) would be a
+read-modify-write race.
+
+The march is **`traceOpaque` in coarse mode from t = 0**, i.e. the existing
+media-blind DDA stepping 4³ blocks over the blockers-class sub-occupancy mask.
+Not a new DDA: two block-steppers that must agree is the bug `common.wgsl`'s
+tracer block exists to prevent. Five directions per face (the normal, weighted
+double, plus four at 45° toward the tangents), so a face's value is
+`unblocked / 6`.
+
+**Why it is on the tick table and not the per-frame shadow table.** Its input is
+the tick's dirty list; recorded per frame it would re-walk the same chunks two
+or three times per tick for an identical answer, i.e. cost that scales with
+FRAMERATE. The compute → fragment hop still gets its barrier, from the global
+memory barrier every command buffer opens with (`vulkan_barrier_graph.md` §3.4).
+
+**Staleness has two clocks and both are one-sided toward the old look.**
+`opennessGen[slot]` holds a hash of the WORLD CHUNK COORD the bytes were
+computed for; the window is toroidal, so a slot is silently reused as it walks,
+and a reader whose stamp does not match falls back to the plain `n.y` lerp. And
+an edit only dirties the chunks it WRITES: a roof stamped 1.4 m above a floor
+does not re-walk the floor, which darkens when the rolling refresh reaches it
+(`kNumChunks / render.opennessChunksPerFrame` ticks). Dilating the dirty list
+instead is not available — a 12 m reach dilates to a 15³ chunk neighbourhood.
+
+**The readers.** `ambientAt`'s near-field terrain hit multiplies the hemisphere
+ambient by `opennessScale(opennessAt(...))`, alongside `ao` and never the sun
+(the sun has its own shadow ray). Far-cascade hits keep the plain lerp — the
+grid is keyed on residency slots and a cascade hit is outside the window by
+definition. Micro hits sample the cell BELOW with the +Y face, because a grass
+tuft is not a ray blocker and its own block has no entry. `microbody.wgsl` uses
+`opennessScaleAtBody`, which walks down at most six blocks to the ground the
+body stands on and takes that surface's value: a body is not in the voxel grid,
+so its own block would read "open sky" and a mob would glow in a cave. The
+sample is bilinear over the four blocks in the FACE PLANE; nearest-only tiles
+visibly at 40 cm blocks in the middle of a smooth wall.
+
+**A MULTIPLY, not `mix(ambGround, ambSky, openness)`.** The mix form makes a
+fully enclosed surface read as `TUNE_AMB_GROUND`, which is what a downward-facing
+surface already gets in open daylight — so a cave floor would come out exactly
+as bright as the underside of an outdoor overhang, and it throws away the `n.y`
+shape cue entirely. Multiplying keeps hue and shape, makes enclosure actually
+darken, and leaves a fully open face BIT-IDENTICAL to the pre-P0 image.
+
+**The resolution trap, and the rule that came out of it.** A face whose
+neighbouring block already holds a blocker skips the march — but it writes
+"no opinion" (255), NOT "fully enclosed" (0). At 40 cm blocks over 10 cm voxels
+the mask cannot tell "buried inside rock" from "there is a one-voxel terrace
+step in front of me", and this terrain is a staircase of one-voxel steps.
+Writing 0 painted every riser on every hillside hard black — measured on the
+tall-grass shot, mean luminance −12.5/255 with 43% of pixels moved, which is
+precisely the banding `wrapDiffuse` exists to remove. With 255 the same shot
+moves −1.2 with 17% of pixels, and nothing P0 exists to darken is lost: a cave
+floor, a room floor and the ground under an overhang all have AIR in the block
+in front of them, so they march. **The conservative direction for a lighting
+grid is the one that never darkens something wrongly.**
+
+**Knobs** (`render.*`): `opennessReach` (12 m), `opennessChunksPerFrame` (256
+slots/tick), `opennessStrength` (1.0 — and 0 is an EXACT off switch on both
+halves: it const-folds the reader and makes `C_OPENNESS` false so neither row is
+recorded), `opennessBilinear` (1).
+
+**Cost**, RTX 3060 Ti, 1080p, 2026-09-02. The compute pass, from `--perf`'s
+`openness` node: p50 0.015 ms idle, 0.008 ms flying (streaming does not light it
+up), 0.19–0.30 ms under explosions / water / a burning canopy. The per-hit read
+in the raymarch, from `--render-budget`'s `noopenness` arm at noon: 0.89 ms of a
+12.25 ms baseline (7.3%) — the reads dominate the pass by an order of magnitude,
+and `render.opennessBilinear = 0` is the lever if that ever needs to come down.
+
+**Verified by** `--selftest --gate openness`: the +Y face of the ground under a
+45×45 stone slab 1.4 m up reads 0.00 (bound 0.30) while the slab's own top face
+reads 1.00 (bound 0.75), and both slots' stamps match `sandvox::OpennessStamp`
+computed on the CPU — which is what keeps that hash and `common.wgsl`'s
+`opennessStamp` from drifting. Thresholds live in `tests/baseline.json`.
+
+**What P0 does not do.** There is no bounce: a sealed room goes to zero ambient
+and stays there, which is honest for a sky-visibility term and is what P1's
+one-bounce gather is for. Debris cubes and sprites (`debris.wgsl`) still shade
+with the plain lerp — they light per VERTEX, and reaching the grid from a vertex
+shader would mean widening `occupancy`'s stage mask for a per-cube ambient.
+
+- Later: P1 (direct injection + one-bounce gather), P2 (write-back), P3
+  (emissives, deleting `heatSpill`) — all in `docs/PLAN_gi.md`. Volumetrics for
+  gases.
 
 ## 9b. Wind (added 2026-08-25)
 
@@ -5570,10 +5902,47 @@ risk: cover blocks and `treeInfoAt` chances first (outside every mirror), then
 `biomeAt` reading a table, then pond geometry last (it needs a C++ twin of the
 table under the mirror's token compare).
 
+### The swatch is a scale ladder, composed off the main thread (2026-09-01)
+
+The biome page's swatch runs from 16 m to 128 m on a side. Up to 32 m it is
+1:1 with the engine (10 vpm). Past that it does NOT get a bigger grid: it
+bakes COARSER, at the finest INTEGER vpm that keeps the side inside
+`MAX_SWATCH` = 384 cells (`biomegen.swatchScale`: 8 vpm at 48 m, 6 at 64,
+4 at 96, 3 at 128), and the viewer draws the one region at `lod = 10 / vpm`
+so it lands in world metres. The reason is the dense volume: a swatch is one
+`nx*ny*nz` Uint16 array copied twice more on the way to the screen (the
+viewer's cells, the mesher's lent copy) and once into a 3D texture, and a
+96 m forest at 10 vpm would be 16x the 24 m swatch's 32 MB per copy — over
+2 GB in flight before the mesher ran. Integer vpm because treegen bakes at
+integer vpm only, so every species goes through the real generator at the
+ground's scale and the composition stays exact rather than resampled; the
+tree cache is keyed on vpm, so the first swatch at a new scale bakes every
+species it places (seconds), reported as progress, and later ones do not.
+
+Composition runs in `assets/editor/swatch_worker.js`, a module worker that
+owns the libraries and the tree cache and returns the cells as one
+transferred buffer already remapped to engine material ids
+(`biomegen.remapToMaterials`). One request in flight; a request made while
+one runs waits as the single queued one, so a slider drag costs at most one
+extra compose and the page never stops answering. If the worker cannot be
+built the page composes inline as it did before.
+
+The viewer side is `worldview.js`'s greedy mesher, rewritten the same day:
+occupancy through a 4096-entry LUT built once per palette, both draw layers
+in one sweep, each plane read from the volume once (the x and y sweeps are
+strided gathers), the merge bounded to the rows and columns that hold a
+face, quads into growable typed arrays. Byte-identical quads to the first
+mesher, with and without neighbour slabs, at 5–6x the speed (a 16M-cell
+swatch: 2.2–3.6 s → ~0.45 s). Vertex positions are Uint16 now; the first
+mesher packed them as bytes, which folded every region past 255 cells on a
+side back over itself — the 320-cell 32 m swatch and any water body wider
+than 25 m drew wrong, with no error anywhere.
+
 ### Verify
 
 `node scripts/test_environment.mjs` (data: determinism of both generators,
-preset sanity, biome validity, the species mirror, the swatch),
+preset sanity, biome validity, the species mirror, the swatch, the scale
+ladder and the in-place remap),
 `bash scripts/check_environment.sh` (the tab in real Chrome: mount, sidebar,
 three pages, WebGL meshing, framebuffer, plan/profile canvases, undo, deep
 links, save routes), `--selftest --gate biomes` (the engine's side),

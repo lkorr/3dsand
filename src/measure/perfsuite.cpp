@@ -1400,6 +1400,45 @@ uint32_t FindNoonTick(const Tuning& tun) {
   return best;
 }
 
+// The tick whose sun sits at a GIVEN elevation — the same scan, for the
+// cameras that are not noon. No closed form, for the same reason FindNoonTick
+// has none: cycleMinutes is a tuning value, so any constant written here
+// becomes the wrong time of day the first time somebody moves it.
+//
+// PREFER THE DESCENDING SIDE. Every elevation below the peak is reached twice
+// a day, once climbing and once falling, and for a render budget the two are
+// not interchangeable: which side of the terrain is lit — and therefore which
+// pixels pass `lambert > 0.0` and cast the shadow ray that is the largest row
+// in this table — is opposite. A camera labelled `dusk` that measured dawn
+// would be a quiet lie, so the scan keeps the best match found while the sun is
+// FALLING and only falls back to the best match overall if the sun never
+// descends through that elevation at all.
+uint32_t FindTickAtElevation(const Tuning& tun, float sinElev) {
+  uint32_t bestAny = 0, bestDesc = 0;
+  float errAny = 1e9f, errDesc = 1e9f;
+  bool haveDesc = false;
+  float prev = ComputeSky(tun, 0.0).sunDir[1];
+  for (uint32_t t = 64; t < 200000u; t += 64u) {
+    const float up = ComputeSky(tun, (double)t).sunDir[1];
+    const float err = std::fabs(up - sinElev);
+    if (err < errAny) { errAny = err; bestAny = t; }
+    if (up < prev && err < errDesc) {
+      errDesc = err;
+      bestDesc = t;
+      haveDesc = true;
+    }
+    prev = up;
+  }
+  return haveDesc ? bestDesc : bestAny;
+}
+
+// Sun elevation for the `dusk` camera: 8 degrees above the horizon. Low enough
+// that the terrain is raked and the shadows are long — the expensive lighting
+// condition this camera exists to measure — and still above the 5-degree
+// (`keyLightDir().y < 0.08`) gate that switches the key light off entirely, so
+// the shadow ray is still being cast on the pixels that pay for it.
+constexpr float kDuskSinElev = 0.1392f;  // sin(8 deg)
+
 struct RenderArm {
   const char* id;
   const char* label;      // what moved, in the units the knob is written in
@@ -1498,6 +1537,16 @@ const RenderArm kRenderArms[] = {
     {"cachesub2", "shadow patch subdiv 4 -> 2",
      [](Tuning& t) { t.render.shadowCacheSubdiv = 2; }, true, 1,
      "the same, at the midpoint"},
+    // ---- the openness (sky-visibility) grid (docs/PLAN_gi.md §2) ----
+    // THE A/B FOR THE WHOLE FEATURE, and it is an exact off switch on both
+    // halves: render.opennessStrength = 0 const-folds opennessScale() to 1.0 in
+    // the fragment shader AND makes C_OPENNESS false, so neither the dirty walk
+    // nor the rolling refresh is recorded. baseline - noopenness is therefore
+    // the pass plus the reads, in one number, on one world.
+    {"noopenness", "openness grid off (pass unrecorded + reads const-folded)",
+     [](Tuning& t) { t.render.opennessStrength = 0.0f; }, true, 1,
+     "the whole openness grid: the compute pass that builds it AND the "
+     "per-hit bilinear read in the raymarch"},
     {"shadow32", "shadowSteps 384 -> 32",
      [](Tuning& t) { t.render.shadowSteps = 32; }, true, 1,
      "shadow march past 32 steps"},
@@ -1510,6 +1559,168 @@ const RenderArm kRenderArms[] = {
 };
 constexpr int kRenderArmCount =
     (int)(sizeof(kRenderArms) / sizeof(kRenderArms[0]));
+
+// ---- arms that only one camera runs ---------------------------------------
+// Deliberately NOT rows of kRenderArms. Two reasons, and the second is the one
+// that matters:
+//
+//   1. The `noon` table stays exactly the 16 rows it has always had, so every
+//      number in this repo's history stays comparable row for row.
+//   2. God rays are shading INSIDE a liquid (`shadeSubmerged`, gated on
+//      `h.liqT < 0.05`). On the overlook — on any camera in air — not one god
+//      ray is cast, so both of these arms would land on the baseline and print
+//      two 0.00 ms rows that read exactly like a measured result saying the
+//      feature is free. An arm that cannot fire on a camera does not belong in
+//      that camera's table.
+const RenderArm kExtraArms[] = {
+    {"nogodray", "godRaySteps 14 -> 0",
+     [](Tuning& t) { t.render.godRaySteps = 0; }, true, 1,
+     "the whole underwater god-ray march — 14 steps, each with its own shadow "
+     "ray and its own waterAbove walk"},
+    {"godshadow0", "godRayShadowSteps 20 -> 0",
+     [](Tuning& t) { t.render.godRayShadowSteps = 0; }, true, 1,
+     "ONLY the shadow ray cast at each god-ray step; the shafts still march, "
+     "so nogodray minus this is the marching itself"},
+};
+constexpr int kExtraArmCount =
+    (int)(sizeof(kExtraArms) / sizeof(kExtraArms[0]));
+
+const RenderArm* FindArm(const char* id) {
+  for (const RenderArm& a : kRenderArms)
+    if (std::strcmp(a.id, id) == 0) return &a;
+  for (const RenderArm& a : kExtraArms)
+    if (std::strcmp(a.id, id) == 0) return &a;
+  return nullptr;
+}
+
+// ---------------------------------------------------------------------------
+// THE CAMERAS.
+//
+// One camera was one camera too few. Every row of the arm table is a property
+// of ONE PICTURE, and the picture the budget was taken from — noon, on a hill,
+// looking out — is the cheapest lighting condition the game has: the sun is
+// overhead so shadow rays are short, nothing is submerged so no god ray, no
+// caustic and no Snell's window is ever evaluated, and the frame is a third
+// sky. Optimising against that budget optimises the easy case.
+//
+// So three: the original (kept byte-for-byte, because its history is the only
+// baseline that exists), a low sun, and an eye INSIDE the lake.
+//
+// WHY THE EXTRA CAMERAS RUN FEWER ARMS. A full 16-arm pass is 16 shader
+// reloads plus 16 x 60 frames, and most of those rows answer a question that
+// does not change with the camera (shadow0 vs noshadow is a footprint claim
+// about the compiled shader, not about the view). The five kept — baseline,
+// noshadow, nofar, noreflect, halfres — are the ones whose answer is a
+// property of the PICTURE, which is exactly what a second picture is for.
+// ---------------------------------------------------------------------------
+struct BudgetCam {
+  const char* id;
+  const char* label;
+  // Fills eye/cam/note and the celestial tick the sky is derived from.
+  // false + `why` = this camera cannot be set up here; the run says so and
+  // carries on with the others rather than failing the whole table.
+  bool (*setup)(Scene& s, uint32_t& tick, std::string& why);
+  // nullptr-terminated list of arm ids; nullptr = every row of kRenderArms.
+  const char* const* arms;
+};
+
+// THE OVERLOOK. High enough to clear the terrain it stands on, pitched down far
+// enough that the frame is roughly a third near ground, a third middle distance
+// and a third horizon-and-sky. That mix is the point: it exercises the fine
+// march, the in-window LOD handoff, the far cascade and the sky path in one
+// frame, in something like the proportion a player standing on a hillside sees.
+// A camera that sees only one of those reports a budget for one of those.
+//
+// These five numbers are FROZEN. They are the camera every --render-budget
+// number ever recorded was taken from; changing them does not improve the
+// camera, it deletes the comparison.
+void OverlookEye(Scene& s) {
+  const int gx = 256, gz = 256;
+  const int h = World::TerrainHeight(gx, gz, kDefaultSeed);
+  s.eye = {(float)gx, (float)(h + 120), (float)gz};
+  s.cam.yaw = 0.785f;
+  s.cam.pitch = -0.32f;
+}
+
+bool CamNoon(Scene& s, uint32_t& tick, std::string& why) {
+  (void)why;
+  OverlookEye(s);
+  s.note = "overlook: 12 m up, pitched into the middle distance";
+  tick = FindNoonTick(CurrentTuning());
+  return true;
+}
+
+bool CamDusk(Scene& s, uint32_t& tick, std::string& why) {
+  (void)why;
+  OverlookEye(s);
+  s.note = "the SAME overlook, sun ~8 deg up: long shadow rays, raked terrain";
+  tick = FindTickAtElevation(CurrentTuning(), kDuskSinElev);
+  return true;
+}
+
+// INSIDE the lake. `shadeSubmerged` — god rays, silt, the caustic web on the
+// bed, Snell's window at the underside of the surface — is reached by exactly
+// one predicate in the whole renderer (`raymarch.wgsl`, `h.liqT < 0.05`), and
+// the only way to reach it is to put the eye in the liquid. There is no
+// RenderParams medium field to set and nothing to toggle: the camera position
+// IS the switch.
+//
+// The pool must be INSIDE THE RESIDENCY WINDOW. Outside it a liquid shades
+// through the far-field cascade as flat colour with no submerged path at all
+// (main.cpp's oil shots relocate the window for exactly this reason), so the
+// budget would be of a grey slab. Hence the CellInWindow test, and hence the
+// authored lake rather than a generated tarn: pondInfo() refuses to place a
+// tarn anywhere in -128..640, which is precisely the window this harness runs.
+bool CamSubmerged(Scene& s, uint32_t& tick, std::string& why) {
+  World::AuthoredPool pools[World::kAuthoredPools];
+  World::AuthoredPoolList(pools);
+  for (const World::AuthoredPool& p : pools) {
+    if (std::strcmp(p.mat, "water") != 0) continue;
+    // Mid-column: bed below, surface above, both inside the submerged path's
+    // reach. An eye near the floor sees no Snell window; one near the surface
+    // sees no caustics.
+    const int ey = (p.floorY + p.waterY) / 2;
+    if (!s.world.CellInWindow({p.cx, ey, p.cz})) continue;
+    s.eye = {(float)p.cx, (float)ey, (float)p.cz};
+    s.cam.yaw = 0.0f;    // +x — Camera::Forward is (cos yaw, sin pitch, sin yaw)
+    s.cam.pitch = 0.0f;  // level: the far bank ahead, bed below, surface above
+    char note[256];
+    std::snprintf(note, sizeof note,
+                  "INSIDE the authored lake: disc r=%d at (%d,%d), floor y=%d, "
+                  "surface y=%d, eye y=%d — %d voxels of water overhead, "
+                  "looking level toward the +x shore",
+                  p.r, p.cx, p.cz, p.floorY, p.waterY, ey, p.waterY - ey);
+    s.note = note;
+    tick = FindNoonTick(CurrentTuning());  // god rays need the sun up
+    return true;
+  }
+  why = "no authored water pool with its mid-column inside the residency "
+        "window. There is no generated-pond fallback on purpose: pondInfo() "
+        "excludes tarns from the -128..640 authored origin region this harness "
+        "runs in, and PondDisc carries no floor height, so a fallback here "
+        "could neither fire nor pick a depth";
+  return false;
+}
+
+const char* const kArmsReduced[] = {
+    "baseline", "noshadow", "nofar", "noreflect", "halfres", nullptr};
+const char* const kArmsSubmerged[] = {
+    "baseline", "noshadow", "nofar",       "noreflect",
+    "halfres",  "nogodray", "godshadow0",  nullptr};
+
+const BudgetCam kBudgetCams[] = {
+    {"noon",
+     "the overlook at the sun's highest — the easy case, and the only one with "
+     "history behind it",
+     CamNoon, nullptr},
+    {"dusk", "the same overlook with the sun ~8 deg above the horizon",
+     CamDusk, kArmsReduced},
+    {"submerged",
+     "eye inside the authored lake — god rays, caustics, Snell's window",
+     CamSubmerged, kArmsSubmerged},
+};
+constexpr int kBudgetCamCount =
+    (int)(sizeof(kBudgetCams) / sizeof(kBudgetCams[0]));
 
 // One arm's measured result.
 struct ArmResult {
@@ -1559,10 +1770,23 @@ class RenderBudgetRunner {
 
     // Apply the arm to a COPY of the baseline, then take the F5 path so the
     // TUNE_* constants are re-const-folded into the shader.
+    //
+    // AN ARM WITH NO TUNING MUTATION STILL NEEDS THE RELOAD, if the arm before
+    // it had one. `SetCurrentTuning` moves the C++ struct; only ReloadShaders
+    // re-const-folds the TUNE_* values into the compiled shader. `halfres` and
+    // `noshadow` mutate nothing, so the old code skipped the reload for
+    // them — and `halfres` is the LAST row of kRenderArms, immediately after
+    // `shadow32`. Every `halfres` number this harness has ever printed was
+    // therefore measured at half resolution AND shadowSteps=32, i.e. against a
+    // baseline it does not share, which is precisely the confound the "one knob
+    // moved per arm" design exists to prevent. `dirty_` is the fix: the shader
+    // is reloaded whenever the constants it was built from are stale, and not
+    // otherwise.
     Tuning t = base;
     if (arm.apply) {
       arm.apply(t);
       SetCurrentTuning(t);
+      dirty_ = true;
       if (!sim_.ReloadShaders(ctx_.device)) {
         SetCurrentTuning(base);
         sim_.ReloadShaders(ctx_.device);
@@ -1571,6 +1795,10 @@ class RenderBudgetRunner {
       }
     } else {
       SetCurrentTuning(t);
+      if (dirty_) {
+        sim_.ReloadShaders(ctx_.device);
+        dirty_ = false;
+      }
     }
 
     const uint32_t d = arm.widthDiv;
@@ -1592,7 +1820,7 @@ class RenderBudgetRunner {
       // actually played in.
       WriteRenderParams(ctx_.queue, world_, s.eye, s.cam, (float)W / (float)H,
                         arm.shadows, kBudgetAnimTime, kFarFogDensity, (float)H,
-                        noonTick_, s.fluidLive);
+                        skyTick_, s.fluidLive);
       rhi::CommandEncoder enc = ctx_.device.CreateCommandEncoder();
       uint32_t rb = 0, re = 0;
       const bool timed = timer_.AllocPassPair("render", rb, re);
@@ -1650,11 +1878,24 @@ class RenderBudgetRunner {
   //
   // Own encoder, submitted after the render has retired: a copy folded into the
   // render encoder reads back zeros.
-  void Shot(const Scene& s, const char* path) {
+  // Put the baseline tuning back and rebuild the shaders from it. Called
+  // between cameras and at the end of the run, so no arm's constants leak into
+  // the shot, the next camera, or a later harness in the same process.
+  void RestoreBase(const Tuning& base) {
+    SetCurrentTuning(base);
+    sim_.ReloadShaders(ctx_.device);
+    dirty_ = false;
+  }
+
+  // `alsoPath`, when given, gets the identical pixels under a second name. That
+  // exists for exactly one reason: `build/render_budget.bmp` is the path
+  // everything downstream already knows, and the noon camera has to keep
+  // writing it even though it now also writes render_budget_noon.bmp.
+  void Shot(const Scene& s, const char* path, const char* alsoPath = nullptr) {
     const uint32_t W = opt_.width, H = opt_.height;
     WriteRenderParams(ctx_.queue, world_, s.eye, s.cam, (float)W / (float)H,
                       /*shadows=*/true, kBudgetAnimTime, kFarFogDensity,
-                      (float)H, noonTick_, s.fluidLive);
+                      (float)H, skyTick_, s.fluidLive);
     rhi::CommandEncoder enc = ctx_.device.CreateCommandEncoder();
     {
       rhi::RenderPass rp = sim_.BeginRenderPass(
@@ -1689,6 +1930,8 @@ class RenderBudgetRunner {
                   (unsigned long long)sum,
                   sum == 0 ? " *** ALL BLACK — the table above is not of "
                              "anything ***" : "");
+    if (alsoPath && WriteBmpFile(alsoPath, px, W, H))
+      std::printf("  the same frame also written to %s\n", alsoPath);
   }
 
  private:
@@ -1702,10 +1945,15 @@ class RenderBudgetRunner {
   rhi::Texture tex_[2];
   rhi::TextureView view_[2];
   FramePacer pacer_;
+  // True when the shaders currently compiled were built from a MUTATED tuning,
+  // so the next arm that mutates nothing still has to reload. See Measure.
+  bool dirty_ = false;
  public:
-  // Fixed across every arm: the frame each arm renders must be the SAME frame,
-  // and this is the tick the sky is derived from.
-  uint32_t noonTick_ = 0;
+  // The celestial tick the sky is derived from. Fixed across every arm of a
+  // camera — the frame each arm renders must be the SAME frame — and set per
+  // CAMERA, which is how `dusk` is a different lighting condition rather than a
+  // different viewpoint.
+  uint32_t skyTick_ = 0;
 };
 
 }  // namespace
@@ -1775,83 +2023,79 @@ int RunRenderBudget(GpuContext& ctx, World& world, Simulation& sim,
   }
   runner.SettleWorld();
 
-  Scene scene{ctx, world, sim, stream, mats};
-  if (pick) {
-    std::string why;
-    if (!pick->setup(scene, why)) {
-      std::fprintf(stderr, "--render-budget: scenario '%s' declined: %s\n",
-                   pick->id, why.c_str());
-      return 1;
+  // Which cameras. `--scenario <id>` keeps its old meaning exactly — one
+  // camera, borrowed from a --perf scenario, all 16 arms — and bypasses the
+  // camera table entirely. Otherwise `--budget-cams a,b,c` selects from
+  // kBudgetCams; empty selects all three.
+  std::vector<const BudgetCam*> cams;
+  if (!pick) {
+    if (opt.cams.empty()) {
+      for (const BudgetCam& c : kBudgetCams) cams.push_back(&c);
+    } else {
+      std::string tok;
+      std::string src = opt.cams + ",";
+      for (char ch : src) {
+        if (ch != ',') { tok += ch; continue; }
+        if (tok.empty()) continue;
+        const BudgetCam* f = nullptr;
+        for (const BudgetCam& c : kBudgetCams)
+          if (tok == c.id) { f = &c; break; }
+        if (!f) {
+          std::fprintf(stderr,
+                       "--budget-cams: no camera named '%s'. Known: ",
+                       tok.c_str());
+          for (const BudgetCam& c : kBudgetCams)
+            std::fprintf(stderr, "%s ", c.id);
+          std::fprintf(stderr, "\n");
+          return 1;
+        }
+        cams.push_back(f);
+        tok.clear();
+      }
     }
-  } else {
-    // THE OVERLOOK. High enough to clear the terrain it stands on, pitched down
-    // far enough that the frame is roughly a third near ground, a third middle
-    // distance and a third horizon-and-sky. That mix is the point: it exercises
-    // the fine march, the in-window LOD handoff, the far cascade and the sky
-    // path in one frame, in something like the proportion a player standing on
-    // a hillside sees. A camera that sees only one of those reports a budget
-    // for one of those.
-    const int gx = 256, gz = 256;
-    const int h = World::TerrainHeight(gx, gz, kDefaultSeed);
-    scene.eye = {(float)gx, (float)(h + 120), (float)gz};
-    scene.cam.yaw = 0.785f;
-    scene.cam.pitch = -0.32f;
-    scene.note = "overlook: 12 m up, pitched into the middle distance";
   }
-  std::printf("camera: %s — %s\n", pick ? pick->id : "overlook",
-              scene.note.c_str());
-  runner.noonTick_ = FindNoonTick(CurrentTuning());
-  std::printf("        eye (%.0f, %.0f, %.0f)  yaw %.2f  pitch %.2f\n",
-              scene.eye.x, scene.eye.y, scene.eye.z, scene.cam.yaw,
-              scene.cam.pitch);
-  std::printf("        sky at celestial tick %u — sun elevation %+.2f, the "
-              "highest in the cycle\n",
-              runner.noonTick_,
-              ComputeSky(CurrentTuning(), (double)runner.noonTick_).sunDir[1]);
-  std::printf("render: %ux%u   arms: %d   (one settled world, one camera, "
-              "one knob moved per arm)\n\n",
-              opt.width, opt.height, kRenderArmCount);
 
   // The tuning every arm is a delta FROM. Restored after each arm, and again at
   // the end, so nothing here leaks into a later harness in the same process.
   const Tuning base = CurrentTuning();
 
-  std::vector<ArmResult> out;
-  for (const RenderArm& arm : kRenderArms) {
-    if (!opt.arms.empty()) {
-      bool wanted = false;
-      for (const std::string& want : opt.arms)
-        if (want == arm.id) wanted = true;
-      if (!wanted) continue;
-    }
-    ArmResult r = runner.Measure(arm, base, scene, /*warm=*/12, /*frames=*/48);
-    std::printf("  %-11s %-42s ", arm.id, arm.label);
-    if (!r.ok) std::printf("SKIPPED — %s\n", r.why.c_str());
-    else std::printf("%7.2f ms\n", r.gpuP50);
-    std::fflush(stdout);
-    out.push_back(r);
-    if (rows) {
-      RenderBudgetRow row;
-      row.arm = arm.id;
-      row.ok = r.ok;
-      row.gpuP50Ms = r.gpuP50;
-      row.gpuP95Ms = r.gpuP95;
-      row.why = r.why;
-      rows->push_back(std::move(row));
-    }
-  }
-  SetCurrentTuning(base);
-  sim.ReloadShaders(ctx.device);
-  runner.Shot(scene, "build/render_budget.bmp");
+  // What the JSON is written from, and what the summary at the end reads.
+  struct CamRun {
+    std::string id, label, note, bmp;
+    Vec3 eye{};
+    float yaw = 0, pitch = 0;
+    uint32_t tick = 0;
+    float sunUp = 0;
+    std::vector<ArmResult> arms;
+    bool haveCache = false;
+    uint32_t cReq = 0, cRes = 0, cRef = 0;
+  };
+  std::vector<CamRun> runs;
+  // The baseline is the arm NAMED baseline, not arms[0]: under --budget-arms
+  // the first arm measured can be any arm, and a delta against it is noise.
+  // 0 when the subset left it out — every "saved" column then prints blank.
+  auto baselineOf = [](const CamRun& cr) {
+    for (const ArmResult& r : cr.arms)
+      if (r.arm == &kRenderArms[0] && r.ok) return r.gpuP50;
+    return 0.0;
+  };
 
-  // ---- shadow cache attribution (CLAUDE.md rule 6) ----------------------
+  // The shadow-cache attribution, per camera (CLAUDE.md rule 6).
+  //
   // A bare "the resolve pass costs 3.9 ms" is the kind of number that invites
   // one elimination run per hypothesis. The two numbers that actually decide
   // between them — how many patches were asked for, and how many were REFUSED
   // because the request list was full — are two words the shader already
-  // maintains, so read them instead of guessing. The Shot above rendered a
-  // frame with the baseline tuning, so these describe that frame.
-  if (sim.ShadowCacheOn()) {
+  // maintains, so read them instead of guessing. Read AFTER the Shot, which
+  // renders one frame at the baseline tuning, so these always describe that
+  // frame and not whichever arm happened to run last.
+  //
+  // Per camera and not once at the end, because dedup is a property of the
+  // PICTURE: a submerged frame and an overlook frame request wildly different
+  // patch counts, and one number labelled with neither is the misreading the
+  // whole camera table exists to prevent.
+  auto readCache = [&](CamRun& cr) {
+    if (!sim.ShadowCacheOn()) return;
     rhi::Buffer stage =
         CreateBuffer(ctx.device, 16,
                      rhi::BufferUsage::MapRead | rhi::BufferUsage::CopyDst,
@@ -1860,42 +2104,237 @@ int RunRenderBudget(GpuContext& ctx, World& world, Simulation& sim,
     senc.CopyBufferToBuffer(world.shadowReq, 0, stage, 0, 16);
     ctx.queue.Submit(senc.Finish());
     uint32_t w[4] = {0, 0, 0, 0};
-    if (rhi::ReadBufferBlocking(ctx.device, stage, 0, w, sizeof(w))) {
-      const double px = (double)opt.width * opt.height;
-      std::printf(
-          "\n  shadow cache: %u patches requested, %u resolved (cap %u), %u "
-          "refused\n            %.2f patches per 100 px — under 100 is real "
-          "dedup, at the cap it is truncation\n",
-          w[2], w[1], kShadowReqCap, w[3], 100.0 * (double)w[2] / px);
+    if (!rhi::ReadBufferBlocking(ctx.device, stage, 0, w, sizeof(w))) return;
+    cr.haveCache = true;
+    cr.cRes = w[1];
+    cr.cReq = w[2];
+    cr.cRef = w[3];
+    const double px = (double)opt.width * opt.height;
+    std::printf(
+        "\n  shadow cache: %u patches requested, %u resolved (cap %u), %u "
+        "refused\n            %.2f patches per 100 px — under 100 is real "
+        "dedup, at the cap it is truncation\n",
+        w[2], w[1], kShadowReqCap, w[3], 100.0 * (double)w[2] / px);
+  };
+
+  // One camera's whole pass: set it up, run its arms, print its table, shoot
+  // its frame, read its cache counters.
+  auto runCamera = [&](const char* id, const char* label,
+                       Scene& scene, uint32_t tick,
+                       const char* const* armIds) {
+    CamRun cr;
+    cr.id = id;
+    cr.label = label ? label : "";
+    cr.note = scene.note;
+    cr.eye = scene.eye;
+    cr.yaw = scene.cam.yaw;
+    cr.pitch = scene.cam.pitch;
+    cr.tick = tick;
+    cr.sunUp = ComputeSky(CurrentTuning(), (double)tick).sunDir[1];
+    cr.bmp = std::string("build/render_budget_") + id + ".bmp";
+    runner.skyTick_ = tick;
+
+    // Which arms. A nullptr list means every row of kRenderArms, in order.
+    std::vector<const RenderArm*> arms;
+    if (!armIds) {
+      for (const RenderArm& a : kRenderArms) arms.push_back(&a);
+    } else {
+      for (const char* const* p = armIds; *p; p++) {
+        const RenderArm* a = FindArm(*p);
+        // A typo in the table is a build-time authoring error, not a runtime
+        // condition; say so loudly rather than quietly measuring 4 arms.
+        if (!a) {
+          std::fprintf(stderr,
+                       "--render-budget: camera '%s' names arm '%s', which "
+                       "does not exist\n", id, *p);
+          continue;
+        }
+        arms.push_back(a);
+      }
+    }
+
+    // --budget-arms: the caller's subset, applied on top of the camera's own
+    // arm list (validated against the full table at the top of the function).
+    if (!opt.arms.empty()) {
+      std::vector<const RenderArm*> kept;
+      for (const RenderArm* a : arms)
+        for (const std::string& want : opt.arms)
+          if (want == a->id) { kept.push_back(a); break; }
+      arms.swap(kept);
+    }
+
+    std::printf("\n=== camera %s — %s ===\n", id, cr.label.c_str());
+    std::printf("        %s\n", scene.note.c_str());
+    std::printf("        eye (%.0f, %.0f, %.0f)  yaw %.2f  pitch %.2f\n",
+                scene.eye.x, scene.eye.y, scene.eye.z, scene.cam.yaw,
+                scene.cam.pitch);
+    std::printf("        sky at celestial tick %u — sun elevation %+.3f "
+                "(%.1f deg above the horizon)\n",
+                tick, cr.sunUp,
+                std::asin(std::max(-1.0f, std::min(1.0f, cr.sunUp))) *
+                    57.2957795f);
+    std::printf("render: %ux%u   arms: %d   (one settled world, one camera, "
+                "one knob moved per arm)\n\n",
+                opt.width, opt.height, (int)arms.size());
+
+    for (const RenderArm* arm : arms) {
+      ArmResult r = runner.Measure(*arm, base, scene, /*warm=*/12,
+                                   /*frames=*/48);
+      std::printf("  %-11s %-42s ", arm->id, arm->label);
+      if (!r.ok) std::printf("SKIPPED — %s\n", r.why.c_str());
+      else std::printf("%7.2f ms\n", r.gpuP50);
+      std::fflush(stdout);
+      if (rows) {
+        RenderBudgetRow row;
+        row.cam = id;
+        row.arm = arm->id;
+        row.ok = r.ok;
+        row.gpuP50Ms = r.gpuP50;
+        row.gpuP95Ms = r.gpuP95;
+        row.why = r.why;
+        rows->push_back(std::move(row));
+      }
+      cr.arms.push_back(r);
+    }
+    runner.RestoreBase(base);
+    // `noon` keeps writing build/render_budget.bmp under its old name as well:
+    // that path is what every previous run and every reader already knows.
+    runner.Shot(scene, cr.bmp.c_str(),
+                cr.id == "noon" ? "build/render_budget.bmp" : nullptr);
+    readCache(cr);
+
+    // ---- the table this camera exists to print --------------------------
+    const double b = baselineOf(cr);
+    std::printf("\n  baseline raymarch: %.2f ms at %ux%u\n\n", b, opt.width,
+                opt.height);
+    std::printf("  %-11s %9s %9s  %s\n", "arm", "ms", "saved",
+                "what the saving is the cost of");
+    std::printf("  %-11s %9s %9s  %s\n", "---", "--", "-----",
+                "------------------------------");
+    for (const ArmResult& r : cr.arms) {
+      if (!r.ok) {
+        std::printf("  %-11s   SKIPPED  %s\n", r.arm->id, r.why.c_str());
+        continue;
+      }
+      if (r.arm == &kRenderArms[0]) continue;
+      const double saved = b - r.gpuP50;
+      std::printf("  %-11s %9.2f %8.2f%s  %s\n", r.arm->id, r.gpuP50, saved,
+                  b > 0 ? "" : " ", r.arm->means);
+    }
+    std::printf("\n  percentages of the %.2f ms baseline:\n", b);
+    for (const ArmResult& r : cr.arms) {
+      if (!r.ok || r.arm == &kRenderArms[0] || b <= 0) continue;
+      std::printf("    %-11s %5.1f%%\n", r.arm->id,
+                  100.0 * (b - r.gpuP50) / b);
+    }
+    runs.push_back(std::move(cr));
+  };
+
+  if (pick) {
+    Scene scene{ctx, world, sim, stream, mats};
+    std::string why;
+    if (!pick->setup(scene, why)) {
+      std::fprintf(stderr, "--render-budget: scenario '%s' declined: %s\n",
+                   pick->id, why.c_str());
+      return 1;
+    }
+    runCamera(pick->id, pick->label, scene, FindNoonTick(CurrentTuning()),
+              nullptr);
+  } else {
+    for (const BudgetCam* c : cams) {
+      // A FRESH Scene per camera. Scene is scenario scratch as well as a
+      // camera, and carrying one across cameras would let a pond index or a
+      // note leak into a view it has nothing to do with.
+      Scene scene{ctx, world, sim, stream, mats};
+      uint32_t tick = 0;
+      std::string why;
+      if (!c->setup(scene, tick, why)) {
+        std::printf("\n=== camera %s — DECLINED ===\n        %s\n", c->id,
+                    why.c_str());
+        continue;
+      }
+      runCamera(c->id, c->label, scene, tick, c->arms);
     }
   }
 
-  // ---- the table the run exists to print --------------------------------
-  // The baseline is the arm named baseline, not out[0]: under --budget-arms
-  // the first row measured can be any arm, and a delta against it is noise.
-  double b = 0.0;
-  for (const ArmResult& r : out)
-    if (r.arm == &kRenderArms[0] && r.ok) b = r.gpuP50;
-  std::printf("\n  baseline raymarch: %.2f ms at %ux%u\n\n", b, opt.width,
-              opt.height);
-  std::printf("  %-11s %9s %9s  %s\n", "arm", "ms", "saved", "what the saving is the cost of");
-  std::printf("  %-11s %9s %9s  %s\n", "---", "--", "-----", "------------------------------");
-  for (const ArmResult& r : out) {
-    if (!r.ok) { std::printf("  %-11s   SKIPPED  %s\n", r.arm->id, r.why.c_str()); continue; }
-    if (r.arm == &kRenderArms[0]) continue;
-    const double saved = b - r.gpuP50;
-    std::printf("  %-11s %9.2f %8.2f%s  %s\n", r.arm->id, r.gpuP50, saved,
-                b > 0 ? "" : " ", r.arm->means);
+  // ---- the machine-readable copy ----------------------------------------
+  // So nobody re-runs a 3-camera, 26-arm pass to read one number back off the
+  // terminal. Objects rather than the flat arrays --perf uses: this is a few
+  // hundred numbers, not 35,000, and the readability is worth more than the
+  // bytes here.
+  {
+    const char* jpath = "build/render_budget.json";
+    std::FILE* f = std::fopen(jpath, "wb");
+    if (!f) {
+      std::fprintf(stderr, "--render-budget: cannot write %s\n", jpath);
+    } else {
+      std::fprintf(f, "{\n\"schema\":1,\n\"gpu\":%s,\n",
+                   JStr(ctx.DeviceName()).c_str());
+      std::fprintf(f, "\"width\":%u,\"height\":%u,\n", opt.width, opt.height);
+      std::fprintf(f, "\"cameras\":[\n");
+      for (size_t ci = 0; ci < runs.size(); ci++) {
+        const CamRun& cr = runs[ci];
+        const double b = baselineOf(cr);
+        std::fprintf(f, "%s{\"id\":%s,\"label\":%s,\"note\":%s,\"bmp\":%s,\n",
+                     ci ? "," : "", JStr(cr.id).c_str(),
+                     JStr(cr.label).c_str(), JStr(cr.note).c_str(),
+                     JStr(cr.bmp).c_str());
+        std::fprintf(f, " \"eye\":[%s,%s,%s],\"yaw\":%s,\"pitch\":%s,\n",
+                     JNum(cr.eye.x).c_str(), JNum(cr.eye.y).c_str(),
+                     JNum(cr.eye.z).c_str(), JNum(cr.yaw).c_str(),
+                     JNum(cr.pitch).c_str());
+        std::fprintf(
+            f, " \"tick\":%u,\"sunSinElev\":%s,\"sunElevDeg\":%s,\n", cr.tick,
+            JNum(cr.sunUp).c_str(),
+            JNum(std::asin(std::max(-1.0f, std::min(1.0f, cr.sunUp))) *
+                 57.2957795f)
+                .c_str());
+        std::fprintf(f, " \"baselineMs\":%s,\n \"arms\":[", JNum(b).c_str());
+        for (size_t ai = 0; ai < cr.arms.size(); ai++) {
+          const ArmResult& r = cr.arms[ai];
+          std::fprintf(f, "%s{\"id\":%s,\"label\":%s,\"means\":%s,\"ok\":%s",
+                       ai ? "," : "", JStr(r.arm->id).c_str(),
+                       JStr(r.arm->label).c_str(), JStr(r.arm->means).c_str(),
+                       r.ok ? "true" : "false");
+          if (r.ok)
+            std::fprintf(f,
+                         ",\"p50\":%s,\"p95\":%s,\"frames\":%d,"
+                         "\"savedMs\":%s,\"pct\":%s",
+                         JNum(r.gpuP50).c_str(), JNum(r.gpuP95).c_str(),
+                         r.frames, JNum(b - r.gpuP50).c_str(),
+                         JNum(b > 0 ? 100.0 * (b - r.gpuP50) / b : 0.0)
+                             .c_str());
+          else
+            std::fprintf(f, ",\"why\":%s", JStr(r.why).c_str());
+          std::fprintf(f, "}");
+        }
+        std::fprintf(f, "],\n \"shadowCache\":");
+        if (cr.haveCache) {
+          const double px = (double)opt.width * opt.height;
+          std::fprintf(f,
+                       "{\"requested\":%u,\"resolved\":%u,\"cap\":%u,"
+                       "\"refused\":%u,\"perHundredPx\":%s}",
+                       cr.cReq, cr.cRes, (unsigned)kShadowReqCap, cr.cRef,
+                       JNum(100.0 * (double)cr.cReq / px).c_str());
+        } else {
+          std::fprintf(f, "null");
+        }
+        std::fprintf(f, "}\n");
+      }
+      std::fprintf(f, "]\n}\n");
+      std::fclose(f);
+      std::printf("\n  wrote %s (%d camera%s)\n", jpath, (int)runs.size(),
+                  runs.size() == 1 ? "" : "s");
+    }
   }
-  std::printf("\n  percentages of the %.2f ms baseline:\n", b);
-  for (const ArmResult& r : out) {
-    if (!r.ok || r.arm == &kRenderArms[0] || b <= 0) continue;
-    std::printf("    %-11s %5.1f%%\n", r.arm->id, 100.0 * (b - r.gpuP50) / b);
-  }
+
   std::printf(
       "\n  An arm is a MEASUREMENT, not a setting: `nofar` and `primary256` "
       "render\n  a visibly wrong world. Read each row as \"this many ms are "
-      "spent here\".\n");
+      "spent here\".\n"
+      "  And read each TABLE as a property of its picture: `noon` is the "
+      "cheapest\n  lighting the game has, which is why it is no longer the "
+      "only one here.\n");
   return ctx.ReportVkValidation("--render-budget") > 0 ? 1 : 0;
 }
 

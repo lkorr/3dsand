@@ -686,6 +686,10 @@ Stats LastStats(const Device& d) {
   return out;
 }
 
+void SetCaptureStats(const Device& d, bool on) {
+  if (vk::Backend* be = NativeBackend(d)) be->SetCaptureStats(on);
+}
+
 TextureView WrapSwapchainImage(vk::Image* img) {
   if (!img) return {};
   auto v = std::make_shared<VkrTextureView>();
@@ -765,6 +769,7 @@ void RecordTableVulkan(const CommandEncoder& enc, pass::Table which, const Table
   cxv.waterChunkCount = cx.waterChunkCount;
   cxv.waterDrainBodies = cx.waterDrainBodies;
   cxv.waterSweepSlot = cx.waterSweepSlot;
+  cxv.opennessChunks = cx.opennessChunks;
   cxv.hashEnable = cx.hashEnable;
   cxv.particlesActive = cx.particlesActive;
   // Both of these were missing from this copy until ROADMAP §3.4 added

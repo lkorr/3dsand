@@ -126,6 +126,13 @@ enum class Buf : uint8_t {
   ShadowReq,
   ShadowArgsStage,
   ShadowArgs,
+  // ---- the openness (sky-visibility) grid (world.h kOpenFaces) ----
+  // Render-only derived data, on the table for the shadow cache's reason: the
+  // openness pass WRITES these on the TICK command buffer and the raymarcher
+  // (plus microbody/debris) READS them in the fragment stage, and a hazard the
+  // table does not know about generates no barrier.
+  Openness,
+  OpennessGen,
   kCount,
 };
 
@@ -187,6 +194,12 @@ enum class Pipe : uint8_t {
   // M5: the scheduled container sweep and its split labelling.
   WaterSweep, WaterSplit,
   FarFill, FarDown,
+  // The openness grid (sim_openness.wgsl). Two entry points: the dirty walk
+  // (indirect on the compacted dirty list, exactly like occupancyDirty) and the
+  // rolling refresh. BEFORE ShadowPrepare so the pipeline-copy loop's bound in
+  // Simulation::RecordTable — which is `(int)Pipe::ShadowResolve + 1` — still
+  // covers them without moving.
+  OpennessDirty, OpennessRefresh,
   // Voxel-keyed shadow cache (shadow_resolve.wgsl). AFTER FarDown, which the
   // note at the fluid block says must stay last — so the copy loop's bound in
   // Simulation::RecordTable moves to ShadowResolve with these. Both are render
@@ -271,6 +284,12 @@ enum class Cond : uint8_t {
   // so on every tick of every world where nobody has touched the water,
   // neither sweep row is recorded and the cost is exactly zero (rule 2).
   WaterSweep,
+  // opennessChunks > 0: the openness grid is on (render.opennessStrength > 0)
+  // AND its per-tick chunk budget is nonzero. Both rows carry it, so
+  // `opennessStrength = 0` records NOTHING — which is what makes the
+  // `noopenness` arm in --render-budget measure the pass AND the reads rather
+  // than the reads alone.
+  Openness,
 };
 
 // Which command buffer a row belongs to — one per Encode* entry point.
@@ -313,6 +332,10 @@ enum class DispatchSel : uint32_t {
                      // per-particle passes and its list-shaped dispatches
                      // (the seam re-copies the buffer between uses)
   // ---- water bodies ----
+  // One WORKGROUP per chunk the openness refresh walks this tick, from
+  // render.opennessChunksPerFrame. A knob, not a count of live work, so it is a
+  // selector rather than a literal extent: changing it must not need a rebuild.
+  OpennessChunks,
   WaterChunks,       // waterChunkCount — one WORKGROUP per listed chunk
   WaterChunks64,     // (waterChunkCount + 63) / 64 — one THREAD per chunk
   // One THREAD per RESERVED drain spawn-op slot. Every slot in the block has
