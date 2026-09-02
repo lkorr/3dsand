@@ -46,9 +46,9 @@ bash scripts/build.sh --selftest         # build + selftest
 bash scripts/build.sh --configure       # force cmake reconfigure
 ```
 
-**Always use `scripts/build.sh`**, never raw cmake — it holds a machine-global mutex. Kill stale instances: `taskkill //F //IM sandvox.exe`. Set `export SANDVOX_NO_CRASH_DIALOG=1` in every shell. Read `crash.log` after crashes. Verify exe mtime before trusting results.
+**Always use `scripts/build.sh`**, never raw cmake — it holds the machine-global mutexes (`scripts/svlock.sh`): **`C:/sv-compile-lock`** while cl.exe runs, **`C:/sv-gpu-lock`** while it links and while any `sandvox.exe` runs. Compile is the long part and nothing but another compile waits on it. It also picks the generator: with `sccache` on PATH (`scoop install sccache`) the build dir is Ninja Multi-Config with the launcher and a shared object cache at `C:/sv-deps/sccache`; the exe is `build/Release/sandvox.exe` either way, and a build dir made by the other generator is re-configured in place with a message. Kill stale instances: `taskkill //F //IM sandvox.exe`. Set `export SANDVOX_NO_CRASH_DIALOG=1` in every shell. Read `crash.log` after crashes. Verify exe mtime before trusting results. `bash scripts/svlock.sh` prints who holds what.
 
-**Never launch `sandvox.exe` directly — wrap EVERY run in `bash scripts/run.sh <cmd>`** (e.g. `bash scripts/run.sh ./build/Release/sandvox.exe --selftest --gate determinism`). It shares the build mutex, so runs, builds, and links serialize across all sessions/worktrees. Concurrent exe runs saturate the GPU, throttle the machine, and make every measured number garbage. Worktree agents: call it by absolute path from the main checkout if your worktree predates it. (`build.sh --selftest` already runs under the lock and stays sanctioned.)
+**Never launch `sandvox.exe` directly — wrap EVERY run in `bash scripts/run.sh <cmd>`** (e.g. `bash scripts/run.sh ./build/Release/sandvox.exe --selftest --gate determinism`). It takes the GPU lock, so runs and links serialize across all sessions/worktrees — but NOT the compile lock, so a `--gate` check no longer queues behind somebody's five-minute compile. `SANDVOX_RUN_EXCLUSIVE=1` takes both, for a `--perf`/`--render-budget` number you intend to quote. Concurrent exe runs saturate the GPU, throttle the machine, and make every measured number garbage. Worktree agents: call it by absolute path from the main checkout if your worktree predates it. (`build.sh --selftest` already runs under the lock and stays sanctioned.)
 
 ```bash
 ./build/Release/sandvox.exe --selftest --gate <name>      # one gate (~4-20s vs ~50s full)
@@ -57,6 +57,8 @@ bash scripts/build.sh --configure       # force cmake reconfigure
 ./build/Release/sandvox.exe --vk-smoke-loud --vk-validation  # 19 pinned hash probes + sync validation
 ./build/Release/sandvox.exe --vk-smoke-loud --rebaseline  # re-pin the smoke probe tables in baseline.json
 ./build/Release/sandvox.exe --suite acceptance            # one-process full acceptance (selftest + both smokes + validation)
+./build/Release/sandvox.exe --verify determinism,mob-burn --shot-frames screenshot,screenshot_far --budget-arms baseline,noshadow
+                                                          # ONE boot: those gates, those --shot frames, those --render-budget arms; all in build/last_run.json
 ./build/Release/sandvox.exe --sweep sim.windDragRef=6,40  # in-process parameter differential
 ./build/Release/sandvox.exe --frames 400                  # windowed N frames then exit
 SANDVOX_PT_DEBUG=1 ./build/Release/sandvox.exe --frames 1200 --autofly-hard   # page-pool sizing: adversarial traversal (see below)
@@ -78,6 +80,30 @@ lifetime. Anything C++ can assert lives in `--selftest --gate voxregion`;
 pixel readback, an edit, an undo) that C++ cannot see.
 
 `--vk-validation` enables sync validation; **a validation message FAILS the run**. `tests/baseline.json` records known-failing gates (exit 0); new failures are regressions (exit 1). `--backend dawn` refuses with exit 2.
+
+### Agent packages: build or don't
+
+Measured 2026-09-01/02: seven worktree agents, ~8 wall-clock hours, most of it
+cold builds nobody needed and lock waits behind them. The rules that follow
+from it:
+
+- **WGSL-only or tuning-only package: NEVER build.** Use the main checkout's
+  `build/Release/sandvox.exe` with `SANDVOX_ASSET_DIR=<your worktree>/assets`
+  (see "What needs a rebuild"). Your first verification is one `run.sh`
+  launch, not a configure. If the exe is older than a C++ change you depend
+  on, that is a reason to ask for main to be rebuilt, not to build a copy.
+- **C++ package: build ONCE, with the shared cache.** `bash scripts/build.sh`
+  in your worktree. With sccache present the dependency objects come from
+  `C:/sv-deps/sccache` and only your own changed TUs compile. Do not build
+  again "to be sure" after a WGSL or JSON edit — those need no build.
+- **End-of-package check is ONE launch: `--verify`.** Gates, `--shot` frames and
+  `--render-budget` arms in a single boot, all recorded in
+  `build/last_run.json`. Four separate boots for `--gate`, `--shot`,
+  `--render-budget` and `--shader-stats` cost four device boots and four lock
+  waits for one claim.
+- **Never run the same gate twice.** A gate you ran while iterating is the
+  result for that tree; if the tree did not change, the answer did not either.
+  Full acceptance runs once, on the tree you ship.
 
 ### When to run what — verification is a BUDGET, not a reflex
 
@@ -213,6 +239,25 @@ from disk at runtime and compiles through Tint. The SPIR-V disk cache
 gets a cache miss and recompiles automatically. Workflow: edit shader → run
 `check_shaders.sh` → run the existing binary. A C++ rebuild for a WGSL change is
 wasted time.
+
+**A WGSL/tuning worktree needs NO BUILD AT ALL.** The exe locates `assets/` by a
+compiled-in absolute path, which is why four of seven WGSL-only agents on
+2026-09-01 each paid a cold worktree build to test a shader. The
+`SANDVOX_ASSET_DIR` **environment variable overrides that path at runtime**
+(`AssetDir()` in `src/test/support.cpp`, the one chokepoint every loader —
+shaders, materials, tuning, prefabs, mobs, sounds, and `tests/baseline.json`
+resolved beside it — goes through). Run the MAIN checkout's binary against your
+worktree's assets:
+
+```bash
+SANDVOX_ASSET_DIR="$PWD/assets" bash "<main>/scripts/run.sh" "<main>/build/Release/sandvox.exe" --selftest --gate determinism
+```
+
+The first stdout line is `assets: <path> (SANDVOX_ASSET_DIR)` — check it. The
+SPIR-V cache keys on shader content, so your edited shader recompiles on that
+first run whichever binary loads it; `shader_cache/` and `build/last_run.json`
+are written under the CWD, so run from your worktree. The baseline that gets
+compared is your worktree's `tests/baseline.json`, not main's.
 
 **`tuning.json` edits need no rebuild.** Tuning is hot-reloaded on F5 in the game,
 and read fresh at every selftest/smoke launch.
