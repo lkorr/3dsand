@@ -3315,10 +3315,44 @@ fn voxWordAtEntry(e : u32, c : vec3<i32>) -> u32 {
 // function that is now trivially true, which is the point: the classic silent
 // bug here is two DDAs that drift.
 //
-// `coarseFromT` IS ACCEPTED AND IGNORED. W2-B fills it in: past that distance
-// the march will test the 4^3 blockers-class sub-occupancy mask instead of the
-// voxel and stop at the block face. Threading it now means the five call sites
-// do not have to move again when it lands.
+// `coarseFromT` IS THE COARSE-TERMINATE DISTANCE, IN FINE VOXELS (the same
+// units as `OpaqueHit.t`, not metres — the call sites divide the metre knob by
+// VOXEL_METERS, see shadowCoarseFromT below). Past it the march stops asking
+// the voxel and asks the 4^3 BLOCKERS-CLASS sub-occupancy mask instead:
+//
+//   bit clear -> NO blocker cell anywhere in this 4x4x4 block. Skipping it is
+//                EXACT, not conservative: the mask's producer runs the same
+//                isRayBlocker test this loop does, cell by cell, on every dirty
+//                walk (sim_occupancy.wgsl), and a sentinel chunk writes ones
+//                for a blocker material and zeros for air or a liquid — the
+//                same split occBlockers() already makes one level up. So the
+//                block DDA past coarseFromT costs a quarter of the iterations
+//                for the same answer wherever the mask is clear.
+//   bit set   -> at least one blocker SOMEWHERE in the block. The march
+//                terminates here and reports a hit at the current cell rather
+//                than finding which of the 64 cells it was. THIS is the
+//                approximation, and it is one-sided: a coarse hit can only
+//                ever be MORE occluded than the fine answer, never less. For a
+//                distant shadow that reads as a canopy going opaque at 4-voxel
+//                granularity, which is both cheaper and CALMER — the fine ray
+//                through a leaf lattice flickers between lit and shadowed on
+//                sub-pixel motion, and this is exactly the aliasing that
+//                averaging over a block removes.
+//
+// `coarseFromT = 1e30` therefore means "never coarse", and the whole block
+// below is unreachable: the compare is against a finite tCur. That is the
+// bit-identity guarantee the reflection and refraction call sites rely on, and
+// with the knob at 0 the const-folded 1e30 lets the compiler delete the code
+// outright (shadowResolve's SPIR-V binary size is unchanged at 0, which is how
+// it was checked).
+//
+// `word` IS UNDEFINED (zero) ON A COARSE HIT. A block has no material — it has
+// up to 64 of them — so there is nothing honest to return. Callers that read
+// `word` (traceReflection, traceRefraction, and shadeSecondaryHit behind them)
+// must therefore pass 1e30, and they do; the callers that pass a finite value
+// (the shadow resolve pass, sunShadowAt, godRays) read only `hit` and `t`.
+// That is asserted by construction rather than by a flag: there are five call
+// sites in the engine and they are all in this comment.
 //
 // `occ` and `mats` come in as POINTERS for exactly paletteColor's reason:
 // common.wgsl is prepended BEFORE any shader declares its bindings, so a
@@ -3338,10 +3372,6 @@ struct OpaqueHit {
 fn traceOpaque(ro : vec3f, rdIn : vec3f, maxSteps : i32, coarseFromT : f32,
                occ : ptr<storage, array<u32>, read>,
                mats : ptr<storage, array<Material>, read>) -> OpaqueHit {
-  // Accepted, deliberately unused until W2-B. A phony assignment says so in the
-  // language instead of in a comment the compiler cannot read.
-  _ = coarseFromT;
-
   var out : OpaqueHit;
   out.hit = false;
   out.t = 0.0;
@@ -3413,6 +3443,7 @@ fn traceOpaque(ro : vec3f, rdIn : vec3f, maxSteps : i32, coarseFromT : f32,
   // shifts and a vec3 compare instead of chunkIndexW's multiplies.
   var cchOcc = 0u;
   var cchPt = 0u;
+  var cchIdx = 0u;   // the SLOT index, which is what subOccIndex keys on
   var cchC = vec3<i32>(0x7FFFFFFF);
 
   for (var i = 0; i < 4096; i++) {
@@ -3422,9 +3453,9 @@ fn traceOpaque(ro : vec3f, rdIn : vec3f, maxSteps : i32, coarseFromT : f32,
     let cc = cell >> vec3<u32>(CHUNK_SHIFT);
     if (any(cc != cchC)) {
       cchC = cc;
-      let chIdx = chunkIndexW(cell);
-      cchOcc = (*occ)[chIdx];
-      cchPt = pageEntryOf(chIdx);
+      cchIdx = chunkIndexW(cell);
+      cchOcc = (*occ)[cchIdx];
+      cchPt = pageEntryOf(cchIdx);
     }
 
     // Chunk skip on the BLOCKER count, never the total: a chunk holding only
@@ -3455,12 +3486,46 @@ fn traceOpaque(ro : vec3f, rdIn : vec3f, maxSteps : i32, coarseFromT : f32,
       }
     }
 
+    // The box the ray is about to jump over, edge in voxels, 0 for "no jump".
+    // ONE jump, two edge sizes: the whole chunk when the chunk holds no
+    // blocker at all, or one 4^3 sub-block when the coarse march is on and
+    // that block's blockers bit is clear. Both boxes are power-of-two aligned
+    // so the same mask-and-floor arithmetic serves either, and writing it once
+    // is not tidiness — the chunk jump's "force the crossing on the exit axis"
+    // rule is the fix for a float-noise shadow leak along box faces, and a
+    // second hand-copied jump would be a second place to forget it.
+    var skipEdge = 0;
     if (chunkSkip) {
-      // Jump to the chunk's exit face. Masking off the low bits is
+      skipEdge = i32(CHUNK);
+    } else if (tCur > coarseFromT) {
+      // ---- COARSE TERMINATE (docs/PLAN_lin_followups.md W2-B, 13.2.1) ----
+      // Past coarseFromT the unit of traversal is the 4^3 block, not the
+      // voxel. Cost per iteration is the same shape as the fine path (one u32
+      // load, one test) but each iteration covers 4 voxels instead of 1, and
+      // the mask is 4 words per chunk against 4,096 for the page, so the loads
+      // hit cache where the voxel reads miss. See the header for why a set bit
+      // may stop the ray early and a clear bit may not.
+      let lo = vec3<u32>(cell & vec3<i32>(i32(CHUNK) - 1));
+      let sbit = subOccBitLocal(lo);
+      let sw = (*occ)[subOccIndex(cchIdx, 1u, sbit >> 5u)];
+      if ((sw & (1u << (sbit & 31u))) != 0u) {
+        out.hit = true;
+        out.t = tCur;
+        out.cell = cell;
+        out.axis = axis;
+        out.sgn = select(select(sgn3.x, sgn3.y, axis == 1), sgn3.z, axis == 2);
+        out.word = 0u;   // UNDEFINED for a coarse hit — see the header
+        return out;
+      }
+      skipEdge = i32(SUBOCC_BLOCK);
+    }
+
+    if (skipEdge != 0) {
+      // Jump to the box's exit face. Masking off the low bits is
       // floor-to-corner for negative world coords too.
-      let blkLo = cell & vec3<i32>(~(i32(CHUNK) - 1));
+      let blkLo = cell & vec3<i32>(~(skipEdge - 1));
       let lo = vec3f(blkLo);
-      let hi = lo + f32(CHUNK);
+      let hi = lo + f32(skipEdge);
       let e0 = (lo - ro) * inv;
       let e1 = (hi - ro) * inv;
       let ex = max(e0, e1);
@@ -3474,15 +3539,15 @@ fn traceOpaque(ro : vec3f, rdIn : vec3f, maxSteps : i32, coarseFromT : f32,
       var nc = vec3<i32>(floor(p));
       // Force the crossing on the exit axis: float noise at a shared face can
       // floor() back into the box just left, which reads as a shadow leak
-      // along chunk boundaries.
+      // along box boundaries.
       if (ex.x <= ex.y && ex.x <= ex.z) {
-        nc.x = select(blkLo.x - 1, blkLo.x + i32(CHUNK), rd.x > 0.0);
+        nc.x = select(blkLo.x - 1, blkLo.x + skipEdge, rd.x > 0.0);
         axis = 0;
       } else if (ex.y <= ex.z) {
-        nc.y = select(blkLo.y - 1, blkLo.y + i32(CHUNK), rd.y > 0.0);
+        nc.y = select(blkLo.y - 1, blkLo.y + skipEdge, rd.y > 0.0);
         axis = 1;
       } else {
-        nc.z = select(blkLo.z - 1, blkLo.z + i32(CHUNK), rd.z > 0.0);
+        nc.z = select(blkLo.z - 1, blkLo.z + skipEdge, rd.z > 0.0);
         axis = 2;
       }
       if (any(nc < wloI) || any(nc >= wloHi)) { break; }
@@ -3516,6 +3581,21 @@ fn traceOpaque(ro : vec3f, rdIn : vec3f, maxSteps : i32, coarseFromT : f32,
     }
   }
   return out;
+}
+
+// The coarse-terminate distance every SHADOW-class caller passes to
+// traceOpaque, in FINE VOXELS. One function so the metres->voxels conversion
+// and the "0 disables" convention cannot drift between the resolve pass and
+// sunShadowAt — the two halves of the shadow cache, which --gate shadow-cache
+// asserts agree ray for ray, so a disagreement here would be a gate failure
+// with a very confusing message.
+//
+// 1e30 rather than a bool, because that is the value the compare
+// `tCur > coarseFromT` can never be true for, which is what lets the whole
+// coarse block const-fold away when the knob is 0.
+fn shadowCoarseFromT() -> f32 {
+  return select(TUNE_SHADOW_COARSE_DIST / VOXEL_METERS, 1e30,
+                TUNE_SHADOW_COARSE_DIST <= 0.0);
 }
 
 // The chunk-linear READ: the word at (chunkSlot, localIdx), synthesized when

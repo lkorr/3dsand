@@ -2562,7 +2562,8 @@ fn sunShadowAt(hp : vec3f, n : vec3f, px : vec2f, camDistFine : f32) -> f32 {
   // trace()'s 26-field register footprint, which for a fragment shader is paid
   // by every pixel whether or not this branch runs. See common.wgsl.
   let s = traceOpaque(hp + n * TUNE_SHADOW_BIAS, keyLightDir(),
-                      TUNE_SHADOW_STEPS, 1e30, &occupancy, &materials);
+                      TUNE_SHADOW_STEPS, shadowCoarseFromT(),
+                      &occupancy, &materials);
   if (!s.hit) { return 1.0; }
   // Distance from receiver to blocker, in metres. Near blockers (a voxel
   // resting on the ground) keep a hard, dark contact shadow; distant ones (a
@@ -3314,6 +3315,11 @@ fn traceReflection(p : vec3f, n : vec3f, rd : vec3f) -> vec3f {
   // a reflection grazing INTO dense canopy, where every step is a real voxel
   // step and the skip never fires. traceOpaque skips on the blocker count, so
   // smoke costs a reflected ray nothing.
+  // 1e30 = never coarse, and here that is a CORRECTNESS requirement rather
+  // than a quality preference: shadeSecondaryHit below reads `h.word` for the
+  // material and the palette variant, and a coarse hit has no word (a 4^3
+  // block holds up to 64 materials). Every caller that reads `word` passes
+  // 1e30; see the traceOpaque header in common.wgsl.
   let h = traceOpaque(p + n * 0.05, rr, TUNE_REFLECTION_STEPS, 1e30,
                       &occupancy, &materials);
   if (!h.hit) { return reflectionSky(rr); }
@@ -6121,6 +6127,8 @@ fn fluidMarchBlocky(ro : vec3f, rdIn : vec3f, tMax : f32,
 // film on dry rock (column ~1 voxel, bed metres away) is unchanged.
 fn traceRefraction(p : vec3f, rdr : vec3f, waterVox : f32,
                    fallback : vec3f) -> vec3f {
+  // 1e30 = never coarse: shadeSecondaryHit reads h.word, which a coarse hit
+  // does not have. Same reason as traceReflection's call above.
   let h = traceOpaque(p, rdr, TUNE_REFLECTION_STEPS, 1e30,
                       &occupancy, &materials);
   if (!h.hit) {

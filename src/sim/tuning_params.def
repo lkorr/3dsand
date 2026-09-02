@@ -280,6 +280,14 @@ TP_F(render, godRayRange, TUNE_GODRAY_RANGE, 14.0f)
 // find the surface or a nearby blocker, not resolve distant geometry.
 TP_I(render, godRayShadowSteps, TUNE_GODRAY_SHADOW_STEPS, 20)
 
+// ---- coarse-terminate for secondary rays (PLAN_lin_followups.md W2-B) ------
+// Metres past which traceOpaque stops asking the voxel and asks the 4^3
+// blockers-class sub-occupancy mask instead: a clear block is skipped whole
+// (exact), a set block stops the ray (conservative). 0 disables it and the
+// const-folded 1e30 deletes the code. It lives next to the god-ray rows
+// because god rays pass 0 for it — they are coarse from the first step.
+TP_F(render, shadowCoarseDist, TUNE_SHADOW_COARSE_DIST, 8.0f)
+
 // ---- drifting particulate (silt) ----
 // Render-only motes in the water volume. This is what gives the shafts
 // something to catch, and it is most of why footage reads as underwater.
