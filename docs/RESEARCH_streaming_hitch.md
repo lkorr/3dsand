@@ -425,6 +425,170 @@ Any of R1/R3 should be sized against this number, not the harness's.
 
 ---
 
+## P2-D. The snapshot-staleness stall under a deep GPU queue — LANDED 2026-09-03
+
+**Branch:** `worktree-agent-a88855b327636dc1f` off `streaming-smooth` @ 82bf233.
+**Item:** `PLAN_surface_flight_perf.md` B3, "replace the `WaitIdle` staleness
+drain with a bounded catch-up". **Files:** `src/sim/world.h` (`kReadbackSlots`),
+`src/sim/world.cpp` (`EncodeReadbacks`), `src/test/support.{h,cpp}`
+(`SubmitTick` attribution + fallback), `src/main.cpp` (summary line, tick cap),
+`scripts/check_invariants.py` (new `ringdepth` check).
+
+### 0. The attribution, before anything was changed
+
+Rule 6: the existing report was a bare count — "snapshot stalls: 136, ring
+refusals: 119". Splitting it took one build and one run, and the answer was not
+the one the item was written for.
+
+`--frames 600 --autofly-surface`, 540 measured frames, integration tree plus
+counters only:
+
+```
+snapshot stalls: 157 over 540 frames (26.1%) | ring refused: 128
+  cause: refused 83 (no copy encoded for the tick) | not-landed 74 (queue depth)
+  arm:   map-wait 157 (157 fences, 3564.9 ms) | WaitIdle 0 (0.0 ms, 0 futile)
+  staleness at stall (ticks): 5:157  max 5
+```
+
+Three findings, in order of how much they change the plan:
+
+1. **The `WaitIdle` arm never fires.** B3's premise — a full device drain on the
+   frame path — was already fixed by the deferred-wake commit's targeted
+   `WaitOldestPendingMap` loop, and the counter that reads "blocking WaitIdle on
+   the frame path" was mis-labelled: it counts every stall, not the drain. What
+   remained was **one fence wait per stall**, 157 of them, 22.7 ms each.
+2. **The staleness histogram is degenerate: always exactly 5.** The check runs
+   every tick and the gap can only grow by one per tick, so it fires the instant
+   it crosses `kPagedSnapshotMaxGap = 4` and never gets further. "How stale" was
+   never the question; "how far behind is the GPU" is.
+3. **53% of stalls were on a tick for which no copy had been encoded at all.**
+   That is the ring being too short, not the GPU being slow — a distinct cause
+   with a distinct fix, and invisible in the aggregate count.
+
+`WaitIdle` being unreachable is structural, not lucky: the loop is bounded by
+the ring depth, the ring is the only producer of `MapReadAsync` maps, so it
+cannot exit on the bound with maps still outstanding. It can only exit stale
+when every map has been delivered — and then `WaitIdle` waits for *work*, which
+is not what is missing. It is now gated on "maps remain" and the leftover case
+is counted as `proceeded stale` (0 in every run since).
+
+### 1. The fix: size the ring from the pipeline, not from a literal
+
+`kReadbackSlots` was `3`. A slot is held from the tick that encodes the copy
+until the submit that produced it retires, so the ring must cover every tick
+that can be in flight: `kMaxTicksPerFrame * (kFramesInFlight + 1)` = 4 x 4 =
+**16**. `main.cpp`'s tick cap now *is* `World::kMaxTicksPerFrame` (one
+definition), and `check_invariants.py`'s new `ringdepth` check compares
+`kFramesInFlight` against `rhi_vulkan.h`'s `kAcquireSlots` — world.h cannot
+include a backend header to read it, and an unchecked mirror is what this
+script exists for.
+
+**Memory:** one slot is 1,997,056 B = 1.904 MiB (27 x 16 KiB mirror + 128 KiB
+dirty + 128 KiB occupancy + 128 KiB support + 108 KiB fluid mirror + ~2 KiB of
+small tables + **1 MiB of `kFetchPerTick` chunk fetches**, the biggest single
+term). 16 slots = **30.5 MiB**, up from 5.7 MiB, against a 360 MiB page pool.
+
+Two knobs stay, permanently, because both questions here are cost questions and
+a cost question deserves a run rather than a rebuild:
+
+- `SANDVOX_READBACK_SLOTS=n` caps how many slots may be occupied, so the 3-slot
+  and 16-slot behaviours are two arms of **one binary** (the "an `#if`-guarded
+  SIMD path tests only itself" rule).
+- `SANDVOX_SNAP_MAXGAP=n` overrides `kPagedSnapshotMaxGap`. The long "raising
+  this is a trap" note in `support.cpp` ends with "the honest way to raise it is
+  to measure first"; this is that measurement, at one run per candidate.
+
+### 2. The measurement
+
+Four arms of one binary, `--frames 600 --autofly-surface`,
+`SANDVOX_RUN_EXCLUSIVE=1`, interleaved A-B-C-D twice (the route is
+dt-integrated; single runs are +-15%, and the first "before" run of the session
+— taken while the machine was loaded — read p50 22.8 / 157 stalls against the
+same configuration's 18.6 / 46.5 when quiet, which is exactly why).
+
+| arm | frame p50 / p95 / p99 / max | >33 / >100 | readbackStall mean / p99 | stalls | refusals | pool HW |
+|---|---|---|---|---|---|---|
+| **A** ring 3, gap 4 (before) | 18.6 / 70.0 / 87.3 / 162.9 | 157 / 2.5 | **1.84 / 42.4** | **46.5** | **70** | 21,126 (60.6%) |
+| **B** ring 16, gap 4 (shipped) | 18.6 / 69.7 / 86.9 / 246.9 | 150 / 1.5 | **0.43 / 12.9** | 30.0 | **0** | 20,732 (59.5%) |
+| C ring 16, gap 6 | 18.7 / 67.8 / 82.0 / 113.7 | 148 / 1.0 | 0.00 / 0.0 | **0** | 0 | 21,545 (61.9%) |
+| D ring 16, gap 8 | 18.3 / 70.2 / 88.2 / 142.0 | 148 / 3.0 | 0.00 / 0.0 | 0 | 0 | 22,463 (64.5%) |
+
+Control, `--frames 600 --autofly-hard` (the residency worst case), A vs C
+interleaved twice — and note `maxGap` is **inert** in this arm, because neither
+side stalls at all, so the whole difference is ring depth:
+
+| arm | frame p50 / p95 / p99 | stalls | pool HW |
+|---|---|---|---|
+| A ring 3 | 8.7 / 26.5 / 48.2 and 8.8 / 25.2 / 48.4 | 0, 0 | 27,201 (78.1%) and 26,339 (75.7%) |
+| C ring 16 | 8.9 / 28.1 / 46.1 and 8.7 / 28.3 / 46.3 | 0, 0 | **24,500 (70.4%) and 24,244 (69.6%)** |
+
+Page faults 0 in every run (`--gate streaming` under both residencies, and a
+`SANDVOX_PT_DEBUG=1 --autofly-hard` pass).
+
+### 3. What the numbers say, including the part that argues against the item
+
+- **The ring depth is the whole of the defensible win.** It takes refusals from
+  70 to **zero**, `readbackStall` p99 from 42.4 ms to 12.9 (3.3x), stalls from
+  46.5 to 30 — and, unexpectedly, takes the adversarial arm's page-pool high
+  water **down 5-8 points** (78.1/75.7% -> 70.4/69.6%). The mechanism is §3.2
+  read backwards: a deeper ring lands a snapshot on more ticks, so
+  `TightenFromSnapshot` runs at a smaller gap, so `cpuDirty` stays tighter and
+  fewer chunks get materialized. A short ring was costing pages, not saving
+  them.
+- **Raising `kPagedSnapshotMaxGap` was NOT taken.** Gap 6 does remove the last
+  30 stalls, and it does not blow up the pool (61.9% vs 60.6%, inside this
+  route's run-to-run spread) — so the trap note's arithmetic is not wrong, it is
+  just not binding at 6. It buys 0.43 ms/frame of CPU that this route does not
+  spend on the critical path, in exchange for loosening a documented
+  freshness bound on two samples. Not worth it. **The knob and this table are
+  the record, so the next person pays one run, not one rebuild.**
+- **The honest headline: removing the stall did not move frame time.** p50/p95/
+  p99 are statistically identical across all four arms (18.3-18.7 / 67.8-70.2 /
+  82.0-88.2). The engine is GPU-bound at ~21 ms of `present`, and the stall was
+  CPU time overlapping the wait it would have paid at the swapchain anyway. The
+  stall was genuinely 52% of CPU *busy* and genuinely not on the critical path;
+  those are compatible statements and only the second one is about framerate.
+  What the fix removes is a **CPU-side blocking wait that gets worse exactly
+  when the machine is loaded** — the loaded-machine run measured 157 stalls
+  against a quiet 46.5 — plus the pool-residency cost above, which is the one
+  that has an abort at the end of it.
+
+### 4. Determinism
+
+Hash-neutral by construction: the ring depth and the staleness ceiling change
+only *when the CPU blocks* and *which chunks are in the materialize set*, both
+of which are derived, unhashed, unsaved data. The harness path
+(`HarnessSnapshotDrain`) is untouched and still drains per tick at gap 0.
+
+- `--gate streaming` **paged and `--residency dense` are identical**: "hash
+  sequences match over 227 shifts, ball chunk evicted=1, 76 glass voxels after
+  re-entry, player crossed=1, store 2527 chunks" on both, page faults 0 on both.
+- `--gate determinism` on this branch is `b9e443c7`, matching the unmodified
+  `streaming-smooth` @ 82bf233. **That is not the pinned `5c5e3236`** — the
+  integration branch already carries a hash move (suspected upload-ordering in
+  the merged rhi staging-ring change, being diagnosed elsewhere and NOT from
+  this package). The claim made here is only that this package moves nothing
+  relative to the tree it branched from.
+
+### 5. Found on the way — a build-correctness hazard, not a perf finding
+
+**`build/.ninja_deps` in a Ninja+sccache worktree is nearly empty** (472 KB, 7
+`world.h` entries for a 100-TU target): sccache swallows MSVC's `/showIncludes`,
+so ninja tracks almost no header dependencies. A `world.h` edit here rebuilt
+only the 30 TUs that include `support.h`; `world.cpp.obj` stayed stale, and the
+link produced a binary with `kSlots = 3` in one translation unit and `16` in
+another — the World object layout differing across TUs, silently. Nothing in the
+build output says so.
+
+**After any header edit in such a worktree, `rm -rf
+build/CMakeFiles/sandvox_core.dir` before `build.sh`.** sccache makes the
+rebuild ~30 s (62 of 101 TUs came straight from cache). The tell is the build
+log's `Building CXX` count: 30 after a `world.h` change is wrong, ~100 is right.
+This is the "header edit during background build -> mixed struct layouts" trap
+with a new cause, and it applies to every agent using this generator.
+
+---
+
 ## 7. Sources
 
 - Godot Voxel Tools performance / `time_budget_ms`:

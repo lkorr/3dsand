@@ -2676,11 +2676,40 @@ class World {
   // and null-checked by FarField (a fill with no index is the old behavior).
   class FarEdits* farEdits = nullptr;
 
-  // Depth of the snapshot readback ring. Public because it is the bound on how
-  // many deliveries a caller draining toward a FRESH snapshot can ever need —
-  // SubmitTick's paged staleness fallback loops against it. The slots
-  // themselves stay private.
-  static constexpr int kReadbackSlots = 3;
+  // ---- THE SNAPSHOT READBACK RING, SIZED FROM THE PIPELINE (P2-D) ---------
+  //
+  // Public because it is the bound on how many deliveries a caller draining
+  // toward a FRESH snapshot can ever need — SubmitTick's paged staleness
+  // fallback loops against it. The slots themselves stay private.
+  //
+  // It was the literal 3, and a literal cannot survive a pipeline that got
+  // deeper. A snapshot slot is occupied from the tick that ENCODES it until
+  // the submit that produced it retires, so the ring has to cover every tick
+  // that can be in flight at once: the frame loop runs up to kMaxTicksPerFrame
+  // ticks per frame, and the swapchain lets the GPU run kFramesInFlight frames
+  // behind the CPU plus the frame being recorded. At 3 slots against 16
+  // possible in-flight ticks, EncodeReadbacks declined on 128 of 540 frames
+  // of `--frames 600 --autofly-surface` and 83 of the 157 staleness stalls
+  // happened on a tick for which no copy had been encoded at all — the ring,
+  // not the GPU, was the reason the mirror could not be refreshed.
+  //
+  // COST: one slot is a mapped host-visible staging buffer of
+  //   27 x 16 KiB mirror + 128 KiB dirty + 128 KiB occupancy + 128 KiB support
+  //   + 108 KiB fluid mirror + ~2 KiB of small tables
+  //   + kFetchPerTick x 16 KiB chunk fetches (1 MiB, the biggest single term)
+  // = 1,997,056 B = 1.904 MiB. 16 slots is 30.5 MiB, up from 5.7 MiB at three.
+  // That is against a 360 MiB page pool and a 512 MiB voxel binding, and it is
+  // the price of never refusing a snapshot the mirror's freshness depends on.
+  //
+  // Both factors are MIRRORS OF SOMEBODY ELSE'S CONSTANT and are checked:
+  // main.cpp's tick loop uses kMaxTicksPerFrame directly (one definition), and
+  // scripts/check_invariants.py compares kFramesInFlight against
+  // rhi_vulkan.h's kAcquireSlots — world.h must not include a backend header
+  // to read it.
+  static constexpr int kMaxTicksPerFrame = 4;   // main.cpp frame-loop cap
+  static constexpr int kFramesInFlight = 3;     // == rhi_vulkan.h kAcquireSlots
+  static constexpr int kReadbackSlots =
+      kMaxTicksPerFrame * (kFramesInFlight + 1);
 
  private:
   struct Slot {

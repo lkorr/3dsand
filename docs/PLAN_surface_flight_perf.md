@@ -534,6 +534,15 @@ When frames are already slow, ticks fall behind the readback ring, `snapshotStal
 latches, and a **full device drain** lands on the frame path. Slow-frame amplifier; this
 is the "readback-cadence dilation" mechanism from the board.
 
+> **Resolved 2026-09-03 (P2-D), and the diagnosis above is half wrong.** The drain is
+> gone and was gone before this item was actioned — the deferred-wake commit replaced it
+> with a targeted one-fence `WaitOldestPendingMap`, and attribution shows the `WaitIdle`
+> arm firing **zero** times over 540 frames. "Ticks fall behind the readback ring" is the
+> right half: the ring held **three** slots against sixteen possible in-flight ticks, so
+> a slow frame could refuse a copy on every one of its ticks. Sizing the ring from the
+> pipeline fixed that. See `RESEARCH_streaming_hitch.md` §P2-D for the numbers, including
+> the finding that removing the stall did not move frame time on this route.
+
 ### B4. Act-set wakes the whole surface band
 `stream.cpp:735-755`: sky skips, buried bulk skips, but **mixed → wake unconditionally**
 (`:740`) → `refilled_` → `cpuDirty_` → N26 dilation (`pagetable.cpp:798-806`). The
@@ -618,8 +627,25 @@ Worst exactly when RLE doesn't compress — mixed surface chunks. Cheapest fix:
    **The real fix is to compute the act set on the GPU beside `genChunk` and read
    back only the (stale-tolerant) demote filter.** That is a design change, not an
    async-ification, and it is the single highest-value item left in this plan.
-9. **B3:** replace the `WaitIdle` staleness drain with a bounded catch-up (skip/defer
-   the snapshot consumer instead of draining the device).
+9. **B3:** ~~replace the `WaitIdle` staleness drain with a bounded catch-up (skip/defer
+   the snapshot consumer instead of draining the device).~~ **DONE 2026-09-03 (P2-D,
+   `RESEARCH_streaming_hitch.md`) — and the item as written was aiming at the wrong
+   thing.** The `WaitIdle` arm had ALREADY been replaced by the deferred-wake commit's
+   targeted `WaitOldestPendingMap` loop and fires **zero** times; the counter that reads
+   "blocking WaitIdle on the frame path" counts every stall, not the drain. Attribution
+   (refused vs not-landed, which arm, staleness histogram) said the real defect was that
+   `kReadbackSlots` was a literal `3` against 16 possible in-flight ticks: **53% of
+   stalls were on a tick for which no snapshot copy had been encoded at all.** The ring
+   is now derived, `kMaxTicksPerFrame * (kFramesInFlight + 1)` = 16 (30.5 MiB of staging,
+   up from 5.7). Measured, `--frames 600 --autofly-surface`, interleaved: ring refusals
+   70 -> **0**, `readbackStall` p99 42.4 -> **12.9 ms**, stalls 46.5 -> 30 — and
+   `--autofly-hard` page-pool high water **78.1/75.7% -> 70.4/69.6%**, because a deeper
+   ring tightens `cpuDirty` from a fresher snapshot. **Frame p50/p95/p99 did not move**
+   (all four arms 18.3-18.7 / 67.8-70.2 / 82-88): this route is GPU-bound and the stall
+   overlapped the `present` wait. Raising `kPagedSnapshotMaxGap` was measured (gap 6
+   removes the last 30 stalls at +1.3 pp pool, gap 8 costs +3.9 pp for nothing) and
+   **not taken**; `SANDVOX_SNAP_MAXGAP` and `SANDVOX_READBACK_SLOTS` make both curves
+   one run each from here.
 10. **B5:** ~~`std::move` into `ChunkStore::Put`; amortize `SpillOverBudget`.~~ **DONE
     (the move); the scan half was a misreading.** Both call sites now move — `Put`
     takes by value and already moves internally, so an lvalue copied the whole RLE

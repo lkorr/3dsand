@@ -34,6 +34,8 @@ const char* kAvatarDefName = "human";
 namespace {
 uint32_t g_snapshotStalls = 0;
 uint32_t g_readbackDeclines = 0;
+// P2-D attribution — see SnapshotStallStats in support.h.
+SnapshotStallStats g_stallStats{};
 }
 
 // Time of day used by --shot, as a 0..1 fraction of the cycle (0 = midnight,
@@ -972,7 +974,31 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
   // The honest way to raise it is to measure first: SANDVOX_PT_DEBUG=1 prints
   // `cpuDirty=` per tick, so run a hitch-heavy flight and look at what the
   // mirror actually reaches at gap 4 before granting it more rings.
-  constexpr uint32_t kPagedSnapshotMaxGap = 4;
+  //
+  // ---- P2-D: IT IS A COST BOUND, SO IT IS MEASURABLE WITHOUT A REBUILD -----
+  // Everything above is about what the gap COSTS, and none of it is about
+  // correctness: step (1)'s recurrence is a valid superset at every gap, and
+  // TightenFromSnapshot refuses outright once `rolls` outruns the C ring, so a
+  // stale snapshot makes the mirror EXPENSIVE, never wrong. That makes the
+  // right way to argue about the value a sweep rather than a paragraph, and
+  // the note above says so in as many words ("the honest way to raise it is to
+  // measure first"). SANDVOX_SNAP_MAXGAP is that measurement, permanently: it
+  // costs one run per candidate instead of one rebuild per candidate. The
+  // ceiling is PageTable::kCRing + 1 — past it the tightening skips entirely
+  // and the mirror is on step (1) alone, which is the runaway the note warns
+  // about with no fixed point to fall back to.
+  static const uint32_t kPagedSnapshotMaxGap = [] {
+    constexpr uint32_t kDefault = 4;
+    if (const char* e = std::getenv("SANDVOX_SNAP_MAXGAP")) {
+      const long n = std::strtol(e, nullptr, 10);
+      if (n >= 1 && n <= 13) {
+        std::printf("[snap] SANDVOX_SNAP_MAXGAP=%ld (default %u)\n", n,
+                    kDefault);
+        return (uint32_t)n;
+      }
+    }
+    return kDefault;
+  }();
   const bool paged = world.residency == World::Residency::Paged;
   const uint32_t maxGap =
       world.pages->InSettleWindow(tick) ? 0u : kPagedSnapshotMaxGap;
@@ -1042,9 +1068,27 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
     // in-flight snapshot and then delivers it. Looping re-checks the ACTUAL
     // predicate — freshness — after each delivery, so it stops the moment the
     // gap is covered instead of over-waiting: with a copy kicked for `tick`
-    // just above, the worst case is draining the 3-slot ring, and the common
-    // case is one wait on a readback that was already nearly done.
+    // just above, the worst case is draining the whole ring, and the common
+    // case is one wait on a readback that was already nearly done. Measured
+    // 2026-09-03 (P2-D): 157 stalls, 157 resolved by exactly ONE fence.
     g_snapshotStalls++;
+    // ---- ATTRIBUTION, recorded BEFORE the wait (rule 6) ------------------
+    // `doCopy` is the whole refused/issued split: false means EncodeReadbacks
+    // found every ring slot in flight and declined, so no snapshot exists for
+    // this tick and the newest one the ring can deliver is strictly older.
+    g_stallStats.stalls++;
+    if (doCopy) g_stallStats.issuedArm++; else g_stallStats.refusedArm++;
+    {
+      const uint32_t gapNow =
+          world.Snap().valid
+              ? (tick > world.Snap().tick ? tick - world.Snap().tick : 0u)
+              : 9u;
+      const uint32_t bucket = world.Snap().valid ? std::min(gapNow, 8u) : 9u;
+      g_stallStats.gapHist[bucket]++;
+      if (world.Snap().valid && gapNow > g_stallStats.gapMax)
+        g_stallStats.gapMax = gapNow;
+    }
+    const auto stallT0 = std::chrono::steady_clock::now();
     // ReadbackStall, NOT Readback: this is the one blocking wait on the path,
     // and it shared a row with the non-blocking pump until the row read as
     // "async readback spiked" after a lake was disturbed. The pump is a poll
@@ -1057,16 +1101,59 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
     // Bounded by the ring depth: each iteration retires one slot, and a slot
     // cannot be re-armed from here (no submit happens inside the loop), so this
     // terminates on WaitOldestPendingMap returning false at the latest.
-    for (int i = 0; i < World::kReadbackSlots && !fresh(); i++)
-      if (!ctx.WaitOldestPendingMap()) break;
-    // Still stale means no in-flight map could supply it — the ring declined a
-    // copy this tick, or a map failed. Fall back to the old behaviour rather
-    // than letting the mirror dilate unchecked: correctness first, and this is
-    // strictly rarer than the case above.
-    if (!fresh()) {
+    // MAPS EXHAUSTED vs LOOP EXHAUSTED, and the difference decides whether the
+    // drain below can possibly help. WaitOldestPendingMap returns false only
+    // when nothing is outstanding; if that happens, every snapshot the ring
+    // ever encoded has already been delivered and no amount of further waiting
+    // will produce a fresher one.
+    bool mapsExhausted = false;
+    for (int i = 0; i < World::kReadbackSlots && !fresh(); i++) {
+      if (!ctx.WaitOldestPendingMap()) {
+        mapsExhausted = true;
+        break;
+      }
+      g_stallStats.mapWaits++;
+    }
+    // Still stale means no in-flight map could supply it — every slot the ring
+    // ever armed has now been delivered and the newest is still too old.
+    const auto idleT0 = std::chrono::steady_clock::now();
+    double idleMs = 0;
+    if (!fresh() && !mapsExhausted) {
+      // ---- THE DRAIN IS NOW UNREACHABLE-BY-CONSTRUCTION, NOT JUST RARE -----
+      // The loop above is bounded by the ring depth and the ring is the only
+      // producer of these maps, so it cannot exit on the bound with maps still
+      // outstanding — `mapsExhausted` is the only way out that leaves the
+      // snapshot stale. In that state WaitIdle waits for WORK, and work is not
+      // what is missing: no readback was ever encoded for a tick inside the
+      // gap, so draining the device delivers nothing new. Measured over
+      // `--frames 600 --autofly-surface` on the 3-slot ring: 157 stalls, 157
+      // resolved by a single targeted fence, ZERO reaching here. Keeping the
+      // arm but gating it on "maps remain" turns a 93 ms futile device drain
+      // into a correctly-attributed no-op, and the g_stallStats.proceedStale
+      // counter names the case that used to hide inside it.
+      g_stallStats.idleArm++;
       ctx.WaitIdle();
       ctx.ProcessEvents();
+      // THE FUTILITY CHECK. WaitIdle waits for work; it does not ENCODE a
+      // readback. If the loop above already retired every pending map and the
+      // newest of them is still older than maxGap, draining the device cannot
+      // change that — the count here is device drains that bought nothing.
+      if (!fresh()) g_stallStats.idleFutile++;
+      idleMs = std::chrono::duration<double, std::milli>(
+                   std::chrono::steady_clock::now() - idleT0)
+                   .count();
+      g_stallStats.idleArmMs += idleMs;
+    } else if (fresh()) {
+      g_stallStats.mapArm++;
+    } else {
+      // Still stale with nothing left to wait for. SAFE — §3.2 step (1)'s
+      // dilation carries the mirror and the tightening either rolls the old
+      // snapshot forward or skips — but expensive, so it is counted rather
+      // than hidden behind a device drain that cannot fix it.
+      g_stallStats.proceedStale++;
     }
+    g_stallStats.mapArmMs +=
+        std::chrono::duration<double, std::milli>(idleT0 - stallT0).count();
   }
 }
 
@@ -1080,6 +1167,12 @@ uint32_t TakeReadbackDeclines() {
   const uint32_t n = g_readbackDeclines;
   g_readbackDeclines = 0;
   return n;
+}
+
+SnapshotStallStats TakeSnapshotStallStats() {
+  const SnapshotStallStats s = g_stallStats;
+  g_stallStats = SnapshotStallStats{};
+  return s;
 }
 
 namespace {

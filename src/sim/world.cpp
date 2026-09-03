@@ -1,6 +1,7 @@
 #include "sim/world.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 
@@ -290,11 +291,37 @@ const CachedChunk* World::Cached(IVec3 worldChunk) const {
   return it == cache_.end() ? nullptr : &it->second;
 }
 
+// ---- THE RING DEPTH, AS AN A/B ARM IN ONE BINARY (P2-D) -------------------
+//
+// kReadbackSlots is derived from the pipeline depth (world.h) and that is the
+// shipping value. This caps how many of those slots may be OCCUPIED, so the
+// old 3-slot behaviour and the derived 16-slot behaviour are two arms of the
+// SAME executable rather than two builds -- the same argument as the
+// "an #if-guarded SIMD path tests only itself" note: a differential measured
+// across two binaries on a shared machine measures the binaries too. The
+// buffers for all kSlots are allocated either way; a capped run just leaves
+// the tail of the ring unused, which costs address space and nothing else.
+static int ActiveReadbackSlots() {
+  static const int n = [] {
+    if (const char* e = std::getenv("SANDVOX_READBACK_SLOTS")) {
+      const long v = std::strtol(e, nullptr, 10);
+      if (v >= 1 && v <= World::kReadbackSlots) {
+        std::printf("[snap] SANDVOX_READBACK_SLOTS=%ld (of %d)\n", v,
+                    World::kReadbackSlots);
+        return (int)v;
+      }
+    }
+    return World::kReadbackSlots;
+  }();
+  return n;
+}
+
 bool World::EncodeReadbacks(const rhi::Device&, const rhi::CommandEncoder& enc,
                             IVec3 playerChunkBase, uint32_t particleLivePage,
                             uint32_t tick) {
   int slot = -1;
-  for (int i = 0; i < kSlots; i++) {
+  const int active = ActiveReadbackSlots();
+  for (int i = 0; i < active; i++) {
     if (!slots_[i].inFlight) { slot = i; break; }
   }
   if (slot < 0) return false;

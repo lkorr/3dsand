@@ -229,7 +229,10 @@ double g_frameScopeMax[sandvox::kPerfScopeCount] = {};
 std::vector<double> g_frameScopeSeries[sandvox::kPerfScopeCount];
 uint64_t g_frameSnapStalls = 0;      // total paged-staleness WaitIdle stalls
 uint64_t g_frameSnapStallFrames = 0; // frames that paid at least one
-uint64_t g_frameRbDeclines = 0;      // readback requests the 3-slot ring refused
+uint64_t g_frameRbDeclines = 0;      // readback requests the ring refused
+// P2-D: WHICH cause and WHICH arm (support.h SnapshotStallStats). Accumulated
+// over the harness frames only, like the three counters above.
+sandvox::SnapshotStallStats g_frameStallStats{};
 
 // ---- --autofly-park: the active-chunk DECAY probe ---------------------------
 //
@@ -5229,7 +5232,12 @@ int main(int argc, char** argv) {
     // Cap the tick backlog: with no cap, any stretch where 30 Hz can't be met
     // (heavy fire, worldgen, a save) accrues unbounded debt and the loop runs
     // 4 ticks/frame long after the load has passed. Drop the excess instead.
-    if (accumulator > 4 * kTickDt) accumulator = 4 * kTickDt;
+    // ONE DEFINITION of the cap: World::kReadbackSlots is derived from it (the
+    // snapshot ring must cover every tick that can be in flight), so a literal
+    // here would silently under-size the ring.
+    constexpr int kMaxTicksPerFrame = World::kMaxTicksPerFrame;
+    if (accumulator > kMaxTicksPerFrame * kTickDt)
+      accumulator = kMaxTicksPerFrame * kTickDt;
     int ticksThisFrame = 0;
     bool mouseL = captured && glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS;
     bool mouseR = captured && glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_RIGHT) == GLFW_PRESS;
@@ -5320,7 +5328,7 @@ int main(int argc, char** argv) {
     // Stream::Update is a per-TICK call and the clamp below runs up to four of
     // them, so a slow frame used to shift two or three times and get slower.
     stream.BeginFrame();
-    while (accumulator >= kTickDt && ticksThisFrame < 4) {
+    while (accumulator >= kTickDt && ticksThisFrame < kMaxTicksPerFrame) {
       accumulator -= kTickDt;
       if (ui.paused && !ui.stepOnce) break;
       ui.stepOnce = false;
@@ -8206,6 +8214,7 @@ int main(int argc, char** argv) {
     double frameScope[sandvox::kPerfScopeCount] = {};
     uint32_t frameStalls = 0;
     uint32_t frameDeclines = 0;
+    sandvox::SnapshotStallStats frameStallStats{};
     const double frameWallMs = (NowSeconds() - now) * 1000.0;
     // The tail of the startup timeline: the first frames are where the lazily
     // created graphics pipelines, the far-field drain and the first ticks land.
@@ -8232,6 +8241,7 @@ int main(int argc, char** argv) {
           std::max(0.0, frameWallMs - sum);
       frameStalls = TakeSnapshotStalls();
       frameDeclines = TakeReadbackDeclines();
+      frameStallStats = TakeSnapshotStallStats();
     }
     if (g_harnessFrames > 0 && frameCounter > 60) {
       for (int i = 0; i < sandvox::kPerfScopeCount; i++) {
@@ -8242,6 +8252,20 @@ int main(int argc, char** argv) {
       g_frameSnapStalls += frameStalls;
       if (frameStalls) g_frameSnapStallFrames++;
       g_frameRbDeclines += frameDeclines;
+      g_frameStallStats.stalls += frameStallStats.stalls;
+      g_frameStallStats.refusedArm += frameStallStats.refusedArm;
+      g_frameStallStats.issuedArm += frameStallStats.issuedArm;
+      g_frameStallStats.mapArm += frameStallStats.mapArm;
+      g_frameStallStats.idleArm += frameStallStats.idleArm;
+      g_frameStallStats.idleFutile += frameStallStats.idleFutile;
+      g_frameStallStats.proceedStale += frameStallStats.proceedStale;
+      g_frameStallStats.mapWaits += frameStallStats.mapWaits;
+      for (int i = 0; i < 10; i++)
+        g_frameStallStats.gapHist[i] += frameStallStats.gapHist[i];
+      g_frameStallStats.gapMax =
+          std::max(g_frameStallStats.gapMax, frameStallStats.gapMax);
+      g_frameStallStats.mapArmMs += frameStallStats.mapArmMs;
+      g_frameStallStats.idleArmMs += frameStallStats.idleArmMs;
     }
 
     // ---- LIVE TELEMETRY: close the frame and send it --------------------
@@ -8412,6 +8436,27 @@ int main(int argc, char** argv) {
                     (unsigned long long)n,
                     100.0 * (double)g_frameSnapStallFrames / (double)n,
                     (unsigned long long)g_frameRbDeclines);
+        // ---- P2-D: which cause, which arm, how stale (CLAUDE.md rule 6) ----
+        // The line above is the bare count. This one says whether the ring was
+        // too shallow (refused) or the GPU too far behind (issued-not-landed),
+        // whether the targeted one-fence wait covered it or the full device
+        // drain ran, and how many of those drains were futile.
+        {
+          const sandvox::SnapshotStallStats& ss = g_frameStallStats;
+          std::printf("      cause: refused %u (no copy encoded for the tick) "
+                      "| not-landed %u (GPU queue depth)\n",
+                      ss.refusedArm, ss.issuedArm);
+          std::printf("      arm:   map-wait %u (%u fences, %.1f ms total) "
+                      "| WaitIdle %u (%.1f ms total, %u futile) "
+                      "| proceeded stale %u\n",
+                      ss.mapArm, ss.mapWaits, ss.mapArmMs, ss.idleArm,
+                      ss.idleArmMs, ss.idleFutile, ss.proceedStale);
+          std::printf("      staleness at stall (ticks):");
+          for (int i = 0; i <= 8; i++)
+            if (ss.gapHist[i]) std::printf(" %d:%u", i, ss.gapHist[i]);
+          if (ss.gapHist[9]) std::printf(" no-snap:%u", ss.gapHist[9]);
+          std::printf("  max %u\n", ss.gapMax);
+        }
         // ---- and one level down into `stream`, which is where it all is ----
         // The scope table says streaming dominates; this says which PART of a
         // window shift. Denominated PER SHIFT, because a shift is the unit the

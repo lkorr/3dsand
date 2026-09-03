@@ -140,6 +140,50 @@ uint32_t TakeSnapshotStalls();
 // ring itself is the limit. Read-and-cleared like TakeSnapshotStalls.
 uint32_t TakeReadbackDeclines();
 
+// ---- P2-D: WHY the stall fired, not just that it did (CLAUDE.md rule 6) ----
+//
+// The two counters above are a bare count, and a bare count buys one hypothesis
+// per run. These say which of the two structurally different causes fired and
+// which arm paid for it:
+//
+//   refusedArm  the ring had no free slot on this tick, so NO copy was issued
+//               for it. The newest snapshot the ring can ever deliver is older
+//               than this tick, and if it is older than maxGap the wait loop
+//               cannot succeed no matter how long it blocks. That is a RING
+//               DEPTH problem.
+//   issuedArm   a copy WAS issued for this tick (and for the ticks before it);
+//               they simply have not landed because the GPU queue is deep.
+//               That is a LATENCY problem, and blocking is the only answer
+//               short of tolerating a bigger gap.
+//
+//   mapArm      the WaitOldestPendingMap loop reached freshness (targeted, one
+//               fence per iteration).
+//   idleArm     it did not, and the full ctx.WaitIdle() drain ran.
+//   idleFutile  ... and the snapshot was STILL stale afterwards. WaitIdle
+//               cannot manufacture a snapshot that was never encoded, so every
+//               count here is a full device drain that bought nothing.
+//
+// gapHist[i] is the staleness (tick - snap.tick) at the moment of the stall,
+// clamped, with slot 9 meaning "no valid snapshot at all". mapArmMs/idleArmMs
+// split the blocked wall time the same way ReadbackStall aggregates it.
+struct SnapshotStallStats {
+  uint32_t stalls = 0;
+  uint32_t refusedArm = 0;
+  uint32_t issuedArm = 0;
+  uint32_t mapArm = 0;
+  uint32_t idleArm = 0;
+  uint32_t idleFutile = 0;
+  uint32_t proceedStale = 0;  // nothing left to wait for; ran on a stale mirror
+  uint32_t mapWaits = 0;
+  uint32_t gapHist[10] = {};
+  uint32_t gapMax = 0;
+  double mapArmMs = 0;
+  double idleArmMs = 0;
+};
+// Read-and-clear, like the two counters above. main.cpp accumulates it over the
+// harness frames and prints it beside the stall line.
+SnapshotStallStats TakeSnapshotStallStats();
+
 // Body render plumbing moved to game/bodyreg.h: BodyRegistry owns the ONE
 // definition of the debris | mob | avatar slot walk, and all three parallel
 // arrays (xforms, cube instances, micro insts) are built through it. The free

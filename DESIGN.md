@@ -6732,7 +6732,7 @@ never blocks, and what spiked was the fallback, firing every tick while the GPU
 was more than a frame behind and the loop was catching up at 4 ticks/frame. That
 is a relabelled GPU wait — the CPU would have spent the same time in `present` —
 so it now has its own row and its own two counters: `snapshotStalls` (the waits)
-and `readbackDeclined` (readback requests the 3-slot ring refused). Declines
+and `readbackDeclined` (readback requests the ring refused). Declines
 without stalls mean the ring is the limit; stalls with declines mean the GPU is.
 
 **Verify the page, not just the numbers.** `scripts/check_perfview.sh` drives the

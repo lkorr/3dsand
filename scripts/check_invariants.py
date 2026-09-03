@@ -1279,6 +1279,34 @@ def check_far_material_bits():
             f"(ids 0..{mask}). Widen the far cell or drop a material.")
 
 
+# ------------------------------------------------------- readback ring depth
+def check_readback_ring():
+    """World::kFramesInFlight must equal rhi_vulkan.h's kAcquireSlots.
+
+    The snapshot readback ring is sized from the pipeline depth
+    (kMaxTicksPerFrame x (kFramesInFlight + 1)) so that every tick that can be
+    in flight at once still has a slot. world.h cannot include a backend
+    header to read the real number, so it mirrors it -- and a mirror nobody
+    checks is the drift this script exists for. Under-sizing the ring is
+    silent: EncodeReadbacks just declines, the CPU page-table mirror goes
+    stale, and the frame blocks on a fence to get it back (P2-D,
+    docs/RESEARCH_streaming_hitch.md).
+    """
+    w = read("src/sim/world.h")
+    v = read("src/gpu/rhi_vulkan.h")
+    if not w or not v:
+        return
+    mw = re.search(r"kFramesInFlight\s*=\s*(\d+)", w)
+    mv = re.search(r"kAcquireSlots\s*=\s*(\d+)", v)
+    if not mw or not mv:
+        return
+    checked.append("readback ring depth")
+    if mw.group(1) != mv.group(1):
+        problems.append(
+            f"world.h kFramesInFlight = {mw.group(1)} but rhi_vulkan.h "
+            f"kAcquireSlots = {mv.group(1)} -- the snapshot readback ring is "
+            f"sized from the first and the GPU runs ahead by the second")
+
 ALL = {
     "worldgen": check_worldgen_mirror,
     "treeatlas": check_tree_atlas,
@@ -1299,6 +1327,7 @@ ALL = {
     "curprim": check_current_prims,
     "counts": check_tick_counts,
     "farbits": check_far_material_bits,
+    "ringdepth": check_readback_ring,
 }
 
 # The hook passes the edited file; run only the checks that file can break.
@@ -1326,6 +1355,8 @@ RELEVANT = {
     "src/gpu/rhi_record.h": ["counts"],
     "src/gpu/vk_record.h": ["counts"],
     "src/gpu/rhi_vk.cpp": ["counts"],
+    "src/gpu/rhi_vulkan.h": ["ringdepth"],
+    "src/sim/world.h": ["ringdepth"],
     "src/sim/pass_table.def": ["counts", "perfnodes"],
     "src/measure/perfnodes.h": ["perfnodes"],
 }
