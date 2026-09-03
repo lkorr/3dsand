@@ -1169,6 +1169,10 @@ void PageTable::ConsumeOccupancy(const std::vector<uint32_t>& occupancy,
   if (zeroStreak_.size() != kNumChunks) zeroStreak_.assign(kNumChunks, 0);
   const auto& t = world_->pageTableCpu();
   const bool haveStainFlags = occStain.size() == kNumChunks;
+  // The tick's free-path event tallies (PageCensus's f* block). Reset here and
+  // published by RunCensus at the bottom of this function, so a reader between
+  // ticks sees one coherent set.
+  pending_ = PageCensus{};
   std::vector<uint32_t> candidates;
   for (uint32_t s = 0; s < kNumChunks; s++) {
     if (occupancy[s] != 0) { zeroStreak_[s] = 0; continue; }
@@ -1246,16 +1250,21 @@ void PageTable::ConsumeOccupancy(const std::vector<uint32_t>& occupancy,
       probesHarvested = (uint32_t)pendingProbeSlots_.size();
       for (size_t ci = 0; ci < pendingProbeSlots_.size(); ci++) {
         const uint32_t s = pendingProbeSlots_[ci];
-        if (ci < pendingProbeOk_.size() && !pendingProbeOk_[ci]) continue;
-        if ((t[s] & kPtSentinelBit) != 0u) continue;  // already freed
+        if (ci < pendingProbeOk_.size() && !pendingProbeOk_[ci]) {
+          pending_.fRefusedGone++;
+          continue;
+        }
+        if ((t[s] & kPtSentinelBit) != 0u) { pending_.fRefusedGone++; continue; }
         // Identity: the slot must still map to the same world chunk it did
         // when the copy was issued. A shift between submit and harvest
         // reassigns the slot; classifying the old chunk's words against the
         // new chunk's page would silently free the wrong data.
         if (ci < pendingProbeKeys_.size() &&
             World::PackChunkKey(world_->SlotToWorldChunk(s)) !=
-                pendingProbeKeys_[ci])
+                pendingProbeKeys_[ci]) {
+          pending_.fRefusedIdent++;
           continue;
+        }
         const uint32_t* words = freeProbe_.data() + ci * (size_t)kChunkVol;
         // Same stainless-air predicate as Classify's EMPTY test — one
         // definition now, and the index the debug print wants comes back from
@@ -1267,11 +1276,17 @@ void PageTable::ConsumeOccupancy(const std::vector<uint32_t>& occupancy,
             std::printf("[pt] tick %u free REFUSED slot %u: word %08x at %u\n",
                         tick_, s, words[at], (uint32_t)at);
           }
+          pending_.fRefusedWords++;
           zeroStreak_[s] = 0;
           continue;
         }
-        if (cpuDirty_.Has(s)) { zeroStreak_[s] = kPageFreeTicks - 1; continue; }
+        if (cpuDirty_.Has(s)) {
+          pending_.fRefusedDirty++;
+          zeroStreak_[s] = kPageFreeTicks - 1;
+          continue;
+        }
         if (shellActive_ && shell_.Has(s)) {
+          pending_.fRefusedShell++;
           zeroStreak_[s] = kPageFreeTicks - 1;
           continue;
         }
@@ -1281,6 +1296,7 @@ void PageTable::ConsumeOccupancy(const std::vector<uint32_t>& occupancy,
         retire_.push_back({page, tick});
         pagesInUse_--;
         pagesFreed_++;
+        pending_.fFreed++;
       }
       pendingProbeSlots_.clear();
       probePending_ = false;
@@ -1289,8 +1305,20 @@ void PageTable::ConsumeOccupancy(const std::vector<uint32_t>& occupancy,
   }
 
   // ---- SUBMIT phase: kick a new probe for this tick's candidates ----------
+  pending_.fCands = (uint32_t)candidates.size();
+  // THE STRANDING PATH, recorded because it is invisible from any other number.
+  // The re-arm loop that keeps a deferred candidate eligible
+  // (`zeroStreak_[...] = kPageFreeTicks - 1`) lives INSIDE the submit block
+  // below, so when the block is skipped because last tick's map has not landed,
+  // every candidate this tick keeps its streak of exactly kPageFreeTicks, ticks
+  // past it next tick, and can never satisfy the `== kPageFreeTicks` trigger
+  // again. It becomes a permanently resident all-air page (PageCensus::rOrphan).
+  if (probeSubmit_ && !candidates.empty() && probePending_)
+    pending_.fProbeBusy = (uint32_t)candidates.size();
   if (probeSubmit_ && !candidates.empty() && !probePending_) {
     const size_t n = std::min(candidates.size(), kMaxFreeProbesPerTick);
+    pending_.fSubmitted = (uint32_t)n;
+    pending_.fCapped = (uint32_t)(candidates.size() - n);
     pendingProbeSlots_.assign(candidates.begin(), candidates.begin() + n);
     pendingProbeKeys_.resize(n);
     for (size_t i = 0; i < n; i++)
@@ -1307,6 +1335,159 @@ void PageTable::ConsumeOccupancy(const std::vector<uint32_t>& occupancy,
                 "harvested=%u %.2f ms\n",
                 tick, candidates.size(), probesRun, probesHarvested,
                 PtNowMs() - probeT0);
+
+  // ---- ATTRIBUTION, after this tick's frees so it describes the result -----
+  RunCensus(occupancy, occStain);
+}
+
+// Bill every resident page to exactly one reason, and bucket it by height band.
+// See the PageCensus comment in the header for the priority order and why it is
+// that order.
+//
+// COST: two more walks of kNumChunks (one to find each slot column's top of
+// matter, one to bill), on top of the walk ConsumeOccupancy was already doing.
+// Measured shape, not cost: ~98k branch-light iterations per tick, no
+// allocation after the first call, no readback and no GPU work. It runs
+// unconditionally rather than behind SANDVOX_PT_DEBUG because the whole point
+// is to answer this question from a LIVE session over --telemetry, where no
+// environment variable was set and no harness flag was passed.
+void PageTable::RunCensus(const std::vector<uint32_t>& occupancy,
+                          const std::vector<uint8_t>& occStain) {
+  if (!paged_) return;
+  if (occupancy.size() != kNumChunks) return;
+  const auto& t = world_->pageTableCpu();
+  const bool haveStain = occStain.size() == kNumChunks;
+
+  PageCensus c;
+  c.valid = true;
+  c.tick = tick_;
+  c.pool = poolPages_;
+  c.resident = pagesInUse_;
+  c.freeList = (uint32_t)freePages_.size();
+  c.retired = (uint32_t)retire_.size();
+  // The f* block was tallied by the caller above.
+  c.fCands = pending_.fCands;
+  c.fSubmitted = pending_.fSubmitted;
+  c.fCapped = pending_.fCapped;
+  c.fProbeBusy = pending_.fProbeBusy;
+  c.fFreed = pending_.fFreed;
+  c.fRefusedWords = pending_.fRefusedWords;
+  c.fRefusedDirty = pending_.fRefusedDirty;
+  c.fRefusedShell = pending_.fRefusedShell;
+  c.fRefusedIdent = pending_.fRefusedIdent;
+  c.fRefusedGone = pending_.fRefusedGone;
+
+  // Pass A: the top of matter per SLOT COLUMN, in WORLD chunk Y.
+  //
+  // World Y and not slot Y, because the window is toroidal on all three axes:
+  // slot y+1 is world y+1 only until the wrap, and a band computed in slot
+  // space would report the column upside down for whichever slice the origin
+  // currently straddles. `kColNone` is "this column has no matter at all",
+  // which is a real state (open ocean of sky) and must not read as ground at
+  // y = 0.
+  constexpr int32_t kColNone = INT32_MIN;
+  if (colTop_.size() != (size_t)kNChunk * kNChunk)
+    colTop_.assign((size_t)kNChunk * kNChunk, kColNone);
+  else
+    std::fill(colTop_.begin(), colTop_.end(), kColNone);
+  for (uint32_t s = 0; s < kNumChunks; s++) {
+    if (occupancy[s] == 0u) continue;
+    const uint32_t sx = s % kNChunk;
+    const uint32_t sz = s / (kNChunk * kNChunk);
+    const int32_t wy = world_->SlotToWorldChunk(s).y;
+    int32_t& top = colTop_[sz * kNChunk + sx];
+    if (top == kColNone || wy > top) top = wy;
+  }
+
+  // Pass B: bill the resident pages.
+  for (uint32_t s = 0; s < kNumChunks; s++) {
+    if ((t[s] & kPtSentinelBit) != 0u) continue;   // sentinel: not a page
+    const uint32_t occ = occupancy[s];
+    const uint8_t streak = zeroStreak_.size() == kNumChunks ? zeroStreak_[s] : 0;
+    if (cpuDirty_.Has(s)) c.rDirty++;
+    else if (materialized_.Has(s)) c.rRing++;
+    else if (occ >= kChunkVol) c.rFull++;
+    else if (occ != 0u) c.rMatter++;
+    else if (shellActive_ && shell_.Has(s)) c.rShell++;
+    else if (haveStain && occStain[s] != 0u) c.rStain++;
+    else if (streak < kPageFreeTicks) c.rWaiting++;
+    else if (streak == kPageFreeTicks) c.rCand++;
+    else c.rOrphan++;
+
+    const uint32_t sx = s % kNChunk;
+    const uint32_t sz = s / (kNChunk * kNChunk);
+    const int32_t top = colTop_[sz * kNChunk + sx];
+    const int32_t wy = world_->SlotToWorldChunk(s).y;
+    if (top == kColNone || wy > top) {
+      c.bSky++;
+      if (occ == 0u) c.bSkyEmpty++;
+    } else if (wy >= top - 1) {
+      c.bSurface++;
+    } else {
+      c.bBuried++;
+    }
+  }
+
+  census_ = c;
+  // Latch the peak's census. pagesHighWater_ is monotonic, so comparing it
+  // against the mark the last latch was taken at fires exactly on the ticks
+  // where the peak moved — which is the tick a --frames run wants explained.
+  if (pagesHighWater_ > censusHighMark_) {
+    censusHighMark_ = pagesHighWater_;
+    censusHigh_ = c;
+  }
+  // Periodic dump. Cadence is a knob because the two questions want different
+  // ones: "what is the steady state" wants every few hundred ticks, "what
+  // happened at the shift" wants every tick.
+  static const uint32_t every = [] {
+    const char* e = getenv("SANDVOX_PT_CENSUS_EVERY");
+    return e ? (uint32_t)std::max(1, atoi(e)) : 120u;
+  }();
+  if (getenv("SANDVOX_PT_DEBUG") && every && (tick_ % every) == 0u) {
+    char label[64];
+    std::snprintf(label, sizeof label, "tick %u", tick_);
+    PrintPageCensus(c, label);
+  }
+}
+
+// The one printer, so SANDVOX_PT_DEBUG's periodic dump and --frames' exit
+// summary cannot disagree about the shape of the table.
+//
+// It prints the RESIDUAL ("unbilled") rather than assuming the buckets add up.
+// A future contributor to residency that this census does not know about would
+// otherwise be silently absorbed into whichever bucket happened to catch it,
+// which is precisely the failure mode a bare count already has.
+void PrintPageCensus(const PageCensus& c, const char* label) {
+  if (!c.valid) {
+    std::printf("[pt-census] %s: no census (dense residency, or no snapshot "
+                "has landed yet)\n", label);
+    return;
+  }
+  const uint32_t billed = c.rDirty + c.rRing + c.rFull + c.rMatter + c.rShell +
+                          c.rStain + c.rWaiting + c.rCand + c.rOrphan;
+  const double pct = c.resident ? 100.0 / (double)c.resident : 0.0;
+  std::printf(
+      "[pt-census] %s (tick %u): resident %u / %u (%.1f%%), free %u, "
+      "retired %u\n"
+      "  held by   dirty %u (%.1f%%) | ring %u (%.1f%%) | full %u (%.1f%%) | "
+      "matter %u (%.1f%%)\n"
+      "            shell %u | stain %u | waiting %u | cand %u | ORPHAN %u "
+      "(%.1f%%) | unbilled %d\n"
+      "  bands     sky %u (of which all-air %u) | surface %u | buried %u\n"
+      "  free path cands %u -> submitted %u, freed %u | capped %u, "
+      "probe-busy %u\n"
+      "            refused: words %u, dirty %u, shell %u, identity %u, "
+      "gone %u\n",
+      label, c.tick, c.resident, c.pool,
+      c.pool ? 100.0 * (double)c.resident / (double)c.pool : 0.0, c.freeList,
+      c.retired, c.rDirty, c.rDirty * pct, c.rRing, c.rRing * pct, c.rFull,
+      c.rFull * pct, c.rMatter, c.rMatter * pct, c.rShell, c.rStain,
+      c.rWaiting, c.rCand, c.rOrphan, c.rOrphan * pct,
+      (int)c.resident - (int)billed, c.bSky, c.bSkyEmpty, c.bSurface,
+      c.bBuried, c.fCands, c.fSubmitted, c.fFreed, c.fCapped, c.fProbeBusy,
+      c.fRefusedWords, c.fRefusedDirty, c.fRefusedShell, c.fRefusedIdent,
+      c.fRefusedGone);
+  std::fflush(stdout);
 }
 
 void PageTable::ResetStreaks(const std::vector<uint32_t>& slots) {

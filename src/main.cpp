@@ -8294,8 +8294,23 @@ int main(int argc, char** argv) {
         ctr(sandvox::PerfCounter::PageFaults, lsn.pageFaults);
         ctr(sandvox::PerfCounter::VoxelsNonAir, (double)lsn.voxelTotal);
       }
-      if (world.pages)
+      if (world.pages) {
         ctr(sandvox::PerfCounter::PagesResident, world.pages->PagesInUse());
+        // WHY those pages are resident, not just how many
+        // (docs/RESEARCH_streaming_hitch.md §6). The four `held` rows partition
+        // PagesResident, so a live capture over --telemetry answers the
+        // question the count alone cannot — which is the whole reason the
+        // census runs on the frame path instead of behind SANDVOX_PT_DEBUG.
+        const PageCensus& pc = world.pages->Census();
+        if (pc.valid) {
+          ctr(sandvox::PerfCounter::PagesHeldDirty, pc.rDirty + pc.rRing);
+          ctr(sandvox::PerfCounter::PagesHeldMatter, pc.rFull + pc.rMatter);
+          ctr(sandvox::PerfCounter::PagesHeldEmpty,
+              pc.rShell + pc.rStain + pc.rWaiting + pc.rCand);
+          ctr(sandvox::PerfCounter::PagesHeldOrphan, pc.rOrphan);
+          ctr(sandvox::PerfCounter::PagesRetired, pc.retired);
+        }
+      }
       // Read-and-cleared above, so a frame that ran four ticks reports all four
       // of their stalls and the next frame starts at zero.
       ctr(sandvox::PerfCounter::SnapshotStalls, (double)frameStalls);
@@ -8518,6 +8533,13 @@ int main(int argc, char** argv) {
                   hw, kPoolPages, 100.0 * (double)hw / (double)kPoolPages,
                   (double)hw * kChunkVol * 4.0 / (1024.0 * 1024.0),
                   world.pages->PagesInUse(), stream.ShiftCount());
+      // And WHAT those pages are, at the peak and at the exit — the two ticks
+      // a sizing run needs explained. Without this the harness prints the
+      // number it exists to measure and nothing about its composition, which
+      // is the same bare-count trap the high-water line itself was added to
+      // fix one level up (CLAUDE.md rule 6).
+      PrintPageCensus(world.pages->CensusAtHighWater(), "high water");
+      PrintPageCensus(world.pages->Census(), "exit");
     }
     // Per-regime arms (see g_frameMsLow/High). The HIGH number is the one the
     // altitude work is judged on; the LOW one is the canopy/meadow skim.

@@ -321,6 +321,18 @@ enum class PerfCounter : uint8_t {
   WaterBodies,       // registered lakes
   SnapshotStalls,    // paged staleness fallbacks: a BLOCKING WaitIdle per count
   ReadbackDeclined,  // readback requests refused: the ring was full
+  // ---- WHY the pages are resident (PageCensus, src/sim/pagetable.h) --------
+  // `pagesResident` alone is the bare count CLAUDE.md rule 6 is about. These
+  // four partition it — their sum IS pagesResident — so a live session can be
+  // read for cause instead of by turning features off. Kept to four because
+  // the census has nine buckets and a telemetry frame is a 8 KiB JSON: the
+  // full table is on stdout under SANDVOX_PT_DEBUG and in --frames' exit
+  // summary; these are the ones whose LEVERS differ.
+  PagesHeldDirty,    // in cpuDirty or its materialize ring: conservatism
+  PagesHeldMatter,   // holds actual matter (full or mixed): the real floor
+  PagesHeldEmpty,    // all air, still reclaimable (hysteresis/stain/shell)
+  PagesHeldOrphan,   // all air, PAST the free trigger: never reclaimable
+  PagesRetired,      // parked in the retire queue, out of the free list
   // The raymarch's inside (RENDER_STATS). Order matches kPerfCounters below
   // AND the RS_* slot order in raymarch.wgsl: RmPixels is the shader's slot 0
   // (the sampled-pixel denominator, scaled back up to pixels), RmPrimarySteps
@@ -366,6 +378,20 @@ inline constexpr PerfCounterDef kPerfCounters[] = {
     // is more than three submits behind. Paired with the stall counter it
     // answers "was the ring or the GPU the limit" without a second run.
     {"readbackDeclined", "readback ring full", "readbackStall", false},
+    // ---- the page pool's residency, ATTRIBUTED ----------------------------
+    // These four partition `pagesResident`. Read them as a stack: dirty+ring
+    // is what the conservative mirror costs, matter is the floor nothing can
+    // reclaim, empty is in flight through the hysteresis, and ORPHAN is pages
+    // that can never come back — the free trigger is an equality on the
+    // zero-streak counter, so a slot whose streak steps past it is stranded
+    // for the life of the process. A rising orphan count in a stationary
+    // session is the residency ratchet, and it is the only one of the four
+    // that is a defect rather than a cost.
+    {"pagesHeldDirty", "pages: dirty + ring", "pageTable", false},
+    {"pagesHeldMatter", "pages: holding matter", "pageTable", false},
+    {"pagesHeldEmpty", "pages: empty, reclaimable", "pageTable", false},
+    {"pagesHeldOrphan", "PAGES STRANDED", "pageTable", true},
+    {"pagesRetired", "pages: retire queue", "pageTable", false},
     // ---- the raymarch's INSIDE, from RENDER_STATS (raymarch.wgsl) ----------
     // Per-frame totals, already scaled up from the 1-in-16 pixel sample the
     // shader records on. A STEP is one DDA cell advance in the named trace; a
