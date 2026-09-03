@@ -4992,7 +4992,7 @@ fn liquidFieldNormal(p : vec3f, mat : u32, fallback : vec3f) -> vec3f {
 // puddle.
 fn shadeViscous(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
                 axis : i32, sgn : f32, pathVox : f32, surfFull : f32,
-                sceneBehind : vec3f, underwater : bool) -> vec3f {
+                sceneBehind : vec3f, tSurf : f32, underwater : bool) -> vec3f {
   let m = materials[mat];
   let upFacing = (axis == 1 && sgn < 0.0);
   let pool = bloodPooling(cell, mat);
@@ -5080,6 +5080,32 @@ fn shadeViscous(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
   // glint carry the image. Rendering oil with blood's backscatter is what made
   // a pool of it look like a pan of wet clay.
   body = mix(body, deep * TUNE_OIL_DARKEN, oily);
+
+  // ---- LIGHT IT ----
+  // The body is an ALBEDO, and until 2026-09-02 it went into the frame raw:
+  // no ambient, no sun, no shadow, no openness. Every opaque surface is
+  // albedo * (ambient + sun), and after tonemapHdr's Reinhard curve and the
+  // gamma encode that product lands a lit meadow at roughly a third of its
+  // authored value — so an UNLIT albedo comes out two to three times brighter
+  // than the same hex painted on a wall beside it, and no palette edit could
+  // fix it (a #3c0909 pool measured (133,72,72) on screen before a single
+  // reflection or sheen term was added; the authored blood looked like pink
+  // paint next to the #4a0f0f STAIN it left, which IS lit, §3). Blood is a
+  // dense scattering suspension, so the back-scattered body light is the same
+  // diffuse term a solid gets: hemisphere ambient scaled by openness, plus the
+  // key light through the cached sun shadow. The cached shadow only (no
+  // sunShadowAt fallback) for the same register-footprint reason the opaque
+  // path gives at SHADOW_CACHE; past TUNE_SHADOW_MAX_DIST it is simply lit.
+  let openRaw = opennessAt(cell, hitP, flat, &openness, &opennessGen);
+  var lambert = wrapDiffuse(dot(n, keyLightDir()), TUNE_DIFFUSE_WRAP);
+  var sunSh = 1.0;
+  if (lambert > 0.0 && (R.flags & 1u) != 0u) {
+    if (SHADOW_CACHE && tSurf * VOXEL_METERS <= TUNE_SHADOW_MAX_DIST) {
+      sunSh = shadowCached(hitP - rd * 1e-3, cell, axis, sgn, tSurf);
+    }
+    lambert *= shadowLiftCap(sunSh, openRaw);
+  }
+  body *= ambientAt(n) * opennessScale(openRaw) + keyLightColor() * lambert;
 
   // What comes back out: the surface behind, filtered by the film, plus the
   // blood's own scattered colour. Blood scatters strongly (it is a suspension,
@@ -5173,7 +5199,9 @@ fn shadeViscous(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
     let ambientSheen = pow(1.0 - cosI, 4.0) * TUNE_BLOOD_AMBIENT_SHEEN;
     let tint = normalize(keyLightColor() + vec3f(1e-4)) * 1.732;
     let sheenAmt = mix(TUNE_BLOOD_SHEEN, TUNE_OIL_SHEEN, oily);
-    color += tint * min(spec, 1.0) * sheenAmt * (0.35 + fres)
+    // The key-lit lobe goes through the same sun shadow as the body: a sun
+    // glint on a pool in the shade of a wall is a glint from nowhere.
+    color += tint * min(spec, 1.0) * sheenAmt * (0.35 + fres) * sunSh
            + ambientAt(n) * ambientSheen;
 
     // ---- thin-film iridescence ----
@@ -7510,7 +7538,7 @@ fn fs(in : VSOut) -> FSOut {
       } else if (isViscousLiquid(materials[lm])) {
         color = shadeViscous(hitP, rd, lm, h.liqCell, h.liqAxis, h.liqSgn,
                              h.liqPath, max(h.mediaSurf, 0.125), color,
-                             underwater);
+                             h.liqT, underwater);
         color = applyAerial(color, rd, h.liqT);
         caShadedLiquid = true;
       } else if (!mpmOwned) {

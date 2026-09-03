@@ -542,7 +542,7 @@
       ]
     },
     {
-      "comment": "Blood. The `stain` block is what marks what it touches: at 90 per-mille a splash grabs the surfaces around it within a second or so, and `consume` 6 means roughly one stained voxel in 160 is eaten away per stain event, so blood slowly pits what it soaks without ever running away with itself (CLAUDE.md rule 2 — see DESIGN.md §6). The renderer picks blood's viscous shading (no ripple bands, a wet sheen, a smooth field normal so it does not read as gelatin cubes) off the authored moveEvery + opacity pair, not off a material ID — see isViscousLiquid in common.wgsl.",
+      "comment": "Blood. The `stain` block is what marks what it touches: at 90 per-mille a splash grabs the surfaces around it within a second or so, and `consume` 6 means roughly one stained voxel in 160 is eaten away per stain event, so blood slowly pits what it soaks without ever running away with itself (CLAUDE.md rule 2 — see DESIGN.md §6). The renderer picks blood's viscous shading (no ripple bands, a wet sheen, a smooth field normal so it does not read as gelatin cubes) off the authored moveEvery + opacity pair, not off a material ID — see isViscousLiquid in common.wgsl. The palette is LINEAR light like every material (the frame is tonemapped and gamma-encoded at the end), so these hexes look near-black in a colour picker and render as a dark blood red once lit; anything paler reads as pink paint next to the stain it leaves.",
       "id": "blood",
       "class": "liquid",
       "density": 1050,
@@ -551,9 +551,9 @@
       "opacity": 200,
       "molten": "steam",
       "colors": [
-        "#5e0e0e",
-        "#3c0909",
-        "#741414"
+        "#3a0808",
+        "#220404",
+        "#4e0c0c"
       ],
       "stain": {
         "type": "blood",

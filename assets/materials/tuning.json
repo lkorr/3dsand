@@ -595,7 +595,7 @@
     "oilEdgeBand": 0.07,
     "oilDropReflect": 0.3,
     "bloodF0": 0.03,
-    "bloodGraze": 0.55,
+    "bloodGraze": 0.3,
     "bloodAbsorb": 55,
     "bloodDepthRamp": 22,
     "bloodPoolLow": 0.18,
@@ -606,7 +606,7 @@
     "bloodSheen": 0.15,
     "bloodSheenDrop": 32,
     "bloodSheenPool": 220,
-    "bloodAmbientSheen": 0.35,
+    "bloodAmbientSheen": 0.15,
     "bloodEdgeDepth": 0.035,
     "bloodEdgeStrength": 0.65,
     "bloodEdgeTint": [

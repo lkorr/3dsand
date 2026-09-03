@@ -4174,6 +4174,15 @@ world hash.
     too viscous to carry them, and running that field over blood makes a puddle
     look like it is boiling. Only a slow, tiny surface-tension wobble, faded out
     on pools.
+  - **The body is LIT (2026-09-02).** The palette colour is an albedo and goes
+    through the same hemisphere ambient x openness + key light x cached sun
+    shadow as an opaque hit. It went into the frame raw before, and because
+    `tonemapHdr` + gamma put a lit surface at about a third of its authored
+    value, unlit blood rendered two to three times brighter than the same hex
+    on the wall next to it — a #3c0909 pool measured (133,72,72) on screen
+    with every reflection and sheen term removed. That is why "make the
+    palette darker" could not fix it, and why the material now matches the
+    stain it leaves (which was always lit, being an albedo change).
   - A **wet sheen** (tight specular lobe, plus an ambient term so it still
     reads wet in shade) is what makes it read as fluid rather than red paint,
     and it is deliberately not gated to up-facing surfaces — a trail running
