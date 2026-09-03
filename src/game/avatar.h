@@ -354,10 +354,10 @@ class PlayerAvatar : public Mob {
   // Requested weight of the named clip's live instance, or 0 if not running.
   // The fall flail is a RAMP now, so "is the fall clip active" is no longer the
   // question — "how far in is it" is.
-  float ClipWeight(const char* name) const {
-    if (!def_) return 0.0f;
   // The held (Ctrl) crouch's pelvis drop, world voxels; 0 when standing.
   float CrouchHold() const { return crouchHold_; }
+  float ClipWeight(const char* name) const {
+    if (!def_) return 0.0f;
     const int c = skel_.FindClip(name);
     if (c < 0) return 0.0f;
     for (const ClipInstance& inst : anim_.clips)
