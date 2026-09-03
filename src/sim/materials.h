@@ -73,6 +73,25 @@ constexpr uint32_t kMatFlagPassable = 8;
 constexpr uint32_t kMatFlagTinted = 16;
 // Max tints per material: the state nibble is 4 bits.
 constexpr uint32_t kMatTintsMax = 16;
+// ---- BURNTINT: the palette is what this voxel looked like BEFORE it caught ----
+// Authored in materials.json as `"burnTint": true` on an emissive material.
+//
+// A burning leaf that renders as a flat orange coal stops reading as a leaf.
+// A burn-tinted material keeps its `colors` as the UNBURNT palette (green
+// leaves, pine needles, autumn leaves) and the RENDERER pulses each cell
+// between that colour and the flame colour (render.burnTintColor, on a slow
+// per-cell phase, render.burnTintRate / Min / Max), so a crown on fire still
+// reads as the crown it was. Render-only: nothing in the sim reads the flag,
+// every emissive grid site (primary hit, far field, secondary rays and the
+// irradiance deposit) goes through burnTintAlbedo() in common.wgsl so the four
+// agree, and the pulse weight also scales the emission so the "leaf" phase of
+// the cycle is lit like a leaf rather than glowing green.
+//
+// It is a flag and three materials (leaf_burning / pine_burning /
+// autumn_burning) rather than one burning material that remembers what it
+// was, because the voxel word has no spare bits to remember it in (world.h);
+// the material id IS the memory.
+constexpr uint32_t kMatFlagBurnTint = 32;
 // Where this material's tint run starts inside the shared tint palette, packed
 // into the free high half of `flags` (bits 16..23) rather than added as a
 // field, for the reason the wind nibbles give below: MaterialGpu is exactly 64
@@ -81,7 +100,7 @@ constexpr uint32_t kMatTintBaseShift = 16, kMatTintBaseMask = 0xFF;
 
 // ---- wind coupling, packed into the SAME flags word ------------------------
 // docs/RESEARCH_wind.md §4.5, invariant 7. Bits 0..7 are the MATF_* booleans
-// above (4 used, 4 spare); bits 8..11 and 12..15 are two authored 4-bit
+// above (6 used, 2 spare); bits 8..11 and 12..15 are two authored 4-bit
 // numbers; 16..31 are free.
 //
 // Packed rather than added as fields because MaterialGpu is exactly 64 bytes

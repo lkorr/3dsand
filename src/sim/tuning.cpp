@@ -1853,6 +1853,10 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadF(*g, "emissiveFlickerBase", r.emissiveFlickerBase, out, at);
     ReadF(*g, "emissiveFlickerAmp", r.emissiveFlickerAmp, out, at);
     ReadF(*g, "emissiveFlickerRate", r.emissiveFlickerRate, out, at);
+    ReadV3(*g, "burnTintColor", r.burnTintColor, out, at);
+    ReadF(*g, "burnTintRate", r.burnTintRate, out, at);
+    ReadF(*g, "burnTintMin", r.burnTintMin, out, at);
+    ReadF(*g, "burnTintMax", r.burnTintMax, out, at);
     ReadF(*g, "waterF0", r.waterF0, out, at);
     ReadV3(*g, "waterAbsorb", r.waterAbsorb, out, at);
     ReadV3(*g, "waterScatter", r.waterScatter, out, at);

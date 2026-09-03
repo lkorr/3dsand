@@ -2608,6 +2608,13 @@ Status GateSimd(Ctx&, std::string& detail) {
 // and never touches the bottom layer of leaves, and a character whose torso
 // burns through never lights his own legs.
 //
+// SINCE 2026-09-03 the dir:down emit drops `spark` -- a falling hot powder --
+// rather than `fire`. Fire became a weak igniter (neighborChance, gate
+// weak-flame) and arm B fell from saturating to 9% with it: a flame in the
+// air below a burning leaf WAS the downward path across a gap. A falling ember
+// is the honest version of that path and lights what it lands on at the
+// coals' rate, which is what this gate now measures on arm B.
+//
 // TWO ARMS, because the fix is two mechanisms and either one alone would let a
 // one-armed gate pass while half the bug survived:
 //
@@ -2758,11 +2765,126 @@ Status GateFireDown(Ctx& c, std::string& detail) {
   return (lit && armA && armB && armBDeep) ? Status::Pass : Status::Fail;
 }
 
+// ---- weak-flame: the floating flame ignites at a fraction of the coals' rate --
+//
+// Every ignition rule in reactions.json is `neighbor: tag:hot`, and `fire` --
+// the gas that rises off every burning voxel and drifts through the air --
+// carries that tag beside the stationary heat sources, so one drifting flame
+// used to light a tree or a robe at the same rate as a bed of coals pressed
+// against it. `"neighborChance": { "fire": 0.125 }` on the ignition rules says
+// otherwise, and the loader compiles it AWAY (ExpandNeighborChance,
+// sim/materials.cpp) into a base rule on a synthetic hot-minus-fire tag plus
+// an exact fire rule at the scaled chance. Nothing on the GPU knows the field
+// exists, which is exactly why this gate reads the COMPILED table: a typo in
+// the field name, a rule the expansion refused, or a synthetic tag that leaked
+// onto fire would each leave the world burning at the old rate under a green
+// determinism gate (the hash would simply move to a wrong world).
+//
+// Pure CPU over c.mats / c.reactions: no world, no GPU, nothing left behind.
+// Asserted per fuel, for a spread of fuels (wood, the three foliage families,
+// grass, cloth): the base rule must match ember, lava and spark (the FALLING
+// ember, which is the coals and keeps the rate) and NOT fire, the
+// fire rule must exist at base/ratio, and the two must sit in that order (a
+// voxel touching both rolls the full rate first). And the two things the
+// exception must NOT have touched: water still steams against fire, skin is
+// still seared by it.
+Status GateWeakFlame(Ctx& c, std::string& detail) {
+  auto matId = [&](const char* n) -> uint32_t {
+    for (size_t i = 0; i < c.mats.size(); i++)
+      if (c.mats[i].name == n) return (uint32_t)i;
+    return 0;
+  };
+  const uint32_t mFire = matId("fire"), mEmber = matId("ember"),
+                 mLava = matId("lava"), mSpark = matId("spark");
+  if (!mFire || !mEmber || !mLava || !mSpark) {
+    detail = "fire / ember / lava / spark missing from materials.json";
+    return Status::Fail;
+  }
+  const double ratio = BaselineNumber("weakFlame.ratio", 8.0);
+  const uint32_t fireTags = c.mats[mFire].gpu.tagMask;
+
+  struct Fuel { const char* self; const char* product; };
+  const Fuel fuels[] = {{"wood", "ember"},
+                        {"leaves", "leaf_burning"},
+                        {"pine_needles", "pine_burning"},
+                        {"autumn_leaves", "autumn_burning"},
+                        {"grass", "fire"},
+                        {"cloth", "cloth_burning"}};
+  std::string fails;
+  int checked = 0;
+  for (const Fuel& f : fuels) {
+    const uint32_t self = matId(f.self), prod = matId(f.product);
+    if (!self || !prod) {
+      fails += std::string(" ") + f.self + ":missing";
+      continue;
+    }
+    const MaterialGpu& mg = c.mats[self].gpu;
+    int baseAt = -1, flameAt = -1;
+    for (uint32_t i = 0; i < mg.reactCount; i++) {
+      const ReactionGpu& r = c.reactions[mg.reactOffset + i];
+      if ((r.packed & 3u) != kReactPair || r.prodSelf != prod) continue;
+      if (r.nbrMat == kNbrAny && r.nbrTags != 0 && baseAt < 0) baseAt = (int)i;
+      if (r.nbrMat == mFire && flameAt < 0) flameAt = (int)i;
+    }
+    if (baseAt < 0 || flameAt < 0) {
+      fails += std::string(" ") + f.self + ":" +
+               (baseAt < 0 ? "no-tag-rule" : "no-fire-rule");
+      continue;
+    }
+    const ReactionGpu& base = c.reactions[mg.reactOffset + baseAt];
+    const ReactionGpu& flame = c.reactions[mg.reactOffset + flameAt];
+    const bool excludesFire = (fireTags & base.nbrTags) == 0;
+    const bool keepsEmber = (c.mats[mEmber].gpu.tagMask & base.nbrTags) != 0;
+    const bool keepsLava = (c.mats[mLava].gpu.tagMask & base.nbrTags) != 0;
+    // The falling ember is the coals, not the flame: it must keep the rate.
+    const bool keepsSpark = (c.mats[mSpark].gpu.tagMask & base.nbrTags) != 0;
+    const double got = flame.chance > 0
+                           ? (double)base.chance / (double)flame.chance : 0.0;
+    const bool scaled = std::fabs(got - ratio) < 0.05;
+    const bool ordered = baseAt < flameAt;
+    if (!(excludesFire && keepsEmber && keepsLava && keepsSpark && scaled &&
+          ordered)) {
+      char b[160];
+      std::snprintf(b, sizeof(b), " %s:{fire-in-mask %d, ember %d, lava %d, "
+                    "spark %d, ratio %.2f, order %d}", f.self, !excludesFire,
+                    keepsEmber, keepsLava, keepsSpark, got, ordered);
+      fails += b;
+    }
+    checked++;
+  }
+
+  // The untouched rules: a tag:hot pair rule that must STILL match fire.
+  struct Keep { const char* self; const char* product; };
+  const Keep keeps[] = {{"water", "steam"}, {"skin", "flesh_cooked"}};
+  for (const Keep& k : keeps) {
+    const uint32_t self = matId(k.self), prod = matId(k.product);
+    if (!self || !prod) { fails += std::string(" ") + k.self + ":missing"; continue; }
+    const MaterialGpu& mg = c.mats[self].gpu;
+    bool ok = false;
+    for (uint32_t i = 0; i < mg.reactCount; i++) {
+      const ReactionGpu& r = c.reactions[mg.reactOffset + i];
+      if ((r.packed & 3u) != kReactPair || r.prodSelf != prod) continue;
+      if (r.nbrTags != 0 && (fireTags & r.nbrTags) != 0) ok = true;
+    }
+    if (!ok) fails += std::string(" ") + k.self + ":no-longer-reacts-to-fire";
+  }
+
+  char buf[512];
+  std::snprintf(buf, sizeof(buf),
+                "%s: %d fuels ignite from fire at 1/%.0f of the coals' rate%s%s",
+                fails.empty() ? "PASS" : "FAIL", checked, ratio,
+                fails.empty() ? "" : " |", fails.c_str());
+  detail = buf;
+  std::printf("weak-flame: %s\n", buf);
+  return fails.empty() ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& SimGates() {
   static const std::vector<Gate> g = {
       {"simd", "sim", {}, false, GateSimd},
+      {"weak-flame", "sim", {}, false, GateWeakFlame},
       {"determinism", "sim", {}, false, GateDeterminism},
       {"sleep", "sim", {}, false, GateSleep},
       {"evaporation", "sim", {}, false, GateEvaporation},

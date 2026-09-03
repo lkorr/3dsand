@@ -2702,16 +2702,17 @@
       "molten": "fire"
     },
     {
-      "//": "FOLIAGE ACTUALLY ALIGHT -- and the reason it has to be a material at all is that fire in this engine only ever moves UP. `fire` is a gas with rise probability 1024/1024 in calm air (gasIntent, sim_step.wgsl), and every emit rule in reactions.json is dir:up, so the world's whole flame budget migrates upward through the fuel. Wood survives that because it ignites to `ember`, a STATIONARY tag:hot solid that cooks all six of its faces for ~140 ticks -- which is why a trunk burns downward. Foliage went straight to `fire`, so a burnt leaf converted itself into the one thing that immediately floats away and left nothing behind to heat the leaf below it. Owner report: a lit tree cooks the top of the crown and leaves the bottom-most layer of leaves untouched. That is exactly the shape of a rising-only heat source.\n\nSo this is `ember` for leaves, and it is a separate id rather than a reuse of `ember` for the two reasons reactions.json already argues at the foliage ignition rules: it must not decay to ASH (a canopy that rained thousands of ash voxels through itself was the thing that authoring was written to avoid), and it must be light and short-lived rather than a dense smouldering log. It leaves NOTHING -- air and a little smoke -- so the burn is still bounded by the canopy consuming itself, which is the same subcriticality argument as before (CLAUDE.md rule 2); all that changed is that the heat now sits still long enough to be conducted sideways and DOWN.\n\nNot tagged flammable: it is already burning, and a second ignition rule reaching it would be a loop. hardness 1 and a low density because it is a leaf, not a coal -- a burning crown should still come apart at a touch.",
+      "//": "FOLIAGE ACTUALLY ALIGHT -- and the reason it has to be a material at all is that fire in this engine only ever moves UP. `fire` is a gas with rise probability 1024/1024 in calm air (gasIntent, sim_step.wgsl), and every emit rule in reactions.json is dir:up, so the world's whole flame budget migrates upward through the fuel. Wood survives that because it ignites to `ember`, a STATIONARY tag:hot solid that cooks all six of its faces for ~140 ticks -- which is why a trunk burns downward. Foliage went straight to `fire`, so a burnt leaf converted itself into the one thing that immediately floats away and left nothing behind to heat the leaf below it. Owner report: a lit tree cooks the top of the crown and leaves the bottom-most layer of leaves untouched. That is exactly the shape of a rising-only heat source.\n\nSo this is `ember` for leaves, and it is a separate id rather than a reuse of `ember` for the two reasons reactions.json already argues at the foliage ignition rules: it must not decay to ASH (a canopy that rained thousands of ash voxels through itself was the thing that authoring was written to avoid), and it must be light and short-lived rather than a dense smouldering log. It leaves NOTHING -- air and a little smoke -- so the burn is still bounded by the canopy consuming itself, which is the same subcriticality argument as before (CLAUDE.md rule 2); all that changed is that the heat now sits still long enough to be conducted sideways and DOWN.\n\nNot tagged flammable: it is already burning, and a second ignition rule reaching it would be a loop. hardness 1 and a low density because it is a leaf, not a coal -- a burning crown should still come apart at a touch.\n\nTHE COLOURS ARE THE LEAF'S, NOT THE FIRE'S (2026-09-03). `burnTint` tells the renderer that this palette is what the voxel looked like BEFORE it caught: each cell breathes between it and render.burnTintColor on a slow per-cell phase (common.wgsl burnTint), so a crown on fire still reads as the crown it was rather than as a heap of identical orange coals. That is also why there are now three of these -- `pine_burning` and `autumn_burning` at the end of this file carry the same numbers over their own family's palette, because the word has no bits to remember which leaf a burning one was. The green family's dark / lit shade tiers burn as this plain tier.",
       "id": "leaf_burning",
       "class": "solid",
       "density": 300,
       "hardness": 1,
       "emission": 200,
+      "burnTint": true,
       "colors": [
-        "#e8701c",
-        "#c04f12",
-        "#ffa233"
+        "#3c8f36",
+        "#33802d",
+        "#4aa244"
       ],
       "tags": [
         "hot",
@@ -2772,6 +2773,60 @@
         "dissolvable"
       ],
       "molten": "fire"
+    },
+    {
+      "//": "leaf_burning for the pine family: pine_needles / pine_dark / pine_lit ignite to this. Same numbers as leaf_burning in every field and the same rules in reactions.json -- the only thing that differs is the palette, which is the plain needle tier's, because a burn-tinted material's colours are the leaf the renderer pulses back to. See leaf_burning's note.",
+      "id": "pine_burning",
+      "class": "solid",
+      "density": 300,
+      "hardness": 1,
+      "emission": 200,
+      "burnTint": true,
+      "colors": [
+        "#1f5c33",
+        "#1a4f2b",
+        "#276b3d"
+      ],
+      "tags": [
+        "hot",
+        "organic"
+      ],
+      "molten": "fire"
+    },
+    {
+      "//": "leaf_burning for the autumn family: autumn_leaves / autumn_dark / autumn_lit ignite to this. Same numbers and rules as leaf_burning; only the palette differs. See leaf_burning's note.",
+      "id": "autumn_burning",
+      "class": "solid",
+      "density": 320,
+      "hardness": 1,
+      "emission": 200,
+      "burnTint": true,
+      "colors": [
+        "#d1762a",
+        "#bb5f1e",
+        "#e0913a"
+      ],
+      "tags": [
+        "hot",
+        "organic"
+      ],
+      "molten": "fire"
+    },
+    {
+      "//": "A FALLING EMBER: the burning fleck that drops off a burning crown, log, robe or body and lands on whatever is below. It exists because the floating flame became a weak igniter (reactions.json, neighborChance) and that took fire's ONLY downward path across an air gap with it: every dir:down emit rule used to emit `fire`, a gas that rises with probability 1 in calm air and ignited what it touched at the full rate, and the fire-down gate's arm B (a slab of leaves lighting the slab one cell of air below it) went from saturating to 9% the moment fire's ignition was cut 8x. A flame licking DOWN through air was never the mechanism that spreads a real fire downward anyway; embers falling out of it are. So the dir:down emits now emit this instead: a light hot POWDER that falls, rests on what it lands on for a few ticks and lights it at the coals' rate, then goes out to air. Short-lived on purpose (180 per-mille, ~5.5 ticks: far enough to fall a canopy gap or a body's height, not far enough to rain fire across a forest floor) and it leaves NOTHING -- no ash, no smoke -- because it is emitted at the rate the fire it replaced was and a crown sheds thousands of them. Doused by anything wet first, so a spark that lands in a pond dies before it can steam it. Not flammable (it is already burning) and not marked burnDuration (it is a flame-like transient, like `fire`, not fuel). Emission just under fire's so a shower of them reads as sparks against the flame rather than as more flame. The stationary heat sources and this one keep the AUTHORED ignition rate; only `fire` -- the flame that floats up and away -- is weakened.",
+      "id": "spark",
+      "class": "powder",
+      "density": 120,
+      "hardness": 1,
+      "emission": 230,
+      "colors": [
+        "#ff8a3a",
+        "#e85a1c",
+        "#ffb060"
+      ],
+      "tags": [
+        "hot"
+      ]
     }
   ]
 }

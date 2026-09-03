@@ -1267,6 +1267,19 @@ Author in JSON, hot-reload at runtime, compile at load into flat GPU tables.
 }
 ```
 
+- **`burnTint` (2026-09-03):** `"burnTint": true` on an emissive material says
+  its `colors` are what the voxel looked like *before* it caught, and the
+  renderer supplies the fire: every emissive grid site (primary hit, far
+  cascade, secondary rays, the irradiance deposit) goes through `burnTint()` in
+  `common.wgsl`, which breathes each cell between that palette and
+  `render.burnTintColor` on a slow per-cell phase (`burnTintRate/Min/Max`) and
+  scales the emission by the same weight, so the leaf end of the breath is lit
+  like a leaf rather than glowing green. Sets `kMatFlagBurnTint`; render-only.
+  This is why there are three burning-leaf materials (`leaf_burning`,
+  `pine_burning`, `autumn_burning`, one per foliage family's palette): the
+  voxel word has no bits to remember which leaf a burning one was, so the
+  material id is the memory. Same rules and numbers in all three.
+
 ### `reactions/*.json`
 ```json
 { "self": "fire",  "neighbor": "tag:flammable", "chance": 10,
@@ -1393,6 +1406,40 @@ Author in JSON, hot-reload at runtime, compile at load into flat GPU tables.
   plus isolated droplets that must **all** be gone. Either assertion alone is
   weak — the first passes a rule that never fires, the second passes the old
   always-fires rule — and only together do they distinguish the two.
+
+- **Per-member exception on a tag rule (2026-09-03):** a pair rule whose
+  neighbour is a `tag:` may carry `"neighborChance": { "<material>": <mul> }`,
+  a different chance for a named member of the tag:
+  ```json
+  { "self": "wood", "neighbor": "tag:hot", "chance": 12, "selfBecomes": "ember",
+    "neighborChance": { "fire": 0.125 } }
+  ```
+  Any hot neighbour ignites wood at 12‰, except that `fire` — the free-floating
+  flame gas, the thing that rises off every burning voxel — does it at an
+  eighth of that. The GPU matches a tag rule with one mask test and a mask
+  cannot say "hot but not fire", so the loader (`ExpandNeighborChance`,
+  `sim/materials.cpp`) compiles the field away into two ordinary rules: the
+  base rule re-pointed at a **synthetic tag** (`hot-fire`, set on every hot
+  material except the named ones — in `MaterialGpu.tagMask` only, never in the
+  authored tag strings, so `tagBit("hot")` in `mob.cpp` still resolves to the
+  authored bit) and one exact-neighbour rule per name at the scaled chance,
+  appended at the END of the bucket — the kernel rolls each rule as
+  `hash3(rnd, ruleIndexInBucket, slot)`, so an insertion mid-bucket would
+  re-roll every authored rule after it (measured: fluid-react's ledger gap
+  1.37% → 4.47% from the shift alone). Both evaluators (`sim_step.wgsl`,
+  `sim/reactcpu.h`) get the split for free. Only ignition rules carry it: the
+  steam / melt / mite rules and the skin sear on `tag:hot` are untouched, and
+  flesh's minCount-3 ignition is a decay COUNT with no per-material weight.
+  Gate `weak-flame` reads the compiled table and asserts the split.
+
+  **What falls is not what floats.** Weakening fire took its only downward path
+  across an air gap with it: every `dir: down` emit rule emitted `fire`, and a
+  flame in the air under a burning leaf was how a canopy lit the layer below a
+  gap (`fire-down` arm B went from saturating to 9%). Those emits now drop
+  `spark` — a short-lived hot POWDER, the falling ember — which lands on what
+  is below, lights it at the coals' rate and goes out to air. Same emission
+  rate as the flame it replaced, so the activity budget is unchanged; no ash,
+  no smoke, because a crown sheds thousands.
 
 - **Staining (2026-08-20):** a liquid may mark the voxels it touches, and may
   eat what it marks. Authored per material, not per material PAIR — the same

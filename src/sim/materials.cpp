@@ -1,6 +1,7 @@
 #include "sim/materials.h"
 
 #include <cstdio>
+#include <algorithm>
 #include <fstream>
 #include <map>
 #include <nlohmann/json.hpp>
@@ -273,6 +274,14 @@ static bool LoadMaterialsJson(const std::string& path, std::vector<MaterialDef>&
     // Soft vegetation: bodies move through it. Collision only — the cell stays
     // a solid for the CA, the brush, fire and the renderer. See kMatFlagPassable.
     if (m.value("passable", false)) d.gpu.flags |= kMatFlagPassable;
+    // Render-only: the palette is the UNBURNT colour and the renderer pulses
+    // it toward the flame colour. See kMatFlagBurnTint.
+    if (m.value("burnTint", false)) {
+      if (m.value("emission", 0) <= 0)
+        errors += path + ": material \"" + d.name +
+                  "\": burnTint needs emission > 0 (it is the pulse's glow)\n";
+      d.gpu.flags |= kMatFlagBurnTint;
+    }
 
     // ---- tints: GRID colour, per material (sim/materials.h kMatFlagTinted) --
     //
@@ -608,6 +617,125 @@ static bool WeatherFlagEnabled(const std::string& name, bool& known) {
   return false;
 }
 
+// "neighborChance": ONE tag rule, a DIFFERENT chance for a named member of
+// the tag.
+//
+//   { "self": "wood", "neighbor": "tag:hot", "chance": 12, "selfBecomes": "ember",
+//     "neighborChance": { "fire": 0.125 } }
+//
+// reads: any hot neighbour ignites wood at 12 per-mille, except that FIRE --
+// the free-floating flame gas, the thing that rises off every burning voxel
+// and drifts through the air -- does it at an eighth of that. The stationary
+// heat sources (ember, lava, burning cloth and flesh, a burning leaf) keep the
+// authored rate.
+//
+// The GPU matches a tag rule with ONE mask test (nbrMatches, sim_step.wgsl),
+// and a mask cannot say "hot but not fire". So this is compiled AWAY here into
+// two ordinary rules the kernels already understand:
+//   * the base rule, re-pointed at a SYNTHETIC tag ("hot-fire") that the loader
+//     sets on every material carrying the tag EXCEPT the named ones, and
+//   * one exact-neighbour rule per named material with the scaled chance,
+// appended at the END of the material's bucket. Both evaluators (sim_step.wgsl
+// and sim/reactcpu.h for bodies) get the split for free, because neither
+// learns a new field. The synthetic bit lives in MaterialGpu.tagMask only --
+// it is never added to MaterialDef::tags, so every consumer that walks the tag
+// STRINGS (mob.cpp's tagBit, cues, debris rubble) still sees exactly what the
+// author wrote, and tagBit("hot") still resolves to the authored bit: fire
+// lacks the synthetic one, so the AND over hot materials drops it.
+//
+// Why not retag fire? "hot" is what water steams against, what a mob's limb
+// scan reads, what the wiki lists. Splitting the tag at the authoring surface
+// would have meant every future hot material remembering two tags; splitting
+// it here means the author writes the exception once, on the rule it is an
+// exception to, and a new hot material is covered by construction.
+//
+// AT THE END, not right behind the base rule, and this is load-bearing:
+// sim_step.wgsl rolls each rule as hash3(rnd, ri, slot) where ri is the rule's
+// index WITHIN THE BUCKET, so a rule inserted mid-bucket re-rolls every rule
+// after it. Measured: putting wood's fire rule second shifted the plant
+// buckets' growth rolls and moved the fluid-react gate's ledger gap from 1.37%
+// to 4.47% with no behaviour change at all. Appending leaves every authored
+// rule's random stream exactly where it was; the only thing the hash then
+// moves for is the behaviour the author asked for. Priority is unaffected in
+// any way that matters -- the exception is the WEAK case, and losing a tie to
+// an earlier rule on the same tick is what a weak case should do.
+//
+// Only a PAIR rule with a `tag:` neighbour can carry it: an exact neighbour
+// has nothing to except, and a decay rule's neighbour fields belong to
+// scaleByNeighbors (a COUNT of hot faces has no per-material weight, which is
+// also why flesh's minCount-3 ignition is untouched by this).
+static bool ExpandNeighborChance(const json& r, std::vector<MaterialDef>& mats,
+                                 TagRegistry& tagReg, const std::string& path,
+                                 const std::string& self, uint32_t kind,
+                                 double chanceMille, ReactionGpu& g,
+                                 std::vector<ReactionGpu>& extra,
+                                 std::string& errors) {
+  const json& s = r["neighborChance"];
+  if (!s.is_object() || s.empty()) {
+    errors += path + ": reaction self=\"" + self +
+              "\": neighborChance must be an object of { material: multiplier }\n";
+    return false;
+  }
+  if (kind != kReactPair || g.nbrTags == 0 || g.nbrMat != kNbrAny) {
+    errors += path + ": reaction self=\"" + self +
+              "\": neighborChance needs a pair rule with a \"tag:\" neighbor "
+              "(it excepts named members of that tag)\n";
+    return false;
+  }
+  const std::string tagName = r["neighbor"].get<std::string>().substr(4);
+  // Sorted, so two rules with the same exception set share one synthetic bit
+  // whatever order they were authored in (the registry is 32 bits wide).
+  std::vector<std::pair<std::string, double>> ex;
+  for (auto it = s.begin(); it != s.end(); ++it) {
+    const int id = FindMaterial(mats, it.key());
+    if (id < 0) {
+      errors += path + ": reaction self=\"" + self +
+                "\": neighborChance names unknown material \"" + it.key() + "\"\n";
+      return false;
+    }
+    if ((mats[(size_t)id].gpu.tagMask & g.nbrTags) == 0) {
+      errors += path + ": reaction self=\"" + self + "\": neighborChance names \"" +
+                it.key() + "\", which does not carry tag \"" + tagName + "\"\n";
+      return false;
+    }
+    if (!it.value().is_number() || it.value().get<double>() <= 0.0) {
+      errors += path + ": reaction self=\"" + self + "\": neighborChance[\"" +
+                it.key() + "\"] must be a multiplier > 0\n";
+      return false;
+    }
+    ex.emplace_back(it.key(), it.value().get<double>());
+  }
+  std::sort(ex.begin(), ex.end());
+  std::string synth = tagName;
+  for (auto& e : ex) synth += "-" + e.first;
+  const uint32_t bit = tagReg.MaskOf(synth, true);
+  if (bit == 0) {
+    errors += path + ": reaction self=\"" + self +
+              "\": neighborChance needs a synthetic tag \"" + synth +
+              "\" and the 32-bit tag registry is full\n";
+    return false;
+  }
+  for (auto& m : mats) {
+    if ((m.gpu.tagMask & g.nbrTags) == 0) continue;
+    bool excepted = false;
+    for (auto& e : ex) excepted |= (m.name == e.first);
+    if (!excepted) m.gpu.tagMask |= bit;
+  }
+  g.nbrTags = bit;
+  for (auto& e : ex) {
+    ReactionGpu x = g;
+    x.nbrTags = 0;
+    x.nbrMat = (uint32_t)FindMaterial(mats, e.first);
+    // Same rounding as the authored chance: once, in double, on the CPU.
+    double c = chanceMille * e.second;
+    if (c > 1000.0) c = 1000.0;
+    x.chance = (uint32_t)(c * (double)kReactChanceScale + 0.5);
+    if (x.chance == 0) x.chance = 1;
+    extra.push_back(x);
+  }
+  return true;
+}
+
 static bool LoadReactionsJson(const std::string& path, std::vector<MaterialDef>& mats,
                               TagRegistry& tagReg, std::vector<ReactionGpu>& out,
                               std::string& errors) {
@@ -631,6 +759,10 @@ static bool LoadReactionsJson(const std::string& path, std::vector<MaterialDef>&
   // Parse in file order, keyed by self id; bucketed after the loop so each
   // material's rules stay in authoring order (first match wins on the GPU).
   std::vector<std::vector<ReactionGpu>> buckets(mats.size());
+  // Rules the loader SYNTHESISED (neighborChance exceptions), appended after
+  // every authored rule of their material so no authored rule's bucket index
+  // -- and therefore its RNG stream -- moves. See ExpandNeighborChance.
+  std::vector<std::vector<ReactionGpu>> tails(mats.size());
 
   for (auto& r : j["reactions"]) {
     if (r.contains("note") && !r.contains("self")) continue;  // section comment
@@ -770,8 +902,17 @@ static bool LoadReactionsJson(const std::string& path, std::vector<MaterialDef>&
     // fields are already spoken for.
     ParseNeighborScale(r, mats, tagReg, path, self, kind, g, errors);
     g.packed = (kind & 3u) | ((dirMask & 7u) << 2u);
+    // A per-member exception splits this rule in two (see ExpandNeighborChance).
+    // The base rule keeps its place; the exact-neighbour rules go to the tail
+    // of the bucket, so a voxel touching both an ember and a flame rolls the
+    // full rate first and nothing authored changes its index.
+    if (r.contains("neighborChance"))
+      ExpandNeighborChance(r, mats, tagReg, path, self, kind, chanceMille, g,
+                           tails[selfId], errors);
     buckets[selfId].push_back(g);
   }
+  for (size_t i = 0; i < mats.size(); i++)
+    buckets[i].insert(buckets[i].end(), tails[i].begin(), tails[i].end());
 
   out.clear();
   for (size_t i = 0; i < mats.size(); i++) {

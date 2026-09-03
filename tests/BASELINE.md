@@ -408,6 +408,25 @@ CA side of the seam. Verified independent of WP5: it fails identically at
 The fix needs a counter inside `doReactions`, which is in `sim_step.wgsl` —
 out of scope for the WP5 branch by explicit instruction. Queued.
 
+## `shadow-cache` — failing at HEAD before the weak-flame change (2026-09-03)
+
+Flipped to `"fail"` while landing the floating-flame / burn-tint change, which
+touches nothing this gate reads. Attributed the way the section below
+prescribes, with two worktrees built from the same `HEAD` (5802c0c plus the
+one-hunk `avatar.h` compile fix the working tree carries — `HEAD` itself does
+not compile since a7ccb47), one pristine and one with the change applied:
+
+    --gate shadow-cache alone   HEAD: agree 1.86 / budget 1.45   FAIL
+    --gate shadow-cache alone   HEAD + change: agree 1.86 / budget 1.45   FAIL
+    in the full suite           HEAD + change: agree 1.87 / budget 1.83   FAIL
+
+Identical to the digit on both trees, so it is not this change. Another
+session had already reported it failing in-suite on the shared tree the day
+before (board, agent-94c495). The suspects are the openness / irradiance
+commits of 2026-09-02 (`99887db` onward), which are the only recent changes to
+what `shadowCached` disagrees with; not chased here. Whoever fixes it: run it
+alone, confirm it passes, and flip the entry back in the same commit.
+
 ## Updating
 
 After fixing a gate, run it alone, confirm it passes, and flip its entry to

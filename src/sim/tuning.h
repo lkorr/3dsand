@@ -2306,6 +2306,13 @@ struct Tuning {
     float emissiveStrength = 1.7f;
     float emissiveFlickerBase = 0.82f, emissiveFlickerAmp = 0.28f,
           emissiveFlickerRate = 9.0f;
+    // Burn-tinted materials (kMatFlagBurnTint): a burning leaf keeps its
+    // leaf palette and pulses toward this flame colour. Rate in rad/s on a
+    // per-cell phase; Min/Max bound the pulse weight (0 = pure leaf, 1 = pure
+    // flame). The emission is scaled by the weight too, so the leaf phase is
+    // lit like a leaf rather than glowing green.
+    float burnTintColor[3] = {1.0f, 0.52f, 0.14f};
+    float burnTintRate = 2.6f, burnTintMin = 0.25f, burnTintMax = 0.9f;
 
     // water
     float waterF0 = 0.0204f;

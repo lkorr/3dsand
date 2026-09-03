@@ -23,6 +23,21 @@
       "becomes": "air"
     },
     {
+      "note": "-------- spark: the falling ember. Douse first, then die to air --------\n`fire` is what rises off a burning voxel; `spark` is what FALLS off one. Every dir:down emit rule in this file (ember, the three burning-leaf materials, burning cloth / hair / linen / flesh) emits this now rather than `fire`, because fire became a weak igniter (the neighborChance section below) and fire licking DOWN through air was the only way a burning thing lit what was under it across a gap -- the fire-down gate's arm B fell from saturating to 9% the day fire was cut 8x. A spark is a light hot powder: it drops, rests on whatever it lands on for a few ticks and lights it at the coals' rate, then goes out. See its note in materials.json for the numbers. It carries no neighborChance of its own -- a fleck that has LANDED on fuel is the coals, not the flame -- and if a burning tree lights the grass under it too readily, the lever is `\"spark\": 0.5` beside `\"fire\"` in the ignition rules' neighborChance, not this decay."
+    },
+    {
+      "self": "spark",
+      "neighbor": "tag:extinguisher",
+      "chance": 600,
+      "selfBecomes": "air"
+    },
+    {
+      "self": "spark",
+      "decay": true,
+      "chance": 180,
+      "becomes": "air"
+    },
+    {
       "note": "-------- smoke & steam: fade; steam condenses into rain --------"
     },
     {
@@ -47,16 +62,25 @@
       "note": "-------- combustion: each flammable defines its burn character --------\nTHE IGNITION CHANCE IS HOW FAST FIRE SPREADS THROUGH THE FUEL; the decay rules further down are how long a lit voxel takes to be consumed. They are separate levers and this note exists because they are easy to confuse. Wood/bark were slowed 1.5x here (18 -> 12, birch 22 -> 15, staff 16 -> 11) so a fire creeps up a trunk instead of running it; the ember decays below are UNCHANGED, so a lit log still burns out on the same schedule it always did."
     },
     {
+      "note": "-------- neighborChance: the FLOATING flame is a weak igniter --------\nEvery ignition rule below is `neighbor: tag:hot`, and `fire` -- the gas that rises off every burning voxel and drifts through the air, the thing that reads on screen as embers floating up from a blaze -- carries that tag alongside the stationary heat sources (ember, lava, a burning leaf, burning cloth and flesh). So a single drifting flame that brushed a tree, a robe or a grass slope lit it at the same rate as a bed of coals pressed against it, and a campfire's plume set light to everything downwind of it.\n\n`\"neighborChance\": { \"fire\": 0.125 }` on a rule says: this rule's chance, but an EIGHTH of it when the hot neighbour is fire. The loader (src/sim/materials.cpp ExpandNeighborChance) compiles it away into two rules the kernels already understand -- the base rule re-pointed at a synthetic tag (hot minus fire) and an exact-neighbour fire rule at the scaled chance -- so nothing on the GPU or in the body evaluator learned a new field, and a new hot material is covered without remembering a second tag. ONLY IGNITION carries it: a rule whose product is a burning material. The steam / melt / mite rules on tag:hot are untouched (a flame over water still steams it), the skin SEAR is untouched (a lick of flame still cooks the surface; flammability is the minCount-3 decay, which counts hot faces and has no per-material weight), and it never touches how long anything burns. The stationary sources keep the authored rate, so a burning log still lights the log beside it exactly as before -- what changed is that the flames rising OFF it are no longer the thing that spreads the fire. What spreads it DOWNWARD is now `spark` (above): the dir:down emits drop a falling ember instead of a flame, because a flame in the air below a burning leaf was the one downward path across a gap and cutting it 8x cut that path with it."
+    },
+    {
       "self": "wood",
       "neighbor": "tag:hot",
       "chance": 12,
-      "selfBecomes": "ember"
+      "selfBecomes": "ember",
+      "neighborChance": {
+        "fire": 0.125
+      }
     },
     {
       "self": "birch_wood",
       "neighbor": "tag:hot",
       "chance": 15,
-      "selfBecomes": "ember"
+      "selfBecomes": "ember",
+      "neighborChance": {
+        "fire": 0.125
+      }
     },
     {
       "note": "foliage is CONSUMED and leaves no ash: a burning canopy should vanish in flame, not decay into thousands of ash voxels raining through the crown. Chances are high because leaves are thin fuel; the burn is bounded by the canopy itself (leaf_burning leaves nothing that grows). ALL FOLIAGE CHANCES WERE CUT 3x on owner report that a crown went up too readily (leaves 225->75->25, needles 380->127, autumn 400->133): a tree should catch and take a while about it rather than flashing over the instant an ember touches it. The RATIOS between the three fuels are preserved -- dry needles and dead autumn leaf still catch several times faster than green leaves, which is the read that makes a pine forest frightening and an oak wood merely flammable. NONE OF THOSE NUMBERS MOVED for the leaf_burning change below and none of them should: they are how fast a crown catches, which the owner has already tuned twice.\n\nWHAT DID CHANGE IS THE PRODUCT. These rules used to read `selfBecomes: fire`, and that is why a lit tree cooked the top of the crown and left the bottom-most layer of leaves alone. `fire` is a GAS that rises with probability 1 in calm air, so a burnt leaf turned itself into the one thing that immediately leaves the neighbourhood: the leaf directly below got exactly one 2.5% roll before its only heat source floated away, and nothing would ever bring heat back down to it. Wood never had this problem because it ignites to `ember`, a stationary tag:hot solid. Foliage now does the same through `leaf_burning`, which is ember-for-leaves: it stands still, cooks all six of its faces for the length of its burn, and decays to air rather than ash. Spread is now a front with a direction-free shape instead of a rising plume."
@@ -65,19 +89,28 @@
       "self": "leaves",
       "neighbor": "tag:hot",
       "chance": 25,
-      "selfBecomes": "leaf_burning"
+      "selfBecomes": "leaf_burning",
+      "neighborChance": {
+        "fire": 0.125
+      }
     },
     {
       "self": "pine_needles",
       "neighbor": "tag:hot",
       "chance": 127,
-      "selfBecomes": "leaf_burning"
+      "selfBecomes": "pine_burning",
+      "neighborChance": {
+        "fire": 0.125
+      }
     },
     {
       "self": "autumn_leaves",
       "neighbor": "tag:hot",
       "chance": 133,
-      "selfBecomes": "leaf_burning"
+      "selfBecomes": "autumn_burning",
+      "neighborChance": {
+        "fire": 0.125
+      }
     },
     {
       "note": "THE SHADE RAMPS BURN LIKE WHAT THEY ARE. assets/editor/treegen.js bakes each foliage and bark family as a three-material ramp (dark / plain / lit) so a crown has form; combustion in this file is authored BY NAME, not by tag, so a ramp member with no rule of its own is a leaf that will not catch. Same chance as its plain sibling in every case -- these are lighting tiers, not different fuels, and a canopy that burned in stripes would be worse than one that did not burn at all."
@@ -86,49 +119,73 @@
       "self": "leaves_dark",
       "neighbor": "tag:hot",
       "chance": 25,
-      "selfBecomes": "leaf_burning"
+      "selfBecomes": "leaf_burning",
+      "neighborChance": {
+        "fire": 0.125
+      }
     },
     {
       "self": "leaves_lit",
       "neighbor": "tag:hot",
       "chance": 25,
-      "selfBecomes": "leaf_burning"
+      "selfBecomes": "leaf_burning",
+      "neighborChance": {
+        "fire": 0.125
+      }
     },
     {
       "self": "pine_dark",
       "neighbor": "tag:hot",
       "chance": 127,
-      "selfBecomes": "leaf_burning"
+      "selfBecomes": "pine_burning",
+      "neighborChance": {
+        "fire": 0.125
+      }
     },
     {
       "self": "pine_lit",
       "neighbor": "tag:hot",
       "chance": 127,
-      "selfBecomes": "leaf_burning"
+      "selfBecomes": "pine_burning",
+      "neighborChance": {
+        "fire": 0.125
+      }
     },
     {
       "self": "autumn_dark",
       "neighbor": "tag:hot",
       "chance": 133,
-      "selfBecomes": "leaf_burning"
+      "selfBecomes": "autumn_burning",
+      "neighborChance": {
+        "fire": 0.125
+      }
     },
     {
       "self": "autumn_lit",
       "neighbor": "tag:hot",
       "chance": 133,
-      "selfBecomes": "leaf_burning"
+      "selfBecomes": "autumn_burning",
+      "neighborChance": {
+        "fire": 0.125
+      }
     },
     {
       "self": "bark_dark",
       "neighbor": "tag:hot",
       "chance": 12,
-      "selfBecomes": "ember"
+      "selfBecomes": "ember",
+      "neighborChance": {
+        "fire": 0.125
+      }
     },
     {
       "self": "bark_light",
       "neighbor": "tag:hot",
       "chance": 12,
-      "selfBecomes": "ember"
+      "selfBecomes": "ember",
+      "neighborChance": {
+        "fire": 0.125
+      }
     },
     {
       "note": "-------- leaf_burning: ember for leaves. Stands still, cooks its neighbours in every direction, leaves nothing --------\nTHE DECAY TOTAL IS THE WHOLE TUNING SURFACE HERE. 80 per-mille is ~12.5 ticks (0.4 s) per leaf voxel, against `fire`'s ~6, and that number is chosen for reach rather than for looks: a green leaf catches at 25 per-mille per hot face, so a neighbour exposed for 12.5 ticks catches with probability 1 - 0.975^12.5 = 27%, and a leaf with four foliage neighbours passes the fire on ~1.1 times before it is spent. Just over unity, which is what a crown that burns through looks like -- and it is bounded the way the file has always bounded foliage, by the fuel being CONSUMED into something that authors no rules, not by the growth factor. Per TICK the growth is 0.09, well inside rule 2.\n\nCut this total and the front stalls out in the interior of a canopy; raise it and a single spark takes the whole forest. It is the one number to reach for if a burning tree feels wrong, and it is a much better lever than the ignition chances above, which the owner has already tuned twice and which control how readily a crown catches at all rather than how far the fire then travels.\n\nNo ash branch AT ALL, deliberately, where cloth and flesh both keep a rare one: a crown is tens of thousands of voxels and even a 0.33 per-mille ash branch would rain a floor of it under every burnt tree. Smoke is the visible residue instead.\n\nDouse first, then emit, then the decays -- the ember ordering, for the ember reason: water must beat the burn to the tick."
@@ -150,7 +207,7 @@
     },
     {
       "self": "leaf_burning",
-      "emit": "fire",
+      "emit": "spark",
       "dir": "down",
       "chance": 35
     },
@@ -175,70 +232,182 @@
       "becomes": "smoke"
     },
     {
+      "note": "-------- pine_burning / autumn_burning: leaf_burning, once per foliage family --------\nThree burning-leaf materials rather than one, and the reason is the RENDERER, not the sim: a burning leaf keeps the palette of the leaf it was and pulses toward the flame colour (materials.json \"burnTint\", common.wgsl burnTint), and the voxel word has no bits left to remember which leaf a burning one used to be, so the material id is the memory. The three families' dark / plain / lit shade tiers collapse onto the plain tier's burning material -- a lighting tier is not worth a material. EVERY NUMBER BELOW IS leaf_burning's, deliberately: these are the same fuel, and the fire-down gate's argument about reach (12.5 ticks of exposure per leaf, ~1.1 hand-offs per leaf) is made once, above, for all three. Change one, change all three."
+    },
+    {
+      "self": "pine_burning",
+      "neighbor": "tag:extinguisher",
+      "chance": 400,
+      "selfBecomes": "air"
+    },
+    {
+      "self": "pine_burning",
+      "emit": "fire",
+      "dir": "up",
+      "chance": 70
+    },
+    {
+      "self": "pine_burning",
+      "emit": "spark",
+      "dir": "down",
+      "chance": 35
+    },
+    {
+      "self": "pine_burning",
+      "emit": "fire",
+      "dir": "side",
+      "chance": 35
+    },
+    {
+      "self": "pine_burning",
+      "decay": true,
+      "burnDuration": true,
+      "chance": 72,
+      "becomes": "air"
+    },
+    {
+      "self": "pine_burning",
+      "decay": true,
+      "burnDuration": true,
+      "chance": 8,
+      "becomes": "smoke"
+    },
+    {
+      "self": "autumn_burning",
+      "neighbor": "tag:extinguisher",
+      "chance": 400,
+      "selfBecomes": "air"
+    },
+    {
+      "self": "autumn_burning",
+      "emit": "fire",
+      "dir": "up",
+      "chance": 70
+    },
+    {
+      "self": "autumn_burning",
+      "emit": "spark",
+      "dir": "down",
+      "chance": 35
+    },
+    {
+      "self": "autumn_burning",
+      "emit": "fire",
+      "dir": "side",
+      "chance": 35
+    },
+    {
+      "self": "autumn_burning",
+      "decay": true,
+      "burnDuration": true,
+      "chance": 72,
+      "becomes": "air"
+    },
+    {
+      "self": "autumn_burning",
+      "decay": true,
+      "burnDuration": true,
+      "chance": 8,
+      "becomes": "smoke"
+    },
+    {
       "self": "grass",
       "neighbor": "tag:hot",
       "chance": 220,
-      "selfBecomes": "fire"
+      "selfBecomes": "fire",
+      "neighborChance": {
+        "fire": 0.125
+      }
     },
     {
       "self": "petal",
       "neighbor": "tag:hot",
       "chance": 300,
-      "selfBecomes": "fire"
+      "selfBecomes": "fire",
+      "neighborChance": {
+        "fire": 0.125
+      }
     },
     {
       "self": "oil",
       "neighbor": "tag:hot",
       "chance": 350,
-      "selfBecomes": "fire"
+      "selfBecomes": "fire",
+      "neighborChance": {
+        "fire": 0.125
+      }
     },
     {
       "self": "dust",
       "neighbor": "tag:hot",
       "chance": 1000,
-      "selfBecomes": "fire"
+      "selfBecomes": "fire",
+      "neighborChance": {
+        "fire": 0.125
+      }
     },
     {
       "self": "plant",
       "neighbor": "tag:hot",
       "chance": 250,
-      "selfBecomes": "fire"
+      "selfBecomes": "fire",
+      "neighborChance": {
+        "fire": 0.125
+      }
     },
     {
       "self": "seed",
       "neighbor": "tag:hot",
       "chance": 400,
-      "selfBecomes": "fire"
+      "selfBecomes": "fire",
+      "neighborChance": {
+        "fire": 0.125
+      }
     },
     {
       "self": "sprout",
       "neighbor": "tag:hot",
       "chance": 300,
-      "selfBecomes": "fire"
+      "selfBecomes": "fire",
+      "neighborChance": {
+        "fire": 0.125
+      }
     },
     {
       "self": "stem",
       "neighbor": "tag:hot",
       "chance": 300,
-      "selfBecomes": "fire"
+      "selfBecomes": "fire",
+      "neighborChance": {
+        "fire": 0.125
+      }
     },
     {
       "self": "flower",
       "neighbor": "tag:hot",
       "chance": 300,
-      "selfBecomes": "fire"
+      "selfBecomes": "fire",
+      "neighborChance": {
+        "fire": 0.125
+      }
     },
     {
       "self": "vine",
       "neighbor": "tag:hot",
       "chance": 300,
-      "selfBecomes": "fire"
+      "selfBecomes": "fire",
+      "neighborChance": {
+        "fire": 0.125
+      }
     },
     {
       "self": "fungus",
       "neighbor": "tag:hot",
       "chance": 350,
-      "selfBecomes": "fire"
+      "selfBecomes": "fire",
+      "neighborChance": {
+        "fire": 0.125
+      }
     },
     {
       "note": "-------- ember: smolders, licks flame upward, dies to ash; doused back to charwood --------"
@@ -260,7 +429,7 @@
     },
     {
       "self": "ember",
-      "emit": "fire",
+      "emit": "spark",
       "dir": "down",
       "chance": 45
     },
@@ -700,7 +869,8 @@
       "minLight": 235,
       "chance": 60,
       "selfBecomes": "fire"
-    },    {
+    },
+    {
       "self": "pine_dark",
       "neighbor": "glass",
       "needsSky": true,
@@ -708,7 +878,8 @@
       "minLight": 235,
       "chance": 60,
       "selfBecomes": "fire"
-    },    {
+    },
+    {
       "self": "pine_lit",
       "neighbor": "glass",
       "needsSky": true,
@@ -745,19 +916,28 @@
       "self": "cloth",
       "neighbor": "tag:hot",
       "chance": 200,
-      "selfBecomes": "cloth_burning"
+      "selfBecomes": "cloth_burning",
+      "neighborChance": {
+        "fire": 0.125
+      }
     },
     {
       "self": "robe_trim",
       "neighbor": "tag:hot",
       "chance": 200,
-      "selfBecomes": "cloth_burning"
+      "selfBecomes": "cloth_burning",
+      "neighborChance": {
+        "fire": 0.125
+      }
     },
     {
       "self": "robe_shadow",
       "neighbor": "tag:hot",
       "chance": 200,
-      "selfBecomes": "cloth_burning"
+      "selfBecomes": "cloth_burning",
+      "neighborChance": {
+        "fire": 0.125
+      }
     },
     {
       "note": "Leather is fabric that resists: the same burning state at one eighth the catch rate. The whole 'a leather jerkin buys you seconds a robe does not' mechanic is this one number."
@@ -766,13 +946,19 @@
       "self": "leather",
       "neighbor": "tag:hot",
       "chance": 25,
-      "selfBecomes": "cloth_burning"
+      "selfBecomes": "cloth_burning",
+      "neighborChance": {
+        "fire": 0.125
+      }
     },
     {
       "self": "grip_leather",
       "neighbor": "tag:hot",
       "chance": 25,
-      "selfBecomes": "cloth_burning"
+      "selfBecomes": "cloth_burning",
+      "neighborChance": {
+        "fire": 0.125
+      }
     },
     {
       "note": "Douse FIRST, then emit, then the decays -- the ember ordering, for the ember reason: water must beat the burn to the tick, and a voxel that spent its tick licking flame upward should not also consume itself. Total decay 39 per-mille is about 26 ticks (0.9 s) per cloth voxel, so a robe burns away over seconds instead of vanishing in one frame.\n\nThe ash branch is deliberately 15x rarer than it first shipped (5 -> 0.33 per-mille): a burning robe is a lot of voxels and at 5 per-mille it buried the wearer's feet in ash. Its old share went to the 'becomes air' branch so the 39 per-mille total -- and therefore the burn DURATION -- is unchanged; only the fraction of cloth that survives as matter moved. Ash from a garment is now a scatter, not a pile."
@@ -791,7 +977,7 @@
     },
     {
       "self": "cloth_burning",
-      "emit": "fire",
+      "emit": "spark",
       "dir": "down",
       "chance": 60
     },
@@ -838,7 +1024,10 @@
       "self": "hair_white",
       "neighbor": "tag:hot",
       "chance": 600,
-      "selfBecomes": "hair_burning"
+      "selfBecomes": "hair_burning",
+      "neighborChance": {
+        "fire": 0.125
+      }
     },
     {
       "self": "hair_burning",
@@ -854,7 +1043,7 @@
     },
     {
       "self": "hair_burning",
-      "emit": "fire",
+      "emit": "spark",
       "dir": "down",
       "chance": 100
     },
@@ -872,7 +1061,10 @@
       "self": "linen",
       "neighbor": "tag:hot",
       "chance": 200,
-      "selfBecomes": "linen_burning"
+      "selfBecomes": "linen_burning",
+      "neighborChance": {
+        "fire": 0.125
+      }
     },
     {
       "self": "linen_burning",
@@ -888,7 +1080,7 @@
     },
     {
       "self": "linen_burning",
-      "emit": "fire",
+      "emit": "spark",
       "dir": "down",
       "chance": 60
     },
@@ -942,7 +1134,7 @@
     },
     {
       "self": "flesh_burning",
-      "emit": "fire",
+      "emit": "spark",
       "dir": "down",
       "chance": 35
     },
@@ -996,7 +1188,10 @@
       "self": "staff_wood",
       "neighbor": "tag:hot",
       "chance": 11,
-      "selfBecomes": "ember"
+      "selfBecomes": "ember",
+      "neighborChance": {
+        "fire": 0.125
+      }
     },
     {
       "note": "ANATOMY. `flesh` and `muscle` are the interior layers the human's anatomy recipe bakes under its skin (assets/editor/anatomy.js). They enter the skin's burn chain at the same chance, on the same entry rule, so once fire has charred the skin off a limb the layer it exposes cooks on the same clock rather than sitting there pink and inert. Bone deliberately has NO rule here -- see the note above the flesh_cooked chain."

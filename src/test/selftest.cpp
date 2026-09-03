@@ -80,6 +80,10 @@ const char* const kOrder[] = {
     // compute, which is a precondition for trusting ANY later gate's page
     // table: PageTable::Classify decides sentinel promotion with them.
     "simd",
+    // With it, for the same reason: `weak-flame` is pure CPU over the compiled
+    // reaction table -- no world, no GPU, no fixtures -- and asserts that the
+    // loader's neighborChance expansion produced the rules the author wrote.
+    "weak-flame",
     // THIRD, and for the same reasons: `scale` is pure CPU over the loaded
     // defs and the atlas files -- no world, no GPU, no fixtures. It asserts
     // that everything authored is the PHYSICAL size it claims, which every

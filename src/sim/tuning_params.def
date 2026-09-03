@@ -184,6 +184,14 @@ TP_F(render, emissiveStrength, TUNE_EMISSIVE_STRENGTH, 1.7f)
 TP_F(render, emissiveFlickerBase, TUNE_EMISSIVE_FLICKER_BASE, 0.82f)
 TP_F(render, emissiveFlickerAmp, TUNE_EMISSIVE_FLICKER_AMP, 0.28f)
 TP_F(render, emissiveFlickerRate, TUNE_EMISSIVE_FLICKER_RATE, 9.0f)
+// Burn-tinted materials (materials.json "burnTint", sim/materials.h
+// kMatFlagBurnTint): the palette is the UNBURNT colour and each cell pulses
+// toward this flame colour on a slow per-cell phase. Min/Max bound the pulse
+// weight; the emission is scaled by the same weight (common.wgsl burnTint).
+TP_V3(render, burnTintColor, TUNE_BURN_TINT_COLOR, 1.0f, 0.52f, 0.14f)
+TP_F(render, burnTintRate, TUNE_BURN_TINT_RATE, 2.6f)
+TP_F(render, burnTintMin, TUNE_BURN_TINT_MIN, 0.25f)
+TP_F(render, burnTintMax, TUNE_BURN_TINT_MAX, 0.9f)
 
 // ---- water ----
 TP_F(render, waterF0, TUNE_WATER_F0, 0.0204f)

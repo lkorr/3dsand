@@ -550,6 +550,14 @@
     "emissiveFlickerBase": 0.82,
     "emissiveFlickerAmp": 0.28,
     "emissiveFlickerRate": 9,
+    "burnTintColor": [
+      1,
+      0.52,
+      0.14
+    ],
+    "burnTintRate": 2.6,
+    "burnTintMin": 0.25,
+    "burnTintMax": 0.9,
     "waterF0": 0.0204,
     "waterAbsorb": [
       1.85,

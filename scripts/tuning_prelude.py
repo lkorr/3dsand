@@ -151,6 +151,10 @@ SPEC = [
     ("render", "emissiveFlickerBase", "TUNE_EMISSIVE_FLICKER_BASE", "f", 0.82),
     ("render", "emissiveFlickerAmp", "TUNE_EMISSIVE_FLICKER_AMP", "f", 0.28),
     ("render", "emissiveFlickerRate", "TUNE_EMISSIVE_FLICKER_RATE", "f", 9.0),
+    ("render", "burnTintColor", "TUNE_BURN_TINT_COLOR", "v3", [1.0, 0.52, 0.14]),
+    ("render", "burnTintRate", "TUNE_BURN_TINT_RATE", "f", 2.6),
+    ("render", "burnTintMin", "TUNE_BURN_TINT_MIN", "f", 0.25),
+    ("render", "burnTintMax", "TUNE_BURN_TINT_MAX", "f", 0.9),
 
     # water
     ("render", "waterF0", "TUNE_WATER_F0", "f", 0.0204),

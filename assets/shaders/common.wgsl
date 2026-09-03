@@ -44,13 +44,18 @@ const MATF_PASSABLE : u32 = 8u;
 // gives a GRID cell a per-voxel colour — art colour never reaches the grid.
 // Liquids can never carry it (their nibble is fullness); refused at load.
 const MATF_TINTED : u32 = 16u;
+// BURNTINT: this material's palette is what the voxel looked like BEFORE it
+// caught, and the renderer pulses each cell toward the flame colour (burnTint()
+// below). Render-only; mirrors kMatFlagBurnTint in sim/materials.h, which has
+// the rationale. leaf_burning / pine_burning / autumn_burning carry it.
+const MATF_BURNTINT : u32 = 32u;
 // Start of this material's 16-entry tint run, packed into the free high half of
 // `flags` (bits 16..23) — see the wind note below for why `flags` and not a new
 // field. Mirrors kMatTintBaseShift / kMatTintBaseMask in sim/materials.h.
 const MATF_TINT_BASE_SHIFT : u32 = 16u;
 const MATF_TINT_BASE_MASK  : u32 = 0xFFu;
 // ---- wind response, packed into the SAME word (docs/RESEARCH_wind.md §4.5) ----
-// `flags` bits 0..7 are the MATF_* booleans above (4 used, 4 spare); bits 8..15
+// `flags` bits 0..7 are the MATF_* booleans above (6 used, 2 spare); bits 8..15
 // are two 4-bit AUTHORED numbers, and 16..31 are still free.
 //
 // They live here rather than in two new fields because `MaterialGpu` is exactly
@@ -1301,6 +1306,51 @@ fn litColor(albedo : vec3f, n : vec3f, worldPos : vec3f, emission : f32,
 fn emberFlicker(emission : f32, hash : u32, time : f32) -> f32 {
   if (emission <= 0.0) { return emission; }
   return emission * (0.82 + 0.28 * sin(time * 9.0 + f32(hash & 0xFFu) * 0.0245));
+}
+
+// ============================== BURN TINT ===================================
+// A MATF_BURNTINT material (sim/materials.h kMatFlagBurnTint) keeps the palette
+// of the thing it was before it caught -- leaf_burning is authored in leaf
+// green, pine_burning in needle green, autumn_burning in autumn orange -- and
+// the RENDERER supplies the fire: each cell breathes between that palette and
+// TUNE_BURN_TINT_COLOR on a slow per-cell phase, so a crown on fire still reads
+// as the crown it was instead of a heap of identical orange coals.
+//
+// ONE helper for every grid site that shades emission (the primary hit, the
+// far cascade, secondary rays, the irradiance deposit), because the four must
+// agree about what a burning leaf looks like or the far field shows a
+// different tree from the near field across the seam. The returned emission is
+// scaled by the SAME weight: at the leaf end of the breath the cell is lit like
+// a leaf (no glow), at the flame end it glows like an ember. Leaving the
+// emission at full while the albedo went green would glow green, which is the
+// one thing this must never do (per-channel it is a very bright leaf, not a
+// fire).
+//
+// The phase key is the same cell hash the emissive flicker uses, so the slow
+// breath and the fast flicker are decorrelated across neighbours in the same
+// way, and the far-field caller passes its cell in FINE voxel coordinates so a
+// cell keeps its phase when it crosses the cascade seam.
+struct BurnTint {
+  albedo : vec3f,
+  emis : f32,
+};
+
+fn burnTintWeight(cell : vec3<i32>, time : f32) -> f32 {
+  let ph = pcg(u32(cell.x * 7 + cell.y * 131 + cell.z * 2917));
+  let s = 0.5 + 0.5 * sin(time * TUNE_BURN_TINT_RATE + f32(ph & 0xFFu) * 0.02454);
+  return mix(TUNE_BURN_TINT_MIN, TUNE_BURN_TINT_MAX, s);
+}
+
+// The breath's mean, for a consumer with no clock: the irradiance deposit is
+// an EMA over frames, and feeding it the pulse would make the bounce light
+// under a burning crown beat.
+fn burnTintMean() -> f32 {
+  return 0.5 * (TUNE_BURN_TINT_MIN + TUNE_BURN_TINT_MAX);
+}
+
+fn burnTint(m : Material, albedo : vec3f, emis : f32, w : f32) -> BurnTint {
+  if ((m.flags & MATF_BURNTINT) == 0u) { return BurnTint(albedo, emis); }
+  return BurnTint(mix(albedo, TUNE_BURN_TINT_COLOR, w), emis * w);
 }
 
 // Camera-basis projection for raster geometry — no matrices; identical math to

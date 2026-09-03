@@ -264,8 +264,12 @@ fn openSunSample(blockMin : vec3<i32>, face : u32, open : f32) -> vec4f {
     let w = voxWordAt(c);
     let m = materials[voxMat(w)];
     if (isRayBlocker(m)) {
-      albedo = paletteColor(m, voxState(w), &materials);
-      emis = f32(m.emission) / 255.0;
+      // Burning foliage deposits the MEAN of its breath (burnTintMean):
+      // this grid is an EMA over frames and must not beat with the pulse.
+      let bt = burnTint(m, paletteColor(m, voxState(w), &materials),
+                        f32(m.emission) / 255.0, burnTintMean());
+      albedo = bt.albedo;
+      emis = bt.emis;
       found = true;
       break;
     }

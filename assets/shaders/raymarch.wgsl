@@ -3614,9 +3614,13 @@ fn shadeSecondaryHit(h : OpaqueHit) -> vec3f {
   // sheen is not resolvable at this budget), same as the grain above.
   var rwet = 0.0;
   albedo = applyStain(albedo, h.word, h.cell, &rwet);
+  // Burning foliage seen in a reflection breathes the same way it does head-on.
+  let bt = burnTint(m, albedo, f32(m.emission) / 255.0,
+                    burnTintWeight(h.cell, R.time));
+  albedo = bt.albedo;
   let lam = wrapDiffuse(dot(rn, keyLightDir()), 0.55);
   var c = albedo * face * (ambientAt(rn) + keyLightColor() * lam * 0.52);
-  let emis = f32(m.emission) / 255.0;
+  let emis = bt.emis;
   if (emis > 0.0) { c += albedo * emis * 1.7; }
   return c;
 }
@@ -7082,6 +7086,12 @@ fn fs(in : VSOut) -> FSOut {
       if (far.axis == 0) { face = TUNE_FACE_X; }
       else if (far.axis == 2) { face = TUNE_FACE_Z; }
       albedo *= surfaceGrain(far.cell << vec3<u32>(farCellShift(far.level)), TUNE_GRAIN_AMP_FAR);
+      // Burning foliage breathes toward the flame colour out here too, keyed
+      // on the FINE cell so a leaf keeps its phase across the cascade seam.
+      let bt = burnTint(m, albedo, f32(m.emission) / 255.0,
+                        burnTintWeight(far.cell << vec3<u32>(farCellShift(far.level)),
+                                       R.time));
+      albedo = bt.albedo;
       // Same wrapped diffuse as the near field — a different falloff here is a
       // visible brightness step at the window seam.
       var lambert = wrapDiffuse(dot(n, keyLightDir()), TUNE_DIFFUSE_WRAP);
@@ -7105,7 +7115,7 @@ fn fs(in : VSOut) -> FSOut {
       // direct sun) so the two representations agree across the seam.
       let fsun = keyLightColor() * lambert;
       color = albedo * face * (ambientAt(n) * ao + fsun);
-      let emis = f32(m.emission) / 255.0;
+      let emis = bt.emis;
       if (emis > 0.0) { color += albedo * emis * TUNE_EMISSIVE_STRENGTH; }
       if (h.liqT <= 0.0) { color = applyAerial(color, rd, far.t); }
       else { color = applyAerial(color, rd, far.t - h.liqT); }
@@ -7143,6 +7153,12 @@ fn fs(in : VSOut) -> FSOut {
       let fullness = f32(voxState(h.word) + 1u) / 8.0;
       albedo = mix(unpackColor(m.color2), unpackColor(m.color0), fullness);
     }
+    // A burning leaf keeps its leaf palette and breathes toward the flame
+    // colour (burnTint, common.wgsl); the emission below breathes with it.
+    // A no-op for every material without MATF_BURNTINT.
+    let bt = burnTint(m, albedo, f32(m.emission) / 255.0,
+                      burnTintWeight(h.cell, R.time));
+    albedo = bt.albedo;
 
     var n = axisVec(h.axis, -h.sgn);
     if (isMicro) {
@@ -7409,7 +7425,7 @@ fn fs(in : VSOut) -> FSOut {
     //
     // Detected by class + flags + emission, never by material ID: any modder's
     // emissive opaque liquid gets this for free (CLAUDE.md conventions).
-    let emis = f32(m.emission) / 255.0;
+    let emis = bt.emis;
     let isMolten = m.klass == CLASS_LIQUID &&
                    (m.flags & MATF_OPAQUE) != 0u && m.emission > 0u;
     if (isMolten) {
