@@ -114,6 +114,9 @@ void PassTimer::Absorb(GpuContext& ctx, const uint64_t* ts, size_t count,
     if (ps) ps->ns += ns;
     else last_.push_back(PassSample{names[p], ns});
   }
+  // The collector form keeps EVERY buffer, not just the newest — see PassFrame
+  // in the header for why a four-tick frame needs it.
+  if (collector_) collector_->push_back(PassFrame{tag, last_});
   // Count each distinct name once per collected command buffer.
   for (Stat& c : stats_) {
     for (const char* n : names)
@@ -143,7 +146,10 @@ void PassTimer::KickDeferred(GpuContext& ctx, uint32_t frame) {
   ringHead_ = (ringHead_ + 1) % kRing;
 }
 
-int PassTimer::PollDeferred(GpuContext& ctx) {
+int PassTimer::PollDeferred(GpuContext& ctx) { return PollDeferred(ctx, nullptr); }
+
+int PassTimer::PollDeferred(GpuContext& ctx, std::vector<PassFrame>* out) {
+  collector_ = out;
   int got = 0;
   // Harvest in ring order starting one past the head, so slots are consumed
   // oldest-first and LastFrame() ends up holding the newest one.
@@ -162,6 +168,7 @@ int PassTimer::PollDeferred(GpuContext& ctx) {
     s.queries = 0;
     s.names.clear();
   }
+  collector_ = nullptr;
   return got;
 }
 

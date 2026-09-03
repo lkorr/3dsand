@@ -833,3 +833,246 @@ own connection.
 Fields used above: `wallMs`, `cpu.*` per `PerfScope`, `gpu.raymarch`,
 `counters.pagesResident`. This is the cheapest way to get the USER's numbers
 rather than a harness's, and it is passive.
+
+
+---
+
+## P3-F. The sprint tail, attributed: it is not the streaming path — LANDED 2026-09-03
+
+**Branch:** `worktree-agent-ae8b16bb4a02aa534` off `streaming-smooth` @ 840e63f.
+**Files:** `src/measure/perfsuite.cpp` (the `surface-sprint` scenario + real-time
+pacing), `src/measure/perfnodes.h` (7 counters, 3 non-pass spans, one
+attribution entry point), `src/test/support.{h,cpp}` (the spans themselves),
+`src/gpu/passtimer.{h,cpp}` (ring depth + a collector form of `PollDeferred`),
+`scripts/check_invariants.py` (`autofly` check), `scripts/p3f_analyse.py`.
+**Hash-neutral:** `--gate determinism` reads `b9e443c7`, unchanged; `--gate
+streaming` passes paged; `--perf`'s own timer-neutrality gate reports
+`cd34055d untimed vs cd34055d timed — IDENTICAL` with the new spans attached.
+
+### 0. What was actually missing: the streaming path had NO GPU BILL AT ALL
+
+Not "unattributed" — **unrecorded**. `PageTable::DrainFills` issues one
+`vkCmdFillBuffer` per page materialized from an `EMPTY`/`UNIFORM` sentinel, the
+free-confirmation probe issues its own copies on its own submit, and
+`EncodeReadbacks` copies ~1.9 MiB out per tick. None of those are
+`pass_table.def` rows, so the barrier generator never sees them, so
+`PerfNodeForPass` cannot name them — and an untimed command produces no
+`PassSample`, so it does not even land in the `unattributed` bucket the page
+prints a warning for. Time that is invisible to the one report designed to
+catch invisible time is the worst case there is, and it is exactly where
+hypothesis (a) lived.
+
+Three timestamp spans now bracket them, on the same `PassTimer` the pass table
+uses and resolved by the resolve `EncodeTick` already encodes:
+`pageFillCmd` -> `pageTable`, `freeProbeCopy` -> `pageTable`, `readbackCopy`
+-> `readback` (names in `kPerfRenderSpans`, which is no longer only render
+spans). `PerfNodeForTimedName` is now the ONE lookup for both populations, so
+the next hand-written span cannot be silently dropped by a caller that picked
+the wrong table.
+
+**One hazard found writing them, worth stating because it is a hang and not a
+wrong number.** `EncodeResolve` resolves `[0, used_)` with
+`VK_QUERY_RESULT_WAIT_BIT`, so every query it covers must have been WRITTEN by a
+command buffer that is actually submitted. The free probe's first version
+allocated its pair and then took the `copied == 0` early return without
+submitting; the tick's resolve would then wait forever on a query nothing wrote.
+The plan is built before the span is opened for that reason alone.
+
+### 1. The scenario: `--perf --scenario surface-sprint`
+
+`--frames 600 --autofly-surface` as a recorded, attributed run.
+`flythrough` cannot see this tail and it is not a subtle difference: it descends
+at 1.5 vox/tick against sprint's 10.8, and it runs exactly one tick per frame.
+
+Faithful to `src/main.cpp`: fly mode, forward + sprint, `player.flySprint /
+kVoxelMeters` along `Camera::Forward()` at the game's own default yaw 2.35 /
+pitch -0.2, altitude pinned analytically to `World::TerrainHeight` + 35 / + 150
+voxels alternating on `tick / 90 & 1`. The two clearances are restated in
+`perfsuite.cpp` and compared against `main.cpp` by
+`check_invariants.py --autofly`, because a copy that drifts measures a
+different flight while looking identical on the page. It advances per TICK
+rather than per frame, which is what keeps the world a pure function of the
+tick counter under a pacing scheme whose frame count is not.
+
+**Real-time paced, and the pacing took two corrections that are the useful part
+of this section.**
+
+1. **No pacing model at all -> the scenario did not exist.** First run: 133 sim
+   ticks over 600 frames (0.22/frame, against the game's ~0.6), 4 active chunks
+   against `--autofly-surface`'s ~550. `dt` IS the frame time and the offscreen
+   harness's frame is ~4.8 ms, so the accumulator barely filled. `FramePacer`
+   already reproduces the swapchain's frames-in-flight bound explicitly because
+   there is no swapchain; the present interval needed the same treatment.
+2. **A FLOOR is not FIFO. FIFO QUANTISES, and the difference is the whole of
+   hypothesis (b).** With `dt = max(work, 1/60)` the run reached 322 ticks over
+   600 frames (0.54/frame — the right cadence) and `ticksThisFrame` never once
+   exceeded 1: floored, a 17 ms frame contributes 17 ms and the feedback loop
+   has no gain. Under FIFO that frame is displayed on the *second* refresh
+   boundary and contributes 33.3 ms, which is what buys the next frame an extra
+   tick, which costs more GPU, which crosses another boundary. Shipped:
+   `dt = ceil(work / period) * period`, bookkeeping only — nothing sleeps, so
+   `wallMs` stays the frame's WORK. `SANDVOX_PERF_VSYNC_HZ` is the knob (0
+   disables), so the three arms above are one binary.
+
+The scenario reaches the game's cadence: **474 ticks over 600 frames
+(0.70/frame), 468 window shifts = 0.99 shifts/tick** (the windowed harness
+measures 0.68), `activeChunks` p50 124 / p95 ~420 / max 498 against
+`--autofly-surface`'s ~550 p50. It does NOT reach the game's frame magnitude —
+see §4, which is a finding rather than an excuse.
+
+### 2. The attribution table
+
+`SANDVOX_RUN_EXCLUSIVE=1 --perf --scenario surface-sprint`, 600 frames, RTX
+3060 Ti, 1920x1080, paged. Split on the 418 frames that ran a tick (the 182 that
+ran none are a real part of a 60 Hz / 30 Hz cadence but comparing them to a
+ticking frame answers nothing). `unattributed: 0 ns, no names.`
+
+| | median frame | worst 5% | delta |
+|---|---|---|---|
+| **wall** | 16.73 | 24.67 (max 27.37) | +7.9 |
+| gpu raymarch | 8.11 | 11.69 | **+3.58** |
+| gpu worldgen (`worldgenList`) | 4.59 | 5.29 | +0.70 |
+| gpu caLoop | 1.66 | 2.19 | +0.53 |
+| gpu openness | 1.02 | 1.30 | +0.27 |
+| gpu farField | 0.02 | 0.15 | +0.13 |
+| gpu shadowCache | 0.61 | 0.64 | +0.03 |
+| gpu occupancy / fluidSys / compact | 0.46 | 0.48 | +0.02 |
+| **gpu readback** (`readbackCopy`) | **0.043** | **0.047** | +0.004 |
+| **gpu pageTable** (`pageFillCmd` + `pageFill` + `freeProbeCopy`) | **0.087** | **0.051** | **-0.036** |
+| **GPU TOTAL** | **16.60** | **21.83** | **+5.23** |
+| cpu present (the pacer's frames-in-flight wait) | 13.92 | 21.68 | +7.76 |
+| cpu stream | 1.62 | 1.72 | +0.10 |
+| cpu pageTableCpu | 0.59 | 0.62 | +0.03 |
+| cpu everything else | 0.56 | 0.61 | +0.05 |
+| ticks this frame | 1.00 | 1.00 | **0.00** |
+| window shifts this frame | 1.00 | 1.00 | **0.00** |
+| shift wake-wait ms | 0.00 | 0.00 | **0.00** (0 misses in the whole run) |
+| snapshot stalls | 0 | 0 | 0 |
+| page fills (EMPTY/UNIFORM, = the fill COMMAND count) | 180 | 192 | +12 |
+| page fills (JITTER, dispatch slots) | 44 | 28 | -16 |
+| page fill bytes | 3.68 MB | 3.60 MB | -0.07 MB |
+| cpuDirty chunks | 4,354 | 5,932 | +1,578 |
+| active chunks | 124 | 201 | +77 |
+| pages resident | 20,338 | 20,486 | +148 |
+
+Per-pass, whole run (us per frame, 600 frames):
+
+| pass / span | us/frame | events | node |
+|---|---|---|---|
+| `worldgenList` | **3,625.9** | 468 | worldgen |
+| `ca` | 1,238.2 | 471 | caLoop |
+| `opennessDirty` | 536.3 | 474 | openness |
+| `shadow_resolve` | 437.0 | 658 | shadowCache |
+| `opennessRefresh` | 269.6 | 474 | openness |
+| `readbackCopy` *(new)* | **33.0** | 473 | readback |
+| `freeProbeCopy` *(new)* | **27.4** | 193 | pageTable |
+| `pageFillCmd` *(new)* | **17.4** | 474 | pageTable |
+| `pageFill` (JITTER dispatch) | 12.0 | 409 | pageTable |
+
+### 3. The hypotheses, with numbers
+
+- **(a) thousands of 16 KiB `vkCmdFillBuffer`s + the JITTER dispatch — KILLED,
+  by two orders of magnitude.** The count was never thousands per tick: 180
+  fills on a median ticking frame, 192 on a tail frame, 987 at the run's
+  maximum. And `pageFillCmd` costs **17.4 us per frame** — 0.1% of a 16.7 ms
+  frame — with the JITTER dispatch a further 12.0 us. The whole `pageTable` GPU
+  node is 0.087 ms median and goes DOWN in the tail. This was the leading
+  suspect and it is not a contributor at all.
+- **(b) four ticks stacking inside one frame — REAL IN THE GAME, STRUCTURALLY
+  UNREACHABLE HERE, and the arithmetic is the useful part.** `kTickDt` is
+  1/30 s and the refresh period 1/60 s, so the accumulator is spent the moment
+  it crosses 33.3 ms: **a frame must exceed FOUR refresh periods (>50 ms of
+  work) before it can owe two ticks.** This harness's worst frame is 27.4 ms —
+  two periods — so `ticksThisFrame` is 1.000 on the median frame and 1.000 on
+  the tail frame. The windowed harness's 11-13 frames over 100 ms are 6+
+  periods and DO owe 3 ticks; the loop is real, it is just gated behind a frame
+  cost this scenario does not reach (§4).
+- **(c) the deferred wake's T+K miss — DID NOT FIRE ONCE.** 0 wake-wait misses
+  and 0.00 ms of wake-wait over 468 shifts, against the brief's 68 misses / 2.3
+  ms mean over 367 shifts in the windowed harness. Two readings are possible and
+  they are not distinguished here: the harness pumps `ProcessEvents` every frame
+  with nothing else competing, so K=4 ticks is always enough; or the windowed
+  run's misses are a consequence of the long frames rather than a cause of them.
+  The second is the more likely given (b) — a 100 ms frame is 3 ticks of shift
+  in one burst — and it is testable by correlating `shiftWakeWaitMs` against
+  `ticksThisFrame` in a run that reaches the band.
+- **(d) eviction / demote / free-probe / snapshot copy bandwidth — KILLED.**
+  `freeProbeCopy` 27.4 us/frame, `readbackCopy` 33.0 us/frame. `stream` CPU is
+  1.62 ms median / 1.72 ms tail and its shift breakdown (`shiftCpuMs`) is 0.505
+  median and 0.504 tail — flat to three decimals. The eviction and demote copies
+  ride Stream's own command buffers and are still untimed on the GPU (see §5),
+  but their CPU issue cost is 0.5 ms/shift and their bandwidth is bounded by the
+  same 1,024-slot plane the 4.65 ms `worldgenList` writes 16 MiB into, so they
+  cannot be an order of magnitude larger than the thing that generates them.
+- **(e) far-field cascade fills on a level crossing — NOT THE TAIL, but the
+  spikiest small row.** `farField` is 0.021 ms on the median frame and 0.153 on
+  a tail frame with a max of 2.70 ms. That is a 128x ratio on a row that is
+  otherwise nothing, so it IS a real periodic spike; it is 3% of the tail delta.
+- **(f) something unbilled — NO. `unattributed: 0 ns`,** on a run where every
+  streaming and paging command is now inside a span.
+
+**What the tail in this scenario IS made of:** +5.23 ms of GPU, of which
+**raymarch is +3.58 (68%)**, `worldgenList` +0.70 (13%), `caLoop` +0.53 (10%),
+`openness` +0.27, `farField` +0.13. The whole page/stream copy path contributes
+**-0.03 ms**. The +7.76 ms on `present` is the pacer draining a queue those GPU
+milliseconds built; it is a consequence, not a cause.
+
+### 4. What this scenario does NOT reproduce, and why that is still an answer
+
+Windowed: p50 18.7, p95 82.2, p99 113.5, max 175, 11-13 frames over 100 ms.
+Here: p50 14.6, p95 23.3, p99 25.1, **max 27.4, zero frames over 33 ms**.
+The cadence, the shift rate and the active-chunk count all match; the frame
+COST does not, and the reason is that the offscreen harness renders three draws
+(world, particles, fluid) where the game renders those plus bodies, micro
+bodies, sprites, debug and the ImGui overlay, and runs Jolt, mobs, the avatar
+and audio around them. Its `raymarch` is 8.1 ms against the owner's live 17.7.
+
+That gap is exactly what keeps it below the boundary in (b), and it makes the
+positive claim sharper rather than weaker. **The streaming and paging path was
+measured HARDER here than the game runs it — 0.99 shifts per tick against 0.68
+— and its entire GPU bill is 4.7 ms per frame, of which 98% is one dispatch
+(`worldgenList`) and 2% is everything else combined, and it is FLAT between a
+median frame and a tail frame.** No arrangement of a flat 4.7 ms produces an
+82 ms frame. Whatever the windowed harness's tail is, it is not the fills, not
+the copies, not the readbacks and not the page table.
+
+The standing hypothesis it leaves, for whoever takes the next package: the
+windowed tail is **FIFO quantisation of a GPU frame that is already at the
+period, amplified by (b)**. The suspicious arithmetic is that 82.2 ms is 4.93
+refresh periods and 113.5 is 6.81 — the p95 and p99 of a distribution that can
+only take values near multiples of 16.67 ms. The way to settle it is not another
+`--frames` run: it is to record `ticksThisFrame` and the presented-frame index
+in the WINDOWED harness (both are already counters) and check whether the
+>100 ms frames are the 3-tick frames. That is a `main.cpp` change of about ten
+lines and one run.
+
+### 5. Still unbilled, for the next package
+
+`Stream`'s eviction copies (`stream.cpp:469`), demote copies (`:1223`) and the
+occupancy/genAct copy (`:855`) ride command buffers `Stream` creates and submits
+itself, with no query resolve. Timing them means writing timestamps in
+`stream.cpp`, which package P3-E holds. It is four lines beside each
+`CreateCommandEncoder` using the same `TickGpuSpan` shape, and §3(d) argues they
+are small — but "argues" is the operative word and they are the last GPU
+commands in this engine that no span covers.
+
+### 6. Tooling notes
+
+- `scripts/p3f_analyse.py <perf.json> [id]` prints the median-vs-worst-5% split
+  used above, per GPU node, CPU scope and counter, sorted by delta. It reads
+  `build/last_run.json`-style output; no re-run needed to ask a new question of
+  a recorded run.
+- `PassTimer::PollDeferred(ctx, &out)` is a new collector form. `Absorb` CLEARS
+  `last_` per command buffer, so `LastFrame()` is the newest one only — correct
+  when a frame submits one timed buffer, and a silent 75% under-count when a
+  paced frame submits four. `kRing` went 6 -> 16 for the same reason
+  (`kMaxTicksPerFrame * (kFramesInFlight + 1)`, the `World::kReadbackSlots`
+  argument): at 6, `KickDeferred` returns early on a slot still mapped and the
+  next `EncodeResolve` overwrites numbers nobody read.
+- **A paced scenario's `worldHash` is machine-dependent by construction** and
+  the three runs above recorded three different ones (`760667c7`,
+  `d7fe12c3`, `53f5e174`). That is not a determinism failure: the WORLD is a
+  pure function of the tick, and the run simply executes a different NUMBER of
+  ticks on a faster or slower machine. Do not compare it across runs and do not
+  rebaseline anything from it — `--perf`'s timer-neutrality gate, which runs a
+  fixed 60 ticks, is the hash that means something in this harness.

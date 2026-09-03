@@ -1307,7 +1307,44 @@ def check_readback_ring():
             f"kAcquireSlots = {mv.group(1)} -- the snapshot readback ring is "
             f"sized from the first and the GPU runs ahead by the second")
 
+def check_autofly_surface():
+    """main.cpp's --autofly-surface clearances  <->  --perf's surface-sprint.
+
+    The `surface-sprint` scenario is a faithful copy of the `--autofly-surface`
+    driver, because the harness has no Player to run the real one through: the
+    game pins the altitude after Player::Update integrates velocity, and the
+    perf harness moves an eye. The copy is legitimate; the two clearance
+    constants drifting apart is not, because the whole claim of the scenario is
+    "this is the same flight", and a scenario that flies 35 voxels over the
+    canopy where the game flies 60 measures a different ray length and a
+    different set of resident chunks while looking identical on the page.
+    """
+    m = read("src/main.cpp")
+    ps = read("src/measure/perfsuite.cpp")
+    if not (m and ps):
+        return
+    checked.append("autofly-surface clearances")
+    for name in ("kAutoflySurfaceLowVox", "kAutoflySurfaceHighVox"):
+        pat = r"constexpr float " + name + r"\s*=\s*([0-9.]+)f"
+        a = re.search(pat, m)
+        b = re.search(pat, ps)
+        if not a or not b:
+            problems.append(
+                f"check_autofly_surface: could not find `constexpr float {name}` "
+                f"in {'src/main.cpp' if not a else 'src/measure/perfsuite.cpp'} "
+                f"-- the copy moved and this check went blind")
+            continue
+        if a.group(1) != b.group(1):
+            problems.append(
+                f"{name} is {a.group(1)} in src/main.cpp and {b.group(1)} in "
+                f"src/measure/perfsuite.cpp -- `--perf --scenario "
+                f"surface-sprint` would no longer be flying the same line as "
+                f"`--frames --autofly-surface`, so the two sets of numbers stop "
+                f"being comparable")
+
+
 ALL = {
+    "autofly": check_autofly_surface,
     "worldgen": check_worldgen_mirror,
     "treeatlas": check_tree_atlas,
     "biomes": check_biome_order,
@@ -1359,6 +1396,8 @@ RELEVANT = {
     "src/sim/world.h": ["ringdepth"],
     "src/sim/pass_table.def": ["counts", "perfnodes"],
     "src/measure/perfnodes.h": ["perfnodes"],
+    "src/measure/perfsuite.cpp": ["autofly"],
+    "src/main.cpp": ["arch", "autofly"],
 }
 
 if __name__ == "__main__":

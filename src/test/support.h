@@ -184,6 +184,37 @@ struct SnapshotStallStats {
 // harness frames and prints it beside the stall line.
 SnapshotStallStats TakeSnapshotStallStats();
 
+// ---- P3-F: BILL THE TICK'S UNTABLED GPU WORK -------------------------------
+//
+// SubmitTick records three lots of GPU commands that pass_table.def does not
+// describe, so `PerfNodeForPass` cannot name them and nothing on the
+// Performance page ever accounted for them:
+//
+//   pageFillCmd    PageTable::DrainFills -- one 16 KiB vkCmdFillBuffer per page
+//                  materialized from an EMPTY/UNIFORM sentinel. Thousands per
+//                  tick under sustained flight, and the leading suspect for the
+//                  sprint-flight frame-time tail.
+//   freeProbeCopy  the free-confirmation probe's per-candidate chunk copies,
+//                  which also carry their OWN vkQueueSubmit.
+//   readbackCopy   EncodeReadbacks + EncodeDirtyCopy, the snapshot's way out.
+//
+// They are timed the way the render pass's draws are: a hand-allocated
+// (begin, end) query pair on the SAME PassTimer the pass table uses, resolved
+// by the resolve EncodeTick already encodes at the tail of the tick command
+// buffer. Names come from `kPerfRenderSpans` in measure/perfnodes.h.
+//
+// A POINTER SET BY THE HARNESS, not a parameter, for the same reason
+// SetHarnessSnapshotDrain is: SubmitTick has fifteen arguments and one call
+// site that cares. NULL in the game, in --selftest and in every run that did
+// not ask, so the recorded command buffer is byte-identical -- a timestamp
+// write observes a command, it does not reorder one, and the --perf harness
+// asserts the world hash matches an untimed run.
+// `::PassTimer` explicitly: this header lives in `namespace sandvox` and the
+// timer does not, so an unqualified name here would declare a second, empty
+// sandvox::PassTimer that silently never matches the real one.
+void SetSubmitTickPassTimer(::PassTimer* t);
+::PassTimer* SubmitTickPassTimer();
+
 // Body render plumbing moved to game/bodyreg.h: BodyRegistry owns the ONE
 // definition of the debris | mob | avatar slot walk, and all three parallel
 // arrays (xforms, cube instances, micro insts) are built through it. The free

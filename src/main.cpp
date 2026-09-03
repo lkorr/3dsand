@@ -8325,8 +8325,11 @@ int main(int argc, char** argv) {
           for (const PassSample& ps : t.LastFrame()) {
             // Render spans and pass rows are two namespaces with two tables;
             // both live in perfnodes.h so the --perf harness bills the same.
-            const int node = isRender ? sandvox::PerfNodeForRenderSpan(ps.name)
-                                      : sandvox::PerfNodeForPass(ps.name);
+            // ONE lookup over both (P3-F): the tick command buffer now carries
+            // hand-written spans too — the page fills and the readback copies —
+            // so `isRender` is no longer the same question as "which table".
+            (void)isRender;
+            const int node = sandvox::PerfNodeForTimedName(ps.name);
             if (node < 0) continue;
             lp.s.gpuMs[node] += (double)ps.ns / 1e6;
             lp.s.gpuValid = true;
