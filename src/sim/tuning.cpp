@@ -1669,6 +1669,21 @@ bool LoadTuning(const std::string& path, Tuning& out) {
       out.warnings.push_back("combustion.burnDurationPct outside 25..800; clamped");
       cb.burnDurationPct = cb.burnDurationPct < 25 ? 25 : 800;
     }
+    ReadI(*g, "spreadPct", cb.spreadPct, out, at);
+    // Clamped for the same reason burnDurationPct is: at 0 every ignition
+    // chance would land on the 1-unit floor materials.cpp applies, i.e. "fire
+    // never spreads at all", which is a typo silently deleting a whole
+    // mechanic. 1% is a hundredth of the authored rate and already glacial;
+    // 400% is four times and is well past anything survivable.
+    if (cb.spreadPct < 1 || cb.spreadPct > 400) {
+      out.warnings.push_back("combustion.spreadPct outside 1..400; clamped");
+      cb.spreadPct = cb.spreadPct < 1 ? 1 : 400;
+    }
+    ReadI(*g, "crossLimbPct", cb.crossLimbPct, out, at);
+    if (cb.crossLimbPct < 0 || cb.crossLimbPct > 100) {
+      out.warnings.push_back("combustion.crossLimbPct outside 0..100; clamped");
+      cb.crossLimbPct = std::clamp(cb.crossLimbPct, 0, 100);
+    }
   }
 
   // ---- wind (docs/RESEARCH_wind.md; the field itself is common.wgsl) ----

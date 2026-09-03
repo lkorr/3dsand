@@ -988,7 +988,9 @@
     "iceMelts": false
   },
   "combustion": {
-    "burnDurationPct": 200
+    "burnDurationPct": 200,
+    "spreadPct": 12,
+    "crossLimbPct": 25
   },
   "wind": {
     "windSpeed": 6,

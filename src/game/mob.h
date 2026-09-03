@@ -422,6 +422,44 @@ struct BodyBurnState {
 // a body with a finer skin derives its collider from the skin by majority-fill,
 // so burning the collider would be writing to derived data and the next
 // re-derive would silently undo it.
+// ---- HEAT ACROSS A JOINT ---------------------------------------------------
+//
+// A world cell one of a creature's OTHER limbs is alight in. A creature's
+// limbs are separate lattices that cannot see each other, and a mob is not in
+// the grid, so until 2026-09-03 the only heat that ever crossed a joint was the
+// `fire` gas a burning voxel emits into the grid -- which rises, and which
+// every ignition rule treats as a weak igniter. A burning torso never lit the
+// legs (owner report). Mob::BuildCrossLimbHeat builds this list once per
+// creature per tick from every limb's burn front, at WORLD pitch (a cell with
+// any alight voxel in it is hot, the same granularity the grid's own fire has),
+// widened by the six face neighbours of each such cell so a joint that does
+// not quite touch at world pitch still conducts. BurnOneLimb reads it wherever
+// the grid holds air, for limbs other than `limb`, and treats the material as
+// the neighbour -- through the ordinary authored table, at
+// combustion.crossLimbPct of the authored chance when this is the only thing
+// arming the rule. Sorted by `key` for binary search; a few dozen entries on a
+// fully engulfed human. Rebuilt every tick and never saved: derived data.
+struct CrossHeatCell {
+  uint64_t key;   // CrossHeatKey(cell)
+  IVec3 cell;     // world cell
+  uint32_t mat;    // a burning material found there (tag:hot)
+  // WHICH LIMBS, AS A BITMASK, and it has to be a mask rather than an index.
+  // A world cell is 8x8x8 skin voxels, so the cell just outside a surface
+  // voxel usually holds MORE OF THAT SAME LIMB; attributing each cell to one
+  // limb would let a burning limb read its own voxels back as an external hot
+  // neighbour, which is a self-sustaining ignition loop (rule 2) dressed as a
+  // feature. A limb reads a cell only if some OTHER limb's bit is set. Limb
+  // indices past 63 fold onto bit 63: two such limbs stop seeing each other,
+  // which is a false negative and therefore the safe direction, and no
+  // authored rig comes near it.
+  uint64_t limbs;
+};
+inline uint64_t CrossHeatKey(IVec3 c) {
+  return ((uint64_t)((uint32_t)c.x & 0x1FFFFFu) << 42) |
+         ((uint64_t)((uint32_t)c.y & 0x1FFFFFu) << 21) |
+         (uint64_t)((uint32_t)c.z & 0x1FFFFFu);
+}
+
 struct BurnLimbView {
   std::vector<PrefabVoxel>* skin = nullptr;  // skinScale units, int16
   std::vector<DebrisVoxel>* coll = nullptr;  // physScale units, int8
@@ -433,6 +471,13 @@ struct BurnLimbView {
   bool* carved = nullptr;      // latched when the brick becomes copy-on-write
   int* flipbook = nullptr;     // cleared on first damage; a frame swap heals
   BodyBurnState* burn = nullptr;
+  // The creature's other limbs' heat (see CrossHeatCell). Null on anything
+  // that is not a creature (debris, a corpse); `selfLimb` is this limb's index
+  // in that list's owner, so a limb never reads its own cells; `crossPct` is
+  // combustion.crossLimbPct, 0 = the list is ignored.
+  const std::vector<CrossHeatCell>* crossHeat = nullptr;
+  int selfLimb = -1;
+  uint32_t crossPct = 0;
 
   // ---- IS SOMETHING WORN IN THE WAY? --------------------------------------
   //
@@ -1226,6 +1271,11 @@ class Mob {
 
   // ---- burn internals -------------------------------------------------------
   BurnLimbView ViewOf(MobLimb& limb);
+  // Rebuild `crossHeat_` from every limb's burn front (see CrossHeatCell).
+  // Costs nothing on a creature with no limb alight. `tick` only rotates which
+  // limb's front is walked first when the scan budget cannot cover them all --
+  // the same fairness BurnTick and BurnLimbs apply, for the same reason.
+  void BuildCrossLimbHeat(uint32_t tick);
   bool FlushBurn(int limbIndex, World& world,
                  std::vector<ParticleSpawn>& spawns, bool force);
   void StripBurnTombstones(MobLimb& limb);
@@ -1298,6 +1348,7 @@ class Mob {
 
   Vec3 origin_{};              // prefab min corner, world voxels
   std::vector<MobLimb> limbs_;
+  std::vector<CrossHeatCell> crossHeat_;  // this tick's heat across joints
   AnimState anim_;             // float presentation state (never hashed)
   float speedNow_ = 0;         // measured planar speed, voxels/sec
   Vec3 bodyUp_{0, 1, 0};       // foot-plane normal (slope tilt)
@@ -2077,6 +2128,13 @@ class MobSystem {
     uint32_t rampWidened = 0;   // ...and ones the world-pitch reading raised
     uint32_t hotFaces[7] = {};  // ramp count histogram, 0..6
     uint32_t exposed[7] = {};   // faces with no lattice neighbour, 0..6
+    // Heat across a joint (CrossHeatCell). `crossCells` is how many world
+    // cells the creature's other limbs offered, `crossFaces` how many faces
+    // took one, `crossOnly` the rules a cross face was the ONLY thing arming
+    // (i.e. the ones combustion.crossLimbPct scaled). A bare "the legs still
+    // did not catch" buys one hypothesis per run; these say which of "no cells
+    // were built", "no face found one" and "the roll refused" it was.
+    uint32_t crossCells = 0, crossFaces = 0, crossOnly = 0;
   };
   const BurnStats& Burn() const { return burnStats_; }
   void ResetBurnStats() { burnStats_ = BurnStats{}; }

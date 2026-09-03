@@ -47,7 +47,7 @@
       "note": "-------- combustion: each flammable defines its burn character --------\nTHE IGNITION CHANCE IS HOW FAST FIRE SPREADS THROUGH THE FUEL; the decay rules further down are how long a lit voxel takes to be consumed. They are separate levers and this note exists because they are easy to confuse. Wood/bark were slowed 1.5x here (18 -> 12, birch 22 -> 15, staff 16 -> 11) so a fire creeps up a trunk instead of running it; the ember decays below are UNCHANGED, so a lit log still burns out on the same schedule it always did."
     },
     {
-      "note": "-------- neighborChance: the FLOATING flame is a weak igniter --------\nEvery ignition rule below is `neighbor: tag:hot`, and `fire` -- the gas that rises off every burning voxel and drifts through the air, the thing that reads on screen as embers floating up from a blaze -- carries that tag alongside the stationary heat sources (ember, lava, a burning leaf, burning cloth and flesh). So a single drifting flame that brushed a tree, a robe or a grass slope lit it at the same rate as a bed of coals pressed against it, and a campfire's plume set light to everything downwind of it.\n\n`\"neighborChance\": { \"fire\": 0.125 }` on a rule says: this rule's chance, but an EIGHTH of it when the hot neighbour is fire. The loader (src/sim/materials.cpp ExpandNeighborChance) compiles it away into two rules the kernels already understand -- the base rule re-pointed at a synthetic tag (hot minus fire) and an exact-neighbour fire rule at the scaled chance -- so nothing on the GPU or in the body evaluator learned a new field, and a new hot material is covered without remembering a second tag. ONLY IGNITION carries it: a rule whose product is a burning material. The steam / melt / mite rules on tag:hot are untouched (a flame over water still steams it), the skin SEAR is untouched (a lick of flame still cooks the surface; flammability is the minCount-3 decay, which counts hot faces and has no per-material weight), and it never touches how long anything burns. The stationary sources keep the authored rate, so a burning log still lights the log beside it exactly as before -- what changed is that the flames rising OFF it are no longer the thing that spreads the fire. THE COST, measured and accepted by the owner: the flame a burning voxel emits DOWNWARD is fire too, and it was fire's only path across an air gap, so the fire-down gate's arm B (a slab of leaves lighting the slab one cell of air below it) fell from saturating to ~9% -- a canopy with air between its layers now burns its top and leaves the layers below a gap alone. fire-down is carried as known-failing in tests/baseline.json for that reason; the fix, if one is ever wanted, is a downward product that does not float, not a bigger fire multiplier."
+      "note": "-------- neighborChance: the FLOATING flame is a weak igniter --------\nEvery ignition rule below is `neighbor: tag:hot`, and `fire` -- the gas that rises off every burning voxel and drifts through the air, the thing that reads on screen as embers floating up from a blaze -- carries that tag alongside the stationary heat sources (ember, lava, a burning leaf, burning cloth and flesh). So a single drifting flame that brushed a tree, a robe or a grass slope lit it at the same rate as a bed of coals pressed against it, and a campfire's plume set light to everything downwind of it.\n\n`\"neighborChance\": { \"fire\": 0.0625 }` on a rule says: this rule's chance, but a SIXTEENTH of it when the hot neighbour is fire. It shipped at an eighth; the owner halved it again on 2026-09-03 ('the fire voxels, the ones that move through the air, have 50% even less chance to catch things') in the same change that let a burning limb heat the limb next to it (Mob::BuildCrossLimbHeat) -- the drifting flame was the only path between a torso and the legs, and now that it is not, it can be as weak as it reads. THE ONE THING THIS DOES NOT WEAKEN is the skin sear (`skin + tag:hot -> flesh_cooked`, no neighborChance), so a body in a fire column still cooks at the same rate; what got rarer is a passing flame lighting the robe. The loader (src/sim/materials.cpp ExpandNeighborChance) compiles it away into two rules the kernels already understand -- the base rule re-pointed at a synthetic tag (hot minus fire) and an exact-neighbour fire rule at the scaled chance -- so nothing on the GPU or in the body evaluator learned a new field, and a new hot material is covered without remembering a second tag. ONLY IGNITION carries it: a rule whose product is a burning material. The steam / melt / mite rules on tag:hot are untouched (a flame over water still steams it), the skin SEAR is untouched (a lick of flame still cooks the surface; flammability is the minCount-3 decay, which counts hot faces and has no per-material weight), and it never touches how long anything burns. The stationary sources keep the authored rate, so a burning log still lights the log beside it exactly as before -- what changed is that the flames rising OFF it are no longer the thing that spreads the fire. THE COST, measured and accepted by the owner: the flame a burning voxel emits DOWNWARD is fire too, and it was fire's only path across an air gap, so the fire-down gate's arm B (a slab of leaves lighting the slab one cell of air below it) fell from saturating to ~9% -- a canopy with air between its layers now burns its top and leaves the layers below a gap alone. fire-down is carried as known-failing in tests/baseline.json for that reason; the fix, if one is ever wanted, is a downward product that does not float, not a bigger fire multiplier."
     },
     {
       "self": "wood",
@@ -55,7 +55,7 @@
       "chance": 12,
       "selfBecomes": "ember",
       "neighborChance": {
-        "fire": 0.125
+        "fire": 0.0625
       }
     },
     {
@@ -64,7 +64,7 @@
       "chance": 15,
       "selfBecomes": "ember",
       "neighborChance": {
-        "fire": 0.125
+        "fire": 0.0625
       }
     },
     {
@@ -76,7 +76,7 @@
       "chance": 25,
       "selfBecomes": "leaf_burning",
       "neighborChance": {
-        "fire": 0.125
+        "fire": 0.0625
       }
     },
     {
@@ -85,7 +85,7 @@
       "chance": 127,
       "selfBecomes": "pine_burning",
       "neighborChance": {
-        "fire": 0.125
+        "fire": 0.0625
       }
     },
     {
@@ -94,7 +94,7 @@
       "chance": 133,
       "selfBecomes": "autumn_burning",
       "neighborChance": {
-        "fire": 0.125
+        "fire": 0.0625
       }
     },
     {
@@ -106,7 +106,7 @@
       "chance": 25,
       "selfBecomes": "leaf_burning",
       "neighborChance": {
-        "fire": 0.125
+        "fire": 0.0625
       }
     },
     {
@@ -115,7 +115,7 @@
       "chance": 25,
       "selfBecomes": "leaf_burning",
       "neighborChance": {
-        "fire": 0.125
+        "fire": 0.0625
       }
     },
     {
@@ -124,7 +124,7 @@
       "chance": 127,
       "selfBecomes": "pine_burning",
       "neighborChance": {
-        "fire": 0.125
+        "fire": 0.0625
       }
     },
     {
@@ -133,7 +133,7 @@
       "chance": 127,
       "selfBecomes": "pine_burning",
       "neighborChance": {
-        "fire": 0.125
+        "fire": 0.0625
       }
     },
     {
@@ -142,7 +142,7 @@
       "chance": 133,
       "selfBecomes": "autumn_burning",
       "neighborChance": {
-        "fire": 0.125
+        "fire": 0.0625
       }
     },
     {
@@ -151,7 +151,7 @@
       "chance": 133,
       "selfBecomes": "autumn_burning",
       "neighborChance": {
-        "fire": 0.125
+        "fire": 0.0625
       }
     },
     {
@@ -160,7 +160,7 @@
       "chance": 12,
       "selfBecomes": "ember",
       "neighborChance": {
-        "fire": 0.125
+        "fire": 0.0625
       }
     },
     {
@@ -169,7 +169,7 @@
       "chance": 12,
       "selfBecomes": "ember",
       "neighborChance": {
-        "fire": 0.125
+        "fire": 0.0625
       }
     },
     {
@@ -301,7 +301,7 @@
       "chance": 220,
       "selfBecomes": "fire",
       "neighborChance": {
-        "fire": 0.125
+        "fire": 0.0625
       }
     },
     {
@@ -310,7 +310,7 @@
       "chance": 300,
       "selfBecomes": "fire",
       "neighborChance": {
-        "fire": 0.125
+        "fire": 0.0625
       }
     },
     {
@@ -319,7 +319,7 @@
       "chance": 350,
       "selfBecomes": "fire",
       "neighborChance": {
-        "fire": 0.125
+        "fire": 0.0625
       }
     },
     {
@@ -328,7 +328,7 @@
       "chance": 1000,
       "selfBecomes": "fire",
       "neighborChance": {
-        "fire": 0.125
+        "fire": 0.0625
       }
     },
     {
@@ -337,7 +337,7 @@
       "chance": 250,
       "selfBecomes": "fire",
       "neighborChance": {
-        "fire": 0.125
+        "fire": 0.0625
       }
     },
     {
@@ -346,7 +346,7 @@
       "chance": 400,
       "selfBecomes": "fire",
       "neighborChance": {
-        "fire": 0.125
+        "fire": 0.0625
       }
     },
     {
@@ -355,7 +355,7 @@
       "chance": 300,
       "selfBecomes": "fire",
       "neighborChance": {
-        "fire": 0.125
+        "fire": 0.0625
       }
     },
     {
@@ -364,7 +364,7 @@
       "chance": 300,
       "selfBecomes": "fire",
       "neighborChance": {
-        "fire": 0.125
+        "fire": 0.0625
       }
     },
     {
@@ -373,7 +373,7 @@
       "chance": 300,
       "selfBecomes": "fire",
       "neighborChance": {
-        "fire": 0.125
+        "fire": 0.0625
       }
     },
     {
@@ -382,7 +382,7 @@
       "chance": 300,
       "selfBecomes": "fire",
       "neighborChance": {
-        "fire": 0.125
+        "fire": 0.0625
       }
     },
     {
@@ -391,7 +391,7 @@
       "chance": 350,
       "selfBecomes": "fire",
       "neighborChance": {
-        "fire": 0.125
+        "fire": 0.0625
       }
     },
     {
@@ -903,7 +903,7 @@
       "chance": 200,
       "selfBecomes": "cloth_burning",
       "neighborChance": {
-        "fire": 0.125
+        "fire": 0.0625
       }
     },
     {
@@ -912,7 +912,7 @@
       "chance": 200,
       "selfBecomes": "cloth_burning",
       "neighborChance": {
-        "fire": 0.125
+        "fire": 0.0625
       }
     },
     {
@@ -921,7 +921,7 @@
       "chance": 200,
       "selfBecomes": "cloth_burning",
       "neighborChance": {
-        "fire": 0.125
+        "fire": 0.0625
       }
     },
     {
@@ -933,7 +933,7 @@
       "chance": 25,
       "selfBecomes": "cloth_burning",
       "neighborChance": {
-        "fire": 0.125
+        "fire": 0.0625
       }
     },
     {
@@ -942,7 +942,7 @@
       "chance": 25,
       "selfBecomes": "cloth_burning",
       "neighborChance": {
-        "fire": 0.125
+        "fire": 0.0625
       }
     },
     {
@@ -1011,7 +1011,7 @@
       "chance": 600,
       "selfBecomes": "hair_burning",
       "neighborChance": {
-        "fire": 0.125
+        "fire": 0.0625
       }
     },
     {
@@ -1048,7 +1048,7 @@
       "chance": 200,
       "selfBecomes": "linen_burning",
       "neighborChance": {
-        "fire": 0.125
+        "fire": 0.0625
       }
     },
     {
@@ -1175,7 +1175,7 @@
       "chance": 11,
       "selfBecomes": "ember",
       "neighborChance": {
-        "fire": 0.125
+        "fire": 0.0625
       }
     },
     {

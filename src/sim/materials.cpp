@@ -621,11 +621,11 @@ static bool WeatherFlagEnabled(const std::string& name, bool& known) {
 // the tag.
 //
 //   { "self": "wood", "neighbor": "tag:hot", "chance": 12, "selfBecomes": "ember",
-//     "neighborChance": { "fire": 0.125 } }
+//     "neighborChance": { "fire": 0.0625 } }
 //
 // reads: any hot neighbour ignites wood at 12 per-mille, except that FIRE --
 // the free-floating flame gas, the thing that rises off every burning voxel
-// and drifts through the air -- does it at an eighth of that. The stationary
+// and drifts through the air -- does it at a sixteenth of that (an eighth until 2026-09-03). The stationary
 // heat sources (ember, lava, burning cloth and flesh, a burning leaf) keep the
 // authored rate.
 //
@@ -835,6 +835,91 @@ static bool LoadReactionsJson(const std::string& path, std::vector<MaterialDef>&
     if (burnDur) {
       const int pct = CurrentTuning().combustion.burnDurationPct;
       chanceMille = chanceMille * 100.0 / (double)(pct > 0 ? pct : 100);
+      if (chanceMille > 1000.0) chanceMille = 1000.0;
+      if (chanceMille < kReactChanceMinMille) chanceMille = kReactChanceMinMille;
+    }
+    // ---- combustion.spreadPct: HOW FAST FIRE SPREADS THROUGH FUEL ----------
+    //
+    // burnDurationPct's twin, scaling the other of the two levers this file's
+    // combustion note names: that one is how long a lit voxel stays lit, this
+    // one is how readily the voxel beside it catches. Owner request
+    // 2026-09-03, "slow down the burning voxel spread by like 8x", and it is a
+    // knob rather than an edit to the authored numbers because those numbers
+    // encode RATIOS the owner has tuned three separate times -- dry needles
+    // against green leaves, cloth against flesh, leather against cloth. A
+    // single multiplier moves the clock and leaves every one of those intact;
+    // dividing thirty authored numbers by eight would not, and could not be
+    // undone from the tuner.
+    //
+    // A RULE IS AN IGNITION IF ITS PRODUCT IS HOT. That is the same test
+    // ExpandNeighborChance uses just below to decide what the floating flame's
+    // weakness applies to, and it is the honest definition: the thing that
+    // makes a voxel a heat source is tag:hot, so a rule that produces one is
+    // the fuel catching, whatever the material happens to be called. It falls
+    // out correctly for every shape in the file -- a pair rule's selfBecomes
+    // (wood -> ember) and a scaled decay's becomes (flesh_cooked ->
+    // flesh_burning, which is authored as a decay only because a pair rule's
+    // neighbour fields are spoken for by scaleByNeighbors) both scale, while
+    // an EMIT rule is excluded automatically because its product is named by
+    // "emit" rather than by either of these keys.
+    //
+    // A rule already marked "burnDuration" is excluded outright, so every rule
+    // has exactly one owner among the two knobs and the retire/relight loop
+    // cannot be scaled twice by two sliders that look independent in the UI.
+    //
+    // ...AND SO IS THE SEAR, which "product is hot" alone does NOT catch and
+    // which has to be here. `skin + tag:hot -> flesh_cooked` produces a
+    // material that is not itself a heat source, so by the test above it is
+    // not an ignition -- and leaving it at the authored rate while everything
+    // around it slowed by eight broke the one comparison the whole body-burn
+    // section of reactions.json is built on. Measured, first run at 12%: skin
+    // halved at t+31 and cloth at t+124, i.e. the flesh now reacted to a
+    // single hot face FOUR TIMES more eagerly than the cloth over it, when the
+    // file authors cloth at about eight times flesh's rate. That is the exact
+    // inversion the note above `skin` in reactions.json records catching once
+    // already, from the other direction, and the mob-burn gate caught it again
+    // here.
+    //
+    // So the second clause: a PAIR rule on FLAMMABLE matter driven by a hot
+    // neighbour is heat converting fuel, whatever its product is called, and
+    // scales with the rest. The flammable test is what keeps heat's other jobs
+    // out of it -- `water + tag:hot -> steam` and ice melting are neither fuel
+    // nor spread, and a flame over a pond still steams it at the authored rate
+    // at any setting of this knob.
+    //
+    // Same placement as burnDur above, and for the same three reasons: before
+    // the range check so the check catches an out-of-range result, before
+    // ExpandNeighborChance so the floating-flame exception is scaled with its
+    // parent rather than drifting away from it, and floored so a rule scaled
+    // toward zero stays rare rather than becoming impossible.
+    const uint32_t hotBit = tagReg.MaskOf("hot", false);
+    auto hasTag = [&](int id, uint32_t bit) {
+      return id >= 0 && bit != 0 && (mats[(size_t)id].gpu.tagMask & bit) != 0;
+    };
+    // Clause one: the product is a heat source, so this rule is fuel catching.
+    auto productHot = [&] {
+      const char* key = r.value("decay", false) ? "becomes" : "selfBecomes";
+      if (!r.contains(key) || !r[key].is_string()) return false;
+      // FindMaterial returns -1 for "air" and for a name the product parse
+      // below will reject; neither is a heat source, so both answer false.
+      return hasTag(FindMaterial(mats, r[key].get<std::string>()), hotBit);
+    };
+    // Clause two: a hot neighbour acting directly on FUEL -- the sear.
+    auto heatOnFuel = [&] {
+      if (r.value("decay", false) || r.contains("emit")) return false;
+      if (!hasTag(FindMaterial(mats, self), tagReg.MaskOf("flammable", false)))
+        return false;
+      if (!r.contains("neighbor") || !r["neighbor"].is_string()) return false;
+      const std::string n = r["neighbor"].get<std::string>();
+      if (n.rfind("tag:", 0) == 0) return n.substr(4) == "hot";
+      return hasTag(FindMaterial(mats, n), hotBit);
+    };
+    const bool ignites = !r.value("burnDuration", false) &&
+                         chanceMille >= kReactChanceMinMille &&
+                         chanceMille <= 1000.0 && (productHot() || heatOnFuel());
+    if (ignites) {
+      const int pct = CurrentTuning().combustion.spreadPct;
+      chanceMille = chanceMille * (double)(pct > 0 ? pct : 100) / 100.0;
       if (chanceMille > 1000.0) chanceMille = 1000.0;
       if (chanceMille < kReactChanceMinMille) chanceMille = kReactChanceMinMille;
     }

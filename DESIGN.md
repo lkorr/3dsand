@@ -2451,6 +2451,78 @@ main.cpp's per-limb HUD readout resolves through it, so the two cannot disagree
 about ash. Derived, not saved: a loaded avatar keeps its low hp but starts at
 cap 1 until it burns again.
 
+**Heat crosses a joint, and until it did a burning torso never lit the legs.**
+Owner report, 2026-09-03. The cause was structural rather than a rate: a
+creature's limbs are separate sparse lattices that cannot see each other, and a
+mob is not in the grid, so the only channel from a burning hip to the thigh
+under it was the `fire` gas the hip emits — and `fire` is a gas that rises with
+probability 1 in calm air, so a flame emitted downward floats straight back up
+through the limb that made it. Within one limb fire had always spread in all six
+directions; across limbs it could not spread at all.
+
+`Mob::BuildCrossLimbHeat` runs once per creature per tick and collects the WORLD
+CELLS its limbs are alight in, from each limb's existing burn front (never a
+walk over the volume — a torso is 31,456 skin voxels), keyed by cell and carrying
+a BITMASK of the limbs that lit it. The mask is the load-bearing part: a world
+cell is 8×8×8 skin voxels, so the cell just outside a surface voxel usually holds
+more of that same limb, and attributing a cell to one limb would let a burning
+limb read its own voxels back as an external hot neighbour — a self-sustaining
+ignition loop dressed as a feature. A limb reads a cell only if some OTHER limb's
+bit is set. Each cell is widened by its six face neighbours, because two limbs
+meeting at a joint need not share a world cell. `MobSystem::BurnOneLimb` then
+reads the list on faces where the grid holds air and nothing is worn in the way
+(a shell still wins — that is the armour mechanic), with the same world-pitch
+tangential widening the grid already gets, so a face pointing into a sibling's
+fire counts for as much as that fire is WIDE and flesh's `minCount 3` is
+reachable across a joint. The igniting is done by the ordinary authored table:
+no limb-to-limb rule, no status effect. `combustion.crossLimbPct` (25) is what a
+rule pays when a sibling is the ONLY thing arming it — decided once over all six
+faces, because a pair rule fires on the first matching face and a cross face that
+happened to sort first would otherwise have hidden a real fire and bought a scale
+it should not get. Two guards: an inverted ramp ("how exposed am I") reads a
+cross face as the air that is really there, and the inbound pass skips cross
+faces entirely, so heat crosses a joint and damage does not.
+
+**The cheap gate has to know about it too**, and that was the whole bug the
+first time. `BurnOneLimb` opens by walking the WORLD around the limb and exiting
+when it finds nothing and the limb is not itself alight; a sibling's lattice is
+in neither place, so a thigh beside a burning hip returned before it built an
+index. Measured: 35,080 cross cells offered and 71,173 faces taking one, with not
+a single thigh voxel changed — the faces were limbs awake for other reasons, and
+the one limb the feature was written for was asleep. The cross cells inside the
+limb's AABB are now appended to the same list the world scan fills, so the gate
+wakes the limb and the existing face-seeding loop queues the voxels behind each
+cell unchanged. Gate: `mob-burn`'s two-arm differential — 279 of 558 thigh voxels
+burnt at `crossLimbPct` 25 against **0** with it at 0.
+
+**Fire spreads eight times slower than reactions.json authors, by one knob.**
+Owner report the same day, once limbs began conducting: the spread was far too
+fast. `combustion.spreadPct` (12) multiplies every ignition chance at
+reaction-COMPILE time (`sim/materials.cpp`), the twin of `burnDurationPct` beside
+it — that one is how long a lit voxel stays lit, this one is how readily the
+voxel beside it catches. A knob rather than an edit to the authored numbers
+because those numbers encode ratios tuned three separate times (dry needles
+against green leaves, cloth against flesh, leather against cloth); one multiplier
+moves the clock and leaves every ratio intact. A rule scales if its product
+carries `tag:hot`, or if it is a pair rule on `tag:flammable` matter driven by a
+hot neighbour — the second clause is the SEAR, and it has to be there: leaving
+`skin → flesh_cooked` at the authored rate while everything around it slowed by
+eight made flesh react to a single hot face four times more eagerly than the
+cloth over it, inverting the comparison the whole body-burn section is built on
+(`mob-burn` caught it as skin halving at t+31 against cloth's t+124). Not scaled:
+anything marked `burnDuration` (each rule has exactly one owner among the two
+knobs), EMIT rules (a slower fire must not also be a dimmer one), and heat's
+other jobs — water steaming, ice melting — which the flammable test excludes.
+The floating flame's own weakness compounds with it: `neighborChance` for `fire`
+went 0.125 → 0.0625 in the same change, so a drifting flame now ignites at a
+sixteenth of a stationary source's rate. **Fixtures sized in ticks are deadlines
+that tighten as this comes down**: the player's 90-tick immersion scored 6.7%
+past the sear against a 15% floor until it was scaled by the knob (49.2% after),
+and `mob-burn`'s termination subtest now asserts CONVERGENCE — keep giving the
+fire quiet ticks while the count is strictly falling, fail only on a plateau —
+rather than a fixed window, which is the honest form of the rule-2 claim and
+does not need retuning every time a combustion knob moves.
+
 **The burn pass starved the legs.** Found by the gate's census, not by
 looking: `MobSystem::BurnLimbs` spends one shared front budget
 (`kBurnFrontPerTick`, 6,000 cells) per candidate cell, limb by limb in def

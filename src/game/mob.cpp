@@ -4484,6 +4484,151 @@ BurnLimbView Mob::ViewOf(MobLimb& limb) {
   return v;
 }
 
+// ---- HEAT ACROSS A JOINT ----------------------------------------------------
+//
+// Owner report, 2026-09-03: "setting a mob on fire leads to their legs never
+// catching on fire". The diagnosis in the report was that fire only ever
+// travels upward, and for a BODY that was exactly right, for a reason that is
+// structural rather than a matter of tuning:
+//
+//   * Within one limb, fire spreads through the lattice: a burning voxel is
+//     tag:hot and the voxel beside it ignites off it through the ordinary
+//     authored table, in all six directions.
+//   * ACROSS limbs it could not spread at all. Each limb is its own sparse
+//     lattice and they are mutually invisible; a mob is not in the grid
+//     either. The ONLY channel between a burning torso and the thigh under it
+//     was the `fire` gas the torso emits into the world -- and `fire` is a gas
+//     that rises with probability 1 in calm air (gasIntent, sim_step.wgsl), so
+//     a flame emitted downward floats straight back up through the torso that
+//     made it. Every ignition rule also treats fire as a weak igniter
+//     (neighborChance, reactions.json), and that multiplier was halved again in
+//     the same change as this one, which would have made the gap worse.
+//
+// So the creature's limbs now conduct. Once per creature per tick this
+// collects the WORLD CELLS its limbs are alight in, and BurnOneLimb reads them
+// as hot neighbours on faces where the grid holds air. It is the same authored
+// table doing the igniting -- no limb-to-limb rule, no status effect -- at
+// combustion.crossLimbPct of the authored chance when a cross cell is the only
+// thing arming the rule, because a joint should conduct heat rather than race
+// fire across it.
+//
+// AT WORLD PITCH, deliberately, matching the argument BurnOneLimb's tangential
+// ring already makes: the grid stores fire in whole cells, so "how much fire is
+// against this face" is a question asked at that pitch. A cell with any alight
+// voxel in it is hot, and each such cell is widened by its six face neighbours
+// so a joint whose two limbs do not quite share a cell still conducts.
+//
+// Derived data, rebuilt every tick, never saved and never hashed -- the limb
+// lattices remain the one authoritative source.
+namespace {
+// World cells the list may hold. A human's world AABB is order 500 cells and
+// dilating it by one does not double that; this is the guard against a
+// pathological rig, not a budget anything normal reaches.
+constexpr size_t kCrossHeatCells = 2048;
+// Front cells ONE limb may transform per tick. The front of a fully engulfed
+// limb is a few hundred, and consecutive front cells overwhelmingly share a
+// world cell (512 skin voxels to a cell at skinScale 8), so the memo below
+// turns most of them into no work at all.
+constexpr uint32_t kCrossHeatFrontPerLimb = 768;
+}  // namespace
+
+void Mob::BuildCrossLimbHeat(uint32_t tick) {
+  crossHeat_.clear();
+  if (!sys_ || limbs_.size() < 2) return;  // one limb has nothing to cross to
+  if (CurrentTuning().combustion.crossLimbPct <= 0) return;
+
+  // Nothing alight anywhere on the creature is the overwhelmingly common case
+  // and must cost one pass over the limb list (rule 2).
+  bool any = false;
+  for (const MobLimb& l : limbs_)
+    if (l.body && !l.burn.front.empty()) { any = true; break; }
+  if (!any) return;
+
+  std::vector<CrossHeatCell>& out = crossHeat_;
+  const size_t nl = limbs_.size();
+  const size_t startLimb = (size_t)(tick % (uint32_t)nl);
+  for (size_t k = 0; k < nl && out.size() < kCrossHeatCells; k++) {
+    const size_t li = (startLimb + k) % nl;
+    MobLimb& limb = limbs_[li];
+    if (!limb.body) continue;
+    BodyBurnState& st = limb.burn;
+    // The FRONT is the alight set, and it is already maintained by the burn
+    // pass -- walking the limb's voxels instead would be O(volume) on a
+    // 31,456-voxel torso every tick. A limb whose index was dropped by a carve
+    // has an empty front for one tick and contributes nothing until the pass
+    // rebuilds it, which is self-healing and one tick latent.
+    if (st.front.empty() || st.idx.empty() || st.dims.x <= 0) continue;
+    BurnLimbView v = ViewOf(limb);
+    const uint64_t bit = 1ull << (li < 63 ? li : 63);
+    const IVec3 bd = st.dims, bm = st.min;
+    const Quat q{limb.xf.quat[0], limb.xf.quat[1], limb.xf.quat[2],
+                 limb.xf.quat[3]};
+    const float inv = 1.0f / (float)std::max(1u, v.scale);
+    const size_t nf = st.front.size();
+    const size_t startCell = (size_t)(tick % (uint32_t)nf);
+    uint32_t budget = kCrossHeatFrontPerLimb;
+    uint64_t memo = ~0ull;  // last world cell emitted, for the run of voxels
+    for (size_t j = 0; j < nf && budget; j++) {
+      if (out.size() >= kCrossHeatCells) break;
+      budget--;
+      const uint32_t c = st.front[(startCell + j) % nf];
+      if (c >= st.idx.size()) continue;
+      const uint32_t e = st.idx[c] & ~kBurnQueued;
+      if (e == 0) continue;
+      const uint32_t m = v.Mat(e - 1);
+      // tag:hot, not merely "has rules": what is being offered to the other
+      // limbs is HEAT, and a material that decays without being hot (smoke on
+      // a body, say) is not heat.
+      if (m == 0 || m >= sys_->matHot_.size() || !sys_->matHot_[m]) continue;
+      const IVec3 p{(int)(c % (uint32_t)bd.x) + bm.x,
+                    (int)((c / (uint32_t)bd.x) % (uint32_t)bd.y) + bm.y,
+                    (int)(c / ((uint32_t)bd.x * (uint32_t)bd.y)) + bm.z};
+      const Vec3 w = limb.xf.pos + Rotate(q, Vec3{((float)p.x + 0.5f) * inv,
+                                                  ((float)p.y + 0.5f) * inv,
+                                                  ((float)p.z + 0.5f) * inv});
+      const IVec3 cell{ifloor(w.x), ifloor(w.y), ifloor(w.z)};
+      const uint64_t key = CrossHeatKey(cell);
+      if (key == memo) continue;  // the run of lattice voxels sharing a cell
+      memo = key;
+      out.push_back({key, cell, m, bit});
+    }
+  }
+  if (out.empty()) return;
+
+  // WIDEN BY ONE CELL. Two limbs meeting at a joint need not share a world
+  // cell -- a thigh's top and a hip's bottom can be a cell apart at world
+  // pitch while touching in metres -- and a joint that conducts only when the
+  // arithmetic happens to land right is the same bug this whole function
+  // exists to fix, just rarer and harder to see. The widened cell carries the
+  // ORIGINATING limb's bit, so the limb that made it still cannot read it.
+  const size_t nBase = out.size();
+  for (size_t i = 0; i < nBase && out.size() + 6 <= kCrossHeatCells; i++) {
+    const CrossHeatCell b = out[i];
+    for (const IVec3& d : kBurnDirs) {
+      const IVec3 c{b.cell.x + d.x, b.cell.y + d.y, b.cell.z + d.z};
+      out.push_back({CrossHeatKey(c), c, b.mat, b.limbs});
+    }
+  }
+
+  // Sort by (key, material) and merge: one entry per world cell, the union of
+  // every limb that put heat there, and the LOWEST material id among them so
+  // the choice does not depend on visit order. Deterministic given the fronts.
+  std::sort(out.begin(), out.end(),
+            [](const CrossHeatCell& a, const CrossHeatCell& b) {
+              if (a.key != b.key) return a.key < b.key;
+              return a.mat < b.mat;
+            });
+  size_t w = 0;
+  for (size_t i = 0; i < out.size(); i++) {
+    if (w > 0 && out[w - 1].key == out[i].key)
+      out[w - 1].limbs |= out[i].limbs;
+    else
+      out[w++] = out[i];
+  }
+  out.resize(w);
+  sys_->burnStats_.crossCells += (uint32_t)w;
+}
+
 void MobSystem::BuildBurnIndex(BurnLimbView& v) {
   BodyBurnState& st = *v.burn;
   const size_t n = v.Size();
@@ -5578,6 +5723,26 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
   std::vector<IVec3> scanHot;
   std::vector<uint32_t> cand;
 
+  // ---- heat from the creature's OTHER limbs ------------------------------
+  // The list is sorted by key, so this is a binary search over a few hundred
+  // entries and it is only reached on a face that found nothing in the grid.
+  // Returns the burning material, or 0 for "no other limb is alight here" --
+  // including the case where the only limb burning in that cell is THIS one,
+  // which is the check that stops a limb reading its own voxels back through
+  // the world and igniting itself (see CrossHeatCell).
+  const uint64_t selfBit =
+      v.selfLimb >= 0 ? (1ull << (v.selfLimb < 63 ? v.selfLimb : 63)) : 0ull;
+  auto crossAt = [&](IVec3 c) -> uint32_t {
+    if (!v.crossHeat || v.crossPct == 0) return 0u;
+    const std::vector<CrossHeatCell>& L = *v.crossHeat;
+    const uint64_t k = CrossHeatKey(c);
+    const auto it = std::lower_bound(
+        L.begin(), L.end(), k,
+        [](const CrossHeatCell& e, uint64_t key) { return e.key < key; });
+    if (it == L.end() || it->key != k) return 0u;
+    return (it->limbs & ~selfBit) ? it->mat : 0u;
+  };
+
   // The pose is read from `limb.xf` as the animation left it, never
   // re-read from Jolt: a live limb is kinematic and re-posed every tick, so
   // a mid-pass re-read tests voxels against a pose the rest of the pass was
@@ -5630,6 +5795,41 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
           // rules — see the inbound pass below).
           if (matHot_[m] || matAttacksBody_[m]) scanHot.push_back({x, y, z});
         }
+  }
+
+  // ---- A SIBLING LIMB'S HEAT MUST ALSO WAKE THIS ONE ----------------------
+  //
+  // The walk above asks the WORLD what is near this limb, and the cheap gate
+  // just below exits when the answer is "nothing" and the limb is not itself
+  // alight. Heat across a joint is in neither place -- it is another limb's
+  // lattice -- so a thigh beside a burning hip answered "nothing near me, and
+  // I am not burning", returned before it built an index, and never reached
+  // the neighbour gather that would have found the hip at all.
+  //
+  // That is why the first run of this feature reported 35,080 cross cells and
+  // 71,173 faces taking one while not a single thigh voxel changed: the faces
+  // were the limbs that happened to be awake for other reasons (the burning
+  // hip reading its own siblings, the torso with the hip's emitted flame in
+  // the grid beside it), and the one limb the feature was written for was
+  // asleep. A bare "0 touched" would have sent the next reader hunting through
+  // the rule evaluation; the counters said the mechanism ran and the limb did
+  // not, which is a different bug and a one-line fix.
+  //
+  // Appended to the SAME list the world scan fills, so everything downstream
+  // is unchanged: the gate sees a non-empty list and wakes the limb, and the
+  // face-seeding loop below queues the voxels behind each cell exactly as it
+  // does for a cell of real fire. The MATERIAL still comes from the neighbour
+  // gather, which is where crossAt decides what a face is looking at; this
+  // only decides which voxels get asked.
+  if (v.crossHeat && v.crossPct > 0 && scanHot.size() < kBurnScanCells) {
+    for (const CrossHeatCell& e : *v.crossHeat) {
+      if (scanHot.size() >= kBurnScanCells) break;
+      if ((e.limbs & ~selfBit) == 0) continue;  // only this limb's own heat
+      if (e.cell.x < lo.x || e.cell.x > hi.x || e.cell.y < lo.y ||
+          e.cell.y > hi.y || e.cell.z < lo.z || e.cell.z > hi.z)
+        continue;
+      scanHot.push_back(e.cell);
+    }
   }
 
   // `st.alight`, not just `st.front`, is what "this limb is still on fire"
@@ -5910,6 +6110,13 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
     // stay shared and unmoved.
     uint32_t ntan[6][4];
     bool tanValid[6] = {};
+    // Which faces got their material from another LIMB rather than from the
+    // grid or from this limb's own lattice. Read twice below: to scale the
+    // chance by combustion.crossLimbPct when a cross face is the only thing
+    // arming a rule, and to keep cross faces out of the two places where
+    // substituting a sibling's material would mean something other than heat
+    // (an inverted ramp, and the inbound pass).
+    bool ncross[6] = {};
     for (int k = 0; k < 6; k++) {
       const IVec3& d = kBurnDirs[k];
       const uint32_t nc = cellOf({vp.x + d.x, vp.y + d.y, vp.z + d.z});
@@ -5963,6 +6170,35 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
         }
         nmat[k] = worn ? worn : wm;
         ncell[k] = kNoBurnCell;
+        // HEAT ACROSS A JOINT, and ONLY where the grid had nothing to say.
+        // A cell holding real matter already answered this face -- fire in it
+        // is stronger evidence than a sibling limb, and a worn shell in the
+        // way is the armour mechanic and must keep winning. So this fills the
+        // gap that used to read as plain air, which is exactly the gap a
+        // burning torso and the thigh below it sat in.
+        if (nmat[k] == 0) {
+          const IVec3 wc{ifloor(wv.x), ifloor(wv.y), ifloor(wv.z)};
+          const uint32_t xm = crossAt(wc);
+          if (xm) {
+            nmat[k] = xm;
+            ncross[k] = true;
+            burnStats_.crossFaces++;
+            // The same world-pitch widening the grid gets, from the same
+            // argument: the sibling's fire is stored in whole world cells, so
+            // a face pointing into it counts for as much as that fire is WIDE.
+            // Without this a cross face is worth 1 and flesh -- authored at
+            // minCount 3 -- could never ignite from a neighbouring limb at
+            // all, which would leave the legs exactly as raw as the bug this
+            // is fixing, only for a different reason.
+            int t = 0;
+            for (int j = 0; j < 6 && t < 4; j++) {
+              const IVec3& e = kBurnDirs[j];
+              if (e.x * d.x + e.y * d.y + e.z * d.z != 0) continue;  // parallel
+              ntan[k][t++] = crossAt({wc.x + e.x, wc.y + e.y, wc.z + e.z});
+            }
+            tanValid[k] = t == 4;
+          }
+        }
         // The tangential ring, at WORLD pitch (see the note above the array).
         // Gated on the face not facing open air, which is the overwhelmingly
         // common case and the one that must stay free — a limb in the open
@@ -6002,6 +6238,30 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
       const ReactionGpu& r = reactions_[mg.reactOffset + ri];
       if (!ReactLightMatches(r, dayPhase_, /*seesSky=*/true)) continue;
       uint32_t chance = r.chance;
+      // ---- IS A SIBLING LIMB THE ONLY THING ARMING THIS RULE? --------------
+      //
+      // Decided ONCE, here, for every shape of rule, because the two shapes
+      // disagree about which neighbour is "the" neighbour and taking either
+      // one's word for it is wrong: a pair rule fires on the FIRST matching
+      // face, so a cross face that happens to sort first would have hidden a
+      // real fire on another face and bought the scale it should not get.
+      // What the scale is actually asking is whether the fire is somewhere
+      // other than on a sibling limb, and that is a question about ALL six.
+      //
+      // A self rule (a plain decay or emit, no neighbour predicate) matches
+      // nothing here and is never scaled -- which is what keeps a limb's own
+      // burn running at its authored clock however its neighbours are lit.
+      // Inverted ramps are excluded for the reason given at the ramp below.
+      bool crossOnly = false;
+      if (!ReactScaleInverted(r)) {
+        bool anyMatch = false, anyReal = false;
+        for (int k = 0; k < 6; k++) {
+          if (!nmat[k] || !ReactNbrMatches(r, nmat[k], matGpu_)) continue;
+          anyMatch = true;
+          if (!ncross[k]) { anyReal = true; break; }
+        }
+        crossOnly = anyMatch && !anyReal;
+      }
       if (ReactScaleArmed(r)) {
         // The neighbour-count ramp. THIS is the mechanic the whole feature
         // turns on: flesh authored with minCount 3 cannot ignite from a
@@ -6009,9 +6269,19 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
         // a wide front spreads and accelerates. It reaches a body at all
         // only because sim/reactcpu.h exists.
         const bool invert = ReactScaleInverted(r);
+        // AN INVERTED RAMP DOES NOT READ CROSS HEAT. Inverted rules count the
+        // neighbours that do NOT match ("how much of me is exposed"), and for
+        // those a sibling limb's material is not a substitute for the air that
+        // is really there -- it would make a limb read as enclosed by standing
+        // next to a burning one. Only water authors an inverted ramp today
+        // (evaporation, freezing) and no body material does, so this is a
+        // guard on a future rule rather than a live case; it is one line and
+        // the alternative is a silent misreading.
         uint32_t cnt = 0;
-        for (int k = 0; k < 6; k++)
-          if (ReactNbrMatches(r, nmat[k], matGpu_) != invert) cnt++;
+        for (int k = 0; k < 6; k++) {
+          const uint32_t nm2 = (invert && ncross[k]) ? 0u : nmat[k];
+          if (ReactNbrMatches(r, nm2, matGpu_) != invert) cnt++;
+        }
         // WIDEN AT WORLD PITCH. A face pointing into matter this rule reacts
         // to counts for as much as that matter is wide across the face, so
         // `minCount 3` on a body means "a real fire" exactly as it does in the
@@ -6045,6 +6315,29 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
           continue;
         }
       }
+      // THE PAIR MATCH MOVED AHEAD OF THE ROLL. It is needed by the apply
+      // below either way, and finding it first costs nothing -- the roll is a
+      // counter-based hash of (limb, cell, tick, rule index) rather than a
+      // sequential stream, so reordering the comparison against it changes no
+      // other roll anywhere and no rule's odds move.
+      int pairMatch = -1;
+      if ((r.packed & 3u) == kReactPair) {
+        for (int k = 0; k < 6; k++)
+          if (nmat[k] && ReactNbrMatches(r, nmat[k], matGpu_)) {
+            pairMatch = k;
+            break;
+          }
+        if (pairMatch < 0) continue;
+      }
+      if (crossOnly && v.crossPct < 100) {
+        // Floored at 1 rather than allowed to truncate to nothing, the way
+        // materials.cpp floors the burn-duration divide: a rule authored at 11
+        // per-mille (a dropped staff) would otherwise become strictly
+        // impossible at 25%, which is a different statement from "rare".
+        const uint32_t scaled = (chance * v.crossPct) / 100u;
+        chance = scaled ? scaled : 1u;
+        burnStats_.crossOnly++;
+      }
       const uint32_t rr = Hash3(limbKey ^ (cell * 2246822519u), tick, ri);
       if (rr % kReactChanceDen >= chance) continue;
       const uint32_t kind = r.packed & 3u;
@@ -6074,13 +6367,12 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
           break;
         }
       } else {  // kReactPair
-        int match = -1;
-        for (int k = 0; k < 6; k++)
-          if (nmat[k] && ReactNbrMatches(r, nmat[k], matGpu_)) { match = k; break; }
-        if (match < 0) continue;
+        const int match = pairMatch;  // found above, before the roll
         // World neighbours are READ-ONLY from this side: a limb cannot
         // rewrite grid content, so only rules that keep the neighbour may
-        // match against one.
+        // match against one. A CROSS neighbour is read-only for a stronger
+        // reason -- it is not even in the grid, it is another limb's lattice,
+        // and ncell says kNoBurnCell for it, so it takes this same path.
         const bool isWorld = ncell[match] == kNoBurnCell;
         if (isWorld && r.prodNbr != kProdKeep) continue;
         applyTo(cell, r.prodSelf, rr);
@@ -6100,6 +6392,14 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
     // would be an N x M table whose two halves would drift.
     for (int k = 0; k < 6 && !fired; k++) {
       if (ncell[k] != kNoBurnCell) continue;  // lattice neighbour, handled above
+      // A SIBLING LIMB MAY NOT REWRITE THIS ONE. This pass exists so a world
+      // cell's rule can act on the body (acid dissolving a limb), and running
+      // it for cross heat would let one limb's material apply its
+      // neighborBecomes to another limb's voxels -- the limb-to-limb coupling
+      // this feature deliberately does not have. Heat crosses a joint; damage
+      // does not. No burning material rewrites its neighbour today, so this is
+      // a guard on the authoring surface rather than a live case.
+      if (ncross[k]) continue;
       const uint32_t wm = nmat[k];
       if (wm == 0 || wm >= matRewritesNbr_.size() || !matRewritesNbr_[wm])
         continue;
@@ -6193,11 +6493,26 @@ void Mob::BurnTick(uint32_t tick, World& world, std::vector<CellOp>& cellOps,
   // key, and the same fairness the mob loop applies across creatures.
   const int nl = (int)limbs_.size();
   const int start = nl > 0 ? (int)(tick % (uint32_t)nl) : 0;
+  // WHAT THE OTHER LIMBS ARE BURNING, built ONCE for the whole creature and
+  // from the fronts as they stand at the top of the tick. Building it per limb
+  // would make a limb's neighbours depend on how far down the loop it sat --
+  // the fronts move underneath as the loop runs -- so the same fire would
+  // spread differently depending on which limb the tick's rotation started
+  // from. One snapshot, read by every limb, is both cheaper and the only
+  // version that is order-independent (see Mob::BuildCrossLimbHeat).
+  BuildCrossLimbHeat(tick);
+  const uint32_t crossPct =
+      (uint32_t)std::clamp(CurrentTuning().combustion.crossLimbPct, 0, 100);
   for (int k = 0; k < nl; k++) {
     const int li = (start + k) % nl;
     if (frontBudget == 0) break;
     if (!limbs_[li].body) continue;
     BurnLimbView v = ViewOf(limbs_[li]);
+    if (!crossHeat_.empty()) {
+      v.crossHeat = &crossHeat_;
+      v.selfLimb = li;
+      v.crossPct = crossPct;
+    }
     // Only a limb something is actually WORN OVER pays for the probe, and an
     // undressed creature does not even transform a point. `worn_` is empty for
     // every mob in the game today, so this is a vector-empty test per limb.

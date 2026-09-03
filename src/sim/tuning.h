@@ -2002,6 +2002,60 @@ struct Tuning {
     // second, so a burning character neither spread the fire nor took much
     // damage from it.
     int burnDurationPct = 200;
+    // HOW FAST FIRE SPREADS THROUGH FUEL, as a percentage of the ignition
+    // chances reactions.json authors. The twin of burnDurationPct next to it,
+    // and the two are the pair that file's combustion note names as the two
+    // separate levers: this one is how readily the voxel BESIDE a burning one
+    // catches, that one is how long a lit voxel then stays lit.
+    //
+    // A rule is an IGNITION if its product carries tag:hot -- wood to ember,
+    // leaf to leaf_burning, cloth to cloth_burning, cooked flesh to burning
+    // flesh -- or if it is a hot neighbour acting on FLAMMABLE matter, which
+    // is the SEAR (skin -> flesh_cooked, whose product is not itself a heat
+    // source). Every one of them scales by this together, so the RATIOS
+    // the owner has tuned three times (dry needles catch faster than green
+    // leaves, cloth about eight times faster than flesh, leather an eighth of
+    // cloth) are preserved exactly. Folded into the chance at reaction-COMPILE
+    // time (sim/materials.cpp), so the GPU never learns the knob exists and
+    // the kernels stay integer.
+    //
+    // FOUR THINGS ARE DELIBERATELY NOT SCALED, and each exclusion is the same
+    // one burnDurationPct makes from the other side:
+    //   * the RETIRE rules (a lit voxel going out) and the RELIGHT rules --
+    //     anything marked "burnDuration" in the JSON belongs to that knob
+    //     alone, so each rule has exactly one owner and the two cannot
+    //     compound on the same number;
+    //   * EMIT rules, so a slower fire is not also a dimmer one -- the flame a
+    //     burning voxel throws off is what it looks like, not how it spreads;
+    //   * HEAT'S OTHER JOBS -- water steaming, ice melting -- because the
+    //     neighbour is hot but the self is not fuel, and a flame over a pond
+    //     should still steam it however slowly fire spreads;
+    //   * EXTINGUISHER rules, so water beats the burn to the tick at any
+    //     setting.
+    //
+    // Default 12 (owner request, 2026-09-03: "slow down the burning voxel
+    // spread by like 8x") -- 12% is a factor of 8.3, the nearest the integer
+    // knob comes to an eighth. It was 100 until that report, i.e. the authored
+    // numbers as written. MOVES THE WORLD HASH: every ignition chance in the
+    // compiled table changes, so a change here is a rebaseline in the same
+    // commit.
+    int spreadPct = 12;
+    // HEAT CROSSES A JOINT. A creature's limbs are separate lattices that
+    // cannot see each other, and a mob is not in the grid, so until 2026-09-03
+    // a burning torso reached the legs only through the `fire` gas it emitted
+    // -- which rises, and which every ignition rule treats as a weak igniter.
+    // Owner report: "setting a mob on fire leads to their legs never catching".
+    // Mob::BuildCrossLimbHeat now hands each limb the world cells its OTHER
+    // limbs are alight in (plus the six cells beside each, so a joint that does
+    // not quite touch at world pitch still conducts), and BurnOneLimb reads
+    // them as hot neighbours where the grid holds air. This is the percentage
+    // of the authored chance such a neighbour ignites at when it is the ONLY
+    // thing arming the rule: 100 = a burning hip lights the thigh exactly as a
+    // burning voxel lights the one beside it in the grid, 0 = the old
+    // behaviour, limbs invisible to each other. Low by owner request -- the
+    // fire should cross a joint, not race across it. Read by the burn pass
+    // every tick, no rebuild; F5 hot-reloads it.
+    int crossLimbPct = 25;
   } combustion;
 
   // ---- wind: the ambient field (docs/RESEARCH_wind.md, DESIGN.md §12) ----

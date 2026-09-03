@@ -2716,7 +2716,10 @@ Status GateMobBurn(Ctx& c, std::string& detail) {
                  // body mass the fire has to get through, and flesh that can
                  // char. Bone is deliberately in neither census -- it has no
                  // fire rules, so counting it would only dilute both ratios.
-                 mFlesh = matId("flesh"), mMuscle = matId("muscle");
+                 mFlesh = matId("flesh"), mMuscle = matId("muscle"),
+                 // Heat doing something that is NOT spreading fire, for the
+                 // spread knob's exclusion probe in I.4.
+                 mWater = matId("water"), mSteam = matId("steam");
   if (!mFire || !mAcid || !mCloth || !mSkin || !mCooked || !mBurning) {
     detail = "body-reactivity materials missing from materials.json";
     return Status::Fail;
@@ -2848,6 +2851,121 @@ Status GateMobBurn(Ctx& c, std::string& detail) {
     std::fflush(stdout);
     ok = ok && i1;
 
+    // ---- I.4 the SPREAD knob scales ignition and ONLY ignition -------------
+    //
+    // combustion.spreadPct is burnDurationPct's twin -- that one is how long a
+    // lit voxel stays lit, this one is how readily the voxel beside it catches
+    // -- and it is folded into the authored chance by the same compiler at the
+    // same point, so it is provable the same way and for microseconds: compile
+    // the table twice and compare.
+    //
+    // THE EXCLUSIONS ARE THE HALF WORTH HAVING, exactly as in I.1. That some
+    // chance moved proves the knob is wired. What matters is that no EMIT rule
+    // moved (a slower fire must not also be a dimmer one), that nothing marked
+    // burnDuration moved (each rule has exactly one owner among the two knobs,
+    // or the retire/relight loop gets scaled twice by two sliders that look
+    // independent in the tuner), and that HEAT'S OTHER JOBS did not move --
+    // water steaming against a flame is a hot neighbour doing something that
+    // is not spreading fire, and it is the case that separates "scale the
+    // spread" from "scale everything a hot cell touches".
+    //
+    // THE SEAR MUST MOVE WITH THE REST, and this asserts that rather than the
+    // reverse, which is the correction that cost a run. skin -> flesh_cooked
+    // produces a material that is not a heat source, so the first draft of the
+    // knob left it at the authored rate -- and a body then browned at four
+    // times the rate the cloth over it caught, inverting the "cloth catches at
+    // about eight times flesh's rate" comparison the whole body-burn section
+    // of reactions.json is built on. The B subtest caught it as skin halving
+    // at t+31 against cloth's t+124. Pinned here as well as there because this
+    // costs microseconds and that costs 150 ticks.
+    {
+      const Tuning saved2 = CurrentTuning();
+      std::vector<MaterialDef> ma, mb;
+      std::vector<ReactionGpu> ra, rb;
+      std::string ea, eb;
+      Tuning ta = saved2;
+      ta.combustion.spreadPct = 100;
+      SetCurrentTuning(ta);
+      const bool loadA = LoadAssets(mp, rp, ma, ra, ea);
+      Tuning tb = saved2;
+      tb.combustion.spreadPct = 50;
+      SetCurrentTuning(tb);
+      const bool loadB = LoadAssets(mp, rp, mb, rb, eb);
+      SetCurrentTuning(saved2);
+
+      uint32_t moved = 0, wrongFactor = 0, emitMoved = 0, durMoved = 0;
+      bool shape = loadA && loadB && ra.size() == rb.size();
+      // Both probe rules are found by what they DO rather than by an index: an
+      // index would silently follow the wrong rule the first time anyone
+      // inserts one above it. The sear is the rule in skin's bucket whose
+      // product is flesh_cooked; the steam rule is the one in water's bucket
+      // whose product is steam.
+      int searA = -1, searB = -1, steamA = -1, steamB = -1;
+      auto findRule = [](const std::vector<MaterialDef>& mm,
+                         const std::vector<ReactionGpu>& rr, uint32_t self,
+                         uint32_t prod) {
+        if (self == 0 || self >= mm.size()) return -1;
+        const MaterialGpu& g = mm[self].gpu;
+        for (uint32_t i = 0; i < g.reactCount; i++)
+          if ((rr[g.reactOffset + i].prodSelf & 0xFFFu) == prod)
+            return (int)(g.reactOffset + i);
+        return -1;
+      };
+      if (shape) {
+        searA = findRule(ma, ra, mSkin, mCooked);
+        searB = findRule(mb, rb, mSkin, mCooked);
+        steamA = findRule(ma, ra, mWater, mSteam);
+        steamB = findRule(mb, rb, mWater, mSteam);
+        for (size_t i = 0; i < ra.size(); i++) {
+          if (ra[i].packed != rb[i].packed || ra[i].prodSelf != rb[i].prodSelf ||
+              ra[i].prodNbr != rb[i].prodNbr || ra[i].cond != rb[i].cond) {
+            shape = false;
+            break;
+          }
+          if (ra[i].chance == rb[i].chance) continue;
+          moved++;
+          if ((ra[i].packed & 3u) == kReactEmit) emitMoved++;
+          const uint32_t want = (ra[i].chance + 1u) / 2u;
+          if (rb[i].chance + 1u < want || rb[i].chance > want + 1u) wrongFactor++;
+        }
+        // Nothing the OTHER knob owns may move with this one. Taken by
+        // re-compiling at a different burnDurationPct and checking the rules
+        // this knob moved are disjoint from the rules that one moves.
+        std::vector<MaterialDef> mc;
+        std::vector<ReactionGpu> rc;
+        std::string ec;
+        Tuning tc = saved2;
+        tc.combustion.spreadPct = 100;
+        tc.combustion.burnDurationPct = saved2.combustion.burnDurationPct * 2;
+        SetCurrentTuning(tc);
+        const bool loadC = LoadAssets(mp, rp, mc, rc, ec);
+        SetCurrentTuning(saved2);
+        if (loadC && rc.size() == ra.size())
+          for (size_t i = 0; i < ra.size(); i++)
+            if (ra[i].chance != rb[i].chance && ra[i].chance != rc[i].chance)
+              durMoved++;
+      }
+      const bool searScaled = searA >= 0 && searB >= 0 &&
+                              ra[searA].chance != rb[searB].chance;
+      // Water is allowed to be missing from a stripped material set; what is
+      // not allowed is for it to be there and to have moved.
+      const bool steamHeld = steamA < 0 || steamB < 0 ||
+                             ra[steamA].chance == rb[steamB].chance;
+      const bool i4 = shape && moved > 0 && wrongFactor == 0 &&
+                      emitMoved == 0 && durMoved == 0 && searScaled && steamHeld;
+      std::printf(
+          "  spread knob: %s (%u ignition rules halved at 50%%, %u by the "
+          "wrong factor, %u emit, %u shared with burn duration; sear %s, steam "
+          "%s; live setting %d%%)\n",
+          i4 ? "PASS" : "FAIL", moved, wrongFactor, emitMoved, durMoved,
+          searScaled ? "scaled" : "HELD", steamHeld ? "held" : "MOVED",
+          saved2.combustion.spreadPct);
+      if (!i4 && (!loadA || !loadB))
+        std::printf("    reload failed: %s%s\n", ea.c_str(), eb.c_str());
+      std::fflush(stdout);
+      ok = ok && i4;
+    }
+
     // ---- I.2 A BURNT CHARACTER IS NEVER A NAKED ONE ------------------------
     // The base human's linen is a material, not a paint colour, precisely so
     // that burning it cannot expose skin — every reaction that rewrites a body
@@ -2940,6 +3058,23 @@ Status GateMobBurn(Ctx& c, std::string& detail) {
     for (int li = 0; li < nLimbs; li++) n += mobs.LimbBurningCount(id, li);
     return n;
   };
+
+  // ---- FIRE FIXTURES ARE SIZED IN TICKS, AND THE SPREAD KNOB IS A CLOCK ----
+  //
+  // Every window below was chosen against the ignition chances reactions.json
+  // authors, i.e. against combustion.spreadPct = 100. That knob multiplies
+  // exactly those chances, so at the shipped 12% a fire needs about eight
+  // times as long to travel the same distance and every fixed window silently
+  // becomes a deadline that tightens as the knob comes down. It failed that
+  // way on the first run at 12%: the player's 90-tick immersion scored 6.7%
+  // past the sear against a 15% floor, which reads as "the body barely burns"
+  // and is really "you gave an eight-times-slower fire the same wall clock".
+  //
+  // The same correction kQuiet already makes for burnDurationPct, for the same
+  // reason and with the same shape. A claim about how far a burn GETS is a
+  // claim about the burn, not about the setting of a slider.
+  const int spreadScale =
+      std::max(1, 100 / std::max(1, CurrentTuning().combustion.spreadPct));
 
   uint32_t t = 12000;
   uint32_t mobFireOps = 0;
@@ -3268,6 +3403,39 @@ Status GateMobBurn(Ctx& c, std::string& detail) {
     const float worstSever = mobs.WorstSeverFraction();
     const std::string worstName = mobs.WorstSeverLimb();
 
+    // ---- TERMINATION IS CONVERGENCE, NOT A DEADLINE ------------------------
+    //
+    // The window above is a duration and already scales with
+    // combustion.burnDurationPct, for the reason recorded at kQuiet. It now
+    // has a SECOND clock over it: combustion.spreadPct decides how fast the
+    // front travels, so at the shipped 12% the fire spends about eight times
+    // as long crawling over the body before there is nothing left to reach.
+    // Measured at 12%: 172 cloth voxels still alight at the deadline and zero
+    // 630 ticks later -- the burn was working exactly as authored and the
+    // deadline was the thing that was wrong.
+    //
+    // Scaling the window by both knobs would make it ~10,000 ticks and this
+    // subtest the most expensive thing in the suite, to assert something it
+    // can assert directly instead. What rule 2 actually requires is that the
+    // process TERMINATES, and the difference between "slow" and "never" is
+    // whether the count is still falling -- which the attribution branch below
+    // was already computing, after the fact, to explain the failure. So it is
+    // the assertion now: keep giving the fire more quiet ticks while it is
+    // strictly converging, and fail only on a PLATEAU, which is a relight loop
+    // whose gain has reached 1 and would never converge at any window size.
+    uint32_t extraTicks = 0;
+    {
+      const int kRound = 315;   // a quarter of the base window
+      const int kRounds = 8;    // hard cap: bounded like everything else here
+      uint32_t prev = alightInWorld();
+      for (int rd = 0; rd < kRounds && prev > 0; rd++) {
+        for (int i = 0; i < kRound; i++) burnTick(id, 0, 0);
+        extraTicks += (uint32_t)kRound;
+        const uint32_t now = alightInWorld();
+        if (now >= prev) break;  // plateau: stop and let the assertion fail
+        prev = now;
+      }
+    }
     const uint32_t stillAlight = alightInWorld();
     const uint32_t charred =
         (mobs.IsAlive(id) ? census(id, mClothChar) + census(id, mCharred) : 0u) +
@@ -3280,9 +3448,10 @@ Status GateMobBurn(Ctx& c, std::string& detail) {
     const bool hOk = wasLit && out && charOk && ate;
     std::printf(
         "  burn leaves char: %s (%u lit, peak %u alight -> %u after %d quiet "
-        "ticks, %u charred; worst sever %s at %.0f%% of spawn volume, floor "
-        "50%%; %s)\n",
-        hOk ? "PASS" : "FAIL", lit, peakAlight, stillAlight, kQuiet, charred,
+        "ticks + %u converging, %u charred; worst sever %s at %.0f%% of spawn "
+        "volume, floor 50%%; %s)\n",
+        hOk ? "PASS" : "FAIL", lit, peakAlight, stillAlight, kQuiet, extraTicks,
+        charred,
         worstSever < 0.0f ? "(nothing severed)" : worstName.c_str(),
         worstSever < 0.0f ? 0.0f : worstSever * 100.0f,
         died ? ("creature died at t+" + std::to_string(deathTick)).c_str()
@@ -3330,6 +3499,180 @@ Status GateMobBurn(Ctx& c, std::string& detail) {
     debris.Reset();
   }
 
+
+  // ---- J. HEAT CROSSES A JOINT --------------------------------------------
+  //
+  // Owner report, 2026-09-03: "setting a mob on fire leads to their legs never
+  // catching on fire". The cause was structural, not a rate: a creature's
+  // limbs are separate lattices that cannot see each other and a mob is not in
+  // the grid, so the only channel from a burning hip to the thigh under it was
+  // the `fire` gas the hip emits -- and `fire` rises with probability 1 in
+  // calm air, so a flame emitted downward floats back up through the limb that
+  // made it. Mob::BuildCrossLimbHeat gives every limb the world cells its
+  // SIBLINGS are alight in, and combustion.crossLimbPct is what a rule armed
+  // only by one of those pays.
+  //
+  // A TWO-ARM DIFFERENTIAL, because the single-arm version of this test is
+  // worthless: "the legs burned" passes just as well if the world fire, the
+  // emitted flame or the fixture's own ground lit them. The control arm sets
+  // crossLimbPct to 0, which is precisely the old behaviour, and the claim is
+  // the DIFFERENCE. Both arms are the same seed, the same rig, the same
+  // ignition and the same tick count, so nothing else can account for it.
+  //
+  // NO WORLD FIRE AT ALL. The soak box the earlier subtests use would light
+  // the legs directly and there would be nothing left to measure; the whole
+  // point is a fire that starts on ONE limb and has to travel.
+  //
+  // The knob is read LIVE by the burn pass, not folded in at load like its
+  // neighbour burnDurationPct, so flipping CurrentTuning between the arms is
+  // enough -- no material recompile, no second binary.
+  {
+    int hipLimb = -1;
+    std::vector<int> legLimbs;
+    for (int li = 0; li < nLimbs; li++) {
+      const std::string& n = mobs.Defs()[wizDef].limbs[li].name;
+      if (n == "hips") hipLimb = li;
+      // The thighs ONLY. A foot is two joints away, so including it would
+      // measure how far the fire travels rather than whether it crosses at
+      // all, and would fail for a reason the differential cannot name.
+      if (n == "legU.L" || n == "legU.R") legLimbs.push_back(li);
+    }
+    if (hipLimb < 0 || legLimbs.empty()) {
+      std::printf("  heat across a joint: FAIL (rig has no hips/legU.* to "
+                  "measure; found %d limbs)\n", nLimbs);
+      std::fflush(stdout);
+      ok = false;
+    } else {
+      // RAW material on the thighs: everything fire has not touched yet.
+      // Counting what is LEFT rather than what appeared is what makes the
+      // measure blind to which way the chain went -- cloth to cloth_burning,
+      // skin to flesh_cooked, or a voxel burnt clean away all count the same,
+      // and a future material in the chain needs no edit here.
+      auto legRaw = [&](uint64_t id) {
+        uint32_t n = 0;
+        for (int li : legLimbs)
+          n += mobs.LimbMaterialCount(id, li, mCloth) +
+               mobs.LimbMaterialCount(id, li, mSkin) +
+               mobs.LimbMaterialCount(id, li, mUnder);
+        return n;
+      };
+      auto legAlight = [&](uint64_t id) {
+        uint32_t n = 0;
+        for (int li : legLimbs) n += mobs.LimbBurningCount(id, li);
+        return n;
+      };
+
+      const Tuning savedT = CurrentTuning();
+      // A SUSTAINED SOURCE, not a longer window, and the distinction is what
+      // keeps this subtest affordable. One flash of ignition on the hips is
+      // not a fire a thigh can catch from at the shipped spread rate: 120 lit
+      // cloth voxels each burn out in ~50 ticks and light well under one
+      // neighbour apiece on the way, so the source is gone before the joint
+      // has had many rolls. Measured that way at spreadPct 12: 2 thigh voxels
+      // touched against the control arm's 5, i.e. pure noise. Re-lighting the
+      // hips on a fixed cadence models what a creature actually on fire looks
+      // like -- something keeps the torso burning -- and holds the SOURCE
+      // constant so the thing being measured is the CROSSING. Applied
+      // identically in both arms, so it cannot manufacture the differential.
+      const int kCrossTicks = 300;
+      const int kRelight = 30;
+      struct Arm {
+        uint32_t touched = 0, alight = 0, lit = 0, raw0 = 0;
+        uint32_t cells = 0, faces = 0, scaled = 0;
+      };
+      Arm arms[2];
+      const int pcts[2] = {savedT.combustion.crossLimbPct, 0};
+      for (int a = 0; a < 2; a++) {
+        Tuning t = savedT;
+        t.combustion.crossLimbPct = pcts[a];
+        // THE DEATH KNOT IS PARKED, the same way the player immersion below
+        // parks it and for the same reason: this fixture holds a fire on the
+        // hips for three hundred ticks and the wizard dies of it, at which
+        // point the mob is gone and every per-limb census reads zero. Both
+        // arms then scored "all 558 thigh voxels touched" and the differential
+        // said 1x -- a measurement of the corpse, not of the crossing. Death
+        // by burns has its own gate (`burn-cap`); this one needs the body to
+        // stay to be counted.
+        t.gore.burnDeathFraction = 1.0f;
+        SetCurrentTuning(t);
+        debris.Reset();
+        mobs.Reset();
+        SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+        ctx.WaitIdle();
+        const IVec3 site = fixture(260);
+        const int h = World::TerrainHeight(site.x, site.z, kDefaultSeed);
+        pchunk = IVec3{site.x >> 4, h >> 4, site.z >> 4};
+        const uint64_t id = mobs.Spawn(wizDef, {site.x, h + 1, site.z});
+        if (!id) continue;
+        for (int i = 0; i < 12; i++) burnTick(id, 0, 0);  // settle onto ground
+        arms[a].raw0 = legRaw(id);
+        // Light the HIPS and nothing else. Cloth first because skin cannot be
+        // lit directly at all -- its rule products (flesh_cooked) carry no
+        // tag:hot, so IgnitedForm refuses it, which is the sear being a colour
+        // change rather than combustion.
+        arms[a].lit = mobs.IgniteLimb(id, hipLimb, 120u, mCloth);
+        if (arms[a].lit == 0) arms[a].lit = mobs.IgniteLimb(id, hipLimb, 120u);
+        mobs.ResetBurnStats();
+        // SAMPLED EVERY TICK AND KEPT AT ITS MINIMUM, never read at the end.
+        // With the knot parked the creature should survive, but "should" is
+        // not a thing to build a measurement on: if it dies anyway the census
+        // goes to zero and an end-state read reports the maximum possible
+        // score for the worst possible reason. The most-burnt state actually
+        // observed while the body was there to observe is the honest number,
+        // and it is the same reasoning the B subtest gives for sampling the
+        // halving tick rather than the end state.
+        uint32_t peakAlight = 0, minRaw = arms[a].raw0;
+        for (int i = 0; i < kCrossTicks; i++) {
+          if (i % kRelight == 0) mobs.IgniteLimb(id, hipLimb, 120u, mCloth);
+          burnTick(id, 0, 0);
+          if (!mobs.IsAlive(id)) break;
+          peakAlight = std::max(peakAlight, legAlight(id));
+          minRaw = std::min(minRaw, legRaw(id));
+        }
+        arms[a].touched = arms[a].raw0 > minRaw ? arms[a].raw0 - minRaw : 0u;
+        arms[a].alight = peakAlight;
+        const MobSystem::BurnStats& bs = mobs.Burn();
+        arms[a].cells = bs.crossCells;
+        arms[a].faces = bs.crossFaces;
+        arms[a].scaled = bs.crossOnly;
+      }
+      SetCurrentTuning(savedT);
+      mobs.Reset();
+      debris.Reset();
+
+      // The claim is the DIFFERENCE, and it is stated as a multiple rather
+      // than as an absolute so it does not have to be retuned every time a
+      // combustion number moves. The control arm is allowed to be non-zero:
+      // the hips still emit fire into the grid and a little of it can drift
+      // back onto a thigh, which is the very path that was too weak to matter
+      // and is the reason this feature exists.
+      const bool crossOk =
+          arms[0].lit > 0 && arms[0].touched > 0 &&
+          arms[0].touched >= arms[1].touched * 4 + 8;
+      std::printf(
+          "  heat across a joint: %s (%u lit on hips; thigh voxels touched "
+          "%u/%u at crossLimbPct %d vs %u/%u at 0, %ux; peak alight %u vs %u)\n",
+          crossOk ? "PASS" : "FAIL", arms[0].lit, arms[0].touched,
+          arms[0].raw0, pcts[0], arms[1].touched, arms[1].raw0,
+          arms[1].touched ? arms[0].touched / arms[1].touched
+                          : arms[0].touched,
+          arms[0].alight, arms[1].alight);
+      // Attribution at the point of failure, not elimination afterwards: the
+      // three counters say which link broke. No cells means the fronts were
+      // empty (the hips never caught, or the index was dropped every tick); no
+      // faces means the thighs never had a face pointing into one (a pose or
+      // widening problem); faces but no scaled rolls means the rules never
+      // matched; all three non-zero with nothing touched means the roll itself
+      // is refusing, i.e. the percentage is too low.
+      if (!crossOk)
+        std::printf("    cross heat: %u cells, %u faces took one, %u rules "
+                    "scaled by it (control arm: %u / %u / %u)\n",
+                    arms[0].cells, arms[0].faces, arms[0].scaled,
+                    arms[1].cells, arms[1].faces, arms[1].scaled);
+      std::fflush(stdout);
+      ok = ok && crossOk;
+    }
+  }
 
   // ---- G. a SEVERED burning limb keeps burning, and so does a corpse -------
   // DebrisSystem::BurnBodies refused micro bodies outright until this package,
@@ -3526,7 +3869,8 @@ Status GateMobBurn(Ctx& c, std::string& detail) {
     int avDeathTick = -1;
     if (spawned) {
       // THE DEATH KNOT IS PARKED AT 100% FOR THIS FIXTURE. The claim here is
-      // how far the burn chain gets across a body over 90 ticks in a
+      // how far the burn chain gets across a body over 90 spread-scaled
+      // ticks (see spreadScale) in a
       // bonfire; with the knot at its shipped 70% the human died at t+50
       // and the chain was measured over half the exposure it was written
       // against (14.9% past the sear, against a floor of 15% set between
@@ -3546,7 +3890,9 @@ Status GateMobBurn(Ctx& c, std::string& detail) {
       body0 = avBody();
       uint32_t lastBody = body0;
       takeCensus();
-      for (int i = 0; i < 90 && avatar.Spawned() && avatar.IsAlive(); i++) {
+      for (int i = 0; i < 90 * spreadScale && avatar.Spawned() &&
+                      avatar.IsAlive();
+           i++) {
         avTick(mFire);
         if (!avatar.IsAlive()) {
           avDeathTick = i;
