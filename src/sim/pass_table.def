@@ -472,9 +472,14 @@ PASS(wg_fill_fluidBlockMap, nullptr, PT_WORLDGEN, PIPE_NONE, K_FILL, 0,0,0, GRP_
 // FILL rows above it still run in both modes: they clear the transient
 // buffers (hash, support, particle counts, both dirty pages) that worldgen
 // resets regardless of how the voxels get written.
+// W(GenAct) is reachable but never taken on this row: genChunk writes genAct
+// only under TickParams::genDeferWake, which only Stream::ShiftAxis sets and
+// the whole-window path never does. Declared anyway because check_pass_table.py
+// walks the CALL GRAPH from the entry point, not the branch conditions, and a
+// spurious barrier on a buffer no other row touches costs nothing.
 PASS(worldgen, "worldgen", PT_WORLDGEN, PIPE_WORLDGEN, K_COMPUTE, D_CHUNKS,1,1, GRP_SIM, DYN_ZERO, C_DENSEWG, 1,
      USES(R(Materials) U(TickUBO) W(Voxels) W(Occupancy) A(DirtyIn) A(DirtyOut)
-          R(PageTable) A(PageFaults) R(TreeAtlas)))
+          R(PageTable) A(PageFaults) R(TreeAtlas) W(GenAct)))
 
 // ========================================================== PT_GENLIST =====
 // Simulation::EncodeGenList — its own encoder, submitted MID-FRAME between
@@ -487,7 +492,7 @@ PASS(worldgen, "worldgen", PT_WORLDGEN, PIPE_WORLDGEN, K_COMPUTE, D_CHUNKS,1,1, 
 PASS(worldgenList, "worldgenList", PT_GENLIST, PIPE_WORLDGEN_LIST, K_COMPUTE, D_GENCOUNT,1,1,
      GRP_SIM, DYN_ZERO, C_GENCOUNT, 1,
      USES(R(GenList) R(Materials) U(TickUBO) W(Voxels) W(Occupancy) A(DirtyIn) A(DirtyOut)
-          R(PageTable) A(PageFaults) R(TreeAtlas)))
+          R(PageTable) A(PageFaults) R(TreeAtlas) W(GenAct)))
 
 // ========================================================= PT_PAGEFILL =====
 // PageTable::DrainFills — materializes the JITTER pages of ONE tick, recorded

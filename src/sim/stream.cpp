@@ -249,7 +249,27 @@ void Stream::Update(IVec3 playerChunk, uint32_t tick) {
     const int mag = d[a] < 0 ? -d[a] : d[a];
     if (mag > bestMag) { bestMag = mag; best = a; }
   }
-  if (best >= 0) ShiftAxis(best, d[best] > 0 ? 1 : -1);
+  // ---- R1: enact any deferred wake whose T + kWakeLatency has arrived ----
+  //
+  // BEFORE the shift below, for a reason that is correctness and not tidiness:
+  // a shift on a different axis regenerates the 32 slots where the two planes
+  // intersect, and an older entry's verdict for those slots would then
+  // describe a chunk that no longer lives there. Completing first means the
+  // only entries InvalidatePendingSlots has to blank are ones whose deadline
+  // has genuinely not arrived yet.
+  //
+  // Also before this tick's SubmitTick, which is what makes the wake legal at
+  // all: RefilledSlot here is consumed by the Materialize inside SubmitTick,
+  // so the woken chunks' 26-neighbourhoods get pages in the SAME tick the CA
+  // first dispatches them.
+  CompleteDueShifts(tick);
+
+  // R4: at most one shift per FRAME (see BeginFrame in stream.h). Ungated for
+  // callers with no frame loop, where one Update is one tick anyway.
+  if (best >= 0 && !(frameGated_ && shiftedThisFrame_)) {
+    ShiftAxis(best, d[best] > 0 ? 1 : -1);
+    shiftedThisFrame_ = true;
+  }
   timing_.totalMs += PtNowMs() - uT0;
 }
 
@@ -285,6 +305,11 @@ void Stream::ShiftAxis(int axis, int dir) {
   if (shiftEvicted_.size() != kNumChunks) shiftEvicted_.assign(kNumChunks, 0);
   for (uint32_t s : slots) shiftEvicted_[s] = 1;
 
+  // A pending entry from an EARLIER shift may name some of these slots (two
+  // planes on different axes intersect in a 32-slot line). Its verdict for
+  // them is about to become stale; blank it. See InvalidatePendingSlots.
+  InvalidatePendingSlots(slots);
+
   const double sT0 = PtNowMs();
   EvictSlots(slots, /*filter=*/true);
   timing_.evictMs += PtNowMs() - sT0;
@@ -294,7 +319,7 @@ void Stream::ShiftAxis(int axis, int dir) {
   else if (axis == 1) no.y += dir;
   else no.z += dir;
   world_->SetWindowOrigin(no);
-  FillSlots(slots);
+  FillSlots(slots, /*deferWake=*/true);
   // Cleared per shift, not per frame: a multi-axis frame runs ShiftAxis once
   // per axis, and axis 2's fill must still be able to wait on axis 1's
   // eviction if they happen to share a slot (the planes intersect along an
@@ -592,7 +617,7 @@ void Stream::DrainEvictions(bool discard) {
   while (!pending_.empty()) CompleteOldest(discard);
 }
 
-void Stream::FillSlots(const std::vector<uint32_t>& slots) {
+void Stream::FillSlots(const std::vector<uint32_t>& slots, bool deferWake) {
   const double fT0 = PtNowMs();
   if (world_->residency == World::Residency::Paged)
     world_->pages->ResetStreaks(slots);
@@ -736,10 +761,11 @@ void Stream::FillSlots(const std::vector<uint32_t>& slots) {
     if (world_->residency == World::Residency::Paged) {
       for (uint32_t gs : genSlots) world_->pages->EnsurePageForOverwrite(gs);
       world_->pages->FlushTableWrites(ctx_->queue);
-      // Contributor (d) — the RefilledSlot calls — moved to AFTER the demote
-      // pass below, where the post-genChunk occupancy is in hand: only the
-      // slots that can ACT are declared, not the whole plane. See the act-set
-      // note at that site.
+      // Contributor (d) — the RefilledSlot calls — lives in ApplyGenVerdict,
+      // where the post-genChunk occupancy is in hand: only the slots that can
+      // ACT are declared, not the whole plane. Under the deferred wake that is
+      // kWakeLatency ticks from now, which is exactly as early as it needs to
+      // be — nothing dispatches the plane until the same call wakes it.
     }
     ctx_->queue.WriteBuffer(world_->genList, 0, genSlots.data(),
                             genSlots.size() * 4);
@@ -751,30 +777,10 @@ void Stream::FillSlots(const std::vector<uint32_t>& slots) {
     // Fluid-lab slab (world.h kLabSlabY): a lab window shift must refill with
     // the SAME slab genColumn produced at startup, not default terrain.
     tp.labMode = World::LabWorld() ? 1u : 0u;
+    // R1: publish the act verdict instead of acting on it (world.h's
+    // genDeferWake, the genChunk tail in worldgen.wgsl).
+    tp.genDeferWake = deferWake ? 1u : 0u;
     ctx_->queue.WriteBuffer(world_->tickUBO, 0, &tp, sizeof(tp));
-
-    // ---- DEBUG-ONLY fence decomposition (SANDVOX_PT_DEBUG) ---------------
-    // The occupancy map below waits on the fence of the LAST submit, which
-    // covers EVERY command buffer queued so far — the previous tick's
-    // SubmitTick, the frame's render, this shift's eviction copies — not just
-    // genChunk. So "occ 30 ms" does not say whether the GPU is busy with work
-    // that already existed or with the shift's own worldgen, and those two
-    // readings call for opposite fixes. Draining the backlog here first splits
-    // it: `pre` is what was already outstanding, `occ` is then genChunk + its
-    // copy alone. Gated because the drain is itself a stall.
-    double preMs = 0.0;
-    if (world_->residency == World::Residency::Paged && PtDbg()) {
-      if (!genOccStaging_)
-        genOccStaging_ = CreateBuffer(
-            ctx_->device, (uint64_t)kNumChunks * 4,
-            rhi::BufferUsage::MapRead | rhi::BufferUsage::CopyDst, "genOcc");
-      rhi::MapTicket pre =
-          rhi::MapReadDeferred(ctx_->device, genOccStaging_, 0, 4);
-      const double p0 = PtNowMs();
-      pre.Wait();
-      preMs = PtNowMs() - p0;
-      pre.Unmap();
-    }
 
     rhi::CommandEncoder enc = ctx_->device.CreateCommandEncoder();
     sim_->EncodeGenList(enc, (uint32_t)genSlots.size());
@@ -786,173 +792,106 @@ void Stream::FillSlots(const std::vector<uint32_t>& slots) {
     // layer touches; the ops go out through the MutationQueue on the following
     // ticks. Cheap when there is no layer — QueueChunk returns on an empty map
     // before it hashes anything.
+    //
+    // Stays at tick T under the deferred wake: the ops are CPU mutations that
+    // travel the MutationQueue and target chunks by WORLD coordinate, so they
+    // are unaffected by whether the CA has been told about the plane yet.
     if (!sandvox::WorldEditLayer().Empty())
       for (uint32_t gs : genSlots)
         sandvox::WorldEditLayer().QueueChunk(world_->SlotToWorldChunk(gs));
-
-    // ---- and DEMOTE the result (§3.5c's compaction, on the streaming path) --
-    //
-    // Without this the shift plane LEAKS: genChunk needs a page for every slot
-    // it writes, but ~85% of a shift plane generates as pure sky, and a page
-    // that is never demoted is never freed either — §3.6's free condition only
-    // fires for slots reporting occTotal == 0 on kPageFreeTicks CONSECUTIVE
-    // snapshots, and a slot that scrolled out stops being reported at all.
-    // Measured before this landed: ~880 pages leaked per window shift
-    // (5832 -> 6711 -> 7584 over three shifts of the loud scenario), which
-    // exhausted the pool while the materialization set itself sat flat at
-    // ~1,200. It is the same classification the store-hit branch does and that
-    // batched worldgen does; this was the one path missing it.
-    //
-    // CLASSIFY ON THE WORDS, never on `occupancy`. Two reasons, both learned
-    // the hard way here:
-    //   - occupancy counts NON-AIR cells, but the hash also covers the STAIN
-    //     layer (bits 24..30, sim_occupancy.wgsl). A chunk can be all-air and
-    //     still carry stain, and demoting it to PT_EMPTY would silently drop
-    //     hashed state — which is exactly gotcha-save-format-drops-stain in a
-    //     new place.
-    //   - PageTable::Classify is the ONE promotion rule (whole-word equality,
-    //     §2.3), so using it here keeps a single definition rather than a
-    //     second predicate that must agree with it.
-    //
-    // The read must not start before genChunk's submit completes: reading early
-    // returns the PREVIOUS contents — for a freshly scrolled-in slot, zeros, so
-    // every generated chunk would be demoted and its matter lost. The batch's
-    // own copy is submitted after genChunk's on the same queue, so queue order
-    // carries that dependency; the only block is the single map at the end.
-    //
-    // ONE COPY PER BATCH, NOT ONE PER SLOT. This loop is the whole cost of a
-    // window shift. Per-slot rhi::ReadbackBlocking creates a buffer, submits a
-    // command buffer, waits the queue idle and maps — once per chunk — and a
-    // shift plane is kNChunk^2 = 1,024 chunks: measured at 92 ms of readback
-    // plus a 14 ms WaitIdle per shift, ~105 ms total, against 0.5 ms for the
-    // same shift under dense residency. Sprint-flying shifts on consecutive
-    // frames, so that stall landed on nearly every frame and pinned the game at
-    // ~7 fps while moving. Batching into kEvictBatch-sized copies (the bound
-    // the eviction path already uses for exactly this reason, 4 MB of staging)
-    // makes it one submit and one map per 256 chunks.
     timing_.fillGenMs += PtNowMs() - fT1;
-    if (world_->residency == World::Residency::Paged) {
-      const bool dbg = PtDbg();
-      const double dT0 = PtNowMs();
-      double occMs = 0.0;
 
-      // ---- PREFILTER ON OCCUPANCY, so the voxel read is sized to the ANSWER --
-      //
-      // genChunk computes each chunk's occupancy in-kernel and writes it in the
-      // same dispatch (worldgen.wgsl), so the demote candidates are known from a
-      // 128 KiB buffer instead of 16 MiB of voxels.
-      //
-      // TWO occupancy values can demote, not one, and the second is the whole
-      // point of the JITTER sentinel (world.h's JITTER block):
-      //   occ == 0          all air         -> PT_EMPTY
-      //   occ == CHUNK_VOL  completely full -> UNIFORM or JITTER
-      // The original form of this prefilter tested `occ == 0` only, on the
-      // reasoning that "a UNIFORM non-air chunk is not something worldgen
-      // produces, because a solid-stone chunk is uniform in MATERIAL but its
-      // state nibble carries per-cell palette jitter". That reasoning was exactly
-      // right and is exactly what JITTER now represents — so the chunks it
-      // excluded are the ones worth compressing. A partially-full chunk still
-      // cannot demote: no sentinel form can describe a mix of air and matter.
-      //
-      // The stain caveat that makes `occ == 0` unsafe on the tick path does NOT
-      // apply here: worldgen writes no stain bits at all, so a freshly
-      // generated all-air chunk carries no hashed state. The words are still
-      // read and Classify still decides — this only narrows WHICH chunks are
-      // read, never what the rule is (PageTable::Classify stays the one
-      // promotion rule, §2.3). Measured on a shift plane: ~1,024 candidates
-      // down to the ~350 that actually demote.
-      // A failed read assigns all zeros, which is the CONSERVATIVE direction
-      // here and only here: a zeroed entry fails the `nonAir != 0` test below,
-      // so every slot falls through into `paged` and gets its words read. The
-      // prefilter degrades to "test everything", never to "demote everything".
-      // ONE POOLED STAGING BUFFER, not a fresh allocation per shift.
-      // rhi::ReadbackBlocking creates a buffer, submits, waits the whole queue
-      // idle and maps, every single shift — and shifts land on consecutive
-      // frames under flight. Keeping the 128 KiB buffer alive across shifts
-      // removes the create/destroy; the copy+map is still queue-ordered behind
-      // genChunk's submit, which is the dependency that matters (reading early
-      // returns the PREVIOUS contents and would demote every generated chunk).
-      // ---- WHY THIS WAIT IS STILL HERE (PLAN_surface_flight_perf.md B2) ----
-      // This map wait is still the largest single CPU item in the live frame.
-      // Re-measured 2026-08-31 with Stream::Timing (stream.h), 347 shifts under
-      // `--frames 900 --autofly-hard`:
-      //
-      //   window shift: 24.54 ms each | evict 0.07  fill-store 0.04
-      //                                 fill-gen 0.39  demote 18.23
-      //
-      // so 74% of a shift is this wait, and streaming as a whole is 92% of the
-      // frame's CPU busy (p50 0.00 ms, p99 42 ms — it is all-or-nothing and it
-      // lands on one frame).
-      //
-      // WHAT IT IS WAITING FOR, because the two readings need opposite fixes
-      // and the earlier note here got this wrong by 8x. With SANDVOX_PT_DEBUG=1
-      // the `pre` drain above empties the backlog first, and the same pass then
-      // reports `occ 2.1-9.1 ms`. So of the 18.2 ms, only ~2-9 is genChunk and
-      // its copy; the rest is a fence behind whatever was already queued — the
-      // frame's render and the previous ticks' submits. That is why making the
-      // COPY cheaper (it reads the whole 128 KiB occupancy buffer for <= 1,024
-      // entries) buys nothing: the cost is the synchronisation point, not the
-      // bytes.
-      //
-      // The previous version of this comment quoted `occ 39.55 ms` and called
-      // it "THE remaining cost of the surface band, and it is not close". It
-      // was measured with the debug pre-drain semantics of the time and it is
-      // 8x stale. Left recorded rather than deleted because it is the exact
-      // trap CLAUDE.md rule 6 warns about in its other direction: prose about a
-      // cost goes stale silently, and a session that trusts it spends its
-      // budget optimising a pass that is already cheap. Re-run the one command
-      // above before believing any number in this block.
-      //
-      // The harvest side, for scale (SANDVOX_PT_DEBUG=1, per shift):
-      //   demote harvest: batches=4 demoted=1024 (memcpy 1.4 ms, classify 4.1)
-      // Classify is at its post-SIMD 4.08 us/chunk, so that half is done.
-      //
-      // The obvious fix -- defer the wait a shift and filter on last shift's
-      // occupancy -- was analysed and is UNSAFE, for a reason worth writing
-      // down because the buffer has TWO consumers with OPPOSITE staleness
-      // requirements:
-      //
-      //   * the DEMOTE prefilter below (the `paged` loop) is stale-TOLERANT.
-      //     It only picks CANDIDATES; HarvestDemotes re-verifies every one
-      //     from the actually-copied words (identity via PackChunkKey, still
-      //     paged, kDemoteFreshTicks, CpuDirty, then Classify). A stale occ
-      //     can only add a candidate Classify then rejects, or omit one that
-      //     demotes a shift later. This is the same stale-filter/exact-verify
-      //     shape as the batched free probe in ConsumeOccupancy.
-      //
-      //   * the ACT SET wake above it is stale-FATAL, and has NO downstream
-      //     verification at all. `nonAir == 0u -> continue` SKIPS
-      //     RefilledSlot, so one chunk that stale data calls "pure sky" while
-      //     it holds matter is a chunk that never wakes -- silent voxel loss,
-      //     which is precisely the 217-page-fault bug. The two conservative
-      //     directions are opposites (zeros mean "test everything" for demote
-      //     and "wake nothing" for the act set), so there is no single stale
-      //     read that is safe for both.
-      //
-      // Waking the whole plane instead, so the act set needs no occupancy, is
-      // the other exit and it is closed too: that is the blanket form the
-      // comment below describes, measured TWICE as fatal pool exhaustion.
-      //
-      // So B2 does not reduce to "make it async". It needs the act set to get
-      // fresh occupancy by a route that is not a CPU fence -- computing the
-      // act set on the GPU beside genChunk and reading back only the demote
-      // filter, most likely. That is a real design change, not a deferral,
-      // and it is left undone deliberately rather than shipped racy.
+    // ---- THE READBACK, AND WHY IT NO LONGER WAITS ------------------------
+    //
+    // What the CPU wants out of the GPU here is two things, and only one of
+    // them was ever urgent:
+    //
+    //   (a) the ACT SET — which generated chunks can act — because
+    //       PageTable::Materialize must give their 26-neighbourhoods pages
+    //       before the CA runs on them. Waking a chunk the mirror has not
+    //       heard of is a voxStore into a sentinel, which common.wgsl drops
+    //       silently: the streaming gate's 217 page faults.
+    //   (b) the DEMOTE classification (sky -> PT_EMPTY, full -> UNIFORM /
+    //       JITTER), which is bookkeeping and has always been allowed to lag.
+    //
+    // (a) was urgent only because the CA acted on the plane in the SAME tick,
+    // and it was urgent expensively: MapReadDeferred borrows the fence of the
+    // last submit, and a fence on one queue waits for everything queued before
+    // it — the previous frame's render and GI passes, the previous ticks' CA,
+    // this shift's eviction copies, and only then genChunk. Measured
+    // 2026-09-03 under `--frames 600 --autofly-surface`: 33.06 ms of a
+    // 34.80 ms shift, 618 shifts in 540 frames, 50% of frames over 33 ms.
+    //
+    // So the CA is told to wait instead. genChunk leaves the plane out of
+    // dirtyIn and publishes its verdict to `genAct`; this queues the copy with
+    // NO Wait and records what is owed; and Update polls the ticket
+    // kWakeLatency ticks later, runs the identical CPU logic, and only then
+    // wakes the act set. See the PendingShift block in stream.h.
+    //
+    // ONE COPY, TWO REGIONS. occupancy (128 KiB, needed for the demote
+    // classification and for the "is any neighbour air" test that decides
+    // whether a FULL chunk is inert) then genAct (one u32 per generated slot).
+    // Both are read in both residency modes: dense skips the page-table half
+    // of the completion but must take the WAKE at the same tick as paged, or
+    // the two modes would not hash identically — and `--residency dense` is
+    // the only live differential oracle this system has.
+    const uint64_t occBytes = (uint64_t)kNumChunks * 4;
+    const uint64_t actBytes = (uint64_t)genSlots.size() * 4;
+    if (deferWake) {
+      // genAct is sized to ONE PLANE, which is the only thing that defers.
+      if (genSlots.size() > (size_t)kNChunk * kNChunk) {
+        std::fprintf(stderr,
+                     "stream: deferred gen list of %zu exceeds genAct (%u); "
+                     "waking in-kernel instead\n",
+                     genSlots.size(), (uint32_t)(kNChunk * kNChunk));
+        std::abort();
+      }
+      PendingShift ps;
+      ps.staging = AcquireShiftStaging();
+      ps.genSlots = genSlots;
+      ps.stale.assign(genSlots.size(), 0);
+      ps.tick = lastTick_;
+      rhi::CommandEncoder oenc = ctx_->device.CreateCommandEncoder();
+      oenc.CopyTracked(pass::Buf::Occupancy, world_->occupancy, 0, ps.staging,
+                       0, occBytes);
+      oenc.CopyTracked(pass::Buf::GenAct, world_->genAct, 0, ps.staging,
+                       occBytes, actBytes);
+      ctx_->queue.Submit(oenc.Finish());
+      ps.map = rhi::MapReadDeferred(ctx_->device, ps.staging, 0,
+                                    occBytes + actBytes);
+      pendingShifts_.push_back(std::move(ps));
+      // BACKSTOP, not a throughput knob (IssueDemoteCopies' shape). Entries
+      // retire on a TICK deadline, so a caller that drives Update without
+      // advancing `tick` would queue them forever. Three is the steady-state
+      // ceiling (one per tick, retired at T+kWakeLatency); eight is slack.
+      while (pendingShifts_.size() > 8) {
+        PendingShift& front = pendingShifts_.front();
+        front.map.Wait();
+        CompleteShift(front, lastTick_);
+        shiftStagingPool_.push_back(front.staging);
+        pendingShifts_.pop_front();
+      }
+    } else {
+      // ---- THE SYNCHRONOUS PATH (ReloadWindow only) ---------------------
+      // A load or a regen refills the WHOLE window and genChunk woke the slots
+      // in-kernel, so the mirror has to learn the act set on this tick or the
+      // very first CA dispatch faults. There is no frame to protect here and
+      // no plane-sized bound to respect, so this keeps the old fence.
+      const double dT0 = PtNowMs();
       std::vector<uint32_t>& occ = genOccScratch_;
       if (occ.size() != kNumChunks) occ.assign(kNumChunks, 0);
       bool occValid = false;
-      const double occT0 = dbg ? PtNowMs() : 0.0;
-      if (!genOccStaging_)
-        genOccStaging_ = CreateBuffer(
-            ctx_->device, (uint64_t)kNumChunks * 4,
-            rhi::BufferUsage::MapRead | rhi::BufferUsage::CopyDst, "genOcc");
-      {
+      if (world_->residency == World::Residency::Paged) {
+        if (!genOccStaging_)
+          genOccStaging_ = CreateBuffer(
+              ctx_->device, occBytes,
+              rhi::BufferUsage::MapRead | rhi::BufferUsage::CopyDst, "genOcc");
         rhi::CommandEncoder oenc = ctx_->device.CreateCommandEncoder();
         oenc.CopyTracked(pass::Buf::Occupancy, world_->occupancy, 0,
-                         genOccStaging_, 0, (uint64_t)kNumChunks * 4);
+                         genOccStaging_, 0, occBytes);
         ctx_->queue.Submit(oenc.Finish());
-        rhi::MapTicket omap = rhi::MapReadDeferred(ctx_->device, genOccStaging_,
-                                                   0, (uint64_t)kNumChunks * 4);
+        rhi::MapTicket omap =
+            rhi::MapReadDeferred(ctx_->device, genOccStaging_, 0, occBytes);
         omap.Wait();
         occValid = omap.Succeeded() && omap.Data();
         if (occValid)
@@ -960,176 +899,281 @@ void Stream::FillSlots(const std::vector<uint32_t>& slots) {
         else
           std::fill(occ.begin(), occ.end(), 0u);  // failed: fall back to all
         omap.Unmap();
+        // No `act`: the kernel already wrote dirtyIn/dirtyOut itself.
+        ApplyGenVerdict(genSlots, {}, occ, occValid, {}, lastTick_);
       }
-      if (dbg) occMs = PtNowMs() - occT0;
+      timing_.demoteMs += PtNowMs() - dT0;
+    }
+  }
+}
 
-      // ---- contributor (d), the ACT SET: wake only what can act -----------
-      //
-      // The blanket form of this — RefilledSlot for every slot of the plane —
-      // is what ran the mirror away: under --autofly-hard the plane is ~all
-      // JITTER-demotable stone, every slot of it hasMatter, so the whole
-      // plane plus its 26-ring (~3,072 chunks) materialized every shift on
-      // consecutive frames, against a free path on an 8-snapshot hysteresis.
-      // Measured twice as a FATAL pool exhaustion (32,148 and 31,691 of
-      // 32,768). Filtering by hasMatter cannot help: a buried stone chunk IS
-      // matter. The right question is not "does it hold matter" but "can any
-      // cell in it ACT" — and with the post-genChunk occupancy in hand the
-      // CPU can answer it per chunk:
-      //
-      //   - pure sky (nonAir == 0): nothing in it can move, and matter can
-      //     only ARRIVE from an acting neighbour, which is covered by that
-      //     neighbour's own ring (the DIRTY != HAS MATTER argument of
-      //     Materialize's bracketed half, verbatim);
-      //   - mixed (0 < nonAir < CHUNK_VOL): a free surface. Wakes.
-      //   - full (nonAir == CHUNK_VOL): cells can act only toward air, and a
-      //     CA write reaches <= 1 cell (rule 1), so a full chunk with NO air
-      //     anywhere in its 26-neighbourhood is inert — that is the buried
-      //     bulk, and it is exactly the JITTER win being protected here. Air
-      //     in any neighbour (a cave wall, the surface, a full sand column
-      //     under sky) wakes it. Out-of-window neighbours are inert by
-      //     definition (not simulated). Full-vs-full liquid gradients need no
-      //     wake of their own: the acting side writes the passive side's
-      //     boundary cell, whose chunk is in the actor's ring, and from then
-      //     on the written chunk is genuinely dirty and the recurrence
-      //     tracks it.
-      //
-      // A failed occupancy read flips the conservative direction here: for
-      // DEMOTION zeros are safe (test everything), for WAKING they would be
-      // silent voxel loss (wake nothing). So a failed read wakes the whole
-      // plane — the pre-act-set behaviour, degraded not broken.
-      for (uint32_t gs : genSlots) {
-        bool wake = true;
-        if (occValid) {
-          const uint32_t nonAir = occ[gs] & 0xFFFFu;
-          if (nonAir == 0u) continue;         // pure sky cannot act
-          wake = nonAir != kChunkVol;         // mixed: free surface
-          if (!wake) {
-            const IVec3 wc = world_->SlotToWorldChunk(gs);
-            for (int dz = -1; dz <= 1 && !wake; dz++)
-              for (int dy = -1; dy <= 1 && !wake; dy++)
-                for (int dx = -1; dx <= 1 && !wake; dx++) {
-                  if (!dx && !dy && !dz) continue;
-                  const IVec3 nc{wc.x + dx, wc.y + dy, wc.z + dz};
-                  if (!world_->ChunkInWindow(nc)) continue;
-                  if ((occ[World::SlotChunkIndex(nc)] & 0xFFFFu) != kChunkVol)
-                    wake = true;
-                }
-          }
-        }
-        if (wake) world_->pages->RefilledSlot(gs);
+// ---- the deferred wake's second half -------------------------------------
+
+rhi::Buffer Stream::AcquireShiftStaging() {
+  if (!shiftStagingPool_.empty()) {
+    rhi::Buffer b = shiftStagingPool_.back();
+    shiftStagingPool_.pop_back();
+    return b;
+  }
+  return CreateBuffer(
+      ctx_->device, ((uint64_t)kNumChunks + (uint64_t)kNChunk * kNChunk) * 4,
+      rhi::BufferUsage::MapRead | rhi::BufferUsage::CopyDst, "shiftVerdict");
+}
+
+void Stream::InvalidatePendingSlots(const std::vector<uint32_t>& slots) {
+  if (pendingShifts_.empty()) return;
+  // A plane is 1,024 of 32,768 slots and the intersection with another axis's
+  // plane is 32 of them, so a membership bitmap beats a per-entry sort.
+  std::vector<uint8_t>& mark = shiftMark_;
+  if (mark.size() != kNumChunks) mark.assign(kNumChunks, 0);
+  for (uint32_t s : slots) mark[s] = 1;
+  for (PendingShift& ps : pendingShifts_)
+    for (size_t i = 0; i < ps.genSlots.size(); i++)
+      if (mark[ps.genSlots[i]]) ps.stale[i] = 1;
+  for (uint32_t s : slots) mark[s] = 0;  // left all-zero for the next call
+}
+
+void Stream::DiscardPendingShifts() {
+  for (PendingShift& ps : pendingShifts_) {
+    ps.map.Wait();  // release the fence borrow before the buffer goes back
+    ps.map.Unmap();
+    shiftStagingPool_.push_back(ps.staging);
+  }
+  pendingShifts_.clear();
+}
+
+void Stream::CompleteDueShifts(uint32_t tick) {
+  while (!pendingShifts_.empty()) {
+    PendingShift& ps = pendingShifts_.front();
+    // Unsigned-safe: a caller that rewinds `tick` (the gates each start their
+    // own tick base) must not wrap into "not due for four billion ticks".
+    if (tick >= ps.tick && tick - ps.tick < kWakeLatency) break;
+    if (!ps.map.Ready()) {
+      // The fence covers work submitted kWakeLatency ticks ago and has
+      // essentially always retired by now. When it has not, this degrades to
+      // the pre-R1 behaviour for ONE shift — counted and printed, because "the
+      // fence came back" must be visible rather than inferred from a frame
+      // histogram.
+      const double w0 = PtNowMs();
+      ps.map.Wait();
+      timing_.wakeWaitMs += PtNowMs() - w0;
+      timing_.wakeWaits++;
+    }
+    CompleteShift(ps, tick);
+    shiftStagingPool_.push_back(ps.staging);
+    pendingShifts_.pop_front();
+  }
+}
+
+void Stream::CompleteShift(PendingShift& ps, uint32_t tick) {
+  const double dT0 = PtNowMs();
+  const uint64_t occBytes = (uint64_t)kNumChunks * 4;
+  std::vector<uint32_t>& occ = genOccScratch_;
+  std::vector<uint32_t>& act = genActScratch_;
+  if (occ.size() != kNumChunks) occ.assign(kNumChunks, 0);
+  act.assign(ps.genSlots.size(), 0u);
+  bool occValid = false;
+  if (ps.map.Succeeded() && ps.map.Data()) {
+    const uint8_t* base = (const uint8_t*)ps.map.Data();
+    std::memcpy(occ.data(), base, (size_t)kNumChunks * 4);
+    std::memcpy(act.data(), base + occBytes, ps.genSlots.size() * 4);
+    occValid = true;
+  } else {
+    // A failed read flips two conservative directions at once and they are
+    // OPPOSITES: for demotion, zeros mean "read every chunk's words", which is
+    // safe; for the act set, zeros would mean "wake nothing", which is silent
+    // voxel loss. So the verdict degrades to "wake the whole plane" — the
+    // pre-act-set behaviour, wide but never wrong — and ApplyGenVerdict's
+    // occValid=false branch does exactly that.
+    std::fill(occ.begin(), occ.end(), 0u);
+    std::fill(act.begin(), act.end(), 1u);
+  }
+  ps.map.Unmap();
+  ApplyGenVerdict(ps.genSlots, ps.stale, occ, occValid, act, tick);
+  timing_.demoteMs += PtNowMs() - dT0;
+  if (PtDbg())
+    std::printf("[pt-time] shift wake T+%u: gen=%zu %.2f ms\n",
+                tick - ps.tick, ps.genSlots.size(), PtNowMs() - dT0);
+}
+
+void Stream::ApplyGenVerdict(const std::vector<uint32_t>& genSlots,
+                             const std::vector<uint8_t>& stale,
+                             const std::vector<uint32_t>& occ, bool occValid,
+                             const std::vector<uint32_t>& act, uint32_t tick) {
+  const bool paged = world_->residency == World::Residency::Paged;
+  const bool enactWake = !act.empty();
+  const WorldSnapshot& snap = world_->Snap();
+  auto isStale = [&](size_t i) { return i < stale.size() && stale[i] != 0; };
+
+  // ---- contributor (d), the ACT SET: wake only what can act -------------
+  //
+  // The blanket form of this — RefilledSlot for every slot of the plane — is
+  // what ran the mirror away: under --autofly-hard the plane is ~all
+  // JITTER-demotable stone, every slot of it hasMatter, so the whole plane
+  // plus its 26-ring (~3,072 chunks) materialized every shift on consecutive
+  // frames, against a free path on an 8-snapshot hysteresis. Measured twice as
+  // a FATAL pool exhaustion (32,148 and 31,691 of 32,768). Filtering by
+  // hasMatter cannot help: a buried stone chunk IS matter. The right question
+  // is not "does it hold matter" but "can any cell in it ACT":
+  //
+  //   - pure sky (nonAir == 0): nothing in it can move, and matter can only
+  //     ARRIVE from an acting neighbour, which is covered by that neighbour's
+  //     own ring (Materialize's bracketed half, verbatim);
+  //   - genChunk says a cell can act: wake, unconditionally. THIS TERM IS NEW
+  //     WITH R1 and it is the invariant the rest of the design rests on —
+  //     cpuDirty must be a SUPERSET of dirtyIn, and `act` IS the set this
+  //     function is about to write into dirtyIn. Declaring one and not the
+  //     other is the 217-page-fault bug with the sides swapped.
+  //   - mixed (0 < nonAir < CHUNK_VOL): a free surface. Wakes.
+  //   - full (nonAir == CHUNK_VOL): cells can act only toward air, and a CA
+  //     write reaches <= 1 cell (rule 1), so a full chunk with NO air anywhere
+  //     in its 26-neighbourhood is inert — that is the buried bulk, and it is
+  //     exactly the JITTER win being protected here. Air in any neighbour
+  //     wakes it. Out-of-window neighbours are inert by definition.
+  //
+  // The occupancy read here is kWakeLatency ticks old for a deferred shift,
+  // and the neighbour test is the only consumer that could care. It cannot go
+  // wrong in the dangerous direction: if a neighbour became air in those ticks
+  // it was written, so it is in cpuDirty, so Materialize gives IT a page — and
+  // "it" is precisely the cell this chunk would write into.
+  std::vector<uint32_t> wake;
+  if (enactWake) wake.reserve(genSlots.size());
+  for (size_t i = 0; i < genSlots.size(); i++) {
+    if (isStale(i)) continue;
+    const uint32_t gs = genSlots[i];
+    const bool canAct = enactWake && act[i] != 0u;
+    if (canAct) wake.push_back(gs);
+    if (!paged) continue;
+    bool w = true;
+    if (occValid) {
+      const uint32_t nonAir = occ[gs] & 0xFFFFu;
+      if (nonAir == 0u && !canAct) continue;  // pure sky cannot act
+      w = canAct || nonAir != kChunkVol;
+      if (!w) {
+        const IVec3 wc = world_->SlotToWorldChunk(gs);
+        for (int dz = -1; dz <= 1 && !w; dz++)
+          for (int dy = -1; dy <= 1 && !w; dy++)
+            for (int dx = -1; dx <= 1 && !w; dx++) {
+              if (!dx && !dy && !dz) continue;
+              const IVec3 nc{wc.x + dx, wc.y + dy, wc.z + dz};
+              if (!world_->ChunkInWindow(nc)) continue;
+              if ((occ[World::SlotChunkIndex(nc)] & 0xFFFFu) != kChunkVol)
+                w = true;
+            }
       }
+    }
+    if (w) world_->pages->RefilledSlot(gs);
+  }
 
-      // Collect the candidates: a sentinel slot has nothing to read and is
-      // already in its demoted form; a PARTIALLY-full slot cannot demote.
-      // ---- ALL-AIR DEMOTES WITHOUT READING ANY WORDS ----------------------
-      //
-      // The occupancy word now carries "this chunk has stain" in bit 31
-      // (packOccStain), which was the only thing `nonAir == 0` could not
-      // establish on its own. An all-air, stainless chunk is by definition
-      // PT_EMPTY's content, so it can be demoted straight from the occupancy
-      // read we already did — no voxel copy, no map, no wait.
-      //
-      // That matters because this is the COMMON case by a wide margin: a shift
-      // plane is mostly sky, and every one of those slots was allocated a page
-      // by EnsurePageForOverwrite just above (genChunk cannot allocate), so
-      // without this they all round-trip allocate -> fill -> read back 16 KiB
-      // -> demote, every shift. Measured on the adversarial descent: ovr=1,024
-      // allocations per tick, the entire plane.
-      //
-      // The FULL case (nonAir == CHUNK_VOL -> UNIFORM or JITTER) still needs
-      // the words: those sentinels must reproduce the resident content
-      // bit-exactly, which is Classify's exact-word rule and not something an
-      // occupancy count can decide.
-      // WHY THIS IS STILL A READBACK, having just added a stain bit that looks
-      // like it should remove one.
-      //
-      // The tempting move is to demote `nonAir == 0 && !anyStain` straight from
-      // the occupancy word, skipping the voxel copy for the ~85% of a shift
-      // plane that generates as sky. It was tried and it LOSES VOXELS: the
-      // streaming gate went 217 -> 240 page faults. Occupancy answers "how many
-      // non-air cells" and now "any stain", but Classify's demote test is
-      // kAirDemoteMask, which ALSO covers bit 31 (kCellOpIfAir) — a transient
-      // "CPU write in flight" flag that occupancy does not and cannot report.
-      // A chunk with a pending op reads as empty by count and is not empty.
-      //
-      // The occupancy prefilter therefore stays what it was: a way to narrow
-      // WHICH chunks are read, never a substitute for reading them. The words
-      // keep deciding, through the one promotion rule (§2.3).
-      //
-      // The stain bit still pays for itself where it CAN be trusted, on the
-      // tick path in PageTable::ConsumeOccupancy: that path already required
-      // the slot to be out of cpuDirty and quiet for kPageFreeTicks, which is
-      // exactly the condition an in-flight op violates.
-      // ---- THE SKY SHARE DEMOTES WITH NO COPY AT ALL ----------------------
-      //
-      // The refusal above is about chunks IN GENERAL, and it is right about
-      // them. These slots are not chunks in general: every one of them was
-      // overwritten end to end by the genChunk dispatch this very call
-      // submitted, and the occupancy being read is that dispatch's own
-      // in-kernel count. So the two things occupancy cannot see do not exist
-      // here — genCell returns packVox(mat, state, STAMP_NEVER) and can set
-      // neither bit 31 (kCellOpIfAir) nor a stain bit, and worldgen writes no
-      // stain at all, which is exactly why genChunk writes packOcc and not
-      // packOccStain. `nonAir == 0` on a freshly generated slot therefore does
-      // not merely suggest PT_EMPTY's content, it IS PT_EMPTY's content.
-      //
-      // What about a write LATER in this same tick? It is covered, and by the
-      // machinery that already exists rather than by luck:
-      //   - a CPU op is assembled AFTER this call and lands in opTargets, an
-      //     UNFILTERED term of materialize(N), which runs later in this tick
-      //     and re-allocates the page before the dispatch;
-      //   - a CA neighbour pushing a voxel in is covered by that neighbour's
-      //     own membership: it is mixed, so the act set above woke it, and
-      //     materialize allocates N26(cpuDirty). This is the same protection
-      //     every OTHER sky chunk in the window already lives on.
-      //
-      // The win is that this is the COMMON case by a wide margin: a shift
-      // plane is mostly sky, and each of those slots was costing a 16 KiB
-      // copy out, a 16 KiB memcpy back, and a 4,096-word Classify to be told
-      // what its occupancy count already said.
-      //
-      // The FULL case (nonAir == kChunkVol -> UNIFORM or JITTER) still needs
-      // the words: those sentinels must reproduce the resident content
-      // bit-exactly, which is Classify's exact-word rule and not something a
-      // count can decide.
-      std::vector<uint32_t> paged;
-      paged.reserve(genSlots.size());
-      uint32_t skyDemoted = 0;
-      for (uint32_t gs : genSlots) {
-        if (world_->PageOffsetOfSlot(gs) == World::kNoPage) continue;
-        const uint32_t nonAir = occ[gs] & 0xFFFFu;  // low 16 = non-air count
-        if (occValid && nonAir == 0u) {
-          world_->pages->SetSentinel(gs, kPtEmpty);
-          skyDemoted++;
+  if (paged) {
+    // ---- the demote candidates (§3.5c's compaction, on the streaming path) -
+    //
+    // Without this the shift plane LEAKS: genChunk needs a page for every slot
+    // it writes, but ~85% of a shift plane generates as pure sky, and a page
+    // that is never demoted is never freed either. Measured before this
+    // landed: ~880 pages leaked per window shift.
+    //
+    // CLASSIFY ON THE WORDS, never on `occupancy` — occupancy counts non-air
+    // cells but the hash also covers the STAIN layer, and PageTable::Classify
+    // is the ONE promotion rule (§2.3). The occupancy read only narrows WHICH
+    // chunks are read. The one exception is the sky share below, and it is an
+    // exception because these slots were overwritten end to end by the
+    // genChunk dispatch whose own in-kernel count this is: genCell returns
+    // packVox(mat, state, STAMP_NEVER), so it can set neither bit 31
+    // (kCellOpIfAir) nor a stain bit, and `nonAir == 0` on a freshly generated
+    // slot does not merely suggest PT_EMPTY's content, it IS PT_EMPTY's
+    // content.
+    std::vector<uint32_t> cands;
+    cands.reserve(genSlots.size());
+    uint32_t skyDemoted = 0, skyHeld = 0;
+    for (size_t i = 0; i < genSlots.size(); i++) {
+      if (isStale(i)) continue;
+      const uint32_t gs = genSlots[i];
+      if (world_->PageOffsetOfSlot(gs) == World::kNoPage) continue;
+      const uint32_t nonAir = occ[gs] & 0xFFFFu;  // low 16 = non-air count
+      if (occValid && nonAir == 0u) {
+        // ---- R1 RACE 1: the count is kWakeLatency ticks old ------------
+        //
+        // Between generation and now, an acting neighbour may have pushed a
+        // voxel into this chunk. Those writes land on a real page (every gen
+        // slot got one) and are perfectly legal; what is not legal is
+        // demoting the chunk to PT_EMPTY afterwards, which frees the page and
+        // deletes the grain. The writer was in dirtyIn at the write tick, so
+        // it is in cpuDirty, and Materialize dilates cpuDirty by N26 — this
+        // chunk is therefore in cpuDirty if anything could have written it.
+        // The snapshot's own flag is the belt to that braces.
+        //
+        // A held page is NOT a leak: the slot is resident and reported, so
+        // PageTable::ConsumeOccupancy's hysteresis frees it a few snapshots
+        // later. The leak the demote pass exists to stop is the slot that
+        // SCROLLED OUT and stopped being reported at all.
+        if (world_->pages->CpuDirty().Has(gs) ||
+            (snap.valid && snap.dirtyFlags[gs])) {
+          skyHeld++;
           continue;
         }
-        if (nonAir != 0u && nonAir != kChunkVol) continue;
-        paged.push_back(gs);
+        world_->pages->SetSentinel(gs, kPtEmpty);
+        skyDemoted++;
+        continue;
       }
-      if (skyDemoted) world_->pages->FlushTableWrites(ctx_->queue);
-
-      // ---- ISSUE the copies now, CLASSIFY on a later frame's harvest -------
-      //
-      // The copies must be encoded here — queue order behind genChunk's submit
-      // is what guarantees they read post-gen data — but nothing about the
-      // DECISION is urgent: with residency at ~1.2k pages of a 32,768-page
-      // pool, a chunk that stays resident a few frames longer costs pages the
-      // pool has thirty-fold spare, while the map.Wait (5.5 s/run) and the
-      // JITTER word-verify (29.6 s/run) were the shift frame's two largest
-      // remaining stalls after the eviction fix. HarvestDemotes applies the
-      // staleness and identity guards at classify time.
-      std::vector<uint64_t> keys;
-      keys.reserve(paged.size());
-      for (uint32_t gs : paged)
-        keys.push_back(World::PackChunkKey(world_->SlotToWorldChunk(gs)));
-      IssueDemoteCopies(paged, keys, lastTick_);
-      timing_.demoteMs += PtNowMs() - dT0;
-      if (dbg)
-        std::printf("[pt-time] shift demote: gen=%zu cands=%zu sky=%u issued "
-                    "total %.2f ms (pre %.2f, occ %.2f)\n",
-                    genSlots.size(), paged.size(), skyDemoted, PtNowMs() - dT0,
-                    preMs, occMs);
+      // A partially-full chunk cannot demote: no sentinel form describes a mix
+      // of air and matter. The FULL case still needs the words — a sentinel
+      // must reproduce the resident content bit-exactly, which is Classify's
+      // exact-word rule and not something a count can decide.
+      if (nonAir != 0u && nonAir != kChunkVol) continue;
+      cands.push_back(gs);
     }
+    if (skyDemoted) world_->pages->FlushTableWrites(ctx_->queue);
+
+    // ISSUE the copies now, CLASSIFY on a later frame's harvest. Under R1
+    // these are encoded kWakeLatency ticks AFTER genChunk rather than
+    // immediately behind it, which is strictly safer: any neighbour write
+    // during those ticks is already in the bytes, so Classify sees it and
+    // refuses the demote rather than relying on the CpuDirty guard alone.
+    std::vector<uint64_t> keys;
+    keys.reserve(cands.size());
+    for (uint32_t gs : cands)
+      keys.push_back(World::PackChunkKey(world_->SlotToWorldChunk(gs)));
+    IssueDemoteCopies(cands, keys, tick);
+    if (PtDbg())
+      std::printf("[pt-time] shift demote: gen=%zu cands=%zu sky=%u held=%u\n",
+                  genSlots.size(), cands.size(), skyDemoted, skyHeld);
+  }
+
+  // ---- and only now, THE WAKE ------------------------------------------
+  //
+  // Exactly what genChunk's two atomicStores used to do, moved to the CPU and
+  // kWakeLatency ticks later: dirtyIn and dirtyOut ARE dirty[page] and
+  // dirty[1 - page], so writing both pages is the same set of flags whichever
+  // page this tick is on (the store-hit branch above writes both for the same
+  // reason). The write is deferred and drains at the HEAD of the next command
+  // buffer, which is this tick's SubmitTick — ahead of sim_compact, and after
+  // the RefilledSlot calls above have been handed to the same tick's
+  // Materialize. That ordering is the whole correctness argument.
+  //
+  // Runs of consecutive slots are coalesced into one call. A Z-axis plane is a
+  // single contiguous span of 1,024 slots; an X-axis plane strides by kNChunk
+  // and coalesces into nothing, which is why this is a run-length walk and not
+  // an unconditional one-call-per-slot loop.
+  if (!wake.empty()) {
+    static const std::vector<uint32_t> ones((size_t)kNChunk * kNChunk, 1u);
+    std::sort(wake.begin(), wake.end());
+    size_t i = 0;
+    while (i < wake.size()) {
+      size_t j = i + 1;
+      while (j < wake.size() && wake[j] == wake[j - 1] + 1) j++;
+      const size_t n = j - i;
+      const uint64_t off = (uint64_t)wake[i] * 4;
+      ctx_->queue.WriteBuffer(world_->dirty[0], off, ones.data(), n * 4);
+      ctx_->queue.WriteBuffer(world_->dirty[1], off, ones.data(), n * 4);
+      i = j;
+    }
+    // This is a waking path that writes dirtyIn without going through a
+    // Simulation::Encode* entry point, so it declares itself to the §3.4
+    // settled-skip latch here — the same self-declaration rule EncodeWakeAll
+    // and EncodeGenList follow. EncodeGenList already did this at tick T, but
+    // T is not when the dirty set actually moved any more.
+    sim_->NoteWakeAll();
   }
 }
 
@@ -1280,9 +1324,13 @@ void Stream::ReloadWindow(IVec3 origin) {
   // in-flight evictions belong to the world being replaced
   DrainEvictions(/*discard=*/true);
   DiscardDemotes();  // same: old-world bytes must never classify the new one
+  DiscardPendingShifts();  // and so do any un-enacted shift verdicts
   world_->SetWindowOrigin(origin);
   modified_.assign(kNumChunks, 0);
   std::vector<uint32_t> slots(kNumChunks);
   for (uint32_t i = 0; i < kNumChunks; i++) slots[i] = i;
-  FillSlots(slots);
+  // deferWake=false: this is the WHOLE window (32,768 slots, far past genAct's
+  // one-plane size), it is not on a frame path worth protecting, and a load
+  // must be simulable on the tick it lands rather than two ticks later.
+  FillSlots(slots, /*deferWake=*/false);
 }

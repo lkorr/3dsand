@@ -204,6 +204,8 @@ BUF_TO_WGSL = {
     # The irradiance grid (PLAN_gi.md 3): binding 29 of simBGL_, 8 of the
     # shadow group, 19 of the render group.
     "Irradiance": {"irradiance"},
+    # The deferred streaming wake's act verdict, binding 30.
+    "GenAct": {"genAct"},
     "PageFaults": {"pageFaults"},
     # MLS-MPM fluid (sim_fluid.wgsl + sim_fluid_seam.wgsl). The particle pair
     # is symbolic: the solver and every seam pass except the compaction source
@@ -272,6 +274,8 @@ _SIM_GROUP0 = {
     "openness", "opennessGen",
     # The irradiance grid, binding 29.
     "irradiance",
+    # The deferred streaming wake's act verdict, binding 30.
+    "genAct",
 }
 # The slim group is 0..4 PLUS the two page buffers at 17/18 — not a dense
 # prefix any more. One WGSL identifier cannot carry two binding numbers
@@ -761,7 +765,7 @@ REGRESSIONS = [
     ("sim_compact.wgsl", "mainNext", ["dirtyIn"], ["dirtyOut"]),
     ("sim_step.wgsl", "main", [], ["dirtyOut"]),      # transitive via markDirty
     ("worldgen.wgsl", "list", [],
-     ["voxels", "occupancy", "dirtyIn", "dirtyOut"]),  # transitive via genChunk
+     ["voxels", "occupancy", "dirtyIn", "dirtyOut", "genAct"]),  # via genChunk
 ]
 
 
