@@ -1167,6 +1167,184 @@ Status GateGiBounce(Ctx& c, std::string& detail) {
 }
 
 // ---------------------------------------------------------------------------
+// gi-nightfall: no block-face keeps yesterday's sun.
+//
+// THE BUG THIS PINS (2026-09-02, reported as "random glowing green blocks at
+// night; the first night is dark, then after a full day some voxels never lose
+// brightness"). Two writers charge an irradiance word and only one of them can
+// ever discharge it. The shadow resolve pass deposits full sunlight for any
+// patch that is ON SCREEN and stops the instant the camera looks away, so it
+// is a charger with no expiry. The openness walk is the discharger: it visits
+// every face every kNumChunks / opennessChunksPerFrame ticks whether anyone is
+// looking or not, and that is the ONLY thing standing between a face and a
+// value from noon.
+//
+// It skipped a face whose CENTRE COLUMN held no blocker. A block is 4 voxels
+// wide; wherever the ground rises or falls by a block inside a 4x4 footprint --
+// a slope, a bank, a trunk, a cliff -- the block holds matter, the face
+// marches (openValueAt finds its ray origin with a 2x2 quincunx, not the
+// centre), and the centre column is empty air. openSunSample looked only at
+// the centre, found nothing, and returned "no sample"; the caller read that as
+// "leave the word alone". Those faces were charged once by daylight and then
+// lit their neighbours with it forever, scattered over exactly the steep
+// ground where the geometry does that, in the green of the grass that charged
+// them.
+//
+// THE FIXTURE is two floating 4x4 plates, each filling one block's footprint,
+// charged at noon and then CARVED DOWN TO ONE COLUMN so that the block still
+// holds matter (its sub-occupancy bit stays set, so the walk still visits it
+// and does not simply zero the word) while its centre column is empty:
+//   A keeps a column the quincunx probes  -> the walk has a real sample again
+//                                            and blends the night's zero in
+//   B keeps a block CORNER, which no probe reaches -> nothing can measure it,
+//                                            and the walk must FADE it
+// Both are the bug; they are separated because the two halves of the fix are
+// different lines, and a gate that only had A would pass with the fade removed.
+//
+// NO RENDER PASS AND NO CAMERA, on purpose: the resolve pass must not be able
+// to contribute, or the gate would be measuring the charger. The only writer
+// under test is the walk, and the sun it reads comes from the RenderParams the
+// gate writes -- noon for the charge, midnight for the fade. Each tick pokes
+// one cell of each plate so the chunk lands on the dirty list and the walk runs
+// there EVERY tick instead of once per full sweep; that is what keeps this gate
+// at ~35 ticks instead of ~4,000.
+Status GateGiNightfall(Ctx& c, std::string& detail) {
+  GpuContext& ctx = c.ctx;
+  World& world = c.world;
+  Simulation& sim = c.sim;
+
+  const uint32_t mSolid = [&]() -> uint32_t {
+    for (size_t i = 0; i < c.mats.size(); i++)
+      if (c.mats[i].name == "stone") return (uint32_t)i;
+    return 0;
+  }();
+  if (!mSolid) {
+    detail = "stone missing from materials.json";
+    return Status::Fail;
+  }
+  const Tuning base = CurrentTuning();
+  if (base.render.giStrength <= 0.0f) {
+    detail = "render.giStrength is 0 - the deposit is compiled out";
+    return Status::Fail;
+  }
+  if (base.render.giDecay <= 0.0f) {
+    detail = "render.giDecay is 0 - an unmeasurable face can never fade";
+    return Status::Fail;
+  }
+
+  SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+  ctx.WaitIdle();
+
+  // Block-aligned so "the centre column" and "a corner" mean what they say.
+  const int kBlk = 1 << (int)kSubOccShift;
+  const int gx = 300, gz = 300;
+  const int ground = World::TerrainHeight(gx, gz, kDefaultSeed);
+  const int by = (ground + 12) & ~(kBlk - 1);
+  const int bxA = gx & ~(kBlk - 1);
+  const int bzA = gz & ~(kBlk - 1);
+  const int bxB = bxA + 2 * kBlk;   // a different block, same row
+  const int bzB = bzA;
+  const IVec3 pchunk{bxA / (int)kChunk, by / (int)kChunk, bzA / (int)kChunk};
+  // The survivors: A on a quincunx column (centre +-1 in both tangents), B on
+  // the block corner, which openSunSample's five columns never reach.
+  const IVec3 keepA{bxA + 1, by, bzA + 1};
+  const IVec3 keepB{bxB + 0, by, bzB + 0};
+
+  std::vector<CellOp> plates, carve;
+  bool sited = true;
+  for (int b = 0; b < 2; b++) {
+    const int ox = b ? bxB : bxA, oz = b ? bzB : bzA;
+    const IVec3 keep = b ? keepB : keepA;
+    for (int dx = 0; dx < kBlk; dx++)
+      for (int dz = 0; dz < kBlk; dz++) {
+        const IVec3 cc{ox + dx, by, oz + dz};
+        if (!world.CellInWindow(cc)) { sited = false; continue; }
+        plates.push_back({World::SlotCellIndex(cc), PackVoxNew(mSolid, 0u)});
+        if (cc.x != keep.x || cc.z != keep.z)
+          carve.push_back({World::SlotCellIndex(cc), PackVoxNew(0u, 0u)});
+      }
+  }
+  if (!sited || plates.empty()) {
+    detail = "fixture site is outside the residency window";
+    return Status::Fail;
+  }
+
+  // Noon and midnight, scanned rather than hardcoded (the shadow-cache gate
+  // says why): the walk's sun is whatever RenderParams carries.
+  uint32_t noonTick = 0, midnightTick = 0;
+  {
+    float bestUp = -2.0f, worstUp = 2.0f;
+    for (uint32_t t = 0; t < 200000u; t += 64u) {
+      const float up = ComputeSky(base, (double)t).sunDir[1];
+      if (up > bestUp) { bestUp = up; noonTick = t; }
+      if (up < worstUp) { worstUp = up; midnightTick = t; }
+    }
+  }
+  const Vec3 eye{(float)bxA, (float)(by + 8), (float)bzA};
+  Camera cam;
+  auto sky = [&](uint32_t skyTick) {
+    WriteRenderParams(ctx.queue, world, eye, cam, 16.0f / 9.0f, true, 0.0f,
+                      kFarFogDensity, 1080.0f, skyTick);
+  };
+
+  uint32_t tick = 80000;
+  auto step = [&](const std::vector<CellOp>& cells) {
+    SubmitTick(ctx, world, sim, ++tick, kDefaultSeed, {}, {}, cells, false,
+               pchunk, false, false);
+  };
+  // One cell of each plate, rewritten to what it already is: the chunk goes on
+  // the dirty list and the walk runs there this tick.
+  const std::vector<CellOp> poke{
+      {World::SlotCellIndex(keepA), PackVoxNew(mSolid, 0u)},
+      {World::SlotCellIndex(keepB), PackVoxNew(mSolid, 0u)}};
+
+  // ---- charge: full plates under a noon sun ----
+  sky(noonTick);
+  step(plates);
+  for (int i = 0; i < 6; i++) step(poke);
+  ctx.WaitIdle();
+  double dayA[3] = {0, 0, 0}, dayB[3] = {0, 0, 0};
+  UnpackRgb9e5(IrradianceWordAt(ctx, world, keepA, 3u), dayA);
+  UnpackRgb9e5(IrradianceWordAt(ctx, world, keepB, 3u), dayB);
+
+  // ---- carve to one column, then night ----
+  step(carve);
+  sky(midnightTick);
+  for (int i = 0; i < 24; i++) step(poke);
+  ctx.WaitIdle();
+  double nightA[3] = {0, 0, 0}, nightB[3] = {0, 0, 0};
+  UnpackRgb9e5(IrradianceWordAt(ctx, world, keepA, 3u), nightA);
+  UnpackRgb9e5(IrradianceWordAt(ctx, world, keepB, 3u), nightB);
+
+  auto lum = [](const double v[3]) {
+    return 0.299 * v[0] + 0.587 * v[1] + 0.114 * v[2];
+  };
+  const double lDayA = lum(dayA), lDayB = lum(dayB);
+  const double lNightA = lum(nightA), lNightB = lum(nightB);
+  const double maxPct = BaselineNumber("giNightfall.maxRemainPct", 5.0);
+  // The charge has to be real or "it faded" is vacuous - the same three-arm
+  // rule the shadow-cache gate follows.
+  const double minDay = BaselineNumber("giNightfall.minDayLum", 0.02);
+  const bool charged = lDayA >= minDay && lDayB >= minDay;
+  const double pctA = lDayA > 0.0 ? 100.0 * lNightA / lDayA : 0.0;
+  const double pctB = lDayB > 0.0 ? 100.0 * lNightB / lDayB : 0.0;
+  const bool ok = charged && pctA <= maxPct && pctB <= maxPct;
+
+  std::printf(
+      "gi-nightfall: %s (two floating blocks charged at noon then carved to one "
+      "column and left in the dark for 24 walked ticks; A keeps a probed column "
+      "and B a block corner. Day luminance A %.4f B %.4f, both must be >= %.4f; "
+      "night A %.4f (%.1f%%) B %.4f (%.1f%%), both must be <= %.1f%% of day. "
+      "blocks at (%d,%d,%d)/(%d,%d,%d), giDecay %.2f)\n",
+      ok ? "PASS" : "FAIL", lDayA, lDayB, minDay, lNightA, pctA, lNightB, pctB,
+      maxPct, bxA, by, bzA, bxB, by, bzB, base.render.giDecay);
+  detail = Format("A %.1f%% of day, B %.1f%% (<= %.1f%%); day lum %.4f/%.4f%s",
+                  pctA, pctB, maxPct, lDayA, lDayB,
+                  charged ? "" : " - NEVER CHARGED");
+  return ok ? Status::Pass : Status::Fail;
+}
+
+// ---------------------------------------------------------------------------
 // shadow-cache: the voxel-keyed shadow cache agrees with the ray it replaced.
 //
 // WHY THIS GATE EXISTS. The cache does not reuse trace(). It cannot: trace()
@@ -1739,6 +1917,9 @@ const std::vector<Gate>& RenderGates() {
       {"openness", "render", {}, false, GateOpenness},
       // Draws (two arms of a fixture frame) AND reads a word back.
       {"gi-bounce", "render", {}, false, GateGiBounce, /*needsRender=*/true},
+      // No render pass on purpose: the resolve pass must not be able to
+      // contribute, or the gate would be measuring the charger.
+      {"gi-nightfall", "render", {}, false, GateGiNightfall},
   };
   return g;
 }

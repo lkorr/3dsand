@@ -4725,10 +4725,21 @@ deposits for every patch it publishes — it already knows the patch's cell, fac
 and shadow term, and one voxel-word read gives the albedo — so anything on
 screen is injected every frame. The openness walk (`sim_openness.wgsl`)
 deposits ONE coarse sun sample per face it marches (a `traceOpaque` block ray
-from the face centre, the first blocker voxel under the centre for albedo), so
-faces nobody is looking at follow the sun within `kNumChunks /
-opennessChunksPerFrame` ticks; a face it cannot march (a blocker in front)
-fades by `render.giDecay` per visit, and a block with no surface reads 0.
+from the face centre; the albedo is the first blocker voxel found in FIVE
+columns of the face - its centre and the same 2x2 quincunx `openValueAt` uses
+to find its ray origin), so faces nobody is looking at follow the sun within
+`kNumChunks / opennessChunksPerFrame` ticks. A face the walk cannot measure -
+it could not march (a blocker in front), or none of the five columns holds a
+blocker - fades by `render.giDecay` per visit, and a block with no surface
+reads 0. **A face the walk cannot measure must never be left alone.** The
+resolve pass is a charger with no expiry: it deposits full sun for anything on
+screen and stops the moment the camera looks away, so the walk's visit is the
+only thing that can ever discharge a word. Sampling the centre column alone and
+skipping the deposit when it held no blocker froze exactly the faces of blocks
+whose surface passes off-centre - every slope, bank, trunk and cliff, since a
+block is 4 voxels wide - at whatever value the last daylight frame put there:
+they went on lighting their neighbours grass-green all night, in scattered
+patches that tracked the steep ground (2026-09-02). Gate `gi-nightfall`.
 Both blend into the word with an EMA (`irrDeposit`: 1/16 per resolve deposit,
 1/2 per walk sample) rather than summing — 256 patches per block-face per
 frame overflow any bounded sum-and-count, and a per-frame reset needs a frame

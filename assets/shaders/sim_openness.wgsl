@@ -242,10 +242,22 @@ fn openValueAt(blockMin : vec3<i32>, face : u32) -> u32 {
 // blends that into its word at GI_WALK_ALPHA. Coarse in both senses — a block
 // mask shadow and one voxel's albedo for a 16-voxel face — which is why the
 // resolve pass's fine deposits outrank it wherever they exist (they land later
-// in the same frame's command stream). Returns w = 0 when the column under the
-// face centre holds no blocker at all (a block with one voxel in a corner):
-// then the walk has no albedo to speak of and leaves the word alone rather than
-// pulling a real deposit toward zero.
+// in the same frame's command stream).
+//
+// FIVE COLUMNS, NOT ONE, and the same five openValueAt probes. A block is 4
+// voxels wide and the surface inside it need not pass through its centre
+// column: anywhere terrain rises or falls by a block within a 4x4 footprint --
+// a slope, a cliff, a bank, a trunk, a ruin edge -- the block holds matter,
+// the face MARCHES (openValueAt finds its origin with a 2x2 quincunx), and the
+// centre column alone is empty air. Sampling only the centre found no albedo
+// on exactly those faces and the caller then LEFT THE WORD ALONE, so a face
+// the shadow resolve pass had charged with noon sunlight on some earlier frame
+// kept that value forever: at dusk the whole grid faded except those, and they
+// went on lighting their neighbours green (grass albedo) all night, scattered
+// wherever the ground was steep. Returns w = 0 only when none of the five
+// columns holds a blocker, and the caller FADES the word in that case -- see
+// the decay branch in openChunk. "Could not measure it" must never mean "keep
+// yesterday's sun".
 fn openSunSample(blockMin : vec3<i32>, face : u32, open : f32) -> vec4f {
   let n = openFaceNormal(face);
   let L = keyLightDirP(R);
@@ -256,24 +268,38 @@ fn openSunSample(blockMin : vec3<i32>, face : u32, open : f32) -> vec4f {
   // emission (P3): a lava face deposits its glow here whether or not the sun
   // is up, which is why a face turned away from the sun still runs this.
   let ni = vec3<i32>(round(n));
-  var c = vec3<i32>(floor(centre + n * (half - 0.5)));
+  let axis = face >> 1u;
+  let t0i = vec3<i32>(select(0, 1, axis == 1u), select(0, 1, axis == 2u),
+                      select(0, 1, axis == 0u));
+  let t1i = vec3<i32>(select(0, 1, axis == 2u), select(0, 1, axis == 0u),
+                      select(0, 1, axis == 1u));
+  let colBase = vec3<i32>(floor(centre + n * (half - 0.5)));
   var albedo = vec3f(0.0);
   var emis = 0.0;
   var found = false;
-  for (var i = 0u; i < SUBOCC_BLOCK; i++) {
-    let w = voxWordAt(c);
-    let m = materials[voxMat(w)];
-    if (isRayBlocker(m)) {
-      // Burning foliage deposits the MEAN of its breath (burnTintMean):
-      // this grid is an EMA over frames and must not beat with the pulse.
-      let bt = burnTint(m, paletteColor(m, voxState(w), &materials),
-                        f32(m.emission) / 255.0, burnTintMean());
-      albedo = bt.albedo;
-      emis = bt.emis;
-      found = true;
-      break;
+  // col 0 is the centre column -- a solid face hits on its first read, so the
+  // four fallbacks cost nothing on the common case. col 1..4 are the 2x2
+  // sub-centres, offset +-1 from the centre in each tangent.
+  for (var col = 0u; col < 5u && !found; col++) {
+    let k = col - 1u;
+    let du = select(select(-1, 1, (k & 1u) != 0u), 0, col == 0u);
+    let dv = select(select(-1, 1, (k & 2u) != 0u), 0, col == 0u);
+    var c = colBase + t0i * du + t1i * dv;
+    for (var i = 0u; i < SUBOCC_BLOCK; i++) {
+      let w = voxWordAt(c);
+      let m = materials[voxMat(w)];
+      if (isRayBlocker(m)) {
+        // Burning foliage deposits the MEAN of its breath (burnTintMean):
+        // this grid is an EMA over frames and must not beat with the pulse.
+        let bt = burnTint(m, paletteColor(m, voxState(w), &materials),
+                          f32(m.emission) / 255.0, burnTintMean());
+        albedo = bt.albedo;
+        emis = bt.emis;
+        found = true;
+        break;
+      }
+      c -= ni;
     }
-    c -= ni;
   }
   if (!found) { return vec4f(0.0); }
   // The sun ray, only for a face the sun can reach: the same origin the
@@ -347,12 +373,23 @@ fn openChunk(slot : u32, li : u32, origin : vec3<i32>) {
       // it, so its light fades at TUNE_GI_DECAY per visit, and the resolve
       // pass re-deposits it every frame while any patch of it is on screen.
       if (TUNE_GI_STRENGTH > 0.0) {
+        var smp = vec4f(0.0);
         if (ov < 256u) {
-          let smp = openSunSample(blockMin, face, f32(ov) * (1.0 / OPEN_MAX));
-          if (smp.w > 0.0) {
-            irrDeposit(idx, smp.xyz, GI_WALK_ALPHA, stampOk, &irradiance);
-          }
+          smp = openSunSample(blockMin, face, f32(ov) * (1.0 / OPEN_MAX));
+        }
+        if (smp.w > 0.0) {
+          irrDeposit(idx, smp.xyz, GI_WALK_ALPHA, stampOk, &irradiance);
         } else {
+          // NOTHING HERE CAN MEASURE THE FACE -- it could not march (a blocker
+          // in front: a terrace riser, or buried rock), or it marched and none
+          // of openSunSample's five columns holds a blocker. Either way the
+          // walk has no answer, and the ONE thing it must not do is keep the
+          // last one: the shadow resolve pass charges these words with full
+          // sun whenever a patch of the face is on screen and never discharges
+          // them once the camera looks away, so a word the walk skips is a
+          // daylight value with no expiry. Fade at TUNE_GI_DECAY per visit
+          // (~128 ticks apart) and let the resolve pass re-charge it every
+          // frame it is actually visible.
           let old = select(vec3f(0.0), unpackRgb9e5(irradiance[idx]), stampOk);
           irradiance[idx] = packRgb9e5(old * (1.0 - TUNE_GI_DECAY));
         }

@@ -217,5 +217,8 @@
   "_giBounce_about": "One-bounce indirect light, docs/PLAN_gi.md 3. A white bone wall stands on the -X edge of a floating 41x41 leaves slab at noon; the gate renders the wall's +X face with render.giStrength at its default and again at 0 and takes the mean per-channel difference over the middle of the frame, in 0..255 units. minGreenDelta is the least green the bounce must add; minGreenOverRed is how much more green than red it must add (a grey brightening is not a bounce off green).",
   "giBounce.minGreenDelta": "2.0",
   "giBounce.minGreenOverRed": "1.0",
-  "giBounce.convergePct": "5.0"
+  "giBounce.convergePct": "5.0",
+  "_giNightfall_about": "No block-face keeps yesterday's sun, docs/PLAN_gi.md 3. Two floating 4x4 plates are charged by the openness walk at noon and then carved down to a single column each -- one on a column openSunSample probes, one on a block corner it does not -- and walked 24 more ticks at midnight. maxRemainPct is the most of the noon luminance either word may still hold; minDayLum is the floor the charge itself must clear, so \"it faded\" cannot pass on a word that was never lit. Before the five-column probe and the unconditional fade both words held 100%.",
+  "giNightfall.maxRemainPct": "5.0",
+  "giNightfall.minDayLum": "0.02"
 }
