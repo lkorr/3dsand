@@ -726,8 +726,34 @@ static bool ExpandNeighborChance(const json& r, std::vector<MaterialDef>& mats,
     ReactionGpu x = g;
     x.nbrTags = 0;
     x.nbrMat = (uint32_t)FindMaterial(mats, e.first);
+    // ---- combustion.flamePct: how much of a fire the DRIFTING FLAME carries.
+    //
+    // The authored multiplier is the per-rule ratio -- WHICH rules let the
+    // flame off lightly is a content decision, and the skin sear deliberately
+    // is not one of them -- and this knob is the global strength over all of
+    // them, exactly as spreadPct is the global strength over the ignition
+    // chances those rules scale from. One authoritative source for each: the
+    // JSON owns the ratios, the knob owns the strength.
+    //
+    // Keyed on the excepted neighbour being a HOT GAS, not on the name
+    // "fire". That is what the exception is actually about -- a thing that
+    // rises off a fire and floats away is a weaker igniter than the coals that
+    // made it -- so a second hot gas is covered by construction, and an
+    // exception naming a hot SOLID or LIQUID ("lava lights this faster") is
+    // left alone, because that is not a drifting flame and this knob has no
+    // business scaling it.
+    double mult = e.second;
+    {
+      const int id = FindMaterial(mats, e.first);
+      const uint32_t hot = tagReg.MaskOf("hot", false);
+      if (id >= 0 && mats[(size_t)id].gpu.klass == CLASS_GAS && hot != 0 &&
+          (mats[(size_t)id].gpu.tagMask & hot) != 0) {
+        const int pct = CurrentTuning().combustion.flamePct;
+        mult = mult * (double)(pct < 0 ? 0 : pct) / 100.0;
+      }
+    }
     // Same rounding as the authored chance: once, in double, on the CPU.
-    double c = chanceMille * e.second;
+    double c = chanceMille * mult;
     if (c > 1000.0) c = 1000.0;
     x.chance = (uint32_t)(c * (double)kReactChanceScale + 0.5);
     if (x.chance == 0) x.chance = 1;

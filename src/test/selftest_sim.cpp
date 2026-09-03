@@ -2798,7 +2798,17 @@ Status GateWeakFlame(Ctx& c, std::string& detail) {
     detail = "fire / ember / lava missing from materials.json";
     return Status::Fail;
   }
-  const double ratio = BaselineNumber("weakFlame.ratio", 8.0);
+  // THE EXPECTED RATIO TRACKS THE KNOB. `weakFlame.ratio` is the ratio
+  // reactions.json authors (the reciprocal of its neighborChance multiplier for
+  // fire, 0.0625 = 16), and combustion.flamePct is the global strength over
+  // that authoring -- so at 200% the flame is twice as dangerous and the ratio
+  // is 8, not 16. Restating the authored number here and calling it the answer
+  // would make this gate fail the moment anyone moved the slider it exists to
+  // protect, which is the opposite of what it is for: it checks that the
+  // exception COMPILED, not that nobody touched the tuning.
+  const int flamePct = CurrentTuning().combustion.flamePct;
+  const double ratio =
+      BaselineNumber("weakFlame.ratio", 8.0) * 100.0 / (double)std::max(1, flamePct);
   const uint32_t fireTags = c.mats[mFire].gpu.tagMask;
 
   struct Fuel { const char* self; const char* product; };
@@ -2866,8 +2876,9 @@ Status GateWeakFlame(Ctx& c, std::string& detail) {
 
   char buf[512];
   std::snprintf(buf, sizeof(buf),
-                "%s: %d fuels ignite from fire at 1/%.0f of the coals' rate%s%s",
-                fails.empty() ? "PASS" : "FAIL", checked, ratio,
+                "%s: %d fuels ignite from fire at 1/%.0f of the coals' rate "
+                "(flamePct %d%%)%s%s",
+                fails.empty() ? "PASS" : "FAIL", checked, ratio, flamePct,
                 fails.empty() ? "" : " |", fails.c_str());
   detail = buf;
   std::printf("weak-flame: %s\n", buf);

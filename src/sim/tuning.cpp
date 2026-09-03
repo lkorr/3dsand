@@ -1679,6 +1679,16 @@ bool LoadTuning(const std::string& path, Tuning& out) {
       out.warnings.push_back("combustion.spreadPct outside 1..400; clamped");
       cb.spreadPct = cb.spreadPct < 1 ? 1 : 400;
     }
+    ReadI(*g, "flamePct", cb.flamePct, out, at);
+    // 0 IS LEGAL HERE, unlike spreadPct: "the drifting flame ignites nothing,
+    // only the coals spread fire" is a coherent game rather than a typo that
+    // deletes a mechanic, and it is the one setting that makes the exception
+    // absolute. The compiled chance still floors at 1 unit (materials.cpp), so
+    // 0 means "as rare as the table can express", not "never".
+    if (cb.flamePct < 0 || cb.flamePct > 800) {
+      out.warnings.push_back("combustion.flamePct outside 0..800; clamped");
+      cb.flamePct = std::clamp(cb.flamePct, 0, 800);
+    }
     ReadI(*g, "crossLimbPct", cb.crossLimbPct, out, at);
     if (cb.crossLimbPct < 0 || cb.crossLimbPct > 100) {
       out.warnings.push_back("combustion.crossLimbPct outside 0..100; clamped");

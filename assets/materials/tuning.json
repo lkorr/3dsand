@@ -990,6 +990,7 @@
   "combustion": {
     "burnDurationPct": 200,
     "spreadPct": 12,
+    "flamePct": 100,
     "crossLimbPct": 25
   },
   "wind": {

@@ -2966,6 +2966,69 @@ Status GateMobBurn(Ctx& c, std::string& detail) {
       ok = ok && i4;
     }
 
+    // ---- I.5 the FLAME knob scales the exception and only the exception ----
+    //
+    // combustion.flamePct is the global strength over the per-rule
+    // neighborChance exceptions reactions.json authors for the drifting flame.
+    // Provable in the compiled table for microseconds, like its two
+    // neighbours: halve the knob and every fire-exception rule must halve,
+    // while the rule it is an exception TO -- the tag rule the coals match --
+    // must not move at all. That second half is the one worth having. The
+    // exception is compiled as a synthetic hot-minus-fire tag plus an exact
+    // fire rule, and a knob that moved both would not be making the flame
+    // weaker, it would be making the whole fire weaker and duplicating
+    // spreadPct under a second name.
+    {
+      const Tuning saved3 = CurrentTuning();
+      std::vector<MaterialDef> mf1, mf2;
+      std::vector<ReactionGpu> rf1, rf2;
+      std::string ef1, ef2;
+      Tuning tf1 = saved3;
+      tf1.combustion.flamePct = 100;
+      SetCurrentTuning(tf1);
+      const bool loadF1 = LoadAssets(mp, rp, mf1, rf1, ef1);
+      Tuning tf2 = saved3;
+      tf2.combustion.flamePct = 50;
+      SetCurrentTuning(tf2);
+      const bool loadF2 = LoadAssets(mp, rp, mf2, rf2, ef2);
+      SetCurrentTuning(saved3);
+
+      uint32_t flameMoved = 0, flameWrong = 0, coalsMoved = 0;
+      bool shapeF = loadF1 && loadF2 && rf1.size() == rf2.size();
+      if (shapeF) {
+        const uint32_t mFire = matId("fire");
+        for (size_t i = 0; i < rf1.size(); i++) {
+          if (rf1[i].packed != rf2[i].packed ||
+              rf1[i].prodSelf != rf2[i].prodSelf || rf1[i].cond != rf2[i].cond) {
+            shapeF = false;
+            break;
+          }
+          if (rf1[i].chance == rf2[i].chance) continue;
+          // An exact-fire-neighbour rule is the exception; anything else that
+          // moved is the knob reaching past what it owns.
+          if (rf1[i].nbrMat == mFire && rf1[i].nbrTags == 0) {
+            flameMoved++;
+            const uint32_t want = (rf1[i].chance + 1u) / 2u;
+            if (rf2[i].chance + 1u < want || rf2[i].chance > want + 1u)
+              flameWrong++;
+          } else {
+            coalsMoved++;
+          }
+        }
+      }
+      const bool i5 = shapeF && flameMoved > 0 && flameWrong == 0 &&
+                      coalsMoved == 0;
+      std::printf("  flame knob: %s (%u fire-exception rules halved at 50%%, "
+                  "%u by the wrong factor, %u non-exception rules moved; live "
+                  "setting %d%%)\n",
+                  i5 ? "PASS" : "FAIL", flameMoved, flameWrong, coalsMoved,
+                  saved3.combustion.flamePct);
+      if (!i5 && (!loadF1 || !loadF2))
+        std::printf("    reload failed: %s%s\n", ef1.c_str(), ef2.c_str());
+      std::fflush(stdout);
+      ok = ok && i5;
+    }
+
     // ---- I.2 A BURNT CHARACTER IS NEVER A NAKED ONE ------------------------
     // The base human's linen is a material, not a paint colour, precisely so
     // that burning it cannot expose skin — every reaction that rewrites a body
@@ -3646,17 +3709,41 @@ Status GateMobBurn(Ctx& c, std::string& detail) {
       // the hips still emit fire into the grid and a little of it can drift
       // back onto a thigh, which is the very path that was too weak to matter
       // and is the reason this feature exists.
+      // A DIFFERENTIAL IS ONLY MEANINGFUL WHILE THE CONTROL IS A CONTROL.
+      //
+      // The control arm is "the old behaviour": the only heat that reaches a
+      // thigh is the grid's, through the flame the hips emit. At the authored
+      // spread rate that path is far too weak to matter, which is the entire
+      // owner report -- it measured 0 of 558. But combustion.spreadPct is a
+      // live knob with a range up to 400%, and at the top of it the ordinary
+      // grid path is fast enough to burn the legs off by itself: measured at
+      // 400%, the control arm took 442 of 558 and the differential collapsed
+      // to 1x. That is not the crossing failing, it is the experiment losing
+      // its control, and reporting it as a failed assertion would be a lie
+      // about which of the two the run found.
+      //
+      // So it is reported as UNMEASURABLE and the subtest declines to assert,
+      // loudly and with the number that made it so. It still FAILS in the case
+      // that matters -- a control that stays near zero while the live arm does
+      // nothing is exactly the bug, and no setting of any knob hides that.
+      const bool saturated = arms[1].touched * 2 >= arms[1].raw0;
       const bool crossOk =
           arms[0].lit > 0 && arms[0].touched > 0 &&
           arms[0].touched >= arms[1].touched * 4 + 8;
       std::printf(
           "  heat across a joint: %s (%u lit on hips; thigh voxels touched "
-          "%u/%u at crossLimbPct %d vs %u/%u at 0, %ux; peak alight %u vs %u)\n",
-          crossOk ? "PASS" : "FAIL", arms[0].lit, arms[0].touched,
-          arms[0].raw0, pcts[0], arms[1].touched, arms[1].raw0,
+          "%u/%u at crossLimbPct %d vs %u/%u at 0, %ux; peak alight %u vs %u"
+          "%s)\n",
+          saturated ? "UNMEASURABLE" : crossOk ? "PASS" : "FAIL", arms[0].lit,
+          arms[0].touched, arms[0].raw0, pcts[0], arms[1].touched,
+          arms[1].raw0,
           arms[1].touched ? arms[0].touched / arms[1].touched
                           : arms[0].touched,
-          arms[0].alight, arms[1].alight);
+          arms[0].alight, arms[1].alight,
+          saturated ? "; the CONTROL arm already burnt half the thigh through "
+                      "the grid, so this differential has no control at this "
+                      "combustion.spreadPct -- not asserted"
+                    : "");
       // Attribution at the point of failure, not elimination afterwards: the
       // three counters say which link broke. No cells means the fronts were
       // empty (the hips never caught, or the index was dropped every tick); no
@@ -3670,7 +3757,7 @@ Status GateMobBurn(Ctx& c, std::string& detail) {
                     arms[0].cells, arms[0].faces, arms[0].scaled,
                     arms[1].cells, arms[1].faces, arms[1].scaled);
       std::fflush(stdout);
-      ok = ok && crossOk;
+      ok = ok && (crossOk || saturated);
     }
   }
 
