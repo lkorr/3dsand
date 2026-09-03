@@ -705,17 +705,39 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
                 rhi::BufferUsage::MapRead | rhi::BufferUsage::CopyDst,
                 "freeProbe");
           }
-          rhi::CommandEncoder enc = pctx->device.CreateCommandEncoder();
+          // ---- DECIDE FIRST, THEN CREATE THE ENCODER (P3-E) --------------
+          //
+          // CreateCommandEncoder is NOT free and NOT side-effect-free: it calls
+          // Backend::BeginCommands, which drains the whole pending-upload queue
+          // into that command buffer's head. This block used to create the
+          // encoder up front and then `return ok` without submitting whenever
+          // every candidate had lost its page since selection — which happens
+          // constantly once the free path is allowed to run — and the writes it
+          // had swallowed, including PageTable::Materialize's page-table flush
+          // for the whole tick, died with it. The GPU then kept the
+          // pre-allocation JITTER sentinel and the tick's `pagefill` plus the
+          // next shift's `genChunk` each wrote 4,096 words through it:
+          // 21,733,376 lost voxels on --gate streaming, with a perfectly
+          // correct CPU-side page table the whole time.
+          //
+          // The backend now hands an abandoned encoder's uploads back
+          // (Backend::AbandonCommands), so this is no longer a correctness
+          // requirement — but deciding first is still the right shape: it costs
+          // no command buffer at all on the ticks that have nothing to copy.
           size_t copied = 0;
           for (size_t i = 0; i < slots.size(); i++) {
-            const uint64_t off = pw->PageOffsetOfSlot(slots[i]);
-            if (off == World::kNoPage) continue;
-            enc.CopyTracked(pass::Buf::Voxels, pw->voxels, off,
-                            state->staging, i * stride, stride);
+            if (pw->PageOffsetOfSlot(slots[i]) == World::kNoPage) continue;
             ok[i] = true;
             copied++;
           }
           if (copied == 0) return ok;
+          rhi::CommandEncoder enc = pctx->device.CreateCommandEncoder();
+          for (size_t i = 0; i < slots.size(); i++) {
+            if (!ok[i]) continue;
+            enc.CopyTracked(pass::Buf::Voxels, pw->voxels,
+                            pw->PageOffsetOfSlot(slots[i]), state->staging,
+                            i * stride, stride);
+          }
           pctx->queue.Submit(enc.Finish());
           state->map = rhi::MapReadDeferred(pctx->device, state->staging, 0,
                                             (uint64_t)slots.size() * stride);

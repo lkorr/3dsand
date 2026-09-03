@@ -153,6 +153,17 @@ struct VkrCommandBuffer final : CommandBufferImpl {
   // True when a render pass in this buffer targeted a swapchain image: the
   // submit must wait the acquire semaphore and signal render-done (D3).
   bool presenting = false;
+  // ---- the second half of the abandoned-uploads rule (P3-E) ---------------
+  // Finish() ends the command buffer but does not run it. A caller that
+  // finishes and then never submits kills exactly the same uploads an
+  // abandoned ENCODER does (Backend::AbandonCommands carries the story), so the
+  // finished handle takes the upload debt over from the encoder and settles it
+  // the same way if it dies unsubmitted.
+  bool submitted = false;
+  std::shared_ptr<VkrState> st;
+  ~VkrCommandBuffer() override {
+    if (!submitted && st && cmd != VK_NULL_HANDLE) st->be->AbandonCommands(cmd);
+  }
 };
 struct VkrQuerySet final : QuerySetImpl {
   VkQueryPool pool = VK_NULL_HANDLE;
@@ -202,6 +213,18 @@ struct VkrEncoder final : CommandEncoderImpl {
   VkCommandBuffer cmd = VK_NULL_HANDLE;
   std::unique_ptr<vk::Recorder> rec;
   vk::Bindings bindings{};  // set by the bridge at the first RecordTable call
+
+  // Set by Finish(): from then on the CommandBuffer handle owns the upload
+  // debt and this destructor must not settle it a second time.
+  bool handedOff = false;
+  ~VkrEncoder() override {
+    // Dropped without Finish(): nothing recorded here will ever run, so give
+    // back the uploads BeginCommands swallowed. The destructor is the one place
+    // that KNOWS the buffer is dead - a "was the previous one submitted yet?"
+    // test at the next BeginCommands cannot tell a dead encoder from a live
+    // second one, and guessing wrong there double-writes the staging ring.
+    if (!handedOff && cmd != VK_NULL_HANDLE) st->be->AbandonCommands(cmd);
+  }
 
   VkrEncoder(std::shared_ptr<VkrState> s, const char* label) : st(std::move(s)) {
     // BeginCommands flushes the pending uploads at the head of the command
@@ -285,6 +308,8 @@ struct VkrEncoder final : CommandEncoderImpl {
     auto impl = std::make_shared<VkrCommandBuffer>();
     impl->cmd = cmd;
     impl->presenting = presenting;
+    impl->st = st;
+    handedOff = true;   // the CommandBuffer handle now owns the upload debt
     return CommandBuffer(std::move(impl));
   }
 };
@@ -302,6 +327,7 @@ struct VkrQueue final : QueueImpl {
     for (uint32_t i = 0; i < count; i++) {
       if (!cmds[i]) continue;
       auto* c = static_cast<VkrCommandBuffer*>(cmds[i].Get());
+      c->submitted = true;
       std::string err;
       VkFence f = c->presenting ? st->be->SubmitEndedPresenting(c->cmd, err)
                                 : st->be->SubmitEnded(c->cmd, err);

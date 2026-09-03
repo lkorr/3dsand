@@ -761,6 +761,24 @@ void Stream::FillSlots(const std::vector<uint32_t>& slots, bool deferWake) {
     if (world_->residency == World::Residency::Paged) {
       for (uint32_t gs : genSlots) world_->pages->EnsurePageForOverwrite(gs);
       world_->pages->FlushTableWrites(ctx_->queue);
+      // ---- THE genChunk PRECONDITION, CHECKED HERE (P3-E) -----------------
+      // genChunk resolves through voxWordInChunk(genList[wg.x], ...), so every
+      // slot in the list must hold a PAGE or all 4,096 of its stores are
+      // dropped. EnsurePageForOverwrite one line above is supposed to be that
+      // guarantee. If this fires, the CPU table lost the page; if it never
+      // fires while the kernel still faults, the loss is on the GPU side of the
+      // deferred table write. Those are different bugs and a fault count
+      // cannot tell them apart.
+      if (PtDbg() || getenv("SANDVOX_PT_FREELOG")) {
+        for (uint32_t gs : genSlots) {
+          if (world_->PageOffsetOfSlot(gs) != World::kNoPage) continue;
+          const IVec3 wc = world_->SlotToWorldChunk(gs);
+          std::printf("[pt-bad] tick %u genlist slot %u chunk (%d,%d,%d): "
+                      "table says sentinel 0x%08x\n",
+                      lastTick_, gs, wc.x * (int)kChunk, wc.y * (int)kChunk,
+                      wc.z * (int)kChunk, world_->PageEntryOfSlot(gs));
+        }
+      }
       // Contributor (d) — the RefilledSlot calls — lives in ApplyGenVerdict,
       // where the post-genChunk occupancy is in hand: only the slots that can
       // ACT are declared, not the whole plane. Under the deferred wake that is

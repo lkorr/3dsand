@@ -355,6 +355,31 @@ class Backend {
   void FlushUploads(VkCommandBuffer cmd);
   size_t PendingUploadCount() const { return pending_.size(); }
 
+  // ---- an ABANDONED command buffer gives its uploads back (P3-E) -----------
+  //
+  // FlushUploads runs in BeginCommands, i.e. when the command buffer is
+  // CREATED, not when it is submitted. So `CreateCommandEncoder()` is what
+  // consumes the pending-upload queue, and a caller that creates an encoder and
+  // then decides it has nothing to record DELETES every write issued before it.
+  //
+  // That is not hypothetical and it is not survivable. The free-confirmation
+  // probe in support.cpp created its encoder before discovering that none of
+  // its candidate slots still had a page, and returned without submitting: the
+  // page-table writes PageTable::Materialize had just issued died with it, the
+  // GPU kept the pre-allocation JITTER sentinel, and the tick's `pagefill` and
+  // the next shift's `genChunk` wrote 4,096 words each through a sentinel.
+  // 21,733,376 lost voxels on one gate, and the CPU-side table was correct the
+  // whole time, which is what made it invisible from every counter.
+  //
+  // So the encoder handle owns the debt: dropping it without Finish/Submit
+  // calls this, which puts the swallowed writes back at the FRONT of the queue
+  // (issue order is the contract) and releases the command buffer. Exact rather
+  // than heuristic — the destructor knows the buffer is dead, where a "was the
+  // previous one submitted yet?" test at the next BeginCommands could not tell
+  // a dead encoder from a live second one.
+  void AbandonCommands(VkCommandBuffer cmd);
+  uint64_t FlushesRecovered() const { return flushesRecovered_; }
+
   // ---- submit (barrier_graph §4.2) ----
   //
   // EVERY submit gets a fence. No exceptions, and the reason is not readbacks:
@@ -620,6 +645,12 @@ class Backend {
     uint64_t high = 0;
   };
   std::vector<FlushMark> flushMarks_;
+  // The uploads recorded into the command buffer that most recently consumed a
+  // flush, held until that buffer is SUBMITTED (dropped then) or ABANDONED
+  // (re-queued then). See AbandonCommands.
+  std::vector<Pending> heldFlush_;
+  VkCommandBuffer heldFlushCmd_ = VK_NULL_HANDLE;
+  uint64_t flushesRecovered_ = 0;
   uint64_t stagingStalls_ = 0;
   uint64_t stagingFallbacks_ = 0;
 

@@ -832,7 +832,15 @@ constexpr uint32_t kPtNoWord = 0xFFFFFFFFu;
 //   [9]      first fault: the refusing slot
 //   [10]     first fault: the TICK it was dropped on
 //   [11..15] LAST fault: kernel id + 1, world chunk x/y/z, tick (racy store)
-//   [16..31] per-kernel fault tally, indexed by PT_K_*
+//   [16]     first fault: the page-table ENTRY the resolve read
+//   [17]     first fault: the in-chunk local index
+//   [18]     LAST fault: the page-table entry (racy store)
+//   [19]     reserved
+//   [20..31] per-kernel fault tally, indexed by PT_K_*
+//
+// [16]/[18] are what separate a FREED page (PT_EMPTY) from a DEMOTED one
+// (UNIFORM / JITTER): the first is the hysteresis free path, the second is
+// Stream's classification. "A sentinel" on its own indicts every suspect.
 //
 // THE WORLD CHUNK IS RESOLVED IN THE SHADER, at fault time, and that is the
 // point of the record existing at all: the slot is a memory ADDRESS, the
@@ -843,9 +851,9 @@ constexpr uint32_t kPtNoWord = 0xFFFFFFFFu;
 constexpr uint32_t kPageFaultWords = 32;
 constexpr uint32_t kPageFaultBytes = kPageFaultWords * 4;
 // Where the per-kernel tally starts inside the record. Mirrored in
-// common.wgsl's voxStore as the literal 16u — the one place a WGSL constant
-// for it would have to be threaded through the prelude for no other reader.
-constexpr uint32_t kPageFaultKernelBase = 16;
+// common.wgsl's voxStore as PT_FAULT_KBASE — the one place a WGSL constant for
+// it would have to be threaded through the prelude for no other reader.
+constexpr uint32_t kPageFaultKernelBase = 20;
 
 // ---- the retire headroom, and why the pool is not exactly kNumChunks -------
 //

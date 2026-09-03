@@ -813,16 +813,18 @@ int Run(Ctx& c, const Options& opt) {
                  : "?";
     };
     if (pageFaults[4] != 0) {
-      lost += Format(" | FIRST %s tick %u chunk (%d,%d,%d) word 0x%08x",
+      lost += Format(" | FIRST %s tick %u chunk (%d,%d,%d) word 0x%08x "
+                     "entry 0x%08x local %u",
                      kname(pageFaults[4]), pageFaults[10],
                      (int32_t)pageFaults[5] * 16, (int32_t)pageFaults[6] * 16,
-                     (int32_t)pageFaults[7] * 16, pageFaults[8]);
+                     (int32_t)pageFaults[7] * 16, pageFaults[8],
+                     pageFaults[16], pageFaults[17]);
     }
     if (pageFaults[11] != 0) {
-      lost += Format(" | LAST %s tick %u chunk (%d,%d,%d)",
+      lost += Format(" | LAST %s tick %u chunk (%d,%d,%d) entry 0x%08x",
                      kname(pageFaults[11]), pageFaults[15],
                      (int32_t)pageFaults[12] * 16, (int32_t)pageFaults[13] * 16,
-                     (int32_t)pageFaults[14] * 16);
+                     (int32_t)pageFaults[14] * 16, pageFaults[18]);
     }
     // The per-kernel tally is the rule-6 line: it answers "which writer" in one
     // run instead of one writer switched off per run.

@@ -5,6 +5,7 @@
 #include <cstring>
 #include <filesystem>
 #include <functional>
+#include <iterator>  // std::make_move_iterator — AbandonCommands re-queue
 
 #include "gpu/vk_spirv.h"
 #include "sim/microvox.h"  // MicroBrickGpu — Class A boundary assert
@@ -1011,7 +1012,12 @@ void Backend::FlushUploads(VkCommandBuffer cmd) {
     }
     touched.push_back(p.dst);
   }
+  // HELD, not dropped. These copies are recorded into `cmd` and will only ever
+  // execute if `cmd` is submitted; until then the writes are still owed. See
+  // AbandonCommands for the case that made this necessary.
+  heldFlush_ = std::move(pending_);
   pending_.clear();
+  heldFlushCmd_ = cmd;
   // CHARGE THE RING TO THIS COMMAND BUFFER. Everything allocated up to now has
   // had its vkCmdCopyBuffer recorded into `cmd`, so the submit of `cmd` is what
   // releases it — not the submit of whatever command buffer happens to be
@@ -1093,7 +1099,40 @@ VkFence Backend::SubmitEnded(VkCommandBuffer cmd, std::string& err) {
   return fence;
 }
 
+// The command buffer that swallowed the last flush is dead: nothing it recorded
+// will ever run, so the uploads it consumed are still owed. Put them back at the
+// FRONT of the queue (issue order is the contract — a later write to the same
+// range must still win) and drop the ring mark that would otherwise pin the
+// staging floor behind a fence that is never coming.
+void Backend::AbandonCommands(VkCommandBuffer cmd) {
+  if (cmd == VK_NULL_HANDLE) return;
+  if (heldFlushCmd_ == cmd) {
+    if (!heldFlush_.empty()) {
+      flushesRecovered_ += (uint64_t)heldFlush_.size();
+      heldFlush_.insert(heldFlush_.end(), std::make_move_iterator(pending_.begin()),
+                        std::make_move_iterator(pending_.end()));
+      pending_.swap(heldFlush_);
+    }
+    heldFlush_.clear();
+    heldFlushCmd_ = VK_NULL_HANDLE;
+    for (size_t i = 0; i < flushMarks_.size(); i++) {
+      if (flushMarks_[i].cmd != cmd) continue;
+      flushMarks_.erase(flushMarks_.begin() + i);
+      break;
+    }
+  }
+  // The buffer was begun by BeginCommands and never ended; end it so the driver
+  // is not freeing a recording buffer, then release it.
+  dfn_.EndCommandBuffer(cmd);
+  dfn_.FreeCommandBuffers(device_, cmdPool_, 1, &cmd);
+}
+
 void Backend::NoteSubmit(VkFence fence, VkCommandBuffer cmd) {
+  // Submitted: the held copies will execute, so the debt is settled.
+  if (heldFlushCmd_ == cmd) {
+    heldFlush_.clear();
+    heldFlushCmd_ = VK_NULL_HANDLE;
+  }
   uint64_t high = stagingSubmitted_;
   for (size_t i = 0; i < flushMarks_.size(); i++) {
     if (flushMarks_[i].cmd != cmd) continue;

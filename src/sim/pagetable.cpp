@@ -393,6 +393,16 @@ void PageTable::MarkTableDirty(uint32_t slot) {
 void PageTable::SetSentinel(uint32_t slot, uint32_t entry) {
   auto& t = world_->pageTableCpuMutable();
   if (t[slot] == entry) return;
+  // The OTHER producer of sentinels, and the one the free log did not cover:
+  // Stream's store-hit classification, the shift's sky demote and the demote
+  // harvest all arrive here. Keyed on the world chunk so it pairs with the
+  // fault record, which is keyed the same way.
+  if ((t[slot] & kPtSentinelBit) == 0u && getenv("SANDVOX_PT_FREELOG")) {
+    const IVec3 wc = world_->SlotToWorldChunk(slot);
+    std::printf("[pt-demote] tick %u slot %u chunk (%d,%d,%d) -> 0x%08x\n",
+                tick_, slot, wc.x * (int)kChunk, wc.y * (int)kChunk,
+                wc.z * (int)kChunk, entry);
+  }
   Free(slot);
   t[slot] = entry;
   MarkTableDirty(slot);
@@ -1627,6 +1637,23 @@ uint32_t PageTable::UploadJitterFills(const rhi::Queue& queue) {
   if (pendingJitterFills_.empty()) return 0;
   jitterUpload_.clear();
   jitterUpload_.reserve(pendingJitterFills_.size() * 2);
+  // ---- THE PAGEFILL PRECONDITION, CHECKED WHERE IT IS DECIDED (P3-E) -------
+  // `pagefill` resolves through voxWordInChunk(slot, ...), so every slot in
+  // this list must hold a PAGE at dispatch time or all 4,096 of its stores are
+  // dropped. Materialize set the page one call ago; if the entry is a sentinel
+  // HERE, the CPU table itself lost it between Materialize and now, which is a
+  // completely different bug from a GPU-ordering one. Splitting those two was
+  // worth the branch: the counter alone cannot.
+  const auto& tj = world_->pageTableCpu();
+  for (const PendingJitterFill& f : pendingJitterFills_) {
+    if ((tj[f.slot] & kPtSentinelBit) != 0u && getenv("SANDVOX_PT_FREELOG")) {
+      const IVec3 wc = world_->SlotToWorldChunk(f.slot);
+      std::printf("[pt-bad] tick %u jitterfill slot %u chunk (%d,%d,%d): table "
+                  "says sentinel 0x%08x, fill entry 0x%08x\n",
+                  tick_, f.slot, wc.x * (int)kChunk, wc.y * (int)kChunk,
+                  wc.z * (int)kChunk, tj[f.slot], f.entry);
+    }
+  }
   for (const PendingJitterFill& f : pendingJitterFills_) {
     jitterUpload_.push_back(f.slot);
     jitterUpload_.push_back(f.entry);

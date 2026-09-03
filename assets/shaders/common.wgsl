@@ -4125,6 +4125,13 @@ fn voxWordInChunkAt(chunkSlot : u32, localIdx : u32) -> u32 {
 // location instead of the STORE location named a chunk layer that had nothing
 // to do with the 58 lost voxels, which is worse than reporting nothing.
 var<private> gPtSlot : u32 = 0xFFFFFFFFu;
+// The page-table ENTRY the refused resolve read, and the in-chunk index it was
+// resolving. The entry is what tells a FREED page (PT_EMPTY) apart from a
+// DEMOTED one (UNIFORM / JITTER) - one is the hysteresis free path, the other
+// is Stream's classification, and they are different bugs with different
+// owners. Without it a fault says only "a sentinel", which is every suspect.
+var<private> gPtEntry : u32 = 0u;
+var<private> gPtLocal : u32 = 0xFFFFFFFFu;
 
 // ---- WHICH KERNEL FAULTED (P3-E) -----------------------------------------
 //
@@ -4157,15 +4164,21 @@ const PT_K_WATERBODY : u32 = 8u;
 const PT_K_WORLDGEN  : u32 = 9u;   // worldgen.wgsl `main` — the whole world
 const PT_K_GENLIST   : u32 = 10u;  // worldgen.wgsl `list` — a streamed plane
 const PT_K_PAGEFILL  : u32 = 11u;  // worldgen.wgsl `pagefill` — JITTER realize
-const PT_K_COUNT     : u32 = 16u;  // per-kernel tally bank width in pageFaults
+const PT_K_COUNT     : u32 = 12u;  // per-kernel tally bank width in pageFaults
+const PT_FAULT_KBASE : u32 = 20u;  // where that bank starts (world.h mirrors it)
 var<private> gPtKernel : u32 = PT_KERNEL;
 
 fn voxWordIndex(c : vec3<i32>) -> u32 {
   let s = vec3<u32>(c & vec3<i32>(WORLD_MASK));
   let slot = chunkIndexOf(s);
   let e = pageTable[slot];
-  if ((e & PT_SENTINEL_BIT) != 0u) { gPtSlot = slot; return PT_NO_WORD; }
   let lo = s % CHUNK;
+  if ((e & PT_SENTINEL_BIT) != 0u) {
+    gPtSlot = slot;
+    gPtEntry = e;
+    gPtLocal = (lo.z * CHUNK + lo.y) * CHUNK + lo.x;
+    return PT_NO_WORD;
+  }
   return e * CHUNK_VOL + (lo.z * CHUNK + lo.y) * CHUNK + lo.x;
 }
 
@@ -4176,7 +4189,12 @@ fn voxWordIndex(c : vec3<i32>) -> u32 {
 // chunk index in hand and want the resolve hoisted out of their inner loop.
 fn voxWordInChunk(chunkSlot : u32, localIdx : u32) -> u32 {
   let e = pageTable[chunkSlot];
-  if ((e & PT_SENTINEL_BIT) != 0u) { gPtSlot = chunkSlot; return PT_NO_WORD; }
+  if ((e & PT_SENTINEL_BIT) != 0u) {
+    gPtSlot = chunkSlot;
+    gPtEntry = e;
+    gPtLocal = localIdx;
+    return PT_NO_WORD;
+  }
   return e * CHUNK_VOL + localIdx;
 }
 
@@ -4219,7 +4237,7 @@ fn voxStore(idx : u32, w : u32) {
     // was the CA", which is one hypothesis tested per run instead of one
     // writer switched off per run.
     if (gPtKernel < PT_K_COUNT) {
-      atomicAdd(&pageFaults[16u + gPtKernel], 1u);
+      atomicAdd(&pageFaults[PT_FAULT_KBASE + gPtKernel], 1u);
     }
     let sc = vec3<i32>(i32(gPtSlot % NCHUNK),
                        i32((gPtSlot / NCHUNK) % NCHUNK),
@@ -4237,12 +4255,15 @@ fn voxStore(idx : u32, w : u32) {
       atomicStore(&pageFaults[8], w);
       atomicStore(&pageFaults[9], gPtSlot);
       atomicStore(&pageFaults[10], ptTick());
+      atomicStore(&pageFaults[16], gPtEntry);
+      atomicStore(&pageFaults[17], gPtLocal);
     }
     atomicStore(&pageFaults[11], gPtKernel + 1u);
     atomicStore(&pageFaults[12], bitcast<u32>(wc.x));
     atomicStore(&pageFaults[13], bitcast<u32>(wc.y));
     atomicStore(&pageFaults[14], bitcast<u32>(wc.z));
     atomicStore(&pageFaults[15], ptTick());
+    atomicStore(&pageFaults[18], gPtEntry);
     return;
   }
   voxels[idx] = w;
