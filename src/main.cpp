@@ -8540,6 +8540,22 @@ int main(int argc, char** argv) {
       // fix one level up (CLAUDE.md rule 6).
       PrintPageCensus(world.pages->CensusAtHighWater(), "high water");
       PrintPageCensus(world.pages->Census(), "exit");
+      // AND THE FAULT COUNT, because a residency number is only meaningful
+      // beside it. The autofly arms are the only place the streaming and free
+      // paths are exercised at length, and until now the one counter this
+      // engine treats as "0 is the only acceptable value" was invisible on
+      // exactly those runs - it is printed by --selftest and the smokes and by
+      // nothing else, so "--frames 1200 --autofly-surface, faults 0" was a
+      // claim nobody could actually read off the run. The snapshot already
+      // carries it (world.cpp's PageFaults copy); this just prints it.
+      {
+        const WorldSnapshot& fsn = world.Snap();
+        std::printf("--frames harness: page faults %u%s\n",
+                    fsn.valid ? fsn.pageFaults : 0u,
+                    (fsn.valid && fsn.pageFaults)
+                        ? "  *** SENTINEL WRITES LOST VOXELS ***"
+                        : " (0 is the only acceptable value)");
+      }
     }
     // Per-regime arms (see g_frameMsLow/High). The HIGH number is the one the
     // altitude work is judged on; the LOW one is the canopy/meadow skim.
