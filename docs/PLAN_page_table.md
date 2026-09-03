@@ -1474,6 +1474,49 @@ while holding matter. The words-probe refuses those correctly (`0x00000001`-
 class refusals in the debug trace); the cost is a wasted probe, not a wrong
 free.
 
+#### Correction — the hysteresis threshold is `>=`, and amendment 3 was the leak — [P3-E, 2026-09-03]
+
+**The condition above says "on `kPageFreeTicks` CONSECUTIVE snapshots". The
+code said `== kPageFreeTicks`, and the difference cost a third of the pool.**
+
+Amendment 3 above ("the overflow held at `kPageFreeTicks - 1` so it re-arms
+rather than sailing past the exact-`==` trigger") is the fix that became the
+bug. It is correct as far as it goes — but the re-arm it describes lived
+*inside* `if (probeSubmit_ && !candidates.empty() && !probePending_)`. The
+deferred word probe submits on tick N and harvests on N+1, so on any tick that
+map had not landed the whole block was skipped and **that tick's entire
+candidate set kept a streak of exactly 8, stepped to 9, and could never satisfy
+`== 8` again for the life of the process.**
+
+Measured (RESEARCH_streaming_hitch.md §6): 65% of candidates stranded that way,
+and the strand set is monotonic — nothing removes a member. A parked window
+plateaued at 23,104 resident pages of which **8,160 (35%) were all-air pages
+over open sky** the free path would never look at again.
+
+**The rule, restated so the implementation cannot drift from it again:
+eligibility is a STATE, not an event.** `occTotal == 0` for at least
+`kPageFreeTicks` consecutive snapshots, and it stays true until the page is
+freed. A tick the probe is busy costs a tick, not the page. Three consequences:
+
+- no re-arm is load-bearing anywhere, so no re-arm can be in the wrong scope;
+- the eligible set is bounded at COLLECTION (`kPageFreeProbesPerTick`, the rate
+  the probe can consume) so it is never a 32,768-entry vector per tick, and the
+  scan START rotates by that same amount per tick so a fixed start cannot
+  starve the tail;
+- `kPageRetireCeiling` is untouched: freeing is still capped at
+  `kPageFreeProbesPerTick` per tick, which is exactly what `kPoolPages` is
+  sized against (§3.8's derivation).
+
+**`EnsurePageForOverwrite` re-arms `zeroStreak_` too**, which `Materialize`
+already did at its own sentinel->page transition. Residency BEGINS there for
+every streaming refill, genList slot and worldgen batch, and the counter means
+"consecutive empty snapshots since residency began".
+
+**The order these two had to land in is the interesting part.** The `>=` change
+ALONE reports 21,733,376 page faults — see the Risk 1 correction below. The leak
+was holding the world together by keeping the free probe idle, so the mirror
+hole it was hiding had to be closed first.
+
 ### 3.7 The pool, the free list, fragmentation
 
 **Layout.** One `voxels` buffer, `kPoolPages × kChunkVol` u32, unchanged in
@@ -2476,6 +2519,53 @@ readback ring already carries a slot's worth of small counters, so fold
 `pageFaults` into the existing snapshot copy and log once if it is ever
 non-zero. Cheap, and it makes the detector work in ordinary play rather than
 only under test.
+
+#### Correction — neutralization 1 is about the ACCESSOR, not about the QUEUE — [P3-E, 2026-09-03]
+
+Neutralization 1 above ("there is no writable accessor that accepts a
+sentinel") is true and it is not sufficient, because it reasons about the
+kernel and the page table is written by the CPU through a DEFERRED queue. A
+write can reach an unmaterialized page with the CPU table perfectly correct, if
+the table update never gets to the GPU.
+
+**Measured, and it is the largest single voxel loss this phase has produced:
+21,733,376 dropped stores on `--gate streaming`** — `worldgen:list` 13,656,064
+and `worldgen:pagefill` 8,077,312, i.e. 3,334 and 1,972 WHOLE chunks of 4,096
+cells, every one of them refused by `entry 0xc0000001`, the JITTER(stone)
+sentinel the slot held *before* the CPU allocated its page. Two CPU-side
+preconditions added at the same time (every `genList` slot and every
+jitter-fill slot must hold a page at the moment its list is built) fired ZERO
+times, which is what localized it: the pages existed and the GPU never heard.
+
+`Backend::FlushUploads` runs from `BeginCommands`, i.e. **when a command buffer
+is CREATED, not when it is submitted**. `CreateCommandEncoder()` is therefore a
+consuming operation on the pending-upload queue, and a caller that creates an
+encoder and then decides it has nothing to record DELETES every write issued
+before it. §3.6's free-confirmation probe did exactly that: it created its
+encoder, discovered that none of its candidates still had a page, and returned
+without submitting — taking `Materialize`'s page-table flush for the whole tick
+with it. Under the `==` trigger the probe almost never ran, so the window was
+almost never open; the moment the `>=` fix let it run every tick, the two
+whole-chunk writers wrote straight through the sentinels.
+
+**Neutralization 5, added: a command buffer that will never run must not
+consume writes that are still owed.** `Backend::AbandonCommands` — an encoder
+dropped without `Finish()`, or a finished `CommandBuffer` dropped without
+`Submit()`, hands the swallowed uploads back to the FRONT of the pending queue
+(issue order is the contract) and drops the staging-ring mark that would
+otherwise pin the floor behind a fence that is never coming. The HANDLE owns
+the debt, so its destructor settles it: that is exact, where a "was the previous
+one submitted yet?" test at the next `BeginCommands` cannot tell a dead encoder
+from a live second one.
+
+**And the reporter that made this expensive.** `pageFaults` was (count, max
+word, max slot, min slot); two of those four are the SLOT, which is a memory
+address, and `selftest.cpp` decoded it through `SlotToWorldChunk` AT REPORT
+TIME with whatever origin the run ended on — fiction after any shift. The record
+now carries the WORLD CHUNK resolved inside `voxStore` at fault time, the TICK,
+the page-table ENTRY that refused, and a PER-KERNEL tally (`PT_KERNEL`, declared
+by every shader that writes voxels; omitting it is a compile error). The tally
+is what named both writers in a single run instead of one writer per run.
 
 ### Risk 2 — the one-tick-late dirty knowledge is insufficient
 

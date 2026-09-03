@@ -333,6 +333,21 @@ enum class PerfCounter : uint8_t {
   PagesHeldEmpty,    // all air, still reclaimable (hysteresis/stain/shell)
   PagesHeldOrphan,   // all air, PAST the free trigger: never reclaimable
   PagesRetired,      // parked in the retire queue, out of the free list
+  // ---- WHAT A FRAME ACTUALLY DID (P3-F, the sprint-flight tail) -----------
+  // A `--perf` frame used to be one sim tick by construction, so "ticks this
+  // frame" was a constant nobody had to record. The `surface-sprint` scenario
+  // is real-time paced like the game loop, which means a slow frame owes up to
+  // World::kMaxTicksPerFrame ticks and pays for all of them before it presents
+  // -- the feedback loop that turns an 18 ms median into a 110 ms tail. Without
+  // this counter every per-frame GPU number in that scenario is a sum over an
+  // unknown denominator, which is rule 6's bare count with extra steps.
+  TicksThisFrame,    // sim ticks run inside this frame (1 in every other scenario)
+  WindowShifts,      // Stream::ShiftAxis runs inside this frame
+  ShiftWakeWaitMs,   // deferred-wake T+K poll that was not ready: a BLOCKING wait
+  ShiftCpuMs,        // evict + fill-store + fill-gen + demote, CPU side
+  PageFillsJitter,   // slots materialized by the `pagefill` DISPATCH (JITTER)
+  PageFillBytes,     // bytes of voxel pool written by BOTH fill halves
+  CpuDirtyChunks,    // the conservative mirror's size: materialize's denominator
   // The raymarch's inside (RENDER_STATS). Order matches kPerfCounters below
   // AND the RS_* slot order in raymarch.wgsl: RmPixels is the shader's slot 0
   // (the sampled-pixel denominator, scaled back up to pixels), RmPrimarySteps
@@ -392,6 +407,18 @@ inline constexpr PerfCounterDef kPerfCounters[] = {
     {"pagesHeldEmpty", "pages: empty, reclaimable", "pageTable", false},
     {"pagesHeldOrphan", "PAGES STRANDED", "pageTable", true},
     {"pagesRetired", "pages: retire queue", "pageTable", false},
+    // ---- what a frame actually did (see the enum block) --------------------
+    {"ticksThisFrame", "sim ticks this frame", "simTick", false},
+    {"windowShifts", "window shifts this frame", "worldStorage", false},
+    // Not a bug counter -- the deferred wake is allowed to miss -- but it IS a
+    // blocking wait on the frame path, so it reads like `snapshotStalls`: the
+    // denominator that turns "stream 4 ms" into "4 ms, of which 2.3 was a poll
+    // that was not ready".
+    {"shiftWakeWaitMs", "shift wake-wait ms", "worldStorage", false},
+    {"shiftCpuMs", "shift CPU ms (evict/fill/demote)", "worldStorage", false},
+    {"pageFillsJitter", "page fills: JITTER dispatch", "pageTable", false},
+    {"pageFillBytes", "page fill bytes", "pageTable", false},
+    {"cpuDirtyChunks", "cpuDirty chunks (mirror)", "pageTable", false},
     // ---- the raymarch's INSIDE, from RENDER_STATS (raymarch.wgsl) ----------
     // Per-frame totals, already scaled up from the 1-in-16 pixel sample the
     // shader records on. A STEP is one DDA cell advance in the named trace; a
@@ -519,6 +546,24 @@ inline constexpr PerfRenderSpanDef kPerfRenderSpans[] = {
     // it has no per-draw split (an offscreen harness frame is one draw), and
     // billed to the raymarch row so an old perf.json keeps reading.
     {"render", "raymarch"},
+
+    // ---- THE TICK'S UNTABLED GPU WORK (P3-F) --------------------------------
+    // These are NOT render spans. They are the GPU commands SubmitTick records
+    // OUTSIDE pass_table.def, which the barrier generator never sees and
+    // PerfNodeForPass therefore cannot name -- the same reason a draw needs a
+    // span, arriving from the other end of the frame. They live in this table
+    // rather than in `passKeys` because check_invariants.py (correctly) demands
+    // that every name in `passKeys` be a real PASS() row.
+    //
+    // Why they had to be added at all: `pageFillCmd` is one vkCmdFillBuffer per
+    // freshly materialized page, thousands per tick under sustained flight, and
+    // it was billed to nothing -- not even to `unattributed`, because an untimed
+    // command produces no PassSample to drop. Time that is not merely
+    // unattributed but UNRECORDED is the one shape a performance page cannot
+    // report on, and the sprint tail is exactly where it lives.
+    {"pageFillCmd", "pageTable"},    // DrainFills: N x 16 KiB vkCmdFillBuffer
+    {"freeProbeCopy", "pageTable"},  // the free-confirmation probe's chunk copies
+    {"readbackCopy", "readback"},    // EncodeReadbacks + EncodeDirtyCopy
 };
 inline int PerfNodeForRenderSpan(const char* span) {
   if (!span) return -1;
@@ -535,6 +580,21 @@ inline int PerfNodeForRenderSpan(const char* span) {
     }
   }
   return -1;
+}
+
+// THE ONE ENTRY POINT for "which node does this timed name bill to".
+//
+// A PassTimer's samples are a mix of two populations that no caller can tell
+// apart from the name alone: pass_table.def rows (named by the recorder) and
+// hand-written spans (named by whoever wrote the timestamp pair). Every caller
+// used to pick one map with an `isRender` bool, which meant a new non-pass span
+// in the TICK command buffer had to be added to the bool's true branch at three
+// separate call sites or vanish into `unattributed`. Ask both, in the order
+// that cannot collide: a span name is not a PASS() row and check_invariants.py
+// enforces the converse.
+inline int PerfNodeForTimedName(const char* name) {
+  const int n = PerfNodeForPass(name);
+  return n >= 0 ? n : PerfNodeForRenderSpan(name);
 }
 
 // Which node a CPU scope bills to. Linear over ~25 rows, called once per scope

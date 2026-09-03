@@ -112,6 +112,22 @@ class PassTimer {
   void KickDeferred(GpuContext& ctx, uint32_t frame);
   int PollDeferred(GpuContext& ctx);
 
+  // One harvested command buffer: the frame tag it was kicked with and the
+  // per-pass times it carried.
+  //
+  // WHY THIS EXISTS. `Absorb` CLEARS `last_` for every buffer it folds in, so
+  // `LastFrame()` is the newest buffer only. That is exactly right when a
+  // frame submits one timed command buffer, and it silently drops three
+  // quarters of the GPU time when a frame runs four sim ticks — which is what
+  // the real game loop does under load and what the `surface-sprint` scenario
+  // reproduces. The collector form appends instead, so a caller that submits
+  // several timed buffers under ONE tag gets all of them.
+  struct PassFrame {
+    uint32_t tag = 0;
+    std::vector<PassSample> passes;
+  };
+  int PollDeferred(GpuContext& ctx, std::vector<PassFrame>* out);
+
   // The most recently harvested command buffer's per-pass times, and the frame
   // tag it was kicked with. Valid after Collect() or a PollDeferred() that
   // returned non-zero.
@@ -152,7 +168,16 @@ class PassTimer {
   // fence retires, and the next frame's CopyBufferToBuffer would be writing
   // into a mapped allocation. Hence a ring, and hence EncodeResolve advancing
   // it: the buffer being copied into is never the one still in flight.
-  static constexpr int kRing = 6;
+  // SIZED FROM THE PIPELINE, not from a literal (the same argument as
+  // World::kReadbackSlots). A slot is held from the EncodeResolve that fills it
+  // until its deferred map retires, so the ring must cover every timed command
+  // buffer that can be in flight: up to four sim ticks per frame, each
+  // resolving its own buffer, times the frames the pacer/swapchain allows in
+  // flight plus one. At 6 a paced 4-tick frame silently dropped buffers —
+  // KickDeferred returns early when the slot it would use is still mapped, and
+  // the next EncodeResolve then overwrites a slot whose numbers were never
+  // read.
+  static constexpr int kRing = 16;
   struct Slot {
     rhi::Buffer staging;
     rhi::MapTicket ticket;             // in flight when truthy
@@ -165,4 +190,6 @@ class PassTimer {
 
   std::vector<PassSample> last_;
   uint32_t lastTag_ = 0;
+  // Non-null only for the duration of the collector-form PollDeferred.
+  std::vector<PassFrame>* collector_ = nullptr;
 };

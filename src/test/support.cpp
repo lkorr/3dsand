@@ -36,7 +36,38 @@ uint32_t g_snapshotStalls = 0;
 uint32_t g_readbackDeclines = 0;
 // P2-D attribution — see SnapshotStallStats in support.h.
 SnapshotStallStats g_stallStats{};
+// P3-F: the PassTimer SubmitTick hangs its three untabled GPU spans on. NULL
+// everywhere except inside a --perf recording, so the game and the selftest
+// encode exactly the command buffer they always did.
+::PassTimer* g_tickTimer = nullptr;
+
+// One (begin, end) timestamp pair around a run of raw GPU commands, named for
+// kPerfRenderSpans. Scoped rather than paired calls for the reason ScopeTimer
+// gives: an early return past the closing write leaves a query unwritten, and
+// Absorb reads an unwritten pair as "pass disabled" and silently drops it — a
+// span that fails to zero rather than to a visible number is worse than none.
+struct TickGpuSpan {
+  const rhi::CommandEncoder& enc;
+  ::PassTimer* t = nullptr;
+  uint32_t b = 0, e = 0;
+  TickGpuSpan(const rhi::CommandEncoder& encoder, const char* name)
+      : enc(encoder) {
+    ::PassTimer* timer = g_tickTimer;
+    if (timer && timer->Valid() && timer->AllocPassPair(name, b, e)) {
+      t = timer;
+      enc.WriteTimestamp(t->NativeQuerySet(), b, false);
+    }
+  }
+  ~TickGpuSpan() {
+    if (t) enc.WriteTimestamp(t->NativeQuerySet(), e, true);
+  }
+  TickGpuSpan(const TickGpuSpan&) = delete;
+  TickGpuSpan& operator=(const TickGpuSpan&) = delete;
+};
 }
+
+void SetSubmitTickPassTimer(::PassTimer* t) { g_tickTimer = t; }
+::PassTimer* SubmitTickPassTimer() { return g_tickTimer; }
 
 // Time of day used by --shot, as a 0..1 fraction of the cycle (0 = midnight,
 // 0.5 = noon). Set by `--time`; see RunShots.
@@ -705,38 +736,54 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
                 rhi::BufferUsage::MapRead | rhi::BufferUsage::CopyDst,
                 "freeProbe");
           }
-          // ---- DECIDE FIRST, THEN CREATE THE ENCODER (P3-E) --------------
+          // ---- DECIDE FIRST, THEN CREATE THE ENCODER (P3-E + P3-F) -------
           //
-          // CreateCommandEncoder is NOT free and NOT side-effect-free: it calls
+          // Two independent reasons arrived at the same shape, and both are
+          // about the same fact: a command buffer that is created and then
+          // dropped is not free.
+          //
+          // P3-E, correctness. `CreateCommandEncoder` calls
           // Backend::BeginCommands, which drains the whole pending-upload queue
           // into that command buffer's head. This block used to create the
           // encoder up front and then `return ok` without submitting whenever
-          // every candidate had lost its page since selection — which happens
-          // constantly once the free path is allowed to run — and the writes it
+          // every candidate had lost its page since selection - which happens
+          // constantly once the free path is allowed to run - and the writes it
           // had swallowed, including PageTable::Materialize's page-table flush
-          // for the whole tick, died with it. The GPU then kept the
-          // pre-allocation JITTER sentinel and the tick's `pagefill` plus the
-          // next shift's `genChunk` each wrote 4,096 words through it:
-          // 21,733,376 lost voxels on --gate streaming, with a perfectly
-          // correct CPU-side page table the whole time.
+          // for the whole tick, died with it. The GPU kept the pre-allocation
+          // JITTER sentinel and the tick's `pagefill` plus the next shift's
+          // `genChunk` each wrote 4,096 words through it: 21,733,376 lost
+          // voxels on --gate streaming, with a perfectly correct CPU-side page
+          // table the whole time. (Backend::AbandonCommands now hands an
+          // abandoned encoder's uploads back, so this is belt to that braces.)
           //
-          // The backend now hands an abandoned encoder's uploads back
-          // (Backend::AbandonCommands), so this is no longer a correctness
-          // requirement — but deciding first is still the right shape: it costs
-          // no command buffer at all on the ticks that have nothing to copy.
-          size_t copied = 0;
+          // P3-F, liveness. A timestamp pair must be WRITTEN by a command
+          // buffer that is actually submitted: PassTimer::EncodeResolve resolves
+          // [0, used_) with VK_QUERY_RESULT_WAIT_BIT, so a pair allocated into a
+          // dropped buffer would make the tick's resolve wait forever on a query
+          // nothing ever wrote - a hung device, not a wrong number.
+          //
+          // So: build the plan, and only then open a command buffer at all.
+          std::vector<std::pair<uint64_t, size_t>> plan;
+          plan.reserve(slots.size());
           for (size_t i = 0; i < slots.size(); i++) {
-            if (pw->PageOffsetOfSlot(slots[i]) == World::kNoPage) continue;
+            const uint64_t off = pw->PageOffsetOfSlot(slots[i]);
+            if (off == World::kNoPage) continue;
+            plan.emplace_back(off, i);
             ok[i] = true;
-            copied++;
           }
+          const size_t copied = plan.size();
           if (copied == 0) return ok;
           rhi::CommandEncoder enc = pctx->device.CreateCommandEncoder();
-          for (size_t i = 0; i < slots.size(); i++) {
-            if (!ok[i]) continue;
-            enc.CopyTracked(pass::Buf::Voxels, pw->voxels,
-                            pw->PageOffsetOfSlot(slots[i]), state->staging,
-                            i * stride, stride);
+          {
+            // TIMED (P3-F). Up to kPageFreeProbesPerTick x 16 KiB of copies on
+            // their OWN command buffer and their own vkQueueSubmit, inside what
+            // the page called "page table CPU". The queries resolve with the
+            // tick's buffer, which is submitted after this one on the same
+            // queue - so the pair is closed by the time the resolve executes.
+            TickGpuSpan spanProbe(enc, "freeProbeCopy");
+            for (const auto& pr : plan)
+              enc.CopyTracked(pass::Buf::Voxels, pw->voxels, pr.first,
+                              state->staging, pr.second * stride, stride);
           }
           pctx->queue.Submit(enc.Finish());
           state->map = rhi::MapReadDeferred(pctx->device, state->staging, 0,
@@ -909,7 +956,17 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
   // RW(Voxels) then gets a derived TRANSFER->COMPUTE barrier. A fill recorded
   // after a dispatch that reads the page is exactly the hazard this ordering
   // exists to prevent.
-  pt.DrainFills(enc);
+  //
+  // TIMED (P3-F). One vkCmdFillBuffer per page materialized from an
+  // EMPTY/UNIFORM sentinel, 16 KiB each, and under sustained flight there are
+  // thousands of them in a tick. They are raw transfer commands, so the pass
+  // table never sees them, so the Performance page billed them to nothing at
+  // all — not to a node, and not even to `unattributed`, because an untimed
+  // command produces no sample to drop.
+  {
+    TickGpuSpan spanFill(enc, "pageFillCmd");
+    pt.DrainFills(enc);
+  }
   // The JITTER half of materialization, same position and same reason: a page
   // whose words vary per cell cannot be a fill pattern, so it is a dispatch.
   // Recorded BEFORE EncodeTick so the tick's first voxel read sees the filled
@@ -1031,6 +1088,10 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
       paged && (HarnessSnapshotDrain() || snapshotStale);
   bool doCopy = false;
   if (wantReadback || needSnapshotForPaging) {
+    // TIMED (P3-F): ~1.9 MiB of copies out per requested tick, recorded as raw
+    // CopyBufferToBuffer rather than as pass rows. `readback` was a CPU-only
+    // row on the Performance page; this is the GPU side of the same system.
+    TickGpuSpan spanRb(enc, "readbackCopy");
     doCopy = world.EncodeReadbacks(ctx.device, enc,
                                    {playerChunk.x - 1, playerChunk.y - 1, playerChunk.z - 1},
                                    1 - sim.Page(), tick);

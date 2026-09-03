@@ -8,6 +8,7 @@
 #include <climits>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <utility>
@@ -214,6 +215,15 @@ struct Scene {
   // from a wiggle in the active-chunk count.
   uint32_t treeVoxAtStart = 0;
 
+  // surface-sprint: ticks flown so far. The pose is an exact function of this
+  // counter (never of frame time), which is what keeps a REAL-TIME PACED
+  // scenario reproducible: the number of frames varies with the machine, the
+  // sequence of world states does not. Owned by the driver, not by Record,
+  // because warm-up ticks have to fly too — a scenario whose warm-up stands
+  // still spends its first recorded frames measuring the transient of setting
+  // off, which is not the thing under test.
+  uint32_t flightTick = 0;
+
   // Notes the setup wants on the page ("great oak, 187 voxels of trunk").
   std::string note;
 };
@@ -252,6 +262,23 @@ struct Scenario {
   // perfectly plausible frames in it, and nothing on the page would look wrong.
   // The only defence is to measure the fixture, not the frame rate.
   void (*verify)(Scene&) = nullptr;
+
+  // ---- REAL-TIME PACING (P3-F) --------------------------------------------
+  // Default false: one iteration of the record loop is one sim tick and one
+  // rendered frame, which is what every scenario before `surface-sprint`
+  // wanted. A frame that is always exactly one tick cannot reproduce the
+  // engine's own worst feedback loop, though — main.cpp runs a fixed-dt
+  // accumulator and owes up to World::kMaxTicksPerFrame ticks to a frame that
+  // ran long, so a slow frame does four ticks' worth of CA, page fills and
+  // window shifts and gets slower still. With this set, one iteration is a
+  // FRAME, `ticks` counts frames, and the ticks inside it come from a real
+  // wall-clock accumulator exactly as the game's do.
+  //
+  // The cost is that the tick count of a run is machine-dependent. It is paid
+  // rather than avoided because the alternative measures a loop the game does
+  // not have; the WORLD stays reproducible because every paced driver derives
+  // its pose from the tick counter and never from dt.
+  bool paced = false;
 };
 
 // ---------------------------------------------------------------------------
@@ -909,6 +936,106 @@ void DriveWater(Scene& s, uint32_t lt, TickOps& out) {
   out.particlesActive = lt >= 60;
 }
 
+// ---------------------------------------------------------------------------
+// SCENARIO: surface-sprint
+//
+// `--frames 600 --autofly-surface` as a recorded, attributed scenario.
+//
+// WHY IT EXISTS. `flythrough` descends diagonally at 1.5 voxels/tick and runs
+// one tick per frame; measured on this tree it is raymarch-bound at ~14 ms and
+// never produces a frame over ~25 ms. The frame-time TAIL the streaming work is
+// chasing — p95 82 ms, p99 113 ms, 11-13 frames over 100 ms — only appears
+// under the game's own sprint flight, which is SEVEN TIMES faster (10.6
+// voxels/tick, 0.67 chunks/tick, a window shift every ~1.5 ticks) and which
+// runs a real accumulator, so a long frame owes up to four ticks and pays for
+// all of them before it presents. Neither of those is a property of the
+// terrain; both are properties of the DRIVER, so the driver is what this
+// scenario copies.
+//
+// WHAT IS COPIED, AND FROM WHERE. src/main.cpp's `--autofly-surface`:
+//   * fly mode, forward held, sprint held  (main.cpp g_autofly block, ~4672)
+//   * speed = player.flySprint / kVoxelMeters, along Camera::Forward() at the
+//     camera's own defaults yaw 2.35 / pitch -0.2 (game/camera.h, player.cpp's
+//     fly branch) — a near-diagonal heading, so both horizontal axes shift.
+//   * altitude PINNED ANALYTICALLY to World::TerrainHeight + 35 or + 150
+//     voxels, alternating on `tick / 90 & 1`  (main.cpp ~4713 and ~5147).
+//     Held rather than flown for the reason main.cpp gives at length: the
+//     quantity under test is a function of height above terrain, and a climb
+//     driven by an input axis wanders with frame time.
+// The two clearance constants are restated here and compared against main.cpp
+// by scripts/check_invariants.py, because two places that must agree is
+// exactly what that script is for.
+//
+// WHAT IS NOT COPIED: main.cpp advances the position once per FRAME by the real
+// dt; this advances once per TICK by kTickDt. Same distance per unit of sim
+// time, and it makes the path a pure function of the tick counter instead of
+// the frame rate — which is the only reason a paced scenario can still be
+// compared run to run.
+constexpr float kAutoflySurfaceLowVox = 35.0f;    // main.cpp kAutoflySurfaceLowVox
+constexpr float kAutoflySurfaceHighVox = 150.0f;  // main.cpp kAutoflySurfaceHighVox
+
+bool SetupSurfaceSprint(Scene& s, std::string&) {
+  const IVec3 org = s.world.WindowOrigin();
+  const int cx = (org.x + (int)kNChunk / 2) * (int)kChunk;
+  const int cz = (org.z + (int)kNChunk / 2) * (int)kChunk;
+  // The GAME'S default look direction, not a scenario-chosen one: the heading
+  // decides how often the window shifts and on how many axes, so borrowing the
+  // camera's own defaults is the difference between reproducing --autofly-
+  // surface and reproducing something that merely resembles it.
+  s.cam.yaw = 2.35f;
+  s.cam.pitch = -0.2f;
+  s.flightTick = 0;
+  s.eye = {(float)cx,
+           (float)(World::TerrainHeight(cx, cz, kDefaultSeed) +
+                   (int)kAutoflySurfaceLowVox),
+           (float)cz};
+  char note[256];
+  std::snprintf(note, sizeof note,
+                "sprint flight over the surface at %.1f vox/tick (%.2f "
+                "chunks/tick), altitude alternating +%d / +%d voxels above "
+                "World::TerrainHeight on tick/90; REAL-TIME PACED, so a long "
+                "frame owes up to %d ticks exactly as the game's does",
+                CurrentTuning().player.flySprint / kVoxelMeters * kTickDt,
+                CurrentTuning().player.flySprint / kVoxelMeters * kTickDt /
+                    (float)kChunk,
+                (int)kAutoflySurfaceLowVox, (int)kAutoflySurfaceHighVox,
+                World::kMaxTicksPerFrame);
+  s.note = note;
+  return true;
+}
+
+void DriveSurfaceSprint(Scene& s, uint32_t, TickOps&) {
+  // Per TICK, from the tick counter, never from dt — see the header note.
+  const uint32_t t = s.flightTick++;
+  const float speed = CurrentTuning().player.flySprint / kVoxelMeters;
+  const float cp = std::cos(s.cam.pitch);
+  s.eye.x += std::cos(s.cam.yaw) * cp * speed * kTickDt;
+  s.eye.z += std::sin(s.cam.yaw) * cp * speed * kTickDt;
+  // The altitude pin. Integer terrain height, exactly as main.cpp does it, so
+  // the two harnesses fly the same line over the same heightfield.
+  const bool high = ((t / 90u) & 1u) != 0u;
+  const int gh = World::TerrainHeight((int)std::floor(s.eye.x),
+                                      (int)std::floor(s.eye.z), kDefaultSeed);
+  s.eye.y = (float)gh + (high ? kAutoflySurfaceHighVox : kAutoflySurfaceLowVox);
+}
+
+void VerifySurfaceSprint(Scene& s) {
+  // A performance chart is insensitive to the fixture, and this fixture is
+  // "did the window actually stream". A scenario that reports 600 beautiful
+  // frames having shifted twice is measuring the wrong thing entirely, and
+  // nothing else on the page would look wrong (the treeburn note says the same
+  // about a fire that never took).
+  const Stream::Timing& t = s.stream.Timings();
+  char extra[224];
+  std::snprintf(extra, sizeof extra,
+                "  |  flew %u ticks, %u window shifts (%.2f/tick), %u wake-wait "
+                "misses",
+                s.flightTick, t.shifts,
+                s.flightTick ? (double)t.shifts / (double)s.flightTick : 0.0,
+                t.wakeWaits);
+  s.note += extra;
+}
+
 const Scenario kScenarios[] = {
     {"idle", "Idle (settled)",
      "A settled world with no input. Rule 2's floor: every other scenario's "
@@ -942,6 +1069,16 @@ const Scenario kScenarios[] = {
      "lights up the MPM solver and the CA/MPM seam, and it runs on terrain "
      "rather than the lab slab so the numbers describe the game.",
      "fluidSys;waterBodies;caLoop;renderPass", 60, 600, SetupWater, DriveWater},
+
+    {"surface-sprint", "Surface sprint (the tail)",
+     "The game's own --autofly-surface: sprint flight over the terrain at 10.6 "
+     "voxels/tick with the altitude pinned analytically, REAL-TIME PACED so a "
+     "long frame owes up to four ticks and pays for all of them. This is the "
+     "only scenario that reproduces the streaming frame-time tail; flythrough "
+     "runs one tick per frame at a seventh of the speed and is raymarch-bound.",
+     "worldStorage;worldgen;pageTable;farField;caLoop;renderPass", 60, 600,
+     SetupSurfaceSprint, DriveSurfaceSprint, VerifySurfaceSprint,
+     /*paced=*/true},
 };
 constexpr int kScenarioCount = (int)(sizeof(kScenarios) / sizeof(kScenarios[0]));
 
@@ -996,6 +1133,10 @@ class PerfRunner {
     if (haveTimer_) {
       timer_.SetRowGranularity(true);
       sim_.SetPassTimer(&timer_);
+      // The SAME timer for SubmitTick's three untabled spans (support.h): they
+      // are recorded into the tick command buffer and resolved by the resolve
+      // EncodeTick already puts at its tail, so they must share its query set.
+      SetSubmitTickPassTimer(&timer_);
     }
     // The render pass is not in the pass table and gets its own query set:
     // it lives in a different command buffer from the tick, so it needs its own
@@ -1038,6 +1179,9 @@ class PerfRunner {
   // Frame -> sample index, so a GPU result arriving three frames late lands in
   // the row it belongs to instead of the present one.
   std::vector<int> frameToSample_;
+  // Scratch for the collector form of PollDeferred; a member so a 600-frame
+  // run does not allocate a vector per poll.
+  std::vector<PassTimer::PassFrame> harvest_;
 
   // Tick numbers continue ACROSS scenarios. They share one World, and a tick
   // number that went backwards would make the 3-bit stamp field gate the wrong
@@ -1155,6 +1299,61 @@ Run PerfRunner::Record(const Scenario& sc) {
   const uint64_t fills0 =
       world_.pages ? world_.pages->FillsIssued() : (uint64_t)0;
   uint64_t prevFills = fills0;
+  uint64_t prevJitterFills =
+      world_.pages ? world_.pages->JitterFillsIssued() : (uint64_t)0;
+  Stream::Timing prevStream = stream_.Timings();
+
+  // ---- the real-time pacer (sc.paced only) --------------------------------
+  // main.cpp's accumulator, verbatim in shape: fill from the real frame dt,
+  // clamp at kMaxTicksPerFrame ticks' worth so a hitch cannot make the next
+  // frame owe an unbounded backlog, then spend whole ticks. Every other
+  // scenario keeps exactly one tick per iteration.
+  //
+  // ---- AND THE VSYNC FLOOR, WHICH IS NOT OPTIONAL -------------------------
+  //
+  // MEASURED, first attempt: without it, `surface-sprint` ran 133 sim ticks
+  // over 600 frames (0.22/frame) where the game runs ~0.6. The harness renders
+  // offscreen with no swapchain, so its frame is ~4.8 ms against the windowed
+  // harness's 18.7 — and `dt` IS the frame time, so a cheap frame accrues a
+  // fifth of a tick and the world barely advances. The run measured a scenario
+  // that does not exist: 4 active chunks where `--autofly-surface` measures
+  // ~550, and no tick backlog ever.
+  //
+  // This is the same hole FramePacer above was built to plug, one step further
+  // out. FramePacer reproduces the swapchain's FRAMES-IN-FLIGHT bound because
+  // there is no swapchain; this reproduces the swapchain's PRESENT INTERVAL for
+  // the same reason. Under FIFO the game's frame cannot be shorter than the
+  // refresh period no matter how little work it has, so its accumulator fills
+  // at least one period per frame — and that, not the GPU cost, is what sets
+  // the baseline ticks/frame that everything downstream (shift rate, active
+  // chunks, materialize set) is a function of.
+  //
+  // A FLOOR, NOT A SLEEP. The harness must not actually wait: `wallMs` would
+  // then be the floor plus jitter for every frame and the percentile the
+  // scenario exists to report would be a constant. So the frame runs flat out
+  // and only the accumulator is told that a refresh period elapsed. The
+  // consequence is stated rather than hidden: `wallMs` here is the frame's WORK,
+  // and the frame's WORK is what a hitch is made of; the vsync wait a real
+  // client would also pay is `present`, which this harness already bills
+  // separately through FramePacer.
+  //
+  // The rate is a knob because it is a cost question and a cost question
+  // deserves a run rather than a rebuild (the SANDVOX_SNAP_MAXGAP argument in
+  // support.cpp). 0 disables the floor entirely, which is the arm that produced
+  // the 133-tick run above.
+  static const double kPacedFloorSec = [] {
+    double hz = 60.0;
+    if (const char* e = std::getenv("SANDVOX_PERF_VSYNC_HZ")) {
+      const double v = std::strtod(e, nullptr);
+      if (v >= 0.0 && v <= 1000.0) {
+        std::printf("[perf] SANDVOX_PERF_VSYNC_HZ=%.1f (default 60)\n", v);
+        hz = v;
+      }
+    }
+    return hz > 0.0 ? 1.0 / hz : 0.0;
+  }();
+  double accumulator = 0.0;
+  double lastFrameEnd = NowSeconds();
 
   // Tick numbering continues across scenarios — the world is shared and a tick
   // number that went backwards would make the stamp field lie.
@@ -1174,37 +1373,109 @@ Run PerfRunner::Record(const Scenario& sc) {
     PerfScopesDrain(fc.ms);
     for (int k = 0; k < kPerfScopeCount; k++) fc.ms[k] = 0;
 
-    TickOps ops;
-    {
-      ScopeTimer sc1(fc, PerfScope::GameLogic);
-      sc.drive(s, recording ? lt : 0, ops);
+    // HOW MANY TICKS THIS FRAME OWES. Unpaced: exactly one, forever, which is
+    // what every scenario but surface-sprint was written against. Paced: the
+    // game's own arithmetic, so a frame that ran 90 ms owes three ticks and the
+    // GPU work of three ticks lands inside the next one.
+    uint32_t ticksThisFrame = 1;
+    if (sc.paced) {
+      const double nowT = NowSeconds();
+      // FIFO QUANTISES, it does not merely floor — and the difference is the
+      // whole of hypothesis (b).
+      //
+      // Under VK_PRESENT_MODE_FIFO a frame is displayed on a refresh boundary,
+      // so a frame whose work is 17 ms does not take 17 ms, it takes 33.3: the
+      // client waits out the rest of the second period. The accumulator that
+      // decides how many ticks the NEXT frame owes is filled with that 33.3, so
+      // one frame that overruns the period by a millisecond buys the next one a
+      // whole extra tick — which costs more GPU, which overruns by more. That
+      // positive feedback is what turns a 21 ms GPU frame into an 82 ms one,
+      // and a FLOOR cannot express it: floored, a 17 ms frame contributes 17 ms
+      // and the loop has no gain at all. Measured with the floor: 322 ticks
+      // over 600 frames, `ticksThisFrame` never once exceeded 1, p95 23 ms
+      // against the windowed harness's 82. The loop was simply absent.
+      //
+      // So: round the elapsed time UP to the next whole refresh period, which
+      // is what the swapchain this harness does not have would have done. It
+      // stays a bookkeeping-only model — nothing sleeps, `wallMs` is still the
+      // frame's real work — because a harness that actually waited would report
+      // the refresh period as its own frame time and measure nothing.
+      const double workSec = nowT - lastFrameEnd;
+      accumulator += kPacedFloorSec > 0.0
+                         ? std::ceil(workSec / kPacedFloorSec - 1e-9) *
+                               kPacedFloorSec
+                         : workSec;
+      lastFrameEnd = nowT;
+      const double cap = (double)World::kMaxTicksPerFrame * (double)kTickDt;
+      if (accumulator > cap) accumulator = cap;
+      ticksThisFrame = 0;
+      while (accumulator >= (double)kTickDt &&
+             ticksThisFrame < (uint32_t)World::kMaxTicksPerFrame) {
+        accumulator -= (double)kTickDt;
+        ticksThisFrame++;
+      }
     }
 
-    const IVec3 playerChunk{(int)s.eye.x >> 4, (int)s.eye.y >> 4,
-                            (int)s.eye.z >> 4};
-    {
-      ScopeTimer sc2(fc, PerfScope::Stream);
-      stream_.Update(playerChunk, tick);
-      for (const ExplosionOp& e : ops.exps)
-        stream_.MarkModifiedBox({e.x - e.radius, e.y - e.radius, e.z - e.radius},
-                                {e.x + e.radius, e.y + e.radius, e.z + e.radius});
+    // THE DELTA BASELINES ARE RE-ARMED WHEN RECORDING STARTS, and skipping
+    // this put the whole warm-up into frame 0: the first sample of the first
+    // run read 37 window shifts, 37,888 chunks streamed, 4,810 page fills and
+    // 120 ms of wake-wait in ONE frame, which is not a frame, it is the
+    // warm-up wearing a frame's label. It also poisons every percentile: one
+    // sample 100x the rest is the max, and on 600 samples it is inside the
+    // p99.9.
+    if (recording && i == sc.warmTicks) {
+      if (world_.pages) {
+        prevFills = world_.pages->FillsIssued();
+        prevJitterFills = world_.pages->JitterFillsIssued();
+      }
+      prevStream = stream_.Timings();
     }
 
-    // SubmitTick BILLS ITSELF now (measure/perfscope.h), in five spans —
-    // upload / waterBody / pageTableCpu / encode / submit — which land in the
-    // process-global accumulator and are drained into `fc` at the bottom of
-    // this frame. This used to be one ScopeTimer labelled `submit`, with a
-    // comment arguing that splitting it would mean a second copy of SubmitTick
-    // and that one honest bar beat three invented ones. That was right about
-    // the copy and wrong about the conclusion: the fix is for the function to
-    // measure its own parts, not for the caller to guess or to give up. The
-    // live path made the same bundle and it is what made "submit spiked to
-    // 30 ms while idle" undiagnosable.
-    SubmitTick(ctx_, world_, sim_, tick, kDefaultSeed, ops.ops, ops.exps,
-               ops.cells, /*hashEnable=*/tick % 15 == 0, playerChunk,
-               /*wantReadback=*/true, ops.particlesActive, ops.spawns,
-               /*farCount=*/0, ops.fluidSpawns, s.fluidLive);
-    if (haveTimer_) timer_.KickDeferred(ctx_, i);
+    uint32_t opsThisFrame = 0, cellOpsThisFrame = 0, expsThisFrame = 0;
+    // The frame's first tick number, so the recorded sample can name the tick it
+    // last ran rather than the one it is about to.
+    const uint32_t frameFirstTick = tick;
+    for (uint32_t sub = 0; sub < ticksThisFrame; sub++) {
+      TickOps ops;
+      {
+        ScopeTimer sc1(fc, PerfScope::GameLogic);
+        sc.drive(s, recording ? lt : 0, ops);
+      }
+      opsThisFrame += (uint32_t)ops.ops.size();
+      cellOpsThisFrame += (uint32_t)ops.cells.size();
+      expsThisFrame += (uint32_t)ops.exps.size();
+
+      const IVec3 playerChunk{(int)s.eye.x >> 4, (int)s.eye.y >> 4,
+                              (int)s.eye.z >> 4};
+      {
+        ScopeTimer sc2(fc, PerfScope::Stream);
+        stream_.Update(playerChunk, tick);
+        for (const ExplosionOp& e : ops.exps)
+          stream_.MarkModifiedBox({e.x - e.radius, e.y - e.radius, e.z - e.radius},
+                                  {e.x + e.radius, e.y + e.radius, e.z + e.radius});
+      }
+
+      // SubmitTick BILLS ITSELF now (measure/perfscope.h), in five spans —
+      // upload / waterBody / pageTableCpu / encode / submit — which land in the
+      // process-global accumulator and are drained into `fc` at the bottom of
+      // this frame. This used to be one ScopeTimer labelled `submit`, with a
+      // comment arguing that splitting it would mean a second copy of SubmitTick
+      // and that one honest bar beat three invented ones. That was right about
+      // the copy and wrong about the conclusion: the fix is for the function to
+      // measure its own parts, not for the caller to guess or to give up. The
+      // live path made the same bundle and it is what made "submit spiked to
+      // 30 ms while idle" undiagnosable.
+      SubmitTick(ctx_, world_, sim_, tick, kDefaultSeed, ops.ops, ops.exps,
+                 ops.cells, /*hashEnable=*/tick % 15 == 0, playerChunk,
+                 /*wantReadback=*/true, ops.particlesActive, ops.spawns,
+                 /*farCount=*/0, ops.fluidSpawns, s.fluidLive);
+      // ONE KickDeferred PER TIMED COMMAND BUFFER, all tagged with the FRAME.
+      // Each SubmitTick resolves its own buffer into its own ring slot, so a
+      // 4-tick frame arms four of them; PassTimer::kRing is sized for that.
+      if (haveTimer_) timer_.KickDeferred(ctx_, i);
+
+      tick++;
+    }   // per-tick loop
 
     RenderFrame(s, fc, i);
 
@@ -1228,7 +1499,11 @@ Run PerfRunner::Record(const Scenario& sc) {
 
     if (recording) {
       PerfSample smp;
-      smp.tick = tick;
+      // The LAST tick this frame ran, not the next one it will. A paced frame
+      // runs 0..kMaxTicksPerFrame ticks, so `tick` after the loop is not a tick
+      // that happened; naming it here would put every paced sample one tick
+      // ahead of its own numbers.
+      smp.tick = tick > frameFirstTick ? tick - 1 : frameFirstTick;
       smp.frame = i;
       for (int k = 0; k < kPerfScopeCount; k++) smp.cpuMs[k] = fc.ms[k];
       // The residual: harness wall clock no scope claimed. Same row and same
@@ -1241,9 +1516,10 @@ Run PerfRunner::Record(const Scenario& sc) {
           sn.valid ? (double)sn.particleCount : 0.0;
       smp.counters[(int)PerfCounter::FluidParticles] =
           sn.valid ? (double)sn.fluidLive : 0.0;
-      smp.counters[(int)PerfCounter::Ops] = (double)ops.ops.size();
-      smp.counters[(int)PerfCounter::CellOps] = (double)ops.cells.size();
-      smp.counters[(int)PerfCounter::Explosions] = (double)ops.exps.size();
+      smp.counters[(int)PerfCounter::Ops] = (double)opsThisFrame;
+      smp.counters[(int)PerfCounter::CellOps] = (double)cellOpsThisFrame;
+      smp.counters[(int)PerfCounter::Explosions] = (double)expsThisFrame;
+      smp.counters[(int)PerfCounter::TicksThisFrame] = (double)ticksThisFrame;
       smp.counters[(int)PerfCounter::PageFaults] =
           sn.valid ? (double)sn.pageFaults : 0.0;
       smp.counters[(int)PerfCounter::VoxelsNonAir] =
@@ -1251,9 +1527,45 @@ Run PerfRunner::Record(const Scenario& sc) {
       if (world_.pages) {
         smp.counters[(int)PerfCounter::PagesResident] =
             (double)world_.pages->PagesInUse();
+        // THE TWO FILL HALVES, SEPARATELY. `pageFills` is the EMPTY/UNIFORM
+        // half: one 16 KiB vkCmdFillBuffer each, so the count IS the command
+        // count and that is the quantity hypothesis (a) is about. The JITTER
+        // half is a single dispatch over however many slots, so its count is a
+        // workgroup count and not a command count — adding them would produce a
+        // number that is neither.
         const uint64_t f = world_.pages->FillsIssued();
+        const uint64_t jf = world_.pages->JitterFillsIssued();
         smp.counters[(int)PerfCounter::PageFills] = (double)(f - prevFills);
+        smp.counters[(int)PerfCounter::PageFillsJitter] =
+            (double)(jf - prevJitterFills);
+        smp.counters[(int)PerfCounter::PageFillBytes] =
+            (double)((f - prevFills) + (jf - prevJitterFills)) *
+            (double)kChunkVol * 4.0;
         prevFills = f;
+        prevJitterFills = jf;
+        smp.counters[(int)PerfCounter::CpuDirtyChunks] =
+            (double)world_.pages->CpuDirty().Size();
+      }
+      // ---- the streaming shift, per frame -----------------------------------
+      // Diffed from Stream's own cumulative Timing rather than re-timed here,
+      // so the harness cannot disagree with the shift breakdown --frames
+      // prints. `shiftCpuMs` is the four phases of ShiftAxis; `wakeWaitMs` is
+      // the deferred wake's T+K poll BLOCKING because the readback it needs has
+      // not landed, which is the one place a shift can still stall the frame.
+      {
+        const Stream::Timing& st = stream_.Timings();
+        smp.counters[(int)PerfCounter::WindowShifts] =
+            (double)(st.shifts - prevStream.shifts);
+        smp.counters[(int)PerfCounter::ShiftWakeWaitMs] =
+            st.wakeWaitMs - prevStream.wakeWaitMs;
+        smp.counters[(int)PerfCounter::ShiftCpuMs] =
+            (st.evictMs - prevStream.evictMs) +
+            (st.fillStoreMs - prevStream.fillStoreMs) +
+            (st.fillGenMs - prevStream.fillGenMs) +
+            (st.demoteMs - prevStream.demoteMs);
+        smp.counters[(int)PerfCounter::ChunksStreamed] =
+            (double)(st.shifts - prevStream.shifts) * (double)(kNChunk * kNChunk);
+        prevStream = st;
       }
       smp.counters[(int)PerfCounter::DrawCalls] = 3;   // world, particles, fluid
       smp.wallMs = (NowSeconds() - frameT0) * 1000.0;
@@ -1262,17 +1574,18 @@ Run PerfRunner::Record(const Scenario& sc) {
     }
 
     // Harvest whatever GPU timings have landed and post them to their own rows.
-    auto post = [&](PassTimer& t, bool isRender) {
-      const uint32_t tag = t.LastFrameTag();
+    //
+    // ONE map for both populations (PerfNodeForTimedName): a sample's name is
+    // either a pass_table.def row or a hand-written span, and the caller has no
+    // business knowing which — a bool at the call site is how a new span in the
+    // tick buffer ends up silently unattributed.
+    auto postFrame = [&](uint32_t tag, const std::vector<PassSample>& passes) {
       if (tag >= frameToSample_.size()) return;
       const int si = frameToSample_[tag];
       if (si < 0) return;   // a warmup frame: its numbers are not recorded
       PerfSample& dst = r.samples[(size_t)si];
-      for (const PassSample& ps : t.LastFrame()) {
-        // Render spans go through kPerfRenderSpans — the same table the live
-        // path in main.cpp uses, so "render" bills to the same row on both.
-        int node = isRender ? PerfNodeForRenderSpan(ps.name)
-                            : PerfNodeForPass(ps.name);
+      for (const PassSample& ps : passes) {
+        const int node = PerfNodeForTimedName(ps.name);
         if (node < 0) {
           r.unattributedNs += ps.ns;
           bool seen = false;
@@ -1285,11 +1598,23 @@ Run PerfRunner::Record(const Scenario& sc) {
         dst.gpuValid = true;
       }
     };
-    if (haveTimer_ && timer_.PollDeferred(ctx_) > 0) post(timer_, false);
-    if (haveRenderTimer_ && renderTimer_.PollDeferred(ctx_) > 0)
-      post(renderTimer_, true);
-
-    tick++;
+    // THE COLLECTOR FORM, not LastFrame(). A paced frame submits up to four
+    // timed command buffers and they can all retire in one poll; LastFrame()
+    // keeps only the newest, so reading it here would have thrown away three
+    // quarters of the GPU time of exactly the frames this scenario exists to
+    // explain — and thrown it away SILENTLY, as a smaller number.
+    if (haveTimer_) {
+      harvest_.clear();
+      if (timer_.PollDeferred(ctx_, &harvest_) > 0)
+        for (const PassTimer::PassFrame& pf : harvest_)
+          postFrame(pf.tag, pf.passes);
+    }
+    if (haveRenderTimer_) {
+      harvest_.clear();
+      if (renderTimer_.PollDeferred(ctx_, &harvest_) > 0)
+        for (const PassTimer::PassFrame& pf : harvest_)
+          postFrame(pf.tag, pf.passes);
+    }
   }
 
   // Drain the last few frames of in-flight timestamps so the tail of the chart
@@ -1298,15 +1623,19 @@ Run PerfRunner::Record(const Scenario& sc) {
   ctx_.WaitIdle();
   for (int drain = 0; drain < 8; drain++) {
     ctx_.ProcessEvents();
-    if (haveTimer_ && timer_.PollDeferred(ctx_) > 0) {
-      const uint32_t tag = timer_.LastFrameTag();
-      if (tag < frameToSample_.size() && frameToSample_[tag] >= 0) {
-        PerfSample& dst = r.samples[(size_t)frameToSample_[tag]];
-        for (const PassSample& ps : timer_.LastFrame()) {
-          const int node = PerfNodeForPass(ps.name);
-          if (node < 0) { r.unattributedNs += ps.ns; continue; }
-          dst.gpuMs[node] += (double)ps.ns / 1e6;
-          dst.gpuValid = true;
+    if (haveTimer_) {
+      harvest_.clear();
+      if (timer_.PollDeferred(ctx_, &harvest_) > 0) {
+        for (const PassTimer::PassFrame& pf : harvest_) {
+          if (pf.tag >= frameToSample_.size()) continue;
+          if (frameToSample_[pf.tag] < 0) continue;
+          PerfSample& dst = r.samples[(size_t)frameToSample_[pf.tag]];
+          for (const PassSample& ps : pf.passes) {
+            const int node = PerfNodeForTimedName(ps.name);
+            if (node < 0) { r.unattributedNs += ps.ns; continue; }
+            dst.gpuMs[node] += (double)ps.ns / 1e6;
+            dst.gpuValid = true;
+          }
         }
       }
     }
@@ -1335,6 +1664,20 @@ Run PerfRunner::Record(const Scenario& sc) {
               sc.id, r.samples.size(), p50, p95, p99,
               p50 > 0 ? 1000.0 / p50 : 0.0, gpuValid, r.samples.size(),
               r.worldHash);
+  if (sc.paced) {
+    // A paced run's tick count is machine-dependent (that is the whole point),
+    // so it is REPORTED rather than assumed. Quoting a frame percentile without
+    // it invites comparing two runs that did different amounts of work.
+    double tk = 0, tkMax = 0;
+    for (const PerfSample& smp : r.samples) {
+      tk += smp.counters[(int)PerfCounter::TicksThisFrame];
+      tkMax = std::max(tkMax, smp.counters[(int)PerfCounter::TicksThisFrame]);
+    }
+    std::printf("  %-12s PACED: %.0f sim ticks over %zu frames (%.2f/frame, "
+                "max %.0f)\n",
+                "", tk, r.samples.size(),
+                r.samples.empty() ? 0.0 : tk / (double)r.samples.size(), tkMax);
+  }
   return r;
 }
 
@@ -2521,7 +2864,7 @@ bool WriteJson(const std::string& path, const std::vector<Run>& runs,
       // The node each pass bills to, resolved HERE rather than re-derived by the
       // page. perfnodes.h is the authority; a second mapping in JavaScript is
       // the drift this whole file exists to avoid.
-      const int nodeIdx = PerfNodeForPass(st.name.c_str());
+      const int nodeIdx = PerfNodeForTimedName(st.name.c_str());
       std::fprintf(f, "%s{\"name\":%s,\"node\":%s,\"usPerFrame\":%s,"
                       "\"samples\":%llu}",
                    i ? "," : "", JStr(st.name).c_str(),
@@ -2587,6 +2930,10 @@ int RunPerf(GpuContext& ctx, World& world, Simulation& sim,
   {
     auto hashAfter60 = [&](PassTimer* t) {
       sim.SetPassTimer(t);
+      // The new SubmitTick spans go through the SAME gate. They are the ones
+      // that bracket raw transfer commands rather than dispatches, so if any
+      // timestamp in this engine could perturb a result it would be these.
+      SetSubmitTickPassTimer(t);
       SubmitWorldgen(ctx, world, sim, kDefaultSeed);
       ctx.WaitIdle();
       for (uint32_t k = 1; k <= 60; k++)
@@ -2596,6 +2943,7 @@ int RunPerf(GpuContext& ctx, World& world, Simulation& sim,
       const uint32_t h = HashWorldNow(ctx, world, sim, kDefaultSeed);
       ctx.WaitIdle();
       sim.SetPassTimer(nullptr);
+      SetSubmitTickPassTimer(nullptr);
       return h;
     };
     const uint32_t hOff = hashAfter60(nullptr);
@@ -2637,6 +2985,7 @@ int RunPerf(GpuContext& ctx, World& world, Simulation& sim,
   }
 
   sim.SetPassTimer(nullptr);
+  SetSubmitTickPassTimer(nullptr);
   if (!WriteJson(opt.out, runs, opt, ctx, world, runner.HaveTimer())) return 1;
   std::printf("\nwrote %s (%zu scenario%s)\n", opt.out.c_str(), runs.size(),
               runs.size() == 1 ? "" : "s");
