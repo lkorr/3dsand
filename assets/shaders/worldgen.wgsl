@@ -40,6 +40,14 @@
 // drains at the head of the next command buffer, and the deferred writes
 // interleave (see world.cpp).
 @group(0) @binding(19) var<storage, read> pageFillList : array<u32>;
+// THE DEFERRED-WAKE SIDE CHANNEL (docs/RESEARCH_streaming_hitch.md R1).
+// One u32 per genList POSITION: 1 if this entry's chunk holds a cell that can
+// act, 0 otherwise. Written only when T.genDeferWake is set (a window shift);
+// the CPU reads it back asynchronously and puts the act set into dirtyIn
+// kWakeLatency ticks later, which is what lets the shift stop fencing.
+// Binding 30 exists ONLY in simBGL_ — `far`/`fardown` run on the slim group
+// and never reach genChunk, exactly like pageFillList at 19.
+@group(0) @binding(30) var<storage, read_write> genAct : array<u32>;
 // The BAKED TREE ATLAS (src/sim/treeatlas.h). Read-only asset data uploaded
 // once at load, like `materials` — see the tree section below for the layout
 // and for why worldgen samples a baked grid instead of evaluating tree shapes.
@@ -4026,7 +4034,11 @@ fn storeSubOcc(slot : u32, t0 : u32, t1 : u32, b0 : u32, b1 : u32) {
   occupancy[subOccIndex(slot, 1u, 1u)] = b1;
 }
 
-fn genChunk(slot : u32, li : u32) {
+// `actIdx` is the caller's position in genList — the index genAct is keyed on.
+// It is only read when T.genDeferWake is set, which only the streaming `list`
+// entry point ever sees; the dense `main` path passes its own workgroup id and
+// never defers.
+fn genChunk(slot : u32, li : u32, actIdx : u32) {
   if (li == 0u) {
     atomicStore(&wgCount, 0u);
     atomicStore(&wgBlock, 0u);
@@ -4147,7 +4159,27 @@ fn genChunk(slot : u32, li : u32) {
     // an explosion or an acting neighbour all wake the chunk through the
     // ordinary paths (markDirty reaches every bordering chunk, and mutations
     // set both flags themselves). This only declines to wake it AT BIRTH.
-    if (atomicLoad(&wgAct) > 0u) {
+    let canAct = atomicLoad(&wgAct) > 0u;
+    // ---- DEFERRED WAKE (docs/RESEARCH_streaming_hitch.md R1) -----------
+    //
+    // Waking here is only safe when the CPU page-table mirror learns the same
+    // set in the SAME tick, because PageTable::Materialize has to give the
+    // woken chunks' 26-neighbourhoods pages before the CA runs on them — and
+    // learning it in the same tick is precisely the 33 ms fence in
+    // Stream::FillSlots (a readback fence on one queue waits behind the
+    // previous frame's render and the previous ticks' CA).
+    //
+    // So a window shift asks for the verdict to be PUBLISHED rather than
+    // acted on: genAct carries it to a readback the CPU polls, and the CPU
+    // sets dirtyIn/dirtyOut itself kWakeLatency ticks later. The clear is NOT
+    // optional in that mode — the slot may carry the previous occupant's
+    // dirty flag, and leaving it set would dispatch the CA over a plane whose
+    // neighbourhood the mirror has not materialized yet.
+    if (T.genDeferWake != 0u) {
+      genAct[actIdx] = select(0u, 1u, canAct);
+      atomicStore(&dirtyIn[slot], 0u);
+      atomicStore(&dirtyOut[slot], 0u);
+    } else if (canAct) {
       atomicStore(&dirtyIn[slot], 1u);
       atomicStore(&dirtyOut[slot], 1u);
     } else {
@@ -4161,7 +4193,7 @@ fn genChunk(slot : u32, li : u32) {
 @compute @workgroup_size(64)
 fn main(@builtin(workgroup_id) wg : vec3<u32>,
         @builtin(local_invocation_index) li : u32) {
-  genChunk(wg.x, li);
+  genChunk(wg.x, li, wg.x);
 }
 
 // Streamed-in chunks: T.genCount slot indices from genList.
@@ -4169,7 +4201,7 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
 fn list(@builtin(workgroup_id) wg : vec3<u32>,
         @builtin(local_invocation_index) li : u32) {
   if (wg.x >= T.genCount) { return; }
-  genChunk(genList[wg.x], li);
+  genChunk(genList[wg.x], li, wg.x);
 }
 
 // ---- JITTER page materialization (world.h's JITTER block) ----------------

@@ -1524,7 +1524,13 @@ struct TickParams {
   // voxel, and which exists so that entrainment's writes land in chunks the
   // CPU declared before the command buffer was built.
   uint32_t windWakeCount = 0;
-  uint32_t pad_wp0 = 0, pad_wp1 = 0;
+  // Deferred streaming wake (docs/RESEARCH_streaming_hitch.md R1; was the
+  // pad_wp0 pad word, so the struct layout and the pinned hash are unchanged
+  // at the 0 default). Nonzero => worldgen's genChunk writes its act verdict
+  // to `genAct` and leaves dirtyIn/dirtyOut CLEARED for the slots it wrote,
+  // instead of waking them itself. Set only by Stream::ShiftAxis.
+  uint32_t genDeferWake = 0;
+  uint32_t pad_wp1 = 0;
   int32_t windPrimLo[3] = {1, 1, 1};   // union AABB of every live primitive,
   int32_t pad_wp2 = 0;                 // inclusive world cells (lo > hi = none)
   int32_t windPrimHi[3] = {0, 0, 0};
@@ -2639,6 +2645,19 @@ class World {
   rhi::Buffer bodyInstances;   // debris-body voxel instances (render)
   rhi::Buffer bodyXforms;      // debris-body transforms (render)
   rhi::Buffer genList;         // worldgen streaming: slot indices to generate
+  // THE DEFERRED-WAKE SIDE CHANNEL (docs/RESEARCH_streaming_hitch.md R1).
+  // One u32 per genList POSITION (not per slot): 1 if genChunk found a cell
+  // that matCanAct in that entry's chunk, 0 otherwise. It exists so the CA
+  // wake of a streamed-in plane can be decided on the GPU at tick T and
+  // ENACTED by the CPU at tick T+kWakeLatency, which is what removes the
+  // 33 ms `omap.Wait()` fence from Stream::FillSlots. Only written when
+  // TickParams::genDeferWake is set, i.e. only by a window shift — full-window
+  // worldgen and the voxregion tool still wake in-kernel at T.
+  //
+  // Sized to ONE SHIFT PLANE, because that is the only producer. A caller that
+  // defers a larger genList would run off the end, so Stream asserts the bound
+  // rather than sizing this at kNumChunks "just in case".
+  rhi::Buffer genAct;          // deferred-wake act verdict, per genList slot
   rhi::Buffer pageFillList;    // JITTER materialization: (slot, entry) pairs
 
   // ---- far-field cascades (render-only; never bound in any sim pipeline) ----

@@ -208,8 +208,8 @@
     [87, "9cdd4ea1"],
     [88, "af1f8309"],
     [90, "2db1b474"],
-    [105, "7a1b2138"],
-    [120, "001b1ba3"]
+    [105, "6d55c704"],
+    [120, "f355c16f"]
   ],
   "shadow-cache": "fail",
   "_openness_about": "The openness (sky-visibility) grid, docs/PLAN_gi.md 2. Both are FRACTIONS of full sky visibility, read straight out of the byte the pass wrote. roofedMax is the +Y face of the ground block under a 45x45 stone slab 1.4 m up; openMin is the +Y face of that slab's own top. Ranges, never equality: the five ray directions are fixed but the value is quantised to a byte and the terrain under the slab is not flat.",

@@ -139,6 +139,12 @@ enum class Buf : uint8_t {
   // per-command-buffer tracker plus the global barrier every buffer opens with
   // are what order them.
   Irradiance,
+  // ---- the deferred streaming wake's act verdict (world.h `genAct`) ----
+  // Written by worldgen:list/genChunk when TickParams::genDeferWake is set and
+  // read back by Stream. On the table because the readback copy is issued
+  // through CopyTracked and the recorder needs the compute-write -> transfer-
+  // read hazard (docs/RESEARCH_streaming_hitch.md R1).
+  GenAct,
   kCount,
 };
 

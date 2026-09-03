@@ -83,6 +83,30 @@ class Stream {
   // latency (see HarvestDemotes) — so it must be the REAL tick, not 0.
   void Update(IVec3 playerChunk, uint32_t tick);
 
+  // ---- R4: AT MOST ONE WINDOW SHIFT PER FRAME -----------------------------
+  //
+  // Update() is a per-TICK call and the frame loop runs up to four ticks on a
+  // catch-up frame (main.cpp's tick clamp), so a frame that was already slow
+  // used to pay two or three shifts and get slower — the self-sustaining loop
+  // that put 19 frames of a 540-frame surface flight over 100 ms
+  // (docs/RESEARCH_streaming_hitch.md §1).
+  //
+  // Deferring the extra shifts to the next frame is safe by exactly the
+  // argument the "one axis per call" rule already uses: kHysteresis is 2
+  // chunks, the player is 13+ chunks from the window edge, and an axis that is
+  // 2 out stays resident and correct for another 2 chunks of travel.
+  //
+  // CALLERS WITHOUT A FRAME LOOP ARE UNAFFECTED. The selftest gates and
+  // vk_smoke drive Update() directly, one call per tick, and never call this;
+  // `frameGated_` stays false and every Update may shift, which is what those
+  // harnesses already did (one Update = one tick = at most one shift anyway).
+  // Gating them would silently change every streaming gate's shift schedule.
+  //
+  // Pending-shift COMPLETION (the T+K half of the deferred wake) is NOT gated
+  // by this: it runs per tick, from Update, because its deadline is measured
+  // in ticks.
+  void BeginFrame() { frameGated_ = true; shiftedThisFrame_ = false; }
+
   // CPU-known writes (brush, explosions) mark chunks modified immediately —
   // the dirty-flag snapshot is ticks latent and eviction can't wait for it.
   // lo/hi are world VOXEL coords (inclusive box).
@@ -102,6 +126,7 @@ class Stream {
   void OnRegen() {
     DrainEvictions(/*discard=*/true);
     DiscardDemotes();
+    DiscardPendingShifts();  // the verdicts describe the REPLACED world
     store_.Clear();
     farEdits_.Clear();
     modified_.assign(kNumChunks, 0);
@@ -138,7 +163,14 @@ class Stream {
     double evictMs = 0;    // EvictSlots: RLE encode, store insert, copy encode
     double fillStoreMs = 0;// FillSlots' store-hit branch: decode + per-slot uploads
     double fillGenMs = 0;  // genList upload + EncodeGenList + submit
-    double demoteMs = 0;   // the post-genChunk occupancy map wait + candidate scan
+    double demoteMs = 0;   // the T+K completion: act set, sky demote, copy issue
+    // The T+K poll that was NOT ready (docs/RESEARCH_streaming_hitch.md R1).
+    // The deferred wake replaces a per-shift fence with a poll kWakeLatency
+    // ticks later; if the GPU is still that far behind, the poll degrades to
+    // the old Wait(). Counted and printed so "the fence came back" is visible
+    // rather than inferred from a frame-time distribution.
+    double wakeWaitMs = 0;
+    uint32_t wakeWaits = 0;
     double harvestMs = 0;  // HarvestDemotes + CompleteOldest at the top of Update
     double dirtyFoldMs = 0;// the per-tick kNumChunks fold of snapshot dirty flags
     double totalMs = 0;    // the whole of Update, so the parts can be checked
@@ -215,7 +247,14 @@ class Stream {
   // written for. This set is those slots, live for the duration of one shift.
   std::vector<uint8_t> shiftEvicted_;
   // Fill slots from store/procgen under the CURRENT window origin.
-  void FillSlots(const std::vector<uint32_t>& slots);
+  //
+  // `deferWake` selects R1's two-phase pipeline for the generated slots: the
+  // kernel publishes its act verdict to `genAct` instead of writing dirtyIn,
+  // the occupancy/genAct readback is queued WITHOUT a Wait, and a PendingShift
+  // records the work owed at tick T + kWakeLatency. Only ShiftAxis passes
+  // true. ReloadWindow passes false — it fills the WHOLE window (32,768 slots,
+  // far past genAct's one-plane size) and a load has no frame to protect.
+  void FillSlots(const std::vector<uint32_t>& slots, bool deferWake);
   // Grab a pooled staging buffer, recycling the oldest pending batch if the
   // ring is full (bounds staging memory to kMaxPendingEvicts batches).
   rhi::Buffer AcquireStaging();
@@ -261,6 +300,109 @@ class Stream {
   // same-coordinate chunk of the new world could demote on the old world's
   // bytes and lose voxels.
   void DiscardDemotes();
+
+  // ---- R1: the deferred shift wake (docs/RESEARCH_streaming_hitch.md) ------
+  //
+  // WHAT THIS REPLACED. FillSlots used to submit genChunk and then block on a
+  // readback of `occupancy` so the CPU page-table mirror could learn the act
+  // set in the SAME tick — Materialize has to give a woken chunk's
+  // 26-neighbourhood pages before the CA runs on it. MapReadDeferred borrows
+  // the fence of the LAST submit, and a fence on one queue waits for
+  // everything queued before it, so that wait sat behind the previous frame's
+  // render and the previous ticks' CA: 33.06 ms of a 34.80 ms shift, 618
+  // shifts in 540 frames.
+  //
+  // THE PIPELINE. At tick T the plane is evicted, paged, generated and
+  // rendered — and left INERT (genChunk clears dirtyIn/dirtyOut for it and
+  // writes its act verdict to `genAct` instead). The readback is queued with
+  // no wait. At tick T + kWakeLatency the ticket is polled, today's CPU logic
+  // runs on the data, and only then is the act set put into dirtyIn.
+  //
+  // The world hash moves once, because a plane now first acts at T+K instead
+  // of T. K is a CONSTANT, so "when does a plane first act" is still a pure
+  // function of (inputs, tick) and the twice-run determinism comparison is
+  // untouched. What is NOT allowed to differ is paged vs dense, which is why
+  // the deferral applies in BOTH residency modes: dense skips the page-table
+  // half of the completion and takes the same wake at the same tick.
+  struct PendingShift {
+    rhi::Buffer staging;
+    rhi::MapTicket map;
+    // genList as submitted: parallel to the genAct entries in the readback.
+    std::vector<uint32_t> genSlots;
+    // Slots dropped because a LATER shift re-generated them under a new
+    // origin (see the intersection rule in CompleteShift): the entry keeps
+    // its readback offsets intact and simply skips these.
+    std::vector<uint8_t> stale;
+    uint32_t tick = 0;   // T, the tick the plane was generated on
+  };
+  // K, AND WHAT ACTUALLY BOUNDS IT.
+  //
+  // The obvious bound is the one the research doc reaches for: K ticks of
+  // travel must stay under kHysteresis so the plane cannot scroll back out
+  // before its wake lands (0.67 chunk/tick at sprint => K < 3). That bound is
+  // real but it is NOT the one in force here, because the reversal it worries
+  // about is handled explicitly rather than made improbable:
+  // InvalidatePendingSlots blanks any pending verdict for a slot a later shift
+  // re-generates, and the later shift's own entry then covers those slots. A
+  // reversal is therefore correct at any K.
+  //
+  // What K actually costs is (a) the plane stays INERT for K ticks — 133 ms at
+  // K=4, on terrain 6+ chunks (9.6 m) from the player, where nothing is
+  // visible and nothing is reachable — and (b) ~586 sky pages per plane are
+  // held K ticks longer.
+  //
+  // K=2 was measured and was not enough. `--frames 600 --autofly-surface`:
+  // the CPU work fell exactly as designed (the shift's `demote` term went
+  // 33.06 -> 0.31 ms) but the T+K poll was still not ready on 296 of 390
+  // shifts and blocked 16.86 ms each. The engine is GPU-bound at ~21 ms and
+  // runs under one tick per frame at that rate, so two ticks is not two
+  // frames of drain — it is not even one. The fence has to cover a whole
+  // frame's render plus the GI passes plus the intervening CA submits.
+  //
+  // Blocking is the ONLY legal answer when the poll misses: deferring the
+  // completion another tick would make the tick a plane first acts on a
+  // function of fence timing, and that is the determinism rule. So K is
+  // raised until the miss is rare instead.
+  static constexpr uint32_t kWakeLatency = 4;
+  // Finish every pending shift whose T + kWakeLatency deadline has arrived.
+  // Called from Update BEFORE the shift below it, so a plane's verdict is
+  // consumed before a new shift can invalidate any of its slots.
+  void CompleteDueShifts(uint32_t tick);
+  void CompleteShift(PendingShift& ps, uint32_t tick);
+  // Mark every pending entry's copy of `slots` stale: a new shift is about to
+  // regenerate them under a different origin, so the older entry's verdict for
+  // them describes a chunk that no longer lives there. Dropping is the simple
+  // correct option — the NEW shift's own entry covers the same slots two ticks
+  // later, and every action the old entry would have taken (RefilledSlot, the
+  // PT_EMPTY demote, the demote copy) is one the new entry takes instead. It
+  // is also mandatory rather than tidy: a stale "pure sky" verdict applied to
+  // a slot that now holds fresh stone would SetSentinel(PT_EMPTY) over it.
+  void InvalidatePendingSlots(const std::vector<uint32_t>& slots);
+  // Drop every pending entry, bytes and all. Mandatory on regen / LoadWorld:
+  // the verdicts belong to the replaced world (the DiscardDemotes argument,
+  // verbatim). The planes stay inert, which is correct — ReloadWindow refills
+  // and wakes the whole window itself.
+  void DiscardPendingShifts();
+  // The CPU half of a streamed-in plane's verdict, shared by both callers:
+  // the SYNCHRONOUS fill (ReloadWindow, which reads occupancy right there) and
+  // the DEFERRED one (a shift, K ticks later). `act` is genChunk's per-genList
+  // act verdict and is empty for the synchronous path, where the kernel woke
+  // the slots itself; a non-empty `act` means this call owes the dirty writes.
+  void ApplyGenVerdict(const std::vector<uint32_t>& genSlots,
+                       const std::vector<uint8_t>& stale,
+                       const std::vector<uint32_t>& occ, bool occValid,
+                       const std::vector<uint32_t>& act, uint32_t tick);
+  std::deque<PendingShift> pendingShifts_;
+  // Staging for the deferred readbacks: occupancy (kNumChunks u32) followed by
+  // one genAct u32 per generated slot, in ONE buffer so a shift costs one
+  // submit and one map. Pooled because up to kWakeLatency + 1 are in flight.
+  std::vector<rhi::Buffer> shiftStagingPool_;
+  rhi::Buffer AcquireShiftStaging();
+  std::vector<uint32_t> genActScratch_;   // mapped-memory bounce, reused
+  std::vector<uint8_t> shiftMark_;        // InvalidatePendingSlots' membership bitmap
+  bool frameGated_ = false;      // BeginFrame has been called at least once
+  bool shiftedThisFrame_ = false;
+
   std::deque<PendingDemote> demotes_;
   std::vector<uint32_t> demoteScratch_;  // mapped-memory bounce, reused
   std::vector<uint32_t> evictScratch_;   // same, for the eviction harvest

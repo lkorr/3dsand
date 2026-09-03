@@ -184,6 +184,11 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         // The irradiance grid (world.h kIrradianceBytes, docs/PLAN_gi.md §3):
         // the openness walk decays it and deposits the off-screen sun sample.
         entry(29, T::Storage),         // irradiance (per block-face RGB9E5)
+        // The deferred streaming wake's act verdict (world.h `genAct`,
+        // docs/RESEARCH_streaming_hitch.md R1). simBGL_ only: `far`/`fardown`
+        // run on the slim group and never reach genChunk, exactly like
+        // pageFillList at 19.
+        entry(30, T::Storage),         // genAct (per genList slot)
     };
     simBGL_ = device.CreateBindGroupLayout(entries, std::size(entries));
 
@@ -460,6 +465,7 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         b(27, world_->openness),
         b(28, world_->opennessGen),
         b(29, world_->irradiance),
+        b(30, world_->genAct),
     };
     simBG_[page] = device.CreateBindGroup(simBGL_, entries, std::size(entries), "simBG");
 
@@ -1094,6 +1100,7 @@ const rhi::Buffer& Simulation::PassBuffer(pass::Buf b) const {
     case B::Openness:            return world_->openness;
     case B::OpennessGen:         return world_->opennessGen;
     case B::Irradiance:          return world_->irradiance;
+    case B::GenAct:              return world_->genAct;
     case B::WaterBodyState:      return world_->waterBodyState;
     case B::TreeAtlas:           return treeAtlasBuf_;
     default:                return world_->voxels;

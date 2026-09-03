@@ -5316,6 +5316,10 @@ int main(int argc, char** argv) {
       }
     }
     spanInput.Close();
+    // R4 (docs/RESEARCH_streaming_hitch.md): one residency shift per FRAME.
+    // Stream::Update is a per-TICK call and the clamp below runs up to four of
+    // them, so a slow frame used to shift two or three times and get slower.
+    stream.BeginFrame();
     while (accumulator >= kTickDt && ticksThisFrame < 4) {
       accumulator -= kTickDt;
       if (ui.paused && !ui.stepOnce) break;
@@ -8416,12 +8420,19 @@ int main(int argc, char** argv) {
         const Stream::Timing& st = stream.Timings();
         if (st.shifts > 0) {
           const double per = 1.0 / (double)st.shifts;
+          // `wake-wait` is the R1 poll that was NOT ready at T+kWakeLatency
+          // and had to block (docs/RESEARCH_streaming_hitch.md). Nonzero means
+          // the fence the deferral was written to remove has come back; zero
+          // is the design working. `demote` is now the T+K completion, not a
+          // fence, so it should read under a millisecond.
           std::printf("    window shift breakdown: %u shifts, %.2f ms each "
                       "| evict %.2f  fill-store %.2f  fill-gen %.2f  demote "
-                      "%.2f || per-tick: harvest %.3f  dirty-fold %.3f\n",
+                      "%.2f  wake-wait %.2f (%u) || per-tick: harvest %.3f  "
+                      "dirty-fold %.3f\n",
                       st.shifts, st.totalMs * per, st.evictMs * per,
                       st.fillStoreMs * per, st.fillGenMs * per,
-                      st.demoteMs * per, st.harvestMs / (double)n,
+                      st.demoteMs * per, st.wakeWaitMs * per, st.wakeWaits,
+                      st.harvestMs / (double)n,
                       st.dirtyFoldMs / (double)n);
         }
       }

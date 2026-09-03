@@ -227,6 +227,11 @@ void World::Init(const rhi::Device& device) {
   bodyXforms = CreateBuffer(device, (uint64_t)kMaxBodySlots * 32,
                             U::Storage | U::CopyDst, "bodyXforms");
   genList = CreateBuffer(device, kNumChunks * 4, U::Storage | U::CopyDst, "genList");
+  // The deferred-wake act verdict (world.h's genAct note). CopySrc because
+  // Stream reads it back — one small copy per window shift, never mapped in
+  // the frame path.
+  genAct = CreateBuffer(device, (uint64_t)kNChunk * kNChunk * 4,
+                        U::Storage | U::CopyDst | U::CopySrc, "genAct");
   // JITTER page materialization gets its OWN list, deliberately NOT genList.
   // Two u32 per entry (slot, sentinel entry) against genList's one, and — the
   // reason it cannot be shared — Stream::FillSlots writes genList MID-FRAME

@@ -253,6 +253,61 @@ are deduplicated across mob defs, so 128 slots cover a whole cast.
   invariant holds from tick one); anything saved mid-flight lands where it
   was, accepted. Entity state is CPU-float gameplay state outside the hashed
   domain (§7), so the grid hash round-trip is unchanged.
+- **Deferred shift wake (2026-09-03, R1 of `docs/RESEARCH_streaming_hitch.md`):**
+  a window shift no longer FENCES. Until this landed, `Stream::FillSlots`
+  submitted the plane's `worldgenList` and then blocked on a readback of
+  `occupancy`, because the CPU page-table mirror had to learn the ACT SET in
+  the same tick — `PageTable::Materialize` must give a woken chunk's
+  26-neighbourhood pages before the CA runs on it, and waking a chunk the
+  mirror has not heard of is a `voxStore` into a sentinel, silently dropped.
+  `MapReadDeferred` borrows the fence of the last submit and a fence on one
+  queue waits for everything queued before it, so that wait sat behind the
+  previous frame's render and GI passes and the previous ticks' CA: **33.06 ms
+  of a 34.80 ms shift**, 618 shifts in 540 frames of `--autofly-surface`.
+
+  The shift is now a two-phase pipeline with a FIXED tick latency
+  `Stream::kWakeLatency` (K = 4). At tick T the plane is evicted, paged,
+  generated, rendered — and left INERT: `genChunk` clears `dirtyIn`/`dirtyOut`
+  for the slots it wrote and publishes its per-chunk "can any cell act" verdict
+  to the new `genAct` side buffer (`TickParams::genDeferWake` selects this; the
+  whole-window worldgen and `--voxserve` paths still wake in-kernel). The
+  occupancy + `genAct` readback is queued with **no `Wait()`** and a
+  `PendingShift` records what is owed. At tick T+K `Stream::Update` polls the
+  ticket, runs the same CPU logic as before (act set → `RefilledSlot`, pure sky
+  → `PT_EMPTY`, full → demote copies) and only then writes the act set into
+  both dirty pages. Between T and T+K the plane is resident and drawn but
+  nothing dispatches it; a neighbour that writes into it lands on a real page
+  (every gen slot has one) and marks it dirty through the ordinary path.
+
+  **The world hash moves once**, because a streamed-in plane first acts at T+K
+  instead of T. K is a constant, so "when does a plane first act" stays a pure
+  function of (inputs, tick); the deferral applies in BOTH residency modes so
+  paged and `--residency dense` still hash identically.
+
+  Three things make it correct rather than merely faster. (1) The sky demote at
+  T+K is refused when the slot is in `cpuDirty` or the latest snapshot's dirty
+  flags — a neighbour may have dropped a grain in during those K ticks, and
+  `SetSentinel(PT_EMPTY)` over it would be voxel loss. A held page is not a
+  leak: the slot is resident and reported, so §3.6's hysteresis frees it.
+  (2) A later shift on another axis regenerates the 32 slots where the two
+  planes intersect, so `InvalidatePendingSlots` blanks those entries in every
+  older pending verdict — a stale "pure sky" applied to fresh stone is the same
+  voxel loss. (3) `cpuDirty` must be a SUPERSET of `dirtyIn`, so every slot the
+  wake writes is `RefilledSlot`-declared, `genAct` included.
+- **One shift per frame (R4, same doc):** `Stream::Update` is a per-TICK call
+  and the frame loop runs up to four ticks, so a slow frame used to shift two
+  or three times and compound its own slowness. `Stream::BeginFrame()` (called
+  once from the frame loop) caps it at one. Callers with no frame loop — the
+  selftest gates, `vk_smoke` — never call it and are ungated, which is what
+  they already did. Pending-shift COMPLETION is per tick, not per frame.
+- **Measured** (`--frames 600 --autofly-surface`, 2026-09-03, before → after):
+  shift 34.80 → 2.74 ms each (its `demote` term 33.06 → 0.23); whole frame p50
+  32.8 → 16.0, p95 95.8 → 56.4, p99 129.4 → 87.1, max 233.9 → 119.8; frames
+  over 33 ms 270 (50%) → 96 (18%), over 100 ms 19 → 2. The cost is residency:
+  the plane holds its pages K ticks longer, and the page-pool high water goes
+  22,652 (65%) → 25,831 (74%) of 34,816. K is one `constexpr` and the whole
+  trade-off curve was measured — K=2 gives back the residency but leaves the
+  fence in place on 76% of shifts.
 - **Unloaded space is treated as solid and inert** so liquids can't drain off the
   edge of the loaded world (Burkelbear's solution; adopt it verbatim).
 - Overworld draw distance beyond the window is handled by the render-only

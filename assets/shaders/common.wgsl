@@ -413,7 +413,15 @@ struct TickParams {
   // new barrier) and why a count of zero is an exact identity.
   windPrimCount : u32,
   windWakeCount : u32,   // chunk slots to dirty-mark — sim_mutate's windWake
-  padWp0 : u32,
+  // DEFERRED STREAMING WAKE (docs/RESEARCH_streaming_hitch.md R1; world.h's
+  // genDeferWake). Nonzero => worldgen's genChunk writes its per-chunk "can
+  // anything here act" verdict into `genAct` and leaves dirtyIn/dirtyOut
+  // CLEARED for the slots it generated, so the CA does not touch a freshly
+  // streamed-in plane until the CPU page-table mirror has been told about it
+  // kWakeLatency ticks later. Zero (every path but a window shift) is the
+  // in-kernel wake this replaced, byte for byte. It was the padWp0 pad word,
+  // so the struct layout is unchanged.
+  genDeferWake : u32,
   padWp1 : u32,
   windPrimLo : vec3<i32>,   // union AABB, inclusive world cells; the whole-loop
   padWp2 : i32,             // early-out. lo > hi means "no primitives".
