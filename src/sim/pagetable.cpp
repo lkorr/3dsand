@@ -1483,7 +1483,19 @@ void PageTable::RunCensus(const std::vector<uint32_t>& occupancy,
     else if (shellActive_ && shell_.Has(s)) c.rShell++;
     else if (haveStain && occStain[s] != 0u) c.rStain++;
     else if (streak < kPageFreeTicks) c.rWaiting++;
-    else if (streak == kPageFreeTicks) c.rCand++;
+    // ELIGIBLE, and under the `>=` trigger that is all `streak > threshold`
+    // means: the slot is a candidate the per-tick probe budget has not reached
+    // yet, and it stays one. Billing those to ORPHAN (which the `==` trigger's
+    // bucketing did, since past-the-threshold was then terminal) reported 3,086
+    // "leaked" pages on a flight arm that was in fact draining normally, which
+    // is a false positive on the one number this census exists to make true.
+    else if (streak < 255) c.rCand++;
+    // SATURATED: 247 consecutive empty snapshots and still not freed. The drain
+    // is kPageFreeProbesPerTick per tick against a kNumChunks window, so even
+    // the worst post-flight backlog measured here (5,189) clears in ~40 ticks.
+    // A page sitting eligible for 247 is not backlog, it is a page the free
+    // path cannot reach — which is exactly what the `==` trigger produced and
+    // what this bucket exists to catch coming back.
     else c.rOrphan++;
 
     const uint32_t sx = s % kNChunk;

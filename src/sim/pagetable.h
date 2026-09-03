@@ -138,9 +138,15 @@ void DilateN26(const SlotSet& in, SlotSet& out);
 //                lever moves it.
 //   7. waiting — all air, streak < kPageFreeTicks: inside the hysteresis, it
 //                will come back on its own.
-//   8. cand    — all air, streak == kPageFreeTicks: a candidate THIS tick.
-//   9. orphan  — all air, streak > kPageFreeTicks. THE BUG BUCKET, and it is
-//                now expected to be ~0. It was the leak: the free trigger in
+//   8. cand    — all air, streak >= kPageFreeTicks: ELIGIBLE. Under the `>=`
+//                trigger this is a state, not a one-tick window, so a slot the
+//                per-tick probe budget has not reached yet lives here and stays
+//                a candidate. Backlog, not loss.
+//   9. orphan  — all air, streak SATURATED at 255, i.e. 247 consecutive empty
+//                snapshots without being freed. THE BUG BUCKET, and it is now
+//                expected to be 0: the drain is kPageFreeProbesPerTick/tick, so
+//                even the worst measured post-flight backlog (5,189 eligible)
+//                clears in ~40 ticks. It was the leak: the free trigger in
 //                ConsumeOccupancy used to be `zeroStreak_[s] ==
 //                kPageFreeTicks`, an EQUALITY, and the only thing that kept a
 //                deferred candidate eligible was a re-arm INSIDE the probe's
