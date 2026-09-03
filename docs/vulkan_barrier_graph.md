@@ -922,12 +922,28 @@ in §4.9.
 
 #### Class A — `vkCmdUpdateBuffer`
 
-**Rule: Class A iff `size ≤ 65536` AND the payload is available at record time
-AND the size is a multiple of 4 (`vkCmdUpdateBuffer` requires 4-byte-aligned
-offset and size).** Nothing else. This is the one consistent rule; an earlier
-draft applied it inconsistently (`farList` at 16 KiB in Class A while `passUBO`
-at 13.5 KiB was in Class B) and that inconsistency is resolved here in favor of
-the size rule.
+**Rule: Class A iff `size ≤ kClassAMaxBytes` AND the payload is available at
+record time AND the size is a multiple of 4 (`vkCmdUpdateBuffer` requires
+4-byte-aligned offset and size).** Nothing else. This is the one consistent
+rule; an earlier draft applied it inconsistently (`farList` at 16 KiB in Class A
+while `passUBO` at 13.5 KiB was in Class B) and that inconsistency is resolved
+here in favor of the size rule.
+
+**`kClassAMaxBytes` is 4096, not 65536 (changed 2026-09-03).** The two numbers
+answer different questions and this section used to conflate them: 65536 is
+`vkCmdUpdateBuffer`'s LEGALITY limit (`kVkUpdateBufferLimit`, still what the two
+boundary `static_assert`s below test), while the class threshold is a POLICY
+about when capturing a payload into the command stream is the cheaper trade. At
+65536 it was not: a revisited window-shift plane refills 1,024 slots through
+`Stream::FillSlots`' store-hit branch with a 16 KiB voxel page each, so a single
+shift recorded **16 MiB of inline command-buffer data** plus 1,024 heap payload
+copies, for a command the spec describes as being for small updates. Note that
+the Class B list further down had ALREADY named "streaming's per-slot 16 KiB
+`voxels` writes" — the document was right and only the implementation
+disagreed. 4096 keeps the genuinely small writes (`tickUBO`, `renderUBO`,
+`farUBO`, the 4-byte dirty/occupancy flags, `genList`, page-table entries) on
+the inline path and sends the rest through the ring. It is still one
+size-derived rule with no exceptions.
 
 `vkCmdUpdateBuffer` **captures the data into the command buffer at record
 time**, which is why no staging allocation and no lifetime tracking are needed
@@ -967,16 +983,37 @@ a validation error at runtime. Do not instead move them to Class B "for safety"
 — a size-derived rule with two hand-made exceptions is the kind of rule that
 gets applied wrong by the next person.
 
-**Class B — persistent-mapped staging ring + `vkCmdCopyBuffer`, for > 65536 B**
-(or for any payload not available at record time).
-A ring of `HOST_VISIBLE | HOST_COHERENT` buffers, persistently mapped, sized to
-comfortably hold one frame's worth of large uploads (16 MiB is ample: the worst
-tick is `cellOps` 512 KiB + `spawnOps` 128 KiB + `bodyInstances` 4 MiB +
-`microPoolBuf_`/`mbPoolBuf_` 4 MiB each on a hot reload). The CPU memcpies into
-the ring inside `QueueWrite`, and the recorder emits a `vkCmdCopyBuffer` when
-the pending queue flushes. Ring regions are reclaimed by the fence of the submit
-that consumed them — **which is why §4.2 gives every submit a fence, not just
-the ones that carry a readback.**
+**Class B — persistent-mapped staging ring + `vkCmdCopyBuffer`, for
+> `kClassAMaxBytes`** (or for any payload not available at record time).
+A ring of `HOST_VISIBLE | HOST_COHERENT` memory, persistently mapped. The CPU
+memcpies into the ring inside `QueueWrite`, and the recorder emits a
+`vkCmdCopyBuffer` when the pending queue flushes. Ring regions are reclaimed by
+the fence of the submit that consumed them — **which is why §4.2 gives every
+submit a fence, not just the ones that carry a readback.**
+
+**Sizing is set by the worst UNSUBMITTED batch, not by the worst tick
+(corrected 2026-09-03).** Reclamation is by submit fence, so bytes queued since
+the last submit can never be reclaimed however long the allocator waits. The
+worst batch is a fully-revisited shift plane: `FillSlots`' store-hit branch
+queues up to 1,024 × 16 KiB and **submits nothing** (the gen branch is what
+submits, and a plane over already-visited terrain has no gen slots). That is
+16 MiB in one batch, which is exactly what the old ring was — i.e. it would have
+run out on the first revisit. `kStagingRingBytes` is now **64 MiB**, 4× the
+worst batch, on top of the ordinary tick traffic this paragraph used to size it
+by (`cellOps` 512 KiB + `spawnOps` 128 KiB + `bodyInstances` 4 MiB +
+`microPoolBuf_`/`mbPoolBuf_` 4 MiB each on a hot reload).
+
+**The reclamation described above was documented but NOT IMPLEMENTED until
+2026-09-03.** `InFlight::stagingHigh` was recorded at every submit and read by
+nothing; the allocator was a bump pointer whose only bound was
+`if (off + size > ring->size) off = 0`, which overwrites offset 0 whether or not
+a queued `vkCmdCopyBuffer` has read it yet. Nothing hit it because the 65536-byte
+class threshold kept almost everything out of the ring. The allocator now keeps
+ABSOLUTE (unwrapped) head/tail counters, pads rather than straddles the physical
+end, and on exhaustion **stalls** on the oldest in-flight submit, then falls back
+to Class A if the batch alone cannot fit — a stall or a slower path, never a
+silent overwrite. `Backend::StagingStalls()`/`StagingFallbacks()` count both and
+shutdown prints a line if either is non-zero.
 
 Class B covers: `cellOps` (≤512 KiB), `spawnOps` (≤128 KiB),
 `bodyInstances` (≤4 MiB), `materialBuf_` (4096 × `sizeof(MaterialGpu)`),
