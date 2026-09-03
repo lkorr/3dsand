@@ -139,14 +139,21 @@ void DilateN26(const SlotSet& in, SlotSet& out);
 //   7. waiting — all air, streak < kPageFreeTicks: inside the hysteresis, it
 //                will come back on its own.
 //   8. cand    — all air, streak == kPageFreeTicks: a candidate THIS tick.
-//   9. orphan  — all air, streak > kPageFreeTicks. THE BUG BUCKET. The free
-//                trigger in ConsumeOccupancy is `zeroStreak_[s] ==
-//                kPageFreeTicks`, an EQUALITY and not a `>=`, so any slot whose
-//                streak steps past 8 without being freed or re-armed can never
-//                be a candidate again for the life of the process. A non-zero
-//                orphan count is a permanent, monotonic residency ratchet, and
-//                it is invisible in a 600-tick harness run for the same reason
-//                a leak is invisible in a short one.
+//   9. orphan  — all air, streak > kPageFreeTicks. THE BUG BUCKET, and it is
+//                now expected to be ~0. It was the leak: the free trigger in
+//                ConsumeOccupancy used to be `zeroStreak_[s] ==
+//                kPageFreeTicks`, an EQUALITY, and the only thing that kept a
+//                deferred candidate eligible was a re-arm INSIDE the probe's
+//                submit block — so every tick the deferred map had not landed,
+//                that tick's whole candidate set stepped past 8 and could never
+//                be a candidate again for the life of the process. 65% of
+//                candidates stranded that way; a parked window plateaued at
+//                23,104 resident pages with 8,160 (35%) of them all-air pages
+//                nothing would ever look at again. The trigger is `>=` now
+//                (P3-E), so a missed tick costs a tick rather than the page.
+//                Kept as a bucket because it is the one number that would show
+//                the ratchet coming back, and it is invisible in a 600-tick run
+//                for the same reason a leak is invisible in a short one.
 //
 // The BANDS answer the other half: "about half the window is sky sentinels" is
 // the expected shape, so the question is which band broke it. Derived from
@@ -170,14 +177,20 @@ struct PageCensus {
   // ---- FREE-PATH HEALTH, this tick ----------------------------------------
   // NOT a partition: these count EVENTS, and the question they answer is
   // whether reclamation is keeping up and, if not, which gate is binding.
-  uint32_t fCands = 0;       // slots that hit the exact trigger this tick
+  uint32_t fCands = 0;       // slots ELIGIBLE this tick (streak >= the
+                             // threshold, resident, stainless, not dirty) —
+                             // counted in full even though only
+                             // kPageFreeProbesPerTick of them are submitted, so
+                             // fCands - fSubmitted is the real backlog
   uint32_t fSubmitted = 0;   // of those, copied for the word probe
-  uint32_t fCapped = 0;      // deferred by kMaxFreeProbesPerTick (streak re-armed)
-  uint32_t fProbeBusy = 0;   // STRANDED: last tick's map was not ready, so the
-                             // submit block never ran — and the re-arm loop
-                             // lives INSIDE that block, so these candidates
-                             // keep their streak of exactly 8, tick past it
-                             // next tick, and become orphans.
+  uint32_t fCapped = 0;      // eligible but over kMaxFreeProbesPerTick this
+                             // tick; still eligible next tick, no re-arm needed
+  uint32_t fProbeBusy = 0;   // last tick's map was not ready, so no probe was
+                             // submitted. This USED to be the stranding path
+                             // and the whole leak (see rOrphan); under the `>=`
+                             // trigger the slots stay eligible, so it is now
+                             // only a RATE signal — a persistently busy probe
+                             // still means reclamation is running behind.
   uint32_t fFreed = 0;           // pages actually handed to the retire queue
   uint32_t fRefusedWords = 0;    // probe read live words: not empty after all
   uint32_t fRefusedDirty = 0;    // in cpuDirty at harvest (re-armed)
@@ -350,8 +363,14 @@ class PageTable {
   // already arriving and the decision is a comparison against a per-slot
   // counter the CPU already keeps.
   //
-  //   A resident page is freed when it has reported occTotal == 0 on
+  //   A resident page is freed when it has reported occTotal == 0 on AT LEAST
   //   kPageFreeTicks CONSECUTIVE snapshots AND its slot is not in cpuDirty.
+  //
+  // "AT LEAST", not "exactly". The trigger was an exact equality until P3-E and
+  // that is what leaked a third of the pool: eligibility became a one-tick
+  // window a slot got once in its life, and any tick the deferred probe was
+  // busy pushed that tick's whole candidate set past it forever. See the
+  // rOrphan note above.
   //
   // BOTH conjuncts are needed and each blocks a different thrash. The
   // consecutive count blocks the SAMPLING thrash (a chunk that empties and

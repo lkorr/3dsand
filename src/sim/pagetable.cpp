@@ -414,6 +414,15 @@ uint64_t PageTable::EnsurePageForOverwrite(uint32_t slot) {
     return (uint64_t)t[slot] * kChunkVol * 4;
   const uint32_t p = Alloc();
   allocsOvr_++;
+  // Re-arm the hysteresis counter, for the same reason Materialize does at its
+  // own sentinel->page transition: zeroStreak_ means "consecutive empty
+  // snapshots SINCE RESIDENCY BEGAN", and residency begins HERE for every
+  // streaming refill, genList slot and worldgen batch. Without it a slot whose
+  // counter had saturated during a long sentinel life is eligible to free on
+  // the very snapshot after it is repopulated, using occupancy that predates
+  // the fill. Stream::FillSlots also calls ResetStreaks over the whole plane,
+  // which covers the shift path; this covers the ones that are not a plane.
+  if (zeroStreak_.size() == kNumChunks) zeroStreak_[slot] = 0;
   t[slot] = p;
   MarkTableDirty(slot);
   return (uint64_t)p * kChunkVol * 4;
@@ -1200,22 +1209,8 @@ void PageTable::ConsumeOccupancy(const std::vector<uint32_t>& occupancy,
   // the speed the probe can consume it and every slot is reached in bounded
   // time. Deterministic in `tick`, which matters only for reproducible debug
   // output — the page table is not hashed.
-  //
-  // ---- DIAGNOSTIC SWITCH (P3-E, temporary) --------------------------------
-  // SANDVOX_PT_FREE_GE=1 widens the EXACT-equality trigger below to `>=`, which
-  // is the orphan-leak fix under investigation, and switches on the bounded
-  // rotated scan that fix needs. It is an env switch and not an edit so that
-  // the leaky and the drained arms are the SAME BINARY: the attribution run
-  // needs the fault record from the drained arm and the baseline from the leaky
-  // one, and rebuilding between them would make the two incomparable for
-  // exactly the reason CLAUDE.md's "verify the binary you measure" note gives.
-  // With it OFF this function is bit-for-bit the shipped behaviour.
-  static const bool kFreeGe = getenv("SANDVOX_PT_FREE_GE") != nullptr;
   const uint32_t scanStart =
-      kFreeGe ? (uint32_t)((uint64_t)tick * (uint64_t)kMaxFreeProbesPerTick %
-                           kNumChunks)
-              : 0u;
-  const size_t collectCap = kFreeGe ? kMaxFreeProbesPerTick : (size_t)kNumChunks;
+      (uint32_t)((uint64_t)tick * (uint64_t)kMaxFreeProbesPerTick % kNumChunks);
   uint32_t eligible = 0;
   for (uint32_t i = 0; i < kNumChunks; i++) {
     const uint32_t s = i + scanStart >= kNumChunks ? i + scanStart - kNumChunks
@@ -1225,9 +1220,24 @@ void PageTable::ConsumeOccupancy(const std::vector<uint32_t>& occupancy,
     // The free DECISION iterates only slots whose counter just reached the
     // threshold, which in a settled world is ZERO slots after the first
     // quarter second and stays zero forever.
-    if (kFreeGe ? (zeroStreak_[s] < kPageFreeTicks)
-                : (zeroStreak_[s] != kPageFreeTicks))
-      continue;
+    // ---- `>=`, NOT `==` — THE ORPHAN LEAK (P3-E) -------------------------
+    //
+    // This was an EXACT equality, and the only thing keeping a deferred
+    // candidate eligible was a re-arm that lived INSIDE the submit block. The
+    // deferred word probe submits on tick N and harvests on N+1; on any tick
+    // where that map had not landed, `probePending_` was still true, the whole
+    // block was skipped, and every candidate that tick kept a streak of exactly
+    // 8, stepped to 9 the next tick, and could NEVER satisfy `== 8` again for
+    // the life of the process. Measured on --autofly-surface: 1,518 of 2,341
+    // candidates (65%) stranded that way, and the strand set is monotonic —
+    // nothing removes a member. A parked window plateaued at 23,104 resident
+    // pages of which 8,160 (35%) were all-air pages the free path would never
+    // look at again (RESEARCH_streaming_hitch.md §6).
+    //
+    // With `>=`, eligibility is a STATE rather than a one-tick window a slot
+    // gets once in its life, so no re-arm is load-bearing and a missed tick
+    // costs a tick, not the page.
+    if (zeroStreak_[s] < kPageFreeTicks) continue;
     if ((t[s] & kPtSentinelBit) != 0u) continue;   // already a sentinel
     // THE STAIN TEST, and it is now free (packOccStain, common.wgsl).
     //
@@ -1255,20 +1265,18 @@ void PageTable::ConsumeOccupancy(const std::vector<uint32_t>& occupancy,
     // authorize a free took the streaming gate from 217 to 240 page faults.
     // The live words keep the final say, through the deferred probe below.
     if (haveStainFlags && occStain[s] != 0) { zeroStreak_[s] = 0; continue; }
-    // THE PER-TICK CAP IS GONE, and that is the actual fix for the leak.
+    // ELIGIBLE. The per-tick probe cap applies to the SUBMISSION, not to
+    // eligibility: a slot the cap skips is still eligible next tick under the
+    // `>=` trigger above, so the cap is a rate limit and nothing else. That
+    // distinction is the leak's whole story — under `==` the cap had to be
+    // paired with a re-arm to avoid becoming permanent, and the re-arm was in
+    // the wrong scope.
     //
-    // It bounded RECLAMATION while nothing bounded ALLOCATION: measured under
-    // flight, 1,270 pages allocated per tick against 128 reclaimed, so the pool
-    // lost ~1,140 every tick until it either exhausted (pre-JITTER, a fatal
-    // abort) or degraded paged play to a p50 of 99 ms against dense's 16 ms. A
-    // reclaim path that cannot outrun its allocator is a leak with extra steps.
-    //
-    // What made the cap necessary was the COST of a probe, and the stain test
-    // above has already removed most probes before they are queued. What is
-    // left is slots that are quiet, out of cpuDirty, and stainless as of the
-    // last snapshot — in a settled world, none at all.
+    // The stain test above has already removed most probes before they are
+    // queued, so what reaches the cap is slots that are quiet, out of cpuDirty,
+    // and stainless as of the last snapshot — in a settled world, none at all.
     eligible++;
-    if (candidates.size() < collectCap) candidates.push_back(s);
+    if (candidates.size() < kMaxFreeProbesPerTick) candidates.push_back(s);
   }
 
   // ---- HARVEST last tick's deferred probe, then SUBMIT this tick's ----------
@@ -1365,13 +1373,12 @@ void PageTable::ConsumeOccupancy(const std::vector<uint32_t>& occupancy,
 
   // ---- SUBMIT phase: kick a new probe for this tick's candidates ----------
   pending_.fCands = eligible;
-  // THE STRANDING PATH, recorded because it is invisible from any other number.
-  // The re-arm loop that keeps a deferred candidate eligible
-  // (`zeroStreak_[...] = kPageFreeTicks - 1`) lives INSIDE the submit block
-  // below, so when the block is skipped because last tick's map has not landed,
-  // every candidate this tick keeps its streak of exactly kPageFreeTicks, ticks
-  // past it next tick, and can never satisfy the `== kPageFreeTicks` trigger
-  // again. It becomes a permanently resident all-air page (PageCensus::rOrphan).
+  // Candidates that found the probe busy. This USED to be the stranding path
+  // and the whole leak: the re-arm that kept a deferred candidate eligible
+  // lived inside the submit block below, so a busy tick pushed every candidate
+  // past the exact-equality trigger for good. Under `>=` it is only a RATE
+  // signal — those slots are still eligible next tick — and it is kept because
+  // a persistently busy probe still means reclamation is running behind.
   if (probeSubmit_ && !candidates.empty() && probePending_)
     pending_.fProbeBusy = (uint32_t)candidates.size();
   if (probeSubmit_ && !candidates.empty() && !probePending_) {
@@ -1386,8 +1393,14 @@ void PageTable::ConsumeOccupancy(const std::vector<uint32_t>& occupancy,
     pendingProbeOk_ = probeSubmit_(pendingProbeSlots_);
     probePending_ = true;
     probesRun = (uint32_t)n;
-    for (size_t i = n; i < candidates.size(); i++)
-      zeroStreak_[candidates[i]] = kPageFreeTicks - 1;
+    // No re-arm loop here any more, and its absence is the point. `candidates`
+    // is capped at COLLECTION, so n == candidates.size() and there is nothing
+    // to defer; more importantly, under the `>=` trigger above a slot the cap
+    // skipped is still eligible next tick on its own. The old loop existed only
+    // to nudge overflow slots back to `kPageFreeTicks - 1` so they could pass
+    // through an exact-equality trigger a second time, and it was the version
+    // of it that lived inside this `if` — skipped whenever the probe was busy —
+    // that leaked a third of the pool.
   }
   if (ptDbg && (probesRun || probesHarvested))
     std::printf("[pt-time] tick %u freeprobe: cands=%zu submitted=%u "
