@@ -291,6 +291,31 @@ Also worth taking from the plan's open list: **`treeAt` per-column hoist**
 (PLAN_surface_flight_perf item 3) — the tile set is column-invariant and
 `genChunk` is already column-major; this attacks the 9.8-20 ms tail directly.
 
+> **CORRECTION (2026-09-03).** That hoist had ALREADY LANDED when this was
+> written, in `3fdcf5c` — `TreeCands` / `treeCandsInto` / `treeFromCands` in
+> `worldgen.wgsl`. Both this paragraph and the plan's item 3 were repeating a
+> stale to-do; the plan now says so at length, with what was really left.
+>
+> The tail was attacked anyway, on branch
+> `worktree-agent-a5f7f4663644acfa6` @ `81b3769`, by hoisting four other things
+> the column or the dispatch already knew (the two authored-POI `baseHeight`
+> anchors, which `genCellIn` was re-deriving for EVERY CELL IN THE WORLD; the
+> tree scan above `treeMaxTop()`; the upper-stalk `flowerAt`; and a per-column
+> sky early-out). Measured on the `worldgen` GPU node of
+> `--perf --scenario flythrough`, two interleaved pairs: **mean per dispatch
+> -17.6% / -18.8%, max 18.4 -> 11.6 ms and 11.7 -> 7.0 ms (-37% / -40%)**, world
+> hash unmoved. Numbers and method in PLAN_surface_flight_perf item 3.
+>
+> **The instrument, since §0 above no longer has one.** R1 removed the fence, so
+> the `pre`/`occ` split in `stream.cpp` is gone and there is no per-shift
+> worldgen timing on `--autofly-surface` any more. Use
+> `--perf --scenario flythrough`: `series.gpu.worldgen` in the perf JSON is one
+> GPU-timer entry PER FRAME for the `worldgen`+`worldgenList` passes, so the
+> non-zero entries are the per-dispatch distribution directly. Do not read the
+> whole-frame p50 for this — worldgen is under 1 ms of a 17-19 ms frame and the
+> scenario is real-time-paced, so the frame histogram moves with machine state
+> by more than the whole of this kernel.
+
 ### R3. Speculative prefetch into free pages (the "no latency at all" version)
 
 The page pool breaks the constraint that makes toroidal clipmaps unable to

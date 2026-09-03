@@ -706,10 +706,83 @@ Ranked, for whoever picks this up:
    recovers only the CPU work that cannot currently overlap on a shift frame, which the
    measurements above suggest is single-digit ms. The act-set staleness argument in
    `stream.cpp` is still the blocker and is still correct.
-3. **`treeAt` per-column hoist.** The tile *set* is column-invariant, so with `genChunk`
+3. ~~**`treeAt` per-column hoist.** The tile *set* is column-invariant, so with `genChunk`
    now column-major the surviving tiles could be resolved once per column instead of per
    cell. Bounded by register pressure — the horizontal reject admits at most 3 tiles per
-   axis typically but 5 in the worst case, so a fixed cache needs an overflow path.
+   axis typically but 5 in the worst case, so a fixed cache needs an overflow path.~~
+   **LANDED IN `3fdcf5c` ("Terrain foundations: a divide-free noise, three column
+   hoists"), and this list went stale without noticing.** `TreeCands` /
+   `treeCandsInto` / `treeFromCands` in `worldgen.wgsl` are exactly the fixed cache
+   this item asks for; the "overflow path" turned out not to be needed, because the
+   NINE derivation beside `TREE_CAND_MAX` is enforced at LOAD time
+   (`treeatlas.h MaxReachForNineCandidates` refuses an atlas that could exceed it)
+   rather than at run time. Anyone re-reading this item should check the shader
+   before implementing it — `docs/RESEARCH_streaming_hitch.md` §R2 repeats the
+   recommendation and is stale for the same reason.
+
+   **What was actually left in that kernel, found by looking (2026-09-03, package
+   P2-C, branch `worktree-agent-a5f7f4663644acfa6` @ `81b3769`):** the per-cell cost
+   Correction 3 attacked was still there, in a place nobody had read for it. The
+   spawn deck and the combat arena are each anchored to `baseHeight` at ONE FIXED
+   COLUMN — a function of the seed and nothing else — and `genCellIn` evaluated both
+   of them, from scratch, for every cell it was ever asked about. `baseHeight` is
+   `landAt`: five octaves plus the biome curve. That is a flat ~60-hash tax on every
+   voxel of every chunk, sky included, sitting under Correction 3's own observation
+   that "`genCell`'s first ninety lines contain no `y`" — the split fixed the first
+   ninety lines and left two `landAt` ladders four hundred lines further down.
+
+   Four hoists landed together, all of them the same shape (something the column or
+   the dispatch already knew, re-derived per cell): the two POI anchors (`Poi`,
+   computed once per workgroup); `treeCandsInto` skipped when the chunk's LOWEST cell
+   is already above `treeMaxTop()` (`treeAt` has always made that reject per cell, and
+   the hoisted path deliberately did not because `cands.top` is tighter — right per
+   cell, wrong per column); the upper-stalk `flowerAt`, once per column instead of
+   once per cell of the `FLOWER_MAX_H` band; and a per-column SKY EARLY-OUT that
+   stores sixteen zeros when the column's ceiling is below the chunk's lowest cell.
+
+   **Measured on the `worldgen` GPU node of `--perf --scenario flythrough`**, which is
+   the per-dispatch time of the streaming worldgen kernel and is recorded per frame in
+   `series.gpu.worldgen` of the perf JSON — that is the instrument to use for this
+   kernel, and it is better than the whole-frame histogram because the flythrough is
+   real-time-paced and `worldgen` is under 1 ms of a 17-19 ms frame. **Two interleaved
+   pairs, because a single run of this scenario moves 22% with machine state** (the
+   two control arms below differ by that much and neither is wrong):
+
+   ```
+                       n   mean    p50    p90     max   total    frame p50
+    before (noisy)    84   6.358  6.068  9.222  18.378  534.1 ms   19.19
+    after  (noisy)    85   5.239  4.910  8.586  11.562  445.3 ms   19.23
+    before (quiet)    85   5.222  5.106  7.249  11.748  443.9 ms   16.61
+    after  (quiet)    85   4.238  4.299  6.195   7.026  360.2 ms   16.59
+   ```
+
+   **Mean per dispatch -17.6% and -18.8% in the two pairs; the MAX -37% and -40%.**
+   The max is the number this was aimed at: `RESEARCH_streaming_hitch.md` §0 records
+   a 20.7 ms worst plane against a 2.6 ms median, and that ratio is what makes a
+   shift visible. Total worldgen GPU over a 600-frame flythrough falls ~85-90 ms.
+
+   Hash-neutral by construction and by measurement: the flythrough's own
+   `worldHash baf91202`, `--gate determinism` (`b9e443c7` on this integration
+   branch — see the note in `tests/BASELINE.md` about the pinned value) and
+   `--gate streaming`'s entire result line ("227 shifts, evicted=1, 76 glass voxels
+   after re-entry, crossed=1, store 2527 chunks") are byte-identical on both arms.
+
+   **The cost, stated because `--shader-stats` is the gate the brief asked for:**
+   `worldgen`/`worldgenList` now SPILL +16/+32 bytes to local memory where they did
+   not before. Register count was already pinned at the driver's 128 ceiling on both
+   arms and the binary grew 708,224 -> 723,584 bytes. Deleting the one companion
+   `bool` the hoists added did not move the spill at all, so it is the hoisted state
+   itself and not an accident of spelling. It is worth having at a measured -18%.
+
+   **What was deliberately NOT done, and why, for whoever picks this up next.** The
+   p90 moved least (-7% / -14.5%), and the p90 is forest. A forest surface column
+   runs TWO independent 25-tile scans over the same +-2 tiles: `treeCandsInto` and
+   `undergrowthSite`, each paying a `landAt` at every surviving trunk site. Merging
+   them is the obvious next lever and it is not free — they need DIFFERENT sets
+   (`treeCandsInto` drops any tile whose baked column holds no runs; `undergrowthSite`
+   needs every present tree inside its crown radius, plus `crownR`/`shade`/`rnd`,
+   which `TreeCand` deliberately does not carry), so a shared cache is wider than
+   either, against a kernel that is already at 128 registers and already spilling.
 
 **Housekeeping owed:** `check_invariants.py` should assert that `TREE_MAX_TRUNK_DM` /
 `TREE_MAX_RAD_DM` / `TREE_BIRCH_RAD_DM` / `TREE_MAX_ABOVE` in `worldgen.wgsl` still
