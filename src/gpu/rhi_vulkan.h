@@ -188,6 +188,19 @@ struct Buffer {
   uint64_t size = 0;
   // Non-null for host-visible allocations (staging ring, readback slots).
   void* mapped = nullptr;
+  // The memory type's property flags, as chosen by VMA. Recorded because the
+  // ONE thing a reader of a mapped pointer needs to know is not derivable from
+  // the pointer: whether the host cache has to be invalidated before the CPU
+  // can see what the device wrote. Also what makes the HOST_CACHED question
+  // answerable without a debugger: CreateBuffer prints the readback type's
+  // flags once, on stderr, at startup.
+  VkMemoryPropertyFlags memProps = 0;
+  // Host-visible but NOT HOST_COHERENT: every CPU read of device-written bytes
+  // must be preceded by vkInvalidateMappedMemoryRanges. False on every desktop
+  // GPU seen so far (they all expose HOST_VISIBLE|HOST_COHERENT|HOST_CACHED),
+  // but "prefer cached" is a PREFERENCE — a device that only has an uncoherent
+  // cached type would silently read stale bytes without this.
+  bool needsInvalidate = false;
   std::string label;
 };
 
@@ -391,6 +404,23 @@ class Backend {
   // (§4.3 step 5), which is a genuine block exactly as `WaitAny` blocks today.
   bool WaitFence(VkFence f, std::string& err);
 
+  // Make a range of a readback buffer's mapped memory readable by the CPU.
+  // A no-op (and free) on HOST_COHERENT memory, which is every allocation this
+  // engine has actually been given; the call exists so that "prefer cached"
+  // cannot turn into "read stale bytes" on a device where the cached type is
+  // not also coherent. Every path that hands a mapped pointer to a reader —
+  // MapReadDeferred's Data(), MapReadAsync's callback, ReadBufferBlocking —
+  // goes through here.
+  void InvalidateForRead(Buffer* b, uint64_t offset, uint64_t size);
+
+  // Staging-ring diagnostics: how many times QueueWrite had to BLOCK on a
+  // fence to get ring space, and how many Class B writes fell back to Class A
+  // because the ring could not be reclaimed at all. Both should be 0; a
+  // non-zero fallback count means the ring is undersized for one unsubmitted
+  // batch (see kStagingRingBytes).
+  uint64_t StagingStalls() const { return stagingStalls_; }
+  uint64_t StagingFallbacks() const { return stagingFallbacks_; }
+
   // ---- images + graphics pipelines (phase 4b) ----
   //
   // CreateImage allocates a device-local VkImage + view. No zero-init queue
@@ -473,8 +503,16 @@ class Backend {
   struct InFlight {
     VkFence fence = VK_NULL_HANDLE;
     VkCommandBuffer cmd = VK_NULL_HANDLE;
-    uint64_t stagingHigh = 0;  // ring high-water at submit; reclaimed on retire
-    uint64_t serial = 0;       // submit order, for the buffer graveyard
+    // The ABSOLUTE (never wrapped) staging-ring span this submit's copies read
+    // from: [stagingLow, stagingHigh). Reclaimed when the fence signals. These
+    // used to be a single `stagingHigh` that NOTHING EVER READ — the ring was a
+    // bump allocator that wrapped unconditionally, so a burst larger than the
+    // ring silently overwrote bytes a queued vkCmdCopyBuffer had not read yet.
+    // Nothing hit it because the class rule kept almost everything out of the
+    // ring; routing 16 KiB page writes through it makes the burst 16 MiB.
+    uint64_t stagingLow = 0;
+    uint64_t stagingHigh = 0;
+    uint64_t serial = 0;  // submit order, for the buffer graveyard
   };
 
   // A buffer whose seam handle was released while submits that might reference
@@ -498,6 +536,24 @@ class Backend {
   bool CreateLogicalDevice(std::string& err);
   bool InitAllocator(std::string& err);
   VkFence AcquireFence(std::string& err);
+
+  // ---- the Class B staging ring (barrier_graph §4.1) ---------------------
+  //
+  // Reserve `size` bytes and return the PHYSICAL byte offset into the ring, or
+  // kStagingNoRoom if the request cannot be satisfied without overwriting bytes
+  // a submitted-or-still-pending copy has yet to read. The failure mode is a
+  // stall (wait on the oldest submit) and then a Class A fallback — never a
+  // silent overwrite.
+  static constexpr uint64_t kStagingNoRoom = UINT64_MAX;
+  uint64_t StagingAlloc(uint64_t size);
+  // Push an InFlight entry for a just-submitted command buffer, charging it the
+  // staging span its flush consumed. The ONE place inFlight_ grows, so the two
+  // vkQueueSubmit call sites cannot disagree about ring accounting.
+  void NoteSubmit(VkFence fence, VkCommandBuffer cmd);
+  // Advance the reclaim floor to the low end of the oldest submit still in
+  // flight. Side-effect free (no command buffers freed, no fences recycled), so
+  // it is safe to call from QueueWrite with an encoder open.
+  void ReclaimStaging();
 
   bool swapchainRequested_ = false;  // Init(wantSwapchain): enable VK_KHR_swapchain
 
@@ -546,7 +602,26 @@ class Backend {
   // Pending uploads, in ISSUE ORDER. Never sorted, never coalesced.
   std::vector<Pending> pending_;
   Buffer* stagingRing_ = nullptr;
-  uint64_t stagingHead_ = 0;
+  // ABSOLUTE byte counters into a conceptually infinite ring; the physical
+  // offset is `% stagingRing_->size`. Absolute rather than wrapped because
+  // "does this allocation collide with something still in flight" is a
+  // comparison the wrapped form cannot express (the old code just wrapped to 0
+  // and hoped).
+  uint64_t stagingHead_ = 0;       // next free
+  uint64_t stagingTail_ = 0;       // reclaim floor: everything below has retired
+  uint64_t stagingSubmitted_ = 0;  // high covered by the most recent submit
+  // The ring high each OPEN command buffer's flush consumed, consumed in turn
+  // by the submit of that command buffer. Keyed by command buffer rather than
+  // kept as one scalar because a flush and its submit are separated by the
+  // caller's whole recording, during which more QueueWrites can arrive whose
+  // copies belong to a LATER command buffer.
+  struct FlushMark {
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    uint64_t high = 0;
+  };
+  std::vector<FlushMark> flushMarks_;
+  uint64_t stagingStalls_ = 0;
+  uint64_t stagingFallbacks_ = 0;
 
   std::vector<InFlight> inFlight_;
   uint64_t submitSerial_ = 0;
@@ -588,12 +663,35 @@ class Backend {
       const VkDebugUtilsMessengerCallbackDataEXT*, void*);
 };
 
-// Class A is the vkCmdUpdateBuffer path and its limit is 65536 bytes. Two
-// engine buffers sit EXACTLY on that boundary — kMaxDebugBoxes * sizeof(DebugBox)
-// and kMaterialSlots * sizeof(MicroBrickGpu) are both 65536 — so each is one
-// constant bump away from silently becoming an illegal update. The
-// static_asserts live in rhi_vulkan.cpp next to the classification rule, so a
-// bump fails the BUILD rather than producing a validation error at runtime.
-inline constexpr uint64_t kClassAMaxBytes = 65536;
+// Vulkan's HARD cap on one vkCmdUpdateBuffer. Two engine buffers sit EXACTLY on
+// it — kMaxDebugBoxes * sizeof(DebugBox) and kMaterialSlots *
+// sizeof(MicroBrickGpu) are both 65536 — so each is one constant bump away from
+// becoming an illegal update. The static_asserts live in rhi_vulkan.cpp next to
+// the classification rule, so a bump fails the BUILD rather than producing a
+// validation error at runtime.
+inline constexpr uint64_t kVkUpdateBufferLimit = 65536;
+
+// THE CLASS A POLICY THRESHOLD, which is a different question from the legality
+// limit above and used to be conflated with it.
+//
+// vkCmdUpdateBuffer captures its payload INTO THE COMMAND BUFFER at record
+// time. That is the right trade for a UBO or a dirty flag and the wrong one for
+// a 16 KiB voxel page: a revisited window-shift plane refills 1,024 slots
+// (Stream::FillSlots' store-hit branch) and at the old 65536-byte threshold
+// every one of those pages was a heap-allocated payload copy plus 16 KiB
+// memcpied into the command stream — 16 MiB of inline command-buffer data per
+// shift, for a command the spec describes as being for small updates.
+// docs/vulkan_barrier_graph.md §4.1 already LISTED "streaming's per-slot 16 KiB
+// voxels writes" under Class B; only the implementation disagreed.
+//
+// 4096 keeps the genuinely small writes (tickUBO, renderUBO, farUBO, the 4-byte
+// dirty/occupancy flags, genList, the page-table entries) on the cheap inline
+// path and sends everything above it through the staging ring. It is still ONE
+// size-derived rule with no exceptions, which is the property the barrier
+// document cares about.
+inline constexpr uint64_t kClassAMaxBytes = 4096;
+static_assert(kClassAMaxBytes <= kVkUpdateBufferLimit,
+              "the Class A policy threshold cannot exceed vkCmdUpdateBuffer's "
+              "own limit");
 
 }  // namespace vk

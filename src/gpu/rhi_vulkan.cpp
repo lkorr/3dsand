@@ -1,6 +1,7 @@
 #include "gpu/rhi_vulkan.h"
 
 #include <cstdio>
+#include <cstdlib>  // std::abort — the staging ring's unserviceable-write path
 #include <cstring>
 #include <filesystem>
 #include <functional>
@@ -23,21 +24,32 @@ namespace vk {
 // "for safety": a size-derived rule with two hand-made exceptions is a rule the
 // next person applies wrong.
 // ---------------------------------------------------------------------------
-static_assert((uint64_t)kMaxDebugBoxes * sizeof(DebugBox) <= kClassAMaxBytes,
+static_assert((uint64_t)kMaxDebugBoxes * sizeof(DebugBox) <= kVkUpdateBufferLimit,
               "debugBoxes exceeded vkCmdUpdateBuffer's 65536-byte limit: it was "
               "EXACTLY at it. Either lower kMaxDebugBoxes or move debugBoxes to "
               "the Class B staging path (barrier_graph 4.1).");
-static_assert((uint64_t)kMaterialSlots * sizeof(MicroBrickGpu) <= kClassAMaxBytes,
+static_assert((uint64_t)kMaterialSlots * sizeof(MicroBrickGpu) <= kVkUpdateBufferLimit,
               "microTableBuf_ exceeded vkCmdUpdateBuffer's 65536-byte limit: it "
               "was EXACTLY at it. Either lower kMaterialSlots or move it to the "
               "Class B staging path (barrier_graph 4.1).");
 
 namespace {
 
-// Big enough for the worst tick the barrier doc enumerates (cellOps 512 KiB +
-// spawnOps 128 KiB + bodyInstances 4 MiB, plus 4 MiB pool buffers on a hot
-// reload). 16 MiB is ample and costs nothing that is not touched.
-constexpr uint64_t kStagingRingBytes = 16ull * 1024 * 1024;
+// Sized for the worst UNSUBMITTED batch, which is the only quantity that
+// matters: ring space is reclaimed by the fence of the submit that consumed it,
+// so bytes queued since the last submit can never be reclaimed no matter how
+// long the allocator waits.
+//
+// The worst batch is a fully-revisited window-shift plane: Stream::FillSlots'
+// store-hit branch refills up to 1,024 slots with a 16 KiB voxel page each and
+// SUBMITS NOTHING (the gen branch is what submits, and a plane over already
+// visited terrain has no gen slots), so 16 MiB of Class B payload accumulates
+// before anything can retire. The old 16 MiB ring was exactly that figure, plus
+// the ordinary tick traffic the doc enumerates (cellOps 512 KiB, spawnOps
+// 128 KiB, bodyInstances 4 MiB, two 4 MiB pool buffers on a hot reload) — i.e.
+// it would have run out on the first revisit. 64 MiB is 4x the worst batch and
+// costs 64 MiB of host RAM that is only touched when written.
+constexpr uint64_t kStagingRingBytes = 64ull * 1024 * 1024;
 
 // Class B copies must respect the alignment vkCmdCopyBuffer wants; 16 is
 // generous and keeps every payload naturally aligned.
@@ -676,19 +688,43 @@ Buffer* Backend::CreateBuffer(uint64_t size, rhi::BufferUsage usage, const char*
   bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 
   VmaAllocationCreateInfo aci{};
+  const bool mapRead = rhi::Any(usage, rhi::BufferUsage::MapRead);
   const bool hostVisible =
       rhi::Any(usage, rhi::BufferUsage::MapRead | rhi::BufferUsage::MapWrite);
   if (hostVisible) {
-    // Persistently mapped and coherent: the readback slots and the staging ring
-    // both want a pointer that stays valid, and coherent memory needs no
-    // explicit flush before a submit reads it.
+    // Persistently mapped: the readback slots and the staging ring both want a
+    // pointer that stays valid.
     aci.usage = VMA_MEMORY_USAGE_AUTO;
     aci.flags = VMA_ALLOCATION_CREATE_MAPPED_BIT;
-    aci.flags |= rhi::Any(usage, rhi::BufferUsage::MapRead)
-                     ? VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT
-                     : VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT;
-    aci.requiredFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                        VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    if (mapRead) {
+      // READBACK. The CPU READS this memory, and the readers are the worst
+      // possible consumers of uncached/write-combined host memory: a 4 MiB
+      // memcpy out of an eviction batch, an RLE run scan, a page-table classify
+      // pass (Stream::CompleteOldest / HarvestDemotes, World's snapshot
+      // callback, PageTable's free-probe harvest). WC reads are uncached with
+      // no prefetch and roughly an order of magnitude slower than RAM.
+      //
+      // So HOST_CACHED is PREFERRED here, explicitly, rather than left to be
+      // implied. Coherence is preferred too but NOT required: requiring it
+      // would let a device that only offers HOST_VISIBLE|HOST_CACHED (no
+      // coherent+cached type) fall back to the uncached type and quietly lose
+      // the whole point. `needsInvalidate` below is what makes the uncoherent
+      // case correct instead of merely reachable.
+      aci.flags |= VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT;
+      aci.requiredFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
+      aci.preferredFlags = VK_MEMORY_PROPERTY_HOST_CACHED_BIT |
+                           VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    } else {
+      // UPLOAD (the Class B staging ring). The CPU only ever writes it, in
+      // sequential runs, and the device reads it — the textbook case for
+      // uncached write-combined memory. HOST_CACHED here would cost cache
+      // pollution and a flush; VMA marks it not-preferred for exactly this
+      // access pattern. Coherent is REQUIRED, because the no-flush-before-
+      // submit argument in barrier_graph §4.1 depends on it.
+      aci.flags |= VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT;
+      aci.requiredFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                          VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    }
   } else {
     aci.usage = VMA_MEMORY_USAGE_AUTO;
     aci.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
@@ -698,6 +734,27 @@ Buffer* Backend::CreateBuffer(uint64_t size, rhi::BufferUsage usage, const char*
   VkResult r = vmaCreateBuffer(allocator_, &bci, &aci, &b->buf, &b->alloc, &info);
   if (r != VK_SUCCESS) return nullptr;
   b->mapped = info.pMappedData;
+  vmaGetAllocationMemoryProperties(allocator_, b->alloc, &b->memProps);
+  b->needsInvalidate =
+      mapRead && (b->memProps & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) == 0;
+  if (mapRead) {
+    // One line, once, naming what the driver actually gave us. "Prefer cached"
+    // is a preference, and a preference that silently did not take is exactly
+    // the kind of thing nobody notices for a year — docs/RESEARCH_streaming_
+    // hitch.md R6 asserted this memory was HOST_COHERENT-only from reading the
+    // create info, which the create info cannot tell you.
+    static bool announced = false;
+    if (!announced) {
+      announced = true;
+      std::fprintf(stderr,
+                   "readback memory: %s%s%s%s (invalidate before read: %s)\n",
+                   (b->memProps & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) ? "DEVICE_LOCAL|" : "",
+                   (b->memProps & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) ? "HOST_VISIBLE|" : "",
+                   (b->memProps & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) ? "HOST_COHERENT|" : "",
+                   (b->memProps & VK_MEMORY_PROPERTY_HOST_CACHED_BIT) ? "HOST_CACHED" : "(uncached)",
+                   b->needsInvalidate ? "yes" : "no");
+    }
+  }
 
   Buffer* raw = b.get();
   // The zero-init REGISTRY. Every buffer, no exceptions, no opt-out.
@@ -767,6 +824,64 @@ bool Backend::ZeroInitAll(std::string& err) {
   return WaitIdle(err);
 }
 
+void Backend::ReclaimStaging() {
+  // The floor is the LOW end of the oldest submit whose fence has not
+  // signalled; everything below it has been read by the device already. Bytes
+  // queued since the last submit are protected automatically, because
+  // stagingSubmitted_ is the ceiling of what any floor can be.
+  uint64_t floor = stagingSubmitted_;
+  for (const InFlight& f : inFlight_) {
+    if (dfn_.GetFenceStatus(device_, f.fence) == VK_SUCCESS) continue;
+    if (f.stagingLow < floor) floor = f.stagingLow;
+  }
+  if (floor > stagingTail_) stagingTail_ = floor;
+}
+
+uint64_t Backend::StagingAlloc(uint64_t size) {
+  const uint64_t cap = stagingRing_ ? stagingRing_->size : 0;
+  if (cap == 0 || size > cap) return kStagingNoRoom;
+  for (;;) {
+    uint64_t off = AlignUp(stagingHead_, kStagingAlign);
+    // A copy region must be contiguous, so pad past the physical end of the
+    // ring rather than splitting. The padding is charged to the ring exactly
+    // like a payload would be, so it cannot make the occupancy test optimistic.
+    const uint64_t phys = off % cap;
+    if (phys + size > cap) off += cap - phys;
+    // The whole point: the live span is [stagingTail_, off + size) and it must
+    // fit in the ring. The pre-2026-09-03 code tested `off + size >
+    // ring->size` and wrapped to 0 on failure, which is not an occupancy test
+    // at all — it overwrote whatever was at offset 0 whether or not a queued
+    // vkCmdCopyBuffer still had to read it.
+    if (off + size <= stagingTail_ + cap) {
+      stagingHead_ = off + size;
+      return off % cap;
+    }
+    // Full. First try the free reclaim, then BLOCK on the oldest submit still
+    // holding space. A stall here is a bad frame; the alternative it replaces
+    // is silent corruption.
+    const uint64_t before = stagingTail_;
+    ReclaimStaging();
+    if (stagingTail_ > before) continue;
+    const InFlight* oldest = nullptr;
+    for (const InFlight& f : inFlight_) {
+      if (dfn_.GetFenceStatus(device_, f.fence) == VK_SUCCESS) continue;
+      if (!oldest || f.serial < oldest->serial) oldest = &f;
+    }
+    // Nothing in flight and still no room: the UNSUBMITTED batch alone fills
+    // the ring, and no amount of waiting can reclaim it. Caller falls back.
+    if (!oldest) return kStagingNoRoom;
+    std::string err;
+    stagingStalls_++;
+    VkFence f = oldest->fence;
+    if (!WaitFence(f, err)) return kStagingNoRoom;
+    ReclaimStaging();
+    // WaitFence returning success means that submit is done; if the floor did
+    // not move, some OTHER in-flight submit is older in ring order, and the
+    // next iteration waits on it. inFlight_ is finite, so this terminates.
+    if (stagingTail_ <= before && inFlight_.empty()) return kStagingNoRoom;
+  }
+}
+
 void Backend::QueueWrite(Buffer* dst, uint64_t offset, const void* data, size_t size) {
   if (!dst || size == 0) return;
   Pending p;
@@ -774,13 +889,41 @@ void Backend::QueueWrite(Buffer* dst, uint64_t offset, const void* data, size_t 
   p.dstOffset = offset;
   p.size = size;
 
-  // THE CLASS RULE, and it is exactly one rule: Class A iff the payload fits
-  // vkCmdUpdateBuffer's 65536-byte limit AND its size is 4-aligned (the command
-  // requires a 4-aligned offset and size). Nothing else. An earlier draft of the
-  // design applied this inconsistently by buffer identity; a size-derived rule
-  // with hand-made exceptions is one the next person applies wrong.
+  // THE CLASS RULE, and it is exactly one rule: Class A iff the payload is at
+  // or under the policy threshold AND its size and offset are 4-aligned (what
+  // vkCmdUpdateBuffer requires). Nothing else — no buffer identity, no
+  // exceptions. The threshold moved from vkCmdUpdateBuffer's 65536-byte
+  // LEGALITY limit to 4096 on 2026-09-03; see kClassAMaxBytes for why those are
+  // different questions.
   p.classA = size <= kClassAMaxBytes && (size % 4) == 0 && (offset % 4) == 0;
 
+  if (!p.classA) {
+    // Class B: memcpy into the persistently-mapped ring now, copy on the GPU at
+    // flush time. The region is reclaimed by the fence of the submit that
+    // consumes it — which is why §4.2 gives EVERY submit a fence.
+    const uint64_t off = StagingAlloc(size);
+    if (off != kStagingNoRoom) {
+      std::memcpy((uint8_t*)stagingRing_->mapped + off, data, size);
+      p.stagingOffset = off;
+    } else if (size <= kVkUpdateBufferLimit && (size % 4) == 0 && (offset % 4) == 0) {
+      // The ring cannot be reclaimed (one unsubmitted batch exceeds it) but the
+      // payload is still a LEGAL vkCmdUpdateBuffer. Degrade to Class A rather
+      // than corrupt or abort: slower, correct, and counted so the ring can be
+      // resized instead of guessed at.
+      stagingFallbacks_++;
+      p.classA = true;
+    } else {
+      // Neither path can take it. This is unreachable with the current ring
+      // (the largest single write in the engine is 4 MiB against a 64 MiB
+      // ring), and dropping it silently would lose GPU state, so say so.
+      std::fprintf(stderr,
+                   "FATAL: staging ring exhausted by an unsubmitted batch and "
+                   "the %llu-byte write to '%s' is too large for "
+                   "vkCmdUpdateBuffer. Raise kStagingRingBytes.\n",
+                   (unsigned long long)size, dst->label.c_str());
+      std::abort();
+    }
+  }
   if (p.classA) {
     // vkCmdUpdateBuffer captures the data into the command buffer at RECORD
     // time, so holding a copy until the flush is all the lifetime management
@@ -790,15 +933,6 @@ void Backend::QueueWrite(Buffer* dst, uint64_t offset, const void* data, size_t 
     // alias.
     p.inlineData.resize(size);
     std::memcpy(p.inlineData.data(), data, size);
-  } else {
-    // Class B: memcpy into the persistently-mapped ring now, copy on the GPU at
-    // flush time. The region is reclaimed by the fence of the submit that
-    // consumes it — which is why §4.2 gives EVERY submit a fence.
-    uint64_t off = AlignUp(stagingHead_, kStagingAlign);
-    if (off + size > stagingRing_->size) off = 0;  // wrap
-    std::memcpy((uint8_t*)stagingRing_->mapped + off, data, size);
-    p.stagingOffset = off;
-    stagingHead_ = off + size;
   }
   // ISSUE ORDER, preserved exactly. Never sorted, never coalesced: last write to
   // a range before a submit must win, and coalescing is what would break that.
@@ -878,6 +1012,18 @@ void Backend::FlushUploads(VkCommandBuffer cmd) {
     touched.push_back(p.dst);
   }
   pending_.clear();
+  // CHARGE THE RING TO THIS COMMAND BUFFER. Everything allocated up to now has
+  // had its vkCmdCopyBuffer recorded into `cmd`, so the submit of `cmd` is what
+  // releases it — not the submit of whatever command buffer happens to be
+  // submitted next, and not "the head at submit time", which would also cover
+  // QueueWrites issued DURING the caller's recording whose copies belong to a
+  // later command buffer.
+  for (FlushMark& m : flushMarks_) {
+    if (m.cmd != cmd) continue;
+    m.high = stagingHead_;
+    return;
+  }
+  flushMarks_.push_back({cmd, stagingHead_});
 }
 
 VkFence Backend::AcquireFence(std::string& err) {
@@ -943,11 +1089,27 @@ VkFence Backend::SubmitEnded(VkCommandBuffer cmd, std::string& err) {
     err = std::string("vkQueueSubmit failed: ") + vkl::ResultName(r);
     return VK_NULL_HANDLE;
   }
-  inFlight_.push_back({fence, cmd, stagingHead_, ++submitSerial_});
+  NoteSubmit(fence, cmd);
   return fence;
 }
 
+void Backend::NoteSubmit(VkFence fence, VkCommandBuffer cmd) {
+  uint64_t high = stagingSubmitted_;
+  for (size_t i = 0; i < flushMarks_.size(); i++) {
+    if (flushMarks_[i].cmd != cmd) continue;
+    if (flushMarks_[i].high > high) high = flushMarks_[i].high;
+    flushMarks_.erase(flushMarks_.begin() + i);
+    break;
+  }
+  inFlight_.push_back({fence, cmd, stagingSubmitted_, high, ++submitSerial_});
+  stagingSubmitted_ = high;
+}
+
 void Backend::PollFences() {
+  // Advance the staging-ring floor BEFORE the erase loop: once an entry is
+  // erased its span is gone, and ReclaimStaging derives the floor from what is
+  // still in flight.
+  ReclaimStaging();
   for (size_t i = 0; i < inFlight_.size();) {
     if (dfn_.GetFenceStatus(device_, inFlight_[i].fence) == VK_SUCCESS) {
       VkFence f = inFlight_[i].fence;
@@ -1030,6 +1192,17 @@ bool Backend::WaitFence(VkFence f, std::string& err) {
   }
   PollFences();
   return true;
+}
+
+void Backend::InvalidateForRead(Buffer* b, uint64_t offset, uint64_t size) {
+  // Fast out on the only case that occurs in practice: coherent memory needs
+  // nothing, and the branch is one predictable load per map.
+  if (!b || !b->needsInvalidate || !b->alloc) return;
+  // vmaInvalidateAllocation, not the raw vkInvalidateMappedMemoryRanges: VMA
+  // rounds the range out to nonCoherentAtomSize and knows the allocation's
+  // offset inside its memory block. Getting either of those wrong by hand is a
+  // validation error at best and a partially-invalidated read at worst.
+  vmaInvalidateAllocation(allocator_, b->alloc, offset, size);
 }
 
 bool Backend::WaitIdle(std::string& err) {
@@ -1698,7 +1871,7 @@ VkFence Backend::SubmitEndedPresenting(VkCommandBuffer cmd, std::string& err) {
     err = std::string("vkQueueSubmit (present) failed: ") + vkl::ResultName(r);
     return VK_NULL_HANDLE;
   }
-  inFlight_.push_back({fence, cmd, stagingHead_, ++submitSerial_});
+  NoteSubmit(fence, cmd);
   // Pin this submit's fence to the acquire slot: reuse of the semaphore waits
   // on it (see AcquireSwapchainImage).
   RetainFence(fence);
@@ -1878,6 +2051,20 @@ void Backend::Shutdown() {
   descPool_ = VK_NULL_HANDLE;
   if (cmdPool_) dfn_.DestroyCommandPool(device_, cmdPool_, nullptr);
   cmdPool_ = VK_NULL_HANDLE;
+
+  // Say it only when it happened. A silent staging ring is the normal case and
+  // does not need a line; a ring that STALLED or fell back to Class A is
+  // undersized for one unsubmitted batch, and that is invisible from the
+  // outside — it shows up as a slow shift with no attribution, which is
+  // exactly the kind of number CLAUDE.md's rule 6 says to instrument rather
+  // than bisect.
+  if (stagingStalls_ || stagingFallbacks_)
+    std::fprintf(stderr,
+                 "staging ring: %llu blocking waits, %llu Class A fallbacks "
+                 "(ring is %llu MiB; raise kStagingRingBytes)\n",
+                 (unsigned long long)stagingStalls_,
+                 (unsigned long long)stagingFallbacks_,
+                 (unsigned long long)(kStagingRingBytes >> 20));
 
   for (auto& b : buffers_)
     if (b->buf) vmaDestroyBuffer(allocator_, b->buf, b->alloc);

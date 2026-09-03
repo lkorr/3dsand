@@ -340,6 +340,11 @@ struct VkrMapTicket final : MapTicketImpl {
   bool Succeeded() override { return buf && buf->mapped; }
   const void* Data() override {
     if (!buf || !buf->mapped) return nullptr;
+    // Readback memory is asked for HOST_CACHED (rhi_vulkan.cpp CreateBuffer),
+    // and a cached type is not guaranteed to be coherent. A no-op on every
+    // allocation this engine has actually been given; the point is that it
+    // stays correct on one that isn't.
+    st->be->InvalidateForRead(buf, offset, size);
     return (const uint8_t*)buf->mapped + offset;
   }
   void Unmap() override {
@@ -551,6 +556,7 @@ struct VkrDevice final : DeviceImpl {
     // the persistent map — the Finish() host barrier made it visible.
     std::string err;
     if (!st->be->WaitIdle(err)) return false;
+    st->be->InvalidateForRead(b, offset, size);
     std::memcpy(out, (const uint8_t*)b->mapped + offset, size);
     return true;
   }
@@ -577,6 +583,10 @@ struct VkrDevice final : DeviceImpl {
       // Move out before firing: the callback may issue new maps.
       VkrState::PendingMap fired = std::move(m);
       st->maps.erase(st->maps.begin() + i);
+      // Same reason as VkrMapTicket::Data(): a HOST_CACHED readback type that
+      // is not also coherent must have its cache invalidated before the CPU
+      // can see what the device wrote.
+      if (fired.buf) st->be->InvalidateForRead(fired.buf, fired.offset, fired.size);
       const void* p = fired.buf && fired.buf->mapped
                           ? (const uint8_t*)fired.buf->mapped + fired.offset
                           : nullptr;
