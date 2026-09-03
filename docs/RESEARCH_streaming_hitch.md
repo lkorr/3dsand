@@ -423,6 +423,124 @@ degrades frame time before the abort. Not diagnosed here. First step is
 plus the `--measure` histogram against that window, not another autofly run.
 Any of R1/R3 should be sized against this number, not the harness's.
 
+> ## ANSWERED 2026-09-03 — a third of the pool is pages the free path can never revisit
+>
+> Instrument: `PageCensus` in `src/sim/pagetable.h`/`.cpp` — every RESIDENT page
+> billed to exactly one mutually exclusive reason (the buckets sum to
+> `resident`, and the printer reports the residual so a future contributor
+> cannot hide in one), plus a height band and a per-tick free-path event
+> tally. Three exposures: `SANDVOX_PT_DEBUG=1` prints it every
+> `SANDVOX_PT_CENSUS_EVERY` ticks (default 120), `--frames` prints it at its
+> high-water tick and at exit, and five `PerfSample` counters
+> (`pagesHeldDirty` / `pagesHeldMatter` / `pagesHeldEmpty` / `pagesHeldOrphan`
+> / `pagesRetired`) carry it over `--telemetry` so the LIVE session can be read
+> the same way. The first four partition `pagesResident`.
+>
+> **The paragraph above was wrong about two things before it was wrong about
+> the cause.** (a) "not another autofly run" — `--frames 1200
+> --autofly-surface` reaches **29,901 of 34,816 (85.9%)**, i.e. ABOVE the live
+> 83%; the doc's 65% / 74% figures were 600-frame runs and the number had not
+> stopped climbing. (b) The §2 LANDED note's "+3,179 pages, 65% → 74%" is
+> therefore not the ceiling of what K=4 costs, it is what it cost in 600
+> frames.
+>
+> ### The measurement
+>
+> | run (`SANDVOX_PT_DEBUG=1`) | pool high water | at exit |
+> |---|---|---|
+> | `--frames 1200 --autofly-surface` | 29,901 (85.9%) @ tick 387 | 25,025 (71.9%) |
+> | `--frames 1200 --autofly-hard` | 26,144 (75.1%) @ tick 100 (the worldgen settle) | 4,928 (14.2%) |
+> | `--frames 2400 --autofly-park` (`SANDVOX_PARK_SETTLE=1500`) | 23,413 (67.2%) @ tick 338 | 23,104 (66.4%) |
+>
+> Census at `--autofly-surface`'s peak (tick 387, 29,901 resident): dirty
+> 12,875 (43.1%) | ring 4,484 (15.0%) | full 7,907 (26.4%) | matter 1,192
+> (4.0%) | waiting 324 | **orphan 3,119 (10.4%)**. So 58% of the PEAK is the
+> conservative mirror and its N26 ring, not matter — but that is a FLIGHT
+> number and it decays to nothing when the player stops.
+>
+> **`--autofly-park` is the one that answers the live session, because it is
+> the only arm that is stationary.** It flies 300 ticks, parks, and then:
+> residency **plateaus at 23,104 (66.4%) and does not move again for 1,000+
+> ticks**. At the plateau `dirty 0 | ring 0 | waiting 0 | cand 0` — the mirror
+> is empty, the free path has nothing queued, nothing is in flight — and the
+> 23,104 pages are:
+>
+> ```
+>   full   9,198 (39.8%)  +  matter 5,746 (24.9%)  = 14,944 real matter
+>   ORPHAN 8,160 (35.3%)                            = all air, never reclaimable
+>   bands  sky 7,883 (all-air 7,883) | surface 2,038 | buried 13,183
+> ```
+>
+> **A third of a stationary window's resident pages are all-air pages over open
+> sky that the free path will never look at again.** Residency does NOT come
+> down after parking. It cannot.
+>
+> ### The mechanism, exactly
+>
+> `PageTable::ConsumeOccupancy`'s free trigger is an EQUALITY:
+>
+> ```cpp
+> if (zeroStreak_[s] != kPageFreeTicks) continue;   // 8, exactly
+> ```
+>
+> and the only thing that keeps a candidate eligible when it is not freed this
+> tick is `zeroStreak_[candidates[i]] = kPageFreeTicks - 1`, which lives INSIDE
+> `if (probeSubmit_ && !candidates.empty() && !probePending_) { ... }`. The
+> deferred word probe submits on tick N and harvests on N+1; whenever that map
+> has not landed, `probePending_` is still true, the whole block is skipped,
+> and **this tick's entire candidate set keeps a streak of exactly 8, steps to
+> 9 next tick, and can never satisfy `== kPageFreeTicks` again for the life of
+> the process.** Measured over the census samples of the surface run: 2,341
+> candidates, 384 submitted, 91 freed, 439 correctly deferred by the cap, and
+> **1,518 (65%) stranded by `probe-busy`**. Two smaller paths strand the same
+> way (a vanished page and the slot-identity mismatch at harvest also `continue`
+> without re-arming); they were 0 and 3.
+>
+> ### What is NOT the lever, now that each has a number
+>
+> - **The probe cap (`kPageFreeProbesPerTick` = 128) is not it.** It re-arms
+>   correctly; `capped` slots come back the next tick. It is a rate limit, and
+>   the doc's suspicion that it is "a plausible mechanism for residency
+>   creeping up and never coming back down" is refuted: what never comes back
+>   down is the stranded set, which the cap does not produce.
+> - **The stain bit is not it.** `stain 0` in every census of all three runs.
+> - **The particle flight shell is not it.** `shell 0` throughout.
+> - **cpuDirty dilation is not it, for a STATIONARY session.** It is the single
+>   largest bucket while flying (dirty+ring = 58% of the peak) and it is worth
+>   attacking on its own account, but it decays to literally zero within ~100
+>   ticks of parking, so it cannot be what the user's stationary 29k is made of.
+> - **Retire quarantine is not it.** `retired` is 0-800, and 0 at the plateau.
+>
+> ### So what are the live session's ~29,000 pages
+>
+> Real matter (the harness parks at ~14,900; a lived-in surface window with
+> lakes, trees and structures will be higher) plus an ORPHAN set that only ever
+> grows. The strand bucket is monotonic — nothing removes a member — so its
+> size is a function of how much flying and activity the session has done. The
+> harness accumulated 8,160 of them in 300 ticks of flight. Two hours is
+> ~216,000 ticks. 29,063 is arithmetically unremarkable, and the reason it
+> "creeps up and never comes back" is that it literally cannot come back.
+>
+> ### The fix (NOT applied here — this package was the instrument)
+>
+> Three lines in `ConsumeOccupancy`: make the trigger `>= kPageFreeTicks`
+> instead of `==`, and hoist the re-arm out of the submit block so a stranded
+> candidate is re-armed whatever the reason it was not probed. With a `>=`
+> trigger the 8,160 pages parked in the harness drain at 128/tick in ~64 ticks.
+> This changes no hashed state (the page table is derived), so it costs a
+> `--gate streaming` and a residency re-measurement, not a rebaseline. Sizing
+> K against §6 should be redone AFTER it, because the number K is being sized
+> against is currently a third leak.
+>
+> ### What the harness still cannot reproduce
+>
+> Brush/spell/explosion ops, mobs, fire, day/night `EncodeWakeAll` (which
+> unions all 32,768 slots into the mirror and materializes every hasMatter
+> chunk at once, a few times per in-game day), store-hit refills on revisited
+> terrain, and TIME — 1,428 ticks is 48 seconds against two hours. Every one of
+> those adds to the strand bucket and none of them removes from it, so the
+> harness numbers are a FLOOR for the live session, not an estimate of it.
+
 ---
 
 ## 7. Sources

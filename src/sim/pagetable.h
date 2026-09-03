@@ -96,6 +96,101 @@ class SlotSet {
 // immediately fatal to the hash.
 void DilateN26(const SlotSet& in, SlotSet& out);
 
+// ---------------------------------------------------------------------------
+// RESIDENCY ATTRIBUTION (docs/RESEARCH_streaming_hitch.md §6, CLAUDE.md rule 6)
+//
+// `pagesResident = 29,195` is a bare count. It says the pool is 83% full and
+// nothing about WHY, and the only way to turn it into a diagnosis by
+// elimination is to switch features off one at a time — which is exactly the
+// sequence rule 6 forbids. So the reporter attributes instead: every RESIDENT
+// page is billed to ONE reason, the reasons are mutually exclusive, and their
+// sum is `resident` by construction (PrintPageCensus prints the residual, so a
+// future contributor to residency that this census does not know about shows
+// up as a non-zero "unbilled" rather than silently distorting a bucket).
+//
+// PRIORITY ORDER, and why it is this order. A page is usually held by several
+// things at once; the census bills it to the FIRST rule below that applies,
+// chosen so the bucket names the thing you would have to change to get the
+// page back:
+//
+//   1. dirty   — the slot is in cpuDirty, i.e. the mirror says the CA may
+//                write it this tick. Freeing it is not on the table.
+//   2. ring    — in the materialization set but NOT in cpuDirty: the N26
+//                dilation, an op ring, a particle-spawn ring, a fluid block.
+//                The cost of the CONSERVATISM, separable from real demand.
+//   3. full    — occTotal == kChunkVol. A full chunk holds matter, and it is
+//                also the JITTER/UNIFORM compression candidate: nothing in the
+//                steady state ever re-Classifies a RESIDENT chunk (only
+//                eviction, store-hit refill and worldgen's post-pass do), so a
+//                full page that no shift has passed over stays a page forever.
+//                This is the closest cheap proxy for "sentinelable-but-held" —
+//                deciding it exactly needs the chunk's 4,096 words, which no
+//                per-tick path has and which the free probe only ever reads
+//                for chunks it already believes are EMPTY.
+//   4. matter  — 0 < occTotal < kChunkVol: a genuine mixed surface page. The
+//                irreducible floor.
+//   5. shell   — all air, held by the particle flight-shell demote guard.
+//   6. stain   — all air, but the occupancy stain bit (bit 31, packOccStain)
+//                is set, so the free path rejects it with no probe. Reported
+//                only for AIR chunks, because that is the only case where
+//                stain BLOCKS anything: a stained chunk with matter is held by
+//                the matter and billing it to stain would be a lie about which
+//                lever moves it.
+//   7. waiting — all air, streak < kPageFreeTicks: inside the hysteresis, it
+//                will come back on its own.
+//   8. cand    — all air, streak == kPageFreeTicks: a candidate THIS tick.
+//   9. orphan  — all air, streak > kPageFreeTicks. THE BUG BUCKET. The free
+//                trigger in ConsumeOccupancy is `zeroStreak_[s] ==
+//                kPageFreeTicks`, an EQUALITY and not a `>=`, so any slot whose
+//                streak steps past 8 without being freed or re-armed can never
+//                be a candidate again for the life of the process. A non-zero
+//                orphan count is a permanent, monotonic residency ratchet, and
+//                it is invisible in a 600-tick harness run for the same reason
+//                a leak is invisible in a short one.
+//
+// The BANDS answer the other half: "about half the window is sky sentinels" is
+// the expected shape, so the question is which band broke it. Derived from
+// OCCUPANCY alone — the topmost chunk holding matter in each of the window's
+// kNChunk^2 slot columns — and never from a noise evaluation, because
+// World::TerrainHeight is 1,024 noise evaluations per census and this has to be
+// affordable on the frame path.
+struct PageCensus {
+  bool valid = false;
+  uint32_t tick = 0;
+  uint32_t pool = 0, resident = 0, freeList = 0, retired = 0;
+  // Mutually exclusive, in the priority order above. Sum == resident.
+  uint32_t rDirty = 0, rRing = 0, rFull = 0, rMatter = 0, rShell = 0,
+           rStain = 0, rWaiting = 0, rCand = 0, rOrphan = 0;
+  // Y bands, RESIDENT pages only, relative to each slot column's topmost chunk
+  // holding matter. `bSky` is strictly above it, `bSurface` is that chunk and
+  // the one below, `bBuried` the rest. `bSkyEmpty` is the share of bSky that is
+  // also all-air — a page over open sky holding nothing at all, which is the
+  // shape a leak takes.
+  uint32_t bSky = 0, bSurface = 0, bBuried = 0, bSkyEmpty = 0;
+  // ---- FREE-PATH HEALTH, this tick ----------------------------------------
+  // NOT a partition: these count EVENTS, and the question they answer is
+  // whether reclamation is keeping up and, if not, which gate is binding.
+  uint32_t fCands = 0;       // slots that hit the exact trigger this tick
+  uint32_t fSubmitted = 0;   // of those, copied for the word probe
+  uint32_t fCapped = 0;      // deferred by kMaxFreeProbesPerTick (streak re-armed)
+  uint32_t fProbeBusy = 0;   // STRANDED: last tick's map was not ready, so the
+                             // submit block never ran — and the re-arm loop
+                             // lives INSIDE that block, so these candidates
+                             // keep their streak of exactly 8, tick past it
+                             // next tick, and become orphans.
+  uint32_t fFreed = 0;           // pages actually handed to the retire queue
+  uint32_t fRefusedWords = 0;    // probe read live words: not empty after all
+  uint32_t fRefusedDirty = 0;    // in cpuDirty at harvest (re-armed)
+  uint32_t fRefusedShell = 0;    // flight-shell guard at harvest (re-armed)
+  uint32_t fRefusedIdent = 0;    // a shift reassigned the slot (NOT re-armed)
+  uint32_t fRefusedGone = 0;     // page vanished / already a sentinel (NOT re-armed)
+};
+
+// One table to stdout. `label` names the moment ("tick 600", "high water",
+// "exit"). Shared by SANDVOX_PT_DEBUG's periodic dump and by --frames' exit
+// summary so the two can never disagree about the shape.
+void PrintPageCensus(const PageCensus& c, const char* label);
+
 class PageTable {
  public:
   // `residency` decides the pool size and whether sentinels ever exist.
@@ -359,6 +454,14 @@ class PageTable {
   // (streaming refill / genList / worldgen batches).
   uint32_t allocsMat_ = 0, allocsOvr_ = 0, refills_ = 0;
   uint32_t PagesHighWater() const { return pagesHighWater_; }
+  // ---- residency attribution (see PageCensus above) ------------------------
+  // `Census()` is the most recent tick's, recomputed inside ConsumeOccupancy's
+  // existing kNumChunks walk. `CensusAtHighWater()` is a copy latched on the
+  // tick pagesInUse_ last set a new maximum — which is the tick a --frames run
+  // actually wants to explain, and which is gone by the time it exits.
+  const PageCensus& Census() const { return census_; }
+  const PageCensus& CensusAtHighWater() const { return censusHigh_; }
+  uint32_t RetireQueueDepth() const { return (uint32_t)retire_.size(); }
   uint32_t PoolPages() const { return poolPages_; }
   uint64_t FillsIssued() const { return fillsIssued_; }
   // JITTER pages materialized by dispatch (the fills a pattern cannot express).
@@ -552,6 +655,24 @@ class PageTable {
   uint32_t tick_ = 0;
   // First tick seen after a reset; -1 = reset happened, tick not yet known.
   int64_t settleAnchor_ = -1;
+
+  // ---- residency attribution ----------------------------------------------
+  // Filled every tick by ConsumeOccupancy, out of the walk it was already
+  // doing. `censusHigh_` is latched when pagesInUse_ sets a new high water, so
+  // a --frames run can explain its peak rather than only its exit.
+  PageCensus census_;
+  PageCensus censusHigh_;
+  uint32_t censusHighMark_ = 0;    // pagesHighWater_ the latch was taken at
+  // Per-column top-of-matter, kNChunk x kNChunk, rebuilt each census. A member
+  // rather than a local so the allocation happens once.
+  std::vector<int32_t> colTop_;
+  // The free-path event tallies for the tick being assembled. Separate from
+  // census_ because the harvest half runs before this tick's counts are
+  // published and the census_ swap must be atomic from a reader's point of
+  // view (main.cpp reads it between ticks).
+  PageCensus pending_;
+  void RunCensus(const std::vector<uint32_t>& occupancy,
+                 const std::vector<uint8_t>& occStain);
 
  public:
   // Drain the queued page-initialization fills into `enc`. MUST be called at
