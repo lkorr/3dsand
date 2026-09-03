@@ -2459,6 +2459,54 @@ fn caveFloraAt(b : CaveBands, x : i32, y : i32, z : i32, seed : u32) -> u32 {
 // order, so the words produced are identical — the world hash is the gate on
 // that, and genCell below still composes the two halves for the callers that
 // evaluate one isolated cell.
+// ---- AUTHORED POI ANCHORS: the two heights that depend on the SEED ALONE ----
+//
+// The spawn deck and the combat arena both ride the terrain, so each one is
+// anchored to `baseHeight` at ONE fixed column. Neither depends on (x, y, z) at
+// all — only on the seed — and yet genCellIn evaluated both of them, from
+// scratch, for EVERY CELL IT WAS EVER ASKED ABOUT. `baseHeight` is `landAt`,
+// which is five octaves plus the biome curve: ~30 hash3 and five integer
+// divides each. That was a flat ~60-hash tax on every voxel of every chunk the
+// worldgen kernel produced, sky included, and on a plane of streamed-in chunks
+// most cells are sky and had literally nothing else to pay for.
+//
+// It is also ~a quarter of the kernel's INSTRUCTION FOOTPRINT: `worldgenList`
+// is a 708 KiB binary against an L0 i-cache measured in tens of KiB, so two
+// inlined copies of the octave ladder sitting in the innermost loop body cost
+// fetch bandwidth on every iteration whether the branch under them is taken or
+// not.
+//
+// So it travels the way the cave bands and the tree candidates already do: the
+// caller computes it once at the widest scope it is constant over (genChunk:
+// once per workgroup, not once per column — it does not depend on x/z either)
+// and hands it down. By VALUE, unlike those two: it is two i32, so there is no
+// dynamic index to spill and nothing to gain from a pointer.
+//
+// The one-shot callers (genCell, genCellCol) still build it inline, so they pay
+// exactly what they paid before and the composition stays a composition rather
+// than a second spelling of the rule.
+struct Poi {
+  deckY  : i32,   // top of the spawn platform's deck slab
+  arenaY : i32,   // the combat arena's levelled deck plane
+};
+
+// The anchor columns, promoted out of genCellIn's body so `farSurfaceMat` and
+// `farColTopFrom` can stop restating 180/110 as literals beside it.
+const POI_DECK_X  : i32 = 166;
+const POI_DECK_Z  : i32 = 166;
+const POI_ARENA_X : i32 = 180;
+const POI_ARENA_Z : i32 = 110;
+
+fn poiAnchors(seed : u32) -> Poi {
+  var p : Poi;
+  // Deck HEIGHT stays 3 m above its anchor so the 1.7 m player walks under it.
+  p.deckY = baseHeight(POI_DECK_X, POI_DECK_Z, seed) + 48;
+  // +16 clears the arena footprint's worst uphill corner; see the long note at
+  // the use site in genCellIn.
+  p.arenaY = baseHeight(POI_ARENA_X, POI_ARENA_Z, seed) + 16;
+  return p;
+}
+
 struct Col {
   h           : i32,         // ground height, after pool and pond carving
   sed         : i32,         // loose wedge thickness at this column, 0 if none
@@ -2971,7 +3019,7 @@ fn genColumn(x : i32, z : i32, seed : u32) -> Col {
 // used, so the body is unchanged line for line. Every one of these is read-only
 // from here down — the only thing this half writes is `mat`.
 //
-// THE TWO HOISTS travel as separate POINTER parameters rather than inside `Col`,
+// THE TWO BIG HOISTS travel as separate POINTER parameters rather than inside `Col`,
 // and both facts are deliberate. Cave bands and tree candidates are pure
 // functions of (x, z, seed) like everything in Col, but unlike anything in Col
 // they are BIG — a nine-tree candidate set is ~300 bytes — so folding them in
@@ -2986,9 +3034,15 @@ fn genColumn(x : i32, z : i32, seed : u32) -> Col {
 // which are literally caveBands+caveIn and treeCandsInto+treeFromCands
 // composed. Any divergence would be a bug in that composition, and the world
 // hash is what proves there is none.
+//
+// `poi` is the THIRD hoist and needs no such flag: it is a pure function of the
+// seed with no fallback spelling at all, so every caller passes the same two
+// numbers and the only question is how often it bothered to compute them. See
+// the Poi struct.
 fn genCellIn(col : Col,
              cave : ptr<function, CaveBands>, caveValid : bool,
              trees : ptr<function, TreeCands>, treeValid : bool,
+             poi : Poi, stalk : Flower,
              x : i32, y : i32, z : i32, seed : u32) -> u32 {
   let h = col.h;
   let sed = col.sed;
@@ -3456,7 +3510,27 @@ fn genCellIn(col : Col,
   if (mat == MAT_AIR && y > h + 1 && y <= h + FLOWER_MAX_H && !ruinFloor &&
       !inRim && pond < 0 && h < TREELINE &&
       biome != B_DESERT && !onFixturePad(x, z) && !shore.onShore) {
-    let fl = flowerAt(x, z, seed, UG_COVER_EDGE);
+    // THE FOURTH HOIST. `UG_COVER_EDGE` is a constant and x/z are the column's,
+    // so every one of the FLOWER_MAX_H - 1 cells in this range asks flowerAt
+    // the IDENTICAL question and gets the identical answer — and flowerAt is a
+    // `biomeAt` plus three vnoise fields plus seven hashes. The guard above is
+    // entirely column-level apart from the y range, so genChunk can evaluate
+    // the whole thing once per column; `stalkValid` selects between that and
+    // the inline spelling exactly the way `caveValid`/`treeValid` do above.
+    //
+    // Validity rides IN the memo as `height < 0` rather than in a companion
+    // `stalkValid : bool`. THAT WAS AN ATTEMPT TO BUY BACK A SPILL AND IT DID
+    // NOT WORK, which is worth writing down: this kernel sits at the driver's
+    // 128-register ceiling, this package's hoists put it into local memory for
+    // the first time (+16 B, +32 B on the list entry point), and deleting the
+    // flag moved that number not at all — the spill is the hoisted state
+    // itself, not the flag beside it. It is 4-8 words against a measured
+    // -17.6% on the dispatch, so it is paid for; the spelling stays because
+    // one parameter is better than two, not because it fixed anything.
+    // `flowerAt` returns height 0 for "no flower" and >= 1 otherwise, never
+    // negative, so -1 is free to mean "nobody memoized this".
+    var fl = stalk;
+    if (fl.height < 0) { fl = flowerAt(x, z, seed, UG_COVER_EDGE); }
     // Grass and petal are the one-cell ground layer and never stack.
     if (fl.mat != MAT_AIR && fl.mat != M_GRASS && fl.mat != M_PETAL &&
         (y - h) <= fl.height) {
@@ -3596,7 +3670,9 @@ fn genCellIn(col : Col,
   // Wood platform on pillars near spawn (authored POI). ~2.5 m square deck on
   // 4 posts. Footprint halved in the third scale pass; deck HEIGHT stays 3 m
   // so the player (1.7 m) still walks under it. Anchored to the local terrain.
-  let deckY = baseHeight(166, 166, seed) + 48;
+  // Anchored to the local terrain, but at ONE fixed column — so this is a
+  // function of the seed alone and comes in already computed (see Poi).
+  let deckY = poi.deckY;
   let onPillar = (abs(x - 148) <= 2 || abs(x - 184) <= 2) &&
                  (abs(z - 148) <= 2 || abs(z - 184) <= 2) && y <= deckY;
   let inSlab = x >= 146 && x <= 186 && z >= 146 && z <= 186 &&
@@ -3621,8 +3697,8 @@ fn genCellIn(col : Col,
   // filled, so there is no lip to trip the step-up and no cave under the floor.
   // Everything is anchored to baseHeight rather than a literal Y, so the arena
   // rides the terrain wherever the seed puts it.
-  let arenaCX = 180;
-  let arenaCZ = 110;
+  let arenaCX = POI_ARENA_X;
+  let arenaCZ = POI_ARENA_Z;
   let arenaHalf = 32;                 // 64 voxels square, ~4 m
   // The deck sits ABOVE the highest ground in its own footprint, not at the
   // centre height. Terrain here spans 20 voxels across 64 (51..71 at the
@@ -3630,7 +3706,7 @@ fn genCellIn(col : Col,
   // and dug the deck into a pit you could not see over the rim of — measured,
   // not guessed. +16 clears the +11 worst case with margin for other seeds, and
   // turns the arena into a low plinth that reads as built rather than excavated.
-  let arenaY = baseHeight(arenaCX, arenaCZ, seed) + 16;
+  let arenaY = poi.arenaY;
   let adx = x - arenaCX;
   let adz = z - arenaCZ;
   let inArena = abs(adx) <= arenaHalf && abs(adz) <= arenaHalf;
@@ -3813,18 +3889,29 @@ fn genCellIn(col : Col,
 fn genCell(c : vec3<i32>, seed : u32) -> u32 {
   var cave : CaveBands;
   var trees : TreeCands;
+  var noStalk : Flower;
+  noStalk.mat = MAT_AIR;
+  noStalk.height = -1;   // "not memoized"; see the stalk block in genCellIn
   return genCellIn(genColumn(c.x, c.z, seed), &cave, false, &trees, false,
-                   c.x, c.y, c.z, seed);
+                   poiAnchors(seed), noStalk, c.x, c.y, c.z, seed);
 }
 
 // The same, for a caller that ALREADY has the column. The far cascade sampler
 // asks for the surface skin at (x, col.h, z) immediately after asking for the
 // shape at (x, y, z), and rebuilding the column between the two was the second
 // genColumn per cell.
-fn genCellCol(col : Col, c : vec3<i32>, seed : u32) -> u32 {
+// `poi` comes in from the caller for the same reason `col` does: the far sweep
+// is column-major over a level chunk and the anchors are constant over the
+// whole DISPATCH, so the kernel builds them once. A caller with nothing to
+// amortize over passes `poiAnchors(seed)` and is exactly where it was.
+fn genCellCol(col : Col, c : vec3<i32>, poi : Poi, seed : u32) -> u32 {
   var cave : CaveBands;
   var trees : TreeCands;
-  return genCellIn(col, &cave, false, &trees, false, c.x, c.y, c.z, seed);
+  var noStalk : Flower;
+  noStalk.mat = MAT_AIR;
+  noStalk.height = -1;   // "not memoized"; see the stalk block in genCellIn
+  return genCellIn(col, &cave, false, &trees, false, poi, noStalk,
+                   c.x, c.y, c.z, seed);
 }
 
 // ---- surfHeightAt IS GONE, and that is the point ---------------------------
@@ -3893,7 +3980,7 @@ fn treeCanopyAt(x : i32, z : i32, seed : u32) -> u32 {
 // must be genColumn at (fine.x, fine.z) — that shared requirement is what keeps
 // the sieve and the downsample on one code path now that surfHeightAt is gone.
 fn farSurfaceMat(col : Col, mat : u32, fine : vec3<i32>, shift : u32,
-                 seed : u32) -> u32 {
+                 poi : Poi, seed : u32) -> u32 {
   let k = materials[mat].klass;
   if (k != CLASS_SOLID && k != CLASS_POWDER) { return mat; }  // fluids keep their ID
   var h = col.h;
@@ -3907,7 +3994,7 @@ fn farSurfaceMat(col : Col, mat : u32, fine : vec3<i32>, shift : u32,
   // into fine-detail range. Suppressed in the fluid lab, whose slab is flat and
   // has no arena on it.
   if (T.labMode == 0u && abs(fine.x - 180) <= 32 && abs(fine.z - 110) <= 32) {
-    h = baseHeight(180, 110, seed) + 16;
+    h = poi.arenaY;
   }
   // "Topmost solid cell of this column": solid means center <= h, and the cell
   // above (center + 2^shift) samples past h. NOT "cell span contains h" — when
@@ -3921,7 +4008,7 @@ fn farSurfaceMat(col : Col, mat : u32, fine : vec3<i32>, shift : u32,
     let can = treeCanopyAt(fine.x, fine.z, seed);
     if (can != MAT_AIR) { return can; }
   }
-  let skin = genCellCol(col, vec3<i32>(fine.x, h, fine.z), seed) & 0xFFFu;
+  let skin = genCellCol(col, vec3<i32>(fine.x, h, fine.z), poi, seed) & 0xFFFu;
   // hollow ruin interiors can return air at y == h; keep the body mat then
   if (skin == MAT_AIR || materials[skin].klass == CLASS_GAS) { return mat; }
   return skin;
@@ -4070,6 +4157,12 @@ fn genChunk(slot : u32, li : u32, actIdx : u32) {
   // issues four 64-byte runs instead of one 256-byte one.
   var cave : CaveBands;
   var trees : TreeCands;
+  // ---- THE THIRD HOIST, and the widest one -----------------------------
+  // The spawn deck's and the arena's anchor heights depend on the SEED alone,
+  // so unlike the two above they do not even belong to a column: one pair per
+  // thread covers all 64 cells it will generate. They used to be two `landAt`
+  // ladders inside genCellIn's body, evaluated per CELL. See Poi.
+  let poi = poiAnchors(T.seed);
   for (var ci = li; ci < CHUNK * CHUNK; ci += 64u) {
     let lx = ci % CHUNK;
     let lz = ci / CHUNK;
@@ -4087,12 +4180,123 @@ fn genChunk(slot : u32, li : u32, actIdx : u32) {
     // cost on every air column of every cascade fill.
     let caveValid = base.y <= col.h && !col.inRim;
     if (caveValid) { cave = caveBands(wx, wz, col.h, T.seed); }
-    // Tree candidates: always, because the answer is what makes the vertical
-    // reject a LOCAL ceiling (`trees.top`) instead of a world-wide constant.
-    treeCandsInto(&trees, wx, wz, T.seed);
+    // Tree candidates: because the answer is what makes the vertical reject a
+    // LOCAL ceiling (`trees.top`) instead of a world-wide constant.
+    //
+    // ---- EXCEPT ABOVE THE WORLD'S TALLEST POSSIBLE TREE ------------------
+    // `treeAt` opens with `if (y > treeMaxTop()) { return MAT_AIR; }` — the
+    // one-compare world-wide reject — and the hoisted path deliberately did
+    // NOT, because `cands.top` is strictly tighter once you have the scan.
+    // That reasoning is right per CELL and wrong per COLUMN: a chunk whose
+    // LOWEST cell already sits above the treeline plus the tallest species is
+    // a chunk where all sixteen cells would take treeAt's branch, and the scan
+    // that produces the tighter bound is 25 tile hashes plus a `landAt` and a
+    // `pondAt` for every tile that survives the horizontal reject. On a
+    // streamed-in vertical plane most chunks are that chunk.
+    //
+    // Skipping it is EXACT, not conservative: `treeCandsInto` would have
+    // admitted only candidates with `vtop <= treeMaxTop()` (that bound is the
+    // invariant treeAt already relies on to agree with treeFromCands, and the
+    // world hash is what proves it), so every one of them fails
+    // `treeFromCands`'s `y > top` test anyway. An empty set produces the same
+    // MAT_AIR the full set would.
+    if (base.y <= treeMaxTop()) {
+      treeCandsInto(&trees, wx, wz, T.seed);
+    } else {
+      trees.n = 0;
+      trees.top = -1048576;   // the same "far below any y" treeCandsInto uses
+    }
+    // ---- THE SKY EARLY-OUT: a column stack entirely above everything -----
+    //
+    // On a streamed-in vertical plane most chunks are sky, and a sky cell still
+    // walked the whole of genCellIn to conclude nothing: sixteen guards, a
+    // tree lookup, the two authored-POI boxes and the ruin box, out of a 708
+    // KiB kernel whose body does not fit in the instruction cache. This
+    // computes the column's CEILING once and, when the chunk's lowest cell is
+    // already above it, stores sixteen zeros — which is exactly the word
+    // genCellIn returns for MAT_AIR (`if (mat == MAT_AIR) { return 0u; }`),
+    // contributes nothing to `count`/`block`/`act` or to either sub-occupancy
+    // mask, and is therefore the same chunk by every observable.
+    //
+    // THE CEILING IS AN ENUMERATION, NOT AN ESTIMATE, and it is the only part
+    // of this that can be wrong. Every block in genCellIn that can leave `mat`
+    // non-air above the ground, with the highest y it can reach:
+    //
+    //   terrain body / grass skin / wet moss   h
+    //   standing fluid, and the pond life          fluidTop
+    //     placed INTO water cells (kelp, reed,
+    //     lilypad — all gated on mat == M_WATER)
+    //   pond life above the waterline          max(pond + 1, h + reedHeight)
+    //     (`bed` is min(h, pw.x) <= h, so the
+    //      reed test y - bed < H bounds by h)
+    //   trees                                  trees.top   (exact, per column)
+    //   shore fringe                           h + max(cattail + 3,
+    //                                                  horsetail + 2)
+    //   every y == h + 1 cover block           h + 1
+    //   the flower stalk                       h + FLOWER_MAX_H
+    //   spawn deck (pillars + slab)            deckY + 3, inside its own box
+    //   arena deck / wall / ivy / ramp         arenaY + 24, inside its box
+    //     (rampTop interpolates between
+    //      baseHeight and arenaY, so arenaY
+    //      dominates it)
+    //   ruin shell / wall moss / ruin ivy      ruin.y + RUIN_HT, and only
+    //                                          when THIS column's site is
+    //                                          present (the footprint plus its
+    //                                          one-voxel ivy skirt is strictly
+    //                                          inside its own tile)
+    //
+    // CACTI ARE THE ONE THING WITH NO COLUMN-LOCAL BOUND, because a saguaro
+    // stands at a NEIGHBOURING tile's ground height and `cactusAt` bounds it
+    // against that site's own `base`, not against this column's `h`. Rather
+    // than invent a bound for it, desert columns simply never take the
+    // early-out — the block is gated on this column's `biome == B_DESERT`, so
+    // excluding that biome is sufficient, and the desert is rare.
+    //
+    // All the h-relative plant reaches collapse into one margin, which is
+    // strictly conservative: over-estimating the ceiling only declines a skip.
+    let skyMargin = max(max(FLOWER_MAX_H, TUNE_REED_HEIGHT),
+                        max(TUNE_SHORE_CATTAIL_HEIGHT + 3,
+                            TUNE_SHORE_HORSETAIL_HEIGHT + 2));
+    var colTop = col.h + skyMargin;
+    colTop = max(colTop, col.fluidTop);
+    colTop = max(colTop, col.pond + 1);
+    colTop = max(colTop, trees.top);
+    if (col.ruin.present) { colTop = max(colTop, col.ruin.y + RUIN_HT); }
+    // The two authored POIs, as the same closed-form boxes genCellIn tests —
+    // widened, because a bound that is too generous costs a skip and a bound
+    // that is too tight costs a voxel.
+    if (wx >= 140 && wx <= 192 && wz >= 140 && wz <= 192) {
+      colTop = max(colTop, poi.deckY + 3);
+    }
+    let sadx = wx - POI_ARENA_X;
+    let sadz = wz - POI_ARENA_Z;
+    if (abs(sadx) <= 40 && sadz >= -64 && sadz <= 40) {
+      colTop = max(colTop, poi.arenaY + 24);
+    }
+    if (col.biome != B_DESERT && base.y > colTop) {
+      for (var ly = 0u; ly < CHUNK; ly += 1u) {
+        voxStore(voxWordInChunk(slot, lx + ly * CHUNK + lz * CHUNK * CHUNK), 0u);
+      }
+      continue;
+    }
+
+    // The upper-stalk flower answer, once per column instead of once per cell
+    // of the FLOWER_MAX_H band. Every term of the guard below is a property of
+    // the COLUMN — it is genCellIn's own guard for that block with the two
+    // y tests replaced by "does this chunk's 16-cell stack reach the band at
+    // all", which is the only part of it that is not column-invariant.
+    let stalkValid = !col.ruinFloor && !col.inRim && col.pond < 0 &&
+                     col.h < TREELINE && col.biome != B_DESERT &&
+                     !onFixturePad(wx, wz) && !col.shore.onShore &&
+                     base.y + i32(CHUNK) > col.h + 1 &&
+                     base.y <= col.h + FLOWER_MAX_H;
+    var stalk : Flower;
+    stalk.mat = MAT_AIR;
+    stalk.height = -1;     // the "nobody memoized this" sentinel
+    if (stalkValid) { stalk = flowerAt(wx, wz, T.seed, UG_COVER_EDGE); }
     for (var ly = 0u; ly < CHUNK; ly += 1u) {
       let i = lx + ly * CHUNK + lz * CHUNK * CHUNK;
-      let w = genCellIn(col, &cave, caveValid, &trees, true,
+      let w = genCellIn(col, &cave, caveValid, &trees, true, poi, stalk,
                         wx, base.y + i32(ly), wz, T.seed);
       // Chunk-linear: the slot's page resolved once, per §2.1's second entry
       // point. genChunk overwrites the WHOLE chunk, so the CPU materializes
@@ -4320,6 +4524,9 @@ fn far(@builtin(workgroup_id) wg : vec3<u32>,
   // base LEVEL-cell coord of this level chunk (origins are level-chunk units)
   let base = farSlotToChunk(sc, F.origins[level - 1u].xyz) * i32(CHUNK);
   let shift = farCellShift(level);   // fine voxels per cell, as a shift
+  // The authored-POI anchors are constant over the whole dispatch (see Poi), so
+  // they are built here rather than inside genCellIn's per-cell body.
+  let poi = poiAnchors(T.seed);
 
   // ---- THE SWEEP, COLUMN-MAJOR (the far half of the genColumn/genCellIn split)
   //
@@ -4362,13 +4569,13 @@ fn far(@builtin(workgroup_id) wg : vec3<u32>,
       // the sieve: fine-voxel center of the 2^shift-wide region this cell covers
       let fine = (cc << vec3<u32>(shift)) + vec3<i32>(1 << (shift - 1u));
       let col = cols[b];
-      let mat = genCellCol(col, fine, T.seed) & 0xFFFu;
+      let mat = genCellCol(col, fine, poi, T.seed) & 0xFFFu;
       // The conservative flag first: it is what a cell keeps when the centre
       // sample found nothing (common.wgsl FAR_BLOCKER_BIT).
       var byteV = farBlockerBitAt(tops[b], cc, shift, T.seed);
       if (mat != MAT_AIR && materials[mat].klass != CLASS_GAS) {
         // shape from the center sample, color from the surface skin (phase 4)
-        byteV |= min(farSurfaceMat(col, mat, fine, shift, T.seed), FAR_MAT_MASK);
+        byteV |= min(farSurfaceMat(col, mat, fine, shift, poi, T.seed), FAR_MAT_MASK);
       }
       // farOcc counts NON-EMPTY cells, which now includes blocker-only ones —
       // it gates empty-space skipping for every far reader, and a reader that
@@ -4436,7 +4643,7 @@ fn far(@builtin(workgroup_id) wg : vec3<u32>,
         farColTopFrom(pcol.h, pcol.fluidTop, pcol.ruin, pfine.x, pfine.z, T.seed),
         pcc, shift, T.seed);
     if (pmat != MAT_AIR && materials[pmat].klass != CLASS_GAS) {
-      byteV |= min(farSurfaceMat(pcol, pmat, pfine, shift, T.seed), FAR_MAT_MASK);
+      byteV |= min(farSurfaceMat(pcol, pmat, pfine, shift, poi, T.seed), FAR_MAT_MASK);
     }
     if (byteV != 0u) { pnz += 1u; }
     let bi = (level - 1u) * FAR_VOX + slot * CHUNK_VOL + ci;
@@ -4505,6 +4712,8 @@ fn fardown(@builtin(workgroup_id) wg : vec3<u32>,
   let sc = vec3<i32>(vec3<u32>(slot % NCHUNK, (slot / NCHUNK) % NCHUNK,
                                slot / (NCHUNK * NCHUNK)));
   let base = slotToWorldChunk(sc, T.origin) * i32(CHUNK);
+  // Constant over the whole dispatch, like in `far` above (see Poi).
+  let poi = poiAnchors(T.seed);
 
   for (var level = 1u; level <= FAR_LEVELS; level++) {
     let shift = farCellShift(level);
@@ -4562,7 +4771,7 @@ fn fardown(@builtin(workgroup_id) wg : vec3<u32>,
         // a downsampled chunk byte-identical to a refilled one at their shared
         // boundary, and it is why farSurfaceMat takes the column rather than
         // deriving a height of its own (surfHeightAt used to, and drifted).
-        byteV |= min(farSurfaceMat(pcol, mat, fine, shift, T.seed), FAR_MAT_MASK);
+        byteV |= min(farSurfaceMat(pcol, mat, fine, shift, poi, T.seed), FAR_MAT_MASK);
       }
       let bi = farVoxByteIndex(level, cc);
       let bsh = (bi & 3u) * 8u;
