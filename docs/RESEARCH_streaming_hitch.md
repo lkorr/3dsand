@@ -521,16 +521,71 @@ Any of R1/R3 should be sized against this number, not the harness's.
 > ~216,000 ticks. 29,063 is arithmetically unremarkable, and the reason it
 > "creeps up and never comes back" is that it literally cannot come back.
 >
-> ### The fix (NOT applied here — this package was the instrument)
+> ### The fix: TRIED, MEASURED, AND REJECTED — it loses voxels
 >
-> Three lines in `ConsumeOccupancy`: make the trigger `>= kPageFreeTicks`
-> instead of `==`, and hoist the re-arm out of the submit block so a stranded
-> candidate is re-armed whatever the reason it was not probed. With a `>=`
-> trigger the 8,160 pages parked in the harness drain at 128/tick in ~64 ticks.
-> This changes no hashed state (the page table is derived), so it costs a
-> `--gate streaming` and a residency re-measurement, not a rebaseline. Sizing
-> K against §6 should be redone AFTER it, because the number K is being sized
-> against is currently a third leak.
+> The three-line fix is obvious and it does not work, and WHY it does not work
+> is the more useful half of this section. Do not re-attempt it as written.
+>
+> **What was tried.** `ConsumeOccupancy`'s trigger widened from
+> `zeroStreak_[s] == kPageFreeTicks` to `>=`, the now-redundant re-arm loop
+> deleted, and the candidate list capped at collection so the eligible set does
+> not become a 32k-entry vector per tick. It does exactly what it says: frees
+> over `--gate streaming` went from a handful to **24,179**, i.e. the backlog
+> drains.
+>
+> **What it costs.** `--gate streaming` reports **21,696,512 page faults —
+> `*** SENTINEL WRITES LOST VOXELS ***`, lost lava.** That is 5,296 chunks'
+> worth of dropped stores (21,696,512 = 5,296 x 4,096), against 0 on the tree
+> that ships here. A change that trips the one counter this engine treats as
+> "0 is the only acceptable value" does not land, however good its residency
+> number is.
+>
+> **Two further guards were tried and neither touched it**, which is the
+> finding:
+>
+> 1. Re-arming `zeroStreak_` in `EnsurePageForOverwrite` (residency BEGINS
+>    there for every streaming refill / genList slot / worldgen batch, and
+>    `Materialize` already re-arms at its own sentinel->page transition, so this
+>    is a real omission worth fixing on its own terms — it just is not this bug).
+> 2. Adding the snapshot's own `dirtyFlags[slot] == 0` as a second conjunct at
+>    selection — the same belt-and-braces the deferred-wake shift adopted for
+>    its sky demote.
+>
+> All three binaries reported **the identical 21,696,512** and the identical
+> 24,179 frees. The census's new `snap-dirty` counter says why guard 2 was
+> inert: **0 refusals on every sample** — the snapshot's dirty flags are clear
+> for every slot the free path selects. The chunks are genuinely clean when the
+> snapshot is stamped and are woken afterwards, by something the CPU mirror
+> never hears about.
+>
+> **So the strand was load-bearing.** Two things were true at once and only the
+> first was known:
+>
+> - `hasMatter` in `Materialize` is "a resident page OR a non-air sentinel" —
+>   **a resident ALL-AIR page counts**. So every stranded page was widening the
+>   materialization set by its own 26-ring, every tick, for free. Freeing them
+>   shrinks that set.
+> - The free path's only real guard is `!cpuDirty`, and `cpuDirty` is a superset
+>   of the writes the **CPU caused**, not of `dirtyIn`. The GPU wakes chunks the
+>   mirror never hears about, and **freeing a page does not clear the GPU's
+>   dirty bit**. The equality trigger made eligibility a one-tick window a slot
+>   got once in its life, so that hole was almost never reached.
+>
+> The leak and the mirror hole are therefore the same bug seen from two ends,
+> and the leak is the one that is currently holding the world together. **The
+> `>=` change must land WITH a repair to `cpuDirty ⊇ dirtyIn`, not before it** —
+> and that repair is in `stream.cpp` / the deferred wake, not in `pagetable.cpp`.
+> Sizing K against §6 should be redone after both.
+>
+> **One reporter defect found on the way, worth fixing whoever gets there
+> first:** `selftest.cpp`'s page-fault report decodes `pageFaults[1]`/`[3]` (the
+> highest and lowest refusing SLOT) through `SlotToWorldChunk` **at report
+> time**, i.e. with whatever window origin the run ended on. After any window
+> shift those printed chunk coordinates are fiction. They cost an hour here:
+> they appeared to name chunks nowhere near anything the free path had touched,
+> which is what the freed-slot attribution (`[pt] tick N FREED slot ... chunk
+> ...`, added and then reverted with the rest of the attempt) eventually
+> contradicted. The fault path should record the world chunk key, not the slot.
 >
 > ### What the harness still cannot reproduce
 >
