@@ -408,6 +408,18 @@ CA side of the seam. Verified independent of WP5: it fails identically at
 The fix needs a counter inside `doReactions`, which is in `sim_step.wgsl` —
 out of scope for the WP5 branch by explicit instruction. Queued.
 
+## `fire-down` — arm B lost to the weak flame, by the owner's choice (2026-09-03)
+
+Flipped to `"fail"` in the follow-up to fe3718d. Fire ignites at an eighth of
+the coals' rate now (`neighborChance`, gate `weak-flame`), and the flame a
+burning leaf emits DOWNWARD is fire: it was the only path across an air gap,
+so arm B (upper slab lighting the lower slab across one cell of air) went from
+saturating to 9% and the lower slab's bottom to 0%. Arm A (conduction through
+a slab) still reads 90-95%. A falling, non-floating downward product restored
+the arm to 85%; the owner declined it. Flip back if that ever changes.
+
+    fire-down: lit 98% | A conduct 90% | B emit (down 1 cell of air) 9% | lower slab bottom 0% [floor 60%]
+
 ## `shadow-cache` — failing at HEAD before the weak-flame change (2026-09-03)
 
 Flipped to `"fail"` while landing the floating-flame / burn-tint change, which

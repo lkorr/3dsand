@@ -23,21 +23,6 @@
       "becomes": "air"
     },
     {
-      "note": "-------- spark: the falling ember. Douse first, then die to air --------\n`fire` is what rises off a burning voxel; `spark` is what FALLS off one. Every dir:down emit rule in this file (ember, the three burning-leaf materials, burning cloth / hair / linen / flesh) emits this now rather than `fire`, because fire became a weak igniter (the neighborChance section below) and fire licking DOWN through air was the only way a burning thing lit what was under it across a gap -- the fire-down gate's arm B fell from saturating to 9% the day fire was cut 8x. A spark is a light hot powder: it drops, rests on whatever it lands on for a few ticks and lights it at the coals' rate, then goes out. See its note in materials.json for the numbers. It carries no neighborChance of its own -- a fleck that has LANDED on fuel is the coals, not the flame -- and if a burning tree lights the grass under it too readily, the lever is `\"spark\": 0.5` beside `\"fire\"` in the ignition rules' neighborChance, not this decay."
-    },
-    {
-      "self": "spark",
-      "neighbor": "tag:extinguisher",
-      "chance": 600,
-      "selfBecomes": "air"
-    },
-    {
-      "self": "spark",
-      "decay": true,
-      "chance": 180,
-      "becomes": "air"
-    },
-    {
       "note": "-------- smoke & steam: fade; steam condenses into rain --------"
     },
     {
@@ -62,7 +47,7 @@
       "note": "-------- combustion: each flammable defines its burn character --------\nTHE IGNITION CHANCE IS HOW FAST FIRE SPREADS THROUGH THE FUEL; the decay rules further down are how long a lit voxel takes to be consumed. They are separate levers and this note exists because they are easy to confuse. Wood/bark were slowed 1.5x here (18 -> 12, birch 22 -> 15, staff 16 -> 11) so a fire creeps up a trunk instead of running it; the ember decays below are UNCHANGED, so a lit log still burns out on the same schedule it always did."
     },
     {
-      "note": "-------- neighborChance: the FLOATING flame is a weak igniter --------\nEvery ignition rule below is `neighbor: tag:hot`, and `fire` -- the gas that rises off every burning voxel and drifts through the air, the thing that reads on screen as embers floating up from a blaze -- carries that tag alongside the stationary heat sources (ember, lava, a burning leaf, burning cloth and flesh). So a single drifting flame that brushed a tree, a robe or a grass slope lit it at the same rate as a bed of coals pressed against it, and a campfire's plume set light to everything downwind of it.\n\n`\"neighborChance\": { \"fire\": 0.125 }` on a rule says: this rule's chance, but an EIGHTH of it when the hot neighbour is fire. The loader (src/sim/materials.cpp ExpandNeighborChance) compiles it away into two rules the kernels already understand -- the base rule re-pointed at a synthetic tag (hot minus fire) and an exact-neighbour fire rule at the scaled chance -- so nothing on the GPU or in the body evaluator learned a new field, and a new hot material is covered without remembering a second tag. ONLY IGNITION carries it: a rule whose product is a burning material. The steam / melt / mite rules on tag:hot are untouched (a flame over water still steams it), the skin SEAR is untouched (a lick of flame still cooks the surface; flammability is the minCount-3 decay, which counts hot faces and has no per-material weight), and it never touches how long anything burns. The stationary sources keep the authored rate, so a burning log still lights the log beside it exactly as before -- what changed is that the flames rising OFF it are no longer the thing that spreads the fire. What spreads it DOWNWARD is now `spark` (above): the dir:down emits drop a falling ember instead of a flame, because a flame in the air below a burning leaf was the one downward path across a gap and cutting it 8x cut that path with it."
+      "note": "-------- neighborChance: the FLOATING flame is a weak igniter --------\nEvery ignition rule below is `neighbor: tag:hot`, and `fire` -- the gas that rises off every burning voxel and drifts through the air, the thing that reads on screen as embers floating up from a blaze -- carries that tag alongside the stationary heat sources (ember, lava, a burning leaf, burning cloth and flesh). So a single drifting flame that brushed a tree, a robe or a grass slope lit it at the same rate as a bed of coals pressed against it, and a campfire's plume set light to everything downwind of it.\n\n`\"neighborChance\": { \"fire\": 0.125 }` on a rule says: this rule's chance, but an EIGHTH of it when the hot neighbour is fire. The loader (src/sim/materials.cpp ExpandNeighborChance) compiles it away into two rules the kernels already understand -- the base rule re-pointed at a synthetic tag (hot minus fire) and an exact-neighbour fire rule at the scaled chance -- so nothing on the GPU or in the body evaluator learned a new field, and a new hot material is covered without remembering a second tag. ONLY IGNITION carries it: a rule whose product is a burning material. The steam / melt / mite rules on tag:hot are untouched (a flame over water still steams it), the skin SEAR is untouched (a lick of flame still cooks the surface; flammability is the minCount-3 decay, which counts hot faces and has no per-material weight), and it never touches how long anything burns. The stationary sources keep the authored rate, so a burning log still lights the log beside it exactly as before -- what changed is that the flames rising OFF it are no longer the thing that spreads the fire. THE COST, measured and accepted by the owner: the flame a burning voxel emits DOWNWARD is fire too, and it was fire's only path across an air gap, so the fire-down gate's arm B (a slab of leaves lighting the slab one cell of air below it) fell from saturating to ~9% -- a canopy with air between its layers now burns its top and leaves the layers below a gap alone. fire-down is carried as known-failing in tests/baseline.json for that reason; the fix, if one is ever wanted, is a downward product that does not float, not a bigger fire multiplier."
     },
     {
       "self": "wood",
@@ -207,7 +192,7 @@
     },
     {
       "self": "leaf_burning",
-      "emit": "spark",
+      "emit": "fire",
       "dir": "down",
       "chance": 35
     },
@@ -248,7 +233,7 @@
     },
     {
       "self": "pine_burning",
-      "emit": "spark",
+      "emit": "fire",
       "dir": "down",
       "chance": 35
     },
@@ -286,7 +271,7 @@
     },
     {
       "self": "autumn_burning",
-      "emit": "spark",
+      "emit": "fire",
       "dir": "down",
       "chance": 35
     },
@@ -429,7 +414,7 @@
     },
     {
       "self": "ember",
-      "emit": "spark",
+      "emit": "fire",
       "dir": "down",
       "chance": 45
     },
@@ -977,7 +962,7 @@
     },
     {
       "self": "cloth_burning",
-      "emit": "spark",
+      "emit": "fire",
       "dir": "down",
       "chance": 60
     },
@@ -1043,7 +1028,7 @@
     },
     {
       "self": "hair_burning",
-      "emit": "spark",
+      "emit": "fire",
       "dir": "down",
       "chance": 100
     },
@@ -1080,7 +1065,7 @@
     },
     {
       "self": "linen_burning",
-      "emit": "spark",
+      "emit": "fire",
       "dir": "down",
       "chance": 60
     },
@@ -1134,7 +1119,7 @@
     },
     {
       "self": "flesh_burning",
-      "emit": "spark",
+      "emit": "fire",
       "dir": "down",
       "chance": 35
     },

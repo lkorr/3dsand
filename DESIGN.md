@@ -1432,14 +1432,10 @@ Author in JSON, hot-reload at runtime, compile at load into flat GPU tables.
   flesh's minCount-3 ignition is a decay COUNT with no per-material weight.
   Gate `weak-flame` reads the compiled table and asserts the split.
 
-  **What falls is not what floats.** Weakening fire took its only downward path
-  across an air gap with it: every `dir: down` emit rule emitted `fire`, and a
-  flame in the air under a burning leaf was how a canopy lit the layer below a
-  gap (`fire-down` arm B went from saturating to 9%). Those emits now drop
-  `spark` — a short-lived hot POWDER, the falling ember — which lands on what
-  is below, lights it at the coals' rate and goes out to air. Same emission
-  rate as the flame it replaced, so the activity budget is unchanged; no ash,
-  no smoke, because a crown sheds thousands.
+  The cost, accepted by the owner: the flame a burning voxel emits downward is
+  fire too and was fire's only path across an air gap, so `fire-down`'s
+  air-gap arm fell from saturating to ~9% and the gate is carried as
+  known-failing. A canopy with air between its layers burns its top.
 
 - **Staining (2026-08-20):** a liquid may mark the voxels it touches, and may
   eat what it marks. Authored per material, not per material PAIR — the same

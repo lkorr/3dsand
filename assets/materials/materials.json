@@ -2811,22 +2811,6 @@
         "organic"
       ],
       "molten": "fire"
-    },
-    {
-      "//": "A FALLING EMBER: the burning fleck that drops off a burning crown, log, robe or body and lands on whatever is below. It exists because the floating flame became a weak igniter (reactions.json, neighborChance) and that took fire's ONLY downward path across an air gap with it: every dir:down emit rule used to emit `fire`, a gas that rises with probability 1 in calm air and ignited what it touched at the full rate, and the fire-down gate's arm B (a slab of leaves lighting the slab one cell of air below it) went from saturating to 9% the moment fire's ignition was cut 8x. A flame licking DOWN through air was never the mechanism that spreads a real fire downward anyway; embers falling out of it are. So the dir:down emits now emit this instead: a light hot POWDER that falls, rests on what it lands on for a few ticks and lights it at the coals' rate, then goes out to air. Short-lived on purpose (180 per-mille, ~5.5 ticks: far enough to fall a canopy gap or a body's height, not far enough to rain fire across a forest floor) and it leaves NOTHING -- no ash, no smoke -- because it is emitted at the rate the fire it replaced was and a crown sheds thousands of them. Doused by anything wet first, so a spark that lands in a pond dies before it can steam it. Not flammable (it is already burning) and not marked burnDuration (it is a flame-like transient, like `fire`, not fuel). Emission just under fire's so a shower of them reads as sparks against the flame rather than as more flame. The stationary heat sources and this one keep the AUTHORED ignition rate; only `fire` -- the flame that floats up and away -- is weakened.",
-      "id": "spark",
-      "class": "powder",
-      "density": 120,
-      "hardness": 1,
-      "emission": 230,
-      "colors": [
-        "#ff8a3a",
-        "#e85a1c",
-        "#ffb060"
-      ],
-      "tags": [
-        "hot"
-      ]
     }
   ]
 }

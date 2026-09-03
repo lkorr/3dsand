@@ -2608,12 +2608,11 @@ Status GateSimd(Ctx&, std::string& detail) {
 // and never touches the bottom layer of leaves, and a character whose torso
 // burns through never lights his own legs.
 //
-// SINCE 2026-09-03 the dir:down emit drops `spark` -- a falling hot powder --
-// rather than `fire`. Fire became a weak igniter (neighborChance, gate
-// weak-flame) and arm B fell from saturating to 9% with it: a flame in the
-// air below a burning leaf WAS the downward path across a gap. A falling ember
-// is the honest version of that path and lights what it lands on at the
-// coals' rate, which is what this gate now measures on arm B.
+// KNOWN-FAILING SINCE 2026-09-03, by the owner's choice: fire became a weak
+// igniter (neighborChance, gate weak-flame) and arm B fell from saturating
+// to ~9% with it, because the flame emitted downward IS fire and was the only
+// path across a gap. A falling non-floating product would restore the arm;
+// the owner declined one. Arm A (conduction) still saturates.
 //
 // TWO ARMS, because the fix is two mechanisms and either one alone would let a
 // one-armed gate pass while half the bug survived:
@@ -2782,8 +2781,7 @@ Status GateFireDown(Ctx& c, std::string& detail) {
 //
 // Pure CPU over c.mats / c.reactions: no world, no GPU, nothing left behind.
 // Asserted per fuel, for a spread of fuels (wood, the three foliage families,
-// grass, cloth): the base rule must match ember, lava and spark (the FALLING
-// ember, which is the coals and keeps the rate) and NOT fire, the
+// grass, cloth): the base rule must match ember and lava and NOT fire, the
 // fire rule must exist at base/ratio, and the two must sit in that order (a
 // voxel touching both rolls the full rate first). And the two things the
 // exception must NOT have touched: water still steams against fire, skin is
@@ -2795,9 +2793,9 @@ Status GateWeakFlame(Ctx& c, std::string& detail) {
     return 0;
   };
   const uint32_t mFire = matId("fire"), mEmber = matId("ember"),
-                 mLava = matId("lava"), mSpark = matId("spark");
-  if (!mFire || !mEmber || !mLava || !mSpark) {
-    detail = "fire / ember / lava / spark missing from materials.json";
+                 mLava = matId("lava");
+  if (!mFire || !mEmber || !mLava) {
+    detail = "fire / ember / lava missing from materials.json";
     return Status::Fail;
   }
   const double ratio = BaselineNumber("weakFlame.ratio", 8.0);
@@ -2836,18 +2834,15 @@ Status GateWeakFlame(Ctx& c, std::string& detail) {
     const bool excludesFire = (fireTags & base.nbrTags) == 0;
     const bool keepsEmber = (c.mats[mEmber].gpu.tagMask & base.nbrTags) != 0;
     const bool keepsLava = (c.mats[mLava].gpu.tagMask & base.nbrTags) != 0;
-    // The falling ember is the coals, not the flame: it must keep the rate.
-    const bool keepsSpark = (c.mats[mSpark].gpu.tagMask & base.nbrTags) != 0;
     const double got = flame.chance > 0
                            ? (double)base.chance / (double)flame.chance : 0.0;
     const bool scaled = std::fabs(got - ratio) < 0.05;
     const bool ordered = baseAt < flameAt;
-    if (!(excludesFire && keepsEmber && keepsLava && keepsSpark && scaled &&
-          ordered)) {
+    if (!(excludesFire && keepsEmber && keepsLava && scaled && ordered)) {
       char b[160];
       std::snprintf(b, sizeof(b), " %s:{fire-in-mask %d, ember %d, lava %d, "
-                    "spark %d, ratio %.2f, order %d}", f.self, !excludesFire,
-                    keepsEmber, keepsLava, keepsSpark, got, ordered);
+                    "ratio %.2f, order %d}", f.self, !excludesFire, keepsEmber,
+                    keepsLava, got, ordered);
       fails += b;
     }
     checked++;
