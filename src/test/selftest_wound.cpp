@@ -54,6 +54,7 @@
 
 #include "game/item.h"
 #include "game/mob.h"
+#include "sim/microbody.h"
 #include "sim/tuning.h"
 #include "test/selftest.h"
 #include "test/support.h"
@@ -1410,6 +1411,371 @@ Status GateCorpseBleed(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+
+// ---------------------------------------------------------------------------
+// corpse-burn: a body that dies alight goes on burning (Gore §G, corpses)
+// ---------------------------------------------------------------------------
+//
+// Reported 2026-09-02: an NPC that died on fire lay there with its embers
+// pulsing at the colour they died in, for good — no char, no smoke, no ash.
+// The live creature burns through MobSystem::BurnOneLimb; the moment Die()
+// hands its limbs to DebrisSystem the same voxels are DebrisSystem::BurnBodies'
+// business, and mob-burn's corpse subtest only asks that the corpse lose at
+// least one voxel in 120 ticks, which a single ember shedding ash satisfies.
+//
+//   A. the same bonfire burn-cap dies in, until the creature is dead, and it
+//      must die with fire ON it (else there is nothing to test).
+//   B. the corpse, with the fixture's fire gone, for `window` ticks: EVERY
+//      piece that died with embers must have advanced them — burning falls,
+//      char rises — and the corpse as a whole must have retired most of what
+//      was alight. Per piece, because a shared scan budget spent in list
+//      order starves the tail (Mob::BurnTick learned this on limbs), and a
+//      total hides a foot that never burned behind a torso that did.
+//   C. the corpse keeps putting real fire into the world while alight — the
+//      smoke and flame a burning body shows are grid fire it emits.
+//   D. THE BRICK AGREES WITH THE LATTICE. The lattice is what burns; the
+//      brick is what is drawn. A poke that misses (wrong frame, unowned
+//      model, pool full) leaves a corpse whose truth is char and whose
+//      picture is embers, which is exactly the report.
+Status GateCorpseBurn(Ctx& c, std::string& detail) {
+  MobSystem& mobs = c.mobs;
+  IdCounterScope idScope(mobs);
+  if (!mobs.BurnTablesReady()) {
+    detail = "burn tables not loaded";
+    return Status::Fail;
+  }
+  auto matId = [&](const char* n) -> uint32_t {
+    for (size_t i = 0; i < c.mats.size(); i++)
+      if (c.mats[i].name == n) return (uint32_t)i;
+    return 0;
+  };
+  const uint32_t mFire = matId("fire"), mSmoke = matId("smoke"),
+                 mAsh = matId("ash");
+  const uint32_t alight[] = {matId("flesh_burning"), matId("cloth_burning"),
+                             matId("linen_burning")};
+  const uint32_t spent[] = {matId("flesh_charred"), matId("flesh_cinder"),
+                            matId("cloth_charred"), matId("linen_charred")};
+  if (!mFire || !alight[0] || !spent[0]) {
+    detail = "fire / flesh_burning / flesh_charred missing from materials.json";
+    return Status::Fail;
+  }
+
+  PrepareWorld(c);
+  // THE CENTRE OF THE WINDOW, not an edge inset like the other fixtures: a
+  // burning NPC runs (measured: 32 voxels along z in the 177 ticks it took to
+  // die), and from an inset of 480 that carried it across the window edge,
+  // where no chunk is fetched, no terrain mesh is built, and the corpse fell
+  // 225 voxels into nothing. The other gates hold their creature in place.
+  const int inset = (int)(kWorldN / 2);
+  const Target t = ChooseTarget(mobs, FixtureSite(c.world, inset));
+  if (!t.valid()) {
+    detail = "no loaded mob def has a severable non-vital limb that bleeds";
+    return Status::Fail;
+  }
+  const MobDef& def = mobs.Defs()[t.defIndex];
+  const int rootLimb = def.rootLimb;
+  IVec3 pchunk{};
+  const uint64_t id = SpawnTarget(c, t, inset, pchunk);
+  if (!id || rootLimb < 0) {
+    detail = "spawn refused";
+    return Status::Fail;
+  }
+
+  uint32_t tick = 71000;
+  uint32_t debrisFireOps = 0, debrisResidueOps = 0;
+  // One real tick. `soak` lights burn-cap's bonfire around the creature. Ops
+  // the DEBRIS pass pushed are counted before the fixture adds its own, and
+  // only the debris pass's — the mob's go with the mob.
+  Vec3 pyre{};
+  auto tickOnce = [&](bool soak) {
+    std::vector<BrushOp> ops;
+    std::vector<ParticleSpawn> spawns;
+    std::vector<CellOp> cellOps;
+    mobs.PreTick(tick + 1, c.world, ops, cellOps, spawns);
+    const size_t fromMobs = cellOps.size();
+    c.debris.QueueSupportEvents(c.world.Snap());
+    c.debris.PreTick(tick + 1, c.world, cellOps, spawns);
+    for (size_t k = fromMobs; k < cellOps.size(); k++) {
+      const uint32_t m = cellOps[k].word & 0xFFFu;
+      if (m == mFire) debrisFireOps++;
+      else if (m == mSmoke || m == mAsh) debrisResidueOps++;
+    }
+    if (soak) {
+      if (mobs.IsAlive(id) && mobs.LimbBody(id, rootLimb))
+        pyre = mobs.LimbVoxelPos(id, rootLimb, 0);
+      const IVec3 b{ifloor(pyre.x), ifloor(pyre.y), ifloor(pyre.z)};
+      for (int dy = -8; dy <= 20; dy++)
+        for (int dz = -6; dz <= 6; dz++)
+          for (int dx = -6; dx <= 6; dx++) {
+            const IVec3 cc{b.x + dx, b.y + dy, b.z + dz};
+            if (!c.world.CellInWindow(cc)) continue;
+            if (cellOps.size() >= kMaxCellOpsPerTick) break;
+            const bool aboveGround =
+                cc.y > World::TerrainHeight(cc.x, cc.z, kDefaultSeed);
+            cellOps.push_back(
+                {World::SlotCellIndex(cc),
+                 PackVoxNew(mFire, 7u) | (aboveGround ? 0u : kCellOpIfAir)});
+          }
+    }
+    ++tick;
+    SubmitTick(c.ctx, c.world, c.sim, tick, kDefaultSeed, ops, {}, cellOps,
+               false, pchunk, true, false, spawns);
+    c.ctx.WaitIdle();
+    c.ctx.ProcessEvents();
+    c.phys.Step(kTickDt);
+    c.debris.PostStep();
+    mobs.PostStep();
+  };
+
+  // ---- A. die in the fire -------------------------------------------------
+  int deathTick = -1;
+  for (int i = 0; i < 1200; i++) {
+    tickOnce(true);
+    if (!mobs.IsAlive(id)) {
+      deathTick = i;
+      break;
+    }
+  }
+  const std::string cause = mobs.DeathCause(id);
+  // The husk is swept on the next PreTick; the bodies are already debris.
+  auto sumOf = [&](uint32_t bi, const uint32_t* mats, size_t n) {
+    uint32_t s = 0;
+    for (size_t k = 0; k < n; k++)
+      if (mats[k]) s += c.debris.BodyMaterialCount(bi, mats[k]);
+    return s;
+  };
+  auto alightOf = [&](uint32_t bi) { return sumOf(bi, alight, 3); };
+  auto spentOf = [&](uint32_t bi) { return sumOf(bi, spent, 4); };
+  // Pieces are tracked by HANDLE. A burn rebuild replaces the handle
+  // (ReplaceBody) and a piece burnt below body-worthiness is swap-removed, so
+  // neither an index nor a handle is stable across the window; a piece whose
+  // handle is no longer present is matched by voxel count among the unclaimed
+  // bodies, and one that matches nothing has finished burning (gone).
+  struct Piece {
+    uint64_t handle;
+    uint32_t alight0, spent0, voxels0;
+    Vec3 pos;
+    uint32_t alight1 = 0, spent1 = 0;
+    bool matched = false, gone = false;
+  };
+  std::vector<Piece> pieces;
+  uint32_t alight0 = 0, spent0 = 0;
+  for (uint32_t bi = 0; bi < c.debris.BodyCount(); bi++) {
+    Piece p{c.debris.BodyHandle(bi), alightOf(bi), spentOf(bi),
+            c.debris.BodyVoxelCount(bi), c.debris.BodyPosition(bi)};
+    alight0 += p.alight0;
+    spent0 += p.spent0;
+    pieces.push_back(p);
+  }
+  const uint32_t bodies0 = c.debris.BodyCount();
+
+  // ---- B + C. the corpse, alone with its own fire ---------------------------
+  // WHERE THE BODIES WENT is recorded per tick (rule 6): "0 bodies at the
+  // end" is a bare count, and a corpse that settled into the grid, one that
+  // fell out of the window and one that burned away are three different
+  // stories with three different fixes.
+  const int window = 400;
+  debrisFireOps = 0;
+  debrisResidueOps = 0;
+  const uint32_t settled0 = c.debris.SettledBack();
+  int lastBodyTick = -1;
+  float lastY = 0.0f, groundY = 0.0f;
+  {
+    const IVec3 b{ifloor(pyre.x), ifloor(pyre.y), ifloor(pyre.z)};
+    groundY = (float)World::TerrainHeight(b.x, b.z, kDefaultSeed);
+  }
+  uint32_t bodiesMid = 0;
+  // The corpse's ground, tick by tick for the first moments: lowest body y
+  // and ManageTerrain's census of the chunks it wanted around the bodies.
+  std::string fall;
+  // ...and the column under the pyre as the chunk cache (the terrain mesh's
+  // source) sees it at death: a corpse falls through water and through a
+  // chunk nobody fetched, and those are different from falling through rock.
+  {
+    const IVec3 b{ifloor(pyre.x), ifloor(pyre.y), ifloor(pyre.z)};
+    Vec3 mean{};
+    for (uint32_t bi = 0; bi < c.debris.BodyCount(); bi++)
+      mean += c.debris.BodyPosition(bi);
+    if (c.debris.BodyCount()) mean = mean * (1.0f / (float)c.debris.BodyCount());
+    const IVec3 org = c.world.WindowOrigin();
+    fall += Format(" pyre (%.0f,%.0f,%.0f) bodies mean (%.0f,%.0f,%.0f) window "
+                   "origin chunk (%d,%d,%d) pchunk (%d,%d,%d) pyre chunk in "
+                   "window=%d cached=%d;",
+                   pyre.x, pyre.y, pyre.z, mean.x, mean.y, mean.z, org.x, org.y,
+                   org.z, pchunk.x, pchunk.y, pchunk.z,
+                   c.world.ChunkInWindow(IVec3{b.x >> 4, b.y >> 4, b.z >> 4}) ? 1 : 0,
+                   c.world.Cached(IVec3{b.x >> 4, b.y >> 4, b.z >> 4}) ? 1 : 0);
+    fall += " column";
+    for (int y = (int)groundY + 4; y >= (int)groundY - 3; y--) {
+      const IVec3 cc{b.x, y, b.z};
+      const CachedChunk* ch = c.world.Cached(IVec3{cc.x >> 4, cc.y >> 4, cc.z >> 4});
+      if (!ch || ch->voxels.size() != kChunkVol) {
+        fall += Format(" %d:?", y);
+        continue;
+      }
+      const uint32_t m =
+          ch->voxels[((cc.z & 15) * (int)kChunk + (cc.y & 15)) * (int)kChunk +
+                     (cc.x & 15)] & 0xFFFu;
+      fall += Format(" %d:%s", y, m < c.mats.size() ? c.mats[m].name.c_str() : "?");
+    }
+    fall += ";";
+  }
+  for (int i = 0; i < window; i++) {
+    if (i < 12 || i == 30 || i == 60) {
+      float lo = 1e9f;
+      for (uint32_t bi = 0; bi < c.debris.BodyCount(); bi++)
+        lo = std::min(lo, c.debris.BodyPosition(bi).y);
+      uint32_t built = 0, unfetched = 0, empty = 0;
+      c.debris.TerrainCensus(built, unfetched, empty);
+      fall += Format(" t+%d:y%.1f/%ub%uu%ue", i, lo, built, unfetched, empty);
+    }
+    tickOnce(false);
+    if (c.debris.BodyCount() > 0) {
+      lastBodyTick = i;
+      float lo = 1e9f;
+      for (uint32_t bi = 0; bi < c.debris.BodyCount(); bi++)
+        lo = std::min(lo, c.debris.BodyPosition(bi).y);
+      lastY = lo;
+    }
+    if (i == window / 2) bodiesMid = c.debris.BodyCount();
+  }
+  const uint32_t settled = c.debris.SettledBack() - settled0;
+
+  std::vector<int> claimed(c.debris.BodyCount(), 0);
+  auto claim = [&](Piece& p, uint32_t bi) {
+    claimed[bi] = 1;
+    p.matched = true;
+    p.alight1 = alightOf(bi);
+    p.spent1 = spentOf(bi);
+  };
+  for (Piece& p : pieces)
+    for (uint32_t bi = 0; bi < c.debris.BodyCount(); bi++)
+      if (!claimed[bi] && c.debris.BodyHandle(bi) == p.handle) {
+        claim(p, bi);
+        break;
+      }
+  // Handle gone: the piece was rebuilt (new handle) or burnt away. Match the
+  // nearest unclaimed body to where the piece lay; a still corpse does not
+  // travel, so anything farther than a body length is not it.
+  for (Piece& p : pieces) {
+    if (p.matched) continue;
+    int best = -1;
+    float bestD = 6.0f;
+    for (uint32_t bi = 0; bi < c.debris.BodyCount(); bi++) {
+      if (claimed[bi]) continue;
+      const float d = (c.debris.BodyPosition(bi) - p.pos).len();
+      if (d < bestD) {
+        bestD = d;
+        best = (int)bi;
+      }
+    }
+    if (best >= 0) claim(p, (uint32_t)best);
+    else p.gone = true;
+  }
+  uint32_t alight1 = 0, spent1 = 0;
+  for (uint32_t bi = 0; bi < c.debris.BodyCount(); bi++) {
+    alight1 += alightOf(bi);
+    spent1 += spentOf(bi);
+  }
+  // Every piece that died with a real ember count must have MOVED: fewer
+  // alight or more spent. Not "retired half of it" -- a corpse with fire on
+  // it burns THROUGH, cooked flesh under the char catching from the embers
+  // beside it, so the alight count on a piece can hold or climb for hundreds
+  // of ticks while the char under it grows; measured 6,155 -> 1,872 alight
+  // and 3,090 -> 7,880 spent over the window, with 6,066 fire ops emitted.
+  // What must never happen is a piece whose numbers do not change at all,
+  // which is the starved body the report describes. 8 is the floor: a piece
+  // with three embers on it can lose them all to the dice or keep them all,
+  // and neither says anything.
+  std::string stalled;
+  uint32_t stalledCount = 0, litPieces = 0;
+  for (const Piece& p : pieces) {
+    if (p.alight0 < 8) continue;
+    litPieces++;
+    if (p.gone) continue;
+    if (p.alight1 * 2 > p.alight0 && p.spent1 <= p.spent0) {
+      stalledCount++;
+      if (stalled.size() < 200)
+        stalled += Format(" [%u vox: %u->%u alight, %u->%u spent]", p.voxels0,
+                          p.alight0, p.alight1, p.spent0, p.spent1);
+    }
+  }
+  // ...and the corpse as a whole is retiring fire, not growing it: fewer
+  // alight than it died with and more char, thirteen seconds on with no fire
+  // but its own. A corpse whose fire GREW over that window with nothing
+  // feeding it would be a closed loop in the fire economy (rule 2).
+  const bool advanced = alight0 > 0 && alight1 < alight0 &&
+                        spent1 > spent0 && stalledCount == 0;
+  const bool emitted = debrisFireOps > 0;
+
+  // ---- D. the brick agrees with the lattice --------------------------------
+  // Per surviving body: count the alight materials in the brick it is drawn
+  // from and compare with the same count on its lattice. A body on the cube
+  // path (no brick) has nothing to disagree with.
+  uint32_t bricks = 0, disagree = 0;
+  std::string disagreeDetail;
+  if (const MicroBodySet* set = c.debris.MicroSet()) {
+    for (uint32_t bi = 0; bi < c.debris.BodyCount(); bi++) {
+      const uint32_t model = c.debris.BodyMicroModel(bi);
+      if (model == kMicroBodyNoModel || model >= set->models.size()) continue;
+      const MicroBodyModelGpu& m = set->models[model];
+      const uint32_t dx = m.dims & 1023u, dy = (m.dims >> 10) & 1023u,
+                     dz = (m.dims >> 20) & 1023u;
+      const size_t count = (size_t)dx * dy * dz;
+      uint32_t brickAlight = 0, brickSpent = 0;
+      for (size_t idx = 0; idx < count; idx++) {
+        const uint32_t w = m.base + (uint32_t)(idx / 2);
+        if (w >= set->pool.size()) break;
+        const uint32_t mat = (set->pool[w] >> ((idx % 2) * 16u)) & 0xFFu;
+        if (!mat) continue;
+        for (uint32_t a : alight)
+          if (a && mat == a) brickAlight++;
+        for (uint32_t s : spent)
+          if (s && mat == s) brickSpent++;
+      }
+      bricks++;
+      const uint32_t latAlight = alightOf(bi), latSpent = spentOf(bi);
+      if (brickAlight != latAlight || brickSpent != latSpent) {
+        disagree++;
+        if (disagreeDetail.size() < 200)
+          disagreeDetail +=
+              Format(" [brick %u/%u vs lattice %u/%u alight/spent]",
+                     brickAlight, brickSpent, latAlight, latSpent);
+      }
+    }
+  }
+  const bool drawn = disagree == 0;
+
+  RecordObserved("corpseBurnDeathTick", (double)deathTick);
+  RecordObserved("corpseBurnAlightAtDeath", (double)alight0);
+  RecordObserved("corpseBurnAlightAtEnd", (double)alight1);
+  RecordObserved("corpseBurnFireOps", (double)debrisFireOps);
+  RecordObserved("corpseBurnStalledPieces", (double)stalledCount);
+
+  const bool died = deathTick >= 0;
+  const bool ok = died && alight0 > 0 && advanced && emitted && drawn;
+  const uint32_t bodies1 = c.debris.BodyCount();
+  mobs.Reset();
+  c.debris.Reset();
+  SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+  c.ctx.WaitIdle();
+  detail = Format(
+      "%s: died at tick %d of '%s' with %u alight / %u spent across %u bodies; "
+      "after %d ticks alone: %u alight / %u spent across %u bodies, %u of %u "
+      "lit pieces stalled%s; debris emitted %u fire + %u smoke/ash ops; %u "
+      "bricks, %u disagree with their lattice%s; %u settled back into the "
+      "grid, %u bodies at t+%d, last body seen at t+%d with lowest y %.1f "
+      "(ground %.0f); fall:%s",
+      t.defName.c_str(), deathTick, cause.c_str(), alight0, spent0, bodies0,
+      window, alight1, spent1, bodies1, stalledCount, litPieces,
+      stalled.c_str(), debrisFireOps, debrisResidueOps, bricks, disagree,
+      disagreeDetail.c_str(), settled, bodiesMid, window / 2, lastBodyTick,
+      lastY, groundY, fall.c_str());
+  std::printf("corpse-burn: %s\n", detail.c_str());
+  std::fflush(stdout);
+  return ok ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& WoundGates() {
@@ -1423,6 +1789,7 @@ const std::vector<Gate>& WoundGates() {
       {"one-hit", "mob", {}, false, GateOneHit, false},
       {"corpse-intact", "mob", {}, false, GateCorpseIntact, false},
       {"corpse-bleed", "mob", {}, false, GateCorpseBleed, false},
+      {"corpse-burn", "mob", {}, false, GateCorpseBurn, false},
   };
   return g;
 }

@@ -242,6 +242,11 @@ const char* const kOrder[] = {
     // Ticks the world (the corpse needs ground to lie on) and regenerates it
     // on the way out, like wound-bleed.
     "corpse-bleed",
+    // ...and a corpse that died alight keeps burning: every piece advances
+    // its embers, keeps emitting fire, and its brick agrees with its lattice
+    // (owner report 2026-09-02: the corpse pulsed at its death colour for
+    // good). Same world fire as burn-cap, regenerated on the way out.
+    "corpse-burn",
     // LAST of the world-touching gates, and it must be: BuildVoxRegion moves
     // the residency window and resets the page table, which is the state every
     // other gate's fixture placement assumes. It restores both before it

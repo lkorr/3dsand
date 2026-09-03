@@ -323,6 +323,45 @@ class DebrisSystem {
     const Body& b = bodies_[i];
     return (uint32_t)(b.HasFineSkin() ? b.skinVoxels.size() : b.voxels.size());
   }
+  // ---- corpse burn, for a gate that has to say WHICH piece stopped ---------
+  // TotalBodyMaterial for ONE body. "The corpse has 900 embers left" is a
+  // bare count; "the left foot has all 80 it died with" names the body the
+  // burn pass never reached.
+  uint32_t BodyMaterialCount(uint32_t i, uint32_t mat) const {
+    if (i >= bodies_.size()) return 0;
+    const Body& b = bodies_[i];
+    uint32_t n = 0;
+    if (b.HasFineSkin()) {
+      for (const PrefabVoxel& v : b.skinVoxels)
+        if ((v.material & 0xFFFu) == (mat & 0xFFFu)) n++;
+    } else {
+      for (const DebrisVoxel& v : b.voxels)
+        if ((v.payload & 0xFFFu) == (mat & 0xFFFu)) n++;
+    }
+    return n;
+  }
+  // The brick this body is DRAWN from (kMicroBodyNoModel on the cube path).
+  // A gate reads the brick back through MicroSet() and censuses it against
+  // the lattice above: the lattice is what burns, the brick is what the
+  // player sees, and "the corpse keeps glowing" is the two disagreeing.
+  uint32_t BodyMicroModel(uint32_t i) const {
+    return i < bodies_.size() ? bodies_[i].micro.model : kMicroBodyNoModel;
+  }
+  // ---- corpse ground, for a gate that has to say WHY a body fell ----------
+  // Of the chunks ManageTerrain wanted on its last sweep: how many carry a
+  // collision mesh, how many are still waiting on their chunk fetch, and how
+  // many were polygonized EMPTY. "The corpse fell out of the window" is a
+  // bare observation; these three numbers are its three causes.
+  void TerrainCensus(uint32_t& built, uint32_t& unfetched,
+                     uint32_t& empty) const {
+    built = unfetched = empty = 0;
+    for (const auto& [key, t] : terrain_) {
+      if (t.lastNeeded != lastTerrainTick_) continue;
+      if (t.handle) built++;
+      else if (t.builtVersion == 0) unfetched++;
+      else empty++;
+    }
+  }
   bool BodyActive(uint32_t i) const;
   uint32_t PendingEvents() const { return (uint32_t)events_.size(); }
   uint32_t SettledBack() const { return settledBack_; }
@@ -451,8 +490,14 @@ class DebrisSystem {
     uint32_t lastImpactStep = 0;  // rate limit, in PostStep counts (30 Hz)
     // body burn (fire continuity on rigidbodies):
     uint32_t serial = 0;          // stable RNG stream id (bodies_ reshuffles)
-    uint16_t activeCount = 0;     // voxels with self-driven rules (decay/emit)
+    uint16_t activeCount = 0;     // voxels with UNCONDITIONAL self rules: alight
     uint16_t pairCount = 0;       // voxels with pair rules (ignitable/dousable)
+    // voxels whose only self rules are neighbour-count gated (charred flesh
+    // relighting, cooked flesh catching): they need something hot NEXT to
+    // them, which is either this body's own alight voxels (activeCount) or
+    // the world's fire (a dirty chunk). Counted apart so a body that is
+    // nothing but char sleeps -- see BurnBodies' willScan.
+    uint16_t scaledCount = 0;
     uint32_t burnCursor = 0;      // rotating scan window into voxels
     uint32_t burnedSinceRebuild = 0;  // batched collider refresh threshold
     uint32_t burnedSinceShatter = 0;  // batched connectivity re-check
@@ -573,7 +618,8 @@ class DebrisSystem {
   // hardcoded material IDs — the JSON stays the single source of behavior)
   std::vector<MaterialGpu> matGpu_;
   std::vector<ReactionGpu> reactions_;
-  std::vector<uint8_t> matSelfActive_;  // material has decay/emit rules
+  std::vector<uint8_t> matSelfActive_;  // material has UNGATED decay/emit rules
+  std::vector<uint8_t> matSelfScaled_;  // ...or only neighbour-count gated ones
   std::vector<uint8_t> matHasPair_;     // material has pair rules
   std::vector<uint8_t> matHasScaled_;   // material has scaleByNeighbors rules
   // Authored GRID tints per material id, 0x00RRGGBB (MaterialDef::tints).
@@ -605,6 +651,7 @@ class DebrisSystem {
   std::vector<Body> bodies_;
   std::vector<std::pair<Vec3, float>> extraAnchors_;    // mob limbs, this tick
   std::unordered_map<uint64_t, TerrainEntry> terrain_;  // packed world chunk key
+  uint32_t lastTerrainTick_ = 0;  // the sweep TerrainCensus reports on
   uint32_t lastCellWriteTick_ = 0;
   bool instancesDirty_ = false;
   uint32_t instanceCount_ = 0;

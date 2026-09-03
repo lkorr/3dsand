@@ -2053,6 +2053,43 @@ neighbors, so this needs an explicit connectivity pass:
   current tick while anything burns would starve island detection forever.
   Selftest gate: `body burn` (ember-topped wood body must shed voxels and
   emit fire ops).
+- **A corpse keeps burning (2026-09-02):** the scan budget above
+  (`kBurnScanPerTick`, 4,096 voxels) was spent in list order to the last
+  voxel, so whichever bodies came first took it all and every body after them
+  got `scanBudget == 0` and skipped. A corpse is fifteen bodies adopted in limb
+  order, ~14k skin voxels on the human: three or four pieces burned and the
+  other eleven — torso included — kept the exact ember count they died with,
+  for good (`corpse-burn` measured 622→622 alight on the torso over 400 ticks,
+  245→245, 333→333, 160→160, 396→396 behind it). On screen: a corpse whose
+  embers pulse at the colour it died in and never char, smoke or ash. The live
+  creature had the same bug on its limbs (`Mob::BurnTick`, "rotate the start
+  limb by tick"); `BurnBodies` now does the same — the start body rotates by
+  tick and each scanning body takes at most its SHARE (budget left over
+  scanners left, floor `kBurnScanMinShare` = 256), handing the remainder on,
+  with the per-body cursor carrying a body larger than its share across
+  ticks. Deterministic: order is a function of tick and the body list, rolls
+  of the (serial, voxel, tick, rule) key. Bodies burned below body-worthiness
+  are erased after the loop, since the rotated order cannot survive a
+  mid-loop swap-remove. **Gated self rules do not keep a body awake:** a
+  decay/emit rule behind `scaleByNeighbors` cannot fire until something hot
+  sits beside the voxel, and `flesh_charred`/`flesh_cooked` own only such
+  rules — counted as "self-driven" they made every charred corpse a body the
+  pass scanned to its budget every tick for the rest of the session (the
+  light-gated-rules-never-sleep trap in another condition). They are tallied
+  in `Body::scaledCount` and wake a body only with a dirty chunk nearby,
+  exactly as pair rules do; an all-char corpse in a settled world costs two
+  field reads. Gate `corpse-burn` (selftest_wound.cpp): the burn-cap bonfire
+  until the human dies of it, then 400 ticks alone — every piece that died
+  with ≥8 embers must have moved (fewer alight or more spent), the corpse as a
+  whole must be retiring fire not growing it, the debris pass must still emit
+  real fire, and every piece's BRICK must census the same alight/spent counts
+  as its lattice (the lattice burns, the brick is what is drawn). Measured
+  after the fix: 6,153→1,870 alight, 3,090→7,866 spent, 6,067 fire ops, 15
+  bricks all agreeing. Fixture note: a burning NPC RUNS (32 voxels in 89
+  ticks), and from an inset near the window edge it crossed it — no fetch, no
+  terrain mesh, the corpse fell 225 voxels into nothing — so this fixture sits
+  at the window centre; `DebrisSystem::TerrainCensus` (built / unfetched /
+  empty meshes on the last sweep) is the instrument that said so.
 - **Body shatter (2026-08-19, implemented):** when burn removals disconnect a
   body's voxels, `ShatterBody` splits it: the largest 6-connected component
   keeps the body, fragments ≥ `kMinBurnFragmentVoxels` (24) become bodies of

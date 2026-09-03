@@ -76,6 +76,11 @@ constexpr uint32_t kMinBurnFragmentVoxels = 24;
 // (emitted fire / escaping ash+smoke) per tick, and how many voxels must burn
 // away before the Jolt collider is rebuilt to match the charred shape.
 constexpr uint32_t kBurnScanPerTick = 4096;
+// The least any scanning body is offered of that per tick, however many
+// bodies are scanning: a body's share is the larger of this and an even split
+// of what is left (BurnBodies, "FAIR SHARE"). 256 keeps a scale-8 finger
+// (a few hundred skin voxels) covered every tick or two even in a crowd.
+constexpr uint32_t kBurnScanMinShare = 256;
 constexpr uint32_t kBurnOpsPerTick = 384;
 constexpr uint32_t kBurnRebuildVoxels = 12;
 // Connectivity re-check after burning is O(n) per body; run it only when
@@ -218,6 +223,7 @@ void DebrisSystem::OnMaterialsReloaded(const std::vector<MaterialDef>& mats,
   tintMapValid_ = false;  // tint lists just moved: the art map derived from them
   matGpu_.clear();
   matSelfActive_.clear();
+  matSelfScaled_.clear();
   matHasPair_.clear();
   matHasScaled_.clear();
   reactions_ = reactions;
@@ -227,14 +233,29 @@ void DebrisSystem::OnMaterialsReloaded(const std::vector<MaterialDef>& mats,
     densityOf_.push_back((float)m.gpu.density);
     matGpu_.push_back(m.gpu);
     matTints_.push_back(m.tints);
-    // which rule shapes this material owns (drives the burn-pass gates)
-    uint8_t selfActive = 0, hasPair = 0;
+    // which rule shapes this material owns (drives the burn-pass gates).
+    //
+    // A self rule behind a neighbour-count ramp is NOT "self-driven": it
+    // cannot fire until something hot sits next to the voxel, and until then
+    // it is exactly as inert as a pair rule with no partner. flesh_charred
+    // and flesh_cooked own only such rules (relight under a four-face front,
+    // catch under a three-face one), and counting them as active made every
+    // charred corpse a body BurnBodies scanned to its budget every tick for
+    // the rest of the session -- the light-gated-rules-never-sleep trap
+    // (CLAUDE.md rule 2) wearing a different condition. Gated self rules go
+    // in their own column and wake a body only with fire nearby.
+    uint8_t selfActive = 0, selfScaled = 0, hasPair = 0;
     for (uint32_t ri = 0; ri < m.gpu.reactCount; ri++) {
-      uint32_t kind = reactions_[m.gpu.reactOffset + ri].packed & 3u;
-      if (kind == kReactDecay || kind == kReactEmit) selfActive = 1;
+      const ReactionGpu& r = reactions_[m.gpu.reactOffset + ri];
+      uint32_t kind = r.packed & 3u;
+      if (kind == kReactDecay || kind == kReactEmit) {
+        if (ReactScaleArmed(r)) selfScaled = 1;
+        else selfActive = 1;
+      }
       if (kind == kReactPair) hasPair = 1;
     }
     matSelfActive_.push_back(selfActive);
+    matSelfScaled_.push_back(selfScaled);
     matHasPair_.push_back(hasPair);
     // Does ANY of this material's rules use the neighbour-count ramp? The burn
     // pass needs the body-local occupancy map to count neighbours, and an
@@ -304,6 +325,7 @@ uint32_t DebrisSystem::GridStateFor(uint32_t mat, uint32_t art,
 void DebrisSystem::RecountBurn(Body& b) const {
   b.activeCount = 0;
   b.pairCount = 0;
+  b.scaledCount = 0;
   // Counted on the AUTHORITATIVE lattice. On a fine-skinned body `voxels` is a
   // majority-filled derivation, so a handful of burning skin voxels can vanish
   // from it entirely — and a body whose activeCount reads 0 is a body this pass
@@ -311,6 +333,7 @@ void DebrisSystem::RecountBurn(Body& b) const {
   auto tally = [&](uint32_t m) {
     if (m == 0 || m >= matGpu_.size()) return;
     if (matSelfActive_[m]) b.activeCount++;
+    if (matSelfScaled_[m]) b.scaledCount++;
     if (matHasPair_[m]) b.pairCount++;
   };
   if (b.HasFineSkin()) {
@@ -926,8 +949,57 @@ void DebrisSystem::BurnBodies(uint32_t tick, World& world,
   // fragment bodies split off by ShatterBody, appended after the loop (a
   // push_back into bodies_ mid-iteration would invalidate `b`)
   std::vector<Body> fragments;
+  // bodies that burned below body-worthiness, erased after the loop: the
+  // rotated visit order below cannot survive a mid-loop swap-remove
+  std::vector<size_t> dead;
 
-  for (size_t bi = 0; bi < bodies_.size();) {
+  // FAIR SHARE OF THE SCAN BUDGET, or the tail of the list never burns.
+  //
+  // kBurnScanPerTick is spent in list order, and it used to be spent to the
+  // last voxel by whichever bodies came first: a body took min(n, whatever is
+  // left) and everything after it got `scanBudget == 0` and skipped. A corpse
+  // is fifteen bodies adopted in limb order, about 14k skin voxels on the
+  // human, against a 4,096 budget — so the first three or four pieces burned
+  // and the other eleven (torso included, 5,102 voxels of it) kept the exact
+  // ember count they died with, forever: the `corpse-burn` gate measured
+  // 622 -> 622 alight over 400 ticks on the torso, 245 -> 245, 333 -> 333,
+  // 160 -> 160, 396 -> 396 on the limbs behind it. On screen that is the
+  // owner report of 2026-09-02: the microvoxels on the corpse stay the colour
+  // they died in, glowing embers pulsing forever. The live creature had the
+  // same bug on its limbs (Mob::BurnTick, "ROTATE THE START LIMB BY TICK");
+  // this is the same fix for the same reason.
+  //
+  // Two parts. The START BODY rotates by tick, so no body is always last. And
+  // each body that will scan takes at most its SHARE — the budget left divided
+  // among the scanners left, with a floor so a crowd of tiny bodies does not
+  // grind every one of them to a handful of voxels — and hands the remainder
+  // on: a 60-voxel hand does not need a fifteenth of anything, and the torso
+  // behind it gets what the hand did not use. The per-body cursor
+  // (b.burnCursor) carries the scan across ticks, so a body larger than its
+  // share is covered in a few ticks rather than never. Deterministic: the
+  // order is a function of the tick and the body list, the rolls of the
+  // (serial, voxel, tick, rule) key, and the budget only decides WHICH voxels
+  // roll this tick.
+  auto willScan = [&](const Body& b) {
+    const uint32_t n = (uint32_t)(b.HasFineSkin() ? b.skinVoxels.size()
+                                                  : b.voxels.size());
+    if (n == 0) return false;
+    if (b.activeCount > 0) return true;
+    // Nothing alight on it: only fire in the world can change it, through a
+    // pair rule (skin + hot) or a gated self rule (char relighting), and the
+    // world's fire shows as a dirty chunk. A body that is all char, lying in
+    // a settled world, costs these two reads and nothing else.
+    return (b.pairCount > 0 || b.scaledCount > 0) &&
+           AnyDirtyNear(b, snap, world);
+  };
+  const size_t nb = bodies_.size();
+  const size_t startBody = (size_t)(tick % (uint32_t)nb);
+  uint32_t scanners = 0;
+  for (const Body& b : bodies_)
+    if (willScan(b)) scanners++;
+
+  for (size_t k = 0; k < nb; k++) {
+    const size_t bi = (startBody + k) % nb;
     Body& b = bodies_[bi];
     // THE AUTHORITATIVE LATTICE, which is not always `voxels`.
     //
@@ -949,11 +1021,11 @@ void DebrisSystem::BurnBodies(uint32_t tick, World& world,
     // Leaving them out was the visible half of "a corpse does not burn": every
     // mob limb of every rig with skinScale > 1 becomes a micro body the instant
     // it is severed or its owner dies, and so does every dropped item.
-    if (n == 0 || scanBudget == 0 || (!active && b.pairCount == 0) ||
-        (!active && !AnyDirtyNear(b, snap, world))) {
-      bi++;
-      continue;
-    }
+    if (!willScan(b) || scanBudget == 0) continue;
+    // This body's share of what is left (see the note above the loop).
+    const uint32_t share =
+        std::max(kBurnScanMinShare, scanBudget / std::max(1u, scanners));
+    scanners = scanners > 0 ? scanners - 1 : 0;
     // A micro body must OWN its brick before a poke can land: a shared model
     // backs every instance of its def, and charring one would char them all.
     // Done up front rather than at the first write so the poke sites stay
@@ -1121,7 +1193,7 @@ void DebrisSystem::BurnBodies(uint32_t tick, World& world,
       }
       return count;
     };
-    uint32_t steps = std::min(n, scanBudget);
+    uint32_t steps = std::min(n, std::min(share, scanBudget));
     scanBudget -= steps;
     for (uint32_t s = 0; s < steps; s++) {
       uint32_t vi = (b.burnCursor + s) % n;
@@ -1130,7 +1202,7 @@ void DebrisSystem::BurnBodies(uint32_t tick, World& world,
       if (m == 0 || m >= matGpu_.size()) continue;
       const MaterialGpu& mg = matGpu_[m];
       if (mg.reactCount == 0) continue;
-      if (!active && !matHasPair_[m]) continue;
+      if (!active && !matHasPair_[m] && !matSelfScaled_[m]) continue;
 
       for (uint32_t ri = 0; ri < mg.reactCount; ri++) {
         const ReactionGpu& r = reactions_[mg.reactOffset + ri];
@@ -1297,10 +1369,11 @@ void DebrisSystem::BurnBodies(uint32_t tick, World& world,
       phys_->GetBodyVelocities(b.handle, lin, ang);
       VoxelsToParticles(b, b.voxels, lin, ang, world, spawns);
       ReleaseBody(b);
-      bodies_[bi] = std::move(bodies_.back());
-      bodies_.pop_back();
+      b.voxels.clear();  // nothing below may burn it again this tick
+      b.skinVoxels.clear();
+      dead.push_back(bi);
       instancesDirty_ = true;
-      continue;  // re-examine the swapped-in body at this index
+      continue;
     }
 
     // batched collider refresh: the charred shape sheds its burned voxels
@@ -1330,9 +1403,16 @@ void DebrisSystem::BurnBodies(uint32_t tick, World& world,
         rebuiltOne = true;
       }
     }
-    bi++;
   }
 
+  // Erase the dead, highest index first so each swap-remove moves a body that
+  // is not itself waiting to be erased.
+  std::sort(dead.begin(), dead.end());
+  for (size_t i = dead.size(); i-- > 0;) {
+    const size_t bi = dead[i];
+    bodies_[bi] = std::move(bodies_.back());
+    bodies_.pop_back();
+  }
   for (Body& f : fragments) {
     bodies_.push_back(std::move(f));
     instancesDirty_ = true;
@@ -2261,6 +2341,7 @@ bool DebrisSystem::BodyLatticeOf(uint64_t handle, std::vector<PrefabVoxel>& out,
 
 void DebrisSystem::ManageTerrain(uint32_t tick, World& world) {
   const WorldSnapshot& snap = world.Snap();
+  lastTerrainTick_ = tick;
 
   // which chunks need collision right now? (around every dynamic body and
   // this tick's registered mob-limb anchors)
