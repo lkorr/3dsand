@@ -316,8 +316,18 @@ std::string PtSeedAccessor(const std::string& body) {
   const bool hasR = body.find("uniform> R :") != std::string::npos;
   const char* u = hasT ? "T" : (hasR ? "R" : nullptr);
   if (!u) return "";
+  // ptTick() rides along for the page-FAULT record (common.wgsl's voxStore):
+  // "which chunk lost a write" is only half a diagnosis without "on which
+  // tick", and the tick is what lines a fault up against the CPU-side free /
+  // shift / deferred-wake log. Both uniforms carry `tick` under the same field
+  // name, exactly like `seed` and `origin` above.
+  //
+  // ADDING ONE HERE MEANS ADDING ONE TO scripts/check_shaders.sh TOO — the
+  // checker reproduces this accessor itself (and counts its lines to remap
+  // diagnostics), so a one-sided addition fails every shader in the tree.
   return std::string("fn ptSeed() -> u32 { return ") + u + ".seed; }\n" +
-         "fn ptOrigin() -> vec3<i32> { return " + u + ".origin; }\n";
+         "fn ptOrigin() -> vec3<i32> { return " + u + ".origin; }\n" +
+         "fn ptTick() -> u32 { return " + u + ".tick; }\n";
 }
 bool BodyWritesVoxels(const std::string& body) {
   return body.find("read_write> voxels") != std::string::npos;

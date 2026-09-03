@@ -54,8 +54,8 @@ void World::Init(const rhi::Device& device) {
                         U::Storage | U::CopySrc | U::CopyDst, "voxels");
   pageTable = CreateBuffer(device, (uint64_t)kNumChunks * 4,
                            U::Storage | U::CopySrc | U::CopyDst, "pageTable");
-  pageFaults = CreateBuffer(device, 16, U::Storage | U::CopySrc | U::CopyDst,
-                            "pageFaults");
+  pageFaults = CreateBuffer(device, kPageFaultBytes,
+                            U::Storage | U::CopySrc | U::CopyDst, "pageFaults");
 
   // The allocator + conservative dirty mirror + materialization rule. It
   // installs the initial table: the IDENTITY MAP in both modes, because
@@ -406,7 +406,8 @@ bool World::EncodeReadbacks(const rhi::Device&, const rhi::CommandEncoder& enc,
   // value is a permanent "this build has a bug" latch, which is the semantics
   // wanted. That is what makes the detector work in ordinary play rather than
   // only under test.
-  enc.CopyTracked(pass::Buf::PageFaults, pageFaults, 0, s.buf, kPageFaultOff, 16);
+  enc.CopyTracked(pass::Buf::PageFaults, pageFaults, 0, s.buf, kPageFaultOff,
+                  kPageFaultBytes);
   // MLS-MPM fluid seam: the live count + event counters and the active block
   // list. 1.3 KB per snapshot; the block list is what keeps every chunk the
   // seam may write materialized (PageTable::UpdateFluidChunks).

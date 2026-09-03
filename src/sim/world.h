@@ -814,6 +814,39 @@ constexpr uint32_t kPtUnresident = 0xFFFFFFFFu;
 // anyone remembering a rule (§2.4).
 constexpr uint32_t kPtNoWord = 0xFFFFFFFFu;
 
+// ---- THE PAGE-FAULT RECORD (P3-E) -----------------------------------------
+//
+// `pageFaults` is not a counter, it is a small fixed-layout record, and the
+// layout is stated ONCE here because five places have to agree about it:
+// world.cpp (the buffer and the snapshot copy), pagetable.cpp (two zeroing
+// sites), support.cpp (the post-worldgen re-zero), selftest.cpp (the report)
+// and common.wgsl's voxStore (the writer).
+//
+//   [0]      total faults, monotonic
+//   [1]      max(refusing SLOT + 1)      legacy, 0 = never faulted
+//   [2]      max(dropped WORD)           legacy
+//   [3]      max(~SLOT) == min slot      legacy
+//   [4]      first fault: kernel id + 1 (0 = none), common.wgsl's PT_K_*
+//   [5..7]   first fault: refusing WORLD CHUNK x/y/z, as i32 bits
+//   [8]      first fault: the dropped word
+//   [9]      first fault: the refusing slot
+//   [10]     first fault: the TICK it was dropped on
+//   [11..15] LAST fault: kernel id + 1, world chunk x/y/z, tick (racy store)
+//   [16..31] per-kernel fault tally, indexed by PT_K_*
+//
+// THE WORLD CHUNK IS RESOLVED IN THE SHADER, at fault time, and that is the
+// point of the record existing at all: the slot is a memory ADDRESS, the
+// window is toroidal, and decoding a slot at report time with the run's final
+// origin names a chunk that has nothing to do with the fault. That decode cost
+// an hour of chasing chunks nothing had touched (RESEARCH_streaming_hitch.md
+// §6). A slot is an identity only within one origin.
+constexpr uint32_t kPageFaultWords = 32;
+constexpr uint32_t kPageFaultBytes = kPageFaultWords * 4;
+// Where the per-kernel tally starts inside the record. Mirrored in
+// common.wgsl's voxStore as the literal 16u — the one place a WGSL constant
+// for it would have to be threaded through the prelude for no other reader.
+constexpr uint32_t kPageFaultKernelBase = 16;
+
 // ---- the retire headroom, and why the pool is not exactly kNumChunks -------
 //
 // A page freed by the hysteresis free probe does not go straight back on the

@@ -100,7 +100,7 @@ void PageTable::ResetAllEmpty(const rhi::Queue& queue) {
   // Ti). Every gate asserts this counter is zero, so an unzeroed counter made
   // that assertion unreadable; combined with the reporting bug below it made
   // "pageFaults == 0" vacuous for the whole phase.
-  const uint32_t faultZero[4] = {0u, 0u, 0u, 0u};
+  const uint32_t faultZero[kPageFaultWords] = {};
   queue.WriteBuffer(world_->pageFaults, 0, faultZero, sizeof(faultZero));
   tableDirty_.clear();
   std::fill(tableDirtyMark_.begin(), tableDirtyMark_.end(), (uint8_t)0);
@@ -169,7 +169,7 @@ void PageTable::ResetIdentity(const rhi::Queue& queue) {
   // Ti). Every gate asserts this counter is zero, so an unzeroed counter made
   // that assertion unreadable; combined with the reporting bug below it made
   // "pageFaults == 0" vacuous for the whole phase.
-  const uint32_t faultZero[4] = {0u, 0u, 0u, 0u};
+  const uint32_t faultZero[kPageFaultWords] = {};
   queue.WriteBuffer(world_->pageFaults, 0, faultZero, sizeof(faultZero));
   tableDirty_.clear();
   std::fill(tableDirtyMark_.begin(), tableDirtyMark_.end(), (uint8_t)0);
@@ -1174,13 +1174,50 @@ void PageTable::ConsumeOccupancy(const std::vector<uint32_t>& occupancy,
   // ticks sees one coherent set.
   pending_ = PageCensus{};
   std::vector<uint32_t> candidates;
-  for (uint32_t s = 0; s < kNumChunks; s++) {
+  // ---- THE ELIGIBLE SET IS BOUNDED AND ROTATED (P3-E) ----------------------
+  //
+  // Under the `>=` trigger eligibility is no longer a one-tick window a slot
+  // gets once in its life: every all-air page stays eligible until it is freed.
+  // On the tick the backlog first drains that is thousands of slots, so the
+  // vector is capped at what a tick can actually SUBMIT — anything past the cap
+  // is not carried, not re-armed and not remembered, it simply stays eligible
+  // and is picked up on a later tick.
+  //
+  // A cap with a fixed scan start would only ever serve the lowest slot indices
+  // (the same starved-tail shape as the burn budget's limb order), so the scan
+  // STARTS where the previous tick's submissions ended: kMaxFreeProbesPerTick
+  // per tick is exactly the drain rate, so the rotation sweeps the window at
+  // the speed the probe can consume it and every slot is reached in bounded
+  // time. Deterministic in `tick`, which matters only for reproducible debug
+  // output — the page table is not hashed.
+  //
+  // ---- DIAGNOSTIC SWITCH (P3-E, temporary) --------------------------------
+  // SANDVOX_PT_FREE_GE=1 widens the EXACT-equality trigger below to `>=`, which
+  // is the orphan-leak fix under investigation, and switches on the bounded
+  // rotated scan that fix needs. It is an env switch and not an edit so that
+  // the leaky and the drained arms are the SAME BINARY: the attribution run
+  // needs the fault record from the drained arm and the baseline from the leaky
+  // one, and rebuilding between them would make the two incomparable for
+  // exactly the reason CLAUDE.md's "verify the binary you measure" note gives.
+  // With it OFF this function is bit-for-bit the shipped behaviour.
+  static const bool kFreeGe = getenv("SANDVOX_PT_FREE_GE") != nullptr;
+  const uint32_t scanStart =
+      kFreeGe ? (uint32_t)((uint64_t)tick * (uint64_t)kMaxFreeProbesPerTick %
+                           kNumChunks)
+              : 0u;
+  const size_t collectCap = kFreeGe ? kMaxFreeProbesPerTick : (size_t)kNumChunks;
+  uint32_t eligible = 0;
+  for (uint32_t i = 0; i < kNumChunks; i++) {
+    const uint32_t s = i + scanStart >= kNumChunks ? i + scanStart - kNumChunks
+                                                   : i + scanStart;
     if (occupancy[s] != 0) { zeroStreak_[s] = 0; continue; }
     if (zeroStreak_[s] < 255) zeroStreak_[s]++;
     // The free DECISION iterates only slots whose counter just reached the
     // threshold, which in a settled world is ZERO slots after the first
     // quarter second and stays zero forever.
-    if (zeroStreak_[s] != kPageFreeTicks) continue;
+    if (kFreeGe ? (zeroStreak_[s] < kPageFreeTicks)
+                : (zeroStreak_[s] != kPageFreeTicks))
+      continue;
     if ((t[s] & kPtSentinelBit) != 0u) continue;   // already a sentinel
     // THE STAIN TEST, and it is now free (packOccStain, common.wgsl).
     //
@@ -1220,7 +1257,8 @@ void PageTable::ConsumeOccupancy(const std::vector<uint32_t>& occupancy,
     // above has already removed most probes before they are queued. What is
     // left is slots that are quiet, out of cpuDirty, and stainless as of the
     // last snapshot — in a settled world, none at all.
-    candidates.push_back(s);
+    eligible++;
+    if (candidates.size() < collectCap) candidates.push_back(s);
   }
 
   // ---- HARVEST last tick's deferred probe, then SUBMIT this tick's ----------
@@ -1291,6 +1329,17 @@ void PageTable::ConsumeOccupancy(const std::vector<uint32_t>& occupancy,
           continue;
         }
         const uint32_t page = t[s];
+        // THE FREE LOG, keyed on the WORLD CHUNK and not the slot. A fault
+        // record names a world chunk (common.wgsl's voxStore); a free that
+        // names a slot cannot be lined up against it after a shift, which is
+        // the whole reason the reporter defect was expensive. Same key, both
+        // ends, so one grep pairs them.
+        if (getenv("SANDVOX_PT_FREELOG")) {
+          const IVec3 wc = world_->SlotToWorldChunk(s);
+          std::printf("[pt-free] tick %u FREED slot %u chunk (%d,%d,%d)\n",
+                      tick, s, wc.x * (int)kChunk, wc.y * (int)kChunk,
+                      wc.z * (int)kChunk);
+        }
         world_->pageTableCpuMutable()[s] = kPtEmpty;
         MarkTableDirty(s);
         retire_.push_back({page, tick});
@@ -1305,7 +1354,7 @@ void PageTable::ConsumeOccupancy(const std::vector<uint32_t>& occupancy,
   }
 
   // ---- SUBMIT phase: kick a new probe for this tick's candidates ----------
-  pending_.fCands = (uint32_t)candidates.size();
+  pending_.fCands = eligible;
   // THE STRANDING PATH, recorded because it is invisible from any other number.
   // The re-arm loop that keeps a deferred candidate eligible
   // (`zeroStreak_[...] = kPageFreeTicks - 1`) lives INSIDE the submit block
@@ -1318,7 +1367,7 @@ void PageTable::ConsumeOccupancy(const std::vector<uint32_t>& occupancy,
   if (probeSubmit_ && !candidates.empty() && !probePending_) {
     const size_t n = std::min(candidates.size(), kMaxFreeProbesPerTick);
     pending_.fSubmitted = (uint32_t)n;
-    pending_.fCapped = (uint32_t)(candidates.size() - n);
+    pending_.fCapped = eligible - (uint32_t)n;
     pendingProbeSlots_.assign(candidates.begin(), candidates.begin() + n);
     pendingProbeKeys_.resize(n);
     for (size_t i = 0; i < n; i++)

@@ -397,8 +397,9 @@ for f in "${FILES[@]}"; do
       continue
     fi
     ptseed="fn ptSeed() -> u32 { return ${u}.seed; }
-fn ptOrigin() -> vec3<i32> { return ${u}.origin; }"
-    ptseedLines=2
+fn ptOrigin() -> vec3<i32> { return ${u}.origin; }
+fn ptTick() -> u32 { return ${u}.tick; }"
+    ptseedLines=3
   fi
 
   combined="$TMP/$name"

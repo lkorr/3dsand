@@ -4126,6 +4126,40 @@ fn voxWordInChunkAt(chunkSlot : u32, localIdx : u32) -> u32 {
 // to do with the 58 lost voxels, which is worse than reporting nothing.
 var<private> gPtSlot : u32 = 0xFFFFFFFFu;
 
+// ---- WHICH KERNEL FAULTED (P3-E) -----------------------------------------
+//
+// A fault COUNT names nothing, and neither does a refusing chunk on its own:
+// "21,696,512 lost stores" is compatible with the CA, a brush, a particle
+// landing and a whole-chunk worldgen dispatch, and telling them apart by
+// switching writers off one at a time is the elimination sequence CLAUDE.md
+// rule 6 forbids. So every writing shader NAMES ITSELF, once, at module scope,
+// and voxStore bills the fault to it.
+//
+// STRUCTURAL, not remembered: this block is inside the WRITE half, which
+// LoadShader only keeps for a shader that declares `read_write> voxels`, and
+// `gPtKernel`'s initializer references PT_KERNEL — so a shader that writes
+// voxels and does not declare PT_KERNEL FAILS TO COMPILE. There is no way to
+// add a voxel writer that reports as "unknown".
+//
+// It is a private var rather than a plain const because one module can hold
+// several writers with different answers: worldgen.wgsl is the whole-world
+// gen, the streaming genList and the JITTER pagefill in one file, and those
+// are three completely different diagnoses. An entry point that is not its
+// module's default assigns gPtKernel as its first statement.
+const PT_K_STEP      : u32 = 1u;
+const PT_K_MUTATE    : u32 = 2u;
+const PT_K_EXPLODE   : u32 = 3u;
+const PT_K_PARTICLE  : u32 = 4u;
+const PT_K_OCCUPANCY : u32 = 5u;
+const PT_K_PICK      : u32 = 6u;
+const PT_K_FLUIDSEAM : u32 = 7u;
+const PT_K_WATERBODY : u32 = 8u;
+const PT_K_WORLDGEN  : u32 = 9u;   // worldgen.wgsl `main` — the whole world
+const PT_K_GENLIST   : u32 = 10u;  // worldgen.wgsl `list` — a streamed plane
+const PT_K_PAGEFILL  : u32 = 11u;  // worldgen.wgsl `pagefill` — JITTER realize
+const PT_K_COUNT     : u32 = 16u;  // per-kernel tally bank width in pageFaults
+var<private> gPtKernel : u32 = PT_KERNEL;
+
 fn voxWordIndex(c : vec3<i32>) -> u32 {
   let s = vec3<u32>(c & vec3<i32>(WORLD_MASK));
   let slot = chunkIndexOf(s);
@@ -4161,15 +4195,54 @@ fn voxWordInChunk(chunkSlot : u32, localIdx : u32) -> u32 {
 // any physical index is some other chunk's voxel.
 fn voxStore(idx : u32, w : u32) {
   if (idx == PT_NO_WORD) {
-    atomicAdd(&pageFaults[0], 1u);
-    // WHICH MATERIAL WAS LOST, as a 96-bit bitmask across the three spare words
-    // `pageFaults` already allocated. The counter alone says "58 voxels went
-    // missing somewhere" and sends you turning worldgen features off one at a
-    // time; the material names the rule in one run. Ids at or above 96 fold
-    // into the top bank, which is flagged rather than hidden.
+    // WHAT THE FAULT RECORD HAS TO ANSWER, and why the slot alone did not.
+    //
+    // The old record was (count, max word, max slot, min slot). Two of those
+    // four are the SLOT, which is a memory address and not an identity: the
+    // window is toroidal, so after any shift the same slot holds a different
+    // world chunk, and the selftest decoded it with the run's FINAL origin.
+    // The printed coordinates were therefore fiction on every flying gate, and
+    // they cost an hour of chasing chunks nothing had ever touched.
+    //
+    // So the record is now (a) the WORLD CHUNK, resolved here, at fault time,
+    // with the origin the faulting dispatch actually ran under; (b) the TICK;
+    // (c) the KERNEL. Those three are what a diagnosis needs — "who wrote
+    // where, when" — and none of them can be reconstructed after the fact.
+    let prev = atomicAdd(&pageFaults[0], 1u);
+    // Legacy triple, kept because the water gates and the smoke reader still
+    // decode it: the widest word dropped, and the highest/lowest refusing slot.
     atomicMax(&pageFaults[2], w);
     atomicMax(&pageFaults[1], gPtSlot + 1u);
     atomicMax(&pageFaults[3], 0xFFFFFFFFu - gPtSlot);   // == min, reported as one
+    // Per-kernel tally. This is the whole of rule 6 in four words of memory:
+    // one run says "all of it was the streamed worldgen plane" or "all of it
+    // was the CA", which is one hypothesis tested per run instead of one
+    // writer switched off per run.
+    if (gPtKernel < PT_K_COUNT) {
+      atomicAdd(&pageFaults[16u + gPtKernel], 1u);
+    }
+    let sc = vec3<i32>(i32(gPtSlot % NCHUNK),
+                       i32((gPtSlot / NCHUNK) % NCHUNK),
+                       i32(gPtSlot / (NCHUNK * NCHUNK)));
+    let wc = slotToWorldChunk(sc, ptOrigin());
+    // FIRST fault (prev == 0 is exactly one invocation, whichever wins the
+    // atomic) and LAST fault (a plain store, so it races and reports SOME late
+    // fault rather than provably the last one — enough to say whether the
+    // pattern moved, which is the question it exists for).
+    if (prev == 0u) {
+      atomicStore(&pageFaults[4], gPtKernel + 1u);
+      atomicStore(&pageFaults[5], bitcast<u32>(wc.x));
+      atomicStore(&pageFaults[6], bitcast<u32>(wc.y));
+      atomicStore(&pageFaults[7], bitcast<u32>(wc.z));
+      atomicStore(&pageFaults[8], w);
+      atomicStore(&pageFaults[9], gPtSlot);
+      atomicStore(&pageFaults[10], ptTick());
+    }
+    atomicStore(&pageFaults[11], gPtKernel + 1u);
+    atomicStore(&pageFaults[12], bitcast<u32>(wc.x));
+    atomicStore(&pageFaults[13], bitcast<u32>(wc.y));
+    atomicStore(&pageFaults[14], bitcast<u32>(wc.z));
+    atomicStore(&pageFaults[15], ptTick());
     return;
   }
   voxels[idx] = w;

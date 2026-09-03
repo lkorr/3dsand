@@ -1298,7 +1298,7 @@ void SubmitWorldgen(GpuContext& ctx, World& world, Simulation& sim, uint32_t see
     // kernel may write through a sentinel. Zeroing here is what makes the
     // counter mean that, and it is why the dense run (identity map, nothing to
     // fault on) reads 0 both before and after this line.
-    const uint32_t faultZero[4] = {0u, 0u, 0u, 0u};
+    const uint32_t faultZero[kPageFaultWords] = {};
     ctx.queue.WriteBuffer(world.pageFaults, 0, faultZero, sizeof(faultZero));
     std::printf("worldgen (paged, %u-slot batches): %u pages in use "
                 "(%.1f MiB of %.1f MiB pool), high water %u\n",

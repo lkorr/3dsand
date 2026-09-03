@@ -766,9 +766,9 @@ int Run(Ctx& c, const Options& opt) {
   // from a structural claim into a measurement made on every run. Non-zero
   // means some chunk a kernel wrote was not materialized before its dispatch,
   // which is risk 1 and is always a bug.
-  uint32_t pageFaults[4] = {0, 0, 0, 0};
+  uint32_t pageFaults[kPageFaultWords] = {};
   rhi::ReadbackBlocking(c.ctx.device, c.ctx.queue, c.world.pageFaults, 0,
-                        pageFaults, 16, "pageFaults");
+                        pageFaults, kPageFaultBytes, "pageFaults");
   // WHAT WAS LOST AND WHERE, from voxStore's three spare words: [2] the widest
   // word it dropped, [1]/[3] the highest and lowest refusing chunk slot.
   //
@@ -788,15 +788,51 @@ int Run(Ctx& c, const Options& opt) {
                    " stain %u/%u)", nm, m, pageFaults[2],
                    (pageFaults[2] >> 12) & 0xF, (pageFaults[2] >> 16) & 0x7,
                    (pageFaults[2] >> 24) & 0xF, (pageFaults[2] >> 28) & 0x7);
-    if (pageFaults[1] != 0) {
-      const uint32_t hi = pageFaults[1] - 1, lo = 0xFFFFFFFFu - pageFaults[3];
-      const IVec3 a = c.world.SlotToWorldChunk(lo);
-      const IVec3 b = c.world.SlotToWorldChunk(hi);
-      lost += Format(" | refusing chunks (%d,%d,%d)..(%d,%d,%d), entries"
-                     " 0x%08x/0x%08x", a.x * 16, a.y * 16, a.z * 16, b.x * 16,
-                     b.y * 16, b.z * 16, c.world.PageEntryOfSlot(lo),
-                     c.world.PageEntryOfSlot(hi));
+    // ---- WHO, WHERE, WHEN (world.h's page-fault record) ------------------
+    //
+    // THE SLOT SPAN THAT USED TO BE PRINTED HERE WAS FICTION on any gate that
+    // flies. It decoded pageFaults[1]/[3] — the highest and lowest refusing
+    // SLOT — through SlotToWorldChunk AT REPORT TIME, i.e. with whatever window
+    // origin the run happened to end on. The window is toroidal and the
+    // streaming gate shifts it 227 times, so those coordinates named chunks
+    // with no relationship to the fault, and they cost an hour of chasing them
+    // (RESEARCH_streaming_hitch.md §6, "one reporter defect found on the way").
+    //
+    // The record now carries the WORLD CHUNK resolved inside voxStore, under
+    // the origin the faulting dispatch actually ran with, plus the tick and the
+    // kernel. Those three cannot be reconstructed after the fact, so they are
+    // the ones worth the four words.
+    static const char* const kKernelName[] = {
+        "?", "sim_step", "sim_mutate", "sim_explode", "sim_particle",
+        "sim_occupancy", "sim_pick", "sim_fluid_seam", "sim_waterbody",
+        "worldgen:main", "worldgen:list", "worldgen:pagefill"};
+    auto kname = [&](uint32_t idPlus1) {
+      const uint32_t id = idPlus1 - 1;
+      return id < (uint32_t)(sizeof kKernelName / sizeof *kKernelName)
+                 ? kKernelName[id]
+                 : "?";
+    };
+    if (pageFaults[4] != 0) {
+      lost += Format(" | FIRST %s tick %u chunk (%d,%d,%d) word 0x%08x",
+                     kname(pageFaults[4]), pageFaults[10],
+                     (int32_t)pageFaults[5] * 16, (int32_t)pageFaults[6] * 16,
+                     (int32_t)pageFaults[7] * 16, pageFaults[8]);
     }
+    if (pageFaults[11] != 0) {
+      lost += Format(" | LAST %s tick %u chunk (%d,%d,%d)",
+                     kname(pageFaults[11]), pageFaults[15],
+                     (int32_t)pageFaults[12] * 16, (int32_t)pageFaults[13] * 16,
+                     (int32_t)pageFaults[14] * 16);
+    }
+    // The per-kernel tally is the rule-6 line: it answers "which writer" in one
+    // run instead of one writer switched off per run.
+    std::string byK;
+    for (uint32_t i = 0; i < kPageFaultWords - kPageFaultKernelBase; i++) {
+      const uint32_t n = pageFaults[kPageFaultKernelBase + i];
+      if (!n) continue;
+      byK += Format("%s%s %u", byK.empty() ? "" : ", ", kname(i + 1), n);
+    }
+    if (!byK.empty()) lost += " | by kernel: " + byK;
   }
   std::printf("page faults over the suite: %u%s%s\n", pageFaults[0],
               pageFaults[0] == 0 ? " (a sentinel write is a lost voxel: 0 is the"

@@ -56,6 +56,11 @@
 @group(0) @binding(26) var<storage, read> treeAtlas : array<u32>;
 @group(0) @binding(17) var<storage, read>       pageTable : array<u32>;
 @group(0) @binding(18) var<storage, read_write> pageFaults : array<atomic<u32>>;
+// This module's page-fault identity (common.wgsl's PT_K_* block). Every
+// shader that declares `read_write> voxels` must define this: gPtKernel's
+// initializer references it, so omitting it is a compile error rather than
+// a fault that reports as "unknown".
+const PT_KERNEL : u32 = PT_K_WORLDGEN;
 
 const M_STONE : u32 = 1u;
 const M_WOOD  : u32 = 2u;
@@ -4404,6 +4409,10 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
 @compute @workgroup_size(64)
 fn list(@builtin(workgroup_id) wg : vec3<u32>,
         @builtin(local_invocation_index) li : u32) {
+  // Not this module's default: a lost STREAMED plane and a lost WHOLE-WORLD
+  // gen are different bugs with different owners (Stream::FillSlots vs
+  // SubmitTick's batched worldgen), and the fault record has to say which.
+  gPtKernel = PT_K_GENLIST;
   if (wg.x >= T.genCount) { return; }
   genChunk(genList[wg.x], li, wg.x);
 }
@@ -4450,6 +4459,7 @@ fn pagefill(@builtin(workgroup_id) wg : vec3<u32>,
   // (slot, entry) pair, so wg.x is in range by construction. `list` above needs
   // its guard because it shares the tick's UBO write; this entry point does not
   // share that write and must not read that field.
+  gPtKernel = PT_K_PAGEFILL;
   let slot  = pageFillList[wg.x * 2u];
   let entry = pageFillList[wg.x * 2u + 1u];
   let sc = vec3<i32>(vec3<u32>(slot % NCHUNK, (slot / NCHUNK) % NCHUNK,

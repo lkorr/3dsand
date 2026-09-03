@@ -15,6 +15,11 @@
 @group(0) @binding(4) var<uniform> T : TickParams;
 @group(0) @binding(17) var<storage, read>       pageTable : array<u32>;
 @group(0) @binding(18) var<storage, read_write> pageFaults : array<atomic<u32>>;
+// This module's page-fault identity (common.wgsl's PT_K_* block). Every
+// shader that declares `read_write> voxels` must define this: gPtKernel's
+// initializer references it, so omitting it is a compile error rather than
+// a fault that reports as "unknown".
+const PT_KERNEL : u32 = PT_K_PARTICLE;
 
 @group(1) @binding(0) var<storage, read_write> pRead  : array<Particle>;
 @group(1) @binding(1) var<storage, read_write> pWrite : array<Particle>;
