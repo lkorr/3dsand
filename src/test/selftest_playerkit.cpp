@@ -124,9 +124,8 @@ Status GatePlayerKit(Ctx& c, std::string& detail) {
     check(kit.equip.At(sheath).def == blade, "and it is actually there");
     check(hb.slots[0].Empty(), "and it left the hotbar slot it came from");
 
-    // The armour slots accept NOTHING today, which is the scaffolding being
-    // honest. When ItemKind::ArmorHead exists this assertion is what will
-    // notice that the head slot's row changed.
+    // The head slot takes helms and nothing else. `kit_rock` is
+    // ItemKind::None, which no slot may ever accept.
     check(kit.Move(fromRock, toHead, hb, items) == MoveResult::WrongKind,
           "the head slot refuses a rock");
     check(kit.equip.At(head).Empty(), "and nothing landed in it");
@@ -161,6 +160,49 @@ Status GatePlayerKit(Ctx& c, std::string& detail) {
     check(kit.bag.At(6).def == rock && kit.bag.At(6).count == 2,
           "a move carries the whole stack, count included");
     check(kit.bag.At(5).Empty(), "and empties the source");
+  }
+
+  // ---- 2b. WHERE A PIECE GOES WHEN NOBODY AIMED ---------------------------
+  //
+  // The right-click "just put this on" destination (EquipSlotFor). It lives in
+  // game/equipment.h and not in the frame loop precisely so it can be asserted
+  // here — the first version was inline in main.cpp and could only be checked
+  // by a human clicking on a slot and looking.
+  {
+    Equipment eq;
+    check(EquipSlotFor(ItemKind::None, eq) == -1,
+          "nothing on the body takes ItemKind::None");
+    const int m = EquipSlotFor(ItemKind::Melee, eq);
+    check(m == sheath,
+          "a melee weapon right-clicks into the sheath, the first slot whose "
+          "authored rule takes it");
+    // Every WORN kind must resolve, and to a slot that puts it ON the body.
+    // This is the assertion that fails the day a kind is added to the enum and
+    // not to the slot table — the item would then be un-equippable by any
+    // gesture, silently.
+    int worn = 0;
+    for (int k = (int)ItemKind::ArmorHead; k <= (int)ItemKind::Trinket; k++) {
+      const int s = EquipSlotFor((ItemKind)k, eq);
+      check(s >= 0 && EquipSlotIsWorn(s),
+            "every worn kind has a slot on the body that takes it");
+      worn++;
+    }
+    check(worn > 0, "there is at least one worn kind to place");
+
+    // FULL SLOTS STILL RESOLVE, and they resolve to the same slot — that is
+    // what makes right-click a swap rather than a refusal once you are
+    // dressed. The empty-first preference only matters when a kind has more
+    // than one home, which the quick slots give the melee kind.
+    eq.slots[m] = {blade, 1};
+    const int again = EquipSlotFor(ItemKind::Melee, eq);
+    check(again >= 0 && again != m,
+          "with the sheath full, a second blade finds the next empty slot "
+          "that takes it rather than knocking the first one out");
+    for (int s = 0; s < kEquipSlotCount; s++)
+      if (EquipSlotAccepts(s, ItemKind::Melee)) eq.slots[s] = {blade, 1};
+    check(EquipSlotFor(ItemKind::Melee, eq) == m,
+          "and with every one of them full it falls back to the first, which "
+          "swaps");
   }
 
   // ---- 3. glyph binding ----------------------------------------------------

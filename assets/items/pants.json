@@ -1,0 +1,69 @@
+{
+  "comment": "The pants, a WORN piece: one shell per covered limb, each of which becomes a real rig slot on the wearer and therefore burns, dissolves, carves, severs and drops exactly as a limb does. Geometry is the stock human's own silhouette dilated outward by one authored micro, so it fits by construction. Regenerate with scripts/gen_stock_armor.py \u2014 `offset` and `fitBox` are MEASURED off gen_human.py's limb table, so editing them by hand puts the garment off the body.",
+  "name": "pants",
+  "artVoxelsPerMetre": 80,
+  "hp": 48.0,
+  "severable": true,
+  "cover": [
+    {
+      "part": "legL.L",
+      "model": "legL.L",
+      "offset": [
+        -2,
+        4,
+        -2
+      ],
+      "fitBox": [
+        8,
+        26,
+        8
+      ],
+      "hp": 12.0
+    },
+    {
+      "part": "legL.R",
+      "model": "legL.R",
+      "offset": [
+        -2,
+        4,
+        -2
+      ],
+      "fitBox": [
+        8,
+        26,
+        8
+      ],
+      "hp": 12.0
+    },
+    {
+      "part": "legU.L",
+      "model": "legU.L",
+      "offset": [
+        -2,
+        0,
+        -2
+      ],
+      "fitBox": [
+        8,
+        28,
+        8
+      ],
+      "hp": 12.0
+    },
+    {
+      "part": "legU.R",
+      "model": "legU.R",
+      "offset": [
+        -2,
+        0,
+        -2
+      ],
+      "fitBox": [
+        8,
+        28,
+        8
+      ],
+      "hp": 12.0
+    }
+  ]
+}

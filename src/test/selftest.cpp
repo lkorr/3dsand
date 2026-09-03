@@ -155,6 +155,9 @@ const char* const kOrder[] = {
     // body gates run in; before `ragdoll-joints` because it leaves the rig
     // undressed and MobSystem reset, which is what that gate expects to find.
     "armor-wear", "item-ground", "armor-fit",
+    // Pure anim over its own five-part fixture — it touches no shared World and
+    // so is order-independent; it sits here to keep the armour gates together.
+    "armor-track", "armor-stock",
     "ragdoll-joints",
     "save-load",   "save-entities", "region-store", "streaming",     "spells",
     "page-roundtrip", "daylight-boundary",

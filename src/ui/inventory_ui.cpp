@@ -47,10 +47,36 @@ constexpr float kPortraitHFallback = 448.0f;
 constexpr const char* kPayloadItem = "SVKIT";
 constexpr const char* kPayloadGlyph = "SVGLY";
 
-// Which chrome sprite carries an item of this kind.
+// Which chrome sprite carries an item of this kind. A worn piece borrows the
+// engraving its own slot uses when empty, so the thing in your pack and the
+// hole it belongs in are drawn with the same mark — which is most of what makes
+// "where does this go" answerable without a tooltip.
 const char* ItemIcon(const std::string& kind) {
   if (kind == "melee") return "item_melee";
+  if (kind == "armor_head") return "slot_head";
+  if (kind == "armor_chest") return "slot_chest";
+  if (kind == "armor_legs") return "slot_legs";
+  if (kind == "armor_boots") return "slot_boots";
+  if (kind == "armor_shoulders") return "slot_shoulders";
+  if (kind == "armor_hands") return "slot_hands";
+  if (kind == "armor_belt") return "slot_belt";
+  if (kind == "trinket") return "slot_trinket";
   return "item_unknown";
+}
+
+// The kind of whatever a KitRef names, off the panel's own mirrors. Used while
+// a drag is in flight: the payload is a KitRef (see kPayloadItem's note on why
+// it is not the item itself), so "what am I holding" is a lookup, not a field.
+std::string KindOfRef(const UIState& s, const KitRef& r) {
+  const std::vector<UIState::KitSlotUI>* v = nullptr;
+  switch (r.space) {
+    case KitSpace::Bag: v = &s.bagSlots; break;
+    case KitSpace::Hotbar: v = &s.hotbarSlots; break;
+    case KitSpace::Equip: v = &s.equipSlots; break;
+    default: return std::string();
+  }
+  if (r.index < 0 || r.index >= (int)v->size()) return std::string();
+  return (*v)[r.index].kind;
 }
 
 const char* GlyphIcon(int type) {
@@ -66,6 +92,7 @@ const char* GlyphIcon(int type) {
 void SlotRim(ImDrawList* dl, ImVec2 at, ui::SlotLook look) {
   const char* frame = look == ui::SlotLook::Refuse   ? "slot_refuse"
                       : look == ui::SlotLook::Hover  ? "slot_hover"
+                      : look == ui::SlotLook::Accept ? "slot_hover"
                       : look == ui::SlotLook::Filled ? "slot_filled"
                                                      : "slot";
   if (ui::Chrome(frame)) {
@@ -99,11 +126,13 @@ float PanelChrome(ImDrawList* dl, ImVec2 wp, ImVec2 ws, const char* title,
 //
 // `accepts` is the slot's authored rule mirrored out of game/equipment.h; the
 // panel never re-derives it, so the day ItemKind::ArmorHead exists this
-// function needs no change at all.
+// function needs no change at all. Null for the bag and the hotbar, which are
+// containers rather than roles and take anything.
 void ItemSlot(UIState& s, const char* id, ImVec2 at,
               const UIState::KitSlotUI& item, KitRef ref,
               const char* emptyIcon, bool acceptsAnything, const char* whyNot,
-              bool selected) {
+              bool selected,
+              const std::vector<std::string>* accepts = nullptr) {
   ImDrawList* dl = ImGui::GetWindowDrawList();
   ImGui::SetCursorScreenPos(at);
   ImGui::PushID(id);
@@ -112,17 +141,41 @@ void ItemSlot(UIState& s, const char* id, ImVec2 at,
   const bool filled = !item.name.empty();
 
   // Is a drag in flight, and would this slot take it? Asked here rather than
-  // inside the drop target so the frame can turn red BEFORE the player lets
-  // go — a refusal you find out about after committing is not a refusal, it
-  // is a punishment.
-  bool refusing = false;
+  // inside the drop target so the frame can answer BEFORE the player lets go —
+  // a refusal you find out about after committing is not a refusal, it is a
+  // punishment.
+  //
+  // AND IT IS TWO ANSWERS, NOT ONE. This used to ask only "does this slot
+  // accept anything at all", which is false for every armour row, so picking up
+  // ANY item turned the whole figure red — including the one slot the piece
+  // belonged in. Asking the real question (does this slot take THIS KIND)
+  // costs the dragged item's kind, which is a lookup through the payload's
+  // KitRef, and it turns a wall of refusals into one lit slot.
+  bool refusing = false, inviting = false;
   if (const ImGuiPayload* p = ImGui::GetDragDropPayload()) {
-    if (p->IsDataType(kPayloadItem) && !acceptsAnything &&
-        ref.space == KitSpace::Equip)
-      refusing = true;
+    if (p->IsDataType(kPayloadItem) && ref.space == KitSpace::Equip) {
+      KitRef from{};
+      std::memcpy(&from, p->Data, sizeof(from));
+      // The slot you picked it UP from is neither an invitation nor a refusal.
+      if (!(from == ref)) {
+        const std::string kind = KindOfRef(s, from);
+        // The LIST is the rule. `acceptsAnything` is a misnomer inherited from
+        // when every armour row was empty — it means "accepts at least one
+        // kind", which is now true of every slot and answers nothing.
+        bool takes = false;
+        if (accepts && !kind.empty())
+          for (const std::string& a : *accepts)
+            if (a == kind) takes = true;
+        if (takes)
+          inviting = true;
+        else
+          refusing = true;
+      }
+    }
   }
 
   const ui::SlotLook look = refusing  ? ui::SlotLook::Refuse
+                            : inviting ? ui::SlotLook::Accept
                             : hovered ? ui::SlotLook::Hover
                             : filled  ? ui::SlotLook::Filled
                                       : ui::SlotLook::Empty;
@@ -177,6 +230,20 @@ void ItemSlot(UIState& s, const char* id, ImVec2 at,
     ImGui::EndDragDropTarget();
   }
 
+  // RIGHT-CLICK: WEAR IT, OR TAKE IT OFF. The one gesture a drag cannot give
+  // you, because a drag needs a destination and this is precisely the case
+  // where the destination is not in doubt — a pair of boots has exactly one
+  // slot. Routed as an intent for the same reason the drag is (see EquipIntent
+  // in ui/overlay.h): the panel says WHICH item, not where it lands.
+  //
+  // Guarded on the drag payload being absent so that releasing a right button
+  // mid-drag cannot fire it as well.
+  if (hovered && filled && !ImGui::GetDragDropPayload() &&
+      ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
+    s.equipItem.pending = true;
+    s.equipItem.from = ref;
+  }
+
   if (hovered) {
     ImGui::BeginTooltip();
     if (filled) {
@@ -197,6 +264,11 @@ void ItemSlot(UIState& s, const char* id, ImVec2 at,
           ImGui::TextUnformatted("RUINED - too little left to mend");
           ImGui::PopStyleColor();
         }
+        // Named for what it will actually do from HERE, which is not the same
+        // sentence in both directions.
+        ImGui::TextDisabled(ref.space == KitSpace::Equip
+                                ? "right-click to take off"
+                                : "right-click to wear");
       }
     } else if (whyNot && *whyNot && !acceptsAnything) {
       ImGui::TextDisabled("empty");
@@ -568,7 +640,7 @@ void DrawInventoryScreen(UIState& s) {
           ItemSlot(s, id, ImVec2(side ? colR : colL, sy),
                    SlotOr(s.equipSlots, idx),
                    KitRef{KitSpace::Equip, idx}, d.icon.c_str(),
-                   d.acceptsAnything, d.why.c_str(), false);
+                   d.acceptsAnything, d.why.c_str(), false, &d.accepts);
         }
       }
     }
@@ -628,7 +700,8 @@ void DrawInventoryScreen(UIState& s) {
         ItemSlot(s, id,
                  ImVec2(wp.x + kPad + k * (kSlot + kSlotGap), y),
                  SlotOr(s.equipSlots, idx), KitRef{KitSpace::Equip, idx},
-                 d.icon.c_str(), d.acceptsAnything, d.why.c_str(), false);
+                 d.icon.c_str(), d.acceptsAnything, d.why.c_str(), false,
+                 &d.accepts);
       }
       y += kSlot + 18;
 

@@ -34,6 +34,11 @@
       "desc": "A gold-shot band worn at the waist, over the robe."
     },
     {
+      "id": "pants",
+      "kind": "armor_legs",
+      "desc": "Grey wool trousers, cut straight and ending where a boot begins. Nothing about them will turn an edge; they are what stands between your legs and the weather."
+    },
+    {
       "id": "boots",
       "kind": "armor_boots",
       "desc": "Cut leather, slow to catch. Better against a spill than against a fire."

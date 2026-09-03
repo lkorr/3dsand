@@ -567,14 +567,43 @@ void AnimSolveTwoBone(const AnimSkeleton& sk, AnimState& st,
   st.model[i1].rot = QuatSlerp(st.model[i1].rot, newLower, w);
   st.model[i1].pos = st.model[i1].pos + (newLowerPos - joint) * w;
 
-  // Descendants of the lower bone (e.g. a foot) follow rigidly: re-flatten the
-  // tail of the chain rather than leaving them at the pre-IK pose.
+  // ---- EVERYTHING HANGING OFF THE TWO SOLVED BONES FOLLOWS THEM -------------
+  //
+  // The solver rewrote model[i0] and model[i1] in place. Every part BELOW
+  // either of them is now stale, and "below" means the whole subtree, not the
+  // direct children of the lower bone.
+  //
+  // That distinction was a real, visible bug and it took an odd shape, because
+  // a rig's own parts mostly happen to be direct children of i1 (a hand under
+  // a forearm, a foot under a shin) and so were covered by accident. What is
+  // NOT covered is anything appended to the rig later — and Mob::AppendWornShell
+  // parents a worn shell to THE LIMB IT COVERS:
+  //
+  //   * a sleeve over armU.L hangs off i0 itself, and never moved with the arm;
+  //   * a boot over foot.L hangs off the foot, a GRANDCHILD of i1, and never
+  //     moved with the leg.
+  //
+  // Both read to the player as armour standing still while the body walks out
+  // of it. The forearm sleeve, the torso panel and the hood all looked fine —
+  // armL IS i1, and the spine is in no chain at all — which is exactly why the
+  // symptom picked out two garments and left the rest alone.
+  //
+  // Parents are stored before children (AnimFlatten's own precondition), so one
+  // increasing pass reaches every descendant after the parent it reads. The
+  // ancestor walk is depth-bounded by the rig (parent index is always < the
+  // child's, so it terminates) and costs nothing at these sizes.
+  auto belowSolved = [&](int k) {
+    for (int p = sk.parts[k].parent; p >= 0; p = sk.parts[p].parent)
+      if (p == i0 || p == i1) return true;
+    return false;
+  };
   for (size_t k = 0; k < n; k++) {
+    if ((int)k == i0 || (int)k == i1) continue;   // the solver owns these two
     const AnimPart& p = sk.parts[k];
-    if (p.parent != i1) continue;
-    st.model[k].rot = QuatNormalize(QuatMul(st.model[i1].rot, st.local[k].rot));
-    st.model[k].pos =
-        st.model[i1].pos + QuatRotate(st.model[i1].rot, st.local[k].pos);
+    if (p.parent < 0 || !belowSolved((int)k)) continue;
+    const Transform& par = st.model[p.parent];
+    st.model[k].rot = QuatNormalize(QuatMul(par.rot, st.local[k].rot));
+    st.model[k].pos = par.pos + QuatRotate(par.rot, st.local[k].pos);
   }
 }
 

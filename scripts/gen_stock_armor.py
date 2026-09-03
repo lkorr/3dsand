@@ -54,7 +54,7 @@ import gen_human as H
 # PALETTE CONVENTION (as everywhere): .vox palette index i+1 == materials.json[i].
 # Asserted against materials.json in main() rather than trusted, because a
 # renumbered material turns a robe into whatever took its slot.
-CLOTH_MAT, CLOTH_ID = 48, "robe_cloth"
+CLOTH_MAT, CLOTH_ID = 48, "cloth"
 TRIM_MAT, TRIM_ID = 49, "robe_trim"
 LEATHER_MAT, LEATHER_ID = 53, "leather"
 
@@ -259,6 +259,40 @@ def build_robe(per_limb, occ):
     return out
 
 
+def build_pants(per_limb, occ):
+    """Trousers: a one-micro tube around each thigh and each shin.
+
+    Returned per PART for the reason every other piece is — a trouser leg that
+    did not swing with the shin would be a plank.
+
+    WHERE THEY STOP, AND WHY IT IS DERIVED. The shin tube starts two micro
+    above the shin's own bottom, which is EXACTLY where the boot's cuff ends
+    (build_boots rings the shin over `foot z1 + 1 .. +2`). Trouser and boot
+    therefore meet on a seam with neither a gap nor a shared cell — a bare ring
+    of shin between them reads as a modelling error, and two shells in one cell
+    read as flicker, because each shell is its own rigid body and the nearer one
+    wins per ray. Both numbers come off the SAME foot box, so re-proportioning
+    the leg keeps the seam.
+
+    THE ONE OVERLAP THAT IS LEFT is with the robe's skirt, over the top of the
+    thigh: the skirt's inner rows are also at radius 1 from the body, and two
+    garments cannot both be the layer against the skin. Left alone rather than
+    subtracted — subtracting the robe's cells (what build_sash does) would hole
+    the trousers for anyone wearing them WITHOUT a robe, which is the worse of
+    the two, and the affected rows are under a skirt when it is there at all."""
+    out = {}
+    for thigh in ("legU.L", "legU.R"):
+        out[thigh] = tube(per_limb[thigh], occ, 1)
+    shins = {"legL.L": "foot.L", "legL.R": "foot.R"}
+    for shin, foot in shins.items():
+        cells = per_limb[shin]
+        z0 = min(c[2] for c in cells)
+        cuff_top = max(c[2] for c in per_limb[foot]) + 2   # boots own up to here
+        out[shin] = tube(per_limb[shin], occ, 1,
+                         zlo=max(z0, cuff_top + 1))
+    return out
+
+
 def build_sash(per_limb, occ, taken):
     """A band at the waist, sitting OUTSIDE the robe rather than inside it.
 
@@ -439,6 +473,8 @@ def main():
         ("robe", "armor_chest", CLOTH_MAT, (BLACK, BLACK_SHADE), 16.0, robe),
         ("sash", "armor_belt", TRIM_MAT, (GOLD, GOLD_SHADE), 8.0,
          {"hips": build_sash(per_limb, occ, taken)}),
+        ("pants", "armor_legs", CLOTH_MAT, (GREY, GREY_SHADE), 12.0,
+         build_pants(per_limb, occ)),
         ("boots", "armor_boots", LEATHER_MAT, (HIDE, HIDE_SHADE), 12.0,
          build_boots(per_limb, occ)),
     ]
@@ -506,7 +542,12 @@ def main():
                 f"`fitBox` are MEASURED off gen_human.py's limb table, so "
                 f"editing them by hand puts the garment off the body."),
             "name": name,
-            "scale": SCALE,
+            # THE AUTHORED RESOLUTION, in the units the loader actually reads.
+            # A bare `"scale": 8` still loads (melee.cpp's legacy branch turns
+            # it into 8 * kLegacyAuthoringVoxelsPerMetre = 80 and warns), but
+            # emitting the derived number and taking a warning for it is how a
+            # generator's output drifts from what the loader wants.
+            "artVoxelsPerMetre": H.ART_VOXELS_PER_METRE,
             "hp": hp * len(cover),
             "severable": True,
             "cover": sorted(cover, key=lambda c: c["part"]),
@@ -543,6 +584,9 @@ ITEM_DESC = {
     "robe": "A heavy black robe, sleeves to the wrist and a skirt to the "
             "knee. Cloth over skin: fire reaches the cloth first.",
     "sash": "A gold-shot band worn at the waist, over the robe.",
+    "pants": "Grey wool trousers, cut straight and ending where a boot "
+             "begins. Nothing about them will turn an edge; they are what "
+             "stands between your legs and the weather.",
     "boots": "Cut leather, slow to catch. Better against a spill than "
              "against a fire.",
 }

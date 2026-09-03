@@ -30,10 +30,12 @@
 //      bodies, so the existing self-rejection must already cover them.
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <string>
 #include <vector>
 
+#include "game/anim.h"
 #include "game/equipment.h"
 #include "game/item.h"
 #include "game/mob.h"
@@ -1408,6 +1410,291 @@ Status GateArmorFit(Ctx& c, std::string& detail) {
 }
 
 // ============================================================================
+// armor-stock — the SHIPPED wardrobe actually fits the SHIPPED body.
+//
+// The gate above this one and the two before it are fixture-based on purpose
+// (see the header note): they test the machinery, and a gate that hardcodes the
+// asset cast fails the day somebody adds a correct asset. This one is the
+// deliberate exception, and it tests the other half — the CONTENT.
+//
+// assets/items/*.json carry two numbers per shell, `offset` and `fitBox`, which
+// scripts/gen_stock_armor.py MEASURES off gen_human.py's limb table. Nothing
+// checked that the measurement still described the rig the engine loads. A
+// stale offset does not crash, does not warn and does not fail any other gate:
+// it puts the sleeve a quarter of a voxel off the arm, which reads as a
+// rendering bug and gets diagnosed as one. Both files are generated, which is
+// exactly the situation where a silent drift is likely and cheap to catch.
+//
+// So: put every worn item in the library on the stock rig and assert that each
+// shell HUGS the limb it names — no gaps, no floating, and covering enough of
+// its host's height to be the garment it claims to be. Everything is derived
+// from the def and the library, so a new piece is covered the moment it exists
+// and no name appears below.
+// ============================================================================
+
+Status GateArmorStock(Ctx& c, std::string& detail) {
+  MobSystem& mobs = c.mobs;
+  bool ok = true;
+  int checks = 0;
+  auto check = [&](bool cond, const std::string& what) {
+    checks++;
+    if (!cond) {
+      ok = false;
+      std::printf("armor-stock: FAILED %s\n", what.c_str());
+    }
+  };
+
+  int avDef = -1;
+  for (size_t i = 0; i < mobs.Defs().size(); i++)
+    if (mobs.Defs()[i].name == kAvatarDefName) avDef = (int)i;
+  if (avDef < 0) {
+    detail = Format("no '%s' def to dress", kAvatarDefName);
+    return Status::Skip;
+  }
+  std::vector<const ItemDef*> worn;
+  for (const ItemDef& it : c.items.items)
+    if (ItemKindIsWorn(it.kind) && !it.cover.empty()) worn.push_back(&it);
+  if (worn.empty()) {
+    detail = "the item library ships no worn pieces";
+    return Status::Skip;
+  }
+
+  mobs.Reset();
+  // Window-anchored, for the reason armor-wear states at length.
+  const IVec3 wOrg = c.world.WindowOrigin();
+  const int sx = wOrg.x * (int)kChunk + 170, sz = wOrg.z * (int)kChunk + 170;
+  const int h = World::TerrainHeight(sx, sz, kDefaultSeed);
+  const uint64_t id = mobs.Spawn(avDef, {sx, h + 1, sz});
+  Mob* m = mobs.FindMobById(id);
+  if (!m) {
+    detail = "spawn refused";
+    return Status::Fail;
+  }
+  const int baseLimbs = m->AppendedBase();
+
+  struct Box {
+    Vec3 lo{1e30f, 1e30f, 1e30f}, hi{-1e30f, -1e30f, -1e30f};
+    bool any = false;
+    void Add(const Vec3& p) {
+      lo.x = std::min(lo.x, p.x); lo.y = std::min(lo.y, p.y);
+      lo.z = std::min(lo.z, p.z);
+      hi.x = std::max(hi.x, p.x); hi.y = std::max(hi.y, p.y);
+      hi.z = std::max(hi.z, p.z);
+      any = true;
+    }
+  };
+  auto boxOf = [&](int limb) {
+    Box b;
+    const uint32_t n = mobs.LimbVoxelCount(id, limb);
+    for (uint32_t k = 0; k < n; k++) b.Add(mobs.LimbVoxelPos(id, limb, k));
+    return b;
+  };
+
+  int shellsSeen = 0;
+  for (const ItemDef* it : worn) {
+    // Every piece into its OWN slot, so nothing here depends on the order the
+    // library happens to be in and two pieces never fight for one slot.
+    int slot = -1;
+    for (int s = 0; s < kEquipSlotCount && slot < 0; s++)
+      if (EquipSlotIsWorn(s) && EquipSlotAccepts(s, it->kind)) slot = s;
+    check(slot >= 0, "'" + it->name + "' has an equip slot that takes it");
+    if (slot < 0) continue;
+    if (!m->WearItem(it, slot)) {
+      check(false, "'" + it->name + "' goes on the stock rig");
+      continue;
+    }
+    for (int i = baseLimbs; i < m->LimbCount(); i++) {
+      const MobLimbDef& ld = m->LimbDefAt(i);
+      if (ld.tag != "worn") continue;
+      int host = -1;
+      for (int j = 0; j < baseLimbs; j++)
+        if (m->LimbDefAt(j).name == ld.parent) host = j;
+      check(host >= 0, ld.name + " is parented to a real limb");
+      if (host < 0) continue;
+      const Box sb = boxOf(i), hb = boxOf(host);
+      check(sb.any && hb.any, ld.name + " and its host both have voxels");
+      if (!sb.any || !hb.any) continue;
+      shellsSeen++;
+
+      // 1. NO GAP. A garment is the body's own silhouette dilated by ONE
+      //    authored micro, so its box may exceed the limb's — but only by the
+      //    little the cut adds (a skirt flares, a hood peaks). A shell whose
+      //    corner is a whole voxel clear of the limb is not a loose fit, it is
+      //    an offset that no longer describes this rig. `slack` is generous
+      //    against the skirt and the boot cuff and still an order of magnitude
+      //    tighter than the "sleeve is on the floor" failure.
+      const float slack = 4.0f;   // world voxels
+      const bool hugs = sb.lo.x > hb.lo.x - slack && sb.hi.x < hb.hi.x + slack &&
+                        sb.lo.y > hb.lo.y - slack && sb.hi.y < hb.hi.y + slack &&
+                        sb.lo.z > hb.lo.z - slack && sb.hi.z < hb.hi.z + slack;
+      if (!hugs)
+        std::printf("  %s: shell (%.2f..%.2f, %.2f..%.2f, %.2f..%.2f) vs limb "
+                    "(%.2f..%.2f, %.2f..%.2f, %.2f..%.2f)\n",
+                    ld.name.c_str(), sb.lo.x, sb.hi.x, sb.lo.y, sb.hi.y,
+                    sb.lo.z, sb.hi.z, hb.lo.x, hb.hi.x, hb.lo.y, hb.hi.y,
+                    hb.lo.z, hb.hi.z);
+      check(hugs, ld.name + " sits ON the limb it covers");
+
+      // 2. IT OVERLAPS ITS HOST ALONG THE BONE. The one failure the box test
+      //    above cannot see: a shell translated cleanly along the limb stays
+      //    inside a generous slack while covering none of it. Trousers that
+      //    started at the ankle would pass (1) and fail this.
+      //
+      //    Measured against the SHORTER of the two spans, not against the
+      //    host's. A belt is a band four authored micro tall over a ten-micro
+      //    pelvis and is SUPPOSED to sit at one end of it — asking for a
+      //    fraction of the HOST's length calls that a defect (it did, at 0.4,
+      //    on the first run) while a trouser leg starting at the ankle would
+      //    still have to be caught. What is common to every correct piece is
+      //    that it is INSIDE its host's span, however short it is.
+      const float lo = std::max(sb.lo.y, hb.lo.y);
+      const float hi = std::min(sb.hi.y, hb.hi.y);
+      const float span = std::max(
+          0.01f, std::min(sb.hi.y - sb.lo.y, hb.hi.y - hb.lo.y));
+      check(hi - lo > span * 0.5f,
+            ld.name + " lies along the limb it covers rather than hanging off "
+                      "one end of it");
+    }
+    m->UnwearItem(slot);
+  }
+  check(shellsSeen > 0, "the wardrobe put at least one shell on the body");
+  mobs.Reset();
+
+  detail = Format("%d shells over %d pieces, %d checks", shellsSeen,
+                  (int)worn.size(), checks);
+  std::printf("armor-stock: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
+// ============================================================================
+// armor-track — a worn shell RIDES the limb it covers, through the IK.
+//
+// A shell's whole placement contract is "AnimPart::rest is the identity, so
+// AnimFlatten puts me exactly where my host went" (Mob::AppendWornShell). That
+// contract has one hole and the two-bone solver is it: the solver rewrites
+// st.model for the two bones IN PLACE, as a post-process on the already-
+// flattened pose, so anything below them is stale until somebody re-flattens
+// it. It used to re-flatten only the DIRECT CHILDREN OF THE LOWER BONE.
+//
+// For a bare rig that is nearly right by accident — a hand hangs off a forearm,
+// a foot hangs off a shin — which is why nothing here noticed for as long as
+// armour was a fixture on a spine part. Wearing real clothes finds the two
+// cases it misses, and the owner reported exactly those two:
+//
+//   * A SLEEVE hangs off the UPPER bone (armU), not below the lower one.
+//   * A BOOT hangs off the FOOT, which is a GRANDCHILD of the lower bone.
+//
+// Both stood still while the limb swung. The torso panel and the hood were
+// fine, because the spine is in no chain at all — a symptom that picks out two
+// garments out of four and looks like bad art.
+//
+// PURE ANIM, no world, no GPU, no rig: the defect is in AnimSolveTwoBone and
+// the fixture is five AnimParts. That is what makes it a ~0 ms gate you can run
+// while iterating (CLAUDE.md, "authoring cheap-to-verify work").
+// ============================================================================
+
+Status GateArmorTrack(Ctx& c, std::string& detail) {
+  (void)c;
+  bool ok = true;
+  int checks = 0;
+  auto check = [&](bool cond, const char* what) {
+    checks++;
+    if (!cond) {
+      ok = false;
+      std::printf("armor-track: FAILED %s\n", what);
+    }
+  };
+
+  // upper -> lower -> tip, plus one shell on the upper bone and one on the tip.
+  // Stored parent-before-child, which AnimFlatten requires and which the real
+  // appended tail also satisfies (a shell's host is always an earlier slot).
+  AnimSkeleton sk;
+  auto addPart = [&](const char* name, int parent, Vec3 restPos) {
+    AnimPart p;
+    p.name = name;
+    p.parent = parent;
+    p.rest.pos = restPos;
+    sk.parts.push_back(p);
+    return (int)sk.parts.size() - 1;
+  };
+  const int upper = addPart("armU", -1, Vec3{0, 20, 0});
+  const int lower = addPart("armL", upper, Vec3{0, -6, 0});
+  const int tip = addPart("hand", lower, Vec3{0, -6, 0});
+  // rest = identity: the shell IS its host's frame. Exactly what
+  // Mob::AppendWornShell writes.
+  const int sleeve = addPart("worn:robe:armU", upper, Vec3{0, 0, 0});
+  const int boot = addPart("worn:boots:hand", tip, Vec3{0, 0, 0});
+  check(sk.ParentsFirst(), "the fixture rig is stored parent-before-child");
+
+  IkChain chain;
+  chain.parts = {upper, lower};
+  chain.effector = tip;
+  chain.pole = Vec3{0, 0, -1};
+
+  AnimState st;
+  st.local.assign(sk.parts.size(), Transform{});
+  for (size_t i = 0; i < sk.parts.size(); i++) st.local[i] = sk.parts[i].rest;
+  AnimFlatten(sk, st);
+  const Vec3 tipBefore = st.model[tip].pos;
+
+  // Somewhere the rest pose plainly is not: off to the side and folded up, so
+  // both bones have to turn. A target the chain already reaches would make
+  // every claim below vacuous.
+  AnimSolveTwoBone(sk, st, chain, Vec3{6, 12, 2}, 1.0f);
+
+  auto samePos = [](const Vec3& a, const Vec3& b) {
+    return (a - b).len() < 1e-3f;
+  };
+  auto sameRot = [](const Quat& a, const Quat& b) {
+    // Quaternion double cover: q and -q are the same rotation.
+    const float d = a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+    return std::fabs(d) > 0.999f;
+  };
+
+  check(!samePos(st.model[tip].pos, tipBefore),
+        "the solve actually moved the chain (otherwise nothing below is a "
+        "claim about anything)");
+  // 1. THE UPPER BONE'S OWN SHELL. The case the old loop could not reach at
+  //    all: `p.parent != i1` skips every child of i0.
+  check(samePos(st.model[sleeve].pos, st.model[upper].pos) &&
+            sameRot(st.model[sleeve].rot, st.model[upper].rot),
+        "a shell on the UPPER bone rides it — the sleeve that stood still "
+        "while the arm swung");
+  // 2. A GRANDCHILD of the lower bone. The boot's case.
+  check(samePos(st.model[boot].pos, st.model[tip].pos) &&
+            sameRot(st.model[boot].rot, st.model[tip].rot),
+        "a shell two levels down rides its host — the boot that stayed where "
+        "the foot used to be");
+  // 3. The case that already worked, so the fix is not a swap of one bug for
+  //    another: the direct child of the lower bone.
+  {
+    const Quat want =
+        QuatNormalize(QuatMul(st.model[lower].rot, st.local[tip].rot));
+    const Vec3 wantPos =
+        st.model[lower].pos + QuatRotate(st.model[lower].rot, st.local[tip].pos);
+    check(samePos(st.model[tip].pos, wantPos) && sameRot(st.model[tip].rot, want),
+          "and a direct child of the lower bone still follows it");
+  }
+  // 4. THE SOLVER STILL OWNS ITS TWO BONES. A re-flatten pass that also
+  //    recomputed i0/i1 from their parents would undo the solve silently — the
+  //    IK would simply stop working, with the shells tracking a pose that never
+  //    reached the target.
+  {
+    AnimState ref;
+    ref.local = st.local;
+    AnimFlatten(sk, ref);
+    check(!samePos(st.model[upper].pos, ref.model[upper].pos) ||
+              !sameRot(st.model[upper].rot, ref.model[upper].rot),
+          "the solved bones keep the solver's pose, not a re-flatten of the "
+          "rest pose");
+  }
+
+  detail = Format("%d checks", checks);
+  std::printf("armor-track: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
+// ============================================================================
 // item-ground — dropping, picking up, and surviving a save.
 //
 // A dropped item is an ORDINARY DEBRIS BODY plus one entry in a registry that
@@ -1558,6 +1845,12 @@ const std::vector<Gate>& EquipmentGates() {
       // Mostly a pure function over integers, plus one rig assertion. Cheap,
       // and it wants nothing any other gate leaves behind.
       {"armor-fit", "equipment", {"prefab"}, false, GateArmorFit},
+      // Pure anim over a five-part fixture: no world, no physics, no defs. It
+      // declares no dependency because it genuinely has none.
+      {"armor-track", "equipment", {}, false, GateArmorTrack},
+      // The one gate here that reads the SHIPPED wardrobe, so it needs the same
+      // standing world the other rig gates do.
+      {"armor-stock", "equipment", {"prefab"}, false, GateArmorStock},
   };
   return g;
 }

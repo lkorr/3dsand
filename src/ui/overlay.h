@@ -519,6 +519,12 @@ struct UIState {
     std::string icon;    // chrome-atlas sprite key for the empty engraving
     std::string why;     // refusal sentence when the slot accepts nothing
     bool acceptsAnything = false;
+    // The slot's authored accepted kinds, as the same display words KitSlotUI
+    // carries. Mirrored so the panel can light up the ONE slot a dragged piece
+    // fits — before that it could only ask "does this slot take anything at
+    // all", which turned every armour slot red under every drag. Still not a
+    // second copy of the rule: this IS EquipSlotDef::accepts, named.
+    std::vector<std::string> accepts;
   };
   std::vector<EquipSlotUI> equipDefs;
   int bagCols = 8, bagRows = 4;
@@ -552,6 +558,16 @@ struct UIState {
     bool pending = false;
     KitRef from;
   } dropItem;
+  // RIGHT-CLICK: "put this where it belongs, I do not want to aim." The panel
+  // deliberately does NOT pick the destination slot — it has the accepted-kinds
+  // mirror and could, but choosing where a piece goes is the equipment system's
+  // decision (game/equipment.h owns the slot table, and it is the thing that
+  // knows a slot is already full). So this says only WHICH item was clicked and
+  // main.cpp answers with a real Move, exactly as a drag does.
+  struct EquipIntent {
+    bool pending = false;
+    KitRef from;
+  } equipItem;
   // A glyph dropped on a bound slot, BY NAME rather than by library index:
   // glyph indices are file-order dependent and die on every R reload, and a
   // latch that survives one frame can easily straddle one.

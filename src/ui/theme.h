@@ -203,7 +203,11 @@ float TrackedTextWidth(const char* text, float tracking);
 
 // The recess UNDER a slot sprite: banded gradient, grain, inner shadow, and
 // the state said in light around it. The sprite frame goes on top.
-enum class SlotLook { Empty, Filled, Hover, Refuse };
+// `Accept` is "a drag is in flight and THIS is where it goes" — the positive
+// half of `Refuse`, which existed alone and made every equip slot go red the
+// moment anything was picked up, including the one slot that would have taken
+// it. A refusal with nothing to contrast against says only "not here".
+enum class SlotLook { Empty, Filled, Hover, Refuse, Accept };
 void SlotSurface(ImDrawList* dl, ImVec2 a, float size, SlotLook look,
                  bool selected);
 

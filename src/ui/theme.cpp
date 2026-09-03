@@ -722,6 +722,14 @@ void SlotSurface(ImDrawList* dl, ImVec2 a, float size, SlotLook look,
     Glow(dl, a, b, ColGold(), 8.0f, 0.35f);
   } else if (look == SlotLook::Refuse) {
     Glow(dl, a, b, ColBloodHi(), 8.0f, 0.45f);
+  } else if (look == SlotLook::Accept) {
+    // PULSED, not static. This one has to be found by an eye that is following
+    // a cursor across the screen, and a steady wash at this size loses to the
+    // motion; a breathing one does not. One wall-clock phase for every slot, so
+    // a piece that fits two of them reads as one invitation rather than two.
+    const float p = 0.5f + 0.5f * (float)std::sin(ImGui::GetTime() * 6.0);
+    Glow(dl, a, b, ColGoldHi(), 10.0f, 0.28f + 0.34f * p);
+    RingOut(dl, a, b, 0.0f, 2.0f, ColGoldHi());
   }
   // The recess. Dark at the top where the rim shades it, a little lit at the
   // bottom; filled slots get a faint gold wash so "something is here" reads
@@ -731,9 +739,10 @@ void SlotSurface(ImDrawList* dl, ImVec2 a, float size, SlotLook look,
   dl->AddRectFilled(a, b, base);
   const ImVec2 fa(a.x + 2, a.y + 2), fb(b.x - 2, b.y - 2);
   GradientV(dl, fa, fb, Fade(ColInk(), 0.0f), Fade(ColHi(), 0.28f));
-  if (look == SlotLook::Filled || look == SlotLook::Hover)
-    dl->AddRectFilled(fa, fb, Fade(ColGold(), look == SlotLook::Hover ? 0.10f
-                                                                        : 0.06f));
+  if (look == SlotLook::Filled || look == SlotLook::Hover ||
+      look == SlotLook::Accept)
+    dl->AddRectFilled(fa, fb, Fade(ColGold(), look == SlotLook::Filled ? 0.06f
+                                                                       : 0.10f));
   Grain(dl, fa, fb, 0.07f);
   InnerShadow(dl, fa, fb, 6.0f, 0.55f);
 }

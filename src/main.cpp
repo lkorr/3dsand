@@ -1984,14 +1984,17 @@ int RunFluidShot(GpuContext& ctx, World& world, Simulation& sim,
 
 // Count of chunks whose dirty flag is set (selftest only — blocking readback).
 
-// --shot-mob <def>[:limb,limb,...] — the mob counterpart of --shot: worldgen,
-// spawn the named def, sever the listed limbs, run real ticks until the
-// locomotion state settles, then write close-up screenshots from three angles.
-// Exists because mob poses (gait, crawl clips, dismemberment states) can
-// otherwise only be judged in a live session — this makes "what does the
-// legless crawl actually look like" a ten-second question.
+// --shot-mob <def>[:limb|+item,...][@x,z] — the mob counterpart of --shot:
+// worldgen, spawn the named def, sever the listed limbs and PUT ON the listed
+// items ("+robe"), run real ticks until the locomotion state settles, then
+// write close-up screenshots from three angles.
+// Exists because mob poses (gait, crawl clips, dismemberment states, and now
+// what the wardrobe looks like on a body) can otherwise only be judged in a
+// live session — this makes "what does the legless crawl actually look like"
+// and "do the sleeves sit on the arms" ten-second questions.
 int RunMobShot(GpuContext& ctx, World& world, Simulation& sim, Physics& phys,
-               DebrisSystem& debris, MobSystem& mobs, const std::string& spec) {
+               DebrisSystem& debris, MobSystem& mobs, const ItemLibrary& items,
+               const std::string& spec) {
   std::string defName = spec, limbCsv;
   // optional trailing "@x,z" picks the spawn column (default 137,139) — the
   // default area is forested and a wandering mob ends its shot behind a trunk
@@ -2056,6 +2059,40 @@ int RunMobShot(GpuContext& ctx, World& world, Simulation& sim, Physics& phys,
     if (end == std::string::npos) end = limbCsv.size();
     std::string nm = limbCsv.substr(start, end - start);
     start = end + 1;
+    // "+name" DRESSES rather than dismembers. Worn geometry is the one thing
+    // about a rig that no headless mode could see: the shells only exist on a
+    // body somebody put clothes on, and the only place that happened was the
+    // live game's equipment panel. So "does the sleeve sit on the arm" could
+    // be answered by a screenshot of a running session and by nothing else,
+    // which is how it stayed wrong. The piece goes in the first slot whose
+    // authored rule takes its kind — the same choice right-click makes.
+    if (!nm.empty() && nm[0] == '+') {
+      const std::string itemName = nm.substr(1);
+      const int ii = items.Find(itemName);
+      const ItemDef* it = items.At(ii);
+      if (!it) {
+        std::fprintf(stderr, "--shot-mob: no item named \"%s\"\n",
+                     itemName.c_str());
+        return 1;
+      }
+      // Only WORN kinds. A sword would resolve to the sheath, which holds an
+      // item without putting it on a body, and the shot would come back
+      // identical with no hint why.
+      const int slot =
+          ItemKindIsWorn(it->kind) ? EquipSlotFor(it->kind, Equipment{}) : -1;
+      if (slot < 0) {
+        std::fprintf(stderr, "--shot-mob: nothing wears a \"%s\"\n",
+                     ItemKindName(it->kind));
+        return 1;
+      }
+      if (!mobs.WearItem(id, it, slot))
+        std::fprintf(stderr, "--shot-mob: \"%s\" would not go on\n",
+                     itemName.c_str());
+      else
+        std::printf("--shot-mob: wearing %s in slot %d\n", itemName.c_str(),
+                    slot);
+      continue;
+    }
     int li = -1;
     for (size_t i = 0; i < def.limbs.size(); i++)
       if (def.limbs[i].name == nm) li = (int)i;
@@ -2607,7 +2644,7 @@ int main(int argc, char** argv) {
   bool noAudio = false;  // --noaudio: run silent (also implied by every headless mode)
   bool telemetryEnabled = false;
   uint16_t telemetryPort = 8080;
-  std::string shotMob;  // --shot-mob <def>[:limb,...] (mob pose look iteration)
+  std::string shotMob;  // --shot-mob <def>[:limb|+item,...] (pose/wardrobe look)
   bool shotFluid = false;  // --shot-fluid (MPM water look iteration)
   // --shot-waterfall: the CA falling-column fixture. Its own flag rather
   // than a frame inside --shot because it BUILDS a scene (a terrace, a
@@ -3498,7 +3535,7 @@ int main(int argc, char** argv) {
     return RunFluidBench(ctx, world, sim, mats, fluidBenchScene,
                          stOpt.jsonPath);
   if (!shotMob.empty())
-    return RunMobShot(ctx, world, sim, phys, debris, mobs, shotMob);
+    return RunMobShot(ctx, world, sim, phys, debris, mobs, items, shotMob);
   if (rebaseline) stOpt.rebaseline = true;
 
   // --sweep sim.X=a,b,c [--sweep-gate <gate>]: run the determinism check at
@@ -3929,6 +3966,12 @@ int main(int argc, char** argv) {
       u.icon = d.icon;
       u.why = d.why;
       u.acceptsAnything = d.accepts[0] != ItemKind::None;
+      // The accepted kinds, as the same words KitSlotUI::kind carries, so the
+      // panel can light the slot a dragged piece belongs in. Copied from the
+      // authored table rather than restated — a second list here is the one
+      // that goes stale when a kind is added to a row.
+      for (ItemKind k : d.accepts)
+        if (k != ItemKind::None) u.accepts.push_back(ItemKindName(k));
       ui.equipDefs.push_back(std::move(u));
     }
     ui.bagCols = Bag::kCols;
@@ -7230,6 +7273,58 @@ int main(int argc, char** argv) {
         // the next tick. Nothing to do here, which is the point of routing the
         // change through the real container rather than around it.
       }
+      // ---- RIGHT-CLICK: PUT IT ON, OR TAKE IT OFF -----------------------
+      //
+      // Consumed here, beside the move latch, and EXECUTED AS A MOVE — so the
+      // kind check, the swap-never-overwrite rule and the refusal sentence are
+      // the same ones a drag gets, rather than a second path that does almost
+      // the same thing. The only thing this adds is CHOOSING the destination,
+      // which is the whole gesture.
+      //
+      // The choice, in order:
+      //   * From an equip slot -> the first free bag slot. Taking something off
+      //     has one obvious destination and it is not another equip slot.
+      //   * Otherwise -> the first slot whose authored `accepts` takes this
+      //     kind and is EMPTY; failing that, the first that takes it at all,
+      //     which swaps. Preferring the empty one is what makes right-clicking
+      //     two rings put them on two fingers instead of one finger twice.
+      if (ui.equipItem.pending) {
+        ui.equipItem.pending = false;
+        const ItemStack* src = kit.Resolve(ui.equipItem.from, hotbar);
+        const ItemDef* def = src && !src->Empty() ? items.At(src->def) : nullptr;
+        KitRef to{};
+        bool have = false;
+        if (!def) {
+          ui.kitMessage = "nothing to equip";
+          ui.kitMessageAge = 0.0f;
+        } else if (ui.equipItem.from.space == KitSpace::Equip) {
+          const int free = kit.bag.FirstFree();
+          if (free >= 0) {
+            to = KitRef{KitSpace::Bag, free};
+            have = true;
+          } else {
+            ui.kitMessage = "your pack is full";
+            ui.kitMessageAge = 0.0f;
+          }
+        } else {
+          const int first = EquipSlotFor(def->kind, kit.equip);
+          if (first >= 0) {
+            to = KitRef{KitSpace::Equip, first};
+            have = true;
+          } else {
+            ui.kitMessage = "there is nowhere on you that takes that";
+            ui.kitMessageAge = 0.0f;
+          }
+        }
+        if (have) {
+          const MoveResult r = kit.Move(ui.equipItem.from, to, hotbar, items);
+          const char* why = MoveResultText(r, to);
+          if (why && *why) {
+            ui.kitMessage = why;
+            ui.kitMessageAge = 0.0f;
+          }
+        }
+      }
       // ---- DROP: the drag that landed on nothing ------------------------
       //
       // Consumed at the SAME point in the frame as the move latch, and for the
@@ -7301,10 +7396,13 @@ int main(int argc, char** argv) {
             u.condition = conditionOf(d);
             u.ruined = GearRuined(u.condition, ruinedAt);
           }
-          switch (d->kind) {
-            case ItemKind::Melee: u.kind = "melee"; break;
-            default: u.kind = ""; break;
-          }
+          // THE KIND, AS THE ONE NAME THE FILE FORMAT ALREADY USES. It was
+          // "melee" or the empty string, which meant every worn piece told the
+          // panel nothing about itself — and the panel now needs it twice: to
+          // pick the item's icon, and to decide which equip slot lights up
+          // under a drag. ItemKindName is the same table items.json parses
+          // through, so there is still exactly one spelling of "armor_legs".
+          u.kind = d->kind == ItemKind::None ? "" : ItemKindName(d->kind);
           // Whatever the def actually carries — no invented stats. A melee
           // item has damage and reach; something with neither says nothing
           // rather than saying "0".

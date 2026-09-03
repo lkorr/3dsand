@@ -171,6 +171,23 @@ inline bool EquipSlotAccepts(int slot, ItemKind kind) {
   return false;
 }
 
+struct Equipment;   // defined below; EquipSlotFor needs only a forward decl
+
+// WHERE A PIECE GOES WHEN NOBODY AIMED — the destination the right-click
+// "just put this on" gesture picks. -1 when nothing on the body takes the kind.
+//
+// It lives here rather than in the frame loop for the reason everything else in
+// this header does: it is a RULE about the slot table, so it can be asserted
+// with no window, no GPU and no input stack (`--gate player-kit`). The version
+// that was inline in main.cpp could only be tested by a human clicking.
+//
+// PREFERS AN EMPTY SLOT over the first that merely accepts. Both are legal
+// destinations — a full slot swaps, which is the same thing a drag onto it
+// does — but right-clicking two rings should put them on two fingers, not put
+// one on and then knock it off with the other. The fallback still returns the
+// first accepting slot so a full set can be swapped a piece at a time.
+inline int EquipSlotFor(ItemKind kind, const Equipment& eq);
+
 // ---- WHAT A WORN PIECE HAS BEEN THROUGH -------------------------------------
 //
 // A shell on the body is a rig slot and carries its own damage: burnt-through
@@ -283,6 +300,16 @@ struct Equipment {
     return true;
   }
 };
+
+inline int EquipSlotFor(ItemKind kind, const Equipment& eq) {
+  int first = -1;
+  for (int s = 0; s < kEquipSlotCount; s++) {
+    if (!EquipSlotAccepts(s, kind)) continue;
+    if (eq.At(s).Empty()) return s;
+    if (first < 0) first = s;
+  }
+  return first;
+}
 
 // THE BAG: general storage, 4 rows of 8. Unlike the hotbar it has no selection
 // and no keys — it is where things live when they are not in hand, which is
