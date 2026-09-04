@@ -487,10 +487,6 @@ SPEC = [
     ("worldgen", "curveDesert8", "TUNE_CURVE_DESERT8", "i", 16384),
     ("worldgen", "biomeBlend", "TUNE_BIOME_BLEND", "i", 18),
     ("worldgen", "treeTile", "TUNE_TREE_TILE", "i", 144),
-    ("worldgen", "treeChanceForest", "TUNE_TREE_CHANCE_FOREST", "u", 78),
-    ("worldgen", "treeChancePine", "TUNE_TREE_CHANCE_PINE", "u", 70),
-    ("worldgen", "treeChanceMeadow", "TUNE_TREE_CHANCE_MEADOW", "u", 22),
-    ("worldgen", "treeChanceDesert", "TUNE_TREE_CHANCE_DESERT", "u", 6),
     ("worldgen", "autumnFraction", "TUNE_AUTUMN_FRACTION", "u", 5),
     ("worldgen", "pondTile", "TUNE_POND_TILE", "i", 448),
     ("worldgen", "pondChance", "TUNE_POND_CHANCE", "u", 4),
@@ -527,11 +523,6 @@ SPEC = [
     # desert / pine highland / alpine ground cover (worldgen agent E)
     ("worldgen", "cactusChance", "TUNE_CACTUS_CHANCE", "u", 26),
     ("worldgen", "saguaroFraction", "TUNE_SAGUARO_FRACTION", "u", 22),
-    ("worldgen", "tussockChance", "TUNE_TUSSOCK_CHANCE", "u", 9),
-    ("worldgen", "scrubChance", "TUNE_SCRUB_CHANCE", "u", 26),
-    ("worldgen", "desertPatch", "TUNE_DESERT_PATCH", "i", 130),
-    ("worldgen", "heathChance", "TUNE_HEATH_CHANCE", "u", 7),
-    ("worldgen", "heathPatch", "TUNE_HEATH_PATCH", "i", 128),
     ("worldgen", "alpineChance", "TUNE_ALPINE_CHANCE", "u", 40),
     ("worldgen", "ruinChance", "TUNE_RUIN_CHANCE", "u", 5),
 

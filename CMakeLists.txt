@@ -438,6 +438,7 @@ add_library(sandvox_core OBJECT
   # The authored biome + water-body preset files (assets/biomes, assets/water):
   # loaded and validated on the CPU; the table worldgen will read.
   src/sim/biomes.cpp
+  src/sim/worldmap.cpp
   src/sim/microvox.cpp
   src/sim/microbody.cpp
   src/game/player.cpp

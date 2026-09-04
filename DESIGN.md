@@ -6648,22 +6648,43 @@ the one model modders already read (PLAN_biomes.md §2 has the survey).
 
 ### What is live and what is scaffold — stated where the user can see it
 
-* **LIVE: tree species and weights.** The `.svtree` header bakes per-biome
-  weights in `treegen.js BIOME_ORDER` order. Those words are now DERIVED from
-  the biome files: the biome page's Save rewrites nothing in the species file
-  by itself, **Sync atlas** writes `placement.biomes` into every species file
-  and re-bakes the changed atlases (`node scripts/seed_environment.mjs --sync`
-  headlessly). The species file keeps the mirror because the bake reads one
-  file per species; the biome file is where it is EDITED. The `biomes` gate and
-  `check_invariants.py` (`biome order`) assert the mirror is current and that
-  worldgen's `B_*` ids, `treeatlas.h kBiomeCount`, `treegen.js BIOME_ORDER`,
-  `biomegen.js ENGINE_BIOMES` and `biomes.cpp kEngineBiomes` agree.
+* **LIVE (world map P1, 2026-09-04): the biome RECORD TABLE.** `worldmap.cpp`
+  packs every `assets/biomes/*.json` into the `worldMap` storage buffer
+  (binding 31, both sim layouts; `src/sim/worldmap.h` is the layout) and
+  `worldgen.wgsl` reads it through `wmBiome()/wmCover()` for: the ground skin
+  and its depth, the wedge's topsoil (`cover.skin/skinDepth/subsoil`), the
+  tree DENSITY (`trees.density`; the tile stays the global `worldgen.treeTile`
+  because the 5x5 candidate scan assumes one lattice), the per-biome cover
+  stack (`cover.plants[]`, rolled in order, first hit wins, one hash salt per
+  row, patch-masked through `vnoise2d`), the cave thresholds
+  (`caves.features` near_surface/deep), and three flags that replaced the
+  hard-coded `biome == B_DESERT/B_PINE` gates — `cover.groundFlora` (the
+  canopy-inverted undergrowth + flower layer), `cover.cacti`, `cover.sandCap`.
+  The desert tussock/scrub and pine heath floors that were shader blocks with
+  five `worldgen.*` knobs are now rows in `desert.json`/`pine.json`; the four
+  `treeChance*` knobs are gone. The alpine-cushion snowline block is still in
+  the shader (it is an ALTITUDE rule, not a biome's; it moves when the
+  landform plane lands, P4). A cover row's `maxSlope` is packed but not yet
+  enforced (P4 gives `Col` a slope).
+* **LIVE: tree species and weights, WITHOUT the bake.** `LoadTreeAtlas` takes
+  the biome set and builds the per-biome weight table from each biome file's
+  `trees.species[]` by name; the `.svtree`'s baked weight words (12..15) are
+  no longer read, so a weight edit reaches the world on the next launch and
+  `placement.biomes` in a species file is informational. **The biome id space
+  is the files:** `index` values must be exactly 0..N-1 (`ValidateBiomeSet`,
+  `check_invariants.py biome order`); the tree atlas and the record table are
+  laid out in that order and the shader reads the count from each header.
+  Eight biomes ship: forest, meadow, pine, desert, tundra, swamp, alpine,
+  ocean. `worldgen.wgsl` still names the first four by id (`B_*`) and
+  `biomeAt` still comes from the noise band — the painted map replaces that
+  in P2; until then the four new biomes exist as records nothing selects.
 * **LIVE: the biome band strip** on the climate section — the three worldgen
   thresholds (`meadowThreshold` / `pineThreshold` / `desertThreshold`) as one
   draggable bar writing `tuning.json`.
-* **AUTHORED, VALIDATED, PREVIEWED, NOT YET READ BY WORLDGEN:** cover plants,
-  water features, cave features, terrain overrides, tree-row conditions,
-  climate coordinates. The `biomes` gate (`src/sim/biomes.*`,
+* **AUTHORED, VALIDATED, PREVIEWED, NOT YET READ BY WORLDGEN:** water
+  features (P4/P5 of the world map), terrain overrides, tree-row and
+  cover-row `nearWater*` conditions, climate coordinates (the painted map
+  supersedes them in P2). The `biomes` gate (`src/sim/biomes.*`,
   `selftest_biomes.cpp`) loads every file and refuses an unknown species,
   preset or material, a biome `index` that is not worldgen's id for its name,
   a stale species mirror, a preset whose berm exceeds its shore lift. The

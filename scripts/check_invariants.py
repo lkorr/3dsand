@@ -1199,26 +1199,38 @@ def check_biome_order():
         if not val:
             problems.append(f"biome order: cannot find the list in {name}")
             return
-    ref = wg_order
-    for name, val in lists.items():
-        if val != ref:
-            problems.append(f"biome order: {name} is {val} but worldgen.wgsl says {ref}")
-    if k is not None and k != len(ref):
-        problems.append(f"biome order: treeatlas.h kBiomeCount is {k} but worldgen has {len(ref)} biomes")
-    # And every engine biome has a file, whose index is its id.
-    for i, name in enumerate(ref):
-        p = ROOT / "assets" / "biomes" / f"{name}.json"
-        if not p.exists():
-            problems.append(f"biome order: assets/biomes/{name}.json is missing (engine biome id {i}) -- node scripts/seed_environment.mjs --seed")
+    # Since the world map's P1 the id space is the FILES: assets/biomes/*.json
+    # `index` values must be exactly 0..N-1, and the tree atlas / worldMap
+    # record tables are laid out in that order at load. worldgen.wgsl still
+    # names the first four by id (B_* until P2 retires them) and treegen.js /
+    # biomegen.js still carry the four the .svtree bake wrote positionally, so
+    # those lists must be a PREFIX of the file order, not equal to it.
+    import json as _json
+    files = {}
+    for p in (ROOT / "assets" / "biomes").glob("*.json"):
+        if p.name.startswith("_"):
             continue
         try:
-            import json as _json
             j = _json.loads(p.read_text(encoding="utf-8"))
         except Exception as e:  # noqa: BLE001
-            problems.append(f"biome order: assets/biomes/{name}.json does not parse: {e}")
+            problems.append(f"biome order: {p.name} does not parse: {e}")
             continue
-        if j.get("index") != i:
-            problems.append(f"biome order: assets/biomes/{name}.json has index {j.get('index')}, worldgen's id is {i}")
+        files[p.stem] = j.get("index")
+    n = len(files)
+    by_id = {}
+    for name, idx in files.items():
+        if not isinstance(idx, int) or idx < 0 or idx >= n:
+            problems.append(f"biome order: assets/biomes/{name}.json index {idx} is outside 0..{n - 1} -- ids must be contiguous")
+        elif idx in by_id:
+            problems.append(f"biome order: assets/biomes/{name}.json and {by_id[idx]}.json both claim index {idx}")
+        else:
+            by_id[idx] = name
+    file_order = [by_id[i] for i in range(n) if i in by_id]
+    for name, val in lists.items():
+        if file_order[:len(val)] != val:
+            problems.append(f"biome order: {name} is {val} but assets/biomes/*.json ids start {file_order[:len(val)]}")
+    if k is not None:
+        problems.append("biome order: treeatlas.h still declares kBiomeCount; the count is data now (TreeAtlas::biomeCount)")
 
 # ------------------------------------------------------- far cell material bits
 def check_far_material_bits():

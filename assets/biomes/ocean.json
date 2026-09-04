@@ -1,0 +1,68 @@
+{
+  "name": "ocean",
+  "displayName": "Ocean",
+  "index": 7,
+  "climate": {
+    "temperature": 0.5,
+    "moisture": 1.0,
+    "notes": "The ring outside the painted map, and any painted sea: sand bed, no trees. Kelp arrives with the sea fill (P4)."
+  },
+  "terrain": {
+    "overrides": {}
+  },
+  "cover": {
+    "skin": "sand",
+    "skinDepth": 3,
+    "subsoil": "sand",
+    "patch": {
+      "threshold": 0,
+      "cellLog2": 5
+    },
+    "plants": [],
+    "groundFlora": false,
+    "sandCap": true
+  },
+  "trees": {
+    "tile": 14.4,
+    "density": 0,
+    "species": []
+  },
+  "water": {
+    "features": []
+  },
+  "caves": {
+    "features": [
+      {
+        "preset": "near_surface",
+        "threshold": 255,
+        "rarity": 1,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0
+        }
+      },
+      {
+        "preset": "deep",
+        "threshold": 255,
+        "rarity": 1,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0
+        }
+      }
+    ]
+  },
+  "swatch": {
+    "sizeM": 24,
+    "reliefM": 1.6,
+    "reliefFreq": 1
+  }
+}

@@ -54,6 +54,10 @@
 // Binding 26 in BOTH simBGL_ and simSlimBGL_: `far`/`fardown` run on the slim
 // group and both reach the tree sampler.
 @group(0) @binding(26) var<storage, read> treeAtlas : array<u32>;
+// The authored world map (src/sim/worldmap.h): the biome record table now,
+// the painted planes and the site table later. Read-only asset data on the
+// same terms as treeAtlas, at binding 31 in both sim layouts.
+@group(0) @binding(31) var<storage, read> worldMap : array<u32>;
 @group(0) @binding(17) var<storage, read>       pageTable : array<u32>;
 @group(0) @binding(18) var<storage, read_write> pageFaults : array<atomic<u32>>;
 // This module's page-fault identity (common.wgsl's PT_K_* block). Every
@@ -1350,6 +1354,58 @@ fn taSpecies(sp : i32, w : u32) -> u32 {
   return treeAtlas[treeAtlas[TA_H_SPECIES_DIR] + u32(sp) * TA_SPECIES_WORDS + w];
 }
 
+// ---- the world map's biome record table (src/sim/worldmap.h) --------------
+// Mirrors worldmap.h's header words, record fields and cover-row fields;
+// check_invariants.py holds the two together. One record per biome id, the
+// cover rows appended after the records. Everything is already an integer the
+// kernel can use: material IDs resolved at load, heights in voxels, chances as
+// 1-in-N, slopes in Q8.
+const WM_H_BIOME_COUNT   : u32 = 10u;
+const WM_H_BIOME_RECORDS : u32 = 11u;
+const WM_H_MAX_COVER_H   : u32 = 20u;
+const WM_B_WORDS         : u32 = 16u;
+const WM_B_SKIN          : u32 = 0u;
+const WM_B_SUBSOIL       : u32 = 1u;
+const WM_B_SKIN_DEPTH    : u32 = 2u;
+const WM_B_PATCH_THRESH  : u32 = 3u;
+const WM_B_PATCH_LOG2    : u32 = 4u;
+const WM_B_TREE_TILE     : u32 = 5u;
+const WM_B_TREE_DENSITY  : u32 = 6u;
+const WM_B_COVER_COUNT   : u32 = 7u;
+const WM_B_COVER_OFF     : u32 = 8u;
+const WM_B_CAVE_T1       : u32 = 9u;
+const WM_B_CAVE_T2       : u32 = 10u;
+const WM_B_SED_MAX       : u32 = 11u;
+const WM_B_FLAGS         : u32 = 12u;
+const WM_B_MAX_COVER_H   : u32 = 13u;
+const WM_C_WORDS         : u32 = 8u;
+const WM_C_MAT           : u32 = 0u;
+const WM_C_HEAD          : u32 = 1u;
+const WM_C_CHANCE        : u32 = 2u;
+const WM_C_HEIGHT        : u32 = 3u;
+const WM_C_MIN_Y         : u32 = 4u;
+const WM_C_MAX_Y         : u32 = 5u;
+const WM_C_MAX_SLOPE     : u32 = 6u;
+const WM_C_PATCH_THRESH  : u32 = 7u;
+const WM_BF_GROUND_FLORA : u32 = 1u;
+const WM_BF_CACTI        : u32 = 2u;
+const WM_BF_SAND_CAP     : u32 = 4u;
+
+fn wmBiomeCount() -> u32 { return worldMap[WM_H_BIOME_COUNT]; }
+// A biome id past the table (a stale save, a buffer that has not been
+// uploaded) reads record 0 rather than whatever lies past the end: the same
+// robustness the tree atlas gets from its header, and never a wild read.
+fn wmBiome(b : u32, w : u32) -> u32 {
+  let n = wmBiomeCount();
+  if (n == 0u) { return 0u; }
+  let id = select(b, 0u, b >= n);
+  return worldMap[worldMap[WM_H_BIOME_RECORDS] + id * WM_B_WORDS + w];
+}
+fn wmFlag(b : u32, f : u32) -> bool { return (wmBiome(b, WM_B_FLAGS) & f) != 0u; }
+fn wmCover(b : u32, i : u32, w : u32) -> u32 {
+  return worldMap[wmBiome(b, WM_B_COVER_OFF) + i * WM_C_WORDS + w];
+}
+
 // Placement is per TREE_TILE XZ tile: hash the tile, and it either holds one
 // tree or none. The tile has to be at least as wide as a canopy or trees
 // overlap into mush. Some overlap is good — that is what closes a canopy — but
@@ -1453,15 +1509,14 @@ fn treeInfoAt(s : TreeSite, land : Land, seed : u32) -> Tree {
   // (The spawn clearing is checked AFTER the species draw, where the crown's
   // real width is known — see the note at that test.)
 
-  // Density by biome: forest is nearly every tile, meadow is sparse clearing,
-  // desert gets the occasional dead bush.
+  // Density by biome, from the biome's record (assets/biomes/<name>.json
+  // `trees.density`, percent of tiles): forest is nearly every tile, meadow a
+  // sparse clearing, desert the occasional dead bush. The TILE is global
+  // (TREE_TILE): a per-biome tile would need a per-biome lattice, and the 5x5
+  // candidate scan assumes one lattice for every column it looks at.
   let biome = biomeAt(t.wx, t.wz, seed);
   let roll = (hsh >> 17u) % 100u;
-  var chance = 0u;
-  if (biome == B_FOREST)      { chance = TUNE_TREE_CHANCE_FOREST; }
-  else if (biome == B_PINE)   { chance = TUNE_TREE_CHANCE_PINE; }
-  else if (biome == B_MEADOW) { chance = TUNE_TREE_CHANCE_MEADOW; }
-  else                        { chance = TUNE_TREE_CHANCE_DESERT; }
+  let chance = wmBiome(biome, WM_B_TREE_DENSITY);
   if (roll >= chance) { return t; }
 
   // ---- WHICH SPECIES: a weighted draw from the biome's own table -----------
@@ -1869,7 +1924,7 @@ fn cactusInfo(tx : i32, tz : i32, seed : u32) -> Cactus {
 
   // Desert only, and never on the keep-out ground every other feature avoids:
   // the spawn clearing, the selftest fixture pads, or a pond.
-  if (biomeAt(c.wx, c.wz, seed) != B_DESERT) { return c; }
+  if (!wmFlag(biomeAt(c.wx, c.wz, seed), WM_BF_CACTI)) { return c; }
   let h = baseHeight(c.wx, c.wz, seed);
   c.base = h;
   if (h >= TREELINE) { return c; }
@@ -2355,18 +2410,21 @@ struct CaveBands {
   top2 : i32,   // deep band additionally capped at h - 40
 };
 
-fn caveBands(x : i32, z : i32, h : i32, seed : u32) -> CaveBands {
+fn caveBands(x : i32, z : i32, h : i32, biome : u32, seed : u32) -> CaveBands {
   var b : CaveBands;
   // band 1: near-surface caverns following the terrain
   // Cell sizes are log2 exponents (5 = 32 voxels, 4 = 16); the masks are shifted
-  // back to the 0..255 band the two THRESHOLD knobs are authored in.
-  b.on1 = (vnoise2d(x, z, 5u, seed ^ 5u).n >> 6) > i32(TUNE_CAVE_THRESHOLD1);
+  // back to the 0..255 band the two THRESHOLD values are authored in. The
+  // thresholds come from the biome's record (assets/biomes/<name>.json
+  // caves.features, near_surface / deep); a biome that authors none carries
+  // the global knobs, packed in by worldmap.cpp.
+  b.on1 = (vnoise2d(x, z, 5u, seed ^ 5u).n >> 6) > i32(wmBiome(biome, WM_B_CAVE_T1));
   b.f1 = h - vlen(40) - ((vnoise2d(x, z, 5u, seed ^ 6u).n * vlen(60)) >> 14);
   b.c1 = min(b.f1 + vlen(10) + ((vnoise2d(x, z, 4u, seed ^ 7u).n * vlen(20)) >> 14),
              h - vlen(40));
   // band 2: deep caverns at absolute depth (streamed depth is real terrain)
   b.on2 = (vnoise2d(x + 7717, z - 4177, 6u, seed ^ 8u).n >> 6) >
-          i32(TUNE_CAVE_THRESHOLD2);
+          i32(wmBiome(biome, WM_B_CAVE_T2));
   b.f2 = -vlen(40) - ((vnoise2d(x, z, 5u, seed ^ 9u).n * vlen(70)) >> 14);
   b.c2 = b.f2 + vlen(12) + ((vnoise2d(x, z, 4u, seed ^ 10u).n * vlen(26)) >> 14);
   // No `m2 > 190` lava test here any more: gating the fill on the cavern
@@ -2384,8 +2442,8 @@ fn caveIn(b : CaveBands, y : i32) -> i32 {
   return 0;
 }
 
-fn caveAt(x : i32, y : i32, z : i32, h : i32, seed : u32) -> i32 {
-  return caveIn(caveBands(x, z, h, seed), y);
+fn caveAt(x : i32, y : i32, z : i32, h : i32, biome : u32, seed : u32) -> i32 {
+  return caveIn(caveBands(x, z, h, biome, seed), y);
 }
 
 // ---- CAVE FLORA: openness placement where openness is a closed form --------
@@ -2976,7 +3034,7 @@ fn genColumn(x : i32, z : i32, seed : u32) -> Col {
   var shore : Shore;
   shore.onShore = false; shore.past = 0; shore.surf = -1;
   if (L.near.onShore && L.near.past < TUNE_SHORE_BAND &&
-      !onFixturePad(x, z) && biome != B_DESERT && h < TREELINE) {
+      !onFixturePad(x, z) && wmFlag(biome, WM_BF_GROUND_FLORA) && h < TREELINE) {
     shore = L.near;
     // A column whose ground stands well above the waterline is a BLUFF, not a
     // shore. This is the single most load-bearing test in the feature, and it
@@ -3081,7 +3139,7 @@ fn genCellIn(col : Col,
       mat = M_STONE;
     } else if (submerged && y > h - 3) {
       mat = M_SAND;                        // sandy pond bed
-    } else if ((biome == B_DESERT || onFixturePad(x, z)) && y > h - 4) {
+    } else if ((wmFlag(biome, WM_BF_SAND_CAP) || onFixturePad(x, z)) && y > h - 4) {
       mat = M_SAND;                        // loose cap — avalanches into repose piles
     } else if (shore.onShore && shore.past < TUNE_SHORE_MUD_WIDTH &&
                y > h - 2) {
@@ -3101,8 +3159,12 @@ fn genCellIn(col : Col,
       // A stone face inside the band that is NOT the mud ring gets wet moss
       // instead — see below.
       mat = M_SHORE_MUD;
-    } else if (y == h) {
-      mat = M_GRASS;                       // forest floor: one grass skin (SOLID)
+    } else if (y > h - i32(wmBiome(biome, WM_B_SKIN_DEPTH))) {
+      // The biome's ground skin (assets/biomes/<name>.json cover.skin /
+      // skinDepth): grass on the forest floor, snow on the tundra, mud in the
+      // marsh. A SOLID, for the reason the sediment note below gives -- a
+      // powder skin on a slope avalanches out from under itself.
+      mat = wmBiome(biome, WM_B_SKIN);
     } else if (y > h - sed && !onFixturePad(x, z)) {
       // NOT ON A FIXTURE PAD. The pad keeps its authored loose SAND cap on
       // purpose ("avalanches into repose piles"), but the four voxels under it
@@ -3131,7 +3193,7 @@ fn genCellIn(col : Col,
       // Topsoil first because that is the order a soil profile has, and because
       // gravel is what you want to hit when you dig a valley floor for
       // something that flows.
-      if (y > h - 1 - TUNE_SED_TOPSOIL) { mat = M_DIRT; }
+      if (y > h - 1 - TUNE_SED_TOPSOIL) { mat = wmBiome(biome, WM_B_SUBSOIL); }
       else { mat = M_GRAVEL; }
     } else {
       mat = M_STONE;
@@ -3146,7 +3208,7 @@ fn genCellIn(col : Col,
       // `caveIn(caveBands(...))`, so the one-shot arm below is the same
       // arithmetic in the same order and produces the same words.
       var cb : CaveBands;
-      if (caveValid) { cb = *cave; } else { cb = caveBands(x, z, h, seed); }
+      if (caveValid) { cb = *cave; } else { cb = caveBands(x, z, h, biome, seed); }
       let cv = caveIn(cb, y);
       if (cv == 1) {
         mat = MAT_AIR;
@@ -3376,7 +3438,7 @@ fn genCellIn(col : Col,
 
   if (mat == MAT_AIR && y == h + 1 && !ruinFloor &&
       !inRim && pond < 0 && h < TREELINE &&
-      biome != B_DESERT && !onFixturePad(x, z) && !shore.onShore) {
+      wmFlag(biome, WM_BF_GROUND_FLORA) && !onFixturePad(x, z) && !shore.onShore) {
     let fr = hash3(seed ^ 0xF10Eu, bitcast<u32>(x), bitcast<u32>(z));
     // ONE 25-tile scan answers both "how shaded is this column" and "how far to
     // the nearest trunk". Calling treeCanopyAt as well would run the identical
@@ -3514,7 +3576,7 @@ fn genCellIn(col : Col,
   // and this one did not would grow a headless stalk out of a stone floor.
   if (mat == MAT_AIR && y > h + 1 && y <= h + FLOWER_MAX_H && !ruinFloor &&
       !inRim && pond < 0 && h < TREELINE &&
-      biome != B_DESERT && !onFixturePad(x, z) && !shore.onShore) {
+      wmFlag(biome, WM_BF_GROUND_FLORA) && !onFixturePad(x, z) && !shore.onShore) {
     // THE FOURTH HOIST. `UG_COVER_EDGE` is a constant and x/z are the column's,
     // so every one of the FLOWER_MAX_H - 1 cells in this range asks flowerAt
     // the IDENTICAL question and gets the identical answer — and flowerAt is a
@@ -3571,58 +3633,66 @@ fn genCellIn(col : Col,
   // the ponds, the spawn clearing and the selftest fixture pads. cactusInfo()
   // enforces them at the SITE (so a column rooted outside cannot lean back in),
   // and the ground block re-tests them per column.
-  if (mat == MAT_AIR && biome == B_DESERT && !inRim && y > h && pond < 0 &&
+  if (mat == MAT_AIR && wmFlag(biome, WM_BF_CACTI) && !inRim && y > h && pond < 0 &&
       h < TREELINE) {
     let cm = cactusAt(x, y, z, seed);
     if (cm != MAT_AIR) { mat = cm; }
   }
 
-  // Desert ground cover. Same shape as the flora block above: one voxel above
-  // the surface, gated by a patch mask so the biome keeps open sand between its
-  // stands. The mask is what makes a desert read as arid — an even sprinkle of
-  // tussock over the whole biome is a dry lawn, and the bare stretches between
-  // stands are the thing that says "desert" rather than "dry field".
+  // ---- THE BIOME'S OWN COVER STACK (assets/biomes/<name>.json cover.plants) --
+  // This replaces the hand-written desert (tussock/scrub) and pine-highland
+  // (heath) floors, and is what gives every biome the tuner shows a floor of
+  // its own without a shader edit. Same shape as those blocks: cells above
+  // the surface, only where the canopy-inverted layer above left air, a patch
+  // mask so the plants grow in stands rather than as uniform static (an even
+  // sprinkle at any rate reads as noise, never as a place).
   //
-  // TWO DISTINCT HASH SALTS, one per species, never bit-slices of one hash —
-  // the pond-life block above documents why at length, and these two species
-  // would visibly co-locate if they shared entropy.
-  if (mat == MAT_AIR && y == h + 1 && biome == B_DESERT && !inRim && pond < 0 &&
-      h < TREELINE && !onFixturePad(x, z)) {
-    // Patch mask, offset off the other flora lattices so the two do not line up
-    // at their cell corners (the same reason the wildflower species field is
-    // sampled at an offset).
-    let cover = vnoise(x - 617, z + 431, 34 * HSCALE, seed ^ 0xD5E7u);
-    if (cover > TUNE_DESERT_PATCH) {
-      let hTus = hash3(seed ^ 0x7055u, bitcast<u32>(x), bitcast<u32>(z));
-      let hScr = hash3(seed ^ 0x5C2Bu, bitcast<u32>(x), bitcast<u32>(z));
-      // Tussock first and commonest: it is the species that turns bare sand
-      // from a texture into ground. Scrub is the sparser woody accent among it.
-      if ((hTus % TUNE_TUSSOCK_CHANCE) == 0u) {
-        mat = M_TUSSOCK;
-      } else if ((hScr % TUNE_SCRUB_CHANCE) == 0u) {
-        mat = M_SCRUB;
-      }
-    }
-  }
-
-  // ---- PINE HIGHLANDS: the conifer floor ------------------------------------
-  // The pine biome grew trees and nothing under them. A conifer stand has a real
-  // floor — huckleberry and juniper in the light gaps, needles everywhere else —
-  // and without it the highlands read as trunks standing on bare stone.
+  // Rows are rolled IN ORDER and the first hit wins, so an author puts the
+  // common ground layer last, the way the shore set rolls marsh grass last.
+  // ONE HASH SALT PER ROW, never bit-slices of one hash -- the pond-life
+  // block documents why at length; two rows sharing entropy would co-locate.
+  // The patch field is sampled at a per-row offset so the rows' lattices do
+  // not line up at cell corners (the reason the wildflower species field is
+  // sampled off-lattice), through vnoise2d, never the legacy vnoise.
   //
-  // Gated on the pine BIOME rather than on canopy cover, because the undergrowth
-  // block (where present) owns the cover-driven layer and this is the species
-  // set that belongs to a biome. A column that grew undergrowth is already
-  // non-air by the time we get here, so the two never fight over a cell: this
-  // fills what the shade set left bare.
-  if (mat == MAT_AIR && y == h + 1 && biome == B_PINE && !inRim && pond < 0 &&
-      h < TREELINE && !onFixturePad(x, z)) {
-    let cover = vnoise(x + 271, z - 859, 30 * HSCALE, seed ^ 0x4EA7u);
-    if (cover > TUNE_HEATH_PATCH) {
-      let hHth = hash3(seed ^ 0x483Bu, bitcast<u32>(x), bitcast<u32>(z));
-      if ((hHth % TUNE_HEATH_CHANCE) == 0u) {
-        mat = M_HEATH;
+  // Cost: on surface columns only, one vnoise2d + one hash per AUTHORED row
+  // until a hit; a biome with no rows pays one header read. Everything placed
+  // is inert (rule 2): the loader resolves names against materials.json and
+  // nothing here is a stem/sprout/seed.
+  if (mat == MAT_AIR && y > h && !inRim && pond < 0 && h < TREELINE &&
+      !onFixturePad(x, z)) {
+    let up = y - h;
+    let nRows = wmBiome(biome, WM_B_COVER_COUNT);
+    let bThresh = i32(wmBiome(biome, WM_B_PATCH_THRESH));
+    let pLog2 = wmBiome(biome, WM_B_PATCH_LOG2);
+    for (var i = 0u; i < nRows; i++) {
+      let chance = wmCover(biome, i, WM_C_CHANCE);
+      if (chance == 0u) { continue; }
+      let hRow = hash3(seed ^ (0xC0E0u + i * 0x9E37u), bitcast<u32>(x), bitcast<u32>(z));
+      if ((hRow % chance) != 0u) { continue; }
+      // Conditions: altitude band and steepness, per row, like a species'.
+      let minY = bitcast<i32>(wmCover(biome, i, WM_C_MIN_Y));
+      let maxY = bitcast<i32>(wmCover(biome, i, WM_C_MAX_Y));
+      if (minY >= 0 && h < minY) { continue; }
+      if (maxY >= 0 && h > maxY) { continue; }
+      // `maxSlope` (WM_C_MAX_SLOPE) is packed but NOT enforced yet: Col has
+      // no slope (LandCol is inside the height mirror and grows a field in
+      // P4, when landform lands). Every authored row is unbounded today.
+      // The patch mask: the biome's threshold, raised further by the row's.
+      let thresh = max(bThresh, i32(wmCover(biome, i, WM_C_PATCH_THRESH)));
+      if (thresh > 0) {
+        let off = i32(i) * 613;
+        let pm = vnoise2d(x - 617 + off, z + 431 - off, pLog2, seed ^ (0xD5E7u + i)).n >> 6;
+        if (pm <= thresh) { continue; }
       }
+      // Height: the row's stalk, jittered per column so a bed of stalks all
+      // cut to one height does not read as a fence; the head caps the top.
+      let base = i32(wmCover(biome, i, WM_C_HEIGHT));
+      let hgt = select(base, max(1, base + i32((hRow >> 5u) % 3u) - 1), base >= 3);
+      if (up > hgt) { break; }
+      let head = wmCover(biome, i, WM_C_HEAD);
+      mat = select(wmCover(biome, i, WM_C_MAT), head, head != 0u && up == hgt);
+      break;
     }
   }
 
@@ -4048,6 +4118,13 @@ fn farSurfaceMat(col : Col, mat : u32, fine : vec3<i32>, shift : u32,
 fn farColTopFrom(h : i32, fluidTop : i32, ruin : Ruin,
                  x : i32, z : i32, seed : u32) -> i32 {
   var top = max(h, fluidTop);
+  // The biome cover stack stands ON the ground and, since the world map's P1,
+  // is authored data that can be taller than a far cell: a stalk that pokes
+  // into the cell above the flagged ground is a blocker the flag would
+  // otherwise miss (the far-fog gate's "flag sits below the material top").
+  // Global max, not per-biome: the corner-column callers hold no biome, and
+  // the bit is conservative by design -- over-flagging costs nothing.
+  top = max(top, h + i32(worldMap[WM_H_MAX_COVER_H]));
   if (ruin.present) { top = max(top, ruin.y + RUIN_HT); }
   if (T.labMode == 0u && abs(x - 180) <= 32 && abs(z - 110) <= 32) {
     top = max(top, baseHeight(180, 110, seed) + 16);
@@ -4184,7 +4261,7 @@ fn genChunk(slot : u32, li : u32, actIdx : u32) {
     // far path's per-cell entry, and computing cave bands there would put this
     // cost on every air column of every cascade fill.
     let caveValid = base.y <= col.h && !col.inRim;
-    if (caveValid) { cave = caveBands(wx, wz, col.h, T.seed); }
+    if (caveValid) { cave = caveBands(wx, wz, col.h, col.biome, T.seed); }
     // Tree candidates: because the answer is what makes the vertical reject a
     // LOCAL ceiling (`trees.top`) instead of a world-wide constant.
     //
@@ -4259,9 +4336,15 @@ fn genChunk(slot : u32, li : u32, actIdx : u32) {
     //
     // All the h-relative plant reaches collapse into one margin, which is
     // strictly conservative: over-estimating the ceiling only declines a skip.
-    let skyMargin = max(max(FLOWER_MAX_H, TUNE_REED_HEIGHT),
-                        max(TUNE_SHORE_CATTAIL_HEIGHT + 3,
-                            TUNE_SHORE_HORSETAIL_HEIGHT + 2));
+    // ...plus the biome's own cover stack (WM_B_MAX_COVER_H, packed from the
+    // tallest authored row, jitter included). Since the world map's P1 the
+    // cover rows are DATA and can be taller than every fixed term here (a
+    // 1.2 m cactus row is 13 voxels); a margin that ignored them would skip a
+    // chunk whose plants it never wrote.
+    let skyMargin = max(max(max(FLOWER_MAX_H, TUNE_REED_HEIGHT),
+                            max(TUNE_SHORE_CATTAIL_HEIGHT + 3,
+                                TUNE_SHORE_HORSETAIL_HEIGHT + 2)),
+                        i32(wmBiome(col.biome, WM_B_MAX_COVER_H)));
     var colTop = col.h + skyMargin;
     colTop = max(colTop, col.fluidTop);
     colTop = max(colTop, col.pond + 1);
@@ -4278,7 +4361,7 @@ fn genChunk(slot : u32, li : u32, actIdx : u32) {
     if (abs(sadx) <= 40 && sadz >= -64 && sadz <= 40) {
       colTop = max(colTop, poi.arenaY + 24);
     }
-    if (col.biome != B_DESERT && base.y > colTop) {
+    if (!wmFlag(col.biome, WM_BF_CACTI) && base.y > colTop) {
       for (var ly = 0u; ly < CHUNK; ly += 1u) {
         voxStore(voxWordInChunk(slot, lx + ly * CHUNK + lz * CHUNK * CHUNK), 0u);
       }
@@ -4291,7 +4374,7 @@ fn genChunk(slot : u32, li : u32, actIdx : u32) {
     // y tests replaced by "does this chunk's 16-cell stack reach the band at
     // all", which is the only part of it that is not column-invariant.
     let stalkValid = !col.ruinFloor && !col.inRim && col.pond < 0 &&
-                     col.h < TREELINE && col.biome != B_DESERT &&
+                     col.h < TREELINE && wmFlag(col.biome, WM_BF_GROUND_FLORA) &&
                      !onFixturePad(wx, wz) && !col.shore.onShore &&
                      base.y + i32(CHUNK) > col.h + 1 &&
                      base.y <= col.h + FLOWER_MAX_H;

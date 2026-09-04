@@ -3160,9 +3160,15 @@ int main(int argc, char** argv) {
       // The second world this process builds needs the same trees as the first
       // -- a treeless second world would hash differently for a reason that has
       // nothing to do with what is being tested.
+      biomes::BiomeSet stBiomes;
+      { std::string bl;
+        if (!biomes::LoadBiomeSet(ad, m, stBiomes, bl)) {
+          std::fprintf(stderr, "%s", bl.c_str());
+          return 1;
+        } }
       TreeAtlas stTrees;
       { std::string tl;
-        if (!LoadTreeAtlas(ad + "/trees", m, stTrees, tl)) {
+        if (!LoadTreeAtlas(ad + "/trees", m, stBiomes, stTrees, tl)) {
           std::fprintf(stderr, "%s", tl.c_str());
           return 1;
         } }
@@ -3173,8 +3179,14 @@ int main(int argc, char** argv) {
       World stWorld;
       stWorld.residency = World::Residency::Paged;
       stWorld.Init(stCtx.device);
+      std::vector<uint32_t> stMapWords;
+      { std::string wl;
+        if (!worldmap::PackBiomeTable(stBiomes, stMapWords, wl)) {
+          std::fprintf(stderr, "%s", wl.c_str());
+          return 1;
+        } }
       Simulation stSim;
-      if (!stSim.Init(stCtx.device, stWorld, m, rx, mic, stTrees, ad + "/shaders"))
+      if (!stSim.Init(stCtx.device, stWorld, m, rx, mic, stTrees, stMapWords, ad + "/shaders"))
         return 1;
       Physics stPhys; stPhys.Init();
       DebrisSystem stDebris; stDebris.Init(&stPhys, &stWorld, m, rx);
@@ -3313,10 +3325,34 @@ int main(int argc, char** argv) {
   // The baked tree atlas (src/sim/treeatlas.h). AFTER LoadAssets, because it
   // resolves the material NAMES its .svtree files carry against the compiled
   // table, and before Simulation::Init, which uploads it.
+  // The biome set (assets/biomes/*.json) is loaded FIRST: it is the id space
+  // the tree atlas's weight table and the worldMap buffer's record table are
+  // both laid out in (docs/PLAN_world_map.md P1).
+  biomes::BiomeSet biomeSet;
+  std::vector<uint32_t> worldMapWords;
+  {
+    std::string blog;
+    if (!biomes::LoadBiomeSet(assetDir, mats, biomeSet, blog)) {
+      std::fprintf(stderr, "%s", blog.c_str());
+      std::fprintf(stderr, "biome files failed to load -- refusing to start\n");
+      return 1;
+    }
+    std::vector<std::string> problems;
+    if (biomes::ValidateBiomeSet(biomeSet, problems)) {
+      for (const std::string& p : problems) std::fprintf(stderr, "biomes: %s\n", p.c_str());
+      std::fprintf(stderr, "biome files are invalid -- refusing to start with a world "
+                           "whose biome ids cannot be laid out\n");
+      return 1;
+    }
+    if (!worldmap::PackBiomeTable(biomeSet, worldMapWords, blog)) {
+      std::fprintf(stderr, "%s", blog.c_str());
+      return 1;
+    }
+  }
   TreeAtlas treeAtlas;
   {
     std::string tlog;
-    if (!LoadTreeAtlas(assetDir + "/trees", mats, treeAtlas, tlog)) {
+    if (!LoadTreeAtlas(assetDir + "/trees", mats, biomeSet, treeAtlas, tlog)) {
       std::fprintf(stderr, "%s", tlog.c_str());
       std::fprintf(stderr, "tree atlas failed to load -- refusing to start with a "
                            "half-read forest\n");
@@ -3371,7 +3407,7 @@ int main(int argc, char** argv) {
   world.Init(ctx.device);
   StartupMark("world buffers (page pool, far cascades)");
   Simulation sim;
-  if (!sim.Init(ctx.device, world, mats, reactions, micro, treeAtlas,
+  if (!sim.Init(ctx.device, world, mats, reactions, micro, treeAtlas, worldMapWords,
                 assetDir + "/shaders"))
     return 1;
   StartupMark("sim init: every compute shader through Tint + the driver");

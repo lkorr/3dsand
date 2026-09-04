@@ -53,6 +53,8 @@
 #pragma once
 
 #include <cstdint>
+#include <string>
+#include <vector>
 
 namespace worldmap {
 
@@ -86,11 +88,78 @@ enum : uint32_t {
   kHSiteCount = 17,
   kHStampRuns = 18,     // word offset: stamp template run-lists
   kHContentHash = 19,   // FNV-1a of both files; reported at boot
+  kHMaxCoverH = 20,     // max over every biome of kB_MaxCoverH: the far
+                        // cascade's blocker band has no biome in hand
   kHeaderWords = 32,    // padded, like treeatlas::kFileHeaderWords
 };
 
 // The magic in both the file and the buffer header: 'SVMP', little-endian.
 inline constexpr uint32_t kMagic = 0x504D5653u;
 inline constexpr uint32_t kVersion = 1u;
+
+// ---- the biome record table (P1) -------------------------------------------
+// One fixed-stride record per biome id, at `kHBiomeRecords`, followed by the
+// cover rows every record points into. This is what `assets/biomes/*.json`
+// becomes on the GPU: the ground skin, the tree density, the per-biome cover
+// stack, the cave thresholds. Mirrored by worldgen.wgsl's WM_B_* / WM_C_*
+// consts; check_invariants.py holds the two together.
+//
+// Everything is an integer the shader can use as-is: material IDS (resolved
+// by name at load, like the tree atlas), heights in VOXELS (the JSON authors
+// metres), chances as 1-in-N, slopes in Q8. A cover row's `heightVox` is the
+// stalk height; `head` caps the top cell when non-zero.
+enum : uint32_t {
+  kBiomeRecWords = 16,
+  kB_Skin = 0,            // material id of the y == h skin
+  kB_Subsoil = 1,         // material id under the skin (the wedge's topsoil)
+  kB_SkinDepth = 2,       // cells of skin, >= 1
+  kB_PatchThreshold = 3,  // 0..255 gate on the biome's patch field; 0 = no mask
+  kB_PatchCellLog2 = 4,   // log2 of the patch field's cell, in voxels
+  kB_TreeTileVox = 5,     // authored tree tile (informational; TREE_TILE is global)
+  kB_TreeDensity = 6,     // percent of tree tiles that grow a tree
+  kB_CoverCount = 7,
+  kB_CoverOff = 8,        // word offset of this biome's first cover row
+  kB_CaveThreshold1 = 9,  // near-surface cave band gate (0..255)
+  kB_CaveThreshold2 = 10, // deep cave band gate
+  kB_SedMax = 11,         // reserved for P4 (0 = use the global knob)
+  kB_Flags = 12,          // kBF_* below
+  kB_MaxCoverH = 13,      // tallest cover row (voxels, jitter included): the
+                          // sky-skip and far-blocker ceilings MUST include it,
+                          // or a plant above the old fixed margin is never
+                          // written by a skipped chunk and sits above the far
+                          // field's flagged top (far-fog gate, 2026-09-04)
+  // 14..15 reserved
+  kCoverRowWords = 8,
+  kC_Mat = 0,
+  kC_Head = 1,
+  kC_Chance = 2,          // 1 in N surface columns; 0 = row is off
+  kC_HeightVox = 3,       // >= 1
+  kC_MinY = 4,            // -1 = unbounded (stored as u32, read as i32)
+  kC_MaxY = 5,
+  kC_MaxSlope = 6,        // Q8; 1024 = unbounded
+  kC_PatchThreshold = 7,  // per-row extra gate on the biome patch field
+};
+// kB_Flags bits. These replace the `biome == B_DESERT` / `== B_PINE` tests
+// that used to gate whole blocks of genCellIn on a hard-coded id.
+inline constexpr uint32_t kBF_GroundFlora = 1u << 0;  // the canopy-inverted undergrowth + flower layer
+inline constexpr uint32_t kBF_Cacti = 1u << 1;        // the cactus proc shape
+inline constexpr uint32_t kBF_SandCap = 1u << 2;      // loose sand cap under the skin (the old desert rule)
+
+}  // namespace worldmap
+
+namespace biomes { struct BiomeSet; }
+
+namespace worldmap {
+
+/**
+ * Pack the loaded biome set into the `worldMap` buffer's words: header +
+ * biome records + cover rows. Biome ids must be contiguous 0..N-1
+ * (ValidateBiomeSet enforces it); the record for id i is at
+ * words[kHBiomeRecords] + i * kBiomeRecWords. Returns false, with `log`,
+ * only on an id-space that cannot be laid out. The content hash goes in
+ * kHContentHash so a moved world hash can be attributed to the table.
+ */
+bool PackBiomeTable(const biomes::BiomeSet& set, std::vector<uint32_t>& words,
+                    std::string& log);
 
 }  // namespace worldmap

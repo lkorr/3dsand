@@ -29,6 +29,7 @@
 #include <string>
 #include <vector>
 
+#include "sim/biomes.h"
 #include "sim/materials.h"
 
 // ---------------------------------------------------------------------------
@@ -49,7 +50,11 @@ inline constexpr uint32_t kVersion = 1u;
 inline constexpr int kHeaderWords = 16;
 inline constexpr int kSpeciesWords = 24;
 inline constexpr int kVariantWords = 12;
-inline constexpr int kBiomeCount = 4;   // worldgen.wgsl B_FOREST..B_DESERT
+// There is no kBiomeCount any more. The biome id space is the set of
+// assets/biomes/*.json files (biomes.h), the weight table has one row per
+// loaded biome, and the shader reads the row count from the atlas header --
+// see TreeAtlas::biomeCount. The .svtree's baked weight words (12..15) are
+// no longer read; the biome files are the one authority (P1 of the world map).
 
 // header word indices
 enum : int {
@@ -127,7 +132,7 @@ struct TreeSpeciesInfo {
   int above = 0;         // tallest voxel above the trunk's ground
   int crownY = 0;
   int crownR = 0;
-  int biome[treeatlas::kBiomeCount] = {0, 0, 0, 0};
+  std::vector<int> biome;  // weight per biome id, from assets/biomes/*.json
   int minY = -1, maxY = -1, maxSlope = 0, sparsity = 1;
   uint32_t canopyMat = 0;  // engine material id the far cascades paint, 0 = none
   int shade = 0;           // 0..255 canopy cover this species casts
@@ -141,6 +146,7 @@ struct TreeAtlas {
    *  "no trees" has to be a legal world, not a crash. */
   std::vector<uint32_t> words;
   int speciesCount = 0;
+  int biomeCount = 0;      // rows in the weight table = loaded biome files
   int maxReachXZ = 0;
   int maxAbove = 0;
   std::vector<TreeSpeciesInfo> species;
@@ -161,9 +167,14 @@ struct TreeAtlas {
  * zero species: worldgen then places no trees, which is a legal world and the
  * state a fresh checkout of the tools would be in before the first bake.
  * Unresolvable material names are reported into `log` and mapped to air.
+ *
+ * `set` is the loaded biome set (biomes.h): the per-biome weight table is
+ * built from each biome file's `trees.species[]` by species NAME, one row per
+ * biome id, so the forest the engine grows is the one the Environment tab
+ * shows with no bake in between. A species no biome lists simply never grows.
  */
 bool LoadTreeAtlas(const std::string& dir, const std::vector<MaterialDef>& mats,
-                   TreeAtlas& out, std::string& log);
+                   const biomes::BiomeSet& set, TreeAtlas& out, std::string& log);
 
 /** Decode one cell of one variant on the CPU, through the same column/run path
  *  the shader takes. Exists for the `tree-atlas` selftest gate — nothing on the

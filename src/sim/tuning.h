@@ -2873,8 +2873,6 @@ struct Tuning {
         curveDesert6 = 8192, curveDesert7 = 12288, curveDesert8 = 16384;
     int biomeBlend = 18;
     int treeTile = 144;
-    int treeChanceForest = 78, treeChancePine = 70;
-    int treeChanceMeadow = 22, treeChanceDesert = 6;
     int autumnFraction = 5;   // 1-in-N broadleaves turn autumn
     int pondTile = 448, pondChance = 4, pondRadiusMin = 48, pondRadiusSpan = 32;
     // Steepest ground a tarn may sit on, |dh/dx|+|dh/dz| in Q8 (256 = the
@@ -2931,14 +2929,9 @@ struct Tuning {
     // Saguaros are landmarks: keep them occasional or the desert reads as a
     // planted grid rather than as somewhere you cross to find one.
     int cactusChance = 26, saguaroFraction = 22;
-    // 1-in-N per desert column, inside desertPatch. Tussock is the common
-    // species (it is what makes bare sand read as ground rather than as a
-    // texture); scrub is the sparse woody accent.
-    int tussockChance = 9, scrubChance = 26;
-    int desertPatch = 130;           // vnoise 0..255 gate; higher = barer
-    // 1-in-N per pine-highland column, inside heathPatch: the huckleberry and
-    // juniper floor under a conifer stand.
-    int heathChance = 7, heathPatch = 128;
+    // The desert tussock/scrub and pine heath floors are no longer knobs: they
+    // are rows in assets/biomes/desert.json and pine.json (cover.plants),
+    // packed into the worldMap buffer's biome records (worldmap.h, P1).
     // 1-in-N per column above TREELINE. The sparsest density here on purpose —
     // the snowline is meant to read as harsh, so this is the one knob that can
     // undo the intent of the whole alpine band by being made generous.

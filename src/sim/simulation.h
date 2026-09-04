@@ -21,7 +21,8 @@ class Simulation {
   bool Init(const rhi::Device& device, World& world,
             const std::vector<MaterialDef>& mats,
             const std::vector<ReactionGpu>& reactions, const MicroSet& micro,
-            const TreeAtlas& trees, const std::string& shaderDir);
+            const TreeAtlas& trees, const std::vector<uint32_t>& worldMapWords,
+            const std::string& shaderDir);
 
   // Recompile all WGSL from disk; returns false (keeping old pipelines) on
   // compile error.

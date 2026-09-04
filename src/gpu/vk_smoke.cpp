@@ -312,15 +312,25 @@ bool RunScenario(bool loud, bool lowPower, bool sledgehammer, bool validation,
   // The smoke harness runs the REAL worldgen, so it needs the real trees --
   // without them every probe would hash a treeless world and the pinned tables
   // would silently describe a different game.
+  biomes::BiomeSet biomeSet;
+  std::vector<uint32_t> worldMapWords;
+  {
+    std::string blog;
+    if (!biomes::LoadBiomeSet(assetDir, mats, biomeSet, blog) ||
+        !worldmap::PackBiomeTable(biomeSet, worldMapWords, blog)) {
+      std::printf("biomes: FAIL\n%s", blog.c_str());
+      return false;
+    }
+  }
   TreeAtlas treeAtlas;
   {
     std::string tlog;
-    if (!LoadTreeAtlas(assetDir + "/trees", mats, treeAtlas, tlog)) {
+    if (!LoadTreeAtlas(assetDir + "/trees", mats, biomeSet, treeAtlas, tlog)) {
       std::printf("tree atlas: FAIL\n%s", tlog.c_str());
       return false;
     }
   }
-  if (!sim.Init(ctx.device, world, mats, reactions, micro, treeAtlas,
+  if (!sim.Init(ctx.device, world, mats, reactions, micro, treeAtlas, worldMapWords,
                 assetDir + "/shaders")) {
     std::printf("sim init: FAIL\n");
     return false;

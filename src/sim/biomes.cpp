@@ -120,6 +120,9 @@ bool LoadBiomeSet(const std::string& assetDir, const std::vector<MaterialDef>& m
     const json& patch = Sub(cv, "patch");
     b.patchThreshold = Get<int>(patch, "threshold", 0);
     b.patchCellLog2 = Get<int>(patch, "cellLog2", 5);
+    b.groundFlora = Get<bool>(cv, "groundFlora", true);
+    b.cacti = Get<bool>(cv, "cacti", false);
+    b.sandCap = Get<bool>(cv, "sandCap", false);
     for (const json& r : Arr(cv, "plants")) {
       CoverRow row;
       row.material = GetS(r, "material");
@@ -240,22 +243,34 @@ int ValidateBiomeSet(const BiomeSet& set, std::vector<std::string>& out) {
   for (const WaterPresetDef& w : set.water) water[w.name] = &w;
 
   if (set.biomes.empty()) bad("no biome files (assets/biomes/*.json) — run node scripts/seed_environment.mjs --seed");
-  for (int i = 0; i < kEngineBiomeCount; i++)
-    if (!BiomeById(set, i))
-      bad(std::string("engine biome ") + kEngineBiomes[i] + " (id " + std::to_string(i) + ") has no file");
+  // THE ID SPACE IS THE FILES. `index` is the biome's id everywhere -- the
+  // record slot in the worldMap buffer, the row in the tree atlas's weight
+  // table, the value `Col.biome` carries -- so the indices must be exactly
+  // 0..N-1 with no gap and no duplicate. The four the shader still names by
+  // id (B_FOREST..B_DESERT, until P2 retires them) must keep those ids.
+  {
+    const int n = static_cast<int>(set.biomes.size());
+    std::vector<int> seen(static_cast<size_t>(n), 0);
+    for (const BiomeDef& b : set.biomes) {
+      if (b.index < 0 || b.index >= n)
+        bad("biomes/" + b.file + ": index " + std::to_string(b.index) + " is outside 0.." + std::to_string(n - 1) +
+            " -- ids must be contiguous, one per file");
+      else if (seen[b.index]++)
+        bad("biomes/" + b.file + ": index " + std::to_string(b.index) + " is used by another biome file");
+    }
+    for (int i = 0; i < kEngineBiomeCount; i++) {
+      const BiomeDef* b = BiomeById(set, i);
+      if (!b) bad(std::string("biome id ") + std::to_string(i) + " must be \"" + kEngineBiomes[i] + "\" (worldgen.wgsl still names it) and has no file");
+      else if (b->name != kEngineBiomes[i])
+        bad("biomes/" + b->file + ": index " + std::to_string(i) + " belongs to \"" + kEngineBiomes[i] + "\" while worldgen.wgsl names it by id");
+    }
+  }
 
   for (const BiomeDef& b : set.biomes) {
     const std::string at = "biomes/" + b.file + ": ";
     if (b.name.empty() || b.name.find_first_not_of("abcdefghijklmnopqrstuvwxyz0123456789_") != std::string::npos)
       bad(at + "name must be [a-z0-9_], got \"" + b.name + "\"");
     if (b.file != b.name + ".json") bad(at + "file name does not match name \"" + b.name + "\"");
-    // The id contract: an engine biome's index IS its worldgen id, a
-    // non-engine biome has -1. Anything else is a file claiming to be a
-    // biome the shader does not know by that number.
-    int want = -1;
-    for (int i = 0; i < kEngineBiomeCount; i++) if (b.name == kEngineBiomes[i]) want = i;
-    if (b.index != want)
-      bad(at + "index " + std::to_string(b.index) + " but worldgen's id for \"" + b.name + "\" is " + std::to_string(want));
     if (!b.skinId && b.skin != "air") bad(at + "cover.skin \"" + b.skin + "\" is not a material");
     if (!b.subsoilId && b.subsoil != "air") bad(at + "cover.subsoil \"" + b.subsoil + "\" is not a material");
     for (size_t i = 0; i < b.cover.size(); i++) {
@@ -284,21 +299,10 @@ int ValidateBiomeSet(const BiomeSet& set, std::vector<std::string>& out) {
         bad(at + "caves.features[" + std::to_string(i) + "] preset must be near_surface or deep");
   }
 
-  // The mirror: the species file must carry exactly the weights the biome
-  // files give it, for every engine biome — including ZERO for a biome that
-  // does not list it. The atlas bakes the species copy, so this is the one
-  // check that says the forest the engine grows is the forest the page shows.
-  for (const SpeciesMirror& s : set.species) {
-    for (int i = 0; i < kEngineBiomeCount; i++) {
-      const BiomeDef* b = BiomeById(set, i);
-      if (!b) continue;
-      int want = 0;
-      for (const TreeRow& r : b->trees) if (r.species == s.name) want = r.weight;
-      if (s.biome[i] != want)
-        bad("trees/" + s.name + ".json: placement.biomes." + kEngineBiomes[i] + " = " + std::to_string(s.biome[i]) +
-            " but biomes/" + b->name + ".json says " + std::to_string(want) + " — node scripts/seed_environment.mjs --sync, then re-bake");
-    }
-  }
+  // No species-mirror check any more: since P1 of the world map the tree
+  // atlas builds its weight table from THESE files at load (treeatlas.cpp),
+  // and the .svtree's baked weight words are not read. `placement.biomes` in
+  // a species file is now informational, kept for the tree page's display.
 
   for (const WaterPresetDef& w : set.water) {
     const std::string at = "water/" + w.file + ": ";

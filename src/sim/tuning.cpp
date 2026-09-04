@@ -2399,10 +2399,6 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadWgCount(*g, "curveDesert8", w.curveDesert8, out, at);
     ReadWgCount(*g, "biomeBlend", w.biomeBlend, out, at);
     ReadWgLen(*g, "treeTile", w.treeTile, out, at);
-    ReadWgCount(*g, "treeChanceForest", w.treeChanceForest, out, at);
-    ReadWgCount(*g, "treeChancePine", w.treeChancePine, out, at);
-    ReadWgCount(*g, "treeChanceMeadow", w.treeChanceMeadow, out, at);
-    ReadWgCount(*g, "treeChanceDesert", w.treeChanceDesert, out, at);
     ReadWgCount(*g, "autumnFraction", w.autumnFraction, out, at);
     ReadWgLen(*g, "pondTile", w.pondTile, out, at);
     ReadWgCount(*g, "pondChance", w.pondChance, out, at);
@@ -2433,11 +2429,6 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadWgCount(*g, "wallIvyDensity", w.wallIvyDensity, out, at);
     ReadWgCount(*g, "cactusChance", w.cactusChance, out, at);
     ReadWgCount(*g, "saguaroFraction", w.saguaroFraction, out, at);
-    ReadWgCount(*g, "tussockChance", w.tussockChance, out, at);
-    ReadWgCount(*g, "scrubChance", w.scrubChance, out, at);
-    ReadWgCount(*g, "desertPatch", w.desertPatch, out, at);
-    ReadWgCount(*g, "heathChance", w.heathChance, out, at);
-    ReadWgCount(*g, "heathPatch", w.heathPatch, out, at);
     ReadWgCount(*g, "alpineChance", w.alpineChance, out, at);
     ReadWgCount(*g, "ruinChance", w.ruinChance, out, at);
     ReadWgLen(*g, "ruinPadMargin", w.ruinPadMargin, out, at);
@@ -2818,10 +2809,6 @@ std::string WorldgenDefaultsJson() {
   n("curveDesert8", w.curveDesert8);
   n("biomeBlend", w.biomeBlend);
   n("treeTile", w.treeTile);
-  n("treeChanceForest", w.treeChanceForest);
-  n("treeChancePine", w.treeChancePine);
-  n("treeChanceMeadow", w.treeChanceMeadow);
-  n("treeChanceDesert", w.treeChanceDesert);
   n("autumnFraction", w.autumnFraction);
   n("pondTile", w.pondTile);
   n("pondChance", w.pondChance);
@@ -2852,11 +2839,6 @@ std::string WorldgenDefaultsJson() {
   n("wallIvyDensity", w.wallIvyDensity);
   n("cactusChance", w.cactusChance);
   n("saguaroFraction", w.saguaroFraction);
-  n("tussockChance", w.tussockChance);
-  n("scrubChance", w.scrubChance);
-  n("desertPatch", w.desertPatch);
-  n("heathChance", w.heathChance);
-  n("heathPatch", w.heathPatch);
   n("alpineChance", w.alpineChance);
   n("ruinChance", w.ruinChance);
   n("ruinPadMargin", w.ruinPadMargin);

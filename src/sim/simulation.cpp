@@ -19,6 +19,7 @@ bool Simulation::Init(const rhi::Device& device, World& world,
                       const std::vector<MaterialDef>& mats,
                       const std::vector<ReactionGpu>& reactions,
                       const MicroSet& micro, const TreeAtlas& trees,
+                      const std::vector<uint32_t>& worldMapWords,
                       const std::string& shaderDir) {
   world_ = &world;
   device_ = device;
@@ -48,16 +49,16 @@ bool Simulation::Init(const rhi::Device& device, World& world,
   // floor for the same reason -- a zero-length storage binding is not legal,
   // and "no map yet" has to be a world rather than a crash.
   //
-  // P0 binds it EMPTY on purpose: the plumbing (layouts, bind groups, pass
-  // table, checker sets) lands as its own commit with no reader, so the world
-  // hash is pinned and the barrier plumbing is proven before any behaviour
-  // moves. The loader and the samplers arrive in P1/P2.
-  worldMapWords_ = std::max<size_t>(worldMapWords_, worldmap::kHeaderWords);
+  // P0 bound it EMPTY (plumbing proven with the hash pinned); P1 uploads the
+  // biome record table worldmap::PackBiomeTable produced from
+  // assets/biomes/*.json. Planes and sites extend the same words in P2/P5.
+  worldMapWords_ = std::max<size_t>(worldMapWords.size(), worldmap::kHeaderWords);
   worldMapBuf_ = CreateBuffer(device, (uint64_t)worldMapWords_ * 4,
                               rhi::BufferUsage::Storage | rhi::BufferUsage::CopyDst,
                               "worldMap");
   {
-    std::vector<uint32_t> pad(worldMapWords_, 0u);
+    std::vector<uint32_t> pad = worldMapWords;
+    pad.resize(worldMapWords_, 0u);
     queue.WriteBuffer(worldMapBuf_, 0, pad.data(), pad.size() * 4);
   }
 

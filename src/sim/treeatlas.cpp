@@ -23,7 +23,6 @@ struct File {
   int variantCount = 0;
   int varDirOff = 0;
   int reach = 0, above = 0, crownY = 0, crownR = 0;
-  int biome[kBiomeCount] = {0, 0, 0, 0};
   int minY = -1, maxY = -1, maxSlope = 0, sparsity = 1;
   int canopyLocal = 0;   // local palette index of the far-field proxy material
   int shade = 0;
@@ -100,7 +99,10 @@ bool ParseFile(const fs::path& path, File& out, std::string& err) {
   out.above = static_cast<int>(w[9]);
   out.crownY = static_cast<int>(w[10]);
   out.crownR = static_cast<int>(w[11]);
-  for (int i = 0; i < kBiomeCount; i++) out.biome[i] = static_cast<int>(w[12 + i]);
+  // Words 12..15 were the baked per-biome weights. NOT READ since the world
+  // map's P1: the biome files are the authority and the loader below builds
+  // the table from them, so a weight edit in the Environment tab reaches the
+  // world on the next launch with no bake in between.
   out.minY = static_cast<int32_t>(w[16]);
   out.maxY = static_cast<int32_t>(w[17]);
   out.maxSlope = static_cast<int>(w[18]);
@@ -168,7 +170,7 @@ bool ParseFile(const fs::path& path, File& out, std::string& err) {
 }  // namespace
 
 bool LoadTreeAtlas(const std::string& dir, const std::vector<MaterialDef>& mats,
-                   TreeAtlas& out, std::string& log) {
+                   const biomes::BiomeSet& set, TreeAtlas& out, std::string& log) {
   out = TreeAtlas{};
   char buf[512];
 
@@ -224,7 +226,9 @@ bool LoadTreeAtlas(const std::string& dir, const std::vector<MaterialDef>& mats,
   const int speciesDir = kHeaderWords;
   const int biomeTable = speciesDir + ns * kSpeciesWords;
   const int biomeStride = 1 + ns;
-  int cursor = biomeTable + kBiomeCount * biomeStride;
+  const int nb = static_cast<int>(set.biomes.size());
+  out.biomeCount = nb;
+  int cursor = biomeTable + nb * biomeStride;
 
   std::vector<int> payloadBase(ns);
   for (int i = 0; i < ns; i++) {
@@ -240,7 +244,7 @@ bool LoadTreeAtlas(const std::string& dir, const std::vector<MaterialDef>& mats,
   W[kHTotalWords] = static_cast<uint32_t>(cursor);
   W[kHBiomeTable] = static_cast<uint32_t>(biomeTable);
   W[kHSpeciesDir] = static_cast<uint32_t>(speciesDir);
-  W[kHBiomeCount] = static_cast<uint32_t>(kBiomeCount);
+  W[kHBiomeCount] = static_cast<uint32_t>(nb);
 
   int unresolved = 0;
   for (int i = 0; i < ns; i++) {
@@ -322,7 +326,14 @@ bool LoadTreeAtlas(const std::string& dir, const std::vector<MaterialDef>& mats,
     info.variants = f.variantCount;
     info.reachXZ = f.reach; info.above = f.above;
     info.crownY = f.crownY; info.crownR = f.crownR;
-    for (int b = 0; b < kBiomeCount; b++) info.biome[b] = f.biome[b];
+    // Weight per biome id, by species NAME, from the biome files. A biome
+    // that does not list this species gives it 0 there.
+    info.biome.assign(static_cast<size_t>(nb), 0);
+    for (const biomes::BiomeDef& b : set.biomes) {
+      if (b.index < 0 || b.index >= nb) continue;
+      for (const biomes::TreeRow& r : b.trees)
+        if (r.species == f.name) info.biome[b.index] = r.weight;
+    }
     info.minY = f.minY; info.maxY = f.maxY;
     info.maxSlope = f.maxSlope; info.sparsity = f.sparsity;
     info.canopyMat = s[kSCanopyMat]; info.shade = f.shade;
@@ -337,7 +348,7 @@ bool LoadTreeAtlas(const std::string& dir, const std::vector<MaterialDef>& mats,
   // with no division and no float. `sparsity` divides the weight here rather
   // than gating after the pick: a post-pick rejection would make a sparse
   // species STEAL tiles from the others and leave holes in the forest.
-  for (int b = 0; b < kBiomeCount; b++) {
+  for (int b = 0; b < nb; b++) {
     uint32_t* row = W + biomeTable + b * biomeStride;
     uint32_t acc = 0;
     for (int i = 0; i < ns; i++) {
