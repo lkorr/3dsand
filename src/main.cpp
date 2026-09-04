@@ -5213,11 +5213,15 @@ int main(int argc, char** argv) {
       for (uint32_t i = 0; i < mobs.MobCount(); i++) {
         const Mob* m = mobs.MobAt(i);
         if (!m || !m->Alive() || !m->Def()) continue;
+        // origin_.y is NOT the live height: a walking mob keeps its foot
+        // height in bodyY_ (the ground probe writes it) and origin_.y is the
+        // spawn value, so a stamp at Origin().y sat metres off the plants'
+        // base and trampleAt's ground band rejected every one of them.
         const Vec3 o = m->Origin();
         const Vec3 s = m->Def()->worldSize;
         const float half = std::max(s.x, s.z) * 0.5f;
         if (half <= 0.0f) continue;
-        tr.Press(o.x + s.x * 0.5f, o.z + s.z * 0.5f, o.y,
+        tr.Press(o.x + s.x * 0.5f, o.z + s.z * 0.5f, m->BodyY(),
                  half * trTun.render.trampleRadius,
                  std::min(1.0f, 0.5f + half * 0.15f), (float)now);
       }
