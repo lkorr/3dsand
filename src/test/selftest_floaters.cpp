@@ -79,6 +79,38 @@ struct SweepResult {
   uint32_t cellsScanned = 0;
   uint32_t chunksMissing = 0;
   std::vector<FloatComp> worst;  // largest few, for the detail line
+
+  // ---- SIZE HISTOGRAM, unfiltered ------------------------------------------
+  //
+  // `components` above is gated on `minVoxels`, which is right for the
+  // `floaters` gate (it is asking about slabs) and wrong for `tree-fell`, whose
+  // whole subject is the LONE VOXEL left hanging where a branch burned out from
+  // under it. Those three sizes need completely different fixes — a single is
+  // the sub-8 rubble handoff not reaching it, a 2..7 clump is the same door,
+  // and a >=8 clump is a rigidbody that was never made — so collapsing them
+  // into one number is the bare count CLAUDE.md rule 6 warns about. Counted for
+  // EVERY unsupported component regardless of `minVoxels`, so the two gates can
+  // ask their own questions of one sweep.
+  uint32_t singles = 0;     // exactly 1 voxel: the "specks in the air" symptom
+  uint32_t smallComps = 0;  // 2..7: below kMinBodyVoxels, should have crumbled
+  uint32_t bigComps = 0;    // >= 8: body-worthy, and still in the grid
+  uint32_t bigVoxels = 0;   // ...and how much matter that is
+
+  // ---- THE BIGGEST COMPONENT, AND WHY IT WAS LET OFF ----------------------
+  //
+  // "0 unsupported components" and "the sweep called the severed tree
+  // supported" read identically from the verdict, and the `tree-fell` gate hit
+  // exactly that: 3300 wood voxels still standing above a fully severed trunk
+  // while this sweep reported nothing floating. A bare 0 cannot be bisected, so
+  // the sweep records the decision at the point it makes it — which component
+  // was largest, whether it rested, and on WHAT.
+  size_t biggest = 0;        // its voxel count
+  IVec3 biggestLo{}, biggestHi{};
+  bool biggestRests = false;
+  // 0 none, 1 box floor (cannot see below), 2 powder underneath,
+  // 3 a foreign solid underneath
+  int biggestRestWhy = 0;
+  IVec3 biggestRestAt{};     // the cell of this component that was held up
 };
 
 SweepResult SweepForFloaters(World& world, const std::vector<MaterialDef>& mats,
@@ -138,6 +170,8 @@ SweepResult SweepForFloaters(World& world, const std::vector<MaterialDef>& mats,
     stack.assign(1, seed);
     seen[seed] = 1;
     bool rests = false;
+    int restWhy = 0;
+    IVec3 restAt{};
     while (!stack.empty()) {
       const size_t i = stack.back();
       stack.pop_back();
@@ -145,8 +179,10 @@ SweepResult SweepForFloaters(World& world, const std::vector<MaterialDef>& mats,
       const int x = (int)(i % dx), y = (int)((i / dx) % dy),
                 z = (int)(i / ((size_t)dx * dy));
       if (y == 0) {
+        if (!rests) { restWhy = 1; restAt = {lo.x + x, lo.y + y, lo.z + z}; }
         rests = true;  // on the floor of the box: we cannot see below it
       } else if (support[lidx(x, y - 1, z)] && !solid[lidx(x, y - 1, z)]) {
+        if (!rests) { restWhy = 2; restAt = {lo.x + x, lo.y + y, lo.z + z}; }
         rests = true;  // powder underneath is real support, and is not in comp
       }
       const int nb[6][3] = {{1, 0, 0},  {-1, 0, 0}, {0, 1, 0},
@@ -172,17 +208,48 @@ SweepResult SweepForFloaters(World& world, const std::vector<MaterialDef>& mats,
                   z = (int)(i / ((size_t)dx * dy));
         if (y == 0) {
           rests = true;
+          restWhy = 1;
+          restAt = {lo.x + x, lo.y + y, lo.z + z};
           break;
         }
         const size_t b = lidx(x, y - 1, z);
         if (support[b] && !mine.count(b)) {
           rests = true;
+          restWhy = 3;
+          restAt = {lo.x + x, lo.y + y, lo.z + z};
           break;
         }
       }
     }
+    if (cells.size() > r.biggest) {
+      r.biggest = cells.size();
+      r.biggestRests = rests;
+      r.biggestRestWhy = restWhy;
+      r.biggestRestAt = restAt;
+      r.biggestLo = IVec3{INT32_MAX, INT32_MAX, INT32_MAX};
+      r.biggestHi = IVec3{INT32_MIN, INT32_MIN, INT32_MIN};
+      for (size_t i : cells) {
+        const int x = (int)(i % dx), y = (int)((i / dx) % dy),
+                  z = (int)(i / ((size_t)dx * dy));
+        r.biggestLo.x = std::min(r.biggestLo.x, lo.x + x);
+        r.biggestHi.x = std::max(r.biggestHi.x, lo.x + x);
+        r.biggestLo.y = std::min(r.biggestLo.y, lo.y + y);
+        r.biggestHi.y = std::max(r.biggestHi.y, lo.y + y);
+        r.biggestLo.z = std::min(r.biggestLo.z, lo.z + z);
+        r.biggestHi.z = std::max(r.biggestHi.z, lo.z + z);
+      }
+    }
     r.componentsTotal++;
-    if (rests || cells.size() < minVoxels) continue;
+    if (rests) continue;
+    // Unfiltered histogram FIRST: `minVoxels` is one gate's question, not the
+    // sweep's, and a single voxel must be counted before it is filtered out.
+    if (cells.size() == 1) r.singles++;
+    else if (cells.size() < 8) r.smallComps++;
+    else {
+      r.bigComps++;
+      r.bigVoxels += (uint32_t)cells.size();
+    }
+    if (cells.size() < minVoxels) continue;
 
     FloatComp fc;
     fc.voxels = cells.size();
@@ -438,11 +505,605 @@ Status GateFloaters(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---------------------------------------------------------------------------
+// tree-fell: the census the `floaters` gate cannot run
+// ---------------------------------------------------------------------------
+//
+// WHY A SECOND GATE. `floaters` sweeps its OWN fixture box — a stone pad and
+// two 27-voxel blocks — which is the right scope for the question it asks (did
+// the settle path stamp something into the sky) and says nothing at all about
+// the question the owner actually reports: burn a tree down and single voxels
+// hang in the air all over, while sections that should be rigidbodies do not
+// fall. The P0-P3 handoff wrote that down explicitly — "the suite's floater
+// sweep runs inside the gate's own fixture box, so it says nothing about a
+// played-in world; point the sweep at a real world before building P4" — and
+// this is that sweep.
+//
+// WHY A BUILT TREE AND NOT A WORLDGEN ONE. Worldgen's trees are placed by a
+// tile hash and their species, height and position move with the seed and with
+// the residency window, which by this point in the suite has walked ~20 chunks
+// (the `floaters` gate above paid for that lesson with a hardcoded site). A
+// gate that first has to HUNT for a tree is a gate whose failures are usually
+// about the hunt. So the fixture is authored, to the dimensions the real atlas
+// actually reports:
+//
+//     species     height   reachXZ        (assets/trees/*.svtree header)
+//     oak             88        54
+//     birch           94        60
+//     pine           121        47
+//     great_oak      159       115
+//     redwood        217        42
+//
+// The three caps this exercise is about are all in phys/debris.cpp, and every
+// one of those trees crosses at least one of them:
+//     kMaxRegionCells   80 cells/axis   the scan box cannot CONTAIN a tree
+//     kMaxIslandVoxels  32000 voxels    the flood aborts and declares "anchored"
+//     DebrisVoxel int8  +-120/axis      no single body can HOLD a tree
+// The fixture below is oak-sized on purpose: tall enough (92) to cross the scan
+// box on y, cheap enough to sweep and to burn inside a gate's time budget. A
+// bigger one would prove nothing the small one does not, and would cost the
+// suite a minute.
+//
+// WHAT IT REPORTS. Two passes, and both report causes rather than a verdict
+// alone (CLAUDE.md rule 6): the sweep's size histogram says WHICH of the three
+// handoff doors leaked (a single voxel is the sub-8 rubble path not reaching
+// it; a >=8 clump is a rigidbody that was never made), and DebrisSystem's
+// FloaterProbe says why the scan declined at the site that declined.
+
+// Deterministic dither. Integer, seeded by cell, so the crown's rim is the same
+// ragged shape on every run and on every machine — the same property worldgen's
+// own trees have, and the reason a support scan near one finds hundreds of
+// isolated leaf voxels.
+uint32_t DitherHash(int x, int y, int z) {
+  uint32_t h = (uint32_t)x * 0x8DA6B343u ^ (uint32_t)y * 0xD8163841u ^
+               (uint32_t)z * 0xCB1AB31Fu;
+  h ^= h >> 15;
+  h *= 0x2C1B3C6Du;
+  h ^= h >> 12;
+  return h;
+}
+
+struct TreeFixture {
+  IVec3 base{};            // trunk foot, world cells (base.y is the ground cell)
+  int height = 0;          // trunk top, cells above base.y
+  int crownR = 0;          // crown radius, cells
+  IVec3 lo{}, hi{};        // the whole tree's bounding box
+  uint32_t woodCells = 0;  // what was actually written
+  uint32_t leafCells = 0;
+};
+
+// Author one tree as exact-cell ops. Trunk, four sloping limbs, and a dithered
+// ellipsoid crown — the shape that matters here is not botanical accuracy but
+// the two features that drive the symptom: a load-bearing trunk that can be cut
+// or burned through, and a crown whose rim is ragged.
+//
+// AND THEN PRUNED TO ONE 6-CONNECTED COMPONENT, which is not decoration. The
+// first version of this fixture dithered the crown rim down to 12% density and
+// planted it as written — and the very first run reported 1067 floating single
+// voxels before the fire had done any work at all, because a 12%-dense shell IS
+// a cloud of isolated voxels. That number was real, but it measured the
+// FIXTURE, not the handoff, and a gate whose baseline reading is its own
+// construction noise can never tell the two apart afterwards. So the tree is
+// flood-filled from its trunk foot and anything the flood does not reach is
+// dropped: what gets planted is exactly one component, resting on the ground,
+// with nothing in the air. Every floater the passes below find was therefore
+// MADE by the fire or the axe, which is the whole claim.
+TreeFixture BuildTree(const World& world, IVec3 base, uint32_t wood,
+                      uint32_t leaves, std::vector<CellOp>& ops) {
+  TreeFixture t;
+  t.base = base;
+  t.height = 92;
+  t.crownR = 26;
+  t.lo = IVec3{base.x - t.crownR - 1, base.y, base.z - t.crownR - 1};
+  t.hi = IVec3{base.x + t.crownR + 1, base.y + t.height + t.crownR / 2 + 1,
+               base.z + t.crownR + 1};
+
+  // Local lattice, so the prune below is an array walk rather than a hash.
+  const int LX = t.hi.x - t.lo.x + 1, LY = t.hi.y - t.lo.y + 1,
+            LZ = t.hi.z - t.lo.z + 1;
+  std::vector<uint16_t> cell((size_t)LX * LY * LZ, 0);
+  auto at = [&](int x, int y, int z) {
+    return (size_t)(((z - t.lo.z) * LY + (y - t.lo.y)) * LX + (x - t.lo.x));
+  };
+  auto inBox = [&](int x, int y, int z) {
+    return x >= t.lo.x && x <= t.hi.x && y >= t.lo.y && y <= t.hi.y &&
+           z >= t.lo.z && z <= t.hi.z;
+  };
+  auto put = [&](int x, int y, int z, uint32_t mat) {
+    if (inBox(x, y, z)) cell[at(x, y, z)] = (uint16_t)mat;
+  };
+
+  // ---- trunk: a radius-3 column ----
+  for (int y = 0; y <= t.height; y++)
+    for (int dz = -3; dz <= 3; dz++)
+      for (int dx = -3; dx <= 3; dx++)
+        if (dx * dx + dz * dz <= 9)
+          put(base.x + dx, base.y + y, base.z + dz, wood);
+
+  // ---- four limbs, sloping up and out from the upper trunk ----
+  const int dir[4][2] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
+  for (int L = 0; L < 4; L++) {
+    const int y0 = t.height - 34 + L * 7;
+    for (int s = 0; s <= 22; s++) {
+      const int cx = base.x + dir[L][0] * s;
+      const int cz = base.z + dir[L][1] * s;
+      const int cy = base.y + y0 + s / 2;
+      for (int dy = -1; dy <= 1; dy++)
+        for (int dz = -1; dz <= 1; dz++)
+          for (int dx = -1; dx <= 1; dx++)
+            put(cx + dx, cy + dy, cz + dz, wood);
+    }
+  }
+
+  // ---- crown: a dithered ellipsoid, thinning toward the rim ----
+  const int cy = base.y + t.height - 6;
+  const int R = t.crownR;
+  for (int dy = -R / 2; dy <= R / 2 + 4; dy++)
+    for (int dz = -R; dz <= R; dz++)
+      for (int dx = -R; dx <= R; dx++) {
+        const float rr = (float)(dx * dx + dz * dz) / (float)(R * R) +
+                         (float)(dy * dy) / (float)((R / 2 + 4) * (R / 2 + 4));
+        if (rr > 1.0f) continue;
+        // 92% dense at the core, 35% at the rim. Ragged enough that burning
+        // through a limb strands what it was holding; dense enough that the
+        // prune below leaves a crown rather than a stick.
+        const uint32_t keep = (uint32_t)(35.0f + 57.0f * (1.0f - rr));
+        if (DitherHash(base.x + dx, cy + dy, base.z + dz) % 100u >= keep)
+          continue;
+        if (!cell[at(base.x + dx, cy + dy, base.z + dz)])
+          put(base.x + dx, cy + dy, base.z + dz, leaves);
+      }
+
+  // ---- prune to the component that reaches the ground ----
+  std::vector<uint8_t> keep(cell.size(), 0);
+  std::vector<size_t> stack;
+  const size_t root = at(base.x, base.y, base.z);
+  if (cell[root]) {
+    keep[root] = 1;
+    stack.push_back(root);
+  }
+  while (!stack.empty()) {
+    const size_t i = stack.back();
+    stack.pop_back();
+    const int x = (int)(i % LX), y = (int)((i / LX) % LY),
+              z = (int)(i / ((size_t)LX * LY));
+    const int nb[6][3] = {{1, 0, 0},  {-1, 0, 0}, {0, 1, 0},
+                          {0, -1, 0}, {0, 0, 1},  {0, 0, -1}};
+    for (auto& d : nb) {
+      const int nx = x + d[0], ny = y + d[1], nz = z + d[2];
+      if (nx < 0 || ny < 0 || nz < 0 || nx >= LX || ny >= LY || nz >= LZ)
+        continue;
+      const size_t ni = (size_t)((nz * LY + ny) * LX + nx);
+      if (cell[ni] && !keep[ni]) {
+        keep[ni] = 1;
+        stack.push_back(ni);
+      }
+    }
+  }
+
+  for (size_t i = 0; i < cell.size(); i++) {
+    if (!keep[i]) continue;
+    const int x = t.lo.x + (int)(i % LX), y = t.lo.y + (int)((i / LX) % LY),
+              z = t.lo.z + (int)(i / ((size_t)LX * LY));
+    const IVec3 cc{x, y, z};
+    if (!world.CellInWindow(cc)) continue;
+    if (ops.size() >= kMaxCellOpsPerTick) break;
+    // Palette jitter by the same `% 3` convention every other writer uses, so
+    // the fixture does not read as one flat slab of colour.
+    ops.push_back({World::SlotCellIndex(cc),
+                   PackVoxNew(cell[i], DitherHash(x, y, z) % 3u)});
+    if (cell[i] == wood) t.woodCells++;
+    else t.leafCells++;
+  }
+  return t;
+}
+
+Status GateTreeFell(Ctx& c, std::string& detail) {
+  World& world = c.world;
+  DebrisSystem& debris = c.debris;
+
+  auto matId = [&](const char* n) -> uint32_t {
+    for (size_t i = 0; i < c.mats.size(); i++)
+      if (c.mats[i].name == n) return (uint32_t)i;
+    return 0;
+  };
+  const uint32_t mWood = matId("wood"), mLeaves = matId("leaves"),
+                 mFire = matId("fire");
+  if (!mWood || !mLeaves || !mFire) {
+    detail = "wood / leaves / fire missing from materials.json";
+    return Status::Fail;
+  }
+
+  std::string failed;
+  auto note = [&failed](bool ok, const char* name) {
+    if (!ok) failed += failed.empty() ? name : (std::string(", ") + name);
+    return ok;
+  };
+
+  // The CENTRE of the window, like corpse-burn and for the same reason: this
+  // fixture is 92 voxels tall and 54 across, and an inset chosen for a 3-voxel
+  // block puts half a tree outside the window where writes are dropped.
+  const IVec3 org = world.WindowOrigin();
+  const int fx = org.x * (int)kChunk + (int)(kWorldN / 2);
+  const int fz = org.z * (int)kChunk + (int)(kWorldN / 2);
+  const int groundY = World::TerrainHeight(fx, fz, kDefaultSeed);
+  const IVec3 fixtureChunk{fx >> 4, groundY >> 4, fz >> 4};
+  const bool siteInWindow = world.ChunkInWindow(fixtureChunk);
+
+  // THE GROUND THIS TREE STANDS ON, measured rather than assumed. The `floaters`
+  // gate builds a flat pad and says why: "procedural terrain at a fixed (x,z) is
+  // a slope worldgen is free to move under this gate". This one plants a 92-tall
+  // tree over a 59-cell footprint, so the relief across that footprint decides
+  // whether a cut through the trunk actually isolates anything — a shoulder of
+  // terrain rising past the cut plane re-attaches the tree to the world through
+  // rock, and the severed tree is then genuinely, correctly, still supported.
+  int terrainMin = INT32_MAX, terrainMax = INT32_MIN;
+  for (int dz = -30; dz <= 30; dz++)
+    for (int dx = -30; dx <= 30; dx++) {
+      const int th = World::TerrainHeight(fx + dx, fz + dz, kDefaultSeed);
+      terrainMin = std::min(terrainMin, th);
+      terrainMax = std::max(terrainMax, th);
+    }
+
+  uint32_t tick = 91000;
+
+  // One tick, with the whole handoff wired: the GPU support-loss flags become
+  // island-check events (QueueSupportEvents), the debris system drains them
+  // (PreTick), and the ops it produces are submitted. The `floaters` gate above
+  // does NOT call QueueSupportEvents — it has no CA activity to flag — so this
+  // is the first gate in the suite that exercises the flag -> event -> island
+  // path end to end.
+  //
+  // `fetch` walks the tree's chunk box asking for mirror copies. The CPU mirror
+  // is 3x3x3 around the player plus whatever is requested, and this gate's
+  // sweep reads that mirror, so without this it would confidently report a
+  // clean world it never looked at (World::kFetchPerTick caps it at 64/tick,
+  // which is why the loops below run for a few ticks before measuring).
+  IVec3 fetchLo{}, fetchHi{};
+  auto runTick = [&](const std::vector<CellOp>& extra, bool fetch) {
+    std::vector<CellOp> cellOps;
+    std::vector<ParticleSpawn> spawns;
+    debris.QueueSupportEvents(world.Snap());
+    debris.PreTick(tick + 1, world, cellOps, spawns);
+    cellOps.insert(cellOps.end(), extra.begin(), extra.end());
+    if (fetch)
+      for (int cz = fetchLo.z >> 4; cz <= (fetchHi.z >> 4); cz++)
+        for (int cy = fetchLo.y >> 4; cy <= (fetchHi.y >> 4); cy++)
+          for (int cx = fetchLo.x >> 4; cx <= (fetchHi.x >> 4); cx++)
+            if (world.ChunkInWindow({cx, cy, cz}))
+              world.RequestChunkFetch({cx, cy, cz});
+    ++tick;
+    SubmitTick(c.ctx, world, c.sim, tick, kDefaultSeed, {}, {}, cellOps, false,
+               fixtureChunk, true, false, spawns);
+    c.ctx.WaitIdle();
+    c.ctx.ProcessEvents();
+    c.phys.Step(kTickDt);
+    debris.PostStep();
+  };
+
+  // Count one material over the swept box, straight off the mirror. The
+  // positive control for both passes: "no floaters" and "the tree was never
+  // written" are the same reading otherwise.
+  auto countMat = [&](uint32_t want, IVec3 lo, IVec3 hi) {
+    uint32_t n = 0;
+    for (int z = lo.z; z <= hi.z; z++)
+      for (int y = lo.y; y <= hi.y; y++)
+        for (int x = lo.x; x <= hi.x; x++) {
+          const IVec3 wc{x >> 4, y >> 4, z >> 4};
+          if (!world.ChunkInWindow(wc)) continue;
+          const CachedChunk* cc = world.Cached(wc);
+          if (!cc || cc->voxels.size() != kChunkVol) continue;
+          const uint32_t w =
+              cc->voxels[((((uint32_t)z) & 15u) * kChunk + (((uint32_t)y) & 15u)) *
+                             kChunk +
+                         (((uint32_t)x) & 15u)];
+          if ((w & 0xFFFu) == want) n++;
+        }
+    return n;
+  };
+
+  // The fixture, planted and given a few ticks to land in the mirror.
+  //
+  // LEVELLED FIRST, and the run that proved it necessary is worth recording.
+  // Planted straight onto worldgen, the gate reported 3300 wood voxels still
+  // standing above a fully severed trunk while the sweep found NOTHING
+  // unsupported — which reads like a broken sweep and is not one. The relief
+  // across this footprint is 162..211 with the trunk foot at 176: the hillside
+  // rises 22 voxels PAST the cut plane, so the tree above the cut was still
+  // 6-connected to the world through rock and was correctly judged supported.
+  // The sweep was right and the fixture was standing in a hill.
+  //
+  // So a disc is levelled to the trunk's own ground height before anything is
+  // planted — dug out where the hill is higher, filled where it falls away.
+  // Radius 12 is chosen from the geometry rather than by taste: above the cut
+  // the only part of the tree below y+35 (the measured relief ceiling) is the
+  // radius-3 trunk, so a 12-cell clearance puts every remaining terrain cell
+  // eight cells from anything the tree owns. Same reason `floaters` builds a
+  // pad, and its comment says it in one line: procedural terrain at a fixed
+  // (x,z) is a slope worldgen is free to move under a gate.
+  // ---- the site: a bare plateau, exactly as wide as the sweep --------------
+  //
+  // Every relaxation of this was paid for by a run, so all three reasons are
+  // written down rather than compressed into "prepare the site":
+  //
+  //   1. LEVELLED AT ALL. Planted straight onto worldgen, the gate reported
+  //      3300 wood voxels still standing above a fully severed trunk while the
+  //      sweep found nothing unsupported. That reads like a broken sweep and is
+  //      not one: relief across this footprint is 162..211 with the trunk foot
+  //      at 176, so the hill rises 22 voxels PAST the cut plane and the tree
+  //      above the cut was still 6-connected to the world through rock.
+  //   2. CLEARED TO THE CEILING, not down to TerrainHeight. Digging only to the
+  //      heightfield left a 118-voxel floater in the "clean" fixture: worldgen
+  //      puts TREES on the hill, and cutting the ground from under one leaves
+  //      its crown in the air. Correct engine behaviour and exactly the bug
+  //      under test — but arriving from the scenery instead of the subject.
+  //   3. AS WIDE AS THE SWEEP BOX. A radius-12 clearing still left 6 floaters,
+  //      because the sweep reaches +-30 and the surrounding forest's crowns are
+  //      dithered down to isolated rim voxels BY DESIGN (DESIGN.md section 7
+  //      says so in as many words). Those are real floaters and none of them is
+  //      this gate's. The box is cleared to its own edge so that what remains
+  //      inside it is the fixture and nothing else.
+  //
+  // `phase` splits the work across ticks: 61x61 columns 135 cells tall is 500k
+  // exact-cell ops and kMaxCellOpsPerTick is 65536.
+  constexpr int kSiteR = 30, kSiteTop = 135, kSiteBand = 15;
+  constexpr int kSitePhases = kSiteTop / kSiteBand + 1;  // + the fill pass
+  auto levelSite = [&](std::vector<CellOp>& ops, int phase) {
+    for (int dz = -kSiteR; dz <= kSiteR; dz++)
+      for (int dx = -kSiteR; dx <= kSiteR; dx++) {
+        const int th = World::TerrainHeight(fx + dx, fz + dz, kDefaultSeed);
+        if (phase + 1 < kSitePhases) {
+          const int y0 = groundY + 1 + phase * kSiteBand;
+          for (int y = y0; y < y0 + kSiteBand; y++) {
+            const IVec3 cc{fx + dx, y, fz + dz};
+            if (world.CellInWindow(cc) && ops.size() < kMaxCellOpsPerTick)
+              ops.push_back({World::SlotCellIndex(cc), 0u});
+          }
+        } else {
+          // fill the hollow up to the trunk's ground, so the stump has ground
+          for (int y = th + 1; y <= groundY; y++) {
+            const IVec3 cc{fx + dx, y, fz + dz};
+            if (world.CellInWindow(cc) && ops.size() < kMaxCellOpsPerTick)
+              ops.push_back(
+                  {World::SlotCellIndex(cc),
+                   PackVoxNew(kMatStone, DitherHash(cc.x, y, cc.z) % 3u)});
+          }
+        }
+      }
+  };
+
+  auto plant = [&]() -> TreeFixture {
+    debris.Reset();
+    SubmitWorldgen(c.ctx, world, c.sim, kDefaultSeed);
+    c.ctx.WaitIdle();
+    {
+      // Its own ticks, ahead of the tree: the terraform raises support-loss
+      // flags of its own, and letting them settle before the subject exists
+      // keeps the probe counters below about the TREE.
+      fetchLo = IVec3{fx - kSiteR, groundY - 6, fz - kSiteR};
+      fetchHi = IVec3{fx + kSiteR, groundY + kSiteTop, fz + kSiteR};
+      for (int phase = 0; phase < kSitePhases; phase++) {
+        std::vector<CellOp> level;
+        levelSite(level, phase);
+        runTick(level, true);
+      }
+      for (int i = 0; i < 80; i++) runTick({}, true);
+    }
+    std::vector<CellOp> build;
+    const TreeFixture t =
+        BuildTree(world, {fx, groundY + 1, fz}, mWood, mLeaves, build);
+    fetchLo = IVec3{t.lo.x - 2, t.lo.y - 4, t.lo.z - 2};
+    fetchHi = IVec3{t.hi.x + 2, t.hi.y + 2, t.hi.z + 2};
+    runTick(build, true);
+    for (int i = 0; i < 14; i++) runTick({}, true);  // mirror catches up
+    return t;
+  };
+
+  // ---- PASS A: BURN IT DOWN ------------------------------------------------
+  //
+  // The owner's report, reproduced: engulf the tree, let the fire eat it, and
+  // ask what the handoff left hanging.
+  //
+  // ENGULFED, not lit at the foot, and the first run is why. A fire at the
+  // trunk base for 40 ticks moved 5% of the wood and never touched a leaf —
+  // ignition is a 1/8 per-neighbour roll and the flame was deliberately
+  // weakened (`combustion.flamePct`), so a base fire takes thousands of ticks
+  // to climb 92 voxels and the gate would have been measuring the climb. The
+  // subject is the AFTERMATH of a burnt tree, so the fixture starts from a tree
+  // that is already alight everywhere: a fire column around the trunk and a
+  // scatter through the crown, held for 60 ticks and then never renewed. After
+  // that it feeds on the tree alone, which is what makes the quiet period below
+  // a real measurement instead of a reading taken inside a pyre.
+  const TreeFixture treeA = plant();
+  const uint32_t woodBeforeA = countMat(mWood, treeA.lo, treeA.hi);
+  const uint32_t leafBeforeA = countMat(mLeaves, treeA.lo, treeA.hi);
+  // THE FIXTURE'S OWN PRECONDITION. BuildTree prunes to one ground-connected
+  // component, so a freshly planted tree must float nothing at all. If this is
+  // not zero, every number the passes below report is construction noise and
+  // the gate is measuring itself (which is exactly what its first run did).
+  const SweepResult swPre =
+      SweepForFloaters(world, c.mats, fetchLo, fetchHi, 1);
+  debris.ResetFloaterProbe();
+  for (int i = 0; i < 640; i++) {
+    std::vector<CellOp> fire;
+    if (i < 60) {
+      // a column of flame hugging the trunk, all the way up
+      for (int y = 0; y <= treeA.height; y++)
+        for (int dz = -6; dz <= 6; dz++)
+          for (int dx = -6; dx <= 6; dx++) {
+            if (dx * dx + dz * dz > 36) continue;
+            const IVec3 cc{fx + dx, groundY + 1 + y, fz + dz};
+            if (!world.CellInWindow(cc)) continue;
+            fire.push_back({World::SlotCellIndex(cc),
+                            PackVoxNew(mFire, 7u) | kCellOpIfAir});
+          }
+      // ...and a scatter through the crown, so the canopy burns with it
+      const int cyA = groundY + 1 + treeA.height - 6, R = treeA.crownR;
+      for (int dy = -R / 2; dy <= R / 2 + 4; dy++)
+        for (int dz = -R; dz <= R; dz++)
+          for (int dx = -R; dx <= R; dx++) {
+            if (dx * dx + dz * dz > R * R) continue;
+            if (DitherHash(fx + dx, cyA + dy + i, fz + dz) % 5u) continue;
+            const IVec3 cc{fx + dx, cyA + dy, fz + dz};
+            if (!world.CellInWindow(cc)) continue;
+            if (fire.size() >= kMaxCellOpsPerTick) break;
+            fire.push_back({World::SlotCellIndex(cc),
+                            PackVoxNew(mFire, 7u) | kCellOpIfAir});
+          }
+    }
+    runTick(fire, true);
+  }
+  // Let the queue drain with nothing new arriving: the scan is rate-limited
+  // (one event a tick, two support chunks a tick, a 45-tick per-chunk cooldown)
+  // and measuring the instant the fire dies would blame the handoff for a
+  // backlog it was still working through. This is the quiet period a player
+  // stands in afterwards, and what they see then is the report.
+  for (int i = 0; i < 400; i++) runTick({}, true);
+
+  const uint32_t woodAfterA = countMat(mWood, treeA.lo, treeA.hi);
+  const uint32_t leafAfterA = countMat(mLeaves, treeA.lo, treeA.hi);
+  const SweepResult swA =
+      SweepForFloaters(world, c.mats, fetchLo, fetchHi, 1);
+  const DebrisSystem::FloaterProbe fpA = debris.Floaters();
+  const uint32_t bodiesA = debris.BodyCount();
+
+  // It must have BURNED, or every number after it is about a tree that just
+  // stood there. Half the wood gone is a low bar deliberately: this gate is not
+  // a combustion test, it only needs the fire to have done real work.
+  const bool burned = note(woodBeforeA > 2000 && woodAfterA * 2 < woodBeforeA,
+                           "tree-actually-burned");
+  const bool cleanStart =
+      note(swPre.singles + swPre.smallComps + swPre.bigComps == 0,
+           "fixture-starts-clean");
+  const bool sweepReal =
+      note(swA.componentsTotal > 0 && swA.cellsScanned > 0, "sweep-saw-something");
+  const bool inWin = note(siteInWindow, "fixture-in-window");
+  const bool noSingles =
+      note(swA.singles <= (uint32_t)BaselineNumber("treeFell.maxSingles", 0),
+           "burn-leaves-no-singles");
+  const bool noClumps =
+      note(swA.smallComps + swA.bigComps <=
+               (uint32_t)BaselineNumber("treeFell.maxClumps", 0),
+           "burn-leaves-no-clumps");
+
+  // ---- PASS B: CUT THE TRUNK ----------------------------------------------
+  //
+  // A fresh tree, a three-voxel slab erased out of the trunk ten cells up, and
+  // nothing else. Everything above the cut is one 6-connected component resting
+  // on air, so the correct outcome is unambiguous: it becomes a rigidbody and
+  // falls over. What it does today is the subject.
+  const TreeFixture treeB = plant();
+  const uint32_t woodBeforeB = countMat(mWood, treeB.lo, treeB.hi);
+  debris.ResetFloaterProbe();
+  {
+    std::vector<CellOp> cut;
+    const int cutY = groundY + 11;
+    for (int y = cutY; y < cutY + 3; y++)
+      for (int dz = -4; dz <= 4; dz++)
+        for (int dx = -4; dx <= 4; dx++) {
+          const IVec3 cc{fx + dx, y, fz + dz};
+          if (!world.CellInWindow(cc)) continue;
+          cut.push_back({World::SlotCellIndex(cc), 0u});
+        }
+    runTick(cut, true);
+  }
+  // The cut also goes in through the CPU door the brush uses, because the GPU
+  // support flag is a BACKSTOP (a 45-tick cooldown behind an async readback)
+  // and a player's axe does not wait for it. Both doors, like the real game.
+  debris.AddDestructionEvent(tick, {fx - 5, groundY + 10, fz - 5},
+                             {fx + 5, groundY + 15, fz + 5});
+  uint32_t maxBodyVox = 0, bodiesMadeB = 0;
+  for (int i = 0; i < 300; i++) {
+    runTick({}, true);
+    bodiesMadeB = std::max(bodiesMadeB, debris.BodyCount());
+    for (uint32_t b = 0; b < debris.BodyCount(); b++)
+      maxBodyVox = std::max(maxBodyVox, debris.BodyVoxelCount(b));
+  }
+  const uint32_t woodAfterB = countMat(mWood, treeB.lo, treeB.hi);
+  // The mirror's own answer to "is the tree still up there", independent of the
+  // sweep's connectivity reasoning. Two numbers derived different ways: if the
+  // wood is still above the cut and the sweep calls nothing unsupported, the
+  // disagreement is the finding (and on the first run it was — see the note on
+  // `standingAbove` in the detail line).
+  const uint32_t standingAbove =
+      countMat(mWood, {treeB.lo.x, groundY + 14, treeB.lo.z}, treeB.hi);
+  const SweepResult swB = SweepForFloaters(world, c.mats, fetchLo, fetchHi, 1);
+  const DebrisSystem::FloaterProbe fpB = debris.Floaters();
+
+  // THE ASSERTION THIS GATE EXISTS FOR. The trunk above the cut is ~2000 wood
+  // voxels with nothing under it; it must leave the grid as a body. The floor
+  // is a fraction of what was standing rather than a literal, so re-shaping the
+  // fixture does not silently re-tune the claim.
+  const uint32_t felledFloor =
+      (uint32_t)(woodBeforeB * BaselineNumber("treeFell.felledFraction", 0.30));
+  const bool felled =
+      note(maxBodyVox >= felledFloor, "cut-trunk-fells-the-tree");
+  // ...and the complementary half, which is what the owner actually sees: the
+  // severed tree must not still be STANDING in the grid.
+  const bool leftStanding =
+      note(swB.bigVoxels <= (uint32_t)BaselineNumber("treeFell.maxStandingVoxels",
+                                                     200),
+           "cut-leaves-nothing-standing");
+
+  RecordObserved("treeFell.singlesObserved", (double)swA.singles);
+  RecordObserved("treeFell.clumpsObserved",
+                 (double)(swA.smallComps + swA.bigComps));
+  RecordObserved("treeFell.burnFloatVoxels", (double)swA.voxels);
+  RecordObserved("treeFell.felledBodyVoxels", (double)maxBodyVox);
+  RecordObserved("treeFell.standingVoxels", (double)swB.bigVoxels);
+
+  std::string worst;
+  for (const FloatComp& f : swA.worst)
+    worst += Format("%s%zu vox mat %u at (%d,%d,%d)", worst.empty() ? "" : "; ",
+                    f.voxels, f.domMat, f.lo.x, f.lo.y, f.lo.z);
+
+  const bool ok = burned && cleanStart && sweepReal && inWin && noSingles &&
+                  noClumps && felled && leftStanding;
+  detail = Format(
+      "at (%d,%d) ground %d (relief %d..%d) inWindow %d; planted clean %u/%u/%u; "
+      "BURN: wood %u->%u leaves %u->%u, %u bodies; floating singles %u, "
+      "2..7 %u, >=8 %u (%u vox) of %u comps over %u cells (%u absent)%s%s%s; "
+      "probe leaks oversize %u, in-place %u, stuck-event %u, defer-gaveup %u, "
+      "queue-dropped %u; anchors boundary %u, unknown %u, oversize-flood %u | "
+      "CUT: wood %u->%u (%u still above the cut), bodies %u, largest body %u "
+      "vox (floor %u), unsupported %u/%u/%u of %u comps over %u cells "
+      "(%u absent) = %u vox; biggest comp %zu vox (%d,%d,%d)..(%d,%d,%d) "
+      "rests %d why %d at (%d,%d,%d); probe stuck-event %u, "
+      "anchors boundary %u, unknown %u, oversize-flood %u%s%s",
+      fx, fz, groundY, terrainMin, terrainMax, siteInWindow ? 1 : 0,
+      swPre.singles, swPre.smallComps,
+      swPre.bigComps, woodBeforeA, woodAfterA, leafBeforeA,
+      leafAfterA, bodiesA, swA.singles, swA.smallComps, swA.bigComps,
+      swA.bigVoxels, swA.componentsTotal, swA.cellsScanned, swA.chunksMissing,
+      worst.empty() ? "" : " [", worst.c_str(), worst.empty() ? "" : "]",
+      fpA.oversizeBboxSkipped, fpA.solidRubbleInPlace, fpA.stuckEventDropped,
+      fpA.deferGaveUp, fpA.eventQueueFullDropped, fpA.anchoredByRegionBoundary,
+      fpA.anchoredByUnknownChunk, fpA.anchoredByOversizeFlood, woodBeforeB,
+      woodAfterB, standingAbove, bodiesMadeB, maxBodyVox, felledFloor,
+      swB.singles, swB.smallComps, swB.bigComps, swB.componentsTotal,
+      swB.cellsScanned, swB.chunksMissing, swB.bigVoxels, swB.biggest,
+      swB.biggestLo.x, swB.biggestLo.y, swB.biggestLo.z, swB.biggestHi.x,
+      swB.biggestHi.y, swB.biggestHi.z, swB.biggestRests ? 1 : 0,
+      swB.biggestRestWhy, swB.biggestRestAt.x, swB.biggestRestAt.y,
+      swB.biggestRestAt.z,
+      fpB.stuckEventDropped, fpB.anchoredByRegionBoundary,
+      fpB.anchoredByUnknownChunk, fpB.anchoredByOversizeFlood,
+      failed.empty() ? "" : "; FAILED: ", failed.c_str());
+  std::printf("tree-fell: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
+
+  // Leave the world as this gate found it, like every late world-touching gate.
+  debris.Reset();
+  SubmitWorldgen(c.ctx, world, c.sim, kDefaultSeed);
+  c.ctx.WaitIdle();
+  return ok ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& FloaterGates() {
   static const std::vector<Gate> g = {
       {"floaters", "phys", {}, false, GateFloaters},
+      {"tree-fell", "phys", {}, false, GateTreeFell},
   };
   return g;
 }

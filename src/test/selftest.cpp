@@ -286,6 +286,15 @@ const char* const kOrder[] = {
     // way out like its neighbours, and from here there is nothing left for it
     // to disturb.
     "floaters",
+    // ...and the same question asked of a TREE, which is where the owner
+    // actually sees it: burn one down and lone voxels hang in the air, cut one
+    // through the trunk and it keeps standing. `floaters` sweeps its own
+    // 3-voxel-block fixture box; this one plants an oak-sized tree (92 tall,
+    // which is past kMaxRegionCells) and sweeps what the fire and the axe leave
+    // behind. Directly after `floaters` for the same reason `floaters` is here:
+    // it burns a fixture, advances the tick stream hard, and regenerates
+    // worldgen on the way out.
+    "tree-fell",
     // LAST of the world-touching gates, and it must be: BuildVoxRegion moves
     // the residency window and resets the page table, which is the state every
     // other gate's fixture placement assumes. It restores both before it
