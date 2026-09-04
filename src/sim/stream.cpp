@@ -433,8 +433,7 @@ void Stream::EvictSlots(const std::vector<uint32_t>& slots, bool filter) {
   // GPU copy and a store insert, against how many the re-derivability test
   // above skipped. Under --autofly-surface the skipped count is ~91% of the
   // real pages, which is the whole reason that test exists.
-  if (PtDbg())
-  {
+  if (PtDbg()) {
     size_t modCount = 0;
     for (uint8_t m : modified_) modCount += (m != 0);
     std::printf("[pt-time] evict issue: slots=%zu stored=%zu skipUnmod=%u "
