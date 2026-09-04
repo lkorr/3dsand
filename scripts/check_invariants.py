@@ -1341,6 +1341,77 @@ def check_autofly_surface():
                 f"surface-sprint` would no longer be flying the same line as "
                 f"`--frames --autofly-surface`, so the two sets of numbers stop "
                 f"being comparable")
+def check_burn_tint_sites():
+    """Every path that turns a material's emission into light goes through burnTint.
+
+    A MATF_BURNTINT material (leaf_burning and friends) is authored in the
+    palette of the thing it WAS -- leaf green -- and the renderer supplies the
+    fire by breathing the albedo toward render.burnTintColor and scaling the
+    emission by the same weight (common.wgsl burnTint). A site that skips it
+    does not merely look slightly wrong: it draws a leaf-green surface at full
+    emissive strength, i.e. a glowing green leaf, which is the exact thing the
+    feature exists to prevent.
+
+    That is easy to miss because "shade a voxel" happens in six places across
+    four shaders -- the primary hit, the far cascade, secondary rays, the two
+    raster body paths, the micro-body march -- plus two that INJECT light
+    rather than draw it (the openness walk and the shadow resolve pass, which
+    write the same irradiance word and must agree about the value). The first
+    version of burnTint covered four of the eight; the other four all showed as
+    green glow in one session (owner report 2026-09-03).
+
+    So this refuses the raw conversion anywhere but inside a burnTint() call.
+    Text, not semantics: it cannot prove a shader is correct, only that nobody
+    reintroduced the exact idiom that was wrong four times. ALLOWED names the
+    handful of sites that legitimately read emission for something other than
+    shading a surface, each with its reason.
+    """
+    import glob as _glob
+
+    # (file, needle) -> why this one is not a burnTint site
+    ALLOWED = {
+        ("common.wgsl", "emission * TUNE_EMISSIVE_STRENGTH"):
+            "irrSample takes an ALREADY-tinted emission from its caller",
+        ("common.wgsl", "return emission *"):
+            "emberFlicker is the fast flicker, applied to a tinted value",
+        ("common.wgsl", "c += albedo * emission * 1.7"):
+            "litColorO takes an already-tinted emission from its caller",
+        ("raymarch.wgsl", "let emis = f32(m.emission) / 255.0;"):
+            "shadeMolten: lava, an OPAQUE liquid, which can never be foliage",
+        ("raymarch.wgsl", "(f32(materials[mat].emission) / 255.0) * fl"):
+            "the media march: gases only, and no gas carries the flag",
+    }
+
+    pat = re.compile(r"emission\s*\)\s*/\s*255\.0")
+    found = False
+    for path in sorted(_glob.glob("assets/shaders/*.wgsl")):
+        src = read(path)
+        if not src:
+            continue
+        found = True
+        name = path.replace("\\", "/").rsplit("/", 1)[-1]
+        lines = src.splitlines()
+        for i, line in enumerate(lines):
+            if not pat.search(line):
+                continue
+            # An argument to burnTint() may sit on the call line or the line
+            # under it (the call is usually wrapped at 80 columns).
+            window = line + " " + (lines[i - 1] if i else "")
+            if "burnTint(" in window:
+                continue
+            if any(k[0] == name and k[1] in line for k in ALLOWED):
+                continue
+            problems.append(
+                f"burn tint: {name}:{i + 1} turns a material's emission into "
+                f"light without burnTint() --\n      {line.strip()}\n"
+                "    A MATF_BURNTINT material would draw its UNBURNT palette "
+                "(leaf green) at full\n    emissive strength here. Pass it "
+                "through burnTint() (burnTintWeight for a grid\n    cell, "
+                "burnTintWeightH for a moving body, burnTintMean for the "
+                "irradiance grid),\n    or add it to ALLOWED in "
+                "check_burn_tint_sites with the reason.")
+    if found:
+        checked.append("burn tint sites")
 
 
 ALL = {
@@ -1365,6 +1436,7 @@ ALL = {
     "counts": check_tick_counts,
     "farbits": check_far_material_bits,
     "ringdepth": check_readback_ring,
+    "burntint": check_burn_tint_sites,
 }
 
 # The hook passes the edited file; run only the checks that file can break.
@@ -1412,7 +1484,7 @@ if __name__ == "__main__":
                     run += checks
             if norm.endswith(".wgsl"):
                 run += ["tuning", "world", "params", "windprim",
-                        "curprim"]
+                        "curprim", "burntint"]
         run = list(dict.fromkeys(run))
         if not run:
             sys.exit(0)  # edited file cannot break any pair

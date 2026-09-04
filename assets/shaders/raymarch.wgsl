@@ -2560,22 +2560,10 @@ fn giGather(p : vec3f, n : vec3f, cell : vec3<i32>) -> vec3f {
 }
 
 // ---- diffuse response ----
-// Plain max(dot(n,l),0) is wrong for terrain built out of axis-aligned voxel
-// faces, and it is the specific reason a grassy hillside rendered as harsh
-// horizontal banding. A voxel slope is a STAIRCASE: every 1-voxel rise puts a
-// vertical face next to a horizontal one. With a hard Lambert term the top face
-// gets dot ~= 0.66 and the away-facing riser gets exactly 0, so the two
-// alternate at ~1.8x brightness down the whole hill. The eye reads that
-// alternation as noise, not as slope, because a real grass slope has no such
-// discontinuity — the two facets differ by a few percent, not by 80%.
-//
-// Wrapped diffuse fixes it at the source: remap dot from [-1,1] so the falloff
-// continues smoothly past the terminator instead of clamping to zero. This is
-// the standard cheap stand-in for the light a rough/scattering surface picks up
-// at grazing angles, and it keeps risers lit enough to sit next to their tops.
-fn wrapDiffuse(ndl : f32, wrap : f32) -> f32 {
-  return clamp((ndl + wrap) / (1.0 + wrap), 0.0, 1.0);
-}
+// wrapDiffuse MOVED to common.wgsl (2026-09-04). The raster body paths shade
+// the same axis-aligned voxel faces this does and were still on a hard
+// Lambert; one definition now serves both. The staircase-banding argument
+// that motivates it went with the function.
 
 // ---- voxel-scale grain ----
 // The palette variants are picked by the state nibble, which worldgen fills
@@ -2815,23 +2803,15 @@ fn sunShadowAt(hp : vec3f, n : vec3f, px : vec2f, camDistFine : f32) -> f32 {
                       TUNE_SHADOW_STEPS, shadowCoarseFromT(),
                       &occupancy, &materials);
   rsAdd(RS_SHADOW, s.steps);
-  // Out of steps underground is a far blocker, not daylight -- the same rule
-  // as shadow_resolve.wgsl, where the reason is written.
-  if (!s.hit) {
-    return select(1.0, TUNE_SHADOW_LIFT, s.steps > u32(TUNE_SHADOW_STEPS));
-  }
-  // Distance from receiver to blocker, in metres. Near blockers (a voxel
-  // resting on the ground) keep a hard, dark contact shadow; distant ones (a
-  // tree canopy over a meadow) soften and lift, which is what stops every
-  // terrace step from stamping a hard black band onto the hillside.
-  let dM = s.t * VOXEL_METERS;
-  // A shadowed point keeps NO direct sun — the hemisphere ambient term is what
-  // fills it in, and that is already occluded by AO. Letting direct sun leak
-  // into shadow instead washes the whole scene out and erases the cast shadow
-  // under overhangs. The softening is in the EDGE, not in the depth: a distant
-  // blocker only partially covers the solar disc, so its shadow lifts toward
-  // ~0.45 of full sun, while a contact shadow stays at 0.
-  return clamp(smoothstep(TUNE_SHADOW_SOFT_NEAR, TUNE_SHADOW_SOFT_FAR, dM) * TUNE_SHADOW_LIFT, 0.0, 1.0);
+  // The softening law itself lives in common.wgsl (shadowFromOpaqueHit) since
+  // 2026-09-04, because the raster body path casts the same ray and must land
+  // on the same penumbra curve — a body and the ground under it disagreeing
+  // about how a shadow edge softens is exactly the artifact sharing it avoids.
+  // Near blockers (a voxel resting on the ground) keep a hard, dark contact
+  // shadow; distant ones (a tree canopy over a meadow) soften and lift, which
+  // is what stops every terrace step from stamping a hard black band onto the
+  // hillside.
+  return shadowFromOpaqueHit(s.hit, s.t, s.steps);
 }
 
 // Callers that shade a surface whose camera distance is not to hand (the

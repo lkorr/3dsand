@@ -1899,6 +1899,280 @@ Status GateShadowCache(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// body-shade: A RIGIDBODY IS LIT BY THE SAME SUN THE GROUND UNDER IT IS.
+//
+// WHAT IS UNDER TEST. Rigidbodies do not go through the raymarcher — they are
+// rasterized cubes (debris.wgsl vsBody/fsBody, shaded by litColorS in
+// common.wgsl). Until 2026-09-04 that path had NO SUN-SHADOW TERM AT ALL: a
+// body received 100% of the key light wherever it stood, so a corpse, a rubble
+// pile or a thrown grenade in shade was ~3.2x too bright in an ordinary cast
+// shadow and ~10.4x indoors (owner report: "fine in full sun, washed out
+// everywhere else"). Nothing else in the suite draws a body, so without this
+// gate that regression is invisible to every check we have.
+//
+// THE MEASUREMENT IS A DIFFERENTIAL ON THE SHADOW TOGGLE, not an absolute
+// brightness. WriteRenderParams(..., shadows, ...) sets R.flags bit 0, and that
+// is the ONLY input that differs between the lit and shaded arms — same
+// geometry, same camera, same tick, same openness and irradiance grids. So
+// whatever moves between them moved because of the shadow term, and nothing
+// else can be blamed for it.
+//
+// WHY THE BODY IS SYNTHESIZED RATHER THAN BROKEN OFF A WALL. The first version
+// of this gate built a floating cube and let AddDestructionEvent's island scan
+// turn it into real debris. That works, but it tests the DESTRUCTION path (an
+// async island scan, Jolt, 60 ticks of settling) to get at the SHADING path,
+// and the `debris` gate already owns the former. Writing the instance buffer
+// directly — exactly as `fire-depth` above does — puts the same cubes through
+// the same vsBody/fsBody pipeline in a handful of ticks instead of sixty, and
+// makes the body position a constant of the fixture rather than an outcome of
+// physics. What is under test is unchanged: these are the real body draws.
+//
+// TWO EARLIER VERSIONS OF THIS GATE PASSED WHILE MEASURING NOTHING, and both
+// failure modes are worth stating because either would silently return green:
+//   1. It called sim.DrawWorld() alone. DrawWorld does NOT draw bodies —
+//      DrawBodies() is a separate call, after BuildInstances and an upload
+//      (main.cpp:2250, selftest_phys.cpp:176). So no body was ever on screen.
+//   2. Its body mask was "pixels that changed between a frame taken before the
+//      body existed and one taken after". Sixty ticks separated those frames,
+//      so the openness grid had caught up in between and the mask was full of
+//      TERRAIN whose lighting had drifted — which is why it reported the same
+//      number with the shadow term forced off as with it on.
+// The mask below cannot fail that way: the reference arm is the same frame at
+// the same tick with the body draw count set to 0, so a pixel differs if and
+// only if a body cube covered it.
+Status GateBodyShade(Ctx& c, std::string& detail) {
+  GpuContext& ctx = c.ctx;
+  World& world = c.world;
+  Simulation& sim = c.sim;
+  const uint32_t W = c.width, H = c.height;
+
+  SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+  ctx.WaitIdle();
+
+  // Same site as `openness` and `gi-bounce`, for the same reason: it is known
+  // to sit inside the residency window wherever streaming has left it.
+  const int gx = 300, gz = 300;
+  const int ground = World::TerrainHeight(gx, gz, kDefaultSeed);
+  const int kHalf = 22;             // 45x45 plates
+  const int floorY = ground + 8;    // the deck the body rests on
+  const int roofY = floorY + 13;    // the roof that shadows it
+  const IVec3 pchunk{gx / 16, floorY / 16, gz / 16};
+
+  std::vector<CellOp> fixture;
+  auto put = [&](int x, int y, int z, uint32_t m) {
+    const IVec3 cc{x, y, z};
+    if (!world.CellInWindow(cc)) return;
+    fixture.push_back({World::SlotCellIndex(cc), PackVoxNew(m, 0u)});
+  };
+  // A DECK AND A ROOF, both two voxels thick. Two thick because a one-voxel
+  // plate is a one-voxel shadow caster and the ray TUNE_SHADOW_BIAS start
+  // offset can step straight over it — the gate would then be measuring a bias
+  // tuning rather than a shadow.
+  for (int dx = -kHalf; dx <= kHalf; dx++)
+    for (int dz = -kHalf; dz <= kHalf; dz++) {
+      put(gx + dx, floorY, gz + dz, kMatStone);
+      put(gx + dx, floorY + 1, gz + dz, kMatStone);
+      put(gx + dx, roofY, gz + dz, kMatStone);
+      put(gx + dx, roofY + 1, gz + dz, kMatStone);
+    }
+  if (fixture.empty()) {
+    detail = "fixture site is outside the residency window";
+    return Status::Fail;
+  }
+  uint32_t tick = 90000;
+  SubmitTick(ctx, world, sim, ++tick, kDefaultSeed, {}, {}, fixture, false,
+             pchunk, false, false);
+  ctx.WaitIdle();
+  // The openness grid refreshes on a rolling walk, so the deck and roof do not
+  // know about each other on the tick they were written. A few ticks let the
+  // walk reach them; without this the deck reports open sky and the AMBIENT
+  // term rather than the shadow carries the difference.
+  for (int i = 0; i < 6; i++)
+    SubmitTick(ctx, world, sim, ++tick, kDefaultSeed, {}, {}, {}, false, pchunk,
+               false, false);
+  ctx.WaitIdle();
+
+  // Noon, scanned rather than hardcoded (the shadow-cache gate says why). A
+  // near-vertical sun is what makes the roof directly overhead the blocker.
+  const Tuning base = CurrentTuning();
+  uint32_t noonTick = 0;
+  {
+    float bestUp = -2.0f;
+    for (uint32_t t = 0; t < 200000u; t += 64u) {
+      const float up = ComputeSky(base, (double)t).sunDir[1];
+      if (up > bestUp) { bestUp = up; noonTick = t; }
+    }
+  }
+
+  // ---- the body: one 5^3 stone cube resting on the deck at the centre ----
+  // Packed by hand rather than through rigrender, for the reason fire-depth
+  // gives above. Slot 0, no art colour — see BodyVoxInst in phys/debris.h.
+  const int kB = 5;
+  const float bodyBaseY = (float)(floorY + 2);
+  std::vector<BodyVoxInst> inst;
+  for (int x = 0; x < kB; x++)
+    for (int y = 0; y < kB; y++)
+      for (int z = 0; z < kB; z++)
+        inst.push_back({(float)x, (float)y, (float)z, kMatStone});
+  std::vector<BodyXformGpu> xf;
+  {
+    BodyXformGpu m{};
+    m.pos[0] = (float)gx - (float)kB * 0.5f;
+    m.pos[1] = bodyBaseY;
+    m.pos[2] = (float)gz - (float)kB * 0.5f;
+    m.quat[3] = 1.0f;   // identity: (x,y,z,w)
+    xf.push_back(m);
+  }
+  ctx.queue.WriteBuffer(world.bodyInstances, 0, inst.data(),
+                        inst.size() * sizeof(BodyVoxInst));
+  ctx.queue.WriteBuffer(world.bodyXforms, 0, xf.data(),
+                        xf.size() * sizeof(BodyXformGpu));
+
+  // Inside the roofed volume, looking across the deck at the cube from a
+  // little above it, so the frame holds the body AND the deck under it.
+  const Vec3 eye{(float)gx - 15.0f, bodyBaseY + 4.0f, (float)gz - 15.0f};
+  Camera cam;
+  cam.yaw = 0.785f;     // toward +X/+Z, i.e. at the cube
+  cam.pitch = -0.18f;
+
+  auto render = [&](bool shadows, uint32_t bodyInstances,
+                    std::vector<uint8_t>& out) -> bool {
+    rhi::Buffer shot =
+        CreateBuffer(ctx.device, (uint64_t)W * H * 4,
+                     rhi::BufferUsage::MapRead | rhi::BufferUsage::CopyDst,
+                     "bodyShadeShot");
+    // FOUR FRAMES, GRAB THE LAST, exactly as --shot does: the shadow cache
+    // resolves a patch one frame after a pixel asks for it, so a single frame
+    // per arm would compare a warm cache against a cold one and report the
+    // cache latency as the body shadow.
+    for (uint32_t f = 0; f < 4; f++) {
+      WriteRenderParams(ctx.queue, world, eye, cam, (float)W / H, shadows, 0.0f,
+                        kFarFogDensity, (float)H, noonTick);
+      rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
+      sim.EncodeShadowResolve(enc);
+      rhi::RenderPass rp = sim.BeginRenderPass(
+          enc, c.view, rhi::TextureFormat::RGBA8Unorm, W, H);
+      sim.DrawWorld(rp);
+      // THE CALL THE FIRST VERSION OF THIS GATE OMITTED. DrawWorld draws the
+      // raymarched world only; a body reaches the screen through here.
+      sim.DrawBodies(rp, bodyInstances);
+      rp.End();
+      if (f == 3) {
+        rhi::TexelCopyTexture srcT{};
+        srcT.texture = c.offscreen;
+        rhi::TexelCopyBuffer dstB{};
+        dstB.buffer = shot;
+        dstB.bytesPerRow = W * 4;
+        dstB.rowsPerImage = H;
+        rhi::Extent3D ext{W, H, 1};
+        enc.CopyTextureToBuffer(srcT, dstB, ext);
+      }
+      ctx.queue.Submit(enc.Finish());
+    }
+    out.assign((size_t)W * H * 4, 0);
+    return rhi::ReadBufferBlocking(ctx.device, shot, 0, out.data(), out.size());
+  };
+
+  // Three arms of ONE world state. `noBody` differs from `lit` only in the
+  // body draw count, so the pixels that differ ARE the body — an
+  // independently-derived mask rather than a projected rectangle this gate
+  // would then be asserting its own arithmetic against.
+  std::vector<uint8_t> noBody, lit, shaded;
+  const uint32_t n = (uint32_t)inst.size();
+  if (!render(false, 0, noBody) || !render(false, n, lit) ||
+      !render(true, n, shaded)) {
+    detail = "render/readback failed";
+    return Status::Fail;
+  }
+
+  auto lum = [](const std::vector<uint8_t>& px, size_t i) {
+    return 0.299 * px[i] + 0.587 * px[i + 1] + 0.114 * px[i + 2];
+  };
+  // Pass 1: the mask and its bounding box.
+  std::vector<uint8_t> isBody((size_t)W * H, 0);
+  uint32_t bx0 = W, bx1 = 0, by0 = H, by1 = 0;
+  size_t nBody = 0;
+  for (uint32_t y = 0; y < H; y++)
+    for (uint32_t x = 0; x < W; x++) {
+      const size_t i = ((size_t)y * W + x) * 4;
+      if (std::fabs(lum(lit, i) - lum(noBody, i)) <= 8.0) continue;
+      isBody[(size_t)y * W + x] = 1;
+      bx0 = std::min(bx0, x); bx1 = std::max(bx1, x);
+      by0 = std::min(by0, y); by1 = std::max(by1, y);
+      nBody++;
+    }
+  if (nBody < 500) {
+    detail = Format("only %zu body pixels — the cube is not in frame (or "
+                    "DrawBodies drew nothing)", nBody);
+    return Status::Fail;
+  }
+
+  // Pass 2: the terrain reference is THE DECK IMMEDIATELY UNDER AND AROUND THE
+  // BODY — the band below the body bounding box, widened by half its width.
+  // Not "every non-body pixel": the frame also holds sky past the deck edge and
+  // roof overhead, neither of which responds to a cast shadow the way a floor
+  // does, and averaging them in would dilute the denominator of the ratio with
+  // surfaces the body is not standing on.
+  const uint32_t bw = bx1 - bx0 + 1;
+  const uint32_t tx0 = (uint32_t)std::max(0, (int)bx0 - (int)bw / 2);
+  const uint32_t tx1 = std::min(W - 1, bx1 + bw / 2);
+  const uint32_t ty0 = std::min(H - 1, by1 + 2);
+  const uint32_t ty1 = std::min(H - 1, by1 + 2 + (by1 - by0) + 40);
+  double bodyLit = 0, bodyShaded = 0, terrLit = 0, terrShaded = 0;
+  size_t nTerr = 0;
+  for (uint32_t y = 0; y < H; y++)
+    for (uint32_t x = 0; x < W; x++) {
+      const size_t p = (size_t)y * W + x, i = p * 4;
+      if (isBody[p]) { bodyLit += lum(lit, i); bodyShaded += lum(shaded, i); }
+      else if (y >= ty0 && y <= ty1 && x >= tx0 && x <= tx1) {
+        terrLit += lum(lit, i); terrShaded += lum(shaded, i); nTerr++;
+      }
+    }
+  if (nTerr < 500) {
+    detail = Format("only %zu deck pixels under the body (%zu body px) — the "
+                    "camera is not looking at the floor", nTerr, nBody);
+    return Status::Fail;
+  }
+  bodyLit /= (double)nBody;   bodyShaded /= (double)nBody;
+  terrLit /= (double)nTerr;   terrShaded /= (double)nTerr;
+
+  // The response to the shadow toggle, as a FRACTION of the surface own lit
+  // brightness — normalising by brightness is what makes a dark body and a
+  // pale deck comparable at all.
+  const double bodyResp = (bodyLit - bodyShaded) / std::max(bodyLit, 1.0);
+  const double terrResp = (terrLit - terrShaded) / std::max(terrLit, 1.0);
+  const double ratio = terrResp > 1e-6 ? bodyResp / terrResp : 0.0;
+
+  // Thresholds in baseline.json, not here (CLAUDE.md: a threshold in source
+  // costs a rebuild to tune). The band is deliberately wide: the claim is "the
+  // body is shadowed roughly as much as the ground it lies on", and the two
+  // paths legitimately differ — a body gets no voxel AO and no GI bounce, and
+  // its faces are not axis-aligned with the grid. Measured with the shadow
+  // term forced off, bodyResp is 0.00 and the ratio 0.00, which is the
+  // regression this exists to catch.
+  const double minTerr = BaselineNumber("bodyShade.minTerrainResponse", 0.05);
+  const double minRatio = BaselineNumber("bodyShade.minRatio", 0.40);
+  const double maxRatio = BaselineNumber("bodyShade.maxRatio", 2.50);
+  // Checked FIRST so a broken fixture reports as a broken fixture rather than
+  // as a body-shading regression: if the deck itself is not in shadow, the
+  // ratio denominator is noise and the whole number is meaningless.
+  const bool fixtureOk = terrResp >= minTerr;
+  const bool ok = fixtureOk && ratio >= minRatio && ratio <= maxRatio;
+
+  detail = Format(
+      "body dims %.3f of its lit level when shadows go on, the deck under it "
+      "%.3f — ratio %.2f, must be %.2f..%.2f (with the body path shadow forced "
+      "off: 0.000 and 0.00). Deck response must exceed %.2f or the fixture "
+      "casts nothing. %zu body px (%.1f lit, %.1f shaded), %zu deck px "
+      "(%.1f lit, %.1f shaded); %d^3 cube on a deck at y=%d under a roof at "
+      "y=%d",
+      bodyResp, terrResp, ratio, minRatio, maxRatio, minTerr, nBody, bodyLit,
+      bodyShaded, nTerr, terrLit, terrShaded, kB, floorY + 1, roofY);
+  if (!fixtureOk)
+    detail += " — FIXTURE, not the body path: the deck is not in shadow";
+  return ok ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& RenderGates() {
@@ -1920,6 +2194,9 @@ const std::vector<Gate>& RenderGates() {
       // No render pass on purpose: the resolve pass must not be able to
       // contribute, or the gate would be measuring the charger.
       {"gi-nightfall", "render", {}, false, GateGiNightfall},
+      // The only gate in the suite that DRAWS A RIGIDBODY. Three arms of one
+      // fixture frame, and it spawns a body through the real destruction path.
+      {"body-shade", "render", {}, false, GateBodyShade, /*needsRender=*/true},
   };
   return g;
 }

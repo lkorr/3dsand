@@ -24,9 +24,15 @@
 // testing composite these bodies against the raymarched world, the particle
 // cubes, the ordinary body cubes and the sprites with no sorting anywhere.
 //
-// SHADOWS: none, v1. Parity with the cube path, which also casts none. Shadow
-// rays must never iterate models (the research note in the PLAN) — a coarse
-// occupancy proxy stamped render-side is the stretch goal, not this.
+// SHADOWS: RECEIVED since 2026-09-04, still CAST by nothing. The distinction
+// is the whole design. This pass casts one sun ray per fragment against the
+// VOXEL GRID (bodySunShadow, common.wgsl), so a limb standing in a building's
+// shade is lit like the ground it stands on — before that it kept 100% of the
+// key light and a mob indoors read ~10x too bright. What has NOT changed is
+// the old rule that shadow rays must never iterate MODELS: the ray marches
+// world voxels only, so a body cannot shadow itself or another body, and the
+// per-fragment cost is independent of how many micro bodies exist. A coarse
+// render-side occupancy proxy is still the stretch goal for body-on-body.
 //
 // DETERMINISM: render-only. These buffers are bound here and nowhere else.
 
@@ -36,9 +42,20 @@
 // take that surface's sky visibility. Without this a mob in a cave keeps full
 // daylight ambient while the cave around it goes dark, which is the failure
 // PLAN_gi.md §1 names by hand.
+// The world grid and its page table, for ONE thing: the sun-shadow ray this
+// pass casts per fragment (bodySunShadow, common.wgsl). A micro body is not in
+// the grid, so nothing shadows it unless it asks, and before 2026-09-04 it
+// never asked — a mob standing in a building's shade was lit as if it were in
+// open sun. Declaring `voxels` is also what keeps the page-table block of
+// common.wgsl from being stripped out of this shader (BodyAddressesVoxels in
+// src/gpu/resources.cpp is a content predicate — it reads the declaration, not
+// a list), which is where traceOpaque and voxWordAt come from. Fragment-only
+// visibility in renderBGL_ is exactly what this pass needs; it shades in fs.
+@group(0) @binding(0) var<storage, read> voxels    : array<u32>;
 @group(0) @binding(1) var<storage, read> occupancy : array<u32>;
 @group(0) @binding(2) var<storage, read> materials : array<Material>;
 @group(0) @binding(3) var<uniform> R : RenderParams;
+@group(0) @binding(9) var<storage, read> pageTable : array<u32>;
 @group(0) @binding(17) var<storage, read> openness    : array<u32>;
 @group(0) @binding(18) var<storage, read> opennessGen : array<u32>;
 
@@ -309,14 +326,25 @@ fn fs(in : VSOut) -> FSOut {
   // emissive body voxels (embers) flicker exactly like their grid counterparts
   // and like the cube path's — one shared definition, in common.wgsl
   let fh = pcg(u32(c.x * 2917 + c.y * 131 + c.z * 7919) + in.slot * 977u);
-  let emis = emberFlicker(f32(mat.emission) / 255.0, fh, R.time);
+  // ...and burn-tinted matter breathes toward the flame colour on the same key
+  // (burnTint, common.wgsl) before it flickers. No mob material carries the
+  // flag today; the rule is that no path may shade emission without it.
+  let bt = burnTint(mat, albedo, f32(mat.emission) / 255.0,
+                    burnTintWeightH(fh, R.time));
+  albedo = bt.albedo;
+  let emis = emberFlicker(bt.emis, fh, R.time);
   // The ambient's spatial term. One downward probe per FRAGMENT (at most six
-  // mask words), which is where a body's shading has to happen — the cube and
-  // sprite paths in debris.wgsl light per VERTEX and are deliberately left on
-  // the plain lerp (see the openness node in ARCH_NODES).
-  let openScale = opennessScaleAtBody(worldPos, &occupancy, &openness,
-                                      &opennessGen);
-  var col = litColorO(albedo, n, worldPos, emis, R, openScale);
+  // mask words), which is where a body's shading has to happen. `.x` is the
+  // ambient multiplier, `.y` the raw openness the shadow lift is capped by —
+  // one walk, both consumers (opennessAtBody, common.wgsl).
+  let open = opennessAtBody(worldPos, &occupancy, &openness, &opennessGen);
+  // THE SUN-SHADOW RAY. The whole reason this pass reaches the voxel grid: a
+  // limb in shade used to keep full key light while the ground it stood on
+  // went dark, so a mob read as lit from a sun the terrain could not see.
+  // Same ray, same softening law and same lift cap as the terrain beside it
+  // (bodySunShadow -> shadowFromOpaqueHit, common.wgsl).
+  let sh = bodySunShadow(worldPos, n, R, &occupancy, &materials);
+  var col = litColorS(albedo, n, worldPos, emis, R, open.x, open.y, sh);
 
   // ---- THE HIT FLASH -------------------------------------------------------
   // ADDITIVE, and BEFORE the tonemap, because litColor's output is linear HDR

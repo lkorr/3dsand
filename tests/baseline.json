@@ -225,6 +225,10 @@
   "giBounce.minGreenDelta": "2.0",
   "giBounce.minGreenOverRed": "1.0",
   "giBounce.convergePct": "5.0",
+  "_bodyShade_about": "Rigidbodies are rasterized cubes (debris.wgsl vsBody/fsBody, shaded by litColorS in common.wgsl), not raymarched, and until 2026-09-04 that path had NO sun-shadow term: a body received 100% of the key light wherever it stood (measured ~3.2x too bright in an ordinary cast shadow, ~10.4x indoors). The gate stands a 5^3 stone rigidbody on a 45x45 deck under a 45x45 roof at noon and renders three arms of ONE world state: body draw count 0 (which yields the body pixel mask by difference), body with shadows off, body with shadows on. It compares how much each surface DIMS when shadows go on, as a fraction of its own lit level -- a ratio, so a dark body and a pale deck are comparable. Measured at the landing: body 0.532, deck 0.562, ratio 0.95. With the body path shadow forced off the body dims 0.000 (bit-identical frames) and the ratio is 0.00, which is the regression this exists to catch. minRatio/maxRatio are a deliberately wide band: a body legitimately gets no voxel AO and no GI bounce and its faces are not axis-aligned with the grid, so it is not expected to track the deck exactly. minTerrainResponse guards the FIXTURE -- if the deck itself is not in shadow the ratio denominator is noise and the gate reports that instead of blaming the body path.",
+  "bodyShade.minTerrainResponse": "0.05",
+  "bodyShade.minRatio": "0.40",
+  "bodyShade.maxRatio": "2.50",
   "_giNightfall_about": "No block-face keeps yesterday's sun, docs/PLAN_gi.md 3. Two floating 4x4 plates are charged by the openness walk at noon and then carved down to a single column each -- one on a column openSunSample probes, one on a block corner it does not -- and walked 24 more ticks at midnight. maxRemainPct is the most of the noon luminance either word may still hold; minDayLum is the floor the charge itself must clear, so \"it faded\" cannot pass on a word that was never lit. Before the five-column probe and the unconditional fade both words held 100%.",
   "giNightfall.maxRemainPct": "5.0",
   "giNightfall.minDayLum": "0.02"

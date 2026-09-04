@@ -1668,9 +1668,16 @@ void Simulation::EnsureRenderPipelines(rhi::TextureFormat format) {
     d.label = "spriteDraw";
     spriteDraw_ = device_.CreateRenderPipeline(d);
 
+    // THE ONE PIPELINE HERE WITH ITS OWN FRAGMENT ENTRY. Rigidbodies shade in
+    // fsBody, not fs, because they are the only raster path that casts a sun
+    // shadow — and `voxels`/`pageTable` are Fragment-only in renderBGL_ above,
+    // so the ray cannot be cast from a vertex shader. See the BodyVSOut note in
+    // debris.wgsl for why the rest of the raster paths stay per-vertex.
     d.vertexEntry = "vsBody";
+    d.fragmentEntry = "fsBody";
     d.label = "bodyDraw";
     bodyDraw_ = device_.CreateRenderPipeline(d);
+    d.fragmentEntry = "fs";  // restore for the pipelines that follow
 
     // MLS-MPM fluid prototype: same module, same layout, own entry point.
     // Opaque cubes for now — translucency across thousands of unsorted cubes

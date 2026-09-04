@@ -1350,12 +1350,31 @@ Author in JSON, hot-reload at runtime, compile at load into flat GPU tables.
 
 - **`burnTint` (2026-09-03):** `"burnTint": true` on an emissive material says
   its `colors` are what the voxel looked like *before* it caught, and the
-  renderer supplies the fire: every emissive grid site (primary hit, far
-  cascade, secondary rays, the irradiance deposit) goes through `burnTint()` in
-  `common.wgsl`, which breathes each cell between that palette and
-  `render.burnTintColor` on a slow per-cell phase (`burnTintRate/Min/Max`) and
-  scales the emission by the same weight, so the leaf end of the breath is lit
-  like a leaf rather than glowing green. Sets `kMatFlagBurnTint`; render-only.
+  renderer supplies the fire: **every** site that turns a material's emission
+  into light goes through `burnTint()` in `common.wgsl`, which breathes each
+  cell between that palette and `render.burnTintColor` on a slow per-cell phase
+  (`burnTintRate/Min/Max`) and scales the emission by the same weight, so the
+  leaf end of the breath is lit like a leaf rather than glowing green. Sets
+  `kMatFlagBurnTint`; render-only.
+
+  **"Every" is eight sites in five shaders, not the four grid ones.** Besides
+  the primary hit, the far cascade and secondary rays in `raymarch.wgsl`, a
+  voxel's emission also becomes light in `debris.wgsl` (`vsBody` and
+  `vsParticle` — the crown that falls off a burning tree is a rigid body, not a
+  grid cell), in `microbody.wgsl`, and in the two writers of the irradiance
+  grid: `sim_openness.wgsl`'s walk and `shadow_resolve.wgsl`'s deposit. The
+  last pair is the sharpest case — they write the *same word*, so they must
+  agree, and both deposit `burnTintMean()` because that grid is an EMA over
+  frames and would otherwise beat with the pulse. The first version covered
+  four of the eight and every one of the other four showed as green glow the
+  same day (owner report 2026-09-03: burning leaves *glowing and pulsing
+  green*). The raster paths key the breath on their per-voxel flicker hash
+  (`burnTintWeightH`) rather than a world cell, because a tumbling piece's
+  phase would otherwise slide as it fell. `check_burn_tint_sites` in
+  `scripts/check_invariants.py` refuses a raw emission-to-light conversion
+  outside a `burnTint()` call, with a named allowlist for the sites that
+  legitimately read emission for something else (lava's molten crust, the gas
+  media march, and the helpers that take an already-tinted value).
   This is why there are three burning-leaf materials (`leaf_burning`,
   `pine_burning`, `autumn_burning`, one per foliage family's palette): the
   voxel word has no bits to remember which leaf a burning one was, so the
@@ -2929,6 +2948,27 @@ running over the baked model.
   latches into a dead hang, and W pulls up (a committed mantle when the lip is
   standable, an arm boost to the next grab when it is not, which chains up
   rough walls).
+- **The collision box is not the figure** (2026-09-02, `Player::Box`).
+  `Player::pos` stays the centre of the NOMINAL 1.7 m figure box
+  (`kHalfXZ`/`kHalfY`: the art contract, the Jolt proxy, the mob sense actor,
+  every `feet = pos.y - kHalfY`), but the box the sweeps use is a smaller one
+  standing on that same sole — `player.collisionWidth` (0.4 m) wide and
+  `player.collisionHeight` (1.5 m) tall, both live tuning — and movement is
+  decided by it alone. Shoulders, arms and the top of the head overhang it
+  and clip terrain by exactly that overhang, on purpose: a corridor a
+  head-clip lower than the figure still admits the figure, and a doorway the
+  elbows brush does not catch. Every sweep/probe in `player.cpp` takes the
+  box as a parameter (`Player::BoxFor` is the one place its shape is
+  decided). The first-person eye is the LOWER of the figure's face row and
+  just under the box top, because only the box is guaranteed clear.
+  **Crouch (Ctrl):** the box shrinks to `player.crouchHeight` (1.15 m), speed
+  scales by `player.crouchSpeedScale` and sprint is off; releasing Ctrl only
+  stands up once the standing box is clear where the body is, so a
+  crawl-space cannot wedge you. The eye change is banked into `viewYOffset`
+  like a step-up. The avatar mirrors `Player::crouching` into a held pelvis
+  drop (`player.crouchKneeDrop`, `PlayerAvatar::crouchHold_`, capped in leg
+  lengths) kept separate from the gait's per-step `stanceCrouch_`; the leg IK
+  turns the drop into a knee bend with the feet where the gait put them.
 - **Projectiles** (spells, thrown things): no colliders — swept ray each frame
   (position + velocity look-ahead, anti-tunneling). Spell modifiers attach as
   **tags with per-frame logic** (material trail, AoE on hit, bounce, acceleration
@@ -3085,27 +3125,6 @@ relation between three casts rather than as absolute counts, because a gate
 that only checked "more words ⇒ more output" would pass a linear ramp too, and
 because measuring the relation is what caught the off-by-one above. The first
 version of the gate folded the impact op into the trail total and reported 343
-- **The collision box is not the figure** (2026-09-02, `Player::Box`).
-  `Player::pos` stays the centre of the NOMINAL 1.7 m figure box
-  (`kHalfXZ`/`kHalfY`: the art contract, the Jolt proxy, the mob sense actor,
-  every `feet = pos.y - kHalfY`), but the box the sweeps use is a smaller one
-  standing on that same sole — `player.collisionWidth` (0.4 m) wide and
-  `player.collisionHeight` (1.5 m) tall, both live tuning — and movement is
-  decided by it alone. Shoulders, arms and the top of the head overhang it
-  and clip terrain by exactly that overhang, on purpose: a corridor a
-  head-clip lower than the figure still admits the figure, and a doorway the
-  elbows brush does not catch. Every sweep/probe in `player.cpp` takes the
-  box as a parameter (`Player::BoxFor` is the one place its shape is
-  decided). The first-person eye is the LOWER of the figure's face row and
-  just under the box top, because only the box is guaranteed clear.
-  **Crouch (Ctrl):** the box shrinks to `player.crouchHeight` (1.15 m), speed
-  scales by `player.crouchSpeedScale` and sprint is off; releasing Ctrl only
-  stands up once the standing box is clear where the body is, so a
-  crawl-space cannot wedge you. The eye change is banked into `viewYOffset`
-  like a step-up. The avatar mirrors `Player::crouching` into a held pelvis
-  drop (`player.crouchKneeDrop`, `PlayerAvatar::crouchHold_`, capped in leg
-  lengths) kept separate from the gait's per-step `stanceCrouch_`; the leg IK
-  turns the drop into a knee bend with the feet where the gait put them.
 voxels against a 64 budget, where the budget was fine and the measurement was
 wrong.
 
@@ -4813,9 +4832,13 @@ DO settle back into the grid: `SettleBodies` collapses each `scale³` micro bloc
 to at most one world voxel by majority fill (blocks under half full become air),
 which is bounded and paid at most once per body.
 
-**Shadows: none, v1** — parity with the cube path, which also casts none. Shadow
-rays must never iterate models; a coarse occupancy proxy stamped render-side is
-the stretch goal.
+**Shadows: received, not cast** (since 2026-09-04; was "none, v1"). The micro
+pass casts one sun ray per fragment against the VOXEL GRID
+(`bodySunShadow` in `common.wgsl`), so a limb in a building's shade is lit like
+the ground it stands on. The old rule survives intact where it mattered — shadow
+rays still never iterate MODELS, so no body shadows itself or another body and
+the per-fragment cost does not scale with the number of micro bodies. A coarse
+render-side occupancy proxy remains the stretch goal for body-on-body.
 
 **Bounds and cost.** The per-fragment DDA is hard-capped at `3·maxDim + 4` steps
 (worst-case diagonal of the brick) with no data-dependent loop bound anywhere.
@@ -4941,10 +4964,59 @@ computed on the CPU — which is what keeps that hash and `common.wgsl`'s
 **What P0 does not do.** There is no bounce: a sealed room goes to zero ambient
 and stays there, which is honest for a sky-visibility term and is what P1's
 one-bounce gather (below) is for. Debris cubes and sprites (`debris.wgsl`) read
-the grid since 2026-09-02 too: one `opennessScaleAtBody` walk per VERTEX from
-the cube's position, with `occupancy`/`openness`/`opennessGen` widened to the
-vertex stage in `renderBGL_` — a burning ember in a cave no longer glows at
-full sky ambient.
+the grid since 2026-09-02 too: one `opennessScaleAtBody` walk from the cube's
+position, with `occupancy`/`openness`/`opennessGen` widened to the vertex stage
+in `renderBGL_` — a burning ember in a cave no longer glows at full sky ambient.
+Particles, sprites and fluid still take that walk per VERTEX; the BODY path
+takes it once per cube (at the centre) and shades per FRAGMENT — see §9.z.
+
+### 9.z Raster body shading parity (added 2026-09-04)
+
+**The defect.** Rigidbodies are not raymarched; they are rasterized cubes
+(`debris.wgsl` `vsBody`/`fsBody`) and micro-body bricks (`microbody.wgsl`),
+shaded by `litColorS` in `common.wgsl`. That function had **no shadow term at
+all**, so a body received 100% of the key light wherever it stood. Modelled at
+shipped tuning against the terrain combine, a body was ~0.94x in open sun (fine),
+**3.2x** too bright in an ordinary cast shadow, **5.3x** with contact AO and
+**10.4x** inside a room — which is exactly the reported symptom, "fine in full
+sun, washed out everywhere else". Four smaller terms were missing with it: the
+per-face tint, wrapped diffuse, and a fog that used a hardcoded `0.0128` and
+ignored `R.fogDensity` (so `main.cpp`'s portrait renders, which pass 0.0, were
+fogged anyway).
+
+**The structural blocker, and the fix.** `voxels` (binding 0) and `pageTable`
+(binding 9) are **Fragment-only** in `renderBGL_`, and `vsBody` shaded in the
+VERTEX stage — so the body path could not reach the world at all. Widening those
+to the vertex stage would hand the world grid to every particle and sprite vertex
+for one consumer, so instead the body path alone ships its surface across the
+interstage boundary (`BodyVSOut`: flat albedo/normal/emissive/openness,
+interpolated world position) and lights it in a new `fsBody` entry point. That
+is the ONLY pipeline in `debris.wgsl` with its own fragment entry.
+
+**One law, not two.** The softening curve was lifted out of `raymarch.wgsl`'s
+`sunShadowAt` into `shadowFromOpaqueHit` in `common.wgsl`, and `wrapDiffuse`
+moved to `common.wgsl` with it. Both paths now call the same functions: a body
+and the ground under it cannot disagree about how a shadow edge softens. The
+lift is capped by raw openness through the same `shadowLiftCap`, which is why
+`opennessAtBody` returns the scale AND the raw byte from one walk.
+
+**What a body still does not get, and why.** No `voxelAO` — it samples the eight
+cell-scale neighbours around an axis-aligned hit face, which a rotated cube does
+not have; a wrong occlusion on every tumbling block is worse than none. No GI
+bounce. And **bodies still cast nothing**: the ray marches world voxels only, so
+there is no contact shadow under a rubble pile and no body-on-body shadowing.
+Particles, sprites and fluid deliberately stay per-vertex and shadowless — foam
+is 1/6 of a cell and there can be ~260k of them.
+
+**The gate.** `--gate body-shade` (`selftest_render.cpp`) stands a 5³ stone body
+on a 45×45 deck under a 45×45 roof at noon and renders three arms of one world
+state: body draw count 0 (which yields the body pixel mask by difference), then
+shadows off, then shadows on. It compares how much each surface dims, as a
+fraction of its own lit level. Measured: the body dims **0.532**, the deck under
+it **0.562**, ratio **0.95**. With the shadow term forced off the body dims
+**0.000** (bit-identical frames) and the ratio is **0.00**. Thresholds are in
+`tests/baseline.json`. `determinismHash` is unmoved — all of this is render-only
+float math on render-only data.
 
 ### 9.y The irradiance grid — one bounce of direct light (added 2026-09-02)
 
@@ -4964,18 +5036,18 @@ and shadow term, and one voxel-word read gives the albedo — so anything on
 screen is injected every frame. The openness walk (`sim_openness.wgsl`)
 deposits ONE coarse sun sample per face it marches (a `traceOpaque` block ray
 from the face centre; the albedo is the first blocker voxel found in FIVE
-columns of the face - its centre and the same 2x2 quincunx `openValueAt` uses
+columns of the face — its centre and the same 2x2 quincunx `openValueAt` uses
 to find its ray origin), so faces nobody is looking at follow the sun within
-`kNumChunks / opennessChunksPerFrame` ticks. A face the walk cannot measure -
+`kNumChunks / opennessChunksPerFrame` ticks. A face the walk cannot measure —
 it could not march (a blocker in front), or none of the five columns holds a
-blocker - fades by `render.giDecay` per visit, and a block with no surface
+blocker — fades by `render.giDecay` per visit, and a block with no surface
 reads 0. **A face the walk cannot measure must never be left alone.** The
 resolve pass is a charger with no expiry: it deposits full sun for anything on
 screen and stops the moment the camera looks away, so the walk's visit is the
 only thing that can ever discharge a word. Sampling the centre column alone and
 skipping the deposit when it held no blocker froze exactly the faces of blocks
-whose surface passes off-centre - every slope, bank, trunk and cliff, since a
-block is 4 voxels wide - at whatever value the last daylight frame put there:
+whose surface passes off-centre — every slope, bank, trunk and cliff, since a
+block is 4 voxels wide — at whatever value the last daylight frame put there:
 they went on lighting their neighbours grass-green all night, in scattered
 patches that tracked the steep ground (2026-09-02). Gate `gi-nightfall`.
 Both blend into the word with an EMA (`irrDeposit`: 1/16 per resolve deposit,

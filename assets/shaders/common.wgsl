@@ -1281,13 +1281,112 @@ fn tonemapHdr(colorIn : vec3f) -> vec3f {
 // A SEPARATE ENTRY POINT rather than a widened litColor: debug_lines.wgsl and
 // several sprite paths want the plain version, and 1.0 here is bit-identical to
 // what they had.
-fn litColorO(albedo : vec3f, n : vec3f, worldPos : vec3f, emission : f32,
-             R : RenderParams, openScale : f32) -> vec3f {
-  let lambert = max(dot(n, keyLightDirP(R)), 0.0);
-  var c = albedo * (ambientAtP(n, R) * openScale + keyLightColorP(R) * lambert);
+//
+// THE SHADOW LIFT CANNOT ENTER AN ENCLOSED SPACE. The penumbra law in
+// shadow_resolve.wgsl / sunShadowAt lifts a shadow toward TUNE_SHADOW_LIFT
+// (0.45 of full sun) by the DISTANCE to the blocker, on the argument that a
+// distant blocker only partially covers the solar disc. That argument holds
+// for a canopy or a fence; it says nothing about WHAT the blocker is, so a
+// cave floor whose ray hits the roof 10 m up got 45% direct sun through 10 m
+// of rock, and P1 then gathered that light onto the walls. Measured by eye
+// (2026-09-02): every cave chamber taller than shadowSoftFar glowed warm in
+// daylight, and the glow followed ceiling height.
+//
+// The disc's edge is only visible from a point that can see the sky, and the
+// openness byte is exactly that measurement. So the LIFTED part of the
+// shadow is scaled by openness while a fully lit face (v = 1, the ray hit
+// nothing) is untouched: a canyon floor in direct sun stays in full sun, a
+// meadow under a tree keeps its soft canopy shadow, a cave gets none.
+// Continuous across the blend between a lit and a lifted patch. `o < 0`
+// (no measurement) leaves the value alone, the pre-P0 look.
+//
+// Applied at every site that turns a shadow-ray distance into light: the
+// fragment shader's read (both the cache and its fallback), the resolve
+// pass's P1 deposit, and the openness walk's own sun sample. Not to the
+// PUBLISHED cache value, which stays the pure ray answer the shadow-cache
+// gate compares against the fragment-stage ray.
+fn shadowLiftCap(v : f32, o : f32) -> f32 {
+  if (o < 0.0) { return v; }
+  return v * mix(o, 1.0, smoothstep(min(TUNE_SHADOW_LIFT, 0.99), 1.0, v));
+}
+
+// ---- diffuse response ----
+// Plain max(dot(n,l),0) is wrong for geometry built out of axis-aligned voxel
+// faces, and it is the specific reason a grassy hillside rendered as harsh
+// horizontal banding. A voxel slope is a STAIRCASE: every 1-voxel rise puts a
+// vertical face next to a horizontal one. With a hard Lambert term the top face
+// gets dot ~= 0.66 and the away-facing riser gets exactly 0, so the two
+// alternate at ~1.8x brightness down the whole hill. The eye reads that
+// alternation as noise, not as slope, because a real grass slope has no such
+// discontinuity — the two facets differ by a few percent, not by 80%.
+//
+// Wrapped diffuse fixes it at the source: remap dot from [-1,1] so the falloff
+// continues smoothly past the terminator instead of clamping to zero. This is
+// the standard cheap stand-in for the light a rough/scattering surface picks up
+// at grazing angles, and it keeps risers lit enough to sit next to their tops.
+//
+// IN common.wgsl, NOT raymarch.wgsl, since 2026-09-04: a debris cube is made of
+// the same axis-aligned faces as the terrain and had the hard Lambert, so a
+// tumbling block flickered between facet brightnesses the ground beside it had
+// stopped showing years ago. One definition, both consumers.
+fn wrapDiffuse(ndl : f32, wrap : f32) -> f32 {
+  return clamp((ndl + wrap) / (1.0 + wrap), 0.0, 1.0);
+}
+
+// THE RASTER SHADING LAW, and it must be the terrain's law (raymarch.wgsl's
+// combine) with the terrain's terms removed only where a raster cube genuinely
+// has no way to supply them. Before 2026-09-04 it was missing FIVE of them and
+// the visible one was the shadow: a rigidbody carried no shadow term at all, so
+// a corpse, a rubble pile or a thrown grenade received 100% of the key light no
+// matter what it stood under. Modelled at shipped tuning, that is 3.2x too
+// bright in an ordinary cast shadow, 5.3x with contact AO and 10.4x inside a
+// room — matching the report exactly ("fine in full sun, washed out
+// everywhere else").
+//
+// The arguments the caller must supply, and why each is a caller's job:
+//   openScale — the ambient's sky multiplier. Only the caller has the
+//               `openness`/`opennessGen` bindings in scope (pointer note above).
+//   openRaw   — the SAME probe's unscaled 0..1 byte, or -1 for "no
+//               measurement". shadowLiftCap needs the raw value: the lift is a
+//               solar-disc argument and cannot enter a cave. Both come out of
+//               one opennessAtBody() call, which is why that returns a pair.
+//   sh        — sun visibility, 1.0 = unshadowed. bodySunShadow() below is the
+//               body path's producer; callers with no voxel bindings (the
+//               debug-line and portrait paths) pass 1.0 and get the old look.
+//
+// AO is the one terrain term deliberately absent. voxelAO samples the eight
+// cell-scale neighbours around a hit FACE, which a rotated cube does not have —
+// its face is not axis-aligned with the grid and its "neighbours" are whatever
+// the body happens to be tumbling past. A wrong occlusion darkening every
+// tumbling block is worse than none, and the openness probe already carries the
+// coarse version of what AO would say. Revisit only with a body-local model.
+fn litColorS(albedo : vec3f, n : vec3f, worldPos : vec3f, emission : f32,
+             R : RenderParams, openScale : f32, openRaw : f32,
+             sh : f32) -> vec3f {
+  // Per-face constant, keyed on the WORLD normal exactly as the terrain keys it
+  // (raymarch.wgsl's `face`) — it only breaks the tie between the two
+  // horizontal axes so parallel faces don't fuse. A cube lit without it sat a
+  // flat 4-8% off the wall behind it.
+  var face = 1.0;
+  if (abs(n.x) > 0.5) { face = TUNE_FACE_X; }
+  else if (abs(n.z) > 0.5) { face = TUNE_FACE_Z; }
+
+  var lambert = wrapDiffuse(dot(n, keyLightDirP(R)), TUNE_DIFFUSE_WRAP);
+  // THE SHADOW MULTIPLIES THE KEY LIGHT ONLY. Ambient is sky light and has its
+  // own occlusion (openScale); multiplying it here too would double-darken a
+  // shadowed body into a black smear, which is the mistake the terrain path
+  // documents at its own combine. The distance-softened lift is capped by raw
+  // openness for the reason written on shadowLiftCap.
+  if ((R.flags & 1u) != 0u) { lambert *= shadowLiftCap(sh, openRaw); }
+
+  var c = albedo * face *
+          (ambientAtP(n, R) * openScale + keyLightColorP(R) * lambert);
   c += albedo * emission * 1.7;
   let dist = length(worldPos - R.camPos);
-  let fog = 1.0 - exp(-dist * VOXEL_METERS * 0.0128);
+  // R.fogDensity, not a hardcoded 0.0128. They agreed at the shipped default
+  // and diverged everywhere else — main.cpp passes 0.0 for portrait renders,
+  // and the hardcode fogged every portrait the frame behind it did not.
+  let fog = 1.0 - exp(-dist * VOXEL_METERS * R.fogDensity);
   // cheap sky tint for fog, dimmed through the night like the real sky (a
   // fixed day-blue tint here was a second source of midnight glow). Both moons
   // count, and an eclipse dims it with everything else.
@@ -1298,6 +1397,17 @@ fn litColorO(albedo : vec3f, n : vec3f, worldPos : vec3f, emission : f32,
   let fogTint = vec3f(0.55, 0.65, 0.85) *
                 mix(0.015 + 0.05 * moonLit, 1.0, eclipseDayWeightP(R));
   return mix(c, fogTint, fog);
+}
+
+// The shadowless form. Every caller that has no voxel bindings to cast a ray
+// with keeps this: -1 openRaw ("no measurement", shadowLiftCap passes it
+// through untouched) and sh = 1.0, which the `R.flags` branch above then
+// multiplies in as a no-op. Face tint and wrapped diffuse DO reach these paths,
+// and that is intended — a particle cube is the same axis-aligned geometry the
+// terrain is and should bank the same way.
+fn litColorO(albedo : vec3f, n : vec3f, worldPos : vec3f, emission : f32,
+             R : RenderParams, openScale : f32) -> vec3f {
+  return litColorS(albedo, n, worldPos, emission, R, openScale, -1.0, 1.0);
 }
 
 // The plain form: no spatial term, bit-identical to what every raster path had
@@ -1324,15 +1434,29 @@ fn emberFlicker(emission : f32, hash : u32, time : f32) -> f32 {
 // TUNE_BURN_TINT_COLOR on a slow per-cell phase, so a crown on fire still reads
 // as the crown it was instead of a heap of identical orange coals.
 //
-// ONE helper for every grid site that shades emission (the primary hit, the
-// far cascade, secondary rays, the irradiance deposit), because the four must
-// agree about what a burning leaf looks like or the far field shows a
-// different tree from the near field across the seam. The returned emission is
-// scaled by the SAME weight: at the leaf end of the breath the cell is lit like
-// a leaf (no glow), at the flame end it glows like an ember. Leaving the
-// emission at full while the albedo went green would glow green, which is the
-// one thing this must never do (per-channel it is a very bright leaf, not a
-// fire).
+// ONE helper for EVERY site that turns a material's emission into light, and
+// "every" is the load-bearing word. They must agree about what a burning leaf
+// looks like or the same leaf reads differently depending on which pass drew
+// it. The returned emission is scaled by the SAME weight: at the leaf end of
+// the breath the cell is lit like a leaf (no glow), at the flame end it glows
+// like an ember. Leaving the emission at full while the albedo went green would
+// glow green, which is the one thing this must never do (per-channel it is a
+// very bright leaf, not a fire).
+//
+// THE SITES ARE NOT ONLY THE GRID ONES. The first version covered the four
+// raymarch/openness paths and missed four more, and every one of them showed
+// (owner report 2026-09-03: "some leaves are glowing and pulsing GREEN"):
+//   * debris.wgsl vsBody / vsParticle -- a burning leaf on a crown that has
+//     fallen is a RIGID BODY, not a grid cell, and it drew raw green at full
+//     emission
+//   * microbody.wgsl -- the same for a burning limb voxel
+//   * shadow_resolve.wgsl -- the P1 irradiance deposit. This one is the worst,
+//     because the openness walk deposits burnTintMean() into the SAME word:
+//     the two writers of one value disagreed, and the resolve pass wins (every
+//     frame against once per sweep), so a burning crown flooded everything
+//     around it with green bounce light.
+// scripts/check_invariants.py refuses a new raw emission-to-light conversion
+// outside a burnTint() call, so the next site cannot be missed silently.
 //
 // The phase key is the same cell hash the emissive flicker uses, so the slow
 // breath and the fast flicker are decorrelated across neighbours in the same
@@ -1343,10 +1467,19 @@ struct BurnTint {
   emis : f32,
 };
 
-fn burnTintWeight(cell : vec3<i32>, time : f32) -> f32 {
-  let ph = pcg(u32(cell.x * 7 + cell.y * 131 + cell.z * 2917));
-  let s = 0.5 + 0.5 * sin(time * TUNE_BURN_TINT_RATE + f32(ph & 0xFFu) * 0.02454);
+// From a phase key rather than a cell. The raster paths shade voxels of a
+// MOVING body, which has no stable world cell -- keyed on where it currently
+// is, a tumbling piece's breath would slide as it fell -- so they pass the same
+// per-voxel hash their ember flicker already uses, exactly as the grid sites
+// pass the cell hash that keys theirs.
+fn burnTintWeightH(hash : u32, time : f32) -> f32 {
+  let s = 0.5 + 0.5 * sin(time * TUNE_BURN_TINT_RATE + f32(hash & 0xFFu) * 0.02454);
   return mix(TUNE_BURN_TINT_MIN, TUNE_BURN_TINT_MAX, s);
+}
+
+fn burnTintWeight(cell : vec3<i32>, time : f32) -> f32 {
+  return burnTintWeightH(pcg(u32(cell.x * 7 + cell.y * 131 + cell.z * 2917)),
+                         time);
 }
 
 // The breath's mean, for a consumer with no clock: the irradiance deposit is
@@ -3155,33 +3288,9 @@ fn opennessScale(o : f32) -> f32 {
                 o >= 0.0);
 }
 
-// THE SHADOW LIFT CANNOT ENTER AN ENCLOSED SPACE. The penumbra law in
-// shadow_resolve.wgsl / sunShadowAt lifts a shadow toward TUNE_SHADOW_LIFT
-// (0.45 of full sun) by the DISTANCE to the blocker, on the argument that a
-// distant blocker only partially covers the solar disc. That argument holds
-// for a canopy or a fence; it says nothing about WHAT the blocker is, so a
-// cave floor whose ray hits the roof 10 m up got 45% direct sun through 10 m
-// of rock, and P1 then gathered that light onto the walls. Measured by eye
-// (2026-09-02): every cave chamber taller than shadowSoftFar glowed warm in
-// daylight, and the glow followed ceiling height.
-//
-// The disc's edge is only visible from a point that can see the sky, and the
-// openness byte is exactly that measurement. So the LIFTED part of the
-// shadow is scaled by openness while a fully lit face (v = 1, the ray hit
-// nothing) is untouched: a canyon floor in direct sun stays in full sun, a
-// meadow under a tree keeps its soft canopy shadow, a cave gets none.
-// Continuous across the blend between a lit and a lifted patch. `o < 0`
-// (no measurement) leaves the value alone, the pre-P0 look.
-//
-// Applied at every site that turns a shadow-ray distance into light: the
-// fragment shader's read (both the cache and its fallback), the resolve
-// pass's P1 deposit, and the openness walk's own sun sample. Not to the
-// PUBLISHED cache value, which stays the pure ray answer the shadow-cache
-// gate compares against the fragment-stage ray.
-fn shadowLiftCap(v : f32, o : f32) -> f32 {
-  if (o < 0.0) { return v; }
-  return v * mix(o, 1.0, smoothstep(min(TUNE_SHADOW_LIFT, 0.99), 1.0, v));
-}
+// shadowLiftCap MOVED UP, next to litColorS (2026-09-04): the raster body
+// path needs it and WGSL wants the definition first. Its documentation went
+// with it.
 
 // The raster paths' version. A BODY is not in the voxel grid, so the block it
 // stands in is air and has no measurement — reading it would report 255 ("open
@@ -3192,11 +3301,17 @@ fn shadowLiftCap(v : f32, o : f32) -> f32 {
 //
 // Six blocks (2.4 m) is the reach. Past that the body is airborne over a hole
 // and the old lerp is as good an answer as any.
-fn opennessScaleAtBody(worldPos : vec3f,
-                       occ : ptr<storage, array<u32>, read>,
-                       op : ptr<storage, array<u32>, read>,
-                       og : ptr<storage, array<u32>, read>) -> f32 {
-  if (TUNE_OPENNESS_STRENGTH <= 0.0) { return 1.0; }
+// Returns BOTH forms of the one probe: .x the ambient scale (opennessScale
+// applied), .y the RAW 0..1 byte or -1 for "no measurement". Two consumers need
+// different ones and the walk is six mask reads, so it is done once: the
+// ambient multiplier wants the floored/strength-scaled value, and
+// shadowLiftCap wants the raw one (a floor of 0.35 would let 35% of the solar
+// disc through a mountain — the exact leak that function exists to close).
+fn opennessAtBody(worldPos : vec3f,
+                  occ : ptr<storage, array<u32>, read>,
+                  op : ptr<storage, array<u32>, read>,
+                  og : ptr<storage, array<u32>, read>) -> vec2f {
+  if (TUNE_OPENNESS_STRENGTH <= 0.0) { return vec2f(1.0, -1.0); }
   var c = vec3<i32>(floor(worldPos));
   for (var i = 0u; i < 6u; i++) {
     let idx = chunkIndexW(c);
@@ -3204,11 +3319,21 @@ fn opennessScaleAtBody(worldPos : vec3f,
     let sbit = subOccBitLocal(lo);
     if (((*occ)[subOccIndex(idx, 1u, sbit >> 5u)] & (1u << (sbit & 31u))) != 0u) {
       let b = opennessByteAt(c, 3u, op, og);   // face 3 = +Y
-      return opennessScale(select(-1.0, f32(b) * (1.0 / OPEN_MAX), b >= 0));
+      let raw = select(-1.0, f32(b) * (1.0 / OPEN_MAX), b >= 0);
+      return vec2f(opennessScale(raw), raw);
     }
     c.y -= i32(SUBOCC_BLOCK);
   }
-  return 1.0;
+  return vec2f(1.0, -1.0);
+}
+
+// The scale alone, for the paths that cast no shadow ray and so have no use for
+// the raw byte (particles, sprites, fluid).
+fn opennessScaleAtBody(worldPos : vec3f,
+                       occ : ptr<storage, array<u32>, read>,
+                       op : ptr<storage, array<u32>, read>,
+                       og : ptr<storage, array<u32>, read>) -> f32 {
+  return opennessAtBody(worldPos, occ, op, og).x;
 }
 
 // ---- IRRADIANCE GRID (src/sim/world.h kIrradianceBytes, PLAN_gi.md §3) -----
@@ -4087,6 +4212,66 @@ fn voxWordInChunkAt(chunkSlot : u32, localIdx : u32) -> u32 {
     return synthWord(e);
   }
   return voxels[e * CHUNK_VOL + localIdx];
+}
+
+// ======================= THE SUN-SHADOW SOFTENING LAW =======================
+// Turns a shadow ray's OpaqueHit into a sun-visibility factor. Extracted from
+// raymarch.wgsl's sunShadowAt on 2026-09-04 so the raster body path could cast
+// the same shadow the terrain does without becoming a SECOND softening law —
+// two of them would put a corpse and the ground under it on different penumbra
+// curves, which is worse than the missing shadow this was written to fix.
+//
+// A shadowed point keeps NO direct sun — the hemisphere ambient term is what
+// fills it in, and that is already occluded. Letting direct sun leak into
+// shadow instead washes the whole scene out and erases the cast shadow under
+// overhangs. The softening is in the EDGE, not in the depth: a distant blocker
+// only partially covers the solar disc, so its shadow lifts toward
+// TUNE_SHADOW_LIFT (~0.45 of full sun), while a contact shadow stays at 0.
+//
+// Out of steps underground is a far blocker, not daylight — the same rule as
+// shadow_resolve.wgsl, where the reason is written.
+fn shadowFromOpaqueHit(hit : bool, t : f32, steps : u32) -> f32 {
+  if (!hit) {
+    return select(1.0, TUNE_SHADOW_LIFT, steps > u32(TUNE_SHADOW_STEPS));
+  }
+  let dM = t * VOXEL_METERS;
+  return clamp(smoothstep(TUNE_SHADOW_SOFT_NEAR, TUNE_SHADOW_SOFT_FAR, dM) *
+               TUNE_SHADOW_LIFT, 0.0, 1.0);
+}
+
+// ---- THE RASTER BODY PATH'S SHADOW RAY -------------------------------------
+// A rigidbody is not in the voxel grid, so nothing in the world casts onto it
+// unless it asks: before this, debris.wgsl and microbody.wgsl had no shadow
+// term at ALL and a body in shade received 100% of the key light (3.2x too
+// bright in an ordinary cast shadow, 10.4x indoors).
+//
+// traceOpaque, not trace(): identical answer for a media-blind ray and none of
+// trace()'s 26-field register footprint, which a fragment shader pays on every
+// pixel whether or not the branch runs. Same reasoning, same call, as
+// sunShadowAt's near-field arm.
+//
+// NO FAR CASCADE ARM. sunShadowAt falls back to farShadowed() past
+// TUNE_SHADOW_MAX_DIST, which reads farVox/farOcc — buffers the body pipelines
+// do not bind. At the shipped 999 m that branch is dead for terrain and a body
+// that far away is under a pixel, so the honest answer here is "unshadowed"
+// rather than a second cascade binding for geometry too small to see it.
+//
+// THE BODY ITSELF IS NOT A BLOCKER, by construction rather than by epsilon:
+// bodies live outside the grid the ray marches, so a cube cannot self-shadow
+// and a rubble pile casts nothing onto itself. That is a real limitation (no
+// contact shadow under a pile) and it is why the bias below stays at the
+// terrain's TUNE_SHADOW_BIAS instead of being widened to escape geometry that
+// is not there to escape.
+fn bodySunShadow(worldPos : vec3f, n : vec3f, R : RenderParams,
+                 occ : ptr<storage, array<u32>, read>,
+                 mats : ptr<storage, array<Material>, read>) -> f32 {
+  if ((R.flags & 1u) == 0u) { return 1.0; }
+  if (length(worldPos - R.camPos) * VOXEL_METERS > TUNE_SHADOW_MAX_DIST) {
+    return 1.0;
+  }
+  let s = traceOpaque(worldPos + n * TUNE_SHADOW_BIAS, keyLightDirP(R),
+                      TUNE_SHADOW_STEPS, shadowCoarseFromT(), occ, mats);
+  return shadowFromOpaqueHit(s.hit, s.t, s.steps);
 }
 
 // >>>PAGE_TABLE_END<<<

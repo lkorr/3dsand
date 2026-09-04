@@ -13,9 +13,18 @@
 // centre (eight reads per cube; the raster stage is nowhere near the frame's
 // cost). Without it a burning ember or a thrown grenade glowed at full sky
 // ambient in the middle of a cave.
+// The world grid and its page table, read ONLY by fsBody's sun-shadow ray
+// (bodySunShadow, common.wgsl). Both are Fragment-only in renderBGL_, which is
+// precisely why the body path had to stop shading in its vertex shader — see
+// the note on vsBody. Declaring `voxels` is also what keeps common.wgsl's
+// page-table block (traceOpaque, voxWordAt) in this shader at all:
+// BodyAddressesVoxels in src/gpu/resources.cpp reads the declaration rather
+// than consulting a list, so there is nothing else to update.
+@group(0) @binding(0) var<storage, read> voxels    : array<u32>;
 @group(0) @binding(1) var<storage, read> occupancy : array<u32>;
 @group(0) @binding(2) var<storage, read> materials : array<Material>;
 @group(0) @binding(3) var<uniform> R : RenderParams;
+@group(0) @binding(9) var<storage, read> pageTable : array<u32>;
 @group(0) @binding(17) var<storage, read> openness    : array<u32>;
 @group(0) @binding(18) var<storage, read> opennessGen : array<u32>;
 
@@ -46,6 +55,42 @@ struct BodyXform {
 struct VSOut {
   @builtin(position) pos : vec4f,
   @location(0) color : vec3f,
+};
+
+// The BODY path's interstage block, and the reason it is a second struct rather
+// than a widened VSOut (2026-09-04).
+//
+// A rigidbody had NO SHADOW TERM: it received 100% of the key light wherever it
+// stood, which measured 3.2x too bright in an ordinary cast shadow and 10.4x
+// indoors — "fine in full sun, washed out everywhere else". Fixing that needs a
+// ray against `voxels`, and `voxels`/`pageTable` are FRAGMENT-ONLY in
+// renderBGL_ (src/sim/simulation.cpp), so a vertex shader cannot reach the
+// world at all. Widening their visibility to Vertex would be the wrong trade:
+// it would hand the world grid to every particle and sprite vertex too, for one
+// consumer.
+//
+// So the body path alone ships its surface across the interstage boundary and
+// lights it in fsBody. vsParticle / vsFluid / vsSprite deliberately STAY on
+// per-vertex litColorO with no shadow: they draw sub-voxel cubes (foam is 1/6
+// of a cell, and there can be ~260k of them), a per-fragment shadow march on
+// that population would cost more than the whole raster stage, and a droplet is
+// too small for a missing shadow to read. That inconsistency is a decision, not
+// an oversight.
+//
+// FLAT on everything the cube is constant over — the face normal, the material
+// albedo, the emissive level and the openness probe are all per-instance or
+// per-face, so interpolating them would only add error. `world` is the one
+// genuinely per-pixel value: it is the shadow ray's origin, and interpolating
+// it is what makes the shadow edge land inside a face instead of snapping to
+// its corners.
+struct BodyVSOut {
+  @builtin(position) pos : vec4f,
+  @location(0) @interpolate(flat) albedo : vec3f,
+  @location(1) @interpolate(flat) wn : vec3f,
+  @location(2) world : vec3f,
+  // (emissive, openness ambient scale, raw openness) — packed into one slot
+  // because all three are flat and a vec3f costs the same as a lone f32.
+  @location(3) @interpolate(flat) misc : vec3f,
 };
 
 // vi in 0..35: face = vi/6 (+x,-x,+y,-y,+z,-z), two triangles per face.
@@ -128,14 +173,20 @@ fn vsParticle(@builtin(vertex_index) vi : u32,
 
   var out : VSOut;
   out.pos = projectView(world - R.camPos, R);
-  out.color = litColorO(albedo, n, world, f32(m.emission) / 255.0, R,
+  // A burning leaf thrown loose is still a burning leaf: the same breath
+  // between the leaf palette and the flame colour the grid gives it (burnTint,
+  // common.wgsl), keyed on the instance so it does not slide as the particle
+  // flies. A no-op for every material without MATF_BURNTINT.
+  let bt = burnTint(m, albedo, f32(m.emission) / 255.0,
+                    burnTintWeightH(pcg(inst * 2917u), R.time));
+  out.color = litColorO(bt.albedo, n, world, bt.emis, R,
                         opennessScaleAtBody(world, &occupancy, &openness, &opennessGen));
   return out;
 }
 
 @vertex
 fn vsBody(@builtin(vertex_index) vi : u32,
-          @builtin(instance_index) inst : u32) -> VSOut {
+          @builtin(instance_index) inst : u32) -> BodyVSOut {
   let b = bodyInst[inst];
   let xf = bodyXf[b.packed >> 16u];
 
@@ -158,15 +209,44 @@ fn vsBody(@builtin(vertex_index) vi : u32,
     albedo = paletteColor(m, (b.packed >> 12u) & 0xFu, &materials);
   }
 
-  var out : VSOut;
+  var out : BodyVSOut;
   out.pos = projectView(world - R.camPos, R);
   // emissive body voxels (embers on burning debris) flicker like their grid
   // counterparts in raymarch.wgsl — same rate, per-voxel phase
   let fh = pcg(inst * 2917u + (b.packed >> 16u) * 131u);
-  let emis = emberFlicker(f32(m.emission) / 255.0, fh, R.time);
-  out.color = litColorO(albedo, wn, world, emis, R,
-                        opennessScaleAtBody(world, &occupancy, &openness, &opennessGen));
+  // ...and a burn-tinted one breathes toward the flame colour first, on the
+  // same phase key. THE CROWN THAT FALLS OFF A BURNING TREE COMES THROUGH
+  // HERE, not through the grid path, so leaving this out showed exactly the
+  // green glow burnTint exists to prevent.
+  let bt = burnTint(m, albedo, f32(m.emission) / 255.0,
+                    burnTintWeightH(fh, R.time));
+  out.albedo = bt.albedo;
+  out.wn = wn;
+  out.world = world;
+  // The openness probe stays PER VERTEX — and now per CUBE CENTRE rather than
+  // per corner. It is a 40 cm-block ambient multiplier, so it has nothing to
+  // say at corner resolution, and taking it at the centre stops a corner that
+  // pokes into the neighbouring block from swinging a whole face's ambient.
+  // Six mask reads once per cube instead of six per vertex: cheaper than what
+  // it replaced, while the term that genuinely needs per-pixel resolution (the
+  // shadow) moved to the fragment stage.
+  let center = xf.pos + quatRotate(xf.quat, vec3f(b.lx, b.ly, b.lz) + vec3f(0.5));
+  let open = opennessAtBody(center, &occupancy, &openness, &opennessGen);
+  out.misc = vec3f(emberFlicker(bt.emis, fh, R.time), open.x, open.y);
   return out;
+}
+
+// The body path's fragment stage. Everything here is what a vertex shader
+// could not do: cast a shadow ray against `voxels` (Fragment-only in
+// renderBGL_) from a per-pixel world position.
+@fragment
+fn fsBody(in : BodyVSOut) -> @location(0) vec4f {
+  let sh = bodySunShadow(in.world, in.wn, R, &occupancy, &materials);
+  let col = litColorS(in.albedo, in.wn, in.world, in.misc.x, R,
+                      in.misc.y, in.misc.z, sh);
+  // Same tonemap as fs() and as the terrain: a cube must match the ground it
+  // lands on at any time of day.
+  return vec4f(tonemapHdr(col), 1.0);
 }
 
 // MLS-MPM fluid prototype (docs/PLAN_mpm_fluids.md; sim_fluid.wgsl). One cube

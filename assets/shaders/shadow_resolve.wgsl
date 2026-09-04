@@ -200,11 +200,18 @@ fn resolve(@builtin(global_invocation_id) gid : vec3<u32>) {
   if (TUNE_GI_STRENGTH > 0.0 && !buried) {
     let pw = voxWordAt(cell);
     let pm = materials[voxMat(pw)];
-    let albedo = paletteColor(pm, voxState(pw), &materials);
+    // Burning foliage deposits the MEAN of its breath, which is what
+    // sim_openness.wgsl's walk deposits into the SAME word -- the two writers
+    // of one value have to agree, and this pass is the loud one (every frame,
+    // against once per sweep). Depositing the raw palette instead put a
+    // burning crown's leaf-green into the grid at full emission and lit
+    // everything under the tree green (owner report 2026-09-03).
+    let bt = burnTint(pm, paletteColor(pm, voxState(pw), &materials),
+                      f32(pm.emission) / 255.0, burnTintMean());
     let ob = opennessByteAt(cell, face, &openness, &opennessGen);
     let lit = shadowLiftCap(v, select(-1.0, f32(ob) * (1.0 / OPEN_MAX), ob >= 0));
-    let sample = irrSample(albedo, n3, keyLightDirP(R), keyLightColorP(R), lit,
-                           f32(pm.emission) / 255.0);
+    let sample = irrSample(bt.albedo, n3, keyLightDirP(R), keyLightColorP(R),
+                           lit, bt.emis);
     let stampOk = opennessGen[chunkIndexW(cell)] == opennessStamp(worldChunkOf(cell));
     irrDeposit(irrIndexOfCell(cell, face), sample, GI_RESOLVE_ALPHA, stampOk,
                &irradiance);
