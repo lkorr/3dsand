@@ -431,6 +431,7 @@ add_library(sandvox_core OBJECT
   # The current field: sinks, vortices, sources and streams summed
   # analytically, the wind field applied to water (plan component 8).
   src/sim/currentprim.cpp
+  src/sim/trample.cpp
   src/sim/voxload.cpp
   # The baked tree atlas: assets/trees/*.svtree -> one storage buffer that
   # worldgen samples instead of evaluating implicit tree shapes per cell.

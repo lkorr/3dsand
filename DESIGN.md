@@ -4525,6 +4525,73 @@ Worldgen does not place these yet (Wave 1a deliberately does not touch it); the
 `--shot` harness paints a demo meadow, and they are brush-selectable like any
 other material.
 
+### Analytic plants and the trample field (2026-09-04)
+
+The brick path above gave every plant ONE 10 cm cell of 8³ voxels and a
+two-frame flipbook, and a meadow of it read as scattered prefab clutter that
+twitched. The tall grass had already left that path (`MICROF_STRANDS`, 2026-08-22:
+analytic blades, ray-shear sway); this generalises it. `MICROF_PLANT` replaces
+`MICROF_STRANDS`, a material's `micro.plant` block replaces `micro.strands`, and
+`tracePlant` (raymarch.wgsl) intersects four kinds of plant in closed form:
+
+| kind | primitives | column / tile |
+|---|---|---|
+| `grass` | tapered flat blades (six half-planes linear in t), seed-head ellipsoids | column |
+| `flower` | a stem blade, leaf boxes, a head: disc with petal notches / bells / spike of buds / cup | column |
+| `mushroom` | cone-frustum stem, clipped ellipsoid cap (flat gill underside), hashed spots | column (clusters) or tile (one big toadstool) |
+| `fern` | a rosette of quadratic-Bézier rachises, each three oriented boxes perforated per leaflet | tile |
+
+**Column vs tile.** A column plant lives in one column and every cell of the
+column rebuilds it from `microColumnHash` — the contract the strands had. A
+TILE plant is wider than a cell, so worldgen paints its whole footprint (`foot`²
+columns, `base+1..base+h` cells) with one material and the renderer rebuilds the
+same plant from the tile hash in every one of those cells. `plantTileAt` in
+`common.wgsl` is the ONE function both sides ask "which plant, where": tile size,
+footprint, height range and a hashed centre strictly inside the tile (so two
+tiles' footprints never overlap). Worldgen's `plantColumnAt` evaluates it once
+per column and `Col.plant` carries the answer to every cell; the base is the
+CENTRE column's ground so the plant is rigid across a slope. The species
+constants (`PLANT_FERN_*`, `PLANT_SHROOM_*`) live in `common.wgsl`, are
+transcribed to `sim/plants.h` for the `--shot` harness, and restated per
+species in `materials.json` for the loader — `check_invariants.py plants` holds
+the three equal.
+
+**One evaluation per tile per ray.** `trace()` memoises the last tile plant it
+intersected (`pKey`/`pHit`/`pT`): the first cell of a tile evaluates the plant
+UNCLIPPED and every later cell of that tile only asks whether the remembered hit
+lies inside it. A hit that falls in a cell worldgen never painted — dug out, cut
+by a trunk — is never reported, which is exactly the clipping a partial plant
+must have. Only evaluations charge `microBudget`; carried cells are free. Past
+`TUNE_MICRO_LOD_DIST` only the centre column of a tile plant stands in as the
+solid proxy; the outer eight pass as air, or a distant fern is a 30 cm cube.
+
+**What the flipbook could not do and this does:** continuous displacement in
+time (the wind is sampled once per plant at its base, every part blends the two
+gust bands with its own hash weights), taper, per-blade yaw and static lean,
+seed heads on a third of the tall blades, real flower heads, mushrooms of
+varying size in a cell and one knee-high toadstool per 7×7 tile, world-space
+normals (`MicroHit.n`, `curved`) so a cap shades as a curved surface, and a
+per-PART palette key (`MicroHit.key`) so a cap spanning nine cells is one colour.
+
+**The trample field.** A bounded ring of footprint stamps (`sim/trample.h`,
+`kTrampleCap` = 48) rides `RenderParams` exactly the way the wave-impact ring
+does: the frame loop presses one under the player and every mob each frame
+(refreshing the stamp it stands in, laying a new one every ~half radius), and
+`trampleAt` in `common.wgsl` sums them at a plant's base — flat under the foot,
+soft rim, held while pressed, recovering as `(1-r)²` over `render.trampleRecover`.
+Plants compress by `render.trampleDepth` and lean away by `render.trampleLean`.
+Render-only and never hashed, by pointer like the wind primitives (it dynamically
+indexes a uniform array in the per-cell plant path). The honest limit, stated
+so nobody re-derives it: a column plant cannot leave its column, so a trampled
+stand is a crushed mat that leans, not blades lying flat across their
+neighbours; lying flat needs the directional over-march of upstream columns,
+affordable only inside the stamp and not built.
+
+**Determinism (rule 1) is untouched**: all of this is render-side, keyed on
+`(seed, cell)` hashes and `R.time`; worldgen's half is integer hashes on the sim
+input stream, and moving the placement moved the pinned hash once, as any
+worldgen change does.
+
 ### Dynamic microvoxel bodies (2026-08-20; docs/PLAN_voxel_editor.md §C)
 
 Static micro-detail above substitutes a brick for a *grid cell*. Creatures and

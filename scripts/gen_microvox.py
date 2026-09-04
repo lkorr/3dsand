@@ -775,18 +775,15 @@ def main():
     for name, frames in [
         # two frames each for the swaying ones; the lean flips sign so the sway
         # is symmetric about upright rather than a one-sided lurch
-        ("grass_tuft", [grass_tuft(1), grass_tuft(-1)]),
+        # grass_tuft, flower_poppy, flower_daisy, flower_bluebell,
+        # flower_foxglove, flower_buttercup and dry_tussock are NO LONGER
+        # BRICKS (2026-09-04): they are analytic `plant` blocks in
+        # materials.json (tracePlant in raymarch.wgsl) — continuous wind
+        # motion, tapered blades, real flower heads, trample response. Their
+        # generator functions above are kept as reference art only.
         ("foliage", [foliage()]),
-        ("flower_poppy", [flower_poppy(0), flower_poppy(1)]),
-        ("flower_daisy", [flower_daisy()]),
         # ---- meadow flowers ----
-        # The four stalked species sway; clover is a flat mat with nothing to
-        # move. Every one of these is stacked 1-5 cells deep by worldgen, so the
-        # flipbook is paid once per MODEL and not once per cell of the stalk —
-        # the same economics the vine strands below rely on.
-        ("flower_bluebell", [flower_bluebell(0), flower_bluebell(1)]),
-        ("flower_foxglove", [flower_foxglove(0), flower_foxglove(1)]),
-        ("flower_buttercup", [flower_buttercup(0), flower_buttercup(1)]),
+        # Clover is a flat mat with nothing to move; the wild rose is a briar.
         ("flower_clover", [flower_clover()]),
         ("flower_wildrose", [flower_wildrose(0), flower_wildrose(1)]),
         # ---- vines / climbers / hanging moss ----
@@ -806,7 +803,6 @@ def main():
         # to being unable to move — so a flipbook on any of the three would be
         # brick-pool cost spent on motion that would be wrong if it appeared.
         ("desert_scrub", [desert_scrub()]),
-        ("dry_tussock", [dry_tussock(1), dry_tussock(-1)]),
         ("heath_shrub", [heath_shrub()]),
         ("alpine_cushion", [alpine_cushion()]),
     ]:

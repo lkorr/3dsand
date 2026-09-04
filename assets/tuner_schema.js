@@ -645,6 +645,10 @@ const TUNING_SCHEMA = [
       {k:'microMaxPerRay', n:'micro bricks per ray', d:'Cap on nested micro marches for one camera ray. Beyond the cap a micro cell reads as solid, not air — grazing rays across grass stay bounded.', min:0, max:32, step:1, int:true},
       {k:'microSwayAmp', n:'wind sway amplitude', d:'Lateral bend at a swaying plant\'s tip, in sub-voxels (1.25 cm each at subdiv 8). Hard-capped at 2: the models keep a 2-sub-voxel wall margin, and past it blade tips shear out of their cell and vanish. 0 turns the wind off.', min:0, max:2, step:0.05},
       {k:'microSwaySpeed', n:'wind sway speed (foliage trim)', d:'A FOLIAGE-LOCAL multiplier on the wind clock. It used to be the sway band rate outright; since the wind rewrite the field itself owns that — see gust rate on the Wind tab — and this is a trim the two sway sites apply on top of the time they hand it. Default is 1.0 for a reason: at anything else, grass is sampling the field at a different phase than the debug arrow overlay is drawing, so the overlay stops being evidence about the grass. Move the Wind tab’s gust rate instead unless you specifically want foliage running off the shared clock.', min:0, max:6, step:0.05, u:'x'},
+      {k:'trampleRecover', n:'trample recover (s)', d:'Seconds a plant flattened by a foot takes to stand back up after the presser leaves. The press-in is fixed at ~0.12 s.', min:0.05, max:6, step:0.05},
+      {k:'trampleDepth', n:'trample depth', d:'How far a fully trampled plant compresses: 0.8 leaves a fifth of its height under the foot. Grass, flowers and ferns; mushrooms ignore it.', min:0, max:0.95, step:0.05},
+      {k:'trampleLean', n:'trample lean (cells)', d:'Lateral lean of a trampled plant\'s tip, in cells, away from the presser. The renderer clamps it inside the plant\'s own column, so it saturates past ~0.4.', min:0, max:1, step:0.05},
+      {k:'trampleRadius', n:'trample radius (x half-width)', d:'A presser\'s stamp radius as a multiple of its collision half-width. 1 is the capsule itself; 1.5 lets the grass bend a little past the foot.', min:0, max:4, step:0.1},
     ],
   },
 

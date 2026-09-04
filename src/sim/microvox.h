@@ -80,16 +80,25 @@ constexpr uint32_t kMicroJitter = 2;       // hash-keyed sub-cell XZ offset
 // per-cell yaw would give each cell of one blade a different quarter-turn and
 // shred the plant at every cell boundary.
 constexpr uint32_t kMicroSway = 4;         // per-column wind bend (render-only)
-// ANALYTIC STRAND PLANTS: the material has no .vox at all. Its cells render a
-// small set of parametric blades — each an independent entity with its own
-// root, height and wind phase, bent by a quadratic cantilever curve and
-// ray-tested in closed form (sheared-slab, traceStrands in raymarch.wgsl).
-// This is the path for anything that must move SMOOTHLY and per-strand
-// (tall grass, and any future reeds/kelp/wheat): brick sway moves a whole
-// cell's content as one rigid piece, strands wiggle individually. Authored as
-// a `strands` block in the micro JSON (see LoadMicroVox); pool layout there.
-// Implies kMicroSway (the stack probes key on it).
-constexpr uint32_t kMicroStrands = 8;      // parametric blades, no brick
+// ANALYTIC PLANTS: the material has no .vox at all. Its cells render a plant
+// reconstructed from hashes and a small parameter block — tapered blades,
+// stems with flower heads, cone stems under ellipsoid caps, leafleted fronds —
+// each primitive ray-tested in closed form (tracePlant in raymarch.wgsl), bent
+// smoothly by the shared wind field and flattened by the trample ring. This
+// is the path for anything that must move SMOOTHLY and per-part: brick sway
+// moves a whole cell's content as one rigid piece on a 1.25 cm lattice and a
+// flipbook steps between two poses; a plant here is continuous in time and
+// in space. Authored as a `plant` block in the micro JSON (see LoadMicroVox);
+// pool layout there. Implies kMicroSway (the stack probes key on it).
+constexpr uint32_t kMicroPlant = 8;        // parametric plant, no brick
+
+// Plant kinds — must match PK_* in raymarch.wgsl.
+constexpr uint32_t kPlantGrass = 1;
+constexpr uint32_t kPlantFlower = 2;
+constexpr uint32_t kPlantMushroom = 3;
+constexpr uint32_t kPlantFern = 4;
+constexpr uint32_t kPlantParamSlots = 16;   // f32 words after the 3-word header
+constexpr uint32_t kPlantPoolWords = 3 + kPlantParamSlots;
 
 // Hard ceiling on the pool, in u32 words. Defined in world.h (as
 // kMicroPoolWordsWorld) because the WGSL prelude is generated from that file

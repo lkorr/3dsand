@@ -52,6 +52,7 @@ passes the edited file so only the relevant checks run.
 
 Exit 0 = agree. Exit 1 = a real mismatch.
 """
+import json
 import re
 import subprocess
 import sys
@@ -1221,6 +1222,63 @@ def check_biome_order():
             problems.append(f"biome order: assets/biomes/{name}.json has index {j.get('index')}, worldgen's id is {i}")
 
 # ------------------------------------------------------- far cell material bits
+def check_plant_tiles():
+    """Tile-plant geometry must agree in THREE places.
+
+    plantTileAt() in common.wgsl is what worldgen paints a footprint from and
+    what the raymarcher rebuilds the plant from; sim/plants.h is its CPU twin
+    (the --shot harness and the `plants` gate place plants with it); and each
+    species' `plant` block in materials.json restates tile/foot/minH/maxH for
+    the loader. A fern whose footprint is 3 wide in worldgen and 5 wide in the
+    renderer draws fronds into cells that were never painted -- they vanish
+    silently, with a green build and an unmoved hash. Also holds the trample
+    ring literal in common.wgsl to kTrampleCap.
+    """
+    cw = read("assets/shaders/common.wgsl")
+    ph = read("src/sim/plants.h")
+    wh = read("src/sim/world.h")
+    mj = read("assets/materials/materials.json")
+    if not (cw and ph and wh and mj):
+        return
+    checked.append("plant tiles")
+    species = {"FERN": ("Fern", "fern"), "SHROOM": ("Shroom", "mushroom_large")}
+    try:
+        mats = {m["id"]: m for m in json.loads(mj)["materials"]}
+    except Exception as e:  # noqa: BLE001
+        problems.append(f"materials.json: {e}")
+        return
+    for key, (cpp, mat_id) in species.items():
+        vals = {}
+        for field in ("TILE", "FOOT", "MINH", "MAXH"):
+            g = re.search(rf"const\s+PLANT_{key}_{field}\s*:\s*i32\s*=\s*(\d+);", cw)
+            c = re.search(rf"kPlant{cpp}{field.title().replace('h', 'H')}\s*=\s*(\d+)", ph)
+            if not g or not c:
+                problems.append(f"plant tiles: cannot find PLANT_{key}_{field} / kPlant{cpp}{field.title()}")
+                continue
+            if g.group(1) != c.group(1):
+                problems.append(
+                    f"common.wgsl PLANT_{key}_{field} = {g.group(1)} but plants.h "
+                    f"kPlant{cpp}{field.title()} = {c.group(1)}")
+            vals[field] = int(g.group(1))
+        gs = re.search(rf"const\s+PLANT_{key}_SALT\s*:\s*u32\s*=\s*(0x[0-9A-Fa-f]+)u;", cw)
+        cs = re.search(rf"kPlant{cpp}Salt\s*=\s*(0x[0-9A-Fa-f]+)u", ph)
+        if gs and cs and gs.group(1).lower() != cs.group(1).lower():
+            problems.append(f"PLANT_{key}_SALT differs between common.wgsl and plants.h")
+        m = mats.get(mat_id, {})
+        pl = (m.get("micro") or {}).get("plant") or {}
+        for field, jkey in (("TILE", "tile"), ("FOOT", "foot"), ("MINH", "minH"), ("MAXH", "maxH")):
+            if field in vals and pl.get(jkey) != vals[field]:
+                problems.append(
+                    f"materials.json {mat_id}.micro.plant.{jkey} = {pl.get(jkey)} but "
+                    f"common.wgsl PLANT_{key}_{field} = {vals[field]}")
+    cap = re.search(r"constexpr\s+uint32_t\s+kTrampleCap\s*=\s*(\d+)", wh)
+    arr = re.search(r"tramples\s*:\s*array<vec4f,\s*(\d+)>", cw)
+    if cap and arr and int(cap.group(1)) * 2 != int(arr.group(1)):
+        problems.append(
+            f"world.h kTrampleCap = {cap.group(1)} (x2 vec4) but common.wgsl "
+            f"RenderParams.tramples is array<vec4f, {arr.group(1)}>")
+
+
 def check_far_material_bits():
     """A far cascade cell is 7 bits of material id + 1 blocker flag (13.2.2).
 
@@ -1299,6 +1357,7 @@ ALL = {
     "curprim": check_current_prims,
     "counts": check_tick_counts,
     "farbits": check_far_material_bits,
+    "plants": check_plant_tiles,
 }
 
 # The hook passes the edited file; run only the checks that file can break.
@@ -1313,7 +1372,8 @@ RELEVANT = {
     "assets/perfview.js": ["perfscopes"],
     "src/measure/perfnodes.h": ["perfnodes", "perfscopes"],
     "src/sim/materials.cpp": ["render", "farbits"],
-    "assets/materials/materials.json": ["farbits"],
+    "assets/materials/materials.json": ["farbits", "plants"],
+    "src/sim/plants.h": ["plants"],
     "src/gpu/resources.cpp": ["world"],
     "src/test/selftest.cpp": ["arch"],
     "src/sim/world.h": ["world", "params", "substeps", "windprim",
@@ -1342,7 +1402,7 @@ if __name__ == "__main__":
                     run += checks
             if norm.endswith(".wgsl"):
                 run += ["tuning", "world", "params", "windprim",
-                        "curprim"]
+                        "curprim", "plants"]
         run = list(dict.fromkeys(run))
         if not run:
             sys.exit(0)  # edited file cannot break any pair

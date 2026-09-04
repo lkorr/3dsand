@@ -28,6 +28,26 @@ struct MicroSpec {
 constexpr uint32_t kDefaultFrameTicks = 10;
 constexpr uint32_t kMaxFrames = 255;  // frameInfo packs the count in 8 bits
 
+// Named f32 parameter slots per plant kind, in POOL ORDER: slot k of kind K is
+// microPool[base + 3 + k] and tracePlant reads it as plantP(d, k). Adding a
+// param means appending a name here AND reading the same slot in the shader;
+// never reorder. Null-terminated at the first unused slot.
+constexpr const char* kPlantParamNames[4][kPlantParamSlots + 1] = {
+    // grass: a column of tapered flat blades
+    {"halfWidth", "thickness", "taper", "tipFrac", "heightVary", "swayScale",
+     "headChance", "rootSpread", "lean", "headLen", nullptr},
+    // flower: one stem, a few leaves, a head in one of four styles
+    {"stemHalfW", "headR", "headH", "leafCount", "leafLen", "leafW", "swayScale",
+     "heightVary", "headDrop", "headCount", "centreR", "petalGap", "petalCount",
+     nullptr},
+    // mushroom: cone stem under an ellipsoid cap, gills below, spots on top
+    {"capRMin", "capRMax", "capH", "stemR", "stemH", "spotChance", "swayScale",
+     "gillDepth", "heightVary", "capFlat", nullptr},
+    // fern: a rosette of arching, leafleted fronds
+    {"frondCount", "frondLen", "rise", "droop", "leafletW", "leafletFreq",
+     "swayScale", "rachisW", "spreadJitter", "tiltJitter", nullptr},
+};
+
 }  // namespace
 
 bool LoadMicroVox(const std::string& materialsPath, const std::string& assetDir,
@@ -75,90 +95,110 @@ bool LoadMicroVox(const std::string& materialsPath, const std::string& assetDir,
       continue;
     }
 
-    // ---- analytic strand plants: a `strands` block instead of a model ------
-    // The cells of this material render N parametric blades, each a separate
-    // entity the shader bends smoothly (traceStrands in raymarch.wgsl) — the
-    // reusable path for per-strand motion. No .vox is involved; the pool holds
-    // the parameters:
-    //   w0            count (0..7) | bodyMat (8..15) | tipMat (16..23)
-    //   w1..w4        f32 bits: halfWidth (cell units), tipFrac (fraction of a
-    //                 strand's own height painted tipMat), swayScale, heightVary
-    //   w5..w5+2N-1   f32 bits: N (x, z) root positions in cell units
+    // ---- analytic plants: a `plant` block instead of a model ---------------
+    // The cells of this material render a parametric plant (tracePlant in
+    // raymarch.wgsl) — no .vox is involved; the pool holds a PlantDef:
+    //   w0   kind (0..7) | bodyMat (8..15) | tipMat (16..23) | accentMat (24..31)
+    //   w1   accent2Mat (0..7) | stemMat (8..15) | tile (16..23) | foot (24..31)
+    //   w2   minH (0..7) | maxH (8..15) | count (16..23) | style (24..31)
+    //   w3.. kPlantParamSlots f32 words, named per kind in kPlantParamNames
+    //
+    // `tile` 0 is a COLUMN plant (grass, a flower: one column, every cell of
+    // it rebuilds the same plant from the column hash). A nonzero tile is a
+    // TILE plant (fern, big toadstool): worldgen paints a foot x foot footprint
+    // and the renderer reconstructs one plant per tile from plantTileAt in
+    // common.wgsl — the tile/foot here must match that species' PLANT_*
+    // constants, which check_invariants.py verifies.
     //
     // AUTHORING RULES, both load-bearing:
     //   * A stacked pair (tall_grass / tall_grass_head) must declare IDENTICAL
-    //     strands blocks apart from body/tip — every cell of a column derives
-    //     the same strand set independently, so differing params would tear
-    //     the plant at the material boundary.
-    //   * Roots + max bend + halfWidth must stay inside the cell: the shader
-    //     clamps the bend rather than let a blade cross into a neighbour cell
-    //     the world DDA never traces.
-    if (mi.contains("strands")) {
-      const json& st = mi["strands"];
-      if (!st.is_object() || !st.contains("roots") || !st["roots"].is_array()) {
-        log += materialsPath + ": material \"" + id +
-               "\": micro.strands needs a `roots` array of [x, z] pairs\n";
+    //     plant blocks apart from body/tip — every cell of a column derives
+    //     the same plant independently, so differing params would tear it at
+    //     the material boundary.
+    //   * Column plants must stay inside their column: the shader clamps the
+    //     wind/trample bend rather than let a blade cross into a neighbour cell
+    //     the world DDA never traces. Tile plants must stay inside their
+    //     footprint for the same reason.
+    if (mi.contains("plant")) {
+      const json& pl = mi["plant"];
+      if (!pl.is_object()) {
+        log += materialsPath + ": material \"" + id + "\": micro.plant must be an object\n";
         continue;
       }
-      std::vector<std::pair<float, float>> roots;
-      bool badS = false;
-      for (const auto& r : st["roots"]) {
-        if (!r.is_array() || r.size() != 2) { badS = true; break; }
-        float x = r[0].get<float>(), z = r[1].get<float>();
-        if (x < 0.03f || x > 0.97f || z < 0.03f || z > 0.97f) {
-          log += materialsPath + ": material \"" + id +
-                 "\": strand root outside 0.03..0.97 (would clip the cell)\n";
-          badS = true;
-          break;
-        }
-        roots.push_back({x, z});
-      }
-      if (badS || roots.empty() || roots.size() > 16) {
+      const std::string kindName = pl.value("kind", "");
+      uint32_t kind = 0;
+      const char* const* names = nullptr;
+      if (kindName == "grass") { kind = kPlantGrass; names = kPlantParamNames[0]; }
+      else if (kindName == "flower") { kind = kPlantFlower; names = kPlantParamNames[1]; }
+      else if (kindName == "mushroom") { kind = kPlantMushroom; names = kPlantParamNames[2]; }
+      else if (kindName == "fern") { kind = kPlantFern; names = kPlantParamNames[3]; }
+      else {
         log += materialsPath + ": material \"" + id +
-               "\": micro.strands.roots must be 1..16 [x, z] pairs\n";
+               "\": micro.plant.kind must be grass|flower|mushroom|fern (got \"" +
+               kindName + "\")\n";
         continue;
       }
-      const float halfW = std::clamp(st.value("halfWidth", 0.06f), 0.01f, 0.2f);
-      const float tipFrac = std::clamp(st.value("tipFrac", 0.0f), 0.0f, 1.0f);
-      const float heightVary = std::clamp(st.value("heightVary", 0.0f), 0.0f, 0.9f);
-      const float swayScale = std::clamp(st.value("swayScale", 1.0f), 0.0f, 4.0f);
       // Palette materials by NAME (the glyphs.json precedent): body defaults
-      // to the material itself, tip to the body.
+      // to the material itself, everything else to the body.
       auto resolve = [&](const std::string& name, int fallback) -> int {
         if (name.empty()) return fallback;
         for (size_t i = 0; i < mats.size(); i++)
           if (mats[i].name == name) return (int)i;
-        log += materialsPath + ": material \"" + id + "\": strands names unknown material \"" +
+        log += materialsPath + ": material \"" + id + "\": plant names unknown material \"" +
                name + "\"\n";
         return fallback;
       };
-      const int body = resolve(st.value("body", ""), matId);
-      const int tip = resolve(st.value("tip", ""), body);
-      if (body > 255 || tip > 255) {
+      const int body = resolve(pl.value("body", ""), matId);
+      const int tip = resolve(pl.value("tip", ""), body);
+      const int accent = resolve(pl.value("accent", ""), tip);
+      const int accent2 = resolve(pl.value("accent2", ""), accent);
+      const int stem = resolve(pl.value("stem", ""), body);
+      if (body > 255 || tip > 255 || accent > 255 || accent2 > 255 || stem > 255) {
         log += materialsPath + ": material \"" + id +
-               "\": strand materials must have ids 1..255 (8-bit pack)\n";
+               "\": plant materials must have ids 1..255 (8-bit pack)\n";
         continue;
       }
-      const uint32_t need = 5 + 2 * (uint32_t)roots.size();
-      if (out.pool.size() + need > kMicroPoolWords) {
+      const uint32_t tile = std::min(pl.value("tile", 0u), 255u);
+      const uint32_t foot = std::min(pl.value("foot", 1u), 255u);
+      const uint32_t minH = std::min(pl.value("minH", 1u), 255u);
+      const uint32_t maxH = std::min(std::max(pl.value("maxH", minH), minH), 255u);
+      const uint32_t count = std::min(pl.value("count", 1u), 255u);
+      const uint32_t style = std::min(pl.value("style", 0u), 255u);
+      float params[kPlantParamSlots] = {};
+      if (pl.contains("params")) {
+        const json& pp = pl["params"];
+        if (!pp.is_object()) {
+          log += materialsPath + ": material \"" + id + "\": micro.plant.params must be an object\n";
+          continue;
+        }
+        for (auto it = pp.begin(); it != pp.end(); ++it) {
+          int slot = -1;
+          for (uint32_t k = 0; k < kPlantParamSlots && names[k]; k++)
+            if (it.key() == names[k]) { slot = (int)k; break; }
+          if (slot < 0) {
+            log += materialsPath + ": material \"" + id + "\": plant kind " + kindName +
+                   " has no param \"" + it.key() + "\"\n";
+            continue;
+          }
+          params[slot] = it.value().is_number() ? it.value().get<float>() : 0.0f;
+        }
+      }
+      if (out.pool.size() + kPlantPoolWords > kMicroPoolWords) {
         log += materialsPath + ": micro brick pool full (" +
                std::to_string(kMicroPoolWords) + " words)\n";
         continue;
       }
       const uint32_t base = (uint32_t)out.pool.size();
-      out.pool.push_back((uint32_t)roots.size() | ((uint32_t)body << 8) |
-                         ((uint32_t)tip << 16));
-      out.pool.push_back(std::bit_cast<uint32_t>(halfW));
-      out.pool.push_back(std::bit_cast<uint32_t>(tipFrac));
-      out.pool.push_back(std::bit_cast<uint32_t>(swayScale));
-      out.pool.push_back(std::bit_cast<uint32_t>(heightVary));
-      for (const auto& r : roots) {
-        out.pool.push_back(std::bit_cast<uint32_t>(r.first));
-        out.pool.push_back(std::bit_cast<uint32_t>(r.second));
-      }
-      // frameCount 1 / period 0: the flipbook machinery is idle for strands.
+      out.pool.push_back(kind | ((uint32_t)body << 8) | ((uint32_t)tip << 16) |
+                         ((uint32_t)accent << 24));
+      out.pool.push_back((uint32_t)accent2 | ((uint32_t)stem << 8) | (tile << 16) |
+                         (foot << 24));
+      out.pool.push_back(minH | (maxH << 8) | (count << 16) | (style << 24));
+      for (uint32_t k = 0; k < kPlantParamSlots; k++)
+        out.pool.push_back(std::bit_cast<uint32_t>(params[k]));
+      // frameCount 1 / period 0: the flipbook machinery is idle for plants.
       out.table[matId] =
-          MicroBrickGpu{base, 0, 1u, kMicroSway | kMicroStrands};
+          MicroBrickGpu{base, 0, 1u, kMicroSway | kMicroPlant};
       mats[matId].gpu.flags |= kMatFlagMicro;
       out.materialCount++;
       continue;

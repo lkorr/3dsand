@@ -19,6 +19,9 @@
 #include "sim/celestial.h"
 #include "sim/faredits.h"
 #include "sim/farfield.h"
+#include "sim/microvox.h"
+#include "sim/plants.h"
+#include "sim/trample.h"
 #include "test/selftest.h"
 #include "test/support.h"
 
@@ -1901,6 +1904,180 @@ Status GateShadowCache(Ctx& c, std::string& detail) {
 
 }  // namespace
 
+
+// ---- plants: the analytic plants load, draw, and flatten under a foot ------
+//
+// Three claims, each cheap enough to iterate on with `--gate plants` alone:
+//   1. LOADER: every shipped analytic species parses as a `plant` block of the
+//      right kind (a typo in a param name is logged and the material silently
+//      falls back to the cube path — this is where that would show).
+//   2. RING: the trample ring keeps ONE stamp for a presser standing still,
+//      lays another when it moves, and drops both once recovered.
+//   3. PICTURE: a stand of tall grass, a fern tile and a big toadstool painted
+//      on bare ground change the frame against the bare ground (the plants
+//      draw at all — a miss that blocked, or a plant that vanished into its
+//      clip, both fail here), and one foot stamp under the stand changes a
+//      SUBSET of those pixels (the trample reaches the shader and does not
+//      repaint the world). The three frames are written out as BMPs, because
+//      "it drew something" is the most a pixel count can say about a fern.
+Status GatePlants(Ctx& c, std::string& detail) {
+  GpuContext& ctx = c.ctx;
+  World& world = c.world;
+  Simulation& sim = c.sim;
+  const uint32_t W = c.width, H = c.height;
+
+  // ---- 1. the loader ----
+  std::vector<MaterialDef> mats = c.mats;   // a copy: LoadMicroVox sets flags
+  MicroSet ms;
+  std::string log;
+  const bool loaded = LoadMicroVox(AssetDir() + "/materials/materials.json",
+                                   AssetDir(), mats, ms, log);
+  int plantMats = 0;
+  bool kinds[5] = {false, false, false, false, false};
+  for (size_t i = 0; i < ms.table.size(); i++) {
+    const MicroBrickGpu& b = ms.table[i];
+    if (b.base == kMicroNoBrick || !(b.flags & kMicroPlant)) continue;
+    plantMats++;
+    const uint32_t kind = ms.pool[b.base] & 0xFFu;
+    if (kind < 5) kinds[kind] = true;
+  }
+  auto isPlant = [&](uint32_t id) {
+    return id < ms.table.size() && ms.table[id].base != kMicroNoBrick &&
+           (ms.table[id].flags & kMicroPlant) != 0;
+  };
+  const bool loaderOk = loaded && kinds[kPlantGrass] && kinds[kPlantFlower] &&
+                        kinds[kPlantMushroom] && kinds[kPlantFern] &&
+                        isPlant(kMatTallGrass) && isPlant(kMatFern) &&
+                        isPlant(kMatMushroomLarge) && isPlant(kMatGrassTuft) &&
+                        plantMats >= 13;
+  if (!log.empty()) std::printf("plants: micro loader said:\n%s", log.c_str());
+
+  // ---- 2. the ring ----
+  TrampleRing ring;
+  ring.Press(10.0f, 10.0f, 5.0f, 3.0f, 1.0f, 0.0f);
+  ring.Press(10.4f, 10.1f, 5.0f, 3.0f, 1.0f, 0.05f);   // still standing in it
+  const bool oneStamp = ring.Count() == 1;
+  ring.Press(14.0f, 10.0f, 5.0f, 3.0f, 1.0f, 0.10f);   // stepped out of it
+  const bool twoStamps = ring.Count() == 2;
+  ring.Expire(0.10f + kTrampleHoldSec + 1.4f + 0.01f, 1.4f);
+  const bool expired = ring.Count() == 0;
+  const bool ringOk = oneStamp && twoStamps && expired;
+
+  // ---- 3. the picture ----
+  SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+  ctx.WaitIdle();
+  // A flat-ish site inside the window, well away from the fixture pads.
+  const int gx = 300, gz = 220;
+  const int gh = World::TerrainHeight(gx, gz, kDefaultSeed);
+  const IVec3 pchunk{gx / 16, gh / 16, gz / 16};
+
+  std::vector<CellOp> plants, clear;
+  auto put = [&](IVec3 cc, uint32_t m) {
+    if (!world.CellInWindow(cc)) return;
+    plants.push_back({World::SlotCellIndex(cc), PackVoxNew(m, 0u)});
+    clear.push_back({World::SlotCellIndex(cc), PackVoxNew(0u, 0u)});
+  };
+  // A 9x9 stand of tall grass, 4-8 cells, on ONE ground level so the frame is
+  // about the plants and not the hillside under them.
+  for (int dz = -4; dz <= 4; dz++)
+    for (int dx = -4; dx <= 4; dx++) {
+      uint32_t r = rng::Hash3(0x91A57u, (uint32_t)(gx + dx), (uint32_t)(gz + dz));
+      const int height = 4 + (int)(r % 5u);
+      for (int k = 1; k <= height; k++)
+        put({gx - 9 + dx, gh + k, gz + 6 + dz},
+            k == height ? kMatTallGrassHead : kMatTallGrass);
+    }
+  // A fern tile and a toadstool tile beside it, exactly where the renderer
+  // rebuilds them (sim/plants.h is plantTileAt's CPU twin).
+  auto paintTile = [&](int tx, int tz, uint32_t salt, int tile, int foot, int minH,
+                       int maxH, uint32_t mat) {
+    PlantTileCpu pt = PlantTileAtCpu(tx * tile, tz * tile, kDefaultSeed, salt,
+                                     tile, foot, minH, maxH, 100u);
+    const int half = foot / 2;
+    const int hc = World::TerrainHeight(pt.cx, pt.cz, kDefaultSeed);
+    for (int dz = -half; dz <= half; dz++)
+      for (int dx = -half; dx <= half; dx++)
+        for (int k = 1; k <= pt.h; k++) put({pt.cx + dx, hc + k, pt.cz + dz}, mat);
+  };
+  paintTile((gx + 2) / kPlantFernTile, (gz + 2) / kPlantFernTile, kPlantFernSalt,
+            kPlantFernTile, kPlantFernFoot, kPlantFernMinH, kPlantFernMaxH, kMatFern);
+  paintTile((gx + 10) / kPlantShroomTile, (gz + 3) / kPlantShroomTile, kPlantShroomSalt,
+            kPlantShroomTile, kPlantShroomFoot, kPlantShroomMinH, kPlantShroomMaxH,
+            kMatMushroomLarge);
+
+  Camera cam;
+  cam.yaw = 1.5708f;   // +Z: the fern dead ahead, the stand and toadstool beside it
+  cam.pitch = -0.6f;
+  const Vec3 eye{(float)gx + 0.5f, (float)gh + 6.0f, (float)gz - 4.0f};
+  const uint32_t noon = TicksPerDayFromTuning(CurrentTuning()) / 2;
+  auto frame = [&](std::vector<uint8_t>& out, const char* bmp) {
+    WriteRenderParams(ctx.queue, world, eye, cam, (float)W / H, true, 0.0f,
+                      kFarFogDensity, 1080.0f, noon);
+    rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
+    rhi::RenderPass rp =
+        sim.BeginRenderPass(enc, c.view, rhi::TextureFormat::RGBA8Unorm, W, H);
+    sim.DrawWorld(rp);
+    rp.End();
+    ctx.queue.Submit(enc.Finish());
+    ctx.WaitIdle();
+    rhi::Buffer shot = CreateBuffer(ctx.device, (uint64_t)W * H * 4,
+                                    rhi::BufferUsage::MapRead | rhi::BufferUsage::CopyDst,
+                                    "plantsShot");
+    rhi::CommandEncoder enc2 = ctx.device.CreateCommandEncoder();
+    rhi::TexelCopyTexture srcT{};
+    srcT.texture = c.offscreen;
+    rhi::TexelCopyBuffer dstB{};
+    dstB.buffer = shot;
+    dstB.bytesPerRow = W * 4;
+    dstB.rowsPerImage = H;
+    rhi::Extent3D ext{W, H, 1};
+    enc2.CopyTextureToBuffer(srcT, dstB, ext);
+    ctx.queue.Submit(enc2.Finish());
+    out.assign((size_t)W * H * 4, 0);
+    rhi::ReadBufferBlocking(ctx.device, shot, 0, out.data(), out.size());
+    if (bmp) WriteBmpFile(bmp, out, W, H);
+  };
+  auto differing = [&](const std::vector<uint8_t>& a, const std::vector<uint8_t>& b) {
+    size_t n = 0;
+    for (size_t i = 0; i + 3 < a.size(); i += 4) {
+      const int d = std::abs((int)a[i] - (int)b[i]) + std::abs((int)a[i + 1] - (int)b[i + 1]) +
+                    std::abs((int)a[i + 2] - (int)b[i + 2]);
+      if (d > 24) n++;
+    }
+    return n;
+  };
+
+  uint32_t t = 41000;
+  std::vector<uint8_t> bare, grown, pressed;
+  Tramples().Clear();
+  frame(bare, nullptr);
+  SubmitTick(ctx, world, sim, ++t, kDefaultSeed, {}, {}, plants, false, pchunk,
+             false, false);
+  ctx.WaitIdle();
+  frame(grown, "plants_grown.bmp");
+  // One foot in the middle of the stand, pressed 1 s ago and still pressed at
+  // the frame's R.time of 0 (WriteRenderParams passes time 0 in the harness).
+  Tramples().Press((float)gx - 8.5f, (float)gz + 6.5f, (float)(gh + 1), 3.0f, 1.0f, -1.0f);
+  Tramples().Press((float)gx - 8.5f, (float)gz + 6.5f, (float)(gh + 1), 3.0f, 1.0f, -0.05f);
+  frame(pressed, "plants_pressed.bmp");
+  Tramples().Clear();
+  // Leave the world as this gate found it.
+  SubmitTick(ctx, world, sim, ++t, kDefaultSeed, {}, {}, clear, false, pchunk,
+             false, false);
+  ctx.WaitIdle();
+
+  const size_t grewPx = differing(bare, grown);
+  const size_t pressPx = differing(grown, pressed);
+  const bool drewOk = grewPx > 20000;
+  const bool pressOk = pressPx > 300 && pressPx < grewPx;
+
+  detail = Format("loader %s (%d plant materials) | ring %s | drew %zu px, "
+                  "foot changed %zu px",
+                  loaderOk ? "ok" : "FAIL", plantMats, ringOk ? "ok" : "FAIL",
+                  grewPx, pressPx);
+  return (loaderOk && ringOk && drewOk && pressOk) ? Status::Pass : Status::Fail;
+}
+
 const std::vector<Gate>& RenderGates() {
   static const std::vector<Gate> g = {
       {"far-fog", "render", {}, false, GateFarFog},
@@ -1920,6 +2097,8 @@ const std::vector<Gate>& RenderGates() {
       // No render pass on purpose: the resolve pass must not be able to
       // contribute, or the gate would be measuring the charger.
       {"gi-nightfall", "render", {}, false, GateGiNightfall},
+      // Draws three frames of a painted stand and reads them back.
+      {"plants", "render", {}, false, GatePlants, /*needsRender=*/true},
   };
   return g;
 }

@@ -94,7 +94,7 @@ const RS_SC_TAPS : u32 = 4u;     // shadowCached() calls (pixels served by the c
 const RS_SC_REQS : u32 = 5u;     // shadowAppendRequest() calls (misses)
 const RS_FAR : u32 = 6u;         // traceFar steps
 const RS_FAR_SHADOW : u32 = 7u;  // farShadowed steps
-const RS_MICRO : u32 = 8u;       // traceMicro + traceStrands steps
+const RS_MICRO : u32 = 8u;       // traceMicro + tracePlant steps
 const RS_REFLECT : u32 = 9u;     // trace() steps from reflection / refraction
 const RS_FLUID : u32 = 10u;      // MPM surface march steps (smooth + blocky + refine)
 const RS_GODRAY : u32 = 11u;     // godRays samples + their shadow trace steps
@@ -845,6 +845,9 @@ struct Hit {
   // from the cell's own material and entry face. Zero micMat means "this hit is
   // an ordinary voxel", which is every hit that predates the feature.
   micMat   : u32,     // material of the micro voxel struck (0 = not a micro hit)
+  micN     : vec3f,   // world-space normal of an analytic plant hit
+  micSmooth: u32,     // 1 = use micN; 0 = derive the normal from axis/sgn
+  micKey   : u32,     // palette key of the plant PART struck (0 = per cell)
 };
 
 fn inBounds(c : vec3<i32>) -> bool { return inWindow(c, R.origin); }
@@ -881,6 +884,14 @@ struct MicroHit {
   t    : f32,   // distance from the cell entry point, in WORLD voxel units
   axis : i32,   // axis last stepped (face normal)
   sgn  : f32,   // ray direction sign on that axis
+  // Analytic plants (tracePlant) report a WORLD-space normal directly — a
+  // mushroom cap is curved and a blade lies in its own plane — and a palette
+  // key for the PART struck (one blade, one cap), so a cap spanning nine
+  // cells is one colour instead of nine. Bricks leave smooth = false and the
+  // caller derives the normal from axis/sgn as before.
+  n      : vec3f,
+  curved : bool,
+  key    : u32,
 };
 
 // Which flipbook frame is showing at `tick`. Integer-only and a pure function
@@ -947,6 +958,9 @@ fn traceMicro(b : MicroBrick, cell : vec3<i32>, entry : vec3f, rd : vec3f,
   out.t = 0.0;
   out.axis = 1;
   out.sgn = -1.0;
+  out.n = vec3f(0.0, 1.0, 0.0);
+  out.curved = false;
+  out.key = 0u;
 
   let sl = b.subdivLog2;
   let S = i32(1u << sl);
@@ -1152,181 +1166,793 @@ fn traceMicro(b : MicroBrick, cell : vec3<i32>, entry : vec3f, rd : vec3f,
   return out;
 }
 
-// ---- analytic strand plants (MICROF_STRANDS) --------------------------------
-// The cells of a strand material hold no brick. Instead each COLUMN carries a
-// small set of parametric blades — root position, own height, own wind phase —
-// and this function intersects the slice of them passing through `cell` in
-// closed form. This is the path for content that must move smoothly and
-// PER-STRAND: the brick sway above bends a whole cell's content as one rigid
-// piece on a sub-voxel lattice, while a strand here is a true entity whose
-// position is a continuous function of time. Nothing is quantised anywhere.
+// ---- analytic plants (MICROF_PLANT) -----------------------------------------
+// The cells of a plant material hold no brick. Each COLUMN (grass, flowers) or
+// each TILE (ferns, big toadstools — see plantTileAt in common.wgsl) carries a
+// parametric plant reconstructed from hashes and the material's PlantDef, and
+// this function intersects the part of it passing through `cell` in closed
+// form. This is the path for content that must move SMOOTHLY: the brick
+// flipbook above steps between two poses on a 1.25 cm lattice, while a plant
+// here is a continuous function of time — every blade, frond and cap is
+// displaced by the shared wind field (windAt) and flattened by the trample
+// ring (trampleAt) with nothing quantised anywhere.
 //
-// Geometry: a blade is a vertical square-section rod bent by a quadratic
-// cantilever curve D(u) = wind * u^2 (root stiff, tip floppy), u = height /
-// plant height. Within one cell the curve is taken as linear (a 10 cm chord of
-// a gentle bend), which makes the rod a SHEARED BOX: substituting the shear
-// into the ray gives a still-straight ray, so the test collapses to the
-// classic three-slab AABB intersection — exact, no iteration. Chord endpoints
-// are exact curve evaluations, so consecutive cells of a column share them and
-// the blade is continuous across every cell boundary.
+// Primitives, all exact:
+//   * tapered sheared BLADE — a flat rod bent by a cantilever curve, taken as
+//     a chord within one cell; the taper makes the width linear in t along the
+//     ray, so the test is six half-planes in t (hitBlade).
+//   * ELLIPSOID with a horizontal clip plane (caps, flower heads, seed heads).
+//   * CONE frustum about Y (mushroom stems).
+//   * ORIENTED BOX (leaves, frond segments), perforated per leaflet.
 //
-// Every strand attribute derives from hash(column, strandIndex): each cell of
-// a stack reconstructs the identical strand set independently, which is what
-// lets worldgen keep stacking plain voxel cells (segment + head materials)
-// while the renderer treats the column as one plant. The material of a hit is
-// the authored body until the strand's own tip fraction, where it switches to
-// the tip material — so dried tips land per-BLADE, not per-cell.
-//
-// Normals are reported as axis/sgn exactly like the brick DDA (the slab that
-// decided entry), so lighting shades a blade as a voxel-crisp rod and the
-// whole MicroHit pipeline downstream is unchanged.
-fn traceStrands(b : MicroBrick, cell : vec3<i32>, entry : vec3f, rd : vec3f)
-    -> MicroHit {
+// Every plant attribute derives from hash(column or tile, part index): each
+// cell of a plant reconstructs the identical plant independently, which is
+// what lets worldgen keep painting plain voxel cells while the renderer treats
+// the column or footprint as one organism. Normals are reported in WORLD space
+// (MicroHit.n, smooth = true) — a cap is a curved surface, and a blade's face
+// normal is the plane it actually lies in.
+
+const PK_GRASS    : u32 = 1u;
+const PK_FLOWER   : u32 = 2u;
+const PK_MUSHROOM : u32 = 3u;
+const PK_FERN     : u32 = 4u;
+
+struct PlantDef {
+  kind : u32,
+  body : u32, tip : u32, accent : u32, accent2 : u32, stem : u32,
+  tile : i32, foot : i32, minH : i32, maxH : i32,
+  count : u32, style : u32,
+  base : u32,   // pool index of param slot 0
+};
+
+// Pool layout: see the plant block in LoadMicroVox (sim/microvox.cpp).
+fn plantDefOf(b : MicroBrick) -> PlantDef {
+  var d : PlantDef;
+  let w0 = microPool[b.base];
+  let w1 = microPool[b.base + 1u];
+  let w2 = microPool[b.base + 2u];
+  d.kind = w0 & 0xFFu;
+  d.body = (w0 >> 8u) & 0xFFu;
+  d.tip = (w0 >> 16u) & 0xFFu;
+  d.accent = (w0 >> 24u) & 0xFFu;
+  d.accent2 = w1 & 0xFFu;
+  d.stem = (w1 >> 8u) & 0xFFu;
+  d.tile = i32((w1 >> 16u) & 0xFFu);
+  d.foot = i32((w1 >> 24u) & 0xFFu);
+  d.minH = i32(w2 & 0xFFu);
+  d.maxH = i32((w2 >> 8u) & 0xFFu);
+  d.count = (w2 >> 16u) & 0xFFu;
+  d.style = (w2 >> 24u) & 0xFFu;
+  d.base = b.base + 3u;
+  return d;
+}
+fn plantP(d : PlantDef, i : u32) -> f32 {
+  return bitcast<f32>(microPool[d.base + i]);
+}
+
+// Which tile plant covers this cell. Salt/geometry by kind so the renderer and
+// worldgen ask plantTileAt the same question (the PLANT_* consts in
+// common.wgsl are the shared truth; the def's tile/foot must equal them).
+fn plantTileOf(d : PlantDef, cell : vec3<i32>) -> PlantTile {
+  if (d.kind == PK_FERN) {
+    return plantTileAt(cell.x, cell.z, R.seed, PLANT_FERN_SALT, PLANT_FERN_TILE,
+                       PLANT_FERN_FOOT, PLANT_FERN_MINH, PLANT_FERN_MAXH, 100u);
+  }
+  return plantTileAt(cell.x, cell.z, R.seed, PLANT_SHROOM_SALT, PLANT_SHROOM_TILE,
+                     PLANT_SHROOM_FOOT, PLANT_SHROOM_MINH, PLANT_SHROOM_MAXH, 100u);
+}
+// Per-ray memo key for a tile plant: one evaluation per (tile, material).
+fn plantTileKey(d : PlantDef, cell : vec3<i32>, mat : u32) -> u32 {
+  let tile = select(PLANT_SHROOM_TILE, PLANT_FERN_TILE, d.kind == PK_FERN);
+  let tx = plantFdiv(cell.x, tile);
+  let tz = plantFdiv(cell.z, tile);
+  return hash3(bitcast<u32>(tx) ^ (mat * 0x9E37u), bitcast<u32>(tz), 0x71E5u) | 1u;
+}
+// Is this cell the centre column of its tile plant (the LOD stand-in)?
+fn plantTileCentre(d : PlantDef, cell : vec3<i32>) -> bool {
+  let pt = plantTileOf(d, cell);
+  return pt.cx == cell.x && pt.cz == cell.z;
+}
+
+// ---- primitives -----------------------------------------------------------
+struct PrimHit {
+  hit  : bool,
+  t    : f32,
+  n    : vec3f,   // world-space (plant space is a translation of world space)
+  lp   : vec3f,   // primitive-local hit point (OBB: box frame; others: unused)
+  clip : bool,    // entered through the clip plane (ellipsoid underside)
+};
+fn primMiss() -> PrimHit {
+  var h : PrimHit;
+  h.hit = false; h.t = 1e9; h.n = vec3f(0.0, 1.0, 0.0); h.lp = vec3f(0.0);
+  h.clip = false;
+  return h;
+}
+
+// Ellipsoid centred c with radii r, kept where y >= yMin (a mushroom cap's
+// flat underside, a bell's open mouth). Ray o + t rd, t in [tLo, tHi].
+fn hitEllipsoid(o : vec3f, rd : vec3f, c : vec3f, r : vec3f, yMin : f32,
+                tLo : f32, tHi : f32) -> PrimHit {
+  var h = primMiss();
+  let oc = (o - c) / r;
+  let dr = rd / r;
+  let A = dot(dr, dr);
+  let B = dot(oc, dr);
+  let C = dot(oc, oc) - 1.0;
+  let disc = B * B - A * C;
+  if (disc < 0.0 || A < 1e-12) { return h; }
+  let sq = sqrt(disc);
+  var tl = max((-B - sq) / A, tLo);
+  var th = min((-B + sq) / A, tHi);
+  var clip = false;
+  if (abs(rd.y) > 1e-6) {
+    let ty = (yMin - o.y) / rd.y;
+    if (rd.y > 0.0) {
+      if (ty > tl) { tl = ty; clip = true; }
+    } else {
+      th = min(th, ty);
+    }
+  } else if (o.y < yMin) {
+    return h;
+  }
+  if (tl > th) { return h; }
+  h.hit = true;
+  h.t = tl;
+  h.clip = clip;
+  if (clip) {
+    h.n = vec3f(0.0, -1.0, 0.0);
+  } else {
+    let p = o + rd * tl;
+    h.n = normalize(((p - c) / r) / r);
+  }
+  return h;
+}
+
+// Cone frustum about a vertical axis through (cxz): radius r0 at y0, r1 at y1.
+fn hitConeY(o : vec3f, rd : vec3f, cxz : vec2f, r0 : f32, r1 : f32,
+            y0 : f32, y1 : f32, tLo : f32, tHi : f32) -> PrimHit {
+  var h = primMiss();
+  let k = (r1 - r0) / max(y1 - y0, 1e-4);
+  let q = o.xz - cxz;
+  let d = rd.xz;
+  let R0 = r0 + k * (o.y - y0);
+  let R1 = k * rd.y;
+  let A = dot(d, d) - R1 * R1;
+  let B = dot(q, d) - R0 * R1;
+  let C = dot(q, q) - R0 * R0;
+  if (A < 1e-9) { return h; }   // ray along the axis, or steeper than the cone
+  let disc = B * B - A * C;
+  if (disc < 0.0) { return h; }
+  let sq = sqrt(disc);
+  var tl = max((-B - sq) / A, tLo);
+  var th = min((-B + sq) / A, tHi);
+  var capN = 0.0;   // nonzero when the entry is a flat end cap
+  if (abs(rd.y) > 1e-6) {
+    let ta = (y0 - o.y) / rd.y;
+    let tb = (y1 - o.y) / rd.y;
+    let tyl = min(ta, tb);
+    let tyh = max(ta, tb);
+    if (tyl > tl) { tl = tyl; capN = select(1.0, -1.0, rd.y > 0.0); }
+    th = min(th, tyh);
+  } else if (o.y < y0 || o.y > y1) {
+    return h;
+  }
+  if (tl > th) { return h; }
+  h.hit = true;
+  h.t = tl;
+  if (capN != 0.0) {
+    h.n = vec3f(0.0, capN, 0.0);
+  } else {
+    let p = o + rd * tl;
+    let qh = p.xz - cxz;
+    let ql = max(length(qh), 1e-5);
+    h.n = normalize(vec3f(qh.x / ql, -k, qh.y / ql));
+  }
+  return h;
+}
+
+// Oriented box: centre c, unit axes (u, v, w), half extents he along them.
+fn hitOBB(o : vec3f, rd : vec3f, c : vec3f, u : vec3f, v : vec3f, w : vec3f,
+          he : vec3f, tLo : f32, tHi : f32) -> PrimHit {
+  var h = primMiss();
+  let oc = o - c;
+  let lo = vec3f(dot(oc, u), dot(oc, v), dot(oc, w));
+  let ld = vec3f(dot(rd, u), dot(rd, v), dot(rd, w));
+  var tl = tLo;
+  var th = tHi;
+  var ax = 0;
+  var sg = 1.0;
+  for (var a = 0; a < 3; a++) {
+    let dd = ld[a];
+    if (abs(dd) < 1e-7) {
+      if (abs(lo[a]) > he[a]) { return h; }
+      continue;
+    }
+    let inv = 1.0 / dd;
+    var t0 = (-he[a] - lo[a]) * inv;
+    var t1 = (he[a] - lo[a]) * inv;
+    if (t0 > t1) { let tmp = t0; t0 = t1; t1 = tmp; }
+    if (t0 > tl) { tl = t0; ax = a; sg = select(1.0, -1.0, dd > 0.0); }
+    th = min(th, t1);
+  }
+  if (tl > th) { return h; }
+  h.hit = true;
+  h.t = tl;
+  h.lp = lo + ld * tl;
+  if (ax == 0) { h.n = u * sg; } else if (ax == 1) { h.n = v * sg; } else { h.n = w * sg; }
+  return h;
+}
+
+// One half-plane c0 + c1 t <= 0 folded into a t interval: a positive slope
+// caps the exit, a negative one raises the entry (and records which plane
+// did, for the normal), and a degenerate one is a yes/no on c0 alone.
+fn bladePlane(c0 : f32, c1 : f32, id : i32, tl : ptr<function, f32>,
+              thi : ptr<function, f32>, which : ptr<function, i32>,
+              empty : ptr<function, bool>) {
+  if (abs(c1) < 1e-7) {
+    if (c0 > 0.0) { *empty = true; }
+    return;
+  }
+  let tb = -c0 / c1;
+  if (c1 > 0.0) {
+    *thi = min(*thi, tb);
+  } else if (tb > *tl) {
+    *tl = tb;
+    *which = id;
+  }
+}
+
+// A tapered, sheared, flat blade within ONE cell (cell-local coordinates).
+//   centreline  c(y) = rt + d0 + shear * y          (y in [0, yTop])
+//   half width  hw(y) = W0 + Wy * y                 (taper: Wy < 0)
+//   thickness   th, constant
+//   wdir / ndir the blade's width and thickness axes in XZ (unit, orthogonal)
+// Six half-planes, each linear in t along the ray, so the intersection is an
+// exact interval and the entering constraint gives the face normal.
+fn hitBlade(e : vec3f, rd : vec3f, rt : vec2f, d0 : vec2f, shear : vec2f,
+            wdir : vec2f, ndir : vec2f, W0 : f32, Wy : f32, th : f32,
+            yTop : f32, tHi : f32) -> PrimHit {
+  var h = primMiss();
+  let R0 = e.xz - rt - d0 - shear * e.y;
+  let R1 = rd.xz - shear * rd.y;
+  let A0 = dot(R0, wdir);  let A1 = dot(R1, wdir);
+  let B0 = dot(R0, ndir);  let B1 = dot(R1, ndir);
+  let H0 = W0 + Wy * e.y;  let H1 = Wy * rd.y;
+  // c0 + c1 t <= 0 for each of the six planes, folded one at a time into the
+  // [tl, thi] interval (written out rather than looped over an array: a
+  // dynamically indexed private array is scratch memory, and it stalled the
+  // driver compile for minutes).
+  var tl = 0.0;
+  var thi = tHi;
+  var which = -1;
+  var empty = false;
+  bladePlane(A0 - H0, A1 - H1, 0, &tl, &thi, &which, &empty);
+  bladePlane(-A0 - H0, -A1 - H1, 1, &tl, &thi, &which, &empty);
+  bladePlane(B0 - th, B1, 2, &tl, &thi, &which, &empty);
+  bladePlane(-B0 - th, -B1, 3, &tl, &thi, &which, &empty);
+  bladePlane(-e.y, -rd.y, 4, &tl, &thi, &which, &empty);
+  bladePlane(e.y - yTop, rd.y, 5, &tl, &thi, &which, &empty);
+  if (empty || tl > thi) { return h; }
+  h.hit = true;
+  h.t = tl;
+  if (which == 0)      { h.n = vec3f(wdir.x, 0.0, wdir.y); }
+  else if (which == 1) { h.n = vec3f(-wdir.x, 0.0, -wdir.y); }
+  else if (which == 2) { h.n = vec3f(ndir.x, 0.0, ndir.y); }
+  else if (which == 3) { h.n = vec3f(-ndir.x, 0.0, -ndir.y); }
+  else if (which == 4) { h.n = vec3f(0.0, -1.0, 0.0); }
+  else if (which == 5) { h.n = vec3f(0.0, 1.0, 0.0); }
+  else                 { h.n = -rd; }   // started inside the blade
+  return h;
+}
+
+// One of eight compass directions, no trig: the same swap-and-negate family as
+// the brick yaw. Used for blade yaws, leaf and frond azimuth jitter.
+fn plantDir8(i : u32) -> vec2f {
+  let k = i & 7u;
+  let s = 0.70710678;
+  if (k == 0u) { return vec2f(1.0, 0.0); }
+  if (k == 1u) { return vec2f(s, s); }
+  if (k == 2u) { return vec2f(0.0, 1.0); }
+  if (k == 3u) { return vec2f(-s, s); }
+  if (k == 4u) { return vec2f(-1.0, 0.0); }
+  if (k == 5u) { return vec2f(-s, -s); }
+  if (k == 6u) { return vec2f(0.0, -1.0); }
+  return vec2f(s, -s);
+}
+fn hf(h : u32, sh : u32) -> f32 { return f32((h >> sh) & 255u) / 255.0; }
+
+// The wind at a plant, in TIP DISPLACEMENT units (cells): the shared field's
+// mean + primitives, and the two gust bands kept separate so each part of a
+// plant can blend them with its own hash weights (that per-part blend is what
+// makes a stand read as many blades in one wind, not one object rocking).
+struct PlantWind { mean : vec2f, b1 : vec2f, b2 : vec2f };
+fn plantWindAt(p : vec3f, ph : f32, amp : f32) -> PlantWind {
+  var w : PlantWind;
+  let ws = windSampleAt(p, R.time * TUNE_MICRO_SWAY_SPEED, ph, &R);
+  w.mean = windSway(windMeanWS(ws) + windPrimAt(p, &R)) * amp;
+  w.b1 = windSway(windBandWS(ws, ws.b1)) * amp;
+  w.b2 = windSway(windBandWS(ws, ws.b2)) * amp;
+  return w;
+}
+fn plantWindBlend(w : PlantWind, h : u32) -> vec2f {
+  return w.mean + w.b1 * (0.55 + 0.45 * hf(h, 16u)) + w.b2 * (0.20 + 0.55 * hf(h, 24u));
+}
+
+// The plant extent up a column: contiguous swaying-micro cells below and above
+// `cell` (bounded at 12 — taller than anything worldgen stacks). Reading
+// neighbour voxels here is fine: this path is primary-camera-ray only.
+fn plantColumnExtent(cell : vec3<i32>, mat : u32, sameMat : bool) -> vec2<i32> {
+  var below = 0;
+  for (var i = 1; i <= 12; i++) {
+    let cb = cell - vec3<i32>(0, i, 0);
+    if (!inBounds(cb)) { break; }
+    let mb = voxMat(voxWordAt(cb));
+    if (mb == 0u) { break; }
+    if (sameMat) { if (mb != mat) { break; } }
+    else if ((microBricks[mb].flags & MICROF_SWAY) == 0u) { break; }
+    below++;
+  }
+  var above = 0;
+  for (var i = 1; i <= 12; i++) {
+    let ca = cell + vec3<i32>(0, i, 0);
+    if (!inBounds(ca)) { break; }
+    let ma = voxMat(voxWordAt(ca));
+    if (ma == 0u) { break; }
+    if (sameMat) { if (ma != mat) { break; } }
+    else if ((microBricks[ma].flags & MICROF_SWAY) == 0u) { break; }
+    above++;
+  }
+  return vec2<i32>(below, above);
+}
+
+// Trample at a plant base: (dirX, dirZ, amount) -> height scale + lean vector.
+struct PlantSquash { hs : f32, lean : vec2f };
+fn plantSquashAt(baseXZ : vec2f, baseY : f32) -> PlantSquash {
+  var s : PlantSquash;
+  let tr = trampleAt(vec3f(baseXZ.x, baseY, baseXZ.y), &R);
+  s.hs = 1.0 - TUNE_TRAMPLE_DEPTH * tr.z;
+  s.lean = tr.xy * (tr.z * TUNE_TRAMPLE_LEAN);
+  return s;
+}
+
+fn tracePlant(b : MicroBrick, d : PlantDef, mat : u32, cell : vec3<i32>,
+              entry : vec3f, rd : vec3f, tHiIn : f32) -> MicroHit {
   var out : MicroHit;
   out.hit = false;
   out.mat = 0u;
   out.t = 0.0;
   out.axis = 1;
   out.sgn = -1.0;
+  out.n = vec3f(0.0, 1.0, 0.0);
+  out.curved = true;
+  out.key = 0u;
 
-  // Pool layout: see the strands block in LoadMicroVox (sim/microvox.cpp).
-  let w0 = microPool[b.base];
-  let count = w0 & 0xFFu;
-  let bodyMat = (w0 >> 8u) & 0xFFu;
-  let tipMat = (w0 >> 16u) & 0xFFu;
-  if (b.base + 5u + count * 2u > MICRO_POOL_WORDS) { return out; }
-  let halfW = bitcast<f32>(microPool[b.base + 1u]);
-  let tipFrac = bitcast<f32>(microPool[b.base + 2u]);
-  let swayScale = bitcast<f32>(microPool[b.base + 3u]);
-  let heightVary = bitcast<f32>(microPool[b.base + 4u]);
+  // Wind amplitude: TUNE_MICRO_SWAY_AMP is authored in sub-voxels of a
+  // subdiv-8 cell; plants work in cell units, hence the /8.
+  let amp = TUNE_MICRO_SWAY_AMP * 0.125;
+  var bestT = tHiIn;
 
-  let colH = microColumnHash(cell);
+  // ======================= column plants: grass, flowers ===================
+  if (d.kind == PK_GRASS || d.kind == PK_FLOWER) {
+    let colH = microColumnHash(cell);
+    let ext = plantColumnExtent(cell, mat, false);
+    let below = ext.x;
+    let totalH = f32(below + 1 + ext.y);
+    let rise0 = f32(below);
+    let baseY = f32(cell.y - below);
+    let baseXZ = vec2f(f32(cell.x) + 0.5, f32(cell.z) + 0.5);
+    let ph = f32(colH & 1023u) * 0.006136;
+    let wind = plantWindAt(vec3f(f32(cell.x), baseY, f32(cell.z)), ph, amp);
+    let sq = plantSquashAt(baseXZ, baseY);
+    // Plant-local ray origin: the plant's base is the bottom of its first cell.
+    let o = entry + vec3f(0.0, rise0, 0.0);
 
-  // Plant extent: same probe as traceMicro, same reasoning — a strand's bend
-  // and height are fractions of the PLANT, which only the column knows.
-  var below = 0;
-  for (var i = 1; i <= 8; i++) {
-    let cb = cell - vec3<i32>(0, i, 0);
-    if (!inBounds(cb)) { break; }
-    let mb = voxMat(voxWordAt(cb));
-    if (mb == 0u || (microBricks[mb].flags & MICROF_SWAY) == 0u) { break; }
-    below++;
-  }
-  var above = 0;
-  for (var i = 1; i <= 8; i++) {
-    let ca = cell + vec3<i32>(0, i, 0);
-    if (!inBounds(ca)) { break; }
-    let ma = voxMat(voxWordAt(ca));
-    if (ma == 0u || (microBricks[ma].flags & MICROF_SWAY) == 0u) { break; }
-    above++;
-  }
-  let totalH = f32(below + 1 + above);
-  let rise0 = f32(below);
-
-  // The shared wind field (common.wgsl `windAt`), sampled ONCE per cell and
-  // kept in its component parts. Brick plants and strand plants visibly live
-  // in the same wind because they are literally reading the same function —
-  // that is DESIGN.md §12 invariant 2, and it is also what makes the debug
-  // arrow overlay evidence about this grass rather than a picture of a
-  // different field.
-  //
-  // The parts stay separate because each strand blends the GUSTS with its own
-  // hash-drawn weights (below), which decorrelates neighbouring blades without
-  // costing extra transcendentals per strand. The MEAN is deliberately not
-  // re-weighted: every blade in the cell stands in the same average wind and
-  // they disagree only about the gusts.
-  let ph = f32(colH & 1023u) * 0.006136;
-  let ws = windSampleAt(vec3f(cell), R.time * TUNE_MICRO_SWAY_SPEED, ph, &R);
-  let band1 = windSway(windBandWS(ws, ws.b1));
-  let band2 = windSway(windBandWS(ws, ws.b2));
-  // The mean, plus the wind primitives (fans/gusts/tornadoes) — with the mean
-  // for the same reason as the brick path above: a primitive is a steady push
-  // on the whole cell, and the per-strand re-weighting below applies to the
-  // GUSTS only. One `windPrimAt` per column, not per blade.
-  let bandMean = windSway(windMeanWS(ws) + windPrimAt(vec3f(cell), &R));
-  // TUNE_MICRO_SWAY_AMP is authored in sub-voxels of a subdiv-8 cell; strands
-  // work in cell units, hence the /8.
-  let amp = TUNE_MICRO_SWAY_AMP * 0.125 * swayScale;
-
-  var bestT = 1e9;
-  for (var s = 0u; s < count; s++) {
-    rsAdd(RS_MICRO, 1u);
-    let hs = hash3(colH, s, 0x57A4Du);
-    // This strand's own height: a fraction of the plant, so a stand's top is
-    // ragged per-blade rather than sheared flat at the column height.
-    let sH = totalH * (1.0 - heightVary * f32(hs & 255u) / 255.0);
-    if (rise0 >= sH) { continue; }
-    let yTop = min(1.0, sH - rise0);
-
-    // Root: the authored slot, plus a small per-column jitter so a field of
-    // columns is not the same 5 blades on a lattice.
-    let rt = vec2f(bitcast<f32>(microPool[b.base + 5u + s * 2u]),
-                   bitcast<f32>(microPool[b.base + 6u + s * 2u])) +
-             (vec2f(f32((hs >> 8u) & 15u), f32((hs >> 12u) & 15u)) - 7.5) *
-                 0.008;
-
-    // Per-strand wind: an individual blend of the two shared bands, plus the
-    // mean the whole cell shares. THIS line is "each strand is its own entity"
-    // — two blades in one cell disagree about the GUST by their weights, not
-    // by living in different fields, and they agree exactly about the average.
-    let wind = (bandMean +
-                band1 * (0.55 + 0.45 * f32((hs >> 16u) & 255u) / 255.0) +
-                band2 * (0.20 + 0.55 * f32((hs >> 24u) & 255u) / 255.0)) * amp;
-
-    // Cantilever chord through this cell: exact curve points at the cell's
-    // bottom and top, clamped so root + bend + half-width never leaves the
-    // cell (the world DDA would never march the part that crossed over).
-    let u0 = rise0 / totalH;
-    let u1 = (rise0 + yTop) / totalH;
-    let lo = vec2f(halfW + 0.01) - rt;
-    let hi = vec2f(0.99 - halfW) - rt;
-    let d0 = clamp(wind * u0 * u0, lo, hi);
-    let d1 = clamp(wind * u1 * u1, lo, hi);
-    let shear = (d1 - d0) / max(yTop, 1e-4);
-
-    // Sheared-slab test. Substituting the linear centreline C(y) = rt + d0 +
-    // shear*y into the ray turns "distance to a slanted rod" into an ordinary
-    // AABB slab test on a resampled ray — same guard against near-zero
-    // components as the DDA above.
-    let dpx = rd.x - shear.x * rd.y;
-    let dpz = rd.z - shear.y * rd.y;
-    let ix = 1.0 / select(dpx, select(-1e-6, 1e-6, dpx >= 0.0), abs(dpx) < 1e-6);
-    let iy = 1.0 / select(rd.y, select(-1e-6, 1e-6, rd.y >= 0.0), abs(rd.y) < 1e-6);
-    let iz = 1.0 / select(dpz, select(-1e-6, 1e-6, dpz >= 0.0), abs(dpz) < 1e-6);
-    let ox = entry.x - rt.x - d0.x - shear.x * entry.y;
-    let oz = entry.z - rt.y - d0.y - shear.y * entry.y;
-    var t0x = (-halfW - ox) * ix;
-    var t1x = (halfW - ox) * ix;
-    if (t0x > t1x) { let tmp = t0x; t0x = t1x; t1x = tmp; }
-    var t0y = (0.0 - entry.y) * iy;
-    var t1y = (yTop - entry.y) * iy;
-    if (t0y > t1y) { let tmp = t0y; t0y = t1y; t1y = tmp; }
-    var t0z = (-halfW - oz) * iz;
-    var t1z = (halfW - oz) * iz;
-    if (t0z > t1z) { let tmp = t0z; t0z = t1z; t1z = tmp; }
-    let tEnter = max(max(t0x, t0y), t0z);
-    let tExit = min(min(t1x, t1y), t1z);
-    if (tEnter > tExit || tEnter < 0.0 || tEnter >= bestT) { continue; }
-
-    bestT = tEnter;
-    out.hit = true;
-    out.t = tEnter;  // cell units == world-voxel units: no conversion
-    if (t0y >= t0x && t0y >= t0z) {
-      out.axis = 1;
-      out.sgn = sign(rd.y);
-    } else if (t0x >= t0z) {
-      out.axis = 0;
-      out.sgn = sign(dpx);
-    } else {
-      out.axis = 2;
-      out.sgn = sign(dpz);
+    if (d.kind == PK_GRASS) {
+      let halfW = plantP(d, 0u);
+      let thick = plantP(d, 1u);
+      let taper = plantP(d, 2u);
+      let tipFrac = plantP(d, 3u);
+      let heightVary = plantP(d, 4u);
+      let swayScale = plantP(d, 5u);
+      let headChance = plantP(d, 6u);
+      let rootSpread = plantP(d, 7u);
+      let leanAmt = plantP(d, 8u);
+      let headLen = plantP(d, 9u);
+      let margin = halfW + 0.02;
+      for (var s = 0u; s < d.count; s++) {
+        rsAdd(RS_MICRO, 1u);
+        let hs = hash3(colH, s, 0x57A4Du);
+        let hs2 = hash3(colH, s, 0xB1ADEu);
+        // This blade's own height: a fraction of the plant, compressed by the
+        // trample, so a stand's top is ragged per blade and a foot presses the
+        // blades under it into a short mat.
+        let sH = totalH * (1.0 - heightVary * hf(hs, 0u)) * sq.hs;
+        if (rise0 >= sH) { continue; }
+        let yTop = min(1.0, sH - rise0);
+        let rt = vec2f(0.5) + (vec2f(hf(hs, 8u), hf(hs2, 0u)) - 0.5) * (2.0 * rootSpread);
+        let q = hs2 >> 8u;
+        let wdir = plantDir8(q);
+        let ndir = vec2f(-wdir.y, wdir.x);
+        // Wind (own gust blend) + a static per-blade lean + the trample lean.
+        let W = plantWindBlend(wind, hs) * swayScale + sq.lean;
+        let L = plantDir8(hs2 >> 12u) * (leanAmt * hf(hs2, 16u));
+        // Cantilever chord through this cell, clamped inside the column.
+        let lo = vec2f(margin) - rt;
+        let hi = vec2f(1.0 - margin) - rt;
+        let u0 = rise0 / sH;
+        let u1 = (rise0 + yTop) / sH;
+        let d0 = clamp(W * u0 * u0 + L * u0, lo, hi);
+        let d1 = clamp(W * u1 * u1 + L * u1, lo, hi);
+        let shear = (d1 - d0) / max(yTop, 1e-4);
+        let Wy = -halfW * taper / sH;
+        let W0 = halfW * (1.0 - taper * u0);
+        let bh = hitBlade(entry, rd, rt, d0, shear, wdir, ndir, W0, Wy,
+                          thick, yTop, bestT);
+        if (bh.hit && bh.t < bestT) {
+          bestT = bh.t;
+          out.hit = true;
+          out.t = bh.t;
+          // Wrapped normal: a blade is a thin translucent leaf, not a wall.
+          // Shaded by its exact face normal a vertical blade sits in sky shade
+          // at noon and reads pale grey-green next to the sunlit ground.
+          out.n = normalize(bh.n + vec3f(0.0, 0.8, 0.0));
+          out.key = hash3(colH, s, 0x7E51u);
+          let hitRise = rise0 + entry.y + rd.y * bh.t;
+          let dead = (hs2 >> 20u) % 8u == 0u;
+          out.mat = d.body;
+          if (dead || hitRise > sH * (1.0 - tipFrac)) { out.mat = d.tip; }
+        }
+        // Seed head: a small ellipsoid riding the blade tip.
+        if (headChance > 0.0 && hf(hs2, 24u) < headChance && headLen > 0.0) {
+          rsAdd(RS_MICRO, 1u);
+          let dtip = clamp(W + L, lo, hi);
+          let c = vec3f(rt.x + dtip.x, sH - headLen * 0.5, rt.y + dtip.y);
+          let eh = hitEllipsoid(o, rd, c, vec3f(halfW * 1.1, headLen * 0.5, halfW * 1.1),
+                                -1e9, 0.0, bestT);
+          if (eh.hit && eh.t < bestT) {
+            bestT = eh.t;
+            out.hit = true;
+            out.t = eh.t;
+            out.n = eh.n;
+            out.key = hash3(colH, s, 0x7E52u);
+            out.mat = d.accent;
+          }
+        }
+      }
+      return out;
     }
-    // Dried tips per BLADE: past this strand's own tip fraction — or the whole
-    // blade for the occasional dead one — the hit shades as the tip material.
-    let hitRise = rise0 + entry.y + rd.y * tEnter;
-    let dead = (hash3(colH, s, 0xD1EDu) & 7u) == 0u;
-    out.mat = bodyMat;
-    if (dead || hitRise > sH * (1.0 - tipFrac)) { out.mat = tipMat; }
+
+    // ---- flower: one stem, a few leaves, a head ----------------------------
+    let stemHalfW = plantP(d, 0u);
+    let headR = plantP(d, 1u);
+    let headH = plantP(d, 2u);
+    let leafCount = u32(plantP(d, 3u));
+    let leafLen = min(plantP(d, 4u), 0.36);
+    let leafW = plantP(d, 5u);
+    let swayScale = plantP(d, 6u);
+    let heightVary = plantP(d, 7u);
+    let headDrop = plantP(d, 8u);
+    let headCount = max(u32(plantP(d, 9u)), 1u);
+    let centreR = plantP(d, 10u);
+    let petalGap = plantP(d, 11u);
+    let petalCount = max(plantP(d, 12u), 1.0);
+    let hs = hash3(colH, 0u, 0xF10Eu);
+    let hs2 = hash3(colH, 1u, 0xF10Eu);
+    let sH = max(totalH * (1.0 - heightVary * hf(hs, 0u)) * sq.hs, 0.3);
+    let rt = vec2f(0.5) + (vec2f(hf(hs, 8u), hf(hs, 16u)) - 0.5) * 0.2;
+    let W = plantWindBlend(wind, hs) * swayScale + sq.lean;
+    let margin = max(headR, stemHalfW) + 0.02;
+    let lo = vec2f(margin) - rt;
+    let hi = vec2f(1.0 - margin) - rt;
+    // The stem, as a square-section blade with no taper to speak of.
+    if (rise0 < sH) {
+      rsAdd(RS_MICRO, 1u);
+      let yTop = min(1.0, sH - rise0);
+      let u0 = rise0 / sH;
+      let u1 = (rise0 + yTop) / sH;
+      let d0 = clamp(W * u0 * u0, lo, hi);
+      let d1 = clamp(W * u1 * u1, lo, hi);
+      let shear = (d1 - d0) / max(yTop, 1e-4);
+      let bh = hitBlade(entry, rd, rt, d0, shear, vec2f(1.0, 0.0), vec2f(0.0, 1.0),
+                        stemHalfW * (1.0 - 0.3 * u0), -stemHalfW * 0.3 / sH,
+                        stemHalfW, yTop, bestT);
+      if (bh.hit && bh.t < bestT) {
+        bestT = bh.t; out.hit = true; out.t = bh.t;
+        out.n = normalize(bh.n + vec3f(0.0, 0.6, 0.0));
+        out.mat = d.stem; out.key = hash3(colH, 9u, 0x7E51u);
+      }
+    }
+    // Leaves: flat boxes off the stem at a hashed azimuth, tilted down.
+    for (var i = 0u; i < min(leafCount, 3u); i++) {
+      rsAdd(RS_MICRO, 1u);
+      let hl = hash3(colH, i + 2u, 0x1EAFu);
+      let u = 0.2 + 0.22 * f32(i) + 0.1 * hf(hl, 0u);
+      if (u * sH > totalH) { continue; }
+      let att = rt + clamp(W * u * u, lo, hi);
+      let dir = plantDir8(hl >> 8u);
+      let ax = normalize(vec3f(dir.x, -0.35 - 0.3 * hf(hl, 16u), dir.y));
+      let vz = normalize(cross(ax, vec3f(0.0, 1.0, 0.0)));
+      let wy = cross(vz, ax);
+      let cen = vec3f(att.x, u * sH, att.y) + ax * (leafLen * 0.5);
+      let lh = hitOBB(o, rd, cen, ax, vz, wy, vec3f(leafLen * 0.5, leafW * 0.5, 0.02),
+                      0.0, bestT);
+      if (lh.hit && lh.t < bestT) {
+        // A pointed leaf: taper the width toward the tip.
+        let along = (lh.lp.x + leafLen * 0.5) / leafLen;   // 0 root .. 1 tip
+        if (abs(lh.lp.y) > leafW * 0.5 * (1.0 - 0.8 * along * along)) { continue; }
+        bestT = lh.t; out.hit = true; out.t = lh.t; out.n = lh.n;
+        out.mat = d.body; out.key = hash3(colH, i + 2u, 0x7E53u);
+      }
+    }
+    // The head.
+    let dtip = clamp(W, lo, hi);
+    let T = vec3f(rt.x + dtip.x, min(sH, totalH - headH * 0.6), rt.y + dtip.y);
+    if (d.style == 0u) {
+      // DISC: a flat ellipsoid of petals with notches between them, and a
+      // small centre boss above it.
+      rsAdd(RS_MICRO, 2u);
+      let eh = hitEllipsoid(o, rd, T, vec3f(headR, headH, headR), -1e9, 0.0, bestT);
+      if (eh.hit && eh.t < bestT) {
+        let p = o + rd * eh.t - T;
+        let rho = length(p.xz);
+        var keep = true;
+        if (rho > centreR) {
+          let ang = atan2(p.z, p.x);
+          let f = fract(ang * petalCount * 0.15915494 + hf(hs2, 0u));
+          if (abs(f - 0.5) > (1.0 - petalGap) * 0.5) { keep = false; }
+        }
+        if (keep) {
+          bestT = eh.t; out.hit = true; out.t = eh.t; out.n = eh.n;
+          out.mat = d.tip; out.key = hash3(colH, 7u, 0x7E54u);
+        }
+      }
+      let ch = hitEllipsoid(o, rd, T + vec3f(0.0, headH * 0.7, 0.0),
+                            vec3f(centreR, centreR * 0.7, centreR), -1e9, 0.0, bestT);
+      if (ch.hit && ch.t < bestT) {
+        bestT = ch.t; out.hit = true; out.t = ch.t; out.n = ch.n;
+        out.mat = d.accent; out.key = hash3(colH, 8u, 0x7E54u);
+      }
+    } else if (d.style == 1u) {
+      // BELLS: hanging on alternate sides of the top of the stem.
+      for (var k = 0u; k < min(headCount, 8u); k++) {
+        rsAdd(RS_MICRO, 1u);
+        let fk = f32(k) / f32(headCount);
+        let u = 0.55 + 0.42 * fk;
+        let att = rt + clamp(W * u * u, lo, hi);
+        let side = plantDir8((hs2 >> 4u) + k * 3u) * (headR * 1.1);
+        let c = vec3f(att.x + side.x, u * sH - headR * headDrop, att.y + side.y);
+        let eh = hitEllipsoid(o, rd, c, vec3f(headR, headH, headR), c.y - headH * 0.55,
+                              0.0, bestT);
+        if (eh.hit && eh.t < bestT) {
+          bestT = eh.t; out.hit = true; out.t = eh.t; out.n = eh.n;
+          out.mat = select(d.tip, d.accent2, eh.clip);
+          out.key = hash3(colH, 20u + k, 0x7E54u);
+        }
+      }
+    } else if (d.style == 2u) {
+      // SPIKE: buds spiralling up the top half, smaller toward the tip, the
+      // last few still green.
+      for (var k = 0u; k < min(headCount, 12u); k++) {
+        rsAdd(RS_MICRO, 1u);
+        let fk = f32(k) / f32(headCount);
+        let u = 0.5 + 0.48 * fk;
+        let att = rt + clamp(W * u * u, lo, hi);
+        let ang = f32(k) * 2.4 + hf(hs2, 8u) * 6.28;
+        let off = vec2f(cos(ang), sin(ang)) * (headR * 0.9);
+        let sc = 1.0 - 0.5 * fk;
+        let c = vec3f(att.x + off.x, u * sH, att.y + off.y);
+        let eh = hitEllipsoid(o, rd, c, vec3f(headR * sc, headH * sc, headR * sc),
+                              -1e9, 0.0, bestT);
+        if (eh.hit && eh.t < bestT) {
+          bestT = eh.t; out.hit = true; out.t = eh.t; out.n = eh.n;
+          out.mat = select(d.tip, d.accent, fk > 0.8);
+          out.key = hash3(colH, 20u + k, 0x7E54u);
+        }
+      }
+    } else {
+      // CUP: a sphere of petals on the stem tip with a boss in it.
+      rsAdd(RS_MICRO, 2u);
+      let c = T + vec3f(0.0, headR * 0.2, 0.0);
+      let eh = hitEllipsoid(o, rd, c, vec3f(headR, headH, headR), c.y - headH * 0.5,
+                            0.0, bestT);
+      if (eh.hit && eh.t < bestT) {
+        bestT = eh.t; out.hit = true; out.t = eh.t; out.n = eh.n;
+        out.mat = select(d.tip, d.stem, eh.clip); out.key = hash3(colH, 7u, 0x7E54u);
+      }
+      let ch = hitEllipsoid(o, rd, c + vec3f(0.0, headH * 0.35, 0.0),
+                            vec3f(centreR, centreR, centreR), -1e9, 0.0, bestT);
+      if (ch.hit && ch.t < bestT) {
+        bestT = ch.t; out.hit = true; out.t = ch.t; out.n = ch.n;
+        out.mat = d.accent; out.key = hash3(colH, 8u, 0x7E54u);
+      }
+    }
+    return out;
+  }
+
+  // ======================= mushrooms =======================================
+  if (d.kind == PK_MUSHROOM) {
+    let capRMin = plantP(d, 0u);
+    let capRMax = plantP(d, 1u);
+    let capHr = plantP(d, 2u);
+    let stemRr = plantP(d, 3u);
+    let stemHr = plantP(d, 4u);
+    let spotChance = plantP(d, 5u);
+    let swayScale = plantP(d, 6u);
+    let gillDepth = plantP(d, 7u);
+    let heightVary = plantP(d, 8u);
+    if (d.style == 0u) {
+      // CLUSTER: up to `count` small mushrooms in one column, each its own
+      // size, all inside the cell.
+      let colH = microColumnHash(cell);
+      let ext = plantColumnExtent(cell, mat, false);
+      let totalH = f32(ext.x + 1 + ext.y);
+      let rise0 = f32(ext.x);
+      let baseY = f32(cell.y - ext.x);
+      let ph = f32(colH & 1023u) * 0.006136;
+      let wind = plantWindAt(vec3f(f32(cell.x), baseY, f32(cell.z)), ph, amp);
+      let o = entry + vec3f(0.0, rise0, 0.0);
+      let n = 1u + hash3(colH, 77u, 0x5A17u) % max(d.count, 1u);
+      for (var k = 0u; k < n; k++) {
+        rsAdd(RS_MICRO, 2u);
+        let hk = hash3(colH, k, 0x5A17u);
+        let capR = min(mix(capRMin, capRMax, hf(hk, 0u)), 0.3);
+        let capH = capR * capHr;
+        var stemH = capR * stemHr * (1.0 - heightVary * hf(hk, 8u));
+        stemH = min(stemH, totalH - capH - 0.03);
+        if (stemH < 0.05) { continue; }
+        let m = capR + 0.03;
+        let rt = vec2f(m) + vec2f(hf(hk, 16u), hf(hk, 24u)) * (1.0 - 2.0 * m);
+        let stemR = capR * stemRr;
+        let sh = hitConeY(o, rd, rt, stemR * 1.15, stemR * 0.9, 0.0, stemH, 0.0, bestT);
+        if (sh.hit && sh.t < bestT) {
+          bestT = sh.t; out.hit = true; out.t = sh.t; out.n = sh.n;
+          out.mat = d.stem; out.key = hash3(colH, k, 0x7E55u);
+        }
+        let sw = plantWindBlend(wind, hk) * (swayScale * 0.05);
+        let c = vec3f(rt.x + sw.x, stemH, rt.y + sw.y);
+        let eh = hitEllipsoid(o, rd, c, vec3f(capR, capH, capR), stemH - capH * gillDepth,
+                              0.0, bestT);
+        if (eh.hit && eh.t < bestT) {
+          bestT = eh.t; out.hit = true; out.t = eh.t; out.n = eh.n;
+          out.key = hash3(colH, k, 0x7E56u);
+          if (eh.clip) {
+            out.mat = d.accent2;
+          } else {
+            let p = (o + rd * eh.t - c) / capR;
+            let sp = hash3(hk, bitcast<u32>(i32(floor(p.x * 5.0 + 8.0))),
+                           bitcast<u32>(i32(floor(p.z * 5.0 + 8.0))));
+            out.mat = select(d.body, d.accent, hf(sp, 0u) < spotChance && p.y > 0.15);
+          }
+        }
+      }
+      return out;
+    }
+    // SINGLE big toadstool: a tile plant, stem in the centre column, cap over
+    // the whole footprint.
+    let pt = plantTileOf(d, cell);
+    let half = d.foot / 2;
+    if (abs(cell.x - pt.cx) > half || abs(cell.z - pt.cz) > half) { return out; }
+    let cc = vec3<i32>(pt.cx, cell.y, pt.cz);
+    if (!inBounds(cc) || voxMat(voxWordAt(cc)) != mat) { return out; }
+    let ext = plantColumnExtent(cc, mat, true);
+    let totalH = f32(ext.x + 1 + ext.y);
+    let baseY = f32(cell.y - ext.x);
+    let jit = (vec2f(hf(pt.rnd, 0u), hf(pt.rnd, 8u)) - 0.5) * 0.4;
+    let origin = vec3f(f32(pt.cx) + 0.5 + jit.x, baseY, f32(pt.cz) + 0.5 + jit.y);
+    let o = entry + vec3f(cell) - origin;
+    let wind = plantWindAt(origin, hf(pt.rnd, 16u) * 6.28, amp);
+    rsAdd(RS_MICRO, 2u);
+    let maxR = f32(half) + 0.5 - 0.1 - abs(max(jit.x, jit.y));
+    let capR = min(mix(capRMin, capRMax, hf(pt.rnd, 16u)), maxR);
+    let capH = min(capR * capHr, totalH * 0.5);
+    let stemH = totalH - capH - 0.03;
+    let stemR = capR * stemRr;
+    let sh = hitConeY(o, rd, vec2f(0.0), stemR * 1.25, stemR * 0.95, 0.0, stemH, 0.0, bestT);
+    if (sh.hit && sh.t < bestT) {
+      bestT = sh.t; out.hit = true; out.t = sh.t; out.n = sh.n;
+      out.mat = d.stem; out.key = pt.rnd;
+    }
+    let sw = plantWindBlend(wind, pt.rnd) * (swayScale * 0.06);
+    let c = vec3f(sw.x, stemH, sw.y);
+    let eh = hitEllipsoid(o, rd, c, vec3f(capR, capH, capR), stemH - capH * gillDepth,
+                          0.0, bestT);
+    if (eh.hit && eh.t < bestT) {
+      bestT = eh.t; out.hit = true; out.t = eh.t; out.n = eh.n;
+      out.key = pt.rnd ^ 0x55u;
+      if (eh.clip) {
+        out.mat = d.accent2;
+      } else {
+        let p = (o + rd * eh.t - c) / capR;
+        let sp = hash3(pt.rnd, bitcast<u32>(i32(floor(p.x * 6.0 + 8.0))),
+                       bitcast<u32>(i32(floor(p.z * 6.0 + 8.0))));
+        out.mat = select(d.body, d.accent, hf(sp, 0u) < spotChance && p.y > 0.1);
+      }
+    }
+    return out;
+  }
+
+  // ======================= fern: a rosette of arching fronds ===============
+  if (d.kind == PK_FERN) {
+    let frondCount = max(u32(plantP(d, 0u)), 1u);
+    let frondLen = plantP(d, 1u);
+    let rise = plantP(d, 2u);
+    let droop = plantP(d, 3u);
+    let leafletW = plantP(d, 4u);
+    let leafletFreq = plantP(d, 5u);
+    let swayScale = plantP(d, 6u);
+    let rachisW = plantP(d, 7u);
+    let spreadJitter = plantP(d, 8u);
+    let pt = plantTileOf(d, cell);
+    let half = d.foot / 2;
+    if (abs(cell.x - pt.cx) > half || abs(cell.z - pt.cz) > half) { return out; }
+    let cc = vec3<i32>(pt.cx, cell.y, pt.cz);
+    if (!inBounds(cc) || voxMat(voxWordAt(cc)) != mat) { return out; }
+    let ext = plantColumnExtent(cc, mat, true);
+    let totalH = f32(ext.x + 1 + ext.y);
+    let baseY = f32(cell.y - ext.x);
+    let jit = (vec2f(hf(pt.rnd, 0u), hf(pt.rnd, 8u)) - 0.5) * 0.3;
+    let origin = vec3f(f32(pt.cx) + 0.5 + jit.x, baseY, f32(pt.cz) + 0.5 + jit.y);
+    let o = entry + vec3f(cell) - origin;
+    let wind = plantWindAt(origin, hf(pt.rnd, 16u) * 6.28, amp);
+    let sq = plantSquashAt(origin.xz, baseY);
+    let n = frondCount + (pt.rnd >> 24u) % 3u;
+    let reach = min(frondLen, f32(half) + 0.5 - 0.12 - abs(max(jit.x, jit.y)));
+    let peak = totalH * rise;
+    for (var i = 0u; i < min(n, 12u); i++) {
+      let hfr = hash3(pt.rnd, i, 0xFE21u);
+      let ang = (f32(i) + spreadJitter * (hf(hfr, 0u) - 0.5)) * 6.2831853 / f32(n);
+      let dir = vec2f(cos(ang), sin(ang));
+      let L = reach * (0.7 + 0.3 * hf(hfr, 8u));
+      let pk = peak * (0.8 + 0.2 * hf(hfr, 16u));
+      // Wind: this frond's own gust blend, growing toward the tip.
+      let wv = plantWindBlend(wind, hfr) * (swayScale * 0.15);
+      // Quadratic Bezier rachis: up out of the crown, out and down to the tip.
+      let P0 = vec3f(0.0, 0.05, 0.0);
+      let P1 = vec3f(dir * (0.4 * L), pk * 1.15).xzy;
+      let P2 = vec3f(dir * L, pk * (1.0 - droop)).xzy;
+      var prev = P0;
+      for (var k = 1u; k <= 3u; k++) {
+        rsAdd(RS_MICRO, 1u);
+        let s = f32(k) / 3.0;
+        let ms = 1.0 - s;
+        var pnt = P0 * (ms * ms) + P1 * (2.0 * ms * s) + P2 * (s * s);
+        // Wind and trample act on the curve points: sway grows as s^2, the
+        // trample squashes the height and pushes the frond away.
+        pnt = vec3f(pnt.x + (wv.x + sq.lean.x) * s * s, pnt.y * sq.hs,
+                    pnt.z + (wv.y + sq.lean.y) * s * s);
+        let seg = pnt - prev;
+        let len = max(length(seg), 1e-4);
+        let ax = seg / len;
+        var vz = cross(ax, vec3f(0.0, 1.0, 0.0));
+        if (dot(vz, vz) < 1e-4) { vz = vec3f(-dir.y, 0.0, dir.x); }
+        vz = normalize(vz);
+        let wy = cross(vz, ax);
+        let smid = (f32(k) - 0.5) / 3.0;
+        let hw = leafletW * clamp(4.0 * smid * (1.0 - smid) + 0.35, 0.0, 1.0);
+        let cen = (prev + pnt) * 0.5;
+        let fh = hitOBB(o, rd, cen, ax, vz, wy, vec3f(len * 0.5 + 0.02, hw, 0.03),
+                        0.0, bestT);
+        prev = pnt;
+        if (!fh.hit || fh.t >= bestT) { continue; }
+        // Leaflets: alternate lobes along the rachis with gaps between them,
+        // each lobe narrowing toward its own tip. The rachis itself is solid.
+        let across = abs(fh.lp.y);
+        var m = d.stem;
+        if (across > rachisW) {
+          let along = (fh.lp.x + len * 0.5) / len;
+          let sg = (f32(k - 1u) + along) / 3.0;
+          let ph = fract(sg * leafletFreq);
+          if (ph > 0.82) { continue; }
+          let lobe = 1.0 - 0.35 * (ph / 0.82);
+          let edge = hw * lobe * (1.0 - 0.6 * max(sg - 0.7, 0.0) / 0.3);
+          if (across > edge) { continue; }
+          m = d.body;
+        }
+        bestT = fh.t; out.hit = true; out.t = fh.t; out.n = fh.n;
+        out.mat = m; out.key = hash3(pt.rnd, i, 0x7E57u);
+      }
+    }
+    return out;
   }
   return out;
 }
@@ -1388,6 +2014,16 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool) -> Hit {
   out.tsMat = 0u;
   out.tsPath = 0.0;
   out.micMat = 0u;
+  out.micN = vec3f(0.0, 1.0, 0.0);
+  out.micSmooth = 0u;
+  out.micKey = 0u;
+  // Tile-plant memo (see the MICROF_PLANT branch below): a fern or a big
+  // toadstool is ONE plant across a 3x3xH footprint, so it is intersected
+  // once per ray and the result is carried across every cell of that tile.
+  var pKey = 0u;
+  var pHit : MicroHit;
+  pHit.hit = false;
+  var pT = 0.0;
 
   // ---- micro-detail budget for THIS ray ----
   // `wantMedia` is exactly "this is the primary camera ray" at every call site
@@ -1865,40 +2501,81 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool) -> Hit {
         // Beyond it the cell shades as a plain voxel, which is not merely
         // cheaper but the SAME answer averaged, and it keeps distant meadows
         // reading as continuous ground instead of dissolving into stipple.
-        if (tCur * VOXEL_METERS > TUNE_MICRO_LOD_DIST) {
-          out.hit = true;
-          out.t = tCur;
-          out.cell = cell;
-          out.axis = axis;
-          out.sgn = sign(rd[axis]);
-          out.word = w;
-          return out;
-        }
-        // Cell-local entry point. tCur is where the ray crossed INTO this cell
-        // (the DDA sets it at the step that arrived here), so ro + rd*tCur
-        // minus the cell corner is a 0..1 coordinate on each axis.
-        let entry = (ro + rd * tCur) - vec3f(cell);
         let mb = microBricks[mat];
-        var mh : MicroHit;
-        if ((mb.flags & MICROF_STRANDS) != 0u) {
-          mh = traceStrands(mb, cell, clamp(entry, vec3f(0.0), vec3f(1.0)), rd);
+        let isPlant = (mb.flags & MICROF_PLANT) != 0u;
+        var pd : PlantDef;
+        if (isPlant) { pd = plantDefOf(mb); }
+        let tileMode = isPlant && pd.tile != 0;
+        if (tCur * VOXEL_METERS > TUNE_MICRO_LOD_DIST) {
+          // A tile plant's footprint is mostly air: past the LOD only its
+          // CENTRE column stands in as the solid proxy, the eight outer
+          // columns pass through as air (or a distant fern is a 30 cm cube).
+          if (!(tileMode && !plantTileCentre(pd, cell))) {
+            out.hit = true;
+            out.t = tCur;
+            out.cell = cell;
+            out.axis = axis;
+            out.sgn = sign(rd[axis]);
+            out.word = w;
+            return out;
+          }
         } else {
-          mh = traceMicro(mb, cell, clamp(entry, vec3f(0.0), vec3f(1.0)),
-                          rd, R.tick);
-        }
-        microBudget -= 1;
-        if (mh.hit) {
-          out.hit = true;
-          out.t = tCur + mh.t;
-          out.cell = cell;
-          out.axis = mh.axis;
-          out.sgn = mh.sgn;
-          // Keep the world voxel's word (stamp/stain/state travel with the
-          // CELL, not with the sub-voxel) but report the micro material
-          // separately, so fs() shades the blade's colour on the tuft's stain.
-          out.word = w;
-          out.micMat = mh.mat;
-          return out;
+          // Cell-local entry point. tCur is where the ray crossed INTO this
+          // cell (the DDA sets it at the step that arrived here), so ro +
+          // rd*tCur minus the cell corner is a 0..1 coordinate on each axis.
+          // tMax still holds the NEXT boundary on each axis, so its minimum
+          // is where the ray leaves this cell — the clip for a plant test.
+          let entry = clamp((ro + rd * tCur) - vec3f(cell), vec3f(0.0), vec3f(1.0));
+          let tExitCell = min(tMax.x, min(tMax.y, tMax.z));
+          var mh : MicroHit;
+          mh.hit = false;
+          var evaluated = true;
+          // ONE evaluation per (tile, material) per ray for a tile plant,
+          // unclipped; every later cell of the same tile only asks whether the
+          // remembered hit lies inside it. A hit that falls in a cell worldgen
+          // never painted (dug out, cut by a trunk) is simply never reported —
+          // the plant is clipped to the cells that exist, as it must be.
+          // A column plant is clipped to this cell and re-evaluated per cell.
+          // tracePlant has exactly ONE call site on purpose: it is a large
+          // kernel and every instantiation is paid again at driver compile.
+          var key = 0u;
+          if (tileMode) { key = plantTileKey(pd, cell, mat); }
+          if (tileMode && key == pKey) {
+            evaluated = false;
+            if (pHit.hit && pT >= tCur - 1e-3 && pT <= tExitCell + 1e-3) {
+              mh = pHit;
+              mh.t = pT - tCur;
+            }
+          } else if (isPlant) {
+            let tClip = select(tExitCell - tCur + 1e-3, 1e9, tileMode);
+            mh = tracePlant(mb, pd, mat, cell, entry, rd, tClip);
+            if (tileMode) {
+              pKey = key;
+              pHit = mh;
+              pT = tCur + mh.t;
+              if (pT > tExitCell + 1e-3) { mh.hit = false; }
+            }
+          } else {
+            mh = traceMicro(mb, cell, entry, rd, R.tick);
+          }
+          if (evaluated) { microBudget -= 1; }
+          if (mh.hit) {
+            out.hit = true;
+            out.t = tCur + mh.t;
+            out.cell = cell;
+            out.axis = mh.axis;
+            out.sgn = mh.sgn;
+            // Keep the world voxel's word (stamp/stain/state travel with the
+            // CELL, not with the sub-voxel) but report the micro material
+            // separately, so fs() shades the blade's colour on the tuft's
+            // stain.
+            out.word = w;
+            out.micMat = mh.mat;
+            out.micN = mh.n;
+            out.micSmooth = select(0u, 1u, mh.curved);
+            out.micKey = mh.key;
+            return out;
+          }
         }
         // MISS — and this is the crucial half. The ray passes through: fall out
         // of the `if` and let the world DDA step past the cell exactly as if it
@@ -7144,7 +7821,10 @@ fn fs(in : VSOut) -> FSOut {
     // exists to give it.
     var albedo : vec3f;
     if (isMicro) {
-      albedo = paletteJitter(m, hash3(R.seed, 1u, cellIndexW(h.cell) ^ h.micMat));
+      // A plant part carries its own key (one blade, one cap) so its colour
+      // is one variant end to end; a brick keys per cell as before.
+      let pk = select(cellIndexW(h.cell), h.micKey, h.micKey != 0u);
+      albedo = paletteJitter(m, hash3(R.seed, 1u, pk ^ h.micMat));
     } else {
       albedo = paletteColor(m, voxState(h.word), &materials);
     }
@@ -7162,12 +7842,17 @@ fn fs(in : VSOut) -> FSOut {
 
     var n = axisVec(h.axis, -h.sgn);
     if (isMicro) {
-      // The nested DDA ran in MODEL space, after the per-cell quarter-turn
-      // swizzle, so its face normal has to be rotated back or a yaw-varied
-      // tuft would light as though the sun had turned with it.
-      n = microNormalToWorld(n, microBricks[voxMat(h.word)].flags,
-                             microCellHash(microBricks[voxMat(h.word)].flags,
-                                           h.cell));
+      if (h.micSmooth != 0u) {
+        // An analytic plant reports its normal in world space already.
+        n = h.micN;
+      } else {
+        // The nested DDA ran in MODEL space, after the per-cell quarter-turn
+        // swizzle, so its face normal has to be rotated back or a yaw-varied
+        // tuft would light as though the sun had turned with it.
+        n = microNormalToWorld(n, microBricks[voxMat(h.word)].flags,
+                               microCellHash(microBricks[voxMat(h.word)].flags,
+                                             h.cell));
+      }
     }
 
     // Voxel-scale grain: breaks up the white-noise palette confetti into

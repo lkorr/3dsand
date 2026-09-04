@@ -2721,6 +2721,20 @@ struct Tuning {
     // cell walls, and anything past that shears blade tips through the wall
     // where the nested DDA never marches them — they vanish, not clip.
     float microSwayAmp = 1.5f;
+    // ---- trample (render-only; DESIGN.md §9 "Analytic plants") ----
+    // Seconds a flattened plant takes to stand back up after the presser
+    // leaves. The press-in itself is fixed (~0.12 s) because a foot lands
+    // faster than anything worth tuning.
+    float trampleRecover = 1.4f;
+    // How far a fully trampled plant compresses: 0.8 leaves 20% of its height.
+    float trampleDepth = 0.8f;
+    // Lateral lean of a fully trampled plant's tip, in cells, AWAY from the
+    // presser. Clamped inside the plant's own column by the renderer, so past
+    // ~0.4 it saturates rather than shearing blades into neighbour cells.
+    float trampleLean = 0.35f;
+    // Multiplier on a presser's collision half-width to get its stamp radius:
+    // feet reach a little past the capsule, and grass bends past the foot.
+    float trampleRadius = 1.5f;
     // FOLIAGE-LOCAL trim on the wind clock, applied on top of wind.gustSpeed.
     // It used to be the band rate outright; since the wind rewrite the field
     // itself owns that (windAt in common.wgsl, wind.gustSpeed), and this is a

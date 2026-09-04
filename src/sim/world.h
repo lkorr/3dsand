@@ -83,7 +83,15 @@ constexpr uint32_t kMatAir = 0, kMatStone = 1, kMatWood = 2, kMatSand = 3,
                    kMatGrassTuft = 39, kMatFoliageBush = 40,
                    kMatFlowerPoppy = 41, kMatFlowerDaisy = 42,
                    kMatPetalRed = 43, kMatPetalWhite = 44, kMatPetalYellow = 45,
-                   kMatLeafGreen = 46, kMatStemGreen = 47;
+                   kMatLeafGreen = 46, kMatStemGreen = 47,
+                   // analytic plants (sim/microvox.h `plant` blocks): the
+                   // meadow flowers, the forest floor set and the tall grass.
+                   // Array positions in materials.json, like everything here.
+                   kMatFlowerBluebell = 65, kMatFlowerFoxglove = 66,
+                   kMatFlowerButtercup = 67, kMatFern = 88,
+                   kMatMushroomCluster = 89, kMatToadstoolPale = 90,
+                   kMatTallGrass = 95, kMatTallGrassHead = 96,
+                   kMatMushroomLarge = 121;
 
 // ---- day/night cycle (DESIGN.md §12) ----------------------------------------
 // The cycle phase is an INTEGER derived from the sim tick, never from wall
@@ -1419,6 +1427,14 @@ constexpr uint32_t kCurrentPrimSim = 1u << 0;
 // construction instead of a growing list.
 constexpr uint32_t kWaveImpactCap = 16;
 
+// Trample ring size (render-only, DESIGN.md §9 "Analytic plants") — must match
+// the literal in RenderParams.tramples in common.wgsl (kTrampleCap * 2 vec4s).
+// A stamp is one presser's footprint on the ground; the player walking lays a
+// fresh one every ~half radius and each lives for hold + recover seconds, so
+// 48 is ~ten seconds of wading plus a handful of mobs. Overflow overwrites the
+// oldest, which is exactly what a faded footprint is.
+constexpr uint32_t kTrampleCap = 48;
+
 // Must match TickParams in common.wgsl.
 struct TickParams {
   uint32_t tick;
@@ -1921,6 +1937,22 @@ struct RenderParams {
   uint32_t waveImpactCount = 0;
   uint32_t pad_wi0 = 0, pad_wi1 = 0, pad_wi2 = 0;
   float waveImpacts[kWaveImpactCap * 4] = {};
+
+  // ---- the trample field (must match RenderParams in common.wgsl) --------
+  // Render-only, like the wind sway it composes with: a bounded ring of
+  // footprint stamps (player + mobs), each an analytic disc the plants flatten
+  // under while it is pressed and spring back from after it is released. No
+  // sim kernel reads it, it is not hashed and not saved. Two vec4 per stamp:
+  //   [x, z, y, radius]           world voxels; y is the ground under the foot
+  //   [t0, tEnd, strength, 0]     R.time it landed / was last pressed; 0..1
+  // Lo/Hi is the union AABB (xz + y band) for the per-sample early reject.
+  uint32_t trampleCount = 0;
+  uint32_t pad_tr0 = 0, pad_tr1 = 0, pad_tr2 = 0;
+  float trampleLo[3] = {1.0f, 1.0f, 1.0f};
+  float pad_tr3 = 0.0f;
+  float trampleHi[3] = {0.0f, 0.0f, 0.0f};
+  float pad_tr4 = 0.0f;
+  float tramples[kTrampleCap * 8] = {};
 
   // ---- the shadow cache's clock (must match RenderParams in common.wgsl) --
   // The RENDER frame counter, and deliberately not `tick` or `time`. `tick` is
