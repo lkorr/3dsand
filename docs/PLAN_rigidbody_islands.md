@@ -142,7 +142,38 @@ ticks):
 - **Result:** 0/0/0 floating components at +400 after the quench; clean within
   100 ticks (the sample stride). The burn half of `tree-fell` passes at zero.
 
-### 3.5 One thing ruled out, cheaply
+### 3.5 The third report: "still plenty of 2–6 voxel clumps"
+The quenched number above was honest and incomplete. Reproduced without the
+quench — sample the natural burn-out every 100 ticks for floating components
+AND cells still hot — the residue sat **flat at ~30 while the hot count fell
+3×**: stranded, not smouldering. Attribution (per-single face classes; forced
+rescan clears them; `freed 1198` for every small component a scan *saw*) said
+they were never being scanned at all. Two holes, both physics errors and both
+specific to a crown burning to ash:
+
+- `flagSupportLoss` treated a solid that became **powder in place** (leaf →
+  ash) as "still supports" and returned; the ash then flowed away flagging only
+  the cell *above*. A clump held sideways or from above by that leaf never got
+  a flag. Powder carries the cell above it and nothing else; the flag now says
+  so.
+- `soloSolid` counted powder on *any* face as attachment, so a lone leaf with
+  ash beside it refused to fall — and, by the hole above, nothing ever came for
+  it. Powder counts only below, as the scan's own anchor rule already said.
+
+Plus two settle-back defects the same series exposed: `SettleFootprintSupported`
+abstained-as-**yes** over an unfetched chunk (the 12-voxel leaf body at the edge
+of the fetched region was the biggest floater left), and a stamp vacates
+nothing so raised no flag — every settle now queues a support scan over its
+box. And the scan budget now charges cells actually *visited*, so the 68× flood
+saving finally buys scans. The sweep also learned that floating on a denser
+liquid is support (six "floating" leaves were sitting on water).
+
+**Natural burn-out series after:** `15, 16, 5, 3, 4` floating at
++300..+1500 with 890→215 cells still hot — a clump lives less than one sample
+before the scan takes it. Quenched: 0/0/0, clean at +100, forced rescan finds
+nothing.
+
+### 3.6 One thing ruled out, cheaply
 The per-chunk support cooldown was *dropping* suppressed flags rather than
 delaying them, which would mean the final state of a burnt region — the one the
 player is standing in front of — is the one state no scan ever runs on. That was

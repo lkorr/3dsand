@@ -65,7 +65,7 @@ constexpr int kSupportDrainPerTick = 8;
 // in PreTick). The scan count stays small on purpose: one scan is a dense
 // mask over a region up to 80^3, so this is the knob that decides how much CPU
 // island detection can take in a tick, and CLAUDE.md rule 2 is what bounds it.
-constexpr uint32_t kEventProbePerTick = 16;
+constexpr uint32_t kEventProbePerTick = 32;
 // The scan budget is in CELLS, not scans, so a tick may run two wide 64^3
 // scans or sixteen narrow 32^3 ones for the same CPU: the dense mask over the
 // region is what a scan costs, and counting scans would let the cheap tier
@@ -1157,17 +1157,26 @@ void DebrisSystem::PreTick(uint32_t tick, World& world, std::vector<CellOp>& cel
       // front of it are waiting on.
       const bool mayFetch = probed <= kEventFetchProbes;
       if (EventReady(e, world, required, mayFetch)) {
-        const uint32_t cost = (uint32_t)(e.hi.x - e.lo.x + 1) *
-                              (uint32_t)(e.hi.y - e.lo.y + 1) *
-                              (uint32_t)(e.hi.z - e.lo.z + 1);
         // The budget is spent by the scan that overruns it, not refused: a
         // wide scan must still be able to run on a tick whose budget is
         // mostly gone, or a stream of cheap scans could starve it forever.
         if (cellsLeft == 0) break;
         if (cellOps.size() > kMaxCellOpsPerTick / 2) break;
-        cellsLeft = cost >= cellsLeft ? 0u : cellsLeft - cost;
         events_.erase(events_.begin() + (long)qi);
+        // CHARGED WHAT IT COST, not what it covered. The first version of this
+        // budget charged the region's volume, so the 68x cheaper flood (seed
+        // from the changed box, stop at the first anchor) bought exactly zero
+        // extra scans a tick -- still two 64^3 regions -- and a real fire, with
+        // a whole crown re-flagging every 45 ticks, starved just as before.
+        // The mask build over the region is charged too, since it is real
+        // work: a scan costs its region once plus whatever the flood walked.
+        const uint64_t visitedBefore = floaters_.scanCellsVisited;
         RunIslandDetection(e, tick, world, cellOps, spawns);
+        const uint64_t cost = (floaters_.scanCellsVisited - visitedBefore) +
+                              (uint64_t)(e.hi.x - e.lo.x + 1) *
+                                  (uint64_t)(e.hi.y - e.lo.y + 1) *
+                                  (uint64_t)(e.hi.z - e.lo.z + 1) / 8u;
+        cellsLeft = cost >= cellsLeft ? 0u : cellsLeft - (uint32_t)cost;
         // terrain under the blast changed: sleeping debris nearby must re-check
         Vec3 c{(float)(e.lo.x + e.hi.x) * 0.5f, (float)(e.lo.y + e.hi.y) * 0.5f,
                (float)(e.lo.z + e.hi.z) * 0.5f};
@@ -1365,9 +1374,16 @@ bool DebrisSystem::SettleFootprintSupported(const std::vector<DebrisVoxel>& src,
         (classOf_[mat] == CLASS_SOLID || classOf_[mat] == CLASS_POWDER))
       return true;
   }
-  // Nothing supported it. Only a footprint whose every below-cell was KNOWN
-  // counts as proof of a void; one unreadable cell and we abstain.
-  return sawUnknown;
+  // Nothing supported it. An UNREADABLE cell below is NOT support -- this used
+  // to abstain by returning true, which stamped the body into the grid on a
+  // guess, exactly the guess DESIGN.md section 7 says this test must not make
+  // ("assuming empty means do not stamp into the world"). Measured on the
+  // `tree-fell` fixture: a 12-voxel leaf body rolled to the edge of the fetched
+  // region, its below-chunk was not cached, it settled, and it was the biggest
+  // floater left after the fire. The fetch has been requested; the body stays
+  // a body and is re-tested in 30 ticks, by which time the chunk is here.
+  (void)sawUnknown;
+  return false;
 }
 
 void DebrisSystem::SettleBodies(uint32_t tick, World& world,
@@ -1523,6 +1539,28 @@ void DebrisSystem::SettleBodies(uint32_t tick, World& world,
     }
 
     lastCellWriteTick_ = tick;
+    // RE-JUDGED BY THE SCAN once it has landed. The support test above proves
+    // one voxel of the footprint has ground under it; it does not prove the
+    // rest of the stamp is connected to that voxel once fill-air-only has
+    // skipped whatever cells the world had already grown into, and nothing
+    // downstream raises a support flag for a stamp (no cell VACATED). So the
+    // body's box goes through the same door a brush edit does, and if the
+    // stamp left anything unsupported the next scan turns it back into a body
+    // -- bounded, because that body must pass this same test to settle again.
+    {
+      IVec3 slo{INT32_MAX, INT32_MAX, INT32_MAX}, shi{INT32_MIN, INT32_MIN, INT32_MIN};
+      for (const DebrisVoxel& v : *settleSrc) {
+        float lx = (float)v.x + 0.5f, ly = (float)v.y + 0.5f, lz = (float)v.z + 0.5f;
+        IVec3 cell{
+            base.x + ifloor(snap[0][0] * lx + snap[0][1] * ly + snap[0][2] * lz),
+            base.y + ifloor(snap[1][0] * lx + snap[1][1] * ly + snap[1][2] * lz),
+            base.z + ifloor(snap[2][0] * lx + snap[2][1] * ly + snap[2][2] * lz)};
+        slo.x = std::min(slo.x, cell.x); shi.x = std::max(shi.x, cell.x);
+        slo.y = std::min(slo.y, cell.y); shi.y = std::max(shi.y, cell.y);
+        slo.z = std::min(slo.z, cell.z); shi.z = std::max(shi.z, cell.z);
+      }
+      AddDestructionEvent(tick, slo, shi, kSupportMargin);
+    }
     ReleaseBody(b);
     bodies_[bi] = std::move(bodies_.back());
     bodies_.pop_back();

@@ -92,6 +92,14 @@ struct SweepResult {
   // EVERY unsupported component regardless of `minVoxels`, so the two gates can
   // ask their own questions of one sweep.
   uint32_t singles = 0;     // exactly 1 voxel: the "specks in the air" symptom
+  // Of the singles: how many have NO solid/powder on any face (the CA's
+  // soloSolid should have dropped these -- if any exist, its chunk never woke)
+  // versus how many touch powder or liquid laterally (soloSolid correctly
+  // leaves those to island detection, which then has to arrive).
+  uint32_t singlesAllAir = 0;
+  uint32_t singlesTouchPowder = 0;
+  uint32_t singlesTouchLiquid = 0;
+  uint32_t singlesTouchOther = 0;  // gas that is not air (fire, smoke)
   uint32_t smallComps = 0;  // 2..7: below kMinBodyVoxels, should have crumbled
   uint32_t bigComps = 0;    // >= 8: body-worthy, and still in the grid
   uint32_t bigVoxels = 0;   // ...and how much matter that is
@@ -108,7 +116,7 @@ struct SweepResult {
   IVec3 biggestLo{}, biggestHi{};
   bool biggestRests = false;
   // 0 none, 1 box floor (cannot see below), 2 powder underneath,
-  // 3 a foreign solid underneath
+  // 3 a foreign solid underneath, 4 afloat on a denser liquid
   int biggestRestWhy = 0;
   IVec3 biggestRestAt{};     // the cell of this component that was held up
 };
@@ -126,10 +134,26 @@ SweepResult SweepForFloaters(World& world, const std::vector<MaterialDef>& mats,
   // borrowed from DebrisSystem, so the gate cannot inherit a mistake from the
   // system it is testing.
   std::vector<uint8_t> klass(mats.size() + 1, 0);
-  for (size_t i = 0; i < mats.size(); i++) klass[i] = (uint8_t)mats[i].gpu.klass;
+  std::vector<int32_t> dens(mats.size() + 1, 0);
+  for (size_t i = 0; i < mats.size(); i++) {
+    klass[i] = (uint8_t)mats[i].gpu.klass;
+    dens[i] = (int32_t)mats[i].gpu.density;
+  }
 
   std::vector<uint16_t> mat(vol, 0);
   std::vector<uint8_t> solid(vol, 0), support(vol, 0);
+  // FLOATING IS SUPPORT. A solid over a liquid denser than itself cannot go
+  // anywhere: soloSolid's tryMove is refused by canDisplace, and a body dropped
+  // onto it would bob. Counting only solid/powder underneath reported six
+  // leaves sitting on water as "floating in the air", which is the one thing
+  // they were not doing. So a cell over a denser liquid is supported; a cell
+  // over a LIGHTER liquid (stone over water) is not, and is expected to sink.
+  auto restsOnLiquid = [&](size_t me, size_t below) {
+    const uint16_t bm = mat[below];
+    if (bm == 0 || klass[bm] != CLASS_LIQUID) return false;
+    const uint16_t mm = mat[me];
+    return mm != 0 && dens[bm] >= dens[mm];
+  };
   for (int z = 0; z < dz; z++)
     for (int y = 0; y < dy; y++) {
       const int wy = lo.y + y, wz = lo.z + z;
@@ -184,6 +208,9 @@ SweepResult SweepForFloaters(World& world, const std::vector<MaterialDef>& mats,
       } else if (support[lidx(x, y - 1, z)] && !solid[lidx(x, y - 1, z)]) {
         if (!rests) { restWhy = 2; restAt = {lo.x + x, lo.y + y, lo.z + z}; }
         rests = true;  // powder underneath is real support, and is not in comp
+      } else if (restsOnLiquid(i, lidx(x, y - 1, z))) {
+        if (!rests) { restWhy = 4; restAt = {lo.x + x, lo.y + y, lo.z + z}; }
+        rests = true;  // afloat
       }
       const int nb[6][3] = {{1, 0, 0},  {-1, 0, 0}, {0, 1, 0},
                             {0, -1, 0}, {0, 0, 1},  {0, 0, -1}};
@@ -243,7 +270,30 @@ SweepResult SweepForFloaters(World& world, const std::vector<MaterialDef>& mats,
     if (rests) continue;
     // Unfiltered histogram FIRST: `minVoxels` is one gate's question, not the
     // sweep's, and a single voxel must be counted before it is filtered out.
-    if (cells.size() == 1) r.singles++;
+    if (cells.size() == 1) {
+      r.singles++;
+      const size_t i = cells[0];
+      const int x = (int)(i % dx), y = (int)((i / dx) % dy),
+                z = (int)(i / ((size_t)dx * dy));
+      bool pow = false, liq = false, oth = false;
+      const int nb6[6][3] = {{1, 0, 0},  {-1, 0, 0}, {0, 1, 0},
+                             {0, -1, 0}, {0, 0, 1},  {0, 0, -1}};
+      for (auto& d : nb6) {
+        const int nx = x + d[0], ny = y + d[1], nz = z + d[2];
+        if (nx < 0 || ny < 0 || nz < 0 || nx >= dx || ny >= dy || nz >= dz)
+          continue;
+        const uint16_t m = mat[lidx(nx, ny, nz)];
+        if (m == 0) continue;
+        const uint8_t k = klass[m];
+        if (k == CLASS_POWDER) pow = true;
+        else if (k == CLASS_LIQUID) liq = true;
+        else if (k != CLASS_SOLID) oth = true;
+      }
+      if (pow) r.singlesTouchPowder++;
+      else if (liq) r.singlesTouchLiquid++;
+      else if (oth) r.singlesTouchOther++;
+      else r.singlesAllAir++;
+    }
     else if (cells.size() < 8) r.smallComps++;
     else {
       r.bigComps++;
@@ -953,6 +1003,50 @@ Status GateTreeFell(Ctx& c, std::string& detail) {
     }
     runTick(fire, true);
   }
+  // ---- PASS A0: THE NATURAL BURN-OUT, sampled ------------------------------
+  //
+  // What the owner actually stands in front of. No quench: the crown goes on
+  // smouldering, and every 100 ticks the box is swept for floating components
+  // AND counted for cells still hot. The pair is what separates "the handoff
+  // strands clumps" from "the fire is still making them": residue that tracks
+  // the hot count is the burn, residue that stays up while the hot count falls
+  // to nothing is the machinery. Reported as a series, because a single
+  // sample of a smouldering tree is a number with no cause attached.
+  std::string burnSeries;
+  uint32_t residueAtBurnEnd = 0, hotAtBurnEnd = 0;
+  {
+    std::vector<uint8_t> hotTag(c.mats.size(), 0);
+    for (size_t i = 0; i < c.mats.size(); i++)
+      for (const std::string& t : c.mats[i].tags)
+        if (t == "hot") hotTag[i] = 1;
+    auto countHot = [&]() {
+      uint32_t n = 0;
+      for (int z = fetchLo.z; z <= fetchHi.z; z++)
+        for (int y = fetchLo.y; y <= fetchHi.y; y++)
+          for (int x = fetchLo.x; x <= fetchHi.x; x++) {
+            const IVec3 wc{x >> 4, y >> 4, z >> 4};
+            if (!world.ChunkInWindow(wc)) continue;
+            const CachedChunk* cc = world.Cached(wc);
+            if (!cc || cc->voxels.size() != kChunkVol) continue;
+            const uint32_t m =
+                cc->voxels[((((uint32_t)z) & 15u) * kChunk + (((uint32_t)y) & 15u)) *
+                               kChunk +
+                           (((uint32_t)x) & 15u)] & 0xFFFu;
+            if (m < hotTag.size() && hotTag[m]) n++;
+          }
+      return n;
+    };
+    for (int t = 100; t <= 1500; t += 100) {
+      for (int i = 0; i < 100; i++) runTick({}, true);
+      const SweepResult s = SweepForFloaters(world, c.mats, fetchLo, fetchHi, 1);
+      residueAtBurnEnd = s.singles + s.smallComps + s.bigComps;
+      hotAtBurnEnd = countHot();
+      if (t % 300 == 0)
+        burnSeries += Format("%s+%d:%u/%uhot", burnSeries.empty() ? "" : " ",
+                             t, residueAtBurnEnd, hotAtBurnEnd);
+    }
+  }
+
   // ---- QUENCH: the fire is now OUT, by fiat ---------------------------------
   //
   // Without this the latency numbers below measure nothing. A burnt tree
@@ -998,6 +1092,14 @@ Status GateTreeFell(Ctx& c, std::string& detail) {
                                      : 0u});
         }
     runTick(quench, true);
+    // AND THE BODIES. A quench of the grid alone left 68 alight rigidbodies on
+    // the ground, and BurnBodies emits real fire back into the grid, so the
+    // "quiet" period re-lit the tree and the post-quench residue ROSE
+    // (31, 37, 29 with zero hot grid cells). Their matter is taken out of the
+    // world here: this clock is for the grid handoff, and a burning corpse
+    // pile is a different fixture's subject.
+    for (uint32_t i = debris.BodyCount(); i-- > 0;)
+      debris.DestroyBody(debris.BodyHandle(i));
   }
   // Let the queue drain with nothing new arriving. This is the quiet period a
   // player stands in afterwards, and what they see then is the report.
@@ -1161,6 +1263,8 @@ Status GateTreeFell(Ctx& c, std::string& detail) {
            "cut-leaves-nothing-standing");
 
   RecordObserved("treeFell.cleanTick", (double)cleanTick);
+  RecordObserved("treeFell.naturalResidue", (double)residueAtBurnEnd);
+  RecordObserved("treeFell.naturalHot", (double)hotAtBurnEnd);
   RecordObserved("treeFell.residueAt300", (double)residueAt300);
   RecordObserved("treeFell.singlesObserved", (double)swA.singles);
   RecordObserved("treeFell.clumpsObserved",
@@ -1178,9 +1282,11 @@ Status GateTreeFell(Ctx& c, std::string& detail) {
                   noClumps && felled && leftStanding;
   detail = Format(
       "at (%d,%d) ground %d (relief %d..%d) inWindow %d; planted clean %u/%u/%u; "
-      "BURN: wood %u->%u leaves %u->%u, %u bodies; floating singles %u, "
+      "BURN: wood %u->%u leaves %u->%u, %u bodies; floating singles %u "
+      "(all-air %u, touch powder %u, liquid %u, hot-gas %u), "
       "2..7 %u, >=8 %u (%u vox) of %u comps over %u cells (%u absent)%s%s%s; "
-      "residue over time: %u @+300, %u @+900, %u @+1800, CLEAN at +%d ticks; "
+      "NATURAL burn-out [%s] (%u floating / %u hot at +1500); after QUENCH residue "
+      "%u @+300, %u @+900, %u @+1800, CLEAN at +%d ticks; "
       "after a FORCED rescan %u/%u/%u (%u vox); "
       "probe leaks oversize %u, in-place %u, stuck-event %u, defer-gaveup %u, "
       "queue-dropped %u; stuck-requeued %u, cooldown-held %u/rearmed %u; "
@@ -1197,9 +1303,12 @@ Status GateTreeFell(Ctx& c, std::string& detail) {
       fx, fz, groundY, terrainMin, terrainMax, siteInWindow ? 1 : 0,
       swPre.singles, swPre.smallComps,
       swPre.bigComps, woodBeforeA, woodAfterA, leafBeforeA,
-      leafAfterA, bodiesA, swA.singles, swA.smallComps, swA.bigComps,
+      leafAfterA, bodiesA, swA.singles, swA.singlesAllAir,
+      swA.singlesTouchPowder, swA.singlesTouchLiquid, swA.singlesTouchOther,
+      swA.smallComps, swA.bigComps,
       swA.bigVoxels, swA.componentsTotal, swA.cellsScanned, swA.chunksMissing,
       worst.empty() ? "" : " [", worst.c_str(), worst.empty() ? "" : "]",
+      burnSeries.c_str(), residueAtBurnEnd, hotAtBurnEnd,
       residueAt300, residueAt900, residueAt1800, cleanTick,
       swA2.singles, swA2.smallComps, swA2.bigComps, swA2.bigVoxels,
       fpA.oversizeBboxSkipped, fpA.solidRubbleInPlace, fpA.stuckEventDropped,

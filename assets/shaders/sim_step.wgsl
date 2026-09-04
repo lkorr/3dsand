@@ -113,7 +113,13 @@ fn soloSolid(c : vec3<i32>) -> bool {
     let nm = voxMat(voxWordAt(n));
     if (nm == MAT_AIR) { continue; }
     let k = materials[nm].klass;
-    if (k == CLASS_SOLID || k == CLASS_POWDER) { return false; }
+    if (k == CLASS_SOLID) { return false; }
+    // Powder only counts BELOW (i == 0): sand beside a voxel does not hold it
+    // up, and RunIslandDetection's anchor rule already says the same (resting
+    // ON powder anchors; powder alongside does not). Counting every face let a
+    // lone leaf with ash beside it refuse to fall, while the ash's own flag
+    // logic never summoned a scan for it -- see flagSupportLoss.
+    if (k == CLASS_POWDER && i == 0u) { return false; }
   }
   return true;
 }
