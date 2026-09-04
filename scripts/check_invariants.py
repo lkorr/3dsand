@@ -1232,6 +1232,70 @@ def check_biome_order():
     if k is not None:
         problems.append("biome order: treeatlas.h still declares kBiomeCount; the count is data now (TreeAtlas::biomeCount)")
 
+# ----------------------------------------------------------- world map layout
+def check_worldmap_layout():
+    """src/sim/worldmap.h's header/record/cover-row word offsets and flag bits
+    are re-declared in worldgen.wgsl as WM_H_* / WM_B_* / WM_C_* / WM_BF_*
+    consts. A slot moved on one side and not the other reads a neighbouring
+    field as the skin material, silently. Names map by convention:
+    kHBiomeCount -> WM_H_BIOME_COUNT, kB_TreeDensity -> WM_B_TREE_DENSITY,
+    kC_HeightVox -> WM_C_HEIGHT (explicit aliases below), kBF_X -> WM_BF_X."""
+    hdr = read("src/sim/worldmap.h")
+    wgsl = read("assets/shaders/worldgen.wgsl")
+    if not (hdr and wgsl):
+        return
+    checked.append("world map layout")
+    cpp = {}
+    for m in re.finditer(r"\b(kH\w+|kB_\w+|kC_\w+)\s*=\s*(\d+)", hdr):
+        cpp[m.group(1)] = int(m.group(2))
+    for m in re.finditer(r"kBF_(\w+)\s*=\s*1u\s*<<\s*(\d+)", hdr):
+        cpp["kBF_" + m.group(1)] = 1 << int(m.group(2))
+    wg = {m.group(1): int(m.group(2))
+          for m in re.finditer(r"const\s+(WM_\w+)\s*:\s*u32\s*=\s*(\d+)u", wgsl)}
+    def snake(name):
+        s = re.sub(r"(?<!^)(?=[A-Z])", "_", name).upper()
+        return s
+    alias = {"kB_PatchThreshold": "WM_B_PATCH_THRESH", "kB_PatchCellLog2": "WM_B_PATCH_LOG2",
+             "kB_TreeTileVox": "WM_B_TREE_TILE", "kB_CaveThreshold1": "WM_B_CAVE_T1",
+             "kB_CaveThreshold2": "WM_B_CAVE_T2", "kBiomeRecWords": "WM_B_WORDS",
+             "kCoverRowWords": "WM_C_WORDS", "kC_HeightVox": "WM_C_HEIGHT",
+             "kC_PatchThreshold": "WM_C_PATCH_THRESH", "kHBiomeRecords": "WM_H_BIOME_RECORDS",
+             "kHMaxCoverH": "WM_H_MAX_COVER_H", "kB_MaxCoverH": "WM_B_MAX_COVER_H",
+             "kHLandformPlane": "WM_H_LANDFORM_PLANE", "kHMoisturePlane": "WM_H_MOISTURE_PLANE"}
+    for m in re.finditer(r"\b(kBiomeRecWords|kCoverRowWords)\s*=\s*(\d+)", hdr):
+        cpp[m.group(1)] = int(m.group(2))
+    for name, wgname in list(alias.items()):
+        pass
+    for cname, val in cpp.items():
+        if cname in alias:
+            wname = alias[cname]
+        elif cname.startswith("kH"):
+            wname = "WM_H_" + snake(cname[2:])
+        elif cname.startswith("kB_"):
+            wname = "WM_B_" + snake(cname[3:])
+        elif cname.startswith("kC_"):
+            wname = "WM_C_" + snake(cname[3:])
+        elif cname.startswith("kBF_"):
+            wname = "WM_BF_" + snake(cname[4:])
+        else:
+            continue
+        if wname not in wg:
+            continue  # not every header word is read by the shader (yet)
+        if wg[wname] != val:
+            problems.append(f"world map layout: worldmap.h {cname} = {val} but worldgen.wgsl {wname} = {wg[wname]}")
+    # Every WM_ const the shader declares must be one the header defines.
+    known = set()
+    for cname in cpp:
+        known.add(alias.get(cname, ""))
+        if cname.startswith("kH"): known.add("WM_H_" + snake(cname[2:]))
+        elif cname.startswith("kB_"): known.add("WM_B_" + snake(cname[3:]))
+        elif cname.startswith("kC_"): known.add("WM_C_" + snake(cname[3:]))
+        elif cname.startswith("kBF_"): known.add("WM_BF_" + snake(cname[4:]))
+    for wname in wg:
+        if wname not in known:
+            problems.append(f"world map layout: worldgen.wgsl declares {wname} but worldmap.h has no matching word")
+
+
 # ------------------------------------------------------- far cell material bits
 def check_far_material_bits():
     """A far cascade cell is 7 bits of material id + 1 blocker flag (13.2.2).
@@ -1431,6 +1495,7 @@ ALL = {
     "worldgen": check_worldgen_mirror,
     "treeatlas": check_tree_atlas,
     "biomes": check_biome_order,
+    "worldmap": check_worldmap_layout,
     "runword": check_run_word_layout,
     "wgunits": check_worldgen_units,
     "wgdefaults": check_worldgen_defaults,

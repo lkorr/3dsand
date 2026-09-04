@@ -3181,10 +3181,13 @@ int main(int argc, char** argv) {
       stWorld.Init(stCtx.device);
       std::vector<uint32_t> stMapWords;
       { std::string wl;
-        if (!worldmap::PackBiomeTable(stBiomes, stMapWords, wl)) {
+        worldmap::WorldMapData stMap;
+        if (!worldmap::LoadWorldMap(ad, CurrentTuning().worldgen.mapLayer, stBiomes, stMap, wl) ||
+            !worldmap::PackWorldMap(stBiomes, stMap, stMapWords, wl)) {
           std::fprintf(stderr, "%s", wl.c_str());
           return 1;
-        } }
+        }
+        worldmap::SetCurrentWorldMap(std::move(stMap)); }
       Simulation stSim;
       if (!stSim.Init(stCtx.device, stWorld, m, rx, mic, stTrees, stMapWords, ad + "/shaders"))
         return 1;
@@ -3344,10 +3347,16 @@ int main(int argc, char** argv) {
                            "whose biome ids cannot be laid out\n");
       return 1;
     }
-    if (!worldmap::PackBiomeTable(biomeSet, worldMapWords, blog)) {
+    worldmap::WorldMapData map;
+    if (!worldmap::LoadWorldMap(assetDir, CurrentTuning().worldgen.mapLayer, biomeSet, map, blog) ||
+        !worldmap::PackWorldMap(biomeSet, map, worldMapWords, blog)) {
       std::fprintf(stderr, "%s", blog.c_str());
+      std::fprintf(stderr, "world map '%s' failed to load -- refusing to start (a world with no "
+                           "map is not a world; see src/sim/worldmap.h)\n",
+                   CurrentTuning().worldgen.mapLayer.c_str());
       return 1;
     }
+    worldmap::SetCurrentWorldMap(std::move(map));
   }
   TreeAtlas treeAtlas;
   {

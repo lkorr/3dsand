@@ -2470,6 +2470,10 @@ class World {
   // mirrored cheaply. ~25 hash3 per call: fine at O(1)/frame (spawn placement,
   // fixture anchoring, a mob ground probe), never in a per-voxel loop.
   static int TerrainHeight(int x, int z, uint32_t seed);
+  // The world map's biome for a column: the CPU twin of worldgen.wgsl's
+  // mapBiomeAt (src/sim/worldmap.h). Reads worldmap::CurrentWorldMap(); 0
+  // until a map is loaded. The `worldmap` gate holds the two together.
+  static uint32_t MapBiomeAt(int x, int z, uint32_t seed);
 
   // The tarn a column stands in or beside. Exists so the `terrain` gate can
   // assert the BERM INVARIANT — every column in the berm core is above its

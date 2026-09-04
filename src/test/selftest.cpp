@@ -120,6 +120,9 @@ const char* const kOrder[] = {
     // checked. No world, no GPU, nothing left behind.
     "biomes",
     "terrain",
+    // Right after terrain, on the same pristine world: the painted map's
+    // biome reaches the kernel (CPU twin at cell centres, GPU skin in-window).
+    "worldmap",
     // SECOND, and it wants the same thing `terrain` does: pristine worldgen at
     // an unmoved origin. Its whole subject is the ANALYTIC basin registry, and
     // the authored lake at (420,420) has to be resident for that to mean

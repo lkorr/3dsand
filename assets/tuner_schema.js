@@ -1201,6 +1201,7 @@ const TUNING_SCHEMA = [
       {k:'mossFace', n:'shaded face', d:'Which wall face wears moss: 0 = \u2212Z, 1 = +X, 2 = +Z, 3 = \u2212X. Worldgen has no sun and no compass, so the shaded side of a ruin wall is a convention rather than a measurement \u2014 this is the knob that declares it.', min:0, max:3, step:1, int:true},
       {k:'caveThreshold1', n:'shallow cave rarity', d:'Cave noise must exceed this for a near-surface cavern. Higher = rarer caves.', min:0, max:255, step:1, int:true},
       {k:'caveThreshold2', n:'deep cave rarity', d:'Same, for the deep cavern band where lava pools form.', min:0, max:255, step:1, int:true},
+      {k:'mapLayer', n:'world map', type:'text', placeholder:'default', d:'Names assets/worldmap/<name>/ — the painted biome + landform planes and site table worldgen reads (the World Map tab). Not optional: a missing map refuses to start. Every map edit moves the world hash.'},
       {k:'editLayer', n:'edit layer', type:'text', placeholder:'(none)', d:'Names assets/worldedits/<name>.svedit — the hand-built voxel patch saved from the Voxels view above. The engine applies it through the mutation queue to every chunk it generates, including streaming refills, so it survives flying away and composes with any seed. Leave empty for pristine worldgen. Note that ANY layer moves the world hash, which is why the shipped default is empty.'},
     ],
   },

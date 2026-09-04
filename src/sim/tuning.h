@@ -2962,6 +2962,13 @@ struct Tuning {
     // construction (it puts voxels in the world), so a shipped default would
     // silently re-pin every determinism number in tests/baseline.json.
     std::string editLayer;
+    // ---- the authored world map (src/sim/worldmap.h) ------------------------
+    // Names assets/worldmap/<mapLayer>/{map.json,map.svmap}: the painted
+    // biome/landform planes and the site table worldgen reads instead of
+    // deriving biome from noise. Unlike editLayer this is NOT optional --
+    // "default" ships, and a missing or unparsable map ABORTS at load rather
+    // than silently generating an all-ocean or all-forest world.
+    std::string mapLayer = "default";
   } worldgen;
 
   // Values that failed validation, for the overlay / console. Empty on success.

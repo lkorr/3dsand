@@ -316,11 +316,14 @@ bool RunScenario(bool loud, bool lowPower, bool sledgehammer, bool validation,
   std::vector<uint32_t> worldMapWords;
   {
     std::string blog;
+    worldmap::WorldMapData map;
     if (!biomes::LoadBiomeSet(assetDir, mats, biomeSet, blog) ||
-        !worldmap::PackBiomeTable(biomeSet, worldMapWords, blog)) {
-      std::printf("biomes: FAIL\n%s", blog.c_str());
+        !worldmap::LoadWorldMap(assetDir, CurrentTuning().worldgen.mapLayer, biomeSet, map, blog) ||
+        !worldmap::PackWorldMap(biomeSet, map, worldMapWords, blog)) {
+      std::printf("biomes/world map: FAIL\n%s", blog.c_str());
       return false;
     }
+    worldmap::SetCurrentWorldMap(std::move(map));
   }
   TreeAtlas treeAtlas;
   {

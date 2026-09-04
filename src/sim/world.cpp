@@ -10,6 +10,7 @@
 #include "sim/pass_table.h"  // pass::Buf ids for the tracked readback copies
 #include "sim/rng.h"
 #include "sim/tuning.h"
+#include "sim/worldmap.h"
 
 // Readback slot layout (offsets in bytes).
 constexpr uint64_t kChunkBytes = kChunkVol * 4;                 // 16 KB
@@ -794,6 +795,23 @@ static N2 vnoise2d(int x, int z, uint32_t csl, uint32_t seed) {
   return v0 + (((v1 - v0) * sy) >> 15);
 }
 // MIRROR-END noise
+
+// ---- the world map's biome, on the CPU (worldgen.wgsl mapBiomeAt) ---------
+// NOT inside a MIRROR block: mapBiomeAt is outside every mirror in the
+// shader too (biomeAt has never had a height role at default tuning). Spelled
+// the same anyway -- same salts, same shift, same warp -- and the `worldmap`
+// gate compares the two at cell centres.
+uint32_t World::MapBiomeAt(int x, int z, uint32_t seed) {
+  const worldmap::WorldMapData& m = worldmap::CurrentWorldMap();
+  if (!m.Loaded()) return 0u;
+  const int amp = m.warpAmpVox;
+  const int wx = x + (((vnoise2d(x, z, 9u, seed ^ 0x3A9Fu).n - 8192) * amp) >> 14);
+  const int wz = z + (((vnoise2d(x, z, 9u, seed ^ 0x3AA0u).n - 8192) * amp) >> 14);
+  int cx, cz;
+  m.CellOf(wx, wz, &cx, &cz);
+  if (!m.Inside(cx, cz)) return static_cast<uint32_t>(m.oceanBiome);
+  return m.BiomeCell(cx, cz);
+}
 
 // The shader's vec2<i32>, so pondAt can be mirrored with the same shape.
 // Outside the mirrored region: WGSL gets this type from the language.

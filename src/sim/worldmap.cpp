@@ -1,13 +1,23 @@
-// worldmap.cpp -- packs the authored biome set into the worldMap buffer.
-// See worldmap.h for the layout and the seed discipline.
+// worldmap.cpp -- loads the authored world map and packs it, with the biome
+// record table, into the worldMap buffer. See worldmap.h for the layout and
+// the seed discipline.
 #include "sim/worldmap.h"
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <cstring>
+#include <fstream>
+#include <sstream>
+#include <unordered_map>
+
+#include <nlohmann/json.hpp>
 
 #include "sim/biomes.h"
 #include "sim/tuning.h"
 #include "sim/world.h"
+
+using nlohmann::json;
 
 namespace worldmap {
 namespace {
@@ -18,13 +28,31 @@ uint32_t Vox(float metres) {
   return U(std::max(1, v));
 }
 
-// FNV-1a over the words, so the boot line can name the table that produced
-// this world's hash. Not a security hash; a change-detector.
-uint32_t Fnv(const std::vector<uint32_t>& w) {
+// FNV-1a. Not a security hash; a change-detector so the boot line can name
+// the table/map that produced this world's hash.
+uint32_t FnvBytes(uint32_t h, const uint8_t* p, size_t n) {
+  for (size_t i = 0; i < n; i++) { h ^= p[i]; h *= 16777619u; }
+  return h;
+}
+uint32_t FnvWords(const std::vector<uint32_t>& w) {
   uint32_t h = 2166136261u;
   for (uint32_t x : w)
     for (int i = 0; i < 4; i++) { h ^= (x >> (8 * i)) & 0xFFu; h *= 16777619u; }
   return h;
+}
+
+// Four cells per word, little-endian.
+void AppendPlane(std::vector<uint32_t>& W, const std::vector<uint8_t>& plane) {
+  const size_t words = (plane.size() + 3) / 4;
+  const size_t at = W.size();
+  W.resize(at + words, 0u);
+  for (size_t i = 0; i < plane.size(); i++)
+    W[at + (i >> 2)] |= static_cast<uint32_t>(plane[i]) << ((i & 3) * 8);
+}
+
+WorldMapData& Slot() {
+  static WorldMapData g;
+  return g;
 }
 
 }  // namespace
@@ -48,8 +76,6 @@ bool PackBiomeTable(const biomes::BiomeSet& set, std::vector<uint32_t>& W,
   W[kHVersion] = kVersion;
   W[kHBiomeCount] = U(n);
   W[kHBiomeRecords] = U(kHeaderWords);
-  // Planes, sites and stamps arrive in P2/P5; their offsets stay 0 = absent,
-  // and the samplers treat 0 as "no plane" rather than reading the header.
   const size_t rec0 = W.size();
   W.resize(rec0 + static_cast<size_t>(n) * kBiomeRecWords, 0u);
 
@@ -106,8 +132,147 @@ bool PackBiomeTable(const biomes::BiomeSet& set, std::vector<uint32_t>& W,
     W[kHMaxCoverH] = std::max(W[kHMaxCoverH], maxH);
   }
   W[kHContentHash] = 0u;
-  W[kHContentHash] = Fnv(W);
+  W[kHContentHash] = FnvWords(W);
   return true;
 }
+
+bool LoadWorldMap(const std::string& assetDir, const std::string& name,
+                  const biomes::BiomeSet& set, WorldMapData& out, std::string& log) {
+  out = WorldMapData{};
+  const std::string dir = assetDir + "/worldmap/" + name;
+  const std::string at = "worldmap/" + name + ": ";
+
+  // ---- map.json -------------------------------------------------------------
+  json j;
+  {
+    std::ifstream f(dir + "/map.json");
+    if (!f) { log += at + "map.json not found (" + dir + ")\n"; return false; }
+    try { f >> j; } catch (const std::exception& e) {
+      log += at + "map.json does not parse: " + e.what() + "\n"; return false;
+    }
+  }
+  auto geti = [&](const char* k, int d) { return j.contains(k) && j[k].is_number() ? j[k].get<int>() : d; };
+  out.name = name;
+  out.cellLog2 = geti("cellLog2", 10);
+  out.seaLevelY = geti("seaLevelY", 0);
+  out.oceanFadeCells = geti("oceanFadeCells", 0);
+  out.warpAmpVox = geti("warpAmpVox", 0);
+  if (j.contains("size") && j["size"].is_array() && j["size"].size() == 2) {
+    out.width = j["size"][0].get<int>(); out.height = j["size"][1].get<int>();
+  }
+  if (j.contains("originCell") && j["originCell"].is_array() && j["originCell"].size() == 2) {
+    out.originCellX = j["originCell"][0].get<int>(); out.originCellZ = j["originCell"][1].get<int>();
+  }
+  if (out.cellLog2 < 4 || out.cellLog2 > 14 || out.width <= 0 || out.height <= 0 ||
+      out.width > 4096 || out.height > 4096) {
+    log += at + "bad cellLog2/size\n"; return false;
+  }
+  // The warp must stay well inside a cell or a one-cell region pinches below
+  // the tree-tile width the shader's comments require (plan: <= cell/6).
+  const int cellVox = 1 << out.cellLog2;
+  if (out.warpAmpVox < 0 || out.warpAmpVox > cellVox / 4) {
+    log += at + "warpAmpVox " + std::to_string(out.warpAmpVox) + " exceeds cell/4 (" +
+           std::to_string(cellVox / 4) + ")\n";
+    return false;
+  }
+
+  // ---- the palette, resolved against the biome files ------------------------
+  std::unordered_map<std::string, int> idOf;
+  for (const biomes::BiomeDef& b : set.biomes) idOf[b.name] = b.index;
+  std::vector<uint8_t> paletteId;
+  if (!j.contains("biomes") || !j["biomes"].is_array() || j["biomes"].empty()) {
+    log += at + "map.json needs a non-empty biomes[] palette\n"; return false;
+  }
+  for (const json& e : j["biomes"]) {
+    const std::string n = e.is_string() ? e.get<std::string>() : "";
+    auto it = idOf.find(n);
+    if (it == idOf.end()) {
+      log += at + "palette names biome \"" + n + "\", which has no assets/biomes/<name>.json\n";
+      return false;
+    }
+    out.palette.push_back(n);
+    paletteId.push_back(static_cast<uint8_t>(it->second));
+  }
+  auto oc = idOf.find("ocean");
+  out.oceanBiome = oc == idOf.end() ? 0 : oc->second;
+
+  // ---- map.svmap --------------------------------------------------------------
+  std::vector<uint8_t> raw;
+  {
+    std::ifstream f(dir + "/map.svmap", std::ios::binary);
+    if (!f) { log += at + "map.svmap not found\n"; return false; }
+    std::ostringstream ss; ss << f.rdbuf();
+    const std::string s = ss.str();
+    raw.assign(s.begin(), s.end());
+  }
+  const size_t cells = static_cast<size_t>(out.width) * out.height;
+  if (raw.size() < 16 + cells * 3) {
+    log += at + "map.svmap is " + std::to_string(raw.size()) + " bytes; expected " +
+           std::to_string(16 + cells * 3) + " for " + std::to_string(out.width) + "x" +
+           std::to_string(out.height) + "\n";
+    return false;
+  }
+  uint32_t magic, ver, w, h;
+  std::memcpy(&magic, raw.data(), 4); std::memcpy(&ver, raw.data() + 4, 4);
+  std::memcpy(&w, raw.data() + 8, 4); std::memcpy(&h, raw.data() + 12, 4);
+  if (magic != kMagic || ver != kVersion) { log += at + "map.svmap: bad magic/version\n"; return false; }
+  if (w != U(out.width) || h != U(out.height)) {
+    log += at + "map.svmap is " + std::to_string(w) + "x" + std::to_string(h) +
+           " but map.json says " + std::to_string(out.width) + "x" + std::to_string(out.height) + "\n";
+    return false;
+  }
+  out.biome.resize(cells); out.landform.resize(cells); out.moisture.resize(cells);
+  for (size_t i = 0; i < cells; i++) {
+    const uint8_t p = raw[16 + i];
+    if (p >= paletteId.size()) {
+      log += at + "biome plane byte " + std::to_string(p) + " at cell " + std::to_string(i) +
+             " is outside the palette (" + std::to_string(paletteId.size()) + " entries)\n";
+      return false;
+    }
+    out.biome[i] = paletteId[p];
+  }
+  std::memcpy(out.landform.data(), raw.data() + 16 + cells, cells);
+  std::memcpy(out.moisture.data(), raw.data() + 16 + cells * 2, cells);
+
+  uint32_t hsh = 2166136261u;
+  hsh = FnvBytes(hsh, raw.data(), raw.size());
+  {
+    const std::string js = j.dump();
+    hsh = FnvBytes(hsh, reinterpret_cast<const uint8_t*>(js.data()), js.size());
+  }
+  out.contentHash = hsh;
+  return true;
+}
+
+bool PackWorldMap(const biomes::BiomeSet& set, const WorldMapData& map,
+                  std::vector<uint32_t>& W, std::string& log) {
+  if (!PackBiomeTable(set, W, log)) return false;
+  if (!map.Loaded()) return true;   // P0/P1 tools: records only, planes absent
+  W[kHCellLog2] = U(map.cellLog2);
+  W[kHWidth] = U(map.width);
+  W[kHHeight] = U(map.height);
+  W[kHOriginX] = U(map.originCellX);
+  W[kHOriginZ] = U(map.originCellZ);
+  W[kHSeaLevelY] = U(map.seaLevelY);
+  W[kHOceanFade] = U(map.oceanFadeCells);
+  W[kHWarpAmp] = U(map.warpAmpVox);
+  W[kHOceanBiome] = U(map.oceanBiome);
+  W[kHBiomePlane] = U(static_cast<int>(W.size()));
+  AppendPlane(W, map.biome);
+  W[kHLandformPlane] = U(static_cast<int>(W.size()));
+  AppendPlane(W, map.landform);
+  W[kHMoisturePlane] = U(static_cast<int>(W.size()));
+  AppendPlane(W, map.moisture);
+  W[kHContentHash] = 0u;
+  W[kHContentHash] = FnvWords(W) ^ map.contentHash;
+  std::printf("world map: '%s' %dx%d cells of %d vox, origin cell (%d,%d), %zu palette, "
+              "content %08x\n",
+              map.name.c_str(), map.width, map.height, 1 << map.cellLog2,
+              map.originCellX, map.originCellZ, map.palette.size(), W[kHContentHash]);
+  return true;
+}
+
+const WorldMapData& CurrentWorldMap() { return Slot(); }
+void SetCurrentWorldMap(WorldMapData map) { Slot() = std::move(map); }
 
 }  // namespace worldmap

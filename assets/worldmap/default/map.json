@@ -1,0 +1,28 @@
+{
+  "name": "default",
+  "about": "The shipped starting map (scripts/seed_worldmap.py). Repaint it in the tuner's World Map tab. Tier A: seed-independent.",
+  "cellLog2": 10,
+  "size": [
+    196,
+    196
+  ],
+  "originCell": [
+    98,
+    98
+  ],
+  "seaLevelY": 190,
+  "oceanFadeCells": 6,
+  "warpAmpVox": 160,
+  "biomes": [
+    "forest",
+    "meadow",
+    "pine",
+    "desert",
+    "tundra",
+    "swamp",
+    "alpine",
+    "ocean"
+  ],
+  "sites": [],
+  "rules": []
+}

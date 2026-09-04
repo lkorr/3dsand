@@ -2440,6 +2440,11 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadWgCount(*g, "caveThreshold2", w.caveThreshold2, out, at);
     // A NAME, never a path: worldedit.cpp joins it under assets/worldedits/,
     // and a value with a separator in it would reach outside that directory.
+    ReadStr(*g, "mapLayer", w.mapLayer, out, at);
+    if (w.mapLayer.empty() || w.mapLayer.find_first_of("/\\:") != std::string::npos) {
+      out.warnings.push_back("worldgen.mapLayer must be a bare map name; using \"default\"");
+      w.mapLayer = "default";
+    }
     ReadStr(*g, "editLayer", w.editLayer, out, at);
     if (w.editLayer.find_first_of("/\\:") != std::string::npos) {
       out.warnings.push_back("worldgen.editLayer must be a bare layer name; ignored");
@@ -2848,6 +2853,7 @@ std::string WorldgenDefaultsJson() {
   n("mossFace", w.mossFace);
   n("caveThreshold1", w.caveThreshold1);
   n("caveThreshold2", w.caveThreshold2);
+  s("mapLayer", w.mapLayer);
   s("editLayer", w.editLayer);
   o << "\n  }\n}\n";
   return o.str();

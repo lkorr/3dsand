@@ -6675,9 +6675,28 @@ the one model modders already read (PLAN_biomes.md §2 has the survey).
   `check_invariants.py biome order`); the tree atlas and the record table are
   laid out in that order and the shader reads the count from each header.
   Eight biomes ship: forest, meadow, pine, desert, tundra, swamp, alpine,
-  ocean. `worldgen.wgsl` still names the first four by id (`B_*`) and
-  `biomeAt` still comes from the noise band — the painted map replaces that
-  in P2; until then the four new biomes exist as records nothing selects.
+  ocean. `worldgen.wgsl` still names the first four by id (`B_*`) as the
+  (identity, folded-out) height curve's input until P4.
+* **LIVE (world map P2a, 2026-09-04): THE BIOME COMES FROM THE PAINTED MAP.**
+  `assets/worldmap/<worldgen.mapLayer>/` — `map.json` (cell size, extent,
+  origin cell, sea level, ocean fade, warp amplitude, the palette of biome
+  NAMES, sites, rules) beside `map.svmap` (three u8 planes: biome, landform,
+  moisture; four cells per word on the GPU). `LoadWorldMap` resolves the
+  palette by name against the biome files and `PackWorldMap` appends header
+  + planes to the same buffer as the records; `mapBiomeAt` in
+  `worldgen.wgsl` is `biomeAt` now. **Tier A is seed-independent** (the
+  plane), **Tier B takes the seed** (the boundary warp, two `vnoise2d`
+  samples, amplitude ≤ cell/4 — the loader refuses more, so a one-cell
+  region can never pinch below two tree tiles). Outside the planes the biome
+  is `ocean`. `World::MapBiomeAt` is the CPU twin; the `worldmap` gate holds
+  it to the plane at cell centres and to the GPU's ground skin in-window;
+  `check_invariants.py` (`world map layout`) holds `worldmap.h`'s word
+  offsets to the shader's `WM_*` consts. A missing or invalid map REFUSES to
+  start. The shipped `default` is `scripts/seed_worldmap.py`'s 20 km
+  starting layout (tundra north, desert east, alpine NW, swamp SE, ocean
+  ring past ~9 km, forest forced around the origin for the fixtures) — a
+  starting point for the World Map tab (P3), not a generator: the map is
+  authored data and every edit to it moves the world hash.
 * **LIVE: the biome band strip** on the climate section — the three worldgen
   thresholds (`meadowThreshold` / `pineThreshold` / `desertThreshold`) as one
   draggable bar writing `tuning.json`.

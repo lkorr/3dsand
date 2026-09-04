@@ -911,8 +911,13 @@ fn baseHeight(x : i32, z : i32, seed : u32) -> i32 {
 // `biomeFromBand`), because the height curve needs the band's continuous value.
 // Same two noise samples, same shifts, same salts, same thresholds, same order:
 // this is one function split in two, not a new one.
+// Since the world map's P2 the biome is READ FROM THE PAINTED MAP
+// (mapBiomeAt, below the tree atlas block), not derived from the noise band.
+// biomeBand/biomeFromBand and the threshold knobs survive only as inputs to
+// the (identity, compile-time-folded) per-biome height curve until P4 retires
+// that with the landform plane.
 fn biomeAt(x : i32, z : i32, seed : u32) -> u32 {
-  return biomeFromBand(biomeBand(x, z, seed));
+  return mapBiomeAt(x, z, seed);
 }
 
 // ---- the spawn clearing ----
@@ -1360,9 +1365,21 @@ fn taSpecies(sp : i32, w : u32) -> u32 {
 // cover rows appended after the records. Everything is already an integer the
 // kernel can use: material IDs resolved at load, heights in voxels, chances as
 // 1-in-N, slopes in Q8.
+const WM_H_CELL_LOG2     : u32 = 2u;
+const WM_H_WIDTH         : u32 = 3u;
+const WM_H_HEIGHT        : u32 = 4u;
+const WM_H_ORIGIN_X      : u32 = 5u;
+const WM_H_ORIGIN_Z      : u32 = 6u;
+const WM_H_SEA_LEVEL_Y   : u32 = 7u;
+const WM_H_OCEAN_FADE    : u32 = 8u;
+const WM_H_WARP_AMP      : u32 = 9u;
 const WM_H_BIOME_COUNT   : u32 = 10u;
 const WM_H_BIOME_RECORDS : u32 = 11u;
+const WM_H_BIOME_PLANE   : u32 = 12u;
+const WM_H_LANDFORM_PLANE: u32 = 13u;
+const WM_H_MOISTURE_PLANE: u32 = 14u;
 const WM_H_MAX_COVER_H   : u32 = 20u;
+const WM_H_OCEAN_BIOME   : u32 = 21u;
 const WM_B_WORDS         : u32 = 16u;
 const WM_B_SKIN          : u32 = 0u;
 const WM_B_SUBSOIL       : u32 = 1u;
@@ -1404,6 +1421,40 @@ fn wmBiome(b : u32, w : u32) -> u32 {
 fn wmFlag(b : u32, f : u32) -> bool { return (wmBiome(b, WM_B_FLAGS) & f) != 0u; }
 fn wmCover(b : u32, i : u32, w : u32) -> u32 {
   return worldMap[wmBiome(b, WM_B_COVER_OFF) + i * WM_C_WORDS + w];
+}
+
+// ---- the painted planes (P2) ------------------------------------------------
+// Four cells per word, little-endian; i = cz * width + cx (worldmap.h).
+fn wmPlaneAt(off : u32, cx : i32, cz : i32) -> u32 {
+  let i = u32(cz) * worldMap[WM_H_WIDTH] + u32(cx);
+  return (worldMap[off + (i >> 2u)] >> ((i & 3u) * 8u)) & 0xFFu;
+}
+// World column -> plane cell. `>>` on a negative i32 is an arithmetic shift
+// in WGSL and in C++ (World::MapBiomeAt is the twin), so this floors.
+fn wmCellOf(x : i32, z : i32) -> vec2<i32> {
+  let l = worldMap[WM_H_CELL_LOG2];
+  return vec2<i32>((x >> l) + i32(worldMap[WM_H_ORIGIN_X]),
+                   (z >> l) + i32(worldMap[WM_H_ORIGIN_Z]));
+}
+fn wmInside(c : vec2<i32>) -> bool {
+  return c.x >= 0 && c.y >= 0 && c.x < i32(worldMap[WM_H_WIDTH]) &&
+         c.y < i32(worldMap[WM_H_HEIGHT]);
+}
+// THE BIOME, from the map: Tier A (the plane) is seed-independent; the
+// boundary warp is Tier B and takes the seed, so a region's EDGE wanders per
+// seed by up to warpAmp (<= cell/4, enforced by the loader) while its centre
+// stays put -- "the mountains are always north, but a little different every
+// seed". Outside the painted planes the world is ocean. Two vnoise2d calls
+// with distinct salts: the same eight hashes the old noise band cost.
+fn mapBiomeAt(x : i32, z : i32, seed : u32) -> u32 {
+  let plane = worldMap[WM_H_BIOME_PLANE];
+  if (plane == 0u) { return 0u; }   // no planes uploaded (a tool with records only)
+  let amp = i32(worldMap[WM_H_WARP_AMP]);
+  let wx = x + (((vnoise2d(x, z, 9u, seed ^ 0x3A9Fu).n - 8192) * amp) >> 14);
+  let wz = z + (((vnoise2d(x, z, 9u, seed ^ 0x3AA0u).n - 8192) * amp) >> 14);
+  let c = wmCellOf(wx, wz);
+  if (!wmInside(c)) { return worldMap[WM_H_OCEAN_BIOME]; }
+  return wmPlaneAt(plane, c.x, c.y);
 }
 
 // Placement is per TREE_TILE XZ tile: hash the tile, and it either holds one

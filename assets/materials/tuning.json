@@ -943,6 +943,7 @@
     "mossFace": 0,
     "caveThreshold1": 150,
     "caveThreshold2": 148,
+    "mapLayer": "default",
     "editLayer": ""
   },
   "dayNight": {

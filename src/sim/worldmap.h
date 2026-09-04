@@ -90,8 +90,13 @@ enum : uint32_t {
   kHContentHash = 19,   // FNV-1a of both files; reported at boot
   kHMaxCoverH = 20,     // max over every biome of kB_MaxCoverH: the far
                         // cascade's blocker band has no biome in hand
+  kHOceanBiome = 21,    // biome id returned outside the painted planes
   kHeaderWords = 32,    // padded, like treeatlas::kFileHeaderWords
 };
+// Planes are packed FOUR CELLS PER WORD, little-endian: cell i of a plane at
+// word (off + (i >> 2)), byte (i & 3); i = cz * width + cx. The biome plane's
+// bytes are biome IDS (map.json's palette resolved by name at load), never
+// palette indices, so the shader does one lookup.
 
 // The magic in both the file and the buffer header: 'SVMP', little-endian.
 inline constexpr uint32_t kMagic = 0x504D5653u;
@@ -161,5 +166,62 @@ namespace worldmap {
  */
 bool PackBiomeTable(const biomes::BiomeSet& set, std::vector<uint32_t>& words,
                     std::string& log);
+
+// ---- the loaded map (P2) ---------------------------------------------------
+/** assets/worldmap/<name>/{map.json,map.svmap}, parsed and resolved. */
+struct WorldMapData {
+  std::string name;
+  int cellLog2 = 10;
+  int width = 0, height = 0;
+  int originCellX = 0, originCellZ = 0;   // plane cell whose low corner is world (0,0)
+  int seaLevelY = 0;
+  int oceanFadeCells = 0;
+  int warpAmpVox = 0;
+  int oceanBiome = 0;                     // id of "ocean" in the set, or 0
+  std::vector<std::string> palette;       // map.json biomes[]: plane byte -> name
+  std::vector<uint8_t> biome;             // RESOLVED to biome ids, width*height
+  std::vector<uint8_t> landform;
+  std::vector<uint8_t> moisture;
+  uint32_t contentHash = 0;               // FNV-1a over both files
+  bool Loaded() const { return width > 0 && height > 0; }
+  /** Cell coordinates of a world voxel column (arithmetic shift: floors). */
+  void CellOf(int x, int z, int* cx, int* cz) const {
+    *cx = (x >> cellLog2) + originCellX;
+    *cz = (z >> cellLog2) + originCellZ;
+  }
+  bool Inside(int cx, int cz) const {
+    return cx >= 0 && cz >= 0 && cx < width && cz < height;
+  }
+  uint8_t BiomeCell(int cx, int cz) const {
+    return biome[static_cast<size_t>(cz) * width + cx];
+  }
+};
+
+/**
+ * Load assets/worldmap/<name>/ and resolve its palette against the biome
+ * set. False, with `log`, on a missing directory, a malformed file, a
+ * palette name no biome file has, or planes whose size disagrees with
+ * map.json -- the caller ABORTS on false (a world with no map is not a
+ * world, see the header comment).
+ */
+bool LoadWorldMap(const std::string& assetDir, const std::string& name,
+                  const biomes::BiomeSet& set, WorldMapData& out, std::string& log);
+
+/**
+ * The whole `worldMap` buffer: PackBiomeTable's words plus the map header
+ * fields and the three planes. `map` may be unloaded (P0/P1 tools), in which
+ * case the plane offsets stay 0 and the samplers return biome 0.
+ */
+bool PackWorldMap(const biomes::BiomeSet& set, const WorldMapData& map,
+                  std::vector<uint32_t>& words, std::string& log);
+
+/**
+ * The process-wide loaded map, for the CPU twins (World::MapBiomeAt and,
+ * from P4, the height mirror). One, like CurrentTuning(): every reader of
+ * "what biome is this column" must see the same planes. Set by the loader
+ * paths in main.cpp / vk_smoke before the first World is built.
+ */
+const WorldMapData& CurrentWorldMap();
+void SetCurrentWorldMap(WorldMapData map);
 
 }  // namespace worldmap
