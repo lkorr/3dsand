@@ -413,6 +413,22 @@ bool streamOk = false;
     }
   }
   bool sdet = shash[0] == shash[1];
+  // ---- THE CROSS-MODE NUMBER (docs/RESEARCH_streaming_hitch.md R2) --------
+  //
+  // `sdet` is a TWICE-RUN comparison inside one process and one residency
+  // mode: it proves the streamed world is reproducible, and it cannot say
+  // anything about whether `--residency dense` produces the same world as
+  // paged. That claim is the only live oracle the page table has, and until
+  // this line it could only be made by inspection — the gate printed a shift
+  // count and a glass-voxel count, both of which are equal across modes for
+  // reasons that have nothing to do with the voxels.
+  //
+  // So the 300-tick hash SEQUENCE is folded into one word and printed. Two
+  // runs of this gate in the two modes agree on it or they do not, and the
+  // fold is over the whole sequence rather than the final hash because a
+  // divergence that heals is still a divergence.
+  uint32_t sseq = 0x811C9DC5u;
+  for (uint32_t h : shash[0]) sseq = (sseq ^ h) * 0x01000193u;
 
   // persistence roundtrip (live readbacks so eviction filters see reality)
   stream.OnRegen();
@@ -498,12 +514,12 @@ bool streamOk = false;
   }
 
   streamOk = sdet && evicted && glass > 0 && crossed;
-  std::printf("streaming: %s (hash sequences %s over %u shifts, ball chunk "
-              "evicted=%d, %u glass voxels after re-entry, player crossed=%d, "
-              "store %zu chunks)\n",
+  std::printf("streaming: %s (hash sequences %s over %u shifts, seq %08x, "
+              "ball chunk evicted=%d, %u glass voxels after re-entry, "
+              "player crossed=%d, store %zu chunks)\n",
               streamOk ? "PASS" : "FAIL", sdet ? "match" : "DIVERGE",
-              stream.ShiftCount(), evicted ? 1 : 0, glass, crossed ? 1 : 0,
-              stream.Store().Count());
+              stream.ShiftCount(), sseq, evicted ? 1 : 0, glass,
+              crossed ? 1 : 0, stream.Store().Count());
 }
 
   // Verdict: the flag the moved body already computed.

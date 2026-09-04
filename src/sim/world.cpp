@@ -231,7 +231,7 @@ void World::Init(const rhi::Device& device) {
   // The deferred-wake act verdict (world.h's genAct note). CopySrc because
   // Stream reads it back — one small copy per window shift, never mapped in
   // the frame path.
-  genAct = CreateBuffer(device, (uint64_t)kNChunk * kNChunk * 4,
+  genAct = CreateBuffer(device, (uint64_t)kGenPlaneRing * kNChunk * kNChunk * 4,
                         U::Storage | U::CopyDst | U::CopySrc, "genAct");
   // JITTER page materialization gets its OWN list, deliberately NOT genList.
   // Two u32 per entry (slot, sentinel entry) against genList's one, and — the

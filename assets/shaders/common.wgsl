@@ -422,7 +422,12 @@ struct TickParams {
   // in-kernel wake this replaced, byte for byte. It was the padWp0 pad word,
   // so the struct layout is unchanged.
   genDeferWake : u32,
-  padWp1 : u32,
+  // THE BATCH WINDOW into genList/genAct (docs/RESEARCH_streaming_hitch.md R2;
+  // world.h's genBatch). Low 24 bits = the first genList entry this dispatch
+  // covers, bit 31 = worldgen's stub mode. See the entry-word block above
+  // `list` in worldgen.wgsl. It was the padWp1 pad word, so the struct layout
+  // is unchanged.
+  genBatch : u32,
   windPrimLo : vec3<i32>,   // union AABB, inclusive world cells; the whole-loop
   padWp2 : i32,             // early-out. lo > hi means "no primitives".
   windPrimHi : vec3<i32>,

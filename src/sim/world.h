@@ -49,6 +49,22 @@ constexpr uint32_t kNChunk = kWorldN / kChunk;          // 32
 constexpr uint32_t kNumChunks = kNChunk * kNChunk * kNChunk;  // 32768
 constexpr uint32_t kChunkVol = kChunk * kChunk * kChunk;      // 4096
 constexpr uint64_t kVoxelCount = (uint64_t)kWorldN * kWorldN * kWorldN;
+// A shift plane: the slots one window shift evicts and refills.
+constexpr uint32_t kShiftPlaneChunks = kNChunk * kNChunk;     // 1024
+// How many shift planes can be mid-generation at once, and therefore how many
+// 1,024-entry regions genList/genAct are partitioned into
+// (docs/RESEARCH_streaming_hitch.md R2). A plane owns its region from the shift
+// tick until the readback that follows its LAST batch, which spans
+// Stream::kWakeLatency ticks, and a shift lands roughly every tick under
+// sprint flight — so this is the ceiling Stream::kMaxPendingShifts enforces,
+// with slack. genList holds kNumChunks entries, so 16 regions fit twice over.
+constexpr uint32_t kGenPlaneRing = 16;
+static_assert(kGenPlaneRing * kShiftPlaneChunks <= kNumChunks,
+              "the genList regions must fit inside genList");
+static_assert(kNumChunks < 0xFFFFu,
+              "a genList entry packs the slot index in its low 16 bits with "
+              "0xFFFF reserved as the cancelled marker (worldgen.wgsl's "
+              "GEN_SLOT_SKIP); a larger window needs a wider entry word");
 
 // ---- the fluid lab's flat-slab worldgen mode (docs/PLAN_fluid_overhaul.md §4)
 // The `--lab` / `--fluid-bench` test world: solid stone for y <= kLabSlabY,
@@ -1571,7 +1587,14 @@ struct TickParams {
   // to `genAct` and leaves dirtyIn/dirtyOut CLEARED for the slots it wrote,
   // instead of waking them itself. Set only by Stream::ShiftAxis.
   uint32_t genDeferWake = 0;
-  uint32_t pad_wp1 = 0;
+  // THE BATCH WINDOW into genList/genAct (docs/RESEARCH_streaming_hitch.md R2;
+  // was the pad_wp1 pad word, so the struct layout and the pinned hash are
+  // unchanged at the 0 default). Low 24 bits = the index of the first genList
+  // entry this dispatch covers; bit 31 selects worldgen's STUB mode, which
+  // writes a pending slot's placeholder material instead of generating it.
+  // The entry-word encoding is stated once in worldgen.wgsl beside `list` and
+  // mirrored by kGenSlotSkip / kGenBatchStubBit in stream.cpp.
+  uint32_t genBatch = 0;
   int32_t windPrimLo[3] = {1, 1, 1};   // union AABB of every live primitive,
   int32_t pad_wp2 = 0;                 // inclusive world cells (lo > hi = none)
   int32_t windPrimHi[3] = {0, 0, 0};
@@ -2695,9 +2718,19 @@ class World {
   // TickParams::genDeferWake is set, i.e. only by a window shift — full-window
   // worldgen and the voxregion tool still wake in-kernel at T.
   //
-  // Sized to ONE SHIFT PLANE, because that is the only producer. A caller that
-  // defers a larger genList would run off the end, so Stream asserts the bound
-  // rather than sizing this at kNumChunks "just in case".
+  // Sized to kGenPlaneRing SHIFT PLANES, because that is the only producer.
+  // A caller that defers a larger genList would run off the end, so Stream
+  // asserts the bound rather than sizing this at kNumChunks "just in case".
+  //
+  // THE RING (R2). A plane's chunks are generated a batch per tick rather than
+  // all on the shift tick, so several planes are mid-generation at once and
+  // each needs its own genList/genAct region for the whole of its life — from
+  // the shift tick to the readback that follows its LAST batch. One region per
+  // in-flight plane, indexed by TickParams::genBatch. kGenPlaneRing is the
+  // ceiling Stream::kMaxPendingShifts enforces; genList (kNumChunks entries) is
+  // large enough for the same number of regions with room to spare, and
+  // ReloadWindow's whole-window list is legal because it drains the queue
+  // first.
   rhi::Buffer genAct;          // deferred-wake act verdict, per genList slot
   rhi::Buffer pageFillList;    // JITTER materialization: (slot, entry) pairs
 

@@ -8489,11 +8489,13 @@ int main(int argc, char** argv) {
           // is the design working. `demote` is now the T+K completion, not a
           // fence, so it should read under a millisecond.
           std::printf("    window shift breakdown: %u shifts, %.2f ms each "
-                      "| evict %.2f  fill-store %.2f  fill-gen %.2f  demote "
+                      "| evict %.2f  fill-store %.2f  fill-gen %.2f  gen-batch "
+                      "%.2f (%.1f/shift)  demote "
                       "%.2f  wake-wait %.2f (%u) || per-tick: harvest %.3f  "
                       "dirty-fold %.3f\n",
                       st.shifts, st.totalMs * per, st.evictMs * per,
                       st.fillStoreMs * per, st.fillGenMs * per,
+                      st.genBatchMs * per, (double)st.genBatches * per,
                       st.demoteMs * per, st.wakeWaitMs * per, st.wakeWaits,
                       st.harvestMs / (double)n,
                       st.dirtyFoldMs / (double)n);
