@@ -888,6 +888,169 @@ Any of R1/R3 should be sized against this number, not the harness's.
 > longer decodes the refusing SLOT through `SlotToWorldChunk` at report time.
 > The record carries the world chunk resolved at fault time instead.
 
+> ### P4-H. LANDED 2026-09-03 — the drain was RATE-bound, and four fifths of the "backlog" was never freeable
+>
+> **Branch** `worktree-agent-aeba7edf008d1ebe0` off `streaming-smooth` @ 85133c1.
+> **Files** `src/sim/pagetable.{h,cpp}`, `src/sim/world.h` (comments + one new
+> constant; `kPoolPages` UNCHANGED). Item: P3-E's closing line, "the binding
+> constraint during flight is now the drain RATE, visible as `cands 4923 ->
+> submitted 128, capped 4795`".
+>
+> #### What the 4,923 candidates were (rule 6 first, and it changed the fix)
+>
+> The census's `fCands` was a stock with no composition, and `fCapped` was
+> DERIVED as `eligible - submitted` — which bills every unfreeable candidate to
+> "the budget was too small", the one reading that makes you raise a budget that
+> is not binding. Four mutually exclusive buckets now partition it, tested in
+> the order in which they are hopeless. At the `--autofly-surface` peak:
+>
+> | bucket | share | what it is |
+> |---|---|---|
+> | **dirty** | **53-56%** | in `cpuDirty`. The HARVEST always refused these (`fRefusedDirty`); a probe spent here learns nothing. The selection loop never tested `cpuDirty` at all — only the harvest did, one tick and one 16 KiB copy later — while `fCands`'s own doc comment claimed it did. |
+> | **ring** | **12-22%** | in the materialization set. Freeing is legal and useless: Materialize takes the page straight back next tick, plus a 16 KiB fill. |
+> | **proven** | 0-33% | neither, AND the occupancy snapshot postdates every tick the slot could have been written on. The CPU already knows the words are stainless air. |
+> | **needs-probe** | 3-8% | neither, but the snapshot does not postdate the last possible write. The live words are the only authority. This is the probe's real job. |
+>
+> **So ~75% of the "backlog" was pages no probe could ever free**, and the free
+> path was spending its whole budget discovering that one tick late. Three
+> further measurements from the same instrument, none of which a bare count
+> could have produced:
+>
+> - **The achieved drain was 26.0 pages/tick against a 128/tick budget.** The
+>   cap was NOT binding. The deferred map lands about one tick in three, so the
+>   probe submitted 54/tick, and of 29,670 probes only 14,265 (48%) ended in a
+>   free.
+> - **38% of all probes were spent on slots whose page vanished before the
+>   harvest** (`gone` 15,090 of 40,120 on the park arm), plus 4% identity
+>   refusals from shifts. The 16 KiB copy is issued, the page is demoted by the
+>   streaming path in the meantime, and the copy is discarded.
+> - **`words` refusals were ZERO in every run measured** — over 100,000 probes
+>   across five arms. In these workloads the probe has never once caught the
+>   stale-occupancy case it exists for. It stays, because "never observed" is
+>   not "cannot happen" and the failure mode is lost hashed state, but it is now
+>   a backstop rather than the mechanism.
+>
+> #### The fix: a clock, not a bigger budget
+>
+> `reachTick_[slot]` records the last tick on which ANY writer could have stored
+> into that slot. It is §3.2's closure lemma written down as a number instead of
+> re-derived per call site: the materialization set IS "every chunk this tick
+> could write", so `Materialize` stamps its members (and `cpuDirty`'s, belt to
+> braces), and the one CPU-seam chokepoint every non-CA writer goes through —
+> `EnsurePageForOverwrite` — stamps the rest. The bulk resets stamp the whole
+> array, since they hand out pages without passing through either.
+>
+> Then: **if `reachTick_[s] < snapTick`, nothing has written the slot since the
+> snapshot was stamped, so the snapshot's own `occTotal == 0` and its
+> `packOccStain` flag describe the chunk as it is NOW.** That is
+> `kAirDemoteMask` satisfied in all 4,096 cells — the exact predicate the word
+> probe evaluates — established from data the CPU already had. The page is
+> released on the spot: no copy, no deferral, no probe slot consumed. It is the
+> same shape as the shift's sky demote at T+K, which also trusts a count because
+> it can argue nothing has written the slot since; the difference is that this
+> one makes the argument for ANY slot, from a clock, rather than only for the
+> plane it has just generated.
+>
+> Two smaller changes come with it, and the first is most of the probe win:
+> candidates in `cpuDirty` / the flight shell / the materialization set are
+> filtered out at COLLECTION rather than refused at harvest, so the probe budget
+> goes only to slots that can actually free. The filter DEFERS, it never
+> disqualifies — under the `>=` trigger every one of them is still eligible next
+> tick.
+>
+> #### Falsified, not argued
+>
+> `SANDVOX_PT_VERIFYFREE=1` routes `proven` candidates through the word probe
+> instead of releasing them and counts every disagreement, so the CPU's claim
+> and the live words are two independently derived answers to one question.
+> `--frames 900 --autofly-surface`, 687 ticks, 34,111 probes, **0 mismatches**,
+> 0 page faults. The arm stays in the binary; it is one env var, and it is the
+> only thing that makes "the closure argument holds" a measurement rather than a
+> paragraph.
+>
+> #### Measured
+>
+> One binary, three arms (`SANDVOX_PT_FREEMODE=0` is the pre-P4-H path):
+>
+> | `--frames 1200 --autofly-surface` | freed/tick | probed/tick | backlog `cand` at peak | pool high water |
+> |---|---|---|---|---|
+> | mode 0 (before) | **26.0** | 54.1 | 1,328 | 24,709 @ tick 549 |
+> | mode 2, ceiling 2,048 (**shipped**) | **111.4** | 41.9 | 38 | 23,909 @ tick 599 |
+> | mode 2, ceiling 8,192 (pool +96 MiB) | 178.1 | 37.4 | 307 | 21,733 @ tick 626 |
+>
+> `--frames 1200 --autofly-park`, which flies 300 ticks and stops — the arms fly
+> the same nominal route, so residency compared AT MATCHED TICKS is the one
+> cross-arm number here that is not soft:
+>
+> | resident at tick | 125 | 175 | 225 | 275 | peak | plateau |
+> |---|---|---|---|---|---|---|
+> | mode 0 | 16,998 | 18,291 | 19,039 | 20,184 | 20,964 @350 | 14,519, reached ~tick 650 |
+> | mode 2 | 14,105 | 16,325 | 15,324 | 17,313 | 22,791 @350 | 16,968, reached ~tick 475 |
+>
+> **Residency during flight is 11-17% lower at matched ticks, and the post-park
+> drain reaches its plateau in ~125 ticks instead of ~325.** The plateau VALUES
+> are not comparable between the two runs and must not be quoted as a result:
+> both are `orphan 0` and made entirely of real matter (`full + matter`), and
+> they differ because the dt-integrated route parks over different terrain
+> (buried band 12,480 vs 14,618). Peak high-water across arms is soft for the
+> same reason — the runs reach different ticks — which is why the rate, the
+> backlog bucket and the matched-tick curve are the numbers this note leads
+> with. Page faults 0 in all six runs; `SANDVOX_PT_AUDIT=1` balanced.
+>
+> #### The pool did NOT grow, and the arithmetic that decided it
+>
+> Every freed page parks in the retire queue for `kPageRetireTicks`, so the
+> SUSTAINED free rate of the engine is `kPageRetireCeiling / kPageRetireTicks`
+> = 2,048 / 16 = **128 pages per tick, whichever gate authorized the free**.
+> Raising it costs 16 pages of pool per extra page per tick. The pre-P4-H path
+> achieved 26/tick against that same limit, so **the ceiling was never the
+> binding constraint and it still had 5x of headroom nobody could reach**; the
+> shipped configuration reaches 111/tick, 87% of what the existing pool already
+> allows. The 8,192 arm (`SANDVOX_PT_RETIRECAP`, one env var) buys 178/tick and
+> ~2,000 pages of peak residency for +6,144 pages of pool = +96 MiB of VRAM, and
+> was not taken: the pool is a fixed reservation, and the residency it buys is
+> headroom against an abort that §3.8's derivation already makes unreachable.
+>
+> `kPageRetireTicks = 16` was re-derived rather than assumed, since shortening
+> it is the only way to raise the rate for free. The comment in `pagetable.h`
+> justified it by "the eviction ring holds kMaxPendingEvicts (4) batches" —
+> stale in both inputs (it is 16 now, and the demote path has its own separate
+> 32) and the wrong quantity besides: what must elapse is the GPU EXECUTING the
+> copy, so the bound is the submitted-but-not-retired pipeline depth in ticks,
+> `kMaxTicksPerFrame * (kFramesInFlight + 1) = 16` — the same quantity P2-D
+> derived for `kReadbackSlots`. The number does not move; it now rests on the
+> same fact as the readback ring instead of on a batch count that has already
+> changed once unnoticed.
+>
+> The ceiling is now ENFORCED at `PageTable::ReleasePage` (a free that would
+> overflow the queue waits a tick, counted as `ceiling-held`) instead of only
+> asserted in `RetirePages`. With two producers, "the queue cannot exceed the
+> product" is one more reading that has to stay true; the assert remains as belt
+> to those braces, and now asserts something the limiter makes impossible.
+>
+> #### What this does NOT fix, with its number
+>
+> At the flight peak the resident set is `dirty 53% + ring 14%` — the
+> conservative mirror and its N26 dilation — and `cand`, the genuinely-freeable
+> backlog this package attacks, was **1,328 of 24,709 pages (5.4%)** before it
+> and 38 after. So the free path is now essentially instantaneous and flight
+> residency is still two thirds mirror. **The next lever is the mirror, not the
+> free path**, and the census says so in one line rather than needing another
+> elimination sequence.
+>
+> #### Instruments left behind
+>
+> `[pt-census]`'s `cand mix` (the four-bucket partition), `reach age` (how long
+> the non-dirty, non-ring candidates have been out of every writer's reach —
+> which separates "the snapshot lag will hand it over next tick" from "something
+> keeps re-marking it"), and **RUN TOTALS**, cumulative since the last table
+> reset and printed with every census. The last one is the one to reach for
+> first: every free-path line above it is ONE TICK, the per-tick numbers vary by
+> an order of magnitude between a tick the deferred map landed on and one it did
+> not, and reading a rate off two samples of a 300-tick run is exactly how "the
+> probe submits 128/tick" survived as a belief while the probe was really
+> submitting once every three ticks.
+
 ---
 
 ## P2-D. The snapshot-staleness stall under a deep GPU queue — LANDED 2026-09-03

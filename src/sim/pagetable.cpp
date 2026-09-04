@@ -121,6 +121,13 @@ void PageTable::ResetAllEmpty(const rhi::Queue& queue) {
   pendingJitterFills_.clear();
   retire_.clear();
   zeroStreak_.assign(kNumChunks, 0);
+  // The bulk resets are the two paths that hand out pages WITHOUT going
+  // through Materialize or EnsurePageForOverwrite, so they stamp the write-
+  // reach clock themselves (P4-H). `tick_` is right and "never" would be
+  // wrong: worldgen writes every one of these slots at this tick, and only a
+  // snapshot that POSTDATES it may be trusted to describe them.
+  reachTick_.assign(kNumChunks, tick_);
+  totals_ = PageCensus{};
 }
 
 void PageTable::ResetIdentity(const rhi::Queue& queue) {
@@ -190,6 +197,13 @@ void PageTable::ResetIdentity(const rhi::Queue& queue) {
   pendingJitterFills_.clear();
   retire_.clear();
   zeroStreak_.assign(kNumChunks, 0);
+  // The bulk resets are the two paths that hand out pages WITHOUT going
+  // through Materialize or EnsurePageForOverwrite, so they stamp the write-
+  // reach clock themselves (P4-H). `tick_` is right and "never" would be
+  // wrong: worldgen writes every one of these slots at this tick, and only a
+  // snapshot that POSTDATES it may be trusted to describe them.
+  reachTick_.assign(kNumChunks, tick_);
+  totals_ = PageCensus{};
 }
 
 uint32_t PageTable::Alloc() {
@@ -414,6 +428,13 @@ uint64_t PageTable::EnsurePageForOverwrite(uint32_t slot) {
     return (uint64_t)t[slot] * kChunkVol * 4;
   const uint32_t p = Alloc();
   allocsOvr_++;
+  // THE CPU SEAM'S HALF OF THE WRITE-REACH CLOCK (P4-H). Every voxel writer
+  // that is not the CA reaches the buffer through this function — the streaming
+  // store-hit refill, the genList plane, LoadWorld, --voxdump's batch — so this
+  // is where they declare themselves. Marking here and in Materialize is what
+  // makes reachTick_ a complete record of "could anything have written this
+  // slot", which is what authorizes a probe-less release.
+  MarkReach(slot);
   // Re-arm the hysteresis counter, for the same reason Materialize does at its
   // own sentinel->page transition: zeroStreak_ means "consecutive empty
   // snapshots SINCE RESIDENCY BEGAN", and residency begins HERE for every
@@ -1137,6 +1158,25 @@ void PageTable::Materialize(const rhi::Queue& queue) {
   // as ops.
   materialized_.UnionWith(fluidChunks_);
 
+  // ---- THE WRITE-REACH CLOCK (P4-H) ---------------------------------------
+  //
+  // `materialized_` is, by its own definition above, the set of chunks THIS
+  // TICK COULD WRITE. Stamping the tick on each member turns that definition
+  // into a per-slot record the free path can consult later: a candidate whose
+  // last stamp predates the occupancy snapshot cannot have changed since the
+  // snapshot, so the snapshot's counts are exact and no word probe can add
+  // anything. cpuDirty is stamped too — it is a subset of the write reach in
+  // every case that matters (a dirty chunk with no matter is excluded from the
+  // bracketed half precisely because nothing in it can move), and unioning it
+  // costs one pass over a list Materialize already walks.
+  //
+  // Cost: two byte-stores per member of two sets this function already
+  // iterates. A settled world's cpuDirty is empty and this is zero work, which
+  // is the rule-2 story the whole mechanism is built on.
+  if (reachTick_.size() != kNumChunks) reachTick_.assign(kNumChunks, 0u);
+  for (uint32_t s : materialized_.Members()) reachTick_[s] = tick_;
+  for (uint32_t s : cpuDirty_.Members()) reachTick_[s] = tick_;
+
   if (getenv("SANDVOX_PT_DEBUG")) {
     std::printf("[pt] tick %u cpuDirty=%zu hasMatter=%zu mat=%zu ops=%zu part=%zu fluid=%zu inUse=%u aM=%u aO=%u\n",
                 tick_, cpuDirty_.Size(), hasMatterCount, materialized_.Size(),
@@ -1181,18 +1221,95 @@ void PageTable::Materialize(const rhi::Queue& queue) {
                 PtNowMs() - matT0, materialized_.Size());
 }
 
+// The ONE place a page goes back, whichever gate authorized it: the word
+// probe's harvest or the probe-less release. Returns false when the retire
+// queue is full, which is the whole rate limit made explicit at the producer.
+//
+// THE CEILING IS NOW ENFORCED, NOT MERELY ASSERTED (P4-H). kPoolPages is
+// derived as kNumChunks + kPageRetireCeiling, and that derivation is only
+// sound while the queue really cannot exceed the ceiling - which used to
+// follow from "one producer, capped at kPageFreeProbesPerTick per tick" and a
+// FATAL in RetirePages if the reading was ever wrong. With a second producer
+// (the probe-less release) the arithmetic is the same and the reading is one
+// more thing to get right, so the bound is applied HERE, where a refusal costs
+// a tick of latency, instead of being discovered there, where it costs an
+// abort. RetirePages keeps its check as belt to these braces: it now asserts
+// something this function makes impossible, which is the correct relationship
+// between a limiter and a tripwire.
+bool PageTable::ReleasePage(uint32_t slot, uint32_t tick) {
+  if (retire_.size() >= (size_t)retireCap_) {
+    pending_.fCeilingHeld++;
+    return false;
+  }
+  const auto& t = world_->pageTableCpu();
+  const uint32_t page = t[slot];
+  if ((page & kPtSentinelBit) != 0u) return true;   // already a sentinel
+  // THE FREE LOG, keyed on the WORLD CHUNK and not the slot. A fault record
+  // names a world chunk (common.wgsl's voxStore); a free that names a slot
+  // cannot be lined up against it after a shift, which is the whole reason
+  // the reporter defect was expensive. Same key, both ends, so one grep pairs
+  // them.
+  if (getenv("SANDVOX_PT_FREELOG")) {
+    const IVec3 wc = world_->SlotToWorldChunk(slot);
+    std::printf("[pt-free] tick %u FREED slot %u chunk (%d,%d,%d)\n",
+                tick, slot, wc.x * (int)kChunk, wc.y * (int)kChunk,
+                wc.z * (int)kChunk);
+  }
+  world_->pageTableCpuMutable()[slot] = kPtEmpty;
+  MarkTableDirty(slot);
+  retire_.push_back({page, tick});
+  pagesInUse_--;
+  pagesFreed_++;
+  pending_.fFreed++;
+  return true;
+}
+
 void PageTable::ConsumeOccupancy(const std::vector<uint32_t>& occupancy,
                                  const std::vector<uint8_t>& occStain,
                                  uint32_t tick) {
   if (!paged_) return;
   if (zeroStreak_.size() != kNumChunks) zeroStreak_.assign(kNumChunks, 0);
+  if (reachTick_.size() != kNumChunks) reachTick_.assign(kNumChunks, 0u);
   const auto& t = world_->pageTableCpu();
   const bool haveStainFlags = occStain.size() == kNumChunks;
+  // ---- THE FREE-PATH MODE, ONE BINARY, THREE ARMS (P4-H) ------------------
+  //
+  // An #if-guarded second form tests only itself, so the pre-P4-H free path
+  // stays reachable at runtime and the A/B is two invocations of one exe:
+  //   SANDVOX_PT_FREEMODE=0  probe every candidate, no collection filter
+  //   SANDVOX_PT_FREEMODE=1  filter at collection, probe the rest
+  //   SANDVOX_PT_FREEMODE=2  + release provable candidates with no probe
+  // SANDVOX_PT_FREEDIRECT=n caps the probe-less releases per tick (the pool is
+  // sized against kPageFreeDirectPerTick, so n above it is clamped).
+  if (freeMode_ < 0) {
+    const char* m = getenv("SANDVOX_PT_FREEMODE");
+    freeMode_ = m ? atoi(m) : 2;
+    const char* d = getenv("SANDVOX_PT_FREEDIRECT");
+    freeDirectMax_ = d ? (uint32_t)std::max(0, atoi(d)) : kPageFreeDirectPerTick;
+    if (freeDirectMax_ > kPageFreeDirectPerTick)
+      freeDirectMax_ = kPageFreeDirectPerTick;
+    verifyFree_ = getenv("SANDVOX_PT_VERIFYFREE") != nullptr;
+    const char* rc = getenv("SANDVOX_PT_RETIRECAP");
+    if (rc) retireCap_ = std::min((uint32_t)std::max(0, atoi(rc)),
+                                  (uint32_t)kPageRetireCeiling);
+    if (getenv("SANDVOX_PT_DEBUG"))
+      std::printf("[pt] free path: mode %d, direct budget %u/tick, probe %zu/tick"
+                  ", verify %d\n", freeMode_, freeDirectMax_,
+                  kMaxFreeProbesPerTick, (int)verifyFree_);
+  }
+  // The tick the occupancy words being consumed were stamped at. The
+  // probe-less release is exactly the claim "nothing has written this slot
+  // since then", so this is the clock everything below is compared against.
+  const WorldSnapshot& snapNow = world_->Snap();
+  const bool haveSnapTick = snapNow.valid;
+  const uint32_t snapTick = snapNow.tick;
   // The tick's free-path event tallies (PageCensus's f* block). Reset here and
   // published by RunCensus at the bottom of this function, so a reader between
   // ticks sees one coherent set.
   pending_ = PageCensus{};
   std::vector<uint32_t> candidates;
+  std::vector<uint8_t> candidateProven;   // SANDVOX_PT_VERIFYFREE cross-check
+  std::vector<uint32_t> direct;           // released with no probe at all
   // ---- THE ELIGIBLE SET IS BOUNDED AND ROTATED (P3-E) ----------------------
   //
   // Under the `>=` trigger eligibility is no longer a one-tick window a slot
@@ -1276,7 +1393,72 @@ void PageTable::ConsumeOccupancy(const std::vector<uint32_t>& occupancy,
     // queued, so what reaches the cap is slots that are quiet, out of cpuDirty,
     // and stainless as of the last snapshot — in a settled world, none at all.
     eligible++;
-    if (candidates.size() < kMaxFreeProbesPerTick) candidates.push_back(s);
+    if (zeroStreak_[s] == kPageFreeTicks) pending_.fNewElig++;
+
+    // ---- WHAT IS THIS CANDIDATE, AND CAN A PROBE HELP IT? (P4-H) ---------
+    //
+    // These four partition the eligible set and they are tested in this order
+    // because that is the order in which they are hopeless:
+    //
+    //  - in cpuDirty: the HARVEST refuses it (fRefusedDirty), so submitting it
+    //    burns one of the tick's 128 copies to learn nothing. The old
+    //    selection loop never tested cpuDirty at all — only the harvest did,
+    //    one tick and one 16 KiB copy later — while the doc comment on fCands
+    //    claimed it did.
+    //  - in the materialization set: freeing it is legal and useless.
+    //    Materialize takes the page straight back next tick and pays a 16 KiB
+    //    fill for it. The ring is the player's own wake; it reclaims itself by
+    //    moving.
+    //  - proven: the snapshot postdates every tick this slot could have been
+    //    written on (see reachTick_), so `occTotal == 0 && !anyStain` is not a
+    //    hypothesis to confirm with live words, it is the answer.
+    //  - otherwise: the words are the only authority. This is the probe's job
+    //    and, after the filtering above, close to its whole job.
+    const bool candDirty = cpuDirty_.Has(s);
+    const bool candShell = shellActive_ && shell_.Has(s);
+    const bool candRing = materialized_.Has(s);
+    const bool candProven =
+        haveSnapTick && haveStainFlags && reachTick_[s] < snapTick;
+    if (candDirty) pending_.fCandDirty++;
+    else if (candRing) pending_.fCandRing++;
+    else if (candProven) pending_.fCandProven++;
+    else pending_.fCandProbe++;
+
+    if (freeMode_ == 0) {
+      if (candidates.size() < kMaxFreeProbesPerTick) {
+        candidates.push_back(s);
+        candidateProven.push_back(0u);
+      } else {
+        pending_.fCapped++;
+      }
+      continue;
+    }
+    // The filter DEFERS, it never disqualifies: under the `>=` trigger every
+    // one of these slots is still eligible next tick, and the ones worth
+    // freeing stop being dirty / stop being in the ring on their own.
+    if (candDirty || candShell || candRing) continue;
+    // How long has this candidate been out of every writer's reach? The
+    // probe-less release needs that to exceed the snapshot lag, so this
+    // separates "the lag will hand it over next tick" from "something keeps
+    // re-marking it and the mirror is the thing to fix".
+    {
+      const uint32_t age = tick_ >= reachTick_[s] ? tick_ - reachTick_[s] : 0u;
+      if (age <= 1u) pending_.aAge1++;
+      else if (age <= 4u) pending_.aAge4++;
+      else if (age <= 16u) pending_.aAge16++;
+      else pending_.aAgeOld++;
+    }
+    if (freeMode_ >= 2 && candProven && !verifyFree_) {
+      if (direct.size() < freeDirectMax_) direct.push_back(s);
+      else pending_.fCapped++;
+      continue;
+    }
+    if (candidates.size() < kMaxFreeProbesPerTick) {
+      candidates.push_back(s);
+      candidateProven.push_back(candProven ? 1u : 0u);
+    } else {
+      pending_.fCapped++;
+    }
   }
 
   // ---- HARVEST last tick's deferred probe, then SUBMIT this tick's ----------
@@ -1327,6 +1509,23 @@ void PageTable::ConsumeOccupancy(const std::vector<uint32_t>& occupancy,
         // the same call instead of a second hand-rolled rescan.
         const size_t at = scan::FirstIndexWhereMasked(words, kChunkVol,
                                                       kAirDemoteMask, 0u);
+        // ---- THE FALSIFICATION TEST FOR THE PROBE-LESS RULE (P4-H) -------
+        //
+        // SANDVOX_PT_VERIFYFREE routes `proven` candidates through the probe
+        // instead of releasing them, so the CPU's claim and the live words are
+        // two INDEPENDENTLY DERIVED answers to the same question rather than
+        // one answer checked against itself. Every disagreement is a voxel the
+        // probe-less path would have dropped, so the arm is only meaningful if
+        // this counter reads 0 - which is something a run can establish,
+        // unlike "the argument looks right".
+        if (ci < pendingProbeProven_.size() && pendingProbeProven_[ci] &&
+            at != kChunkVol) {
+          pending_.fVerifyBad++;
+          std::printf("[pt] VERIFYFREE MISMATCH tick %u slot %u: word %08x at "
+                      "%u, reach %u vs snap %u\n",
+                      tick_, s, words[at], (uint32_t)at, reachTick_[s],
+                      snapTick);
+        }
         if (at != kChunkVol) {
           if (ptDbg) {
             std::printf("[pt] tick %u free REFUSED slot %u: word %08x at %u\n",
@@ -1346,29 +1545,62 @@ void PageTable::ConsumeOccupancy(const std::vector<uint32_t>& occupancy,
           zeroStreak_[s] = kPageFreeTicks - 1;
           continue;
         }
-        const uint32_t page = t[s];
-        // THE FREE LOG, keyed on the WORLD CHUNK and not the slot. A fault
-        // record names a world chunk (common.wgsl's voxStore); a free that
-        // names a slot cannot be lined up against it after a shift, which is
-        // the whole reason the reporter defect was expensive. Same key, both
-        // ends, so one grep pairs them.
-        if (getenv("SANDVOX_PT_FREELOG")) {
-          const IVec3 wc = world_->SlotToWorldChunk(s);
-          std::printf("[pt-free] tick %u FREED slot %u chunk (%d,%d,%d)\n",
-                      tick, s, wc.x * (int)kChunk, wc.y * (int)kChunk,
-                      wc.z * (int)kChunk);
-        }
-        world_->pageTableCpuMutable()[s] = kPtEmpty;
-        MarkTableDirty(s);
-        retire_.push_back({page, tick});
-        pagesInUse_--;
-        pagesFreed_++;
-        pending_.fFreed++;
+        ReleasePage(s, tick);
       }
       pendingProbeSlots_.clear();
+      pendingProbeProven_.clear();
       probePending_ = false;
     }
     // If not ready yet, keep probePending_ true — harvest again next tick.
+  }
+
+  // ---- RELEASE phase: the candidates that need no probe at all (P4-H) ----
+  //
+  // THE ARGUMENT, from 3.2's closure lemma and nowhere else. A page may be
+  // handed back only if no in-flight or future write can reach its slot while
+  // the table still points at it. For a slot in `direct`:
+  //
+  //  1. FUTURE writes. The materialization set is DEFINED as every chunk this
+  //     tick could write, and a write lands in a slot only if the slot is in
+  //     it - that is what makes a page fault a bug rather than an expected
+  //     outcome. Next tick's set is built AFTER this table entry is already
+  //     PT_EMPTY, and Materialize hands the slot a fresh page before any
+  //     dispatch that could write it. A future write re-materializes; it
+  //     cannot land in the released page.
+  //  2. IN-FLIGHT writes. A write encoded on an earlier tick targets this slot
+  //     only if the slot was in THAT tick's materialization set or was passed
+  //     to EnsurePageForOverwrite - and both stamp reachTick_. Selection
+  //     required reachTick_[s] < snapTick, so the newest write this slot can
+  //     have taken predates the snapshot being consumed. Nothing is in flight.
+  //  3. WHAT THE PAGE HOLDS. The same inequality makes the snapshot's own
+  //     numbers current rather than stale: occTotal == 0 (no cell holds a
+  //     non-air material) and packOccStain's bit 31 clear (no cell carries
+  //     stain bits 24-30). sim_mutate strips CELLOP_IF_AIR before it stores,
+  //     so bit 31 of a VOXEL cannot persist either. That is kAirDemoteMask
+  //     satisfied in all 4,096 cells - the exact predicate the word probe
+  //     evaluates - established from data the CPU already had. The probe
+  //     cannot reach a different verdict; it can only reach it a tick later
+  //     and 16 KiB of PCIe poorer.
+  //  4. THE PAGE still goes through the retire queue, unchanged. Risk 5 is
+  //     about an in-flight COPY reading a page after it has been reallocated,
+  //     which is a different hazard from a write and is not weakened here.
+  //
+  // This is the same shape as the shift's sky demote at T+K (stream.cpp's
+  // ApplyGenVerdict), which also trusts a count instead of the words because
+  // it can argue nothing has written the slot since the count was taken. The
+  // difference is that this one makes the argument for ANY slot, from a clock,
+  // instead of only for the plane it has just generated.
+  if (!direct.empty()) {
+    for (uint32_t s : direct) {
+      // Re-test the three cheap guards at release time. They were true at
+      // selection a few lines ago and nothing between can have changed them -
+      // but a free is the one operation in this file that cannot be undone.
+      if ((t[s] & kPtSentinelBit) != 0u) continue;
+      if (cpuDirty_.Has(s)) continue;
+      if (shellActive_ && shell_.Has(s)) continue;
+      if (!ReleasePage(s, tick)) break;   // retire queue at its ceiling
+      pending_.fFreedDirect++;
+    }
   }
 
   // ---- SUBMIT phase: kick a new probe for this tick's candidates ----------
@@ -1384,8 +1616,16 @@ void PageTable::ConsumeOccupancy(const std::vector<uint32_t>& occupancy,
   if (probeSubmit_ && !candidates.empty() && !probePending_) {
     const size_t n = std::min(candidates.size(), kMaxFreeProbesPerTick);
     pending_.fSubmitted = (uint32_t)n;
-    pending_.fCapped = eligible - (uint32_t)n;
+    // fCapped is counted at SELECTION now, not derived here as
+    // `eligible - submitted`. With the filter in place the two differ and the
+    // derived form is the misleading one: it billed every dirty and every ring
+    // candidate to "the budget was too small", which is the one reading that
+    // makes you raise a budget that was not binding.
     pendingProbeSlots_.assign(candidates.begin(), candidates.begin() + n);
+    pendingProbeProven_.assign(candidateProven.begin(),
+                               candidateProven.begin() +
+                                   std::min(n, candidateProven.size()));
+    pendingProbeProven_.resize(n, 0u);
     pendingProbeKeys_.resize(n);
     for (size_t i = 0; i < n; i++)
       pendingProbeKeys_[i] =
@@ -1407,6 +1647,27 @@ void PageTable::ConsumeOccupancy(const std::vector<uint32_t>& occupancy,
                 "harvested=%u %.2f ms\n",
                 tick, candidates.size(), probesRun, probesHarvested,
                 PtNowMs() - probeT0);
+
+  // ---- RUN TOTALS ---------------------------------------------------------
+  // Accumulated every tick, printed with every census. See the t* block in
+  // PageCensus for why a sampled per-tick line is not a rate.
+  totals_.tTicks++;
+  totals_.tNewElig += pending_.fNewElig;
+  totals_.tSubmitted += pending_.fSubmitted;
+  totals_.tFreed += pending_.fFreed;
+  totals_.tFreedDirect += pending_.fFreedDirect;
+  totals_.tRefusedWords += pending_.fRefusedWords;
+  totals_.tRefusedDirty += pending_.fRefusedDirty;
+  totals_.tCeilingHeld += pending_.fCeilingHeld;
+  if (pending_.fProbeBusy) totals_.tProbeBusyTicks++;
+  // allocsMat_/allocsOvr_ are per-TICK counters (BeginTick clears them), so
+  // these accumulate rather than assign — the first version assigned and
+  // reported "132 allocations" for a 548-tick flight, which is one tick's.
+  totals_.tAllocMat += allocsMat_;
+  totals_.tAllocOvr += allocsOvr_;
+  totals_.tRefusedGone += pending_.fRefusedGone;
+  totals_.tRefusedIdent += pending_.fRefusedIdent;
+  totals_.tFreedPeak = std::max(totals_.tFreedPeak, (uint64_t)pending_.fFreed);
 
   // ---- ATTRIBUTION, after this tick's frees so it describes the result -----
   RunCensus(occupancy, occStain);
@@ -1448,6 +1709,32 @@ void PageTable::RunCensus(const std::vector<uint32_t>& occupancy,
   c.fRefusedShell = pending_.fRefusedShell;
   c.fRefusedIdent = pending_.fRefusedIdent;
   c.fRefusedGone = pending_.fRefusedGone;
+  c.fCandDirty = pending_.fCandDirty;
+  c.fCandRing = pending_.fCandRing;
+  c.fCandProven = pending_.fCandProven;
+  c.fCandProbe = pending_.fCandProbe;
+  c.fNewElig = pending_.fNewElig;
+  c.fFreedDirect = pending_.fFreedDirect;
+  c.fVerifyBad = pending_.fVerifyBad;
+  c.fCeilingHeld = pending_.fCeilingHeld;
+  c.aAge1 = pending_.aAge1;
+  c.aAge4 = pending_.aAge4;
+  c.aAge16 = pending_.aAge16;
+  c.aAgeOld = pending_.aAgeOld;
+  c.tTicks = totals_.tTicks;
+  c.tNewElig = totals_.tNewElig;
+  c.tSubmitted = totals_.tSubmitted;
+  c.tFreed = totals_.tFreed;
+  c.tFreedDirect = totals_.tFreedDirect;
+  c.tRefusedWords = totals_.tRefusedWords;
+  c.tRefusedDirty = totals_.tRefusedDirty;
+  c.tProbeBusyTicks = totals_.tProbeBusyTicks;
+  c.tCeilingHeld = totals_.tCeilingHeld;
+  c.tAllocMat = totals_.tAllocMat;
+  c.tAllocOvr = totals_.tAllocOvr;
+  c.tRefusedGone = totals_.tRefusedGone;
+  c.tRefusedIdent = totals_.tRefusedIdent;
+  c.tFreedPeak = totals_.tFreedPeak;
 
   // Pass A: the top of matter per SLOT COLUMN, in WORLD chunk Y.
   //
@@ -1558,19 +1845,45 @@ void PrintPageCensus(const PageCensus& c, const char* label) {
       "            shell %u | stain %u | waiting %u | cand %u | ORPHAN %u "
       "(%.1f%%) | unbilled %d\n"
       "  bands     sky %u (of which all-air %u) | surface %u | buried %u\n"
-      "  free path cands %u -> submitted %u, freed %u | capped %u, "
-      "probe-busy %u\n"
+      "  free path cands %u -> submitted %u, freed %u (direct %u) | "
+      "capped %u, probe-busy %u, ceiling-held %u\n"
       "            refused: words %u, dirty %u, shell %u, identity %u, "
-      "gone %u\n",
+      "gone %u\n"
+      "  cand mix  new %u | dirty %u, ring %u, PROVEN %u, needs-probe %u"
+      " | verify-bad %u\n"
+      "  reach age (non-dirty, non-ring cands) <=1 %u | 2-4 %u | 5-16 %u"
+      " | >16 %u\n"
+      "  RUN TOTALS over %llu ticks: newly-eligible %llu, probed %llu, "
+      "FREED %llu (direct %llu)\n"
+      "            per tick: elig %.1f, freed %.1f (peak %llu) | probe busy "
+      "on %llu ticks, ceiling held %llu\n"
+      "            probe refused: words %llu, dirty %llu, gone %llu, "
+      "identity %llu\n"
+      "            allocs: materialize %llu, overwrite %llu\n",
       label, c.tick, c.resident, c.pool,
       c.pool ? 100.0 * (double)c.resident / (double)c.pool : 0.0, c.freeList,
       c.retired, c.rDirty, c.rDirty * pct, c.rRing, c.rRing * pct, c.rFull,
       c.rFull * pct, c.rMatter, c.rMatter * pct, c.rShell, c.rStain,
       c.rWaiting, c.rCand, c.rOrphan, c.rOrphan * pct,
       (int)c.resident - (int)billed, c.bSky, c.bSkyEmpty, c.bSurface,
-      c.bBuried, c.fCands, c.fSubmitted, c.fFreed, c.fCapped, c.fProbeBusy,
-      c.fRefusedWords, c.fRefusedDirty, c.fRefusedShell, c.fRefusedIdent,
-      c.fRefusedGone);
+      c.bBuried, c.fCands, c.fSubmitted, c.fFreed, c.fFreedDirect, c.fCapped,
+      c.fProbeBusy, c.fCeilingHeld, c.fRefusedWords, c.fRefusedDirty,
+      c.fRefusedShell, c.fRefusedIdent, c.fRefusedGone, c.fNewElig,
+      c.fCandDirty, c.fCandRing, c.fCandProven, c.fCandProbe, c.fVerifyBad,
+      c.aAge1, c.aAge4, c.aAge16, c.aAgeOld,
+      (unsigned long long)c.tTicks, (unsigned long long)c.tNewElig,
+      (unsigned long long)c.tSubmitted, (unsigned long long)c.tFreed,
+      (unsigned long long)c.tFreedDirect,
+      c.tTicks ? (double)c.tNewElig / (double)c.tTicks : 0.0,
+      c.tTicks ? (double)c.tFreed / (double)c.tTicks : 0.0,
+      (unsigned long long)c.tFreedPeak,
+      (unsigned long long)c.tProbeBusyTicks,
+      (unsigned long long)c.tCeilingHeld,
+      (unsigned long long)c.tRefusedWords,
+      (unsigned long long)c.tRefusedDirty,
+      (unsigned long long)c.tRefusedGone,
+      (unsigned long long)c.tRefusedIdent,
+      (unsigned long long)c.tAllocMat, (unsigned long long)c.tAllocOvr);
   std::fflush(stdout);
 }
 

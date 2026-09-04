@@ -203,6 +203,58 @@ struct PageCensus {
   uint32_t fRefusedShell = 0;    // flight-shell guard at harvest (re-armed)
   uint32_t fRefusedIdent = 0;    // a shift reassigned the slot (NOT re-armed)
   uint32_t fRefusedGone = 0;     // page vanished / already a sentinel (NOT re-armed)
+  // ---- WHAT THE ELIGIBLE SET IS MADE OF (P4-H) ----------------------------
+  //
+  // `fCands` is a STOCK and it was the only number the free path reported, so
+  // "cands 4923 -> submitted 128" says reclamation is behind and nothing about
+  // WHY or about what would fix it (CLAUDE.md rule 6: a bare count buys one
+  // hypothesis per run). These four PARTITION fCands, in the order the
+  // selection loop tests them:
+  //
+  //   dirty  — in cpuDirty. The harvest would refuse it anyway, so a probe
+  //            spent here is a probe wasted. (The doc comment on fCands used
+  //            to claim "not dirty"; the selection loop never tested it.)
+  //   ring   — in the materialization set but not dirty: freeing it hands the
+  //            page back and Materialize takes it again NEXT TICK, plus a
+  //            16 KiB fill. Churn, not reclamation.
+  //   proven — neither, and the snapshot POSTDATES every tick the slot could
+  //            have been written on, so the CPU already knows the words are
+  //            stainless air and no GPU probe can tell it anything new.
+  //   probe  — neither, but the snapshot does not postdate the last possible
+  //            write (a freshly refilled slot is the common case), so the live
+  //            words are the only authority. This is what the probe is FOR.
+  uint32_t fCandDirty = 0, fCandRing = 0, fCandProven = 0, fCandProbe = 0;
+  // Slots that became eligible THIS tick (streak crossed the threshold). The
+  // flow against fCands's stock: reclamation keeps up iff fFreed >= fNewElig
+  // in the steady state, and no per-tick budget can beat a flow above it.
+  uint32_t fNewElig = 0;
+  uint32_t fFreedDirect = 0;   // of fFreed, released with no probe at all
+  uint32_t fVerifyBad = 0;     // SANDVOX_PT_VERIFYFREE: a `proven` slot the
+                               // word probe then REFUSED. Must be 0; a
+                               // non-zero falsifies the closure argument.
+  uint32_t fCeilingHeld = 0;   // frees deferred because the retire queue is at
+                               // kPageRetireCeiling (the rate limit made
+                               // explicit at the producer)
+  // ---- WHY A CANDIDATE IS NOT PROVABLE: AGE SINCE LAST WRITE-REACH -------
+  // For the candidates that survive the dirty/ring filter, `tick -
+  // reachTick_[s]` bucketed. The probe-less release needs that age to exceed
+  // the SNAPSHOT LAG, so this says whether a non-provable candidate is one
+  // the lag will hand over in a tick or two (a3 / a8 heavy) or one something
+  // keeps re-marking (a1 heavy, and then the mirror is the thing to fix).
+  uint32_t aAge1 = 0, aAge4 = 0, aAge16 = 0, aAgeOld = 0;
+  // ---- RUN TOTALS, because every line above is ONE TICK -------------------
+  //
+  // The census is sampled (every SANDVOX_PT_CENSUS_EVERY ticks, plus the
+  // high-water latch and the exit), and the free path's per-tick numbers vary
+  // by an order of magnitude between a tick the deferred map landed on and one
+  // it did not. Reading a rate off two samples of a 300-tick run is how "the
+  // probe submits 128/tick" survives as a belief while the probe is really
+  // submitting once every three ticks. These are cumulative since the last
+  // table reset and they are the numbers a drain-rate claim must quote.
+  uint64_t tTicks = 0, tNewElig = 0, tSubmitted = 0, tFreed = 0,
+           tFreedDirect = 0, tRefusedWords = 0, tRefusedDirty = 0,
+           tProbeBusyTicks = 0, tCeilingHeld = 0, tAllocMat = 0, tAllocOvr = 0,
+           tRefusedGone = 0, tRefusedIdent = 0, tFreedPeak = 0;
 };
 
 // One table to stdout. `label` names the moment ("tick 600", "high water",
@@ -609,6 +661,63 @@ class PageTable {
   // already running and takes NO further action. That is the rule-2 story, and
   // it is honest: not free, but not a new scan either.
   std::vector<uint8_t> zeroStreak_;
+
+  // ---- THE WRITE-REACH CLOCK (P4-H) ---------------------------------------
+  //
+  // Per slot: the last tick on which ANY writer could have stored a voxel into
+  // it. `kReachNever` (= 0) means "not since the last table reset".
+  //
+  // This is §3.2's closure lemma written down as a number instead of re-derived
+  // per call site. The materialization set IS, by definition, "every chunk this
+  // tick could write": the CA acts only on chunks in dirtyIn, cpuDirty is a
+  // superset of dirtyIn, a CA write reaches at most one cell (rule 1), so every
+  // CA write of tick N lands in N26(cpuDirty(N) n hasMatter) — the bracketed
+  // half — and the op / particle-spawn / fluid rings are unioned in for the
+  // three writers whose targets are CPU-declared rather than CA-derived. The
+  // only voxel writers outside it are the CPU-seam ones (streaming store-hit
+  // refill, the genList plane, LoadWorld, the voxregion tool), and every one of
+  // those goes through EnsurePageForOverwrite — which is exactly why that
+  // function is the one chokepoint. Both mark here.
+  //
+  // What it buys: if the occupancy snapshot being consumed was stamped at tick
+  // S and reachTick_[s] < S, then nothing has written slot s since S, so the
+  // snapshot's own occupancy and stain flag describe the chunk AS IT IS NOW
+  // rather than as it was. `occTotal == 0 && !anyStain` is then not a hint that
+  // needs confirming with 16 KiB of live words — it is the answer, and the page
+  // can be released with no GPU work at all. Same shape as the shift's sky
+  // demote at T+K, which trusts its own in-kernel count for the same reason.
+  //
+  // The comparison is STRICT (`<`, not `<=`) so it holds whether sim_occupancy
+  // runs before or after the CA within tick S. One tick of extra latency
+  // against a bound nobody has to re-check.
+  //
+  // A slot that has never been marked reads 0, which is "proven" against any
+  // snapshot past tick 0 — and that is correct rather than a hole, because a
+  // slot can only BECOME a free candidate by holding a page, and the only two
+  // ways to hold one are Materialize (marks) and EnsurePageForOverwrite
+  // (marks). The bulk resets (ResetIdentity / ResetAllEmpty, which hand out
+  // pages without going through either) stamp the whole array themselves.
+  std::vector<uint32_t> reachTick_;
+  void MarkReach(uint32_t slot) {
+    if (slot < reachTick_.size()) reachTick_[slot] = tick_;
+  }
+  // Free-path mode, from SANDVOX_PT_FREEMODE (see ConsumeOccupancy):
+  //   0 = probe everything, no collection filter (pre-P4-H behaviour)
+  //   1 = filter dirty/shell/ring out at collection, still probe the rest
+  //   2 = 1 + release `proven` candidates with no probe   [default]
+  // Cumulative free-path events since the last reset (PageCensus's t* block).
+  PageCensus totals_;
+  int freeMode_ = -1;          // -1 = not yet read from the environment
+  uint32_t freeDirectMax_ = 0; // per-tick probe-less release budget
+  // SANDVOX_PT_RETIRECAP=n clamps the ENFORCED retire ceiling below the
+  // compile-time one, so "what would this cost if the pool did not grow?" is
+  // an arm of the same binary rather than a rebuild. The sustained free rate
+  // of the whole engine is this number divided by kPageRetireTicks, which is
+  // the one sentence that decides kPageFreeDirectPerTick.
+  uint32_t retireCap_ = kPageRetireCeiling;
+  bool verifyFree_ = false;    // route `proven` slots through the probe anyway
+  std::vector<uint8_t> pendingProbeProven_;
+
   std::function<std::vector<bool>(const std::vector<uint32_t>&)> probeSubmit_;
   std::function<bool(uint32_t*)> probeHarvest_;
   std::vector<uint32_t> freeProbe_;
@@ -657,10 +766,26 @@ class PageTable {
   //
   // A freed page is therefore PARKED with the tick that freed it and only
   // becomes reusable once enough ticks have passed for any in-flight copy to
-  // have completed. kRetireTicks bounds that: the eviction ring holds
-  // kMaxPendingEvicts (4) batches and CompleteOldest is called when it fills,
-  // so a copy cannot outlive that many drains — 16 is comfortable headroom and
-  // costs only that many pages of latency in the free list.
+  // have completed.
+  //
+  // THE DERIVATION OF 16, RE-DONE 2026-09-03 (P4-H) because the one that was
+  // here had gone stale in both of its inputs. It read: "the eviction ring
+  // holds kMaxPendingEvicts (4) batches and CompleteOldest is called when it
+  // fills, so a copy cannot outlive that many drains - 16 is comfortable
+  // headroom". kMaxPendingEvicts is 16 now (stream.cpp), the demote path has
+  // its own separate kMaxPendingDemotes of 32, and neither of those is the
+  // right quantity anyway: what has to elapse is not batches, it is the GPU
+  // EXECUTING the copy. So the bound is the depth of the submitted-but-not-
+  // retired pipeline in TICKS, which is exactly the quantity P2-D derived for
+  // kReadbackSlots: kMaxTicksPerFrame * (kFramesInFlight + 1) = 4 * 4 = 16.
+  // The number does not move; its justification does, and it now rests on the
+  // same one fact as the readback ring rather than on a batch count that has
+  // already changed once without anybody noticing.
+  //
+  // Shortening it is the ONE way to raise the sustained free rate without
+  // enlarging the pool (the rate is kPageRetireCeiling / kRetireTicks), and
+  // this derivation is why P4-H did not do it: 16 is not slack, it is the
+  // pipeline depth.
   //
   // §4.2's sentinel fast path sidesteps most of this entirely: a sentinel slot
   // is not copied at all, so it has no in-flight reference to have.
@@ -672,7 +797,7 @@ class PageTable {
   struct Retired { uint32_t page; uint32_t tick; };
   std::deque<Retired> retire_;
   static constexpr uint32_t kRetireTicks = kPageRetireTicks;
-  static_assert(kPoolPages >= kNumChunks + kMaxFreeProbesPerTick * kRetireTicks,
+  static_assert(kPoolPages >= kNumChunks + kPageRetireCeiling,
                 "page pool must cover one page per chunk slot PLUS every page "
                 "the retire queue can hold out of the free list; otherwise "
                 "Alloc() can abort while slots are still sentinels");
@@ -698,6 +823,12 @@ class PageTable {
   PageCensus pending_;
   void RunCensus(const std::vector<uint32_t>& occupancy,
                  const std::vector<uint8_t>& occStain);
+
+  // Hand one page back to the retire queue. The single exit for both free
+  // gates (the word probe's harvest and the probe-less release), so the retire
+  // ceiling, the free log and the accounting live in one place. Returns false
+  // if the queue is at kPageRetireCeiling and the free must wait a tick.
+  bool ReleasePage(uint32_t slot, uint32_t tick);
 
  public:
   // Drain the queued page-initialization fills into `enc`. MUST be called at
