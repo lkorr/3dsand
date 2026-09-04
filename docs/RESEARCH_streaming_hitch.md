@@ -10,6 +10,53 @@ Companion docs: `docs/PLAN_surface_flight_perf.md` (history, Corrections 1-6),
 
 ---
 
+## STATUS 2026-09-04 — what landed on `streaming-smooth`, measured once at the end
+
+Integration branch `streaming-smooth` (worktree `.claude/worktrees/streaming-smooth`)
+= main f8325da + the packages below. Every number: `SANDVOX_RUN_EXCLUSIVE=1`,
+integrated exe, `--frames 600 --autofly-surface`, two runs; "before" is the
+2026-09-02 exe on the same harness (§0).
+
+| | before | after (run 1 / run 2) |
+|---|---|---|
+| whole frame p50 / p95 / p99 (ms) | 32.8 / 95.8 / 129.4 | 17.0 / 70.8 / 91.2 · 17.1 / 69.3 / 86.1 |
+| frames > 33 ms / > 100 ms | 270 (50%) / 19 | 128 (24%) / 3 · 137 (25%) / 2 |
+| per shift, CPU (ms) | 34.80 (demote fence 33.06) | 4.93 · 4.62 (fence 0; wake-wait 1.15 / 0.89) |
+| snapshot stalls / ring refusals | 1 / 11 (fence hid them); 136 / 119 after R1 alone | 28 / 0 · 17 / 0 |
+| pool high water | 22,652 (65%) | 19,377 (56%) · 18,489 (53%) |
+| page faults | 0 | 0 |
+| `--autofly-hard` control p50 | ~3 (older tree) / 8.8 (R1 tree) | 9.3, 0 stalls, high water 23,864 |
+
+`--suite acceptance` on the integrated tree: page faults 0, both smoke tables
+match their new pins, regressions = `armor-react` + `wound-accumulate` only
+(upstream: the fire landing halved gas ignition and bare flesh no longer
+ignites in the gate's window; not touched here).
+
+Landed, in order: R1 deferred wake K=4 (012bcb3) + R4 one shift per frame;
+rhi staging-ring reclamation fix + 4 KiB class-A threshold (cdfb8a8); P2-D
+readback ring 3 → 16 derived (9d66543); P2-C worldgen hoists −18% mean /
+−40% max (81b3769); P2-B page census (042e5be); P3-E `AbandonCommands` +
+free trigger `>=` (5761a2e, ccf8357); P3-F `surface-sprint` perf scenario +
+GPU billing of fills/copies (bc00fc5); P4-H probe-less release by ordering
+clock, frees 26 → 111/tick (d87eb83); baseline quoting + pins (245fcfc,
+dfd30e0, 840e63f). Built and REJECTED with numbers: R2 worldgen spreading
+(a2ce7ad — at ~1 shift/tick spreading is the identity and adds 28%).
+
+Open, with the number that says so: (1) the frame is now GPU-bound and the
+tail is the RAYMARCH (68% of the worst-5% delta in `surface-sprint`; the
+owner's live game renders at 17.7 ms) — a renderer item, not streaming;
+(2) `worldgenList` 4.2 ms median per plane is 98% of the remaining streaming
+GPU bill — P4-G's "do not generate the sky" (needs a CPU mirror of worldgen's
+column top) is the lever, not spreading; (3) at a flight peak the resident set
+is dirty 53% + ring 14% — the mirror's N26 dilation, not the free path, is the
+residency lever now; (4) paged vs dense hash SEQUENCES differ across shifts
+(P4-G's fold; P5-I bisecting); (5) the per-shift `demote` CPU term rose from
+0.3 to ~2.2 ms between the P2 and P4 merges (P3-E/P4-H collection filters?) —
+small, unattributed. (6) `--frames` runs die when any `build.sh` taskkills
+`sandvox.exe` by image name — run a renamed copy.
+
+---
+
 ## 0. The measurement (do not trust the prose without re-running this)
 
 Binary `build/Release/sandvox.exe` of 2026-09-02 20:04 (tree 2e30611), quiet
