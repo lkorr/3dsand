@@ -1549,9 +1549,7 @@ Run PerfRunner::Record(const Scenario& sc) {
       // ---- the streaming shift, per frame -----------------------------------
       // Diffed from Stream's own cumulative Timing rather than re-timed here,
       // so the harness cannot disagree with the shift breakdown --frames
-      // prints. `shiftCpuMs` is the five phases of ShiftAxis (R2's per-tick
-      // worldgen batches included, which is why it is charged to the frame that
-      // ISSUES a batch rather than to the shift tick); `wakeWaitMs` is
+      // prints. `shiftCpuMs` is the four phases of ShiftAxis; `wakeWaitMs` is
       // the deferred wake's T+K poll BLOCKING because the readback it needs has
       // not landed, which is the one place a shift can still stall the frame.
       {
@@ -1564,7 +1562,6 @@ Run PerfRunner::Record(const Scenario& sc) {
             (st.evictMs - prevStream.evictMs) +
             (st.fillStoreMs - prevStream.fillStoreMs) +
             (st.fillGenMs - prevStream.fillGenMs) +
-            (st.genBatchMs - prevStream.genBatchMs) +
             (st.demoteMs - prevStream.demoteMs);
         smp.counters[(int)PerfCounter::ChunksStreamed] =
             (double)(st.shifts - prevStream.shifts) * (double)(kNChunk * kNChunk);

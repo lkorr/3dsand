@@ -281,8 +281,21 @@ are deduplicated across mob defs, so 128 slots cover a whole cast.
 
   **The world hash moves once**, because a streamed-in plane first acts at T+K
   instead of T. K is a constant, so "when does a plane first act" stays a pure
-  function of (inputs, tick); the deferral applies in BOTH residency modes so
-  paged and `--residency dense` still hash identically.
+  function of (inputs, tick); the deferral applies in BOTH residency modes, so
+  it cannot itself be a source of paged/dense difference.
+
+  > **CORRECTION 2026-09-03 (P4-G).** "paged and `--residency dense` still hash
+  > identically" was an argument, not a measurement, and nothing in the engine
+  > was checking it: the `streaming` gate's `sdet` is a TWICE-RUN comparison
+  > inside one mode. It now also prints a fold of its whole 300-tick hash
+  > sequence and the hash of its FIRST tick, and **the two modes do not agree**
+  > — `f23ebbe9` paged against `397cc3e2` dense on `85133c1`, with `t1`
+  > matching. A matching first tick puts the divergence in the SHIFT path (tick
+  > 1 is one CA tick after a fresh whole-window worldgen, before any shift), not
+  > in worldgen or materialization. Each mode is reproducible against itself, so
+  > this is not a determinism failure; it is the paged/dense oracle being broken
+  > for streaming, and it is not attributed further yet.
+  > docs/RESEARCH_streaming_hitch.md §R2/P4-G.
 
   Three things make it correct rather than merely faster. (1) The sky demote at
   T+K is refused when the slot is in `cpuDirty` or the latest snapshot's dirty
@@ -294,6 +307,19 @@ are deduplicated across mob defs, so 128 slots cover a whole cast.
   older pending verdict — a stale "pure sky" applied to fresh stone is the same
   voxel loss. (3) `cpuDirty` must be a SUPERSET of `dirtyIn`, so every slot the
   wake writes is `RefilledSlot`-declared, `genAct` included.
+- **Spreading the plane's worldgen over those K ticks: MEASURED AND REJECTED
+  (R2, 2026-09-03).** `worldgenList` is 98% of the streaming GPU bill, so the
+  obvious next move was to issue the plane 256 chunks a tick instead of 1,024 at
+  once. Built in full and it is a **28% regression** on that very pass. The
+  reason is arithmetic and no implementation fixes it: at the measured **0.99
+  window shifts per tick** four planes each contribute a quarter every tick, so
+  the per-tick total is unchanged and only the dispatch count goes up (~350 us
+  each in submit plus the head-of-command-buffer barrier). The control that
+  proves it — the same machinery with the batch set to the whole plane —
+  reproduces the baseline exactly. Numbers, the placeholder design and what to
+  do instead (do not generate the ~586 pure-sky chunks of a plane at all, which
+  needs a CPU mirror of worldgen's `colTop`) are in
+  docs/RESEARCH_streaming_hitch.md §R2/P4-G.
 - **One shift per frame (R4, same doc):** `Stream::Update` is a per-TICK call
   and the frame loop runs up to four ticks, so a slow frame used to shift two
   or three times and compound its own slowness. `Stream::BeginFrame()` (called

@@ -278,6 +278,178 @@ learns K ticks later, and the CA is simply told to wait K ticks.
 
 ### R2. Spread the plane's worldgen over ticks (once R1 removes the fence)
 
+> ## P4-G. BUILT, MEASURED AND REJECTED 2026-09-03 — the mean cannot move and the split costs 28%
+>
+> **Branch** `worktree-p4g-genspread`. The implementation is complete and
+> passing at **`78feb6c`**; the branch tip **reverts it** and keeps only the
+> instrument that killed it. Read this section before re-attempting R2 — the
+> reason it fails is arithmetic, not an implementation defect, so a better
+> implementation cannot rescue it.
+>
+> ### What was built (it works; it is just not worth having)
+>
+> Exactly the design below. A shift plane's 1,024 chunks were ordered
+> SURFACE OUTWARD (key: the chunk's distance from `World::TerrainHeight` at its
+> own column, memoized per column; tie-break the slot index — a pure function of
+> the plane and the seed, never of frame time) and issued
+> `kGenChunksPerTick = 256` per tick over four ticks. Three consequences were
+> handled and all three worked:
+>
+> - **A placeholder for a slot between the shift tick and its own batch.** Air
+>   above the column's ground, `stone` at or below it, chosen on the CPU from
+>   `World::TerrainHeight` and installed as a page-table SENTINEL under paged
+>   (no page, no memory, no fill) or written by a stub dispatch under dense. The
+>   Y band matters: DESIGN.md's "unloaded space is solid and inert" is the right
+>   rule at and below the ground, where the neighbouring plane's sand and water
+>   are active at the window edge, and the wrong rule above it, where a stone
+>   placeholder is a wall of rock 25 m in front of a sprinting player that also
+>   blocks the shadow and openness walks. Surface-outward ordering then means
+>   the only chunks that ever WEAR a placeholder are the ones it describes
+>   correctly.
+> - **The occupancy/`genAct` readback moved behind the LAST batch** (recorded in
+>   the same command buffer, tracker-derived barrier), with `genList`/`genAct`
+>   partitioned into `kGenPlaneRing` per-plane regions addressed by a new
+>   `TickParams::genBatch` (low 24 bits the base, bit 31 the stub mode) because
+>   a shift lands roughly every tick and four planes are mid-generation at once.
+> - **Cancellation.** `InvalidatePendingSlots` already blanked a stale verdict;
+>   an un-dispatched batch entry additionally becomes `GEN_SLOT_SKIP` so the
+>   kernel generates nothing for a slot a later shift has repurposed. Batches
+>   use the CURRENT origin, which is correct precisely because the only slots a
+>   later shift re-homes are the ones it has just marked stale.
+>
+> Gates: `--gate streaming` PASS paged and dense, `--gate determinism`
+> `b9e443c7` UNMOVED (that gate never shifts the window), **page faults 0** in
+> both modes.
+>
+> ### The measurement that ended it
+>
+> `SANDVOX_RUN_EXCLUSIVE=1 --perf --scenario surface-sprint`, 600 frames,
+> RTX 3060 Ti. The `worldgen` GPU node's PER-FRAME distribution, read straight
+> out of `series.gpu.worldgen` (non-zero entries only — those are the frames
+> that ran a dispatch):
+>
+> | arm | mean (all 600) | p50 | p90 | p99 | max | shift ms |
+> |---|---|---|---|---|---|---|
+> | baseline `85133c1` | **3.86** | 5.28 | 8.26 | 11.84 | 12.46 | 4.24 |
+> | R2, 4 batches of 256 | **4.92 / 4.94** (two runs) | 6.13 | 9.73 | 12.88 | **13.72** | 8.73 |
+> | **control: R2 machinery, `kGenChunksPerTick = 1024`** | **3.77** | 5.23 | 7.10 | 10.38 | 11.87 | — |
+>
+> **The control is the whole finding.** All of R2's machinery — the region ring,
+> the entry word, the placeholder pass, the moved readback — with the batch size
+> set to the whole plane reproduces the baseline cost to within run noise
+> (3.77 vs 3.86; two runs of the 256 arm agree to 0.4%). So the +28% is not the
+> placeholders and not the bookkeeping: **it is the four dispatches.** Splitting
+> one 1,024-workgroup `worldgenList` into four of 256 costs ~1.4 ms per shift —
+> about 350 us per extra dispatch, which is the extra submit, the
+> head-of-command-buffer global barrier every command buffer pays
+> (vulkan_barrier_graph §3.4) and the ramp/tail of a dispatch that no longer
+> fills the machine.
+>
+> The windowed harness agrees, and it is where the >100 ms tail lives.
+> `SANDVOX_RUN_EXCLUSIVE=1 --frames 600 --autofly-surface`:
+>
+> | | baseline | R2 (256) |
+> |---|---|---|
+> | frame p50 / p95 / p99 / max | 16.1 / 62.0 / 85.1 / 160.0 | 18.1 / 70.8 / 90.4 / 159.7 |
+> | frames > 33 ms | 133 (24.6%) | 155 (28.7%) |
+> | window shift | 4.24 ms (fill-gen 0.21, demote 2.26) | 8.73 ms (fill-gen 1.12, gen-batch 0.36, demote 2.14) |
+> | **wake-wait** | 0.74 ms, **21 misses** / 340 shifts | 4.05 ms, **78 misses** / 360 shifts |
+> | page pool high water | 20,718 (59.5%) | **22,942 (65.9%)** |
+> | page faults | 0 | 0 |
+>
+> ### Why no implementation can rescue it — three independent reasons
+>
+> 1. **THE MEAN IS FIXED BY THE SHIFT RATE, AND THE SHIFT RATE IS ~1/TICK.**
+>    `surface-sprint` measures 0.99 shifts per tick (P3-F §1 measured the same).
+>    A plane spread over four ticks means FOUR planes are each contributing a
+>    quarter every tick — the same 1,024 chunks per tick the single dispatch
+>    produced in one lump. Spreading redistributes work between planes, not
+>    between ticks, and at one plane per tick that redistribution is the
+>    identity. **The brief's target of `worldgen` 3.6 -> 0.9 ms/frame was
+>    arithmetically unreachable from the start.** This should have been checked
+>    against P3-F's own 0.99 shifts/tick line before any code was written.
+> 2. **THE MAXIMUM DOES NOT MOVE EITHER, AND MEASURED, IT GOT WORSE.** The
+>    argument for R2 was the 11.3 ms tree-and-cave plane. But a frame under
+>    spreading carries one batch from each of four different planes, so the
+>    expensive plane's quarter is added to three other planes' quarters rather
+>    than replacing them: the frame total is a plane's worth either way. The
+>    measured max went 12.46 -> 13.72 (and the 1-batch control's is 11.87), so
+>    the variance-reduction claim is refuted by data as well as by arithmetic.
+> 3. **IT UNDOES R4 ON CATCH-UP FRAMES.** R4 caps the window at one SHIFT per
+>    frame, which bounds worldgen per frame to one plane. R2's batches are
+>    scheduled per TICK — they have to be, or the tick a chunk stops being a
+>    placeholder becomes a function of frame pacing and the world hash with it —
+>    so a 3-tick catch-up frame issues three ticks of batches from every
+>    in-flight plane, up to three planes' worth. That is the exact frame R4
+>    exists to protect, and it is why `>33 ms` went 24.6% -> 28.7%.
+>
+> Two further costs that are fixable but pointless to fix given the above:
+> `fill-gen` 0.21 -> 1.12 ms/shift is the CPU placeholder pass (the sort, the
+> per-column `TerrainHeight` memo, 768 `SetSentinel`s and their coalesced table
+> writes); and moving the readback behind the last batch leaves the T+K poll
+> `kWakeLatency - (kGenBatches - 1)` ticks of drain instead of K, which tripled
+> the wake-wait misses at three ticks. Buying that back means raising K, which
+> is what put pool high water up 2,224 pages.
+>
+> ### One thing R2 DID get right, and it is worth keeping in mind
+>
+> Allocating pages per BATCH rather than per plane is strictly better than the
+> shift tick allocating all 1,024 at once, and installing a placeholder SENTINEL
+> costs the pool nothing at all. That half of the idea is real; it is just
+> attached to a dispatch split that costs more than it saves. (`SetSentinel` ->
+> `Free` returns a page to `freePages_` DIRECTLY — only the hysteresis free
+> probe parks pages in the retire queue — so demoting a plane's worth of slots
+> is not a `kPageRetireCeiling` hazard, which is worth knowing for R3.)
+>
+> ### What to do instead, with the evidence
+>
+> **Do not generate the sky.** `genChunk` already has a per-column early-out —
+> `if (col.biome != B_DESERT && base.y > colTop) { write air; continue; }` in
+> `worldgen.wgsl` — and P3-F measured ~586 of a plane's 1,024 chunks as pure
+> sky. Those workgroups still dispatch, still run `genColumn` for 256 columns
+> and still write 16 KiB of zeros each. A CPU-side skip that installed `PT_EMPTY`
+> and left them out of the list would remove **~57% of `worldgenList`** — a real
+> ~2 ms/frame, against R2's zero. What it needs is a CPU mirror of `colTop` (the
+> top of anything worldgen places in a column: canopy, ruin walls, flora), which
+> does not exist today; `World::TerrainHeight` is the GROUND by contract and is
+> not it. That mirror is the item, and it is a "two places must agree" pair that
+> `check_invariants.py` would have to police the way it already polices the
+> height contract.
+>
+> The other honest reading of P3-F §4 still stands: `worldgenList` is 4.7 ms of
+> a 16.7 ms frame and FLAT between a median and a tail frame, so it is not what
+> the >100 ms windowed frames are made of. The standing hypothesis there is FIFO
+> quantisation amplified by 3-tick frames, and the way to settle it is the ten
+> lines in `main.cpp` P3-F §4 names, not another pass at the worldgen kernel.
+>
+> ### The instrument that shipped, and a pre-existing bug it found
+>
+> The branch tip keeps one thing: **`--gate streaming` now prints a fold of its
+> whole 300-tick hash SEQUENCE (`seq`) and the hash of its FIRST tick (`t1`).**
+> `sdet` was a twice-run comparison inside ONE residency mode; nothing in this
+> engine was comparing the streamed world across `--residency paged` and
+> `--residency dense`, which is the only live oracle the page table has.
+>
+> It does not agree, and **it did not agree before this package either**:
+>
+> | tree | paged `seq` | dense `seq` | `t1` (both modes) |
+> |---|---|---|---|
+> | `85133c1` (baseline) | `f23ebbe9` | `397cc3e2` | — |
+> | branch tip | `f23ebbe9` | `397cc3e2` | matches |
+> | R2 `78feb6c` | `77e93536` | `c452ed25` | `dc2eb1c2` (matches) |
+>
+> **`t1` MATCHES across modes and `seq` does not**, which places it: tick 1 is
+> one CA tick after a fresh `SubmitWorldgen` with the window at the origin and
+> before `stream.Update` has moved the player a whole chunk, so no shift has
+> happened yet. The divergence is in the SHIFT path, not in worldgen or in
+> materialization. It is not R2's — both trees show it — and it is not a
+> determinism failure (each mode is reproducible against itself; that is what
+> `sdet` says). It is the paged/dense oracle being broken for streaming, and
+> nobody could have known because nothing printed a comparable number. The next
+> step is a per-tick sequence dump behind an env var and a diff, which will name
+> the first divergent tick in one run per mode.
+
+
 With no fence, `worldgenList` no longer needs to finish in the shift tick — it
 needs to finish by T+K. Split the 1,024-chunk dispatch into K submits of
 1,024/K (or budget it: the `occ` distribution says 2.6 ms p50 but 9.8 ms p90

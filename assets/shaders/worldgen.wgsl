@@ -4405,88 +4405,7 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
   genChunk(wg.x, li, wg.x);
 }
 
-// ---- THE genList ENTRY WORD, AND THE BATCH WINDOW (R2) --------------------
-//
-// docs/RESEARCH_streaming_hitch.md R2: a shift plane's 1,024 chunks are no
-// longer one dispatch on the shift tick. They are kGenChunksPerTick per tick
-// over the ticks the deferred wake already grants, in a FIXED order that is a
-// pure function of the plane (never of frame time). That needs three things
-// this entry point did not have:
-//
-//   1. A BASE. Up to kGenPlaneRing planes are mid-generation at once (a shift
-//      lands roughly every tick), so each owns a 1,024-entry region of genList
-//      and the matching region of genAct. T.genBatch's low bits are the index
-//      of the first entry this dispatch covers.
-//   2. A STUB MODE. A slot whose batch has not run yet must hold something
-//      DETERMINISTIC and inert rather than the departed chunk's voxels, so the
-//      shift tick also dispatches a stub over every not-yet-generated slot.
-//      T.genBatch's top bit selects it.
-//   3. A PER-ENTRY SENTINEL MATERIAL, which is what the stub writes, and a
-//      SKIP marker for a slot a later shift has repurposed. Both ride the
-//      entry word, so the CPU is the single author of both decisions:
-//
-//        bits 0..15   slot index (GEN_SLOT_SKIP = "cancelled, generate nothing")
-//        bits 16..27  sentinel material id (0 = air) — stub mode only
-//
-// Mirrored in src/sim/stream.cpp (kGenSlotSkip / kGenBatchStubBit / the packer
-// GenEntry) and checked by scripts/check_invariants.py --genbatch.
-const GEN_SLOT_SKIP : u32 = 0xFFFFu;
-const GEN_BATCH_BASE_MASK : u32 = 0x00FFFFFFu;
-const GEN_BATCH_STUB_BIT : u32 = 0x80000000u;
-
-// ---- THE PENDING-SLOT STUB (R2) ------------------------------------------
-//
-// What a shift plane's slots hold between the shift tick and the tick their
-// own batch generates them. NOT the departed chunk's voxels: the slot maps to
-// a different world chunk the moment the origin moves, so those words are
-// arbitrary terrain from 32 chunks away and the renderer, the shadow and
-// openness walks, the neighbouring CA and the occupancy pass can all see them.
-//
-// The content is ONE material everywhere, chosen per slot on the CPU from
-// World::TerrainHeight — air above the column top, stone at or below it — so
-// it is a pure function of (world chunk, seed) and both residency modes agree.
-// DESIGN.md's rule for space the engine has not loaded yet is "solid and
-// inert", and that is why the ground half is stone rather than air: a neighbour
-// chunk's sand or water at the window edge would otherwise fall into a void
-// that becomes rock two ticks later, and the grain would be deleted by the
-// generation that follows it. Above the column top there is nothing to fall
-// and a stone wall would be visible from 25 m, so that half reads as air.
-//
-// It writes exactly what a UNIFORM sentinel of the same material reads as:
-// synthWord for the voxels (only where the slot is RESIDENT — under paged the
-// CPU installs the sentinel in the page table instead and there is no page to
-// write), and sim_occupancy's own sentinel-branch values for the occupancy and
-// sub-occupancy words. Those two exits must agree, because a hash tick takes
-// the analytic one and every other tick takes this one.
-//
-// dirtyIn/dirtyOut are CLEARED for the same reason genChunk clears them under
-// genDeferWake: the slot may still carry the departed chunk's dirty flag, and
-// dispatching the CA over a plane the CPU mirror has not materialized is the
-// 217-page-fault bug.
-fn genStub(slot : u32, mat : u32, li : u32) {
-  let e = pageTable[slot];
-  if ((e & PT_SENTINEL_BIT) == 0u) {
-    let w = synthWord(PT_SENTINEL_BIT | mat);
-    for (var i = li; i < CHUNK_VOL; i += 64u) {
-      voxStore(voxWordInChunk(slot, i), w);
-    }
-  }
-  if (li == 0u) {
-    if (mat == MAT_AIR) {
-      occupancy[slot] = packOcc(0u, 0u);
-      storeSubOcc(slot, 0u, 0u, 0u, 0u);
-    } else {
-      let isB = isRayBlocker(materials[mat]);
-      let bo = select(0u, subOccAllOnes(), isB);
-      occupancy[slot] = packOcc(CHUNK_VOL, select(0u, CHUNK_VOL, isB));
-      storeSubOcc(slot, subOccAllOnes(), subOccAllOnes(), bo, bo);
-    }
-    atomicStore(&dirtyIn[slot], 0u);
-    atomicStore(&dirtyOut[slot], 0u);
-  }
-}
-
-// Streamed-in chunks: T.genCount entries of genList from T.genBatch's base.
+// Streamed-in chunks: T.genCount slot indices from genList.
 @compute @workgroup_size(64)
 fn list(@builtin(workgroup_id) wg : vec3<u32>,
         @builtin(local_invocation_index) li : u32) {
@@ -4495,18 +4414,7 @@ fn list(@builtin(workgroup_id) wg : vec3<u32>,
   // SubmitTick's batched worldgen), and the fault record has to say which.
   gPtKernel = PT_K_GENLIST;
   if (wg.x >= T.genCount) { return; }
-  let idx = (T.genBatch & GEN_BATCH_BASE_MASK) + wg.x;
-  let e = genList[idx];
-  let slot = e & 0xFFFFu;
-  // A later shift repurposed this slot under a new origin; its own entry
-  // covers it now (Stream::InvalidatePendingSlots). The position is kept so
-  // genAct stays aligned with the CPU's copy of the list.
-  if (slot == GEN_SLOT_SKIP) { return; }
-  if ((T.genBatch & GEN_BATCH_STUB_BIT) != 0u) {
-    genStub(slot, (e >> 16u) & 0xFFFu, li);
-    return;
-  }
-  genChunk(slot, li, idx);
+  genChunk(genList[wg.x], li, wg.x);
 }
 
 // ---- JITTER page materialization (world.h's JITTER block) ----------------

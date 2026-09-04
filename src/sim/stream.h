@@ -171,13 +171,6 @@ class Stream {
     // rather than inferred from a frame-time distribution.
     double wakeWaitMs = 0;
     uint32_t wakeWaits = 0;
-    // R2: worldgenList dispatches issued for a plane's per-tick batches, and
-    // the CPU time spent issuing them (page allocation, the batch list upload,
-    // the submit). Separate from fillGenMs, which is now only the SHIFT tick's
-    // share, so "did the plane actually get spread" is one number rather than
-    // an inference from a GPU histogram.
-    double genBatchMs = 0;
-    uint32_t genBatches = 0;
     double harvestMs = 0;  // HarvestDemotes + CompleteOldest at the top of Update
     double dirtyFoldMs = 0;// the per-tick kNumChunks fold of snapshot dirty flags
     double totalMs = 0;    // the whole of Update, so the parts can be checked
@@ -334,49 +327,14 @@ class Stream {
   struct PendingShift {
     rhi::Buffer staging;
     rhi::MapTicket map;
-    // The readback is issued after the LAST batch's submit, not at T (R2), so
-    // an entry spends most of its life with no ticket at all.
-    bool mapIssued = false;
-    // genList as submitted, in GENERATION ORDER (see kGenChunksPerTick):
-    // parallel to the genAct entries in the readback.
+    // genList as submitted: parallel to the genAct entries in the readback.
     std::vector<uint32_t> genSlots;
-    // Parallel to genSlots: the material a slot's PLACEHOLDER holds until its
-    // own batch generates it (0 = air). See kGenChunksPerTick.
-    std::vector<uint16_t> sentMat;
     // Slots dropped because a LATER shift re-generated them under a new
     // origin (see the intersection rule in CompleteShift): the entry keeps
     // its readback offsets intact and simply skips these.
     std::vector<uint8_t> stale;
-    uint32_t region = 0;        // genList/genAct region (world.h kGenPlaneRing)
-    uint32_t tick = 0;          // T, the tick the plane was generated on
-    uint32_t dispatched = 0;    // entries whose batch has been submitted
-    uint32_t lastBatchTick = 0; // one batch per plane per tick, never two
+    uint32_t tick = 0;   // T, the tick the plane was generated on
   };
-  // ---- R2: THE PLANE'S WORLDGEN, SPREAD OVER THE TICKS R1 ALREADY BOUGHT ---
-  //
-  // docs/RESEARCH_streaming_hitch.md R2. R1 removed the CPU fence from a shift
-  // but left `worldgenList` as ONE dispatch of 1,024 workgroups writing 16 MiB
-  // on the shift tick: 98% of the streaming path's whole GPU bill, 4.65 ms on
-  // an average plane and 11.3 ms on a tree-and-cave one (P3-F §2). Nothing
-  // needs it finished on that tick any more — only by the tick the wake lands.
-  //
-  // So it is issued kGenChunksPerTick chunks per tick, in a FIXED order that is
-  // a pure function of the plane (never of frame time, which is what Godot
-  // Voxel's ms budget gives up). The order is SURFACE OUTWARD — each slot is
-  // keyed by its chunk's distance from World::TerrainHeight at its own column
-  // and the nearest go first — for two reasons that are the same reason: the
-  // surface band is the only part of the plane whose placeholder is a visible
-  // lie, and it is the only part an acting neighbour can reach.
-  //
-  // NOTE ON THE STEADY-STATE MEAN. Under sprint flight a shift lands about
-  // once per tick, so four planes each contributing one batch put the SAME
-  // ~1,024 chunks through the kernel per tick as one plane did. Spreading
-  // cannot and does not move the per-tick mean; what it moves is the per-tick
-  // MAXIMUM, which is the 11.3 ms outlier, and the frame-to-frame variance
-  // when the shift rate is below one per tick.
-  static constexpr uint32_t kGenChunksPerTick = 256;   // = kShiftPlaneChunks / 4
-  static constexpr uint32_t kGenBatches =
-      (kShiftPlaneChunks + kGenChunksPerTick - 1) / kGenChunksPerTick;
   // K, AND WHAT ACTUALLY BOUNDS IT.
   //
   // The obvious bound is the one the research doc reaches for: K ticks of
@@ -405,50 +363,12 @@ class Stream {
   // completion another tick would make the tick a plane first acts on a
   // function of fence timing, and that is the determinism rule. So K is
   // raised until the miss is rare instead.
-  //
-  // R2 SPLIT K IN TWO, and only the second half is what the miss rate reads.
-  // The readback is no longer issued at T: it follows the plane's LAST batch,
-  // at T + kGenBatches - 1. What the T+K poll actually gets is therefore
-  // kWakeDrainTicks of wall time, not K, and K=4 with four batches would have
-  // left ONE tick of drain against the four that measured 17 misses in 338
-  // shifts. So K is derived from the drain rather than chosen, and the drain
-  // is the number to move if the misses come back.
-  //
-  // The cost of the extra ticks is the same one R1 pays and no more: the plane
-  // is inert for K ticks (200 ms at K=6) on terrain 6+ chunks from the player.
-  // The PAGE cost went DOWN rather than up — a plane's pages are now allocated
-  // a batch at a time instead of all 1,024 on the shift tick, and the slots
-  // that are still sentinels when the shift lands stay sentinels until their
-  // own batch.
-  static constexpr uint32_t kWakeDrainTicks = 3;
-  static constexpr uint32_t kWakeLatency = kGenBatches - 1 + kWakeDrainTicks;
-  // Backstop, not a throughput knob: it bounds the genList/genAct regions in
-  // flight (world.h kGenPlaneRing) and the staging pool with it.
-  static constexpr size_t kMaxPendingShifts = kGenPlaneRing;
+  static constexpr uint32_t kWakeLatency = 4;
   // Finish every pending shift whose T + kWakeLatency deadline has arrived.
   // Called from Update BEFORE the shift below it, so a plane's verdict is
   // consumed before a new shift can invalidate any of its slots.
   void CompleteDueShifts(uint32_t tick);
   void CompleteShift(PendingShift& ps, uint32_t tick);
-  // ---- R2's three entry points --------------------------------------------
-  // Queue a shift plane: order its slots surface-outward, choose each one's
-  // placeholder material, install the placeholders, and dispatch batch 0 plus
-  // the stub over everything else. Takes ownership of `genSlots`.
-  void BeginGenPlane(std::vector<uint32_t>& genSlots);
-  // Submit the next kGenChunksPerTick entries of `ps`. On the last batch it
-  // also encodes the occupancy+genAct readback and issues the map.
-  void DispatchGenBatch(PendingShift& ps);
-  // One batch per plane per tick, for every plane that still owes work. Called
-  // from Update BEFORE CompleteDueShifts, so a plane's last batch is always
-  // submitted before its own deadline poll.
-  void PumpGenBatches(uint32_t tick);
-  // Every remaining batch at once (the backstop and the discard paths).
-  void FinishGenPlane(PendingShift& ps);
-  // The placeholder a not-yet-generated slot holds: air above its column's
-  // ground, `stoneMat_` at or below it. Pure function of (world chunk, seed).
-  // `dist` receives the chunk's distance in voxels from that ground, which is
-  // the generation-order key.
-  uint32_t PlaceholderMat(IVec3 wc, int* dist);
   // Mark every pending entry's copy of `slots` stale: a new shift is about to
   // regenerate them under a different origin, so the older entry's verdict for
   // them describes a chunk that no longer lives there. Dropping is the simple
@@ -480,18 +400,6 @@ class Stream {
   rhi::Buffer AcquireShiftStaging();
   std::vector<uint32_t> genActScratch_;   // mapped-memory bounce, reused
   std::vector<uint8_t> shiftMark_;        // InvalidatePendingSlots' membership bitmap
-  std::vector<uint32_t> genEntryScratch_; // one batch's packed genList entries
-  // Round-robin over the kGenPlaneRing genList/genAct regions.
-  uint32_t genRegion_ = 0;
-  // The placeholder's SOLID material, resolved by NAME at material load
-  // (materials are data — see OnMaterialsReloaded). 0 = not found, which
-  // degrades the placeholder to air everywhere: deterministic and safe, just
-  // no longer "unloaded space is solid".
-  uint32_t stoneMat_ = 0;
-  // Per-plane memo for World::TerrainHeight, which is ~25 hash3 a call. A
-  // Z- or X-axis plane has only kNChunk distinct columns; a Y-axis plane has
-  // kNChunk^2, and those are the rare ones.
-  std::unordered_map<uint64_t, int> colHeight_;
   bool frameGated_ = false;      // BeginFrame has been called at least once
   bool shiftedThisFrame_ = false;
 

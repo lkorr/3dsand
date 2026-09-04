@@ -1343,49 +1343,6 @@ def check_autofly_surface():
                 f"being comparable")
 
 
-def check_gen_batch_encoding():
-    """worldgen.wgsl's genList entry word  <->  stream.cpp's packer.
-
-    R2 spreads a shift plane's worldgen over ticks, and the CPU has to tell the
-    kernel three things per entry that used to be implicit in "the whole plane,
-    right now": which slot, what placeholder material it holds until its batch
-    runs, and whether a later shift cancelled it. All three ride the 32-bit
-    entry word, so the two halves of that encoding are a classic
-    two-places-must-agree pair -- and a drift here is silent, because a
-    mis-decoded slot index still addresses SOME chunk and writes real terrain
-    into it (docs/RESEARCH_streaming_hitch.md R2).
-    """
-    w = read("assets/shaders/worldgen.wgsl")
-    c = read("src/sim/stream.cpp")
-    if not w or not c:
-        return
-    checked.append("genList entry word")
-    for wname, cname in (("GEN_SLOT_SKIP", "kGenSlotSkip"),
-                         ("GEN_BATCH_STUB_BIT", "kGenBatchStubBit")):
-        mw = re.search(wname + r"\s*:\s*u32\s*=\s*(0x[0-9A-Fa-f]+|\d+)u", w)
-        mc = re.search(cname + r"\s*=\s*(0x[0-9A-Fa-f]+|\d+)u", c)
-        if not mw or not mc:
-            problems.append(f"{wname}/{cname}: one side is missing")
-            continue
-        if int(mw.group(1), 0) != int(mc.group(1), 0):
-            problems.append(
-                f"worldgen.wgsl {wname} = {mw.group(1)} but stream.cpp "
-                f"{cname} = {mc.group(1)} -- the genList entry word is decoded "
-                f"one way and packed another")
-    # The slot field's width. The kernel masks with 0xFFFF and the packer
-    # shifts the material to bit 16; world.h's static_assert is what keeps the
-    # window small enough for that, and this is the shader half of it.
-    if "e & 0xFFFFu" not in w:
-        problems.append(
-            "worldgen.wgsl's `list` no longer masks the genList entry with "
-            "0xFFFF -- stream.cpp's GenEntry still packs the placeholder "
-            "material at bit 16")
-    if "0xFFFu) << 16" not in c:
-        problems.append(
-            "stream.cpp's GenEntry no longer packs the placeholder material at "
-            "bit 16 -- worldgen.wgsl's genStub still decodes it from there")
-
-
 ALL = {
     "autofly": check_autofly_surface,
     "worldgen": check_worldgen_mirror,
@@ -1408,7 +1365,6 @@ ALL = {
     "counts": check_tick_counts,
     "farbits": check_far_material_bits,
     "ringdepth": check_readback_ring,
-    "genbatch": check_gen_batch_encoding,
 }
 
 # The hook passes the edited file; run only the checks that file can break.
@@ -1429,7 +1385,7 @@ RELEVANT = {
     "src/sim/world.h": ["world", "params", "substeps", "windprim",
                         "curprim"],
     "src/sim/world.cpp": ["worldgen"],
-    "assets/shaders/worldgen.wgsl": ["worldgen", "treeatlas", "genbatch"],
+    "assets/shaders/worldgen.wgsl": ["worldgen", "treeatlas"],
     "src/sim/treeatlas.h": ["treeatlas"],
     "assets/editor/treegen.js": ["treeatlas"],
     "src/sim/simulation.cpp": ["counts"],
@@ -1440,7 +1396,6 @@ RELEVANT = {
     "src/sim/world.h": ["ringdepth"],
     "src/sim/pass_table.def": ["counts", "perfnodes"],
     "src/measure/perfnodes.h": ["perfnodes"],
-    "src/sim/stream.cpp": ["genbatch"],
     "src/measure/perfsuite.cpp": ["autofly"],
     "src/main.cpp": ["arch", "autofly"],
 }
