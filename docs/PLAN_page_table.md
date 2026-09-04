@@ -2537,6 +2537,43 @@ addresses to today's code. That means:
 2. Any hash divergence between paged and dense is *definitionally* about
    sentinels and page assignment, never about the arithmetic.
 
+**CAVEAT ON POINT 2 — it is FALSE as written, and a divergence that lived from
+this phase until 2026-09-03 is the counter-example. [P5-I]**
+
+The enumeration "sentinels and page assignment" covers the VOXEL path, which is
+the only place the mode difference was ever thought to live. It leaves out the
+CPU-side machinery that **only paged mode drives**, and that is where the
+divergence actually was: `SubmitTick`'s forced snapshot readback was gated
+`paged && ...`, so under a headless harness `World::Snap().valid` was true on
+every tick in paged and false on every tick in dense; `Stream::EvictSlots`'s
+re-derivability filter reads exactly that flag, so dense stored all 1,024 slots
+of every leaving plane and paged stored ~30; and since R1's deferred wake a
+chunk that comes back from the STORE wakes in the refill tick while one that
+comes back from `genChunk` wakes `kWakeLatency` ticks later. Same words
+throughout — a whole-window per-chunk digest at the tick before the divergence
+is identical in every bit, with 17,003 slots sentinel in one mode and resident
+in the other — and a different wake TICK.
+
+So the honest form of point 2 is: **a divergence is about sentinels, page
+assignment, or anything else a paged run does that a dense run does not.** The
+third clause is the one that bites, because it is not enumerable from this
+document; it has to be found by diffing what the two modes actually execute. The
+symptom is also nothing like a translation bug: the first tick matched, the
+words matched, and only the ACTIVITY schedule differed.
+
+Two operational consequences, both cheap:
+
+- **§6.3's "every gate runs in both residency modes" was never true of the
+  suite, and it is not what protects this.** What protects it is a number that
+  is COMPARABLE across the modes. `--gate streaming` now folds its whole 300-tick
+  hash sequence to one word and prints it beside the first tick's hash (`seq`
+  and `t1`); a matching `t1` under a differing `seq` puts the fault in the shift
+  path, and that one line is what localised this. Any gate that streams should
+  print the same pair.
+- **The oracle is only an oracle if both arms are DRIVEN the same way.** Before
+  comparing modes, check that the harness itself is residency-independent — the
+  gate on `paged` here was in the test support layer, not in the engine.
+
 **Naming.** `--residency` rather than `--paged`/`--dense` as separate flags, so
 the two modes are one variable with a total order of values — the phase-6
 lesson about `bool backendVulkan` (a flag named for the non-default cannot

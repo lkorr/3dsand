@@ -1553,3 +1553,220 @@ commands in this engine that no span covers.
   ticks on a faster or slower machine. Do not compare it across runs and do not
   rebaseline anything from it — `--perf`'s timer-neutrality gate, which runs a
   fixed 60 ticks, is the hash that means something in this harness.
+
+---
+
+## P5-I. The paged/dense oracle was comparing two differently-driven harnesses — FIXED 2026-09-03
+
+**The number P4-G left behind.** `--gate streaming` folds its 300-tick hash
+SEQUENCE into one word. Paged folded `f23ebbe9` and dense `397cc3e2`, with
+tick 1 matching in both, and the same pair reproduced on `85133c1` and on the
+branch tip. Each mode reproduces itself (`sdet` says so), so this was never a
+rule-1 failure — but `--residency dense` is the only live oracle the page table
+has (PLAN_page_table.md §6), and it was not agreeing with the thing it exists to
+be an oracle for.
+
+### 0. The answer, in one line
+
+`SubmitTick`'s forced-snapshot arm was gated on residency, a headless harness
+never gets a snapshot on its own, and `Stream::EvictSlots`'s re-derivability
+filter reads exactly that flag — so **dense stored every slot of every leaving
+plane and paged stored ~30 of 1,024**, and a chunk that is in the store re-enters
+the window by a different code path, on a different tick, than one that is not.
+
+```
+-  const bool needSnapshotForPaging = paged && (HarnessSnapshotDrain() || snapshotStale);
++  const bool needSnapshotForPaging =           HarnessSnapshotDrain() || snapshotStale;
+```
+
+(`src/test/support.cpp`; `snapshotStale` already carries its own `paged &&`, so
+the paged arm is bit-identical and the game path — which never sets
+`HarnessSnapshotDrain` — is untouched.)
+
+| tree | paged `seq` | dense `seq` | `t1` |
+|---|---|---|---|
+| merge base `f8325da`, before | `2140222c` | `8727a37b` | `ba2561f4` both |
+| merge base `f8325da`, after | `2140222c` | `2140222c` | `ba2561f4` both |
+| `streaming-smooth` `a2ce7ad`, before | `f23ebbe9` | `397cc3e2` | `3864d291` both |
+| `streaming-smooth` `a2ce7ad`, after | `f23ebbe9` | `f23ebbe9` | `3864d291` both |
+
+**It is PRE-EXISTING.** It reproduces on `f8325da` — the merge base, before the
+deferred wake, the rhi ring, the census, P3-E and the worldgen hoists — and the
+same one-line change closes it there. Nothing on the integration branch caused
+it, and the paged number does not move, so no pinned hash moves.
+
+### 1. How it was localised (the ladder, and what each rung cost)
+
+Three env-gated instruments were added to the `streaming` gate; all are no-ops
+when unset and none changes behaviour when set.
+
+- **`SANDVOX_SEQ_DUMP=<path>`** — one line per tick of run 0: tick, player chunk,
+  cumulative shift count, `origin.x`, hash. One run per mode, `diff`. **First
+  divergent tick: 5041**, index 40, the tick of shift #21 — and the shift
+  schedule says what that is: shifts 1..20 are the initial recentring (the window
+  walking from the origin to the player, ticks 5001-5020, all bringing in
+  never-visited planes); shift 21 at tick 5041 is the **first shift that
+  re-enters a plane the window had already left** (`origin.x` −6 → −5 brings back
+  plane x = 26, evicted at tick 5018).
+- **`SANDVOX_SEQ_DIGEST=<i>`** (+`SANDVOX_SEQ_DIGEST_OUT`) — a per-chunk digest of
+  the whole window at one tick, §9.4's dump-and-diff, but with **two** digests
+  per slot: `raw` over every word, and `hashlike` over exactly what
+  `sim_occupancy`'s hash sees (non-air cells only, material+state+stain). The
+  pair separates "the words differ" from "the words agree and the hash of them
+  does not". Sentinel slots are digested from `SynthWordAt`, so a JITTER chunk
+  digests as the page it would materialize into.
+  - At tick **5040**: `raw 0, hashlike 0, nonair 0, dirty[0] 0, dirty[1] 0,
+    occupancy 0` differences over all 32,768 slots — the two worlds are
+    bit-identical, including stamps, while **17,003 slots are sentinels in paged
+    and real pages in dense**. The sentinel synthesis is exact; that half of the
+    design is not the bug.
+  - At tick **5041**: exactly **4 chunks** differ, all at `wc.x = 26` — the
+    incoming plane — and **930 slots of that plane are awake (`dirty[0] = 1`)
+    under dense and none under paged**.
+- **`SANDVOX_SEQ_WORDS=<slot,...>`** — those slots' 4,096 words verbatim.
+  **Five cells** differ in the whole world:
+
+  | slot | chunk | cell | paged | dense |
+  |---|---|---|---|---|
+  | 17850 | (26,13,17) | 3989 | `00001021` | `00030021` |
+  | 27034 | (26,12,−6) | 2286 | `00001021` | `00032021` |
+  | 28090 | (26,13,−5) | 68 | `00002021` | `00030021` |
+  | 28090 | (26,13,−5) | 842 | `00001021` | `00032021` |
+  | 30138 | (26,13,−3) | 3934 | `00002021` | `00032021` |
+
+  All material 33 (**grass**), differing only in the state nibble and the tick
+  stamp: paged holds stamp 0 (the save-stripped word the refill wrote), dense
+  holds stamp 3 (a live stamp — the cell was written **this tick**). The rule is
+  the grass creep, `grass + tag:soil -> neighborBecomes grass` at 3 per mille —
+  and **grass itself carries the `soil` tag**, so the rule fires grass-onto-grass
+  and re-rolls the target's palette variant, which is hashed. It fired in dense
+  and not in paged because in paged the plane was not awake yet.
+
+`SANDVOX_NO_JITTER=1` was run as the standard differential and made no
+difference (`f23ebbe9` either way), which removed JITTER classification from the
+list before any of the above.
+
+### 2. The mechanism, end to end
+
+1. **`World::Snap().valid` was residency-dependent under a harness.** The block
+   comment on `SetHarnessSnapshotDrain` (`src/test/support.h`) says a headless
+   harness never gets a snapshot on its own: it submits and pumps in lockstep,
+   so the fence has not retired when the callback would fire. `SubmitTick`'s
+   forced-readback arm was `paged && (HarnessSnapshotDrain() || snapshotStale)`,
+   so only the paged arm got one. Measured directly, on the `evict issue` debug
+   line (which now prints it): paged `snapValid=1 snapTick=5001..` from the
+   second tick on, dense `snapValid=0 snapTick=0 modified=0` on all 227 shifts.
+   The gate passes `wantReadback=false` (it reads the world through blocking
+   hash reads), so nothing else was going to request one.
+2. **`Stream::EvictSlots`'s re-derivability filter reads that flag.**
+   `if (filter && snap.valid && modified_[s] == 0) continue;` — the "AN
+   UNMODIFIED CHUNK IS ALREADY REPRODUCIBLE" test, plus the `worth` test above
+   it. With no snapshot both are skipped:
+
+   | | leaving plane |
+   |---|---|
+   | paged | `slots=1024 stored=32 skipUnmod=523` (rest are sentinels, stored by CPU synthesis) |
+   | dense | `slots=1024 stored=1024 skipUnmod=0`, on every one of 227 shifts |
+
+3. **Store membership decides the refill PATH.** `FillSlots` looks the chunk up:
+   a hit takes the store-hit branch (RLE decode, upload, and `dirty[0] = dirty[1]
+   = 1` — awake **this** tick); a miss goes on `genSlots` and is regenerated by
+   `genChunk`, which under R1's deferred wake explicitly **clears**
+   `dirtyIn`/`dirtyOut` and publishes its verdict to `genAct`, so the chunk wakes
+   `kWakeLatency = 4` ticks later.
+4. **So the same plane started its CA four ticks apart in the two modes**, the
+   tick-keyed RNG rolled differently, and five grass cells crept in one world and
+   not the other. From tick 5041 the sequences never re-converge.
+
+The content is not in question anywhere in this chain: the store round-trip and
+a re-generation produce the same words (tick 5040's digest proves it for the
+whole window, and 5041's proves it for the re-entered plane except for the five
+cells the CA itself wrote). **What differs is only WHEN the plane wakes.**
+
+### 3. What the fix does and does not do
+
+**Does:** repairs the oracle. An oracle is only an oracle if both arms are driven
+the same way, and `--residency dense` was being run under a different harness
+from `--residency paged`. Both modes now fold to the same word on both trees,
+with 0 page faults and each still reproducing itself.
+
+**Does not:** remove the hazard underneath, which is worth stating plainly
+because it is about the GAME and not about the harness —
+
+> **Snapshot AVAILABILITY is a readback-timing property, and it decides what
+> enters the chunk store, and (since R1) store membership decides when a
+> re-entering plane starts acting. So a GPU-timing-dependent value reaches
+> hashed state.**
+
+`stream.h`'s "known accepted race" note accepts the latency of that snapshot on
+the grounds that the cost is "bounded, cosmetic" — a front that started on the
+trailing plane in the last ~2 ticks can be evicted as boring and lost. That
+argument is about what is PRESERVED, and it was sound while the store was only a
+persistence mechanism. R1 gave store membership a second job: it now selects
+between "wake now" and "wake at T+4". `World::EncodeReadbacks` DECLINES while
+every ring slot is in flight (P2-D counted the refusals), so in a real session a
+hitch can flip a plane from ~30 stored chunks to 1,024, and every one of those
+chunks then wakes four ticks earlier on re-entry than it would have.
+
+Nothing measures this today: the harness's readback cadence is fixed, so both
+`sdet` and the twice-run `--selftest` comparison are blind to it by construction.
+
+**The clean fix, for whoever takes it:** make the two refill branches wake
+identically, so store membership stops being an input to the world. Concretely,
+`FillSlots`' store-hit branch should publish into the same `PendingShift` and
+wake at `T + kWakeLatency` instead of writing `dirty[0]`/`dirty[1]` inline —
+the refilled plane is inert for K ticks either way, which is R1's own argument.
+That moves the pinned hash (a store-hit plane starts acting 4 ticks later than
+today) and is a real behaviour change, so it is written up here rather than
+taken as part of an oracle repair.
+
+### 4. Things this contradicts
+
+- **PLAN_page_table.md §6.3's "every gate runs in both residency modes" is not
+  what the suite does**, and if it had been, this would have been caught at
+  phase 7. Nothing compared a hash across the two modes until P4-G's fold.
+- **§6.2's "any hash divergence between paged and dense is *definitionally*
+  about sentinels and page assignment, never about the arithmetic"** is false as
+  written, and this is the counter-example: the divergence was in neither. It
+  was in a THIRD thing — the CPU-side machinery that only paged mode drives.
+  §6 now carries the caveat.
+
+### 5. Cost
+
+Six builds and 18 gate runs, of which the four that mattered were: one
+`SEQ_DUMP` pair (first divergent tick) and one `SEQ_DIGEST` pair (four chunks,
+five cells). The two runs that settled the mechanism were free — the
+`[pt-time] evict issue` line already existed and already ran in both modes;
+it just had `snapValid` added to it.
+
+### 6. Found on the way: the dense arm is not green at SUITE scope, and that is pre-existing
+
+`--selftest --residency dense` (the whole suite, not `--gate streaming`) reports
+
+```
+page faults over the suite: 267911169  *** SENTINEL WRITES LOST VOXELS ***
+  | lost water (id 5, word 0x00007005: state 7 stamp 0 stain 0/0)
+  | FIRST worldgen:main tick 0 chunk (352,128,0) word 0x00001001 entry 0x80000000
+  | by kernel: sim_mutate 1, worldgen:main 267911168
+```
+
+`entry 0x80000000` is `PT_EMPTY` — a sentinel, **under `--residency dense`,
+where the table is supposed to be the identity map and no sentinel can exist**,
+and 267,911,168 / 4,096 = 65,408 chunk-writes, i.e. two whole-window
+`worldgen:main` dispatches dropped end to end. Dense's regression list at suite
+scope is `page-roundtrip, armor-react, wound-accumulate, voxregion`.
+
+**This is not P5-I's.** Measured as a control on the same tree with the one-line
+change reverted and nothing else touched: identical fault count, same kernel,
+same sentinel entry, and the pre-fix `seq 397cc3e2`. The likely shape is a gate
+that installs sentinels and leaves them in the shared `World` for a later gate's
+`SubmitWorldgen` (`kOrder` in `selftest.cpp` — gates share one world), which
+`--gate streaming` alone never sees: that gate reports 0 page faults in both
+modes, before and after.
+
+It is recorded here because it is the same lesson one level up: **§6.3 says the
+dense arm is load-bearing test infrastructure, and nobody has run the SUITE in
+it recently enough to notice it drops 268 million voxels.** The oracle needs to
+be green, not merely available. Whoever picks this up should start from
+`page-roundtrip` and `voxregion` — the two gates that fail in dense and pass in
+paged — with `SANDVOX_PT_DUMPSLOT` on the first chunk the fault names.
