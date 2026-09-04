@@ -1522,8 +1522,8 @@ void PlayerAvatar::PreTick(uint32_t tick, const Player& player, float heading,
 
   // Shared per-tick body upkeep (Mob) — identical to what MobSystem::PreTick
   // runs for every NPC: drain gore authored outside the tick, and tick the
-  // severed holds down (the avatar-layer strip on release happens in the
-  // OnBodyReleasedToWorld override).
+  // severed holds down (a released piece goes to
+  // Physics::ReleaseToWorldWhenClear, the same as an NPC's).
   DrainPendingSpawns(world, spawns);
   TickSeveredHolds(dt);
   // ...and the hit flash, which is the same kind of thing: per-limb state that
@@ -2183,10 +2183,3 @@ int PlayerAvatar::LivePartCount() const {
 // big AABB per body. See rigrender::AppendDebugBoxesFor for why these come
 // from the Jolt shape rather than from the voxels that built it.
 
-// A body leaving the rig for the world stops being "you": back on the normal
-// dynamic layer it can bump the player like any other debris — the avatar-
-// layer exemption is only for parts still attached and still living inside
-// the player's capsule.
-void PlayerAvatar::OnBodyReleasedToWorld(uint64_t bodyHandle) {
-  if (phys_) phys_->SetBodyAvatarLayer(bodyHandle, false);
-}

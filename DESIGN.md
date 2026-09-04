@@ -2270,6 +2270,19 @@ neighbors, so this needs an explicit connectivity pass:
   reads and that nothing had ever fetched, so a component touching a scan-box
   face was anchored on a guess — but does not *wait* for it, since a stale ring
   answers "is there rock out there" perfectly well.
+- **A solid that turns to powder in place stops holding things up
+  (2026-09-04).** `flagSupportLoss` returned early for a powder *product* as if
+  it still supported everything, and the ash then flowed away flagging only the
+  cell above it — so a clump held sideways or from above by a leaf that burned
+  to ash was never flagged and never scanned. Powder carries the cell above it
+  and nothing else, and the flag now says so (all solid neighbours except the
+  one above). `soloSolid` has the same correction: powder counts as attachment
+  only when it is *below*. Both came out of the `tree-fell` natural burn-out
+  series, where residue sat flat at ~30 while the hot count fell 3× — stranded,
+  not smouldering. And `SettleFootprintSupported` no longer abstains-as-yes on
+  an unfetched chunk below (the 12-voxel leaf body at the edge of the fetched
+  region was the biggest floater left), and every settle now queues a support
+  scan over the stamp, since a stamp vacates nothing and so raises no flag.
 - **The flood seeds from what changed and stops at the first anchor
   (2026-09-04).** `RunIslandDetection` used to seed from every solid cell in
   the region, which for a 64³ box on a hillside meant labelling the whole
@@ -6707,6 +6720,90 @@ on the bare creature losing anything: nothing but acid removes iron, so the
 count is its own evidence, whereas the steel arm needs the bare creature to
 know its bath was acid — and on some terrain the bare creature stands where the
 acid never pools.
+
+### A blade chips iron; it does not carve it (2026-09-04)
+
+The kerf `Mob::CutLimb` builds is sized for flesh, and a shell is one authored
+micro thick, so a sword went through a cuirass and out the other side: the
+connectivity split found two halves, and the cut-through rule took "the entire
+centre piece" off in one blow. That is what a sword does to a robe; to a plate
+it does the other thing armour was built for, and skates.
+
+On a WORN slot the slot is scaled by `gear.cutHardnessRef` (8, skin's) over the
+shell material's `hardness` — the same 0..255 field the blast crater and the
+dig read — floored at `gear.cutHardnessMin` and at one skin cell in every
+direction, so cloth (5) and leather (14) are cut about like flesh, iron (160)
+takes a chip, and no strike costs a plate nothing. A suit still wears through
+under a patient enemy; it takes a fight rather than a stroke, and it wears
+through in HOLES, which the occlusion probe already reads as exposure. The
+impact-speed knock-loose (the sword-from-the-hand rule) no longer applies to
+worn slots: a strap does not snap because the blow was fast. Held blades were
+never carved (the sweep skips the held slot) and flesh keeps the wound model
+the `wound` gate pins. `armor-wear` 3c cuts a steel cube and a cloth cube of
+identical geometry with one kerf.
+
+### What leaves a body cannot launch anybody
+
+Everything that leaves a creature — a severed limb, a cut strap's plate, a
+sword knocked from a hand, a carved gobbet, a corpse's limbs, an item dropped
+from the pack — is created exactly where the creature is, which for the player
+means INSIDE the capsule proxy. A severed piece is also KINEMATIC for its
+0.25 s hold, frozen where it was cut: an NPC's arm cut mid-swing was frozen
+inside the player who cut it, on the normal contact layer, an overlap the
+solver could not move, so `PlayerPushOut` moved the PLAYER a body-width a tick
+for fifteen ticks. That was "I dismembered him and flew across the field", and
+the avatar's own pieces had already been exempted once (`Layers::AVATAR`).
+
+The rule now belongs to the body, not to who it came off.
+`Physics::ReleaseToWorldWhenClear` puts a body on the no-player-contact layer
+and remembers it; every step, each remembered body whose world AABB has left
+the proxy goes back to `MOVING` and is forgotten. So a piece never shoves the
+creature it came off, and the moment it has fallen clear it is ordinary debris
+that can be stood on, kicked and picked up — the avatar's corpse no longer
+keeps its exemption for good either. Bounded at 256; past that the oldest is
+released unconditionally. The avatar's `OnBodyReleasedToWorld` override is
+gone with it. NPCs were never pushed by anything: their limbs are kinematic and
+they have no push-out. `player-body` asserts a block born inside the proxy
+reads no push while it overlaps, and reads one again once the proxy has
+walked away.
+
+### A piece cut loose is a thing on the floor
+
+A cut strap was `DetachLimb(adopt)` like any severed limb, which made the shell
+an anonymous debris body: not the robe, nothing `E` could see, and the wearer's
+slot still said "robe". Now a piece's IDENTITY shell — the same panel a dropped
+copy is made of (`ItemGroundVoxels`) — takes the piece with it when it leaves
+by blade: its other shells fall as rags, the `WornPiece` entry is erased, the
+loss is reported through `Mob::LostGear` with the piece's damage captured one
+call before the shells forget it, and `MobSystem::SetOnItemShed` registers the
+body under the item's name in `WorldItems`. `main.cpp` drains the report at the
+top of the tick, BEFORE the sheath and the wear loop read the kit — or those
+seams would faithfully pull a second sword out of the sheath and put the
+cuirass back on — clears the equip slot, and files the damage by name, so a
+piece picked back up and re-worn has exactly the holes it had. A sleeve alone
+is still a rag, and the piece goes on being worn without it. A sword knocked
+from the hand takes the same road and the creature is unarmed from that
+instant (`heldSlot_` clears in `ShedGearBeforeDetach`, not at a later
+`EquipItem`). A shell consumed by fire registers nothing: there is no body.
+The dead slots are swept out of the appended tail once the severed hold is
+over, so `LimbCount` is not a history of what was worn. `armor-wear` 3d.
+
+The half of this that is still open: a piece knocked off an NPC and picked up
+by the player comes back as authored, because `WornDamage` is keyed by cover
+index and the ground registry carries only a name and a lattice.
+
+### Cross-limb heat respects the coat
+
+`BuildCrossLimbHeat` lets a burning limb warm its siblings through faces where
+the grid holds air — and that is exactly where `WornAlong` was never asked,
+because the probe ran only against a THREAT in the grid. A burning bare hand
+lit the wrist inside its sleeve, and the fire walked up the arm under the
+plate: "the character is on fire inside the armour". The probe now runs on
+cross faces too, with the same march and reach; the sibling's flame reads as
+the shell's material, which is not hot, and whether the shell catches from it
+is the shell's own pass's business. What can still catch is what the grid can
+see: the face behind a helm's eye slit, a bare hand, and the wrist opening of a
+sleeve along the arm's own axis.
 
 ### Mirror in, intent out
 

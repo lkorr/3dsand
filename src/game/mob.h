@@ -936,6 +936,36 @@ class Mob {
   float WornCondition(int equipSlot) const;
   // Rig slots this piece occupies, for tests and for the occlusion probe.
   const std::vector<int>& WornSlotsAt(int pieceIndex) const;
+
+  // ---- GEAR THAT LEFT THE BODY BY FORCE ---------------------------------
+  //
+  // A worn piece whose IDENTITY shell (the panel a dropped copy of the item
+  // is made of — ItemGroundVoxels, game/worlditems.h) is cut loose leaves the
+  // wardrobe: its other shells fall with it as rags, the WornPiece entry is
+  // gone, and the shell on the ground is registered as the ITEM through
+  // MobSystem::SetOnItemShed so `E` can pick it up. A sword knocked from the
+  // hand takes the same path. Either way the creature's OWNER has bookkeeping
+  // to do that this class cannot see — the player's equipment slot, sheath
+  // and damage record live in PlayerKit — so the loss is reported here and
+  // drained by whoever owns the kit (main.cpp for the avatar). NPCs are
+  // never drained; the list is capped so it cannot grow.
+  //
+  // `damage` is the piece as it was the instant before it came off, so a
+  // piece picked back up and re-worn has exactly the holes it had. A sleeve
+  // cut off EARLIER is not here: that shell is already a rag on the floor,
+  // and the piece went on being worn without it.
+  struct LostGear {
+    int equipSlot = -1;     // -1 for the held item
+    std::string item;
+    bool held = false;
+    WornDamage damage;      // empty for the held item
+  };
+  const std::vector<LostGear>& LostGearEvents() const { return lostGear_; }
+  void ClearLostGear() { lostGear_.clear(); }
+  // Which worn piece owns rig slot `slot`, or -1.
+  int WornPieceOfSlot(int slot) const;
+  // The rig slot of a piece's identity shell (see LostGear), or -1.
+  int IdentityShellOf(int pieceIndex) const;
   // Is `worldPos` inside a live voxel of any shell worn over `bodyLimb`?
   // Reports the occluding shell's MATERIAL (0 = not occluded), because the
   // burn pass does not want a bool — it wants to know what the flesh's
@@ -1124,9 +1154,13 @@ class Mob {
   // Limbs of the player's body live on the AVATAR physics layer (they sit
   // inside the player capsule and must not push it — see avatar.cpp Spawn).
   virtual bool AvatarLayer() const { return false; }
-  // A body leaving this rig for the world (severed-hold release, death
-  // ragdoll). The avatar strips its avatar-layer exemption here.
-  virtual void OnBodyReleasedToWorld(uint64_t /*bodyHandle*/) {}
+  // (There used to be an OnBodyReleasedToWorld here, where the avatar put a
+  // severed piece back on the normal layer after its hold. Gone: EVERY body
+  // that leaves ANY rig now goes through Physics::ReleaseToWorldWhenClear,
+  // which keeps it off the player until it has fallen clear — an NPC's
+  // severed arm inside the player's capsule launched the player exactly as
+  // the avatar's own used to, and the fix belongs to the body, not to who it
+  // came off.)
   // NPC husks drop their limb list at death (PreTick reaps them); the avatar
   // keeps it so the HUD's per-part readout survives the death screen.
   virtual bool DropLimbListOnDeath() const { return true; }
@@ -1421,6 +1455,13 @@ class Mob {
     std::vector<ShellIndex> index;
   };
   std::vector<WornPiece> worn_;
+  std::vector<LostGear> lostGear_;
+  static constexpr size_t kMaxLostGear = 16;
+  // The gear half of DetachLimb: the held item or a worn piece's identity
+  // shell leaving as debris. Runs BEFORE the lattice is handed over, because
+  // CaptureWorn reads the shells, and returns the item name to register the
+  // adopted body under (empty = not an item).
+  std::string ShedGearBeforeDetach(int limbIndex);
 
   // Held item state — ONE piece of entity<->slot sync, kept only in EquipItem.
   int heldSlot_ = -1;
@@ -1671,6 +1712,15 @@ class MobSystem {
   // R and a copy here would be a second, stale library. The Mob stores its held
   // item BY NAME (item.h's index hazard), so the resolve happens per swing.
   void SetItems(const ItemLibrary* items) { items_ = items; }
+  // A PIECE OF GEAR HITTING THE FLOOR. Called with the debris body a worn
+  // piece's identity shell or a held item became on leaving a rig, and the
+  // item's NAME — the one seam by which main.cpp's WorldItems learns that a
+  // body it did not drop is a thing you can pick up (Mob::LostGear). Not
+  // fired for a shell consumed by fire (there is no body) nor for the rags a
+  // piece sheds beside its identity shell.
+  void SetOnItemShed(std::function<void(uint64_t, const std::string&)> cb) {
+    onItemShed_ = std::move(cb);
+  }
 
   // ---- the attack seam (Phase C consumes this) ----------------------------
   // Requests issued this tick. The AI decides WHEN and WHERE; it never swings,
@@ -2001,6 +2051,10 @@ class MobSystem {
   // counts: a micro limb emits no cube instances at all, so counting draws
   // would silently measure nothing on exactly the rigs carving matters most on.
   uint32_t LimbVoxelCount(uint64_t mobId, int limbIndex) const;
+  // The SKIN lattice's count when the limb has one (the collider above is a
+  // majority-fill downsample of it, and a chip one skin voxel deep never
+  // reaches it), else the same number as LimbVoxelCount.
+  uint32_t LimbSkinVoxelCount(uint64_t mobId, int limbIndex) const;
   uint32_t LimbVoxelsAtSpawn(uint64_t mobId, int limbIndex) const;
   // How many of a limb's surviving voxels have at least `minOpen` of their six
   // face-neighbours missing — the roughness of what a carve LEFT BEHIND.
@@ -2309,6 +2363,7 @@ class MobSystem {
   // its weapon BY NAME and the swing looks it up.
   StyleLibrary styles_;
   const ItemLibrary* items_ = nullptr;
+  std::function<void(uint64_t, const std::string&)> onItemShed_;
   std::vector<BlockEvent> blocks_;
   // The player's body, registered by main.cpp so the handle-keyed lookups can
   // find it. NOT owned and NOT in `mobs_` — see SetAvatar.

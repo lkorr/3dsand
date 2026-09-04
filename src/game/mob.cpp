@@ -1426,7 +1426,7 @@ void Mob::ReleaseRig() {
     if (l.holdBody) {
       phys_->SetBodyKinematic(l.holdBody, false);
       phys_->ClearCollisionGroup(l.holdBody);
-      OnBodyReleasedToWorld(l.holdBody);
+      phys_->ReleaseToWorldWhenClear(l.holdBody);
       l.holdBody = 0;
     }
     // A carved limb owns a copy-on-write brick; dropping the rig without
@@ -3095,11 +3095,117 @@ void Mob::TickSeveredHolds(float dt) {
     // A severed part must collide with the body it came off again: the
     // rig's GroupFilterTable suppressed those contacts forever otherwise.
     phys_->ClearCollisionGroup(limb.holdBody);
-    // It also stops being part of this creature — the avatar strips its
-    // player-layer exemption here (no-op for an NPC).
-    OnBodyReleasedToWorld(limb.holdBody);
+    // It also stops being part of ANY creature — but it may not touch the
+    // player until it has fallen clear of them (see DetachLimb).
+    phys_->ReleaseToWorldWhenClear(limb.holdBody);
     limb.holdBody = 0;
   }
+  // HUSKS OF GEAR. A body limb that is gone keeps its slot forever (the rig's
+  // indices are its anatomy: the stump's parent, the HUD's diagram). A worn
+  // piece that LEFT (ShedGearBeforeDetach) or a sword knocked from the hand
+  // has no such claim: nothing refers to the slot once its hold is over, and
+  // every knocked-off cuirass leaving three dead entries in the appended tail
+  // would make LimbCount a count of history. Swept top-down so each erase
+  // leaves the lower indices where they were.
+  for (int i = (int)limbs_.size() - 1; i >= baseLimbs_; i--) {
+    const MobLimb& L = limbs_[i];
+    if (L.body || L.holdBody) continue;
+    if (i == heldSlot_ || WornPieceOfSlot(i) >= 0) continue;
+    RemoveAppendedSlots(i, 1);
+  }
+}
+
+// ---- gear leaving the body by force ----------------------------------------
+
+int Mob::WornPieceOfSlot(int slot) const {
+  for (size_t p = 0; p < worn_.size(); p++)
+    for (int s : worn_[p].slots)
+      if (s == slot) return (int)p;
+  return -1;
+}
+
+int Mob::IdentityShellOf(int pieceIndex) const {
+  if (pieceIndex < 0 || pieceIndex >= (int)worn_.size()) return -1;
+  const WornPiece& p = worn_[pieceIndex];
+  // THE SAME PANEL A DROPPED COPY IS MADE OF (ItemGroundVoxels): the cover
+  // entry with the most voxels, found through the def when the library has
+  // it. Off the library — a test fixture, an item removed by a reload — the
+  // shell that was biggest at spawn is the same answer for every stock piece.
+  int coverWant = -1;
+  if (sys_ && sys_->items_) {
+    const int di = sys_->items_->Find(p.item);
+    if (const ItemDef* d = sys_->items_->At(di)) {
+      size_t best = 0;
+      for (size_t ci = 0; ci < d->cover.size(); ci++)
+        if (coverWant < 0 || d->cover[ci].voxels.size() > best) {
+          best = d->cover[ci].voxels.size();
+          coverWant = (int)ci;
+        }
+    }
+  }
+  if (coverWant >= 0)
+    for (size_t k = 0; k < p.slots.size() && k < p.cover.size(); k++)
+      if (p.cover[k] == coverWant) return p.slots[k];
+  int bestSlot = -1;
+  uint32_t bestAt0 = 0;
+  for (int s : p.slots) {
+    if (s < 0 || s >= (int)limbs_.size()) continue;
+    if (bestSlot < 0 || limbs_[s].voxelsAtSpawn > bestAt0) {
+      bestAt0 = limbs_[s].voxelsAtSpawn;
+      bestSlot = s;
+    }
+  }
+  return bestSlot;
+}
+
+std::string Mob::ShedGearBeforeDetach(int limbIndex) {
+  std::string name;
+  auto report = [&](LostGear lg) {
+    if (lostGear_.size() >= kMaxLostGear)   // bounded; nobody drains an NPC's
+      lostGear_.erase(lostGear_.begin());
+    lostGear_.push_back(std::move(lg));
+  };
+  // THE SWORD LEAVES THE HAND — knocked out by a fast parry, or still in the
+  // fist of a hand that was cut off (DetachLimb's child recursion lands here
+  // either way). The creature is unarmed from this instant: heldSlot_ is
+  // cleared NOW rather than by a later EquipItem, so an NPC's swing driver
+  // sees no blade and the player's re-equip seam does not pull a second sword
+  // out of the sheath while the first is lying on the floor.
+  if (limbIndex == heldSlot_ && !heldItem_.empty()) {
+    LostGear lg;
+    lg.item = heldItem_;
+    lg.held = true;
+    name = heldItem_;
+    report(std::move(lg));
+    heldSlot_ = -1;
+    heldPartIndex_ = -1;
+    heldItem_.clear();
+    heldPart_.clear();
+    return name;
+  }
+  if (!IsWornSlot(limbIndex)) return name;
+  const int pi = WornPieceOfSlot(limbIndex);
+  if (pi < 0) return name;
+  // A SLEEVE CUT OFF IS A RAG, and the piece goes on being worn without it —
+  // the strap-cut behaviour armour shipped with. Only the identity shell
+  // takes the piece with it.
+  if (IdentityShellOf(pi) != limbIndex) return name;
+  LostGear lg;
+  lg.equipSlot = worn_[pi].equipSlot;
+  lg.item = worn_[pi].item;
+  CaptureWorn(lg.equipSlot, lg.damage);
+  name = lg.item;
+  // The other shells are sewn to this one: they fall as rags. Collected
+  // first and the piece erased BEFORE they detach, so the recursion below
+  // finds no piece for them and reports nothing twice.
+  std::vector<int> others;
+  for (int s : worn_[pi].slots)
+    if (s != limbIndex && s >= 0 && s < (int)limbs_.size() && limbs_[s].body)
+      others.push_back(s);
+  worn_.erase(worn_.begin() + pi);
+  report(std::move(lg));
+  for (int s : others) DetachLimb(s, /*adopt=*/true);
+  return name;
 }
 
 void Mob::RegisterTerrainAnchor() {
@@ -3803,8 +3909,11 @@ bool Mob::Damage(uint64_t bodyHandle, float amount, Vec3 hitWorldVoxel,
     //    creature, geometry dismembers it.
     const float impactBar =
         ld.severImpactSpeed * CurrentTuning().gore.woundImpactSeverScale;
-    const bool impactSevers = ld.severImpactSpeed > 0 && impactBar > 0 &&
-                              impactSpeed >= impactBar;
+    // A STRAP DOES NOT SNAP BECAUSE THE BLOW WAS FAST. The impact rule is the
+    // sword-knocked-from-the-hand rule; a cuirass leaves by being cut through
+    // (CarveLimb) or never.
+    const bool impactSevers = !IsWornSlot((int)i) && ld.severImpactSpeed > 0 &&
+                              impactBar > 0 && impactSpeed >= impactBar;
     limb.hp -= amount;
     limb.woundLocal = RotateInv(q, hitWorldVoxel - limb.xf.pos);
     // ---- THE HIT FLASH ------------------------------------------------------
@@ -4142,9 +4251,51 @@ bool Mob::CutLimb(uint64_t bodyHandle, const BladeCut& cut, World& world,
     w = v.cross(u).normalized();
 
     const auto& gt = CurrentTuning().gore;
-    const float depth = std::max(cut.depth, 0.0f);
-    const float halfW = std::max(cut.halfWidth, 1e-3f);
-    const float halfL = std::max(cut.length, 1e-3f);
+    float depth = std::max(cut.depth, 0.0f);
+    float halfW = std::max(cut.halfWidth, 1e-3f);
+    float halfL = std::max(cut.length, 1e-3f);
+    // ---- A BLADE CHIPS IRON; IT DOES NOT CARVE IT --------------------------
+    //
+    // The kerf above is sized for flesh, and it was sized for flesh on a
+    // cuirass too: a shell is one authored micro thick, so a slot cut for a
+    // thigh went straight through the plate and out the other side, the
+    // connectivity split found two halves, and the cut-through rule below
+    // took "the entire centre piece" off with one blow. That is what a sword
+    // does to a robe. To a plate it does the OTHER thing armour was built to
+    // do: it skates, and takes a chip.
+    //
+    // Scaled by the shell's MATERIAL HARDNESS — the same 0..255 field the
+    // blast crater and the dig already read (materials.json) — against
+    // `gear.cutHardnessRef`, the hardness a full kerf is written for (skin's
+    // 8). Cloth at 5 and leather at 14 barely move; iron at 160 takes a
+    // twentieth, floored at `gear.cutHardnessMin` and at ONE lattice voxel
+    // deep so every blow still costs the plate something and a suit really
+    // does wear through under a patient enemy. A worn slot only: a held blade
+    // is never carved (melee.cpp skips the held slot), and flesh keeps the
+    // wound model the `wound` gate pins.
+    if (IsWornSlot((int)i) && sys_ != nullptr) {
+      uint32_t m = 0;
+      if (!limb.skinVoxels.empty())
+        m = limb.skinVoxels[0].material & 0xFFFu;
+      else if (!limb.voxels.empty())
+        m = limb.voxels[0].payload & 0xFFFu;
+      const auto& gear = CurrentTuning().gear;
+      const float hard =
+          m < sys_->matGpu_.size() ? (float)sys_->matGpu_[m].hardness : 0.0f;
+      if (hard > 0.0f && gear.cutHardnessRef > 0.0f) {
+        const float k = std::clamp(gear.cutHardnessRef / hard,
+                                   std::clamp(gear.cutHardnessMin, 0.0f, 1.0f),
+                                   1.0f);
+        // The chip is at least one lattice cell in every direction, or a
+        // blade thinner than a cell (a stock edge is 0.08 voxels against a
+        // 0.125-voxel skin cell) would slip between cell centres and cost
+        // the plate nothing at all on most strikes.
+        const float oneCell = 1.0f / (float)std::max(1u, SkinScaleOf(limb));
+        depth = std::max(depth * k, std::min(depth, oneCell));
+        halfL = std::max(halfL * k, std::min(halfL, oneCell));
+        halfW = std::max(halfW, oneCell);
+      }
+    }
     // HOW FAR BACK THE SLOT STARTS. `cut.at` is a ray hit on the JOLT
     // COLLIDER, which is a greedy box merge inflated by a convex radius — it
     // is near the surface, not on it, and at skinScale 8 "near" is several
@@ -4899,16 +5050,15 @@ void Mob::EmitCarvedFragment(const MobLimb& src, uint32_t physScale,
     LimbVoxelsToParticles(src, physScale, part, world, spawns);
     return;
   }
-  // A gobbet of the AVATAR is born INSIDE the player's capsule proxy — the
-  // carve that made it happened on a limb that lives there. On the plain MOVING
-  // layer that is an instant deep penetration against the proxy, and
-  // PlayerPushOut turns it into a shove; a spray of them is the player skating
-  // off sideways every time acid takes a bite. Same rule as the limb it came
-  // off (Layers::AVATAR): your own body may not push you, and neither may the
-  // pieces of it. Unlike a severed limb this never converts back — a fist-sized
-  // lump of you that has stopped colliding with you is invisible, and it is
-  // still fully collidable with the world.
-  if (AvatarLayer()) phys_->SetBodyAvatarLayer(h, true);
+  // A gobbet is born INSIDE whoever it was carved out of — and, when the
+  // player is the one swinging, often inside the player too: the carve
+  // happened at sword's reach. On the plain MOVING layer that is an instant
+  // deep penetration against the proxy, and PlayerPushOut turns it into a
+  // shove; a spray of them is the player skating off sideways every time acid
+  // takes a bite (or a blade a chunk). Kept off the player until it has
+  // fallen clear, then ordinary debris — the same rule every piece that
+  // leaves a rig now follows.
+  phys_->ReleaseToWorldWhenClear(h);
   // Push it off the wound so it visibly leaves the body rather than resting in
   // the cavity it came from.
   Vec3 away = xf.pos - src.xf.pos;
@@ -6178,7 +6328,24 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
         // burning torso and the thigh below it sat in.
         if (nmat[k] == 0) {
           const IVec3 wc{ifloor(wv.x), ifloor(wv.y), ifloor(wv.z)};
-          const uint32_t xm = crossAt(wc);
+          uint32_t xm = crossAt(wc);
+          // ...AND A COAT IS IN THE WAY OF A SIBLING'S HEAT TOO. The probe
+          // above only ran against a THREAT in the grid, and cross heat sits
+          // exactly where the grid has nothing to say — so a burning bare
+          // hand lit the forearm INSIDE its sleeve, and the fire walked up the
+          // arm under the plate: "the character is on fire inside the
+          // armour". The same march, the same reach; the sibling's flame is
+          // read as the shell's material, which is not hot, and the shell's
+          // own pass decides whether the shell catches from it.
+          if (xm) {
+            const uint32_t wornX =
+                v.WornAlong(wv, Rotate(q, outward), kWornNbrReach);
+            if (wornX) {
+              nmat[k] = wornX;
+              xm = 0;
+              if (v.occlude) wornStats_.nbrSubstituted++;
+            }
+          }
           if (xm) {
             nmat[k] = xm;
             ncross[k] = true;
@@ -6818,16 +6985,20 @@ void Mob::Sever(int limbIndex) {
       // there is the second half of "being on fire causes spurts like crazy".
       const bool worn = IsWornSlot(limbIndex);
       const bool gore = !worn && !inBurnFlush_;
-      // ...AND IT MUST NOT BECOME A RIGIDBODY INSIDE THE WEARER.
+      // ...AND A GARMENT CONSUMED BY FIRE LEAVES NO BODY AT ALL.
       //
       // DetachLimb(adopt=true) hands the slot to DebrisSystem, which makes it
-      // an ordinary dynamic body — spawned exactly overlapping the player
-      // capsule it was strapped to, and outside Layers::AVATAR, so Jolt's
-      // resolution of that overlap fires the player across the room. That is
-      // the reported "clothes burning off launches the player", and it is not
-      // a physics tuning problem: a garment consumed BY FIRE has nothing left
-      // to fall off, so there should be no body at all. Rags cut loose by a
-      // blade still drop, because that is a piece of gear hitting the floor.
+      // an ordinary dynamic body. When this was first written that body was
+      // spawned overlapping the wearer's capsule on the normal contact layer,
+      // and Jolt's resolution of the overlap fired the player across the room
+      // — "clothes burning off launches the player". The layer half of that is
+      // now handled for every body that leaves a rig (DetachLimb,
+      // Physics::ReleaseToWorldWhenClear); what remains true is the physical
+      // half: a garment consumed BY FIRE has nothing left to fall off, so
+      // there should be no body. Rags cut loose by a blade still drop, because
+      // that is a piece of gear hitting the floor — and if the rag is the
+      // piece's identity shell, the whole piece goes with it and lands as a
+      // thing you can pick up (ShedGearBeforeDetach).
       const bool adopt = !(worn && inBurnFlush_);
       if (gore && adopt) {
         // THE PIECE BLEEDS TOO, from its own end of the cut: a head on the
@@ -7005,6 +7176,10 @@ void Mob::DetachLimb(int limbIndex, bool adopt) {
   if (limbIndex >= 0 && limbIndex < (int)anim_.partAlive.size())
     anim_.partAlive[limbIndex] = 0;  // gait stops scheduling it, IK -> 0
   if (adopt) {
+    // GEAR FIRST, while the shells still hold their lattices (CaptureWorn
+    // reads them, and AdoptBody below moves this one out). Names the item the
+    // adopted body is registered as, or nothing for anatomy and rags.
+    const std::string shedAs = ShedGearBeforeDetach(limbIndex);
     // Hand the micro description over with the body: that is what makes a
     // severed microvoxel limb keep its detail as ordinary debris (PLAN §C4) —
     // and, for a CARVED limb, what makes it keep its wounds. The brick this
@@ -7022,11 +7197,25 @@ void Mob::DetachLimb(int limbIndex, bool adopt) {
     limb.carved = false;
     limb.holdBody = limb.body;
     limb.holdSeconds = kSeverHoldSeconds;
+    // OFF THE PLAYER'S CONTACT LAYER FOR THE HOLD, whoever it came off. The
+    // piece is KINEMATIC for kSeverHoldSeconds, frozen in the pose it was cut
+    // in — and an NPC's arm cut off mid-swing is frozen INSIDE the player who
+    // cut it. On the normal layer that is an unresolvable overlap the proxy
+    // cannot move, so PlayerPushOut moved the player instead, a body-width a
+    // tick for fifteen ticks: "I dismembered him and flew across the field".
+    // The avatar's own pieces were already exempt; now everything is, and
+    // TickSeveredHolds hands the piece to ReleaseToWorldWhenClear rather than
+    // straight back to the world.
+    phys_->SetBodyAvatarLayer(limb.body, true);
     // The wound went with the body. Left here it would go on paying out of
     // the husk entry: BleedTick's bodyless fallback drips at the rest-pose
     // anchor of a limb that is no longer on this creature.
     limb.bleedBudget = 0.0f;
     limb.gushTicks = 0;
+    // A PIECE OF GEAR HITTING THE FLOOR: tell the ground registry which item
+    // that body is, so `E` can pick it up (Mob::LostGear).
+    if (!shedAs.empty() && sys_ && sys_->onItemShed_)
+      sys_->onItemShed_(limb.holdBody, shedAs);
   } else {
     // Not adopted: nothing downstream will ever free this limb's brick, so it
     // must be returned here.
@@ -7096,20 +7285,19 @@ void Mob::Die() {
                        limb.MicroRef(SkinScaleOf(limb)), PhysScaleOf(limb),
                        std::move(limb.skinVoxels), def_->bleedMat,
                        WoundOf(limb));
-    // NOTE THE ABSENT OnBodyReleasedToWorld. A limb that is SEVERED gets its
-    // avatar-layer exemption stripped, but only after kSeverHoldSeconds
-    // (TickSeveredHolds) — by then it has swung clear of the capsule it grew
-    // out of. A corpse has no such beat: on death EVERY limb goes dynamic at
-    // once, in the pose it was standing in, i.e. entirely inside the player's
-    // capsule proxy. Handing those to the plain MOVING layer in the same frame
-    // hands Jolt a dozen deep, unresolvable penetrations against the proxy and
-    // the solver does the only thing it can — it fires the whole ragdoll out of
-    // the capsule in whatever direction the overlap resolved. That is the "I
-    // died and my body went FLYING" bug; it should keel over.
+    // A CORPSE FALLS WHERE IT STOOD, which for the avatar is entirely inside
+    // the player's capsule proxy, and for an NPC killed at sword's reach is
+    // often half inside it. Handing those limbs to the plain MOVING layer in
+    // the same frame hands Jolt a dozen deep, unresolvable penetrations
+    // against the proxy and the solver does the only thing it can — it fires
+    // the whole ragdoll out of the capsule in whatever direction the overlap
+    // resolved. That is the "I died and my body went FLYING" bug; it should
+    // keel over. (The avatar's limbs used to keep their exemption for good,
+    // which made your own remains walk-through after a respawn.)
     //
-    // So the corpse keeps the exemption for good. The cost is that you can walk
-    // through your own remains after respawning, which nobody can see; the
-    // alternative is a launch nobody can miss.
+    // Off the player's contact layer until it has fallen clear, then debris
+    // like any other: the same rule a severed piece follows.
+    phys_->ReleaseToWorldWhenClear(limb.body);
     limb.skinVoxels.clear();
     limb.carved = false;  // brick ownership moved with the body (see DetachLimb)
     limb.body = 0;
@@ -7419,6 +7607,17 @@ uint32_t MobSystem::LimbVoxelCount(uint64_t mobId, int limbIndex) const {
   for (const Mob& mob : mobs_)
     if (mob.id_ == mobId && limbIndex >= 0 && limbIndex < (int)mob.limbs_.size())
       return (uint32_t)mob.limbs_[limbIndex].voxels.size();
+  return 0;
+}
+
+uint32_t MobSystem::LimbSkinVoxelCount(uint64_t mobId, int limbIndex) const {
+  for (const Mob& mob : mobs_)
+    if (mob.id_ == mobId && limbIndex >= 0 &&
+        limbIndex < (int)mob.limbs_.size()) {
+      const MobLimb& L = mob.limbs_[limbIndex];
+      return (uint32_t)(L.HasFineSkin() ? L.skinVoxels.size()
+                                        : L.voxels.size());
+    }
   return 0;
 }
 
@@ -7980,6 +8179,16 @@ void Mob::RemoveAppendedSlots(int first, int count) {
   // Physics first, while the handles are still reachable.
   for (int i = first; i < first + count; i++) {
     MobLimb& L = limbs_[i];
+    // A slot still HOLDING a severed piece (the kinematic beat after a cut)
+    // is being erased under it: finish the hold now, or the piece stays
+    // kinematic in mid-air forever with nothing left to time it out.
+    if (L.holdBody) {
+      phys_->SetBodyKinematic(L.holdBody, false);
+      phys_->ClearCollisionGroup(L.holdBody);
+      phys_->ReleaseToWorldWhenClear(L.holdBody);
+      L.holdBody = 0;
+      L.holdSeconds = 0;
+    }
     if (L.joint) {
       phys_->DestroyJoint(L.joint);
       L.joint = 0;

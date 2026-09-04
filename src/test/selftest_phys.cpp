@@ -615,6 +615,49 @@ bool pushOk = false;
   float pushFar = phys.PlayerPushOut(pb, at).len();
   phys.RemoveBody(farBody);
 
+  // RELEASE WHEN CLEAR (Physics::ReleaseToWorldWhenClear). A body born inside
+  // the proxy — a severed limb, a cut strap's plate, a sword knocked from a
+  // hand — must be invisible to the push while it overlaps, and ordinary
+  // debris once it is clear: one that stayed exempt would be walk-through
+  // forever, one that never was is the "dismembered him and flew across the
+  // field" launch.
+  bool releaseOk = false;
+  {
+    // The proxy is PINNED for this: MovePlayerBody hands it the velocity the
+    // move implies (capped at 30 m/s) and the game re-teleports it every
+    // tick, but here nothing does, so after the Step above it is sailing off
+    // at 30 m/s and the overlap test would be reading a proxy that has left.
+    auto pin = [&]() {
+      phys.MovePlayerBody(pb, at, kTickDt);
+      phys.SetBodyVelocity(pb, Vec3{});
+    };
+    pin();
+    uint64_t inside = stoneBlock({499, 499, 499});  // straddles the capsule
+    phys.ReleaseToWorldWhenClear(inside);
+    const float pushHeld = phys.PlayerPushOut(pb, at).len();
+    phys.Step(kTickDt);   // still overlapping after a step: still exempt
+    const float pushHeld2 = phys.PlayerPushOut(pb, at).len();
+    const size_t pendingInside = phys.PendingReleaseCount();
+    // The proxy walks away; the block stays. Next step it is clear.
+    at = Vec3{540.0f, 500.0f, 500.0f};
+    pin();
+    phys.Step(kTickDt);
+    const size_t pendingAfter = phys.PendingReleaseCount();
+    BodyTransform bx{};
+    phys.GetTransform(inside, bx);
+    // Back on the normal layer: a proxy placed over it reads a push again.
+    const float pushAfter =
+        phys.PlayerPushOut(pb, bx.pos + Vec3{1.5f, 1.5f, 1.5f}).len();
+    phys.RemoveBody(inside);
+    releaseOk = pushHeld < 1e-3f && pushHeld2 < 1e-3f && pendingInside == 1 &&
+                pendingAfter == 0 && pushAfter > 0.01f;
+    std::printf(
+        "player body: release-when-clear %s (held %.3f/%.3f vox, pending %zu "
+        "-> %zu, after %.2f vox)\n",
+        releaseOk ? "ok" : "FAILED", pushHeld, pushHeld2, pendingInside,
+        pendingAfter, pushAfter);
+  }
+
   // mass-relative shove: the proxy is dynamic with a real mass, so walking
   // into a light sphere must move it far more than the same walk into a
   // heavy one (both fall freely — only horizontal displacement counts).
@@ -638,7 +681,7 @@ bool pushOk = false;
   float heavyMoved = walkInto(12000.0f);  // ~780 kg lead sphere
   phys.RemoveBody(pb);
   bool shoveOk = lightMoved > 2.0f && lightMoved > 3.0f * heavyMoved;
-  pushOk = pushNear > 0.01f && pushFar < 1e-3f && shoveOk;
+  pushOk = pushNear > 0.01f && pushFar < 1e-3f && shoveOk && releaseOk;
   std::printf(
       "player body: %s (overlap push %.2f vox, clear push %.3f vox, "
       "shove light %.1f vox vs heavy %.1f vox)\n",

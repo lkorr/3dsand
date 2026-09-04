@@ -76,7 +76,9 @@
     "zoomMax": 2.5
   },
   "gear": {
-    "ruinedCondition": 0.4
+    "ruinedCondition": 0.4,
+    "cutHardnessRef": 8,
+    "cutHardnessMin": 0.05
   },
   "avatar": {
     "enabled": true,

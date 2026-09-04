@@ -471,6 +471,179 @@ Status GateArmorWear(Ctx& c, std::string& detail) {
     check(mob->WearItem(&boots, bootSlot, &dmg), "re-worn for the teardown");
   }
 
+  // ---- 3c. A BLADE CHIPS IRON; IT CARVES CLOTH ---------------------------
+  //
+  // Two identical cubes over the same limb, one of steel and one of cloth,
+  // and the same kerf through each. The slot is sized for flesh, and on one
+  // authored micro of plate it used to go straight through and out the other
+  // side — the connectivity split then found two halves and the cut-through
+  // rule took the whole cuirass off in a blow. gear.cutHardnessRef scales it
+  // by the shell material's hardness: cloth (5) is cut about like flesh,
+  // steel (200) is chipped, and never for nothing.
+  {
+    auto matId = [&](const char* n) -> uint32_t {
+      for (size_t i = 0; i < c.mats.size(); i++)
+        if (c.mats[i].name == n) return (uint32_t)i;
+      return 0;
+    };
+    const uint32_t mSteel = matId("steel"), mCloth = matId("cloth");
+    if (mSteel && mCloth) {
+      const ItemDef plateCube =
+          MakeWornFixture("fixture_plate_cube", ItemKind::ArmorShoulders,
+                          {spineA}, 8, mSteel, fixtureMicro);
+      const ItemDef clothCube =
+          MakeWornFixture("fixture_cloth_cube", ItemKind::ArmorChest, {spineA},
+                          8, mCloth, fixtureMicro);
+      const int plateSlot = (int)EquipSlotId::Shoulders;
+      check(mob->WearItem(&plateCube, plateSlot), "a steel cube goes on");
+      check(mob->WearItem(&clothCube, chestSlot), "and a cloth one over it");
+      auto shellOf = [&](const char* item) {
+        for (int p = 0; p < mob->WornPieceCount(); p++) {
+          const std::vector<int>& s = mob->WornSlotsAt(p);
+          if (!s.empty() &&
+              mob->LimbDefAt(s[0]).name.find(item) != std::string::npos)
+            return s[0];
+        }
+        return -1;
+      };
+      const int ps = shellOf("fixture_plate_cube"), cs = shellOf("fixture_cloth_cube");
+      check(ps >= 0 && cs >= 0, "both shells found");
+      auto cutInto = [&](int slot) -> float {
+        if (slot < 0) return 0.0f;
+        const uint64_t body = mobs.LimbBody(id, slot);
+        // The SKIN count: a chip one skin voxel deep never reaches the
+        // majority-filled collider, which is the point of it being a chip.
+        const uint32_t before = mobs.LimbSkinVoxelCount(id, slot);
+        // Downward through the top face, the same three sizing lines
+        // main.cpp's sweep computes at power 1 and heft 1. Centred on the
+        // cube (the mean of its two corner collider voxels, whatever pose the
+        // torso is in), a little off the cell grid so the slot straddles cell
+        // centres rather than landing exactly between them.
+        const uint32_t nc = mobs.LimbVoxelCount(id, slot);
+        const Vec3 centre = (mobs.LimbVoxelPos(id, slot, 0) +
+                             mobs.LimbVoxelPos(id, slot, nc ? nc - 1 : 0)) *
+                            0.5f;
+        const auto& g = CurrentTuning().gore;
+        BladeCut cut;
+        cut.at = centre + Vec3{0.06f, 0.9f, 0.06f};
+        cut.edgeAxis = Vec3{1, 0, 0};
+        cut.cutDir = Vec3{0, -1, 0};
+        cut.halfWidth = std::max(0.2f * g.cutWidth, 0.08f);
+        cut.depth = g.cutDepth + g.cutDepthPower;
+        cut.length = g.cutLength;
+        cut.power = 1.0f;
+        cut.seed = 0xC4A7u;
+        std::vector<ParticleSpawn> spawns;
+        MobSystem::BladeCutScope blade(mobs, 1.0f);
+        mobs.CutLimb(body, cut, c.world, spawns);
+        const uint32_t after = mobs.LimbSkinVoxelCount(id, slot);
+        return before ? 1.0f - (float)after / (float)before : 0.0f;
+      };
+      const float lostSteel = cutInto(ps);
+      const float lostCloth = cutInto(cs);
+      std::printf("armor-wear: one kerf took %.2f%% of the steel cube and "
+                  "%.2f%% of the cloth one\n",
+                  lostSteel * 100.0f, lostCloth * 100.0f);
+      check(lostSteel > 0.0f, "the blade still costs steel something");
+      check(lostSteel < 0.02f, "but a chip, not a slot: under 2% of the plate");
+      check(lostCloth > 5.0f * lostSteel,
+            "while the same kerf takes cloth like flesh");
+      check(mob->WornItem(plateSlot) == "fixture_plate_cube" &&
+                mobs.LimbBody(id, ps) != 0,
+            "and the plate is still strapped on");
+      mob->UnwearItem(plateSlot);
+      mob->UnwearItem(chestSlot);
+    }
+  }
+
+  // ---- 3d. CUT LOOSE: a piece that leaves by force is a thing on the floor --
+  //
+  // A strap cut is DetachLimb(adopt) like any severed limb, which made the
+  // shell an anonymous debris body: not the robe, not anything `E` could see,
+  // and the wearer's slot still said "robe". Now the piece's IDENTITY shell
+  // (the panel a dropped copy is made of) takes the piece with it: the other
+  // shells fall as rags, the slot empties, the owner is told (LostGear) and
+  // the body is registered under the item's name. A sleeve alone is still a
+  // rag. The sword knocked from the hand takes the same road.
+  {
+    std::vector<std::pair<uint64_t, std::string>> shed;
+    mobs.SetOnItemShed([&shed](uint64_t h, const std::string& n) {
+      shed.push_back({h, n});
+    });
+    check(mob->WearItem(&robe, chestSlot), "the robe goes on for the cut");
+    int piece = -1;
+    for (int p = 0; p < mob->WornPieceCount(); p++) {
+      const std::vector<int>& s = mob->WornSlotsAt(p);
+      if (!s.empty() && mob->LimbDefAt(s[0]).name.find("fixture_robe") !=
+                            std::string::npos)
+        piece = p;
+    }
+    const int identity = mob->IdentityShellOf(piece);
+    int sleeve = -1;
+    for (int s : mob->WornSlotsAt(piece))
+      if (s != identity) { sleeve = s; break; }
+    check(identity >= 0 && sleeve >= 0, "the robe has an identity shell and a sleeve");
+    const int limbsDressed = mob->LimbCount();
+
+    // A sleeve cut off is a rag: the piece stays on, nothing is an item.
+    mobs.Sever(id, sleeve);
+    check(shed.empty(), "a severed sleeve is not registered as the robe");
+    check(mob->WornItem(chestSlot) == "fixture_robe",
+          "and the robe is still worn without it");
+    check(mob->LostGearEvents().empty(), "and the owner is not told of a loss");
+
+    // The identity shell takes the piece with it.
+    const uint64_t identityBody = mobs.LimbBody(id, identity);
+    mobs.Sever(id, identity);
+    check(shed.size() == 1 && shed[0].second == "fixture_robe" &&
+              shed[0].first == identityBody,
+          "the identity shell's body is registered as the robe");
+    check(mob->WornItem(chestSlot).empty(), "and the robe is no longer worn");
+    check(mob->WornPieceCount() == 1, "only the boots remain registered");
+    check(mob->LostGearEvents().size() == 1 &&
+              mob->LostGearEvents()[0].equipSlot == chestSlot &&
+              mob->LostGearEvents()[0].item == "fixture_robe" &&
+              !mob->LostGearEvents()[0].held,
+          "the owner is told which slot lost what");
+    check(!mob->LostGearEvents()[0].damage.Empty(),
+          "with the piece's damage (it is missing a sleeve)");
+    int robeBodies = 0;
+    for (int i = baseLimbs; i < mob->LimbCount(); i++)
+      if (mob->LimbDefAt(i).name.find("fixture_robe") != std::string::npos &&
+          mobs.LimbBody(id, i))
+        robeBodies++;
+    check(robeBodies == 0, "every shell of the robe has left the body");
+    mob->ClearLostGear();
+
+    // Once the severed-hold beat is over, the dead slots are swept: the tail
+    // is not a history of what was worn.
+    mob->TickSeveredHolds(1.0f);
+    check(mob->LimbCount() == limbsDressed - (int)robeParts.size(),
+          "and the robe's slots are gone from the tail after the hold");
+
+    // The sword knocked out of the hand.
+    if (armed) {
+      const int hs = mob->HeldSlot();
+      const uint64_t swordBody = mobs.LimbBody(id, hs);
+      const int limbsArmed = mob->LimbCount();
+      mobs.Sever(id, hs);
+      check(shed.size() == 2 && shed[1].second == sword->name &&
+                shed[1].first == swordBody,
+            "a sword knocked from the hand is registered as the sword");
+      check(mob->HeldSlot() < 0 && mob->HeldItem().empty(),
+            "and the creature is unarmed from that instant");
+      check(mob->LostGearEvents().size() == 1 &&
+                mob->LostGearEvents()[0].held &&
+                mob->LostGearEvents()[0].item == sword->name,
+            "and the owner is told it was the held item");
+      mob->ClearLostGear();
+      mob->TickSeveredHolds(1.0f);
+      check(mob->LimbCount() == limbsArmed - 1,
+            "the sword's dead slot is swept after the hold too");
+    }
+    mobs.SetOnItemShed(nullptr);
+  }
+
   // ---- 4. everything comes off cleanly -----------------------------------
   check(mob->UnwearItem(bootSlot), "the boots come off");
   if (armed) mob->EquipItem(nullptr);

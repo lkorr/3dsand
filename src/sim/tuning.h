@@ -306,6 +306,12 @@ struct Tuning {
     // by being geometrically in the way, so how much of it is in the way is
     // what its condition means.
     float ruinedCondition = 0.40f;
+    // A blade's kerf into a WORN shell is scaled by cutHardnessRef divided by
+    // the shell material's hardness (materials.json, 0..255), floored at
+    // cutHardnessMin: a shell as hard as skin (8) is cut like flesh, iron
+    // (160) is chipped. See Mob::CutLimb. 0 disables the scaling.
+    float cutHardnessRef = 8.0f;
+    float cutHardnessMin = 0.05f;
   } gear;
 
   // ---- player avatar ----

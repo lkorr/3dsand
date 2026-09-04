@@ -502,6 +502,10 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     const std::string at = "gear";
     ReadF(*g, "ruinedCondition", c.ruinedCondition, out, at);
     c.ruinedCondition = std::clamp(c.ruinedCondition, 0.0f, 1.0f);
+    ReadF(*g, "cutHardnessRef", c.cutHardnessRef, out, at);
+    ReadF(*g, "cutHardnessMin", c.cutHardnessMin, out, at);
+    if (c.cutHardnessRef < 0.0f) c.cutHardnessRef = 0.0f;
+    c.cutHardnessMin = std::clamp(c.cutHardnessMin, 0.0f, 1.0f);
   }
 
   if (const json* g = Find(j, "avatar")) {

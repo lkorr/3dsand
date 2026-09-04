@@ -266,6 +266,8 @@ bool Physics::Init() {
 }
 
 void Physics::Shutdown() {
+  pendingRelease_.clear();
+  playerBody_ = 0;
   joints_.reset();  // constraint refs drop before the system that owns bodies
   system_.reset();  // ...and the system drops before the listener it points at
   contacts_.reset();
@@ -297,6 +299,8 @@ void Physics::Step(float dt) {
   if (contacts_) contacts_->impacts.clear();
   system_->Update(dt, CurrentTuning().physics.collisionSteps, tempAlloc_.get(),
                   jobs_.get());
+  // After the step, so a piece is judged against where it has fallen TO.
+  TickPendingReleases();
 }
 
 uint64_t Physics::CreateDebrisBody(const std::vector<DebrisVoxel>& voxels,
@@ -523,7 +527,11 @@ uint64_t Physics::CreatePlayerBody(float halfXZVox, float halfYVox) {
   JPH::BodyID id = bi.CreateAndAddBody(bcs, JPH::EActivation::Activate);
   // NOT in dynamicBodies_: the proxy never despawns and must not receive
   // explosion impulses or WakeNear — the player controller owns its motion.
-  return id.IsInvalid() ? 0 : FromBodyID(id);
+  if (id.IsInvalid()) return 0;
+  // The newest proxy is THE player for ReleaseToWorldWhenClear. A selftest
+  // that makes and removes several is served by the one it is using now.
+  playerBody_ = FromBodyID(id);
+  return playerBody_;
 }
 
 void Physics::MovePlayerBody(uint64_t handle, Vec3 centerVoxel, float dt) {
@@ -906,6 +914,72 @@ void Physics::SetBodyAvatarLayer(uint64_t handle, bool isAvatar) {
   bi.SetObjectLayer(id, isAvatar ? Layers::AVATAR : Layers::MOVING);
 }
 
+bool Physics::WorldBounds(uint64_t handle, float outMin[3],
+                          float outMax[3]) const {
+  if (!system_ || handle == 0) return false;
+  const JPH::BodyLockInterface& bli = system_->GetBodyLockInterface();
+  JPH::BodyLockRead lock(bli, ToBodyID(handle));
+  if (!lock.Succeeded()) return false;
+  const JPH::AABox b = lock.GetBody().GetWorldSpaceBounds();
+  outMin[0] = b.mMin.GetX(); outMin[1] = b.mMin.GetY(); outMin[2] = b.mMin.GetZ();
+  outMax[0] = b.mMax.GetX(); outMax[1] = b.mMax.GetY(); outMax[2] = b.mMax.GetZ();
+  return true;
+}
+
+void Physics::ReleaseToWorldWhenClear(uint64_t handle) {
+  if (!system_ || handle == 0) return;
+  JPH::BodyInterface& bi = system_->GetBodyInterface();
+  const JPH::BodyID id = ToBodyID(handle);
+  if (!bi.IsAdded(id)) return;
+  // Nobody to protect: straight to the ordinary layer.
+  if (playerBody_ == 0 || !bi.IsAdded(ToBodyID(playerBody_))) {
+    bi.SetObjectLayer(id, Layers::MOVING);
+    return;
+  }
+  bi.SetObjectLayer(id, Layers::AVATAR);
+  for (uint64_t h : pendingRelease_)
+    if (h == handle) return;
+  if (pendingRelease_.size() >= kMaxPendingRelease) {
+    // Bounded (CLAUDE.md rule 2): the oldest goes now, clear or not. At 256
+    // simultaneous pieces inside one player something else is already wrong.
+    const JPH::BodyID old = ToBodyID(pendingRelease_.front());
+    if (bi.IsAdded(old)) bi.SetObjectLayer(old, Layers::MOVING);
+    pendingRelease_.erase(pendingRelease_.begin());
+  }
+  pendingRelease_.push_back(handle);
+}
+
+void Physics::TickPendingReleases() {
+  if (pendingRelease_.empty() || !system_) return;
+  JPH::BodyInterface& bi = system_->GetBodyInterface();
+  float pmin[3], pmax[3];
+  const bool havePlayer =
+      playerBody_ != 0 && WorldBounds(playerBody_, pmin, pmax);
+  // A hand's breadth of clearance, so a body resting AGAINST the capsule does
+  // not flip layers on the tick it touches and shove on the next. Metres.
+  constexpr float kMargin = 0.05f;
+  size_t w = 0;
+  for (size_t i = 0; i < pendingRelease_.size(); i++) {
+    const uint64_t h = pendingRelease_[i];
+    const JPH::BodyID id = ToBodyID(h);
+    if (!bi.IsAdded(id)) continue;  // dead: forget it
+    float bmin[3], bmax[3];
+    bool overlaps = false;
+    if (havePlayer && WorldBounds(h, bmin, bmax)) {
+      overlaps = true;
+      for (int a = 0; a < 3; a++)
+        if (bmax[a] + kMargin < pmin[a] || bmin[a] - kMargin > pmax[a])
+          overlaps = false;
+    }
+    if (overlaps) {
+      pendingRelease_[w++] = h;
+      continue;
+    }
+    bi.SetObjectLayer(id, Layers::MOVING);
+  }
+  pendingRelease_.resize(w);
+}
+
 void Physics::DisableCollisionsAmong(const std::vector<uint64_t>& handles) {
   if (!system_ || handles.size() < 2) return;
   JPH::Ref<JPH::GroupFilterTable> table =
@@ -964,6 +1038,13 @@ void Physics::RemoveBody(uint64_t handle) {
   JPH::BodyID id = ToBodyID(handle);
   bi.RemoveBody(id);
   bi.DestroyBody(id);
+  if (handle == playerBody_) playerBody_ = 0;
+  for (size_t i = 0; i < pendingRelease_.size(); i++) {
+    if (pendingRelease_[i] == handle) {
+      pendingRelease_.erase(pendingRelease_.begin() + (ptrdiff_t)i);
+      break;
+    }
+  }
   for (size_t i = 0; i < dynamicBodies_.size(); i++) {
     if (dynamicBodies_[i] == handle) {
       dynamicBodies_[i] = dynamicBodies_.back();

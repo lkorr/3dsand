@@ -31,8 +31,8 @@
 //   - first-person part hiding, camera transforms, persistence ('AVTR').
 //
 // Everything else it does differently is an EXPLICIT override of Mob's
-// virtual seam (AvatarLayer, OnBodyReleasedToWorld, DropLimbListOnDeath,
-// MarkInstancesDirty) — never a parallel copy of shared mechanics.
+// virtual seam (AvatarLayer, DropLimbListOnDeath, MarkInstancesDirty) — never
+// a parallel copy of shared mechanics.
 //
 // DETERMINISM (CLAUDE.md rule 1). Every field here is CPU-float PRESENTATION
 // state, exactly like Mob's: poses, springs, camera offsets and the ragdoll
@@ -381,9 +381,6 @@ class PlayerAvatar : public Mob {
   // "walking forward drifts backwards" bug. The layer is identical in every
   // other respect and stays visible to rays.
   bool AvatarLayer() const override { return true; }
-  // A body leaving the rig for the world stops being "you": back on the
-  // normal layer it can bump the player like any other debris.
-  void OnBodyReleasedToWorld(uint64_t bodyHandle) override;
   // Keep the limb list on death so the HUD's per-part readout survives the
   // death screen; Despawn/Revive tears it down instead of the husk sweep.
   bool DropLimbListOnDeath() const override { return false; }

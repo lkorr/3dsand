@@ -3503,6 +3503,12 @@ int main(int argc, char** argv) {
     // whatever is in its fist. By pointer, because items reload on R.
     mobs.SetItems(&items);
   }
+  // A PIECE OF GEAR HITTING THE FLOOR BY FORCE — a cuirass cut loose, a sword
+  // knocked from a hand, anyone's — is the same kind of body an inventory drop
+  // makes, and the registry is what makes `E` see it (DESIGN.md §8c). The
+  // release hook above already forgets it when the body goes.
+  mobs.SetOnItemShed(
+      [&ground](uint64_t h, const std::string& name) { ground.Add(h, name); });
   Stream stream;
   stream.Init(&ctx, &world, &sim, kDefaultSeed);
   stream.OnMaterialsReloaded(mats);
@@ -5283,6 +5289,34 @@ int main(int argc, char** argv) {
     // — dragged into the pack from the character screen, say — is no longer
     // drawn, and this is where that is noticed: the state lives on one side of
     // the question, so there is nothing to keep in step.
+    // ---- GEAR THAT LEFT THE BODY BY FORCE (Mob::LostGear) --------------------
+    //
+    // The rig reports; the KIT is this frame's to fix, and it has to be fixed
+    // BEFORE the sheath and the wear loop below read it in the same tick, or
+    // the re-equip seams would faithfully pull a second sword out of the
+    // sheath while the first lies at your feet, and put the cuirass back on
+    // a body the plate has just fallen off. The piece on the ground is
+    // registered under its name (SetOnItemShed), so picking it back up is the
+    // ordinary `E` and wearing it again restores exactly the holes it had:
+    // the damage travels through `kit.wornDamage` by name, the same road a
+    // piece dragged into the pack takes.
+    for (const Mob::LostGear& lg : avatar.LostGearEvents()) {
+      if (lg.held) {
+        ItemStack& sh = kit.equip.slots[kSheathSlot];
+        if (KitItemName(sh, items) == lg.item) sh = ItemStack{};
+        ui.kitMessage = "your " + lg.item + " was knocked from your hand";
+      } else {
+        kit.SetDamage(lg.item, lg.damage);
+        if (lg.equipSlot >= 0 && lg.equipSlot < kEquipSlotCount &&
+            KitItemName(kit.equip.At(lg.equipSlot), items) == lg.item) {
+          kit.equip.slots[lg.equipSlot] = ItemStack{};
+          wearTried[lg.equipSlot].clear();
+        }
+        ui.kitMessage = "your " + lg.item + " was cut loose";
+      }
+      ui.kitMessageAge = 0.0f;
+    }
+    avatar.ClearLostGear();
     sheath.Reconcile(sheathKind(), UIState::kToolMelee, ui.tool);
     const ItemStack& sheathed = kit.equip.At(kSheathSlot);
     const ItemDef* heldItem =
