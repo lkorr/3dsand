@@ -505,7 +505,6 @@ SPEC = [
     ("worldgen", "kelpHeight", "TUNE_KELP_HEIGHT", "i", 10),
 
     # vines / climbers / hanging moss (worldgen agent B)
-    ("worldgen", "wallIvyDensity", "TUNE_WALL_IVY_DENSITY", "u", 3),
 
     # shoreline: the wet fringe outside a pond
     ("worldgen", "shoreBand", "TUNE_SHORE_BAND", "i", 24),
@@ -524,16 +523,12 @@ SPEC = [
     ("worldgen", "cactusChance", "TUNE_CACTUS_CHANCE", "u", 26),
     ("worldgen", "saguaroFraction", "TUNE_SAGUARO_FRACTION", "u", 22),
     ("worldgen", "alpineChance", "TUNE_ALPINE_CHANCE", "u", 40),
-    ("worldgen", "ruinChance", "TUNE_RUIN_CHANCE", "u", 5),
 
     # ruin pads (13.3.2)
-    ("worldgen", "ruinPadMargin", "TUNE_RUIN_PAD_MARGIN", "i", 20),
-    ("worldgen", "ruinMaxSlope", "TUNE_RUIN_MAX_SLOPE", "i", 20),
 
     # cave flora + the shaded face (13.3.4)
     ("worldgen", "caveMushroomChance", "TUNE_CAVE_MUSHROOM_CHANCE", "u", 26),
     ("worldgen", "caveCrystalChance", "TUNE_CAVE_CRYSTAL_CHANCE", "u", 9),
-    ("worldgen", "mossFace", "TUNE_MOSS_FACE", "u", 0),
     ("worldgen", "caveThreshold1", "TUNE_CAVE_THRESHOLD1", "u", 150),
     ("worldgen", "caveThreshold2", "TUNE_CAVE_THRESHOLD2", "u", 148),
 

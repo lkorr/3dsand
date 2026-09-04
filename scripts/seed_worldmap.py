@@ -106,7 +106,10 @@ meta = {
     "oceanFadeCells": FADE,
     "warpAmpVox": 160,
     "biomes": BIOMES,
-    "sites": [],
+    "sites": [
+        {"id": "harness", "kind": "pad", "min": [-128, -128], "max": [640, 640],
+         "about": "The selftest harness region: no tree trunks or crowns, no tarns, no cover. Keeps every fixture column (60..150 on the x==z diagonal) and the test tarn at (420,420) on the ground the gates were written against."}
+    ],
     "rules": []
 }
 (OUT / 'map.json').write_text(json.dumps(meta, indent=2) + '\n', encoding='utf-8')

@@ -2553,7 +2553,10 @@ class World {
     int rimY;          // the containment rim outside the disc = spill elevation
     const char* mat;   // "water", "oil", "lava"
   };
-  static constexpr int kAuthoredPools = 3;
+  static constexpr int kAuthoredPools = 1;
+  // The harness pad box from the world map (worldmap.h): the CPU twin of
+  // worldgen.wgsl's inHarness, for fixtures that want to know they are on it.
+  static bool InHarness(int x, int z);
   static void AuthoredPoolList(AuthoredPool out[kAuthoredPools]);
 
   // Fluid-lab worldgen mode (kLabSlabY block above). A process-wide static

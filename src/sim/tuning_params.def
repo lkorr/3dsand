@@ -892,7 +892,6 @@ TP_I(worldgen, kelpHeight, TUNE_KELP_HEIGHT, 10)
 // Ivy coverage on the ARENA and RUIN stone walls, 1..8. Higher is denser;
 // coverage always falls off toward the top of the wall so the coping stays
 // clear and the creeper reads as having climbed rather than been painted.
-TP_U(worldgen, wallIvyDensity, TUNE_WALL_IVY_DENSITY, 3)
 // ---- shoreline: the wet fringe outside a pond ----
 // RESTORED by agent E: these ten rows were dropped from this file during a
 // concurrent rollback while their declarations stayed in tuning.h and their
@@ -948,25 +947,17 @@ TP_U(worldgen, alpineChance, TUNE_ALPINE_CHANCE, 40)
 // lost from this file during the concurrent rollback while their declarations
 // stayed in tuning.h, which is the combination that fails tint at
 // "unresolved value TUNE_CAVE_THRESHOLD1" rather than at compile time.
-TP_U(worldgen, ruinChance, TUNE_RUIN_CHANCE, 5)
 // ---- ruin pads (13.3.2) ----
 // A ruin is a BUILDING: it stands on a level floor and the ground yields to it.
 // landColumn takes the four footprint-corner column heights, flattens the
 // footprint to their median, and ramps that pad back out to the natural terrain
-// over ruinPadMargin columns.
 //
 // THE TWO NUMBERS ARE A PAIR. The steepest column-to-column step the apron can
-// add is about (ruinMaxSlope / 2) / ruinPadMargin, and the CA's angle of repose
-// is exactly 1 voxel per column — so ruinMaxSlope must stay under twice
-// ruinPadMargin or the ramp itself becomes ground loose material can never rest
 // on. At 20 and 20 the apron adds half a voxel per column.
 //
-// ruinMaxSlope is also the REFUSAL: a site whose corners disagree by more than
 // this is not built at all, because flattening it would be a cut-and-fill scar
 // deeper than the building is tall. The footprint still reads as a clearing
 // (see ruinFloorAt) so a refused site looks like an old foundation.
-TP_I(worldgen, ruinPadMargin, TUNE_RUIN_PAD_MARGIN, 20)
-TP_I(worldgen, ruinMaxSlope, TUNE_RUIN_MAX_SLOPE, 20)
 // ---- cave flora + the shaded face (13.3.4) ----
 // 1-in-N per column, INSIDE the relevant patch mask, on the one cell that is
 // the cave's floor or its ceiling. Mushrooms go on the shallow band's floor
@@ -982,7 +973,6 @@ TP_U(worldgen, caveCrystalChance, TUNE_CAVE_CRYSTAL_CHANCE, 9)
 // Which wall face wears moss: 0 = -Z, 1 = +X, 2 = +Z, 3 = -X. Worldgen has no
 // sun and no compass, so a shaded face is a CONVENTION rather than a
 // measurement, and this is the knob that declares it. -Z is "north".
-TP_U(worldgen, mossFace, TUNE_MOSS_FACE, 0)
 TP_U(worldgen, caveThreshold1, TUNE_CAVE_THRESHOLD1, 150)
 TP_U(worldgen, caveThreshold2, TUNE_CAVE_THRESHOLD2, 148)
 

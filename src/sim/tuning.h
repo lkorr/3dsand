@@ -2922,7 +2922,6 @@ struct Tuning {
     // kind of divergence the .svtree bake exists to end: the tuner's Trees tab
     // is the only tree authoring surface now, so a decoration is either baked
     // into the atlas or it does not exist. Wall ivy is not tree decoration.
-    int wallIvyDensity = 3;          // 1..8, arena + ruin stone-wall coverage
     // ---- desert / pine highland / alpine ground cover ----
     // Percent of 2.5 m tiles in the desert that hold a cactus, and the percent
     // of those that are tall saguaro columns rather than ground-level barrels.
@@ -2936,22 +2935,15 @@ struct Tuning {
     // the snowline is meant to read as harsh, so this is the one knob that can
     // undo the intent of the whole alpine band by being made generous.
     int alpineChance = 40;
-    int ruinChance = 5;
     // Ruin pads: the footprint is flattened to the median of its four corner
-    // column heights and ramped back to the terrain over ruinPadMargin columns;
-    // a site whose corners disagree by more than ruinMaxSlope is refused.
-    // Keep ruinMaxSlope under 2*ruinPadMargin — see the note in
     // tuning_params.def, the apron's own step is what the angle of repose
     // bounds.
-    int ruinPadMargin = 20, ruinMaxSlope = 20;
     int caveThreshold1 = 150, caveThreshold2 = 148;
     // Cave flora: 1-in-N per column on the one cell that is the band's floor
     // (mushrooms, shallow band) or its floor and ceiling (crystal, deep band),
-    // inside a patch mask. mossFace picks which wall face wears moss --
     // 0 = -Z, 1 = +X, 2 = +Z, 3 = -X -- because worldgen has no sun and a
     // shaded face here is a convention, not a measurement.
     int caveMushroomChance = 26, caveCrystalChance = 9;
-    int mossFace = 0;
     // ---- the authored edit layer (src/sim/worldedit.h) ---------------------
     // Names assets/worldedits/<editLayer>.svedit, the hand-built patch the
     // Worldgen tab's voxel view writes. Applied through the MutationQueue to

@@ -196,6 +196,21 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
   auto oc = idOf.find("ocean");
   out.oceanBiome = oc == idOf.end() ? 0 : oc->second;
 
+  // ---- sites: only the harness pad box is read until P5 ------------------------
+  if (j.contains("sites") && j["sites"].is_array()) {
+    for (const json& s : j["sites"]) {
+      if (!s.is_object() || s.value("kind", "") != "pad") continue;
+      if (!(s.contains("min") && s.contains("max") && s["min"].is_array() &&
+            s["max"].is_array() && s["min"].size() == 2 && s["max"].size() == 2)) {
+        log += at + "site \"" + s.value("id", "?") + "\" kind pad needs min[2]/max[2] in world voxels\n";
+        return false;
+      }
+      out.harnessX0 = s["min"][0].get<int>(); out.harnessZ0 = s["min"][1].get<int>();
+      out.harnessX1 = s["max"][0].get<int>(); out.harnessZ1 = s["max"][1].get<int>();
+      break;  // one pad until the site table lands
+    }
+  }
+
   // ---- map.svmap --------------------------------------------------------------
   std::vector<uint8_t> raw;
   {
@@ -257,6 +272,10 @@ bool PackWorldMap(const biomes::BiomeSet& set, const WorldMapData& map,
   W[kHOceanFade] = U(map.oceanFadeCells);
   W[kHWarpAmp] = U(map.warpAmpVox);
   W[kHOceanBiome] = U(map.oceanBiome);
+  W[kHHarnessX0] = U(map.harnessX0);
+  W[kHHarnessZ0] = U(map.harnessZ0);
+  W[kHHarnessX1] = U(map.harnessX1);
+  W[kHHarnessZ1] = U(map.harnessZ1);
   W[kHBiomePlane] = U(static_cast<int>(W.size()));
   AppendPlane(W, map.biome);
   W[kHLandformPlane] = U(static_cast<int>(W.size()));

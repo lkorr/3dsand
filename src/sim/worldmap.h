@@ -91,6 +91,14 @@ enum : uint32_t {
   kHMaxCoverH = 20,     // max over every biome of kB_MaxCoverH: the far
                         // cascade's blocker band has no biome in hand
   kHOceanBiome = 21,    // biome id returned outside the painted planes
+  // The harness site (map.json sites[], kind "pad"): a world-voxel box that
+  // keeps the selftest fixtures' ground clear of trees, tarns and cover. It
+  // replaced the spawn clearing / fixture pads / pond keep-out literals in
+  // P2b; P5's site table generalises it. i32 in u32 words.
+  kHHarnessX0 = 22,
+  kHHarnessZ0 = 23,
+  kHHarnessX1 = 24,
+  kHHarnessZ1 = 25,
   kHeaderWords = 32,    // padded, like treeatlas::kFileHeaderWords
 };
 // Planes are packed FOUR CELLS PER WORD, little-endian: cell i of a plane at
@@ -178,6 +186,12 @@ struct WorldMapData {
   int oceanFadeCells = 0;
   int warpAmpVox = 0;
   int oceanBiome = 0;                     // id of "ocean" in the set, or 0
+  // The harness pad box, world voxels, inclusive. From map.json sites[] with
+  // kind "pad"; a map without one gets an empty box (x1 < x0).
+  int harnessX0 = 0, harnessZ0 = 0, harnessX1 = -1, harnessZ1 = -1;
+  bool InHarness(int x, int z) const {
+    return x >= harnessX0 && x <= harnessX1 && z >= harnessZ0 && z <= harnessZ1;
+  }
   std::vector<std::string> palette;       // map.json biomes[]: plane byte -> name
   std::vector<uint8_t> biome;             // RESOLVED to biome ids, width*height
   std::vector<uint8_t> landform;

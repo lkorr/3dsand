@@ -6697,6 +6697,34 @@ the one model modders already read (PLAN_biomes.md §2 has the survey).
   ring past ~9 km, forest forced around the origin for the fixtures) — a
   starting point for the World Map tab (P3), not a generator: the map is
   authored data and every edit to it moves the world hash.
+* **DELETED (world map P2b, 2026-09-04): the hand-coded origin set pieces.**
+  The wood deck, the combat arena (+ its ivy, ramp, screenshots), the oil
+  pond and the lava pool, the per-tile ruin scatter (+ pad, shell, moss,
+  ivy, the `ruin*`/`wallIvyDensity`/`mossFace` knobs and the terrain gate's
+  A8), `inSpawnClearing`, `onFixturePad` and `pondInfo`'s literal keep-out
+  box and discs are gone from `worldgen.wgsl`, `world.cpp` and `main.cpp`.
+  What survives is ONE authored site read from the map: the **harness pad**
+  (`map.json` `sites[]`, kind `pad`, a world-voxel box; `WM_H_HARNESS_*` in
+  the buffer header, `inHarness`/`crownMeetsHarness` in the shader,
+  `World::InHarness` on the CPU) that keeps the fixture columns clear of
+  trunks, crowns, tarns and cover, and the **harness tarn** at (420,420) —
+  the one authored pool left, because the `waterbody` gate's `Basin(1)`,
+  the water screenshots and `perfsuite` all read it
+  (`World::kAuthoredPools` is 1). `landColumn` is now `landColumnBare`
+  with no pad to blend in. Fixture columns no longer get a loose sand cap:
+  they stand on their biome's skin like everything else — DESIGN §6 already
+  said the `armor-react`-style fix is a levelled pad, which P5's site table
+  gives every site. `RESEARCH_worldgen` §8.2's "the first landmark should
+  introduce a proper table" is P5.
+* **LIVE (world map P3, 2026-09-04): the World map page.** Environment →
+  World map (`assets/editor/map.js`) paints the biome plane (palette = the
+  biome files), the landform plane (0..255, soft brush) and the harness pad
+  box, with pan/zoom, stroke undo and a cell/world readout, and saves both
+  files through `/api/worldmap` + `/api/worldmap/planes`
+  (`scripts/tuner_server.py`, bare names, format-checked, write-then-
+  rename). The page shows the planes as painted; the Worldgen tab's
+  heightmap/voxel views show what worldgen makes of them. Every save moves
+  the world hash; the engine reads the map at boot, so regenerate to see it.
 * **LIVE: the biome band strip** on the climate section — the three worldgen
   thresholds (`meadowThreshold` / `pineThreshold` / `desertThreshold`) as one
   draggable bar writing `tuning.json`.

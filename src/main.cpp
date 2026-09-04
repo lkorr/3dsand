@@ -924,13 +924,8 @@ int RunShots(GpuContext& ctx, World& world, Simulation& sim) {
   // near-horizontal: aimed steeply down, the frame fills with the window again.
   render({108, (float)(h108 + 300), 108}, 0.785f, -0.06f,
          "screenshot_cascade.bmp");
-  // Combat arena POI, centered at (180,110): from outside the -x/-z corner
-  // looking across the deck, high enough to see the far wall and both doorways.
-  {
-    int ah = World::TerrainHeight(180, 110, kDefaultSeed);
-    render({120, (float)(ah + 40), 50}, 0.9f, -0.32f, "screenshot_arena.bmp");
-    render({180, (float)(ah + 90), 40}, 1.5708f, -0.85f, "screenshot_arena_top.bmp");
-  }
+  // (The combat arena and its two screenshots went with the world map's P2b;
+  // authored sites return through the map's site table in P5.)
   // Water look shots: the authored lake is centered at (420,420), surface at
   // y=68 (worldgen poolY 44 + 24), floor at y=44, rim y=70.
   //   _water: from the near rim at a shallow grazing angle — where Fresnel

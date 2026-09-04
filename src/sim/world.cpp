@@ -813,6 +813,14 @@ uint32_t World::MapBiomeAt(int x, int z, uint32_t seed) {
   return m.BiomeCell(cx, cz);
 }
 
+// The harness pad box (worldgen.wgsl inHarness): the one authored site until
+// P5's site table. Outside the mirror on both sides; the mirrored pondInfo
+// calls it by the same name.
+static bool inHarness(int x, int z) {
+  return worldmap::CurrentWorldMap().InHarness(x, z);
+}
+bool World::InHarness(int x, int z) { return inHarness(x, z); }
+
 // The shader's vec2<i32>, so pondAt can be mirrored with the same shape.
 // Outside the mirrored region: WGSL gets this type from the language.
 struct IV2 {
@@ -1111,13 +1119,7 @@ static Pond pondInfo(int pt, int pz, uint32_t seed) {
   // the bowl, the berm, the shore fringe, the ruins, evaporation and the MPM
   // seam were each ruled out by measurement, and the residue is a liquid-CA
   // question. See docs/PLAN_terrain_overhaul.md.
-  if (cx >= -128 && cx <= 640 && cz >= -128 && cz <= 640) { return p; }
-  int q1x = cx - 420; int q1z = cz - 420;
-  int q2x = cx - 260; int q2z = cz - 300;
-  int q3x = cx - 220; int q3z = cz - 520;
-  if (q1x * q1x + q1z * q1z < 128 * 128) { return p; }
-  if (q2x * q2x + q2z * q2z < 128 * 128) { return p; }
-  if (q3x * q3x + q3z * q3z < 128 * 128) { return p; }
+  if (inHarness(cx, cz)) { return p; }
   Land c = landAt(cx, cz, seed);
   if (c.slope > WG().pondMaxSlope) { return p; }
   if (c.slope * r > (WG().pondDepth - WG().pondDepthRim) * 256) { return p; }
@@ -1208,41 +1210,6 @@ static bool sLabWorld = false;
 void World::SetLabWorld(bool on) { sLabWorld = on; }
 bool World::LabWorld() { return sLabWorld; }
 
-// worldgen.wgsl's RUIN SITES block, mirrored. These live OUTSIDE the tagged
-// region on purpose: check_invariants.py compares the landheight blocks by
-// INTEGER LITERAL, and a geometry constant that is named on both sides cannot
-// drift into that comparison as a bare number. HSCALE is 1 in worldgen.wgsl; if
-// it ever moves, kRuinTile moves with it and the `terrain` gate's per-voxel
-// pass C1 is what would catch a miss.
-static constexpr int kRuinTile = 256;    // 256 * HSCALE
-static constexpr int kRuinW = 56;        // 3.5 m footprint
-static constexpr int kRuinMargin = 32;   // inset that keeps it in its tile
-
-struct RuinTile {
-  bool present;
-  int rx;
-  int rz;
-};
-static RuinTile ruinTileAt(int x, int z, uint32_t seed) {
-  RuinTile r;
-  r.present = false; r.rx = 0; r.rz = 0;
-  const int tx = fdiv(x, kRuinTile);
-  const int tz = fdiv(z, kRuinTile);
-  if (tx == 0 && tz == 0) return r;
-  const uint32_t rh = hash3(seed ^ 0xA111CEu, (uint32_t)tx, (uint32_t)tz);
-  if (rh % (uint32_t)WG().ruinChance != 0u) return r;
-  const uint32_t jit =
-      (uint32_t)std::max(kRuinTile - kRuinW - kRuinMargin * 2, 1);
-  r.rx = tx * kRuinTile + kRuinMargin + (int)((rh >> 8u) % jit);
-  r.rz = tz * kRuinTile + kRuinMargin + (int)((rh >> 16u) % jit);
-  r.present = true;
-  return r;
-}
-static int ruinOutset(const RuinTile& t, int x, int z) {
-  const int dx = std::max(t.rx - x, x - (t.rx + kRuinW - 1));
-  const int dz = std::max(t.rz - z, z - (t.rz + kRuinW - 1));
-  return std::max(std::max(dx, dz), 0);
-}
 
 // MIRROR-BEGIN landheight
 // THE HEIGHT CONTRACT (DESIGN.md; landColumn in worldgen.wgsl):
@@ -1290,13 +1257,7 @@ static BareCol landColumnBare(int x, int z, uint32_t seed) {
   int pdx = x - 420; int pdz = z - 420;
   int pd2 = pdx * pdx + pdz * pdz;
   int pR = vlen(68); int pRim = vlen(80);
-  int odx = x - 260; int odz = z - 300;
-  int od2 = odx * odx + odz * odz;
-  int oR = vlen(32); int oRim = vlen(42);
-  int ldx = x - 220; int ldz = z - 520;
-  int ld2 = ldx * ldx + ldz * ldz;
-  int lR = vlen(24); int lRim = vlen(34);
-  const bool inRim = pd2 < pRim * pRim || od2 < oRim * oRim || ld2 < lRim * lRim;
+  const bool inRim = pd2 < pRim * pRim;
 
   IV2 pw = pondAt(x, z, seed);
   Shore near;
@@ -1319,16 +1280,6 @@ static BareCol landColumnBare(int x, int z, uint32_t seed) {
   } else if (pd2 < pRim * pRim) {
     h = std::max(h, poolY + vlen(26));
   }
-  if (od2 < oR * oR) {
-    h = poolY + vlen(6);
-  } else if (od2 < oRim * oRim) {
-    h = std::max(h, poolY + vlen(26));
-  }
-  if (ld2 < lR * lR) {
-    h = poolY + vlen(2);
-  } else if (ld2 < lRim * lRim) {
-    h = std::max(h, poolY + vlen(22));
-  }
   // Disc ponds: the bowl REPLACES the ground inside (see the block over the
   // same line in landColumn — as a min() the bed was raw hillside wherever the
   // terrain undercut the bowl, and genCellIn lays sand on it), berm outside.
@@ -1343,66 +1294,18 @@ static BareCol landColumnBare(int x, int z, uint32_t seed) {
   return b;
 }
 
-// The pad, mirroring ruinPad in worldgen.wgsl: four footprint-corner columns,
-// median for the height, spread for the refusal, and a refusal on any corner
-// standing in water. Returns false for a site that is not built.
-static bool ruinPad(const RuinTile& t, uint32_t seed, int* padY) {
-  const int far = kRuinW - 1;
-  const BareCol k0 = landColumnBare(t.rx, t.rz, seed);
-  const BareCol k1 = landColumnBare(t.rx + far, t.rz, seed);
-  const BareCol k2 = landColumnBare(t.rx, t.rz + far, seed);
-  const BareCol k3 = landColumnBare(t.rx + far, t.rz + far, seed);
-  if (k0.wet || k1.wet || k2.wet || k3.wet) return false;
-  int a = k0.h, b = k1.h, c = k2.h, d = k3.h;
-  if (a > b) std::swap(a, b);
-  if (c > d) std::swap(c, d);
-  if (a > c) std::swap(a, c);
-  if (b > d) std::swap(b, d);
-  if (b > c) std::swap(b, c);
-  if (d - a > WG().ruinMaxSlope) return false;
-  *padY = (b + c) >> 1;
-  return true;
-}
 
 int World::TerrainHeight(int x, int z, uint32_t seed) {
   // Lab slab: the same guard landColumn takes in worldgen.wgsl. Before the
   // tuning reads on purpose — the lab surface must not move when worldgen
   // knobs are tuned, or every scene's fixture heights drift.
   if (sLabWorld) return kLabSlabY;
-  const BareCol base = landColumnBare(x, z, seed);
-  const RuinTile t = ruinTileAt(x, z, seed);
-  if (!t.present) return base.h;
-  const int margin = std::max(WG().ruinPadMargin, 2);
-  const int d = ruinOutset(t, x, z);
-  if (d >= margin) return base.h;
-  int padY = 0;
-  if (!ruinPad(t, seed, &padY)) return base.h;
-  const int w = ((margin - d) * 256) / margin;
-  return base.h + (((padY - base.h) * w) >> 8);
+  // Since the world map's P2b there is no ruin pad to blend in; authored
+  // sites arrive with their own pad in P5.
+  return landColumnBare(x, z, seed).h;
 }
 // MIRROR-END landheight
 
-// ---- the terrain gate's only window onto a ruin pad ------------------------
-//
-// Pass C1 compares CPU and GPU per voxel, but only over x,z in [48,144], and a
-// ruin can NEVER be there: worldgen skips tile (0,0) outright. So the pad is
-// the one rule in landColumn that the per-voxel mirror proof structurally
-// cannot reach, and this is what the gate asserts the CPU half of instead.
-//
-// A free function with its prototype repeated in selftest_terrain.cpp rather
-// than a World:: member, deliberately: world.h is a hub header and a new
-// declaration there recompiles the whole engine to serve one assertion.
-bool RuinSiteForGate(int tileX, int tileZ, uint32_t seed, int* rx, int* rz,
-                     int* w, int* padY) {
-  const RuinTile t = ruinTileAt(tileX * kRuinTile + kRuinTile / 2,
-                                tileZ * kRuinTile + kRuinTile / 2, seed);
-  *rx = t.rx;
-  *rz = t.rz;
-  *w = kRuinW;
-  *padY = 0;
-  if (!t.present) return false;
-  return ruinPad(t, seed, padY);
-}
 
 // The map probe (world.h Column). Composed from the SAME functions the height
 // contract is built out of rather than re-deriving anything — `landAt` for the
@@ -1422,16 +1325,11 @@ World::Column World::TerrainColumn(int x, int z, uint32_t seed) {
   // will actually lay there.
   const int poolY = WG().spawnPlainY - vlen(15);
   const int pdx = x - 420, pdz = z - 420, pd2 = pdx * pdx + pdz * pdz;
-  const int odx = x - 260, odz = z - 300, od2 = odx * odx + odz * odz;
-  const int ldx = x - 220, ldz = z - 520, ld2 = ldx * ldx + ldz * ldz;
-  const int pR = vlen(68), oR = vlen(32), lR = vlen(24);
-  const int pRim = vlen(80), oRim = vlen(42), lRim = vlen(34);
-  const bool inRim = pd2 < pRim * pRim || od2 < oRim * oRim || ld2 < lRim * lRim;
+  const int pR = vlen(68), pRim = vlen(80);
+  const bool inRim = pd2 < pRim * pRim;
   const IV2 pw = pondAt(x, z, seed);
   c.sed = (inRim || pw.y >= 0) ? 0 : l.sed;
-  if (pd2 < pR * pR) c.water = poolY + vlen(24);          // the authored lake
-  else if (od2 < oR * oR) c.water = poolY + vlen(24);     // the oil pond
-  else if (ld2 < lR * lR) c.water = poolY + vlen(20);     // the lava pool
+  if (pd2 < pR * pR) c.water = poolY + vlen(24);          // the harness tarn
   else if (pw.y >= 0) c.water = pw.y;                     // a tarn
   return c;
 }
@@ -1443,12 +1341,8 @@ World::PondQuery World::PondNearColumn(int x, int z, uint32_t seed) {
   PondQuery q{false, false, 0, -1};
   if (sLabWorld) return q;
   const int pdx = x - 420, pdz = z - 420;
-  const int odx = x - 260, odz = z - 300;
-  const int ldx = x - 220, ldz = z - 520;
-  const int pRim = vlen(80), oRim = vlen(42), lRim = vlen(34);
-  const bool inRim = pdx * pdx + pdz * pdz < pRim * pRim ||
-                     odx * odx + odz * odz < oRim * oRim ||
-                     ldx * ldx + ldz * ldz < lRim * lRim;
+  const int pRim = vlen(80);
+  const bool inRim = pdx * pdx + pdz * pdz < pRim * pRim;
   const IV2 pw = pondAt(x, z, seed);
   if (pw.y >= 0) {
     q.inDisc = true;
@@ -1495,12 +1389,11 @@ void World::AuthoredPoolList(AuthoredPool out[kAuthoredPools]) {
   // waterY], which is genCellIn's `fluidTop >= 0 && y <= fluidTop` branch taken
   // after the `y <= h` terrain branch has already claimed the floor.
   const int poolY = WG().spawnPlainY - vlen(15);
+  // One authored pool since the world map's P2b: the harness tarn the
+  // waterbody gate reads as Basin(1). The oil pond and the lava pool went
+  // with the arena and the deck.
   out[0] = {420, 420, vlen(68), poolY,            poolY + vlen(24),
             poolY + vlen(26), "water"};
-  out[1] = {260, 300, vlen(32), poolY + vlen(6),  poolY + vlen(24),
-            poolY + vlen(26), "oil"};
-  out[2] = {220, 520, vlen(24), poolY + vlen(2),  poolY + vlen(20),
-            poolY + vlen(22), "lava"};
 }
 
 // ---- MPM fluid render bounds (RenderParams::fluidLo/fluidHi) ---------------
