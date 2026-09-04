@@ -221,5 +221,34 @@ console.log('\n-- swatch --');
   }
 }
 
+/* ---- 6. the world map ---------------------------------------------------------- */
+// assets/worldmap/default is what the engine boots on; the World map page
+// reads and writes the same two files. Pure checks: the planes parse, agree
+// with map.json, name only biomes that have files, and the harness pad is a
+// box. src/sim/worldmap.h is the authority for the format.
+console.log('\n-- world map --');
+{
+  const MAP = join(ROOT, 'assets', 'worldmap', 'default');
+  ok(existsSync(join(MAP, 'map.json')) && existsSync(join(MAP, 'map.svmap')), 'assets/worldmap/default has map.json + map.svmap');
+  if (existsSync(join(MAP, 'map.json')) && existsSync(join(MAP, 'map.svmap'))) {
+    const j = readJson(join(MAP, 'map.json'));
+    const raw = readFileSync(join(MAP, 'map.svmap'));
+    const dv = new DataView(raw.buffer, raw.byteOffset, raw.byteLength);
+    const [w, h] = j.size;
+    ok(dv.getUint32(0, true) === 0x504D5653 && dv.getUint32(4, true) === 1, 'map.svmap magic SVMP v1');
+    ok(dv.getUint32(8, true) === w && dv.getUint32(12, true) === h, `map.svmap is ${w}x${h} like map.json`);
+    ok(raw.length === 16 + w * h * 3, `map.svmap holds three ${w}x${h} planes`);
+    const biomeFiles = new Set(readdirSync(join(ROOT, 'assets', 'biomes')).filter(f => f.endsWith('.json') && f[0] !== '_').map(f => f.slice(0, -5)));
+    ok(j.biomes.every(n => biomeFiles.has(n)), 'every palette name has a biome file: ' + j.biomes.join(','));
+    let maxIdx = 0;
+    for (let i = 16; i < 16 + w * h; i++) maxIdx = Math.max(maxIdx, raw[i]);
+    ok(maxIdx < j.biomes.length, `biome plane indices < palette size (${maxIdx} < ${j.biomes.length})`);
+    ok(j.warpAmpVox >= 0 && j.warpAmpVox <= (1 << j.cellLog2) / 4, `warpAmpVox ${j.warpAmpVox} <= cell/4`);
+    const pad = (j.sites || []).find(s => s.kind === 'pad');
+    ok(!!pad && pad.min[0] <= pad.max[0] && pad.min[1] <= pad.max[1], 'a harness pad box exists and is a box');
+    ok(!!pad && pad.min[0] <= 60 && pad.max[0] >= 420 && pad.min[1] <= 60 && pad.max[1] >= 420, 'the pad covers the fixture columns and the (420,420) tarn');
+  }
+}
+
 console.log('\n' + (fails ? `${fails} of ${count} checks FAILED` : `all ${count} checks passed`));
 process.exit(fails ? 1 : 0);

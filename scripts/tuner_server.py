@@ -449,6 +449,11 @@ VOXCACHE_MAX = 2000
 
 WORLDEDIT_DIR = os.path.join(ASSETS, "worldedits")
 WORLDEDIT_EXT = ".svedit"
+# The authored world map (src/sim/worldmap.h): assets/worldmap/<name>/ holds
+# map.json (the diffable half) beside map.svmap (the three u8 planes). The
+# Environment tab's World map page reads and writes both through the
+# /api/worldmap routes below; the engine reads them at boot.
+WORLDMAP_DIR = os.path.join(ASSETS, "worldmap")
 
 # ---- the machine-global run mutex, in Python -------------------------------
 #
@@ -669,6 +674,17 @@ def _worldedit_path(name):
     if any(c not in ok for c in name):
         return None
     return os.path.join(WORLDEDIT_DIR, name + WORLDEDIT_EXT)
+
+
+def _worldmap_dir(name):
+    """assets/worldmap/<name>, or None unless `name` is a bare safe name.
+    Same discipline as _worldedit_path: a NAME, never a path."""
+    if not name or len(name) > 64:
+        return None
+    ok = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_")
+    if any(c not in ok for c in name):
+        return None
+    return os.path.join(WORLDMAP_DIR, name)
 
 
 def run_build():
@@ -1153,6 +1169,29 @@ class Handler(BaseHTTPRequestHandler):
             with open(path, "rb") as f:
                 return self._send(200, f.read(), "application/octet-stream")
 
+        if p == "/api/worldmaps":
+            maps = []
+            try:
+                for n in sorted(os.listdir(WORLDMAP_DIR)):
+                    d = os.path.join(WORLDMAP_DIR, n)
+                    if os.path.isfile(os.path.join(d, "map.json")):
+                        maps.append({"name": n, "mtime": int(os.path.getmtime(os.path.join(d, "map.json")))})
+            except OSError:
+                pass
+            return self._json(200, {"ok": True, "maps": maps})
+        if p == "/api/worldmap" or p == "/api/worldmap/planes":
+            name = (self._query().get("name") or [""])[0]
+            d = _worldmap_dir(name)
+            if not d:
+                return self._json(400, {"ok": False, "error": "bad map name"})
+            fn = "map.json" if p == "/api/worldmap" else "map.svmap"
+            path = os.path.join(d, fn)
+            if not os.path.isfile(path):
+                return self._json(404, {"ok": False, "error": "no such map"})
+            with open(path, "rb") as f:
+                return self._send(200, f.read(),
+                                  "application/json" if fn == "map.json" else "application/octet-stream")
+
         if p == "/perf.json":
             # The Performance tab reads build/perf.json, which lives OUTSIDE
             # assets/ (it is build output, not an authored asset, and it must
@@ -1459,6 +1498,35 @@ class Handler(BaseHTTPRequestHandler):
                 os.makedirs(WORLDEDIT_DIR, exist_ok=True)
                 # Write-then-rename: a half-written edit layer is a world the
                 # engine will refuse to load, and the tuner autosaves.
+                tmp = path + ".tmp"
+                with open(tmp, "wb") as f:
+                    f.write(blob)
+                os.replace(tmp, path)
+            except OSError as e:
+                return self._json(500, {"ok": False, "error": str(e)})
+            return self._json(200, {"ok": True, "bytes": len(blob)})
+
+        if p == "/api/worldmap" or p == "/api/worldmap/planes":
+            name = (self._query().get("name") or [""])[0]
+            d = _worldmap_dir(name)
+            if not d:
+                return self._json(400, {"ok": False, "error": "bad map name"})
+            blob = self._raw()
+            if p == "/api/worldmap":
+                try:
+                    j = json.loads(blob.decode("utf-8"))
+                except Exception as e:  # noqa: BLE001
+                    return self._json(400, {"ok": False, "error": "map.json does not parse: %s" % e})
+                if not isinstance(j.get("biomes"), list) or not isinstance(j.get("size"), list):
+                    return self._json(400, {"ok": False, "error": "map.json needs biomes[] and size[]"})
+                fn = "map.json"
+            else:
+                if len(blob) < 16 or blob[:4] != b"SVMP":
+                    return self._json(400, {"ok": False, "error": "not an SVMP plane file"})
+                fn = "map.svmap"
+            path = os.path.join(d, fn)
+            try:
+                os.makedirs(d, exist_ok=True)
                 tmp = path + ".tmp"
                 with open(tmp, "wb") as f:
                     f.write(blob)
