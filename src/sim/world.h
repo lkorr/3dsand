@@ -880,7 +880,35 @@ constexpr uint32_t kPageFaultKernelBase = 20;
 // file). pagetable.h's kMaxFreeProbesPerTick / kRetireTicks alias these, so
 // there is still exactly one definition of each number.
 constexpr uint32_t kPageFreeProbesPerTick = 128;
+// The PROBE-LESS release BURST budget (P4-H). A candidate whose occupancy
+// snapshot postdates every tick it could have been written on needs no 16 KiB
+// copy to prove it is stainless air - the snapshot already said so - so it is
+// released on the spot and never enters the probe queue. This number is what
+// ONE TICK may release that way; it is not the sustained rate.
+//
+// THE SUSTAINED RATE IS kPageRetireCeiling / kPageRetireTicks AND NOTHING
+// ELSE, whichever gate authorized the free, because every freed page parks in
+// the retire queue for kPageRetireTicks. 2,048 / 16 = 128 pages per tick, and
+// raising it costs 16 pages of POOL for each extra page per tick. Measured
+// P4-H, --frames 1200 --autofly-surface: the pre-P4-H path achieved 26.0
+// frees/tick against that same 128 limit, so the ceiling was never the binding
+// constraint - the PROBE was, and it still had 5x of headroom nobody could
+// reach. With the probe-less release the measured rate is 111.4/tick, 87% of
+// what this pool already allows. Lifting the ceiling to 8,192 (pool +6,144
+// pages = +96 MiB) buys 178.1/tick and about 2,000 pages of peak residency;
+// that arm is one env var away (SANDVOX_PT_RETIRECAP) and was NOT taken,
+// because the pool is a fixed VRAM reservation and the residency it buys is
+// headroom against an abort the derivation below already makes unreachable.
+constexpr uint32_t kPageFreeDirectPerTick = 384;
 constexpr uint32_t kPageRetireTicks = 16;
+// UNCHANGED by P4-H, and deliberately so: both free producers park into this
+// one queue and share this one ceiling, so the pool derivation below is
+// exactly what it was. What DID change is that the bound is now ENFORCED at
+// PageTable::ReleasePage (a free that would overflow the queue waits a tick)
+// instead of only being asserted in RetirePages. With two producers, "the
+// queue cannot exceed the product" is one more reading that has to stay true,
+// and a rate limiter that refuses is much cheaper to be wrong about than an
+// abort that fires. The assert stays as belt to these braces.
 constexpr uint32_t kPageRetireCeiling = kPageFreeProbesPerTick * kPageRetireTicks;
 
 // Physical pages in the pool under --residency paged. DERIVED FROM kWorldN,

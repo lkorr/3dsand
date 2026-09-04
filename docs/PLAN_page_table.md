@@ -1512,10 +1512,98 @@ already did at its own sentinel->page transition. Residency BEGINS there for
 every streaming refill, genList slot and worldgen batch, and the counter means
 "consecutive empty snapshots since residency began".
 
+#### Amendment 5 — the probe is a BACKSTOP; the free rule is a clock — [P4-H, 2026-09-03]
+
+The hysteresis condition above ends at the word probe: `occTotal == 0` is
+stale, so the live words decide. That is right whenever the snapshot might be
+out of date about the chunk — and there is a cheap, exact test for whether it
+might be:
+
+```
+reachTick_[s] = the last tick on which ANY writer could have stored into slot s
+```
+
+maintained in two places and only two, because the design already says there
+are only two. `Materialize` stamps every member of the materialization set —
+which §3.2 DEFINES as "every chunk this tick could write", so the stamp is that
+definition recorded rather than a new claim — and `EnsurePageForOverwrite`
+stamps the CPU seam (store-hit refill, the genList plane, `LoadWorld`, the
+voxregion tool), which is the one chokepoint every non-CA writer passes through.
+The bulk resets (`ResetIdentity`, `ResetAllEmpty`) stamp the whole array, since
+they hand out pages without going through either.
+
+**The rule: if `reachTick_[s] < snapTick`, nothing has written the slot since
+the occupancy snapshot was stamped, so that snapshot's `occTotal == 0` and its
+`packOccStain` bit are CURRENT, not stale.** Together they are `kAirDemoteMask`
+satisfied in every one of the 4,096 cells — the exact predicate the probe
+evaluates — so the page is released immediately: no 16 KiB copy, no one-tick
+deferral, no probe budget consumed. The comparison is strict so it holds
+whichever side of the CA `sim_occupancy` runs on.
+
+This is the same argument the shift's sky demote at T+K already makes
+(stream.cpp `ApplyGenVerdict`, "it can set neither bit 31 nor a stain bit"),
+generalized: that one can only make it for the plane it just generated, this
+one makes it for any slot, from a clock.
+
+Two consequences worth stating plainly:
+
+- **The eligible set is filtered at COLLECTION, not at harvest.** A candidate in
+  `cpuDirty`, in the flight shell, or in the materialization set was ALWAYS
+  going to be refused (or freed and immediately re-materialized); probing it
+  spends a copy to learn what the CPU already knew. Measured at the flight peak:
+  53-56% of the eligible set was `cpuDirty` and 12-22% was ring, i.e. ~75% of
+  the "backlog" was never freeable. The filter defers, it never disqualifies —
+  under the `>=` trigger each of those slots is eligible again next tick.
+- **The probe remains, and it is now a backstop.** It is the only authority for
+  a slot whose snapshot predates a possible write — a freshly refilled slot, the
+  common case — and the failure mode it guards is lost hashed state. It has
+  never once fired on words in any measured run (0 refusals over 100,000+
+  probes), which is an argument for keeping it cheap, not for deleting it.
+
+The rule is FALSIFIABLE and is falsified on demand: `SANDVOX_PT_VERIFYFREE=1`
+routes provable candidates through the probe anyway and counts disagreements
+(0 over 34,111 probes / 687 ticks of `--autofly-surface`).
+
 **The order these two had to land in is the interesting part.** The `>=` change
 ALONE reports 21,733,376 page faults — see the Risk 1 correction below. The leak
 was holding the world together by keeping the free probe idle, so the mirror
 hole it was hiding had to be closed first.
+
+#### The retire queue IS the reclaim rate limit — [P4-H, 2026-09-03]
+
+One sentence that was nowhere in this document and decides every future
+"can we free faster" question:
+
+> **The sustained free rate of the engine is `kPageRetireCeiling /
+> kPageRetireTicks`, whichever gate authorized the free.**
+
+2,048 / 16 = 128 pages per tick. Every freed page parks for `kPageRetireTicks`
+(§3.7's risk-5 quarantine), so a steady rate R fills the queue to 16R and the
+ceiling is a hard cap on R. Raising it costs **16 pages of pool per extra page
+per tick**, because §3.8 derives `kPoolPages = kNumChunks + kPageRetireCeiling`.
+
+The corollary that matters, and the reason P4-H did not raise anything: **the
+pre-P4-H free path achieved 26 pages/tick against that 128 limit.** The ceiling
+was not the binding constraint and had 5x of unreachable headroom; the probe
+was. After the clock rule above the measured rate is 111/tick — 87% of what the
+existing pool already permits — so the pool is UNCHANGED. The 8,192-ceiling arm
+(178/tick, +96 MiB of pool) exists behind `SANDVOX_PT_RETIRECAP` and was
+measured and declined.
+
+`kPageRetireTicks = 16` is the pipeline depth, not slack: what has to elapse is
+the GPU EXECUTING an in-flight copy, so the bound is
+`kMaxTicksPerFrame * (kFramesInFlight + 1)` — the same quantity P2-D derived for
+`kReadbackSlots`. (The old justification in `pagetable.h` counted eviction
+BATCHES and named a `kMaxPendingEvicts` of 4 that has since become 16, with a
+separate demote ring of 32. Both inputs were stale and neither was the right
+quantity.) Shortening it is the only way to buy rate without pool, and this is
+why that door is closed.
+
+The ceiling is ENFORCED at `PageTable::ReleasePage` — a free that would overflow
+the queue waits a tick — rather than only asserted in `RetirePages`. With two
+free producers, "the queue cannot exceed the product" is one more reading that
+has to stay true, and a limiter that refuses is cheaper to be wrong about than
+an abort that fires. The assert stays as belt to those braces.
 
 ### 3.7 The pool, the free list, fragmentation
 
