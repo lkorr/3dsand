@@ -434,8 +434,14 @@ void Stream::EvictSlots(const std::vector<uint32_t>& slots, bool filter) {
   // above skipped. Under --autofly-surface the skipped count is ~91% of the
   // real pages, which is the whole reason that test exists.
   if (PtDbg())
-    std::printf("[pt-time] evict issue: slots=%zu stored=%zu skipUnmod=%u\n",
-                slots.size(), toSave.size(), unmodReal);
+  {
+    size_t modCount = 0;
+    for (uint8_t m : modified_) modCount += (m != 0);
+    std::printf("[pt-time] evict issue: slots=%zu stored=%zu skipUnmod=%u "
+                "snapValid=%d snapTick=%u modified=%zu\n",
+                slots.size(), toSave.size(), unmodReal, snap.valid ? 1 : 0,
+                snap.valid ? snap.tick : 0u, modCount);
+  }
 
   for (size_t off = 0; off < toSave.size(); off += kEvictBatch) {
     size_t n = std::min(kEvictBatch, toSave.size() - off);

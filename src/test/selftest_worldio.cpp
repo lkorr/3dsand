@@ -8,8 +8,10 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -17,7 +19,9 @@
 #include "game/brush.h"
 #include "game/persist.h"
 #include "game/player.h"
+#include "gpu/rhi.h"
 #include "sim/chunkstore.h"
+#include "sim/pagetable.h"
 #include "sim/worldio.h"
 #include "test/selftest.h"
 #include "test/support.h"
@@ -398,6 +402,29 @@ Status GateStreaming(Ctx& c, std::string& detail) {
 bool streamOk = false;
 {
   std::vector<uint32_t> shash[2];
+  // P5-I instrument: per-tick record of run 0, so a paged-vs-dense diff names
+  // the FIRST divergent tick instead of only folding to a different word.
+  // Env-gated (`SANDVOX_SEQ_DUMP=<path>`); costs nothing when unset and
+  // changes no behaviour when set.
+  struct SeqRow { uint32_t tick; int chunkX; uint32_t shifts; int32_t originX;
+                  uint32_t hash; };
+  std::vector<SeqRow> seqRows;
+  const char* digEnv = std::getenv("SANDVOX_SEQ_DIGEST");
+  const int digestAt = digEnv ? std::atoi(digEnv) : -1;
+  const char* digestOut = std::getenv("SANDVOX_SEQ_DIGEST_OUT")
+                              ? std::getenv("SANDVOX_SEQ_DIGEST_OUT")
+                              : "seq_digest.txt";
+  // SANDVOX_SEQ_WORDS=<slot,slot,...>: with SEQ_DIGEST, dump those slots'
+  // 4,096 words verbatim beside the digest, so the two modes can be diffed
+  // cell by cell.
+  std::vector<uint32_t> wantWords;
+  if (const char* ws = std::getenv("SANDVOX_SEQ_WORDS")) {
+    const char* q = ws;
+    while (*q) {
+      wantWords.push_back((uint32_t)strtoul(q, (char**)&q, 10));
+      while (*q == ',' || *q == ' ') q++;
+    }
+  }
   for (int run = 0; run < 2; run++) {
     stream.OnRegen();
     world.SetWindowOrigin({0, 0, 0});
@@ -409,7 +436,127 @@ bool streamOk = false;
       stream.Update(pc, t);
       SubmitTick(ctx, world, sim, ++t, kDefaultSeed, {}, {}, {}, true, pc,
                  false, false);
-      shash[run].push_back(ReadHashSync(ctx, world));
+      const uint32_t hh = ReadHashSync(ctx, world);
+      shash[run].push_back(hh);
+      if (run == 0)
+        seqRows.push_back({t, pc.x, stream.ShiftCount(),
+                           world.WindowOrigin().x, hh});
+      // P5-I: per-chunk digest at ONE tick (PLAN_page_table.md 9.4's
+      // dump-and-diff), so a paged run and a dense run name the divergent
+      // SLOT instead of a different fold. Two digests per slot: `raw` over
+      // every word, and `hsh` over exactly what sim_occupancy's hash sees
+      // (non-air cells only, material+state+stain, stamp and excite bits
+      // excluded) - the pair separates "the words differ" from "the words
+      // agree and the hash of them does not".
+      if (run == 0 && digestAt >= 0 && i == digestAt) {
+        ctx.WaitIdle();
+        const uint32_t poolPages = world.PoolPages();
+        std::vector<uint32_t> slotOfPage(poolPages, 0xFFFFFFFFu);
+        for (uint32_t sl = 0; sl < kNumChunks; sl++) {
+          const uint32_t e = world.PageEntryOfSlot(sl);
+          if ((e & kPtSentinelBit) == 0u && e < poolPages) slotOfPage[e] = sl;
+        }
+        std::vector<uint32_t> digRaw(kNumChunks, 2166136261u);
+        std::vector<uint32_t> digHsh(kNumChunks, 2166136261u);
+        std::vector<uint32_t> occ(kNumChunks, 0u);
+        std::map<uint32_t, std::vector<uint32_t>> gotWords;
+        auto fold = [](uint32_t h, uint32_t v) { return (h ^ v) * 16777619u; };
+        auto digestWords = [&](uint32_t sl, const uint32_t* w) {
+          uint32_t r = 2166136261u, q = 2166136261u, n = 0;
+          for (uint32_t k = 0; k < kChunkVol; k++) {
+            r = fold(r, w[k]);
+            if ((w[k] & 0xFFFu) != 0u) {
+              n++;
+              const uint32_t v =
+                  (w[k] & 0xFFFFu) | ((w[k] & kStainBits) >> 8u);
+              q = fold(fold(q, k), v);
+            }
+          }
+          digRaw[sl] = r; digHsh[sl] = q; occ[sl] = n;
+          for (uint32_t wsl : wantWords)
+            if (wsl == sl) gotWords[sl].assign(w, w + kChunkVol);
+        };
+        // resident pages, read back in 2048-page batches (32 MiB each)
+        const uint32_t kBatch = 2048;
+        std::vector<uint32_t> buf((size_t)kBatch * kChunkVol);
+        for (uint32_t p0 = 0; p0 < poolPages; p0 += kBatch) {
+          const uint32_t n = std::min(kBatch, poolPages - p0);
+          bool any = false;
+          for (uint32_t k = 0; k < n; k++)
+            if (slotOfPage[p0 + k] != 0xFFFFFFFFu) any = true;
+          if (!any) continue;
+          if (!rhi::ReadbackBlocking(ctx.device, ctx.queue, world.voxels,
+                                     (uint64_t)p0 * kChunkVol * 4, buf.data(),
+                                     (size_t)n * kChunkVol * 4, "p5idig"))
+            continue;
+          for (uint32_t k = 0; k < n; k++)
+            if (slotOfPage[p0 + k] != 0xFFFFFFFFu)
+              digestWords(slotOfPage[p0 + k], buf.data() + (size_t)k * kChunkVol);
+        }
+        // sentinel slots: synthesize what they would materialize into
+        std::vector<uint32_t> syn(kChunkVol);
+        for (uint32_t sl = 0; sl < kNumChunks; sl++) {
+          const uint32_t e = world.PageEntryOfSlot(sl);
+          if ((e & kPtSentinelBit) == 0u) continue;
+          const IVec3 wc = world.SlotToWorldChunk(sl);
+          const int bx = wc.x * (int)kChunk, by = wc.y * (int)kChunk,
+                    bz = wc.z * (int)kChunk;
+          for (uint32_t k = 0; k < kChunkVol; k++)
+            syn[k] = SynthWordAt(e, bx + (int)(k % kChunk),
+                                 by + (int)((k / kChunk) % kChunk),
+                                 bz + (int)(k / (kChunk * kChunk)),
+                                 world.pages->WorldSeed());
+          digestWords(sl, syn.data());
+        }
+        std::vector<uint32_t> d0(kNumChunks, 0u), d1(kNumChunks, 0u),
+            occBuf(kNumChunks, 0u);
+        rhi::ReadbackBlocking(ctx.device, ctx.queue, world.dirty[0], 0,
+                              d0.data(), kNumChunks * 4, "p5id0");
+        rhi::ReadbackBlocking(ctx.device, ctx.queue, world.dirty[1], 0,
+                              d1.data(), kNumChunks * 4, "p5id1");
+        rhi::ReadbackBlocking(ctx.device, ctx.queue, world.occupancy, 0,
+                              occBuf.data(), kNumChunks * 4, "p5iocc");
+        char dpath[512];
+        std::snprintf(dpath, sizeof(dpath), "%s", digestOut);
+        if (FILE* df = std::fopen(dpath, "w")) {
+          std::fprintf(df, "# slot entry raw hashlike nonair wc.x wc.y wc.z d0 d1 occ tick %u hash %08x origin %d %d %d\n", t, hh, world.WindowOrigin().x, world.WindowOrigin().y, world.WindowOrigin().z);
+          for (uint32_t sl = 0; sl < kNumChunks; sl++) {
+            const IVec3 wc = world.SlotToWorldChunk(sl);
+            std::fprintf(df, "%u %08X %08X %08X %u %d %d %d %u %u %08X\n",
+                         sl, world.PageEntryOfSlot(sl), digRaw[sl], digHsh[sl],
+                         occ[sl], wc.x, wc.y, wc.z, d0[sl], d1[sl], occBuf[sl]);
+          }
+          std::fclose(df);
+          std::printf("  digest at i=%d tick %u -> %s\n", i, t, dpath);
+        }
+        if (!gotWords.empty()) {
+          char wpath[600];
+          std::snprintf(wpath, sizeof(wpath), "%s.words", digestOut);
+          if (FILE* wf = std::fopen(wpath, "w")) {
+            for (auto& kv : gotWords) {
+              const IVec3 wc = world.SlotToWorldChunk(kv.first);
+              std::fprintf(wf, "# slot %u entry %08X chunk %d %d %d\n",
+                           kv.first, world.PageEntryOfSlot(kv.first), wc.x,
+                           wc.y, wc.z);
+              for (uint32_t k = 0; k < kChunkVol; k++)
+                std::fprintf(wf, "%u %u %08X\n", kv.first, k, kv.second[k]);
+            }
+            std::fclose(wf);
+            std::printf("  words -> %s\n", wpath);
+          }
+        }
+      }
+    }
+  }
+  if (const char* dumpPath = std::getenv("SANDVOX_SEQ_DUMP")) {
+    if (FILE* f = std::fopen(dumpPath, "w")) {
+      std::fprintf(f, "# i tick chunkX shifts originX hash\n");
+      for (size_t i = 0; i < seqRows.size(); i++)
+        std::fprintf(f, "%zu %u %d %u %d %08x\n", i, seqRows[i].tick,
+                     seqRows[i].chunkX, seqRows[i].shifts, seqRows[i].originX,
+                     seqRows[i].hash);
+      std::fclose(f);
+      std::printf("  seq dump -> %s (%zu ticks)\n", dumpPath, seqRows.size());
     }
   }
   bool sdet = shash[0] == shash[1];

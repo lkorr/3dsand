@@ -1084,8 +1084,41 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
   const bool snapshotStale =
       paged &&
       (!world.Snap().valid || (tick > world.Snap().tick + maxGap));
+  // ---- P5-I: THE HARNESS ARM IS RESIDENCY-INDEPENDENT --------------------
+  //
+  // It used to be `paged && (HarnessSnapshotDrain() || snapshotStale)`, and
+  // the `paged &&` on the FIRST disjunct is what broke the paged/dense oracle
+  // for streaming (PLAN_page_table.md §6, RESEARCH_streaming_hitch.md P5-I).
+  //
+  // A headless harness never gets a snapshot on its own (see the block comment
+  // on SetHarnessSnapshotDrain in support.h), so with that conjunct the two
+  // residency modes ran with DIFFERENT `World::Snap()` availability:
+  // `Snap().valid` was true on every tick under paged and false on every tick
+  // under dense. `Stream::EvictSlots`'s re-derivability filter reads exactly
+  // that flag — `if (filter && snap.valid && modified_[s] == 0) continue;` —
+  // so dense stored all 1,024 slots of every leaving plane and paged stored
+  // ~30. On re-entry a stored chunk takes FillSlots' store-hit branch (which
+  // wakes it in the same tick) and an unstored one takes the gen branch (which
+  // under R1 wakes it kWakeLatency ticks later), so the two modes started the
+  // same plane's CA four ticks apart and the world hash sequences diverged at
+  // the first re-entering plane. Measured on the `streaming` gate: identical
+  // words, dirty flags and occupancy at tick 5040; at 5041 (the first shift
+  // that re-enters a plane the window had already left) 930 of the plane's
+  // slots are awake under dense and none under paged, and five grass cells
+  // creep in one mode and not the other.
+  //
+  // The oracle is only an oracle if both arms are driven the same way. The
+  // dense arm now takes the same drain the paged arm always did; the game path
+  // is untouched (this whole branch is behind HarnessSnapshotDrain(), which
+  // main.cpp's frame loop never sets), and the paged arm is bit-unchanged, so
+  // no pinned hash moves.
+  //
+  // This repairs the ORACLE. It does not remove the underlying hazard, which
+  // is that snapshot AVAILABILITY — a readback-timing property — decides what
+  // enters the chunk store and therefore when a re-entering plane starts
+  // acting. See the P5-I section of docs/RESEARCH_streaming_hitch.md.
   const bool needSnapshotForPaging =
-      paged && (HarnessSnapshotDrain() || snapshotStale);
+      HarnessSnapshotDrain() || snapshotStale;
   bool doCopy = false;
   if (wantReadback || needSnapshotForPaging) {
     // TIMED (P3-F): ~1.9 MiB of copies out per requested tick, recorded as raw
