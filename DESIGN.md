@@ -6562,14 +6562,75 @@ across 630 ticks of a creature burning to death.
 
 ### The stock set
 
-`scripts/gen_stock_armor.py` emits hood / robe / sash / boots. The geometry is
-DERIVED, not drawn: each shell is the stock human's own silhouette dilated
-outward by one authored micro with the body subtracted back off, importing
-`gen_human.py`'s limb table rather than restating it. So the garment fits by
-construction, is strictly outside the body, and re-proportioning the human
-re-proportions the coat. Colour is art-palette slots in `.col` layers, never
-materials — painting with materials is what makes mina's sash burn on a
-different schedule from her sleeve.
+`scripts/gen_stock_armor.py` emits hood / robe / sash / pants / boots in cloth
+and leather, and iron_helm / iron_cuirass / iron_greaves / iron_sabatons in
+iron. The geometry is DERIVED, not drawn: each shell is the stock human's own
+silhouette dilated outward by one authored micro with the body subtracted back
+off, importing `gen_human.py`'s limb table rather than restating it. So the
+garment fits by construction, is strictly outside the body, and
+re-proportioning the human re-proportions the coat. Colour is art-palette slots
+in `.col` layers, never materials — painting with materials is what makes
+mina's sash burn on a different schedule from her sleeve. The plate set is the
+same builders over a different material (a helm with an eye slit for the hood,
+a short straight fauld for the skirt), which is the point of deriving: a second
+suit is a second row of one table.
+
+**What a per-z dilation cannot produce, and what was done about it (2026-09-04).**
+The tube is a ring per row and cannot cap anything, so every lid is authored
+explicitly — and three of them were wrong in ways only a dressed figure shows:
+
+* *Shoulders.* The torso's lid was its own top silhouette grown by one, and the
+  upper arms end on the SAME row, so the top of each arm was bare skin. The yoke
+  is now the torso's top row and both upper arms' top rows grown by one, on the
+  TORSO shell rather than the arms': the arm's anchor is its top
+  (`joint_top`), so a raised arm rotates in place under the yoke instead of
+  carrying a lid off with it.
+* *Neck.* The neck is three rows of the HEAD limb and the hood started above
+  them, so a dressed figure showed a stub of bare neck standing in the yoke's
+  hole. The torso shell now rings those rows as a collar and the hood and helm
+  start where the skull starts, on a seam with it; `neck_rows` derives the
+  count from the head geometry (the run of identical bottom rows) so both sides
+  read one number.
+* *The sash.* It was dilated from EVERY robe cell at waist height, and the
+  forearms hang beside the hips at waist height, so it ringed the sleeves too:
+  a band six micro wide on each side with a loop around each arm that stayed on
+  the hips slot while the arm swung out of it — "the hands go inside the belt".
+  It now seeds from the torso and skirt shells only, one micro proud of the
+  robe, and is INTERRUPTED where an arm hangs flush against the hips, because
+  there is no cell between them for a belt to pass through. At rest the arm
+  covers the break. That is the honest geometry of a figure whose arms hang
+  flush, and a better trade than a belt inside the sleeve (two shells in one
+  cell) or around it.
+
+The sleeves SHARE cells with the torso shell — the armpit corners and, at the
+waist where the torso tapers, a whole column — and that is deliberate. Giving
+those cells to one side was tried and put a stripe of bare forearm on every
+walking figure: the sleeve's inner wall is what shows when the arm swings
+forward and the torso's side column is what shows when it swings back, so
+whichever side cedes is wrong in half the gait. Two shells of one material in
+one colour coinciding at rest is invisible; z-fighting is only a defect between
+things that look different, which is why the sash does subtract the robe.
+
+**Iron, not steel.** `steel` carries no `tag:dissolvable`, so acid cannot
+touch it at all — that is what a sword is made of and what `armor-react`'s
+steel arm measures (0 voxels lost). A suit that acid eats SLOWLY is a different
+fact, and here a fact is a material: `iron` (materials.json, id 121) is not
+flammable, not organic, and carries exactly one rule of its own,
+`acid + iron -> air` at 10 per-mille a tick against 250 for flesh and cloth.
+The rule is APPENDED after acid's other rules rather than placed
+specific-before-generic: nothing else matches iron, and a rule inserted earlier
+renumbers every acid rule after it — rule index is part of the reaction RNG
+stream — so the world hash does not move for a material worldgen never places.
+`armor-react` arm (e) holds an iron plate in the same acid bath as the steel
+one for 60 ticks and asserts it is eaten — at all, and with at least 40% left.
+"At all" rather than a floor, because how much acid actually stands against a
+torso plate is bath luck (2.3% in 25 ticks in one run, 0.6% in 60 in the next)
+while steel's figure in the same bath is exactly zero every time; the figure is
+printed beside the verdict for anyone retuning the rate. Nor is it conditioned
+on the bare creature losing anything: nothing but acid removes iron, so the
+count is its own evidence, whereas the steel arm needs the bare creature to
+know its bath was acid — and on some terrain the bare creature stands where the
+acid never pools.
 
 ### Mirror in, intent out
 

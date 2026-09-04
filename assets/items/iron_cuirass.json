@@ -1,8 +1,8 @@
 {
-  "comment": "The robe, a WORN piece: one shell per covered limb, each of which becomes a real rig slot on the wearer and therefore burns, dissolves, carves, severs and drops exactly as a limb does. Geometry is the stock human's own silhouette dilated outward by one authored micro, so it fits by construction. Regenerate with scripts/gen_stock_armor.py \u2014 `offset` and `fitBox` are MEASURED off gen_human.py's limb table, so editing them by hand puts the garment off the body.",
-  "name": "robe",
+  "comment": "The iron_cuirass, a WORN piece: one shell per covered limb, each of which becomes a real rig slot on the wearer and therefore burns, dissolves, carves, severs and drops exactly as a limb does. Geometry is the stock human's own silhouette dilated outward by one authored micro, so it fits by construction. Regenerate with scripts/gen_stock_armor.py \u2014 `offset` and `fitBox` are MEASURED off gen_human.py's limb table, so editing them by hand puts the garment off the body.",
+  "name": "iron_cuirass",
   "artVoxelsPerMetre": 80,
-  "hp": 96.0,
+  "hp": 240.0,
   "severable": true,
   "cover": [
     {
@@ -18,7 +18,7 @@
         22,
         8
       ],
-      "hp": 16.0
+      "hp": 40.0
     },
     {
       "part": "armL.R",
@@ -33,7 +33,7 @@
         22,
         8
       ],
-      "hp": 16.0
+      "hp": 40.0
     },
     {
       "part": "armU.L",
@@ -48,7 +48,7 @@
         22,
         8
       ],
-      "hp": 16.0
+      "hp": 40.0
     },
     {
       "part": "armU.R",
@@ -63,22 +63,22 @@
         22,
         8
       ],
-      "hp": 16.0
+      "hp": 40.0
     },
     {
       "part": "hips",
       "model": "hips",
       "offset": [
-        -4,
-        -12,
-        -6
+        -2,
+        -6,
+        -2
       ],
       "fitBox": [
         20,
         20,
         12
       ],
-      "hp": 16.0
+      "hp": 40.0
     },
     {
       "part": "torso",
@@ -93,7 +93,7 @@
         36,
         12
       ],
-      "hp": 16.0
+      "hp": 40.0
     }
   ]
 }

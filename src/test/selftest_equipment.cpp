@@ -548,6 +548,10 @@ Status GateArmorWear(Ctx& c, std::string& detail) {
 //   d. Rule 2: a dressed creature standing in a settled world costs zero. The
 //      probe must not have turned the burn pass's cheap early-out into a
 //      per-tick cost for every clothed mob in the world.
+//   e. Iron in acid: the plate set's material has a rule of its own (10
+//      per-mille) rather than steel's absence of one, so a plate of it is
+//      eaten -- some, and slowly. Zero means the rule never reached a body;
+//      fast means it is not armour.
 // ============================================================================
 
 Status GateArmorReact(Ctx& c, std::string& detail) {
@@ -887,9 +891,14 @@ Status GateArmorReact(Ctx& c, std::string& detail) {
   // Skin is now a one-voxel shell (1,619 of the 6,057-voxel torso), so a
   // fraction "of the skin" is four times as jumpy as the same leak measured
   // against the limb.
-  auto bath = [&](const ItemDef& piece, int slot, uint32_t soakMat, int soakUp,
-                  int ticks, int inset, uint32_t& lostDressed,
-                  uint32_t& lostBare, uint32_t& shellStart, uint32_t& shellEnd,
+  // `shellMat` is what the piece is MADE OF, and the shell census counts that
+  // material alone: a cloak's cloth becoming cloth_burning and a plate's iron
+  // becoming air are both "the cover is being consumed", and a count of the
+  // authored material is the one number that reads the same for both.
+  auto bath = [&](const ItemDef& piece, int slot, uint32_t shellMat,
+                  uint32_t soakMat, int soakUp, int ticks, int inset,
+                  uint32_t& lostDressed, uint32_t& lostBare,
+                  uint32_t& shellStart, uint32_t& shellEnd,
                   uint32_t& dressedSkin0, uint32_t& dressedVox0,
                   uint32_t& lostVoxDressed, int* firstDressed, int* firstBare) {
     debris.Reset();
@@ -950,7 +959,7 @@ Status GateArmorReact(Ctx& c, std::string& detail) {
     const int shell = shellSlotOf(ma, piece.name.c_str());
     for (int i = 0; i < 12; i++) { soakTick(a, 0, 0); soakTick(b, 0, 0); }
     mobs.ResetWornStats();
-    shellStart = limbMat(a, shell, mSteel) + limbMat(a, shell, mCloth);
+    shellStart = limbMat(a, shell, shellMat);
     const uint32_t a0 = limbMat(a, coveredIdx, mSkin);
     const uint32_t b0 = limbMat(b, controlIdx, mSkin);
     dressedSkin0 = a0;
@@ -995,7 +1004,7 @@ Status GateArmorReact(Ctx& c, std::string& detail) {
       liveSkinA = limbMat(a, coveredIdx, mSkin);
       liveSkinB = limbMat(b, controlIdx, mSkin);
       liveVoxA = mobs.LimbArtVoxelCount(a, coveredIdx);
-      liveShell = limbMat(a, shell, mSteel) + limbMat(a, shell, mCloth);
+      liveShell = limbMat(a, shell, shellMat);
       // "First loss" is the first tick past ONE PERCENT of the limb's skin,
       // not the first voxel. The first-voxel reading was an artefact of the
       // burn pass's fixed order: the dressed creature spawned second and was
@@ -1023,8 +1032,8 @@ Status GateArmorReact(Ctx& c, std::string& detail) {
   {
     uint32_t lostA = 0, lostB = 0, s0 = 0, s1 = 0, skin0 = 0, vox0 = 0,
              lostVox = 0;
-    if (!bath(cloak, cloakSlot, mFire, 18, 120, 200, lostA, lostB, s0, s1,
-              skin0, vox0, lostVox, &coveredFirstLoss, &controlFirstLoss)) {
+    if (!bath(cloak, cloakSlot, mCloth, mFire, 18, 120, 200, lostA, lostB, s0,
+              s1, skin0, vox0, lostVox, &coveredFirstLoss, &controlFirstLoss)) {
       detail = "could not dress the rig for the fire arm";
       return Status::Fail;
     }
@@ -1090,8 +1099,8 @@ Status GateArmorReact(Ctx& c, std::string& detail) {
   {
     uint32_t lostA = 0, lostB = 0, s0 = 0, s1 = 0, skin0 = 0, vox0 = 0,
              lostVox = 0;
-    if (!bath(plate, plateSlot, mAcid, 4, 120, 250, lostA, lostB, s0, s1,
-              skin0, vox0, lostVox, nullptr, nullptr)) {
+    if (!bath(plate, plateSlot, mSteel, mAcid, 4, 120, 250, lostA, lostB, s0,
+              s1, skin0, vox0, lostVox, nullptr, nullptr)) {
       detail = "could not plate the rig for the acid arm";
       return Status::Fail;
     }
@@ -1177,6 +1186,72 @@ Status GateArmorReact(Ctx& c, std::string& detail) {
     ok = ok && cOk;
   }
 
+  // ---- e. iron in acid: SLOW, not immune ----------------------------------
+  //
+  // The plate set (assets/items/iron_*.json) is `iron`, not steel, and the
+  // difference is one authored line: `acid + iron -> air` at 10 per-mille a
+  // tick (reactions.json), against 250 for the organics a body is made of.
+  // Steel's immunity above is an ABSENCE (no tag, no rule); this is a RATE,
+  // and a rate is a claim with two failure modes -- zero, which would mean
+  // the inbound pass never matched the rule (a material-id neighbour on a
+  // body voxel, the one shape no other rule on a body exercises), and fast,
+  // which would mean the plate is a slower way to die rather than an answer.
+  //
+  // Same bath, same creature, same limb, a shell of iron in place of steel,
+  // held for HALF the steel arm's time: at 10 per-mille each exposed micro
+  // voxel survives 60 ticks with p = 0.99^60 = 0.55, so the outer of the two
+  // skin layers should be roughly half gone and the inner one a fraction of
+  // that -- and a plate half eaten is one the acid has started to reach
+  // through, which a longer bath turns into a dead creature and a frozen
+  // census. The bounds are wide on purpose: the burn pass has a per-tick
+  // budget and shares it between two creatures, so the realised rate is
+  // below the authored one by an amount that is the budget's business, not
+  // this gate's. "Some, and most of it left" is the claim; the exact figure
+  // is printed beside it for anyone retuning the number.
+  {
+    const uint32_t mIron = matId("iron");
+    if (!mIron) {
+      std::printf("  iron pits in acid: SKIP (no 'iron' in materials.json)\n");
+    } else {
+      const ItemDef ironPlate = MakeEnclosingFixture(
+          "fixture_iron", ItemKind::ArmorShoulders, def, covered, mIron, 2,
+          fixtureMicro);
+      uint32_t lostA = 0, lostB = 0, s0 = 0, s1 = 0, skin0 = 0, vox0 = 0,
+               lostVox = 0;
+      if (ironPlate.cover.empty() ||
+          !bath(ironPlate, plateSlot, mIron, mAcid, 4, 60, 250, lostA, lostB,
+                s0, s1, skin0, vox0, lostVox, nullptr, nullptr)) {
+        detail = "could not plate the rig in iron for the acid arm";
+        return Status::Fail;
+      }
+      // NOT conditioned on the bare arm. The steel arm needs `lostB > 0` to
+      // know its bath was acid at all, because a plate that loses nothing in
+      // no acid looks exactly like one that loses nothing in acid. Iron has
+      // no such ambiguity: nothing but acid removes it, so `eaten` IS the
+      // evidence -- and the bare creature stands twelve voxels away on ground
+      // the acid may or may not pool on (see the steel arm's note), which
+      // has failed that arm before for reasons that had nothing to do with
+      // the plate. "Some" is ANY: how much acid actually stands against the
+      // plate is the same bath luck (2.3% in 25 ticks in one run, 0.6% in 60
+      // in the next), and steel's figure in the same bath is exactly 0 every
+      // time, so zero against nonzero is the whole distinction. The rate's
+      // authored value is the reaction's, not this gate's, to state.
+      const uint32_t eaten = s0 - s1;
+      const bool some = s0 > 0 && eaten > 0;
+      const bool most = s0 > 0 && s1 * 5u >= s0 * 2u;     // >= 40% left
+      const bool eOk = some && most;
+      std::printf(
+          "  iron pits in acid: %s (plate %u -> %u iron = %.1f%% eaten in %d "
+          "ticks at 10 per-mille; limb under it lost %u skin; bare lost %u "
+          "(not asserted); died dressed %s bare %s)\n",
+          eOk ? "PASS" : "FAIL", s0, s1,
+          s0 ? 100.0f * (float)eaten / (float)s0 : 0.0f,
+          diedDressed < 0 ? 60 : std::max(1, diedDressed), lostA, lostB,
+          diedDressed < 0 ? "no" : std::to_string(diedDressed).c_str(),
+          diedBare < 0 ? "no" : std::to_string(diedBare).c_str());
+      ok = ok && eOk;
+    }
+  }
 
   // LEAVE THE WORLD AS THIS GATE FOUND IT. It poured real acid and lit real
   // fires at absolute coordinates; every gate after it places fixtures by

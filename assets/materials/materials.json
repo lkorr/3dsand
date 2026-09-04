@@ -2811,6 +2811,34 @@
         "organic"
       ],
       "molten": "fire"
+    },
+    {
+      "//": "WROUGHT IRON: the plate set's material (scripts/gen_stock_armor.py iron_helm/cuirass/greaves/sabatons). A SECOND metal, not a tint of steel, because it carries a rule steel does not: reactions.json's `acid + iron -> air` at 10 per-mille a tick. Steel has no tag:dissolvable and no rule of its own, so acid cannot touch a sword at all and armor-react measures 0 voxels lost under a steel plate; a suit that acid eats SLOWLY (against 250 for flesh and cloth, 45 for the generic dissolvable tag) is a different fact, and here a fact is a material. Not flammable and not organic, so fire has nothing on it to catch and the burn pass never lists it -- a limb under it reads its neighbour as iron rather than as fire (mob.cpp WornAlong). Hardness under steel's 200: a blade beats it in sooner than it would a blade. Never placed by worldgen, so the nibble is free for the metal finishes below.",
+      "id": "iron",
+      "footstep": "stone",
+      "class": "solid",
+      "density": 7600,
+      "hardness": 160,
+      "rubble": "gravel",
+      "colors": [
+        "#8a8f96",
+        "#70757c",
+        "#a4a9b0"
+      ],
+      "tints": [
+        "#8a8f96",
+        "#5c6167",
+        "#3a4048",
+        "#c9a24a",
+        "#b06a3a",
+        "#c07a72",
+        "#b8bfc8",
+        "#6a7a86"
+      ],
+      "tags": [
+        "mineral"
+      ],
+      "molten": "lava"
     }
   ]
 }

@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""Generate the STOCK ARMOUR SET — assets/items/{hood,robe,sash,boots}.{vox,json}.
+"""Generate the STOCK WARDROBE — assets/items/{hood,robe,sash,pants,boots} in
+cloth and leather, and the PLATE SET {iron_helm,iron_cuirass,iron_greaves,
+iron_sabatons} in iron — each as <name>.vox + <name>.json.
 
 WHAT A WORN PIECE IS. Not a mesh draped over the body: a LIST OF SHELLS, one
 per body part it covers, each of which becomes a real rig slot on the wearer
@@ -57,6 +59,14 @@ import gen_human as H
 CLOTH_MAT, CLOTH_ID = 48, "cloth"
 TRIM_MAT, TRIM_ID = 49, "robe_trim"
 LEATHER_MAT, LEATHER_ID = 53, "leather"
+# THE PLATE SET IS IRON, NOT STEEL. `steel` carries no tag:dissolvable, so acid
+# cannot touch it at all -- that is what a sword is made of, and armor-react
+# measures it. Wrought iron is a second material precisely so that it can carry
+# a rule steel does not: `acid + iron -> air` at 10 per-mille per tick, against
+# 250 for organics and 45 for the generic dissolvable tag. A suit that acid eats
+# slowly is a different FACT from a blade acid cannot eat, and here a fact is a
+# material (see the note at the top of this file).
+IRON_MAT, IRON_ID = 121, "iron"
 
 # ---- art palette ------------------------------------------------------------
 # Allocated DOWNWARD from 255 like gen_human's, and FILE-LOCAL: palette indices
@@ -70,6 +80,8 @@ GOLD = 251
 GOLD_SHADE = 250
 HIDE = 249
 HIDE_SHADE = 248
+IRON = 247
+IRON_SHADE = 246
 
 ART_RGB = {
     BLACK:       0x2A2A2E,
@@ -80,6 +92,8 @@ ART_RGB = {
     GOLD_SHADE:  0x8C6E22,
     HIDE:        0x4A3220,
     HIDE_SHADE:  0x332215,
+    IRON:        0x8A8F96,
+    IRON_SHADE:  0x5C6167,
 }
 
 # Authored at gen_human's ART_SCALE and shipped at its SCALE, for the same
@@ -194,18 +208,40 @@ def cap(limb, occupied, z_from, z_to, grow=0):
 
 # ---- the pieces -------------------------------------------------------------
 
+def neck_rows(head):
+    """How many rows at the bottom of the head limb are NECK.
+
+    gen_human's head_vox draws the neck as a run of identical rows before the
+    skull's profile starts, and that run is what this measures: rows from the
+    bottom whose xy silhouette is the bottom row's. Derived rather than copied
+    from head_vox's `neck_top`, which is a local there -- the two head pieces
+    below start where the skull starts, and the chest pieces' collar stops
+    where the neck does, so the number has to be one both sides read from the
+    same geometry or a re-proportioned head opens a bare ring between them."""
+    z0 = min(c[2] for c in head)
+    base = {(x, y) for (x, y, z) in head if z == z0}
+    n = 0
+    while {(x, y) for (x, y, z) in head if z == z0 + n} == base:
+        n += 1
+    return n
+
+
 def build_hood(per_limb, occ):
     """A cowl over the skull with the face cut out of it.
 
     The face void is the one place a purely derived garment cannot be derived:
     a hood that hugs the head is a helmet with no eyeholes. Cut against the EYE
     ROW gen_human derives from tuning.json rather than a literal, so the window
-    stays on the face if the head is ever re-proportioned."""
+    stays on the face if the head is ever re-proportioned.
+
+    STARTS WHERE THE SKULL STARTS. The neck rows below belong to the chest
+    piece's collar (build_robe), so a hood over a robe meets the collar on a
+    seam rather than sharing its cells with it."""
     head = per_limb["head"]
     z0 = min(c[2] for c in head)
     z1 = max(c[2] for c in head)
     y0 = min(c[1] for c in head)
-    shell = tube(head, occ, 1, zlo=z0 + 2)      # bare neck below the cowl
+    shell = tube(head, occ, 1, zlo=z0 + neck_rows(head))
     shell |= cap(head, occ, z1, range(z1 + 1, z1 + 2))
     # The peak. Mina's hood has one and it is most of what makes a cowl read as
     # a cowl rather than as a swim cap; two tapering rows is the cheapest thing
@@ -225,28 +261,95 @@ def build_hood(per_limb, occ):
     return shell
 
 
-def build_robe(per_limb, occ):
+def build_helm(per_limb, occ):
+    """A close helm: the skull ringed and crowned, with one slit at the eyes.
+
+    Same construction as the hood (skull tube, flat crown, a one-row dome in
+    place of the cowl's peak) and the same derived eye row; what differs is
+    the void. A cowl leaves the whole face open; a helm leaves TWO ROWS across
+    the eyes, and only across them -- the slit stops short of the temples,
+    because a slit that wrapped the head would read as a headband."""
+    head = per_limb["head"]
+    z0 = min(c[2] for c in head)
+    z1 = max(c[2] for c in head)
+    y0 = min(c[1] for c in head)
+    shell = tube(head, occ, 1, zlo=z0 + neck_rows(head))
+    shell |= cap(head, occ, z1, range(z1 + 1, z1 + 2))
+    crown = {(x, y) for (x, y, z) in head if z == z1}
+    cx = sum(x for (x, _y) in crown) / max(1, len(crown))
+    cy = sum(y for (_x, y) in crown) / max(1, len(crown))
+    dome = {(x, y) for (x, y) in crown
+            if abs(x + 0.5 - cx) <= 2.0 and abs(y + 0.5 - cy) <= 2.0}
+    shell |= {(x, y, z1 + 2) for (x, y) in dome if (x, y, z1 + 2) not in occ}
+    eye_z = H.EYE_Z
+    shell = {(x, y, z) for (x, y, z) in shell
+             if not (y <= y0 and eye_z - 1 <= z <= eye_z
+                     and abs(x + 0.5 - cx) <= 3.5)}
+    return shell
+
+
+def build_robe(per_limb, occ, skirt_rows=6, flare_every=2):
     """Torso panel, four sleeve segments, and a skirt over the hips.
 
     Returned per PART, because each one becomes its own shell on its own rig
     slot: the sleeve has to swing with the forearm, and a single welded robe
-    model could only ever be nailed to one of them."""
+    model could only ever be nailed to one of them.
+
+    THE SHOULDERS AND THE NECK ARE THE TORSO SHELL'S. The per-z tube cannot
+    cap anything (ring_xy's note), so the top of the torso is a plate laid at
+    tz1+1 -- and the upper arms end on the SAME row, so a plate cut to the
+    torso's own silhouette left the top of each arm bare: a robe with the
+    shoulders cut out of it. The yoke is now the torso's top row AND both
+    upper arms' top rows, grown by one, so it runs unbroken across the
+    shoulders and hangs one micro past the outside of each sleeve. It rides
+    the torso rather than the arms because the arm's anchor is its top
+    (gen_human joint_top): the arm rotates in place under it, so a raised arm
+    turns inside the yoke instead of carrying a lid off with it.
+
+    The collar is the same idea one limb up. The neck is part of the HEAD
+    limb, three rows of it, and the hood starts above them (build_hood), so
+    without a collar a dressed figure showed a bare stub of neck standing in
+    the hole of the yoke. The collar rings the neck rows above the yoke; the
+    head turns inside it.
+
+    THE SLEEVES SHARE CELLS WITH THE BODY, ON PURPOSE. An arm hangs flush
+    against the torso, so a ring around the arm and a ring around the torso
+    meet in the armpit and, at the waist where the torso tapers, along a
+    whole column -- two shells over one cell. Giving those cells to one side
+    was tried (the sleeves subtracting the torso and skirt) and it put a
+    stripe of bare forearm on every walking figure: the sleeve's inner wall
+    is exactly what shows when the arm swings forward, and the torso's side
+    column is exactly what shows when it swings back, so whichever side
+    cedes is wrong in half the gait. Both keep the cell. Two shells of ONE
+    material in ONE colour coinciding at rest is invisible -- z-fighting is
+    only a defect between things that look different, which is why the sash
+    (build_sash) does subtract the robe."""
     out = {}
     torso = per_limb["torso"]
     tz1 = max(c[2] for c in torso)
-    out["torso"] = tube(torso, occ, 1) | cap(torso, occ, tz1, range(tz1 + 1, tz1 + 2), grow=1)
-    for arm in ("armU.L", "armU.R", "armL.L", "armL.R"):
-        out[arm] = tube(per_limb[arm], occ, 1)
+    body = tube(torso, occ, 1)
+    body |= cap(torso, occ, tz1, range(tz1 + 1, tz1 + 2), grow=1)
+    for arm in ("armU.L", "armU.R"):
+        cells = per_limb[arm]
+        az1 = max(c[2] for c in cells)
+        body |= cap(cells, occ, az1, range(az1 + 1, az1 + 2), grow=1)
+    head = per_limb["head"]
+    hz0 = min(c[2] for c in head)
+    neck = {c for c in head if c[2] < hz0 + neck_rows(head)}
+    body |= tube(neck, occ, 1, zlo=tz1 + 1)
+    out["torso"] = body
 
     # THE SKIRT. A tube around the hips, then flaring outward as it falls past
     # them — which is the only shell here that is not simply the body plus one,
-    # because a skirt that hugged the thighs would not be a skirt.
+    # because a skirt that hugged the thighs would not be a skirt. `skirt_rows`
+    # is how far it falls and `flare_every` how many rows per step outward; the
+    # plate fauld is the same builder with a short straight drop.
     hips = per_limb["hips"]
     hz0 = min(c[2] for c in hips)
     skirt = tube(hips, occ, 1)
     hem = {(x, y) for (x, y, z) in hips if z == hz0}
-    for i, z in enumerate(range(hz0 - 1, hz0 - 7, -1)):
-        r = 1 + i // 2
+    for i, z in enumerate(range(hz0 - 1, hz0 - 1 - skirt_rows, -1)):
+        r = 1 + i // flare_every
         row = set()
         for (x, y) in hem:
             for dx in range(-r, r + 1):
@@ -256,6 +359,9 @@ def build_robe(per_limb, occ):
                     row.add((x + dx, y + dy, z))
         skirt |= {c for c in row if c not in occ}
     out["hips"] = skirt
+
+    for arm in ("armU.L", "armU.R", "armL.L", "armL.R"):
+        out[arm] = tube(per_limb[arm], occ, 1)
     return out
 
 
@@ -293,7 +399,7 @@ def build_pants(per_limb, occ):
     return out
 
 
-def build_sash(per_limb, occ, taken):
+def build_sash(per_limb, occ, robe):
     """A band at the waist, sitting OUTSIDE the robe rather than inside it.
 
     DILATED FROM THE ROBE'S OWN SURFACE, not from the body at a bigger radius.
@@ -305,15 +411,33 @@ def build_sash(per_limb, occ, taken):
     UNION of the body and whatever the robe put there gives a complete band on
     the outermost surface, which is what a belt is.
 
-    `taken` is every cell the robe already claimed; subtracting it is what
-    keeps two shells over one limb from occupying the same lattice cells and
-    z-fighting — a thing that can happen here precisely because a piece is not
-    one welded model."""
+    FROM THE ROBE'S BODY, NOT FROM THE WHOLE ROBE. The first version of that
+    dilated the union of the hips and EVERY robe cell at waist height -- and
+    the forearms hang beside the hips at waist height, so the band ringed the
+    sleeves too: a belt six micro wide on each side, with a loop around each
+    arm that stayed on the hips slot while the arm swung out of it. That is
+    what "the hands go inside the belt" was. Only the torso and skirt shells
+    seed the band now; the sleeves, like the arms, are subtracted from it.
+
+    So the band is a ring one micro proud of the robe's body, and it is
+    INTERRUPTED where an arm hangs against the hips, because the arm is flush
+    with the body and there is no cell between them for a belt to pass
+    through. At rest the arm covers the break; a swung-out arm shows it. That
+    is the honest geometry of a figure whose arms hang flush, and it is a
+    better trade than either a belt inside the sleeve (two shells in one cell,
+    z-fighting) or a belt around it (the loop above).
+
+    `robe` is the robe's shells by part; every cell of every one of them is
+    subtracted from the band, so the two pieces never share a cell."""
     hips = per_limb["hips"]
     z1 = max(c[2] for c in hips)
     lo = z1 - 3
-    base = {c for c in (hips | taken) if lo <= c[2] <= z1}
-    band = ring_xy(base, occ | taken, 1)
+    robe_body = robe["torso"] | robe["hips"]
+    robe_all = set()
+    for s in robe.values():
+        robe_all |= s
+    base = {c for c in (hips | robe_body) if lo <= c[2] <= z1}
+    band = ring_xy(base, occ | robe_all, 1)
     return {c for c in band if lo <= c[2] <= z1}
 
 
@@ -453,7 +577,10 @@ def main():
     with open(os.path.join(root, "assets", "materials", "materials.json")) as mf:
         mats = json.load(mf)["materials"]
     for idx, want in ((CLOTH_MAT, CLOTH_ID), (TRIM_MAT, TRIM_ID),
-                      (LEATHER_MAT, LEATHER_ID)):
+                      (LEATHER_MAT, LEATHER_ID), (IRON_MAT, IRON_ID)):
+        assert idx <= len(mats), (
+            f"materials.json has {len(mats)} rows, none at index {idx} for "
+            f"{want!r} -- append the material before generating the set")
         assert mats[idx - 1]["id"] == want, (
             f"materials.json[{idx - 1}] is {mats[idx - 1]['id']!r}, not "
             f"{want!r} — the palette index this set is authored against has "
@@ -464,18 +591,30 @@ def main():
     per_limb, occ = body_cells()
 
     robe = build_robe(per_limb, occ)
-    taken = set()
-    for s in robe.values():
-        taken |= s
+    # THE PLATE SET is the cloth set's builders over a different material, with
+    # a helm for the hood and a short straight fauld for the skirt. That is the
+    # point of deriving the geometry: a second suit is a second row of this
+    # table, not a second set of drawings. What makes it ARMOUR is the
+    # material -- iron does not burn and acid pits it at 10 per-mille a tick
+    # (reactions.json) -- and the hp, which is what a blow costs it.
+    plate = build_robe(per_limb, occ, skirt_rows=3, flare_every=3)
     pieces = [
         ("hood", "armor_head", CLOTH_MAT, (BLACK, BLACK_SHADE), 14.0,
          {"head": build_hood(per_limb, occ)}),
         ("robe", "armor_chest", CLOTH_MAT, (BLACK, BLACK_SHADE), 16.0, robe),
         ("sash", "armor_belt", TRIM_MAT, (GOLD, GOLD_SHADE), 8.0,
-         {"hips": build_sash(per_limb, occ, taken)}),
+         {"hips": build_sash(per_limb, occ, robe)}),
         ("pants", "armor_legs", CLOTH_MAT, (GREY, GREY_SHADE), 12.0,
          build_pants(per_limb, occ)),
         ("boots", "armor_boots", LEATHER_MAT, (HIDE, HIDE_SHADE), 12.0,
+         build_boots(per_limb, occ)),
+        ("iron_helm", "armor_head", IRON_MAT, (IRON, IRON_SHADE), 48.0,
+         {"head": build_helm(per_limb, occ)}),
+        ("iron_cuirass", "armor_chest", IRON_MAT, (IRON, IRON_SHADE), 40.0,
+         plate),
+        ("iron_greaves", "armor_legs", IRON_MAT, (IRON, IRON_SHADE), 32.0,
+         build_pants(per_limb, occ)),
+        ("iron_sabatons", "armor_boots", IRON_MAT, (IRON, IRON_SHADE), 32.0,
          build_boots(per_limb, occ)),
     ]
 
@@ -589,6 +728,18 @@ ITEM_DESC = {
              "stands between your legs and the weather.",
     "boots": "Cut leather, slow to catch. Better against a spill than "
              "against a fire.",
+    "iron_helm": "A close iron helm with one slit across the eyes. Iron "
+                 "over the skull: fire finds nothing on it to catch, and "
+                 "acid pits it a grain at a time instead of eating it.",
+    "iron_cuirass": "An iron breastplate with a gorget at the throat, a "
+                    "yoke across both shoulders, plate down each arm to the "
+                    "wrist and a short fauld over the hips. It does not "
+                    "burn. Acid takes it slowly, and a blade takes it not "
+                    "at all until it has beaten it in.",
+    "iron_greaves": "Iron cuisses and greaves, thigh to ankle. Heavy, "
+                    "fireproof, and slow to dissolve.",
+    "iron_sabatons": "Iron shoes with an ankle cuff. What a spill of acid "
+                     "meets first, and what it gets through last.",
 }
 
 if __name__ == "__main__":
