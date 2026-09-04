@@ -2104,13 +2104,35 @@ neighbors, so this needs an explicit connectivity pass:
 - **Support-loss triggers (2026-08-19):** explosions and brush erases are not the
   only ways support disappears — the CA itself removes it (fire burns a stem,
   ember decays to ash, acid dissolves rock, sand flows out from under a slab).
-  `sim_step` sets a per-chunk *support-loss flag* (side-channel buffer, never fed
-  back into voxel state) whenever a supporting voxel (solid/powder) vacates or
-  transforms next to a solid; the flags ride the async readback, are cleared on
-  consume, and become island-check events with a per-chunk cooldown. A solid
-  component with powder directly below counts as *resting* (anchored) — without
-  that rule every slab on a sand pile would convert to a rigidbody the moment a
-  grain shifted.
+  `flagSupportLoss` sets a per-chunk *support-loss flag* (side-channel buffer,
+  never fed back into voxel state) whenever a supporting voxel (solid/powder)
+  vacates or transforms next to a solid; the flags ride the async readback, are
+  cleared on consume, and become island-check events with a per-chunk cooldown.
+  A solid component with powder directly below counts as *resting* (anchored) —
+  without that rule every slab on a sand pile would convert to a rigidbody the
+  moment a grain shifted.
+- **Every removal path raises the flag, not just the CA (2026-09-03):**
+  `flagSupportLoss` used to live in `sim_step.wgsl` and be called from it alone,
+  so only CA-driven removals were reported. `sim_mutate.wgsl` (brush erase,
+  laser melt, and the exact-cell ops that carry island removal, settle-back and
+  body-burn escapes) and `sim_explode.wgsl` raised nothing at all — the CPU
+  compensated with four hand-rolled `AddDestructionEvent` calls at the brush,
+  laser and grenade sites, and anything with no such call (a spell carving a
+  pillar) stranded whatever it had been holding up. Since solids never fall in
+  the CA, island detection is the ONLY thing that can drop them and this flag is
+  the only thing that summons island detection, so a missing call is a permanent
+  floater. The function now lives in `common.wgsl` behind a
+  `>>>SUPPORT_LOSS_BEGIN<<<` strip block — the same filter the page-table
+  accessors use, keyed on whether the shader declares `supportOut`, so it is one
+  authoritative copy rather than three (Lin's rule 3). The CPU calls stay: they
+  are immediate, while the GPU flag rides a readback with a 45-tick per-chunk
+  cooldown and a 2/tick drain, so the flag is a BACKSTOP and not a replacement.
+  It also no longer stops at the first solid neighbour it finds — the old early
+  `return` flagged one chunk, so a cell vacating between two solids in different
+  chunks left the second one's matter hanging. Gate: `support-flag` (an
+  all-stone post astride a chunk boundary, one exact-cell erase between two
+  solids; the CA cannot move stone, so the two flagged chunks it measures can
+  only have come from the mutation path).
 - **Bounded 6-connected flood fill** outward from voxels adjacent to the removal.
   Meeting fronts merge. If a fill exceeds ~32,000 voxels (~8 chunks), abort and
   declare "not an island" — an unbounded check could collapse an entire dungeon
@@ -2127,7 +2149,74 @@ neighbors, so this needs an explicit connectivity pass:
   a face, so felling one produced no body at all, while its dithered crown rim
   became sub-8 "islands" that were deleted. Unknown/unfetched cells and the
   residency edge read as solid, so the conservative direction is unchanged.
-- Known accepted flaw: large floating sections can survive. Ship it; revisit.
+- **Nothing is left hanging by the handoff (2026-09-03).** A `CLASS_SOLID`
+  voxel never moves in the CA (`sim_step` returns early for it), so island
+  detection is the *only* mechanism that makes solid matter fall and there is
+  no second line of defence behind it: every component this path declines to
+  convert stays exactly where it is, permanently. Four paths used to decline a
+  component by leaving it in the grid, and each was a permanent floater:
+  - the **grid-op budget** (`cellOps` over `kMaxCellOpsPerTick`) broke out of
+    the component loop, but `PreTick` had already popped the event — so the
+    comment said "next tick" while the code abandoned the whole tail of the
+    scan;
+  - the **particle ring** being full made the solid-rubble branch fall through
+    to a grid write, stamping a scrap back exactly where its support used to
+    be, which the comment immediately above it correctly said not to do;
+  - the **oversize-bbox guard** (`>120`, the `int8` `DebrisVoxel` limit leaking
+    into world logic) `continue`d, abandoning the component;
+  - a **full event queue** made `AddDestructionEvent` return false, and the
+    brush / grenade / laser call sites all ignored it.
+
+  All four now DEFER instead of abandoning. The region is re-queued with a
+  retry counter (`kMaxEventRetries`) and re-derived from the grid on a later
+  tick — simpler and more correct than a resume cursor, because converted
+  components have already left the grid, and safe because `lastCellWriteTick_`
+  holds the re-queued event until the chunk cache reflects this tick's writes.
+  A full event queue spills the region's chunks onto `pendingSupport_`, the
+  queue that never drops, so a lost scan became a late one and callers no
+  longer need to check the return.
+- **Nothing settles into thin air (2026-09-03).** `SettleBodies` gated on
+  asleep-long-enough, not-bleeding, near-axis-aligned, fits-window-and-budget —
+  and never asked whether anything was underneath. That matters because
+  **bodies are not in the grid**: a body resting on another body is resting on
+  nothing the world knows about, so it settled, and when the lower body later
+  despawned (`PostStep` retires the oldest past `kMaxBodies`, or it streams
+  out, or it burns away) the stamped voxels hung there — with no support-loss
+  flag ever raised, because no CA cell vacated. `SettleFootprintSupported` now
+  walks the snapped footprint and requires grid solid/powder directly beneath
+  some voxel that is not the body's own. Unknown chunks are requested and read
+  as *no* support — the opposite of the convention in `RunIslandDetection`,
+  and deliberately: there, assuming solid means "do not make a body"; here,
+  assuming empty means "do not stamp into the world". Both refuse to convert
+  matter on a guess. **A refused body is also WOKEN**, and that half is what
+  makes the refusal honest: refusing alone only decides the body must not
+  become grid, and leaving it asleep over a void is the same floater in a
+  different representation — one that also holds a slot in a list capped at
+  `kMaxBodies`, so unsettleable bodies accumulate and `PostStep`'s oldest-first
+  retirement starts evicting live ones (measured as `wound-accumulate` seeing
+  +0 debris bodies from a limb it had just severed). Waking closes the loop
+  instead: the body falls, lands, and the next scan finds it supported. A pile
+  therefore settles bottom-up. This also fixes the load path for free, since
+  `worldio` recreates bodies asleep by design and a world saved mid-fall used
+  to stamp itself into the sky.
+  `SANDVOX_NO_SETTLE_SUPPORT=1` restores the old behaviour for one run, so
+  "did the support test cause this" is an A/B rather than a revert.
+- **Attribution, not a bare count.** `DebrisSystem::FloaterProbe` counts every
+  decline at the site that makes it, split into leaks (`deferGaveUp`,
+  `solidRubbleInPlace`, `stuckEventDropped`), deferrals (the repairs working),
+  and why components were judged anchored (a *known* solid outside the scan box
+  versus an unfetched chunk assumed solid). Gate: `floaters` — a body asleep
+  over a void must not settle, the same body on the ground must still settle
+  (the control, without which the first assertion is satisfied by a build that
+  settles nothing), and a bounded sweep of the fixture box must find no
+  unsupported solid component.
+- Remaining accepted flaw: the scan is still **local and conservative**, so a
+  large floating section can survive when it extends past the 80-cell region
+  (`kMaxRegionCells`), exceeds `kMaxIslandVoxels`, or touches an unfetched
+  chunk that reads as solid. That is now *measured* rather than assumed — the
+  `anchoredBy*` counters say which of the three is holding a region up — and
+  the fix for it is a slow global "connected to the floor" sweep, not a wider
+  local scan.
 
 ### Rigidbodies
 - Detected islands are **removed from the grid** and become rigidbodies:

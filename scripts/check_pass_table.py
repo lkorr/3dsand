@@ -286,6 +286,13 @@ _SIM_GROUP0 = {
 # binding 24 has to name the same buffer in every module that declares it.
 _SLIM_GROUP0 = {"voxels", "dirtyIn", "dirtyOut", "materials", "T",
                 "pageTable", "pageFaults", "waterBodyState",
+                # supportOut is in the SLIM group as of the support-loss
+                # chokepoint: sim_explode's `apply` runs on simPL2_ and is the
+                # engine's largest remover of supporting matter, and the shared
+                # flagSupportLoss lives in common.wgsl -- so binding 15 has to
+                # name the same buffer here that it does in simBGL_. Same
+                # argument as waterBodyState and treeAtlas.
+                "supportOut",
                 # treeAtlas is in the SLIM group as well as the full one: `far`
                 # and `fardown` build on farPL_ and both reach the tree sampler
                 # (genCell -> treeAt, farSurfaceMat -> treeCanopyAt), so binding

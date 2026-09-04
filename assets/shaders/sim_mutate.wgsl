@@ -18,6 +18,12 @@ struct CellOp {
   word    : u32,
 };
 @group(0) @binding(14) var<storage, read> cellOps : array<CellOp>;
+// Per-chunk support-loss flags. The MutationQueue can take a supporting voxel
+// out of the grid (a brush erase, a laser melt, an island removal) and solids
+// never fall in the CA, so without this the matter above simply hangs there —
+// island detection is the only thing that can drop it, and this flag is what
+// summons island detection. Side channel: see common.wgsl's SUPPORT_LOSS block.
+@group(0) @binding(15) var<storage, read_write> supportOut : array<atomic<u32>>;
 @group(0) @binding(17) var<storage, read>       pageTable : array<u32>;
 @group(0) @binding(18) var<storage, read_write> pageFaults : array<atomic<u32>>;
 // This module's page-fault identity (common.wgsl's PT_K_* block). Every
@@ -67,16 +73,19 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
   // memory. See the note in sim_step:main.
   let slotIdx = cellIndexW(c);
   let idx = voxWordIndex(c);
-  if (op.mode == 0u && voxMat(voxWordAt(c)) != MAT_AIR) { return; }  // paint fills air only
+  // Read the OCCUPANT ONCE, ahead of every branch that wants it: the paint
+  // mode's air test, the melt mode's source material, and the support-loss
+  // flag at the bottom, which needs what was here BEFORE the store.
+  let prevMat = voxMat(voxWordAt(c));
+  if (op.mode == 0u && prevMat != MAT_AIR) { return; }  // paint fills air only
 
   var mat = op.material;
   if (op.mode == 2u) {
     // melt (laser, PLAN §C1): each cell converts to ITS OWN molten product
     // from the material table — stone becomes lava while the sand next to it
     // becomes molten glass. Air stays air, 255-hardness matter is immune.
-    let cur = voxMat(voxWordAt(c));
-    if (cur == MAT_AIR || materials[cur].hardness >= 255u) { return; }
-    mat = materials[cur].molten;
+    if (prevMat == MAT_AIR || materials[prevMat].hardness >= 255u) { return; }
+    mat = materials[prevMat].molten;
   }
 
   let rnd = hash3(T.seed ^ 0x5EEDu, T.tick, slotIdx);
@@ -88,6 +97,11 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
   }
   voxStore(idx, packVox(mat, state, STAMP_NEVER));
   markBoth(c);
+  // An erase (mode 1 writing air) or a melt (solid -> lava) can be the thing a
+  // ledge was standing on. Air-into-air and paint-into-air cost one compare:
+  // prevMat is MAT_AIR, whose class is neither SOLID nor POWDER, so the call
+  // returns on its first line.
+  flagSupportLoss(c, materials[prevMat].klass, mat);
 }
 
 // Exact-cell writes (island removal / rubble handoff, DESIGN.md §7). Same
@@ -114,8 +128,13 @@ fn cells(@builtin(global_invocation_id) gid : vec3<u32>) {
   // an EMPTY chunk should see air and proceed. That it can proceed is the
   // CPU's obligation — §3.3 materializes every op target unfiltered, precisely
   // so a brush into open sky is not silently a no-op.
+  // Hoisted out of the fill-air-only branch below, because the support flag
+  // needs it on EVERY path: an exact-cell op is how island removal and the
+  // rubble handoff take matter out of the grid, and those are precisely the
+  // writes that can leave something above them unsupported.
+  let prevMat = voxMat(voxWordInChunkAt(ci, lo));
   if ((word & CELLOP_IF_AIR) != 0u) {
-    if (voxMat(voxWordInChunkAt(ci, lo)) != MAT_AIR) { return; }
+    if (prevMat != MAT_AIR) { return; }
     word &= ~CELLOP_IF_AIR;
   }
   voxStore(wordIdx, word);
@@ -123,7 +142,15 @@ fn cells(@builtin(global_invocation_id) gid : vec3<u32>) {
   let sc = vec3<i32>(vec3<u32>(ci % NCHUNK, (ci / NCHUNK) % NCHUNK,
                                ci / (NCHUNK * NCHUNK)));
   let l = vec3<i32>(vec3<u32>(lo % CHUNK, (lo / CHUNK) % CHUNK, lo / (CHUNK * CHUNK)));
-  markBoth(slotToWorldChunk(sc, T.origin) * i32(CHUNK) + l);
+  let wc = slotToWorldChunk(sc, T.origin) * i32(CHUNK) + l;
+  markBoth(wc);
+  // Island removal and the rubble handoff write air here; settle-back writes a
+  // SOLID, which flagSupportLoss rejects on its second line (a solid still
+  // supports). Body-burn escapes are CELLOP_IF_AIR ops that only land on air,
+  // so prevMat is MAT_AIR and they never reach the neighbour walk — which is
+  // what keeps DESIGN.md §7's "burn ops must not starve island detection"
+  // property intact without a special case here.
+  flagSupportLoss(wc, materials[prevMat].klass, voxMat(word));
 }
 
 // ---- WIND PRIMITIVE FOOTPRINT WAKE (docs/RESEARCH_wind.md §4.3, §10) -------

@@ -21,6 +21,12 @@
 @group(0) @binding(2) var<storage, read_write> dirtyOut : array<atomic<u32>>;
 @group(0) @binding(3) var<storage, read>       materials : array<Material>;
 @group(0) @binding(4) var<uniform> T : TickParams;
+// Per-chunk support-loss flags (common.wgsl's SUPPORT_LOSS block). A blast is
+// the single largest remover of supporting matter in the engine, and it wrote
+// none of these until now: the CPU queued ONE island event around the blast
+// centre and anything the crater undercut beyond that event's margin stayed in
+// the air. Side channel, never read back into voxel state.
+@group(0) @binding(15) var<storage, read_write> supportOut : array<atomic<u32>>;
 @group(0) @binding(17) var<storage, read>       pageTable : array<u32>;
 @group(0) @binding(18) var<storage, read_write> pageFaults : array<atomic<u32>>;
 // This module's page-fault identity (common.wgsl's PT_K_* block). Every
@@ -130,6 +136,12 @@ fn apply(@builtin(workgroup_id) wg : vec3<u32>,
   let w = voxWordAt(c);
   voxStore(voxWordIndex(c), 0u);
   markBoth(c);
+  // This cell is now air. markBoth above only WAKES the chunk, which makes the
+  // CA re-run there — and the CA cannot drop a solid, so waking it is not the
+  // same as noticing the loss. The flag is what reaches island detection.
+  // Distinct from the shockwave's markBoth in `mark`: that one wakes chunks the
+  // blast passed THROUGH without destroying anything, where nothing vacated.
+  flagSupportLoss(c, materials[voxMat(w)].klass, MAT_AIR);
 
   let m = materials[voxMat(w)];
   var ejectPerMille = TUNE_EJECT_SOLID;

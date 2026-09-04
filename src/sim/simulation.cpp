@@ -202,6 +202,12 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         entry(2, T::Storage),          // dirtyOut
         entry(3, T::ReadOnlyStorage),  // materials
         entry(4, T::Uniform),          // TickParams
+        // Support-loss flags, SAME binding number as in simBGL_ for the reason
+        // the page-table note above gives: one WGSL identifier cannot carry two
+        // binding numbers across modules that share common.wgsl, and the
+        // SUPPORT_LOSS block is shared exactly that way. sim_explode runs on
+        // this layout and is the engine's biggest remover of supporting matter.
+        entry(15, T::Storage),         // supportOut
         entry(17, T::ReadOnlyStorage), // pageTable
         entry(18, T::Storage),         // pageFaults
         // COMPONENT 7 put the water-body ledger in the SLIM group: the
@@ -475,6 +481,7 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         b(2, world_->dirty[1 - page]),
         b(3, materialBuf_),
         b(4, world_->tickUBO),
+        b(15, world_->support),
         b(17, world_->pageTable),
         b(18, world_->pageFaults),
         b(24, world_->waterBodyState),

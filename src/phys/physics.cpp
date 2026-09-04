@@ -1093,6 +1093,13 @@ void Physics::DeactivateBody(uint64_t handle) {
   system_->GetBodyInterface().DeactivateBody(ToBodyID(handle));
 }
 
+void Physics::ActivateBody(uint64_t handle) {
+  if (!system_ || handle == 0) return;
+  JPH::BodyInterface& bi = system_->GetBodyInterface();
+  JPH::BodyID id = ToBodyID(handle);
+  if (bi.IsAdded(id)) bi.ActivateBody(id);
+}
+
 void Physics::ApplyRadialImpulse(Vec3 centerVoxel, float radiusVoxels,
                                  float impulse) {
   if (!system_) return;

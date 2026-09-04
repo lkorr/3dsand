@@ -4269,3 +4269,75 @@ fn voxStore(idx : u32, w : u32) {
   voxels[idx] = w;
 }
 // >>>PAGE_TABLE_WRITE_END<<<
+
+// ---- SIX FACE DIRECTIONS ---------------------------------------------------
+// Promoted out of sim_step.wgsl when flagSupportLoss below became shared: two
+// copies of a direction table is exactly the divergence the support block
+// exists to end, and the order is load-bearing (index 1 is UP, which is what
+// the POWDER branch of flagSupportLoss selects on). No bindings, so this sits
+// outside the stripped block and costs the shaders that never call it nothing.
+fn faceDir(i : u32) -> vec3<i32> {
+  switch (i % 6u) {
+    case 0u: { return vec3<i32>(0, -1, 0); }
+    case 1u: { return vec3<i32>(0,  1, 0); }
+    case 2u: { return vec3<i32>( 1, 0, 0); }
+    case 3u: { return vec3<i32>(-1, 0, 0); }
+    case 4u: { return vec3<i32>(0, 0,  1); }
+    default: { return vec3<i32>(0, 0, -1); }
+  }
+}
+
+// >>>SUPPORT_LOSS_BEGIN<<<
+// ---- SUPPORT-LOSS FLAGGING (DESIGN.md §7) ----------------------------------
+//
+// THE ONE PLACE A VANISHING SUPPORT IS REPORTED. Every path that can take a
+// supporting voxel out of the grid calls this: the CA (sim_step — powder
+// sliding out, a reaction transmuting rock, a stain eating its neighbour), the
+// MutationQueue (sim_mutate — brush erase, laser melt, and the exact-cell ops
+// that carry island removal, settle-back and body-burn escapes), and the blast
+// kernel (sim_explode). It lived in sim_step.wgsl until the mutation and blast
+// paths were wired up, which meant a spell that carved a pillar out from under
+// a ledge stranded the ledge in the air with nothing to notice: solids never
+// fall in the CA, so island detection is the ONLY thing that can drop them,
+// and this flag is the only thing that summons island detection.
+//
+// Stripped out for shaders that do not declare `supportOut`, exactly as the
+// page block is stripped for shaders that do not address voxels — WGSL
+// resolves module-scope references whether or not a function is reachable, so
+// leaving it in would be a compile error everywhere else. This is a filter,
+// not a second copy (gpu/resources.cpp, kSupportBlockBegin).
+//
+// SIDE CHANNEL, and that is what keeps it outside rule 1. The flags are read
+// back by the CPU to queue island checks (debris.cpp QueueSupportEvents), are
+// never fed back into voxel state, and every writer stores the same value 1 —
+// so no ordering between invocations can change the result, and nothing here
+// touches the world hash. Do not make a support flag influence a voxel write.
+//
+// oldKlass==POWDER checks UP ONLY: solids REST on powder, but a solid merely
+// beside a shifting sand pile is not supported by it, and checking laterals
+// would flag every wall next to settling sand (rule 2 — that is an unbounded
+// rescan of every dune in the world).
+fn flagSupportLoss(c : vec3<i32>, oldKlass : u32, newMat : u32) {
+  if (oldKlass != CLASS_SOLID && oldKlass != CLASS_POWDER) { return; }
+  let nm = newMat & 0xFFFu;  // 12-bit id; sentinel values land on a zeroed entry
+  if (nm != MAT_AIR) {
+    let nk = materials[nm].klass;
+    if (nk == CLASS_SOLID || nk == CLASS_POWDER) { return; }  // still supports
+  }
+  // ALL SIX NEIGHBOURS, not the first one found. The early `return` this
+  // replaces flagged one chunk and stopped, so a cell vacating between two
+  // solids that live in DIFFERENT chunks left the second chunk unflagged and
+  // whatever it was holding up floating. Costs nothing extra in the common
+  // case: the loop already ran to six whenever no solid was adjacent, which is
+  // the overwhelming majority of calls, and the stores are idempotent.
+  for (var i = 0u; i < 6u; i++) {
+    if (oldKlass == CLASS_POWDER && i != 1u) { continue; }  // up only
+    let n = c + faceDir(i);
+    if (!inWindow(n, ptOrigin())) { continue; }
+    let nmat = voxMat(voxWordAt((n)));
+    if (nmat != MAT_AIR && materials[nmat].klass == CLASS_SOLID) {
+      atomicStore(&supportOut[chunkIndexW(n)], 1u);
+    }
+  }
+}
+// >>>SUPPORT_LOSS_END<<<

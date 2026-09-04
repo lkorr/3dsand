@@ -2885,6 +2885,181 @@ Status GateWeakFlame(Ctx& c, std::string& detail) {
   return fails.empty() ? Status::Pass : Status::Fail;
 }
 
+// ---------------------------------------------------------------- support-flag
+// EVERY REMOVAL PATH RAISES THE SUPPORT FLAG, not just the CA.
+//
+// Solids never move in the CA (sim_step returns early for CLASS_SOLID), so the
+// only thing that can ever drop unsupported rock is island detection — and the
+// only thing that summons island detection is a per-chunk support-loss flag.
+// Until the chokepoint landed, `flagSupportLoss` was called from sim_step
+// alone: a spell or an exact-cell op that carved a pillar out from under a
+// ledge left the ledge hanging with nothing in the engine aware of it.
+//
+// WHY THE FIXTURE IS ALL STONE. A powder fixture would prove nothing: the CA
+// itself flags support loss when a grain slides, so a flag would appear whether
+// or not the mutation path raised one. With stone above and stone below and a
+// single cell erased between them, the CA has nothing it can do — sim_step
+// visits the chunk and returns. Any flag observed here therefore came from
+// sim_mutate, which is exactly the claim.
+//
+// WHY THE ERASED CELL SITS ON A CHUNK BOUNDARY. The second half of the fix:
+// flagSupportLoss used to `return` after the FIRST solid neighbour it found,
+// so a cell vacating between two solids in DIFFERENT chunks flagged one and
+// left the other's matter floating. The erased cell here has a solid directly
+// ABOVE it (same chunk) and a solid to its -X (the neighbouring chunk), and
+// faceDir's order visits +Y before -X — so the old code flagged the home chunk
+// and stopped. Asserting BOTH chunks is what makes this gate see the early
+// return rather than just the missing call.
+Status GateSupportFlag(Ctx& c, std::string& detail) {
+  GpuContext& ctx = c.ctx;
+  World& world = c.world;
+  Simulation& sim = c.sim;
+  const std::vector<MaterialDef>& mats = c.mats;
+  int si = -1;
+  for (size_t i = 0; i < mats.size(); i++)
+    if (mats[i].name == "stone") si = (int)i;
+  if (si < 0) {
+    detail = "FAIL: no stone material";
+    return Status::Fail;
+  }
+
+  SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+  ctx.WaitIdle();
+
+  // The gap cell sits at a chunk boundary on X so its -X neighbour is in the
+  // chunk next door. Anchored over the terrain, never a literal Y (support.h):
+  // at a fixed height this fixture was inside bedrock once the datum moved.
+  const int gx = 96;                       // 96 = 6*16, a chunk's low X face
+  const int gz = 96;
+  const int gy = FixtureYOver(gx - 4, gz - 4, gx + 4, gz + 4, kDefaultSeed, 12);
+
+  std::vector<CellOp> scene;
+  auto put = [&](int x, int y, int z, int m) {
+    scene.push_back({World::SlotCellIndex({x, y, z}),
+                     (uint32_t)(m & 0xFFF)});
+  };
+  // A stone post with a cap, standing clear of the ground, plus one stone
+  // voxel hanging off the gap cell's -X face in the neighbouring chunk.
+  for (int y = 0; y < 6; y++) put(gx, gy + y, gz, si);   // the post
+  put(gx - 1, gy + 2, gz, si);                            // the -X arm
+  const int kGapY = gy + 2;                               // the cell to erase
+
+  uint32_t t = 1;
+  SubmitTick(ctx, world, sim, t, kDefaultSeed, {}, {}, scene, false,
+             {gx >> 4, kGapY >> 4, gz >> 4}, false, false);
+  ctx.WaitIdle();
+
+  // Settle, then READ BACK to consume and clear every flag worldgen and the
+  // fixture placement itself raised. Support flags accumulate until a readback
+  // takes them (world.cpp: copy-then-fill), so without this the count below
+  // would include someone else's tick.
+  for (int i = 0; i < 8; i++)
+    SubmitTick(ctx, world, sim, ++t, kDefaultSeed, {}, {}, {}, false,
+               {gx >> 4, kGapY >> 4, gz >> 4}, i == 7, false);
+  ctx.WaitIdle();
+
+  // HOW THE FLAGS ARE COLLECTED, and it is the whole difficulty of testing
+  // this buffer.
+  //
+  // Support flags are ONE-SHOT: world.cpp's readback copies them out and
+  // immediately fills the buffer with zeroes. And under paged residency — the
+  // default — the harness forces a snapshot readback every <= 4 ticks whether
+  // or not the caller asked for one (support.cpp's needSnapshotForPaging: the
+  // page mirror starves without it). So a gate CANNOT read world.support
+  // directly and expect to find anything: the drain cadence is not the gate's
+  // to control, and an earlier draft of this one measured 0 flagged chunks
+  // world-wide with a provably intact fixture for exactly that reason.
+  //
+  // The flags are therefore collected the way their real consumer collects
+  // them (DebrisSystem::QueueSupportEvents): union of snap.supportFlags over a
+  // window of ticks, so whichever snapshot happens to drain them is caught.
+  std::vector<uint8_t> seen(kNumChunks, 0);
+  auto collect = [&](int ticks) {
+    for (int i = 0; i < ticks; i++) {
+      SubmitTick(ctx, world, sim, ++t, kDefaultSeed, {}, {}, {}, false,
+                 {gx >> 4, kGapY >> 4, gz >> 4}, true, false);
+      ctx.WaitIdle();
+      const WorldSnapshot& sn = world.Snap();
+      if (!sn.valid || sn.supportFlags.size() != kNumChunks) continue;
+      for (uint32_t ci = 0; ci < kNumChunks; ci++)
+        if (sn.supportFlags[ci]) seen[ci] = 1;
+    }
+  };
+  // Baseline window: drain and record everything worldgen and the fixture
+  // placement raised, so the assertion below can require that the erase
+  // flagged something NEW rather than merely that a flag exists somewhere.
+  collect(12);
+  std::vector<uint8_t> before = seen;
+
+  const uint32_t homeChunk = World::SlotChunkIndex({gx >> 4, kGapY >> 4, gz >> 4});
+  const uint32_t westChunk =
+      World::SlotChunkIndex({(gx - 1) >> 4, kGapY >> 4, gz >> 4});
+  if (homeChunk == westChunk) {
+    detail = "FAIL: fixture is not astride a chunk boundary (gx must be 16-aligned)";
+    return Status::Fail;
+  }
+
+  // THE MUTATION UNDER TEST: one exact-cell op erasing the gap. This is the
+  // path island removal, settle-back and the spell VM all write through.
+  std::fill(seen.begin(), seen.end(), (uint8_t)0);
+  std::vector<CellOp> erase{{World::SlotCellIndex({gx, kGapY, gz}), 0u}};
+  SubmitTick(ctx, world, sim, ++t, kDefaultSeed, {}, {}, erase, false,
+             {gx >> 4, kGapY >> 4, gz >> 4}, true, false);
+  ctx.WaitIdle();
+  {
+    const WorldSnapshot& sn = world.Snap();
+    if (sn.valid && sn.supportFlags.size() == kNumChunks)
+      for (uint32_t ci = 0; ci < kNumChunks; ci++)
+        if (sn.supportFlags[ci]) seen[ci] = 1;
+  }
+  collect(12);
+  std::vector<uint8_t> after = seen;
+
+  const bool homeFlagged = after[homeChunk] != 0;
+  const bool westFlagged = after[westChunk] != 0;
+  // ATTRIBUTION, not a bare pass/fail. A zero here has several very different
+  // causes — the fixture never landed, the erase never landed, or the flag was
+  // genuinely not raised — and "home=0" alone cannot tell them apart. So the
+  // verdict line carries the fixture census and both windows' flag counts.
+  uint32_t nBefore = 0, nAfter = 0;
+  for (uint32_t i = 0; i < kNumChunks; i++) {
+    nBefore += before[i] ? 1u : 0u;
+    nAfter += after[i] ? 1u : 0u;
+  }
+  std::vector<uint32_t> vox(kNumChunks * (size_t)kChunkVol);
+  ReadVoxelsSync(ctx, world, 0, kNumChunks, vox.data(), "supportVox");
+  auto matAt = [&](int x, int y, int z) {
+    return vox[World::SlotCellIndex({x, y, z})] & 0xFFFu;
+  };
+  const bool capThere = (int)matAt(gx, gy + 5, gz) == si;
+  const bool armThere = (int)matAt(gx - 1, kGapY, gz) == si;
+  const bool gapOpen = matAt(gx, kGapY, gz) == 0u;
+
+  std::string fails;
+  if (!capThere) fails += " the post never landed (fixture missing);";
+  if (!armThere) fails += " the -X arm never landed (fixture missing);";
+  if (!gapOpen) fails += " the erase op never landed (gap still solid);";
+  if (capThere && armThere && gapOpen) {
+    if (!homeFlagged)
+      fails += " the post's own chunk was not flagged (the mutation path raised nothing);";
+    if (!westFlagged)
+      fails += " the -X arm's chunk was not flagged (flagSupportLoss stopped at the first neighbour);";
+  }
+
+  char buf[512];
+  std::snprintf(buf, sizeof(buf),
+                "%s: one exact-cell erase between two solids flagged home=%d "
+                "west=%d (chunks %u/%u); fixture cap=%d arm=%d gap=%d; "
+                "flagged chunks baseline %u -> after-erase %u%s%s",
+                fails.empty() ? "PASS" : "FAIL", homeFlagged ? 1 : 0,
+                westFlagged ? 1 : 0, homeChunk, westChunk, capThere ? 1 : 0,
+                armThere ? 1 : 0, gapOpen ? 1 : 0, nBefore, nAfter,
+                fails.empty() ? "" : " |", fails.c_str());
+  detail = buf;
+  std::printf("support-flag: %s\n", buf);
+  return fails.empty() ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& SimGates() {
@@ -2906,6 +3081,7 @@ const std::vector<Gate>& SimGates() {
       {"page-roundtrip", "sim", {}, false, GatePageRoundtrip},
       {"fire-down", "sim", {}, false, GateFireDown},
       {"daylight-boundary", "sim", {}, false, GateDaylightBoundary},
+      {"support-flag", "sim", {}, false, GateSupportFlag},
       // No draw of its own, but its verdict reads bestFrameMs, which only the
       // screenshots gate sets — so it needs the render path transitively.
       {"perf", "sim", {"screenshots"}, true, GatePerf, /*needsRender=*/true},

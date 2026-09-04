@@ -479,6 +479,7 @@ add_library(sandvox_core OBJECT
   src/test/selftest_render.cpp
   src/test/selftest_player.cpp
   src/test/selftest_phys.cpp
+  src/test/selftest_floaters.cpp
   src/test/selftest_mob.cpp
   src/test/selftest_worldio.cpp
   src/test/selftest_spell.cpp

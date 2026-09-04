@@ -276,6 +276,12 @@ class Physics {
   // must start asleep so a settled pile reloads settled (CLAUDE.md rule 2)
   // instead of every piece re-simulating its rest on the first tick.
   void DeactivateBody(uint64_t handle);
+  // Wake one body. The counterpart to DeactivateBody, and the reason it exists
+  // is SettleBodies: a body that is refused a settle for want of ground under
+  // it must also be given the chance to FALL, or the refusal just parks it as
+  // a permanent sleeping body. WakeNear would do it, but it wakes every body
+  // in a radius to solve a question about one.
+  void ActivateBody(uint64_t handle);
   // Local-space bounds of a body's actual COLLIDER, in voxels, relative to its
   // own origin. For the collision-box debug overlay.
   //

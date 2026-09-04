@@ -291,6 +291,22 @@ constexpr const char* kPageBlockEnd = ">>>PAGE_TABLE_END<<<";
 constexpr const char* kPageWriteBegin = ">>>PAGE_TABLE_WRITE_BEGIN<<<";
 constexpr const char* kPageWriteEnd = ">>>PAGE_TABLE_WRITE_END<<<";
 
+// The support-loss block in common.wgsl references `supportOut` and
+// `materials`, which only the three kernels that can REMOVE a voxel declare
+// (sim_step, sim_mutate, sim_explode). Same filter as the page block above and
+// for the same WGSL reason: an unreachable function's identifiers still have to
+// resolve, so leaving it in raymarch.wgsl is a compile error.
+//
+// The predicate is read off the body — "does it declare supportOut" — rather
+// than kept as a list here, so wiring a fourth removal path up cannot desync a
+// list it forgot to edit.
+constexpr const char* kSupportBlockBegin = ">>>SUPPORT_LOSS_BEGIN<<<";
+constexpr const char* kSupportBlockEnd = ">>>SUPPORT_LOSS_END<<<";
+
+bool BodyFlagsSupportLoss(const std::string& body) {
+  return body.find("> supportOut") != std::string::npos;
+}
+
 bool BodyAddressesVoxels(const std::string& body) {
   return body.find("> voxels") != std::string::npos;
 }
@@ -366,6 +382,9 @@ rhi::ShaderModule LoadShader(const rhi::Device& device, const std::string& shade
   // The seed accessor the page block's JITTER synthesis calls. Empty unless
   // this shader addresses voxels, which is exactly when the block survives.
   std::string ptSeed;
+  if (!BodyFlagsSupportLoss(body)) {
+    common = StripBlock(common, kSupportBlockBegin, kSupportBlockEnd);
+  }
   if (!BodyAddressesVoxels(body)) {
     common = StripBlock(common, kPageBlockBegin, kPageBlockEnd);
     common = StripBlock(common, kPageWriteBegin, kPageWriteEnd);

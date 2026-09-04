@@ -38,6 +38,7 @@ const std::vector<Gate>& RenderGates();
 const std::vector<Gate>& PlayerGates();
 const std::vector<Gate>& MobGates();
 const std::vector<Gate>& BodyGates();
+const std::vector<Gate>& FloaterGates();
 const std::vector<Gate>& AudioGates();
 const std::vector<Gate>& WorldIoGates();
 const std::vector<Gate>& VoxRegionGates();
@@ -161,6 +162,12 @@ const char* const kOrder[] = {
     "ragdoll-joints",
     "save-load",   "save-entities", "region-store", "streaming",     "spells",
     "page-roundtrip", "daylight-boundary",
+    // Support-loss flagging from the MUTATION path. Cheap and
+    // self-contained (its own worldgen, an all-stone fixture the CA
+    // cannot touch), and it regenerates the world on the way in, so it
+    // neither inherits nor leaves anything the gates around it care
+    // about.
+    "support-flag",
     // Per-voxel body reactivity. Late, and it must be: it lights real fires and
     // pours real acid at absolute coordinates, and it regenerates the world on
     // the way out so the gates after it still find pristine terrain (rule 7).
@@ -254,6 +261,23 @@ const char* const kOrder[] = {
     // (owner report 2026-09-02: the corpse pulsed at its death colour for
     // good). Same world fire as burn-cap, regenerated on the way out.
     "corpse-burn",
+    // ---- NOTHING IS LEFT HANGING (2026-09-03) -----------------------------
+    // LAST of everything that touches the shared World except `voxregion`, and
+    // that position was EARNED rather than chosen. It first sat at the end of
+    // the phys group — which is what the rule in the wound block above says to
+    // do, and which was still wrong, because "the end of its group" is only the
+    // end of the RUN for the group that happens to be last. From the middle of
+    // the suite this gate builds a stone pad, drops two bodies on it, stamps
+    // matter into the grid and advances the tick stream, and the first
+    // full-suite run came back with `wound-accumulate` red beside it: exactly
+    // the id-keyed perturbation the wound block warns about, committed by the
+    // gate added to obey it.
+    //
+    // So the rule is really: a new gate goes as late as it can, and "its group"
+    // is a tiebreak, not the constraint. This one regenerates worldgen on the
+    // way out like its neighbours, and from here there is nothing left for it
+    // to disturb.
+    "floaters",
     // LAST of the world-touching gates, and it must be: BuildVoxRegion moves
     // the residency window and resets the page table, which is the state every
     // other gate's fixture placement assumes. It restores both before it
@@ -270,7 +294,8 @@ const std::vector<Gate>& Registry() {
                           &SimGates(), &CaGates(), &WindGates(), &WaterGates(),
                           &RenderGates(),
                           &PlayerGates(),
-                          &MobGates(), &BodyGates(), &WorldIoGates(), &AudioGates(),
+                          &MobGates(), &BodyGates(), &FloaterGates(),
+                          &WorldIoGates(), &AudioGates(),
                           &VoxRegionGates(),
                           &SpellGates(), &PlayerKitGates(), &SwingGates(),
                           &EquipmentGates(), &WoundGates(), &CombatGates()})

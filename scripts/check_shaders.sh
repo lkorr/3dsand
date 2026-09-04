@@ -363,17 +363,24 @@ for f in "${FILES[@]}"; do
   # Two blocks: the READ half needs voxels + pageTable, the WRITE half also
   # needs voxels to be read_write and needs pageFaults. raymarch has the first
   # and not the second.
+  # The support-loss block gets the same treatment: it references supportOut,
+  # which only the kernels that can REMOVE a voxel declare (sim_step,
+  # sim_mutate, sim_explode). Predicate read off the body, exactly as
+  # LoadShader's BodyFlagsSupportLoss does.
   commonSrc="$COMMON"
-  stripRead=0; stripWrite=0
+  stripRead=0; stripWrite=0; stripSupport=0
   grep -q '> voxels' "$f" || { stripRead=1; stripWrite=1; }
   grep -q 'read_write> voxels' "$f" || stripWrite=1
-  if [ "$stripRead" -eq 1 ] || [ "$stripWrite" -eq 1 ]; then
+  grep -q '> supportOut' "$f" || stripSupport=1
+  if [ "$stripRead" -eq 1 ] || [ "$stripWrite" -eq 1 ] || [ "$stripSupport" -eq 1 ]; then
     commonSrc="$TMP/common_${name}"
-    awk -v sr="$stripRead" -v sw="$stripWrite" '
+    awk -v sr="$stripRead" -v sw="$stripWrite" -v ss="$stripSupport" '
       /PAGE_TABLE_WRITE_BEGIN/ { print; s = sw; next }
       /PAGE_TABLE_WRITE_END/   { print; s = 0;  next }
       /PAGE_TABLE_BEGIN/       { print; s = sr; next }
       /PAGE_TABLE_END/         { print; s = 0;  next }
+      /SUPPORT_LOSS_BEGIN/     { print; s = ss; next }
+      /SUPPORT_LOSS_END/       { print; s = 0;  next }
       s                        { print ""; next }
       { print }
     ' "$COMMON" > "$commonSrc"

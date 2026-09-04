@@ -59,30 +59,11 @@ fn markVoxActive(idx : u32) {
 // the residency window, not a fixed cube.
 fn inBounds(c : vec3<i32>) -> bool { return inWindow(c, T.origin); }
 
-// A supporting cell at c stopped supporting (its occupant left or became
-// non-solid/non-powder). If a CLASS_SOLID voxel rests on / hangs off it, flag
-// that solid's chunk so the CPU runs a bounded island check there.
-// oldKlass==POWDER checks up only (solids REST on powder; a solid merely
-// beside a shifting sand pile is not supported by it — checking laterals
-// would flag every wall next to settling sand).
-fn flagSupportLoss(c : vec3<i32>, oldKlass : u32, newMat : u32) {
-  if (oldKlass != CLASS_SOLID && oldKlass != CLASS_POWDER) { return; }
-  let nm = newMat & 0xFFFu;  // 12-bit id; sentinel values land on a zeroed entry
-  if (nm != MAT_AIR) {
-    let nk = materials[nm].klass;
-    if (nk == CLASS_SOLID || nk == CLASS_POWDER) { return; }  // still supports
-  }
-  for (var i = 0u; i < 6u; i++) {
-    if (oldKlass == CLASS_POWDER && i != 1u) { continue; }  // up only
-    let n = c + faceDir(i);
-    if (!inBounds(n)) { continue; }
-    let nmat = voxMat(voxWordAt((n)));
-    if (nmat != MAT_AIR && materials[nmat].klass == CLASS_SOLID) {
-      atomicStore(&supportOut[chunkIndexW(n)], 1u);
-      return;
-    }
-  }
-}
+// flagSupportLoss now lives in common.wgsl (the SUPPORT_LOSS block): the
+// MutationQueue and blast kernels raise it too, and two copies of the rule
+// was the bug. `supportOut` is still declared above, which is the predicate
+// LoadShader strips the block on.
+
 
 // Mark the chunk containing world cell c dirty for next tick, plus every
 // neighbor chunk c borders (cross-chunk neighbors re-evaluate; sleeping is
@@ -177,16 +158,8 @@ fn transferLiquid(src : vec3<i32>, dst : vec3<i32>, mat : u32,
 }
 
 // The six face directions with their RDIR_* bits: -y, +y, then laterals.
-fn faceDir(i : u32) -> vec3<i32> {
-  switch (i % 6u) {
-    case 0u: { return vec3<i32>(0, -1, 0); }
-    case 1u: { return vec3<i32>(0,  1, 0); }
-    case 2u: { return vec3<i32>( 1, 0, 0); }
-    case 3u: { return vec3<i32>(-1, 0, 0); }
-    case 4u: { return vec3<i32>(0, 0,  1); }
-    default: { return vec3<i32>(0, 0, -1); }
-  }
-}
+// faceDir moved to common.wgsl beside flagSupportLoss, its only cross-shader
+// caller. faceDirBit stays: RDIR_* are sim_step's own.
 fn faceDirBit(i : u32) -> u32 {
   switch (i % 6u) {
     case 0u: { return RDIR_DOWN; }

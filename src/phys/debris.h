@@ -63,7 +63,16 @@ class DebrisSystem {
   // Register a destruction event; the box is expanded by `margin` and clamped
   // to the bounded fill region (DESIGN.md §7: ~32k voxel abort). Returns false
   // if the event queue is full (caller may retry next tick).
-  bool AddDestructionEvent(uint32_t tick, IVec3 lo, IVec3 hi, int margin = 10);
+  // Returns false when the event queue is full. THE RETURN IS ADVISORY, NOT A
+  // LOSS: on a full queue the region's chunks are spilled onto
+  // `pendingSupport_`, which is the queue that never drops, so the scan
+  // happens late rather than never. Callers therefore do not have to check it
+  // — which is what they were already doing, only now it is correct.
+  //
+  // `spillOnFull` exists for exactly one caller: the pendingSupport_ drain
+  // itself, which must not re-enqueue what it is in the middle of draining.
+  bool AddDestructionEvent(uint32_t tick, IVec3 lo, IVec3 hi, int margin = 10,
+                           bool spillOnFull = true);
 
   // Convert the snapshot's GPU support-loss flags (sim_step saw a supporting
   // voxel vacate next to a solid) into island-check events, per-chunk
@@ -388,6 +397,59 @@ class DebrisSystem {
   const SettleProbe& Settle() const { return settle_; }
   void ResetSettleProbe() { settle_ = SettleProbe{}; }
 
+  // ---- floater attribution (the grid <-> body handoff's leak sites) -------
+  //
+  // WHY THIS EXISTS, and why it is counters rather than a bisect.
+  //
+  // A CLASS_SOLID voxel never moves in the CA (sim_step returns early for it),
+  // so island detection is the ONLY mechanism that makes solid matter fall.
+  // Every component this file declines to convert stays exactly where it is,
+  // forever, with nothing downstream to catch it — which makes "something is
+  // floating" a bare symptom with eight distinct possible causes and no way to
+  // tell them apart from the outside. That is precisely the number CLAUDE.md
+  // rule 6 says not to bisect: elimination buys one hypothesis per run, while
+  // recording the cause AT THE SITE buys all of them at once.
+  //
+  // So every path that declines a component increments the counter naming WHY.
+  // The `floaters` gate prints these beside its own sweep of the world, and
+  // the pair answers "what is floating" and "which door did it leave by" in a
+  // single run. Increments only; no allocation, no readback, nothing that
+  // costs anything when nothing is declined.
+  //
+  // The distinction that matters when reading them: `deferred*` counters are
+  // the FIXES working (matter stayed in the grid on purpose and the event was
+  // re-queued to come back for it), while `*GaveUp` and `solidRubbleInPlace`
+  // are genuine leaks. A non-zero `deferred*` is healthy; a non-zero
+  // `*GaveUp` is a floater that got away.
+  struct FloaterProbe {
+    // --- leaks: matter left in the grid with no path back ---
+    uint32_t oversizeBboxSkipped = 0;   // component wider than the int8 lattice
+    uint32_t solidRubbleInPlace = 0;    // a SOLID scrap written back where it hung
+    uint32_t stuckEventDropped = 0;     // readback starvation / region streamed out
+    uint32_t deferGaveUp = 0;           // re-queue budget exhausted
+    uint32_t eventQueueFullDropped = 0; // queue full AND the spill also failed
+    // NOT a leak: the pendingSupport_ drain found the event queue full and left
+    // the chunk queued for next tick. Back-pressure, which is the queue working.
+    uint32_t drainBackpressure = 0;
+    // --- deferrals: the fixes doing their job ---
+    uint32_t deferredCellOpBudget = 0;  // op budget ran out mid-scan
+    uint32_t deferredSpawnRing = 0;     // particle ring full, cells left alone
+    uint32_t deferredOversize = 0;      // oversize component held for a re-scan
+    uint32_t eventQueueFullSpilled = 0; // queue full -> pendingSupport_ instead
+    uint32_t settleWithoutSupport = 0;  // a settle refused for want of ground
+    // --- why components were judged anchored (context, not a verdict) ---
+    // A component can be anchored for a good reason (the structure really does
+    // continue outside the scan box) or a conservative one (we could not see
+    // what is out there). The second is the documented source of the "large
+    // floating sections survive" flaw, and separating them is what makes the
+    // gate's number diagnosable instead of merely alarming.
+    uint32_t anchoredByRegionBoundary = 0;  // solid genuinely continues outside
+    uint32_t anchoredByUnknownChunk = 0;    // unfetched / out-of-window: assumed
+    uint32_t anchoredByOversizeFlood = 0;   // over kMaxIslandVoxels: unjudgeable
+  };
+  const FloaterProbe& Floaters() const { return floaters_; }
+  void ResetFloaterProbe() { floaters_ = FloaterProbe{}; }
+
   // ---- persistence (sim/worldio.h, entities.sve section 'DBRS') -----------
   // Everything a body IS travels: collider + skin lattices, transform, scales,
   // bleed material. Jolt handles do NOT survive a session — load recreates
@@ -443,6 +505,12 @@ class DebrisSystem {
   struct Event {
     uint32_t tick;
     IVec3 lo, hi;  // voxel box (inclusive), already expanded + clamped
+    // How many times this event has been DEFERRED and re-queued because a
+    // budget ran out mid-scan (see RunIslandDetection's `deferEvent`). Bounded
+    // so a region whose components never fit cannot cycle forever; on
+    // exhaustion the give-up is COUNTED rather than silent, which is the whole
+    // point of the floater probe below.
+    uint8_t retries = 0;
   };
   struct Body {
     uint64_t handle = 0;
@@ -513,6 +581,23 @@ class DebrisSystem {
   };
 
   bool EventReady(const Event& e, World& world, uint32_t required) const;
+  // Push every world chunk the (already clamped) region covers onto
+  // pendingSupport_. The overflow path for a full event queue; deduped by
+  // supportPending_ exactly like a GPU support flag, so a region spilled twice
+  // costs one entry.
+  void SpillRegionToSupport(const Event& e);
+  // Is any voxel of a settle candidate's snapped footprint resting on grid
+  // solid/powder? See the long note at the call site in SettleBodies — this is
+  // what stops a body that was resting on ANOTHER BODY from stamping itself
+  // into the world as permanently floating stone.
+  //
+  // `snap` is the signed-permutation basis SettleBodies derived, `base` the
+  // rounded body origin. Chunks that are not cached are REQUESTED and read as
+  // "no support", so a settle near an unfetched chunk waits for the fetch
+  // instead of guessing — the same self-healing shape EventReady has.
+  bool SettleFootprintSupported(const std::vector<DebrisVoxel>& src,
+                                const int (*snap)[3], IVec3 base,
+                                World& world) const;
   void RunIslandDetection(const Event& e, uint32_t tick, World& world,
                           std::vector<CellOp>& cellOps,
                           std::vector<ParticleSpawn>& spawns);
@@ -657,6 +742,7 @@ class DebrisSystem {
   uint32_t instanceCount_ = 0;
   uint32_t settledBack_ = 0;
   SettleProbe settle_{};
+  FloaterProbe floaters_{};
   // Drained by main.cpp each frame; bounded by the same per-tick body budget
   // that bounds island creation, so this cannot grow without limit.
   std::vector<BreakEvent> breaks_;

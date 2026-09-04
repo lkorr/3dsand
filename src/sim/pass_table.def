@@ -120,16 +120,22 @@ PASS(fill_actVoxViz, nullptr, PT_TICK, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE, DYN_N
 // ---- phase 1: prep (one ComputePassEncoder today: mutate+explode+compact) --
 // D_OPS/D_CELLS/D_EXP/D_SPAWN are dispatch-extent selectors resolved from the
 // tick's counts at record time (see PassDispatchExtent in pass_table.cpp).
+// A(Support): an erase or a melt can remove what a ledge was standing on, and
+// solids never fall in the CA — flagSupportLoss (common.wgsl) is what reaches
+// island detection. Atomic-store-only, same as every other writer of this
+// buffer, so it orders against nothing.
 PASS(mutate, "prep(mutate+explode+compact)", PT_TICK, PIPE_MUTATE,      K_COMPUTE, D_OPS,4,4,   GRP_SIM,       DYN_ZERO, C_OPS, 1,
      USES(R(Materials) U(TickUBO) R(OpsBuf) RW(Voxels) A(DirtyIn) A(DirtyOut)
-          R(PageTable) A(PageFaults)))
-// No R(Materials): `cells` writes the authored word straight into the grid and
-// never consults the material table (unlike `main`, which does). The barrier
-// doc's T11 row lists materials; the rooted walk says otherwise and the walk is
-// right — check_pass_table.py caught this.
+          A(Support) R(PageTable) A(PageFaults)))
+// R(Materials) is NEW here and the comment it replaces said the opposite: this
+// row genuinely did not consult the material table, because `cells` wrote the
+// authored word straight into the grid. It now reads the OUTGOING occupant's
+// class to decide whether a support vanished, which is a real read of the
+// table — check_pass_table.py is what holds the two in step, and it caught the
+// original mistake in this row the same way.
 PASS(mutateCells, "prep(mutate+explode+compact)", PT_TICK, PIPE_MUTATE_CELLS,K_COMPUTE, D_CELLS,1,1, GRP_SIM,       DYN_ZERO, C_CELLS, 1,
-     USES(U(TickUBO) R(CellOps) RW(Voxels) A(DirtyIn) A(DirtyOut)
-          R(PageTable) A(PageFaults)))
+     USES(R(Materials) U(TickUBO) R(CellOps) RW(Voxels) A(DirtyIn) A(DirtyOut)
+          A(Support) R(PageTable) A(PageFaults)))
 // WIND PRIMITIVE FOOTPRINT WAKE (docs/RESEARCH_wind.md §4.3, §10). Sets the
 // dirty flag on the chunks a fan/gust/tornado declared this tick, so a SETTLED
 // dune under one of them is simulated at all. It writes no voxel and reads no
@@ -153,9 +159,13 @@ PASS(explodeMark, "prep(mutate+explode+compact)", PT_TICK, PIPE_EXPLODE_MARK, K_
           R(PageTable)))
 // read-only in practice: `expMask` is read_write for the module because `mark`
 // writes it. `apply` consumes the mask `mark` produced and never amends it.
+// A(Support): the blast is the largest remover of supporting matter in the
+// engine and raised no flag at all until now — the CPU queued one island event
+// at the blast centre and whatever the crater undercut past that margin stayed
+// in the air. `mark` deliberately does NOT take this use: it destroys nothing.
 PASS(explodeApply, "prep(mutate+explode+compact)", PT_TICK, PIPE_EXPLODE_APPLY,K_COMPUTE, D_EXP,D_EXPWG,D_EXPWG,  GRP_SLIM_PART, DYN_NONE, C_EXP, 1,
      USES(R(Materials) U(TickUBO) R(ExpOps) R(ExpMask) RW(Voxels) A(DirtyIn) A(DirtyOut)
-          A(ParticleCounts) W(ParticlesRead) R(PageTable) A(PageFaults)))
+          A(Support) A(ParticleCounts) W(ParticlesRead) R(PageTable) A(PageFaults)))
 // CPU particle spawns (debris shatter) append to the READ page here, before
 // args1 sizes the integrate dispatch — same page explosion ejecta uses.
 PASS(particleSpawn, "prep(mutate+explode+compact)", PT_TICK, PIPE_P_SPAWN,     K_COMPUTE, D_SPAWN,1,1,GRP_SLIM_PART, DYN_NONE, C_SPAWN, 1,

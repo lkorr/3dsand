@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
+#include <unordered_set>
 
 #include "phys/lattice.h"
 #include "phys/marching_cubes.h"
@@ -49,6 +51,21 @@ constexpr uint32_t kSupportCooldownTicks = 45;
 // component touching the region boundary is conservatively kept.
 constexpr int kSupportMargin = 24;
 constexpr int kSupportDrainPerTick = 2;
+// How many times one region may be DEFERRED and re-queued before the scan
+// gives up on it. A deferral happens when a budget (grid ops, particle ring)
+// runs out with components still unconverted; the event comes back next tick,
+// by which time this tick's writes have landed and the remainder is smaller.
+// Progress is therefore monotonic in practice and the cap is a backstop, not a
+// schedule — but it MUST exist, because "re-queue until it fits" against a
+// permanently saturated budget is an infinite loop, and this file's whole
+// contract is that nothing here grows without bound (CLAUDE.md rule 2).
+constexpr uint8_t kMaxEventRetries = 8;
+// Ceiling on the spill queue. pendingSupport_ never drops entries by design
+// (a missed final flag is a floating island forever), which is exactly why it
+// needs a ceiling somewhere: without one, a caller looping on destruction
+// could grow it to the size of the window. At 2 chunks/tick this is already
+// ~34 s of backlog, far past the point where a bigger number would help.
+constexpr size_t kMaxPendingSupport = 4096;
 
 // Body budget policy. Anything that comes loose as a coherent object earns a
 // rigidbody — a felled trunk falls as a log, not as a puff of powder. The only
@@ -375,7 +392,32 @@ void DebrisSystem::Reset() {
   nextSerial_ = 1;
 }
 
-bool DebrisSystem::AddDestructionEvent(uint32_t tick, IVec3 lo, IVec3 hi, int margin) {
+// Every world chunk the clamped region covers, onto the queue that never
+// drops. Deduped through supportPending_ exactly as a GPU support flag is, so
+// spilling the same region twice costs one entry — and deliberately WITHOUT
+// touching supportCooldown_: the cooldown throttles the CA's repeating flags
+// (sand pouring, fire burning), and borrowing it here would let a spilled
+// explosion suppress a genuine flag from the same chunk moments later.
+void DebrisSystem::SpillRegionToSupport(const Event& e) {
+  for (int cz = e.lo.z >> 4; cz <= (e.hi.z >> 4); cz++)
+    for (int cy = e.lo.y >> 4; cy <= (e.hi.y >> 4); cy++)
+      for (int cx = e.lo.x >> 4; cx <= (e.hi.x >> 4); cx++) {
+        IVec3 wc{cx, cy, cz};
+        if (!world_->ChunkInWindow(wc)) continue;
+        if (pendingSupport_.size() >= kMaxPendingSupport) {
+          floaters_.eventQueueFullDropped++;
+          return;
+        }
+        uint64_t key = World::PackChunkKey(wc);
+        if (supportPending_.count(key)) continue;
+        supportPending_[key] = 1;
+        pendingSupport_.push_back(wc);
+        floaters_.eventQueueFullSpilled++;
+      }
+}
+
+bool DebrisSystem::AddDestructionEvent(uint32_t tick, IVec3 lo, IVec3 hi,
+                                       int margin, bool spillOnFull) {
   Event e;
   e.tick = tick;
   // expand for support context, clamp to the bounded region + world
@@ -398,7 +440,28 @@ bool DebrisSystem::AddDestructionEvent(uint32_t tick, IVec3 lo, IVec3 hi, int ma
   e.lo.x = std::max(e.lo.x, wlo.x); e.lo.y = std::max(e.lo.y, wlo.y); e.lo.z = std::max(e.lo.z, wlo.z);
   e.hi.x = std::min(e.hi.x, whi.x); e.hi.y = std::min(e.hi.y, whi.y); e.hi.z = std::min(e.hi.z, whi.z);
   if (e.lo.x > e.hi.x || e.lo.y > e.hi.y || e.lo.z > e.hi.z) return true;  // degenerate: done
-  if (events_.size() >= 64) return false;
+  if (events_.size() >= 64) {
+    // THE QUEUE IS FULL, BUT THE EVENT IS NOT LOST. Every caller of this
+    // function — the brush, the grenade, the laser — ignored the false it used
+    // to return here, so a busy moment (one grenade into a burning forest)
+    // silently threw away the island check for a hole it had just made, and
+    // whatever that hole was holding up floated for the rest of the session.
+    //
+    // Spilling to pendingSupport_ makes the failure a DELAY instead of a loss:
+    // that queue is drained two chunks a tick and never drops, so the scan
+    // still happens, just later. The return value stays for the one caller
+    // that genuinely wants to retry in place (the drain itself, which passes
+    // spillOnFull = false so it cannot re-enqueue what it is draining).
+    // NOT counted as a drop when spillOnFull is false: that caller is the
+    // pendingSupport_ drain, which leaves the chunk queued and comes back next
+    // tick. Counting its back-pressure as lost matter put 114 phantom entries
+    // in the leak column on the first full-suite run and made a healthy queue
+    // look like a haemorrhage — the exact failure mode this probe exists to
+    // prevent, committed by the probe itself.
+    if (spillOnFull) SpillRegionToSupport(e);
+    else floaters_.drainBackpressure++;
+    return false;
+  }
   events_.push_back(e);
   return true;
 }
@@ -486,15 +549,28 @@ void DebrisSystem::RunIslandDetection(const Event& e, uint32_t tick, World& worl
   // decide whether a component leaving the region is really attached to more
   // structure out there, or just happens to graze the box. One cache lookup
   // per query, only for boundary cells of unanchored components.
-  auto solidOutside = [&](int wx, int wy, int wz) -> bool {
-    if (!world.CellInWindow({wx, wy, wz})) return true;  // window edge is solid
+  //
+  // TRI-STATE, not a bool, and the third state is the point. Anchoring on a
+  // KNOWN solid out there is the rule working: the structure really does
+  // continue and must not fall. Anchoring because the cell is outside the
+  // residency window or its chunk has not been fetched is a GUESS in the
+  // conservative direction — correct as a default, and also the documented
+  // source of "large floating sections survive" (DESIGN.md section 7). Told
+  // apart at the point of decision, the floater probe can say which of the two
+  // is holding a given region up; collapsed into one bool, as it was, the
+  // difference is unrecoverable downstream and the gate's number means nothing.
+  enum : int { OUTSIDE_AIR = 0, OUTSIDE_SOLID = 1, OUTSIDE_UNKNOWN = 2 };
+  auto solidOutside = [&](int wx, int wy, int wz) -> int {
+    if (!world.CellInWindow({wx, wy, wz})) return OUTSIDE_UNKNOWN;  // window edge
     const CachedChunk* cc = world.Cached(ChunkOfCell(wx, wy, wz));
-    if (!cc || cc->voxels.size() != kChunkVol) return true;  // unknown: assume
+    if (!cc || cc->voxels.size() != kChunkVol) return OUTSIDE_UNKNOWN;  // unfetched
     uint32_t mat = cc->voxels[((uint32_t)(wz & 15) * kChunk +
                                (uint32_t)(wy & 15)) * kChunk +
                               (uint32_t)(wx & 15)] & 0xFFF;
-    return mat != 0 && mat < classOf_.size() &&
-           (classOf_[mat] == CLASS_SOLID || classOf_[mat] == CLASS_POWDER);
+    return (mat != 0 && mat < classOf_.size() &&
+            (classOf_[mat] == CLASS_SOLID || classOf_[mat] == CLASS_POWDER))
+               ? OUTSIDE_SOLID
+               : OUTSIDE_AIR;
   };
 
   // 6-connected components; a component touching the region boundary is
@@ -505,6 +581,12 @@ void DebrisSystem::RunIslandDetection(const Event& e, uint32_t tick, World& worl
   struct Comp {
     std::vector<size_t> cells;
     bool anchored = false;
+    // WHY it is anchored, for the floater probe. None of these set on an
+    // anchored component means it is genuinely supported (resting on powder),
+    // which is the one anchor that needs no explanation.
+    bool boundaryAnchor = false;  // a known solid continues outside the box
+    bool unknownAnchor = false;   // unfetched / out-of-window: assumed solid
+    bool oversizeAnchor = false;  // over kMaxIslandVoxels: too big to judge
   };
   std::vector<Comp> comps;
   for (size_t seed = 0; seed < vol; seed++) {
@@ -516,7 +598,10 @@ void DebrisSystem::RunIslandDetection(const Event& e, uint32_t tick, World& worl
       size_t i = stack.back();
       stack.pop_back();
       comp.cells.push_back(i);
-      if (comp.cells.size() > kMaxIslandVoxels) comp.anchored = true;  // abort: too big
+      if (comp.cells.size() > kMaxIslandVoxels) {  // abort: too big to judge
+        comp.anchored = true;
+        comp.oversizeAnchor = true;
+      }
       int x = (int)(i % dx), y = (int)((i / dx) % dy), z = (int)(i / ((size_t)dx * dy));
       // Leaving the region only anchors when the structure actually CONTINUES
       // outside: a cell on the boundary face whose outward neighbor is solid
@@ -529,12 +614,19 @@ void DebrisSystem::RunIslandDetection(const Event& e, uint32_t tick, World& worl
       // a tree is taller than that, so the crown always grazed a face and was
       // pinned — while its dithered rim leaves became sub-8 islands and got
       // deleted. Now only the trunk's actual ground contact anchors it.
-      if (x == 0 && solidOutside(e.lo.x - 1, e.lo.y + y, e.lo.z + z)) comp.anchored = true;
-      if (y == 0 && solidOutside(e.lo.x + x, e.lo.y - 1, e.lo.z + z)) comp.anchored = true;
-      if (z == 0 && solidOutside(e.lo.x + x, e.lo.y + y, e.lo.z - 1)) comp.anchored = true;
-      if (x == dx - 1 && solidOutside(e.hi.x + 1, e.lo.y + y, e.lo.z + z)) comp.anchored = true;
-      if (y == dy - 1 && solidOutside(e.lo.x + x, e.hi.y + 1, e.lo.z + z)) comp.anchored = true;
-      if (z == dz - 1 && solidOutside(e.lo.x + x, e.lo.y + y, e.hi.z + 1)) comp.anchored = true;
+      auto edge = [&](int wx, int wy, int wz) {
+        const int r = solidOutside(wx, wy, wz);
+        if (r == OUTSIDE_AIR) return;
+        comp.anchored = true;
+        if (r == OUTSIDE_UNKNOWN) comp.unknownAnchor = true;
+        else comp.boundaryAnchor = true;
+      };
+      if (x == 0) edge(e.lo.x - 1, e.lo.y + y, e.lo.z + z);
+      if (y == 0) edge(e.lo.x + x, e.lo.y - 1, e.lo.z + z);
+      if (z == 0) edge(e.lo.x + x, e.lo.y + y, e.lo.z - 1);
+      if (x == dx - 1) edge(e.hi.x + 1, e.lo.y + y, e.lo.z + z);
+      if (y == dy - 1) edge(e.lo.x + x, e.hi.y + 1, e.lo.z + z);
+      if (z == dz - 1) edge(e.lo.x + x, e.lo.y + y, e.hi.z + 1);
       // resting on powder = supported: without this, every slab on a sand
       // pile would convert to a body the moment a support-loss scan runs.
       // When the powder flows away the sim re-flags the chunk and the next
@@ -563,6 +655,22 @@ void DebrisSystem::RunIslandDetection(const Event& e, uint32_t tick, World& worl
   // Largest components first: when a scan turns up more loose structure than
   // the per-tick body budget covers, the tree gets the body and the twigs fall
   // back to rubble, rather than the arbitrary scan order deciding.
+  // Anchor attribution, one tally per component. Context rather than a
+  // verdict: an anchored component is not necessarily a floater, but when the
+  // gate finds one, THESE are the numbers that say whether the scan judged it
+  // or merely declined to.
+  for (const Comp& cm : comps) {
+    if (!cm.anchored) continue;
+    if (cm.oversizeAnchor) floaters_.anchoredByOversizeFlood++;
+    if (cm.unknownAnchor) floaters_.anchoredByUnknownChunk++;
+    if (cm.boundaryAnchor) floaters_.anchoredByRegionBoundary++;
+  }
+
+  // Set when a budget stopped us with work left in this region. The event is
+  // re-queued at the bottom of the function so the remainder is picked up on a
+  // later tick, against a grid that by then reflects this tick's writes.
+  bool deferEvent = false;
+
   std::vector<uint32_t> order;
   order.reserve(comps.size());
   for (uint32_t c = 0; c < (uint32_t)comps.size(); c++)
@@ -574,7 +682,25 @@ void DebrisSystem::RunIslandDetection(const Event& e, uint32_t tick, World& worl
   uint32_t madeThisScan = 0;
   for (uint32_t ci : order) {
     const Comp& comp = comps[ci];
-    if (cellOps.size() + comp.cells.size() > kMaxCellOpsPerTick) break;  // next tick
+    if (cellOps.size() + comp.cells.size() > kMaxCellOpsPerTick) {
+      // "next tick" is what the comment always said and what the code never
+      // did: the event was popped by the caller BEFORE this function ran, so
+      // breaking here abandoned every remaining component of the scan in the
+      // grid, unanchored, with nothing left to look at them again. They are
+      // unsupported by construction — that is why they are in `order` — so
+      // each one is a permanent floater.
+      //
+      // Now the region is genuinely re-queued. Nothing needs to be carried
+      // across the tick with it: the components already converted have left
+      // the grid, so a re-scan simply re-derives what is left, smaller. The
+      // freshness watermark (lastCellWriteTick_, set below) is what makes that
+      // safe — EventReady holds the re-queued event until the chunk cache has
+      // caught up past this tick's writes, so the re-scan cannot see stale
+      // cells for matter it already removed.
+      floaters_.deferredCellOpBudget++;
+      deferEvent = true;
+      break;
+    }
 
     // Body-worthiness. A scan over a burning forest can turn up dozens of
     // loose components; each body costs a compound-shape build plus permanent
@@ -630,7 +756,25 @@ void DebrisSystem::RunIslandDetection(const Event& e, uint32_t tick, World& worl
         // rejoins the grid as itself. Powder/liquid rubble still goes straight
         // back to the CA, which already moves it.
         bool frozen = rub < matGpu_.size() && matGpu_[rub].klass == CLASS_SOLID;
-        if (frozen && spawns.size() < kMaxParticleSpawnsPerTick) {
+        if (frozen && spawns.size() >= kMaxParticleSpawnsPerTick) {
+          // THE RING IS FULL AND THE SCRAP IS SOLID. The comment above spells
+          // out why this cell must not be written back: a solid cannot fall in
+          // the CA, so stamping it here leaves it hanging exactly where its
+          // support used to be. Until now the code said that and then did it
+          // anyway, because the particle branch was an `if` whose else-path
+          // fell through to the grid write.
+          //
+          // Leaving the cell ALONE is the correct third option, and it is only
+          // correct because of the re-queue: the voxel keeps its own material
+          // and stays where it is for now, and the region comes back on a
+          // later tick when the spawn ring has drained. Skipping the cell
+          // without the deferral would be the same leak wearing a different
+          // comment.
+          floaters_.deferredSpawnRing++;
+          deferEvent = true;
+          continue;
+        }
+        if (frozen) {
           ParticleSpawn s{};
           s.px = (int32_t)((wx * 256) + 128);
           s.py = (int32_t)((wy * 256) + 128);
@@ -656,7 +800,31 @@ void DebrisSystem::RunIslandDetection(const Event& e, uint32_t tick, World& worl
       mn.x = std::min(mn.x, x); mn.y = std::min(mn.y, y); mn.z = std::min(mn.z, z);
       mx.x = std::max(mx.x, x); mx.y = std::max(mx.y, y); mx.z = std::max(mx.z, z);
     }
-    if (mx.x - mn.x > 120 || mx.y - mn.y > 120 || mx.z - mn.z > 120) continue;
+    if (mx.x - mn.x > 120 || mx.y - mn.y > 120 || mx.z - mn.z > 120) {
+      // DebrisVoxel stores body-local coordinates in int8, so a body cannot be
+      // wider than ~120 voxels on any axis. This guard is that limit leaking
+      // out of the storage format into world logic — and `continue` left the
+      // component sitting in the grid, unanchored, forever.
+      //
+      // IT IS CURRENTLY UNREACHABLE, and the fix is written to match that
+      // rather than to speculate. AddDestructionEvent clamps every region to
+      // kMaxRegionCells (80) per axis, so a component found inside one cannot
+      // span more than 80 — the bound this tests for cannot be crossed by any
+      // caller that exists. Building a splitter that shards the component into
+      // jointed sub-bodies would be a few hundred lines and up to 27 Jolt
+      // bodies from ONE island, to serve a branch that never executes and
+      // against the body-worthiness budget this file is built around.
+      //
+      // So: keep the guard as defence-in-depth (kMaxRegionCells is a constant
+      // someone will raise one day), make it DEFER instead of abandon, and
+      // count it. If the counter is ever non-zero the assumption above has
+      // expired and the splitter is the next piece of work — which is a much
+      // better position than the silent leak this was.
+      floaters_.oversizeBboxSkipped++;
+      floaters_.deferredOversize++;
+      deferEvent = true;
+      continue;
+    }
 
     Body body;
     body.voxels.reserve(comp.cells.size());
@@ -698,6 +866,40 @@ void DebrisSystem::RunIslandDetection(const Event& e, uint32_t tick, World& worl
     std::printf("debris: island of %zu voxels -> body (total %zu)\n",
                 comp.cells.size(), bodies_.size());
   }
+
+  // ---- the re-queue -------------------------------------------------------
+  //
+  // Three paths above stop short with unconverted, unanchored matter still in
+  // the grid: the grid-op budget, the particle ring, and the oversize guard.
+  // Every one of them used to end the scan there, and because PreTick pops the
+  // event BEFORE calling this function, "stop short" meant "abandon" — the
+  // matter is unsupported by construction (it is in `order` precisely because
+  // nothing anchors it), a solid cannot fall in the CA, and nothing downstream
+  // would ever look at it again. That is a permanent floater per component.
+  //
+  // Re-queueing costs one deque entry and re-derives the remainder from the
+  // grid on a later tick, which is both simpler and more correct than carrying
+  // a resume cursor across the gap: the components already converted have LEFT
+  // the grid, so a re-scan simply finds what is left, smaller. Passing `tick`
+  // rather than `e.tick` is what makes that safe — EventReady holds the event
+  // until the chunk cache reflects the writes this scan just queued, so the
+  // re-scan cannot rediscover matter it has already removed and double-convert
+  // it.
+  //
+  // Bounded by kMaxEventRetries. Each pass removes matter, so the remainder
+  // shrinks and the cap should never be reached — but "should never" is not a
+  // bound, and exhausting it is a genuine leak, counted as one.
+  if (deferEvent) {
+    if (e.retries < kMaxEventRetries) {
+      Event again = e;
+      again.retries = (uint8_t)(e.retries + 1);
+      again.tick = tick;
+      if (events_.size() < 64) events_.push_back(again);
+      else SpillRegionToSupport(again);  // never dropped, only late
+    } else {
+      floaters_.deferGaveUp++;
+    }
+  }
 }
 
 void DebrisSystem::PreTick(uint32_t tick, World& world, std::vector<CellOp>& cellOps,
@@ -713,7 +915,10 @@ void DebrisSystem::PreTick(uint32_t tick, World& world, std::vector<CellOp>& cel
     IVec3 lo{wc.x * (int)kChunk, wc.y * (int)kChunk, wc.z * (int)kChunk};
     IVec3 hi{lo.x + (int)kChunk - 1, lo.y + (int)kChunk - 1, lo.z + (int)kChunk - 1};
     if (world_->ChunkInWindow(wc)) {  // streamed out: forget it
-      if (!AddDestructionEvent(tick, lo, hi, kSupportMargin)) break;  // full: retry
+      // spillOnFull = false: this IS the spill queue draining. Re-enqueueing
+      // the chunk we are holding would be a loop that never empties.
+      if (!AddDestructionEvent(tick, lo, hi, kSupportMargin, false))
+        break;  // full: leave it queued and retry next tick
     }
     pendingSupport_.pop_front();
     supportPending_.erase(World::PackChunkKey(wc));
@@ -735,7 +940,10 @@ void DebrisSystem::PreTick(uint32_t tick, World& world, std::vector<CellOp>& cel
     } else if ((events_.size() > 1 && tick > events_.front().tick + 120) ||
                tick > events_.front().tick + 300) {
       // stuck event (readback starvation, or its region streamed out): drop
-      // rather than stall the queue
+      // rather than stall the queue. COUNTED, because this is a real leak —
+      // whatever that region was holding up is now unexamined — and a silent
+      // one is indistinguishable from every other reason something floats.
+      floaters_.stuckEventDropped++;
       events_.pop_front();
     }
   }
@@ -807,6 +1015,101 @@ std::vector<DebrisVoxel> DownsampleMicro(const std::vector<DebrisVoxel>& src,
 
 }  // namespace
 
+// Is anything in the GRID holding this footprint up?
+//
+// Walks the snapped footprint and asks, for each voxel, whether the cell
+// directly below it is solid or powder. Cells belonging to the footprint
+// itself are skipped — a body's own lower voxels are not support for its upper
+// ones. Early-outs on the first support found, so a body sitting flat on the
+// ground costs one lookup.
+//
+// AN UNKNOWN CELL BELOW DOES NOT REFUSE THE SETTLE, and that is a correction
+// paid for by a full-suite run. The first version read an uncached chunk as
+// "no support" on the theory that refusing is always the safe direction. It is
+// not: a refusal is permanent in effect, because a body whose underside is
+// never cached never settles, and `--gate floaters` could not see that (the
+// gate-scope cache held the fixture, the full-suite cache did not — the same
+// subset-versus-suite trap CLAUDE.md rule 7 describes, and it turned the
+// CONTROL arm red while the arm under test stayed green).
+//
+// So the rule is: refuse only when the cells below are AFFIRMATIVELY empty.
+// Unknown chunks are requested and abstain. That also puts this in line with
+// RunIslandDetection's convention (an unknown cell reads as solid) instead of
+// deliberately against it.
+//
+// It costs nothing on the bug this exists for. The body-on-body case — a body
+// resting on another body, which the world knows nothing about — has KNOWN AIR
+// underneath, because ManageTerrain fetches every chunk within radius + 6 of
+// every body precisely so it can build collision there. A body whose underside
+// really is unfetched has no collision either, so it is falling, not sleeping,
+// and cannot reach this code.
+bool DebrisSystem::SettleFootprintSupported(const std::vector<DebrisVoxel>& src,
+                                            const int (*snap)[3], IVec3 base,
+                                            World& world) const {
+  // A/B SWITCH, in the spirit of SANDVOX_PT_DEBUG / SANDVOX_PT_AUDIT. Setting
+  // SANDVOX_NO_SETTLE_SUPPORT=1 restores the pre-2026-09-03 behaviour of
+  // settling anything that is asleep and aligned, so "did the support test
+  // cause this" is ONE run against the same binary rather than a revert, a
+  // rebuild and a bisect. Read once; costs a branch on a path that runs for at
+  // most one body per tick.
+  static const bool kDisabled = [] {
+    const char* e = std::getenv("SANDVOX_NO_SETTLE_SUPPORT");
+    return e && *e && *e != '0';
+  }();
+  if (kDisabled) return true;
+  // The footprint as a set, so "the cell below is my own voxel" is answerable
+  // without an O(n^2) scan. Bodies that reach here are at most a few thousand
+  // voxels (kMaxIslandVoxels bounds the island that made them), and this runs
+  // for at most one body per tick.
+  // Its own packer rather than World::PackChunkKey: that one is named for
+  // CHUNK coordinates and these are CELL coordinates, and a key function
+  // borrowed across two coordinate systems is exactly the kind of quiet
+  // aliasing this codebase pays for elsewhere. Same 21-bits-per-axis layout,
+  // which covers +-1,048,576 cells — four orders of magnitude past the
+  // residency window.
+  auto cellKey = [](IVec3 c) -> uint64_t {
+    auto u = [](int v) { return (uint64_t)(uint32_t)(v + (1 << 20)) & 0x1FFFFF; };
+    return u(c.x) | (u(c.y) << 21) | (u(c.z) << 42);
+  };
+  std::unordered_set<uint64_t> occupied;
+  occupied.reserve(src.size() * 2);
+  auto cellOf = [&](const DebrisVoxel& v) {
+    const float lx = (float)v.x + 0.5f, ly = (float)v.y + 0.5f,
+                lz = (float)v.z + 0.5f;
+    return IVec3{
+        base.x + ifloor(snap[0][0] * lx + snap[0][1] * ly + snap[0][2] * lz),
+        base.y + ifloor(snap[1][0] * lx + snap[1][1] * ly + snap[1][2] * lz),
+        base.z + ifloor(snap[2][0] * lx + snap[2][1] * ly + snap[2][2] * lz)};
+  };
+  for (const DebrisVoxel& v : src) {
+    IVec3 c = cellOf(v);
+    occupied.insert(cellKey(c));
+  }
+  bool sawUnknown = false;
+  for (const DebrisVoxel& v : src) {
+    IVec3 c = cellOf(v);
+    IVec3 below{c.x, c.y - 1, c.z};
+    if (occupied.count(cellKey(below))) continue;  // my own voxel, not support
+    if (!world.CellInWindow(below)) return true;  // outside the window is solid
+    IVec3 wc = ChunkOfCell(below.x, below.y, below.z);
+    const CachedChunk* cc = world.Cached(wc);
+    if (!cc || cc->voxels.size() != kChunkVol) {
+      world.RequestChunkFetch(wc);
+      sawUnknown = true;  // abstain: cannot prove this body is over a void
+      continue;
+    }
+    uint32_t mat = cc->voxels[((uint32_t)(below.z & 15) * kChunk +
+                               (uint32_t)(below.y & 15)) * kChunk +
+                              (uint32_t)(below.x & 15)] & 0xFFF;
+    if (mat != 0 && mat < classOf_.size() &&
+        (classOf_[mat] == CLASS_SOLID || classOf_[mat] == CLASS_POWDER))
+      return true;
+  }
+  // Nothing supported it. Only a footprint whose every below-cell was KNOWN
+  // counts as proof of a void; one unreadable cell and we abstain.
+  return sawUnknown;
+}
+
 void DebrisSystem::SettleBodies(uint32_t tick, World& world,
                                 std::vector<CellOp>& cellOps) {
   constexpr uint32_t kSettleAfterTicks = 60;   // 2 s asleep before converting
@@ -872,6 +1175,59 @@ void DebrisSystem::SettleBodies(uint32_t tick, World& world,
     // cell corner, voxel centers land on distinct cells — no self-collisions.
     IVec3 base{(int)std::lround(b.xf.pos.x), (int)std::lround(b.xf.pos.y),
                (int)std::lround(b.xf.pos.z)};
+
+    // NOTHING SETTLES INTO THIN AIR.
+    //
+    // Every other condition above is about whether this body CAN be expressed
+    // on the lattice — asleep long enough, not bleeding, close enough to a
+    // signed permutation, fits the window and the op budget. None of them ask
+    // the one question that decides whether the result is a rock on the ground
+    // or a rock in the sky, and until now nothing did.
+    //
+    // It matters because BODIES ARE NOT IN THE GRID. A body resting on another
+    // body is resting on nothing the world knows about: Jolt is perfectly
+    // happy, the stack sleeps, the upper one settles — and later the lower one
+    // despawns (PostStep retires the oldest past kMaxBodies, or it streams out,
+    // or it burns away) leaving the stamped voxels hanging. No support-loss
+    // flag ever fires for that, because no CA cell vacated; sim_step never saw
+    // anything happen. And a CLASS_SOLID voxel does not fall on its own, so it
+    // is there for good.
+    //
+    // The same check covers the load path for free. worldio recreates bodies
+    // ASLEEP by design so a settled pile reloads settled (Physics::
+    // DeactivateBody), which means a world saved mid-fall used to arrive with
+    // 60 inactive ticks already banked and stamp itself into the air on the
+    // first scan.
+    //
+    // Refusing is cheap and self-correcting: the body stays a body, stays
+    // asleep, and re-tests every 30 ticks. A pile therefore settles from the
+    // bottom up — the lowest body gains grid support, becomes grid, and the
+    // one above it now has support to find.
+    if (!SettleFootprintSupported(*settleSrc, snap, base, world)) {
+      floaters_.settleWithoutSupport++;
+      // AND WAKE IT, which is the half that makes the refusal honest.
+      //
+      // Refusing alone only decides that this body must not BECOME grid. It
+      // says nothing about what the body should do instead, and the answer is
+      // not "hang there as a sleeping rigidbody forever" — that is the same
+      // floater wearing a different representation, and it costs a permanent
+      // slot in a list capped at kMaxBodies.
+      //
+      // That cap is how the omission bit. Bodies that can never settle
+      // accumulate, the list saturates, and PostStep's oldest-first retirement
+      // starts evicting bodies to make room for them — measured at suite scope
+      // as `wound-accumulate` seeing +0 debris bodies from a limb it had just
+      // severed, because one was culled as the new one arrived.
+      //
+      // Waking closes the loop instead: the body falls, lands on something,
+      // and the next scan finds it supported and settles it normally. A body
+      // genuinely wedged over a void stays awake and visible rather than
+      // quietly immortal, which is the right failure to have.
+      b.inactiveTicks = 0;
+      phys_->ActivateBody(b.handle);
+      continue;
+    }
+
     bool inWindow = true;
     size_t opsStart = cellOps.size();
     for (const DebrisVoxel& v : *settleSrc) {
