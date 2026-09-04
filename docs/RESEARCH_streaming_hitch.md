@@ -621,6 +621,101 @@ Any of R1/R3 should be sized against this number, not the harness's.
 > those adds to the strand bucket and none of them removes from it, so the
 > harness numbers are a FLOOR for the live session, not an estimate of it.
 
+> ### P3-E. FIXED 2026-09-03 - and the strand was hiding an upload bug, not covering for one
+>
+> **Branch** `worktree-agent-ad3bffc9a478973bc` (commits 45e6be8 attribution,
+> 5761a2e the hole, ccf8357 the leak, 44dc1e7 census, 05a3e8f harness).
+>
+> The section above is right about the mechanism and right that the three-line
+> fix loses 21.7M voxels. It is wrong about one inference, and that inference is
+> what made the fix look impossible: **"the CA writes into chunks the mirror
+> never hears about" was never demonstrated.** It was inferred from a fault
+> count with no writer attached. The mirror is fine. The CA never faulted once.
+>
+> #### The attribution, which took one run
+>
+> `pageFaults` grew a per-kernel tally, a world chunk resolved INSIDE `voxStore`
+> at fault time, the tick, and the page-table entry that refused. One
+> `--gate streaming`:
+>
+> ```
+> by kernel: worldgen:list 13656064, worldgen:pagefill 8077312
+> FIRST worldgen:pagefill chunk (432,160,352) word 0x00000001 entry 0xc0000001
+> ```
+>
+> 3,334 and 1,972 WHOLE chunks of 4,096 cells; `0xc0000001` is JITTER(stone),
+> the sentinel each slot held *before* the CPU allocated its page. Two CPU-side
+> preconditions added in the same commit - every genList slot and every
+> jitter-fill slot must hold a page when its list is built - fired **zero**
+> times. The pages existed; the GPU never heard about them.
+>
+> #### The cause: creating a command encoder is what drains the upload queue
+>
+> `Backend::FlushUploads` runs from `BeginCommands`, i.e. at command-buffer
+> CREATION, not at submit. So `CreateCommandEncoder()` consumes the pending
+> upload queue, and a caller that creates an encoder and then decides it has
+> nothing to record DELETES every write issued before it.
+>
+> That caller is §3.6's free-confirmation probe: it created its encoder, found
+> that none of its 128 candidates still had a page, and returned without
+> submitting - taking `PageTable::Materialize`'s page-table flush for the whole
+> tick with it. **Under the `==` trigger the probe almost never ran, so the
+> window was almost never open.** That is the real sense in which the strand was
+> "load-bearing": not that the orphan pages widened the materialization set
+> usefully, but that the leak kept the free probe idle and so kept this latent
+> bug unreachable.
+>
+> Fixed at the class, not the instance: an encoder dropped without `Finish()`,
+> or a finished `CommandBuffer` dropped without `Submit()`, hands the swallowed
+> uploads BACK to the front of the queue (`Backend::AbandonCommands`). The
+> handle owns the debt, so its destructor settles it - exact, where a "was the
+> previous one submitted yet?" test at the next `BeginCommands` cannot tell a
+> dead encoder from a live second one.
+>
+> #### Then the leak, unchanged in shape from the section above
+>
+> `>=` instead of `==`; the re-arm DELETED rather than hoisted (under `>=` there
+> is nothing to re-arm); the eligible set bounded at collection to
+> `kPageFreeProbesPerTick` with the scan start rotating by that same amount per
+> tick so the cap cannot starve the tail; `EnsurePageForOverwrite` re-arms
+> `zeroStreak_` (residency begins there). `kPageRetireCeiling` is untouched -
+> freeing is still capped at `kPageFreeProbesPerTick`/tick, which is what
+> `kPoolPages` is sized against.
+>
+> #### Measured, after
+>
+> | run | before | after |
+> |---|---|---|
+> | `--frames 2400 --autofly-park` PLATEAU | 23,104 (66.4%), **orphan 8,160** | **16,308 (46.8%), orphan 0** |
+> | ... of which all-air sky pages | 7,883 | **186** |
+> | `--frames 1200 --autofly-surface` high water | 29,901 (85.9%) | 22,804 (65.5%) |
+> | `--frames 1200 --autofly-hard` high water | 26,144 (75.1%) | 24,437 (70.2%) |
+> | `--gate streaming` page faults | 0 (leaky) / 21,733,376 (`>=` alone) | **0** |
+>
+> **The plateau is the number that matters and it is the one that moved.** A
+> parked window is now `full 12,017 + matter 4,105`, with `dirty 0 | ring 0 |
+> ORPHAN 0` - i.e. real matter and nothing else. The 8,160 all-air pages the
+> section above measured are gone, and residency comes down after parking, which
+> it previously could not.
+>
+> **The flight PEAKS barely move, and that is the honest reading**: 58% of the
+> peak was `dirty + ring` (the conservative mirror and its N26 dilation), which
+> the leak fix does not touch. The binding constraint during flight is now the
+> drain RATE, visible as `cands 4923 -> submitted 128, capped 4795` in the
+> census: eligibility is no longer the problem, the 128/tick probe budget is.
+> That is a separate, well-posed item with a number attached, and it did not
+> exist as one before.
+>
+> **Caveat on the peaks specifically.** The autofly arms are FRAME-budgeted, so
+> how many ticks a `--frames N` run reaches varies with machine load (this
+> surface run reached tick 797; the "before" note's reached 387). Residency is a
+> function of ticks travelled, so cross-run PEAK comparisons are soft. The
+> plateau is not - it is a fixed point, held for 1,000+ ticks, not a transient.
+>
+> **One reporter defect from the section above is fixed**: selftest.cpp no
+> longer decodes the refusing SLOT through `SlotToWorldChunk` at report time.
+> The record carries the world chunk resolved at fault time instead.
+
 ---
 
 ## P2-D. The snapshot-staleness stall under a deep GPU queue — LANDED 2026-09-03
