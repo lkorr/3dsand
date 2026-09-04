@@ -91,6 +91,33 @@ fn markDirty(c : vec3<i32>) {
 
 // Can a mover of (klass, density) enter the cell holding word tw?
 // rising=true for gases (they seek lower density above), false for falling.
+// Is this cell a component of ONE — no solid and no powder on any of its six
+// faces? See the long note at the call site for why this is the whole island
+// test for the degenerate case, and why six distance-1 reads are inside the
+// colour lattice's guarantee when a longer walk would not be.
+//
+// PROBES DOWNWARD FIRST, and that ordering is the cost argument rather than a
+// style choice: this runs for every awake solid cell, and essentially every
+// solid cell in a terrain chunk has ground directly beneath it, so the common
+// case exits after ONE extra load instead of six.
+fn soloSolid(c : vec3<i32>) -> bool {
+  // below, the four laterals, then above: cheapest rejection first
+  var off = array<vec3<i32>, 6>(
+      vec3<i32>(0, -1, 0), vec3<i32>(1, 0, 0), vec3<i32>(-1, 0, 0),
+      vec3<i32>(0, 0, 1), vec3<i32>(0, 0, -1), vec3<i32>(0, 1, 0));
+  for (var i = 0u; i < 6u; i = i + 1u) {
+    let n = c + off[i];
+    // Cannot see past the residency window, so assume attached: the same
+    // direction island detection takes when a chunk is unfetched.
+    if (!inBounds(n)) { return false; }
+    let nm = voxMat(voxWordAt(n));
+    if (nm == MAT_AIR) { continue; }
+    let k = materials[nm].klass;
+    if (k == CLASS_SOLID || k == CLASS_POWDER) { return false; }
+  }
+  return true;
+}
+
 fn canDisplace(myDensity : i32, rising : bool, tw : u32) -> bool {
   let tmat = voxMat(tw);
   var td : i32;
@@ -1540,6 +1567,48 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
   if (voxStamp(w) == stampFor(T.tick, P.substep)) { return; }  // already acted this substep
 
   let m = materials[mat];
+
+  // ---- A SOLID WITH NOTHING TOUCHING IT IS A ONE-VOXEL ISLAND -------------
+  //
+  // A CLASS_SOLID voxel never moves in the CA, so island detection is the only
+  // thing that can make solid matter fall — and island detection is a CPU
+  // machine: a GPU support-loss flag, a per-chunk cooldown, an async readback,
+  // a queue drained a few entries a tick, a bounded region scan, a connectivity
+  // flood, an anchor test. Every one of those is the right tool for deciding
+  // whether a LEDGE is still attached to a cliff. All of it is absurd for a
+  // single voxel, and measurably it does not arrive: burning one tree in the
+  // `tree-fell` gate left 38 lone voxels hanging with every leak counter at
+  // zero, `eventQueueFullSpilled` at 1113 and the sub-8 rubble handoff reached
+  // 401 times against 11105 small components anchored at a scan-box boundary.
+  // A firehose into a straw.
+  //
+  // But "is this a one-voxel island" needs no connectivity analysis at all. A
+  // solid with no solid or powder among its six faces IS a component of one, by
+  // definition, decided from information the cell already has in hand. So it
+  // falls, here, like the powder it has become — no flag, no queue, no scan,
+  // and nothing to congest. The expensive machine keeps the job it is good at.
+  //
+  // WITHIN THE LATTICE'S READ BOUND, which is the constraint that decides
+  // whether this is legal at all. The 3x3x3 colour lattice keeps acting cells
+  // >=3 apart and bounds WRITES to <=1 cell — it promises nothing about reads,
+  // and a `seesSky` that walked 48 cells up once broke determinism at tick 1
+  // for exactly that reason. This reads six cells at distance 1: an acting cell
+  // may write at distance <=1 from itself, so a cell one step from me can only
+  // be written by an acting cell within two steps of me, and I am the only one
+  // there. No race, whatever the schedule.
+  //
+  // AN UNSEEN NEIGHBOUR COUNTS AS ATTACHED, the same conservative direction
+  // RunIslandDetection's `solidOutside` takes at the residency edge: refuse to
+  // move matter on a guess.
+  if (m.klass == CLASS_SOLID && soloSolid(c)) {
+    // Straight down, and only down. Displacement rules still apply, so a chip
+    // resting on lava it cannot sink into simply stays — which is support, and
+    // reads as such. Failure does NOT markDirty: nothing here may keep a chunk
+    // awake forever (CLAUDE.md rule 2), and any change around it re-dirties the
+    // chunk through the ordinary paths.
+    if (tryMove(c, c + vec3<i32>(0, -1, 0), w, m.density, false)) { return; }
+  }
+
   // Provably inert cell: no reaction bucket, no staining, and a SOLID class, so
   // every branch below is skipped and nothing is written. Structurally a no-op
   // — the three tests it folds are each still there underneath — but it is the

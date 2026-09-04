@@ -439,6 +439,58 @@ commits of 2026-09-02 (`99887db` onward), which are the only recent changes to
 what `shadowCached` disagrees with; not chased here. Whoever fixes it: run it
 alone, confirm it passes, and flip the entry back in the same commit.
 
+## `mob-burn` — falling embers carry fire down (2026-09-04)
+
+Marked `"fail"` by a change the owner asked for, not by a defect.
+
+Isolated solids now fall in the CA (`soloSolid`, `assets/shaders/sim_step.wgsl`)
+so that lone voxels stop hanging in the air after a tree burns. **Ember is a
+solid**, so a lone ember now drops and carries fire downward — the same
+downward-fire path the rejected `spark` material would have added on 2026-09-03.
+The owner was asked directly whether hot materials should be excluded from the
+rule and chose to keep them falling.
+
+Two subchecks measure it head-on:
+
+- **heat across a joint** isolates cross-limb conduction by setting
+  `crossLimbPct` to 0. The thigh now takes **94/558** voxels at that setting
+  against **0/558** before: heat is arriving by falling onto the limb rather
+  than through the joint, so the check's isolation no longer holds.
+- **cloth vs flesh** wants cloth to burn faster than skin, and now sees skin
+  **96%** consumed against **45%**.
+
+ATTRIBUTED, not assumed. The same binary with the rule disabled passes both
+(thigh 0/558, skin 45%), measured at gate scope on both arms — the control arm
+is a one-line WGSL edit, so this needed no rebuild and no second binary.
+
+Fixing it properly means teaching the gate to isolate cross-limb heat from
+AMBIENT heat, which changes what it measures and belongs to the owner of the
+burn gates. Do NOT fix it by excluding hot materials from `soloSolid`: that
+decision has already been made the other way.
+
+## `streaming` — the glass ball comes back empty, at suite scope only (2026-09-04)
+
+Marked `"fail"` on branch `floaters-p0-p3` with the cause NOT understood.
+
+Detail line: `ball chunk evicted=1, 0 glass voxels after re-entry`. The gate
+streams a radius-3 glass ball out of the window and back and expects it to
+return; at suite scope it returns empty.
+
+Attributed at the same scope on both arms before recording, because the island
+and floater work landed beside it is the obvious suspect and is NOT the cause:
+
+- The full suite with the isolated-solid CA rule disabled (a copy of the asset
+  tree with `soloSolid` off via `SANDVOX_ASSET_DIR`) fails identically.
+- The ball is a solid sphere resting on the ground; `soloSolid` requires a
+  voxel with NO solid neighbour and cannot touch it.
+- `--verify streaming,...` PASSES with the rule on and with it off (76 glass
+  voxels after re-entry), so this is a shared-`World` ordering dependency
+  (CLAUDE.md rule 7) or the `streaming-smooth` merge interacting with other
+  sessions' uncommitted files on this tree.
+
+Needs the streaming owner. Do not flip it back without running it inside the
+full suite.
+
 ## Updating
 
 After fixing a gate, run it alone, confirm it passes, and flip its entry to

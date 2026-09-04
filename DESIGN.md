@@ -2168,9 +2168,35 @@ neighbors, so this needs an explicit connectivity pass:
   a face, so felling one produced no body at all, while its dithered crown rim
   became sub-8 "islands" that were deleted. Unknown/unfetched cells and the
   residency edge read as solid, so the conservative direction is unchanged.
-- **Nothing is left hanging by the handoff (2026-09-03).** A `CLASS_SOLID`
-  voxel never moves in the CA (`sim_step` returns early for it), so island
-  detection is the *only* mechanism that makes solid matter fall and there is
+- **A solid with nothing touching it falls in the CA (2026-09-04).** The one
+  exception to the rule below, and the reason it is an exception is that it
+  needs no connectivity analysis: a `CLASS_SOLID` voxel with no solid and no
+  powder on any of its six faces **is** a component of one, decided from
+  information the cell already holds. `sim_step.wgsl` drops it like a powder —
+  no support flag, no cooldown, no readback, no queue, no region scan. Island
+  detection keeps the job it is actually good at (is this *ledge* still attached
+  to that cliff) and stops being asked to arrive somewhere for a single voxel,
+  which measurably it did not: burning one tree in the `tree-fell` fixture left
+  38 lone voxels hanging with every leak counter at zero, the sub-8 rubble
+  handoff reached 401 times against 11105 small components anchored at a
+  scan-box boundary, and `eventQueueFullSpilled` at 1113. Afterwards, 5.
+  Three constraints make it legal rather than merely appealing. **The lattice
+  bounds reads, not just writes**: acting cells are ≥3 apart and may write ≤1
+  cell away, so a cell one step from me can only be written by an acting cell
+  within two steps of me, and I am the only one there — this probe reads exactly
+  distance 1, where the `seesSky` walk that broke determinism at tick 1 read 48.
+  **Rule 2 survives**: the six faces are probed downward-first, so a terrain
+  cell with ground beneath it exits after one extra load, and a failed move
+  never calls `markDirty`, so nothing can hold a chunk awake (`sleep` still
+  reports 0 / 32768 active). **Things that float on liquid still float**, with
+  no new rule: `canDisplace` already refuses a denser target and every
+  water-surface plant is far lighter than water. An unseen neighbour counts as
+  attached, the same conservative direction `solidOutside` takes at the
+  residency edge. Gate: `tree-fell`.
+- **Nothing is left hanging by the handoff (2026-09-03).** Otherwise a
+  `CLASS_SOLID` voxel does not move in the CA (`sim_step` returns early for it),
+  so island detection is the *only* mechanism that makes solid matter fall for
+  anything bigger than the single-voxel case above, and there is
   no second line of defence behind it: every component this path declines to
   convert stays exactly where it is, permanently. Four paths used to decline a
   component by leaving it in the grid, and each was a permanent floater:
@@ -2229,13 +2255,62 @@ neighbors, so this needs an explicit connectivity pass:
   (the control, without which the first assertion is satisfied by a build that
   settles nothing), and a bounded sweep of the fixture box must find no
   unsupported solid component.
-- Remaining accepted flaw: the scan is still **local and conservative**, so a
-  large floating section can survive when it extends past the 80-cell region
-  (`kMaxRegionCells`), exceeds `kMaxIslandVoxels`, or touches an unfetched
-  chunk that reads as solid. That is now *measured* rather than assumed — the
-  `anchoredBy*` counters say which of the three is holding a region up — and
-  the fix for it is a slow global "connected to the floor" sweep, not a wider
-  local scan.
+- **The queue was head-of-line blocked (2026-09-04).** `PreTick` examined
+  `events_.front()` and nothing else, so a head whose chunks had not arrived did
+  nothing for 120 ticks while everything behind it aged toward its own timeout:
+  one region that streamed out took four seconds of island detection down with
+  it, measured as **312 events dropped over one burning tree**. A bounded prefix
+  of the queue is now probed and the ready ones run, with only the first couple
+  of probes allowed to request fetches (a deep probe must not flood the fetch
+  queue that the events in front of it are waiting on). A stuck event whose
+  region is still resident spills to `pendingSupport_` rather than being
+  dropped; only one that has genuinely left the window is dropped, and that is
+  not a leak because there is nothing there to float. Also `EventReady` now
+  requests the one-chunk **ring** around the region — the cells `solidOutside`
+  reads and that nothing had ever fetched, so a component touching a scan-box
+  face was anchored on a guess — but does not *wait* for it, since a stale ring
+  answers "is there rock out there" perfectly well.
+- **The flood seeds from what changed and stops at the first anchor
+  (2026-09-04).** `RunIslandDetection` used to seed from every solid cell in
+  the region, which for a 64³ box on a hillside meant labelling the whole
+  terrain slab on every scan to learn that the ground is anchored. A component
+  that does not touch the changed box (the erased cells or the flagged chunk,
+  plus one cell of slack) did not lose its support *here*, so only solids in
+  `Event::seedLo..seedHi` start a flood; and once a component is anchored — by
+  the boundary, by powder beneath, by size, or by touching a component already
+  judged anchored (the verdict is transitive, which is what makes stopping
+  sound) — the rest of its walk is bookkeeping for nothing and is skipped.
+  Unanchored components are still flooded to completion, because their cells
+  are what gets converted. Measured on one burning tree: **40.2 M → 0.59 M
+  cells visited (68×)** with identical verdicts, A/B in one binary via
+  `SANDVOX_ISLAND_FULL_FLOOD=1`. The scan budget is now in **cells**
+  (`kIslandScanCellsPerTick`), not scans, so the saving turns into scans. A
+  narrow-margin first tier that escalated on clipping was tried the same day
+  and reverted: near a tree 627 of 714 narrow scans clipped, so it doubled the
+  work and the residue rose.
+- **What the burn half of `tree-fell` measures now:** after an oak-sized tree
+  burns and is quenched, **0 floating components** at +400 ticks and the world
+  clean within 100 ticks (the sample stride) — down from 38 lone voxels and 29
+  clumps. The residue the owner reported hanging "for a minute or two" was two
+  things: matter still smouldering (a burnt crown keeps making floaters for
+  thousands of ticks), and the queue above dropping or starving the scans that
+  would have cleared them.
+- Remaining accepted flaw, and it is now a **plan rather than an admission**
+  (`docs/PLAN_rigidbody_islands.md`): the scan is still local and conservative,
+  so a large floating section survives when it extends past the 80-cell region
+  (`kMaxRegionCells`), exceeds `kMaxIslandVoxels`, or touches an unfetched chunk
+  that reads as solid. Measured rather than assumed — cut an oak-sized tree
+  through the trunk and **28,573 voxels stay standing** while the scan makes a
+  25-voxel body, and the `anchoredBy*` counters name which cap did it. For that
+  tree only the first binds (28,573 is under 32,000 and every axis is under the
+  `int8` 120), but a `great_oak` at 159 × 230 fails all three. The chosen fix is
+  a sparse chunk-tiled flood that can span 256 cells, plus **sharding an
+  oversize component into ≤96-voxel sub-bodies welded with the cone-limited
+  joints ragdolls already use** — which also makes a felled trunk flex and snap
+  instead of falling as a rigid telephone pole. A global "connected to the
+  floor" sweep is no longer the presumed answer: the single-voxel case that
+  motivated it is handled locally and for free by the rule above. Gate:
+  `tree-fell`, assertion `cut-trunk-fells-the-tree`, red on purpose.
 
 ### Rigidbodies
 - Detected islands are **removed from the grid** and become rigidbodies:
@@ -4169,9 +4244,10 @@ as solid — the residency-window rule — or the camera backs out of the world)
 Pull-in is instant and push-out is eased; easing inward would leave the camera
 inside the wall for the duration of the ease, which is the artifact players
 actually notice. In first person the body is hidden but the arms, hands and
-staff are kept. The render eye is the only consumer — brush, laser, grenade and
-physics all keep using `Player::EyePos()`, so no camera setting can move the
-world hash.
+staff are kept. The render eye is the only consumer — brush, laser, grenade,
+physics and **the audio listener** all keep using `Player::EyePos()` /
+`ViewEyePos()`, so no camera setting can move the world hash, and none can move
+where you hear from either (§12b, "The ears are on the character").
 
 ---
 
@@ -7140,6 +7216,29 @@ Two conversions happen in exactly one function (`AudioWorld::MakeParams`):
 - **Units.** The engine needs METERS, not voxels — its binaural cues use virtual
   ears offset by 0.087 *units*, which is a head radius only if a unit is a
   meter. Feeding voxels would put the listener's ears 87 cm apart.
+
+### The ears are on the character, not on the camera (2026-09-04)
+
+`ListenerPose` is published once a frame from **`Player::ViewEyePos()`** —
+the head, at ear height — with the orientation taken from `Camera`'s look
+direction. That split is deliberate and each half was once wrong:
+
+- **Position must not be the render eye.** It was, until this note. In third
+  person the render eye is an orbit boom several metres behind the body, so
+  flipping the camera key silently moved every distance, every doppler shift
+  and, worst, the occlusion ray's origin — and the boom is frequently pulled
+  into the wall behind the player, which muffled the whole world. Third person
+  now hears exactly what first person hears.
+- **Position must not be the avatar's head joint either**, tempting as "the
+  model's ears" sounds. That transform is one tick latent out of Jolt and rides
+  the gait's bob and sway; a listener parked on it turns every footstep into a
+  doppler wobble. It is the same three objections that stop the camera from
+  orbiting the head joint (§8, Camera). The player's own eye is authoritative,
+  frame-current and already step-smoothed.
+- **Orientation must be the LOOK direction, not the body heading.** In third
+  person the model faces where it *runs* (`ResolveAvatarHeading`), so ears
+  welded to the torso would swing the stereo image away from the picture every
+  time the player strafed.
 
 ### Why every asset on disk is mono
 
