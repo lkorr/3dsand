@@ -427,8 +427,17 @@ bool streamOk = false;
   // runs of this gate in the two modes agree on it or they do not, and the
   // fold is over the whole sequence rather than the final hash because a
   // divergence that heals is still a divergence.
+  //
+  // The FIRST tick is printed beside the fold for attribution, and it is what
+  // turns "the two modes disagree" into "and here is which half". Tick 1 of
+  // this loop is one CA tick after a fresh SubmitWorldgen with the window at
+  // the origin and BEFORE stream.Update has moved the player a whole chunk, so
+  // no shift has happened yet: a `t1` that already differs across modes is a
+  // worldgen/materialization difference and has nothing to do with streaming,
+  // while a matching `t1` under a differing `seq` puts it in the shift path.
   uint32_t sseq = 0x811C9DC5u;
   for (uint32_t h : shash[0]) sseq = (sseq ^ h) * 0x01000193u;
+  const uint32_t st1 = shash[0].empty() ? 0u : shash[0][0];
 
   // persistence roundtrip (live readbacks so eviction filters see reality)
   stream.OnRegen();
@@ -514,11 +523,11 @@ bool streamOk = false;
   }
 
   streamOk = sdet && evicted && glass > 0 && crossed;
-  std::printf("streaming: %s (hash sequences %s over %u shifts, seq %08x, "
-              "ball chunk evicted=%d, %u glass voxels after re-entry, "
-              "player crossed=%d, store %zu chunks)\n",
+  std::printf("streaming: %s (hash sequences %s over %u shifts, seq %08x "
+              "t1 %08x, ball chunk evicted=%d, %u glass voxels after "
+              "re-entry, player crossed=%d, store %zu chunks)\n",
               streamOk ? "PASS" : "FAIL", sdet ? "match" : "DIVERGE",
-              stream.ShiftCount(), sseq, evicted ? 1 : 0, glass,
+              stream.ShiftCount(), sseq, st1, evicted ? 1 : 0, glass,
               crossed ? 1 : 0, stream.Store().Count());
 }
 

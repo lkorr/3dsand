@@ -1038,27 +1038,41 @@ void Stream::BeginGenPlane(std::vector<uint32_t>& genSlots) {
 
   // ---- THE PLACEHOLDERS, CPU HALF ---------------------------------------
   //
-  // Under paged, a slot that is already a SENTINEL only needs its table entry
-  // changed — no page, no memory, no fill. That is most of a shift plane, and
-  // it is why this costs the pool LESS than the old "a page for all 1,024
-  // slots on the shift tick" did rather than more.
+  // Under paged a placeholder is a TABLE ENTRY and nothing else: no page, no
+  // memory, no fill, and no 16 KiB of voxel writes. Every not-yet-generated
+  // slot goes to a sentinel here, INCLUDING the ones that are currently
+  // resident, and that is the difference between R2 costing GPU time and
+  // saving it.
   //
-  // A slot that is RESIDENT keeps its page and the stub dispatch overwrites
-  // the words instead. Demoting it here would hand ~300 pages a shift to the
-  // retire queue, which kPoolPages is not sized for (world.h's kPageRetireCeiling
-  // assertion in RetirePages says so in as many words) — and it would buy
-  // nothing, because the slot's own batch allocates a page again within
-  // kGenBatches ticks.
+  // MEASURED, because the first version got this wrong. Keeping a resident
+  // slot's page and having the stub dispatch write the placeholder word into
+  // it costs ~460 chunks x 16 KiB of extra voxel traffic per shift on top of
+  // the 16 MiB the plane's own generation writes, and `worldgenList` went
+  // 4,321 -> 5,276 us/frame on --perf --scenario surface-sprint: a 22%
+  // REGRESSION on the pass the whole package exists to make cheaper.
   //
-  // Under dense there are no sentinels and every slot takes the stub's words.
+  // Freeing here is legal and is not the retire queue's business. SetSentinel
+  // -> Free returns the page to freePages_ DIRECTLY; only the hysteresis free
+  // probe parks pages in the retire queue, and kPageRetireCeiling bounds that
+  // path alone (world.h). The hazard the retire queue exists for — an
+  // in-flight eviction copy still reading the page — cannot reach these slots
+  // either: EvictSlots submitted their copies EAGERLY, before the origin moved
+  // and before this call, so those reads are already ahead of any reuse in
+  // queue order.
+  //
+  // The pool gain is the other half: a plane's pages now arrive a batch at a
+  // time and its untouched three quarters hold none at all, where the shift
+  // tick used to allocate all 1,024 at once.
+  //
+  // Under dense there are no sentinels, so the stub writes the words instead —
+  // the kernel decides that per slot from the page-table entry, which is what
+  // keeps the two modes writing the same voxels from one rule.
   if (paged) {
-    for (size_t i = first; i < n; i++) {
-      const uint32_t gs = ps.genSlots[i];
-      if (world_->PageOffsetOfSlot(gs) != World::kNoPage) continue;
+    for (size_t i = first; i < n; i++)
       world_->pages->SetSentinel(
-          gs, ps.sentMat[i] == 0 ? kPtEmpty
-                                 : (kPtSentinelBit | (uint32_t)ps.sentMat[i]));
-    }
+          ps.genSlots[i],
+          ps.sentMat[i] == 0 ? kPtEmpty
+                             : (kPtSentinelBit | (uint32_t)ps.sentMat[i]));
     world_->pages->FlushTableWrites(ctx_->queue);
   }
 
