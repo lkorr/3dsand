@@ -8,6 +8,7 @@
 #include "gpu/vk_record.h"
 
 #include <cstdio>
+#include <cstdlib>  // std::abort -- the null-handle guard in RecordTable
 
 #include "sim/world.h"  // kExplosionWg, kNumChunks (pass::kPassStride is in pass_table.h)
 
@@ -508,6 +509,24 @@ void Recorder::RecordTable(pass::Table which, const RecordCtx& cx) {
         break;
     }
     if (layout == VK_NULL_HANDLE || setCount == 0) continue;
+
+    // RECORD AT THE POINT OF FAILURE. A null pipeline or descriptor set handed
+    // to the driver here is an access violation four frames down inside the
+    // ICD, attributed to whatever gate happened to submit first — which is how
+    // the world-map binding (2026-09-04) cost three runs to name a row. Say
+    // which row and which handle, and stop.
+    if (pipe == VK_NULL_HANDLE || sets[0] == VK_NULL_HANDLE ||
+        (setCount > 1 && sets[1] == VK_NULL_HANDLE)) {
+      std::fprintf(stderr,
+                   "FATAL: pass row '%s' would bind a null handle: pipeline=%p "
+                   "set0=%p set1=%p (setCount %u, groups %d). A null pipeline is "
+                   "a failed MakeComputePipeline; a null set is a failed "
+                   "CreateBindGroup.\n",
+                   r.name, (void*)pipe, (void*)sets[0], (void*)sets[1], setCount,
+                   (int)r.groups);
+      std::fflush(stderr);
+      std::abort();
+    }
 
     f.CmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
 

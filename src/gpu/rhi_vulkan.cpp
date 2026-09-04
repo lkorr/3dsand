@@ -316,16 +316,29 @@ bool Backend::Init(bool lowPower, bool validation, bool syncValidation,
     return false;
   }
 
-  // Descriptor pool sized for the engine's ~25 pipelines across a handful of
-  // bind groups, with headroom. Phase 3c can size this from the pass table.
+  // Descriptor pool. THIS IS A BUDGET THAT IS NEVER REFILLED: sets are
+  // allocated by CreateDescriptorSet and never freed (no FREE_DESCRIPTOR_SET
+  // bit, no reset), so every bind-group rebuild over a process lifetime --
+  // and a full --selftest rebuilds the sim groups many times as gates
+  // re-create the world -- draws it down. It used to be 512 storage
+  // descriptors / 128 sets, "with headroom", and the allocation failure
+  // below returned VK_NULL_HANDLE instead of saying so, which would have
+  // surfaced as an access violation inside the driver at the first bind,
+  // gates away from the cause. Found while chasing exactly such a crash on
+  // 2026-09-04 (adding the worldMap binding, 31); that crash turned out to be
+  // a stale cross-worktree sccache object with the OLD pass::Buf layout, NOT
+  // this pool -- but the budget was one binding-per-set from the same
+  // symptom, so it is sized generously now (descriptors are bytes) and the
+  // failure path aborts with a count. Phase 3c can still size this from the
+  // pass table, but it must keep the abort.
   VkDescriptorPoolSize sizes[] = {
-      {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 512},
-      {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 128},
-      {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 64},
-      {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, 64},
+      {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4096},
+      {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 512},
+      {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 256},
+      {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, 256},
   };
   VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-  dpi.maxSets = 128;
+  dpi.maxSets = 512;
   dpi.poolSizeCount = (uint32_t)std::size(sizes);
   dpi.pPoolSizes = sizes;
   r = dfn_.CreateDescriptorPool(device_, &dpi, nullptr, &descPool_);
@@ -1941,14 +1954,43 @@ VkDescriptorSet Backend::CreateDescriptorSet(VkDescriptorSetLayout layout,
   ai.descriptorSetCount = 1;
   ai.pSetLayouts = &layout;
   VkDescriptorSet set = VK_NULL_HANDLE;
-  if (dfn_.AllocateDescriptorSets(device_, &ai, &set) != VK_SUCCESS)
-    return VK_NULL_HANDLE;
+  // Record at the point of FAILURE, not four frames later. A null set handed
+  // back here is bound by the recorder without a check and faults inside the
+  // driver at vkCmdBindDescriptorSets, which is how a pool budget (see the
+  // pool's creation) read as a NULL-pointer crash in a gate that had nothing
+  // to do with it. The pool is never refilled, so this is a hard ceiling on
+  // sets-per-process; say so, with the count, and stop.
+  static uint32_t setsAllocated = 0;
+  VkResult ar = dfn_.AllocateDescriptorSets(device_, &ai, &set);
+  if (ar != VK_SUCCESS) {
+    std::fprintf(stderr,
+                 "FATAL: vkAllocateDescriptorSets failed (%s) after %u sets: the "
+                 "descriptor pool (rhi_vulkan.cpp, never refilled) is exhausted. "
+                 "Raise its sizes or stop rebuilding bind groups.\n",
+                 vkl::ResultName(ar), setsAllocated);
+    std::fflush(stderr);
+    std::abort();
+  }
+  setsAllocated++;
 
   std::vector<VkDescriptorBufferInfo> infos(count);
   std::vector<VkWriteDescriptorSet> writes(count);
   for (size_t i = 0; i < count; i++) {
     Buffer* b = i < buffers.size() ? buffers[i] : nullptr;
-    infos[i].buffer = b ? b->buf : VK_NULL_HANDLE;
+    // A descriptor written with VK_NULL_HANDLE is not an error here and not an
+    // error at bind time; it is an access violation inside the driver at the
+    // first dispatch that touches the set, attributed to whatever pass ran.
+    // Refuse it where it happens, naming the binding.
+    if (!b || b->buf == VK_NULL_HANDLE) {
+      std::fprintf(stderr,
+                   "FATAL: CreateDescriptorSet: binding %u of a %zu-entry set has "
+                   "a null buffer (rhi::Buffer %s). The buffer was never created "
+                   "or its creation failed silently.\n",
+                   entries[i].binding, count, b ? "present, VkBuffer null" : "absent");
+      std::fflush(stderr);
+      std::abort();
+    }
+    infos[i].buffer = b->buf;
     infos[i].offset = entries[i].offset;
     // SIZE 0 MEANS "the rest of the buffer from offset" — a wgpu semantic the
     // seam preserves, and the reason Buffer caches its size at all. Vulkan

@@ -8,6 +8,7 @@
 #include "sim/microvox.h"
 #include "sim/pass_table.h"
 #include "sim/treeatlas.h"
+#include "sim/worldmap.h"
 #include "sim/world.h"
 
 // Owns the compute pipelines + bind groups and records the fixed-tick GPU
@@ -340,6 +341,13 @@ class Simulation {
   // like a change to the material table's SIZE.
   rhi::Buffer treeAtlasBuf_;
   size_t treeAtlasWords_ = 0;
+  // The authored world map (src/sim/worldmap.h): load-time asset data, bound
+  // read-only into simBGL_ and simSlimBGL_ at binding 31, on the same terms as
+  // the tree atlas above. P0 binds it header-sized and empty -- there is no
+  // loader and no reader yet, which is what keeps this commit's world hash
+  // identical to its parent's.
+  rhi::Buffer worldMapBuf_;
+  size_t worldMapWords_ = 0;
   // Art palette RGB (0x00RRGGBB), indexed from kArtPaletteBaseGpu. Cached so a
   // materials hot-reload can restore it — see SetArtPalette.
   std::vector<uint32_t> artPalette_;

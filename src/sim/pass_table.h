@@ -114,6 +114,13 @@ enum class Buf : uint8_t {
   // read that the table does not know about is the failure mode this file
   // exists to make impossible.
   TreeAtlas,
+  // The authored world map (src/sim/worldmap.h, docs/PLAN_world_map.md).
+  // Identical standing to TreeAtlas above: read-only, dispatch-invariant asset
+  // data uploaded once at load, sampled by worldgen per column. It never
+  // appears on a write side, so it generates no barriers; it is on the table
+  // because a read the table does not know about is exactly the failure mode
+  // this file exists to make impossible.
+  WorldMap,
   // ---- the voxel-keyed shadow cache (world.h kShadowCacheBuckets) ----
   // RENDER-side buffers, on the table for the same reason TreeAtlas is: a
   // hazard the table does not know about generates no barrier. The resolve
