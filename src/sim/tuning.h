@@ -2056,6 +2056,34 @@ struct Tuning {
     // fire should cross a joint, not race across it. Read by the burn pass
     // every tick, no rebuild; F5 hot-reloads it.
     int crossLimbPct = 25;
+    // HOW MUCH OF A FIRE THE DRIFTING FLAME CARRIES. `fire` is the gas that
+    // rises off every burning voxel and floats through the air; it carries
+    // tag:hot like the coals do, so before neighborChance existed a flame that
+    // brushed a tree lit it at the same rate as a bed of embers pressed
+    // against it, and a campfire set light to everything downwind.
+    // reactions.json authors the exception per ignition rule
+    // (`"neighborChance": { "fire": 0.0625 }`, a sixteenth) because WHICH
+    // rules get it is a content decision -- the skin sear deliberately does
+    // not, so a lick of flame still cooks a surface at full rate. This knob is
+    // the global scale over every one of those authored exceptions, the same
+    // relationship spreadPct has to the ignition chances themselves: the JSON
+    // owns the per-rule ratios, the knob owns the strength.
+    //
+    // 100 = as authored, so a drifting flame ignites at a sixteenth (6.25%) of
+    // a stationary source's rate. 200 = an eighth, 50 = a thirty-second, 0 =
+    // the flame cannot ignite anything at all and only the coals spread fire.
+    //
+    // Applied to a neighbour that is a HOT GAS rather than to the name
+    // "fire" -- that is what the exception is actually about, and it means a
+    // second hot gas is covered by construction instead of by remembering to
+    // add it here. An exception naming a hot SOLID or LIQUID (a future
+    // "lava ignites this faster" rule) is untouched: that is not a drifting
+    // flame and this knob has no business scaling it.
+    //
+    // MOVES THE WORLD HASH, like its two neighbours: the compiled chance of
+    // every fire-exception rule changes. The `weak-flame` gate reads this and
+    // scales its expected ratio with it, so moving the knob does not fail it.
+    int flamePct = 100;
   } combustion;
 
   // ---- wind: the ambient field (docs/RESEARCH_wind.md, DESIGN.md §12) ----
