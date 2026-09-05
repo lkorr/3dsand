@@ -1722,8 +1722,9 @@ std::vector<PipelineExecutable> Backend::CollectPipelineStats() const {
 }
 
 // ---------------------------------------------------------------------------
-// Phase 4b D3: the swapchain. FIFO to match Dawn's present mode; per-image
-// render-done semaphores; a fence-paced ring of acquire semaphores.
+// Phase 4b D3: the swapchain. Present mode from SetPresentMode (mailbox by
+// default since 2026-09-05, FIFO fallback); per-image render-done semaphores;
+// a fence-paced ring of acquire semaphores.
 // ---------------------------------------------------------------------------
 
 PFN_vkVoidFunction Backend::InstanceProc(const char* name) const {
@@ -1792,7 +1793,34 @@ bool Backend::ConfigureSwapchain(VkSurfaceKHR surface, uint32_t w, uint32_t h,
     return true;
   }
 
+  // Present mode: what was asked for if the surface offers it, else FIFO
+  // (the one mode every surface must support). Asked for and got are both
+  // recorded so the caller can print the truth.
+  VkPresentModeKHR wantMode = VK_PRESENT_MODE_FIFO_KHR;
+  switch (presentMode_) {
+    case rhi::PresentMode::Mailbox: wantMode = VK_PRESENT_MODE_MAILBOX_KHR; break;
+    case rhi::PresentMode::Immediate: wantMode = VK_PRESENT_MODE_IMMEDIATE_KHR; break;
+    default: break;
+  }
+  VkPresentModeKHR mode = VK_PRESENT_MODE_FIFO_KHR;
+  if (wantMode != VK_PRESENT_MODE_FIFO_KHR && ifn_.GetPhysicalDeviceSurfacePresentModesKHR) {
+    uint32_t pmCount = 0;
+    ifn_.GetPhysicalDeviceSurfacePresentModesKHR(phys_, surface_, &pmCount, nullptr);
+    std::vector<VkPresentModeKHR> pms(pmCount);
+    if (pmCount)
+      ifn_.GetPhysicalDeviceSurfacePresentModesKHR(phys_, surface_, &pmCount, pms.data());
+    for (VkPresentModeKHR pm : pms)
+      if (pm == wantMode) mode = wantMode;
+  }
+  activePresentMode_ = mode == VK_PRESENT_MODE_MAILBOX_KHR     ? rhi::PresentMode::Mailbox
+                       : mode == VK_PRESENT_MODE_IMMEDIATE_KHR ? rhi::PresentMode::Immediate
+                                                               : rhi::PresentMode::Fifo;
+
   uint32_t imageCount = caps.minImageCount + 1;
+  // Mailbox needs a spare image to swap the newest frame into while one is
+  // being scanned out and one is being rendered; two would degrade to FIFO
+  // pacing in practice.
+  if (mode == VK_PRESENT_MODE_MAILBOX_KHR && imageCount < 3) imageCount = 3;
   if (caps.maxImageCount && imageCount > caps.maxImageCount)
     imageCount = caps.maxImageCount;
 
@@ -1820,13 +1848,18 @@ bool Backend::ConfigureSwapchain(VkSurfaceKHR surface, uint32_t w, uint32_t h,
   sci.imageColorSpace = chosen.colorSpace;
   sci.imageExtent = extent;
   sci.imageArrayLayers = 1;
+  // TRANSFER_DST as well as COLOR_ATTACHMENT when the surface allows it: the
+  // internal-resolution frame (render.renderScale) reaches the swapchain by
+  // a blit, not a draw. Every desktop surface offers it; a surface that does
+  // not simply cannot be blitted into, and the frame loop's scale path checks
+  // SwapchainBlittable before trying.
   sci.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+  swapBlittable_ = (caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_DST_BIT) != 0;
+  if (swapBlittable_) sci.imageUsage |= VK_IMAGE_USAGE_TRANSFER_DST_BIT;
   sci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
   sci.preTransform = caps.currentTransform;
   sci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
-  // FIFO: always available, and it is Dawn's PresentMode::Fifo — the vsync
-  // pacing the game already has.
-  sci.presentMode = VK_PRESENT_MODE_FIFO_KHR;
+  sci.presentMode = mode;
   sci.clipped = VK_TRUE;
 
   VkResult r = dfn_.CreateSwapchainKHR(device_, &sci, nullptr, &swapchain_);

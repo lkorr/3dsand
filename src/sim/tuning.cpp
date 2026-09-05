@@ -2111,6 +2111,9 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadF(*g, "farShadowReach", r.farShadowReach, out, at);
     ReadI(*g, "farBlockerHitLevel", r.farBlockerHitLevel, out, at);
     ReadF(*g, "lodHandoffDist", r.lodHandoffDist, out, at);
+    ReadF(*g, "renderScale", r.renderScale, out, at);
+    ReadI(*g, "presentMode", r.presentMode, out, at);
+    ReadF(*g, "fpsCap", r.fpsCap, out, at);
     ReadF(*g, "shadowMaxDist", r.shadowMaxDist, out, at);
     ReadF(*g, "shadowCoarseDist", r.shadowCoarseDist, out, at);
     ReadF(*g, "opennessReach", r.opennessReach, out, at);
@@ -2241,6 +2244,13 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     // deliberately no ceiling — >= 25.6 m disables the handoff, which is the
     // documented way to A/B it.
     if (r.lodHandoffDist < 2.0f) { r.lodHandoffDist = 2.0f; }
+    // A scale above 1 would be supersampling the most expensive shader in the
+    // engine; below a quarter the frame is 400x225 and the UI text on top is
+    // larger than the terrain. Present mode is an enum; fpsCap 0 = off.
+    if (r.renderScale > 1.0f) { r.renderScale = 1.0f; }
+    if (r.renderScale < 0.25f) { r.renderScale = 0.25f; }
+    if (r.presentMode < 0 || r.presentMode > 2) { r.presentMode = 1; }
+    if (r.fpsCap < 0.0f) { r.fpsCap = 0.0f; }
     // 0 is meaningful here (all shadows go through the cascade), so only
     // negatives are refused.
     if (r.shadowMaxDist < 0.0f) { r.shadowMaxDist = 0.0f; }

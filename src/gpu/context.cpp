@@ -102,6 +102,7 @@ bool GpuContext::Init(GLFWwindow* window, uint32_t w, uint32_t h,
       return false;
     }
     surfaceFormat = back_->vk->SwapchainFormat();
+    presentMode = back_->vk->ActivePresentMode();
   } else {
     surfaceFormat = rhi::TextureFormat::RGBA8Unorm;  // headless offscreen
   }
@@ -119,6 +120,36 @@ void GpuContext::Resize(uint32_t w, uint32_t h) {
   std::string err;
   if (!back_->vk->ConfigureSwapchain(VK_NULL_HANDLE, w, h, err))
     std::fprintf(stderr, "swapchain resize failed: %s\n", err.c_str());
+  presentMode = back_->vk->ActivePresentMode();
+}
+
+static const char* PresentModeName(rhi::PresentMode m) {
+  switch (m) {
+    case rhi::PresentMode::Mailbox: return "mailbox";
+    case rhi::PresentMode::Immediate: return "immediate";
+    default: return "fifo";
+  }
+}
+
+void GpuContext::SetPresentMode(rhi::PresentMode mode) {
+  if (!back_ || !back_->vk) return;
+  if (back_->vk->RequestedPresentMode() == mode) return;
+  back_->vk->SetPresentMode(mode);
+  // Headless (no surface yet) or before Init: the request is remembered and
+  // the first ConfigureSwapchain honours it.
+  if (back_->vk->SwapchainImageCount() == 0 || width == 0 || height == 0) return;
+  std::string err;
+  if (!back_->vk->ConfigureSwapchain(VK_NULL_HANDLE, width, height, err)) {
+    std::fprintf(stderr, "swapchain present-mode change failed: %s\n", err.c_str());
+    return;
+  }
+  presentMode = back_->vk->ActivePresentMode();
+  std::printf("present mode: %s%s\n", PresentModeName(presentMode),
+              presentMode != mode ? " (requested mode not offered by the surface)" : "");
+}
+
+bool GpuContext::SwapchainBlittable() const {
+  return back_ && back_->vk && back_->vk->SwapchainBlittable();
 }
 
 rhi::TextureView GpuContext::AcquireFrame() {

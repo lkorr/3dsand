@@ -4,6 +4,8 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
+#include <thread>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -2707,6 +2709,9 @@ int main(int argc, char** argv) {
   // only live differential oracle — if paged ever misbehaves, the first
   // diagnostic step is the same scenario under dense.
   bool residencyPaged = true;  // --residency paged|dense
+  // --present fifo|mailbox|immediate pins the swapchain present mode for the
+  // run; -1 = follow render.presentMode in tuning.json (F5-live).
+  int presentOverride = -1;
   bool vkInfo = false;   // --vk-info: Vulkan backend smoke test (headless)
   bool vkSmoke = false;  // --vk-smoke: cross-backend world-hash comparison (headless)
   // --vk-smoke-loud: phase 3c's determinism acceptance evidence — the same
@@ -2949,6 +2954,15 @@ int main(int argc, char** argv) {
       if (v == "paged") residencyPaged = true;
       else if (v == "dense") residencyPaged = false;
       else { std::fprintf(stderr, "--residency wants paged|dense, got '%s'\n",
+                          v.c_str()); return 1; }
+    }
+    else if (a == "--present") {
+      if (i + 1 >= argc) { std::fprintf(stderr, "--present requires fifo|mailbox|immediate\n"); return 1; }
+      const std::string v = argv[++i];
+      if (v == "fifo") presentOverride = 0;
+      else if (v == "mailbox") presentOverride = 1;
+      else if (v == "immediate") presentOverride = 2;
+      else { std::fprintf(stderr, "--present wants fifo|mailbox|immediate, got '%s'\n",
                           v.c_str()); return 1; }
     }
     else if (a == "--shot-mob") {
@@ -3879,6 +3893,19 @@ int main(int argc, char** argv) {
       "avatarPortrait");
   rhi::TextureView portraitView = portraitTexture.CreateView();
   ui.portraitTex = overlay.RegisterTexture(portraitView);
+  // ---- internal render scale (render.renderScale) --------------------------
+  // The world's offscreen colour target when the scale is below 1, cached on
+  // its size like the depth targets; the blit up to the swapchain and the
+  // native-size UI pass are in the render section. At scale 1 none of this
+  // exists and the frame renders into the swapchain exactly as before.
+  rhi::Texture scaledTex;
+  rhi::TextureView scaledView;
+  uint32_t scaledW = 0, scaledH = 0;
+  // Present mode last requested from the context; -1 forces the first frame
+  // to apply whatever tuning / --present says.
+  int presentApplied = -1;
+  // fpsCap: the deadline the previous frame ended on.
+  double fpsCapLast = 0.0;
   ui.portraitW = (int)kPortraitW;
   ui.portraitH = (int)kPortraitH;
   // A FIXED "studio" sun, independent of the world clock. --shot-mob's own
@@ -4494,6 +4521,17 @@ int main(int argc, char** argv) {
     glfwGetFramebufferSize(window, &fbw, &fbh);
     if (fbw > 0 && fbh > 0 && ((uint32_t)fbw != ctx.width || (uint32_t)fbh != ctx.height))
       ctx.Resize(fbw, fbh);
+    // Present mode, applied only when the setting CHANGES (a swapchain
+    // recreate drains the queue). Same spot as the resize because it is the
+    // same operation, and no image is acquired here.
+    {
+      const int want = presentOverride >= 0 ? presentOverride
+                                            : CurrentTuning().render.presentMode;
+      if (want != presentApplied) {
+        ctx.SetPresentMode((rhi::PresentMode)want);
+        presentApplied = want;
+      }
+    }
 
     // ---- lab tuning watcher (plan §4.3) ----
     // Poll tuning.json's mtime at ~4 Hz and run the existing F5 path on any
@@ -7497,10 +7535,24 @@ int main(int argc, char** argv) {
       // the main camera; the portrait pass writes its own params, submits, and
       // then calls this again to put the world's camera back in front of the
       // main pass. One definition, so the two cannot drift.
+      // The world's render size this frame. `scaled` is the whole switch: at
+      // 1.0 (or on a surface that cannot be blitted into) the frame renders
+      // straight into the swapchain and nothing below changes.
+      const float renderScale = CurrentTuning().render.renderScale;
+      const bool scaled = renderScale < 0.999f && ctx.SwapchainBlittable();
+      const uint32_t renderW =
+          scaled ? std::max(1u, (uint32_t)std::lround(ctx.width * renderScale))
+                 : ctx.width;
+      const uint32_t renderH =
+          scaled ? std::max(1u, (uint32_t)std::lround(ctx.height * renderScale))
+                 : ctx.height;
+      // viewPx is the RENDER height: every footprint / cone-width term in the
+      // raymarch is derived from it, so a scaled frame tells the shader its
+      // real pixel size rather than the window's.
       auto writeMainRenderParams = [&] {
         WriteRenderParams(ctx.queue, world, eye, cam,
                           (float)ctx.width / (float)ctx.height, ui.shadows,
-                          (float)now, fogSmooth, (float)ctx.height, tick,
+                          (float)now, fogSmooth, (float)renderH, tick,
                           fluidCount,
                           (float)(accumulator / kTickDt),
                           ui.showDirtyVoxels ? 2u : 0u);
@@ -8803,8 +8855,20 @@ int main(int argc, char** argv) {
         if (sp.on) enc.WriteTimestamp(liveRenderTimer.NativeQuerySet(), sp.e, true);
       };
       sim.EncodeShadowResolve(enc);
-      rhi::RenderPass rp = sim.BeginRenderPass(enc, target, ctx.surfaceFormat,
-                                                       ctx.width, ctx.height);
+      if (scaled && (!scaledView || scaledW != renderW || scaledH != renderH)) {
+        scaledW = renderW;
+        scaledH = renderH;
+        scaledTex = ctx.device.CreateTexture(
+            {renderW, renderH, 1}, ctx.surfaceFormat,
+            rhi::TextureUsage::RenderAttachment | rhi::TextureUsage::CopySrc,
+            "worldScaled");
+        scaledView = scaledTex.CreateView();
+        std::printf("render scale %.2f: world at %ux%u, window %ux%u\n",
+                    renderScale, renderW, renderH, ctx.width, ctx.height);
+      }
+      rhi::RenderPass rp =
+          sim.BeginRenderPass(enc, scaled ? scaledView : target, ctx.surfaceFormat,
+                              renderW, renderH);
       {
         const LiveSpan sp = spanBegin("rm_world");
         sim.DrawWorld(rp);
@@ -8850,6 +8914,15 @@ int main(int argc, char** argv) {
                                      ? CurrentDebugArrowCount()
                                      : 0u);
         spanEnd(sp);
+      }
+      if (scaled) {
+        // The world is done at internal resolution: blit it up (NEAREST — the
+        // voxels stay square) and open a native-size pass for the UI so text
+        // and panels are never scaled.
+        rp.End();
+        enc.BlitTexture(scaledView, target);
+        rp = sim.BeginOverlayRenderPass(enc, target, ctx.surfaceFormat, ctx.width,
+                                        ctx.height);
       }
       {
         const LiveSpan sp = spanBegin("rm_overlay");
@@ -8962,6 +9035,30 @@ int main(int argc, char** argv) {
     // encode + present", and the scope split above must not silently redefine
     // it into encode-only.
     if (g_harnessFrames > 0) g_harnessRenderMs += (NowSeconds() - tAcquire0) * 1000.0;
+    // ---- fps cap (render.fpsCap) ----
+    // A sleep to the next deadline, billed to `present`: it is a wait, not
+    // work, exactly like the vsync block. Deadlines advance by the period, not
+    // by "now + period", so the cap does not drift under jitter; a frame that
+    // arrives more than a period late resets rather than trying to catch up.
+    {
+      const float cap = CurrentTuning().render.fpsCap;
+      if (cap > 0.0f) {
+        const double period = 1.0 / (double)cap;
+        const double t0 = NowSeconds();
+        double deadline = fpsCapLast + period;
+        if (deadline < t0 - period) deadline = t0;
+        if (deadline > t0) {
+          const double coarse = deadline - t0 - 0.0015;
+          if (coarse > 0.0)
+            std::this_thread::sleep_for(std::chrono::duration<double>(coarse));
+          while (NowSeconds() < deadline) std::this_thread::yield();
+        }
+        fpsCapLast = deadline;
+        sandvox::PerfScopeAdd(sandvox::PerfScope::Present, t0, NowSeconds());
+      } else {
+        fpsCapLast = 0.0;
+      }
+    }
     {
       sandvox::PerfSpan spanRb(sandvox::PerfScope::Readback);
       ctx.ProcessEvents();  // pumps MapAsync callbacks (mirror updates)

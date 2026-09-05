@@ -267,6 +267,15 @@ struct VkrEncoder final : CommandEncoderImpl {
     rec->CopyImageToBuffer(im, NB(dst.buffer), dst.offset, dst.bytesPerRow,
                            extent.width, extent.height);
   }
+  void BlitTexture(const TextureView& src, const TextureView& dst,
+                   bool linear) override {
+    vk::Image* d = NI(dst);
+    // A blit INTO the swapchain image is a touch of it: the submit must wait
+    // the acquire semaphore and signal render-done exactly as a pass that
+    // rendered into it would.
+    if (d && d->presentable) presenting = true;
+    rec->BlitImage(NI(src), d, linear);
+  }
   void ResolveQuerySet(const QuerySet& qs, uint32_t firstQuery, uint32_t queryCount,
                        const Buffer& dst, uint64_t dstOffset) override;
   void WriteTimestamp(const QuerySet& qs, uint32_t index, bool bottom) override;

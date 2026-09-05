@@ -97,6 +97,8 @@ struct CommandEncoderImpl {
                                 uint64_t size, uint32_t pattern) = 0;
   virtual void CopyTextureToBuffer(const TexelCopyTexture& src, const TexelCopyBuffer& dst,
                                    const Extent3D& extent) = 0;
+  virtual void BlitTexture(const TextureView& src, const TextureView& dst,
+                           bool linear) = 0;
   virtual void ResolveQuerySet(const QuerySet& qs, uint32_t firstQuery, uint32_t queryCount,
                                const Buffer& dst, uint64_t dstOffset) = 0;
   virtual void WriteTimestamp(const QuerySet& qs, uint32_t index, bool bottom) = 0;

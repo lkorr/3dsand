@@ -2816,6 +2816,28 @@ struct Tuning {
     // entirely and get the old "switch only at window exit" behaviour — which
     // is exactly how to A/B it without a rebuild (F5 reloads it).
     float lodHandoffDist = 24.0f;
+    // ---- frame pacing and internal resolution (CPU-only: no .def row, no
+    // TUNE_* constant — nothing here reaches a shader) ----------------------
+    //
+    // renderScale: the WORLD is rendered at (width, height) x this, into an
+    // offscreen target, and blitted up to the swapchain with NEAREST
+    // filtering; the ImGui overlay draws at native resolution on top. The
+    // raymarch is cleanly pixel-linear (the render-budget `halfres` arm saved
+    // 70% of it), and the far cascade already renders at ~6 px per cell at
+    // 1080p, so most of what a scaled frame loses is resolution the data
+    // never had. 1.0 renders straight into the swapchain as before — the
+    // offscreen target and the blit exist only below 1. Clamped to [0.25, 1].
+    float renderScale = 1.0f;
+    // presentMode: 0 fifo (vsync, quantises a 22 ms frame to 33), 1 mailbox
+    // (newest frame at each vblank, no tearing, no quantisation), 2 immediate
+    // (tears). Applied when it CHANGES (a swapchain recreate). Use fifo or an
+    // fpsCap while recording: mailbox lets the game submit as fast as it can,
+    // which starves a capture tool of GPU time.
+    int presentMode = 1;
+    // fpsCap: frames per second the loop will not exceed, 0 = uncapped. A
+    // sleep at the end of the frame, billed to the `present` scope as a wait.
+    // The way to leave a recorder (OBS) its share of the GPU.
+    float fpsCap = 0.0f;
     // Distance in METERS past which a PRIMARY hit takes the cascade shadow
     // (farShadowed) instead of a real per-voxel sun ray (A3).
     //

@@ -211,7 +211,9 @@ class Simulation {
   void SetCaForced(bool on) { caForced_ = on; }
 
   // Render pass with the shared depth target (raymarch writes frag_depth,
-  // raster geometry depth-tests against it). Caller draws UI into same pass.
+  // raster geometry depth-tests against it). At render.renderScale 1 the
+  // caller draws the UI into this same pass; below 1 it blits the world up and
+  // draws the UI in BeginOverlayRenderPass instead.
   rhi::RenderPass BeginRenderPass(const rhi::CommandEncoder& enc,
                                           const rhi::TextureView& target,
                                           rhi::TextureFormat format,
@@ -229,6 +231,17 @@ class Simulation {
                                      const rhi::TextureView& target,
                                      rhi::TextureFormat format, uint32_t width,
                                      uint32_t height, const float clear[4]);
+  // The native-resolution pass the UI draws into when the world was rendered
+  // at render.renderScale < 1 and blitted up: colour LOADS (the blit put the
+  // world there), depth is its own cache cleared fresh. ImGui's pipeline is
+  // built against kDepthFormat, so the pass must carry a depth attachment even
+  // though nothing in it depth-tests. A THIRD depth cache, for the EnsureDepth
+  // reason: the world pass now keys its cache on the internal size, and a
+  // native-size pass sharing it would recreate both every frame.
+  rhi::RenderPass BeginOverlayRenderPass(const rhi::CommandEncoder& enc,
+                                         const rhi::TextureView& target,
+                                         rhi::TextureFormat format,
+                                         uint32_t width, uint32_t height);
   void DrawWorld(const rhi::RenderPass& pass);
   void DrawParticles(const rhi::RenderPass& pass);
   // MLS-MPM fluid prototype: instanced cubes from the fluid particle buffer.
@@ -321,6 +334,7 @@ class Simulation {
   void BuildSimBindGroups(const rhi::Device& device);
   void EnsureDepth(uint32_t width, uint32_t height);
   void EnsureAuxDepth(uint32_t width, uint32_t height);
+  void EnsureOverlayDepth(uint32_t width, uint32_t height);
   void EnsureRenderPipelines(rhi::TextureFormat format);
   // Stamp the cached art palette into a material table being (re)built.
   void ApplyArtPalette(std::vector<MaterialGpu>& table) const;
@@ -433,6 +447,11 @@ class Simulation {
   rhi::Texture auxDepthTex_;
   rhi::TextureView auxDepthView_;
   uint32_t auxDepthW_ = 0, auxDepthH_ = 0;
+  // THIRD depth target: the native-size UI pass over a scaled world frame
+  // (BeginOverlayRenderPass).
+  rhi::Texture overlayDepthTex_;
+  rhi::TextureView overlayDepthView_;
+  uint32_t overlayDepthW_ = 0, overlayDepthH_ = 0;
 
   // Two bind groups: page 0 reads dirty[0]/writes dirty[1], page 1 reversed.
   // Particle groups follow the same paging (b0 = read page, b1 = write page).

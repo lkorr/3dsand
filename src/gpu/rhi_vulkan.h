@@ -295,12 +295,21 @@ class Backend {
 
   // ---- swapchain (phase 4b D3) ----
   //
-  // FIFO present mode, matching Dawn's PresentMode::Fifo. `surface` is taken
+  // Present mode per SetPresentMode (FIFO fallback). `surface` is taken
   // on the FIRST call and owned by the backend from then on; pass
   // VK_NULL_HANDLE to recreate at a new size (resize). Recreation drains the
   // queue first.
   bool ConfigureSwapchain(VkSurfaceKHR surface, uint32_t w, uint32_t h,
                           std::string& err);
+  // The mode the NEXT ConfigureSwapchain asks for (rhi::PresentMode). Falls
+  // back to FIFO when the surface does not offer it; ActivePresentMode says
+  // what was actually created.
+  void SetPresentMode(rhi::PresentMode m) { presentMode_ = m; }
+  rhi::PresentMode RequestedPresentMode() const { return presentMode_; }
+  rhi::PresentMode ActivePresentMode() const { return activePresentMode_; }
+  // True when the swapchain images were created with TRANSFER_DST, i.e. a
+  // CommandEncoder::BlitTexture into them is legal.
+  bool SwapchainBlittable() const { return swapBlittable_; }
   // Acquire the next image. Null on OUT_OF_DATE (caller skips the frame; the
   // resize path reconfigures) or if no swapchain exists.
   Image* AcquireSwapchainImage();
@@ -610,6 +619,9 @@ class Backend {
   VkSwapchainKHR swapchain_ = VK_NULL_HANDLE;
   VkFormat swapFormat_ = VK_FORMAT_UNDEFINED;
   std::vector<std::unique_ptr<Image>> swapImages_;  // wrap swapchain VkImages
+  rhi::PresentMode presentMode_ = rhi::PresentMode::Fifo;
+  rhi::PresentMode activePresentMode_ = rhi::PresentMode::Fifo;
+  bool swapBlittable_ = false;
   std::vector<VkSemaphore> renderDone_;             // one per swapchain image
   // Acquire semaphores: a small ring paced by the fence of the submit that
   // consumed each one — a semaphore handed to vkAcquireNextImageKHR must be

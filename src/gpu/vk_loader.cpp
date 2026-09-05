@@ -163,6 +163,7 @@ void LoadDevice(const InstanceFns& i, VkDevice dev, DeviceFns& o) {
   VKL_D(CmdSetViewport);
   VKL_D(CmdSetScissor);
   VKL_D(CmdCopyImageToBuffer);
+  VKL_D(CmdBlitImage);
   VKL_D(CreateImageView);
   VKL_D(DestroyImageView);
   VKL_D(CreateGraphicsPipelines);

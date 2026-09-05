@@ -68,6 +68,16 @@ namespace rhi {
 // to be undone.
 enum class BackendKind : uint32_t { Vulkan };
 
+// Swapchain pacing. Fifo is vsync: a frame that misses the vblank waits for
+// the next one, so a 22 ms frame on a 60 Hz display SHOWS at 33 ms (30 fps)
+// while the GPU idles for a third of it. Mailbox keeps the newest finished
+// frame and presents it at the next vblank — no tearing, no quantisation, a
+// 22 ms frame shows as 45 fps. Immediate presents as soon as it is rendered and
+// tears. A mode the surface does not offer falls back to Fifo, which every
+// Vulkan surface must support. The tuning row render.presentMode / the
+// --present flag select it (main.cpp); GpuContext::SetPresentMode applies it.
+enum class PresentMode : uint32_t { Fifo = 0, Mailbox = 1, Immediate = 2 };
+
 // ---------------------------------------------------------------- enums ----
 // Values are NOT assumed to match any backend's; every backend maps explicitly.
 
@@ -401,6 +411,15 @@ class CommandEncoder {
 
   void CopyTextureToBuffer(const TexelCopyTexture& src, const TexelCopyBuffer& dst,
                            const Extent3D& extent) const;
+  // Whole-image scaled copy, `src` -> `dst`, sizes taken from the images.
+  // The internal-resolution frame's upscale to the swapchain
+  // (render.renderScale): NEAREST by default so a scaled frame stays pixel
+  // art; `linear` is the alternative for anyone who wants the blur. Record it
+  // AFTER RenderPass::End() and before any pass that draws over `dst`; the
+  // backend derives both images' layout transitions. `dst` must have been
+  // created (or, for the swapchain, configured) with CopyDst usage.
+  void BlitTexture(const TextureView& src, const TextureView& dst,
+                   bool linear = false) const;
   void ResolveQuerySet(const QuerySet& qs, uint32_t firstQuery, uint32_t queryCount,
                        const Buffer& dst, uint64_t dstOffset) const;
 

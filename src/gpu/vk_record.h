@@ -339,6 +339,14 @@ class Recorder {
   // host barrier when mapped). `bytesPerRow` is converted to texels here.
   void CopyImageToBuffer(Image* src, Buffer* dst, uint64_t dstOffset,
                          uint32_t bytesPerRow, uint32_t w, uint32_t h);
+  // The upscale path (render.renderScale): whole-image blit from `src` to
+  // `dst`, both transitioned by the same derived path CopyImageToBuffer
+  // uses (src from its tracked attachment write; dst from whatever it was
+  // last — PRESENT_SRC for a swapchain image that was shown last frame,
+  // UNDEFINED on its first use). NEAREST unless `linear`, because the world
+  // is pixel art and a 2/3-scale frame sampled linearly is a blur, not a
+  // smaller picture. Outside a rendering scope only, like every transfer.
+  void BlitImage(Image* src, Image* dst, bool linear);
 
   const RecordStats& Stats() const { return stats_; }
 

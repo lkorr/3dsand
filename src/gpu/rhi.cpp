@@ -101,6 +101,11 @@ void CommandEncoder::CopyTextureToBuffer(const TexelCopyTexture& src,
   p_->CopyTextureToBuffer(src, dst, extent);
 }
 
+void CommandEncoder::BlitTexture(const TextureView& src, const TextureView& dst,
+                                 bool linear) const {
+  p_->BlitTexture(src, dst, linear);
+}
+
 void CommandEncoder::ResolveQuerySet(const QuerySet& qs, uint32_t firstQuery,
                                      uint32_t queryCount, const Buffer& dst,
                                      uint64_t dstOffset) const {

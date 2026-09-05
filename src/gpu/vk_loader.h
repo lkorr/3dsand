@@ -172,6 +172,7 @@ struct DeviceFns {
   PFN_vkCmdSetViewport CmdSetViewport = nullptr;
   PFN_vkCmdSetScissor CmdSetScissor = nullptr;
   PFN_vkCmdCopyImageToBuffer CmdCopyImageToBuffer = nullptr;
+  PFN_vkCmdBlitImage CmdBlitImage = nullptr;
   PFN_vkCreateImageView CreateImageView = nullptr;
   PFN_vkDestroyImageView DestroyImageView = nullptr;
   PFN_vkCreateGraphicsPipelines CreateGraphicsPipelines = nullptr;

@@ -41,6 +41,14 @@ class GpuContext {
             rhi::BackendKind backend = rhi::BackendKind::Vulkan,
             bool vkValidation = false, bool vkSledgehammer = false);
   void Resize(uint32_t width, uint32_t height);
+  // Swapchain pacing (rhi::PresentMode). Recreates the swapchain if one
+  // exists and the mode differs from the one it was created with — a queue
+  // drain, so call it when the setting CHANGES, not every frame. `presentMode`
+  // afterwards is what was actually created (Fifo if the surface refused).
+  void SetPresentMode(rhi::PresentMode mode);
+  // True when the swapchain accepts CommandEncoder::BlitTexture as its
+  // destination (TRANSFER_DST usage), which the internal render scale needs.
+  bool SwapchainBlittable() const;
 
   // Returns an invalid TextureView if the surface is temporarily unusable.
   rhi::TextureView AcquireFrame();
@@ -60,6 +68,8 @@ class GpuContext {
   rhi::BackendKind backendKind = rhi::BackendKind::Vulkan;
   rhi::TextureFormat surfaceFormat = rhi::TextureFormat::Undefined;
   uint32_t width = 0, height = 0;
+  // The present mode the live swapchain was created with (Fifo when headless).
+  rhi::PresentMode presentMode = rhi::PresentMode::Fifo;
 
   // The Vulkan backend object, or null before Init. Diagnostics only
   // (--vk-smoke prints caps + validation messages); nothing above src/gpu

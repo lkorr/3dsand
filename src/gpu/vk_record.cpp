@@ -639,6 +639,32 @@ void Recorder::CopyToHost(Buffer* src, uint64_t srcOffset, Buffer* dst,
   if (dst->mapped) hostWritten_.push_back(dst);
 }
 
+void Recorder::BlitImage(Image* src, Image* dst, bool linear) {
+  if (!src || src->img == VK_NULL_HANDLE || !dst || dst->img == VK_NULL_HANDLE ||
+      renderOpen_ || !be_.Fns().CmdBlitImage)
+    return;
+  // No buffer hazards: a blit touches images only. The two layout transitions
+  // are derived exactly as the screenshot copy's is, and batched into one
+  // vkCmdPipelineBarrier2.
+  TransitionImage(src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                  VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+  TransitionImage(dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                  VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+  FlushPendingImages();
+
+  VkImageBlit region{};
+  region.srcSubresource = {src->aspect, 0, 0, 1};
+  region.srcOffsets[0] = {0, 0, 0};
+  region.srcOffsets[1] = {(int32_t)src->width, (int32_t)src->height, 1};
+  region.dstSubresource = {dst->aspect, 0, 0, 1};
+  region.dstOffsets[0] = {0, 0, 0};
+  region.dstOffsets[1] = {(int32_t)dst->width, (int32_t)dst->height, 1};
+  be_.Fns().CmdBlitImage(cmd_, src->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                         dst->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region,
+                         linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
+  stats_.copies++;
+}
+
 void Recorder::FillUntracked(Buffer* dst, uint64_t offset, uint64_t size) {
   if (!dst || !dst->buf) return;
   bool dstTable = false;

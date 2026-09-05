@@ -1730,6 +1730,17 @@ void Simulation::EnsureAuxDepth(uint32_t width, uint32_t height) {
   auxDepthView_ = auxDepthTex_.CreateView();
 }
 
+void Simulation::EnsureOverlayDepth(uint32_t width, uint32_t height) {
+  if (overlayDepthView_ && overlayDepthW_ == width && overlayDepthH_ == height)
+    return;
+  overlayDepthW_ = width;
+  overlayDepthH_ = height;
+  overlayDepthTex_ =
+      device_.CreateTexture({width, height, 1}, kDepthFormat,
+                            rhi::TextureUsage::RenderAttachment, "depthOverlay");
+  overlayDepthView_ = overlayDepthTex_.CreateView();
+}
+
 void Simulation::EnsureRenderPipelines(rhi::TextureFormat format) {
   if (format == targetFormat_) return;
   targetFormat_ = format;
@@ -1944,6 +1955,26 @@ rhi::RenderPass Simulation::BeginAuxRenderPass(const rhi::CommandEncoder& enc,
   d.depth.loadOp = rhi::LoadOp::Clear;
   d.depth.storeOp = rhi::StoreOp::Store;
   d.depth.clearValue = 0.0f;  // reversed-Z: clear to far
+  return enc.BeginRenderPass(d);
+}
+
+rhi::RenderPass Simulation::BeginOverlayRenderPass(const rhi::CommandEncoder& enc,
+                                                   const rhi::TextureView& target,
+                                                   rhi::TextureFormat format,
+                                                   uint32_t width, uint32_t height) {
+  EnsureRenderPipelines(format);
+  EnsureOverlayDepth(width, height);
+
+  rhi::RenderPassDesc d{};
+  d.label = "overlay";
+  d.color.view = target;
+  d.color.loadOp = rhi::LoadOp::Load;  // the blitted world frame
+  d.color.storeOp = rhi::StoreOp::Store;
+  d.hasDepth = true;
+  d.depth.view = overlayDepthView_;
+  d.depth.loadOp = rhi::LoadOp::Clear;
+  d.depth.storeOp = rhi::StoreOp::Discard;
+  d.depth.clearValue = 0.0f;
   return enc.BeginRenderPass(d);
 }
 
