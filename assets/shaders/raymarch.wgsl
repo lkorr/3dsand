@@ -3026,7 +3026,12 @@ fn farLevelForDist(distFine : f32) -> u32 {
   return FAR_LEVELS;
 }
 
-fn farShadowed(level : u32, roFine : vec3f) -> bool {
+// Returns the distance to the blocker in FINE voxels, or -1.0 when the ray
+// left the level box / its reach unblocked. The distance is what lets a far
+// receiver take the SAME softening law the near field uses
+// (shadowFromOpaqueHit): a contact blocker stays dark, a canopy 8 m up lifts
+// toward TUNE_SHADOW_LIFT, exactly as it does one voxel inside the window.
+fn farShadowDist(level : u32, roFine : vec3f) -> f32 {
   var rd = keyLightDir();
   if (abs(rd.x) < 1e-6) { rd.x = select(-1e-6, 1e-6, rd.x >= 0.0); }
   if (abs(rd.y) < 1e-6) { rd.y = select(-1e-6, 1e-6, rd.y >= 0.0); }
@@ -3052,7 +3057,7 @@ fn farShadowed(level : u32, roFine : vec3f) -> bool {
   let steps = farShadowSteps(level);
   for (var i = 0; i < steps; i++) {
     rsAdd(RS_FAR_SHADOW, 1u);
-    if (!farInBox(cell, org)) { return false; }
+    if (!farInBox(cell, org)) { return -1.0; }
     if (farOcc[farOccIndex(level, cell)] == 0u) {
       // empty level chunk: jump to its exit face (seam-safe, as in traceFar)
       let ch = worldChunkOf(cell);
@@ -3062,7 +3067,7 @@ fn farShadowed(level : u32, roFine : vec3f) -> bool {
       let ex = max(e0, e1);
       let tOut = max(min(ex.x, min(ex.y, ex.z)), tCur);
       let t = tOut + 1e-4;
-      if (t >= tExit) { return false; }
+      if (t >= tExit) { return -1.0; }
       let p = roL + rd * t;
       var nc = vec3<i32>(floor(p));
       if (ex.x <= ex.y && ex.x <= ex.z) {
@@ -3072,7 +3077,7 @@ fn farShadowed(level : u32, roFine : vec3f) -> bool {
       } else {
         nc.z = select(ch.z * i32(CHUNK) - 1, (ch.z + 1) * i32(CHUNK), rd.z > 0.0);
       }
-      if (!farInBox(nc, org)) { return false; }
+      if (!farInBox(nc, org)) { return -1.0; }
       cell = nc;
       for (var a = 0; a < 3; a++) {
         let boundary = f32(cell[a]) + select(0.0, 1.0, rd[a] > 0.0);
@@ -3081,11 +3086,27 @@ fn farShadowed(level : u32, roFine : vec3f) -> bool {
       tCur = t;
       continue;
     }
-    // The conservative flag at EVERY level: a shadow caster that is half a
-    // cell too tall reads as terrain on the horizon, and the cells this
-    // recovers — terrace tops, ridge crests, a ruin wall thinner than a cell —
-    // are exactly the ones whose shadows were missing.
-    if (farBlockerAt(level, cell)) { return true; }
+    // MATERIAL CELLS ONLY — the conservative blocker flag is NOT a shadow
+    // caster (changed in the LOD-seam pass, 2026-09-04; it was, at every level,
+    // since 13.2.2). The flag marks every cell whose footprint MAY hold
+    // terrain, which on a slope or a terrace is the whole band of cells the
+    // ground surface passes through — including the row a surface receiver's
+    // ray starts in and the rows its neighbours' flags occupy. Honouring it
+    // shadowed most of the far surface at near-zero distance. The old flat
+    // x0.3 lift turned that into a general dimming (the far meadow rendered
+    // ~20% darker than the near one, measured on screenshot_ground), and the
+    // near field's contact-dark softening law made it a black stipple.
+    //
+    // Measured, same frame, far-meadow mean RGB against the near meadow's
+    // (126, 172, 110): flags honoured 94/123/90; flags honoured only above the
+    // start row 94/123/90 (no better — the flagged band is not one row deep);
+    // flags ignored 126/165/109; far shadows off entirely 128/168/111. Material
+    // cells carry every caster a shadow can show at cascade scale; what the
+    // flag adds is a half-cell crest that the near field would not shadow
+    // either. The flag keeps its other reader (traceFar's primary-hit path,
+    // behind render.farBlockerHitLevel).
+    let byte = farByteAt(level, cell);
+    if ((byte & FAR_MAT_MASK) != 0u) { return tCur * s; }
     if (tMax.x < tMax.y && tMax.x < tMax.z) {
       cell.x += stepv.x; tCur = tMax.x; tMax.x += tDelta.x;
     } else if (tMax.y < tMax.z) {
@@ -3093,9 +3114,47 @@ fn farShadowed(level : u32, roFine : vec3f) -> bool {
     } else {
       cell.z += stepv.z; tCur = tMax.z; tMax.z += tDelta.z;
     }
-    if (tCur >= tExit) { return false; }
+    if (tCur >= tExit) { return -1.0; }
   }
-  return false;
+  return -1.0;
+}
+
+fn farShadowed(level : u32, roFine : vec3f) -> bool {
+  return farShadowDist(level, roFine) >= 0.0;
+}
+
+// ---- far-field ambient occlusion: voxelAO's rule over cascade cells ----------
+// Mirrors voxelAO (below) tap for tap so a terrace riser darkens the same way
+// on both sides of the window edge: two tangent neighbours in the plane in
+// front of the face, the corner the hit leans into, ramped by the hit's
+// position in the face. Occluders are MATERIAL cells only, never the
+// conservative blocker flag: the flag sits on the whole row above a surface
+// whenever the ground is in the surface cell's upper half (see farShadowDist),
+// and taken as an occluder it darkened every far terrace tread to the full AO
+// depth. Micro plants are no longer in the cascade at all, so grass cannot
+// stamp AO onto a meadow here any more than it can inside (isRayBlocker).
+// Cells outside the level box do not occlude, as unloaded space does not near.
+fn farAoSolidAt(level : u32, c : vec3<i32>) -> f32 {
+  if (!farInBox(c, F.origins[level - 1u].xyz)) { return 0.0; }
+  return select(0.0, 1.0, farMatAt(level, c) != 0u);
+}
+
+fn farVoxelAO(level : u32, cell : vec3<i32>, n : vec3<i32>, a1 : i32, a2 : i32,
+              uv : vec2f) -> f32 {
+  let base = cell + n;
+  let s1 = select(-1, 1, uv.x > 0.5);
+  let s2 = select(-1, 1, uv.y > 0.5);
+  let d1 = axisVecI(a1, s1);
+  let d2 = axisVecI(a2, s2);
+  let side1 = farAoSolidAt(level, base + d1);
+  let side2 = farAoSolidAt(level, base + d2);
+  let corner = farAoSolidAt(level, base + d1 + d2);
+  var occ = side1 + side2;
+  if (side1 > 0.0 && side2 > 0.0) { occ = 3.0; } else { occ += corner; }
+  let w1 = abs(uv.x - 0.5) * 2.0;
+  let w2 = abs(uv.y - 0.5) * 2.0;
+  let reach = clamp(max(w1, w2), 0.0, 1.0);
+  return clamp(1.0 - (occ / 3.0) * TUNE_AO_STRENGTH * reach, 0.0, 1.0);
 }
 
 // Aerial perspective: distance fog that converges EXACTLY to the sky color in
@@ -7744,17 +7803,26 @@ fn fs(in : VSOut) -> FSOut {
       // a one-sample AO — lighting mismatch at the window seam is what makes
       // LOD terrain read as a different world.
       let m = materials[far.mat];
-      // palette jitter at a FIXED world frequency (~0.5 m patches) instead of
-      // per level cell: coarse cells otherwise flatten into single-color slabs
-      // and the texture contrast visibly drops at every LOD handoff.
-      //
-      // paletteJitter, NOT paletteColor: a far cascade cell has no voxel word,
-      // so `jit` is a hash and never a state nibble. paletteColor() would read
-      // it as a MATF_TINTED material's dye index (common.wgsl).
-      let jc = (far.cell << vec3<u32>(farCellShift(far.level))) >> vec3<u32>(3u);
-      let jit = pcg(u32(jc.x * 7 + jc.y * 131 + jc.z * 2917));
-      var albedo = paletteJitter(m, jit);
       var n = axisVec(far.axis, -far.sgn);
+      // ---- TEXTURE AT THE FINE VOXEL, NOT AT THE CELL (the LOD-seam pass) ----
+      // The near field's per-voxel "texture" is two positional hashes: the
+      // worldgen palette variant (synthJitterState, the state nibble every
+      // pristine voxel carries) and surfaceGrain over the fine lattice. The far
+      // field used to key both on the CELL (a 0.8 m patch hash and the cell's
+      // corner), so the texture frequency dropped 8x at the window edge and
+      // again at every level seam — the coarse side read as a flat, paler paint
+      // even where its geometry was fine. Keying on the fine voxel just inside
+      // the hit face gives every cascade cell the same speckle the voxels
+      // under it would have shown: the geometry coarsens across a seam, the
+      // surface pattern does not. This is what a mesh LOD gets for free by
+      // tiling its texture in world units, and it costs nothing here beyond
+      // one floor().
+      //
+      // paletteJitter, NOT paletteColor: this is a hash, not a state nibble,
+      // and paletteColor() would read it as a MATF_TINTED dye index.
+      let hitP = R.camPos + rd * far.t;
+      let fineV = vec3<i32>(floor(hitP - n * 0.5));
+      var albedo = paletteJitter(m, synthJitterState(fineV, R.seed));
       if (m.klass == CLASS_LIQUID) {
         albedo = unpackColor(m.color0);
         // distant water: a touch of sky reflection on up-facing surfaces so
@@ -7769,7 +7837,11 @@ fn fs(in : VSOut) -> FSOut {
       var face = 1.0;
       if (far.axis == 0) { face = TUNE_FACE_X; }
       else if (far.axis == 2) { face = TUNE_FACE_Z; }
-      albedo *= surfaceGrain(far.cell << vec3<u32>(farCellShift(far.level)), TUNE_GRAIN_AMP_FAR);
+      // Same lattice as the near field's surfaceGrain(h.cell, ...) — see the
+      // fine-voxel note above. TUNE_GRAIN_AMP_FAR ships equal to TUNE_GRAIN_AMP
+      // now that the pattern matches; it stays a knob so the far field can be
+      // calmed independently if a coarser cascade ever needs it.
+      albedo *= surfaceGrain(fineV, TUNE_GRAIN_AMP_FAR);
       // Burning foliage breathes toward the flame colour out here too, keyed
       // on the FINE cell so a leaf keeps its phase across the cascade seam.
       let bt = burnTint(m, albedo, f32(m.emission) / 255.0,
@@ -7783,18 +7855,47 @@ fn fs(in : VSOut) -> FSOut {
         // start the shadow march just off the hit face, in fine-voxel coords
         let hp = R.camPos + rd * (far.t - 1e-3) +
                  n * (0.55 * f32(1u << farCellShift(far.level)));
-        // SOFT, not hard-zero: at cascade resolution most shadow casters are
-        // single-cell terrace steps and canopy rings, and a hard shadow term
-        // turns them into high-frequency dark speckle ("ant trails") across
-        // every hillside. 0.3 keeps the form cue without the noise.
-        if (farShadowed(far.level, hp)) { lambert *= TUNE_SHADOW_FAR_LIFT; }
+        // THE NEAR FIELD'S SOFTENING LAW, on the cascade's own blocker
+        // distance. The old term was a flat x0.3 for any blocker, which put a
+        // contact shadow under a tree and the shadow of a ridge 40 m away at the
+        // same depth while the near field one voxel closer graded them from
+        // black to a 0.45 lift — a visible shadow-depth step along the whole
+        // window edge. shadowFromOpaqueHit is the one law the terrain and the
+        // raster bodies already share; feeding it the far march's distance
+        // puts the cascade on the same penumbra curve.
+        //
+        // LEVELS 3+ KEEP A FLOOR AT TUNE_SHADOW_FAR_LIFT. At 80 cm cells and
+        // beyond, a caster is mostly a single terrace step and a hard contact
+        // shadow on it renders as the "ant trail" speckle the phase-4 pass
+        // measured; the two near levels (20/40 cm cells, out to ~100 m) are
+        // where the seam is judged and where the near law is right.
+        let sd = farShadowDist(far.level, hp);
+        if (sd >= 0.0) {
+          var sh = shadowFromOpaqueHit(true, sd, 0u);
+          if (far.level >= 3u) { sh = max(sh, TUNE_SHADOW_FAR_LIFT); }
+          lambert *= sh;
+        }
       }
-      // one-sample AO: an occupied cell directly above darkens — valley floors
-      // and ground under flattened canopy stop rendering at full sky ambient
-      var ao = 1.0;
+      // ---- THE NEAR FIELD'S FOUR-TAP AO, on cascade cells ----
+      // voxelAO's rule (two tangent neighbours + the corner the hit leans into,
+      // ramped by the hit's position in the face) over farBlockerAt at the hit's
+      // own level. The old term was a single "is the cell above occupied" test:
+      // no darkening in the crease where a slope meets a step, none at the foot
+      // of a tree or a wall, so every far terrace read as an unshaded stack of
+      // slabs while the near field graded its risers. Four byte reads per far
+      // pixel, on the primary hit only.
+      let ni = vec3<i32>(round(n));
+      let a1 = select(0, 1, far.axis == 0);
+      let a2 = select(2, 1, far.axis == 2);
+      let sL = f32(1u << farCellShift(far.level));
+      let uvL = vec2f(fract(axisPick(hitP, a1) / sL), fract(axisPick(hitP, a2) / sL));
+      var ao = farVoxelAO(far.level, far.cell, ni, a1, a2, uvL);
+      // The occupied-cell-above term stays on top: it is what darkens the
+      // ground under a flattened canopy at levels >= 5, where the crown is
+      // painted onto the surface cell and nothing sits above it to occlude.
       let up = far.cell + vec3<i32>(0, 1, 0);
       if (farInBox(up, F.origins[far.level - 1u].xyz) &&
-          farMatAt(far.level, up) != 0u) { ao = TUNE_AO_FAR; }
+          farMatAt(far.level, up) != 0u) { ao *= TUNE_AO_FAR; }
       // Same lighting model as the near field (hemisphere ambient x AO, plus
       // direct sun) so the two representations agree across the seam.
       let fsun = keyLightColor() * lambert;
