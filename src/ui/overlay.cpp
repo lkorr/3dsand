@@ -505,13 +505,25 @@ void Overlay::Draw(UIState& s) {
   if (s.spellRefused > 0)
     ImGui::TextColored(ImVec4(0.6f, 0.9f, 1.0f, 1.0f), "ward refused %d", s.spellRefused);
   if (!s.glyphSlots.empty()) {
-    std::string strip;
-    for (size_t i = 0; i < s.glyphSlots.size(); i++) {
-      if (s.glyphSlots[i].empty()) continue;
-      strip += std::to_string((i + 1) % 10) + ":" + s.glyphSlots[i] + "  ";
+    // Two rows: bank A on the number row, bank B on Shift. The bank Shift is
+    // holding is drawn bright; a page shows as its name with a page mark.
+    for (int bank = 0; bank < 2; bank++) {
+      std::string strip = bank == 0 ? "1-0:   " : "S+1-0: ";
+      bool any = false;
+      for (size_t i = (size_t)bank * 10; i < s.glyphSlots.size() && i < (size_t)(bank + 1) * 10; i++) {
+        if (s.glyphSlots[i].empty()) continue;
+        any = true;
+        const bool page = i < s.glyphSlotKinds.size() && s.glyphSlotKinds[i] == 2;
+        strip += std::to_string((i + 1) % 10) + ":" + (page ? "[" : "") + s.glyphSlots[i] +
+                 (page ? "]" : "") + "  ";
+      }
+      if (!any) continue;
+      if (s.glyphBankB == (bank == 1)) ImGui::Text("%s", strip.c_str());
+      else ImGui::TextDisabled("%s", strip.c_str());
     }
-    ImGui::TextDisabled("%s", strip.c_str());
   }
+  if (s.spellNoteAge < 3.0f && !s.spellNote.empty())
+    ImGui::TextColored(ImVec4(0.9f, 0.85f, 0.5f, 1.0f), "%s", s.spellNote.c_str());
   ImGui::Text("projectiles %d", s.liveProjectiles);
   if (s.spellOpsDropped > 0) {
     ImGui::SameLine();

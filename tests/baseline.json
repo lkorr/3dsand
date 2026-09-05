@@ -62,6 +62,7 @@
   "streaming": "fail",
   "spells": "pass",
   "spells-oracle": "pass",
+  "grimoire": "pass",
   "perf": "pass",
   "page-roundtrip": "pass",
   "daylight-boundary": "pass",

@@ -1,9 +1,13 @@
 # PLAN: the magic grammar
 
-Status: PROPOSAL (2026-09-04). Nothing here is implemented. The exploratory
-slice in `game/spell.*` + `assets/spells/glyphs.json` (DESIGN.md §8 "The spell
-system") stays; this plan replaces its *language* while keeping its four
-structural commitments:
+Status: LANDED (2026-09-04, P0–P5 on branch `worktree-magic-grammar`; DESIGN.md
+§8 "The spell system" is the record of what shipped and where it differs from
+the text below — L6 is stated over every group's neighbourhood, Matter under
+`trail` lowers to `place`, PLYR went to v4 (it was already v3), the cauterise
+rule measures a third of the exposed surface, a severed limb is not regrown,
+and mob bodies have no impulse seam for a sustained `float`). The exploratory
+slice in `game/spell.*` + `assets/spells/glyphs.json` stayed; this plan replaced
+its *language* while keeping its four structural commitments:
 
 1. only output is `SpellEmission` → MutationQueue ops,
 2. `ApplySpellEffect(payload, at, dir)` is position-parameterized (backfire is

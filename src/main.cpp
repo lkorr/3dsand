@@ -148,7 +148,8 @@ bool g_shotInventory = false;
 constexpr uint64_t kShotInvOpenFrame = 150;    // let the avatar spawn and settle
 constexpr uint64_t kShotInvDamageFrame = 170;
 constexpr uint64_t kShotInvGearFrame = 220;    // -> screenshot_inventory.bmp
-constexpr uint64_t kShotInvCaptureFrame = 240;  // -> ..._health.bmp; last frame
+constexpr uint64_t kShotInvCaptureFrame = 240;  // -> ..._health.bmp
+constexpr uint64_t kShotInvGrimoireFrame = 260; // -> ..._grimoire.bmp; last frame
 
 
 // --frames N (phase 4b D3): windowed verification harness. 0 = play normally.
@@ -2793,7 +2794,7 @@ int main(int argc, char** argv) {
     // g_shotInventory.
     else if (a == "--shot-inventory") {
       g_shotInventory = true;
-      g_harnessFrames = kShotInvCaptureFrame;
+      g_harnessFrames = kShotInvGrimoireFrame;
     }
     // `--duel-dummy` is the melee FEEL harness: a sword-armed human standing
     // three metres in front of the spawn, with nothing driving it. Mobs have no
@@ -3846,7 +3847,7 @@ int main(int argc, char** argv) {
   float lookSensNow = 1.0f;
 
   KeyEdge eP, eN, eV, eF1, eF3, eF4, eF5, eF6, eF9, eF10, eR, eEsc, eLBracket, eRBracket, eJump,
-      eG, eX, eB, eT, eO, eM, eK, eTab, eC, eH, eZ, eBack, eDel, eU, eL, eI, eQ,
+      eG, eX, eB, eT, eO, eM, eK, eTab, eC, eH, eZ, eBack, eDel, eEq, eU, eL, eI, eQ,
       eE;
   KeyEdge eGlyph[kGlyphSlots];
   bool prevMouseL = false;
@@ -4269,6 +4270,20 @@ int main(int argc, char** argv) {
       // Swap to the inspector between the two captures, so the second picture
       // is the half the first cannot show.
       if (frameCounter == kShotInvGearFrame + 1) ui.inspectMode = true;
+      // Third picture: the grimoire with a page selected and its word row
+      // populated — the panel's job is to be looked at (plan §12c).
+      if (frameCounter == kShotInvCaptureFrame + 1) {
+        ui.inspectMode = false;
+        ui.grimoireMode = true;
+        if (!glyphs.conjoined.empty()) {
+          const ConjoinedGlyph& cg = glyphs.conjoined[0];
+          ui.grimoireSelected = cg.id;
+          ui.grimoireEditName = cg.id;
+          ui.grimoireEditWords.clear();
+          for (int gi : cg.glyphs)
+            if (const GlyphDef* d = glyphs.At(gi)) ui.grimoireEditWords.push_back(d->id);
+        }
+      }
     }
     glfwPollEvents();
     double now = NowSeconds();
@@ -4541,14 +4556,21 @@ int main(int argc, char** argv) {
         }
     } else {
       // Pressing a number SPEAKS that glyph — it never casts. Edge-triggered:
-      // a held key must not stutter the same word onto the stack.
-      for (int i = 0; i < kGlyphSlots; i++) {
+      // a held key must not stutter the same word onto the stack. TWO BANKS
+      // (plan §12a): `1`-`0` speak bank A, `Shift+1`-`0` bank B. Sprint is
+      // on Shift outside magic mode and magic mode captures the number row,
+      // so nothing collides.
+      const bool bankB = key(GLFW_KEY_LEFT_SHIFT) || key(GLFW_KEY_RIGHT_SHIFT);
+      for (int i = 0; i < kGlyphBank; i++) {
         // GLFW's number row is contiguous 1..9 then 0, and slot 10 is the 0
         // key, matching the strip the HUD prints.
         int k = (i == 9) ? GLFW_KEY_0 : (GLFW_KEY_1 + i);
         if (captured && eGlyph[i].Pressed(key(k)))
-          caster.SpeakSlot(glyphs, i);
+          caster.SpeakSlot(glyphs, i + (bankB ? kGlyphBank : 0));
       }
+      // `=` captures the sentence on the stack into the grimoire (§12b): the
+      // fast path for "that worked, make it one key".
+      if (captured && eEq.Pressed(key(GLFW_KEY_EQUAL))) caster.CaptureStack(glyphs);
     }
     if (captured && eZ.Pressed(key(GLFW_KEY_Z))) {
       ui.magicMode = !ui.magicMode;
@@ -4897,11 +4919,12 @@ int main(int argc, char** argv) {
           // existed the point was moot (GrantAllAndBind overwrote the
           // bindings anyway, which is its own bug: every reload threw away
           // whatever the player had arranged). Snapshot, reload, re-resolve.
-          std::vector<std::string> boundNames(kGlyphSlots);
+          std::vector<std::string> boundNames(kGlyphSlots), boundPages(kGlyphSlots);
           for (int i = 0; i < kGlyphSlots; i++) {
             const int gi = caster.inventory.At(i);
             if (gi >= 0 && gi < (int)glyphs.glyphs.size())
               boundNames[i] = glyphs.glyphs[gi].id;
+            boundPages[i] = caster.inventory.PageAt(i);
           }
           if (LoadGlyphs(assetDir + "/spells/glyphs.json", mats, next, gerr)) {
             glyphs = std::move(next);
@@ -4912,6 +4935,10 @@ int main(int argc, char** argv) {
             // rather than pointing at whatever now occupies that index — the
             // same rule the item hotbar's re-validation below uses.
             for (int i = 0; i < kGlyphSlots; i++) {
+              if (!boundPages[i].empty()) {
+                caster.inventory.BindPage(i, boundPages[i]);   // pages are names already
+                continue;
+              }
               if (boundNames[i].empty()) {
                 caster.inventory.Bind(i, -1);
                 continue;
@@ -7465,11 +7492,30 @@ int main(int argc, char** argv) {
       ui.windPrims = (int)WindPrims().Count();
       ui.windWakeChunks = (int)WindPrims().LastWakeCount();
       ui.glyphSlots.clear();
+      ui.glyphSlotKinds.clear();
+      ui.glyphSlotReadouts.clear();
       for (int i = 0; i < kGlyphSlots; i++) {
+        const SlotKind k = caster.inventory.KindAt(i);
+        ui.glyphSlotKinds.push_back((int)k);
+        if (k == SlotKind::Page) {
+          const std::string& name = caster.inventory.PageAt(i);
+          ui.glyphSlots.push_back(name);
+          const GrimoireExpansion ex = ExpandWords(glyphs, caster.grimoire, {name}, kSpellStackMax);
+          SpellStack st;
+          st.spoken = ex.spoken;
+          ui.glyphSlotReadouts.push_back(DescribeSpell(glyphs, CompileSpell(glyphs, st)).text);
+          continue;
+        }
         int gi = caster.inventory.At(i);
         ui.glyphSlots.push_back(
             gi >= 0 && gi < (int)glyphs.glyphs.size() ? glyphs.glyphs[gi].id : "");
+        ui.glyphSlotReadouts.push_back("");
       }
+      ui.glyphBankB = captured && ui.magicMode &&
+                      (key(GLFW_KEY_LEFT_SHIFT) || key(GLFW_KEY_RIGHT_SHIFT));
+      caster.noteAge += dt;
+      ui.spellNote = caster.note;
+      ui.spellNoteAge = caster.noteAge;
       // hotbar + swing readout (game/item.h, game/melee.h)
       ui.itemNames.clear();
       for (int i = 0; i < kItemSlots; i++) {
@@ -7656,12 +7702,111 @@ int main(int argc, char** argv) {
         ui.bindGlyph.pending = false;
         // BY NAME. The panel never handles a glyph index, so a bind cannot
         // survive into a reload as a stale index (see the R-reload block).
-        const int gi = ui.bindGlyph.glyphId.empty()
-                           ? -1
-                           : glyphs.Find(ui.bindGlyph.glyphId);
-        if (!caster.inventory.Bind(ui.bindGlyph.slot, gi)) {
-          ui.kitMessage = "you do not know that glyph";
+        if (ui.bindGlyph.page) {
+          GrimoirePage scratch;
+          if (!FindPage(glyphs, caster.grimoire, ui.bindGlyph.glyphId, scratch) ||
+              !caster.inventory.BindPage(ui.bindGlyph.slot, ui.bindGlyph.glyphId)) {
+            ui.kitMessage = "no such page";
+            ui.kitMessageAge = 0.0f;
+          }
+        } else {
+          const int gi = ui.bindGlyph.glyphId.empty()
+                             ? -1
+                             : glyphs.Find(ui.bindGlyph.glyphId);
+          if (!caster.inventory.Bind(ui.bindGlyph.slot, gi)) {
+            ui.kitMessage = "you do not know that glyph";
+            ui.kitMessageAge = 0.0f;
+          }
+        }
+      }
+      if (ui.grimoireOp.pending) {
+        ui.grimoireOp.pending = false;
+        const UIState::GrimoireIntent& op = ui.grimoireOp;
+        auto say = [&](const std::string& m) {
+          ui.kitMessage = m;
           ui.kitMessageAge = 0.0f;
+        };
+        if (op.op == UIState::GrimoireIntent::Delete) {
+          const int pi = caster.grimoire.Find(op.name);
+          if (pi >= 0) {
+            caster.grimoire.pages.erase(caster.grimoire.pages.begin() + pi);
+            // Slots holding the page keep its name: they speak nothing and the
+            // strip shows ?, which is the by-name contract (DESIGN §8b).
+            say("deleted " + op.name);
+            if (ui.grimoireSelected == op.name) {
+              ui.grimoireSelected.clear();
+              ui.grimoireEditWords.clear();
+              ui.grimoireEditName.clear();
+              ui.grimoireEditDirty = false;
+            }
+          } else {
+            say("that page is not yours to delete");
+          }
+        } else if (op.op == UIState::GrimoireIntent::Duplicate) {
+          GrimoirePage scratch;
+          const GrimoirePage* src = FindPage(glyphs, caster.grimoire, op.name, scratch);
+          if (!src) {
+            say("no such page");
+          } else if ((int)caster.grimoire.pages.size() >= glyphs.budgets.maxGrimoirePages) {
+            say("the grimoire is full");
+          } else {
+            GrimoirePage copy;
+            copy.words = src->words;
+            copy.name = op.name + "-copy";
+            for (int k = 2; caster.grimoire.Find(copy.name) >= 0 && k < 100; k++)
+              copy.name = op.name + "-copy" + std::to_string(k);
+            caster.grimoire.pages.push_back(copy);
+            ui.grimoireSelected = copy.name;
+            ui.grimoireEditName = copy.name;
+            ui.grimoireEditWords = copy.words;
+            ui.grimoireEditDirty = false;
+            say("copied to " + copy.name);
+          }
+        } else {
+          // SAVE: a name, a bounded word list, no cycle. A starter's name
+          // cannot be taken (it would shadow the read-only page).
+          std::string name = op.name;
+          while (!name.empty() && name.back() == ' ') name.pop_back();
+          std::vector<std::string> words = op.words;
+          if ((int)words.size() > glyphs.budgets.maxMacroWords)
+            words.resize(glyphs.budgets.maxMacroWords);
+          bool starter = false;
+          for (const ConjoinedGlyph& cg : glyphs.conjoined) starter = starter || cg.id == name;
+          std::string why;
+          if (name.empty()) {
+            say("a page needs a name");
+          } else if (starter || glyphs.Find(name) >= 0) {
+            say("that name belongs to the library");
+          } else if (GrimoireWouldCycle(glyphs, caster.grimoire, name, words, why)) {
+            say("refused: " + why);
+          } else {
+            int pi = caster.grimoire.Find(name);
+            // Renaming the selected page: the old entry goes, slots bound to
+            // the old name follow it.
+            if (pi < 0 && !ui.grimoireSelected.empty() && ui.grimoireSelected != name) {
+              const int old = caster.grimoire.Find(ui.grimoireSelected);
+              if (old >= 0) {
+                caster.grimoire.pages[old].name = name;
+                for (int i = 0; i < kGlyphSlots; i++)
+                  if (caster.inventory.PageAt(i) == ui.grimoireSelected)
+                    caster.inventory.BindPage(i, name);
+                pi = old;
+              }
+            }
+            if (pi < 0 && (int)caster.grimoire.pages.size() >= glyphs.budgets.maxGrimoirePages) {
+              say("the grimoire is full");
+            } else {
+              if (pi < 0) {
+                caster.grimoire.pages.push_back(GrimoirePage{name, words, false});
+              } else {
+                caster.grimoire.pages[pi].words = words;
+              }
+              ui.grimoireSelected = name;
+              ui.grimoireEditName = name;
+              ui.grimoireEditDirty = false;
+              say("saved " + name);
+            }
+          }
         }
       }
       ui.kitMessageAge += dt;
@@ -7727,14 +7872,70 @@ int main(int argc, char** argv) {
           ui.equipSlots.push_back(mirror(kit.equip.slots[i]));
 
         ui.glyphsOwned.clear();
-        for (int gi : caster.inventory.owned) {
-          if (gi < 0 || gi >= (int)glyphs.glyphs.size()) continue;
+        for (int gi = 0; gi < (int)glyphs.glyphs.size(); gi++) {
           const GlyphDef& g = glyphs.glyphs[gi];
           UIState::GlyphUI u;
           u.id = g.id;
           u.desc = g.desc;
           u.type = (int)g.sort;
           u.mana = g.word;
+          u.owned = caster.inventory.Owns(gi);
+          u.axis = g.axis;
+          u.example = g.example;
+          // Valence, in the sort names the grammar uses (plan §9).
+          auto slotNames = [](uint8_t mask) {
+            if (mask == kSortAny) return std::string("any");
+            std::string s;
+            const char* names[5] = {"matter", "effect", "delivery", "mod", "operator"};
+            for (int b = 0; b < 5; b++)
+              if (mask & (1u << b)) s += (s.empty() ? "" : "/") + std::string(names[b]);
+            return s;
+          };
+          if (g.sort == GlyphSort::Operator) {
+            u.valence = (g.hasLeft ? slotNames(g.leftMask) + " < " : std::string()) + g.id +
+                        (g.hasRight ? " > " + slotNames(g.rightMask) : std::string()) + " -> " +
+                        GlyphSortName(g.result);
+            u.emptyNote = std::string(g.hasLeft ? "left empty: incomplete (charged)" : "") +
+                          (g.hasLeft && g.hasRight ? "   " : "") +
+                          (g.hasRight ? "right empty: incomplete (charged)" : "");
+          } else if (g.sort == GlyphSort::Mod) {
+            const char* opn = g.op == ModOp::Mul ? "x" : g.op == ModOp::Div ? "/" : "+";
+            u.valence = std::string("edits ") + ModFieldName(g.field) + " " + opn +
+                        std::to_string(g.amount) + ", again per repeat";
+          } else if (g.sort == GlyphSort::Delivery) {
+            u.valence = std::string(g.mech == DeliveryMech::Flight ? "flight" :
+                                    g.mech == DeliveryMech::Continuous ? "continuous" : "instant") +
+                        ", carry x" + std::to_string(g.carryMille / 1000) + "." +
+                        std::to_string((g.carryMille % 1000) / 100);
+          } else if (g.sort == GlyphSort::Effect) {
+            u.valence = std::string("effect: ") + SpellVerbName(g.verb);
+          } else {
+            u.valence = g.wildcard ? "matter: whatever is there"
+                                   : "matter: " + g.materialName + ", value " +
+                                         std::to_string(glyphs.Arcane(g.material));
+          }
+          switch (g.sort == GlyphSort::Operator || g.sort == GlyphSort::Effect ? g.verb
+                                                                                : SpellVerb::None) {
+            case SpellVerb::Convert: u.tariff = "volume x (convert + value gap)"; break;
+            case SpellVerb::Explode: u.tariff = "power x r^3"; break;
+            case SpellVerb::Wind: u.tariff = "footprint x ticks"; break;
+            case SpellVerb::Mend: u.tariff = "per voxel: value(M) x graft + foreign penalty"; break;
+            case SpellVerb::Trail: u.tariff = "budget voxels x E"; break;
+            case SpellVerb::Sustain: u.tariff = "E per tick, sustained"; break;
+            case SpellVerb::Filter: u.tariff = "radius^3 per tick"; break;
+            case SpellVerb::Repeat: u.tariff = "repeats x E"; break;
+            case SpellVerb::Place: u.tariff = "voxels x value(M)"; break;
+            default:
+              u.tariff = g.sort == GlyphSort::Matter ? "voxels x value(M) x place" :
+                         g.sort == GlyphSort::Mod ? "on the expansion (count, volume)" :
+                         g.sort == GlyphSort::Delivery ? "carry x the payload, + the word" : "";
+          }
+          if (g.sort != GlyphSort::Delivery) {
+            std::string d;
+            for (const GlyphDef& o : glyphs.glyphs)
+              if (o.sort == GlyphSort::Delivery) d += (d.empty() ? "" : ", ") + o.id;
+            u.delivers = "hand, " + d;
+          }
           // The matter swatch is the material's own gpu colour, so a fire
           // glyph is the colour fire actually renders as rather than a colour
           // somebody picked for the UI.
@@ -7742,6 +7943,47 @@ int main(int argc, char** argv) {
               g.material < mats.size())
             u.color = mats[g.material].gpu.color0;
           ui.glyphsOwned.push_back(std::move(u));
+        }
+
+        // The grimoire: the authored starters (read-only) and the player's
+        // pages, each with the readout and price of its expansion, through
+        // the same DescribeSpell the live sentence uses.
+        ui.grimoirePages.clear();
+        ui.grimoireMaxPages = glyphs.budgets.maxGrimoirePages;
+        ui.grimoireMaxWords = glyphs.budgets.maxMacroWords;
+        auto describeWords = [&](const std::vector<std::string>& words, std::string& readout,
+                                 int32_t& price, bool& unknown, int& dropped) {
+          const GrimoireExpansion ex = ExpandWords(glyphs, caster.grimoire, words, kSpellStackMax);
+          SpellStack st;
+          st.spoken = ex.spoken;
+          const CastList l = CompileSpell(glyphs, st);
+          readout = DescribeSpell(glyphs, l).text;
+          if (ex.dropped > 0) readout += "   (? = a word that no longer exists)";
+          if (ex.truncated) readout += "   (cut at the stack bound)";
+          price = l.manaCost;
+          unknown = l.priceUnknown;
+          dropped = ex.dropped;
+        };
+        for (const ConjoinedGlyph& cg : glyphs.conjoined) {
+          UIState::GrimoirePageUI p;
+          p.name = cg.id;
+          p.readOnly = true;
+          for (int gi : cg.glyphs)
+            if (const GlyphDef* d = glyphs.At(gi)) p.words.push_back(d->id);
+          describeWords(p.words, p.readout, p.price, p.priceUnknown, p.dropped);
+          ui.grimoirePages.push_back(std::move(p));
+        }
+        for (const GrimoirePage& pg : caster.grimoire.pages) {
+          UIState::GrimoirePageUI p;
+          p.name = pg.name;
+          p.words = pg.words;
+          describeWords(p.words, p.readout, p.price, p.priceUnknown, p.dropped);
+          ui.grimoirePages.push_back(std::move(p));
+        }
+        {
+          int dropped = 0;
+          describeWords(ui.grimoireEditWords, ui.grimoireEditReadout, ui.grimoireEditPrice,
+                        ui.grimoireEditPriceUnknown, dropped);
         }
       }
 
@@ -8272,7 +8514,8 @@ int main(int argc, char** argv) {
         // separates the first two from the third in a single run. (It was the
         // third: a 9-slice frame whose middle slice was opaque.)
         if (g_shotInventory && (frameCounter == kShotInvGearFrame ||
-                                frameCounter == kShotInvCaptureFrame))
+                                frameCounter == kShotInvCaptureFrame ||
+                                frameCounter == kShotInvGrimoireFrame))
           std::printf("--shot-inventory: portrait cube=%zu micro=%u "
                       "eye=(%.1f %.1f %.1f) target=(%.1f %.1f %.1f)\n",
                       pInst.size(), pMicro, portraitCam.eye.x, portraitCam.eye.y,
@@ -8406,10 +8649,13 @@ int main(int argc, char** argv) {
       // legal here for the same reason it is in --shot: this is the last frame
       // of a harness run, not the frame path of a game.
       if (g_shotInventory && (frameCounter == kShotInvGearFrame ||
-                              frameCounter == kShotInvCaptureFrame)) {
+                              frameCounter == kShotInvCaptureFrame ||
+                              frameCounter == kShotInvGrimoireFrame)) {
         const char* shotPath = frameCounter == kShotInvGearFrame
                                    ? "screenshot_inventory.bmp"
-                                   : "screenshot_inventory_health.bmp";
+                               : frameCounter == kShotInvCaptureFrame
+                                   ? "screenshot_inventory_health.bmp"
+                                   : "screenshot_inventory_grimoire.bmp";
         const uint32_t W = ctx.width, H = ctx.height;
         rhi::Texture shotTex = ctx.device.CreateTexture(
             {W, H, 1}, ctx.surfaceFormat,

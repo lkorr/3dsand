@@ -456,8 +456,14 @@ struct UIState {
   int windPrims = 0;
   int windPrimsDropped = 0;
   int windWakeChunks = 0;   // chunks the primitives woke last tick
-  // slot -> glyph id, for the bound-key strip. Empty string = unbound slot.
+  // slot -> glyph id or page name, for the bound-key strip. Empty string =
+  // unbound slot. Twenty slots: bank A (1-0) then bank B (Shift+1-0).
   std::vector<std::string> glyphSlots;
+  std::vector<int> glyphSlotKinds;             // SlotKind: 0 none, 1 glyph, 2 page
+  std::vector<std::string> glyphSlotReadouts;  // a page's bracket readout
+  bool glyphBankB = false;                     // Shift held: the strip highlights bank B
+  std::string spellNote;                       // "saved as ...", "the stack is full"
+  float spellNoteAge = 99.0f;
 
   // ==========================================================================
   // THE CHARACTER SCREEN (I) — ui/inventory_ui.cpp
@@ -550,8 +556,40 @@ struct UIState {
     int type = 0;         // GlyphSort: 0 matter, 1 effect, 2 delivery, 3 mod, 4 operator
     int mana = 0;         // the word cost
     uint32_t color = 0;   // matter swatch (gpu color0), 0 = not matter
+    // The §9 info box, every field read from the glyph's JSON entry so the
+    // box is never wrong about the glyph and a modder's glyph gets one free.
+    bool owned = true;    // unowned: drawn greyed, name hidden
+    std::string valence;  // "matter < >< > matter -> effect"
+    std::string tariff;   // the tariff formula, in words
+    std::string axis;     // what repeating scales
+    std::string example;
+    std::string delivers; // which deliveries carry it
+    std::string emptyNote;// "left empty: _" for operators
   };
-  std::vector<GlyphUI> glyphsOwned;
+  std::vector<GlyphUI> glyphsOwned;   // EVERY glyph, `owned` says which
+  // ---- the grimoire (plan §12b) --------------------------------------------
+  struct GrimoirePageUI {
+    std::string name;
+    std::vector<std::string> words;
+    bool readOnly = false;      // an authored starter
+    std::string readout;        // the bracket readout of its expansion
+    int32_t price = 0;          // lowered as if cast alone
+    bool priceUnknown = false;  // depends on `anything`
+    int dropped = 0;            // words that no longer resolve
+  };
+  std::vector<GrimoirePageUI> grimoirePages;
+  int grimoireMaxPages = 32, grimoireMaxWords = 16;
+  // The page being composed: UI-owned until Save. main.cpp fills the readout
+  // and price for the row every frame through the same DescribeSpell the live
+  // sentence uses, so the panel can never disagree with the game.
+  bool grimoireMode = false;                // the arsenal panel: glyphs vs grimoire
+  std::string grimoireSelected;             // page name, "" = none
+  std::string grimoireEditName;
+  std::vector<std::string> grimoireEditWords;
+  bool grimoireEditDirty = false;
+  std::string grimoireEditReadout;
+  int32_t grimoireEditPrice = 0;
+  bool grimoireEditPriceUnknown = false;
   // `glyphSlots` above is already the bound strip (slot -> glyph id) and IS
   // the arsenal's bottom row — the panel and the live hotkeys read one mirror,
   // which is what makes binding in the panel provably the same thing as the
@@ -589,7 +627,17 @@ struct UIState {
     bool pending = false;
     int slot = -1;             // 0..kGlyphSlots-1
     std::string glyphId;       // empty = unbind
+    bool page = false;         // glyphId names a grimoire page, not a glyph
   } bindGlyph;
+  // A grimoire operation: save the composed page (cycle-checked by main.cpp,
+  // refused with the reason in kitMessage), delete a page, or duplicate a
+  // read-only starter into the player's own pages.
+  struct GrimoireIntent {
+    bool pending = false;
+    enum Op { Save = 0, Delete, Duplicate } op = Save;
+    std::string name;
+    std::vector<std::string> words;
+  } grimoireOp;
   // A body part clicked in the health inspector with a sentence on the
   // stack: cast it with `self` resolving AT that part (docs/
   // PLAN_magic_grammar.md §7 — `fire self` on a bleeding stump). The panel

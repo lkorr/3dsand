@@ -108,21 +108,6 @@ bool ParseModField(const std::string& s, ModField& out) {
     }
   return false;
 }
-const char* ModFieldName(ModField f) {
-  switch (f) {
-    case ModField::Count: return "count";
-    case ModField::Children: return "children";
-    case ModField::Gravity: return "gravity";
-    case ModField::Speed: return "speed";
-    case ModField::Lifetime: return "lifetime";
-    case ModField::Radius: return "radius";
-    case ModField::Bounces: return "bounces";
-    case ModField::Pierce: return "pierce";
-    case ModField::Seek: return "seek";
-    case ModField::Fuse: return "fuse";
-    default: return "none";
-  }
-}
 
 // Parses a slot spec: "any" | ["matter", "effect", ...]. Returns false on an
 // unknown sort name.
@@ -197,6 +182,22 @@ std::string Times(int32_t n, BracketStyle style) {
 }
 
 }  // namespace
+
+const char* ModFieldName(ModField f) {
+  switch (f) {
+    case ModField::Count: return "count";
+    case ModField::Children: return "children";
+    case ModField::Gravity: return "gravity";
+    case ModField::Speed: return "speed";
+    case ModField::Lifetime: return "lifetime";
+    case ModField::Radius: return "radius";
+    case ModField::Bounces: return "bounces";
+    case ModField::Pierce: return "pierce";
+    case ModField::Seek: return "seek";
+    case ModField::Fuse: return "fuse";
+    default: return "none";
+  }
+}
 
 // ---- names -------------------------------------------------------------------
 

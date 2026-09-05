@@ -156,6 +156,7 @@ enum class ModField : uint8_t {
   Fuse,       // ticks after impact before resolving
 };
 enum class ModOp : uint8_t { Mul = 0, Div, Add };
+const char* ModFieldName(ModField f);
 
 // How repetition acts. Matter and Effects ADD (×N of the axis); Mods COMPOSE
 // (applied again: shotgun 3/9/27). Plan §4.

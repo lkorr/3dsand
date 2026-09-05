@@ -6267,10 +6267,10 @@ function wikiIndex(){
     count:t.count?t.count():null,
   });
   for(const g of glyphList())out.push({
-    kind:'glyph',id:g.id,label:g.id,group:'magic',sub:GLYPH_ICON[g.type]||'',
-    hay:[g.id,g.type,g.material||'',g.form||'',g.modifier||'',g.desc||'']
+    kind:'glyph',id:g.id,label:g.id,group:'magic',sub:GLYPH_ICON[gsort(g)]||'',
+    hay:[g.id,gsort(g),g.material||'',g.verb||'',g.mech||'',g.field||'',g.desc||'']
       .join(' ').toLowerCase(),
-    count:g.mana,
+    count:gword(g),
   });
   return out;
 }
@@ -6282,7 +6282,13 @@ function glyphList(){
   return Array.isArray(g)?g.filter(x=>x&&typeof x.id==='string'):[];
 }
 function glyphById(id){return glyphList().find(g=>g.id===id)||null;}
-const GLYPH_ICON={element:'◆',form:'▶',modifier:'✦'};
+const GLYPH_ICON={element:'◆',form:'▶',modifier:'✦',
+                  matter:'◆',effect:'✦',delivery:'▶',mod:'⚙',operator:'⋈'};
+// The grammar's schema (docs/PLAN_magic_grammar.md): `sort` and `word`
+// replaced the first slice's `type` and `mana`. Read both, so an old file
+// still renders.
+function gsort(g){return g.sort||g.type||'';}
+function gword(g){return g.word!=null?g.word:(g.mana!=null?g.mana:0);}
 
 function renderWikiList(){
   const host=$('#wikiList');host.innerHTML='';
@@ -7082,8 +7088,8 @@ function magicGlyphIndex(host){
        'folder (not assets/materials/) so the Wiki can reach assets/spells/.'));
     return;
   }
-  for(const type of ['element','form','modifier']){
-    const rows=list.filter(g=>g.type===type);
+  for(const type of ['matter','effect','operator','delivery','mod','element','form','modifier']){
+    const rows=list.filter(g=>gsort(g)===type);
     if(!rows.length)continue;
     const body=el('div',{});
     for(const g of rows){
@@ -7092,7 +7098,7 @@ function magicGlyphIndex(host){
       c.addEventListener('click',()=>wikiGo('glyph',g.id));
       line.append(c);
       line.append(el('span',{class:'txt'},g.desc||''));
-      line.append(el('span',{class:'ch'},g.mana+' mana'));
+      line.append(el('span',{class:'ch'},gword(g)+' word'));
       body.append(line);
     }
     host.append(wsec(GLYPH_ICON[type]+' '+type+'s',rows.length,true,body));
@@ -7137,15 +7143,15 @@ function magicGlyphIndex(host){
 function wikiGlyph(host){
   const g=glyphById(wikiSel.id);
   if(!g){host.append(wempty('no such glyph'));return;}
-  const isEl=g.type==='element';
-  const m=isEl?matById(g.material):null;
+  const isEl=gsort(g)==='element'||gsort(g)==='matter';
+  const m=isEl&&g.material?matById(g.material):null;
 
   host.append(el('div',{class:'wikihead'},
     el('span',{class:'sw',style:'background:'+(m?((m.colors||[])[0]||'#666'):'none')+
       (m?'':';border-color:transparent')},m?'':(GLYPH_ICON[g.type]||'')),
     el('h2',{},g.id),
-    el('span',{class:'kind'},g.type),
-    el('span',{class:'kind'},g.mana+' mana'),
+    el('span',{class:'kind'},gsort(g)),
+    el('span',{class:'kind'},gword(g)+' word'),
     el('span',{class:'spacer',style:'flex:1'}),
     el('span',{class:'hint',style:'font-size:11px'},'read-only · edit assets/spells/glyphs.json')));
 
@@ -7153,9 +7159,16 @@ function wikiGlyph(host){
 
   const f=el('div',{class:'wfacts'});
   const fact=(k,v)=>{f.append(el('div',{class:'k'},k),el('div',{class:'v'},v));};
-  fact('type',g.type);
-  fact('mana',String(g.mana)+' ');
-  if(isEl){
+  fact('sort',gsort(g));
+  fact('word',String(gword(g))+' ');
+  if(g.verb)fact('verb',g.verb);
+  if(g.left||g.right)fact('valence',(g.left?(Array.isArray(g.left)?g.left.join('/'):g.left)+' ◂ ':'')+g.id+(g.right?' ▸ '+(Array.isArray(g.right)?g.right.join('/'):g.right):'')+' → '+(g.result||'effect'));
+  if(g.mech)fact('mech',g.mech+(g.carry!=null?', carry ×'+(g.carry/1000).toFixed(1):''));
+  if(g.field)fact('field',g.field+' '+(g.op||'mul')+' '+g.amount+', again per repeat');
+  if(g.axis)fact('again',g.axis);
+  if(g.example)fact('example',g.example);
+  if(g.wildcard)fact('wildcard','matches whatever is there; priced as it + budgets.anythingSurchargeMille, billed when it lands');
+  if(isEl&&g.wildcard){}else if(isEl){
     const mm=el('span',{});
     if(m){
       const c=el('code',{style:'cursor:pointer'},g.material);
@@ -7182,10 +7195,11 @@ function wikiGlyph(host){
   host.append(wsec('\u{1F4CB} Fields',null,true,f));
 
   const amp=el('div',{});
-  const cost=n=>{let t=0;for(let i=0;i<n;i++)t+=g.mana*Math.pow(2,Math.min(i,6));return t;};
-  amp.append(mpara('Repeating this glyph doubles its contribution and its share of the cost:'));
-  amp.append(mtable(['spoken','multiplier','running cost'],
-    [1,2,3,4].map(n=>[Array(n).fill(g.id).join(' '),'×'+Math.pow(2,n-1),String(cost(n))])));
+  const compose=gsort(g)==='mod'||g.repeat==='compose';
+  amp.append(mpara(compose?'A mod COMPOSES: saying it again applies the edit again (shotgun 3/9/27, swift ×2/×4, float −1g/−2g), and everything behind it is paid that many times:'
+                           :'Matter and effects ADD: saying it again is one more of its axis (×N), and the word cost is N words; the tariff prices the expansion:'));
+  amp.append(mtable(['spoken','effect','word cost'],
+    [1,2,3,4].map(n=>[Array(n).fill(g.id).join(' '),compose?('applied ×'+n):('×'+n),String(gword(g)*n)])));
   if(g.type==='element')amp.append(mpara('For an element the multiplier scales the MATTER — '+
     'spray voxel count, and the share of any modifier’s authorized ops.'));
   if(g.type==='form')amp.append(mpara('For a form it scales speed and lifetime: "more projectile" '+
@@ -8302,12 +8316,12 @@ const ARCH_NODES={
     sym:['ItemDef','EquipItem'],
     details:'<code>items.json</code> is BEHAVIOUR the engine switches on (kind, damage, reach, carveBonus); the per-asset sidecar is art and grip. The scene-to-engine rotation mapping is applied on read so art and hitbox rotate together.'},
 
-  glyphs:{label:'Glyphs',tag:'cpu',
-    desc:'Spell composition vocabulary: Element (a material by name), Form (Spray / Projectile) and Modifier (Trail, TransmuteTo). Hot-reloads with R.',
-    files:['assets/spells/glyphs.json','src/game/spell.h','src/game/spell.cpp'],
-    sym:['GlyphDef','GlyphLibrary','LoadGlyphs','SpellBudgets'],
-    tst:['spells'],
-    details:'A glyph names its material and the name resolves to a 12-bit id at load; an unresolvable name makes the engine REFUSE the file rather than silently pick air. Authored numbers are clamped against the engine’s own ceilings in <code>LoadGlyphs</code> — content cannot author an over-budget spell.'},
+  glyphs:{label:'Glyphs & the grimoire',tag:'cpu',
+    desc:'The magic grammar (docs/PLAN_magic_grammar.md): 44 words of five sorts — matter, effect, delivery, mod, operator — parsed by six rules into clauses, lowered to a cast list, priced by a tariff on what the cast does to the world. Two banks on the number row, a grimoire of macros. Hot-reloads with R.',
+    files:['assets/spells/glyphs.json','assets/spells/grammar_oracle.json','scripts/magic_grammar.py','src/game/spell.h','src/game/spell.cpp','src/game/caster.h','src/game/caster.cpp','src/ui/inventory_ui.cpp'],
+    sym:['GlyphDef','GlyphLibrary','ParseSpell','LowerSpell','EffectTariff','ApplySpellEffect','SpellSystem','Grimoire','ExpandWords'],
+    tst:['spells','spells-oracle','grimoire','player-kit'],
+    details:'<b>Five sorts, six rules.</b> A glyph is <code>{sort, verb, valence, word, axis}</code> in glyphs.json; nothing in C++ knows which words exist. R1 runs merge (matter and effects ADD, mods COMPOSE: shotgun³ is 27), R2 operators bind their neighbours greedily on their declared side, R3 an empty required slot is INCOMPLETE (charged, does nothing; <code>anything</code> and <code>air</code> are the explicit words), R4 a delivery closes the clause, R5 no delivery = <code>hand</code>, R6 bag order is irrelevant. <code>scripts/magic_grammar.py</code> is the executable reference: it generates docs/MAGIC_PERMUTATIONS.md and the oracle the <code>spells-oracle</code> gate parses (407 sentences). The <code>spells</code> gate asserts the LAWS over every sequence of length ≤ 3 from a 19-word alphabet (totality, commutativity, exact ×N, clause independence, delivery invariance, locality, tariff monotonicity, finite budgets), not a pinned list.<br><br><b>You pay for voxels, not words.</b> Every material has an <code>arcane</code> value (materials.json); spray/place/convert/explode/wind/mend are priced on the volume they touch, deliveries carry a per-mille premium, instances multiply everything. <code>anything</code> is priced when it lands and billed after the fact. An unstable transmute lands a melt-mode share.<br><br><b>Deliveries are records, mods are field edits.</b> hand/self instant; projectile/bolt/lob/orb/bomb flight (bomb is a real rigid body through the debris path, resolved where it rests when the fuse runs out); beam continuous. <code>aura</code> sustains an effect or mod on the body at the point, billed per tick and reserved out of the max; <code>null</code> is the op-stream filter at the MutationQueue splice; <code>echo</code> repeats; <code>mend</code> grafts what it takes from the world into the anatomy recipe, and a charred wound stops bleeding.<br><br><b>The tongue and the grimoire.</b> <code>1-0</code> speak bank A, <code>Shift+1-0</code> bank B; <code>=</code> captures the stack as a page; the character screen’s arsenal is sorted by sort with the §9 info box and a grimoire composer (nesting depth 4, cycle refusal, 16-word overflow). PLYR v4 saves pages and the twenty slots by name and still loads v3. Verify: <code>--gate spells</code>, <code>--gate spells-oracle</code>, <code>--gate grimoire</code>, <code>--shot-inventory</code> (three frames).'},
 
   microDetail:{label:'Micro Detail',tag:'cpu',
     desc:'Sub-voxel geometry with zero storage and zero sim cost. A material may declare a "micro" block; the world cell stays an ordinary voxel of that material and only the RAYMARCHER substitutes a finer subdiv^3 model when a primary ray lands on it.',

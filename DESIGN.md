@@ -3405,11 +3405,63 @@ Op budget fairness is explicit (`SpellSystem::kSpellOpsPerTick = 24` of the 64
 magic's share is deliberately NOT tunable) and overflow is **counted and shown
 in the HUD** rather than dropped silently.
 
+**The tongue: two banks on the number row (plan §12a; `game/caster.h`).**
+`1`–`0` speak bank A (slots 0..9), `Shift+1`–`0` bank B (10..19): twenty live
+words, one hand, no menu. Sprint is on Shift outside magic mode and magic mode
+captures the number row, so nothing collides. A slot holds a glyph OR a
+grimoire page (`SlotKind`), both by NAME; the HUD strip draws two rows and
+lights the bank Shift is holding. The character screen's arsenal is sorted by
+SORT into five columns — matter, effect, operator, delivery, mod — each glyph
+with its sort's colour and its valence mark (`<` takes the word before it,
+`><` is infix), unowned glyphs greyed with their name hidden (the shape of a
+word you have not learned is visible and the word is not), and hover opens
+the §9 info box, every field of which is read from the glyph's JSON entry
+(`UIState::GlyphUI`), so the box is never wrong about the glyph and a modder's
+glyph gets one free. `GrantAllAndBind` is the debug default; `Grant`/`Owns`
+are the acquisition loop's seam.
+
+**The grimoire: macros as saved word lists (plan §12b; `Grimoire`,
+`ExpandWords`).** A page is a name and a list of glyph NAMES and page NAMES.
+Speaking it pushes its expansion onto the stack exactly as if you had spoken
+the words, and the six rules apply to the result — that sentence is the whole
+mechanic. Pages are fragments (`hellfire projectile` and `hellfire bomb` are
+both live sentences; `hellfire hellfire` merges by R1), they nest to
+`budgets.maxMacroDepth` (4) with a cycle check at save time that refuses with
+the reason shown (`GrimoireWouldCycle`), and an expansion is capped by the
+16-word stack: a page speaks as much as fits and the HUD says so (rule 2: no
+unbounded expansion, ever). A word that no longer resolves drops with a log
+line and shows as `?`; the page is kept (the DESIGN §8b contract). Two ways to
+make one: `=` in magic mode CAPTURES the stack to a page auto-named from its
+readout (`fire2-trail-projectile`), and the character screen's GRIMOIRE panel
+COMPOSES — a page list (the authored starters from `glyphs.json`'s
+`conjoined` block appear read-only; `heal` = `blood mend`, `firebolt` = `fire
+trail projectile`, `ward` = `transmute null aura self`), and for the selected
+page a word row you drag glyphs and pages into and reorder, a name, the
+derived readout, the price (`?` when it depends on `anything`), Save / Delete
+/ Duplicate, and a row of twenty keys to bind it to. The row is described
+through the same `DescribeSpell` the live sentence uses, so the panel can
+never disagree with the game about what a page means. Editing a page rewires
+every slot bound to it, because slots hold the page's name.
+
+**PLYR v4** appends the grimoire (pages: name + words; the twenty slots as
+(kind, name) pairs) after the v3 payload and still loads v3 (an empty
+grimoire, the ten bound names landing in bank A). v2 and older stay refused,
+as they were. Gate `grimoire` (CPU-only, own fixtures, beside `player-kit`):
+expansion equals speaking (same cast list); nesting expands to depth and
+stops past it; a cycle is refused with a reason; the overflow cap truncates
+and reports; a missing name drops one word and keeps the page; the v4 round
+trip compares by name, a v3 payload loads with bank A intact, a truncated one
+is refused; a page bound to a key speaks its expansion; capture names the
+page from the sentence. `--shot-inventory` writes a third frame,
+`screenshot_inventory_grimoire.bmp`, with a page selected and its word row
+populated.
+
 Selftest gates `spells` (the trail's voxel budget respected exactly and the
 projectile dead with it; an overcast resolving Fatal, emitting its own payload
 and asking for the caster to be carved; `fire`×N throwing exactly N times the
-matter of `fire` at exactly N times the price; the cast latch; the laws) and
-`spells-oracle` (the parser against the reference script, every entry).
+matter of `fire` at exactly N times the price; the cast latch; the laws; the
+bomb, the sustained things, the mend), `spells-oracle` (the parser against the
+reference script, every entry) and `grimoire`.
 
 ### Items, and mouse-directed melee (2026-08-20; `game/item.h`, `game/melee.*`)
 

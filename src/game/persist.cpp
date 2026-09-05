@@ -78,7 +78,7 @@ void PutF32(std::vector<uint8_t>& out, float v) {
   PutU32(out, bits);
 }
 
-void SavePlayerKit(const PlayerKitRefs& r, std::vector<uint8_t>& out) {
+void SavePlayerKitBytes(const PlayerKitRefs& r, std::vector<uint8_t>& out, uint32_t version) {
   auto putSlots = [&](const ItemStack* v, int n) {
     PutU32(out, (uint32_t)n);
     for (int i = 0; i < n; i++) {
@@ -136,13 +136,37 @@ void SavePlayerKit(const PlayerKitRefs& r, std::vector<uint8_t>& out) {
       }
     }
   }
+  if (version < 4) return;
+
+  // ---- v4: the grimoire (plan §12c) ------------------------------------------
+  //
+  //   u32 pages    then per page: str name, u32 words, then per word: str
+  //   u32 slots    then per slot: u32 kind (SlotKind), str name
+  //
+  // Words and slot names are glyph NAMES and page NAMES, the same contract as
+  // every other slot in this section: a name that no longer resolves drops
+  // that word with a log line and keeps the page.
+  const Grimoire& gr = r.caster->grimoire;
+  PutU32(out, (uint32_t)gr.pages.size());
+  for (const GrimoirePage& p : gr.pages) {
+    PutStr(out, p.name);
+    PutU32(out, (uint32_t)p.words.size());
+    for (const std::string& w : p.words) PutStr(out, w);
+  }
+  PutU32(out, (uint32_t)kGlyphSlots);
+  for (int i = 0; i < kGlyphSlots; i++) {
+    const SlotKind k = gi.KindAt(i);
+    PutU32(out, (uint32_t)k);
+    PutStr(out, k == SlotKind::Page ? gi.PageAt(i) : glyphName(gi.At(i)));
+  }
 }
 
 bool LoadPlayerKit(const PlayerKitRefs& r, const uint8_t* data, size_t len,
                    uint32_t version) {
-  if (version != kPlayerKitSaveVersion) {
-    std::fprintf(stderr, "PLYR: unknown version %u (this build writes %u)\n",
-                 version, kPlayerKitSaveVersion);
+  if (version > kPlayerKitSaveVersion || version < kPlayerKitOldestLoadable) {
+    std::fprintf(stderr, "PLYR: unknown version %u (this build writes %u, loads %u..%u)\n",
+                 version, kPlayerKitSaveVersion, kPlayerKitOldestLoadable,
+                 kPlayerKitSaveVersion);
     return false;
   }
   Reader rd{data, len};
@@ -228,6 +252,40 @@ bool LoadPlayerKit(const PlayerKitRefs& r, const uint8_t* data, size_t len,
       // same rule the slots above follow for an unresolvable name.
       if (rd.ok && !d.Empty() && r.items->Find(name) >= 0)
         r.kit->wornDamage[name] = std::move(d);
+    }
+  }
+  // ---- v4: the grimoire ------------------------------------------------------
+  r.caster->grimoire.pages.clear();
+  if (version >= 4) {
+    const uint32_t pages = rd.U32();
+    for (uint32_t i = 0; i < pages && rd.ok; i++) {
+      GrimoirePage p;
+      p.name = rd.Str();
+      const uint32_t nw = rd.U32();
+      if (!rd.ok || (size_t)nw * 4u > rd.left) {
+        rd.ok = false;
+        break;
+      }
+      for (uint32_t k = 0; k < nw && rd.ok; k++) p.words.push_back(rd.Str());
+      // Kept even when a word names nothing any more: the readout shows `?`
+      // and the page is the player's to fix, not the loader's to delete.
+      if (rd.ok && !p.name.empty() &&
+          (int)r.caster->grimoire.pages.size() < r.glyphs->budgets.maxGrimoirePages)
+        r.caster->grimoire.pages.push_back(std::move(p));
+    }
+    const uint32_t slots = rd.U32();
+    for (uint32_t i = 0; i < slots && rd.ok; i++) {
+      const uint32_t kind = rd.U32();
+      const std::string name = rd.Str();
+      if (!rd.ok) break;
+      if ((int)i >= kGlyphSlots) continue;
+      if (kind == (uint32_t)SlotKind::Page) {
+        if (!name.empty()) gi.BindPage((int)i, name);
+      } else if (kind == (uint32_t)SlotKind::Glyph) {
+        gi.Bind((int)i, name.empty() ? -1 : r.glyphs->Find(name));
+      } else {
+        gi.Bind((int)i, -1);
+      }
     }
   }
   if (dropped > 0)
@@ -352,6 +410,10 @@ bool LoadWorldItems(const WorldItemRefs& r, const uint8_t* data, size_t len,
 
 }  // namespace
 
+void SavePlayerKit(const PlayerKitRefs& r, std::vector<uint8_t>& out, uint32_t version) {
+  SavePlayerKitBytes(r, out, version);
+}
+
 EntityIO MakeEntityIO(DebrisSystem& debris, MobSystem& mobs,
                       PlayerAvatar* avatar, const PlayerKitRefs* player,
                       const WorldItemRefs* ground) {
@@ -401,8 +463,9 @@ EntityIO MakeEntityIO(DebrisSystem& debris, MobSystem& mobs,
           r.kit->wornDamage.clear();
           r.caster->inventory.owned.clear();
           for (int i = 0; i < kGlyphSlots; i++) r.caster->inventory.Bind(i, -1);
+          r.caster->grimoire.pages.clear();
         },
-        [r](std::vector<uint8_t>& out) { SavePlayerKit(r, out); },
+        [r](std::vector<uint8_t>& out) { SavePlayerKitBytes(r, out, kPlayerKitSaveVersion); },
         [r](const uint8_t* d, size_t n, uint32_t v) {
           return LoadPlayerKit(r, d, n, v);
         }});
