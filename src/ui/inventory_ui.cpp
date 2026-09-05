@@ -436,6 +436,42 @@ void InspectOverlay(const UIState& s, ImVec2 at, ImVec2 size) {
   }
 }
 
+// CAST ON A PART. With a sentence on the stack, every present limb of the
+// inspector becomes a target: click it and the spell resolves there with
+// `self` (docs/PLAN_magic_grammar.md §7). The panel never touches the VM — it
+// latches the slot, and main.cpp turns the slot into a position and casts.
+void InspectCastPicks(UIState& s, ImVec2 at, ImVec2 size) {
+  if (!s.bodyValid || s.spellText.empty()) return;
+  ImDrawList* dl = ImGui::GetWindowDrawList();
+  const float flash = 0.5f + 0.5f * (float)std::sin(ImGui::GetTime() * 3.0);
+  for (int i = 0; i < UIState::kSlotCount; i++) {
+    const UIState::BodyPartUI& b = s.body[i];
+    if (!b.present || b.severed || !b.projValid) continue;
+    const ImVec2 p0(at.x + b.projMin[0] * size.x, at.y + b.projMin[1] * size.y);
+    const ImVec2 p1(at.x + b.projMax[0] * size.x, at.y + b.projMax[1] * size.y);
+    if (p1.x - p0.x < 2.0f || p1.y - p0.y < 2.0f) continue;
+    ImGui::SetCursorScreenPos(p0);
+    ImGui::PushID(1000 + i);
+    ImGui::InvisibleButton("##castpart", ImVec2(p1.x - p0.x, p1.y - p0.y));
+    const bool hot = ImGui::IsItemHovered();
+    if (hot) {
+      // A pixel outline, not an anti-aliased stroke: the frame reads as "this
+      // is where it lands".
+      const ImU32 col = Fade(IM_COL32(150, 200, 255, 255), 0.5f + 0.5f * flash);
+      dl->AddRectFilled(ImVec2(p0.x, p0.y), ImVec2(p1.x, p0.y + 2), col);
+      dl->AddRectFilled(ImVec2(p0.x, p1.y - 2), ImVec2(p1.x, p1.y), col);
+      dl->AddRectFilled(ImVec2(p0.x, p0.y), ImVec2(p0.x + 2, p1.y), col);
+      dl->AddRectFilled(ImVec2(p1.x - 2, p0.y), ImVec2(p1.x, p1.y), col);
+      ImGui::SetTooltip("cast %s here", s.spellText.c_str());
+    }
+    if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
+      s.castAtPart.pending = true;
+      s.castAtPart.slot = i;
+    }
+    ImGui::PopID();
+  }
+}
+
 // One row of the injury list. Ordered worst-first by the caller.
 //
 // LAID OUT WITH THE CURSOR, not with hand-computed y offsets. The first
@@ -620,8 +656,10 @@ void DrawInventoryScreen(UIState& s) {
 
     ImGui::SetCursorScreenPos(ImVec2(portX, portY));
     Portrait(s, ImVec2(portX, portY), ImVec2(kPortraitW, kPortraitH));
-    if (s.inspectMode)
+    if (s.inspectMode) {
       InspectOverlay(s, ImVec2(portX, portY), ImVec2(kPortraitW, kPortraitH));
+      InspectCastPicks(s, ImVec2(portX, portY), ImVec2(kPortraitW, kPortraitH));
+    }
 
     if (!s.inspectMode) {
       // Armour columns. Indices are the EquipSlotId order from

@@ -187,6 +187,8 @@ struct GlyphDef {
   RepeatKind repeat = RepeatKind::Add;
 
   // ---- matter ----
+  // Also: what a `place` effect lays, and what a rigid-body delivery (bomb)
+  // is made of.
   std::string materialName;      // authored name; resolved at load
   uint32_t material = 0;         // resolved 12-bit id (0 = air, the void word)
   bool wildcard = false;         // `anything`: matches what is actually there
@@ -488,6 +490,7 @@ struct SpellProjectile {
   int32_t markedX = 0, markedY = 0, markedZ = 0;
   bool markedValid = false;
   int32_t bouncesLeft = 0, pierceLeft = 0;
+  bool piercing = false;     // inside the wall it is passing through
   int32_t fuseLeft = -1;     // >= 0: resting, counting down to resolve
   bool resting = false;
   bool alive = true;
@@ -499,6 +502,48 @@ struct SpellProjectile {
   // without the VM knowing what a mob is (thesis 4).
   uint64_t casterId = 0;
   uint64_t body = 0;         // rigid-body handle for a `bomb` (P2), 0 = none
+};
+
+// A RIGID-BODY CARRIER (bomb): flight with a fuse, as a real body through the
+// existing debris path. The VM cannot create one (that is physics, and the
+// owner's business), so it REPORTS the request and the owner answers with
+// SpellSystem::AdoptBody(token, handle). From then on the bomb is ordinary
+// debris — it falls, rolls, settles, catches fire — and the VM only asks where
+// it is (SpellBodyProbe) until the fuse runs out.
+struct SpellBodyRequest {
+  uint32_t token = 0;    // matches the AdoptBody call
+  Vec3 pos{};            // world voxels, the ball's centre
+  Vec3 vel{};            // voxels per second
+  float radius = 1.5f;   // voxels
+  uint32_t material = 0; // what the ball is made of (the delivery glyph's)
+};
+
+struct SpellBomb {
+  SpellCast cast;
+  uint32_t token = 0;
+  uint64_t body = 0;         // 0 until adopted
+  int32_t fuseLeft = 0;
+  int32_t ticksLeft = 0;     // hard bound even if the fuse never runs (rule 2)
+  SpellFxVec lastPos{};
+  int32_t trailBudget = 0;
+  int32_t trailPhase = 0;
+  int32_t markedX = 0, markedY = 0, markedZ = 0;
+  bool markedValid = false;
+  int32_t instability = 0;
+  int32_t gen = 0;
+  uint64_t casterId = 0;
+};
+
+// What the VM may ask the owner about bodies, one tick latent, without knowing
+// what a mob or a rigid body is (thesis 4). Nullable: without it a bomb goes
+// off where it was thrown and nothing seeks.
+struct SpellBodyProbe {
+  // The current centre of an adopted body; false when it no longer exists.
+  bool (*bodyAt)(void* ctx, uint64_t handle, Vec3& outCentre) = nullptr;
+  // The nearest body worth turning toward, from `from`, for `casterId`'s own
+  // bolt (so a caster's bolts do not seek the caster). False when none.
+  bool (*nearestTarget)(void* ctx, Vec3 from, uint64_t casterId, Vec3& outCentre) = nullptr;
+  void* ctx = nullptr;
 };
 
 // ---- caster state ----------------------------------------------------------
@@ -573,6 +618,14 @@ struct SpellEmission {
   // `anything` resolved: what the wildcard turned out to be worth, to bill the
   // caster now (plan §4). Summed by the owner into the caster's pool.
   int32_t billOnResolve = 0;
+  // Rigid-body carriers to create (bomb) and ones whose fuse has run out.
+  std::vector<SpellBodyRequest> bodyRequests;
+  std::vector<uint64_t> bodyDone;
+  // A Mod on a body-anchored delivery acts on the CASTER's body where that
+  // means anything: `float self` is a hop, `heavy self` a shove down. Voxels
+  // per second, reported for the owner to apply (the VM cannot touch a
+  // controller). Zero when no anchored cast carried a gravity edit.
+  Vec3 casterImpulseVps{};
 };
 
 // A probe into the world the VM may consult while resolving (the CPU mirror,
@@ -612,22 +665,38 @@ class SpellSystem {
                   SpellEmission& out, const SpellProbe* probe = nullptr,
                   const SpellFxVec* selfAt = nullptr);
 
-  // Advance every live projectile one tick.
+  // Advance every live projectile and bomb one tick. `bodies` answers where
+  // adopted bodies are and what a seeking bolt should turn toward.
   void Tick(uint32_t tick, const World& world,
-            const std::vector<uint32_t>& classOf, SpellEmission& out);
+            const std::vector<uint32_t>& classOf, SpellEmission& out,
+            const SpellBodyProbe* bodies = nullptr);
 
-  void Clear() { live_.clear(); }
+  // The owner's answer to a SpellBodyRequest: the handle it made for `token`.
+  // A token the VM no longer holds (the bomb already went off) is ignored and
+  // the owner keeps the body.
+  bool AdoptBody(uint32_t token, uint64_t handle);
+
+  void Clear() {
+    live_.clear();
+    bombs_.clear();
+  }
   const std::vector<SpellProjectile>& Live() const { return live_; }
   int LiveCount() const { return (int)live_.size(); }
+  const std::vector<SpellBomb>& Bombs() const { return bombs_; }
+  int BombCount() const { return (int)bombs_.size(); }
   int OpsDroppedLastTick() const { return opsDropped_; }
 
  private:
   void Launch(const SpellCast& cast, SpellFxVec originFx, SpellFxVec aim,
               uint64_t casterId, uint32_t tick, int32_t instance,
               int32_t instability, SpellEmission& out, const SpellProbe* probe);
+  void RequestBody(const SpellCast& cast, SpellFxVec originFx, SpellFxVec aim,
+                   uint64_t casterId, int32_t instability, SpellEmission& out);
 
   const GlyphLibrary* lib_ = nullptr;
   std::vector<SpellProjectile> live_;
+  std::vector<SpellBomb> bombs_;
+  uint32_t nextToken_ = 0;
   int opsDropped_ = 0;
 };
 

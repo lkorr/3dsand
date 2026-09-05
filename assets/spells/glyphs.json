@@ -383,6 +383,7 @@
       "id": "bomb",
       "sort": "delivery",
       "word": 3,
+      "material": "stone",
       "mech": "flight",
       "speed": 16,
       "lifetimeTicks": 300,

@@ -3853,6 +3853,9 @@ int main(int argc, char** argv) {
   bool prevMouseR = false;
   // RMB cast, latched until a tick actually runs (see the cast site below).
   bool castQueued = false;
+  // A body part clicked in the inspector with a sentence on the stack, latched
+  // the same way: the slot, or -1.
+  int castAtPartQueued = -1;
   std::vector<Grenade> grenades;
 
   // ---- magic (game/spell.h, game/caster.h) ---------------------------------
@@ -6223,6 +6226,37 @@ int main(int argc, char** argv) {
         // rather than a pending intent.
         const bool castNow = castQueued;
         castQueued = false;
+        // The inspector's "cast it on this part": `self` resolves at the
+        // clicked limb's centre, with the effect radii clamped to the part.
+        // Same Cast(), one extra argument (plan §7); the VM never learns what
+        // a part is.
+        const int castPart = castAtPartQueued;
+        castAtPartQueued = -1;
+        if (castPart >= 0 && !caster.stack.Empty() && avatar.Spawned()) {
+          int part = -1;
+          if (const MobDef* def = avatar.Def()) {
+            for (int i = 0; i < (int)def->limbs.size(); i++)
+              if (BodySlotFor(avatar.PartName(i), avatar.PartTag(i)) == castPart &&
+                  avatar.PartAlive(i))
+                part = i;
+          }
+          Vec3 at;
+          Quat rot;
+          if (part >= 0 && avatar.PartWorldTransform(part, at, rot)) {
+            const SpellFxVec selfAt{SpellFxFromFloat(at.x), SpellFxFromFloat(at.y),
+                                    SpellFxFromFloat(at.z)};
+            const Vec3 body = player.pos;
+            const SpellFxVec originFx{SpellFxFromFloat(body.x), SpellFxFromFloat(body.y),
+                                      SpellFxFromFloat(body.z)};
+            const SpellFxVec dirFx{0, kSpellFxOne, 0};
+            const SpellProbe probe = WorldSpellProbe(world);
+            CastResult res = spells.Cast(caster.compiled, caster.mana, playerHealth,
+                                         0x9134A5EEu, originFx, dirFx, tick, emit, &probe,
+                                         &selfAt);
+            caster.lastOutcome = res.outcome;
+            if (res.outcome != CastOutcome::Nothing) caster.Clear(glyphs);
+          }
+        }
         if (castNow && !caster.stack.Empty()) {
           // Origin at the muzzle — in front of the eye so the bolt does not
           // spawn inside the caster's own head. Direction is the aim ray.
@@ -6254,7 +6288,70 @@ int main(int argc, char** argv) {
           if (res.outcome != CastOutcome::Nothing) caster.Clear(glyphs);
         }
 
-        spells.Tick(tick, world, classOf, emit);
+        // What the VM may ask about bodies: where an adopted bomb is, and the
+        // nearest mob for a seeking bolt (never the caster's own body).
+        struct SpellBodyCtx {
+          Physics* phys;
+          MobSystem* mobs;
+        } bodyCtx{&phys, &mobs};
+        SpellBodyProbe bodyProbe;
+        bodyProbe.ctx = &bodyCtx;
+        bodyProbe.bodyAt = [](void* c, uint64_t h, Vec3& out) {
+          BodyTransform xf;
+          if (!((SpellBodyCtx*)c)->phys->GetTransform(h, xf)) return false;
+          out = xf.pos;
+          return true;
+        };
+        bodyProbe.nearestTarget = [](void* c, Vec3 from, uint64_t, Vec3& out) {
+          MobSystem& m = *((SpellBodyCtx*)c)->mobs;
+          float best = 96.0f * 96.0f;   // seek range, voxels squared
+          bool found = false;
+          for (uint32_t i = 0; i < m.MobCount(); i++) {
+            const Vec3 p = m.MobOrigin(m.MobIdAt(i));
+            const Vec3 d = p - from;
+            const float d2 = d.x * d.x + d.y * d.y + d.z * d.z;
+            if (d2 < best) {
+              best = d2;
+              out = p;
+              found = true;
+            }
+          }
+          return found;
+        };
+        spells.Tick(tick, world, classOf, emit, &bodyProbe);
+
+        // BOMBS ARE DEBRIS. The VM asked for a rigid body; this is the owner
+        // making one through the same path a dropped item takes (a Jolt
+        // sphere so it rolls, a voxel ball to draw it, adopted by the debris
+        // system so it falls, settles, burns and can be blown apart) and
+        // handing the handle back. When the fuse runs out the VM resolves the
+        // payload where the body is and asks for it to be taken away.
+        for (const SpellBodyRequest& rq : emit.bodyRequests) {
+          const float r = rq.radius;
+          std::vector<DebrisVoxel> ball;
+          const int ext = (int)std::ceil(r);
+          for (int z = -ext; z < ext; z++)
+            for (int y = -ext; y < ext; y++)
+              for (int x = -ext; x < ext; x++) {
+                const float dx = x + 0.5f, dy = y + 0.5f, dz = z + 0.5f;
+                if (dx * dx + dy * dy + dz * dz <= r * r)
+                  ball.push_back({(int8_t)x, (int8_t)y, (int8_t)z, 0, (uint16_t)rq.material});
+              }
+          BodyTransform xf{};
+          xf.pos = rq.pos;
+          xf.quat[3] = 1;
+          const float density =
+              rq.material < mats.size() ? (float)mats[rq.material].gpu.density : 2000.0f;
+          const uint64_t h = phys.CreateSphereBody(rq.pos, r, density);
+          if (!h) continue;
+          phys.SetBodyVelocity(h, rq.vel);
+          phys.ReleaseToWorldWhenClear(h);
+          debris.AdoptBody(h, std::move(ball), xf);
+          spells.AdoptBody(rq.token, h);
+        }
+        for (uint64_t h : emit.bodyDone) debris.DestroyBody(h);
+        // An anchored gravity Mod acting on the caster's own body (a hop).
+        if (emit.casterImpulseVps.y != 0.0f) player.vel.y += emit.casterImpulseVps.y;
 
         // THE WILDCARD'S BILL. `anything` is priced by what it turned out to
         // be, when it resolves (plan §4): mana first, then the body, exactly
@@ -7417,6 +7514,10 @@ int main(int argc, char** argv) {
           }
           ui.kitMessageAge = 0.0f;
         }
+      }
+      if (ui.castAtPart.pending) {
+        ui.castAtPart.pending = false;
+        castAtPartQueued = ui.castAtPart.slot;
       }
       if (ui.bindGlyph.pending) {
         ui.bindGlyph.pending = false;

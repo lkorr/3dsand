@@ -474,6 +474,16 @@ bool LoadGlyphs(const std::string& path, const std::vector<MaterialDef>& mats,
         d.ticks = ClampI(g.value("ticks", 90), 1, b.maxStatusTicks);
         d.body = g.value("body", false);
         d.resolveOnExpiry = g.value("resolveOnExpiry", false);
+        if (d.body) {
+          // A rigid-body carrier is MADE of something: the ball the owner
+          // adopts as debris needs a material, and it is content.
+          d.materialName = g.value("material", std::string());
+          if (!resolveMat(d.materialName, d.material) || d.material == 0) {
+            errors += where + "is a body delivery with unknown material \"" +
+                      d.materialName + "\"\n";
+            return false;
+          }
+        }
         break;
       }
       case GlyphSort::Mod: {
@@ -1721,12 +1731,21 @@ CastResult SpellSystem::Cast(const CastList& list, CasterState& caster,
       switch (c.delivery.mech) {
         case DeliveryMech::Instant: {
           SpellFxVec at = originFx;
+          const std::vector<EffectInst>* payload = &c.payload;
+          std::vector<EffectInst> clamped;
           if (c.delivery.glyph < 0) {
             // hand: at reach, along the aim.
             const SpellFxVec u = Unit(d, (int64_t)c.delivery.reach * kSpellFxOne);
             at = {originFx.x + u.x, originFx.y + u.y, originFx.z + u.z};
           } else if (selfAt) {
+            // The character screen's clicked part: resolve THERE, with the
+            // effect radii clamped to the part so `fire self` on a stump
+            // chars the stump and not the torso beside it.
             at = *selfAt;
+            clamped = c.payload;
+            for (EffectInst& e : clamped)
+              if (e.radius > c.delivery.impactRadius) e.radius = c.delivery.impactRadius;
+            payload = &clamped;
           }
           // Fanned resolve points around the anchor for a shotgun on a
           // body-anchored delivery: instance i lands a voxel or two off.
@@ -1735,12 +1754,20 @@ CastResult SpellSystem::Cast(const CastList& list, CasterState& caster,
                                       2 * kSpellFxOne);
             at = {at.x + u.x, at.y + u.y, at.z + u.z};
           }
-          ApplySpellEffect(*lib_, c.payload, at, d, 1000, out, probe, r.instability,
+          ApplySpellEffect(*lib_, *payload, at, d, 1000, out, probe, r.instability,
                            (uint32_t)i);
+          // A gravity Mod on an anchored delivery acts on the caster's body:
+          // `float self` hops, `float float self` more so, `heavy` shoves
+          // down. Once, as an impulse; `aura` is what makes it a status.
+          if (i == 0 && c.delivery.gravityMille != 0)
+            out.casterImpulseVps.y += -(float)c.delivery.gravityMille * 0.012f;
           break;
         }
         case DeliveryMech::Flight:
-          Launch(c, originFx, d, casterId, tick, i, r.instability, out, probe);
+          if (c.delivery.body)
+            RequestBody(c, originFx, d, casterId, r.instability, out);
+          else
+            Launch(c, originFx, d, casterId, tick, i, r.instability, out, probe);
           break;
         case DeliveryMech::Continuous: {
           // Until the held beam lands (P3): one resolve at the ray's reach.
@@ -1756,13 +1783,62 @@ CastResult SpellSystem::Cast(const CastList& list, CasterState& caster,
   return r;
 }
 
+void SpellSystem::RequestBody(const SpellCast& cast, SpellFxVec originFx,
+                              SpellFxVec aim, uint64_t casterId,
+                              int32_t instability, SpellEmission& out) {
+  const SpellBudgets& b = lib_->budgets;
+  // Bombs share the live-projectile cap (rule 2); over it, the bomb goes off
+  // in the hand like an over-budget bolt would.
+  if ((int)(live_.size() + bombs_.size()) >= b.maxLiveProjectiles ||
+      cast.generation > b.maxGeneration) {
+    ApplySpellEffect(*lib_, cast.payload, originFx, aim, 400, out, nullptr, instability);
+    return;
+  }
+  SpellBomb bm;
+  bm.cast = cast;
+  bm.token = ++nextToken_;
+  bm.fuseLeft = std::max(1, cast.delivery.fuseTicks);
+  bm.ticksLeft = ClampI(SatAdd(cast.delivery.lifetimeTicks, cast.delivery.fuseTicks), 1,
+                        2 * b.maxLifetimeTicks);
+  bm.lastPos = originFx;
+  bm.trailBudget = cast.delivery.trail.empty() ? 0 : cast.delivery.trailBudget;
+  bm.instability = instability;
+  bm.gen = cast.generation;
+  bm.casterId = casterId;
+  bombs_.push_back(std::move(bm));
+
+  SpellBodyRequest rq;
+  rq.token = nextToken_;
+  rq.pos = Vec3{SpellFxToFloat(originFx.x), SpellFxToFloat(originFx.y),
+                SpellFxToFloat(originFx.z)};
+  const SpellFxVec v = Unit(aim, (int64_t)cast.delivery.speed * kSpellFxOne);
+  // voxels/tick -> voxels/second at the physics boundary
+  rq.vel = Vec3{SpellFxToFloat(v.x) * (float)kTicksPerSecond,
+                SpellFxToFloat(v.y) * (float)kTicksPerSecond,
+                SpellFxToFloat(v.z) * (float)kTicksPerSecond};
+  rq.radius = 1.5f;
+  rq.material = lib_->Delivery(cast.delivery.glyph).material;
+  out.bodyRequests.push_back(rq);
+}
+
+bool SpellSystem::AdoptBody(uint32_t token, uint64_t handle) {
+  for (SpellBomb& bm : bombs_) {
+    if (bm.token == token) {
+      bm.body = handle;
+      return true;
+    }
+  }
+  return false;
+}
+
 void SpellSystem::Tick(uint32_t tick, const World& world,
                        const std::vector<uint32_t>& classOf,
-                       SpellEmission& out) {
+                       SpellEmission& out, const SpellBodyProbe* bodies) {
   opsDropped_ = 0;
   if (!lib_) return;
   int opsUsed = 0;
   const SpellProbe probe = WorldSpellProbe(world);
+  const SpellBudgets& b = lib_->budgets;
 
   auto solidAt = [&](int32_t x, int32_t y, int32_t z) {
     // OUT OF WINDOW = SOLID. The residency-window rule (DESIGN.md §3):
@@ -1777,25 +1853,121 @@ void SpellSystem::Tick(uint32_t tick, const World& world,
     return k == CellKind::Solid;
   };
 
+  // A trail mark at a whole voxel: charge the hard budget BEFORE emitting and
+  // refuse when it does not fit (rule 2). Returns false when the budget died.
+  auto mark = [&](const SpellCast& cast, int32_t& budget, int32_t& phase, int32_t& mx0,
+                  int32_t& my0, int32_t& mz0, bool& valid, SpellFxVec at, SpellFxVec dir) {
+    if (budget <= 0 || cast.delivery.trail.empty()) return true;
+    const int32_t mx = SpellFxFloor(at.x), my = SpellFxFloor(at.y), mz = SpellFxFloor(at.z);
+    if (valid && mx == mx0 && my == my0 && mz == mz0) return true;
+    if (!world.CellInWindow({(int)mx, (int)my, (int)mz})) return true;
+    const int32_t every = std::max(1, cast.delivery.trailEvery);
+    if ((phase++ % every) != 0) return true;
+    if (opsUsed >= kSpellOpsPerTick) {
+      opsDropped_++;
+      return true;
+    }
+    int32_t vol = 0;
+    for (const EffectInst& e : cast.delivery.trail) vol = SatAdd(vol, EffectVolume(*lib_, e));
+    if (vol < 1) vol = 1;
+    if (vol > budget) {
+      // Cannot afford another mark: the trail is the spell's whole point, so
+      // the carrier dies with its budget rather than flying on inertly.
+      budget = 0;
+      return false;
+    }
+    budget -= vol;
+    const size_t before = out.ops.size();
+    const SpellFxVec c{mx * kSpellFxOne + kSpellFxOne / 2, my * kSpellFxOne + kSpellFxOne / 2,
+                       mz * kSpellFxOne + kSpellFxOne / 2};
+    ApplySpellEffect(*lib_, cast.delivery.trail, c, dir, 1000, out, &probe, 0, (uint32_t)phase);
+    opsUsed += (int)(out.ops.size() - before);
+    mx0 = mx;
+    my0 = my;
+    mz0 = mz;
+    valid = true;
+    return budget > 0;
+  };
+
+  // Resolve a cast at a point through the SAME function backfire uses
+  // (thesis 2), then its children. `from` is the last free position, which is
+  // where children launch from — a child launched inside the wall it hit would
+  // impact on its first sub-step and chain.
+  auto resolve = [&](const SpellCast& cast, SpellFxVec at, SpellFxVec from, SpellFxVec dir,
+                     int32_t instability, int32_t gen, uint64_t casterId, uint32_t salt) {
+    if (opsUsed < kSpellOpsPerTick) {
+      const size_t before = out.ops.size();
+      ApplySpellEffect(*lib_, cast.payload, at, dir, 1000, out, &probe, instability, salt);
+      opsUsed += (int)(out.ops.size() - before);
+    } else {
+      opsDropped_++;
+    }
+    // SPLIT: children with the same payload, one generation down, fanned back
+    // off the surface. The generation counter is the subcriticality guarantee
+    // (rule 2): nothing past budgets.maxGeneration launches.
+    if (cast.delivery.children > 1 && cast.delivery.mech == DeliveryMech::Flight &&
+        !cast.delivery.body && gen + 1 <= b.maxGeneration) {
+      SpellCast child = cast;
+      child.generation = gen + 1;
+      const SpellFxVec back{-dir.x, -dir.y, -dir.z};
+      for (int32_t k = 0; k < cast.delivery.children; k++) {
+        const SpellFxVec d =
+            SpellFan(back, k + 1, cast.delivery.children + 1, tick ^ salt, casterId);
+        Launch(child, from, d, casterId, tick, k, instability, out, &probe);
+      }
+    }
+  };
+
+  // Steer a seeking bolt toward the nearest target. The target is a float
+  // position from the owner (a mob origin); it is converted once and every
+  // update to the authoritative velocity is integer.
+  auto seek = [&](SpellProjectile& p) {
+    if (p.cast.delivery.seek <= 0 || !bodies || !bodies->nearestTarget) return;
+    Vec3 tgt;
+    const Vec3 from{SpellFxToFloat(p.pos.x), SpellFxToFloat(p.pos.y), SpellFxToFloat(p.pos.z)};
+    if (!bodies->nearestTarget(bodies->ctx, from, p.casterId, tgt)) return;
+    const int64_t sp = IntSqrt((int64_t)p.vel.x * p.vel.x + (int64_t)p.vel.y * p.vel.y +
+                               (int64_t)p.vel.z * p.vel.z);
+    if (sp <= 0) return;
+    const SpellFxVec to{SpellFxFromFloat(tgt.x) - p.pos.x, SpellFxFromFloat(tgt.y) - p.pos.y,
+                        SpellFxFromFloat(tgt.z) - p.pos.z};
+    const SpellFxVec u = Unit(to, sp);
+    const int32_t k = std::min(p.cast.delivery.seek, 8);
+    SpellFxVec v{(int32_t)(((int64_t)p.vel.x * (16 - k) + (int64_t)u.x * k) / 16),
+                 (int32_t)(((int64_t)p.vel.y * (16 - k) + (int64_t)u.y * k) / 16),
+                 (int32_t)(((int64_t)p.vel.z * (16 - k) + (int64_t)u.z * k) / 16)};
+    p.vel = Unit(v, sp);
+  };
+
   for (size_t i = 0; i < live_.size();) {
     SpellProjectile& p = live_[i];
     bool impact = false;
     SpellFxVec impactAt = p.pos;
 
-    if (--p.ticksLeft <= 0) {
+    if (p.resting) {
+      // A fused bolt sits where it landed until the fuse runs out.
+      if (--p.fuseLeft <= 0) {
+        resolve(p.cast, p.pos, p.pos, {0, kSpellFxOne, 0}, p.instability, p.gen, p.casterId,
+                (uint32_t)tick);
+        p.alive = false;
+      }
+    } else if (--p.ticksLeft <= 0) {
       // Lifetime expiry is a HARD bound (rule 2). An expired bolt fizzles —
       // unless the delivery says its life running out IS its resolve (orb).
-      if (p.cast.delivery.resolveOnExpiry) impact = true;
+      if (p.cast.delivery.resolveOnExpiry) {
+        impact = true;
+        impactAt = p.pos;
+      }
       p.alive = false;
     } else {
-      // Gravity, per the record.
+      // Gravity and homing, per the record.
       if (p.cast.delivery.gravityMille != 0)
         p.vel.y -= (int32_t)((int64_t)kGravityFxPerTick2 * p.cast.delivery.gravityMille / 1000);
+      seek(p);
       // Swept integration with anti-tunneling: step at most half a voxel at a
       // time, exactly as sim_particle.wgsl does.
       const int32_t kHalf = kSpellFxOne / 2;
-      int64_t maxComp = std::max({(int64_t)std::abs(p.vel.x),
-                                  (int64_t)std::abs(p.vel.y),
+      int64_t maxComp = std::max({(int64_t)std::abs(p.vel.x), (int64_t)std::abs(p.vel.y),
                                   (int64_t)std::abs(p.vel.z)});
       int32_t steps = (int32_t)((maxComp + kHalf - 1) / kHalf);
       if (steps < 1) steps = 1;
@@ -1808,74 +1980,95 @@ void SpellSystem::Tick(uint32_t tick, const World& world,
         next.z += p.vel.z / steps;
         const int32_t cx = SpellFxFloor(next.x), cy = SpellFxFloor(next.y),
                       cz = SpellFxFloor(next.z);
-        if (solidAt(cx, cy, cz)) {
+        const bool solid = solidAt(cx, cy, cz);
+        if (solid && p.piercing) {
+          // Still inside the wall it is passing through.
+          p.pos = next;
+          continue;
+        }
+        if (!solid) p.piercing = false;
+        if (solid) {
+          if (p.pierceLeft > 0) {
+            // PIERCE: through this wall, resolving on the next one.
+            p.pierceLeft--;
+            p.piercing = true;
+            p.pos = next;
+            continue;
+          }
+          if (p.bouncesLeft > 0) {
+            // BOUNCE: reflect the axis that entered the solid (each axis
+            // probed alone), losing a fifth of the speed so it settles.
+            p.bouncesLeft--;
+            const int32_t px = SpellFxFloor(p.pos.x), py = SpellFxFloor(p.pos.y),
+                          pz = SpellFxFloor(p.pos.z);
+            bool fx = solidAt(cx, py, pz), fy = solidAt(px, cy, pz), fz = solidAt(px, py, cz);
+            if (!fx && !fy && !fz) fx = fy = fz = true;
+            if (fx) p.vel.x = -p.vel.x;
+            if (fy) p.vel.y = -p.vel.y;
+            if (fz) p.vel.z = -p.vel.z;
+            p.vel.x = p.vel.x * 4 / 5;
+            p.vel.y = p.vel.y * 4 / 5;
+            p.vel.z = p.vel.z * 4 / 5;
+            continue;
+          }
+          if (p.cast.delivery.fuseTicks > 0) {
+            // FUSE: rest where it landed and count down.
+            p.resting = true;
+            p.fuseLeft = p.cast.delivery.fuseTicks;
+            break;
+          }
           impact = true;
           impactAt = next;
           break;
         }
         p.pos = next;
-
-        // Trail: run the trail effects at each WHOLE VOXEL crossed, charging a
-        // hard budget BEFORE emitting and refusing when it does not fit.
-        if (p.trailBudget > 0 && !p.cast.delivery.trail.empty()) {
-          const int32_t mx = SpellFxFloor(p.pos.x), my = SpellFxFloor(p.pos.y),
-                        mz = SpellFxFloor(p.pos.z);
-          if (p.markedValid && mx == p.markedX && my == p.markedY && mz == p.markedZ)
-            continue;
-          if (!world.CellInWindow({(int)mx, (int)my, (int)mz})) continue;
-          const int32_t every = std::max(1, p.cast.delivery.trailEvery);
-          if ((p.trailPhase++ % every) != 0) continue;
-          if (opsUsed >= kSpellOpsPerTick) {
-            opsDropped_++;
-            continue;
-          }
-          int32_t vol = 0;
-          for (const EffectInst& e : p.cast.delivery.trail)
-            vol = SatAdd(vol, EffectVolume(*lib_, e));
-          if (vol < 1) vol = 1;
-          if (vol > p.trailBudget) {
-            // Cannot afford another mark: the trail is the spell's whole
-            // point, so the projectile dies with its budget rather than
-            // flying on inertly.
-            p.trailBudget = 0;
-            p.alive = false;
-            break;
-          }
-          p.trailBudget -= vol;
-          const size_t before = out.ops.size();
-          const SpellFxVec markAt{mx * kSpellFxOne + kSpellFxOne / 2,
-                                  my * kSpellFxOne + kSpellFxOne / 2,
-                                  mz * kSpellFxOne + kSpellFxOne / 2};
-          ApplySpellEffect(*lib_, p.cast.delivery.trail, markAt, p.vel, 1000, out, &probe, 0,
-                           (uint32_t)p.trailPhase);
-          opsUsed += (int)(out.ops.size() - before);
-          p.markedX = mx;
-          p.markedY = my;
-          p.markedZ = mz;
-          p.markedValid = true;
-          if (p.trailBudget <= 0) p.alive = false;
+        if (!mark(p.cast, p.trailBudget, p.trailPhase, p.markedX, p.markedY, p.markedZ,
+                  p.markedValid, p.pos, p.vel)) {
+          p.alive = false;
+          break;
         }
-        if (!p.alive) break;
       }
     }
 
     if (impact) {
-      // Impact runs the payload through the SAME function backfire uses
-      // (thesis 2), at the impact position.
-      if (opsUsed < kSpellOpsPerTick) {
-        size_t before = out.ops.size();
-        ApplySpellEffect(*lib_, p.cast.payload, impactAt, p.vel, 1000, out, &probe,
-                         p.instability, (uint32_t)tick);
-        opsUsed += (int)(out.ops.size() - before);
-      } else {
-        opsDropped_++;
-      }
+      resolve(p.cast, impactAt, p.pos, p.vel, p.instability, p.gen, p.casterId, (uint32_t)tick);
       p.alive = false;
     }
 
     if (!p.alive) {
       live_[i] = live_.back();
       live_.pop_back();
+    } else {
+      i++;
+    }
+  }
+
+  // BOMBS: rigid bodies the owner adopted. The VM asks where each one is,
+  // lays its trail as it rolls, and resolves the payload there when the fuse
+  // runs out — or when the body is gone (something blew it up first), or when
+  // the hard tick bound passes (the owner never adopted it).
+  for (size_t i = 0; i < bombs_.size();) {
+    SpellBomb& bm = bombs_[i];
+    bool gone = false;
+    if (bm.body != 0 && bodies && bodies->bodyAt) {
+      Vec3 c;
+      if (bodies->bodyAt(bodies->ctx, bm.body, c)) {
+        bm.lastPos = {SpellFxFromFloat(c.x), SpellFxFromFloat(c.y), SpellFxFromFloat(c.z)};
+      } else {
+        gone = true;
+      }
+    }
+    if (bm.trailBudget > 0)
+      mark(bm.cast, bm.trailBudget, bm.trailPhase, bm.markedX, bm.markedY, bm.markedZ,
+           bm.markedValid, bm.lastPos, {0, kSpellFxOne, 0});
+    const bool fused = --bm.fuseLeft <= 0;
+    const bool expired = --bm.ticksLeft <= 0;
+    if (fused || gone || expired) {
+      resolve(bm.cast, bm.lastPos, bm.lastPos, {0, kSpellFxOne, 0}, bm.instability, bm.gen,
+              bm.casterId, (uint32_t)tick ^ bm.token);
+      if (bm.body != 0 && !gone) out.bodyDone.push_back(bm.body);
+      bombs_[i] = bombs_.back();
+      bombs_.pop_back();
     } else {
       i++;
     }

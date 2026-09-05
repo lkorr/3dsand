@@ -3194,10 +3194,54 @@ one; locality is about where the word lands relative to every binding), L4
 clause independence (`cost(A ‖ B) = cost(A) + cost(B)` and the casts are the
 union whenever the parse of A+B is the parses side by side), L7 tariff
 monotonicity (`A transmute B` non-decreasing in `arcane(B) − arcane(A)` and in
-volume; a spray in its voxel count). L5 (delivery invariance) and L8 (finite
-budgets) join in later phases. A change that breaks a law breaks a *class* of
-spells, which is what the line says; a change that moves one spell's numbers
-is a rebaseline.
+volume; a spray in its voxel count), L5 delivery invariance (the payload of
+`E… projectile`, `E… bomb` and `E… self` is identical; only the record
+differs). L8 (finite budgets) joins in P3. A change that breaks a law breaks a
+*class* of spells, which is what the line says; a change that moves one
+spell's numbers is a rebaseline.
+
+**Deliveries are three mechanisms, and Mods are field edits on their record
+(plan §5; `DeliveryRec`, `ApplyMod`).** `hand`/`self` are *instant* at a
+point; `projectile`/`bolt`/`lob`/`orb`/`bomb` are *flight* (speed, gravity,
+lifetime, bounces, pierce, seek, fuse, count, children, resolve radius, a
+trail with its budget); `beam` is *continuous*. A Mod names ONE field and
+how to edit it (`field`/`op`/`amount` in `glyphs.json`) and repeating it
+applies the edit again — `shotgun` ×count, `float` −1 g, `swift` ×speed,
+`long` ×lifetime (and ×fuse, and ×reach when anchored), `wide` ×radius,
+`bounce`/`pierce`/`seek` +1, `fuse` +30 ticks, `split` ×children. Adding a
+Mod is one JSON entry naming a field. The runtime reads the record and
+nothing else: a bounce reflects the axis that entered the solid (each axis
+probed alone) and loses a fifth of the speed; a pierce passes through one
+wall and resolves on the next; a fused bolt rests where it landed and counts
+down; a seeking bolt turns toward the nearest target the owner names
+(`SpellBodyProbe::nearestTarget`, integer steering after one float→fixed
+conversion at the query boundary); `split` launches children with the same
+payload from the last free position, one generation down, and nothing past
+`budgets.maxGeneration` launches (rule 2). A gravity Mod on an anchored
+delivery is reported as `casterImpulseVps` for the owner to apply to the
+body — `float self` hops.
+
+**A bomb is a rigid body through the existing debris path.** The VM cannot
+create a body (that is physics, the owner's business), so `bomb` reports a
+`SpellBodyRequest` (centre, velocity, radius, the delivery glyph's `material`)
+and the owner makes a Jolt sphere with a voxel ball, adopts it as ordinary
+debris — it falls, rolls, settles, burns, can be blown apart — and hands the
+handle back through `SpellSystem::AdoptBody(token, handle)`. Each tick the VM
+asks `SpellBodyProbe::bodyAt` where it is, lays its trail as it rolls (the
+trail mod runs on the record regardless of speed, so a `fire trail bomb` lays
+fire down the slope), and when the fuse runs out resolves the payload WHERE
+THE BODY IS and reports the handle in `bodyDone` for the owner to remove. A
+body that is gone before its fuse (something blew it up) resolves where it
+was last seen; a request the owner never adopted resolves at the hard tick
+bound. Bombs share `maxLiveProjectiles`.
+
+**`self` from the character screen resolves at the clicked part.** The health
+inspector's limb rectangles become targets while a sentence is on the stack
+(`InspectCastPicks`); the click latches only a body slot (`castAtPart`), and
+`main.cpp` turns the slot into the limb's world transform and calls the same
+`Cast()` with `selfAt` — the effect radii clamped to the delivery's impact
+radius so `fire self` on a stump chars the stump and not the torso beside it.
+Nothing in the VM knows what a part is.
 
 **Cost: you pay for voxels, not for words (plan §4; `EffectTariff`,
 `PriceCast`).** Every glyph has a small fixed `word` cost. The real price is

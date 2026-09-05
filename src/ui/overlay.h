@@ -583,6 +583,14 @@ struct UIState {
     int slot = -1;             // 0..kGlyphSlots-1
     std::string glyphId;       // empty = unbind
   } bindGlyph;
+  // A body part clicked in the health inspector with a sentence on the
+  // stack: cast it with `self` resolving AT that part (docs/
+  // PLAN_magic_grammar.md §7 — `fire self` on a bleeding stump). The panel
+  // says only WHICH slot; main.cpp turns it into a position.
+  struct CastAtPartIntent {
+    bool pending = false;
+    int slot = -1;             // UIState::BodySlot
+  } castAtPart;
 
   // What the last refused action said, and how long ago. Flashed under the
   // panel rather than swallowed: a slot that silently declines is the failure
