@@ -2098,6 +2098,7 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadF(*g, "bleachAmount", r.bleachAmount, out, at);
     ReadF(*g, "gamma", r.gamma, out, at);
     ReadF(*g, "microLodDist", r.microLodDist, out, at);
+    ReadF(*g, "plantLodDist", r.plantLodDist, out, at);
     ReadI(*g, "microMaxPerRay", r.microMaxPerRay, out, at);
     ReadF(*g, "microSwayAmp", r.microSwayAmp, out, at);
     ReadF(*g, "microSwaySpeed", r.microSwaySpeed, out, at);
@@ -2196,6 +2197,7 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     // which is a legitimate way to turn the feature off by eye.
     if (r.microMaxPerRay < 0) { r.microMaxPerRay = 0; }
     if (r.microLodDist < 0.0f) { r.microLodDist = 0.0f; }
+    if (r.plantLodDist < 0.0f) { r.plantLodDist = 0.0f; }
     // The sway models are authored with a 2-sub-voxel wall margin; a larger
     // amplitude shears blade tips out of the cell where they simply vanish.
     if (r.microSwayAmp < 0.0f) { r.microSwayAmp = 0.0f; }

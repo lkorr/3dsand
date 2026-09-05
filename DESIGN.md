@@ -5089,6 +5089,13 @@ by a trunk — is never reported, which is exactly the clipping a partial plant
 must have. Only evaluations charge `microBudget`; carried cells are free. Past
 `TUNE_MICRO_LOD_DIST` only the centre column of a tile plant stands in as the
 solid proxy; the outer eight pass as air, or a distant fern is a 30 cm cube.
+Column plants take the SHORTER of that and `render.plantLodDist` (16 m): an
+evaluation is a wind sample plus six to eight blade tests, charged for every
+cell a grazing ray crosses up to `microMaxPerRay`, and a blade is sub-pixel
+long before its cell is — at 40 m a meadow ran at a third of the frame rate of
+snow (2026-09-04). Inside the grass loop each blade's chord box is tested
+against the ray's XZ footprint through the cell before `hitBlade`, exact and
+conservative, so most of a tuft's blades cost two hashes and a compare.
 
 **What the flipbook could not do and this does:** continuous displacement in
 time (the wind is sampled once per plant at its base, every part blends the two

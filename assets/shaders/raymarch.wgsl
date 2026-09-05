@@ -1559,6 +1559,14 @@ fn tracePlant(b : MicroBrick, d : PlantDef, mat : u32, cell : vec3<i32>,
       let leanAmt = plantP(d, 8u);
       let headLen = plantP(d, 9u);
       let margin = halfW + 0.02;
+      // The ray's XZ footprint through this cell, for the per-blade cull
+      // below: entry to the cell exit (tHiIn is the exit for a column plant).
+      let segEnd = entry.xz + rd.xz * tHiIn;
+      let segLo = min(entry.xz, segEnd);
+      let segHi = max(entry.xz, segEnd);
+      // Widest a blade ever is in XZ: half width along wdir, thickness along
+      // ndir, so this bounds both axes whatever the yaw.
+      let bladeR = halfW + thick;
       for (var s = 0u; s < d.count; s++) {
         rsAdd(RS_MICRO, 1u);
         let hs = hash3(colH, s, 0x57A4Du);
@@ -1584,6 +1592,17 @@ fn tracePlant(b : MicroBrick, d : PlantDef, mat : u32, cell : vec3<i32>,
         let d0 = clamp(W * u0 * u0 + L * u0, lo, hi);
         let d1 = clamp(W * u1 * u1 + L * u1, lo, hi);
         let shear = (d1 - d0) / max(yTop, 1e-4);
+        // FOOTPRINT CULL, exact and conservative: the chord's centreline runs
+        // from rt + d0 to rt + d1 within this cell, so its XZ box widened by
+        // the blade's greatest half-extent contains the blade; if the ray's
+        // own XZ box through the cell misses it, hitBlade cannot hit. Most
+        // blades of a tuft are nowhere near a given ray, and the six planes
+        // were the expensive half of every iteration.
+        let cA = rt + d0;
+        let cB = rt + d1;
+        if (any(segHi < min(cA, cB) - bladeR) || any(segLo > max(cA, cB) + bladeR)) {
+          continue;
+        }
         let Wy = -halfW * taper / sH;
         let W0 = halfW * (1.0 - taper * u0);
         let bh = hitBlade(entry, rd, rt, d0, shear, wdir, ndir, W0, Wy,
@@ -2506,7 +2525,15 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool) -> Hit {
         var pd : PlantDef;
         if (isPlant) { pd = plantDefOf(mb); }
         let tileMode = isPlant && pd.tile != 0;
-        if (tCur * VOXEL_METERS > TUNE_MICRO_LOD_DIST) {
+        // A COLUMN plant (grass, flower, small mushroom) takes the shorter of
+        // the two cuts: its blades are sub-pixel long before its cell is, and
+        // an evaluation is a wind sample plus six to eight blade tests, paid
+        // for every cell a grazing ray crosses up to microBudget. A tile plant
+        // is 30-50 cm of geometry and keeps TUNE_MICRO_LOD_DIST.
+        let lodDist = select(TUNE_MICRO_LOD_DIST,
+                             min(TUNE_MICRO_LOD_DIST, TUNE_PLANT_LOD_DIST),
+                             isPlant && !tileMode);
+        if (tCur * VOXEL_METERS > lodDist) {
           // A tile plant's footprint is mostly air: past the LOD only its
           // CENTRE column stands in as the solid proxy, the eight outer
           // columns pass through as air (or a distant fern is a 30 cm cube).

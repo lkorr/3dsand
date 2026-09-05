@@ -2716,6 +2716,15 @@ struct Tuning {
     // paying a 3*subdiv-step march to decide the colour of a sub-pixel — the
     // LOD is not an approximation there, it is the same answer for less.
     float microLodDist = 40.0f;
+    // The same cut for COLUMN plants (grass, flowers, small mushrooms —
+    // tracePlant, not the brick DDA), and the reason it is a separate knob:
+    // an analytic tuft costs a wind sample, a trample lookup and six to eight
+    // blade intersections per cell the ray crosses, up to microMaxPerRay cells
+    // per ray, and a blade is sub-pixel long before a cell is. Measured
+    // 2026-09-04: a meadow at 40 m fell from ~50 to ~15 fps against ~50 in
+    // snow. Tile plants (ferns, big toadstools) are 30-50 cm and keep
+    // microLodDist. Effective distance is min(microLodDist, plantLodDist).
+    float plantLodDist = 16.0f;
     // Cap on nested micro marches per primary ray. A ray grazing a meadow can
     // cross dozens of grass cells, and each one that MISSES keeps the ray
     // alive, so without a cap one pixel can pay for the whole field. Past the

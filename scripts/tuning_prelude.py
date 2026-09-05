@@ -307,6 +307,7 @@ SPEC = [
 
     # static micro-detail
     ("render", "microLodDist", "TUNE_MICRO_LOD_DIST", "f", 40.0),
+    ("render", "plantLodDist", "TUNE_PLANT_LOD_DIST", "f", 16.0),
     ("render", "microMaxPerRay", "TUNE_MICRO_MAX_PER_RAY", "i", 8),
     ("render", "microSwayAmp", "TUNE_MICRO_SWAY_AMP", "f", 1.5),
     ("render", "microSwaySpeed", "TUNE_MICRO_SWAY_SPEED", "f", 1.0),
