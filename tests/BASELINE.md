@@ -541,3 +541,21 @@ is `treeAtlasHash` (8d14bc1e6117ce3d -> da8bc516535faf82: the atlas gained a
 per-(biome, species) condition table). `ai-approach`'s "wall 0/33 columns in
 mirror" is the rule-7 mirror-anchoring dependency selftest_swing.cpp already
 documents.
+
+## Five gates recorded as known-failing at the world map, not at the environment wave (2026-09-05, coordinator)
+
+`wind-prim`, `flung-liquid`, `fire-depth`, `openness`, `ai-approach` were
+already failing on main's own exe + assets before P-A..P-E (three
+independent same-scope controls: P-C, P-D, P-E each ran main's binary on
+the pre-wave assets and got the same failures and the same 4dca1e0d). They
+came in with the world map landing (board 2026-09-05T00:31Z: "5 fail alone
+on the new world ... the world under your fixtures changed") and were never
+recorded because the owner set the pin by hand. Three of them
+(`wind-prim`, `fire-depth`, `openness`) had NO key in baseline.json at all,
+so `--rebaseline` could never have recorded them (ReplaceJsonValue only
+updates keys that exist) and every run would have reported them as fresh
+regressions forever. Keys added by hand as "fail"; then the ONE end-of-wave
+`--selftest --rebaseline` recorded `determinismHash` 7aeb3ea5 -> 44fa72cb
+(P-C moved the calm home area) and `treeAtlasHash` 8d14bc1e6117ce3d ->
+da8bc516535faf82 (P-D's condition table). Owners of those five gates: the
+fixtures' ground changed under them; see docs/PLAN_world_map.md.
