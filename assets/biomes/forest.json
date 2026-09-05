@@ -92,8 +92,8 @@
     ]
   },
   "trees": {
-    "tile": 14.4,
-    "density": 78,
+    "tile": 5.6,
+    "density": 48,
     "species": [
       {
         "species": "oak",

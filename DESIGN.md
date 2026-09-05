@@ -2168,9 +2168,35 @@ neighbors, so this needs an explicit connectivity pass:
   a face, so felling one produced no body at all, while its dithered crown rim
   became sub-8 "islands" that were deleted. Unknown/unfetched cells and the
   residency edge read as solid, so the conservative direction is unchanged.
-- **Nothing is left hanging by the handoff (2026-09-03).** A `CLASS_SOLID`
-  voxel never moves in the CA (`sim_step` returns early for it), so island
-  detection is the *only* mechanism that makes solid matter fall and there is
+- **A solid with nothing touching it falls in the CA (2026-09-04).** The one
+  exception to the rule below, and the reason it is an exception is that it
+  needs no connectivity analysis: a `CLASS_SOLID` voxel with no solid and no
+  powder on any of its six faces **is** a component of one, decided from
+  information the cell already holds. `sim_step.wgsl` drops it like a powder —
+  no support flag, no cooldown, no readback, no queue, no region scan. Island
+  detection keeps the job it is actually good at (is this *ledge* still attached
+  to that cliff) and stops being asked to arrive somewhere for a single voxel,
+  which measurably it did not: burning one tree in the `tree-fell` fixture left
+  38 lone voxels hanging with every leak counter at zero, the sub-8 rubble
+  handoff reached 401 times against 11105 small components anchored at a
+  scan-box boundary, and `eventQueueFullSpilled` at 1113. Afterwards, 5.
+  Three constraints make it legal rather than merely appealing. **The lattice
+  bounds reads, not just writes**: acting cells are ≥3 apart and may write ≤1
+  cell away, so a cell one step from me can only be written by an acting cell
+  within two steps of me, and I am the only one there — this probe reads exactly
+  distance 1, where the `seesSky` walk that broke determinism at tick 1 read 48.
+  **Rule 2 survives**: the six faces are probed downward-first, so a terrain
+  cell with ground beneath it exits after one extra load, and a failed move
+  never calls `markDirty`, so nothing can hold a chunk awake (`sleep` still
+  reports 0 / 32768 active). **Things that float on liquid still float**, with
+  no new rule: `canDisplace` already refuses a denser target and every
+  water-surface plant is far lighter than water. An unseen neighbour counts as
+  attached, the same conservative direction `solidOutside` takes at the
+  residency edge. Gate: `tree-fell`.
+- **Nothing is left hanging by the handoff (2026-09-03).** Otherwise a
+  `CLASS_SOLID` voxel does not move in the CA (`sim_step` returns early for it),
+  so island detection is the *only* mechanism that makes solid matter fall for
+  anything bigger than the single-voxel case above, and there is
   no second line of defence behind it: every component this path declines to
   convert stays exactly where it is, permanently. Four paths used to decline a
   component by leaving it in the grid, and each was a permanent floater:
@@ -2229,13 +2255,75 @@ neighbors, so this needs an explicit connectivity pass:
   (the control, without which the first assertion is satisfied by a build that
   settles nothing), and a bounded sweep of the fixture box must find no
   unsupported solid component.
-- Remaining accepted flaw: the scan is still **local and conservative**, so a
-  large floating section can survive when it extends past the 80-cell region
-  (`kMaxRegionCells`), exceeds `kMaxIslandVoxels`, or touches an unfetched
-  chunk that reads as solid. That is now *measured* rather than assumed — the
-  `anchoredBy*` counters say which of the three is holding a region up — and
-  the fix for it is a slow global "connected to the floor" sweep, not a wider
-  local scan.
+- **The queue was head-of-line blocked (2026-09-04).** `PreTick` examined
+  `events_.front()` and nothing else, so a head whose chunks had not arrived did
+  nothing for 120 ticks while everything behind it aged toward its own timeout:
+  one region that streamed out took four seconds of island detection down with
+  it, measured as **312 events dropped over one burning tree**. A bounded prefix
+  of the queue is now probed and the ready ones run, with only the first couple
+  of probes allowed to request fetches (a deep probe must not flood the fetch
+  queue that the events in front of it are waiting on). A stuck event whose
+  region is still resident spills to `pendingSupport_` rather than being
+  dropped; only one that has genuinely left the window is dropped, and that is
+  not a leak because there is nothing there to float. Also `EventReady` now
+  requests the one-chunk **ring** around the region — the cells `solidOutside`
+  reads and that nothing had ever fetched, so a component touching a scan-box
+  face was anchored on a guess — but does not *wait* for it, since a stale ring
+  answers "is there rock out there" perfectly well.
+- **A solid that turns to powder in place stops holding things up
+  (2026-09-04).** `flagSupportLoss` returned early for a powder *product* as if
+  it still supported everything, and the ash then flowed away flagging only the
+  cell above it — so a clump held sideways or from above by a leaf that burned
+  to ash was never flagged and never scanned. Powder carries the cell above it
+  and nothing else, and the flag now says so (all solid neighbours except the
+  one above). `soloSolid` has the same correction: powder counts as attachment
+  only when it is *below*. Both came out of the `tree-fell` natural burn-out
+  series, where residue sat flat at ~30 while the hot count fell 3× — stranded,
+  not smouldering. And `SettleFootprintSupported` no longer abstains-as-yes on
+  an unfetched chunk below (the 12-voxel leaf body at the edge of the fetched
+  region was the biggest floater left), and every settle now queues a support
+  scan over the stamp, since a stamp vacates nothing and so raises no flag.
+- **The flood seeds from what changed and stops at the first anchor
+  (2026-09-04).** `RunIslandDetection` used to seed from every solid cell in
+  the region, which for a 64³ box on a hillside meant labelling the whole
+  terrain slab on every scan to learn that the ground is anchored. A component
+  that does not touch the changed box (the erased cells or the flagged chunk,
+  plus one cell of slack) did not lose its support *here*, so only solids in
+  `Event::seedLo..seedHi` start a flood; and once a component is anchored — by
+  the boundary, by powder beneath, by size, or by touching a component already
+  judged anchored (the verdict is transitive, which is what makes stopping
+  sound) — the rest of its walk is bookkeeping for nothing and is skipped.
+  Unanchored components are still flooded to completion, because their cells
+  are what gets converted. Measured on one burning tree: **40.2 M → 0.59 M
+  cells visited (68×)** with identical verdicts, A/B in one binary via
+  `SANDVOX_ISLAND_FULL_FLOOD=1`. The scan budget is now in **cells**
+  (`kIslandScanCellsPerTick`), not scans, so the saving turns into scans. A
+  narrow-margin first tier that escalated on clipping was tried the same day
+  and reverted: near a tree 627 of 714 narrow scans clipped, so it doubled the
+  work and the residue rose.
+- **What the burn half of `tree-fell` measures now:** after an oak-sized tree
+  burns and is quenched, **0 floating components** at +400 ticks and the world
+  clean within 100 ticks (the sample stride) — down from 38 lone voxels and 29
+  clumps. The residue the owner reported hanging "for a minute or two" was two
+  things: matter still smouldering (a burnt crown keeps making floaters for
+  thousands of ticks), and the queue above dropping or starving the scans that
+  would have cleared them.
+- Remaining accepted flaw, and it is now a **plan rather than an admission**
+  (`docs/PLAN_rigidbody_islands.md`): the scan is still local and conservative,
+  so a large floating section survives when it extends past the 80-cell region
+  (`kMaxRegionCells`), exceeds `kMaxIslandVoxels`, or touches an unfetched chunk
+  that reads as solid. Measured rather than assumed — cut an oak-sized tree
+  through the trunk and **28,573 voxels stay standing** while the scan makes a
+  25-voxel body, and the `anchoredBy*` counters name which cap did it. For that
+  tree only the first binds (28,573 is under 32,000 and every axis is under the
+  `int8` 120), but a `great_oak` at 159 × 230 fails all three. The chosen fix is
+  a sparse chunk-tiled flood that can span 256 cells, plus **sharding an
+  oversize component into ≤96-voxel sub-bodies welded with the cone-limited
+  joints ragdolls already use** — which also makes a felled trunk flex and snap
+  instead of falling as a rigid telephone pole. A global "connected to the
+  floor" sweep is no longer the presumed answer: the single-voxel case that
+  motivated it is handled locally and for free by the rule above. Gate:
+  `tree-fell`, assertion `cut-trunk-fells-the-tree`, red on purpose.
 
 ### Rigidbodies
 - Detected islands are **removed from the grid** and become rigidbodies:
@@ -4169,9 +4257,10 @@ as solid — the residency-window rule — or the camera backs out of the world)
 Pull-in is instant and push-out is eased; easing inward would leave the camera
 inside the wall for the duration of the ease, which is the artifact players
 actually notice. In first person the body is hidden but the arms, hands and
-staff are kept. The render eye is the only consumer — brush, laser, grenade and
-physics all keep using `Player::EyePos()`, so no camera setting can move the
-world hash.
+staff are kept. The render eye is the only consumer — brush, laser, grenade,
+physics and **the audio listener** all keep using `Player::EyePos()` /
+`ViewEyePos()`, so no camera setting can move the world hash, and none can move
+where you hear from either (§12b, "The ears are on the character").
 
 ---
 
@@ -6629,14 +6718,159 @@ across 630 ticks of a creature burning to death.
 
 ### The stock set
 
-`scripts/gen_stock_armor.py` emits hood / robe / sash / boots. The geometry is
-DERIVED, not drawn: each shell is the stock human's own silhouette dilated
-outward by one authored micro with the body subtracted back off, importing
-`gen_human.py`'s limb table rather than restating it. So the garment fits by
-construction, is strictly outside the body, and re-proportioning the human
-re-proportions the coat. Colour is art-palette slots in `.col` layers, never
-materials — painting with materials is what makes mina's sash burn on a
-different schedule from her sleeve.
+`scripts/gen_stock_armor.py` emits hood / robe / sash / pants / boots in cloth
+and leather, and iron_helm / iron_cuirass / iron_greaves / iron_sabatons in
+iron. The geometry is DERIVED, not drawn: each shell is the stock human's own
+silhouette dilated outward by one authored micro with the body subtracted back
+off, importing `gen_human.py`'s limb table rather than restating it. So the
+garment fits by construction, is strictly outside the body, and
+re-proportioning the human re-proportions the coat. Colour is art-palette slots
+in `.col` layers, never materials — painting with materials is what makes
+mina's sash burn on a different schedule from her sleeve. The plate set is the
+same builders over a different material (a helm with an eye slit for the hood,
+a short straight fauld for the skirt), which is the point of deriving: a second
+suit is a second row of one table.
+
+**What a per-z dilation cannot produce, and what was done about it (2026-09-04).**
+The tube is a ring per row and cannot cap anything, so every lid is authored
+explicitly — and three of them were wrong in ways only a dressed figure shows:
+
+* *Shoulders.* The torso's lid was its own top silhouette grown by one, and the
+  upper arms end on the SAME row, so the top of each arm was bare skin. The yoke
+  is now the torso's top row and both upper arms' top rows grown by one, on the
+  TORSO shell rather than the arms': the arm's anchor is its top
+  (`joint_top`), so a raised arm rotates in place under the yoke instead of
+  carrying a lid off with it.
+* *Neck.* The neck is three rows of the HEAD limb and the hood started above
+  them, so a dressed figure showed a stub of bare neck standing in the yoke's
+  hole. The torso shell now rings those rows as a collar and the hood and helm
+  start where the skull starts, on a seam with it; `neck_rows` derives the
+  count from the head geometry (the run of identical bottom rows) so both sides
+  read one number.
+* *The sash.* It was dilated from EVERY robe cell at waist height, and the
+  forearms hang beside the hips at waist height, so it ringed the sleeves too:
+  a band six micro wide on each side with a loop around each arm that stayed on
+  the hips slot while the arm swung out of it — "the hands go inside the belt".
+  It now seeds from the torso and skirt shells only, one micro proud of the
+  robe, and is INTERRUPTED where an arm hangs flush against the hips, because
+  there is no cell between them for a belt to pass through. At rest the arm
+  covers the break. That is the honest geometry of a figure whose arms hang
+  flush, and a better trade than a belt inside the sleeve (two shells in one
+  cell) or around it.
+
+The sleeves SHARE cells with the torso shell — the armpit corners and, at the
+waist where the torso tapers, a whole column — and that is deliberate. Giving
+those cells to one side was tried and put a stripe of bare forearm on every
+walking figure: the sleeve's inner wall is what shows when the arm swings
+forward and the torso's side column is what shows when it swings back, so
+whichever side cedes is wrong in half the gait. Two shells of one material in
+one colour coinciding at rest is invisible; z-fighting is only a defect between
+things that look different, which is why the sash does subtract the robe.
+
+**Iron, not steel.** `steel` carries no `tag:dissolvable`, so acid cannot
+touch it at all — that is what a sword is made of and what `armor-react`'s
+steel arm measures (0 voxels lost). A suit that acid eats SLOWLY is a different
+fact, and here a fact is a material: `iron` (materials.json, id 121) is not
+flammable, not organic, and carries exactly one rule of its own,
+`acid + iron -> air` at 10 per-mille a tick against 250 for flesh and cloth.
+The rule is APPENDED after acid's other rules rather than placed
+specific-before-generic: nothing else matches iron, and a rule inserted earlier
+renumbers every acid rule after it — rule index is part of the reaction RNG
+stream — so the world hash does not move for a material worldgen never places.
+`armor-react` arm (e) holds an iron plate in the same acid bath as the steel
+one for 60 ticks and asserts it is eaten — at all, and with at least 40% left.
+"At all" rather than a floor, because how much acid actually stands against a
+torso plate is bath luck (2.3% in 25 ticks in one run, 0.6% in 60 in the next)
+while steel's figure in the same bath is exactly zero every time; the figure is
+printed beside the verdict for anyone retuning the rate. Nor is it conditioned
+on the bare creature losing anything: nothing but acid removes iron, so the
+count is its own evidence, whereas the steel arm needs the bare creature to
+know its bath was acid — and on some terrain the bare creature stands where the
+acid never pools.
+
+### A blade chips iron; it does not carve it (2026-09-04)
+
+The kerf `Mob::CutLimb` builds is sized for flesh, and a shell is one authored
+micro thick, so a sword went through a cuirass and out the other side: the
+connectivity split found two halves, and the cut-through rule took "the entire
+centre piece" off in one blow. That is what a sword does to a robe; to a plate
+it does the other thing armour was built for, and skates.
+
+On a WORN slot the slot is scaled by `gear.cutHardnessRef` (8, skin's) over the
+shell material's `hardness` — the same 0..255 field the blast crater and the
+dig read — floored at `gear.cutHardnessMin` and at one skin cell in every
+direction, so cloth (5) and leather (14) are cut about like flesh, iron (160)
+takes a chip, and no strike costs a plate nothing. A suit still wears through
+under a patient enemy; it takes a fight rather than a stroke, and it wears
+through in HOLES, which the occlusion probe already reads as exposure. The
+impact-speed knock-loose (the sword-from-the-hand rule) no longer applies to
+worn slots: a strap does not snap because the blow was fast. Held blades were
+never carved (the sweep skips the held slot) and flesh keeps the wound model
+the `wound` gate pins. `armor-wear` 3c cuts a steel cube and a cloth cube of
+identical geometry with one kerf.
+
+### What leaves a body cannot launch anybody
+
+Everything that leaves a creature — a severed limb, a cut strap's plate, a
+sword knocked from a hand, a carved gobbet, a corpse's limbs, an item dropped
+from the pack — is created exactly where the creature is, which for the player
+means INSIDE the capsule proxy. A severed piece is also KINEMATIC for its
+0.25 s hold, frozen where it was cut: an NPC's arm cut mid-swing was frozen
+inside the player who cut it, on the normal contact layer, an overlap the
+solver could not move, so `PlayerPushOut` moved the PLAYER a body-width a tick
+for fifteen ticks. That was "I dismembered him and flew across the field", and
+the avatar's own pieces had already been exempted once (`Layers::AVATAR`).
+
+The rule now belongs to the body, not to who it came off.
+`Physics::ReleaseToWorldWhenClear` puts a body on the no-player-contact layer
+and remembers it; every step, each remembered body whose world AABB has left
+the proxy goes back to `MOVING` and is forgotten. So a piece never shoves the
+creature it came off, and the moment it has fallen clear it is ordinary debris
+that can be stood on, kicked and picked up — the avatar's corpse no longer
+keeps its exemption for good either. Bounded at 256; past that the oldest is
+released unconditionally. The avatar's `OnBodyReleasedToWorld` override is
+gone with it. NPCs were never pushed by anything: their limbs are kinematic and
+they have no push-out. `player-body` asserts a block born inside the proxy
+reads no push while it overlaps, and reads one again once the proxy has
+walked away.
+
+### A piece cut loose is a thing on the floor
+
+A cut strap was `DetachLimb(adopt)` like any severed limb, which made the shell
+an anonymous debris body: not the robe, nothing `E` could see, and the wearer's
+slot still said "robe". Now a piece's IDENTITY shell — the same panel a dropped
+copy is made of (`ItemGroundVoxels`) — takes the piece with it when it leaves
+by blade: its other shells fall as rags, the `WornPiece` entry is erased, the
+loss is reported through `Mob::LostGear` with the piece's damage captured one
+call before the shells forget it, and `MobSystem::SetOnItemShed` registers the
+body under the item's name in `WorldItems`. `main.cpp` drains the report at the
+top of the tick, BEFORE the sheath and the wear loop read the kit — or those
+seams would faithfully pull a second sword out of the sheath and put the
+cuirass back on — clears the equip slot, and files the damage by name, so a
+piece picked back up and re-worn has exactly the holes it had. A sleeve alone
+is still a rag, and the piece goes on being worn without it. A sword knocked
+from the hand takes the same road and the creature is unarmed from that
+instant (`heldSlot_` clears in `ShedGearBeforeDetach`, not at a later
+`EquipItem`). A shell consumed by fire registers nothing: there is no body.
+The dead slots are swept out of the appended tail once the severed hold is
+over, so `LimbCount` is not a history of what was worn. `armor-wear` 3d.
+
+The half of this that is still open: a piece knocked off an NPC and picked up
+by the player comes back as authored, because `WornDamage` is keyed by cover
+index and the ground registry carries only a name and a lattice.
+
+### Cross-limb heat respects the coat
+
+`BuildCrossLimbHeat` lets a burning limb warm its siblings through faces where
+the grid holds air — and that is exactly where `WornAlong` was never asked,
+because the probe ran only against a THREAT in the grid. A burning bare hand
+lit the wrist inside its sleeve, and the fire walked up the arm under the
+plate: "the character is on fire inside the armour". The probe now runs on
+cross faces too, with the same march and reach; the sibling's flame reads as
+the shell's material, which is not hot, and whether the shell catches from it
+is the shell's own pass's business. What can still catch is what the grid can
+see: the face behind a helm's eye slit, a bare hand, and the wrist opening of a
+sleeve along the arm's own axis.
 
 ### Mirror in, intent out
 
@@ -7259,6 +7493,29 @@ Two conversions happen in exactly one function (`AudioWorld::MakeParams`):
 - **Units.** The engine needs METERS, not voxels — its binaural cues use virtual
   ears offset by 0.087 *units*, which is a head radius only if a unit is a
   meter. Feeding voxels would put the listener's ears 87 cm apart.
+
+### The ears are on the character, not on the camera (2026-09-04)
+
+`ListenerPose` is published once a frame from **`Player::ViewEyePos()`** —
+the head, at ear height — with the orientation taken from `Camera`'s look
+direction. That split is deliberate and each half was once wrong:
+
+- **Position must not be the render eye.** It was, until this note. In third
+  person the render eye is an orbit boom several metres behind the body, so
+  flipping the camera key silently moved every distance, every doppler shift
+  and, worst, the occlusion ray's origin — and the boom is frequently pulled
+  into the wall behind the player, which muffled the whole world. Third person
+  now hears exactly what first person hears.
+- **Position must not be the avatar's head joint either**, tempting as "the
+  model's ears" sounds. That transform is one tick latent out of Jolt and rides
+  the gait's bob and sway; a listener parked on it turns every footstep into a
+  doppler wobble. It is the same three objections that stop the camera from
+  orbiting the head joint (§8, Camera). The player's own eye is authoritative,
+  frame-current and already step-smoothed.
+- **Orientation must be the LOOK direction, not the body heading.** In third
+  person the model faces where it *runs* (`ResolveAvatarHeading`), so ears
+  welded to the torso would swing the stereo image away from the picture every
+  time the player strafed.
 
 ### Why every asset on disk is mono
 

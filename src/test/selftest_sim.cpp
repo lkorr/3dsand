@@ -2999,6 +2999,24 @@ Status GateSupportFlag(Ctx& c, std::string& detail) {
     return Status::Fail;
   }
 
+  // FIXTURE INTEGRITY IS ESTABLISHED HERE, BEFORE THE ERASE, and that ordering
+  // is load-bearing since 2026-09-04. The -X arm is a single stone voxel whose
+  // only neighbour is the gap cell, so the moment the erase lands the arm IS a
+  // one-voxel island — and `soloSolid` in sim_step.wgsl now drops those. Read
+  // afterwards, as this census used to be, a correctly-behaving engine reports
+  // "the -X arm never landed (fixture missing)" and the gate blames the fixture
+  // for the feature it is standing next to. What the gate actually claims (an
+  // exact-cell erase between two solids flags BOTH chunks) is untouched; only
+  // the moment at which "the fixture was really there" is a meaningful question
+  // has moved, from after the mutation to before it.
+  std::vector<uint32_t> voxPre(kNumChunks * (size_t)kChunkVol);
+  ReadVoxelsSync(ctx, world, 0, kNumChunks, voxPre.data(), "supportVoxPre");
+  auto matPre = [&](int x, int y, int z) {
+    return voxPre[World::SlotCellIndex({x, y, z})] & 0xFFFu;
+  };
+  const bool capThere = (int)matPre(gx, gy + 5, gz) == si;
+  const bool armThere = (int)matPre(gx - 1, kGapY, gz) == si;
+
   // THE MUTATION UNDER TEST: one exact-cell op erasing the gap. This is the
   // path island removal, settle-back and the spell VM all write through.
   std::fill(seen.begin(), seen.end(), (uint8_t)0);
@@ -3031,8 +3049,8 @@ Status GateSupportFlag(Ctx& c, std::string& detail) {
   auto matAt = [&](int x, int y, int z) {
     return vox[World::SlotCellIndex({x, y, z})] & 0xFFFu;
   };
-  const bool capThere = (int)matAt(gx, gy + 5, gz) == si;
-  const bool armThere = (int)matAt(gx - 1, kGapY, gz) == si;
+  // Only the ERASE is read after the fact; `capThere` / `armThere` were taken
+  // before it, for the reason given at that read.
   const bool gapOpen = matAt(gx, kGapY, gz) == 0u;
 
   std::string fails;

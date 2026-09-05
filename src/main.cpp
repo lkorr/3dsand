@@ -3604,6 +3604,12 @@ int main(int argc, char** argv) {
     // whatever is in its fist. By pointer, because items reload on R.
     mobs.SetItems(&items);
   }
+  // A PIECE OF GEAR HITTING THE FLOOR BY FORCE — a cuirass cut loose, a sword
+  // knocked from a hand, anyone's — is the same kind of body an inventory drop
+  // makes, and the registry is what makes `E` see it (DESIGN.md §8c). The
+  // release hook above already forgets it when the body goes.
+  mobs.SetOnItemShed(
+      [&ground](uint64_t h, const std::string& name) { ground.Add(h, name); });
   Stream stream;
   stream.Init(&ctx, &world, &sim, kDefaultSeed);
   stream.OnMaterialsReloaded(mats);
@@ -5416,6 +5422,34 @@ int main(int argc, char** argv) {
     // — dragged into the pack from the character screen, say — is no longer
     // drawn, and this is where that is noticed: the state lives on one side of
     // the question, so there is nothing to keep in step.
+    // ---- GEAR THAT LEFT THE BODY BY FORCE (Mob::LostGear) --------------------
+    //
+    // The rig reports; the KIT is this frame's to fix, and it has to be fixed
+    // BEFORE the sheath and the wear loop below read it in the same tick, or
+    // the re-equip seams would faithfully pull a second sword out of the
+    // sheath while the first lies at your feet, and put the cuirass back on
+    // a body the plate has just fallen off. The piece on the ground is
+    // registered under its name (SetOnItemShed), so picking it back up is the
+    // ordinary `E` and wearing it again restores exactly the holes it had:
+    // the damage travels through `kit.wornDamage` by name, the same road a
+    // piece dragged into the pack takes.
+    for (const Mob::LostGear& lg : avatar.LostGearEvents()) {
+      if (lg.held) {
+        ItemStack& sh = kit.equip.slots[kSheathSlot];
+        if (KitItemName(sh, items) == lg.item) sh = ItemStack{};
+        ui.kitMessage = "your " + lg.item + " was knocked from your hand";
+      } else {
+        kit.SetDamage(lg.item, lg.damage);
+        if (lg.equipSlot >= 0 && lg.equipSlot < kEquipSlotCount &&
+            KitItemName(kit.equip.At(lg.equipSlot), items) == lg.item) {
+          kit.equip.slots[lg.equipSlot] = ItemStack{};
+          wearTried[lg.equipSlot].clear();
+        }
+        ui.kitMessage = "your " + lg.item + " was cut loose";
+      }
+      ui.kitMessageAge = 0.0f;
+    }
+    avatar.ClearLostGear();
     sheath.Reconcile(sheathKind(), UIState::kToolMelee, ui.tool);
     const ItemStack& sheathed = kit.equip.At(kSheathSlot);
     const ItemDef* heldItem =
@@ -6921,15 +6955,32 @@ int main(int argc, char** argv) {
       }
 
       // ---- audio ----
-      // The listener rides the RENDER eye, not the player's head: in third
-      // person the camera is where the player's attention is, and putting the
-      // ears anywhere else makes panning disagree with what is on screen.
-      // After the camera block, so `eye` is final for the frame.
+      // THE EARS ARE ON THE CHARACTER, NOT ON THE CAMERA. `eye` is the RENDER
+      // eye and in third person that is a boom several metres behind the body,
+      // so using it moved the whole soundscape backwards the moment you pressed
+      // the camera key: distances, doppler and — worst — occlusion were all
+      // solved from the boom, which routinely sits inside the wall behind you
+      // and muffled everything. Third person now hears exactly what first
+      // person hears.
+      //
+      // Position is `Player::ViewEyePos()` — the head, at ear height, in BOTH
+      // modes, and the same value first person was already using. Deliberately
+      // not the avatar's head joint: that transform is one tick latent out of
+      // Jolt and rides the gait's bob and sway, which the listener would
+      // convert into doppler wobble on every step (the same three reasons the
+      // camera block above refuses to orbit it).
+      //
+      // Orientation stays `cam.yaw/pitch` — the LOOK direction, which is what
+      // the ears face in first person and what the screen is showing in third.
+      // The body's own heading is not it: in third person the model faces where
+      // it RUNS (ResolveAvatarHeading), so strafing would swing the stereo
+      // image away from the picture.
       //
       // Footfalls are drained here rather than inside the tick loop because
       // that loop runs up to 4 times per frame; firing from inside it would
       // put several steps at the same instant.
       sandvox::PerfSpan spanAudio(sandvox::PerfScope::Audio);
+      const Vec3 earPos = player.ViewEyePos();
       if (audioCues.Enabled()) {
         for (const PlayerAvatar::Footfall& ff : avatar.Footfalls()) {
           if (ff.landing)
@@ -7072,10 +7123,10 @@ int main(int argc, char** argv) {
             // making the player wait out a full retry period past dusk.
             nightRollTimer = ta.nightRetrySeconds;
           }
-          audioCues.SetNightAmbience(eye, want, allowStart);
+          audioCues.SetNightAmbience(earPos, want, allowStart);
         }
 
-        audioCues.Update(dt, eye, cam.yaw, cam.pitch, &world);
+        audioCues.Update(dt, earPos, cam.yaw, cam.pitch, &world);
       }
       avatar.ClearFootfalls();
       // Cleared unconditionally, like the footfalls: a queue that only drains

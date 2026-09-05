@@ -198,6 +198,34 @@ class Physics {
   // "you" and should be able to bump into you like any other debris.
   void SetBodyAvatarLayer(uint64_t handle, bool isAvatar);
 
+  // A BODY BORN INSIDE SOMEBODY MUST NOT SHOVE THEM OUT OF IT.
+  //
+  // Everything that leaves a creature — a severed limb, a cut strap's
+  // pauldron, a sword knocked from a hand, a carved-off gobbet, a corpse's
+  // limbs, an item dropped from the pack — is created exactly where the
+  // creature is, which for the player means INSIDE the capsule proxy. On the
+  // normal layer that is a deep penetration the solver cannot resolve, and
+  // PlayerPushOut turns it into a shove of up to a body-width per tick for as
+  // long as the overlap lasts: a kinematic piece (the severed-hold beat) does
+  // not move, so the PLAYER does, at ~36 m/s, until it is clear. That was "my
+  // arm came off and I was launched across the field".
+  //
+  // This puts the body on the no-player-contact layer (Layers::AVATAR, the
+  // same one the player's own attached limbs live on) and remembers it. Every
+  // Step, each remembered body whose world AABB no longer overlaps the proxy
+  // is moved back to MOVING and forgotten — so it never pushes the creature
+  // it came off, and the moment it has fallen clear it is ordinary debris
+  // that can be stood on, kicked and picked up. The check is an AABB test
+  // (one lock per body), bounded by kMaxPendingRelease; past that the oldest
+  // is released unconditionally rather than the list growing.
+  //
+  // With no player proxy in the world (a headless NPC-only run) the body goes
+  // straight to MOVING: there is nobody to protect.
+  void ReleaseToWorldWhenClear(uint64_t handle);
+  static constexpr size_t kMaxPendingRelease = 256;
+  // How many bodies are still waiting to be released. For the selftest.
+  size_t PendingReleaseCount() const { return pendingRelease_.size(); }
+
   // Disable collisions among a set of bodies (one mob's limbs): adjacent limb
   // boxes otherwise fight their own joints — the push/pull jitter keeps the
   // ragdoll awake forever. Jolt's own Ragdoll class does exactly this.
@@ -321,6 +349,14 @@ class Physics {
   std::unique_ptr<JointImpls> joints_;
   uint64_t nextJointId_ = 1;
   uint32_t nextCollisionGroup_ = 1;
+  // The player proxy (CreatePlayerBody), so ReleaseToWorldWhenClear can ask
+  // "is this body still inside the player" without the caller threading the
+  // handle through every mob. Zero in a world with no player.
+  uint64_t playerBody_ = 0;
+  std::vector<uint64_t> pendingRelease_;
+  // World-space AABB of a live body, metres. False for a dead handle.
+  bool WorldBounds(uint64_t handle, float outMin[3], float outMax[3]) const;
+  void TickPendingReleases();
   // ReplaceBody's per-joint step: rebuild `joint` with `newBody` standing in
   // for `oldBody` on whichever side it was. False if nothing was rebuilt.
   bool RetargetJoint(uint64_t joint, uint64_t oldBody, uint64_t newBody);

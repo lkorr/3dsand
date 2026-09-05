@@ -139,12 +139,12 @@ const M_WILDROSE  : u32 = 69u;
 // materials.json, recompute after any append lands ahead of this one.
 const M_TALLGRASS      : u32 = 95u;
 const M_TALLGRASS_HEAD : u32 = 96u;
-// ---- the lawn tuft (materials.json id 39) and the big toadstool (121) ----
+// ---- the lawn tuft (materials.json id 39) and the big toadstool (122; iron is 121) ----
 // grass_tuft is the one-to-two-cell analytic grass that replaced the solid
 // grass/petal cubes flowerAt used to scatter as its "ground layer" (those read
 // as green gravel). mushroom_large is a TILE plant — see plantColumnAt.
 const M_GRASS_TUFT     : u32 = 39u;
-const M_MUSHROOM_LARGE : u32 = 121u;
+const M_MUSHROOM_LARGE : u32 = 122u;
 // ---- THE VOXEL-SIZE SCALE --------------------------------------------------
 //
 // VOXELS_PER_M is emitted from world.h's kVoxelsPerMetre (the integer
