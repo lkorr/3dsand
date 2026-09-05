@@ -503,3 +503,24 @@ your change: run it alone at your commit, then `git stash` — no, **don't**
 (see the stash hazard in CLAUDE.md) — instead build a clean checkout of the
 merge-base in a separate worktree and run that one gate there. The point of the
 baseline is that you should rarely need to.
+
+## `determinismHash` 3b55aba6 -> 04a8117e, and three flapping gates (2026-09-04, magic grammar)
+
+Landing docs/PLAN_magic_grammar.md (branch `worktree-magic-grammar`, six
+commits) the full suite moved the pin. Attributed before recording: the hash
+is 04a8117e with AND without the appended `gold` material, and with the base
+commit's `sim_mutate.wgsl` in place of the from-filter edit, so nothing this
+work touched moved it; and the main checkout's own binary reports PIN MOVED
+against 3b55aba6 too. The pin was stale on the base branch. Recorded by hand
+because `--rebaseline` refused three runs in a row over gates that flap at
+suite scope and pass alone or in the next run: `scale` (a stale sash pin,
+fixed below), `corpse-burn` (once: "pyre chunk in window=0 cached=0", bodies
+falling through unresident ground; passed twice after), `fire-depth` and
+`armor-react` (once: "bare burned at t+never"; passed twice before). None of
+those names code the grammar touches; they belong with the body-burning
+family already recorded above (`mob-burn`, `fire-down`, `tree-fell`).
+
+`scaleMetres_item/sash` 0.550 -> 0.300: the sash geometry changed in
+d142be4 and the pin did not follow.
+
+The smoke tables (`smokeQuiet`, `smokeLoud`) were rebaselined by the tool.
