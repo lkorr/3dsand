@@ -208,6 +208,11 @@ struct GlyphDef {
   int32_t ticks = 0;             // sustain / repeat / beam lifetime bound
   int32_t repeats = 0;           // repeat: how many times
   int32_t perTick = 1;           // mend: voxels grafted per tick
+  // mend: the anatomy's own materials (no foreign penalty), by name in the
+  // glyph's "native" list, and the penalty for anything else: extra
+  // arcane(M) × foreignPenaltyMille / 1000 per voxel.
+  std::vector<uint32_t> nativeMats;
+  int32_t foreignPenaltyMille = 1000;
   GlyphWind wind;
 
   // ---- delivery record defaults ----
@@ -604,6 +609,15 @@ struct SpellFilter {
   int32_t ticksLeft = 1;
 };
 
+// A GRAFT: `count` voxels of `material` to fill into the caster's missing
+// anatomy cells (Mob::RestoreBody), nearest-to-root first. The world half —
+// the source voxels leaving as convert(cell->air) ops — is already in `ops`.
+struct SpellRestore {
+  uint64_t casterId = 0;
+  uint32_t material = 0;
+  int32_t count = 0;
+};
+
 // A per-tick charge the owner applies to a caster (statuses, beams).
 struct SpellBill {
   uint64_t casterId = 0;
@@ -703,6 +717,7 @@ struct SpellEmission {
   std::vector<SpellFilter> filters;
   std::vector<SpellBill> bills;
   std::vector<SpellBodyImpulse> bodyImpulses;
+  std::vector<SpellRestore> restores;
 };
 
 // A probe into the world the VM may consult while resolving (the CPU mirror,

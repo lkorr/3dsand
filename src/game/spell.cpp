@@ -435,6 +435,15 @@ bool LoadGlyphs(const std::string& path, const std::vector<MaterialDef>& mats,
                          1, b.maxStatusTicks);
         d.repeats = ClampI(g.value("repeats", 4), 1, 64);
         d.perTick = ClampI(g.value("perTick", 1), 1, 64);
+        d.foreignPenaltyMille = ClampI(g.value("foreignPenaltyMille", 1000), 0, 100000);
+        for (const json& nm : g.value("native", json::array())) {
+          uint32_t id;
+          if (!nm.is_string() || !resolveMat(nm.get<std::string>(), id)) {
+            errors += where + "native list names unknown material\n";
+            return false;
+          }
+          d.nativeMats.push_back(id);
+        }
         if (d.verb == SpellVerb::Place) {
           d.materialName = g.value("material", std::string());
           if (!resolveMat(d.materialName, d.material) || d.material == 0) {
@@ -1007,9 +1016,18 @@ int32_t EffectTariff(const GlyphLibrary& lib, const EffectInst& e) {
       const int64_t v = (int64_t)vol * g->wind.ttlTicks * e.n * b.rateWind / 1000;
       return v > 0x3FFFFFFF ? 0x3FFFFFFF : (int32_t)std::max<int64_t>(v, 1);
     }
-    case SpellVerb::Mend:
+    case SpellVerb::Mend: {
+      // voxels × arcane(M) × rate.graft, plus the FOREIGN penalty when M is
+      // not the anatomy's own: blood/flesh/bone none, wood some, steel a lot.
       if (e.anyA) return 0;
-      return SatMul(vol, SatMul(lib.Arcane(e.matA), b.rateGraft));
+      int32_t per = SatMul(lib.Arcane(e.matA), b.rateGraft);
+      bool native = false;
+      if (g)
+        for (uint32_t nm : g->nativeMats) native = native || nm == e.matA;
+      if (!native && g)
+        per = SatAdd(per, (int32_t)((int64_t)lib.Arcane(e.matA) * g->foreignPenaltyMille / 1000));
+      return SatMul(vol, per);
+    }
     case SpellVerb::Filter: return std::max(1, vol / 1000);
     case SpellVerb::Trail: {
       int32_t t = 0;
@@ -1669,10 +1687,45 @@ void ApplySpellEffect(const GlyphLibrary& lib, const std::vector<EffectInst>& pa
         out.filters.push_back(f);
         break;
       }
-      case SpellVerb::Mend:
+      case SpellVerb::Mend: {
+        // `M mend`: the graft loop. Take up to perTick × n voxels of M from
+        // within the radius of the point (a convert(cell->air) op per voxel,
+        // filtered to M so nothing else leaves) and post a restore request
+        // for the caster's body: fill the next missing anatomy cells with M.
+        // The probe is the CPU mirror, so this reaches only what is mirrored
+        // — reach around the caster, which is what a hand channel is.
+        if (!probe || !probe->matAt) break;
+        const int32_t want = SatMul(g ? g->perTick : 1, e.n);
+        const int32_t r = ClampI(e.radius, 0, 8);
+        uint32_t src = e.anyA ? 0u : e.matA;
+        if (!e.anyA && src == 0) break;   // mends from nothing: charged
+        int32_t took = 0;
+        for (int32_t dz = -r; dz <= r && took < want; dz++)
+          for (int32_t dy = -r; dy <= r && took < want; dy++)
+            for (int32_t dx = -r; dx <= r && took < want; dx++) {
+              if (dx * dx + dy * dy + dz * dz > r * r) continue;
+              bool known;
+              const uint32_t m = probe->matAt(probe->ctx, cx + dx, cy + dy, cz + dz, known);
+              if (!known || m == 0) continue;
+              if (src == 0) src = m;   // the wildcard takes the first matter it finds
+              if (m != src) continue;
+              out.ops.push_back({cx + dx, cy + dy, cz + dz, 0, 0u /*air*/, 1u, src, 0});
+              took++;
+            }
+        if (took > 0) {
+          out.restores.push_back({0, src, took});
+          if (e.anyA) {
+            const int32_t val = lib.Arcane(src);
+            out.billOnResolve = SatAdd(
+                out.billOnResolve,
+                SatMul(took, SatAdd(SatMul(val, b.rateGraft),
+                                    (int32_t)((int64_t)val * b.anythingSurchargeMille / 1000))));
+          }
+        }
+        break;
+      }
       case SpellVerb::Trail:
       case SpellVerb::None:
-        // mend lands in P4 (a body verb). Charged, nothing yet.
         break;
     }
   }
@@ -1833,6 +1886,8 @@ CastResult SpellSystem::Cast(const CastList& list, CasterState& caster,
   for (SpellStatus& st : out.statuses) st.casterId = casterId;
   for (SpellEcho& ec : out.echoes) ec.casterId = casterId;
   for (SpellFilter& f : out.filters) f.casterId = casterId;
+  for (SpellRestore& rs : out.restores)
+    if (rs.casterId == 0) rs.casterId = casterId;
   Adopt(out, bodies);
   return r;
 }
@@ -2108,6 +2163,8 @@ void SpellSystem::Tick(uint32_t tick, const World& world,
       if (ec.casterId == 0) ec.casterId = casterId;
     for (SpellFilter& f : out.filters)
       if (f.casterId == 0) f.casterId = casterId;
+    for (SpellRestore& rs : out.restores)
+      if (rs.casterId == 0) rs.casterId = casterId;
   };
 
   // Resolve a cast at a point through the SAME function backfire uses

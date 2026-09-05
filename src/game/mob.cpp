@@ -3403,6 +3403,20 @@ void Mob::BleedTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
       if (gushed && !DrainBlood((float)gushed * dropletVox)) return;
     }
 
+    // ---- THE CAUTERISE RULE (docs/PLAN_magic_grammar.md §7) --------------
+    // A charred cell is not a bleed source. When the flesh at the wound has
+    // burnt through, the wound is CLOSED: the budget is dropped, the gout
+    // stops and the stump no longer tops itself up. A body rule, not a spell
+    // rule — so any fire, from any delivery, on any bleeding part stops it,
+    // and it costs the burn.
+    if ((limb.bleedBudget >= 1.0f || limb.stumpOpen || limb.gushTicks > 0) &&
+        WoundCharred(limb)) {
+      limb.bleedBudget = 0.0f;
+      limb.stumpOpen = false;
+      limb.gushTicks = 0;
+      continue;
+    }
+
     // ---- THE STUMP THAT NEVER CLOSES (gore.stumpBleedsOpen) ----
     // A lost limb is a clock. Top the wound back up to one clump so the drip
     // below always has something to spend, for as long as the creature is
@@ -4913,6 +4927,213 @@ bool Mob::ReskinLimbMicro(MobLimb& limb, uint32_t skinScale,
     limb.gushLocal = limb.gushLocal - d;
   }
   return true;
+}
+
+bool Mob::WoundCharred(const MobLimb& limb) const {
+  if (!limb.body || !sys_) return false;
+  const bool fine = limb.HasFineSkin();
+  const float scale = (float)std::max(1u, fine ? SkinScaleOf(limb) : PhysScaleOf(limb));
+  // The bleed source is the EXPOSED flesh at the wound: the surface voxels
+  // (an open face) within 1.5 world voxels of it. The wound is closed when a
+  // third of those that can char have charred (stage 2) — the same grading
+  // the burn cap uses (Mob::RecountBurn), by SURFACE rather than volume,
+  // because the char is inert and shields what is under it: a limb in a fire
+  // converges near a third of its burnable volume charred with its whole
+  // outside black, and a volume rule would never close it. A third rather
+  // than half because charred voxels keep burning down to ash and leave the
+  // lattice, so the charred share of the surface plateaus well under one.
+  // Bone and steel neither bleed nor burn and are not counted.
+  const Vec3 w = limb.woundLocal * scale;
+  const float r2 = 1.5f * 1.5f * scale * scale;
+  std::vector<uint64_t> occ;
+  auto key = [](int x, int y, int z) {
+    return ((uint64_t)(uint32_t)(x + 32768) << 42) | ((uint64_t)(uint32_t)(y + 32768) << 21) |
+           (uint64_t)(uint32_t)(z + 32768);
+  };
+  struct Near {
+    int x, y, z;
+    uint32_t mat;
+  };
+  std::vector<Near> near;
+  auto visit = [&](int vx, int vy, int vz, uint32_t mat) {
+    occ.push_back(key(vx, vy, vz));
+    const float dx = (float)vx + 0.5f - w.x, dy = (float)vy + 0.5f - w.y,
+                dz = (float)vz + 0.5f - w.z;
+    if (dx * dx + dy * dy + dz * dz <= r2) near.push_back({vx, vy, vz, mat});
+  };
+  if (fine) {
+    for (const PrefabVoxel& v : limb.skinVoxels) visit(v.x, v.y, v.z, v.material & 0xFFFu);
+  } else {
+    for (const DebrisVoxel& v : limb.voxels) visit(v.x, v.y, v.z, v.payload & 0xFFFu);
+  }
+  if (near.empty()) return false;
+  std::sort(occ.begin(), occ.end());
+  static const int kDirs[6][3] = {{1, 0, 0}, {-1, 0, 0}, {0, 1, 0}, {0, -1, 0}, {0, 0, 1}, {0, 0, -1}};
+  uint32_t surface = 0, charred = 0;
+  for (const Near& n : near) {
+    const uint8_t stage = sys_->BurnStageOf(n.mat);
+    if (stage == 0 && !sys_->BurnableOf(n.mat)) continue;
+    bool open = false;
+    for (const auto& d : kDirs)
+      if (!std::binary_search(occ.begin(), occ.end(), key(n.x + d[0], n.y + d[1], n.z + d[2]))) {
+        open = true;
+        break;
+      }
+    if (!open) continue;
+    surface++;
+    if (stage == 2u) charred++;
+  }
+  return surface > 0 && charred * 3 >= surface;
+}
+
+namespace {
+// The recipe cell -> current lattice cell rebase. ReskinLimbMicro rebases a
+// carved brick to its own min corner and moves restOffset with it, so the
+// authored coordinates and today's differ by exactly that drift.
+IVec3 RecipeRebase(const MobLimb& limb, const PrefabModel& model, float inv, uint32_t scale) {
+  const Vec3 authored{(float)model.offset.x * inv, (float)model.offset.y * inv,
+                      (float)model.offset.z * inv};
+  const Vec3 d = (limb.restOffset - authored) * (float)scale;
+  return {(int)std::lround(d.x), (int)std::lround(d.y), (int)std::lround(d.z)};
+}
+uint64_t CellKey(int x, int y, int z) {
+  return ((uint64_t)(uint32_t)(x + 32768) << 42) | ((uint64_t)(uint32_t)(y + 32768) << 21) |
+         (uint64_t)(uint32_t)(z + 32768);
+}
+}  // namespace
+
+uint32_t Mob::MissingVoxelCount(int limbIndex) const {
+  if (!def_ || limbIndex < 0 || limbIndex >= (int)limbs_.size()) return 0;
+  const MobLimb& limb = limbs_[limbIndex];
+  if (!limb.body) return 0;
+  if (limbIndex >= (int)def_->limbs.size()) return 0;
+  const int mi = FindModel(def_->prefab, def_->limbs[limbIndex].name);
+  if (mi < 0) return 0;
+  const size_t have = limb.HasFineSkin() ? limb.skinVoxels.size() : limb.voxels.size();
+  const size_t recipe = def_->prefab.models[mi].voxels.size();
+  return recipe > have ? (uint32_t)(recipe - have) : 0u;
+}
+
+int Mob::RestoreVoxels(int limbIndex, uint32_t material, int count) {
+  if (!def_ || count <= 0 || material == 0) return 0;
+  if (limbIndex < 0 || limbIndex >= (int)limbs_.size() || limbIndex >= (int)def_->limbs.size())
+    return 0;
+  MobLimb& limb = limbs_[limbIndex];
+  if (!limb.body) return 0;   // severed: nothing to fill
+  const MobDef& def = *def_;
+  const int mi = FindModel(def.prefab, def.limbs[limbIndex].name);
+  if (mi < 0) return 0;
+  const PrefabModel& model = def.prefab.models[mi];
+  const bool fine = limb.HasFineSkin();
+  const uint32_t skinScale = std::max(1u, SkinScaleOf(limb));
+  const uint32_t physScale = std::max(1u, PhysScaleOf(limb));
+  const uint32_t scale = fine ? skinScale : physScale;
+  const float inv = 1.0f / (float)def.skinScale;
+  const IVec3 rebase = RecipeRebase(limb, model, inv, scale);
+
+  // What is there now.
+  std::vector<uint64_t> have;
+  if (fine) {
+    have.reserve(limb.skinVoxels.size());
+    for (const PrefabVoxel& v : limb.skinVoxels) have.push_back(CellKey(v.x, v.y, v.z));
+  } else {
+    have.reserve(limb.voxels.size());
+    for (const DebrisVoxel& v : limb.voxels) have.push_back(CellKey(v.x, v.y, v.z));
+  }
+  std::sort(have.begin(), have.end());
+
+  // What is missing, nearest the joint first. anchorLimb is limb-local in
+  // world voxels; compare on the lattice.
+  struct Cand {
+    float d2;
+    int x, y, z;
+  };
+  std::vector<Cand> missing;
+  const Vec3 root = limb.anchorLimb * (float)scale;
+  for (const PrefabVoxel& v : model.voxels) {
+    // The recipe is on the skin lattice; the collider lattice is coarser.
+    int x = v.x, y = v.y, z = v.z;
+    if (!fine && def.skinScale > physScale) {
+      const int r = (int)(def.skinScale / physScale);
+      x /= r;
+      y /= r;
+      z /= r;
+    }
+    x -= rebase.x;
+    y -= rebase.y;
+    z -= rebase.z;
+    if (std::binary_search(have.begin(), have.end(), CellKey(x, y, z))) continue;
+    if (!fine && (x < -127 || x > 127 || y < -127 || y > 127 || z < -127 || z > 127)) continue;
+    const float dx = (float)x + 0.5f - root.x, dy = (float)y + 0.5f - root.y,
+                dz = (float)z + 0.5f - root.z;
+    missing.push_back({dx * dx + dy * dy + dz * dz, x, y, z});
+  }
+  if (missing.empty()) return 0;
+  std::sort(missing.begin(), missing.end(), [](const Cand& a, const Cand& b) {
+    if (a.d2 != b.d2) return a.d2 < b.d2;
+    if (a.y != b.y) return a.y < b.y;
+    if (a.x != b.x) return a.x < b.x;
+    return a.z < b.z;
+  });
+  int placed = 0;
+  std::vector<uint64_t> seen;
+  for (const Cand& c : missing) {
+    if (placed >= count) break;
+    const uint64_t k = CellKey(c.x, c.y, c.z);
+    if (std::binary_search(seen.begin(), seen.end(), k)) continue;   // the coarse lattice folds cells
+    seen.insert(std::lower_bound(seen.begin(), seen.end(), k), k);
+    const uint32_t variant = ((uint32_t)(c.x * 7 + c.y * 13 + c.z * 29)) % 3u;
+    if (fine) {
+      limb.skinVoxels.push_back({(int16_t)c.x, (int16_t)c.y, (int16_t)c.z,
+                                 (uint16_t)(material | (variant << 12)), 0});
+    } else {
+      limb.voxels.push_back({(int8_t)c.x, (int8_t)c.y, (int8_t)c.z, 0,
+                             (uint16_t)(material | (variant << 12))});
+    }
+    placed++;
+  }
+  if (placed == 0) return 0;
+  if (fine) {
+    // Skin -> collider, never back (phys/lattice.h).
+    bool overflow = false;
+    limb.voxels = DownsampleSkin(limb.skinVoxels, std::max(1u, skinScale / physScale), &overflow);
+  }
+  // Credit the volume put back as hp, capped at the limb's authored hp: what
+  // a carve charged per voxel, a graft refunds per voxel.
+  const float hpMax = def.limbs[limbIndex].hp;
+  if (limb.voxelsAtSpawn > 0)
+    limb.hp = std::min(hpMax, limb.hp + hpMax * (float)placed / (float)limb.voxelsAtSpawn);
+  limb.voxelsCharged += (uint32_t)placed;
+  // Art, then collider, the order the carve uses; and the burn index points
+  // at the old lattice now.
+  if (limb.microModel >= 0) ReskinLimbMicro(limb, skinScale, physScale);
+  RebuildLimbBody(limbIndex);
+  DropBurnIndex(limb.burn);
+  limb.carved = true;
+  return placed;
+}
+
+int Mob::RestoreBody(uint32_t material, int count) {
+  int total = 0;
+  if (!def_) return 0;
+  for (size_t i = 0; i < def_->limbs.size() && count > 0; i++) {
+    const int n = RestoreVoxels((int)i, material, count);
+    total += n;
+    count -= n;
+  }
+  return total;
+}
+
+int MobSystem::RestoreMob(uint64_t mobId, uint32_t material, int count) {
+  for (Mob& m : mobs_)
+    if (m.Id() == mobId) return m.RestoreBody(material, count);
+  return 0;
+}
+
+uint32_t MobSystem::MissingVoxelCount(uint64_t mobId, int limbIndex) const {
+  for (const Mob& m : mobs_)
+    if (m.Id() == mobId) return m.MissingVoxelCount(limbIndex);
+  return 0;
 }
 
 bool Mob::RebuildLimbBody(int limbIndex) {

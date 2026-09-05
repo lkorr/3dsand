@@ -3248,6 +3248,45 @@ every held tick and is gone after release; an echo fires exactly `repeats`
 times; a ward refuses a convert op inside its radius at the splice, passes a
 paint op, and is gone the next tick.
 
+**Mend is the graft loop, and the anatomy `.vox` is the recipe (plan §7;
+`Mob::RestoreVoxels`).** `M mend` is an Effect-operator with a left Matter
+slot: where it resolves it takes up to `perTick × n` voxels of M from within
+its radius — each leaves the world as a `convert(cell→air)` op filtered to M,
+so nothing else goes — and posts a `SpellRestore` (caster, M, count) that the
+owner applies to the caster's body: `Mob::RestoreBody` walks the rig
+root-first and `RestoreVoxels` fills the next missing cells of each LIVE limb
+with M, nearest the joint anchor first so a stump regrows outward, re-derives
+the collider and the brick the way a carve does, and credits hp for the
+volume put back. "Missing" is well-defined because the def's prefab model is
+what should be there (rebased by the drift `ReskinLimbMicro` left on
+`restOffset`). The restored cell IS material M: wood burns, steel does not,
+acid eats flesh and not glass. The tariff makes the anatomy's own materials
+(the glyph's `native` list) cheap and everything else dear
+(`foreignPenaltyMille` × `arcane(M)` per voxel). A severed limb is not
+regrown: it has no lattice to fill; `mend self` finds no matter at the
+caster's own body (the body is not in the grid) and mends nothing. The
+starter page `heal` is `blood mend`.
+
+**The cauterise rule is a body rule, not a spell rule.** In the bleed tick,
+a wound whose EXPOSED flesh has charred is CLOSED: the budget is dropped, the
+gout stops, the stump no longer tops itself up (`Mob::WoundCharred`). The
+measure is the surface voxels (an open face) within 1.5 world voxels of the
+wound that can char at all — bone and steel neither bleed nor burn — and the
+wound is closed when a third of them are at burn stage 2. Surface, not
+volume, and a third, not half, for the reason the burn cap grades by
+body-surface area (`Mob::RecountBurn`): the char is inert and shields what
+is under it, and charred voxels burn down to ash and leave the lattice, so a
+stump in a fire has its whole outside black while its charred share of
+volume converges near a third and its charred share of surface plateaus well
+under one. So `fire self` on a bleeding stump chars the exposed flesh and
+stops the bleeding — and so does any fire, from any delivery, and it costs
+the burn. Gate `spells` check (7): the VM half over a fake mirror, the graft
+on a carved creature (missing count falls by exactly what landed), and a
+severed forearm's stump bleeding, then standing in world fire (the path a
+sprayed `fire` takes: bare skin catches from hot cells beside it, direct
+ignition is the cloth entry point), then closed while the creature lives —
+at tick 811 of 1500 on the human.
+
 **Deliveries are three mechanisms, and Mods are field edits on their record
 (plan §5; `DeliveryRec`, `ApplyMod`).** `hand`/`self` are *instant* at a
 point; `projectile`/`bolt`/`lob`/`orb`/`bomb` are *flight* (speed, gravity,

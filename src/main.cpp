@@ -6413,6 +6413,16 @@ int main(int argc, char** argv) {
         // A sustained gravity mod on the player's own body.
         for (const SpellBodyImpulse& bi : emit.bodyImpulses)
           if (bi.target == 0x9134A5EEu) player.vel.y += bi.vps.y;
+        // GRAFTS: the world half already left as ops; the body half fills the
+        // caster's missing anatomy cells with that matter, root-first. The VM
+        // cannot reach a body (thesis 4); the owner does it.
+        for (const SpellRestore& rs : emit.restores) {
+          if (rs.casterId == 0x9134A5EEu) {
+            if (avatar.Spawned()) avatar.RestoreBody(rs.material, rs.count);
+          } else {
+            mobs.RestoreMob(rs.casterId, rs.material, rs.count);
+          }
+        }
         // WARDS filter the spell's OWN emission too (a fire aura inside an
         // anti-fire ward is refused like anyone else's).
         ui.spellRefused = spells.FilterStreams(emit.ops, emit.explosions, emit.spawns, emit.winds);

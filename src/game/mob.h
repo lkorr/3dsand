@@ -1215,6 +1215,26 @@ class Mob {
                  const CarveSpall* spall = nullptr);
   bool ReskinLimbMicro(MobLimb& limb, uint32_t skinScale, uint32_t physScale);
   bool RebuildLimbBody(int limbIndex);
+
+ public:
+  // ---- MEND (docs/PLAN_magic_grammar.md §7; game/spell.h verb `mend`) -------
+  // The anatomy .vox IS the recipe of what should be there, so "missing" is
+  // well-defined and so is "which cell next": RestoreVoxels fills up to
+  // `count` missing cells of a LIVE limb with `material`, nearest the joint
+  // anchor first (a stump regrows outward), re-derives the collider and the
+  // brick, and credits hp for the volume put back. The restored cell IS that
+  // material: wood burns, steel does not. Returns how many landed. A severed
+  // limb has no lattice to fill and is not regrown.
+  int RestoreVoxels(int limbIndex, uint32_t material, int count);
+  uint32_t MissingVoxelCount(int limbIndex) const;
+  // Root-first across the rig: the def's limb order is parent-before-child.
+  int RestoreBody(uint32_t material, int count);
+  // THE CAUTERISE RULE: a charred cell is not a bleed source. True when the
+  // limb's voxel nearest its wound is at burn stage 2 (charred / ash), which
+  // the bleed tick reads to close the wound for good.
+  bool WoundCharred(const MobLimb& limb) const;
+
+ protected:
   // ---- the wound model's two helpers (game/mob.cpp, and the notes there) ----
   // Voxels of `limb` within `radiusWorld` world voxels of its joint anchor, on
   // whichever lattice is authoritative. ONE pass, no allocation. This is the
@@ -2051,6 +2071,10 @@ class MobSystem {
   // counts: a micro limb emits no cube instances at all, so counting draws
   // would silently measure nothing on exactly the rigs carving matters most on.
   uint32_t LimbVoxelCount(uint64_t mobId, int limbIndex) const;
+  // Mend on a creature, by id (the mob cast it, or it was the target): fills
+  // missing anatomy cells with `material`, root-first. Returns how many.
+  int RestoreMob(uint64_t mobId, uint32_t material, int count);
+  uint32_t MissingVoxelCount(uint64_t mobId, int limbIndex) const;
   // The SKIN lattice's count when the limb has one (the collider above is a
   // majority-fill downsample of it, and a chip one skin voxel deep never
   // reaches it), else the same number as LimbVoxelCount.

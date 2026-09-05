@@ -26,7 +26,9 @@
 #include <nlohmann/json.hpp>
 
 #include "game/brush.h"
+#include "game/mob.h"
 #include "game/spell.h"
+#include "phys/debris.h"
 #include "test/selftest.h"
 #include "test/support.h"
 
@@ -775,20 +777,225 @@ Status GateSpells(Ctx& c, std::string& detail) {
                 echoBlasts, repeats, refused, wardExpired ? 1 : 0);
   }
 
+  // ---- (7) MEND: the world half, the body half, and the cauterise rule -----
+  // `blood mend` by hand over a patch of blood takes voxels out of the world
+  // as filtered convert(cell->air) ops and posts a restore for exactly that
+  // many; a carved creature's missing anatomy cells fill root-first with the
+  // matter and the missing count falls by exactly what landed; and a stump
+  // that has charred through stops bleeding while the creature lives.
+  bool mendOk = false;
+  {
+    // The VM half, over a fake mirror: blood in a 3-voxel ball around reach.
+    struct BloodPatch {
+      int32_t cx, cy, cz;
+      uint32_t blood;
+    } patch{0, 0, 0, 0};
+    for (size_t i = 0; i < mats.size(); i++)
+      if (mats[i].name == "blood") patch.blood = (uint32_t)i;
+    SpellProbe bp;
+    bp.ctx = &patch;
+    bp.matAt = [](void* c, int32_t x, int32_t y, int32_t z, bool& known) -> uint32_t {
+      const BloodPatch& p = *(BloodPatch*)c;
+      known = true;
+      const int32_t dx = x - p.cx, dy = y - p.cy, dz = z - p.cz;
+      return dx * dx + dy * dy + dz * dz <= 9 ? p.blood : 0u;
+    };
+    const int gMend = lib.Find("mend");
+    const int32_t perTick = gMend >= 0 ? lib.glyphs[gMend].perTick : 0;
+    CastList sp = CompileSpell(lib, speak({"blood", "mend"}));
+    patch.cx = 3;   // hand reach along +x from the origin
+    CasterState cs;
+    cs.mana = 100000;
+    cs.manaMax = 100000;
+    FakeHealth hp(100000);
+    SpellSystem msys;
+    msys.SetLibrary(&lib);
+    SpellEmission e;
+    msys.Cast(sp, cs, hp.cb, 9, {0, 0, 0}, {kSpellFxOne, 0, 0}, 1, e, &bp);
+    int converts = 0;
+    bool filtered = true;
+    for (const BrushOp& o : e.ops) {
+      if (o.mode != 1u || o.material != 0u) continue;
+      converts++;
+      filtered = filtered && o.pad0 == patch.blood && o.radius == 0;
+    }
+    const bool vmOk = patch.blood != 0 && perTick > 0 && converts == perTick && filtered &&
+                      e.restores.size() == 1 && e.restores[0].material == patch.blood &&
+                      e.restores[0].count == converts && e.restores[0].casterId == 9;
+
+    // The body half, on a real creature: carve, then graft back.
+    MobSystem& mobs = c.mobs;
+    int dummyDef = -1;
+    for (size_t i = 0; i < mobs.Defs().size(); i++)
+      if (mobs.Defs()[i].name == kAvatarDefName) dummyDef = (int)i;
+    bool bodyOk = false, cauteriseOk = false;
+    int missingBefore = 0, restored = 0, missingAfter = 0, bleedTicks = 0, charTick = -1;
+    bool died = false;
+    int charredAtEnd = 0, burningAtEnd = 0, parentVox = 0, cookedAtEnd = 0;
+    if (dummyDef >= 0) {
+      // Inside the CURRENT residency window (streaming moved it): a creature
+      // spawned outside it has no bodies and is culled on the first tick.
+      const IVec3 wo = world.WindowOrigin();
+      const int sx = wo.x * (int)kChunk + 72, sz = wo.z * (int)kChunk + 72;
+      const int h = World::TerrainHeight(sx, sz, kDefaultSeed);
+      IVec3 pc{sx >> 4, (h + 1) >> 4, sz >> 4};
+      const uint64_t id = mobs.Spawn(dummyDef, {sx, h + 1, sz});
+      const MobDef& dd = mobs.Defs()[dummyDef];
+      auto limbIndex = [&](const char* name) {
+        for (size_t i = 0; i < dd.limbs.size(); i++)
+          if (dd.limbs[i].name == name) return (int)i;
+        return -1;
+      };
+      uint32_t t = 9000;
+      auto mobTick = [&]() {
+        std::vector<BrushOp> ops;
+        std::vector<ParticleSpawn> spawns;
+        std::vector<CellOp> cellOps;
+        mobs.PreTick(t + 1, world, ops, cellOps, spawns);
+        c.debris.QueueSupportEvents(world.Snap());
+        c.debris.PreTick(t + 1, world, cellOps, spawns);
+        ++t;
+        SubmitTick(c.ctx, world, c.sim, t, kDefaultSeed, ops, {}, cellOps, false, pc,
+                   true, false, spawns);
+        c.ctx.WaitIdle();
+        c.ctx.ProcessEvents();
+        c.phys.Step(kTickDt);
+        c.debris.PostStep();
+        mobs.PostStep();
+      };
+      for (int i = 0; i < 6; i++) mobTick();
+      // A small blast into the torso (the biggest limb) takes a bite out of it.
+      const int torso = limbIndex("torso");
+      std::vector<ParticleSpawn> spawns;
+      if (torso >= 0 && mobs.LimbVoxelCount(id, torso) > 0)
+        mobs.CarveLimbRadial(mobs.LimbBody(id, torso),
+                             mobs.LimbVoxelPos(id, torso, mobs.LimbVoxelCount(id, torso) / 2),
+                             1.5f, true, false, world, spawns);
+      for (int i = 0; i < 2; i++) mobTick();
+      int carvedLimb = -1;
+      for (int li = 0; li < (int)dd.limbs.size(); li++)
+        if (mobs.MissingVoxelCount(id, li) > 0 && carvedLimb < 0) carvedLimb = li;
+      if (carvedLimb >= 0) {
+        missingBefore = (int)mobs.MissingVoxelCount(id, carvedLimb);
+        // RestoreBody walks root-first; the first limb with a hole is where
+        // the graft lands, and the count must move by exactly what landed.
+        restored = mobs.RestoreMob(id, patch.blood, 20);
+        missingAfter = (int)mobs.MissingVoxelCount(id, carvedLimb);
+        bodyOk = missingBefore > 0 && restored > 0 && restored <= 20 &&
+                 missingAfter == missingBefore - restored;
+      }
+      // Cauterise: cut the forearm so the upper arm's stump bleeds, then put
+      // REAL FIRE in the world around the wound — the path `fire self` takes,
+      // through the CA and the body's own burn front (direct ignition is a
+      // cloth-only entry point; bare skin catches from hot cells beside it) —
+      // and wait for the flesh at the wound to char through while the
+      // creature lives.
+      const int arm = limbIndex("armL.L");
+      uint32_t mFire = 0;
+      for (size_t m = 0; m < mats.size(); m++)
+        if (mats[m].name == "fire") mFire = (uint32_t)m;
+      if (arm >= 0 && mFire != 0) {
+        mobs.Sever(id, arm);
+        Vec3 woundW{};
+        bool haveWound = false;
+        for (int i = 0; i < 8; i++) {
+          mobTick();
+          for (const MobSystem::BleedSource& bs : mobs.BleedSources())
+            if (bs.key == ((id << 8) ^ (uint64_t)(limbIndex(dd.limbs[arm].parent.c_str()) + 1))) {
+              bleedTicks++;
+              woundW = bs.posVoxel;
+              haveWound = true;
+            }
+        }
+        const int parent = limbIndex(dd.limbs[arm].parent.c_str());
+        // The STUMP's own wound, by the key the bleed list carries (the torso
+        // carve above left a wound of its own that drips down on its own
+        // clock and is nowhere near the fire).
+        const uint64_t stumpKey = (id << 8) ^ (uint64_t)(parent + 1);
+        auto soakTick = [&]() {
+          std::vector<BrushOp> ops;
+          std::vector<ParticleSpawn> spawns2;
+          std::vector<CellOp> cellOps;
+          mobs.PreTick(t + 1, world, ops, cellOps, spawns2);
+          c.debris.QueueSupportEvents(world.Snap());
+          c.debris.PreTick(t + 1, world, cellOps, spawns2);
+          const IVec3 b{ifloor(woundW.x), ifloor(woundW.y), ifloor(woundW.z)};
+          for (int dz = -2; dz <= 2; dz++)
+            for (int dy = -2; dy <= 2; dy++)
+              for (int dx = -2; dx <= 2; dx++) {
+                const IVec3 cc{b.x + dx, b.y + dy, b.z + dz};
+                if (!world.CellInWindow(cc)) continue;
+                if (cellOps.size() >= kMaxCellOpsPerTick) break;
+                cellOps.push_back({World::SlotCellIndex(cc),
+                                   PackVoxNew(mFire, 7u) | kCellOpIfAir});
+              }
+          ++t;
+          SubmitTick(c.ctx, world, c.sim, t, kDefaultSeed, ops, {}, cellOps, false, pc,
+                     true, false, spawns2);
+          c.ctx.WaitIdle();
+          c.ctx.ProcessEvents();
+          c.phys.Step(kTickDt);
+          c.debris.PostStep();
+          mobs.PostStep();
+        };
+        for (int i = 0; haveWound && i < 1500 && charTick < 0; i++) {
+          // The creature WANDERS: the fire follows the wound, and the mirror
+          // (which the burn front reads hot cells from) follows the creature.
+          const Vec3 mo = mobs.MobOrigin(id);
+          pc = IVec3{ifloor(mo.x) >> 4, ifloor(mo.y) >> 4, ifloor(mo.z) >> 4};
+          soakTick();
+          bool alive = false;
+          for (uint32_t k = 0; k < mobs.MobCount(); k++) alive = alive || mobs.MobIdAt(k) == id;
+          if (!alive) {
+            died = true;
+            break;
+          }
+          bool bleeding = false;
+          for (const MobSystem::BleedSource& bs : mobs.BleedSources())
+            if (bs.key == stumpKey) {
+              bleeding = true;
+              woundW = bs.posVoxel;
+            }
+          if (!bleeding && i > 4) charTick = i;
+        }
+        if (parent >= 0) {
+          for (size_t m = 0; m < mats.size(); m++)
+            if (Mob::BurnStageOfMaterialName(mats[m].name) == 2)
+              charredAtEnd += (int)mobs.LimbMaterialCount(id, parent, (uint32_t)m);
+            else if (Mob::BurnStageOfMaterialName(mats[m].name) == 1)
+              cookedAtEnd += (int)mobs.LimbMaterialCount(id, parent, (uint32_t)m);
+          burningAtEnd = (int)mobs.LimbBurningCount(id, parent);
+          parentVox = (int)mobs.LimbVoxelCount(id, parent);
+        }
+        cauteriseOk = bleedTicks > 0 && charTick > 0 && !died;
+      }
+      mobs.Reset();
+      c.debris.Reset();
+    }
+    mendOk = vmOk && bodyOk && cauteriseOk;
+    std::printf("spell mend: %s (vm: %d convert ops filtered=%d, restore %d; body: missing %d "
+                "-> grafted %d -> missing %d; cauterise: bled %d ticks, closed at tick %d, "
+                "died=%d; stump %d voxels: %d charred, %d burning, %d cooked at the end)\n",
+                mendOk ? "PASS" : "FAIL", converts, filtered ? 1 : 0,
+                e.restores.empty() ? 0 : e.restores[0].count, missingBefore, restored,
+                missingAfter, bleedTicks, charTick, died ? 1 : 0,
+                parentVox, charredAtEnd, burningAtEnd, cookedAtEnd);
+  }
+
   const bool lawsOk = alphaOk && lawFail == 0 && l1 > 0 && l2pairs > 0 && l3 > 0 &&
                       l6cases > 0 && l4cases > 0 && l7 > 0 && l5 > 0 && l8 > 0;
   const bool spellOk = budgetOk && fatalOk && carveAsked && fatalEmitted && sprayOk &&
-                       latchOk && lawsOk && bombOk && sustainOk;
+                       latchOk && lawsOk && bombOk && sustainOk && mendOk;
   std::printf(
       "spells: %s (trail authorized %lld/%d voxels over %d ticks, died=%d; "
       "overcast fatal=%d carve=%d payload=%d; spray %d/%d/%d voxels for "
-      "%d/%d/%d mana; bomb=%d sustain=%d; laws over %zu sequences: L1 %d, L2 %d/%d, "
+      "%d/%d/%d mana; bomb=%d sustain=%d mend=%d; laws over %zu sequences: L1 %d, L2 %d/%d, "
       "L3 %d, L4 %d/%d, L5 %d, L6 %d/%d, L7 %d, L8 %d, %d failures)\n",
       spellOk ? "PASS" : "FAIL", (long long)trailVolume, authoredBudget, flownTicks,
       diedWithBudget ? 1 : 0, fatalOk ? 1 : 0, carveAsked ? 1 : 0, fatalEmitted ? 1 : 0,
       sprayN[0], sprayN[1], sprayN[2], sprayCost[0], sprayCost[1], sprayCost[2],
-      bombOk ? 1 : 0, sustainOk ? 1 : 0, seqs.size(), l1, l2, l2pairs, l3, l4, l4cases, l5,
-      l6, l6cases, l7, l8, lawFail);
+      bombOk ? 1 : 0, sustainOk ? 1 : 0, mendOk ? 1 : 0, seqs.size(), l1, l2, l2pairs, l3, l4,
+      l4cases, l5, l6, l6cases, l7, l8, lawFail);
   detail = Format("laws %zu seq, %d failures", seqs.size(), lawFail);
   return spellOk ? Status::Pass : Status::Fail;
 }

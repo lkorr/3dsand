@@ -255,6 +255,14 @@
       "result": "effect",
       "perTick": 1,
       "radius": 4,
+      "native": [
+        "blood",
+        "flesh",
+        "bone",
+        "skin",
+        "muscle"
+      ],
+      "foreignPenaltyMille": 1000,
       "example": "blood mend",
       "axis": "voxels per tick",
       "desc": "M mend: draws matter M from the resolve point into the caster's missing anatomy cells, one voxel at a time. Needs a source word."
