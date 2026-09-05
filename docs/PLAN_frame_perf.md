@@ -31,14 +31,55 @@ flight the tick work (~13 ms) serialises ahead of the raymarch.
   22 ms frame to 33), `render.fpsCap`. Harness p50 7.6 -> 3.8 ms at 0.75 scale.
   `rhi::CommandEncoder::BlitTexture`, `Simulation::BeginOverlayRenderPass`.
 
+- **GI gather cache + openness refresh skip** (2026-09-05, branch
+  `perf-gi-openness`; §3 items 1 and 4). Same binary, assets A/B against a
+  detached `a0deae5` worktree; every boot checked for `timestamps: yes`.
+  - `giGather`'s nine rays now run once per block-face (from its centre) into
+    a second plane of `irradiance` (`GI_CACHE_BASE`), per chunk slot every
+    `render.giCachePeriod` (8) frames or when the word reads 0, read bilinear
+    over the face plane (`giBounceAt`). `--shader-stats`: raymarch fragment
+    168 -> 168 registers, no local memory, binary +2.4%. `--render-budget`
+    noon 1080p, two boots: `nogicache` (the old per-pixel gather) +1.01 /
+    +1.26 ms over a 17.9 / 17.7 ms baseline; `nogi` now saves only 0.31 /
+    0.45 ms, i.e. the whole feature costs ~0.4 ms where it cost 1.2.
+    `cachesub2` saves 0.59 / 0.19 ms — inside the ±0.5 ms per-arm noise, so
+    subdiv 2 is not a lever at this camera. `--perf` raymarch mean: idle
+    18.6 -> 17.7 ms, flythrough 21.0 -> 20.1, sprint 13.4 -> 13.0 (in flight
+    the walk zeroes the cache for every touched chunk, so most of it is
+    live). `gi-bounce` with the cache: G +31.8 vs +32.8 per-pixel; a
+    `screenshot_ground` triplet reads cached vs GI-off G +2.60/255 against
+    live vs GI-off +2.72. The first `nogicache` number this package printed
+    (12.83 ms) was a shader that FAILED to compile — `% 0u` const-folds to a
+    Tint error — and a boot contaminated by another agent's exe; both are
+    why the modulo is guarded and why the two later boots are the record.
+  - The refresh skips the five-ray march for a slot whose stamp matches and
+    whose column nothing within reach touched since its last full walk
+    (`opennessGen` planes `OPEN_WALKED_BASE` / `OPEN_TOUCH_BASE`; dirty walks
+    and stale-stamp arrivals stamp the 17×17 columns around them), keeping
+    only the sun re-sample and decay; solid sentinel chunks settle interior
+    faces without the origin search. Measured (`--perf --scenario`, openness
+    node): **idle settles to 0.053 ms/frame from 0.287 (-82%)** once every
+    slot has had one full visit after its column's last touch — about two
+    refresh cycles, ~8 s at 30 Hz — and a diagnostic with skip visits as a
+    no-op reads 0.007, so what remains is the sun re-sample kept on purpose.
+    Sprint 1.30 -> 1.21 ms and flythrough 0.48 -> 0.50: in flight a whole
+    chunk plane streams in per tick and the node is the DIRTY walk of those
+    planes, which no refresh policy can touch; the sentinel fast path is the
+    7% there. The plan's "1.3 ms in a world where nothing changed" was the
+    sprint number; in an idle world the node was 0.27 and is now 0.05.
+  - The `openness` gate passes again (it was known-failing since the harness
+    pads went): its floor is BUILT now, floating over the real surface found
+    by scanning the voxel column, because the old probe cell sat in a
+    one-voxel pit of a slope and the walk's origin search could not march it
+    (`openness attribution:` line in the gate output says so).
+
 ## 3. Open targets, in order
 
-1. **Shadow rays and the GI gather.** `shadowCacheSubdiv` is 4 (16 patches per
-   face, 34 rays / 100 px). Price 2 as a `--render-budget` arm — tuning only.
-   `giGather` (raymarch.wgsl ~8187 -> ~3348) casts 9 `traceOpaque` rays on every
-   lit near pixel every frame, reading an irradiance buffer that is already
-   temporally filtered; cache the gather per block-face patch the way the shadow
-   cache works (`shadowCached`, ~3856), or gather every other pixel.
+1. **Shadow rays and the GI gather.** LANDED 2026-09-05 (§2): the gather is
+   cached per block-face (`giBounceAt`, ~1.0–1.3 ms at the noon overlook);
+   `cachesub2` measured inside the noise and stays at 4. What is left of the
+   shadow ray is the per-frame resolve of every visible patch
+   (`shadowCache` node 0.6–1.5 ms), not its granularity.
 2. **Async compute queue for the sim** (ROADMAP_scale.md §3.6, never started).
    Hides most of the ~13 ms tick side under the raymarch in flight; zero win
    standing still. Large: the barrier generator in `vk_record.cpp` is
@@ -53,10 +94,11 @@ flight the tick work (~13 ms) serialises ahead of the raymarch.
    reads. NOT the rejected R2 spreading experiment (that redistributed the same
    work and paid ~350 us per extra dispatch); this removes work and adds one
    dispatch. Measure the column share with a stub arm before building.
-4. **Openness refresh runs every tick regardless of activity** — 256 chunks per
-   tick + the dirty pass, 1.3 ms GPU mean in sprint. Halve
-   `opennessChunksPerFrame` (tuning); structurally skip sentinel chunks and
-   chunks whose generation already matches with no changed neighbour.
+4. **Openness refresh runs every tick regardless of activity** — LANDED
+   2026-09-05 (§2): idle 0.29 -> 0.05 ms. The sprint 1.3 ms is the dirty walk
+   of the chunk plane that streams in every tick; the only lever left there is
+   the per-face cost of a NEW surface chunk's walk (the up-rays to the window
+   top are the long ones), or walking a streamed plane over more than one tick.
 5. **Streaming hitch tail** (stream CPU p95 35 ms / max 171, wake-wait max
    118, snapshot stall max 81). Deferred wake + one shift per frame landed;
    the next lever is the mirror's N26 dilation (dirty 43% + ring 15% of the

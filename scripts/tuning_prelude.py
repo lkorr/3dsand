@@ -231,6 +231,7 @@ SPEC = [
     ("render", "giDecay", "TUNE_GI_DECAY", "f", 0.25),
     ("render", "giFeedback", "TUNE_GI_FEEDBACK", "f", 0.2),
     ("render", "giGatherBlocks", "TUNE_GI_GATHER_BLOCKS", "i", 3),
+    ("render", "giCachePeriod", "TUNE_GI_CACHE_PERIOD", "i", 8),
 
     # drifting particulate (silt)
     ("render", "siltDensity", "TUNE_SILT_DENSITY", "f", 0.55),

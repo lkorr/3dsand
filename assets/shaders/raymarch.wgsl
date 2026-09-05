@@ -3345,27 +3345,15 @@ fn ambientAt(n : vec3f) -> vec3f {
 // The cost is measured by --render-budget's `nogi` arm.
 const GI_W_NORMAL : f32 = 0.25;
 const GI_W_RING : f32 = 0.09375;
-fn giGather(p : vec3f, n : vec3f, cell : vec3<i32>) -> vec3f {
-  let face = openFaceOfNormal(n);
+// The nine rays from an origin already pushed clear of the receiver's block
+// (see giGather for the per-pixel origin and giBounceAt for the cached,
+// block-face-centre one).
+fn giGatherRays(ro : vec3f, n : vec3f, face : u32) -> vec3f {
   let axis = i32(face >> 1u);
   let t0 = vec3f(select(0.0, 1.0, axis == 1), select(0.0, 1.0, axis == 2),
                  select(0.0, 1.0, axis == 0));
   let t1 = vec3f(select(0.0, 1.0, axis == 2), select(0.0, 1.0, axis == 0),
                  select(0.0, 1.0, axis == 1));
-  // THE ORIGIN IS PUSHED CLEAR OF THE RECEIVER'S OWN BLOCK along the normal.
-  // traceOpaque's coarse march tests the block it starts in, and a wall's
-  // block column reaches up to three voxels in front of its face, so a ray
-  // starting on the face would report the wall itself as the first emitter on
-  // every direction that leans toward its column — the first version of this
-  // function lit a wall beside a sunlit floor at 6% of the floor, and that
-  // was why. Half a voxel past the block's far plane: the same "never start on
-  // a boundary" rule sim_openness.wgsl's rays follow.
-  let ci = axisPickI(cell, axis);
-  let b0 = (ci >> SUBOCC_SHIFT) << SUBOCC_SHIFT;
-  let plane = f32(ci) + select(0.0, 1.0, (face & 1u) != 0u);
-  let dOut = select(plane - f32(b0), f32(b0 + i32(SUBOCC_BLOCK)) - plane,
-                    (face & 1u) != 0u) + 0.5;
-  let ro = p + n * dOut;
   let maxSteps = TUNE_GI_GATHER_BLOCKS + 1;
   var acc = vec3f(0.0);
   for (var r = 0u; r < 9u; r++) {
@@ -3404,6 +3392,124 @@ fn giGather(p : vec3f, n : vec3f, cell : vec3<i32>) -> vec3f {
     acc += e * (w / (ax + ay + az));
   }
   return acc;
+}
+
+// The UNCACHED gather, per pixel: what every lit near hit paid before the
+// cache (render.giCachePeriod = 0 -- the `nogicache` --render-budget arm).
+fn giGather(p : vec3f, n : vec3f, cell : vec3<i32>) -> vec3f {
+  let face = openFaceOfNormal(n);
+  let axis = i32(face >> 1u);
+  // THE ORIGIN IS PUSHED CLEAR OF THE RECEIVER'S OWN BLOCK along the normal.
+  // traceOpaque's coarse march tests the block it starts in, and a wall's
+  // block column reaches up to three voxels in front of its face, so a ray
+  // starting on the face would report the wall itself as the first emitter on
+  // every direction that leans toward its column — the first version of this
+  // function lit a wall beside a sunlit floor at 6% of the floor, and that
+  // was why. Half a voxel past the block's far plane: the same "never start on
+  // a boundary" rule sim_openness.wgsl's rays follow.
+  let ci = axisPickI(cell, axis);
+  let b0 = (ci >> SUBOCC_SHIFT) << SUBOCC_SHIFT;
+  let plane = f32(ci) + select(0.0, 1.0, (face & 1u) != 0u);
+  let dOut = select(plane - f32(b0), f32(b0 + i32(SUBOCC_BLOCK)) - plane,
+                    (face & 1u) != 0u) + 0.5;
+  return giGatherRays(p + n * dOut, n, face);
+}
+
+// ---- the gather CACHE (docs/PLAN_frame_perf.md §3 item 1) ------------------
+// The nine rays above ran on every lit near pixel every frame, reading a grid
+// that is itself an EMA over frames -- 1.2 ms of the overlook frame for a
+// signal that changes at the shadow cache's pace. The gather is a function of
+// the block-face and the geometry around it, not of the pixel, so it is cached
+// per block-face in the second plane of `irradiance` (common.wgsl
+// GI_CACHE_BASE) from the FACE'S CENTRE, and re-run for a chunk slot's faces
+// only on that slot's scheduled frame -- slots are staggered over
+// render.giCachePeriod frames, so 1/N of what is on screen re-gathers each
+// frame -- or for a word that reads 0, "never gathered" (a chunk just walked
+// or just arrived; the first frame that looks at it pays once). Per SLOT and
+// not per block-face on purpose: a warp of pixels lies within one chunk far
+// more often than within one block, so the re-gather branch stays uniform
+// across it instead of firing for the whole warp whenever one lane is due.
+//
+// READ BILINEAR across the four block-faces in the face plane, exactly as
+// opennessAt reads its bytes and for the same reason: a 40 cm block-constant
+// bounce tiles a wall visibly where the light has a gradient. Taps that read
+// 0 (a neighbour never gathered, or off the window) drop out; the pixel's own
+// tap never can, it was just filled. Every read and write is under the slot's
+// openness stamp; a slot the walk has not stamped yet gathers live, as it
+// always did.
+//
+// The per-pixel origin varied with the hit point; the cached origin is the
+// face centre half a voxel past the block's far plane along the normal, the
+// same origin sim_openness.wgsl's own rays start from. Nothing here lives
+// across the DDA loop: it runs in the shade, after the hit.
+fn giCacheWordAt(c : vec3<i32>, face : u32) -> u32 {
+  let slot = chunkIndexW(c);
+  if (opennessGen[slot] != opennessStamp(worldChunkOf(c))) { return 0u; }
+  return irradiance[GI_CACHE_BASE + irrIndexOfCell(c, face)];
+}
+fn giBounceAt(p : vec3f, n : vec3f, cell : vec3<i32>) -> vec3f {
+  if (TUNE_GI_CACHE_PERIOD <= 0) { return giGather(p, n, cell); }
+  let slot = chunkIndexW(cell);
+  if (opennessGen[slot] != opennessStamp(worldChunkOf(cell))) {
+    return giGather(p, n, cell);
+  }
+  let face = openFaceOfNormal(n);
+  let lo = vec3<u32>(cell & vec3<i32>(i32(CHUNK) - 1));
+  let idx = GI_CACHE_BASE + irrIndex(slot, subOccBitLocal(lo), face);
+  var own = irradiance[idx];
+  // max(.., 1): the early return above folds the period-0 arm away, but the
+  // modulo below is still compiled, and a const-evaluated `% 0u` is a Tint
+  // error that refuses the whole shader (the first `nogicache` measurement
+  // silently measured nothing for exactly that reason).
+  let phase = (R.frameIdx + ((slot * 2654435761u) >> 24u)) %
+              max(u32(TUNE_GI_CACHE_PERIOD), 1u);
+  if (own == 0u || phase == 0u) {
+    let half = f32(SUBOCC_BLOCK) * 0.5;
+    let blockMin = cell - vec3<i32>(lo & vec3<u32>(SUBOCC_BLOCK - 1u));
+    let ro = vec3f(blockMin) + vec3f(half) + n * (half + 0.5);
+    // The low bit forced on: 0 must mean "never", and a face in the dark
+    // gathers a true zero.
+    own = packRgb9e5(giGatherRays(ro, n, face)) | 1u;
+    irradiance[idx] = own;
+  }
+  if (TUNE_OPENNESS_BILINEAR == 0) { return unpackRgb9e5(own); }
+  // The four taps, as opennessAt places them: block centres in the face
+  // plane, this cell's slab on the face axis.
+  let axis = face >> 1u;
+  let ea = vec3<i32>(select(0, 1, axis == 0u), select(0, 1, axis == 1u),
+                     select(0, 1, axis == 2u));
+  let eu = vec3<i32>(select(0, 1, axis == 1u), select(0, 1, axis == 2u),
+                     select(0, 1, axis == 0u));
+  let ev = vec3<i32>(select(0, 1, axis == 2u), select(0, 1, axis == 0u),
+                     select(0, 1, axis == 1u));
+  let blk = f32(SUBOCC_BLOCK);
+  let fu = dot(p, vec3f(eu)) / blk - 0.5;
+  let fv = dot(p, vec3f(ev)) / blk - 0.5;
+  let bu = floor(fu);
+  let bv = floor(fv);
+  let wu = fu - bu;
+  let wv = fv - bv;
+  let hb = i32(SUBOCC_BLOCK) / 2;
+  let base = cell * ea + eu * (i32(bu) * i32(SUBOCC_BLOCK) + hb) +
+             ev * (i32(bv) * i32(SUBOCC_BLOCK) + hb);
+  let du = eu * i32(SUBOCC_BLOCK);
+  let dv = ev * i32(SUBOCC_BLOCK);
+  let g00 = giCacheWordAt(base, face);
+  let g10 = giCacheWordAt(base + du, face);
+  let g01 = giCacheWordAt(base + dv, face);
+  let g11 = giCacheWordAt(base + du + dv, face);
+  let w00 = (1.0 - wu) * (1.0 - wv);
+  let w10 = wu * (1.0 - wv);
+  let w01 = (1.0 - wu) * wv;
+  let w11 = wu * wv;
+  var acc = vec3f(0.0);
+  var wsum = 0.0;
+  if (g00 != 0u) { acc += unpackRgb9e5(g00) * w00; wsum += w00; }
+  if (g10 != 0u) { acc += unpackRgb9e5(g10) * w10; wsum += w10; }
+  if (g01 != 0u) { acc += unpackRgb9e5(g01) * w01; wsum += w01; }
+  if (g11 != 0u) { acc += unpackRgb9e5(g11) * w11; wsum += w11; }
+  if (wsum <= 1e-6) { return unpackRgb9e5(own); }
+  return acc / wsum;
 }
 
 // ---- diffuse response ----
@@ -8184,7 +8290,7 @@ fn fs(in : VSOut) -> FSOut {
     // case gathers from the ground the tuft grows in, like the openness read.
     // TUNE_GI_STRENGTH = 0 folds the whole call away (the `nogi` arm).
     if (TUNE_GI_STRENGTH > 0.0) {
-      let bounce = albedo * ao * giGather(hp, openN, openCell) * TUNE_GI_STRENGTH;
+      let bounce = albedo * ao * giBounceAt(hp, openN, openCell) * TUNE_GI_STRENGTH;
       color += bounce;
       // ---- P2 write-back (docs/PLAN_gi.md §4) ----
       // This pixel's OUTGOING radiance — the direct term it just computed plus

@@ -324,9 +324,40 @@ fn openSunSample(blockMin : vec3<i32>, face : u32, open : f32) -> vec4f {
   return vec4f(irrSample(albedo, n, L, keyLightColorP(R), lit, emis), 1.0);
 }
 
+// ---- the touch plane (common.wgsl OPEN_TOUCH_BASE) -------------------------
+// Stamp T.tick on every slot column within reach of this slot's column: the
+// refresh reads it to decide whether a chunk's faces could have changed since
+// they were last marched. Reach in chunk columns, from the same knob the rays
+// use, rounded up and capped at half the window (past that every column is
+// within reach anyway). 17x17 plain stores per call at the default 12 m /
+// 1.6 m chunks, spread over the workgroup: a few stores per thread, on the
+// activity side of the ledger (rule 2), and a benign race -- every writer
+// stores the same tick.
+const OPEN_TOUCH_R : i32 =
+    min(i32(ceil(TUNE_OPENNESS_REACH / VOXEL_METERS / f32(CHUNK))), i32(NCHUNK) / 2);
+const OPEN_TOUCH_SPAN : u32 = u32(2 * OPEN_TOUCH_R + 1);
+fn openTouchAround(slot : u32, li : u32) {
+  let sx = i32(slot % NCHUNK);
+  let sz = i32(slot / (NCHUNK * NCHUNK));
+  let n = OPEN_TOUCH_SPAN * OPEN_TOUCH_SPAN;
+  for (var i = li; i < n; i += OPEN_WORDS_PER_CHUNK) {
+    let cx = (sx + i32(i % OPEN_TOUCH_SPAN) - OPEN_TOUCH_R) & NCHUNK_MASK;
+    let cz = (sz + i32(i / OPEN_TOUCH_SPAN) - OPEN_TOUCH_R) & NCHUNK_MASK;
+    opennessGen[OPEN_TOUCH_BASE + u32(cz) * NCHUNK + u32(cx)] = T.tick;
+  }
+}
+
 // One chunk slot. `li` is both the thread index and the WORD index within the
 // chunk's OPEN_WORDS_PER_CHUNK-word run.
-fn openChunk(slot : u32, li : u32, origin : vec3<i32>) {
+//
+// `fullIn` asks for the five-ray march on every surface face. false -- the
+// refresh's SKIP visit -- keeps each face's stored byte and does only the
+// irradiance maintenance: the coarse sun re-sample for a face that marched
+// and the decay for one that could not. That half must never stop: a face lit
+// at noon, off screen at dusk, is an emitter the gather reads, and "keep
+// yesterday's sun" was the bug the decay exists for (the charger-with-no-
+// expiry, 2026-09-03). A stale stamp forces a full walk whatever was asked.
+fn openChunk(slot : u32, li : u32, origin : vec3<i32>, fullIn : bool) {
   let wc = openWorldChunk(slot, origin);
   let chunkMin = wc * i32(CHUNK);
   let stamp = opennessStamp(wc);
@@ -336,11 +367,39 @@ fn openChunk(slot : u32, li : u32, origin : vec3<i32>) {
   // stores the new one, with the barrier between, so no thread can see its own
   // workgroup's store.
   let stampOk = opennessGen[slot] == stamp;
+  let full = fullIn || !stampOk;
+  // The word this thread stored last time, for the skip visit. Read before the
+  // barrier for the same reason as the stamp (nothing else writes it, but the
+  // habit is the point).
+  let prev = openness[slot * OPEN_WORDS_PER_CHUNK + li];
   workgroupBarrier();
   // The stamp, from thread 0. Written unconditionally, including for a chunk
   // with no matter in it at all: "computed, and the answer is open" is a
   // different statement from "never computed", and only the stamp carries it.
-  if (li == 0u) { opennessGen[slot] = stamp; }
+  // The walked tick beside it, only on a full walk: the refresh compares it
+  // with the column's touch tick to decide whether the next visit may skip.
+  if (li == 0u) {
+    opennessGen[slot] = stamp;
+    if (full) { opennessGen[OPEN_WALKED_BASE + slot] = T.tick; }
+  }
+  // A chunk that ARRIVED (stale stamp) is geometry its neighbours' faces were
+  // never marched against -- the slot held something else when they were --
+  // so it touches the columns around it exactly as a dirty walk does. Without
+  // this a hill streaming in beside a walked floor would leave that floor
+  // measured against the sky that used to be in the hill's slot.
+  if (!stampOk) { openTouchAround(slot, li); }
+
+  // A SOLID SENTINEL CHUNK (UNIFORM / JITTER of a ray blocker) is full to its
+  // edges: every face of an interior block is buried, and the four-column
+  // origin search would read twenty voxels per face to find that out -- 384
+  // faces of it per chunk, on the many buried stone chunks the refresh walks
+  // every tick. Only a face ON THE CHUNK BOUNDARY can be exposed (its front
+  // cell is in the neighbour), so the rest are settled here without a read.
+  // PT_EMPTY is not a special case: no block has a blocker, so the loop below
+  // already takes its cheap branch.
+  let pt = pageTable[slot];
+  let solidSentinel = (pt & PT_SENTINEL_BIT) != 0u && pt != PT_EMPTY &&
+                      isRayBlocker(materials[pt & PT_MAT_MASK]);
 
   var packed = 0u;
   for (var k = 0u; k < 4u; k++) {
@@ -352,7 +411,7 @@ fn openChunk(slot : u32, li : u32, origin : vec3<i32>) {
     // No blocker anywhere in this block: there is no surface here, so no reader
     // will ever look at this byte (a reader indexes the block of a cell it just
     // HIT, which by construction has one). 255 rather than 0 so that if one
-    // ever does — a bilinear tap rolling off the edge of a wall — it reads as
+    // ever does -- a bilinear tap rolling off the edge of a wall -- it reads as
     // open air, which is what a block with nothing in it is.
     let bx = block % SUBOCC_DIM;
     let by = (block / SUBOCC_DIM) % SUBOCC_DIM;
@@ -362,14 +421,28 @@ fn openChunk(slot : u32, li : u32, origin : vec3<i32>) {
     if ((sw & (1u << (block & 31u))) != 0u) {
       let blockMin = chunkMin + vec3<i32>(i32(bx), i32(by), i32(bz)) *
                                     i32(SUBOCC_BLOCK);
-      let ov = openValueAt(blockMin, face);
+      // 256 is "no opinion" (could not march); measured values are <= OPEN_MAX.
+      var ov = 256u;
+      // On the boundary of the chunk on this face's side?
+      let axis = face >> 1u;
+      let coord = select(select(bx, by, axis == 1u), bz, axis == 2u);
+      let onEdge = select(coord == 0u, coord == SUBOCC_DIM - 1u, (face & 1u) != 0u);
+      if (!(solidSentinel && !onEdge)) {
+        if (full) {
+          ov = openValueAt(blockMin, face);
+        } else {
+          // The skip visit: the byte stands. 255 in the byte is 256 here.
+          let pb = (prev >> (k * 8u)) & 0xFFu;
+          ov = select(pb, 256u, pb == 255u);
+        }
+      }
       // Measured values are already <= OPEN_MAX; 256 ("no opinion") lands on
       // 255, which the reader drops from its filter rather than reading as
       // open sky -- the splotch fix, see opennessByteAt.
       v = min(ov, 255u);
       // ---- P1: keep the face's irradiance word honest ----
       // Marched: blend in one coarse sun sample. Could not march (a blocker
-      // in front — a terrace riser, or buried rock): nothing here can measure
+      // in front -- a terrace riser, or buried rock): nothing here can measure
       // it, so its light fades at TUNE_GI_DECAY per visit, and the resolve
       // pass re-deposits it every frame while any patch of it is on screen.
       if (TUNE_GI_STRENGTH > 0.0) {
@@ -389,16 +462,28 @@ fn openChunk(slot : u32, li : u32, origin : vec3<i32>) {
           // them once the camera looks away, so a word the walk skips is a
           // daylight value with no expiry. Fade at TUNE_GI_DECAY per visit
           // (~128 ticks apart) and let the resolve pass re-charge it every
-          // frame it is actually visible.
-          let old = select(vec3f(0.0), unpackRgb9e5(irradiance[idx]), stampOk);
-          irradiance[idx] = packRgb9e5(old * (1.0 - TUNE_GI_DECAY));
+          // frame it is actually visible. A word already at 0 (most buried
+          // faces, forever) is left alone rather than rewritten as 0.
+          let oldW = irradiance[idx];
+          if (!stampOk) {
+            irradiance[idx] = 0u;
+          } else if (oldW != 0u) {
+            irradiance[idx] = packRgb9e5(unpackRgb9e5(oldW) * (1.0 - TUNE_GI_DECAY));
+          }
         }
+        // The gather cache (common.wgsl GI_CACHE_BASE): a full walk means the
+        // geometry around this face may have moved, so what its nine rays
+        // saw is void. 0 = "never gathered"; the raymarch refills it on the
+        // first frame it looks here. A skip visit leaves it be.
+        if (full) { irradiance[GI_CACHE_BASE + idx] = 0u; }
       }
     } else if (TUNE_GI_STRENGTH > 0.0) {
       // No surface in the block: no light leaves it. Zero, so a gather ray
       // that lands here (a block that just lost its last blocker) reads dark
-      // rather than the light of whatever stood here before.
+      // rather than the light of whatever stood here before. The cache word
+      // with it -- nothing can receive here either.
       irradiance[idx] = 0u;
+      irradiance[GI_CACHE_BASE + idx] = 0u;
     }
     packed |= v << (k * 8u);
   }
@@ -407,33 +492,50 @@ fn openChunk(slot : u32, li : u32, origin : vec3<i32>) {
 
 // ---------------------------------------------------------------- passes ----
 
-// dirty: the chunks written this tick, indirect over the compacted dirty list —
+// dirty: the chunks written this tick, indirect over the compacted dirty list --
 // the same list and the same args `occupancyDirty` rides, recorded immediately
 // after it so the blockers mask this pass marches is the one that tick just
 // rewrote. This is the half that makes an edit visible: dig a hole in a roof
 // and the floor under it brightens on the next tick, with no invalidation
-// machinery anywhere.
+// machinery anywhere. Always a FULL walk, and it touches the columns within
+// reach so the refresh re-marches the neighbours the edit could have changed
+// (a roof stamped over a floor darkens that floor on the floor's next visit,
+// instead of never).
 @compute @workgroup_size(OPEN_WORDS_PER_CHUNK)
 fn dirty(@builtin(workgroup_id) wg : vec3<u32>,
          @builtin(local_invocation_index) li : u32) {
-  openChunk(dirtyList[wg.x], li, T.origin);
+  let slot = dirtyList[wg.x];
+  openTouchAround(slot, li);
+  openChunk(slot, li, T.origin, true);
 }
 
 // refresh: a flat TUNE_OPENNESS_CHUNKS slots per tick, round robin. The cursor
 // is derived from T.tick rather than stored in a params word, which costs
 // nothing and cannot go stale: tick * budget advances by exactly one budget per
 // tick by construction, and a tick the pass was not recorded on simply skips
-// its slice — the next pass over that slot is at most kNumChunks / budget ticks
+// its slice -- the next pass over that slot is at most kNumChunks / budget ticks
 // away either way.
 //
 // The dirty walk above covers every EDIT, so this exists for the two cases it
 // cannot see: the cold start (a slot whose stamp is still 0) and a chunk that
 // streamed into a slot some other chunk's bytes are still sitting in. Neither
-// is urgent — a stale-stamped slot reads as "unknown" and shades from the old
+// is urgent -- a stale-stamped slot reads as "unknown" and shades from the old
 // hemisphere lerp until this reaches it.
+//
+// FULL OR SKIP (PLAN_frame_perf.md s3 item 4). A slot whose column was touched
+// since its last full walk marches again; one that was not keeps its bytes
+// and does the irradiance maintenance only. Compared MODULO 2^32 -- "touched
+// more recently than walked" as (now - touched) < (now - walked) -- so a tick
+// clock that jumps backwards between harness fixtures still re-walks, and so
+// a slice the pass was not recorded on (an idle tick, s3.4) cannot age a
+// touch past a fixed window: the touch stands until a full walk follows it.
 @compute @workgroup_size(OPEN_WORDS_PER_CHUNK)
 fn refresh(@builtin(workgroup_id) wg : vec3<u32>,
            @builtin(local_invocation_index) li : u32) {
   let cursor = (T.tick * u32(max(TUNE_OPENNESS_CHUNKS, 1))) % NUM_CHUNKS;
-  openChunk((cursor + wg.x) % NUM_CHUNKS, li, T.origin);
+  let slot = (cursor + wg.x) % NUM_CHUNKS;
+  let touched = opennessGen[OPEN_TOUCH_BASE + openColumnOfSlot(slot)];
+  let walked = opennessGen[OPEN_WALKED_BASE + slot];
+  let full = (T.tick - touched) < (T.tick - walked);
+  openChunk(slot, li, T.origin, full);
 }
