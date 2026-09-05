@@ -15,6 +15,11 @@
  *      files say. This is the one place the two authoring surfaces could
  *      disagree, and the engine reads the SPECIES copy — so a stale mirror is
  *      a biome that silently does not do what its page shows.
+ *   4. THE LIVE MANIFEST (section 7). Every editable field of a biome file, a
+ *      water preset and the map is listed in assets/editor/envlive.js as read
+ *      or not-read-by-package, and every manifest key names a real field. A
+ *      field missing from the manifest is the "third state" PLAN_environment_
+ *      truth §1 forbids: shown as live, read by nothing.
  *
  *   node scripts/test_environment.mjs
  *
@@ -29,6 +34,7 @@ const load = rel => import(pathToFileURL(join(ROOT, rel)).href);
 const WG = await load('assets/editor/watergen.js');
 const BG = await load('assets/editor/biomegen.js');
 const TG = await load('assets/editor/treegen.js');
+const LV = await load('assets/editor/envlive.js');
 const MATS = JSON.parse(readFileSync(join(ROOT, 'assets/materials/materials.json'), 'utf8'));
 const MATNAMES = new Set(MATS.materials.map(m => m.id));
 
@@ -257,6 +263,70 @@ console.log('\n-- world map --');
     ok(rules.every(r => r.kind !== 'stamp' || (typeof r.template === 'string' && j.biomes.includes(r.biome) && r.perKm2 >= 0)), `${rules.length} rule(s) name a template, a palette biome and a perKm2`);
     ok(rules.every(r => r.kind !== 'stamp' || prefabs.has(r.template)), 'every rule names an existing assets/prefabs/<template>.vox');
   }
+}
+
+/* ---- 7. the LIVE manifest covers every editable field ---------------------------- */
+// Walk the data models the pages edit and require an envlive.js entry for
+// every leaf; then walk the manifest and require every key to be a leaf. Arrays
+// of rows are walked through their default row (BG.defaultRows / the preset's
+// first shore plant) under the "[]" spelling the pages use.
+console.log('\n-- live manifest (envlive.js) --');
+{
+  const leaves = (obj, base, rows) => {
+    const out = [];
+    for (const k of Object.keys(obj)) {
+      const v = obj[k], p = base ? base + '.' + k : k;
+      if (Array.isArray(v)) {
+        const tpl = rows && rows[p];
+        if (tpl && typeof tpl === 'object' && !Array.isArray(tpl)) out.push(...leaves(tpl, p + '[]', rows));
+        else out.push(tpl === null ? p : p + '[]');          // a leaf array (a profile, a palette)
+      } else if (v && typeof v === 'object') {
+        if (rows && rows[p] === null) out.push(p);           // an opaque object edited as one field
+        else out.push(...leaves(v, p, rows));
+      } else out.push(p);
+    }
+    return out;
+  };
+  const check = (scope, paths) => {
+    const missing = paths.filter(p => !LV.lookup(scope, p));
+    ok(missing.length === 0, scope + ': every editable field is in the LIVE manifest (' + paths.length + ' fields)' +
+       (missing.length ? ' — MISSING: ' + missing.join(', ') : ''));
+    const have = new Set(paths);
+    const stray = Object.keys(LV.LIVE[scope]).filter(k => !have.has(k));
+    ok(stray.length === 0, scope + ': every manifest key names a real field' + (stray.length ? ' — STRAY: ' + stray.join(', ') : ''));
+    const entries = Object.values(LV.LIVE[scope]);
+    const shaped = entries.every(e => e.read === true || e.preview === true ||
+                                      (e.read === false && typeof e.package === 'string' && typeof e.why === 'string' && e.why.length > 10));
+    ok(shaped, scope + ': every unread entry names its package and why');
+    const unread = entries.filter(e => e.read === false).length;
+    ok(true, scope + ': ' + (entries.length - unread) + ' live/preview, ' + unread + ' not read' +
+       (unread ? ' (' + [...new Set(entries.filter(e => e.read === false).map(e => e.package))].sort().join(', ') + ')' : ''));
+  };
+  const R = BG.defaultRows();
+  const biomeRows = {'cover.plants': R.coverPlant, 'trees.species': R.treeSpecies, 'water.features': R.waterFeature,
+                     'caves.features': R.caveFeature, 'terrain.overrides': null};
+  check('biome', leaves(BG.defaultBiome(), '', biomeRows));
+  const wp = WG.defaultParams();
+  check('water', leaves(wp, '', {'shore.plants': wp.shore.plants[0], 'bathymetry.profile': null}));
+  const mapJson = readJson(join(ROOT, 'assets', 'worldmap', 'default', 'map.json'));
+  const mapRows = {sites: {}, rules: {}, biomes: null, size: null, originCell: null};
+  const mapPaths = leaves(mapJson, '', mapRows).filter(p => !/^(sites|rules)\[\]\./.test(p))
+      .concat(['sites[]', 'rules[]', 'planes.biome', 'planes.landform', 'planes.moisture']);
+  check('map', [...new Set(mapPaths)]);
+  // The one claim this package exists for: the engine ignores the biome's tile
+  // (TREE_TILE is global) and the page must say so. P-D flips this entry and
+  // the assertion together.
+  const tile = LV.lookup('biome', 'trees.tile');
+  ok(!!tile && tile.read === false && tile.package === 'P-D', 'trees.tile is marked not-read (package ' + (tile && tile.package) + ') until P-D');
+  ok(LV.normalizePath('cover.plants[3].conditions.minY') === 'cover.plants[].conditions.minY', 'lookup elides array indices');
+  ok(LV.isLive('biome', 'trees.density') && !LV.isLive('biome', 'water.features[].rarity'), 'isLive: density yes, a water row no');
+  // Round trip: the P-E fields survive normalizeBiome so a save carries them.
+  const nb = BG.normalizeBiome({caves: {features: [{preset: 'deep', threshold: 140, mushroomChance: 7, crystalChance: 9}]},
+                                cover: {cactusChance: 40, saguaroFraction: 15, cacti: true}});
+  ok(nb.caves.features[0].mushroomChance === 7 && nb.caves.features[0].crystalChance === 9 &&
+     nb.cover.cactusChance === 40 && nb.cover.saguaroFraction === 15 && nb.cover.cacti === true &&
+     nb.cover.groundFlora === true && nb.cover.sandCap === false,
+     'normalizeBiome carries the flags and the P-E fields (mushroom 7, crystal 9, cactus 1-in-40, saguaro 15%)');
 }
 
 console.log('\n' + (fails ? `${fails} of ${count} checks FAILED` : `all ${count} checks passed`));

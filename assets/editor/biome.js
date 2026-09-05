@@ -7,18 +7,17 @@
  * the engine will read (tree species from assets/trees/, water presets from
  * assets/water/), drawn through WorldView.
  *
- * WHAT IS LIVE AND WHAT IS SCAFFOLD, said plainly because the page says it too:
- *
- *   LIVE   tree species + weights. Saving a biome rewrites placement.biomes in
- *          every species file and "Sync atlas" re-bakes the ones that changed,
- *          which is what the engine reads. The world hash moves when it does.
- *   LIVE   the biome BAND strip — the three worldgen thresholds that decide
- *          which biome a column is. Dragging a divider edits tuning.json.
- *   AUTHORED, NOT YET READ BY THE ENGINE   cover plants, water features, cave
- *          features, terrain overrides, tree row conditions, climate
- *          coordinates. The `biomes` gate validates every name they use; the
- *          swatch composes them; worldgen still runs its hardcoded per-biome
- *          blocks. docs/PLAN_biomes.md §5 is the wiring plan.
+ * WHAT IS LIVE AND WHAT IS NOT is one table, assets/editor/envlive.js, and
+ * every field on this page goes through envui.liveMark with its JSON path:
+ * a field the engine does not read is DISABLED (greyed, tooltip = the plan
+ * package that reads it and why). Since the world map (2026-09-04) worldgen
+ * reads the biome record the loader packs — skin / subsoil / skin depth, the
+ * patch mask, the three flags, the cover rows with their minY / maxY /
+ * patchThreshold, trees.density, the species weights, the cave thresholds —
+ * and NOT trees.tile, the water rows, terrain overrides, climate, or the
+ * rest of the conditions. docs/PLAN_environment_truth.md is the schedule.
+ * The biome itself comes from the painted map (the World map page), not from
+ * the worldgen thresholds, so the band strip below is dead and says so.
  *
  * EVERY FEATURE ROW CARRIES THE SAME PLACEMENT CHAIN: a rarity (1-in-N tiles,
  * or a weight, or a percent — one form per stack, the others shown read-only
@@ -30,6 +29,7 @@
 import * as BG from './biomegen.js';
 import * as TG from './treegen.js';
 import * as UI from './envui.js';
+import * as LV from './envlive.js';
 
 const PAGE = 'env-biome';
 const CLS = 'bm';
@@ -227,6 +227,7 @@ function validateInto(host) {
 function ctx() {
   return {el: H.el, cls: CLS, params: () => biome, widgets,
           snapshot: (k) => undo.snapshot(k),
+          live: (path) => LV.lookup('biome', path),
           onChange: () => { markDirty(); regenerate(false); }};
 }
 function markDirty() {
@@ -245,9 +246,12 @@ const COND_FIELDS = [
   {k: 'patchThreshold', n: 'patch >', min: 0, max: 255, step: 1, title: 'Only where this row’s patch noise (0..255) is above this. 0 = everywhere.'}
 ];
 
-/** The conditions line under a feature row: six small number boxes. */
-function conditionsLine(item) {
+/** The conditions line under a feature row: six small number boxes, each
+ *  marked live / not-read by its own path (`base`.conditions.`k`) because the
+ *  engine enforces some of a cover row's conditions and none of a tree row's. */
+function conditionsLine(item, base) {
   const el = H.el;
+  const C = ctx();
   const line = el('div', {class: CLS + 'cond'});
   for (const f of COND_FIELDS) {
     const inp = el('input', {type: 'number', class: CLS + 'num', value: item.conditions[f.k],
@@ -257,18 +261,23 @@ function conditionsLine(item) {
       item.conditions[f.k] = +inp.value;
       markDirty(); regenerate(false);
     });
-    line.append(el('label', {title: f.title}, f.n), inp);
+    const lab = el('label', {title: f.title}, f.n);
+    const cell = el('span', {class: CLS + 'condcell'}, lab, inp);
+    UI.liveMark(C, cell, base + '.conditions.' + f.k, [inp]);
+    line.append(cell);
   }
   return line;
 }
 
 /**
  * A reorderable stack of feature rows.
- *   spec = {items(): array, make(): item, cols: [{k, type, options(), min, max, step, title, w}],
+ *   spec = {base: 'cover.plants[]' (the rows' manifest path), items(): array, make(): item,
+ *           cols: [{k, type, options(), min, max, step, title, w}],
  *           derived(item) -> string, addLabel, hint}
  */
 function stackEditor(body, spec) {
   const el = H.el;
+  const C = ctx();
   const host = el('div', {});
   const render = () => {
     host.innerHTML = '';
@@ -294,8 +303,13 @@ function stackEditor(body, spec) {
           it[c.k] = c.type === 'select' ? inp.value : +inp.value;
           render(); markDirty(); regenerate(false);
         });
-        if (c.label) cells.push(el('span', {class: CLS + 'unit'}, c.label));
-        cells.push(inp);
+        // Each column is its own field: a cave row's threshold is read and its
+        // rarity is not, so the mark is per input, not per row.
+        const cell = el('span', {class: CLS + 'stackcell'});
+        if (c.label) cell.append(el('span', {class: CLS + 'unit'}, c.label));
+        cell.append(inp);
+        UI.liveMark(C, cell, spec.base + '.' + c.k, [inp]);
+        cells.push(cell);
       }
       const up = el('button', {title: 'move up'}, '▲'), dn = el('button', {title: 'move down'}, '▼');
       const rm = el('button', {title: 'remove'}, '✕');
@@ -315,7 +329,7 @@ function stackEditor(body, spec) {
       let condEl = null;
       cond.addEventListener('click', () => {
         if (condEl) { condEl.remove(); condEl = null; cond.classList.remove('on'); return; }
-        condEl = conditionsLine(it);
+        condEl = conditionsLine(it, spec.base);
         wrap.append(condEl);
         cond.classList.add('on');
       });
@@ -335,16 +349,28 @@ function stackEditor(body, spec) {
 }
 
 /* ===========================================================================
- * the biome BAND strip — the engine's three thresholds, live
+ * the biome BAND strip — DEAD since the world map, kept visible and greyed
+ *
+ * biomeAt() returns mapBiomeAt(): the biome is the painted plane, not the
+ * noise band. worldgen.meadow/pine/desertThreshold, biomeLog2 and biomeBlend
+ * survive only inside biomeCurve() (worldgen.wgsl ~733), which picks which
+ * biome's HEIGHT CURVE crossfades where — and every shipped curve is the
+ * identity, so CURVE_IDENT_ALL folds that out of the shader too. P-G moves
+ * the curves into the biome files; P-I deletes the knobs. Until then the
+ * strip is drawn from tuning.json with no grips, so nobody drags a slider
+ * that changes nothing.
  * ======================================================================== */
+const BAND_DEAD = 'DEAD since the world map: biomeAt reads the painted map (World map page). These thresholds ' +
+                  'only choose which biome’s height curve blends where, and every shipped curve is the identity. ' +
+                  'Deleted in P-I.';
 function bandStrip(body) {
   const el = H.el;
   const T = H.tuning && H.tuning();
-  const wrap = el('div', {class: CLS + 'band'});
+  const wrap = el('div', {class: CLS + 'band ' + CLS + 'dead', title: BAND_DEAD});
   const info = el('div', {class: CLS + 'hint'});
   body.append(wrap, info);
   if (!T || !T.tune || !T.tune.worldgen) {
-    info.textContent = 'No tuning.json loaded — the band strip needs it.';
+    info.textContent = 'No tuning.json loaded — the (dead) band strip needs it to draw.';
     return;
   }
   const W = T.tune.worldgen;
@@ -358,34 +384,15 @@ function bandStrip(body) {
       const w = Math.max(0, edges[i + 1] - edges[i]) / 255 * 100;
       const seg = el('div', {class: CLS + 'seg' + (segs[i][0] === biomeName ? ' cur' : ''),
                              style: 'width:' + w + '%;background:' + segs[i][1],
-                             title: segs[i][0] + ': biome noise ' + edges[i] + '..' + edges[i + 1]},
+                             title: segs[i][0] + ' (click to open). ' + BAND_DEAD},
                      segs[i][0]);
       seg.addEventListener('click', () => { if (H.openPage) H.openPage('biome', segs[i][0]); });
       wrap.append(seg);
-      if (i < 3) {
-        const grip = el('div', {class: CLS + 'grip', title: keys[i] + ' = ' + th[i] + ' (drag)'});
-        grip.style.left = (edges[i + 1] / 255 * 100) + '%';
-        let dragging = false;
-        grip.addEventListener('mousedown', (e) => { dragging = true; e.preventDefault(); });
-        window.addEventListener('mousemove', (e) => {
-          if (!dragging) return;
-          const r = wrap.getBoundingClientRect();
-          let v = Math.round((e.clientX - r.left) / r.width * 255);
-          const lo = i > 0 ? (W[keys[i - 1]] | 0) + 1 : 0, hi = i < 2 ? (W[keys[i + 1]] | 0) - 1 : 255;
-          v = Math.max(lo, Math.min(hi, v));
-          if (v === (W[keys[i]] | 0)) return;
-          W[keys[i]] = v;
-          T.touchTune();
-          paint();
-        });
-        window.addEventListener('mouseup', () => { dragging = false; });
-        wrap.append(grip);
-      }
     }
-    const pct = (a, b) => ((b - a) / 255 * 100).toFixed(0) + '%';
-    info.textContent = 'Share of the biome noise: meadow ' + pct(0, th[0]) + ' · forest ' + pct(th[0], th[1]) +
-        ' · pine ' + pct(th[1], th[2]) + ' · desert ' + pct(th[2], 255) +
-        '. Drag a divider to move worldgen.' + keys.join('/') + ' (writes tuning.json; regen world in game).';
+    info.innerHTML = '';
+    info.append(el('span', {class: CLS + 'livepill', title: BAND_DEAD}, 'P-I'),
+                ' worldgen.' + keys.join('/') + ' = ' + th.join('/') + ' — not what decides a column’s biome any more: ' +
+                'paint that on the World map page. The Worldgen tab marks these knobs deprecated.');
   };
   paint();
   widgets.push(paint);
@@ -436,7 +443,9 @@ function terrainSection(body) {
         ov[pr.k] = pr.int ? Math.round(+val.value) : +val.value;
         markDirty(); render();
       });
-      list.append(el('div', {class: CLS + 'row', title: pr.d || ''}, el('label', {}, pr.n || pr.k), val, chk, tag));
+      const line = el('div', {class: CLS + 'row', title: pr.d || ''}, el('label', {}, pr.n || pr.k), val, chk, tag);
+      list.append(line);
+      UI.liveMark(ctx(), line, 'terrain.overrides', [val, chk]);
     }
     if (!n) list.append(el('div', {class: CLS + 'hint'}, onlyOver.checked ? 'No overrides yet.' : 'No knob matches.'));
   };
@@ -465,16 +474,18 @@ function buildPanel() {
 
   // ---- identity & climate ---------------------------------------------------
   let s = UI.section(el, CLS, 'Identity & climate',
-                     engine ? 'An ENGINE biome: worldgen id ' + BG.ENGINE_BIOMES.indexOf(biome.name) +
-                              '. The band strip is live tuning; temperature/moisture are the coordinates the ' +
-                              'planned climate grid will select by (PLAN_biomes.md §4) and are authored but not read.'
-                            : 'NOT an engine biome yet: worldgen has four hardcoded ids. This file is authored, ' +
-                              'validated and previewed, and will be selectable when biomeAt reads a table.');
+                     engine ? 'An ENGINE biome: id ' + BG.ENGINE_BIOMES.indexOf(biome.name) +
+                              ' in the packed record table; the painted map (World map page) says where it is. ' +
+                              'Greyed fields are not read by the engine yet — the tooltip names the package that will.'
+                            : 'NOT an engine biome yet: its name is not in ENGINE_BIOMES (biomegen.js), so Save ' +
+                              'writes index -1 and the loader refuses it. Add the name there and to the map palette.');
   const disp = el('input', {type: 'text', class: CLS + 'num', value: biome.displayName, style: 'text-align:left'});
   disp.addEventListener('change', () => { undo.snapshot(null); biome.displayName = disp.value; markDirty(); });
   widgets.push(() => { disp.value = biome.displayName; });
-  s.body.append(el('div', {class: CLS + 'row'}, el('label', {}, 'display name'), disp));
-  s.body.append(el('div', {class: CLS + 'hint', style: 'margin:6px 0 2px'}, 'Where each engine biome sits on the biome noise'));
+  const dispRow = el('div', {class: CLS + 'row'}, el('label', {}, 'display name'), disp);
+  s.body.append(dispRow);
+  UI.liveMark(C, dispRow, 'displayName');
+  s.body.append(el('div', {class: CLS + 'hint', style: 'margin:6px 0 2px'}, 'The old biome-noise thresholds (dead — the map decides)'));
   bandStrip(s.body);
   UI.row(C, s.body, {k: 'temperature', n: 'temperature', min: 0, max: 1, step: 0.01,
                      d: '0 cold .. 1 hot. The planned climate field is seed-independent with a fixed compass: colder toward +Z.'}, 'climate');
@@ -484,33 +495,45 @@ function buildPanel() {
   notes.value = biome.climate.notes || '';
   notes.addEventListener('change', () => { undo.snapshot(null); biome.climate.notes = notes.value; markDirty(); });
   widgets.push(() => { notes.value = biome.climate.notes || ''; });
-  s.body.append(el('div', {class: CLS + 'row'}, el('label', {}, 'notes'), notes));
+  const notesRow = el('div', {class: CLS + 'row'}, el('label', {}, 'notes'), notes);
+  s.body.append(notesRow);
+  UI.liveMark(C, notesRow, 'climate.notes');
   col.append(s.wrap);
 
   // ---- terrain ------------------------------------------------------------------
   s = UI.section(el, CLS, 'Terrain overrides',
                  'The Worldgen tab’s knobs, per biome. Tick a knob to give this biome its own value; ' +
-                 'untouched knobs inherit. AUTHORED, NOT YET READ: the plan of record (PLAN_terrain_overhaul §G) ' +
-                 'is one height function whose octave amplitudes a smooth uplift field modulates, and these ' +
-                 'are the per-biome inputs to that.', {closed: true});
+                 'untouched knobs inherit. NOT READ (P-G): the loader parses these into BiomeDef::terrainOverrides ' +
+                 'and nothing reads them; P-G replaces the free-form map with a fixed hill / grain / detail record ' +
+                 'and the per-biome relief curve, both read by the height twin.', {closed: true});
   terrainSection(s.body);
   col.append(s.wrap);
 
   // ---- ground cover ---------------------------------------------------------------
   s = UI.section(el, CLS, 'Ground cover',
-                 'The skin the ground wears and the small plants on it. Each plant row is 1-in-N ' +
-                 'columns, gated by the shared patch mask and its own conditions.');
-  UI.matRow(C, s.body, {k: 'skin', n: 'ground skin', d: 'Topmost cell. worldgen paints desert sand 4 deep, everything else grass 1 deep.'}, 'cover', mats, {filter: isSolid});
+                 'The skin the ground wears and the small plants on it. LIVE: skin / subsoil / depth, the patch ' +
+                 'mask, the three flags, and every plant row (1-in-N surface columns; its min Y / max Y / patch ' +
+                 'condition enforced, slope and water distance not yet — P-D).');
+  UI.matRow(C, s.body, {k: 'skin', n: 'ground skin', d: 'Topmost cell (WM_B_SKIN), skinDepth cells deep.'}, 'cover', mats, {filter: isSolid});
   UI.row(C, s.body, {k: 'skinDepth', n: 'skin depth (cells)', min: 1, max: 8, step: 1, int: true, d: ''}, 'cover');
-  UI.matRow(C, s.body, {k: 'subsoil', n: 'subsoil', d: ''}, 'cover', mats, {filter: isSolid});
+  UI.matRow(C, s.body, {k: 'subsoil', n: 'subsoil', d: 'Under the skin: the sediment wedge’s topsoil (WM_B_SUBSOIL).'}, 'cover', mats, {filter: isSolid});
   UI.row(C, s.body, {k: 'threshold', n: 'patch threshold', min: 0, max: 255, step: 1, int: true,
                      d: 'Plants only grow where the patch noise (0..255) is above this. Higher leaves more open ground between stands — what makes a desert read as arid rather than as a dry lawn.'}, 'cover.patch');
   UI.row(C, s.body, {k: 'cellLog2', n: 'patch size (log2)', min: 2, max: 9, step: 1, int: true,
                      d: 'Patch cell as a power of two, in cells.'}, 'cover.patch');
+  UI.boolRow(C, s.body, {k: 'groundFlora', n: 'ground flora blocks',
+                         d: 'WM_BF_GROUND_FLORA: the world-wide flower / tall-grass / undergrowth blocks run in this biome (off for desert, ocean, alpine).'}, 'cover');
+  UI.boolRow(C, s.body, {k: 'cacti', n: 'cactus block', d: 'WM_BF_CACTI: the cactus site scan runs in this biome.'}, 'cover');
+  UI.boolRow(C, s.body, {k: 'sandCap', n: 'sand cap', d: 'WM_BF_SAND_CAP: four cells of sand under the skin, above the subsoil.'}, 'cover');
+  UI.row(C, s.body, {k: 'cactusChance', n: 'cactus 1-in-N', min: 0, max: 400, step: 1, int: true,
+                     d: 'One in this many cactus tiles grows a cactus; 0 = never. Today the global worldgen.cactusChance (a percent) decides; P-E reads this instead.'}, 'cover');
+  UI.row(C, s.body, {k: 'saguaroFraction', n: 'saguaro %', min: 0, max: 100, step: 1, int: true, u: '%',
+                     d: 'Percent of those cacti that are tall saguaro columns rather than barrels. Today the global worldgen.saguaroFraction decides; P-E reads this instead.'}, 'cover');
   s.body.append(el('div', {class: CLS + 'hint', style: 'margin-top:6px'}, 'Plants'));
   stackEditor(s.body, {
+    base: 'cover.plants[]',
     items: () => biome.cover.plants,
-    make: () => ({material: 'grass_tuft', head: '', chance: 12, height: 0.2, conditions: BG.defaultConditions()}),
+    make: () => BG.defaultRows().coverPlant,
     cols: [
       {k: 'material', type: 'select', options: solidNames, title: 'the plant'},
       {k: 'head', type: 'select', options: solidNames, none: '(no head)', title: 'optional single cell on top'},
@@ -527,28 +550,38 @@ function buildPanel() {
   col.append(s.wrap);
 
   // ---- trees ------------------------------------------------------------------------
+  // THE DENSITY STAT USES THE ENGINE'S TILE. TREE_TILE is one global lattice
+  // (worldgen.treeTile); the biome's own `tile` is packed but informational
+  // until P-D. Predicting trees/ha from the ignored tile is how the page once
+  // promised 153/ha where the engine made 23/ha (PLAN_environment_truth §0).
   const T = H.tuning && H.tuning();
-  const treeTileM = T && T.tune && T.tune.worldgen ? (T.tune.worldgen.treeTile / vpm()) : biome.trees.tile;
+  const engineTile = !!(T && T.tune && T.tune.worldgen && T.tune.worldgen.treeTile > 0);
+  const treeTileM = engineTile ? (T.tune.worldgen.treeTile / vpm()) : biome.trees.tile;
+  const tileNote = engineTile ? 'at the ENGINE tile worldgen.treeTile = ' + treeTileM.toFixed(1) + ' m'
+                              : 'at this row’s tile (no tuning.json loaded, so the engine tile is unknown)';
   s = UI.section(el, CLS, 'Trees',
-                 'Which species, at what weight. LIVE: the weights are what the tree atlas bakes — saving ' +
-                 'writes placement.biomes into each species file, and "Sync atlas" re-bakes the changed ones. ' +
-                 'Tile spacing and density are worldgen.treeTile / treeChance' + cap(biome.name) +
-                 ' today (the Worldgen tab); the row here is the value this biome will carry when worldgen reads the table.');
+                 'LIVE: density (percent of tiles that grow a tree, WM_B_TREE_DENSITY) and the species weights ' +
+                 '(the atlas biome table is built from these rows at load; "Sync atlas" refreshes the Trees ' +
+                 'page’s read-only mirror). NOT READ: the tile — one global lattice, worldgen.treeTile, until ' +
+                 'P-D thins a fine lattice to each biome’s spacing — and the per-row conditions (the species ' +
+                 'file’s band and slope gate a pick instead).');
   UI.row(C, s.body, {k: 'tile', n: 'tile (m)', min: 1.6, max: 51.2, step: 0.8, u: 'm',
-                     d: 'Metres between candidate trunk sites: at most one tree per tile. Engine today: worldgen.treeTile = ' + treeTileM.toFixed(1) + ' m.'}, 'trees');
+                     d: 'Metres between candidate trunk sites: at most one tree per tile. Engine today: worldgen.treeTile = ' + treeTileM.toFixed(1) + ' m for every biome.'}, 'trees');
   UI.row(C, s.body, {k: 'density', n: 'density (%)', min: 0, max: 100, step: 1, int: true, u: '%',
                      d: 'Percent of tiles that grow a tree.'}, 'trees');
   const dstat = el('div', {class: CLS + 'derived'});
   const paintD = () => {
-    const d = BG.densityStats(biome.trees.tile, biome.trees.density);
-    dstat.textContent = '≈ ' + d.perHa.toFixed(0) + ' trees per hectare · 1 tree in ' + (d.oneIn ? d.oneIn.toFixed(1) : '∞') + ' tiles';
+    const d = BG.densityStats(treeTileM, biome.trees.density);
+    dstat.textContent = '≈ ' + d.perHa.toFixed(0) + ' trees per hectare ' + tileNote +
+                        ' · 1 tree in ' + (d.oneIn ? d.oneIn.toFixed(1) : '∞') + ' tiles';
   };
   paintD(); widgets.push(paintD);
   s.body.append(dstat);
   const total = () => biome.trees.species.reduce((a, r) => a + (r.weight | 0), 0);
   stackEditor(s.body, {
+    base: 'trees.species[]',
     items: () => biome.trees.species,
-    make: () => ({species: Object.keys(libs.trees)[0] || 'oak', weight: 10, conditions: BG.defaultConditions()}),
+    make: () => Object.assign(BG.defaultRows().treeSpecies, {species: Object.keys(libs.trees)[0] || 'oak'}),
     cols: [
       {k: 'species', type: 'select', options: () => Object.keys(libs.trees).sort(), title: 'a file in assets/trees/'},
       {k: 'weight', label: 'weight', min: 0, max: 100, step: 1, w: '52px', title: 'Relative weight against the other rows. 0 = never here.'}
@@ -558,7 +591,7 @@ function buildPanel() {
       const sp = libs.trees[it.species];
       const spar = sp && sp.placement && sp.placement.sparsity > 1 ? ' ÷ sparsity ' + sp.placement.sparsity : '';
       const share = t ? (100 * it.weight / t).toFixed(0) : 0;
-      const d = BG.densityStats(biome.trees.tile, biome.trees.density);
+      const d = BG.densityStats(treeTileM, biome.trees.density);
       return share + '% of trees here' + spar + ' · ≈ ' + (d.perHa * (t ? it.weight / t : 0)).toFixed(1) + ' per hectare' +
              (sp && sp.placement && (sp.placement.maxY >= 0 || sp.placement.minY >= 0)
                 ? ' · species band ' + sp.placement.minY + '..' + sp.placement.maxY + ' m' : '');
@@ -578,15 +611,17 @@ function buildPanel() {
   // ---- water ----------------------------------------------------------------------------
   s = UI.section(el, CLS, 'Water bodies',
                  'Which presets from assets/water/ appear here, one per TILE at most, one tile in N. ' +
-                 'AUTHORED, NOT YET READ: worldgen still grows its one parabolic tarn from the pond* rows; ' +
-                 'the swatch composes these.');
+                 'NOT READ (P-F): no water row is packed; worldgen grows one parabolic tarn per pond tile ' +
+                 'from worldgen.pond* (the Water bodies page shows those knobs). The swatch composes these.');
   stackEditor(s.body, {
+    base: 'water.features[]',
     items: () => biome.water.features,
     make: () => {
       const nm = Object.keys(libs.water)[0] || 'tarn';
       const p = libs.water[nm] && libs.water[nm].placement || {};
-      return {preset: nm, tile: p.tile || 44.8, rarity: p.rarity || 4,
-              conditions: Object.assign(BG.defaultConditions(), {maxSlope: p.maxSlope || 96})};
+      return Object.assign(BG.defaultRows().waterFeature,
+                           {preset: nm, tile: p.tile || 44.8, rarity: p.rarity || 4,
+                            conditions: Object.assign(BG.defaultConditions(), {maxSlope: p.maxSlope || 96})});
     },
     cols: [
       {k: 'preset', type: 'select', options: () => Object.keys(libs.water).sort(), title: 'a file in assets/water/'},
@@ -614,16 +649,20 @@ function buildPanel() {
 
   // ---- caves ----------------------------------------------------------------------------
   s = UI.section(el, CLS, 'Caves',
-                 'SCAFFOLD. worldgen carves two bands world-wide (caveThreshold1 near the surface, ' +
-                 'caveThreshold2 deep; the Caves page has the live knobs). A row here is the per-biome ' +
-                 'version those knobs will become; the swatch does not cut caves (it shows the surface).', {closed: true});
+                 'LIVE: a near_surface row’s threshold is this biome’s WM_B_CAVE_T1 and a deep row’s is ' +
+                 'WM_B_CAVE_T2 (a biome with no row keeps the global worldgen.caveThreshold1/2). NOT READ: ' +
+                 'rarity (no package yet) and the mushroom / crystal chances — worldgen.caveMushroomChance / ' +
+                 'caveCrystalChance are global until P-E. The swatch does not cut caves (it shows the surface).', {closed: true});
   stackEditor(s.body, {
+    base: 'caves.features[]',
     items: () => biome.caves.features,
-    make: () => ({preset: 'near_surface', threshold: 150, rarity: 1, conditions: BG.defaultConditions()}),
+    make: () => BG.defaultRows().caveFeature,
     cols: [
       {k: 'preset', type: 'select', options: () => ['near_surface', 'deep'], title: 'which band'},
       {k: 'threshold', label: 'noise >', min: 0, max: 255, step: 1, w: '50px', title: 'cave noise threshold (0..255); higher = fewer caves'},
-      {k: 'rarity', label: '1 in', min: 0, max: 16, step: 1, w: '44px', title: 'one region in N has this band at all'}
+      {k: 'rarity', label: '1 in', min: 0, max: 16, step: 1, w: '44px', title: 'one region in N has this band at all'},
+      {k: 'mushroomChance', label: 'mushroom 1 in', min: 0, max: 400, step: 1, w: '44px', title: 'one in N floor columns of this band grows a mushroom; 0 = never'},
+      {k: 'crystalChance', label: 'crystal 1 in', min: 0, max: 400, step: 1, w: '44px', title: 'one in N floor/ceiling columns of this band grows a crystal; 0 = never'}
     ],
     addLabel: '+ cave band'
   });
@@ -637,8 +676,6 @@ function buildPanel() {
 
   paintSync();
 }
-
-function cap(s) { return s ? s[0].toUpperCase() + s.slice(1) : s; }
 
 /* ===========================================================================
  * atlas sync — biome weights -> species files -> re-bake
@@ -759,10 +796,13 @@ const CSS = UI.pageCss(PAGE, CLS, `
 #${PAGE} .${CLS}grip{position:absolute;top:-3px;width:6px;height:28px;margin-left:-3px;background:#fff;border-radius:2px;cursor:ew-resize;box-shadow:0 0 0 1px #000}
 #${PAGE} .${CLS}stackitem{border-left:2px solid #2a3040;padding:2px 0 2px 6px;margin:3px 0}
 #${PAGE} .${CLS}stackrow{display:flex;gap:4px;align-items:center;flex-wrap:wrap;font-size:11px}
+#${PAGE} .${CLS}stackcell{display:inline-flex;gap:3px;align-items:center;flex:0 1 auto}
+#${PAGE} .${CLS}stackcell:has(select){flex:1 1 90px}
 #${PAGE} .${CLS}stackrow select{flex:1 1 90px;min-width:70px}
 #${PAGE} .${CLS}stackrow button{padding:0 4px;font-size:10px;line-height:18px}
 #${PAGE} .${CLS}condbtn.set{color:#ffb454}
-#${PAGE} .${CLS}cond{display:grid;grid-template-columns:repeat(6,auto 1fr);gap:2px 4px;align-items:center;margin:3px 0 2px;font-size:10px}
+#${PAGE} .${CLS}cond{display:grid;grid-template-columns:repeat(3,1fr);gap:2px 6px;align-items:center;margin:3px 0 2px;font-size:10px}
+#${PAGE} .${CLS}condcell{display:flex;gap:3px;align-items:center;min-width:0}
 #${PAGE} .${CLS}cond label{color:#7c8ba3;white-space:nowrap}
 #${PAGE} .${CLS}cond input{width:100%;min-width:38px}
 #${PAGE} .${CLS}ord{color:#6f7f97;font:10px monospace;width:14px}
