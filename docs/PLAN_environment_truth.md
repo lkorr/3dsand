@@ -92,7 +92,7 @@ each one alone is enough:
   `biomeLog2`, `biomeBlend`, `alpineChance`) deprecated; they are deleted in
   P-I.
 
-### P-C  Spawn is a site on the map (C++ small, map.json)
+### P-C  Spawn is a site on the map (C++ small, map.json) — LANDED 2026-09-04
 
 - `map.json sites[]` gains `{kind: "spawn", at: [x, z]}`; `main.cpp` reads
   it for the game start and for `regen world` (`player.pos = {140,..,140}`
@@ -102,6 +102,43 @@ each one alone is enough:
 - The `spawn`-relative constants (`spawnPlainY/R/Fade`, the calm home area)
   centre on the spawn site instead of the origin. `spawnPlain*` moves to
   `map.json terrain.homeArea` in P-I.
+
+What landed (branch `worktree-agent-afc028c1e63df3e08`):
+
+- Loader: `worldmap.cpp` parses kind `spawn` (`at[2]`, one per map — a
+  second refuses; absent → (140, 140) with a printed notice) into
+  `WorldMapData::spawnX/Z/spawnAuthored`; packed as header words
+  `kHSpawnX = 26` / `kHSpawnZ = 27` (`WM_H_SPAWN_X/Z`; the world-map layout
+  check holds them together). Written even for an unloaded map so the two
+  mirrors never disagree.
+- Game: `SpawnPos()` / `SpawnWindowOrigin()` in `main.cpp`; boot and the F7
+  regen block start there AND centre the residency window on the spawn
+  before worldgen (`Stream::Update` shifts one chunk-plane per axis per
+  frame, so a spawn 40 chunks from a window at the origin would otherwise
+  stream to the player). Lab scenes keep their own origins. Selftest player
+  proxies keep (140, 140).
+- Home area: **two centres, not one.** The pad's flatness only ever came
+  from the origin-centred fade (kind `pad` is not in the site table, so
+  `sitePadAt` never levels it), and the fixture gates were written against
+  that ground. `landAt` now takes `min(w_spawn, w_pad)` where `w_spawn` is
+  the Chebyshev ramp from `spawnCentre()` (R + fade) and `w_pad` is the same
+  fade measured from the box's EDGE (`harnessOutside()`, 0 inside; "far"
+  when the map has no pad). Both accessors are outside the mirror, spelled
+  identically in `world.cpp`; the mirrored token stream is unchanged
+  between the two sides (`check_invariants.py` green).
+- Default map: spawn `(900, 900)` — 260 vox past the pad's edge (widest
+  crown reach is 115), inside the forced-forest cells, ground ≈ y200 over
+  sea y112, no tarn. Also in `scripts/seed_worldmap.py` so a re-seed keeps
+  it.
+- Page: `map.js` draws the spawn diamond (dim + "default" when the map
+  names none) and has a `Spawn` tool that moves it by click; saved with
+  the rest, undo-able. P-B's LIVE manifest should list `sites.spawn` as
+  read.
+- Gate: `spawn-site` (after `worldmap` in `kOrder`; CPU only): authored,
+  outside the harness box and every stamp site's cells, above `seaLevelY`,
+  not under a tarn, not the ocean biome. Reports the distance past the box
+  and the ground.
+- Hash: moved (the home area moved), rebaselined once at the end.
 
 ### P-D  Tree spacing per biome, WITHOUT a per-biome lattice (WGSL + loader)
 

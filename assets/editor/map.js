@@ -8,8 +8,10 @@
  * is `size` cells with `originCell` at world (0,0). The biome plane holds
  * indices into `biomes[]` (the palette, by NAME); the landform plane is 0..255
  * (0 = ocean floor, 255 = alpine) and owns the height from P4; moisture is
- * reserved. Sites are a list; until P5's site table the engine reads one
- * `kind: "pad"` box — the selftest harness region.
+ * reserved. Sites are a list: one `kind: "pad"` box (the selftest harness
+ * region), one `kind: "spawn"` column (where the game starts and the centre
+ * of the calm home area; PLAN_environment_truth P-C), and `kind: "stamp"`
+ * markers (P5).
  *
  * WHAT IT IS NOT. Not a preview of the generated world: the Worldgen tab's
  * heightmap and voxel views are. This page draws the PLANES, plainly, so you
@@ -44,7 +46,8 @@ let H = null;
 let els = {};
 let map = null;            // {name, json, biome:Uint8Array, landform:Uint8Array, moisture:Uint8Array}
 let dirty = false;
-let tool = 'biome';        // biome | landform | pad
+let tool = 'biome';        // biome | landform | pad | spawn | stamp
+const SPAWN_DEFAULT = [140, 140];   // worldmap.cpp's default when a map names no spawn
 let brush = {index: 0, radius: 2, landform: 128, soft: true};
 let view = {cx: 0, cz: 0, scale: 4};   // cell-space centre + pixels per cell
 let showLandform = true;
@@ -191,6 +194,21 @@ function paint() {
     ctx.fillStyle = '#ffb454'; ctx.font = '11px monospace';
     ctx.fillText(s.id || 'pad', ox + x0 * view.scale + 3, oy + z0 * view.scale - 3);
   }
+  // the spawn site: a diamond at the column, the default (dim) if the map
+  // names none -- the engine starts the player there either way
+  {
+    const l = map.json.cellLog2, cv = 1 << l;
+    const s = (map.json.sites || []).find(s => s.kind === 'spawn');
+    const at = s && Array.isArray(s.at) ? s.at : SPAWN_DEFAULT;
+    const sx = ox + (at[0] / cv + ocx) * view.scale, sz = oy + (at[1] / cv + ocz) * view.scale;
+    const r = 6;
+    ctx.strokeStyle = tool === 'spawn' ? '#ff7a7a' : (s ? '#8dff9a' : '#6f8f75'); ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(sx, sz - r); ctx.lineTo(sx + r, sz); ctx.lineTo(sx, sz + r); ctx.lineTo(sx - r, sz); ctx.closePath();
+    ctx.stroke();
+    ctx.fillStyle = s ? '#8dff9a' : '#6f8f75'; ctx.font = '11px monospace';
+    ctx.fillText(s ? `spawn (${at[0]},${at[1]})` : `spawn (default ${at[0]},${at[1]})`, sx + r + 3, sz + 4);
+  }
   // stamp sites: a marker at the centre with the footprint radius
   for (const s of (map.json.sites || [])) {
     if (s.kind !== 'stamp') continue;
@@ -203,7 +221,7 @@ function paint() {
     ctx.fillText((s.id || 'site') + ' (' + (s.template || '?') + (s.rot ? ' r' + s.rot : '') + ')', sx + rr + 3, sz + 4);
   }
   // brush cursor
-  if (els.hover && tool !== 'pad' && tool !== 'stamp') {
+  if (els.hover && tool !== 'pad' && tool !== 'stamp' && tool !== 'spawn') {
     ctx.strokeStyle = 'rgba(255,255,255,0.7)'; ctx.lineWidth = 1;
     ctx.beginPath();
     ctx.arc(ox + (els.hover[0] + 0.5) * view.scale, oy + (els.hover[1] + 0.5) * view.scale,
@@ -225,6 +243,16 @@ function cellAt(ev) {
   const W = els.canvas.clientWidth, Hh = els.canvas.clientHeight;
   const px = ev.clientX - r.left, py = ev.clientY - r.top;
   return [Math.floor((px - W / 2) / view.scale + view.cx), Math.floor((py - Hh / 2) / view.scale + view.cz)];
+}
+// The exact world column under the cursor (fractional cell -> voxels): the
+// cell centre when zoomed out, the column itself when zoomed in.
+function worldColumnAt(ev) {
+  const r = els.canvas.getBoundingClientRect();
+  const W = els.canvas.clientWidth, Hh = els.canvas.clientHeight;
+  const fx = (ev.clientX - r.left - W / 2) / view.scale + view.cx;
+  const fz = (ev.clientY - r.top - Hh / 2) / view.scale + view.cz;
+  const cv = 1 << map.json.cellLog2;
+  return [Math.round((fx - map.json.originCell[0]) * cv), Math.round((fz - map.json.originCell[1]) * cv)];
 }
 function applyBrush(cx, cz) {
   const [w, h] = map.json.size;
@@ -263,18 +291,25 @@ function wire() {
       padDrag = {x0: wx, z0: wz};
       return;
     }
+    if (tool === 'spawn') {
+      // Click: the spawn site goes to the cursor's world column. ONE per map
+      // (the loader refuses two), so this moves it rather than adding one.
+      const [wx, wz] = worldColumnAt(ev);
+      const sites = map.json.sites || (map.json.sites = []);
+      stroke = snapshot();
+      const s = sites.find(s => s.kind === 'spawn');
+      if (s) s.at = [wx, wz];
+      else sites.push({id: 'spawn', kind: 'spawn', at: [wx, wz]});
+      stroke.changed = true;
+      paint();
+      return;
+    }
     if (tool === 'stamp') {
       // Click: a new stamp site at the cursor's world column (cell centre if
       // zoomed out, the exact column when zoomed in). Shift+click on an
       // existing marker deletes it. Sites are hand-placed here; rules
       // (seeded placement per biome) are P5b.
-      const r = els.canvas.getBoundingClientRect();
-      const W = els.canvas.clientWidth, Hh = els.canvas.clientHeight;
-      const fx = (ev.clientX - r.left - W / 2) / view.scale + view.cx;
-      const fz = (ev.clientY - r.top - Hh / 2) / view.scale + view.cz;
-      const cv = 1 << map.json.cellLog2;
-      const wx = Math.round((fx - map.json.originCell[0]) * cv);
-      const wz = Math.round((fz - map.json.originCell[1]) * cv);
+      const [wx, wz] = worldColumnAt(ev);
       const sites = map.json.sites || (map.json.sites = []);
       const hit = sites.find(s => s.kind === 'stamp' && Math.abs(s.x - wx) <= (s.radius || 16) && Math.abs(s.z - wz) <= (s.radius || 16));
       stroke = snapshot();
@@ -415,6 +450,7 @@ export function attach(hooks) {
     biome: el('button', {title: 'paint the selected biome (left-drag)'}, 'Biome brush'),
     landform: el('button', {title: 'paint landform 0..255 (left-drag)'}, 'Landform brush'),
     pad: el('button', {title: 'drag the harness pad box (world voxels)'}, 'Pad box'),
+    spawn: el('button', {title: 'click: put the spawn site there (where the game starts; the calm home area centres on it). One per map.'}, 'Spawn'),
     stamp: el('button', {title: 'click: place a stamp site (a .vox from assets/prefabs/); shift+click a marker: delete it'}, 'Stamp site'),
   };
   for (const [k, b] of Object.entries(els.tools)) b.addEventListener('click', () => { tool = k; syncControls(); paint(); });
@@ -436,14 +472,14 @@ export function attach(hooks) {
   const bar = el('div', {class: 'mapbar'},
     el('label', {}, 'map ', els.mapSel), els.save, undoBtn, redoBtn, fitBtn,
     el('span', {style: 'width:10px'}),
-    els.tools.biome, els.tools.landform, els.tools.pad, els.tools.stamp,
+    els.tools.biome, els.tools.landform, els.tools.pad, els.tools.spawn, els.tools.stamp,
     el('label', {}, ' radius ', els.radius, ' ', els.radiusOut),
     el('label', {}, ' landform ', els.land, ' ', els.landOut),
     el('label', {}, ' ', showLf, ' shade by landform'));
   const note = el('div', {class: 'mapnote'},
     'Tier A: what you paint here is where the biomes ARE on every seed; the boundary warp and everything inside a region take the seed. ' +
     'Cells are 2^cellLog2 voxels (102.4 m). Right/middle-drag pans, wheel zooms, [ ] resize the brush. ' +
-    'The pad box is the selftest harness region (no trunks, crowns, tarns or cover inside). ' +
+    'The pad box is the selftest harness region (no trunks, crowns, tarns or cover inside); the spawn diamond is where the game starts and the centre of the calm home area (worldgen.spawnPlain*) -- keep it outside the pad, on land, or the spawn-site gate says so. ' +
     'A stamp site places assets/prefabs/<name>.vox on a levelled pad at that column (its cells keep out trees, tarns and cover); the engine refuses to start if the .vox is missing. ' +
     'Saving writes assets/worldmap/<name>/ and moves the world hash; regenerate the world to see it.');
   root.append(bar, els.palette, els.canvas, els.status, note);
