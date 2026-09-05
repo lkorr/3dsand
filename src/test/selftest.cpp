@@ -29,6 +29,7 @@ namespace selftest {
 const std::vector<Gate>& TerrainGates();
 const std::vector<Gate>& TreeGates();
 const std::vector<Gate>& BiomeGates();
+const std::vector<Gate>& EnvTruthGates();
 const std::vector<Gate>& ScaleGates();
 const std::vector<Gate>& SimGates();
 const std::vector<Gate>& CaGates();
@@ -140,6 +141,12 @@ const char* const kOrder[] = {
     // (the F7 / Apply path). Regenerates twice and leaves the pristine world
     // it found, so `waterbody` below sees what `terrain` left.
     "env-reload",
+    // Then: the number the Environment tab shows is the number the world
+    // has (PLAN_environment_truth P-H). One synthetic one-biome world per
+    // biome file, measured against the page's prediction; regenerates per
+    // biome and leaves the pristine world through the same reload +
+    // regen `env-reload` uses, so `waterbody` still sees what `terrain` left.
+    "env-truth",
     // SECOND, and it wants the same thing `terrain` does: pristine worldgen at
     // an unmoved origin. Its whole subject is the ANALYTIC basin registry, and
     // the authored lake at (420,420) has to be resident for that to mean
@@ -327,7 +334,7 @@ const char* const kOrder[] = {
 const std::vector<Gate>& Registry() {
   static std::vector<Gate> all = [] {
     std::vector<Gate> pool;
-    for (const auto* g : {&TerrainGates(), &TreeGates(), &BiomeGates(), &ScaleGates(),
+    for (const auto* g : {&TerrainGates(), &TreeGates(), &BiomeGates(), &EnvTruthGates(), &ScaleGates(),
                           &SimGates(), &CaGates(), &WindGates(), &WaterGates(),
                           &RenderGates(),
                           &PlayerGates(),
