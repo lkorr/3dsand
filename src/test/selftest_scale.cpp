@@ -178,7 +178,9 @@ Status GateScale(Ctx& c, std::string& detail) {
   {
     TreeAtlas atlas;
     std::string log;
-    if (!LoadTreeAtlas(sandvox::AssetDir() + "/trees", c.mats, atlas, log)) {
+    biomes::BiomeSet set;
+    if (!biomes::LoadBiomeSet(sandvox::AssetDir(), c.mats, set, log) ||
+        !LoadTreeAtlas(sandvox::AssetDir() + "/trees", c.mats, set, atlas, log)) {
       ok = false;
       notes += "tree atlas did not load: " + log + " ";
     } else if (atlas.species.empty()) {

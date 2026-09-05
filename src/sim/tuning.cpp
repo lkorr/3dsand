@@ -2101,6 +2101,10 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadI(*g, "microMaxPerRay", r.microMaxPerRay, out, at);
     ReadF(*g, "microSwayAmp", r.microSwayAmp, out, at);
     ReadF(*g, "microSwaySpeed", r.microSwaySpeed, out, at);
+    ReadF(*g, "trampleRecover", r.trampleRecover, out, at);
+    ReadF(*g, "trampleDepth", r.trampleDepth, out, at);
+    ReadF(*g, "trampleLean", r.trampleLean, out, at);
+    ReadF(*g, "trampleRadius", r.trampleRadius, out, at);
     ReadI(*g, "primarySteps", r.primarySteps, out, at);
     ReadI(*g, "farSteps", r.farSteps, out, at);
     ReadF(*g, "farShadowReach", r.farShadowReach, out, at);
@@ -2111,6 +2115,7 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadF(*g, "opennessReach", r.opennessReach, out, at);
     ReadI(*g, "opennessChunksPerFrame", r.opennessChunksPerFrame, out, at);
     ReadF(*g, "opennessStrength", r.opennessStrength, out, at);
+    ReadF(*g, "opennessFloor", r.opennessFloor, out, at);
     ReadI(*g, "opennessBilinear", r.opennessBilinear, out, at);
     ReadF(*g, "giStrength", r.giStrength, out, at);
     ReadF(*g, "giDecay", r.giDecay, out, at);
@@ -2127,7 +2132,6 @@ bool LoadTuning(const std::string& path, Tuning& out) {
       out.warnings.push_back("render.gamma must be > 0; reset to 2.2");
       r.gamma = 2.2f;
     }
-    ReadF(*g, "opennessFloor", r.opennessFloor, out, at);
     // starSize divides in the star PSF, starDensity scales the direction grid,
     // and skyMieG at exactly +-1 makes the Henyey-Greenstein denominator
     // collapse.
@@ -2197,6 +2201,12 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     if (r.microSwayAmp < 0.0f) { r.microSwayAmp = 0.0f; }
     if (r.microSwayAmp > 2.0f) { r.microSwayAmp = 2.0f; }
     if (r.microSwaySpeed < 0.0f) { r.microSwaySpeed = 0.0f; }
+    if (r.trampleRecover < 0.05f) { r.trampleRecover = 0.05f; }
+    if (r.trampleDepth < 0.0f) { r.trampleDepth = 0.0f; }
+    if (r.trampleDepth > 0.95f) { r.trampleDepth = 0.95f; }
+    if (r.trampleLean < 0.0f) { r.trampleLean = 0.0f; }
+    if (r.trampleLean > 1.0f) { r.trampleLean = 1.0f; }
+    if (r.trampleRadius < 0.0f) { r.trampleRadius = 0.0f; }
     if (r.shadowSteps < 0) { r.shadowSteps = 0; }
     // Subdivision must be >= 1 and within the 3 bits the shadow request record
     // gives each sub-index (world.h kShadowSubdivMax). A 0 here would divide by
@@ -2243,6 +2253,7 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     // an intent, and both are one keystroke away in the tuner.
     if (r.opennessReach < 0.0f) { r.opennessReach = 0.0f; }
     r.opennessStrength = std::clamp(r.opennessStrength, 0.0f, 1.0f);
+    r.opennessFloor = std::clamp(r.opennessFloor, 0.0f, 1.0f);
     if (r.opennessChunksPerFrame < 0) { r.opennessChunksPerFrame = 0; }
     // Indirect light (PLAN_gi.md §3-4). A negative strength would subtract
     // light; a decay outside [0,1] is meaningless; and the P2 write-back must
@@ -2259,7 +2270,6 @@ bool LoadTuning(const std::string& path, Tuning& out) {
           "render.giFeedback must be below render.giDecay (multi-bounce would "
           "brighten without bound); clamped");
       r.giFeedback = std::max(0.0f, r.giDecay * 0.5f);
-    r.opennessFloor = std::clamp(r.opennessFloor, 0.0f, 1.0f);
     }
     r.giGatherBlocks = std::clamp(r.giGatherBlocks, 0, 8);
     // Multi-bounce gain (P2): each bounce is albedo x the gather's 0.28 form
@@ -2403,10 +2413,6 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadWgCount(*g, "curveDesert8", w.curveDesert8, out, at);
     ReadWgCount(*g, "biomeBlend", w.biomeBlend, out, at);
     ReadWgLen(*g, "treeTile", w.treeTile, out, at);
-    ReadWgCount(*g, "treeChanceForest", w.treeChanceForest, out, at);
-    ReadWgCount(*g, "treeChancePine", w.treeChancePine, out, at);
-    ReadWgCount(*g, "treeChanceMeadow", w.treeChanceMeadow, out, at);
-    ReadWgCount(*g, "treeChanceDesert", w.treeChanceDesert, out, at);
     ReadWgCount(*g, "autumnFraction", w.autumnFraction, out, at);
     ReadWgLen(*g, "pondTile", w.pondTile, out, at);
     ReadWgCount(*g, "pondChance", w.pondChance, out, at);
@@ -2434,25 +2440,20 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadWgLen(*g, "shoreHorsetailHeight", w.shoreHorsetailHeight, out, at);
     ReadWgCount(*g, "shoreIrisChance", w.shoreIrisChance, out, at);
     ReadWgCount(*g, "shoreMossChance", w.shoreMossChance, out, at);
-    ReadWgCount(*g, "wallIvyDensity", w.wallIvyDensity, out, at);
     ReadWgCount(*g, "cactusChance", w.cactusChance, out, at);
     ReadWgCount(*g, "saguaroFraction", w.saguaroFraction, out, at);
-    ReadWgCount(*g, "tussockChance", w.tussockChance, out, at);
-    ReadWgCount(*g, "scrubChance", w.scrubChance, out, at);
-    ReadWgCount(*g, "desertPatch", w.desertPatch, out, at);
-    ReadWgCount(*g, "heathChance", w.heathChance, out, at);
-    ReadWgCount(*g, "heathPatch", w.heathPatch, out, at);
     ReadWgCount(*g, "alpineChance", w.alpineChance, out, at);
-    ReadWgCount(*g, "ruinChance", w.ruinChance, out, at);
-    ReadWgLen(*g, "ruinPadMargin", w.ruinPadMargin, out, at);
-    ReadWgLen(*g, "ruinMaxSlope", w.ruinMaxSlope, out, at);
     ReadWgCount(*g, "caveMushroomChance", w.caveMushroomChance, out, at);
     ReadWgCount(*g, "caveCrystalChance", w.caveCrystalChance, out, at);
-    ReadWgCount(*g, "mossFace", w.mossFace, out, at);
     ReadWgCount(*g, "caveThreshold1", w.caveThreshold1, out, at);
     ReadWgCount(*g, "caveThreshold2", w.caveThreshold2, out, at);
     // A NAME, never a path: worldedit.cpp joins it under assets/worldedits/,
     // and a value with a separator in it would reach outside that directory.
+    ReadStr(*g, "mapLayer", w.mapLayer, out, at);
+    if (w.mapLayer.empty() || w.mapLayer.find_first_of("/\\:") != std::string::npos) {
+      out.warnings.push_back("worldgen.mapLayer must be a bare map name; using \"default\"");
+      w.mapLayer = "default";
+    }
     ReadStr(*g, "editLayer", w.editLayer, out, at);
     if (w.editLayer.find_first_of("/\\:") != std::string::npos) {
       out.warnings.push_back("worldgen.editLayer must be a bare layer name; ignored");
@@ -2641,11 +2642,8 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     // silently, which reads as "shoreMudWidth stopped doing anything".
     if (w.shoreMudWidth > w.shoreBand) w.shoreMudWidth = w.shoreBand;
     if (w.shoreCattailReach > w.shoreBand) w.shoreCattailReach = w.shoreBand;
-    atLeast("ruinChance", w.ruinChance, 1);
     // The pad blend divides by the margin, and the ivy pass reads the ruin from
     // columns one voxel OUTSIDE the footprint, so the margin has to reach them.
-    atLeast("ruinPadMargin", w.ruinPadMargin, 2);
-    atLeast("ruinMaxSlope", w.ruinMaxSlope, 0);
     // Both are the divisor of a `% chance == 0` roll.
     atLeast("caveMushroomChance", w.caveMushroomChance, 1);
     atLeast("caveCrystalChance", w.caveCrystalChance, 1);
@@ -2687,32 +2685,9 @@ bool LoadTuning(const std::string& path, Tuning& out) {
       }
       if (w.biomeBlend < 0) w.biomeBlend = 0;
     }
-    // mossFace is masked to 0..3 in the shader; clamp here so the tuner's
-    // number and the wall agree instead of wrapping silently.
-    if (w.mossFace < 0 || w.mossFace > 3) {
-      out.warnings.push_back(
-          "worldgen.mossFace must be 0..3 (-Z, +X, +Z, -X); clamped");
-      w.mossFace = w.mossFace & 3;
-    }
-    // A margin of 32 or more would push a pad out of its own tile, and
-    // landColumn only ever looks at the column's own tile (worldgen.wgsl, the
-    // RUIN SITES block). 31 is the largest value that keeps that true.
-    if (w.ruinPadMargin > 31) {
-      out.warnings.push_back(
-          "worldgen.ruinPadMargin > 31 would push a pad outside its own ruin "
-          "tile; clamped to 31");
-      w.ruinPadMargin = 31;
-    }
+    // (The wallIvyDensity / ruinPadMargin / mossFace clamps went with the
+    // arena and the ruin scatter in the world map's P2b.)
     atLeast("autumnFraction", w.autumnFraction, 1);
-    // wallIvyDensity is the NUMERATOR of a coverage ramp (32/d and 48/d). At 0
-    // it divides by zero; past 8 the integer division collapses to 4 and 6 and
-    // the knob stops doing anything, so the useful range is 1..8.
-    atLeast("wallIvyDensity", w.wallIvyDensity, 1);
-    if (w.wallIvyDensity > 8) {
-      out.warnings.push_back(
-          "worldgen.wallIvyDensity > 8 has no further effect; clamped to 8");
-      w.wallIvyDensity = 8;
-    }
   }
 
   return true;
@@ -2822,10 +2797,6 @@ std::string WorldgenDefaultsJson() {
   n("curveDesert8", w.curveDesert8);
   n("biomeBlend", w.biomeBlend);
   n("treeTile", w.treeTile);
-  n("treeChanceForest", w.treeChanceForest);
-  n("treeChancePine", w.treeChancePine);
-  n("treeChanceMeadow", w.treeChanceMeadow);
-  n("treeChanceDesert", w.treeChanceDesert);
   n("autumnFraction", w.autumnFraction);
   n("pondTile", w.pondTile);
   n("pondChance", w.pondChance);
@@ -2853,23 +2824,14 @@ std::string WorldgenDefaultsJson() {
   n("shoreHorsetailHeight", w.shoreHorsetailHeight);
   n("shoreIrisChance", w.shoreIrisChance);
   n("shoreMossChance", w.shoreMossChance);
-  n("wallIvyDensity", w.wallIvyDensity);
   n("cactusChance", w.cactusChance);
   n("saguaroFraction", w.saguaroFraction);
-  n("tussockChance", w.tussockChance);
-  n("scrubChance", w.scrubChance);
-  n("desertPatch", w.desertPatch);
-  n("heathChance", w.heathChance);
-  n("heathPatch", w.heathPatch);
   n("alpineChance", w.alpineChance);
-  n("ruinChance", w.ruinChance);
-  n("ruinPadMargin", w.ruinPadMargin);
-  n("ruinMaxSlope", w.ruinMaxSlope);
   n("caveMushroomChance", w.caveMushroomChance);
   n("caveCrystalChance", w.caveCrystalChance);
-  n("mossFace", w.mossFace);
   n("caveThreshold1", w.caveThreshold1);
   n("caveThreshold2", w.caveThreshold2);
+  s("mapLayer", w.mapLayer);
   s("editLayer", w.editLayer);
   o << "\n  }\n}\n";
   return o.str();

@@ -8,7 +8,6 @@ rule measures a third of the exposed surface, a severed limb is not regrown,
 and mob bodies have no impulse seam for a sustained `float`). The exploratory
 slice in `game/spell.*` + `assets/spells/glyphs.json` stayed; this plan replaced
 its *language* while keeping its four structural commitments:
-
 1. only output is `SpellEmission` → MutationQueue ops,
 2. `ApplySpellEffect(payload, at, dir)` is position-parameterized (backfire is
    the same call at the caster),

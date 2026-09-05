@@ -479,11 +479,6 @@ class PlayerAvatar : public Mob {
   // Derived from the rig and the current speed — this is the reach the stride
   // is spent out of. See the stance note in UpdateGait.
   float stanceCrouch_ = 0.0f;
-
-  // Head look: the goal set by SetLook, and the smoothed value the rig is
-  // actually posed at. Two of them so the head EASES onto the mouse rather
-  // than stepping with it — the same reason the body yaw has a half-life.
-  float lookYawGoal_ = 0, lookPitchGoal_ = 0;
   // The HELD crouch (Ctrl): Player::crouching mirrored in each PreTick, and
   // the eased pelvis drop it drives, world voxels. Kept apart from
   // stanceCrouch_ on purpose — that is the gait's own reach budget, oscillates
@@ -492,5 +487,10 @@ class PlayerAvatar : public Mob {
   // world points the drop lands in the knees with the feet where they were.
   bool crouchWant_ = false;
   float crouchHold_ = 0.0f;
+
+  // Head look: the goal set by SetLook, and the smoothed value the rig is
+  // actually posed at. Two of them so the head EASES onto the mouse rather
+  // than stepping with it — the same reason the body yaw has a half-life.
+  float lookYawGoal_ = 0, lookPitchGoal_ = 0;
   float lookYaw_ = 0, lookPitch_ = 0;
 };

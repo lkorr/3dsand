@@ -1,28 +1,28 @@
 {
-  "name": "desert",
-  "displayName": "Desert",
-  "index": 3,
+  "name": "tundra",
+  "displayName": "Tundra",
+  "index": 4,
   "climate": {
-    "temperature": 0.9,
-    "moisture": 0.1,
-    "notes": "Biome noise above desertThreshold."
+    "temperature": 0.1,
+    "moisture": 0.35,
+    "notes": "The snowy north of the world map: frozen ground under snow, sparse dead wood, ice-skinned tarns."
   },
   "terrain": {
     "overrides": {}
   },
   "cover": {
-    "skin": "sand",
-    "skinDepth": 4,
-    "subsoil": "sand",
+    "skin": "snow",
+    "skinDepth": 2,
+    "subsoil": "dirt",
     "patch": {
-      "threshold": 128,
+      "threshold": 140,
       "cellLog2": 5
     },
     "plants": [
       {
         "material": "dry_tussock",
         "head": "",
-        "chance": 20,
+        "chance": 18,
         "height": 0.3,
         "conditions": {
           "minY": -1,
@@ -34,10 +34,10 @@
         }
       },
       {
-        "material": "desert_scrub",
+        "material": "alpine_cushion",
         "head": "",
-        "chance": 36,
-        "height": 0.5,
+        "chance": 26,
+        "height": 0.1,
         "conditions": {
           "minY": -1,
           "maxY": -1,
@@ -48,10 +48,10 @@
         }
       },
       {
-        "material": "cactus_flesh",
-        "head": "cactus_bloom",
-        "chance": 90,
-        "height": 1.2,
+        "material": "moss_patch",
+        "head": "",
+        "chance": 40,
+        "height": 0.1,
         "conditions": {
           "minY": -1,
           "maxY": -1,
@@ -61,30 +61,15 @@
           "patchThreshold": 0
         }
       }
-    ],
-    "groundFlora": false,
-    "cacti": true,
-    "sandCap": true
+    ]
   },
   "trees": {
     "tile": 14.4,
-    "density": 6,
+    "density": 8,
     "species": [
       {
-        "species": "bush",
-        "weight": 26,
-        "conditions": {
-          "minY": -1,
-          "maxY": -1,
-          "maxSlope": 1024,
-          "nearWaterMax": -1,
-          "nearWaterMin": 0,
-          "patchThreshold": 0
-        }
-      },
-      {
         "species": "dead",
-        "weight": 10,
+        "weight": 6,
         "conditions": {
           "minY": -1,
           "maxY": -1,
@@ -95,8 +80,20 @@
         }
       },
       {
-        "species": "eucalyptus",
-        "weight": 8,
+        "species": "spruce",
+        "weight": 4,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0
+        }
+      },
+      {
+        "species": "bush",
+        "weight": 3,
         "conditions": {
           "minY": -1,
           "maxY": -1,
@@ -111,26 +108,13 @@
   "water": {
     "features": [
       {
-        "preset": "oasis",
-        "tile": 102.4,
+        "preset": "tarn",
+        "tile": 44.8,
         "rarity": 6,
         "conditions": {
           "minY": -1,
           "maxY": -1,
-          "maxSlope": 48,
-          "nearWaterMax": -1,
-          "nearWaterMin": 0,
-          "patchThreshold": 0
-        }
-      },
-      {
-        "preset": "playa",
-        "tile": 128,
-        "rarity": 5,
-        "conditions": {
-          "minY": -1,
-          "maxY": -1,
-          "maxSlope": 24,
+          "maxSlope": 96,
           "nearWaterMax": -1,
           "nearWaterMin": 0,
           "patchThreshold": 0

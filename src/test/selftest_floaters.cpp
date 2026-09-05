@@ -419,10 +419,23 @@ Status GateFloaters(Ctx& c, std::string& detail) {
   {
     std::vector<CellOp> pad;
     for (int z = -6; z <= 6; z++)
-      for (int x = -6; x <= 6; x++)
+      for (int x = -6; x <= 6; x++) {
         for (int y = padY - 3; y <= padY; y++)
           pad.push_back(
               {World::SlotCellIndex({fx + x, y, fz + z}), (uint32_t)kMatStone});
+        // AND CLEAR THE AIR ABOVE IT. The pad is stone up to h+2, but worldgen
+        // is free to have grown ground cover from h+1 upward on this column
+        // (since the world map's P1 every biome's cover rows come from
+        // assets/biomes/*.json and reach h+4 and beyond), and a block set down
+        // on top of a fern never rests square, never sleeps, and never
+        // settles -- which reads as "supported-still-settles" failing for a
+        // reason that has nothing to do with support. The fixture owns its
+        // footprint: pad below, open air above, exactly what the control arm
+        // assumes.
+        for (int y = padY + 1; y <= padY + 12; y++)
+          pad.push_back(
+              {World::SlotCellIndex({fx + x, y, fz + z}), (uint32_t)kMatAir});
+      }
     SubmitTick(c.ctx, world, c.sim, t, kDefaultSeed, {}, {}, pad, false,
                fixtureChunk, true, false, {});
     c.ctx.WaitIdle();

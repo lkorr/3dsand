@@ -21,6 +21,7 @@
 #include "sim/waterbody.h"
 #include "sim/windprim.h"
 #include "sim/currentprim.h"
+#include "sim/trample.h"
 
 namespace sandvox {
 
@@ -285,6 +286,26 @@ void WriteRenderParams(const rhi::Queue& queue, const World& world,
       rp.waveImpacts[i * 4 + 1] = wi.Data()[i].z;
       rp.waveImpacts[i * 4 + 2] = wi.Data()[i].t0;
       rp.waveImpacts[i * 4 + 3] = wi.Data()[i].amp;
+    }
+  }
+  // The trample ring (sim/trample.h): footprints the plants flatten under.
+  // Render-only like the impact ring above; the frame loop presses it, this
+  // is its only reader. Empty in every headless path unless a gate presses.
+  {
+    const TrampleRing& tr = Tramples();
+    const uint32_t n = std::min(tr.Count(), kTrampleCap);
+    rp.trampleCount = n;
+    float lo[3], hi[3];
+    if (n > 0 && tr.Bounds(lo, hi)) {
+      for (int k = 0; k < 3; k++) { rp.trampleLo[k] = lo[k]; rp.trampleHi[k] = hi[k]; }
+    } else {
+      for (int k = 0; k < 3; k++) { rp.trampleLo[k] = 1.0f; rp.trampleHi[k] = 0.0f; }
+    }
+    for (uint32_t i = 0; i < n; i++) {
+      const TrampleStamp& s = tr.Data()[i];
+      float* w = &rp.tramples[i * 8];
+      w[0] = s.x; w[1] = s.z; w[2] = s.y; w[3] = s.radius;
+      w[4] = s.t0; w[5] = s.tEnd; w[6] = s.strength; w[7] = 0.0f;
     }
   }
   IVec3 o = world.WindowOrigin();

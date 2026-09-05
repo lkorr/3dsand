@@ -90,6 +90,13 @@ struct BiomeDef {
   uint32_t skinId = 0, subsoilId = 0;
   int skinDepth = 1;
   int patchThreshold = 0, patchCellLog2 = 5;
+  // Which of worldgen's fixed-function ground layers this biome gets. These
+  // replace the `biome == B_DESERT` / `== B_PINE` tests that gated whole
+  // blocks of genCellIn on a hard-coded id (cover.groundFlora, cover.cacti,
+  // cover.sandCap in the JSON).
+  bool groundFlora = true;   // the canopy-inverted undergrowth + flower layer
+  bool cacti = false;        // the cactus proc shape
+  bool sandCap = false;      // loose sand cap under the skin
   std::vector<CoverRow> cover;
   float treeTileM = 14.4f;
   int treeDensity = 0;                   // percent of tiles

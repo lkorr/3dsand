@@ -310,6 +310,10 @@ SPEC = [
     ("render", "microMaxPerRay", "TUNE_MICRO_MAX_PER_RAY", "i", 8),
     ("render", "microSwayAmp", "TUNE_MICRO_SWAY_AMP", "f", 1.5),
     ("render", "microSwaySpeed", "TUNE_MICRO_SWAY_SPEED", "f", 1.0),
+    ("render", "trampleRecover", "TUNE_TRAMPLE_RECOVER", "f", 1.4),
+    ("render", "trampleDepth", "TUNE_TRAMPLE_DEPTH", "f", 0.8),
+    ("render", "trampleLean", "TUNE_TRAMPLE_LEAN", "f", 0.35),
+    ("render", "trampleRadius", "TUNE_TRAMPLE_RADIUS", "f", 1.5),
     ("render", "primarySteps", "TUNE_PRIMARY_STEPS", "i", 4096),
     ("render", "farSteps", "TUNE_FAR_STEPS", "i", 384),
     ("render", "farShadowReach", "TUNE_FAR_SHADOW_REACH", "f", 60.0),
@@ -487,10 +491,6 @@ SPEC = [
     ("worldgen", "curveDesert8", "TUNE_CURVE_DESERT8", "i", 16384),
     ("worldgen", "biomeBlend", "TUNE_BIOME_BLEND", "i", 18),
     ("worldgen", "treeTile", "TUNE_TREE_TILE", "i", 144),
-    ("worldgen", "treeChanceForest", "TUNE_TREE_CHANCE_FOREST", "u", 78),
-    ("worldgen", "treeChancePine", "TUNE_TREE_CHANCE_PINE", "u", 70),
-    ("worldgen", "treeChanceMeadow", "TUNE_TREE_CHANCE_MEADOW", "u", 22),
-    ("worldgen", "treeChanceDesert", "TUNE_TREE_CHANCE_DESERT", "u", 6),
     ("worldgen", "autumnFraction", "TUNE_AUTUMN_FRACTION", "u", 5),
     ("worldgen", "pondTile", "TUNE_POND_TILE", "i", 448),
     ("worldgen", "pondChance", "TUNE_POND_CHANCE", "u", 4),
@@ -509,7 +509,6 @@ SPEC = [
     ("worldgen", "kelpHeight", "TUNE_KELP_HEIGHT", "i", 10),
 
     # vines / climbers / hanging moss (worldgen agent B)
-    ("worldgen", "wallIvyDensity", "TUNE_WALL_IVY_DENSITY", "u", 3),
 
     # shoreline: the wet fringe outside a pond
     ("worldgen", "shoreBand", "TUNE_SHORE_BAND", "i", 24),
@@ -527,22 +526,13 @@ SPEC = [
     # desert / pine highland / alpine ground cover (worldgen agent E)
     ("worldgen", "cactusChance", "TUNE_CACTUS_CHANCE", "u", 26),
     ("worldgen", "saguaroFraction", "TUNE_SAGUARO_FRACTION", "u", 22),
-    ("worldgen", "tussockChance", "TUNE_TUSSOCK_CHANCE", "u", 9),
-    ("worldgen", "scrubChance", "TUNE_SCRUB_CHANCE", "u", 26),
-    ("worldgen", "desertPatch", "TUNE_DESERT_PATCH", "i", 130),
-    ("worldgen", "heathChance", "TUNE_HEATH_CHANCE", "u", 7),
-    ("worldgen", "heathPatch", "TUNE_HEATH_PATCH", "i", 128),
     ("worldgen", "alpineChance", "TUNE_ALPINE_CHANCE", "u", 40),
-    ("worldgen", "ruinChance", "TUNE_RUIN_CHANCE", "u", 5),
 
     # ruin pads (13.3.2)
-    ("worldgen", "ruinPadMargin", "TUNE_RUIN_PAD_MARGIN", "i", 20),
-    ("worldgen", "ruinMaxSlope", "TUNE_RUIN_MAX_SLOPE", "i", 20),
 
     # cave flora + the shaded face (13.3.4)
     ("worldgen", "caveMushroomChance", "TUNE_CAVE_MUSHROOM_CHANCE", "u", 26),
     ("worldgen", "caveCrystalChance", "TUNE_CAVE_CRYSTAL_CHANCE", "u", 9),
-    ("worldgen", "mossFace", "TUNE_MOSS_FACE", "u", 0),
     ("worldgen", "caveThreshold1", "TUNE_CAVE_THRESHOLD1", "u", 150),
     ("worldgen", "caveThreshold2", "TUNE_CAVE_THRESHOLD2", "u", 148),
 

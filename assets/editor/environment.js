@@ -31,6 +31,7 @@
 import * as Trees from './trees.js';
 import * as Water from './water.js';
 import * as Biome from './biome.js';
+import * as WorldMap from './map.js';
 
 let H = null;
 let root = null;
@@ -40,8 +41,8 @@ let dirtyBy = {};
 let els = {};
 let envActive = false;
 
-const PAGE_ORDER = ['biome', 'trees', 'water', 'caves', 'cover'];
-const PAGE_LABEL = {trees: 'Trees', water: 'Water bodies', caves: 'Caves', cover: 'Ground cover'};
+const PAGE_ORDER = ['map', 'biome', 'trees', 'water', 'caves', 'cover'];
+const PAGE_LABEL = {map: 'World map', trees: 'Trees', water: 'Water bodies', caves: 'Caves', cover: 'Ground cover'};
 
 const CSS = `
 #view-environment.active{display:flex;gap:10px;height:calc(100vh - 150px);min-height:520px}
@@ -162,6 +163,14 @@ async function paintNav() {
   try { names = await Biome.listBiomes(); } catch (e) { names = []; }
   if (gen !== navGen) return;
   nav.innerHTML = '';
+  nav.append(el('h4', {}, 'World'));
+  {
+    const b = el('button', {'data-page': 'map', class: current === 'map' ? 'on' : ''},
+                 el('span', {}, PAGE_LABEL.map),
+                 el('span', {class: 'pill' + (dirtyBy.map ? ' dirty' : '')}, dirtyBy.map ? 'unsaved' : 'map'));
+    b.addEventListener('click', () => showPage('map'));
+    nav.append(b);
+  }
   nav.append(el('h4', {}, 'Biomes'));
   const cur = Biome.currentName();
   for (const n of names) {
@@ -256,9 +265,10 @@ export function attach(hooks) {
   Trees.attach(shared('trees'));
   Water.attach(shared('water'));
   Biome.attach(shared('biome'));
+  WorldMap.attach(shared('map'));
   paintKnobPages();
   paintNav();
-  current = 'biome';
+  current = 'map';
 }
 
 export function activate() {
@@ -268,7 +278,7 @@ export function activate() {
   // its band strip and terrain rows once tuning is there.
   paintKnobPages();
   if (Biome.tuningAvailable) Biome.tuningAvailable();
-  showPage(current || 'biome');
+  showPage(current || 'map');
   paintNav();
 }
 

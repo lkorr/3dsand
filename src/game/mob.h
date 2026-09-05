@@ -1964,6 +1964,12 @@ class MobSystem {
                         uint32_t color) const;
   uint32_t LimbBodyCount() const;
   uint32_t MobCount() const { return (uint32_t)mobs_.size(); }
+  // The i'th mob record, or null past the end. Read-only: the frame loop uses
+  // it to lay trample stamps under every creature (sim/trample.h), which
+  // needs a position and a footprint and nothing else about the body.
+  const Mob* MobAt(uint32_t i) const {
+    return i < mobs_.size() ? &mobs_[i] : nullptr;
+  }
 
   // introspection (selftest / overlay)
   // Id of the i'th mob record, 0 past the end. A LOADED mob gets a fresh id

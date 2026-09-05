@@ -19,6 +19,8 @@
 
 #include "audio/cues.h"
 #include "game/avatar.h"
+#include "sim/trample.h"
+#include "sim/plants.h"
 #include "game/bodyreg.h"
 #include "game/brush.h"
 #include "game/persist.h"
@@ -925,13 +927,8 @@ int RunShots(GpuContext& ctx, World& world, Simulation& sim) {
   // near-horizontal: aimed steeply down, the frame fills with the window again.
   render({108, (float)(h108 + 300), 108}, 0.785f, -0.06f,
          "screenshot_cascade.bmp");
-  // Combat arena POI, centered at (180,110): from outside the -x/-z corner
-  // looking across the deck, high enough to see the far wall and both doorways.
-  {
-    int ah = World::TerrainHeight(180, 110, kDefaultSeed);
-    render({120, (float)(ah + 40), 50}, 0.9f, -0.32f, "screenshot_arena.bmp");
-    render({180, (float)(ah + 90), 40}, 1.5708f, -0.85f, "screenshot_arena_top.bmp");
-  }
+  // (The combat arena and its two screenshots went with the world map's P2b;
+  // authored sites return through the map's site table in P5.)
   // Water look shots: the authored lake is centered at (420,420), surface at
   // y=68 (worldgen poolY 44 + 24), floor at y=44, rim y=70.
   //   _water: from the near rim at a shallow grazing angle — where Fresnel
@@ -1440,13 +1437,69 @@ int RunShots(GpuContext& ctx, World& world, Simulation& sim) {
         r ^= r >> 13; r *= 0x9E3779B9u; r ^= r >> 16;
         uint32_t roll = r % 100u;
         uint32_t mat;
-        if (roll < 55u) { mat = kMatGrassTuft; }
-        else if (roll < 62u) { mat = kMatFlowerPoppy; }
-        else if (roll < 68u) { mat = kMatFlowerDaisy; }
-        else if (roll < 72u) { mat = kMatFoliageBush; }
+        int height = 1;
+        // The close camera stands at (-16, -16): nothing within three cells
+        // of it, or the frame is the inside of whatever grew there.
+        if (dx >= -19 && dx <= -13 && dz >= -19 && dz <= -13) continue;
+        // The near quadrant (dz > 6) is a tall-grass stand so the close shot
+        // has blades at eye level; the rest is lawn with flowers in it.
+        if (dz > 6 && roll < 80u) {
+          mat = kMatTallGrass;
+          height = 4 + (int)((r >> 8u) % 5u);
+        } else if (roll < 50u) { mat = kMatGrassTuft; height = 1 + (int)((r >> 9u) & 1u); }
+        else if (roll < 55u) { mat = kMatFlowerPoppy; height = 3; }
+        else if (roll < 60u) { mat = kMatFlowerDaisy; height = 2 + (int)((r >> 9u) & 1u); }
+        else if (roll < 63u) { mat = kMatFlowerFoxglove; height = 5 + (int)((r >> 9u) % 3u); }
+        else if (roll < 67u) { mat = kMatFlowerBluebell; height = 2 + (int)((r >> 9u) & 1u); }
+        else if (roll < 71u) { mat = kMatFlowerButtercup; height = 2; }
+        else if (roll < 73u) { mat = kMatFoliageBush; }
         else { continue; }  // bare ground between the tufts
-        // Same word rules as a brush paint on a solid: state 0, unstamped.
-        flora.push_back({World::SlotCellIndex(c), PackVoxNew(mat, 0u)});
+        for (int k = 0; k < height; k++) {
+          IVec3 ck{wx, gh + 1 + k, wz};
+          if (!world.CellInWindow(ck)) continue;
+          uint32_t m = mat;
+          if (mat == kMatTallGrass && k == height - 1) m = kMatTallGrassHead;
+          // Same word rules as a brush paint on a solid: state 0, unstamped.
+          flora.push_back({World::SlotCellIndex(ck), PackVoxNew(m, 0u)});
+        }
+      }
+    }
+    // TILE PLANTS: a fern bank and two big toadstools on the far side, and a
+    // ring of small mushrooms, placed exactly where the renderer will rebuild
+    // them (sim/plants.h is the CPU twin of plantTileAt).
+    {
+      auto paintTile = [&](int tx, int tz, uint32_t salt, int tile, int foot, int minH,
+                           int maxH, uint32_t mat) {
+        PlantTileCpu pt = PlantTileAtCpu(tx * tile, tz * tile, kDefaultSeed, salt,
+                                         tile, foot, minH, maxH, 100u);
+        int hc = World::TerrainHeight(pt.cx, pt.cz, kDefaultSeed);
+        int half = foot / 2;
+        for (int dz = -half; dz <= half; dz++)
+          for (int dx = -half; dx <= half; dx++)
+            for (int k = 1; k <= pt.h; k++) {
+              IVec3 c{pt.cx + dx, hc + k, pt.cz + dz};
+              if (!world.CellInWindow(c)) continue;
+              flora.push_back({World::SlotCellIndex(c), PackVoxNew(mat, 0u)});
+            }
+      };
+      for (int tz = -4; tz <= -2; tz++)
+        for (int tx = 0; tx <= 3; tx++)
+          paintTile((gx / kPlantFernTile) + tx, (gz / kPlantFernTile) + tz,
+                    kPlantFernSalt, kPlantFernTile, kPlantFernFoot, kPlantFernMinH,
+                    kPlantFernMaxH, kMatFern);
+      paintTile((gx / kPlantShroomTile) - 1, (gz / kPlantShroomTile) - 1,
+                kPlantShroomSalt, kPlantShroomTile, kPlantShroomFoot,
+                kPlantShroomMinH, kPlantShroomMaxH, kMatMushroomLarge);
+      paintTile((gx / kPlantShroomTile) + 1, (gz / kPlantShroomTile) - 2,
+                kPlantShroomSalt, kPlantShroomTile, kPlantShroomFoot,
+                kPlantShroomMinH, kPlantShroomMaxH, kMatMushroomLarge);
+      for (int i = 0; i < 12; i++) {
+        int wx = gx - 12 + (i * 7) % 11, wz = gz - 14 + (i * 5) % 7;
+        int gh = World::TerrainHeight(wx, wz, kDefaultSeed);
+        IVec3 c{wx, gh + 1, wz};
+        if (!world.CellInWindow(c)) continue;
+        flora.push_back({World::SlotCellIndex(c),
+                         PackVoxNew((i & 1) ? kMatMushroomCluster : kMatToadstoolPale, 0u)});
       }
     }
     for (uint32_t t = 133; t <= 136; t++)
@@ -1461,7 +1514,10 @@ int RunShots(GpuContext& ctx, World& world, Simulation& sim) {
     // Above the tips looking down the slope: close enough that individual
     // blades and petals resolve, but OUT of the grass — a camera at tuft height
     // sits inside a blade and the frame is one green wall.
-    render({(float)(gx - 16), (float)(mh + 7), (float)(gz - 16)}, 0.785f, -0.32f,
+    // On the CAMERA's own column: the datum moved with the terrain overhaul
+    // and mh + 7 at (-16, -16) was a lens buried in the hillside.
+    const int ch = World::TerrainHeight(gx - 16, gz - 16, kDefaultSeed);
+    render({(float)(gx - 16), (float)(ch + 8), (float)(gz - 16)}, 0.785f, -0.28f,
            "screenshot_micro.bmp");
     // High and back: crosses TUNE_MICRO_LOD_DIST inside one frame, so the
     // near/far handoff is visible as a single image rather than two shots.
@@ -3161,9 +3217,15 @@ int main(int argc, char** argv) {
       // The second world this process builds needs the same trees as the first
       // -- a treeless second world would hash differently for a reason that has
       // nothing to do with what is being tested.
+      biomes::BiomeSet stBiomes;
+      { std::string bl;
+        if (!biomes::LoadBiomeSet(ad, m, stBiomes, bl)) {
+          std::fprintf(stderr, "%s", bl.c_str());
+          return 1;
+        } }
       TreeAtlas stTrees;
       { std::string tl;
-        if (!LoadTreeAtlas(ad + "/trees", m, stTrees, tl)) {
+        if (!LoadTreeAtlas(ad + "/trees", m, stBiomes, stTrees, tl)) {
           std::fprintf(stderr, "%s", tl.c_str());
           return 1;
         } }
@@ -3174,8 +3236,17 @@ int main(int argc, char** argv) {
       World stWorld;
       stWorld.residency = World::Residency::Paged;
       stWorld.Init(stCtx.device);
+      std::vector<uint32_t> stMapWords;
+      { std::string wl;
+        worldmap::WorldMapData stMap;
+        if (!worldmap::LoadWorldMap(ad, CurrentTuning().worldgen.mapLayer, stBiomes, m.size(), kDefaultSeed, stMap, wl) ||
+            !worldmap::PackWorldMap(stBiomes, stMap, stMapWords, wl)) {
+          std::fprintf(stderr, "%s", wl.c_str());
+          return 1;
+        }
+        worldmap::SetCurrentWorldMap(std::move(stMap)); }
       Simulation stSim;
-      if (!stSim.Init(stCtx.device, stWorld, m, rx, mic, stTrees, ad + "/shaders"))
+      if (!stSim.Init(stCtx.device, stWorld, m, rx, mic, stTrees, stMapWords, ad + "/shaders"))
         return 1;
       Physics stPhys; stPhys.Init();
       DebrisSystem stDebris; stDebris.Init(&stPhys, &stWorld, m, rx);
@@ -3313,10 +3384,40 @@ int main(int argc, char** argv) {
   // The baked tree atlas (src/sim/treeatlas.h). AFTER LoadAssets, because it
   // resolves the material NAMES its .svtree files carry against the compiled
   // table, and before Simulation::Init, which uploads it.
+  // The biome set (assets/biomes/*.json) is loaded FIRST: it is the id space
+  // the tree atlas's weight table and the worldMap buffer's record table are
+  // both laid out in (docs/PLAN_world_map.md P1).
+  biomes::BiomeSet biomeSet;
+  std::vector<uint32_t> worldMapWords;
+  {
+    std::string blog;
+    if (!biomes::LoadBiomeSet(assetDir, mats, biomeSet, blog)) {
+      std::fprintf(stderr, "%s", blog.c_str());
+      std::fprintf(stderr, "biome files failed to load -- refusing to start\n");
+      return 1;
+    }
+    std::vector<std::string> problems;
+    if (biomes::ValidateBiomeSet(biomeSet, problems)) {
+      for (const std::string& p : problems) std::fprintf(stderr, "biomes: %s\n", p.c_str());
+      std::fprintf(stderr, "biome files are invalid -- refusing to start with a world "
+                           "whose biome ids cannot be laid out\n");
+      return 1;
+    }
+    worldmap::WorldMapData map;
+    if (!worldmap::LoadWorldMap(assetDir, CurrentTuning().worldgen.mapLayer, biomeSet, mats.size(), kDefaultSeed, map, blog) ||
+        !worldmap::PackWorldMap(biomeSet, map, worldMapWords, blog)) {
+      std::fprintf(stderr, "%s", blog.c_str());
+      std::fprintf(stderr, "world map '%s' failed to load -- refusing to start (a world with no "
+                           "map is not a world; see src/sim/worldmap.h)\n",
+                   CurrentTuning().worldgen.mapLayer.c_str());
+      return 1;
+    }
+    worldmap::SetCurrentWorldMap(std::move(map));
+  }
   TreeAtlas treeAtlas;
   {
     std::string tlog;
-    if (!LoadTreeAtlas(assetDir + "/trees", mats, treeAtlas, tlog)) {
+    if (!LoadTreeAtlas(assetDir + "/trees", mats, biomeSet, treeAtlas, tlog)) {
       std::fprintf(stderr, "%s", tlog.c_str());
       std::fprintf(stderr, "tree atlas failed to load -- refusing to start with a "
                            "half-read forest\n");
@@ -3371,7 +3472,7 @@ int main(int argc, char** argv) {
   world.Init(ctx.device);
   StartupMark("world buffers (page pool, far cascades)");
   Simulation sim;
-  if (!sim.Init(ctx.device, world, mats, reactions, micro, treeAtlas,
+  if (!sim.Init(ctx.device, world, mats, reactions, micro, treeAtlas, worldMapWords,
                 assetDir + "/shaders"))
     return 1;
   StartupMark("sim init: every compute shader through Tint + the driver");
@@ -5175,6 +5276,38 @@ int main(int argc, char** argv) {
         WaveImpacts().Add(player.pos.x, player.pos.z, (float)now, amp);
       }
       wasInLiquid = player.inLiquid;
+    }
+    // ---- the trample ring: feet on the plants ------------------------------
+    // Every grounded presser lays or refreshes a footprint stamp under itself
+    // each frame (sim/trample.h); the plants read the ring at their base and
+    // flatten under it, then spring back over render.trampleRecover seconds.
+    // The avatar is the player and is NOT in mobs_, so it is not counted
+    // twice. A mob's stamp is its collision footprint, not its art, so a bird
+    // overhead presses nothing — trampleAt also rejects stamps whose ground
+    // level is far from the plant's base.
+    {
+      const Tuning& trTun = CurrentTuning();
+      TrampleRing& tr = Tramples();
+      if (player.grounded) {
+        tr.Press(player.pos.x, player.pos.z, player.pos.y - Player::kHalfY,
+                 Player::kHalfXZ * trTun.render.trampleRadius, 1.0f, (float)now);
+      }
+      for (uint32_t i = 0; i < mobs.MobCount(); i++) {
+        const Mob* m = mobs.MobAt(i);
+        if (!m || !m->Alive() || !m->Def()) continue;
+        // origin_.y is NOT the live height: a walking mob keeps its foot
+        // height in bodyY_ (the ground probe writes it) and origin_.y is the
+        // spawn value, so a stamp at Origin().y sat metres off the plants'
+        // base and trampleAt's ground band rejected every one of them.
+        const Vec3 o = m->Origin();
+        const Vec3 s = m->Def()->worldSize;
+        const float half = std::max(s.x, s.z) * 0.5f;
+        if (half <= 0.0f) continue;
+        tr.Press(o.x + s.x * 0.5f, o.z + s.z * 0.5f, m->BodyY(),
+                 half * trTun.render.trampleRadius,
+                 std::min(1.0f, 0.5f + half * 0.15f), (float)now);
+      }
+      tr.Expire((float)now, trTun.render.trampleRecover);
     }
     // --autofly-surface altitude pin. Held analytically against the worldgen
     // heightfield rather than flown, so the measured quantity (ray length
@@ -7076,15 +7209,32 @@ int main(int argc, char** argv) {
       }
 
       // ---- audio ----
-      // The listener rides the RENDER eye, not the player's head: in third
-      // person the camera is where the player's attention is, and putting the
-      // ears anywhere else makes panning disagree with what is on screen.
-      // After the camera block, so `eye` is final for the frame.
+      // THE EARS ARE ON THE CHARACTER, NOT ON THE CAMERA. `eye` is the RENDER
+      // eye and in third person that is a boom several metres behind the body,
+      // so using it moved the whole soundscape backwards the moment you pressed
+      // the camera key: distances, doppler and — worst — occlusion were all
+      // solved from the boom, which routinely sits inside the wall behind you
+      // and muffled everything. Third person now hears exactly what first
+      // person hears.
+      //
+      // Position is `Player::ViewEyePos()` — the head, at ear height, in BOTH
+      // modes, and the same value first person was already using. Deliberately
+      // not the avatar's head joint: that transform is one tick latent out of
+      // Jolt and rides the gait's bob and sway, which the listener would
+      // convert into doppler wobble on every step (the same three reasons the
+      // camera block above refuses to orbit it).
+      //
+      // Orientation stays `cam.yaw/pitch` — the LOOK direction, which is what
+      // the ears face in first person and what the screen is showing in third.
+      // The body's own heading is not it: in third person the model faces where
+      // it RUNS (ResolveAvatarHeading), so strafing would swing the stereo
+      // image away from the picture.
       //
       // Footfalls are drained here rather than inside the tick loop because
       // that loop runs up to 4 times per frame; firing from inside it would
       // put several steps at the same instant.
       sandvox::PerfSpan spanAudio(sandvox::PerfScope::Audio);
+      const Vec3 earPos = player.ViewEyePos();
       if (audioCues.Enabled()) {
         for (const PlayerAvatar::Footfall& ff : avatar.Footfalls()) {
           if (ff.landing)
@@ -7227,10 +7377,10 @@ int main(int argc, char** argv) {
             // making the player wait out a full retry period past dusk.
             nightRollTimer = ta.nightRetrySeconds;
           }
-          audioCues.SetNightAmbience(eye, want, allowStart);
+          audioCues.SetNightAmbience(earPos, want, allowStart);
         }
 
-        audioCues.Update(dt, eye, cam.yaw, cam.pitch, &world);
+        audioCues.Update(dt, earPos, cam.yaw, cam.pitch, &world);
       }
       avatar.ClearFootfalls();
       // Cleared unconditionally, like the footfalls: a queue that only drains

@@ -71,6 +71,11 @@ def main():
     ts.ROOT = root
     ts.ASSETS = os.path.join(root, "assets")
     ts.MATDIR = os.path.join(ts.ASSETS, "materials")
+    # Every module-level path derived from ASSETS has to be rebound here too,
+    # or the frozen exe reads it from PyInstaller's temp dir: the World map page
+    # listed no maps for exactly that reason.
+    ts.WORLDEDIT_DIR = os.path.join(ts.ASSETS, "worldedits")
+    ts.WORLDMAP_DIR = os.path.join(ts.ASSETS, "worldmap")
     # REBUILT, NOT PATCHED, and that is a standing hazard: this dict is a second
     # copy of tuner_server.WRITABLE and the two silently drift. `items` was
     # missing here for exactly that reason -- the browser could save items.json

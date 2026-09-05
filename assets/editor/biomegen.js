@@ -100,7 +100,15 @@ export function remapToMaterials(res, matIds) {
 
 /** worldgen.wgsl's B_* ids, in id order. treegen.js BIOME_ORDER is the same
  *  list; scripts/check_invariants.py asserts all three agree with the files. */
-export const ENGINE_BIOMES = ['forest', 'meadow', 'pine', 'desert'];
+// The biome ID SPACE, in id order. Since the world map's P1 this is the list
+// of assets/biomes/*.json files by `index` (0..N-1, contiguous), which the
+// engine packs into the worldMap buffer in this order; check_invariants.py
+// (`biome order`) asserts this list is a prefix of the files' id order. The
+// biome page's Save assigns `index` from a name's position here, so a name
+// missing from this list would be saved as -1 and the engine would refuse to
+// start (ids must be contiguous). Add a biome HERE and as a file together.
+export const ENGINE_BIOMES = ['forest', 'meadow', 'pine', 'desert',
+                              'tundra', 'swamp', 'alpine', 'ocean'];
 
 // =============================================================================
 // hashing (lowbias32, as treegen/watergen)

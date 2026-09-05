@@ -235,6 +235,9 @@ BUF_TO_WGSL = {
     # The baked tree atlas, binding 26 of BOTH simBGL_ and simSlimBGL_ (the
     # far-cascade pipelines call genCell, so they sample it too).
     "TreeAtlas": {"treeAtlas"},
+    # The authored world map, binding 31 of BOTH simBGL_ and simSlimBGL_, for
+    # the same reason the tree atlas is in both (docs/PLAN_world_map.md).
+    "WorldMap": {"worldMap"},
     # Indirect-args and transfer-only buffers are never bound in a bind group,
     # so no WGSL name maps to them and the walk cannot see them. Correct: they
     # are consumed by vkCmdDispatchIndirect / vkCmdCopyBuffer, not by a shader.
@@ -276,6 +279,8 @@ _SIM_GROUP0 = {
     "irradiance",
     # The deferred streaming wake's act verdict, binding 30.
     "genAct",
+    # The authored world map, binding 31 (docs/PLAN_world_map.md).
+    "worldMap",
 }
 # The slim group is 0..4 PLUS the two page buffers at 17/18 — not a dense
 # prefix any more. One WGSL identifier cannot carry two binding numbers
@@ -298,7 +303,13 @@ _SLIM_GROUP0 = {"voxels", "dirtyIn", "dirtyOut", "materials", "T",
                 # (genCell -> treeAt, farSurfaceMat -> treeCanopyAt), so binding
                 # 26 has to name the same buffer in every module that declares
                 # it -- the same argument as waterBodyState above.
-                "treeAtlas"}
+                "treeAtlas",
+                # worldMap is in the SLIM group for exactly treeAtlas's
+                # reason: `far`/`fardown` build on farPL_ and both reach the
+                # biome sampler (farSurfaceMat -> treeCanopyAt -> treeInfoAt
+                # -> biomeAt), which reads the map, so binding 31 has to name
+                # the same buffer in every module that declares it.
+                "worldMap"}
 _PARTICLE_GROUP1 = {"pRead", "pReadBuf", "pWrite", "counts", "claim", "pArgs",
                     "expOps", "expMask", "spawnOps"}
 _FAR_GROUP1 = {"farVox", "farOcc", "farList", "F", "farDirty", "farPatch"}

@@ -110,12 +110,8 @@
 
 using namespace sandvox;
 
-// Defined in src/sim/world.cpp, next to World::TerrainHeight. Declared
-// here rather than in world.h because world.h is a hub header and this
-// serves exactly one assertion (A8). Returns false for a tile with no
-// ruin, or one whose site the flatness gate refused.
-bool RuinSiteForGate(int tileX, int tileZ, uint32_t seed, int* rx,
-                     int* rz, int* w, int* padY);
+// (A8, the ruin-pad check, went with the ruin scatter in the world map's P2b;
+// authored sites return through the map's site table in P5.)
 
 namespace selftest {
 namespace {
@@ -182,7 +178,6 @@ struct PassAOut {
   int boxMin = 0, boxMax = 0;   // surface range over pass C's readback box ONLY
   int pondCols = 0;      // columns sampled inside a tarn
   int bermCols = 0;      // columns sampled in a tarn's berm core
-  int ruinX = 0, ruinZ = 0, ruinY = -1, ruinApron = 0;   // A8's located site
   std::string why;
 };
 
@@ -403,14 +398,20 @@ PassAOut PassA(World& world, uint32_t seed, std::string* log) {
       }
   }
 
-  // A5 — treeline bracketing.
+  // A5 — treeline bracketing. Against the FAR transects' band, not the home
+  // region's: since the world map (P4) the ground within 2 km of the origin
+  // is whatever the map paints there -- flat forest by design, with the
+  // snowline where alpine is painted -- so "the treeline is inside the
+  // surface band around spawn" stopped being a property of a sane world.
+  // What still must hold is that the treeline is reachable SOMEWHERE the
+  // transects see: below it there are trees, above it there is snow.
   {
     const int treeline = CurrentTuning().worldgen.treeline;
-    if ((double)treeline <= o.hP5 || (double)treeline >= o.hP95) {
+    if (treeline <= o.farMin || treeline >= o.farMax) {
       o.ok = false;
-      o.why += Format("%streeline y%d outside the p5..p95 surface band "
-                      "y%.0f..y%.0f (a world with no trees, or nothing but)",
-                      o.why.empty() ? "" : "; ", treeline, o.hP5, o.hP95);
+      o.why += Format("%streeline y%d outside the far-transect surface band "
+                      "y%d..y%d (a world with no trees, or nothing but)",
+                      o.why.empty() ? "" : "; ", treeline, o.farMin, o.farMax);
     }
   }
 
@@ -449,61 +450,6 @@ PassAOut PassA(World& world, uint32_t seed, std::string* log) {
   // "No site within the scan" is a FAILURE, not a skip. A predicate that
   // silently finds nothing is the circular assertion CLAUDE.md warns about —
   // it would go on passing after the feature was deleted.
-  {
-    int rx = 0, rz = 0, rw = 0, padY = 0;
-    bool found = false;
-    for (int r = 1; r <= 4 && !found; r++)
-      for (int tz = -r; tz <= r && !found; tz++)
-        for (int tx = -r; tx <= r && !found; tx++) {
-          if (std::max(std::abs(tx), std::abs(tz)) != r) continue;
-          if (RuinSiteForGate(tx, tz, seed, &rx, &rz, &rw, &padY)) found = true;
-        }
-    if (!found) {
-      o.ok = false;
-      o.why += Format("%sno accepted ruin site on any tile within 4 of the "
-                      "origin — either worldgen.ruinChance/ruinMaxSlope refuse "
-                      "everything, or the pad never reaches TerrainHeight",
-                      o.why.empty() ? "" : "; ");
-    } else {
-      int flatLo = INT32_MAX, flatHi = INT32_MIN;
-      for (int z = rz; z < rz + rw; z++)
-        for (int x = rx; x < rx + rw; x++) {
-          const int h = World::TerrainHeight(x, z, seed);
-          flatLo = std::min(flatLo, h);
-          flatHi = std::max(flatHi, h);
-        }
-      if (flatLo != padY || flatHi != padY) {
-        o.ok = false;
-        o.why += Format("%sruin footprint at (%d,%d) is not flat: TerrainHeight "
-                        "spans y%d..y%d where the pad is y%d",
-                        o.why.empty() ? "" : "; ", rx, rz, flatLo, flatHi, padY);
-      }
-      // The apron, out through the margin and a little past it, on both axes.
-      const int margin = CurrentTuning().worldgen.ruinPadMargin;
-      int apron = 0;
-      for (int side = 0; side < 2; side++) {
-        const int c = (side == 0 ? rz : rx) + rw / 2;
-        int prev = INT32_MIN;
-        for (int d = -(margin + 4); d < rw + margin + 4; d++) {
-          const int x = side == 0 ? rx + d : c;
-          const int z = side == 0 ? c : rz + d;
-          const int h = World::TerrainHeight(x, z, seed);
-          if (prev != INT32_MIN) apron = std::max(apron, std::abs(h - prev));
-          prev = h;
-        }
-      }
-      const int cap = (int)BaselineNumber("terrain.slopeMax", 64);
-      if (apron > cap) {
-        o.ok = false;
-        o.why += Format("%sruin pad apron at (%d,%d) steps %d voxels per column "
-                        "> %d — the ramp itself is above the angle of repose "
-                        "(worldgen.ruinMaxSlope must stay under twice "
-                        "worldgen.ruinPadMargin)",
-                        o.why.empty() ? "" : "; ", rx, rz, apron, cap);
-      }
-      o.ruinX = rx; o.ruinZ = rz; o.ruinY = padY; o.ruinApron = apron;
-    }
-  }
 
   if (log)
     *log = Format(
@@ -511,13 +457,12 @@ PassAOut PassA(World& world, uint32_t seed, std::string* log) {
         " | far transects y%d..y%d (%.1f m) | pass-C box y%d..y%d"
         " | local relief over 512 vox: %d (window is %u) | adjacent step max %d "
         "p99.9 %.0f | spawn-transect max step %d | tarns: %d bowl cols, %d berm "
-        "cols checked | nearest ruin pad (%d,%d) flat at y%d, apron step %d",
+        "cols checked",
         o.hMin, o.hMax, o.hMean, o.hP5, o.hP95, o.hMax - o.hMin,
         (double)(o.hMax - o.hMin) * kVoxelMeters, o.farMin, o.farMax,
         (double)(o.farMax - o.farMin) * kVoxelMeters, o.boxMin, o.boxMax,
         o.localRelief, kWorldN,
-        o.slopeMax, o.slopeP999, o.rampMax, o.pondCols, o.bermCols,
-        o.ruinX, o.ruinZ, o.ruinY, o.ruinApron);
+        o.slopeMax, o.slopeP999, o.rampMax, o.pondCols, o.bermCols);
   return o;
 }
 

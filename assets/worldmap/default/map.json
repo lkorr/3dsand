@@ -1,0 +1,42 @@
+{
+  "name": "default",
+  "about": "The shipped starting map (scripts/seed_worldmap.py). Repaint it in the tuner's World Map tab. Tier A: seed-independent.",
+  "cellLog2": 10,
+  "size": [
+    196,
+    196
+  ],
+  "originCell": [
+    98,
+    98
+  ],
+  "seaLevelY": 112,
+  "oceanFadeCells": 6,
+  "warpAmpVox": 160,
+  "biomes": [
+    "forest",
+    "meadow",
+    "pine",
+    "desert",
+    "tundra",
+    "swamp",
+    "alpine",
+    "ocean"
+  ],
+  "sites": [
+    {
+      "id": "harness",
+      "kind": "pad",
+      "min": [
+        -128,
+        -128
+      ],
+      "max": [
+        640,
+        640
+      ],
+      "about": "The selftest harness region: no tree trunks or crowns, no tarns, no cover. Keeps every fixture column (60..150 on the x==z diagonal) and the test tarn at (420,420) on the ground the gates were written against."
+    }
+  ],
+  "rules": []
+}

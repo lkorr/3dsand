@@ -5050,6 +5050,73 @@ Worldgen does not place these yet (Wave 1a deliberately does not touch it); the
 `--shot` harness paints a demo meadow, and they are brush-selectable like any
 other material.
 
+### Analytic plants and the trample field (2026-09-04)
+
+The brick path above gave every plant ONE 10 cm cell of 8³ voxels and a
+two-frame flipbook, and a meadow of it read as scattered prefab clutter that
+twitched. The tall grass had already left that path (`MICROF_STRANDS`, 2026-08-22:
+analytic blades, ray-shear sway); this generalises it. `MICROF_PLANT` replaces
+`MICROF_STRANDS`, a material's `micro.plant` block replaces `micro.strands`, and
+`tracePlant` (raymarch.wgsl) intersects four kinds of plant in closed form:
+
+| kind | primitives | column / tile |
+|---|---|---|
+| `grass` | tapered flat blades (six half-planes linear in t), seed-head ellipsoids | column |
+| `flower` | a stem blade, leaf boxes, a head: disc with petal notches / bells / spike of buds / cup | column |
+| `mushroom` | cone-frustum stem, clipped ellipsoid cap (flat gill underside), hashed spots | column (clusters) or tile (one big toadstool) |
+| `fern` | a rosette of quadratic-Bézier rachises, each three oriented boxes perforated per leaflet | tile |
+
+**Column vs tile.** A column plant lives in one column and every cell of the
+column rebuilds it from `microColumnHash` — the contract the strands had. A
+TILE plant is wider than a cell, so worldgen paints its whole footprint (`foot`²
+columns, `base+1..base+h` cells) with one material and the renderer rebuilds the
+same plant from the tile hash in every one of those cells. `plantTileAt` in
+`common.wgsl` is the ONE function both sides ask "which plant, where": tile size,
+footprint, height range and a hashed centre strictly inside the tile (so two
+tiles' footprints never overlap). Worldgen's `plantColumnAt` evaluates it once
+per column and `Col.plant` carries the answer to every cell; the base is the
+CENTRE column's ground so the plant is rigid across a slope. The species
+constants (`PLANT_FERN_*`, `PLANT_SHROOM_*`) live in `common.wgsl`, are
+transcribed to `sim/plants.h` for the `--shot` harness, and restated per
+species in `materials.json` for the loader — `check_invariants.py plants` holds
+the three equal.
+
+**One evaluation per tile per ray.** `trace()` memoises the last tile plant it
+intersected (`pKey`/`pHit`/`pT`): the first cell of a tile evaluates the plant
+UNCLIPPED and every later cell of that tile only asks whether the remembered hit
+lies inside it. A hit that falls in a cell worldgen never painted — dug out, cut
+by a trunk — is never reported, which is exactly the clipping a partial plant
+must have. Only evaluations charge `microBudget`; carried cells are free. Past
+`TUNE_MICRO_LOD_DIST` only the centre column of a tile plant stands in as the
+solid proxy; the outer eight pass as air, or a distant fern is a 30 cm cube.
+
+**What the flipbook could not do and this does:** continuous displacement in
+time (the wind is sampled once per plant at its base, every part blends the two
+gust bands with its own hash weights), taper, per-blade yaw and static lean,
+seed heads on a third of the tall blades, real flower heads, mushrooms of
+varying size in a cell and one knee-high toadstool per 7×7 tile, world-space
+normals (`MicroHit.n`, `curved`) so a cap shades as a curved surface, and a
+per-PART palette key (`MicroHit.key`) so a cap spanning nine cells is one colour.
+
+**The trample field.** A bounded ring of footprint stamps (`sim/trample.h`,
+`kTrampleCap` = 48) rides `RenderParams` exactly the way the wave-impact ring
+does: the frame loop presses one under the player and every mob each frame
+(refreshing the stamp it stands in, laying a new one every ~half radius), and
+`trampleAt` in `common.wgsl` sums them at a plant's base — flat under the foot,
+soft rim, held while pressed, recovering as `(1-r)²` over `render.trampleRecover`.
+Plants compress by `render.trampleDepth` and lean away by `render.trampleLean`.
+Render-only and never hashed, by pointer like the wind primitives (it dynamically
+indexes a uniform array in the per-cell plant path). The honest limit, stated
+so nobody re-derives it: a column plant cannot leave its column, so a trampled
+stand is a crushed mat that leans, not blades lying flat across their
+neighbours; lying flat needs the directional over-march of upstream columns,
+affordable only inside the stamp and not built.
+
+**Determinism (rule 1) is untouched**: all of this is render-side, keyed on
+`(seed, cell)` hashes and `R.time`; worldgen's half is integer hashes on the sim
+input stream, and moving the placement moved the pinned hash once, as any
+worldgen change does.
+
 ### Dynamic microvoxel bodies (2026-08-20; docs/PLAN_voxel_editor.md §C)
 
 Static micro-detail above substitutes a brick for a *grid cell*. Creatures and
@@ -7129,22 +7196,135 @@ the one model modders already read (PLAN_biomes.md §2 has the survey).
 
 ### What is live and what is scaffold — stated where the user can see it
 
-* **LIVE: tree species and weights.** The `.svtree` header bakes per-biome
-  weights in `treegen.js BIOME_ORDER` order. Those words are now DERIVED from
-  the biome files: the biome page's Save rewrites nothing in the species file
-  by itself, **Sync atlas** writes `placement.biomes` into every species file
-  and re-bakes the changed atlases (`node scripts/seed_environment.mjs --sync`
-  headlessly). The species file keeps the mirror because the bake reads one
-  file per species; the biome file is where it is EDITED. The `biomes` gate and
-  `check_invariants.py` (`biome order`) assert the mirror is current and that
-  worldgen's `B_*` ids, `treeatlas.h kBiomeCount`, `treegen.js BIOME_ORDER`,
-  `biomegen.js ENGINE_BIOMES` and `biomes.cpp kEngineBiomes` agree.
+* **LIVE (world map P1, 2026-09-04): the biome RECORD TABLE.** `worldmap.cpp`
+  packs every `assets/biomes/*.json` into the `worldMap` storage buffer
+  (binding 31, both sim layouts; `src/sim/worldmap.h` is the layout) and
+  `worldgen.wgsl` reads it through `wmBiome()/wmCover()` for: the ground skin
+  and its depth, the wedge's topsoil (`cover.skin/skinDepth/subsoil`), the
+  tree DENSITY (`trees.density`; the tile stays the global `worldgen.treeTile`
+  because the 5x5 candidate scan assumes one lattice), the per-biome cover
+  stack (`cover.plants[]`, rolled in order, first hit wins, one hash salt per
+  row, patch-masked through `vnoise2d`), the cave thresholds
+  (`caves.features` near_surface/deep), and three flags that replaced the
+  hard-coded `biome == B_DESERT/B_PINE` gates — `cover.groundFlora` (the
+  canopy-inverted undergrowth + flower layer), `cover.cacti`, `cover.sandCap`.
+  The desert tussock/scrub and pine heath floors that were shader blocks with
+  five `worldgen.*` knobs are now rows in `desert.json`/`pine.json`; the four
+  `treeChance*` knobs are gone. The alpine-cushion snowline block is still in
+  the shader (it is an ALTITUDE rule, not a biome's; it moves when the
+  landform plane lands, P4). A cover row's `maxSlope` is packed but not yet
+  enforced (P4 gives `Col` a slope).
+* **LIVE: tree species and weights, WITHOUT the bake.** `LoadTreeAtlas` takes
+  the biome set and builds the per-biome weight table from each biome file's
+  `trees.species[]` by name; the `.svtree`'s baked weight words (12..15) are
+  no longer read, so a weight edit reaches the world on the next launch and
+  `placement.biomes` in a species file is informational. **The biome id space
+  is the files:** `index` values must be exactly 0..N-1 (`ValidateBiomeSet`,
+  `check_invariants.py biome order`); the tree atlas and the record table are
+  laid out in that order and the shader reads the count from each header.
+  Eight biomes ship: forest, meadow, pine, desert, tundra, swamp, alpine,
+  ocean. `worldgen.wgsl` still names the first four by id (`B_*`) as the
+  (identity, folded-out) height curve's input until P4.
+* **LIVE (world map P2a, 2026-09-04): THE BIOME COMES FROM THE PAINTED MAP.**
+  `assets/worldmap/<worldgen.mapLayer>/` — `map.json` (cell size, extent,
+  origin cell, sea level, ocean fade, warp amplitude, the palette of biome
+  NAMES, sites, rules) beside `map.svmap` (three u8 planes: biome, landform,
+  moisture; four cells per word on the GPU). `LoadWorldMap` resolves the
+  palette by name against the biome files and `PackWorldMap` appends header
+  + planes to the same buffer as the records; `mapBiomeAt` in
+  `worldgen.wgsl` is `biomeAt` now. **Tier A is seed-independent** (the
+  plane), **Tier B takes the seed** (the boundary warp, two `vnoise2d`
+  samples, amplitude ≤ cell/4 — the loader refuses more, so a one-cell
+  region can never pinch below two tree tiles). Outside the planes the biome
+  is `ocean`. `World::MapBiomeAt` is the CPU twin; the `worldmap` gate holds
+  it to the plane at cell centres and to the GPU's ground skin in-window;
+  `check_invariants.py` (`world map layout`) holds `worldmap.h`'s word
+  offsets to the shader's `WM_*` consts. A missing or invalid map REFUSES to
+  start. The shipped `default` is `scripts/seed_worldmap.py`'s 20 km
+  starting layout (tundra north, desert east, alpine NW, swamp SE, ocean
+  ring past ~9 km, forest forced around the origin for the fixtures) — a
+  starting point for the World Map tab (P3), not a generator: the map is
+  authored data and every edit to it moves the world hash.
+* **DELETED (world map P2b, 2026-09-04): the hand-coded origin set pieces.**
+  The wood deck, the combat arena (+ its ivy, ramp, screenshots), the oil
+  pond and the lava pool, the per-tile ruin scatter (+ pad, shell, moss,
+  ivy, the `ruin*`/`wallIvyDensity`/`mossFace` knobs and the terrain gate's
+  A8), `inSpawnClearing`, `onFixturePad` and `pondInfo`'s literal keep-out
+  box and discs are gone from `worldgen.wgsl`, `world.cpp` and `main.cpp`.
+  What survives is ONE authored site read from the map: the **harness pad**
+  (`map.json` `sites[]`, kind `pad`, a world-voxel box; `WM_H_HARNESS_*` in
+  the buffer header, `inHarness`/`crownMeetsHarness` in the shader,
+  `World::InHarness` on the CPU) that keeps the fixture columns clear of
+  trunks, crowns, tarns and cover, and the **harness tarn** at (420,420) —
+  the one authored pool left, because the `waterbody` gate's `Basin(1)`,
+  the water screenshots and `perfsuite` all read it
+  (`World::kAuthoredPools` is 1). `landColumn` is now `landColumnBare`
+  with no pad to blend in. Fixture columns no longer get a loose sand cap:
+  they stand on their biome's skin like everything else — DESIGN §6 already
+  said the `armor-react`-style fix is a levelled pad, which P5's site table
+  gives every site. `RESEARCH_worldgen` §8.2's "the first landmark should
+  introduce a proper table" is P5.
+* **LIVE (world map P3, 2026-09-04): the World map page.** Environment →
+  World map (`assets/editor/map.js`) paints the biome plane (palette = the
+  biome files), the landform plane (0..255, soft brush) and the harness pad
+  box, with pan/zoom, stroke undo and a cell/world readout, and saves both
+  files through `/api/worldmap` + `/api/worldmap/planes`
+  (`scripts/tuner_server.py`, bare names, format-checked, write-then-
+  rename). The page shows the planes as painted; the Worldgen tab's
+  heightmap/voxel views show what worldgen makes of them. Every save moves
+  the world hash; the engine reads the map at boot, so regenerate to see it.
+* **LIVE (world map P4, 2026-09-04): THE LANDFORM PLANE OWNS THE CONTINENTAL
+  RUNG, and the sea is a plane.** `landAt`'s `o0` is `landformOctave(x, z)`
+  on both mirrors: `dev = ((mapLandformQ8 - 32768) * contAmplitude) >> 16`,
+  so `worldgen.contAmplitude` still says how tall the world is (one landform
+  unit = amplitude/256 voxels, 4 at the default) and the map says WHERE;
+  the gradient feeding the finer rungs' domain warp is the cell-to-cell
+  difference of the plane. `mapLandformQ8` is a Q8 bilinear over the four
+  cells around the column (cell value = its centre), clamped at the plane's
+  edge and faded to 0 over `oceanFadeCells` beyond it; it and `seaLevelY()`
+  live OUTSIDE the height mirror in both languages and the mirrored code
+  calls them by name (the `terrain` gate's C1 is the per-voxel proof). The
+  range/hill/detail/grain octaves and the spawn-plain fade are unchanged.
+  **The sea**: `landColumnBare` fills `fluid = water, fluidTop = seaLevelY`
+  wherever ground is under the map's `seaLevelY` (one global plane,
+  `RESEARCH_worldgen` §6.5 option (a)); the sediment wedge is zero under
+  it; `TerrainColumn` reports the sea as water. Landform units are coarse
+  against the fine octaves' ±84-voxel dip, so a painted map has to keep
+  land ≥ ~132 above a sea level of 112 — the default map does; the World
+  map page's landform brush is where that is authored. `LAVA_LID` is not
+  needed yet: no biome record carves caves under the sea (ocean's cave
+  thresholds are 255) and lava only pools in caves.
+* **LIVE (world map P5, 2026-09-04): THE SITE TABLE.** `map.json sites[]`
+  of kind `stamp` (a `.vox` from `assets/prefabs/`, a world column, a
+  rotation, a pad margin) and `rules[]` (`{kind: stamp, template, biome,
+  perKm2, minSpacing, rot|-1, padMargin, salt}` — resolved at load with the
+  world seed, integer hash per cell in row-major order, greedy spacing, so
+  the same seed places the same sites everywhere; Tier B). The loader packs
+  each (template, rotation) once into columns of runs in the tree atlas's
+  encoding, writes one `kS_*` record per site and a per-cell SITE INDEX
+  plane (`site id + 1`). In the shader `wmSiteAt` is one plane read per
+  column; **`sitePadAt`** (inside the height mirror, identical in
+  `world.cpp`) levels the ground under the footprint to the site centre's
+  height and ramps back over the margin — `ruinPad` generalised, and
+  `World::TerrainHeight` applies it too, so the height contract holds;
+  **`wmStampCell`** overlays the template's runs above the pad in
+  `genCellIn` (non-air replaces, air leaves the world alone) — pure
+  worldgen, so the far cascades show a stamped building at any distance
+  with nothing to patch, and the sky early-out / far blocker band include
+  `wmSiteTopAt`; **`siteKeepOut`** (the harness box or any site cell)
+  suppresses trunks, tarns and cover. A missing template refuses to start.
+  The World map page places/deletes stamp sites (`Stamp site` tool).
+  `assets/prefabs/` ships no `.vox` yet, so the default map has none; the
+  first authored one exercises the whole path. Not yet: `proc:` kinds
+  (the ruin shell is gone; a generator per kind is the follow-up plan),
+  slope-gated rules, sites larger than 512 voxels a side.
 * **LIVE: the biome band strip** on the climate section — the three worldgen
   thresholds (`meadowThreshold` / `pineThreshold` / `desertThreshold`) as one
   draggable bar writing `tuning.json`.
-* **AUTHORED, VALIDATED, PREVIEWED, NOT YET READ BY WORLDGEN:** cover plants,
-  water features, cave features, terrain overrides, tree-row conditions,
-  climate coordinates. The `biomes` gate (`src/sim/biomes.*`,
+* **AUTHORED, VALIDATED, PREVIEWED, NOT YET READ BY WORLDGEN:** water
+  features (P4/P5 of the world map), terrain overrides, tree-row and
+  cover-row `nearWater*` conditions, climate coordinates (the painted map
+  supersedes them in P2). The `biomes` gate (`src/sim/biomes.*`,
   `selftest_biomes.cpp`) loads every file and refuses an unknown species,
   preset or material, a biome `index` that is not worldgen's id for its name,
   a stale species mirror, a preset whose berm exceeds its shore lift. The

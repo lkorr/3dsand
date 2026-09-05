@@ -52,6 +52,7 @@ passes the edited file so only the relevant checks run.
 
 Exit 0 = agree. Exit 1 = a real mismatch.
 """
+import json
 import re
 import subprocess
 import sys
@@ -1199,28 +1200,168 @@ def check_biome_order():
         if not val:
             problems.append(f"biome order: cannot find the list in {name}")
             return
-    ref = wg_order
-    for name, val in lists.items():
-        if val != ref:
-            problems.append(f"biome order: {name} is {val} but worldgen.wgsl says {ref}")
-    if k is not None and k != len(ref):
-        problems.append(f"biome order: treeatlas.h kBiomeCount is {k} but worldgen has {len(ref)} biomes")
-    # And every engine biome has a file, whose index is its id.
-    for i, name in enumerate(ref):
-        p = ROOT / "assets" / "biomes" / f"{name}.json"
-        if not p.exists():
-            problems.append(f"biome order: assets/biomes/{name}.json is missing (engine biome id {i}) -- node scripts/seed_environment.mjs --seed")
+    # Since the world map's P1 the id space is the FILES: assets/biomes/*.json
+    # `index` values must be exactly 0..N-1, and the tree atlas / worldMap
+    # record tables are laid out in that order at load. worldgen.wgsl still
+    # names the first four by id (B_* until P2 retires them) and treegen.js /
+    # biomegen.js still carry the four the .svtree bake wrote positionally, so
+    # those lists must be a PREFIX of the file order, not equal to it.
+    import json as _json
+    files = {}
+    for p in (ROOT / "assets" / "biomes").glob("*.json"):
+        if p.name.startswith("_"):
             continue
         try:
-            import json as _json
             j = _json.loads(p.read_text(encoding="utf-8"))
         except Exception as e:  # noqa: BLE001
-            problems.append(f"biome order: assets/biomes/{name}.json does not parse: {e}")
+            problems.append(f"biome order: {p.name} does not parse: {e}")
             continue
-        if j.get("index") != i:
-            problems.append(f"biome order: assets/biomes/{name}.json has index {j.get('index')}, worldgen's id is {i}")
+        files[p.stem] = j.get("index")
+    n = len(files)
+    by_id = {}
+    for name, idx in files.items():
+        if not isinstance(idx, int) or idx < 0 or idx >= n:
+            problems.append(f"biome order: assets/biomes/{name}.json index {idx} is outside 0..{n - 1} -- ids must be contiguous")
+        elif idx in by_id:
+            problems.append(f"biome order: assets/biomes/{name}.json and {by_id[idx]}.json both claim index {idx}")
+        else:
+            by_id[idx] = name
+    file_order = [by_id[i] for i in range(n) if i in by_id]
+    for name, val in lists.items():
+        if file_order[:len(val)] != val:
+            problems.append(f"biome order: {name} is {val} but assets/biomes/*.json ids start {file_order[:len(val)]}")
+    if k is not None:
+        problems.append("biome order: treeatlas.h still declares kBiomeCount; the count is data now (TreeAtlas::biomeCount)")
+
+# ----------------------------------------------------------- world map layout
+def check_worldmap_layout():
+    """src/sim/worldmap.h's header/record/cover-row word offsets and flag bits
+    are re-declared in worldgen.wgsl as WM_H_* / WM_B_* / WM_C_* / WM_BF_*
+    consts. A slot moved on one side and not the other reads a neighbouring
+    field as the skin material, silently. Names map by convention:
+    kHBiomeCount -> WM_H_BIOME_COUNT, kB_TreeDensity -> WM_B_TREE_DENSITY,
+    kC_HeightVox -> WM_C_HEIGHT (explicit aliases below), kBF_X -> WM_BF_X."""
+    hdr = read("src/sim/worldmap.h")
+    wgsl = read("assets/shaders/worldgen.wgsl")
+    if not (hdr and wgsl):
+        return
+    checked.append("world map layout")
+    cpp = {}
+    for m in re.finditer(r"\b(kH\w+|kB_\w+|kC_\w+|kS_\w+|kStamp_\w+)\s*=\s*(\d+)", hdr):
+        cpp[m.group(1)] = int(m.group(2))
+    for m in re.finditer(r"kBF_(\w+)\s*=\s*1u\s*<<\s*(\d+)", hdr):
+        cpp["kBF_" + m.group(1)] = 1 << int(m.group(2))
+    wg = {m.group(1): int(m.group(2))
+          for m in re.finditer(r"const\s+(WM_\w+)\s*:\s*u32\s*=\s*(\d+)u", wgsl)}
+    def snake(name):
+        s = re.sub(r"(?<!^)(?=[A-Z])", "_", name).upper()
+        return s
+    alias = {"kB_PatchThreshold": "WM_B_PATCH_THRESH", "kB_PatchCellLog2": "WM_B_PATCH_LOG2",
+             "kB_TreeTileVox": "WM_B_TREE_TILE", "kB_CaveThreshold1": "WM_B_CAVE_T1",
+             "kB_CaveThreshold2": "WM_B_CAVE_T2", "kBiomeRecWords": "WM_B_WORDS",
+             "kCoverRowWords": "WM_C_WORDS", "kC_HeightVox": "WM_C_HEIGHT",
+             "kC_PatchThreshold": "WM_C_PATCH_THRESH", "kHBiomeRecords": "WM_H_BIOME_RECORDS",
+             "kHMaxCoverH": "WM_H_MAX_COVER_H", "kB_MaxCoverH": "WM_B_MAX_COVER_H",
+             "kHLandformPlane": "WM_H_LANDFORM_PLANE", "kHMoisturePlane": "WM_H_MOISTURE_PLANE",
+             "kSiteRecWords": "WM_S_WORDS", "kStampHdrWords": "WM_STAMP_HDR_WORDS",
+             "kS_PadMargin": "WM_S_PAD_MARGIN", "kS_StampOff": "WM_S_STAMP_OFF",
+             "kStamp_NX": "WM_STAMP_NX", "kStamp_NY": "WM_STAMP_NY", "kStamp_NZ": "WM_STAMP_NZ",
+             "kStamp_Columns": "WM_STAMP_COLUMNS"}
+    for m in re.finditer(r"\b(kBiomeRecWords|kCoverRowWords|kSiteRecWords|kStampHdrWords)\s*=\s*(\d+)", hdr):
+        cpp[m.group(1)] = int(m.group(2))
+    for name, wgname in list(alias.items()):
+        pass
+    for cname, val in cpp.items():
+        if cname in alias:
+            wname = alias[cname]
+        elif cname.startswith("kH"):
+            wname = "WM_H_" + snake(cname[2:])
+        elif cname.startswith("kB_"):
+            wname = "WM_B_" + snake(cname[3:])
+        elif cname.startswith("kC_"):
+            wname = "WM_C_" + snake(cname[3:])
+        elif cname.startswith("kS_"):
+            wname = "WM_S_" + snake(cname[3:])
+        elif cname.startswith("kBF_"):
+            wname = "WM_BF_" + snake(cname[4:])
+        else:
+            continue
+        if wname not in wg:
+            continue  # not every header word is read by the shader (yet)
+        if wg[wname] != val:
+            problems.append(f"world map layout: worldmap.h {cname} = {val} but worldgen.wgsl {wname} = {wg[wname]}")
+    # Every WM_ const the shader declares must be one the header defines.
+    known = set()
+    for cname in cpp:
+        known.add(alias.get(cname, ""))
+        if cname.startswith("kH"): known.add("WM_H_" + snake(cname[2:]))
+        elif cname.startswith("kB_"): known.add("WM_B_" + snake(cname[3:]))
+        elif cname.startswith("kC_"): known.add("WM_C_" + snake(cname[3:]))
+        elif cname.startswith("kS_"): known.add("WM_S_" + snake(cname[3:]))
+        elif cname.startswith("kBF_"): known.add("WM_BF_" + snake(cname[4:]))
+    for wname in wg:
+        if wname not in known:
+            problems.append(f"world map layout: worldgen.wgsl declares {wname} but worldmap.h has no matching word")
+
 
 # ------------------------------------------------------- far cell material bits
+def check_plant_tiles():
+    """Tile-plant geometry must agree in THREE places.
+
+    plantTileAt() in common.wgsl is what worldgen paints a footprint from and
+    what the raymarcher rebuilds the plant from; sim/plants.h is its CPU twin
+    (the --shot harness and the `plants` gate place plants with it); and each
+    species' `plant` block in materials.json restates tile/foot/minH/maxH for
+    the loader. A fern whose footprint is 3 wide in worldgen and 5 wide in the
+    renderer draws fronds into cells that were never painted -- they vanish
+    silently, with a green build and an unmoved hash. Also holds the trample
+    ring literal in common.wgsl to kTrampleCap.
+    """
+    cw = read("assets/shaders/common.wgsl")
+    ph = read("src/sim/plants.h")
+    wh = read("src/sim/world.h")
+    mj = read("assets/materials/materials.json")
+    if not (cw and ph and wh and mj):
+        return
+    checked.append("plant tiles")
+    species = {"FERN": ("Fern", "fern"), "SHROOM": ("Shroom", "mushroom_large")}
+    try:
+        mats = {m["id"]: m for m in json.loads(mj)["materials"]}
+    except Exception as e:  # noqa: BLE001
+        problems.append(f"materials.json: {e}")
+        return
+    for key, (cpp, mat_id) in species.items():
+        vals = {}
+        for field in ("TILE", "FOOT", "MINH", "MAXH"):
+            g = re.search(rf"const\s+PLANT_{key}_{field}\s*:\s*i32\s*=\s*(\d+);", cw)
+            c = re.search(rf"kPlant{cpp}{field.title().replace('h', 'H')}\s*=\s*(\d+)", ph)
+            if not g or not c:
+                problems.append(f"plant tiles: cannot find PLANT_{key}_{field} / kPlant{cpp}{field.title()}")
+                continue
+            if g.group(1) != c.group(1):
+                problems.append(
+                    f"common.wgsl PLANT_{key}_{field} = {g.group(1)} but plants.h "
+                    f"kPlant{cpp}{field.title()} = {c.group(1)}")
+            vals[field] = int(g.group(1))
+        gs = re.search(rf"const\s+PLANT_{key}_SALT\s*:\s*u32\s*=\s*(0x[0-9A-Fa-f]+)u;", cw)
+        cs = re.search(rf"kPlant{cpp}Salt\s*=\s*(0x[0-9A-Fa-f]+)u", ph)
+        if gs and cs and gs.group(1).lower() != cs.group(1).lower():
+            problems.append(f"PLANT_{key}_SALT differs between common.wgsl and plants.h")
+        m = mats.get(mat_id, {})
+        pl = (m.get("micro") or {}).get("plant") or {}
+        for field, jkey in (("TILE", "tile"), ("FOOT", "foot"), ("MINH", "minH"), ("MAXH", "maxH")):
+            if field in vals and pl.get(jkey) != vals[field]:
+                problems.append(
+                    f"materials.json {mat_id}.micro.plant.{jkey} = {pl.get(jkey)} but "
+                    f"common.wgsl PLANT_{key}_{field} = {vals[field]}")
+    cap = re.search(r"constexpr\s+uint32_t\s+kTrampleCap\s*=\s*(\d+)", wh)
+    arr = re.search(r"tramples\s*:\s*array<vec4f,\s*(\d+)>", cw)
+    if cap and arr and int(cap.group(1)) * 2 != int(arr.group(1)):
+        problems.append(
+            f"world.h kTrampleCap = {cap.group(1)} (x2 vec4) but common.wgsl "
+            f"RenderParams.tramples is array<vec4f, {arr.group(1)}>")
+
+
 def check_far_material_bits():
     """A far cascade cell is 7 bits of material id + 1 blocker flag (13.2.2).
 
@@ -1419,6 +1560,7 @@ ALL = {
     "worldgen": check_worldgen_mirror,
     "treeatlas": check_tree_atlas,
     "biomes": check_biome_order,
+    "worldmap": check_worldmap_layout,
     "runword": check_run_word_layout,
     "wgunits": check_worldgen_units,
     "wgdefaults": check_worldgen_defaults,
@@ -1437,6 +1579,7 @@ ALL = {
     "farbits": check_far_material_bits,
     "ringdepth": check_readback_ring,
     "burntint": check_burn_tint_sites,
+    "plants": check_plant_tiles,
 }
 
 # The hook passes the edited file; run only the checks that file can break.
@@ -1451,7 +1594,8 @@ RELEVANT = {
     "assets/perfview.js": ["perfscopes"],
     "src/measure/perfnodes.h": ["perfnodes", "perfscopes"],
     "src/sim/materials.cpp": ["render", "farbits"],
-    "assets/materials/materials.json": ["farbits"],
+    "assets/materials/materials.json": ["farbits", "plants"],
+    "src/sim/plants.h": ["plants"],
     "src/gpu/resources.cpp": ["world"],
     "src/test/selftest.cpp": ["arch"],
     "src/sim/world.h": ["world", "params", "substeps", "windprim",
@@ -1484,7 +1628,7 @@ if __name__ == "__main__":
                     run += checks
             if norm.endswith(".wgsl"):
                 run += ["tuning", "world", "params", "windprim",
-                        "curprim", "burntint"]
+                        "curprim", "burntint", "plants"]
         run = list(dict.fromkeys(run))
         if not run:
             sys.exit(0)  # edited file cannot break any pair

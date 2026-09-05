@@ -36,7 +36,9 @@ Status GateTreeAtlas(Ctx& c, std::string& detail) {
   TreeAtlas atlas;
   std::string log;
   const std::string dir = sandvox::AssetDir() + "/trees";
-  if (!LoadTreeAtlas(dir, c.mats, atlas, log)) {
+  biomes::BiomeSet set;
+  if (!biomes::LoadBiomeSet(sandvox::AssetDir(), c.mats, set, log) ||
+      !LoadTreeAtlas(dir, c.mats, set, atlas, log)) {
     detail = "atlas did not load: " + log;
     std::printf("tree-atlas: FAIL (%s)\n", detail.c_str());
     return Status::Fail;
@@ -133,9 +135,9 @@ Status GateTreeAtlas(Ctx& c, std::string& detail) {
   const uint32_t bt = W[treeatlas::kHBiomeTable];
   const int stride = 1 + atlas.speciesCount;
   int emptyBiomes = 0;
-  for (int b = 0; b < treeatlas::kBiomeCount; b++)
+  for (int b = 0; b < atlas.biomeCount; b++)
     if (W[bt + b * stride] == 0) emptyBiomes++;
-  if (emptyBiomes >= treeatlas::kBiomeCount) {
+  if (emptyBiomes >= atlas.biomeCount) {
     ok = false;
     why += " | no biome has a single species that wants it";
   }

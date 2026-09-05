@@ -19,6 +19,7 @@ bool Simulation::Init(const rhi::Device& device, World& world,
                       const std::vector<MaterialDef>& mats,
                       const std::vector<ReactionGpu>& reactions,
                       const MicroSet& micro, const TreeAtlas& trees,
+                      const std::vector<uint32_t>& worldMapWords,
                       const std::string& shaderDir) {
   world_ = &world;
   device_ = device;
@@ -39,6 +40,26 @@ bool Simulation::Init(const rhi::Device& device, World& world,
     std::vector<uint32_t> pad = trees.words;
     pad.resize(treeAtlasWords_, 0u);
     queue.WriteBuffer(treeAtlasBuf_, 0, pad.data(), pad.size() * 4);
+  }
+
+  // The authored world map (src/sim/worldmap.h, docs/PLAN_world_map.md). Same
+  // standing as the tree atlas above: read-only, dispatch-invariant asset data
+  // uploaded once at load, sampled per column by worldgen. Created here because
+  // it is a bind-group entry, and sized to the loaded map with a header-only
+  // floor for the same reason -- a zero-length storage binding is not legal,
+  // and "no map yet" has to be a world rather than a crash.
+  //
+  // P0 bound it EMPTY (plumbing proven with the hash pinned); P1 uploads the
+  // biome record table worldmap::PackBiomeTable produced from
+  // assets/biomes/*.json. Planes and sites extend the same words in P2/P5.
+  worldMapWords_ = std::max<size_t>(worldMapWords.size(), worldmap::kHeaderWords);
+  worldMapBuf_ = CreateBuffer(device, (uint64_t)worldMapWords_ * 4,
+                              rhi::BufferUsage::Storage | rhi::BufferUsage::CopyDst,
+                              "worldMap");
+  {
+    std::vector<uint32_t> pad = worldMapWords;
+    pad.resize(worldMapWords_, 0u);
+    queue.WriteBuffer(worldMapBuf_, 0, pad.data(), pad.size() * 4);
   }
 
   materialBuf_ = CreateBuffer(device, sizeof(MaterialGpu) * 4096,
@@ -189,6 +210,19 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         // run on the slim group and never reach genChunk, exactly like
         // pageFillList at 19.
         entry(30, T::Storage),         // genAct (per genList slot)
+        // The authored world map (docs/PLAN_world_map.md). Read-only asset
+        // data, exactly like treeAtlas at 26 -- and binding 31 in BOTH this
+        // layout and simSlimBGL_ for the same reason 17/18 and 26 are: one
+        // WGSL identifier cannot carry two binding numbers across modules that
+        // share common.wgsl, and `far`/`fardown` run on the slim group and
+        // reach the biome sampler (farSurfaceMat -> treeCanopyAt ->
+        // treeInfoAt -> biomeAt).
+        //
+        // 31 and not 27: docs/PLAN_biomes.md §5(ii) says "27 is free", which
+        // was true when it was written and stopped being true when openness
+        // (27/28), irradiance (29) and genAct (30) landed. This layout is a
+        // dense 0..30, so 31 is the first free slot.
+        entry(31, T::ReadOnlyStorage), // worldMap
     };
     simBGL_ = device.CreateBindGroupLayout(entries, std::size(entries));
 
@@ -219,6 +253,10 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         // Same binding number as in simBGL_ above; `fardown`/`far` build on
         // this layout and both reach genCell -> treeAt.
         entry(26, T::ReadOnlyStorage), // treeAtlas
+        // Same binding number as in simBGL_ above, same argument as treeAtlas:
+        // `far`/`fardown` build on this layout and both reach genCell's biome
+        // sampler, which reads the map.
+        entry(31, T::ReadOnlyStorage), // worldMap
     };
     simSlimBGL_ = device.CreateBindGroupLayout(sentries, std::size(sentries));
 
@@ -472,6 +510,7 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         b(28, world_->opennessGen),
         b(29, world_->irradiance),
         b(30, world_->genAct),
+        b(31, worldMapBuf_),
     };
     simBG_[page] = device.CreateBindGroup(simBGL_, entries, std::size(entries), "simBG");
 
@@ -486,6 +525,7 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         b(18, world_->pageFaults),
         b(24, world_->waterBodyState),
         b(26, treeAtlasBuf_),
+        b(31, worldMapBuf_),
     };
     simSlimBG_[page] =
         device.CreateBindGroup(simSlimBGL_, sentries, std::size(sentries), "simSlimBG");
@@ -1110,6 +1150,7 @@ const rhi::Buffer& Simulation::PassBuffer(pass::Buf b) const {
     case B::GenAct:              return world_->genAct;
     case B::WaterBodyState:      return world_->waterBodyState;
     case B::TreeAtlas:           return treeAtlasBuf_;
+    case B::WorldMap:            return worldMapBuf_;
     default:                return world_->voxels;
   }
 }

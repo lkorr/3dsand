@@ -125,7 +125,12 @@ const biomeNames = list(BIOMES);
 const speciesNames = list(TREES);
 ok(biomeNames.length >= 4, 'assets/biomes/ has ' + biomeNames.length + ' biome files');
 for (const n of BG.ENGINE_BIOMES) ok(biomeNames.includes(n), 'engine biome "' + n + '" has a file');
-ok(JSON.stringify(BG.ENGINE_BIOMES) === JSON.stringify(TG.BIOME_ORDER), 'biomegen.ENGINE_BIOMES == treegen.BIOME_ORDER (the .svtree header order)');
+// Since the world map's P1 the engine's biome id space is the biome FILES
+// (ENGINE_BIOMES, 0..N-1) and the .svtree's baked weight words are not read;
+// treegen.js BIOME_ORDER is only the four positional words the bake still
+// writes, so it must be a PREFIX of the id space, not equal to it.
+ok(JSON.stringify(BG.ENGINE_BIOMES.slice(0, TG.BIOME_ORDER.length)) === JSON.stringify(TG.BIOME_ORDER),
+   'treegen.BIOME_ORDER is a prefix of biomegen.ENGINE_BIOMES (the biome id space)');
 const biomes = biomeNames.map(n => BG.normalizeBiome(readJson(join(BIOMES, n + '.json'))));
 const libs = {trees: new Set(speciesNames), water: new Set(presetNames), materials: MATNAMES};
 for (const b of biomes) {
@@ -133,18 +138,31 @@ for (const b of biomes) {
   ok(bad.length === 0, b.name + ': valid' + (bad.length ? ' — ' + bad.join('; ') : ''));
   const file = b.name;
   ok(b.index === BG.ENGINE_BIOMES.indexOf(file), b.name + ': index ' + b.index + ' matches worldgen id ' + BG.ENGINE_BIOMES.indexOf(file));
-  ok(b.trees.species.length > 0, b.name + ': lists ' + b.trees.species.length + ' tree species');
-  ok(b.water.features.length > 0, b.name + ': lists ' + b.water.features.length + ' water bodies');
+  // A biome with zero tree density (the ocean) legitimately lists nothing:
+  // it IS water and grows no trees. Everything else must name at least one
+  // species and one body-of-water preset, or the tab is showing an empty stack.
+  if (b.trees.density > 0) {
+    ok(b.trees.species.length > 0, b.name + ': lists ' + b.trees.species.length + ' tree species');
+    ok(b.water.features.length > 0, b.name + ': lists ' + b.water.features.length + ' water bodies');
+  } else {
+    ok(true, b.name + ': tree density 0 -- ' + b.trees.species.length + ' species, ' + b.water.features.length + ' water bodies (nothing required)');
+  }
 }
 
-/* ---- 4. the mirror: species placement.biomes == biome files ------------------- */
-console.log('\n-- species weight mirror --');
+/* ---- 4. the mirror: species placement.biomes vs biome files (informational) --- */
+// Since the world map's P1 the engine builds the tree weight table from the
+// biome files at load and never reads the .svtree's baked weight words, so
+// `placement.biomes` in a species file is a DISPLAY mirror for the Trees page,
+// not an authority. A stale mirror is reported, never failed; `node
+// scripts/seed_environment.mjs --sync` refreshes it.
+console.log('\n-- species weight mirror (informational) --');
 for (const sp of speciesNames) {
   const j = readJson(join(TREES, sp + '.json'));
   const want = BG.speciesWeightsFrom(biomes, sp);
   const have = (j.placement && j.placement.biomes) || {};
-  ok(BG.speciesWeightsMatch(biomes, sp, have), sp + ': ' + JSON.stringify(have) +
-     (BG.speciesWeightsMatch(biomes, sp, have) ? '' : ' != biomes say ' + JSON.stringify(want) + ' — run node scripts/seed_environment.mjs --sync'));
+  const same = BG.speciesWeightsMatch(biomes, sp, have);
+  ok(true, sp + ': ' + (same ? 'mirror current' : 'mirror stale (' + JSON.stringify(have) +
+     ' vs biomes ' + JSON.stringify(want) + ') -- node scripts/seed_environment.mjs --sync to refresh the Trees page'));
 }
 
 /* ---- 5. the swatch --------------------------------------------------------------- */
@@ -200,6 +218,44 @@ console.log('\n-- swatch --');
       if (big.cells[i] !== want) okRemap = false;
     }
     ok(okRemap, 'remapToMaterials: in place, by name, state nibble kept, nothing missing');
+  }
+}
+
+/* ---- 6. the world map ---------------------------------------------------------- */
+// assets/worldmap/default is what the engine boots on; the World map page
+// reads and writes the same two files. Pure checks: the planes parse, agree
+// with map.json, name only biomes that have files, and the harness pad is a
+// box. src/sim/worldmap.h is the authority for the format.
+console.log('\n-- world map --');
+{
+  const MAP = join(ROOT, 'assets', 'worldmap', 'default');
+  ok(existsSync(join(MAP, 'map.json')) && existsSync(join(MAP, 'map.svmap')), 'assets/worldmap/default has map.json + map.svmap');
+  if (existsSync(join(MAP, 'map.json')) && existsSync(join(MAP, 'map.svmap'))) {
+    const j = readJson(join(MAP, 'map.json'));
+    const raw = readFileSync(join(MAP, 'map.svmap'));
+    const dv = new DataView(raw.buffer, raw.byteOffset, raw.byteLength);
+    const [w, h] = j.size;
+    ok(dv.getUint32(0, true) === 0x504D5653 && dv.getUint32(4, true) === 1, 'map.svmap magic SVMP v1');
+    ok(dv.getUint32(8, true) === w && dv.getUint32(12, true) === h, `map.svmap is ${w}x${h} like map.json`);
+    ok(raw.length === 16 + w * h * 3, `map.svmap holds three ${w}x${h} planes`);
+    const biomeFiles = new Set(readdirSync(join(ROOT, 'assets', 'biomes')).filter(f => f.endsWith('.json') && f[0] !== '_').map(f => f.slice(0, -5)));
+    ok(j.biomes.every(n => biomeFiles.has(n)), 'every palette name has a biome file: ' + j.biomes.join(','));
+    let maxIdx = 0;
+    for (let i = 16; i < 16 + w * h; i++) maxIdx = Math.max(maxIdx, raw[i]);
+    ok(maxIdx < j.biomes.length, `biome plane indices < palette size (${maxIdx} < ${j.biomes.length})`);
+    ok(j.warpAmpVox >= 0 && j.warpAmpVox <= (1 << j.cellLog2) / 4, `warpAmpVox ${j.warpAmpVox} <= cell/4`);
+    const pad = (j.sites || []).find(s => s.kind === 'pad');
+    ok(!!pad && pad.min[0] <= pad.max[0] && pad.min[1] <= pad.max[1], 'a harness pad box exists and is a box');
+    ok(!!pad && pad.min[0] <= 60 && pad.max[0] >= 420 && pad.min[1] <= 60 && pad.max[1] >= 420, 'the pad covers the fixture columns and the (420,420) tarn');
+    // stamp sites and rules (P5): every template named must exist as a .vox,
+    // because the engine refuses to start otherwise.
+    const prefabs = new Set(existsSync(join(ROOT, 'assets', 'prefabs')) ? readdirSync(join(ROOT, 'assets', 'prefabs')).filter(f => f.endsWith('.vox')).map(f => f.slice(0, -4)) : []);
+    const stamps = (j.sites || []).filter(s => s.kind === 'stamp');
+    ok(stamps.every(s => typeof s.template === 'string' && Number.isInteger(s.x) && Number.isInteger(s.z)), `${stamps.length} stamp site(s) carry template/x/z`);
+    ok(stamps.every(s => prefabs.has(s.template)), 'every stamp site names an existing assets/prefabs/<template>.vox');
+    const rules = (j.rules || []);
+    ok(rules.every(r => r.kind !== 'stamp' || (typeof r.template === 'string' && j.biomes.includes(r.biome) && r.perKm2 >= 0)), `${rules.length} rule(s) name a template, a palette biome and a perKm2`);
+    ok(rules.every(r => r.kind !== 'stamp' || prefabs.has(r.template)), 'every rule names an existing assets/prefabs/<template>.vox');
   }
 }
 

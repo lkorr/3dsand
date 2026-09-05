@@ -129,6 +129,9 @@ const char* const kOrder[] = {
     // checked. No world, no GPU, nothing left behind.
     "biomes",
     "terrain",
+    // Right after terrain, on the same pristine world: the painted map's
+    // biome reaches the kernel (CPU twin at cell centres, GPU skin in-window).
+    "worldmap",
     // SECOND, and it wants the same thing `terrain` does: pristine worldgen at
     // an unmoved origin. Its whole subject is the ANALYTIC basin registry, and
     // the authored lake at (420,420) has to be resident for that to mean
@@ -151,7 +154,7 @@ const char* const kOrder[] = {
     // const-folded, so they do not exist without a reload) and restores the
     // baseline tuning before returning. It leaves no world state behind, so
     // it sits with the other rendering gates rather than at either end.
-    "screenshots", "fire-depth", "shadow-cache", "openness", "gi-bounce", "gi-nightfall",
+    "screenshots", "fire-depth", "shadow-cache", "openness", "gi-bounce", "gi-nightfall", "plants",
     // With the other render gates: `body-shade` runs its own worldgen and is
     // the one gate that draws a RIGIDBODY. It writes the body instance buffer
     // directly (like `fire-depth`) rather than going through the DebrisSystem,

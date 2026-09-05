@@ -1,28 +1,56 @@
 {
-  "name": "forest",
-  "displayName": "Forest",
-  "index": 0,
+  "name": "swamp",
+  "displayName": "Swamp",
+  "index": 5,
   "climate": {
-    "temperature": 0.55,
-    "moisture": 0.65,
-    "notes": "The default band of the biome noise: between meadowThreshold and pineThreshold."
+    "temperature": 0.6,
+    "moisture": 0.95,
+    "notes": "The wettest cell of the climate grid: mud underfoot, standing water everywhere, willows and reeds."
   },
   "terrain": {
     "overrides": {}
   },
   "cover": {
-    "skin": "grass",
-    "skinDepth": 1,
+    "skin": "shore_mud",
+    "skinDepth": 2,
     "subsoil": "dirt",
     "patch": {
-      "threshold": 0,
+      "threshold": 60,
       "cellLog2": 5
     },
     "plants": [
       {
+        "material": "cattail",
+        "head": "cattail_head",
+        "chance": 12,
+        "height": 0.9,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0
+        }
+      },
+      {
+        "material": "horsetail",
+        "head": "",
+        "chance": 14,
+        "height": 0.6,
+        "conditions": {
+          "minY": -1,
+          "maxY": -1,
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0
+        }
+      },
+      {
         "material": "fern",
         "head": "",
-        "chance": 16,
+        "chance": 20,
         "height": 0.4,
         "conditions": {
           "minY": -1,
@@ -34,10 +62,10 @@
         }
       },
       {
-        "material": "flower_bluebell",
+        "material": "moss_patch",
         "head": "",
-        "chance": 40,
-        "height": 0.2,
+        "chance": 24,
+        "height": 0.1,
         "conditions": {
           "minY": -1,
           "maxY": -1,
@@ -48,37 +76,9 @@
         }
       },
       {
-        "material": "mushroom_cluster",
+        "material": "marsh_grass",
         "head": "",
-        "chance": 90,
-        "height": 0.2,
-        "conditions": {
-          "minY": -1,
-          "maxY": -1,
-          "maxSlope": 1024,
-          "nearWaterMax": -1,
-          "nearWaterMin": 0,
-          "patchThreshold": 0
-        }
-      },
-      {
-        "material": "bramble",
-        "head": "",
-        "chance": 60,
-        "height": 0.4,
-        "conditions": {
-          "minY": -1,
-          "maxY": -1,
-          "maxSlope": 1024,
-          "nearWaterMax": -1,
-          "nearWaterMin": 0,
-          "patchThreshold": 0
-        }
-      },
-      {
-        "material": "grass_tuft",
-        "head": "",
-        "chance": 9,
+        "chance": 5,
         "height": 0.2,
         "conditions": {
           "minY": -1,
@@ -92,24 +92,12 @@
     ]
   },
   "trees": {
-    "tile": 5.6,
-    "density": 48,
+    "tile": 14.4,
+    "density": 45,
     "species": [
       {
-        "species": "oak",
-        "weight": 42,
-        "conditions": {
-          "minY": -1,
-          "maxY": -1,
-          "maxSlope": 1024,
-          "nearWaterMax": -1,
-          "nearWaterMin": 0,
-          "patchThreshold": 0
-        }
-      },
-      {
-        "species": "great_oak",
-        "weight": 12,
+        "species": "willow",
+        "weight": 30,
         "conditions": {
           "minY": -1,
           "maxY": -1,
@@ -121,67 +109,7 @@
       },
       {
         "species": "birch",
-        "weight": 18,
-        "conditions": {
-          "minY": -1,
-          "maxY": -1,
-          "maxSlope": 1024,
-          "nearWaterMax": -1,
-          "nearWaterMin": 0,
-          "patchThreshold": 0
-        }
-      },
-      {
-        "species": "pine",
-        "weight": 14,
-        "conditions": {
-          "minY": -1,
-          "maxY": -1,
-          "maxSlope": 1024,
-          "nearWaterMax": -1,
-          "nearWaterMin": 0,
-          "patchThreshold": 0
-        }
-      },
-      {
-        "species": "spruce",
-        "weight": 4,
-        "conditions": {
-          "minY": -1,
-          "maxY": -1,
-          "maxSlope": 1024,
-          "nearWaterMax": -1,
-          "nearWaterMin": 0,
-          "patchThreshold": 0
-        }
-      },
-      {
-        "species": "redwood",
-        "weight": 3,
-        "conditions": {
-          "minY": -1,
-          "maxY": -1,
-          "maxSlope": 1024,
-          "nearWaterMax": -1,
-          "nearWaterMin": 0,
-          "patchThreshold": 0
-        }
-      },
-      {
-        "species": "willow",
-        "weight": 6,
-        "conditions": {
-          "minY": -1,
-          "maxY": -1,
-          "maxSlope": 1024,
-          "nearWaterMax": 6,
-          "nearWaterMin": 0,
-          "patchThreshold": 0
-        }
-      },
-      {
-        "species": "eucalyptus",
-        "weight": 5,
+        "weight": 8,
         "conditions": {
           "minY": -1,
           "maxY": -1,
@@ -193,7 +121,7 @@
       },
       {
         "species": "bush",
-        "weight": 16,
+        "weight": 10,
         "conditions": {
           "minY": -1,
           "maxY": -1,
@@ -205,7 +133,7 @@
       },
       {
         "species": "dead",
-        "weight": 4,
+        "weight": 6,
         "conditions": {
           "minY": -1,
           "maxY": -1,
@@ -220,26 +148,26 @@
   "water": {
     "features": [
       {
-        "preset": "tarn",
-        "tile": 44.8,
-        "rarity": 4,
+        "preset": "marsh",
+        "tile": 25.6,
+        "rarity": 2,
         "conditions": {
           "minY": -1,
           "maxY": -1,
-          "maxSlope": 96,
+          "maxSlope": 64,
           "nearWaterMax": -1,
           "nearWaterMin": 0,
           "patchThreshold": 0
         }
       },
       {
-        "preset": "spring_pool",
-        "tile": 25.6,
-        "rarity": 12,
+        "preset": "kettle",
+        "tile": 44.8,
+        "rarity": 8,
         "conditions": {
           "minY": -1,
           "maxY": -1,
-          "maxSlope": 160,
+          "maxSlope": 96,
           "nearWaterMax": -1,
           "nearWaterMin": 0,
           "patchThreshold": 0
@@ -251,7 +179,7 @@
     "features": [
       {
         "preset": "near_surface",
-        "threshold": 150,
+        "threshold": 200,
         "rarity": 1,
         "conditions": {
           "minY": -1,

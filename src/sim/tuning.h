@@ -2549,6 +2549,7 @@ struct Tuning {
     float opennessReach = 12.0f;        // metres a hemisphere ray looks
     int opennessChunksPerFrame = 256;   // slots the rolling refresh walks/tick
     float opennessStrength = 1.0f;      // 0 = old lerp AND the pass unrecorded
+    float opennessFloor = 0.3f;         // least ambient multiplier an enclosed face keeps
     int opennessBilinear = 1;           // blend the 4 blocks in the face plane
 
     // ---- one-bounce indirect light (docs/PLAN_gi.md §3) ----
@@ -2603,7 +2604,6 @@ struct Tuning {
     // widening this band makes more liquids inherit water's look.
     float subClearLow = 0.62f, subClearHigh = 0.82f;
 
-    float opennessFloor = 0.3f;         // least ambient multiplier an enclosed face keeps
     // Faint directional glow toward the surface when submerged in a medium
     // too dense to see through. A near-opaque liquid gates off Snell's window,
     // and what that left was a featureless field of colour with no sense of up
@@ -2727,6 +2727,20 @@ struct Tuning {
     // cell walls, and anything past that shears blade tips through the wall
     // where the nested DDA never marches them — they vanish, not clip.
     float microSwayAmp = 1.5f;
+    // ---- trample (render-only; DESIGN.md §9 "Analytic plants") ----
+    // Seconds a flattened plant takes to stand back up after the presser
+    // leaves. The press-in itself is fixed (~0.12 s) because a foot lands
+    // faster than anything worth tuning.
+    float trampleRecover = 1.4f;
+    // How far a fully trampled plant compresses: 0.8 leaves 20% of its height.
+    float trampleDepth = 0.8f;
+    // Lateral lean of a fully trampled plant's tip, in cells, AWAY from the
+    // presser. Clamped inside the plant's own column by the renderer, so past
+    // ~0.4 it saturates rather than shearing blades into neighbour cells.
+    float trampleLean = 0.35f;
+    // Multiplier on a presser's collision half-width to get its stamp radius:
+    // feet reach a little past the capsule, and grass bends past the foot.
+    float trampleRadius = 1.5f;
     // FOLIAGE-LOCAL trim on the wind clock, applied on top of wind.gustSpeed.
     // It used to be the band rate outright; since the wind rewrite the field
     // itself owns that (windAt in common.wgsl, wind.gustSpeed), and this is a
@@ -2879,8 +2893,6 @@ struct Tuning {
         curveDesert6 = 8192, curveDesert7 = 12288, curveDesert8 = 16384;
     int biomeBlend = 18;
     int treeTile = 144;
-    int treeChanceForest = 78, treeChancePine = 70;
-    int treeChanceMeadow = 22, treeChanceDesert = 6;
     int autumnFraction = 5;   // 1-in-N broadleaves turn autumn
     int pondTile = 448, pondChance = 4, pondRadiusMin = 48, pondRadiusSpan = 32;
     // Steepest ground a tarn may sit on, |dh/dx|+|dh/dz| in Q8 (256 = the
@@ -2930,41 +2942,28 @@ struct Tuning {
     // kind of divergence the .svtree bake exists to end: the tuner's Trees tab
     // is the only tree authoring surface now, so a decoration is either baked
     // into the atlas or it does not exist. Wall ivy is not tree decoration.
-    int wallIvyDensity = 3;          // 1..8, arena + ruin stone-wall coverage
     // ---- desert / pine highland / alpine ground cover ----
     // Percent of 2.5 m tiles in the desert that hold a cactus, and the percent
     // of those that are tall saguaro columns rather than ground-level barrels.
     // Saguaros are landmarks: keep them occasional or the desert reads as a
     // planted grid rather than as somewhere you cross to find one.
     int cactusChance = 26, saguaroFraction = 22;
-    // 1-in-N per desert column, inside desertPatch. Tussock is the common
-    // species (it is what makes bare sand read as ground rather than as a
-    // texture); scrub is the sparse woody accent.
-    int tussockChance = 9, scrubChance = 26;
-    int desertPatch = 130;           // vnoise 0..255 gate; higher = barer
-    // 1-in-N per pine-highland column, inside heathPatch: the huckleberry and
-    // juniper floor under a conifer stand.
-    int heathChance = 7, heathPatch = 128;
+    // The desert tussock/scrub and pine heath floors are no longer knobs: they
+    // are rows in assets/biomes/desert.json and pine.json (cover.plants),
+    // packed into the worldMap buffer's biome records (worldmap.h, P1).
     // 1-in-N per column above TREELINE. The sparsest density here on purpose —
     // the snowline is meant to read as harsh, so this is the one knob that can
     // undo the intent of the whole alpine band by being made generous.
     int alpineChance = 40;
-    int ruinChance = 5;
     // Ruin pads: the footprint is flattened to the median of its four corner
-    // column heights and ramped back to the terrain over ruinPadMargin columns;
-    // a site whose corners disagree by more than ruinMaxSlope is refused.
-    // Keep ruinMaxSlope under 2*ruinPadMargin — see the note in
     // tuning_params.def, the apron's own step is what the angle of repose
     // bounds.
-    int ruinPadMargin = 20, ruinMaxSlope = 20;
     int caveThreshold1 = 150, caveThreshold2 = 148;
     // Cave flora: 1-in-N per column on the one cell that is the band's floor
     // (mushrooms, shallow band) or its floor and ceiling (crystal, deep band),
-    // inside a patch mask. mossFace picks which wall face wears moss --
     // 0 = -Z, 1 = +X, 2 = +Z, 3 = -X -- because worldgen has no sun and a
     // shaded face here is a convention, not a measurement.
     int caveMushroomChance = 26, caveCrystalChance = 9;
-    int mossFace = 0;
     // ---- the authored edit layer (src/sim/worldedit.h) ---------------------
     // Names assets/worldedits/<editLayer>.svedit, the hand-built patch the
     // Worldgen tab's voxel view writes. Applied through the MutationQueue to
@@ -2975,6 +2974,13 @@ struct Tuning {
     // construction (it puts voxels in the world), so a shipped default would
     // silently re-pin every determinism number in tests/baseline.json.
     std::string editLayer;
+    // ---- the authored world map (src/sim/worldmap.h) ------------------------
+    // Names assets/worldmap/<mapLayer>/{map.json,map.svmap}: the painted
+    // biome/landform planes and the site table worldgen reads instead of
+    // deriving biome from noise. Unlike editLayer this is NOT optional --
+    // "default" ships, and a missing or unparsable map ABORTS at load rather
+    // than silently generating an all-ocean or all-forest world.
+    std::string mapLayer = "default";
   } worldgen;
 
   // Values that failed validation, for the overlay / console. Empty on success.
