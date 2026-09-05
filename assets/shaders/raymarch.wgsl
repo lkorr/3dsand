@@ -2883,18 +2883,63 @@ fn traceFar(ro : vec3f, rdIn : vec3f, tStart : f32, px : vec2f) -> FarHit {
     else if (tmin.z > tmin.x && tmin.z > tmin.y) { axis = 2; }
     var tCur = t;
 
+    // Where this level's COVERAGE ends, for the seam below: the box exit
+    // unless the step budget runs out first. A ray that exhausts
+    // TUNE_FAR_STEPS used to hand the next level its box EXIT anyway, so the
+    // stretch between where it stopped and the box edge was marched by nobody
+    // and a grazing ray over a long terrain band could open a sky-coloured hole
+    // in a hillside. Now the next (coarser) level picks up at the stop point:
+    // the budget is an LOD handoff, not a cliff, and farSteps can be tuned for
+    // the frame instead of for the worst ray.
+    var tStop = tExit;
+
     for (var i = 0; i < TUNE_FAR_STEPS; i++) {
       rsAdd(RS_FAR, 1u);
+      if (i == TUNE_FAR_STEPS - 1) { tStop = tCur; }
       if (!farInBox(cell, org)) { break; }
-      if (farOcc[farOccIndex(level, cell)] == 0u) {
-        // empty level chunk: jump to its exit face (same seam-safe jump as
-        // the fine march — force the crossing on the exit axis)
-        let ch = worldChunkOf(cell);
-        let clo = vec3f(ch * i32(CHUNK));
-        let e0 = (clo - roL) * inv;
-        let e1 = (clo + f32(CHUNK) - roL) * inv;
-        let ex = max(e0, e1);
-        let tOut = max(min(ex.x, min(ex.y, ex.z)), tCur);
+      let occ = farOcc[farOccIndex(level, cell)];
+      let ch = worldChunkOf(cell);
+      // Where this level chunk ends along the ray, for the two skips below.
+      let clo = vec3f(ch * i32(CHUNK));
+      let ex = max((clo - roL) * inv, (clo + f32(CHUNK) - roL) * inv);
+      let tOut = max(min(ex.x, min(ex.y, ex.z)), tCur);
+      var toExit = occ == 0u;
+      if (!toExit) {
+        // ---- THE ROW SKIP (the farOcc word, common.wgsl) ----
+        // Above the chunk's highest non-empty row there is nothing to hit. An
+        // ascending ray leaves through the exit face; a descending one drops
+        // straight onto that row — the DDA resumes there with the y crossing
+        // forced, exactly as the seam-safe chunk jump forces its exit axis.
+        // Every cell skipped is air by the producers' own accounting, so the
+        // hit (and the miss) is the one the cell-by-cell march would find.
+        let top = farOccTop(occ);
+        let yTop = ch.y * i32(CHUNK) + i32(top);
+        if (top != 0u && cell.y >= yTop) {
+          let tPlane = max((f32(yTop) - roL.y) * inv.y, tCur);
+          if (rd.y >= 0.0 || tPlane + 1e-4 >= tOut) {
+            toExit = true;
+          } else {
+            t = tPlane + 1e-4;
+            if (t >= tExit) { break; }
+            p = roL + rd * t;
+            var nc = vec3<i32>(floor(p));
+            nc.y = yTop - 1;
+            if (!farInBox(nc, org)) { break; }
+            cell = nc;
+            for (var a = 0; a < 3; a++) {
+              let boundary = f32(cell[a]) + select(0.0, 1.0, rd[a] > 0.0);
+              tMax[a] = (boundary - roL[a]) * inv[a];
+            }
+            tCur = t;
+            axis = 1;
+            continue;
+          }
+        }
+      }
+      if (toExit) {
+        // empty level chunk (or nothing left in it above the ray): jump to its
+        // exit face (same seam-safe jump as the fine march — force the
+        // crossing on the exit axis)
         t = tOut + 1e-4;
         if (t >= tExit) { break; }
         p = roL + rd * t;
@@ -2966,8 +3011,9 @@ fn traceFar(ro : vec3f, rdIn : vec3f, tStart : f32, px : vec2f) -> FarHit {
     // Level k -> k+1 seam. The outer level's cells are 2s fine voxels, so half
     // a coarse cell is s: pull this handoff up to s nearer and the ring where
     // level k's box ends dissolves. Still max()'d against the running tPrev so
-    // the start can never precede an even earlier level's coverage.
-    tPrev = max(tPrev, tExit * s - dith * 2.0 * s);
+    // the start can never precede an even earlier level's coverage. tStop is
+    // the box exit, or the stop point of a ray that ran out of steps (above).
+    tPrev = max(tPrev, tStop * s - dith * 2.0 * s);
   }
   return out;
 }
@@ -2996,10 +3042,21 @@ fn traceFar(ro : vec3f, rdIn : vec3f, tStart : f32, px : vec2f) -> FarHit {
 // level's cells, so the shadow reaches the same distance into the world at
 // every level and the step count falls out of the geometry. The clamp bounds
 // both ends: never so few steps that a coarse level cannot leave its own cell,
-// never more than the old cap, which is what protects the frame.
+// never more than the cap, which is what protects the frame.
+//
+// THE CAP IS 64, AND THE REACH SHIPS AT 24 m (2026-09-04). Since the LOD-seam
+// pass stopped treating the blocker flag as a caster, an unshadowed far ray
+// walks its whole reach instead of stopping in the flagged row: measured on
+// the owner's live flight, 38 far-shadow steps per PIXEL over a frame that was
+// 81% cascade, 74 M steps a frame against 264 M for the far march itself. A
+// caster that matters at cascade range is a canopy or a ridge within a few
+// tens of metres of its receiver (a 10 m tree at 30 deg sun casts ~17 m);
+// levels >= 3 floor at TUNE_SHADOW_FAR_LIFT anyway, so the long tail of the
+// reach bought nothing visible. At 24 m: level 1 runs 64 steps (12.8 m at
+// 20 cm cells), level 2 60, level 3 30, level 4 15.
 fn farShadowSteps(level : u32) -> i32 {
   let cellM = f32(1u << farCellShift(level)) * VOXEL_METERS;
-  return clamp(i32(TUNE_FAR_SHADOW_REACH / max(cellM, 1e-4)), 8, 128);
+  return clamp(i32(TUNE_FAR_SHADOW_REACH / max(cellM, 1e-4)), 8, 64);
 }
 
 // Which cascade level covers a point, given as a distance from the camera in
@@ -3058,14 +3115,41 @@ fn farShadowDist(level : u32, roFine : vec3f) -> f32 {
   for (var i = 0; i < steps; i++) {
     rsAdd(RS_FAR_SHADOW, 1u);
     if (!farInBox(cell, org)) { return -1.0; }
-    if (farOcc[farOccIndex(level, cell)] == 0u) {
-      // empty level chunk: jump to its exit face (seam-safe, as in traceFar)
-      let ch = worldChunkOf(cell);
-      let clo = vec3f(ch * i32(CHUNK));
-      let e0 = (clo - roL) * inv;
-      let e1 = (clo + f32(CHUNK) - roL) * inv;
-      let ex = max(e0, e1);
-      let tOut = max(min(ex.x, min(ex.y, ex.z)), tCur);
+    let occ = farOcc[farOccIndex(level, cell)];
+    let ch = worldChunkOf(cell);
+    let clo = vec3f(ch * i32(CHUNK));
+    let ex = max((clo - roL) * inv, (clo + f32(CHUNK) - roL) * inv);
+    let tOut = max(min(ex.x, min(ex.y, ex.z)), tCur);
+    var toExit = occ == 0u;
+    if (!toExit) {
+      // The row skip (traceFar has the full note): a sun ray that has climbed
+      // above the chunk's highest non-empty row cannot be blocked in it.
+      let top = farOccTop(occ);
+      let yTop = ch.y * i32(CHUNK) + i32(top);
+      if (top != 0u && cell.y >= yTop) {
+        let tPlane = max((f32(yTop) - roL.y) * inv.y, tCur);
+        if (rd.y >= 0.0 || tPlane + 1e-4 >= tOut) {
+          toExit = true;
+        } else {
+          let t = tPlane + 1e-4;
+          if (t >= tExit) { return -1.0; }
+          let p = roL + rd * t;
+          var nc = vec3<i32>(floor(p));
+          nc.y = yTop - 1;
+          if (!farInBox(nc, org)) { return -1.0; }
+          cell = nc;
+          for (var a = 0; a < 3; a++) {
+            let boundary = f32(cell[a]) + select(0.0, 1.0, rd[a] > 0.0);
+            tMax[a] = (boundary - roL[a]) * inv[a];
+          }
+          tCur = t;
+          continue;
+        }
+      }
+    }
+    if (toExit) {
+      // empty level chunk (or nothing left above the ray): jump to its exit
+      // face (seam-safe, as in traceFar)
       let t = tOut + 1e-4;
       if (t >= tExit) { return -1.0; }
       let p = roL + rd * t;

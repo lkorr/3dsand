@@ -243,25 +243,33 @@ const UG_COVER_DEEP : i32 = 190;
 // 1-in-N per column, inside the relevant patch mask. These are the densities
 // that make the floor read as dense without paving it: a fern every ~7 columns
 // inside a fern bank is a bank you push through, one every 2 is a hedge.
-const UG_FERN_CHANCE    : u32 = 7u;
+//
+// HALVED ACROSS THE BOARD on 2026-09-04 (every 1-in-N below doubled, every
+// percent halved, and the same in flowerAt, the shore/pond tuning rows and
+// the biome cover rows): the ground layer was the largest single term in
+// worldgen and the far refill while flying — a column inside a fern footprint
+// pays a second landColumn and a 25-tile tree scan (plantSiteAt), and every
+// placed cell is one the renderer treats as a micro model. Density is a look
+// knob; halve it here, not by lowering the render LOD.
+const UG_FERN_CHANCE    : u32 = 14u;
 // TILE PLANTS (ferns, big toadstools): percent of tiles inside the patch mask
 // that grow one. Tile size / footprint / height live in common.wgsl as the
 // PLANT_* consts because the renderer rebuilds the plant from the same hash.
-const PLANT_FERN_CHANCE   : u32 = 45u;
-const PLANT_SHROOM_CHANCE : u32 = 5u;
+const PLANT_FERN_CHANCE   : u32 = 22u;
+const PLANT_SHROOM_CHANCE : u32 = 3u;
 const UG_FERN_PATCH     : i32 = 140;    // vnoise 0..255; ~40% of the area
-const UG_MOSS_CHANCE    : u32 = 3u;
+const UG_MOSS_CHANCE    : u32 = 6u;
 const UG_MOSS_PATCH     : i32 = 150;
-const UG_BRAMBLE_CHANCE : u32 = 23u;
+const UG_BRAMBLE_CHANCE : u32 = 46u;
 const UG_SAPLING_CHANCE : u32 = 900u;   // rare on purpose: it reads as a TREE
-const UG_LITTER_CHANCE  : u32 = 4u;     // the default floor of a wood
-const UG_LITTER_EDGE_CHANCE : u32 = 11u;  // thinner, past the crown rim
+const UG_LITTER_CHANCE  : u32 = 8u;     // the default floor of a wood
+const UG_LITTER_EDGE_CHANCE : u32 = 22u;  // thinner, past the crown rim
 
 // Mushrooms ring the BOLE. Radius in voxels (a great oak's ring is wider, via
 // the per-tree jitter added at the call site); the inner d2 > 9 keeps them off
 // the trunk cells themselves.
 const UG_SHROOM_RING : i32 = (11 * VLEN_NUM) / VLEN_DEN;
-const UG_SHROOM_BASE_CHANCE : u32 = 3u;
+const UG_SHROOM_BASE_CHANCE : u32 = 6u;
 
 // Biomes, from the low-frequency biome field (see biomeAt).
 const B_FOREST : u32 = 0u;   // dominant: grass over dirt, dense trees
@@ -2434,8 +2442,9 @@ fn flowerAt(x : i32, z : i32, seed : u32, cover : i32) -> Flower {
     let tg = vnoise(x + 501, z - 267, 15 * HSCALE, seed ^ 0x7A55u);
     if (tg > 176) {
       let hTall = hash3(seed ^ 0x7A56u, bitcast<u32>(x), bitcast<u32>(z));
-      let dens = min(u32(tg - 176) >> 3u, 8u);   // 0..8 in tenths of columns
-      if ((hTall % 10u) < dens + 1u) {
+      let dens = min(u32(tg - 176) >> 3u, 8u);   // 0..8 in twentieths of columns
+      // % 20, not % 10: half the blades of the first cut (see UG_FERN_CHANCE).
+      if ((hTall % 20u) < dens + 1u) {
         f.mat = M_TALLGRASS;
         // 4..8 cells (40-80 cm): the cap ramps with patch depth so the core
         // of a stand overtops its fringe, and the per-plant jitter under the
@@ -2448,9 +2457,10 @@ fn flowerAt(x : i32, z : i32, seed : u32, cover : i32) -> Flower {
     }
   }
 
+  // Per-mille per column; half the first cut (see UG_FERN_CHANCE).
   var thresh = 0u;
-  if (biome == B_MEADOW) { thresh = select(6u, 60u, clump > 165); }
-  else                   { thresh = select(2u, 16u, clump > 190); }
+  if (biome == B_MEADOW) { thresh = select(3u, 30u, clump > 165); }
+  else                   { thresh = select(1u, 8u, clump > 190); }
   if ((fr % 1000u) >= thresh) { return f; }
 
   let sp = vnoise(x + 911, z - 733, 40 * HSCALE, seed ^ 0xF1A5u);
@@ -4485,6 +4495,10 @@ var<workgroup> wgFarCount : atomic<u32>;
 // because the two are answers to different questions and only their SUM is
 // safe to publish (see the farOcc note at the bottom of `far`).
 var<workgroup> wgFarPatchNZ : atomic<u32>;
+// One plus the chunk-local row of the highest non-empty cell, sweep and patch
+// together (common.wgsl FAR_OCC_TOP_SHIFT: the far readers skip the air above
+// it). 0 when the chunk is empty.
+var<workgroup> wgFarTop : atomic<u32>;
 
 @compute @workgroup_size(64)
 fn far(@builtin(workgroup_id) wg : vec3<u32>,
@@ -4493,6 +4507,7 @@ fn far(@builtin(workgroup_id) wg : vec3<u32>,
   if (li == 0u) {
     atomicStore(&wgFarCount, 0u);
     atomicStore(&wgFarPatchNZ, 0u);
+    atomicStore(&wgFarTop, 0u);
   }
   workgroupBarrier();
 
@@ -4540,6 +4555,7 @@ fn far(@builtin(workgroup_id) wg : vec3<u32>,
     tops[b] = farColTopFrom(cols[b].h, cols[b].fluidTop, fine.x, fine.z, T.seed);
   }
   let planeBase = ((level - 1u) * FAR_VOX + slot * CHUNK_VOL) / 4u;
+  var top = 0u;   // one plus the highest row with a non-empty cell, this thread
   for (var yi = 0u; yi < CHUNK; yi++) {
     var word = 0u;
     for (var b = 0u; b < 4u; b++) {
@@ -4558,7 +4574,7 @@ fn far(@builtin(workgroup_id) wg : vec3<u32>,
       // farOcc counts NON-EMPTY cells, which now includes blocker-only ones —
       // it gates empty-space skipping for every far reader, and a reader that
       // hits on the flag must not have its chunk skipped out from under it.
-      if (byteV != 0u) { count += 1u; }
+      if (byteV != 0u) { count += 1u; top = yi + 1u; }
       word |= byteV << (b * 8u);
     }
     // The cell index in this level chunk is x + y*CHUNK + z*CHUNK*CHUNK (see the
@@ -4571,6 +4587,7 @@ fn far(@builtin(workgroup_id) wg : vec3<u32>,
                 word);
   }
   atomicAdd(&wgFarCount, count);
+  atomicMax(&wgFarTop, top);
   // ---- THE EDIT PATCH (far-field edit persistence) ---------------------
   //
   // The sweep above is PRISTINE PROCGEN, and that is the whole problem this
@@ -4623,7 +4640,7 @@ fn far(@builtin(workgroup_id) wg : vec3<u32>,
     if (farCellIsSolid(pmat)) {
       byteV |= min(farSurfaceMat(pcol, pmat, pfine, shift, T.seed), FAR_MAT_MASK);
     }
-    if (byteV != 0u) { pnz += 1u; }
+    if (byteV != 0u) { pnz += 1u; atomicMax(&wgFarTop, u32(pl.y) + 1u); }
     let bi = (level - 1u) * FAR_VOX + slot * CHUNK_VOL + ci;
     let bsh = (bi & 3u) * 8u;
     atomicAnd(&farVox[bi >> 2u], ~(0xFFu << bsh));
@@ -4638,9 +4655,13 @@ fn far(@builtin(workgroup_id) wg : vec3<u32>,
     // `fardown`'s atomicMax takes). The sum double-counts a patched cell that
     // was already non-air in the sweep and ignores a patch that cleared one —
     // both land on the safe side.
+    // The top row rides the same word (common.wgsl FAR_OCC_TOP_SHIFT); it
+    // is the max over the sweep and the patch, so it is conservative-high in
+    // exactly the way the count is.
     atomicStore(&farOcc[(level - 1u) * FAR_NUM_CHUNKS + slot],
-                min(atomicLoad(&wgFarCount) + atomicLoad(&wgFarPatchNZ),
-                    CHUNK_VOL));
+                farOccPack(min(atomicLoad(&wgFarCount) + atomicLoad(&wgFarPatchNZ),
+                               CHUNK_VOL),
+                           atomicLoad(&wgFarTop)));
   }
 }
 
@@ -4755,7 +4776,12 @@ fn fardown(@builtin(workgroup_id) wg : vec3<u32>,
       atomicAnd(&farVox[bi >> 2u], ~(0xFFu << bsh));
       atomicOr(&farVox[bi >> 2u], byteV << bsh);
       if (byteV != 0u) {
-        atomicMax(&farOcc[farOccIndex(level, cc)], 1u);
+        // Count 1 (all a reader asks of the count is non-zero) under this
+        // cell's row: max() compares the row first, so a live edit that stacks
+        // something above the sieve's top row raises it, and nothing ever
+        // lowers it (common.wgsl, the farOcc word).
+        atomicMax(&farOcc[farOccIndex(level, cc)],
+                  farOccPack(1u, u32(cc.y & (i32(CHUNK) - 1)) + 1u));
       }
     }
   }

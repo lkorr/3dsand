@@ -3111,6 +3111,33 @@ fn farVoxByteIndex(level : u32, c : vec3<i32>) -> u32 {
 fn farOccIndex(level : u32, c : vec3<i32>) -> u32 {
   return (level - 1u) * FAR_NUM_CHUNKS + farChunkIndexG(c);
 }
+// ---- THE farOcc WORD: a non-empty count AND the chunk's top row -------------
+// Low 16 bits: how many of the level chunk's 4096 cells are non-empty (any
+// non-zero byte — material or the blocker flag); zero is what the far readers
+// skip a whole chunk on. Bits 16..20: ONE PLUS the chunk-local row (0..15) of
+// the highest non-empty cell, so 0 means "unknown, assume full" and 16 means
+// the top row has something in it.
+//
+// The top row is what lets a far ray skip the AIR inside a terrain chunk
+// (2026-09-04). Occupancy alone skips only chunks with nothing in them, and
+// the surface band's chunks all have something: a ray 12 m up pitched at the
+// middle distance spent ~90 level-1 cells crossing the air above the ground
+// in each band chunk before it met the surface, and a grazing one walked the
+// whole band. With the top row known, a ray that is above it drops straight
+// onto that row (descending) or jumps to the chunk's exit face (ascending).
+// Exact, never hides geometry: the row is conservative-high by construction —
+// `far` measures it over the sieve + patch, `fardown` raises it with atomicMax
+// for every non-empty cell it writes and never lowers it, so an edit that
+// clears a cell leaves a stale-high row, which only costs steps.
+//
+// atomicMax IS the merge: the row sits ABOVE the count so a later producer's
+// max() compares rows first, and a word whose row is raised by `fardown` keeps
+// a non-zero count (its own 1), which is all the count is read for.
+const FAR_OCC_TOP_SHIFT : u32 = 16u;
+fn farOccPack(count : u32, topRowPlusOne : u32) -> u32 {
+  return (count & 0xFFFFu) | (topRowPlusOne << FAR_OCC_TOP_SHIFT);
+}
+fn farOccTop(occ : u32) -> u32 { return occ >> FAR_OCC_TOP_SHIFT; }
 
 // ---- THE FAR CELL BYTE: 7 bits of material + 1 CONSERVATIVE BLOCKER BIT ----
 // (13.2.2, docs/PLAN_lin_followups.md W2-D)

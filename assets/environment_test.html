@@ -123,7 +123,10 @@ function readLit(wv, cv){
     say(nav.querySelectorAll('button[data-page]').length >= 8, 'and the four component pages');
 
     // ---- 3. the biome page --------------------------------------------------------------------------
+    // Since the World map page (P3) the tab opens on the map, so the biome
+    // page is deep-linked here the way the sidebar does it.
     var B = E._modules.Biome;
+    await E._open('biome', 'forest');
     ok = await waitFor(function(){ return !!B._biome() && B.currentName() === 'forest'; });
     say(ok, 'biome page loaded forest: ' + (B._biome() && B._biome().displayName));
     var bstats = pages.biome.querySelector('.bmstats');
@@ -136,8 +139,47 @@ function readLit(wv, cv){
     var stackRows = pages.biome.querySelectorAll('.bmstackrow').length;
     say(stackRows >= 10, 'feature stacks built ' + stackRows + ' rows (cover + trees + water + caves)');
     var band = pages.biome.querySelector('.bmband');
-    say(!!band && band.querySelectorAll('.bmseg').length === 4 && band.querySelectorAll('.bmgrip').length === 3,
-        'biome band strip: 4 segments, 3 draggable thresholds');
+    say(!!band && band.querySelectorAll('.bmseg').length === 4 && band.querySelectorAll('.bmgrip').length === 0 &&
+        band.classList.contains('bmdead'),
+        'biome band strip: 4 segments, NO grips, greyed as dead (biomeAt reads the painted map)');
+    // ---- 3b. honest pages (PLAN_environment_truth P-B) ---------------------------------------------
+    // Unread fields render disabled with the package in a pill; live ones do not.
+    function rowOf(page, cls, label) {
+      var hit = null;
+      page.querySelectorAll('.' + cls + 'row > label').forEach(function (l) { if (l.firstChild && l.firstChild.textContent === label) hit = l.parentNode; });
+      return hit;
+    }
+    var tileRow = rowOf(pages.biome, 'bm', 'tile (m)'), densRow = rowOf(pages.biome, 'bm', 'density (%)');
+    say(!!tileRow && tileRow.classList.contains('bmdead') && tileRow.querySelector('input').disabled &&
+        /P-D/.test((tileRow.querySelector('.bmlivepill') || {}).textContent || ''),
+        'trees.tile renders disabled with a P-D pill: ' + (tileRow && tileRow.title.split('\n').pop().slice(0, 70)));
+    say(!!densRow && !densRow.classList.contains('bmdead') && !densRow.querySelector('input').disabled && !densRow.querySelector('.bmlivepill'),
+        'trees.density renders live (no pill, enabled)');
+    var dstat = null;
+    pages.biome.querySelectorAll('.bmderived').forEach(function (d) { if (/trees per hectare/.test(d.textContent)) dstat = dstat || d; });
+    say(!!dstat && /ENGINE tile worldgen\.treeTile = [\d.]+ m/.test(dstat.textContent),
+        'the density stat uses the engine tile: ' + (dstat && dstat.textContent.slice(0, 90)));
+    var covRow = rowOf(pages.biome, 'bm', 'ground flora blocks'), cacRow = rowOf(pages.biome, 'bm', 'cactus 1-in-N');
+    say(!!covRow && !covRow.classList.contains('bmdead') && !!cacRow && cacRow.classList.contains('bmdead') &&
+        /P-E/.test((cacRow.querySelector('.bmlivepill') || {}).textContent || ''),
+        'the packed flags are live rows; cactusChance is a disabled P-E row');
+    say(pages.biome.querySelectorAll('.bmlive-unknown').length === 0, 'no field on the biome page is outside the manifest');
+    // A LIVE slider regenerates and coalesces into one undo step (the drag test
+    // lived on the water page until every water field became not-read).
+    var bdepth0 = B._undoDepth();
+    var bbefore = bstats.textContent;
+    var brng = densRow.querySelector('.bmrng');
+    var bv0 = brng.value;
+    for (var bd = 0; bd < 6; bd++) {
+      brng.value = String(Math.max(parseFloat(brng.min), parseFloat(brng.value) - parseFloat(brng.step)));
+      brng.dispatchEvent(new Event('input', {bubbles: true}));
+    }
+    ok = await waitFor(function(){ return bstats.textContent !== bbefore && /voxels/.test(bstats.textContent); }, 120000);
+    say(ok && brng.value !== bv0, 'a six-step density drag recomposed the swatch (' + bv0 + ' -> ' + brng.value + ')');
+    say(B._undoDepth() === bdepth0 + 1, 'and cost exactly one undo step (' + (B._undoDepth() - bdepth0) + ')');
+    document.dispatchEvent(new KeyboardEvent('keydown', {key: 'z', ctrlKey: true, bubbles: true}));
+    ok = await waitFor(function(){ return B._undoDepth() === bdepth0 && brng.value === bv0; }, 20000);
+    say(ok, 'Ctrl+Z put the density back (' + brng.value + ')');
     var wvB = B._view();
     var lb = null;
     ok = await waitFor(function(){ lb = readLit(wvB, pages.biome.querySelector('canvas.bmview')); return lb.quads > 100 && lb.lit > lb.tot * 0.01; }, 60000);
@@ -185,29 +227,30 @@ function readLit(wv, cv){
     }
     say(painted(pages.water.querySelector('canvas.wbplan')) > 5, 'plan canvas painted (' + painted(pages.water.querySelector('canvas.wbplan')) + ' colours sampled)');
     say(painted(pages.water.querySelector('canvas.wbprofile')) > 3, 'profile canvas painted');
-    // A slider regenerates; undo coalesces a drag into one step.
-    var wdepth0 = W._undoDepth();
-    var before = wstats.textContent;
-    var rng = pages.water.querySelectorAll('.wbrng')[0];
-    var v0 = rng.value;
-    for (var d = 0; d < 6; d++) {
-      rng.value = String(Math.min(parseFloat(rng.max), parseFloat(rng.value) + parseFloat(rng.step)));
-      rng.dispatchEvent(new Event('input', {bubbles: true}));
-    }
-    ok = await waitFor(function(){ return wstats.textContent !== before; }, 30000);
-    say(ok && rng.value !== v0, 'a six-step radius drag regenerated the body (' + v0 + ' -> ' + rng.value + ')');
-    say(W._undoDepth() === wdepth0 + 1, 'and cost exactly one undo step (' + (W._undoDepth() - wdepth0) + ')');
-    document.dispatchEvent(new KeyboardEvent('keydown', {key: 'z', ctrlKey: true, bubbles: true}));
-    ok = await waitFor(function(){ return W._undoDepth() === wdepth0 && rng.value === v0; }, 20000);
-    say(ok, 'Ctrl+Z put the radius back (' + rng.value + ')');
-    // Profile editor: a dblclick-free add via mousedown on empty canvas adds a point.
+    // Honest pages: nothing in a preset reaches worldgen, so every row is
+    // disabled with its package (geometry P-F, vegetation P-E) and the profile
+    // canvas draws but does not edit. The manifest (envlive.js) is the switch.
+    var wr = pages.water.querySelectorAll('.wbrow');
+    var wdead = 0, wpf = 0, wpe = 0, wlive = 0;
+    wr.forEach(function (r) {
+      var p = r.querySelector('.wblivepill');
+      if (r.classList.contains('wbdead')) { wdead++; if (p && p.textContent === 'P-F') wpf++; if (p && p.textContent === 'P-E') wpe++; }
+      else if (!r.classList.contains('wbpreview')) wlive++;
+    });
+    say(wdead > 40 && wpf > 20 && wpe > 10, 'water rows render disabled with their package: ' + wdead + ' dead (' + wpf + ' P-F, ' + wpe + ' P-E), ' + wlive + ' live');
+    var radRow = rowOf(pages.water, 'wb', 'radius (m)');
+    say(!!radRow && radRow.querySelector('.wbrng').disabled && radRow.querySelector('.wbnum').disabled, 'the radius slider and box are disabled');
+    say(pages.water.querySelectorAll('.wblive-unknown').length === 0, 'no field on the water page is outside the manifest');
+    var plantIn = pages.water.querySelector('.wbplant input');
+    say(!!plantIn && plantIn.disabled && /P-E/.test(plantIn.title), 'shore plant rows are disabled as P-E');
     var prof = pages.water.querySelector('canvas.wbprofile');
     var nPts = W._params().bathymetry.profile.length;
     var r = prof.getBoundingClientRect();
     prof.dispatchEvent(new MouseEvent('mousedown', {button: 0, clientX: r.left + r.width * 0.4, clientY: r.top + r.height * 0.4, bubbles: true}));
     window.dispatchEvent(new MouseEvent('mouseup', {bubbles: true}));
-    ok = await waitFor(function(){ return W._params().bathymetry.profile.length === nPts + 1; }, 20000);
-    say(ok, 'clicking the profile added a control point (' + nPts + ' -> ' + W._params().bathymetry.profile.length + ')');
+    await new Promise(function (res) { setTimeout(res, 300); });
+    say(prof.classList.contains('wbdead') && W._params().bathymetry.profile.length === nPts,
+        'the profile canvas is greyed and a click adds no point (' + nPts + ' -> ' + W._params().bathymetry.profile.length + ')');
 
     // ---- 5. the trees page still works inside the shell ------------------------------------------------
     var T = E._modules.Trees;

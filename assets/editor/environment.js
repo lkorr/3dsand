@@ -142,17 +142,18 @@ function paintKnobPages() {
     'worldgen carves two bands world-wide: a near-surface band under caveThreshold1 and a deep band under ',
     'caveThreshold2, both stone-walled, with lava below LAVA_LEVEL through the one caveFill() route. These are ',
     'the live knobs (they write tuning.json; a new world shows them). ',
-    el('b', {}, 'Per-biome caves are scaffolded'), ' on each biome page as a cave stack, authored and validated but ',
-    'not yet read — the plan is the 3D caves behind a province mask in docs/RESEARCH_worldgen.md stage 8.'
+    el('b', {}, 'Per-biome caves'), ': each biome page’s cave stack sets THIS biome’s two thresholds (read; a ',
+    'biome with no row keeps these globals). caveMushroomChance / caveCrystalChance become per-biome rows in ',
+    'P-E of docs/PLAN_environment_truth.md, which deletes those two knobs here.'
   ], k => CAVE_KEYS.test(k));
   knobPage('cover', [
     el('b', {}, 'Ground cover — the engine today. '),
     'The flora worldgen paints per column: meadow tall grass and flowers, desert tussock and scrub behind a ',
     'patch mask, pine heath, the alpine cushion above the treeline, and the undergrowth layer that reads ',
     'canopy shade rather than biome. These knobs are world-wide; the ',
-    el('b', {}, 'per-biome version is each biome page’s Ground cover stack'), ', which the swatch composes and ',
-    'the `biomes` gate validates, and which worldgen will read once the cover blocks take a biome table ',
-    '(the lowest-risk seam: every one of them is outside the CPU-mirrored height code).'
+    el('b', {}, 'per-biome version is each biome page’s Ground cover stack'), ', which worldgen READS (the cover ',
+    'rows, the patch mask, the groundFlora / cacti / sandCap flags that gate these blocks). cactusChance and ',
+    'saguaroFraction move onto the biome page in P-E of docs/PLAN_environment_truth.md, which deletes them here.'
   ], k => COVER_KEYS.test(k));
 }
 
