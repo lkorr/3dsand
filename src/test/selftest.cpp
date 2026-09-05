@@ -132,6 +132,10 @@ const char* const kOrder[] = {
     // Right after terrain, on the same pristine world: the painted map's
     // biome reaches the kernel (CPU twin at cell centres, GPU skin in-window).
     "worldmap",
+    // With it: the map's spawn site is where a player can actually start --
+    // outside the harness box, on land, not in a tarn, where trees may grow.
+    // CPU only (the height mirror and the map), nothing left behind.
+    "spawn-site",
     // Then: an edited biome table reaches the NEXT worldgen without a restart
     // (the F7 / Apply path). Regenerates twice and leaves the pristine world
     // it found, so `waterbody` below sees what `terrain` left.

@@ -99,6 +99,13 @@ enum : uint32_t {
   kHHarnessZ0 = 23,
   kHHarnessX1 = 24,
   kHHarnessZ1 = 25,
+  // The spawn site (map.json sites[], kind "spawn", `at: [x, z]`): the world
+  // column the player starts on, and the centre of the calm home area
+  // (landAt's coarse-octave fade, PLAN_environment_truth P-C). One per map;
+  // a map without one defaults to (140, 140), the pre-P-C literal, so old
+  // maps keep starting where they did. i32 in u32 words, like the box above.
+  kHSpawnX = 26,
+  kHSpawnZ = 27,
   kHeaderWords = 32,    // padded, like treeatlas::kFileHeaderWords
 };
 // Planes are packed FOUR CELLS PER WORD, little-endian: cell i of a plane at
@@ -225,6 +232,10 @@ struct WorldMapData {
   bool InHarness(int x, int z) const {
     return x >= harnessX0 && x <= harnessX1 && z >= harnessZ0 && z <= harnessZ1;
   }
+  // The spawn site (kind "spawn"). `spawnAuthored` says the map named it;
+  // otherwise these are the (140, 140) default and the loader said so.
+  int spawnX = 140, spawnZ = 140;
+  bool spawnAuthored = false;
   std::vector<std::string> palette;       // map.json biomes[]: plane byte -> name
   // Authored stamp sites (P5), resolved: the template loaded, rotated, and
   // packed into columns of runs at load. `siteIndex` is the per-cell plane.

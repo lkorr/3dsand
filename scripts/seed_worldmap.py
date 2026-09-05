@@ -29,7 +29,7 @@ ROOT = pathlib.Path(sys.argv[1]) if len(sys.argv) > 1 else pathlib.Path(__file__
 OUT = ROOT / 'assets' / 'worldmap' / 'default'
 W = H = 196            # 196 cells x 102.4 m = 20 km
 CELL_LOG2 = 10
-ORIGIN = (98, 98)      # spawn at the centre
+ORIGIN = (98, 98)      # the world origin at the centre; spawn is a site (below)
 RADIUS = 88            # painted disc, cells; ocean outside
 FADE = 6
 BIOMES = ['forest', 'meadow', 'pine', 'desert', 'tundra', 'swamp', 'alpine', 'ocean']
@@ -112,7 +112,12 @@ meta = {
     "biomes": BIOMES,
     "sites": [
         {"id": "harness", "kind": "pad", "min": [-128, -128], "max": [640, 640],
-         "about": "The selftest harness region: no tree trunks or crowns, no tarns, no cover. Keeps every fixture column (60..150 on the x==z diagonal) and the test tarn at (420,420) on the ground the gates were written against."}
+         "about": "The selftest harness region: no tree trunks or crowns, no tarns, no cover. Keeps every fixture column (60..150 on the x==z diagonal) and the test tarn at (420,420) on the ground the gates were written against."},
+        # The player does NOT start on the pad (PLAN_environment_truth P-C):
+        # the pad refuses trees and cover, so spawn sits past its edge plus
+        # the widest crown reach, still inside the forced-forest cells.
+        {"id": "spawn", "kind": "spawn", "at": [900, 900],
+         "about": "Where the game starts, and the centre of the calm home area (worldgen.spawnPlain*). Outside the harness pad by more than the widest crown reach (115 vox past x/z 640), on forced forest, on land: the spawn-site gate checks all of that."}
     ],
     "rules": []
 }

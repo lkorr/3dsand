@@ -287,14 +287,30 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
     return true;
   };
 
-  // ---- sites: the harness pad box, and the stamp sites ------------------------
+  // ---- sites: the harness pad box, the spawn site, and the stamp sites --------
   bool havePad = false;
   if (j.contains("sites") && j["sites"].is_array()) {
     for (const json& s : j["sites"]) {
       if (!s.is_object()) continue;
       const std::string kind = s.value("kind", "");
       const std::string id = s.value("id", "?");
-      if (kind == "pad") {
+      if (kind == "spawn") {
+        // ONE per map: two spawns is an authoring error, not a choice, and
+        // "the first one wins" would make the map page's marker a lie.
+        if (out.spawnAuthored) {
+          log += at + "site \"" + id + "\": a second kind spawn (the map already has one at (" +
+                 std::to_string(out.spawnX) + "," + std::to_string(out.spawnZ) + "))\n";
+          return false;
+        }
+        if (!(s.contains("at") && s["at"].is_array() && s["at"].size() == 2 &&
+              s["at"][0].is_number() && s["at"][1].is_number())) {
+          log += at + "site \"" + id + "\" kind spawn needs at[2] in world voxels\n";
+          return false;
+        }
+        out.spawnX = s["at"][0].get<int>();
+        out.spawnZ = s["at"][1].get<int>();
+        out.spawnAuthored = true;
+      } else if (kind == "pad") {
         if (havePad) continue;   // one pad box until the pad becomes a site kind proper
         if (!(s.contains("min") && s.contains("max") && s["min"].is_array() &&
               s["max"].is_array() && s["min"].size() == 2 && s["max"].size() == 2)) {
@@ -323,6 +339,12 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
       }
     }
   }
+  // A map that names no spawn starts where every map did before P-C. Said
+  // out loud, because a player standing on the harness pad's bare grass is
+  // otherwise indistinguishable from a biome that failed to author.
+  if (!out.spawnAuthored)
+    std::printf("world map: '%s' has no kind \"spawn\" site; defaulting spawn to (%d,%d)\n",
+                name.c_str(), out.spawnX, out.spawnZ);
   // Rules are resolved after the planes are read (they need the biome plane);
   // see below.
 
@@ -454,6 +476,11 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
 bool PackWorldMap(const biomes::BiomeSet& set, const WorldMapData& map,
                   std::vector<uint32_t>& W, std::string& log) {
   if (!PackBiomeTable(set, W, log)) return false;
+  // The spawn words are written even for an unloaded map (the default), so
+  // the shader's spawnCentre() and the C++ twin never disagree about where
+  // the home area is -- the twin reads WorldMapData's default either way.
+  W[kHSpawnX] = U(map.spawnX);
+  W[kHSpawnZ] = U(map.spawnZ);
   if (!map.Loaded()) return true;   // P0/P1 tools: records only, planes absent
   W[kHCellLog2] = U(map.cellLog2);
   W[kHWidth] = U(map.width);

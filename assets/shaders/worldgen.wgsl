@@ -850,7 +850,8 @@ fn landAt(x : i32, z : i32, seed : u32) -> Land {
                   g3x, g3z, seed ^ 5u);
 
   // ---- THE CALM HOME AREA ----
-  // Only the TWO COARSE octaves fade toward the origin. Fading the whole
+  // Only the TWO COARSE octaves fade toward the SPAWN SITE (map.json sites[],
+  // kind "spawn"; spawnCentre() reads it from the header). Fading the whole
   // deviation would pin spawn to a mathematically exact plane 64 m across —
   // which is not "calm", it is a dinner plate, and it would also make the
   // terrain gate's pass C a test of a constant. The three fine rungs stay at
@@ -862,12 +863,25 @@ fn landAt(x : i32, z : i32, seed : u32) -> Land {
   // transects walk both. The `d < fade` guard is not cosmetic: `d << 14` on a
   // world coordinate a few hundred thousand voxels out would overflow, and X/Z
   // are infinite here.
-  let d = max(abs(x), abs(z)) - TUNE_SPAWN_PLAIN_R;
+  //
+  // TWO CENTRES. The harness box gets the same fade, measured from its EDGE
+  // (harnessOutside is 0 anywhere inside it), and the calmer of the two wins.
+  // The pad's flatness only ever came from this fade -- kind "pad" is not in
+  // the site table, so sitePadAt never levels it -- and the fixtures were
+  // written against that ground (terrain C2, floaters, corpse-burn). Moving
+  // the spawn out of the pad must not move the pad's ground with it.
+  let sc = spawnCentre();
+  let d = max(abs(x - sc.x), abs(z - sc.y)) - TUNE_SPAWN_PLAIN_R;
   var w = 16384;
   if (d < TUNE_SPAWN_PLAIN_FADE) {
     w = (max(d, 0) * 16384) / TUNE_SPAWN_PLAIN_FADE;
   }
-  let ws = vsmooth(w << 1) >> 1;                    // Q14 smoothstep of the ramp
+  let dh = harnessOutside(x, z);
+  var wh = 16384;
+  if (dh < TUNE_SPAWN_PLAIN_FADE) {
+    wh = (dh * 16384) / TUNE_SPAWN_PLAIN_FADE;
+  }
+  let ws = vsmooth(min(w, wh) << 1) >> 1;           // Q14 smoothstep of the ramp
   let coarse = TUNE_BASE_HEIGHT + cv.x - TUNE_SPAWN_PLAIN_Y;
   let bed = TUNE_SPAWN_PLAIN_Y + o2.dev + o3.dev + o4.dev
           + ((coarse * ws) >> 14);
@@ -1367,6 +1381,8 @@ const WM_H_HARNESS_X0    : u32 = 22u;
 const WM_H_HARNESS_Z0    : u32 = 23u;
 const WM_H_HARNESS_X1    : u32 = 24u;
 const WM_H_HARNESS_Z1    : u32 = 25u;
+const WM_H_SPAWN_X       : u32 = 26u;
+const WM_H_SPAWN_Z       : u32 = 27u;
 // the site table (worldmap.h kS_* / kStamp_*)
 const WM_S_WORDS         : u32 = 16u;
 const WM_S_KIND          : u32 = 0u;
@@ -1460,6 +1476,30 @@ fn inHarness(x : i32, z : i32) -> bool {
 fn crownMeetsHarness(wx : i32, wz : i32, r : i32) -> bool {
   return wx + r >= i32(worldMap[WM_H_HARNESS_X0]) && wx - r <= i32(worldMap[WM_H_HARNESS_X1]) &&
          wz + r >= i32(worldMap[WM_H_HARNESS_Z0]) && wz - r <= i32(worldMap[WM_H_HARNESS_Z1]);
+}
+// Chebyshev distance from a column to the harness box, 0 inside it: the
+// mirrored landAt keeps the box's ground calm (its own coarse-octave fade,
+// beside the spawn's) so the fixtures stand on the ground their gates were
+// written against wherever the spawn site goes. A map with no pad (x1 < x0)
+// reports "far", which switches that fade off. Outside the height mirror on
+// both sides; world.cpp spells the same name.
+fn harnessOutside(x : i32, z : i32) -> i32 {
+  let x0 = i32(worldMap[WM_H_HARNESS_X0]);
+  let x1 = i32(worldMap[WM_H_HARNESS_X1]);
+  if (x1 < x0) { return 1073741824; }
+  let z0 = i32(worldMap[WM_H_HARNESS_Z0]);
+  let z1 = i32(worldMap[WM_H_HARNESS_Z1]);
+  return max(max(max(x0 - x, x - x1), max(z0 - z, z - z1)), 0);
+}
+
+// ---- THE SPAWN SITE (PLAN_environment_truth P-C) -----------------------------
+// Where the player starts (map.json sites[], kind "spawn") and the centre of
+// the calm home area. Read from the header so the C++ twin (world.cpp
+// spawnCentre, reading worldmap::CurrentWorldMap()) sees the same column;
+// the mirrored landAt calls it by name. Not a Tier-A/B question: it is an
+// authored point, no seed.
+fn spawnCentre() -> vec2<i32> {
+  return vec2<i32>(i32(worldMap[WM_H_SPAWN_X]), i32(worldMap[WM_H_SPAWN_Z]));
 }
 
 // ---- THE SITE TABLE (P5) ----------------------------------------------------
