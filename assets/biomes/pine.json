@@ -22,7 +22,7 @@
       {
         "material": "heath_shrub",
         "head": "",
-        "chance": 14,
+        "chance": 28,
         "height": 0.4,
         "conditions": {
           "minY": -1,
@@ -36,7 +36,7 @@
       {
         "material": "fern",
         "head": "",
-        "chance": 30,
+        "chance": 60,
         "height": 0.4,
         "conditions": {
           "minY": -1,
@@ -50,7 +50,7 @@
       {
         "material": "moss_patch",
         "head": "",
-        "chance": 40,
+        "chance": 80,
         "height": 0.1,
         "conditions": {
           "minY": -1,
@@ -64,7 +64,7 @@
       {
         "material": "toadstool_pale",
         "head": "",
-        "chance": 120,
+        "chance": 240,
         "height": 0.2,
         "conditions": {
           "minY": -1,

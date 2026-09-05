@@ -22,7 +22,7 @@
       {
         "material": "tall_grass",
         "head": "tall_grass_head",
-        "chance": 6,
+        "chance": 12,
         "height": 0.5,
         "conditions": {
           "minY": -1,
@@ -36,7 +36,7 @@
       {
         "material": "flower_poppy",
         "head": "",
-        "chance": 30,
+        "chance": 60,
         "height": 0.2,
         "conditions": {
           "minY": -1,
@@ -50,7 +50,7 @@
       {
         "material": "flower_daisy",
         "head": "",
-        "chance": 26,
+        "chance": 52,
         "height": 0.2,
         "conditions": {
           "minY": -1,
@@ -64,7 +64,7 @@
       {
         "material": "flower_buttercup",
         "head": "",
-        "chance": 34,
+        "chance": 68,
         "height": 0.2,
         "conditions": {
           "minY": -1,
@@ -78,7 +78,7 @@
       {
         "material": "flower_clover",
         "head": "",
-        "chance": 20,
+        "chance": 40,
         "height": 0.1,
         "conditions": {
           "minY": -1,
@@ -92,7 +92,7 @@
       {
         "material": "grass_tuft",
         "head": "",
-        "chance": 7,
+        "chance": 14,
         "height": 0.2,
         "conditions": {
           "minY": -1,

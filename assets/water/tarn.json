@@ -70,34 +70,34 @@
     "lift": 1.2,
     "mudWidth": 1,
     "mudMaterial": "shore_mud",
-    "mossChance": 3,
+    "mossChance": 6,
     "mossMaterial": "wet_moss",
     "plants": [
       {
         "material": "cattail",
         "head": "cattail_head",
-        "chance": 12,
+        "chance": 24,
         "reach": 0.9,
         "height": 2
       },
       {
         "material": "horsetail",
         "head": "",
-        "chance": 10,
+        "chance": 20,
         "reach": 1.6,
         "height": 0.9
       },
       {
         "material": "water_iris",
         "head": "",
-        "chance": 34,
+        "chance": 68,
         "reach": 2,
         "height": 0.5
       },
       {
         "material": "marsh_grass",
         "head": "",
-        "chance": 4,
+        "chance": 8,
         "reach": 2.4,
         "height": 0.3
       }
@@ -106,7 +106,7 @@
   "aquatic": {
     "emergent": {
       "material": "reed",
-      "chance": 130,
+      "chance": 260,
       "minDepth": 0.4,
       "maxDepth": 1.4,
       "height": 1.6
@@ -114,14 +114,14 @@
     "floating": {
       "material": "lilypad",
       "flower": "lily_flower",
-      "chance": 22,
+      "chance": 44,
       "flowerChance": 5,
       "minDepth": 1,
       "maxDepth": 3
     },
     "submerged": {
       "material": "kelp",
-      "chance": 120,
+      "chance": 240,
       "minDepth": 1.6,
       "height": 1,
       "clearance": 0.4

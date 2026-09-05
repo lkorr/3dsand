@@ -22,7 +22,7 @@
       {
         "material": "dry_tussock",
         "head": "",
-        "chance": 20,
+        "chance": 40,
         "height": 0.3,
         "conditions": {
           "minY": -1,
@@ -36,7 +36,7 @@
       {
         "material": "desert_scrub",
         "head": "",
-        "chance": 36,
+        "chance": 72,
         "height": 0.5,
         "conditions": {
           "minY": -1,
@@ -50,7 +50,7 @@
       {
         "material": "cactus_flesh",
         "head": "cactus_bloom",
-        "chance": 90,
+        "chance": 180,
         "height": 1.2,
         "conditions": {
           "minY": -1,

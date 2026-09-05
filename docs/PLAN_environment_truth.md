@@ -1,8 +1,8 @@
 # PLAN: the Environment tab is the truth about the world
 
 Status: PROPOSAL, 2026-09-04. Supersedes `PLAN_biomes.md` §5 (the wiring
-order) and closes the follow-up list in `PLAN_world_map.md`. P-E landed
-2026-09-05 (branch `worktree-agent-a94a80cbbbe792d1b`); the rest is open.
+order) and closes the follow-up list in `PLAN_world_map.md`. P-A, P-B and P-E
+landed 2026-09-05; the rest is open.
 
 ## 0. Why edits do not show today (measured on main 482b756)
 

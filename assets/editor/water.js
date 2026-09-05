@@ -20,11 +20,20 @@
  * THE PAGE WORKS WITH NO BUILT EXE: generation is pure JS, the palette comes
  * from the materials.json the page already holds, files go through the
  * ordinary /api/model routes (the server allowlists `water`).
+ *
+ * NOTHING IN A PRESET REACHES WORLDGEN TODAY (src/sim/biomes.cpp parses the
+ * files, ValidateBiomeSet checks them, and that is the consumer list), so
+ * every row here renders DISABLED with the package that flips it: geometry
+ * (footprint, bathymetry, fill, berm, bed, placement) in P-F, the shore and
+ * aquatic vegetation in P-E — assets/editor/envlive.js is the table. The
+ * preview still composes from the file, so the page remains a viewer; the
+ * fields re-enable when the manifest flips, not when this file changes.
  */
 
 import * as WG from './watergen.js';
 import * as VOX from './vox.js';
 import * as UI from './envui.js';
+import * as LV from './envlive.js';
 
 const PAGE = 'env-water';
 const CLS = 'wb';
@@ -204,6 +213,7 @@ function ctx() {
   return {
     el: H.el, cls: CLS, params: () => params, widgets,
     snapshot: (k) => undo.snapshot(k),
+    live: (path) => LV.lookup('water', path),
     onChange: () => { markDirty(); regenerate(false); }
   };
 }
@@ -444,8 +454,16 @@ function bindProfileEditor(cv) {
     const r = cv.getBoundingClientRect();
     return [(e.clientX - r.left) * cv.width / r.width, (e.clientY - r.top) * cv.height / r.height];
   };
+  // The profile is a field like any other (bathymetry.profile): while the
+  // manifest says the engine does not read it, the canvas draws but does not
+  // edit, and wears the same greyed class as the rows.
+  const live = () => LV.isLive('water', 'bathymetry.profile');
+  if (!live()) {
+    cv.classList.add(CLS + 'dead');
+    cv.title = LV.describe(LV.lookup('water', 'bathymetry.profile')) + '\n' + cv.title;
+  }
   cv.addEventListener('mousedown', (e) => {
-    if (e.button !== 0) return;
+    if (e.button !== 0 || !live()) return;
     const [x, y] = pos(e);
     let i = nearestPoint(cv, x, y);
     undo.snapshot(null);
@@ -461,6 +479,7 @@ function bindProfileEditor(cv) {
     e.preventDefault();
   });
   cv.addEventListener('dblclick', (e) => {
+    if (!live()) return;
     const [x, y] = pos(e);
     const i = nearestPoint(cv, x, y);
     const pts = profilePts();
@@ -529,11 +548,17 @@ function buildPlantList(body) {
       up.addEventListener('click', () => { undo.snapshot(null); [plants[i - 1], plants[i]] = [plants[i], plants[i - 1]]; render(); markDirty(); regenerate(false); });
       dn.addEventListener('click', () => { undo.snapshot(null); [plants[i + 1], plants[i]] = [plants[i], plants[i + 1]]; render(); markDirty(); regenerate(false); });
       rm.addEventListener('click', () => { undo.snapshot(null); plants.splice(i, 1); render(); markDirty(); regenerate(false); });
-      list.append(el('div', {class: CLS + 'plant'},
+      const row = el('div', {class: CLS + 'plant'},
         el('span', {class: CLS + 'ord'}, String(i + 1)), matSel, headSel,
         el('span', {class: CLS + 'unit'}, '1 in'), chance,
         el('span', {class: CLS + 'unit'}, 'reach'), reach,
-        el('span', {class: CLS + 'unit'}, 'h'), height, up, dn, rm));
+        el('span', {class: CLS + 'unit'}, 'h'), height, up, dn, rm);
+      list.append(row);
+      const C = ctx();
+      const mark = (inp, k) => UI.liveMark(C, inp, 'shore.plants[].' + k, [inp]);
+      mark(matSel, 'material'); mark(headSel, 'head'); mark(chance, 'chance'); mark(reach, 'reach'); mark(height, 'height');
+      const e = LV.lookup('water', 'shore.plants[].material');
+      if (e && e.read === false) row.classList.add(CLS + 'dead');
     });
     const add = el('button', {}, '+ plant');
     add.addEventListener('click', () => {
@@ -575,6 +600,7 @@ function buildPanel() {
                  'double-click to remove.');
   BATHY_ROWS.forEach(r => UI.row(C, s.body, r, 'bathymetry'));
   const pre = el('div', {class: CLS + 'bar'}, el('span', {class: CLS + 'unit'}, 'profile'));
+  const preBtns = [];
   for (const [nm, pts] of PROFILE_PRESETS) {
     const b = el('button', {}, nm);
     b.addEventListener('click', () => {
@@ -583,8 +609,10 @@ function buildPanel() {
       markDirty(); regenerate(false);
     });
     pre.append(b);
+    preBtns.push(b);
   }
   s.body.append(pre);
+  UI.liveMark(C, pre, 'bathymetry.profile', preBtns);
   col.append(s.wrap);
 
   s = UI.section(el, CLS, 'Fill', 'What the basin holds. A body with no fill is a dry bed — a ' +
@@ -652,7 +680,8 @@ function buildPanel() {
     s = UI.section(el, CLS, 'Engine today — worldgen.pond*/shore*',
                    'What the ENGINE grows right now: one parabolic tarn per pond tile, shaped by these ' +
                    'tuning.json rows (live; a new world shows them). The presets above are what it will ' +
-                   'grow once worldgen reads the water table (PLAN_biomes.md §5, step 3).', {closed: true});
+                   'grow once P-F (geometry) and P-E (shore / aquatic rows) of docs/PLAN_environment_truth.md ' +
+                   'land; those packages delete these knobs.', {closed: true});
     const box = el('div', {class: 'trows'});
     for (const pr of wgTab.params) {
       if (pr.sec || !/^(pond|shore|reed|kelp|lily)/.test(pr.k)) continue;
@@ -666,14 +695,18 @@ function buildPanel() {
   const disp = el('input', {type: 'text', class: CLS + 'num', value: params.displayName});
   disp.addEventListener('change', () => { undo.snapshot(null); params.displayName = disp.value; markDirty(); });
   widgets.push(() => { disp.value = params.displayName; });
-  s.body.append(el('div', {class: CLS + 'row'}, el('label', {}, 'display name'), disp));
+  const dispRow = el('div', {class: CLS + 'row'}, el('label', {}, 'display name'), disp);
+  s.body.append(dispRow);
+  UI.liveMark(C, dispRow, 'displayName');
   const kind = el('select', {class: CLS + 'num'});
   ['lake', 'pond', 'marsh', 'pool', 'dry'].forEach(k => kind.append(el('option', {value: k}, k)));
   kind.value = params.kind;
   kind.addEventListener('change', () => { undo.snapshot(null); params.kind = kind.value; markDirty(); });
   widgets.push(() => { kind.value = params.kind; });
-  s.body.append(el('div', {class: CLS + 'row', title: 'A label the biome page groups by. No engine meaning.'},
-                   el('label', {}, 'kind'), kind));
+  const kindRow = el('div', {class: CLS + 'row', title: 'A label the biome page groups by. No engine meaning.'},
+                     el('label', {}, 'kind'), kind);
+  s.body.append(kindRow);
+  UI.liveMark(C, kindRow, 'kind');
   col.append(s.wrap);
 }
 

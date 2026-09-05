@@ -543,6 +543,20 @@ int RunVoxServe(GpuContext& ctx, World& world, Simulation& sim,
           sim.UploadTables(ctx.queue, live, nr);
         }
       }
+      // And the environment (docs/PLAN_environment_truth.md P-A): the biome
+      // files, the painted map and the tree atlas are most of what the
+      // terrain view exists to show. A RELOAD that kept the boot copies drew
+      // the biome you had, not the one you just saved.
+      {
+        biomes::EnvironmentStamp stamp;
+        std::string elog;
+        if (!ReloadEnvironment(ctx, sim, live, stamp, elog)) {
+          std::fprintf(stderr, "%s", elog.c_str());
+          fail("environment reload failed (kept old tables): " + elog);
+          continue;
+        }
+        std::fprintf(stderr, "%s\n", stamp.Line().c_str());
+      }
       ok(0);
       continue;
     }

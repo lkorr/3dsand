@@ -477,59 +477,8 @@ bool Simulation::Init(const rhi::Device& device, World& world,
     e.size = size;  // 0 = whole buffer, per rhi::BindGroupEntry
     return e;
   };
+  BuildSimBindGroups(device);
   for (int page = 0; page < 2; page++) {
-    rhi::BindGroupEntry entries[] = {
-        b(0, world_->voxels),
-        b(1, world_->dirty[page]),
-        b(2, world_->dirty[1 - page]),
-        b(3, materialBuf_),
-        b(4, world_->tickUBO),
-        b(5, world_->passUBO, 16),  // dynamic-offset window
-        b(6, world_->opsBuf),
-        b(7, world_->occupancy),
-        b(8, world_->hash),
-        b(9, world_->pick),
-        b(10, world_->renderUBO),
-        b(11, reactionBuf_),
-        b(12, world_->dirtyList),
-        b(13, world_->argsStage),
-        b(14, world_->cellOps),
-        b(15, world_->support),
-        b(16, world_->genList),
-        b(17, world_->pageTable),
-        b(18, world_->pageFaults),
-        b(19, world_->pageFillList),
-        b(20, world_->fluidBlockMap),
-        b(21, world_->fluidGrid),
-        b(22, world_->fluidCellScratch),
-        b(23, world_->actVoxViz),
-        b(24, world_->waterBodyState),
-        b(25, world_->fluidSpawnOps),
-        b(26, treeAtlasBuf_),
-        b(27, world_->openness),
-        b(28, world_->opennessGen),
-        b(29, world_->irradiance),
-        b(30, world_->genAct),
-        b(31, worldMapBuf_),
-    };
-    simBG_[page] = device.CreateBindGroup(simBGL_, entries, std::size(entries), "simBG");
-
-    rhi::BindGroupEntry sentries[] = {
-        b(0, world_->voxels),
-        b(1, world_->dirty[page]),
-        b(2, world_->dirty[1 - page]),
-        b(3, materialBuf_),
-        b(4, world_->tickUBO),
-        b(15, world_->support),
-        b(17, world_->pageTable),
-        b(18, world_->pageFaults),
-        b(24, world_->waterBodyState),
-        b(26, treeAtlasBuf_),
-        b(31, worldMapBuf_),
-    };
-    simSlimBG_[page] =
-        device.CreateBindGroup(simSlimBGL_, sentries, std::size(sentries), "simSlimBG");
-
     rhi::BindGroupEntry pentries[] = {
         b(0, world_->particles[page]),
         b(1, world_->particles[1 - page]),
@@ -732,6 +681,104 @@ void Simulation::SetArtPalette(const rhi::Queue& queue,
     run[i].color0 = ArtRgbToGpu(artPalette_[i]);
   queue.WriteBuffer(materialBuf_, (uint64_t)kArtPaletteBaseGpu * sizeof(MaterialGpu),
                     run.data(), run.size() * sizeof(MaterialGpu));
+}
+
+void Simulation::BuildSimBindGroups(const rhi::Device& device) {
+  auto b = [](uint32_t binding, const rhi::Buffer& buf, uint64_t size = 0) {
+    rhi::BindGroupEntry e{};
+    e.binding = binding;
+    e.buffer = buf;
+    e.size = size;  // 0 = whole buffer, per rhi::BindGroupEntry
+    return e;
+  };
+  for (int page = 0; page < 2; page++) {
+    rhi::BindGroupEntry entries[] = {
+        b(0, world_->voxels),
+        b(1, world_->dirty[page]),
+        b(2, world_->dirty[1 - page]),
+        b(3, materialBuf_),
+        b(4, world_->tickUBO),
+        b(5, world_->passUBO, 16),  // dynamic-offset window
+        b(6, world_->opsBuf),
+        b(7, world_->occupancy),
+        b(8, world_->hash),
+        b(9, world_->pick),
+        b(10, world_->renderUBO),
+        b(11, reactionBuf_),
+        b(12, world_->dirtyList),
+        b(13, world_->argsStage),
+        b(14, world_->cellOps),
+        b(15, world_->support),
+        b(16, world_->genList),
+        b(17, world_->pageTable),
+        b(18, world_->pageFaults),
+        b(19, world_->pageFillList),
+        b(20, world_->fluidBlockMap),
+        b(21, world_->fluidGrid),
+        b(22, world_->fluidCellScratch),
+        b(23, world_->actVoxViz),
+        b(24, world_->waterBodyState),
+        b(25, world_->fluidSpawnOps),
+        b(26, treeAtlasBuf_),
+        b(27, world_->openness),
+        b(28, world_->opennessGen),
+        b(29, world_->irradiance),
+        b(30, world_->genAct),
+        b(31, worldMapBuf_),
+    };
+    simBG_[page] = device.CreateBindGroup(simBGL_, entries, std::size(entries), "simBG");
+
+    rhi::BindGroupEntry sentries[] = {
+        b(0, world_->voxels),
+        b(1, world_->dirty[page]),
+        b(2, world_->dirty[1 - page]),
+        b(3, materialBuf_),
+        b(4, world_->tickUBO),
+        b(15, world_->support),
+        b(17, world_->pageTable),
+        b(18, world_->pageFaults),
+        b(24, world_->waterBodyState),
+        b(26, treeAtlasBuf_),
+        b(31, worldMapBuf_),
+    };
+    simSlimBG_[page] =
+        device.CreateBindGroup(simSlimBGL_, sentries, std::size(sentries), "simSlimBG");
+  }
+}
+
+void Simulation::UploadEnvironment(const rhi::Device& device, const rhi::Queue& queue,
+                                   const TreeAtlas& trees,
+                                   const std::vector<uint32_t>& worldMapWords) {
+  // Grow-only: a table that shrank keeps its buffer and is zero-padded, the
+  // same way Init pads to the header floor. Only a table that no longer fits
+  // costs a new buffer -- and with it the two bind groups, because a bind
+  // group names a buffer, not a slot.
+  bool rebind = false;
+  if (trees.words.size() > treeAtlasWords_) {
+    treeAtlasWords_ = trees.words.size();
+    treeAtlasBuf_ = CreateBuffer(device, (uint64_t)treeAtlasWords_ * 4,
+                                 rhi::BufferUsage::Storage | rhi::BufferUsage::CopyDst,
+                                 "treeAtlas");
+    rebind = true;
+  }
+  if (worldMapWords.size() > worldMapWords_) {
+    worldMapWords_ = worldMapWords.size();
+    worldMapBuf_ = CreateBuffer(device, (uint64_t)worldMapWords_ * 4,
+                                rhi::BufferUsage::Storage | rhi::BufferUsage::CopyDst,
+                                "worldMap");
+    rebind = true;
+  }
+  {
+    std::vector<uint32_t> pad = trees.words;
+    pad.resize(treeAtlasWords_, 0u);
+    queue.WriteBuffer(treeAtlasBuf_, 0, pad.data(), pad.size() * 4);
+  }
+  {
+    std::vector<uint32_t> pad = worldMapWords;
+    pad.resize(worldMapWords_, 0u);
+    queue.WriteBuffer(worldMapBuf_, 0, pad.data(), pad.size() * 4);
+  }
+  if (rebind) BuildSimBindGroups(device);
 }
 
 void Simulation::UploadTables(const rhi::Queue& queue,

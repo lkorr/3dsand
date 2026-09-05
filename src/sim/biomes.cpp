@@ -266,6 +266,69 @@ const BiomeDef* BiomeById(const BiomeSet& set, int id) {
   return nullptr;
 }
 
+// ---- the environment stamp ----------------------------------------------------
+// MIRRORED by scripts/tuner_server.py `_fnv_file_set`: same seed, same prime,
+// same (name, 0, bytes) sequence, same byte-order sort. A drift here shows as
+// a permanently STALE badge in the tuner, which is loud enough.
+uint32_t HashFileSet(const std::string& dir, const std::vector<std::string>& exts) {
+  std::vector<fs::path> files;
+  std::error_code ec;
+  if (fs::is_directory(dir, ec)) {
+    for (const auto& e : fs::directory_iterator(dir, ec)) {
+      if (!e.is_regular_file(ec)) continue;
+      const std::string ext = e.path().extension().string();
+      bool want = exts.empty();
+      for (const std::string& x : exts) want = want || ext == x;
+      if (want) files.push_back(e.path());
+    }
+  }
+  std::sort(files.begin(), files.end(), [](const fs::path& a, const fs::path& b) {
+    return a.filename().string() < b.filename().string();
+  });
+  uint32_t h = 2166136261u;
+  auto mix = [&](const unsigned char* p, size_t n) {
+    for (size_t i = 0; i < n; i++) { h ^= p[i]; h *= 16777619u; }
+  };
+  for (const fs::path& p : files) {
+    const std::string name = p.filename().string();
+    mix(reinterpret_cast<const unsigned char*>(name.data()), name.size());
+    const unsigned char zero = 0;
+    mix(&zero, 1);
+    std::ifstream f(p, std::ios::binary);
+    std::string bytes((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    mix(reinterpret_cast<const unsigned char*>(bytes.data()), bytes.size());
+  }
+  return h;
+}
+
+EnvironmentStamp StampEnvironment(const std::string& assetDir, const std::string& mapName) {
+  EnvironmentStamp s;
+  s.mapName = mapName;
+  s.map = HashFileSet(assetDir + "/worldmap/" + mapName, {".json", ".svmap"});
+  // The water presets are a worldgen input since P-E (their flora rows are
+  // packed into the same buffer as the biome records), so they are part of
+  // the `biomes` stamp: an edited preset must light the apply button too.
+  s.biomes = HashFileSet(assetDir + "/biomes", {".json"}) ^
+             HashFileSet(assetDir + "/water", {".json"});
+  s.trees = HashFileSet(assetDir + "/trees", {".json", ".svtree"});
+  return s;
+}
+
+std::string EnvironmentStamp::Line() const {
+  char buf[256];
+  std::snprintf(buf, sizeof buf, "environment: map %s %08x | biomes %08x | trees %08x",
+                mapName.c_str(), map, biomes, trees);
+  return buf;
+}
+
+std::string EnvironmentStamp::Json() const {
+  char buf[256];
+  std::snprintf(buf, sizeof buf,
+                "{\"map\":\"%s\",\"mapHash\":\"%08x\",\"biomesHash\":\"%08x\",\"treesHash\":\"%08x\"}",
+                mapName.c_str(), map, biomes, trees);
+  return buf;
+}
+
 int ValidateBiomeSet(const BiomeSet& set, std::vector<std::string>& out) {
   int n = 0;
   auto bad = [&](const std::string& s) { out.push_back(s); n++; };

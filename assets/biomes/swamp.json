@@ -22,7 +22,7 @@
       {
         "material": "cattail",
         "head": "cattail_head",
-        "chance": 12,
+        "chance": 24,
         "height": 0.9,
         "conditions": {
           "minY": -1,
@@ -36,7 +36,7 @@
       {
         "material": "horsetail",
         "head": "",
-        "chance": 14,
+        "chance": 28,
         "height": 0.6,
         "conditions": {
           "minY": -1,
@@ -50,7 +50,7 @@
       {
         "material": "fern",
         "head": "",
-        "chance": 20,
+        "chance": 40,
         "height": 0.4,
         "conditions": {
           "minY": -1,
@@ -64,7 +64,7 @@
       {
         "material": "moss_patch",
         "head": "",
-        "chance": 24,
+        "chance": 48,
         "height": 0.1,
         "conditions": {
           "minY": -1,
@@ -78,7 +78,7 @@
       {
         "material": "marsh_grass",
         "head": "",
-        "chance": 5,
+        "chance": 10,
         "height": 0.2,
         "conditions": {
           "minY": -1,

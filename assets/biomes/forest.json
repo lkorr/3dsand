@@ -22,7 +22,7 @@
       {
         "material": "fern",
         "head": "",
-        "chance": 16,
+        "chance": 32,
         "height": 0.4,
         "conditions": {
           "minY": -1,
@@ -36,7 +36,7 @@
       {
         "material": "flower_bluebell",
         "head": "",
-        "chance": 40,
+        "chance": 80,
         "height": 0.2,
         "conditions": {
           "minY": -1,
@@ -50,7 +50,7 @@
       {
         "material": "mushroom_cluster",
         "head": "",
-        "chance": 90,
+        "chance": 180,
         "height": 0.2,
         "conditions": {
           "minY": -1,
@@ -64,7 +64,7 @@
       {
         "material": "bramble",
         "head": "",
-        "chance": 60,
+        "chance": 120,
         "height": 0.4,
         "conditions": {
           "minY": -1,
@@ -78,7 +78,7 @@
       {
         "material": "grass_tuft",
         "head": "",
-        "chance": 9,
+        "chance": 18,
         "height": 0.2,
         "conditions": {
           "minY": -1,

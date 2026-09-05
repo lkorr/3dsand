@@ -18,6 +18,7 @@
 #include "math3d.h"
 #include "phys/debris.h"
 #include "game/mob.h"
+#include "sim/biomes.h"
 #include "sim/simulation.h"
 #include "sim/tuning.h"
 #include "sim/world.h"
@@ -88,6 +89,20 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
 
 void SubmitWorldgen(GpuContext& ctx, World& world, Simulation& sim,
                     uint32_t seed);
+
+// Re-read the AUTHORED ENVIRONMENT from disk -- assets/biomes/*.json, the
+// world map named by worldgen.mapLayer, assets/trees/* -- validate it the way
+// boot does, and push it to the GPU (Simulation::UploadEnvironment) and to
+// the CPU twins (worldmap::SetCurrentWorldMap). docs/PLAN_environment_truth.md
+// P-A: this is what "regen world", F7, the tuner's Apply button and
+// --voxserve's RELOAD all call, so a saved biome or a repainted map reaches
+// the next worldgen without a restart. Drains the GPU first (a table that
+// grew is a new buffer). On ANY failure nothing is replaced: the world keeps
+// generating from the tables it had and `log` says which file refused. Does
+// NOT regenerate anything itself -- the caller decides what to rebuild.
+bool ReloadEnvironment(GpuContext& ctx, Simulation& sim,
+                       const std::vector<MaterialDef>& mats,
+                       biomes::EnvironmentStamp& stamp, std::string& log);
 
 // ---- harness snapshot drain (PLAN_page_table.md, phase 7b) ----------------
 //
