@@ -849,6 +849,7 @@
   },
   "worldgen": {
     "refVoxelsPerMetre": 10,
+    "vegetation": 1,
     "treeline": 228,
     "baseHeight": 200,
     "contAmplitude": 1024,

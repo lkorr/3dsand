@@ -2354,6 +2354,8 @@ bool LoadTuning(const std::string& path, Tuning& out) {
                                  Tuning& t, const std::string& a) {
       ReadI(o, k, v, t, a);
     };
+    ReadWgCount(*g, "vegetation", w.vegetation, out, at);
+    w.vegetation = (w.vegetation != 0) ? 1 : 0;   // a flag: anything nonzero is on
     ReadWgLen(*g, "treeline", w.treeline, out, at);
     ReadWgLen(*g, "baseHeight", w.baseHeight, out, at);
     // The octave ladder. Amplitudes are LENGTHS and cells are LOG2 CELLS, so a
@@ -2706,6 +2708,7 @@ std::string WorldgenDefaultsJson() {
   };
   o << "{\n  \"worldgen\": {";
   n("refVoxelsPerMetre", w.refVoxelsPerMetre);
+  n("vegetation", w.vegetation);
   n("treeline", w.treeline);
   n("baseHeight", w.baseHeight);
   n("contAmplitude", w.contAmplitude);

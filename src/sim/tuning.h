@@ -2859,6 +2859,10 @@ struct Tuning {
     // the Q8 slope) are untouched, because a probability and a gradient do not
     // have a length in them.
     int refVoxelsPerMetre = 10;
+    // 1 = plants generate, 0 = a bare world (trees, cacti, flowers, grass,
+    // undergrowth, cover rows, shore/pond/cave flora, alpine cushion, wet moss
+    // all off). A frame-rate A/B lever; see tuning_params.def.
+    int vegetation = 1;
     int treeline = 228;
     // The world DATUM. Every octave below is a CENTRED deviation, so terrain
     // sits at baseHeight on average and spans +- half the summed amplitudes.

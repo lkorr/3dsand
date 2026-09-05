@@ -422,6 +422,7 @@ SPEC = [
 
     # worldgen (integer; needs a world regen to take effect)
     ("worldgen", "refVoxelsPerMetre", "TUNE_REF_VOXELS_PER_METRE", "i", 10),
+    ("worldgen", "vegetation", "TUNE_VEGETATION", "u", 1),
     ("worldgen", "treeline", "TUNE_TREELINE", "i", 228),
     ("worldgen", "baseHeight", "TUNE_BASE_HEIGHT", "i", 200),
     ("worldgen", "contAmplitude", "TUNE_CONT_AMPLITUDE", "i", 1024),

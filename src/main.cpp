@@ -4727,7 +4727,15 @@ int main(int argc, char** argv) {
     // it is the third kind of hot reload, and the one an Environment-tab save
     // needs -- worldgen reads those tables, so a reload without a regen would
     // show nothing and a regen without a reload shows the OLD tables.
-    if (devKeys && eF7.Pressed(key(GLFW_KEY_F7))) ui.regenWorld = true;
+    // F7 ALSO takes the F5 path first: worldgen's knobs are WGSL constants
+    // baked into the kernel through the tuning prelude, so a regen on the old
+    // kernel shows the old world -- which is the same argument as the
+    // environment reload above, one level down. The reload block runs earlier
+    // in this same frame than the regen block, so the order is right.
+    if (devKeys && eF7.Pressed(key(GLFW_KEY_F7))) {
+      ui.reloadShaders = true;
+      ui.regenWorld = true;
+    }
     if (devKeys && eF9.Pressed(key(GLFW_KEY_F9))) ui.saveWorld = true;
     if (devKeys && eF10.Pressed(key(GLFW_KEY_F10))) ui.loadWorld = true;
     if (devKeys && eR.Pressed(key(GLFW_KEY_R))) ui.reloadMaterials = true;

@@ -1107,6 +1107,9 @@ const TUNING_SCHEMA = [
     group: 'worldgen',
     blurb: 'Terrain shape, biomes, trees, ponds and caves. These only affect newly generated chunks — press "regen world" (or walk somewhere new) to see changes.',
     params: [
+      {k:'vegetation', n:'vegetation', sec:{t:'vegetation', d:'the one switch for every plant'},
+       d:'Whether worldgen places plants at all. Off is a BARE world: no trees, cacti, flowers, tall grass, undergrowth, biome cover rows, shore plants, pond life, cave flora, alpine cushion or wet moss. Terrain, water, caves and ruins are untouched. This is the frame-rate A/B lever — the analytic plant tracer bills per plant cell in view, and this removes every one of them — so compare a walk with it on against the same walk with it off. In-game: press F7 (reload + regen) after flipping it. Worldgen knob, so it moves the world hash while off.',
+       bool:true, boolInt:true},
       {k:'baseHeight', n:'world datum', d:'The MEAN terrain height. Every octave below is a centred deviation, so the ground sits here on average and spans this plus or minus half the summed amplitudes — there is as much room below the datum for sea basins as above it for mountains.', min:0, max:1024, step:4, int:true, u:'vox'},
       {k:'contAmplitude', n:'continental height', d:'Full swing of the coarsest octave — the one that decides where the landmasses and the deep basins are. At 1024 the field spans plus or minus 51 m from this rung alone. This and "range height" are the two octaves the calm home area fades out.', min:0, max:2048, step:16, int:true, u:'vox'},
       {k:'contLog2', n:'continental size (log2)', d:'Continental noise cell as a power of two: 11 = 2048 voxels = 204.8 m. A LOG2 exponent, not a size — that is what makes the terrain noise divide-free. Keep amplitude/cell near 0.5 or you are building slope rather than relief.', min:3, max:15, step:1, int:true, u:'log2'},

@@ -492,6 +492,14 @@ const HSCALE : i32 = 1;
 // a bare `80` in four places when the band was y44..y90 — retune it whenever
 // the band moves.
 const TREELINE : i32 = TUNE_TREELINE;
+// worldgen.vegetation: the kill-switch for every plant this file places. Gated
+// at the SOURCE of each feature (the *Info / *At functions and the table-driven
+// blocks in genCellIn), not by a material test at the end, so the tree
+// candidate scan, the undergrowth canopy scan and the far cascade's crown
+// proxy all see the same treeless, coverless world -- and none of them pays
+// for plants that will not be placed. A frame-rate A/B lever; terrain, water,
+// caves and ruins are untouched.
+const VEGETATION : bool = TUNE_VEGETATION != 0u;
 
 // ---- the biome FIELD, split from the biome DECISION ------------------------
 //
@@ -1888,6 +1896,7 @@ fn treeInfoAt(s : TreeSite, land : Land, seed : u32) -> Tree {
 
   let ns = taSpeciesCount();
   if (ns <= 0) { return t; }            // no atlas: a legal, treeless world
+  if (!VEGETATION) { return t; }        // worldgen.vegetation = 0: no trees
 
   let hsh = s.hsh;
   let h = land.h;
@@ -2353,6 +2362,7 @@ fn cactusInfo(tx : i32, tz : i32, seed : u32) -> Cactus {
   // Only where the biome says so (cover.cacti), and never on the keep-out
   // ground every other feature avoids: the spawn clearing, the selftest
   // fixture pads, or a pond.
+  if (!VEGETATION) { return c; }
   let cb = biomeAt(c.wx, c.wz, seed);
   if (!wmFlag(cb, WM_BF_CACTI)) { return c; }
   let h = baseHeight(c.wx, c.wz, seed);
@@ -2606,6 +2616,7 @@ fn flowerAt(x : i32, z : i32, seed : u32, cover : i32) -> Flower {
   var f : Flower;
   f.mat = MAT_AIR;
   f.height = 0;
+  if (!VEGETATION) { return f; }
 
   let fr = hash3(seed ^ 0xF10Eu, bitcast<u32>(x), bitcast<u32>(z));
   let clump = vnoise(x, z, 24 * HSCALE, seed ^ 0xF11Eu);
@@ -2906,6 +2917,7 @@ fn caveAt(x : i32, y : i32, z : i32, h : i32, biome : u32, seed : u32) -> i32 {
 //
 // Returns MAT_AIR for "leave the cave open".
 fn caveFloraAt(b : CaveBands, biome : u32, x : i32, y : i32, z : i32, seed : u32) -> u32 {
+  if (!VEGETATION) { return MAT_AIR; }
   // Never in the flooded band, and never within reach of it.
   if (y <= LAVA_LEVEL + CAVE_LAVA_MARGIN) { return MAT_AIR; }
 
@@ -3027,6 +3039,7 @@ fn plantColumnAt(x : i32, z : i32, seed : u32, biome : u32) -> PlantCol {
   pc.mat = MAT_AIR;
   pc.base = 0;
   pc.top = -1;
+  if (!VEGETATION) { return pc; }
   // The tile plants belong to biomes with the ground-flora layer (the
   // world map's flag), not to two hard-coded ids.
   if (!wmFlag(biome, WM_BF_GROUND_FLORA)) { return pc; }
@@ -3564,7 +3577,7 @@ fn genCellIn(col : Col,
     // pond-life block below and is what once turned scattered planting into a
     // solid wall. Chance and material are the water preset's (shore.mossChance
     // / mossMaterial); a biome with no water rows reads 0 and grows none.
-    if (mat == M_STONE && y == h && shore.onShore) {
+    if (VEGETATION && mat == M_STONE && y == h && shore.onShore) {
       let wp = wmWaterOf(biome);
       let mossMat = wmWater(wp, WM_W_MOSS_MAT);
       if (mossMat != 0u &&
@@ -3605,7 +3618,7 @@ fn genCellIn(col : Col,
   // see wmWaterOf). Depths are voxels of water over the bed, heights cells
   // above the bed. A band with chance 0, or a biome with no water rows, rolls
   // nothing (rollChance).
-  if (mat == M_WATER && pond >= 0) {
+  if (VEGETATION && mat == M_WATER && pond >= 0) {
     let wp = wmWaterOf(biome);
     let bed = min(h, pw.x);          // the carved bowl floor at this column
     let depth = pond - bed;          // water column height in voxels
@@ -3649,7 +3662,7 @@ fn genCellIn(col : Col,
   // so they are the same features as the water-cell block above continued
   // upward — same hashes, same column tests, so a reed is one continuous stalk
   // through the surface rather than two unrelated halves.
-  if (mat == MAT_AIR && pond >= 0 && y > pond) {
+  if (VEGETATION && mat == MAT_AIR && pond >= 0 && y > pond) {
     let wp = wmWaterOf(biome);
     let bed = min(h, pw.x);
     let depth = pond - bed;
@@ -3675,7 +3688,7 @@ fn genCellIn(col : Col,
   // ---- surface cover: trees, then ground flora ----
   // Only above ground and out of the water, and never inside the authored rims
   // (a tree rooted on a pool rim would drop leaves into the pool).
-  if (mat == MAT_AIR && !inRim && y > h && h < TREELINE && pond < 0) {
+  if (VEGETATION && mat == MAT_AIR && !inRim && y > h && h < TREELINE && pond < 0) {
     var tm = MAT_AIR;
     if (treeValid) { tm = treeFromCands(trees, y); }
     else { tm = treeAt(x, y, z, seed); }
@@ -3720,7 +3733,7 @@ fn genCellIn(col : Col,
   // on the SAME hash is what keeps a head from floating over no stalk.
   // worldmap.cpp's MaxPlantH includes the jitter, so the sky-skip and far
   // blocker ceilings cover the tallest column a row can produce.
-  if (mat == MAT_AIR && shore.onShore && y > h) {
+  if (VEGETATION && mat == MAT_AIR && shore.onShore && y > h) {
     let up = y - h;                  // voxels above this column's ground
     let wp = wmWaterOf(biome);
     let nRows = wmWater(wp, WM_W_SHORE_COUNT);
@@ -3748,7 +3761,7 @@ fn genCellIn(col : Col,
   }
 
 
-  if (mat == MAT_AIR && y == h + 1 &&       !inRim && pond < 0 && h < TREELINE &&
+  if (VEGETATION && mat == MAT_AIR && y == h + 1 && !inRim && pond < 0 && h < TREELINE &&
       wmFlag(biome, WM_BF_GROUND_FLORA) && !shore.onShore && !siteKeepOut(x, z)) {
     let fr = hash3(seed ^ 0xF10Eu, bitcast<u32>(x), bitcast<u32>(z));
     // ONE 25-tile scan answers both "how shaded is this column" and "how far to
@@ -3883,7 +3896,7 @@ fn genCellIn(col : Col,
   // repeated here rather than inferred: this branch RE-DERIVES the species from
   // flowerAt instead of reading the base cell, so a guard the base block took
   // and this one did not would grow a headless stalk out of a stone floor.
-  if (mat == MAT_AIR && y > h + 1 && y <= h + FLOWER_MAX_H && !inRim && pond < 0 &&
+  if (VEGETATION && mat == MAT_AIR && y > h + 1 && y <= h + FLOWER_MAX_H && !inRim && pond < 0 &&
       h < TREELINE && wmFlag(biome, WM_BF_GROUND_FLORA) && !shore.onShore &&
       !siteKeepOut(x, z)) {
     let fl = flowerAt(x, z, seed, UG_COVER_EDGE);
@@ -3920,7 +3933,7 @@ fn genCellIn(col : Col,
   // the ponds, the spawn clearing and the selftest fixture pads. cactusInfo()
   // enforces them at the SITE (so a column rooted outside cannot lean back in),
   // and the ground block re-tests them per column.
-  if (mat == MAT_AIR && wmFlag(biome, WM_BF_CACTI) && !inRim && y > h && pond < 0 &&
+  if (VEGETATION && mat == MAT_AIR && wmFlag(biome, WM_BF_CACTI) && !inRim && y > h && pond < 0 &&
       h < TREELINE) {
     let cm = cactusAt(x, y, z, seed);
     if (cm != MAT_AIR) { mat = cm; }
@@ -3946,7 +3959,7 @@ fn genCellIn(col : Col,
   // until a hit; a biome with no rows pays one header read. Everything placed
   // is inert (rule 2): the loader resolves names against materials.json and
   // nothing here is a stem/sprout/seed.
-  if (mat == MAT_AIR && y > h && !inRim && pond < 0 && h < TREELINE &&
+  if (VEGETATION && mat == MAT_AIR && y > h && !inRim && pond < 0 && h < TREELINE &&
       !siteKeepOut(x, z)) {
     let up = y - h;
     let nRows = wmBiome(biome, WM_B_COVER_COUNT);
@@ -4012,7 +4025,7 @@ fn genCellIn(col : Col,
   // centimetres of growth pressed flat against the ground — so rather than spend
   // a material id on the distinction, the ground under it makes it: on snow the
   // cell reads as a cushion, on wind-scoured stone as lichen.
-  if (mat == MAT_AIR && y == h + 1 && h >= TREELINE && !inRim && pond < 0 &&
+  if (VEGETATION && mat == MAT_AIR && y == h + 1 && h >= TREELINE && !inRim && pond < 0 &&
       !siteKeepOut(x, z)) {
     let hAlp = hash3(seed ^ 0xA1F1u, bitcast<u32>(x), bitcast<u32>(z));
     // A patch mask here too, but a WEAK one: alpine plants really do grow in

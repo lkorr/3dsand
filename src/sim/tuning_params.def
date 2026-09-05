@@ -641,6 +641,17 @@ TP_F(sim, currentDrag, TUNE_CURRENT_DRAG, 6.0f)
 // Bump this row instead if you ever re-author the group at the new scale.
 // (The shader's own hardcoded lengths scale off VOXELS_PER_M / this.)
 TP_I(worldgen, refVoxelsPerMetre, TUNE_REF_VOXELS_PER_METRE, 10)
+// THE VEGETATION KILL-SWITCH. 0 generates a world with no plants at all: no
+// trees, cacti, flowers, tall grass, undergrowth, biome cover rows, shore
+// plants, pond life, cave flora, alpine cushion or wet moss. Every placement
+// block in worldgen.wgsl is gated on it at its SOURCE (treeInfoAt, cactusInfo,
+// flowerAt, plantColumnAt, caveFloraAt and the table-driven blocks in
+// genCellIn), so the far cascade, the undergrowth canopy scan and the tree
+// candidate list all agree there is nothing there. A frame-rate A/B lever: the
+// analytic plant tracer costs per plant cell it can see, and this is the one
+// switch that removes every one of them. Terrain, water, caves and ruins are
+// untouched. MOVES THE WORLD HASH at 0, as any worldgen knob does.
+TP_U(worldgen, vegetation, TUNE_VEGETATION, 1)
 TP_I(worldgen, treeline, TUNE_TREELINE, 228)
 // The world DATUM: the mean of the octave ladder below, since every octave is a
 // CENTRED deviation (n - 8192) rather than a 0..amp lump. So terrain sits at
