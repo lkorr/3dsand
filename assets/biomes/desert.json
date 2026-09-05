@@ -64,7 +64,9 @@
     ],
     "groundFlora": false,
     "cacti": true,
-    "sandCap": true
+    "sandCap": true,
+    "cactusChance": 26,
+    "saguaroFraction": 22
   },
   "trees": {
     "tile": 14.4,
@@ -151,7 +153,8 @@
           "nearWaterMax": -1,
           "nearWaterMin": 0,
           "patchThreshold": 0
-        }
+        },
+        "mushroomChance": 26
       },
       {
         "preset": "deep",
@@ -164,7 +167,8 @@
           "nearWaterMax": -1,
           "nearWaterMin": 0,
           "patchThreshold": 0
-        }
+        },
+        "crystalChance": 9
       }
     ]
   },

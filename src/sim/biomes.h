@@ -79,6 +79,12 @@ struct CaveRow {
   std::string preset;                    // near_surface | deep
   int threshold = 0;
   int rarity = 0;
+  // P-E: the flora on this band's floor (and, for the deep band, ceiling).
+  // 1-in-N per eligible cell inside the patch mask; 0 = never. Only
+  // mushroomChance is read from the near_surface row and only crystalChance
+  // from the deep row (worldmap.cpp packs them that way).
+  int mushroomChance = 0;
+  int crystalChance = 0;
   Conditions cond;
 };
 
@@ -97,6 +103,11 @@ struct BiomeDef {
   bool groundFlora = true;   // the canopy-inverted undergrowth + flower layer
   bool cacti = false;        // the cactus proc shape
   bool sandCap = false;      // loose sand cap under the skin
+  // P-E: the cactus density, when `cacti` is on. Percent of 2.5 m tiles that
+  // hold one, and the percent of those that are tall saguaro columns rather
+  // than barrels (cover.cactusChance / cover.saguaroFraction in the JSON).
+  int cactusChance = 0;
+  int saguaroFraction = 0;
   std::vector<CoverRow> cover;
   float treeTileM = 14.4f;
   int treeDensity = 0;                   // percent of tiles
@@ -105,6 +116,26 @@ struct BiomeDef {
   std::vector<CaveRow> caves;
   std::map<std::string, double> terrainOverrides;   // worldgen.<key> -> value
   std::string file;
+};
+
+/** One shore.plants[] row: a stalk on the wet fringe outside the water. */
+struct ShorePlantRow {
+  std::string material, head;
+  uint32_t materialId = 0, headId = 0;   // resolved; 0 = unresolved / none
+  int chance = 0;                        // 1 in N shore columns within reach; 0 = off
+  float reachM = 0;                      // metres past the waterline it still grows
+  float heightM = 0.3f;                  // stalk height above the ground
+};
+
+/** The aquatic.* bands: what grows in the water, by depth over the bed. */
+struct AquaticBand {
+  std::string material, flower;          // `flower` is the floating band's blossom
+  uint32_t materialId = 0, flowerId = 0;
+  int chance = 0;                        // 1 in N columns in the band; 0 = off
+  int flowerChance = 0;                  // floating: 1 in N pads carry the flower
+  float minDepthM = 0, maxDepthM = 0;    // the depth band (submerged: min only)
+  float heightM = 0;                     // emergent / submerged: cells above the bed
+  float clearanceM = 0;                  // submerged: water kept clear above the top
 };
 
 struct WaterPresetDef {
@@ -117,6 +148,13 @@ struct WaterPresetDef {
   std::vector<std::string> unresolved;   // the subset materials.json does not have
   float tileM = 0;
   int rarity = 0, maxSlope = 0;
+  // P-E: the flora half, read by worldgen through the worldMap buffer's
+  // water preset table (worldmap.h kW_* / kP_*).
+  int mossChance = 0;                    // 1-in-N shore stone surface cells; 0 = never
+  std::string mossMaterial;
+  uint32_t mossId = 0;
+  std::vector<ShorePlantRow> shorePlants;
+  AquaticBand emergent, floating, submerged;
   std::string file;
 };
 
