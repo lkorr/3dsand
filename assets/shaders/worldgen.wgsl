@@ -78,6 +78,15 @@ const M_PINE   : u32 = 35u;
 const M_AUTUMN : u32 = 36u;
 const M_BIRCH  : u32 = 37u;
 const M_PETAL  : u32 = 38u;
+// The one-cell grass DECORATION at y == h + 1, as opposed to M_GRASS, which is
+// the ground SKIN at y == h. They used to be the same material and that was the
+// bug: `grass` is not `passable`, so a decorative blade was a solid 10 cm step
+// rendered in the identical colour as the lawn it stood on, while the tall
+// grass and flowers beside it were walk-through. The walkable surface of a
+// meadow alternated between h+1 and h+2 on a per-column hash with nothing
+// visible to explain it. Two jobs, two materials: the skin stays solid because
+// it IS the ground, the decoration is passable like every other plant.
+const M_GRASS_TUFT : u32 = 39u;
 // ---- aquatic plants (materials.json ids 59..62) ----
 const M_LILYPAD : u32 = 59u;
 const M_LILYFLR : u32 = 60u;
@@ -2166,7 +2175,11 @@ fn flowerAt(x : i32, z : i32, seed : u32, cover : i32) -> Flower {
 
   // Grass is the default: a meadow is grass WITH flowers in it. Grass and petal
   // stay ONE cell — they are the ground layer the flowers rise out of.
-  var m = select(M_PETAL, M_GRASS, (fr >> 11u) % 4u != 0u);
+  //
+  // M_GRASS_TUFT, never M_GRASS: this cell sits at h + 1, ON the skin, and the
+  // skin material is not passable. See the constant's note — a tuft spelled as
+  // the skin is a solid step you cannot see.
+  var m = select(M_PETAL, M_GRASS_TUFT, (fr >> 11u) % 4u != 0u);
   if (spj < 55) {
     if ((hBell % 3u) == 0u) { m = M_BLUEBELL; }
   } else if (spj < 100) {
@@ -2181,7 +2194,7 @@ fn flowerAt(x : i32, z : i32, seed : u32, cover : i32) -> Flower {
 
   f.mat = m;
   // Only the five flowers stack; grass and petal are the one-cell ground layer.
-  if (m == M_GRASS || m == M_PETAL) { f.height = 1; }
+  if (m == M_GRASS_TUFT || m == M_PETAL) { f.height = 1; }
   else { f.height = flowerHeight(m, hFoxg >> 7u); }
   return f;
 }
@@ -3537,7 +3550,7 @@ fn genCellIn(col : Col,
     var fl = stalk;
     if (fl.height < 0) { fl = flowerAt(x, z, seed, UG_COVER_EDGE); }
     // Grass and petal are the one-cell ground layer and never stack.
-    if (fl.mat != MAT_AIR && fl.mat != M_GRASS && fl.mat != M_PETAL &&
+    if (fl.mat != MAT_AIR && fl.mat != M_GRASS_TUFT && fl.mat != M_PETAL &&
         (y - h) <= fl.height) {
       mat = fl.mat;
       // Tall grass caps its stack with the head material — dried tips at the

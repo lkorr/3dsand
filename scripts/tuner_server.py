@@ -407,7 +407,57 @@ def _next_variant_name(setdir, setname, ext):
 # Through scripts/build.sh, never raw cmake: the script owns the generator
 # choice (Ninja + sccache needs the MSVC environment it captures), the compile
 # and GPU locks, and the taskkill before the link.
-BUILD_CMD = ["bash", os.path.join(ROOT, "scripts", "build.sh")]
+
+def bash_exe():
+    """The bash that runs scripts/*.sh: Git for Windows (or MSYS2), NEVER the
+    WSL launcher.
+
+    A bare "bash" is not that. Launched from Explorer the tuner inherits the
+    machine PATH, whose first entry is C:/Windows/System32 -- and System32
+    holds bash.exe, the WSL launcher. That bash eats the backslashes of a
+    Windows path and looks for what is left inside a Linux distro:
+    "/bin/bash: C:UsersLuke...scriptsbuild.sh: No such file or directory",
+    exit 127. From a Git Bash terminal the same "bash" happens to resolve to
+    the right one, which is why this only ever failed for the double-clicked
+    exe. Resolve it by install location, in this order: SANDVOX_BASH, git's
+    own tree (the git on PATH: scoop or the installer), the usual install
+    roots, then whatever `bash` PATH names as long as it is not under
+    Windows/ (WSL) or WindowsApps/ (the Store stub)."""
+    env = os.environ.get("SANDVOX_BASH")
+    if env and os.path.isfile(env):
+        return env
+    cands = []
+    git = shutil.which("git")
+    if git:
+        # <root>/cmd/git.exe, <root>/bin/git.exe or <root>/mingw64/bin/git.exe
+        d = os.path.dirname(os.path.abspath(git))
+        for root in (os.path.dirname(d), os.path.dirname(os.path.dirname(d))):
+            cands += [os.path.join(root, "bin", "bash.exe"),
+                      os.path.join(root, "usr", "bin", "bash.exe")]
+    for pf in (os.environ.get("ProgramFiles", "C:/Program Files"),
+               os.environ.get("ProgramFiles(x86)", "C:/Program Files (x86)"),
+               os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs")):
+        cands += [os.path.join(pf, "Git", "bin", "bash.exe"),
+                  os.path.join(pf, "Git", "usr", "bin", "bash.exe")]
+    cands += ["C:/msys64/usr/bin/bash.exe"]
+    for c in cands:
+        if c and os.path.isfile(c):
+            return c
+    found = shutil.which("bash")
+    if found:
+        low = os.path.abspath(found).lower()
+        windir = os.environ.get("WINDIR", "C:/Windows").lower().replace("/", "\\")
+        if not low.startswith(windir) and "windowsapps" not in low:
+            return found
+    return "bash"
+
+
+def build_cmd():
+    """Built per call, not at import: the frozen app re-points ROOT after
+    importing this module (tuner_app.main), and a module-level list captured
+    the PyInstaller extraction directory's parent: Temp/scripts/build.sh."""
+    return [bash_exe(), os.path.join(ROOT, "scripts", "build.sh")]
+
 EXE = os.path.join(ROOT, "build", "Release", "sandvox.exe")
 
 # Build state, shared with the poller. Guarded because ThreadingHTTPServer
@@ -677,7 +727,7 @@ def run_build():
     with _lock:
         _build = {"running": True, "ok": None, "log": "", "returncode": None}
     try:
-        p = subprocess.run(BUILD_CMD, cwd=ROOT, capture_output=True,
+        p = subprocess.run(build_cmd(), cwd=ROOT, capture_output=True,
                            shell=False, timeout=1800,
                            creationflags=subprocess.CREATE_NO_WINDOW)
         out = _text(p.stdout) + _text(p.stderr)
@@ -700,8 +750,8 @@ def run_build():
     except FileNotFoundError:
         with _lock:
             _build = {"running": False, "ok": False, "returncode": -1,
-                      "log": "cmake not found on PATH. Open a shell that has it "
-                             "(or the VS developer prompt) and try there."}
+                      "log": "bash not found (%s). Install Git for Windows, or "
+                             "set SANDVOX_BASH to a bash.exe." % (build_cmd()[0],)}
     except subprocess.TimeoutExpired:
         with _lock:
             _build = {"running": False, "ok": False, "returncode": -1,
@@ -1537,7 +1587,7 @@ class Handler(BaseHTTPRequestHandler):
 
             body = self._body()
             scenario = body.get("scenario") or ""
-            argv = ["bash", os.path.join(ROOT, "scripts", "run.sh"), EXE, "--perf"]
+            argv = [bash_exe(), os.path.join(ROOT, "scripts", "run.sh"), EXE, "--perf"]
             # Whitelist: the scenario id is never spliced from client text.
             if scenario in ("idle", "treeburn", "flythrough", "explosion", "water"):
                 argv += ["--scenario", scenario]

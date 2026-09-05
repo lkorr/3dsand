@@ -6822,15 +6822,32 @@ int main(int argc, char** argv) {
       }
 
       // ---- audio ----
-      // The listener rides the RENDER eye, not the player's head: in third
-      // person the camera is where the player's attention is, and putting the
-      // ears anywhere else makes panning disagree with what is on screen.
-      // After the camera block, so `eye` is final for the frame.
+      // THE EARS ARE ON THE CHARACTER, NOT ON THE CAMERA. `eye` is the RENDER
+      // eye and in third person that is a boom several metres behind the body,
+      // so using it moved the whole soundscape backwards the moment you pressed
+      // the camera key: distances, doppler and — worst — occlusion were all
+      // solved from the boom, which routinely sits inside the wall behind you
+      // and muffled everything. Third person now hears exactly what first
+      // person hears.
+      //
+      // Position is `Player::ViewEyePos()` — the head, at ear height, in BOTH
+      // modes, and the same value first person was already using. Deliberately
+      // not the avatar's head joint: that transform is one tick latent out of
+      // Jolt and rides the gait's bob and sway, which the listener would
+      // convert into doppler wobble on every step (the same three reasons the
+      // camera block above refuses to orbit it).
+      //
+      // Orientation stays `cam.yaw/pitch` — the LOOK direction, which is what
+      // the ears face in first person and what the screen is showing in third.
+      // The body's own heading is not it: in third person the model faces where
+      // it RUNS (ResolveAvatarHeading), so strafing would swing the stereo
+      // image away from the picture.
       //
       // Footfalls are drained here rather than inside the tick loop because
       // that loop runs up to 4 times per frame; firing from inside it would
       // put several steps at the same instant.
       sandvox::PerfSpan spanAudio(sandvox::PerfScope::Audio);
+      const Vec3 earPos = player.ViewEyePos();
       if (audioCues.Enabled()) {
         for (const PlayerAvatar::Footfall& ff : avatar.Footfalls()) {
           if (ff.landing)
@@ -6973,10 +6990,10 @@ int main(int argc, char** argv) {
             // making the player wait out a full retry period past dusk.
             nightRollTimer = ta.nightRetrySeconds;
           }
-          audioCues.SetNightAmbience(eye, want, allowStart);
+          audioCues.SetNightAmbience(earPos, want, allowStart);
         }
 
-        audioCues.Update(dt, eye, cam.yaw, cam.pitch, &world);
+        audioCues.Update(dt, earPos, cam.yaw, cam.pitch, &world);
       }
       avatar.ClearFootfalls();
       // Cleared unconditionally, like the footfalls: a queue that only drains

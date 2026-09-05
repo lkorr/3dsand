@@ -372,6 +372,8 @@
     },
     {
       "id": "flower",
+      "//passable": "Ground COVER, not ground. Worldgen sets these one voxel ABOVE the terrain skin, and a non-passable cover cell is a solid 10 cm step the player climbs onto while the tall grass and flowers beside it are walk-through -- the meadow floor alternated between h+1 and h+2 on a per-column hash with nothing visible to explain it. Every other plant in the file is already passable; these six are the originals, from before the flag existed. `grass` (the SKIN at y == h) is deliberately NOT among them: it is the ground, and flagging it would sink the player a voxel into the terrain everywhere. `flower` is here because reactions.json swaps petal <-> flower by daylight, so flagging only one of that pair puts the step back every morning.",
+      "passable": true,
       "class": "solid",
       "density": 300,
       "hardness": 6,
@@ -551,9 +553,9 @@
       "opacity": 200,
       "molten": "steam",
       "colors": [
-        "#3a0808",
-        "#220404",
-        "#4e0c0c"
+        "#5a0606",
+        "#3a0404",
+        "#7a0a0a"
       ],
       "stain": {
         "type": "blood",
@@ -674,6 +676,7 @@
     },
     {
       "id": "petal",
+      "passable": true,
       "class": "solid",
       "density": 290,
       "hardness": 5,
@@ -692,6 +695,7 @@
     },
     {
       "id": "grass_tuft",
+      "passable": true,
       "footstep": "leaf",
       "class": "solid",
       "density": 200,
@@ -729,6 +733,7 @@
     },
     {
       "id": "foliage_bush",
+      "passable": true,
       "footstep": "leaf",
       "class": "solid",
       "density": 260,
@@ -754,6 +759,7 @@
     },
     {
       "id": "flower_poppy",
+      "passable": true,
       "class": "solid",
       "density": 210,
       "hardness": 2,
@@ -790,6 +796,7 @@
     },
     {
       "id": "flower_daisy",
+      "passable": true,
       "class": "solid",
       "density": 210,
       "hardness": 2,
