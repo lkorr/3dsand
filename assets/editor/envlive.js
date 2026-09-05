@@ -82,8 +82,8 @@ export const LIVE = {
     'cover.groundFlora': R('WM_BF_GROUND_FLORA: the flower/undergrowth/tall-grass blocks'),
     'cover.cacti': R('WM_BF_CACTI: the cactus block runs here'),
     'cover.sandCap': R('WM_BF_SAND_CAP: a 4-deep sand cap under the skin'),
-    'cover.cactusChance': N('P-E', 'today worldgen.cactusChance is global; P-E reads this per biome'),
-    'cover.saguaroFraction': N('P-E', 'today worldgen.saguaroFraction is global; P-E reads this per biome'),
+    'cover.cactusChance': R('WM_B_CACTUS_CHANCE (percent of 2.5 m tiles, when cover.cacti is on)'),
+    'cover.saguaroFraction': R('WM_B_SAGUARO_FRACTION (percent of those cacti that are columns)'),
     'cover.plants[].material': R('WM_C_MAT'),
     'cover.plants[].head': R('WM_C_HEAD'),
     'cover.plants[].chance': R('WM_C_CHANCE (1 in N surface columns)'),
@@ -101,8 +101,8 @@ export const LIVE = {
     'caves.features[].preset': R('selects which of the two band thresholds this row sets'),
     'caves.features[].threshold': R('WM_B_CAVE_T1 / WM_B_CAVE_T2'),
     'caves.features[].rarity': N('later', 'only the threshold is packed; a per-region rarity has no package yet (RESEARCH_worldgen stage 8)'),
-    'caves.features[].mushroomChance': N('P-E', 'today worldgen.caveMushroomChance is global; P-E reads this per biome'),
-    'caves.features[].crystalChance': N('P-E', 'today worldgen.caveCrystalChance is global; P-E reads this per biome'),
+    'caves.features[].mushroomChance': R('WM_B_CAVE_MUSHROOM_CHANCE (the near_surface row; 1 in N floor cells, 0 = never)'),
+    'caves.features[].crystalChance': R('WM_B_CAVE_CRYSTAL_CHANCE (the deep row; 1 in N floor/ceiling cells, 0 = never)'),
 
     'swatch.sizeM': P('the swatch side; not a world value'),
     'swatch.reliefM': P('ground noise under the swatch; not the engine’s terrain'),
@@ -114,9 +114,13 @@ export const LIVE = {
   conditions('caves.features[]', [], 'later', COND_CAVE)),
 
   // ---- assets/water/<name>.json ---------------------------------------------
-  // Nothing in a preset reaches worldgen today: src/sim/biomes.cpp parses the
-  // files and ValidateBiomeSet checks them, and that is the whole consumer
-  // list. Geometry goes live in P-F, the vegetation in P-E.
+  // The VEGETATION half of a preset is live since P-E: shore.plants[],
+  // shore.mossChance/mossMaterial and the aquatic bands are packed into the
+  // worldMap buffer's water table (src/sim/worldmap.h kW_* / kP_*) and read
+  // by genCellIn. P-E INTERIM: a pond wears its biome's FIRST water row's
+  // preset (kB_WaterPreset) until P-F gives pond sites their own. The
+  // GEOMETRY half (footprint, bathymetry, fill, berm, bed, the shore band
+  // itself) still comes from the worldgen.pond* / shore* knobs until P-F.
   water: {
     'name': R('identity: the file name a biome row names'),
     'displayName': R('identity: label only'),
@@ -149,9 +153,9 @@ export const LIVE = {
 // watergen.defaultParams() that is not in the identity/preview list above.
 {
   const geom = (why) => N('P-F', why);
-  const veg = (why) => N('P-E', why);
-  const G = 'no preset field reaches worldgen; P-F packs footprint / bathymetry / fill / berm / bed / placement into the pond table the height twin reads';
-  const V = 'no preset field reaches worldgen; P-E replaces worldgen.shore* / reed* / lily* / kelp* with these rows';
+  const veg = (why) => R(why);
+  const G = 'no geometry field reaches worldgen yet; P-F packs footprint / bathymetry / fill / berm / bed / placement into the pond table the height twin reads';
+  const V = 'WM_W_* / WM_P_*: the water table in the worldMap buffer, read by genCellIn for every pond and shore in a biome whose FIRST water row names this preset (P-E interim, until P-F)';
   const add = (base, keys, mk, why) => { for (const k of keys) LIVE.water[base + '.' + k] = mk(why); };
   add('footprint', ['radius', 'radiusV', 'aspect', 'squareness', 'rotation', 'rotationRandom', 'warpAmp', 'warpFreq',
                     'warpOctaves', 'lobes', 'lobeRadius', 'lobeSpread', 'lobeWeld', 'islands', 'islandRadius', 'islandHeight'], geom, G);
@@ -161,7 +165,9 @@ export const LIVE = {
   add('bed', ['shallow', 'deep', 'shallowDepth', 'thickness', 'substrate'], geom, G);
   add('ground', ['skin', 'soil', 'soilDepth', 'rock'], geom, G);
   add('placement', ['tile', 'rarity', 'maxSlope', 'minY', 'maxY'], geom, G);
-  add('shore', ['band', 'lift', 'mudWidth', 'mudMaterial', 'mossChance', 'mossMaterial'], veg, V);
+  // The band's shape is geometry (worldgen.shoreBand / shoreLift / shoreMudWidth until P-F); what grows on it is P-E's.
+  add('shore', ['band', 'lift', 'mudWidth', 'mudMaterial'], geom, G);
+  add('shore', ['mossChance', 'mossMaterial'], veg, V);
   add('shore.plants[]', ['material', 'head', 'chance', 'reach', 'height'], veg, V);
   add('aquatic.emergent', ['material', 'chance', 'minDepth', 'maxDepth', 'height'], veg, V);
   add('aquatic.floating', ['material', 'flower', 'chance', 'flowerChance', 'minDepth', 'maxDepth'], veg, V);

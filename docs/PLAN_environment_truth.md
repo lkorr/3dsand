@@ -1,8 +1,8 @@
 # PLAN: the Environment tab is the truth about the world
 
 Status: PROPOSAL, 2026-09-04. Supersedes `PLAN_biomes.md` §5 (the wiring
-order) and closes the follow-up list in `PLAN_world_map.md`. Nothing here is
-implemented yet.
+order) and closes the follow-up list in `PLAN_world_map.md`. P-A, P-B and P-E
+landed 2026-09-05; the rest is open.
 
 ## 0. Why edits do not show today (measured on main 482b756)
 
@@ -141,15 +141,63 @@ predicts:
   live here: they are one compare each on data already in hand
   (`land.h`, `land.slope`, `pondNear`). Cover-row conditions the same.
 
-### P-E  Shore, aquatic and cave flora per biome / per water preset
+### P-E  Shore, aquatic and cave flora per biome / per water preset — LANDED
 
-All outside the height mirror: table reads. The shore plant rows of a water
-preset (`shore.plants[]`, `aquatic.*`) replace `TUNE_SHORE_*_CHANCE/HEIGHT/
-REACH`, `reed*`, `lily*`, `kelp*`; cave flora chances (`caveMushroomChance`,
-`caveCrystalChance`) become rows on the biome's `caves.features`.
-`cactusChance`/`saguaroFraction` become a `cacti` cover row with a `shape`
-field (the cactus is the one implicit shape that is not a material stalk).
-`autumnFraction` moves to the species file. Delete the knobs.
+All outside the height mirror: table reads. As built (2026-09-05):
+
+- **The water preset table** in the worldMap buffer: `kHWaterRecords` /
+  `kHWaterCount` (header words 26, 27), one 32-word record per
+  `assets/water/<name>.json` in loader (sorted file name) order — `kW_*` in
+  `worldmap.h`, `WM_W_*` in the shader — carrying the FLORA half of the
+  preset: `shore.mossChance/mossMaterial`, the `aquatic.emergent /
+  floating / submerged` bands (material, chance, min/max depth, height,
+  clearance, flower + flowerChance) and `kW_MaxPlantH`. Each record points
+  at its `shore.plants[]` rows (8 words each, `kP_*` / `WM_P_*`: material,
+  head, chance, reach, height). Words 22..31 of a record are reserved for
+  P-F's geometry. `genCellIn` reads the bands and the shore rows from there;
+  the shore rows roll in authored order, first hit wins, per-row salt,
+  stalk jitter ±(H/6, ≥1) for H ≥ 3, head on the top max(1, H/8) cells.
+- **P-E INTERIM — which preset a pond uses:** a disc pond has no preset of
+  its own until P-F, so every pond and shore in a biome wears the preset of
+  the biome's FIRST `water.features[]` row (`kB_WaterPreset`, 1-based; 0 =
+  the biome has no water rows and grows no shore, pond or moss flora).
+  Documented at `wmWaterOf` in the shader and `WaterPresetOf` in
+  `worldmap.cpp`. P-F replaces this with the pond site's own preset.
+- **Cave flora per biome:** `mushroomChance` on the `near_surface` row and
+  `crystalChance` on the `deep` row of `caves.features[]` →
+  `kB_CaveMushroomChance` / `kB_CaveCrystalChance` (1-in-N, 0 = never; no
+  global default). `caveFloraAt` takes the biome.
+- **Cacti per biome:** `cover.cactusChance` (percent of 2.5 m tiles) and
+  `cover.saguaroFraction` (percent of those that are columns) →
+  `kB_CactusChance` / `kB_SaguaroFraction`; `cover.cacti` stays the on/off
+  flag. (The plan's "a `cacti` cover row with a `shape` field" was not
+  built; two fields beside the existing flag is one surface, not two.)
+- **Autumn:** the species file's `autumnChance` was already the roll; the
+  global `worldgen.autumnFraction` (a scale whose default was the no-op) is
+  deleted. No re-bake.
+- **Heights:** `kB_MaxCoverH` and `kHMaxCoverH` now include the biome's
+  preset's `kW_MaxPlantH` (tallest shore row with jitter, or the emergent
+  height), so the sky-skip margin and the far cascade's blocker band cover
+  every data-driven plant. `genChunk`'s `skyMargin` is
+  `max(FLOWER_MAX_H, WM_B_MAX_COVER_H)` alone.
+- **Biome record stride** `kBiomeRecWords` 16 → 32; the new words are
+  16..20, 14..15 left for P-D.
+- **Deleted knobs (19):** `autumnFraction`, `lilyChance`,
+  `lilyFlowerChance`, `reedChance`, `reedHeight`, `kelpChance`,
+  `kelpHeight`, `shoreCattailChance/Reach/Height`, `shoreSedgeChance`,
+  `shoreHorsetailChance/Height`, `shoreIrisChance`, `shoreMossChance`,
+  `cactusChance`, `saguaroFraction`, `caveMushroomChance`,
+  `caveCrystalChance` — from `tuning_params.def`, `tuning.h`, `LoadTuning`,
+  `tuning.json`, `tuner_schema.js`, and the generated `tuning_prelude.py`.
+  `shoreBand`, `shoreLift`, `shoreMudWidth` and the `pond*` geometry stay
+  for P-F.
+- Seeded by `scripts/seed_flora_rows.py` (adds only absent keys, with the
+  old global values). `assets/water/tarn.json` had `floating.minDepth 6 /
+  maxDepth 3` (an empty band — no lilies on any tarn); set to the generator
+  default 1 / 3, and `ValidateBiomeSet` now refuses an empty band.
+- Not done here, deliberately: the shore band's EXISTENCE is still gated on
+  `kBF_GroundFlora` in `genColumn` (so an oasis's shore rows never show in
+  the desert) — that gate is the band geometry's and moves with P-F.
 
 ### P-F  Water presets drive pond geometry (the mirror package)
 
@@ -158,6 +206,8 @@ field (the cactus is the one implicit shape that is not a material stalk).
 - Per-biome water rows → a packed table: tile, rarity, radius min/span,
   depth, rim depth, berm height/width, shore band/lift, bed materials. The
   preset's bathymetry curve is sampled to a Q8 table of 17 knots at load.
+  P-E left words 22..31 of each `kW_*` record for this, and `kB_WaterPreset`
+  becomes the pond site's preset instead of the biome's first row.
 - `World::TerrainHeight` reads the same table through a C++ twin with the
   same identifier spelling (the `POND_TILE → pondTile` normaliser alias
   already exists for this). `terrain` C1 (9,409 columns) is the proof;

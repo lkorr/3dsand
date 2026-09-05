@@ -1385,6 +1385,8 @@ const WM_H_HARNESS_X0    : u32 = 22u;
 const WM_H_HARNESS_Z0    : u32 = 23u;
 const WM_H_HARNESS_X1    : u32 = 24u;
 const WM_H_HARNESS_Z1    : u32 = 25u;
+const WM_H_WATER_RECORDS : u32 = 26u;
+const WM_H_WATER_COUNT   : u32 = 27u;
 // the site table (worldmap.h kS_* / kStamp_*)
 const WM_S_WORDS         : u32 = 16u;
 const WM_S_KIND          : u32 = 0u;
@@ -1400,7 +1402,7 @@ const WM_STAMP_NX        : u32 = 0u;
 const WM_STAMP_NY        : u32 = 1u;
 const WM_STAMP_NZ        : u32 = 2u;
 const WM_STAMP_COLUMNS   : u32 = 3u;
-const WM_B_WORDS         : u32 = 16u;
+const WM_B_WORDS         : u32 = 32u;
 const WM_B_SKIN          : u32 = 0u;
 const WM_B_SUBSOIL       : u32 = 1u;
 const WM_B_SKIN_DEPTH    : u32 = 2u;
@@ -1416,6 +1418,12 @@ const WM_B_SED_MAX       : u32 = 11u;
 const WM_B_FLAGS         : u32 = 12u;
 const WM_B_MAX_COVER_H   : u32 = 13u;
 const WM_B_TREE_CHANCE_Q16 : u32 = 14u;   // thinning on the ONE tree lattice, Q16
+// P-E: the flora that used to be worldgen.* knobs (worldmap.h kB_* 16..20)
+const WM_B_WATER_PRESET  : u32 = 16u;
+const WM_B_CAVE_MUSHROOM_CHANCE : u32 = 17u;
+const WM_B_CAVE_CRYSTAL_CHANCE  : u32 = 18u;
+const WM_B_CACTUS_CHANCE : u32 = 19u;
+const WM_B_SAGUARO_FRACTION : u32 = 20u;
 const WM_C_WORDS         : u32 = 12u;
 const WM_C_MAT           : u32 = 0u;
 const WM_C_HEAD          : u32 = 1u;
@@ -1430,6 +1438,38 @@ const WM_C_NEAR_WATER_MIN : u32 = 9u;   // at least this far from a rim, 0 = off
 const WM_BF_GROUND_FLORA : u32 = 1u;
 const WM_BF_CACTI        : u32 = 2u;
 const WM_BF_SAND_CAP     : u32 = 4u;
+// the water preset table (worldmap.h kW_* / kP_*): the FLORA half of
+// assets/water/<name>.json. Depths are voxels of water over the bed, heights
+// cells from the bed (aquatic) or the ground (shore); chances 1-in-N, 0 = off.
+const WM_W_WORDS               : u32 = 32u;
+const WM_W_FILL                : u32 = 0u;
+const WM_W_SHORE_COUNT         : u32 = 1u;
+const WM_W_SHORE_OFF           : u32 = 2u;
+const WM_W_MOSS_CHANCE         : u32 = 3u;
+const WM_W_MOSS_MAT            : u32 = 4u;
+const WM_W_EMERGENT_MAT        : u32 = 5u;
+const WM_W_EMERGENT_CHANCE     : u32 = 6u;
+const WM_W_EMERGENT_MIN_DEPTH  : u32 = 7u;
+const WM_W_EMERGENT_MAX_DEPTH  : u32 = 8u;
+const WM_W_EMERGENT_HEIGHT     : u32 = 9u;
+const WM_W_FLOATING_MAT        : u32 = 10u;
+const WM_W_FLOATING_FLOWER     : u32 = 11u;
+const WM_W_FLOATING_CHANCE     : u32 = 12u;
+const WM_W_FLOATING_FLOWER_CHANCE : u32 = 13u;
+const WM_W_FLOATING_MIN_DEPTH  : u32 = 14u;
+const WM_W_FLOATING_MAX_DEPTH  : u32 = 15u;
+const WM_W_SUBMERGED_MAT       : u32 = 16u;
+const WM_W_SUBMERGED_CHANCE    : u32 = 17u;
+const WM_W_SUBMERGED_MIN_DEPTH : u32 = 18u;
+const WM_W_SUBMERGED_HEIGHT    : u32 = 19u;
+const WM_W_SUBMERGED_CLEARANCE : u32 = 20u;
+const WM_W_MAX_PLANT_H         : u32 = 21u;
+const WM_P_WORDS               : u32 = 8u;
+const WM_P_MAT                 : u32 = 0u;
+const WM_P_HEAD                : u32 = 1u;
+const WM_P_CHANCE              : u32 = 2u;
+const WM_P_REACH               : u32 = 3u;
+const WM_P_HEIGHT              : u32 = 4u;
 
 fn wmBiomeCount() -> u32 { return worldMap[WM_H_BIOME_COUNT]; }
 // A biome id past the table (a stale save, a buffer that has not been
@@ -1444,6 +1484,26 @@ fn wmBiome(b : u32, w : u32) -> u32 {
 fn wmFlag(b : u32, f : u32) -> bool { return (wmBiome(b, WM_B_FLAGS) & f) != 0u; }
 fn wmCover(b : u32, i : u32, w : u32) -> u32 {
   return worldMap[wmBiome(b, WM_B_COVER_OFF) + i * WM_C_WORDS + w];
+}
+// ---- the water preset a column's pond and shore wear (P-E) -----------------
+// P-E INTERIM: a disc pond has no preset of its own until P-F drives the bowl
+// from the water table, so every pond and shore in a biome wears the preset
+// of the biome's FIRST water.features row (worldmap.cpp WaterPresetOf). The
+// index is 1-based; 0 = the biome authors no water and every read below is 0,
+// which turns every chance off -- no shore plants, no pond life, no moss.
+fn wmWaterOf(b : u32) -> u32 { return wmBiome(b, WM_B_WATER_PRESET); }
+fn wmWater(p : u32, w : u32) -> u32 {
+  if (p == 0u || p > worldMap[WM_H_WATER_COUNT]) { return 0u; }
+  return worldMap[worldMap[WM_H_WATER_RECORDS] + (p - 1u) * WM_W_WORDS + w];
+}
+fn wmShore(p : u32, i : u32, w : u32) -> u32 {
+  return worldMap[wmWater(p, WM_W_SHORE_OFF) + i * WM_P_WORDS + w];
+}
+// `h % chance == 0` with chance 0 = never, in one place. Every flora chance
+// in the tables is authored 1-in-N with 0 meaning off, and a modulo by zero
+// is undefined on the GPU, so no reader below spells the test itself.
+fn rollChance(h : u32, chance : u32) -> bool {
+  return chance != 0u && (h % chance) == 0u;
 }
 
 // ---- the painted planes (P2) ------------------------------------------------
@@ -1912,12 +1972,12 @@ fn treeInfoAt(s : TreeSite, land : Land, seed : u32) -> Tree {
   // Autumn is per TREE, never per voxel: a stand turns together or not at all.
   //
   // The species file authors WHETHER and HOW OFTEN this species turns (an oak
-  // does, a spruce never will), and `worldgen.autumnFraction` scales that
-  // globally so the whole world's autumn can be dialled from the tuner without
-  // re-baking ten atlases. The knob is a 1-in-N rarity whose DEFAULT is 5, so
-  // dividing by 5 makes the default an exact no-op and the authored numbers
-  // mean what they say — raise it and every species turns rarer together.
-  let ac = taSpecies(sp, TA_S_AUTUMN) * TUNE_AUTUMN_FRACTION / 5u;
+  // does, a spruce never will): `autumnChance` in assets/trees/<name>.json,
+  // 1-in-N trees, carried into the atlas header as TA_S_AUTUMN. There is no
+  // global scale on it any more (P-E deleted worldgen.autumnFraction, whose
+  // default was the no-op): one authoring surface per fact, and the number on
+  // the tree page is the number the world rolls.
+  let ac = taSpecies(sp, TA_S_AUTUMN);
   t.autumn = ac != 0u && ((h3 >> 14u) % max(ac, 1u)) == 0u;
   t.present = true;
   return t;
@@ -2250,23 +2310,28 @@ fn cactusInfo(tx : i32, tz : i32, seed : u32) -> Cactus {
   c.wx = tx * CACTUS_TILE + inset + i32((hsh >> 3u) % span);
   c.wz = tz * CACTUS_TILE + inset + i32((hsh >> 9u) % span);
 
-  // Desert only, and never on the keep-out ground every other feature avoids:
-  // the spawn clearing, the selftest fixture pads, or a pond.
-  if (!wmFlag(biomeAt(c.wx, c.wz, seed), WM_BF_CACTI)) { return c; }
+  // Only where the biome says so (cover.cacti), and never on the keep-out
+  // ground every other feature avoids: the spawn clearing, the selftest
+  // fixture pads, or a pond.
+  let cb = biomeAt(c.wx, c.wz, seed);
+  if (!wmFlag(cb, WM_BF_CACTI)) { return c; }
   let h = baseHeight(c.wx, c.wz, seed);
   c.base = h;
   if (h >= TREELINE) { return c; }
   if (siteKeepOut(c.wx, c.wz)) { return c; }
   if (pondAt(c.wx, c.wz, seed).y >= 0) { return c; }
 
+  // Density and mix are the biome's (cover.cactusChance / saguaroFraction,
+  // both percents, packed by worldmap.cpp): the flag says whether, the
+  // record says how many.
   let roll = (hsh >> 17u) % 100u;
-  if (roll >= TUNE_CACTUS_CHANCE) { return c; }
+  if (roll >= wmBiome(cb, WM_B_CACTUS_CHANCE)) { return c; }
 
   // Barrels outnumber saguaros heavily. A desert with a saguaro every 2.5 m is
   // a plantation; the columns have to be occasional or they stop being
   // landmarks, which is the entire job they do here.
   let sroll = (hsh >> 24u) % 100u;
-  c.species = select(1u, 0u, sroll < TUNE_SAGUARO_FRACTION);
+  c.species = select(1u, 0u, sroll < wmBiome(cb, WM_B_SAGUARO_FRACTION));
 
   // Dimensions in TENTHS OF A METRE, converted below — same convention as
   // treeInfo, and the reason a saguaro comes out at a real 3.2-5.0 m instead
@@ -2795,8 +2860,12 @@ fn caveAt(x : i32, y : i32, z : i32, h : i32, biome : u32, seed : u32) -> i32 {
 // the two bands overlap: band 2 can undercut band 1's floor, and band 1 can eat
 // band 2's ceiling. `caveIn` is the authority for both and costs comparisons.
 //
+// The chances are the biome's (assets/biomes/<name>.json caves.features:
+// mushroomChance on the near_surface row, crystalChance on the deep row,
+// 1-in-N, 0 = never), read from its record -- there is no global knob.
+//
 // Returns MAT_AIR for "leave the cave open".
-fn caveFloraAt(b : CaveBands, x : i32, y : i32, z : i32, seed : u32) -> u32 {
+fn caveFloraAt(b : CaveBands, biome : u32, x : i32, y : i32, z : i32, seed : u32) -> u32 {
   // Never in the flooded band, and never within reach of it.
   if (y <= LAVA_LEVEL + CAVE_LAVA_MARGIN) { return MAT_AIR; }
 
@@ -2809,7 +2878,7 @@ fn caveFloraAt(b : CaveBands, x : i32, y : i32, z : i32, seed : u32) -> u32 {
     if (vnoise(x, z, CAVE_SHROOM_PATCH_CELL, seed ^ 0x5CA9u) >
         CAVE_SHROOM_PATCH) {
       let hm = hash3(seed ^ 0x5A18u, bitcast<u32>(x), bitcast<u32>(z));
-      if ((hm % TUNE_CAVE_MUSHROOM_CHANCE) == 0u) {
+      if (rollChance(hm, wmBiome(biome, WM_B_CAVE_MUSHROOM_CHANCE))) {
         // Same red/pale split the forest floor uses, and gated on the SAME roll
         // so this only picks WHICH mushroom, never adds more of them.
         return select(M_TOADSTOOL, M_MUSHROOM, ((hm >> 13u) % 4u) == 0u);
@@ -2832,7 +2901,7 @@ fn caveFloraAt(b : CaveBands, x : i32, y : i32, z : i32, seed : u32) -> u32 {
       // note in the pond-life block about what correlated slices do to a
       // scatter. A seam and a mushroom bank must be different places.
       let hc = hash3(seed ^ 0xC17Au, bitcast<u32>(x), bitcast<u32>(z));
-      if ((hc % TUNE_CAVE_CRYSTAL_CHANCE) == 0u) { return M_CRYSTAL; }
+      if (rollChance(hc, wmBiome(biome, WM_B_CAVE_CRYSTAL_CHANCE))) { return M_CRYSTAL; }
     }
   }
   return MAT_AIR;
@@ -3439,7 +3508,7 @@ fn genCellIn(col : Col,
         // Cave flora fills the carved cell it stands in — no extra voxel, no
         // extra occupancy, nothing new for the CA to look at, and everything it
         // places is inert (rule 2).
-        mat = caveFloraAt(cb, x, y, z, seed);
+        mat = caveFloraAt(cb, biome, x, y, z, seed);
       }
       else if (cv == 2) { mat = M_LAVA; }
     }
@@ -3453,11 +3522,16 @@ fn genCellIn(col : Col,
     // Its own hash salt, like every other species here: slicing one column
     // hash for two rolls correlates them, which is documented at length in the
     // pond-life block below and is what once turned scattered planting into a
-    // solid wall.
-    if (mat == M_STONE && y == h && shore.onShore &&
-        hash3(seed ^ 0x4D05u, bitcast<u32>(x), bitcast<u32>(z))
-          % TUNE_SHORE_MOSS_CHANCE == 0u) {
-      mat = M_WET_MOSS;
+    // solid wall. Chance and material are the water preset's (shore.mossChance
+    // / mossMaterial); a biome with no water rows reads 0 and grows none.
+    if (mat == M_STONE && y == h && shore.onShore) {
+      let wp = wmWaterOf(biome);
+      let mossMat = wmWater(wp, WM_W_MOSS_MAT);
+      if (mossMat != 0u &&
+          rollChance(hash3(seed ^ 0x4D05u, bitcast<u32>(x), bitcast<u32>(z)),
+                     wmWater(wp, WM_W_MOSS_CHANCE))) {
+        mat = mossMat;
+      }
     }
   } else if (fluidTop >= 0 && y <= fluidTop) {
     mat = fluid;
@@ -3484,7 +3558,15 @@ fn genCellIn(col : Col,
   // than chance to grow another. That is what turned a scattered planting into
   // a solid wall of stalks. Three distinct salts cost two extra hashes per
   // pond column and are actually independent.
+  //
+  // WHICH plants, at WHAT depth, HOW tall: the water preset's aquatic bands
+  // (assets/water/<name>.json aquatic.emergent / floating / submerged), read
+  // from the worldMap table -- the pond's biome names the preset (P-E interim,
+  // see wmWaterOf). Depths are voxels of water over the bed, heights cells
+  // above the bed. A band with chance 0, or a biome with no water rows, rolls
+  // nothing (rollChance).
   if (mat == M_WATER && pond >= 0) {
+    let wp = wmWaterOf(biome);
     let bed = min(h, pw.x);          // the carved bowl floor at this column
     let depth = pond - bed;          // water column height in voxels
     let above = pond - y;            // how far under the surface this cell is
@@ -3492,28 +3574,34 @@ fn genCellIn(col : Col,
     let hReed = hash3(seed ^ 0x2E3Du, bitcast<u32>(x), bitcast<u32>(z));
     let hKelp = hash3(seed ^ 0xC5B1u, bitcast<u32>(x), bitcast<u32>(z));
 
-    // LILYPADS: a single cell floating ON the surface. Needs enough water
-    // under it that a pad reads as floating rather than as lying on mud.
-    if (y == pond && depth >= 10 && (hLily % TUNE_LILY_CHANCE) == 0u) {
-      mat = M_LILYPAD;
-    } else if (depth >= 4 && depth <= 14 && above >= 0 &&
-               y - bed < TUNE_REED_HEIGHT &&
-               (hReed % TUNE_REED_CHANCE) == 0u) {
-      // REEDS: emergent, in the SHALLOW MARGIN only — a narrow depth band, so
+    // FLOATING (lilypads): a single cell ON the surface. Needs enough water
+    // under it that a pad reads as floating rather than as lying on mud --
+    // the band's minDepth -- and stops past maxDepth.
+    if (y == pond && depth >= i32(wmWater(wp, WM_W_FLOATING_MIN_DEPTH)) &&
+        depth <= i32(wmWater(wp, WM_W_FLOATING_MAX_DEPTH)) &&
+        rollChance(hLily, wmWater(wp, WM_W_FLOATING_CHANCE))) {
+      mat = wmWater(wp, WM_W_FLOATING_MAT);
+    } else if (depth >= i32(wmWater(wp, WM_W_EMERGENT_MIN_DEPTH)) &&
+               depth <= i32(wmWater(wp, WM_W_EMERGENT_MAX_DEPTH)) && above >= 0 &&
+               y - bed < i32(wmWater(wp, WM_W_EMERGENT_HEIGHT)) &&
+               rollChance(hReed, wmWater(wp, WM_W_EMERGENT_CHANCE))) {
+      // EMERGENT (reeds): in the SHALLOW MARGIN only — a narrow depth band, so
       // they form a fringe around the shore rather than filling the bowl. They
       // grow from the bed and break the surface, which is what makes them read
       // as reeds rather than as underwater grass, so the height test is
       // against the BED, not against the waterline.
-      mat = M_REED;
-    } else if (depth > 16 && above > 4 && y - bed < TUNE_KELP_HEIGHT &&
-               (hKelp % TUNE_KELP_CHANCE) == 0u) {
-      // KELP: fully submerged, in the DEEP MIDDLE only (depth > 16 excludes
-      // the whole shallow ring the reeds occupy, so the two never interleave).
-      // `above > 4` keeps a clear margin below the surface so kelp never pokes
-      // through — that margin is the difference between kelp and a reed. This
-      // is the plant that gives the submerged view its vertical structure for
-      // the light shafts to cut across.
-      mat = M_KELP;
+      mat = wmWater(wp, WM_W_EMERGENT_MAT);
+    } else if (depth > i32(wmWater(wp, WM_W_SUBMERGED_MIN_DEPTH)) &&
+               above > i32(wmWater(wp, WM_W_SUBMERGED_CLEARANCE)) &&
+               y - bed < i32(wmWater(wp, WM_W_SUBMERGED_HEIGHT)) &&
+               rollChance(hKelp, wmWater(wp, WM_W_SUBMERGED_CHANCE))) {
+      // SUBMERGED (kelp): fully under, in the DEEP MIDDLE only (a minDepth
+      // past the emergent band's maxDepth keeps the two from interleaving).
+      // `above > clearance` keeps a clear margin below the surface so kelp
+      // never pokes through — that margin is the difference between kelp and
+      // a reed. This is the plant that gives the submerged view its vertical
+      // structure for the light shafts to cut across.
+      mat = wmWater(wp, WM_W_SUBMERGED_MAT);
     }
   }
   // Above the waterline over a pond: the emergent half of the reeds, and the
@@ -3522,19 +3610,25 @@ fn genCellIn(col : Col,
   // upward — same hashes, same column tests, so a reed is one continuous stalk
   // through the surface rather than two unrelated halves.
   if (mat == MAT_AIR && pond >= 0 && y > pond) {
+    let wp = wmWaterOf(biome);
     let bed = min(h, pw.x);
     let depth = pond - bed;
     let hLily = hash3(seed ^ 0x71A9u, bitcast<u32>(x), bitcast<u32>(z));
     let hReed = hash3(seed ^ 0x2E3Du, bitcast<u32>(x), bitcast<u32>(z));
-    if (depth >= 4 && depth <= 14 && y - bed < TUNE_REED_HEIGHT &&
-        (hReed % TUNE_REED_CHANCE) == 0u) {
-      mat = M_REED;
-    } else if (y == pond + 1 && depth >= 10 &&
-               (hLily % TUNE_LILY_CHANCE) == 0u &&
-               ((hLily >> 9u) % TUNE_LILY_FLOWER_CHANCE) == 0u) {
+    if (depth >= i32(wmWater(wp, WM_W_EMERGENT_MIN_DEPTH)) &&
+        depth <= i32(wmWater(wp, WM_W_EMERGENT_MAX_DEPTH)) &&
+        y - bed < i32(wmWater(wp, WM_W_EMERGENT_HEIGHT)) &&
+        rollChance(hReed, wmWater(wp, WM_W_EMERGENT_CHANCE))) {
+      mat = wmWater(wp, WM_W_EMERGENT_MAT);
+    } else if (y == pond + 1 &&
+               depth >= i32(wmWater(wp, WM_W_FLOATING_MIN_DEPTH)) &&
+               depth <= i32(wmWater(wp, WM_W_FLOATING_MAX_DEPTH)) &&
+               rollChance(hLily, wmWater(wp, WM_W_FLOATING_CHANCE)) &&
+               rollChance(hLily >> 9u, wmWater(wp, WM_W_FLOATING_FLOWER_CHANCE))) {
       // Blossom on a minority of pads. Gated on the SAME pad roll, so a flower
-      // can only ever appear on a cell that actually grew a pad under it.
-      mat = M_LILYFLR;
+      // can only ever appear on a cell that actually grew a pad under it. The
+      // packer zeroes the flower chance when the preset names no flower.
+      mat = wmWater(wp, WM_W_FLOATING_FLOWER);
     }
   }
 
@@ -3562,48 +3656,49 @@ fn genCellIn(col : Col,
   // it stands beside: a shore plant that did would keep every pond chunk awake
   // forever and break the sleep budget (rule 2).
   //
-  // FOUR DISTINCT HASH SALTS, one per species, never bit-slices of one hash.
-  // The pond-life block above documents why at length — slices of a single
-  // hash share entropy, so a column that grew one plant is far likelier than
-  // chance to grow another, and the scattered planting collapses into a wall.
-  // The cost is three extra hashes on shore columns only.
+  // THE SPECIES ARE THE WATER PRESET'S (assets/water/<name>.json
+  // shore.plants[], packed as WM_P_* rows; the biome names the preset, see
+  // wmWaterOf). Rows are rolled IN AUTHORED ORDER and the first hit wins,
+  // exactly like the biome cover stack, so the author puts the water-hugging
+  // species (cattail: small reach, tall) first and the ground layer that
+  // covers the whole band (marsh grass: full reach, dense) LAST, filling
+  // whatever the taller rows did not claim -- that ordering is what makes the
+  // band read as a gradient from the water rather than as a mixed salad.
   //
-  // Species by DISTANCE FROM THE WATER, so the band reads as a gradient rather
-  // than as a mixed salad: cattails have their feet wet, horsetail stands just
-  // behind them, marsh grass covers the lot, and the iris is the rare accent.
+  // ONE DISTINCT HASH SALT PER ROW, never bit-slices of one hash. The
+  // pond-life block above documents why at length — slices of a single hash
+  // share entropy, so a column that grew one plant is far likelier than chance
+  // to grow another, and the scattered planting collapses into a wall. The
+  // cost is one hash per authored row until a hit, on shore columns only.
+  //
+  // Per row: `reach` is how far past the waterline (shore.past, voxels) it
+  // still grows; `height` is the stalk, jittered per column by +-(H/6, at
+  // least 1) for stalks of 3+ so a bed of stalks does not read as a fence --
+  // the cover stack's rule, widened for a 2 m cattail; `head`, when named,
+  // caps the top max(1, H/8) cells (two on a cattail, one on anything short).
+  // The head is not its own roll: it is part of the same plant, so gating it
+  // on the SAME hash is what keeps a head from floating over no stalk.
+  // worldmap.cpp's MaxPlantH includes the jitter, so the sky-skip and far
+  // blocker ceilings cover the tallest column a row can produce.
   if (mat == MAT_AIR && shore.onShore && y > h) {
     let up = y - h;                  // voxels above this column's ground
-    let hCat  = hash3(seed ^ 0x9C41u, bitcast<u32>(x), bitcast<u32>(z));
-    let hHors = hash3(seed ^ 0x3E77u, bitcast<u32>(x), bitcast<u32>(z));
-    let hSedge= hash3(seed ^ 0x58BDu, bitcast<u32>(x), bitcast<u32>(z));
-    let hIris = hash3(seed ^ 0xA219u, bitcast<u32>(x), bitcast<u32>(z));
-
-    // CATTAILS: the tall silhouette at the waterline, and the only thing here
-    // that is more than a couple of voxels tall. Height jitters per column —
-    // a bed of stalks all cut to exactly one height reads as a fence.
-    let catH = TUNE_SHORE_CATTAIL_HEIGHT + i32((hCat >> 5u) % 7u) - 3;
-    if (shore.past <= TUNE_SHORE_CATTAIL_REACH && up < catH &&
-        (hCat % TUNE_SHORE_CATTAIL_CHANCE) == 0u) {
-      // The brown seed head caps the top two cells of the stalk. Not its own
-      // roll: it is part of the same plant, so gating it on the SAME hash is
-      // what keeps a head from ever floating over a column with no stalk.
-      mat = select(M_CATTAIL, M_CATTAIL_HEAD, up >= catH - 2);
-    } else if (up < TUNE_SHORE_HORSETAIL_HEIGHT + i32((hHors >> 5u) % 5u) - 2 &&
-               (hHors % TUNE_SHORE_HORSETAIL_CHANCE) == 0u) {
-      // HORSETAIL: mid-height jointed stalks filling between the cattails at
-      // the water and the grass further up the bank. Grey-green, so the three
-      // species do not merge into one block of the same colour.
-      mat = M_HORSETAIL;
-    } else if (up == 1 && (hIris % TUNE_SHORE_IRIS_CHANCE) == 0u) {
-      // WATER IRIS: one cell, a micro model. Rare on purpose — this is the
-      // thing you spot, not the thing you wade through.
-      mat = M_WATER_IRIS;
-    } else if (up == 1 && (hSedge % TUNE_SHORE_SEDGE_CHANCE) == 0u) {
-      // MARSH GRASS: one cell, a micro model, and the densest of the four. It
-      // is the ground cover of the whole band, which is what makes the fringe
-      // read as marsh rather than as lawn running up to water — so it is rolled
-      // LAST, filling whatever the taller species did not claim.
-      mat = M_MARSH_GRASS;
+    let wp = wmWaterOf(biome);
+    let nRows = wmWater(wp, WM_W_SHORE_COUNT);
+    for (var i = 0u; i < nRows; i++) {
+      if (shore.past > i32(wmShore(wp, i, WM_P_REACH))) { continue; }
+      let hRow = hash3(seed ^ (0x9C41u + i * 0x9E37u), bitcast<u32>(x), bitcast<u32>(z));
+      if (!rollChance(hRow, wmShore(wp, i, WM_P_CHANCE))) { continue; }
+      let base = i32(wmShore(wp, i, WM_P_HEIGHT));
+      let amp = select(0, max(1, base / 6), base >= 3);
+      let hgt = max(1, base + i32((hRow >> 5u) % u32(2 * amp + 1)) - amp);
+      // This row claimed the column: a cell above its stalk is air, never a
+      // later row's -- the same `break` the cover stack takes, so two rows
+      // never stack into one plant.
+      if (up > hgt) { break; }
+      let head = wmShore(wp, i, WM_P_HEAD);
+      let headCells = max(1, hgt / 8);
+      mat = select(wmShore(wp, i, WM_P_MAT), head, head != 0u && up > hgt - headCells);
+      break;
     }
   }
 
@@ -4337,15 +4432,13 @@ fn genChunk(slot : u32, li : u32, actIdx : u32) {
     //
     // All the h-relative plant reaches collapse into one margin, which is
     // strictly conservative: over-estimating the ceiling only declines a skip.
-    // ...plus the biome's own cover stack (WM_B_MAX_COVER_H, packed from the
-    // tallest authored row, jitter included). Since the world map's P1 the
-    // cover rows are DATA and can be taller than every fixed term here (a
-    // 1.2 m cactus row is 13 voxels); a margin that ignored them would skip a
-    // chunk whose plants it never wrote.
-    let skyMargin = max(max(max(FLOWER_MAX_H, TUNE_REED_HEIGHT),
-                            max(TUNE_SHORE_CATTAIL_HEIGHT + 3,
-                                TUNE_SHORE_HORSETAIL_HEIGHT + 2)),
-                        i32(wmBiome(col.biome, WM_B_MAX_COVER_H)));
+    // The biome's own cover stack AND its water preset's shore / emergent
+    // plants arrive as WM_B_MAX_COVER_H (worldmap.cpp packs the tallest
+    // authored row of either, jitter and head included). Since the world
+    // map's P1 the cover rows are DATA and can be taller than the fixed term
+    // here (a 2 m cattail is 23 voxels with its jitter); a margin that ignored
+    // them would skip a chunk whose plants it never wrote.
+    let skyMargin = max(FLOWER_MAX_H, i32(wmBiome(col.biome, WM_B_MAX_COVER_H)));
     var colTop = col.h + skyMargin;
     colTop = max(colTop, col.fluidTop);
     colTop = max(colTop, col.pond + 1);

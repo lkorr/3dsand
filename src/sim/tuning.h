@@ -2904,7 +2904,6 @@ struct Tuning {
     // There is no `treeTile` any more: the tree lattice is the finest
     // `trees.tile` among assets/biomes/*.json (biomes.h FinestTreeTileVox),
     // and each biome thins on it to its own density. One authoring surface.
-    int autumnFraction = 5;   // 1-in-N broadleaves turn autumn
     int pondTile = 448, pondChance = 4, pondRadiusMin = 48, pondRadiusSpan = 32;
     // Steepest ground a tarn may sit on, |dh/dx|+|dh/dz| in Q8 (256 = the
     // CA's angle of repose). A bowl cut into a slope lays its sand bed on a
@@ -2920,13 +2919,11 @@ struct Tuning {
     // roughly 20 before you can actually submerge in one — the previous
     // 8-voxel bowl was 0.8 m and could only be waded through.
     int pondDepth = 26, pondDepthRim = 3;
-    // Pond vegetation. Each is a 1-in-N placement roll per candidate column,
-    // plus a height in voxels where the plant is more than one cell tall.
-    // These are ordinary inert solids placed once at generation: nothing here
-    // grows or reacts, so a settled pond still sleeps (rule 2).
-    int lilyChance = 22, lilyFlowerChance = 5;
-    int reedChance = 130, reedHeight = 16;
-    int kelpChance = 120, kelpHeight = 10;
+    // Pond vegetation (lilypads, reeds, kelp) and the shore species are NOT
+    // here since P-E: they are the water preset's aquatic.* / shore.plants[]
+    // (assets/water/<name>.json), packed into the worldMap buffer's water
+    // table (worldmap.h kW_*). Only the pond/shore GEOMETRY knobs remain,
+    // until P-F.
     // Shoreline: the wet fringe OUTSIDE the pond disc, which used to go
     // straight from water to plain hillside grass. shoreBand is how many
     // voxels past the rim the fringe reaches AND the sole cost knob for
@@ -2943,22 +2940,14 @@ struct Tuning {
     // the reed beds in the shallow bays. High leverage — at the default pond
     // it keeps 5% of the raw band at 4 and 99% at 24.
     int shoreLift = 12;
-    int shoreCattailChance = 12, shoreCattailReach = 9, shoreCattailHeight = 20;
-    int shoreSedgeChance = 4;
-    int shoreHorsetailChance = 10, shoreHorsetailHeight = 9;
-    int shoreIrisChance = 34;
-    int shoreMossChance = 3;         // 1-in-N wet stone faces wear moss
     // Tree vines, hanging moss and trunk ivy USED TO BE TUNED HERE. They were
     // implicit decoration worldgen drew on top of a tree, which is exactly the
     // kind of divergence the .svtree bake exists to end: the tuner's Trees tab
     // is the only tree authoring surface now, so a decoration is either baked
     // into the atlas or it does not exist. Wall ivy is not tree decoration.
     // ---- desert / pine highland / alpine ground cover ----
-    // Percent of 2.5 m tiles in the desert that hold a cactus, and the percent
-    // of those that are tall saguaro columns rather than ground-level barrels.
-    // Saguaros are landmarks: keep them occasional or the desert reads as a
-    // planted grid rather than as somewhere you cross to find one.
-    int cactusChance = 26, saguaroFraction = 22;
+    // Cacti are per biome since P-E (cover.cacti / cactusChance /
+    // saguaroFraction in assets/biomes/<name>.json, worldmap.h kB_*).
     // The desert tussock/scrub and pine heath floors are no longer knobs: they
     // are rows in assets/biomes/desert.json and pine.json (cover.plants),
     // packed into the worldMap buffer's biome records (worldmap.h, P1).
@@ -2970,11 +2959,9 @@ struct Tuning {
     // tuning_params.def, the apron's own step is what the angle of repose
     // bounds.
     int caveThreshold1 = 150, caveThreshold2 = 148;
-    // Cave flora: 1-in-N per column on the one cell that is the band's floor
-    // (mushrooms, shallow band) or its floor and ceiling (crystal, deep band),
-    // 0 = -Z, 1 = +X, 2 = +Z, 3 = -X -- because worldgen has no sun and a
-    // shaded face here is a convention, not a measurement.
-    int caveMushroomChance = 26, caveCrystalChance = 9;
+    // Cave flora (mushrooms on the shallow band's floor, crystal on the deep
+    // band's floor and ceiling) is per biome since P-E: mushroomChance /
+    // crystalChance on the caves.features rows of assets/biomes/<name>.json.
     // ---- the authored edit layer (src/sim/worldedit.h) ---------------------
     // Names assets/worldedits/<editLayer>.svedit, the hand-built patch the
     // Worldgen tab's voxel view writes. Applied through the MutationQueue to

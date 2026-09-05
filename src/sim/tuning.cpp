@@ -2414,7 +2414,6 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadWgCount(*g, "curveDesert7", w.curveDesert7, out, at);
     ReadWgCount(*g, "curveDesert8", w.curveDesert8, out, at);
     ReadWgCount(*g, "biomeBlend", w.biomeBlend, out, at);
-    ReadWgCount(*g, "autumnFraction", w.autumnFraction, out, at);
     ReadWgLen(*g, "pondTile", w.pondTile, out, at);
     ReadWgCount(*g, "pondChance", w.pondChance, out, at);
     ReadWgLen(*g, "pondRadiusMin", w.pondRadiusMin, out, at);
@@ -2424,28 +2423,10 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadWgLen(*g, "pondBermWidth", w.pondBermWidth, out, at);
     ReadWgLen(*g, "pondDepth", w.pondDepth, out, at);
     ReadWgLen(*g, "pondDepthRim", w.pondDepthRim, out, at);
-    ReadWgCount(*g, "lilyChance", w.lilyChance, out, at);
-    ReadWgCount(*g, "lilyFlowerChance", w.lilyFlowerChance, out, at);
-    ReadWgCount(*g, "reedChance", w.reedChance, out, at);
-    ReadWgLen(*g, "reedHeight", w.reedHeight, out, at);
-    ReadWgCount(*g, "kelpChance", w.kelpChance, out, at);
-    ReadWgLen(*g, "kelpHeight", w.kelpHeight, out, at);
     ReadWgLen(*g, "shoreBand", w.shoreBand, out, at);
     ReadWgLen(*g, "shoreMudWidth", w.shoreMudWidth, out, at);
     ReadWgLen(*g, "shoreLift", w.shoreLift, out, at);
-    ReadWgCount(*g, "shoreCattailChance", w.shoreCattailChance, out, at);
-    ReadWgLen(*g, "shoreCattailReach", w.shoreCattailReach, out, at);
-    ReadWgLen(*g, "shoreCattailHeight", w.shoreCattailHeight, out, at);
-    ReadWgCount(*g, "shoreSedgeChance", w.shoreSedgeChance, out, at);
-    ReadWgCount(*g, "shoreHorsetailChance", w.shoreHorsetailChance, out, at);
-    ReadWgLen(*g, "shoreHorsetailHeight", w.shoreHorsetailHeight, out, at);
-    ReadWgCount(*g, "shoreIrisChance", w.shoreIrisChance, out, at);
-    ReadWgCount(*g, "shoreMossChance", w.shoreMossChance, out, at);
-    ReadWgCount(*g, "cactusChance", w.cactusChance, out, at);
-    ReadWgCount(*g, "saguaroFraction", w.saguaroFraction, out, at);
     ReadWgCount(*g, "alpineChance", w.alpineChance, out, at);
-    ReadWgCount(*g, "caveMushroomChance", w.caveMushroomChance, out, at);
-    ReadWgCount(*g, "caveCrystalChance", w.caveCrystalChance, out, at);
     ReadWgCount(*g, "caveThreshold1", w.caveThreshold1, out, at);
     ReadWgCount(*g, "caveThreshold2", w.caveThreshold2, out, at);
     // A NAME, never a path: worldedit.cpp joins it under assets/worldedits/,
@@ -2543,10 +2524,6 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     atLeast("pondTile", w.pondTile, 8);
     atLeast("pondChance", w.pondChance, 1);
     atLeast("pondRadiusSpan", w.pondRadiusSpan, 1);
-    atLeast("lilyChance", w.lilyChance, 1);
-    atLeast("lilyFlowerChance", w.lilyFlowerChance, 1);
-    atLeast("reedChance", w.reedChance, 1);
-    atLeast("kelpChance", w.kelpChance, 1);
     atLeast("pondDepthRim", w.pondDepthRim, 1);
     atLeast("pondDepth", w.pondDepth, w.pondDepthRim);
     // The bowl is carved DOWN from the water surface, and the cave system
@@ -2588,13 +2565,6 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     atLeast("shoreBand", w.shoreBand, 0);      // 0 legally disables the fringe
     atLeast("shoreMudWidth", w.shoreMudWidth, 0);
     atLeast("shoreLift", w.shoreLift, 0);
-    atLeast("shoreCattailChance", w.shoreCattailChance, 1);
-    atLeast("shoreCattailHeight", w.shoreCattailHeight, 1);
-    atLeast("shoreSedgeChance", w.shoreSedgeChance, 1);
-    atLeast("shoreHorsetailChance", w.shoreHorsetailChance, 1);
-    atLeast("shoreHorsetailHeight", w.shoreHorsetailHeight, 1);
-    atLeast("shoreIrisChance", w.shoreIrisChance, 1);
-    atLeast("shoreMossChance", w.shoreMossChance, 1);
     // shoreAt() resolves the distance past the rim by 8 steps of bisection over
     // [0, shoreBand], which is exact only while the band fits in 2^8.
     // NOT scaled, and that is the point: 255 is 2^8 - 1, an ALGORITHM limit on
@@ -2638,12 +2608,8 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     // The mud ring lives inside the band; a wider one would just be clipped
     // silently, which reads as "shoreMudWidth stopped doing anything".
     if (w.shoreMudWidth > w.shoreBand) w.shoreMudWidth = w.shoreBand;
-    if (w.shoreCattailReach > w.shoreBand) w.shoreCattailReach = w.shoreBand;
     // The pad blend divides by the margin, and the ivy pass reads the ruin from
     // columns one voxel OUTSIDE the footprint, so the margin has to reach them.
-    // Both are the divisor of a `% chance == 0` roll.
-    atLeast("caveMushroomChance", w.caveMushroomChance, 1);
-    atLeast("caveCrystalChance", w.caveCrystalChance, 1);
     // Every curve knot is Q14 over the coarse swing, and curveTangent's
     // i32 multiply is only safe inside that bound (worldgen.wgsl).
     {
@@ -2683,8 +2649,8 @@ bool LoadTuning(const std::string& path, Tuning& out) {
       if (w.biomeBlend < 0) w.biomeBlend = 0;
     }
     // (The wallIvyDensity / ruinPadMargin / mossFace clamps went with the
-    // arena and the ruin scatter in the world map's P2b.)
-    atLeast("autumnFraction", w.autumnFraction, 1);
+    // arena and the ruin scatter in the world map's P2b; the shore species,
+    // pond life, cactus, cave flora and autumnFraction clamps with P-E.)
   }
 
   return true;
@@ -2793,7 +2759,6 @@ std::string WorldgenDefaultsJson() {
   n("curveDesert7", w.curveDesert7);
   n("curveDesert8", w.curveDesert8);
   n("biomeBlend", w.biomeBlend);
-  n("autumnFraction", w.autumnFraction);
   n("pondTile", w.pondTile);
   n("pondChance", w.pondChance);
   n("pondRadiusMin", w.pondRadiusMin);
@@ -2803,28 +2768,10 @@ std::string WorldgenDefaultsJson() {
   n("pondBermWidth", w.pondBermWidth);
   n("pondDepth", w.pondDepth);
   n("pondDepthRim", w.pondDepthRim);
-  n("lilyChance", w.lilyChance);
-  n("lilyFlowerChance", w.lilyFlowerChance);
-  n("reedChance", w.reedChance);
-  n("reedHeight", w.reedHeight);
-  n("kelpChance", w.kelpChance);
-  n("kelpHeight", w.kelpHeight);
   n("shoreBand", w.shoreBand);
   n("shoreMudWidth", w.shoreMudWidth);
   n("shoreLift", w.shoreLift);
-  n("shoreCattailChance", w.shoreCattailChance);
-  n("shoreCattailReach", w.shoreCattailReach);
-  n("shoreCattailHeight", w.shoreCattailHeight);
-  n("shoreSedgeChance", w.shoreSedgeChance);
-  n("shoreHorsetailChance", w.shoreHorsetailChance);
-  n("shoreHorsetailHeight", w.shoreHorsetailHeight);
-  n("shoreIrisChance", w.shoreIrisChance);
-  n("shoreMossChance", w.shoreMossChance);
-  n("cactusChance", w.cactusChance);
-  n("saguaroFraction", w.saguaroFraction);
   n("alpineChance", w.alpineChance);
-  n("caveMushroomChance", w.caveMushroomChance);
-  n("caveCrystalChance", w.caveCrystalChance);
   n("caveThreshold1", w.caveThreshold1);
   n("caveThreshold2", w.caveThreshold2);
   s("mapLayer", w.mapLayer);

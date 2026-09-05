@@ -1270,7 +1270,10 @@ class Handler(BaseHTTPRequestHandler):
                 "ok": True,
                 "map": name,
                 "mapHash": "%08x" % _fnv_file_set(d or "", (".json", ".svmap")),
-                "biomesHash": "%08x" % _fnv_file_set(os.path.join(ASSETS, "biomes"), (".json",)),
+                # biomes ^ water: the presets' flora rows are packed with the
+                # biome records since P-E (mirrors StampEnvironment)
+                "biomesHash": "%08x" % (_fnv_file_set(os.path.join(ASSETS, "biomes"), (".json",)) ^
+                                        _fnv_file_set(os.path.join(ASSETS, "water"), (".json",))),
                 "treesHash": "%08x" % _fnv_file_set(os.path.join(ASSETS, "trees"), (".json", ".svtree")),
             })
         if p == "/api/worldmaps":

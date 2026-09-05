@@ -69,11 +69,17 @@ RMIN, RSPAN = T["pondRadiusMin"], T["pondRadiusSpan"]
 PD, PDR = T["pondDepth"], T["pondDepthRim"]
 BAND, MUDW = T["shoreBand"], T["shoreMudWidth"]
 LIFT = T["shoreLift"]
-CATC = T["shoreCattailChance"]
-CATR, CATH = T["shoreCattailReach"], T["shoreCattailHeight"]
-SEDC = T["shoreSedgeChance"]
-HORC, HORH = T["shoreHorsetailChance"], T["shoreHorsetailHeight"]
-IRIC, MOSSC = T["shoreIrisChance"], T["shoreMossChance"]
+# P-E: the shore SPECIES are the water preset's (assets/water/<name>.json
+# shore.plants[] / shore.mossChance), not tuning knobs. The forest and meadow
+# biomes' first water row is the tarn, which is what every pond in them wears
+# until P-F (worldmap.cpp WaterPresetOf). Rows are (material, chance, reach
+# voxels, height voxels) in authored order, as worldmap.cpp packs them.
+_VPM = T.get("refVoxelsPerMetre", 10)
+_W = json.load(open(os.path.join(ROOT, "assets", "water", "tarn.json"), encoding="utf-8"))
+MOSSC = _W["shore"].get("mossChance", 0)
+SHORE_ROWS = [(p["material"], p["chance"], max(0, int(round(p.get("reach", 0) * _VPM))),
+               max(1, int(round(p.get("height", 0.3) * _VPM))))
+              for p in _W["shore"]["plants"] if p.get("chance", 0) > 0]
 
 
 def vnoise(x, z, cs, seed):
@@ -224,24 +230,22 @@ def cover(p):
             cols += 1
             if past < MUDW:
                 cnt["shore_mud"] += 1
-            elif hash3(SEED ^ 0x4D05, u32(x), u32(z)) % MOSSC == 0:
+            elif MOSSC and hash3(SEED ^ 0x4D05, u32(x), u32(z)) % MOSSC == 0:
                 cnt["wet_moss"] += 1
-            hCat = hash3(SEED ^ 0x9C41, u32(x), u32(z))
-            hHor = hash3(SEED ^ 0x3E77, u32(x), u32(z))
-            hSed = hash3(SEED ^ 0x58BD, u32(x), u32(z))
-            hIri = hash3(SEED ^ 0xA219, u32(x), u32(z))
-            catH = CATH + ((hCat >> 5) % 7) - 3
-            horH = HORH + ((hHor >> 5) % 5) - 2
-            if past <= CATR and catH > 1 and hCat % CATC == 0:
-                cnt["cattail"] += 1
-                cnt["~cattail voxels"] += catH
-            elif horH > 1 and hHor % HORC == 0:
-                cnt["horsetail"] += 1
-                cnt["~horsetail voxels"] += horH
-            elif hIri % IRIC == 0:
-                cnt["water_iris"] += 1
-            elif hSed % SEDC == 0:
-                cnt["marsh_grass"] += 1
+            # The shader's shore loop: rows in authored order, one salt per
+            # row, first hit wins; stalks of 3+ jitter by +-(H/6, at least 1).
+            for i, (name, chance, reach, base) in enumerate(SHORE_ROWS):
+                if past > reach:
+                    continue
+                hRow = hash3(SEED ^ ((0x9C41 + i * 0x9E37) & 0xFFFFFFFF), u32(x), u32(z))
+                if hRow % chance != 0:
+                    continue
+                amp = max(1, base // 6) if base >= 3 else 0
+                hgt = max(1, base + ((hRow >> 5) % (2 * amp + 1)) - amp)
+                cnt[name] += 1
+                if hgt > 1:
+                    cnt["~%s voxels" % name] += hgt
+                break
     return cols, bluff, cnt
 
 

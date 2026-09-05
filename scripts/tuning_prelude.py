@@ -491,7 +491,6 @@ SPEC = [
     ("worldgen", "curveDesert7", "TUNE_CURVE_DESERT7", "i", 12288),
     ("worldgen", "curveDesert8", "TUNE_CURVE_DESERT8", "i", 16384),
     ("worldgen", "biomeBlend", "TUNE_BIOME_BLEND", "i", 18),
-    ("worldgen", "autumnFraction", "TUNE_AUTUMN_FRACTION", "u", 5),
     ("worldgen", "pondTile", "TUNE_POND_TILE", "i", 448),
     ("worldgen", "pondChance", "TUNE_POND_CHANCE", "u", 4),
     ("worldgen", "pondRadiusMin", "TUNE_POND_RADIUS_MIN", "i", 48),
@@ -501,12 +500,8 @@ SPEC = [
     ("worldgen", "pondBermWidth", "TUNE_POND_BERM_WIDTH", "i", 14),
     ("worldgen", "pondDepth", "TUNE_POND_DEPTH", "i", 26),
     ("worldgen", "pondDepthRim", "TUNE_POND_DEPTH_RIM", "i", 3),
-    ("worldgen", "lilyChance", "TUNE_LILY_CHANCE", "u", 22),
-    ("worldgen", "lilyFlowerChance", "TUNE_LILY_FLOWER_CHANCE", "u", 5),
-    ("worldgen", "reedChance", "TUNE_REED_CHANCE", "u", 130),
-    ("worldgen", "reedHeight", "TUNE_REED_HEIGHT", "i", 16),
-    ("worldgen", "kelpChance", "TUNE_KELP_CHANCE", "u", 120),
-    ("worldgen", "kelpHeight", "TUNE_KELP_HEIGHT", "i", 10),
+
+    # pond life: lilypads, reeds, kelp
 
     # vines / climbers / hanging moss (worldgen agent B)
 
@@ -514,25 +509,13 @@ SPEC = [
     ("worldgen", "shoreBand", "TUNE_SHORE_BAND", "i", 24),
     ("worldgen", "shoreMudWidth", "TUNE_SHORE_MUD_WIDTH", "i", 10),
     ("worldgen", "shoreLift", "TUNE_SHORE_LIFT", "i", 12),
-    ("worldgen", "shoreCattailChance", "TUNE_SHORE_CATTAIL_CHANCE", "u", 12),
-    ("worldgen", "shoreCattailReach", "TUNE_SHORE_CATTAIL_REACH", "i", 9),
-    ("worldgen", "shoreCattailHeight", "TUNE_SHORE_CATTAIL_HEIGHT", "i", 20),
-    ("worldgen", "shoreSedgeChance", "TUNE_SHORE_SEDGE_CHANCE", "u", 4),
-    ("worldgen", "shoreHorsetailChance", "TUNE_SHORE_HORSETAIL_CHANCE", "u", 10),
-    ("worldgen", "shoreHorsetailHeight", "TUNE_SHORE_HORSETAIL_HEIGHT", "i", 9),
-    ("worldgen", "shoreIrisChance", "TUNE_SHORE_IRIS_CHANCE", "u", 34),
-    ("worldgen", "shoreMossChance", "TUNE_SHORE_MOSS_CHANCE", "u", 3),
 
     # desert / pine highland / alpine ground cover (worldgen agent E)
-    ("worldgen", "cactusChance", "TUNE_CACTUS_CHANCE", "u", 26),
-    ("worldgen", "saguaroFraction", "TUNE_SAGUARO_FRACTION", "u", 22),
     ("worldgen", "alpineChance", "TUNE_ALPINE_CHANCE", "u", 40),
 
     # ruin pads (13.3.2)
 
     # cave flora + the shaded face (13.3.4)
-    ("worldgen", "caveMushroomChance", "TUNE_CAVE_MUSHROOM_CHANCE", "u", 26),
-    ("worldgen", "caveCrystalChance", "TUNE_CAVE_CRYSTAL_CHANCE", "u", 9),
     ("worldgen", "caveThreshold1", "TUNE_CAVE_THRESHOLD1", "u", 150),
     ("worldgen", "caveThreshold2", "TUNE_CAVE_THRESHOLD2", "u", 148),
 

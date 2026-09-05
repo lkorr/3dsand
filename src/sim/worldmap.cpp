@@ -29,6 +29,42 @@ uint32_t Vox(float metres) {
   const int v = static_cast<int>(std::lround(metres * kVoxelsPerMetre));
   return U(std::max(1, v));
 }
+// A depth or a reach may legitimately be zero ("from the waterline").
+uint32_t Vox0(float metres) {
+  const int v = static_cast<int>(std::lround(metres * kVoxelsPerMetre));
+  return U(std::max(0, v));
+}
+
+// ---- the flora half of a water preset (P-E) --------------------------------
+// The shader jitters a shore stalk of 3+ cells by +-(H/6, at least 1) per
+// column so a bed of stalks is not a fence; the ceiling has to include it.
+uint32_t ShoreJitter(uint32_t h) { return h >= 3u ? std::max(1u, h / 6u) : 0u; }
+
+// Whether a row is really on: an authored chance AND a material that
+// resolved. ValidateBiomeSet reports the half-authored case; here it is
+// simply not packed, so the shader never rolls for a material 0.
+bool ShoreRowOn(const biomes::ShorePlantRow& r) { return r.chance > 0 && r.materialId != 0; }
+bool BandOn(const biomes::AquaticBand& b) { return b.chance > 0 && b.materialId != 0; }
+
+// The tallest thing this preset puts above the ground (shore rows, jitter
+// included) or above the bed (the emergent band): the sky-skip / far-blocker
+// margin for any column the preset can touch.
+uint32_t MaxPlantH(const biomes::WaterPresetDef& w) {
+  uint32_t m = 0;
+  for (const biomes::ShorePlantRow& r : w.shorePlants)
+    if (ShoreRowOn(r)) m = std::max(m, Vox(r.heightM) + ShoreJitter(Vox(r.heightM)));
+  if (BandOn(w.emergent)) m = std::max(m, Vox(w.emergent.heightM));
+  return m;
+}
+
+// The P-E interim rule: a biome's ponds and shores wear its FIRST water row's
+// preset (a pond has no preset of its own until P-F). 0 = none.
+uint32_t WaterPresetOf(const biomes::BiomeSet& set, const biomes::BiomeDef& b) {
+  if (b.water.empty()) return 0u;
+  for (size_t i = 0; i < set.water.size(); i++)
+    if (set.water[i].name == b.water[0].preset) return static_cast<uint32_t>(i + 1);
+  return 0u;
+}
 
 // FNV-1a. Not a security hash; a change-detector so the boot line can name
 // the table/map that produced this world's hash.
@@ -111,6 +147,22 @@ bool PackBiomeTable(const biomes::BiomeSet& set, std::vector<uint32_t>& W,
     if (b.cacti) flags |= kBF_Cacti;
     if (b.sandCap) flags |= kBF_SandCap;
     r[kB_Flags] = flags;
+    // P-E: cave flora from the band rows (mushrooms on the near band's floor,
+    // crystal on the deep band's floor and ceiling), the cactus density, and
+    // the water preset the biome's ponds and shores wear (see WaterPresetOf).
+    // A biome that authors no row / no key gets 0 = never; there is no global
+    // default any more.
+    int mushroom = 0, crystal = 0;
+    for (const biomes::CaveRow& c : b.caves) {
+      if (c.preset == "near_surface") mushroom = c.mushroomChance;
+      else if (c.preset == "deep") crystal = c.crystalChance;
+    }
+    r[kB_CaveMushroomChance] = U(std::max(0, mushroom));
+    r[kB_CaveCrystalChance] = U(std::max(0, crystal));
+    r[kB_CactusChance] = U(std::clamp(b.cactusChance, 0, 100));
+    r[kB_SaguaroFraction] = U(std::clamp(b.saguaroFraction, 0, 100));
+    const uint32_t wp = WaterPresetOf(set, b);
+    r[kB_WaterPreset] = wp;
     // Cover rows are appended AFTER every record so the record table stays a
     // fixed stride; a row with chance 0 is authored-off and skipped here.
     r[kB_CoverOff] = U(static_cast<int>(W.size()));
@@ -138,9 +190,72 @@ bool PackBiomeTable(const biomes::BiomeSet& set, std::vector<uint32_t>& W,
       row[kC_NearWaterMin] = U(std::max(0, static_cast<int>(std::lround(c.cond.nearWaterMinM * kVoxelsPerMetre))));
       count++;
     }
+    // The biome's ceiling includes its water preset's plants: a shore stalk
+    // stands on ground the sky-skip would otherwise clear above (the same
+    // "skipped chunk drops voxels" failure the cover rows had).
+    if (wp) maxH = std::max(maxH, MaxPlantH(set.water[wp - 1]));
     W[rec0 + static_cast<size_t>(i) * kBiomeRecWords + kB_CoverCount] = U(count);
     W[rec0 + static_cast<size_t>(i) * kBiomeRecWords + kB_MaxCoverH] = maxH;
     W[kHMaxCoverH] = std::max(W[kHMaxCoverH], maxH);
+  }
+
+  // ---- the water preset table (P-E): records, then each preset's shore rows --
+  // Every preset is packed whether or not a biome names it: the index is the
+  // loader's order, and P-F will address the table from pond sites as well.
+  const int nw = static_cast<int>(set.water.size());
+  W[kHWaterCount] = U(nw);
+  W[kHWaterRecords] = U(static_cast<int>(W.size()));
+  const size_t wrec0 = W.size();
+  W.resize(wrec0 + static_cast<size_t>(nw) * kWaterRecWords, 0u);
+  for (int i = 0; i < nw; i++) {
+    const biomes::WaterPresetDef& w = set.water[static_cast<size_t>(i)];
+    auto rec = [&](uint32_t word) -> uint32_t& { return W[wrec0 + static_cast<size_t>(i) * kWaterRecWords + word]; };
+    rec(kW_Fill) = w.fillId;
+    rec(kW_MossChance) = w.mossId ? U(std::max(0, w.mossChance)) : 0u;
+    rec(kW_MossMat) = w.mossId;
+    const biomes::AquaticBand& e = w.emergent;
+    if (BandOn(e)) {
+      rec(kW_EmergentMat) = e.materialId;
+      rec(kW_EmergentChance) = U(e.chance);
+      rec(kW_EmergentMinDepth) = Vox0(e.minDepthM);
+      rec(kW_EmergentMaxDepth) = Vox0(e.maxDepthM);
+      rec(kW_EmergentHeight) = Vox(e.heightM);
+    }
+    const biomes::AquaticBand& f = w.floating;
+    if (BandOn(f)) {
+      rec(kW_FloatingMat) = f.materialId;
+      rec(kW_FloatingFlower) = f.flowerId;
+      rec(kW_FloatingChance) = U(f.chance);
+      rec(kW_FloatingFlowerChance) = f.flowerId ? U(std::max(0, f.flowerChance)) : 0u;
+      rec(kW_FloatingMinDepth) = Vox0(f.minDepthM);
+      rec(kW_FloatingMaxDepth) = Vox0(f.maxDepthM);
+    }
+    const biomes::AquaticBand& s = w.submerged;
+    if (BandOn(s)) {
+      rec(kW_SubmergedMat) = s.materialId;
+      rec(kW_SubmergedChance) = U(s.chance);
+      rec(kW_SubmergedMinDepth) = Vox0(s.minDepthM);
+      rec(kW_SubmergedHeight) = Vox(s.heightM);
+      rec(kW_SubmergedClearance) = Vox0(s.clearanceM);
+    }
+    rec(kW_MaxPlantH) = MaxPlantH(w);
+    // Shore rows, in authored order (the shader rolls them in order, first
+    // hit wins, so the author puts the common ground layer last).
+    rec(kW_ShoreOff) = U(static_cast<int>(W.size()));
+    uint32_t count = 0;
+    for (const biomes::ShorePlantRow& p : w.shorePlants) {
+      if (!ShoreRowOn(p)) continue;
+      const size_t at = W.size();
+      W.resize(at + kShoreRowWords, 0u);
+      uint32_t* row = W.data() + at;   // W moved: never hold `rec` across this
+      row[kP_Mat] = p.materialId;
+      row[kP_Head] = p.headId;
+      row[kP_Chance] = U(p.chance);
+      row[kP_Reach] = Vox0(p.reachM);
+      row[kP_Height] = Vox(p.heightM);
+      count++;
+    }
+    W[wrec0 + static_cast<size_t>(i) * kWaterRecWords + kW_ShoreCount] = count;
   }
   W[kHContentHash] = 0u;
   W[kHContentHash] = FnvWords(W);
