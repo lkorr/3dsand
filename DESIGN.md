@@ -3410,14 +3410,21 @@ in the HUD** rather than dropped silently.
 words, one hand, no menu. Sprint is on Shift outside magic mode and magic mode
 captures the number row, so nothing collides. A slot holds a glyph OR a
 grimoire page (`SlotKind`), both by NAME; the HUD strip draws two rows and
-lights the bank Shift is holding. The character screen's arsenal is sorted by
-SORT into five columns — matter, effect, operator, delivery, mod — each glyph
+lights the bank Shift is holding. The character screen's ARSENAL is a full
+column of its own (`ui/inventory_ui.cpp`): the twenty bound keys on top, then
+EVERY WORD as a table with one band of rows per sort — matter, effect,
+operator, delivery, mod — the sort's name in a gutter on the left, each glyph
 with its sort's colour and its valence mark (`<` takes the word before it,
 `><` is infix), unowned glyphs greyed with their name hidden (the shape of a
 word you have not learned is visible and the word is not), and hover opens
 the §9 info box, every field of which is read from the glyph's JSON entry
 (`UIState::GlyphUI`), so the box is never wrong about the glyph and a modder's
-glyph gets one free. `GrantAllAndBind` is the debug default; `Grant`/`Owns`
+glyph gets one free. The table is the drag SOURCE for the keys and for the
+grimoire, so it is never hidden behind a mode: the first version put the
+grimoire behind a toggle on the arsenal, and the glyphs it needed vanished the
+moment the toggle was pressed. Every tooltip on the screen is set in the 13 px
+small font, wrapped at 320 px; the screen's own 26 px face under the cursor
+covered a third of the panel it was describing. `GrantAllAndBind` is the debug default; `Grant`/`Owns`
 are the acquisition loop's seam.
 
 **The grimoire: macros as saved word lists (plan §12b; `Grimoire`,
@@ -3433,15 +3440,19 @@ unbounded expansion, ever). A word that no longer resolves drops with a log
 line and shows as `?`; the page is kept (the DESIGN §8b contract). Two ways to
 make one: `=` in magic mode CAPTURES the stack to a page auto-named from its
 readout (`fire2-trail-projectile`), and the character screen's GRIMOIRE panel
-COMPOSES — a page list (the authored starters from `glyphs.json`'s
-`conjoined` block appear read-only; `heal` = `blood mend`, `firebolt` = `fire
-trail projectile`, `ward` = `transmute null aura self`), and for the selected
-page a word row you drag glyphs and pages into and reorder, a name, the
-derived readout, the price (`?` when it depends on `anything`), Save / Delete
-/ Duplicate, and a row of twenty keys to bind it to. The row is described
-through the same `DescribeSpell` the live sentence uses, so the panel can
-never disagree with the game about what a page means. Editing a page rewires
-every slot bound to it, because slots hold the page's name.
+COMPOSES — its own panel above the pack, in a third column beside the arsenal
+(when the window is too narrow for three columns it falls back to a toggle on
+the arsenal, over the pack). A page list on the left (the authored starters
+from `glyphs.json`'s `conjoined` block appear read-only; `heal` = `blood
+mend`, `firebolt` = `fire trail projectile`, `ward` = `transmute null aura
+self`), and for the selected page a name, a word row you drag glyphs and pages
+into and reorder (right-click or drag out to remove), the derived readout on a
+dark page in small type, the price (`?` when it depends on `anything`), and
+Save / Duplicate / Delete. A page is bound to a key by dragging it from the
+list onto the key in the arsenal — the same gesture as a glyph. The row is
+described through the same `DescribeSpell` the live sentence uses, so the
+panel can never disagree with the game about what a page means. Editing a
+page rewires every slot bound to it, because slots hold the page's name.
 
 **PLYR v4** appends the grimoire (pages: name + words; the twenty slots as
 (kind, name) pairs) after the v3 payload and still loads v3 (an empty
