@@ -485,6 +485,40 @@ void Overlay::Draw(UIState& s) {
   if (s.spellLastBillAge < 2.5f && s.spellLastBill > 0)
     ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f), "billed %d on resolve",
                        s.spellLastBill);
+  // Dev control of the pool: set the max to anything up to 2^30 (ResolveCast
+  // adds mana + health in an int32, so the ceiling stays below overflow),
+  // fill it once, or pin it full every tick. Requests only; main.cpp applies.
+  if (ImGui::TreeNode("dev: mana pool")) {
+    constexpr int32_t kDevManaCeiling = 1 << 30;
+    if (s.devManaMaxEdit <= 0) s.devManaMaxEdit = s.manaPoolMax > 0 ? s.manaPoolMax : 100;
+    ImGui::SetNextItemWidth(140.0f);
+    int edit = s.devManaMaxEdit;
+    if (ImGui::InputInt("max", &edit, 100, 10000)) s.devManaMaxEdit = edit;
+    if (s.devManaMaxEdit < 1) s.devManaMaxEdit = 1;
+    if (s.devManaMaxEdit > kDevManaCeiling) s.devManaMaxEdit = kDevManaCeiling;
+    ImGui::SameLine();
+    if (ImGui::Button("apply max")) s.devManaMaxRequest = s.devManaMaxEdit;
+    ImGui::SameLine();
+    if (ImGui::Button("fill")) s.devManaFill = true;
+    // Presets apply immediately AND fill, which is what "ridiculous" means in
+    // practice — nobody sets 1e9 and then wants to wait for regen.
+    struct Preset {
+      const char* label;
+      int32_t value;
+    };
+    const Preset presets[] = {{"100", 100},      {"1k", 1000},        {"100k", 100000},
+                              {"10M", 10000000}, {"1G", 1000000000}, {"2^30", kDevManaCeiling}};
+    for (size_t i = 0; i < sizeof(presets) / sizeof(presets[0]); i++) {
+      if (i > 0) ImGui::SameLine();
+      if (ImGui::SmallButton(presets[i].label)) {
+        s.devManaMaxEdit = presets[i].value;
+        s.devManaMaxRequest = presets[i].value;
+        s.devManaFill = true;
+      }
+    }
+    ImGui::Checkbox("infinite (refill to max every tick)", &s.devManaInfinite);
+    ImGui::TreePop();
+  }
   if (s.spellCost > s.mana + s.health) {
     ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.3f, 1.0f),
                        "FATAL - this will kill you");

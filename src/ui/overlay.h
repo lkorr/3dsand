@@ -362,6 +362,14 @@ struct UIState {
   // The pool's authored max and what live statuses reserve out of it (plan
   // §7): the bar draws [manaMax, manaPoolMax] as reserved.
   int32_t manaPoolMax = 0, manaReserved = 0;
+  // Dev overrides for the pool ("dev: mana pool" under the magic bar). The
+  // pool belongs to the caster, so the panel only ASKS and main.cpp applies
+  // these in the tick loop, beside the regen tick, so a sustained aura under
+  // "infinite" never sees a dry tick between frames.
+  int32_t devManaMaxEdit = 0;        // the input box; 0 = seed from manaPoolMax
+  int32_t devManaMaxRequest = -1;    // one-shot: set the pool's max to this
+  bool devManaFill = false;          // one-shot: mana = effective max
+  bool devManaInfinite = false;      // sticky: refill to the max every tick
   // What the caster is sustaining, newest last, for the HUD list and the
   // drop key. Each line is the status's readout and its per-tick price.
   std::vector<std::string> spellStatuses;

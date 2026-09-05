@@ -6447,6 +6447,20 @@ int main(int argc, char** argv) {
       std::vector<ExplosionOp> spellExps;
       {
         caster.mana.Tick();
+        // Dev-panel overrides of the pool (ui/overlay.h devMana*). Applied
+        // HERE, after the regen tick and before the cast/bill sites below, so
+        // "infinite" is a full pool at every point a tariff is resolved
+        // against it. The player's caster only; mobs keep their own pools.
+        if (ui.devManaMaxRequest >= 0) {
+          caster.mana.manaMax = std::max(1, ui.devManaMaxRequest);
+          ui.devManaMaxRequest = -1;
+          caster.mana.mana = std::min(caster.mana.mana, caster.mana.EffectiveMax());
+        }
+        if (ui.devManaFill || ui.devManaInfinite) {
+          caster.mana.mana = caster.mana.EffectiveMax();
+          caster.mana.regenAccum = 0;
+          ui.devManaFill = false;
+        }
         SpellEmission emit;
 
         // What the VM may ask about bodies: where an adopted bomb is, and the
