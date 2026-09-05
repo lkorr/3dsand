@@ -3918,10 +3918,38 @@ fn farSurfaceMat(col : Col, mat : u32, fine : vec3<i32>, shift : u32,
     let can = treeCanopyAt(fine.x, fine.z, seed);
     if (can != MAT_AIR) { return can; }
   }
+  // MEADOW COVER IS NOT FLATTENED INTO THE SKIN, and this was tried (LOD-seam
+  // pass, 2026-09-04) before being taken out again: painting the surface cell
+  // under a tall-grass column with the strand material turned every far meadow
+  // the strand palette's dark green while the near meadow, seen at 25 m, reads
+  // as the lime skin with thin blades over it -- a harder colour step than the
+  // one it was meant to remove. A blade thinner than a cascade cell contributes
+  // nothing to the far field (farCellIsSolid drops the plant cell itself); what
+  // the near field shows between its blades is the skin, and the skin is what
+  // the far field paints. A genuine blend would need a far-only proxy material
+  // whose palette is the skin/blade average -- not a cell rule.
   let skin = genCellCol(col, vec3<i32>(fine.x, h, fine.z), seed) & 0xFFFu;
   // hollow ruin interiors can return air at y == h; keep the body mat then
   if (skin == MAT_AIR || materials[skin].klass == CLASS_GAS) { return mat; }
   return skin;
+}
+
+// ---- WHAT A CENTRE SAMPLE MAY TURN INTO A CASCADE CELL --------------------
+// Shared by the sieve, the downsample and the edit patch, so the three
+// producers keep their byte-for-byte agreement (the `far-downsample` gate).
+// Gases were always dropped (no media in the far field). MICRO materials are
+// now dropped too: a grass tuft or a flower is a mostly-air cell that the
+// renderer fills with blades or a sub-voxel model, and the cascade has no such
+// path — its centre sample became a SOLID CUBE of the plant's palette, 20 cm at
+// level 1 and 25 m at level 8. Measured on screenshot_ground: the meadow past
+// the window edge was littered with straw-coloured boulders that were
+// tall_grass cells. A blade thinner than any cascade cell contributes nothing
+// to the far GEOMETRY; its COLOUR reaches the far field through
+// farSurfaceMat's cover flattening instead.
+fn farCellIsSolid(mat : u32) -> bool {
+  if (mat == MAT_AIR) { return false; }
+  let m = materials[mat];
+  return m.klass != CLASS_GAS && (m.flags & MATF_MICRO) == 0u;
 }
 
 // ---- the conservative "any blocker" bit (13.2.2) --------------------------
@@ -4483,7 +4511,7 @@ fn far(@builtin(workgroup_id) wg : vec3<u32>,
       // The conservative flag first: it is what a cell keeps when the centre
       // sample found nothing (common.wgsl FAR_BLOCKER_BIT).
       var byteV = farBlockerBitAt(tops[b], cc, shift, T.seed);
-      if (mat != MAT_AIR && materials[mat].klass != CLASS_GAS) {
+      if (farCellIsSolid(mat)) {
         // shape from the center sample, color from the surface skin (phase 4)
         byteV |= min(farSurfaceMat(col, mat, fine, shift, T.seed), FAR_MAT_MASK);
       }
@@ -4552,7 +4580,7 @@ fn far(@builtin(workgroup_id) wg : vec3<u32>,
     var byteV = farBlockerBitAt(
         farColTopFrom(pcol.h, pcol.fluidTop, pfine.x, pfine.z, T.seed),
         pcc, shift, T.seed);
-    if (pmat != MAT_AIR && materials[pmat].klass != CLASS_GAS) {
+    if (farCellIsSolid(pmat)) {
       byteV |= min(farSurfaceMat(pcol, pmat, pfine, shift, T.seed), FAR_MAT_MASK);
     }
     if (byteV != 0u) { pnz += 1u; }
@@ -4668,7 +4696,7 @@ fn fardown(@builtin(workgroup_id) wg : vec3<u32>,
           cc, shift, T.seed);
       // live grid (the sample point is inside this chunk, hence resident)
       let mat = voxWordAt(fine) & 0xFFFu;
-      if (mat != MAT_AIR && materials[mat].klass != CLASS_GAS) {
+      if (farCellIsSolid(mat)) {
         // Same skin rule as the sieve — the skin is looked up from PRISTINE
         // procgen (genCell), so a pristine chunk downsamples bit-identically
         // to the sieve's fill. An edited surface keeps its pristine skin color

@@ -4304,18 +4304,23 @@ world hash.
   occupancy-skipped DDA in level-cell units; t-ordering (each level starts at
   the previous box's exit) keeps coarse data from ever occluding fine data.
   **A ray leaves the fine march at whichever comes first: the window exit, or
-  the in-window LOD handoff** (`TUNE_LOD_HANDOFF_DIST`, 24 m default, render
-  group). The handoff is a `min()` clamp on `trace()`'s `tExit`, so it moves
-  where the cascade takes over without touching the handoff machinery — the
-  cascade start distance, the one-sided seam dither and the `tPrev` ordering
-  all read `tExit` exactly as before. PRIMARY rays only (`wantMedia`): a shadow
-  ray that gave up at 24 m would report "lit" for a receiver whose blocker is
-  further, which unshadows terrain rather than coarsening it. Setting the knob
-  ≥ the window half-extent (25.6 m) restores window-exit-only behaviour.
-  Measured worth ~8-11% of the offscreen frame, saturating at 22-24 m; past
-  the handoff, terrain quantises to level-1 cells (40 cm), which preserves
-  silhouettes but coarsens mid-field grass detail
-  (`docs/PLAN_surface_flight_perf.md` A1).
+  the in-window LOD handoff** (`TUNE_LOD_HANDOFF_DIST`, render group — **ships
+  DISABLED at 26 m since the LOD-seam pass, 2026-09-04**; it was 24). The
+  handoff is a `min()` clamp on `trace()`'s `tExit`, so it moves where the
+  cascade takes over without touching the handoff machinery — the cascade
+  start distance, the one-sided seam dither and the `tPrev` ordering all read
+  `tExit` exactly as before. PRIMARY rays only (`wantMedia`): a shadow ray that
+  gave up at 24 m would report "lit" for a receiver whose blocker is further,
+  which unshadows terrain rather than coarsening it. Any value ≥ the window
+  half-extent (25.6 m) disables it and the window BOX edge is the handoff.
+  Measured worth ~8-11% of the offscreen frame, saturating at 22-24 m
+  (`docs/PLAN_surface_flight_perf.md` A1) — and at 24 m it was THE visible
+  ring: a `t` clamp on a normalised ray is a sphere around the camera, so every
+  representation change the seam carries (cell size 10 → 20 cm, and every
+  shading term listed under the seam pass below) landed on one circle on the
+  ground at a constant 24 m, where a 20 cm cell is still 6 px. The box edge is
+  25.6-44 m away, is not a circle, and is where the fine data genuinely ends.
+  Turn the knob back down to buy the 8-11% at the cost of the ring.
   **Distance look (phase 4, 2026-08-19):** kFarLevels is 8 (128 MiB farVox —
   exactly the WebGPU default storage-binding limit; the horizon sits 2 km out
   at 6.25 cm voxels). Cell COLOR is decoupled from cell SHAPE: shape still
@@ -4330,16 +4335,51 @@ world hash.
   material instead (`treeCanopyAt`) — trees too thin to survive center
   sampling are flattened into the terrain, so the far forest keeps its canopy
   color. Far hits shade with the same palette/face/ambient constants as the
-  near field plus: palette jitter keyed at a fixed ~0.5 m world frequency
-  (not per level cell, which flattened coarse cells into single-color slabs),
-  a one-sample AO from the cell above, sky reflection on distant water top
-  faces, and a SOFT sun-shadow term (`farShadowed`) — one occupancy-skipped
-  DDA toward the sun through the hit's own cascade level, attenuating lambert
-  to 0.3 rather than zero because at cascade resolution most casters are
-  single-cell terrace steps and a hard term reads as speckle noise. Fog is
-  aerial perspective: `applyAerial` converges surfaces exactly to
+  near field plus sky reflection on distant water top faces; the texture, AO
+  and shadow terms are the near field's own since the seam pass below (phase 4
+  had a 0.5 m palette hash, a one-sample AO and a flat ×0.3 shadow lift). Fog
+  is aerial perspective: `applyAerial` converges surfaces exactly to
   `skyColor(rd)` (the old ×0.9 target left everything hanging slightly darker
   than the sky it should dissolve into, which read as a gray veil).
+  **The LOD-seam pass (2026-09-04) — one rule: the only thing allowed to
+  change across a seam is the cell size.** Studied against a shipped mesh-LOD
+  voxel game (Fortune's Favor, `docs/refs/`), whose seams are invisible not
+  because they blend (they hard-swap 62 m chunk meshes at 2^k block scale, no
+  morphing, no crossfade) but because NOTHING ELSE changes: the texture tiles
+  in world units at every LOD (`TexCoord * scale`), and lighting, shadows, SSAO
+  and fog are deferred screen-space passes that do not know which LOD wrote
+  the pixel. Our seam changed five things at once, and each is now matched:
+  (1) **texture** — the far palette variant is `synthJitterState` at the fine
+  voxel just inside the hit face (the exact positional formula worldgen writes
+  into every pristine voxel's state nibble) and `surfaceGrain` on the same
+  fine lattice, so a cascade cell wears the speckle the voxels under it would
+  have shown; `grainAmpFar` ships equal to `grainAmp`. (2) **AO** — `farVoxelAO`
+  is `voxelAO`'s four-tap rule over cascade cells at `aoStrength`, occluders
+  being MATERIAL cells only. (3) **shadow** — `farShadowDist` returns the
+  blocker distance and the far hit takes `shadowFromOpaqueHit`, the one
+  softening law the terrain and the raster bodies share; levels ≥ 3 keep a
+  floor at `shadowFarLift`. (4) **plants** — `farCellIsSolid` drops MATF_MICRO
+  materials from the sieve, the downsample and the patch path: a grass tuft or
+  a flower is a mostly-air cell the renderer fills with blades, and its centre
+  sample had been a solid cube of the plant's palette (20 cm at level 1, 25 m
+  at level 8 — the straw boulders on every far meadow). (5) **the handoff** —
+  the 24 m sphere above is off. Measured on `screenshot_cascade`'s world,
+  far-meadow mean RGB vs the near meadow's 126/172/110: before 108/138/99,
+  after 126/165/109; with far shadows off entirely 128/168/111, so what
+  remains is real cast shadow. What was tried and taken out: painting the
+  surface cell under a tall-grass column with the strand material (the meadow
+  at 25 m reads as skin between thin blades, and the strand palette made the
+  far side darker than the near) — a blend would need a far-only proxy
+  material, not a cell rule. What is still not matched, in order of visibility:
+  the blades themselves end at the window edge (analytic plants have no far
+  representation); the 2× cell step is a 3 px → 6 px block change at the seam
+  and at every level box; the near field's one-bounce GI and openness terms
+  have no far equivalent; far water is an opaque disc. The structural answer
+  for the first two is the mesh game's: surface memory scales with area, so it
+  keeps full-detail chunks out to ~500 m (1.5 px per block at the swap), where
+  a dense cascade level costs volume — see `docs/PLAN_far_field_cascades.md`
+  §5.6 for why `kFarN` is the only knob and what a sparse near level would
+  take.
   **The far cell byte is 7 + 1, not 8 (13.2.2, 2026-09-01):** bit 7 of every
   far cell is a CONSERVATIVE BLOCKER FLAG — "pristine worldgen puts something a
   ray would stop on somewhere inside this cell's fine footprint" — and the
@@ -4355,9 +4395,12 @@ world hash.
   downsample would disagree with it at their shared boundary. Its cost is one
   comparison for all but ONE cell per column — the surface band, where the four
   corner columns are sampled — and its blind spot is edits, which reach the far
-  field only through the material byte. `farShadowed` treats it as a blocker at
-  every level; a primary ray only up to `render.farBlockerHitLevel`, which
-  ships at **0**. That default is a measured kill-criterion result, not
+  field only through the material byte. `farShadowDist` does NOT treat it as a
+  caster (it did, at every level, until the LOD-seam pass): the flag covers the
+  whole band of cells the ground surface passes through, so honouring it
+  shadowed most of the far surface at near-zero distance — the ×0.3 lift was
+  hiding that as a ~20% general dimming. A primary ray honours it only up to
+  `render.farBlockerHitLevel`, which ships at **0**. That default is a measured kill-criterion result, not
   timidity: at 2 the visible half does what it was built for (the half of every
   surface cell whose centre sampled air comes back, so a 60 m snow patch stops
   being a dithered smear) but the same one-cell lift buries the single-cell
