@@ -543,7 +543,76 @@ struct SpellBodyProbe {
   // The nearest body worth turning toward, from `from`, for `casterId`'s own
   // bolt (so a caster's bolts do not seek the caster). False when none.
   bool (*nearestTarget)(void* ctx, Vec3 from, uint64_t casterId, Vec3& outCentre) = nullptr;
+  // The body (a mob, the player) within `radius` of `from`, by the owner's
+  // opaque id, for a status to attach to. False when the point is a PLACE.
+  bool (*bodyIdAt)(void* ctx, Vec3 from, float radius, uint64_t& outId,
+                   Vec3& outCentre) = nullptr;
+  // Where a body is now; false when it is gone (the status drops).
+  bool (*bodyPos)(void* ctx, uint64_t id, Vec3& outCentre) = nullptr;
   void* ctx = nullptr;
+};
+
+// A SUSTAINED STATUS (plan §7): what the `aura` operator produces. Attached to
+// a body by the owner's opaque id, or to a place; runs every tick, billed
+// every tick to the caster as a reservation out of their max mana, until
+// dropped, dry, or the hard tick cap (rule 2; also a per-caster cap).
+struct SpellStatus {
+  EffectInst effect;         // the Sustain instance: inner effect, or a mod
+  uint64_t target = 0;       // body id, 0 = a place
+  SpellFxVec at{};           // the place, or the body's last centre
+  SpellFxVec dir{0, kSpellFxOne, 0};
+  uint64_t casterId = 0;
+  int32_t ticksLeft = 0;
+  int32_t perTick = 0;       // tariff per tick
+  int32_t instability = 0;
+  uint32_t id = 0;           // for the drop UI (newest = highest)
+};
+
+// A HELD BEAM: continuous delivery. Resolves at the ray hit every tick the
+// owner keeps it held (HoldBeam), billed per tick, ended by release, by
+// running dry, or by the tick cap.
+struct SpellBeam {
+  SpellCast cast;
+  uint64_t casterId = 0;
+  SpellFxVec origin{}, dir{kSpellFxOne, 0, 0};
+  int32_t ticksLeft = 0;
+  int32_t perTick = 0;
+  int32_t instability = 0;
+  bool held = true;
+  bool prepaid = true;       // the cast paid for the first resolve
+};
+
+// An ECHO: the inner effect again at the point every `period` ticks, a
+// bounded number of times (priced up front: repeats × the effect).
+struct SpellEcho {
+  std::vector<EffectInst> inner;
+  SpellFxVec at{}, dir{};
+  int32_t left = 0, period = 1, phase = 0;
+  uint64_t casterId = 0;
+  int32_t instability = 0;
+};
+
+// A FILTER (plan §7 wards): `W null`. Refuses incoming ops of W's kind within
+// `radius` of `at`, on the OP STREAM at the MutationQueue splice — never the
+// CA, so acid already flowing still flows and the counterplay is physics.
+// One tick unless sustained by aura, which re-issues it every tick.
+struct SpellFilter {
+  int glyph = -1;            // the refused word
+  SpellFxVec at{};
+  int32_t radius = 1;
+  uint64_t casterId = 0;
+  int32_t ticksLeft = 1;
+};
+
+// A per-tick charge the owner applies to a caster (statuses, beams).
+struct SpellBill {
+  uint64_t casterId = 0;
+  int32_t amount = 0;
+};
+// A per-tick impulse a sustained mod puts on a body (float aura ...).
+struct SpellBodyImpulse {
+  uint64_t target = 0;       // body id
+  Vec3 vps{};                // voxels per second
 };
 
 // ---- caster state ----------------------------------------------------------
@@ -626,6 +695,14 @@ struct SpellEmission {
   // per second, reported for the owner to apply (the VM cannot touch a
   // controller). Zero when no anchored cast carried a gravity edit.
   Vec3 casterImpulseVps{};
+  // Sustained things the payload asked for. The SYSTEM adopts these at the
+  // end of the call that produced them (statuses, echoes, filters are its
+  // state); the owner reads bills and impulses.
+  std::vector<SpellStatus> statuses;
+  std::vector<SpellEcho> echoes;
+  std::vector<SpellFilter> filters;
+  std::vector<SpellBill> bills;
+  std::vector<SpellBodyImpulse> bodyImpulses;
 };
 
 // A probe into the world the VM may consult while resolving (the CPU mirror,
@@ -663,7 +740,8 @@ class SpellSystem {
                   const CasterHealth& health, uint64_t casterId,
                   SpellFxVec originFx, SpellFxVec dirFx, uint32_t tick,
                   SpellEmission& out, const SpellProbe* probe = nullptr,
-                  const SpellFxVec* selfAt = nullptr);
+                  const SpellFxVec* selfAt = nullptr,
+                  const SpellBodyProbe* bodies = nullptr);
 
   // Advance every live projectile and bomb one tick. `bodies` answers where
   // adopted bodies are and what a seeking bolt should turn toward.
@@ -676,15 +754,47 @@ class SpellSystem {
   // the owner keeps the body.
   bool AdoptBody(uint32_t token, uint64_t handle);
 
+  // ---- sustained (plan §7) --------------------------------------------------
+  // A held beam follows the caster's aim: the owner reports it every tick and
+  // whether the cast key is still down. Not held = the beam ends.
+  void HoldBeam(uint64_t casterId, SpellFxVec originFx, SpellFxVec dirFx, bool held);
+  // Drop the newest status this caster is paying for (the drop UI), or all of
+  // them (the caster ran dry, or died).
+  bool DropNewestStatus(uint64_t casterId);
+  void DropAll(uint64_t casterId);
+  // What this caster's live statuses reserve out of their max mana: the
+  // per-tick tariff × the regen horizon (plan §7: "lowers your maximum mana"
+  // without a second number).
+  int32_t ReservationFor(uint64_t casterId) const;
+  static constexpr int32_t kReserveHorizonTicks = 30;
+  int StatusCountFor(uint64_t casterId) const;
+  const std::vector<SpellStatus>& Statuses() const { return statuses_; }
+  const std::vector<SpellBeam>& Beams() const { return beams_; }
+  const std::vector<SpellEcho>& Echoes() const { return echoes_; }
+  const std::vector<SpellFilter>& Filters() const { return filters_; }
+
+  // ---- the op-stream filter (plan §7 wards) ----------------------------------
+  // Applied by the owner at the MutationQueue splice: every op within a
+  // filter's radius whose kind the filter's word names is REMOVED. Returns
+  // how many were refused. Carriers (projectiles, bombs) are absorbed inside
+  // Tick() the same way.
+  int FilterStreams(std::vector<BrushOp>& ops, std::vector<ExplosionOp>& exps,
+                    std::vector<ParticleSpawn>& spawns, std::vector<WindPrim>& winds) const;
+
   void Clear() {
     live_.clear();
     bombs_.clear();
+    statuses_.clear();
+    beams_.clear();
+    echoes_.clear();
+    filters_.clear();
   }
   const std::vector<SpellProjectile>& Live() const { return live_; }
   int LiveCount() const { return (int)live_.size(); }
   const std::vector<SpellBomb>& Bombs() const { return bombs_; }
   int BombCount() const { return (int)bombs_.size(); }
   int OpsDroppedLastTick() const { return opsDropped_; }
+  int RefusedLastTick() const { return refused_; }
 
  private:
   void Launch(const SpellCast& cast, SpellFxVec originFx, SpellFxVec aim,
@@ -693,11 +803,23 @@ class SpellSystem {
   void RequestBody(const SpellCast& cast, SpellFxVec originFx, SpellFxVec aim,
                    uint64_t casterId, int32_t instability, SpellEmission& out);
 
+  // Take the sustained things a payload asked for into the system's state,
+  // attaching statuses to the body at their point (per-caster cap applied).
+  void Adopt(SpellEmission& out, const SpellBodyProbe* bodies);
+  bool FilterRefuses(const SpellFilter& f, int32_t x, int32_t y, int32_t z,
+                     uint32_t material, int kindMode) const;
+
   const GlyphLibrary* lib_ = nullptr;
   std::vector<SpellProjectile> live_;
   std::vector<SpellBomb> bombs_;
+  std::vector<SpellStatus> statuses_;
+  std::vector<SpellBeam> beams_;
+  std::vector<SpellEcho> echoes_;
+  std::vector<SpellFilter> filters_;
   uint32_t nextToken_ = 0;
+  uint32_t nextStatusId_ = 0;
   int opsDropped_ = 0;
+  int refused_ = 0;
 };
 
 // Trajectory wobble from an unstable cast. Integer + counter-based hash, so it

@@ -624,20 +624,171 @@ Status GateSpells(Ctx& c, std::string& detail) {
                 resolvedAtTick, atBody ? 1 : 0, doneHandles);
   }
 
+  // L8 budgets — every lowered cast declares finite ticks, voxels, instances
+  // and generation; nothing lowers to an unbounded process (rule 2).
+  int l8 = 0;
+  {
+    const int32_t tickBound = 2 * lib.budgets.maxLifetimeTicks + lib.budgets.maxStatusTicks;
+    for (const auto& s : seqs) {
+      const CastList l = CompileSpell(lib, stackOf(s));
+      bool ok = true;
+      for (const SpellCast& c : l.casts)
+        ok = ok && c.ticks >= 1 && c.ticks <= tickBound && c.voxels >= 0 &&
+             c.voxels < (1 << 30) && c.instances >= 1 &&
+             c.instances <= lib.budgets.maxInstances && c.generation >= 0 &&
+             c.generation <= lib.budgets.maxGeneration;
+      if (!ok) fail("L8", spell(s));
+      else l8++;
+    }
+  }
+
+  // ---- (6) SUSTAINED: aura attaches, bills, caps; a beam ends on release;
+  // an echo repeats a bounded number of times; a ward refuses at the splice.
+  bool sustainOk = false;
+  {
+    SpellSystem ssys;
+    ssys.SetLibrary(&lib);
+    CasterState cs;
+    cs.mana = 100000;
+    cs.manaMax = 100000;
+    FakeHealth hp(100000);
+    const IVec3 worg = world.WindowOrigin();
+    const SpellFxVec origin{SpellFxFromFloat((float)(worg.x * (int)kChunk + 64)),
+                            SpellFxFromFloat((float)(worg.y * (int)kChunk + (int)kWorldN / 2)),
+                            SpellFxFromFloat((float)(worg.z * (int)kChunk + 64))};
+    // A fake owner with ONE body at the origin (the caster's own).
+    struct Bodies {
+      Vec3 at;
+    } bodies{Vec3{SpellFxToFloat(origin.x), SpellFxToFloat(origin.y), SpellFxToFloat(origin.z)}};
+    SpellBodyProbe bp;
+    bp.ctx = &bodies;
+    bp.bodyIdAt = [](void* c, Vec3 from, float r, uint64_t& id, Vec3& out) {
+      const Vec3 d = ((Bodies*)c)->at - from;
+      if (d.x * d.x + d.y * d.y + d.z * d.z > r * r) return false;
+      id = 42;
+      out = ((Bodies*)c)->at;
+      return true;
+    };
+    bp.bodyPos = [](void* c, uint64_t id, Vec3& out) {
+      if (id != 42) return false;
+      out = ((Bodies*)c)->at;
+      return true;
+    };
+    // fire aura self: a status on body 42, billed every tick, capped.
+    SpellEmission e0;
+    ssys.Cast(CompileSpell(lib, speak({"fire", "aura", "self"})), cs, hp.cb, 9, origin,
+              {kSpellFxOne, 0, 0}, 1, e0, nullptr, nullptr, &bp);
+    const int after1 = ssys.StatusCountFor(9);
+    int billed = 0, sprays = 0;
+    for (int t = 0; t < 10; t++) {
+      SpellEmission e;
+      ssys.Tick((uint32_t)(20 + t), world, classOf, e, &bp);
+      for (const SpellBill& sb : e.bills)
+        if (sb.casterId == 9) billed += sb.amount;
+      sprays += (int)e.spawns.size();
+    }
+    const int32_t reserve = ssys.ReservationFor(9);
+    for (int k = 0; k < lib.budgets.maxStatusPerCaster + 3; k++) {
+      SpellEmission e;
+      ssys.Cast(CompileSpell(lib, speak({"fire", "aura", "self"})), cs, hp.cb, 9, origin,
+                {kSpellFxOne, 0, 0}, (uint32_t)(40 + k), e, nullptr, nullptr, &bp);
+    }
+    const int capped = ssys.StatusCountFor(9);
+    const bool dropped = ssys.DropNewestStatus(9);
+    const int afterDrop = ssys.StatusCountFor(9);
+    ssys.DropAll(9);
+    const int afterAll = ssys.StatusCountFor(9);
+    // A status runs out at its tick cap.
+    SpellEmission e1;
+    ssys.Cast(CompileSpell(lib, speak({"fire", "aura", "self"})), cs, hp.cb, 9, origin,
+              {kSpellFxOne, 0, 0}, 60, e1, nullptr, nullptr, &bp);
+    int capTicks = 0;
+    for (int t = 0; t < lib.budgets.maxStatusTicks + 5 && ssys.StatusCountFor(9) > 0; t++) {
+      SpellEmission e;
+      ssys.Tick((uint32_t)(100 + t), world, classOf, e, &bp);
+      capTicks++;
+    }
+    const bool attachedToBody = !ssys.Statuses().empty() || afterAll == 0;
+    (void)attachedToBody;
+    const bool statusOk = after1 == 1 && billed > 0 && sprays > 0 && reserve > 0 &&
+                          capped == lib.budgets.maxStatusPerCaster && dropped &&
+                          afterDrop == capped - 1 && afterAll == 0 &&
+                          capTicks <= lib.budgets.maxStatusTicks;
+
+    // A beam: held for 5 ticks, then released; it resolves on every held
+    // tick (the cast itself resolves nothing) and is gone the tick after
+    // release.
+    SpellEmission e2;
+    ssys.Cast(CompileSpell(lib, speak({"explosive", "beam"})), cs, hp.cb, 9, origin,
+              {kSpellFxOne, 0, 0}, 200, e2, nullptr);
+    int beamTicks = 0;
+    for (int t = 0; t < 8; t++) {
+      ssys.HoldBeam(9, origin, {kSpellFxOne, 0, 0}, t < 5);
+      SpellEmission e;
+      ssys.Tick((uint32_t)(200 + t), world, classOf, e, &bp);
+      if (!e.explosions.empty()) beamTicks++;
+    }
+    const bool beamOk = (int)ssys.Beams().size() == 0 && beamTicks == 5;
+
+    // An echo: explosive echo self repeats `repeats` times in all, then stops.
+    const int gEcho = lib.Find("echo");
+    const int32_t repeats = gEcho >= 0 ? lib.glyphs[gEcho].repeats : 0;
+    SpellEmission e3;
+    ssys.Cast(CompileSpell(lib, speak({"explosive", "echo", "self"})), cs, hp.cb, 9, origin,
+              {kSpellFxOne, 0, 0}, 300, e3, nullptr);
+    int echoBlasts = (int)e3.explosions.size();
+    for (int t = 0; t < 200; t++) {
+      SpellEmission e;
+      ssys.Tick((uint32_t)(300 + t), world, classOf, e, &bp);
+      echoBlasts += (int)e.explosions.size();
+    }
+    const bool echoOk = repeats > 1 && echoBlasts == repeats && ssys.Echoes().empty();
+
+    // A ward: `transmute null self` refuses a convert op inside its radius at
+    // the splice and lets a paint op through; the filter is gone next tick.
+    SpellEmission e4;
+    ssys.Cast(CompileSpell(lib, speak({"transmute", "null", "self"})), cs, hp.cb, 9, origin,
+              {kSpellFxOne, 0, 0}, 400, e4, nullptr);
+    std::vector<BrushOp> ops = {
+        {SpellFxFloor(origin.x) + 1, SpellFxFloor(origin.y), SpellFxFloor(origin.z), 1, 5u, 1u, 0, 0},
+        {SpellFxFloor(origin.x) + 1, SpellFxFloor(origin.y), SpellFxFloor(origin.z), 1, 5u, 0u, 0, 0},
+        {SpellFxFloor(origin.x) + 500, SpellFxFloor(origin.y), SpellFxFloor(origin.z), 1, 5u, 1u, 0, 0},
+    };
+    std::vector<ExplosionOp> exps;
+    std::vector<ParticleSpawn> spawns;
+    std::vector<WindPrim> winds;
+    const int refused = ssys.FilterStreams(ops, exps, spawns, winds);
+    const bool wardOk = (int)ssys.Filters().size() == 1 && refused == 1 && ops.size() == 2 &&
+                        ops[0].mode == 0u;
+    {
+      SpellEmission e;
+      ssys.Tick(500, world, classOf, e, &bp);
+    }
+    const bool wardExpired = ssys.Filters().empty();
+
+    sustainOk = statusOk && beamOk && echoOk && wardOk && wardExpired;
+    std::printf("spell sustain: %s (aura attached=%d billed=%d sprayed=%d reserve=%d cap=%d/%d "
+                "drop=%d capTicks=%d; beam ticks=%d; echo blasts=%d/%d; ward refused=%d "
+                "expired=%d)\n",
+                sustainOk ? "PASS" : "FAIL", after1, billed, sprays, reserve, capped,
+                lib.budgets.maxStatusPerCaster, dropped ? 1 : 0, capTicks, beamTicks,
+                echoBlasts, repeats, refused, wardExpired ? 1 : 0);
+  }
+
   const bool lawsOk = alphaOk && lawFail == 0 && l1 > 0 && l2pairs > 0 && l3 > 0 &&
-                      l6cases > 0 && l4cases > 0 && l7 > 0 && l5 > 0;
+                      l6cases > 0 && l4cases > 0 && l7 > 0 && l5 > 0 && l8 > 0;
   const bool spellOk = budgetOk && fatalOk && carveAsked && fatalEmitted && sprayOk &&
-                       latchOk && lawsOk && bombOk;
+                       latchOk && lawsOk && bombOk && sustainOk;
   std::printf(
       "spells: %s (trail authorized %lld/%d voxels over %d ticks, died=%d; "
       "overcast fatal=%d carve=%d payload=%d; spray %d/%d/%d voxels for "
-      "%d/%d/%d mana; bomb=%d; laws over %zu sequences: L1 %d, L2 %d/%d, L3 %d, "
-      "L4 %d/%d, L5 %d, L6 %d/%d, L7 %d, %d failures)\n",
+      "%d/%d/%d mana; bomb=%d sustain=%d; laws over %zu sequences: L1 %d, L2 %d/%d, "
+      "L3 %d, L4 %d/%d, L5 %d, L6 %d/%d, L7 %d, L8 %d, %d failures)\n",
       spellOk ? "PASS" : "FAIL", (long long)trailVolume, authoredBudget, flownTicks,
       diedWithBudget ? 1 : 0, fatalOk ? 1 : 0, carveAsked ? 1 : 0, fatalEmitted ? 1 : 0,
       sprayN[0], sprayN[1], sprayN[2], sprayCost[0], sprayCost[1], sprayCost[2],
-      bombOk ? 1 : 0, seqs.size(), l1, l2, l2pairs, l3, l4, l4cases, l5, l6, l6cases, l7,
-      lawFail);
+      bombOk ? 1 : 0, sustainOk ? 1 : 0, seqs.size(), l1, l2, l2pairs, l3, l4, l4cases, l5,
+      l6, l6cases, l7, l8, lawFail);
   detail = Format("laws %zu seq, %d failures", seqs.size(), lawFail);
   return spellOk ? Status::Pass : Status::Fail;
 }

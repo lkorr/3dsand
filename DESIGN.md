@@ -3196,9 +3196,57 @@ union whenever the parse of A+B is the parses side by side), L7 tariff
 monotonicity (`A transmute B` non-decreasing in `arcane(B) − arcane(A)` and in
 volume; a spray in its voxel count), L5 delivery invariance (the payload of
 `E… projectile`, `E… bomb` and `E… self` is identical; only the record
-differs). L8 (finite budgets) joins in P3. A change that breaks a law breaks a
-*class* of spells, which is what the line says; a change that moves one
-spell's numbers is a rebaseline.
+differs), L8 budgets (every lowered cast declares finite ticks, voxels,
+instances and generation). A change that breaks a law breaks a *class* of
+spells, which is what the line says; a change that moves one spell's numbers
+is a rebaseline.
+
+**Sustained things are the `aura` operator, one word for wards and curses
+alike (plan §7; `SpellStatus`, `SpellSystem::Adopt`).** `X aura` produces an
+Effect that, where it resolves, attaches X — an Effect, a Matter (sprayed), or
+a Mod — to the body at the point (the owner's `SpellBodyProbe::bodyIdAt`, an
+opaque id: a mob's, or the player's caster id) or to the place if no body is
+there. `float aura self` is floaty; `float float aura projectile` lifts
+whoever the bolt hits; `fire aura self` sprays fire from your body every tick.
+The status runs every tick where the body is now and is BILLED every tick to
+the caster (`SpellEmission::bills`) at the inner effect's tariff — the same
+tariff as it emits, no second mechanism — and the caster's max mana shows the
+per-tick sum × a 30-tick horizon as RESERVED (`CasterState::reserved`, drawn
+on the bar the way the burn cap is). It ends when the caster drops it (Delete
+drops the newest), when the body is gone, when they run dry (mana, then
+health; when neither pays, `DropAll`), or at the hard tick cap
+(`budgets.maxStatusTicks`); a caster may hold `maxStatusPerCaster` at once
+and the aura beyond it is charged and attaches nothing (rule 2). A sustained
+Mod acts on the body as if the body were the delivery: gravity is a per-tick
+impulse the owner applies (`bodyImpulses`; the player's controller today,
+mobs have no impulse seam yet), the rest have no meaning on a body and were
+charged for the word.
+
+**`null` is the op-stream filter, at the MutationQueue splice.** `W null`
+yields a filter entry (one tick, unless an aura re-issues it every tick) that
+refuses incoming ops of W's kind within its radius — by W's SORT and VERB,
+never by name: a Matter word refuses ops and spawns of that material,
+`transmute` refuses overwrite/melt ops, `explosive` explosions, `gust` winds,
+a Delivery word absorbs carriers of that mech (bolts die inside a
+`projectile null aura self`). The owner calls `FilterStreams` on the tick's
+`ops`/`exps`/`spawns` right before `SubmitTick`, whoever produced them (the
+brush, a mob, a spell — including the ward-caster's own), and the count is
+shown in the HUD. The op stream, never the CA: acid already flowing still
+flows, and that is the counterplay, on purpose.
+
+**`beam` is continuous delivery; `echo` a bounded repeat.** A held beam
+(`SpellBeam`) follows the caster's aim (`HoldBeam` every tick with the cast
+key's state), marches the ray to the first solid or its reach, resolves the
+payload there every tick and bills the tariff of one resolve per tick; it
+ends on release, on running dry, or at its tick cap. `E echo` runs E now and
+schedules it again every `everyTicks` for `repeats` in all (`SpellEcho`),
+priced up front as repeats × E.
+
+Gate `spells` check (6): an aura attaches, bills every tick, reserves, caps
+per caster, drops on request and runs out at the tick cap; a beam resolves
+every held tick and is gone after release; an echo fires exactly `repeats`
+times; a ward refuses a convert op inside its radius at the splice, passes a
+paint op, and is gone the next tick.
 
 **Deliveries are three mechanisms, and Mods are field edits on their record
 (plan §5; `DeliveryRec`, `ApplyMod`).** `hand`/`self` are *instant* at a

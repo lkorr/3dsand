@@ -202,8 +202,11 @@ void Overlay::DrawHUD(const UIState& s) {
 
   bar(yHealth, s.health, s.healthMax, fromHealth, IM_COL32(190, 55, 55, 235),
       IM_COL32(255, 140, 60, 245), "hp", s.healthCap);
-  bar(yMana, s.mana, s.manaMax, fromMana, IM_COL32(70, 120, 230, 235),
-      IM_COL32(150, 200, 255, 245), "mp", -1);
+  // The reservation is drawn the way the burn cap is: the span past the
+  // effective max is what the auras are holding, not mana that was spent.
+  bar(yMana, s.mana, s.manaPoolMax > 0 ? s.manaPoolMax : s.manaMax, fromMana,
+      IM_COL32(70, 120, 230, 235), IM_COL32(150, 200, 255, 245), "mp",
+      s.manaReserved > 0 ? s.manaMax : -1);
 
   // ---- body condition, sitting directly above the hp bar -------------------
   const float figureH = DrawBodyFigure(s, x, yHealth - gap);
@@ -495,6 +498,12 @@ void Overlay::Draw(UIState& s) {
   } else {
     ImGui::TextDisabled("speaking: (nothing)   RMB casts, C clears");
   }
+  if (!s.spellStatuses.empty()) {
+    ImGui::Text("sustaining (%d reserved, Delete drops the newest):", s.manaReserved);
+    for (const std::string& st : s.spellStatuses) ImGui::TextDisabled("  %s", st.c_str());
+  }
+  if (s.spellRefused > 0)
+    ImGui::TextColored(ImVec4(0.6f, 0.9f, 1.0f, 1.0f), "ward refused %d", s.spellRefused);
   if (!s.glyphSlots.empty()) {
     std::string strip;
     for (size_t i = 0; i < s.glyphSlots.size(); i++) {

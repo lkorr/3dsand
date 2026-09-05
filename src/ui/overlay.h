@@ -358,7 +358,14 @@ struct UIState {
   // real visual break rather than a number.
   bool magicMode = false;         // number row speaks glyphs instead of picking
                                   // a brush material
-  int32_t mana = 0, manaMax = 0;  // manaMax is the ward-adjusted EFFECTIVE max
+  int32_t mana = 0, manaMax = 0;  // manaMax is the EFFECTIVE max (pool - reservation)
+  // The pool's authored max and what live statuses reserve out of it (plan
+  // §7): the bar draws [manaMax, manaPoolMax] as reserved.
+  int32_t manaPoolMax = 0, manaReserved = 0;
+  // What the caster is sustaining, newest last, for the HUD list and the
+  // drop key. Each line is the status's readout and its per-tick price.
+  std::vector<std::string> spellStatuses;
+  int spellRefused = 0;           // ops a ward refused this tick
   int32_t health = 0;
   // Authored ceiling for the HUD bar's denominator. Health does NOT regenerate,
   // so this is only ever a high-water mark the player moves away from.

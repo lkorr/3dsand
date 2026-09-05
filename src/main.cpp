@@ -3846,7 +3846,7 @@ int main(int argc, char** argv) {
   float lookSensNow = 1.0f;
 
   KeyEdge eP, eN, eV, eF1, eF3, eF4, eF5, eF6, eF9, eF10, eR, eEsc, eLBracket, eRBracket, eJump,
-      eG, eX, eB, eT, eO, eM, eK, eTab, eC, eH, eZ, eBack, eU, eL, eI, eQ,
+      eG, eX, eB, eT, eO, eM, eK, eTab, eC, eH, eZ, eBack, eDel, eU, eL, eI, eQ,
       eE;
   KeyEdge eGlyph[kGlyphSlots];
   bool prevMouseL = false;
@@ -3856,6 +3856,10 @@ int main(int argc, char** argv) {
   // A body part clicked in the inspector with a sentence on the stack, latched
   // the same way: the slot, or -1.
   int castAtPartQueued = -1;
+  // RMB held (a beam stays lit while it is), and Delete pressed in magic mode
+  // (drop the newest status), both read on the frame and consumed by the tick.
+  bool beamHeld = false;
+  bool dropStatusQueued = false;
   std::vector<Grenade> grenades;
 
   // ---- magic (game/spell.h, game/caster.h) ---------------------------------
@@ -5274,6 +5278,10 @@ int main(int argc, char** argv) {
     // already a sticky flag consumed-and-cleared inside the loop for exactly
     // this reason; casting was the one that was not.
     if (captured && ui.magicMode && mouseRClick) castQueued = true;
+    beamHeld = captured && mouseR;
+    if (captured && ui.magicMode && eDel.Pressed(key(GLFW_KEY_DELETE))) dropStatusQueued = true;
+    beamHeld = captured && mouseR;
+    if (captured && ui.magicMode && eDel.Pressed(key(GLFW_KEY_DELETE))) dropStatusQueued = true;
     // A click made while paused is DROPPED rather than held: the tick loop
     // breaks before the cast site while paused, so a latched click would sit
     // there and discharge the instant you unpause, at whatever you happen to
@@ -6219,6 +6227,80 @@ int main(int argc, char** argv) {
         caster.mana.Tick();
         SpellEmission emit;
 
+        // What the VM may ask about bodies: where an adopted bomb is, and the
+        // nearest mob for a seeking bolt (never the caster's own body).
+        struct SpellBodyCtx {
+          Physics* phys;
+          MobSystem* mobs;
+          const Player* player;
+          uint64_t playerId;
+        } bodyCtx{&phys, &mobs, &player, 0x9134A5EEu};
+        SpellBodyProbe bodyProbe;
+        bodyProbe.ctx = &bodyCtx;
+        // The body a status attaches to: the nearest mob origin within the
+        // radius, else the player. Ids are the mob's own and the player's
+        // caster id — opaque to the VM either way.
+        bodyProbe.bodyIdAt = [](void* c, Vec3 from, float radius, uint64_t& id, Vec3& out) {
+          SpellBodyCtx& bc = *(SpellBodyCtx*)c;
+          float best = radius * radius;
+          bool found = false;
+          for (uint32_t i = 0; i < bc.mobs->MobCount(); i++) {
+            const uint64_t mid = bc.mobs->MobIdAt(i);
+            const Vec3 p = bc.mobs->MobOrigin(mid);
+            const Vec3 d = p - from;
+            const float d2 = d.x * d.x + d.y * d.y + d.z * d.z;
+            if (d2 <= best) {
+              best = d2;
+              id = mid;
+              out = p;
+              found = true;
+            }
+          }
+          const Vec3 dp = bc.player->pos - from;
+          // The figure box is ~1.7 m: a point anywhere on the body counts.
+          const float pr = radius + 9.0f;
+          if (!found && dp.x * dp.x + dp.y * dp.y + dp.z * dp.z <= pr * pr) {
+            id = bc.playerId;
+            out = bc.player->pos;
+            found = true;
+          }
+          return found;
+        };
+        bodyProbe.bodyPos = [](void* c, uint64_t id, Vec3& out) {
+          SpellBodyCtx& bc = *(SpellBodyCtx*)c;
+          if (id == bc.playerId) {
+            out = bc.player->pos;
+            return true;
+          }
+          for (uint32_t i = 0; i < bc.mobs->MobCount(); i++)
+            if (bc.mobs->MobIdAt(i) == id) {
+              out = bc.mobs->MobOrigin(id);
+              return true;
+            }
+          return false;
+        };
+        bodyProbe.bodyAt = [](void* c, uint64_t h, Vec3& out) {
+          BodyTransform xf;
+          if (!((SpellBodyCtx*)c)->phys->GetTransform(h, xf)) return false;
+          out = xf.pos;
+          return true;
+        };
+        bodyProbe.nearestTarget = [](void* c, Vec3 from, uint64_t, Vec3& out) {
+          MobSystem& m = *((SpellBodyCtx*)c)->mobs;
+          float best = 96.0f * 96.0f;   // seek range, voxels squared
+          bool found = false;
+          for (uint32_t i = 0; i < m.MobCount(); i++) {
+            const Vec3 p = m.MobOrigin(m.MobIdAt(i));
+            const Vec3 d = p - from;
+            const float d2 = d.x * d.x + d.y * d.y + d.z * d.z;
+            if (d2 < best) {
+              best = d2;
+              out = p;
+              found = true;
+            }
+          }
+          return found;
+        };
         // Consume the latch on the FIRST tick of the frame that sees it, and
         // clear it even when there is nothing spoken — otherwise a click on an
         // empty stack stays queued and fires the next spell the moment one is
@@ -6252,7 +6334,7 @@ int main(int argc, char** argv) {
             const SpellProbe probe = WorldSpellProbe(world);
             CastResult res = spells.Cast(caster.compiled, caster.mana, playerHealth,
                                          0x9134A5EEu, originFx, dirFx, tick, emit, &probe,
-                                         &selfAt);
+                                         &selfAt, &bodyProbe);
             caster.lastOutcome = res.outcome;
             if (res.outcome != CastOutcome::Nothing) caster.Clear(glyphs);
           }
@@ -6283,42 +6365,57 @@ int main(int argc, char** argv) {
           CastResult res =
               spells.Cast(caster.compiled, caster.mana, playerHealth,
                           0x9134A5EEu /*casterId*/, originFx, dirFx, tick, emit,
-                          &probe);
+                          &probe, nullptr, &bodyProbe);
           caster.lastOutcome = res.outcome;
           if (res.outcome != CastOutcome::Nothing) caster.Clear(glyphs);
         }
 
-        // What the VM may ask about bodies: where an adopted bomb is, and the
-        // nearest mob for a seeking bolt (never the caster's own body).
-        struct SpellBodyCtx {
-          Physics* phys;
-          MobSystem* mobs;
-        } bodyCtx{&phys, &mobs};
-        SpellBodyProbe bodyProbe;
-        bodyProbe.ctx = &bodyCtx;
-        bodyProbe.bodyAt = [](void* c, uint64_t h, Vec3& out) {
-          BodyTransform xf;
-          if (!((SpellBodyCtx*)c)->phys->GetTransform(h, xf)) return false;
-          out = xf.pos;
-          return true;
-        };
-        bodyProbe.nearestTarget = [](void* c, Vec3 from, uint64_t, Vec3& out) {
-          MobSystem& m = *((SpellBodyCtx*)c)->mobs;
-          float best = 96.0f * 96.0f;   // seek range, voxels squared
-          bool found = false;
-          for (uint32_t i = 0; i < m.MobCount(); i++) {
-            const Vec3 p = m.MobOrigin(m.MobIdAt(i));
-            const Vec3 d = p - from;
-            const float d2 = d.x * d.x + d.y * d.y + d.z * d.z;
-            if (d2 < best) {
-              best = d2;
-              out = p;
-              found = true;
+        // A held beam follows the aim while RMB stays down.
+        {
+          const Vec3 eye = player.EyePos();
+          const Vec3 fwd = cam.Forward();
+          const Vec3 muzzle = eye + fwd * 1.5f;
+          spells.HoldBeam(0x9134A5EEu,
+                          {SpellFxFromFloat(muzzle.x), SpellFxFromFloat(muzzle.y),
+                           SpellFxFromFloat(muzzle.z)},
+                          {SpellFxFromFloat(fwd.x), SpellFxFromFloat(fwd.y),
+                           SpellFxFromFloat(fwd.z)},
+                          beamHeld);
+        }
+        if (dropStatusQueued) {
+          dropStatusQueued = false;
+          spells.DropNewestStatus(0x9134A5EEu);
+        }
+        spells.Tick(tick, world, classOf, emit, &bodyProbe);
+
+        // THE PER-TICK BILL. Statuses and a held beam pay the same tariff as
+        // they emit (plan §4): mana first, then the body, and when neither
+        // can pay the caster has run dry and everything they sustain drops.
+        {
+          int32_t bill = 0;
+          for (const SpellBill& sb : emit.bills)
+            if (sb.casterId == 0x9134A5EEu) bill += sb.amount;
+          if (bill > 0) {
+            const int32_t fromMana = std::min(bill, caster.mana.mana);
+            caster.mana.mana -= fromMana;
+            bill -= fromMana;
+            if (bill > 0) {
+              const int32_t hp = playerHealth.Get();
+              if (hp > bill) {
+                playerHealth.Spend(bill);
+              } else {
+                spells.DropAll(0x9134A5EEu);   // dry: it all goes out
+              }
             }
           }
-          return found;
-        };
-        spells.Tick(tick, world, classOf, emit, &bodyProbe);
+          caster.mana.reserved = spells.ReservationFor(0x9134A5EEu);
+        }
+        // A sustained gravity mod on the player's own body.
+        for (const SpellBodyImpulse& bi : emit.bodyImpulses)
+          if (bi.target == 0x9134A5EEu) player.vel.y += bi.vps.y;
+        // WARDS filter the spell's OWN emission too (a fire aura inside an
+        // anti-fire ward is refused like anyone else's).
+        ui.spellRefused = spells.FilterStreams(emit.ops, emit.explosions, emit.spawns, emit.winds);
 
         // BOMBS ARE DEBRIS. The VM asked for a rigid body; this is the owner
         // making one through the same path a dropped item takes (a Jolt
@@ -6743,6 +6840,14 @@ int main(int argc, char** argv) {
         WorldEditLayer().Drain(world, cellOps,
                                kMaxCellOpsPerTick - (uint32_t)cellOps.size());
       phys.MovePlayerBody(playerBody, player.pos, kTickDt);
+      // WARDS, AT THE SPLICE (DESIGN.md §8): a live filter refuses ops of its
+      // word's kind within its radius, whoever produced them — the brush, a
+      // mob, a spell. The op stream, never the CA: acid already flowing still
+      // flows, and that is the counterplay.
+      {
+        std::vector<WindPrim> noWinds;
+        ui.spellRefused += spells.FilterStreams(ops, exps, spawns, noWinds);
+      }
       double tSubmit0 = NowSeconds();
       SubmitTick(ctx, world, sim, tick, kDefaultSeed, ops, exps, cellOps,
                  tick % 15 == 0 /*hash occasionally*/, pc, true, particlesActive,
@@ -7306,6 +7411,24 @@ int main(int argc, char** argv) {
       // makes the mana/health crossover a decision rather than a surprise.
       ui.mana = caster.mana.mana;
       ui.manaMax = caster.mana.EffectiveMax();
+      ui.manaPoolMax = caster.mana.manaMax;
+      ui.manaReserved = caster.mana.reserved;
+      ui.spellStatuses.clear();
+      for (const SpellStatus& st : spells.Statuses()) {
+        if (st.casterId != 0x9134A5EEu) continue;
+        std::string line = DescribeCast(glyphs, SpellCast{});
+        line.clear();
+        const GlyphDef* ig = glyphs.At(st.effect.inner.empty() ? -1 : st.effect.inner[0].glyph);
+        const GlyphDef* ag = glyphs.At(st.effect.glyph);
+        line = std::string(ig ? ig->id : "mod") + " " + (ag ? ag->id : "aura") +
+               (st.target == 0x9134A5EEu ? " on you" : (st.target ? " on them" : " on the place")) +
+               "  " + std::to_string(st.perTick) + "/tick, " +
+               std::to_string(st.ticksLeft / 30) + " s";
+        ui.spellStatuses.push_back(line);
+      }
+      for (const SpellBeam& bm : spells.Beams())
+        if (bm.casterId == 0x9134A5EEu)
+          ui.spellStatuses.push_back("beam  " + std::to_string(bm.perTick) + "/tick");
       ui.health = playerHealth.Get();
       ui.healthMax = avatar.HealthMax();
       ui.healthCap = avatar.HealthCap();

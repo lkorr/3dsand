@@ -1622,19 +1622,57 @@ void ApplySpellEffect(const GlyphLibrary& lib, const std::vector<EffectInst>& pa
         break;
       }
       case SpellVerb::Repeat: {
-        // The inner effect, again, a bounded number of times. The lowering
-        // charged repeats × the effect; this tick runs the first one. (P3
-        // schedules the rest.)
+        // The inner effect, now, and again every `everyTicks` for `repeats`
+        // in all: the lowering charged repeats × the effect up front. The
+        // rest is scheduled as an echo the system ticks.
         ApplySpellEffect(lib, e.inner, atFx, dirFx, strengthMille, out, probe,
                          instabilityMille, salt ^ 0x5EC0u);
+        if (g && g->repeats > 1) {
+          SpellEcho ec;
+          ec.inner = e.inner;
+          ec.at = atFx;
+          ec.dir = dirFx;
+          ec.left = g->repeats - 1;
+          ec.period = std::max(1, g->everyTicks);
+          ec.instability = instabilityMille;
+          out.echoes.push_back(std::move(ec));
+        }
+        break;
+      }
+      case SpellVerb::Sustain: {
+        // `X aura`: SUSTAIN the inner effect or mod on the body at the point,
+        // or on the place if no body is there. The system attaches it; every
+        // tick it runs and bills the caster. Repeating `aura` widens the
+        // attach radius.
+        SpellStatus st;
+        st.effect = e;
+        st.at = atFx;
+        st.dir = dirFx;
+        st.ticksLeft = ClampI(g ? g->ticks : 1, 1, b.maxStatusTicks);
+        st.instability = instabilityMille;
+        int32_t per = 0;
+        for (const EffectInst& i : e.inner) per = SatAdd(per, EffectTariff(lib, i));
+        st.perTick = per;
+        out.statuses.push_back(std::move(st));
+        break;
+      }
+      case SpellVerb::Filter: {
+        // `W null`: a filter entry at the point for the word's kind, one tick
+        // unless an aura re-issues it. What it refuses is decided at the
+        // splice (SpellSystem::FilterStreams), by the word's sort and verb.
+        if (e.inner.empty()) break;
+        SpellFilter f;
+        f.glyph = e.inner[0].glyph;
+        f.at = atFx;
+        f.radius = ClampI(ScaleRadiusCbrt(e.radius, e.n), 1, 64);
+        f.ticksLeft = ClampI(g ? g->ticks : 1, 1, b.maxStatusTicks);
+        out.filters.push_back(f);
         break;
       }
       case SpellVerb::Mend:
-      case SpellVerb::Sustain:
-      case SpellVerb::Filter:
       case SpellVerb::Trail:
       case SpellVerb::None:
-        // Sustained / body verbs land in P3 and P4. Charged, nothing yet.
+        // mend lands in P4 (a body verb). Charged, nothing yet.
         break;
     }
   }
@@ -1688,7 +1726,8 @@ CastResult SpellSystem::Cast(const CastList& list, CasterState& caster,
                              const CasterHealth& health, uint64_t casterId,
                              SpellFxVec originFx, SpellFxVec dirFx,
                              uint32_t tick, SpellEmission& out,
-                             const SpellProbe* probe, const SpellFxVec* selfAt) {
+                             const SpellProbe* probe, const SpellFxVec* selfAt,
+                             const SpellBodyProbe* bodies) {
   CastResult r;
   if (!lib_) return r;
   // The ONLY thing that is not a spell is silence.
@@ -1770,17 +1809,188 @@ CastResult SpellSystem::Cast(const CastList& list, CasterState& caster,
             Launch(c, originFx, d, casterId, tick, i, r.instability, out, probe);
           break;
         case DeliveryMech::Continuous: {
-          // Until the held beam lands (P3): one resolve at the ray's reach.
-          const SpellFxVec u = Unit(d, (int64_t)std::max(c.delivery.reach, 1) * kSpellFxOne);
-          const SpellFxVec at{originFx.x + u.x, originFx.y + u.y, originFx.z + u.z};
-          ApplySpellEffect(*lib_, c.payload, at, d, 1000, out, probe, r.instability,
-                           (uint32_t)i);
+          // A HELD BEAM: resolves at the ray hit every tick the owner keeps
+          // it held (HoldBeam), billed per tick. The first tick is what the
+          // cast paid for; the rest are bills.
+          if (i > 0) break;   // one beam; shotgun fans its resolve, not its ray
+          SpellBeam bm;
+          bm.cast = c;
+          bm.casterId = casterId;
+          bm.origin = originFx;
+          bm.dir = d;
+          bm.ticksLeft = ClampI(c.delivery.lifetimeTicks, 1, lib_->budgets.maxStatusTicks);
+          bm.perTick = SatAdd(c.tariff, c.carryCost);
+          bm.instability = r.instability;
+          bm.held = true;
+          beams_.push_back(std::move(bm));
           break;
         }
       }
     }
   }
+  // Statuses, echoes and filters the payload asked for become system state;
+  // the caster who spoke them pays for them.
+  for (SpellStatus& st : out.statuses) st.casterId = casterId;
+  for (SpellEcho& ec : out.echoes) ec.casterId = casterId;
+  for (SpellFilter& f : out.filters) f.casterId = casterId;
+  Adopt(out, bodies);
   return r;
+}
+
+void SpellSystem::Adopt(SpellEmission& out, const SpellBodyProbe* bodies) {
+  const SpellBudgets& b = lib_->budgets;
+  for (SpellStatus& st : out.statuses) {
+    // Rule 2: a hard cap on live statuses per caster. Over it the aura is
+    // charged (it was) and attaches nothing.
+    if (StatusCountFor(st.casterId) >= b.maxStatusPerCaster) continue;
+    st.id = ++nextStatusId_;
+    st.ticksLeft = ClampI(st.ticksLeft, 1, b.maxStatusTicks);
+    // The body at the point, or the place.
+    if (bodies && bodies->bodyIdAt) {
+      const Vec3 from{SpellFxToFloat(st.at.x), SpellFxToFloat(st.at.y), SpellFxToFloat(st.at.z)};
+      const float r = (float)std::max(1, ScaleRadiusCbrt(st.effect.radius, st.effect.n)) + 2.0f;
+      uint64_t id;
+      Vec3 c;
+      if (bodies->bodyIdAt(bodies->ctx, from, r, id, c)) {
+        st.target = id;
+        st.at = {SpellFxFromFloat(c.x), SpellFxFromFloat(c.y), SpellFxFromFloat(c.z)};
+      }
+    }
+    statuses_.push_back(std::move(st));
+  }
+  out.statuses.clear();
+  for (SpellEcho& ec : out.echoes) {
+    if ((int)echoes_.size() >= 64) break;   // bounded, like everything here
+    echoes_.push_back(std::move(ec));
+  }
+  out.echoes.clear();
+  for (SpellFilter& f : out.filters) {
+    if ((int)filters_.size() >= 64) break;
+    filters_.push_back(f);
+  }
+  out.filters.clear();
+}
+
+void SpellSystem::HoldBeam(uint64_t casterId, SpellFxVec originFx, SpellFxVec dirFx,
+                           bool held) {
+  for (SpellBeam& bm : beams_) {
+    if (bm.casterId != casterId) continue;
+    bm.origin = originFx;
+    bm.dir = dirFx;
+    bm.held = bm.held && held;
+  }
+}
+
+bool SpellSystem::DropNewestStatus(uint64_t casterId) {
+  int best = -1;
+  for (size_t i = 0; i < statuses_.size(); i++)
+    if (statuses_[i].casterId == casterId &&
+        (best < 0 || statuses_[i].id > statuses_[best].id))
+      best = (int)i;
+  if (best < 0) return false;
+  statuses_[best] = statuses_.back();
+  statuses_.pop_back();
+  return true;
+}
+
+void SpellSystem::DropAll(uint64_t casterId) {
+  for (size_t i = 0; i < statuses_.size();) {
+    if (statuses_[i].casterId == casterId) {
+      statuses_[i] = statuses_.back();
+      statuses_.pop_back();
+    } else {
+      i++;
+    }
+  }
+  for (SpellBeam& bm : beams_)
+    if (bm.casterId == casterId) bm.held = false;
+}
+
+int32_t SpellSystem::ReservationFor(uint64_t casterId) const {
+  int32_t per = 0;
+  for (const SpellStatus& st : statuses_)
+    if (st.casterId == casterId) per = SatAdd(per, st.perTick);
+  for (const SpellBeam& bm : beams_)
+    if (bm.casterId == casterId && bm.held) per = SatAdd(per, bm.perTick);
+  return SatMul(per, kReserveHorizonTicks);
+}
+
+int SpellSystem::StatusCountFor(uint64_t casterId) const {
+  int n = 0;
+  for (const SpellStatus& st : statuses_)
+    if (st.casterId == casterId) n++;
+  return n;
+}
+
+// What a filter's word refuses, by the word's SORT and VERB — never by name:
+//   matter        ops and spawns of that material
+//   convert       overwrite/melt ops (mode != 0)
+//   place / spray paint ops / spawns
+//   explode       explosions
+//   wind          wind primitives
+//   delivery      carriers of that mech (absorbed in Tick)
+// `kindMode`: 0 brush op (material, mode in `material`/x?), see callers.
+bool SpellSystem::FilterRefuses(const SpellFilter& f, int32_t x, int32_t y, int32_t z,
+                                uint32_t material, int kindMode) const {
+  const GlyphDef* w = lib_->At(f.glyph);
+  if (!w) return false;
+  const int64_t dx = x - SpellFxFloor(f.at.x), dy = y - SpellFxFloor(f.at.y),
+                dz = z - SpellFxFloor(f.at.z);
+  if (dx * dx + dy * dy + dz * dz > (int64_t)f.radius * f.radius) return false;
+  // kindMode: 0 = paint op, 1 = overwrite op, 2 = melt op, 3 = spawn,
+  //           4 = explosion, 5 = wind
+  switch (w->sort) {
+    case GlyphSort::Matter:
+      if (w->wildcard) return kindMode <= 3;   // `anything null`: all matter ops
+      return (kindMode <= 3) && material == w->material;
+    case GlyphSort::Effect:
+    case GlyphSort::Operator:
+      switch (w->verb) {
+        case SpellVerb::Convert: return kindMode == 1 || kindMode == 2;
+        case SpellVerb::Place: return kindMode == 0;
+        case SpellVerb::Spray: return kindMode == 3;
+        case SpellVerb::Explode: return kindMode == 4;
+        case SpellVerb::Wind: return kindMode == 5;
+        default: return false;
+      }
+    default:
+      return false;
+  }
+}
+
+int SpellSystem::FilterStreams(std::vector<BrushOp>& ops, std::vector<ExplosionOp>& exps,
+                               std::vector<ParticleSpawn>& spawns,
+                               std::vector<WindPrim>& winds) const {
+  if (filters_.empty() || !lib_) return 0;
+  int n = 0;
+  auto sweep = [&](auto& v, auto pred) {
+    size_t w = 0;
+    for (size_t i = 0; i < v.size(); i++) {
+      bool refuse = false;
+      for (const SpellFilter& f : filters_)
+        if (pred(f, v[i])) {
+          refuse = true;
+          break;
+        }
+      if (refuse) n++;
+      else v[w++] = v[i];
+    }
+    v.resize(w);
+  };
+  sweep(ops, [&](const SpellFilter& f, const BrushOp& o) {
+    return FilterRefuses(f, o.x, o.y, o.z, o.material & 0xFFFu, (int)std::min(o.mode, 2u));
+  });
+  sweep(exps, [&](const SpellFilter& f, const ExplosionOp& o) {
+    return FilterRefuses(f, o.x, o.y, o.z, 0, 4);
+  });
+  sweep(spawns, [&](const SpellFilter& f, const ParticleSpawn& o) {
+    return FilterRefuses(f, SpellFxFloor(o.px), SpellFxFloor(o.py), SpellFxFloor(o.pz),
+                         o.payload & 0xFFFu, 3);
+  });
+  sweep(winds, [&](const SpellFilter& f, const WindPrim& o) {
+    return FilterRefuses(f, o.x, o.y, o.z, 0, 5);
+  });
+  return n;
 }
 
 void SpellSystem::RequestBody(const SpellCast& cast, SpellFxVec originFx,
@@ -1835,6 +2045,7 @@ void SpellSystem::Tick(uint32_t tick, const World& world,
                        const std::vector<uint32_t>& classOf,
                        SpellEmission& out, const SpellBodyProbe* bodies) {
   opsDropped_ = 0;
+  refused_ = 0;
   if (!lib_) return;
   int opsUsed = 0;
   const SpellProbe probe = WorldSpellProbe(world);
@@ -1889,6 +2100,16 @@ void SpellSystem::Tick(uint32_t tick, const World& world,
     return budget > 0;
   };
 
+  // Everything a resolve asked to sustain belongs to the caster who threw it.
+  auto stamp = [&](uint64_t casterId) {
+    for (SpellStatus& st : out.statuses)
+      if (st.casterId == 0) st.casterId = casterId;
+    for (SpellEcho& ec : out.echoes)
+      if (ec.casterId == 0) ec.casterId = casterId;
+    for (SpellFilter& f : out.filters)
+      if (f.casterId == 0) f.casterId = casterId;
+  };
+
   // Resolve a cast at a point through the SAME function backfire uses
   // (thesis 2), then its children. `from` is the last free position, which is
   // where children launch from — a child launched inside the wall it hit would
@@ -1899,6 +2120,7 @@ void SpellSystem::Tick(uint32_t tick, const World& world,
       const size_t before = out.ops.size();
       ApplySpellEffect(*lib_, cast.payload, at, dir, 1000, out, &probe, instability, salt);
       opsUsed += (int)(out.ops.size() - before);
+      stamp(casterId);
     } else {
       opsDropped_++;
     }
@@ -2027,6 +2249,7 @@ void SpellSystem::Tick(uint32_t tick, const World& world,
           p.alive = false;
           break;
         }
+        stamp(p.casterId);
       }
     }
 
@@ -2036,6 +2259,30 @@ void SpellSystem::Tick(uint32_t tick, const World& world,
     }
 
     if (!p.alive) {
+      live_[i] = live_.back();
+      live_.pop_back();
+    } else {
+      i++;
+    }
+  }
+
+  // A carrier inside a filter for its delivery's kind is ABSORBED: it dies
+  // without resolving. `projectile null aura self` absorbs bolts.
+  auto absorbed = [&](int deliveryGlyph, SpellFxVec at) {
+    const GlyphDef& dg = lib_->Delivery(deliveryGlyph);
+    for (const SpellFilter& f : filters_) {
+      const GlyphDef* w = lib_->At(f.glyph);
+      if (!w || w->sort != GlyphSort::Delivery || w->mech != dg.mech) continue;
+      const int64_t dx = SpellFxFloor(at.x) - SpellFxFloor(f.at.x),
+                    dy = SpellFxFloor(at.y) - SpellFxFloor(f.at.y),
+                    dz = SpellFxFloor(at.z) - SpellFxFloor(f.at.z);
+      if (dx * dx + dy * dy + dz * dz <= (int64_t)f.radius * f.radius) return true;
+    }
+    return false;
+  };
+  for (size_t i = 0; i < live_.size();) {
+    if (absorbed(live_[i].cast.delivery.glyph, live_[i].pos)) {
+      refused_++;
       live_[i] = live_.back();
       live_.pop_back();
     } else {
@@ -2058,11 +2305,21 @@ void SpellSystem::Tick(uint32_t tick, const World& world,
         gone = true;
       }
     }
-    if (bm.trailBudget > 0)
+    if (bm.trailBudget > 0) {
       mark(bm.cast, bm.trailBudget, bm.trailPhase, bm.markedX, bm.markedY, bm.markedZ,
            bm.markedValid, bm.lastPos, {0, kSpellFxOne, 0});
+      stamp(bm.casterId);
+    }
     const bool fused = --bm.fuseLeft <= 0;
     const bool expired = --bm.ticksLeft <= 0;
+    if (absorbed(bm.cast.delivery.glyph, bm.lastPos)) {
+      // Absorbed: the body is handed back without going off.
+      refused_++;
+      if (bm.body != 0 && !gone) out.bodyDone.push_back(bm.body);
+      bombs_[i] = bombs_.back();
+      bombs_.pop_back();
+      continue;
+    }
     if (fused || gone || expired) {
       resolve(bm.cast, bm.lastPos, bm.lastPos, {0, kSpellFxOne, 0}, bm.instability, bm.gen,
               bm.casterId, (uint32_t)tick ^ bm.token);
@@ -2073,4 +2330,124 @@ void SpellSystem::Tick(uint32_t tick, const World& world,
       i++;
     }
   }
+
+  // STATUSES: the aura operator's product. Every tick: where the body is now
+  // (or the place), run the inner effect there — or put the sustained mod on
+  // the body — and bill the caster. Ends when the tick cap runs out or the
+  // body is gone; the owner drops it when the caster runs dry.
+  for (size_t i = 0; i < statuses_.size();) {
+    SpellStatus& st = statuses_[i];
+    bool gone = false;
+    if (st.target != 0) {
+      Vec3 c;
+      if (bodies && bodies->bodyPos && bodies->bodyPos(bodies->ctx, st.target, c))
+        st.at = {SpellFxFromFloat(c.x), SpellFxFromFloat(c.y), SpellFxFromFloat(c.z)};
+      else if (bodies && bodies->bodyPos)
+        gone = true;
+    }
+    if (!gone) {
+      if (st.effect.modField != ModField::None) {
+        // A sustained MOD acts on the body as if the body were the delivery:
+        // gravity is a per-tick impulse; the rest have no meaning on a body
+        // and were charged for the word.
+        if (st.effect.modField == ModField::Gravity && st.target != 0) {
+          int32_t g = 0;
+          for (int32_t k = 0; k < st.effect.modN; k++)
+            g = ClampI(st.effect.modOp == ModOp::Add ? g + st.effect.modAmount : g, -8000, 8000);
+          // Per tick: what the record's edit would do to the flight, as a
+          // velocity change on the body (voxels/s per tick).
+          out.bodyImpulses.push_back({st.target, Vec3{0, -(float)g * 0.012f, 0}});
+        }
+      } else if (!st.effect.inner.empty()) {
+        if (opsUsed < kSpellOpsPerTick) {
+          const size_t before = out.ops.size();
+          ApplySpellEffect(*lib_, st.effect.inner, st.at, st.dir, 1000, out, &probe,
+                           st.instability, (uint32_t)tick ^ st.id);
+          opsUsed += (int)(out.ops.size() - before);
+          stamp(st.casterId);
+        } else {
+          opsDropped_++;
+        }
+      }
+      if (st.perTick > 0) out.bills.push_back({st.casterId, st.perTick});
+    }
+    if (gone || --st.ticksLeft <= 0) {
+      statuses_[i] = statuses_.back();
+      statuses_.pop_back();
+    } else {
+      i++;
+    }
+  }
+
+  // BEAMS: march the ray from the caster's aim to the first solid (or the
+  // reach), resolve there, bill per tick.
+  for (size_t i = 0; i < beams_.size();) {
+    SpellBeam& bm = beams_[i];
+    if (!bm.held || --bm.ticksLeft <= 0) {
+      beams_[i] = beams_.back();
+      beams_.pop_back();
+      continue;
+    }
+    const int32_t reach = std::max(1, bm.cast.delivery.reach);
+    const SpellFxVec step = Unit(bm.dir, kSpellFxOne / 2);
+    SpellFxVec at = bm.origin;
+    for (int32_t k = 0; k < reach * 2; k++) {
+      const SpellFxVec next{at.x + step.x, at.y + step.y, at.z + step.z};
+      if (solidAt(SpellFxFloor(next.x), SpellFxFloor(next.y), SpellFxFloor(next.z))) {
+        at = next;
+        break;
+      }
+      at = next;
+    }
+    if (opsUsed < kSpellOpsPerTick) {
+      const size_t before = out.ops.size();
+      ApplySpellEffect(*lib_, bm.cast.payload, at, bm.dir, 1000, out, &probe, bm.instability,
+                       (uint32_t)tick);
+      opsUsed += (int)(out.ops.size() - before);
+      stamp(bm.casterId);
+    } else {
+      opsDropped_++;
+    }
+    if (bm.perTick > 0 && !bm.prepaid) out.bills.push_back({bm.casterId, bm.perTick});
+    bm.prepaid = false;
+    i++;
+  }
+
+  // ECHOES: the inner effect again, every period, a bounded number of times.
+  for (size_t i = 0; i < echoes_.size();) {
+    SpellEcho& ec = echoes_[i];
+    if (++ec.phase >= ec.period) {
+      ec.phase = 0;
+      if (opsUsed < kSpellOpsPerTick) {
+        const size_t before = out.ops.size();
+        ApplySpellEffect(*lib_, ec.inner, ec.at, ec.dir, 1000, out, &probe, ec.instability,
+                         (uint32_t)tick ^ (uint32_t)i);
+        opsUsed += (int)(out.ops.size() - before);
+        stamp(ec.casterId);
+      } else {
+        opsDropped_++;
+      }
+      ec.left--;
+    }
+    if (ec.left <= 0) {
+      echoes_[i] = echoes_.back();
+      echoes_.pop_back();
+    } else {
+      i++;
+    }
+  }
+
+  // FILTERS: one tick each unless an aura re-issued them this tick (below).
+  for (size_t i = 0; i < filters_.size();) {
+    if (--filters_[i].ticksLeft <= 0) {
+      filters_[i] = filters_.back();
+      filters_.pop_back();
+    } else {
+      i++;
+    }
+  }
+
+  // Whatever this tick's resolves asked to sustain: attach to the bodies at
+  // their points (the owner's probe), price per tick, cap per caster.
+  Adopt(out, bodies);
 }
