@@ -94,6 +94,11 @@ const char* const kOrder[] = {
     // with the other cheap front-loaded checks rather than after them.
     "scale",
     "player-kit",
+    // With it: `spells-oracle` is pure CPU over glyphs.json and the generated
+    // grammar oracle -- no world, no GPU, nothing left behind -- and a parser
+    // that disagrees with the reference script should be the first thing a
+    // full run says.
+    "spells-oracle",
     // And with them, for the same reason: `swing` is MeleeState alone — no
     // world, no GPU, no assets, its own fixtures — so it costs milliseconds
     // and disturbs nothing. It asserts the swing's INPUT MAPPING, which is the

@@ -3272,9 +3272,8 @@ int main(int argc, char** argv) {
       std::fprintf(stderr, "glyph load failed:\n%s", gerr.c_str());
       return 1;
     }
-    std::printf("loaded %zu glyphs (%zu conjoined, %zu wards)\n",
-                glyphs.glyphs.size(), glyphs.conjoined.size(),
-                glyphs.wards.size());
+    std::printf("loaded %zu glyphs (%zu conjoined)\n", glyphs.glyphs.size(),
+                glyphs.conjoined.size());
   }
 
   // items (assets/items/items.json — game/item.h). Content, same as glyphs,
@@ -7479,12 +7478,13 @@ int main(int argc, char** argv) {
           UIState::GlyphUI u;
           u.id = g.id;
           u.desc = g.desc;
-          u.type = (int)g.type;
-          u.mana = g.mana;
-          // The element swatch is the material's own gpu colour, so a fire
+          u.type = (int)g.sort;
+          u.mana = g.word;
+          // The matter swatch is the material's own gpu colour, so a fire
           // glyph is the colour fire actually renders as rather than a colour
           // somebody picked for the UI.
-          if (g.type == GlyphType::Element && g.material < mats.size())
+          if (g.sort == GlyphSort::Matter && !g.wildcard && g.material > 0 &&
+              g.material < mats.size())
             u.color = mats[g.material].gpu.color0;
           ui.glyphsOwned.push_back(std::move(u));
         }
@@ -7741,9 +7741,11 @@ int main(int argc, char** argv) {
         s.pos[1] = SpellFxToFloat(p.pos.y);
         s.pos[2] = SpellFxToFloat(p.pos.z);
         s.halfSize = 0.6f;
-        s.color = p.spell.element < mats.size()
-                      ? mats[p.spell.element].gpu.color0
-                      : 0xFFFFFFFFu;
+        // The bolt is drawn in the colour of the first matter it carries
+        // (a spray, a convert's product, a trail mark); a bolt that carries
+        // none (a bare `explosive projectile`) is white.
+        const uint32_t tint = CastTintMaterial(p.cast);
+        s.color = tint != 0 && tint < mats.size() ? mats[tint].gpu.color0 : 0xFFFFFFFFu;
         s.emission = 1.0f;
         sprv.push_back(s);
       }

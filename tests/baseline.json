@@ -61,6 +61,7 @@
   "_streamingKnown_about": "KNOWN-FAILING AT SUITE SCOPE since at least 2026-09-04 on branch floaters-p0-p3, and NOT caused by the island/floater work landed beside it. Detail: 'ball chunk evicted=1, 0 glass voxels after re-entry' -- the glass ball streams out and comes back empty. ATTRIBUTED at the same scope on both arms: the full suite with the isolated-solid CA rule disabled (SANDVOX_ASSET_DIR pointing at a copy of the tree with soloSolid off) fails identically, and the ball is a solid radius-3 sphere resting on the ground that soloSolid cannot touch. It PASSES under --verify with the rule on or off (76 glass voxels after re-entry), so this is a shared-World ordering dependency (CLAUDE.md rule 7) or the streaming-smooth merge + other sessions' uncommitted tree, and needs the streaming owner. Recorded so it stops masking real regressions; DO NOT treat this as understood.",
   "streaming": "fail",
   "spells": "pass",
+  "spells-oracle": "pass",
   "perf": "pass",
   "page-roundtrip": "pass",
   "daylight-boundary": "pass",

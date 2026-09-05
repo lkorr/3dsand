@@ -3064,157 +3064,180 @@ running over the baked model.
   This tag-composition structure is deliberately the seed of the Noita-style
   wand/spell system later.
 
-### The spell system (2026-08-20; `game/spell`, `game/caster`, `assets/spells/glyphs.json`)
+### The spell system (2026-08-20; grammar 2026-09-04; `game/spell`, `game/caster`, `assets/spells/glyphs.json`)
 
-The Noita-style wand system this section always anticipated ("spell modifiers
-attach as tags with per-frame logic ... the seed of the Noita-style wand/spell
-system later"), crossed with the *ancient language* of Eragon: you speak words,
-the words compose, and imprecision is punished rather than rejected. What is
-implemented is an **exploratory slice** — one form (projectile), four elements,
-two modifiers — deliberately optimized for being CHANGED rather than for being
-complete. What follows is the part that is *not* meant to change.
+The Noita-style wand system this section always anticipated, crossed with the
+*ancient language* of Eragon: you speak words, the words compose, and
+imprecision is punished rather than rejected. The first slice (2026-08-20) had
+three glyph types and a "last element wins" fold; `docs/PLAN_magic_grammar.md`
+replaced the *language* on 2026-09-04 while keeping the four structural
+commitments below, which are the part of this section that is *not* meant to
+change.
 
 **A spell is a program whose only output is op-stream emissions.** Every world
 change a spell makes leaves as a `BrushOp`/`ExplosionOp`/`CellOp`/
-`ParticleSpawn` on the MutationQueue (rule 3). `SpellEmission` is the only
-channel out of the VM, and there is no path from spell code into a voxel
-buffer. That is what gives spells save/replay/networking for free, and it is
-why a spell blast joins the ordinary `exps` list rather than getting its own
+`ParticleSpawn`/`WindPrim` on the MutationQueue (rule 3). `SpellEmission` is
+the only channel out of the VM, and there is no path from spell code into a
+voxel buffer. That is what gives spells save/replay/networking for free, and it
+is why a spell blast joins the ordinary `exps` list rather than getting its own
 detonation path — island checks, body damage, mob carving and impulse all apply
 with no spell-specific code.
 
 **The effect payload is position-parameterized, so backfire is free.**
-`ApplySpellEffect(spell, at, dir, strength, out)` takes the position as an
-argument, so "cast it at the muzzle" and "cast it at the caster's own chest"
-are the *same call*. Backfire is therefore never per-spell special-case code: a
-new element or form gets a thematic death the day it is added. This was built
-this way from the first line, while only two effects existed, precisely because
-it is the kind of structure that cannot be retrofitted once the glyph set grows.
+`ApplySpellEffect(payload, at, dir, strength, out)` takes the position as an
+argument, so "cast it at the muzzle", "cast it where the bolt landed", "cast
+it at the clicked body part" and "cast it into the caster's own chest" are the
+*same call*. Backfire is therefore never per-spell special-case code: a new
+verb gets a thematic death the day it is added.
 
 **The VM is integer, in fixed point — and this is NOT rule 1.** Projectile
 position/velocity are 24.8 fixed-point voxels (the exact convention
 `ParticleSpawn` already uses), and mana/health/timers are integers. Spell state
 is CPU-side gameplay state *outside* the hashed grid domain, exactly like mobs
-and debris, so the world hash cannot see it either way — verified: the hash is
-unmoved at `765da1f8` with the system live. It is fixed-point for **lockstep MP
-(§10) and replay debugging**, where a projectile's path must reproduce
-bit-exactly on every machine. The comments say so explicitly so nobody
-"simplifies" it back to float. Floats appear only at the drawing boundary.
+and debris, so the world hash cannot see it either way. It is fixed-point for
+**lockstep MP (§10) and replay debugging**, where a projectile's path must
+reproduce bit-exactly on every machine. Floats appear only at the drawing
+boundary.
 
-**The VM is not player-coupled.** Casting is a free function over (glyph list,
-caster state, origin, direction) → emitted ops; a mob will drive the identical
+**The VM is not player-coupled.** Casting is a free function over (cast list,
+caster state, origin, direction) → emitted ops; a mob drives the identical
 `Cast()` call. Health is read through a `CasterHealth` callback rather than a
 field, which is what lets the player's health stay where it actually lives —
-`PlayerAvatar`'s per-part hp — instead of a parallel number that would drift
-from the visible damage state within a session. `PlayerCaster` (inventory +
-spoken stack) is a separate struct and `Player` is untouched.
+`PlayerAvatar`'s per-part hp — instead of a parallel number that would drift.
+`PlayerCaster` (inventory + spoken stack) is a separate struct and `Player` is
+untouched.
 
-**Rule 2 applies to magic, with no exception.** Every sustained effect declares
-a finite budget up front: a trail carries a hard voxel VOLUME budget that only
-decreases, and the projectile dies when it is spent; lifetimes and live
-projectile counts are capped in `glyphs.json` and clamped against engine
-ceilings at load. A generation counter is wired now (`Spell::gen`, capped)
-even though nothing triggers anything yet — it is the subcriticality guarantee,
-and it is annoying to add after triggers exist. This codebase has hit the
-"permanent condition keeps chunks awake forever" trap three times already
-(light-gated rules, staining, viscous liquids); a trail spell must not be the
-fourth, and the selftest asserts the budget is respected *exactly*.
+**Rule 2 applies to magic, with no exception.** Every lowered cast carries four
+finite numbers — `ticks`, `voxels`, `instances`, `generation` — and law L8
+asserts them. A trail carries a hard voxel VOLUME budget that only decreases,
+and the projectile dies when it is spent; lifetimes, live projectile counts,
+multiplicity, fan count and generation are capped in `glyphs.json` and clamped
+against engine ceilings at load.
 
-**Every sequence compiles into something that does something.** There is no
-invalid spell — only one that does something other than you meant. That is the
-design thesis: the ancient language punishes imprecision by granting the
-literal request, not by refusing to parse. `CompileSpell` is total, and two
-rules are what make it so:
+#### The grammar (docs/PLAN_magic_grammar.md §1–§3; `ParseSpell`, `LowerSpell`)
 
-- **Repetition amplifies.** The Nth utterance of a glyph contributes 2^(N-1)
-  and costs 2^(N-1) times its mana, so `sand`=×1, `sand sand`=×2,
-  `sand sand sand`=×4 — the running total for N words is (2^N − 1)× the base.
-  Doubling rather than a linear ramp because the interesting decision ("is this
-  worth an entire extra mana bar?") only exists if the curve is steep, and
-  because it makes the price legible without arithmetic: each extra word costs
-  as much as everything before it combined. Capped at ×64 (`kMaxAmplifyPow`);
-  past the cap an extra word is free and does nothing, which is more honest
-  than charging for an effect the budget will refuse to deliver. A *different*
-  element replaces rather than stacks (`water lava` throws lava): an element is
-  what the spell is made OF, and "made of two things" has no meaning here while
-  "more of it" does. Repeating a form throws harder, repeating a modifier buys
-  a proportionally bigger one — `trail trail` is one trail with twice the
-  budget, not two trails fighting over one projectile.
-- **An unspoken form is Spray.** `SpellForm::Spray` is the fallback, not "no
-  form": a bare element flings a few loose voxels of itself out of the caster's
-  hand as ballistic particles (the existing ejecta pipeline, §5 — they fly,
-  collide and reinsert on landing). So the shortest legal spell is one word,
-  and every longer sequence reads as an elaboration of it rather than as a
-  correction. Spray is emitted from inside `ApplySpellEffect`, so a fatal spray
-  backfires into the caster's own body for free like everything else.
+Hundreds of glyphs, uncountably many sequences, every one does the predictable
+literal thing, and nobody ever writes a rule for a specific combination. The
+way to get that is the way programming languages get it: a handful of
+**sorts**, a fixed **valence** per word, a tiny set of **primitives** every
+effect lowers to, and a **tariff** that prices what the spell does to the
+world rather than the words it used.
 
-Only silence is not a spell. A form with no element still charges and fizzles.
+Five sorts, declared per glyph in `glyphs.json` (`sort`): **Matter** (a
+material by name; `air` is the void, `anything` the wildcard), **Effect**
+(something that happens at a point: a `verb` plus parameters), **Delivery**
+(how an Effect reaches a point: `mech` instant | flight | continuous plus the
+record fields), **Mod** (a field edit on the delivery record: `field`, `op`,
+`amount`), **Operator** (a verb with argument slots — `left`/`right` list the
+sorts each accepts, `result` the sort produced; every unary operator takes the
+word BEFORE it, only `transmute` is infix). Nothing in C++ knows which words
+exist. The C++ vocabulary is the sort names, the verb names (`spray`, `place`,
+`convert`, `explode`, `wind`, `mend`, `trail`, `sustain`, `filter`, `repeat`)
+and the record field names — each verb maps to ONE op type or ONE engine seam,
+and `ApplySpellEffect` switches on the verb and nothing else.
 
-The HUD shows what the VM thinks the spell is — "spray: 6 voxels from your
-hand", "bolt ×2, element ×4 + trail ×2" — which is worth far more than
-validation, since the question is never "is this legal" but "what will this do".
+Six parse rules, and they are the whole grammar:
 
-One arithmetic trap this cost, recorded because the two counters look
-interchangeable and are not: the amplification counters track repeats *beyond
-the first* (one utterance ⇒ pow 0, which is what the `×` multipliers want),
-while the mana charge needs the count of *prior* utterances. They differ by one
-from the second utterance onward. Reading the counter directly for the charge
-billed the second `sand` at ×1, so three sands cost 3/6/12 while the voxel
-count correctly doubled at 3/6/12 — the output and the price silently disagreed.
+- **R1 runs merge.** `shotgun shotgun shotgun` is `shotgun×3`; capped
+  (`budgets.maxMultiplicity`). Matter and Effects ADD (×N of the verb's declared
+  axis: spray voxels, explode power); Mods COMPOSE (applied again: shotgun
+  3/9/27, swift ×2/×4, float −1g/−2g).
+- **R2 operators bind their neighbours, greedily, on their declared side,**
+  left to right. A bound group is one item of the operator's result sort, and
+  the HUD's brackets are *derived from the binding*, so what you see is what
+  bound.
+- **R3 an operator with an empty required slot is INCOMPLETE:** charged its
+  word, does nothing, drawn as `_`. There are no defaults — `anything` and
+  `air` are words — so "unmake whatever is there" is spelled `anything
+  transmute air`.
+- **R4 a Delivery closes the clause.** `explosive projectile fire bomb` is two
+  casts. A second Delivery starts a new clause rather than replacing the first,
+  because that is the only total reading that never discards a spoken word.
+- **R5 a clause without a Delivery is delivered by `hand`,** at reach in front
+  of the caster. A bare `explosive` goes off there, and yes, it hurts.
+- **R6 order inside a bag does not matter.** Only operators (R2) and clause
+  boundaries (R4) are order-sensitive. The lowering rebuilds each clause from
+  its bag in a CANONICAL order (by key), because mods compose through integer
+  arithmetic that does not commute under clamping (49 halved then doubled is
+  48) — without that `swift slow` and `slow swift` would be two different
+  records and R6 would be a lie.
+
+`ParseSpell` (R1–R4, R6) produces a `SpellTree`; `LowerSpell` turns each clause
+into a `SpellCast` — a `DeliveryRec` (the record Mods edit), a payload of
+`EffectInst`s, an instance count, the four rule-2 budgets and the price split
+into word / tariff / carry; `CastList` is what `Cast()` runs, what a projectile
+carries and what backfire runs. Every sequence lowers to a definite cast list;
+there is no misfire state, and the imprecision penalty lives entirely in the
+mana/health crossover.
+
+**The reference interpreter is the oracle.** `scripts/magic_grammar.py`
+implements R1–R6 over the same glyph table and generates
+`docs/MAGIC_PERMUTATIONS.md` (every word, every brief sentence, every pair over
+a 19-word alphabet, every triple over a 10-word core). `--oracle` writes
+`assets/spells/grammar_oracle.json`, and the `spells-oracle` gate parses every
+entry with the C++ and compares the bracket string and the clause structure.
+A row of the permutation table that reads wrong is a rule that is wrong; fix
+the rule in both places and regenerate.
+
+**The laws are the gate, not a pinned list.** The `spells` gate asserts
+algebraic properties over every sequence of length ≤ 3 drawn from that
+alphabet, generated in the test: L1 totality (non-empty cast list, finite
+cost, non-empty description), L2 bag commutativity (a permutation with the
+same canonical form lowers to an IDENTICAL cast list, compared field by
+field), L3 multiplicity (`g g` ≡ `g×2` exactly until the cap: spray voxels ×N,
+explode power ×N, a mod's field edited once more per word, cost monotone),
+L6 local binding (an operator's bound arguments do not change when a word is
+inserted anywhere that does not land inside or adjacent to ANY operator
+group's spoken span — "any", because greedy binding means a word dropped into
+another operator's slot region can steal its argument and free a word for this
+one; locality is about where the word lands relative to every binding). L4/L7
+(clause independence, tariff monotonicity), L5 (delivery invariance) and L8
+(finite budgets) join in later phases. A change that breaks a law breaks a
+*class* of spells, which is what the line says; a change that moves one
+spell's numbers is a rebaseline.
+
+Two decisions worth recording because the obvious alternative is wrong:
+
+- **`transmute` is an OVERWRITE brush op (mode 1) with a FROM filter, not the
+  laser's melt mode (2).** Melt converts each cell to *its own* authored
+  `molten` product, which is exactly right for a heat beam and exactly wrong
+  for "turn dirt into water", where the caster chose both ends. The from
+  filter rides in the op's spare words (`_p0` = the only material it may
+  replace, 0 = any; `_p1` bit 0 = the wildcard matches matter, not the void),
+  zero for every other producer, so the brush and the laser are unchanged.
+  `air transmute B` is a paint-into-air op; `A transmute air` is an erase
+  filtered to A. Melt mode is used for exactly one thing: the share of an
+  UNSTABLE convert that goes wrong (plan §4).
+- **Matter under `trail` lowers to `place` (a mark), not `spray`.** A spray
+  at every marked voxel would multiply the particle spawn count by the spray
+  size along the whole path, and the trail budget is a voxel count: one mark
+  per voxel is what it measures. Everywhere else a free Matter is `spray(M)`,
+  which is what keeps the one-word spell alive.
 
 **Casting into health makes a spell IMPRECISE, not merely expensive.** Cost ≤
 mana casts normally; cost ≤ mana + health casts but spends the remainder as
 health *and* wobbles the trajectory in proportion to how deep it went; cost >
-mana + health runs the spell's own payload at the caster and kills them. That
+mana + health runs every cast's payload at the caster and kills them. That
 middle case is the whole mechanic — it makes the mana bar a *precision meter*
 rather than a second HP bar — so the HUD draws mana and health on one axis with
-a hard break at the crossover, rather than as two numbers.
+a hard break at the crossover.
 
-Two decisions worth recording because the obvious alternative is wrong:
-
-- **`transmute_to` is an OVERWRITE brush op (mode 1), not the laser's melt mode
-  (2).** Melt converts each cell to *its own* authored `molten` product
-  (stone→lava, sand→molten glass), which is exactly right for a heat beam and
-  exactly wrong for "transmute to acid", where the caster chooses the target
-  material. Mode 1 is the existing primitive for that; no second conversion
-  path was invented.
-- **A projectile treats UNKNOWN cells as PASSABLE, the opposite of the player
-  controller's choice.** The CPU mirror covers only the 3×3×3 chunks around the
-  player (~48 voxels), which is ample for a capsule that never leaves its own
-  neighbourhood and useless for a 48 vox/tick projectile that exits the mirror
-  within one tick. Reading Unknown as solid — the conservative-looking option —
-  detonates every bolt in the caster's face. Out-of-window space is still
-  solid, per §3. The cost is that a bolt fired at a distant wall passes through
-  it; the honest fix is a swept `RequestChunkFetch` along the flight path, not
-  a bigger mirror.
-
-Wards and glyph conjoining are landed as **shape only** (structs + `glyphs.json`
-blocks, no behaviour). The recorded intent for wards is the load-bearing part:
-a ward filters the incoming **op stream** (cheap, CPU-side, sim untouched), not
-the CA — so it stops someone *casting* acid at your feet but not acid already
-flowing toward you. That is deliberate: it keeps the falling-sand game
-underneath and makes "cast next to them and let physics do it" the counterplay.
-Ward drain is a **fraction** of max mana rather than a flat amount, because a
-flat cost lets a big late-game pool buy invulnerability.
+**A projectile treats UNKNOWN cells as PASSABLE, the opposite of the player
+controller's choice.** The CPU mirror covers only the 3×3×3 chunks around the
+player (~48 voxels), useless for a 48 vox/tick projectile that exits it within
+one tick. Reading Unknown as solid detonates every bolt in the caster's face.
+Out-of-window space is still solid, per §3.
 
 Op budget fairness is explicit (`SpellSystem::kSpellOpsPerTick = 24` of the 64
-`BrushOp`s, alongside `gore.bleedOpsPerTick` — 6 by default — for mob and for
-avatar bleeding each; magic's share is deliberately NOT tunable, so turning the
-gore up cannot starve spells, and the bleed side is clamped to 64) and overflow is
-**counted and shown in the HUD** rather than dropped silently — a spell that
-sometimes doesn't fire is miserable to diagnose.
+`BrushOp`s, alongside `gore.bleedOpsPerTick` for mob and avatar bleeding;
+magic's share is deliberately NOT tunable) and overflow is **counted and shown
+in the HUD** rather than dropped silently.
 
-Selftest gate `spells`: the trail's voxel budget is respected exactly and the
-projectile dies with it; an overcast resolves Fatal, emits its own payload, and
-asks for the caster to be carved; and a bare element sprays, with N+1 words
-producing *exactly* twice the matter of N at *exactly* the doubled price.
-Invariants, not plausible numbers — the amplification is asserted as an exact
-relation between three casts rather than as absolute counts, because a gate
-that only checked "more words ⇒ more output" would pass a linear ramp too, and
-because measuring the relation is what caught the off-by-one above. The first
-version of the gate folded the impact op into the trail total and reported 343
-voxels against a 64 budget, where the budget was fine and the measurement was
-wrong.
+Selftest gates `spells` (the trail's voxel budget respected exactly and the
+projectile dead with it; an overcast resolving Fatal, emitting its own payload
+and asking for the caster to be carved; `fire`×N throwing exactly N times the
+matter of `fire` at exactly N times the price; the cast latch; the laws) and
+`spells-oracle` (the parser against the reference script, every entry).
 
 ### Items, and mouse-directed melee (2026-08-20; `game/item.h`, `game/melee.*`)
 

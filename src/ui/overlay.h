@@ -533,9 +533,9 @@ struct UIState {
   struct GlyphUI {
     std::string id;
     std::string desc;
-    int type = 0;         // GlyphType: 0 element, 1 form, 2 modifier
-    int mana = 0;
-    uint32_t color = 0;   // element swatch (gpu color0), 0 = not an element
+    int type = 0;         // GlyphSort: 0 matter, 1 effect, 2 delivery, 3 mod, 4 operator
+    int mana = 0;         // the word cost
+    uint32_t color = 0;   // matter swatch (gpu color0), 0 = not matter
   };
   std::vector<GlyphUI> glyphsOwned;
   // `glyphSlots` above is already the bound strip (slot -> glyph id) and IS

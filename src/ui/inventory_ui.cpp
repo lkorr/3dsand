@@ -80,10 +80,11 @@ std::string KindOfRef(const UIState& s, const KitRef& r) {
 }
 
 const char* GlyphIcon(int type) {
+  // GlyphSort: 0 matter, 1 effect, 2 delivery, 3 mod, 4 operator.
   switch (type) {
-    case 1: return "glyph_form";
-    case 2: return "glyph_modifier";
-    default: return "glyph_element";
+    case 2: return "glyph_form";
+    case 0: return "glyph_element";
+    default: return "glyph_modifier";
   }
 }
 

@@ -74,7 +74,7 @@ struct PlayerCaster {
   // HUD can show the running cost draining live BEFORE the cast. Cost being
   // computable before casting is what makes the mana/health crossover legible,
   // which is the whole tension mechanic.
-  Spell compiled;
+  CastList compiled;
   SpellReadout readout;
 
   // Last cast's outcome, for the HUD flash.
@@ -83,7 +83,7 @@ struct PlayerCaster {
 
   void Recompile(const GlyphLibrary& lib) {
     compiled = CompileSpell(lib, stack);
-    readout = DescribeSpell(lib, stack, compiled);
+    readout = DescribeSpell(lib, compiled);
   }
   // Speak the glyph bound to a slot. Pressing a number SPEAKS, it never casts.
   bool SpeakSlot(const GlyphLibrary& lib, int slot) {
@@ -91,7 +91,7 @@ struct PlayerCaster {
     if (gi < 0) return false;
     // Bound so a stuck key cannot grow the stack without limit (rule 2 applies
     // to UI state too — an unbounded stack is an unbounded mana cost).
-    if (stack.spoken.size() >= 16) return false;
+    if ((int)stack.spoken.size() >= kSpellStackMax) return false;
     stack.spoken.push_back(gi);
     Recompile(lib);
     return true;

@@ -2839,6 +2839,23 @@
         "mineral"
       ],
       "molten": "lava"
+    },
+    {
+      "comment": "The dearest common matter (docs/PLAN_magic_grammar.md): the top of the arcane tariff, so making it is what kills alchemists. Never placed by worldgen; exists so the tongue has the word.",
+      "id": "gold",
+      "footstep": "stone",
+      "class": "solid",
+      "density": 19300,
+      "hardness": 40,
+      "rubble": "gravel",
+      "colors": [
+        "#d9a92c",
+        "#c99a22",
+        "#e8bd45"
+      ],
+      "tags": [
+        "mineral"
+      ]
     }
   ]
 }

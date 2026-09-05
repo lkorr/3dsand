@@ -78,6 +78,12 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
   // flag at the bottom, which needs what was here BEFORE the store.
   let prevMat = voxMat(voxWordAt(c));
   if (op.mode == 0u && prevMat != MAT_AIR) { return; }  // paint fills air only
+  // A spell's transmute (game/spell.cpp Convert) is an overwrite with a FROM
+  // filter: _p0 names the only material it may replace (0 = any), and bit 0 of
+  // _p1 says the wildcard matches matter, not the void. Both are zero for every
+  // other producer, so the brush and the laser are unchanged.
+  if (op.mode != 0u && op._p0 != 0u && prevMat != op._p0) { return; }
+  if (op.mode != 0u && (op._p1 & 1u) != 0u && prevMat == MAT_AIR) { return; }
 
   var mat = op.material;
   if (op.mode == 2u) {
