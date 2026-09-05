@@ -7429,18 +7429,32 @@ the one model modders already read (PLAN_biomes.md §2 has the survey).
   first authored one exercises the whole path. Not yet: `proc:` kinds
   (the ruin shell is gone; a generator per kind is the follow-up plan),
   slope-gated rules, sites larger than 512 voxels a side.
-* **LIVE: the biome band strip** on the climate section — the three worldgen
-  thresholds (`meadowThreshold` / `pineThreshold` / `desertThreshold`) as one
-  draggable bar writing `tuning.json`.
-* **AUTHORED, VALIDATED, PREVIEWED, NOT YET READ BY WORLDGEN:** water
-  features (P4/P5 of the world map), terrain overrides, tree-row and
-  cover-row `nearWater*` conditions, climate coordinates (the painted map
-  supersedes them in P2). The `biomes` gate (`src/sim/biomes.*`,
-  `selftest_biomes.cpp`) loads every file and refuses an unknown species,
-  preset or material, a biome `index` that is not worldgen's id for its name,
-  a stale species mirror, a preset whose berm exceeds its shore lift. The
-  swatch on the biome page composes all of it. The pages say "authored, not
-  yet read" in their section notes, on purpose.
+* **THE LIVE MANIFEST** (`assets/editor/envlive.js`, PLAN_environment_truth
+  P-B, 2026-09-05). One table says, per JSON path of a biome file, a water
+  preset and the map, `{read: true}` or `{read: false, package, why}`; every
+  row builder goes through `envui.liveMark`, so an unread field renders
+  DISABLED (greyed, not hidden, tooltip = the package that reads it), and
+  `test_environment.mjs` §7 walks `BG.defaultBiome()` / `defaultRows()`,
+  `WG.defaultParams()` and `map.json` and fails on a field the manifest does
+  not list — no third state. The truth is derived from `PackBiomeTable` +
+  `worldgen.wgsl`, never from the plan. Read today: skin / subsoil / depth,
+  patch mask, the three flags, cover rows with `minY` / `maxY` /
+  `patchThreshold`, `trees.density`, species weights, cave thresholds. Not
+  read: `trees.tile` and every other `conditions` field (P-D), the water
+  rows and every preset field (P-F geometry, P-E vegetation),
+  `terrain.overrides` (P-G), climate and the moisture plane (later). The
+  trees/ha stat uses the ENGINE tile (`worldgen.treeTile`).
+* **THE BAND STRIP IS DEAD** and drawn greyed with no grips: `biomeAt` is
+  `mapBiomeAt`, so `meadow/pine/desertThreshold`, `biomeLog2` and `biomeBlend`
+  reach only `biomeCurve`'s height-curve crossfade, and `CURVE_IDENT_ALL`
+  folds that out with the shipped identity curves. The Worldgen tab marks
+  those five knobs `dead:` in `tuner_schema.js` (`tuneRow` disables them);
+  P-G moves the curves into the biome files and P-I deletes the rows.
+* The `biomes` gate (`src/sim/biomes.*`, `selftest_biomes.cpp`) loads every
+  file and refuses an unknown species, preset or material, a biome `index`
+  that is not worldgen's id for its name, a stale species mirror, a preset
+  whose berm exceeds its shore lift. The swatch on the biome page composes
+  all of it, read or not.
 
 ### The generators are the preview AND the future truth
 
