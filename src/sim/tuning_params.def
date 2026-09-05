@@ -836,7 +836,8 @@ TP_I(worldgen, curveDesert8, TUNE_CURVE_DESERT8, 16384)
 // smallest gap between thresholds.
 TP_I(worldgen, biomeBlend, TUNE_BIOME_BLEND, 18)
 TP_I(worldgen, treeTile, TUNE_TREE_TILE, 144)
-TP_U(worldgen, autumnFraction, TUNE_AUTUMN_FRACTION, 5)
+// (autumnFraction went in P-E: a species' autumn rarity is `autumnChance` in
+// assets/trees/<name>.json alone, with no global scale on it.)
 TP_I(worldgen, pondTile, TUNE_POND_TILE, 448)
 TP_U(worldgen, pondChance, TUNE_POND_CHANCE, 4)
 // Radii SHRANK with the perched-tarn change (68..127 -> 48..79). A pond whose
@@ -874,18 +875,11 @@ TP_I(worldgen, pondBermWidth, TUNE_POND_BERM_WIDTH, 14)
 // enough to wade in from.
 TP_I(worldgen, pondDepth, TUNE_POND_DEPTH, 26)
 TP_I(worldgen, pondDepthRim, TUNE_POND_DEPTH_RIM, 3)
-// 1-in-N chance a surface cell over deep enough water carries a lilypad, and
-// 1-in-N that a pad carries a blossom.
-TP_U(worldgen, lilyChance, TUNE_LILY_CHANCE, 22)
-TP_U(worldgen, lilyFlowerChance, TUNE_LILY_FLOWER_CHANCE, 5)
-// 1-in-N chance a shallow-margin column grows a reed clump, and how tall the
-// clump runs (voxels above the bed, so a reed in deeper water is still cut off
-// at the surface by the emergent check in genCell).
-TP_U(worldgen, reedChance, TUNE_REED_CHANCE, 130)
-TP_I(worldgen, reedHeight, TUNE_REED_HEIGHT, 16)
-// 1-in-N chance a deeper bed column grows kelp, and its height in voxels.
-TP_U(worldgen, kelpChance, TUNE_KELP_CHANCE, 120)
-TP_I(worldgen, kelpHeight, TUNE_KELP_HEIGHT, 10)
+// ---- pond life: lilypads, reeds, kelp ----
+// NOT KNOBS ANY MORE (P-E). The floating / emergent / submerged bands are
+// `aquatic.*` in assets/water/<name>.json, packed into the worldMap buffer's
+// water preset table (src/sim/worldmap.h kW_*) and read there by genCellIn;
+// the same for the shore species (shore.plants[], shore.mossChance) below.
 // ---- vines / climbers / hanging moss (worldgen agent B) ----
 // The nine rows that used to live here — vineChance, vineLenMin/Span,
 // creeperFlowerChance, mossChance, mossLenMin/Span, ivyChance, ivyTwist —
@@ -915,26 +909,19 @@ TP_I(worldgen, shoreMudWidth, TUNE_SHORE_MUD_WIDTH, 10)
 // the steep sides as dry bank. It moves coverage a long way — at the default
 // pond it keeps 5% of the raw band at 4 and 99% at 24.
 TP_I(worldgen, shoreLift, TUNE_SHORE_LIFT, 12)
-TP_U(worldgen, shoreCattailChance, TUNE_SHORE_CATTAIL_CHANCE, 12)
-TP_I(worldgen, shoreCattailReach, TUNE_SHORE_CATTAIL_REACH, 9)
-TP_I(worldgen, shoreCattailHeight, TUNE_SHORE_CATTAIL_HEIGHT, 20)
-TP_U(worldgen, shoreSedgeChance, TUNE_SHORE_SEDGE_CHANCE, 4)
-TP_U(worldgen, shoreHorsetailChance, TUNE_SHORE_HORSETAIL_CHANCE, 10)
-TP_I(worldgen, shoreHorsetailHeight, TUNE_SHORE_HORSETAIL_HEIGHT, 9)
-TP_U(worldgen, shoreIrisChance, TUNE_SHORE_IRIS_CHANCE, 34)
-TP_U(worldgen, shoreMossChance, TUNE_SHORE_MOSS_CHANCE, 3)
+// (The eight shore SPECIES rows -- cattail/horsetail/iris/sedge chance,
+// reach and height, and the wet-moss chance -- went in P-E: they are
+// shore.plants[] / shore.mossChance of the water preset now. The three
+// GEOMETRY rows above stay until P-F, which is when the band itself comes
+// from the preset.)
 // ---- desert / pine highland / alpine ground cover (worldgen agent E) ----
 // The three biomes that generated bare. All of these are 1-in-N per column
 // inside the relevant mask, or a percentage where noted, and every one of them
 // places INERT material in a single voxel above the surface (rule 2).
 //
-// Cacti. `cactusChance` is a PERCENT per 2.5 m tile, not a 1-in-N, matching
-// treeChance* above — a cactus is placed by the same per-tile scheme a tree is.
-// `saguaroFraction` is the percentage of those that are tall columns rather
-// than ground-level barrels; the columns are landmarks, so they have to stay
-// occasional or the desert reads as a plantation.
-TP_U(worldgen, cactusChance, TUNE_CACTUS_CHANCE, 26)
-TP_U(worldgen, saguaroFraction, TUNE_SAGUARO_FRACTION, 22)
+// Cacti are per biome since P-E: cover.cacti (on/off), cover.cactusChance
+// (percent of 2.5 m tiles) and cover.saguaroFraction (percent of those that
+// are tall columns) in assets/biomes/<name>.json, read from the biome record.
 // Desert ground cover, 1-in-N per column. Tussock is the common one — it is
 // what stops bare sand reading as a texture — and scrub is the woody accent.
 // Both are gated by a patch mask so the desert has bare stretches between
@@ -964,17 +951,10 @@ TP_U(worldgen, alpineChance, TUNE_ALPINE_CHANCE, 40)
 // deeper than the building is tall. The footprint still reads as a clearing
 // (see ruinFloorAt) so a refused site looks like an old foundation.
 // ---- cave flora + the shaded face (13.3.4) ----
-// 1-in-N per column, INSIDE the relevant patch mask, on the one cell that is
-// the cave's floor or its ceiling. Mushrooms go on the shallow band's floor
-// (the caverns you walk into from a hillside); crystal goes on the deep band's
-// floor and ceiling (the ones you only reach by digging), never within
-// CAVE_LAVA_MARGIN of the magma table.
-//
-// Both are SPARSER than they look: the patch masks already cut the eligible
-// area to about a third, and only one y per column is eligible at all, so these
-// are the density WITHIN a seam rather than over the cavern.
-TP_U(worldgen, caveMushroomChance, TUNE_CAVE_MUSHROOM_CHANCE, 26)
-TP_U(worldgen, caveCrystalChance, TUNE_CAVE_CRYSTAL_CHANCE, 9)
+// The cave flora chances (mushrooms on the shallow band's floor, crystal on
+// the deep band's floor and ceiling) are per biome since P-E: `mushroomChance`
+// on the near_surface row and `crystalChance` on the deep row of
+// caves.features in assets/biomes/<name>.json, read from the biome record.
 // Which wall face wears moss: 0 = -Z, 1 = +X, 2 = +Z, 3 = -X. Worldgen has no
 // sun and no compass, so a shaded face is a CONVENTION rather than a
 // measurement, and this is the knob that declares it. -Z is "north".

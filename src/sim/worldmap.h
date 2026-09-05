@@ -99,6 +99,12 @@ enum : uint32_t {
   kHHarnessZ0 = 23,
   kHHarnessX1 = 24,
   kHHarnessZ1 = 25,
+  // The water preset table (P-E): one kWaterRecWords record per
+  // assets/water/<name>.json, in the loader's (sorted file name) order, plus
+  // the shore plant rows the records point into. kHMaxCoverH includes every
+  // preset's kW_MaxPlantH, for the same reason it includes the cover rows.
+  kHWaterRecords = 26,  // word offset: per-preset record table
+  kHWaterCount = 27,
   kHeaderWords = 32,    // padded, like treeatlas::kFileHeaderWords
 };
 // Planes are packed FOUR CELLS PER WORD, little-endian: cell i of a plane at
@@ -122,7 +128,7 @@ inline constexpr uint32_t kVersion = 1u;
 // metres), chances as 1-in-N, slopes in Q8. A cover row's `heightVox` is the
 // stalk height; `head` caps the top cell when non-zero.
 enum : uint32_t {
-  kBiomeRecWords = 16,
+  kBiomeRecWords = 32,
   kB_Skin = 0,            // material id of the y == h skin
   kB_Subsoil = 1,         // material id under the skin (the wedge's topsoil)
   kB_SkinDepth = 2,       // cells of skin, >= 1
@@ -141,7 +147,18 @@ enum : uint32_t {
                           // or a plant above the old fixed margin is never
                           // written by a skipped chunk and sits above the far
                           // field's flagged top (far-fog gate, 2026-09-04)
-  // 14..15 reserved
+  // 14..15 reserved (P-D takes 14 for its per-biome tree chance)
+  // ---- P-E: the flora that used to be worldgen.* knobs ----
+  // P-E INTERIM: a pond has no preset of its own until P-F drives the bowl
+  // from the water table, so every pond and shore in a biome wears the
+  // preset of the biome's FIRST water.features row. 0 = the biome authors no
+  // water rows and grows no shore, pond or moss flora at all.
+  kB_WaterPreset = 16,    // 1 + index into the water preset table; 0 = none
+  kB_CaveMushroomChance = 17, // 1-in-N floor cells of the near band; 0 = never
+  kB_CaveCrystalChance = 18,  // 1-in-N floor/ceiling cells of the deep band; 0 = never
+  kB_CactusChance = 19,       // percent of CACTUS_TILE tiles that grow one (kBF_Cacti gates it)
+  kB_SaguaroFraction = 20,    // percent of those that are saguaro columns, not barrels
+  // 21..31 reserved
   kCoverRowWords = 8,
   kC_Mat = 0,
   kC_Head = 1,
@@ -157,6 +174,57 @@ enum : uint32_t {
 inline constexpr uint32_t kBF_GroundFlora = 1u << 0;  // the canopy-inverted undergrowth + flower layer
 inline constexpr uint32_t kBF_Cacti = 1u << 1;        // the cactus proc shape
 inline constexpr uint32_t kBF_SandCap = 1u << 2;      // loose sand cap under the skin (the old desert rule)
+
+// ---- the water preset table (P-E) --------------------------------------------
+// One fixed-stride record per assets/water/<name>.json at kHWaterRecords, in
+// the loader's order (sorted file name), followed by the shore plant rows the
+// records point into. This is the FLORA half of a preset -- what grows on the
+// wet fringe outside the bowl (shore.plants[], shore.mossChance), and what
+// grows in the water by depth band (aquatic.emergent / floating / submerged).
+// The GEOMETRY half (footprint, bathymetry, berm, shore band/lift) stays on
+// the worldgen.pond* / shore* knobs until P-F; words 22..31 are reserved for
+// it. Mirrored by worldgen.wgsl's WM_W_* / WM_P_* consts; check_invariants.py
+// holds the two together.
+//
+// Depths are voxels of water over the bed, heights voxels from the bed (the
+// aquatic rows) or from the ground (the shore rows); metres in the JSON.
+// Every chance is 1-in-N with 0 = never (the shader guards the modulo).
+enum : uint32_t {
+  kWaterRecWords = 32,
+  kW_Fill = 0,                 // fill material id; 0 = a dry preset (informational until P-F)
+  kW_ShoreCount = 1,
+  kW_ShoreOff = 2,             // word offset of this preset's first shore plant row
+  kW_MossChance = 3,           // 1-in-N shore-band stone surface cells wear kW_MossMat
+  kW_MossMat = 4,
+  kW_EmergentMat = 5,          // reeds: stand on the bed, break the surface
+  kW_EmergentChance = 6,
+  kW_EmergentMinDepth = 7,     // water column depth band, inclusive
+  kW_EmergentMaxDepth = 8,
+  kW_EmergentHeight = 9,       // cells above the bed
+  kW_FloatingMat = 10,         // lilypads: one cell ON the surface
+  kW_FloatingFlower = 11,      // the blossom one cell above a pad (0 = none)
+  kW_FloatingChance = 12,
+  kW_FloatingFlowerChance = 13,// 1-in-N pads carry the flower
+  kW_FloatingMinDepth = 14,
+  kW_FloatingMaxDepth = 15,
+  kW_SubmergedMat = 16,        // kelp: from the bed, held under the surface
+  kW_SubmergedChance = 17,
+  kW_SubmergedMinDepth = 18,   // only where the water is DEEPER than this
+  kW_SubmergedHeight = 19,     // cells above the bed
+  kW_SubmergedClearance = 20,  // cells of water kept clear above the top
+  kW_MaxPlantH = 21,           // tallest thing this preset puts above ground or bed
+                               // (jitter and head included): folded into
+                               // kB_MaxCoverH / kHMaxCoverH so the sky-skip and
+                               // far-blocker ceilings cover it
+  // 22..31 reserved (P-F geometry)
+  kShoreRowWords = 8,
+  kP_Mat = 0,
+  kP_Head = 1,                 // caps the top cells when non-zero
+  kP_Chance = 2,               // 1 in N shore columns within reach; 0 = row is off
+  kP_Reach = 3,                // voxels past the waterline the row still grows
+  kP_Height = 4,               // stalk cells above the ground, >= 1
+  // 5..7 reserved
+};
 
 // ---- the site table (P5) ----------------------------------------------------
 // One record per authored site at kHSiteTable (kHSiteCount of them), plus a
@@ -199,7 +267,8 @@ namespace worldmap {
 
 /**
  * Pack the loaded biome set into the `worldMap` buffer's words: header +
- * biome records + cover rows. Biome ids must be contiguous 0..N-1
+ * biome records + cover rows + water preset records + shore plant rows.
+ * Biome ids must be contiguous 0..N-1
  * (ValidateBiomeSet enforces it); the record for id i is at
  * words[kHBiomeRecords] + i * kBiomeRecWords. Returns false, with `log`,
  * only on an id-space that cannot be laid out. The content hash goes in

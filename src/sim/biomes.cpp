@@ -123,6 +123,8 @@ bool LoadBiomeSet(const std::string& assetDir, const std::vector<MaterialDef>& m
     b.groundFlora = Get<bool>(cv, "groundFlora", true);
     b.cacti = Get<bool>(cv, "cacti", false);
     b.sandCap = Get<bool>(cv, "sandCap", false);
+    b.cactusChance = Get<int>(cv, "cactusChance", 0);
+    b.saguaroFraction = Get<int>(cv, "saguaroFraction", 0);
     for (const json& r : Arr(cv, "plants")) {
       CoverRow row;
       row.material = GetS(r, "material");
@@ -157,6 +159,8 @@ bool LoadBiomeSet(const std::string& assetDir, const std::vector<MaterialDef>& m
       row.preset = GetS(r, "preset", "near_surface");
       row.threshold = Get<int>(r, "threshold", 0);
       row.rarity = Get<int>(r, "rarity", 0);
+      row.mushroomChance = Get<int>(r, "mushroomChance", 0);
+      row.crystalChance = Get<int>(r, "crystalChance", 0);
       row.cond = ReadCond(r);
       b.caves.push_back(row);
     }
@@ -206,11 +210,39 @@ bool LoadBiomeSet(const std::string& assetDir, const std::vector<MaterialDef>& m
     const json& gr = Sub(j, "ground");
     add(GetS(gr, "skin")); add(GetS(gr, "soil")); add(GetS(gr, "rock"));
     add(GetS(sh, "mudMaterial")); add(GetS(sh, "mossMaterial"));
-    for (const json& r : Arr(sh, "plants")) { add(GetS(r, "material")); add(GetS(r, "head")); }
+    // ---- the flora half (P-E), the part worldgen reads today ----
+    w.mossChance = Get<int>(sh, "mossChance", 0);
+    w.mossMaterial = GetS(sh, "mossMaterial");
+    w.mossId = matId(w.mossMaterial);
+    for (const json& r : Arr(sh, "plants")) {
+      ShorePlantRow row;
+      row.material = GetS(r, "material");
+      row.head = GetS(r, "head");
+      row.materialId = matId(row.material);
+      row.headId = matId(row.head);
+      row.chance = Get<int>(r, "chance", 0);
+      row.reachM = Get<float>(r, "reach", 0.f);
+      row.heightM = Get<float>(r, "height", 0.3f);
+      add(row.material); add(row.head);
+      w.shorePlants.push_back(row);
+    }
     const json& aq = Sub(j, "aquatic");
-    add(GetS(Sub(aq, "emergent"), "material"));
-    add(GetS(Sub(aq, "floating"), "material")); add(GetS(Sub(aq, "floating"), "flower"));
-    add(GetS(Sub(aq, "submerged"), "material"));
+    auto band = [&](const json& s, AquaticBand& o) {
+      o.material = GetS(s, "material");
+      o.flower = GetS(s, "flower");
+      o.materialId = matId(o.material);
+      o.flowerId = matId(o.flower);
+      o.chance = Get<int>(s, "chance", 0);
+      o.flowerChance = Get<int>(s, "flowerChance", 0);
+      o.minDepthM = Get<float>(s, "minDepth", 0.f);
+      o.maxDepthM = Get<float>(s, "maxDepth", 0.f);
+      o.heightM = Get<float>(s, "height", 0.f);
+      o.clearanceM = Get<float>(s, "clearance", 0.f);
+      add(o.material); add(o.flower);
+    };
+    band(Sub(aq, "emergent"), w.emergent);
+    band(Sub(aq, "floating"), w.floating);
+    band(Sub(aq, "submerged"), w.submerged);
     out.water.push_back(std::move(w));
   }
 
@@ -294,9 +326,16 @@ int ValidateBiomeSet(const BiomeSet& set, std::vector<std::string>& out) {
       if (r.tileM <= 0) bad(at + "water.features[" + std::to_string(i) + "] tile must be > 0");
       if (r.rarity < 0) bad(at + "water.features[" + std::to_string(i) + "] rarity < 0");
     }
-    for (size_t i = 0; i < b.caves.size(); i++)
+    for (size_t i = 0; i < b.caves.size(); i++) {
       if (b.caves[i].preset != "near_surface" && b.caves[i].preset != "deep")
         bad(at + "caves.features[" + std::to_string(i) + "] preset must be near_surface or deep");
+      if (b.caves[i].mushroomChance < 0 || b.caves[i].crystalChance < 0)
+        bad(at + "caves.features[" + std::to_string(i) + "] mushroomChance / crystalChance must be >= 0 (0 = never)");
+    }
+    if (b.cactusChance < 0 || b.cactusChance > 100)
+      bad(at + "cover.cactusChance is a percent of tiles, got " + std::to_string(b.cactusChance));
+    if (b.saguaroFraction < 0 || b.saguaroFraction > 100)
+      bad(at + "cover.saguaroFraction is a percent of cacti, got " + std::to_string(b.saguaroFraction));
   }
 
   // No species-mirror check any more: since P1 of the world map the tree
@@ -317,6 +356,27 @@ int ValidateBiomeSet(const BiomeSet& set, std::vector<std::string>& out) {
     if (wet && w.bermHeightM > w.shoreLiftM && w.shoreBandM > 0)
       bad(at + "berm.height " + std::to_string(w.bermHeightM) + " exceeds shore.lift " + std::to_string(w.shoreLiftM) +
           " — no column near this body can be shore (the engine's pondBerm/shoreLift rule)");
+    // The flora half: a row that is ON (chance > 0) must name a real material,
+    // because the packer drops it otherwise and the page would show a plant
+    // the world does not have. Chances are modulo divisors: never negative.
+    if (w.mossChance < 0) bad(at + "shore.mossChance must be >= 0");
+    for (size_t i = 0; i < w.shorePlants.size(); i++) {
+      const ShorePlantRow& r = w.shorePlants[i];
+      const std::string row = at + "shore.plants[" + std::to_string(i) + "] ";
+      if (r.chance < 0) bad(row + "chance must be >= 0");
+      if (r.chance > 0 && !r.materialId) bad(row + "material \"" + r.material + "\" is not a material");
+      if (r.reachM < 0 || r.heightM <= 0) bad(row + "reach must be >= 0 and height > 0");
+    }
+    auto bandOk = [&](const char* name, const AquaticBand& o, bool depthBand) {
+      const std::string row = at + std::string("aquatic.") + name + " ";
+      if (o.chance < 0 || o.flowerChance < 0) bad(row + "chance must be >= 0");
+      if (o.chance > 0 && !o.materialId) bad(row + "material \"" + o.material + "\" is not a material");
+      if (o.chance > 0 && depthBand && o.maxDepthM < o.minDepthM)
+        bad(row + "maxDepth " + std::to_string(o.maxDepthM) + " is below minDepth " + std::to_string(o.minDepthM) + " — the band is empty");
+    };
+    bandOk("emergent", w.emergent, true);
+    bandOk("floating", w.floating, true);
+    bandOk("submerged", w.submerged, false);
   }
   return n;
 }

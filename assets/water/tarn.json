@@ -116,7 +116,7 @@
       "flower": "lily_flower",
       "chance": 22,
       "flowerChance": 5,
-      "minDepth": 6,
+      "minDepth": 1,
       "maxDepth": 3
     },
     "submerged": {
