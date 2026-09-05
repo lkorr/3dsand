@@ -2097,6 +2097,10 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadI(*g, "microMaxPerRay", r.microMaxPerRay, out, at);
     ReadF(*g, "microSwayAmp", r.microSwayAmp, out, at);
     ReadF(*g, "microSwaySpeed", r.microSwaySpeed, out, at);
+    ReadF(*g, "trampleRecover", r.trampleRecover, out, at);
+    ReadF(*g, "trampleDepth", r.trampleDepth, out, at);
+    ReadF(*g, "trampleLean", r.trampleLean, out, at);
+    ReadF(*g, "trampleRadius", r.trampleRadius, out, at);
     ReadI(*g, "primarySteps", r.primarySteps, out, at);
     ReadI(*g, "farSteps", r.farSteps, out, at);
     ReadF(*g, "farShadowReach", r.farShadowReach, out, at);
@@ -2193,6 +2197,12 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     if (r.microSwayAmp < 0.0f) { r.microSwayAmp = 0.0f; }
     if (r.microSwayAmp > 2.0f) { r.microSwayAmp = 2.0f; }
     if (r.microSwaySpeed < 0.0f) { r.microSwaySpeed = 0.0f; }
+    if (r.trampleRecover < 0.05f) { r.trampleRecover = 0.05f; }
+    if (r.trampleDepth < 0.0f) { r.trampleDepth = 0.0f; }
+    if (r.trampleDepth > 0.95f) { r.trampleDepth = 0.95f; }
+    if (r.trampleLean < 0.0f) { r.trampleLean = 0.0f; }
+    if (r.trampleLean > 1.0f) { r.trampleLean = 1.0f; }
+    if (r.trampleRadius < 0.0f) { r.trampleRadius = 0.0f; }
     if (r.shadowSteps < 0) { r.shadowSteps = 0; }
     // Subdivision must be >= 1 and within the 3 bits the shadow request record
     // gives each sub-index (world.h kShadowSubdivMax). A 0 here would divide by

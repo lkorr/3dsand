@@ -145,7 +145,7 @@ const char* const kOrder[] = {
     // const-folded, so they do not exist without a reload) and restores the
     // baseline tuning before returning. It leaves no world state behind, so
     // it sits with the other rendering gates rather than at either end.
-    "screenshots", "fire-depth", "shadow-cache", "openness", "gi-bounce", "gi-nightfall",
+    "screenshots", "fire-depth", "shadow-cache", "openness", "gi-bounce", "gi-nightfall", "plants",
     // With the other render gates: `body-shade` runs its own worldgen and is
     // the one gate that draws a RIGIDBODY. It writes the body instance buffer
     // directly (like `fire-depth`) rather than going through the DebrisSystem,

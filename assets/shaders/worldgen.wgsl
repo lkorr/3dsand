@@ -139,6 +139,12 @@ const M_WILDROSE  : u32 = 69u;
 // materials.json, recompute after any append lands ahead of this one.
 const M_TALLGRASS      : u32 = 95u;
 const M_TALLGRASS_HEAD : u32 = 96u;
+// ---- the lawn tuft (materials.json id 39) and the big toadstool (121) ----
+// grass_tuft is the one-to-two-cell analytic grass that replaced the solid
+// grass/petal cubes flowerAt used to scatter as its "ground layer" (those read
+// as green gravel). mushroom_large is a TILE plant — see plantColumnAt.
+const M_GRASS_TUFT     : u32 = 39u;
+const M_MUSHROOM_LARGE : u32 = 121u;
 // ---- THE VOXEL-SIZE SCALE --------------------------------------------------
 //
 // VOXELS_PER_M is emitted from world.h's kVoxelsPerMetre (the integer
@@ -238,6 +244,11 @@ const UG_COVER_DEEP : i32 = 190;
 // that make the floor read as dense without paving it: a fern every ~7 columns
 // inside a fern bank is a bank you push through, one every 2 is a hedge.
 const UG_FERN_CHANCE    : u32 = 7u;
+// TILE PLANTS (ferns, big toadstools): percent of tiles inside the patch mask
+// that grow one. Tile size / footprint / height live in common.wgsl as the
+// PLANT_* consts because the renderer rebuilds the plant from the same hash.
+const PLANT_FERN_CHANCE   : u32 = 45u;
+const PLANT_SHROOM_CHANCE : u32 = 5u;
 const UG_FERN_PATCH     : i32 = 140;    // vnoise 0..255; ~40% of the area
 const UG_MOSS_CHANCE    : u32 = 3u;
 const UG_MOSS_PATCH     : i32 = 150;
@@ -2349,7 +2360,7 @@ fn flowerHeight(sp : u32, h : u32) -> i32 {
     case M_BUTTERCUP: { return 2 + i32(h % 2u); }           // 20-30 cm
     case M_BLUEBELL:  { return 2 + i32(h % 2u); }           // 20-30 cm
     case M_WILDROSE:  { return 3 + i32(h % 2u); }           // 30-40 cm briar
-    default:          { return 3 + i32(h % 3u); }           // foxglove 30-50 cm
+    default:          { return 5 + i32(h % 3u); }           // foxglove 50-70 cm
   }
 }
 
@@ -2410,9 +2421,10 @@ fn flowerAt(x : i32, z : i32, seed : u32, cover : i32) -> Flower {
   let hClov = hash3(seed ^ 0xC10Fu, bitcast<u32>(x), bitcast<u32>(z));
   let hRose = hash3(seed ^ 0x8053u, bitcast<u32>(x), bitcast<u32>(z));
 
-  // Grass is the default: a meadow is grass WITH flowers in it. Grass and petal
-  // stay ONE cell — they are the ground layer the flowers rise out of.
-  var m = select(M_PETAL, M_GRASS, (fr >> 11u) % 4u != 0u);
+  // A lawn tuft is the default: a meadow is grass WITH flowers in it. It used
+  // to be a solid grass or petal cube on the surface, which read as green
+  // gravel; the tuft is one or two cells of short analytic blades.
+  var m = M_GRASS_TUFT;
   if (spj < 55) {
     if ((hBell % 3u) == 0u) { m = M_BLUEBELL; }
   } else if (spj < 100) {
@@ -2426,8 +2438,8 @@ fn flowerAt(x : i32, z : i32, seed : u32, cover : i32) -> Flower {
   if (cover >= UG_COVER_EDGE && (hRose % 9u) == 0u) { m = M_WILDROSE; }
 
   f.mat = m;
-  // Only the five flowers stack; grass and petal are the one-cell ground layer.
-  if (m == M_GRASS || m == M_PETAL) { f.height = 1; }
+  // The tuft is one or two cells; the flowers stack by species.
+  if (m == M_GRASS_TUFT) { f.height = 1 + i32((fr >> 13u) & 1u); }
   else { f.height = flowerHeight(m, hFoxg >> 7u); }
   return f;
 }
@@ -2727,8 +2739,148 @@ struct Col {
   inPoolFloor : bool,
   inRim       : bool,
   shore       : Shore,
+  plant       : PlantCol,    // the tile plant whose footprint covers this column
 };
 
+// ---- tile plants: ferns and big toadstools ---------------------------------
+// A column plant (grass, a flower) is one column and flowerAt() answers it per
+// column. A TILE plant is wider than a cell — a fern is a 30 cm rosette, a big
+// fly agaric a 30 cm cap — so its footprint is foot x foot columns painted
+// with ONE material, base+1 .. base+h cells each, and the renderer rebuilds
+// the whole plant from the tile hash in every one of those cells
+// (plantTileAt in common.wgsl is the shared question, tracePlant in
+// raymarch.wgsl the answer). The base is the CENTRE column's ground, so the
+// plant stays one rigid thing across a slope instead of stepping per column;
+// outer cells that land inside higher ground simply are not placed (the
+// mat == MAT_AIR gate) and the renderer clips the plant to the cells that
+// exist.
+//
+// Cost: one plantTileAt per column (a hash), and for columns INSIDE a present
+// footprint one landColumn + one undergrowthSite scan at the centre. Ferns
+// cover ~10% of forest columns, so that is one extra scan per ten columns.
+struct PlantCol {
+  mat  : u32,   // MAT_AIR when no tile plant covers this column
+  base : i32,   // the centre column's ground; cells base+1 .. top are plant
+  top  : i32,
+};
+
+// Is (cx, cz) a place a tile plant may stand? The same exclusions the
+// ground-flora block applies to its own column, evaluated at the CENTRE, plus
+// "not in or against a trunk" and, for ferns, canopy cover.
+struct PlantSite { ok : bool, h : i32 };
+fn plantSiteAt(cx : i32, cz : i32, seed : u32, needCover : bool) -> PlantSite {
+  var ps : PlantSite;
+  ps.ok = false;
+  ps.h = 0;
+  if (siteKeepOut(cx, cz)) { return ps; }
+  if (!wmFlag(biomeAt(cx, cz, seed), WM_BF_GROUND_FLORA)) { return ps; }
+  let L = landColumn(cx, cz, seed);
+  ps.h = L.h;
+  if (L.h >= TREELINE || L.pond >= 0 || L.inRim || L.inPoolFloor) { return ps; }
+  if (L.near.onShore && L.near.past < TUNE_SHORE_BAND) { return ps; }
+  let ug = undergrowthSite(cx, cz, seed);
+  if (ug.trunkD2 <= 4) { return ps; }
+  if (needCover && ug.cover < UG_COVER_MIN) { return ps; }
+  ps.ok = true;
+  return ps;
+}
+
+fn plantColumnAt(x : i32, z : i32, seed : u32, biome : u32) -> PlantCol {
+  var pc : PlantCol;
+  pc.mat = MAT_AIR;
+  pc.base = 0;
+  pc.top = -1;
+  // The tile plants belong to biomes with the ground-flora layer (the
+  // world map's flag), not to two hard-coded ids.
+  if (!wmFlag(biome, WM_BF_GROUND_FLORA)) { return pc; }
+  // FERNS: the signature closed-canopy plant, in banks (the same patch mask
+  // the one-cell fern used), under real cover.
+  {
+    let pt = plantTileAt(x, z, seed, PLANT_FERN_SALT, PLANT_FERN_TILE,
+                         PLANT_FERN_FOOT, PLANT_FERN_MINH, PLANT_FERN_MAXH,
+                         PLANT_FERN_CHANCE);
+    let half = PLANT_FERN_FOOT / 2;
+    if (pt.present && abs(x - pt.cx) <= half && abs(z - pt.cz) <= half &&
+        vnoise(pt.cx, pt.cz, 20 * HSCALE, seed ^ 0xFE70u) > UG_FERN_PATCH) {
+      let site = plantSiteAt(pt.cx, pt.cz, seed, true);
+      if (site.ok) {
+        pc.mat = M_FERN;
+        pc.base = site.h;
+        pc.top = site.h + pt.h;
+        return pc;
+      }
+    }
+  }
+  // BIG TOADSTOOLS: rare, anywhere in the wood — a fern bank is the wrong
+  // place for one, so a column already in a fern footprint never gets here.
+  {
+    let pt = plantTileAt(x, z, seed, PLANT_SHROOM_SALT, PLANT_SHROOM_TILE,
+                         PLANT_SHROOM_FOOT, PLANT_SHROOM_MINH, PLANT_SHROOM_MAXH,
+                         PLANT_SHROOM_CHANCE);
+    let half = PLANT_SHROOM_FOOT / 2;
+    if (pt.present && abs(x - pt.cx) <= half && abs(z - pt.cz) <= half) {
+      let site = plantSiteAt(pt.cx, pt.cz, seed, false);
+      if (site.ok) {
+        pc.mat = M_MUSHROOM_LARGE;
+        pc.base = site.h;
+        pc.top = site.h + pt.h;
+      }
+    }
+  }
+  return pc;
+}
+
+// ---- THE HEIGHT CONTRACT ---------------------------------------------------
+//
+//     World::TerrainHeight(x, z, seed)  ==  genColumn(x, z, seed).h,  exactly,
+//     for all inputs.
+//
+// (DESIGN.md carries the same sentence.) `landColumn` is the height half of the
+// column and the ONLY definition of ground level: the terrain octaves, the
+// authored pool floors and rims, the pond bowl carve, and the tarn berm. The C++
+// mirror in world.cpp reproduces it; the `terrain` gate's pass C1 is what proves
+// they still agree, per voxel, on pristine procgen.
+//
+// WHAT IT IS NOT is "the topmost solid voxel". That would include canopy, ruin
+// walls, a grass tuft and the arena deck, it cannot be mirrored cheaply (a tile
+// scan in a tick path), and it is not what any of TerrainHeight's ~30 callers
+// want — every one of them is asking where the GROUND is so it can stand
+// something on it. The arena in particular stays OUT: it is a material override
+// in genCellIn, and folding it into `h` would double-apply it and move cave
+// depth and tree bases under its footprint.
+//
+// COST DISCIPLINE. This is now ~25 hash3 (two octaves, one pond tile, one pond
+// centre, up to four neighbour tiles) and it is called from CPU paths that run
+// at O(1) per frame — spawn placement, fixture anchoring, a mob probe. It must
+// never be called in a per-voxel loop on either side.
+// ---- RUIN SITES: decided in the COLUMN half, so the building gets a pad ----
+//
+// A ruin used to be stamped in the CELL half at `baseHeight(centre)` — the raw
+// five-octave ladder, with the pond bowl, the authored pool floors and the tarn
+// berm all missing from it — and with no gate at all on how steep the ground
+// under it was. On a hillside that left one wall floating a metre in the air
+// and buried the opposite one; beside a tarn it put the floor under the water
+// table. Both are the same bug: the site was decided against a height that is
+// not the height the world is actually built at.
+//
+// So the decision moves here, next to the ponds, and the site FLATTENS the
+// ground it stands on the way a foundation does — the terrain yields to the
+// building rather than the other way round. Three pieces:
+//
+//   * `ruinTileAt` is the CHEAP half: one tile hash and the same jittered
+//     footprint the cell half always used. It costs one hash3 and knows nothing
+//     about height, which is what lets the tree and ground-cover rules ask "is
+//     this column a ruin floor?" per candidate without paying for a pad.
+//   * `ruinPad` is the EXPENSIVE half: four column heights at the footprint
+//     corners, AFTER pond and pool composition. Median for the pad height,
+//     spread for the refusal. Only columns within `worldgen.ruinPadMargin` of
+//     the footprint ever evaluate it, which is ~1.5% of the world.
+//   * `landColumn` blends the pad out into the terrain over that margin.
+//
+// The footprint is always strictly inside its own tile (margin 32, width 56,
+// jitter <= 136, so rx - tx*256 is in [32, 167] and rx + 56 <= 223 < 256), so a
+// column only ever has to look at ITS OWN tile — which stays true as long as
+// the pad margin is under 32, and LoadTuning clamps it there.
 
 
 struct LandCol {
@@ -2953,6 +3105,9 @@ fn genColumn(x : i32, z : i32, seed : u32) -> Col {
     lab.shore.onShore = false;
     lab.shore.past = 0;
     lab.shore.surf = -1;
+    lab.plant.mat = MAT_AIR;
+    lab.plant.base = 0;
+    lab.plant.top = -1;
     return lab;
   }
   // THE GROUND, and everything derived from it, in one call. This is the same
@@ -3008,6 +3163,7 @@ fn genColumn(x : i32, z : i32, seed : u32) -> Col {
   col.inPoolFloor = L.inPoolFloor;
   col.inRim = L.inRim;
   col.shore = shore;
+  col.plant = plantColumnAt(x, z, seed, biome);
   return col;
 }
 
@@ -3317,6 +3473,11 @@ fn genCellIn(col : Col,
     }
   }
 
+  if (mat == MAT_AIR && col.plant.mat != MAT_AIR && y > col.plant.base &&
+      y <= col.plant.top) {
+    mat = col.plant.mat;
+  }
+
 
   if (mat == MAT_AIR && y == h + 1 &&       !inRim && pond < 0 && h < TREELINE &&
       wmFlag(biome, WM_BF_GROUND_FLORA) && !shore.onShore && !siteKeepOut(x, z)) {
@@ -3371,12 +3532,10 @@ fn genCellIn(col : Col,
         // common ring. Gated on the SAME roll that placed a mushroom at all, so
         // this only ever picks WHICH mushroom, never adds more of them.
         mat = select(M_TOADSTOOL, M_MUSHROOM, ((hShroom >> 13u) % 4u) == 0u);
-      } else if ((hFern % UG_FERN_CHANCE) == 0u &&
-                 fernPatch > UG_FERN_PATCH) {
-        // FERNS: the signature closed-canopy plant, and the tallest thing in
-        // this layer. Restricted to the patch mask so they form banks.
-        mat = M_FERN;
       } else if ((hBram % UG_BRAMBLE_CHANCE) == 0u && ug.cover < UG_COVER_DEEP) {
+        // (Ferns used to be next in this chain, one cell each. They are TILE
+        // plants now — plantColumnAt — and have already claimed their cells
+        // above, on the same patch mask.)
         // BRAMBLES want the HALF-lit margin, not the deep shade — they are the
         // plant of a woodland edge and a light gap. Gating them below
         // UG_COVER_DEEP is what keeps them out of the darkest interior, where
@@ -3455,32 +3614,11 @@ fn genCellIn(col : Col,
   // repeated here rather than inferred: this branch RE-DERIVES the species from
   // flowerAt instead of reading the base cell, so a guard the base block took
   // and this one did not would grow a headless stalk out of a stone floor.
-  if (mat == MAT_AIR && y > h + 1 && y <= h + FLOWER_MAX_H &&       !inRim && pond < 0 && h < TREELINE &&
-      wmFlag(biome, WM_BF_GROUND_FLORA) && !shore.onShore && !siteKeepOut(x, z)) {
-    // THE FOURTH HOIST. `UG_COVER_EDGE` is a constant and x/z are the column's,
-    // so every one of the FLOWER_MAX_H - 1 cells in this range asks flowerAt
-    // the IDENTICAL question and gets the identical answer — and flowerAt is a
-    // `biomeAt` plus three vnoise fields plus seven hashes. The guard above is
-    // entirely column-level apart from the y range, so genChunk can evaluate
-    // the whole thing once per column; `stalkValid` selects between that and
-    // the inline spelling exactly the way `caveValid`/`treeValid` do above.
-    //
-    // Validity rides IN the memo as `height < 0` rather than in a companion
-    // `stalkValid : bool`. THAT WAS AN ATTEMPT TO BUY BACK A SPILL AND IT DID
-    // NOT WORK, which is worth writing down: this kernel sits at the driver's
-    // 128-register ceiling, this package's hoists put it into local memory for
-    // the first time (+16 B, +32 B on the list entry point), and deleting the
-    // flag moved that number not at all — the spill is the hoisted state
-    // itself, not the flag beside it. It is 4-8 words against a measured
-    // -17.6% on the dispatch, so it is paid for; the spelling stays because
-    // one parameter is better than two, not because it fixed anything.
-    // `flowerAt` returns height 0 for "no flower" and >= 1 otherwise, never
-    // negative, so -1 is free to mean "nobody memoized this".
-    var fl = stalk;
-    if (fl.height < 0) { fl = flowerAt(x, z, seed, UG_COVER_EDGE); }
-    // Grass and petal are the one-cell ground layer and never stack.
-    if (fl.mat != MAT_AIR && fl.mat != M_GRASS && fl.mat != M_PETAL &&
-        (y - h) <= fl.height) {
+  if (mat == MAT_AIR && y > h + 1 && y <= h + FLOWER_MAX_H && !inRim && pond < 0 &&
+      h < TREELINE && wmFlag(biome, WM_BF_GROUND_FLORA) && !shore.onShore &&
+      !siteKeepOut(x, z)) {
+    let fl = flowerAt(x, z, seed, UG_COVER_EDGE);
+    if (fl.mat != MAT_AIR && (y - h) <= fl.height) {
       mat = fl.mat;
       // Tall grass caps its stack with the head material — dried tips at the
       // per-plant height, the way cattail_head caps the cattail stalk. Only

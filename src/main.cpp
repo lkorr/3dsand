@@ -19,6 +19,8 @@
 
 #include "audio/cues.h"
 #include "game/avatar.h"
+#include "sim/trample.h"
+#include "sim/plants.h"
 #include "game/bodyreg.h"
 #include "game/brush.h"
 #include "game/persist.h"
@@ -1434,13 +1436,69 @@ int RunShots(GpuContext& ctx, World& world, Simulation& sim) {
         r ^= r >> 13; r *= 0x9E3779B9u; r ^= r >> 16;
         uint32_t roll = r % 100u;
         uint32_t mat;
-        if (roll < 55u) { mat = kMatGrassTuft; }
-        else if (roll < 62u) { mat = kMatFlowerPoppy; }
-        else if (roll < 68u) { mat = kMatFlowerDaisy; }
-        else if (roll < 72u) { mat = kMatFoliageBush; }
+        int height = 1;
+        // The close camera stands at (-16, -16): nothing within three cells
+        // of it, or the frame is the inside of whatever grew there.
+        if (dx >= -19 && dx <= -13 && dz >= -19 && dz <= -13) continue;
+        // The near quadrant (dz > 6) is a tall-grass stand so the close shot
+        // has blades at eye level; the rest is lawn with flowers in it.
+        if (dz > 6 && roll < 80u) {
+          mat = kMatTallGrass;
+          height = 4 + (int)((r >> 8u) % 5u);
+        } else if (roll < 50u) { mat = kMatGrassTuft; height = 1 + (int)((r >> 9u) & 1u); }
+        else if (roll < 55u) { mat = kMatFlowerPoppy; height = 3; }
+        else if (roll < 60u) { mat = kMatFlowerDaisy; height = 2 + (int)((r >> 9u) & 1u); }
+        else if (roll < 63u) { mat = kMatFlowerFoxglove; height = 5 + (int)((r >> 9u) % 3u); }
+        else if (roll < 67u) { mat = kMatFlowerBluebell; height = 2 + (int)((r >> 9u) & 1u); }
+        else if (roll < 71u) { mat = kMatFlowerButtercup; height = 2; }
+        else if (roll < 73u) { mat = kMatFoliageBush; }
         else { continue; }  // bare ground between the tufts
-        // Same word rules as a brush paint on a solid: state 0, unstamped.
-        flora.push_back({World::SlotCellIndex(c), PackVoxNew(mat, 0u)});
+        for (int k = 0; k < height; k++) {
+          IVec3 ck{wx, gh + 1 + k, wz};
+          if (!world.CellInWindow(ck)) continue;
+          uint32_t m = mat;
+          if (mat == kMatTallGrass && k == height - 1) m = kMatTallGrassHead;
+          // Same word rules as a brush paint on a solid: state 0, unstamped.
+          flora.push_back({World::SlotCellIndex(ck), PackVoxNew(m, 0u)});
+        }
+      }
+    }
+    // TILE PLANTS: a fern bank and two big toadstools on the far side, and a
+    // ring of small mushrooms, placed exactly where the renderer will rebuild
+    // them (sim/plants.h is the CPU twin of plantTileAt).
+    {
+      auto paintTile = [&](int tx, int tz, uint32_t salt, int tile, int foot, int minH,
+                           int maxH, uint32_t mat) {
+        PlantTileCpu pt = PlantTileAtCpu(tx * tile, tz * tile, kDefaultSeed, salt,
+                                         tile, foot, minH, maxH, 100u);
+        int hc = World::TerrainHeight(pt.cx, pt.cz, kDefaultSeed);
+        int half = foot / 2;
+        for (int dz = -half; dz <= half; dz++)
+          for (int dx = -half; dx <= half; dx++)
+            for (int k = 1; k <= pt.h; k++) {
+              IVec3 c{pt.cx + dx, hc + k, pt.cz + dz};
+              if (!world.CellInWindow(c)) continue;
+              flora.push_back({World::SlotCellIndex(c), PackVoxNew(mat, 0u)});
+            }
+      };
+      for (int tz = -4; tz <= -2; tz++)
+        for (int tx = 0; tx <= 3; tx++)
+          paintTile((gx / kPlantFernTile) + tx, (gz / kPlantFernTile) + tz,
+                    kPlantFernSalt, kPlantFernTile, kPlantFernFoot, kPlantFernMinH,
+                    kPlantFernMaxH, kMatFern);
+      paintTile((gx / kPlantShroomTile) - 1, (gz / kPlantShroomTile) - 1,
+                kPlantShroomSalt, kPlantShroomTile, kPlantShroomFoot,
+                kPlantShroomMinH, kPlantShroomMaxH, kMatMushroomLarge);
+      paintTile((gx / kPlantShroomTile) + 1, (gz / kPlantShroomTile) - 2,
+                kPlantShroomSalt, kPlantShroomTile, kPlantShroomFoot,
+                kPlantShroomMinH, kPlantShroomMaxH, kMatMushroomLarge);
+      for (int i = 0; i < 12; i++) {
+        int wx = gx - 12 + (i * 7) % 11, wz = gz - 14 + (i * 5) % 7;
+        int gh = World::TerrainHeight(wx, wz, kDefaultSeed);
+        IVec3 c{wx, gh + 1, wz};
+        if (!world.CellInWindow(c)) continue;
+        flora.push_back({World::SlotCellIndex(c),
+                         PackVoxNew((i & 1) ? kMatMushroomCluster : kMatToadstoolPale, 0u)});
       }
     }
     for (uint32_t t = 133; t <= 136; t++)
@@ -1455,7 +1513,10 @@ int RunShots(GpuContext& ctx, World& world, Simulation& sim) {
     // Above the tips looking down the slope: close enough that individual
     // blades and petals resolve, but OUT of the grass — a camera at tuft height
     // sits inside a blade and the frame is one green wall.
-    render({(float)(gx - 16), (float)(mh + 7), (float)(gz - 16)}, 0.785f, -0.32f,
+    // On the CAMERA's own column: the datum moved with the terrain overhaul
+    // and mh + 7 at (-16, -16) was a lens buried in the hillside.
+    const int ch = World::TerrainHeight(gx - 16, gz - 16, kDefaultSeed);
+    render({(float)(gx - 16), (float)(ch + 8), (float)(gz - 16)}, 0.785f, -0.28f,
            "screenshot_micro.bmp");
     // High and back: crosses TUNE_MICRO_LOD_DIST inside one frame, so the
     // near/far handoff is visible as a single image rather than two shots.
@@ -5176,6 +5237,38 @@ int main(int argc, char** argv) {
         WaveImpacts().Add(player.pos.x, player.pos.z, (float)now, amp);
       }
       wasInLiquid = player.inLiquid;
+    }
+    // ---- the trample ring: feet on the plants ------------------------------
+    // Every grounded presser lays or refreshes a footprint stamp under itself
+    // each frame (sim/trample.h); the plants read the ring at their base and
+    // flatten under it, then spring back over render.trampleRecover seconds.
+    // The avatar is the player and is NOT in mobs_, so it is not counted
+    // twice. A mob's stamp is its collision footprint, not its art, so a bird
+    // overhead presses nothing — trampleAt also rejects stamps whose ground
+    // level is far from the plant's base.
+    {
+      const Tuning& trTun = CurrentTuning();
+      TrampleRing& tr = Tramples();
+      if (player.grounded) {
+        tr.Press(player.pos.x, player.pos.z, player.pos.y - Player::kHalfY,
+                 Player::kHalfXZ * trTun.render.trampleRadius, 1.0f, (float)now);
+      }
+      for (uint32_t i = 0; i < mobs.MobCount(); i++) {
+        const Mob* m = mobs.MobAt(i);
+        if (!m || !m->Alive() || !m->Def()) continue;
+        // origin_.y is NOT the live height: a walking mob keeps its foot
+        // height in bodyY_ (the ground probe writes it) and origin_.y is the
+        // spawn value, so a stamp at Origin().y sat metres off the plants'
+        // base and trampleAt's ground band rejected every one of them.
+        const Vec3 o = m->Origin();
+        const Vec3 s = m->Def()->worldSize;
+        const float half = std::max(s.x, s.z) * 0.5f;
+        if (half <= 0.0f) continue;
+        tr.Press(o.x + s.x * 0.5f, o.z + s.z * 0.5f, m->BodyY(),
+                 half * trTun.render.trampleRadius,
+                 std::min(1.0f, 0.5f + half * 0.15f), (float)now);
+      }
+      tr.Expire((float)now, trTun.render.trampleRecover);
     }
     // --autofly-surface altitude pin. Held analytically against the worldgen
     // heightfield rather than flown, so the measured quantity (ray length

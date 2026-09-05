@@ -246,13 +246,124 @@ const MICROF_JITTER : u32 = 2u;  // hash-keyed sub-cell XZ offset
 // yaw/jitter identity hash per-COLUMN instead of per-cell, because swaying
 // materials are the ones worldgen stacks into multi-cell plants.
 const MICROF_SWAY   : u32 = 4u;  // per-column wind bend (render-only)
-// Analytic strand plants: no brick, the pool holds parametric blade params and
-// traceStrands (raymarch.wgsl) intersects each blade in closed form. Always
-// set together with MICROF_SWAY (the plant-extent probes key on it).
-const MICROF_STRANDS : u32 = 8u; // parametric blades, no brick
+// Analytic plants: no brick. The pool holds a PlantDef (kind, palette
+// materials, tile geometry and 16 f32 params — see LoadMicroVox) and
+// tracePlant (raymarch.wgsl) intersects the plant's primitives in closed form:
+// tapered blades, ellipsoid caps, cone stems, leafleted fronds. Always set
+// together with MICROF_SWAY (the plant-extent probes key on it).
+const MICROF_PLANT : u32 = 8u;   // parametric plant, no brick
 
 fn microFrameCount(b : MicroBrick) -> u32 { return b.frameInfo & 0xFFu; }
 fn microPeriod(b : MicroBrick) -> u32 { return b.frameInfo >> 8u; }
+
+// ---- TILE PLANTS: one plant per tile, shared by worldgen and the renderer --
+// A COLUMN plant (grass, a flower) lives in one column and every cell of the
+// column rebuilds it from the column hash. A TILE plant (a fern, a knee-high
+// toadstool) is wider than a cell, so worldgen paints its whole footprint —
+// foot x foot columns, base+1..base+H cells — with the plant material and the
+// renderer reconstructs the SAME plant from the tile hash in every one of
+// those cells. This function is the one place both sides ask "which plant,
+// where". Integer-only (worldgen is a sim kernel, rule 1).
+//
+// The footprint is centred on a hashed cell strictly INSIDE the tile, so two
+// tiles' footprints can never overlap and a cell belongs to at most one plant.
+// `h` is the plant's height in cells; `rnd` its per-plant variation hash.
+struct PlantTile {
+  present : bool,
+  cx : i32,     // centre column, world voxels
+  cz : i32,
+  h  : i32,     // cells above the base: cells base+1 .. base+h are plant
+  rnd : u32,
+};
+fn plantFdiv(a : i32, b : i32) -> i32 {
+  return select(a / b, (a - b + 1) / b, a < 0);
+}
+fn plantTileAt(x : i32, z : i32, seed : u32, salt : u32, tile : i32,
+               foot : i32, minH : i32, maxH : i32, chancePct : u32)
+    -> PlantTile {
+  var t : PlantTile;
+  t.present = false;
+  let tx = plantFdiv(x, tile);
+  let tz = plantFdiv(z, tile);
+  let r = hash3(seed ^ salt, bitcast<u32>(tx), bitcast<u32>(tz));
+  t.rnd = r;
+  let half = foot / 2;
+  // Centre anywhere the footprint still fits inside the tile.
+  let span = max(tile - 2 * half, 1);
+  t.cx = tx * tile + half + i32((r >> 4u) % u32(span));
+  t.cz = tz * tile + half + i32((r >> 12u) % u32(span));
+  t.h = minH + i32((r >> 20u) % u32(max(maxH - minH + 1, 1)));
+  t.present = (r % 100u) < chancePct;
+  return t;
+}
+// Species tile constants — shared by worldgen (placement) and raymarch
+// (reconstruction). Change one and both sides move together; this is why they
+// are here rather than in the materials JSON or in worldgen.wgsl.
+const PLANT_FERN_SALT   : u32 = 0xFE21u;
+const PLANT_FERN_TILE   : i32 = 7;
+const PLANT_FERN_FOOT   : i32 = 5;
+const PLANT_FERN_MINH   : i32 = 3;
+const PLANT_FERN_MAXH   : i32 = 5;
+const PLANT_SHROOM_SALT : u32 = 0x5A1Cu;
+const PLANT_SHROOM_TILE : i32 = 7;
+const PLANT_SHROOM_FOOT : i32 = 3;
+const PLANT_SHROOM_MINH : i32 = 2;
+const PLANT_SHROOM_MAXH : i32 = 3;
+// Tallest tile plant, for worldgen's cell-range gate.
+const PLANT_TILE_MAXH   : i32 = 5;
+
+// ---- THE TRAMPLE FIELD (render-only) ---------------------------------------
+// Footprint stamps from the player and the mobs ride RenderParams exactly the
+// way the wave impacts do. A stamp is a disc on the ground: while it is being
+// pressed (time < tEnd) a plant under it is flat; after the presser leaves it
+// springs back over TUNE_TRAMPLE_RECOVER seconds. The plants read this at
+// their base and compress + lean away from the centre (tracePlant).
+//
+// Returns (dirX, dirZ, amount): the unit XZ direction AWAY from the strongest
+// stamp and its 0..1 flatten amount. Zero everywhere outside the union AABB,
+// which is what makes a world with nobody walking in it cost one compare.
+//
+// BY POINTER, like windPrimAt: it dynamically indexes a uniform array, and a
+// by-value RenderParams here would spill 2 KB of scratch per call in the
+// per-cell plant path (DESIGN.md §12, "the price of riding the uniform").
+fn trampleAt(p : vec3f, R : ptr<uniform, RenderParams>) -> vec3f {
+  if ((*R).trampleCount == 0u) { return vec3f(0.0); }
+  if (any(p < (*R).trampleLo) || any(p > (*R).trampleHi)) { return vec3f(0.0); }
+  var best = 0.0;
+  var dir = vec2f(1.0, 0.0);
+  let now = (*R).time;
+  for (var i = 0u; i < (*R).trampleCount; i++) {
+    let a = (*R).tramples[i * 2u];        // x, z, y, radius
+    let b = (*R).tramples[i * 2u + 1u];   // t0, tEnd, strength, -
+    let d = p.xz - a.xy;
+    let d2 = dot(d, d);
+    let r2 = a.w * a.w;
+    if (d2 >= r2) { continue; }
+    // Only plants whose base sits at the foot's ground level: a stamp on a
+    // ledge must not flatten the grass at the cliff foot below it.
+    let dy = p.y - a.z;
+    if (dy < -1.5 || dy > 3.0) { continue; }
+    // Radial profile: flat under the foot, soft rim (1 - q^2 in q = r^2/R^2).
+    let q = d2 / r2;
+    let fall = 1.0 - q * q;
+    // Envelope: quick press-in from t0, held to tEnd, then a recovery that is
+    // fastest at first — grass springs up and then settles.
+    let press = clamp((now - b.x) / 0.12, 0.0, 1.0);
+    var env = 1.0;
+    let rel = now - b.y;
+    if (rel > 0.0) {
+      let r = rel / TUNE_TRAMPLE_RECOVER;
+      if (r >= 1.0) { continue; }
+      env = (1.0 - r) * (1.0 - r);
+    }
+    let amt = fall * press * env * b.z;
+    if (amt > best) {
+      best = amt;
+      dir = select(d * inverseSqrt(max(d2, 1e-6)), vec2f(1.0, 0.0), d2 < 1e-6);
+    }
+  }
+  return vec3f(dir, best);
+}
 
 // ---- dynamic microvoxel BODIES (docs/PLAN_voxel_editor.md §C) --------------
 // A mob limb authored at "scale": 2|4 keeps its voxels in MICRO units and is
@@ -1041,6 +1152,18 @@ struct RenderParams {
   _pwi1 : u32,
   _pwi2 : u32,
   waveImpacts : array<vec4f, 16>,   // WAVE_IMPACT_CAP
+  // ---- the trample field (must match RenderParams in world.h) -------------
+  // Footprint stamps from the player and the mobs; see trampleAt(). Two vec4
+  // per stamp: [x, z, y, radius] then [t0, tEnd, strength, 0]. Render-only.
+  trampleCount : u32,
+  _ptr0 : u32,
+  _ptr1 : u32,
+  _ptr2 : u32,
+  trampleLo : vec3f,
+  _ptr3 : f32,
+  trampleHi : vec3f,
+  _ptr4 : f32,
+  tramples : array<vec4f, 96>,   // 2 * kTrampleCap (48)
   // ---- shadow cache (must match RenderParams in world.h) ----
   // frameIdx is the RENDER frame counter, not `tick` (30 Hz, several frames per
   // tick) and not `time` (a float that cannot be compared for equality). Only

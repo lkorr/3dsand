@@ -220,8 +220,8 @@ def main():
     # Two frames each, differing only by the lean, so the shore breathes. The
     # frame DURATIONS live in the "micro" block in materials.json, not here —
     # .vox cannot carry timing.
-    write_vox(os.path.join(out, "marsh_grass.vox"), size,
-              [marsh_grass(1), marsh_grass(-1)])
+    # marsh_grass is an analytic `plant` block since 2026-09-04 (tracePlant in
+    # raymarch.wgsl); marsh_grass() above is reference art only.
     write_vox(os.path.join(out, "water_iris.vox"), size,
               [water_iris(0), water_iris(1)])
     print("wrote assets/microvox/{marsh_grass,water_iris}.vox")
