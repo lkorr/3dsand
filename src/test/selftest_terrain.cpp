@@ -398,14 +398,20 @@ PassAOut PassA(World& world, uint32_t seed, std::string* log) {
       }
   }
 
-  // A5 — treeline bracketing.
+  // A5 — treeline bracketing. Against the FAR transects' band, not the home
+  // region's: since the world map (P4) the ground within 2 km of the origin
+  // is whatever the map paints there -- flat forest by design, with the
+  // snowline where alpine is painted -- so "the treeline is inside the
+  // surface band around spawn" stopped being a property of a sane world.
+  // What still must hold is that the treeline is reachable SOMEWHERE the
+  // transects see: below it there are trees, above it there is snow.
   {
     const int treeline = CurrentTuning().worldgen.treeline;
-    if ((double)treeline <= o.hP5 || (double)treeline >= o.hP95) {
+    if (treeline <= o.farMin || treeline >= o.farMax) {
       o.ok = false;
-      o.why += Format("%streeline y%d outside the p5..p95 surface band "
-                      "y%.0f..y%.0f (a world with no trees, or nothing but)",
-                      o.why.empty() ? "" : "; ", treeline, o.hP5, o.hP95);
+      o.why += Format("%streeline y%d outside the far-transect surface band "
+                      "y%d..y%d (a world with no trees, or nothing but)",
+                      o.why.empty() ? "" : "; ", treeline, o.farMin, o.farMax);
     }
   }
 

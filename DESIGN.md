@@ -6725,6 +6725,27 @@ the one model modders already read (PLAN_biomes.md §2 has the survey).
   rename). The page shows the planes as painted; the Worldgen tab's
   heightmap/voxel views show what worldgen makes of them. Every save moves
   the world hash; the engine reads the map at boot, so regenerate to see it.
+* **LIVE (world map P4, 2026-09-04): THE LANDFORM PLANE OWNS THE CONTINENTAL
+  RUNG, and the sea is a plane.** `landAt`'s `o0` is `landformOctave(x, z)`
+  on both mirrors: `dev = ((mapLandformQ8 - 32768) * contAmplitude) >> 16`,
+  so `worldgen.contAmplitude` still says how tall the world is (one landform
+  unit = amplitude/256 voxels, 4 at the default) and the map says WHERE;
+  the gradient feeding the finer rungs' domain warp is the cell-to-cell
+  difference of the plane. `mapLandformQ8` is a Q8 bilinear over the four
+  cells around the column (cell value = its centre), clamped at the plane's
+  edge and faded to 0 over `oceanFadeCells` beyond it; it and `seaLevelY()`
+  live OUTSIDE the height mirror in both languages and the mirrored code
+  calls them by name (the `terrain` gate's C1 is the per-voxel proof). The
+  range/hill/detail/grain octaves and the spawn-plain fade are unchanged.
+  **The sea**: `landColumnBare` fills `fluid = water, fluidTop = seaLevelY`
+  wherever ground is under the map's `seaLevelY` (one global plane,
+  `RESEARCH_worldgen` §6.5 option (a)); the sediment wedge is zero under
+  it; `TerrainColumn` reports the sea as water. Landform units are coarse
+  against the fine octaves' ±84-voxel dip, so a painted map has to keep
+  land ≥ ~132 above a sea level of 112 — the default map does; the World
+  map page's landform brush is where that is authored. `LAVA_LID` is not
+  needed yet: no biome record carves caves under the sea (ocean's cave
+  thresholds are 255) and lava only pools in caves.
 * **LIVE: the biome band strip** on the climate section — the three worldgen
   thresholds (`meadowThreshold` / `pineThreshold` / `desertThreshold`) as one
   draggable bar writing `tuning.json`.

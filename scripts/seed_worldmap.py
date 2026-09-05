@@ -75,23 +75,27 @@ for cz in range(H):
         n1 = fbm(cx, cz, 18, 21) - 0.5   # +-0.5 regional wobble
         n2 = fbm(cx, cz, 9, 31) - 0.5
         b = B['forest']
-        relief = 128
+        relief = 134
         if north + n1 * 0.6 > 0.42:
-            b = B['tundra']; relief = 150
+            b = B['tundra']; relief = 144
         elif east + n1 * 0.5 > 0.45:
-            b = B['desert']; relief = 110
+            b = B['desert']; relief = 136
         elif dx < -8 and north > 0.10 and north + n2 * 0.8 < 0.55 and (-east) + n1 * 0.7 > 0.30:
             b = B['alpine']; relief = 225
         elif east + n2 * 0.6 > 0.12 and north + n1 * 0.6 < -0.28:
-            b = B['swamp']; relief = 92
+            b = B['swamp']; relief = 116
         elif north + n2 * 0.5 > 0.22:
-            b = B['pine']; relief = 150
+            b = B['pine']; relief = 154
         elif n2 > 0.27:
-            b = B['meadow']; relief = 122
+            b = B['meadow']; relief = 134
+        # LANDFORM UNITS: contAmplitude 1024 makes one unit 4 voxels (0.4 m) about
+        # 128, and the finer octaves dip up to ~84 voxels, so land must sit >= 132
+        # to stay above seaLevelY 112 everywhere (swamp at 116 floods in its lows
+        # on purpose). Ocean <= 40 is 350+ voxels down.
         # the harness region: today's fixtures were written against this ground
         if abs(dx) <= 2 and abs(dz) <= 2:
-            b = B['forest']; relief = 128
-        relief += int(round((fbm(cx, cz, 6, 41) - 0.5) * 24))
+            b = B['forest']; relief = 134
+        relief += int(round((fbm(cx, cz, 6, 41) - 0.5) * 8))
         biome[i] = b
         land[i] = max(0, min(255, relief))
 
@@ -102,7 +106,7 @@ meta = {
     "cellLog2": CELL_LOG2,
     "size": [W, H],
     "originCell": list(ORIGIN),
-    "seaLevelY": 190,
+    "seaLevelY": 112,
     "oceanFadeCells": FADE,
     "warpAmpVox": 160,
     "biomes": BIOMES,

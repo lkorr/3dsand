@@ -788,6 +788,20 @@ fn octave(x : i32, z : i32, csl : u32, amp : i32,
   return o;
 }
 
+// The continental rung, FROM THE MAP (P4): where the old o0 octave sampled
+// noise at contLog2, this reads the painted landform plane. contAmplitude
+// keeps its meaning -- the height span the full 0..255 landform range maps
+// to, centred on 128 -- so the knob still says how tall the world is and the
+// map says where. Its own function inside the mirror so the two sides spell
+// the same three lines; the plane readers it calls live outside it.
+fn landformOctave(x : i32, z : i32) -> Oct {
+  var o : Oct;
+  o.dev = ((mapLandformQ8(x, z) - 32768) * TUNE_CONT_AMPLITUDE) >> 16;
+  o.gx = mapLandformGx(x, z);
+  o.gz = mapLandformGz(x, z);
+  return o;
+}
+
 fn landAt(x : i32, z : i32, seed : u32) -> Land {
   // ---- five octaves, lacunarity 4, persistence 1/4 ----
   // Every rung has the same amplitude/wavelength ratio of 0.5, which is the
@@ -795,7 +809,7 @@ fn landAt(x : i32, z : i32, seed : u32) -> Land {
   // everything coarser than it, so the accumulation order below is load-bearing
   // and is written out rather than looped — world.cpp has to mirror it, and a
   // mirror of "whatever the compiler unrolled" is not a mirror.
-  let o0 = octave(x, z, TUNE_CONT_LOG2,   TUNE_CONT_AMPLITUDE,   0, 0, seed ^ 1u);
+  let o0 = landformOctave(x, z);
   let o1 = octave(x, z, TUNE_RANGE_LOG2,  TUNE_RANGE_AMPLITUDE,
                   o0.gx, o0.gz, seed ^ 2u);
   // ---- THE PER-BIOME HEIGHT CURVE (13.3.3) ----
@@ -889,6 +903,7 @@ fn landAt(x : i32, z : i32, seed : u32) -> Land {
   sed = (max(sed, 0) * max(TUNE_SED_SLOPE - slope, 0)) /
         max(TUNE_SED_SLOPE, 1);
   sed = clamp(sed, 0, TUNE_SED_MAX);
+  if (bed < seaLevelY()) { sed = 0; }
 
   var l : Land;
   l.h = bed + sed;
@@ -1416,6 +1431,78 @@ fn inHarness(x : i32, z : i32) -> bool {
 fn crownMeetsHarness(wx : i32, wz : i32, r : i32) -> bool {
   return wx + r >= i32(worldMap[WM_H_HARNESS_X0]) && wx - r <= i32(worldMap[WM_H_HARNESS_X1]) &&
          wz + r >= i32(worldMap[WM_H_HARNESS_Z0]) && wz - r <= i32(worldMap[WM_H_HARNESS_Z1]);
+}
+
+// ---- THE LANDFORM PLANE (P4): the map owns the continental rung -----------
+// These are the ONLY readers of the landform plane and the sea level, and
+// they sit OUTSIDE the height mirror on purpose: the mirrored landAt calls
+// landformOctave()/seaLevelY() by name and the C++ twins (world.cpp, same
+// names, same arithmetic over the same bytes) are what World::TerrainHeight
+// runs. The `terrain` gate's C1 pass proves the two agree per voxel; the
+// token compare only has to see the call.
+//
+// Tier A, no seed: the plane is where the mountains ARE. Q8 bilinear over
+// the four cells around the column; outside the painted planes the value
+// fades to 0 (the ocean floor) over WM_H_OCEAN_FADE cells, so past the
+// coast the ground keeps falling and the sea fill below takes over. Clamped
+// reads: a cell index past the edge reads the edge cell, never the next
+// row, and the same clamp is spelled in the C++ twin.
+fn seaLevelY() -> i32 { return i32(worldMap[WM_H_SEA_LEVEL_Y]); }
+fn wmLandformCellQ8(cx : i32, cz : i32) -> i32 {
+  let w = i32(worldMap[WM_H_WIDTH]);
+  let h = i32(worldMap[WM_H_HEIGHT]);
+  let c = vec2<i32>(clamp(cx, 0, w - 1), clamp(cz, 0, h - 1));
+  return i32(wmPlaneAt(worldMap[WM_H_LANDFORM_PLANE], c.x, c.y)) << 8;
+}
+// Q8 landform at a column: 0..65280. Bilinear over the cell's four corners
+// (the cell value is its CENTRE), then the ocean fade past the plane's edge.
+fn mapLandformQ8(x : i32, z : i32) -> i32 {
+  if (worldMap[WM_H_LANDFORM_PLANE] == 0u) { return 32768; }   // no planes: flat
+  let l = worldMap[WM_H_CELL_LOG2];
+  let half = 1 << (l - 1u);
+  let mx = x - half + (i32(worldMap[WM_H_ORIGIN_X]) << l);
+  let mz = z - half + (i32(worldMap[WM_H_ORIGIN_Z]) << l);
+  let cx = mx >> l;
+  let cz = mz >> l;
+  let mask = (1 << l) - 1;
+  let fx = mx & mask;
+  let fz = mz & mask;
+  let c00 = wmLandformCellQ8(cx, cz);
+  let c10 = wmLandformCellQ8(cx + 1, cz);
+  let c01 = wmLandformCellQ8(cx, cz + 1);
+  let c11 = wmLandformCellQ8(cx + 1, cz + 1);
+  let a = c00 + (((c10 - c00) * fx) >> l);
+  let b = c01 + (((c11 - c01) * fx) >> l);
+  let v = a + (((b - a) * fz) >> l);
+  // outside the plane: how many cells past the edge, then the fade
+  let w = i32(worldMap[WM_H_WIDTH]);
+  let hh = i32(worldMap[WM_H_HEIGHT]);
+  let dOut = max(max(-cx, cx + 1 - w), max(-cz, cz + 1 - hh));
+  let fade = max(i32(worldMap[WM_H_OCEAN_FADE]), 1);
+  if (dOut <= 0) { return v; }
+  return (v * max(fade - dOut, 0)) / fade;
+}
+// Gradient of the landform contribution, in the octave's Q8-per-voxel units:
+// the cell-to-cell difference of the Q8 plane, scaled by the amplitude, over
+// one cell of voxels. Piecewise constant per cell; it only feeds the domain
+// warp of the finer rungs and the sediment slope gate.
+fn mapLandformGx(x : i32, z : i32) -> i32 {
+  if (worldMap[WM_H_LANDFORM_PLANE] == 0u) { return 0; }
+  let l = worldMap[WM_H_CELL_LOG2];
+  let half = 1 << (l - 1u);
+  let cx = (x - half + (i32(worldMap[WM_H_ORIGIN_X]) << l)) >> l;
+  let cz = (z - half + (i32(worldMap[WM_H_ORIGIN_Z]) << l)) >> l;
+  let d = wmLandformCellQ8(cx + 1, cz) - wmLandformCellQ8(cx, cz);
+  return (d * TUNE_CONT_AMPLITUDE) >> (8u + l);
+}
+fn mapLandformGz(x : i32, z : i32) -> i32 {
+  if (worldMap[WM_H_LANDFORM_PLANE] == 0u) { return 0; }
+  let l = worldMap[WM_H_CELL_LOG2];
+  let half = 1 << (l - 1u);
+  let cx = (x - half + (i32(worldMap[WM_H_ORIGIN_X]) << l)) >> l;
+  let cz = (z - half + (i32(worldMap[WM_H_ORIGIN_Z]) << l)) >> l;
+  let d = wmLandformCellQ8(cx, cz + 1) - wmLandformCellQ8(cx, cz);
+  return (d * TUNE_CONT_AMPLITUDE) >> (8u + l);
 }
 // THE BIOME, from the map: Tier A (the plane) is seed-independent; the
 // boundary warp is Tier B and takes the seed, so a region's EDGE wanders per
@@ -2708,6 +2795,10 @@ fn landColumnBare(x : i32, z : i32, seed : u32) -> LandCol {
              L.near.past < TUNE_POND_BERM_WIDTH) {
     h = bermLift(h, L.near.surf, L.near.past);
   }
+  // THE SEA (P4): ground under the map's sea level is under water. One
+  // global plane (RESEARCH_worldgen 6.5's option (a)), which is what lets
+  // the ocean ring past the painted map be water without a tile scheme.
+  if (h < seaLevelY() && L.fluidTop < 0) { L.fluid = M_WATER; L.fluidTop = seaLevelY(); }
   L.h = h;
   L.sed = sed;
   return L;

@@ -1003,6 +1003,62 @@ static IV2 biomeCurve(int x, int z, int u, uint32_t seed) {
              lo.y + (((hg.y - lo.y) * w) >> 8));
 }
 
+// ---- the landform plane and the sea level, on the CPU (P4) ----------------
+// The twins of worldgen.wgsl's seaLevelY / mapLandformQ8 / mapLandformGx,Gz:
+// same arithmetic over the same bytes (worldmap::CurrentWorldMap()). Outside
+// the height mirror on both sides; the mirrored landAt calls them by name and
+// the `terrain` gate's C1 pass is the per-voxel proof they agree.
+static int seaLevelY() { return worldmap::CurrentWorldMap().seaLevelY; }
+static int wmLandformCellQ8(int cx, int cz) {
+  const worldmap::WorldMapData& m = worldmap::CurrentWorldMap();
+  const int x = std::clamp(cx, 0, m.width - 1), z = std::clamp(cz, 0, m.height - 1);
+  return (int)m.landform[(size_t)z * m.width + x] << 8;
+}
+static int mapLandformQ8(int x, int z) {
+  const worldmap::WorldMapData& m = worldmap::CurrentWorldMap();
+  if (!m.Loaded()) return 32768;
+  const uint32_t l = (uint32_t)m.cellLog2;
+  const int half = 1 << (l - 1u);
+  const int mx = x - half + (m.originCellX << l);
+  const int mz = z - half + (m.originCellZ << l);
+  const int cx = mx >> l;
+  const int cz = mz >> l;
+  const int mask = (1 << l) - 1;
+  const int fx = mx & mask;
+  const int fz = mz & mask;
+  const int c00 = wmLandformCellQ8(cx, cz);
+  const int c10 = wmLandformCellQ8(cx + 1, cz);
+  const int c01 = wmLandformCellQ8(cx, cz + 1);
+  const int c11 = wmLandformCellQ8(cx + 1, cz + 1);
+  const int a = c00 + (((c10 - c00) * fx) >> l);
+  const int b = c01 + (((c11 - c01) * fx) >> l);
+  const int v = a + (((b - a) * fz) >> l);
+  const int dOut = std::max(std::max(-cx, cx + 1 - m.width), std::max(-cz, cz + 1 - m.height));
+  const int fade = std::max(m.oceanFadeCells, 1);
+  if (dOut <= 0) return v;
+  return (v * std::max(fade - dOut, 0)) / fade;
+}
+static int mapLandformGx(int x, int z) {
+  const worldmap::WorldMapData& m = worldmap::CurrentWorldMap();
+  if (!m.Loaded()) return 0;
+  const uint32_t l = (uint32_t)m.cellLog2;
+  const int half = 1 << (l - 1u);
+  const int cx = (x - half + (m.originCellX << l)) >> l;
+  const int cz = (z - half + (m.originCellZ << l)) >> l;
+  const int d = wmLandformCellQ8(cx + 1, cz) - wmLandformCellQ8(cx, cz);
+  return (d * WG().contAmplitude) >> (8u + l);
+}
+static int mapLandformGz(int x, int z) {
+  const worldmap::WorldMapData& m = worldmap::CurrentWorldMap();
+  if (!m.Loaded()) return 0;
+  const uint32_t l = (uint32_t)m.cellLog2;
+  const int half = 1 << (l - 1u);
+  const int cx = (x - half + (m.originCellX << l)) >> l;
+  const int cz = (z - half + (m.originCellZ << l)) >> l;
+  const int d = wmLandformCellQ8(cx, cz + 1) - wmLandformCellQ8(cx, cz);
+  return (d * WG().contAmplitude) >> (8u + l);
+}
+
 // MIRROR-BEGIN height
 // The height chain, mirrored. Everything here is a pure function of (x, z,
 // seed) and of the worldgen tuning; nothing reads a material id, which is what
@@ -1034,8 +1090,16 @@ static Oct octave(int x, int z, uint32_t csl, int amp,
   o.gz = (((n.dz * amp) >> (6u + csl)) * att) >> 8;
   return o;
 }
+
+static Oct landformOctave(int x, int z) {
+  Oct o;
+  o.dev = ((mapLandformQ8(x, z) - 32768) * WG().contAmplitude) >> 16;
+  o.gx = mapLandformGx(x, z);
+  o.gz = mapLandformGz(x, z);
+  return o;
+}
 static Land landAt(int x, int z, uint32_t seed) {
-  Oct o0 = octave(x, z, WG().contLog2, WG().contAmplitude, 0, 0, seed ^ 1u);
+  Oct o0 = landformOctave(x, z);
   Oct o1 = octave(x, z, WG().rangeLog2, WG().rangeAmplitude,
                   o0.gx, o0.gz, seed ^ 2u);
   // The per-biome height curve, on the two COARSE rungs only. cv.y is the
@@ -1072,6 +1136,7 @@ static Land landAt(int x, int z, uint32_t seed) {
   sed = (std::max(sed, 0) * std::max(WG().sedSlope - slope, 0)) /
         std::max(WG().sedSlope, 1);
   sed = std::clamp(sed, 0, WG().sedMax);
+  if (bed < seaLevelY()) { sed = 0; }
 
   Land l;
   l.h = bed + sed;
@@ -1290,7 +1355,7 @@ static BareCol landColumnBare(int x, int z, uint32_t seed) {
   }
   BareCol b;
   b.h = h;
-  b.wet = (pw.y >= 0 || inRim);
+  b.wet = (pw.y >= 0 || inRim || h < seaLevelY());
   return b;
 }
 
@@ -1331,6 +1396,7 @@ World::Column World::TerrainColumn(int x, int z, uint32_t seed) {
   c.sed = (inRim || pw.y >= 0) ? 0 : l.sed;
   if (pd2 < pR * pR) c.water = poolY + vlen(24);          // the harness tarn
   else if (pw.y >= 0) c.water = pw.y;                     // a tarn
+  else if (c.h < seaLevelY()) c.water = seaLevelY();      // the sea (P4)
   return c;
 }
 
