@@ -32,6 +32,15 @@ constexpr float kPad = 16.0f;
 // The panel frame sprite's border is 8 source px = 16 screen px; content sits
 // inside it by kPad, so the header bar is flush with the frame's inner edge.
 constexpr float kFrame = 16.0f;
+// The pitch of a cell in a row of them (slot + 4), the arsenal table's gutter
+// of sort labels, how many cells a table row and a key row hold, the gap
+// between panel columns, and the grimoire's page-list width.
+constexpr float kCell = 48.0f;
+constexpr float kGutter = 68.0f;
+constexpr int kTableCols = 9;
+constexpr int kKeyCols = 10;
+constexpr float kColGap = 20.0f;
+constexpr float kListW = 160.0f;
 // Fallback portrait size, used only before main.cpp has created the offscreen
 // target (or if it failed to). The REAL size is UIState::portraitW/H, mirrored
 // out of the texture that was actually made — the image is displayed 1:1, so
@@ -121,6 +130,28 @@ void SlotRim(ImDrawList* dl, ImVec2 at, ui::SlotLook look) {
                      : look == ui::SlotLook::Hover ? ui::ColGold()
                                                    : ui::ColBronze();
   dl->AddRect(at, ImVec2(at.x + kSlot, at.y + kSlot), edge);
+}
+
+// ---- tooltips ---------------------------------------------------------------
+// Every tooltip on this screen is set in the SMALL font. The screen's own type
+// is the 26 px face beside 2x chrome, and a paragraph of it under the cursor
+// covered a third of the panel it was describing; 13 px is the same pixel
+// font at its native size — half the height, four times the words per box.
+// Wrapped at 320 px so a long description is a block and not a banner.
+void BeginTip() {
+  ImGui::BeginTooltip();
+  ImGui::PushFont(ui::FontSmall());
+  ImGui::PushTextWrapPos(320.0f);
+}
+void EndTip() {
+  ImGui::PopTextWrapPos();
+  ImGui::PopFont();
+  ImGui::EndTooltip();
+}
+void Tip(const char* text) {
+  BeginTip();
+  ImGui::TextUnformatted(text);
+  EndTip();
 }
 
 // A panel: body, frame, and the header bar inside it. Returns the y where
@@ -263,7 +294,7 @@ void ItemSlot(UIState& s, const char* id, ImVec2 at,
   }
 
   if (hovered) {
-    ImGui::BeginTooltip();
+    BeginTip();
     if (filled) {
       ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(
                                                ui::ColGoldHi()));
@@ -297,7 +328,7 @@ void ItemSlot(UIState& s, const char* id, ImVec2 at,
     } else {
       ImGui::TextDisabled("empty");
     }
-    ImGui::EndTooltip();
+    EndTip();
   }
   ImGui::PopID();
 }
@@ -347,7 +378,7 @@ void PageContents(ImDrawList* dl, ImVec2 at) {
 // through the mirror, so the box is never wrong about the glyph and a
 // modder's glyph gets one for free.
 void GlyphInfoBox(const UIState::GlyphUI& g, const char* sortName) {
-  ImGui::BeginTooltip();
+  BeginTip();
   ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(ui::ColGoldHi()));
   if (g.owned) {
     std::string up = g.id;
@@ -360,25 +391,18 @@ void GlyphInfoBox(const UIState::GlyphUI& g, const char* sortName) {
   ImGui::TextDisabled("%s . %s", sortName, g.valence.c_str());
   if (!g.owned) {
     ImGui::TextDisabled("a word you have not learned");
-    ImGui::EndTooltip();
+    EndTip();
     return;
   }
-  if (!g.desc.empty()) {
-    ImGui::PushTextWrapPos(380.0f);
-    ImGui::TextWrapped("\"%s\"", g.desc.c_str());
-    ImGui::PopTextWrapPos();
-  }
+  if (!g.desc.empty()) ImGui::TextWrapped("\"%s\"", g.desc.c_str());
   if (!g.emptyNote.empty()) ImGui::TextDisabled("%s", g.emptyNote.c_str());
   ImGui::TextDisabled("word %d%s%s", g.mana, g.tariff.empty() ? "" : " . tariff: ",
                       g.tariff.c_str());
   if (!g.axis.empty()) ImGui::TextDisabled("again: %s", g.axis.c_str());
-  if (!g.delivers.empty()) {
-    ImGui::PushTextWrapPos(380.0f);
-    ImGui::TextDisabled("delivers by: %s", g.delivers.c_str());
-    ImGui::PopTextWrapPos();
-  }
+  if (!g.delivers.empty()) ImGui::TextDisabled("delivers by: %s", g.delivers.c_str());
   if (!g.example.empty()) ImGui::TextDisabled("example: %s", g.example.c_str());
-  ImGui::EndTooltip();
+  ImGui::TextDisabled("drag onto a key to bind it, or into a page to write with it");
+  EndTip();
 }
 
 // ---- the live portrait ------------------------------------------------------
@@ -528,7 +552,9 @@ void InspectCastPicks(UIState& s, ImVec2 at, ImVec2 size) {
       dl->AddRectFilled(ImVec2(p0.x, p1.y - 2), ImVec2(p1.x, p1.y), col);
       dl->AddRectFilled(ImVec2(p0.x, p0.y), ImVec2(p0.x + 2, p1.y), col);
       dl->AddRectFilled(ImVec2(p1.x - 2, p0.y), ImVec2(p1.x, p1.y), col);
-      ImGui::SetTooltip("cast %s here", s.spellText.c_str());
+      BeginTip();
+      ImGui::Text("cast %s here", s.spellText.c_str());
+      EndTip();
     }
     if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
       s.castAtPart.pending = true;
@@ -626,6 +652,541 @@ void InjuryRow(const UIState::BodyPartUI& b) {
   ImGui::Dummy(ImVec2(0, 6));
 }
 
+// ---- the arsenal's pieces ----------------------------------------------------
+
+// The sort's name, and the order the table lists the sorts in: matter, effect,
+// operator, delivery, mod — the order a sentence is usually built in.
+const char* kSortLabel[5] = {"matter", "effect", "delivery", "mod", "operator"};
+const int kSortOrder[5] = {0, 1, 4, 2, 3};
+
+// The drag preview for a word: the cell itself, with its name beside it in
+// small type, so what is under the cursor is the thing you picked up and not
+// a line of text standing in for it.
+void WordDragPreview(const UIState::GlyphUI* g, const char* name) {
+  ImGui::Dummy(ImVec2(kSlot, kSlot));
+  ImDrawList* pd = ImGui::GetWindowDrawList();
+  const ImVec2 p = ImGui::GetItemRectMin();
+  ui::SlotSurface(pd, p, kSlot, ui::SlotLook::Filled, false);
+  if (g) GlyphContents(pd, p, *g);
+  else PageContents(pd, p);
+  ImGui::SameLine(0, 8);
+  ImGui::PushFont(ui::FontSmall());
+  ImGui::SetCursorPosY(ImGui::GetCursorPosY() + std::floor((kSlot - 13.0f) * 0.5f));
+  ImGui::TextUnformatted(name);
+  ImGui::PopFont();
+}
+
+const UIState::GlyphUI* FindGlyph(const UIState& s, const std::string& id) {
+  for (const UIState::GlyphUI& c : s.glyphsOwned)
+    if (c.id == id) return &c;
+  return nullptr;
+}
+
+const UIState::GrimoirePageUI* FindPageUI(const UIState& s, const std::string& name) {
+  for (const UIState::GrimoirePageUI& p : s.grimoirePages)
+    if (p.name == name) return &p;
+  return nullptr;
+}
+
+// One word of the table: the cell, its sort tag, its valence mark, the drag
+// out of it, and the §9 info box on hover.
+void GlyphCell(int index, const UIState::GlyphUI& g, ImDrawList* cd, ImVec2 at, int sort) {
+  ImGui::SetCursorScreenPos(at);
+  ImGui::PushID(2000 + index);
+  ImGui::InvisibleButton("##kg", ImVec2(kSlot, kSlot));
+  const bool hov = ImGui::IsItemHovered();
+  const ui::SlotLook look = hov ? ui::SlotLook::Hover : ui::SlotLook::Filled;
+  ui::SlotSurface(cd, at, kSlot, look, false);
+  SlotRim(cd, at, look);
+  GlyphContents(cd, at, g);
+  // The sort's colour as a 2 px tag on the left edge, and for an operator the
+  // valence mark in the corner: < takes the word before it, >< is infix.
+  cd->AddRectFilled(ImVec2(at.x + 2, at.y + 4), ImVec2(at.x + 4, at.y + kSlot - 4),
+                    Fade(SortColour(sort), 0.9f));
+  if (sort == 4) {
+    ImGui::PushFont(ui::FontSmall());
+    const char* mark = g.valence.find(" > ") != std::string::npos
+                           ? (g.valence.find(" < ") != std::string::npos ? "><" : ">")
+                           : "<";
+    const ImVec2 ms = ImGui::CalcTextSize(mark);
+    cd->AddText(ImVec2(at.x + kSlot - ms.x - 5, at.y + 3), Fade(ui::ColGoldPale(), 0.95f), mark);
+    ImGui::PopFont();
+  }
+  if (!g.owned)
+    cd->AddRectFilled(at, ImVec2(at.x + kSlot, at.y + kSlot), Fade(ui::ColInk(), 0.62f));
+  if (g.owned && ImGui::BeginDragDropSource()) {
+    char buf[64] = {};
+    std::snprintf(buf, sizeof buf, "%s", g.id.c_str());
+    ImGui::SetDragDropPayload(kPayloadGlyph, buf, sizeof(buf));
+    WordDragPreview(&g, g.id.c_str());
+    ImGui::EndDragDropSource();
+  }
+  if (hov) GlyphInfoBox(g, kSortLabel[sort]);
+  ImGui::PopID();
+}
+
+// The table's height for a given number of cells per row, so the caller can
+// size the child to the content and put things under it.
+float GlyphTableHeight(const UIState& s, int perRow) {
+  float h = 0;
+  for (int c = 0; c < 5; c++) {
+    int n = 0;
+    for (const UIState::GlyphUI& g : s.glyphsOwned)
+      if (g.type == kSortOrder[c]) n++;
+    if (n == 0) continue;
+    h += ((n + perRow - 1) / perRow) * kCell + 8;
+  }
+  return std::max(h, 26.0f);
+}
+
+// EVERY WORD, as a table with one band of rows per sort: the sort's name in
+// small type in a gutter on the left, its colour running down beside it, and
+// its words at nine to a row. Fifteen matter words are two rows here; in the
+// five-columns-by-sort version they were a fifteen-row column in a box that
+// showed three.
+void GlyphTable(const UIState& s, ImVec2 at, ImVec2 size, int perRow) {
+  ImGui::SetCursorScreenPos(at);
+  ImGui::BeginChild("##known", size, ImGuiChildFlags_None, ImGuiWindowFlags_NoBackground);
+  {
+    ImDrawList* cd = ImGui::GetWindowDrawList();
+    const ImVec2 base = ImGui::GetCursorScreenPos();
+    float y = base.y;
+    for (int c = 0; c < 5; c++) {
+      const int sort = kSortOrder[c];
+      int n = 0;
+      for (const UIState::GlyphUI& g : s.glyphsOwned)
+        if (g.type == sort) n++;
+      if (n == 0) continue;
+      const int rows = (n + perRow - 1) / perRow;
+      const float bandH = rows * kCell - (kCell - kSlot);
+      ImGui::PushFont(ui::FontSmall());
+      cd->AddText(ImVec2(base.x, y + 2), Fade(SortColour(sort), 1.0f), kSortLabel[sort]);
+      char cnt[16];
+      std::snprintf(cnt, sizeof cnt, "%d", n);
+      cd->AddText(ImVec2(base.x, y + 16), Fade(ui::ColParchDim(), 0.6f), cnt);
+      ImGui::PopFont();
+      cd->AddRectFilled(ImVec2(base.x + kGutter - 10, y + 2),
+                        ImVec2(base.x + kGutter - 8, y + bandH - 2),
+                        Fade(SortColour(sort), 0.55f));
+      int k = 0;
+      for (int i = 0; i < (int)s.glyphsOwned.size(); i++) {
+        const UIState::GlyphUI& g = s.glyphsOwned[i];
+        if (g.type != sort) continue;
+        const ImVec2 p(base.x + kGutter + (k % perRow) * kCell, y + (k / perRow) * kCell);
+        k++;
+        GlyphCell(i, g, cd, p, sort);
+      }
+      y += rows * kCell + 8;
+    }
+    if (s.glyphsOwned.empty()) {
+      ImGui::SetCursorScreenPos(base);
+      ImGui::TextDisabled("You know no words.");
+      y = base.y + 26;
+    }
+    ImGui::SetCursorScreenPos(base);
+    ImGui::Dummy(ImVec2(size.x, y - base.y));
+  }
+  ImGui::EndChild();
+}
+
+// BOUND: the twenty keys, bank A on the number row and bank B on Shift, each
+// a drop target for a glyph or a page and cleared by right-click. Returns the
+// height used.
+float BoundKeys(UIState& s, ImDrawList* dl, ImVec2 at, float width) {
+  const float bankGap = 4.0f;
+  for (int i = 0; i < (int)s.glyphSlots.size() && i < 20; i++) {
+    const int bank = i / 10, col = i % 10;
+    const float gx = at.x + col * kCell;
+    const float gy = at.y + bank * (kSlot + bankGap);
+    if (gx + kSlot > at.x + width) continue;
+    const std::string& id = s.glyphSlots[i];
+    const bool isPage = i < (int)s.glyphSlotKinds.size() && s.glyphSlotKinds[i] == 2;
+    ImGui::SetCursorScreenPos(ImVec2(gx, gy));
+    ImGui::PushID(1000 + i);
+    ImGui::InvisibleButton("##gs", ImVec2(kSlot, kSlot));
+    const bool hov = ImGui::IsItemHovered();
+    const UIState::GlyphUI* g = isPage ? nullptr : FindGlyph(s, id);
+    const bool filled = g || isPage;
+    const ui::SlotLook look = hov ? ui::SlotLook::Hover
+                              : filled ? ui::SlotLook::Filled
+                                       : ui::SlotLook::Empty;
+    ui::SlotSurface(dl, ImVec2(gx, gy), kSlot, look, false);
+    SlotRim(dl, ImVec2(gx, gy), look);
+    if (g) GlyphContents(dl, ImVec2(gx, gy), *g);
+    if (isPage) PageContents(dl, ImVec2(gx, gy));
+    // The bank Shift is holding is lit; the other rests.
+    if ((bank == 1) != s.glyphBankB)
+      dl->AddRectFilled(ImVec2(gx, gy), ImVec2(gx + kSlot, gy + kSlot),
+                        Fade(ui::ColInk(), 0.28f));
+    {
+      char k[6];
+      std::snprintf(k, sizeof k, bank ? "S%d" : "%d", (col + 1) % 10);
+      ui::KeyBadge(dl, ImVec2(gx + 2, gy + 2), k);
+    }
+    if (ImGui::BeginDragDropTarget()) {
+      if (const ImGuiPayload* p = ImGui::AcceptDragDropPayload(kPayloadGlyph)) {
+        s.bindGlyph.pending = true;
+        s.bindGlyph.slot = i;
+        s.bindGlyph.glyphId = (const char*)p->Data;
+        s.bindGlyph.page = false;
+      }
+      if (const ImGuiPayload* p = ImGui::AcceptDragDropPayload(kPayloadPage)) {
+        s.bindGlyph.pending = true;
+        s.bindGlyph.slot = i;
+        s.bindGlyph.glyphId = (const char*)p->Data;
+        s.bindGlyph.page = true;
+      }
+      ImGui::EndDragDropTarget();
+    }
+    // Right-click unbinds. A bound slot has to be clearable without needing
+    // somewhere to drag it TO.
+    if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Right) && !id.empty()) {
+      s.bindGlyph.pending = true;
+      s.bindGlyph.slot = i;
+      s.bindGlyph.glyphId.clear();
+      s.bindGlyph.page = false;
+    }
+    if (hov) {
+      BeginTip();
+      char key[24];
+      std::snprintf(key, sizeof key, bank ? "Shift+%d" : "%d", (col + 1) % 10);
+      if (g) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(ui::ColGoldHi()));
+        ImGui::TextUnformatted(g->id.c_str());
+        ImGui::PopStyleColor();
+        if (!g->desc.empty()) ImGui::TextDisabled("%s", g->desc.c_str());
+        ImGui::TextDisabled("%s speaks it  .  right-click to unbind", key);
+      } else if (isPage) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(ui::ColGoldHi()));
+        ImGui::Text("[%s]  a page", id.c_str());
+        ImGui::PopStyleColor();
+        const std::string& ro = i < (int)s.glyphSlotReadouts.size() ? s.glyphSlotReadouts[i] : "";
+        ImGui::TextDisabled("%s", ro.empty() ? "(a page that names nothing)" : ro.c_str());
+        ImGui::TextDisabled("%s speaks it  .  right-click to unbind", key);
+      } else {
+        ImGui::TextDisabled("%s: unbound", key);
+        ImGui::TextDisabled("drag a word or a page here");
+      }
+      EndTip();
+    }
+    ImGui::PopID();
+  }
+  return 2 * kSlot + bankGap;
+}
+
+// ---- the grimoire ---------------------------------------------------------
+//
+// A page list on the left; for the selected page a composer on the right: a
+// name, a word row you drag glyphs and pages into and reorder, the derived
+// readout, the price, and Save / Duplicate / Delete. The row is described by
+// the same DescribeSpell the live sentence uses, so the panel can never
+// disagree with the game about what a page means. Binding a page to a key is
+// a drag from the list onto the key — the twenty-badge bind row this used to
+// have set "S10" in 27 px cells of 26 px type, and was the panel's worst
+// clipped text.
+void GrimoireBody(UIState& s, ImVec2 at, ImVec2 size) {
+  // ---- the page list ----
+  ImGui::SetCursorScreenPos(at);
+  ImGui::BeginChild("##pages", ImVec2(kListW, size.y), ImGuiChildFlags_None,
+                    ImGuiWindowFlags_NoBackground);
+  {
+    ImDrawList* cd = ImGui::GetWindowDrawList();
+    const ImVec2 base = ImGui::GetCursorScreenPos();
+    const float rowW = ImGui::GetContentRegionAvail().x;
+    constexpr float kRow = 22.0f;
+    // Names in small type: a captured page is named from its readout
+    // ("fire2-trail-projectile"), which at 26 px is wider than this column.
+    ImGui::PushFont(ui::FontSmall());
+    float py = base.y;
+    {
+      ImGui::SetCursorScreenPos(ImVec2(base.x, py));
+      ImGui::PushID("newpage");
+      ImGui::InvisibleButton("##np", ImVec2(rowW, kRow));
+      const bool hov = ImGui::IsItemHovered();
+      const bool sel = s.grimoireSelected.empty();
+      if (sel)
+        cd->AddRectFilled(ImVec2(base.x, py), ImVec2(base.x + rowW, py + kRow),
+                          Fade(ui::ColGold(), 0.14f));
+      cd->AddText(ImVec2(base.x + 8, py + 4),
+                  hov || sel ? ui::ColGoldHi() : Fade(ui::ColParchDim(), 0.9f), "+ new page");
+      if (ImGui::IsItemClicked()) {
+        s.grimoireSelected.clear();
+        s.grimoireEditName.clear();
+        s.grimoireEditWords.clear();
+        s.grimoireEditDirty = false;
+      }
+      if (hov) Tip("A blank page: drag words into the row, name it, save it.");
+      ImGui::PopID();
+      py += kRow + 4;
+    }
+    for (int i = 0; i < (int)s.grimoirePages.size(); i++) {
+      const UIState::GrimoirePageUI& p = s.grimoirePages[i];
+      ImGui::SetCursorScreenPos(ImVec2(base.x, py));
+      ImGui::PushID(3000 + i);
+      ImGui::InvisibleButton("##pg", ImVec2(rowW, kRow));
+      const bool hov = ImGui::IsItemHovered();
+      const bool sel = p.name == s.grimoireSelected;
+      if (sel)
+        cd->AddRectFilled(ImVec2(base.x, py), ImVec2(base.x + rowW, py + kRow),
+                          Fade(ui::ColGold(), 0.18f));
+      // A 2 px gold tag for a starter (authored, read-only), a parchment one
+      // for the player's own; the name after it, clipped to the list.
+      cd->AddRectFilled(ImVec2(base.x, py + 4), ImVec2(base.x + 2, py + kRow - 4),
+                        p.readOnly ? Fade(ui::ColGoldDim(), 0.9f) : Fade(ui::ColParchDim(), 0.9f));
+      cd->PushClipRect(ImVec2(base.x, py), ImVec2(base.x + rowW - 2, py + kRow), true);
+      cd->AddText(ImVec2(base.x + 8, py + 4),
+                  hov || sel ? ui::ColGoldPale() : Fade(ui::ColParch(), 0.9f), p.name.c_str());
+      cd->PopClipRect();
+      if (p.dropped > 0)
+        cd->AddText(ImVec2(base.x + rowW - 12, py + 4), ui::ColBloodHi(), "?");
+      if (ImGui::IsItemClicked()) {
+        s.grimoireSelected = p.name;
+        s.grimoireEditName = p.name;
+        s.grimoireEditWords = p.words;
+        s.grimoireEditDirty = false;
+      }
+      if (ImGui::BeginDragDropSource()) {
+        char buf[64] = {};
+        std::snprintf(buf, sizeof buf, "%s", p.name.c_str());
+        ImGui::SetDragDropPayload(kPayloadPage, buf, sizeof(buf));
+        WordDragPreview(nullptr, p.name.c_str());
+        ImGui::EndDragDropSource();
+      }
+      if (hov) {
+        BeginTip();
+        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(ui::ColGoldHi()));
+        ImGui::Text("[%s]%s", p.name.c_str(), p.readOnly ? "  (authored, read-only)" : "");
+        ImGui::PopStyleColor();
+        std::string words;
+        for (const std::string& w : p.words) words += (words.empty() ? "" : " ") + w;
+        ImGui::TextUnformatted(words.c_str());
+        ImGui::TextDisabled("%s", p.readout.c_str());
+        if (p.priceUnknown) ImGui::TextDisabled("price %d + ?", p.price);
+        else ImGui::TextDisabled("price %d", p.price);
+        ImGui::TextDisabled("click to open  .  drag onto a key to bind it, or into a page's row to nest it");
+        EndTip();
+      }
+      ImGui::PopID();
+      py += kRow;
+    }
+    ImGui::PopFont();
+    ImGui::SetCursorScreenPos(base);
+    ImGui::Dummy(ImVec2(rowW, py - base.y));
+  }
+  ImGui::EndChild();
+
+  // ---- the composer ----
+  const float compX = at.x + kListW + 12;
+  const float compW = size.x - kListW - 12;
+  ImGui::SetCursorScreenPos(ImVec2(compX, at.y));
+  ImGui::BeginChild("##compose", ImVec2(compW, size.y), ImGuiChildFlags_None,
+                    ImGuiWindowFlags_NoBackground);
+  {
+    ImDrawList* cd = ImGui::GetWindowDrawList();
+    const ImVec2 base = ImGui::GetCursorScreenPos();
+    const float innerW = ImGui::GetContentRegionAvail().x;
+    const UIState::GrimoirePageUI* sel = FindPageUI(s, s.grimoireSelected);
+    const bool readOnly = sel && sel->readOnly;
+    float cy = base.y;
+    // The name.
+    {
+      char buf[64];
+      std::snprintf(buf, sizeof buf, "%s", s.grimoireEditName.c_str());
+      ImGui::SetCursorScreenPos(ImVec2(base.x, cy));
+      ImGui::PushItemWidth(innerW);
+      if (readOnly) ImGui::BeginDisabled();
+      if (ImGui::InputTextWithHint("##pagename", "name this page", buf, sizeof buf)) {
+        s.grimoireEditName = buf;
+        s.grimoireEditDirty = true;
+      }
+      if (readOnly) ImGui::EndDisabled();
+      ImGui::PopItemWidth();
+      if (ImGui::IsItemHovered())
+        Tip(readOnly ? "An authored page: copy it to edit."
+                     : "The page's name: what a bound key speaks.");
+      cy += ImGui::GetFrameHeight() + 8;
+    }
+    // The word row: every cell the page can hold, drawn whether or not it is
+    // filled, so the page's capacity is visible and the drop target is the
+    // whole row and not one trailing cell. A drop on any empty cell appends.
+    const int nWords = (int)s.grimoireEditWords.size();
+    const int cells = std::max(1, s.grimoireMaxWords);
+    const int perRow = std::max(1, (int)((innerW + (kCell - kSlot)) / kCell));
+    auto insertWord = [&](int at, const char* name) {
+      if (readOnly) return;
+      if ((int)s.grimoireEditWords.size() >= s.grimoireMaxWords) return;
+      at = std::max(0, std::min(at, (int)s.grimoireEditWords.size()));
+      s.grimoireEditWords.insert(s.grimoireEditWords.begin() + at, name);
+      s.grimoireEditDirty = true;
+    };
+    for (int i = 0; i < cells; i++) {
+      const ImVec2 p(base.x + (i % perRow) * kCell, cy + (i / perRow) * kCell);
+      ImGui::SetCursorScreenPos(p);
+      ImGui::PushID(4000 + i);
+      ImGui::InvisibleButton("##wd", ImVec2(kSlot, kSlot));
+      const bool hov = ImGui::IsItemHovered();
+      const bool has = i < nWords;
+      const ui::SlotLook look = hov ? ui::SlotLook::Hover
+                                : has ? ui::SlotLook::Filled
+                                      : ui::SlotLook::Empty;
+      ui::SlotSurface(cd, p, kSlot, look, false);
+      SlotRim(cd, p, look);
+      if (has) {
+        const std::string& w = s.grimoireEditWords[i];
+        const UIState::GlyphUI* g = FindGlyph(s, w);
+        const UIState::GrimoirePageUI* pg = g ? nullptr : FindPageUI(s, w);
+        if (g) {
+          GlyphContents(cd, p, *g);
+          cd->AddRectFilled(ImVec2(p.x + 2, p.y + 4), ImVec2(p.x + 4, p.y + kSlot - 4),
+                            Fade(SortColour(g->type), 0.9f));
+        } else if (pg) {
+          PageContents(cd, p);
+        } else {
+          cd->AddText(ImVec2(p.x + kSlot * 0.5f - 6, p.y + kSlot * 0.5f - 13), ui::ColBloodHi(), "?");
+        }
+        // Reorder: drag a word onto another cell. Drag it out of every panel
+        // and it leaves the page (the drop handler at the end of the screen).
+        if (!readOnly && ImGui::BeginDragDropSource()) {
+          int idx = i;
+          ImGui::SetDragDropPayload(kPayloadWord, &idx, sizeof idx);
+          WordDragPreview(g, w.c_str());
+          ImGui::EndDragDropSource();
+        }
+        if (hov) {
+          BeginTip();
+          ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(ui::ColGoldHi()));
+          if (g) ImGui::TextUnformatted(w.c_str());
+          else if (pg) ImGui::Text("[%s]  a page", w.c_str());
+          else ImGui::Text("%s  (a word that no longer exists)", w.c_str());
+          ImGui::PopStyleColor();
+          if (g) ImGui::TextDisabled("%s  .  %s", kSortLabel[g->type], g->desc.c_str());
+          else if (pg) ImGui::TextDisabled("%s", pg->readout.c_str());
+          if (!readOnly) ImGui::TextDisabled("drag to reorder  .  right-click or drag out to remove");
+          EndTip();
+        }
+        if (!readOnly && hov && ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
+          s.grimoireEditWords.erase(s.grimoireEditWords.begin() + i);
+          s.grimoireEditDirty = true;
+        }
+      } else if (hov) {
+        Tip(readOnly ? "An authored page: copy it to edit."
+                     : "Drop a word from the arsenal, or a page from the list, here.");
+      }
+      if (!readOnly && ImGui::BeginDragDropTarget()) {
+        if (const ImGuiPayload* p = ImGui::AcceptDragDropPayload(kPayloadGlyph))
+          insertWord(i, (const char*)p->Data);
+        if (const ImGuiPayload* p = ImGui::AcceptDragDropPayload(kPayloadPage))
+          insertWord(i, (const char*)p->Data);
+        if (const ImGuiPayload* p = ImGui::AcceptDragDropPayload(kPayloadWord)) {
+          const int from = *(const int*)p->Data;
+          if (from >= 0 && from < (int)s.grimoireEditWords.size() && from != i) {
+            const std::string w = s.grimoireEditWords[from];
+            s.grimoireEditWords.erase(s.grimoireEditWords.begin() + from);
+            const int to = std::min(i > from ? i - 1 : i, (int)s.grimoireEditWords.size());
+            s.grimoireEditWords.insert(s.grimoireEditWords.begin() + to, w);
+            s.grimoireEditDirty = true;
+          }
+        }
+        ImGui::EndDragDropTarget();
+      }
+      ImGui::PopID();
+    }
+    cy += ((cells + perRow - 1) / perRow) * kCell + 4;
+
+    // The readout and the price, in small type on a dark page: this is what
+    // the row MEANS, from main.cpp's DescribeSpell of it.
+    {
+      ImGui::PushFont(ui::FontSmall());
+      const char* ro = nWords == 0 ? "an empty page - drop words into the row above"
+                                   : s.grimoireEditReadout.empty() ? "(says nothing)"
+                                                                   : s.grimoireEditReadout.c_str();
+      const float wrapW = innerW - 20;
+      const ImVec2 ts = ImGui::CalcTextSize(ro, nullptr, false, wrapW);
+      const float boxH = std::max(2 * 13.0f, ts.y) + 12;
+      const ImVec2 a(base.x, cy), b(base.x + innerW, cy + boxH);
+      cd->AddRectFilled(a, b, Fade(ui::ColInk(), 0.42f));
+      cd->AddRectFilled(a, ImVec2(a.x + 2, b.y), Fade(ui::ColGoldDim(), 0.7f));
+      cd->AddText(ui::FontSmall(), 13.0f, ImVec2(a.x + 10, a.y + 6),
+                  nWords == 0 ? Fade(ui::ColParchDim(), 0.8f) : ui::ColParch(), ro, nullptr,
+                  wrapW);
+      cy += boxH + 6;
+      char price[96];
+      std::snprintf(price, sizeof price, "price %d%s      %d / %d words", s.grimoireEditPrice,
+                    s.grimoireEditPriceUnknown ? " + ?" : "", nWords, s.grimoireMaxWords);
+      cd->AddText(ImVec2(base.x + 2, cy), Fade(ui::ColParchDim(), 0.9f), price);
+      ImGui::PopFont();
+      cy += 20;
+    }
+
+    // Save / Duplicate / Delete, in the screen's own button. A disabled one is
+    // drawn and then dimmed: the row keeps its shape whichever page is open.
+    {
+      float bx = base.x;
+      auto button = [&](const char* id, const char* label, bool enabled) {
+        if (!enabled) ImGui::BeginDisabled();
+        const bool clicked = ui::Button(id, ImVec2(bx, cy), label, false, 80);
+        if (!enabled) {
+          ImGui::EndDisabled();
+          cd->AddRectFilled(ImGui::GetItemRectMin(), ImGui::GetItemRectMax(),
+                            Fade(ui::ColInk(), 0.45f));
+        }
+        bx = ImGui::GetItemRectMax().x + 8;
+        return clicked && enabled;
+      };
+      if (button("##save", "save", !readOnly)) {
+        s.grimoireOp.pending = true;
+        s.grimoireOp.op = UIState::GrimoireIntent::Save;
+        s.grimoireOp.name = s.grimoireEditName;
+        s.grimoireOp.words = s.grimoireEditWords;
+      }
+      if (ImGui::IsItemHovered())
+        Tip(readOnly ? "An authored page cannot be changed."
+                     : "Keep this page under this name. Refused if the name is the library's "
+                       "or the page would contain itself.");
+      if (button("##dup", "copy", sel != nullptr)) {
+        s.grimoireOp.pending = true;
+        s.grimoireOp.op = UIState::GrimoireIntent::Duplicate;
+        s.grimoireOp.name = s.grimoireSelected;
+      }
+      if (ImGui::IsItemHovered()) Tip("A copy of this page, yours to edit.");
+      if (button("##del", "delete", sel != nullptr && !readOnly)) {
+        s.grimoireOp.pending = true;
+        s.grimoireOp.op = UIState::GrimoireIntent::Delete;
+        s.grimoireOp.name = s.grimoireSelected;
+      }
+      if (ImGui::IsItemHovered())
+        Tip("Tear the page out. Keys bound to it keep its name and speak nothing.");
+      cy += ImGui::GetTextLineHeight() + 8 + 6;
+    }
+
+    // The status line: what just happened, else what to do next.
+    {
+      ImGui::PushFont(ui::FontSmall());
+      const char* msg = nullptr;
+      ImU32 col = Fade(ui::ColParchDim(), 0.85f);
+      if (!s.kitMessage.empty() && s.kitMessageAge < 4.0f) {
+        msg = s.kitMessage.c_str();
+        col = ui::ColEmber();
+      } else if (readOnly) {
+        msg = "an authored page: copy it to make one of your own";
+      } else if (s.grimoireEditDirty) {
+        msg = "unsaved";
+        col = ui::ColGoldHi();
+      } else if (!sel && nWords == 0) {
+        msg = "drag words in from the arsenal, or press = in magic mode to capture the stack";
+      }
+      if (msg) {
+        cd->AddText(ui::FontSmall(), 13.0f, ImVec2(base.x + 2, cy), col, msg, nullptr, innerW - 4);
+        cy += ImGui::CalcTextSize(msg, nullptr, false, innerW - 4).y + 4;
+      }
+      ImGui::PopFont();
+    }
+    ImGui::SetCursorScreenPos(base);
+    ImGui::Dummy(ImVec2(innerW, cy - base.y));
+  }
+  ImGui::EndChild();
+}
+
 }  // namespace
 
 void DrawInventoryScreen(UIState& s) {
@@ -649,17 +1210,24 @@ void DrawInventoryScreen(UIState& s) {
   // Room under the panels for the footer hint's tab.
   const float bottom = std::max(top + 200.0f, disp.y - 46.0f);
   const float leftX = 28.0f;
-  const float rightX = leftX + leftW + 24.0f;
-  // The right column is CAPPED, not stretched to the window. A 4x8 grid in a
-  // 1000-pixel panel is a grid floating in a sea of frame; the panel should be
-  // the size of what is in it. The cap is the widest of the two things that
-  // live there: eight bag columns, or ten bound-glyph keys.
-  const float cols = (float)std::max(1, s.bagCols);
-  const float bagW = kPad * 2 + cols * kSlot + (cols - 1) * kSlotGap;
-  const float keyW = kPad * 2 + 10 * kSlot + 9 * 6.0f;
-  const float rightWant = std::max(bagW, keyW);
-  const float rightW =
-      std::max(320.0f, std::min(rightWant, disp.x - rightX - 28.0f));
+  // The arsenal is exactly as wide as its table: a gutter of sort labels and
+  // nine cells. Ten bound keys at the same pitch fit inside that too.
+  const float arsenalW = kPad * 2 + kGutter + (kTableCols - 1) * kCell + kSlot;
+  const float midX = leftX + leftW + kColGap;
+  // The pack is exactly as tall as its grid and its hotbar; whatever column
+  // it shares gives it that and keeps the rest.
+  const float lineH = ImGui::GetTextLineHeight();
+  const float packH = kFrame + ui::kHeaderH + 14 + s.bagRows * (kSlot + kSlotGap) + 10 +
+                      (lineH + 6) + 2 + kSlot + 12 + kFrame;
+  // The third column holds the grimoire over the pack, ten cells wide (the
+  // eight-column bag fits inside), and exists only when the window has room
+  // for it beside the other two and height for a composer above the pack.
+  const float grimX = midX + arsenalW + kColGap;
+  const float grimWant = kPad * 2 + (kKeyCols - 1) * kCell + kSlot;
+  const float grimRoom = disp.x - 28.0f - grimX;
+  const bool wide = grimRoom >= grimWant && (bottom - top) >= packH + kColGap + 300.0f;
+  const float grimW = std::min(grimRoom, grimWant + 40.0f);
+  const float grimH = bottom - top - packH - kColGap;
 
   const ImGuiWindowFlags kPanelFlags =
       ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
@@ -681,6 +1249,10 @@ void DrawInventoryScreen(UIState& s) {
   stBag.darkMix = 0.34f;
   stBag.sheenPeak = 0.35f;
   stBag.bronzeAlpha = 0.12f;
+  ui::PanelStyle stGrim;
+  stGrim.darkMix = 0.36f;
+  stGrim.sheenPeak = 0.50f;
+  stGrim.bronzeAlpha = 0.10f;
 
   // ==========================================================================
   // LEFT: the character panel
@@ -705,13 +1277,12 @@ void DrawInventoryScreen(UIState& s) {
                      label, s.inspectMode, bw))
         s.inspectMode = !s.inspectMode;
       if (ImGui::IsItemHovered())
-        ImGui::SetTooltip(
-            s.inspectMode
+        Tip(s.inspectMode
                 ? "Back to equipment."
-                : "What is actually wrong with this body: per-limb hp, how\n"
-                  "much of each limb is still THERE, what is on fire, and\n"
-                  "what came off. The two are different measurements - a\n"
-                  "laser can bore a limb hollow without hurting it much.");
+                : "What is actually wrong with this body: per-limb hp, how much of "
+                  "each limb is still THERE, what is on fire, and what came off. The "
+                  "two are different measurements - a laser can bore a limb hollow "
+                  "without hurting it much.");
     }
 
     // The portrait, with a column of slots on each side.
@@ -855,481 +1426,101 @@ void DrawInventoryScreen(UIState& s) {
   ImGui::End();
 
   // ==========================================================================
-  // TOP RIGHT: the arsenal (plan §12a)
+  // THE RIGHT TWO COLUMNS: arsenal | grimoire over pack (plan §12a, §12b)
   // ==========================================================================
-  // Two rows of bound keys (bank A on the number row, bank B on Shift), then
-  // every glyph the library has, in FIVE COLUMNS BY SORT with its sort's
-  // colour and valence marks, so a player looking for "the thing that goes
-  // after fire" looks in one column. Unowned glyphs are greyed with their
-  // name hidden: the shape of a word you have not learned is visible and the
-  // word is not. Hover opens the §9 info box, every field of which comes from
-  // the glyph's JSON entry.
-  // The right column is three panels: the pack keeps the height its 4x8
-  // grid and hotbar need, the grimoire the height its composer needs, and
-  // the arsenal takes the rest (its sorted grid scrolls).
-  // The arsenal panel has TWO PAGES, glyphs and grimoire, toggled on its
-  // header the way the character panel toggles gear and condition: at 900
-  // px there is no room for a third panel in the column, and the grimoire's
-  // composer wants the arsenal's width anyway.
-  const float arsenalH = std::min(380.0f, (bottom - top) * 0.46f);
-  ImGui::SetNextWindowPos(ImVec2(rightX, top));
-  ImGui::SetNextWindowSize(ImVec2(rightW, arsenalH));
+  // The ARSENAL is a full column of its own: the twenty bound keys, then every
+  // word in the library in a table with one row-band per sort. That table is
+  // the drag SOURCE for both of the other panels, and a source you cannot see
+  // while you compose is no source — the first version put the grimoire
+  // behind a mode toggle on the arsenal, and the grid it needed vanished the
+  // moment the toggle was pressed. The GRIMOIRE sits above the PACK in a third
+  // column, so a page drags onto a key and a glyph drags into a page along one
+  // short horizontal line each. When the window has no room for a third
+  // column the old arrangement returns: the arsenal toggles between its table
+  // and the grimoire, over the pack.
+  const float arsenalH = wide ? (bottom - top) : (bottom - top - packH - kColGap);
+  ImGui::SetNextWindowPos(ImVec2(midX, top));
+  ImGui::SetNextWindowSize(ImVec2(arsenalW, arsenalH));
   ImGui::Begin("##arsenal", nullptr, kPanelFlags);
   {
     ImDrawList* dl = ImGui::GetWindowDrawList();
     const ImVec2 wp = ImGui::GetWindowPos();
     const ImVec2 ws = ImGui::GetWindowSize();
-    float y = PanelChrome(dl, wp, ws, s.grimoireMode ? "GRIMOIRE" : "ARSENAL", nullptr,
-                          stArsenal);
-    // The toggle sits on the header bar, right-aligned, like the character
-    // panel's gear/health.
-    {
-      const char* label = s.grimoireMode ? "glyphs" : "grimoire";
+    const bool grimoireHere = !wide && s.grimoireMode;
+    float y = PanelChrome(dl, wp, ws, grimoireHere ? "GRIMOIRE" : "ARSENAL",
+                          wide ? "every word you know" : nullptr, stArsenal);
+    if (!wide) {
+      // The narrow fallback's toggle, on the header bar like the character
+      // panel's gear/health.
+      const char* label = grimoireHere ? "words" : "grimoire";
       const ImVec2 ts = ImGui::CalcTextSize(label);
       const float bw = std::max(96.0f, ts.x + 24);
       if (ui::Button("##arsmode",
                      ImVec2(wp.x + ws.x - kFrame - 10 - bw,
                             wp.y + kFrame + std::floor((ui::kHeaderH - ts.y - 8) * 0.5f)),
-                     label, s.grimoireMode, bw))
+                     label, grimoireHere, bw))
         s.grimoireMode = !s.grimoireMode;
       if (ImGui::IsItemHovered())
-        ImGui::SetTooltip(s.grimoireMode
-                              ? "Back to the glyphs and the bound keys."
-                              : "Your pages: saved word lists that speak as one key.\n"
-                                "Compose one here, or press = in magic mode to capture\n"
-                                "the sentence on the stack.");
+        Tip(grimoireHere ? "Back to the words."
+                         : "Your pages: saved word lists that speak as one key.");
     }
-    if (!s.grimoireMode) {
     // The bound rows FIRST: they are the thing that matters, and they are
     // literally the number row the game is listening to.
-    y = ui::Subheading(dl, ImVec2(wp.x + kPad, y), ws.x - kPad * 2, "BOUND   1-0 / Shift+1-0");
+    y = ui::Subheading(dl, ImVec2(wp.x + kPad, y), ws.x - kPad * 2,
+                       "BOUND   1-0 / Shift+1-0");
     y += 2;
-    const float glyphSlot = kSlot;
-    const float bankGap = 4.0f;
-    for (int i = 0; i < (int)s.glyphSlots.size() && i < 20; i++) {
-      const int bank = i / 10, col = i % 10;
-      const float gx = wp.x + kPad + col * (glyphSlot + 6);
-      const float gy = y + bank * (glyphSlot + bankGap);
-      if (gx + glyphSlot > wp.x + ws.x - kPad) continue;
-      const std::string& id = s.glyphSlots[i];
-      const bool isPage = i < (int)s.glyphSlotKinds.size() && s.glyphSlotKinds[i] == 2;
-      ImGui::SetCursorScreenPos(ImVec2(gx, gy));
-      ImGui::PushID(1000 + i);
-      ImGui::InvisibleButton("##gs", ImVec2(glyphSlot, glyphSlot));
-      const bool hov = ImGui::IsItemHovered();
-      const UIState::GlyphUI* g = nullptr;
-      if (!isPage)
-        for (const UIState::GlyphUI& c : s.glyphsOwned)
-          if (c.id == id) g = &c;
-      const bool filled = g || isPage;
-      const ui::SlotLook look = hov ? ui::SlotLook::Hover
-                                : filled ? ui::SlotLook::Filled
-                                         : ui::SlotLook::Empty;
-      // The bank Shift is holding is lit; the other rests.
-      ui::SlotSurface(dl, ImVec2(gx, gy), glyphSlot, look, false);
-      SlotRim(dl, ImVec2(gx, gy), look);
-      if (g) GlyphContents(dl, ImVec2(gx, gy), *g);
-      if (isPage) PageContents(dl, ImVec2(gx, gy));
-      if ((bank == 1) != s.glyphBankB)
-        dl->AddRectFilled(ImVec2(gx, gy), ImVec2(gx + glyphSlot, gy + glyphSlot),
-                          Fade(ui::ColInk(), 0.28f));
-      {
-        char k[6];
-        std::snprintf(k, sizeof k, bank ? "S%d" : "%d", (col + 1) % 10);
-        ui::KeyBadge(dl, ImVec2(gx + 2, gy + 2), k);
-      }
-      if (ImGui::BeginDragDropTarget()) {
-        if (const ImGuiPayload* p = ImGui::AcceptDragDropPayload(kPayloadGlyph)) {
-          s.bindGlyph.pending = true;
-          s.bindGlyph.slot = i;
-          s.bindGlyph.glyphId = (const char*)p->Data;
-          s.bindGlyph.page = false;
-        }
-        if (const ImGuiPayload* p = ImGui::AcceptDragDropPayload(kPayloadPage)) {
-          s.bindGlyph.pending = true;
-          s.bindGlyph.slot = i;
-          s.bindGlyph.glyphId = (const char*)p->Data;
-          s.bindGlyph.page = true;
-        }
-        ImGui::EndDragDropTarget();
-      }
-      // Right-click unbinds. A bound slot has to be clearable without needing
-      // somewhere to drag it TO.
-      if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Right) && !id.empty()) {
-        s.bindGlyph.pending = true;
-        s.bindGlyph.slot = i;
-        s.bindGlyph.glyphId.clear();
-        s.bindGlyph.page = false;
-      }
-      if (hov) {
-        ImGui::BeginTooltip();
-        if (g) {
-          ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(ui::ColGoldHi()));
-          ImGui::TextUnformatted(g->id.c_str());
-          ImGui::PopStyleColor();
-          if (!g->desc.empty()) ImGui::TextDisabled("%s", g->desc.c_str());
-          ImGui::TextDisabled("right-click to unbind");
-        } else if (isPage) {
-          ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(ui::ColGoldHi()));
-          ImGui::Text("[%s]", id.c_str());
-          ImGui::PopStyleColor();
-          const std::string& ro = i < (int)s.glyphSlotReadouts.size() ? s.glyphSlotReadouts[i] : "";
-          ImGui::TextDisabled("%s", ro.empty() ? "(a page that names nothing)" : ro.c_str());
-          ImGui::TextDisabled("right-click to unbind");
-        } else {
-          ImGui::TextDisabled("unbound - drag a glyph or a page here");
-        }
-        ImGui::EndTooltip();
-      }
-      ImGui::PopID();
-    }
-    y += 2 * glyphSlot + bankGap + 14;
-
-    y = ui::Subheading(dl, ImVec2(wp.x + kPad, y), ws.x - kPad * 2, "BY SORT");
-    y += 2;
-
-    ImGui::SetCursorScreenPos(ImVec2(wp.x + kPad, y));
-    ImGui::BeginChild("##known", ImVec2(ws.x - kPad * 2, wp.y + ws.y - kPad - y - 4),
-                      ImGuiChildFlags_None, ImGuiWindowFlags_NoBackground);
-    {
-      ImDrawList* cd = ImGui::GetWindowDrawList();
-      const float availW = ImGui::GetContentRegionAvail().x;
-      const ImVec2 base = ImGui::GetCursorScreenPos();
-      static const char* kSortNames[5] = {"matter", "effect", "deliv", "mod", "op"};
-      static const int kColumnOrder[5] = {0, 1, 4, 2, 3};   // matter effect operator delivery mod
-      const float colW = std::floor((availW - 4 * 6.0f) / 5.0f);
-      const int perCol = std::max(1, (int)(colW / (glyphSlot + 6)));
-      int deepest = 0;
-      for (int c = 0; c < 5; c++) {
-        const int sort = kColumnOrder[c];
-        const float cx = base.x + c * (colW + 6.0f);
-        cd->AddText(ImVec2(cx + 2, base.y), Fade(ui::ColParchDim(), 0.9f), kSortNames[sort]);
-        cd->AddRectFilled(ImVec2(cx, base.y + 20), ImVec2(cx + colW, base.y + 21),
-                          Fade(SortColour(sort), 0.8f));
-        int n = 0;
-        for (int i = 0; i < (int)s.glyphsOwned.size(); i++) {
-          const UIState::GlyphUI& g = s.glyphsOwned[i];
-          if (g.type != sort) continue;
-          const float gx = cx + (n % perCol) * (glyphSlot + 6);
-          const float gy = base.y + 26 + (n / perCol) * (glyphSlot + 6);
-          n++;
-          ImGui::SetCursorScreenPos(ImVec2(gx, gy));
-          ImGui::PushID(2000 + i);
-          ImGui::InvisibleButton("##kg", ImVec2(glyphSlot, glyphSlot));
-          const bool hov = ImGui::IsItemHovered();
-          const ui::SlotLook look = hov ? ui::SlotLook::Hover : ui::SlotLook::Filled;
-          ui::SlotSurface(cd, ImVec2(gx, gy), glyphSlot, look, false);
-          SlotRim(cd, ImVec2(gx, gy), look);
-          GlyphContents(cd, ImVec2(gx, gy), g);
-          // The sort's colour as a 2 px tag on the left edge, and the valence
-          // marks in the corner: < takes the word before it, >< is infix.
-          cd->AddRectFilled(ImVec2(gx + 2, gy + 4), ImVec2(gx + 4, gy + glyphSlot - 4),
-                            Fade(SortColour(sort), 0.9f));
-          if (sort == 4)
-            cd->AddText(ImVec2(gx + glyphSlot - 16, gy + 3), Fade(ui::ColGoldPale(), 0.9f),
-                        g.valence.find(" > ") != std::string::npos ? "><" : "<");
-          if (!g.owned)
-            cd->AddRectFilled(ImVec2(gx, gy), ImVec2(gx + glyphSlot, gy + glyphSlot),
-                              Fade(ui::ColInk(), 0.62f));
-          if (g.owned && ImGui::BeginDragDropSource()) {
-            char buf[64] = {};
-            std::snprintf(buf, sizeof buf, "%s", g.id.c_str());
-            ImGui::SetDragDropPayload(kPayloadGlyph, buf, sizeof(buf));
-            ImGui::TextUnformatted(g.id.c_str());
-            ImGui::EndDragDropSource();
-          }
-          if (hov) {
-            static const char* kFull[5] = {"matter", "effect", "delivery", "mod", "operator"};
-            GlyphInfoBox(g, kFull[sort]);
-          }
-          ImGui::PopID();
-        }
-        deepest = std::max(deepest, (n + perCol - 1) / perCol);
-      }
-      if (s.glyphsOwned.empty()) {
-        ImGui::SetCursorScreenPos(base);
-        ImGui::TextDisabled("You know no glyphs.");
-      }
-      ImGui::SetCursorScreenPos(base);
-      ImGui::Dummy(ImVec2(availW, 26 + deepest * (glyphSlot + 6)));
-    }
-    ImGui::EndChild();
+    y += BoundKeys(s, dl, ImVec2(wp.x + kPad, y), ws.x - kPad * 2) + 14;
+    if (grimoireHere) {
+      GrimoireBody(s, ImVec2(wp.x + kPad, y),
+                   ImVec2(ws.x - kPad * 2, wp.y + ws.y - kPad - y));
     } else {
-    // ---- THE GRIMOIRE PAGE (plan §12b) ----
-    // A page list on the left; for the selected page a word row you drag
-    // glyphs and pages into, a name, the derived bracket readout, the price,
-    // and Save / Delete / Duplicate / bind-to-key. The row is described by the
-    // same DescribeSpell the live sentence uses, so the panel can never
-    // disagree with the game about what a page means.
-    const float listW = 150.0f;
-    const float innerH = wp.y + ws.y - kPad - y - 4;
-
-    // ---- the page list ----
-    ImGui::SetCursorScreenPos(ImVec2(wp.x + kPad, y));
-    ImGui::BeginChild("##pages", ImVec2(listW, innerH), ImGuiChildFlags_None,
-                      ImGuiWindowFlags_NoBackground);
-    {
-      ImDrawList* cd = ImGui::GetWindowDrawList();
-      const ImVec2 base = ImGui::GetCursorScreenPos();
-      float py = base.y;
-      // "+ new page" first: compose from nothing.
-      {
-        ImGui::SetCursorScreenPos(ImVec2(base.x, py));
-        ImGui::PushID("newpage");
-        ImGui::InvisibleButton("##np", ImVec2(listW - 4, 20));
-        const bool hov = ImGui::IsItemHovered();
-        cd->AddText(ImVec2(base.x + 2, py + 1), hov ? ui::ColGoldHi() : Fade(ui::ColParchDim(), 0.9f),
-                    "+ new page");
-        if (ImGui::IsItemClicked()) {
-          s.grimoireSelected.clear();
-          s.grimoireEditName.clear();
-          s.grimoireEditWords.clear();
-          s.grimoireEditDirty = false;
-        }
-        ImGui::PopID();
-        py += 24;
+      y = ui::Subheading(dl, ImVec2(wp.x + kPad, y), ws.x - kPad * 2, "EVERY WORD");
+      y += 2;
+      const float innerW = ws.x - kPad * 2;
+      const int perRow = std::max(1, (int)((innerW - kGutter + (kCell - kSlot)) / kCell));
+      const float need = GlyphTableHeight(s, perRow);
+      const float room = wp.y + ws.y - kPad - y - (wide ? 2 * 13.0f + 12 : 0.0f);
+      const float tableH = std::min(need, room);
+      GlyphTable(s, ImVec2(wp.x + kPad, y), ImVec2(innerW, tableH), perRow);
+      y += tableH + 6;
+      if (wide) {
+        // Two lines of small type under the table: the three gestures the
+        // column is for, said once where the words are.
+        ImGui::PushFont(ui::FontSmall());
+        dl->AddText(ImVec2(wp.x + kPad, y), Fade(ui::ColParchDim(), 0.8f),
+                    "drag a word onto a key to bind it  .  right-click a key to clear it");
+        dl->AddText(ImVec2(wp.x + kPad, y + 14), Fade(ui::ColParchDim(), 0.8f),
+                    "drag a word into a grimoire page to write with it  .  hover to read");
+        ImGui::PopFont();
       }
-      for (int i = 0; i < (int)s.grimoirePages.size(); i++) {
-        const UIState::GrimoirePageUI& p = s.grimoirePages[i];
-        ImGui::SetCursorScreenPos(ImVec2(base.x, py));
-        ImGui::PushID(3000 + i);
-        ImGui::InvisibleButton("##pg", ImVec2(listW - 4, 20));
-        const bool hov = ImGui::IsItemHovered();
-        const bool sel = p.name == s.grimoireSelected;
-        if (sel)
-          cd->AddRectFilled(ImVec2(base.x, py), ImVec2(base.x + listW - 4, py + 20),
-                            Fade(ui::ColGold(), 0.18f));
-        // A 2 px gold tag for a starter (authored, read-only), a parchment one
-        // for the player's own; the name after it, clipped to the list.
-        cd->AddRectFilled(ImVec2(base.x, py + 3), ImVec2(base.x + 2, py + 17),
-                          p.readOnly ? Fade(ui::ColGoldDim(), 0.9f) : Fade(ui::ColParchDim(), 0.9f));
-        cd->PushClipRect(ImVec2(base.x, py), ImVec2(base.x + listW - 6, py + 20), true);
-        cd->AddText(ImVec2(base.x + 8, py + 1),
-                    hov || sel ? ui::ColGoldPale() : Fade(ui::ColParch(), 0.9f), p.name.c_str());
-        cd->PopClipRect();
-        if (ImGui::IsItemClicked()) {
-          s.grimoireSelected = p.name;
-          s.grimoireEditName = p.name;
-          s.grimoireEditWords = p.words;
-          s.grimoireEditDirty = false;
-        }
-        if (ImGui::BeginDragDropSource()) {
-          char buf[64] = {};
-          std::snprintf(buf, sizeof buf, "%s", p.name.c_str());
-          ImGui::SetDragDropPayload(kPayloadPage, buf, sizeof(buf));
-          ImGui::Text("[%s]", p.name.c_str());
-          ImGui::EndDragDropSource();
-        }
-        if (hov) {
-          ImGui::BeginTooltip();
-          ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(ui::ColGoldHi()));
-          ImGui::Text("[%s]%s", p.name.c_str(), p.readOnly ? "  (authored, read-only)" : "");
-          ImGui::PopStyleColor();
-          std::string words;
-          for (const std::string& w : p.words) words += (words.empty() ? "" : " ") + w;
-          ImGui::TextDisabled("%s", words.c_str());
-          ImGui::TextDisabled("%s", p.readout.c_str());
-          if (p.priceUnknown) ImGui::TextDisabled("price %d + ?", p.price);
-          else ImGui::TextDisabled("price %d", p.price);
-          ImGui::TextDisabled("drag onto a key to bind, or into a word row to nest");
-          ImGui::EndTooltip();
-        }
-        ImGui::PopID();
-        py += 24;
-      }
-      ImGui::SetCursorScreenPos(base);
-      ImGui::Dummy(ImVec2(listW - 4, py - base.y));
-    }
-    ImGui::EndChild();
-
-    // ---- the composer ----
-    const float compX = wp.x + kPad + listW + 12;
-    const float compW = wp.x + ws.x - kPad - compX;
-    ImGui::SetCursorScreenPos(ImVec2(compX, y));
-    ImGui::BeginChild("##compose", ImVec2(compW, innerH), ImGuiChildFlags_None,
-                      ImGuiWindowFlags_NoBackground);
-    {
-      ImDrawList* cd = ImGui::GetWindowDrawList();
-      const ImVec2 base = ImGui::GetCursorScreenPos();
-      bool readOnly = false;
-      for (const UIState::GrimoirePageUI& p : s.grimoirePages)
-        if (p.name == s.grimoireSelected) readOnly = p.readOnly;
-      float cy = base.y;
-      // The name.
-      {
-        char buf[64];
-        std::snprintf(buf, sizeof buf, "%s", s.grimoireEditName.c_str());
-        ImGui::SetCursorScreenPos(ImVec2(base.x, cy));
-        ImGui::PushItemWidth(std::min(220.0f, compW - 8));
-        if (readOnly) ImGui::BeginDisabled();
-        if (ImGui::InputText("##pagename", buf, sizeof buf)) {
-          s.grimoireEditName = buf;
-          s.grimoireEditDirty = true;
-        }
-        if (readOnly) ImGui::EndDisabled();
-        ImGui::PopItemWidth();
-        if (ImGui::IsItemHovered())
-          ImGui::SetTooltip("%s", readOnly ? "an authored page: duplicate it to edit"
-                                           : "the page's name (what a bound key speaks)");
-        cy += 26;
-      }
-      // The word row: each word is a cell; the trailing empty cell appends.
-      const int nWords = (int)s.grimoireEditWords.size();
-      const int cells = std::min(nWords + 1, s.grimoireMaxWords);
-      const float cellStep = kSlot + 4;
-      const int perRow = std::max(1, (int)((compW + 4) / cellStep));
-      auto insertWord = [&](int at, const char* name) {
-        if (readOnly) return;
-        if ((int)s.grimoireEditWords.size() >= s.grimoireMaxWords) return;
-        at = std::max(0, std::min(at, (int)s.grimoireEditWords.size()));
-        s.grimoireEditWords.insert(s.grimoireEditWords.begin() + at, name);
-        s.grimoireEditDirty = true;
-      };
-      for (int i = 0; i < cells; i++) {
-        const float gx = base.x + (i % perRow) * cellStep;
-        const float gy = cy + (i / perRow) * cellStep;
-        ImGui::SetCursorScreenPos(ImVec2(gx, gy));
-        ImGui::PushID(4000 + i);
-        ImGui::InvisibleButton("##wd", ImVec2(kSlot, kSlot));
-        const bool hov = ImGui::IsItemHovered();
-        const bool has = i < nWords;
-        const ui::SlotLook look = hov ? ui::SlotLook::Hover : has ? ui::SlotLook::Filled : ui::SlotLook::Empty;
-        ui::SlotSurface(cd, ImVec2(gx, gy), kSlot, look, false);
-        SlotRim(cd, ImVec2(gx, gy), look);
-        if (has) {
-          const std::string& w = s.grimoireEditWords[i];
-          const UIState::GlyphUI* g = nullptr;
-          for (const UIState::GlyphUI& c : s.glyphsOwned)
-            if (c.id == w) g = &c;
-          if (g) {
-            GlyphContents(cd, ImVec2(gx, gy), *g);
-          } else {
-            bool isPage = false;
-            for (const UIState::GrimoirePageUI& p : s.grimoirePages) isPage = isPage || p.name == w;
-            if (isPage) PageContents(cd, ImVec2(gx, gy));
-            else cd->AddText(ImVec2(gx + kSlot * 0.5f - 4, gy + kSlot * 0.5f - 7), ui::ColBloodHi(), "?");
-          }
-          // Reorder: drag a word onto another cell.
-          if (!readOnly && ImGui::BeginDragDropSource()) {
-            int idx = i;
-            ImGui::SetDragDropPayload(kPayloadWord, &idx, sizeof idx);
-            ImGui::TextUnformatted(w.c_str());
-            ImGui::EndDragDropSource();
-          }
-          if (hov) {
-            ImGui::BeginTooltip();
-            ImGui::TextUnformatted(w.c_str());
-            if (!readOnly) ImGui::TextDisabled("click to remove, drag to reorder");
-            ImGui::EndTooltip();
-          }
-          if (!readOnly && hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
-              !ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
-            s.grimoireEditWords.erase(s.grimoireEditWords.begin() + i);
-            s.grimoireEditDirty = true;
-          }
-        } else if (hov) {
-          ImGui::SetTooltip("%s", readOnly ? "read-only" : "drop a glyph or a page here");
-        }
-        if (!readOnly && ImGui::BeginDragDropTarget()) {
-          if (const ImGuiPayload* p = ImGui::AcceptDragDropPayload(kPayloadGlyph))
-            insertWord(i, (const char*)p->Data);
-          if (const ImGuiPayload* p = ImGui::AcceptDragDropPayload(kPayloadPage))
-            insertWord(i, (const char*)p->Data);
-          if (const ImGuiPayload* p = ImGui::AcceptDragDropPayload(kPayloadWord)) {
-            const int from = *(const int*)p->Data;
-            if (from >= 0 && from < (int)s.grimoireEditWords.size() && from != i) {
-              const std::string w = s.grimoireEditWords[from];
-              s.grimoireEditWords.erase(s.grimoireEditWords.begin() + from);
-              const int to = std::min(i > from ? i - 1 : i, (int)s.grimoireEditWords.size());
-              s.grimoireEditWords.insert(s.grimoireEditWords.begin() + to, w);
-              s.grimoireEditDirty = true;
-            }
-          }
-          ImGui::EndDragDropTarget();
-        }
-        ImGui::PopID();
-      }
-      cy += ((cells + perRow - 1) / perRow) * cellStep + 6;
-      // The readout and the price, from main.cpp's DescribeSpell of the row.
-      {
-        const std::string ro = s.grimoireEditReadout.empty() ? "(empty page)" : s.grimoireEditReadout;
-        ImGui::SetCursorScreenPos(ImVec2(base.x, cy));
-        ImGui::PushTextWrapPos(base.x + compW - 4);
-        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(ui::ColParch()), "%s", ro.c_str());
-        ImGui::PopTextWrapPos();
-        cy = ImGui::GetCursorScreenPos().y + 2;
-        char price[64];
-        std::snprintf(price, sizeof price, "price %d%s   %d/%d words", s.grimoireEditPrice,
-                      s.grimoireEditPriceUnknown ? " + ?" : "", nWords, s.grimoireMaxWords);
-        cd->AddText(ImVec2(base.x, cy), Fade(ui::ColParchDim(), 0.9f), price);
-        cy += 20;
-      }
-      // Buttons.
-      ImGui::SetCursorScreenPos(ImVec2(base.x, cy));
-      if (readOnly) ImGui::BeginDisabled();
-      if (ImGui::SmallButton("save")) {
-        s.grimoireOp.pending = true;
-        s.grimoireOp.op = UIState::GrimoireIntent::Save;
-        s.grimoireOp.name = s.grimoireEditName;
-        s.grimoireOp.words = s.grimoireEditWords;
-      }
-      ImGui::SameLine();
-      if (ImGui::SmallButton("delete")) {
-        s.grimoireOp.pending = true;
-        s.grimoireOp.op = UIState::GrimoireIntent::Delete;
-        s.grimoireOp.name = s.grimoireSelected;
-      }
-      if (readOnly) ImGui::EndDisabled();
-      ImGui::SameLine();
-      if (s.grimoireSelected.empty()) ImGui::BeginDisabled();
-      if (ImGui::SmallButton("duplicate")) {
-        s.grimoireOp.pending = true;
-        s.grimoireOp.op = UIState::GrimoireIntent::Duplicate;
-        s.grimoireOp.name = s.grimoireSelected;
-      }
-      if (s.grimoireSelected.empty()) ImGui::EndDisabled();
-      ImGui::SameLine();
-      ImGui::TextDisabled("%s", s.grimoireEditDirty ? "unsaved" : "");
-      cy += 24;
-      // Bind to a key: twenty small badges, one click.
-      if (!s.grimoireSelected.empty()) {
-        cd->AddText(ImVec2(base.x, cy + 2), Fade(ui::ColParchDim(), 0.9f), "bind:");
-        for (int i = 0; i < 20; i++) {
-          const float bx = base.x + 52 + (i % 10) * 27.0f;
-          const float by = cy + (i / 10) * 20.0f;
-          ImGui::SetCursorScreenPos(ImVec2(bx, by));
-          ImGui::PushID(5000 + i);
-          ImGui::InvisibleButton("##bk", ImVec2(28, 18));
-          const bool hov = ImGui::IsItemHovered();
-          char k[6];
-          std::snprintf(k, sizeof k, i >= 10 ? "S%d" : "%d", (i + 1) % 10);
-          const bool held = i < (int)s.glyphSlots.size() && s.glyphSlots[i] == s.grimoireSelected;
-          cd->AddText(ImVec2(bx + 2, by), held ? ui::ColGoldHi() : hov ? ui::ColGoldPale()
-                                                                        : Fade(ui::ColParchDim(), 0.8f), k);
-          if (ImGui::IsItemClicked()) {
-            s.bindGlyph.pending = true;
-            s.bindGlyph.slot = i;
-            s.bindGlyph.glyphId = s.grimoireSelected;
-            s.bindGlyph.page = true;
-          }
-          ImGui::PopID();
-        }
-        cy += 44;
-      }
-      ImGui::SetCursorScreenPos(base);
-      ImGui::Dummy(ImVec2(compW, cy - base.y));
-    }
-    ImGui::EndChild();
     }
   }
   ImGui::End();
 
+  // ---- THE GRIMOIRE (its own panel, wide layout only) -----------------------
+  if (wide) {
+    ImGui::SetNextWindowPos(ImVec2(grimX, top));
+    ImGui::SetNextWindowSize(ImVec2(grimW, grimH));
+    ImGui::Begin("##grimoire", nullptr, kPanelFlags);
+    {
+      ImDrawList* dl = ImGui::GetWindowDrawList();
+      const ImVec2 wp = ImGui::GetWindowPos();
+      const ImVec2 ws = ImGui::GetWindowSize();
+      const float y = PanelChrome(dl, wp, ws, "GRIMOIRE", "saved sentences", stGrim);
+      GrimoireBody(s, ImVec2(wp.x + kPad, y),
+                   ImVec2(ws.x - kPad * 2, wp.y + ws.y - kPad - y));
+    }
+    ImGui::End();
+  }
+
   // ==========================================================================
-  // BOTTOM RIGHT: bag + hotbar
+  // THE PACK: bag + hotbar, under the grimoire (wide) or the arsenal (narrow)
   // ==========================================================================
-  const float bagY = top + arsenalH + 20;
-  ImGui::SetNextWindowPos(ImVec2(rightX, bagY));
-  ImGui::SetNextWindowSize(ImVec2(rightW, std::max(200.0f, bottom - bagY)));
+  const ImVec2 packPos = wide ? ImVec2(grimX, top + grimH + kColGap)
+                              : ImVec2(midX, top + arsenalH + kColGap);
+  const float packW = wide ? grimW : arsenalW;
+  ImGui::SetNextWindowPos(packPos);
+  ImGui::SetNextWindowSize(ImVec2(packW, std::max(200.0f, bottom - packPos.y)));
   ImGui::Begin("##bag", nullptr, kPanelFlags);
   {
     ImDrawList* dl = ImGui::GetWindowDrawList();
@@ -1337,10 +1528,15 @@ void DrawInventoryScreen(UIState& s) {
     const ImVec2 ws = ImGui::GetWindowSize();
     float y = PanelChrome(dl, wp, ws, "PACK", "drag out to drop", stBag);
 
+    // The grid is centred in the panel: the panel is as wide as ten cells
+    // (the column above it needs that) and the bag is eight, and eight cells
+    // hugging the left edge of a ten-cell panel read as a mistake.
+    const float bagInner = s.bagCols * kSlot + (s.bagCols - 1) * kSlotGap;
+    const float ox = std::max(0.0f, std::floor((ws.x - kPad * 2 - bagInner) * 0.25f) * 2.0f);
     for (int r = 0; r < s.bagRows; r++)
       for (int c = 0; c < s.bagCols; c++) {
         const int idx = r * s.bagCols + c;
-        const float gx = wp.x + kPad + c * (kSlot + kSlotGap);
+        const float gx = wp.x + kPad + ox + c * (kSlot + kSlotGap);
         const float gy = y + r * (kSlot + kSlotGap);
         if (gx + kSlot > wp.x + ws.x - kPad) continue;
         char id[32];
@@ -1354,7 +1550,7 @@ void DrawInventoryScreen(UIState& s) {
                        "IN HAND  1-0");
     y += 2;
     for (int i = 0; i < (int)s.hotbarSlots.size(); i++) {
-      const float gx = wp.x + kPad + i * (kSlot + 6);
+      const float gx = wp.x + kPad + i * kCell;
       if (gx + kSlot > wp.x + ws.x - kPad) break;
       char id[32];
       std::snprintf(id, sizeof id, "hb%d", i);
@@ -1365,20 +1561,10 @@ void DrawInventoryScreen(UIState& s) {
       std::snprintf(k, sizeof k, "%d", (i + 1) % 10);
       ui::KeyBadge(dl, ImVec2(gx + 2, y + 2), k);
     }
-    y += kSlot + 12;
-
-    // The refusal flash. Fades over ~2.5 s rather than sticking: it is an
-    // answer to something you just did, and an answer still on screen a minute
-    // later reads as a persistent error state.
-    if (!s.kitMessage.empty() && s.kitMessageAge < 2.5f) {
-      const float a = std::clamp(1.6f - s.kitMessageAge * 0.7f, 0.0f, 1.0f);
-      ui::ShadowText(dl, ImVec2(wp.x + kPad, y), Fade(ui::ColEmber(), a),
-                     s.kitMessage.c_str());
-    }
   }
   ImGui::End();
 
-  // ---- DRAGGED OUT OF EVERY PANEL: PUT IT ON THE FLOOR --------------------
+  // ---- DRAGGED OUT OF EVERY PANEL --------------------------------------------
   //
   // Every slot is a drop TARGET, so a drag that ends anywhere else has been
   // refused by all of them and imgui simply forgets it. That silence is the
@@ -1388,28 +1574,42 @@ void DrawInventoryScreen(UIState& s) {
   // Detected the only way imgui allows — the payload was still live last frame
   // and the mouse has now been released with nobody accepting it. Deliberately
   // AFTER every panel has had its chance, so a legal move is never mistaken
-  // for a drop.
+  // for a drop. An ITEM goes on the floor; a WORD dragged out of the page
+  // being composed leaves the page — the same gesture, the same meaning.
   if (const ImGuiPayload* p = ImGui::GetDragDropPayload()) {
-    if (p->IsDataType(kPayloadItem) &&
-        ImGui::IsMouseReleased(ImGuiMouseButton_Left) &&
-        !ImGui::IsAnyItemHovered()) {
-      KitRef from{};
-      std::memcpy(&from, p->Data, sizeof(from));
-      s.dropItem.pending = true;
-      s.dropItem.from = from;
+    if (ImGui::IsMouseReleased(ImGuiMouseButton_Left) && !ImGui::IsAnyItemHovered()) {
+      if (p->IsDataType(kPayloadItem)) {
+        KitRef from{};
+        std::memcpy(&from, p->Data, sizeof(from));
+        s.dropItem.pending = true;
+        s.dropItem.from = from;
+      } else if (p->IsDataType(kPayloadWord)) {
+        int idx = -1;
+        std::memcpy(&idx, p->Data, sizeof(idx));
+        if (idx >= 0 && idx < (int)s.grimoireEditWords.size()) {
+          s.grimoireEditWords.erase(s.grimoireEditWords.begin() + idx);
+          s.grimoireEditDirty = true;
+        }
+      }
     }
   }
 
-  // The one line of instruction, centred under everything, on a dark tab so
-  // it reads over whatever the world is doing down there.
+  // The one line at the foot of the screen, centred under everything on a
+  // dark tab so it reads over whatever the world is doing down there: the
+  // instruction, or — while one is fresh — the answer to what you just did
+  // ("that won't fit there", "saved heal", "refused: ..."). The answer fades
+  // over ~2.5 s rather than sticking, because an answer still on screen a
+  // minute later reads as a persistent error state.
   {
-    const char* hint = "I or Esc to close   |   drag out to drop";
-    const ImVec2 ts = ImGui::CalcTextSize(hint);
+    const bool fresh = !s.kitMessage.empty() && s.kitMessageAge < 2.5f;
+    const char* text = fresh ? s.kitMessage.c_str() : "I or Esc to close   |   drag out to drop";
+    const float a = fresh ? std::clamp(1.6f - s.kitMessageAge * 0.7f, 0.0f, 1.0f) : 0.85f;
+    const ImVec2 ts = ImGui::CalcTextSize(text);
     const ImVec2 tp(std::floor((disp.x - ts.x) * 0.5f), disp.y - ts.y - 8);
     bg->AddRectFilled(ImVec2(tp.x - 12, tp.y - 2), ImVec2(tp.x + ts.x + 12, disp.y),
                       Fade(ui::ColInk(), 0.6f));
     bg->AddRectFilled(ImVec2(tp.x - 12, tp.y - 2), ImVec2(tp.x + ts.x + 12, tp.y),
-                      Fade(ui::ColGoldDim(), 0.5f));
-    ui::ShadowText(bg, tp, Fade(ui::ColParchDim(), 0.85f), hint);
+                      Fade(fresh ? ui::ColEmber() : ui::ColGoldDim(), 0.5f));
+    ui::ShadowText(bg, tp, Fade(fresh ? ui::ColEmber() : ui::ColParchDim(), a), text);
   }
 }

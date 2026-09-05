@@ -175,6 +175,15 @@ export function defaultBiome() {
       skinDepth: 1,                  // cells of skin (desert sand is 4)
       subsoil: 'dirt',
       patch: {threshold: 0, cellLog2: 5},   // shared patch mask for the plant rows
+      // The three kBF_* flags PackBiomeTable packs (src/sim/worldmap.cpp);
+      // defaults match the C++ reader's (biomes.cpp LoadBiomeSet).
+      groundFlora: true,             // WM_BF_GROUND_FLORA: flowers / undergrowth / tall grass run here
+      cacti: false,                  // WM_BF_CACTI: the cactus block runs here
+      sandCap: false,                // WM_BF_SAND_CAP: a 4-deep sand cap under the skin
+      // P-E reads these per biome (today worldgen.cactusChance / saguaroFraction
+      // are global). 1-in-N and percent; 0 = never.
+      cactusChance: 0,
+      saguaroFraction: 0,
       plants: []                     // [{material, head, chance, height, conditions}]
     },
     trees: {
@@ -209,8 +218,28 @@ function merge(dst, src) {
 
 export function normalizeConditions(c) { return merge(defaultConditions(), c || {}); }
 
+/** One default row per stack — the shape normalizeBiome coerces every row to,
+ *  what the biome page's "+ row" buttons push, and what test_environment.mjs
+ *  walks to prove every row field is in the LIVE manifest (envlive.js). */
+export function defaultRows() {
+  return {
+    coverPlant: {material: 'grass_tuft', head: '', chance: 12, height: 0.2, conditions: defaultConditions()},
+    treeSpecies: {species: 'oak', weight: 10, conditions: defaultConditions()},
+    waterFeature: {preset: 'tarn', tile: 44.8, rarity: 4, conditions: defaultConditions()},
+    // mushroomChance / crystalChance: 1-in-N of the band's floor (ceiling for
+    // crystal) columns, 0 = never. Global knobs today; P-E reads these.
+    caveFeature: {preset: 'near_surface', threshold: 150, rarity: 1, mushroomChance: 0, crystalChance: 0,
+                  conditions: defaultConditions()}
+  };
+}
+
 export function normalizeBiome(src) {
   const b = merge(defaultBiome(), src || {});
+  b.cover.groundFlora = b.cover.groundFlora !== false;
+  b.cover.cacti = !!b.cover.cacti;
+  b.cover.sandCap = !!b.cover.sandCap;
+  b.cover.cactusChance = Math.max(0, b.cover.cactusChance | 0);
+  b.cover.saguaroFraction = Math.min(100, Math.max(0, b.cover.saguaroFraction | 0));
   b.cover.plants = (b.cover.plants || []).map(p => ({
     material: String(p.material || ''), head: String(p.head || ''),
     chance: Math.max(0, p.chance | 0), height: +p.height || 0.3,
@@ -226,7 +255,9 @@ export function normalizeBiome(src) {
   }));
   b.caves.features = (b.caves.features || []).map(f => ({
     preset: String(f.preset || 'near_surface'), threshold: f.threshold | 0,
-    rarity: Math.max(0, f.rarity | 0), conditions: normalizeConditions(f.conditions)
+    rarity: Math.max(0, f.rarity | 0),
+    mushroomChance: Math.max(0, f.mushroomChance | 0), crystalChance: Math.max(0, f.crystalChance | 0),
+    conditions: normalizeConditions(f.conditions)
   }));
   return b;
 }

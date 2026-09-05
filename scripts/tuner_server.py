@@ -726,6 +726,39 @@ def _worldedit_path(name):
     return os.path.join(WORLDEDIT_DIR, name + WORLDEDIT_EXT)
 
 
+_FNV_CACHE = {}
+
+
+def _fnv_file_set(d, exts):
+    """MIRRORS biomes::HashFileSet (src/sim/biomes.cpp): FNV-1a 32 over each
+    file's NAME, a zero byte, and its BYTES, files in byte-order-sorted name
+    order, only the given extensions. Cached per (path, mtime, size) because
+    the .svtree atlases are the bulk of it and a badge repaints often."""
+    h = 0x811C9DC5
+    if not d or not os.path.isdir(d):
+        return h
+    names = sorted(n for n in os.listdir(d)
+                   if os.path.isfile(os.path.join(d, n)) and any(n.endswith(e) for e in exts))
+    for n in names:
+        path = os.path.join(d, n)
+        try:
+            st = os.stat(path)
+        except OSError:
+            continue
+        key = (path, st.st_mtime_ns, st.st_size, h)
+        hit = _FNV_CACHE.get(key)
+        if hit is not None:
+            h = hit
+            continue
+        h0 = h
+        with open(path, "rb") as f:
+            data = n.encode("utf-8") + b"\0" + f.read()
+        for b in data:
+            h = ((h ^ b) * 0x01000193) & 0xFFFFFFFF
+        _FNV_CACHE[(path, st.st_mtime_ns, st.st_size, h0)] = h
+    return h
+
+
 def _worldmap_dir(name):
     """assets/worldmap/<name>, or None unless `name` is a bare safe name.
     Same discipline as _worldedit_path: a NAME, never a path."""
@@ -1219,6 +1252,27 @@ class Handler(BaseHTTPRequestHandler):
             with open(path, "rb") as f:
                 return self._send(200, f.read(), "application/octet-stream")
 
+        if p == "/api/environment/hashes":
+            # The disk side of the STALE badge (docs/PLAN_environment_truth.md
+            # P-A): the same three FNV-1a numbers the engine prints at boot as
+            # "environment: map <name> <hash> | biomes <hash> | trees <hash>"
+            # (biomes::StampEnvironment). The Environment tab compares these
+            # with what the running game reports over telemetry.
+            name = (self._query().get("name") or [""])[0]
+            if not name:
+                try:
+                    with open(WRITABLE["tuning"], "r", encoding="utf-8") as f:
+                        name = (json.load(f).get("worldgen") or {}).get("mapLayer") or "default"
+                except (OSError, ValueError):
+                    name = "default"
+            d = _worldmap_dir(name)
+            return self._json(200, {
+                "ok": True,
+                "map": name,
+                "mapHash": "%08x" % _fnv_file_set(d or "", (".json", ".svmap")),
+                "biomesHash": "%08x" % _fnv_file_set(os.path.join(ASSETS, "biomes"), (".json",)),
+                "treesHash": "%08x" % _fnv_file_set(os.path.join(ASSETS, "trees"), (".json", ".svtree")),
+            })
         if p == "/api/worldmaps":
             maps = []
             try:

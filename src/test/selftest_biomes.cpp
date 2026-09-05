@@ -25,6 +25,7 @@
 #include <vector>
 
 #include "sim/biomes.h"
+#include "sim/treeatlas.h"
 #include "sim/tuning.h"
 #include "sim/world.h"
 #include "sim/worldmap.h"
@@ -141,12 +142,111 @@ Status GateWorldMap(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---- env-reload -----------------------------------------------------------
+// The hot path an Environment-tab save takes (docs/PLAN_environment_truth.md
+// P-A): a biome table edited AFTER boot reaches the next worldgen. Three
+// claims on one in-window forest column:
+//   A. the pristine world has the forest's authored skin at ground level;
+//   B. with the forest's skin swapped IN MEMORY (no file touched), packed and
+//      pushed through Simulation::UploadEnvironment, a regen shows the swap --
+//      the kernel read the new table, not a cached one;
+//   C. ReloadEnvironment (the real F7 / Apply / --voxserve RELOAD call) reads
+//      the files back and a regen shows the authored skin again -- which is
+//      also what leaves the suite the pristine world it had.
+Status GateEnvReload(Ctx& c, std::string& detail) {
+  using sandvox::kDefaultSeed;
+  using sandvox::ReadVoxelsSync;
+  using sandvox::ReloadEnvironment;
+  using sandvox::SubmitWorldgen;
+  const std::string dir = sandvox::AssetDir();
+  biomes::BiomeSet set;
+  std::string log;
+  if (!biomes::LoadBiomeSet(dir, c.mats, set, log)) {
+    detail = "biome files did not load: " + log;
+    std::printf("env-reload: FAIL (%s)\n", detail.c_str());
+    return Status::Fail;
+  }
+  const worldmap::WorldMapData& m = worldmap::CurrentWorldMap();
+  if (!m.Loaded()) {
+    detail = "no world map loaded";
+    std::printf("env-reload: FAIL (%s)\n", detail.c_str());
+    return Status::Fail;
+  }
+
+  // The column: in-window, below the treeline, whose twin biome has a skin
+  // that is not what we will swap it to. Same sweep the worldmap gate uses.
+  const IVec3 org = c.world.WindowOrigin();
+  const int treeline = CurrentTuning().worldgen.treeline;
+  int cx = 0, cz = 0, ch = 0;
+  biomes::BiomeDef* target = nullptr;
+  for (int i = 0; i < 12 && !target; i++) {
+    const int x = org.x * (int)kChunk + 40 + i * 52;
+    const int z = org.z * (int)kChunk + 400 + i * 13;
+    const int h = World::TerrainHeight(x, z, kDefaultSeed);
+    if (h >= treeline) continue;
+    if (!c.world.ChunkInWindow(IVec3{x >> 4, h >> 4, z >> 4})) continue;
+    const int b = (int)World::MapBiomeAt(x, z, kDefaultSeed);
+    for (biomes::BiomeDef& d : set.biomes)
+      if (d.index == b && d.skinId != 0) { target = &d; cx = x; cz = z; ch = h; }
+  }
+  if (!target) {
+    detail = "no in-window column with a skinned biome below the treeline";
+    std::printf("env-reload: FAIL (%s)\n", detail.c_str());
+    return Status::Fail;
+  }
+  // The swap material: the biome's own subsoil if it differs, else stone (1).
+  const uint32_t authored = target->skinId;
+  const uint32_t swapped = (target->subsoilId && target->subsoilId != authored) ? target->subsoilId : 1u;
+  auto name = [&](uint32_t id) { return id < c.mats.size() ? c.mats[id].name : std::string("?"); };
+  auto skinAt = [&]() -> uint32_t {
+    const IVec3 cc{cx >> 4, ch >> 4, cz >> 4};
+    std::vector<uint32_t> chunk(kChunkVol, 0);
+    ReadVoxelsSync(c.ctx, c.world, World::SlotChunkIndex(cc), 1, chunk.data(), "env-reload");
+    const uint32_t local = ((uint32_t)(cz & 15) * kChunk + (uint32_t)(ch & 15)) * kChunk + (uint32_t)(cx & 15);
+    return chunk[local] & 0xFFFu;
+  };
+
+  // A.
+  const uint32_t before = skinAt();
+  // B. In-memory edit, packed, uploaded, regenerated.
+  target->skinId = swapped;
+  std::vector<uint32_t> words;
+  TreeAtlas atlas;
+  if (!worldmap::PackWorldMap(set, m, words, log) ||
+      !LoadTreeAtlas(dir + "/trees", c.mats, set, atlas, log)) {
+    detail = "pack failed: " + log;
+    std::printf("env-reload: FAIL (%s)\n", detail.c_str());
+    return Status::Fail;
+  }
+  c.ctx.WaitIdle();
+  c.sim.UploadEnvironment(c.ctx.device, c.ctx.queue, atlas, words);
+  SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+  const uint32_t during = skinAt();
+  // C. The real reload, from disk.
+  biomes::EnvironmentStamp stamp;
+  const bool reloaded = ReloadEnvironment(c.ctx, c.sim, c.mats, stamp, log);
+  SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+  const uint32_t after = skinAt();
+
+  const bool ok = reloaded && before == authored && during == swapped && after == authored;
+  char buf[400];
+  std::snprintf(buf, sizeof buf,
+                "%s column (%d,%d) h %d: skin %s -> uploaded %s -> reloaded %s (authored %s, swap %s)%s%s",
+                target->name.c_str(), cx, cz, ch, name(before).c_str(), name(during).c_str(),
+                name(after).c_str(), name(authored).c_str(), name(swapped).c_str(),
+                reloaded ? "" : "; ReloadEnvironment REFUSED: ", reloaded ? "" : log.c_str());
+  detail = buf;
+  std::printf("env-reload: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& BiomeGates() {
   static const std::vector<Gate> g = {
       {"biomes", "sim", {}, false, GateBiomes},
       {"worldmap", "sim", {}, false, GateWorldMap},
+      {"env-reload", "sim", {}, false, GateEnvReload},
   };
   return g;
 }

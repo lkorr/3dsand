@@ -3410,14 +3410,21 @@ in the HUD** rather than dropped silently.
 words, one hand, no menu. Sprint is on Shift outside magic mode and magic mode
 captures the number row, so nothing collides. A slot holds a glyph OR a
 grimoire page (`SlotKind`), both by NAME; the HUD strip draws two rows and
-lights the bank Shift is holding. The character screen's arsenal is sorted by
-SORT into five columns — matter, effect, operator, delivery, mod — each glyph
+lights the bank Shift is holding. The character screen's ARSENAL is a full
+column of its own (`ui/inventory_ui.cpp`): the twenty bound keys on top, then
+EVERY WORD as a table with one band of rows per sort — matter, effect,
+operator, delivery, mod — the sort's name in a gutter on the left, each glyph
 with its sort's colour and its valence mark (`<` takes the word before it,
 `><` is infix), unowned glyphs greyed with their name hidden (the shape of a
 word you have not learned is visible and the word is not), and hover opens
 the §9 info box, every field of which is read from the glyph's JSON entry
 (`UIState::GlyphUI`), so the box is never wrong about the glyph and a modder's
-glyph gets one free. `GrantAllAndBind` is the debug default; `Grant`/`Owns`
+glyph gets one free. The table is the drag SOURCE for the keys and for the
+grimoire, so it is never hidden behind a mode: the first version put the
+grimoire behind a toggle on the arsenal, and the glyphs it needed vanished the
+moment the toggle was pressed. Every tooltip on the screen is set in the 13 px
+small font, wrapped at 320 px; the screen's own 26 px face under the cursor
+covered a third of the panel it was describing. `GrantAllAndBind` is the debug default; `Grant`/`Owns`
 are the acquisition loop's seam.
 
 **The grimoire: macros as saved word lists (plan §12b; `Grimoire`,
@@ -3433,15 +3440,19 @@ unbounded expansion, ever). A word that no longer resolves drops with a log
 line and shows as `?`; the page is kept (the DESIGN §8b contract). Two ways to
 make one: `=` in magic mode CAPTURES the stack to a page auto-named from its
 readout (`fire2-trail-projectile`), and the character screen's GRIMOIRE panel
-COMPOSES — a page list (the authored starters from `glyphs.json`'s
-`conjoined` block appear read-only; `heal` = `blood mend`, `firebolt` = `fire
-trail projectile`, `ward` = `transmute null aura self`), and for the selected
-page a word row you drag glyphs and pages into and reorder, a name, the
-derived readout, the price (`?` when it depends on `anything`), Save / Delete
-/ Duplicate, and a row of twenty keys to bind it to. The row is described
-through the same `DescribeSpell` the live sentence uses, so the panel can
-never disagree with the game about what a page means. Editing a page rewires
-every slot bound to it, because slots hold the page's name.
+COMPOSES — its own panel above the pack, in a third column beside the arsenal
+(when the window is too narrow for three columns it falls back to a toggle on
+the arsenal, over the pack). A page list on the left (the authored starters
+from `glyphs.json`'s `conjoined` block appear read-only; `heal` = `blood
+mend`, `firebolt` = `fire trail projectile`, `ward` = `transmute null aura
+self`), and for the selected page a name, a word row you drag glyphs and pages
+into and reorder (right-click or drag out to remove), the derived readout on a
+dark page in small type, the price (`?` when it depends on `anything`), and
+Save / Duplicate / Delete. A page is bound to a key by dragging it from the
+list onto the key in the arsenal — the same gesture as a glyph. The row is
+described through the same `DescribeSpell` the live sentence uses, so the
+panel can never disagree with the game about what a page means. Editing a
+page rewires every slot bound to it, because slots hold the page's name.
 
 **PLYR v4** appends the grimoire (pages: name + words; the twenty slots as
 (kind, name) pairs) after the v3 payload and still loads v3 (an empty
@@ -4694,7 +4705,28 @@ where you hear from either (§12b, "The ears are on the character").
   being MATERIAL cells only. (3) **shadow** — `farShadowDist` returns the
   blocker distance and the far hit takes `shadowFromOpaqueHit`, the one
   softening law the terrain and the raster bodies share; levels ≥ 3 keep a
-  floor at `shadowFarLift`. (4) **plants** — `farCellIsSolid` drops MATF_MICRO
+  floor at `shadowFarLift`. Its reach is `render.farShadowReach` in metres,
+  converted to steps per level and capped at 64: it ships at 24 m (was 60)
+  because once the blocker flag stopped being a caster an UNSHADOWED ray walks
+  the whole reach — the owner's live flight measured 38 far-shadow steps per
+  pixel against 136 far-march steps, on a frame that was 81% cascade — and a
+  caster a cascade pixel can show is a canopy or a ridge within a few tens of
+  metres. Likewise `render.farSteps` is an LOD handoff rather than a cliff: a
+  ray that exhausts a level's budget hands the next level its STOP POINT, not
+  the box exit (which left the rest of that level marched by nobody — a hole
+  on a grazing hillside), so the budget may be tuned for the frame and its
+  cost is 2× cells sooner along grazing rays. And the `farOcc` word is no
+  longer only a count: bits 16..20 carry ONE PLUS the level chunk's highest
+  non-empty row (`farOccPack`/`farOccTop`, common.wgsl; `far` measures it,
+  `fardown` raises it by atomicMax and nothing lowers it, so an edit that
+  clears a cell leaves it stale-HIGH, which only costs steps). Occupancy alone
+  skips chunks with nothing in them, and every chunk of the surface band has
+  something: a ray 12 m up pitched at the middle distance walked ~90 level-1
+  cells of air per band chunk before it met the ground. Above that row
+  `traceFar` and `farShadowDist` now jump to the chunk's exit face (ascending)
+  or drop straight onto the row (descending) and resume the DDA there —
+  exact, measured pixel-identical to the cell-by-cell march within the
+  wind-animated noise of two frames. (4) **plants** — `farCellIsSolid` drops MATF_MICRO
   materials from the sieve, the downsample and the patch path: a grass tuft or
   a flower is a mostly-air cell the renderer fills with blades, and its centre
   sample had been a solid cube of the plant's palette (20 cm at level 1, 25 m
@@ -5139,6 +5171,19 @@ long before its cell is — at 40 m a meadow ran at a third of the frame rate of
 snow (2026-09-04). Inside the grass loop each blade's chord box is tested
 against the ray's XZ footprint through the cell before `hitBlade`, exact and
 conservative, so most of a tuft's blades cost two hashes and a compare.
+
+**Density is a look knob and it was halved (2026-09-04).** Every ground-cover
+rate — `flowerAt`'s per-mille thresholds and tall-grass stand density, the
+`UG_*_CHANCE` undergrowth rows, `PLANT_FERN_CHANCE` / `PLANT_SHROOM_CHANCE`
+for the tile plants, the shore/pond `worldgen.*Chance` tuning rows and the
+`chance` of every biome cover row in `assets/biomes/*.json` — is half what the
+plant overhaul shipped with. Not for the raymarch: while flying the live
+telemetry showed ~0 micro steps per pixel (plants are cubes past
+`plantLodDist`). For WORLDGEN and the far refill, which were 8 + 16 ms of a
+53 ms GPU frame in flight: a column inside a fern footprint pays a second
+`landColumn` and a 25-tile tree scan (`plantSiteAt`) in `genColumn`, which the
+`far` sieve runs 256 times per level chunk, and every placed cell is one the
+renderer treats as a micro model. Trees are untouched.
 
 **What the flipbook could not do and this does:** continuous displacement in
 time (the wind is sampled once per plant at its base, every part blends the two
@@ -7332,7 +7377,23 @@ the one model modders already read (PLAN_biomes.md §2 has the survey).
   (`scripts/tuner_server.py`, bare names, format-checked, write-then-
   rename). The page shows the planes as painted; the Worldgen tab's
   heightmap/voxel views show what worldgen makes of them. Every save moves
-  the world hash; the engine reads the map at boot, so regenerate to see it.
+  the world hash.
+* **LIVE (environment truth P-A, 2026-09-04): THE ENVIRONMENT HOT-RELOADS,
+  and the game says what it was generated from.** `ReloadEnvironment`
+  (`test/support.cpp`) re-reads the biome files, the map named by
+  `worldgen.mapLayer` and the tree atlas, validates them exactly as boot
+  does, and pushes them through `Simulation::UploadEnvironment` (a table
+  that grew gets a new buffer and the two sim bind groups are rebuilt) and
+  `worldmap::SetCurrentWorldMap` for the CPU twins. A refusal keeps the old
+  tables and names the file. Callers: **F7**, the overlay's "reload
+  environment + regen world", `--voxserve RELOAD`, and the Environment
+  tab's **Apply to game** over the telemetry socket (`{"cmd":
+  "apply-environment"}`; `Telemetry` now reads client frames). Boot and
+  every reload print `environment: map <name> <hash> | biomes <hash> |
+  trees <hash>` (`biomes::StampEnvironment`, FNV-1a over the files, mirrored
+  by `tuner_server.py /api/environment/hashes`), and the tab shows whether
+  the running game is behind the disk. Gate: `env-reload`. Plan:
+  `docs/PLAN_environment_truth.md`.
 * **LIVE (world map P4, 2026-09-04): THE LANDFORM PLANE OWNS THE CONTINENTAL
   RUNG, and the sea is a plane.** `landAt`'s `o0` is `landformOctave(x, z)`
   on both mirrors: `dev = ((mapLandformQ8 - 32768) * contAmplitude) >> 16`,
@@ -7378,18 +7439,32 @@ the one model modders already read (PLAN_biomes.md §2 has the survey).
   first authored one exercises the whole path. Not yet: `proc:` kinds
   (the ruin shell is gone; a generator per kind is the follow-up plan),
   slope-gated rules, sites larger than 512 voxels a side.
-* **LIVE: the biome band strip** on the climate section — the three worldgen
-  thresholds (`meadowThreshold` / `pineThreshold` / `desertThreshold`) as one
-  draggable bar writing `tuning.json`.
-* **AUTHORED, VALIDATED, PREVIEWED, NOT YET READ BY WORLDGEN:** water
-  features (P4/P5 of the world map), terrain overrides, tree-row and
-  cover-row `nearWater*` conditions, climate coordinates (the painted map
-  supersedes them in P2). The `biomes` gate (`src/sim/biomes.*`,
-  `selftest_biomes.cpp`) loads every file and refuses an unknown species,
-  preset or material, a biome `index` that is not worldgen's id for its name,
-  a stale species mirror, a preset whose berm exceeds its shore lift. The
-  swatch on the biome page composes all of it. The pages say "authored, not
-  yet read" in their section notes, on purpose.
+* **THE LIVE MANIFEST** (`assets/editor/envlive.js`, PLAN_environment_truth
+  P-B, 2026-09-05). One table says, per JSON path of a biome file, a water
+  preset and the map, `{read: true}` or `{read: false, package, why}`; every
+  row builder goes through `envui.liveMark`, so an unread field renders
+  DISABLED (greyed, not hidden, tooltip = the package that reads it), and
+  `test_environment.mjs` §7 walks `BG.defaultBiome()` / `defaultRows()`,
+  `WG.defaultParams()` and `map.json` and fails on a field the manifest does
+  not list — no third state. The truth is derived from `PackBiomeTable` +
+  `worldgen.wgsl`, never from the plan. Read today: skin / subsoil / depth,
+  patch mask, the three flags, cover rows with `minY` / `maxY` /
+  `patchThreshold`, `trees.density`, species weights, cave thresholds. Not
+  read: `trees.tile` and every other `conditions` field (P-D), the water
+  rows and every preset field (P-F geometry, P-E vegetation),
+  `terrain.overrides` (P-G), climate and the moisture plane (later). The
+  trees/ha stat uses the ENGINE tile (`worldgen.treeTile`).
+* **THE BAND STRIP IS DEAD** and drawn greyed with no grips: `biomeAt` is
+  `mapBiomeAt`, so `meadow/pine/desertThreshold`, `biomeLog2` and `biomeBlend`
+  reach only `biomeCurve`'s height-curve crossfade, and `CURVE_IDENT_ALL`
+  folds that out with the shipped identity curves. The Worldgen tab marks
+  those five knobs `dead:` in `tuner_schema.js` (`tuneRow` disables them);
+  P-G moves the curves into the biome files and P-I deletes the rows.
+* The `biomes` gate (`src/sim/biomes.*`, `selftest_biomes.cpp`) loads every
+  file and refuses an unknown species, preset or material, a biome `index`
+  that is not worldgen's id for its name, a stale species mirror, a preset
+  whose berm exceeds its shore lift. The swatch on the biome page composes
+  all of it, read or not.
 
 ### The generators are the preview AND the future truth
 

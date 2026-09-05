@@ -13,6 +13,45 @@
 
 'use strict';
 
+import * as LV from './envlive.js';
+
+/* ---------------------------------------------------------------------------
+ * LIVE / NOT READ — the one place a field's engine status becomes pixels.
+ *
+ * Every row builder below, and the hand-built stack rows in biome.js and
+ * water.js, call liveMark(ctx, line, path, inputs) after building a field.
+ * ctx.live(path) returns the envlive.js entry for the page's scope. An unread
+ * field is DISABLED (greyed, still visible, tooltip = the package and why),
+ * a preview-only field is enabled with the note, and a field the manifest
+ * does not know at all is outlined red so the third state cannot hide in a
+ * browser either (test_environment.mjs fails it in Node).
+ * ------------------------------------------------------------------------- */
+export function liveMark(ctx, line, path, inputs) {
+  if (!ctx || !ctx.live || !line) return undefined;
+  const entry = ctx.live(path);
+  const cls = ctx.cls || '';
+  const note = LV.describe(entry);
+  const title = line.getAttribute && line.getAttribute('title');
+  if (line.setAttribute) line.setAttribute('title', title ? title + '\n' + note : note);
+  if (entry && entry.read === true) return entry;
+  const els = inputs || (line.querySelectorAll ? [...line.querySelectorAll('input,select,textarea')] : []);
+  if (!entry) {
+    line.classList.add(cls + 'live-unknown');
+  } else if (entry.preview) {
+    line.classList.add(cls + 'preview');
+  } else {
+    line.classList.add(cls + 'dead');
+    for (const e of els) { e.disabled = true; e.title = note; }
+  }
+  const p = LV.pill(entry);
+  if (p && ctx.el) {
+    // Into the label when there is one, so the row grid keeps its columns.
+    const host = (line.querySelector && line.querySelector(':scope > label')) || line;
+    host.append(ctx.el('span', {class: cls + 'livepill', title: note}, p));
+  }
+  return entry;
+}
+
 export function getPath(obj, path) {
   if (!path) return obj;
   return path.split('.').reduce((o, k) => (o == null ? o : o[k]), obj);
@@ -116,6 +155,7 @@ export function row(ctx, container, r, base) {
   const line = el('div', {class: cls + 'row', title: r.d || ''}, label, rng, num);
   if (r.u) line.append(el('span', {class: cls + 'unit'}, r.u));
   container.append(line);
+  liveMark(ctx, line, path);
   const set = (v) => {
     const mx = String(maxOf());
     num.max = mx; rng.max = mx;
@@ -140,6 +180,7 @@ export function boolRow(ctx, container, r, base) {
   const line = el('div', {class: cls + 'row', title: r.d || ''}, el('label', {}, r.n),
                   el('div', {}, chk));
   container.append(line);
+  liveMark(ctx, line, path);
   ctx.widgets.push(() => { chk.checked = !!getPath(P(), path); });
   return line;
 }
@@ -171,6 +212,7 @@ export function matRow(ctx, container, r, base, mats, opts) {
   });
   const line = el('div', {class: cls + 'row', title: r.d || ''}, el('label', {}, r.n), sel);
   container.append(line);
+  liveMark(ctx, line, path);
   ctx.widgets.push(rebuild);
   return line;
 }
@@ -282,5 +324,10 @@ ${P} ${c}stats .warn{color:#ffb454}
 ${P} ${c}stats .ok{color:#7fd48a}
 ${P} canvas${c}view{flex:1;min-height:0;width:100%;background:#0e1116;border:1px solid #2a3040;border-radius:6px}
 ${P} button.on{background:#2b4a6f;border-color:#5aa9e6}
+${P} ${c}dead{opacity:.45}
+${P} ${c}dead input,${P} ${c}dead select,${P} ${c}dead textarea{cursor:not-allowed}
+${P} ${c}live-unknown{outline:1px dashed #ff5a5a;outline-offset:1px}
+${P} ${c}livepill{font:9px/1 monospace;color:#ffb454;border:1px solid #6b4a1a;border-radius:3px;padding:2px 3px;white-space:nowrap;justify-self:start}
+${P} ${c}preview ${c}livepill{color:#7c8ba3;border-color:#2a3040}
 ${extra || ''}`;
 }

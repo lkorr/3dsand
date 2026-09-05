@@ -22,7 +22,7 @@
       {
         "material": "dry_tussock",
         "head": "",
-        "chance": 18,
+        "chance": 36,
         "height": 0.3,
         "conditions": {
           "minY": -1,
@@ -36,7 +36,7 @@
       {
         "material": "alpine_cushion",
         "head": "",
-        "chance": 26,
+        "chance": 52,
         "height": 0.1,
         "conditions": {
           "minY": -1,
@@ -50,7 +50,7 @@
       {
         "material": "moss_patch",
         "head": "",
-        "chance": 40,
+        "chance": 80,
         "height": 0.1,
         "conditions": {
           "minY": -1,

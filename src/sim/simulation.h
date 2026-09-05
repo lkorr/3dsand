@@ -48,6 +48,16 @@ class Simulation {
   // otherwise wipe them, repainting every mob in its raw material colours.
   // Render-only; nothing here can reach a world cell or the hash.
   void SetArtPalette(const rhi::Queue& queue, const std::vector<uint32_t>& rgb);
+  // Re-upload the two AUTHORED-ENVIRONMENT tables after a reload
+  // (docs/PLAN_environment_truth.md P-A): the tree atlas (binding 26) and the
+  // world map -- biome records, cover rows, planes, sites (binding 31). Either
+  // may have GROWN since Init (a new species, a bigger map, a new biome); then
+  // the buffer is recreated and the two sim bind groups that hold it are
+  // rebuilt, which is why the caller must have drained the GPU
+  // (ctx.WaitIdle()) first. Data only: no pipeline is touched, and the next
+  // worldgen reads the new tables the same way the first one read the old.
+  void UploadEnvironment(const rhi::Device& device, const rhi::Queue& queue,
+                         const TreeAtlas& trees, const std::vector<uint32_t>& worldMapWords);
 
   void EncodeWorldgen(const rhi::CommandEncoder& enc, bool denseGen = true);
   // Generate `count` streamed-in chunks whose SLOT indices the caller wrote to
@@ -306,6 +316,9 @@ class Simulation {
 
  private:
   bool BuildPipelines(const rhi::Device& device, std::string* err);
+  // The full and slim sim bind groups, both pages. Called by Init and again by
+  // UploadEnvironment when a table buffer had to be recreated.
+  void BuildSimBindGroups(const rhi::Device& device);
   void EnsureDepth(uint32_t width, uint32_t height);
   void EnsureAuxDepth(uint32_t width, uint32_t height);
   void EnsureRenderPipelines(rhi::TextureFormat format);
@@ -336,17 +349,14 @@ class Simulation {
   std::string shaderDir_;
   rhi::Buffer materialBuf_;
   rhi::Buffer reactionBuf_;
-  // The baked tree atlas (src/sim/treeatlas.h): load-time asset data, bound
-  // read-only into simBGL_ and simSlimBGL_ at binding 26. Never rewritten
-  // after Init -- editing a species means re-baking and restarting, exactly
-  // like a change to the material table's SIZE.
+  // The baked tree atlas (src/sim/treeatlas.h): asset data, bound read-only
+  // into simBGL_ and simSlimBGL_ at binding 26. Rewritten only by
+  // UploadEnvironment (a reload from disk), never by the frame loop.
   rhi::Buffer treeAtlasBuf_;
   size_t treeAtlasWords_ = 0;
-  // The authored world map (src/sim/worldmap.h): load-time asset data, bound
-  // read-only into simBGL_ and simSlimBGL_ at binding 31, on the same terms as
-  // the tree atlas above. P0 binds it header-sized and empty -- there is no
-  // loader and no reader yet, which is what keeps this commit's world hash
-  // identical to its parent's.
+  // The authored world map (src/sim/worldmap.h): asset data, bound read-only
+  // into simBGL_ and simSlimBGL_ at binding 31, on the same terms as the tree
+  // atlas above.
   rhi::Buffer worldMapBuf_;
   size_t worldMapWords_ = 0;
   // Art palette RGB (0x00RRGGBB), indexed from kArtPaletteBaseGpu. Cached so a
