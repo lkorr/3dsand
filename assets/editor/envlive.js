@@ -141,7 +141,7 @@ export const LIVE = {
     'oceanFadeCells': R('WM_H_OCEAN_FADE'),
     'warpAmpVox': R('the biome-edge warp'),
     'biomes': R('the palette: plane byte -> biome file'),
-    'sites[]': R('the site table: pad boxes, stamps'),
+    'sites[]': R('the site table: the pad box, the spawn site (where the game starts; the calm home area centres on it), stamps'),
     'rules[]': R('seeded per-biome stamp placement'),
     'planes.biome': R('mapBiomeAt'),
     'planes.landform': R('mapLandformQ8: owns the continental rung of the height'),

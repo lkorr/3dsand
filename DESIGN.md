@@ -1681,14 +1681,22 @@ into 2.5 and puts *the entire world* above the angle of repose, where nothing
 loose can ever come to rest. With it the field saturates near slope 1.2 on
 ridges and goes genuinely flat in valleys.
 
-**The calm home area** fades only the two coarse octaves toward the world
-origin, over `spawnPlainFade` past a Chebyshev radius of `spawnPlainR`. Fading
-the whole deviation would pin spawn to a mathematically exact plane 64 m across
-— which is not "calm", it is a dinner plate, and it would make the `terrain`
-gate's per-voxel pass a test of a constant. The fade *width* is load-bearing: a
-ramp of magnitude A over width W adds slope up to 1.5·A/W, so squeezing 640
-voxels of coarse relief into a 300-voxel fade builds a cliff at exactly the
-boundary. Pass A4 measures it; read that number rather than guessing it.
+**The calm home area** fades only the two coarse octaves toward the **spawn
+site** (`map.json sites[]`, kind `spawn`; `spawnCentre()` in both mirrors reads
+it from the map header's `WM_H_SPAWN_X/Z`), over `spawnPlainFade` past a
+Chebyshev radius of `spawnPlainR`. Fading the whole deviation would pin spawn
+to a mathematically exact plane 64 m across — which is not "calm", it is a
+dinner plate, and it would make the `terrain` gate's per-voxel pass a test of a
+constant. The fade *width* is load-bearing: a ramp of magnitude A over width W
+adds slope up to 1.5·A/W, so squeezing 640 voxels of coarse relief into a
+300-voxel fade builds a cliff at exactly the boundary. Pass A4 measures it;
+read that number rather than guessing it. **Two centres** (environment truth
+P-C, 2026-09-04): the harness pad box gets the same fade measured from its
+*edge* (`harnessOutside()`, 0 anywhere inside the box) and the calmer of the
+two wins — kind `pad` is not in the site table, so `sitePadAt` never levels
+it, and its flatness only ever came from this fade. The fixtures were written
+against that ground; moving the spawn out of the pad must not move the pad's
+ground with it.
 
 **The sediment wedge** is what makes the relief mean something to the sim rather
 than only to the eye: low flat ground carries metres of loose dirt over gravel,
@@ -7394,6 +7402,26 @@ the one model modders already read (PLAN_biomes.md §2 has the survey).
   by `tuner_server.py /api/environment/hashes`), and the tab shows whether
   the running game is behind the disk. Gate: `env-reload`. Plan:
   `docs/PLAN_environment_truth.md`.
+* **LIVE (environment truth P-C, 2026-09-04): SPAWN IS A SITE ON THE MAP.**
+  The player used to start at a literal (140, 140) — inside the harness pad,
+  which refuses every trunk, crown, tarn and cover for the fixtures' sake, so
+  the first thing seen was 77 m of bare grass whatever the biome said.
+  `map.json sites[]` now carries `{kind: "spawn", at: [x, z]}` (one per map;
+  the loader refuses two, and a map without one defaults to (140, 140) and
+  says so), packed into header words `kHSpawnX/Z` (`WM_H_SPAWN_X/Z`).
+  `main.cpp` boots and regenerates (F7) from `CurrentWorldMap().spawnX/Z`
+  and centres the residency window on it before the boot worldgen; the
+  selftest's player proxies keep their literals — they are fixtures on the
+  pad. The calm home area (`spawnPlain*`) centres on the spawn through
+  `spawnCentre()` inside the height mirror, with a second fade from the pad
+  box's edge so the pad's ground does not move (the paragraph under
+  "Derivative attenuation" above). The default map's spawn is (900, 900):
+  260 voxels past the pad's edge (more than the widest crown reach, 115), in
+  the forced-forest cells, ground y≈200 over a sea at y112. The World map
+  page draws the spawn diamond and has a `Spawn` tool that moves it by
+  click. Gate: `spawn-site` (authored, outside the box and every site cell,
+  above the sea, not under a tarn, not ocean). `spawnPlain*` stays in
+  `tuning.json` until P-G moves it to `map.json terrain.homeArea`.
 * **LIVE (world map P4, 2026-09-04): THE LANDFORM PLANE OWNS THE CONTINENTAL
   RUNG, and the sea is a plane.** `landAt`'s `o0` is `landformOctave(x, z)`
   on both mirrors: `dev = ((mapLandformQ8 - 32768) * contAmplitude) >> 16`,

@@ -857,6 +857,23 @@ struct IV2 {
 };
 static IV2 iv2(int a, int b) { IV2 v; v.x = a; v.y = b; return v; }
 
+// The spawn site and the harness box's edge distance (worldgen.wgsl
+// spawnCentre / harnessOutside): the two centres of the calm home area in
+// the mirrored landAt below. Outside the mirror on both sides; the mirrored
+// code calls them by name, and the `terrain` gate's C1 is the per-voxel
+// proof they read the same numbers. An empty box (x1 < x0) is "far", which
+// switches the pad's fade off.
+static IV2 spawnCentre() {
+  const worldmap::WorldMapData& m = worldmap::CurrentWorldMap();
+  return iv2(m.spawnX, m.spawnZ);
+}
+static int harnessOutside(int x, int z) {
+  const worldmap::WorldMapData& m = worldmap::CurrentWorldMap();
+  if (m.harnessX1 < m.harnessX0) return 1073741824;
+  return std::max(std::max(std::max(m.harnessX0 - x, x - m.harnessX1),
+                           std::max(m.harnessZ0 - z, z - m.harnessZ1)), 0);
+}
+
 // ---- the biome field and the per-biome height curves, mirrored -------------
 //
 // OUTSIDE the tagged region on purpose. check_invariants.py TOKEN-COMPARES the
@@ -1148,12 +1165,18 @@ static Land landAt(int x, int z, uint32_t seed) {
   Oct o4 = octave(x, z, WG().grainLog2, WG().grainAmplitude,
                   g3x, g3z, seed ^ 5u);
 
-  int d = std::max(std::abs(x), std::abs(z)) - WG().spawnPlainR;
+  IV2 sc = spawnCentre();
+  int d = std::max(std::abs(x - sc.x), std::abs(z - sc.y)) - WG().spawnPlainR;
   int w = 16384;
   if (d < WG().spawnPlainFade) {
     w = (std::max(d, 0) * 16384) / WG().spawnPlainFade;
   }
-  int ws = vsmooth(w << 1) >> 1;
+  int dh = harnessOutside(x, z);
+  int wh = 16384;
+  if (dh < WG().spawnPlainFade) {
+    wh = (dh * 16384) / WG().spawnPlainFade;
+  }
+  int ws = vsmooth(std::min(w, wh) << 1) >> 1;
   int coarse = WG().baseHeight + cv.x - WG().spawnPlainY;
   int bed = WG().spawnPlainY + o2.dev + o3.dev + o4.dev
           + ((coarse * ws) >> 14);

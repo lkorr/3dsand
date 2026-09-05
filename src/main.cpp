@@ -759,6 +759,26 @@ void ProjectBodyUI(const PlayerAvatar& av, Physics& phys, const PortraitCam& pc,
   }
 }
 
+// ---- the spawn site (docs/PLAN_environment_truth.md P-C) --------------------
+// The game starts on the map's kind "spawn" site (worldmap.h kHSpawnX/Z), not
+// at a literal: the harness pad (-128..640)^2 refuses every tree, crown, tarn
+// and cover so the fixtures keep their ground, and a player who starts inside
+// it sees 77 m of bare grass whatever the biome says. The fixtures do not
+// move; the player does. `SpawnWindowOrigin` centres the residency window on
+// that column BEFORE the boot worldgen, so the first frame is generated
+// around the player rather than streamed to them one chunk-plane at a time
+// (Stream::Update shifts one chunk per axis per frame).
+IVec3 SpawnWindowOrigin() {
+  const worldmap::WorldMapData& m = worldmap::CurrentWorldMap();
+  const int half = (int)kNChunk / 2;
+  return IVec3{(m.spawnX >> 4) - half, 0, (m.spawnZ >> 4) - half};
+}
+Vec3 SpawnPos() {
+  const worldmap::WorldMapData& m = worldmap::CurrentWorldMap();
+  const int h = World::TerrainHeight(m.spawnX, m.spawnZ, kDefaultSeed);
+  return Vec3{(float)m.spawnX, (float)(h + 10), (float)m.spawnZ};
+}
+
 // --shot: minimal look-iteration harness. Worldgen, drain the far-field fill
 // queue, settle briefly, write the three standard screenshots, exit — so
 // render/look changes can be judged in seconds instead of the full selftest.
@@ -3874,6 +3894,10 @@ int main(int argc, char** argv) {
   // capsule sweep moves through reeds and kelp (sim/materials.h).
   std::vector<uint32_t> classOf = BuildCollisionClasses(mats);
 
+  // The window around the spawn site (SpawnWindowOrigin), so the boot
+  // worldgen fills the ground the player lands on. The lab scenes below set
+  // their own origins; the smoke/selftest paths never reach here.
+  if (labScene < 0) world.SetWindowOrigin(SpawnWindowOrigin());
   SubmitWorldgen(ctx, world, sim, kDefaultSeed);
   StartupMark("worldgen submitted");
 
@@ -3920,8 +3944,12 @@ int main(int argc, char** argv) {
   // Creatures the AI panel put in the world, so its "kill all spawned" button
   // reaps exactly those and leaves content-placed mobs alone.
   std::vector<uint64_t> aiSpawnedMobs;
-  int spawnH = World::TerrainHeight(140, 140, kDefaultSeed);
-  player.pos = Vec3{140, (float)(spawnH + 10), 140};
+  // The map's spawn site (SpawnPos above): the selftest's own player proxies
+  // keep their literal (140, 140) -- they are fixtures on the harness pad.
+  player.pos = SpawnPos();
+  std::printf("spawn: (%d, %d) on the map's spawn site, ground y%d\n",
+              worldmap::CurrentWorldMap().spawnX, worldmap::CurrentWorldMap().spawnZ,
+              (int)player.pos.y - 10);
   // Lab: fixed per-scene pose, flying, aimed at the scene — the same pose the
   // bench renders from, so what is judged live and what is measured headless
   // are the same framing.
@@ -5204,11 +5232,11 @@ int main(int argc, char** argv) {
         }
       }
       stream.OnRegen();
-      world.SetWindowOrigin({0, 0, 0});
+      // The spawn site and the ground under it are functions of the map just
+      // reloaded: a moved spawn takes effect here, on F7.
+      world.SetWindowOrigin(labScene >= 0 ? IVec3{0, 0, 0} : SpawnWindowOrigin());
       SubmitWorldgen(ctx, world, sim, kDefaultSeed);
-      // The ground under spawn is a function of the map just reloaded.
-      spawnH = World::TerrainHeight(140, 140, kDefaultSeed);
-      player.pos = Vec3{140, (float)(spawnH + 10), 140};
+      player.pos = SpawnPos();
       // Lab: a regen wipes the scene structure, so restart the scene clock
       // (build ops re-land on the next tick) and return to the scene pose.
       if (labScene >= 0) {

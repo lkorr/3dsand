@@ -36,6 +36,15 @@
         640
       ],
       "about": "The selftest harness region: no tree trunks or crowns, no tarns, no cover. Keeps every fixture column (60..150 on the x==z diagonal) and the test tarn at (420,420) on the ground the gates were written against."
+    },
+    {
+      "id": "spawn",
+      "kind": "spawn",
+      "at": [
+        900,
+        900
+      ],
+      "about": "Where the game starts, and the centre of the calm home area (worldgen.spawnPlain*). Outside the harness pad by more than the widest crown reach (115 vox past x/z 640), on forced forest, on land: the spawn-site gate checks all of that."
     }
   ],
   "rules": []
