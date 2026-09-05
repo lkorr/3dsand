@@ -743,7 +743,7 @@ async function saveBiome(asName) {
   if (H.onDirty) H.onDirty(false);
   els.save.disabled = true;
   els.title.textContent = biome.displayName + '  ·  biomes/' + clean + '.json';
-  H.toast('saved biomes/' + clean + '.json' + (BG.ENGINE_BIOMES.includes(clean) ? ' — Sync atlas if tree weights changed' : ''));
+  H.toast('saved biomes/' + clean + '.json — press Apply to game (or F7 in the game) to see it');
   if (H.onLibraryChanged) H.onLibraryChanged('biomes');
   paintSync();
 }

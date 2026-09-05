@@ -132,6 +132,10 @@ const char* const kOrder[] = {
     // Right after terrain, on the same pristine world: the painted map's
     // biome reaches the kernel (CPU twin at cell centres, GPU skin in-window).
     "worldmap",
+    // Then: an edited biome table reaches the NEXT worldgen without a restart
+    // (the F7 / Apply path). Regenerates twice and leaves the pristine world
+    // it found, so `waterbody` below sees what `terrain` left.
+    "env-reload",
     // SECOND, and it wants the same thing `terrain` does: pristine worldgen at
     // an unmoved origin. Its whole subject is the ANALYTIC basin registry, and
     // the authored lake at (420,420) has to be resident for that to mean

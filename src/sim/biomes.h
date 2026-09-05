@@ -152,4 +152,26 @@ int ValidateBiomeSet(const BiomeSet& set, std::vector<std::string>& out);
 /** Find a biome by engine id; nullptr if the set has no file for it. */
 const BiomeDef* BiomeById(const BiomeSet& set, int id);
 
+/**
+ * THE ENVIRONMENT STAMP (docs/PLAN_environment_truth.md P-A): one
+ * change-detector per authored input worldgen takes from disk -- the world
+ * map (map.json + map.svmap), the biome files, and the tree species + baked
+ * atlases. Each is FNV-1a over every file's NAME, a zero byte, and its BYTES,
+ * files in sorted-name order. Deliberately that simple, because the tuner
+ * server computes the SAME number in Python (/api/environment/hashes) and
+ * the Environment tab compares it with what the running game reports over
+ * telemetry: equal means the world you are looking at was generated from the
+ * files on disk; different means "apply". Printed at boot and after every
+ * reload as one line so a moved world hash can be attributed to a changed
+ * input without a bisect.
+ */
+struct EnvironmentStamp {
+  std::string mapName;
+  uint32_t map = 0, biomes = 0, trees = 0;
+  std::string Line() const;   // "environment: map <name> <hash> | biomes <hash> | trees <hash>"
+  std::string Json() const;   // {"map":"<name>","mapHash":"..","biomesHash":"..","treesHash":".."}
+};
+uint32_t HashFileSet(const std::string& dir, const std::vector<std::string>& exts);
+EnvironmentStamp StampEnvironment(const std::string& assetDir, const std::string& mapName);
+
 }  // namespace biomes

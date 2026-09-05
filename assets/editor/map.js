@@ -133,7 +133,7 @@ async function saveMap() {
   j = await r.json();
   if (!j.ok) { toast('planes save failed: ' + (j.error || '?'), true); return; }
   markDirty(false);
-  toast(`saved worldmap/${name} — regenerate the world to see it (every map edit moves the world hash)`);
+  toast(`saved worldmap/${name} — press Apply to game (or F7 in the game) to see it; every map edit moves the world hash`);
 }
 
 /* ---- rendering --------------------------------------------------------------- */

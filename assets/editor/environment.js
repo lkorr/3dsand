@@ -32,6 +32,7 @@ import * as Trees from './trees.js';
 import * as Water from './water.js';
 import * as Biome from './biome.js';
 import * as WorldMap from './map.js';
+import * as Link from './envlink.js';
 
 let H = null;
 let root = null;
@@ -55,6 +56,14 @@ const CSS = `
 #view-environment .envnav button .pill.eng{color:#7fd48a}
 #view-environment .envnav button .pill.dirty{color:#ffb454}
 #view-environment .envnav .envnote{font:10px/1.4 monospace;color:#6f7f97;margin-top:auto;padding-top:10px;border-top:1px solid #2a3040}
+#view-environment .envnav .gamebar{font:10px/1.5 monospace;color:#9fb0c8;padding:8px 6px;border:1px solid #2a3040;border-radius:5px;background:#12161f;display:flex;flex-direction:column;gap:4px}
+#view-environment .envnav .gamebar b{color:#dbe4f0;font-weight:600}
+#view-environment .envnav .gamebar .st{color:#6f7f97}
+#view-environment .envnav .gamebar .st.live{color:#7fd48a}
+#view-environment .envnav .gamebar .st.stale{color:#ffb454}
+#view-environment .envnav .gamebar button{margin-top:2px;padding:5px 8px;border:1px solid #2b4a6f;background:#1f2a3d;color:#fff;border-radius:5px;cursor:pointer;font-size:11px}
+#view-environment .envnav .gamebar button.stale{border-color:#ffb454;background:#3a2a10}
+#view-environment .envnav .gamebar button:disabled{opacity:.45;cursor:default}
 #view-environment .envmain{flex:1;min-width:0;min-height:0;height:100%;position:relative}
 #view-environment .envpage{display:none;height:100%}
 #view-environment .envpage.active{display:flex}
@@ -209,7 +218,48 @@ async function paintNav() {
   nav.append(el('div', {class: 'envnote'},
     'A biome SELECTS from the component libraries and says how often and where. ',
     'Species and presets are edited once, in their library; a biome edits the row.'));
+  els.gamebar = el('div', {class: 'gamebar'});
+  nav.append(els.gamebar);
+  paintGameBar();
 }
+
+/* ---------------------------------------------------------------------------
+ * the game link (envlink.js): is the running game behind the disk, and Apply
+ * ------------------------------------------------------------------------- */
+let diskStamp = null;
+let gameBarGen = 0;
+async function paintGameBar() {
+  const bar = els.gamebar;
+  if (!bar) return;
+  const el = H.el;
+  const gen = ++gameBarGen;
+  try { diskStamp = await Link.diskHashes(); } catch (e) { diskStamp = null; }
+  if (gen !== gameBarGen || bar !== els.gamebar) return;
+  const {connected, stamp} = Link.state();
+  const stale = Link.staleParts(stamp, diskStamp);
+  const unsaved = Object.values(dirtyBy).some(Boolean);
+  bar.innerHTML = '';
+  bar.append(el('div', {}, el('b', {}, 'Game'), ' ',
+    el('span', {class: 'st' + (connected ? ' live' : '')},
+       connected ? (stamp ? 'live · map ' + stamp.map : 'live · waiting for its stamp') : 'not connected')));
+  if (connected && stamp) {
+    const line = stale.length ? 'behind the disk: ' + stale.join(', ') : 'generated from the files on disk';
+    bar.append(el('div', {class: 'st' + (stale.length ? ' stale' : ' live')}, line));
+  } else if (!connected) {
+    bar.append(el('div', {class: 'st'},
+      'Launch the game with Play (it opens the telemetry port), or press F7 in a game you started by hand after saving.'));
+  }
+  if (unsaved) bar.append(el('div', {class: 'st stale'}, 'unsaved edits: save first, then apply'));
+  const btn = el('button', {class: stale.length ? 'stale' : '', disabled: !connected},
+                 stale.length ? 'Apply to game (F7)' : 'Reload + regen in game (F7)');
+  btn.title = 'The game re-reads assets/biomes, assets/worldmap and assets/trees from disk, re-uploads the tables and regenerates the world. Same as F7 or the overlay button.';
+  btn.addEventListener('click', () => {
+    if (Link.apply()) toast('applying: the game is reloading the environment and regenerating');
+    else toast('no game connected', true);
+  });
+  bar.append(btn);
+}
+function toast(m, bad) { if (H && H.toast) H.toast(m, bad); }
 
 function setDirty(page, d) {
   dirtyBy[page] = !!d;
@@ -269,6 +319,11 @@ export function attach(hooks) {
   paintKnobPages();
   paintNav();
   current = 'map';
+
+  // The game link: repaint the bar whenever the game attaches, detaches or
+  // re-stamps, and whenever a page saves (setDirty(false) -> paintNav).
+  Link.onChange(() => paintGameBar());
+  Link.start(H.engineUrl ? H.engineUrl() : undefined);
 }
 
 export function activate() {

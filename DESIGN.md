@@ -7333,7 +7333,23 @@ the one model modders already read (PLAN_biomes.md §2 has the survey).
   (`scripts/tuner_server.py`, bare names, format-checked, write-then-
   rename). The page shows the planes as painted; the Worldgen tab's
   heightmap/voxel views show what worldgen makes of them. Every save moves
-  the world hash; the engine reads the map at boot, so regenerate to see it.
+  the world hash.
+* **LIVE (environment truth P-A, 2026-09-04): THE ENVIRONMENT HOT-RELOADS,
+  and the game says what it was generated from.** `ReloadEnvironment`
+  (`test/support.cpp`) re-reads the biome files, the map named by
+  `worldgen.mapLayer` and the tree atlas, validates them exactly as boot
+  does, and pushes them through `Simulation::UploadEnvironment` (a table
+  that grew gets a new buffer and the two sim bind groups are rebuilt) and
+  `worldmap::SetCurrentWorldMap` for the CPU twins. A refusal keeps the old
+  tables and names the file. Callers: **F7**, the overlay's "reload
+  environment + regen world", `--voxserve RELOAD`, and the Environment
+  tab's **Apply to game** over the telemetry socket (`{"cmd":
+  "apply-environment"}`; `Telemetry` now reads client frames). Boot and
+  every reload print `environment: map <name> <hash> | biomes <hash> |
+  trees <hash>` (`biomes::StampEnvironment`, FNV-1a over the files, mirrored
+  by `tuner_server.py /api/environment/hashes`), and the tab shows whether
+  the running game is behind the disk. Gate: `env-reload`. Plan:
+  `docs/PLAN_environment_truth.md`.
 * **LIVE (world map P4, 2026-09-04): THE LANDFORM PLANE OWNS THE CONTINENTAL
   RUNG, and the sea is a plane.** `landAt`'s `o0` is `landformOctave(x, z)`
   on both mirrors: `dev = ((mapLandformQ8 - 32768) * contAmplitude) >> 16`,

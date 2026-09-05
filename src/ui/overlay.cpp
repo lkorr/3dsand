@@ -894,7 +894,7 @@ void Overlay::Draw(UIState& s) {
   ImGui::SameLine();
   if (ImGui::Button("reload materials (R)")) s.reloadMaterials = true;
   ImGui::SameLine();
-  if (ImGui::Button("regen world")) s.regenWorld = true;
+  if (ImGui::Button("reload environment + regen world (F7)")) s.regenWorld = true;
 
   if (ImGui::Button("save world (F9)")) s.saveWorld = true;
   ImGui::SameLine();

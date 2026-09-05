@@ -177,6 +177,7 @@ bool Telemetry::Start(uint16_t port) {
 void Telemetry::Poll() {
   if (listen_ == kInvalid) return;
   Accept();
+  ReadClients();
 }
 
 void Telemetry::Accept() {
@@ -187,10 +188,87 @@ void Telemetry::Accept() {
     if (!Handshake((intptr_t)c)) { CloseSocket(c); continue; }
     bool placed = false;
     for (int i = 0; i < kMaxClients; i++) {
-      if (clients_[i] == kInvalid) { clients_[i] = (intptr_t)c; placed = true; break; }
+      if (clients_[i] == kInvalid) {
+        clients_[i] = (intptr_t)c;
+        inbuf_[i].clear();
+        newClients_++;
+        placed = true;
+        break;
+      }
     }
     if (!placed) CloseSocket(c);
   }
+}
+
+// Client -> server frames (RFC 6455 §5.2). Browsers MASK every frame they
+// send, so the four-byte key is expected rather than optional; a text frame
+// becomes a queued command, a close frame drops the client, anything else
+// (ping, binary, continuation) is consumed and ignored. Non-blocking: a
+// frame that has not fully arrived waits in inbuf_ for the next Poll.
+void Telemetry::ReadClients() {
+  for (int i = 0; i < kMaxClients; i++) {
+    if (clients_[i] == kInvalid) continue;
+    char tmp[1024];
+    for (;;) {
+      int n = recv((SOCKET)clients_[i], tmp, (int)sizeof tmp, 0);
+      if (n > 0) { inbuf_[i].append(tmp, (size_t)n); if (n < (int)sizeof tmp) break; continue; }
+      if (n == 0) { Drop(clients_[i]); break; }
+      if (!WouldBlock()) { Drop(clients_[i]); }
+      break;
+    }
+    if (clients_[i] == kInvalid) continue;
+    std::string& b = inbuf_[i];
+    for (;;) {
+      if (b.size() < 2) break;
+      const uint8_t b0 = (uint8_t)b[0], b1 = (uint8_t)b[1];
+      const int opcode = b0 & 0x0F;
+      const bool masked = (b1 & 0x80) != 0;
+      size_t len = b1 & 0x7F, at = 2;
+      if (len == 126) {
+        if (b.size() < 4) break;
+        len = ((size_t)(uint8_t)b[2] << 8) | (uint8_t)b[3];
+        at = 4;
+      } else if (len == 127) {
+        if (b.size() < 10) break;
+        len = 0;
+        for (int k = 0; k < 8; k++) len = (len << 8) | (uint8_t)b[2 + k];
+        at = 10;
+      }
+      if (len > 65536) { Drop(clients_[i]); b.clear(); break; }   // not a command
+      const size_t maskAt = at;
+      if (masked) at += 4;
+      if (b.size() < at + len) break;
+      if (opcode == 1) {
+        std::string payload = b.substr(at, len);
+        if (masked)
+          for (size_t k = 0; k < len; k++) payload[k] ^= b[maskAt + (k & 3)];
+        commands_.push_back(std::move(payload));
+      } else if (opcode == 8) {
+        Drop(clients_[i]);
+        b.clear();
+        break;
+      }
+      b.erase(0, at + len);
+    }
+  }
+}
+
+bool Telemetry::PopCommand(std::string& out) {
+  if (commands_.empty()) return false;
+  out = std::move(commands_.front());
+  commands_.erase(commands_.begin());
+  return true;
+}
+
+void Telemetry::SendText(const char* json, int len) {
+  if (!HasClient()) return;
+  SendAll(json, len);
+}
+
+int Telemetry::TakeNewClients() {
+  const int n = newClients_;
+  newClients_ = 0;
+  return n;
 }
 
 bool Telemetry::Handshake(intptr_t fd) {
@@ -263,7 +341,7 @@ void Telemetry::Send(intptr_t fd, const char* data, int len) {
 void Telemetry::Drop(intptr_t fd) {
   CloseSocket((SOCKET)fd);
   for (int i = 0; i < kMaxClients; i++) {
-    if (clients_[i] == fd) { clients_[i] = kInvalid; break; }
+    if (clients_[i] == fd) { clients_[i] = kInvalid; inbuf_[i].clear(); break; }
   }
 }
 

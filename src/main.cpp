@@ -3425,6 +3425,16 @@ int main(int argc, char** argv) {
     }
     if (!tlog.empty()) std::fprintf(stderr, "%s", tlog.c_str());
   }
+  // What the world is about to be generated FROM, as one line: the tuner
+  // compares these against the files on disk to say whether the running game
+  // is behind an Environment save (docs/PLAN_environment_truth.md P-A).
+  // Re-stamped by every environment reload (F7 / regen world / Apply).
+  biomes::EnvironmentStamp envStamp =
+      biomes::StampEnvironment(assetDir, CurrentTuning().worldgen.mapLayer);
+  std::printf("%s\n", envStamp.Line().c_str());
+  auto envStampMessage = [&envStamp]() {
+    return std::string("{\"v\":3,\"type\":\"environment\",\"stamp\":") + envStamp.Json() + "}";
+  };
 
   GLFWwindow* window = nullptr;
   if (!selftest && !shot && !shotWaterfall && !measure && !perf &&
@@ -3947,7 +3957,7 @@ int main(int argc, char** argv) {
   // switched (camera.meleeSensHalflife). See the note at the ApplyMouse call.
   float lookSensNow = 1.0f;
 
-  KeyEdge eP, eN, eV, eF1, eF3, eF4, eF5, eF6, eF9, eF10, eR, eEsc, eLBracket, eRBracket, eJump,
+  KeyEdge eP, eN, eV, eF1, eF3, eF4, eF5, eF6, eF7, eF9, eF10, eR, eEsc, eLBracket, eRBracket, eJump,
       eG, eX, eB, eT, eO, eM, eK, eTab, eC, eH, eZ, eBack, eDel, eEq, eU, eL, eI, eQ,
       eE;
   KeyEdge eGlyph[kGlyphSlots];
@@ -4636,6 +4646,12 @@ int main(int argc, char** argv) {
     if (devKeys && eF5.Pressed(key(GLFW_KEY_F5))) ui.reloadShaders = true;
     if (devKeys && eF6.Pressed(key(GLFW_KEY_F6)))
       ui.showDirtyChunks = !ui.showDirtyChunks;
+    // F7: reload the environment (biomes, world map, tree atlas) from disk
+    // and regenerate. Beside F5 (shaders + tuning) and R (materials) because
+    // it is the third kind of hot reload, and the one an Environment-tab save
+    // needs -- worldgen reads those tables, so a reload without a regen would
+    // show nothing and a regen without a reload shows the OLD tables.
+    if (devKeys && eF7.Pressed(key(GLFW_KEY_F7))) ui.regenWorld = true;
     if (devKeys && eF9.Pressed(key(GLFW_KEY_F9))) ui.saveWorld = true;
     if (devKeys && eF10.Pressed(key(GLFW_KEY_F10))) ui.loadWorld = true;
     if (devKeys && eR.Pressed(key(GLFW_KEY_R))) ui.reloadMaterials = true;
@@ -5171,9 +5187,27 @@ int main(int argc, char** argv) {
     }
     if (ui.regenWorld) {
       ui.regenWorld = false;
+      // A regen ALWAYS re-reads the environment first (PLAN_environment_truth
+      // P-A): the button exists to see what you authored, and what you
+      // authored is on disk. A file that refuses keeps the old tables and
+      // says so; the regen still happens, on those.
+      {
+        std::string elog;
+        if (ReloadEnvironment(ctx, sim, mats, envStamp, elog)) {
+          std::printf("%s (reloaded)\n", envStamp.Line().c_str());
+        } else {
+          std::fprintf(stderr, "%s", elog.c_str());
+        }
+        if (telemetryEnabled) {
+          const std::string m = envStampMessage();
+          telemetry.SendText(m.c_str(), (int)m.size());
+        }
+      }
       stream.OnRegen();
       world.SetWindowOrigin({0, 0, 0});
       SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+      // The ground under spawn is a function of the map just reloaded.
+      spawnH = World::TerrainHeight(140, 140, kDefaultSeed);
       player.pos = Vec3{140, (float)(spawnH + 10), 140};
       // Lab: a regen wipes the scene structure, so restart the scene clock
       // (build ops re-land on the next tick) and return to the scene pose.
@@ -8891,6 +8925,23 @@ int main(int argc, char** argv) {
       ctx.ProcessEvents();  // pumps MapAsync callbacks (mirror updates)
     }
     telemetry.Poll();
+    // The inbound half of the socket (PLAN_environment_truth P-A): a page
+    // that just attached gets the environment stamp once; a page that asks
+    // for a reload gets exactly what F7 does, on the next frame.
+    if (telemetryEnabled) {
+      if (telemetry.TakeNewClients() > 0) {
+        const std::string m = envStampMessage();
+        telemetry.SendText(m.c_str(), (int)m.size());
+      }
+      for (std::string cmd; telemetry.PopCommand(cmd);) {
+        if (cmd.find("apply-environment") != std::string::npos) {
+          ui.regenWorld = true;
+        } else if (cmd.find("env-stamp") != std::string::npos) {
+          const std::string m = envStampMessage();
+          telemetry.SendText(m.c_str(), (int)m.size());
+        }
+      }
+    }
 
     // ---- CLOSE THE FRAME'S CPU ACCOUNTING -------------------------------
     //

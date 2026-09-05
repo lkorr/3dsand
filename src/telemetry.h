@@ -1,5 +1,7 @@
 #pragma once
 #include <cstdint>
+#include <string>
+#include <vector>
 
 #include "measure/perfnodes.h"
 
@@ -48,8 +50,23 @@ class Telemetry {
   // --telemetry on and nobody watching, the cost is one pointer compare.
   bool HasClient() const;
 
+  // ---- the INBOUND half (docs/PLAN_environment_truth.md P-A) --------------
+  // A page may send small text frames back: today `{"cmd":"apply-environment"}`
+  // (reload biomes/map/atlas from disk and regenerate) and
+  // `{"cmd":"env-stamp"}` (re-send the environment stamp). Poll() drains the
+  // sockets into a queue; the frame loop pops and acts, so nothing here
+  // touches game state and the socket thread model stays "none".
+  bool PopCommand(std::string& out);
+  // One text message to every attached client, outside the per-frame sample:
+  // the environment stamp after boot and after every reload.
+  void SendText(const char* json, int len);
+  // Clients that attached since the last call. The frame loop uses it to send
+  // a fresh page the state it needs ONCE (the stamp) rather than every frame.
+  int TakeNewClients();
+
  private:
   void Accept();
+  void ReadClients();
   bool Handshake(intptr_t fd);
   void Send(intptr_t fd, const char* data, int len);
   void SendAll(const char* json, int len);
@@ -60,4 +77,9 @@ class Telemetry {
   static constexpr int kMaxClients = 4;
   intptr_t clients_[kMaxClients] = {kInvalid, kInvalid, kInvalid, kInvalid};
   char recvBuf_[4096] = {};
+  // Per-client partial-frame accumulator (a command is ~30 bytes, so this is
+  // almost always empty) and the drained command queue.
+  std::string inbuf_[kMaxClients];
+  std::vector<std::string> commands_;
+  int newClients_ = 0;
 };

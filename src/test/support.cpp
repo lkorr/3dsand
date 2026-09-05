@@ -15,7 +15,10 @@
 
 #include "gpu/resources.h"
 #include "measure/perfscope.h"
+#include "sim/biomes.h"
 #include "sim/farfield.h"
+#include "sim/treeatlas.h"
+#include "sim/worldmap.h"
 #include "sim/wind.h"
 #include "sim/worldedit.h"
 #include "sim/waterbody.h"
@@ -1320,6 +1323,47 @@ bool g_harnessSnapshotDrain = false;
 
 void SetHarnessSnapshotDrain(bool on) { g_harnessSnapshotDrain = on; }
 bool HarnessSnapshotDrain() { return g_harnessSnapshotDrain; }
+
+bool ReloadEnvironment(GpuContext& ctx, Simulation& sim,
+                       const std::vector<MaterialDef>& mats,
+                       biomes::EnvironmentStamp& stamp, std::string& log) {
+  const std::string assetDir = AssetDir();
+  const std::string mapName = CurrentTuning().worldgen.mapLayer;
+  // The same three loads, in the same order and with the same refusals, as
+  // boot (main.cpp): the biome set first because it is the id space the other
+  // two are laid out in.
+  biomes::BiomeSet set;
+  if (!biomes::LoadBiomeSet(assetDir, mats, set, log)) {
+    log += "environment reload: a biome/water/species file did not parse -- kept the old tables\n";
+    return false;
+  }
+  std::vector<std::string> problems;
+  if (biomes::ValidateBiomeSet(set, problems)) {
+    for (const std::string& p : problems) log += "biomes: " + p + "\n";
+    log += "environment reload: biome files are invalid -- kept the old tables\n";
+    return false;
+  }
+  worldmap::WorldMapData map;
+  std::vector<uint32_t> words;
+  if (!worldmap::LoadWorldMap(assetDir, mapName, set, mats.size(), kDefaultSeed, map, log) ||
+      !worldmap::PackWorldMap(set, map, words, log)) {
+    log += "environment reload: world map '" + mapName + "' failed to load -- kept the old tables\n";
+    return false;
+  }
+  TreeAtlas trees;
+  if (!LoadTreeAtlas(assetDir + "/trees", mats, set, trees, log)) {
+    log += "environment reload: tree atlas failed to load -- kept the old tables\n";
+    return false;
+  }
+  // Everything parsed and validated: now, and only now, replace. The CPU
+  // twins (World::MapBiomeAt, TerrainHeight's site pads) read the current map
+  // through worldmap::CurrentWorldMap, so the two sides flip together.
+  ctx.WaitIdle();
+  worldmap::SetCurrentWorldMap(std::move(map));
+  sim.UploadEnvironment(ctx.device, ctx.queue, trees, words);
+  stamp = biomes::StampEnvironment(assetDir, mapName);
+  return true;
+}
 
 void SubmitWorldgen(GpuContext& ctx, World& world, Simulation& sim, uint32_t seed) {
   // The authored edit layer patches whatever worldgen produces, so a fresh
