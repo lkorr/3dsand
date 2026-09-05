@@ -1,8 +1,11 @@
 # PLAN: the Environment tab is the truth about the world
 
-Status: PROPOSAL, 2026-09-04. Supersedes `PLAN_biomes.md` §5 (the wiring
-order) and closes the follow-up list in `PLAN_world_map.md`. P-A, P-B and P-E
-landed 2026-09-05; the rest is open.
+Status: IN PROGRESS. Supersedes `PLAN_biomes.md` §5 (the wiring order) and
+closes the follow-up list in `PLAN_world_map.md`. **Landed:** P-A, P-B, P-C
+(2026-09-04), P-D, P-E (2026-09-05). **Open:** P-F, P-G, P-H, P-I, run in
+that order as one worktree + one rebaseline each, under the §5 brief below
+(owner, 2026-09-05), which widens P-F and P-G so the map — not tuning — is
+the whole environment.
 
 ## 0. Why edits do not show today (measured on main 482b756)
 
@@ -318,3 +321,98 @@ something to measure) and grows a row per package.
   the player moves.
 - Replacing the world map's painted biomes with climate noise. The map is
   the decision (`RESEARCH_worldgen` §8); the Environment tab paints it.
+
+## 5. The map IS the environment (owner brief, 2026-09-05)
+
+The owner's goal, in their words: *cleanly and easily declare what the
+entire environment will look like — where the biomes are, how the terrain
+looks — seeded to look slightly different but largely consistent: there is
+always a mountain to the east, always a lake in region X. A comprehensive
+map editor that controls the entire map, and later the locations of notable
+buildings and towns.* The three-tier rule in `PLAN_world_map.md` is exactly
+this: **Tier A (the map) is seed-independent and authored; Tier B/C is
+seeded detail.** Every remaining package is judged by one question: after
+it lands, is that fact declared ON THE MAP PAGE, and does the game show it?
+
+What the remaining packages therefore deliver, beyond §2:
+
+### P-F, widened: lakes are map content
+
+- **Two sources for one pond table.** (a) **Authored water sites**, Tier A:
+  `map.json sites[]` gains `{kind: "water", id, preset, at: [x, z], radius?,
+  rotation?}`. Same on every seed; the preset's footprint / bathymetry /
+  fill / berm / bed / shore geometry applies; a site may override the
+  preset's radius. (b) **Rolled ponds**, Tier B: the biome's
+  `water.features[]` rows (preset, tile, rarity, conditions) roll per tile
+  with the seed, exactly as trees do. Both go through the SAME packed
+  record (`kW_*` words 22..31 + the 17-knot Q8 bathymetry table) and the
+  same shader path, so an authored lake and a rolled tarn differ only in
+  where their centre came from.
+- **A site wins its ground.** Inside an authored water site's footprint +
+  shore band no rolled pond, tree, cover row or cave breach is placed
+  (the `siteKeepOut` discipline the pad already has).
+- **Inside the height mirror** (`pondInfo/pondAt/pondNear/bermLift`): the
+  C++ twin reads the same table with the same identifier spelling;
+  `terrain` C1, A6 and `waterbody` (with a `Profiled` bowl) are the proof.
+  The bathymetry `profile` curve is sampled to Q8 knots at load — the
+  shader never sees a float and never sees 30 uniform reads in the loop
+  (the driver-compile stall recorded in memory).
+- **Map page:** a `water` tool beside spawn/stamp: click places a lake,
+  drag moves it, a side panel picks the preset and radius, the footprint
+  is drawn to scale. The `spawn-site` gate's checks extend to "not under
+  an authored lake". P-E's interim `kB_WaterPreset` (first row wins) is
+  replaced by the site's / the roll's own preset.
+- **Delete** the nine `pond*` and four `shore*` geometry knobs; the Water
+  pages' greyed geometry fields go live (`envlive.js`).
+
+### P-G, widened: the terrain's shape is authored on the map
+
+- The landform plane is already the continental rung inside the mirror;
+  give it authority. `map.json terrain` gets `landformRangeVox` (what a
+  painted 0..255 spans, so a painted ridge can be a 150 m mountain, not a
+  40 m swell), the octave amplitudes and log2 sizes, `fbmAtten`, the
+  sediment wedge, `treeline`, `homeArea` (P-C's spawnPlain*),
+  `refVoxelsPerMetre`. The map page gets a **Terrain** section for them and
+  a **heightmap backdrop** (the `--heightmap` route already exists) so the
+  painted landform is seen as relief, not as a colour.
+- Per-biome relief: `curve[9]` and the hill/grain/detail Q8 multipliers in
+  each `assets/biomes/<name>.json terrain` block (the parsed-but-unread
+  `terrain.overrides` becomes that fixed record). Inside the mirror →
+  twin + `terrain` C1. Curves stay const-evaluable or arrive as a table
+  read.
+- **Landform sites, Tier A** (the "mountain to the east" as a declared
+  thing rather than a painted blob): `{kind: "landform", shape: peak |
+  ridge | basin | plateau, at, radius, heightVox, rotation?}` overlaid on
+  the plane at load (CPU, into the packed landform plane — the shader
+  reads the plane as today, so nothing new enters the mirror). The map
+  page draws and drags them.
+- **Delete** the 36 curve knots, the octave/sediment/treeline/spawnPlain/
+  ref rows, and the seven dead-or-duplicate rows still in `worldgen.*`:
+  `biomeLog2`, `desert/pine/meadowThreshold`, `biomeBlend`,
+  `caveThreshold1/2` (nothing reads `TUNE_CAVE_THRESHOLD*` since P-E) and
+  `alpineChance` (the alpine biome already authors an `alpine_cushion`
+  cover row that the cover stack's `h < TREELINE` gate silently ignores
+  where the alpine biome lives — lift the gate, let rows use `minY`).
+
+### P-H as planned; P-I, widened: the map page is the one front door
+
+- P-I deletes the Worldgen tab and makes Environment → World map the
+  single entry: map selector (`mapLayer`, `editLayer`), Terrain section,
+  the heightmap + voxel views as a preview pane, and a **sites panel**
+  listing every site by kind (pad, spawn, water, landform, stamp) with
+  select / rename / delete — the list that towns and notable buildings
+  will join (`proc:` kind, `PLAN_world_map.md` follow-ups). The
+  `worldgen.vegetation` A/B switch moves to a dev group; it is not world
+  content.
+- The game keeps printing `environment: map <name> <hash> | biomes | trees`
+  and F7 keeps meaning reload + regen, so the loop stays edit → F7 → see.
+
+### Coordination
+
+One implementer per package, sequential (they all touch `worldgen.wgsl`,
+`world.cpp`, `worldmap.*`, `map.js`); each claims on the board, works in a
+worktree, builds ONCE, verifies with ONE `--verify`/`--suite acceptance` at
+the end, rebaselines once, updates this file's status line and the tuner's
+`ARCH_NODES` + Development Status, and merges to main. The seven-knob
+cleanup goes with P-G. `env-truth` (P-H) grows a row per package after it
+exists.
