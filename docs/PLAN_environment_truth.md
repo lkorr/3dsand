@@ -105,6 +105,14 @@ each one alone is enough:
 
 ### P-D  Tree spacing per biome, WITHOUT a per-biome lattice (WGSL + loader)
 
+Status: LANDED 2026-09-05 (branch `worktree-agent-a1ee467469277c744`). As
+built: `kB_TreeChanceQ16` (biome word 14), `kCoverRowWords` 8→12 with
+`kC_NearWaterMax/Min`, the atlas's `kHCondTable` per (biome, species),
+`TREE_TILE/SCAN/CAND_MAX` from `treeatlas.h TreeLatticeFor` (56 / 2 / 25 on
+the shipped biomes, cap 5x5), `worldgen.treeTile` deleted. Measured
+`--perf flythrough` worldgen 12.6 → 29.6 µs/chunk (+135 %, with the forest
+23 → 153 trees/ha as authored): the reach cap named below is now due.
+
 The shader comment at `worldgen.wgsl:1712` is right that the 5×5 candidate
 scan needs one lattice. The robust answer is to keep ONE lattice and make it
 the FINEST authored spacing, then thin each biome to the density its page

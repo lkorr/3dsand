@@ -524,3 +524,20 @@ family already recorded above (`mob-burn`, `fire-down`, `tree-fell`).
 d142be4 and the pin did not follow.
 
 The smoke tables (`smokeQuiet`, `smokeLoud`) were rebaselined by the tool.
+
+## `determinismHash` 7aeb3ea5 -> 4dca1e0d was already stale at 482b756 (2026-09-05, P-D tree lattice)
+
+Recorded, NOT rebaselined (the coordinator rebaselines main once after
+P-C/P-D/P-E). Landing P-D (`docs/PLAN_environment_truth.md`: one tree
+lattice, thinned per biome) the full suite reported `determinism: PIN MOVED
+(final hash 4dca1e0d ... sim reproduces itself)` plus REGRESSIONS `wind-prim,
+flung-liquid, fire-depth, openness, ai-approach`. Attributed at the same scope
+before anything was touched: the MAIN checkout's own exe on the committed
+482b756 assets (`SANDVOX_ASSET_DIR` to a `git archive` of HEAD) reports the
+SAME 4dca1e0d and the SAME five failures. None of it is P-D's -- the harness
+window is the pad site, which bans trunks, crowns and cover, so tree
+placement cannot reach the hashed world at all. The only pin P-D itself moves
+is `treeAtlasHash` (8d14bc1e6117ce3d -> da8bc516535faf82: the atlas gained a
+per-(biome, species) condition table). `ai-approach`'s "wall 0/33 columns in
+mirror" is the rule-7 mirror-anchoring dependency selftest_swing.cpp already
+documents.
