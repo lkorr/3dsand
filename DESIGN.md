@@ -4705,7 +4705,28 @@ where you hear from either (§12b, "The ears are on the character").
   being MATERIAL cells only. (3) **shadow** — `farShadowDist` returns the
   blocker distance and the far hit takes `shadowFromOpaqueHit`, the one
   softening law the terrain and the raster bodies share; levels ≥ 3 keep a
-  floor at `shadowFarLift`. (4) **plants** — `farCellIsSolid` drops MATF_MICRO
+  floor at `shadowFarLift`. Its reach is `render.farShadowReach` in metres,
+  converted to steps per level and capped at 64: it ships at 24 m (was 60)
+  because once the blocker flag stopped being a caster an UNSHADOWED ray walks
+  the whole reach — the owner's live flight measured 38 far-shadow steps per
+  pixel against 136 far-march steps, on a frame that was 81% cascade — and a
+  caster a cascade pixel can show is a canopy or a ridge within a few tens of
+  metres. Likewise `render.farSteps` is an LOD handoff rather than a cliff: a
+  ray that exhausts a level's budget hands the next level its STOP POINT, not
+  the box exit (which left the rest of that level marched by nobody — a hole
+  on a grazing hillside), so the budget may be tuned for the frame and its
+  cost is 2× cells sooner along grazing rays. And the `farOcc` word is no
+  longer only a count: bits 16..20 carry ONE PLUS the level chunk's highest
+  non-empty row (`farOccPack`/`farOccTop`, common.wgsl; `far` measures it,
+  `fardown` raises it by atomicMax and nothing lowers it, so an edit that
+  clears a cell leaves it stale-HIGH, which only costs steps). Occupancy alone
+  skips chunks with nothing in them, and every chunk of the surface band has
+  something: a ray 12 m up pitched at the middle distance walked ~90 level-1
+  cells of air per band chunk before it met the ground. Above that row
+  `traceFar` and `farShadowDist` now jump to the chunk's exit face (ascending)
+  or drop straight onto the row (descending) and resume the DDA there —
+  exact, measured pixel-identical to the cell-by-cell march within the
+  wind-animated noise of two frames. (4) **plants** — `farCellIsSolid` drops MATF_MICRO
   materials from the sieve, the downsample and the patch path: a grass tuft or
   a flower is a mostly-air cell the renderer fills with blades, and its centre
   sample had been a solid cube of the plant's palette (20 cm at level 1, 25 m
@@ -5150,6 +5171,19 @@ long before its cell is — at 40 m a meadow ran at a third of the frame rate of
 snow (2026-09-04). Inside the grass loop each blade's chord box is tested
 against the ray's XZ footprint through the cell before `hitBlade`, exact and
 conservative, so most of a tuft's blades cost two hashes and a compare.
+
+**Density is a look knob and it was halved (2026-09-04).** Every ground-cover
+rate — `flowerAt`'s per-mille thresholds and tall-grass stand density, the
+`UG_*_CHANCE` undergrowth rows, `PLANT_FERN_CHANCE` / `PLANT_SHROOM_CHANCE`
+for the tile plants, the shore/pond `worldgen.*Chance` tuning rows and the
+`chance` of every biome cover row in `assets/biomes/*.json` — is half what the
+plant overhaul shipped with. Not for the raymarch: while flying the live
+telemetry showed ~0 micro steps per pixel (plants are cubes past
+`plantLodDist`). For WORLDGEN and the far refill, which were 8 + 16 ms of a
+53 ms GPU frame in flight: a column inside a fern footprint pays a second
+`landColumn` and a 25-tile tree scan (`plantSiteAt`) in `genColumn`, which the
+`far` sieve runs 256 times per level chunk, and every placed cell is one the
+renderer treats as a micro model. Trees are untouched.
 
 **What the flipbook could not do and this does:** continuous displacement in
 time (the wind is sampled once per plant at its base, every part blends the two
