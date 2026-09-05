@@ -2168,9 +2168,35 @@ neighbors, so this needs an explicit connectivity pass:
   a face, so felling one produced no body at all, while its dithered crown rim
   became sub-8 "islands" that were deleted. Unknown/unfetched cells and the
   residency edge read as solid, so the conservative direction is unchanged.
-- **Nothing is left hanging by the handoff (2026-09-03).** A `CLASS_SOLID`
-  voxel never moves in the CA (`sim_step` returns early for it), so island
-  detection is the *only* mechanism that makes solid matter fall and there is
+- **A solid with nothing touching it falls in the CA (2026-09-04).** The one
+  exception to the rule below, and the reason it is an exception is that it
+  needs no connectivity analysis: a `CLASS_SOLID` voxel with no solid and no
+  powder on any of its six faces **is** a component of one, decided from
+  information the cell already holds. `sim_step.wgsl` drops it like a powder —
+  no support flag, no cooldown, no readback, no queue, no region scan. Island
+  detection keeps the job it is actually good at (is this *ledge* still attached
+  to that cliff) and stops being asked to arrive somewhere for a single voxel,
+  which measurably it did not: burning one tree in the `tree-fell` fixture left
+  38 lone voxels hanging with every leak counter at zero, the sub-8 rubble
+  handoff reached 401 times against 11105 small components anchored at a
+  scan-box boundary, and `eventQueueFullSpilled` at 1113. Afterwards, 5.
+  Three constraints make it legal rather than merely appealing. **The lattice
+  bounds reads, not just writes**: acting cells are ≥3 apart and may write ≤1
+  cell away, so a cell one step from me can only be written by an acting cell
+  within two steps of me, and I am the only one there — this probe reads exactly
+  distance 1, where the `seesSky` walk that broke determinism at tick 1 read 48.
+  **Rule 2 survives**: the six faces are probed downward-first, so a terrain
+  cell with ground beneath it exits after one extra load, and a failed move
+  never calls `markDirty`, so nothing can hold a chunk awake (`sleep` still
+  reports 0 / 32768 active). **Things that float on liquid still float**, with
+  no new rule: `canDisplace` already refuses a denser target and every
+  water-surface plant is far lighter than water. An unseen neighbour counts as
+  attached, the same conservative direction `solidOutside` takes at the
+  residency edge. Gate: `tree-fell`.
+- **Nothing is left hanging by the handoff (2026-09-03).** Otherwise a
+  `CLASS_SOLID` voxel does not move in the CA (`sim_step` returns early for it),
+  so island detection is the *only* mechanism that makes solid matter fall for
+  anything bigger than the single-voxel case above, and there is
   no second line of defence behind it: every component this path declines to
   convert stays exactly where it is, permanently. Four paths used to decline a
   component by leaving it in the grid, and each was a permanent floater:
@@ -2229,13 +2255,75 @@ neighbors, so this needs an explicit connectivity pass:
   (the control, without which the first assertion is satisfied by a build that
   settles nothing), and a bounded sweep of the fixture box must find no
   unsupported solid component.
-- Remaining accepted flaw: the scan is still **local and conservative**, so a
-  large floating section can survive when it extends past the 80-cell region
-  (`kMaxRegionCells`), exceeds `kMaxIslandVoxels`, or touches an unfetched
-  chunk that reads as solid. That is now *measured* rather than assumed — the
-  `anchoredBy*` counters say which of the three is holding a region up — and
-  the fix for it is a slow global "connected to the floor" sweep, not a wider
-  local scan.
+- **The queue was head-of-line blocked (2026-09-04).** `PreTick` examined
+  `events_.front()` and nothing else, so a head whose chunks had not arrived did
+  nothing for 120 ticks while everything behind it aged toward its own timeout:
+  one region that streamed out took four seconds of island detection down with
+  it, measured as **312 events dropped over one burning tree**. A bounded prefix
+  of the queue is now probed and the ready ones run, with only the first couple
+  of probes allowed to request fetches (a deep probe must not flood the fetch
+  queue that the events in front of it are waiting on). A stuck event whose
+  region is still resident spills to `pendingSupport_` rather than being
+  dropped; only one that has genuinely left the window is dropped, and that is
+  not a leak because there is nothing there to float. Also `EventReady` now
+  requests the one-chunk **ring** around the region — the cells `solidOutside`
+  reads and that nothing had ever fetched, so a component touching a scan-box
+  face was anchored on a guess — but does not *wait* for it, since a stale ring
+  answers "is there rock out there" perfectly well.
+- **A solid that turns to powder in place stops holding things up
+  (2026-09-04).** `flagSupportLoss` returned early for a powder *product* as if
+  it still supported everything, and the ash then flowed away flagging only the
+  cell above it — so a clump held sideways or from above by a leaf that burned
+  to ash was never flagged and never scanned. Powder carries the cell above it
+  and nothing else, and the flag now says so (all solid neighbours except the
+  one above). `soloSolid` has the same correction: powder counts as attachment
+  only when it is *below*. Both came out of the `tree-fell` natural burn-out
+  series, where residue sat flat at ~30 while the hot count fell 3× — stranded,
+  not smouldering. And `SettleFootprintSupported` no longer abstains-as-yes on
+  an unfetched chunk below (the 12-voxel leaf body at the edge of the fetched
+  region was the biggest floater left), and every settle now queues a support
+  scan over the stamp, since a stamp vacates nothing and so raises no flag.
+- **The flood seeds from what changed and stops at the first anchor
+  (2026-09-04).** `RunIslandDetection` used to seed from every solid cell in
+  the region, which for a 64³ box on a hillside meant labelling the whole
+  terrain slab on every scan to learn that the ground is anchored. A component
+  that does not touch the changed box (the erased cells or the flagged chunk,
+  plus one cell of slack) did not lose its support *here*, so only solids in
+  `Event::seedLo..seedHi` start a flood; and once a component is anchored — by
+  the boundary, by powder beneath, by size, or by touching a component already
+  judged anchored (the verdict is transitive, which is what makes stopping
+  sound) — the rest of its walk is bookkeeping for nothing and is skipped.
+  Unanchored components are still flooded to completion, because their cells
+  are what gets converted. Measured on one burning tree: **40.2 M → 0.59 M
+  cells visited (68×)** with identical verdicts, A/B in one binary via
+  `SANDVOX_ISLAND_FULL_FLOOD=1`. The scan budget is now in **cells**
+  (`kIslandScanCellsPerTick`), not scans, so the saving turns into scans. A
+  narrow-margin first tier that escalated on clipping was tried the same day
+  and reverted: near a tree 627 of 714 narrow scans clipped, so it doubled the
+  work and the residue rose.
+- **What the burn half of `tree-fell` measures now:** after an oak-sized tree
+  burns and is quenched, **0 floating components** at +400 ticks and the world
+  clean within 100 ticks (the sample stride) — down from 38 lone voxels and 29
+  clumps. The residue the owner reported hanging "for a minute or two" was two
+  things: matter still smouldering (a burnt crown keeps making floaters for
+  thousands of ticks), and the queue above dropping or starving the scans that
+  would have cleared them.
+- Remaining accepted flaw, and it is now a **plan rather than an admission**
+  (`docs/PLAN_rigidbody_islands.md`): the scan is still local and conservative,
+  so a large floating section survives when it extends past the 80-cell region
+  (`kMaxRegionCells`), exceeds `kMaxIslandVoxels`, or touches an unfetched chunk
+  that reads as solid. Measured rather than assumed — cut an oak-sized tree
+  through the trunk and **28,573 voxels stay standing** while the scan makes a
+  25-voxel body, and the `anchoredBy*` counters name which cap did it. For that
+  tree only the first binds (28,573 is under 32,000 and every axis is under the
+  `int8` 120), but a `great_oak` at 159 × 230 fails all three. The chosen fix is
+  a sparse chunk-tiled flood that can span 256 cells, plus **sharding an
+  oversize component into ≤96-voxel sub-bodies welded with the cone-limited
+  joints ragdolls already use** — which also makes a felled trunk flex and snap
+  instead of falling as a rigid telephone pole. A global "connected to the
+  floor" sweep is no longer the presumed answer: the single-voxel case that
+  motivated it is handled locally and for free by the rule above. Gate:
+  `tree-fell`, assertion `cut-trunk-fells-the-tree`, red on purpose.
 
 ### Rigidbodies
 - Detected islands are **removed from the grid** and become rigidbodies:
@@ -2976,157 +3064,404 @@ running over the baked model.
   This tag-composition structure is deliberately the seed of the Noita-style
   wand/spell system later.
 
-### The spell system (2026-08-20; `game/spell`, `game/caster`, `assets/spells/glyphs.json`)
+### The spell system (2026-08-20; grammar 2026-09-04; `game/spell`, `game/caster`, `assets/spells/glyphs.json`)
 
-The Noita-style wand system this section always anticipated ("spell modifiers
-attach as tags with per-frame logic ... the seed of the Noita-style wand/spell
-system later"), crossed with the *ancient language* of Eragon: you speak words,
-the words compose, and imprecision is punished rather than rejected. What is
-implemented is an **exploratory slice** — one form (projectile), four elements,
-two modifiers — deliberately optimized for being CHANGED rather than for being
-complete. What follows is the part that is *not* meant to change.
+The Noita-style wand system this section always anticipated, crossed with the
+*ancient language* of Eragon: you speak words, the words compose, and
+imprecision is punished rather than rejected. The first slice (2026-08-20) had
+three glyph types and a "last element wins" fold; `docs/PLAN_magic_grammar.md`
+replaced the *language* on 2026-09-04 while keeping the four structural
+commitments below, which are the part of this section that is *not* meant to
+change.
 
 **A spell is a program whose only output is op-stream emissions.** Every world
 change a spell makes leaves as a `BrushOp`/`ExplosionOp`/`CellOp`/
-`ParticleSpawn` on the MutationQueue (rule 3). `SpellEmission` is the only
-channel out of the VM, and there is no path from spell code into a voxel
-buffer. That is what gives spells save/replay/networking for free, and it is
-why a spell blast joins the ordinary `exps` list rather than getting its own
+`ParticleSpawn`/`WindPrim` on the MutationQueue (rule 3). `SpellEmission` is
+the only channel out of the VM, and there is no path from spell code into a
+voxel buffer. That is what gives spells save/replay/networking for free, and it
+is why a spell blast joins the ordinary `exps` list rather than getting its own
 detonation path — island checks, body damage, mob carving and impulse all apply
 with no spell-specific code.
 
 **The effect payload is position-parameterized, so backfire is free.**
-`ApplySpellEffect(spell, at, dir, strength, out)` takes the position as an
-argument, so "cast it at the muzzle" and "cast it at the caster's own chest"
-are the *same call*. Backfire is therefore never per-spell special-case code: a
-new element or form gets a thematic death the day it is added. This was built
-this way from the first line, while only two effects existed, precisely because
-it is the kind of structure that cannot be retrofitted once the glyph set grows.
+`ApplySpellEffect(payload, at, dir, strength, out)` takes the position as an
+argument, so "cast it at the muzzle", "cast it where the bolt landed", "cast
+it at the clicked body part" and "cast it into the caster's own chest" are the
+*same call*. Backfire is therefore never per-spell special-case code: a new
+verb gets a thematic death the day it is added.
 
 **The VM is integer, in fixed point — and this is NOT rule 1.** Projectile
 position/velocity are 24.8 fixed-point voxels (the exact convention
 `ParticleSpawn` already uses), and mana/health/timers are integers. Spell state
 is CPU-side gameplay state *outside* the hashed grid domain, exactly like mobs
-and debris, so the world hash cannot see it either way — verified: the hash is
-unmoved at `765da1f8` with the system live. It is fixed-point for **lockstep MP
-(§10) and replay debugging**, where a projectile's path must reproduce
-bit-exactly on every machine. The comments say so explicitly so nobody
-"simplifies" it back to float. Floats appear only at the drawing boundary.
+and debris, so the world hash cannot see it either way. It is fixed-point for
+**lockstep MP (§10) and replay debugging**, where a projectile's path must
+reproduce bit-exactly on every machine. Floats appear only at the drawing
+boundary.
 
-**The VM is not player-coupled.** Casting is a free function over (glyph list,
-caster state, origin, direction) → emitted ops; a mob will drive the identical
+**The VM is not player-coupled.** Casting is a free function over (cast list,
+caster state, origin, direction) → emitted ops; a mob drives the identical
 `Cast()` call. Health is read through a `CasterHealth` callback rather than a
 field, which is what lets the player's health stay where it actually lives —
-`PlayerAvatar`'s per-part hp — instead of a parallel number that would drift
-from the visible damage state within a session. `PlayerCaster` (inventory +
-spoken stack) is a separate struct and `Player` is untouched.
+`PlayerAvatar`'s per-part hp — instead of a parallel number that would drift.
+`PlayerCaster` (inventory + spoken stack) is a separate struct and `Player` is
+untouched.
 
-**Rule 2 applies to magic, with no exception.** Every sustained effect declares
-a finite budget up front: a trail carries a hard voxel VOLUME budget that only
-decreases, and the projectile dies when it is spent; lifetimes and live
-projectile counts are capped in `glyphs.json` and clamped against engine
-ceilings at load. A generation counter is wired now (`Spell::gen`, capped)
-even though nothing triggers anything yet — it is the subcriticality guarantee,
-and it is annoying to add after triggers exist. This codebase has hit the
-"permanent condition keeps chunks awake forever" trap three times already
-(light-gated rules, staining, viscous liquids); a trail spell must not be the
-fourth, and the selftest asserts the budget is respected *exactly*.
+**Rule 2 applies to magic, with no exception.** Every lowered cast carries four
+finite numbers — `ticks`, `voxels`, `instances`, `generation` — and law L8
+asserts them. A trail carries a hard voxel VOLUME budget that only decreases,
+and the projectile dies when it is spent; lifetimes, live projectile counts,
+multiplicity, fan count and generation are capped in `glyphs.json` and clamped
+against engine ceilings at load.
 
-**Every sequence compiles into something that does something.** There is no
-invalid spell — only one that does something other than you meant. That is the
-design thesis: the ancient language punishes imprecision by granting the
-literal request, not by refusing to parse. `CompileSpell` is total, and two
-rules are what make it so:
+#### The grammar (docs/PLAN_magic_grammar.md §1–§3; `ParseSpell`, `LowerSpell`)
 
-- **Repetition amplifies.** The Nth utterance of a glyph contributes 2^(N-1)
-  and costs 2^(N-1) times its mana, so `sand`=×1, `sand sand`=×2,
-  `sand sand sand`=×4 — the running total for N words is (2^N − 1)× the base.
-  Doubling rather than a linear ramp because the interesting decision ("is this
-  worth an entire extra mana bar?") only exists if the curve is steep, and
-  because it makes the price legible without arithmetic: each extra word costs
-  as much as everything before it combined. Capped at ×64 (`kMaxAmplifyPow`);
-  past the cap an extra word is free and does nothing, which is more honest
-  than charging for an effect the budget will refuse to deliver. A *different*
-  element replaces rather than stacks (`water lava` throws lava): an element is
-  what the spell is made OF, and "made of two things" has no meaning here while
-  "more of it" does. Repeating a form throws harder, repeating a modifier buys
-  a proportionally bigger one — `trail trail` is one trail with twice the
-  budget, not two trails fighting over one projectile.
-- **An unspoken form is Spray.** `SpellForm::Spray` is the fallback, not "no
-  form": a bare element flings a few loose voxels of itself out of the caster's
-  hand as ballistic particles (the existing ejecta pipeline, §5 — they fly,
-  collide and reinsert on landing). So the shortest legal spell is one word,
-  and every longer sequence reads as an elaboration of it rather than as a
-  correction. Spray is emitted from inside `ApplySpellEffect`, so a fatal spray
-  backfires into the caster's own body for free like everything else.
+Hundreds of glyphs, uncountably many sequences, every one does the predictable
+literal thing, and nobody ever writes a rule for a specific combination. The
+way to get that is the way programming languages get it: a handful of
+**sorts**, a fixed **valence** per word, a tiny set of **primitives** every
+effect lowers to, and a **tariff** that prices what the spell does to the
+world rather than the words it used.
 
-Only silence is not a spell. A form with no element still charges and fizzles.
+Five sorts, declared per glyph in `glyphs.json` (`sort`): **Matter** (a
+material by name; `air` is the void, `anything` the wildcard), **Effect**
+(something that happens at a point: a `verb` plus parameters), **Delivery**
+(how an Effect reaches a point: `mech` instant | flight | continuous plus the
+record fields), **Mod** (a field edit on the delivery record: `field`, `op`,
+`amount`), **Operator** (a verb with argument slots — `left`/`right` list the
+sorts each accepts, `result` the sort produced; every unary operator takes the
+word BEFORE it, only `transmute` is infix). Nothing in C++ knows which words
+exist. The C++ vocabulary is the sort names, the verb names (`spray`, `place`,
+`convert`, `explode`, `wind`, `mend`, `trail`, `sustain`, `filter`, `repeat`)
+and the record field names — each verb maps to ONE op type or ONE engine seam,
+and `ApplySpellEffect` switches on the verb and nothing else.
 
-The HUD shows what the VM thinks the spell is — "spray: 6 voxels from your
-hand", "bolt ×2, element ×4 + trail ×2" — which is worth far more than
-validation, since the question is never "is this legal" but "what will this do".
+Six parse rules, and they are the whole grammar:
 
-One arithmetic trap this cost, recorded because the two counters look
-interchangeable and are not: the amplification counters track repeats *beyond
-the first* (one utterance ⇒ pow 0, which is what the `×` multipliers want),
-while the mana charge needs the count of *prior* utterances. They differ by one
-from the second utterance onward. Reading the counter directly for the charge
-billed the second `sand` at ×1, so three sands cost 3/6/12 while the voxel
-count correctly doubled at 3/6/12 — the output and the price silently disagreed.
+- **R1 runs merge.** `shotgun shotgun shotgun` is `shotgun×3`; capped
+  (`budgets.maxMultiplicity`). Matter and Effects ADD (×N of the verb's declared
+  axis: spray voxels, explode power); Mods COMPOSE (applied again: shotgun
+  3/9/27, swift ×2/×4, float −1g/−2g).
+- **R2 operators bind their neighbours, greedily, on their declared side,**
+  left to right. A bound group is one item of the operator's result sort, and
+  the HUD's brackets are *derived from the binding*, so what you see is what
+  bound.
+- **R3 an operator with an empty required slot is INCOMPLETE:** charged its
+  word, does nothing, drawn as `_`. There are no defaults — `anything` and
+  `air` are words — so "unmake whatever is there" is spelled `anything
+  transmute air`.
+- **R4 a Delivery closes the clause.** `explosive projectile fire bomb` is two
+  casts. A second Delivery starts a new clause rather than replacing the first,
+  because that is the only total reading that never discards a spoken word.
+- **R5 a clause without a Delivery is delivered by `hand`,** at reach in front
+  of the caster. A bare `explosive` goes off there, and yes, it hurts.
+- **R6 order inside a bag does not matter.** Only operators (R2) and clause
+  boundaries (R4) are order-sensitive. The lowering rebuilds each clause from
+  its bag in a CANONICAL order (by key), because mods compose through integer
+  arithmetic that does not commute under clamping (49 halved then doubled is
+  48) — without that `swift slow` and `slow swift` would be two different
+  records and R6 would be a lie.
+
+`ParseSpell` (R1–R4, R6) produces a `SpellTree`; `LowerSpell` turns each clause
+into a `SpellCast` — a `DeliveryRec` (the record Mods edit), a payload of
+`EffectInst`s, an instance count, the four rule-2 budgets and the price split
+into word / tariff / carry; `CastList` is what `Cast()` runs, what a projectile
+carries and what backfire runs. Every sequence lowers to a definite cast list;
+there is no misfire state, and the imprecision penalty lives entirely in the
+mana/health crossover.
+
+**The reference interpreter is the oracle.** `scripts/magic_grammar.py`
+implements R1–R6 over the same glyph table and generates
+`docs/MAGIC_PERMUTATIONS.md` (every word, every brief sentence, every pair over
+a 19-word alphabet, every triple over a 10-word core). `--oracle` writes
+`assets/spells/grammar_oracle.json`, and the `spells-oracle` gate parses every
+entry with the C++ and compares the bracket string and the clause structure.
+A row of the permutation table that reads wrong is a rule that is wrong; fix
+the rule in both places and regenerate.
+
+**The laws are the gate, not a pinned list.** The `spells` gate asserts
+algebraic properties over every sequence of length ≤ 3 drawn from that
+alphabet, generated in the test: L1 totality (non-empty cast list, finite
+cost, non-empty description), L2 bag commutativity (a permutation with the
+same canonical form lowers to an IDENTICAL cast list, compared field by
+field), L3 multiplicity (`g g` ≡ `g×2` exactly until the cap: spray voxels ×N,
+explode power ×N, a mod's field edited once more per word, cost monotone),
+L6 local binding (an operator's bound arguments do not change when a word is
+inserted anywhere that does not land inside or adjacent to ANY operator
+group's spoken span — "any", because greedy binding means a word dropped into
+another operator's slot region can steal its argument and free a word for this
+one; locality is about where the word lands relative to every binding), L4
+clause independence (`cost(A ‖ B) = cost(A) + cost(B)` and the casts are the
+union whenever the parse of A+B is the parses side by side), L7 tariff
+monotonicity (`A transmute B` non-decreasing in `arcane(B) − arcane(A)` and in
+volume; a spray in its voxel count), L5 delivery invariance (the payload of
+`E… projectile`, `E… bomb` and `E… self` is identical; only the record
+differs), L8 budgets (every lowered cast declares finite ticks, voxels,
+instances and generation). A change that breaks a law breaks a *class* of
+spells, which is what the line says; a change that moves one spell's numbers
+is a rebaseline.
+
+**Sustained things are the `aura` operator, one word for wards and curses
+alike (plan §7; `SpellStatus`, `SpellSystem::Adopt`).** `X aura` produces an
+Effect that, where it resolves, attaches X — an Effect, a Matter (sprayed), or
+a Mod — to the body at the point (the owner's `SpellBodyProbe::bodyIdAt`, an
+opaque id: a mob's, or the player's caster id) or to the place if no body is
+there. `float aura self` is floaty; `float float aura projectile` lifts
+whoever the bolt hits; `fire aura self` sprays fire from your body every tick.
+The status runs every tick where the body is now and is BILLED every tick to
+the caster (`SpellEmission::bills`) at the inner effect's tariff — the same
+tariff as it emits, no second mechanism — and the caster's max mana shows the
+per-tick sum × a 30-tick horizon as RESERVED (`CasterState::reserved`, drawn
+on the bar the way the burn cap is). It ends when the caster drops it (Delete
+drops the newest), when the body is gone, when they run dry (mana, then
+health; when neither pays, `DropAll`), or at the hard tick cap
+(`budgets.maxStatusTicks`); a caster may hold `maxStatusPerCaster` at once
+and the aura beyond it is charged and attaches nothing (rule 2). A sustained
+Mod acts on the body as if the body were the delivery: gravity is a per-tick
+impulse the owner applies (`bodyImpulses`; the player's controller today,
+mobs have no impulse seam yet), the rest have no meaning on a body and were
+charged for the word.
+
+**`null` is the op-stream filter, at the MutationQueue splice.** `W null`
+yields a filter entry (one tick, unless an aura re-issues it every tick) that
+refuses incoming ops of W's kind within its radius — by W's SORT and VERB,
+never by name: a Matter word refuses ops and spawns of that material,
+`transmute` refuses overwrite/melt ops, `explosive` explosions, `gust` winds,
+a Delivery word absorbs carriers of that mech (bolts die inside a
+`projectile null aura self`). The owner calls `FilterStreams` on the tick's
+`ops`/`exps`/`spawns` right before `SubmitTick`, whoever produced them (the
+brush, a mob, a spell — including the ward-caster's own), and the count is
+shown in the HUD. The op stream, never the CA: acid already flowing still
+flows, and that is the counterplay, on purpose.
+
+**`beam` is continuous delivery; `echo` a bounded repeat.** A held beam
+(`SpellBeam`) follows the caster's aim (`HoldBeam` every tick with the cast
+key's state), marches the ray to the first solid or its reach, resolves the
+payload there every tick and bills the tariff of one resolve per tick; it
+ends on release, on running dry, or at its tick cap. `E echo` runs E now and
+schedules it again every `everyTicks` for `repeats` in all (`SpellEcho`),
+priced up front as repeats × E.
+
+Gate `spells` check (6): an aura attaches, bills every tick, reserves, caps
+per caster, drops on request and runs out at the tick cap; a beam resolves
+every held tick and is gone after release; an echo fires exactly `repeats`
+times; a ward refuses a convert op inside its radius at the splice, passes a
+paint op, and is gone the next tick.
+
+**Mend is the graft loop, and the anatomy `.vox` is the recipe (plan §7;
+`Mob::RestoreVoxels`).** `M mend` is an Effect-operator with a left Matter
+slot: where it resolves it takes up to `perTick × n` voxels of M from within
+its radius — each leaves the world as a `convert(cell→air)` op filtered to M,
+so nothing else goes — and posts a `SpellRestore` (caster, M, count) that the
+owner applies to the caster's body: `Mob::RestoreBody` walks the rig
+root-first and `RestoreVoxels` fills the next missing cells of each LIVE limb
+with M, nearest the joint anchor first so a stump regrows outward, re-derives
+the collider and the brick the way a carve does, and credits hp for the
+volume put back. "Missing" is well-defined because the def's prefab model is
+what should be there (rebased by the drift `ReskinLimbMicro` left on
+`restOffset`). The restored cell IS material M: wood burns, steel does not,
+acid eats flesh and not glass. The tariff makes the anatomy's own materials
+(the glyph's `native` list) cheap and everything else dear
+(`foreignPenaltyMille` × `arcane(M)` per voxel). A severed limb is not
+regrown: it has no lattice to fill; `mend self` finds no matter at the
+caster's own body (the body is not in the grid) and mends nothing. The
+starter page `heal` is `blood mend`.
+
+**The cauterise rule is a body rule, not a spell rule.** In the bleed tick,
+a wound whose EXPOSED flesh has charred is CLOSED: the budget is dropped, the
+gout stops, the stump no longer tops itself up (`Mob::WoundCharred`). The
+measure is the surface voxels (an open face) within 1.5 world voxels of the
+wound that can char at all — bone and steel neither bleed nor burn — and the
+wound is closed when a third of them are at burn stage 2. Surface, not
+volume, and a third, not half, for the reason the burn cap grades by
+body-surface area (`Mob::RecountBurn`): the char is inert and shields what
+is under it, and charred voxels burn down to ash and leave the lattice, so a
+stump in a fire has its whole outside black while its charred share of
+volume converges near a third and its charred share of surface plateaus well
+under one. So `fire self` on a bleeding stump chars the exposed flesh and
+stops the bleeding — and so does any fire, from any delivery, and it costs
+the burn. Gate `spells` check (7): the VM half over a fake mirror, the graft
+on a carved creature (missing count falls by exactly what landed), and a
+severed forearm's stump bleeding, then standing in world fire (the path a
+sprayed `fire` takes: bare skin catches from hot cells beside it, direct
+ignition is the cloth entry point), then closed while the creature lives —
+at tick 811 of 1500 on the human.
+
+**Deliveries are three mechanisms, and Mods are field edits on their record
+(plan §5; `DeliveryRec`, `ApplyMod`).** `hand`/`self` are *instant* at a
+point; `projectile`/`bolt`/`lob`/`orb`/`bomb` are *flight* (speed, gravity,
+lifetime, bounces, pierce, seek, fuse, count, children, resolve radius, a
+trail with its budget); `beam` is *continuous*. A Mod names ONE field and
+how to edit it (`field`/`op`/`amount` in `glyphs.json`) and repeating it
+applies the edit again — `shotgun` ×count, `float` −1 g, `swift` ×speed,
+`long` ×lifetime (and ×fuse, and ×reach when anchored), `wide` ×radius,
+`bounce`/`pierce`/`seek` +1, `fuse` +30 ticks, `split` ×children. Adding a
+Mod is one JSON entry naming a field. The runtime reads the record and
+nothing else: a bounce reflects the axis that entered the solid (each axis
+probed alone) and loses a fifth of the speed; a pierce passes through one
+wall and resolves on the next; a fused bolt rests where it landed and counts
+down; a seeking bolt turns toward the nearest target the owner names
+(`SpellBodyProbe::nearestTarget`, integer steering after one float→fixed
+conversion at the query boundary); `split` launches children with the same
+payload from the last free position, one generation down, and nothing past
+`budgets.maxGeneration` launches (rule 2). A gravity Mod on an anchored
+delivery is reported as `casterImpulseVps` for the owner to apply to the
+body — `float self` hops.
+
+**A bomb is a rigid body through the existing debris path.** The VM cannot
+create a body (that is physics, the owner's business), so `bomb` reports a
+`SpellBodyRequest` (centre, velocity, radius, the delivery glyph's `material`)
+and the owner makes a Jolt sphere with a voxel ball, adopts it as ordinary
+debris — it falls, rolls, settles, burns, can be blown apart — and hands the
+handle back through `SpellSystem::AdoptBody(token, handle)`. Each tick the VM
+asks `SpellBodyProbe::bodyAt` where it is, lays its trail as it rolls (the
+trail mod runs on the record regardless of speed, so a `fire trail bomb` lays
+fire down the slope), and when the fuse runs out resolves the payload WHERE
+THE BODY IS and reports the handle in `bodyDone` for the owner to remove. A
+body that is gone before its fuse (something blew it up) resolves where it
+was last seen; a request the owner never adopted resolves at the hard tick
+bound. Bombs share `maxLiveProjectiles`.
+
+**`self` from the character screen resolves at the clicked part.** The health
+inspector's limb rectangles become targets while a sentence is on the stack
+(`InspectCastPicks`); the click latches only a body slot (`castAtPart`), and
+`main.cpp` turns the slot into the limb's world transform and calls the same
+`Cast()` with `selfAt` — the effect radii clamped to the delivery's impact
+radius so `fire self` on a stump chars the stump and not the torso beside it.
+Nothing in the VM knows what a part is.
+
+**Cost: you pay for voxels, not for words (plan §4; `EffectTariff`,
+`PriceCast`).** Every glyph has a small fixed `word` cost. The real price is
+the TARIFF on the ops the cast emits, and the lowering knows those before
+anything is cast, so the HUD shows the split — word + tariff + carry — live,
+and "why is this 900 mana" is answered before the click. Material value is one
+integer per material (`arcane` in `materials.json`, derived from density when
+absent; `MaterialDef::arcane`), not a from×to table, so hundreds of materials
+stay O(N) and a modder prices a new one with one key. Spray/place cost voxels
+× `arcane(M)` × `rates.place`; convert costs voxels × (`rates.convert` +
+max(0, `arcane(B) − arcane(A)`)) — down in value is the base only, up is the
+gap, and water→gold over a pool of thousands of voxels is the story the brief
+wants told; explode costs power × r³ × `rates.explode`/1000, the one
+superlinear curve per word because the WORLD effect is; wind costs footprint
+× ticks; mend costs voxels × `arcane(M)` × `rates.graft`. Each Delivery
+declares `carry`, a per-mille premium on the payload tariff (`hand`/`self`/
+`bomb` 1.0, `projectile` 3.0, `bolt` 4.0), and instances multiply everything,
+so `shotgun³` pays 27 bolts' worth and reads as a lethal number before you
+commit. Sustained effects (`aura`, a held `beam`) price at zero up front and
+pay the same tariff per tick as they emit.
+
+**`anything` is priced when it lands.** The wildcard's tariff is unknowable
+before the cast (the HUD shows `+ ?`): on resolve, the material actually at
+the point (the centre cell stands for the volume) is read through the
+`SpellProbe` over the CPU mirror, and the cast bills the conversion from it
+plus that matter's value × `budgets.anythingSurchargeMille`, reported as
+`SpellEmission::billOnResolve` and paid by the owner mana-first, then from the
+body. An `anything transmute gold` into a gold vein is cheap; the same bolt
+into a lake bills the water→gold gap for the whole resolve volume after the
+fact, which is the danger the word is for.
+
+**Imprecision degrades the product, not just the aim.** An Unstable cast's
+convert ops land in melt mode (`BrushOp` mode 2, each cell to its own authored
+heat product) with probability equal to the instability, per op, by
+counter-based hash — so the caster who tries `water transmute gold` on a tarn
+spends the pool, runs into health, and the last ops boil the water instead of
+gilding it. The instability rides on the projectile to its impact. One `if` on
+an existing op mode, not a new system.
+
+Two decisions worth recording because the obvious alternative is wrong:
+
+- **`transmute` is an OVERWRITE brush op (mode 1) with a FROM filter, not the
+  laser's melt mode (2).** Melt converts each cell to *its own* authored
+  `molten` product, which is exactly right for a heat beam and exactly wrong
+  for "turn dirt into water", where the caster chose both ends. The from
+  filter rides in the op's spare words (`_p0` = the only material it may
+  replace, 0 = any; `_p1` bit 0 = the wildcard matches matter, not the void),
+  zero for every other producer, so the brush and the laser are unchanged.
+  `air transmute B` is a paint-into-air op; `A transmute air` is an erase
+  filtered to A. Melt mode is used for exactly one thing: the share of an
+  UNSTABLE convert that goes wrong (plan §4).
+- **Matter under `trail` lowers to `place` (a mark), not `spray`.** A spray
+  at every marked voxel would multiply the particle spawn count by the spray
+  size along the whole path, and the trail budget is a voxel count: one mark
+  per voxel is what it measures. Everywhere else a free Matter is `spray(M)`,
+  which is what keeps the one-word spell alive.
 
 **Casting into health makes a spell IMPRECISE, not merely expensive.** Cost ≤
 mana casts normally; cost ≤ mana + health casts but spends the remainder as
 health *and* wobbles the trajectory in proportion to how deep it went; cost >
-mana + health runs the spell's own payload at the caster and kills them. That
+mana + health runs every cast's payload at the caster and kills them. That
 middle case is the whole mechanic — it makes the mana bar a *precision meter*
 rather than a second HP bar — so the HUD draws mana and health on one axis with
-a hard break at the crossover, rather than as two numbers.
+a hard break at the crossover.
 
-Two decisions worth recording because the obvious alternative is wrong:
-
-- **`transmute_to` is an OVERWRITE brush op (mode 1), not the laser's melt mode
-  (2).** Melt converts each cell to *its own* authored `molten` product
-  (stone→lava, sand→molten glass), which is exactly right for a heat beam and
-  exactly wrong for "transmute to acid", where the caster chooses the target
-  material. Mode 1 is the existing primitive for that; no second conversion
-  path was invented.
-- **A projectile treats UNKNOWN cells as PASSABLE, the opposite of the player
-  controller's choice.** The CPU mirror covers only the 3×3×3 chunks around the
-  player (~48 voxels), which is ample for a capsule that never leaves its own
-  neighbourhood and useless for a 48 vox/tick projectile that exits the mirror
-  within one tick. Reading Unknown as solid — the conservative-looking option —
-  detonates every bolt in the caster's face. Out-of-window space is still
-  solid, per §3. The cost is that a bolt fired at a distant wall passes through
-  it; the honest fix is a swept `RequestChunkFetch` along the flight path, not
-  a bigger mirror.
-
-Wards and glyph conjoining are landed as **shape only** (structs + `glyphs.json`
-blocks, no behaviour). The recorded intent for wards is the load-bearing part:
-a ward filters the incoming **op stream** (cheap, CPU-side, sim untouched), not
-the CA — so it stops someone *casting* acid at your feet but not acid already
-flowing toward you. That is deliberate: it keeps the falling-sand game
-underneath and makes "cast next to them and let physics do it" the counterplay.
-Ward drain is a **fraction** of max mana rather than a flat amount, because a
-flat cost lets a big late-game pool buy invulnerability.
+**A projectile treats UNKNOWN cells as PASSABLE, the opposite of the player
+controller's choice.** The CPU mirror covers only the 3×3×3 chunks around the
+player (~48 voxels), useless for a 48 vox/tick projectile that exits it within
+one tick. Reading Unknown as solid detonates every bolt in the caster's face.
+Out-of-window space is still solid, per §3.
 
 Op budget fairness is explicit (`SpellSystem::kSpellOpsPerTick = 24` of the 64
-`BrushOp`s, alongside `gore.bleedOpsPerTick` — 6 by default — for mob and for
-avatar bleeding each; magic's share is deliberately NOT tunable, so turning the
-gore up cannot starve spells, and the bleed side is clamped to 64) and overflow is
-**counted and shown in the HUD** rather than dropped silently — a spell that
-sometimes doesn't fire is miserable to diagnose.
+`BrushOp`s, alongside `gore.bleedOpsPerTick` for mob and avatar bleeding;
+magic's share is deliberately NOT tunable) and overflow is **counted and shown
+in the HUD** rather than dropped silently.
 
-Selftest gate `spells`: the trail's voxel budget is respected exactly and the
-projectile dies with it; an overcast resolves Fatal, emits its own payload, and
-asks for the caster to be carved; and a bare element sprays, with N+1 words
-producing *exactly* twice the matter of N at *exactly* the doubled price.
-Invariants, not plausible numbers — the amplification is asserted as an exact
-relation between three casts rather than as absolute counts, because a gate
-that only checked "more words ⇒ more output" would pass a linear ramp too, and
-because measuring the relation is what caught the off-by-one above. The first
-version of the gate folded the impact op into the trail total and reported 343
-voxels against a 64 budget, where the budget was fine and the measurement was
-wrong.
+**The tongue: two banks on the number row (plan §12a; `game/caster.h`).**
+`1`–`0` speak bank A (slots 0..9), `Shift+1`–`0` bank B (10..19): twenty live
+words, one hand, no menu. Sprint is on Shift outside magic mode and magic mode
+captures the number row, so nothing collides. A slot holds a glyph OR a
+grimoire page (`SlotKind`), both by NAME; the HUD strip draws two rows and
+lights the bank Shift is holding. The character screen's arsenal is sorted by
+SORT into five columns — matter, effect, operator, delivery, mod — each glyph
+with its sort's colour and its valence mark (`<` takes the word before it,
+`><` is infix), unowned glyphs greyed with their name hidden (the shape of a
+word you have not learned is visible and the word is not), and hover opens
+the §9 info box, every field of which is read from the glyph's JSON entry
+(`UIState::GlyphUI`), so the box is never wrong about the glyph and a modder's
+glyph gets one free. `GrantAllAndBind` is the debug default; `Grant`/`Owns`
+are the acquisition loop's seam.
+
+**The grimoire: macros as saved word lists (plan §12b; `Grimoire`,
+`ExpandWords`).** A page is a name and a list of glyph NAMES and page NAMES.
+Speaking it pushes its expansion onto the stack exactly as if you had spoken
+the words, and the six rules apply to the result — that sentence is the whole
+mechanic. Pages are fragments (`hellfire projectile` and `hellfire bomb` are
+both live sentences; `hellfire hellfire` merges by R1), they nest to
+`budgets.maxMacroDepth` (4) with a cycle check at save time that refuses with
+the reason shown (`GrimoireWouldCycle`), and an expansion is capped by the
+16-word stack: a page speaks as much as fits and the HUD says so (rule 2: no
+unbounded expansion, ever). A word that no longer resolves drops with a log
+line and shows as `?`; the page is kept (the DESIGN §8b contract). Two ways to
+make one: `=` in magic mode CAPTURES the stack to a page auto-named from its
+readout (`fire2-trail-projectile`), and the character screen's GRIMOIRE panel
+COMPOSES — a page list (the authored starters from `glyphs.json`'s
+`conjoined` block appear read-only; `heal` = `blood mend`, `firebolt` = `fire
+trail projectile`, `ward` = `transmute null aura self`), and for the selected
+page a word row you drag glyphs and pages into and reorder, a name, the
+derived readout, the price (`?` when it depends on `anything`), Save / Delete
+/ Duplicate, and a row of twenty keys to bind it to. The row is described
+through the same `DescribeSpell` the live sentence uses, so the panel can
+never disagree with the game about what a page means. Editing a page rewires
+every slot bound to it, because slots hold the page's name.
+
+**PLYR v4** appends the grimoire (pages: name + words; the twenty slots as
+(kind, name) pairs) after the v3 payload and still loads v3 (an empty
+grimoire, the ten bound names landing in bank A). v2 and older stay refused,
+as they were. Gate `grimoire` (CPU-only, own fixtures, beside `player-kit`):
+expansion equals speaking (same cast list); nesting expands to depth and
+stops past it; a cycle is refused with a reason; the overflow cap truncates
+and reports; a missing name drops one word and keeps the page; the v4 round
+trip compares by name, a v3 payload loads with bank A intact, a truncated one
+is refused; a page bound to a key speaks its expansion; capture names the
+page from the sentence. `--shot-inventory` writes a third frame,
+`screenshot_inventory_grimoire.bmp`, with a page selected and its word row
+populated.
+
+Selftest gates `spells` (the trail's voxel budget respected exactly and the
+projectile dead with it; an overcast resolving Fatal, emitting its own payload
+and asking for the caster to be carved; `fire`×N throwing exactly N times the
+matter of `fire` at exactly N times the price; the cast latch; the laws; the
+bomb, the sustained things, the mend), `spells-oracle` (the parser against the
+reference script, every entry) and `grimoire`.
 
 ### Items, and mouse-directed melee (2026-08-20; `game/item.h`, `game/melee.*`)
 
@@ -4169,9 +4504,10 @@ as solid — the residency-window rule — or the camera backs out of the world)
 Pull-in is instant and push-out is eased; easing inward would leave the camera
 inside the wall for the duration of the ease, which is the artifact players
 actually notice. In first person the body is hidden but the arms, hands and
-staff are kept. The render eye is the only consumer — brush, laser, grenade and
-physics all keep using `Player::EyePos()`, so no camera setting can move the
-world hash.
+staff are kept. The render eye is the only consumer — brush, laser, grenade,
+physics and **the audio listener** all keep using `Player::EyePos()` /
+`ViewEyePos()`, so no camera setting can move the world hash, and none can move
+where you hear from either (§12b, "The ears are on the character").
 
 ---
 
@@ -6672,14 +7008,159 @@ across 630 ticks of a creature burning to death.
 
 ### The stock set
 
-`scripts/gen_stock_armor.py` emits hood / robe / sash / boots. The geometry is
-DERIVED, not drawn: each shell is the stock human's own silhouette dilated
-outward by one authored micro with the body subtracted back off, importing
-`gen_human.py`'s limb table rather than restating it. So the garment fits by
-construction, is strictly outside the body, and re-proportioning the human
-re-proportions the coat. Colour is art-palette slots in `.col` layers, never
-materials — painting with materials is what makes mina's sash burn on a
-different schedule from her sleeve.
+`scripts/gen_stock_armor.py` emits hood / robe / sash / pants / boots in cloth
+and leather, and iron_helm / iron_cuirass / iron_greaves / iron_sabatons in
+iron. The geometry is DERIVED, not drawn: each shell is the stock human's own
+silhouette dilated outward by one authored micro with the body subtracted back
+off, importing `gen_human.py`'s limb table rather than restating it. So the
+garment fits by construction, is strictly outside the body, and
+re-proportioning the human re-proportions the coat. Colour is art-palette slots
+in `.col` layers, never materials — painting with materials is what makes
+mina's sash burn on a different schedule from her sleeve. The plate set is the
+same builders over a different material (a helm with an eye slit for the hood,
+a short straight fauld for the skirt), which is the point of deriving: a second
+suit is a second row of one table.
+
+**What a per-z dilation cannot produce, and what was done about it (2026-09-04).**
+The tube is a ring per row and cannot cap anything, so every lid is authored
+explicitly — and three of them were wrong in ways only a dressed figure shows:
+
+* *Shoulders.* The torso's lid was its own top silhouette grown by one, and the
+  upper arms end on the SAME row, so the top of each arm was bare skin. The yoke
+  is now the torso's top row and both upper arms' top rows grown by one, on the
+  TORSO shell rather than the arms': the arm's anchor is its top
+  (`joint_top`), so a raised arm rotates in place under the yoke instead of
+  carrying a lid off with it.
+* *Neck.* The neck is three rows of the HEAD limb and the hood started above
+  them, so a dressed figure showed a stub of bare neck standing in the yoke's
+  hole. The torso shell now rings those rows as a collar and the hood and helm
+  start where the skull starts, on a seam with it; `neck_rows` derives the
+  count from the head geometry (the run of identical bottom rows) so both sides
+  read one number.
+* *The sash.* It was dilated from EVERY robe cell at waist height, and the
+  forearms hang beside the hips at waist height, so it ringed the sleeves too:
+  a band six micro wide on each side with a loop around each arm that stayed on
+  the hips slot while the arm swung out of it — "the hands go inside the belt".
+  It now seeds from the torso and skirt shells only, one micro proud of the
+  robe, and is INTERRUPTED where an arm hangs flush against the hips, because
+  there is no cell between them for a belt to pass through. At rest the arm
+  covers the break. That is the honest geometry of a figure whose arms hang
+  flush, and a better trade than a belt inside the sleeve (two shells in one
+  cell) or around it.
+
+The sleeves SHARE cells with the torso shell — the armpit corners and, at the
+waist where the torso tapers, a whole column — and that is deliberate. Giving
+those cells to one side was tried and put a stripe of bare forearm on every
+walking figure: the sleeve's inner wall is what shows when the arm swings
+forward and the torso's side column is what shows when it swings back, so
+whichever side cedes is wrong in half the gait. Two shells of one material in
+one colour coinciding at rest is invisible; z-fighting is only a defect between
+things that look different, which is why the sash does subtract the robe.
+
+**Iron, not steel.** `steel` carries no `tag:dissolvable`, so acid cannot
+touch it at all — that is what a sword is made of and what `armor-react`'s
+steel arm measures (0 voxels lost). A suit that acid eats SLOWLY is a different
+fact, and here a fact is a material: `iron` (materials.json, id 121) is not
+flammable, not organic, and carries exactly one rule of its own,
+`acid + iron -> air` at 10 per-mille a tick against 250 for flesh and cloth.
+The rule is APPENDED after acid's other rules rather than placed
+specific-before-generic: nothing else matches iron, and a rule inserted earlier
+renumbers every acid rule after it — rule index is part of the reaction RNG
+stream — so the world hash does not move for a material worldgen never places.
+`armor-react` arm (e) holds an iron plate in the same acid bath as the steel
+one for 60 ticks and asserts it is eaten — at all, and with at least 40% left.
+"At all" rather than a floor, because how much acid actually stands against a
+torso plate is bath luck (2.3% in 25 ticks in one run, 0.6% in 60 in the next)
+while steel's figure in the same bath is exactly zero every time; the figure is
+printed beside the verdict for anyone retuning the rate. Nor is it conditioned
+on the bare creature losing anything: nothing but acid removes iron, so the
+count is its own evidence, whereas the steel arm needs the bare creature to
+know its bath was acid — and on some terrain the bare creature stands where the
+acid never pools.
+
+### A blade chips iron; it does not carve it (2026-09-04)
+
+The kerf `Mob::CutLimb` builds is sized for flesh, and a shell is one authored
+micro thick, so a sword went through a cuirass and out the other side: the
+connectivity split found two halves, and the cut-through rule took "the entire
+centre piece" off in one blow. That is what a sword does to a robe; to a plate
+it does the other thing armour was built for, and skates.
+
+On a WORN slot the slot is scaled by `gear.cutHardnessRef` (8, skin's) over the
+shell material's `hardness` — the same 0..255 field the blast crater and the
+dig read — floored at `gear.cutHardnessMin` and at one skin cell in every
+direction, so cloth (5) and leather (14) are cut about like flesh, iron (160)
+takes a chip, and no strike costs a plate nothing. A suit still wears through
+under a patient enemy; it takes a fight rather than a stroke, and it wears
+through in HOLES, which the occlusion probe already reads as exposure. The
+impact-speed knock-loose (the sword-from-the-hand rule) no longer applies to
+worn slots: a strap does not snap because the blow was fast. Held blades were
+never carved (the sweep skips the held slot) and flesh keeps the wound model
+the `wound` gate pins. `armor-wear` 3c cuts a steel cube and a cloth cube of
+identical geometry with one kerf.
+
+### What leaves a body cannot launch anybody
+
+Everything that leaves a creature — a severed limb, a cut strap's plate, a
+sword knocked from a hand, a carved gobbet, a corpse's limbs, an item dropped
+from the pack — is created exactly where the creature is, which for the player
+means INSIDE the capsule proxy. A severed piece is also KINEMATIC for its
+0.25 s hold, frozen where it was cut: an NPC's arm cut mid-swing was frozen
+inside the player who cut it, on the normal contact layer, an overlap the
+solver could not move, so `PlayerPushOut` moved the PLAYER a body-width a tick
+for fifteen ticks. That was "I dismembered him and flew across the field", and
+the avatar's own pieces had already been exempted once (`Layers::AVATAR`).
+
+The rule now belongs to the body, not to who it came off.
+`Physics::ReleaseToWorldWhenClear` puts a body on the no-player-contact layer
+and remembers it; every step, each remembered body whose world AABB has left
+the proxy goes back to `MOVING` and is forgotten. So a piece never shoves the
+creature it came off, and the moment it has fallen clear it is ordinary debris
+that can be stood on, kicked and picked up — the avatar's corpse no longer
+keeps its exemption for good either. Bounded at 256; past that the oldest is
+released unconditionally. The avatar's `OnBodyReleasedToWorld` override is
+gone with it. NPCs were never pushed by anything: their limbs are kinematic and
+they have no push-out. `player-body` asserts a block born inside the proxy
+reads no push while it overlaps, and reads one again once the proxy has
+walked away.
+
+### A piece cut loose is a thing on the floor
+
+A cut strap was `DetachLimb(adopt)` like any severed limb, which made the shell
+an anonymous debris body: not the robe, nothing `E` could see, and the wearer's
+slot still said "robe". Now a piece's IDENTITY shell — the same panel a dropped
+copy is made of (`ItemGroundVoxels`) — takes the piece with it when it leaves
+by blade: its other shells fall as rags, the `WornPiece` entry is erased, the
+loss is reported through `Mob::LostGear` with the piece's damage captured one
+call before the shells forget it, and `MobSystem::SetOnItemShed` registers the
+body under the item's name in `WorldItems`. `main.cpp` drains the report at the
+top of the tick, BEFORE the sheath and the wear loop read the kit — or those
+seams would faithfully pull a second sword out of the sheath and put the
+cuirass back on — clears the equip slot, and files the damage by name, so a
+piece picked back up and re-worn has exactly the holes it had. A sleeve alone
+is still a rag, and the piece goes on being worn without it. A sword knocked
+from the hand takes the same road and the creature is unarmed from that
+instant (`heldSlot_` clears in `ShedGearBeforeDetach`, not at a later
+`EquipItem`). A shell consumed by fire registers nothing: there is no body.
+The dead slots are swept out of the appended tail once the severed hold is
+over, so `LimbCount` is not a history of what was worn. `armor-wear` 3d.
+
+The half of this that is still open: a piece knocked off an NPC and picked up
+by the player comes back as authored, because `WornDamage` is keyed by cover
+index and the ground registry carries only a name and a lattice.
+
+### Cross-limb heat respects the coat
+
+`BuildCrossLimbHeat` lets a burning limb warm its siblings through faces where
+the grid holds air — and that is exactly where `WornAlong` was never asked,
+because the probe ran only against a THREAT in the grid. A burning bare hand
+lit the wrist inside its sleeve, and the fire walked up the arm under the
+plate: "the character is on fire inside the armour". The probe now runs on
+cross faces too, with the same march and reach; the sibling's flame reads as
+the shell's material, which is not hot, and whether the shell catches from it
+is the shell's own pass's business. What can still catch is what the grid can
+see: the face behind a helm's eye slit, a bare hand, and the wrist opening of a
+sleeve along the arm's own axis.
 
 ### Mirror in, intent out
 
@@ -7302,6 +7783,29 @@ Two conversions happen in exactly one function (`AudioWorld::MakeParams`):
 - **Units.** The engine needs METERS, not voxels — its binaural cues use virtual
   ears offset by 0.087 *units*, which is a head radius only if a unit is a
   meter. Feeding voxels would put the listener's ears 87 cm apart.
+
+### The ears are on the character, not on the camera (2026-09-04)
+
+`ListenerPose` is published once a frame from **`Player::ViewEyePos()`** —
+the head, at ear height — with the orientation taken from `Camera`'s look
+direction. That split is deliberate and each half was once wrong:
+
+- **Position must not be the render eye.** It was, until this note. In third
+  person the render eye is an orbit boom several metres behind the body, so
+  flipping the camera key silently moved every distance, every doppler shift
+  and, worst, the occlusion ray's origin — and the boom is frequently pulled
+  into the wall behind the player, which muffled the whole world. Third person
+  now hears exactly what first person hears.
+- **Position must not be the avatar's head joint either**, tempting as "the
+  model's ears" sounds. That transform is one tick latent out of Jolt and rides
+  the gait's bob and sway; a listener parked on it turns every footstep into a
+  doppler wobble. It is the same three objections that stop the camera from
+  orbiting the head joint (§8, Camera). The player's own eye is authoritative,
+  frame-current and already step-smoothed.
+- **Orientation must be the LOOK direction, not the body heading.** In third
+  person the model faces where it *runs* (`ResolveAvatarHeading`), so ears
+  welded to the torso would swing the stereo image away from the picture every
+  time the player strafed.
 
 ### Why every asset on disk is mono
 

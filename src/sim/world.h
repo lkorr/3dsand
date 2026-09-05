@@ -91,7 +91,7 @@ constexpr uint32_t kMatAir = 0, kMatStone = 1, kMatWood = 2, kMatSand = 3,
                    kMatFlowerButtercup = 67, kMatFern = 88,
                    kMatMushroomCluster = 89, kMatToadstoolPale = 90,
                    kMatTallGrass = 95, kMatTallGrassHead = 96,
-                   kMatMushroomLarge = 121;
+                   kMatMushroomLarge = 122;
 
 // ---- day/night cycle (DESIGN.md §12) ----------------------------------------
 // The cycle phase is an INTEGER derived from the sim tick, never from wall

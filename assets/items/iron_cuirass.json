@@ -1,0 +1,99 @@
+{
+  "comment": "The iron_cuirass, a WORN piece: one shell per covered limb, each of which becomes a real rig slot on the wearer and therefore burns, dissolves, carves, severs and drops exactly as a limb does. Geometry is the stock human's own silhouette dilated outward by one authored micro, so it fits by construction. Regenerate with scripts/gen_stock_armor.py \u2014 `offset` and `fitBox` are MEASURED off gen_human.py's limb table, so editing them by hand puts the garment off the body.",
+  "name": "iron_cuirass",
+  "artVoxelsPerMetre": 80,
+  "hp": 240.0,
+  "severable": true,
+  "cover": [
+    {
+      "part": "armL.L",
+      "model": "armL.L",
+      "offset": [
+        -2,
+        0,
+        -2
+      ],
+      "fitBox": [
+        8,
+        22,
+        8
+      ],
+      "hp": 40.0
+    },
+    {
+      "part": "armL.R",
+      "model": "armL.R",
+      "offset": [
+        -2,
+        0,
+        -2
+      ],
+      "fitBox": [
+        8,
+        22,
+        8
+      ],
+      "hp": 40.0
+    },
+    {
+      "part": "armU.L",
+      "model": "armU.L",
+      "offset": [
+        -2,
+        0,
+        -2
+      ],
+      "fitBox": [
+        8,
+        22,
+        8
+      ],
+      "hp": 40.0
+    },
+    {
+      "part": "armU.R",
+      "model": "armU.R",
+      "offset": [
+        -2,
+        0,
+        -2
+      ],
+      "fitBox": [
+        8,
+        22,
+        8
+      ],
+      "hp": 40.0
+    },
+    {
+      "part": "hips",
+      "model": "hips",
+      "offset": [
+        -2,
+        -6,
+        -2
+      ],
+      "fitBox": [
+        20,
+        20,
+        12
+      ],
+      "hp": 40.0
+    },
+    {
+      "part": "torso",
+      "model": "torso",
+      "offset": [
+        -10,
+        0,
+        -2
+      ],
+      "fitBox": [
+        20,
+        36,
+        12
+      ],
+      "hp": 40.0
+    }
+  ]
+}

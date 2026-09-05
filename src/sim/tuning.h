@@ -306,6 +306,12 @@ struct Tuning {
     // by being geometrically in the way, so how much of it is in the way is
     // what its condition means.
     float ruinedCondition = 0.40f;
+    // A blade's kerf into a WORN shell is scaled by cutHardnessRef divided by
+    // the shell material's hardness (materials.json, 0..255), floored at
+    // cutHardnessMin: a shell as hard as skin (8) is cut like flesh, iron
+    // (160) is chipped. See Mob::CutLimb. 0 disables the scaling.
+    float cutHardnessRef = 8.0f;
+    float cutHardnessMin = 0.05f;
   } gear;
 
   // ---- player avatar ----
@@ -2543,6 +2549,7 @@ struct Tuning {
     float opennessReach = 12.0f;        // metres a hemisphere ray looks
     int opennessChunksPerFrame = 256;   // slots the rolling refresh walks/tick
     float opennessStrength = 1.0f;      // 0 = old lerp AND the pass unrecorded
+    float opennessFloor = 0.3f;         // least ambient multiplier an enclosed face keeps
     int opennessBilinear = 1;           // blend the 4 blocks in the face plane
 
     // ---- one-bounce indirect light (docs/PLAN_gi.md §3) ----
@@ -2597,7 +2604,6 @@ struct Tuning {
     // widening this band makes more liquids inherit water's look.
     float subClearLow = 0.62f, subClearHigh = 0.82f;
 
-    float opennessFloor = 0.3f;         // least ambient multiplier an enclosed face keeps
     // Faint directional glow toward the surface when submerged in a medium
     // too dense to see through. A near-opaque liquid gates off Snell's window,
     // and what that left was a featureless field of colour with no sense of up

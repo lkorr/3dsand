@@ -163,6 +163,14 @@ async function paintNav() {
   try { names = await Biome.listBiomes(); } catch (e) { names = []; }
   if (gen !== navGen) return;
   nav.innerHTML = '';
+  nav.append(el('h4', {}, 'World'));
+  {
+    const b = el('button', {'data-page': 'map', class: current === 'map' ? 'on' : ''},
+                 el('span', {}, PAGE_LABEL.map),
+                 el('span', {class: 'pill' + (dirtyBy.map ? ' dirty' : '')}, dirtyBy.map ? 'unsaved' : 'map'));
+    b.addEventListener('click', () => showPage('map'));
+    nav.append(b);
+  }
   nav.append(el('h4', {}, 'Biomes'));
   const cur = Biome.currentName();
   for (const n of names) {
@@ -260,7 +268,7 @@ export function attach(hooks) {
   WorldMap.attach(shared('map'));
   paintKnobPages();
   paintNav();
-  current = 'biome';
+  current = 'map';
 }
 
 export function activate() {
@@ -270,7 +278,7 @@ export function activate() {
   // its band strip and terrain rows once tuning is there.
   paintKnobPages();
   if (Biome.tuningAvailable) Biome.tuningAvailable();
-  showPage(current || 'biome');
+  showPage(current || 'map');
   paintNav();
 }
 

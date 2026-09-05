@@ -66,7 +66,12 @@ struct PlayerKitRefs {
 // Version 3 adds the CONDITION SUMMARY to each shell record (voxels at spawn,
 // voxels still live). Derivable from the lattice only while the piece is on a
 // body, which is exactly when it is not in this file — see WornShellDamage.
-constexpr uint32_t kPlayerKitSaveVersion = 3;
+// Version 4 appends the GRIMOIRE (docs/PLAN_magic_grammar.md §12c): the
+// player's pages (name + words, all by name), then the twenty bound slots as
+// (kind, name) pairs. A v3 payload still loads: an empty grimoire, and the ten
+// bound names it carries land in bank A. v2 and older are refused as before.
+constexpr uint32_t kPlayerKitSaveVersion = 4;
+constexpr uint32_t kPlayerKitOldestLoadable = 3;
 
 // ITEMS ON THE GROUND ('ITMS'): what is lying around, by name and pose.
 //
@@ -93,6 +98,12 @@ struct WorldItemRefs {
 };
 
 constexpr uint32_t kWorldItemSaveVersion = 1;
+
+// The 'PLYR' serializer, exposed so the grimoire gate can write an OLDER
+// version's payload (everything up to that version's last block) and prove
+// the loader still takes it.
+void SavePlayerKit(const PlayerKitRefs& r, std::vector<uint8_t>& out,
+                   uint32_t version = kPlayerKitSaveVersion);
 
 EntityIO MakeEntityIO(DebrisSystem& debris, MobSystem& mobs,
                       PlayerAvatar* avatar,

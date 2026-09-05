@@ -519,6 +519,13 @@
       "selfBecomes": "air"
     },
     {
+      "note": "ACID PITS IRON, SLOWLY. The plate set (assets/items/iron_*.json) is `iron`, a material that carries no dissolvable tag on purpose: the two tag rules above would otherwise apply as well, and a rule that fails its roll does not stop the next one from being tried. So iron's whole acid behaviour is this one line -- 10 per-mille a tick, against 250 for the organics a body is made of, which is what makes a suit of it a real answer to a pool of acid rather than a slower way to die in one. Steel stays IMMUNE (no rule, no tag); that is what a sword is made of and what armor-react measures.\n\nAPPENDED after acid's other rules rather than placed specific-before-generic, and deliberately: the convention exists so a specific rule wins over a tag rule that would ALSO match, and nothing else matches iron. Placing it earlier would renumber every acid rule after it, and rule index is part of the reaction RNG stream (mob.cpp's inbound pass, sim_step's bucket loop) -- a re-roll of every acid reaction in the world for a rule that fires only against a material worldgen never places. This way the determinism hash does not move.",
+      "self": "acid",
+      "neighbor": "iron",
+      "chance": 10,
+      "neighborBecomes": "air"
+    },
+    {
       "note": "-------- cold: creeping freeze, melting, snow compaction --------"
     },
     {

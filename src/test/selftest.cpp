@@ -44,6 +44,7 @@ const std::vector<Gate>& WorldIoGates();
 const std::vector<Gate>& VoxRegionGates();
 const std::vector<Gate>& SpellGates();
 const std::vector<Gate>& PlayerKitGates();
+const std::vector<Gate>& GrimoireGates();
 const std::vector<Gate>& SwingGates();
 const std::vector<Gate>& EquipmentGates();
 const std::vector<Gate>& WoundGates();
@@ -94,6 +95,14 @@ const char* const kOrder[] = {
     // with the other cheap front-loaded checks rather than after them.
     "scale",
     "player-kit",
+    // With it: `spells-oracle` is pure CPU over glyphs.json and the generated
+    // grammar oracle -- no world, no GPU, nothing left behind -- and a parser
+    // that disagrees with the reference script should be the first thing a
+    // full run says.
+    "spells-oracle",
+    // And `grimoire`: CPU-only over its own fixtures, beside `player-kit`
+    // for the same reasons (plan §12c).
+    "grimoire",
     // And with them, for the same reason: `swing` is MeleeState alone — no
     // world, no GPU, no assets, its own fixtures — so it costs milliseconds
     // and disturbs nothing. It asserts the swing's INPUT MAPPING, which is the
@@ -317,7 +326,7 @@ const std::vector<Gate>& Registry() {
                           &MobGates(), &BodyGates(), &FloaterGates(),
                           &WorldIoGates(), &AudioGates(),
                           &VoxRegionGates(),
-                          &SpellGates(), &PlayerKitGates(), &SwingGates(),
+                          &SpellGates(), &PlayerKitGates(), &GrimoireGates(), &SwingGates(),
                           &EquipmentGates(), &WoundGates(), &CombatGates()})
       pool.insert(pool.end(), g->begin(), g->end());
 

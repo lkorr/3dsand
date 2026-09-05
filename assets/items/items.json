@@ -42,6 +42,26 @@
       "id": "boots",
       "kind": "armor_boots",
       "desc": "Cut leather, slow to catch. Better against a spill than against a fire."
+    },
+    {
+      "id": "iron_helm",
+      "kind": "armor_head",
+      "desc": "A close iron helm with one slit across the eyes. Iron over the skull: fire finds nothing on it to catch, and acid pits it a grain at a time instead of eating it."
+    },
+    {
+      "id": "iron_cuirass",
+      "kind": "armor_chest",
+      "desc": "An iron breastplate with a gorget at the throat, a yoke across both shoulders, plate down each arm to the wrist and a short fauld over the hips. It does not burn. Acid takes it slowly, and a blade takes it not at all until it has beaten it in."
+    },
+    {
+      "id": "iron_greaves",
+      "kind": "armor_legs",
+      "desc": "Iron cuisses and greaves, thigh to ankle. Heavy, fireproof, and slow to dissolve."
+    },
+    {
+      "id": "iron_sabatons",
+      "kind": "armor_boots",
+      "desc": "Iron shoes with an ankle cuff. What a spill of acid meets first, and what it gets through last."
     }
   ]
 }

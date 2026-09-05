@@ -502,6 +502,10 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     const std::string at = "gear";
     ReadF(*g, "ruinedCondition", c.ruinedCondition, out, at);
     c.ruinedCondition = std::clamp(c.ruinedCondition, 0.0f, 1.0f);
+    ReadF(*g, "cutHardnessRef", c.cutHardnessRef, out, at);
+    ReadF(*g, "cutHardnessMin", c.cutHardnessMin, out, at);
+    if (c.cutHardnessRef < 0.0f) c.cutHardnessRef = 0.0f;
+    c.cutHardnessMin = std::clamp(c.cutHardnessMin, 0.0f, 1.0f);
   }
 
   if (const json* g = Find(j, "avatar")) {
@@ -2111,6 +2115,7 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadF(*g, "opennessReach", r.opennessReach, out, at);
     ReadI(*g, "opennessChunksPerFrame", r.opennessChunksPerFrame, out, at);
     ReadF(*g, "opennessStrength", r.opennessStrength, out, at);
+    ReadF(*g, "opennessFloor", r.opennessFloor, out, at);
     ReadI(*g, "opennessBilinear", r.opennessBilinear, out, at);
     ReadF(*g, "giStrength", r.giStrength, out, at);
     ReadF(*g, "giDecay", r.giDecay, out, at);
@@ -2127,7 +2132,6 @@ bool LoadTuning(const std::string& path, Tuning& out) {
       out.warnings.push_back("render.gamma must be > 0; reset to 2.2");
       r.gamma = 2.2f;
     }
-    ReadF(*g, "opennessFloor", r.opennessFloor, out, at);
     // starSize divides in the star PSF, starDensity scales the direction grid,
     // and skyMieG at exactly +-1 makes the Henyey-Greenstein denominator
     // collapse.
@@ -2249,6 +2253,7 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     // an intent, and both are one keystroke away in the tuner.
     if (r.opennessReach < 0.0f) { r.opennessReach = 0.0f; }
     r.opennessStrength = std::clamp(r.opennessStrength, 0.0f, 1.0f);
+    r.opennessFloor = std::clamp(r.opennessFloor, 0.0f, 1.0f);
     if (r.opennessChunksPerFrame < 0) { r.opennessChunksPerFrame = 0; }
     // Indirect light (PLAN_gi.md §3-4). A negative strength would subtract
     // light; a decay outside [0,1] is meaningless; and the P2 write-back must
@@ -2265,7 +2270,6 @@ bool LoadTuning(const std::string& path, Tuning& out) {
           "render.giFeedback must be below render.giDecay (multi-bounce would "
           "brighten without bound); clamped");
       r.giFeedback = std::max(0.0f, r.giDecay * 0.5f);
-    r.opennessFloor = std::clamp(r.opennessFloor, 0.0f, 1.0f);
     }
     r.giGatherBlocks = std::clamp(r.giGatherBlocks, 0, 8);
     // Multi-bounce gain (P2): each bounce is albedo x the gather's 0.28 form

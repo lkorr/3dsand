@@ -4628,9 +4628,18 @@ fn faceDir(i : u32) -> vec3<i32> {
 fn flagSupportLoss(c : vec3<i32>, oldKlass : u32, newMat : u32) {
   if (oldKlass != CLASS_SOLID && oldKlass != CLASS_POWDER) { return; }
   let nm = newMat & 0xFFFu;  // 12-bit id; sentinel values land on a zeroed entry
+  // A solid that became a POWDER in place (leaf -> ash, ember -> ash) still
+  // holds up the cell ABOVE it, and nothing else: powder does not carry a
+  // lateral or overhead load. This used to return for a powder product as if
+  // it still supported everything, and the ash then flowed away flagging only
+  // upward -- so a clump held sideways or from above by a leaf that turned to
+  // ash was never flagged, never scanned, and hung there. Measured on the
+  // `tree-fell` fixture as the 2..7-voxel leaf clumps left after a crown burns.
+  var keepsAbove = false;
   if (nm != MAT_AIR) {
     let nk = materials[nm].klass;
-    if (nk == CLASS_SOLID || nk == CLASS_POWDER) { return; }  // still supports
+    if (nk == CLASS_SOLID) { return; }  // still supports everything
+    if (nk == CLASS_POWDER) { keepsAbove = true; }
   }
   // ALL SIX NEIGHBOURS, not the first one found. The early `return` this
   // replaces flagged one chunk and stopped, so a cell vacating between two
@@ -4640,6 +4649,7 @@ fn flagSupportLoss(c : vec3<i32>, oldKlass : u32, newMat : u32) {
   // the overwhelming majority of calls, and the stores are idempotent.
   for (var i = 0u; i < 6u; i++) {
     if (oldKlass == CLASS_POWDER && i != 1u) { continue; }  // up only
+    if (keepsAbove && i == 1u) { continue; }  // the powder product still holds that one
     let n = c + faceDir(i);
     if (!inWindow(n, ptOrigin())) { continue; }
     let nmat = voxMat(voxWordAt((n)));

@@ -3,6 +3,7 @@
   "materials": [
     {
       "id": "stone",
+      "arcane": 2,
       "footstep": "path",
       "class": "solid",
       "density": 2600,
@@ -21,6 +22,7 @@
     },
     {
       "id": "wood",
+      "arcane": 2,
       "sounds": {
         "break": "branch"
       },
@@ -42,6 +44,7 @@
     },
     {
       "id": "sand",
+      "arcane": 1,
       "footstep": "path",
       "class": "powder",
       "absorb": {
@@ -81,6 +84,7 @@
     },
     {
       "id": "water",
+      "arcane": 1,
       "class": "liquid",
       "density": 1000,
       "hardness": 4,
@@ -155,6 +159,7 @@
     },
     {
       "id": "fire",
+      "arcane": 3,
       "class": "gas",
       "density": 3,
       "emission": 255,
@@ -206,6 +211,7 @@
     },
     {
       "id": "lava",
+      "arcane": 8,
       "class": "liquid",
       "density": 2800,
       "hardness": 6,
@@ -226,6 +232,7 @@
     },
     {
       "id": "acid",
+      "arcane": 6,
       "class": "liquid",
       "density": 1200,
       "hardness": 4,
@@ -274,6 +281,7 @@
     },
     {
       "id": "dirt",
+      "arcane": 1,
       "footstep": "path",
       "class": "powder",
       "absorb": {
@@ -372,6 +380,8 @@
     },
     {
       "id": "flower",
+      "//passable": "Ground COVER, not ground. Worldgen sets these one voxel ABOVE the terrain skin, and a non-passable cover cell is a solid 10 cm step the player climbs onto while the tall grass and flowers beside it are walk-through -- the meadow floor alternated between h+1 and h+2 on a per-column hash with nothing visible to explain it. Every other plant in the file is already passable; these six are the originals, from before the flag existed. `grass` (the SKIN at y == h) is deliberately NOT among them: it is the ground, and flagging it would sink the player a voxel into the terrain everywhere. `flower` is here because reactions.json swaps petal <-> flower by daylight, so flagging only one of that pair puts the step back every morning.",
+      "passable": true,
       "class": "solid",
       "density": 300,
       "hardness": 6,
@@ -544,6 +554,7 @@
     {
       "comment": "Blood. The `stain` block is what marks what it touches: at 90 per-mille a splash grabs the surfaces around it within a second or so, and `consume` 6 means roughly one stained voxel in 160 is eaten away per stain event, so blood slowly pits what it soaks without ever running away with itself (CLAUDE.md rule 2 — see DESIGN.md §6). The renderer picks blood's viscous shading (no ripple bands, a wet sheen, a smooth field normal so it does not read as gelatin cubes) off the authored moveEvery + opacity pair, not off a material ID — see isViscousLiquid in common.wgsl. The palette is LINEAR light like every material (the frame is tonemapped and gamma-encoded at the end), so these hexes look near-black in a colour picker and render as a dark blood red once lit; anything paler reads as pink paint next to the stain it leaves.",
       "id": "blood",
+      "arcane": 3,
       "class": "liquid",
       "density": 1050,
       "hardness": 4,
@@ -551,9 +562,9 @@
       "opacity": 200,
       "molten": "steam",
       "colors": [
-        "#3a0808",
-        "#220404",
-        "#4e0c0c"
+        "#5a0606",
+        "#3a0404",
+        "#7a0a0a"
       ],
       "stain": {
         "type": "blood",
@@ -674,6 +685,7 @@
     },
     {
       "id": "petal",
+      "passable": true,
       "class": "solid",
       "density": 290,
       "hardness": 5,
@@ -692,6 +704,7 @@
     },
     {
       "id": "grass_tuft",
+      "passable": true,
       "footstep": "leaf",
       "class": "solid",
       "density": 200,
@@ -730,6 +743,7 @@
     },
     {
       "id": "foliage_bush",
+      "passable": true,
       "footstep": "leaf",
       "class": "solid",
       "density": 260,
@@ -755,6 +769,7 @@
     },
     {
       "id": "flower_poppy",
+      "passable": true,
       "class": "solid",
       "density": 210,
       "hardness": 2,
@@ -799,6 +814,7 @@
     },
     {
       "id": "flower_daisy",
+      "passable": true,
       "class": "solid",
       "density": 210,
       "hardness": 2,
@@ -1139,6 +1155,7 @@
     },
     {
       "id": "bone",
+      "arcane": 5,
       "footstep": "path",
       "class": "solid",
       "density": 1200,
@@ -1165,6 +1182,7 @@
     },
     {
       "id": "steel",
+      "arcane": 12,
       "footstep": "stone",
       "class": "solid",
       "density": 7800,
@@ -2844,6 +2862,7 @@
     {
       "//": "ANATOMY (assets/editor/anatomy.js; DESIGN.md §7 'What is under the skin'). The human is no longer skin all the way through: a sidecar recipe paints its interior by depth -- skin, then this, then muscle, then bone -- so a cut face, a burn-through or a peeled limb in the tuner shows layers instead of more skin. Subcutaneous flesh: the pale layer one voxel under the skin. Enters the SAME burn chain as skin (reactions.json, 'flesh + tag:hot -> flesh_cooked') so a body burns through its layers on one clock; bone has no fire rules and survives by construction.",
       "id": "flesh",
+      "arcane": 4,
       "class": "solid",
       "density": 950,
       "hardness": 6,
@@ -2916,6 +2935,34 @@
         "organic"
       ],
       "molten": "fire"
+    },
+    {
+      "//": "WROUGHT IRON: the plate set's material (scripts/gen_stock_armor.py iron_helm/cuirass/greaves/sabatons). A SECOND metal, not a tint of steel, because it carries a rule steel does not: reactions.json's `acid + iron -> air` at 10 per-mille a tick. Steel has no tag:dissolvable and no rule of its own, so acid cannot touch a sword at all and armor-react measures 0 voxels lost under a steel plate; a suit that acid eats SLOWLY (against 250 for flesh and cloth, 45 for the generic dissolvable tag) is a different fact, and here a fact is a material. Not flammable and not organic, so fire has nothing on it to catch and the burn pass never lists it -- a limb under it reads its neighbour as iron rather than as fire (mob.cpp WornAlong). Hardness under steel's 200: a blade beats it in sooner than it would a blade. Never placed by worldgen, so the nibble is free for the metal finishes below.",
+      "id": "iron",
+      "footstep": "stone",
+      "class": "solid",
+      "density": 7600,
+      "hardness": 160,
+      "rubble": "gravel",
+      "colors": [
+        "#8a8f96",
+        "#70757c",
+        "#a4a9b0"
+      ],
+      "tints": [
+        "#8a8f96",
+        "#5c6167",
+        "#3a4048",
+        "#c9a24a",
+        "#b06a3a",
+        "#c07a72",
+        "#b8bfc8",
+        "#6a7a86"
+      ],
+      "tags": [
+        "mineral"
+      ],
+      "molten": "lava"
     },
     {
       "//": "BIG TOADSTOOL (analytic TILE plant): one knee-high fly agaric per 7x7 tile, stem in the centre column, cap over a 3x3 footprint two to three cells tall. Worldgen paints the whole footprint with this material and the renderer rebuilds ONE mushroom from the tile hash in every cell of it (plantTileAt in common.wgsl, tracePlant in raymarch.wgsl). Inert like the rest of the undergrowth set.",
@@ -3036,6 +3083,23 @@
         "dissolvable"
       ],
       "molten": "fire"
-    }
+    },
+    {
+      "comment": "The dearest common matter (docs/PLAN_magic_grammar.md): the top of the arcane tariff, so making it is what kills alchemists. Never placed by worldgen; exists so the tongue has the word.",
+      "id": "gold",
+      "arcane": 40,
+      "footstep": "stone",
+      "class": "solid",
+      "density": 19300,
+      "hardness": 40,
+      "rubble": "gravel",
+      "colors": [
+        "#d9a92c",
+        "#c99a22",
+        "#e8bd45"
+      ],
+      "tags": [
+        "mineral"
+      ]    }
   ]
 }

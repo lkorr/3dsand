@@ -457,6 +457,7 @@ add_library(sandvox_core OBJECT
   src/game/avatar.cpp
   src/game/thirdperson.cpp
   src/game/spell.cpp
+  src/game/caster.cpp
   src/game/melee.cpp
   src/game/strokes.cpp
   # The acceptance gate. support.cpp holds the sim/render plumbing that main.cpp
@@ -470,6 +471,7 @@ add_library(sandvox_core OBJECT
   src/test/support.cpp
   src/test/selftest.cpp
   src/test/selftest_voxregion.cpp
+  src/test/selftest_grimoire.cpp
   src/test/selftest_terrain.cpp
   src/test/selftest_trees.cpp
   src/test/selftest_biomes.cpp

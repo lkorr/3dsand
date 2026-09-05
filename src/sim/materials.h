@@ -324,6 +324,13 @@ struct MaterialDef {
   // What the laser/heat melt mode converts this into (stone -> lava,
   // sand -> molten_glass, wood -> fire ...). Empty = vaporize to air.
   std::string molten;
+  // ARCANE VALUE: the per-voxel base of the spell tariff (docs/
+  // PLAN_magic_grammar.md section 4; materials.json "arcane"). One integer
+  // per material rather than a from x to table, so hundreds of materials stay
+  // O(N) and a modder prices a new one with one key. 0 for air, small for
+  // dirt/sand/water, large for gold. Authored, or derived from density when
+  // absent (DeriveArcane), so every material has a price the day it exists.
+  int32_t arcane = 0;
   // Name of the stain this material leaves, if any (materials.json "stain":
   // {"type": ...}). Shared across materials: two liquids naming the same stain
   // get the same palette slot. Empty = this material does not stain.

@@ -150,7 +150,8 @@ bool g_shotInventory = false;
 constexpr uint64_t kShotInvOpenFrame = 150;    // let the avatar spawn and settle
 constexpr uint64_t kShotInvDamageFrame = 170;
 constexpr uint64_t kShotInvGearFrame = 220;    // -> screenshot_inventory.bmp
-constexpr uint64_t kShotInvCaptureFrame = 240;  // -> ..._health.bmp; last frame
+constexpr uint64_t kShotInvCaptureFrame = 240;  // -> ..._health.bmp
+constexpr uint64_t kShotInvGrimoireFrame = 260; // -> ..._grimoire.bmp; last frame
 
 
 // --frames N (phase 4b D3): windowed verification harness. 0 = play normally.
@@ -2849,7 +2850,7 @@ int main(int argc, char** argv) {
     // g_shotInventory.
     else if (a == "--shot-inventory") {
       g_shotInventory = true;
-      g_harnessFrames = kShotInvCaptureFrame;
+      g_harnessFrames = kShotInvGrimoireFrame;
     }
     // `--duel-dummy` is the melee FEEL harness: a sword-armed human standing
     // three metres in front of the spawn, with nothing driving it. Mobs have no
@@ -3343,9 +3344,8 @@ int main(int argc, char** argv) {
       std::fprintf(stderr, "glyph load failed:\n%s", gerr.c_str());
       return 1;
     }
-    std::printf("loaded %zu glyphs (%zu conjoined, %zu wards)\n",
-                glyphs.glyphs.size(), glyphs.conjoined.size(),
-                glyphs.wards.size());
+    std::printf("loaded %zu glyphs (%zu conjoined)\n", glyphs.glyphs.size(),
+                glyphs.conjoined.size());
   }
 
   // items (assets/items/items.json — game/item.h). Content, same as glyphs,
@@ -3604,6 +3604,12 @@ int main(int argc, char** argv) {
     // whatever is in its fist. By pointer, because items reload on R.
     mobs.SetItems(&items);
   }
+  // A PIECE OF GEAR HITTING THE FLOOR BY FORCE — a cuirass cut loose, a sword
+  // knocked from a hand, anyone's — is the same kind of body an inventory drop
+  // makes, and the registry is what makes `E` see it (DESIGN.md §8c). The
+  // release hook above already forgets it when the body goes.
+  mobs.SetOnItemShed(
+      [&ground](uint64_t h, const std::string& name) { ground.Add(h, name); });
   Stream stream;
   stream.Init(&ctx, &world, &sim, kDefaultSeed);
   stream.OnMaterialsReloaded(mats);
@@ -3942,13 +3948,20 @@ int main(int argc, char** argv) {
   float lookSensNow = 1.0f;
 
   KeyEdge eP, eN, eV, eF1, eF3, eF4, eF5, eF6, eF9, eF10, eR, eEsc, eLBracket, eRBracket, eJump,
-      eG, eX, eB, eT, eO, eM, eK, eTab, eC, eH, eZ, eBack, eU, eL, eI, eQ,
+      eG, eX, eB, eT, eO, eM, eK, eTab, eC, eH, eZ, eBack, eDel, eEq, eU, eL, eI, eQ,
       eE;
   KeyEdge eGlyph[kGlyphSlots];
   bool prevMouseL = false;
   bool prevMouseR = false;
   // RMB cast, latched until a tick actually runs (see the cast site below).
   bool castQueued = false;
+  // A body part clicked in the inspector with a sentence on the stack, latched
+  // the same way: the slot, or -1.
+  int castAtPartQueued = -1;
+  // RMB held (a beam stays lit while it is), and Delete pressed in magic mode
+  // (drop the newest status), both read on the frame and consumed by the tick.
+  bool beamHeld = false;
+  bool dropStatusQueued = false;
   std::vector<Grenade> grenades;
 
   // ---- magic (game/spell.h, game/caster.h) ---------------------------------
@@ -4358,6 +4371,20 @@ int main(int argc, char** argv) {
       // Swap to the inspector between the two captures, so the second picture
       // is the half the first cannot show.
       if (frameCounter == kShotInvGearFrame + 1) ui.inspectMode = true;
+      // Third picture: the grimoire with a page selected and its word row
+      // populated — the panel's job is to be looked at (plan §12c).
+      if (frameCounter == kShotInvCaptureFrame + 1) {
+        ui.inspectMode = false;
+        ui.grimoireMode = true;
+        if (!glyphs.conjoined.empty()) {
+          const ConjoinedGlyph& cg = glyphs.conjoined[0];
+          ui.grimoireSelected = cg.id;
+          ui.grimoireEditName = cg.id;
+          ui.grimoireEditWords.clear();
+          for (int gi : cg.glyphs)
+            if (const GlyphDef* d = glyphs.At(gi)) ui.grimoireEditWords.push_back(d->id);
+        }
+      }
     }
     glfwPollEvents();
     double now = NowSeconds();
@@ -4630,14 +4657,21 @@ int main(int argc, char** argv) {
         }
     } else {
       // Pressing a number SPEAKS that glyph — it never casts. Edge-triggered:
-      // a held key must not stutter the same word onto the stack.
-      for (int i = 0; i < kGlyphSlots; i++) {
+      // a held key must not stutter the same word onto the stack. TWO BANKS
+      // (plan §12a): `1`-`0` speak bank A, `Shift+1`-`0` bank B. Sprint is
+      // on Shift outside magic mode and magic mode captures the number row,
+      // so nothing collides.
+      const bool bankB = key(GLFW_KEY_LEFT_SHIFT) || key(GLFW_KEY_RIGHT_SHIFT);
+      for (int i = 0; i < kGlyphBank; i++) {
         // GLFW's number row is contiguous 1..9 then 0, and slot 10 is the 0
         // key, matching the strip the HUD prints.
         int k = (i == 9) ? GLFW_KEY_0 : (GLFW_KEY_1 + i);
         if (captured && eGlyph[i].Pressed(key(k)))
-          caster.SpeakSlot(glyphs, i);
+          caster.SpeakSlot(glyphs, i + (bankB ? kGlyphBank : 0));
       }
+      // `=` captures the sentence on the stack into the grimoire (§12b): the
+      // fast path for "that worked, make it one key".
+      if (captured && eEq.Pressed(key(GLFW_KEY_EQUAL))) caster.CaptureStack(glyphs);
     }
     if (captured && eZ.Pressed(key(GLFW_KEY_Z))) {
       ui.magicMode = !ui.magicMode;
@@ -4986,11 +5020,12 @@ int main(int argc, char** argv) {
           // existed the point was moot (GrantAllAndBind overwrote the
           // bindings anyway, which is its own bug: every reload threw away
           // whatever the player had arranged). Snapshot, reload, re-resolve.
-          std::vector<std::string> boundNames(kGlyphSlots);
+          std::vector<std::string> boundNames(kGlyphSlots), boundPages(kGlyphSlots);
           for (int i = 0; i < kGlyphSlots; i++) {
             const int gi = caster.inventory.At(i);
             if (gi >= 0 && gi < (int)glyphs.glyphs.size())
               boundNames[i] = glyphs.glyphs[gi].id;
+            boundPages[i] = caster.inventory.PageAt(i);
           }
           if (LoadGlyphs(assetDir + "/spells/glyphs.json", mats, next, gerr)) {
             glyphs = std::move(next);
@@ -5001,6 +5036,10 @@ int main(int argc, char** argv) {
             // rather than pointing at whatever now occupies that index — the
             // same rule the item hotbar's re-validation below uses.
             for (int i = 0; i < kGlyphSlots; i++) {
+              if (!boundPages[i].empty()) {
+                caster.inventory.BindPage(i, boundPages[i]);   // pages are names already
+                continue;
+              }
               if (boundNames[i].empty()) {
                 caster.inventory.Bind(i, -1);
                 continue;
@@ -5399,6 +5438,10 @@ int main(int argc, char** argv) {
     // already a sticky flag consumed-and-cleared inside the loop for exactly
     // this reason; casting was the one that was not.
     if (captured && ui.magicMode && mouseRClick) castQueued = true;
+    beamHeld = captured && mouseR;
+    if (captured && ui.magicMode && eDel.Pressed(key(GLFW_KEY_DELETE))) dropStatusQueued = true;
+    beamHeld = captured && mouseR;
+    if (captured && ui.magicMode && eDel.Pressed(key(GLFW_KEY_DELETE))) dropStatusQueued = true;
     // A click made while paused is DROPPED rather than held: the tick loop
     // breaks before the cast site while paused, so a latched click would sit
     // there and discharge the instant you unpause, at whatever you happen to
@@ -5416,6 +5459,34 @@ int main(int argc, char** argv) {
     // — dragged into the pack from the character screen, say — is no longer
     // drawn, and this is where that is noticed: the state lives on one side of
     // the question, so there is nothing to keep in step.
+    // ---- GEAR THAT LEFT THE BODY BY FORCE (Mob::LostGear) --------------------
+    //
+    // The rig reports; the KIT is this frame's to fix, and it has to be fixed
+    // BEFORE the sheath and the wear loop below read it in the same tick, or
+    // the re-equip seams would faithfully pull a second sword out of the
+    // sheath while the first lies at your feet, and put the cuirass back on
+    // a body the plate has just fallen off. The piece on the ground is
+    // registered under its name (SetOnItemShed), so picking it back up is the
+    // ordinary `E` and wearing it again restores exactly the holes it had:
+    // the damage travels through `kit.wornDamage` by name, the same road a
+    // piece dragged into the pack takes.
+    for (const Mob::LostGear& lg : avatar.LostGearEvents()) {
+      if (lg.held) {
+        ItemStack& sh = kit.equip.slots[kSheathSlot];
+        if (KitItemName(sh, items) == lg.item) sh = ItemStack{};
+        ui.kitMessage = "your " + lg.item + " was knocked from your hand";
+      } else {
+        kit.SetDamage(lg.item, lg.damage);
+        if (lg.equipSlot >= 0 && lg.equipSlot < kEquipSlotCount &&
+            KitItemName(kit.equip.At(lg.equipSlot), items) == lg.item) {
+          kit.equip.slots[lg.equipSlot] = ItemStack{};
+          wearTried[lg.equipSlot].clear();
+        }
+        ui.kitMessage = "your " + lg.item + " was cut loose";
+      }
+      ui.kitMessageAge = 0.0f;
+    }
+    avatar.ClearLostGear();
     sheath.Reconcile(sheathKind(), UIState::kToolMelee, ui.tool);
     const ItemStack& sheathed = kit.equip.At(kSheathSlot);
     const ItemDef* heldItem =
@@ -6316,6 +6387,80 @@ int main(int argc, char** argv) {
         caster.mana.Tick();
         SpellEmission emit;
 
+        // What the VM may ask about bodies: where an adopted bomb is, and the
+        // nearest mob for a seeking bolt (never the caster's own body).
+        struct SpellBodyCtx {
+          Physics* phys;
+          MobSystem* mobs;
+          const Player* player;
+          uint64_t playerId;
+        } bodyCtx{&phys, &mobs, &player, 0x9134A5EEu};
+        SpellBodyProbe bodyProbe;
+        bodyProbe.ctx = &bodyCtx;
+        // The body a status attaches to: the nearest mob origin within the
+        // radius, else the player. Ids are the mob's own and the player's
+        // caster id — opaque to the VM either way.
+        bodyProbe.bodyIdAt = [](void* c, Vec3 from, float radius, uint64_t& id, Vec3& out) {
+          SpellBodyCtx& bc = *(SpellBodyCtx*)c;
+          float best = radius * radius;
+          bool found = false;
+          for (uint32_t i = 0; i < bc.mobs->MobCount(); i++) {
+            const uint64_t mid = bc.mobs->MobIdAt(i);
+            const Vec3 p = bc.mobs->MobOrigin(mid);
+            const Vec3 d = p - from;
+            const float d2 = d.x * d.x + d.y * d.y + d.z * d.z;
+            if (d2 <= best) {
+              best = d2;
+              id = mid;
+              out = p;
+              found = true;
+            }
+          }
+          const Vec3 dp = bc.player->pos - from;
+          // The figure box is ~1.7 m: a point anywhere on the body counts.
+          const float pr = radius + 9.0f;
+          if (!found && dp.x * dp.x + dp.y * dp.y + dp.z * dp.z <= pr * pr) {
+            id = bc.playerId;
+            out = bc.player->pos;
+            found = true;
+          }
+          return found;
+        };
+        bodyProbe.bodyPos = [](void* c, uint64_t id, Vec3& out) {
+          SpellBodyCtx& bc = *(SpellBodyCtx*)c;
+          if (id == bc.playerId) {
+            out = bc.player->pos;
+            return true;
+          }
+          for (uint32_t i = 0; i < bc.mobs->MobCount(); i++)
+            if (bc.mobs->MobIdAt(i) == id) {
+              out = bc.mobs->MobOrigin(id);
+              return true;
+            }
+          return false;
+        };
+        bodyProbe.bodyAt = [](void* c, uint64_t h, Vec3& out) {
+          BodyTransform xf;
+          if (!((SpellBodyCtx*)c)->phys->GetTransform(h, xf)) return false;
+          out = xf.pos;
+          return true;
+        };
+        bodyProbe.nearestTarget = [](void* c, Vec3 from, uint64_t, Vec3& out) {
+          MobSystem& m = *((SpellBodyCtx*)c)->mobs;
+          float best = 96.0f * 96.0f;   // seek range, voxels squared
+          bool found = false;
+          for (uint32_t i = 0; i < m.MobCount(); i++) {
+            const Vec3 p = m.MobOrigin(m.MobIdAt(i));
+            const Vec3 d = p - from;
+            const float d2 = d.x * d.x + d.y * d.y + d.z * d.z;
+            if (d2 < best) {
+              best = d2;
+              out = p;
+              found = true;
+            }
+          }
+          return found;
+        };
         // Consume the latch on the FIRST tick of the frame that sees it, and
         // clear it even when there is nothing spoken — otherwise a click on an
         // empty stack stays queued and fires the next spell the moment one is
@@ -6323,6 +6468,37 @@ int main(int argc, char** argv) {
         // rather than a pending intent.
         const bool castNow = castQueued;
         castQueued = false;
+        // The inspector's "cast it on this part": `self` resolves at the
+        // clicked limb's centre, with the effect radii clamped to the part.
+        // Same Cast(), one extra argument (plan §7); the VM never learns what
+        // a part is.
+        const int castPart = castAtPartQueued;
+        castAtPartQueued = -1;
+        if (castPart >= 0 && !caster.stack.Empty() && avatar.Spawned()) {
+          int part = -1;
+          if (const MobDef* def = avatar.Def()) {
+            for (int i = 0; i < (int)def->limbs.size(); i++)
+              if (BodySlotFor(avatar.PartName(i), avatar.PartTag(i)) == castPart &&
+                  avatar.PartAlive(i))
+                part = i;
+          }
+          Vec3 at;
+          Quat rot;
+          if (part >= 0 && avatar.PartWorldTransform(part, at, rot)) {
+            const SpellFxVec selfAt{SpellFxFromFloat(at.x), SpellFxFromFloat(at.y),
+                                    SpellFxFromFloat(at.z)};
+            const Vec3 body = player.pos;
+            const SpellFxVec originFx{SpellFxFromFloat(body.x), SpellFxFromFloat(body.y),
+                                      SpellFxFromFloat(body.z)};
+            const SpellFxVec dirFx{0, kSpellFxOne, 0};
+            const SpellProbe probe = WorldSpellProbe(world);
+            CastResult res = spells.Cast(caster.compiled, caster.mana, playerHealth,
+                                         0x9134A5EEu, originFx, dirFx, tick, emit, &probe,
+                                         &selfAt, &bodyProbe);
+            caster.lastOutcome = res.outcome;
+            if (res.outcome != CastOutcome::Nothing) caster.Clear(glyphs);
+          }
+        }
         if (castNow && !caster.stack.Empty()) {
           // Origin at the muzzle — in front of the eye so the bolt does not
           // spawn inside the caster's own head. Direction is the aim ray.
@@ -6345,14 +6521,118 @@ int main(int argc, char** argv) {
             originFx = {SpellFxFromFloat(body.x), SpellFxFromFloat(body.y),
                         SpellFxFromFloat(body.z)};
           }
+          const SpellProbe probe = WorldSpellProbe(world);
           CastResult res =
               spells.Cast(caster.compiled, caster.mana, playerHealth,
-                          0x9134A5EEu /*casterId*/, originFx, dirFx, tick, emit);
+                          0x9134A5EEu /*casterId*/, originFx, dirFx, tick, emit,
+                          &probe, nullptr, &bodyProbe);
           caster.lastOutcome = res.outcome;
           if (res.outcome != CastOutcome::Nothing) caster.Clear(glyphs);
         }
 
-        spells.Tick(tick, world, classOf, emit);
+        // A held beam follows the aim while RMB stays down.
+        {
+          const Vec3 eye = player.EyePos();
+          const Vec3 fwd = cam.Forward();
+          const Vec3 muzzle = eye + fwd * 1.5f;
+          spells.HoldBeam(0x9134A5EEu,
+                          {SpellFxFromFloat(muzzle.x), SpellFxFromFloat(muzzle.y),
+                           SpellFxFromFloat(muzzle.z)},
+                          {SpellFxFromFloat(fwd.x), SpellFxFromFloat(fwd.y),
+                           SpellFxFromFloat(fwd.z)},
+                          beamHeld);
+        }
+        if (dropStatusQueued) {
+          dropStatusQueued = false;
+          spells.DropNewestStatus(0x9134A5EEu);
+        }
+        spells.Tick(tick, world, classOf, emit, &bodyProbe);
+
+        // THE PER-TICK BILL. Statuses and a held beam pay the same tariff as
+        // they emit (plan §4): mana first, then the body, and when neither
+        // can pay the caster has run dry and everything they sustain drops.
+        {
+          int32_t bill = 0;
+          for (const SpellBill& sb : emit.bills)
+            if (sb.casterId == 0x9134A5EEu) bill += sb.amount;
+          if (bill > 0) {
+            const int32_t fromMana = std::min(bill, caster.mana.mana);
+            caster.mana.mana -= fromMana;
+            bill -= fromMana;
+            if (bill > 0) {
+              const int32_t hp = playerHealth.Get();
+              if (hp > bill) {
+                playerHealth.Spend(bill);
+              } else {
+                spells.DropAll(0x9134A5EEu);   // dry: it all goes out
+              }
+            }
+          }
+          caster.mana.reserved = spells.ReservationFor(0x9134A5EEu);
+        }
+        // A sustained gravity mod on the player's own body.
+        for (const SpellBodyImpulse& bi : emit.bodyImpulses)
+          if (bi.target == 0x9134A5EEu) player.vel.y += bi.vps.y;
+        // GRAFTS: the world half already left as ops; the body half fills the
+        // caster's missing anatomy cells with that matter, root-first. The VM
+        // cannot reach a body (thesis 4); the owner does it.
+        for (const SpellRestore& rs : emit.restores) {
+          if (rs.casterId == 0x9134A5EEu) {
+            if (avatar.Spawned()) avatar.RestoreBody(rs.material, rs.count);
+          } else {
+            mobs.RestoreMob(rs.casterId, rs.material, rs.count);
+          }
+        }
+        // WARDS filter the spell's OWN emission too (a fire aura inside an
+        // anti-fire ward is refused like anyone else's).
+        ui.spellRefused = spells.FilterStreams(emit.ops, emit.explosions, emit.spawns, emit.winds);
+
+        // BOMBS ARE DEBRIS. The VM asked for a rigid body; this is the owner
+        // making one through the same path a dropped item takes (a Jolt
+        // sphere so it rolls, a voxel ball to draw it, adopted by the debris
+        // system so it falls, settles, burns and can be blown apart) and
+        // handing the handle back. When the fuse runs out the VM resolves the
+        // payload where the body is and asks for it to be taken away.
+        for (const SpellBodyRequest& rq : emit.bodyRequests) {
+          const float r = rq.radius;
+          std::vector<DebrisVoxel> ball;
+          const int ext = (int)std::ceil(r);
+          for (int z = -ext; z < ext; z++)
+            for (int y = -ext; y < ext; y++)
+              for (int x = -ext; x < ext; x++) {
+                const float dx = x + 0.5f, dy = y + 0.5f, dz = z + 0.5f;
+                if (dx * dx + dy * dy + dz * dz <= r * r)
+                  ball.push_back({(int8_t)x, (int8_t)y, (int8_t)z, 0, (uint16_t)rq.material});
+              }
+          BodyTransform xf{};
+          xf.pos = rq.pos;
+          xf.quat[3] = 1;
+          const float density =
+              rq.material < mats.size() ? (float)mats[rq.material].gpu.density : 2000.0f;
+          const uint64_t h = phys.CreateSphereBody(rq.pos, r, density);
+          if (!h) continue;
+          phys.SetBodyVelocity(h, rq.vel);
+          phys.ReleaseToWorldWhenClear(h);
+          debris.AdoptBody(h, std::move(ball), xf);
+          spells.AdoptBody(rq.token, h);
+        }
+        for (uint64_t h : emit.bodyDone) debris.DestroyBody(h);
+        // An anchored gravity Mod acting on the caster's own body (a hop).
+        if (emit.casterImpulseVps.y != 0.0f) player.vel.y += emit.casterImpulseVps.y;
+
+        // THE WILDCARD'S BILL. `anything` is priced by what it turned out to
+        // be, when it resolves (plan §4): mana first, then the body, exactly
+        // the crossover a spoken cost pays -- except that this one lands after
+        // the fact, which is the danger the word is for.
+        if (emit.billOnResolve > 0) {
+          int32_t bill = emit.billOnResolve;
+          const int32_t fromMana = std::min(bill, caster.mana.mana);
+          caster.mana.mana -= fromMana;
+          bill -= fromMana;
+          if (bill > 0) playerHealth.Spend(bill);
+          ui.spellLastBill = emit.billOnResolve;
+          ui.spellLastBillAge = 0.0f;
+        }
 
         // The caster's own body pays for a fatal overcast: severed parts, then
         // death, all through the existing dismemberment/gore pipeline. The
@@ -6730,6 +7010,14 @@ int main(int argc, char** argv) {
         WorldEditLayer().Drain(world, cellOps,
                                kMaxCellOpsPerTick - (uint32_t)cellOps.size());
       phys.MovePlayerBody(playerBody, player.pos, kTickDt);
+      // WARDS, AT THE SPLICE (DESIGN.md §8): a live filter refuses ops of its
+      // word's kind within its radius, whoever produced them — the brush, a
+      // mob, a spell. The op stream, never the CA: acid already flowing still
+      // flows, and that is the counterplay.
+      {
+        std::vector<WindPrim> noWinds;
+        ui.spellRefused += spells.FilterStreams(ops, exps, spawns, noWinds);
+      }
       double tSubmit0 = NowSeconds();
       SubmitTick(ctx, world, sim, tick, kDefaultSeed, ops, exps, cellOps,
                  tick % 15 == 0 /*hash occasionally*/, pc, true, particlesActive,
@@ -6921,15 +7209,32 @@ int main(int argc, char** argv) {
       }
 
       // ---- audio ----
-      // The listener rides the RENDER eye, not the player's head: in third
-      // person the camera is where the player's attention is, and putting the
-      // ears anywhere else makes panning disagree with what is on screen.
-      // After the camera block, so `eye` is final for the frame.
+      // THE EARS ARE ON THE CHARACTER, NOT ON THE CAMERA. `eye` is the RENDER
+      // eye and in third person that is a boom several metres behind the body,
+      // so using it moved the whole soundscape backwards the moment you pressed
+      // the camera key: distances, doppler and — worst — occlusion were all
+      // solved from the boom, which routinely sits inside the wall behind you
+      // and muffled everything. Third person now hears exactly what first
+      // person hears.
+      //
+      // Position is `Player::ViewEyePos()` — the head, at ear height, in BOTH
+      // modes, and the same value first person was already using. Deliberately
+      // not the avatar's head joint: that transform is one tick latent out of
+      // Jolt and rides the gait's bob and sway, which the listener would
+      // convert into doppler wobble on every step (the same three reasons the
+      // camera block above refuses to orbit it).
+      //
+      // Orientation stays `cam.yaw/pitch` — the LOOK direction, which is what
+      // the ears face in first person and what the screen is showing in third.
+      // The body's own heading is not it: in third person the model faces where
+      // it RUNS (ResolveAvatarHeading), so strafing would swing the stereo
+      // image away from the picture.
       //
       // Footfalls are drained here rather than inside the tick loop because
       // that loop runs up to 4 times per frame; firing from inside it would
       // put several steps at the same instant.
       sandvox::PerfSpan spanAudio(sandvox::PerfScope::Audio);
+      const Vec3 earPos = player.ViewEyePos();
       if (audioCues.Enabled()) {
         for (const PlayerAvatar::Footfall& ff : avatar.Footfalls()) {
           if (ff.landing)
@@ -7072,10 +7377,10 @@ int main(int argc, char** argv) {
             // making the player wait out a full retry period past dusk.
             nightRollTimer = ta.nightRetrySeconds;
           }
-          audioCues.SetNightAmbience(eye, want, allowStart);
+          audioCues.SetNightAmbience(earPos, want, allowStart);
         }
 
-        audioCues.Update(dt, eye, cam.yaw, cam.pitch, &world);
+        audioCues.Update(dt, earPos, cam.yaw, cam.pitch, &world);
       }
       avatar.ClearFootfalls();
       // Cleared unconditionally, like the footfalls: a queue that only drains
@@ -7293,6 +7598,24 @@ int main(int argc, char** argv) {
       // makes the mana/health crossover a decision rather than a surprise.
       ui.mana = caster.mana.mana;
       ui.manaMax = caster.mana.EffectiveMax();
+      ui.manaPoolMax = caster.mana.manaMax;
+      ui.manaReserved = caster.mana.reserved;
+      ui.spellStatuses.clear();
+      for (const SpellStatus& st : spells.Statuses()) {
+        if (st.casterId != 0x9134A5EEu) continue;
+        std::string line = DescribeCast(glyphs, SpellCast{});
+        line.clear();
+        const GlyphDef* ig = glyphs.At(st.effect.inner.empty() ? -1 : st.effect.inner[0].glyph);
+        const GlyphDef* ag = glyphs.At(st.effect.glyph);
+        line = std::string(ig ? ig->id : "mod") + " " + (ag ? ag->id : "aura") +
+               (st.target == 0x9134A5EEu ? " on you" : (st.target ? " on them" : " on the place")) +
+               "  " + std::to_string(st.perTick) + "/tick, " +
+               std::to_string(st.ticksLeft / 30) + " s";
+        ui.spellStatuses.push_back(line);
+      }
+      for (const SpellBeam& bm : spells.Beams())
+        if (bm.casterId == 0x9134A5EEu)
+          ui.spellStatuses.push_back("beam  " + std::to_string(bm.perTick) + "/tick");
       ui.health = playerHealth.Get();
       ui.healthMax = avatar.HealthMax();
       ui.healthCap = avatar.HealthCap();
@@ -7304,6 +7627,11 @@ int main(int argc, char** argv) {
       FillBodyUI(avatar, burnMats, ui);
       ui.locoState = avatar.Spawned() ? avatar.Locomotion().stateName : "";
       ui.spellCost = caster.compiled.manaCost;
+      ui.spellWord = caster.compiled.wordCost;
+      ui.spellTariff = caster.compiled.tariff;
+      ui.spellCarry = caster.compiled.carryCost;
+      ui.spellPriceUnknown = caster.compiled.priceUnknown;
+      ui.spellLastBillAge += dt;
       ui.spellText = caster.readout.text;
       ui.spellVerdict = caster.readout.verdict;
       ui.spellOutcome = (int)caster.lastOutcome;
@@ -7314,11 +7642,30 @@ int main(int argc, char** argv) {
       ui.windPrims = (int)WindPrims().Count();
       ui.windWakeChunks = (int)WindPrims().LastWakeCount();
       ui.glyphSlots.clear();
+      ui.glyphSlotKinds.clear();
+      ui.glyphSlotReadouts.clear();
       for (int i = 0; i < kGlyphSlots; i++) {
+        const SlotKind k = caster.inventory.KindAt(i);
+        ui.glyphSlotKinds.push_back((int)k);
+        if (k == SlotKind::Page) {
+          const std::string& name = caster.inventory.PageAt(i);
+          ui.glyphSlots.push_back(name);
+          const GrimoireExpansion ex = ExpandWords(glyphs, caster.grimoire, {name}, kSpellStackMax);
+          SpellStack st;
+          st.spoken = ex.spoken;
+          ui.glyphSlotReadouts.push_back(DescribeSpell(glyphs, CompileSpell(glyphs, st)).text);
+          continue;
+        }
         int gi = caster.inventory.At(i);
         ui.glyphSlots.push_back(
             gi >= 0 && gi < (int)glyphs.glyphs.size() ? glyphs.glyphs[gi].id : "");
+        ui.glyphSlotReadouts.push_back("");
       }
+      ui.glyphBankB = captured && ui.magicMode &&
+                      (key(GLFW_KEY_LEFT_SHIFT) || key(GLFW_KEY_RIGHT_SHIFT));
+      caster.noteAge += dt;
+      ui.spellNote = caster.note;
+      ui.spellNoteAge = caster.noteAge;
       // hotbar + swing readout (game/item.h, game/melee.h)
       ui.itemNames.clear();
       for (int i = 0; i < kItemSlots; i++) {
@@ -7497,16 +7844,119 @@ int main(int argc, char** argv) {
           ui.kitMessageAge = 0.0f;
         }
       }
+      if (ui.castAtPart.pending) {
+        ui.castAtPart.pending = false;
+        castAtPartQueued = ui.castAtPart.slot;
+      }
       if (ui.bindGlyph.pending) {
         ui.bindGlyph.pending = false;
         // BY NAME. The panel never handles a glyph index, so a bind cannot
         // survive into a reload as a stale index (see the R-reload block).
-        const int gi = ui.bindGlyph.glyphId.empty()
-                           ? -1
-                           : glyphs.Find(ui.bindGlyph.glyphId);
-        if (!caster.inventory.Bind(ui.bindGlyph.slot, gi)) {
-          ui.kitMessage = "you do not know that glyph";
+        if (ui.bindGlyph.page) {
+          GrimoirePage scratch;
+          if (!FindPage(glyphs, caster.grimoire, ui.bindGlyph.glyphId, scratch) ||
+              !caster.inventory.BindPage(ui.bindGlyph.slot, ui.bindGlyph.glyphId)) {
+            ui.kitMessage = "no such page";
+            ui.kitMessageAge = 0.0f;
+          }
+        } else {
+          const int gi = ui.bindGlyph.glyphId.empty()
+                             ? -1
+                             : glyphs.Find(ui.bindGlyph.glyphId);
+          if (!caster.inventory.Bind(ui.bindGlyph.slot, gi)) {
+            ui.kitMessage = "you do not know that glyph";
+            ui.kitMessageAge = 0.0f;
+          }
+        }
+      }
+      if (ui.grimoireOp.pending) {
+        ui.grimoireOp.pending = false;
+        const UIState::GrimoireIntent& op = ui.grimoireOp;
+        auto say = [&](const std::string& m) {
+          ui.kitMessage = m;
           ui.kitMessageAge = 0.0f;
+        };
+        if (op.op == UIState::GrimoireIntent::Delete) {
+          const int pi = caster.grimoire.Find(op.name);
+          if (pi >= 0) {
+            caster.grimoire.pages.erase(caster.grimoire.pages.begin() + pi);
+            // Slots holding the page keep its name: they speak nothing and the
+            // strip shows ?, which is the by-name contract (DESIGN §8b).
+            say("deleted " + op.name);
+            if (ui.grimoireSelected == op.name) {
+              ui.grimoireSelected.clear();
+              ui.grimoireEditWords.clear();
+              ui.grimoireEditName.clear();
+              ui.grimoireEditDirty = false;
+            }
+          } else {
+            say("that page is not yours to delete");
+          }
+        } else if (op.op == UIState::GrimoireIntent::Duplicate) {
+          GrimoirePage scratch;
+          const GrimoirePage* src = FindPage(glyphs, caster.grimoire, op.name, scratch);
+          if (!src) {
+            say("no such page");
+          } else if ((int)caster.grimoire.pages.size() >= glyphs.budgets.maxGrimoirePages) {
+            say("the grimoire is full");
+          } else {
+            GrimoirePage copy;
+            copy.words = src->words;
+            copy.name = op.name + "-copy";
+            for (int k = 2; caster.grimoire.Find(copy.name) >= 0 && k < 100; k++)
+              copy.name = op.name + "-copy" + std::to_string(k);
+            caster.grimoire.pages.push_back(copy);
+            ui.grimoireSelected = copy.name;
+            ui.grimoireEditName = copy.name;
+            ui.grimoireEditWords = copy.words;
+            ui.grimoireEditDirty = false;
+            say("copied to " + copy.name);
+          }
+        } else {
+          // SAVE: a name, a bounded word list, no cycle. A starter's name
+          // cannot be taken (it would shadow the read-only page).
+          std::string name = op.name;
+          while (!name.empty() && name.back() == ' ') name.pop_back();
+          std::vector<std::string> words = op.words;
+          if ((int)words.size() > glyphs.budgets.maxMacroWords)
+            words.resize(glyphs.budgets.maxMacroWords);
+          bool starter = false;
+          for (const ConjoinedGlyph& cg : glyphs.conjoined) starter = starter || cg.id == name;
+          std::string why;
+          if (name.empty()) {
+            say("a page needs a name");
+          } else if (starter || glyphs.Find(name) >= 0) {
+            say("that name belongs to the library");
+          } else if (GrimoireWouldCycle(glyphs, caster.grimoire, name, words, why)) {
+            say("refused: " + why);
+          } else {
+            int pi = caster.grimoire.Find(name);
+            // Renaming the selected page: the old entry goes, slots bound to
+            // the old name follow it.
+            if (pi < 0 && !ui.grimoireSelected.empty() && ui.grimoireSelected != name) {
+              const int old = caster.grimoire.Find(ui.grimoireSelected);
+              if (old >= 0) {
+                caster.grimoire.pages[old].name = name;
+                for (int i = 0; i < kGlyphSlots; i++)
+                  if (caster.inventory.PageAt(i) == ui.grimoireSelected)
+                    caster.inventory.BindPage(i, name);
+                pi = old;
+              }
+            }
+            if (pi < 0 && (int)caster.grimoire.pages.size() >= glyphs.budgets.maxGrimoirePages) {
+              say("the grimoire is full");
+            } else {
+              if (pi < 0) {
+                caster.grimoire.pages.push_back(GrimoirePage{name, words, false});
+              } else {
+                caster.grimoire.pages[pi].words = words;
+              }
+              ui.grimoireSelected = name;
+              ui.grimoireEditName = name;
+              ui.grimoireEditDirty = false;
+              say("saved " + name);
+            }
+          }
         }
       }
       ui.kitMessageAge += dt;
@@ -7572,20 +8022,118 @@ int main(int argc, char** argv) {
           ui.equipSlots.push_back(mirror(kit.equip.slots[i]));
 
         ui.glyphsOwned.clear();
-        for (int gi : caster.inventory.owned) {
-          if (gi < 0 || gi >= (int)glyphs.glyphs.size()) continue;
+        for (int gi = 0; gi < (int)glyphs.glyphs.size(); gi++) {
           const GlyphDef& g = glyphs.glyphs[gi];
           UIState::GlyphUI u;
           u.id = g.id;
           u.desc = g.desc;
-          u.type = (int)g.type;
-          u.mana = g.mana;
-          // The element swatch is the material's own gpu colour, so a fire
+          u.type = (int)g.sort;
+          u.mana = g.word;
+          u.owned = caster.inventory.Owns(gi);
+          u.axis = g.axis;
+          u.example = g.example;
+          // Valence, in the sort names the grammar uses (plan §9).
+          auto slotNames = [](uint8_t mask) {
+            if (mask == kSortAny) return std::string("any");
+            std::string s;
+            const char* names[5] = {"matter", "effect", "delivery", "mod", "operator"};
+            for (int b = 0; b < 5; b++)
+              if (mask & (1u << b)) s += (s.empty() ? "" : "/") + std::string(names[b]);
+            return s;
+          };
+          if (g.sort == GlyphSort::Operator) {
+            u.valence = (g.hasLeft ? slotNames(g.leftMask) + " < " : std::string()) + g.id +
+                        (g.hasRight ? " > " + slotNames(g.rightMask) : std::string()) + " -> " +
+                        GlyphSortName(g.result);
+            u.emptyNote = std::string(g.hasLeft ? "left empty: incomplete (charged)" : "") +
+                          (g.hasLeft && g.hasRight ? "   " : "") +
+                          (g.hasRight ? "right empty: incomplete (charged)" : "");
+          } else if (g.sort == GlyphSort::Mod) {
+            const char* opn = g.op == ModOp::Mul ? "x" : g.op == ModOp::Div ? "/" : "+";
+            u.valence = std::string("edits ") + ModFieldName(g.field) + " " + opn +
+                        std::to_string(g.amount) + ", again per repeat";
+          } else if (g.sort == GlyphSort::Delivery) {
+            u.valence = std::string(g.mech == DeliveryMech::Flight ? "flight" :
+                                    g.mech == DeliveryMech::Continuous ? "continuous" : "instant") +
+                        ", carry x" + std::to_string(g.carryMille / 1000) + "." +
+                        std::to_string((g.carryMille % 1000) / 100);
+          } else if (g.sort == GlyphSort::Effect) {
+            u.valence = std::string("effect: ") + SpellVerbName(g.verb);
+          } else {
+            u.valence = g.wildcard ? "matter: whatever is there"
+                                   : "matter: " + g.materialName + ", value " +
+                                         std::to_string(glyphs.Arcane(g.material));
+          }
+          switch (g.sort == GlyphSort::Operator || g.sort == GlyphSort::Effect ? g.verb
+                                                                                : SpellVerb::None) {
+            case SpellVerb::Convert: u.tariff = "volume x (convert + value gap)"; break;
+            case SpellVerb::Explode: u.tariff = "power x r^3"; break;
+            case SpellVerb::Wind: u.tariff = "footprint x ticks"; break;
+            case SpellVerb::Mend: u.tariff = "per voxel: value(M) x graft + foreign penalty"; break;
+            case SpellVerb::Trail: u.tariff = "budget voxels x E"; break;
+            case SpellVerb::Sustain: u.tariff = "E per tick, sustained"; break;
+            case SpellVerb::Filter: u.tariff = "radius^3 per tick"; break;
+            case SpellVerb::Repeat: u.tariff = "repeats x E"; break;
+            case SpellVerb::Place: u.tariff = "voxels x value(M)"; break;
+            default:
+              u.tariff = g.sort == GlyphSort::Matter ? "voxels x value(M) x place" :
+                         g.sort == GlyphSort::Mod ? "on the expansion (count, volume)" :
+                         g.sort == GlyphSort::Delivery ? "carry x the payload, + the word" : "";
+          }
+          if (g.sort != GlyphSort::Delivery) {
+            std::string d;
+            for (const GlyphDef& o : glyphs.glyphs)
+              if (o.sort == GlyphSort::Delivery) d += (d.empty() ? "" : ", ") + o.id;
+            u.delivers = "hand, " + d;
+          }
+          // The matter swatch is the material's own gpu colour, so a fire
           // glyph is the colour fire actually renders as rather than a colour
           // somebody picked for the UI.
-          if (g.type == GlyphType::Element && g.material < mats.size())
+          if (g.sort == GlyphSort::Matter && !g.wildcard && g.material > 0 &&
+              g.material < mats.size())
             u.color = mats[g.material].gpu.color0;
           ui.glyphsOwned.push_back(std::move(u));
+        }
+
+        // The grimoire: the authored starters (read-only) and the player's
+        // pages, each with the readout and price of its expansion, through
+        // the same DescribeSpell the live sentence uses.
+        ui.grimoirePages.clear();
+        ui.grimoireMaxPages = glyphs.budgets.maxGrimoirePages;
+        ui.grimoireMaxWords = glyphs.budgets.maxMacroWords;
+        auto describeWords = [&](const std::vector<std::string>& words, std::string& readout,
+                                 int32_t& price, bool& unknown, int& dropped) {
+          const GrimoireExpansion ex = ExpandWords(glyphs, caster.grimoire, words, kSpellStackMax);
+          SpellStack st;
+          st.spoken = ex.spoken;
+          const CastList l = CompileSpell(glyphs, st);
+          readout = DescribeSpell(glyphs, l).text;
+          if (ex.dropped > 0) readout += "   (? = a word that no longer exists)";
+          if (ex.truncated) readout += "   (cut at the stack bound)";
+          price = l.manaCost;
+          unknown = l.priceUnknown;
+          dropped = ex.dropped;
+        };
+        for (const ConjoinedGlyph& cg : glyphs.conjoined) {
+          UIState::GrimoirePageUI p;
+          p.name = cg.id;
+          p.readOnly = true;
+          for (int gi : cg.glyphs)
+            if (const GlyphDef* d = glyphs.At(gi)) p.words.push_back(d->id);
+          describeWords(p.words, p.readout, p.price, p.priceUnknown, p.dropped);
+          ui.grimoirePages.push_back(std::move(p));
+        }
+        for (const GrimoirePage& pg : caster.grimoire.pages) {
+          UIState::GrimoirePageUI p;
+          p.name = pg.name;
+          p.words = pg.words;
+          describeWords(p.words, p.readout, p.price, p.priceUnknown, p.dropped);
+          ui.grimoirePages.push_back(std::move(p));
+        }
+        {
+          int dropped = 0;
+          describeWords(ui.grimoireEditWords, ui.grimoireEditReadout, ui.grimoireEditPrice,
+                        ui.grimoireEditPriceUnknown, dropped);
         }
       }
 
@@ -7840,9 +8388,11 @@ int main(int argc, char** argv) {
         s.pos[1] = SpellFxToFloat(p.pos.y);
         s.pos[2] = SpellFxToFloat(p.pos.z);
         s.halfSize = 0.6f;
-        s.color = p.spell.element < mats.size()
-                      ? mats[p.spell.element].gpu.color0
-                      : 0xFFFFFFFFu;
+        // The bolt is drawn in the colour of the first matter it carries
+        // (a spray, a convert's product, a trail mark); a bolt that carries
+        // none (a bare `explosive projectile`) is white.
+        const uint32_t tint = CastTintMaterial(p.cast);
+        s.color = tint != 0 && tint < mats.size() ? mats[tint].gpu.color0 : 0xFFFFFFFFu;
         s.emission = 1.0f;
         sprv.push_back(s);
       }
@@ -8114,7 +8664,8 @@ int main(int argc, char** argv) {
         // separates the first two from the third in a single run. (It was the
         // third: a 9-slice frame whose middle slice was opaque.)
         if (g_shotInventory && (frameCounter == kShotInvGearFrame ||
-                                frameCounter == kShotInvCaptureFrame))
+                                frameCounter == kShotInvCaptureFrame ||
+                                frameCounter == kShotInvGrimoireFrame))
           std::printf("--shot-inventory: portrait cube=%zu micro=%u "
                       "eye=(%.1f %.1f %.1f) target=(%.1f %.1f %.1f)\n",
                       pInst.size(), pMicro, portraitCam.eye.x, portraitCam.eye.y,
@@ -8248,10 +8799,13 @@ int main(int argc, char** argv) {
       // legal here for the same reason it is in --shot: this is the last frame
       // of a harness run, not the frame path of a game.
       if (g_shotInventory && (frameCounter == kShotInvGearFrame ||
-                              frameCounter == kShotInvCaptureFrame)) {
+                              frameCounter == kShotInvCaptureFrame ||
+                              frameCounter == kShotInvGrimoireFrame)) {
         const char* shotPath = frameCounter == kShotInvGearFrame
                                    ? "screenshot_inventory.bmp"
-                                   : "screenshot_inventory_health.bmp";
+                               : frameCounter == kShotInvCaptureFrame
+                                   ? "screenshot_inventory_health.bmp"
+                                   : "screenshot_inventory_grimoire.bmp";
         const uint32_t W = ctx.width, H = ctx.height;
         rhi::Texture shotTex = ctx.device.CreateTexture(
             {W, H, 1}, ctx.surfaceFormat,

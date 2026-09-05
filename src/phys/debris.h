@@ -425,7 +425,7 @@ class DebrisSystem {
     // --- leaks: matter left in the grid with no path back ---
     uint32_t oversizeBboxSkipped = 0;   // component wider than the int8 lattice
     uint32_t solidRubbleInPlace = 0;    // a SOLID scrap written back where it hung
-    uint32_t stuckEventDropped = 0;     // readback starvation / region streamed out
+    uint32_t stuckEventDropped = 0;     // region left the window: nothing there
     uint32_t deferGaveUp = 0;           // re-queue budget exhausted
     uint32_t eventQueueFullDropped = 0; // queue full AND the spill also failed
     // NOT a leak: the pendingSupport_ drain found the event queue full and left
@@ -437,6 +437,24 @@ class DebrisSystem {
     uint32_t deferredOversize = 0;      // oversize component held for a re-scan
     uint32_t eventQueueFullSpilled = 0; // queue full -> pendingSupport_ instead
     uint32_t settleWithoutSupport = 0;  // a settle refused for want of ground
+    // An event whose chunks never arrived, spilled back to pendingSupport_
+    // instead of being thrown away. In the deferral column, not the leak
+    // column: the region is still resident, so the scan is late, not lost.
+    uint32_t stuckEventRequeued = 0;
+    // Support flags the per-chunk cooldown suppressed, and how many of those
+    // were later promoted once it expired. `held` with a zero `rearmed` means
+    // the re-arm is not running; both zero means the cooldown never fires and
+    // is not the reason anything floats.
+    uint32_t supportLateHeld = 0;
+    uint32_t supportLateRearmed = 0;
+    // Scan cost, so a latency claim can be checked against the work it did:
+    // cells the flood actually visited, against cells the regions covered. The
+    // ratio is what seeding from the changed box and stopping at the first
+    // anchor buy; if it drifts back toward 1.0 the scan is labelling terrain
+    // again.
+    uint64_t scanCellsVisited = 0;
+    uint64_t scanCellsCovered = 0;
+    uint32_t scans = 0;
     // --- why components were judged anchored (context, not a verdict) ---
     // A component can be anchored for a good reason (the structure really does
     // continue outside the scan box) or a conservative one (we could not see
@@ -446,6 +464,20 @@ class DebrisSystem {
     uint32_t anchoredByRegionBoundary = 0;  // solid genuinely continues outside
     uint32_t anchoredByUnknownChunk = 0;    // unfetched / out-of-window: assumed
     uint32_t anchoredByOversizeFlood = 0;   // over kMaxIslandVoxels: unjudgeable
+    // ---- the same three, for components too SMALL to be anything -----------
+    //
+    // The counters above are dominated by bulk: a scan over terrain anchors the
+    // ground every time and reports tens of thousands, which is correct and
+    // says nothing. A component of one to seven voxels is a different claim
+    // entirely — a lone burnt twig is not "structure that continues outside the
+    // box", and if one is being anchored then the anchor test is what is
+    // leaving specks in the air. Split out so the two questions stop sharing a
+    // number (CLAUDE.md rule 6), and cheap: three increments on a branch that
+    // only runs for components under the body floor.
+    uint32_t smallAnchoredBoundary = 0;
+    uint32_t smallAnchoredUnknown = 0;
+    uint32_t smallAnchoredPowder = 0;  // resting on powder: a legitimate anchor
+    uint32_t smallUnanchored = 0;      // ...and how many were freed, for scale
   };
   const FloaterProbe& Floaters() const { return floaters_; }
   void ResetFloaterProbe() { floaters_ = FloaterProbe{}; }
@@ -511,6 +543,13 @@ class DebrisSystem {
     // exhaustion the give-up is COUNTED rather than silent, which is the whole
     // point of the floater probe below.
     uint8_t retries = 0;
+    // The box the caller actually named, BEFORE the margin was added: the
+    // erased cells, the flagged chunk. The flood seeds only from solids in
+    // (and one cell around) this box -- see RunIslandDetection -- because a
+    // component that does not touch what changed did not lose its support
+    // here, and labelling the whole terrain slab in a 64^3 region for every
+    // scan was most of what a scan cost.
+    IVec3 seedLo{}, seedHi{};
   };
   struct Body {
     uint64_t handle = 0;
@@ -580,12 +619,20 @@ class DebrisSystem {
                             // through a chunk must not rebuild-and-wake
   };
 
-  bool EventReady(const Event& e, World& world, uint32_t required) const;
+  // Are every one of this region's chunks cached at or past `required`? When
+  // `requestFetch`, missing ones are asked for — plus the one-chunk RING around
+  // the region, which `solidOutside` reads and which nothing used to fetch, so
+  // a component touching a scan-box face was anchored on a guess. The ring is
+  // requested but never waited for; see the comment at the call site.
+  bool EventReady(const Event& e, World& world, uint32_t required,
+                  bool requestFetch = true) const;
   // Push every world chunk the (already clamped) region covers onto
   // pendingSupport_. The overflow path for a full event queue; deduped by
   // supportPending_ exactly like a GPU support flag, so a region spilled twice
   // costs one entry.
   void SpillRegionToSupport(const Event& e);
+  // Promote chunks the cooldown suppressed, once it has expired.
+  void RearmLateSupport(uint32_t tick);
   // Is any voxel of a settle candidate's snapped footprint resting on grid
   // solid/powder? See the long note at the call site in SettleBodies — this is
   // what stops a body that was resting on ANOTHER BODY from stamping itself
@@ -732,8 +779,22 @@ class DebrisSystem {
   std::deque<IVec3> pendingSupport_;
   std::unordered_map<uint64_t, uint8_t> supportPending_;    // dedup (packed key)
   std::unordered_map<uint64_t, uint32_t> supportCooldown_;  // chunk -> last tick
+  // Chunks whose flag the cooldown SUPPRESSED, held until it expires. Without
+  // this the cooldown is a drop rather than a delay and the final state of a
+  // burnt-out region — the one the player is looking at — is the one state no
+  // scan ever runs on. Deduped per chunk and capped like pendingSupport_.
+  std::deque<IVec3> supportLateQueue_;
+  std::unordered_map<uint64_t, uint8_t> supportLate_;
   uint32_t lastSupportSnapTick_ = 0;
   std::vector<Body> bodies_;
+  // Scan scratch, REUSED across scans. A 64^3 region is 262,144 cells and
+  // RunIslandDetection used to construct three vectors over it per scan -- 2.4
+  // MB allocated, zeroed and freed for every support-loss chunk, which is the
+  // cost that capped the scan rate. Kept between calls and `assign`ed, so the
+  // zeroing stays and the allocator leaves the hot path.
+  std::vector<uint32_t> scanWords_;
+  std::vector<uint8_t> scanSolid_;
+  std::vector<int32_t> scanLabel_;
   std::vector<std::pair<Vec3, float>> extraAnchors_;    // mob limbs, this tick
   std::unordered_map<uint64_t, TerrainEntry> terrain_;  // packed world chunk key
   uint32_t lastTerrainTick_ = 0;  // the sweep TerrainCensus reports on

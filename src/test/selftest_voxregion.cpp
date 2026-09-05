@@ -313,10 +313,38 @@ Status GateVoxRegion(Ctx& c, std::string& detail) {
                  {8, 3, 8}, false, false);
       ctx.WaitIdle();
       ReadVoxelsSync(ctx, world, slot, 1, after.data(), "editAfter");
-      check((after[inChunk] & 0xFFFu) == 2u,
-            "the applied voxel reads material " +
-            std::to_string(after[inChunk] & 0xFFFu) + ", wanted 2 (was " +
-            std::to_string(before[inChunk] & 0xFFFu) + ")");
+      // AT ITS CELL, OR ONE BELOW IT, and the second alternative is not a
+      // loosened assertion — it is the same assertion in a world where
+      // isolated solids fall. This layer places ONE wood voxel into open air,
+      // and since 2026-09-04 a solid with no solid or powder on any of its six
+      // faces is a one-voxel island and drops in the CA (`soloSolid`,
+      // sim_step.wgsl; owned by the `tree-fell` gate). The tick this gate
+      // submits runs sim_mutate AND sim_step, so a correctly applied edit has
+      // already taken its first step down by the time it is read back.
+      //
+      // The claim is unchanged and still cannot be satisfied by accident: if
+      // the op never reached the grid, NEITHER cell holds wood. What the gate
+      // says the tuner promises — "an edit will be there when you play" — is
+      // exactly as true; a lone floating voxel simply now falls to the ground
+      // like anything else with nothing under it, which is what an author
+      // placing one should expect of a falling-sand world.
+      // Searched down its own COLUMN rather than at one fixed offset: a tick
+      // runs two gravity substeps, so the number of cells it has dropped by the
+      // time this reads back is a property of the substep schedule and not
+      // something this gate should be pinned to. The column stays inside the
+      // chunk that was read (local y is 3), so this is still one chunk's data.
+      const uint32_t landedAt = after[inChunk] & 0xFFFu;
+      int foundY = -1;
+      for (int y = wantVox2.y; y >= (wc.y * (int)kChunk) && foundY < 0; y--) {
+        const uint32_t ic =
+            World::SlotCellIndex({wantVox2.x, y, wantVox2.z}) - slot * kChunkVol;
+        if ((after[ic] & 0xFFFu) == 2u) foundY = y;
+      }
+      check(foundY >= 0,
+            "the applied voxel is nowhere in its column: reads material " +
+                std::to_string(landedAt) + " at its own cell (was " +
+                std::to_string(before[inChunk] & 0xFFFu) +
+                "), and no wood anywhere below it in the chunk");
     }
     check(!layer.HasPending(), "layer still has pending chunks after a full drain");
 

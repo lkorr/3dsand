@@ -202,8 +202,11 @@ void Overlay::DrawHUD(const UIState& s) {
 
   bar(yHealth, s.health, s.healthMax, fromHealth, IM_COL32(190, 55, 55, 235),
       IM_COL32(255, 140, 60, 245), "hp", s.healthCap);
-  bar(yMana, s.mana, s.manaMax, fromMana, IM_COL32(70, 120, 230, 235),
-      IM_COL32(150, 200, 255, 245), "mp", -1);
+  // The reservation is drawn the way the burn cap is: the span past the
+  // effective max is what the auras are holding, not mana that was spent.
+  bar(yMana, s.mana, s.manaPoolMax > 0 ? s.manaPoolMax : s.manaMax, fromMana,
+      IM_COL32(70, 120, 230, 235), IM_COL32(150, 200, 255, 245), "mp",
+      s.manaReserved > 0 ? s.manaMax : -1);
 
   // ---- body condition, sitting directly above the hp bar -------------------
   const float figureH = DrawBodyFigure(s, x, yHealth - gap);
@@ -473,8 +476,15 @@ void Overlay::Draw(UIState& s) {
     }
     ImGui::Dummy(ImVec2(w, h + 4));
   }
-  ImGui::Text("mana %d/%d   health %d   cost %d", s.mana, s.manaMax, s.health,
-              s.spellCost);
+  ImGui::Text("mana %d/%d   health %d   cost %d%s", s.mana, s.manaMax, s.health,
+              s.spellCost, s.spellPriceUnknown ? " + ?" : "");
+  if (s.spellCost > 0 || s.spellPriceUnknown)
+    ImGui::TextDisabled("  word %d + tariff %d + carry %d%s", s.spellWord, s.spellTariff,
+                        s.spellCarry,
+                        s.spellPriceUnknown ? "   (anything: priced when it lands)" : "");
+  if (s.spellLastBillAge < 2.5f && s.spellLastBill > 0)
+    ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f), "billed %d on resolve",
+                       s.spellLastBill);
   if (s.spellCost > s.mana + s.health) {
     ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.3f, 1.0f),
                        "FATAL - this will kill you");
@@ -488,14 +498,32 @@ void Overlay::Draw(UIState& s) {
   } else {
     ImGui::TextDisabled("speaking: (nothing)   RMB casts, C clears");
   }
-  if (!s.glyphSlots.empty()) {
-    std::string strip;
-    for (size_t i = 0; i < s.glyphSlots.size(); i++) {
-      if (s.glyphSlots[i].empty()) continue;
-      strip += std::to_string((i + 1) % 10) + ":" + s.glyphSlots[i] + "  ";
-    }
-    ImGui::TextDisabled("%s", strip.c_str());
+  if (!s.spellStatuses.empty()) {
+    ImGui::Text("sustaining (%d reserved, Delete drops the newest):", s.manaReserved);
+    for (const std::string& st : s.spellStatuses) ImGui::TextDisabled("  %s", st.c_str());
   }
+  if (s.spellRefused > 0)
+    ImGui::TextColored(ImVec4(0.6f, 0.9f, 1.0f, 1.0f), "ward refused %d", s.spellRefused);
+  if (!s.glyphSlots.empty()) {
+    // Two rows: bank A on the number row, bank B on Shift. The bank Shift is
+    // holding is drawn bright; a page shows as its name with a page mark.
+    for (int bank = 0; bank < 2; bank++) {
+      std::string strip = bank == 0 ? "1-0:   " : "S+1-0: ";
+      bool any = false;
+      for (size_t i = (size_t)bank * 10; i < s.glyphSlots.size() && i < (size_t)(bank + 1) * 10; i++) {
+        if (s.glyphSlots[i].empty()) continue;
+        any = true;
+        const bool page = i < s.glyphSlotKinds.size() && s.glyphSlotKinds[i] == 2;
+        strip += std::to_string((i + 1) % 10) + ":" + (page ? "[" : "") + s.glyphSlots[i] +
+                 (page ? "]" : "") + "  ";
+      }
+      if (!any) continue;
+      if (s.glyphBankB == (bank == 1)) ImGui::Text("%s", strip.c_str());
+      else ImGui::TextDisabled("%s", strip.c_str());
+    }
+  }
+  if (s.spellNoteAge < 3.0f && !s.spellNote.empty())
+    ImGui::TextColored(ImVec4(0.9f, 0.85f, 0.5f, 1.0f), "%s", s.spellNote.c_str());
   ImGui::Text("projectiles %d", s.liveProjectiles);
   if (s.spellOpsDropped > 0) {
     ImGui::SameLine();
