@@ -821,6 +821,34 @@ static bool inHarness(int x, int z) {
 }
 bool World::InHarness(int x, int z) { return inHarness(x, z); }
 
+// ---- the site table, on the CPU (worldgen.wgsl wmSiteAt / wmSiteI) --------
+// Same names as the shader so the mirrored sitePadAt below reads the same.
+static constexpr uint32_t WM_S_X = worldmap::kS_X;
+static constexpr uint32_t WM_S_Z = worldmap::kS_Z;
+static constexpr uint32_t WM_S_RADIUS = worldmap::kS_Radius;
+static constexpr uint32_t WM_S_PAD_MARGIN = worldmap::kS_PadMargin;
+static uint32_t wmSiteAt(int x, int z) {
+  const worldmap::WorldMapData& m = worldmap::CurrentWorldMap();
+  if (!m.Loaded() || m.siteIndex.empty()) return 0u;
+  int cx, cz;
+  m.CellOf(x, z, &cx, &cz);
+  if (!m.Inside(cx, cz)) return 0u;
+  return m.SiteCell(cx, cz);
+}
+static int wmSiteI(uint32_t sid, uint32_t w) {
+  const worldmap::WorldMapData::StampSite& s = worldmap::CurrentWorldMap().sites[sid - 1];
+  switch (w) {
+    case worldmap::kS_X: return s.x;
+    case worldmap::kS_Z: return s.z;
+    case worldmap::kS_Radius: return s.radius;
+    case worldmap::kS_PadMargin: return s.padMargin;
+    default: return 0;
+  }
+}
+static bool siteKeepOut(int x, int z) {
+  return inHarness(x, z) || wmSiteAt(x, z) != 0u;
+}
+
 // The shader's vec2<i32>, so pondAt can be mirrored with the same shape.
 // Outside the mirrored region: WGSL gets this type from the language.
 struct IV2 {
@@ -1184,7 +1212,7 @@ static Pond pondInfo(int pt, int pz, uint32_t seed) {
   // the bowl, the berm, the shore fringe, the ruins, evaporation and the MPM
   // seam were each ruled out by measurement, and the residue is a liquid-CA
   // question. See docs/PLAN_terrain_overhaul.md.
-  if (inHarness(cx, cz)) { return p; }
+  if (siteKeepOut(cx, cz)) { return p; }
   Land c = landAt(cx, cz, seed);
   if (c.slope > WG().pondMaxSlope) { return p; }
   if (c.slope * r > (WG().pondDepth - WG().pondDepthRim) * 256) { return p; }
@@ -1359,15 +1387,27 @@ static BareCol landColumnBare(int x, int z, uint32_t seed) {
   return b;
 }
 
+static int sitePadAt(int x, int z, int h, uint32_t seed) {
+  const uint32_t sid = wmSiteAt(x, z);
+  if (sid == 0u) { return h; }
+  const int sx = wmSiteI(sid, WM_S_X);
+  const int sz = wmSiteI(sid, WM_S_Z);
+  const int r = wmSiteI(sid, WM_S_RADIUS);
+  const int margin = std::max(wmSiteI(sid, WM_S_PAD_MARGIN), 1);
+  const int d = std::max(std::max(std::abs(x - sx), std::abs(z - sz)) - r, 0);
+  if (d >= margin) { return h; }
+  const int padY = landColumnBare(sx, sz, seed).h;
+  const int w = ((margin - d) * 256) / margin;
+  return h + (((padY - h) * w) >> 8);
+}
 
 int World::TerrainHeight(int x, int z, uint32_t seed) {
   // Lab slab: the same guard landColumn takes in worldgen.wgsl. Before the
   // tuning reads on purpose — the lab surface must not move when worldgen
   // knobs are tuned, or every scene's fixture heights drift.
   if (sLabWorld) return kLabSlabY;
-  // Since the world map's P2b there is no ruin pad to blend in; authored
-  // sites arrive with their own pad in P5.
-  return landColumnBare(x, z, seed).h;
+  const int h = landColumnBare(x, z, seed).h;
+  return sitePadAt(x, z, h, seed);
 }
 // MIRROR-END landheight
 

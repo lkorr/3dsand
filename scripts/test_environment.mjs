@@ -247,6 +247,15 @@ console.log('\n-- world map --');
     const pad = (j.sites || []).find(s => s.kind === 'pad');
     ok(!!pad && pad.min[0] <= pad.max[0] && pad.min[1] <= pad.max[1], 'a harness pad box exists and is a box');
     ok(!!pad && pad.min[0] <= 60 && pad.max[0] >= 420 && pad.min[1] <= 60 && pad.max[1] >= 420, 'the pad covers the fixture columns and the (420,420) tarn');
+    // stamp sites and rules (P5): every template named must exist as a .vox,
+    // because the engine refuses to start otherwise.
+    const prefabs = new Set(existsSync(join(ROOT, 'assets', 'prefabs')) ? readdirSync(join(ROOT, 'assets', 'prefabs')).filter(f => f.endsWith('.vox')).map(f => f.slice(0, -4)) : []);
+    const stamps = (j.sites || []).filter(s => s.kind === 'stamp');
+    ok(stamps.every(s => typeof s.template === 'string' && Number.isInteger(s.x) && Number.isInteger(s.z)), `${stamps.length} stamp site(s) carry template/x/z`);
+    ok(stamps.every(s => prefabs.has(s.template)), 'every stamp site names an existing assets/prefabs/<template>.vox');
+    const rules = (j.rules || []);
+    ok(rules.every(r => r.kind !== 'stamp' || (typeof r.template === 'string' && j.biomes.includes(r.biome) && r.perKm2 >= 0)), `${rules.length} rule(s) name a template, a palette biome and a perKm2`);
+    ok(rules.every(r => r.kind !== 'stamp' || prefabs.has(r.template)), 'every rule names an existing assets/prefabs/<template>.vox');
   }
 }
 

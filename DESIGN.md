@@ -6746,6 +6746,30 @@ the one model modders already read (PLAN_biomes.md §2 has the survey).
   map page's landform brush is where that is authored. `LAVA_LID` is not
   needed yet: no biome record carves caves under the sea (ocean's cave
   thresholds are 255) and lava only pools in caves.
+* **LIVE (world map P5, 2026-09-04): THE SITE TABLE.** `map.json sites[]`
+  of kind `stamp` (a `.vox` from `assets/prefabs/`, a world column, a
+  rotation, a pad margin) and `rules[]` (`{kind: stamp, template, biome,
+  perKm2, minSpacing, rot|-1, padMargin, salt}` — resolved at load with the
+  world seed, integer hash per cell in row-major order, greedy spacing, so
+  the same seed places the same sites everywhere; Tier B). The loader packs
+  each (template, rotation) once into columns of runs in the tree atlas's
+  encoding, writes one `kS_*` record per site and a per-cell SITE INDEX
+  plane (`site id + 1`). In the shader `wmSiteAt` is one plane read per
+  column; **`sitePadAt`** (inside the height mirror, identical in
+  `world.cpp`) levels the ground under the footprint to the site centre's
+  height and ramps back over the margin — `ruinPad` generalised, and
+  `World::TerrainHeight` applies it too, so the height contract holds;
+  **`wmStampCell`** overlays the template's runs above the pad in
+  `genCellIn` (non-air replaces, air leaves the world alone) — pure
+  worldgen, so the far cascades show a stamped building at any distance
+  with nothing to patch, and the sky early-out / far blocker band include
+  `wmSiteTopAt`; **`siteKeepOut`** (the harness box or any site cell)
+  suppresses trunks, tarns and cover. A missing template refuses to start.
+  The World map page places/deletes stamp sites (`Stamp site` tool).
+  `assets/prefabs/` ships no `.vox` yet, so the default map has none; the
+  first authored one exercises the whole path. Not yet: `proc:` kinds
+  (the ruin shell is gone; a generator per kind is the follow-up plan),
+  slope-gated rules, sites larger than 512 voxels a side.
 * **LIVE: the biome band strip** on the climate section — the three worldgen
   thresholds (`meadowThreshold` / `pineThreshold` / `desertThreshold`) as one
   draggable bar writing `tuning.json`.

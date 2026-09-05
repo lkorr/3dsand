@@ -1046,7 +1046,7 @@ fn pondInfo(pt : i32, pz : i32, seed : u32) -> Pond {
   // the bowl, the berm, the shore fringe, the ruins, evaporation and the MPM
   // seam were each ruled out by measurement, and the residue is a liquid-CA
   // question. See docs/PLAN_terrain_overhaul.md.
-  if (inHarness(cx, cz)) { return p; }
+  if (siteKeepOut(cx, cz)) { return p; }
   // ---- THE SLOPE GATE: a tarn is PERCHED, not QUARRIED --------------------
   //
   // Last, because it is the only test here that costs a noise sample, and the
@@ -1349,10 +1349,28 @@ const WM_H_LANDFORM_PLANE: u32 = 13u;
 const WM_H_MOISTURE_PLANE: u32 = 14u;
 const WM_H_MAX_COVER_H   : u32 = 20u;
 const WM_H_OCEAN_BIOME   : u32 = 21u;
+const WM_H_SITE_INDEX    : u32 = 15u;
+const WM_H_SITE_TABLE    : u32 = 16u;
+const WM_H_SITE_COUNT    : u32 = 17u;
 const WM_H_HARNESS_X0    : u32 = 22u;
 const WM_H_HARNESS_Z0    : u32 = 23u;
 const WM_H_HARNESS_X1    : u32 = 24u;
 const WM_H_HARNESS_Z1    : u32 = 25u;
+// the site table (worldmap.h kS_* / kStamp_*)
+const WM_S_WORDS         : u32 = 16u;
+const WM_S_KIND          : u32 = 0u;
+const WM_S_X             : u32 = 1u;
+const WM_S_Z             : u32 = 2u;
+const WM_S_RADIUS        : u32 = 3u;
+const WM_S_PAD_MARGIN    : u32 = 4u;
+const WM_S_ROT           : u32 = 5u;
+const WM_S_SALT          : u32 = 6u;
+const WM_S_STAMP_OFF     : u32 = 7u;
+const WM_STAMP_HDR_WORDS : u32 = 4u;
+const WM_STAMP_NX        : u32 = 0u;
+const WM_STAMP_NY        : u32 = 1u;
+const WM_STAMP_NZ        : u32 = 2u;
+const WM_STAMP_COLUMNS   : u32 = 3u;
 const WM_B_WORDS         : u32 = 16u;
 const WM_B_SKIN          : u32 = 0u;
 const WM_B_SUBSOIL       : u32 = 1u;
@@ -1431,6 +1449,66 @@ fn inHarness(x : i32, z : i32) -> bool {
 fn crownMeetsHarness(wx : i32, wz : i32, r : i32) -> bool {
   return wx + r >= i32(worldMap[WM_H_HARNESS_X0]) && wx - r <= i32(worldMap[WM_H_HARNESS_X1]) &&
          wz + r >= i32(worldMap[WM_H_HARNESS_Z0]) && wz - r <= i32(worldMap[WM_H_HARNESS_Z1]);
+}
+
+// ---- THE SITE TABLE (P5) ----------------------------------------------------
+// `wmSiteAt` is the per-column cost: one plane read, 0 = no site. A site's
+// record gives its centre, footprint radius, pad margin and stamp block. The
+// pad (`sitePadAt`, inside the height mirror) levels the ground under the
+// footprint to the height at the site's centre and ramps it back over the
+// margin -- Lin's "shape the terrain toward the structure", the ruinPad this
+// replaced generalised to authored sites. The stamp (`wmStampCell`) is a
+// per-cell overlay of the template's runs, exactly the tree atlas's shape,
+// so it is correct in `far` at any distance with nothing to patch. Keep-outs
+// (`siteKeepOut`) suppress trees, tarns and cover on the site's cells, the
+// harness box included.
+fn wmSiteAt(x : i32, z : i32) -> u32 {
+  let plane = worldMap[WM_H_SITE_INDEX];
+  if (plane == 0u) { return 0u; }
+  let c = wmCellOf(x, z);
+  if (!wmInside(c)) { return 0u; }
+  return wmPlaneAt(plane, c.x, c.y);
+}
+fn wmSiteI(sid : u32, w : u32) -> i32 {
+  return bitcast<i32>(worldMap[worldMap[WM_H_SITE_TABLE] + (sid - 1u) * WM_S_WORDS + w]);
+}
+fn siteKeepOut(x : i32, z : i32) -> bool {
+  return inHarness(x, z) || wmSiteAt(x, z) != 0u;
+}
+// The template voxel this world cell would carry, MAT_AIR if none: the
+// stamp's footprint is centred on the site, its bottom row sits one above
+// the pad height (`padY`, which the caller resolves the way sitePadAt does).
+fn wmStampCell(sid : u32, x : i32, y : i32, z : i32, padY : i32) -> u32 {
+  let blk = u32(wmSiteI(sid, WM_S_STAMP_OFF));
+  if (blk == 0u) { return MAT_AIR; }
+  let nx = i32(worldMap[blk + WM_STAMP_NX]);
+  let ny = i32(worldMap[blk + WM_STAMP_NY]);
+  let nz = i32(worldMap[blk + WM_STAMP_NZ]);
+  let lx = x - (wmSiteI(sid, WM_S_X) - nx / 2);
+  let lz = z - (wmSiteI(sid, WM_S_Z) - nz / 2);
+  let ly = y - padY - 1;
+  if (lx < 0 || lz < 0 || ly < 0 || lx >= nx || lz >= nz || ly >= ny) { return MAT_AIR; }
+  let ci = worldMap[blk + WM_STAMP_COLUMNS] + u32(lz * nx + lx) * 2u;
+  let runOff = worldMap[ci];
+  let cnt = worldMap[ci + 1u];
+  for (var k = 0u; k < cnt; k++) {
+    let r = worldMap[runOff + k];
+    let y0 = i32((r >> 16u) & TREE_RUN_Y0_MASK);
+    if (ly < y0) { return MAT_AIR; }
+    if (ly < y0 + i32((r >> TREE_RUN_LEN_SHIFT) & TREE_RUN_LEN_MASK)) { return r & 0xFFFu; }
+  }
+  return MAT_AIR;
+}
+// The top of whatever a site puts above the ground at this column, for the
+// sky early-out and the far blocker band: pad height + the stamp's height.
+// -1e6 where there is no site, so max() ignores it.
+fn wmSiteTopAt(x : i32, z : i32, seed : u32) -> i32 {
+  let sid = wmSiteAt(x, z);
+  if (sid == 0u) { return -1048576; }
+  let blk = u32(wmSiteI(sid, WM_S_STAMP_OFF));
+  if (blk == 0u) { return -1048576; }
+  let padY = landColumnBare(wmSiteI(sid, WM_S_X), wmSiteI(sid, WM_S_Z), seed).h;
+  return padY + 1 + i32(worldMap[blk + WM_STAMP_NY]);
 }
 
 // ---- THE LANDFORM PLANE (P4): the map owns the continental rung -----------
@@ -1690,6 +1768,9 @@ fn treeInfoAt(s : TreeSite, land : Land, seed : u32) -> Tree {
   // Box OVERLAP, not a corner test: a crown wider than the clearing would pass
   // every corner check while covering the whole thing.
   if (crownMeetsHarness(t.wx, t.wz, t.reach)) { return t; }
+  // No trunk on an authored site's cells (P5): the pad is a floor, the stamp
+  // a building. A crown reaching in from outside is allowed and wanted.
+  if (wmSiteAt(t.wx, t.wz) != 0u) { return t; }
 
   t.sp = sp;
   t.above = i32(taSpecies(sp, TA_S_ABOVE));
@@ -2039,7 +2120,7 @@ fn cactusInfo(tx : i32, tz : i32, seed : u32) -> Cactus {
   let h = baseHeight(c.wx, c.wz, seed);
   c.base = h;
   if (h >= TREELINE) { return c; }
-  if (inHarness(c.wx, c.wz)) { return c; }
+  if (siteKeepOut(c.wx, c.wz)) { return c; }
   if (pondAt(c.wx, c.wz, seed).y >= 0) { return c; }
 
   let roll = (hsh >> 17u) % 100u;
@@ -2808,10 +2889,34 @@ fn landColumnBare(x : i32, z : i32, seed : u32) -> LandCol {
 // The height contract's public face: the bare column with the ruin pad blended
 // into it. Everything else in this file and in World::TerrainHeight goes
 // through here.
+// The pad under an authored site (P5): inside the footprint the ground IS
+// the height at the site's centre (exact, so a stamped floor is flat), and
+// over `margin` columns past it the terrain ramps back. Spelled identically
+// in world.cpp; the site readers it calls live outside the mirror.
+fn sitePadAt(x : i32, z : i32, h : i32, seed : u32) -> i32 {
+  let sid = wmSiteAt(x, z);
+  if (sid == 0u) { return h; }
+  let sx = wmSiteI(sid, WM_S_X);
+  let sz = wmSiteI(sid, WM_S_Z);
+  let r = wmSiteI(sid, WM_S_RADIUS);
+  let margin = max(wmSiteI(sid, WM_S_PAD_MARGIN), 1);
+  let d = max(max(abs(x - sx), abs(z - sz)) - r, 0);
+  if (d >= margin) { return h; }
+  let padY = landColumnBare(sx, sz, seed).h;
+  let w = ((margin - d) * 256) / margin;
+  return h + (((padY - h) * w) >> 8);
+}
+
 fn landColumn(x : i32, z : i32, seed : u32) -> LandCol {
-  // Since the world map's P2b there is no pad to blend in: the ruin
-  // scatter is gone and authored sites arrive with their own pad in P5.
-  return landColumnBare(x, z, seed);
+  var L = landColumnBare(x, z, seed);
+  let hp = sitePadAt(x, z, L.h, seed);
+  if (hp != L.h) {
+    // Cut-and-fill under a building: the loose wedge goes with it, for the
+    // reason the pond-bank block gives (powder under a stone floor creeps).
+    L.h = hp;
+    L.sed = 0;
+  }
+  return L;
 }
 // MIRROR-END landheight
 
@@ -3214,7 +3319,7 @@ fn genCellIn(col : Col,
 
 
   if (mat == MAT_AIR && y == h + 1 &&       !inRim && pond < 0 && h < TREELINE &&
-      wmFlag(biome, WM_BF_GROUND_FLORA) && !shore.onShore && !inHarness(x, z)) {
+      wmFlag(biome, WM_BF_GROUND_FLORA) && !shore.onShore && !siteKeepOut(x, z)) {
     let fr = hash3(seed ^ 0xF10Eu, bitcast<u32>(x), bitcast<u32>(z));
     // ONE 25-tile scan answers both "how shaded is this column" and "how far to
     // the nearest trunk". Calling treeCanopyAt as well would run the identical
@@ -3351,7 +3456,7 @@ fn genCellIn(col : Col,
   // flowerAt instead of reading the base cell, so a guard the base block took
   // and this one did not would grow a headless stalk out of a stone floor.
   if (mat == MAT_AIR && y > h + 1 && y <= h + FLOWER_MAX_H &&       !inRim && pond < 0 && h < TREELINE &&
-      wmFlag(biome, WM_BF_GROUND_FLORA) && !shore.onShore && !inHarness(x, z)) {
+      wmFlag(biome, WM_BF_GROUND_FLORA) && !shore.onShore && !siteKeepOut(x, z)) {
     // THE FOURTH HOIST. `UG_COVER_EDGE` is a constant and x/z are the column's,
     // so every one of the FLOWER_MAX_H - 1 cells in this range asks flowerAt
     // the IDENTICAL question and gets the identical answer — and flowerAt is a
@@ -3435,7 +3540,7 @@ fn genCellIn(col : Col,
   // is inert (rule 2): the loader resolves names against materials.json and
   // nothing here is a stem/sprout/seed.
   if (mat == MAT_AIR && y > h && !inRim && pond < 0 && h < TREELINE &&
-      !inHarness(x, z)) {
+      !siteKeepOut(x, z)) {
     let up = y - h;
     let nRows = wmBiome(biome, WM_B_COVER_COUNT);
     let bThresh = i32(wmBiome(biome, WM_B_PATCH_THRESH));
@@ -3492,7 +3597,7 @@ fn genCellIn(col : Col,
   // a material id on the distinction, the ground under it makes it: on snow the
   // cell reads as a cushion, on wind-scoured stone as lichen.
   if (mat == MAT_AIR && y == h + 1 && h >= TREELINE && !inRim && pond < 0 &&
-      !inHarness(x, z)) {
+      !siteKeepOut(x, z)) {
     let hAlp = hash3(seed ^ 0xA1F1u, bitcast<u32>(x), bitcast<u32>(z));
     // A patch mask here too, but a WEAK one: alpine plants really do grow in
     // scattered colonies wherever the wind lets them, so the mask only thins the
@@ -3530,6 +3635,20 @@ fn genCellIn(col : Col,
   // `landColumn` already accepted and already flattened the ground to, so the
   // shell now stands ON the pad by construction rather than by coincidence.
   // See the RUIN SITES block above landColumn.
+
+  // ---- authored sites (P5): a stamp overlays everything above its pad -----
+  // One plane read for the common case (no site); on a site's cells, the
+  // template's column of runs. Non-air template voxels replace whatever the
+  // terrain and cover put here; template air leaves the world alone, so a
+  // stamp is a building on the ground, not a box cut out of it.
+  {
+    let sid = wmSiteAt(x, z);
+    if (sid != 0u && y > h - 2) {
+      let padY = landColumnBare(wmSiteI(sid, WM_S_X), wmSiteI(sid, WM_S_Z), seed).h;
+      let sm = wmStampCell(sid, x, y, z, padY);
+      if (sm != MAT_AIR) { mat = sm; }
+    }
+  }
 
   if (mat == MAT_AIR) { return 0u; }
   let rnd = hash3(seed ^ 0xC0FFEEu,
@@ -3702,6 +3821,7 @@ fn farColTopFrom(h : i32, fluidTop : i32, x : i32, z : i32, seed : u32) -> i32 {
   // Global max, not per-biome: the corner-column callers hold no biome, and
   // the bit is conservative by design -- over-flagging costs nothing.
   top = max(top, h + i32(worldMap[WM_H_MAX_COVER_H]));
+  top = max(top, wmSiteTopAt(x, z, seed));   // an authored stamp (P5)
   return top;
 }
 // The same for a column the caller does not already hold. `landColumn`, not
@@ -3921,6 +4041,7 @@ fn genChunk(slot : u32, li : u32, actIdx : u32) {
     colTop = max(colTop, col.fluidTop);
     colTop = max(colTop, col.pond + 1);
     colTop = max(colTop, trees.top);
+    colTop = max(colTop, wmSiteTopAt(wx, wz, T.seed));
     if (!wmFlag(col.biome, WM_BF_CACTI) && base.y > colTop) {
       for (var ly = 0u; ly < CHUNK; ly += 1u) {
         voxStore(voxWordInChunk(slot, lx + ly * CHUNK + lz * CHUNK * CHUNK), 0u);
@@ -3935,7 +4056,7 @@ fn genChunk(slot : u32, li : u32, actIdx : u32) {
     // all", which is the only part of it that is not column-invariant.
     let stalkValid = !col.inRim && col.pond < 0 &&
                      col.h < TREELINE && wmFlag(col.biome, WM_BF_GROUND_FLORA) &&
-                     !col.shore.onShore && !inHarness(wx, wz) &&
+                     !col.shore.onShore && !siteKeepOut(wx, wz) &&
                      base.y + i32(CHUNK) > col.h + 1 &&
                      base.y <= col.h + FLOWER_MAX_H;
     var stalk : Flower;

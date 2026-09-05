@@ -158,6 +158,39 @@ inline constexpr uint32_t kBF_GroundFlora = 1u << 0;  // the canopy-inverted und
 inline constexpr uint32_t kBF_Cacti = 1u << 1;        // the cactus proc shape
 inline constexpr uint32_t kBF_SandCap = 1u << 2;      // loose sand cap under the skin (the old desert rule)
 
+// ---- the site table (P5) ----------------------------------------------------
+// One record per authored site at kHSiteTable (kHSiteCount of them), plus a
+// per-cell SITE INDEX plane (kHSiteIndex; four cells per word like the
+// others) holding `site id + 1`, 0 = no site touches this cell. A site marks
+// every cell its footprint + pad margin reaches, first site wins. That plane
+// is what keeps the shader's per-column cost at one read: `wmSiteAt(x, z)`.
+//
+// Kinds: kSitePad is the harness box and is NOT in the table (it is the
+// WM_H_HARNESS_* header words); kSiteStamp is an authored .vox placed with
+// its footprint centred on (x, z), its bottom voxel row at the pad height
+// + 1, rotated rot*90 degrees at PACK time so the shader's overlay is one
+// column lookup in a run-list -- the tree atlas's encoding (mat | y0 << 16 |
+// len << 27), because trees are the proof that a per-cell overlay of
+// authored voxels is correct in the far cascades at any distance.
+enum : uint32_t {
+  kSiteRecWords = 16,
+  kS_Kind = 0,          // kSiteStamp
+  kS_X = 1,             // world voxel centre (i32 in u32)
+  kS_Z = 2,
+  kS_Radius = 3,        // Chebyshev footprint radius in voxels: keep-out + pad
+  kS_PadMargin = 4,     // columns over which the pad ramps back to terrain
+  kS_Rot = 5,           // 0..3, informational (baked into the stamp block)
+  kS_Salt = 6,
+  kS_StampOff = 7,      // word offset of the stamp block, 0 = none
+  // 8..15 reserved
+  kStampHdrWords = 4,
+  kStamp_NX = 0, kStamp_NY = 1, kStamp_NZ = 2, kStamp_Columns = 3,
+  // columns: nx*nz pairs of (runOff, runCount), absolute word offsets; runs:
+  // mat (12 bits) | y0 << 16 | len << 27, y0 < 2048, len <= 31, y0 ascending
+  kSitePad = 0,
+  kSiteStamp = 1,
+};
+
 }  // namespace worldmap
 
 namespace biomes { struct BiomeSet; }
@@ -193,6 +226,20 @@ struct WorldMapData {
     return x >= harnessX0 && x <= harnessX1 && z >= harnessZ0 && z <= harnessZ1;
   }
   std::vector<std::string> palette;       // map.json biomes[]: plane byte -> name
+  // Authored stamp sites (P5), resolved: the template loaded, rotated, and
+  // packed into columns of runs at load. `siteIndex` is the per-cell plane.
+  struct StampSite {
+    std::string id, templateName;
+    int x = 0, z = 0, radius = 0, padMargin = 8, rot = 0;
+    uint32_t salt = 0;
+    int nx = 0, ny = 0, nz = 0;
+    std::vector<uint32_t> words;          // the packed stamp block, offsets RELATIVE to its start
+  };
+  std::vector<StampSite> sites;
+  std::vector<uint8_t> siteIndex;         // width*height, site id + 1, 0 = none
+  uint8_t SiteCell(int cx, int cz) const {
+    return siteIndex.empty() ? 0 : siteIndex[static_cast<size_t>(cz) * width + cx];
+  }
   std::vector<uint8_t> biome;             // RESOLVED to biome ids, width*height
   std::vector<uint8_t> landform;
   std::vector<uint8_t> moisture;
@@ -219,7 +266,8 @@ struct WorldMapData {
  * world, see the header comment).
  */
 bool LoadWorldMap(const std::string& assetDir, const std::string& name,
-                  const biomes::BiomeSet& set, WorldMapData& out, std::string& log);
+                  const biomes::BiomeSet& set, size_t materialCount, uint32_t seed,
+                  WorldMapData& out, std::string& log);
 
 /**
  * The whole `worldMap` buffer: PackBiomeTable's words plus the map header

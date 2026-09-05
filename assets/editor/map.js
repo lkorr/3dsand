@@ -191,8 +191,19 @@ function paint() {
     ctx.fillStyle = '#ffb454'; ctx.font = '11px monospace';
     ctx.fillText(s.id || 'pad', ox + x0 * view.scale + 3, oy + z0 * view.scale - 3);
   }
+  // stamp sites: a marker at the centre with the footprint radius
+  for (const s of (map.json.sites || [])) {
+    if (s.kind !== 'stamp') continue;
+    const l = map.json.cellLog2, cv = 1 << l;
+    const sx = ox + (s.x / cv + ocx) * view.scale, sz = oy + (s.z / cv + ocz) * view.scale;
+    const rr = Math.max(3, ((s.radius || 16) / cv) * view.scale);
+    ctx.strokeStyle = tool === 'stamp' ? '#ff7a7a' : '#7fd4ff'; ctx.lineWidth = 2;
+    ctx.strokeRect(sx - rr, sz - rr, rr * 2, rr * 2);
+    ctx.fillStyle = '#7fd4ff'; ctx.font = '11px monospace';
+    ctx.fillText((s.id || 'site') + ' (' + (s.template || '?') + (s.rot ? ' r' + s.rot : '') + ')', sx + rr + 3, sz + 4);
+  }
   // brush cursor
-  if (els.hover && tool !== 'pad') {
+  if (els.hover && tool !== 'pad' && tool !== 'stamp') {
     ctx.strokeStyle = 'rgba(255,255,255,0.7)'; ctx.lineWidth = 1;
     ctx.beginPath();
     ctx.arc(ox + (els.hover[0] + 0.5) * view.scale, oy + (els.hover[1] + 0.5) * view.scale,
@@ -250,6 +261,35 @@ function wire() {
       const [wx, wz] = worldOfCell(cx, cz);
       stroke = snapshot();
       padDrag = {x0: wx, z0: wz};
+      return;
+    }
+    if (tool === 'stamp') {
+      // Click: a new stamp site at the cursor's world column (cell centre if
+      // zoomed out, the exact column when zoomed in). Shift+click on an
+      // existing marker deletes it. Sites are hand-placed here; rules
+      // (seeded placement per biome) are P5b.
+      const r = els.canvas.getBoundingClientRect();
+      const W = els.canvas.clientWidth, Hh = els.canvas.clientHeight;
+      const fx = (ev.clientX - r.left - W / 2) / view.scale + view.cx;
+      const fz = (ev.clientY - r.top - Hh / 2) / view.scale + view.cz;
+      const cv = 1 << map.json.cellLog2;
+      const wx = Math.round((fx - map.json.originCell[0]) * cv);
+      const wz = Math.round((fz - map.json.originCell[1]) * cv);
+      const sites = map.json.sites || (map.json.sites = []);
+      const hit = sites.find(s => s.kind === 'stamp' && Math.abs(s.x - wx) <= (s.radius || 16) && Math.abs(s.z - wz) <= (s.radius || 16));
+      stroke = snapshot();
+      if (ev.shiftKey && hit) {
+        sites.splice(sites.indexOf(hit), 1);
+        stroke.changed = true;
+      } else if (!hit) {
+        const t = prompt('Template: assets/prefabs/<name>.vox', els.lastTemplate || '');
+        if (!t) { stroke = null; return; }
+        els.lastTemplate = t;
+        const rot = parseInt(prompt('Rotation (0..3 quarter turns):', '0') || '0', 10) & 3;
+        sites.push({id: t + '_' + sites.length, kind: 'stamp', template: t, x: wx, z: wz, rot, padMargin: 8, salt: sites.length});
+        stroke.changed = true;
+      }
+      paint();
       return;
     }
     stroke = snapshot();
@@ -375,6 +415,7 @@ export function attach(hooks) {
     biome: el('button', {title: 'paint the selected biome (left-drag)'}, 'Biome brush'),
     landform: el('button', {title: 'paint landform 0..255 (left-drag)'}, 'Landform brush'),
     pad: el('button', {title: 'drag the harness pad box (world voxels)'}, 'Pad box'),
+    stamp: el('button', {title: 'click: place a stamp site (a .vox from assets/prefabs/); shift+click a marker: delete it'}, 'Stamp site'),
   };
   for (const [k, b] of Object.entries(els.tools)) b.addEventListener('click', () => { tool = k; syncControls(); paint(); });
   els.radius = el('input', {type: 'range', min: 0, max: 24, value: brush.radius, style: 'width:110px'});
@@ -395,7 +436,7 @@ export function attach(hooks) {
   const bar = el('div', {class: 'mapbar'},
     el('label', {}, 'map ', els.mapSel), els.save, undoBtn, redoBtn, fitBtn,
     el('span', {style: 'width:10px'}),
-    els.tools.biome, els.tools.landform, els.tools.pad,
+    els.tools.biome, els.tools.landform, els.tools.pad, els.tools.stamp,
     el('label', {}, ' radius ', els.radius, ' ', els.radiusOut),
     el('label', {}, ' landform ', els.land, ' ', els.landOut),
     el('label', {}, ' ', showLf, ' shade by landform'));
@@ -403,6 +444,7 @@ export function attach(hooks) {
     'Tier A: what you paint here is where the biomes ARE on every seed; the boundary warp and everything inside a region take the seed. ' +
     'Cells are 2^cellLog2 voxels (102.4 m). Right/middle-drag pans, wheel zooms, [ ] resize the brush. ' +
     'The pad box is the selftest harness region (no trunks, crowns, tarns or cover inside). ' +
+    'A stamp site places assets/prefabs/<name>.vox on a levelled pad at that column (its cells keep out trees, tarns and cover); the engine refuses to start if the .vox is missing. ' +
     'Saving writes assets/worldmap/<name>/ and moves the world hash; regenerate the world to see it.');
   root.append(bar, els.palette, els.canvas, els.status, note);
   wire();

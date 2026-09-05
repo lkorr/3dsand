@@ -1246,7 +1246,7 @@ def check_worldmap_layout():
         return
     checked.append("world map layout")
     cpp = {}
-    for m in re.finditer(r"\b(kH\w+|kB_\w+|kC_\w+)\s*=\s*(\d+)", hdr):
+    for m in re.finditer(r"\b(kH\w+|kB_\w+|kC_\w+|kS_\w+|kStamp_\w+)\s*=\s*(\d+)", hdr):
         cpp[m.group(1)] = int(m.group(2))
     for m in re.finditer(r"kBF_(\w+)\s*=\s*1u\s*<<\s*(\d+)", hdr):
         cpp["kBF_" + m.group(1)] = 1 << int(m.group(2))
@@ -1261,8 +1261,12 @@ def check_worldmap_layout():
              "kCoverRowWords": "WM_C_WORDS", "kC_HeightVox": "WM_C_HEIGHT",
              "kC_PatchThreshold": "WM_C_PATCH_THRESH", "kHBiomeRecords": "WM_H_BIOME_RECORDS",
              "kHMaxCoverH": "WM_H_MAX_COVER_H", "kB_MaxCoverH": "WM_B_MAX_COVER_H",
-             "kHLandformPlane": "WM_H_LANDFORM_PLANE", "kHMoisturePlane": "WM_H_MOISTURE_PLANE"}
-    for m in re.finditer(r"\b(kBiomeRecWords|kCoverRowWords)\s*=\s*(\d+)", hdr):
+             "kHLandformPlane": "WM_H_LANDFORM_PLANE", "kHMoisturePlane": "WM_H_MOISTURE_PLANE",
+             "kSiteRecWords": "WM_S_WORDS", "kStampHdrWords": "WM_STAMP_HDR_WORDS",
+             "kS_PadMargin": "WM_S_PAD_MARGIN", "kS_StampOff": "WM_S_STAMP_OFF",
+             "kStamp_NX": "WM_STAMP_NX", "kStamp_NY": "WM_STAMP_NY", "kStamp_NZ": "WM_STAMP_NZ",
+             "kStamp_Columns": "WM_STAMP_COLUMNS"}
+    for m in re.finditer(r"\b(kBiomeRecWords|kCoverRowWords|kSiteRecWords|kStampHdrWords)\s*=\s*(\d+)", hdr):
         cpp[m.group(1)] = int(m.group(2))
     for name, wgname in list(alias.items()):
         pass
@@ -1275,6 +1279,8 @@ def check_worldmap_layout():
             wname = "WM_B_" + snake(cname[3:])
         elif cname.startswith("kC_"):
             wname = "WM_C_" + snake(cname[3:])
+        elif cname.startswith("kS_"):
+            wname = "WM_S_" + snake(cname[3:])
         elif cname.startswith("kBF_"):
             wname = "WM_BF_" + snake(cname[4:])
         else:
@@ -1290,6 +1296,7 @@ def check_worldmap_layout():
         if cname.startswith("kH"): known.add("WM_H_" + snake(cname[2:]))
         elif cname.startswith("kB_"): known.add("WM_B_" + snake(cname[3:]))
         elif cname.startswith("kC_"): known.add("WM_C_" + snake(cname[3:]))
+        elif cname.startswith("kS_"): known.add("WM_S_" + snake(cname[3:]))
         elif cname.startswith("kBF_"): known.add("WM_BF_" + snake(cname[4:]))
     for wname in wg:
         if wname not in known:

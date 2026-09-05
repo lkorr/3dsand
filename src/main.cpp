@@ -3177,7 +3177,7 @@ int main(int argc, char** argv) {
       std::vector<uint32_t> stMapWords;
       { std::string wl;
         worldmap::WorldMapData stMap;
-        if (!worldmap::LoadWorldMap(ad, CurrentTuning().worldgen.mapLayer, stBiomes, stMap, wl) ||
+        if (!worldmap::LoadWorldMap(ad, CurrentTuning().worldgen.mapLayer, stBiomes, m.size(), kDefaultSeed, stMap, wl) ||
             !worldmap::PackWorldMap(stBiomes, stMap, stMapWords, wl)) {
           std::fprintf(stderr, "%s", wl.c_str());
           return 1;
@@ -3343,7 +3343,7 @@ int main(int argc, char** argv) {
       return 1;
     }
     worldmap::WorldMapData map;
-    if (!worldmap::LoadWorldMap(assetDir, CurrentTuning().worldgen.mapLayer, biomeSet, map, blog) ||
+    if (!worldmap::LoadWorldMap(assetDir, CurrentTuning().worldgen.mapLayer, biomeSet, mats.size(), kDefaultSeed, map, blog) ||
         !worldmap::PackWorldMap(biomeSet, map, worldMapWords, blog)) {
       std::fprintf(stderr, "%s", blog.c_str());
       std::fprintf(stderr, "world map '%s' failed to load -- refusing to start (a world with no "
