@@ -178,6 +178,25 @@ struct GlyphWind {
   bool entrain = false;
 };
 
+// How a CARRIER looks in flight. Render-only content, never authoritative:
+// the delivery glyph's "look" block in glyphs.json. main.cpp draws sprites
+// from it at the drawing boundary; the VM never reads it, so a modder can
+// make a bolt a comet without touching a number the sim depends on.
+enum class LookShape : uint8_t {
+  Bolt = 0,   // a bright core with a streak of sprites back along the velocity
+  Ball,       // a rounded blob (core + six face lobes), short tail
+  Orb,        // a large slow core with a ring of motes orbiting the flight axis
+  Spark,      // a small flickering point (a fuse, a resting bolt)
+};
+struct GlyphLook {
+  LookShape shape = LookShape::Ball;
+  float size = 0.6f;               // core half-size, voxels
+  int32_t tail = 0;                // trailing sprites behind the core
+  float tailStep = 0.5f;           // voxels between them, back along the velocity
+  float glow = 1.0f;               // emission of the core
+  uint32_t color = 0xFFFFFFFFu;    // 0xAABBGGRR, used when the cast carries no matter
+};
+
 struct GlyphDef {
   std::string id;
   std::string desc;
@@ -219,7 +238,11 @@ struct GlyphDef {
   // ---- delivery record defaults ----
   DeliveryMech mech = DeliveryMech::Instant;
   int32_t carryMille = 1000;     // premium on the payload tariff
-  int32_t speed = 48;            // voxels/tick, whole voxels
+  // Speed in 24.8 FIXED voxels per tick (kSpellFxOne = one voxel), so the
+  // authored number may be fractional: "speed": 4.8 in glyphs.json is 4.8
+  // voxels a tick, 144 voxels a second at 30 Hz. Whole-voxel speeds were the
+  // reason every bolt crossed the CPU mirror in one tick.
+  int32_t speedFx = 48 * kSpellFxOne / 10;
   int32_t lifetimeTicks = 150;   // hard bound (rule 2)
   int32_t impactRadius = 3;      // kinetic impact of an empty payload
   int32_t gravityMille = 0;      // per-mille of g
@@ -227,6 +250,7 @@ struct GlyphDef {
   int32_t reach = 3;             // instant: voxels in front of the caster
   bool body = false;             // flight as a rigid body (bomb)
   bool resolveOnExpiry = false;  // orb: life running out is a resolve, not a fizzle
+  GlyphLook look;                // how it is drawn (render-only)
 
   // ---- mod ----
   ModField field = ModField::None;
@@ -404,7 +428,7 @@ struct DeliveryRec {
   DeliveryMech mech = DeliveryMech::Instant;
   int32_t weight = 1;        // Delivery×N: speed, lifetime, kinetic impact ×N
   int32_t carryMille = 1000;
-  int32_t speed = 0;         // voxels/tick
+  int32_t speedFx = 0;       // 24.8 fixed voxels/tick (GlyphDef::speedFx)
   int32_t lifetimeTicks = 1;
   int32_t impactRadius = 1;
   int32_t gravityMille = 0;  // per-mille of g (flight), or on the anchored body
@@ -508,6 +532,9 @@ struct SpellProjectile {
   // without the VM knowing what a mob is (thesis 4).
   uint64_t casterId = 0;
   uint64_t body = 0;         // rigid-body handle for a `bomb` (P2), 0 = none
+  // A per-launch serial, for the renderer only (live_ is swap-removed, so an
+  // index is not an identity): phases a bolt's flicker and an orb's ring.
+  uint32_t seq = 0;
 };
 
 // A RIGID-BODY CARRIER (bomb): flight with a fuse, as a real body through the
@@ -555,7 +582,22 @@ struct SpellBodyProbe {
                    Vec3& outCentre) = nullptr;
   // Where a body is now; false when it is gone (the status drops).
   bool (*bodyPos)(void* ctx, uint64_t id, Vec3& outCentre) = nullptr;
+  // THE BODY A FLIGHT RUNS INTO. The first body (a mob's limb, a debris
+  // chunk, another caster) on the segment `from`..`to` that is not
+  // `casterId`'s own; `outHit` is where the segment meets it. False when the
+  // segment is clear. Bodies are not in the voxel grid, so without this a
+  // bolt flies straight through a creature and resolves on the wall behind.
+  bool (*bodyHit)(void* ctx, Vec3 from, Vec3 to, uint64_t casterId, Vec3& outHit) = nullptr;
   void* ctx = nullptr;
+};
+
+// A RESOLVE HAPPENED HERE: reported so the renderer can draw a flash. Render
+// information only — the world change itself is the ops beside it.
+struct SpellImpactFx {
+  SpellFxVec at{};
+  uint32_t tint = 0;        // CastTintMaterial of the cast, 0 = none
+  int32_t radius = 1;       // the largest radius the resolve worked at
+  int deliveryGlyph = -1;   // for the look's colour fallback
 };
 
 // A SUSTAINED STATUS (plan §7): what the `aura` operator produces. Attached to
@@ -719,6 +761,8 @@ struct SpellEmission {
   std::vector<SpellBill> bills;
   std::vector<SpellBodyImpulse> bodyImpulses;
   std::vector<SpellRestore> restores;
+  // Where flights and bombs resolved this tick (render-only).
+  std::vector<SpellImpactFx> impacts;
 };
 
 // A probe into the world the VM may consult while resolving (the CPU mirror,
@@ -760,8 +804,11 @@ class SpellSystem {
                   const SpellBodyProbe* bodies = nullptr);
 
   // Advance every live projectile and bomb one tick. `bodies` answers where
-  // adopted bodies are and what a seeking bolt should turn toward.
-  void Tick(uint32_t tick, const World& world,
+  // adopted bodies are, what a seeking bolt should turn toward and what a
+  // flight runs into. The world is non-const because a flight beyond the
+  // 3x3x3 CPU mirror asks for the chunks ahead of it (World::RequestChunkFetch,
+  // bounded and coalesced) so it has something to hit when it gets there.
+  void Tick(uint32_t tick, World& world,
             const std::vector<uint32_t>& classOf, SpellEmission& out,
             const SpellBodyProbe* bodies = nullptr);
 
@@ -834,6 +881,7 @@ class SpellSystem {
   std::vector<SpellFilter> filters_;
   uint32_t nextToken_ = 0;
   uint32_t nextStatusId_ = 0;
+  uint32_t nextSeq_ = 0;
   int opsDropped_ = 0;
   int refused_ = 0;
 };

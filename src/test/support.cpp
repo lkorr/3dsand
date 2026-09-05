@@ -1366,6 +1366,12 @@ bool ReloadEnvironment(GpuContext& ctx, Simulation& sim,
 }
 
 void SubmitWorldgen(GpuContext& ctx, World& world, Simulation& sim, uint32_t seed) {
+  // The seed the CPU may assume the ground under: Stream::Init does this in
+  // the game; the harness has no stream, and a spell flight past the mirror
+  // reads World::TerrainHeight(x, z, world.WorldSeed()) for the cells nobody
+  // has fetched (spell.cpp, SpellSystem::Tick). Mirror seed only -- the page
+  // table's seed stays as it was, so residency classification is untouched.
+  world.SetMirrorSeed(seed);
   // The authored edit layer patches whatever worldgen produces, so a fresh
   // world re-queues every edited chunk the window contains. Queue only — the
   // ops go out through the MutationQueue on the ticks that follow (rule 3), not

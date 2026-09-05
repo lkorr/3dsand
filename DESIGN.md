@@ -3402,11 +3402,42 @@ middle case is the whole mechanic — it makes the mana bar a *precision meter*
 rather than a second HP bar — so the HUD draws mana and health on one axis with
 a hard break at the crossover.
 
-**A projectile treats UNKNOWN cells as PASSABLE, the opposite of the player
-controller's choice.** The CPU mirror covers only the 3×3×3 chunks around the
-player (~48 voxels), useless for a 48 vox/tick projectile that exits it within
-one tick. Reading Unknown as solid detonates every bolt in the caster's face.
-Out-of-window space is still solid, per §3.
+**A flight collides in three tiers of knowledge, and with bodies by ray.** The
+CPU mirror covers only the 3×3×3 chunks around the player (~48 voxels), and
+everything a bolt does happens past it. Reading Unknown as solid detonated
+every bolt in the caster's face; reading it as passable (the 2026-09-04 answer)
+meant nothing past the mirror was ever hit — a bolt fizzled at the end of its
+life, and `explosive projectile` did nothing. Now `SpellSystem::Tick` asks, in
+order: the mirror (the truth, one tick latent); the on-demand chunk cache
+(`World::Cached`), which the flight keeps warm by requesting the chunks along
+its velocity every tick (`RequestChunkFetch`, coalesced, bounded by
+`kFetchPerTick`); and the ground contract `World::TerrainHeight(x, z,
+world.WorldSeed())` for a cell nobody has fetched yet — so at worst a bolt
+lands ON the ground, never under it and never through it. Bodies are not in the
+grid at all, so one `Physics::CastRayBody` over each tick's segment
+(`SpellBodyProbe::bodyHit`) resolves the cast on the first mob limb, debris
+chunk or bomb it meets; the caster's own parts are rejected by ownership, the
+laser's rule. Out-of-window space is still solid, per §3. The `spells` gate
+fires `explosive projectile` straight down from 60 voxels up, far from any
+mirror, and requires the explosion at or above that column's contract height.
+
+**Speed is 24.8 fixed voxels per tick and is authored fractional.** The
+deliveries shipped at 48–96 whole voxels a tick (144–288 m/s at 30 Hz, faster
+than any arrow) and were cut tenfold on 2026-09-05: `projectile` 4.8, `bolt`
+9.6, `lob` 2.4, `orb` 1, `bomb` 1.6 vox/tick (14.4, 28.8, 7.2, 3, 4.8 m/s).
+`GlyphDef::speedFx` / `DeliveryRec::speedFx`; `swift`/`slow` multiply the
+fixed-point value; the describe line prints m/s. Spray (`budgets.spraySpeed`)
+is loose matter, not a carrier, and was not touched.
+
+**How a carrier looks is content: the delivery's `look` block.** `shape` (bolt
+| ball | orb | spark), `size`, `tail`, `tailStep`, `glow`, `color` — read into
+`GlyphLook`, never by the VM, and drawn by main.cpp's sprite pass at the
+float boundary: a bolt is a core with a streak back along the velocity, a ball
+a core with six lobes and a short tail, an orb a breathing core with motes
+orbiting the flight axis, a spark a flicker (a bomb's fuse, a resting fused
+bolt). Tinted by `CastTintMaterial` when the cast carries matter, else by the
+look's colour. Every resolve also reports a `SpellImpactFx` and main.cpp draws
+a nine-tick shell of motes there. `kMaxSprites` is 512 for this.
 
 Op budget fairness is explicit (`SpellSystem::kSpellOpsPerTick = 24` of the 64
 `BrushOp`s, alongside `gore.bleedOpsPerTick` for mob and avatar bleeding;

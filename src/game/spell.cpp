@@ -73,6 +73,34 @@ int32_t SatAdd(int32_t a, int32_t b) {
 // over kVoxelMeters, over a 30 Hz tick, squared. Integer arithmetic on the
 // authored constants so every machine derives the same number (~27).
 constexpr int32_t kTicksPerSecond = 30;
+// The fastest a flight may go, in 24.8 fixed voxels/tick (512 voxels a tick
+// was the old whole-voxel ceiling; it stays as the ceiling of the unit).
+constexpr int32_t kMaxSpeedFx = 512 * kSpellFxOne;
+// A speed authored in glyphs.json (voxels/tick, fractional) to fixed point.
+int32_t SpeedFxFrom(double voxPerTick) {
+  const double fx = voxPerTick * (double)kSpellFxOne;
+  if (fx < 1.0) return 1;
+  if (fx > (double)kMaxSpeedFx) return kMaxSpeedFx;
+  return (int32_t)(fx + 0.5);
+}
+// "#RRGGBB" or "#AARRGGBB" -> the sprite's 0xAABBGGRR. Anything else: white.
+uint32_t ParseLookColor(const std::string& hex) {
+  if (hex.size() != 7 && hex.size() != 9) return 0xFFFFFFFFu;
+  if (hex[0] != '#') return 0xFFFFFFFFu;
+  uint32_t v = 0;
+  for (size_t i = 1; i < hex.size(); i++) {
+    const char c = hex[i];
+    uint32_t d;
+    if (c >= '0' && c <= '9') d = (uint32_t)(c - '0');
+    else if (c >= 'a' && c <= 'f') d = (uint32_t)(c - 'a' + 10);
+    else if (c >= 'A' && c <= 'F') d = (uint32_t)(c - 'A' + 10);
+    else return 0xFFFFFFFFu;
+    v = (v << 4) | d;
+  }
+  const uint32_t a = hex.size() == 9 ? (v >> 24) & 0xFF : 0xFF;
+  const uint32_t r = (v >> 16) & 0xFF, g = (v >> 8) & 0xFF, b = v & 0xFF;
+  return (a << 24) | (b << 16) | (g << 8) | r;
+}
 constexpr int32_t kGravityFxPerTick2 =
     (int32_t)((int64_t)981 * kVoxelsPerMetre * kSpellFxOne /
               (100 * kTicksPerSecond * kTicksPerSecond));
@@ -475,7 +503,7 @@ bool LoadGlyphs(const std::string& path, const std::vector<MaterialDef>& mats,
           return false;
         }
         d.carryMille = ClampI(g.value("carry", 1000), 0, 100000);
-        d.speed = ClampI(g.value("speed", 48), 1, 512);
+        d.speedFx = SpeedFxFrom(g.value("speed", 4.8));
         d.lifetimeTicks = ClampI(g.value("lifetimeTicks", 150), 1, b.maxLifetimeTicks);
         d.impactRadius = ClampI(g.value("impactRadius", 3), 0, 8);
         d.gravityMille = ClampI(g.value("gravity", 0), -8000, 8000);
@@ -484,6 +512,21 @@ bool LoadGlyphs(const std::string& path, const std::vector<MaterialDef>& mats,
         d.ticks = ClampI(g.value("ticks", 90), 1, b.maxStatusTicks);
         d.body = g.value("body", false);
         d.resolveOnExpiry = g.value("resolveOnExpiry", false);
+        // The look: render-only, so a bad value is a default and not an error.
+        d.look.shape = d.body ? LookShape::Spark : LookShape::Ball;
+        if (g.contains("look") && g["look"].is_object()) {
+          const json& lk = g["look"];
+          const std::string shape = lk.value("shape", std::string());
+          if (shape == "bolt") d.look.shape = LookShape::Bolt;
+          else if (shape == "ball") d.look.shape = LookShape::Ball;
+          else if (shape == "orb") d.look.shape = LookShape::Orb;
+          else if (shape == "spark") d.look.shape = LookShape::Spark;
+          d.look.size = std::clamp((float)lk.value("size", 0.6), 0.1f, 4.0f);
+          d.look.tail = ClampI(lk.value("tail", 0), 0, 16);
+          d.look.tailStep = std::clamp((float)lk.value("tailStep", 0.5), 0.1f, 4.0f);
+          d.look.glow = std::clamp((float)lk.value("glow", 1.0), 0.0f, 4.0f);
+          d.look.color = ParseLookColor(lk.value("color", std::string()));
+        }
         if (d.body) {
           // A rigid-body carrier is MADE of something: the ball the owner
           // adopts as debris needs a material, and it is content.
@@ -763,7 +806,7 @@ DeliveryRec RecordFor(const GlyphLibrary& lib, int deliveryGlyph, int32_t weight
   r.carryMille = g.carryMille;
   // Delivery×N is WEIGHT: speed, lifetime and kinetic impact ×N. Count is
   // shotgun's job.
-  r.speed = ClampI(SatMul(g.speed, weight), 1, 512);
+  r.speedFx = ClampI(SatMul(g.speedFx, weight), 1, kMaxSpeedFx);
   r.lifetimeTicks = ClampI(SatMul(g.lifetimeTicks, weight), 1, b.maxLifetimeTicks);
   r.impactRadius = ClampI(SatMul(g.impactRadius, weight), 0, 8);
   r.gravityMille = g.gravityMille;
@@ -790,7 +833,7 @@ void ApplyMod(DeliveryRec& r, const GlyphDef& g, int32_t n, const SpellBudgets& 
       case ModField::Count: r.count = ClampI(edit(r.count), 1, b.maxInstances); break;
       case ModField::Children: r.children = ClampI(edit(r.children < 1 ? 1 : r.children), 1, 16); break;
       case ModField::Gravity: r.gravityMille = ClampI(edit(r.gravityMille), -8000, 8000); break;
-      case ModField::Speed: r.speed = ClampI(edit(r.speed), 1, 512); break;
+      case ModField::Speed: r.speedFx = ClampI(edit(r.speedFx), 1, kMaxSpeedFx); break;
       case ModField::Lifetime:
         r.lifetimeTicks = ClampI(edit(r.lifetimeTicks), 1, b.maxLifetimeTicks);
         if (r.fuseTicks > 0) r.fuseTicks = ClampI(edit(r.fuseTicks), 0, b.maxLifetimeTicks);
@@ -1289,7 +1332,14 @@ std::string DescribeCast(const GlyphLibrary& lib, const SpellCast& cast) {
   if (d.gravityMille != g.gravityMille)
     add("gravity " + std::to_string(d.gravityMille) + "/1000 g" +
         (d.mech == DeliveryMech::Instant ? " on the caster's body" : ""));
-  if (d.speed != ClampI(SatMul(g.speed, d.weight), 1, 512)) add("speed " + std::to_string(d.speed) + " vox/tick");
+  if (d.speedFx != ClampI(SatMul(g.speedFx, d.weight), 1, kMaxSpeedFx)) {
+    // Fixed voxels/tick -> m/s, one decimal, for the reader.
+    const double ms = (double)d.speedFx / (double)kSpellFxOne * (double)kTicksPerSecond /
+                      (double)kVoxelsPerMetre;
+    char buf[48];
+    std::snprintf(buf, sizeof buf, "speed %.1f m/s", ms);
+    add(buf);
+  }
   if (d.radiusMille != 1000) add("resolve radius x" + std::to_string(d.radiusMille) + "/1000");
   if (d.bounces > 0) add(std::to_string(d.bounces) + " bounce(s)");
   if (d.pierce > 0) add("passes through " + std::to_string(d.pierce));
@@ -1768,7 +1818,8 @@ void SpellSystem::Launch(const SpellCast& cast, SpellFxVec originFx, SpellFxVec 
   p.ticksLeft = ClampI(cast.delivery.lifetimeTicks, 1, lib_->budgets.maxLifetimeTicks);
   // Normalize the aim to the record's speed, in fixed point. Integer sqrt so
   // two machines agree exactly (no libm, no float).
-  p.vel = Unit(aim, (int64_t)cast.delivery.speed * kSpellFxOne);
+  p.vel = Unit(aim, (int64_t)cast.delivery.speedFx);
+  p.seq = ++nextSeq_;
   // Trail budget: a HARD voxel count that only ever decreases (rule 2).
   p.trailBudget = cast.delivery.trail.empty() ? 0 : cast.delivery.trailBudget;
   p.bouncesLeft = cast.delivery.bounces;
@@ -2077,7 +2128,7 @@ void SpellSystem::RequestBody(const SpellCast& cast, SpellFxVec originFx,
   rq.token = nextToken_;
   rq.pos = Vec3{SpellFxToFloat(originFx.x), SpellFxToFloat(originFx.y),
                 SpellFxToFloat(originFx.z)};
-  const SpellFxVec v = Unit(aim, (int64_t)cast.delivery.speed * kSpellFxOne);
+  const SpellFxVec v = Unit(aim, (int64_t)cast.delivery.speedFx);
   // voxels/tick -> voxels/second at the physics boundary
   rq.vel = Vec3{SpellFxToFloat(v.x) * (float)kTicksPerSecond,
                 SpellFxToFloat(v.y) * (float)kTicksPerSecond,
@@ -2097,7 +2148,7 @@ bool SpellSystem::AdoptBody(uint32_t token, uint64_t handle) {
   return false;
 }
 
-void SpellSystem::Tick(uint32_t tick, const World& world,
+void SpellSystem::Tick(uint32_t tick, World& world,
                        const std::vector<uint32_t>& classOf,
                        SpellEmission& out, const SpellBodyProbe* bodies) {
   opsDropped_ = 0;
@@ -2106,18 +2157,50 @@ void SpellSystem::Tick(uint32_t tick, const World& world,
   int opsUsed = 0;
   const SpellProbe probe = WorldSpellProbe(world);
   const SpellBudgets& b = lib_->budgets;
+  const uint32_t seed = world.WorldSeed();
 
+  // WHAT A FLIGHT CAN HIT, in three tiers of knowledge. The CPU mirror is only
+  // the 3x3x3 chunks around the PLAYER (~48 voxels); everything a bolt does
+  // happens past it. Reading Unknown as solid detonated every bolt in the
+  // caster's face; reading it as passable (the previous answer) meant a bolt
+  // never hit anything at all once it left the mirror -- it fizzled at the end
+  // of its life, which is what "explosives don't deliver" looked like.
+  //   1. the mirror, when the cell is in it (one tick latent, the truth);
+  //   2. the on-demand chunk cache (World::Cached), which the flight itself
+  //      keeps warm by asking for the chunks ahead of it (prefetch below);
+  //   3. the ground contract, World::TerrainHeight == genColumn(x,z).h
+  //      exactly, for a cell nobody has fetched yet -- so at worst a bolt
+  //      lands ON THE GROUND, never under it, and never through it.
+  // Out-of-window space stays solid (DESIGN.md section 3).
   auto solidAt = [&](int32_t x, int32_t y, int32_t z) {
-    // OUT OF WINDOW = SOLID. The residency-window rule (DESIGN.md §3):
-    // unloaded space is solid and inert, so a projectile leaving the simulated
-    // world stops at the boundary rather than flying forever through nothing.
     if (!world.CellInWindow({(int)x, (int)y, (int)z})) return true;
-    CellKind k = world.KindAt({(int)x, (int)y, (int)z}, classOf);
-    // UNKNOWN = PASSABLE, the opposite of the player controller's choice. The
-    // CPU mirror is only the 3x3x3 chunks around the PLAYER (~48 voxels), so a
-    // 48 vox/tick projectile exits it inside one tick; reading Unknown as solid
-    // detonated every bolt in the caster's face.
-    return k == CellKind::Solid;
+    const CellKind k = world.KindAt({(int)x, (int)y, (int)z}, classOf);
+    if (k != CellKind::Unknown) return k == CellKind::Solid;
+    const IVec3 wc{x >> 4, y >> 4, z >> 4};
+    if (const CachedChunk* cc = world.Cached(wc); cc && cc->voxels.size() == kChunkVol) {
+      const uint32_t mat =
+          cc->voxels[(size_t)(((z & 15) * (int)kChunk + (y & 15)) * (int)kChunk + (x & 15))] &
+          0xFFFu;
+      if (mat == 0 || mat >= classOf.size()) return false;
+      // Solid and powder both stop a flight, exactly as World::KindAt says.
+      return classOf[mat] == 0u || classOf[mat] == 1u;
+    }
+    world.RequestChunkFetch(wc);
+    return y <= World::TerrainHeight(x, z, seed);
+  };
+  // Ask for the chunks a flight is about to cross: its own and a few along the
+  // velocity. Coalesced by World (one request per chunk per readback), bounded
+  // by kFetchPerTick, and nothing when the chunk is already in the mirror.
+  auto prefetch = [&](SpellFxVec at, SpellFxVec vel) {
+    const SpellFxVec step = Unit(vel, 12 * kSpellFxOne);
+    for (int k = 0; k < 5; k++) {
+      const IVec3 cell{SpellFxFloor(at.x), SpellFxFloor(at.y), SpellFxFloor(at.z)};
+      if (world.CellInWindow(cell) && world.KindAt(cell, classOf) == CellKind::Unknown)
+        world.RequestChunkFetch({cell.x >> 4, cell.y >> 4, cell.z >> 4});
+      at.x += step.x;
+      at.y += step.y;
+      at.z += step.z;
+    }
   };
 
   // A trail mark at a whole voxel: charge the hard budget BEFORE emitting and
@@ -2174,6 +2257,15 @@ void SpellSystem::Tick(uint32_t tick, const World& world,
   // impact on its first sub-step and chain.
   auto resolve = [&](const SpellCast& cast, SpellFxVec at, SpellFxVec from, SpellFxVec dir,
                      int32_t instability, int32_t gen, uint64_t casterId, uint32_t salt) {
+    {
+      SpellImpactFx fx;
+      fx.at = at;
+      fx.tint = CastTintMaterial(cast);
+      fx.radius = std::max(1, cast.delivery.impactRadius);
+      for (const EffectInst& e : cast.payload) fx.radius = std::max(fx.radius, e.radius);
+      fx.deliveryGlyph = cast.delivery.glyph;
+      out.impacts.push_back(fx);
+    }
     if (opsUsed < kSpellOpsPerTick) {
       const size_t before = out.ops.size();
       ApplySpellEffect(*lib_, cast.payload, at, dir, 1000, out, &probe, instability, salt);
@@ -2244,6 +2336,8 @@ void SpellSystem::Tick(uint32_t tick, const World& world,
       if (p.cast.delivery.gravityMille != 0)
         p.vel.y -= (int32_t)((int64_t)kGravityFxPerTick2 * p.cast.delivery.gravityMille / 1000);
       seek(p);
+      prefetch(p.pos, p.vel);
+      const SpellFxVec tickStart = p.pos;
       // Swept integration with anti-tunneling: step at most half a voxel at a
       // time, exactly as sim_particle.wgsl does.
       const int32_t kHalf = kSpellFxOne / 2;
@@ -2308,6 +2402,25 @@ void SpellSystem::Tick(uint32_t tick, const World& world,
           break;
         }
         stamp(p.casterId);
+      }
+      // BODIES. Mobs, debris and other casters are not in the voxel grid, so
+      // the sweep above cannot see them: one ray over this tick's segment
+      // (up to the wall it stopped at, if it stopped) asks the owner. A body
+      // on the way resolves the cast on the body, whatever the record said
+      // about bounces or piercing -- flesh is what a bolt is for.
+      if (p.alive && bodies && bodies->bodyHit) {
+        const SpellFxVec segEnd = impact ? impactAt : p.pos;
+        const Vec3 a{SpellFxToFloat(tickStart.x), SpellFxToFloat(tickStart.y),
+                     SpellFxToFloat(tickStart.z)};
+        const Vec3 bEnd{SpellFxToFloat(segEnd.x), SpellFxToFloat(segEnd.y),
+                        SpellFxToFloat(segEnd.z)};
+        Vec3 hit;
+        if (bodies->bodyHit(bodies->ctx, a, bEnd, p.casterId, hit)) {
+          impact = true;
+          impactAt = {SpellFxFromFloat(hit.x), SpellFxFromFloat(hit.y), SpellFxFromFloat(hit.z)};
+          p.pos = impactAt;
+          p.resting = false;
+        }
       }
     }
 

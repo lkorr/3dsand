@@ -402,6 +402,7 @@ void GlyphInfoBox(const UIState::GlyphUI& g, const char* sortName) {
   if (!g.delivers.empty()) ImGui::TextDisabled("delivers by: %s", g.delivers.c_str());
   if (!g.example.empty()) ImGui::TextDisabled("example: %s", g.example.c_str());
   ImGui::TextDisabled("drag onto a key to bind it, or into a page to write with it");
+  ImGui::TextDisabled("right-click to write it onto the end of the open page");
   EndTip();
 }
 
@@ -690,11 +691,31 @@ const UIState::GrimoirePageUI* FindPageUI(const UIState& s, const std::string& n
 
 // One word of the table: the cell, its sort tag, its valence mark, the drag
 // out of it, and the §9 info box on hover.
-void GlyphCell(int index, const UIState::GlyphUI& g, ImDrawList* cd, ImVec2 at, int sort) {
+// A word straight into the page being composed, at the end (the grimoire's
+// right-click). Refused silently when the open page is authored or full; the
+// composer's own text says why in both cases.
+bool WriteWordIntoPage(UIState& s, const char* name) {
+  const UIState::GrimoirePageUI* sel = FindPageUI(s, s.grimoireSelected);
+  if (sel && sel->readOnly) return false;
+  if ((int)s.grimoireEditWords.size() >= s.grimoireMaxWords) return false;
+  s.grimoireEditWords.push_back(name);
+  s.grimoireEditDirty = true;
+  return true;
+}
+
+void GlyphCell(UIState& s, int index, const UIState::GlyphUI& g, ImDrawList* cd, ImVec2 at,
+               int sort) {
   ImGui::SetCursorScreenPos(at);
   ImGui::PushID(2000 + index);
   ImGui::InvisibleButton("##kg", ImVec2(kSlot, kSlot));
   const bool hov = ImGui::IsItemHovered();
+  // RIGHT-CLICK: the word goes straight onto the end of the open page, so a
+  // sentence can be written by clicking down the table in order and then
+  // tidied by dragging, instead of aimed cell by cell. Guarded on no drag in
+  // flight so releasing a right button mid-drag cannot fire it as well.
+  if (hov && g.owned && !ImGui::GetDragDropPayload() &&
+      ImGui::IsMouseClicked(ImGuiMouseButton_Right))
+    WriteWordIntoPage(s, g.id.c_str());
   const ui::SlotLook look = hov ? ui::SlotLook::Hover : ui::SlotLook::Filled;
   ui::SlotSurface(cd, at, kSlot, look, false);
   SlotRim(cd, at, look);
@@ -744,7 +765,7 @@ float GlyphTableHeight(const UIState& s, int perRow) {
 // its words at nine to a row. Fifteen matter words are two rows here; in the
 // five-columns-by-sort version they were a fifteen-row column in a box that
 // showed three.
-void GlyphTable(const UIState& s, ImVec2 at, ImVec2 size, int perRow) {
+void GlyphTable(UIState& s, ImVec2 at, ImVec2 size, int perRow) {
   ImGui::SetCursorScreenPos(at);
   ImGui::BeginChild("##known", size, ImGuiChildFlags_None, ImGuiWindowFlags_NoBackground);
   {
@@ -774,7 +795,7 @@ void GlyphTable(const UIState& s, ImVec2 at, ImVec2 size, int perRow) {
         if (g.type != sort) continue;
         const ImVec2 p(base.x + kGutter + (k % perRow) * kCell, y + (k / perRow) * kCell);
         k++;
-        GlyphCell(i, g, cd, p, sort);
+        GlyphCell(s, i, g, cd, p, sort);
       }
       y += rows * kCell + 8;
     }
@@ -945,6 +966,11 @@ void GrimoireBody(UIState& s, ImVec2 at, ImVec2 size) {
         s.grimoireEditWords = p.words;
         s.grimoireEditDirty = false;
       }
+      // Right-click: nest this page into the open one (never into itself —
+      // the save would refuse the cycle anyway; this just does not offer it).
+      if (hov && !ImGui::GetDragDropPayload() && p.name != s.grimoireSelected &&
+          ImGui::IsMouseClicked(ImGuiMouseButton_Right))
+        WriteWordIntoPage(s, p.name.c_str());
       if (ImGui::BeginDragDropSource()) {
         char buf[64] = {};
         std::snprintf(buf, sizeof buf, "%s", p.name.c_str());
@@ -963,7 +989,7 @@ void GrimoireBody(UIState& s, ImVec2 at, ImVec2 size) {
         ImGui::TextDisabled("%s", p.readout.c_str());
         if (p.priceUnknown) ImGui::TextDisabled("price %d + ?", p.price);
         else ImGui::TextDisabled("price %d", p.price);
-        ImGui::TextDisabled("click to open  .  drag onto a key to bind it, or into a page's row to nest it");
+        ImGui::TextDisabled("click to open  .  right-click to nest it in the open page  .  drag onto a key to bind it");
         EndTip();
       }
       ImGui::PopID();
@@ -1490,7 +1516,7 @@ void DrawInventoryScreen(UIState& s) {
         dl->AddText(ImVec2(wp.x + kPad, y), Fade(ui::ColParchDim(), 0.8f),
                     "drag a word onto a key to bind it  .  right-click a key to clear it");
         dl->AddText(ImVec2(wp.x + kPad, y + 14), Fade(ui::ColParchDim(), 0.8f),
-                    "drag a word into a grimoire page to write with it  .  hover to read");
+                    "right-click a word to write it onto the open page  .  hover to read");
         ImGui::PopFont();
       }
     }

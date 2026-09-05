@@ -29,6 +29,7 @@
 #include "game/mob.h"
 #include "game/spell.h"
 #include "phys/debris.h"
+#include "sim/worldmap.h"
 #include "test/selftest.h"
 #include "test/support.h"
 
@@ -76,7 +77,7 @@ std::string CastsSignature(const GlyphLibrary& lib, const CastList& l) {
                   "[d%d m%d w%d c%d sp%d lt%d ir%d g%d fu%d re%d n%d ch%d b%d p%d "
                   "s%d rm%d body%d x%d tb%d te%d | inst%d word%d tar%d carry%d unk%d "
                   "t%d v%d gen%d]",
-                  d.glyph, (int)d.mech, d.weight, d.carryMille, d.speed, d.lifetimeTicks,
+                  d.glyph, (int)d.mech, d.weight, d.carryMille, d.speedFx, d.lifetimeTicks,
                   d.impactRadius, d.gravityMille, d.fuseTicks, d.reach, d.count,
                   d.children, d.bounces, d.pierce, d.seek, d.radiusMille, d.body ? 1 : 0,
                   d.resolveOnExpiry ? 1 : 0, d.trailBudget, d.trailEvery, c.instances,
@@ -118,7 +119,7 @@ int32_t RecordField(const DeliveryRec& d, ModField f) {
     case ModField::Count: return d.count;
     case ModField::Children: return d.children;
     case ModField::Gravity: return d.gravityMille;
-    case ModField::Speed: return d.speed;
+    case ModField::Speed: return d.speedFx;
     case ModField::Lifetime: return d.lifetimeTicks;
     case ModField::Radius: return d.radiusMille;
     case ModField::Bounces: return d.bounces;
@@ -154,6 +155,33 @@ Status GateSpells(Ctx& c, std::string& detail) {
       if (gi >= 0) st.spoken.push_back(gi);
     }
     return st;
+  };
+
+  // A column whose ground is INSIDE the window with `minAbove` voxels of
+  // window above it, searched from the window's centre outward on a coarse
+  // grid. The harness landform fades toward the sea at the window's edges
+  // (environment truth P-C), so a corner column can have no ground in the
+  // window at all -- a fixture placed there spawns nothing / lands on the
+  // window floor, and reads as "the engine did nothing" (rule 7).
+  auto groundColumn = [&](int minAbove, int& ox, int& oz, int& oh) {
+    const IVec3 wo = world.WindowOrigin();
+    const int yLo = wo.y * (int)kChunk, yHi = yLo + (int)kWorldN;
+    const int cx = wo.x * (int)kChunk + (int)kWorldN / 2;
+    const int cz = wo.z * (int)kChunk + (int)kWorldN / 2;
+    for (int ring = 0; ring * 32 < (int)kWorldN / 2 - 16; ring++)
+      for (int dz = -ring; dz <= ring; dz++)
+        for (int dx = -ring; dx <= ring; dx++) {
+          if (std::max(std::abs(dx), std::abs(dz)) != ring) continue;
+          const int x = cx + dx * 32, z = cz + dz * 32;
+          const int h = World::TerrainHeight(x, z, kDefaultSeed);
+          if (h >= yLo + 8 && h + minAbove <= yHi - 8) {
+            ox = x;
+            oz = z;
+            oh = h;
+            return true;
+          }
+        }
+    return false;
   };
 
   // ---- (1) the trail budget is respected EXACTLY -----------------------------
@@ -205,6 +233,84 @@ Status GateSpells(Ctx& c, std::string& detail) {
   }
   const bool budgetOk = authoredBudget > 0 && trailVolume > 0 &&
                         trailVolume <= authoredBudget && diedWithBudget;
+
+  // ---- (1b) DELIVERY: a flight past the mirror still lands ------------------
+  // `explosive projectile` fired straight down from well above the ground,
+  // far from wherever the CPU mirror happens to be, must RESOLVE: one
+  // explosion, at or above the ground contract's height for that column and
+  // not under it, before its lifetime runs out. Before the chunk-cache /
+  // TerrainHeight tiers every cell past the mirror read as passable, so a
+  // bolt fizzled at the end of its life and "explosive projectile" did
+  // nothing at all -- which no gate here noticed, because every flight in
+  // this file was measured for what it did on the way, never for whether it
+  // arrived.
+  bool deliverOk = false, deliverColumn = false, deliverMirrored = false;
+  int deliverTicks = 0, deliverGround = 0, deliverY = -1, deliverSx = 0, deliverSz = 0;
+  {
+    CastList sp = CompileSpell(lib, speak({"explosive", "projectile"}));
+    CasterState cs;
+    cs.mana = 10000;
+    cs.manaMax = 10000;
+    FakeHealth hp(10000);
+    deliverColumn = groundColumn(70, deliverSx, deliverSz, deliverGround);
+    {
+      // Where the fixture is, for attribution when it is not where it should
+      // be: the window and the contract height at its centre.
+      const IVec3 wo = world.WindowOrigin();
+      const int cx = wo.x * (int)kChunk + (int)kWorldN / 2, cz = wo.z * (int)kChunk + (int)kWorldN / 2;
+      std::printf("spell delivery: window origin (%d,%d,%d) chunks, centre column (%d,%d) ground y%d, "
+                  "column %s at (%d,%d) y%d\n",
+                  wo.x, wo.y, wo.z, cx, cz, World::TerrainHeight(cx, cz, kDefaultSeed),
+                  deliverColumn ? "found" : "NOT FOUND", deliverSx, deliverSz, deliverGround);
+      const worldmap::WorldMapData& m = worldmap::CurrentWorldMap();
+      const WorldSnapshot& sn = world.Snap();
+      int topSolid = -9999;
+      if (sn.valid) {
+        // The highest solid the mirror holds at its centre column, as the
+        // ground truth against the contract.
+        const int mx = sn.mirrorBase.x * (int)kChunk + 24, mz = sn.mirrorBase.z * (int)kChunk + 24;
+        for (int y = sn.mirrorBase.y * (int)kChunk + 47; y >= sn.mirrorBase.y * (int)kChunk; y--)
+          if (world.KindAt({mx, y, mz}, classOf) == CellKind::Solid) { topSolid = y; break; }
+        std::printf("spell delivery: mirror base (%d,%d,%d), top solid at its centre column (%d,%d) y%d, "
+                    "contract there y%d\n", sn.mirrorBase.x, sn.mirrorBase.y, sn.mirrorBase.z, mx, mz,
+                    topSolid, World::TerrainHeight(mx, mz, kDefaultSeed));
+      }
+      std::printf("spell delivery: map loaded=%d harness box (%d,%d)-(%d,%d) sea y%d spawn (%d,%d); "
+                  "contract y at (100,100)=%d (150,150)=%d (72,72)=%d spawn=%d; mirror seed %u\n",
+                  m.Loaded() ? 1 : 0, m.harnessX0, m.harnessZ0, m.harnessX1, m.harnessZ1, m.seaLevelY,
+                  m.spawnX, m.spawnZ, World::TerrainHeight(100, 100, kDefaultSeed),
+                  World::TerrainHeight(150, 150, kDefaultSeed), World::TerrainHeight(72, 72, kDefaultSeed),
+                  World::TerrainHeight(m.spawnX, m.spawnZ, kDefaultSeed), world.WorldSeed());
+    }
+    const int sy = deliverGround + 60;
+    const SpellFxVec origin{SpellFxFromFloat((float)deliverSx + 0.5f), SpellFxFromFloat((float)sy),
+                            SpellFxFromFloat((float)deliverSz + 0.5f)};
+    // Whether the launch cell is in the CPU mirror (then tier 1 answers) or
+    // past it (tiers 2/3, the new path). Printed, not asserted: the claim is
+    // that it lands either way.
+    deliverMirrored =
+        world.KindAt({deliverSx, sy, deliverSz}, classOf) != CellKind::Unknown;
+    SpellEmission emit;
+    sys.Cast(sp, cs, hp.cb, 3, origin, {0, -kSpellFxOne, 0}, 1, emit);
+    const bool launched = sys.LiveCount() == 1 && emit.explosions.empty();
+    bool resolved = false;
+    for (int t = 0; t < (int)lib.budgets.maxLifetimeTicks + 10 && !resolved; t++) {
+      SpellEmission e;
+      sys.Tick((uint32_t)(600 + t), world, classOf, e);
+      deliverTicks++;
+      if (!e.explosions.empty()) {
+        resolved = true;
+        deliverY = (int)e.explosions[0].y;
+      }
+      if (sys.LiveCount() == 0) break;
+    }
+    // Landed on the ground (or on something standing on it: a tree, a rock),
+    // never under it; not at the muzzle (60 voxels at <= ~6 vox/tick is more
+    // than three ticks); and within the fall rather than at the lifetime
+    // bound.
+    deliverOk = deliverColumn && launched && resolved && deliverY >= deliverGround - 1 &&
+                deliverTicks >= 3 && deliverTicks < sp.casts[0].delivery.lifetimeTicks;
+  }
 
   // ---- (2) the overcast ------------------------------------------------------
   // Cost beyond mana + health must resolve Fatal, and a Fatal cast must run the
@@ -835,9 +941,18 @@ Status GateSpells(Ctx& c, std::string& detail) {
     if (dummyDef >= 0) {
       // Inside the CURRENT residency window (streaming moved it): a creature
       // spawned outside it has no bodies and is culled on the first tick.
-      const IVec3 wo = world.WindowOrigin();
-      const int sx = wo.x * (int)kChunk + 72, sz = wo.z * (int)kChunk + 72;
-      const int h = World::TerrainHeight(sx, sz, kDefaultSeed);
+      // And on ground that is inside the window: 72 voxels in from the
+      // corner sits on the landform's fade to the sea at some window
+      // positions, where the ground is under the window floor and the
+      // creature spawned there was culled the same way -- "missing 0 ->
+      // grafted 0" with nothing wrong in mend.
+      int sx = 0, sz = 0, h = 0;
+      if (!groundColumn(40, sx, sz, h)) {
+        const IVec3 wo = world.WindowOrigin();
+        sx = wo.x * (int)kChunk + 72;
+        sz = wo.z * (int)kChunk + 72;
+        h = World::TerrainHeight(sx, sz, kDefaultSeed);
+      }
       IVec3 pc{sx >> 4, (h + 1) >> 4, sz >> 4};
       const uint64_t id = mobs.Spawn(dummyDef, {sx, h + 1, sz});
       const MobDef& dd = mobs.Defs()[dummyDef];
@@ -984,15 +1099,18 @@ Status GateSpells(Ctx& c, std::string& detail) {
 
   const bool lawsOk = alphaOk && lawFail == 0 && l1 > 0 && l2pairs > 0 && l3 > 0 &&
                       l6cases > 0 && l4cases > 0 && l7 > 0 && l5 > 0 && l8 > 0;
-  const bool spellOk = budgetOk && fatalOk && carveAsked && fatalEmitted && sprayOk &&
-                       latchOk && lawsOk && bombOk && sustainOk && mendOk;
+  const bool spellOk = budgetOk && deliverOk && fatalOk && carveAsked && fatalEmitted &&
+                       sprayOk && latchOk && lawsOk && bombOk && sustainOk && mendOk;
   std::printf(
       "spells: %s (trail authorized %lld/%d voxels over %d ticks, died=%d; "
+      "delivered=%d at y=%d over ground %d (%d,%d; column=%d mirrored=%d) after %d ticks; "
       "overcast fatal=%d carve=%d payload=%d; spray %d/%d/%d voxels for "
       "%d/%d/%d mana; bomb=%d sustain=%d mend=%d; laws over %zu sequences: L1 %d, L2 %d/%d, "
       "L3 %d, L4 %d/%d, L5 %d, L6 %d/%d, L7 %d, L8 %d, %d failures)\n",
       spellOk ? "PASS" : "FAIL", (long long)trailVolume, authoredBudget, flownTicks,
-      diedWithBudget ? 1 : 0, fatalOk ? 1 : 0, carveAsked ? 1 : 0, fatalEmitted ? 1 : 0,
+      diedWithBudget ? 1 : 0, deliverOk ? 1 : 0, deliverY, deliverGround, deliverSx, deliverSz,
+      deliverColumn ? 1 : 0, deliverMirrored ? 1 : 0, deliverTicks,
+      fatalOk ? 1 : 0, carveAsked ? 1 : 0, fatalEmitted ? 1 : 0,
       sprayN[0], sprayN[1], sprayN[2], sprayCost[0], sprayCost[1], sprayCost[2],
       bombOk ? 1 : 0, sustainOk ? 1 : 0, mendOk ? 1 : 0, seqs.size(), l1, l2, l2pairs, l3, l4,
       l4cases, l5, l6, l6cases, l7, l8, lawFail);
@@ -1101,7 +1219,13 @@ Status GateSpellsOracle(Ctx& c, std::string& detail) {
 
 const std::vector<Gate>& SpellGates() {
   static const std::vector<Gate> g = {
-      {"spells", "spell", {"streaming"}, false, GateSpells},
+      // No deps. The VM gate anchors to world.WindowOrigin(), which exists
+      // whether or not the streaming gate passed; it was declared to depend on
+      // `streaming` at the original gate split with no reason recorded, and
+      // when streaming went red (2026-09-04, tests/BASELINE.md) this gate was
+      // SKIPPED in every scope for a day -- which is how "explosive
+      // projectile does nothing" shipped with the gate nominally green.
+      {"spells", "spell", {}, false, GateSpells},
       // No deps: CPU-only over the glyph library and the oracle file.
       {"spells-oracle", "spell", {}, false, GateSpellsOracle},
   };

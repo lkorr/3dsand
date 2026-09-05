@@ -4028,6 +4028,16 @@ int main(int argc, char** argv) {
   bool beamHeld = false;
   bool dropStatusQueued = false;
   std::vector<Grenade> grenades;
+  // Where a spell resolved, for the renderer: a short-lived burst of sprites
+  // (SpellEmission::impacts). Render-only, counted down per TICK so the flash
+  // lasts the same world-time at any frame rate.
+  struct SpellFlash {
+    Vec3 at;
+    uint32_t color;
+    float radius;
+    int ttl, ttl0;
+  };
+  std::vector<SpellFlash> spellFlashes;
 
   // ---- magic (game/spell.h, game/caster.h) ---------------------------------
   // The VM is not player-coupled: SpellSystem takes an origin, a direction and
@@ -6508,9 +6518,29 @@ int main(int argc, char** argv) {
           MobSystem* mobs;
           const Player* player;
           uint64_t playerId;
-        } bodyCtx{&phys, &mobs, &player, 0x9134A5EEu};
+          const PlayerAvatar* avatar;
+        } bodyCtx{&phys, &mobs, &player, 0x9134A5EEu, &avatar};
         SpellBodyProbe bodyProbe;
         bodyProbe.ctx = &bodyCtx;
+        // WHAT A FLIGHT RUNS INTO: the first MOVING-layer body on the tick's
+        // segment (a mob limb, debris, a bomb), through the same ray the laser
+        // and the melee sweep use. The caster's own parts are rejected by
+        // OWNERSHIP, not distance (the laser's rule): an arm swings through
+        // the muzzle line constantly, and a bolt that went off in the hand
+        // would read as the overcast backfire it is not.
+        bodyProbe.bodyHit = [](void* c, Vec3 from, Vec3 to, uint64_t casterId, Vec3& out) {
+          SpellBodyCtx& bc = *(SpellBodyCtx*)c;
+          const Vec3 seg = to - from;
+          const float len = seg.len();
+          if (len < 1e-4f) return false;
+          const Vec3 dir = seg * (1.0f / len);
+          float frac = 1.0f;
+          const uint64_t h = bc.phys->CastRayBody(from, dir, len, frac);
+          if (h == 0) return false;
+          if (casterId == bc.playerId && bc.avatar->OwnsBody(h)) return false;
+          out = from + dir * (frac * len);
+          return true;
+        };
         // The body a status attaches to: the nearest mob origin within the
         // radius, else the player. Ids are the mob's own and the player's
         // caster id — opaque to the VM either way.
@@ -6661,6 +6691,22 @@ int main(int argc, char** argv) {
           spells.DropNewestStatus(0x9134A5EEu);
         }
         spells.Tick(tick, world, classOf, emit, &bodyProbe);
+        // Impact flashes: born from this tick's resolves, aged per tick.
+        for (SpellFlash& fl : spellFlashes) fl.ttl--;
+        spellFlashes.erase(std::remove_if(spellFlashes.begin(), spellFlashes.end(),
+                                          [](const SpellFlash& f) { return f.ttl <= 0; }),
+                           spellFlashes.end());
+        for (const SpellImpactFx& fx : emit.impacts) {
+          if (spellFlashes.size() >= 24) break;
+          SpellFlash fl;
+          fl.at = Vec3{SpellFxToFloat(fx.at.x), SpellFxToFloat(fx.at.y), SpellFxToFloat(fx.at.z)};
+          fl.color = fx.tint != 0 && fx.tint < mats.size()
+                         ? mats[fx.tint].gpu.color0
+                         : glyphs.Delivery(fx.deliveryGlyph).look.color;
+          fl.radius = (float)std::clamp(fx.radius, 1, 12);
+          fl.ttl = fl.ttl0 = 9;
+          spellFlashes.push_back(fl);
+        }
 
         // THE PER-TICK BILL. Statuses and a held beam pay the same tariff as
         // they emit (plan §4): mana first, then the body, and when neither
@@ -8505,24 +8551,134 @@ int main(int argc, char** argv) {
         sprv.push_back(s);
       }
 
-      // spell projectiles render as emissive sprites tinted by their element,
-      // so a firebolt reads as fire and an acid bolt as acid with no per-spell
-      // render code. THIS is the one place spell state becomes float: the
-      // authoritative position is fixed-point and is only lerped to float here,
-      // at the drawing boundary (spell.h thesis 3).
-      for (const SpellProjectile& p : spells.Live()) {
-        Sprite s{};
-        s.pos[0] = SpellFxToFloat(p.pos.x);
-        s.pos[1] = SpellFxToFloat(p.pos.y);
-        s.pos[2] = SpellFxToFloat(p.pos.z);
-        s.halfSize = 0.6f;
-        // The bolt is drawn in the colour of the first matter it carries
-        // (a spray, a convert's product, a trail mark); a bolt that carries
-        // none (a bare `explosive projectile`) is white.
-        const uint32_t tint = CastTintMaterial(p.cast);
-        s.color = tint != 0 && tint < mats.size() ? mats[tint].gpu.color0 : 0xFFFFFFFFu;
-        s.emission = 1.0f;
-        sprv.push_back(s);
+      // SPELL FLIGHTS. Each delivery glyph's `look` (glyphs.json, render-only
+      // content) says how its carrier is drawn: a bolt is a bright core with a
+      // streak back along the velocity, a ball a rounded mass of lobes with a
+      // short tail, an orb a slow breathing core with motes orbiting the flight
+      // axis, a spark a flicker. All emissive, tinted by the first matter the
+      // cast carries (a firebolt reads as fire, an acid bolt as acid) or else
+      // by the look's own colour, with no per-spell render code. THIS is the
+      // one place spell state becomes float: the authoritative position is
+      // fixed-point and is only lerped to float here, at the drawing boundary
+      // (spell.h thesis 3). Over the sprite budget a flight keeps its core and
+      // loses its dressing, in launch order.
+      {
+        const float tNow = (float)NowSeconds();
+        auto scaleColor = [](uint32_t c, float k) -> uint32_t {
+          auto ch = [&](int sh) {
+            const float v = (float)((c >> sh) & 0xFFu) * k;
+            return (uint32_t)std::clamp(v, 0.0f, 255.0f) << sh;
+          };
+          return (c & 0xFF000000u) | ch(0) | ch(8) | ch(16);
+        };
+        auto push = [&](Vec3 at, float half, uint32_t color, float emission) {
+          if (sprv.size() + 1 >= kMaxSprites) return false;
+          Sprite s{};
+          s.pos[0] = at.x;
+          s.pos[1] = at.y;
+          s.pos[2] = at.z;
+          s.halfSize = half;
+          s.color = color;
+          s.emission = emission;
+          sprv.push_back(s);
+          return true;
+        };
+        static const Vec3 kAxes[6] = {{1, 0, 0}, {-1, 0, 0}, {0, 1, 0},
+                                      {0, -1, 0}, {0, 0, 1}, {0, 0, -1}};
+        for (const SpellProjectile& p : spells.Live()) {
+          const GlyphLook& lk = glyphs.Delivery(p.cast.delivery.glyph).look;
+          const Vec3 at{SpellFxToFloat(p.pos.x), SpellFxToFloat(p.pos.y), SpellFxToFloat(p.pos.z)};
+          const Vec3 v{SpellFxToFloat(p.vel.x), SpellFxToFloat(p.vel.y), SpellFxToFloat(p.vel.z)};
+          const float sp = v.len();
+          const Vec3 dir = sp > 1e-4f ? v * (1.0f / sp) : Vec3{0, 1, 0};
+          const uint32_t tint = CastTintMaterial(p.cast);
+          const uint32_t base = tint != 0 && tint < mats.size() ? mats[tint].gpu.color0 : lk.color;
+          const float phase = (float)(p.seq % 64u) * 0.37f;
+          const float flick = 0.85f + 0.15f * std::sin(tNow * 23.0f + phase);
+          if (p.resting) {
+            // A fused bolt sits where it landed: a spark that pulses faster as
+            // the fuse runs down.
+            const float pulse =
+                0.5f + 0.5f * std::sin(tNow * (8.0f + 40.0f / (float)std::max(1, p.fuseLeft)));
+            push(at, lk.size * 0.5f * (0.6f + 0.4f * pulse), base, lk.glow * (0.5f + pulse));
+            continue;
+          }
+          switch (lk.shape) {
+            case LookShape::Bolt: {
+              push(at, lk.size * flick, base, lk.glow * 1.2f);
+              for (int k = 1; k <= lk.tail; k++) {
+                const float f = (float)k / (float)(lk.tail + 1);
+                if (!push(at - dir * (lk.tailStep * (float)k), lk.size * (1.0f - 0.8f * f) * 0.8f,
+                          scaleColor(base, 1.0f - 0.7f * f), lk.glow * (1.0f - f)))
+                  break;
+              }
+              break;
+            }
+            case LookShape::Ball: {
+              push(at, lk.size * flick, base, lk.glow);
+              // Six lobes make one cube read as a rounded mass.
+              const float lobe = lk.size * 0.62f, off = lk.size * 0.55f;
+              for (int k = 0; k < 6; k++)
+                push(at + kAxes[k] * off, lobe, scaleColor(base, 0.85f), lk.glow * 0.8f);
+              for (int k = 1; k <= lk.tail; k++) {
+                const float f = (float)k / (float)(lk.tail + 1);
+                if (!push(at - dir * (lk.tailStep * (float)k), lk.size * (0.7f - 0.5f * f),
+                          scaleColor(base, 0.8f - 0.6f * f), lk.glow * (0.7f - 0.6f * f)))
+                  break;
+              }
+              break;
+            }
+            case LookShape::Orb: {
+              const float breathe = 1.0f + 0.12f * std::sin(tNow * 3.0f + phase);
+              push(at, lk.size * breathe, base, lk.glow);
+              // A ring of motes about the flight axis.
+              const Vec3 up = std::fabs(dir.y) < 0.9f ? Vec3{0, 1, 0} : Vec3{1, 0, 0};
+              const Vec3 u = up.cross(dir).normalized();
+              const Vec3 w = dir.cross(u);
+              const int motes = std::max(3, lk.tail);
+              const float rr = lk.size * 1.6f;
+              for (int k = 0; k < motes; k++) {
+                const float ang = tNow * 4.0f + phase + (float)k * 6.2831853f / (float)motes;
+                if (!push(at + (u * std::cos(ang) + w * std::sin(ang)) * rr, lk.size * 0.28f,
+                          scaleColor(base, 1.1f), lk.glow * 1.3f))
+                  break;
+              }
+              break;
+            }
+            case LookShape::Spark: {
+              push(at, lk.size * flick, base, lk.glow * 1.5f);
+              for (int k = 1; k <= lk.tail; k++) {
+                const float f = (float)k / (float)(lk.tail + 1);
+                if (!push(at - dir * (lk.tailStep * (float)k), lk.size * 0.5f * (1.0f - f),
+                          scaleColor(base, 1.0f - 0.8f * f), lk.glow * (1.0f - f)))
+                  break;
+              }
+              break;
+            }
+          }
+        }
+        // Bombs are debris bodies and the debris path draws them; the fuse
+        // sparks on top, faster as it runs down.
+        for (const SpellBomb& bm : spells.Bombs()) {
+          const Vec3 at{SpellFxToFloat(bm.lastPos.x), SpellFxToFloat(bm.lastPos.y) + 2.0f,
+                        SpellFxToFloat(bm.lastPos.z)};
+          const float pulse =
+              0.5f + 0.5f * std::sin(tNow * (6.0f + 60.0f / (float)std::max(1, bm.fuseLeft)));
+          push(at, 0.25f + 0.2f * pulse, 0xFF60D0FFu, 1.5f + pulse);
+        }
+        // Impact flashes: a core that shrinks as a shell of motes flies out.
+        for (const SpellFlash& fl : spellFlashes) {
+          const float age = (float)(fl.ttl0 - fl.ttl) / (float)fl.ttl0;   // 0..1
+          const float r = fl.radius * (0.3f + 0.9f * age);
+          push(fl.at, fl.radius * 0.5f * (1.0f - age) + 0.2f, fl.color, 2.0f * (1.0f - age));
+          for (int k = 0; k < 8; k++) {
+            const Vec3 corner{(k & 1) ? 0.577f : -0.577f, (k & 2) ? 0.577f : -0.577f,
+                              (k & 4) ? 0.577f : -0.577f};
+            if (!push(fl.at + corner * r, 0.25f * (1.0f - age) + 0.08f,
+                      scaleColor(fl.color, 1.0f - 0.5f * age), 1.5f * (1.0f - age)))
+              break;
+          }
+        }
       }
 
       // prefab tool preview: marker box at the anchor cell, sized to the

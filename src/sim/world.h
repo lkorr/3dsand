@@ -392,7 +392,10 @@ struct Sprite {
   float emission;
   uint32_t pad0 = 0, pad1 = 0;
 };
-constexpr uint32_t kMaxSprites = 64;
+// 512: a spell flight is up to ~20 sprites (core, lobes, tail, orbit) and
+// up to maxLiveProjectiles fly at once, plus impact flashes and markers.
+// 16 KiB, CPU-written once a frame.
+constexpr uint32_t kMaxSprites = 512;
 
 // One ORIENTED wireframe box for the collision-box debug overlay.
 struct DebugBox {
@@ -2416,6 +2419,10 @@ class World {
   // See mirrorSeed_. Set by Stream::Init at the same point the page table's
   // copy is set.
   void SetMirrorSeed(uint32_t s) { mirrorSeed_ = s; }
+  // The world seed the mirror and the page table synthesize with — the same
+  // seed worldgen ran under, so World::TerrainHeight(x, z, WorldSeed()) is
+  // the ground a CPU system may assume where nothing has been fetched.
+  uint32_t WorldSeed() const { return mirrorSeed_; }
 
   // Residency mode. `dense` is the identity map — page i for slot i — which
   // makes every address bit-identical to pre-paging code while still running
