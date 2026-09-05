@@ -2414,7 +2414,6 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadWgCount(*g, "curveDesert7", w.curveDesert7, out, at);
     ReadWgCount(*g, "curveDesert8", w.curveDesert8, out, at);
     ReadWgCount(*g, "biomeBlend", w.biomeBlend, out, at);
-    ReadWgLen(*g, "treeTile", w.treeTile, out, at);
     ReadWgCount(*g, "autumnFraction", w.autumnFraction, out, at);
     ReadWgLen(*g, "pondTile", w.pondTile, out, at);
     ReadWgCount(*g, "pondChance", w.pondChance, out, at);
@@ -2538,13 +2537,9 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     // that the `gravel` half of the stack simply never appears, which is a
     // silently different world rather than an error.
     if (w.sedTopsoil > w.sedMax) { w.sedTopsoil = w.sedMax; }
-    // treeCandsInto keeps at most TREE_CAND_MAX = 9 candidate tiles per column,
-    // and that 9 is DERIVED: a site sits in the middle half of its tile, so the
-    // tiles whose sites can reach within TREE_MAX_REACH (124) of a column span
-    // 319 voxels of tile origin, i.e. ceil(319/treeTile) + 1 per axis. At 112
-    // that is 3 per axis and 9 total; below it a tenth candidate exists and
-    // would be silently dropped — a canopy that vanishes on one column.
-    atLeast("treeTile", w.treeTile, scaleLen(112));
+    // The tree lattice is no longer a knob: LoadTreeAtlas derives the scan
+    // and candidate cap from the biome files' finest tile and refuses an atlas
+    // whose widest crown would overflow them (sim/treeatlas.h TreeLattice).
     atLeast("pondTile", w.pondTile, 8);
     atLeast("pondChance", w.pondChance, 1);
     atLeast("pondRadiusSpan", w.pondRadiusSpan, 1);
@@ -2798,7 +2793,6 @@ std::string WorldgenDefaultsJson() {
   n("curveDesert7", w.curveDesert7);
   n("curveDesert8", w.curveDesert8);
   n("biomeBlend", w.biomeBlend);
-  n("treeTile", w.treeTile);
   n("autumnFraction", w.autumnFraction);
   n("pondTile", w.pondTile);
   n("pondChance", w.pondChance);

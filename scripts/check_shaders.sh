@@ -323,6 +323,17 @@ TUNING_TEXT="$(python "$ROOT/scripts/tuning_prelude.py")" || {
 }
 PRELUDE_TEXT="$(printf '%s\n%s' "$PRELUDE_TEXT" "$TUNING_TEXT")"
 
+# The tree lattice (ShaderConstantPrelude's TREE_TILE / TREE_SCAN /
+# TREE_CAND_MAX). Load-time asset data in the engine -- the finest biome tile
+# and the atlas's widest reach -- so it is derived from the same assets here
+# (scripts/tree_lattice.py mirrors treeatlas.h TreeLatticeFor) rather than
+# scraped from a header. TREE_CAND_MAX sizes an array in worldgen.wgsl.
+TREE_TEXT="$(python "$ROOT/scripts/tree_lattice.py" --vpm "$W_VPM" --assets "$ROOT/assets")" || {
+  echo "check_shaders: scripts/tree_lattice.py failed" >&2
+  exit 1
+}
+PRELUDE_TEXT="$(printf '%s\n%s' "$PRELUDE_TEXT" "$TREE_TEXT")"
+
 # Lines contributed ahead of the body: prelude + its "\n" + common + its "\n".
 # Error line L in the combined source maps to line L - OFFSET in the body file.
 COMMON_LINES="$(wc -l < "$COMMON" | tr -d ' ')"

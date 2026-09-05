@@ -1007,7 +1007,7 @@ def check_worldgen_defaults():
 # pointer, and what comes out is a forest of trees built from other trees'
 # columns -- plausible-looking garbage, at some seeds, in some places. Nothing
 # else in the repo looks at both files.
-TA_PREFIX = {"kH": "TA_H_", "kS": "TA_S_", "kV": "TA_V_"}
+TA_PREFIX = {"kH": "TA_H_", "kS": "TA_S_", "kV": "TA_V_", "kC": "TA_C_"}
 TA_SKIP = {"kHMagic", "kHVersion", "kHBiomeCount", "kHTotalWords",
            "kSFlags", "kVRuns", "kVReach", "kVAbove",
            "kVCrownY", "kVCrownR"}
@@ -1016,7 +1016,11 @@ TA_SKIP = {"kHMagic", "kHVersion", "kHBiomeCount", "kHTotalWords",
 TA_ALIAS = {
     "kHSpeciesCount": "TA_H_SPECIES_COUNT", "kHMaxReach": "TA_H_MAX_REACH",
     "kHMaxAbove": "TA_H_MAX_ABOVE", "kHBiomeTable": "TA_H_BIOME_TABLE",
-    "kHSpeciesDir": "TA_H_SPECIES_DIR",
+    "kHSpeciesDir": "TA_H_SPECIES_DIR", "kHCondTable": "TA_H_COND_TABLE",
+    # The per-(biome, species) condition rows (P-D of PLAN_environment_truth).
+    "kCMinY": "TA_C_MIN_Y", "kCMaxY": "TA_C_MAX_Y", "kCMaxSlope": "TA_C_MAX_SLOPE",
+    "kCNearWaterMax": "TA_C_NEAR_WATER_MAX", "kCNearWaterMin": "TA_C_NEAR_WATER_MIN",
+    "kCPatchThreshold": "TA_C_PATCH_THRESH",
     "kSVariantDir": "TA_S_VARIANT_DIR", "kSVariantCount": "TA_S_VARIANT_CNT",
     "kSReach": "TA_S_REACH", "kSAbove": "TA_S_ABOVE", "kSCrownY": "TA_S_CROWN_Y",
     "kSCrownR": "TA_S_CROWN_R", "kSMinY": "TA_S_MIN_Y", "kSMaxY": "TA_S_MAX_Y",
@@ -1076,7 +1080,8 @@ def check_tree_atlas():
                 f"trees' columns")
 
     for a, b in (("kSpeciesWords", "TA_SPECIES_WORDS"),
-                 ("kVariantWords", "TA_VARIANT_WORDS")):
+                 ("kVariantWords", "TA_VARIANT_WORDS"),
+                 ("kCondWords", "TA_COND_WORDS")):
         if a in cpp and b in wg and cpp[a] != wg[b]:
             problems.append(
                 f"tree atlas: {a} = {cpp[a]} in treeatlas.h but {b} = {wg[b]} "

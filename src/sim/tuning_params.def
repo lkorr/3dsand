@@ -835,7 +835,6 @@ TP_I(worldgen, curveDesert8, TUNE_CURVE_DESERT8, 16384)
 // meeting on a contour is a step of tens of voxels. Keep it under half the
 // smallest gap between thresholds.
 TP_I(worldgen, biomeBlend, TUNE_BIOME_BLEND, 18)
-TP_I(worldgen, treeTile, TUNE_TREE_TILE, 144)
 TP_U(worldgen, autumnFraction, TUNE_AUTUMN_FRACTION, 5)
 TP_I(worldgen, pondTile, TUNE_POND_TILE, 448)
 TP_U(worldgen, pondChance, TUNE_POND_CHANCE, 4)

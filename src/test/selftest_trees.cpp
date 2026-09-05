@@ -26,6 +26,7 @@
 
 #include "sim/treeatlas.h"
 #include "sim/tuning.h"
+#include "sim/world.h"   // kVoxelsPerMetre, for the trees/ha line
 #include "test/selftest.h"
 #include "test/support.h"
 
@@ -53,17 +54,43 @@ Status GateTreeAtlas(Ctx& c, std::string& detail) {
   std::string why;
   const uint32_t* W = atlas.words.data();
 
-  // ---- 1. the candidate-set bound -----------------------------------------
-  // worldgen keeps nine trees per column on an arithmetic argument that reads
-  // the widest species' reach (treeatlas.h). LoadTreeAtlas refuses past it;
-  // assert it here too, because a refusal is exactly the thing that gets
-  // "temporarily" relaxed to land a wider crown.
-  const int tile = std::max(16, CurrentTuning().worldgen.treeTile);
-  const int bound = treeatlas::MaxReachForNineCandidates(tile);
-  if (atlas.maxReachXZ > bound) {
+  // ---- 1. the lattice and its candidate-set bound --------------------------
+  // worldgen keeps TREE_CAND_MAX trees per column on an arithmetic argument
+  // that reads the widest species' reach and the finest biome tile
+  // (treeatlas.h TreeLattice). LoadTreeAtlas refuses past the cap; assert it
+  // here too, because a refusal is exactly the thing that gets "temporarily"
+  // relaxed to land a wider crown. And the lattice the SHADERS were compiled
+  // against must be this one -- a stale prelude would size the candidate
+  // array for a different forest.
+  const treeatlas::TreeLattice& lat = atlas.lattice;
+  const int tile = lat.tile;
+  const int bound = treeatlas::MaxReachForCandidates(tile, treeatlas::kTreeCandPerAxisCap);
+  if (atlas.maxReachXZ > bound || lat.perAxis > treeatlas::kTreeCandPerAxisCap) {
     ok = false;
-    why += Format(" | widest reach %d > %d, the nine-candidate bound at "
-                  "treeTile %d", atlas.maxReachXZ, bound, tile);
+    why += Format(" | widest reach %d > %d, the %dx%d-candidate bound at "
+                  "lattice %d", atlas.maxReachXZ, bound,
+                  treeatlas::kTreeCandPerAxisCap, treeatlas::kTreeCandPerAxisCap, tile);
+  }
+  {
+    const treeatlas::TreeLattice& live = treeatlas::CurrentTreeLattice();
+    if (live.tile != lat.tile || live.scan != lat.scan || live.candMax != lat.candMax) {
+      ok = false;
+      why += Format(" | shaders compiled for lattice %d/%d/%d but the assets say %d/%d/%d",
+                    live.tile, live.scan, live.candMax, lat.tile, lat.scan, lat.candMax);
+    }
+  }
+  // The per-biome thinning on that lattice: what the Environment tab's
+  // densityStats predicts is what PackBiomeTable packs, so print it where a
+  // "the forest is thinner than the page" report can be checked against.
+  for (const biomes::BiomeDef& b : set.biomes) {
+    const uint32_t q = biomes::TreeChanceQ16(b, tile);
+    if (q == 0) continue;
+    // trees/ha = chance * (100 m / tile m)^2; tile m = tile / vpm.
+    const double tileM = (double)tile / kVoxelsPerMetre;
+    const double perHa = (q / 65536.0) * (100.0 / tileM) * (100.0 / tileM);
+    std::printf("tree-atlas:   %-8s tile %5.1f m density %3d%% -> chance %5u/65536 on "
+                "the %d-vox lattice (~%.0f trees/ha)\n",
+                b.name.c_str(), b.treeTileM, b.treeDensity, q, tile, perHa);
   }
 
   // ---- 2. every run resolved, and the metadata is TRUE --------------------
@@ -212,9 +239,10 @@ Status GateTreeAtlas(Ctx& c, std::string& detail) {
   }
 
   detail = Format("%d species, %zu runs, %zu voxels, %.2f MiB, reach<=%d "
-                  "(bound %d), hash %s%s", atlas.speciesCount, runs, voxels,
+                  "(bound %d), lattice %d vox scan +-%d cands %d, hash %s%s",
+                  atlas.speciesCount, runs, voxels,
                   atlas.Bytes() / 1048576.0, atlas.maxReachXZ, bound,
-                  got.c_str(), why.c_str());
+                  lat.tile, lat.scan, lat.candMax, got.c_str(), why.c_str());
   std::printf("tree-atlas: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
   return ok ? Status::Pass : Status::Fail;
 }

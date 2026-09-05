@@ -1,6 +1,7 @@
 #include "sim/biomes.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
@@ -8,6 +9,8 @@
 #include <unordered_map>
 
 #include <nlohmann/json.hpp>
+
+#include "sim/world.h"   // kVoxelsPerMetre: the tree lattice is in voxels
 
 namespace fs = std::filesystem;
 using nlohmann::json;
@@ -232,6 +235,34 @@ bool LoadBiomeSet(const std::string& assetDir, const std::vector<MaterialDef>& m
 const BiomeDef* BiomeById(const BiomeSet& set, int id) {
   for (const BiomeDef& b : set.biomes) if (b.index == id) return &b;
   return nullptr;
+}
+
+int TreeTileVox(const BiomeDef& b) {
+  // The same rounding worldmap.cpp's Vox() applies to every authored metre.
+  const int v = static_cast<int>(std::lround(b.treeTileM * kVoxelsPerMetre));
+  return std::max(kTreeTileFloorVox, v);
+}
+
+int FinestTreeTileVox(const BiomeSet& set) {
+  int best = 0;
+  for (const BiomeDef& b : set.biomes) {
+    if (b.treeDensity <= 0 || b.trees.empty()) continue;   // grows nothing: no vote
+    const int t = TreeTileVox(b);
+    if (best == 0 || t < best) best = t;
+  }
+  return best == 0 ? kTreeTileDefaultVox : best;
+}
+
+uint32_t TreeChanceQ16(const BiomeDef& b, int latticeVox) {
+  const int density = std::clamp(b.treeDensity, 0, 100);
+  if (density == 0 || b.trees.empty()) return 0u;
+  const int64_t T = std::max(1, latticeVox);
+  const int64_t tile = std::max<int64_t>(T, TreeTileVox(b));   // never finer than the lattice
+  // density/100 * (T/tile)^2 * 65536, rounded, all in i64: density <= 100,
+  // T^2 <= 512^2, so the numerator stays under 2^45.
+  const int64_t num = static_cast<int64_t>(density) * T * T * 65536 + 50 * tile * tile;
+  const int64_t den = 100 * tile * tile;
+  return static_cast<uint32_t>(std::min<int64_t>(65536, num / den));
 }
 
 int ValidateBiomeSet(const BiomeSet& set, std::vector<std::string>& out) {

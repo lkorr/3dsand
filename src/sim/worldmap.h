@@ -128,8 +128,9 @@ enum : uint32_t {
   kB_SkinDepth = 2,       // cells of skin, >= 1
   kB_PatchThreshold = 3,  // 0..255 gate on the biome's patch field; 0 = no mask
   kB_PatchCellLog2 = 4,   // log2 of the patch field's cell, in voxels
-  kB_TreeTileVox = 5,     // authored tree tile (informational; TREE_TILE is global)
-  kB_TreeDensity = 6,     // percent of tree tiles that grow a tree
+  kB_TreeTileVox = 5,     // authored tree tile, voxels (the page's number; the
+                          // shader places on ONE lattice -- see kB_TreeChanceQ16)
+  kB_TreeDensity = 6,     // authored percent of the biome's OWN tiles (informational)
   kB_CoverCount = 7,
   kB_CoverOff = 8,        // word offset of this biome's first cover row
   kB_CaveThreshold1 = 9,  // near-surface cave band gate (0..255)
@@ -141,16 +142,25 @@ enum : uint32_t {
                           // or a plant above the old fixed margin is never
                           // written by a skipped chunk and sits above the far
                           // field's flagged top (far-fog gate, 2026-09-04)
-  // 14..15 reserved
-  kCoverRowWords = 8,
+  // P-D (docs/PLAN_environment_truth.md): the biome's thinning chance on the
+  // world's ONE tree lattice, Q16 (65536 = every lattice tile). Computed by
+  // biomes.h TreeChanceQ16 from density and tile against the finest authored
+  // tile, so trees per hectare match the page's densityStats by construction.
+  // This is the word treeInfoAt rolls against; kB_TreeDensity is not read.
+  kB_TreeChanceQ16 = 14,
+  // 15 reserved
+  kCoverRowWords = 12,
   kC_Mat = 0,
   kC_Head = 1,
   kC_Chance = 2,          // 1 in N surface columns; 0 = row is off
   kC_HeightVox = 3,       // >= 1
   kC_MinY = 4,            // -1 = unbounded (stored as u32, read as i32)
   kC_MaxY = 5,
-  kC_MaxSlope = 6,        // Q8; 1024 = unbounded
+  kC_MaxSlope = 6,        // Q8; 0 or >= 1024 = unbounded
   kC_PatchThreshold = 7,  // per-row extra gate on the biome patch field
+  kC_NearWaterMax = 8,    // voxels from a pond rim, -1 = unbounded (P-D)
+  kC_NearWaterMin = 9,    // at least this many voxels from a rim, 0 = off
+  // 10..11 reserved
 };
 // kB_Flags bits. These replace the `biome == B_DESERT` / `== B_PINE` tests
 // that used to gate whole blocks of genCellIn on a hard-coded id.

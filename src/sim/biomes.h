@@ -152,4 +152,31 @@ int ValidateBiomeSet(const BiomeSet& set, std::vector<std::string>& out);
 /** Find a biome by engine id; nullptr if the set has no file for it. */
 const BiomeDef* BiomeById(const BiomeSet& set, int id);
 
+// ---- THE ONE TREE LATTICE (docs/PLAN_environment_truth.md P-D) -------------
+// Every biome authors its own `trees.tile`, but worldgen scans ONE lattice:
+// a per-biome lattice would need a per-biome candidate scan, and the column
+// scan looks at tiles whose biome it has not yet paid to know. So the world's
+// lattice is the FINEST authored spacing among the biomes that grow trees at
+// all, and each biome is THINNED on that lattice to the density its page
+// predicts: chance_b = density_b * (T / tile_b)^2, in Q16 (worldmap.cpp
+// PackBiomeTable, kB_TreeChanceQ16). Trees per hectare then match the
+// Environment tab's densityStats by construction; only the jitter pattern
+// differs from what a coarser lattice would draw.
+//
+// The floor is the tuner schema's minimum (16 vox = 1.6 m); a biome with
+// density 0 does not vote, so an ocean at 14.4 m never coarsens a forest.
+inline constexpr int kTreeTileFloorVox = 16;
+inline constexpr int kTreeTileDefaultVox = 144;   // no biome grows trees
+/** The lattice, in voxels, from the loaded set. Pure; both packers call it. */
+int FinestTreeTileVox(const BiomeSet& set);
+/** `trees.tile` of one biome, in voxels, as the packer rounds it. */
+int TreeTileVox(const BiomeDef& b);
+/**
+ * The per-biome thinning chance on the shared lattice, Q16 (65536 = every
+ * tile). Integer arithmetic on purpose: it is packed into the worldMap buffer
+ * and read by the shader, so it is rule-1 state that must not depend on a
+ * host's float rounding.
+ */
+uint32_t TreeChanceQ16(const BiomeDef& b, int latticeVox);
+
 }  // namespace biomes

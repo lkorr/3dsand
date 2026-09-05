@@ -491,7 +491,6 @@ SPEC = [
     ("worldgen", "curveDesert7", "TUNE_CURVE_DESERT7", "i", 12288),
     ("worldgen", "curveDesert8", "TUNE_CURVE_DESERT8", "i", 16384),
     ("worldgen", "biomeBlend", "TUNE_BIOME_BLEND", "i", 18),
-    ("worldgen", "treeTile", "TUNE_TREE_TILE", "i", 144),
     ("worldgen", "autumnFraction", "TUNE_AUTUMN_FRACTION", "u", 5),
     ("worldgen", "pondTile", "TUNE_POND_TILE", "i", 448),
     ("worldgen", "pondChance", "TUNE_POND_CHANCE", "u", 4),

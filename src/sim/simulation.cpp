@@ -26,6 +26,12 @@ bool Simulation::Init(const rhi::Device& device, World& world,
   shaderDir_ = shaderDir;
   rhi::Queue queue = device.GetQueue();
 
+  // The tree lattice the atlas was loaded against becomes the TREE_TILE /
+  // TREE_SCAN / TREE_CAND_MAX prelude constants of every shader compiled from
+  // here on (gpu/resources.cpp ShaderConstantPrelude). Set BEFORE the first
+  // LoadShader below, and it stays set for F5 reloads and --shader-stats.
+  treeatlas::SetCurrentTreeLattice(trees.lattice);
+
   // The baked tree atlas. Sized to what the assets actually hold rather than to
   // a ceiling constant: it is load-time asset data, it never grows, and the
   // buffer is created BEFORE the bind groups below because it is one of their

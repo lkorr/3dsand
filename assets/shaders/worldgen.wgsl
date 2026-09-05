@@ -1308,6 +1308,16 @@ const TA_H_MAX_REACH     : u32 = 4u;
 const TA_H_MAX_ABOVE     : u32 = 5u;
 const TA_H_BIOME_TABLE   : u32 = 6u;
 const TA_H_SPECIES_DIR   : u32 = 7u;
+const TA_H_COND_TABLE    : u32 = 9u;   // biome x species placement conditions
+// One row per (biome, species): the biome file's tree-row `conditions`
+// (treeatlas.h kCondWords). Voxels and Q8, -1 = unbounded where it says so.
+const TA_COND_WORDS      : u32 = 8u;
+const TA_C_MIN_Y          : u32 = 0u;
+const TA_C_MAX_Y          : u32 = 1u;
+const TA_C_MAX_SLOPE      : u32 = 2u;   // 0 or >= 1024 = unbounded
+const TA_C_NEAR_WATER_MAX : u32 = 3u;   // -1 = unbounded
+const TA_C_NEAR_WATER_MIN : u32 = 4u;   // 0 = off
+const TA_C_PATCH_THRESH   : u32 = 5u;   // 0 = off
 
 const TA_SPECIES_WORDS : u32 = 24u;
 const TA_S_VARIANT_DIR : u32 = 0u;
@@ -1397,7 +1407,8 @@ const WM_B_CAVE_T2       : u32 = 10u;
 const WM_B_SED_MAX       : u32 = 11u;
 const WM_B_FLAGS         : u32 = 12u;
 const WM_B_MAX_COVER_H   : u32 = 13u;
-const WM_C_WORDS         : u32 = 8u;
+const WM_B_TREE_CHANCE_Q16 : u32 = 14u;   // thinning on the ONE tree lattice, Q16
+const WM_C_WORDS         : u32 = 12u;
 const WM_C_MAT           : u32 = 0u;
 const WM_C_HEAD          : u32 = 1u;
 const WM_C_CHANCE        : u32 = 2u;
@@ -1406,6 +1417,8 @@ const WM_C_MIN_Y         : u32 = 4u;
 const WM_C_MAX_Y         : u32 = 5u;
 const WM_C_MAX_SLOPE     : u32 = 6u;
 const WM_C_PATCH_THRESH  : u32 = 7u;
+const WM_C_NEAR_WATER_MAX : u32 = 8u;   // voxels from a pond rim, -1 = unbounded
+const WM_C_NEAR_WATER_MIN : u32 = 9u;   // at least this far from a rim, 0 = off
 const WM_BF_GROUND_FLORA : u32 = 1u;
 const WM_BF_CACTI        : u32 = 2u;
 const WM_BF_SAND_CAP     : u32 = 4u;
@@ -1611,12 +1624,19 @@ fn mapBiomeAt(x : i32, z : i32, seed : u32) -> u32 {
 }
 
 // Placement is per TREE_TILE XZ tile: hash the tile, and it either holds one
-// tree or none. The tile has to be at least as wide as a canopy or trees
-// overlap into mush. Some overlap is good — that is what closes a canopy — but
-// it has to be overlap, not merger.
-const TREE_TILE : i32 = TUNE_TREE_TILE;         // ~14 m between trunk sites
-// How many tiles out to search. See the NINE derivation at TreeCands.
-const TREE_SCAN : i32 = 2;
+// tree or none. Some overlap is good — that is what closes a canopy — but it
+// has to be overlap, not merger, and each biome decides how much it gets.
+//
+// ONE LATTICE, THINNED PER BIOME (docs/PLAN_environment_truth.md P-D).
+// TREE_TILE, TREE_SCAN and TREE_CAND_MAX are PRELUDE CONSTANTS now, derived at
+// load (sim/treeatlas.h TreeLattice): the tile is the FINEST `trees.tile` any
+// tree-growing biome authors, the scan and the candidate cap follow from it
+// and the atlas's widest reach. A biome authored coarser than the lattice is
+// thinned on it to its own density — WM_B_TREE_CHANCE_Q16, rolled in
+// treeInfoAt — so trees per hectare are what its page predicts and only the
+// jitter pattern differs. A per-biome lattice was rejected on purpose: the
+// candidate scan below looks at tiles whose biome it has not yet paid to
+// know, so every column has to agree on where the tiles are.
 //
 // Everything is a pure function of (tile coords, seed) — no state, no
 // scattering pass — so a tree straddling a chunk border generates identically
@@ -1679,6 +1699,67 @@ fn treeSite(tx : i32, tz : i32, seed : u32) -> TreeSite {
   return s;
 }
 
+// ---- distance to water, for the authored `nearWater` conditions -----------
+// How many whole voxels of dry ground lie between column (x,z) and the nearest
+// disc-pond rim within `band` voxels: 0 = the first column outside the rim,
+// -1 = no rim within the band, or the column is inside a disc (that is water,
+// not near it -- pondAt's job). The same 2x2 tile walk as pondNear, with the
+// band supplied by the caller instead of the berm's: a tree row's "within 6 m
+// of water" is wider than any shore band, and pondNear sits inside the height
+// mirror where a second band would have to be mirrored for nothing. Costs up
+// to four pondInfo (a hash each) and is only reached by a row that authors a
+// water condition, so an unconditioned forest pays nothing here.
+fn waterDistAt(x : i32, z : i32, seed : u32, band : i32) -> i32 {
+  if (band <= 0) { return -1; }
+  // The 2x2 walk assumes a disc in a NON-adjacent tile cannot reach: true
+  // while the band is under half a tile, so clamp rather than scan 3x3.
+  let b = min(band, POND_TILE / 2);
+  let pt = fdiv(x, POND_TILE);
+  let pz = fdiv(z, POND_TILE);
+  let lx = fmodp(x, POND_TILE);
+  let lz = fmodp(z, POND_TILE);
+  let sx = select(select(0, 1, lx >= POND_TILE - b), -1, lx < b);
+  let sz = select(select(0, 1, lz >= POND_TILE - b), -1, lz < b);
+  var best = 0x7FFFFFFF;
+  var bestR = 0;
+  for (var iz = 0; iz < 2; iz++) {
+    let oz = select(0, sz, iz == 1);
+    if (iz == 1 && sz == 0) { continue; }
+    for (var ix = 0; ix < 2; ix++) {
+      let ox = select(0, sx, ix == 1);
+      if (ix == 1 && sx == 0) { continue; }
+      let p = pondInfo(pt + ox, pz + oz, seed);
+      if (!p.present) { continue; }
+      let dx = x - p.cx;
+      let dz = z - p.cz;
+      let d2 = dx * dx + dz * dz;
+      if (d2 <= p.r * p.r) { return -1; }
+      let outer = p.r + b;
+      if (d2 > outer * outer) { continue; }
+      if (d2 < best) { best = d2; bestR = p.r; }
+    }
+  }
+  if (best == 0x7FFFFFFF) { return -1; }
+  // Bisection on the squared radius, as pondNear does it: the smallest k with
+  // d2 <= (r+k)^2, minus one. Integer throughout (rule 1).
+  var lo = 0;
+  var hi = b;
+  for (var i = 0; i < 10; i++) {
+    if (lo >= hi) { break; }
+    let mid = (lo + hi) / 2;
+    let rr = bestR + mid;
+    if (best <= rr * rr) { hi = mid; } else { lo = mid + 1; }
+  }
+  return max(lo - 1, 0);
+}
+// One compare per authored bound. `d` is waterDistAt's answer; a row with
+// neither bound never calls it.
+fn nearWaterOk(d : i32, nearMax : i32, nearMin : i32) -> bool {
+  if (nearMax >= 0 && (d < 0 || d >= nearMax)) { return false; }
+  if (nearMin > 0 && d >= 0 && d < nearMin) { return false; }
+  return true;
+}
+
 // The rest of treeInfo, given a site and the LAND at that site.
 //
 // `land` is passed in rather than sampled here because the caller has already
@@ -1709,14 +1790,17 @@ fn treeInfoAt(s : TreeSite, land : Land, seed : u32) -> Tree {
   // (The spawn clearing is checked AFTER the species draw, where the crown's
   // real width is known — see the note at that test.)
 
-  // Density by biome, from the biome's record (assets/biomes/<name>.json
-  // `trees.density`, percent of tiles): forest is nearly every tile, meadow a
-  // sparse clearing, desert the occasional dead bush. The TILE is global
-  // (TREE_TILE): a per-biome tile would need a per-biome lattice, and the 5x5
-  // candidate scan assumes one lattice for every column it looks at.
+  // Density by biome, from the biome's record: its authored `trees.density`
+  // and `trees.tile` folded into ONE Q16 chance on the world's shared lattice
+  // (worldmap.h kB_TreeChanceQ16; the derivation is at the TREE_TILE note
+  // above). Forest at 5.6 m / 48 % rolls 0.48 per tile; a meadow at 14.4 m /
+  // 22 % rolls 0.033 per fine tile, which is the same 22 % of its own coarse
+  // tiles by area. The top 16 bits of the site hash: bits 3.. and 9.. are
+  // the trunk jitter, and for any tile up to 256 voxels the three slices are
+  // disjoint.
   let biome = biomeAt(t.wx, t.wz, seed);
-  let roll = (hsh >> 17u) % 100u;
-  let chance = wmBiome(biome, WM_B_TREE_DENSITY);
+  let roll = hsh >> 16u;
+  let chance = wmBiome(biome, WM_B_TREE_CHANCE_Q16);
   if (roll >= chance) { return t; }
 
   // ---- WHICH SPECIES: a weighted draw from the biome's own table -----------
@@ -1751,6 +1835,36 @@ fn treeInfoAt(s : TreeSite, land : Land, seed : u32) -> Tree {
   if (maxY >= 0 && h > maxY) { return t; }
   let maxSlope = i32(taSpecies(sp, TA_S_MAX_SLOPE));
   if (maxSlope > 0 && land.slope > maxSlope) { return t; }
+  // ---- THE BIOME'S OWN ROW CONDITIONS (assets/biomes/<name>.json trees.
+  // species[].conditions), per (biome, species), from the atlas's condition
+  // table. The same shape as the species gates and the same rule: a gated-out
+  // pick grows nothing. One compare each on numbers already in hand; the
+  // water distance is the one that costs a lookup, and only a row that
+  // authors it pays.
+  {
+    let cb = treeAtlas[TA_H_COND_TABLE] +
+             (biome * u32(ns) + u32(sp)) * TA_COND_WORDS;
+    let rMinY = bitcast<i32>(treeAtlas[cb + TA_C_MIN_Y]);
+    let rMaxY = bitcast<i32>(treeAtlas[cb + TA_C_MAX_Y]);
+    if (rMinY >= 0 && h < rMinY) { return t; }
+    if (rMaxY >= 0 && h > rMaxY) { return t; }
+    let rSlope = i32(treeAtlas[cb + TA_C_MAX_SLOPE]);
+    if (rSlope > 0 && rSlope < 1024 && land.slope > rSlope) { return t; }
+    let nwMax = bitcast<i32>(treeAtlas[cb + TA_C_NEAR_WATER_MAX]);
+    let nwMin = i32(treeAtlas[cb + TA_C_NEAR_WATER_MIN]);
+    if (nwMax >= 0 || nwMin > 0) {
+      let d = waterDistAt(t.wx, t.wz, seed, max(nwMax, nwMin));
+      if (!nearWaterOk(d, nwMax, nwMin)) { return t; }
+    }
+    // The biome's patch field, sampled at the trunk with a tree-only offset
+    // so a stand of this species does not line up with a cover row's lattice.
+    let rPatch = i32(treeAtlas[cb + TA_C_PATCH_THRESH]);
+    if (rPatch > 0) {
+      let pLog2 = wmBiome(biome, WM_B_PATCH_LOG2);
+      let pm = vnoise2d(t.wx + 307, t.wz - 911, pLog2, seed ^ 0xD5F7u).n >> 6;
+      if (pm <= rPatch) { return t; }
+    }
+  }
 
   // ---- WHICH VARIANT, AND HOW IT SITS --------------------------------------
   // variants x 4 rotations x mirror is 24 appearances from three baked trees,
@@ -1871,23 +1985,26 @@ fn segDist2(px : i32, py : i32, pz : i32,
 // so the per-cell loop typically runs zero or one iterations under open sky and
 // one or two under a closed canopy.
 //
-// NINE IS ENOUGH, and it is checked rather than assumed. A site sits in the
-// middle half of its tile, so tile `t` puts its trunk in
+// TREE_CAND_MAX IS ENOUGH, and it is derived rather than assumed. A site sits
+// in the middle half of its tile, so tile `t` puts its trunk in
 // [TILE*t + TILE/4, TILE*t + 3*TILE/4); a tile can reach column x only if that
 // range meets [x - reach, x + reach], which spans 2*reach + TILE/2 - 1 voxels
 // of tile origin and therefore covers at most (2*reach + TILE/2 - 1)/TILE + 1
-// tiles per axis. At TILE 144 that is three per axis — nine — for any species
-// narrower than 180 voxels. `reach` is now ASSET DATA, so LoadTreeAtlas
-// (src/sim/treeatlas.h MaxReachForNineCandidates) REFUSES an atlas that would
-// break the derivation: past the bound the shader silently drops a candidate,
-// and the symptom is a canopy missing from some columns and present on others.
-const TREE_CAND_MAX : i32 = 9;
+// tiles per axis; the cap is that count squared, and TREE_SCAN is the number
+// of tiles per side whose trunk range can meet the window at all. At a tile
+// of 144 and the great oak's 115 that was three per axis — nine; at the
+// forest's 56 it is five — twenty-five. Both `reach` and the tile are ASSET
+// DATA, so LoadTreeAtlas (src/sim/treeatlas.h TreeLatticeFor) derives all
+// three numbers at load, hands them to every shader as prelude constants,
+// and REFUSES an atlas past kTreeCandPerAxisCap: past the cap the shader
+// would silently drop a candidate, and the symptom is a canopy missing from
+// some columns and present on others.
 
-// The compact per-column form. Deliberately NINE WORDS: this array lives on the
-// function stack of genChunk and a wide struct here is scratch traffic on every
-// worldgen thread. Everything a per-cell test needs and nothing it does not —
-// the species metadata stays in the atlas, where the two scans that want it
-// (undergrowth, far canopy) read it directly.
+// The compact per-column form. Deliberately EIGHT WORDS per candidate: this
+// array lives on the function stack of genChunk and a wide struct here is
+// scratch traffic on every worldgen thread. Everything a per-cell test needs
+// and nothing it does not — the species metadata stays in the atlas, where
+// the two scans that want it (undergrowth, far canopy) read it directly.
 struct TreeCand {
   wx     : i32,
   wz     : i32,
@@ -1902,7 +2019,7 @@ struct TreeCand {
 struct TreeCands {
   n   : i32,
   top : i32,             // highest vtop in the set; far below any y when empty
-  t   : array<TreeCand, 9>,  // TREE_CAND_MAX; WGSL wants a literal here
+  t   : array<TreeCand, TREE_CAND_MAX>,   // a prelude const, so it sizes at load
 };
 
 // Rotate a trunk-relative offset into the variant's own grid. Four quarter
@@ -1933,9 +2050,9 @@ fn treeCandsInto(c : ptr<function, TreeCands>, x : i32, z : i32, seed : u32) {
   for (var oz = -TREE_SCAN; oz <= TREE_SCAN; oz++) {
     for (var ox = -TREE_SCAN; ox <= TREE_SCAN; ox++) {
       // Horizontal reject on the trunk site alone (one hash), against the
-      // WIDEST species in the atlas. A +-2 tile's trunk is at least
-      // TILE*2 - TILE/4 away, so the outer ring is rejected outright and only
-      // a few of the 25 tiles reach the noise queries below.
+      // WIDEST species in the atlas. Only the tiles whose trunk can reach
+      // this column go on to the noise queries below; on a coarse lattice
+      // that is the inner ring, on a fine one most of the scan.
       let s = treeSite(tx + ox, tz + oz, seed);
       if (abs(x - s.wx) > maxReach || abs(z - s.wz) > maxReach) { continue; }
       let t = treeInfoAt(s, landAt(s.wx, s.wz, seed), seed);
@@ -1955,7 +2072,7 @@ fn treeCandsInto(c : ptr<function, TreeCands>, x : i32, z : i32, seed : u32) {
       let cnt = treeAtlas[ci + 1u];
       if (cnt == 0u) { continue; }
 
-      if ((*c).n >= TREE_CAND_MAX) { continue; }   // see the NINE derivation
+      if ((*c).n >= TREE_CAND_MAX) { continue; }   // see the derivation at TreeCands
       var e : TreeCand;
       e.wx = t.wx; e.wz = t.wz; e.base = t.base;
       e.ny = i32(treeAtlas[t.varOff + TA_V_NY]);
@@ -2320,7 +2437,7 @@ fn cactusAt(x : i32, y : i32, z : i32, seed : u32) -> u32 {
 // everything the placement rule needs — cover, and the distance to the nearest
 // trunk (mushrooms ring tree bases, which is the cheapest high-value detail
 // available here). Calling treeCanopyAt separately would have doubled the scan
-// for the same answer. The scan is bounded at (2*TREE_SCAN+1)^2 = 25 tiles and
+// for the same answer. The scan is bounded at (2*TREE_SCAN+1)^2 tiles and
 // runs for exactly one Y per column (the y == h + 1 gate), so it costs the same
 // order as the flower block it sits next to.
 //
@@ -2730,6 +2847,7 @@ fn caveFloraAt(b : CaveBands, x : i32, y : i32, z : i32, seed : u32) -> u32 {
 
 struct Col {
   h           : i32,         // ground height, after pool and pond carving
+  slope       : i32,         // coarse landform gradient, Q8 (LandCol.slope)
   sed         : i32,         // loose wedge thickness at this column, 0 if none
   biome       : u32,
   pond        : i32,         // disc-pond water surface Y, or -1
@@ -2885,6 +3003,8 @@ fn plantColumnAt(x : i32, z : i32, seed : u32, biome : u32) -> PlantCol {
 
 struct LandCol {
   h           : i32,         // GROUND. The contract above.
+  slope       : i32,         // Land.slope at this column: the coarse landform
+                             // gradient, Q8, for the per-row maxSlope gates
   sed         : i32,         // loose wedge thickness INSIDE h, 0 where overridden
   pond        : i32,         // disc-pond water surface Y, or -1
   pw          : vec2<i32>,   // pondAt's (bowl floor, surface)
@@ -2913,6 +3033,7 @@ fn landColumnBare(x : i32, z : i32, seed : u32) -> LandCol {
   // rather than through a second copy of the constant.
   if (T.labMode != 0u) {
     L.h = LAB_SLAB_Y;
+    L.slope = 0;
     L.sed = 0;
     L.inPoolFloor = true;
     L.inRim = true;
@@ -2934,6 +3055,7 @@ fn landColumnBare(x : i32, z : i32, seed : u32) -> LandCol {
   // chunks awake at tick 120 against 7 with the wedge disabled entirely, all of
   // them tarn banks and the rock under them.
   let land = landAt(x, z, seed);
+  L.slope = land.slope;
   let bed = land.h - land.sed;
 
   // ---- authored origin-area set pieces (absolute world coords) ----
@@ -3094,6 +3216,7 @@ fn genColumn(x : i32, z : i32, seed : u32) -> Col {
   if (T.labMode != 0u) {
     var lab : Col;
     lab.h = LAB_SLAB_Y;
+    lab.slope = 0;
     lab.sed = 0;
     lab.biome = 0u;
     lab.pond = -1;
@@ -3154,6 +3277,7 @@ fn genColumn(x : i32, z : i32, seed : u32) -> Col {
 
   var col : Col;
   col.h = h;
+  col.slope = L.slope;
   col.sed = L.sed;
   col.biome = biome;
   col.pond = L.pond;
@@ -3688,14 +3812,23 @@ fn genCellIn(col : Col,
       if (chance == 0u) { continue; }
       let hRow = hash3(seed ^ (0xC0E0u + i * 0x9E37u), bitcast<u32>(x), bitcast<u32>(z));
       if ((hRow % chance) != 0u) { continue; }
-      // Conditions: altitude band and steepness, per row, like a species'.
+      // Conditions: altitude band, steepness and water distance, per row,
+      // like a species'. One compare each on the column's own numbers; the
+      // water distance is the one that costs a lookup (waterDistAt, up to
+      // four pond hashes) and only a row that authors a bound pays it, AFTER
+      // the chance roll so an unlucky column pays nothing.
       let minY = bitcast<i32>(wmCover(biome, i, WM_C_MIN_Y));
       let maxY = bitcast<i32>(wmCover(biome, i, WM_C_MAX_Y));
       if (minY >= 0 && h < minY) { continue; }
       if (maxY >= 0 && h > maxY) { continue; }
-      // `maxSlope` (WM_C_MAX_SLOPE) is packed but NOT enforced yet: Col has
-      // no slope (LandCol is inside the height mirror and grows a field in
-      // P4, when landform lands). Every authored row is unbounded today.
+      let rSlope = i32(wmCover(biome, i, WM_C_MAX_SLOPE));
+      if (rSlope > 0 && rSlope < 1024 && col.slope > rSlope) { continue; }
+      let nwMax = bitcast<i32>(wmCover(biome, i, WM_C_NEAR_WATER_MAX));
+      let nwMin = i32(wmCover(biome, i, WM_C_NEAR_WATER_MIN));
+      if (nwMax >= 0 || nwMin > 0) {
+        let d = waterDistAt(x, z, seed, max(nwMax, nwMin));
+        if (!nearWaterOk(d, nwMax, nwMin)) { continue; }
+      }
       // The patch mask: the biome's threshold, raised further by the row's.
       let thresh = max(bThresh, i32(wmCover(biome, i, WM_C_PATCH_THRESH)));
       if (thresh > 0) {

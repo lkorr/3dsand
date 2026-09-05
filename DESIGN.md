@@ -7251,10 +7251,20 @@ the one model modders already read (PLAN_biomes.md §2 has the survey).
   (binding 31, both sim layouts; `src/sim/worldmap.h` is the layout) and
   `worldgen.wgsl` reads it through `wmBiome()/wmCover()` for: the ground skin
   and its depth, the wedge's topsoil (`cover.skin/skinDepth/subsoil`), the
-  tree DENSITY (`trees.density`; the tile stays the global `worldgen.treeTile`
-  because the 5x5 candidate scan assumes one lattice), the per-biome cover
-  stack (`cover.plants[]`, rolled in order, first hit wins, one hash salt per
-  row, patch-masked through `vnoise2d`), the cave thresholds
+  tree spacing and density (`trees.tile` + `trees.density`, P-D of
+  `PLAN_environment_truth.md`, 2026-09-05: worldgen scans ONE lattice, the
+  FINEST tile among the biomes that grow trees, and thins each biome on it to
+  `density × (T/tile)²` in Q16 — `kB_TreeChanceQ16` — so trees per hectare
+  are the page's number by construction; `TREE_TILE`/`TREE_SCAN`/
+  `TREE_CAND_MAX` are load-time prelude constants from `treeatlas.h
+  TreeLatticeFor`, `worldgen.treeTile` is gone, and `LoadTreeAtlas` refuses a
+  crown wider than the 5x5 candidate cap on that lattice), the per-row
+  `conditions` on tree and cover rows (`minY`/`maxY`/`maxSlope`/
+  `nearWaterMax`/`nearWaterMin`/`patchThreshold`, packed per (biome, species)
+  into the atlas's condition table and onto the cover row; `nearWater` is
+  `waterDistAt`, a pond-rim distance with the row's own band), the per-biome
+  cover stack (`cover.plants[]`, rolled in order, first hit wins, one hash
+  salt per row, patch-masked through `vnoise2d`), the cave thresholds
   (`caves.features` near_surface/deep), and three flags that replaced the
   hard-coded `biome == B_DESERT/B_PINE` gates — `cover.groundFlora` (the
   canopy-inverted undergrowth + flower layer), `cover.cacti`, `cover.sandCap`.

@@ -2901,7 +2901,9 @@ struct Tuning {
         curveDesert3 = -4096, curveDesert4 = 0, curveDesert5 = 4096,
         curveDesert6 = 8192, curveDesert7 = 12288, curveDesert8 = 16384;
     int biomeBlend = 18;
-    int treeTile = 144;
+    // There is no `treeTile` any more: the tree lattice is the finest
+    // `trees.tile` among assets/biomes/*.json (biomes.h FinestTreeTileVox),
+    // and each biome thins on it to its own density. One authoring surface.
     int autumnFraction = 5;   // 1-in-N broadleaves turn autumn
     int pondTile = 448, pondChance = 4, pondRadiusMin = 48, pondRadiusSpan = 32;
     // Steepest ground a tarn may sit on, |dh/dx|+|dh/dz| in Q8 (256 = the

@@ -1,17 +1,28 @@
 #include "sim/treeatlas.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <unordered_map>
 
-#include "sim/tuning.h"   // worldgen.treeTile, for the candidate-set bound
 #include "sim/world.h"    // kVoxelsPerMetre, for the atlas bake-scale check
 
 namespace fs = std::filesystem;
 using namespace treeatlas;
+
+namespace treeatlas {
+namespace {
+TreeLattice& LatticeSlot() {
+  static TreeLattice g;
+  return g;
+}
+}  // namespace
+const TreeLattice& CurrentTreeLattice() { return LatticeSlot(); }
+void SetCurrentTreeLattice(const TreeLattice& l) { LatticeSlot() = l; }
+}  // namespace treeatlas
 
 namespace {
 
@@ -228,7 +239,8 @@ bool LoadTreeAtlas(const std::string& dir, const std::vector<MaterialDef>& mats,
   const int biomeStride = 1 + ns;
   const int nb = static_cast<int>(set.biomes.size());
   out.biomeCount = nb;
-  int cursor = biomeTable + nb * biomeStride;
+  const int condTable = biomeTable + nb * biomeStride;
+  int cursor = condTable + nb * ns * kCondWords;
 
   std::vector<int> payloadBase(ns);
   for (int i = 0; i < ns; i++) {
@@ -245,6 +257,7 @@ bool LoadTreeAtlas(const std::string& dir, const std::vector<MaterialDef>& mats,
   W[kHBiomeTable] = static_cast<uint32_t>(biomeTable);
   W[kHSpeciesDir] = static_cast<uint32_t>(speciesDir);
   W[kHBiomeCount] = static_cast<uint32_t>(nb);
+  W[kHCondTable] = static_cast<uint32_t>(condTable);
 
   int unresolved = 0;
   for (int i = 0; i < ns; i++) {
@@ -359,25 +372,58 @@ bool LoadTreeAtlas(const std::string& dir, const std::vector<MaterialDef>& mats,
     row[0] = acc;
   }
 
+  // ---- condition table ------------------------------------------------------
+  // The biome file's per-row `conditions`, per (biome, species), in the units
+  // the shader compares against: ground Y in voxels, slope in Q8, water
+  // distance in voxels. A species the biome does not list gets the unbounded
+  // row; its weight is 0 above so it is never picked anyway.
+  for (int b = 0; b < nb; b++) {
+    const biomes::BiomeDef* def = nullptr;
+    for (const biomes::BiomeDef& d : set.biomes) if (d.index == b) def = &d;
+    for (int i = 0; i < ns; i++) {
+      uint32_t* c = W + condTable + (b * ns + i) * kCondWords;
+      biomes::Conditions cond;   // defaults: unbounded
+      if (def) {
+        for (const biomes::TreeRow& r : def->trees)
+          if (r.species == out.species[i].name) cond = r.cond;
+      }
+      auto vox = [](float metres) -> int32_t {
+        return static_cast<int32_t>(std::lround(metres * kVoxelsPerMetre));
+      };
+      c[kCMinY] = static_cast<uint32_t>(cond.minY);
+      c[kCMaxY] = static_cast<uint32_t>(cond.maxY);
+      c[kCMaxSlope] = static_cast<uint32_t>(std::clamp(cond.maxSlope, 0, 1024));
+      c[kCNearWaterMax] = static_cast<uint32_t>(cond.nearWaterMaxM < 0 ? -1 : vox(cond.nearWaterMaxM));
+      c[kCNearWaterMin] = static_cast<uint32_t>(std::max(0, vox(cond.nearWaterMinM)));
+      c[kCPatchThreshold] = static_cast<uint32_t>(std::clamp(cond.patchThreshold, 0, 255));
+    }
+  }
+
   W[kHMaxReach] = static_cast<uint32_t>(out.maxReachXZ);
   W[kHMaxAbove] = static_cast<uint32_t>(out.maxAbove);
   out.speciesCount = ns;
 
-  // THE CANDIDATE-SET BOUND (see treeatlas.h). worldgen keeps nine trees per
-  // column because the tile arithmetic says nine is enough, and that derivation
-  // reads the widest species' reach — which is now asset data. Refusing here is
-  // the only place the two can be held together: past the bound the shader
-  // silently DROPS a candidate, and the symptom is a canopy missing from some
-  // columns and present on others, which nothing else in the repo would notice.
+  // THE LATTICE AND ITS CANDIDATE-SET BOUND (see treeatlas.h). The lattice is
+  // the finest tile any tree-growing biome authors; the scan and the candidate
+  // cap follow from it and the widest species' reach -- which is asset data.
+  // Refusing here is the only place the two can be held together: past the
+  // cap the shader silently DROPS a candidate, and the symptom is a canopy
+  // missing from some columns and present on others, which nothing else in
+  // the repo would notice.
   {
-    const int tile = std::max(16, CurrentTuning().worldgen.treeTile);
-    const int bound = treeatlas::MaxReachForNineCandidates(tile);
-    if (out.maxReachXZ > bound) {
+    const int tile = biomes::FinestTreeTileVox(set);
+    out.lattice = TreeLatticeFor(tile, out.maxReachXZ);
+    if (out.lattice.perAxis > kTreeCandPerAxisCap) {
+      const int bound = MaxReachForCandidates(tile, kTreeCandPerAxisCap);
+      std::string finest = "?";
+      for (const biomes::BiomeDef& b : set.biomes)
+        if (b.treeDensity > 0 && !b.trees.empty() && biomes::TreeTileVox(b) == tile) finest = b.name;
       snprintf(buf, sizeof buf,
                "tree atlas: widest species reaches %d voxels, but worldgen's "
-               "nine-candidate set only holds up to %d at treeTile %d -- narrow "
-               "the crown or raise worldgen.treeTile\n",
-               out.maxReachXZ, bound, tile);
+               "candidate set only holds up to %d at the finest biome tree tile "
+               "(%d vox, biomes/%s.json trees.tile) -- narrow the crown, cap that "
+               "species' reach in the tree page, or widen that biome's tile\n",
+               out.maxReachXZ, bound, tile, finest.c_str());
       log += buf;
       return false;
     }
@@ -388,10 +434,12 @@ bool LoadTreeAtlas(const std::string& dir, const std::vector<MaterialDef>& mats,
            " -- the world will have no trees (run `node scripts/bake_trees.mjs`)\n";
   } else {
     snprintf(buf, sizeof buf,
-             "tree atlas: %d species, %d variants, %.2f MiB, reach %d, above %d%s\n",
+             "tree atlas: %d species, %d variants, %.2f MiB, reach %d, above %d; "
+             "lattice %d vox, scan +-%d, %d candidates%s\n",
              ns,
              [&] { int t = 0; for (auto& s : out.species) t += s.variants; return t; }(),
              out.Bytes() / 1048576.0, out.maxReachXZ, out.maxAbove,
+             out.lattice.tile, out.lattice.scan, out.lattice.candMax,
              unresolved ? " (WITH UNRESOLVED MATERIALS)" : "");
     log += buf;
   }

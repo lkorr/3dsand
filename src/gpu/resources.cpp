@@ -5,6 +5,7 @@
 #include <fstream>
 #include <sstream>
 
+#include "sim/treeatlas.h"   // CurrentTreeLattice: the TREE_* prelude consts
 #include "sim/tuning.h"
 #include "sim/world.h"
 
@@ -248,6 +249,18 @@ std::string ShaderConstantPrelude() {
   // scale-free. Emitted at full precision so it round-trips the f32 exactly.
   o.precision(9);
   o << "const VOXEL_METERS : f32 = " << kVoxelMeters << ";\n";
+  // The tree lattice (sim/treeatlas.h TreeLattice; docs/PLAN_environment_truth
+  // P-D): the finest authored biome tile, and the scan / candidate cap derived
+  // from it and the atlas's widest reach. LOAD-TIME ASSET DATA rather than a
+  // world.h constant -- Simulation::Init sets it from the atlas it uploads
+  // before the first LoadShader. Mirrored by scripts/tree_lattice.py for
+  // check_shaders.sh, which derives the same three numbers from the assets.
+  {
+    const treeatlas::TreeLattice& l = treeatlas::CurrentTreeLattice();
+    o << "const TREE_TILE : i32 = " << l.tile << ";\n";
+    o << "const TREE_SCAN : i32 = " << l.scan << ";\n";
+    o << "const TREE_CAND_MAX : i32 = " << l.candMax << ";\n";
+  }
   // The same number as an INTEGER reciprocal, for the sim/worldgen side. It has
   // to be integer and it has to come from here: everything worldgen authors in
   // metres (the whole tree and cactus size table) converts through it, and the

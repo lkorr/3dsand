@@ -72,6 +72,10 @@ bool PackBiomeTable(const biomes::BiomeSet& set, std::vector<uint32_t>& W,
     byId[b.index] = &b;
   }
   const auto& wg = CurrentTuning().worldgen;
+  // The one tree lattice every biome is thinned on (biomes.h). The tree atlas
+  // derives the same number for the shader's scan; both are pure functions of
+  // the set, so there is no ordering between the two loaders.
+  const int treeLattice = biomes::FinestTreeTileVox(set);
 
   W.assign(kHeaderWords, 0u);
   W[kHMagic] = kMagic;
@@ -89,8 +93,9 @@ bool PackBiomeTable(const biomes::BiomeSet& set, std::vector<uint32_t>& W,
     r[kB_SkinDepth] = U(std::max(1, b.skinDepth));
     r[kB_PatchThreshold] = U(std::clamp(b.patchThreshold, 0, 255));
     r[kB_PatchCellLog2] = U(std::clamp(b.patchCellLog2, 2, 12));
-    r[kB_TreeTileVox] = Vox(b.treeTileM);
+    r[kB_TreeTileVox] = U(biomes::TreeTileVox(b));
     r[kB_TreeDensity] = U(std::clamp(b.treeDensity, 0, 100));
+    r[kB_TreeChanceQ16] = biomes::TreeChanceQ16(b, treeLattice);
     // Cave thresholds: the biome's rows override the global knobs, which stay
     // the default so a biome that says nothing about caves keeps today's.
     int t1 = wg.caveThreshold1, t2 = wg.caveThreshold2;
@@ -127,6 +132,10 @@ bool PackBiomeTable(const biomes::BiomeSet& set, std::vector<uint32_t>& W,
       row[kC_MaxY] = U(c.cond.maxY);
       row[kC_MaxSlope] = U(std::clamp(c.cond.maxSlope, 0, 1024));
       row[kC_PatchThreshold] = U(std::clamp(c.cond.patchThreshold, 0, 255));
+      // Water distances: metres -> voxels, -1 stays "unbounded".
+      row[kC_NearWaterMax] = c.cond.nearWaterMaxM < 0
+          ? U(-1) : U(static_cast<int>(std::lround(c.cond.nearWaterMaxM * kVoxelsPerMetre)));
+      row[kC_NearWaterMin] = U(std::max(0, static_cast<int>(std::lround(c.cond.nearWaterMinM * kVoxelsPerMetre))));
       count++;
     }
     W[rec0 + static_cast<size_t>(i) * kBiomeRecWords + kB_CoverCount] = U(count);
