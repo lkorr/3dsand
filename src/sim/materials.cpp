@@ -385,6 +385,17 @@ static bool LoadMaterialsJson(const std::string& path, std::vector<MaterialDef>&
 
     d.rubble = m.value("rubble", "");
     d.molten = m.value("molten", "");
+    // The tariff base. Derived from density when not authored: a voxel of
+    // something heavy is worth more to conjure than a voxel of smoke, which is
+    // the right default for the long tail and wrong for exactly the materials
+    // a designer will author (gold, steel, blood) -- so those carry the key.
+    {
+      int32_t derived = d.gpu.density / 1000;
+      if (derived < 1) derived = 1;
+      if (derived > 12) derived = 12;
+      d.arcane = m.value("arcane", derived);
+      if (d.arcane < 0) d.arcane = 0;
+    }
     // Sound slots. The "sounds" object is the general form; the flat
     // "footstep" key predates it and is still honoured so no existing
     // materials.json has to be rewritten. The object wins when both appear —

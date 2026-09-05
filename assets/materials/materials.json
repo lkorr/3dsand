@@ -3,6 +3,7 @@
   "materials": [
     {
       "id": "stone",
+      "arcane": 2,
       "footstep": "path",
       "class": "solid",
       "density": 2600,
@@ -21,6 +22,7 @@
     },
     {
       "id": "wood",
+      "arcane": 2,
       "sounds": {
         "break": "branch"
       },
@@ -42,6 +44,7 @@
     },
     {
       "id": "sand",
+      "arcane": 1,
       "footstep": "path",
       "class": "powder",
       "absorb": {
@@ -81,6 +84,7 @@
     },
     {
       "id": "water",
+      "arcane": 1,
       "class": "liquid",
       "density": 1000,
       "hardness": 4,
@@ -155,6 +159,7 @@
     },
     {
       "id": "fire",
+      "arcane": 3,
       "class": "gas",
       "density": 3,
       "emission": 255,
@@ -206,6 +211,7 @@
     },
     {
       "id": "lava",
+      "arcane": 8,
       "class": "liquid",
       "density": 2800,
       "hardness": 6,
@@ -226,6 +232,7 @@
     },
     {
       "id": "acid",
+      "arcane": 6,
       "class": "liquid",
       "density": 1200,
       "hardness": 4,
@@ -274,6 +281,7 @@
     },
     {
       "id": "dirt",
+      "arcane": 1,
       "footstep": "path",
       "class": "powder",
       "absorb": {
@@ -544,6 +552,7 @@
     {
       "comment": "Blood. The `stain` block is what marks what it touches: at 90 per-mille a splash grabs the surfaces around it within a second or so, and `consume` 6 means roughly one stained voxel in 160 is eaten away per stain event, so blood slowly pits what it soaks without ever running away with itself (CLAUDE.md rule 2 — see DESIGN.md §6). The renderer picks blood's viscous shading (no ripple bands, a wet sheen, a smooth field normal so it does not read as gelatin cubes) off the authored moveEvery + opacity pair, not off a material ID — see isViscousLiquid in common.wgsl. The palette is LINEAR light like every material (the frame is tonemapped and gamma-encoded at the end), so these hexes look near-black in a colour picker and render as a dark blood red once lit; anything paler reads as pink paint next to the stain it leaves.",
       "id": "blood",
+      "arcane": 3,
       "class": "liquid",
       "density": 1050,
       "hardness": 4,
@@ -1111,6 +1120,7 @@
     },
     {
       "id": "bone",
+      "arcane": 5,
       "footstep": "path",
       "class": "solid",
       "density": 1200,
@@ -1137,6 +1147,7 @@
     },
     {
       "id": "steel",
+      "arcane": 12,
       "footstep": "stone",
       "class": "solid",
       "density": 7800,
@@ -2739,6 +2750,7 @@
     {
       "//": "ANATOMY (assets/editor/anatomy.js; DESIGN.md §7 'What is under the skin'). The human is no longer skin all the way through: a sidecar recipe paints its interior by depth -- skin, then this, then muscle, then bone -- so a cut face, a burn-through or a peeled limb in the tuner shows layers instead of more skin. Subcutaneous flesh: the pale layer one voxel under the skin. Enters the SAME burn chain as skin (reactions.json, 'flesh + tag:hot -> flesh_cooked') so a body burns through its layers on one clock; bone has no fire rules and survives by construction.",
       "id": "flesh",
+      "arcane": 4,
       "class": "solid",
       "density": 950,
       "hardness": 6,
@@ -2843,6 +2855,7 @@
     {
       "comment": "The dearest common matter (docs/PLAN_magic_grammar.md): the top of the arcane tariff, so making it is what kills alchemists. Never placed by worldgen; exists so the tongue has the word.",
       "id": "gold",
+      "arcane": 40,
       "footstep": "stone",
       "class": "solid",
       "density": 19300,

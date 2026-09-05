@@ -473,8 +473,15 @@ void Overlay::Draw(UIState& s) {
     }
     ImGui::Dummy(ImVec2(w, h + 4));
   }
-  ImGui::Text("mana %d/%d   health %d   cost %d", s.mana, s.manaMax, s.health,
-              s.spellCost);
+  ImGui::Text("mana %d/%d   health %d   cost %d%s", s.mana, s.manaMax, s.health,
+              s.spellCost, s.spellPriceUnknown ? " + ?" : "");
+  if (s.spellCost > 0 || s.spellPriceUnknown)
+    ImGui::TextDisabled("  word %d + tariff %d + carry %d%s", s.spellWord, s.spellTariff,
+                        s.spellCarry,
+                        s.spellPriceUnknown ? "   (anything: priced when it lands)" : "");
+  if (s.spellLastBillAge < 2.5f && s.spellLastBill > 0)
+    ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f), "billed %d on resolve",
+                       s.spellLastBill);
   if (s.spellCost > s.mana + s.health) {
     ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.3f, 1.0f),
                        "FATAL - this will kill you");

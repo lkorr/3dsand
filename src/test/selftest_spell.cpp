@@ -65,7 +65,7 @@ void SigEffect(const GlyphLibrary& lib, const EffectInst& e, std::string& s) {
   for (const EffectInst& i : e.inner) SigEffect(lib, i, s);
   s += "}";
 }
-std::string CastSignature(const GlyphLibrary& lib, const CastList& l) {
+std::string CastsSignature(const GlyphLibrary& lib, const CastList& l) {
   std::string s;
   char buf[512];
   for (const SpellCast& c : l.casts) {
@@ -85,10 +85,13 @@ std::string CastSignature(const GlyphLibrary& lib, const CastList& l) {
     s += "|";
     for (const EffectInst& e : c.payload) SigEffect(lib, e, s);
   }
+  return s;
+}
+std::string CastSignature(const GlyphLibrary& lib, const CastList& l) {
+  char buf[128];
   std::snprintf(buf, sizeof buf, " cost%d/%d/%d=%d", l.wordCost, l.tariff, l.carryCost,
                 l.manaCost);
-  s += buf;
-  return s;
+  return CastsSignature(lib, l) + buf;
 }
 
 // The R6 canonical form of a parse: per clause (delivery, weight, sorted
@@ -467,18 +470,91 @@ Status GateSpells(Ctx& c, std::string& detail) {
     }
   }
 
-  const bool lawsOk = alphaOk && lawFail == 0 && l1 > 0 && l2pairs > 0 && l3 > 0 && l6cases > 0;
+  // L4 clause independence — cost(A ‖ B) = cost(A) + cost(B) and the casts
+  // are the union, whenever the boundary holds: the parse of A+B is the parse
+  // of A beside the parse of B. (A B that opens with an operator whose left
+  // slot takes A's delivery word — `projectile null` — is a different
+  // sentence, and the canonical-form precondition excludes it.)
+  int l4 = 0, l4cases = 0;
+  {
+    std::vector<std::vector<int>> as, bs;
+    std::vector<CastList> lbs;
+    for (const auto& s : seqs) {
+      if (s.size() > 2) continue;
+      bs.push_back(s);
+      lbs.push_back(CompileSpell(lib, stackOf(s)));
+      if (lib.glyphs[s.back()].sort == GlyphSort::Delivery) as.push_back(s);
+    }
+    for (const auto& a : as) {
+      const CastList la = CompileSpell(lib, stackOf(a));
+      const std::string ca = Canon(lib, la.tree);
+      const std::string sa = CastsSignature(lib, la);
+      for (size_t bi = 0; bi < bs.size(); bi++) {
+        const CastList& lb = lbs[bi];
+        std::vector<int> ab = a;
+        ab.insert(ab.end(), bs[bi].begin(), bs[bi].end());
+        const CastList lab = CompileSpell(lib, stackOf(ab));
+        if (Canon(lib, lab.tree) != ca + Canon(lib, lb.tree)) continue;
+        l4cases++;
+        const bool ok = lab.manaCost == la.manaCost + lb.manaCost &&
+                        lab.priceUnknown == (la.priceUnknown || lb.priceUnknown) &&
+                        CastsSignature(lib, lab) == sa + CastsSignature(lib, lb);
+        if (!ok) fail("L4", spell(a) + " || " + spell(bs[bi]));
+        else l4++;
+      }
+    }
+  }
+
+  // L7 tariff monotonicity — for `A transmute B` (A != B), cost is
+  // non-decreasing in arcane(B) - arcane(A) and in the volume; for any spray,
+  // in the voxel count.
+  int l7 = 0;
+  {
+    std::vector<int> matter;
+    for (int i = 0; i < (int)lib.glyphs.size(); i++)
+      if (lib.glyphs[i].sort == GlyphSort::Matter && !lib.glyphs[i].wildcard) matter.push_back(i);
+    std::stable_sort(matter.begin(), matter.end(), [&](int x, int y) {
+      return lib.Arcane(lib.glyphs[x].material) < lib.Arcane(lib.glyphs[y].material);
+    });
+    const int gT = lib.Find("transmute"), gWide = lib.Find("wide");
+    for (int a : matter) {
+      int32_t prev = -1;
+      for (int bm : matter) {
+        if (bm == a) continue;
+        const CastList l = CompileSpell(lib, stackOf({a, gT, bm}));
+        if (prev >= 0 && l.manaCost < prev)
+          fail("L7", spell({a, gT, bm}) + " costs less than the cheaper target before it");
+        else
+          l7++;
+        prev = l.manaCost;
+        // Volume: transmute×2 converts twice the volume; wide resolves wider.
+        const int32_t base = l.manaCost;
+        const int32_t twice = CompileSpell(lib, stackOf({a, gT, gT, bm})).manaCost;
+        const int32_t wide = gWide >= 0 ? CompileSpell(lib, stackOf({gWide, a, gT, bm})).manaCost : base;
+        if (twice < base || wide < base) fail("L7", spell({a, gT, bm}) + " volume");
+        else l7++;
+      }
+      // A spray, in the voxel count.
+      const int32_t one = CompileSpell(lib, stackOf({a})).manaCost;
+      const int32_t two = CompileSpell(lib, stackOf({a, a})).manaCost;
+      if (two < one) fail("L7", spell({a, a}) + " spray");
+      else l7++;
+    }
+  }
+
+  const bool lawsOk = alphaOk && lawFail == 0 && l1 > 0 && l2pairs > 0 && l3 > 0 &&
+                      l6cases > 0 && l4cases > 0 && l7 > 0;
   const bool spellOk = budgetOk && fatalOk && carveAsked && fatalEmitted && sprayOk &&
                        latchOk && lawsOk;
   std::printf(
       "spells: %s (trail authorized %lld/%d voxels over %d ticks, died=%d; "
       "overcast fatal=%d carve=%d payload=%d; spray %d/%d/%d voxels for "
-      "%d/%d/%d mana; laws over %zu sequences: L1 %d, L2 %d/%d, L3 %d, L6 %d/%d, "
-      "%d failures)\n",
+      "%d/%d/%d mana; laws over %zu sequences: L1 %d, L2 %d/%d, L3 %d, L4 %d/%d, "
+      "L6 %d/%d, L7 %d, %d failures)\n",
       spellOk ? "PASS" : "FAIL", (long long)trailVolume, authoredBudget, flownTicks,
       diedWithBudget ? 1 : 0, fatalOk ? 1 : 0, carveAsked ? 1 : 0, fatalEmitted ? 1 : 0,
       sprayN[0], sprayN[1], sprayN[2], sprayCost[0], sprayCost[1], sprayCost[2],
-      seqs.size(), l1, l2, l2pairs, l3, l6, l6cases, lawFail);
+      seqs.size(), l1, l2, l2pairs, l3, l4, l4cases, l6, l6cases, l7, lawFail);
   detail = Format("laws %zu seq, %d failures", seqs.size(), lawFail);
   return spellOk ? Status::Pass : Status::Fail;
 }

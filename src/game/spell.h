@@ -271,6 +271,12 @@ struct GlyphLibrary {
   std::vector<GlyphDef> glyphs;
   std::vector<ConjoinedGlyph> conjoined;
   SpellBudgets budgets;
+  // Per-material arcane value (materials.json), copied at load so pricing
+  // needs only the library. Index == 12-bit material id.
+  std::vector<int32_t> arcane;
+  int32_t Arcane(uint32_t mat) const {
+    return mat < arcane.size() ? arcane[mat] : 0;
+  }
   // The implicit delivery (R5). Not in `glyphs`, so it cannot be spoken; its
   // record fields come from the "hand" block.
   GlyphDef hand;
@@ -447,6 +453,12 @@ CastList LowerSpell(const GlyphLibrary& lib, const SpellTree& tree);
 // The predicted world footprint of one effect at one point, in voxels: what
 // the trail budget charges per mark and what the tariff prices.
 int32_t EffectVolume(const GlyphLibrary& lib, const EffectInst& e);
+// THE TARIFF (plan §4): what one effect does to the world, priced per voxel by
+// the material's arcane value and the budgets' rates. `anything` prices as 0
+// here and is billed when it resolves (SpellEmission::billOnResolve).
+int32_t EffectTariff(const GlyphLibrary& lib, const EffectInst& e);
+// Fills a cast's tariff and carry from its payload, trail and instances.
+void PriceCast(const GlyphLibrary& lib, SpellCast& cast);
 // The first material a cast carries (a spray, a convert's product, a trail
 // mark), for drawing the bolt; 0 when it carries none.
 uint32_t CastTintMaterial(const SpellCast& cast);
@@ -480,6 +492,9 @@ struct SpellProjectile {
   bool resting = false;
   bool alive = true;
   int32_t gen = 0;
+  // The cast's instability, carried to the impact: an unstable convert lands
+  // a melt-mode share wherever it resolves, not only at the hand.
+  int32_t instability = 0;
   // Casters are identified by an opaque integer, so a mob can own a projectile
   // without the VM knowing what a mob is (thesis 4).
   uint64_t casterId = 0;
@@ -609,7 +624,7 @@ class SpellSystem {
  private:
   void Launch(const SpellCast& cast, SpellFxVec originFx, SpellFxVec aim,
               uint64_t casterId, uint32_t tick, int32_t instance,
-              SpellEmission& out, const SpellProbe* probe);
+              int32_t instability, SpellEmission& out, const SpellProbe* probe);
 
   const GlyphLibrary* lib_ = nullptr;
   std::vector<SpellProjectile> live_;

@@ -528,6 +528,8 @@ bool LoadGlyphs(const std::string& path, const std::vector<MaterialDef>& mats,
     errors += "glyphs: no glyphs loaded\n";
     return false;
   }
+  out.arcane.resize(mats.size(), 0);
+  for (size_t i = 0; i < mats.size(); i++) out.arcane[i] = mats[i].arcane;
   return true;
 }
 
@@ -962,6 +964,83 @@ int32_t EffectVolume(const GlyphLibrary& lib, const EffectInst& e) {
   }
 }
 
+int32_t EffectTariff(const GlyphLibrary& lib, const EffectInst& e) {
+  const SpellBudgets& b = lib.budgets;
+  const GlyphDef* g = lib.At(e.glyph);
+  if (!e.complete) return 0;
+  const int32_t vol = EffectVolume(lib, e);
+  switch (e.verb) {
+    case SpellVerb::Spray:
+    case SpellVerb::Place:
+      // voxels x arcane(M) x rate.place. The wildcard is priced when it lands.
+      if (e.anyA) return 0;
+      return SatMul(vol, SatMul(lib.Arcane(e.matA), b.ratePlace));
+    case SpellVerb::Convert: {
+      // voxels x (rate.convert + max(0, arcane(B) - arcane(A))): going DOWN in
+      // value costs the base only; going up costs the gap. Water -> gold over a
+      // pool of thousands of voxels is the story the brief wants told.
+      if (e.anyB) return 0;
+      if (!e.anyA && e.matA == e.matB) return 0;
+      const int32_t gap = e.anyA ? 0 : std::max(0, lib.Arcane(e.matB) - lib.Arcane(e.matA));
+      return SatMul(vol, SatAdd(b.rateConvert, gap));
+    }
+    case SpellVerb::Explode: {
+      // power x r^3 x rate.explode / 1000: the only superlinear curve per word,
+      // because the WORLD effect is.
+      const int32_t r = ClampI(ScaleRadiusCbrt(e.radius, e.n), 1, kMaxExplosionRadius);
+      const int64_t power = (int64_t)(g ? g->power : 220) * e.n;
+      const int64_t v = power * r * r * r * b.rateExplode / 1000;
+      return v > 0x3FFFFFFF ? 0x3FFFFFFF : (int32_t)std::max<int64_t>(v, 1);
+    }
+    case SpellVerb::Wind: {
+      if (!g || !g->wind.has) return 0;
+      const int64_t v = (int64_t)vol * g->wind.ttlTicks * e.n * b.rateWind / 1000;
+      return v > 0x3FFFFFFF ? 0x3FFFFFFF : (int32_t)std::max<int64_t>(v, 1);
+    }
+    case SpellVerb::Mend:
+      if (e.anyA) return 0;
+      return SatMul(vol, SatMul(lib.Arcane(e.matA), b.rateGraft));
+    case SpellVerb::Filter: return std::max(1, vol / 1000);
+    case SpellVerb::Trail: {
+      int32_t t = 0;
+      for (const EffectInst& i : e.inner) t = SatAdd(t, EffectTariff(lib, i));
+      return t;
+    }
+    case SpellVerb::Sustain:
+      // Billed per tick as it runs (P3), never up front.
+      return 0;
+    case SpellVerb::Repeat: {
+      int32_t t = 0;
+      for (const EffectInst& i : e.inner) t = SatAdd(t, EffectTariff(lib, i));
+      return SatMul(t, g ? g->repeats : 1);
+    }
+    default: return 0;
+  }
+}
+
+void PriceCast(const GlyphLibrary& lib, SpellCast& cast) {
+  int32_t t = 0;
+  for (const EffectInst& e : cast.payload) t = SatAdd(t, EffectTariff(lib, e));
+  // A trail is priced as marks x the per-mark tariff of what it lays: the
+  // budget is a voxel count, so the number of marks is budget / mark volume.
+  if (!cast.delivery.trail.empty()) {
+    int32_t markVol = 0, markTariff = 0;
+    for (const EffectInst& e : cast.delivery.trail) {
+      markVol = SatAdd(markVol, EffectVolume(lib, e));
+      markTariff = SatAdd(markTariff, EffectTariff(lib, e));
+    }
+    const int32_t marks = cast.delivery.trailBudget / std::max(1, markVol);
+    t = SatAdd(t, SatMul(marks, markTariff));
+  }
+  // A held beam pays the tariff every tick it is held (P3 bills it as it
+  // emits); the up-front price is one resolve.
+  cast.tariff = SatMul(t, cast.instances);
+  // The delivery premium: carry is per-mille on the payload tariff, and the
+  // part above x1 is what the HUD shows as "carry".
+  const int64_t premium = (int64_t)cast.tariff * (cast.delivery.carryMille - 1000) / 1000;
+  cast.carryCost = premium <= 0 ? 0 : (premium > 0x3FFFFFFF ? 0x3FFFFFFF : (int32_t)premium);
+}
+
 namespace {
 uint32_t TintOf(const std::vector<EffectInst>& es) {
   for (const EffectInst& e : es) {
@@ -1038,6 +1117,7 @@ CastList LowerSpell(const GlyphLibrary& lib, const SpellTree& tree) {
 
     cast.instances = ClampI(cast.delivery.count, 1, b.maxInstances);
     cast.generation = 0;
+    PriceCast(lib, cast);
     // Rule 2 budgets, all finite.
     int32_t ticks = 1;
     switch (cast.delivery.mech) {
@@ -1417,9 +1497,13 @@ void ApplySpellEffect(const GlyphLibrary& lib, const std::vector<EffectInst>& pa
           out.spawns.push_back(s);
         }
         if (e.anyA) {
-          // The wildcard is priced by what it turned out to be (P1).
-          bool known;
-          (void)known;
+          // THE WILDCARD IS PRICED WHEN IT LANDS: what it turned out to be, at
+          // the place rate, PLUS its value times the surcharge.
+          const int32_t val = lib.Arcane(mat);
+          out.billOnResolve = SatAdd(
+              out.billOnResolve,
+              SatMul((int32_t)n, SatAdd(SatMul(val, b.ratePlace),
+                                        (int32_t)((int64_t)val * b.anythingSurchargeMille / 1000))));
         }
         break;
       }
@@ -1428,6 +1512,14 @@ void ApplySpellEffect(const GlyphLibrary& lib, const std::vector<EffectInst>& pa
         if (e.anyA) {
           bool known;
           mat = matHere(known);
+          if (mat != 0) {
+            const int32_t val = lib.Arcane(mat);
+            const int32_t vox = SatMul(Cube(e.radius), e.n);
+            out.billOnResolve = SatAdd(
+                out.billOnResolve,
+                SatMul(vox, SatAdd(SatMul(val, b.ratePlace),
+                                   (int32_t)((int64_t)val * b.anythingSurchargeMille / 1000))));
+          }
         }
         if (mat == 0) break;
         const int32_t r = ClampI(ScaleRadiusCbrt(e.radius, e.n), 0, 8);
@@ -1461,6 +1553,23 @@ void ApplySpellEffect(const GlyphLibrary& lib, const std::vector<EffectInst>& pa
           if ((int32_t)roll < instabilityMille) {
             op.mode = 2u;
             op.material = 0;
+          }
+        }
+        if (e.anyA) {
+          // Billed on resolve: the conversion from what is actually there (the
+          // centre cell stands for the volume), plus the wildcard's surcharge on
+          // that matter's value. An `anything transmute gold` into a gold vein
+          // is cheap; into a lake it bills the water->gold gap.
+          bool known;
+          const uint32_t actual = matHere(known);
+          if (actual != 0) {
+            const int32_t val = lib.Arcane(actual);
+            const int32_t gap = std::max(0, lib.Arcane(e.matB) - val);
+            const int32_t vox = Cube(r);
+            out.billOnResolve = SatAdd(
+                out.billOnResolve,
+                SatMul(vox, SatAdd(SatAdd(b.rateConvert, gap),
+                                   (int32_t)((int64_t)val * b.anythingSurchargeMille / 1000))));
           }
         }
         out.ops.push_back(op);
@@ -1536,7 +1645,8 @@ SpellFxVec Unit(SpellFxVec v, int64_t scale) {
 
 void SpellSystem::Launch(const SpellCast& cast, SpellFxVec originFx, SpellFxVec aim,
                          uint64_t casterId, uint32_t tick, int32_t instance,
-                         SpellEmission& out, const SpellProbe* probe) {
+                         int32_t instability, SpellEmission& out,
+                         const SpellProbe* probe) {
   (void)instance;
   (void)tick;
   // Rule 2: a hard cap on live projectiles, checked before the spawn. Over
@@ -1552,6 +1662,7 @@ void SpellSystem::Launch(const SpellCast& cast, SpellFxVec originFx, SpellFxVec 
   p.pos = originFx;
   p.casterId = casterId;
   p.gen = cast.generation;
+  p.instability = instability;
   p.ticksLeft = ClampI(cast.delivery.lifetimeTicks, 1, lib_->budgets.maxLifetimeTicks);
   // Normalize the aim to the record's speed, in fixed point. Integer sqrt so
   // two machines agree exactly (no libm, no float).
@@ -1629,7 +1740,7 @@ CastResult SpellSystem::Cast(const CastList& list, CasterState& caster,
           break;
         }
         case DeliveryMech::Flight:
-          Launch(c, originFx, d, casterId, tick, i, out, probe);
+          Launch(c, originFx, d, casterId, tick, i, r.instability, out, probe);
           break;
         case DeliveryMech::Continuous: {
           // Until the held beam lands (P3): one resolve at the ray's reach.
@@ -1753,8 +1864,8 @@ void SpellSystem::Tick(uint32_t tick, const World& world,
       // (thesis 2), at the impact position.
       if (opsUsed < kSpellOpsPerTick) {
         size_t before = out.ops.size();
-        ApplySpellEffect(*lib_, p.cast.payload, impactAt, p.vel, 1000, out, &probe, 0,
-                         (uint32_t)tick);
+        ApplySpellEffect(*lib_, p.cast.payload, impactAt, p.vel, 1000, out, &probe,
+                         p.instability, (uint32_t)tick);
         opsUsed += (int)(out.ops.size() - before);
       } else {
         opsDropped_++;

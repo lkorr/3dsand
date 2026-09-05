@@ -3190,11 +3190,52 @@ L6 local binding (an operator's bound arguments do not change when a word is
 inserted anywhere that does not land inside or adjacent to ANY operator
 group's spoken span — "any", because greedy binding means a word dropped into
 another operator's slot region can steal its argument and free a word for this
-one; locality is about where the word lands relative to every binding). L4/L7
-(clause independence, tariff monotonicity), L5 (delivery invariance) and L8
-(finite budgets) join in later phases. A change that breaks a law breaks a
-*class* of spells, which is what the line says; a change that moves one
-spell's numbers is a rebaseline.
+one; locality is about where the word lands relative to every binding), L4
+clause independence (`cost(A ‖ B) = cost(A) + cost(B)` and the casts are the
+union whenever the parse of A+B is the parses side by side), L7 tariff
+monotonicity (`A transmute B` non-decreasing in `arcane(B) − arcane(A)` and in
+volume; a spray in its voxel count). L5 (delivery invariance) and L8 (finite
+budgets) join in later phases. A change that breaks a law breaks a *class* of
+spells, which is what the line says; a change that moves one spell's numbers
+is a rebaseline.
+
+**Cost: you pay for voxels, not for words (plan §4; `EffectTariff`,
+`PriceCast`).** Every glyph has a small fixed `word` cost. The real price is
+the TARIFF on the ops the cast emits, and the lowering knows those before
+anything is cast, so the HUD shows the split — word + tariff + carry — live,
+and "why is this 900 mana" is answered before the click. Material value is one
+integer per material (`arcane` in `materials.json`, derived from density when
+absent; `MaterialDef::arcane`), not a from×to table, so hundreds of materials
+stay O(N) and a modder prices a new one with one key. Spray/place cost voxels
+× `arcane(M)` × `rates.place`; convert costs voxels × (`rates.convert` +
+max(0, `arcane(B) − arcane(A)`)) — down in value is the base only, up is the
+gap, and water→gold over a pool of thousands of voxels is the story the brief
+wants told; explode costs power × r³ × `rates.explode`/1000, the one
+superlinear curve per word because the WORLD effect is; wind costs footprint
+× ticks; mend costs voxels × `arcane(M)` × `rates.graft`. Each Delivery
+declares `carry`, a per-mille premium on the payload tariff (`hand`/`self`/
+`bomb` 1.0, `projectile` 3.0, `bolt` 4.0), and instances multiply everything,
+so `shotgun³` pays 27 bolts' worth and reads as a lethal number before you
+commit. Sustained effects (`aura`, a held `beam`) price at zero up front and
+pay the same tariff per tick as they emit.
+
+**`anything` is priced when it lands.** The wildcard's tariff is unknowable
+before the cast (the HUD shows `+ ?`): on resolve, the material actually at
+the point (the centre cell stands for the volume) is read through the
+`SpellProbe` over the CPU mirror, and the cast bills the conversion from it
+plus that matter's value × `budgets.anythingSurchargeMille`, reported as
+`SpellEmission::billOnResolve` and paid by the owner mana-first, then from the
+body. An `anything transmute gold` into a gold vein is cheap; the same bolt
+into a lake bills the water→gold gap for the whole resolve volume after the
+fact, which is the danger the word is for.
+
+**Imprecision degrades the product, not just the aim.** An Unstable cast's
+convert ops land in melt mode (`BrushOp` mode 2, each cell to its own authored
+heat product) with probability equal to the instability, per op, by
+counter-based hash — so the caster who tries `water transmute gold` on a tarn
+spends the pool, runs into health, and the last ops boil the water instead of
+gilding it. The instability rides on the projectile to its impact. One `if` on
+an existing op mode, not a new system.
 
 Two decisions worth recording because the obvious alternative is wrong:
 

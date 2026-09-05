@@ -6245,14 +6245,30 @@ int main(int argc, char** argv) {
             originFx = {SpellFxFromFloat(body.x), SpellFxFromFloat(body.y),
                         SpellFxFromFloat(body.z)};
           }
+          const SpellProbe probe = WorldSpellProbe(world);
           CastResult res =
               spells.Cast(caster.compiled, caster.mana, playerHealth,
-                          0x9134A5EEu /*casterId*/, originFx, dirFx, tick, emit);
+                          0x9134A5EEu /*casterId*/, originFx, dirFx, tick, emit,
+                          &probe);
           caster.lastOutcome = res.outcome;
           if (res.outcome != CastOutcome::Nothing) caster.Clear(glyphs);
         }
 
         spells.Tick(tick, world, classOf, emit);
+
+        // THE WILDCARD'S BILL. `anything` is priced by what it turned out to
+        // be, when it resolves (plan §4): mana first, then the body, exactly
+        // the crossover a spoken cost pays -- except that this one lands after
+        // the fact, which is the danger the word is for.
+        if (emit.billOnResolve > 0) {
+          int32_t bill = emit.billOnResolve;
+          const int32_t fromMana = std::min(bill, caster.mana.mana);
+          caster.mana.mana -= fromMana;
+          bill -= fromMana;
+          if (bill > 0) playerHealth.Spend(bill);
+          ui.spellLastBill = emit.billOnResolve;
+          ui.spellLastBillAge = 0.0f;
+        }
 
         // The caster's own body pays for a fatal overcast: severed parts, then
         // death, all through the existing dismemberment/gore pipeline. The
@@ -7204,6 +7220,11 @@ int main(int argc, char** argv) {
       FillBodyUI(avatar, burnMats, ui);
       ui.locoState = avatar.Spawned() ? avatar.Locomotion().stateName : "";
       ui.spellCost = caster.compiled.manaCost;
+      ui.spellWord = caster.compiled.wordCost;
+      ui.spellTariff = caster.compiled.tariff;
+      ui.spellCarry = caster.compiled.carryCost;
+      ui.spellPriceUnknown = caster.compiled.priceUnknown;
+      ui.spellLastBillAge += dt;
       ui.spellText = caster.readout.text;
       ui.spellVerdict = caster.readout.verdict;
       ui.spellOutcome = (int)caster.lastOutcome;

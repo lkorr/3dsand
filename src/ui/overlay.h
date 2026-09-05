@@ -429,6 +429,13 @@ struct UIState {
   BodyPartUI body[kSlotCount];
   bool bodyValid = false;   // false until the avatar has spawned
   int32_t spellCost = 0;          // running cost of the spoken sequence
+  // The price SPLIT (plan §9): word costs, the tariff on what the cast does
+  // to the world, and the delivery premium on that tariff. "Why is this 900
+  // mana" is answered here before the cast.
+  int32_t spellWord = 0, spellTariff = 0, spellCarry = 0;
+  bool spellPriceUnknown = false; // `anything`: part of the price is billed on resolve
+  int32_t spellLastBill = 0;      // what the last wildcard resolve billed
+  float spellLastBillAge = 99.0f;
   std::string spellText;          // "lava + trail + projectile"
   std::string spellVerdict;       // what the VM thinks it is
   int spellOutcome = -1;          // last CastOutcome, -1 = none yet
