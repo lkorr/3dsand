@@ -4,6 +4,7 @@
 #include "measure/perfsuite.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cinttypes>
 #include <climits>
 #include <cmath>
@@ -23,6 +24,7 @@
 #include "measure/perfscope.h"
 #include "sim/celestial.h"
 #include "sim/materials.h"
+#include "sim/microvox.h"
 #include "sim/pagetable.h"
 #include "sim/simulation.h"
 #include "sim/stream.h"
@@ -1918,6 +1920,12 @@ const RenderArm kRenderArms[] = {
 };
 constexpr int kRenderArmCount =
     (int)(sizeof(kRenderArms) / sizeof(kRenderArms[0]));
+// The Rm* block of PerfCounter is the shader's slot table, one enumerator per
+// kRenderStatSlots in RS_* order; main.cpp's slot->counter copy and the stats
+// print below both index it that way.
+static_assert((int)PerfCounter::Count - (int)PerfCounter::RmPixels ==
+                  (int)kRenderStatSlots,
+              "PerfCounter::Rm* must have exactly kRenderStatSlots rows");
 
 // ---- arms that only one camera runs ---------------------------------------
 // Deliberately NOT rows of kRenderArms. Two reasons, and the second is the one
@@ -1940,6 +1948,24 @@ const RenderArm kExtraArms[] = {
      [](Tuning& t) { t.render.godRayShadowSteps = 0; }, true, 1,
      "ONLY the shadow ray cast at each god-ray step; the shafts still march, "
      "so nogodray minus this is the marching itself"},
+    // ---- the foliage ceilings (meadow / canopy cameras) ----------------
+    // Each is a CEILING, not a proposal: it deletes or caps one whole term
+    // so the delta from baseline bounds what any optimisation of that term
+    // could ever recover. `nomicro` (kRenderArms) is the fourth of the set —
+    // microMaxPerRay 0 const-folds the plant/brick branch out of trace()
+    // entirely, so it is the ceiling on everything plant-related.
+    {"micro1", "microMaxPerRay 8 -> 1",
+     [](Tuning& t) { t.render.microMaxPerRay = 1; }, true, 1,
+     "every plant/brick evaluation past the FIRST cell a ray enters — the "
+     "grazing-ray cost of a meadow"},
+    {"plantlod4", "plantLodDist 16 -> 4 m",
+     [](Tuning& t) { t.render.plantLodDist = 4.0f; }, true, 1,
+     "column-plant evaluations between 4 m and 16 m (past the cut a plant "
+     "cell is a solid cube)"},
+    {"fine2m", "lodHandoffDist 26 -> 2 m",
+     [](Tuning& t) { t.render.lodHandoffDist = 2.0f; }, true, 1,
+     "the WHOLE in-window fine march past 2 m — everything the cascade "
+     "could stand in for, plants included"},
 };
 constexpr int kExtraArmCount =
     (int)(sizeof(kExtraArms) / sizeof(kExtraArms[0]));
@@ -2061,8 +2087,359 @@ bool CamSubmerged(Scene& s, uint32_t& tick, std::string& why) {
   return false;
 }
 
+// ---------------------------------------------------------------------------
+// THE FOLIAGE CAMERAS (2026-09-05).
+//
+// The owner's report: the GPU collapses standing in tall grass and looking
+// through a tree canopy. Neither overlook sees that — from 12 m up a meadow is
+// a few hundred plant cells at 20 m, and no ray of the overlook ever crosses
+// a crown. So two cameras that are FOUND, not authored: the world is read
+// back after it settles, every column scored by how much foliage stands
+// around it, and the eye put where the score is highest. Procedural because
+// the seed, the biome files and the tree bakes all move the meadows around;
+// an authored coordinate would be measuring bare dirt within a month.
+//
+// The scan reads the whole residency window's surface band once (rows of 32
+// chunk slots; sentinels are synthesised CPU-side by ReadVoxelsSync, so sky
+// costs nothing) and both cameras share it through the cache below, reset per
+// RunRenderBudget so it can never describe a previous world.
+// ---------------------------------------------------------------------------
+struct FoliageScan {
+  bool valid = false;
+  int x0 = 0, z0 = 0;   // world voxel origin of the maps below
+  int span = 0;         // kNChunk * kChunk on each axis
+  // Per (x,z) column of the window.
+  std::vector<uint16_t> plantAt;   // cells whose material has a micro.plant block
+  std::vector<uint16_t> leafAt;    // cells tagged `foliage`
+  std::vector<int16_t> groundY;    // highest cell that is neither, nor air
+  std::vector<int16_t> leafLo, leafHi;
+  // Summed-area tables, (span+1)^2, so a box score is four reads.
+  std::vector<uint32_t> plantSat, leafSat;
+  uint64_t plantTotal = 0, leafTotal = 0;
+  uint32_t plantMats = 0, leafMats = 0;
+  uint32_t chunksRead = 0;
+  double seconds = 0;
+  // Box score over a column map: cells within +-r of (ix, iz) inclusive,
+  // clipped to the maps.
+  uint32_t Box(const std::vector<uint32_t>& sat, int ix, int iz, int r) const {
+    const int w = span + 1;
+    const int xa = std::max(ix - r, 0), za = std::max(iz - r, 0);
+    const int xb = std::min(ix + r + 1, span), zb = std::min(iz + r + 1, span);
+    if (xa >= xb || za >= zb) return 0;
+    return sat[(size_t)zb * w + xb] - sat[(size_t)za * w + xb] -
+           sat[(size_t)zb * w + xa] + sat[(size_t)za * w + xa];
+  }
+  // Highest-scoring column whose box lies fully inside the maps, or -1.
+  int Best(const std::vector<uint32_t>& sat, int r, uint32_t& score) const {
+    int best = -1;
+    score = 0;
+    for (int iz = r; iz < span - r; iz++)
+      for (int ix = r; ix < span - r; ix++) {
+        const uint32_t v = Box(sat, ix, iz, r);
+        if (v > score) { score = v; best = iz * span + ix; }
+      }
+    return best;
+  }
+};
+FoliageScan g_foliage;
+
+void BuildSat(const std::vector<uint16_t>& src, int span,
+              std::vector<uint32_t>& sat) {
+  const int w = span + 1;
+  sat.assign((size_t)w * w, 0);
+  for (int z = 0; z < span; z++) {
+    uint32_t row = 0;
+    for (int x = 0; x < span; x++) {
+      row += src[(size_t)z * span + x];
+      sat[(size_t)(z + 1) * w + (x + 1)] = sat[(size_t)z * w + (x + 1)] + row;
+    }
+  }
+}
+
+const FoliageScan& ScanFoliage(GpuContext& ctx, World& world,
+                               const std::vector<MaterialDef>& mats) {
+  FoliageScan& f = g_foliage;
+  if (f.valid) return f;
+  const auto t0 = std::chrono::steady_clock::now();
+  // WHICH MATERIALS ARE PLANTS: the micro loader is the one place that knows
+  // which "micro" blocks resolved to an analytic plant (kMicroPlant), so ask
+  // it — on a copy of the table, since it sets MATF_MICRO on what it is given.
+  std::vector<uint8_t> isPlant(mats.size(), 0), isLeaf(mats.size(), 0);
+  {
+    std::vector<MaterialDef> copy = mats;
+    MicroSet ms;
+    std::string log;
+    LoadMicroVox(AssetDir() + "/materials/materials.json", AssetDir(), copy, ms,
+                 log);
+    for (size_t i = 0; i < ms.table.size() && i < mats.size(); i++)
+      if (ms.table[i].base != kMicroNoBrick &&
+          (ms.table[i].flags & kMicroPlant) != 0) {
+        isPlant[i] = 1;
+        f.plantMats++;
+      }
+  }
+  for (uint32_t i = 0; i < mats.size(); i++)
+    if (MatHasTag(mats, i, "foliage")) { isLeaf[i] = 1; f.leafMats++; }
+
+  const IVec3 org = world.WindowOrigin();
+  f.span = (int)(kNChunk * kChunk);
+  f.x0 = org.x * (int)kChunk;
+  f.z0 = org.z * (int)kChunk;
+  const size_t n = (size_t)f.span * f.span;
+  f.plantAt.assign(n, 0);
+  f.leafAt.assign(n, 0);
+  f.groundY.assign(n, INT16_MIN);
+  f.leafLo.assign(n, INT16_MAX);
+  f.leafHi.assign(n, INT16_MIN);
+
+  // One read per (y, z) chunk row: the 32 x-slots of a row are contiguous in
+  // slot space (SlotChunkIndex is x-fastest), so a row is one range and
+  // ReadVoxelsSync splits it into resident runs itself. The y band per row is
+  // anchored to World::TerrainHeight across the row — from below the lowest
+  // ground to above the tallest crown FindTallestTrunk allows for.
+  std::vector<uint32_t> row((size_t)kNChunk * kChunkVol);
+  for (int cz = org.z; cz < org.z + (int)kNChunk; cz++) {
+    int gmin = INT_MAX, gmax = INT_MIN;
+    for (int cx = org.x; cx < org.x + (int)kNChunk; cx++) {
+      const int h = World::TerrainHeight(cx * (int)kChunk + 8,
+                                         cz * (int)kChunk + 8, kDefaultSeed);
+      gmin = std::min(gmin, h);
+      gmax = std::max(gmax, h);
+    }
+    const int cyLo = std::max(org.y, (gmin - 32) / (int)kChunk);
+    const int cyHi = std::min(org.y + (int)kNChunk - 1,
+                              (gmax + 224) / (int)kChunk);
+    for (int cy = cyLo; cy <= cyHi; cy++) {
+      const uint32_t first =
+          World::SlotChunkIndex({0, cy, cz}) & ~(kNChunk - 1);
+      ReadVoxelsSync(ctx, world, first, kNChunk, row.data(), "budgetFoliage");
+      f.chunksRead += kNChunk;
+      for (uint32_t sx = 0; sx < kNChunk; sx++) {
+        const IVec3 wc = world.SlotToWorldChunk(first + sx);
+        const uint32_t* c = row.data() + (size_t)sx * kChunkVol;
+        for (uint32_t li = 0; li < kChunkVol; li++) {
+          const uint32_t m = c[li] & 0xFFFu;
+          if (m == 0 || m >= mats.size()) continue;
+          const int lx = (int)(li % kChunk), ly = (int)((li / kChunk) % kChunk),
+                    lz = (int)(li / (kChunk * kChunk));
+          const int wx = wc.x * (int)kChunk + lx, wy = wc.y * (int)kChunk + ly,
+                    wz = wc.z * (int)kChunk + lz;
+          const int ix = wx - f.x0, iz = wz - f.z0;
+          if (ix < 0 || iz < 0 || ix >= f.span || iz >= f.span) continue;
+          const size_t ci = (size_t)iz * f.span + ix;
+          if (isPlant[m]) {
+            f.plantAt[ci]++;
+          } else if (isLeaf[m]) {
+            f.leafAt[ci]++;
+            f.leafLo[ci] = (int16_t)std::min((int)f.leafLo[ci], wy);
+            f.leafHi[ci] = (int16_t)std::max((int)f.leafHi[ci], wy);
+          } else {
+            f.groundY[ci] = (int16_t)std::max((int)f.groundY[ci], wy);
+          }
+        }
+      }
+    }
+  }
+  for (size_t i = 0; i < n; i++) {
+    f.plantTotal += f.plantAt[i];
+    f.leafTotal += f.leafAt[i];
+  }
+  BuildSat(f.plantAt, f.span, f.plantSat);
+  BuildSat(f.leafAt, f.span, f.leafSat);
+  f.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                            t0).count();
+  f.valid = true;
+  std::printf("  foliage scan: %u chunks read in %.1f s — %llu plant cells "
+              "(%u plant materials), %llu leaf cells (%u foliage materials) "
+              "in the window\n",
+              f.chunksRead, f.seconds, (unsigned long long)f.plantTotal,
+              f.plantMats, (unsigned long long)f.leafTotal, f.leafMats);
+  return f;
+}
+
+// Is a world cell open to an EYE — air, or a plant cell (passable, and an eye
+// in a tuft is the case the meadow camera exists for)? Reads the scan's
+// column classification rather than the GPU; a column the scan never saw is
+// treated as open. Conservative about crowns: only the leaf SPAN per column
+// is kept, so any cell inside it counts as closed.
+bool EyeCellOpen(const FoliageScan& f, int wx, int wy, int wz) {
+  const int ix = wx - f.x0, iz = wz - f.z0;
+  if (ix < 0 || iz < 0 || ix >= f.span || iz >= f.span) return true;
+  const size_t ci = (size_t)iz * f.span + ix;
+  if (wy <= f.groundY[ci]) return false;
+  if (f.leafAt[ci] > 0 && wy >= f.leafLo[ci] && wy <= f.leafHi[ci]) return false;
+  return true;
+}
+
+// ATTRIBUTION for a chosen site (CLAUDE.md rule 6): what the page table and
+// the occupancy table say about the chunk under a cell, and what the voxels
+// there actually are. Printed for every foliage eye so a frame that renders
+// nothing near-field names the chunk that refused, instead of leaving a bare
+// "0 near hits" to be chased one hypothesis per run.
+void ProbeCell(GpuContext& ctx, World& world,
+               const std::vector<MaterialDef>& mats, IVec3 c,
+               const std::vector<uint32_t>& occ, const char* label) {
+  const IVec3 wc{c.x >> 4, c.y >> 4, c.z >> 4};
+  if (!world.ChunkInWindow(wc)) {
+    std::printf("    probe %-12s cell (%d,%d,%d): chunk (%d,%d,%d) is OUTSIDE "
+                "the window\n", label, c.x, c.y, c.z, wc.x, wc.y, wc.z);
+    return;
+  }
+  const uint32_t slot = World::SlotChunkIndex(wc);
+  const uint32_t e = world.PageEntryOfSlot(slot);
+  char pt[64];
+  if ((e & kPtSentinelBit) == 0) std::snprintf(pt, sizeof pt, "page %u", e);
+  else if (e == kPtEmpty) std::snprintf(pt, sizeof pt, "EMPTY");
+  else {
+    const uint32_t m = e & 0xFFFu;
+    std::snprintf(pt, sizeof pt, "%s(%s)", (e & kPtJitterBit) ? "JITTER" : "UNIFORM",
+                  m < mats.size() ? mats[m].name.c_str() : "?");
+  }
+  std::vector<uint32_t> chunk(kChunkVol);
+  ReadVoxelsSync(ctx, world, slot, 1, chunk.data(), "budgetProbe");
+  uint32_t nonAir = 0;
+  for (uint32_t w : chunk) nonAir += (w & 0xFFFu) != 0;
+  const uint32_t here = chunk[World::SlotCellIndex(c) - slot * kChunkVol] & 0xFFFu;
+  std::printf("    probe %-12s cell (%d,%d,%d) = %s | chunk (%d,%d,%d) slot %u: "
+              "page table %s, occupancy nonAir %u rayBlockers %u, readback "
+              "nonAir %u\n",
+              label, c.x, c.y, c.z,
+              here < mats.size() ? mats[here].name.c_str() : "?", wc.x, wc.y,
+              wc.z, slot, pt, occ[slot] & 0xFFFFu, occ[slot] >> 16, nonAir);
+}
+
+// Scoring radii, in voxels. Meadow 8 m: the frame is grass at 0-20 m, and 8 m
+// is inside the band where a column plant is still TRACED rather than cubed
+// (render.plantLodDist 16 m), so the densest 8 m box is the densest thing the
+// plant march ever sees. Canopy 6 m: about one crown. Boxes, not discs — four
+// summed-area reads each.
+constexpr int kMeadowRadius = 80;
+constexpr int kCanopyRadius = 60;
+
+bool CamMeadow(Scene& s, uint32_t& tick, std::string& why) {
+  const FoliageScan& f = ScanFoliage(s.ctx, s.world, s.mats);
+  if (f.plantMats == 0) {
+    why = "no material has a micro.plant block, so there is nothing to stand "
+          "in";
+    return false;
+  }
+  uint32_t score = 0;
+  const int ci = f.Best(f.plantSat, kMeadowRadius, score);
+  if (ci < 0 || score == 0) {
+    why = "no plant cells in the residency window (worldgen.vegetation off, "
+          "or no cover in this biome)";
+    return false;
+  }
+  const int ix = ci % f.span, iz = ci / f.span;
+  const int wx = f.x0 + ix, wz = f.z0 + iz;
+  int ground = f.groundY[(size_t)ci];
+  if (ground == INT16_MIN) ground = World::TerrainHeight(wx, wz, kDefaultSeed);
+  // Standing height: 1.6 m over the ground under the eye, INSIDE the grass.
+  int ey = ground + 16;
+  while (!EyeCellOpen(f, wx, ey, wz) && ey < ground + 40) ey++;
+  s.eye = {(float)wx + 0.5f, (float)ey + 0.5f, (float)wz + 0.5f};
+  s.cam.yaw = 0.785f;
+  s.cam.pitch = -0.15f;
+  const uint32_t near = f.Box(f.plantSat, ix, iz, 20);
+  char note[320];
+  std::snprintf(note, sizeof note,
+                "MEADOW: eye %d voxels over ground y=%d in the densest plant "
+                "patch of the window — %u plant cells within %d m of (%d,%d) "
+                "(%u within 2 m) of %llu in the window; pitched slightly down "
+                "so the frame is grass at 0-20 m",
+                ey - ground, ground, score, kMeadowRadius / 10, wx, wz, near,
+                (unsigned long long)f.plantTotal);
+  s.note = note;
+  std::printf("  meadow site: eye (%d, %d, %d) — %u plant cells within %d m, "
+              "%u within 2 m\n",
+              wx, ey, wz, score, kMeadowRadius / 10, near);
+  {
+    const std::vector<uint32_t> occ = ReadOccupancy(s.ctx, s.world);
+    ProbeCell(s.ctx, s.world, s.mats, {wx, ey, wz}, occ, "eye");
+    ProbeCell(s.ctx, s.world, s.mats, {wx, ground, wz}, occ, "ground");
+    ProbeCell(s.ctx, s.world, s.mats, {wx + 30, ground, wz + 30}, occ, "ground+3m");
+    const int gz = World::TerrainHeight(256, 256, kDefaultSeed);
+    ProbeCell(s.ctx, s.world, s.mats, {256, gz, 256}, occ, "noon-ground");
+  }
+  tick = FindNoonTick(CurrentTuning());
+  return true;
+}
+
+bool CamCanopy(Scene& s, uint32_t& tick, std::string& why) {
+  const FoliageScan& f = ScanFoliage(s.ctx, s.world, s.mats);
+  if (f.leafMats == 0) {
+    why = "no material carries tag:foliage, so there is no canopy to look "
+          "through";
+    return false;
+  }
+  uint32_t score = 0;
+  const int ci = f.Best(f.leafSat, kCanopyRadius, score);
+  if (ci < 0 || score == 0) {
+    why = "no leaf cells in the residency window (no trees placed here)";
+    return false;
+  }
+  const int ix = ci % f.span, iz = ci / f.span;
+  const int wx = f.x0 + ix, wz = f.z0 + iz;
+  // The crown's vertical extent over the 3 m around the winning column: the
+  // eye goes 1 m under its lowest leaf so it looks UP through the whole mass.
+  int lo = INT_MAX, hi = INT_MIN, ground = INT16_MIN;
+  for (int dz = -30; dz <= 30; dz++)
+    for (int dx = -30; dx <= 30; dx++) {
+      const int jx = ix + dx, jz = iz + dz;
+      if (jx < 0 || jz < 0 || jx >= f.span || jz >= f.span) continue;
+      const size_t cj = (size_t)jz * f.span + jx;
+      if (f.leafAt[cj] == 0) continue;
+      lo = std::min(lo, (int)f.leafLo[cj]);
+      hi = std::max(hi, (int)f.leafHi[cj]);
+      ground = std::max(ground, (int)f.groundY[cj]);
+    }
+  if (lo == INT_MAX) {
+    why = "the winning leaf column has no leaf span (scan inconsistency)";
+    return false;
+  }
+  if (ground == INT16_MIN) ground = World::TerrainHeight(wx, wz, kDefaultSeed);
+  // Stand 2.5-8 m off the crown's centre column on the -x-z diagonal, so yaw
+  // 0.785 (+x+z) looks INTO the crown, and walk outward / downward until the
+  // eye is in open air — the centre column is usually the trunk.
+  int ex = wx, ey = std::max(ground + 16, lo - 10), ez = wz;
+  bool placed = false;
+  for (int off = 25; off <= 80 && !placed; off += 10) {
+    const int tx = wx - (int)(off * 0.7071f), tz = wz - (int)(off * 0.7071f);
+    for (int ty = std::max(ground + 16, lo - 10); ty >= ground + 12 && !placed;
+         ty--) {
+      if (EyeCellOpen(f, tx, ty, tz)) { ex = tx; ey = ty; ez = tz; placed = true; }
+    }
+  }
+  s.eye = {(float)ex + 0.5f, (float)ey + 0.5f, (float)ez + 0.5f};
+  s.cam.yaw = 0.785f;
+  s.cam.pitch = 0.35f;
+  char note[360];
+  std::snprintf(note, sizeof note,
+                "CANOPY: eye %d voxels under the lowest leaf of the largest "
+                "crown in the window — %u leaf cells within %d m of (%d,%d), "
+                "leaves y=%d..%d, ground y=%d — %s, looking up through the "
+                "mass toward the sky",
+                lo - ey, score, kCanopyRadius / 10, wx, wz, lo, hi, ground,
+                placed ? "2.5-8 m off the centre column on the -x-z diagonal"
+                       : "NOT placed in open air (every probe closed)");
+  s.note = note;
+  std::printf("  canopy site: eye (%d, %d, %d), crown centre (%d,%d), leaves "
+              "y=%d..%d — %u leaf cells within %d m%s\n",
+              ex, ey, ez, wx, wz, lo, hi, score, kCanopyRadius / 10,
+              placed ? "" : "  *** eye not in open air ***");
+  tick = FindNoonTick(CurrentTuning());
+  return true;
+}
+
 const char* const kArmsReduced[] = {
     "baseline", "noshadow", "nofar", "noreflect", "halfres", nullptr};
+// The foliage cameras: the picture-dependent rows plus the ceilings that only
+// mean something with plants in the frame. `nomicro` is the ceiling on the
+// whole plant march; `micro1` / `plantlod4` price its two knobs; `lod8` and
+// `fine2m` bound the fine march the plants are part of.
+const char* const kArmsFoliage[] = {
+    "baseline", "noshadow",  "nogi", "nofar",  "halfres", "nomicro",
+    "micro1",   "plantlod4", "lod8", "fine2m", nullptr};
 const char* const kArmsSubmerged[] = {
     "baseline", "noshadow", "nofar",       "noreflect",
     "halfres",  "nogodray", "godshadow0",  nullptr};
@@ -2077,6 +2454,11 @@ const BudgetCam kBudgetCams[] = {
     {"submerged",
      "eye inside the authored lake — god rays, caustics, Snell's window",
      CamSubmerged, kArmsSubmerged},
+    {"meadow",
+     "standing in the densest grass the window has — the plant march",
+     CamMeadow, kArmsFoliage},
+    {"canopy", "under the largest crown, looking up through the leaves",
+     CamCanopy, kArmsFoliage},
 };
 constexpr int kBudgetCamCount =
     (int)(sizeof(kBudgetCams) / sizeof(kBudgetCams[0]));
@@ -2293,6 +2675,72 @@ class RenderBudgetRunner {
       std::printf("  the same frame also written to %s\n", alsoPath);
   }
 
+  // THE COUNTERS INSIDE THE FRAME (RENDER_STATS, world.h kRenderStat*).
+  //
+  // The arm table says how many ms a feature costs; this says how many STEPS
+  // it took to cost them — primary DDA cells, chunk skips, micro cells
+  // entered, plant evaluations — so a ceiling can be read against the work it
+  // deleted rather than against a guess.
+  //
+  // A SEPARATE PASS, AFTER THE ARMS, at the baseline tuning. RENDER_STATS is
+  // a prelude const (gpu/resources.h): compiled in, the accumulators live in
+  // registers across the whole of trace() and the flush is ~2M atomics a
+  // frame, which is exactly the perturbation main.cpp keeps out of --perf.
+  // So the arms are timed with the shipping shader and the counters are read
+  // from a second compile that is never timed. Two reloads per camera; the
+  // caller's RestoreBase does the second.
+  //
+  // Returns false (and leaves `out` zero) when the device compiled the
+  // counters out — fragment atomics are a capability, not a given.
+  bool Stats(const Scene& s, double out[kRenderStatSlots]) {
+    for (uint32_t k = 0; k < kRenderStatSlots; k++) out[k] = 0;
+    SetRenderStatsEnabled(true);
+    const bool reloaded = sim_.ReloadShaders(ctx_.device);
+    SetRenderStatsEnabled(false);
+    dirty_ = true;   // the shipping prelude has to be re-folded afterwards
+    if (!reloaded) return false;
+    const uint32_t W = opt_.width, H = opt_.height;
+    rhi::Buffer stage = CreateBuffer(
+        ctx_.device, kRenderStatBytes,
+        rhi::BufferUsage::MapRead | rhi::BufferUsage::CopyDst, "budgetStats");
+    std::vector<uint32_t> prev(kRenderStatWords, 0), cur(kRenderStatWords, 0);
+    // Three frames: the counters are monotonic and never cleared, so a frame
+    // is the difference of two readbacks; the first pair absorbs whatever the
+    // reload left in the buffer.
+    for (int fr = 0; fr < 3; fr++) {
+      WriteRenderParams(ctx_.queue, world_, s.eye, s.cam, (float)W / (float)H,
+                        /*shadows=*/true, kBudgetAnimTime, kFarFogDensity,
+                        (float)H, skyTick_, s.fluidLive);
+      rhi::CommandEncoder enc = ctx_.device.CreateCommandEncoder();
+      sim_.EncodeShadowResolve(enc);
+      {
+        rhi::RenderPass rp = sim_.BeginRenderPass(
+            enc, view_[0], rhi::TextureFormat::RGBA8Unorm, W, H);
+        sim_.DrawWorld(rp);
+        rp.End();
+      }
+      ctx_.queue.Submit(enc.Finish());
+      ctx_.WaitIdle();
+      rhi::CommandEncoder cenc = ctx_.device.CreateCommandEncoder();
+      cenc.CopyBufferToBuffer(world_.renderStats, 0, stage, 0, kRenderStatBytes);
+      ctx_.queue.Submit(cenc.Finish());
+      ctx_.WaitIdle();
+      prev.swap(cur);
+      if (!rhi::ReadBufferBlocking(ctx_.device, stage, 0, cur.data(),
+                                   kRenderStatBytes))
+        return false;
+    }
+    uint32_t tot[kRenderStatSlots] = {};
+    for (uint32_t st = 0; st < kRenderStatStripes; st++)
+      for (uint32_t k = 0; k < kRenderStatSlots; k++)
+        tot[k] += (uint32_t)(cur[st * kRenderStatSlots + k] -
+                             prev[st * kRenderStatSlots + k]);
+    if (tot[0] == 0) return false;   // compiled out, or nothing sampled
+    for (uint32_t k = 0; k < kRenderStatSlots; k++)
+      out[k] = (double)tot[k] * (double)kRenderStatSample;
+    return true;
+  }
+
  private:
   GpuContext& ctx_;
   World& world_;
@@ -2325,13 +2773,11 @@ int RunRenderBudget(GpuContext& ctx, World& world, Simulation& sim,
   // An arm name that matches nothing is a typo, and a typo that silently runs
   // the full table costs the minutes the subset was meant to save.
   for (const std::string& want : opt.arms) {
-    bool known = false;
-    for (const RenderArm& arm : kRenderArms)
-      if (want == arm.id) known = true;
-    if (!known) {
+    if (!FindArm(want.c_str())) {
       std::fprintf(stderr, "--render-budget: no arm named '%s' (try: ",
                    want.c_str());
       for (const RenderArm& arm : kRenderArms) std::fprintf(stderr, "%s ", arm.id);
+      for (const RenderArm& arm : kExtraArms) std::fprintf(stderr, "%s ", arm.id);
       std::fprintf(stderr, ")\n");
       return 1;
     }
@@ -2381,6 +2827,7 @@ int RunRenderBudget(GpuContext& ctx, World& world, Simulation& sim,
     return 1;
   }
   runner.SettleWorld();
+  g_foliage = FoliageScan{};   // the scan describes THIS settled world only
 
   // Which cameras. `--scenario <id>` keeps its old meaning exactly — one
   // camera, borrowed from a --perf scenario, all 16 arms — and bypasses the
@@ -2428,6 +2875,10 @@ int RunRenderBudget(GpuContext& ctx, World& world, Simulation& sim,
     std::vector<ArmResult> arms;
     bool haveCache = false;
     uint32_t cReq = 0, cRes = 0, cRef = 0;
+    // RENDER_STATS per-frame totals at the baseline tuning (Runner::Stats);
+    // slot k is perfnodes.h PerfCounter::RmPixels + k.
+    bool haveStats = false;
+    double stats[kRenderStatSlots] = {};
   };
   std::vector<CamRun> runs;
   // The baseline is the arm NAMED baseline, not arms[0]: under --budget-arms
@@ -2555,6 +3006,8 @@ int RunRenderBudget(GpuContext& ctx, World& world, Simulation& sim,
       }
       cr.arms.push_back(r);
     }
+    // The counters, from a second compile at the baseline tuning (Stats).
+    cr.haveStats = runner.Stats(scene, cr.stats);
     runner.RestoreBase(base);
     // `noon` keeps writing build/render_budget.bmp under its old name as well:
     // that path is what every previous run and every reader already knows.
@@ -2585,6 +3038,22 @@ int RunRenderBudget(GpuContext& ctx, World& world, Simulation& sim,
       if (!r.ok || r.arm == &kRenderArms[0] || b <= 0) continue;
       std::printf("    %-11s %5.1f%%\n", r.arm->id,
                   100.0 * (b - r.gpuP50) / b);
+    }
+    // ---- the counters, per pixel -----------------------------------------
+    // Divided by the SAMPLED pixel count (slot 0, scaled back up), not W*H.
+    if (cr.haveStats) {
+      const double px = cr.stats[0];
+      std::printf("\n  inside the baseline frame (RENDER_STATS, per pixel; "
+                  "%.0f px sampled, x%u):\n", px / kRenderStatSample,
+                  kRenderStatSample);
+      for (uint32_t k = 1; k < kRenderStatSlots; k++) {
+        const PerfCounterDef& d =
+            kPerfCounters[(int)PerfCounter::RmPixels + (int)k];
+        std::printf("    %-20s %8.3f  %s\n", d.key, cr.stats[k] / px, d.label);
+      }
+    } else {
+      std::printf("\n  RENDER_STATS unavailable (no fragment atomics on this "
+                  "device, or the reload failed) — no per-pixel counters\n");
     }
     runs.push_back(std::move(cr));
   };
@@ -2667,7 +3136,23 @@ int RunRenderBudget(GpuContext& ctx, World& world, Simulation& sim,
             std::fprintf(f, ",\"why\":%s", JStr(r.why).c_str());
           std::fprintf(f, "}");
         }
-        std::fprintf(f, "],\n \"shadowCache\":");
+        std::fprintf(f, "],\n \"stats\":");
+        if (cr.haveStats) {
+          // Per pixel of the sampled count, keyed by the perfnodes.h rm*
+          // names; `rmPixels` itself is the absolute sampled count, scaled.
+          std::fprintf(f, "{");
+          for (uint32_t k = 0; k < kRenderStatSlots; k++) {
+            const PerfCounterDef& d =
+                kPerfCounters[(int)PerfCounter::RmPixels + (int)k];
+            std::fprintf(f, "%s%s:%s", k ? "," : "", JStr(d.key).c_str(),
+                         JNum(k == 0 ? cr.stats[0] : cr.stats[k] / cr.stats[0])
+                             .c_str());
+          }
+          std::fprintf(f, "}");
+        } else {
+          std::fprintf(f, "null");
+        }
+        std::fprintf(f, ",\n \"shadowCache\":");
         if (cr.haveCache) {
           const double px = (double)opt.width * opt.height;
           std::fprintf(f,

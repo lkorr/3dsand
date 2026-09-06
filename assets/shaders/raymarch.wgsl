@@ -102,7 +102,17 @@ const RS_PX_SKY : u32 = 12u;     // pixels that hit nothing, near or far
 const RS_PX_FAR : u32 = 13u;     // pixels resolved by the far cascades
 const RS_PX_WATER : u32 = 14u;   // pixels through shadeWater
 const RS_PX_SUB : u32 = 15u;     // pixels through shadeSubmerged
-var<private> gRs : array<u32, 16>;
+// The foliage split (PLAN_frame_perf.md "Foliage cameras"). RS_MICRO counts
+// STEPS inside a brick or blade tests inside a plant; these three say how the
+// ray got there. ENTER is every micro/plant cell a primary ray stepped into
+// with budget left; EVAL is every tracePlant / traceMicro call actually made
+// (an ENTER served by the tile-plant memo is not an EVAL); RS_CHUNK_SKIP is
+// every empty-box jump the DDA took, so primary steps split into cells marched
+// and boxes skipped.
+const RS_MICRO_ENTER : u32 = 16u; // micro/plant cells entered by a primary ray
+const RS_PLANT_EVAL : u32 = 17u;  // tracePlant + traceMicro calls (memo misses)
+const RS_CHUNK_SKIP : u32 = 18u;  // chunk / sub-chunk empty-box jumps taken
+var<private> gRs : array<u32, RENDER_STATS_SLOTS>;
 // Whether THIS pixel is on the sample. Set once at the top of fs(); every
 // rsAdd is predicated on it so the 15-in-16 unsampled pixels do no counting.
 var<private> gRsOn : bool = false;
@@ -2365,6 +2375,7 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool) -> Hit {
     }
 
     if (chunkSkip || subSkip) {
+      rsAdd(RS_CHUNK_SKIP, 1u);
       // empty box (whole chunk, or one sub-chunk block): jump to its exit face.
       // Masking off the low bits is floor-to-box-corner for negative world
       // coords too, and is cheaper than the shift-and-multiply worldChunkOf
@@ -2520,6 +2531,7 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool) -> Hit {
         // Beyond it the cell shades as a plain voxel, which is not merely
         // cheaper but the SAME answer averaged, and it keeps distant meadows
         // reading as continuous ground instead of dissolving into stipple.
+        rsAdd(RS_MICRO_ENTER, 1u);
         let mb = microBricks[mat];
         let isPlant = (mb.flags & MICROF_PLANT) != 0u;
         var pd : PlantDef;
@@ -2585,7 +2597,7 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool) -> Hit {
           } else {
             mh = traceMicro(mb, cell, entry, rd, R.tick);
           }
-          if (evaluated) { microBudget -= 1; }
+          if (evaluated) { microBudget -= 1; rsAdd(RS_PLANT_EVAL, 1u); }
           if (mh.hit) {
             out.hit = true;
             out.t = tCur + mh.t;

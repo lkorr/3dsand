@@ -708,7 +708,9 @@ constexpr uint32_t kShadowReqWords = 4;         // key, bucket, packed cell, pac
 // and makes a missed readback a gap rather than a corruption.
 // Render-only, never hashed, never saved; the buffer exists whether or not the
 // const is true so the render bind group has one layout.
-constexpr uint32_t kRenderStatSlots = 16;
+// 19 since 2026-09-05: slots 16..18 are the foliage split (micro cells
+// entered, plant evaluations, chunk skips) — raymarch.wgsl RS_MICRO_ENTER..
+constexpr uint32_t kRenderStatSlots = 19;
 constexpr uint32_t kRenderStatStripes = 64;
 constexpr uint32_t kRenderStatWords = kRenderStatSlots * kRenderStatStripes;
 constexpr uint64_t kRenderStatBytes = (uint64_t)kRenderStatWords * 4;

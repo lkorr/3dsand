@@ -357,6 +357,7 @@ enum class PerfCounter : uint8_t {
   RmShadowCacheReqs, RmFarSteps, RmFarShadowSteps, RmMicroSteps,
   RmReflectSteps, RmFluidSteps, RmGodraySteps, RmPxSky, RmPxFar, RmPxWater,
   RmPxSubmerged,
+  RmMicroEnters, RmPlantEvals, RmChunkSkips,
   Count
 };
 constexpr int kPerfCounterCount = (int)PerfCounter::Count;
@@ -443,6 +444,15 @@ inline constexpr PerfCounterDef kPerfCounters[] = {
     {"rmPxFar", "far cascade pixels", "farField", false},
     {"rmPxWater", "water surface pixels", "raymarch", false},
     {"rmPxSubmerged", "submerged pixels", "raymarch", false},
+    // The foliage split (2026-09-05). rmMicroSteps is work INSIDE a plant or
+    // brick; these say how often the primary ray got there and how often the
+    // trip was paid: an ENTER served by the tile-plant memo is not an EVAL.
+    // Chunk skips are the empty-box jumps, so primary steps minus skips is
+    // the count of cells actually marched. The Rm* block must stay exactly
+    // kRenderStatSlots long (perfsuite.cpp static_asserts it).
+    {"rmMicroEnters", "micro/plant cells entered", "microDetail", false},
+    {"rmPlantEvals", "plant/brick evaluations (memo misses)", "microDetail", false},
+    {"rmChunkSkips", "chunk-skip jumps", "raymarch", false},
 };
 static_assert((int)(sizeof(kPerfCounters) / sizeof(kPerfCounters[0])) ==
                   kPerfCounterCount,
