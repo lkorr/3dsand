@@ -58,7 +58,7 @@ function conditions(base, readSet, pkg, why) {
 
 const COND_TREE = 'P-D: the row’s conditions are packed per (biome, species) into the tree atlas (TA_C_*) and compared in treeInfoAt; a gated-out pick grows nothing.';
 const COND_COVER = 'P-D: enforced in the cover block (WM_C_MIN_Y/MAX_Y/MAX_SLOPE/PATCH_THRESH, nearWater via waterDistAt).';
-const COND_WATER = 'water rows are not packed at all; P-F drives pond geometry from the presets.';
+const COND_WATER = 'P-F: packed per row (WM_R_MIN_Y / MAX_Y / MAX_SLOPE) and tested at the pond centre in pondInfo; the water distance gates mean nothing for a body of water and the patch gate has no package yet.';
 const COND_CAVE = 'cave rows are read for their threshold only; per-row conditions have no package yet.';
 
 export const LIVE = {
@@ -94,9 +94,9 @@ export const LIVE = {
     'trees.species[].species': R('the atlas biome table is built from these rows at load'),
     'trees.species[].weight': R('the atlas biome table is built from these rows at load'),
 
-    'water.features[].preset': N('P-F', 'no water row is packed; worldgen grows one parabolic tarn per pond tile from worldgen.pond*'),
-    'water.features[].tile': N('P-F', 'no water row is packed; worldgen grows one parabolic tarn per pond tile from worldgen.pond*'),
-    'water.features[].rarity': N('P-F', 'no water row is packed; worldgen grows one parabolic tarn per pond tile from worldgen.pond*'),
+    'water.features[].preset': R('P-F: WM_R_PRESET — the preset the pond this row rolls wears (its bowl, berm, shore band, bed and flora)'),
+    'water.features[].tile': R('P-F: worldgen rolls ONE pond lattice (the finest water tile of any biome, WM_H_POND_TILE) and thins this row on it to (T/tile)² / rarity, WM_R_CHANCE_Q16 — bodies per km² are rarityStats(tile, rarity) by construction'),
+    'water.features[].rarity': R('P-F: WM_R_CHANCE_Q16 (with the tile)'),
 
     'caves.features[].preset': R('selects which of the two band thresholds this row sets'),
     'caves.features[].threshold': R('WM_B_CAVE_T1 / WM_B_CAVE_T2'),
@@ -110,17 +110,18 @@ export const LIVE = {
   },
   conditions('cover.plants[]', ALL_CONDS, 'P-D', COND_COVER),
   conditions('trees.species[]', ALL_CONDS, 'P-D', COND_TREE),
-  conditions('water.features[]', [], 'P-F', COND_WATER),
+  conditions('water.features[]', ['minY', 'maxY', 'maxSlope'], 'later', COND_WATER),
   conditions('caves.features[]', [], 'later', COND_CAVE)),
 
   // ---- assets/water/<name>.json ---------------------------------------------
   // The VEGETATION half of a preset is live since P-E: shore.plants[],
   // shore.mossChance/mossMaterial and the aquatic bands are packed into the
   // worldMap buffer's water table (src/sim/worldmap.h kW_* / kP_*) and read
-  // by genCellIn. P-E INTERIM: a pond wears its biome's FIRST water row's
-  // preset (kB_WaterPreset) until P-F gives pond sites their own. The
-  // GEOMETRY half (footprint, bathymetry, fill, berm, bed, the shore band
-  // itself) still comes from the worldgen.pond* / shore* knobs until P-F.
+  // by genCellIn. The GEOMETRY half is live since P-F: the disc radius band,
+  // the depth profile (sampled to knots), the fill, the berm, the shore band
+  // and the bed are packed into the same record (kW_* 22..49) and carved by
+  // the height mirror. A pond wears the preset of the biome row that rolled
+  // it or the kind "water" map site that placed it; nothing is a knob.
   water: {
     'name': R('identity: the file name a biome row names'),
     'displayName': R('identity: label only'),
@@ -141,7 +142,7 @@ export const LIVE = {
     'oceanFadeCells': R('WM_H_OCEAN_FADE'),
     'warpAmpVox': R('the biome-edge warp'),
     'biomes': R('the palette: plane byte -> biome file'),
-    'sites[]': R('the site table: the pad box, the spawn site (where the game starts; the calm home area centres on it), stamps'),
+    'sites[]': R('the site table: the pad box, the spawn site (where the game starts; the calm home area centres on it), stamps, and kind "water" AUTHORED LAKES (P-F: a preset at a fixed centre, same on every seed)'),
     'rules[]': R('seeded per-biome stamp placement'),
     'planes.biome': R('mapBiomeAt'),
     'planes.landform': R('mapLandformQ8: owns the continental rung of the height'),
@@ -152,21 +153,36 @@ export const LIVE = {
 // The water preset's geometry + vegetation, generated: every leaf of
 // watergen.defaultParams() that is not in the identity/preview list above.
 {
-  const geom = (why) => N('P-F', why);
+  const geom = (why) => R(why);
   const veg = (why) => R(why);
-  const G = 'no geometry field reaches worldgen yet; P-F packs footprint / bathymetry / fill / berm / bed / placement into the pond table the height twin reads';
-  const V = 'WM_W_* / WM_P_*: the water table in the worldMap buffer, read by genCellIn for every pond and shore in a biome whose FIRST water row names this preset (P-E interim, until P-F)';
+  const later = (why) => N('later', why);
+  const G = 'P-F: packed by worldmap::WaterGeomOf into the kW_* geometry words (worldgen.wgsl WM_W_*) and carved by the height mirror (pondInfo / bowlDepth / bermLift / pondNear) for every rolled pond and authored lake wearing this preset';
+  const SHAPE = 'the engine carves a DISC (radius ± radiusV); the shaped footprint is the preview’s and has no package yet';
+  const NOISE = 'the engine’s bowl is the sampled profile alone; floor noise is the preview’s and has no package yet';
+  const GROUND = 'the ground around a pond is the BIOME’s skin/subsoil (cover.skin); a per-preset ground has no package yet';
+  const PLACE = 'the row DEFAULTS the biome page seeds a new water row with; what worldgen reads is the biome row’s own tile / rarity / conditions (WM_R_*)';
+  const V = 'WM_W_* / WM_P_*: the water table in the worldMap buffer, read by genCellIn for every pond and shore wearing this preset (the row that rolled it or the site that placed it)';
   const add = (base, keys, mk, why) => { for (const k of keys) LIVE.water[base + '.' + k] = mk(why); };
-  add('footprint', ['radius', 'radiusV', 'aspect', 'squareness', 'rotation', 'rotationRandom', 'warpAmp', 'warpFreq',
-                    'warpOctaves', 'lobes', 'lobeRadius', 'lobeSpread', 'lobeWeld', 'islands', 'islandRadius', 'islandHeight'], geom, G);
-  add('bathymetry', ['depth', 'rimDepth', 'profile', 'floorNoise', 'floorNoiseFreq'], geom, G);
-  add('fill', ['material', 'level', 'surfaceMaterial'], geom, G);
-  add('berm', ['height', 'width', 'coreFrac'], geom, G);
-  add('bed', ['shallow', 'deep', 'shallowDepth', 'thickness', 'substrate'], geom, G);
-  add('ground', ['skin', 'soil', 'soilDepth', 'rock'], geom, G);
-  add('placement', ['tile', 'rarity', 'maxSlope', 'minY', 'maxY'], geom, G);
-  // The band's shape is geometry (worldgen.shoreBand / shoreLift / shoreMudWidth until P-F); what grows on it is P-E's.
-  add('shore', ['band', 'lift', 'mudWidth', 'mudMaterial'], geom, G);
+  // The geometry half (P-F). Read: the disc radius band, the depth profile,
+  // the fill, the berm, the bed and the shore band. Not read: the preview's
+  // shaped footprint, its floor noise, the per-preset ground, and the level.
+  add('footprint', ['radius', 'radiusV'], geom, G + ' (WM_W_RADIUS_MIN / RADIUS_SPAN)');
+  add('footprint', ['aspect', 'squareness', 'rotation', 'rotationRandom', 'warpAmp', 'warpFreq',
+                    'warpOctaves', 'lobes', 'lobeRadius', 'lobeSpread', 'lobeWeld', 'islands', 'islandRadius', 'islandHeight'], later, SHAPE);
+  add('bathymetry', ['depth', 'rimDepth'], geom, G + ' (WM_W_DEPTH / RIM_DEPTH)');
+  add('bathymetry', ['profile'], geom, G + ' (sampled to 17 Q8 knots at sqrt(k/16), WM_W_KNOTS; the shader interpolates in d²)');
+  add('bathymetry', ['floorNoise', 'floorNoiseFreq'], later, NOISE);
+  add('fill', ['material'], geom, G + ' (WM_W_FILL; none = a dry bowl)');
+  add('fill', ['level'], later, 'the waterline is the rim ground at the centre column; a part-full body has no package yet');
+  add('fill', ['surfaceMaterial'], later, 'no package yet; the fill is one material');
+  add('berm', ['height', 'width'], geom, G + ' (WM_W_BERM_H / BERM_W: the core is width/4, at least 2)');
+  add('berm', ['coreFrac'], later, 'the engine’s berm core is width/4 (at least 2 columns); an authored fraction has no package yet');
+  add('bed', ['shallow', 'deep', 'shallowDepth', 'thickness', 'substrate'], geom,
+      G + ' (WM_W_BED_*: shallow under water shallower than shallowDepth, deep below, substrate on faces steeper than a powder can hold)');
+  add('ground', ['skin', 'soil', 'soilDepth', 'rock'], later, GROUND);
+  add('placement', ['tile', 'rarity', 'maxSlope', 'minY', 'maxY'], P, PLACE);
+  // The band's shape and skin are the preset's too (P-F); what grows on it is P-E's.
+  add('shore', ['band', 'lift', 'mudWidth', 'mudMaterial'], geom, G + ' (WM_W_SHORE_BAND / SHORE_LIFT / MUD_WIDTH / MUD_MAT)');
   add('shore', ['mossChance', 'mossMaterial'], veg, V);
   add('shore.plants[]', ['material', 'head', 'chance', 'reach', 'height'], veg, V);
   add('aquatic.emergent', ['material', 'chance', 'minDepth', 'maxDepth', 'height'], veg, V);

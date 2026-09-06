@@ -823,10 +823,13 @@ bool World::InHarness(int x, int z) { return inHarness(x, z); }
 
 // ---- the site table, on the CPU (worldgen.wgsl wmSiteAt / wmSiteI) --------
 // Same names as the shader so the mirrored sitePadAt below reads the same.
+static constexpr uint32_t WM_S_KIND = worldmap::kS_Kind;
 static constexpr uint32_t WM_S_X = worldmap::kS_X;
 static constexpr uint32_t WM_S_Z = worldmap::kS_Z;
 static constexpr uint32_t WM_S_RADIUS = worldmap::kS_Radius;
 static constexpr uint32_t WM_S_PAD_MARGIN = worldmap::kS_PadMargin;
+static constexpr uint32_t WM_S_PRESET = worldmap::kS_Preset;
+static constexpr uint32_t WM_SITE_WATER = worldmap::kSiteWater;
 static uint32_t wmSiteAt(int x, int z) {
   const worldmap::WorldMapData& m = worldmap::CurrentWorldMap();
   if (!m.Loaded() || m.siteIndex.empty()) return 0u;
@@ -838,15 +841,108 @@ static uint32_t wmSiteAt(int x, int z) {
 static int wmSiteI(uint32_t sid, uint32_t w) {
   const worldmap::WorldMapData::StampSite& s = worldmap::CurrentWorldMap().sites[sid - 1];
   switch (w) {
+    case worldmap::kS_Kind: return s.kind;
     case worldmap::kS_X: return s.x;
     case worldmap::kS_Z: return s.z;
     case worldmap::kS_Radius: return s.radius;
     case worldmap::kS_PadMargin: return s.padMargin;
+    case worldmap::kS_Preset: return s.preset;
     default: return 0;
   }
 }
+// A water site (P-F) keeps out by its DISC plus its shore/berm band, not by
+// its cells; every other kind keeps its cells. Same test as the shader's.
 static bool siteKeepOut(int x, int z) {
-  return inHarness(x, z) || wmSiteAt(x, z) != 0u;
+  if (inHarness(x, z)) { return true; }
+  const uint32_t sid = wmSiteAt(x, z);
+  if (sid == 0u) { return false; }
+  if ((uint32_t)(wmSiteI(sid, WM_S_KIND)) != WM_SITE_WATER) { return true; }
+  const int dx = x - wmSiteI(sid, WM_S_X);
+  const int dz = z - wmSiteI(sid, WM_S_Z);
+  const int reach = wmSiteI(sid, WM_S_RADIUS) + wmSiteI(sid, WM_S_PAD_MARGIN);
+  return dx * dx + dz * dz <= reach * reach;
+}
+// The painted cell's biome, no warp and no seed (worldgen.wgsl biomeCellAt):
+// whose water rows roll at a pond tile.
+static uint32_t biomeCellAt(int x, int z) {
+  const worldmap::WorldMapData& m = worldmap::CurrentWorldMap();
+  if (!m.Loaded()) return 0u;
+  int cx, cz;
+  m.CellOf(x, z, &cx, &cz);
+  if (!m.Inside(cx, cz)) return static_cast<uint32_t>(m.oceanBiome);
+  return m.BiomeCell(cx, cz);
+}
+
+// ---- the water table, on the CPU (worldgen.wgsl wmWater / wmWaterRow /
+// pondTile / pondBand / waterKnot; P-F) ------------------------------------
+// The mirrored pondInfo / bowlDepth / pondNear read the preset geometry
+// through these names on both sides. Here they read WorldMapData::water and
+// ::biomeWater, which LoadWorldMap filled with the SAME WaterGeomOf /
+// PackWaterRows integers the packer wrote into the buffer.
+static constexpr uint32_t WM_W_FILL = worldmap::kW_Fill;
+static constexpr uint32_t WM_W_RADIUS_MIN = worldmap::kW_RadiusMin;
+static constexpr uint32_t WM_W_RADIUS_SPAN = worldmap::kW_RadiusSpan;
+static constexpr uint32_t WM_W_DEPTH = worldmap::kW_Depth;
+static constexpr uint32_t WM_W_RIM_DEPTH = worldmap::kW_RimDepth;
+static constexpr uint32_t WM_W_BERM_H = worldmap::kW_BermH;
+static constexpr uint32_t WM_W_BERM_W = worldmap::kW_BermW;
+static constexpr uint32_t WM_W_SHORE_BAND = worldmap::kW_ShoreBand;
+static constexpr uint32_t WM_W_SHORE_LIFT = worldmap::kW_ShoreLift;
+static constexpr uint32_t WM_W_BAND = worldmap::kW_Band;
+static constexpr uint32_t WM_R_PRESET = worldmap::kR_Preset;
+static constexpr uint32_t WM_R_CHANCE_Q16 = worldmap::kR_ChanceQ16;
+static constexpr uint32_t WM_R_MIN_Y = worldmap::kR_MinY;
+static constexpr uint32_t WM_R_MAX_Y = worldmap::kR_MaxY;
+static constexpr uint32_t WM_R_MAX_SLOPE = worldmap::kR_MaxSlope;
+static const worldmap::WaterGeom* waterGeomOf(uint32_t p) {
+  const worldmap::WorldMapData& m = worldmap::CurrentWorldMap();
+  if (p == 0u || p > m.water.size()) return nullptr;
+  return &m.water[p - 1];
+}
+static uint32_t wmWater(uint32_t p, uint32_t w) {
+  const worldmap::WaterGeom* g = waterGeomOf(p);
+  if (!g) return 0u;
+  switch (w) {
+    case worldmap::kW_Fill: return g->fill;
+    case worldmap::kW_RadiusMin: return (uint32_t)g->radiusMin;
+    case worldmap::kW_RadiusSpan: return (uint32_t)g->radiusSpan;
+    case worldmap::kW_Depth: return (uint32_t)g->depth;
+    case worldmap::kW_RimDepth: return (uint32_t)g->rimDepth;
+    case worldmap::kW_BermH: return (uint32_t)g->bermH;
+    case worldmap::kW_BermW: return (uint32_t)g->bermW;
+    case worldmap::kW_ShoreBand: return (uint32_t)g->shoreBand;
+    case worldmap::kW_ShoreLift: return (uint32_t)g->shoreLift;
+    case worldmap::kW_MudWidth: return (uint32_t)g->mudWidth;
+    case worldmap::kW_MudMat: return g->mudMat;
+    case worldmap::kW_BedShallow: return g->bedShallow;
+    case worldmap::kW_BedDeep: return g->bedDeep;
+    case worldmap::kW_BedShallowDepth: return (uint32_t)g->bedShallowDepth;
+    case worldmap::kW_BedThickness: return (uint32_t)g->bedThickness;
+    case worldmap::kW_BedSubstrate: return g->bedSubstrate;
+    case worldmap::kW_MaxSlope: return (uint32_t)g->maxSlope;
+    case worldmap::kW_MinY: return (uint32_t)g->minY;
+    case worldmap::kW_MaxY: return (uint32_t)g->maxY;
+    case worldmap::kW_Band: return (uint32_t)g->band;
+    default: return 0u;
+  }
+}
+static int wmWaterI(uint32_t p, uint32_t w) { return (int)wmWater(p, w); }
+static uint32_t wmWaterRowCount(uint32_t b) {
+  const worldmap::WorldMapData& m = worldmap::CurrentWorldMap();
+  if (b >= m.biomeWater.size()) return 0u;
+  return (uint32_t)m.biomeWater[b].size();
+}
+static int wmWaterRow(uint32_t b, uint32_t i, uint32_t w) {
+  const worldmap::WorldMapData& m = worldmap::CurrentWorldMap();
+  if (b >= m.biomeWater.size() || i >= m.biomeWater[b].size() || w >= worldmap::kWaterRowWords) return 0;
+  return (int)m.biomeWater[b][i].w[w];
+}
+static int pondTile() { return worldmap::CurrentWorldMap().pondTile; }
+static int pondBand() { return worldmap::CurrentWorldMap().pondBand; }
+static int waterKnot(uint32_t p, uint32_t k) {
+  const worldmap::WaterGeom* g = waterGeomOf(p);
+  if (!g || k > 16u) return 0;
+  return g->knots[k];
 }
 
 // The shader's vec2<i32>, so pondAt can be mirrored with the same shape.
@@ -1200,123 +1296,263 @@ static int baseHeight(int x, int z, uint32_t seed) {
 }
 struct Pond {
   bool present;
+  bool authored;
   int cx;
   int cz;
   int r;
   int surf;
+  uint32_t wp;
+  int minY;
+  int maxY;
+  int maxSlope;
 };
-static Pond pondInfo(int pt, int pz, uint32_t seed) {
+
+static Pond pondNone() {
   Pond p;
-  p.present = false; p.cx = 0; p.cz = 0; p.r = 0; p.surf = -1;
-  uint32_t rh = hash3(seed ^ 0xB0A7u, (uint32_t)(pt), (uint32_t)(pz));
-  if (rh % (uint32_t)WG().pondChance != 0u) { return p; }
-  int r = WG().pondRadiusMin + (int)((rh >> 4u) % (uint32_t)WG().pondRadiusSpan);
-  int maxR = WG().pondRadiusMin + (int)(WG().pondRadiusSpan) - 1;
-  int inset = maxR + 4;
-  uint32_t span = (uint32_t)(std::max(WG().pondTile - 2 * inset, 1));
-  if (WG().pondTile - 2 * inset < 1) { return p; }
-  int cx = pt * WG().pondTile + inset + (int)((rh >> 9u) % span);
-  int cz = pz * WG().pondTile + inset + (int)((rh >> 17u) % span);
-  // ---- THE AUTHORED ORIGIN REGION ----
-  // A tarn may not land in the 512-voxel cube at the world origin, and this box
-  // is that cube plus one full disc-and-berm of margin so nothing REACHES in
-  // either. The region is authored content end to end: three set-piece pools,
-  // the combat arena, the wood platform, the spawn clearing, the fixture pads,
-  // and every column the selftest suite drops a body onto. It is also exactly
-  // the residency window the harness runs in.
-  //
-  // The box used to be -44..264, which covered the fixtures and nothing else.
-  // It is widened here for a second reason that is a DEFECT, not a design, and
-  // is recorded rather than hidden: a generated tarn does not reach rest. Seven
-  // chunks around one stay awake indefinitely — five of them from the pond
-  // vegetation, two from the water itself — which `sleep` tolerates (its bound
-  // is 32) and `ca-skip` and `wind-prim` do not, because both need a tick with
-  // an EMPTY dirty set. Nothing in the height function causes it: the wedge,
-  // the bowl, the berm, the shore fringe, the ruins, evaporation and the MPM
-  // seam were each ruled out by measurement, and the residue is a liquid-CA
-  // question. See docs/PLAN_terrain_overhaul.md.
-  if (siteKeepOut(cx, cz)) { return p; }
-  Land c = landAt(cx, cz, seed);
-  if (c.slope > WG().pondMaxSlope) { return p; }
-  if (c.slope * r > (WG().pondDepth - WG().pondDepthRim) * 256) { return p; }
-  p.present = true; p.cx = cx; p.cz = cz; p.r = r; p.surf = c.h;
+  p.present = false; p.authored = false; p.cx = 0; p.cz = 0; p.r = 0; p.surf = -1; p.wp = 0u;
+  p.minY = -1; p.maxY = -1; p.maxSlope = 1024;
   return p;
 }
-static int bermLift(int h, int surf, int past) {
-  int bw = WG().pondBermWidth;
-  int core = std::max(bw / 4, 2);
-  if (past < core) { return std::max(h, surf + WG().pondBerm); }
-  int span = std::max(bw - core, 1);
-  int t = span - (past - core);
-  if (t <= 0) { return h; }
-  return std::max(h, h + ((surf + WG().pondBerm - h) * t) / span);
+
+struct PondSet {
+  int n;
+  Pond d0;
+  Pond d1;
+  Pond d2;
+  Pond d3;
+  Pond d4;
+};
+
+static PondSet pondSetNone() {
+  PondSet s;
+  s.n = 0;
+  s.d0 = pondNone(); s.d1 = pondNone(); s.d2 = pondNone(); s.d3 = pondNone(); s.d4 = pondNone();
+  return s;
 }
-static IV2 pondAt(int x, int z, uint32_t seed) {
-  IV2 none = iv2(-1, -1);
-  Pond p = pondInfo(fdiv(x, WG().pondTile), fdiv(z, WG().pondTile), seed);
-  if (!p.present) { return none; }
-  int dx = x - p.cx;
-  int dz = z - p.cz;
-  int d2 = dx * dx + dz * dz;
-  if (d2 > p.r * p.r) { return none; }
-  int surf = p.surf;
-  int depth = WG().pondDepthRim +
-              ((p.r * p.r - d2) * (WG().pondDepth - WG().pondDepthRim)) / (p.r * p.r);
-  return iv2(surf - depth, surf);
+
+static PondSet setPush(PondSet s, Pond p) {
+  PondSet q = s;
+  if (q.n == 0) { q.d0 = p; } else if (q.n == 1) { q.d1 = p; } else if (q.n == 2) { q.d2 = p; }
+  else if (q.n == 3) { q.d3 = p; } else { q.d4 = p; }
+  q.n = q.n + 1;
+  return q;
+}
+
+static int bowlDepth(uint32_t wp, int r, int d2) {
+  const int r2 = std::max(r * r, 1);
+  const int s = std::min(d2, r2) * 16;
+  const int u = std::min(s / r2, 15);
+  const int frac = s - u * r2;
+  const int k0 = waterKnot(wp, (uint32_t)(u));
+  const int k1 = waterKnot(wp, (uint32_t)(u) + 1u);
+  const int f = k0 - ((k0 - k1) * frac) / r2;
+  const int rd = wmWaterI(wp, WM_W_RIM_DEPTH);
+  return rd + ((wmWaterI(wp, WM_W_DEPTH) - rd) * f) / 256;
+}
+
+static int isqrtLe(int v, int hi0) {
+  int lo = 0;
+  int hi = hi0;
+  for (int i = 0; i < 12; i++) {
+    if (lo >= hi) { break; }
+    const int mid = (lo + hi + 1) / 2;
+    if (mid * mid <= v) { lo = mid; } else { hi = mid - 1; }
+  }
+  return lo;
+}
+
+static bool bowlSteep(Pond p, int x, int z) {
+  const int dx = x - p.cx;
+  const int dz = z - p.cz;
+  const int d2 = dx * dx + dz * dz;
+  const int d = isqrtLe(d2, p.r) + 1;
+  const int here = bowlDepth(p.wp, p.r, d2);
+  const int out = bowlDepth(p.wp, p.r, std::min(d * d, p.r * p.r));
+  return here - out > 1;
+}
+
+static Pond waterSiteNear(int x, int z) {
+  Pond p = pondNone();
+  const uint32_t sid = wmSiteAt(x, z);
+  if (sid == 0u) { return p; }
+  if ((uint32_t)(wmSiteI(sid, WM_S_KIND)) != WM_SITE_WATER) { return p; }
+  p.cx = wmSiteI(sid, WM_S_X);
+  p.cz = wmSiteI(sid, WM_S_Z);
+  p.r = wmSiteI(sid, WM_S_RADIUS);
+  p.wp = (uint32_t)(wmSiteI(sid, WM_S_PRESET));
+  p.present = true;
+  p.authored = true;
+  return p;
+}
+
+static bool waterRowHit(uint32_t biome, uint32_t i, int pt, int pz, uint32_t seed) {
+  const uint32_t hRow = hash3(seed ^ (0xB0A7u + i * 0x9E37u), (uint32_t)(pt), (uint32_t)(pz));
+  return (int)(hRow & 0xFFFFu) < wmWaterRow(biome, i, WM_R_CHANCE_Q16);
+}
+
+static Pond pondRoll(int pt, int pz, uint32_t seed) {
+  Pond p = pondNone();
+  const int tile = pondTile();
+  if (tile <= 0) { return p; }
+  const uint32_t rh = hash3(seed ^ 0xB0A7u, (uint32_t)(pt), (uint32_t)(pz));
+  const uint32_t span = (uint32_t)(std::max(tile / 2, 1));
+  int cx = pt * tile + tile / 4 + (int)((rh >> 9u) % span);
+  int cz = pz * tile + tile / 4 + (int)((rh >> 17u) % span);
+  const uint32_t biome = biomeCellAt(cx, cz);
+  const uint32_t n = wmWaterRowCount(biome);
+  if (n == 0u) { return p; }
+  uint32_t row = 4u;
+  if (n > 3u && waterRowHit(biome, 3u, pt, pz, seed)) { row = 3u; }
+  if (n > 2u && waterRowHit(biome, 2u, pt, pz, seed)) { row = 2u; }
+  if (n > 1u && waterRowHit(biome, 1u, pt, pz, seed)) { row = 1u; }
+  if (n > 0u && waterRowHit(biome, 0u, pt, pz, seed)) { row = 0u; }
+  if (row == 4u) { return p; }
+  const uint32_t wp = (uint32_t)(wmWaterRow(biome, row, WM_R_PRESET));
+  if (wp == 0u) { return p; }
+  const int r = wmWaterI(wp, WM_W_RADIUS_MIN) + (int)((((rh >> 4u) & 0xFFFFu) * (uint32_t)(wmWaterI(wp, WM_W_RADIUS_SPAN))) >> 16u);
+  const int inset = r + 4;
+  if (tile - 2 * inset < 1) { return p; }
+  cx = std::clamp(cx, pt * tile + inset, pt * tile + tile - 1 - inset);
+  cz = std::clamp(cz, pz * tile + inset, pz * tile + tile - 1 - inset);
+  if (siteKeepOut(cx, cz)) { return p; }
+  p.present = true; p.cx = cx; p.cz = cz; p.r = r; p.wp = wp;
+  p.minY = wmWaterRow(biome, row, WM_R_MIN_Y);
+  p.maxY = wmWaterRow(biome, row, WM_R_MAX_Y);
+  p.maxSlope = wmWaterRow(biome, row, WM_R_MAX_SLOPE);
+  return p;
+}
+
+static PondSet pondScan(int x, int z, uint32_t seed) {
+  PondSet s = pondSetNone();
+  const Pond a = waterSiteNear(x, z);
+  if (a.present) { s = setPush(s, a); }
+  const int tile = pondTile();
+  if (tile <= 0) { return s; }
+  const int band = pondBand();
+  const int pt = fdiv(x, tile);
+  const int pz = fdiv(z, tile);
+  const int lx = fmodp(x, tile);
+  const int lz = fmodp(z, tile);
+  const int sx = select(select(0, 1, lx >= tile - band), -1, lx < band);
+  const int sz = select(select(0, 1, lz >= tile - band), -1, lz < band);
+  const Pond p0 = pondRoll(pt, pz, seed);
+  if (p0.present) { s = setPush(s, p0); }
+  if (sx != 0) {
+    const Pond p1 = pondRoll(pt + sx, pz, seed);
+    if (p1.present) { s = setPush(s, p1); }
+  }
+  if (sz != 0) {
+    const Pond p2 = pondRoll(pt, pz + sz, seed);
+    if (p2.present) { s = setPush(s, p2); }
+  }
+  if (sx != 0 && sz != 0) {
+    const Pond p3 = pondRoll(pt + sx, pz + sz, seed);
+    if (p3.present) { s = setPush(s, p3); }
+  }
+  return s;
+}
+
+static Pond pondGate(Pond q, uint32_t seed) {
+  Pond p = q;
+  if (!p.present) { return p; }
+  const Land c = landAt(p.cx, p.cz, seed);
+  p.surf = c.h;
+  if (p.authored) { return p; }
+  if (p.minY >= 0 && c.h < p.minY) { return pondNone(); }
+  if (p.maxY >= 0 && c.h > p.maxY) { return pondNone(); }
+  if (c.slope > p.maxSlope) { return pondNone(); }
+  if (c.slope * p.r > (wmWaterI(p.wp, WM_W_DEPTH) - wmWaterI(p.wp, WM_W_RIM_DEPTH)) * 256) { return pondNone(); }
+  return p;
+}
+
+static int bermLift(uint32_t wp, int h, int surf, int past) {
+  const int bw = wmWaterI(wp, WM_W_BERM_W);
+  const int bh = wmWaterI(wp, WM_W_BERM_H);
+  const int core = std::max(bw / 4, 2);
+  if (past < core) { return std::max(h, surf + bh); }
+  const int span = std::max(bw - core, 1);
+  const int t = span - (past - core);
+  if (t <= 0) { return h; }
+  return std::max(h, h + ((surf + bh - h) * t) / span);
+}
+
+static bool inDisc(Pond p, int x, int z) {
+  const int dx = x - p.cx;
+  const int dz = z - p.cz;
+  return p.present && dx * dx + dz * dz <= p.r * p.r;
+}
+
+static bool pondCovers(PondSet s, int x, int z) {
+  return inDisc(s.d0, x, z) || inDisc(s.d1, x, z) || inDisc(s.d2, x, z) ||
+         inDisc(s.d3, x, z) || inDisc(s.d4, x, z);
+}
+
+static Pond pondCover(PondSet s, int x, int z, uint32_t seed) {
+  Pond cand = pondNone();
+  if (inDisc(s.d4, x, z)) { cand = s.d4; }
+  if (inDisc(s.d3, x, z)) { cand = s.d3; }
+  if (inDisc(s.d2, x, z)) { cand = s.d2; }
+  if (inDisc(s.d1, x, z)) { cand = s.d1; }
+  if (inDisc(s.d0, x, z)) { cand = s.d0; }
+  return pondGate(cand, seed);
+}
+
+static IV2 bowlAt(Pond p, int x, int z) {
+  if (!p.present) { return iv2(-1, -1); }
+  const int dx = x - p.cx;
+  const int dz = z - p.cz;
+  const int depth = bowlDepth(p.wp, p.r, dx * dx + dz * dz);
+  return iv2(p.surf - depth, p.surf);
+}
+
+static int shoreD2(Pond p, int x, int z) {
+  if (!p.present) { return 0x7FFFFFFF; }
+  const int dx = x - p.cx;
+  const int dz = z - p.cz;
+  const int d2 = dx * dx + dz * dz;
+  const int outer = p.r + wmWaterI(p.wp, WM_W_BAND);
+  if (d2 > outer * outer) { return 0x7FFFFFFF; }
+  return d2;
 }
 struct Shore {
   bool onShore;
   int past;
   int surf;
+  uint32_t wp;
 };
-static Shore pondNear(int x, int z, uint32_t seed) {
-  Shore s;
-  s.onShore = false; s.past = 0; s.surf = -1;
 
-  int band = std::max(WG().shoreBand, WG().pondBermWidth);
-  if (band <= 0) { return s; }
-
-  int pt = fdiv(x, WG().pondTile);
-  int pz = fdiv(z, WG().pondTile);
-  int lx = fmodp(x, WG().pondTile);
-  int lz = fmodp(z, WG().pondTile);
-  int sx = select(select(0, 1, lx >= WG().pondTile - band), -1, lx < band);
-  int sz = select(select(0, 1, lz >= WG().pondTile - band), -1, lz < band);
-
+static Shore pondNear(PondSet s, int x, int z, uint32_t seed) {
+  Shore sh;
+  sh.onShore = false; sh.past = 0; sh.surf = -1; sh.wp = 0u;
+  if (pondCovers(s, x, z)) { return sh; }
   int best = 0x7FFFFFFF;
-  Pond bestP;
-  bestP.present = false; bestP.cx = 0; bestP.cz = 0; bestP.r = 0; bestP.surf = -1;
-  for (int iz = 0; iz < 2; iz++) {
-    int oz = select(0, sz, iz == 1);
-    if (iz == 1 && sz == 0) { continue; }
-    for (int ix = 0; ix < 2; ix++) {
-      int ox = select(0, sx, ix == 1);
-      if (ix == 1 && sx == 0) { continue; }
-      Pond p = pondInfo(pt + ox, pz + oz, seed);
-      if (!p.present) { continue; }
-      int dx = x - p.cx;
-      int dz = z - p.cz;
-      int d2 = dx * dx + dz * dz;
-      if (d2 <= p.r * p.r) { return s; }
-      int outer = p.r + band;
-      if (d2 > outer * outer) { continue; }
-      if (d2 < best) { best = d2; bestP = p; }
-    }
-  }
-  if (!bestP.present) { return s; }
+  Pond bestP = pondNone();
+  const int e0 = shoreD2(s.d0, x, z);
+  if (e0 < best) { best = e0; bestP = s.d0; }
+  const int e1 = shoreD2(s.d1, x, z);
+  if (e1 < best) { best = e1; bestP = s.d1; }
+  const int e2 = shoreD2(s.d2, x, z);
+  if (e2 < best) { best = e2; bestP = s.d2; }
+  const int e3 = shoreD2(s.d3, x, z);
+  if (e3 < best) { best = e3; bestP = s.d3; }
+  const int e4 = shoreD2(s.d4, x, z);
+  if (e4 < best) { best = e4; bestP = s.d4; }
+  const Pond g = pondGate(bestP, seed);
+  if (!g.present) { return sh; }
 
   int lo = 0;
-  int hi = band;
+  int hi = wmWaterI(g.wp, WM_W_BAND);
   for (int i = 0; i < 8; i++) {
     if (lo >= hi) { break; }
-    int mid = (lo + hi) / 2;
-    int rr = bestP.r + mid;
+    const int mid = (lo + hi) / 2;
+    const int rr = g.r + mid;
     if (best <= rr * rr) { hi = mid; } else { lo = mid + 1; }
   }
-  s.onShore = true;
-  s.past = std::max(lo - 1, 0);
-  s.surf = bestP.surf;
-  return s;
+  sh.onShore = true;
+  sh.past = std::max(lo - 1, 0);
+  sh.surf = g.surf;
+  sh.wp = g.wp;
+  return sh;
 }
 // MIRROR-END height
 
@@ -1375,18 +1611,21 @@ static BareCol landColumnBare(int x, int z, uint32_t seed) {
   int pR = vlen(68); int pRim = vlen(80);
   const bool inRim = pd2 < pRim * pRim;
 
-  IV2 pw = pondAt(x, z, seed);
+  const PondSet s = pondScan(x, z, seed);
+  const Pond pc = pondCover(s, x, z, seed);
+  IV2 pw = bowlAt(pc, x, z);
   Shore near;
-  near.onShore = false; near.past = 0; near.surf = -1;
-  if (pw.y < 0 && !inRim) { near = pondNear(x, z, seed); }
+  near.onShore = false; near.past = 0; near.surf = -1; near.wp = 0u;
+  if (pw.y < 0 && !inRim) { near = pondNear(s, x, z, seed); }
 
   // The wedge, ramped out across a tarn's bank rather than switched off at its
-  // edge — a hard switch is a cliff of loose gravel over a bowl of sand.
+  // edge — a hard switch is a cliff of loose gravel over a bowl of sand. The
+  // band is the near pond's preset's (P-F).
   int sed = land.sed;
   if (inRim || pw.y >= 0) {
     sed = 0;
   } else if (near.onShore) {
-    const int band = std::max(std::max(WG().shoreBand, WG().pondBermWidth), 1);
+    const int band = std::max(wmWaterI(near.wp, WM_W_BAND), 1);
     sed = (sed * std::min(near.past, band)) / band;
   }
   int h = bed + sed;
@@ -1401,8 +1640,8 @@ static BareCol landColumnBare(int x, int z, uint32_t seed) {
   // terrain undercut the bowl, and genCellIn lays sand on it), berm outside.
   if (pw.y >= 0) {
     h = pw.x;
-  } else if (!inRim && near.onShore && near.past < WG().pondBermWidth) {
-    h = bermLift(h, near.surf, near.past);
+  } else if (!inRim && near.onShore && near.past < wmWaterI(near.wp, WM_W_BERM_W)) {
+    h = bermLift(near.wp, h, near.surf, near.past);
   }
   BareCol b;
   b.h = h;
@@ -1413,6 +1652,7 @@ static BareCol landColumnBare(int x, int z, uint32_t seed) {
 static int sitePadAt(int x, int z, int h, uint32_t seed) {
   const uint32_t sid = wmSiteAt(x, z);
   if (sid == 0u) { return h; }
+  if ((uint32_t)(wmSiteI(sid, WM_S_KIND)) == WM_SITE_WATER) { return h; }
   const int sx = wmSiteI(sid, WM_S_X);
   const int sz = wmSiteI(sid, WM_S_Z);
   const int r = wmSiteI(sid, WM_S_RADIUS);
@@ -1455,7 +1695,7 @@ World::Column World::TerrainColumn(int x, int z, uint32_t seed) {
   const int pdx = x - 420, pdz = z - 420, pd2 = pdx * pdx + pdz * pdz;
   const int pR = vlen(68), pRim = vlen(80);
   const bool inRim = pd2 < pRim * pRim;
-  const IV2 pw = pondAt(x, z, seed);
+  const IV2 pw = bowlAt(pondCover(pondScan(x, z, seed), x, z, seed), x, z);
   c.sed = (inRim || pw.y >= 0) ? 0 : l.sed;
   if (pd2 < pR * pR) c.water = poolY + vlen(24);          // the harness tarn
   else if (pw.y >= 0) c.water = pw.y;                     // a tarn
@@ -1467,23 +1707,55 @@ World::Column World::TerrainColumn(int x, int z, uint32_t seed) {
 // to TerrainHeight on purpose: if one grows a case the other has to, and the
 // `terrain` gate's berm assertion is only meaningful while they agree.
 World::PondQuery World::PondNearColumn(int x, int z, uint32_t seed) {
-  PondQuery q{false, false, 0, -1};
+  PondQuery q{};
+  q.surf = -1;
   if (sLabWorld) return q;
   const int pdx = x - 420, pdz = z - 420;
   const int pRim = vlen(80);
   const bool inRim = pdx * pdx + pdz * pdz < pRim * pRim;
-  const IV2 pw = pondAt(x, z, seed);
+  const PondSet s = pondScan(x, z, seed);
+  const Pond pc = pondCover(s, x, z, seed);
+  const IV2 pw = bowlAt(pc, x, z);
   if (pw.y >= 0) {
     q.inDisc = true;
     q.surf = pw.y;
+    q.preset = pc.wp;
+    q.bermH = wmWaterI(pc.wp, WM_W_BERM_H);
+    q.bermW = wmWaterI(pc.wp, WM_W_BERM_W);
+    q.band = wmWaterI(pc.wp, WM_W_BAND);
     return q;
   }
   if (inRim) return q;
-  const Shore near = pondNear(x, z, seed);
+  const Shore near = pondNear(s, x, z, seed);
   q.near = near.onShore;
   q.past = near.past;
   q.surf = near.surf;
+  q.preset = near.wp;
+  q.bermH = wmWaterI(near.wp, WM_W_BERM_H);
+  q.bermW = wmWaterI(near.wp, WM_W_BERM_W);
+  q.band = wmWaterI(near.wp, WM_W_BAND);
   return q;
+}
+
+// A PondDisc from a mirrored Pond: the disc plus the geometry its preset
+// gives it, for the basin registry and the gates. One place, so nothing
+// downstream re-reads the table by hand.
+static World::PondDisc DiscOf(const Pond& p) {
+  World::PondDisc d;
+  if (!p.present) return d;
+  d.present = true;
+  d.cx = p.cx;
+  d.cz = p.cz;
+  d.r = p.r;
+  d.surf = p.surf;
+  d.preset = p.wp;
+  d.depth = wmWaterI(p.wp, WM_W_DEPTH);
+  d.rimDepth = wmWaterI(p.wp, WM_W_RIM_DEPTH);
+  d.bermH = wmWaterI(p.wp, WM_W_BERM_H);
+  d.bermW = wmWaterI(p.wp, WM_W_BERM_W);
+  d.band = wmWaterI(p.wp, WM_W_BAND);
+  d.fillId = wmWater(p.wp, WM_W_FILL);
+  return d;
 }
 
 // ---- the basin registry's source (world.h PondDisc / AuthoredPool) ---------
@@ -1495,22 +1767,51 @@ World::PondQuery World::PondNearColumn(int x, int z, uint32_t seed) {
 // of the terrain (see the accessor comment in world.h).
 
 World::PondDisc World::PondTile(int tileX, int tileZ, uint32_t seed) {
-  PondDisc d;
   // The lab slab has no ponds at all: genColumn's labMode branch returns
   // pond = -1 for every column, so a registry that reported one would describe
   // water the world does not contain.
-  if (sLabWorld) return d;
-  const Pond p = pondInfo(tileX, tileZ, seed);
-  if (!p.present) return d;
-  d.present = true;
-  d.cx = p.cx;
-  d.cz = p.cz;
-  d.r = p.r;
-  d.surf = p.surf;
-  return d;
+  if (sLabWorld) return PondDisc{};
+  return DiscOf(pondGate(pondRoll(tileX, tileZ, seed), seed));
 }
 
-int World::PondTileSize() { return WG().pondTile; }
+int World::PondTileSize() { return pondTile(); }
+
+// The authored lakes (P-F): every kSiteWater record of the loaded map, with
+// its waterline from the same mirrored pondSurf the shader runs.
+int World::WaterSiteCount() {
+  int n = 0;
+  for (const worldmap::WorldMapData::StampSite& s : worldmap::CurrentWorldMap().sites)
+    if (s.kind == worldmap::kSiteWater) n++;
+  return n;
+}
+World::PondDisc World::WaterSiteDisc(int index, uint32_t seed) {
+  if (sLabWorld) return PondDisc{};
+  int n = 0;
+  const worldmap::WorldMapData& m = worldmap::CurrentWorldMap();
+  for (size_t i = 0; i < m.sites.size(); i++) {
+    const worldmap::WorldMapData::StampSite& s = m.sites[i];
+    if (s.kind != worldmap::kSiteWater) continue;
+    if (n++ != index) continue;
+    Pond p = pondNone();
+    p.present = true;
+    p.cx = s.x; p.cz = s.z; p.r = s.radius; p.wp = (uint32_t)s.preset;
+    p.surf = landAt(p.cx, p.cz, seed).h;   // the same waterline waterSiteAt gives it
+    return DiscOf(p);
+  }
+  return PondDisc{};
+}
+
+int World::BowlDepth(uint32_t preset, int r, int d2) { return bowlDepth(preset, r, d2); }
+
+int World::PondReachMax() {
+  int reach = 0;
+  const worldmap::WorldMapData& m = worldmap::CurrentWorldMap();
+  for (const worldmap::WaterGeom& g : m.water)
+    reach = std::max(reach, g.radiusMin + g.radiusSpan - 1 + g.band);
+  for (const worldmap::WorldMapData::StampSite& s : m.sites)
+    if (s.kind == worldmap::kSiteWater) reach = std::max(reach, s.radius + s.padMargin);
+  return reach + 4;
+}
 
 void World::AuthoredPoolList(AuthoredPool out[kAuthoredPools]) {
   // The same three discs TerrainHeight overrides `h` for, with the same

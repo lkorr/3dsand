@@ -559,3 +559,17 @@ regressions forever. Keys added by hand as "fail"; then the ONE end-of-wave
 (P-C moved the calm home area) and `treeAtlasHash` 8d14bc1e6117ce3d ->
 da8bc516535faf82 (P-D's condition table). Owners of those five gates: the
 fixtures' ground changed under them; see docs/PLAN_world_map.md.
+
+## P-F: presets carve the ponds, lakes are map sites (2026-09-06)
+
+`determinismHash` moves once, at the end of the package, for the reason the
+package exists: every rolled tarn's radius, depth, profile, berm and shore
+band are now its water preset's (`assets/water/<name>.json`) instead of the
+twelve deleted `worldgen.pond*` / `shore*` knobs, ponds roll on one lattice
+(the finest water tile of any biome, 256 vox) thinned per biome row instead
+of the 448-vox `pondTile`, and the default map gained an authored lake
+(`home_lake`, east of spawn). The harness window is the pad site, which bans
+tarns, so the hashed world moves through the shore/berm reach of tarns just
+outside it and through the lattice's tile hashes, not through the fixtures'
+ground. The twice-run comparison is the invariant; the pin is the
+notification.

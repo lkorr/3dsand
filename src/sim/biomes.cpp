@@ -11,6 +11,7 @@
 #include <nlohmann/json.hpp>
 
 #include "sim/world.h"   // kVoxelsPerMetre: the tree lattice is in voxels
+#include "sim/worldmap.h" // WaterGeomOf / PondLatticeVox: the pond rows are validated in voxels
 
 namespace fs = std::filesystem;
 using nlohmann::json;
@@ -202,6 +203,8 @@ bool LoadBiomeSet(const std::string& assetDir, const std::vector<MaterialDef>& m
     w.tileM = Get<float>(pl, "tile", 0.f);
     w.rarity = Get<int>(pl, "rarity", 0);
     w.maxSlope = Get<int>(pl, "maxSlope", 0);
+    w.minY = Get<int>(pl, "minY", -1);
+    w.maxY = Get<int>(pl, "maxY", -1);
     auto add = [&](const std::string& n) {
       if (n.empty() || n == "none") return;
       w.materials.push_back(n);
@@ -213,6 +216,43 @@ bool LoadBiomeSet(const std::string& assetDir, const std::vector<MaterialDef>& m
     const json& gr = Sub(j, "ground");
     add(GetS(gr, "skin")); add(GetS(gr, "soil")); add(GetS(gr, "rock"));
     add(GetS(sh, "mudMaterial")); add(GetS(sh, "mossMaterial"));
+    // ---- the geometry half (P-F): the bed, the mud ring, the profile ----
+    // The profile is read the way watergen.js sanitizeProfile reads it:
+    // finite pairs, clamped to [0,1], sorted by u, pinned to u = 0 and u = 1,
+    // exact-duplicate u collapsed. worldmap::WaterGeomOf samples it.
+    w.bedShallow = GetS(bd, "shallow");
+    w.bedDeep = GetS(bd, "deep");
+    w.bedSubstrate = GetS(bd, "substrate");
+    w.bedShallowId = matId(w.bedShallow);
+    w.bedDeepId = matId(w.bedDeep);
+    w.bedSubstrateId = matId(w.bedSubstrate);
+    w.bedShallowDepthM = Get<float>(bd, "shallowDepth", 0.f);
+    w.bedThicknessM = Get<float>(bd, "thickness", 0.3f);
+    w.mudWidthM = Get<float>(sh, "mudWidth", 0.f);
+    w.mudMaterial = GetS(sh, "mudMaterial");
+    w.mudId = matId(w.mudMaterial);
+    {
+      std::vector<std::pair<float, float>> pts;
+      for (const json& q : Arr(ba, "profile")) {
+        if (!q.is_array() || q.size() < 2 || !q[0].is_number() || !q[1].is_number()) continue;
+        const float u = q[0].get<float>(), v = q[1].get<float>();
+        if (!std::isfinite(u) || !std::isfinite(v)) continue;
+        pts.emplace_back(std::clamp(u, 0.f, 1.f), std::clamp(v, 0.f, 1.f));
+      }
+      std::stable_sort(pts.begin(), pts.end(),
+                       [](const auto& a, const auto& b) { return a.first < b.first; });
+      if (pts.empty()) { pts.emplace_back(0.f, 1.f); pts.emplace_back(1.f, 0.f); }
+      if (pts.front().first > 0.f) pts.insert(pts.begin(), {0.f, pts.front().second});
+      if (pts.back().first < 1.f) pts.emplace_back(1.f, pts.back().second);
+      pts.front().first = 0.f; pts.back().first = 1.f;
+      std::vector<std::pair<float, float>> dedup;
+      dedup.push_back(pts[0]);
+      for (size_t i = 1; i < pts.size(); i++) {
+        if (pts[i].first - dedup.back().first > 1e-4f) dedup.push_back(pts[i]);
+        else dedup.back() = pts[i];
+      }
+      w.profile = std::move(dedup);
+    }
     // ---- the flora half (P-E), the part worldgen reads today ----
     w.mossChance = Get<int>(sh, "mossChance", 0);
     w.mossMaterial = GetS(sh, "mossMaterial");
@@ -414,11 +454,38 @@ int ValidateBiomeSet(const BiomeSet& set, std::vector<std::string>& out) {
       if (seen[r.species]++) bad(at + "trees.species lists \"" + r.species + "\" twice");
       if (r.weight < 0) bad(at + "trees.species[" + std::to_string(i) + "] weight < 0");
     }
+    {
+      int live = 0;
+      for (const WaterRow& r : b.water) if (r.rarity > 0 && r.tileM > 0 && water.count(r.preset)) live++;
+      if (live > static_cast<int>(worldmap::kWaterRowsMax))
+        bad(at + "water.features has " + std::to_string(live) + " rows that roll; worldgen rolls at most " +
+            std::to_string(worldmap::kWaterRowsMax) + " per biome (the rest are dropped)");
+    }
     for (size_t i = 0; i < b.water.size(); i++) {
       const WaterRow& r = b.water[i];
-      if (!water.count(r.preset)) bad(at + "water.features[" + std::to_string(i) + "] preset \"" + r.preset + "\" has no assets/water/<name>.json");
-      if (r.tileM <= 0) bad(at + "water.features[" + std::to_string(i) + "] tile must be > 0");
-      if (r.rarity < 0) bad(at + "water.features[" + std::to_string(i) + "] rarity < 0");
+      const std::string row = at + "water.features[" + std::to_string(i) + "] ";
+      auto it = water.find(r.preset);
+      if (it == water.end()) { bad(row + "preset \"" + r.preset + "\" has no assets/water/<name>.json"); continue; }
+      if (r.tileM <= 0) bad(row + "tile must be > 0");
+      if (r.rarity < 0) bad(row + "rarity < 0");
+      // P-F: a rolled disc never leaves its own tile (pondInfo's inset), so
+      // the row's tile has to hold the preset's WIDEST disc plus the margin
+      // the inset keeps, or the row can never place anything -- which the
+      // page would show as a rarity that does nothing.
+      const worldmap::WaterGeom g = worldmap::WaterGeomOf(*it->second);
+      const int tileVox = static_cast<int>(std::lround(r.tileM * kVoxelsPerMetre));
+      const int need = 2 * (g.radiusMin + g.radiusSpan - 1 + 4) + 1;
+      if (r.rarity > 0 && tileVox < need)
+        bad(row + "tile " + std::to_string(r.tileM) + " m cannot hold a \"" + r.preset + "\" disc (max radius " +
+            std::to_string(g.radiusMin + g.radiusSpan - 1) + " vox): needs >= " +
+            std::to_string(need / static_cast<float>(kVoxelsPerMetre)) + " m");
+      // The shore/berm band scans at most one neighbouring tile per axis
+      // (pondNear), which is sound only while the band is under half the
+      // LATTICE -- and the lattice is the finest tile of any biome.
+      const int lattice = worldmap::PondLatticeVox(set);
+      if (r.rarity > 0 && lattice > 0 && g.band > lattice / 2 - 1)
+        bad(row + "preset \"" + r.preset + "\" shore/berm band " + std::to_string(g.band) +
+            " vox exceeds half the pond lattice (" + std::to_string(lattice) + " vox, the finest water tile of any biome)");
     }
     for (size_t i = 0; i < b.caves.size(); i++) {
       if (b.caves[i].preset != "near_surface" && b.caves[i].preset != "deep")
@@ -443,6 +510,30 @@ int ValidateBiomeSet(const BiomeSet& set, std::vector<std::string>& out) {
     if (w.radiusM <= 0) bad(at + "footprint.radius must be > 0");
     if (w.depthM <= 0) bad(at + "bathymetry.depth must be > 0");
     if (w.rimDepthM > w.depthM + 1e-6f) bad(at + "rimDepth exceeds depth");
+    // P-F: the geometry the engine carves. The band has two ceilings of its
+    // own (pondNear's 8-step bisection resolves 0..255; half the lattice is
+    // checked per biome row above), and the bed thickness must be a cell.
+    {
+      const worldmap::WaterGeom g = worldmap::WaterGeomOf(w);
+      if (w.shoreBandM * kVoxelsPerMetre > 255.f)
+        bad(at + "shore.band > 25.5 m exceeds pondNear's 8-step bisection");
+      if (w.bermWidthM * kVoxelsPerMetre > 255.f)
+        bad(at + "berm.width > 25.5 m exceeds pondNear's 8-step bisection");
+      if (w.radiusVM < 0) bad(at + "footprint.radiusV must be >= 0");
+      if (w.radiusM - w.radiusVM < 0.4f)
+        bad(at + "footprint.radius - radiusV must be >= 0.4 m (a 4-voxel disc)");
+      if (w.depthM > 20.f) bad(at + "bathymetry.depth > 20 m");
+      if (w.bedThicknessM < 0) bad(at + "bed.thickness must be >= 0");
+      // Not a refusal: a bowl face steeper than the CA's angle of repose gets
+      // the substrate instead of the powder bed (genCellIn's bedSolid), so a
+      // steep authored tarn stays settled. Said once here so the author
+      // knows why the bed is stone on the walls.
+      const int steep = worldmap::WaterGeomSteepestQ8(g, g.radiusMin);
+      if (steep > 256 && g.bedSubstrate == 0 && (g.bedShallow || g.bedDeep))
+        bad(at + "bathymetry is steeper than one voxel per column at the smallest radius (" +
+            std::to_string(steep / 256.0) + " vox/col) and bed.substrate names no material -- "
+            "the powder bed on those faces would avalanche forever (rule 2); name a solid substrate or flatten the profile");
+    }
     const bool wet = !w.fill.empty() && w.fill != "none";
     if (wet && !w.fillId) bad(at + "fill.material \"" + w.fill + "\" is not a material");
     for (const std::string& u : w.unresolved)

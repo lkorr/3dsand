@@ -2,10 +2,10 @@
 
 Status: IN PROGRESS. Supersedes `PLAN_biomes.md` §5 (the wiring order) and
 closes the follow-up list in `PLAN_world_map.md`. **Landed:** P-A, P-B, P-C
-(2026-09-04), P-D, P-E (2026-09-05). **Open:** P-F, P-G, P-H, P-I, run in
-that order as one worktree + one rebaseline each, under the §5 brief below
-(owner, 2026-09-05), which widens P-F and P-G so the map — not tuning — is
-the whole environment.
+(2026-09-04), P-D, P-E (2026-09-05), P-F (2026-09-06: lakes are map content,
+presets carve the bowl). **Open:** P-G, P-H, P-I, run in that order as one
+worktree + one rebaseline each, under the §5 brief below (owner, 2026-09-05),
+which widens P-F and P-G so the map — not tuning — is the whole environment.
 
 ## 0. Why edits do not show today (measured on main 482b756)
 
@@ -239,20 +239,109 @@ All outside the height mirror: table reads. As built (2026-09-05):
   `kBF_GroundFlora` in `genColumn` (so an oasis's shore rows never show in
   the desert) — that gate is the band geometry's and moves with P-F.
 
-### P-F  Water presets drive pond geometry (the mirror package)
+### P-F  Water presets drive pond geometry (the mirror package) — LANDED
 
-`pondInfo/pondAt/pondNear/bermLift` sit inside `MIRROR-BEGIN height`, so:
+Status: LANDED 2026-09-06 (branch `worktree-agent-a00095fe9e8995fe3`), as
+widened by §5. As built:
 
-- Per-biome water rows → a packed table: tile, rarity, radius min/span,
-  depth, rim depth, berm height/width, shore band/lift, bed materials. The
-  preset's bathymetry curve is sampled to a Q8 table of 17 knots at load.
-  P-E left words 22..31 of each `kW_*` record for this, and `kB_WaterPreset`
-  becomes the pond site's preset instead of the biome's first row.
-- `World::TerrainHeight` reads the same table through a C++ twin with the
-  same identifier spelling (the `POND_TILE → pondTile` normaliser alias
-  already exists for this). `terrain` C1 (9,409 columns) is the proof;
-  `terrain` A6 and the `waterbody` gate gain a `Profiled` bowl.
-- Delete the nine `pond*` and four `shore*` geometry knobs.
+- **The water record grew, 32 → 64 words** (`worldmap.h kW_*`): the P-E
+  flora half stays at 0..21; the geometry half is 22..49 — radius min/span,
+  depth, rim depth, berm height/width, shore band/lift/mud width, mud
+  material, bed shallow/deep/substrate + shallow depth + thickness, the
+  informational placement gates, `kW_Band = max(shore band, berm width)`,
+  and **17 Q8 profile knots** two per word. `WaterGeomOf` is the ONE
+  conversion (metres → voxels, curve → knots, ceilings), used by the packer
+  and kept on `WorldMapData::water` for the CPU twin, so both sides read the
+  same integers by construction.
+- **The profile is parametrised by d²/r², not d/r.** The shader has no sqrt
+  (rule 1) and evaluates the bowl from `dx²+dz²`, so the curve
+  (`watergen.js profileAt`, ported to C++ as the load-time sampler) is
+  sampled at u_k = sqrt(k/16) and interpolated linearly in d² between knots
+  (`bowlDepth`). Knots are forced non-increasing and pinned 256 → 0, so the
+  bowl is a bowl and the basin curve can invert it by bisection
+  (`waterbody.cpp` `WaterBasinKind::Profiled` asks `World::BowlDepth`, the
+  mirrored function, rather than restating the shape).
+- **One pond lattice, thinned per biome** — the tree rule again. The
+  lattice is the finest live `water.features[].tile` of any biome
+  (`kHPondTile`, floor 6.4 m; a header word, not a prelude constant, so
+  `check_shaders.sh` needed nothing). Each biome's rows are packed after its
+  cover rows (`kR_*`: preset, `(T/tile)²/rarity` in Q16, minY/maxY/maxSlope)
+  and `pondInfo` rolls them in authored order at the tile's site, first hit
+  wins, conditions at the pond centre. `kB_WaterPreset` (the P-E interim) is
+  gone: a pond wears the preset of the row that rolled it.
+- **Authored lakes are site records** (`kSiteWater`, `{kind: "water",
+  preset, at, radius?}`; `kS_Preset`): found per column through the same
+  site index plane as stamps (`waterSiteNear`), `sitePadAt` skips the kind,
+  and `siteKeepOut` tests a water site by DISC + band rather than by cells,
+  so a lake does not bald four 102 m cells of forest. `pondCover` takes the
+  authored lake first, then the rolled pond; `pondNear` scans the widest
+  band any preset asks for (`kHPondBand`) and tests each candidate against
+  its own. Rolled ponds keep out of every site by the disc's centre and four
+  extremes (`pondKeepOut`). The shipped map gained one, `home_lake`
+  (`spawn_lake` preset, east of spawn).
+- **The repose pairing became a per-column decision.** `LoadTuning` used to
+  clamp the depth against the smallest radius so the sand bed never sat on a
+  face steeper than a voxel per column. Now `bowlSteep` (in the mirror)
+  compares the bowl depth here against one voxel further out; a face that
+  steep wears the preset's `bed.substrate` instead of its powder bed
+  (`Col.bedSolid`), so a preset may be as deep as its author drew it and
+  the world still settles. `ValidateBiomeSet` reports a steep preset that
+  names no substrate. The cave-shell depth clamp is gone too: caves sit 40
+  under each column's OWN (carved) height, so a bowl cannot breach them.
+- **The bed and the mud are the preset's:** `bed.shallow` under water
+  shallower than `bed.shallowDepth`, `bed.deep` below, `bed.thickness`
+  cells, `shore.mudMaterial` on the mud ring; the fill is `fill.material`
+  (none = a dry bowl, a playa). The shore band's existence follows the pond
+  now, not `kBF_GroundFlora`.
+- **Deleted knobs (12):** `pondTile`, `pondChance`, `pondRadiusMin/Span`,
+  `pondMaxSlope`, `pondBerm`, `pondBermWidth`, `pondDepth`, `pondDepthRim`,
+  `shoreBand`, `shoreMudWidth`, `shoreLift` — from `tuning_params.def`,
+  `tuning.h`, `LoadTuning` (reads + the whole clamp block),
+  `WorldgenDefaultsJson`, `tuning.json`, `tuner_schema.js`,
+  `tuning_prelude.py`. `World::PondTileSize` is the lattice; `PondDisc` /
+  `PondQuery` carry the preset's geometry so the gates and the registry read
+  nothing by hand; `World::WaterSiteCount/Disc`, `BowlDepth`, `PondReachMax`
+  are new.
+- **Gates:** `terrain` A6 asserts against the query's own berm; `waterbody`'s
+  bowl arm is `Profiled` on the tarn it finds; `spawn-site` reads a water
+  site's cells as fine unless the spawn is under or on the shore of it;
+  `biomes` refuses a row whose tile cannot hold its preset's widest disc or
+  whose band exceeds half the lattice (swamp's marsh tile went 25.6 → 28.8 m
+  for exactly that). `check_invariants.py` learned `kR_*` and the site kinds.
+- **Map page:** a `Water` tool — click places a lake with the chosen preset
+  and radius, drag moves it, shift-click deletes; the footprint and its band
+  are drawn to scale. `envlive.js`: the water rows and the geometry fields
+  are live; the shaped footprint, floor noise, `fill.level`, `coreFrac` and
+  the per-preset ground are `later`; `placement.*` are the row defaults.
+- **The driver's compile time is a budget, and this package spent it three
+  times before learning the shape.** The first cut read the table inside
+  `pondInfo` and let the tree scans inline it: worldgen's cold compile went
+  from ~5 min to never (26 min once, killed at 10 GB four times). What
+  finally held it: (1) the pond lattice is a PRELUDE CONSTANT (`POND_TILE`,
+  `gpu/resources.cpp`, mirrored by `scripts/pond_lattice.py` for
+  `check_shaders.sh`; `Simulation::UploadEnvironment` recompiles when a
+  reload moves it) because worldgen divides by it in ~1000 inlined places
+  and a division by a buffer word there is a full expansion each time; (2)
+  the radius roll is a multiply-and-shift, never a modulo by a table word;
+  (3) the biome rows roll UNROLLED over a cap of four (`kWaterRowsMax`),
+  never a buffer-bounded loop with a break; (4) **a column's pond
+  candidates are scanned ONCE** (`pondScan` → `PondSet`, five named slots,
+  the site plus up to four rolled tiles) and handed BY VALUE to the bowl,
+  the shore, the tree/cactus scans and the near-water conditions, which
+  are pure arithmetic on it — `pondRoll` (thirty table reads) was being
+  inlined ~500 times per column path through the four 25-tile tree scans;
+  (5) exactly two `landAt` per column for ponds (`pondGate` on the covering
+  candidate and on the nearest shore candidate), none in the scans: trees
+  and cacti refuse a CANDIDATE's disc and conditions measure distance to a
+  candidate, ungated, which costs a tree on a refused hillside tarn now and
+  then. Design rule for anything that reads the worldMap buffer from the
+  height path from now on: resolve it per COLUMN into a value and pass the
+  value into the per-candidate scans.
+- **Not built, deliberately:** `fill.level` (a part-full body; the waterline
+  is the rim ground); the harness tarn at (420,420) stays the authored pool
+  in `landColumnBare` — it never came from `pondInfo`, and its flat stone
+  floor is what the fixtures were written against (a `spawn_lake` preset
+  with the same numbers exists for the day it becomes a site).
 
 ### P-G  Terrain per biome and per map
 

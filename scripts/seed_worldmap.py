@@ -117,7 +117,12 @@ meta = {
         # the pad refuses trees and cover, so spawn sits past its edge plus
         # the widest crown reach, still inside the forced-forest cells.
         {"id": "spawn", "kind": "spawn", "at": [900, 900],
-         "about": "Where the game starts, and the centre of the calm home area (worldgen.spawnPlain*). Outside the harness pad by more than the widest crown reach (115 vox past x/z 640), on forced forest, on land: the spawn-site gate checks all of that."}
+         "about": "Where the game starts, and the centre of the calm home area (worldgen.spawnPlain*). Outside the harness pad by more than the widest crown reach (115 vox past x/z 640), on forced forest, on land: the spawn-site gate checks all of that."},
+        # An AUTHORED lake (PLAN_environment_truth P-F): Tier A, the same place
+        # on every seed, wearing the spawn_lake preset's geometry. East of
+        # spawn by more than its radius + shore band.
+        {"id": "home_lake", "kind": "water", "preset": "spawn_lake", "at": [1240, 900],
+         "about": "An AUTHORED lake (P-F): same place on every seed, the spawn_lake preset's geometry. East of spawn by more than its radius + shore band, so the spawn-site gate sees it as near-but-dry ground."}
     ],
     "rules": []
 }

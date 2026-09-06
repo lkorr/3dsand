@@ -132,7 +132,9 @@ constexpr uint32_t kWaterDrainSettleTicks = 64;
 // sweep will produce for dug terrain.
 enum class WaterBasinKind : uint32_t {
   FlatDisc = 0,      // the three authored pools: floor is one Y, walls vertical
-  ParabolicBowl = 1, // a tarn: pondAt's integer parabola
+  ParabolicBowl = 1, // the pre-P-F tarn: an integer parabola (kept for the gate's round-trip arm)
+  Profiled = 2,      // a P-F tarn or authored lake: the preset's sampled profile,
+                     // World::BowlDepth(preset, r, d2), inverted by bisection
 };
 
 // THE CONTAINER. A pure function of (seed, tuning) — nothing here is measured
@@ -162,6 +164,7 @@ struct WaterBasin {
   // because the body is no longer a body, it is a flow.
   int spillY = 0;
   WaterBasinKind kind = WaterBasinKind::FlatDisc;
+  uint32_t preset = 0;       // Profiled: the water preset (1-based) the bowl wears
   // The material by NAME, resolved at the consumer's boundary (design guideline
   // #4: author content by name, resolve at load). Storing an id here would bake
   // a materials.json ordering into a derived cache.

@@ -183,7 +183,12 @@ Status GateSpawnSite(Ctx& c, std::string& detail) {
   std::string why;
   if (!m.spawnAuthored) why += "; map.json sites[] has no kind \"spawn\" (loader defaulted)";
   if (inBox) why += "; inside the harness box";
-  if (siteCell) why += "; on stamp site " + std::to_string(siteCell - 1) + "'s cells";
+  // A water site's cells are not a keep-out (its DISC + band is, P-F), so a
+  // spawn on a lake's cells is fine as long as it is not under the water
+  // (pq.inDisc, below) or on its wet fringe.
+  const bool waterCell = siteCell && m.sites[static_cast<size_t>(siteCell - 1)].kind == worldmap::kSiteWater;
+  if (siteCell && !waterCell) why += "; on stamp site " + std::to_string(siteCell - 1) + "'s cells";
+  if (waterCell && pq.near) why += "; on authored lake \"" + m.sites[static_cast<size_t>(siteCell - 1)].id + "\"'s shore";
   if (h <= m.seaLevelY) why += "; ground y" + std::to_string(h) + " is under seaLevelY " + std::to_string(m.seaLevelY);
   if (pq.inDisc) why += "; under a tarn (surface y" + std::to_string(pq.surf) + ")";
   if ((int)b == m.oceanBiome) why += "; biome is the ocean";

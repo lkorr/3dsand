@@ -492,24 +492,12 @@ SPEC = [
     ("worldgen", "curveDesert7", "TUNE_CURVE_DESERT7", "i", 12288),
     ("worldgen", "curveDesert8", "TUNE_CURVE_DESERT8", "i", 16384),
     ("worldgen", "biomeBlend", "TUNE_BIOME_BLEND", "i", 18),
-    ("worldgen", "pondTile", "TUNE_POND_TILE", "i", 448),
-    ("worldgen", "pondChance", "TUNE_POND_CHANCE", "u", 4),
-    ("worldgen", "pondRadiusMin", "TUNE_POND_RADIUS_MIN", "i", 48),
-    ("worldgen", "pondRadiusSpan", "TUNE_POND_RADIUS_SPAN", "u", 32),
-    ("worldgen", "pondMaxSlope", "TUNE_POND_MAX_SLOPE", "i", 96),
-    ("worldgen", "pondBerm", "TUNE_POND_BERM", "i", 5),
-    ("worldgen", "pondBermWidth", "TUNE_POND_BERM_WIDTH", "i", 14),
-    ("worldgen", "pondDepth", "TUNE_POND_DEPTH", "i", 26),
-    ("worldgen", "pondDepthRim", "TUNE_POND_DEPTH_RIM", "i", 3),
+
+    # ponds and shores: NOT KNOBS ANY MORE (P-F)
 
     # pond life: lilypads, reeds, kelp
 
     # vines / climbers / hanging moss (worldgen agent B)
-
-    # shoreline: the wet fringe outside a pond
-    ("worldgen", "shoreBand", "TUNE_SHORE_BAND", "i", 24),
-    ("worldgen", "shoreMudWidth", "TUNE_SHORE_MUD_WIDTH", "i", 10),
-    ("worldgen", "shoreLift", "TUNE_SHORE_LIFT", "i", 12),
 
     # desert / pine highland / alpine ground cover (worldgen agent E)
     ("worldgen", "alpineChance", "TUNE_ALPINE_CHANCE", "u", 40),

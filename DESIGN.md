@@ -1934,6 +1934,26 @@ mirrored cheaply (it needs `treeAt`'s tile scan in a tick path); every one of
 TerrainHeight's ~30 callers is asking where the ground is so it can stand
 something on it.
 
+**The pond half of the contract reads a table since P-F** (environment truth,
+2026-09-06). `pondInfo` / `bowlDepth` / `bermLift` / `pondNear` stay inside
+`MIRROR-BEGIN height` and token-identical on both sides, but every number
+they use is a water PRESET's (`assets/water/<name>.json`, packed by
+`worldmap::WaterGeomOf` into the worldMap buffer's `kW_*` record and kept on
+`WorldMapData::water` for the twin) read through accessors spelled the same
+in both files — `wmWaterI`, `waterKnot`, `wmWaterRow`, `pondTile`,
+`pondBand`. WHICH preset a column's pond wears comes from two sources through
+one `Pond`: the biome's `water.features[]` rows rolled on the one pond
+lattice (`kHPondTile`, the finest water tile of any biome, thinned per row
+like the trees), or a `kind: "water"` site on the map (`waterSiteAt`,
+found per column through the site index plane; its keep-out is its disc plus
+its band, never its cells, and `sitePadAt` skips it). The bowl is the
+preset's sampled profile, linear in d² between knots so the shader needs no
+sqrt; a face steeper than a voxel per column wears the preset's substrate
+instead of its powder bed (`bowlSteep`), which is what let the depth stop
+being bounded by the radius. The `terrain` gate's C1 is still the per-voxel
+proof; the harness tarn at (420,420) is still the authored pool below, not
+a site.
+
 Two things are deliberately **outside** the contract. The **arena** levels its
 footprint as a material override in `genCellIn`, not as a change to `Col.h` —
 folding it in would double-apply it and move cave depth and tree bases under its
@@ -6077,7 +6097,14 @@ Three pieces:
   `a >= m*b` for non-negative integers — so there is no resampling and no
   floating point. Cells, never columns: counting columns would silently
   reimplement the single-span-per-column assumption that got heightfields
-  rejected.
+  rejected. **Since P-F (environment truth, 2026-09-06) the bowl is the water
+  PRESET's profile, not a parabola:** `bowlDepth` interpolates seventeen Q8
+  knots in d² (sampled at sqrt(k/16) at load, forced non-increasing), and the
+  registry's `Profiled` kind inverts THAT by bisection over d² against
+  `World::BowlDepth`, the mirrored function itself — still integer, still no
+  fourth copy. The disc, its preset and the preset's berm ride in
+  `PondDisc`; `World::WaterSiteDisc` publishes the map's authored lakes
+  beside the rolled tarns.
 * **The jurisdiction ladder** (component 5's structure). Below spill, over a
   volume threshold, quiescent for K ticks, no straddling chunks. Enter and exit
   thresholds are distinct and `LoadTuning` FORCES the gap, because a body parked
