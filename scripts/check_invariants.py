@@ -1575,7 +1575,63 @@ def check_burn_tint_sites():
         checked.append("burn tint sites")
 
 
+# ------------------------------------------------------- env predictions
+def check_env_predictions():
+    """tests/env_predictions.json (written by scripts/test_environment.mjs
+    section 8) is the JS side of the env-truth gate's nominal port: the biome
+    pages' trees/ha and cover 1-in-N, keyed by an FNV-1a over
+    assets/biomes/*.json in biomes::HashFileSet's (name, 0, bytes) sequence.
+    The gate refuses a stale file at runtime; this is the same check without
+    a GPU, so a biome edit that forgot the export fails here first."""
+    p = ROOT / "tests" / "env_predictions.json"
+    if not p.exists():
+        problems.append("tests/env_predictions.json is missing -- run "
+                        "`node scripts/test_environment.mjs` and commit it")
+        return
+    try:
+        j = json.loads(p.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        problems.append(f"tests/env_predictions.json does not parse: {e}")
+        return
+    d = ROOT / "assets" / "biomes"
+    h = 0x811C9DC5
+    def mix(b):
+        nonlocal h
+        for x in b:
+            h ^= x
+            h = (h * 0x01000193) & 0xFFFFFFFF
+    for n in sorted(f.name for f in d.iterdir() if f.is_file() and f.suffix == ".json"):
+        mix(n.encode("utf-8"))
+        mix(b"\0")
+        mix((d / n).read_bytes())
+    want = f"{h:08x}"
+    if j.get("biomesHash") != want:
+        problems.append(f"tests/env_predictions.json is STALE: biomesHash "
+                        f"{j.get('biomesHash')} but assets/biomes/*.json hashes {want} -- "
+                        "run `node scripts/test_environment.mjs` and commit the file")
+        return
+    names = sorted(f.stem for f in d.iterdir() if f.is_file() and f.suffix == ".json")
+    have = sorted((j.get("biomes") or {}).keys())
+    if names != have:
+        problems.append(f"tests/env_predictions.json lists biomes {have} but "
+                        f"assets/biomes has {names}")
+        return
+    # The nominal formulas, restated: a drift here is the JS and the C++ port
+    # disagreeing about what the page prints, which the gate would also catch.
+    for n in names:
+        b = json.loads((d / (n + ".json")).read_text(encoding="utf-8"))
+        t = b.get("trees", {})
+        tile, dens = float(t.get("tile", 14.4)), float(t.get("density", 0))
+        per_ha = (10000.0 / (tile * tile)) * dens / 100.0 if tile else 0.0
+        e = j["biomes"][n]
+        if abs(e.get("treesPerHa", -1) - per_ha) > 1e-6 * max(1.0, per_ha):
+            problems.append(f"env predictions: {n} treesPerHa {e.get('treesPerHa')} "
+                            f"but the biome file gives {per_ha}")
+    checked.append("env predictions")
+
+
 ALL = {
+    "envpred": check_env_predictions,
     "autofly": check_autofly_surface,
     "worldgen": check_worldgen_mirror,
     "treeatlas": check_tree_atlas,
@@ -1634,6 +1690,8 @@ RELEVANT = {
     "src/measure/perfnodes.h": ["perfnodes"],
     "src/measure/perfsuite.cpp": ["autofly"],
     "src/main.cpp": ["arch", "autofly"],
+    "tests/env_predictions.json": ["envpred"],
+    "scripts/test_environment.mjs": ["envpred"],
 }
 
 if __name__ == "__main__":

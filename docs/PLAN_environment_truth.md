@@ -359,20 +359,86 @@ widened by §5. As built:
   The World map page gets a "Terrain" section for them with the heightmap
   backdrop the follow-up list already wanted.
 
-### P-H  The accuracy gate: `env-truth`
+### P-H  The accuracy gate: `env-truth` — LANDED 2026-09-05
 
-What makes "changes the game accurately" a tested claim:
+What makes "changes the game accurately" a tested claim. As built
+(`src/test/selftest_envtruth.cpp`, in `kOrder` right after `env-reload`):
 
-- For every biome: pack a synthetic one-biome map in memory (flat landform,
-  no sites), run worldgen over a 4-chunk window on a fixed seed, and measure
-  from the GPU: trees per hectare (trunk columns at ground), cover fraction
-  per row, skin and subsoil materials, bodies of water per km² (on a larger
-  window, P-F). Compare to predictions from a C++ port of `biomegen.js`'s
-  `densityStats`/`rarityStats` — held to the JS by `scripts/
-  test_environment.mjs` exporting the same numbers to JSON and
-  `check_invariants.py` comparing. Tolerances in `tests/baseline.json`.
-- Runs under `--gate env-truth` alone (~10 s); the per-biome table is
-  printed so a miss names the biome and the row.
+- **One synthetic one-biome world per biome file**, packed IN MEMORY from a
+  copy of the loaded map: that biome on every cell, landform 128 (flat),
+  no stamp sites, the harness box moved a million voxels away
+  (`crownMeetsHarness` has no "no box" case, so an empty box would still
+  catch crowns spanning the origin), the spawn — and so the calm home area
+  — at the residency window's centre. Uploaded through the F7 seam
+  (`Simulation::UploadEnvironment` + `SubmitWorldgen`) with
+  `worldmap::SetCurrentWorldMap` so the CPU twins read the same map;
+  restored at the end by the same `ReloadEnvironment` + regen `env-reload`
+  uses, so `waterbody` still sees the pristine world `terrain` left.
+- **The whole 512² window is measured**, not 4 chunks: a lattice tile is
+  56 voxels, so the window holds only 73 tree sites and the sparse biomes
+  expect one or two trees; a smaller box would have no statistics at all.
+  Per biome that is 241,503 eligible surface columns (below the treeline,
+  off the authored pool's rim ring and any tarn or shore the twin reports)
+  = 0.24 ha.
+- **Trees per SITE, not per trunk voxel.** `treeSite()` is replayed on the
+  CPU (`rng::Hash3`, the one mirror of `hash3`); the tree is present if the
+  voxel at h + 1 + ly on the trunk column is the (ly, material) a variant
+  puts at its anchor. Expected count = Σ over sites of `kB_TreeChanceQ16`
+  × the weight share of species that pass their minY/maxY (species file
+  and biome row, exact from the twin's h), an INTERVAL [lo, hi] where a
+  nearWater row counts in hi only (the 60-voxel water walk is outside
+  `World::PondNearColumn`'s band), and a binomial σ. Asserted within
+  `envTruthSigmas` σ + `envTruthTreeSlack` trees.
+- **Cover per row** from the voxel at h + 1, rows rolled in order with
+  first-hit-wins, the biome patch mask modelled in DISTRIBUTION
+  (`PatchPassFraction`: the exact integer smoothstep-bilinear of four
+  uniform corners that `vnoise2d` is; the noise twin itself is
+  file-static in `world.cpp`). Where nothing but the row can place its
+  material (alpine, desert's non-cactus rows, ocean) it is asserted:
+  measured 1.21 / 0.68 / 2.15 / 1.15 / 0.83 % against expected 1.24 /
+  0.68 / 2.15 / 1.12 / 0.83 %. Skin at y == h: 100 % in every biome.
+- **The nominal port** (`densityStats`, "1 in N") is held to the JS:
+  `scripts/test_environment.mjs` §8 writes `tests/env_predictions.json`
+  (COMMITTED, with an FNV-1a over `assets/biomes/*.json` in
+  `biomes::HashFileSet`'s sequence); the gate fails on a stale or
+  disagreeing file and `check_invariants.py` (`envpred`) fails on a stale
+  one without a GPU. Thresholds and the recorded values (`envTruth*`) are
+  in `tests/baseline.json`; every run writes `build/env_truth.json`.
+- **Cost: 27 s, not 10** — attributed, not guessed: gen 2.4–2.8 s per
+  biome (pack + upload + a full-window `SubmitWorldgen`, which includes
+  the page classifier's whole-window readback), twins 0.22 s, readback
+  0.21 s. Eight full-window regens are 80 % of it; a "regenerate this
+  sub-box" seam in `support.cpp` would bring the gate to ~5 s.
+
+What it found, which is the point of a gate like this:
+
+1. **The ground-flora chain is an unauthored second source of cover.**
+   Biomes with `cover.groundFlora` (forest, meadow, pine, swamp, tundra)
+   run the shader's hard-coded undergrowth/flower chain BEFORE the cover
+   stack, placing fern, moss, bramble, grass tufts and flowers the rows
+   also name. In the forest 5.9 % of columns wear a plant NO row placed
+   (swamp 1.5 %, pine 0.9 %, tundra 0.7 %, meadow 0.5 %), and the rows'
+   own fractions are pushed off the page's number in both directions
+   (meadow tall_grass 11.4 % measured vs 8.3 % authored). Those rows are
+   REPORTED, not asserted, and the unauthored share is recorded per biome
+   (`envTruthUnauthoredPct_*`). **P-G should make the chain rows** (it is
+   the same shape as the cover stack, plus a canopy-cover condition), at
+   which point every biome's cover is asserted and that number goes to 0.
+2. **The species height caps sit on the home-area height.** `spawnPlainY`
+   is 200 (20 m); willow's maxY is 20.4 m, great oak 20.6, oak 21.4,
+   eucalyptus 21.2, birch 22 — so on the rolling ground around spawn
+   roughly a quarter of the forest's picks are gated out by altitude and
+   the page's 153 trees/ha becomes an expected 112 (measured 95). The
+   page cannot show this (it has no terrain). Either the caps move up or
+   P-G's terrain-per-map makes the page aware of the home height.
+3. **The subsoil the page names is under a quarter of the ground.** The
+   sediment wedge (`sedSlope` gate, `sedStrip`) leaves dirt under grass on
+   27.5 % of forest/meadow columns, 20.9 % swamp/tundra, 8.6 % desert;
+   the rest is gravel or stone at h − skinDepth. `envTruthSubsoilMinPct`
+   ships at 0 (report-only) until P-G decides whether `cover.subsoil` is
+   a claim about the wedge or about the skin's underside.
+4. Water bodies per km² is P-F's row (`TODO(P-F)` in the table): there is
+   no per-biome pond table to measure against yet.
 
 ### P-I  The Worldgen tab is deleted
 

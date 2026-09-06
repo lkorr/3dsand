@@ -475,6 +475,7 @@ add_library(sandvox_core OBJECT
   src/test/selftest_terrain.cpp
   src/test/selftest_trees.cpp
   src/test/selftest_biomes.cpp
+  src/test/selftest_envtruth.cpp
   src/test/selftest_scale.cpp
   src/test/selftest_sim.cpp
   src/test/selftest_ca.cpp
