@@ -24,6 +24,34 @@ Structural facts: no reprojection, no history buffer, no checkerboarding — the
 only temporal reuse is the shadow cache. Sim and render share one queue, so in
 flight the tick work (~13 ms) serialises ahead of the raymarch.
 
+### Foliage cameras (2026-09-05, branch perf-foliage-cameras)
+
+`--render-budget` gained two procedurally sited cameras, `meadow` (eye height in
+the densest column-plant patch the CPU snapshot can find) and `canopy` (under
+the largest crown, looking up through the leaves), four ceiling arms
+(`micro1`, `plantlod4`, `fine2m`, `lod8` on every camera) and three counters
+(`rmMicroEnters`, `rmPlantEvals`, `rmChunkSkips`; `kRenderStatSlots` 16 -> 19)
+so plant cells ENTERED, plant EVALUATIONS (memo misses) and chunk-skip jumps
+are separable from `rmMicroSteps`. The first run was cut short by the GPU
+lock queue; what it recorded before that (1080p, RTX 3060 Ti, exclusive):
+
+| camera | baseline | noshadow | nofar | nogi | lod8 | halfres |
+|---|---|---|---|---|---|---|
+| noon overlook | 19.6 | 17.4 | 15.5 | 17.6 | **8.9** | 5.4 |
+| dusk overlook | 22.5 | 19.9 | 17.9 | | | 5.8 |
+| submerged | 48.5 | 47.1 | 45.7 | | | 12.4 |
+| meadow (430,240,172) | **23.4** | 22.1 | | | | |
+
+Reading so far: the meadow frame is 23.4 ms at eye height versus 19.6 for the
+overlook, and shadows are not it (1.3 ms). On the overlook the fine 10 cm
+march from 8 to 24 m is still 10.7 ms of 19.6 (`lod8`), which is the largest
+single lever in the table. The meadow ceiling arms (`micro1`, `plantlod4`,
+`fine2m`) and the canopy camera have NOT been measured yet: run
+`SANDVOX_RUN_EXCLUSIVE=1 bash scripts/run.sh ./build/Release/sandvox.exe --render-budget --budget-cams meadow,canopy`
+and fill this table in before building anything from the candidate list in
+memory `project-raymarch-accel-research`. `--shader-stats` before/after the
+counters was also not taken; the raymarch fragment was 168 registers before.
+
 ## 2. Landed
 
 - **Internal render scale + present mode + fps cap** (commit `7f214ac`):
