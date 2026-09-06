@@ -334,6 +334,15 @@ TREE_TEXT="$(python "$ROOT/scripts/tree_lattice.py" --vpm "$W_VPM" --assets "$RO
 }
 PRELUDE_TEXT="$(printf '%s\n%s' "$PRELUDE_TEXT" "$TREE_TEXT")"
 
+# The pond lattice (ShaderConstantPrelude's POND_TILE; P-F): the finest live
+# water tile of any biome, derived from the assets by scripts/pond_lattice.py
+# exactly as worldmap.cpp PondLatticeVox derives it at load.
+POND_TEXT="$(python "$ROOT/scripts/pond_lattice.py" --vpm "$W_VPM" --assets "$ROOT/assets")" || {
+  echo "check_shaders: scripts/pond_lattice.py failed" >&2
+  exit 1
+}
+PRELUDE_TEXT="$(printf '%s\n%s' "$PRELUDE_TEXT" "$POND_TEXT")"
+
 # Lines contributed ahead of the body: prelude + its "\n" + common + its "\n".
 # Error line L in the combined source maps to line L - OFFSET in the body file.
 COMMON_LINES="$(wc -l < "$COMMON" | tr -d ' ')"

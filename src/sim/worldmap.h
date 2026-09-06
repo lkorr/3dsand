@@ -112,6 +112,16 @@ enum : uint32_t {
   // maps keep starting where they did. i32 in u32 words, like the box above.
   kHSpawnX = 28,
   kHSpawnZ = 29,
+  // THE ONE POND LATTICE (P-F, docs/PLAN_environment_truth.md): rolled ponds
+  // sit on one lattice of kHPondTile voxels -- the FINEST `water.features[]
+  // .tile` among the biomes that author water -- and each biome's rows are
+  // thinned on it to the density the page predicts, exactly as trees are
+  // (kR_ChanceQ16 below). 0 = no biome authors water and worldgen rolls
+  // none. kHPondBand is the widest max(shore.band, berm.width) any preset
+  // asks for, in voxels: the height mirror's pondNear scans that far for a
+  // disc before it knows which preset the disc wears.
+  kHPondTile = 30,
+  kHPondBand = 31,
   kHeaderWords = 32,    // padded, like treeatlas::kFileHeaderWords
 };
 // Planes are packed FOUR CELLS PER WORD, little-endian: cell i of a plane at
@@ -163,16 +173,18 @@ enum : uint32_t {
   kB_TreeChanceQ16 = 14,
   // 15 reserved
   // ---- P-E: the flora that used to be worldgen.* knobs ----
-  // P-E INTERIM: a pond has no preset of its own until P-F drives the bowl
-  // from the water table, so every pond and shore in a biome wears the
-  // preset of the biome's FIRST water.features row. 0 = the biome authors no
-  // water rows and grows no shore, pond or moss flora at all.
-  kB_WaterPreset = 16,    // 1 + index into the water preset table; 0 = none
+  // P-F: the biome's water rows (assets/biomes/<name>.json water.features[]),
+  // packed after the cover rows as kWaterRowWords records: which preset, the
+  // thinning chance on the one pond lattice, and the row's conditions. A pond
+  // wears the preset of the ROW that rolled it (or of the authored site that
+  // placed it), never a biome-wide one.
+  kB_WaterCount = 16,
   kB_CaveMushroomChance = 17, // 1-in-N floor cells of the near band; 0 = never
   kB_CaveCrystalChance = 18,  // 1-in-N floor/ceiling cells of the deep band; 0 = never
   kB_CactusChance = 19,       // percent of CACTUS_TILE tiles that grow one (kBF_Cacti gates it)
   kB_SaguaroFraction = 20,    // percent of those that are saguaro columns, not barrels
-  // 21..31 reserved
+  kB_WaterOff = 21,           // word offset of this biome's first water row (P-F)
+  // 22..31 reserved
   kCoverRowWords = 12,
   kC_Mat = 0,
   kC_Head = 1,
@@ -185,6 +197,24 @@ enum : uint32_t {
   kC_NearWaterMax = 8,    // voxels from a pond rim, -1 = unbounded (P-D)
   kC_NearWaterMin = 9,    // at least this many voxels from a rim, 0 = off
   // 10..11 reserved
+  // ---- the biome's water rows (P-F) ----
+  // Rolled in authored order per pond tile, first hit wins (the cover stack's
+  // rule): a row's chance is `(T / tile)^2 / rarity` in Q16 on the shared
+  // lattice T (kHPondTile), so bodies per km^2 match the page's rarityStats
+  // by construction. Conditions are tested at the pond's CENTRE column.
+  kWaterRowWords = 8,
+  // At most FOUR live rows per biome: the shader rolls them unrolled, not in
+  // a loop (a buffer-bounded loop inside a function the driver inlines ~160
+  // times per column path stalled its compile). The packer drops the rest
+  // and ValidateBiomeSet says so.
+  kWaterRowsMax = 4,
+  kR_Preset = 0,          // 1 + index into the water preset table
+  kR_ChanceQ16 = 1,       // 65536 = every lattice tile
+  kR_MinY = 2,            // -1 = unbounded (i32 in u32)
+  kR_MaxY = 3,
+  kR_MaxSlope = 4,        // Q8; 0 or >= 1024 = unbounded
+  kR_PatchThreshold = 5,  // 0..255 gate on the biome patch field at the centre
+  // 6..7 reserved
 };
 // kB_Flags bits. These replace the `biome == B_DESERT` / `== B_PINE` tests
 // that used to gate whole blocks of genCellIn on a hard-coded id.
@@ -198,16 +228,27 @@ inline constexpr uint32_t kBF_SandCap = 1u << 2;      // loose sand cap under th
 // records point into. This is the FLORA half of a preset -- what grows on the
 // wet fringe outside the bowl (shore.plants[], shore.mossChance), and what
 // grows in the water by depth band (aquatic.emergent / floating / submerged).
-// The GEOMETRY half (footprint, bathymetry, berm, shore band/lift) stays on
-// the worldgen.pond* / shore* knobs until P-F; words 22..31 are reserved for
-// it. Mirrored by worldgen.wgsl's WM_W_* / WM_P_* consts; check_invariants.py
+// The GEOMETRY half (P-F) follows at words 22..: the disc radius band, the
+// bowl depth and its 17-knot profile, the berm, the shore band and the bed.
+// Mirrored by worldgen.wgsl's WM_W_* / WM_P_* consts; check_invariants.py
 // holds the two together.
+//
+// THE PROFILE IS PARAMETRISED BY d^2 / r^2, NOT BY d / r. The bowl is
+// evaluated per column from `dx*dx + dz*dz` and the shader has no sqrt it may
+// use (rule 1); so the preset's `bathymetry.profile` curve (watergen.js
+// profileAt, monotone cubic over u = d/r) is sampled at LOAD at the seventeen
+// non-uniform radii u_k = sqrt(k / 16), k = 0..16, into Q8 depth fractions
+// (256 = the full centre depth, 0 = the rim). The shader then interpolates
+// linearly in d^2 between knot floor(16 d^2 / r^2) and the next -- integer
+// throughout, exact on both sides of the mirror, and the shape it draws is
+// the authored curve within a knot's width. Knots are packed two per word,
+// low half first.
 //
 // Depths are voxels of water over the bed, heights voxels from the bed (the
 // aquatic rows) or from the ground (the shore rows); metres in the JSON.
 // Every chance is 1-in-N with 0 = never (the shader guards the modulo).
 enum : uint32_t {
-  kWaterRecWords = 32,
+  kWaterRecWords = 64,
   kW_Fill = 0,                 // fill material id; 0 = a dry preset (informational until P-F)
   kW_ShoreCount = 1,
   kW_ShoreOff = 2,             // word offset of this preset's first shore plant row
@@ -233,7 +274,28 @@ enum : uint32_t {
                                // (jitter and head included): folded into
                                // kB_MaxCoverH / kHMaxCoverH so the sky-skip and
                                // far-blocker ceilings cover it
-  // 22..31 reserved (P-F geometry)
+  // ---- the geometry half (P-F); voxels unless said otherwise ----
+  kW_RadiusMin = 22,           // footprint.radius - radiusV, >= 4
+  kW_RadiusSpan = 23,          // 2 * radiusV + 1, >= 1: a rolled disc is min + hash % span
+  kW_Depth = 24,               // bathymetry.depth at the centre
+  kW_RimDepth = 25,            // bathymetry.rimDepth at the shoreline
+  kW_BermH = 26,               // berm.height: the annulus core is forced to surf + this
+  kW_BermW = 27,               // berm.width: columns over which the lift ramps out
+  kW_ShoreBand = 28,           // shore.band: how far past the rim the wet fringe reaches
+  kW_ShoreLift = 29,           // shore.lift: ground this far above the waterline is bluff
+  kW_MudWidth = 30,            // shore.mudWidth: the inner ring whose skin is mud
+  kW_MudMat = 31,              // shore.mudMaterial id; 0 = the biome skin
+  kW_BedShallow = 32,          // bed.shallow id, on the bowl floor under shallow water
+  kW_BedDeep = 33,             // bed.deep id, elsewhere on the floor
+  kW_BedShallowDepth = 34,     // water shallower than this wears bed.shallow
+  kW_BedThickness = 35,        // cells of bed on the floor, >= 1
+  kW_BedSubstrate = 36,        // bed.substrate id: the SOLID a face too steep for a powder bed wears
+  kW_MaxSlope = 37,            // placement.maxSlope, Q8 (the biome row's own gate is what rolls)
+  kW_MinY = 38,                // placement.minY (i32; informational)
+  kW_MaxY = 39,                // placement.maxY (i32; informational)
+  kW_Band = 40,                // max(kW_ShoreBand, kW_BermW): pondNear's per-disc reach
+  kW_Knots = 41,               // 17 Q8 knots, two per word (low half first): words 41..49
+  // 50..63 reserved
   kShoreRowWords = 8,
   kP_Mat = 0,
   kP_Head = 1,                 // caps the top cells when non-zero
@@ -257,30 +319,82 @@ enum : uint32_t {
 // column lookup in a run-list -- the tree atlas's encoding (mat | y0 << 16 |
 // len << 27), because trees are the proof that a per-cell overlay of
 // authored voxels is correct in the far cascades at any distance.
+// kSiteWater (P-F): an AUTHORED LAKE, Tier A -- `{kind: "water", preset,
+// at: [x, z], radius?}` in map.json. The same record: kS_X/Z is the disc
+// centre, kS_Radius the disc radius (the preset's, or the site's override),
+// kS_PadMargin the preset's shore/berm band (what the site index plane
+// reaches), kS_Preset the water preset. The height mirror's waterSiteNear
+// finds it through the same per-cell index plane the stamps use, and from
+// there it is a Pond like any rolled one -- same bowl, same berm, same shore,
+// same flora -- with its centre from the map instead of the seed. It is not
+// padded (sitePadAt skips the kind) and its keep-out is the DISC plus the
+// band, not its cells (siteKeepOut tests the kind), so a lake does not bald
+// four whole cells of forest around it.
 enum : uint32_t {
   kSiteRecWords = 16,
-  kS_Kind = 0,          // kSiteStamp
+  kS_Kind = 0,          // kSiteStamp | kSiteWater
   kS_X = 1,             // world voxel centre (i32 in u32)
   kS_Z = 2,
   kS_Radius = 3,        // Chebyshev footprint radius in voxels: keep-out + pad
+                        // (a water site: the disc radius)
   kS_PadMargin = 4,     // columns over which the pad ramps back to terrain
+                        // (a water site: its preset's shore/berm band)
   kS_Rot = 5,           // 0..3, informational (baked into the stamp block)
   kS_Salt = 6,
   kS_StampOff = 7,      // word offset of the stamp block, 0 = none
-  // 8..15 reserved
+  kS_Preset = 8,        // water site: 1 + index into the water preset table
+  // 9..15 reserved
   kStampHdrWords = 4,
   kStamp_NX = 0, kStamp_NY = 1, kStamp_NZ = 2, kStamp_Columns = 3,
   // columns: nx*nz pairs of (runOff, runCount), absolute word offsets; runs:
   // mat (12 bits) | y0 << 16 | len << 27, y0 < 2048, len <= 31, y0 ascending
   kSitePad = 0,
   kSiteStamp = 1,
+  kSiteWater = 2,
 };
 
 }  // namespace worldmap
 
-namespace biomes { struct BiomeSet; }
+namespace biomes { struct BiomeSet; struct BiomeDef; struct WaterPresetDef; }
 
 namespace worldmap {
+
+// ---- the geometry half of a water preset, as the engine holds it (P-F) ----
+// ONE conversion from assets/water/<name>.json to voxel integers + the sampled
+// profile, used by the packer (PackBiomeTable -> the kW_* words) AND kept on
+// the loaded map (WorldMapData::water) for the CPU twin of the height mirror,
+// so World::TerrainHeight and the shader read the same integers by
+// construction. Every field is what the kW_* word of the same name holds.
+struct WaterGeom {
+  int radiusMin = 4, radiusSpan = 1;
+  int depth = 1, rimDepth = 0;
+  int bermH = 0, bermW = 1;
+  int shoreBand = 0, shoreLift = 0, mudWidth = 0;
+  int bedShallowDepth = 0, bedThickness = 1;
+  int maxSlope = 1024, minY = -1, maxY = -1;
+  int band = 1;                          // max(shoreBand, bermW)
+  uint32_t fill = 0, mudMat = 0, bedShallow = 0, bedDeep = 0, bedSubstrate = 0;
+  int knots[17] = {};                    // Q8 depth fractions at u_k = sqrt(k/16), non-increasing
+};
+/** The preset's geometry in voxels, profile sampled, every ceiling applied. */
+WaterGeom WaterGeomOf(const biomes::WaterPresetDef& w);
+/** The steepest per-column drop of the sampled bowl at radius `r`, in Q8
+ *  voxels per voxel of radius (256 = one voxel per column, the CA's angle
+ *  of repose). A face steeper than that gets the substrate instead of the
+ *  powder bed (genCellIn), so this is a report, never a refusal. */
+int WaterGeomSteepestQ8(const WaterGeom& g, int r);
+/** One packed water row of a biome (kR_*). */
+struct WaterRowPacked { uint32_t w[kWaterRowWords] = {}; };
+/** The pond lattice: the finest `water.features[].tile` among biomes that
+ *  author a row that can roll, in voxels; 0 when none does. Pure. */
+int PondLatticeVox(const biomes::BiomeSet& set);
+/** The widest max(shore.band, berm.width) over every preset, in voxels. */
+int PondBandVox(const biomes::BiomeSet& set);
+/** A biome's water rows packed for the lattice (chance thinned, conditions
+ *  in voxels). Rows that name no loaded preset or cannot roll are dropped. */
+std::vector<WaterRowPacked> PackWaterRows(const biomes::BiomeSet& set, const biomes::BiomeDef& b, int latticeVox);
+/** 1 + index of the preset by name, 0 if the set has none. */
+uint32_t WaterPresetIndex(const biomes::BiomeSet& set, const std::string& name);
 
 /**
  * Pack the loaded biome set into the `worldMap` buffer's words: header +
@@ -320,12 +434,22 @@ struct WorldMapData {
   // packed into columns of runs at load. `siteIndex` is the per-cell plane.
   struct StampSite {
     std::string id, templateName;
+    int kind = kSiteStamp;                // kSiteStamp | kSiteWater (P-F)
     int x = 0, z = 0, radius = 0, padMargin = 8, rot = 0;
     uint32_t salt = 0;
+    int preset = 0;                       // water site: 1 + preset index
     int nx = 0, ny = 0, nz = 0;
     std::vector<uint32_t> words;          // the packed stamp block, offsets RELATIVE to its start
   };
-  std::vector<StampSite> sites;
+  std::vector<StampSite> sites;           // stamps AND water sites, in site-id order
+  // The water table the height mirror's CPU twin reads (worldgen.wgsl reads
+  // the kW_* / kR_* words; these are the same integers): one WaterGeom per
+  // preset in loader order, each biome's packed rows by biome id, the lattice
+  // and the scan band. Filled by LoadWorldMap from the set it resolved the
+  // palette against, so the two sides cannot see different presets.
+  std::vector<WaterGeom> water;
+  std::vector<std::vector<WaterRowPacked>> biomeWater;
+  int pondTile = 0, pondBand = 0;
   std::vector<uint8_t> siteIndex;         // width*height, site id + 1, 0 = none
   uint8_t SiteCell(int cx, int cz) const {
     return siteIndex.empty() ? 0 : siteIndex[static_cast<size_t>(cz) * width + cx];

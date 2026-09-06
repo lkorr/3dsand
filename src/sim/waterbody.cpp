@@ -74,6 +74,25 @@ int64_t crossSectionD2(const WaterBasin& b, int y) {
   // read as slightly fuller, never as holding water it does not have.
   if (y > b.surfY) return b.discD2Max;
   if (b.kind == WaterBasinKind::FlatDisc) return b.discD2Max;
+  if (b.kind == WaterBasinKind::Profiled) {
+    // P-F: the bowl is the preset's sampled profile, and the inversion asks
+    // THE SAME integer function the height mirror carves with
+    // (World::BowlDepth) rather than restating it: a cell at height y is
+    // inside iff depth(d2) >= k + 1, depth is non-increasing in d2 (the
+    // knots are forced monotone at load), so the largest such d2 is one
+    // bisection over [0, discD2Max]. ~22 steps per level per basin, once
+    // per window rebuild.
+    const int k = b.surfY - y;
+    if (k + 1 <= b.rimDepth) return b.discD2Max;   // shallower than the rim: the whole disc
+    int64_t lo = -1, hi = b.discD2Max;             // invariant: depth(lo) >= k+1 (or lo = -1), depth(hi+1) < k+1
+    if (World::BowlDepth(b.preset, b.radius, 0) < k + 1) return -1;
+    lo = 0;
+    while (lo < hi) {
+      const int64_t mid = (lo + hi + 1) / 2;
+      if (World::BowlDepth(b.preset, b.radius, (int)mid) >= k + 1) lo = mid; else hi = mid - 1;
+    }
+    return lo;
+  }
 
   const int64_t R2 = (int64_t)b.radius * (int64_t)b.radius;
   const int64_t A = b.centreDepth - b.rimDepth;
@@ -187,7 +206,6 @@ void WaterBodySystem::RebuildBasins(const World& world, uint32_t seed) {
   basins_.clear();
   curves_.clear();
 
-  const auto& wg = CurrentTuning().worldgen;
   const IVec3 o = world.WindowOrigin();
   const int lox = o.x * (int)kChunk, loz = o.z * (int)kChunk;
   const int hix = lox + (int)kWorldN - 1, hiz = loz + (int)kWorldN - 1;
@@ -218,39 +236,53 @@ void WaterBodySystem::RebuildBasins(const World& world, uint32_t seed) {
     basins_.push_back(std::move(b));
   }
 
+  // A P-F pond (a rolled tarn or an authored lake) as a basin: the preset's
+  // geometry rides in the PondDisc, so nothing here reads a knob. A dry
+  // preset (no fill) is a bowl with no body and is not registered.
+  const auto addDisc = [&](const World::PondDisc& d, uint32_t id) {
+    if (!d.present || d.fillId == 0u) return;
+    if ((uint32_t)basins_.size() >= kWaterBodyCap) {
+      // Rule 2: budgets are charged BEFORE emission. A window holding more
+      // tarns than the cap simply leaves the extras unregistered, which
+      // means "simulated the way they are today" — the same safe
+      // degradation refusing adoption gives.
+      return;
+    }
+    WaterBasin b;
+    b.id = id;
+    b.cx = d.cx;
+    b.cz = d.cz;
+    b.radius = d.r;
+    b.discD2Max = d.r * d.r;
+    b.surfY = d.surf;
+    b.centreDepth = d.depth;
+    b.rimDepth = d.rimDepth;
+    b.floorY = d.surf - d.depth;
+    b.spillY = d.surf + d.bermH;
+    b.kind = WaterBasinKind::Profiled;
+    b.preset = d.preset;
+    b.matName = "water";
+    basins_.push_back(std::move(b));
+  };
+  // Authored lakes first (stable ids by index on the map), whatever the
+  // window: a lake outside it simply has no resident cells to adopt.
+  for (int i = 0; i < World::WaterSiteCount(); i++) {
+    const World::PondDisc d = World::WaterSiteDisc(i, seed);
+    if (!d.present) continue;
+    if (d.cx + d.r < lox || d.cx - d.r > hix || d.cz + d.r < loz || d.cz - d.r > hiz) continue;
+    addDisc(d, 0x40000000u | (uint32_t)i);
+  }
   // Tarns: one scan of the pond tiles the window touches. A disc never leaves
   // its own tile (pondInfo's inset), so this finds every one that can reach in.
   const int tile = World::PondTileSize();
   if (tile > 0) {
     for (int tz = fdiv(loz, tile); tz <= fdiv(hiz, tile); tz++) {
       for (int tx = fdiv(lox, tile); tx <= fdiv(hix, tile); tx++) {
-        const World::PondDisc d = World::PondTile(tx, tz, seed);
-        if (!d.present) continue;
-        if ((uint32_t)basins_.size() >= kWaterBodyCap) {
-          // Rule 2: budgets are charged BEFORE emission. A window holding more
-          // tarns than the cap simply leaves the extras unregistered, which
-          // means "simulated the way they are today" — the same safe
-          // degradation refusing adoption gives.
-          continue;
-        }
-        WaterBasin b;
         // Stable identity from WHERE it is, not from discovery order: a
         // descriptor that renamed itself when the player walked away would
         // re-adopt every window move, and every re-adoption is a seam crossing.
-        b.id = 0x80000000u | (((uint32_t)tx & 0xFFFFu) << 16) |
-               ((uint32_t)tz & 0xFFFFu);
-        b.cx = d.cx;
-        b.cz = d.cz;
-        b.radius = d.r;
-        b.discD2Max = d.r * d.r;
-        b.surfY = d.surf;
-        b.centreDepth = wg.pondDepth;
-        b.rimDepth = wg.pondDepthRim;
-        b.floorY = d.surf - wg.pondDepth;
-        b.spillY = d.surf + wg.pondBerm;
-        b.kind = WaterBasinKind::ParabolicBowl;
-        b.matName = "water";
-        basins_.push_back(std::move(b));
+        addDisc(World::PondTile(tx, tz, seed),
+                0x80000000u | (((uint32_t)tx & 0xFFFFu) << 16) | ((uint32_t)tz & 0xFFFFu));
       }
     }
   }

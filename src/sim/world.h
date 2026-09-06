@@ -2523,10 +2523,14 @@ class World {
   // would actually apply the berm, so a passing assertion means exactly what
   // the shader promises and nothing looser.
   struct PondQuery {
-    bool inDisc;   // this column is under a tarn's water
-    bool near;     // outside a disc but inside the berm/shore scan band
-    int past;      // voxels beyond that disc's rim (0 = first column outside)
-    int surf;      // that tarn's water surface Y
+    bool inDisc = false;   // this column is under a tarn's water
+    bool near = false;     // outside a disc but inside the berm/shore scan band
+    int past = 0;          // voxels beyond that disc's rim (0 = first column outside)
+    int surf = -1;         // that tarn's water surface Y
+    // P-F: the tarn's preset and the geometry the gates assert against --
+    // the berm core height/width and the shore/berm scan band, voxels.
+    uint32_t preset = 0;
+    int bermH = 0, bermW = 0, band = 0;
   };
   static PondQuery PondNearColumn(int x, int z, uint32_t seed);
 
@@ -2575,11 +2579,30 @@ class World {
     int cx = 0, cz = 0;  // centre, world cells
     int r = 0;           // radius, world cells
     int surf = -1;       // water surface Y
+    // P-F: the preset the pond wears and the geometry it gives the bowl --
+    // what the basin registry's curve and the gates read instead of the
+    // deleted worldgen.pond* knobs. Voxels; fillId 0 = a dry preset.
+    uint32_t preset = 0;
+    int depth = 0, rimDepth = 0, bermH = 0, bermW = 0, band = 0;
+    uint32_t fillId = 0;
   };
   static PondDisc PondTile(int tileX, int tileZ, uint32_t seed);
-  // Tile pitch in world cells (worldgen.pondTile). Exposed so a caller can turn
-  // a box into a tile range without taking a dependency on the tuning struct.
+  // Tile pitch in world cells: the one pond lattice (worldmap.h kHPondTile),
+  // 0 when no biome authors water. Exposed so a caller can turn a box into a
+  // tile range without taking a dependency on the map struct.
   static int PondTileSize();
+  // The AUTHORED lakes of the loaded map (worldmap.h kSiteWater; P-F), by
+  // index over the map's water sites, with the same waterline the shader
+  // gives them. The registry adds these beside the rolled tarns.
+  static int WaterSiteCount();
+  static PondDisc WaterSiteDisc(int index, uint32_t seed);
+  // The mirrored bowl depth at squared distance d2 from the centre of a disc
+  // of radius r wearing `preset`: the basin curve inverts THIS by bisection
+  // rather than re-deriving the profile (worldmap.h explains the knots).
+  static int BowlDepth(uint32_t preset, int r, int d2);
+  // The widest disc + band any pond can reach, voxels: a probe walking out
+  // of a tarn to its berm core stops after this many columns at most.
+  static int PondReachMax();
 
   // The three authored pools at the world origin — the lake, the oil pond and
   // the lava pool of `--fluid-bench wp5`'s pond68 scene. Flat floors, vertical

@@ -1019,253 +1019,389 @@ fn biomeAt(x : i32, z : i32, seed : u32) -> u32 {
 // rise, which reads as a dammed tarn — and a small perched tarn is what a
 // mountainside should carry once package C gives it 200 m of relief, which is
 // why the radii shrank with this change rather than growing.
-const POND_TILE : i32 = TUNE_POND_TILE;   // 14 m between pond sites
-
-// Per-tile pond descriptor, unpacked from one tile hash — the pond analogue of
-// treeInfo. Split out of pondAt so the SHORE band (shoreAt, below) can ask
-// "where is the nearest pond rim" for a column that is OUTSIDE every disc, and
-// therefore gets `none` back from pondAt. Both callers must see exactly the
-// same disc, so there is one place that decides it.
+// ---- P-F: the pond table -------------------------------------------------
+// Ponds come from TWO sources through ONE table (docs/PLAN_environment_truth
+// P-F): AUTHORED water sites on the map (Tier A, `waterSiteNear`: the centre
+// and radius are the map's, same on every seed) and ROLLED ponds (Tier B,
+// `pondInfo`: one per tile of the one pond lattice, `pondTile()`, thinned per
+// biome by the biome's water rows). Both become a `Pond` wearing a water
+// PRESET (`wp`, 1-based into the worldMap buffer's kW_* records), and from
+// there the bowl, the berm, the shore band and the flora are the preset's.
+// The knobs this replaced (worldgen.pond* / shore*) are gone; every number
+// below is a table read through the accessors above the harness block.
 // MIRROR-BEGIN height
 struct Pond {
-  present : bool,
-  cx      : i32,   // disc centre, world coords
-  cz      : i32,
-  r       : i32,   // disc radius
-  surf    : i32,   // water surface Y: the ground the CENTRE column would have
+  present  : bool,
+  authored : bool, // an authored lake: no row gates, no undercut gate
+  cx       : i32,  // disc centre, world coords
+  cz       : i32,
+  r        : i32,  // disc radius
+  surf     : i32,  // water surface Y: the ground the CENTRE column would have (-1 until gated)
+  wp       : u32,  // the water preset this pond wears; 0 = none
+  minY     : i32,  // the row's conditions, carried to the gate (-1 = unbounded)
+  maxY     : i32,
+  maxSlope : i32,  // Q8; 1024 = unbounded
 };
 
-fn pondInfo(pt : i32, pz : i32, seed : u32) -> Pond {
+fn pondNone() -> Pond {
   var p : Pond;
-  p.present = false; p.cx = 0; p.cz = 0; p.r = 0; p.surf = -1;
+  p.present = false; p.authored = false; p.cx = 0; p.cz = 0; p.r = 0; p.surf = -1; p.wp = 0u;
+  p.minY = -1; p.maxY = -1; p.maxSlope = 1024;
+  return p;
+}
 
+// THE POND SET of a column: every pond CANDIDATE that could touch it -- the
+// authored lake of its cell (slot 0 when present) and the rolled candidates
+// of its own tile and of the neighbouring tiles whose edge is within the
+// scan band. Built ONCE per column by pondScan and handed by value to every
+// reader (the bowl, the shore, the tree and cactus scans, the near-water
+// conditions), because pondRoll is thirty table reads and the tree scans
+// used to inline it five hundred times per column path -- which is what
+// took the driver's compile of this kernel from minutes to never. Five named
+// slots rather than an array: the height mirror's token compare has no
+// array syntax in common between the two languages, and nothing indexes it
+// dynamically (a dynamic index into a by-value struct spills it).
+struct PondSet {
+  n  : i32,
+  d0 : Pond,
+  d1 : Pond,
+  d2 : Pond,
+  d3 : Pond,
+  d4 : Pond,
+};
+
+fn pondSetNone() -> PondSet {
+  var s : PondSet;
+  s.n = 0;
+  s.d0 = pondNone(); s.d1 = pondNone(); s.d2 = pondNone(); s.d3 = pondNone(); s.d4 = pondNone();
+  return s;
+}
+
+fn setPush(s : PondSet, p : Pond) -> PondSet {
+  var q = s;
+  if (q.n == 0) { q.d0 = p; } else if (q.n == 1) { q.d1 = p; } else if (q.n == 2) { q.d2 = p; }
+  else if (q.n == 3) { q.d3 = p; } else { q.d4 = p; }
+  q.n = q.n + 1;
+  return q;
+}
+
+// The bowl's depth below the waterline at squared distance d2 from the centre
+// of a disc of radius r wearing preset wp: the preset's sampled profile,
+// linear in d2 between knot floor(16 d2 / r2) and the next (worldmap.h says
+// why the knots sit at sqrt(k/16)). Integer throughout and monotone in d2,
+// which is what lets the basin registry invert it by bisection.
+fn bowlDepth(wp : u32, r : i32, d2 : i32) -> i32 {
+  let r2 = max(r * r, 1);
+  let s = min(d2, r2) * 16;
+  let u = min(s / r2, 15);
+  let frac = s - u * r2;
+  let k0 = waterKnot(wp, u32(u));
+  let k1 = waterKnot(wp, u32(u) + 1u);
+  let f = k0 - ((k0 - k1) * frac) / r2;
+  let rd = wmWaterI(wp, WM_W_RIM_DEPTH);
+  return rd + ((wmWaterI(wp, WM_W_DEPTH) - rd) * f) / 256;
+}
+
+// The largest s <= hi0 with s * s <= v, by bisection: an integer sqrt for the
+// bed-steepness test below (12 steps cover a 2048-voxel radius). Rule 1.
+fn isqrtLe(v : i32, hi0 : i32) -> i32 {
+  var lo = 0;
+  var hi = hi0;
+  for (var i = 0; i < 12; i++) {
+    if (lo >= hi) { break; }
+    let mid = (lo + hi + 1) / 2;
+    if (mid * mid <= v) { lo = mid; } else { hi = mid - 1; }
+  }
+  return lo;
+}
+
+// Is the bowl face at this column steeper than the CA's angle of repose (one
+// voxel per column)? Compared against the column one voxel further out along
+// the radius. A face this steep gets the preset's SUBSTRATE instead of its
+// powder bed (genCellIn), so a steep authored tarn stays settled (rule 2)
+// instead of avalanching its sand forever -- which is why the preset's depth
+// no longer has to be bounded by its radius.
+fn bowlSteep(p : Pond, x : i32, z : i32) -> bool {
+  let dx = x - p.cx;
+  let dz = z - p.cz;
+  let d2 = dx * dx + dz * dz;
+  let d = isqrtLe(d2, p.r) + 1;
+  let here = bowlDepth(p.wp, p.r, d2);
+  let out = bowlDepth(p.wp, p.r, min(d * d, p.r * p.r));
+  return here - out > 1;
+}
+
+// THE AUTHORED LAKE (Tier A) whose index cell this column sits in, or none.
+// No seed touches its centre, radius or preset; only its waterline is the
+// terrain's, filled by pondGate like a rolled pond's, so it sits IN the
+// ground rather than at an authored Y.
+fn waterSiteNear(x : i32, z : i32) -> Pond {
+  var p = pondNone();
+  let sid = wmSiteAt(x, z);
+  if (sid == 0u) { return p; }
+  if (u32(wmSiteI(sid, WM_S_KIND)) != WM_SITE_WATER) { return p; }
+  p.cx = wmSiteI(sid, WM_S_X);
+  p.cz = wmSiteI(sid, WM_S_Z);
+  p.r = wmSiteI(sid, WM_S_RADIUS);
+  p.wp = u32(wmSiteI(sid, WM_S_PRESET));
+  p.present = true;
+  p.authored = true;
+  return p;
+}
+
+// ONE HASH SALT PER ROW, never bit-slices of one hash (the pond-life block in
+// genCellIn documents why): two rows sharing entropy would co-locate.
+fn waterRowHit(biome : u32, i : u32, pt : i32, pz : i32, seed : u32) -> bool {
+  let hRow = hash3(seed ^ (0xB0A7u + i * 0x9E37u), bitcast<u32>(pt), bitcast<u32>(pz));
+  return i32(hRow & 0xFFFFu) < wmWaterRow(biome, i, WM_R_CHANCE_Q16);
+}
+
+// THE ROLLED POND of one lattice tile (Tier B): the CANDIDATE. The pond
+// analogue of treeInfo, on the pond analogue of the one tree lattice: the
+// tile hash puts the site in the middle half of the tile, the painted cell
+// there says whose water rows roll (biomeCellAt: the cell, no warp), the
+// rows roll in authored order by chance alone -- UNROLLED over the packer's
+// cap of four (worldmap.h kWaterRowsMax), last to first so the first hit
+// wins; a row's chance is already thinned for the lattice by worldmap.cpp
+// PackWaterRows -- and the row that hits names the preset and OWNS the tile.
+// The radius is the preset's (a multiply-and-shift, never a modulo by a
+// table word), the centre is pulled inward so the disc never leaves its tile
+// (a column consults ONE tile for its cover, so a disc that overhung its
+// edge would be half a bowl), the keep-out runs. NO landAt here: the row's
+// conditions and the slope gates are pondGate's, paid once per column on the
+// candidate that matters.
+fn pondRoll(pt : i32, pz : i32, seed : u32) -> Pond {
+  var p = pondNone();
+  let tile = pondTile();
+  if (tile <= 0) { return p; }
   let rh = hash3(seed ^ 0xB0A7u, bitcast<u32>(pt), bitcast<u32>(pz));
-  if (rh % TUNE_POND_CHANCE != 0u) { return p; }                 // ~1 pond per 4 tiles
-  let r = TUNE_POND_RADIUS_MIN + i32((rh >> 4u) % TUNE_POND_RADIUS_SPAN);
-  // The disc must never leave its own tile: pondAt is consulted for ONE tile
-  // per column (no neighbourhood scan), so a pond that overhung its tile edge
-  // would simply vanish from the columns on the other side — half a bowl,
-  // carved terrain with no water in it.
-  //
-  // The inset is therefore DERIVED from the largest radius this tuning can
-  // produce, not a hardcoded constant. It used to be a literal 60, which was
-  // correct only for the original radius 20..36; the moment the radii grew
-  // past it the guarantee silently broke. `maxR + 4` keeps a small margin for
-  // the rim samples.
-  let maxR = TUNE_POND_RADIUS_MIN + i32(TUNE_POND_RADIUS_SPAN) - 1;
-  let inset = maxR + 4;
-  // A tile that cannot contain the biggest possible disc holds no pond at all,
-  // rather than one that silently clips. max(1) keeps the modulo legal.
-  let span = u32(max(POND_TILE - 2 * inset, 1));
-  if (POND_TILE - 2 * inset < 1) { return p; }
-  let cx = pt * POND_TILE + inset + i32((rh >> 9u) % span);
-  let cz = pz * POND_TILE + inset + i32((rh >> 17u) % span);
-  // Keep-out zones, by DISC (center + radius), not by column: the spawn
-  // clearing + fixture pads, and the three authored pools (128 covers the widest
-  // rim 80 + max radius 36 + slack).
-  //
-  // The streaming ball column (408,128) used to need its own keep-out because
-  // its test assumed TerrainHeight() was the surface there and TerrainHeight()
-  // did not know about pond bowls. It does now — World::TerrainHeight is
-  // genColumn's `h` exactly (see the height contract in DESIGN.md) — so the
-  // keep-out is gone and a pond may land there like anywhere else.
-  // ---- THE AUTHORED ORIGIN REGION ----
-  // A tarn may not land in the 512-voxel cube at the world origin, and this box
-  // is that cube plus one full disc-and-berm of margin so nothing REACHES in
-  // either. The region is authored content end to end: three set-piece pools,
-  // the combat arena, the wood platform, the spawn clearing, the fixture pads,
-  // and every column the selftest suite drops a body onto. It is also exactly
-  // the residency window the harness runs in.
-  //
-  // The box used to be -44..264, which covered the fixtures and nothing else.
-  // It is widened here for a second reason that is a DEFECT, not a design, and
-  // is recorded rather than hidden: a generated tarn does not reach rest. Seven
-  // chunks around one stay awake indefinitely — five of them from the pond
-  // vegetation, two from the water itself — which `sleep` tolerates (its bound
-  // is 32) and `ca-skip` and `wind-prim` do not, because both need a tick with
-  // an EMPTY dirty set. Nothing in the height function causes it: the wedge,
-  // the bowl, the berm, the shore fringe, the ruins, evaporation and the MPM
-  // seam were each ruled out by measurement, and the residue is a liquid-CA
-  // question. See docs/PLAN_terrain_overhaul.md.
+  let span = u32(max(tile / 2, 1));
+  var cx = pt * tile + tile / 4 + i32((rh >> 9u) % span);
+  var cz = pz * tile + tile / 4 + i32((rh >> 17u) % span);
+  let biome = biomeCellAt(cx, cz);
+  let n = wmWaterRowCount(biome);
+  if (n == 0u) { return p; }
+  var row = 4u;
+  if (n > 3u && waterRowHit(biome, 3u, pt, pz, seed)) { row = 3u; }
+  if (n > 2u && waterRowHit(biome, 2u, pt, pz, seed)) { row = 2u; }
+  if (n > 1u && waterRowHit(biome, 1u, pt, pz, seed)) { row = 1u; }
+  if (n > 0u && waterRowHit(biome, 0u, pt, pz, seed)) { row = 0u; }
+  if (row == 4u) { return p; }
+  let wp = u32(wmWaterRow(biome, row, WM_R_PRESET));
+  if (wp == 0u) { return p; }
+  let r = wmWaterI(wp, WM_W_RADIUS_MIN) + i32((((rh >> 4u) & 0xFFFFu) * u32(wmWaterI(wp, WM_W_RADIUS_SPAN))) >> 16u);
+  let inset = r + 4;
+  if (tile - 2 * inset < 1) { return p; }
+  cx = clamp(cx, pt * tile + inset, pt * tile + tile - 1 - inset);
+  cz = clamp(cz, pz * tile + inset, pz * tile + tile - 1 - inset);
+  // Keep-outs, by CENTRE (as stamps always were): the harness box, every
+  // stamp's cells, every authored lake's disc + band. A site wins its ground.
   if (siteKeepOut(cx, cz)) { return p; }
-  // ---- THE SLOPE GATE: a tarn is PERCHED, not QUARRIED --------------------
-  //
-  // Last, because it is the only test here that costs a noise sample, and the
-  // hash rejects above throw away three tiles in four before it.
-  //
-  // The waterline comes from the centre column, so on a hillside it sits far
-  // below the uphill rim -- and `h = min(h, bowl floor)` then cuts a cliff into
-  // that hillside and lays a SAND bed down its inside face. That bed is powder
-  // on a wall: the CA's angle of repose is 1 voxel per column and the bowl's
-  // rim gradient is 2*(pondDepth - pondDepthRim)/r, so on steep ground the
-  // tarn is an avalanche that never stops (CLAUDE.md rule 2 -- and it does not
-  // announce itself here, it announces itself as `ca-skip` finding the world
-  // never quiet). LoadTuning bounds the depth against the radius for the same
-  // reason; this bounds the GROUND.
-  //
-  // Refusing the site is also what makes a tarn read as a tarn. A pond needs a
-  // flat shelf to sit on; carved into a slope it reads as a quarry.
-  //
-  // TWO TESTS, and the second is radius-aware because the first is not enough.
-  // A slope of s drops s*r voxels across the radius; where that exceeds the
-  // bowl's own depth the ground UNDERCUTS the bowl, `pondAt` stops describing
-  // the floor and the floor is raw hillside again — with a sand bed on it. So
-  // the drop across the radius must stay inside the bowl, which at a fixed
-  // slope makes big tarns need flatter ground than small ones. `slope` is Q8,
-  // hence the 256.
-  let c = landAt(cx, cz, seed);
-  if (c.slope > TUNE_POND_MAX_SLOPE) { return p; }
-  if (c.slope * r > (TUNE_POND_DEPTH - TUNE_POND_DEPTH_RIM) * 256) { return p; }
-  p.present = true; p.cx = cx; p.cz = cz; p.r = r; p.surf = c.h;
+  p.present = true; p.cx = cx; p.cz = cz; p.r = r; p.wp = wp;
+  p.minY = wmWaterRow(biome, row, WM_R_MIN_Y);
+  p.maxY = wmWaterRow(biome, row, WM_R_MAX_Y);
+  p.maxSlope = wmWaterRow(biome, row, WM_R_MAX_SLOPE);
+  return p;
+}
+
+// The column's pond set: the authored lake of its cell, then the rolled
+// candidates of its own tile and of the neighbouring tiles whose edge is
+// within the widest band any preset asks for (pondBand(): at most one
+// neighbour per axis, so at most 2x2 tiles -- ValidateBiomeSet keeps every
+// band under half the lattice). At most five pondRoll per column, on the
+// column path only.
+fn pondScan(x : i32, z : i32, seed : u32) -> PondSet {
+  var s = pondSetNone();
+  let a = waterSiteNear(x, z);
+  if (a.present) { s = setPush(s, a); }
+  let tile = pondTile();
+  if (tile <= 0) { return s; }
+  let band = pondBand();
+  let pt = fdiv(x, tile);
+  let pz = fdiv(z, tile);
+  let lx = fmodp(x, tile);
+  let lz = fmodp(z, tile);
+  let sx = select(select(0, 1, lx >= tile - band), -1, lx < band);
+  let sz = select(select(0, 1, lz >= tile - band), -1, lz < band);
+  let p0 = pondRoll(pt, pz, seed);
+  if (p0.present) { s = setPush(s, p0); }
+  if (sx != 0) {
+    let p1 = pondRoll(pt + sx, pz, seed);
+    if (p1.present) { s = setPush(s, p1); }
+  }
+  if (sz != 0) {
+    let p2 = pondRoll(pt, pz + sz, seed);
+    if (p2.present) { s = setPush(s, p2); }
+  }
+  if (sx != 0 && sz != 0) {
+    let p3 = pondRoll(pt + sx, pz + sz, seed);
+    if (p3.present) { s = setPush(s, p3); }
+  }
+  return s;
+}
+
+// THE GATE: one landAt at the candidate's centre answers its waterline, the
+// row's conditions and the slope gates. An authored lake takes only the
+// waterline -- the author placed it.
+//
+// ---- THE SLOPE GATE: a tarn is PERCHED, not QUARRIED ----------------------
+// The row's maxSlope is one test; the radius-aware half is the other. A slope
+// of s drops s*r voxels across the radius; where that exceeds the bowl's own
+// depth the ground UNDERCUTS the bowl and the floor is raw hillside again
+// with a bed on it. `slope` is Q8, hence the 256.
+fn pondGate(q : Pond, seed : u32) -> Pond {
+  var p = q;
+  if (!p.present) { return p; }
+  let c = landAt(p.cx, p.cz, seed);
+  p.surf = c.h;
+  if (p.authored) { return p; }
+  if (p.minY >= 0 && c.h < p.minY) { return pondNone(); }
+  if (p.maxY >= 0 && c.h > p.maxY) { return pondNone(); }
+  if (c.slope > p.maxSlope) { return pondNone(); }
+  if (c.slope * p.r > (wmWaterI(p.wp, WM_W_DEPTH) - wmWaterI(p.wp, WM_W_RIM_DEPTH)) * 256) { return pondNone(); }
   return p;
 }
 
 // The berm: what makes containment structural. `past` is whole voxels beyond
-// the rim. The inner CORE is forced flat at `surf + pondBerm` — that is the wall
-// the water cannot cross, and it is the only part the guarantee rests on. The
-// rest ramps the lift linearly back to the natural ground so the bank blends;
-// where the ground is already above the berm nothing moves at all.
-fn bermLift(h : i32, surf : i32, past : i32) -> i32 {
-  let bw = TUNE_POND_BERM_WIDTH;
+// the rim. The inner CORE is forced flat at `surf + berm height` -- that is the
+// wall the water cannot cross, and it is the only part the guarantee rests
+// on. The rest ramps the lift linearly back to the natural ground so the bank
+// blends; where the ground is already above the berm nothing moves at all.
+// Height and width are the preset's.
+fn bermLift(wp : u32, h : i32, surf : i32, past : i32) -> i32 {
+  let bw = wmWaterI(wp, WM_W_BERM_W);
+  let bh = wmWaterI(wp, WM_W_BERM_H);
   let core = max(bw / 4, 2);
-  if (past < core) { return max(h, surf + TUNE_POND_BERM); }
+  if (past < core) { return max(h, surf + bh); }
   let span = max(bw - core, 1);
   let t = span - (past - core);
   if (t <= 0) { return h; }
-  return max(h, h + ((surf + TUNE_POND_BERM - h) * t) / span);
+  return max(h, h + ((surf + bh - h) * t) / span);
 }
 
-// Returns (bowl floor, water surface) at this column, or (-1,-1) outside any
-// pond. genCell carves the terrain to the floor and fills (floor, surface]
-// with water. Pure function of (coords, seed), exactly like treeInfo.
-fn pondAt(x : i32, z : i32, seed : u32) -> vec2<i32> {
-  let none = vec2<i32>(-1, -1);
-  let p = pondInfo(fdiv(x, POND_TILE), fdiv(z, POND_TILE), seed);
-  if (!p.present) { return none; }
+// Does disc p cover column (x, z)?
+fn inDisc(p : Pond, x : i32, z : i32) -> bool {
+  let dx = x - p.cx;
+  let dz = z - p.cz;
+  return p.present && dx * dx + dz * dz <= p.r * p.r;
+}
+
+// "Is this column under a pond CANDIDATE?" -- pure arithmetic on the set,
+// for the tree and cactus scans. Ungated: a tile that rolled a tarn its
+// slope gate then refused still refuses a trunk in its disc, which costs a
+// tree on a hillside now and then and no table read.
+fn pondCovers(s : PondSet, x : i32, z : i32) -> bool {
+  return inDisc(s.d0, x, z) || inDisc(s.d1, x, z) || inDisc(s.d2, x, z) ||
+         inDisc(s.d3, x, z) || inDisc(s.d4, x, z);
+}
+
+// The pond whose DISC covers this column, gated, or none. Slot 0 (the
+// authored lake, when present) wins its ground. ONE pondGate, so one landAt.
+fn pondCover(s : PondSet, x : i32, z : i32, seed : u32) -> Pond {
+  var cand = pondNone();
+  if (inDisc(s.d4, x, z)) { cand = s.d4; }
+  if (inDisc(s.d3, x, z)) { cand = s.d3; }
+  if (inDisc(s.d2, x, z)) { cand = s.d2; }
+  if (inDisc(s.d1, x, z)) { cand = s.d1; }
+  if (inDisc(s.d0, x, z)) { cand = s.d0; }
+  return pondGate(cand, seed);
+}
+
+// (bowl floor, water surface) at this column for a covering pond, or (-1,-1).
+// genCell carves the terrain to the floor and fills (floor, surface] with the
+// preset's fill.
+fn bowlAt(p : Pond, x : i32, z : i32) -> vec2<i32> {
+  if (!p.present) { return vec2<i32>(-1, -1); }
+  let dx = x - p.cx;
+  let dz = z - p.cz;
+  let depth = bowlDepth(p.wp, p.r, dx * dx + dz * dz);
+  return vec2<i32>(p.surf - depth, p.surf);
+}
+
+// A candidate's squared distance to the column if the column is within the
+// candidate's OWN preset's band outside its disc; "far" otherwise.
+fn shoreD2(p : Pond, x : i32, z : i32) -> i32 {
+  if (!p.present) { return 0x7FFFFFFF; }
   let dx = x - p.cx;
   let dz = z - p.cz;
   let d2 = dx * dx + dz * dz;
-  if (d2 > p.r * p.r) { return none; }
-  let surf = p.surf;
-  // Parabolic bowl, carved below the water surface (terrain that is already
-  // lower stays — water just fills deeper there, still capped by the
-  // rim-derived surface).
-  //
-  // DEPTH IS THE WHOLE POINT: at kVoxelMeters 0.10 the player capsule is 17
-  // voxels tall, so the original 8-voxel centre depth was 0.8 m and a pond
-  // could only ever be waded through. TUNE_POND_DEPTH now puts the centre well
-  // over the player's head while TUNE_POND_DEPTH_RIM keeps the edge shallow,
-  // so you walk in off a beach rather than stepping off a wall.
-  // LoadTuning clamps the depth under the cave layer — a bowl that breaches a
-  // tunnel drains the pond and the world never settles.
-  let depth = TUNE_POND_DEPTH_RIM +
-              ((p.r * p.r - d2) * (TUNE_POND_DEPTH - TUNE_POND_DEPTH_RIM)) / (p.r * p.r);
-  return vec2<i32>(surf - depth, surf);
+  let outer = p.r + wmWaterI(p.wp, WM_W_BAND);
+  if (d2 > outer * outer) { return 0x7FFFFFFF; }
+  return d2;
 }
 // MIRROR-END height
 
 // ---- the shore band ----
 // The wet fringe OUTSIDE the disc. Everything up to here treated a pond as a
-// binary — inside the disc you get water and pond life, one voxel outside you
-// get the same plain grass as a hillside a kilometre away — so walking up to a
+// binary -- inside the disc you get water and pond life, one voxel outside you
+// get the same plain grass as a hillside a kilometre away -- so walking up to a
 // pond had no approach: the marsh, the mud, the reed bed you push through are
 // what make arriving at water read as arriving somewhere.
 //
-// COST (rule 2). This is a per-column query on the worldgen path, which runs
-// for every cell of every generated chunk, so it must be O(1) and cheap in the
-// overwhelmingly common case of "nowhere near a pond":
+// COST (rule 2). Pure arithmetic on the column's pond set (pondScan already
+// paid the table reads), then ONE pondGate (one landAt) on the nearest
+// candidate. A nearest candidate that fails its gate leaves the column with
+// no shore, even if a second candidate within its band would have passed --
+// two ponds within one band of one column is rare, and the alternative is
+// four landAt per column. Each candidate is tested against ITS OWN preset's
+// band (shoreD2), so a marsh's 4 m fringe and a tarn's 2.4 m one coexist on
+// one lattice.
 //
-//   * At most FOUR pondInfo calls, never a 5x5 scan like the trees. A pond disc
-//     is guaranteed to lie inside its own tile (see the inset above), so a
-//     column can only be within `band` of a disc belonging to its own tile or
-//     to a tile whose EDGE is within `band` of the column — and a column is
-//     within `band` of at most one tile edge per axis. The loop is over
-//     {0, sx} x {0, sz} where sx/sz are 0 unless the column is inside `band` of
-//     that axis' tile boundary, so it collapses to ONE call away from the
-//     boundaries and the duplicate (0,0) entry is skipped.
-//   * the waterline is carried IN the Pond (one landAt at the centre, paid
-//     inside pondInfo) rather than resampled per caller.
-//
-// Returns (distance PAST the rim in voxels, water surface Y), or (-1,-1) when
-// this column is not near any disc. Distance 0 is the first column outside the
-// disc; the inside of the disc returns none (that is pondAt's job).
+// Returns (distance PAST the rim in voxels, water surface Y, the preset), or
+// none when this column is not near any disc. Distance 0 is the first column
+// outside the disc; the inside of the disc returns none (that is the bowl's
+// job).
 //
 // TWO CONSUMERS, ONE SCAN. genColumn uses this both for the BERM (which must be
 // applied to every column near a disc, whatever the biome or the ground height)
 // and for the marsh FRINGE (which is the berm band narrowed by biome, fixture
-// and waterline tests). The scan band is therefore the wider of the two widths,
-// and `onShore` here means only "a disc is near enough to matter" — genColumn
-// is what decides whether that is a shore.
-//
-// Why the band cannot simply be read off `pondAt` returning none: the disc's
-// clearance inside its own tile can be as little as 4 voxels for the largest
-// radius, so a wider band derived from one tile alone would be sliced off flat
-// along a tile edge — a straight-line haircut through a marsh, which is exactly
-// the artifact the tile scan buys us out of.
+// and waterline tests). `onShore` here means only "a disc is near enough to
+// matter" -- genColumn is what decides whether that is a shore.
 // MIRROR-BEGIN height
 struct Shore {
   onShore : bool,
   past    : i32,   // voxels beyond the rim (0 = first dry column)
   surf    : i32,   // the pond's water surface Y
+  wp      : u32,   // the pond's preset; 0 = none
 };
 
-fn pondNear(x : i32, z : i32, seed : u32) -> Shore {
-  var s : Shore;
-  s.onShore = false; s.past = 0; s.surf = -1;
-
-  let band = max(TUNE_SHORE_BAND, TUNE_POND_BERM_WIDTH);
-  if (band <= 0) { return s; }
-
-  let pt = fdiv(x, POND_TILE);
-  let pz = fdiv(z, POND_TILE);
-  // Which neighbouring tile (if any) has an edge close enough that its disc
-  // could reach this column. -1/+1/0 per axis, so at most 2x2 tiles total.
-  let lx = fmodp(x, POND_TILE);
-  let lz = fmodp(z, POND_TILE);
-  let sx = select(select(0, 1, lx >= POND_TILE - band), -1, lx < band);
-  let sz = select(select(0, 1, lz >= POND_TILE - band), -1, lz < band);
-
+fn pondNear(s : PondSet, x : i32, z : i32, seed : u32) -> Shore {
+  var sh : Shore;
+  sh.onShore = false; sh.past = 0; sh.surf = -1; sh.wp = 0u;
+  // Inside any candidate's disc is the pond, not the shore.
+  if (pondCovers(s, x, z)) { return sh; }
   var best = 0x7FFFFFFF;
-  var bestP : Pond;
-  bestP.present = false; bestP.cx = 0; bestP.cz = 0; bestP.r = 0; bestP.surf = -1;
-  for (var iz = 0; iz < 2; iz++) {
-    let oz = select(0, sz, iz == 1);
-    if (iz == 1 && sz == 0) { continue; }        // no second row to check
-    for (var ix = 0; ix < 2; ix++) {
-      let ox = select(0, sx, ix == 1);
-      if (ix == 1 && sx == 0) { continue; }      // no second column to check
-      let p = pondInfo(pt + ox, pz + oz, seed);
-      if (!p.present) { continue; }
-      let dx = x - p.cx;
-      let dz = z - p.cz;
-      let d2 = dx * dx + dz * dz;
-      // Inside the disc is the pond, not the shore.
-      if (d2 <= p.r * p.r) { return s; }
-      // Compare in SQUARED distance to keep this integer-exact (no isqrt), then
-      // resolve `past` once, on the winner only.
-      let outer = p.r + band;
-      if (d2 > outer * outer) { continue; }
-      if (d2 < best) { best = d2; bestP = p; }
-    }
-  }
-  if (!bestP.present) { return s; }
+  var bestP = pondNone();
+  let e0 = shoreD2(s.d0, x, z);
+  if (e0 < best) { best = e0; bestP = s.d0; }
+  let e1 = shoreD2(s.d1, x, z);
+  if (e1 < best) { best = e1; bestP = s.d1; }
+  let e2 = shoreD2(s.d2, x, z);
+  if (e2 < best) { best = e2; bestP = s.d2; }
+  let e3 = shoreD2(s.d3, x, z);
+  if (e3 < best) { best = e3; bestP = s.d3; }
+  let e4 = shoreD2(s.d4, x, z);
+  if (e4 < best) { best = e4; bestP = s.d4; }
+  let g = pondGate(bestP, seed);
+  if (!g.present) { return sh; }
 
-  // Integer distance past the rim, by bisection on the squared radius — 8 steps
-  // over the band, no sqrt and no f32 (rule 1). `past` is the smallest k with
-  // d2 <= (r+k)^2, minus one, i.e. the number of whole voxels of dry ground
-  // between this column and the waterline.
+  // Integer distance past the rim, by bisection on the squared radius -- 8
+  // steps over the winner's band, no sqrt and no f32 (rule 1). `past` is the
+  // smallest k with d2 <= (r+k)^2, minus one, i.e. the number of whole voxels
+  // of dry ground between this column and the waterline.
   var lo = 0;
-  var hi = band;
+  var hi = wmWaterI(g.wp, WM_W_BAND);
   for (var i = 0; i < 8; i++) {
     if (lo >= hi) { break; }
     let mid = (lo + hi) / 2;
-    let rr = bestP.r + mid;
+    let rr = g.r + mid;
     if (best <= rr * rr) { hi = mid; } else { lo = mid + 1; }
   }
-  s.onShore = true;
-  s.past = max(lo - 1, 0);
-  s.surf = bestP.surf;
-  return s;
+  sh.onShore = true;
+  sh.past = max(lo - 1, 0);
+  sh.surf = g.surf;
+  sh.wp = g.wp;
+  return sh;
 }
 // MIRROR-END height
 
@@ -1411,6 +1547,8 @@ const WM_H_WATER_RECORDS : u32 = 26u;
 const WM_H_WATER_COUNT   : u32 = 27u;
 const WM_H_SPAWN_X       : u32 = 28u;
 const WM_H_SPAWN_Z       : u32 = 29u;
+const WM_H_POND_TILE     : u32 = 30u;   // P-F: the one pond lattice, voxels; 0 = no water rows
+const WM_H_POND_BAND     : u32 = 31u;   // P-F: the widest shore/berm band any preset asks for
 // the site table (worldmap.h kS_* / kStamp_*)
 const WM_S_WORDS         : u32 = 16u;
 const WM_S_KIND          : u32 = 0u;
@@ -1421,6 +1559,9 @@ const WM_S_PAD_MARGIN    : u32 = 4u;
 const WM_S_ROT           : u32 = 5u;
 const WM_S_SALT          : u32 = 6u;
 const WM_S_STAMP_OFF     : u32 = 7u;
+const WM_S_PRESET        : u32 = 8u;    // water site: 1 + preset index
+const WM_SITE_STAMP      : u32 = 1u;
+const WM_SITE_WATER      : u32 = 2u;    // P-F: an authored lake (worldmap.h kSiteWater)
 const WM_STAMP_HDR_WORDS : u32 = 4u;
 const WM_STAMP_NX        : u32 = 0u;
 const WM_STAMP_NY        : u32 = 1u;
@@ -1442,12 +1583,13 @@ const WM_B_SED_MAX       : u32 = 11u;
 const WM_B_FLAGS         : u32 = 12u;
 const WM_B_MAX_COVER_H   : u32 = 13u;
 const WM_B_TREE_CHANCE_Q16 : u32 = 14u;   // thinning on the ONE tree lattice, Q16
-// P-E: the flora that used to be worldgen.* knobs (worldmap.h kB_* 16..20)
-const WM_B_WATER_PRESET  : u32 = 16u;
+// P-E: the flora that used to be worldgen.* knobs (worldmap.h kB_* 16..21)
+const WM_B_WATER_COUNT   : u32 = 16u;   // P-F: the biome's water rows (WM_R_*)
 const WM_B_CAVE_MUSHROOM_CHANCE : u32 = 17u;
 const WM_B_CAVE_CRYSTAL_CHANCE  : u32 = 18u;
 const WM_B_CACTUS_CHANCE : u32 = 19u;
 const WM_B_SAGUARO_FRACTION : u32 = 20u;
+const WM_B_WATER_OFF     : u32 = 21u;
 const WM_C_WORDS         : u32 = 12u;
 const WM_C_MAT           : u32 = 0u;
 const WM_C_HEAD          : u32 = 1u;
@@ -1459,13 +1601,23 @@ const WM_C_MAX_SLOPE     : u32 = 6u;
 const WM_C_PATCH_THRESH  : u32 = 7u;
 const WM_C_NEAR_WATER_MAX : u32 = 8u;   // voxels from a pond rim, -1 = unbounded
 const WM_C_NEAR_WATER_MIN : u32 = 9u;   // at least this far from a rim, 0 = off
+// the biome's water rows (worldmap.h kR_*, P-F): preset, thinning chance on
+// the one pond lattice (Q16), and the row's conditions at the pond centre.
+const WM_R_WORDS         : u32 = 8u;
+const WM_R_PRESET        : u32 = 0u;
+const WM_R_CHANCE_Q16    : u32 = 1u;
+const WM_R_MIN_Y         : u32 = 2u;
+const WM_R_MAX_Y         : u32 = 3u;
+const WM_R_MAX_SLOPE     : u32 = 4u;
+const WM_R_PATCH_THRESHOLD : u32 = 5u;
 const WM_BF_GROUND_FLORA : u32 = 1u;
 const WM_BF_CACTI        : u32 = 2u;
 const WM_BF_SAND_CAP     : u32 = 4u;
 // the water preset table (worldmap.h kW_* / kP_*): the FLORA half of
-// assets/water/<name>.json. Depths are voxels of water over the bed, heights
-// cells from the bed (aquatic) or the ground (shore); chances 1-in-N, 0 = off.
-const WM_W_WORDS               : u32 = 32u;
+// assets/water/<name>.json (P-E) and, from word 22, the GEOMETRY half (P-F).
+// Depths are voxels of water over the bed, heights cells from the bed
+// (aquatic) or the ground (shore); chances 1-in-N, 0 = off.
+const WM_W_WORDS               : u32 = 64u;
 const WM_W_FILL                : u32 = 0u;
 const WM_W_SHORE_COUNT         : u32 = 1u;
 const WM_W_SHORE_OFF           : u32 = 2u;
@@ -1488,6 +1640,28 @@ const WM_W_SUBMERGED_MIN_DEPTH : u32 = 18u;
 const WM_W_SUBMERGED_HEIGHT    : u32 = 19u;
 const WM_W_SUBMERGED_CLEARANCE : u32 = 20u;
 const WM_W_MAX_PLANT_H         : u32 = 21u;
+// the geometry half (P-F), voxels: see worldmap.h for the d^2-parametrised
+// profile knots and why there are seventeen of them
+const WM_W_RADIUS_MIN          : u32 = 22u;
+const WM_W_RADIUS_SPAN         : u32 = 23u;
+const WM_W_DEPTH               : u32 = 24u;
+const WM_W_RIM_DEPTH           : u32 = 25u;
+const WM_W_BERM_H              : u32 = 26u;
+const WM_W_BERM_W              : u32 = 27u;
+const WM_W_SHORE_BAND          : u32 = 28u;
+const WM_W_SHORE_LIFT          : u32 = 29u;
+const WM_W_MUD_WIDTH           : u32 = 30u;
+const WM_W_MUD_MAT             : u32 = 31u;
+const WM_W_BED_SHALLOW         : u32 = 32u;
+const WM_W_BED_DEEP            : u32 = 33u;
+const WM_W_BED_SHALLOW_DEPTH   : u32 = 34u;
+const WM_W_BED_THICKNESS       : u32 = 35u;
+const WM_W_BED_SUBSTRATE       : u32 = 36u;
+const WM_W_MAX_SLOPE           : u32 = 37u;
+const WM_W_MIN_Y               : u32 = 38u;
+const WM_W_MAX_Y               : u32 = 39u;
+const WM_W_BAND                : u32 = 40u;
+const WM_W_KNOTS               : u32 = 41u;
 const WM_P_WORDS               : u32 = 8u;
 const WM_P_MAT                 : u32 = 0u;
 const WM_P_HEAD                : u32 = 1u;
@@ -1509,19 +1683,40 @@ fn wmFlag(b : u32, f : u32) -> bool { return (wmBiome(b, WM_B_FLAGS) & f) != 0u;
 fn wmCover(b : u32, i : u32, w : u32) -> u32 {
   return worldMap[wmBiome(b, WM_B_COVER_OFF) + i * WM_C_WORDS + w];
 }
-// ---- the water preset a column's pond and shore wear (P-E) -----------------
-// P-E INTERIM: a disc pond has no preset of its own until P-F drives the bowl
-// from the water table, so every pond and shore in a biome wears the preset
-// of the biome's FIRST water.features row (worldmap.cpp WaterPresetOf). The
-// index is 1-based; 0 = the biome authors no water and every read below is 0,
-// which turns every chance off -- no shore plants, no pond life, no moss.
-fn wmWaterOf(b : u32) -> u32 { return wmBiome(b, WM_B_WATER_PRESET); }
+// ---- the water preset table (P-E flora, P-F geometry) ----------------------
+// A pond wears the preset of the row that ROLLED it or the authored site that
+// PLACED it (P-F): `Pond.wp` / `Shore.wp` / `Col.wp` carry the 1-based index
+// down to every reader. 0 = no pond and every read below is 0, which turns
+// every chance off -- no shore plants, no pond life, no moss, no bowl.
 fn wmWater(p : u32, w : u32) -> u32 {
   if (p == 0u || p > worldMap[WM_H_WATER_COUNT]) { return 0u; }
   return worldMap[worldMap[WM_H_WATER_RECORDS] + (p - 1u) * WM_W_WORDS + w];
 }
+fn wmWaterI(p : u32, w : u32) -> i32 { return bitcast<i32>(wmWater(p, w)); }
 fn wmShore(p : u32, i : u32, w : u32) -> u32 {
   return worldMap[wmWater(p, WM_W_SHORE_OFF) + i * WM_P_WORDS + w];
+}
+// A biome's water rows (WM_R_*), and the one pond lattice + scan band from
+// the header. These, `wmWaterI` and `waterKnot` are what the height mirror
+// reads the table through: they sit OUTSIDE the mirror on both sides and
+// world.cpp spells the same names over WorldMapData::water, so the mirrored
+// pondInfo / bowlDepth / pondNear are token-identical and the `terrain`
+// gate's C1 is the per-voxel proof they read the same integers.
+fn wmWaterRowCount(b : u32) -> u32 { return wmBiome(b, WM_B_WATER_COUNT); }
+fn wmWaterRow(b : u32, i : u32, w : u32) -> i32 {
+  return bitcast<i32>(worldMap[wmBiome(b, WM_B_WATER_OFF) + i * WM_R_WORDS + w]);
+}
+// The pond lattice is a PRELUDE CONSTANT (POND_TILE, gpu/resources.cpp
+// ShaderConstantPrelude from the same WorldMapData word the buffer carries at
+// WM_H_POND_TILE): worldgen divides by it in ~1000 inlined places, and a
+// division by a runtime word there took the driver's compile from minutes to
+// never. Behind a function so the mirrored code spells `pondTile()` on both
+// sides; the driver folds it.
+fn pondTile() -> i32 { return POND_TILE; }
+fn pondBand() -> i32 { return i32(worldMap[WM_H_POND_BAND]); }
+// Knot k (0..16) of the preset's depth profile, Q8; two per word, low first.
+fn waterKnot(p : u32, k : u32) -> i32 {
+  return i32((wmWater(p, WM_W_KNOTS + (k >> 1u)) >> ((k & 1u) * 16u)) & 0xFFFFu);
 }
 // `h % chance == 0` with chance 0 = never, in one place. Every flora chance
 // in the tables is authored 1-in-N with 0 meaning off, and a modulo by zero
@@ -1612,8 +1807,19 @@ fn wmSiteAt(x : i32, z : i32) -> u32 {
 fn wmSiteI(sid : u32, w : u32) -> i32 {
   return bitcast<i32>(worldMap[worldMap[WM_H_SITE_TABLE] + (sid - 1u) * WM_S_WORDS + w]);
 }
+// A water site (P-F) keeps out by its DISC plus its shore/berm band, not by
+// its cells: a lake's cells are four 102 m squares and a stamp's rule would
+// bald the forest around every tarn on the map. Every other kind keeps its
+// cells, as before.
 fn siteKeepOut(x : i32, z : i32) -> bool {
-  return inHarness(x, z) || wmSiteAt(x, z) != 0u;
+  if (inHarness(x, z)) { return true; }
+  let sid = wmSiteAt(x, z);
+  if (sid == 0u) { return false; }
+  if (u32(wmSiteI(sid, WM_S_KIND)) != WM_SITE_WATER) { return true; }
+  let dx = x - wmSiteI(sid, WM_S_X);
+  let dz = z - wmSiteI(sid, WM_S_Z);
+  let reach = wmSiteI(sid, WM_S_RADIUS) + wmSiteI(sid, WM_S_PAD_MARGIN);
+  return dx * dx + dz * dz <= reach * reach;
 }
 // The template voxel this world cell would carry, MAT_AIR if none: the
 // stamp's footprint is centred on the site, its bottom row sits one above
@@ -1728,6 +1934,20 @@ fn mapLandformGz(x : i32, z : i32) -> i32 {
 // stays put -- "the mountains are always north, but a little different every
 // seed". Outside the painted planes the world is ocean. Two vnoise2d calls
 // with distinct salts: the same eight hashes the old noise band cost.
+// The painted cell's biome with NO warp and no seed (P-F): what decides whose
+// water rows roll at a pond tile. pondInfo is inlined ~150 times per column
+// path (the tree scan alone asks it 25 x 5 times), and the warped read costs
+// two noise samples per copy -- that was the difference between a 200 s
+// worldgen compile and one that never finished. Tier A: the cell, not the
+// wobbled edge; a tarn half a cell from a biome border may roll the
+// neighbour's rows, which is Tier-B detail. world.cpp spells the same.
+fn biomeCellAt(x : i32, z : i32) -> u32 {
+  let plane = worldMap[WM_H_BIOME_PLANE];
+  if (plane == 0u) { return 0u; }
+  let c = wmCellOf(x, z);
+  if (!wmInside(c)) { return worldMap[WM_H_OCEAN_BIOME]; }
+  return wmPlaneAt(plane, c.x, c.y);
+}
 fn mapBiomeAt(x : i32, z : i32, seed : u32) -> u32 {
   let plane = worldMap[WM_H_BIOME_PLANE];
   if (plane == 0u) { return 0u; }   // no planes uploaded (a tool with records only)
@@ -1825,41 +2045,49 @@ fn treeSite(tx : i32, tz : i32, seed : u32) -> TreeSite {
 // mirror where a second band would have to be mirrored for nothing. Costs up
 // to four pondInfo (a hash each) and is only reached by a row that authors a
 // water condition, so an unconditioned forest pays nothing here.
-fn waterDistAt(x : i32, z : i32, seed : u32, band : i32) -> i32 {
+// A candidate's squared distance to the column if its rim is within `band`
+// of it (outside its disc); "far" otherwise.
+fn candD2(p : Pond, x : i32, z : i32, band : i32) -> i32 {
+  if (!p.present) { return 0x7FFFFFFF; }
+  let dx = x - p.cx;
+  let dz = z - p.cz;
+  let d2 = dx * dx + dz * dz;
+  let outer = p.r + band;
+  if (d2 > outer * outer) { return 0x7FFFFFFF; }
+  return d2;
+}
+// The pond set BY POINTER (the scans' form, like `trees`): a by-value PondSet
+// in a function inlined 25 times per column is 51 words copied 25 times, and
+// the driver's compile of `far` died of it. Nothing here indexes it
+// dynamically.
+fn pondCoversP(ponds : ptr<function, PondSet>, x : i32, z : i32) -> bool {
+  return inDisc((*ponds).d0, x, z) || inDisc((*ponds).d1, x, z) || inDisc((*ponds).d2, x, z) ||
+         inDisc((*ponds).d3, x, z) || inDisc((*ponds).d4, x, z);
+}
+fn waterDistAt(ponds : ptr<function, PondSet>, x : i32, z : i32, band : i32) -> i32 {
   if (band <= 0) { return -1; }
-  // The 2x2 walk assumes a disc in a NON-adjacent tile cannot reach: true
-  // while the band is under half a tile, so clamp rather than scan 3x3.
-  let b = min(band, POND_TILE / 2);
-  let pt = fdiv(x, POND_TILE);
-  let pz = fdiv(z, POND_TILE);
-  let lx = fmodp(x, POND_TILE);
-  let lz = fmodp(z, POND_TILE);
-  let sx = select(select(0, 1, lx >= POND_TILE - b), -1, lx < b);
-  let sz = select(select(0, 1, lz >= POND_TILE - b), -1, lz < b);
+  // Pure arithmetic on the column's pond set (P-F): inside any candidate's
+  // disc is water; otherwise the nearest candidate whose rim is within `band`.
+  // UNGATED, like pondCoversP: a placement condition measures distance to the
+  // nearest pond CANDIDATE and never pays a table read inside the tree scan.
+  if (pondCoversP(ponds, x, z)) { return -1; }
   var best = 0x7FFFFFFF;
   var bestR = 0;
-  for (var iz = 0; iz < 2; iz++) {
-    let oz = select(0, sz, iz == 1);
-    if (iz == 1 && sz == 0) { continue; }
-    for (var ix = 0; ix < 2; ix++) {
-      let ox = select(0, sx, ix == 1);
-      if (ix == 1 && sx == 0) { continue; }
-      let p = pondInfo(pt + ox, pz + oz, seed);
-      if (!p.present) { continue; }
-      let dx = x - p.cx;
-      let dz = z - p.cz;
-      let d2 = dx * dx + dz * dz;
-      if (d2 <= p.r * p.r) { return -1; }
-      let outer = p.r + b;
-      if (d2 > outer * outer) { continue; }
-      if (d2 < best) { best = d2; bestR = p.r; }
-    }
-  }
+  let c0 = candD2((*ponds).d0, x, z, band);
+  if (c0 < best) { best = c0; bestR = (*ponds).d0.r; }
+  let c1 = candD2((*ponds).d1, x, z, band);
+  if (c1 < best) { best = c1; bestR = (*ponds).d1.r; }
+  let c2 = candD2((*ponds).d2, x, z, band);
+  if (c2 < best) { best = c2; bestR = (*ponds).d2.r; }
+  let c3 = candD2((*ponds).d3, x, z, band);
+  if (c3 < best) { best = c3; bestR = (*ponds).d3.r; }
+  let c4 = candD2((*ponds).d4, x, z, band);
+  if (c4 < best) { best = c4; bestR = (*ponds).d4.r; }
   if (best == 0x7FFFFFFF) { return -1; }
   // Bisection on the squared radius, as pondNear does it: the smallest k with
   // d2 <= (r+k)^2, minus one. Integer throughout (rule 1).
   var lo = 0;
-  var hi = b;
+  var hi = band;
   for (var i = 0; i < 10; i++) {
     if (lo >= hi) { break; }
     let mid = (lo + hi) / 2;
@@ -1885,7 +2113,7 @@ fn nearWaterOk(d : i32, nearMax : i32, nearMin : i32) -> bool {
 // per-species steepness gate needs: `Land.slope` is the coarse landform
 // gradient (the hill octaves, not the grain), which is the only gradient a
 // slope gate may read — the grain octave crosses a whole gate in one column.
-fn treeInfoAt(s : TreeSite, land : Land, seed : u32) -> Tree {
+fn treeInfoAt(s : TreeSite, land : Land, seed : u32, ponds : ptr<function, PondSet>) -> Tree {
   var t : Tree;
   t.present = false;
   t.sp = -1; t.varOff = 0u;
@@ -1903,7 +2131,7 @@ fn treeInfoAt(s : TreeSite, land : Land, seed : u32) -> Tree {
 
   // No trees on snowfields, in ponds, or over the selftest fixture sites.
   if (h >= TREELINE) { return t; }
-  if (pondAt(t.wx, t.wz, seed).y >= 0) { return t; }
+  if (pondCoversP(ponds,t.wx, t.wz)) { return t; }
   // (The spawn clearing is checked AFTER the species draw, where the crown's
   // real width is known — see the note at that test.)
 
@@ -1970,7 +2198,7 @@ fn treeInfoAt(s : TreeSite, land : Land, seed : u32) -> Tree {
     let nwMax = bitcast<i32>(treeAtlas[cb + TA_C_NEAR_WATER_MAX]);
     let nwMin = i32(treeAtlas[cb + TA_C_NEAR_WATER_MIN]);
     if (nwMax >= 0 || nwMin > 0) {
-      let d = waterDistAt(t.wx, t.wz, seed, max(nwMax, nwMin));
+      let d = waterDistAt(ponds, t.wx, t.wz, max(nwMax, nwMin));
       if (!nearWaterOk(d, nwMax, nwMin)) { return t; }
     }
     // The biome's patch field, sampled at the trunk with a tree-only offset
@@ -2034,9 +2262,9 @@ fn treeInfoAt(s : TreeSite, land : Land, seed : u32) -> Tree {
 
 // The one-shot form, for callers with no reject of their own to do first
 // (undergrowthSite, treeCanopyAt).
-fn treeInfo(tx : i32, tz : i32, seed : u32) -> Tree {
+fn treeInfo(tx : i32, tz : i32, seed : u32, ponds : ptr<function, PondSet>) -> Tree {
   let s = treeSite(tx, tz, seed);
-  return treeInfoAt(s, landAt(s.wx, s.wz, seed), seed);
+  return treeInfoAt(s, landAt(s.wx, s.wz, seed), seed, ponds);
 }
 
 // Integer sine on a 256-step circle, returning -256..256. Bhaskara-style
@@ -2157,7 +2385,7 @@ fn treeLocalXZ(t : Tree, dx : i32, dz : i32) -> vec2<i32> {
   return vec2<i32>(ax + rx, az + rz);
 }
 
-fn treeCandsInto(c : ptr<function, TreeCands>, x : i32, z : i32, seed : u32) {
+fn treeCandsInto(c : ptr<function, TreeCands>, x : i32, z : i32, seed : u32, ponds : ptr<function, PondSet>) {
   (*c).n = 0;
   (*c).top = -1048576;
   if (taSpeciesCount() <= 0) { return; }
@@ -2172,7 +2400,7 @@ fn treeCandsInto(c : ptr<function, TreeCands>, x : i32, z : i32, seed : u32) {
       // that is the inner ring, on a fine one most of the scan.
       let s = treeSite(tx + ox, tz + oz, seed);
       if (abs(x - s.wx) > maxReach || abs(z - s.wz) > maxReach) { continue; }
-      let t = treeInfoAt(s, landAt(s.wx, s.wz, seed), seed);
+      let t = treeInfoAt(s, landAt(s.wx, s.wz, seed), seed, ponds);
       if (!t.present) { continue; }
       // Now the species' OWN reach, which is what actually decides.
       if (abs(x - t.wx) > t.reach || abs(z - t.wz) > t.reach) { continue; }
@@ -2287,10 +2515,10 @@ fn treeFromCands(c : ptr<function, TreeCands>, y : i32) -> u32 {
 // The world-wide vertical pre-reject stays HERE and only here: it is what stops
 // an isolated sky cell paying for a candidate scan it will not use. The hoisted
 // path does not need it, because `cands.top` is strictly tighter.
-fn treeAt(x : i32, y : i32, z : i32, seed : u32) -> u32 {
+fn treeAt(x : i32, y : i32, z : i32, seed : u32, ponds : ptr<function, PondSet>) -> u32 {
   if (y > treeMaxTop()) { return MAT_AIR; }
   var c : TreeCands;
-  treeCandsInto(&c, x, z, seed);
+  treeCandsInto(&c, x, z, seed, ponds);
   return treeFromCands(&c, y);
 }
 
@@ -2342,7 +2570,7 @@ struct Cactus {
   rnd     : u32,
 };
 
-fn cactusInfo(tx : i32, tz : i32, seed : u32) -> Cactus {
+fn cactusInfo(tx : i32, tz : i32, seed : u32, ponds : ptr<function, PondSet>) -> Cactus {
   var c : Cactus;
   c.present = false;
   c.species = 0u; c.wx = 0; c.wz = 0; c.base = 0;
@@ -2369,7 +2597,7 @@ fn cactusInfo(tx : i32, tz : i32, seed : u32) -> Cactus {
   c.base = h;
   if (h >= TREELINE) { return c; }
   if (siteKeepOut(c.wx, c.wz)) { return c; }
-  if (pondAt(c.wx, c.wz, seed).y >= 0) { return c; }
+  if (pondCoversP(ponds,c.wx, c.wz)) { return c; }
 
   // Density and mix are the biome's (cover.cactusChance / saguaroFraction,
   // both percents, packed by worldmap.cpp): the flag says whether, the
@@ -2516,12 +2744,12 @@ fn cactusCell(c : Cactus, x : i32, y : i32, z : i32, seed : u32) -> u32 {
 // neighbourhood. First non-air wins — order is by tile index, a fixed priority,
 // never dispatch order (rule 1). Same structure as treeAt, including the AABB
 // reject before any shape work.
-fn cactusAt(x : i32, y : i32, z : i32, seed : u32) -> u32 {
+fn cactusAt(x : i32, y : i32, z : i32, seed : u32, ponds : ptr<function, PondSet>) -> u32 {
   let tx = fdiv(x, CACTUS_TILE);
   let tz = fdiv(z, CACTUS_TILE);
   for (var oz = -CACTUS_SCAN; oz <= CACTUS_SCAN; oz++) {
     for (var ox = -CACTUS_SCAN; ox <= CACTUS_SCAN; ox++) {
-      let c = cactusInfo(tx + ox, tz + oz, seed);
+      let c = cactusInfo(tx + ox, tz + oz, seed, ponds);
       if (!c.present) { continue; }
       // HORIZONTAL reject. Must cover the widest thing the species can produce
       // or the outer arm gets sliced off at an invisible cylinder — the same
@@ -2703,7 +2931,7 @@ struct Undergrowth {
 // Contributions ADD across overlapping crowns and saturate at 255: two crowns
 // overlapping is genuinely darker than one, and that is what makes a dense
 // stand of oaks grow a different floor from an isolated tree.
-fn undergrowthSite(x : i32, z : i32, seed : u32) -> Undergrowth {
+fn undergrowthSite(x : i32, z : i32, seed : u32, ponds : ptr<function, PondSet>) -> Undergrowth {
   var u : Undergrowth;
   u.cover = 0;
   u.trunkD2 = 1 << 24;      // "no trunk anywhere near", larger than any reach
@@ -2714,7 +2942,7 @@ fn undergrowthSite(x : i32, z : i32, seed : u32) -> Undergrowth {
   let tz = fdiv(z, TREE_TILE);
   for (var oz = -TREE_SCAN; oz <= TREE_SCAN; oz++) {
     for (var ox = -TREE_SCAN; ox <= TREE_SCAN; ox++) {
-      let t = treeInfo(tx + ox, tz + oz, seed);
+      let t = treeInfo(tx + ox, tz + oz, seed, ponds);
       if (!t.present) { continue; }
       let dx = x - t.wx;
       let dz = z - t.wz;
@@ -2988,6 +3216,8 @@ struct Col {
   inPoolFloor : bool,
   inRim       : bool,
   shore       : Shore,
+  wp          : u32,         // the water preset this column's pond or shore wears; 0 = none (P-F)
+  bedSolid    : bool,        // inside a disc: the bowl face here is steeper than a powder bed can hold
   plant       : PlantCol,    // the tile plant whose footprint covers this column
 };
 
@@ -3023,11 +3253,11 @@ fn plantSiteAt(cx : i32, cz : i32, seed : u32, needCover : bool) -> PlantSite {
   ps.h = 0;
   if (siteKeepOut(cx, cz)) { return ps; }
   if (!wmFlag(biomeAt(cx, cz, seed), WM_BF_GROUND_FLORA)) { return ps; }
-  let L = landColumn(cx, cz, seed);
+  var L = landColumn(cx, cz, seed);
   ps.h = L.h;
   if (L.h >= TREELINE || L.pond >= 0 || L.inRim || L.inPoolFloor) { return ps; }
-  if (L.near.onShore && L.near.past < TUNE_SHORE_BAND) { return ps; }
-  let ug = undergrowthSite(cx, cz, seed);
+  if (L.near.onShore && L.near.past < wmWaterI(L.near.wp, WM_W_SHORE_BAND)) { return ps; }
+  let ug = undergrowthSite(cx, cz, seed, &L.ponds);
   if (ug.trunkD2 <= 4) { return ps; }
   if (needCover && ug.cover < UG_COVER_MIN) { return ps; }
   ps.ok = true;
@@ -3145,6 +3375,9 @@ struct LandCol {
   inPoolFloor : bool,
   inRim       : bool,
   near        : Shore,       // nearest disc OUTSIDE this column, or none
+  wp          : u32,         // the covering pond's preset, else the near shore's; 0 = none (P-F)
+  bedSolid    : bool,        // inside a disc: face steeper than a powder bed can hold
+  ponds       : PondSet,     // the column's pond candidates (pondScan), for the scans
 };
 
 // MIRROR-BEGIN landheight
@@ -3159,7 +3392,10 @@ fn landColumnBare(x : i32, z : i32, seed : u32) -> LandCol {
   L.pw = vec2<i32>(-1, -1);
   L.fluid = MAT_AIR;
   L.fluidTop = -1;
-  L.near.onShore = false; L.near.past = 0; L.near.surf = -1;
+  L.near.onShore = false; L.near.past = 0; L.near.surf = -1; L.near.wp = 0u;
+  L.wp = 0u;
+  L.bedSolid = false;
+  L.ponds = pondSetNone();
   // The fluid lab's flat slab — the same guard genColumn takes below, taken
   // here as well so World::TerrainHeight sees the slab through the contract
   // rather than through a second copy of the constant.
@@ -3231,18 +3467,23 @@ fn landColumnBare(x : i32, z : i32, seed : u32) -> LandCol {
   // scan that serves BOTH the berm and the marsh fringe (genColumn narrows the
   // same answer), and it is skipped inside a disc or an authored rim, where
   // there is nothing outside to be near.
-  L.pw = pondAt(x, z, seed);
-  if (L.pw.y < 0 && !L.inRim) { L.near = pondNear(x, z, seed); }
+  // The column's pond candidates, scanned ONCE (the only table reads on this
+  // path) and handed to the bowl, the shore and, through LandCol, every scan.
+  L.ponds = pondScan(x, z, seed);
+  let pc = pondCover(L.ponds, x, z, seed);
+  L.pw = bowlAt(pc, x, z);
+  if (L.pw.y < 0 && !L.inRim) { L.near = pondNear(L.ponds, x, z, seed); }
+  L.wp = select(L.near.wp, pc.wp, pc.present);
 
   // ---- the wedge, after everything that has to suppress it ----
   // The pond band ramps rather than switches, over the same width `pondNear`
-  // scans, so the wedge thins to nothing as it reaches the water instead of
-  // ending in a wall of loose gravel above a bowl full of sand.
+  // scans for THIS preset, so the wedge thins to nothing as it reaches the
+  // water instead of ending in a wall of loose gravel above a bowl of sand.
   var sed = land.sed;
   if (L.inRim || L.pw.y >= 0) {
     sed = 0;
   } else if (L.near.onShore) {
-    let band = max(max(TUNE_SHORE_BAND, TUNE_POND_BERM_WIDTH), 1);
+    let band = max(wmWaterI(L.near.wp, WM_W_BAND), 1);
     sed = (sed * min(L.near.past, band)) / band;
   }
   var h = bed + sed;
@@ -3277,10 +3518,14 @@ fn landColumnBare(x : i32, z : i32, seed : u32) -> LandCol {
     // uphill one, which is what a dammed tarn IS; pondInfo's radius-aware gate
     // above is what keeps the fill from becoming a wall.
     h = L.pw.x;
-    if (L.fluidTop < 0) { L.fluid = M_WATER; L.fluidTop = L.pw.y; }
+    // The fill is the preset's (water, lava, or none for a dry playa), and
+    // the bed is a powder only where the face can hold it (bowlSteep).
+    let fill = wmWater(pc.wp, WM_W_FILL);
+    if (L.fluidTop < 0 && fill != 0u) { L.fluid = fill; L.fluidTop = L.pw.y; }
+    L.bedSolid = bowlSteep(pc, x, z);
   } else if (!L.inRim && L.near.onShore &&
-             L.near.past < TUNE_POND_BERM_WIDTH) {
-    h = bermLift(h, L.near.surf, L.near.past);
+             L.near.past < wmWaterI(L.near.wp, WM_W_BERM_W)) {
+    h = bermLift(L.near.wp, h, L.near.surf, L.near.past);
   }
   // THE SEA (P4): ground under the map's sea level is under water. One
   // global plane (RESEARCH_worldgen 6.5's option (a)), which is what lets
@@ -3302,6 +3547,9 @@ fn landColumnBare(x : i32, z : i32, seed : u32) -> LandCol {
 fn sitePadAt(x : i32, z : i32, h : i32, seed : u32) -> i32 {
   let sid = wmSiteAt(x, z);
   if (sid == 0u) { return h; }
+  // A water site is a bowl, not a building: the pond block above already
+  // shaped the ground under it, and levelling it here would fill the lake.
+  if (u32(wmSiteI(sid, WM_S_KIND)) == WM_SITE_WATER) { return h; }
   let sx = wmSiteI(sid, WM_S_X);
   let sz = wmSiteI(sid, WM_S_Z);
   let r = wmSiteI(sid, WM_S_RADIUS);
@@ -3360,6 +3608,9 @@ fn genColumn(x : i32, z : i32, seed : u32) -> Col {
     lab.shore.onShore = false;
     lab.shore.past = 0;
     lab.shore.surf = -1;
+    lab.shore.wp = 0u;
+    lab.wp = 0u;
+    lab.bedSolid = false;
     lab.plant.mat = MAT_AIR;
     lab.plant.base = 0;
     lab.plant.top = -1;
@@ -3383,9 +3634,12 @@ fn genColumn(x : i32, z : i32, seed : u32) -> Col {
   // in the desert, and never above the treeline, so a shore is always a shore
   // and never a marsh growing out of a snowfield.
   var shore : Shore;
-  shore.onShore = false; shore.past = 0; shore.surf = -1;
-  if (L.near.onShore && L.near.past < TUNE_SHORE_BAND &&
-      wmFlag(biome, WM_BF_GROUND_FLORA) && h < TREELINE) {
+  shore.onShore = false; shore.past = 0; shore.surf = -1; shore.wp = 0u;
+  // The band's width is the pond's preset's (P-F), and the band's EXISTENCE
+  // follows the pond, not the biome's ground-flora flag: an oasis's shore
+  // rows show in the desert because the oasis preset authored them.
+  if (L.near.onShore && L.near.past < wmWaterI(L.near.wp, WM_W_SHORE_BAND) &&
+      h < TREELINE) {
     shore = L.near;
     // A column whose ground stands well above the waterline is a BLUFF, not a
     // shore. This is the single most load-bearing test in the feature, and it
@@ -3402,7 +3656,7 @@ fn genColumn(x : i32, z : i32, seed : u32) -> Col {
     // the band width. NOTE the interaction with the berm: `h` here is the
     // BERMED ground, so shoreLift must stay comfortably above `pondBerm` or the
     // berm suppresses the very fringe it is supposed to stand behind.
-    if (h > shore.surf + TUNE_SHORE_LIFT) {
+    if (h > shore.surf + wmWaterI(shore.wp, WM_W_SHORE_LIFT)) {
       shore.onShore = false;
     }
   }
@@ -3419,6 +3673,8 @@ fn genColumn(x : i32, z : i32, seed : u32) -> Col {
   col.inPoolFloor = L.inPoolFloor;
   col.inRim = L.inRim;
   col.shore = shore;
+  col.wp = L.wp;
+  col.bedSolid = L.bedSolid;
   col.plant = plantColumnAt(x, z, seed, biome);
   return col;
 }
@@ -3452,6 +3708,7 @@ fn genColumn(x : i32, z : i32, seed : u32) -> Col {
 fn genCellIn(col : Col,
              cave : ptr<function, CaveBands>, caveValid : bool,
              trees : ptr<function, TreeCands>, treeValid : bool,
+             ponds : ptr<function, PondSet>,
              stalk : Flower,
              x : i32, y : i32, z : i32, seed : u32) -> u32 {
   let h = col.h;
@@ -3464,6 +3721,8 @@ fn genCellIn(col : Col,
   let inPoolFloor = col.inPoolFloor;
   let inRim = col.inRim;
   let shore = col.shore;
+  let wp = col.wp;               // the preset this column's pond or shore wears (P-F)
+  let bedSolid = col.bedSolid;
   var mat = MAT_AIR;
 
   if (y <= h) {
@@ -3483,11 +3742,20 @@ fn genCellIn(col : Col,
       mat = M_SNOW;                        // snow caps on the high hills
     } else if (inPoolFloor) {
       mat = M_STONE;
-    } else if (submerged && y > h - 3) {
-      mat = M_SAND;                        // sandy pond bed
+    } else if (submerged && y > h - wmWaterI(wp, WM_W_BED_THICKNESS)) {
+      // THE BED (P-F): the preset's, by water depth -- bed.shallow (sand)
+      // where the water over this column is shallower than bed.shallowDepth,
+      // bed.deep (mud) below that -- and its SUBSTRATE wherever the bowl
+      // face is steeper than a powder can hold (landColumnBare's bowlSteep),
+      // so a steep tarn wall is stone with a sand bed only where it flattens.
+      // A preset naming no material falls back to sand, the pre-P-F bed.
+      var bed = select(wmWater(wp, WM_W_BED_DEEP), wmWater(wp, WM_W_BED_SHALLOW),
+                       pond - h < wmWaterI(wp, WM_W_BED_SHALLOW_DEPTH));
+      if (bedSolid) { bed = wmWater(wp, WM_W_BED_SUBSTRATE); }
+      mat = select(bed, select(M_SAND, M_STONE, bedSolid), bed == 0u);
     } else if (wmFlag(biome, WM_BF_SAND_CAP) && y > h - 4) {
       mat = M_SAND;                        // loose cap — avalanches into repose piles
-    } else if (shore.onShore && shore.past < TUNE_SHORE_MUD_WIDTH &&
+    } else if (shore.onShore && shore.past < wmWaterI(wp, WM_W_MUD_WIDTH) &&
                y > h - 2) {
       // WET MUD, in the inner ring only. This is the transition the whole
       // feature exists for: the bed inside the disc is sand and the bank
@@ -3503,8 +3771,10 @@ fn genCellIn(col : Col,
       // chunk never sleeps.
       //
       // A stone face inside the band that is NOT the mud ring gets wet moss
-      // instead — see below.
-      mat = M_SHORE_MUD;
+      // instead — see below. The material is the preset's shore.mudMaterial
+      // (P-F); a preset naming none keeps the shore mud.
+      let mud = wmWater(wp, WM_W_MUD_MAT);
+      mat = select(M_SHORE_MUD, mud, mud != 0u);
     } else if (y > h - i32(wmBiome(biome, WM_B_SKIN_DEPTH))) {
       // The biome's ground skin (assets/biomes/<name>.json cover.skin /
       // skinDepth): grass on the forest floor, snow on the tundra, mud in the
@@ -3578,8 +3848,7 @@ fn genCellIn(col : Col,
     // solid wall. Chance and material are the water preset's (shore.mossChance
     // / mossMaterial); a biome with no water rows reads 0 and grows none.
     if (VEGETATION && mat == M_STONE && y == h && shore.onShore) {
-      let wp = wmWaterOf(biome);
-      let mossMat = wmWater(wp, WM_W_MOSS_MAT);
+        let mossMat = wmWater(wp, WM_W_MOSS_MAT);
       if (mossMat != 0u &&
           rollChance(hash3(seed ^ 0x4D05u, bitcast<u32>(x), bitcast<u32>(z)),
                      wmWater(wp, WM_W_MOSS_CHANCE))) {
@@ -3614,12 +3883,11 @@ fn genCellIn(col : Col,
   //
   // WHICH plants, at WHAT depth, HOW tall: the water preset's aquatic bands
   // (assets/water/<name>.json aquatic.emergent / floating / submerged), read
-  // from the worldMap table -- the pond's biome names the preset (P-E interim,
-  // see wmWaterOf). Depths are voxels of water over the bed, heights cells
-  // above the bed. A band with chance 0, or a biome with no water rows, rolls
+  // from the worldMap table -- the pond's OWN preset (`wp`, the row that
+  // rolled it or the site that placed it; P-F). Depths are voxels of water
+  // over the bed, heights cells above the bed. A band with chance 0 rolls
   // nothing (rollChance).
   if (VEGETATION && mat == M_WATER && pond >= 0) {
-    let wp = wmWaterOf(biome);
     let bed = min(h, pw.x);          // the carved bowl floor at this column
     let depth = pond - bed;          // water column height in voxels
     let above = pond - y;            // how far under the surface this cell is
@@ -3663,7 +3931,6 @@ fn genCellIn(col : Col,
   // upward — same hashes, same column tests, so a reed is one continuous stalk
   // through the surface rather than two unrelated halves.
   if (VEGETATION && mat == MAT_AIR && pond >= 0 && y > pond) {
-    let wp = wmWaterOf(biome);
     let bed = min(h, pw.x);
     let depth = pond - bed;
     let hLily = hash3(seed ^ 0x71A9u, bitcast<u32>(x), bitcast<u32>(z));
@@ -3691,7 +3958,7 @@ fn genCellIn(col : Col,
   if (VEGETATION && mat == MAT_AIR && !inRim && y > h && h < TREELINE && pond < 0) {
     var tm = MAT_AIR;
     if (treeValid) { tm = treeFromCands(trees, y); }
-    else { tm = treeAt(x, y, z, seed); }
+    else { tm = treeAt(x, y, z, seed, ponds); }
     if (tm != MAT_AIR) { mat = tm; }
   }
 
@@ -3710,8 +3977,8 @@ fn genCellIn(col : Col,
   // forever and break the sleep budget (rule 2).
   //
   // THE SPECIES ARE THE WATER PRESET'S (assets/water/<name>.json
-  // shore.plants[], packed as WM_P_* rows; the biome names the preset, see
-  // wmWaterOf). Rows are rolled IN AUTHORED ORDER and the first hit wins,
+  // shore.plants[], packed as WM_P_* rows; the pond names the preset, `wp`,
+  // P-F). Rows are rolled IN AUTHORED ORDER and the first hit wins,
   // exactly like the biome cover stack, so the author puts the water-hugging
   // species (cattail: small reach, tall) first and the ground layer that
   // covers the whole band (marsh grass: full reach, dense) LAST, filling
@@ -3735,7 +4002,6 @@ fn genCellIn(col : Col,
   // blocker ceilings cover the tallest column a row can produce.
   if (VEGETATION && mat == MAT_AIR && shore.onShore && y > h) {
     let up = y - h;                  // voxels above this column's ground
-    let wp = wmWaterOf(biome);
     let nRows = wmWater(wp, WM_W_SHORE_COUNT);
     for (var i = 0u; i < nRows; i++) {
       if (shore.past > i32(wmShore(wp, i, WM_P_REACH))) { continue; }
@@ -3767,7 +4033,7 @@ fn genCellIn(col : Col,
     // ONE 25-tile scan answers both "how shaded is this column" and "how far to
     // the nearest trunk". Calling treeCanopyAt as well would run the identical
     // scan a second time for a strictly weaker answer.
-    let ug = undergrowthSite(x, z, seed);
+    let ug = undergrowthSite(x, z, seed, ponds);
 
     // SEPARATE HASH SALTS PER SPECIES, never bit-slices of one hash. Slicing
     // (fr, fr>>3, fr>>17) looks independent and is not — the slices share
@@ -3935,7 +4201,7 @@ fn genCellIn(col : Col,
   // and the ground block re-tests them per column.
   if (VEGETATION && mat == MAT_AIR && wmFlag(biome, WM_BF_CACTI) && !inRim && y > h && pond < 0 &&
       h < TREELINE) {
-    let cm = cactusAt(x, y, z, seed);
+    let cm = cactusAt(x, y, z, seed, ponds);
     if (cm != MAT_AIR) { mat = cm; }
   }
 
@@ -3984,7 +4250,7 @@ fn genCellIn(col : Col,
       let nwMax = bitcast<i32>(wmCover(biome, i, WM_C_NEAR_WATER_MAX));
       let nwMin = i32(wmCover(biome, i, WM_C_NEAR_WATER_MIN));
       if (nwMax >= 0 || nwMin > 0) {
-        let d = waterDistAt(x, z, seed, max(nwMax, nwMin));
+        let d = waterDistAt(ponds, x, z, max(nwMax, nwMin));
         if (!nearWaterOk(d, nwMax, nwMin)) { continue; }
       }
       // The patch mask: the biome's threshold, raised further by the row's.
@@ -4105,7 +4371,8 @@ fn genCell(c : vec3<i32>, seed : u32) -> u32 {
   var noStalk : Flower;
   noStalk.mat = MAT_AIR;
   noStalk.height = -1;   // "not memoized"; see the stalk block in genCellIn
-  return genCellIn(genColumn(c.x, c.z, seed), &cave, false, &trees, false,
+  var ponds = pondScan(c.x, c.z, seed);
+  return genCellIn(genColumn(c.x, c.z, seed), &cave, false, &trees, false, &ponds,
                    noStalk, c.x, c.y, c.z, seed);
 }
 
@@ -4123,7 +4390,8 @@ fn genCellCol(col : Col, c : vec3<i32>, seed : u32) -> u32 {
   var noStalk : Flower;
   noStalk.mat = MAT_AIR;
   noStalk.height = -1;   // "not memoized"; see the stalk block in genCellIn
-  return genCellIn(col, &cave, false, &trees, false, noStalk,
+  var ponds = pondScan(c.x, c.z, seed);
+  return genCellIn(col, &cave, false, &trees, false, &ponds, noStalk,
                    c.x, c.y, c.z, seed);
 }
 
@@ -4143,12 +4411,12 @@ fn genCellCol(col : Col, c : vec3<i32>, seed : u32) -> u32 {
 // far field flattens crowns into the terrain skin instead — the horizon keeps
 // its canopy color even where no individual tree survives sampling. Pure
 // function of (coords, seed), same as everything the sieve uses.
-fn treeCanopyAt(x : i32, z : i32, seed : u32) -> u32 {
+fn treeCanopyAt(x : i32, z : i32, seed : u32, ponds : ptr<function, PondSet>) -> u32 {
   let tx = fdiv(x, TREE_TILE);
   let tz = fdiv(z, TREE_TILE);
   for (var oz = -TREE_SCAN; oz <= TREE_SCAN; oz++) {
     for (var ox = -TREE_SCAN; ox <= TREE_SCAN; ox++) {
-      let t = treeInfo(tx + ox, tz + oz, seed);
+      let t = treeInfo(tx + ox, tz + oz, seed, ponds);
       if (!t.present) { continue; }
       // The species' own far-field proxy material, out of the atlas: the mid
       // step of its leaf ramp, or ZERO for a species with no foliage worth
@@ -4206,7 +4474,8 @@ fn farSurfaceMat(col : Col, mat : u32, fine : vec3<i32>, shift : u32,
   // canopy flattening only where cells are 2 m+ (32+ fine voxels); finer
   // levels still resolve trees as shapes and double-painting would fatten them
   if (shift >= 5u) {
-    let can = treeCanopyAt(fine.x, fine.z, seed);
+    var ponds = pondScan(fine.x, fine.z, seed);
+    let can = treeCanopyAt(fine.x, fine.z, seed, &ponds);
     if (can != MAT_AIR) { return can; }
   }
   // MEADOW COVER IS NOT FLATTENED INTO THE SKIN, and this was tried (LOD-seam
@@ -4400,6 +4669,10 @@ fn genChunk(slot : u32, li : u32, actIdx : u32) {
     let wx = base.x + i32(lx);
     let wz = base.z + i32(lz);
     let col = genColumn(wx, wz, T.seed);
+    // The column's pond candidates, ONCE, by pointer into the scans (like
+    // `trees`): the tree/cactus scans and the near-water conditions read it
+    // per candidate as arithmetic, never as table reads.
+    var ponds = pondScan(wx, wz, T.seed);
     // ---- THE COLUMN PROLOGUE (the other 15/16ths of the saving) ----------
     //
     // Cave bands: only worth having where a cell of THIS chunk can be stone
@@ -4432,7 +4705,7 @@ fn genChunk(slot : u32, li : u32, actIdx : u32) {
     // `treeFromCands`'s `y > top` test anyway. An empty set produces the same
     // MAT_AIR the full set would.
     if (base.y <= treeMaxTop()) {
-      treeCandsInto(&trees, wx, wz, T.seed);
+      treeCandsInto(&trees, wx, wz, T.seed, &ponds);
     } else {
       trees.n = 0;
       trees.top = -1048576;   // the same "far below any y" treeCandsInto uses
@@ -4520,7 +4793,7 @@ fn genChunk(slot : u32, li : u32, actIdx : u32) {
     if (stalkValid) { stalk = flowerAt(wx, wz, T.seed, UG_COVER_EDGE); }
     for (var ly = 0u; ly < CHUNK; ly += 1u) {
       let i = lx + ly * CHUNK + lz * CHUNK * CHUNK;
-      let w = genCellIn(col, &cave, caveValid, &trees, true, stalk,
+      let w = genCellIn(col, &cave, caveValid, &trees, true, &ponds, stalk,
                         wx, base.y + i32(ly), wz, T.seed);
       // Chunk-linear: the slot's page resolved once, per §2.1's second entry
       // point. genChunk overwrites the WHOLE chunk, so the CPU materializes

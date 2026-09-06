@@ -1,13 +1,16 @@
 #include "gpu/resources.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <sstream>
 
 #include "sim/treeatlas.h"   // CurrentTreeLattice: the TREE_* prelude consts
 #include "sim/tuning.h"
 #include "sim/world.h"
+#include "sim/worldmap.h"    // CurrentWorldMap().pondTile: the POND_TILE prelude const
 
 // ---- GPU buffer budget -----------------------------------------------------
 // Every storage/uniform/indirect buffer the engine owns is created through this
@@ -261,6 +264,15 @@ std::string ShaderConstantPrelude() {
     o << "const TREE_SCAN : i32 = " << l.scan << ";\n";
     o << "const TREE_CAND_MAX : i32 = " << l.candMax << ";\n";
   }
+  // The pond lattice (worldmap.h kHPondTile; docs/PLAN_environment_truth P-F):
+  // the finest live water tile of any biome, as LOAD-TIME ASSET DATA like the
+  // tree lattice -- and a CONSTANT rather than the header word the buffer
+  // also carries, because worldgen divides by it in ~1000 inlined places
+  // (fdiv/fmodp per pond tile, per tree candidate) and a division by a
+  // runtime value there is what took the driver's worldgen compile from
+  // minutes to never. Simulation::UploadEnvironment recompiles when a reload
+  // moves it. Mirrored by scripts/pond_lattice.py for check_shaders.sh.
+  o << "const POND_TILE : i32 = " << worldmap::CurrentWorldMap().pondTile << ";\n";
   // The same number as an INTEGER reciprocal, for the sim/worldgen side. It has
   // to be integer and it has to come from here: everything worldgen authors in
   // metres (the whole tree and cactus size table) converts through it, and the
@@ -434,5 +446,17 @@ rhi::ComputePipeline MakeComputePipeline(const rhi::Device& device,
                                          const rhi::PipelineLayout& layout,
                                          const rhi::ShaderModule& module,
                                          const char* entry, const char* label) {
-  return device.CreateComputePipeline(layout, module, entry, label);
+  // SANDVOX_SHADER_TIMING=1: one line per pipeline with the driver's compile
+  // time, so a cold `sim init` that takes minutes names the entry point that
+  // took them instead of being one number (CLAUDE.md verification rule 6).
+  // worldgen.wgsl alone is FIVE entry points (main, list, pagefill, far,
+  // fardown), each a full compile of the kernel; that is where the minutes go.
+  static const bool timing = std::getenv("SANDVOX_SHADER_TIMING") != nullptr;
+  if (!timing) return device.CreateComputePipeline(layout, module, entry, label);
+  const auto t0 = std::chrono::steady_clock::now();
+  rhi::ComputePipeline p = device.CreateComputePipeline(layout, module, entry, label);
+  const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+  std::printf("pipeline %-16s %-10s %9.1f ms\n", label, entry, ms);
+  std::fflush(stdout);
+  return p;
 }

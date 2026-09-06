@@ -10,6 +10,11 @@
 #include "sim/tuning.h"      // fluidExciteMode gates the seam recording
 #include "gpu/rhi_record.h"  // the Vulkan table-recording bridge (phase 4a)
 #include "gpu/rhi_vk.h"      // rhi::vkr::SavePipelineCache (EnsureRenderPipelines)
+#include "sim/worldmap.h"    // CurrentWorldMap().pondTile: the POND_TILE prelude const (P-F)
+
+// The pond lattice the live shaders were compiled with (POND_TILE), so an
+// environment reload that moves it recompiles them (UploadEnvironment).
+static int sPondTileCompiled = -1;
 
 // kPassStride (the passUBO dynamic-offset slice stride) moved to pass_table.h
 // when the Vulkan recorder became a second consumer of it — see the note there.
@@ -31,6 +36,10 @@ bool Simulation::Init(const rhi::Device& device, World& world,
   // here on (gpu/resources.cpp ShaderConstantPrelude). Set BEFORE the first
   // LoadShader below, and it stays set for F5 reloads and --shader-stats.
   treeatlas::SetCurrentTreeLattice(trees.lattice);
+  // The pond lattice the same way (POND_TILE, from the map already set as
+  // CurrentWorldMap by the caller); remembered so UploadEnvironment knows
+  // whether a reload moved it under the compiled shaders.
+  sPondTileCompiled = worldmap::CurrentWorldMap().pondTile;
 
   // The baked tree atlas. Sized to what the assets actually hold rather than to
   // a ceiling constant: it is load-time asset data, it never grows, and the
@@ -800,6 +809,19 @@ void Simulation::UploadEnvironment(const rhi::Device& device, const rhi::Queue& 
                   live.tile, live.scan, live.candMax, want.tile, want.scan, want.candMax);
       if (!ReloadShaders(device))
         std::fprintf(stderr, "environment: shader reload FAILED; the old lattice's pipelines stay live\n");
+      sPondTileCompiled = worldmap::CurrentWorldMap().pondTile;
+    }
+  }
+  // The pond lattice (POND_TILE) is a prelude constant for the same reason
+  // (P-F): a reload whose finest water tile moved recompiles, or worldgen
+  // would roll the old lattice against the new rows.
+  {
+    const int want = worldmap::CurrentWorldMap().pondTile;
+    if (want != sPondTileCompiled) {
+      std::printf("environment: pond lattice %d -> %d, recompiling shaders\n", sPondTileCompiled, want);
+      if (!ReloadShaders(device))
+        std::fprintf(stderr, "environment: shader reload FAILED; the old lattice's pipelines stay live\n");
+      sPondTileCompiled = want;
     }
   }
 }

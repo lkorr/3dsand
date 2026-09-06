@@ -796,9 +796,9 @@ MIRROR_RE = re.compile(
 
 # WGSL spellings that have no counterpart token on the C++ side, and vice versa.
 _WGSL_DROP = (r"\b(?:let|var|fn|i32|u32|f32|bool"
-              r"|N2|Oct|Land|Pond|Shore|LandCol|CaveBands|TreeCands)\b")
+              r"|N2|Oct|Land|Pond|PondSet|Shore|LandCol|CaveBands|TreeCands)\b")
 _CPP_DROP = (r"\b(?:static|inline|const|int|uint32_t|int32_t|unsigned|bool"
-             r"|N2|Oct|Land|Pond|Shore|IV2)\b")
+             r"|N2|Oct|Land|Pond|PondSet|Shore|IV2)\b")
 
 
 def _mirror_blocks(text, tag):
@@ -1252,7 +1252,7 @@ def check_worldmap_layout():
         return
     checked.append("world map layout")
     cpp = {}
-    for m in re.finditer(r"\b(kH\w+|kB_\w+|kC_\w+|kS_\w+|kStamp_\w+|kW_\w+|kP_\w+)\s*=\s*(\d+)", hdr):
+    for m in re.finditer(r"\b(kH\w+|kB_\w+|kC_\w+|kS_\w+|kStamp_\w+|kW_\w+|kP_\w+|kR_\w+|kSite\w+)\s*=\s*(\d+)", hdr):
         cpp[m.group(1)] = int(m.group(2))
     for m in re.finditer(r"kBF_(\w+)\s*=\s*1u\s*<<\s*(\d+)", hdr):
         cpp["kBF_" + m.group(1)] = 1 << int(m.group(2))
@@ -1274,8 +1274,11 @@ def check_worldmap_layout():
              "kStamp_Columns": "WM_STAMP_COLUMNS",
              # the water preset table (P-E): kW_* -> WM_W_*, shore rows kP_* -> WM_P_*
              "kWaterRecWords": "WM_W_WORDS", "kShoreRowWords": "WM_P_WORDS",
-             "kW_MaxPlantH": "WM_W_MAX_PLANT_H"}
-    for m in re.finditer(r"\b(kBiomeRecWords|kCoverRowWords|kSiteRecWords|kStampHdrWords|kWaterRecWords|kShoreRowWords)\s*=\s*(\d+)", hdr):
+             "kW_MaxPlantH": "WM_W_MAX_PLANT_H",
+             # P-F: the biome's water rows kR_* -> WM_R_*, the site kinds
+             "kWaterRowWords": "WM_R_WORDS", "kR_ChanceQ16": "WM_R_CHANCE_Q16",
+             "kSitePad": "WM_SITE_PAD", "kSiteStamp": "WM_SITE_STAMP", "kSiteWater": "WM_SITE_WATER"}
+    for m in re.finditer(r"\b(kBiomeRecWords|kCoverRowWords|kSiteRecWords|kStampHdrWords|kWaterRecWords|kShoreRowWords|kWaterRowWords)\s*=\s*(\d+)", hdr):
         cpp[m.group(1)] = int(m.group(2))
     for name, wgname in list(alias.items()):
         pass
@@ -1294,6 +1297,8 @@ def check_worldmap_layout():
             wname = "WM_W_" + snake(cname[3:])
         elif cname.startswith("kP_"):
             wname = "WM_P_" + snake(cname[3:])
+        elif cname.startswith("kR_"):
+            wname = "WM_R_" + snake(cname[3:])
         elif cname.startswith("kBF_"):
             wname = "WM_BF_" + snake(cname[4:])
         else:
@@ -1312,6 +1317,7 @@ def check_worldmap_layout():
         elif cname.startswith("kS_"): known.add("WM_S_" + snake(cname[3:]))
         elif cname.startswith("kW_"): known.add("WM_W_" + snake(cname[3:]))
         elif cname.startswith("kP_"): known.add("WM_P_" + snake(cname[3:]))
+        elif cname.startswith("kR_"): known.add("WM_R_" + snake(cname[3:]))
         elif cname.startswith("kBF_"): known.add("WM_BF_" + snake(cname[4:]))
     for wname in wg:
         if wname not in known:

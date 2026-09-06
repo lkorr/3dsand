@@ -324,10 +324,13 @@ Status GateWaterBody(Ctx& c, std::string& detail) {
     b.radius = 48;
     b.discD2Max = 48 * 48;
     b.surfY = 1000;
-    b.centreDepth = base.worldgen.pondDepth;
-    b.rimDepth = base.worldgen.pondDepthRim;
+    // The pre-P-F tarn's numbers (depth 26, rim 3, berm 5), as literals: this
+    // arm is the parabola's own round-trip, kept beside the profiled bowl the
+    // world makes now so the inversion's off-by-one is still pinned somewhere.
+    b.centreDepth = 26;
+    b.rimDepth = 3;
     b.floorY = b.surfY - b.centreDepth;
-    b.spillY = b.surfY + base.worldgen.pondBerm;
+    b.spillY = b.surfY + 5;
     b.kind = WaterBasinKind::ParabolicBowl;
     const WaterBasinCurve cur = WaterBasinBuildCurve(b);
     curveLevels = (uint32_t)cur.area.size();
@@ -408,11 +411,15 @@ Status GateWaterBody(Ctx& c, std::string& detail) {
       b.radius = found.r;
       b.discD2Max = found.r * found.r;
       b.surfY = found.surf;
-      b.centreDepth = base.worldgen.pondDepth;
-      b.rimDepth = base.worldgen.pondDepthRim;
+      // P-F: the geometry is the tarn's own preset's, carried in the disc,
+      // and the curve inverts the mirrored bowl (World::BowlDepth) by
+      // bisection -- the Profiled kind the registry builds for every pond.
+      b.centreDepth = found.depth;
+      b.rimDepth = found.rimDepth;
       b.floorY = found.surf - b.centreDepth;
-      b.spillY = found.surf + base.worldgen.pondBerm;
-      b.kind = WaterBasinKind::ParabolicBowl;
+      b.spillY = found.surf + found.bermH;
+      b.kind = WaterBasinKind::Profiled;
+      b.preset = found.preset;
       tarnR = (uint32_t)found.r;
       const WaterBasinCurve cur = WaterBasinBuildCurve(b);
       tarnCurveCells = (int64_t)(WaterBasinVolumeEighths(cur, b.surfY) / 8u);

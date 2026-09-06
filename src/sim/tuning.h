@@ -2930,42 +2930,12 @@ struct Tuning {
     // There is no `treeTile` any more: the tree lattice is the finest
     // `trees.tile` among assets/biomes/*.json (biomes.h FinestTreeTileVox),
     // and each biome thins on it to its own density. One authoring surface.
-    int pondTile = 448, pondChance = 4, pondRadiusMin = 48, pondRadiusSpan = 32;
-    // Steepest ground a tarn may sit on, |dh/dx|+|dh/dz| in Q8 (256 = the
-    // CA's angle of repose). A bowl cut into a slope lays its sand bed on a
-    // wall and never settles.
-    int pondMaxSlope = 96;
-    // The tarn berm: the annulus just outside the disc is forced to
-    // (waterline + pondBerm) and ramps back to natural ground over
-    // pondBermWidth voxels. This is what makes pond containment STRUCTURAL —
-    // the rim-sampling density it replaced was already stale at these radii.
-    int pondBerm = 5, pondBermWidth = 14;
-    // Bowl depth in VOXELS: pondDepth at the centre, pondDepthRim at the edge.
-    // At kVoxelMeters 0.10 the player is 17 voxels tall, so a pond has to reach
-    // roughly 20 before you can actually submerge in one — the previous
-    // 8-voxel bowl was 0.8 m and could only be waded through.
-    int pondDepth = 26, pondDepthRim = 3;
-    // Pond vegetation (lilypads, reeds, kelp) and the shore species are NOT
-    // here since P-E: they are the water preset's aquatic.* / shore.plants[]
-    // (assets/water/<name>.json), packed into the worldMap buffer's water
-    // table (worldmap.h kW_*). Only the pond/shore GEOMETRY knobs remain,
-    // until P-F.
-    // Shoreline: the wet fringe OUTSIDE the pond disc, which used to go
-    // straight from water to plain hillside grass. shoreBand is how many
-    // voxels past the rim the fringe reaches AND the sole cost knob for
-    // shoreAt() — it is the width of the tile-edge strip where a column has to
-    // consult a second pond tile, so it must stay well under pondTile.
-    // shoreMudWidth is the (shorter) inner ring where the ground skin becomes
-    // wet mud instead of grass. The rest are 1-in-N placement rolls per shore
-    // column, same inert-solid contract as the pond vegetation above.
-    int shoreBand = 24, shoreMudWidth = 10;
-    // shoreLift is the VERTICAL half of the band: how far above the waterline
-    // a column may stand and still be shore. pondSurface is min(rim) - 2, so
-    // most of a rim is well above the water and a fringe cut by radius alone
-    // paints marsh up the abutting hillside; cutting on height instead puts
-    // the reed beds in the shallow bays. High leverage — at the default pond
-    // it keeps 5% of the raw band at 4 and 99% at 24.
-    int shoreLift = 12;
+    // There are no pond* / shore* geometry knobs any more (P-F): a body of
+    // water's geometry is its preset's (assets/water/<name>.json, packed into
+    // the worldMap buffer's water table, worldmap.h kW_*), where it appears is
+    // the biome's water.features[] rows (kR_*) on the one pond lattice
+    // (kHPondTile) or an authored `kind: "water"` site on the map. One
+    // authoring surface, like the trees.
     // Tree vines, hanging moss and trunk ivy USED TO BE TUNED HERE. They were
     // implicit decoration worldgen drew on top of a tree, which is exactly the
     // kind of divergence the .svtree bake exists to end: the tuner's Trees tab

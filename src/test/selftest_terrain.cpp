@@ -200,7 +200,6 @@ struct PassAOut {
 // Two comparisons per sampled column, no rim sweep, and it holds at every seed
 // and every radius rather than at the ones somebody checked.
 bool CheckPondColumn(int x, int z, int h, uint32_t seed, PassAOut& o) {
-  const auto& w = CurrentTuning().worldgen;
   const World::PondQuery q = World::PondNearColumn(x, z, seed);
   if (q.inDisc) {
     o.pondCols++;
@@ -215,16 +214,18 @@ bool CheckPondColumn(int x, int z, int h, uint32_t seed, PassAOut& o) {
   }
   // The core is the flat part of the berm — the wall the water cannot cross.
   // Outside it the lift ramps back to natural ground on purpose, so only the
-  // core carries the guarantee. bermLift() in worldgen.wgsl defines it.
-  const int core = std::max(w.pondBermWidth / 4, 2);
+  // core carries the guarantee. bermLift() in worldgen.wgsl defines it, from
+  // the PRESET's berm (P-F): the query carries the height and width the
+  // pond's own preset gave it.
+  const int core = std::max(q.bermW / 4, 2);
   if (!q.near || q.past >= core) return true;
   o.bermCols++;
-  if (h < q.surf + w.pondBerm) {
+  if (h < q.surf + q.bermH) {
     o.ok = false;
     o.why += Format("%sberm column (%d,%d) at %d past the rim: ground y%d is "
-                    "under waterline y%d + berm %d — this tarn leaks",
+                    "under waterline y%d + berm %d (preset %u) — this tarn leaks",
                     o.why.empty() ? "" : "; ", x, z, q.past, h, q.surf,
-                    w.pondBerm);
+                    q.bermH, q.preset);
     return false;
   }
   return true;
@@ -259,15 +260,16 @@ PassAOut PassA(World& world, uint32_t seed, std::string* log) {
   // until the disc ends, then check every column of the berm core. Bounded by
   // construction — 24 probes of at most (maxR + bermWidth) steps.
   {
-    const auto& w = CurrentTuning().worldgen;
-    const int reach = w.pondRadiusMin + w.pondRadiusSpan + w.pondBermWidth + 4;
+    // The widest disc + band any preset or authored lake can produce (P-F):
+    // the walk stops at the berm's outer edge long before that.
+    const int reach = World::PondReachMax();
     for (auto [px, pz] : inPond) {
       for (int i = 0; i <= reach; i++) {
         const int x = px + i;
         const int h = World::TerrainHeight(x, pz, seed);
         if (!CheckPondColumn(x, pz, h, seed, o)) break;
         const World::PondQuery q = World::PondNearColumn(x, pz, seed);
-        if (!q.inDisc && (!q.near || q.past >= w.pondBermWidth)) break;
+        if (!q.inDisc && (!q.near || q.past >= q.bermW)) break;
       }
     }
   }

@@ -2426,18 +2426,8 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadWgCount(*g, "curveDesert7", w.curveDesert7, out, at);
     ReadWgCount(*g, "curveDesert8", w.curveDesert8, out, at);
     ReadWgCount(*g, "biomeBlend", w.biomeBlend, out, at);
-    ReadWgLen(*g, "pondTile", w.pondTile, out, at);
-    ReadWgCount(*g, "pondChance", w.pondChance, out, at);
-    ReadWgLen(*g, "pondRadiusMin", w.pondRadiusMin, out, at);
-    ReadWgLen(*g, "pondRadiusSpan", w.pondRadiusSpan, out, at);
-    ReadWgCount(*g, "pondMaxSlope", w.pondMaxSlope, out, at);
-    ReadWgLen(*g, "pondBerm", w.pondBerm, out, at);
-    ReadWgLen(*g, "pondBermWidth", w.pondBermWidth, out, at);
-    ReadWgLen(*g, "pondDepth", w.pondDepth, out, at);
-    ReadWgLen(*g, "pondDepthRim", w.pondDepthRim, out, at);
-    ReadWgLen(*g, "shoreBand", w.shoreBand, out, at);
-    ReadWgLen(*g, "shoreMudWidth", w.shoreMudWidth, out, at);
-    ReadWgLen(*g, "shoreLift", w.shoreLift, out, at);
+    // (The pond* / shore* geometry rows went in P-F: they are the water
+    // preset's, packed by worldmap::WaterGeomOf. Nothing to read here.)
     ReadWgCount(*g, "alpineChance", w.alpineChance, out, at);
     ReadWgCount(*g, "caveThreshold1", w.caveThreshold1, out, at);
     ReadWgCount(*g, "caveThreshold2", w.caveThreshold2, out, at);
@@ -2533,93 +2523,14 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     // The tree lattice is no longer a knob: LoadTreeAtlas derives the scan
     // and candidate cap from the biome files' finest tile and refuses an atlas
     // whose widest crown would overflow them (sim/treeatlas.h TreeLattice).
-    atLeast("pondTile", w.pondTile, 8);
-    atLeast("pondChance", w.pondChance, 1);
-    atLeast("pondRadiusSpan", w.pondRadiusSpan, 1);
-    atLeast("pondDepthRim", w.pondDepthRim, 1);
-    atLeast("pondDepth", w.pondDepth, w.pondDepthRim);
-    // The bowl is carved DOWN from the water surface, and the cave system
-    // starts 40 voxels under the terrain surface. A bowl deeper than that
-    // breaches a tunnel, the pond drains into the cave network, and the world
-    // never settles — which shows up as a sleep-gate failure a long way from
-    // this file. 34 keeps a margin under the 40.
-    // 34 is a LENGTH (the cave layer starts 40 under the surface), so it moves
-    // with the voxel scale exactly like the row it bounds.
-    if (w.pondDepth > scaleLen(34)) {
-      out.warnings.push_back(
-          "worldgen.pondDepth > " + std::to_string(scaleLen(34)) +
-          " would breach the cave layer and drain the pond; clamped");
-      w.pondDepth = scaleLen(34);
-    }
-    atLeast("pondMaxSlope", w.pondMaxSlope, 0);
-    // THE REPOSE PAIRING. The bowl is parabolic, so it is steepest at the rim,
-    // where it falls 2*(pondDepth - pondDepthRim)/r voxels per column -- and the
-    // bed laid on that face is SAND. This CA's angle of repose is exactly 1
-    // voxel per column (sim_step.wgsl slides a powder into any free
-    // down-diagonal), so above that the tarn is a permanent avalanche and the
-    // chunk never sleeps (CLAUDE.md rule 2). It does not fail here or in the
-    // pond: it fails as `ca-skip` reporting the world is never quiet, two gates
-    // and a hundred lines of output away. Bound against the SMALLEST radius the
-    // tuning can roll, because that is the steepest bowl it can produce.
-    const int reposeDepth = w.pondDepthRim + w.pondRadiusMin / 2;
-    if (w.pondDepth > reposeDepth) {
-      out.warnings.push_back(
-          "worldgen.pondDepth " + std::to_string(w.pondDepth) +
-          " exceeds the angle of repose for pondRadiusMin " +
-          std::to_string(w.pondRadiusMin) +
-          " -- the sand bed on the bowl wall would avalanche forever; clamped "
-          "to " + std::to_string(reposeDepth) +
-          " (raise pondRadiusMin instead if you want a deeper tarn)");
-      w.pondDepth = reposeDepth;
-    }
-    // Shoreline knobs. Every "chance" is a modulo divisor (zero is a
-    // div-by-zero in the shader); the band has two ceilings of its own.
-    atLeast("shoreBand", w.shoreBand, 0);      // 0 legally disables the fringe
-    atLeast("shoreMudWidth", w.shoreMudWidth, 0);
-    atLeast("shoreLift", w.shoreLift, 0);
-    // shoreAt() resolves the distance past the rim by 8 steps of bisection over
-    // [0, shoreBand], which is exact only while the band fits in 2^8.
-    // NOT scaled, and that is the point: 255 is 2^8 - 1, an ALGORITHM limit on
-    // pondNear's 8-step bisection, not a distance. It is therefore the one
-    // ceiling that gets TIGHTER in physical terms as voxels shrink — at 40
-    // voxels/m a 6.4 m shore band is the most the bisection can resolve, and
-    // widening it needs a ninth step rather than a bigger number here.
-    if (w.shoreBand > 255) {
-      out.warnings.push_back(
-          "worldgen.shoreBand > 255 exceeds pondNear's 8-step bisection; "
-          "clamped to 255");
-      w.shoreBand = 255;
-    }
-    // shoreAt() checks the column's own pond tile plus AT MOST one neighbour
-    // per axis, which is only sound while a column can be within `band` of one
-    // tile edge at a time. Past pondTile/2 - 1 both edges of the same axis are
-    // in reach and the far side's pond would be missed — a marsh sliced off
-    // flat along a tile boundary. Half the tile is already absurdly wide
-    // (224 voxels at the default), so this never bites real tunings.
-    if (w.shoreBand > w.pondTile / 2 - 1) {
-      out.warnings.push_back(
-          "worldgen.shoreBand must stay under half of pondTile for shoreAt's "
-          "2x2 tile scan; clamped");
-      w.shoreBand = w.pondTile / 2 - 1;
-      if (w.shoreBand < 0) w.shoreBand = 0;
-    }
-    // The berm. `pondBermWidth` shares pondNear's scan band with `shoreBand`,
-    // so it takes the same 8-step-bisection and half-a-tile ceilings; and the
-    // berm must stay under shoreLift or it suppresses the very marsh fringe it
-    // is supposed to stand behind (see the shore block in genColumn).
-    atLeast("pondBerm", w.pondBerm, 0);
-    atLeast("pondBermWidth", w.pondBermWidth, 1);
-    if (w.pondBermWidth > 255) w.pondBermWidth = 255;
-    if (w.pondBermWidth > w.pondTile / 2 - 1)
-      w.pondBermWidth = std::max(1, w.pondTile / 2 - 1);
-    if (w.pondBerm >= w.shoreLift && w.shoreBand > 0) {
-      out.warnings.push_back(
-          "worldgen.pondBerm >= shoreLift: the berm stands the bank above the "
-          "waterline test, so no column near a pond can be a shore");
-    }
-    // The mud ring lives inside the band; a wider one would just be clipped
-    // silently, which reads as "shoreMudWidth stopped doing anything".
-    if (w.shoreMudWidth > w.shoreBand) w.shoreMudWidth = w.shoreBand;
+    // The pond and shore ceilings that used to live here -- the repose pairing
+    // between depth and the smallest radius, the cave-shell depth clamp, the
+    // band's 8-step-bisection and half-a-tile ceilings, berm vs lift, the mud
+    // ring inside the band -- moved with the knobs (P-F): worldmap::WaterGeomOf
+    // clamps what a preset can hold, ValidateBiomeSet refuses what a biome row
+    // cannot roll, and a bowl face too steep for a powder bed wears the
+    // preset's substrate per column (worldgen.wgsl bowlSteep) instead of being
+    // bounded here.
     // The pad blend divides by the margin, and the ivy pass reads the ruin from
     // columns one voxel OUTSIDE the footprint, so the margin has to reach them.
     // Every curve knot is Q14 over the coarse swing, and curveTangent's
@@ -2772,18 +2683,7 @@ std::string WorldgenDefaultsJson() {
   n("curveDesert7", w.curveDesert7);
   n("curveDesert8", w.curveDesert8);
   n("biomeBlend", w.biomeBlend);
-  n("pondTile", w.pondTile);
-  n("pondChance", w.pondChance);
-  n("pondRadiusMin", w.pondRadiusMin);
-  n("pondRadiusSpan", w.pondRadiusSpan);
-  n("pondMaxSlope", w.pondMaxSlope);
-  n("pondBerm", w.pondBerm);
-  n("pondBermWidth", w.pondBermWidth);
-  n("pondDepth", w.pondDepth);
-  n("pondDepthRim", w.pondDepthRim);
-  n("shoreBand", w.shoreBand);
-  n("shoreMudWidth", w.shoreMudWidth);
-  n("shoreLift", w.shoreLift);
+  // (pond* / shore* went in P-F: the water preset's geometry, not a knob.)
   n("alpineChance", w.alpineChance);
   n("caveThreshold1", w.caveThreshold1);
   n("caveThreshold2", w.caveThreshold2);

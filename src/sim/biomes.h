@@ -148,6 +148,16 @@ struct WaterPresetDef {
   std::vector<std::string> unresolved;   // the subset materials.json does not have
   float tileM = 0;
   int rarity = 0, maxSlope = 0;
+  int minY = -1, maxY = -1;              // placement.minY / maxY (row defaults; the biome row's gate rolls)
+  // P-F: the geometry half, packed by worldmap::WaterGeomOf into the kW_*
+  // geometry words and the 17 sampled profile knots.
+  std::vector<std::pair<float, float>> profile;   // bathymetry.profile, (u, depth fraction) pairs, sanitized
+  float mudWidthM = 0;                   // shore.mudWidth
+  std::string mudMaterial;               // shore.mudMaterial
+  uint32_t mudId = 0;
+  std::string bedShallow, bedDeep, bedSubstrate;  // bed.shallow / deep / substrate
+  uint32_t bedShallowId = 0, bedDeepId = 0, bedSubstrateId = 0;
+  float bedShallowDepthM = 0, bedThicknessM = 0.3f;
   // P-E: the flora half, read by worldgen through the worldMap buffer's
   // water preset table (worldmap.h kW_* / kP_*).
   int mossChance = 0;                    // 1-in-N shore stone surface cells; 0 = never

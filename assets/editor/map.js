@@ -10,8 +10,9 @@
  * (0 = ocean floor, 255 = alpine) and owns the height from P4; moisture is
  * reserved. Sites are a list: one `kind: "pad"` box (the selftest harness
  * region), one `kind: "spawn"` column (where the game starts and the centre
- * of the calm home area; PLAN_environment_truth P-C), and `kind: "stamp"`
- * markers (P5).
+ * of the calm home area; PLAN_environment_truth P-C), `kind: "stamp"`
+ * markers (P5), and `kind: "water"` AUTHORED LAKES (P-F: a water preset at a
+ * fixed centre, the same on every seed).
  *
  * WHAT IT IS NOT. Not a preview of the generated world: the Worldgen tab's
  * heightmap and voxel views are. This page draws the PLANES, plainly, so you
@@ -46,8 +47,16 @@ let H = null;
 let els = {};
 let map = null;            // {name, json, biome:Uint8Array, landform:Uint8Array, moisture:Uint8Array}
 let dirty = false;
-let tool = 'biome';        // biome | landform | pad | spawn | stamp
+let tool = 'biome';        // biome | landform | pad | spawn | stamp | water
 const SPAWN_DEFAULT = [140, 140];   // worldmap.cpp's default when a map names no spawn
+// The water tool (P-F): an AUTHORED LAKE is `{kind: "water", preset, at: [x, z],
+// radius?}` -- Tier A, the same place on every seed, wearing the preset's
+// geometry (footprint radius unless overridden, depth profile, berm, shore
+// band, bed, flora). `presets` is assets/water/ by name; `radiusM` 0 = the
+// preset's own radius; `geom` caches each preset's radius/band in voxels for
+// drawing the footprint to scale.
+let water = {preset: '', radiusM: 0, presets: [], geom: {}};
+let waterDrag = null;      // {site, dx, dz}: dragging an existing lake by its centre
 let brush = {index: 0, radius: 2, landform: 128, soft: true};
 let view = {cx: 0, cz: 0, scale: 4};   // cell-space centre + pixels per cell
 let showLandform = true;
@@ -123,6 +132,34 @@ async function loadMap(name) {
   fit();
   paint();
   status(`loaded worldmap/${name}: ${json.size[0]}x${json.size[1]} cells of ${1 << json.cellLog2} vox (${(json.size[0] * (1 << json.cellLog2) / 10 / 1000).toFixed(1)} km)`);
+}
+// The water presets for the Water tool (P-F): the names under assets/water/
+// and, per preset, the radius and shore/berm band in voxels the engine
+// derives (worldmap.cpp WaterGeomOf: 10 voxels to the metre, band =
+// max(shore.band, berm.width)) so a lake's footprint draws to scale.
+async function loadWaterPresets() {
+  const r = await fetch('/api/models', {cache: 'no-store'});
+  const j = await r.json();
+  const names = [...new Set((j.files || [])
+      .filter(f => f.dir === 'water' && f.name.endsWith('.json') && f.name[0] !== '_')
+      .map(f => f.name.slice(0, -5)))].sort();
+  water.presets = names;
+  for (const n of names) {
+    try {
+      const rp = await fetch('/api/model?path=water/' + encodeURIComponent(n + '.json'), {cache: 'no-store'});
+      const p = await rp.json();
+      const fp = p.footprint || {}, sh = p.shore || {}, be = p.berm || {};
+      water.geom[n] = {
+        radius: Math.max(4, Math.round((fp.radius || 0) * 10)),
+        band: Math.max(1, Math.round(Math.max(sh.band || 0, be.width || 0) * 10))
+      };
+    } catch (e) { water.geom[n] = {radius: 60, band: 24}; }
+  }
+  if (els.waterPreset) {
+    els.waterPreset.replaceChildren(...names.map(n => H.el('option', {value: n}, n)));
+    if (!water.preset && names.length) water.preset = names.includes('tarn') ? 'tarn' : names[0];
+    els.waterPreset.value = water.preset;
+  }
 }
 async function saveMap() {
   if (!map) return;
@@ -220,8 +257,27 @@ function paint() {
     ctx.fillStyle = '#7fd4ff'; ctx.font = '11px monospace';
     ctx.fillText((s.id || 'site') + ' (' + (s.template || '?') + (s.rot ? ' r' + s.rot : '') + ')', sx + rr + 3, sz + 4);
   }
+  // water sites (P-F): the disc to scale, the shore/berm band as a dashed
+  // ring, the preset and radius as the label
+  for (const s of (map.json.sites || [])) {
+    if (s.kind !== 'water') continue;
+    const l = map.json.cellLog2, cv = 1 << l;
+    const at = Array.isArray(s.at) ? s.at : [0, 0];
+    const sx = ox + (at[0] / cv + ocx) * view.scale, sz = oy + (at[1] / cv + ocz) * view.scale;
+    const g = water.geom[s.preset] || {radius: 60, band: 24};
+    const rv = s.radius || g.radius;
+    const rr = Math.max(3, (rv / cv) * view.scale);
+    const rb = Math.max(rr + 1, ((rv + g.band) / cv) * view.scale);
+    ctx.strokeStyle = tool === 'water' ? '#ff7a7a' : '#5fc8ff'; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(sx, sz, rr, 0, Math.PI * 2); ctx.stroke();
+    ctx.setLineDash([3, 3]); ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.arc(sx, sz, rb, 0, Math.PI * 2); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = '#5fc8ff'; ctx.font = '11px monospace';
+    ctx.fillText((s.id || 'lake') + ' (' + (s.preset || '?') + ' r' + (rv / 10).toFixed(1) + 'm)', sx + rr + 3, sz + 4);
+  }
   // brush cursor
-  if (els.hover && tool !== 'pad' && tool !== 'stamp' && tool !== 'spawn') {
+  if (els.hover && tool !== 'pad' && tool !== 'stamp' && tool !== 'spawn' && tool !== 'water') {
     ctx.strokeStyle = 'rgba(255,255,255,0.7)'; ctx.lineWidth = 1;
     ctx.beginPath();
     ctx.arc(ox + (els.hover[0] + 0.5) * view.scale, oy + (els.hover[1] + 0.5) * view.scale,
@@ -327,6 +383,37 @@ function wire() {
       paint();
       return;
     }
+    if (tool === 'water') {
+      // Click on a lake: pick it up (drag moves it). Shift+click: delete it.
+      // Click on open map: a new lake at the cursor's world column with the
+      // chosen preset and radius (0 = the preset's own). Tier A: the engine
+      // reads the centre and radius from map.json, never from the seed.
+      const [wx, wz] = worldColumnAt(ev);
+      const sites = map.json.sites || (map.json.sites = []);
+      const hit = sites.find(s => {
+        if (s.kind !== 'water' || !Array.isArray(s.at)) return false;
+        const g = water.geom[s.preset] || {radius: 60};
+        const r = s.radius || g.radius;
+        const dx = s.at[0] - wx, dz = s.at[1] - wz;
+        return dx * dx + dz * dz <= r * r;
+      });
+      stroke = snapshot();
+      if (ev.shiftKey && hit) {
+        sites.splice(sites.indexOf(hit), 1);
+        stroke.changed = true;
+      } else if (hit) {
+        waterDrag = {site: hit, dx: hit.at[0] - wx, dz: hit.at[1] - wz};
+      } else {
+        if (!water.preset) { toast('pick a water preset first', true); stroke = null; return; }
+        const n = sites.filter(s => s.kind === 'water').length;
+        const s = {id: water.preset + '_' + n, kind: 'water', preset: water.preset, at: [wx, wz]};
+        if (water.radiusM > 0) s.radius = Math.round(water.radiusM * 10);
+        sites.push(s);
+        stroke.changed = true;
+      }
+      paint();
+      return;
+    }
     stroke = snapshot();
     stroke.changed = applyBrush(...cellAt(ev));
     paint();
@@ -346,6 +433,10 @@ function wire() {
       if (s) { s.min = box.min; s.max = box.max; }
       else map.json.sites = [...(map.json.sites || []), {id: 'harness', kind: 'pad', ...box}];
       stroke.changed = true;
+    } else if (waterDrag && ev.buttons & 1) {
+      const [wx, wz] = worldColumnAt(ev);
+      waterDrag.site.at = [wx + waterDrag.dx, wz + waterDrag.dz];
+      stroke.changed = true;
     } else if (stroke && ev.buttons & 1) {
       if (applyBrush(...cell)) stroke.changed = true;
     }
@@ -361,6 +452,7 @@ function wire() {
   const up = () => {
     panning = null;
     padDrag = null;
+    waterDrag = null;
     if (stroke) {
       if (stroke.changed) { undo.push(stroke); if (undo.length > 40) undo.shift(); redo = []; markDirty(true); }
       stroke = null;
@@ -452,8 +544,16 @@ export function attach(hooks) {
     pad: el('button', {title: 'drag the harness pad box (world voxels)'}, 'Pad box'),
     spawn: el('button', {title: 'click: put the spawn site there (where the game starts; the calm home area centres on it). One per map.'}, 'Spawn'),
     stamp: el('button', {title: 'click: place a stamp site (a .vox from assets/prefabs/); shift+click a marker: delete it'}, 'Stamp site'),
+    water: el('button', {title: 'click: place an AUTHORED LAKE (a water preset at that column, same on every seed); drag a lake to move it; shift+click: delete it'}, 'Water'),
   };
   for (const [k, b] of Object.entries(els.tools)) b.addEventListener('click', () => { tool = k; syncControls(); paint(); });
+  // The water tool's preset and radius (P-F). The preset list is
+  // assets/water/ (the Water bodies page's own list); the geometry cache is
+  // what draws each lake's footprint and band to scale.
+  els.waterPreset = el('select', {title: 'the water preset a new lake wears (Environment > Water bodies)'});
+  els.waterPreset.addEventListener('change', () => { water.preset = els.waterPreset.value; tool = 'water'; syncControls(); paint(); });
+  els.waterRadius = el('input', {type: 'number', min: 0, step: 0.5, value: 0, style: 'width:64px', title: 'radius in metres for a NEW lake; 0 = the preset\'s own footprint radius'});
+  els.waterRadius.addEventListener('change', () => { water.radiusM = Math.max(0, +els.waterRadius.value || 0); });
   els.radius = el('input', {type: 'range', min: 0, max: 24, value: brush.radius, style: 'width:110px'});
   els.radiusOut = el('span', {}, String(brush.radius));
   els.radius.addEventListener('input', () => { brush.radius = +els.radius.value; syncControls(); paint(); });
@@ -472,7 +572,8 @@ export function attach(hooks) {
   const bar = el('div', {class: 'mapbar'},
     el('label', {}, 'map ', els.mapSel), els.save, undoBtn, redoBtn, fitBtn,
     el('span', {style: 'width:10px'}),
-    els.tools.biome, els.tools.landform, els.tools.pad, els.tools.spawn, els.tools.stamp,
+    els.tools.biome, els.tools.landform, els.tools.pad, els.tools.spawn, els.tools.stamp, els.tools.water,
+    el('label', {}, ' lake ', els.waterPreset, ' r ', els.waterRadius, ' m'),
     el('label', {}, ' radius ', els.radius, ' ', els.radiusOut),
     el('label', {}, ' landform ', els.land, ' ', els.landOut),
     el('label', {}, ' ', showLf, ' shade by landform'));
@@ -481,12 +582,16 @@ export function attach(hooks) {
     'Cells are 2^cellLog2 voxels (102.4 m). Right/middle-drag pans, wheel zooms, [ ] resize the brush. ' +
     'The pad box is the selftest harness region (no trunks, crowns, tarns or cover inside); the spawn diamond is where the game starts and the centre of the calm home area (worldgen.spawnPlain*) -- keep it outside the pad, on land, or the spawn-site gate says so. ' +
     'A stamp site places assets/prefabs/<name>.vox on a levelled pad at that column (its cells keep out trees, tarns and cover); the engine refuses to start if the .vox is missing. ' +
-    'Saving writes assets/worldmap/<name>/ and moves the world hash; regenerate the world to see it.');
+    'A water site is an AUTHORED LAKE: the chosen preset (Environment > Water bodies) carved at that column on every seed -- its bowl, berm, shore band, bed and flora are the preset\'s, only the centre (and an optional radius) is yours; rolled ponds, trees and cover keep out of its disc and band. ' +
+    'Saving writes assets/worldmap/<name>/ and moves the world hash; regenerate the world (F7) to see it.');
   root.append(bar, els.palette, els.canvas, els.status, note);
   wire();
   new ResizeObserver(() => paint()).observe(els.canvas);
 
   els.mapSel.addEventListener('change', () => loadMap(els.mapSel.value).catch(e => toast('load failed: ' + e.message, true)));
+  // The water presets, and each one's radius + band in voxels (the engine's
+  // rounding: 10 voxels to the metre, band = max(shore.band, berm.width)).
+  loadWaterPresets().then(() => paint()).catch(e => status('water presets: ' + e.message));
   listMaps().then(names => {
     els.mapSel.replaceChildren(...names.map(n => el('option', {value: n}, n)));
     const want = (H.tuning && H.tuning.worldgen && H.tuning.worldgen.mapLayer) || names[0];

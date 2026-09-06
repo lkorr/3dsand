@@ -848,82 +848,33 @@ TP_I(worldgen, curveDesert8, TUNE_CURVE_DESERT8, 16384)
 TP_I(worldgen, biomeBlend, TUNE_BIOME_BLEND, 18)
 // (autumnFraction went in P-E: a species' autumn rarity is `autumnChance` in
 // assets/trees/<name>.json alone, with no global scale on it.)
-TP_I(worldgen, pondTile, TUNE_POND_TILE, 448)
-TP_U(worldgen, pondChance, TUNE_POND_CHANCE, 4)
-// Radii SHRANK with the perched-tarn change (68..127 -> 48..79). A pond whose
-// waterline comes from its own centre and is contained by a forced berm is a
-// TARN, and a 10 m one reads right where a 25 m one reads as a failed lake.
-// The big water is package D's job.
-//
-// The FLOOR on the minimum is not taste, it is the angle of repose. The bowl's
-// steepest point is its rim, falling 2*(pondDepth - pondDepthRim)/r per column,
-// and the bed laid on it is SAND. Above 1 voxel/column that sand avalanches
-// forever and the chunk never sleeps, so a swimmable 26-voxel bowl needs
-// r >= 2*(26-3) = 46. LoadTuning enforces the pairing; 24 was tried and it is
-// what made the world stop settling.
-TP_I(worldgen, pondRadiusMin, TUNE_POND_RADIUS_MIN, 48)
-TP_U(worldgen, pondRadiusSpan, TUNE_POND_RADIUS_SPAN, 32)
-// Steepest ground a tarn may sit on, as |dh/dx| + |dh/dz| in Q8 (256 = 45
-// degrees = the CA's angle of repose). A tarn is PERCHED: on a slope the
-// centre-derived waterline sits under the uphill rim, the bowl cuts a cliff
-// into the hillside, and the sand bed goes down that cliff's inside face.
-// 0 disables tarns entirely, which is a legal thing to want.
-TP_I(worldgen, pondMaxSlope, TUNE_POND_MAX_SLOPE, 96)
-// The berm: how far ABOVE the waterline the annulus just outside the disc is
-// forced, and over how many voxels that lift ramps back to natural ground. The
-// first is what makes containment structural rather than a rim-sampling density
-// (see the perched-tarn block in worldgen.wgsl); the second is only ever a look
-// knob. Keep pondBerm comfortably under worldgen.shoreLift or the berm
-// suppresses the marsh fringe that is supposed to stand on it.
-TP_I(worldgen, pondBerm, TUNE_POND_BERM, 5)
-TP_I(worldgen, pondBermWidth, TUNE_POND_BERM_WIDTH, 14)
-// Bowl depth in VOXELS at the pond centre, tapering to pondDepthRim at the
-// edge. At kVoxelMeters 0.10 the player capsule is 17 voxels tall, so the old
-// 8-voxel centre depth was 0.8 m — ankle deep, and it made "swim in a pond"
-// impossible anywhere except the one authored lake. 26 puts the centre at
-// 2.6 m, comfortably over the player's head, while the rim stays shallow
-// enough to wade in from.
-TP_I(worldgen, pondDepth, TUNE_POND_DEPTH, 26)
-TP_I(worldgen, pondDepthRim, TUNE_POND_DEPTH_RIM, 3)
+// ---- ponds and shores: NOT KNOBS ANY MORE (P-F) ----
+// The nine pond* rows (tile, chance, radius min/span, max slope, berm height/
+// width, depth, rim depth) and the three shore* rows (band, mud width, lift)
+// are gone. A body of water's geometry is its PRESET's -- footprint,
+// bathymetry (a sampled profile, not a parabola), berm, shore band and bed
+// in assets/water/<name>.json -- packed into the worldMap buffer's water
+// table (src/sim/worldmap.h kW_* words 22..49); WHICH preset appears WHERE is
+// the biome's water.features[] rows (kR_*: tile, rarity, conditions) rolled
+// on the one pond lattice (kHPondTile, the finest tile of any biome), or an
+// authored `kind: "water"` site on the map. The angle-of-repose pairing that
+// LoadTuning used to enforce between depth and radius is a per-column
+// decision now (worldgen.wgsl bowlSteep: a face too steep for a powder bed
+// wears the preset's substrate), so a preset may be as deep as its author
+// drew it. ValidateBiomeSet holds the rest (a tile must hold its preset's
+// widest disc; a band must fit pondNear's scan).
 // ---- pond life: lilypads, reeds, kelp ----
 // NOT KNOBS ANY MORE (P-E). The floating / emergent / submerged bands are
 // `aquatic.*` in assets/water/<name>.json, packed into the worldMap buffer's
 // water preset table (src/sim/worldmap.h kW_*) and read there by genCellIn;
-// the same for the shore species (shore.plants[], shore.mossChance) below.
+// the same for the shore species (shore.plants[], shore.mossChance).
 // ---- vines / climbers / hanging moss (worldgen agent B) ----
 // The nine rows that used to live here — vineChance, vineLenMin/Span,
 // creeperFlowerChance, mossChance, mossLenMin/Span, ivyChance, ivyTwist —
 // tuned worldgen's implicit tree decoration, which no longer exists: a tree is
 // the baked .svtree atlas and nothing else, so anything hanging off one is
 // authored in treegen.js, not dialled in here. The MATERIALS survive; only the
-// generator did not. Wall ivy below is unrelated and stays.
-//
-// Ivy coverage on the ARENA and RUIN stone walls, 1..8. Higher is denser;
-// coverage always falls off toward the top of the wall so the coping stays
-// clear and the creeper reads as having climbed rather than been painted.
-// ---- shoreline: the wet fringe outside a pond ----
-// RESTORED by agent E: these ten rows were dropped from this file during a
-// concurrent rollback while their declarations stayed in tuning.h and their
-// TUNE_* names stayed referenced by worldgen.wgsl. That combination passes
-// check_invariants' .h side and still fails tint with "unresolved value
-// TUNE_SHORE_BAND", which invalidates the worldgen pipeline and makes EVERY
-// gate fail as a determinism regression. Defaults below are read straight off
-// the declarations in tuning.h so they cannot disagree with it.
-TP_I(worldgen, shoreBand, TUNE_SHORE_BAND, 24)
-TP_I(worldgen, shoreMudWidth, TUNE_SHORE_MUD_WIDTH, 10)
-// How far ABOVE the waterline a column may stand and still count as shore, in
-// voxels. The most load-bearing knob in the feature: pondSurface is
-// min(rim) - 2, so most of a rim stands well above the water, and a fringe
-// defined by radius alone paints marsh up whatever hillside abuts the disc.
-// Cutting on height instead puts the reed beds in the shallow bays and leaves
-// the steep sides as dry bank. It moves coverage a long way — at the default
-// pond it keeps 5% of the raw band at 4 and 99% at 24.
-TP_I(worldgen, shoreLift, TUNE_SHORE_LIFT, 12)
-// (The eight shore SPECIES rows -- cattail/horsetail/iris/sedge chance,
-// reach and height, and the wet-moss chance -- went in P-E: they are
-// shore.plants[] / shore.mossChance of the water preset now. The three
-// GEOMETRY rows above stay until P-F, which is when the band itself comes
-// from the preset.)
+// generator did not.
 // ---- desert / pine highland / alpine ground cover (worldgen agent E) ----
 // The three biomes that generated bare. All of these are 1-in-N per column
 // inside the relevant mask, or a percentage where noted, and every one of them

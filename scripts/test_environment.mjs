@@ -322,7 +322,15 @@ console.log('\n-- live manifest (envlive.js) --');
     ok(LV.isLive('biome', 'trees.species[].conditions.' + k) && LV.isLive('biome', 'cover.plants[].conditions.' + k),
        'conditions.' + k + ' is live on tree and cover rows (P-D)');
   ok(LV.normalizePath('cover.plants[3].conditions.minY') === 'cover.plants[].conditions.minY', 'lookup elides array indices');
-  ok(LV.isLive('biome', 'trees.density') && !LV.isLive('biome', 'water.features[].rarity'), 'isLive: density yes, a water row no');
+  ok(LV.isLive('biome', 'trees.density') && !LV.isLive('biome', 'climate.moisture'), 'isLive: density yes, a climate coordinate no');
+  // P-F landed: the water rows roll (tile / rarity / preset + minY/maxY/maxSlope
+  // at the pond centre) and the preset's geometry is carved; the shaped
+  // footprint and the floor noise stay preview-only.
+  for (const k of ['preset', 'tile', 'rarity', 'conditions.minY', 'conditions.maxSlope'])
+    ok(LV.isLive('biome', 'water.features[].' + k), 'water.features[].' + k + ' is live (P-F)');
+  for (const k of ['footprint.radius', 'bathymetry.depth', 'bathymetry.profile', 'berm.height', 'shore.band', 'bed.shallow', 'fill.material'])
+    ok(LV.isLive('water', k) && LV.lookup('water', k).read === true, 'water preset ' + k + ' is read (P-F)');
+  ok(!LV.isLive('water', 'footprint.lobes') && !LV.isLive('water', 'bathymetry.floorNoise'), 'the shaped footprint and floor noise stay preview-only');
   // Round trip: the P-E fields survive normalizeBiome so a save carries them.
   const nb = BG.normalizeBiome({caves: {features: [{preset: 'deep', threshold: 140, mushroomChance: 7, crystalChance: 9}]},
                                 cover: {cactusChance: 40, saguaroFraction: 15, cacti: true}});

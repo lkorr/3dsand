@@ -57,14 +57,148 @@ uint32_t MaxPlantH(const biomes::WaterPresetDef& w) {
   return m;
 }
 
-// The P-E interim rule: a biome's ponds and shores wear its FIRST water row's
-// preset (a pond has no preset of its own until P-F). 0 = none.
-uint32_t WaterPresetOf(const biomes::BiomeSet& set, const biomes::BiomeDef& b) {
-  if (b.water.empty()) return 0u;
+// ---- the geometry half of a water preset (P-F) ------------------------------
+// watergen.js profileAt, ported: monotone cubic (Fritsch-Carlson) through the
+// sanitized (u, fraction) points. Evaluated on the CPU at load only -- the
+// shader sees the sampled integer knots and nothing else.
+double ProfileAt(const std::vector<std::pair<float, float>>& pts, double u) {
+  const size_t n = pts.size();
+  if (n == 0) return 1.0 - u;
+  if (n == 1) return pts[0].second;
+  u = std::clamp(u, 0.0, 1.0);
+  std::vector<double> d(n - 1), m(n);
+  for (size_t i = 0; i + 1 < n; i++) {
+    const double h = pts[i + 1].first - pts[i].first;
+    d[i] = h > 0 ? (pts[i + 1].second - pts[i].second) / h : 0.0;
+  }
+  m[0] = d[0]; m[n - 1] = d[n - 2];
+  for (size_t i = 1; i + 1 < n; i++) {
+    if (d[i - 1] * d[i] <= 0) { m[i] = 0; continue; }
+    const double w1 = 2 * (pts[i + 1].first - pts[i].first) + (pts[i].first - pts[i - 1].first);
+    const double w2 = (pts[i + 1].first - pts[i].first) + 2 * (pts[i].first - pts[i - 1].first);
+    m[i] = (w1 + w2) / (w1 / d[i - 1] + w2 / d[i]);
+  }
+  size_t i = 0;
+  while (i + 2 < n && u > pts[i + 1].first) i++;
+  const double h = pts[i + 1].first - pts[i].first;
+  if (h <= 0) return pts[i].second;
+  const double t = (u - pts[i].first) / h, t2 = t * t, t3 = t2 * t;
+  const double h00 = 2 * t3 - 3 * t2 + 1, h10 = t3 - 2 * t2 + t;
+  const double h01 = -2 * t3 + 3 * t2, h11 = t3 - t2;
+  const double v = h00 * pts[i].second + h10 * h * m[i] + h01 * pts[i + 1].second + h11 * h * m[i + 1];
+  return std::clamp(v, 0.0, 1.0);
+}
+
+}  // namespace
+
+WaterGeom WaterGeomOf(const biomes::WaterPresetDef& w) {
+  WaterGeom g;
+  const auto vox = [](float m) { return static_cast<int>(std::lround(m * kVoxelsPerMetre)); };
+  const int r = vox(w.radiusM), rv = std::max(0, vox(w.radiusVM));
+  g.radiusMin = std::clamp(r - rv, 4, 2048);
+  g.radiusSpan = std::clamp(2 * rv + 1, 1, 4096);
+  g.depth = std::clamp(vox(w.depthM), 1, 200);
+  g.rimDepth = std::clamp(vox(w.rimDepthM), 0, g.depth);
+  g.bermH = std::clamp(vox(w.bermHeightM), 0, 255);
+  g.bermW = std::clamp(vox(w.bermWidthM), 1, 255);
+  g.shoreBand = std::clamp(vox(w.shoreBandM), 0, 255);
+  g.shoreLift = std::clamp(vox(w.shoreLiftM), 0, 4096);
+  g.mudWidth = std::clamp(vox(w.mudWidthM), 0, g.shoreBand);
+  g.bedShallowDepth = std::clamp(vox(w.bedShallowDepthM), 0, 4096);
+  g.bedThickness = std::clamp(vox(w.bedThicknessM), 0, 64);
+  g.maxSlope = std::clamp(w.maxSlope <= 0 ? 1024 : w.maxSlope, 0, 1024);
+  g.minY = w.minY; g.maxY = w.maxY;
+  g.band = std::max(g.shoreBand, g.bermW);
+  g.fill = w.fillId;
+  g.mudMat = w.mudId;
+  g.bedShallow = w.bedShallowId;
+  g.bedDeep = w.bedDeepId;
+  g.bedSubstrate = w.bedSubstrateId;
+  // Seventeen knots at u_k = sqrt(k / 16), the radii the shader's
+  // d^2-parametrised interpolation lands on; forced NON-INCREASING so the
+  // bowl is a bowl (the basin curve inverts it by bisection) and pinned to
+  // 256 at the centre and 0 at the rim like the sanitized curve.
+  int prev = 256;
+  for (int k = 0; k <= 16; k++) {
+    int v = static_cast<int>(std::lround(256.0 * ProfileAt(w.profile, std::sqrt(k / 16.0))));
+    v = std::clamp(v, 0, 256);
+    if (k == 0) v = 256;
+    if (k == 16) v = 0;
+    v = std::min(v, prev);
+    g.knots[k] = v;
+    prev = v;
+  }
+  return g;
+}
+
+int WaterGeomSteepestQ8(const WaterGeom& g, int r) {
+  int worst = 0;
+  const double dd = g.depth - g.rimDepth;
+  for (int k = 0; k < 16; k++) {
+    const double dr = (std::sqrt((k + 1) / 16.0) - std::sqrt(k / 16.0)) * std::max(r, 1);
+    const double drop = (g.knots[k] - g.knots[k + 1]) / 256.0 * dd;
+    if (dr > 0) worst = std::max(worst, static_cast<int>(std::lround(256.0 * drop / dr)));
+  }
+  return worst;
+}
+
+uint32_t WaterPresetIndex(const biomes::BiomeSet& set, const std::string& name) {
   for (size_t i = 0; i < set.water.size(); i++)
-    if (set.water[i].name == b.water[0].preset) return static_cast<uint32_t>(i + 1);
+    if (set.water[i].name == name) return static_cast<uint32_t>(i + 1);
   return 0u;
 }
+
+namespace {
+int TileVoxOf(const biomes::WaterRow& r) {
+  return std::max(0, static_cast<int>(std::lround(r.tileM * kVoxelsPerMetre)));
+}
+// A row that can place something: a loaded preset and a rarity that rolls.
+bool WaterRowLive(const biomes::BiomeSet& set, const biomes::WaterRow& r) {
+  return r.rarity > 0 && TileVoxOf(r) > 0 && WaterPresetIndex(set, r.preset) != 0u;
+}
+}  // namespace
+
+int PondLatticeVox(const biomes::BiomeSet& set) {
+  int finest = 0;
+  for (const biomes::BiomeDef& b : set.biomes)
+    for (const biomes::WaterRow& r : b.water)
+      if (WaterRowLive(set, r)) finest = finest == 0 ? TileVoxOf(r) : std::min(finest, TileVoxOf(r));
+  // The lattice floor: a disc needs room to be a disc. 64 vox = 6.4 m.
+  return finest == 0 ? 0 : std::max(finest, 64);
+}
+
+int PondBandVox(const biomes::BiomeSet& set) {
+  int band = 0;
+  for (const biomes::WaterPresetDef& w : set.water) band = std::max(band, WaterGeomOf(w).band);
+  return band;
+}
+
+std::vector<WaterRowPacked> PackWaterRows(const biomes::BiomeSet& set, const biomes::BiomeDef& b, int latticeVox) {
+  std::vector<WaterRowPacked> out;
+  if (latticeVox <= 0) return out;
+  for (const biomes::WaterRow& r : b.water) {
+    if (!WaterRowLive(set, r)) continue;
+    if (out.size() >= kWaterRowsMax) break;   // the shader rolls four, unrolled
+    // chance = (T / tile)^2 / rarity in Q16, integer: T^2 * 65536 / (tile^2 * rarity).
+    // A biome whose tile IS the lattice and rarity 4 rolls 1 in 4 lattice
+    // tiles; a coarser tile thins by the area ratio, so bodies per km^2 match
+    // the page's rarityStats whatever lattice the finest biome imposed.
+    const int64_t T = latticeVox, tile = TileVoxOf(r);
+    int64_t chance = (T * T * 65536) / std::max<int64_t>(1, tile * tile * r.rarity);
+    chance = std::clamp<int64_t>(chance, 1, 65536);
+    WaterRowPacked p;
+    p.w[kR_Preset] = WaterPresetIndex(set, r.preset);
+    p.w[kR_ChanceQ16] = static_cast<uint32_t>(chance);
+    p.w[kR_MinY] = U(r.cond.minY);
+    p.w[kR_MaxY] = U(r.cond.maxY);
+    p.w[kR_MaxSlope] = U(std::clamp(r.cond.maxSlope, 0, 1024));
+    p.w[kR_PatchThreshold] = U(std::clamp(r.cond.patchThreshold, 0, 255));
+    out.push_back(p);
+  }
+  return out;
+}
+
+namespace {
 
 // FNV-1a. Not a security hash; a change-detector so the boot line can name
 // the table/map that produced this world's hash.
@@ -112,6 +246,8 @@ bool PackBiomeTable(const biomes::BiomeSet& set, std::vector<uint32_t>& W,
   // derives the same number for the shader's scan; both are pure functions of
   // the set, so there is no ordering between the two loaders.
   const int treeLattice = biomes::FinestTreeTileVox(set);
+  // The one pond lattice (worldmap.h kHPondTile), the same way.
+  const int pondLattice = PondLatticeVox(set);
 
   W.assign(kHeaderWords, 0u);
   W[kHMagic] = kMagic;
@@ -161,8 +297,6 @@ bool PackBiomeTable(const biomes::BiomeSet& set, std::vector<uint32_t>& W,
     r[kB_CaveCrystalChance] = U(std::max(0, crystal));
     r[kB_CactusChance] = U(std::clamp(b.cactusChance, 0, 100));
     r[kB_SaguaroFraction] = U(std::clamp(b.saguaroFraction, 0, 100));
-    const uint32_t wp = WaterPresetOf(set, b);
-    r[kB_WaterPreset] = wp;
     // Cover rows are appended AFTER every record so the record table stays a
     // fixed stride; a row with chance 0 is authored-off and skipped here.
     r[kB_CoverOff] = U(static_cast<int>(W.size()));
@@ -190,14 +324,30 @@ bool PackBiomeTable(const biomes::BiomeSet& set, std::vector<uint32_t>& W,
       row[kC_NearWaterMin] = U(std::max(0, static_cast<int>(std::lround(c.cond.nearWaterMinM * kVoxelsPerMetre))));
       count++;
     }
-    // The biome's ceiling includes its water preset's plants: a shore stalk
-    // stands on ground the sky-skip would otherwise clear above (the same
-    // "skipped chunk drops voxels" failure the cover rows had).
-    if (wp) maxH = std::max(maxH, MaxPlantH(set.water[wp - 1]));
+    // The biome's ceiling includes EVERY preset its water rows can roll (and,
+    // through kHMaxCoverH below, every preset an authored site can wear): a
+    // shore stalk stands on ground the sky-skip would otherwise clear above
+    // (the same "skipped chunk drops voxels" failure the cover rows had).
+    for (const biomes::WaterRow& wr : b.water) {
+      const uint32_t wp = WaterPresetIndex(set, wr.preset);
+      if (wp) maxH = std::max(maxH, MaxPlantH(set.water[wp - 1]));
+    }
     W[rec0 + static_cast<size_t>(i) * kBiomeRecWords + kB_CoverCount] = U(count);
+    // P-F: the biome's water rows, after its cover rows.
+    {
+      const std::vector<WaterRowPacked> rows = PackWaterRows(set, b, pondLattice);
+      W[rec0 + static_cast<size_t>(i) * kBiomeRecWords + kB_WaterOff] = U(static_cast<int>(W.size()));
+      W[rec0 + static_cast<size_t>(i) * kBiomeRecWords + kB_WaterCount] = U(static_cast<int>(rows.size()));
+      for (const WaterRowPacked& p : rows) W.insert(W.end(), p.w, p.w + kWaterRowWords);
+    }
     W[rec0 + static_cast<size_t>(i) * kBiomeRecWords + kB_MaxCoverH] = maxH;
     W[kHMaxCoverH] = std::max(W[kHMaxCoverH], maxH);
   }
+  // An authored water site may wear any preset in any biome, so the far
+  // blocker band and the sky-skip take the widest plant of them all.
+  for (const biomes::WaterPresetDef& w : set.water) W[kHMaxCoverH] = std::max(W[kHMaxCoverH], MaxPlantH(w));
+  W[kHPondTile] = U(pondLattice);
+  W[kHPondBand] = U(PondBandVox(set));
 
   // ---- the water preset table (P-E): records, then each preset's shore rows --
   // Every preset is packed whether or not a biome names it: the index is the
@@ -239,6 +389,32 @@ bool PackBiomeTable(const biomes::BiomeSet& set, std::vector<uint32_t>& W,
       rec(kW_SubmergedClearance) = Vox0(s.clearanceM);
     }
     rec(kW_MaxPlantH) = MaxPlantH(w);
+    // ---- the geometry half (P-F): one WaterGeomOf, the same call the loader
+    // keeps for the CPU twin, so the two sides pack the same integers ----
+    {
+      const WaterGeom g = WaterGeomOf(w);
+      rec(kW_RadiusMin) = U(g.radiusMin);
+      rec(kW_RadiusSpan) = U(g.radiusSpan);
+      rec(kW_Depth) = U(g.depth);
+      rec(kW_RimDepth) = U(g.rimDepth);
+      rec(kW_BermH) = U(g.bermH);
+      rec(kW_BermW) = U(g.bermW);
+      rec(kW_ShoreBand) = U(g.shoreBand);
+      rec(kW_ShoreLift) = U(g.shoreLift);
+      rec(kW_MudWidth) = U(g.mudWidth);
+      rec(kW_MudMat) = g.mudMat;
+      rec(kW_BedShallow) = g.bedShallow;
+      rec(kW_BedDeep) = g.bedDeep;
+      rec(kW_BedShallowDepth) = U(g.bedShallowDepth);
+      rec(kW_BedThickness) = U(g.bedThickness);
+      rec(kW_BedSubstrate) = g.bedSubstrate;
+      rec(kW_MaxSlope) = U(g.maxSlope);
+      rec(kW_MinY) = U(g.minY);
+      rec(kW_MaxY) = U(g.maxY);
+      rec(kW_Band) = U(g.band);
+      for (int k = 0; k <= 16; k++)
+        rec(kW_Knots + static_cast<uint32_t>(k >> 1)) |= U(g.knots[k]) << ((k & 1) * 16);
+    }
     // Shore rows, in authored order (the shader rolls them in order, first
     // hit wins, so the author puts the common ground layer last).
     rec(kW_ShoreOff) = U(static_cast<int>(W.size()));
@@ -460,9 +636,50 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
         if (s.contains("radius") && s["radius"].is_number()) st.radius = std::max(st.radius, s["radius"].get<int>());
         if (out.sites.size() >= 254) { log += at + "more than 254 stamp sites\n"; return false; }
         out.sites.push_back(std::move(st));
+      } else if (kind == "water") {
+        // P-F: an AUTHORED LAKE. Tier A -- its centre is the map's, its
+        // geometry the preset's (radius overridable, in world voxels), and it
+        // is a site record so the shader and the CPU twin find it through
+        // the per-cell index plane like a stamp. A preset the set does not
+        // have is a broken authored reference: refuse, like a missing .vox.
+        WorldMapData::StampSite st;
+        st.id = id;
+        st.kind = kSiteWater;
+        st.templateName = s.value("preset", "");
+        if (!(s.contains("at") && s["at"].is_array() && s["at"].size() == 2 &&
+              s["at"][0].is_number() && s["at"][1].is_number())) {
+          log += at + "site \"" + id + "\" kind water needs at[2] in world voxels\n";
+          return false;
+        }
+        st.x = s["at"][0].get<int>(); st.z = s["at"][1].get<int>();
+        st.preset = static_cast<int>(WaterPresetIndex(set, st.templateName));
+        if (st.preset == 0) {
+          log += at + "site \"" + id + "\" kind water names preset \"" + st.templateName +
+                 "\", which has no assets/water/<name>.json\n";
+          return false;
+        }
+        const WaterGeom g = WaterGeomOf(set.water[static_cast<size_t>(st.preset - 1)]);
+        st.radius = g.radiusMin + (g.radiusSpan - 1) / 2;   // the preset's authored radius
+        if (s.contains("radius") && s["radius"].is_number())
+          st.radius = std::clamp(s["radius"].get<int>(), 4, 2048);
+        st.padMargin = std::max(1, g.band);                  // the index plane's reach past the disc
+        st.salt = 0;
+        if (out.sites.size() >= 254) { log += at + "more than 254 sites\n"; return false; }
+        out.sites.push_back(std::move(st));
       }
     }
   }
+  // ---- the water table for the CPU twin (worldmap.h WorldMapData::water) ----
+  // The same WaterGeomOf / PackWaterRows the packer runs, kept here so
+  // World::TerrainHeight reads the integers the shader reads.
+  out.water.clear();
+  for (const biomes::WaterPresetDef& w : set.water) out.water.push_back(WaterGeomOf(w));
+  out.pondTile = PondLatticeVox(set);
+  out.pondBand = PondBandVox(set);
+  out.biomeWater.assign(set.biomes.size(), {});
+  for (const biomes::BiomeDef& b : set.biomes)
+    if (b.index >= 0 && b.index < static_cast<int>(set.biomes.size()))
+      out.biomeWater[static_cast<size_t>(b.index)] = PackWaterRows(set, b, out.pondTile);
   // A map that names no spawn starts where every map did before P-C. Said
   // out loud, because a player standing on the harness pad's bare grass is
   // otherwise indistinguishable from a biome that failed to author.
@@ -575,7 +792,10 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
   out.siteIndex.assign(cells, 0);
   for (size_t si = 0; si < out.sites.size(); si++) {
     const WorldMapData::StampSite& st = out.sites[si];
-    const int reach = st.radius + st.padMargin;
+    // A stamp reaches its footprint + pad margin; a water site its disc + the
+    // preset's shore/berm band (stored in padMargin), + 1 for the bisection's
+    // outer column.
+    const int reach = st.radius + st.padMargin + (st.kind == kSiteWater ? 1 : 0);
     int c0x, c0z, c1x, c1z;
     out.CellOf(st.x - reach, st.z - reach, &c0x, &c0z);
     out.CellOf(st.x + reach, st.z + reach, &c1x, &c1z);
@@ -635,12 +855,14 @@ bool PackWorldMap(const biomes::BiomeSet& set, const WorldMapData& map,
   for (size_t i = 0; i < map.sites.size(); i++) {
     const WorldMapData::StampSite& s = map.sites[i];
     uint32_t* r = W.data() + tab0 + i * kSiteRecWords;
-    r[kS_Kind] = kSiteStamp;
+    r[kS_Kind] = U(s.kind);
     r[kS_X] = U(s.x); r[kS_Z] = U(s.z);
     r[kS_Radius] = U(s.radius);
     r[kS_PadMargin] = U(s.padMargin);
     r[kS_Rot] = U(s.rot);
     r[kS_Salt] = s.salt;
+    r[kS_Preset] = U(s.preset);
+    if (s.kind != kSiteStamp || s.words.empty()) continue;   // a water site has no block
     // The stamp block: rebase its relative offsets (column dir + run offsets)
     // onto the buffer as it is appended.
     const uint32_t base = static_cast<uint32_t>(W.size());
