@@ -139,6 +139,65 @@ SkyState SkyForTick(const Tuning& t, uint32_t tick) {
   return ComputeSky(t, Celestial().RenderTick(tick));
 }
 
+// ---- the TAA camera jitter -------------------------------------------------
+// See support.h for why this is here and not inlined in the frame loop.
+void ApplyTaaJitter(const Camera& cam, const Vec3& eye, float aspect,
+                    uint32_t renderW, uint32_t renderH, uint32_t frameIdx,
+                    float amp, Camera& outJittered,
+                    Simulation::TaaCamera& outTaa) {
+  outJittered = cam;
+  outTaa = Simulation::TaaCamera{};
+  // The fov WriteRenderParams will use, read from where it reads it. Taking
+  // cam.fovY instead would be a second opinion about the projection, and the
+  // whole point of measuring the shift below is that there is only one.
+  const float thf = std::tan(CurrentTuning().camera.fovY * 0.5f);
+  if (renderW == 0 || renderH == 0) return;
+
+  float rx = 0.0f, ry = 0.0f;
+  Simulation::TaaJitter(frameIdx, &rx, &ry);
+  rx *= amp;
+  ry *= amp;
+  // A pixel is 2*tanHalfFov/renderPx of angle. Yaw turns about WORLD Y, so its
+  // angular effect on the view direction scales with cos(pitch) — divided back
+  // out, floored so a straight-up look does not ask for an infinite nudge.
+  const float cp = std::max(0.2f, std::cos(cam.pitch));
+  outJittered.yaw += rx * (2.0f * thf * aspect) / ((float)renderW * cp);
+  outJittered.pitch += ry * (2.0f * thf) / (float)renderH;
+
+  // ---- and what that nudge actually did, in pixels -------------------------
+  // MEASURED, not derived. The resolve has to know where the image moved to
+  // within a fraction of a pixel or its reconstruction filter is centred on the
+  // wrong place, and a sign or a cos(pitch) term recovered from the rotation
+  // algebra is exactly the kind of thing that is wrong once and then wrong
+  // quietly. So: take the UNJITTERED forward direction — the one that landed on
+  // the exact centre of the screen before the nudge — and project it through
+  // the JITTERED basis. Where it lands, relative to the centre, IS the shift,
+  // sign and perspective term included. The small-angle algebra above only has
+  // to get the amplitude roughly right; this is the truth.
+  const Vec3 jr = outJittered.Right(), ju = outJittered.Up(),
+             jf = outJittered.Forward();
+  const Vec3 f0 = cam.Forward();
+  const float vz = std::max(1e-4f, f0.dot(jf));
+  const float nx = f0.dot(jr) / (vz * thf * aspect);
+  const float ny = f0.dot(ju) / (vz * thf);
+  outTaa.right[0] = jr.x; outTaa.right[1] = jr.y; outTaa.right[2] = jr.z;
+  outTaa.up[0] = ju.x;    outTaa.up[1] = ju.y;    outTaa.up[2] = ju.z;
+  outTaa.fwd[0] = jf.x;   outTaa.fwd[1] = jf.y;   outTaa.fwd[2] = jf.z;
+  // `eye` is ABSOLUTE world voxels — the residency window is a view into the
+  // infinite world at absolute chunk coordinates (world.h: "the resident cube
+  // covers world chunks [origin, origin+kNChunk)"), so a window shift does not
+  // move it and the frame-to-frame delta is real camera motion and nothing
+  // else. Widened to double so the subtraction in WriteTaaParams keeps the
+  // sub-voxel part at the tens of thousands of voxels a 20 km map reaches.
+  outTaa.eye[0] = (double)eye.x;
+  outTaa.eye[1] = (double)eye.y;
+  outTaa.eye[2] = (double)eye.z;
+  outTaa.tanHalfFov = thf;
+  outTaa.aspect = aspect;
+  outTaa.jitterX = (nx * 0.5f) * (float)renderW;
+  outTaa.jitterY = (-ny * 0.5f) * (float)renderH;
+}
+
 void WriteRenderParams(const rhi::Queue& queue, const World& world,
                        const Vec3& eye, const Camera& cam, float aspect,
                        bool shadows, float time,

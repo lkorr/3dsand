@@ -2828,6 +2828,56 @@ struct Tuning {
     // never had. 1.0 renders straight into the swapchain as before — the
     // offscreen target and the blit exist only below 1. Clamped to [0.25, 1].
     float renderScale = 1.0f;
+    // ---- TAA + temporal upscale (assets/shaders/taa.wgsl) ----------------
+    //
+    // taa: 1 replaces the NEAREST blit at the end of a scaled frame with a
+    // resolve pass that accumulates sub-pixel-jittered frames into a
+    // native-resolution history. What renderScale costs in edges, this buys
+    // back over ~16 frames — the point of the pair is that 0.7 stops looking
+    // like 0.7. 0 is the old blit, byte for byte, and is the A/B arm.
+    //
+    // At renderScale 1 it is still worth having: the jitter + accumulation is
+    // then plain temporal ANTI-ALIASING of a full-resolution frame, which is
+    // what softens the shadow cache's patch quantisation and the voxel
+    // silhouettes without touching either system.
+    //
+    // CPU-ONLY, all four of these: they reach taa.wgsl through its own small
+    // uniform buffer, not through a TUNE_* shader constant, so changing one
+    // costs no shader recompile and applies on the NEXT FRAME. That is
+    // deliberate — an A/B you can flip mid-flight is one that gets run.
+    int taa = 0;
+    // taaMaxHist: the ceiling on accumulated sample weight, i.e. the effective
+    // length of the running average. 64 is voxelbit's stationary ceiling and
+    // converges hardest; lower reacts faster to a change and ghosts less.
+    // Below ~4 there is not enough history to reconstruct anything and the
+    // pass is a cost with no product.
+    float taaMaxHist = 24.0f;
+    // taaClamp: how far OUTSIDE the 3x3 colour box of the current frame a
+    // history sample is allowed to sit before it is pulled in. 0 is the
+    // hardest clamp (sharpest, most flicker), large is no clamp at all
+    // (smoothest, ghosts behind every moving edge). This is the one knob that
+    // trades ghosting against flicker; everything else trades cost.
+    float taaClamp = 0.25f;
+    // taaJitter: scale on the R2 sub-pixel camera offset, in render pixels.
+    // 1 = the full +/-0.5 px the reconstruction filter integrates over. 0
+    // disables the jitter and leaves the accumulation running, which is the
+    // arm that isolates "what did the jitter buy" from "what did the temporal
+    // average buy" — with it at 0 the pass can only blur.
+    float taaJitter = 1.0f;
+    // taaSharpLod: with TAA on, tell the raymarch its pixels are NATIVE-sized
+    // rather than render-sized — `viewPx` goes to the window height instead of
+    // the render height. This is the voxel equivalent of the negative mip bias
+    // every temporal upscaler ships with: `viewPx` drives the plant LOD
+    // distance, the water ripple footprint and the micro-detail cutoff, so at
+    // renderScale 0.7 without it the low-resolution frame is not merely
+    // sampled more coarsely, it is DRAWN with coarser content — and detail the
+    // renderer chose not to draw is detail no accumulator can recover.
+    //
+    // The trade is real in both directions: each frame is more aliased (which
+    // is what the accumulator is for) and finer LOD is kept further out (which
+    // costs time). 0 keeps the old behaviour and is the A/B arm; `--gate taa`
+    // measures both arms in one run and prints both errors.
+    int taaSharpLod = 1;
     // presentMode: 0 fifo (vsync, quantises a 22 ms frame to 33), 1 mailbox
     // (newest frame at each vblank, no tearing, no quantisation), 2 immediate
     // (tears). Applied when it CHANGES (a swapchain recreate). Use fifo or an

@@ -339,13 +339,32 @@ def parse_pipeline_entries():
     a different entry point cannot silently keep the old row's R/W expectations.
     The shape there is:
 
-        mStep    = mod("sim_step.wgsl");
-        step_    = MakeComputePipeline(device, simPL_, mStep, "main", "step");
+        mod(&mStep, "sim_step.wgsl");
+        step_ = MakeComputePipeline(device, simPL_, mStep, "main", "step");
+
+    BOTH SHAPES OF THE FIRST LINE ARE ACCEPTED. `mod` was a value-returning
+    helper (`mStep = mod("sim_step.wgsl")`) until the threaded module loads of
+    the shader-compile overhaul turned it into a job that writes through a
+    pointer. This function kept only the old pattern, so from that commit it
+    scraped ZERO modules and every run of this checker failed with "could not
+    scrape any pipeline mapping" — i.e. the whole barrier check was dark, and
+    the failure looked like a broken regex rather than a missing barrier, which
+    is exactly the way a safety net stops being one. Match both.
     """
     txt = read(SIM)
     mods = {}   # module variable -> shader file name
     for m in re.finditer(r"(\w+)\s*=\s*mod\(\s*\"([\w.]+\.wgsl)\"\s*\)", txt):
         mods[m.group(1)] = m.group(2)
+    for m in re.finditer(r"mod\(\s*&(\w+)\s*,\s*\"([\w.]+\.wgsl)\"\s*\)", txt):
+        mods[m.group(1)] = m.group(2)
+    # One level of ALIASING, for the deferred far build: it copies the module
+    # into a `const rhi::ShaderModule module = mWorldgen;` local so the compile
+    # thread captures a handle it owns, and the MakeComputePipeline calls name
+    # that local. Declared-type-anchored so this cannot match an arbitrary
+    # assignment.
+    for m in re.finditer(r"rhi::ShaderModule\s+(\w+)\s*=\s*(\w+)\s*;", txt):
+        if m.group(2) in mods:
+            mods[m.group(1)] = mods[m.group(2)]
 
     out = {}
     for m in re.finditer(
@@ -355,6 +374,24 @@ def parse_pipeline_entries():
         f = mods.get(module)
         if f:
             out[member] = (f, entry, layout)
+    # …and by DEBUG LABEL, for the calls whose result does not go straight into
+    # a `member_`. The deferred far set is the case: it is compiled on a
+    # background thread into a `FarPipelines` struct (`r.fill = ...`) and
+    # published later, so the assignment target is `r.fill`, not `farFill_`.
+    # Without this the checker could not resolve PIPE_FAR_FILL/PIPE_FAR_DOWN and
+    # reported the two rows AND worldgen.wgsl's `far`/`fardown` entry points as
+    # untabled — four failures for a code shape, hiding the real ones.
+    #
+    # The label is the last argument and the convention is that it IS the member
+    # without the trailing underscore. setdefault, not assignment: a direct
+    # `member_ =` above is the stronger evidence and keeps priority.
+    for m in re.finditer(
+            r"MakeComputePipeline\(\s*\w+\s*,\s*(\w+)\s*,\s*(\w+)\s*,"
+            r"\s*\"(\w+)\"\s*,\s*\"(\w+)\"\s*\)", txt):
+        layout, module, entry, label = m.groups()
+        f = mods.get(module)
+        if f:
+            out.setdefault(label + "_", (f, entry, layout))
     return out
 
 

@@ -5693,6 +5693,100 @@ and `render.heatSpillStrength` are gone.
 - Later: volumetrics for gases; a bilinear over the emitter faces if the
   block-scale edge of a bounce patch ever matters.
 
+### 9.t TAA and temporal upscale (added 2026-09-07; `assets/shaders/taa.wgsl`)
+
+`render.renderScale` renders the world at a fraction of the window and blits it
+up with NEAREST. That is the biggest single lever in the renderer — the
+`halfres` budget arm saves ~70% of the raymarch — but what it produces is a
+SMALLER PICTURE, not a cheaper one: at 0.7 you are looking at 0.7-resolution
+edges and nothing ever fills them back in. `render.taa` replaces that blit with
+a resolve pass that does.
+
+**The chain, per frame, when `render.taa` is on:**
+
+```
+  (CPU) ApplyTaaJitter  -> perturb the Camera by this frame's R2 sub-pixel
+                           offset; MEASURE the resulting image shift in pixels
+  WriteRenderParams(jittered camera)
+  Simulation::WriteTaaParams   (before any render pass opens)
+  ... the ordinary world render pass, into the offscreen target at render res
+  Simulation::EncodeTaaCapture -> CopyTextureToBuffer colour AND depth
+  Simulation::BeginTaaRenderPass + DrawTaa -> resolve into the swapchain
+  Simulation::BeginOverlayRenderPass -> the UI, at native res, on top
+  Simulation::FlipTaaPage
+```
+
+**Four things about it are decisions, not details.**
+
+1. **Storage buffers, not textures.** The rhi has no sampled-texture or sampler
+   binding at all — `BindGroupEntry` carries a `Buffer` and nothing else, and
+   the only image anything samples in this engine is ImGui's avatar portrait,
+   through ImGui's own descriptor path. The finished frame therefore reaches the
+   resolve the way everything else reaches a shader here: an image-to-buffer
+   copy into a plain storage buffer, indexed by hand. The alternative was four
+   new concepts (sampled images, samplers, RGBA16F, their layout transitions) in
+   the one file the whole engine sees the GPU through. The cost is one copy of
+   the render-resolution frame, colour and depth, ~8 MB at 0.7 of 1080p.
+
+2. **The jitter is a yaw/pitch nudge on the `Camera`, not a shear of the basis.**
+   Every path that draws — the raymarch's ray construction AND `projectView` for
+   bodies, particles, sprites and the debug arrows — derives from the same
+   `RenderParams`, so perturbing the camera that is written into it moves all of
+   them by exactly the same amount. There is no second place to keep in step and
+   no way for the raster and the ray to disagree. `cam` itself is never
+   modified: picking, the brush ray, the player's movement basis and every
+   mirror query still see the true camera, so nothing that reaches the sim can
+   see the jitter.
+
+3. **The shift is MEASURED, not derived.** The resolve must know where the image
+   moved to within a fraction of a pixel or its reconstruction filter is centred
+   on the wrong texel. `ApplyTaaJitter` projects the UNJITTERED forward direction
+   through the JITTERED basis and reads off where it lands — sign, `cos(pitch)`
+   term and perspective included. The small-angle algebra that produced the
+   nudge only has to get the amplitude roughly right.
+
+4. **Accumulation is weight-proportional, which is what makes it an UPSCALE.**
+   The history stores accumulated WEIGHT, not a frame count, and each frame
+   contributes `w / (W + w)` where `w` is the reconstruction filter's response
+   at this native pixel — how close that frame's jittered sample landed.
+   Blending at a constant rate instead converges to the average of the filter
+   over the jitter sequence, which is a WIDER filter than any single frame's: it
+   would spend the jitter on blur. The history is ping-ponged because the
+   resolve reads it bilinearly at a REPROJECTED position (other pixels' texels)
+   while writing its own.
+
+**Rejection is the colour box and nothing else.** There is no history-depth
+buffer and no per-pixel surface id: a disocclusion reprojects onto a pixel whose
+colour is outside the 3x3 range of what is actually there now, the clamp pulls
+it in, and where it had to move a long way the accumulated weight is cut so the
+pixel reconverges in a few frames. `render.taaClamp` is the one knob that trades
+ghosting against flicker.
+
+**Render-only, in the strict sense.** The history, the colour copy and the depth
+copy are derived data in the §9 sense — never read by the sim, never hashed,
+never saved, and the jitter never reaches the camera the game logic uses. The
+world hash is identical with `render.taa` at 0 and at 1.
+
+**Gated by `--gate taa`**, which asserts two things and pins no constants: that
+the resolve at 1:1 with no jitter is closer to a plain render than a ONE-PIXEL
+SHIFT of that render is (the alignment claim — every plausible mapping bug fails
+it by a mile), and that sixteen jittered half-resolution frames resolve closer to
+the full-resolution render than a NEAREST upscale of the same half-resolution
+frame does (the product claim). Both are relative to another arm of the same
+run, so neither needs rebaselining when the scene or the harness resolution
+moves.
+
+**What is NOT here.** A separate SVGF-style denoiser for the lighting terms,
+which was the other half of the package this came from. That port assumes one
+jittered sun-occlusion ray and one stratified AO ray per pixel per frame; this
+engine traces neither. The sun term is the §9 shadow cache (one ray per visible
+surface PATCH per frame, resolved by a compute pass), sky visibility is the
+world-space openness grid (§9.x), ambient occlusion is `voxelAO` — three voxel
+fetches, no ray — and one-bounce indirect is `giGather` over the world-space
+irradiance grid (§9.y). A screen-space denoiser needs screen-space noise, and
+this renderer's noise is in the QUANTISATION of those world-space caches, which
+is what the temporal accumulator above softens as a side effect.
+
 ## 9b. Wind (added 2026-08-25)
 
 Plan of record: **`docs/RESEARCH_wind.md`** — the decision record, the industry

@@ -857,8 +857,24 @@ void Recorder::TransitionImage(Image* im, VkImageLayout newLayout,
   // recording has touched the image (prior submits are ordered by the §3.4
   // head barrier). A same-layout re-use within one recording still needs the
   // execution/memory dependency, e.g. two renders into one offscreen target.
-  if (im->layout == newLayout && s->lastWriteStage == 0 && s->readStagesSince == 0)
+  //
+  // NO BARRIER IS NOT NO ACCESS. The early-out must still record the scope this
+  // caller is about to use the image in, or a LATER transition of the same
+  // image in the same recording derives its SOURCE from an empty state and
+  // emits srcStageMask/srcAccessMask = 0 — a layout transition unsynchronised
+  // against the access that preceded it. Nothing reached that before 2026-09-07
+  // because no path transitioned an attachment twice in one recording; the TAA
+  // capture does (render into the target, then copy it out), and sync
+  // validation named it immediately: "vkCmdPipelineBarrier2 performs image
+  // layout transition on VkImage …, which was previously written at the end of
+  // the render pass instance by the attachment storeOp … srcStageMask = 0".
+  // The non-early-out path below already ends with these two lines; making both
+  // paths agree is the whole fix.
+  if (im->layout == newLayout && s->lastWriteStage == 0 && s->readStagesSince == 0) {
+    s->lastWriteStage = dstStage;
+    s->lastWriteAccess = dstAccess;
     return;
+  }
   VkImageMemoryBarrier2 b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
   // First touch this recording: src NONE/0 is correct — availability of prior
   // submits' writes came from the head barrier; this transition only needs the

@@ -2352,6 +2352,328 @@ Status GatePlants(Ctx& c, std::string& detail) {
   return (loaderOk && ringOk && drewOk && pressOk) ? Status::Pass : Status::Fail;
 }
 
+// ---------------------------------------------------------------------------
+// taa: the temporal resolve is ALIGNED, and it RECONSTRUCTS.
+//
+// WHAT IS UNDER TEST (assets/shaders/taa.wgsl). Two claims, and they are the
+// only two that matter, because everything else about the pass is either
+// obviously true (it compiles) or unfalsifiable from a test (it "looks better").
+//
+//   A. ALIGNMENT. Run the resolve at 1:1 with the jitter amplitude at zero and
+//      no history. Its output must be closer to a straight render of the same
+//      frame than a ONE-PIXEL SHIFT of that render is. This is the assertion
+//      that actually earns its keep: the whole pass is a coordinate mapping
+//      between three grids (native pixel centres, render pixel centres, the
+//      jitter offset that relates them) and every plausible bug in it — a
+//      dropped 0.5, an inverted Y, a jitter sign measured the wrong way round —
+//      lands the reconstruction filter on the wrong texel and fails this by a
+//      mile. It is calibrated AGAINST THE FRAME ITSELF rather than against a
+//      pinned number, so it means the same thing on any scene, any resolution
+//      and any machine.
+//
+//   B. RECONSTRUCTION. Render at HALF resolution, resolve sixteen jittered
+//      frames of a stationary camera, and the result must be closer to the
+//      full-resolution render than nearest-neighbour upscaling of the same
+//      half-resolution frame is. That is the product claim of the whole
+//      package — "renderScale 0.7 becomes shippable" — reduced to a number
+//      that a machine can check. If temporal upsampling is not beating a
+//      NEAREST blit on a stationary camera then it is not doing anything, and
+//      no amount of looking at screenshots would settle it as cheaply.
+//
+// BOTH ARE RELATIVE COMPARISONS, deliberately: no threshold in this gate is a
+// magic constant that would need re-tuning when the scene, the camera or the
+// harness resolution moves. The margins below are the only literals, and they
+// are slack, not calibration.
+//
+// STATIONARY CAMERA, and that is not ducking the hard case. Reprojection under
+// motion is exercised by the game; what a gate can pin cheaply and repeatably
+// is the sampling geometry, and a moving camera would make the metric depend on
+// how fast the fixture streams rather than on whether the resolve is correct.
+Status GateTaa(Ctx& c, std::string& detail) {
+  GpuContext& ctx = c.ctx;
+  World& world = c.world;
+  Simulation& sim = c.sim;
+  const uint32_t W = c.width, H = c.height;
+  const uint32_t rw = W / 2, rh = H / 2;
+  const float aspect = (float)W / (float)H;
+
+  SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+  ctx.WaitIdle();
+
+  // Terrain rather than a built fixture: the claim is about RESOLUTION, so the
+  // scene wants high spatial frequency and worldgen supplies more of it than
+  // anything this gate could place. A camera over the same site the other
+  // render gates use, pitched down so the frame is ground and not sky — an
+  // upscaler scores perfectly on flat sky and the metric would say nothing.
+  const int gx = 300, gz = 300;
+  const int ground = World::TerrainHeight(gx, gz, kDefaultSeed);
+  const Vec3 eye{(float)gx, (float)(ground + 40), (float)gz};
+  Camera cam;
+  cam.yaw = 0.785f;
+  cam.pitch = -0.35f;
+
+  rhi::Texture small = ctx.device.CreateTexture(
+      {rw, rh, 1}, rhi::TextureFormat::RGBA8Unorm,
+      rhi::TextureUsage::RenderAttachment | rhi::TextureUsage::CopySrc,
+      "taaGateSmall");
+  rhi::TextureView smallView = small.CreateView();
+
+  // One render of `srcView` at (w,h), read back. `frames` because the shadow
+  // cache resolves a patch one frame late and the far cascade settles over a
+  // few — the same reason --shot renders four frames and grabs the last.
+  // ---- the cost of the thing, measured in the run that already exists -----
+  // Wall clock around a batch of frames with ONE WaitIdle at the end, so the
+  // number includes the GPU and not just the record. It is not a --perf figure
+  // and is not compared against a threshold — it is ADVISORY, printed in the
+  // detail line, and it exists because the alternative was a windowed run on a
+  // machine four sessions share. Same scene, same camera, back to back in one
+  // process: the DIFFERENCE between two arms measured this way is honest even
+  // where the absolute number is not.
+  double msNative = 0.0, msHalf = 0.0, msHalfTaa = 0.0;
+  auto timeIt = [&](uint32_t frames, double& into, auto&& body) {
+    ctx.WaitIdle();
+    const double t0 = NowSeconds();
+    for (uint32_t f = 0; f < frames; f++) body(f);
+    ctx.WaitIdle();
+    into = (NowSeconds() - t0) * 1000.0 / (double)frames;
+  };
+
+  auto renderTo = [&](const rhi::TextureView& dstView, const rhi::Texture& dstTex,
+                      uint32_t w, uint32_t h, uint32_t frames,
+                      std::vector<uint8_t>& out) -> bool {
+    rhi::Buffer shot =
+        CreateBuffer(ctx.device, (uint64_t)w * h * 4,
+                     rhi::BufferUsage::MapRead | rhi::BufferUsage::CopyDst,
+                     "taaGateShot");
+    for (uint32_t f = 0; f < frames; f++) {
+      WriteRenderParams(ctx.queue, world, eye, cam, aspect, true, 0.0f,
+                        kFarFogDensity, (float)h);
+      rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
+      sim.EncodeShadowResolve(enc);
+      rhi::RenderPass rp =
+          sim.BeginRenderPass(enc, dstView, rhi::TextureFormat::RGBA8Unorm, w, h);
+      sim.DrawWorld(rp);
+      rp.End();
+      if (f + 1 == frames) {
+        rhi::TexelCopyTexture srcT{};
+        srcT.texture = dstTex;
+        rhi::TexelCopyBuffer dstB{};
+        dstB.buffer = shot;
+        dstB.bytesPerRow = w * 4;
+        dstB.rowsPerImage = h;
+        rhi::Extent3D ext{w, h, 1};
+        enc.CopyTextureToBuffer(srcT, dstB, ext);
+      }
+      ctx.queue.Submit(enc.Finish());
+    }
+    out.assign((size_t)w * h * 4, 0);
+    return rhi::ReadBufferBlocking(ctx.device, shot, 0, out.data(), out.size());
+  };
+
+  std::vector<uint8_t> ref;
+  if (!renderTo(c.view, c.offscreen, W, H, 4, ref)) {
+    detail = "native reference readback failed";
+    return Status::Fail;
+  }
+  // Checked AFTER the first draw, because that draw is what builds the render
+  // pipelines and therefore what decides the answer.
+  if (!sim.TaaAvailable()) {
+    detail = "taa pipeline unavailable (no fragment stores?) — nothing to test";
+    return Status::Skip;
+  }
+
+  // The full TAA chain: N jittered frames at (w,h) resolved into (W,H).
+  auto taaResolve = [&](uint32_t w, uint32_t h, float amp, uint32_t frames,
+                        bool sharpLod, std::vector<uint8_t>& out) -> bool {
+    sim.ResetTaa();
+    sim.EnsureTaa(w, h, W, H);
+    rhi::Buffer shot =
+        CreateBuffer(ctx.device, (uint64_t)W * H * 4,
+                     rhi::BufferUsage::MapRead | rhi::BufferUsage::CopyDst,
+                     "taaGateResolve");
+    for (uint32_t f = 0; f < frames; f++) {
+      Camera jcam;
+      Simulation::TaaCamera taaCam{};
+      ApplyTaaJitter(cam, eye, aspect, w, h, f, amp, jcam, taaCam);
+      // render.taaSharpLod, passed explicitly rather than read from the tuning:
+      // the point of this gate is to MEASURE both arms in one run, so the knob
+      // it is deciding must not also be the knob it obeys.
+      WriteRenderParams(ctx.queue, world, eye, jcam, aspect, true, 0.0f,
+                        kFarFogDensity, sharpLod ? (float)H : (float)h);
+      sim.WriteTaaParams(ctx.queue, taaCam, CurrentTuning().render.taaMaxHist,
+                         CurrentTuning().render.taaClamp, /*reset=*/f == 0,
+                         /*bgraSource=*/false);
+      rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
+      sim.EncodeShadowResolve(enc);
+      rhi::RenderPass rp = sim.BeginRenderPass(
+          enc, w == W ? c.view : smallView, rhi::TextureFormat::RGBA8Unorm, w, h);
+      sim.DrawWorld(rp);
+      rp.End();
+      // AT 1:1 THE SOURCE AND THE DESTINATION ARE THE SAME IMAGE, and that is
+      // legal here rather than a hazard: the capture copy lands the world frame
+      // in a storage buffer BEFORE the resolve pass opens, and the resolve
+      // reads only that buffer — it never samples the image it is drawing into.
+      // The recorder derives both layout transitions (COLOR_ATTACHMENT ->
+      // TRANSFER_SRC -> COLOR_ATTACHMENT) from its own tracked state, which is
+      // the case its "two renders into one offscreen target" note covers.
+      sim.EncodeTaaCapture(enc, w == W ? c.offscreen : small);
+      rhi::RenderPass rp2 = sim.BeginTaaRenderPass(
+          enc, c.view, rhi::TextureFormat::RGBA8Unorm, W, H);
+      sim.DrawTaa(rp2);
+      rp2.End();
+      if (f + 1 == frames) {
+        rhi::TexelCopyTexture srcT{};
+        srcT.texture = c.offscreen;
+        rhi::TexelCopyBuffer dstB{};
+        dstB.buffer = shot;
+        dstB.bytesPerRow = W * 4;
+        dstB.rowsPerImage = H;
+        rhi::Extent3D ext{W, H, 1};
+        enc.CopyTextureToBuffer(srcT, dstB, ext);
+      }
+      ctx.queue.Submit(enc.Finish());
+      sim.FlipTaaPage();
+    }
+    out.assign((size_t)W * H * 4, 0);
+    return rhi::ReadBufferBlocking(ctx.device, shot, 0, out.data(), out.size());
+  };
+
+  // Mean absolute per-channel difference between two native-sized frames, in
+  // 0..255 units. Alpha skipped: the raymarch pins it to 1 and the resolve
+  // writes 1, so including it would only dilute the number.
+  auto mae = [&](const std::vector<uint8_t>& a,
+                 const std::vector<uint8_t>& b) -> double {
+    double s = 0.0;
+    size_t n = 0;
+    for (size_t i = 0; i + 3 < a.size() && i + 3 < b.size(); i += 4)
+      for (int k = 0; k < 3; k++) {
+        s += std::fabs((double)a[i + k] - (double)b[i + k]);
+        n++;
+      }
+    return n ? s / (double)n : 0.0;
+  };
+
+  // ---- A: alignment ------------------------------------------------------
+  // The yardstick: the same frame shifted one pixel. Any mapping bug in the
+  // resolve is at least this wrong, and a correct resolve is far less wrong.
+  std::vector<uint8_t> shifted((size_t)W * H * 4, 0);
+  for (uint32_t y = 0; y < H; y++)
+    for (uint32_t x = 0; x < W; x++) {
+      const uint32_t sx = x == 0 ? 0 : x - 1;
+      for (int k = 0; k < 4; k++)
+        shifted[((size_t)y * W + x) * 4 + k] = ref[((size_t)y * W + sx) * 4 + k];
+    }
+  const double shiftErr = mae(shifted, ref);
+
+  std::vector<uint8_t> aligned;
+  if (!taaResolve(W, H, /*amp=*/0.0f, /*frames=*/2, /*sharpLod=*/false, aligned)) {
+    detail = "1:1 resolve readback failed";
+    return Status::Fail;
+  }
+  const double alignErr = mae(aligned, ref);
+
+  // ---- B: reconstruction --------------------------------------------------
+  std::vector<uint8_t> lo;
+  if (!renderTo(smallView, small, rw, rh, 4, lo)) {
+    detail = "half-resolution readback failed";
+    return Status::Fail;
+  }
+  // The NEAREST blit, reproduced on the CPU: dst pixel d takes src floor(d/2),
+  // which is what vkCmdBlitImage with VK_FILTER_NEAREST does for an exact 2x.
+  std::vector<uint8_t> nearest((size_t)W * H * 4, 0);
+  for (uint32_t y = 0; y < H; y++)
+    for (uint32_t x = 0; x < W; x++) {
+      const size_t s = ((size_t)(y / 2) * rw + (x / 2)) * 4;
+      for (int k = 0; k < 4; k++)
+        nearest[((size_t)y * W + x) * 4 + k] = lo[s + k];
+    }
+  const double nearestErr = mae(nearest, ref);
+
+  // BOTH LOD ARMS, in the one run, because the knob they decide
+  // (render.taaSharpLod) has no defensible default until somebody has seen the
+  // two numbers side by side — and two runs of a 16-frame accumulation on a
+  // machine four sessions share is exactly the kind of A/B this repo's rule 6
+  // says to fold into the instrument instead.
+  std::vector<uint8_t> upPlain, upSharp;
+  if (!taaResolve(rw, rh, /*amp=*/1.0f, /*frames=*/16, /*sharpLod=*/false,
+                  upPlain) ||
+      !taaResolve(rw, rh, /*amp=*/1.0f, /*frames=*/16, /*sharpLod=*/true,
+                  upSharp)) {
+    detail = "half-resolution resolve readback failed";
+    return Status::Fail;
+  }
+  const double taaPlainErr = mae(upPlain, ref);
+  const double taaSharpErr = mae(upSharp, ref);
+  // The gate passes on the BETTER of the two: the claim under test is "temporal
+  // upsampling beats a NEAREST blit", not "this particular knob setting does".
+  // Which one won is printed, and that is what picks the shipped default.
+  const double taaErr = std::min(taaPlainErr, taaSharpErr);
+
+  // ---- cost, three arms, no readbacks in the timed loop -------------------
+  auto drawOnly = [&](const rhi::TextureView& v, uint32_t w, uint32_t h) {
+    WriteRenderParams(ctx.queue, world, eye, cam, aspect, true, 0.0f,
+                      kFarFogDensity, (float)h);
+    rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
+    sim.EncodeShadowResolve(enc);
+    rhi::RenderPass rp =
+        sim.BeginRenderPass(enc, v, rhi::TextureFormat::RGBA8Unorm, w, h);
+    sim.DrawWorld(rp);
+    rp.End();
+    ctx.queue.Submit(enc.Finish());
+  };
+  timeIt(8, msNative, [&](uint32_t) { drawOnly(c.view, W, H); });
+  timeIt(8, msHalf, [&](uint32_t) { drawOnly(smallView, rw, rh); });
+  sim.ResetTaa();
+  sim.EnsureTaa(rw, rh, W, H);
+  // Timed with the LOD arm that WON above, so the cost quoted is the cost of
+  // the configuration the numbers just argued for and not of a third one.
+  const bool timeSharp = taaSharpErr < taaPlainErr;
+  timeIt(8, msHalfTaa, [&](uint32_t f) {
+    Camera jcam;
+    Simulation::TaaCamera taaCam{};
+    ApplyTaaJitter(cam, eye, aspect, rw, rh, f, 1.0f, jcam, taaCam);
+    WriteRenderParams(ctx.queue, world, eye, jcam, aspect, true, 0.0f,
+                      kFarFogDensity, timeSharp ? (float)H : (float)rh);
+    sim.WriteTaaParams(ctx.queue, taaCam, CurrentTuning().render.taaMaxHist,
+                       CurrentTuning().render.taaClamp, /*reset=*/f == 0,
+                       /*bgraSource=*/false);
+    rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
+    sim.EncodeShadowResolve(enc);
+    rhi::RenderPass rp = sim.BeginRenderPass(
+        enc, smallView, rhi::TextureFormat::RGBA8Unorm, rw, rh);
+    sim.DrawWorld(rp);
+    rp.End();
+    sim.EncodeTaaCapture(enc, small);
+    rhi::RenderPass rp2 =
+        sim.BeginTaaRenderPass(enc, c.view, rhi::TextureFormat::RGBA8Unorm, W, H);
+    sim.DrawTaa(rp2);
+    rp2.End();
+    ctx.queue.Submit(enc.Finish());
+    sim.FlipTaaPage();
+  });
+
+  // The margins are SLACK, not calibration. A resolve landing on the right
+  // texel scores a small fraction of a one-pixel shift; one landing on the
+  // wrong texel scores about the same as the shift or worse. 0.5 sits in the
+  // empty middle. Likewise a working reconstruction beats NEAREST outright, so
+  // "at least 2% better" only excludes a tie.
+  const bool alignOk = alignErr < shiftErr * 0.5;
+  const bool reconOk = taaErr < nearestErr * 0.98;
+  detail = Format(
+      "taa: %s (alignment err %.2f vs 1px-shift %.2f; half-res reconstruct "
+      "err %.2f sharpLod=0 / %.2f sharpLod=1 vs nearest %.2f over 16 jittered "
+      "frames, sharpLod=%d wins; cost/frame %.2f ms full-res, %.2f ms half-res, "
+      "%.2f ms half-res+resolve = %+.2f ms for the resolve, %+.2f ms net vs "
+      "full-res)",
+      alignOk && reconOk ? "aligned and reconstructing"
+                         : (alignOk ? "ALIGNED but not reconstructing"
+                                    : "MISALIGNED"),
+      alignErr, shiftErr, taaPlainErr, taaSharpErr, nearestErr,
+      taaSharpErr < taaPlainErr ? 1 : 0, msNative, msHalf, msHalfTaa,
+      msHalfTaa - msHalf, msHalfTaa - msNative);
+  return alignOk && reconOk ? Status::Pass : Status::Fail;
+}
+
 const std::vector<Gate>& RenderGates() {
   static const std::vector<Gate> g = {
       {"far-fog", "render", {}, false, GateFarFog},
@@ -2376,6 +2698,11 @@ const std::vector<Gate>& RenderGates() {
       {"body-shade", "render", {}, false, GateBodyShade, /*needsRender=*/true},
       // Draws three frames of a painted stand and reads them back.
       {"plants", "render", {}, false, GatePlants, /*needsRender=*/true},
+      // The TAA resolve: draws 4 + 2 + 4 + 16 frames of the same terrain view
+      // at two resolutions and compares four images. Every threshold in it is
+      // relative to another arm of the same run, so it pins nothing that would
+      // need rebaselining when the scene or the harness resolution moves.
+      {"taa", "render", {}, false, GateTaa, /*needsRender=*/true},
   };
   return g;
 }

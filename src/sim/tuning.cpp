@@ -2112,6 +2112,11 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadI(*g, "farBlockerHitLevel", r.farBlockerHitLevel, out, at);
     ReadF(*g, "lodHandoffDist", r.lodHandoffDist, out, at);
     ReadF(*g, "renderScale", r.renderScale, out, at);
+    ReadI(*g, "taa", r.taa, out, at);
+    ReadF(*g, "taaMaxHist", r.taaMaxHist, out, at);
+    ReadF(*g, "taaClamp", r.taaClamp, out, at);
+    ReadF(*g, "taaJitter", r.taaJitter, out, at);
+    ReadI(*g, "taaSharpLod", r.taaSharpLod, out, at);
     ReadI(*g, "presentMode", r.presentMode, out, at);
     ReadF(*g, "fpsCap", r.fpsCap, out, at);
     ReadF(*g, "shadowMaxDist", r.shadowMaxDist, out, at);
@@ -2249,6 +2254,15 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     // larger than the terrain. Present mode is an enum; fpsCap 0 = off.
     if (r.renderScale > 1.0f) { r.renderScale = 1.0f; }
     if (r.renderScale < 0.25f) { r.renderScale = 0.25f; }
+    // TAA: a history shorter than 1 sample is not a history, and one longer
+    // than the f16 the shader stores it in cannot be counted. The clamp width
+    // and the jitter are both allowed to be 0 (those are the A/B arms) but
+    // neither is allowed to be negative, which would invert the test it feeds.
+    if (r.taaMaxHist < 1.0f) { r.taaMaxHist = 1.0f; }
+    if (r.taaMaxHist > 512.0f) { r.taaMaxHist = 512.0f; }
+    if (r.taaClamp < 0.0f) { r.taaClamp = 0.0f; }
+    if (r.taaJitter < 0.0f) { r.taaJitter = 0.0f; }
+    if (r.taaJitter > 2.0f) { r.taaJitter = 2.0f; }
     if (r.presentMode < 0 || r.presentMode > 2) { r.presentMode = 1; }
     if (r.fpsCap < 0.0f) { r.fpsCap = 0.0f; }
     // 0 is meaningful here (all shadows go through the cascade), so only

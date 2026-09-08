@@ -170,6 +170,12 @@ const char* const kOrder[] = {
     // baseline tuning before returning. It leaves no world state behind, so
     // it sits with the other rendering gates rather than at either end.
     "screenshots", "fire-depth", "shadow-cache", "openness", "gi-bounce", "gi-nightfall", "plants",
+    // `taa` runs its own worldgen and leaves no world state behind — it only
+    // draws the same view four ways and compares the images. It sits AFTER
+    // `shadow-cache` because that gate reloads the shaders three times and
+    // restores the baseline tuning; running before it would put a shader
+    // rebuild in the middle of a 16-frame accumulation.
+    "taa",
     // With the other render gates: `body-shade` runs its own worldgen and is
     // the one gate that draws a RIGIDBODY. It writes the body instance buffer
     // directly (like `fire-depth`) rather than going through the DebrisSystem,

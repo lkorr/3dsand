@@ -758,9 +758,30 @@ PASS(fluidGridUp, "fluid(substep)", PT_FLUID, PIPE_FLUID_GRIDUP, K_INDIRECT, IND
 // one grid accumulator that survives the per-substep clear, so the next
 // substep's clear/p2g and the RENDERER both read what this pass wrote and the
 // hazard is real, not notional.
+// FOUND BY THE CHECKER THE MOMENT IT COULD SEE AGAIN (2026-09-07). Four uses
+// were missing from this row for as long as check_pass_table.py's pipeline
+// scrape had been dark — the threaded module loads changed `mod` from a
+// value-returning helper to a pointer-writing job, the regex still matched only
+// the old shape, and from then on the script resolved ZERO pipelines and failed
+// with "could not scrape any pipeline mapping" instead of with findings. A
+// checker that fails for a reason nobody reads is not a checker.
+//   A(FluidArgsStage), not R: g2p does `atomicAdd(&fluidArgs[FA_DEAD], 1u)` on
+//     every particle it kills. Declared as a plain READ, phase 3 emitted no
+//     WAR/WAW dependency for it and every later reader of that word — the
+//     compaction's dead count, the seam's dispatch sizing — was unsynchronized
+//     against this pass. This is the exact hazard class the table exists for.
+//   R(Voxels)/R(Materials)/R(PageTable): g2p resolves the voxel a particle has
+//     moved into (has the cell gone solid under it?), so it reads the whole
+//     paged addressing path. The CA writes those buffers earlier in the same
+//     tick; without the declaration that RAW hop had no barrier.
+// Over-declaring here would be harmless (a barrier for a hazard that is not
+// there costs sync and nothing else) and under-declaring is a silent
+// cross-vendor desync, which is why all four go in as read rather than being
+// argued down one at a time.
 PASS(fluidG2p, "fluid(substep)", PT_FLUID, PIPE_FLUID_G2P, K_INDIRECT, IND_FLUIDPARGS,0,0, GRP_SLIM_FLUID, DYN_NONE, C_ALWAYS, 1,
      USES(U(TickUBO) RW(FluidParticlesWrite) R(FluidBlockMap) RW(FluidGrid)
-          W(ParticlesWrite) A(ParticleCounts) R(FluidArgsStage)
+          W(ParticlesWrite) A(ParticleCounts) A(FluidArgsStage)
+          R(Voxels) R(Materials) R(PageTable)
           I(FluidPDispatchArgs)))
 
 // ====================================================== PT_FLUIDSEAM =======

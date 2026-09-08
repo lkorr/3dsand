@@ -3916,6 +3916,18 @@ int main(int argc, char** argv) {
   rhi::Texture scaledTex;
   rhi::TextureView scaledView;
   uint32_t scaledW = 0, scaledH = 0;
+  // ---- TAA (render.taa; assets/shaders/taa.wgsl) ---------------------------
+  // The offscreen target above becomes unconditional when TAA is on, because
+  // the resolve reads the finished world frame out of it — at renderScale 1 it
+  // is the same size as the swapchain, and the resolve does anti-aliasing
+  // rather than upscaling, but the path is identical either way.
+  //
+  // `taaFrameNo` is the jitter sequence's index. It counts RESOLVED frames, not
+  // rendered ones, so a frame the resolve skipped (feature off, portrait pass)
+  // does not advance the sequence past a sample that was never taken.
+  uint32_t taaFrameNo = 0;
+  bool taaWasOn = false;
+  float taaScaleWas = -1.0f;
   // Present mode last requested from the context; -1 forces the first frame
   // to apply whatever tuning / --present says.
   int presentApplied = -1;
@@ -7622,13 +7634,52 @@ int main(int argc, char** argv) {
       const uint32_t renderH =
           scaled ? std::max(1u, (uint32_t)std::lround(ctx.height * renderScale))
                  : ctx.height;
+      // ---- TAA: the sub-pixel camera jitter ---------------------------------
+      // `taaOn` also forces the OFFSCREEN path at scale 1: the resolve reads
+      // the finished world frame out of a texture it can copy from, and the
+      // swapchain image is not that.
+      const bool taaOn = CurrentTuning().render.taa != 0 && sim.TaaAvailable() &&
+                         ctx.SwapchainBlittable();
+      const bool offscreen = scaled || taaOn;
+      //
+      // THE JITTER IS A YAW/PITCH NUDGE, not a shear of the basis, and that is
+      // the whole reason it is safe. Every path that draws this frame — the
+      // raymarch's ray construction AND projectView for bodies, particles,
+      // sprites and the debug arrows — derives its basis from the SAME
+      // RenderParams, so perturbing the Camera the params are written from
+      // moves all of them by exactly the same amount. There is no second place
+      // to keep in step and no way for the raster and the ray to disagree.
+      //
+      // Gameplay is untouched: `cam` itself is not modified, only the copy
+      // handed to WriteRenderParams. Picking, the brush ray, the player's
+      // movement basis and every mirror query still see the true camera, so
+      // nothing that reaches the sim can see the jitter — rule 1 is not in
+      // play here at all, but "render-only means render-only" is cheap to keep.
+      Camera jcam = cam;
+      Simulation::TaaCamera taaCam{};
+      if (taaOn) {
+        ApplyTaaJitter(cam, eye, (float)ctx.width / (float)ctx.height, renderW,
+                       renderH, taaFrameNo, CurrentTuning().render.taaJitter,
+                       jcam, taaCam);
+      }
       // viewPx is the RENDER height: every footprint / cone-width term in the
       // raymarch is derived from it, so a scaled frame tells the shader its
       // real pixel size rather than the window's.
+      //
+      // …EXCEPT under TAA with render.taaSharpLod, where it is deliberately
+      // told the NATIVE height instead. That is the voxel equivalent of the
+      // negative mip bias every temporal upscaler ships with: `viewPx` drives
+      // the plant LOD distance, the water ripple footprint and the
+      // micro-detail cutoff, so a scaled frame without it is not merely
+      // sampled more coarsely — it is DRAWN with coarser content, and detail
+      // the renderer chose not to draw is detail no accumulator can recover.
+      const float viewPxThisFrame =
+          (taaOn && CurrentTuning().render.taaSharpLod != 0) ? (float)ctx.height
+                                                             : (float)renderH;
       auto writeMainRenderParams = [&] {
-        WriteRenderParams(ctx.queue, world, eye, cam,
+        WriteRenderParams(ctx.queue, world, eye, jcam,
                           (float)ctx.width / (float)ctx.height, ui.shadows,
-                          (float)now, fogSmooth, (float)renderH, tick,
+                          (float)now, fogSmooth, viewPxThisFrame, tick,
                           fluidCount,
                           (float)(accumulator / kTickDt),
                           ui.showDirtyVoxels ? 2u : 0u);
@@ -9041,7 +9092,7 @@ int main(int argc, char** argv) {
         if (sp.on) enc.WriteTimestamp(liveRenderTimer.NativeQuerySet(), sp.e, true);
       };
       sim.EncodeShadowResolve(enc);
-      if (scaled && (!scaledView || scaledW != renderW || scaledH != renderH)) {
+      if (offscreen && (!scaledView || scaledW != renderW || scaledH != renderH)) {
         scaledW = renderW;
         scaledH = renderH;
         scaledTex = ctx.device.CreateTexture(
@@ -9049,12 +9100,31 @@ int main(int argc, char** argv) {
             rhi::TextureUsage::RenderAttachment | rhi::TextureUsage::CopySrc,
             "worldScaled");
         scaledView = scaledTex.CreateView();
-        std::printf("render scale %.2f: world at %ux%u, window %ux%u\n",
-                    renderScale, renderW, renderH, ctx.width, ctx.height);
+        std::printf("render scale %.2f%s: world at %ux%u, window %ux%u\n",
+                    renderScale, taaOn ? " (taa)" : "", renderW, renderH,
+                    ctx.width, ctx.height);
       }
+      if (taaOn) {
+        // A toggle or a scale change invalidates the accumulator: the history
+        // was built at a different resolution or with a jitter sequence that
+        // was not running. EnsureTaa resets on a size change by itself; this
+        // covers the two that keep the size and change the meaning.
+        if (!taaWasOn || taaScaleWas != renderScale) sim.ResetTaa();
+        sim.EnsureTaa(renderW, renderH, ctx.width, ctx.height);
+        // Uploaded HERE, before any render pass opens, for the reason
+        // UploadMicroBodyInsts is hoisted out of DrawMicroBodies: a buffer
+        // write issued with a rendering scope open is legal in WebGPU and
+        // ILLEGAL in Vulkan (barrier_graph §4.6). Everything it needs — the
+        // jittered basis, the eye, the two knobs — is already known.
+        sim.WriteTaaParams(ctx.queue, taaCam, CurrentTuning().render.taaMaxHist,
+                           CurrentTuning().render.taaClamp, /*reset=*/false,
+                           ctx.surfaceFormat == rhi::TextureFormat::BGRA8Unorm);
+      }
+      taaWasOn = taaOn;
+      taaScaleWas = renderScale;
       rhi::RenderPass rp =
-          sim.BeginRenderPass(enc, scaled ? scaledView : target, ctx.surfaceFormat,
-                              renderW, renderH);
+          sim.BeginRenderPass(enc, offscreen ? scaledView : target,
+                              ctx.surfaceFormat, renderW, renderH);
       {
         const LiveSpan sp = spanBegin("rm_world");
         sim.DrawWorld(rp);
@@ -9101,12 +9171,35 @@ int main(int argc, char** argv) {
                                      : 0u);
         spanEnd(sp);
       }
-      if (scaled) {
-        // The world is done at internal resolution: blit it up (NEAREST — the
-        // voxels stay square) and open a native-size pass for the UI so text
-        // and panels are never scaled.
+      if (offscreen) {
+        // The world is done at internal resolution. Either resolve it through
+        // TAA (accumulate + upscale) or blit it up (NEAREST — the voxels stay
+        // square), then open a native-size pass for the UI so text and panels
+        // are never scaled.
         rp.End();
-        enc.BlitTexture(scaledView, target);
+        if (taaOn) {
+          // The copies MUST be outside a rendering scope — the recorder drops a
+          // transfer recorded inside one, silently. `rp.End()` above is what
+          // makes them legal, and BeginTaaRenderPass's own BeginRendering
+          // flushes the transfer->fragment-read hazard on both buffers for us
+          // (vk_record.cpp's FlushForRenderDomain walks the untracked extras
+          // too), so there is no hand-written barrier here and there must not be.
+          const LiveSpan spc = spanBegin("rm_taa_copy");
+          sim.EncodeTaaCapture(enc, scaledTex);
+          spanEnd(spc);
+          rp = sim.BeginTaaRenderPass(enc, target, ctx.surfaceFormat, ctx.width,
+                                      ctx.height);
+          {
+            const LiveSpan sp = spanBegin("rm_taa");
+            sim.DrawTaa(rp);
+            spanEnd(sp);
+          }
+          rp.End();
+          taaFrameNo++;
+          sim.FlipTaaPage();
+        } else {
+          enc.BlitTexture(scaledView, target);
+        }
         rp = sim.BeginOverlayRenderPass(enc, target, ctx.surfaceFormat, ctx.width,
                                         ctx.height);
       }

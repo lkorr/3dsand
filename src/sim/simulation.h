@@ -291,6 +291,68 @@ class Simulation {
   // Pure draw: no uploads, no queue. `count` comes from UploadMicroBodyInsts.
   void DrawMicroBodies(const rhi::RenderPass& pass, uint32_t count);
 
+  // ---- TAA + temporal upscale (assets/shaders/taa.wgsl) --------------------
+  //
+  // The pass that REPLACES the NEAREST blit at the end of a scaled frame: it
+  // accumulates sub-pixel-jittered low-resolution frames into a
+  // native-resolution history and resolves that into the swapchain. See the
+  // header of taa.wgsl for the mechanism, and main.cpp's jitter block for
+  // where the camera perturbation is applied (CPU-side, folded into the basis,
+  // so the raymarch and every raster path move together).
+  //
+  // ALL RENDER-ONLY DERIVED DATA. Nothing here is read by the sim, hashed, or
+  // saved; a run with taa on and one with it off produce the same world.
+  //
+  // The camera a frame was rendered with, as this pass needs it. `eye` is
+  // ABSOLUTE world position (not R.camPos, which is window-relative): the
+  // residency window can shift between two frames, and the reprojection needs
+  // a delta that survives that.
+  struct TaaCamera {
+    float right[3] = {1, 0, 0};
+    float up[3] = {0, 1, 0};
+    float fwd[3] = {0, 0, 1};
+    double eye[3] = {0, 0, 0};
+    float tanHalfFov = 1.0f;
+    float aspect = 1.0f;
+    // This frame's image shift, in RENDER pixels — the jitter that was folded
+    // into the basis above, in the units the shader reconstructs with.
+    float jitterX = 0.0f, jitterY = 0.0f;
+  };
+  // The R2 (plastic-constant) low-discrepancy jitter sequence, +/-0.5 px.
+  // Public and pure so the caller can scale it (render.taaJitter) and so it is
+  // one definition rather than a magic pair of constants in main.cpp.
+  static void TaaJitter(uint32_t frameIdx, float* jx, float* jy);
+  // Fragment stores are the hard requirement (the resolve writes its history
+  // from a fragment shader, like the shadow cache); the pipeline is the soft
+  // one — a shader that failed to compile leaves TAA off rather than crashing.
+  bool TaaAvailable() const { return taaAvailable_; }
+  // Size/allocate for this frame. Cheap and idempotent when nothing moved;
+  // a size change resets the history, because a resized history is not one.
+  void EnsureTaa(uint32_t renderW, uint32_t renderH, uint32_t nativeW,
+                 uint32_t nativeH);
+  // Copy the finished world frame (colour + the depth it wrote) into the
+  // storage buffers the resolve reads. MUST be recorded after the world pass
+  // has ENDED — a transfer inside a rendering scope is illegal, and the
+  // recorder silently drops it.
+  void EncodeTaaCapture(const rhi::CommandEncoder& enc,
+                        const rhi::Texture& colorTex);
+  // Upload the frame's params. Diffs against the camera stored by the previous
+  // call, so the caller never tracks a previous frame itself. `reset` forces
+  // the history away (first frame, a teleport, a knob change).
+  void WriteTaaParams(const rhi::Queue& queue, const TaaCamera& cam,
+                      float maxHist, float clampK, bool reset, bool bgraSource);
+  rhi::RenderPass BeginTaaRenderPass(const rhi::CommandEncoder& enc,
+                                     const rhi::TextureView& target,
+                                     rhi::TextureFormat format, uint32_t width,
+                                     uint32_t height);
+  void DrawTaa(const rhi::RenderPass& pass);
+  // Swap the history read/write halves. Call once per resolved frame, after
+  // the submit, exactly like FlipPage.
+  void FlipTaaPage() { taaPage_ = 1 - taaPage_; }
+  // Drop the accumulated history at the next resolve (teleport, load, a scale
+  // or toggle change). Cheap: one flag, no allocation.
+  void ResetTaa() { taaReset_ = true; }
+
   static constexpr rhi::TextureFormat kDepthFormat = rhi::TextureFormat::Depth32Float;
 
   // Which dirty buffer the tick just encoded writes as "active next tick".
@@ -510,6 +572,25 @@ class Simulation {
   rhi::Texture overlayDepthTex_;
   rhi::TextureView overlayDepthView_;
   uint32_t overlayDepthW_ = 0, overlayDepthH_ = 0;
+
+  // ---- TAA (taa.wgsl) ------------------------------------------------------
+  // taaColor_/taaDepth_ are the render-resolution frame copied out of its
+  // attachments; taaHist_ is the NATIVE-resolution accumulator, PING-PONGED
+  // because the resolve reads it bilinearly at a reprojected position (other
+  // pixels' texels) while writing its own. One buffer would be a race between
+  // invocations of one draw — the dirtyIn/dirtyOut argument, applied to a frame.
+  rhi::Buffer taaColor_, taaDepth_, taaHist_[2], taaUBO_;
+  rhi::BindGroupLayout taaBGL_;
+  rhi::PipelineLayout taaPL_;
+  rhi::BindGroup taaBG_[2];
+  rhi::RenderPipeline taaResolve_;
+  rhi::ShaderModule taaModule_;
+  uint32_t taaRW_ = 0, taaRH_ = 0, taaNW_ = 0, taaNH_ = 0;
+  int taaPage_ = 0;
+  bool taaReset_ = true;
+  bool taaAvailable_ = false;
+  bool taaHavePrev_ = false;
+  TaaCamera taaPrevCam_{};
 
   // Two bind groups: page 0 reads dirty[0]/writes dirty[1], page 1 reversed.
   // Particle groups follow the same paging (b0 = read page, b1 = write page).

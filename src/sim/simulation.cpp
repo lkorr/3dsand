@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <functional>
@@ -604,6 +605,37 @@ bool Simulation::Init(const rhi::Device& device, World& world,
     rhi::BindGroupLayout shadowGroups[] = {shadowBGL_};
     shadowPL_ = device.CreatePipelineLayout(shadowGroups, 1);
   }
+  // ---- the TAA resolve's layout (taa.wgsl) --------------------------------
+  // Its OWN layout, sharing nothing with renderBGL_: this pass reads none of
+  // the world (no voxels, no materials, no RenderParams) and the two buffers it
+  // does read are sized on the WINDOW, not the world, so they are recreated
+  // whenever the window or render.renderScale moves. Putting them in the
+  // renderer's group would mean rebuilding the renderer's bind group on a
+  // window resize, for a pass the renderer does not use.
+  //
+  // The LAYOUT is created here, in Init, because the pipeline is built from it
+  // in EnsureRenderPipelines; the BIND GROUPS are created in EnsureTaa, which
+  // is where the buffers they point at come into existence.
+  {
+    auto e = [](uint32_t binding, rhi::BufferBindingType type) {
+      rhi::BindGroupLayoutEntry x{};
+      x.binding = binding;
+      x.visibility = rhi::ShaderStage::Fragment;
+      x.type = type;
+      return x;
+    };
+    using T = rhi::BufferBindingType;
+    rhi::BindGroupLayoutEntry entries[] = {
+        e(0, T::Uniform),            // TaaParams
+        e(1, T::ReadOnlyStorage),    // srcColor  (this frame, render res)
+        e(2, T::ReadOnlyStorage),    // srcDepth  (this frame, render res)
+        e(3, T::ReadOnlyStorage),    // histIn    (native res, page ^ 1)
+        e(4, T::Storage),            // histOut   (native res, page)
+    };
+    taaBGL_ = device.CreateBindGroupLayout(entries, std::size(entries));
+    rhi::BindGroupLayout taaGroups[] = {taaBGL_};
+    taaPL_ = device.CreatePipelineLayout(taaGroups, 1);
+  }
   {
     rhi::BindGroupEntry entries[] = {
         b(0, world_->bodyXforms),
@@ -1028,6 +1060,10 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   rhi::ShaderModule mShadow;
   rhi::ShaderModule mExplode, mParticle, mFluid, mFluidSeam, mWaterBody;
   rhi::ShaderModule mRay, mDebris, mMicroBody, mDebugLines, mDebugWind, mDebugCur;
+  // The TAA resolve (taa.wgsl). Its own tiny module on purpose: the render
+  // pipeline it feeds must stay a fast driver compile, and growing raymarch's
+  // entry to hold it would put it behind the one shader on the critical path.
+  rhi::ShaderModule mTaa;
   {
     PipelineBuildPool loads;
     auto mod = [&](rhi::ShaderModule* into, const char* name) {
@@ -1054,6 +1090,7 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
     mod(&mDebugLines, "debug_lines.wgsl");
     mod(&mDebugWind, "debug_wind.wgsl");
     mod(&mDebugCur, "debug_current.wgsl");
+    mod(&mTaa, "taa.wgsl");
     loads.Run(buildThreads);
   }
   if (!mWorldgen || !mMutate || !mCompact || !mStep || !mOcc || !mPick ||
@@ -1270,6 +1307,7 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   }
 
   raymarchModule_ = mRay;
+  taaModule_ = mTaa;
   debrisModule_ = mDebris;
   microBodyModule_ = mMicroBody;
   debugLineModule_ = mDebugLines;
@@ -1990,8 +2028,14 @@ void Simulation::EnsureDepth(uint32_t width, uint32_t height) {
   if (depthView_ && depthW_ == width && depthH_ == height) return;
   depthW_ = width;
   depthH_ = height;
-  depthTex_ = device_.CreateTexture({width, height, 1}, kDepthFormat,
-                                    rhi::TextureUsage::RenderAttachment, "depth");
+  // CopySrc as well as RenderAttachment: the TAA resolve reprojects through the
+  // depth this pass wrote, and the only way a shader in this engine reads an
+  // image is a copy into a storage buffer (EncodeTaaCapture). It is a usage
+  // FLAG on a texture that already exists — no extra memory, no extra pass —
+  // so it is unconditional rather than gated on render.taa.
+  depthTex_ = device_.CreateTexture(
+      {width, height, 1}, kDepthFormat,
+      rhi::TextureUsage::RenderAttachment | rhi::TextureUsage::CopySrc, "depth");
   depthView_ = depthTex_.CreateView();
 }
 
@@ -2014,6 +2058,196 @@ void Simulation::EnsureOverlayDepth(uint32_t width, uint32_t height) {
       device_.CreateTexture({width, height, 1}, kDepthFormat,
                             rhi::TextureUsage::RenderAttachment, "depthOverlay");
   overlayDepthView_ = overlayDepthTex_.CreateView();
+}
+
+// ===========================================================================
+// TAA + temporal upscale (assets/shaders/taa.wgsl)
+// ===========================================================================
+
+namespace {
+// The uniform, mirrored by hand against `struct TaaParams` in taa.wgsl.
+// std140-ish, vec3+scalar pairs, exactly like RenderParams — and unlike
+// RenderParams this one is NOT checked by check_invariants.py, because it is
+// not in world.h. Keep the two in the same order and the padding explicit.
+struct TaaParamsGpu {
+  float camRight[3]; float tanHalfFov;
+  float camUp[3];    float aspect;
+  float camFwd[3];   float pad3;
+  float pRight[3];   float maxHist;
+  float pUp[3];      float clampK;
+  float pFwd[3];     float pad0;
+  float eyeDelta[3]; float pad1;
+  float jitter[2];   float pJitter[2];
+  uint32_t renderW, renderH, nativeW, nativeH;
+  uint32_t srcPitch, flags, reset, pad2;
+};
+static_assert(sizeof(TaaParamsGpu) == 160,
+              "TaaParamsGpu must match TaaParams in taa.wgsl");
+static_assert(sizeof(TaaParamsGpu) % 16 == 0, "uniform must be 16-byte sized");
+}  // namespace
+
+// The R2 sequence (Roberts 2018): the 2D generalisation of the golden ratio,
+// g = 1.32471795724474602596 (the plastic number), a_i = 1/g^i. It is the
+// jitter voxelbit.net uses and the reason ONE sample per pixel per frame
+// converges like two white-noise ones — successive frames land maximally far
+// from every frame before them, so a short history already covers the pixel
+// evenly, where a random offset clumps and leaves gaps.
+//
+// Range is +/-0.5 of a RENDER pixel: a full pixel of coverage, which is what
+// the reconstruction filter in taa.wgsl integrates over. Wider would alias the
+// filter; narrower would leave native detail permanently unsampled.
+void Simulation::TaaJitter(uint32_t frameIdx, float* jx, float* jy) {
+  constexpr double kA1 = 0.7548776662466927;   // 1/g
+  constexpr double kA2 = 0.5698402909980532;   // 1/g^2
+  const double n = (double)(frameIdx & 1023u);
+  auto frac = [](double v) { return v - std::floor(v); };
+  if (jx) *jx = (float)(frac(0.5 + kA1 * n) - 0.5);
+  if (jy) *jy = (float)(frac(0.5 + kA2 * n) - 0.5);
+}
+
+void Simulation::EnsureTaa(uint32_t renderW, uint32_t renderH, uint32_t nativeW,
+                           uint32_t nativeH) {
+  if (!taaAvailable_) return;
+  if (renderW == 0 || renderH == 0 || nativeW == 0 || nativeH == 0) return;
+  if (taaRW_ == renderW && taaRH_ == renderH && taaNW_ == nativeW &&
+      taaNH_ == nativeH && taaHist_[0] && taaBG_[0])
+    return;
+  using U = rhi::BufferUsage;
+  const bool srcMoved = (taaRW_ != renderW || taaRH_ != renderH);
+  const bool dstMoved = (taaNW_ != nativeW || taaNH_ != nativeH);
+  taaRW_ = renderW;
+  taaRH_ = renderH;
+  taaNW_ = nativeW;
+  taaNH_ = nativeH;
+  if (srcMoved || !taaColor_) {
+    // 4 bytes per texel each: one 8:8:8:8 unorm word of colour, one f32 of
+    // reversed-Z depth. No row padding — Vulkan's bufferRowLength is in texels
+    // and has no 256-byte rule (that is WebGPU's), so the pitch IS the width
+    // and the shader's srcPitch is renderW.
+    const uint64_t bytes = (uint64_t)renderW * renderH * 4;
+    taaColor_ = CreateBuffer(device_, bytes, U::Storage | U::CopyDst, "taaColor");
+    taaDepth_ = CreateBuffer(device_, bytes, U::Storage | U::CopyDst, "taaDepth");
+  }
+  if (dstMoved || !taaHist_[0]) {
+    // Two words per native pixel: rgb + accumulated weight, four halves.
+    const uint64_t bytes = (uint64_t)nativeW * nativeH * 8;
+    taaHist_[0] = CreateBuffer(device_, bytes, U::Storage | U::CopyDst, "taaHistA");
+    taaHist_[1] = CreateBuffer(device_, bytes, U::Storage | U::CopyDst, "taaHistB");
+  }
+  if (!taaUBO_) {
+    taaUBO_ = CreateBuffer(device_, sizeof(TaaParamsGpu),
+                           U::Uniform | U::CopyDst, "taaUBO");
+  }
+  auto b = [](uint32_t binding, const rhi::Buffer& buf) {
+    rhi::BindGroupEntry e{};
+    e.binding = binding;
+    e.buffer = buf;
+    return e;
+  };
+  for (int p = 0; p < 2; p++) {
+    rhi::BindGroupEntry entries[] = {
+        b(0, taaUBO_), b(1, taaColor_), b(2, taaDepth_),
+        b(3, taaHist_[1 - p]),   // read the OTHER page
+        b(4, taaHist_[p]),       // write this one
+    };
+    taaBG_[p] = device_.CreateBindGroup(taaBGL_, entries, std::size(entries),
+                                        p == 0 ? "taaBG0" : "taaBG1");
+  }
+  // A resized history is not the same history. Say so rather than resolving one
+  // frame of stretched garbage.
+  taaReset_ = true;
+}
+
+void Simulation::EncodeTaaCapture(const rhi::CommandEncoder& enc,
+                                  const rhi::Texture& colorTex) {
+  if (!taaAvailable_ || !taaColor_ || !colorTex || !depthTex_) return;
+  rhi::TexelCopyTexture src{};
+  rhi::TexelCopyBuffer dst{};
+  rhi::Extent3D ext{taaRW_, taaRH_, 1};
+  src.texture = colorTex;
+  dst.buffer = taaColor_;
+  dst.bytesPerRow = taaRW_ * 4;
+  dst.rowsPerImage = taaRH_;
+  enc.CopyTextureToBuffer(src, dst, ext);
+  // The DEPTH the same pass wrote, which is the whole reprojection input. The
+  // recorder takes the aspect from the image, so a depth image copies through
+  // the same call a colour one does; both are 4-byte texels.
+  src.texture = depthTex_;
+  dst.buffer = taaDepth_;
+  enc.CopyTextureToBuffer(src, dst, ext);
+}
+
+void Simulation::WriteTaaParams(const rhi::Queue& queue, const TaaCamera& cam,
+                                float maxHist, float clampK, bool reset,
+                                bool bgraSource) {
+  if (!taaAvailable_ || !taaUBO_) return;
+  TaaParamsGpu p{};
+  for (int i = 0; i < 3; i++) {
+    p.camRight[i] = cam.right[i];
+    p.camUp[i] = cam.up[i];
+    p.camFwd[i] = cam.fwd[i];
+  }
+  p.tanHalfFov = cam.tanHalfFov;
+  p.aspect = cam.aspect;
+  p.maxHist = maxHist;
+  p.clampK = clampK;
+  p.jitter[0] = cam.jitterX;
+  p.jitter[1] = cam.jitterY;
+  const bool haveHistory = taaHavePrev_ && !reset && !taaReset_;
+  if (haveHistory) {
+    for (int i = 0; i < 3; i++) {
+      p.pRight[i] = taaPrevCam_.right[i];
+      p.pUp[i] = taaPrevCam_.up[i];
+      p.pFwd[i] = taaPrevCam_.fwd[i];
+      // curEye - prevEye, differenced in DOUBLE and narrowed once: the eyes are
+      // absolute world coordinates and can be tens of thousands of voxels from
+      // the origin, where a float subtraction of two nearby positions loses the
+      // sub-voxel part that is the entire signal here.
+      p.eyeDelta[i] = (float)(cam.eye[i] - taaPrevCam_.eye[i]);
+    }
+    p.pJitter[0] = taaPrevCam_.jitterX;
+    p.pJitter[1] = taaPrevCam_.jitterY;
+  }
+  p.renderW = taaRW_;
+  p.renderH = taaRH_;
+  p.nativeW = taaNW_;
+  p.nativeH = taaNH_;
+  p.srcPitch = taaRW_;
+  p.flags = bgraSource ? 1u : 0u;
+  p.reset = haveHistory ? 0u : 1u;
+  queue.WriteBuffer(taaUBO_, 0, &p, sizeof p);
+  taaPrevCam_ = cam;
+  taaHavePrev_ = true;
+  taaReset_ = false;
+}
+
+rhi::RenderPass Simulation::BeginTaaRenderPass(const rhi::CommandEncoder& enc,
+                                               const rhi::TextureView& target,
+                                               rhi::TextureFormat format,
+                                               uint32_t width, uint32_t height) {
+  EnsureRenderPipelines(format);
+  EnsureOverlayDepth(width, height);
+
+  rhi::RenderPassDesc d{};
+  d.label = "taa";
+  d.color.view = target;
+  // CLEAR, not Load: the resolve writes every pixel of the target, so loading
+  // last frame's presented image would be a read nothing consumes.
+  d.color.loadOp = rhi::LoadOp::Clear;
+  d.color.storeOp = rhi::StoreOp::Store;
+  d.hasDepth = true;
+  d.depth.view = overlayDepthView_;
+  d.depth.loadOp = rhi::LoadOp::Clear;
+  d.depth.storeOp = rhi::StoreOp::Discard;
+  d.depth.clearValue = 0.0f;
+  return enc.BeginRenderPass(d);
+}
+
+void Simulation::DrawTaa(const rhi::RenderPass& pass) {
+  if (!taaAvailable_ || !taaResolve_ || !taaBG_[taaPage_]) return;
+  pass.SetPipeline(taaResolve_);
+  pass.SetBindGroup(0, taaBG_[taaPage_]);
+  pass.Draw(3);
 }
 
 // STILL SERIAL, deliberately (docs/PLAN_shader_compile.md package A audited
@@ -2198,7 +2432,37 @@ void Simulation::EnsureRenderPipelines(rhi::TextureFormat format) {
     d.depth = dsTest;
     pool.Add([this, d] { microBodyDraw_ = device_.CreateRenderPipeline(d); });
   }
+  // The TAA resolve. It carries a depth ATTACHMENT it never uses, and shares
+  // the overlay pass's native-size depth cache to do it: this pass runs
+  // immediately before the UI pass, at the same size, so reusing that cache
+  // costs one clear and no fourth texture — and it keeps every render pipeline
+  // in this function built against the same depth format, which is the
+  // arrangement dynamic rendering is least surprising under.
+  if (taaModule_) {
+    rhi::DepthState dsIgnore{};
+    dsIgnore.format = kDepthFormat;
+    dsIgnore.depthWriteEnabled = false;
+    dsIgnore.depthCompare = rhi::CompareFunction::Always;
+
+    rhi::RenderPipelineDesc d{};
+    d.label = "taaResolve";
+    d.layout = taaPL_;
+    d.vertexModule = taaModule_;
+    d.vertexEntry = "vs";
+    d.fragmentModule = taaModule_;
+    d.fragmentEntry = "fs";
+    d.colorFormat = format;
+    d.topology = rhi::PrimitiveTopology::TriangleList;
+    d.cullMode = rhi::CullMode::None;
+    d.depth = dsIgnore;
+    pool.Add([this, d] { taaResolve_ = device_.CreateRenderPipeline(d); });
+  }
   pool.Run(buildThreads);
+  // Decided after the join, from the same two inputs the shadow cache's flag is:
+  // the device must allow a fragment shader to write storage (the history IS a
+  // fragment-stage write), and the pipeline must actually have compiled. A
+  // machine that fails either renders the plain NEAREST blit and says nothing.
+  taaAvailable_ = FragmentStoresAvailable() && (bool)taaResolve_;
   std::fprintf(stderr, "[startup] render pipelines built in %.2f s\n",
                std::chrono::duration<double>(std::chrono::steady_clock::now() -
                                              tRp0).count());

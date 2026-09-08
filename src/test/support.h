@@ -65,6 +65,28 @@ void WriteRenderParams(const rhi::Queue& queue, const World& world,
                        float frameFrac = 0.0f,
                        uint32_t extraFlags = 0);
 
+// ---- the TAA camera jitter (render.taa; assets/shaders/taa.wgsl) -----------
+//
+// Perturb `cam` by this frame's R2 sub-pixel offset, MEASURE what that did to
+// the image in render pixels, and fill the TaaCamera the resolve pass
+// reprojects through. One definition, two consumers — the frame loop and the
+// `taa` gate — because a gate that jitters the camera differently from the game
+// is a gate that passes against behaviour the game does not have, which is the
+// whole reason this file exists.
+//
+// `outJittered` is what WriteRenderParams must then be given: perturbing the
+// CAMERA rather than the basis is what keeps the raymarch's ray construction
+// and projectView's raster projection moving together — both derive from the
+// same RenderParams and there is no second place to keep in step.
+//
+// `amp` is render.taaJitter (1 = the full +/-0.5 px). `aspect` and the fov come
+// from the same places WriteRenderParams reads them, so the measured shift is
+// the shift that frame actually has.
+void ApplyTaaJitter(const Camera& cam, const Vec3& eye, float aspect,
+                    uint32_t renderW, uint32_t renderH, uint32_t frameIdx,
+                    float amp, Camera& outJittered,
+                    Simulation::TaaCamera& outTaa);
+
 // Encode + submit one sim tick. `particlesActive` must be derived only from
 // tick-deterministic inputs (explosion history + a settled particle count),
 // never from frame timing — see DESIGN.md §2/§4.
