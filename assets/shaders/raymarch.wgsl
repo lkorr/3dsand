@@ -2915,8 +2915,6 @@ fn traceFar(ro : vec3f, rdIn : vec3f, tStart : f32, px : vec2f) -> FarHit {
     // rather than entering and immediately breaking out of each one.
     let tExit = min(min(tmax.x, min(tmax.y, tmax.z)), tCeil / s);
     if (tExit <= tEnter) { continue; }   // box missed (or fully behind tPrev)
-    // TEMP-DIAG (W1-B): borrowed slot, remove before commit
-    rsAdd(RS_PX_SUB, 1u);
 
     // ---- NESTED TRAVERSAL: a CHUNK cursor over a CELL cursor ---------------
     // (2026-09-07.) This was ONE flat cell DDA with a re-seed hack: every time
@@ -2926,19 +2924,34 @@ fn traceFar(ro : vec3f, rdIn : vec3f, tStart : f32, px : vec2f) -> FarHit {
     // re-read farOcc on every one of the sixteen cells after the one that had
     // already told it what the chunk holds.
     //
-    // MEASURED, --render-budget noon — the overlook, the camera every far-field
-    // number in this repo comes from: the cascade resolves ZERO pixels there
-    // (rmPxFar 0.000) and still costs 68.7 far steps per FRAME pixel, 120.7 per
-    // SKY ray. The cascade geometry says exactly where those go and there is no
+    // MEASURED. The cascade geometry says where the steps go and there is no
     // content in the answer: the levels are nested boxes whose half-extent
     // DOUBLES, so a ray marches the SHELL of level k, which is FAR_N/4..FAR_N/2
-    // cells = 8..16 chunks across, and there are FAR_LEVELS shells. ~8 x ~15 =
-    // ~120 chunk crossings, every one of them a full re-seed of empty air.
+    // cells = 8..16 chunks across, and it enters 7.8 of the FAR_LEVELS shells.
+    // Counted per pixel on the cascade camera, 75.6% of far steps were CHUNK
+    // probes and only 24.4% were cell tests — three quarters of the far march
+    // was crossing empty air, one full DDA re-seed at a time.
     //
     // Two cursors (voxelbit's L2/L1 split): the CHUNK cursor advances with one
     // compare and one add and is all an empty chunk ever costs; the CELL cursor
     // is seeded ONLY for a chunk with something in it. Same cells tested, same
     // hit, one farOcc load per CHUNK instead of one per cell.
+    //
+    // Standalone --render-budget under the exclusive lock, one exe and two
+    // asset trees back to back (the `nofar` control moved 0.25% and 1.2%):
+    //   noon overlook  far march 2.03 -> 1.37 ms  (-32%)
+    //   cascade camera far march 5.54 -> 3.93 ms  (-29%), frame 11.45 -> 9.76
+    // The counted step total goes UP ~6% (68.7 -> 73.2 / 128.6 -> 136.4 per
+    // pixel) because a chunk probe still counts as one RS_FAR step; what fell
+    // is the cost of a step.
+    //
+    // A COARSER MASK ABOVE THE CHUNK IS NOT THE NEXT STEP, by the chord law the
+    // SUBOCC_SKIP note states: at 4 chunks per super-cell the mean chord is
+    // (2/3)*4 = 2.67 chunk probes replaced by one super probe, saving ~1.7
+    // probes per empty super-cell — real, but it needs a new GPU producer and a
+    // new buffer, and a probe now costs a compare and an add. The bigger lever
+    // is that a sky ray still ENTERS all eight levels: a per-level occupied-Y
+    // slab would let it skip whole levels on one compare.
     //
     // THE TWO CURSORS ARE INDEPENDENT — the cell cursor never advances the
     // chunk cursor — so their floating-point accumulations cannot drift into
@@ -2982,8 +2995,6 @@ fn traceFar(ro : vec3f, rdIn : vec3f, tStart : f32, px : vec2f) -> FarHit {
 
     while (budget > 0) {
       rsAdd(RS_FAR, 1u);
-      // TEMP-DIAG (W1-B): borrowed slot, remove before commit
-      rsAdd(RS_MICRO, 1u);
       budget -= 1;
       if (!farInBox(cc * i32(CHUNK), org)) { break; }
       if (tCur >= tExit) { break; }
@@ -3013,8 +3024,6 @@ fn traceFar(ro : vec3f, rdIn : vec3f, tStart : f32, px : vec2f) -> FarHit {
               } else {
                 tIn = tPlane + 1e-4;
                 axis = 1;
-                // TEMP-DIAG (W1-B): borrowed slot, remove before commit
-                rsAdd(RS_FLUID, 1u);
               }
             }
           }
@@ -3038,8 +3047,6 @@ fn traceFar(ro : vec3f, rdIn : vec3f, tStart : f32, px : vec2f) -> FarHit {
           for (var j = 0; j < 3 * i32(CHUNK); j++) {
             if (budget <= 0) { break; }
             rsAdd(RS_FAR, 1u);
-            // TEMP-DIAG (W1-B): borrowed slot, remove before commit
-            rsAdd(RS_GODRAY, 1u);
             budget -= 1;
             let cellByte = farByteAt(level, vc);
             var mat = cellByte & FAR_MAT_MASK;
