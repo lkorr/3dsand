@@ -572,6 +572,17 @@ re-enumerate it — other sections reference `C(N)` and this table.
 | d | **`Stream::FillSlots`** (`stream.cpp:271-273`) | per store-hit slot, `WriteBuffer(dirty[0], s*4, 1)` **and** `dirty[1]` — the "wake once: neighbors may have changed since this chunk was saved" write. Mid-frame, between ticks, from its own path (§3.5d) | review NEW-2 |
 | e | **the PARTICLE FLIGHT SHELL** (`PageTable::ApplyParticleShell`) | while a particle may be in flight, `occMatter(S)` — every chunk whose latest-snapshot occupancy is non-zero — is unioned into `cpuDirty`, applied at step (3) strictly after the tightening, **after** step (1)'s propagate, and one application PAST the off condition. This is what closes the GPU-ORIGINATED-WAKE hole: `resolve`'s landing `markDirtyNext` is the one dirty-writer with no CPU-known target at its own tick, and the intersection in step (2) can never ADD it back once a mid-flight snapshot has (correctly) tightened the mirror to empty (§3.4, phase-7 close) | phase-7 close |
 
+| f | **`genChunk`'s BIRTH WAKE** (`worldgen.wgsl`, "THE STREAMING WAKE") | the kernel itself stores `dirtyIn[slot] = dirtyOut[slot] = 1` for every generated slot holding a cell that `matCanAct`. On the STREAMING path the verdict is deferred (`genDeferWake`) and the CPU enacts it, so it arrives as (d); on the **batched worldgen** path (`SubmitWorldgen`) it fired on the GPU and the mirror never heard about it — `ResetAllEmpty` had just cleared `cpuDirty`, so the first tick after ANY worldgen ran the CA over every acting chunk in the window with a materialization set of that tick's op ring alone. Fixed by reading `dirty[0]` back once at the end of the batch loop and declaring the act set through (d)'s `RefilledSlot`; the flags ARE the wake, so the mirror cannot disagree with it, and a CPU re-implementation of `matCanAct` would be a second authority for one fact | W1-D, 2026-09-08 |
+
+(f) is the one this list existed to catch and did not, and its shape is the
+table's own thesis restated: the mechanism was right everywhere, the ENUMERATION
+was short by one. It surfaced as `lost sand (id 3) | FIRST sim_step tick 80001
+chunk (352,208,480) entry 0x80000000` — 24 dropped stores over a full
+`--selftest` — and only after a world-map edit moved the window's terrain, because
+the fault needs acting matter on a chunk boundary with an ALL-AIR chunk across
+it (a cliff edge). The hole was there from the beginning; the terrain decided
+whether anything fell through it.
+
 (d) is the same failure shape as (c) and is worth stating plainly: a refilled
 slot is dirty on the **next tick**, in **both** pages, decided by streaming
 rather than by the tick loop. Its target chunk was just written by streaming, so

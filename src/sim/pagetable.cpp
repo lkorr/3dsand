@@ -846,7 +846,13 @@ void PageTable::WakeAll() {
 void PageTable::RefilledSlot(uint32_t slot) {
   refills_++;
   // Contributor (d): Stream::FillSlots writes dirty[0] AND dirty[1] for a
-  // store-hit or freshly generated slot. Its target was just written by
+  // store-hit or freshly generated slot — and so does the BATCHED WORLDGEN
+  // (SubmitWorldgen), whose genChunk tail wakes every acting slot on the GPU
+  // and whose act set the CPU mirror reads back and declares here. Two
+  // callers, one contributor, because it is one fact: "the dirty flags were
+  // written for this slot by something outside the tick recurrence". Missing
+  // the second cost 24 lost voxels a suite; see the note in SubmitWorldgen.
+  // Its target was just written by
   // streaming so it is materialized anyway, but it must still enter cpuDirty or
   // a tightening would intersect the refilled chunk (and its NEIGHBOURS) away,
   // and the CA frontier a stream-in creates would be invisible to the mirror.
