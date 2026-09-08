@@ -103,12 +103,30 @@ step:
 2. Merge `main` and `list` into one entry (uniform-driven indirection). Saves ~75 s.
 3. Pass `PondSet`/`LandCol` via `ptr<function>` everywhere; stop embedding PondSet in
    LandCol. This is the documented NVIDIA pathology (large by-value aggregates).
-4. Reduce genColumn/genCellIn inline copies (a helper does NOT dedupe — every call site
-   inlines; only a rolled loop over a worklist dedupes). `far` currently reaches 3-4 copies.
+4. ~~Reduce genColumn/genCellIn inline copies~~ — DEMOTED by package B's measurement
+   (see above): spirv-opt's inline-exhaustive makes the module 24x LARGER and the driver
+   compiles it 3.6x faster, so inline-copy count is not what the driver charges for.
+   Only worth revisiting if it shrinks the 181 s spirv-opt pass itself.
 
-## Expected end state
-- A lands: worldgen edit → playable in ~80-100 s, far terrain pops in ~12 min later;
-  full cold build bounded by `far` alone (~750 s), not the 17-min sum.
-- B lands (if the experiment wins): the 750 s bound itself shrinks.
-- C lands (later): far ≈ fardown ≈ 100 s → whole cold boot ~2 min, and with A's
-  parallelism, iteration on worldgen becomes ~100 s wall.
+## Measured end state (A+B merged on `shader-compile-fast`, 2026-09-07)
+Cold CWD (both caches wiped), renamed exe, RTX 3060 Ti:
+- **Cold boot**: frame loop entered 64.7 s, frame 1 at 113.6 s (render pipelines
+  45.7 s, parallel but CPU-starved by the deferred far/fardown optimizer threads),
+  far cascades ready 413.9 s. Was ~17 min before any frame.
+- **Worldgen-edit iteration loop** (everything else warm): **frame 1 at 42.5 s**,
+  far cascades refreshed at 292.9 s. This is the number the plan existed for.
+- F5 with unchanged shaders: worldgen pipelines from cache in ~1-3 ms.
+- Determinism: twice-run PASS on the merged tree; the pin move (44fa72cb →
+  ef83fd47) and 24 selftest page faults belong to the carried main WIP's
+  map.svmap edit (established by package A's worldmap-revert differential and
+  package B's opt-off control), so the pin is the worldgen owner's to move.
+
+Open follow-ups:
+- spirv-opt on the deferred pair runs ~3x slower than standalone (far 302-349 s
+  vs 98.6 s) from CPU contention with boot — the unmeasured `legal` recipe, or
+  a lower thread count for the deferred set, would shrink far-ready.
+- Package C (far split + main/list merge + by-value flattening) still applies
+  and now attacks both the driver time AND the spirv-opt time.
+- `scripts/run.sh`'s stale-lock handling killed this session's wrapper shells
+  three times while a long compile held sv-gpu-lock (the exes survived,
+  orphaned). Long-run holders need a keepalive the reaper respects.

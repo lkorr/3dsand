@@ -2024,6 +2024,20 @@ void Simulation::EnsureRenderPipelines(rhi::TextureFormat format) {
   // compile of the raymarch fragment shader INSIDE the first frame.
   const auto tRp0 = std::chrono::steady_clock::now();
 
+  // Fanned out over PipelineBuildPool like BuildPipelines' compute batches —
+  // same legality argument (the backend's bookkeeping is mutexed, the shared
+  // VkPipelineCache is internally synchronized), same `--shader-stats` serial
+  // fallback. This block was left serial when `far` alone was 639 s and these
+  // nine were 45-52 s; with the SPIR-V optimizer landed the compute block is
+  // ~60 s total and a serial render block measured 64 s wall on a cold cache —
+  // it had become HALF the time to first frame. The descs are built up front
+  // as plain values (not one desc mutated between creates, which is what kept
+  // this serial), and every state object a desc points into — `blend` below —
+  // lives in this scope until the pool joins.
+  PipelineBuildPool pool;
+  const unsigned buildThreads =
+      rhi::vkr::CaptureStats(device_) ? 1u : kBuildThreads;
+
   rhi::DepthState dsAlways{};
   dsAlways.format = kDepthFormat;
   dsAlways.depthWriteEnabled = true;
@@ -2045,7 +2059,7 @@ void Simulation::EnsureRenderPipelines(rhi::TextureFormat format) {
     d.colorFormat = format;
     d.topology = rhi::PrimitiveTopology::TriangleList;
     d.depth = dsAlways;
-    raymarch_ = device_.CreateRenderPipeline(d);
+    pool.Add([this, d] { raymarch_ = device_.CreateRenderPipeline(d); });
   }
   {
     rhi::RenderPipelineDesc d{};
@@ -2059,11 +2073,11 @@ void Simulation::EnsureRenderPipelines(rhi::TextureFormat format) {
     d.topology = rhi::PrimitiveTopology::TriangleList;
     d.cullMode = rhi::CullMode::None;
     d.depth = dsTest;
-    particleDraw_ = device_.CreateRenderPipeline(d);
+    pool.Add([this, d] { particleDraw_ = device_.CreateRenderPipeline(d); });
 
     d.vertexEntry = "vsSprite";
     d.label = "spriteDraw";
-    spriteDraw_ = device_.CreateRenderPipeline(d);
+    pool.Add([this, d] { spriteDraw_ = device_.CreateRenderPipeline(d); });
 
     // THE ONE PIPELINE HERE WITH ITS OWN FRAGMENT ENTRY. Rigidbodies shade in
     // fsBody, not fs, because they are the only raster path that casts a sun
@@ -2073,7 +2087,7 @@ void Simulation::EnsureRenderPipelines(rhi::TextureFormat format) {
     d.vertexEntry = "vsBody";
     d.fragmentEntry = "fsBody";
     d.label = "bodyDraw";
-    bodyDraw_ = device_.CreateRenderPipeline(d);
+    pool.Add([this, d] { bodyDraw_ = device_.CreateRenderPipeline(d); });
     d.fragmentEntry = "fs";  // restore for the pipelines that follow
 
     // MLS-MPM fluid prototype: same module, same layout, own entry point.
@@ -2082,8 +2096,12 @@ void Simulation::EnsureRenderPipelines(rhi::TextureFormat format) {
     // fine with solid water-coloured droplets.
     d.vertexEntry = "vsFluid";
     d.label = "fluidDraw";
-    fluidDraw_ = device_.CreateRenderPipeline(d);
+    pool.Add([this, d] { fluidDraw_ = device_.CreateRenderPipeline(d); });
   }
+  // NOTE: `blend` (pointed into by the debug descs below) must outlive
+  // pool.Run — it is declared at function scope, not inside the block, for
+  // exactly that reason.
+  rhi::BlendState blend{};
   {
     // Collision-box wireframes. Its own module (debug_lines.wgsl) but the SAME
     // pipeline layout, so it needs no new bind groups.
@@ -2099,7 +2117,6 @@ void Simulation::EnsureRenderPipelines(rhi::TextureFormat format) {
     dsNone.depthCompare = rhi::CompareFunction::Always;
 
     // Straight alpha over the frame: these are annotation, not lit geometry.
-    rhi::BlendState blend{};
     blend.color.srcFactor = rhi::BlendFactor::SrcAlpha;
     blend.color.dstFactor = rhi::BlendFactor::OneMinusSrcAlpha;
     blend.color.operation = rhi::BlendOperation::Add;
@@ -2119,7 +2136,7 @@ void Simulation::EnsureRenderPipelines(rhi::TextureFormat format) {
     d.topology = rhi::PrimitiveTopology::TriangleList;
     d.cullMode = rhi::CullMode::None;
     d.depth = dsNone;
-    debugBoxDraw_ = device_.CreateRenderPipeline(d);
+    pool.Add([this, d] { debugBoxDraw_ = device_.CreateRenderPipeline(d); });
 
     // Wind slope-field arrows (docs/RESEARCH_wind.md §4.8). Same module story
     // as the wireframes — its own file, the SAME pipeline layout, so no new
@@ -2144,7 +2161,7 @@ void Simulation::EnsureRenderPipelines(rhi::TextureFormat format) {
     d.fragmentModule = debugWindModule_;
     d.fragmentEntry = "fsArrow";
     d.depth = dsWind;
-    debugWindDraw_ = device_.CreateRenderPipeline(d);
+    pool.Add([this, d] { debugWindDraw_ = device_.CreateRenderPipeline(d); });
 
     // The CURRENT field's arrows (water plan component 8). Same pipeline
     // state, same depth rule, same argument for it — a different field.
@@ -2154,7 +2171,7 @@ void Simulation::EnsureRenderPipelines(rhi::TextureFormat format) {
     d.fragmentModule = debugCurModule_;
     d.fragmentEntry = "fsCurArrow";
     d.depth = dsWind;
-    debugCurrentDraw_ = device_.CreateRenderPipeline(d);
+    pool.Add([this, d] { debugCurrentDraw_ = device_.CreateRenderPipeline(d); });
   }
   {
     // Micro bodies: own layout (renderBGL_ + microBodyBGL_), own module, and
@@ -2172,8 +2189,9 @@ void Simulation::EnsureRenderPipelines(rhi::TextureFormat format) {
     d.topology = rhi::PrimitiveTopology::TriangleList;
     d.cullMode = rhi::CullMode::Front;
     d.depth = dsTest;
-    microBodyDraw_ = device_.CreateRenderPipeline(d);
+    pool.Add([this, d] { microBodyDraw_ = device_.CreateRenderPipeline(d); });
   }
+  pool.Run(buildThreads);
   std::fprintf(stderr, "[startup] render pipelines built in %.2f s\n",
                std::chrono::duration<double>(std::chrono::steady_clock::now() -
                                              tRp0).count());
