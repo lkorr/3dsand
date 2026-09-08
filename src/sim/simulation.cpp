@@ -975,6 +975,12 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   pageFill_ = MakeComputePipeline(device, simPL_, mWorldgen, "pagefill", "pageFill");
   farFill_ = MakeComputePipeline(device, farPL_, mWorldgen, "far", "farFill");
   farDown_ = MakeComputePipeline(device, farPL_, mWorldgen, "fardown", "farDown");
+  // Persist the driver's pipeline cache NOW, exactly as EnsureRenderPipelines
+  // does after its own build: worldgen's five entry points are the multi-minute
+  // compile, and a launch killed anywhere past this line (build.sh's taskkill,
+  // a user giving up on a stalled load) would otherwise throw that work away
+  // and pay it again on every retry.
+  rhi::vkr::SavePipelineCache(device_);
   // The shadow cache's two render-path kernels. Loaded unconditionally even
   // when the cache is compiled out of raymarch.wgsl: the pipelines are cheap,
   // and EncodeShadowResolve is what decides whether they ever run, so the
@@ -1055,6 +1061,10 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   // M5: the scheduled container sweep (components 2 case 2 + 10).
   waterSweep_ = MakeComputePipeline(device, simPL_, mWaterBody, "wbSweep", "waterSweep");
   waterSplit_ = MakeComputePipeline(device, simPL_, mWaterBody, "wbSplit", "waterSplit");
+
+  // Second save: the rest of the compute block above is another 30-60 s of
+  // driver work on a cold cache (raymarch and the fluid family dominate).
+  rhi::vkr::SavePipelineCache(device_);
 
   // A backend that fails pipeline creation returns an INVALID handle (Vulkan:
   // Tint or vkCreateComputePipelines refused). Dawn reports errors through its
