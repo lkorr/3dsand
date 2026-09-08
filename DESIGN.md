@@ -368,8 +368,10 @@ That did not hold. `kVoxelMeters` had not moved since v0.2, and when it went
 
 Non-worldgen code authors in **metres** and converts at use, through
 `src/sim/scale.h` (`MetresToCells`, `MetresPerSecToCells`, `MetresToCellsI`).
-The `worldgen` tuning group keeps its own older mechanism — rows authored in
-voxels at `worldgen.refVoxelsPerMetre`, rescaled by `LoadTuning` — because a
+The map's terrain block (`assets/worldmap/<name>/map.json` `terrain`, since
+environment truth P-G) keeps its own older mechanism — numbers authored in
+voxels at `terrain.refVoxelsPerMetre`, rescaled by `LoadWorldMap`, with the
+prelude's `REF_VOXELS_PER_METRE` for the shader's own literals — because a
 terrain octave amplitude has no natural metre value. Two mechanisms, one line
 between them; do not add a third.
 
@@ -1668,8 +1670,8 @@ whose rungs all share an A/W adds detail without adding slope.
 | detail | 32 / 3.2 m | 16 / 1.6 m | live everywhere |
 | grain | 8 / 0.8 m | 4 / 0.4 m | live everywhere |
 
-Every octave is a **centred deviation** (`n - 8192`), so `worldgen.baseHeight`
-is the world's *mean* height rather than its floor and there is as much room
+Every octave is a **centred deviation** (`n - 8192`), so `terrain.baseHeight`
+(the map's; P-G) is the world's *mean* height rather than its floor and there is as much room
 below the datum for sea basins as above it for mountains. Measured over a 3,072
 voxel transect from the origin: **y-351 .. y+607**, i.e. ~96 m of relief where
 the pre-overhaul world had 5.4 m.
@@ -1683,8 +1685,9 @@ ridges and goes genuinely flat in valleys.
 
 **The calm home area** fades only the two coarse octaves toward the **spawn
 site** (`map.json sites[]`, kind `spawn`; `spawnCentre()` in both mirrors reads
-it from the map header's `WM_H_SPAWN_X/Z`), over `spawnPlainFade` past a
-Chebyshev radius of `spawnPlainR`. Fading the whole deviation would pin spawn
+it from the map header's `WM_H_SPAWN_X/Z`), over the map's
+`terrain.homeArea.fade` past a Chebyshev radius of `terrain.homeArea.radius`
+(P-G; they were `worldgen.spawnPlainFade/R`). Fading the whole deviation would pin spawn
 to a mathematically exact plane 64 m across — which is not "calm", it is a
 dinner plate, and it would make the `terrain` gate's per-voxel pass a test of a
 constant. The fade *width* is load-bearing: a ramp of magnitude A over width W
@@ -1718,9 +1721,10 @@ about it are not obvious and both were measured:
   has a free down-diagonal exactly where a neighbouring column is 3+ voxels
   lower — which is the ground the gate has already taken the wedge to zero on.
 
-`worldgen.sedSlope = 0` turns the wedge off, which makes
-`--sweep worldgen.sedSlope=0,96` a one-invocation proof that the knob reaches
-the kernel.
+`terrain.sedSlope = 0` (map.json, P-G) turns the wedge off. It is a map word
+rather than a tuning row now, so `--sweep` cannot reach it; the `terrain`
+gate's C1 (the CPU twin against the GPU per voxel) is the proof the words the
+map carries are the words the kernel reads.
 
 ##### Per-biome height curves (2026-09-01, Lin 13.3.3)
 
@@ -1735,11 +1739,12 @@ That is the same split `Land.slope` already makes for the sediment wedge.
   curve's values are `-16384 + i·32768/7` — not integers, so an identity curve
   could not be authored at all and "the default moves nothing" would be
   unprovable. Nine knots is eight intervals and the identity is
-  `-16384 + i·4096` exactly, which is what all four biomes default to.
+  `-16384 + i·4096` exactly, which is what a biome that authors nothing
+  carries (`assets/biomes/<name>.json` `terrain.curve`, P-G).
 * **The domain is half what it looks like.** `octave` returns
   `((n − 8192)·amp) >> 14` and `n − 8192` is ±8192, so one rung spans ±amp/2 and
-  the coarse pair spans ±`(contAmplitude + rangeAmplitude)/2`. Authoring against
-  the full sum would leave the outer knots unreachable at every seed.
+  the coarse pair spans ±`(landformRangeVox + rangeAmplitude)/2`. Authoring
+  against the full sum would leave the outer knots unreachable at every seed.
 * **The identity is bit-exact, by three separate pieces of arithmetic.** (1) The
   Hermite basis is summed *before* the shift: `h00+h01` is exactly 4096 and
   `h10+h11+h01` is exactly `t` in integers, whatever the rounding of t² and t³,
@@ -1762,63 +1767,85 @@ That is the same split `Land.slope` already makes for the sediment wedge.
   the whole feature — including its two extra `vnoise2d` samples — out of the
   shader. A world that does not use a curve pays nothing for it.
 
-###### The ceiling on how far two biomes may differ
+###### Where the curve lives now (environment truth P-G, 2026-09-07)
 
-`curveBiomePair` crossfades the two nearest biomes over ±`worldgen.biomeBlend`
-band units, because a hard switch puts a **cliff** along every biome edge: the
-curve reshapes octaves whose amplitude is 100 m. But the crossfade can only be
-as wide as the biome field's own edge, and that is the binding constraint:
+The curve is **the biome file's** (`assets/biomes/<name>.json` `terrain.curve`,
+nine Q14 knots) beside three Q8 multipliers on the map's hill / detail / grain
+octaves (`terrain.hill/detail/grain`, 256 = the map's amplitude), packed into
+the biome record (`worldmap.h kB_CurveKnot0..kB_GrainMul`) and read by the
+height mirror on both sides. The 36 `worldgen.curve*` knobs, `biomeBlend`,
+`biomeLog2` and the three thresholds are gone.
 
-| measured (seed 1337) | |
-|---|---|
-| `\|d(band)/dcolumn\|` | mean 0.30, p95 **1**, max **2** |
-| blend at ±18 band units | 36 columns typical, **18 columns worst case** |
-| ⇒ a delta of *D* Q14 units | ramps at `D/25.6/18` voxels per column |
+**It blends on the map's own lattice.** A column reads the FOUR map cells
+around it — the same cell-centred bilinear `mapLandformQ8` uses — and mixes
+the knots (`biomeMixAt` / `curveKnotAt`) before the Hermite, so two biomes'
+curves crossfade over a whole 102 m cell and never meet on a cliff. That
+retires the old "±18 band units of crossfade" ceiling: the ramp is a cell
+wide by construction, and a 35-voxel knot delta is 0.03 voxels per column.
+Four equal values mix to that value exactly (`a + ((b − a)·f) >> l` adds
+nothing when `b == a`), which is the fourth piece of the identity's
+bit-exactness.
 
-The CA's angle of repose is 1 voxel per column and the world's ambient p99.9
-adjacent step is already 2, so **~900 Q14 units (≈35 voxels) is about the
-ceiling on the difference between two *adjacent* biomes' knots** — which is what
-the shipped defaults use. Non-adjacent pairs are unconstrained: the band order is
-meadow | forest | pine | desert, so meadow and desert never meet.
+**Nothing folds at compile time any more.** `CURVE_IDENT_ALL` and the
+select chain over 36 constants went with the knobs; the knots are table
+reads, so an authored curve is a file edit and an F7, never a shader
+recompile — and never the fifteen-minute driver compile the constant knots
+produced the first time a non-identity set was tried. The identity ships
+in every biome because the fixture gates were written against the map's
+relief; a biome's curve is now the author's to change without a global
+default moving under `armor-react`.
 
-`biomeBlend` defaults to 18 — the largest the clamp allows, since it is capped at
-half the smallest threshold gap; two boundaries inside one crossfade would
-silently drop a biome from the blend. To go further than the ceiling you have to
-widen the biome field itself (`worldgen.biomeLog2`) or spread the thresholds.
+##### The terrain is the map's (environment truth P-G, 2026-09-07)
 
-###### The shipped defaults are the identity, and that is a measurement
+Every number that shaped the ground used to be a `worldgen.*` row in
+`tuning.json`. It is **`map.json terrain`** now, per map, packed into the
+worldMap buffer header (`worldmap.h kHTerrain*`, words 32..53) and read by
+name inside the height mirror on both sides (`wmTerrain(WM_H_TERRAIN_*)`,
+token-identical in `worldgen.wgsl` and `world.cpp`): the datum, what a
+painted landform 0..255 spans (`landformRangeVox`, the old `contAmplitude`
+— a painted ridge can be a 150 m mountain by raising it), the four seeded
+octaves (range / hill / detail / grain, amplitude + log2 cell), `fbmAtten`,
+the calm home area (`homeArea.y/radius/fade`), the sediment wedge, the
+treeline and the reference scale. `TerrainWords` is the one packing; the
+loader keeps the same words on `WorldMapData` for the CPU twin, and the
+`terrain` gate's C1 is the per-voxel proof. Lengths are rescaled from
+`refVoxelsPerMetre` at load exactly as `LoadTuning` used to rescale the rows.
+There is no continental noise octave: the painted landform plane IS the
+continental rung.
 
-A set at that ceiling was authored, measured, and **reverted**. It works: over a
-409.6 m map at (4096, 4096), `--heightmap` against the identity arm gives
+**A landform can be declared, not only painted.** `map.json sites[]` takes
+`{kind: "landform", shape: peak | ridge | basin | plateau, at, radius,
+heightVox, rotation?}` — "there is always a mountain to the east". The loader
+overlays it onto the packed landform plane (`OverlayLandformSites`: a cone,
+an elongated cone at a heading, a sunk cone, a flat top ramped out, in
+landform units of `landformRangeVox / 256` voxels each), so the shader reads
+the plane exactly as before and nothing new enters the mirror. Tier A: no
+seed anywhere near it. The shipped map declares `east_range`.
 
-| biome | curve | columns | relief (sd) identity → curved | mean move |
-|---|---|---:|---|---:|
-| forest | identity | 25,532 | 260.0 → 259.3 | 3.0 vox |
-| meadow | flatter | 26,791 | 236.0 → **219.8** (−6.9%) | 26.6 vox |
-| pine | steeper | 7,660 | 228.5 → **243.2** (+6.4%) | 20.6 vox |
-| desert | lower | 5,553 | 174.1 → 186.7 | 11.9 vox |
+**The ground flora is rows.** The shader's hard-coded undergrowth / flower
+chain (mushrooms under crowns, brambles, moss, saplings, litter; flowers, tall
+grass and edge litter in the gaps) and the alpine-cushion block are cover
+rows in the biome files with a **canopy condition** (`canopyMin/Max`, 0 open
+sky .. 255 deep shade, `worldmap.h kC_CanopyMin/Max`) and a `minY` at the
+treeline for the cushion. `undergrowthSite`'s 25-tile scan runs once per
+column, only for a biome whose rows bound the canopy (`kBF_CanopyRows`),
+handed into `genCellIn` as the memo the flower stalk used to be. The cover
+stack has no treeline gate any more: a row's `maxY` is its own snowline (the
+seeded rows stop at 227). The `env-truth` gate therefore asserts every
+biome's rows; the tile plants (`plantColumnAt`'s ferns and big toadstools)
+and the proc cactus are the two second sources left, reported not asserted,
+and a canopy-conditioned row is an interval (hi only) like a nearWater row.
+The stale species height caps (`placement.maxY` 20–23 m, authored for a
+y32..y86 world and sitting on the 20 m home area) are lifted and the atlas
+re-baked.
 
-(forest's 3.0 voxels is only its neighbours' curves bleeding in across the
-crossfade; the largest single-column move anywhere was 54 voxels.)
-
-**What it also does is break `armor-react`.** That gate plants its acid
-differential at `WindowOrigin + 250` and `+ 262` on *raw procgen ground*, and
-the window is wherever the gates before it left it. With the authored set the
-acid stopped reaching the control creature entirely and the dressed one died:
-
-| both arms, FULL SUITE scope | steel stops acid | dressed | bare | death |
-|---|---|---:|---:|---|
-| identity knots | PASS | 16/6057 | 357 | neither |
-| authored knots | **FAIL** | 5/6057 | **0** | dressed, t17 |
-
-Scope is load-bearing here (CLAUDE.md rule 7): the *same* gate PASSES under
-`--gate armor-react` with the authored set, because the window sits elsewhere.
-
-So the mechanism ships live and authorable and the **default stays neutral**.
-The fix is not a milder curve — any global worldgen default can move that
-ground. It is for that gate to stand on a levelled pad the way the fixture
-columns at (60,60)…(140,140) already do (`onFixturePad`), instead of on whatever
-procgen puts under `WindowOrigin + 250`.
+**What is left in tuning.json:** `world.mapLayer` / `world.editLayer` (which
+files the game loads; the map page's selectors) and `debug.vegetation` (the
+dev A/B switch, Tuning → Dev switches). The Worldgen tab is gone (P-I):
+Environment → World map is the one front door — map + edit layer, the
+Terrain section, the Sites panel (pad, spawn, water, landform, stamp:
+select / rename / delete), the heightmap backdrop, and the heightmap + voxel
+views re-homed as a preview pane.
 
 **Tree sizes are metre-true again.** `VOX_PER_M` in `worldgen.wgsl` was a
 hardcoded 16 — correct when a voxel was 6.25 cm, and left behind when `world.h`
@@ -2046,9 +2073,9 @@ There used to be a fourth height function, `surfHeightAt`, which hand-copied
 this arithmetic for the far-field skin lookup and had already drifted (it never
 took the lab branch). It is gone; `farSurfaceMat` takes the column.
 
-`World::TerrainHeight` reads the same
-`worldgen` values as the shader, so tuning terrain cannot desync collision from
-the terrain you can see. `scripts/tuning_prelude.py` supplies the same constants
+`World::TerrainHeight` reads the same map words as the shader
+(`WorldMapData::terrainWords`, the very `TerrainWords()` the packer wrote),
+so editing the terrain cannot desync collision from the terrain you can see. `scripts/tuning_prelude.py` supplies the same constants
 to `check_shaders.sh`, and is **generated** from `src/sim/tuning_params.def` —
 the one table the emitter itself expands — so the offline validator and the
 engine cannot disagree about a name, a type, or a default. They used to be two
@@ -6790,7 +6817,8 @@ CHANGE it that composes with worldgen instead of replacing it.
 ### 9c.1 Why the column map was not enough
 
 `--heightmap` renders a grid of `World::TerrainColumn` — ground height, slope,
-sediment depth, water depth per (x, z) — and the tuner's Worldgen tab drew it.
+sediment depth, water depth per (x, z) — and the tuner's Worldgen tab drew it
+(the World map page's preview pane, since P-I).
 Its 3D mode extruded that same grid into one heightfield mesh, which is why it
 read as a single continuous sheet: it had exactly the information a column field
 has. A cave, an overhang, a tree, the floor of a pond and a single voxel are all
@@ -6858,13 +6886,13 @@ z-fighting double face that does not.
 
 Brush strokes and selection operations write a sparse, chunk-keyed patch of
 world cell → voxel word, saved to `assets/worldedits/<name>.svedit` and named by
-`worldgen.editLayer`.
+`world.editLayer` (the map page's edits selector).
 
 It is deliberately none of the three things it could have been:
 
 * not a **ChunkStore save** (`world.svd/`), which is a live world pinned to one
   seed and one history and cannot compose with a worldgen change — and the whole
-  premise of the Worldgen tab is that you are still moving the sliders;
+  premise of the preview pane is that you are still editing the map;
 * not **FarEdits**, which is derived, disposable cascade state;
 * not a **second writer into the voxel buffer**. It emits `CellOp`s and they go
   through the MutationQueue like every other mutation (rule 3), which is what
@@ -6883,7 +6911,7 @@ clamped: a cell index is window-relative, so applying one for a non-resident
 chunk punches a hole in whatever now owns that slot.
 
 **Any layer moves the world hash**, because it puts voxels in the world. That is
-why `worldgen.editLayer` ships empty and no gate sets it.
+why `world.editLayer` ships empty and no gate sets it.
 
 ### 9c.5 Verification
 
@@ -7397,7 +7425,7 @@ the one model modders already read (PLAN_biomes.md §2 has the survey).
   ocean. `worldgen.wgsl` still names the first four by id (`B_*`) as the
   (identity, folded-out) height curve's input until P4.
 * **LIVE (world map P2a, 2026-09-04): THE BIOME COMES FROM THE PAINTED MAP.**
-  `assets/worldmap/<worldgen.mapLayer>/` — `map.json` (cell size, extent,
+  `assets/worldmap/<world.mapLayer>/` — `map.json` (cell size, extent,
   origin cell, sea level, ocean fade, warp amplitude, the palette of biome
   NAMES, sites, rules) beside `map.svmap` (three u8 planes: biome, landform,
   moisture; four cells per word on the GPU). `LoadWorldMap` resolves the
@@ -7441,13 +7469,13 @@ the one model modders already read (PLAN_biomes.md §2 has the survey).
   box, with pan/zoom, stroke undo and a cell/world readout, and saves both
   files through `/api/worldmap` + `/api/worldmap/planes`
   (`scripts/tuner_server.py`, bare names, format-checked, write-then-
-  rename). The page shows the planes as painted; the Worldgen tab's
-  heightmap/voxel views show what worldgen makes of them. Every save moves
-  the world hash.
+  rename). The page shows the planes as painted; its preview pane (the old
+  Worldgen tab's heightmap/voxel views, P-I) shows what worldgen makes of
+  them. Every save moves the world hash.
 * **LIVE (environment truth P-A, 2026-09-04): THE ENVIRONMENT HOT-RELOADS,
   and the game says what it was generated from.** `ReloadEnvironment`
   (`test/support.cpp`) re-reads the biome files, the map named by
-  `worldgen.mapLayer` and the tree atlas, validates them exactly as boot
+  `world.mapLayer` and the tree atlas, validates them exactly as boot
   does, and pushes them through `Simulation::UploadEnvironment` (a table
   that grew gets a new buffer and the two sim bind groups are rebuilt) and
   `worldmap::SetCurrentWorldMap` for the CPU twins. A refusal keeps the old
@@ -7540,12 +7568,10 @@ the one model modders already read (PLAN_biomes.md §2 has the survey).
   rows and every preset field (P-F geometry, P-E vegetation),
   `terrain.overrides` (P-G), climate and the moisture plane (later). The
   trees/ha stat uses the ENGINE tile (`worldgen.treeTile`).
-* **THE BAND STRIP IS DEAD** and drawn greyed with no grips: `biomeAt` is
-  `mapBiomeAt`, so `meadow/pine/desertThreshold`, `biomeLog2` and `biomeBlend`
-  reach only `biomeCurve`'s height-curve crossfade, and `CURVE_IDENT_ALL`
-  folds that out with the shipped identity curves. The Worldgen tab marks
-  those five knobs `dead:` in `tuner_schema.js` (`tuneRow` disables them);
-  P-G moves the curves into the biome files and P-I deletes the rows.
+* **THE BAND STRIP IS GONE** (P-G, 2026-09-07): `biomeAt` is `mapBiomeAt`,
+  and the five knobs it drew (`meadow/pine/desertThreshold`, `biomeLog2`,
+  `biomeBlend`) are deleted with the rest of `worldgen.*`; the biome page's
+  Relief section (the curve + multipliers) took its place.
 * The `biomes` gate (`src/sim/biomes.*`, `selftest_biomes.cpp`) loads every
   file and refuses an unknown species, preset or material, a biome `index`
   that is not worldgen's id for its name, a stale species mirror, a preset

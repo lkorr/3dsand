@@ -148,6 +148,105 @@ uint32_t WaterPresetIndex(const biomes::BiomeSet& set, const std::string& name) 
   return 0u;
 }
 
+// ---- the map's terrain (P-G) --------------------------------------------------
+void TerrainWords(const TerrainParams& t, uint32_t out[kTerrainWords]) {
+  const auto at = [&](uint32_t word) -> uint32_t& { return out[word - kHTerrainBaseHeight]; };
+  at(kHTerrainBaseHeight) = U(t.baseHeight);
+  at(kHTerrainLandformRange) = U(std::max(0, t.landformRangeVox));
+  at(kHTerrainRangeAmplitude) = U(std::max(0, t.rangeAmplitude));
+  at(kHTerrainRangeLog2) = U(std::clamp(t.rangeLog2, 3, 15));
+  at(kHTerrainHillAmplitude) = U(std::max(0, t.hillAmplitude));
+  at(kHTerrainHillLog2) = U(std::clamp(t.hillLog2, 3, 15));
+  at(kHTerrainDetailAmplitude) = U(std::max(0, t.detailAmplitude));
+  at(kHTerrainDetailLog2) = U(std::clamp(t.detailLog2, 3, 15));
+  at(kHTerrainGrainAmplitude) = U(std::max(0, t.grainAmplitude));
+  at(kHTerrainGrainLog2) = U(std::clamp(t.grainLog2, 3, 15));
+  at(kHTerrainFbmAtten) = U(std::clamp(t.fbmAtten, 0, 256));
+  at(kHTerrainHomeY) = U(t.homeY);
+  at(kHTerrainHomeR) = U(std::max(0, t.homeR));
+  at(kHTerrainHomeFade) = U(std::max(1, t.homeFade));
+  at(kHTerrainSedCeil) = U(t.sedCeil);
+  at(kHTerrainSedFraction) = U(std::max(0, t.sedFraction));
+  at(kHTerrainSedStrip) = U(std::max(0, t.sedStrip));
+  at(kHTerrainSedSlope) = U(std::max(0, t.sedSlope));
+  at(kHTerrainSedMax) = U(std::max(0, t.sedMax));
+  at(kHTerrainSedTopsoil) = U(std::clamp(t.sedTopsoil, 0, std::max(0, t.sedMax)));
+  at(kHTerrainTreeline) = U(t.treeline);
+  at(kHTerrainRefVpm) = U(std::max(1, t.refVoxelsPerMetre));
+}
+
+BiomeTerrainPacked PackBiomeTerrain(const biomes::BiomeDef& b) {
+  BiomeTerrainPacked p;
+  for (int i = 0; i < 9; i++)
+    p.w[kB_CurveKnot0 - kB_CurveKnot0 + static_cast<uint32_t>(i)] = U(std::clamp(b.terrain.curve[i], -16384, 16384));
+  p.w[kB_HillMul - kB_CurveKnot0] = U(std::clamp(b.terrain.hill, 0, 4096));
+  p.w[kB_DetailMul - kB_CurveKnot0] = U(std::clamp(b.terrain.detail, 0, 4096));
+  p.w[kB_GrainMul - kB_CurveKnot0] = U(std::clamp(b.terrain.grain, 0, 4096));
+  return p;
+}
+
+// A declared landform, onto the plane. Tier A: no seed anywhere in here. The
+// plane's unit is landformRangeVox / 256 voxels (the shader's
+// ((L << 8) - 32768) * range >> 16), so a site's heightVox becomes
+// heightVox * 256 / range units at its centre. Shapes are profiles of the
+// normalised distance t in 0..1 from the centre:
+//   peak     1 - t                      (a cone)
+//   basin    -(1 - t)                   (the cone, sunk; heightVox's sign is
+//                                        taken as a magnitude either way)
+//   plateau  1 inside 0.6, then 1 - (t - 0.6) / 0.4   (a flat top, ramped out)
+//   ridge    the cone over an ellipse of semi-axes (radius, radius / 3)
+//            turned `rotation` degrees, so it reads as a range with a crest
+// The value is accumulated in whole units and clamped to the byte at the end,
+// so a peak painted over a basin sums rather than replaces.
+void OverlayLandformSites(const std::vector<LandformSite>& sites, int landformRangeVox,
+                          int cellLog2, int width, int height, int originCellX, int originCellZ,
+                          std::vector<uint8_t>& landform) {
+  if (sites.empty() || landform.size() != static_cast<size_t>(width) * height) return;
+  const double unitsPerVox = 256.0 / static_cast<double>(std::max(1, landformRangeVox));
+  const int half = 1 << (cellLog2 - 1);
+  std::vector<double> acc(landform.size());
+  for (size_t i = 0; i < landform.size(); i++) acc[i] = landform[i];
+  for (const LandformSite& st : sites) {
+    const double r = std::max(1, st.radius);
+    const double amp = std::fabs(static_cast<double>(st.heightVox)) * unitsPerVox * (st.shape == "basin" ? -1.0 : 1.0);
+    if (amp == 0.0) continue;
+    const double ang = st.rotation * 3.14159265358979323846 / 180.0;
+    const double ca = std::cos(ang), sa = std::sin(ang);
+    // cells the footprint can reach, +1 for the ridge's rotated corners
+    int c0x, c0z, c1x, c1z;
+    const auto cellOf = [&](int x, int z, int* cx, int* cz) {
+      *cx = (x >> cellLog2) + originCellX;
+      *cz = (z >> cellLog2) + originCellZ;
+    };
+    cellOf(st.x - st.radius - 1, st.z - st.radius - 1, &c0x, &c0z);
+    cellOf(st.x + st.radius + 1, st.z + st.radius + 1, &c1x, &c1z);
+    c0x = std::max(c0x - 1, 0); c0z = std::max(c0z - 1, 0);
+    c1x = std::min(c1x + 1, width - 1); c1z = std::min(c1z + 1, height - 1);
+    for (int cz = c0z; cz <= c1z; cz++)
+      for (int cx = c0x; cx <= c1x; cx++) {
+        const double wx = ((cx - originCellX) << cellLog2) + half;
+        const double wz = ((cz - originCellZ) << cellLog2) + half;
+        const double dx = wx - st.x, dz = wz - st.z;
+        double t;
+        if (st.shape == "ridge") {
+          // into the ridge's frame: `u` along the crest, `v` across it
+          const double u = dx * ca + dz * sa, v = -dx * sa + dz * ca;
+          const double a = r, b = std::max(1.0, r / 3.0);
+          t = std::sqrt((u * u) / (a * a) + (v * v) / (b * b));
+        } else {
+          t = std::sqrt(dx * dx + dz * dz) / r;
+        }
+        if (t >= 1.0) continue;
+        double f;
+        if (st.shape == "plateau") f = t <= 0.6 ? 1.0 : 1.0 - (t - 0.6) / 0.4;
+        else f = 1.0 - t;
+        acc[static_cast<size_t>(cz) * width + cx] += amp * f;
+      }
+  }
+  for (size_t i = 0; i < landform.size(); i++)
+    landform[i] = static_cast<uint8_t>(std::clamp(static_cast<int>(std::lround(acc[i])), 0, 255));
+}
+
 namespace {
 int TileVoxOf(const biomes::WaterRow& r) {
   return std::max(0, static_cast<int>(std::lround(r.tileM * kVoxelsPerMetre)));
@@ -241,7 +340,6 @@ bool PackBiomeTable(const biomes::BiomeSet& set, std::vector<uint32_t>& W,
     }
     byId[b.index] = &b;
   }
-  const auto& wg = CurrentTuning().worldgen;
   // The one tree lattice every biome is thinned on (biomes.h). The tree atlas
   // derives the same number for the shader's scan; both are pure functions of
   // the set, so there is no ordering between the two loaders.
@@ -268,9 +366,9 @@ bool PackBiomeTable(const biomes::BiomeSet& set, std::vector<uint32_t>& W,
     r[kB_TreeTileVox] = U(biomes::TreeTileVox(b));
     r[kB_TreeDensity] = U(std::clamp(b.treeDensity, 0, 100));
     r[kB_TreeChanceQ16] = biomes::TreeChanceQ16(b, treeLattice);
-    // Cave thresholds: the biome's rows override the global knobs, which stay
-    // the default so a biome that says nothing about caves keeps today's.
-    int t1 = wg.caveThreshold1, t2 = wg.caveThreshold2;
+    // Cave thresholds: the biome's rows. A biome that authors no row keeps
+    // the pre-biome world's (150 / 148); there is no global knob any more.
+    int t1 = 150, t2 = 148;
     for (const biomes::CaveRow& c : b.caves) {
       if (c.preset == "near_surface") t1 = c.threshold;
       else if (c.preset == "deep") t2 = c.threshold;
@@ -282,7 +380,15 @@ bool PackBiomeTable(const biomes::BiomeSet& set, std::vector<uint32_t>& W,
     if (b.groundFlora) flags |= kBF_GroundFlora;
     if (b.cacti) flags |= kBF_Cacti;
     if (b.sandCap) flags |= kBF_SandCap;
+    for (const biomes::CoverRow& c : b.cover)
+      if (c.chance > 0 && c.materialId != 0 && (c.cond.canopyMin > 0 || c.cond.canopyMax < 255)) flags |= kBF_CanopyRows;
     r[kB_Flags] = flags;
+    // P-G: the biome's terrain record, the same PackBiomeTerrain the loader
+    // keeps on WorldMapData::biomeTerrain for the CPU twin.
+    {
+      const BiomeTerrainPacked bt = PackBiomeTerrain(b);
+      for (uint32_t k = 0; k < kBiomeTerrainWords; k++) r[kB_CurveKnot0 + k] = bt.w[k];
+    }
     // P-E: cave flora from the band rows (mushrooms on the near band's floor,
     // crystal on the deep band's floor and ceiling), the cactus density, and
     // the water preset the biome's ponds and shores wear (see WaterPresetOf).
@@ -322,6 +428,8 @@ bool PackBiomeTable(const biomes::BiomeSet& set, std::vector<uint32_t>& W,
       row[kC_NearWaterMax] = c.cond.nearWaterMaxM < 0
           ? U(-1) : U(static_cast<int>(std::lround(c.cond.nearWaterMaxM * kVoxelsPerMetre)));
       row[kC_NearWaterMin] = U(std::max(0, static_cast<int>(std::lround(c.cond.nearWaterMinM * kVoxelsPerMetre))));
+      row[kC_CanopyMin] = U(std::clamp(c.cond.canopyMin, 0, 255));
+      row[kC_CanopyMax] = U(std::clamp(c.cond.canopyMax, 0, 255));
       count++;
     }
     // The biome's ceiling includes EVERY preset its water rows can roll (and,
@@ -519,6 +627,60 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
   }
   auto geti = [&](const char* k, int d) { return j.contains(k) && j[k].is_number() ? j[k].get<int>() : d; };
   out.name = name;
+  // ---- terrain (P-G): the numbers that used to be worldgen.* --------------------
+  // Every length is authored at `refVoxelsPerMetre` voxels to the metre and
+  // rescaled to world.h's kVoxelsPerMetre here, exactly as LoadTuning used
+  // to rescale the rows: (v * live) / ref, so the shipped case is exact.
+  // Log2 cells shift by the ratio's log2. Counts and Q8 ratios are untouched.
+  {
+    const json te = j.contains("terrain") && j["terrain"].is_object() ? j["terrain"] : json::object();
+    TerrainParams& t = out.terrain;
+    auto num = [&](const char* k, int d) { return te.contains(k) && te[k].is_number() ? te[k].get<int>() : d; };
+    t.refVoxelsPerMetre = std::max(1, num("refVoxelsPerMetre", t.refVoxelsPerMetre));
+    const int ref = t.refVoxelsPerMetre;
+    auto len = [&](const char* k, int d) { return (num(k, d) * kVoxelsPerMetre) / ref; };
+    int cellShift = 0;
+    for (int r = kVoxelsPerMetre; r > ref; r /= 2) cellShift++;
+    for (int r = ref; r > kVoxelsPerMetre; r /= 2) cellShift--;
+    auto log2c = [&](const char* k, int d) { return std::clamp(num(k, d) + cellShift, 3, 15); };
+    t.baseHeight = len("baseHeight", t.baseHeight);
+    t.landformRangeVox = len("landformRangeVox", t.landformRangeVox);
+    t.rangeAmplitude = len("rangeAmplitude", t.rangeAmplitude);
+    t.rangeLog2 = log2c("rangeLog2", t.rangeLog2);
+    t.hillAmplitude = len("hillAmplitude", t.hillAmplitude);
+    t.hillLog2 = log2c("hillLog2", t.hillLog2);
+    t.detailAmplitude = len("detailAmplitude", t.detailAmplitude);
+    t.detailLog2 = log2c("detailLog2", t.detailLog2);
+    t.grainAmplitude = len("grainAmplitude", t.grainAmplitude);
+    t.grainLog2 = log2c("grainLog2", t.grainLog2);
+    t.fbmAtten = std::clamp(num("fbmAtten", t.fbmAtten), 0, 256);
+    const json ha = te.contains("homeArea") && te["homeArea"].is_object() ? te["homeArea"] : json::object();
+    auto hnum = [&](const char* k, int d) { return ha.contains(k) && ha[k].is_number() ? ha[k].get<int>() : d; };
+    t.homeY = (hnum("y", t.homeY) * kVoxelsPerMetre) / ref;
+    t.homeR = std::max(0, (hnum("radius", t.homeR) * kVoxelsPerMetre) / ref);
+    // A fade of 0 would divide by zero in landAt and make the home area's
+    // boundary a STEP of the whole coarse relief (the terrain gate's A4).
+    t.homeFade = std::max(1, (hnum("fade", t.homeFade) * kVoxelsPerMetre) / ref);
+    t.sedCeil = len("sedCeil", t.sedCeil);
+    t.sedFraction = std::max(0, num("sedFraction", t.sedFraction));
+    t.sedStrip = std::max(0, len("sedStrip", t.sedStrip));
+    t.sedSlope = std::max(0, num("sedSlope", t.sedSlope));
+    t.sedMax = std::max(0, len("sedMax", t.sedMax));
+    // THE CAVE SHELL: caveBands caps the near-surface cavern at h - 40 (a
+    // shader literal scaled by vlen); a wedge thicker than that is undercut
+    // and drops a column of loose powder into it -- `ca-skip` finds the world
+    // never quiet three gates away.
+    {
+      const int shell = (36 * kVoxelsPerMetre) / ref;
+      if (t.sedMax > shell) {
+        std::printf("world map: '%s' terrain.sedMax %d reaches into the cave shell; clamped to %d\n", name.c_str(), t.sedMax, shell);
+        t.sedMax = shell;
+      }
+    }
+    t.sedTopsoil = std::clamp(len("sedTopsoil", t.sedTopsoil), 0, t.sedMax);
+    t.treeline = len("treeline", t.treeline);
+    TerrainWords(t, out.terrainWords);
+  }
   out.cellLog2 = geti("cellLog2", 10);
   out.seaLevelY = geti("seaLevelY", 0);
   out.oceanFadeCells = geti("oceanFadeCells", 0);
@@ -636,6 +798,26 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
         if (s.contains("radius") && s["radius"].is_number()) st.radius = std::max(st.radius, s["radius"].get<int>());
         if (out.sites.size() >= 254) { log += at + "more than 254 stamp sites\n"; return false; }
         out.sites.push_back(std::move(st));
+      } else if (kind == "landform") {
+        // P-G: a DECLARED landform, Tier A. Overlaid onto the plane once the
+        // planes are read (below); never in the site table.
+        LandformSite ls;
+        ls.id = id;
+        ls.shape = s.value("shape", "peak");
+        if (ls.shape != "peak" && ls.shape != "ridge" && ls.shape != "basin" && ls.shape != "plateau") {
+          log += at + "site \"" + id + "\" kind landform: shape must be peak | ridge | basin | plateau, not \"" + ls.shape + "\"\n";
+          return false;
+        }
+        if (!(s.contains("at") && s["at"].is_array() && s["at"].size() == 2 &&
+              s["at"][0].is_number() && s["at"][1].is_number())) {
+          log += at + "site \"" + id + "\" kind landform needs at[2] in world voxels\n";
+          return false;
+        }
+        ls.x = s["at"][0].get<int>(); ls.z = s["at"][1].get<int>();
+        ls.radius = std::clamp(s.value("radius", 1024), 1, 1 << 20);
+        ls.heightVox = std::clamp(s.value("heightVox", 0), -100000, 100000);
+        ls.rotation = s.value("rotation", 0);
+        out.landformSites.push_back(std::move(ls));
       } else if (kind == "water") {
         // P-F: an AUTHORED LAKE. Tier A -- its centre is the map's, its
         // geometry the preset's (radius overridable, in world voxels), and it
@@ -726,6 +908,17 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
   }
   std::memcpy(out.landform.data(), raw.data() + 16 + cells, cells);
   std::memcpy(out.moisture.data(), raw.data() + 16 + cells * 2, cells);
+  // ---- the declared landforms, onto the painted plane (P-G) --------------------
+  // After the plane is read, before anything samples it. The shader and the
+  // CPU twin both read the OVERLAID plane and nothing else: a landform site
+  // exists at load and nowhere in the height mirror.
+  OverlayLandformSites(out.landformSites, out.terrain.landformRangeVox, out.cellLog2,
+                       out.width, out.height, out.originCellX, out.originCellZ, out.landform);
+  // ---- each biome's terrain record for the CPU twin (worldmap.h kB_Curve*) ----
+  out.biomeTerrain.assign(set.biomes.size(), {});
+  for (const biomes::BiomeDef& b : set.biomes)
+    if (b.index >= 0 && b.index < static_cast<int>(set.biomes.size()))
+      out.biomeTerrain[static_cast<size_t>(b.index)] = PackBiomeTerrain(b);
 
   // ---- rules (P5b): seeded placement per biome ----------------------------------
   // "3 crypts per km2 of forest, never within 400 m of each other" is one
@@ -825,6 +1018,9 @@ bool PackWorldMap(const biomes::BiomeSet& set, const WorldMapData& map,
   // the home area is -- the twin reads WorldMapData's default either way.
   W[kHSpawnX] = U(map.spawnX);
   W[kHSpawnZ] = U(map.spawnZ);
+  // The terrain words likewise (P-G): an unloaded map carries the defaults,
+  // and the twin reads WorldMapData's copy of the same words either way.
+  for (uint32_t k = 0; k < kTerrainWords; k++) W[kHTerrainBaseHeight + k] = map.terrainWords[k];
   if (!map.Loaded()) return true;   // P0/P1 tools: records only, planes absent
   W[kHCellLog2] = U(map.cellLog2);
   W[kHWidth] = U(map.width);
@@ -884,5 +1080,6 @@ bool PackWorldMap(const biomes::BiomeSet& set, const WorldMapData& map,
 
 const WorldMapData& CurrentWorldMap() { return Slot(); }
 void SetCurrentWorldMap(WorldMapData map) { Slot() = std::move(map); }
+const TerrainParams& CurrentTerrain() { return Slot().terrain; }
 
 }  // namespace worldmap

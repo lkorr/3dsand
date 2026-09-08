@@ -2447,7 +2447,7 @@ Vec3 LaserMuzzle(const Player& player, const Camera& cam) {
 //   4  u32  version (1)                 20  i32 cz
 //   8  u32  res                         24  u32 seed
 //   12 u32  span (voxels)               28  i32 voxelsPerMetre
-//   32 i32  hMin   36 i32 hMax          40 i32 seaHint (spawnPlainY)
+//   32 i32  hMin   36 i32 hMax          40 i32 seaHint (the map's terrain.homeArea.y)
 //   44 u32  reserved
 //   48 .. res*res * 8 bytes: i32 h, i16 water (h - water, clamped, or -32768
 //          for dry), u8 sed, u8 slope (Q8 clamped to 255)
@@ -2518,7 +2518,7 @@ int WriteHeightmap(const std::string& spec, const std::string& outPath) {
   put32(28, (uint32_t)kVoxelsPerMetre);
   put32(32, (uint32_t)hMin);
   put32(36, (uint32_t)hMax);
-  put32(40, (uint32_t)CurrentTuning().worldgen.spawnPlainY);
+  put32(40, (uint32_t)worldmap::CurrentTerrain().homeY);
   put32(44, 0);
 
   std::error_code ec;
@@ -2757,7 +2757,6 @@ int main(int argc, char** argv) {
   std::string voxdumpArgs;
   std::string voxdumpOut = "build/voxregion.bin";
   bool voxserve = false;
-  std::string dumpDefaultsOut;   // --dump-tuning-defaults <path>
   selftest::Options stOpt;
   for (int i = 1; i < argc; i++) {
     std::string a = argv[i];
@@ -3121,17 +3120,6 @@ int main(int argc, char** argv) {
       voxdumpOut = argv[++i];
     }
     else if (a == "--voxserve") voxserve = true;
-    // --dump-tuning-defaults <path>: the worldgen group's compiled-in defaults
-    // as JSON, for the tuner's "Reset terrain" button. Reads NOTHING — not
-    // tuning.json, not a device — because the whole point is the values before
-    // any file has had a say.
-    else if (a == "--dump-tuning-defaults") {
-      if (i + 1 >= argc) {
-        std::fprintf(stderr, "--dump-tuning-defaults wants a path\n");
-        return 1;
-      }
-      dumpDefaultsOut = argv[++i];
-    }
     else {
       std::fprintf(stderr, "unrecognized argument: '%s'\n"
                            "Run with --help for usage.\n", a.c_str());
@@ -3161,47 +3149,43 @@ int main(int argc, char** argv) {
   // means an agent can ask "what gates exist" without a GPU or a built world.
   if (stOpt.list) return selftest::List();
 
-  // --dump-tuning-defaults: the worldgen group's COMPILED-IN defaults as JSON,
-  // for the tuner's "Reset terrain" button.
-  //
-  // Answers before tuning.json is read, deliberately — and that is the whole
-  // mode. Loading the file first would hand back whatever the file already
-  // says, which is the one answer a reset button must never give. No device, no
-  // assets either, so it costs a process launch and nothing else.
-  if (!dumpDefaultsOut.empty()) {
-    const std::string js = WorldgenDefaultsJson();
-    std::error_code ec;
-    const std::filesystem::path p(dumpDefaultsOut);
-    if (p.has_parent_path())
-      std::filesystem::create_directories(p.parent_path(), ec);
-    std::ofstream f(dumpDefaultsOut, std::ios::binary);
-    if (!f) {
-      std::fprintf(stderr, "--dump-tuning-defaults: cannot write %s\n",
-                   dumpDefaultsOut.c_str());
-      return 1;
-    }
-    f.write(js.data(), (std::streamsize)js.size());
-    std::printf("worldgen defaults -> %s (%zu bytes)\n",
-                dumpDefaultsOut.c_str(), js.size());
-    return 0;
-  }
-
   // --heightmap: render a grid of World::TerrainColumn to a file and exit.
   //
-  // NO GPU, NO ASSETS, NO WINDOW — it answers before GpuContext exists, which
-  // is what makes it cheap enough for the tuner to call on every slider drag.
-  // All it needs is tuning.json, which it reads fresh, so the map it draws is
-  // the world the CURRENT worldgen parameters describe.
+  // NO GPU, NO WINDOW — it answers before GpuContext exists, which is what
+  // makes it cheap enough for the tuner to call on every redraw. It reads
+  // tuning.json (for the map's name), the materials, the biome files and the
+  // map FRESH -- since P-G every number that shapes the ground is the map's
+  // and the biomes' (map.json `terrain`, the per-biome relief record), so the
+  // picture it draws is the world those files describe right now.
   //
   // It is the same World::TerrainHeight the game collides against, on purpose:
   // a JS reimplementation in the tuner would be a third copy of the octave
   // ladder with nothing enforcing it against the other two (see the note over
-  // World::Column). The cost is a process launch per map, ~100 ms.
+  // World::Column). The cost is a process launch per map, ~150 ms.
   if (!heightmapArgs.empty()) {
     Tuning tune;
     std::string tuneErrs;
     LoadTuning(AssetDir() + "/materials/tuning.json", tune);
     SetCurrentTuning(tune);
+    {
+      const std::string ad = AssetDir();
+      std::vector<MaterialDef> m;
+      std::vector<ReactionGpu> rx;
+      std::string errs;
+      if (!LoadAssets(ad + "/materials/materials.json", ad + "/materials/reactions.json", m, rx, errs)) {
+        std::fprintf(stderr, "--heightmap: asset load failed:\n%s\n", errs.c_str());
+        return 1;
+      }
+      biomes::BiomeSet set;
+      worldmap::WorldMapData map;
+      std::string blog;
+      if (!biomes::LoadBiomeSet(ad, m, set, blog) ||
+          !worldmap::LoadWorldMap(ad, CurrentTuning().world.mapLayer, set, m.size(), kDefaultSeed, map, blog)) {
+        std::fprintf(stderr, "--heightmap: %s", blog.c_str());
+        return 1;
+      }
+      worldmap::SetCurrentWorldMap(std::move(map));
+    }
     return WriteHeightmap(heightmapArgs, heightmapOut);
   }
 
@@ -3273,7 +3257,7 @@ int main(int argc, char** argv) {
       std::vector<uint32_t> stMapWords;
       { std::string wl;
         worldmap::WorldMapData stMap;
-        if (!worldmap::LoadWorldMap(ad, CurrentTuning().worldgen.mapLayer, stBiomes, m.size(), kDefaultSeed, stMap, wl) ||
+        if (!worldmap::LoadWorldMap(ad, CurrentTuning().world.mapLayer, stBiomes, m.size(), kDefaultSeed, stMap, wl) ||
             !worldmap::PackWorldMap(stBiomes, stMap, stMapWords, wl)) {
           std::fprintf(stderr, "%s", wl.c_str());
           return 1;
@@ -3438,12 +3422,12 @@ int main(int argc, char** argv) {
       return 1;
     }
     worldmap::WorldMapData map;
-    if (!worldmap::LoadWorldMap(assetDir, CurrentTuning().worldgen.mapLayer, biomeSet, mats.size(), kDefaultSeed, map, blog) ||
+    if (!worldmap::LoadWorldMap(assetDir, CurrentTuning().world.mapLayer, biomeSet, mats.size(), kDefaultSeed, map, blog) ||
         !worldmap::PackWorldMap(biomeSet, map, worldMapWords, blog)) {
       std::fprintf(stderr, "%s", blog.c_str());
       std::fprintf(stderr, "world map '%s' failed to load -- refusing to start (a world with no "
                            "map is not a world; see src/sim/worldmap.h)\n",
-                   CurrentTuning().worldgen.mapLayer.c_str());
+                   CurrentTuning().world.mapLayer.c_str());
       return 1;
     }
     worldmap::SetCurrentWorldMap(std::move(map));
@@ -3464,7 +3448,7 @@ int main(int argc, char** argv) {
   // is behind an Environment save (docs/PLAN_environment_truth.md P-A).
   // Re-stamped by every environment reload (F7 / regen world / Apply).
   biomes::EnvironmentStamp envStamp =
-      biomes::StampEnvironment(assetDir, CurrentTuning().worldgen.mapLayer);
+      biomes::StampEnvironment(assetDir, CurrentTuning().world.mapLayer);
   std::printf("%s\n", envStamp.Line().c_str());
   auto envStampMessage = [&envStamp]() {
     return std::string("{\"v\":3,\"type\":\"environment\",\"stamp\":") + envStamp.Json() + "}";

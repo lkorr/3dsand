@@ -72,8 +72,8 @@ bash scripts/check_worldview.sh                           # tuner voxel view in 
 ```
 
 `--voxdump`/`--voxserve` (`src/tools/voxregion.h`) are the tuner's voxel terrain
-view: they run the real GPU worldgen and read a box back, so the Worldgen tab
-draws actual cells instead of a column map. `--voxserve` is a stdin request loop
+view: they run the real GPU worldgen and read a box back, so the World map
+page's preview pane draws actual cells instead of a column map. `--voxserve` is a stdin request loop
 because device+SPIR-V boot is ~3 s and a region is ~8 ms; `tuner_server.py` keeps
 one alive and takes the run mutex **per request**, never for the process
 lifetime. Anything C++ can assert lives in `--selftest --gate voxregion`;
@@ -323,8 +323,9 @@ hashes are identical, the parameter doesn't reach the kernel at those values.
 | `assets/materials/` | `tuning.json` (F5 hot-reload), materials+reactions JSON (R hot-reload) |
 | `src/tools/` | `voxregion.*` = `--voxdump`/`--voxserve`, real voxels for the tuner's terrain view |
 | `assets/tuner.html`+`tuner_schema.js` | browser editor for JSONs, Wiki, Audio, Notes tabs |
-| `assets/worldview.js` | the Worldgen tab's voxel terrain viewer + editor (WebGL2, worker mesher, LOD) |
-| `assets/worldedits/` | authored `.svedit` layers, applied by `worldgen.editLayer` |
+| `assets/worldview.js` | the World map page's preview pane: voxel terrain viewer + editor (WebGL2, worker mesher, LOD) |
+| `assets/worldedits/` | authored `.svedit` layers, applied by `world.editLayer` (the map page's edits selector) |
+| `assets/worldmap/<name>/` | THE MAP IS THE ENVIRONMENT: `map.json` (`terrain` = every number that shapes the ground, the sites: pad / spawn / water / landform / stamp) + `map.svmap` (biome / landform planes). Edited only on Environment → World map. `tuning.json` holds no worldgen knobs (`world.mapLayer` names the map; `debug.vegetation` is a dev switch) |
 | `assets/sound_schema.js` | only list of sound slots; must match `Cues::kSlotPrefix` in `audio/cues.cpp` |
 | `assets/spells/glyphs.json` | glyph content, materials by name, hot-reloads with R |
 | `assets/trees/` | `<species>.json` = authored tree params (the truth), `<species>.svtree` = the baked voxel atlas the engine loads. Voxelized ONLY by `assets/editor/treegen.js`; re-bake with `node scripts/bake_trees.mjs`, which MOVES THE WORLD HASH |

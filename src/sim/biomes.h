@@ -52,6 +52,12 @@ struct Conditions {
   float nearWaterMaxM = -1; // metres; only within this distance of water
   float nearWaterMinM = 0;  // metres; at least this far from water
   int patchThreshold = 0;   // 0..255 patch-noise gate
+  // P-G: the canopy band, 0..255 from worldgen's undergrowthSite (0 = open
+  // sky, 255 = deep under overlapping crowns). 0 / 255 = unbounded. Only
+  // cover rows read it: this is what the shader's hard-coded undergrowth /
+  // flower chain became.
+  int canopyMin = 0;
+  int canopyMax = 255;
 };
 
 struct CoverRow {
@@ -114,7 +120,17 @@ struct BiomeDef {
   std::vector<TreeRow> trees;
   std::vector<WaterRow> water;
   std::vector<CaveRow> caves;
-  std::map<std::string, double> terrainOverrides;   // worldgen.<key> -> value
+  // P-G: the biome's relief. `curve` is nine Q14 knots on a uniform grid over
+  // the coarse relief's full swing (the identity is -16384 + i*4096: a run of
+  // equal knots is a plateau, below the diagonal is flatter than the map, above
+  // it steeper); hill / detail / grain are Q8 multipliers on the MAP's three
+  // fine octaves (256 = the map's own amplitude). Packed into the biome record
+  // (worldmap.h kB_CurveKnot0..kB_GrainMul) and read by the height mirror,
+  // blended across map cells so biomes never meet on a cliff.
+  struct Terrain {
+    int curve[9] = {-16384, -12288, -8192, -4096, 0, 4096, 8192, 12288, 16384};
+    int hill = 256, detail = 256, grain = 256;
+  } terrain;
   std::string file;
 };
 

@@ -343,6 +343,16 @@ POND_TEXT="$(python "$ROOT/scripts/pond_lattice.py" --vpm "$W_VPM" --assets "$RO
 }
 PRELUDE_TEXT="$(printf '%s\n%s' "$PRELUDE_TEXT" "$POND_TEXT")"
 
+# The map's reference scale (ShaderConstantPrelude's REF_VOXELS_PER_METRE;
+# P-G): map.json terrain.refVoxelsPerMetre of the map tuning.json names,
+# derived from the assets by scripts/map_terrain.py exactly as LoadWorldMap
+# reads it at load.
+MAP_TEXT="$(python "$ROOT/scripts/map_terrain.py" --assets "$ROOT/assets")" || {
+  echo "check_shaders: scripts/map_terrain.py failed" >&2
+  exit 1
+}
+PRELUDE_TEXT="$(printf '%s\n%s' "$PRELUDE_TEXT" "$MAP_TEXT")"
+
 # Lines contributed ahead of the body: prelude + its "\n" + common + its "\n".
 # Error line L in the combined source maps to line L - OFFSET in the body file.
 COMMON_LINES="$(wc -l < "$COMMON" | tr -d ' ')"

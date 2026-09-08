@@ -8,7 +8,20 @@
     "notes": "The ring outside the painted map, and any painted sea: sand bed, no trees. Kelp arrives with the sea fill (P4)."
   },
   "terrain": {
-    "overrides": {}
+    "curve": [
+      -16384,
+      -12288,
+      -8192,
+      -4096,
+      0,
+      4096,
+      8192,
+      12288,
+      16384
+    ],
+    "hill": 256,
+    "detail": 256,
+    "grain": 256
   },
   "cover": {
     "skin": "sand",

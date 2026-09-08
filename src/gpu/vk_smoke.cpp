@@ -318,7 +318,7 @@ bool RunScenario(bool loud, bool lowPower, bool sledgehammer, bool validation,
     std::string blog;
     worldmap::WorldMapData map;
     if (!biomes::LoadBiomeSet(assetDir, mats, biomeSet, blog) ||
-        !worldmap::LoadWorldMap(assetDir, CurrentTuning().worldgen.mapLayer, biomeSet, mats.size(), kDefaultSeed, map, blog) ||
+        !worldmap::LoadWorldMap(assetDir, CurrentTuning().world.mapLayer, biomeSet, mats.size(), kDefaultSeed, map, blog) ||
         !worldmap::PackWorldMap(biomeSet, map, worldMapWords, blog)) {
       std::printf("biomes/world map: FAIL\n%s", blog.c_str());
       return false;

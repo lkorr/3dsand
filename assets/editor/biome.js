@@ -1,23 +1,25 @@
 /* biome.js — the Biome page of the Environment tab.
  *
  * ONE BIOME, ALL ITS STACKS. The left column is the biome file
- * (assets/biomes/<name>.json) as sections — climate & identity, terrain
- * overrides, ground cover, trees, water, caves — and the right column is a
- * SWATCH: a square of the biome composed by biomegen.js from the same files
- * the engine will read (tree species from assets/trees/, water presets from
- * assets/water/), drawn through WorldView.
+ * (assets/biomes/<name>.json) as sections — climate & identity, the relief
+ * (the height curve and the hill / detail / grain multipliers), ground cover,
+ * trees, water, caves — and the right column is a SWATCH: a square of the
+ * biome composed by biomegen.js from the same files the engine will read
+ * (tree species from assets/trees/, water presets from assets/water/), drawn
+ * through WorldView.
  *
  * WHAT IS LIVE AND WHAT IS NOT is one table, assets/editor/envlive.js, and
  * every field on this page goes through envui.liveMark with its JSON path:
  * a field the engine does not read is DISABLED (greyed, tooltip = the plan
- * package that reads it and why). Since the world map (2026-09-04) worldgen
- * reads the biome record the loader packs — skin / subsoil / skin depth, the
- * patch mask, the three flags, the cover rows with their minY / maxY /
- * patchThreshold, trees.density, the species weights, the cave thresholds —
- * and NOT trees.tile, the water rows, terrain overrides, climate, or the
- * rest of the conditions. docs/PLAN_environment_truth.md is the schedule.
- * The biome itself comes from the painted map (the World map page), not from
- * the worldgen thresholds, so the band strip below is dead and says so.
+ * package that reads it and why). Since PLAN_environment_truth P-G
+ * (2026-09-07) everything on this page but the climate coordinates and the
+ * cave rows' rarity is read: the biome record the loader packs carries the
+ * relief record, the skin, the patch mask, the flags, every cover row with
+ * all eight conditions (the canopy pair is what the engine's hard-coded
+ * undergrowth / flower chain became), the tree density + weights + row
+ * conditions, the water rows and the cave thresholds. The biome itself comes
+ * from the painted map (the World map page); there are no worldgen.*
+ * thresholds any more.
  *
  * EVERY FEATURE ROW CARRIES THE SAME PLACEMENT CHAIN: a rarity (1-in-N tiles,
  * or a weight, or a percent — one form per stack, the others shown read-only
@@ -243,7 +245,9 @@ const COND_FIELDS = [
   {k: 'maxSlope', n: 'slope ≤', min: 0, max: 1024, step: 8, title: 'Q8 landform slope gate: 256 = 45° = the angle of repose. 1024 = no bound.'},
   {k: 'nearWaterMax', n: 'water ≤ m', min: -1, max: 200, step: 0.5, title: 'Only within this many metres of a water body. -1 = anywhere.'},
   {k: 'nearWaterMin', n: 'water ≥ m', min: 0, max: 200, step: 0.5, title: 'Keep at least this far from water.'},
-  {k: 'patchThreshold', n: 'patch >', min: 0, max: 255, step: 1, title: 'Only where this row’s patch noise (0..255) is above this. 0 = everywhere.'}
+  {k: 'patchThreshold', n: 'patch >', min: 0, max: 255, step: 1, title: 'Only where this row’s patch noise (0..255) is above this. 0 = everywhere.'},
+  {k: 'canopyMin', n: 'canopy ≥', min: 0, max: 255, step: 1, title: 'Cover rows: only where the canopy cover (0 = open sky .. 255 = deep under overlapping crowns) is at least this. 96 is under a crown, 40 its edge. 0 = no bound.'},
+  {k: 'canopyMax', n: 'canopy ≤', min: 0, max: 255, step: 1, title: 'Cover rows: only where the canopy cover is at most this. 95 keeps a flower out of the shade. 255 = no bound.'}
 ];
 
 /** The conditions line under a feature row: six small number boxes, each
@@ -349,110 +353,87 @@ function stackEditor(body, spec) {
 }
 
 /* ===========================================================================
- * the biome BAND strip — DEAD since the world map, kept visible and greyed
+ * the relief (P-G): the height curve and the three multipliers
  *
- * biomeAt() returns mapBiomeAt(): the biome is the painted plane, not the
- * noise band. worldgen.meadow/pine/desertThreshold, biomeLog2 and biomeBlend
- * survive only inside biomeCurve() (worldgen.wgsl ~733), which picks which
- * biome's HEIGHT CURVE crossfades where — and every shipped curve is the
- * identity, so CURVE_IDENT_ALL folds that out of the shader too. P-G moves
- * the curves into the biome files; P-I deletes the knobs. Until then the
- * strip is drawn from tuning.json with no grips, so nobody drags a slider
- * that changes nothing.
+ * `terrain.curve` is nine Q14 knots on a uniform grid over the coarse
+ * relief's full swing: knot i is the ground the biome has where the map's
+ * relief sits at input i. The diagonal is the identity (the map's relief,
+ * unchanged); below it is flatter, above it steeper, a run of equal knots
+ * is a plateau. The engine interpolates monotone-cubic and BLENDS the four
+ * map cells around a column, so two biomes' curves crossfade over a whole
+ * cell. `hill` / `detail` / `grain` scale the map's three fine octaves (Q8:
+ * 256 = the map's amplitude). All of it is read (worldmap.h kB_CurveKnot0..
+ * kB_GrainMul); the canvas is the curve, dragged by its knots.
  * ======================================================================== */
-const BAND_DEAD = 'DEAD since the world map: biomeAt reads the painted map (World map page). These thresholds ' +
-                  'only choose which biome’s height curve blends where, and every shipped curve is the identity. ' +
-                  'Deleted in P-I.';
-function bandStrip(body) {
+const CURVE_W = 260, CURVE_H = 150;
+function reliefSection(body) {
   const el = H.el;
-  const T = H.tuning && H.tuning();
-  const wrap = el('div', {class: CLS + 'band ' + CLS + 'dead', title: BAND_DEAD});
+  const C = ctx();
+  const T = () => biome.terrain;
+  const cv = el('canvas', {class: CLS + 'curve', width: CURVE_W, height: CURVE_H,
+                           title: 'Drag a knot up (steeper) or down (flatter). The diagonal is the map\u2019s own relief. Double-click: reset to the identity.'});
   const info = el('div', {class: CLS + 'hint'});
-  body.append(wrap, info);
-  if (!T || !T.tune || !T.tune.worldgen) {
-    info.textContent = 'No tuning.json loaded — the (dead) band strip needs it to draw.';
-    return;
-  }
-  const W = T.tune.worldgen;
-  const keys = ['meadowThreshold', 'pineThreshold', 'desertThreshold'];
-  const segs = [['meadow', '#7fbf5a'], ['forest', '#3f8f4a'], ['pine', '#2f6f5f'], ['desert', '#d9b866']];
+  const line = el('div', {class: CLS + 'row'}, el('label', {}, 'height curve'), cv);
+  body.append(line, info);
+  UI.liveMark(C, line, 'terrain.curve', []);
+  const kx = i => 12 + (CURVE_W - 24) * i / 8;
+  const ky = v => CURVE_H - 12 - (CURVE_H - 24) * (v + 16384) / 32768;
   const paint = () => {
-    wrap.innerHTML = '';
-    const th = keys.map(k => Math.max(0, Math.min(255, W[k] | 0)));
-    const edges = [0, th[0], th[1], th[2], 255];
-    for (let i = 0; i < 4; i++) {
-      const w = Math.max(0, edges[i + 1] - edges[i]) / 255 * 100;
-      const seg = el('div', {class: CLS + 'seg' + (segs[i][0] === biomeName ? ' cur' : ''),
-                             style: 'width:' + w + '%;background:' + segs[i][1],
-                             title: segs[i][0] + ' (click to open). ' + BAND_DEAD},
-                     segs[i][0]);
-      seg.addEventListener('click', () => { if (H.openPage) H.openPage('biome', segs[i][0]); });
-      wrap.append(seg);
-    }
-    info.innerHTML = '';
-    info.append(el('span', {class: CLS + 'livepill', title: BAND_DEAD}, 'P-I'),
-                ' worldgen.' + keys.join('/') + ' = ' + th.join('/') + ' — not what decides a column’s biome any more: ' +
-                'paint that on the World map page. The Worldgen tab marks these knobs deprecated.');
+    const g = cv.getContext('2d');
+    g.clearRect(0, 0, CURVE_W, CURVE_H);
+    g.fillStyle = '#0e1219'; g.fillRect(0, 0, CURVE_W, CURVE_H);
+    g.strokeStyle = '#2a3040'; g.lineWidth = 1;
+    g.beginPath(); g.moveTo(kx(0), ky(-16384)); g.lineTo(kx(8), ky(16384)); g.stroke();   // the identity
+    g.strokeStyle = '#7fd4ff'; g.lineWidth = 2;
+    g.beginPath();
+    T().curve.forEach((v, i) => { if (i) g.lineTo(kx(i), ky(v)); else g.moveTo(kx(i), ky(v)); });
+    g.stroke();
+    g.fillStyle = '#ffd866';
+    T().curve.forEach((v, i) => { g.beginPath(); g.arc(kx(i), ky(v), 4, 0, Math.PI * 2); g.fill(); });
+    const ident = BG.terrainIsIdentity(T());
+    info.textContent = ident ? 'the identity: this biome keeps the map\u2019s relief exactly (the default)'
+                             : 'knots (Q14): ' + T().curve.join(', ');
   };
+  let drag = -1;
+  const pick = (ev) => {
+    const r = cv.getBoundingClientRect();
+    const x = (ev.clientX - r.left) * CURVE_W / r.width;
+    let best = -1, bd = 12;
+    for (let i = 0; i < 9; i++) { const d = Math.abs(x - kx(i)); if (d < bd) { bd = d; best = i; } }
+    return best;
+  };
+  const valueAt = (ev) => {
+    const r = cv.getBoundingClientRect();
+    const y = (ev.clientY - r.top) * CURVE_H / r.height;
+    const v = (CURVE_H - 12 - y) / (CURVE_H - 24) * 32768 - 16384;
+    return Math.max(-16384, Math.min(16384, Math.round(v / 256) * 256));
+  };
+  cv.addEventListener('pointerdown', (ev) => {
+    if (cv.classList.contains(CLS + 'dead')) return;
+    drag = pick(ev);
+    if (drag < 0) return;
+    cv.setPointerCapture(ev.pointerId);
+    undo.snapshot('terrain.curve');
+  });
+  cv.addEventListener('pointermove', (ev) => {
+    if (drag < 0) return;
+    T().curve[drag] = valueAt(ev);
+    paint(); markDirty();
+  });
+  const up = () => { if (drag >= 0) { drag = -1; regenerate(false); } };
+  cv.addEventListener('pointerup', up);
+  cv.addEventListener('pointercancel', up);
+  cv.addEventListener('dblclick', () => {
+    undo.snapshot(null);
+    T().curve = BG.CURVE_IDENTITY.slice();
+    paint(); markDirty(); regenerate(false);
+  });
   paint();
   widgets.push(paint);
-}
-
-/* ===========================================================================
- * terrain overrides — inherit-or-override over the worldgen rows
- * ======================================================================== */
-function terrainSection(body) {
-  const el = H.el;
-  const T = H.tuning && H.tuning();
-  const tab = T && T.schema ? T.schema.find(t => t.id === 'worldgen') : null;
-  if (!tab || !T.tune || !T.tune.worldgen) {
-    body.append(el('div', {class: CLS + 'hint'}, 'Needs tuning.json and the worldgen schema.'));
-    return;
-  }
-  const filter = el('input', {type: 'text', class: CLS + 'num', placeholder: 'filter knobs…', style: 'text-align:left'});
-  const onlyOver = el('input', {type: 'checkbox'});
-  const list = el('div', {});
-  body.append(el('div', {class: CLS + 'bar'}, filter,
-                 el('label', {class: CLS + 'hint', style: 'display:flex;gap:4px;align-items:center'}, onlyOver, 'overridden only')),
-              list);
-  const render = () => {
-    list.innerHTML = '';
-    const q = filter.value.trim().toLowerCase();
-    const ov = biome.terrain.overrides;
-    let n = 0;
-    for (const pr of tab.params) {
-      if (pr.sec || pr.type || pr.bool) continue;
-      const hit = !q || pr.k.toLowerCase().includes(q) || (pr.n || '').toLowerCase().includes(q);
-      const has = Object.prototype.hasOwnProperty.call(ov, pr.k);
-      if (!hit || (onlyOver.checked && !has)) continue;
-      n++;
-      const inherited = T.tune.worldgen[pr.k];
-      const chk = el('input', {type: 'checkbox', title: 'override this knob for this biome'});
-      chk.checked = has;
-      const val = el('input', {type: 'number', class: CLS + 'num', min: pr.min, max: pr.max, step: pr.step,
-                               value: has ? ov[pr.k] : inherited, disabled: !has});
-      const tag = el('span', {class: CLS + 'unit' + (has ? ' over' : '')},
-                     has ? 'overrides ' + inherited : 'inherited from Worldgen');
-      chk.addEventListener('change', () => {
-        undo.snapshot(null);
-        if (chk.checked) ov[pr.k] = inherited; else delete ov[pr.k];
-        markDirty(); render();
-      });
-      val.addEventListener('change', () => {
-        undo.snapshot(null);
-        ov[pr.k] = pr.int ? Math.round(+val.value) : +val.value;
-        markDirty(); render();
-      });
-      const line = el('div', {class: CLS + 'row', title: pr.d || ''}, el('label', {}, pr.n || pr.k), val, chk, tag);
-      list.append(line);
-      UI.liveMark(ctx(), line, 'terrain.overrides', [val, chk]);
-    }
-    if (!n) list.append(el('div', {class: CLS + 'hint'}, onlyOver.checked ? 'No overrides yet.' : 'No knob matches.'));
-  };
-  filter.addEventListener('input', render);
-  onlyOver.addEventListener('change', render);
-  render();
-  widgets.push(render);
+  for (const [k, n, d] of [['hill', 'hills ×', 'Q8 multiplier on the map\u2019s hill octave: 256 = the map\u2019s amplitude, 128 half, 512 double.'],
+                           ['detail', 'detail ×', 'Q8 multiplier on the map\u2019s detail octave.'],
+                           ['grain', 'grain ×', 'Q8 multiplier on the map\u2019s grain octave.']])
+    UI.row(C, body, {k, n, min: 0, max: 1024, step: 8, int: true, u: 'Q8', d}, 'terrain');
 }
 
 /* ===========================================================================
@@ -485,8 +466,6 @@ function buildPanel() {
   const dispRow = el('div', {class: CLS + 'row'}, el('label', {}, 'display name'), disp);
   s.body.append(dispRow);
   UI.liveMark(C, dispRow, 'displayName');
-  s.body.append(el('div', {class: CLS + 'hint', style: 'margin:6px 0 2px'}, 'The old biome-noise thresholds (dead — the map decides)'));
-  bandStrip(s.body);
   UI.row(C, s.body, {k: 'temperature', n: 'temperature', min: 0, max: 1, step: 0.01,
                      d: '0 cold .. 1 hot. The planned climate field is seed-independent with a fixed compass: colder toward +Z.'}, 'climate');
   UI.row(C, s.body, {k: 'moisture', n: 'moisture', min: 0, max: 1, step: 0.01,
@@ -500,20 +479,24 @@ function buildPanel() {
   UI.liveMark(C, notesRow, 'climate.notes');
   col.append(s.wrap);
 
-  // ---- terrain ------------------------------------------------------------------
-  s = UI.section(el, CLS, 'Terrain overrides',
-                 'The Worldgen tab’s knobs, per biome. Tick a knob to give this biome its own value; ' +
-                 'untouched knobs inherit. NOT READ (P-G): the loader parses these into BiomeDef::terrainOverrides ' +
-                 'and nothing reads them; P-G replaces the free-form map with a fixed hill / grain / detail record ' +
-                 'and the per-biome relief curve, both read by the height twin.', {closed: true});
-  terrainSection(s.body);
+  // ---- relief ------------------------------------------------------------------
+  s = UI.section(el, CLS, 'Relief',
+                 'LIVE (P-G): how this biome reshapes the map\u2019s terrain. The curve remaps the coarse relief ' +
+                 '(the painted landform + the range octave) \u2014 the diagonal is the map\u2019s own; below it flatter, ' +
+                 'above it steeper, a level run a plateau \u2014 and the three multipliers scale the map\u2019s fine ' +
+                 'octaves. The engine blends the four map cells around a column, so neighbours never meet on a cliff. ' +
+                 'The per-map numbers (datum, landform range, octaves, home area, sediment, treeline) are on the World map page.');
+  reliefSection(s.body);
   col.append(s.wrap);
 
   // ---- ground cover ---------------------------------------------------------------
   s = UI.section(el, CLS, 'Ground cover',
                  'The skin the ground wears and the small plants on it. LIVE: skin / subsoil / depth, the patch ' +
-                 'mask, the three flags, and every plant row (1-in-N surface columns; its min Y / max Y / patch ' +
-                 'condition enforced, slope and water distance not yet — P-D).');
+                 'mask, the three flags, and every plant row (1-in-N surface columns) with all eight conditions. ' +
+                 'Rows roll in order, first hit wins. Since P-G there is no hard-coded ground flora: the shade ' +
+                 'plants, litter, saplings and flowers are rows with a CANOPY condition (0 open sky .. 255 deep ' +
+                 'shade: 96+ is under a crown, ≤95 a gap), and no treeline gate — a row\u2019s max Y is its own ' +
+                 'snowline (the shipped rows stop at the map\u2019s treeline, 227; the alpine cushion above it is a row with min Y 228).');
   UI.matRow(C, s.body, {k: 'skin', n: 'ground skin', d: 'Topmost cell (WM_B_SKIN), skinDepth cells deep.'}, 'cover', mats, {filter: isSolid});
   UI.row(C, s.body, {k: 'skinDepth', n: 'skin depth (cells)', min: 1, max: 8, step: 1, int: true, d: ''}, 'cover');
   UI.matRow(C, s.body, {k: 'subsoil', n: 'subsoil', d: 'Under the skin: the sediment wedge’s topsoil (WM_B_SUBSOIL).'}, 'cover', mats, {filter: isSolid});
@@ -921,7 +904,8 @@ export function hasUnsaved() { return !!biome && !biomeName; }
  *  landed has no band strip and no terrain rows. The host calls this on every
  *  tab activation and the panel rebuilds once, when tuning first appears. */
 export function tuningAvailable() {
-  if (biome && !builtWithTuning && H.tuning && H.tuning() && H.tuning().tune) buildPanel();
+  // Nothing on the panel needs tuning.json any more (P-G moved the terrain
+  // to the map and the biome files); kept for the host's call.
 }
 
 // test seams

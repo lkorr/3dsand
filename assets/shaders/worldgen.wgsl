@@ -90,7 +90,7 @@ const M_KELP    : u32 = 62u;
 // ---- desert / pine-highland / alpine flora (materials.json ids 70..76) ----
 // The three biomes that generated as bare ground: desert (bare sand plus the
 // occasional dead bush), the pine highlands (bare needles over stone) and the
-// snowline above TREELINE (bare snow). Placed by cactusAt() and the three
+// snowline above treeline() (bare snow). Placed by cactusAt() and the three
 // biome ground-cover blocks at the end of genCell.
 //
 // These numbers are ARRAY POSITIONS in materials.json (id == index + 1), read
@@ -148,11 +148,12 @@ const M_MUSHROOM_LARGE : u32 = 122u;
 // ---- THE VOXEL-SIZE SCALE --------------------------------------------------
 //
 // VOXELS_PER_M is emitted from world.h's kVoxelsPerMetre (the integer
-// reciprocal of kVoxelMeters); TUNE_REF_VOXELS_PER_METRE is the scale the
-// worldgen TUNING ROWS are authored at, and LoadTuning has already rescaled
-// those. What is left is the lengths hardcoded HERE — cave band depths, the
-// magma table, tile pitches, the authored set pieces — and `vlen()` is how they
-// follow. Multiply first, divide second, so the shipped case (num == den) is
+// reciprocal of kVoxelMeters); REF_VOXELS_PER_METRE is the scale the map's
+// TERRAIN (map.json `terrain`, P-G) is authored at -- a prelude constant from
+// the loaded map, mirrored by scripts/map_terrain.py for check_shaders.sh --
+// and LoadWorldMap has already rescaled those. What is left is the lengths
+// hardcoded HERE — cave band depths, the magma table, tile pitches, the
+// authored set pieces — and `vlen()` is how they follow. Multiply first, divide second, so the shipped case (num == den) is
 // exact and this whole mechanism is bit-identical to the literals it replaced.
 //
 // A LENGTH gets vlen(). A count, a probability, a 0..255 noise threshold and a
@@ -160,14 +161,13 @@ const M_MUSHROOM_LARGE : u32 = 122u;
 // repose is 1 voxel/column at every voxel size and why pondMaxSlope needs no
 // scaling anywhere.
 const VLEN_NUM : i32 = VOXELS_PER_M;
-const VLEN_DEN : i32 = TUNE_REF_VOXELS_PER_METRE;
+const VLEN_DEN : i32 = REF_VOXELS_PER_METRE;
 fn vlen(v : i32) -> i32 { return (v * VLEN_NUM) / VLEN_DEN; }
 
-// Tallest a meadow flower can be, in CELLS — must be >= the largest value
-// flowerHeight() can return (now tall grass, 4 + 4 = 8; foxglove reaches 5).
-// It bounds the Y range the stalk branch scans, so an under-count silently
-// beheads the tall species and an over-count just costs a few wasted
-// evaluations per column.
+// The floor of genChunk's sky-skip margin, in CELLS: at least the tallest
+// TILE plant (a fern at PLANT_FERN_MAXH 5, a big toadstool at 3). The cover
+// rows' own ceiling (WM_B_MAX_COVER_H) is the other arm of that max; the
+// flower stalks this used to bound are rows now.
 const FLOWER_MAX_H : i32 = (8 * VLEN_NUM) / VLEN_DEN;
 // ---- shoreline: the wet fringe outside a pond (materials.json ids 81..87) ----
 // Placed by the shore-cover block in genCell against shoreAt(). Like the vine
@@ -228,48 +228,25 @@ const CAVE_LAVA_MARGIN : i32 = (6 * VLEN_NUM) / VLEN_DEN;
 // change the world hash, so they are rule-1 state and belong with the rest of
 // the integer procgen rather than behind an F5 reload.
 //
-// The two COVER thresholds are the whole design, so they are worth reading as a
-// unit. undergrowthSite() returns 0 (open sky) .. 255 (deep under a crown):
-//   < UG_COVER_EDGE   open ground:  grass and flowers, nothing else
-//   >= UG_COVER_EDGE  canopy edge:  flowers, plus a thinning scatter of litter
-//   >= UG_COVER_MIN   under cover:  the shade set takes over from the flowers
-//   >= UG_COVER_DEEP  deep shade:   brambles drop out, fern/moss/litter remain
-// UG_COVER_MIN sits near the middle of a single crown's ramp, NOT at its rim:
-// a rim-aligned threshold draws a visible circle of fern around every tree.
-const UG_COVER_EDGE : i32 = 40;
+// undergrowthSite() returns the CANOPY COVER of a column, 0 (open sky) .. 255
+// (deep under overlapping crowns). Since P-G (docs/PLAN_environment_truth.md)
+// the shade plants, the litter, the saplings and the meadow flowers are COVER
+// ROWS in assets/biomes/<name>.json with a `canopyMin` / `canopyMax`
+// condition (WM_C_CANOPY_MIN / MAX) instead of a hard-coded chain here; the
+// one threshold that survives gates the TILE ferns (plantSiteAt): a fern bank
+// wants real shade, and 96 sits near the middle of a single crown's ramp
+// rather than at its rim, where a threshold draws a visible circle of fern
+// around every tree.
 const UG_COVER_MIN  : i32 = 96;
-const UG_COVER_DEEP : i32 = 190;
 
-// 1-in-N per column, inside the relevant patch mask. These are the densities
-// that make the floor read as dense without paving it: a fern every ~7 columns
-// inside a fern bank is a bank you push through, one every 2 is a hedge.
-//
-// HALVED ACROSS THE BOARD on 2026-09-04 (every 1-in-N below doubled, every
-// percent halved, and the same in flowerAt, the shore/pond tuning rows and
-// the biome cover rows): the ground layer was the largest single term in
-// worldgen and the far refill while flying — a column inside a fern footprint
-// pays a second landColumn and a 25-tile tree scan (plantSiteAt), and every
-// placed cell is one the renderer treats as a micro model. Density is a look
-// knob; halve it here, not by lowering the render LOD.
-const UG_FERN_CHANCE    : u32 = 14u;
 // TILE PLANTS (ferns, big toadstools): percent of tiles inside the patch mask
 // that grow one. Tile size / footprint / height live in common.wgsl as the
 // PLANT_* consts because the renderer rebuilds the plant from the same hash.
+// HALVED on 2026-09-04 with the rest of the ground layer (density is a look
+// knob; halve it here, not by lowering the render LOD).
 const PLANT_FERN_CHANCE   : u32 = 22u;
 const PLANT_SHROOM_CHANCE : u32 = 3u;
 const UG_FERN_PATCH     : i32 = 140;    // vnoise 0..255; ~40% of the area
-const UG_MOSS_CHANCE    : u32 = 6u;
-const UG_MOSS_PATCH     : i32 = 150;
-const UG_BRAMBLE_CHANCE : u32 = 46u;
-const UG_SAPLING_CHANCE : u32 = 900u;   // rare on purpose: it reads as a TREE
-const UG_LITTER_CHANCE  : u32 = 8u;     // the default floor of a wood
-const UG_LITTER_EDGE_CHANCE : u32 = 22u;  // thinner, past the crown rim
-
-// Mushrooms ring the BOLE. Radius in voxels (a great oak's ring is wider, via
-// the per-tree jitter added at the call site); the inner d2 > 9 keeps them off
-// the trunk cells themselves.
-const UG_SHROOM_RING : i32 = (11 * VLEN_NUM) / VLEN_DEN;
-const UG_SHROOM_BASE_CHANCE : u32 = 6u;
 
 // Biomes, from the low-frequency biome field (see biomeAt).
 const B_FOREST : u32 = 0u;   // dominant: grass over dirt, dense trees
@@ -487,11 +464,10 @@ fn vnoise3(x : i32, y : i32, z : i32, cxl : u32, cyl : u32, seed : u32) -> i32 {
 const HSCALE : i32 = 1;
 
 
-// Snow/treeline. Terrain spans y32..y86, so this sits in the top ~quarter of
-// the range: high ridges go bare and white, everything below is forest. It was
-// a bare `80` in four places when the band was y44..y90 — retune it whenever
-// the band moves.
-const TREELINE : i32 = TUNE_TREELINE;
+// Snow/treeline: the ground Y at and above which the skin is snow and no tree
+// stands. map.json `terrain.treeline` (P-G), read from the worldMap header so
+// the C++ side (worldmap::CurrentTerrain().treeline) sees the same number.
+fn treeline() -> i32 { return wmTerrain(WM_H_TERRAIN_TREELINE); }
 // worldgen.vegetation: the kill-switch for every plant this file places. Gated
 // at the SOURCE of each feature (the *Info / *At functions and the table-driven
 // blocks in genCellIn), not by a material test at the end, so the tree
@@ -501,66 +477,41 @@ const TREELINE : i32 = TUNE_TREELINE;
 // caves and ruins are untouched.
 const VEGETATION : bool = TUNE_VEGETATION != 0u;
 
-// ---- the biome FIELD, split from the biome DECISION ------------------------
-//
-// One low-frequency noise picks the biome, a second breaks up the boundary so
-// biomes interlock instead of meeting on a smooth contour. Desert is gated to
-// the top of the range (~12% of the field) so it reads as a rare destination
-// you walk to rather than the default world. Height still overrides at the top:
-// snow caps above TREELINE regardless of biome (handled in genCellIn).
-// The biome cell is a LOG2 EXPONENT (9 = 512 voxels = 51.2 m) — deliberately
-// NOT halved with the rest of the third scale pass. Trees kept their size and
-// their 9 m spacing, so a biome region has to stay many tree-tiles wide or a
-// "meadow" holds one bush and the field reads as per-tree noise. The break-up
-// octave is two exponents down (128 voxels) so edges stay proportionally
-// ragged. The Q14 samples are shifted back down to the 0..255 band the four
-// THRESHOLD knobs are authored in, so the primitive swap does not silently
-// re-scale them.
-//
-// The BAND and the DECISION are separate functions because the height curve
-// below needs the band's CONTINUOUS value — a thresholded biome id has no
-// "how close to the edge am I", and a curve that switches on the id alone puts
-// a cliff along every biome boundary. Everything above still calls biomeAt and
-// sees exactly what it always did.
-// Package G retires this noise entirely for the compass climate.
-fn biomeBand(x : i32, z : i32, seed : u32) -> i32 {
-  return (vnoise2d(x, z, TUNE_BIOME_LOG2, seed ^ 0x1Bu).n >> 6)
-       + (((vnoise2d(x, z, TUNE_BIOME_LOG2 - 2u, seed ^ 0x1Cu).n >> 6) - 128) / 3);
-}
-
-fn biomeFromBand(b : i32) -> u32 {
-  if (b > i32(TUNE_DESERT_THRESHOLD)) { return B_DESERT; }
-  if (b > i32(TUNE_PINE_THRESHOLD)) { return B_PINE; }
-  if (b < i32(TUNE_MEADOW_THRESHOLD))  { return B_MEADOW; }
-  return B_FOREST;
-}
-
-// ---- PER-BIOME HEIGHT CURVES (Lin 13.3.3) ---------------------------------
+// ---- PER-BIOME RELIEF (P-G): the curve and the multipliers, FROM THE MAP ----
 //
 // "This biome is flat plains, that one is jagged mountains", authored as nine
-// numbers instead of a hand-tuned noise ladder. The curve reshapes the COARSE
-// SUM only — the continental and range rungs, the two that decide where the
-// mountains and the basins are — and leaves hill/detail/grain alone. So a
-// biome changes the LANDFORM and never the texture on it, which is the same
-// split `Land.slope` already makes for the sediment wedge.
+// numbers in assets/biomes/<name>.json `terrain.curve` plus three multipliers
+// on the map's fine octaves (`terrain.hill / detail / grain`, Q8, 256 = the
+// map's own amplitude). They live in the biome RECORD (WM_B_CURVE_KNOT0..8,
+// WM_B_HILL_MUL ..) and a column reads them from the FOUR MAP CELLS around it,
+// bilinearly, on the landform plane's own lattice (cell values at cell
+// centres, mapLandformQ8's arithmetic exactly) -- so two biomes' curves
+// crossfade over a whole cell (102 m) and never meet on a cliff. Tier A: no
+// seed anywhere in here; the cells are the map's. The old noise band, its
+// three thresholds and the +-18-unit crossfade went with the knobs.
+//
+// The curve reshapes the COARSE SUM only -- the landform plane and the range
+// rung, the two that decide where the mountains and the basins are -- and
+// leaves hill/detail/grain to the multipliers. So a biome changes the LANDFORM
+// with the curve and the TEXTURE with the multipliers, which is the same split
+// `Land.slope` makes for the sediment wedge.
 //
 // ---- NINE KNOTS, NOT EIGHT, AND WHY ---------------------------------------
-// The plan asked for eight. Eight knots is SEVEN intervals, so the identity
-// curve's knot values are -16384 + i*32768/7 — not integers. An identity curve
-// could then not be AUTHORED at all, only approximated, and "the default curve
-// moves nothing" would be unprovable rather than merely untested. Nine knots is
-// eight intervals and the identity values are -16384 + i*4096 exactly, which is
-// what all four biomes default to. Four extra rows buys the proof.
+// Eight knots is SEVEN intervals, so the identity curve's knot values are
+// -16384 + i*32768/7 — not integers. An identity curve could then not be
+// AUTHORED at all, only approximated, and "the default curve moves nothing"
+// would be unprovable rather than merely untested. Nine knots is eight
+// intervals and the identity values are -16384 + i*4096 exactly, which is what
+// a biome that says nothing about its terrain carries.
 //
 // ---- THE DOMAIN -----------------------------------------------------------
-// The plan said the input spans +-(contAmp + rangeAmp). It does not: `octave`
-// returns `((n - 8192) * amp) >> 14` and `n - 8192` is +-8192, so ONE rung
-// spans +-amp/2 and the two together span +-(contAmp + rangeAmp)/2. Authoring
-// against the doubled range would have left the outer two knots at each end
-// unreachable at every seed.
+// One rung spans +-amp/2 (`octave` returns `((n - 8192) * amp) >> 14` and
+// `n - 8192` is +-8192; the landform plane's contribution is the same shape
+// over its range), so the coarse pair spans +-(landformRange + rangeAmp)/2
+// and that is the curve's input grid.
 //
 // ---- WHY THE IDENTITY IS BIT-EXACT ----------------------------------------
-// Three separate pieces of the arithmetic, and all three are load-bearing:
+// Four separate pieces of the arithmetic, and all four are load-bearing:
 //
 //  1. The Hermite basis is summed BEFORE the shift, not per term. h00+h01 is
 //     exactly 4096 and h10+h11+h01 is exactly `t`, in integers, whatever the
@@ -573,90 +524,68 @@ fn biomeFromBand(b : i32) -> u32 {
 //     floor, and would bias every column down by one — never happens at all.
 //  3. The gradient scale falls out the same way: dv/dp is exactly 4096 for the
 //     identity, so the Q8 slope is exactly 256 and `(g * 256) >> 8 == g`.
+//  4. The bilinear mix of four EQUAL values is that value: `a + ((b - a) * f)
+//     >> l` with b == a adds exactly zero. So four identity biomes mix to the
+//     identity, and four 256s to 256.
 //
-// On top of that, `CURVE_IDENT_ALL` is a MODULE CONST — four biomes' worth of
-// comparisons between two consts — so with the default knots Tint folds the
-// whole feature, including its two extra vnoise2d samples, out of the shader.
-// A default world pays nothing for a curve it does not use.
+// Nothing folds at compile time any more -- the knots are table reads -- which
+// is the price of an authorable curve, paid once per column. (With the knots as
+// compile-time constants the driver's compile of this kernel ran past fifteen
+// minutes the moment a non-identity set was authored; a table read is what
+// the memory of that says to do.)
 const CURVE_KNOTS : i32 = 9;
 const CURVE_SEGS  : i32 = 8;
-const CURVE_HI : i32 = (TUNE_CONT_AMPLITUDE + TUNE_RANGE_AMPLITUDE) / 2;
 
-const CURVE_IDENT_ALL : bool =
-    (TUNE_CURVE_FOREST0 == -16384 &&
-     TUNE_CURVE_FOREST1 == -12288 &&
-     TUNE_CURVE_FOREST2 == -8192 &&
-     TUNE_CURVE_FOREST3 == -4096 &&
-     TUNE_CURVE_FOREST4 == 0 &&
-     TUNE_CURVE_FOREST5 == 4096 &&
-     TUNE_CURVE_FOREST6 == 8192 &&
-     TUNE_CURVE_FOREST7 == 12288 &&
-     TUNE_CURVE_FOREST8 == 16384 &&
-     TUNE_CURVE_PINE0 == -16384 &&
-     TUNE_CURVE_PINE1 == -12288 &&
-     TUNE_CURVE_PINE2 == -8192 &&
-     TUNE_CURVE_PINE3 == -4096 &&
-     TUNE_CURVE_PINE4 == 0 &&
-     TUNE_CURVE_PINE5 == 4096 &&
-     TUNE_CURVE_PINE6 == 8192 &&
-     TUNE_CURVE_PINE7 == 12288 &&
-     TUNE_CURVE_PINE8 == 16384 &&
-     TUNE_CURVE_MEADOW0 == -16384 &&
-     TUNE_CURVE_MEADOW1 == -12288 &&
-     TUNE_CURVE_MEADOW2 == -8192 &&
-     TUNE_CURVE_MEADOW3 == -4096 &&
-     TUNE_CURVE_MEADOW4 == 0 &&
-     TUNE_CURVE_MEADOW5 == 4096 &&
-     TUNE_CURVE_MEADOW6 == 8192 &&
-     TUNE_CURVE_MEADOW7 == 12288 &&
-     TUNE_CURVE_MEADOW8 == 16384 &&
-     TUNE_CURVE_DESERT0 == -16384 &&
-     TUNE_CURVE_DESERT1 == -12288 &&
-     TUNE_CURVE_DESERT2 == -8192 &&
-     TUNE_CURVE_DESERT3 == -4096 &&
-     TUNE_CURVE_DESERT4 == 0 &&
-     TUNE_CURVE_DESERT5 == 4096 &&
-     TUNE_CURVE_DESERT6 == 8192 &&
-     TUNE_CURVE_DESERT7 == 12288 &&
-     TUNE_CURVE_DESERT8 == 16384);
-
-fn pick9(i : i32, a0 : i32, a1 : i32, a2 : i32, a3 : i32, a4 : i32,
-         a5 : i32, a6 : i32, a7 : i32, a8 : i32) -> i32 {
-  var v = a0;
-  v = select(v, a1, i == 1);
-  v = select(v, a2, i == 2);
-  v = select(v, a3, i == 3);
-  v = select(v, a4, i == 4);
-  v = select(v, a5, i == 5);
-  v = select(v, a6, i == 6);
-  v = select(v, a7, i == 7);
-  v = select(v, a8, i == 8);
-  return v;
+// The four map cells around a column and where the column sits between them:
+// the landform plane's lattice (cell values at cell CENTRES), spelled exactly
+// as mapLandformQ8 spells it, so the curve blends on the same grid the relief
+// it reshapes is drawn on.
+struct BiomeMix {
+  b00 : u32,
+  b10 : u32,
+  b01 : u32,
+  b11 : u32,
+  fx : i32,
+  fz : i32,
+  l : u32,
+};
+fn wmBiomeCellId(cx : i32, cz : i32) -> u32 {
+  let w = i32(worldMap[WM_H_WIDTH]);
+  let h = i32(worldMap[WM_H_HEIGHT]);
+  let c = vec2<i32>(clamp(cx, 0, w - 1), clamp(cz, 0, h - 1));
+  return wmPlaneAt(worldMap[WM_H_BIOME_PLANE], c.x, c.y);
 }
-
-// A SELECT CHAIN, never a runtime-indexed array: CLAUDE.md's note about a
-// dynamic index into a by-value uniform spilling the whole struct to scratch
-// applies to any indexable aggregate, and this is read four times per column.
-fn curveKnot(b : u32, i : i32) -> i32 {
-  let j = clamp(i, 0, CURVE_KNOTS - 1);
-  if (b == B_FOREST) {
-    return pick9(j, TUNE_CURVE_FOREST0, TUNE_CURVE_FOREST1, TUNE_CURVE_FOREST2,
-               TUNE_CURVE_FOREST3, TUNE_CURVE_FOREST4, TUNE_CURVE_FOREST5,
-               TUNE_CURVE_FOREST6, TUNE_CURVE_FOREST7, TUNE_CURVE_FOREST8);
-  }
-  if (b == B_PINE) {
-    return pick9(j, TUNE_CURVE_PINE0, TUNE_CURVE_PINE1, TUNE_CURVE_PINE2,
-               TUNE_CURVE_PINE3, TUNE_CURVE_PINE4, TUNE_CURVE_PINE5,
-               TUNE_CURVE_PINE6, TUNE_CURVE_PINE7, TUNE_CURVE_PINE8);
-  }
-  if (b == B_MEADOW) {
-    return pick9(j, TUNE_CURVE_MEADOW0, TUNE_CURVE_MEADOW1, TUNE_CURVE_MEADOW2,
-               TUNE_CURVE_MEADOW3, TUNE_CURVE_MEADOW4, TUNE_CURVE_MEADOW5,
-               TUNE_CURVE_MEADOW6, TUNE_CURVE_MEADOW7, TUNE_CURVE_MEADOW8);
-  }
-  return pick9(j, TUNE_CURVE_DESERT0, TUNE_CURVE_DESERT1, TUNE_CURVE_DESERT2,
-               TUNE_CURVE_DESERT3, TUNE_CURVE_DESERT4, TUNE_CURVE_DESERT5,
-               TUNE_CURVE_DESERT6, TUNE_CURVE_DESERT7, TUNE_CURVE_DESERT8);
+fn biomeMixAt(x : i32, z : i32) -> BiomeMix {
+  var m : BiomeMix;
+  let l = worldMap[WM_H_CELL_LOG2];
+  let half = 1 << (l - 1u);
+  let mx = x - half + (i32(worldMap[WM_H_ORIGIN_X]) << l);
+  let mz = z - half + (i32(worldMap[WM_H_ORIGIN_Z]) << l);
+  let cx = mx >> l;
+  let cz = mz >> l;
+  let mask = (1 << l) - 1;
+  m.fx = mx & mask;
+  m.fz = mz & mask;
+  m.l = l;
+  m.b00 = wmBiomeCellId(cx, cz);
+  m.b10 = wmBiomeCellId(cx + 1, cz);
+  m.b01 = wmBiomeCellId(cx, cz + 1);
+  m.b11 = wmBiomeCellId(cx + 1, cz + 1);
+  return m;
+}
+fn mixI(m : BiomeMix, v00 : i32, v10 : i32, v01 : i32, v11 : i32) -> i32 {
+  let a = v00 + (((v10 - v00) * m.fx) >> m.l);
+  let b = v01 + (((v11 - v01) * m.fx) >> m.l);
+  return a + (((b - a) * m.fz) >> m.l);
+}
+// A biome record word read as a signed value (the knots are Q14, signed).
+fn wmBiomeI(b : u32, w : u32) -> i32 { return bitcast<i32>(wmBiome(b, w)); }
+fn curveKnotAt(m : BiomeMix, i : i32) -> i32 {
+  let w = WM_B_CURVE_KNOT0 + u32(clamp(i, 0, CURVE_KNOTS - 1));
+  return mixI(m, wmBiomeI(m.b00, w), wmBiomeI(m.b10, w), wmBiomeI(m.b01, w), wmBiomeI(m.b11, w));
+}
+fn curveHi() -> i32 {
+  return max((wmTerrain(WM_H_TERRAIN_LANDFORM_RANGE) + wmTerrain(WM_H_TERRAIN_RANGE_AMPLITUDE)) / 2, 1);
 }
 
 // Fritsch-Carlson, for uniformly spaced knots: the harmonic mean of the two
@@ -665,16 +594,19 @@ fn curveKnot(b : u32, i : i32) -> i32 {
 // both, and an overshoot here is a hill the author did not put there.
 //
 // The multiply is safe in i32 because it only happens when the two secants
-// share a sign: knot values are clamped to +-16384 by LoadTuning, so a secant
+// share a sign: knot values are clamped to +-16384 by the loader, so a secant
 // of +32768 forces its neighbour negative and takes the early return.
 fn curveTangent(dPrev : i32, dNext : i32) -> i32 {
   if (dPrev * dNext <= 0) { return 0; }
   return (2 * dPrev * dNext) / (dPrev + dNext);
 }
 
-// One biome's curve. Returns (value in voxels, d(value)/d(input) in Q8).
-fn curveOne(b : u32, u : i32) -> vec2<i32> {
-  let hi = max(CURVE_HI, 1);
+// The blended curve at a column. Returns (value in voxels, d(value)/d(input)
+// in Q8); BOTH are used -- the slope multiplies the accumulated gradient so
+// the iq attenuation of hill/detail/grain still sees the ground it is actually
+// attenuating against.
+fn curveOne(m : BiomeMix, u : i32) -> vec2<i32> {
+  let hi = curveHi();
   let uc = clamp(u, -hi, hi);
   // Parameter across the eight segments, Q12 within a segment. The identity's
   // value at this parameter is exactly `p - 16384`, which is what (2) above
@@ -682,10 +614,10 @@ fn curveOne(b : u32, u : i32) -> vec2<i32> {
   let p = clamp(((uc + hi) * (CURVE_SEGS << 12)) / (2 * hi), 0, CURVE_SEGS << 12);
   let seg = min(p >> 12, CURVE_SEGS - 1);
   let t = p - (seg << 12);
-  let km = curveKnot(b, seg - 1);
-  let k0 = curveKnot(b, seg);
-  let k1 = curveKnot(b, seg + 1);
-  let k2 = curveKnot(b, seg + 2);
+  let km = curveKnotAt(m, seg - 1);
+  let k0 = curveKnotAt(m, seg);
+  let k1 = curveKnotAt(m, seg + 1);
+  let k2 = curveKnotAt(m, seg + 2);
   let d0 = k1 - k0;
   let m0 = select(curveTangent(k0 - km, d0), d0, seg == 0);
   let m1 = select(curveTangent(d0, k2 - k1), d0, seg == CURVE_SEGS - 1);
@@ -709,49 +641,29 @@ fn curveOne(b : u32, u : i32) -> vec2<i32> {
   return vec2<i32>(uc + (((v - (p - 16384)) * hi) >> 14),
                    clamp(dv >> 4, 0, 4096));
 }
-
-// Which two biomes this column sits between, and how far across. Returns
-// (loBiome, hiBiome, Q8 weight of hi). A hard switch on `biomeFromBand` would
-// put a CLIFF along every biome edge -- the curve is applied to the coarse rungs
-// whose amplitude is 100 m, so two different curves meeting on a contour is a
-// step of tens of voxels, not a texture seam.
-fn curveBiomePair(band : i32) -> vec3<i32> {
-  let hard = i32(biomeFromBand(band));
-  let bw = max(TUNE_BIOME_BLEND, 0);
-  if (bw <= 0) { return vec3<i32>(hard, hard, 0); }
-  // The three boundaries of the band, low side to high side. LoadTuning keeps
-  // the thresholds more than 2*biomeBlend apart, so at most one can be in
-  // range and the order of the tests does not matter.
-  let tm = i32(TUNE_MEADOW_THRESHOLD);   // below it: meadow, above: forest
-  let tp = i32(TUNE_PINE_THRESHOLD);     // below it: forest, above: pine
-  let td = i32(TUNE_DESERT_THRESHOLD);   // below it: pine,   above: desert
-  if (band > tm - bw && band <= tm + bw) {
-    return vec3<i32>(i32(B_MEADOW), i32(B_FOREST),
-                     ((band - (tm - bw)) * 256) / (2 * bw));
-  }
-  if (band > tp - bw && band <= tp + bw) {
-    return vec3<i32>(i32(B_FOREST), i32(B_PINE),
-                     ((band - (tp - bw)) * 256) / (2 * bw));
-  }
-  if (band > td - bw && band <= td + bw) {
-    return vec3<i32>(i32(B_PINE), i32(B_DESERT),
-                     ((band - (td - bw)) * 256) / (2 * bw));
-  }
-  return vec3<i32>(hard, hard, 0);
+fn biomeCurve(m : BiomeMix, u : i32) -> vec2<i32> {
+  if (worldMap[WM_H_BIOME_PLANE] == 0u) { return vec2<i32>(u, 256); }   // no planes: the identity
+  return curveOne(m, u);
 }
-
-// The curve, blended across the biome edge. `u` is the coarse sum; the result
-// is (reshaped sum, Q8 slope) and BOTH are used -- the slope multiplies the
-// accumulated gradient so the iq attenuation of hill/detail/grain still sees
-// the ground it is actually attenuating against.
-fn biomeCurve(x : i32, z : i32, u : i32, seed : u32) -> vec2<i32> {
-  if (CURVE_IDENT_ALL) { return vec2<i32>(u, 256); }
-  let pr = curveBiomePair(biomeBand(x, z, seed));
-  let lo = curveOne(u32(pr.x), u);
-  if (pr.z <= 0) { return lo; }
-  let hg = curveOne(u32(pr.y), u);
-  return vec2<i32>(lo.x + (((hg.x - lo.x) * pr.z) >> 8),
-                   lo.y + (((hg.y - lo.y) * pr.z) >> 8));
+// The three multipliers, blended the same way. 256 = the map's own amplitude.
+struct BiomeRelief {
+  hill : i32,
+  detail : i32,
+  grain : i32,
+};
+fn biomeReliefAt(m : BiomeMix) -> BiomeRelief {
+  var r : BiomeRelief;
+  r.hill = 256;
+  r.detail = 256;
+  r.grain = 256;
+  if (worldMap[WM_H_BIOME_PLANE] == 0u) { return r; }
+  r.hill = mixI(m, wmBiomeI(m.b00, WM_B_HILL_MUL), wmBiomeI(m.b10, WM_B_HILL_MUL),
+                wmBiomeI(m.b01, WM_B_HILL_MUL), wmBiomeI(m.b11, WM_B_HILL_MUL));
+  r.detail = mixI(m, wmBiomeI(m.b00, WM_B_DETAIL_MUL), wmBiomeI(m.b10, WM_B_DETAIL_MUL),
+                  wmBiomeI(m.b01, WM_B_DETAIL_MUL), wmBiomeI(m.b11, WM_B_DETAIL_MUL));
+  r.grain = mixI(m, wmBiomeI(m.b00, WM_B_GRAIN_MUL), wmBiomeI(m.b10, WM_B_GRAIN_MUL),
+                 wmBiomeI(m.b01, WM_B_GRAIN_MUL), wmBiomeI(m.b11, WM_B_GRAIN_MUL));
+  return r;
 }
 
 // MIRROR-BEGIN height
@@ -805,7 +717,7 @@ fn octave(x : i32, z : i32, csl : u32, amp : i32,
   // "unattenuated". ONE divide per octave, which is still fewer than the five
   // the legacy vnoise did per SAMPLE.
   let g = abs(gx) + abs(gz);
-  let att = 65536 / (256 + ((TUNE_FBM_ATTEN * ((g * g) >> 8)) >> 8));
+  let att = 65536 / (256 + ((wmTerrain(WM_H_TERRAIN_FBM_ATTEN) * ((g * g) >> 8)) >> 8));
   var o : Oct;
   o.dev = ((((n.n - 8192) * amp) >> 14) * att) >> 8;
   // dh/dx is (dn/dt * amp) / (2^14 * cell) and Q8 multiplies by 256, so the
@@ -816,14 +728,14 @@ fn octave(x : i32, z : i32, csl : u32, amp : i32,
 }
 
 // The continental rung, FROM THE MAP (P4): where the old o0 octave sampled
-// noise at contLog2, this reads the painted landform plane. contAmplitude
-// keeps its meaning -- the height span the full 0..255 landform range maps
-// to, centred on 128 -- so the knob still says how tall the world is and the
-// map says where. Its own function inside the mirror so the two sides spell
-// the same three lines; the plane readers it calls live outside it.
+// noise, this reads the painted landform plane. map.json terrain
+// .landformRangeVox (WM_H_TERRAIN_LANDFORM_RANGE) is the height span the full
+// 0..255 landform range maps to, centred on 128 -- so the map says how tall
+// the world is AND where. Its own function inside the mirror so the two
+// sides spell the same three lines; the plane readers it calls live outside.
 fn landformOctave(x : i32, z : i32) -> Oct {
   var o : Oct;
-  o.dev = ((mapLandformQ8(x, z) - 32768) * TUNE_CONT_AMPLITUDE) >> 16;
+  o.dev = ((mapLandformQ8(x, z) - 32768) * wmTerrain(WM_H_TERRAIN_LANDFORM_RANGE)) >> 16;
   o.gx = mapLandformGx(x, z);
   o.gz = mapLandformGz(x, z);
   return o;
@@ -836,10 +748,17 @@ fn landAt(x : i32, z : i32, seed : u32) -> Land {
   // everything coarser than it, so the accumulation order below is load-bearing
   // and is written out rather than looped — world.cpp has to mirror it, and a
   // mirror of "whatever the compiler unrolled" is not a mirror.
+  //
+  // EVERY NUMBER IS THE MAP'S (P-G): map.json `terrain` through the worldMap
+  // header (wmTerrain), and the biome's own relief record through the four
+  // map cells around the column (biomeMixAt, read ONCE here and handed to the
+  // curve and the multipliers). Nothing in this function is a tuning knob.
+  let bm = biomeMixAt(x, z);
+  let rl = biomeReliefAt(bm);
   let o0 = landformOctave(x, z);
-  let o1 = octave(x, z, TUNE_RANGE_LOG2,  TUNE_RANGE_AMPLITUDE,
+  let o1 = octave(x, z, wmTerrainU(WM_H_TERRAIN_RANGE_LOG2), wmTerrain(WM_H_TERRAIN_RANGE_AMPLITUDE),
                   o0.gx, o0.gz, seed ^ 2u);
-  // ---- THE PER-BIOME HEIGHT CURVE (13.3.3) ----
+  // ---- THE PER-BIOME HEIGHT CURVE ----
   // HERE, and only here: the two coarse rungs are the landform, and the three
   // fine ones are the texture on it. Reshaping the sum of the coarse pair is
   // what lets a meadow be flat plains and a pine highland be jagged without
@@ -851,18 +770,20 @@ fn landAt(x : i32, z : i32, seed : u32) -> Land {
   // biome that flattened its landform would keep the hill octave attenuated as
   // though the mountains were still there. Identity gives exactly 256, so
   // (g * 256) >> 8 == g and nothing moves.
-  let cv = biomeCurve(x, z, o0.dev + o1.dev, seed);
+  let cv = biomeCurve(bm, o0.dev + o1.dev);
   let g1x = ((o0.gx + o1.gx) * cv.y) >> 8;
   let g1z = ((o0.gz + o1.gz) * cv.y) >> 8;
-  let o2 = octave(x, z, TUNE_HILL_LOG2,   TUNE_HILL_AMPLITUDE,
+  // The three fine rungs, each scaled by the biome's Q8 multiplier (256 = the
+  // map's amplitude; a flatter meadow authors 128 on the hills).
+  let o2 = octave(x, z, wmTerrainU(WM_H_TERRAIN_HILL_LOG2), (wmTerrain(WM_H_TERRAIN_HILL_AMPLITUDE) * rl.hill) >> 8,
                   g1x, g1z, seed ^ 3u);
   let g2x = g1x + o2.gx;
   let g2z = g1z + o2.gz;
-  let o3 = octave(x, z, TUNE_DETAIL_LOG2, TUNE_DETAIL_AMPLITUDE,
+  let o3 = octave(x, z, wmTerrainU(WM_H_TERRAIN_DETAIL_LOG2), (wmTerrain(WM_H_TERRAIN_DETAIL_AMPLITUDE) * rl.detail) >> 8,
                   g2x, g2z, seed ^ 4u);
   let g3x = g2x + o3.gx;
   let g3z = g2z + o3.gz;
-  let o4 = octave(x, z, TUNE_GRAIN_LOG2,  TUNE_GRAIN_AMPLITUDE,
+  let o4 = octave(x, z, wmTerrainU(WM_H_TERRAIN_GRAIN_LOG2), (wmTerrain(WM_H_TERRAIN_GRAIN_AMPLITUDE) * rl.grain) >> 8,
                   g3x, g3z, seed ^ 5u);
 
   // ---- THE CALM HOME AREA ----
@@ -872,7 +793,7 @@ fn landAt(x : i32, z : i32, seed : u32) -> Land {
   // which is not "calm", it is a dinner plate, and it would also make the
   // terrain gate's pass C a test of a constant. The three fine rungs stay at
   // full amplitude, so the home area is rolling country of about the shape the
-  // pre-overhaul world had, sitting at spawnPlainY.
+  // pre-overhaul world had, sitting at terrain.homeArea.y.
   //
   // CHEBYSHEV distance, so no isqrt; a square region has its steepest boundary
   // on the axes and its longest on the diagonal, which is why the gate's A4
@@ -887,19 +808,21 @@ fn landAt(x : i32, z : i32, seed : u32) -> Land {
   // written against that ground (terrain C2, floaters, corpse-burn). Moving
   // the spawn out of the pad must not move the pad's ground with it.
   let sc = spawnCentre();
-  let d = max(abs(x - sc.x), abs(z - sc.y)) - TUNE_SPAWN_PLAIN_R;
+  let fade = wmTerrain(WM_H_TERRAIN_HOME_FADE);
+  let d = max(abs(x - sc.x), abs(z - sc.y)) - wmTerrain(WM_H_TERRAIN_HOME_R);
   var w = 16384;
-  if (d < TUNE_SPAWN_PLAIN_FADE) {
-    w = (max(d, 0) * 16384) / TUNE_SPAWN_PLAIN_FADE;
+  if (d < fade) {
+    w = (max(d, 0) * 16384) / fade;
   }
   let dh = harnessOutside(x, z);
   var wh = 16384;
-  if (dh < TUNE_SPAWN_PLAIN_FADE) {
-    wh = (dh * 16384) / TUNE_SPAWN_PLAIN_FADE;
+  if (dh < fade) {
+    wh = (dh * 16384) / fade;
   }
   let ws = vsmooth(min(w, wh) << 1) >> 1;           // Q14 smoothstep of the ramp
-  let coarse = TUNE_BASE_HEIGHT + cv.x - TUNE_SPAWN_PLAIN_Y;
-  let bed = TUNE_SPAWN_PLAIN_Y + o2.dev + o3.dev + o4.dev
+  let homeY = wmTerrain(WM_H_TERRAIN_HOME_Y);
+  let coarse = wmTerrain(WM_H_TERRAIN_BASE_HEIGHT) + cv.x - homeY;
+  let bed = homeY + o2.dev + o3.dev + o4.dev
           + ((coarse * ws) >> 14);
 
   // ---- THE SEDIMENT WEDGE ----
@@ -939,11 +862,12 @@ fn landAt(x : i32, z : i32, seed : u32) -> Land {
   // Physically it is also the better model in both cases: sediment is what
   // FILLS surface roughness, so roughness must not switch it off.
   let slope = abs(g2x) + abs(g2z);
-  let room = max(0, TUNE_SED_CEIL - bed);
-  var sed = ((room * TUNE_SED_FRACTION) >> 8) - TUNE_SED_STRIP;
-  sed = (max(sed, 0) * max(TUNE_SED_SLOPE - slope, 0)) /
-        max(TUNE_SED_SLOPE, 1);
-  sed = clamp(sed, 0, TUNE_SED_MAX);
+  let room = max(0, wmTerrain(WM_H_TERRAIN_SED_CEIL) - bed);
+  var sed = ((room * wmTerrain(WM_H_TERRAIN_SED_FRACTION)) >> 8) - wmTerrain(WM_H_TERRAIN_SED_STRIP);
+  let sedSlope = wmTerrain(WM_H_TERRAIN_SED_SLOPE);
+  sed = (max(sed, 0) * max(sedSlope - slope, 0)) /
+        max(sedSlope, 1);
+  sed = clamp(sed, 0, wmTerrain(WM_H_TERRAIN_SED_MAX));
   if (bed < seaLevelY()) { sed = 0; }
 
   var l : Land;
@@ -959,15 +883,10 @@ fn baseHeight(x : i32, z : i32, seed : u32) -> i32 {
 // MIRROR-END height
 
 // ---- biome field ----
-// The field and the thresholds moved up above landAt (see `biomeBand` /
-// `biomeFromBand`), because the height curve needs the band's continuous value.
-// Same two noise samples, same shifts, same salts, same thresholds, same order:
-// this is one function split in two, not a new one.
-// Since the world map's P2 the biome is READ FROM THE PAINTED MAP
-// (mapBiomeAt, below the tree atlas block), not derived from the noise band.
-// biomeBand/biomeFromBand and the threshold knobs survive only as inputs to
-// the (identity, compile-time-folded) per-biome height curve until P4 retires
-// that with the landform plane.
+// Since the world map's P2 the biome is READ FROM THE PAINTED MAP (mapBiomeAt,
+// below the tree atlas block). The noise band, its three thresholds and the
+// crossfade the height curve used to key on went with the worldgen.* knobs
+// (P-G): the curve blends on the map's own cells now (biomeMixAt).
 fn biomeAt(x : i32, z : i32, seed : u32) -> u32 {
   return mapBiomeAt(x, z, seed);
 }
@@ -1549,6 +1468,33 @@ const WM_H_SPAWN_X       : u32 = 28u;
 const WM_H_SPAWN_Z       : u32 = 29u;
 const WM_H_POND_TILE     : u32 = 30u;   // P-F: the one pond lattice, voxels; 0 = no water rows
 const WM_H_POND_BAND     : u32 = 31u;   // P-F: the widest shore/berm band any preset asks for
+// ---- THE TERRAIN (P-G): map.json `terrain`, per map (worldmap.h kHTerrain*) ----
+// Read inside the height mirror by name (wmTerrain / wmTerrainU), spelled the
+// same in world.cpp. Voxels at the live voxel size, log2 shifts, Q8 counts.
+const WM_H_TERRAIN_BASE_HEIGHT      : u32 = 32u;
+const WM_H_TERRAIN_LANDFORM_RANGE   : u32 = 33u;
+const WM_H_TERRAIN_RANGE_AMPLITUDE  : u32 = 34u;
+const WM_H_TERRAIN_RANGE_LOG2       : u32 = 35u;
+const WM_H_TERRAIN_HILL_AMPLITUDE   : u32 = 36u;
+const WM_H_TERRAIN_HILL_LOG2        : u32 = 37u;
+const WM_H_TERRAIN_DETAIL_AMPLITUDE : u32 = 38u;
+const WM_H_TERRAIN_DETAIL_LOG2      : u32 = 39u;
+const WM_H_TERRAIN_GRAIN_AMPLITUDE  : u32 = 40u;
+const WM_H_TERRAIN_GRAIN_LOG2       : u32 = 41u;
+const WM_H_TERRAIN_FBM_ATTEN        : u32 = 42u;
+const WM_H_TERRAIN_HOME_Y           : u32 = 43u;
+const WM_H_TERRAIN_HOME_R           : u32 = 44u;
+const WM_H_TERRAIN_HOME_FADE        : u32 = 45u;
+const WM_H_TERRAIN_SED_CEIL         : u32 = 46u;
+const WM_H_TERRAIN_SED_FRACTION     : u32 = 47u;
+const WM_H_TERRAIN_SED_STRIP        : u32 = 48u;
+const WM_H_TERRAIN_SED_SLOPE        : u32 = 49u;
+const WM_H_TERRAIN_SED_MAX          : u32 = 50u;
+const WM_H_TERRAIN_SED_TOPSOIL      : u32 = 51u;
+const WM_H_TERRAIN_TREELINE         : u32 = 52u;
+const WM_H_TERRAIN_REF_VPM          : u32 = 53u;
+fn wmTerrain(w : u32) -> i32 { return bitcast<i32>(worldMap[w]); }
+fn wmTerrainU(w : u32) -> u32 { return worldMap[w]; }
 // the site table (worldmap.h kS_* / kStamp_*)
 const WM_S_WORDS         : u32 = 16u;
 const WM_S_KIND          : u32 = 0u;
@@ -1567,7 +1513,7 @@ const WM_STAMP_NX        : u32 = 0u;
 const WM_STAMP_NY        : u32 = 1u;
 const WM_STAMP_NZ        : u32 = 2u;
 const WM_STAMP_COLUMNS   : u32 = 3u;
-const WM_B_WORDS         : u32 = 32u;
+const WM_B_WORDS         : u32 = 48u;
 const WM_B_SKIN          : u32 = 0u;
 const WM_B_SUBSOIL       : u32 = 1u;
 const WM_B_SKIN_DEPTH    : u32 = 2u;
@@ -1590,6 +1536,13 @@ const WM_B_CAVE_CRYSTAL_CHANCE  : u32 = 18u;
 const WM_B_CACTUS_CHANCE : u32 = 19u;
 const WM_B_SAGUARO_FRACTION : u32 = 20u;
 const WM_B_WATER_OFF     : u32 = 21u;
+// P-G: the biome's terrain record -- nine Q14 relief-curve knots and three Q8
+// multipliers on the map's hill / detail / grain octaves (biomeCurve /
+// biomeReliefAt, blended over the four map cells around a column).
+const WM_B_CURVE_KNOT0   : u32 = 22u;   // ..30u
+const WM_B_HILL_MUL      : u32 = 31u;
+const WM_B_DETAIL_MUL    : u32 = 32u;
+const WM_B_GRAIN_MUL     : u32 = 33u;
 const WM_C_WORDS         : u32 = 12u;
 const WM_C_MAT           : u32 = 0u;
 const WM_C_HEAD          : u32 = 1u;
@@ -1601,6 +1554,8 @@ const WM_C_MAX_SLOPE     : u32 = 6u;
 const WM_C_PATCH_THRESH  : u32 = 7u;
 const WM_C_NEAR_WATER_MAX : u32 = 8u;   // voxels from a pond rim, -1 = unbounded
 const WM_C_NEAR_WATER_MIN : u32 = 9u;   // at least this far from a rim, 0 = off
+const WM_C_CANOPY_MIN    : u32 = 10u;   // P-G: undergrowthSite cover band, 0..255; 0 / 255 = unbounded
+const WM_C_CANOPY_MAX    : u32 = 11u;
 // the biome's water rows (worldmap.h kR_*, P-F): preset, thinning chance on
 // the one pond lattice (Q16), and the row's conditions at the pond centre.
 const WM_R_WORDS         : u32 = 8u;
@@ -1613,6 +1568,7 @@ const WM_R_PATCH_THRESHOLD : u32 = 5u;
 const WM_BF_GROUND_FLORA : u32 = 1u;
 const WM_BF_CACTI        : u32 = 2u;
 const WM_BF_SAND_CAP     : u32 = 4u;
+const WM_BF_CANOPY_ROWS  : u32 = 8u;    // P-G: a cover row bounds the canopy cover; scan the trees once per column
 // the water preset table (worldmap.h kW_* / kP_*): the FLORA half of
 // assets/water/<name>.json (P-E) and, from word 22, the GEOMETRY half (P-F).
 // Depths are voxels of water over the bed, heights cells from the bed
@@ -1936,7 +1892,7 @@ fn mapLandformGx(x : i32, z : i32) -> i32 {
   let cx = (x - half + (i32(worldMap[WM_H_ORIGIN_X]) << l)) >> l;
   let cz = (z - half + (i32(worldMap[WM_H_ORIGIN_Z]) << l)) >> l;
   let d = wmLandformCellQ8(cx + 1, cz) - wmLandformCellQ8(cx, cz);
-  return (d * TUNE_CONT_AMPLITUDE) >> (8u + l);
+  return (d * wmTerrain(WM_H_TERRAIN_LANDFORM_RANGE)) >> (8u + l);
 }
 fn mapLandformGz(x : i32, z : i32) -> i32 {
   if (worldMap[WM_H_LANDFORM_PLANE] == 0u) { return 0; }
@@ -1945,7 +1901,7 @@ fn mapLandformGz(x : i32, z : i32) -> i32 {
   let cx = (x - half + (i32(worldMap[WM_H_ORIGIN_X]) << l)) >> l;
   let cz = (z - half + (i32(worldMap[WM_H_ORIGIN_Z]) << l)) >> l;
   let d = wmLandformCellQ8(cx, cz + 1) - wmLandformCellQ8(cx, cz);
-  return (d * TUNE_CONT_AMPLITUDE) >> (8u + l);
+  return (d * wmTerrain(WM_H_TERRAIN_LANDFORM_RANGE)) >> (8u + l);
 }
 // THE BIOME, from the map: Tier A (the plane) is seed-independent; the
 // boundary warp is Tier B and takes the seed, so a region's EDGE wanders per
@@ -2011,7 +1967,7 @@ fn treeMaxReach() -> i32 { return i32(treeAtlas[TA_H_MAX_REACH]); }
 // trunk can stand on; above it plus the tallest species there is no tree
 // anywhere in the world, at any seed — one compare replaces the whole scan.
 // The HOISTED path does not use this at all: `cands.top` is strictly tighter.
-fn treeMaxTop() -> i32 { return TUNE_TREELINE - 1 + treeMaxAbove(); }
+fn treeMaxTop() -> i32 { return treeline() - 1 + treeMaxAbove(); }
 
 // Per-tile tree descriptor. The FULL form, used by the scans that need a
 // species' metadata (undergrowth cover, the far-field canopy proxy); the
@@ -2149,7 +2105,7 @@ fn treeInfoAt(s : TreeSite, land : Land, seed : u32, ponds : ptr<function, PondS
   let h = land.h;
 
   // No trees on snowfields, in ponds, or over the selftest fixture sites.
-  if (h >= TREELINE) { return t; }
+  if (h >= treeline()) { return t; }
   if (pondCoversP(ponds,t.wx, t.wz)) { return t; }
   // (The spawn clearing is checked AFTER the species draw, where the crown's
   // real width is known — see the note at that test.)
@@ -2614,7 +2570,7 @@ fn cactusInfo(tx : i32, tz : i32, seed : u32, ponds : ptr<function, PondSet>) ->
   if (!wmFlag(cb, WM_BF_CACTI)) { return c; }
   let h = baseHeight(c.wx, c.wz, seed);
   c.base = h;
-  if (h >= TREELINE) { return c; }
+  if (h >= treeline()) { return c; }
   if (siteKeepOut(c.wx, c.wz)) { return c; }
   if (pondCoversP(ponds,c.wx, c.wz)) { return c; }
 
@@ -2814,125 +2770,12 @@ fn cactusAt(x : i32, y : i32, z : i32, seed : u32, ponds : ptr<function, PondSet
 // Everything placed is INERT (rule 2): no reaction in reactions.json uses any
 // of these as `self` with an emit, so a generated forest floor settles and
 // sleeps exactly as the bare one did.
-// ---- meadow flowers: which species, and how tall --------------------------
-// A micro model is ONE world cell, and a cell is VOXEL_METERS = 10 cm. So a
-// single-cell flower is 10 cm tall whatever its model does, and every species
-// is the same height as every other — a "foxglove" (1-2 m in life) came out the
-// same size as clover. That is the tabletop-model-of-itself failure the tree
-// block above documents, in miniature.
-//
-// The fix is the reed pattern: a flower is a STACK of cells, and the model in
-// each cell is the same micro model repeated. Height is per-species (a briar is
-// not a clover) with a per-plant hash jitter on top, so a patch has a natural
-// height spread instead of being a mown lawn of identical stems.
-//
-// flowerSpecies() is the single source of truth for "what grows in this
-// column", called by BOTH the base-cell branch and the upper-stalk branch.
-// Sharing it is what makes a stalk one continuous plant rather than two
-// unrelated halves that happen to be adjacent — the same reason the reed block
-// tests the same hashes above and below the waterline.
-struct Flower {
-  mat    : u32,   // MAT_AIR when this column grows no flower
-  height : i32,   // total cells, >= 1
-};
-
-// Per-species base height in CELLS, jittered per plant. Ranges are chosen
-// against the 10 cm cell: clover is ground cover and stays 1 cell (10 cm),
-// while a foxglove spire reaches 4 (40 cm). These are deliberately at the low
-// end of life-size — a true 1.5 m foxglove is 15 cells, which at meadow density
-// would be a wall of stems the player cannot see over.
-fn flowerHeight(sp : u32, h : u32) -> i32 {
-  switch (sp) {
-    case M_CLOVER:    { return 1; }                        // 10 cm mat
-    case M_BUTTERCUP: { return 2 + i32(h % 2u); }           // 20-30 cm
-    case M_BLUEBELL:  { return 2 + i32(h % 2u); }           // 20-30 cm
-    case M_WILDROSE:  { return 3 + i32(h % 2u); }           // 30-40 cm briar
-    default:          { return 5 + i32(h % 3u); }           // foxglove 50-70 cm
-  }
-}
-
-// Which flower this column grows, and how tall. `cover` is the canopy cover
-// from undergrowthSite (wild rose is a woodland-margin plant, so it is placed
-// by cover rather than by the species field).
-//
-// Pure function of (x, z, seed, cover): the upper-stalk branch re-derives it
-// per cell WITHOUT re-running the 25-tile scan, by passing the cover it already
-// knows is irrelevant there (see the call site) — so a taller flower costs a
-// few hashes per extra cell, never another scan.
-fn flowerAt(x : i32, z : i32, seed : u32, cover : i32) -> Flower {
-  var f : Flower;
-  f.mat = MAT_AIR;
-  f.height = 0;
-  if (!VEGETATION) { return f; }
-
-  let fr = hash3(seed ^ 0xF10Eu, bitcast<u32>(x), bitcast<u32>(z));
-  let clump = vnoise(x, z, 24 * HSCALE, seed ^ 0xF11Eu);
-  let biome = biomeAt(x, z, seed);
-
-  // ---- tall grass stands: the reed-bed of the open meadow ------------------
-  // Checked BEFORE the flower threshold because a stand is dense where flowers
-  // are sparse: up to ~90% of columns in a patch core grow a blade, which no
-  // per-mille flower rate reaches. The patch mask ramps both density and
-  // height from the fringe to the core, so a stand rises out of the lawn as a
-  // dome of blades rather than standing on a hard edge — the same reasoning
-  // as the crown-cover ramp in undergrowthSite. Columns inside a stand that
-  // roll NO blade fall through to the normal grass/flower chain, so a stand
-  // has an understory instead of bare dirt between the stems.
-  if (biome == B_MEADOW) {
-    let tg = vnoise(x + 501, z - 267, 15 * HSCALE, seed ^ 0x7A55u);
-    if (tg > 176) {
-      let hTall = hash3(seed ^ 0x7A56u, bitcast<u32>(x), bitcast<u32>(z));
-      let dens = min(u32(tg - 176) >> 3u, 8u);   // 0..8 in twentieths of columns
-      // % 20, not % 10: half the blades of the first cut (see UG_FERN_CHANCE).
-      if ((hTall % 20u) < dens + 1u) {
-        f.mat = M_TALLGRASS;
-        // 4..8 cells (40-80 cm): the cap ramps with patch depth so the core
-        // of a stand overtops its fringe, and the per-plant jitter under the
-        // cap is what keeps the top ragged — a bed cut to one height reads as
-        // a fence (the cattail block learned this first).
-        let hi = 4 + min((tg - 176) / 12, 4);
-        f.height = 4 + i32((hTall >> 8u) % u32(max(hi - 3, 1)));
-        return f;
-      }
-    }
-  }
-
-  // Per-mille per column; half the first cut (see UG_FERN_CHANCE).
-  var thresh = 0u;
-  if (biome == B_MEADOW) { thresh = select(3u, 30u, clump > 165); }
-  else                   { thresh = select(1u, 8u, clump > 190); }
-  if ((fr % 1000u) >= thresh) { return f; }
-
-  let sp = vnoise(x + 911, z - 733, 40 * HSCALE, seed ^ 0xF1A5u);
-  let spj = sp + (vnoise(x, z, 11 * HSCALE, seed ^ 0xF1A6u) - 128) / 4;
-  let hBell = hash3(seed ^ 0xB1E7u, bitcast<u32>(x), bitcast<u32>(z));
-  let hFoxg = hash3(seed ^ 0xF0C9u, bitcast<u32>(x), bitcast<u32>(z));
-  let hButt = hash3(seed ^ 0x8B77u, bitcast<u32>(x), bitcast<u32>(z));
-  let hClov = hash3(seed ^ 0xC10Fu, bitcast<u32>(x), bitcast<u32>(z));
-  let hRose = hash3(seed ^ 0x8053u, bitcast<u32>(x), bitcast<u32>(z));
-
-  // A lawn tuft is the default: a meadow is grass WITH flowers in it. It used
-  // to be a solid grass or petal cube on the surface, which read as green
-  // gravel; the tuft is one or two cells of short analytic blades.
-  var m = M_GRASS_TUFT;
-  if (spj < 55) {
-    if ((hBell % 3u) == 0u) { m = M_BLUEBELL; }
-  } else if (spj < 100) {
-    if ((hButt % 2u) == 0u) { m = M_BUTTERCUP; }
-  } else if (spj < 140) {
-    if ((hClov % 3u) != 0u) { m = M_CLOVER; }
-  } else if (spj < 175) {
-    if ((hFoxg % 7u) == 0u) { m = M_FOXGLOVE; }
-    else if ((hButt % 3u) == 0u) { m = M_BUTTERCUP; }
-  }
-  if (cover >= UG_COVER_EDGE && (hRose % 9u) == 0u) { m = M_WILDROSE; }
-
-  f.mat = m;
-  // The tuft is one or two cells; the flowers stack by species.
-  if (m == M_GRASS_TUFT) { f.height = 1 + i32((fr >> 13u) & 1u); }
-  else { f.height = flowerHeight(m, hFoxg >> 7u); }
-  return f;
-}
+// (The meadow flower / tall grass species block that stood here -- flowerAt,
+// flowerHeight, the per-mille clump rates -- is COVER ROWS since P-G: each
+// biome's assets/biomes/<name>.json authors its flowers, tall grass (with its
+// head), litter, moss, brambles and saplings as rows with `canopyMin` /
+// `canopyMax` conditions on the cover this function measures, and the
+// env-truth gate asserts every one of them against the page.)
 
 struct Undergrowth {
   cover   : i32,   // 0 = open sky, 255 = deep under a crown
@@ -3274,7 +3117,7 @@ fn plantSiteAt(cx : i32, cz : i32, seed : u32, needCover : bool) -> PlantSite {
   if (!wmFlag(biomeAt(cx, cz, seed), WM_BF_GROUND_FLORA)) { return ps; }
   var L = landColumn(cx, cz, seed);
   ps.h = L.h;
-  if (L.h >= TREELINE || L.pond >= 0 || L.inRim || L.inPoolFloor) { return ps; }
+  if (L.h >= treeline() || L.pond >= 0 || L.inRim || L.inPoolFloor) { return ps; }
   if (L.near.onShore && L.near.past < wmWaterI(L.near.wp, WM_W_SHORE_BAND)) { return ps; }
   let ug = undergrowthSite(cx, cz, seed, &L.ponds);
   if (ug.trunkD2 <= 4) { return ps; }
@@ -3472,7 +3315,7 @@ fn landColumnBare(x : i32, z : i32, seed : u32) -> LandCol {
   // 15 below the plain, with a rim forced 26 above the floor, reproduces the
   // relationship the old numbers had against the old band (floor 15 under the
   // mean, rim 11 over it) at any datum.
-  let poolY = TUNE_SPAWN_PLAIN_Y - vlen(15);
+  let poolY = wmTerrain(WM_H_TERRAIN_HOME_Y) - vlen(15);
   // Water lake at (420,420), ~8.5 m across
   let pdx = x - 420; let pdz = z - 420;
   let pd2 = pdx * pdx + pdz * pdz;
@@ -3658,7 +3501,7 @@ fn genColumn(x : i32, z : i32, seed : u32) -> Col {
   // follows the pond, not the biome's ground-flora flag: an oasis's shore
   // rows show in the desert because the oasis preset authored them.
   if (L.near.onShore && L.near.past < wmWaterI(L.near.wp, WM_W_SHORE_BAND) &&
-      h < TREELINE) {
+      h < treeline()) {
     shore = L.near;
     // A column whose ground stands well above the waterline is a BLUFF, not a
     // shore. This is the single most load-bearing test in the feature, and it
@@ -3728,7 +3571,7 @@ fn genCellIn(col : Col,
              cave : ptr<function, CaveBands>, caveValid : bool,
              trees : ptr<function, TreeCands>, treeValid : bool,
              ponds : ptr<function, PondSet>,
-             stalk : Flower,
+             canopyMemo : i32,
              x : i32, y : i32, z : i32, seed : u32) -> u32 {
   let h = col.h;
   let sed = col.sed;
@@ -3757,7 +3600,7 @@ fn genCellIn(col : Col,
     // That is a rule-2 failure (CLAUDE.md), and it does not report itself here:
     // it reports itself as `ca-skip` finding the world never reaches a quiet
     // tick, three gates away, with no clue as to why.
-    if (!inRim && h >= TREELINE && y > h - 2) {
+    if (!inRim && h >= treeline() && y > h - 2) {
       mat = M_SNOW;                        // snow caps on the high hills
     } else if (inPoolFloor) {
       mat = M_STONE;
@@ -3828,7 +3671,7 @@ fn genCellIn(col : Col,
       // Topsoil first because that is the order a soil profile has, and because
       // gravel is what you want to hit when you dig a valley floor for
       // something that flows.
-      if (y > h - 1 - TUNE_SED_TOPSOIL) { mat = wmBiome(biome, WM_B_SUBSOIL); }
+      if (y > h - 1 - wmTerrain(WM_H_TERRAIN_SED_TOPSOIL)) { mat = wmBiome(biome, WM_B_SUBSOIL); }
       else { mat = M_GRAVEL; }
     } else {
       mat = M_STONE;
@@ -3974,7 +3817,7 @@ fn genCellIn(col : Col,
   // ---- surface cover: trees, then ground flora ----
   // Only above ground and out of the water, and never inside the authored rims
   // (a tree rooted on a pool rim would drop leaves into the pool).
-  if (VEGETATION && mat == MAT_AIR && !inRim && y > h && h < TREELINE && pond < 0) {
+  if (VEGETATION && mat == MAT_AIR && !inRim && y > h && h < treeline() && pond < 0) {
     var tm = MAT_AIR;
     if (treeValid) { tm = treeFromCands(trees, y); }
     else { tm = treeAt(x, y, z, seed, ponds); }
@@ -4046,156 +3889,11 @@ fn genCellIn(col : Col,
   }
 
 
-  if (VEGETATION && mat == MAT_AIR && y == h + 1 && !inRim && pond < 0 && h < TREELINE &&
-      wmFlag(biome, WM_BF_GROUND_FLORA) && !shore.onShore && !siteKeepOut(x, z)) {
-    let fr = hash3(seed ^ 0xF10Eu, bitcast<u32>(x), bitcast<u32>(z));
-    // ONE 25-tile scan answers both "how shaded is this column" and "how far to
-    // the nearest trunk". Calling treeCanopyAt as well would run the identical
-    // scan a second time for a strictly weaker answer.
-    let ug = undergrowthSite(x, z, seed, ponds);
-
-    // SEPARATE HASH SALTS PER SPECIES, never bit-slices of one hash. Slicing
-    // (fr, fr>>3, fr>>17) looks independent and is not — the slices share
-    // entropy, so a column that grew one plant is far more likely than chance
-    // to grow another, and a scattered planting collapses into clumps of
-    // everything-at-once. That is the bug the pond-life block above documents;
-    // it cost that feature a solid wall of stalks. These are the same cost as
-    // the pond block pays: a handful of extra hashes on surface columns only.
-    let hFern  = hash3(seed ^ 0xFE7Au, bitcast<u32>(x), bitcast<u32>(z));
-    let hShroom= hash3(seed ^ 0x5A17u, bitcast<u32>(x), bitcast<u32>(z));
-    let hMoss  = hash3(seed ^ 0x3C0Bu, bitcast<u32>(x), bitcast<u32>(z));
-    let hSap   = hash3(seed ^ 0x9D42u, bitcast<u32>(x), bitcast<u32>(z));
-    let hBram  = hash3(seed ^ 0x61E9u, bitcast<u32>(x), bitcast<u32>(z));
-    let hLit   = hash3(seed ^ 0x0B8Fu, bitcast<u32>(x), bitcast<u32>(z));
-
-    // Patch masks, so undergrowth grows in stands rather than as uniform
-    // static — the same device the flower clump mask uses, and for the same
-    // reason: uniform density at any rate reads as noise, never as a place.
-    // Two independent fields at different scales so a fern bank and a moss
-    // patch are not the same patch wearing different plants.
-    let fernPatch = vnoise(x, z, 20 * HSCALE, seed ^ 0xFE70u);
-    let mossPatch = vnoise(x, z, 14 * HSCALE, seed ^ 0x3C00u);
-
-    // ---- layer 1: under the canopy ----
-    // UG_COVER_MIN is where the crown's shadow is deep enough that the shade
-    // plants win. It sits at the halfway point of the cover ramp so the
-    // transition lands inside the crown rather than exactly on its rim — a
-    // rim-aligned transition draws a visible circle of fern around every tree,
-    // which is the artifact this threshold exists to avoid.
-    if (ug.cover >= UG_COVER_MIN) {
-      // MUSHROOMS AT THE TREE BASE. The single cheapest high-value detail
-      // available here: trunk position is already known from the same scan, so
-      // a ring of fungus around the bole costs one comparison. The ring is an
-      // ANNULUS, not a disc — the trunk itself occupies the middle, and
-      // mushrooms grow on the leaf mould around a bole rather than on the bark.
-      // Radius scales with the tree so a great oak carries a wider ring.
-      let ringOut = UG_SHROOM_RING + i32(ug.rnd >> 28u);
-      // Not around a shrub: a mushroom ring wants a bole and leaf mould, and
-      // `shade == 0` is exactly the species that have neither.
-      let atBase = ug.trunkD2 > 9 && ug.trunkD2 < ringOut * ringOut &&
-                   ug.shade > 0;
-      if (atBase && (hShroom % UG_SHROOM_BASE_CHANCE) == 0u) {
-        // Red fly-agaric is the rarer, showier one; the pale toadstool is the
-        // common ring. Gated on the SAME roll that placed a mushroom at all, so
-        // this only ever picks WHICH mushroom, never adds more of them.
-        mat = select(M_TOADSTOOL, M_MUSHROOM, ((hShroom >> 13u) % 4u) == 0u);
-      } else if ((hBram % UG_BRAMBLE_CHANCE) == 0u && ug.cover < UG_COVER_DEEP) {
-        // (Ferns used to be next in this chain, one cell each. They are TILE
-        // plants now — plantColumnAt — and have already claimed their cells
-        // above, on the same patch mask.)
-        // BRAMBLES want the HALF-lit margin, not the deep shade — they are the
-        // plant of a woodland edge and a light gap. Gating them below
-        // UG_COVER_DEEP is what keeps them out of the darkest interior, where
-        // the fern and moss belong.
-        mat = M_BRAMBLE;
-      } else if ((hMoss % UG_MOSS_CHANCE) == 0u && mossPatch > UG_MOSS_PATCH) {
-        // MOSS: the damp carpet. Its own patch field, so a moss patch and a
-        // fern bank are different places.
-        mat = M_MOSS;
-      } else if ((hSap % UG_SAPLING_CHANCE) == 0u) {
-        // SAPLINGS: deliberately RARE. A seedling every few metres reads as a
-        // nursery, not as a forest; and unlike everything else in this layer a
-        // sapling is a recognisable tree, so the eye finds it. It is also the
-        // one that must never become reactive — a growing sapling is exactly
-        // the "reaction-driven growth" rule 2 forbids.
-        mat = M_SAPLING;
-      } else if ((hLit % UG_LITTER_CHANCE) == 0u) {
-        // LEAF LITTER: the cheapest and commonest cover, one voxel of fallen
-        // leaves and twigs. Last in the chain on purpose — it is the default
-        // floor of a wood, so it fills whatever the plants above did not take.
-        mat = M_LITTER;
-      }
-    } else {
-      // ---- layer 2: the gaps ----
-      // The ORIGINAL grass/flower block, now gated on LOW canopy cover. It was
-      // always meant to be the light-loving layer; it just had nothing to be
-      // the complement of. Its rates are untouched.
-      //
-      // clump mask, species field and per-species rolls all live in flowerAt()
-      // now, because the upper cells of a tall flower have to re-derive exactly
-      // the same answer. Everything the old inline block did is still done, in
-      // the same order, with the same salts and the same rates — see flowerAt.
-      let fl = flowerAt(x, z, seed, ug.cover);
-      if (fl.mat != MAT_AIR) {
-        // The base cell of the plant. Cells 1..height-1 are placed by the
-        // separate stalk branch below, which re-derives this same answer.
-        mat = fl.mat;
-      } else if (ug.cover >= UG_COVER_EDGE &&
-                 (hLit % UG_LITTER_EDGE_CHANCE) == 0u) {
-        // The half-lit margin still gets litter, thinly. Without it the two
-        // layers meet on a hard line — flowers on one side, fern on the other —
-        // and the boundary reads as a seam. A thinning scatter of fallen leaves
-        // reaching a little way out past the crown is what a real canopy edge
-        // looks like, and it costs one more roll on columns that grew nothing.
-        mat = M_LITTER;
-      }
-    }
-  }
-
-  // ---- meadow flowers, cells 2..height: the rest of the stalk ---------------
-  // The block above places only the BASE cell (y == h + 1). A flower taller
-  // than one cell continues here, exactly the way the reed block continues its
-  // stalk above the waterline: same column, same hashes, same species answer,
-  // so the plant is one continuous thing rather than two features that happen
-  // to touch.
-  //
-  // COST. This branch is deliberately NOT part of the block above, because that
-  // block runs undergrowthSite() — the 25-tile scan — and putting the stalk
-  // inside it would multiply the most expensive thing on the surface by the
-  // flower height. Here the scan is replaced by ONE cheap fact: the only
-  // species that needs canopy cover is the wild rose, and cover is a property
-  // of the COLUMN, not of Y. So the stalk asks flowerAt for the species with
-  // cover forced to the edge threshold, and then keeps the answer only if the
-  // base cell agrees — `mat` at the base is already the authority. Concretely:
-  // a column whose base grew a rose regrows a rose here; a column whose base
-  // grew something else regrows that. The one case the shortcut could differ on
-  // (cover below the rose threshold) is the case where flowerAt returns the
-  // non-rose species anyway, because the rose is the LAST override in the
-  // chain — so forcing cover high can only ever ADD a rose to a column that
-  // already rolled `hRose % 9 == 0`, and that column's base grew a rose too.
-  //
-  // Y range is bounded by the tallest flower (FLOWER_MAX_H), so a column pays
-  // at most that many extra evaluations and a settled world still costs nothing
-  // (rule 2 — nothing here is reactive).
-  // `!ruinFloor` for the same reason the base block has it, and it has to be
-  // repeated here rather than inferred: this branch RE-DERIVES the species from
-  // flowerAt instead of reading the base cell, so a guard the base block took
-  // and this one did not would grow a headless stalk out of a stone floor.
-  if (VEGETATION && mat == MAT_AIR && y > h + 1 && y <= h + FLOWER_MAX_H && !inRim && pond < 0 &&
-      h < TREELINE && wmFlag(biome, WM_BF_GROUND_FLORA) && !shore.onShore &&
-      !siteKeepOut(x, z)) {
-    let fl = flowerAt(x, z, seed, UG_COVER_EDGE);
-    if (fl.mat != MAT_AIR && (y - h) <= fl.height) {
-      mat = fl.mat;
-      // Tall grass caps its stack with the head material — dried tips at the
-      // per-plant height, the way cattail_head caps the cattail stalk. Only
-      // the terminal cell: heights start at 4, so the base block below never
-      // needs the same test.
-      if (fl.mat == M_TALLGRASS && (y - h) == fl.height) {
-        mat = M_TALLGRASS_HEAD;
-      }
-    }
-  }
+  // (The canopy-inverted undergrowth / flower chain that stood here -- the
+  // mushroom ring, brambles, moss, saplings and litter under the crowns, the
+  // flowers, tall grass and edge litter in the gaps -- is the biome's own
+  // COVER STACK below since P-G: rows with canopyMin / canopyMax conditions,
+  // authored in assets/biomes/<name>.json and asserted by the env-truth gate.)
 
   // ---- DESERT: cacti, then the scrub-and-tussock floor ----------------------
   // The desert generated as bare sand with an occasional dead bush, and the
@@ -4219,7 +3917,7 @@ fn genCellIn(col : Col,
   // enforces them at the SITE (so a column rooted outside cannot lean back in),
   // and the ground block re-tests them per column.
   if (VEGETATION && mat == MAT_AIR && wmFlag(biome, WM_BF_CACTI) && !inRim && y > h && pond < 0 &&
-      h < TREELINE) {
+      h < treeline()) {
     let cm = cactusAt(x, y, z, seed, ponds);
     if (cm != MAT_AIR) { mat = cm; }
   }
@@ -4244,17 +3942,35 @@ fn genCellIn(col : Col,
   // until a hit; a biome with no rows pays one header read. Everything placed
   // is inert (rule 2): the loader resolves names against materials.json and
   // nothing here is a stem/sprout/seed.
-  if (VEGETATION && mat == MAT_AIR && y > h && !inRim && pond < 0 && h < TREELINE &&
+  //
+  // NO TREELINE GATE (P-G): a row's own minY / maxY is its altitude band, and
+  // the snowline is a per-map number -- the alpine cushion above it is an
+  // `alpine_cushion` row with `minY` at the treeline, not a block of its own.
+  //
+  // THE CANOPY CONDITION (P-G): rows may bound undergrowthSite's cover
+  // (WM_C_CANOPY_MIN / MAX), which is what the hard-coded undergrowth /
+  // flower chain became. The 25-tile scan runs ONCE PER COLUMN, and only for
+  // a biome that authors such a row (WM_BF_CANOPY_ROWS): genChunk hands the
+  // column's answer in as `canopyMemo` (the far cascade's single-cell callers
+  // pass -1 and pay the scan here, once, for the surface cell they ask for).
+  if (VEGETATION && mat == MAT_AIR && y > h && !inRim && pond < 0 &&
       !siteKeepOut(x, z)) {
     let up = y - h;
     let nRows = wmBiome(biome, WM_B_COVER_COUNT);
     let bThresh = i32(wmBiome(biome, WM_B_PATCH_THRESH));
     let pLog2 = wmBiome(biome, WM_B_PATCH_LOG2);
+    var canopy = canopyMemo;
+    if (canopy < 0 && wmFlag(biome, WM_BF_CANOPY_ROWS)) {
+      canopy = undergrowthSite(x, z, seed, ponds).cover;
+    }
     for (var i = 0u; i < nRows; i++) {
       let chance = wmCover(biome, i, WM_C_CHANCE);
       if (chance == 0u) { continue; }
       let hRow = hash3(seed ^ (0xC0E0u + i * 0x9E37u), bitcast<u32>(x), bitcast<u32>(z));
       if ((hRow % chance) != 0u) { continue; }
+      let cMin = i32(wmCover(biome, i, WM_C_CANOPY_MIN));
+      let cMax = i32(wmCover(biome, i, WM_C_CANOPY_MAX));
+      if (max(canopy, 0) < cMin || max(canopy, 0) > cMax) { continue; }
       // Conditions: altitude band, steepness and water distance, per row,
       // like a species'. One compare each on the column's own numbers; the
       // water distance is the one that costs a lookup (waterDistAt, up to
@@ -4290,37 +4006,10 @@ fn genCellIn(col : Col,
     }
   }
 
-  // ---- SNOWLINE: hardy alpine cushions above the treeline -------------------
-  // Everything else in this file stops at TREELINE (`h < TREELINE` gates the
-  // trees, the flowers, the undergrowth and both blocks above), which left the
-  // high ridges as pure bare snow — correct, and completely dead.
-  //
-  // ONE species, DELIBERATELY SPARSE. The point of the alpine band is that it
-  // reads as harsh, so what goes up there is a scatter of cushions clinging on,
-  // not a planted ridge. TUNE_ALPINE_CHANCE defaults to the sparsest density in
-  // worldgen for exactly that reason, and making it generous is the one change
-  // that undoes the intent of the whole band.
-  //
-  // This is the ONE cover block gated on `h >= TREELINE` rather than
-  // `h < TREELINE`, which is also why it cannot collide with any of them: no
-  // column satisfies both.
-  //
-  // The same material doubles as the lichen crust on exposed rock. At this scale
-  // a cushion plant and a lichen mat are the same object — a couple of
-  // centimetres of growth pressed flat against the ground — so rather than spend
-  // a material id on the distinction, the ground under it makes it: on snow the
-  // cell reads as a cushion, on wind-scoured stone as lichen.
-  if (VEGETATION && mat == MAT_AIR && y == h + 1 && h >= TREELINE && !inRim && pond < 0 &&
-      !siteKeepOut(x, z)) {
-    let hAlp = hash3(seed ^ 0xA1F1u, bitcast<u32>(x), bitcast<u32>(z));
-    // A patch mask here too, but a WEAK one: alpine plants really do grow in
-    // scattered colonies wherever the wind lets them, so the mask only thins the
-    // most exposed ground rather than carving the band into stands.
-    let cover = vnoise(x - 1103, z + 977, 26 * HSCALE, seed ^ 0xA1F2u);
-    if (cover > 96 && (hAlp % TUNE_ALPINE_CHANCE) == 0u) {
-      mat = M_CUSHION;
-    }
-  }
+  // (The snowline block -- alpine cushions above the treeline at a hard-coded
+  // 1-in-N -- is an `alpine_cushion` cover row with `minY` at the treeline in
+  // the alpine and tundra biomes since P-G. The cover stack has no treeline
+  // gate any more, so the row reaches the snow.)
 
   // Reactive seeds are deliberately NOT scattered by worldgen any more.
   //
@@ -4387,12 +4076,9 @@ fn genCellIn(col : Col,
 fn genCell(c : vec3<i32>, seed : u32) -> u32 {
   var cave : CaveBands;
   var trees : TreeCands;
-  var noStalk : Flower;
-  noStalk.mat = MAT_AIR;
-  noStalk.height = -1;   // "not memoized"; see the stalk block in genCellIn
   var ponds = pondScan(c.x, c.z, seed);
   return genCellIn(genColumn(c.x, c.z, seed), &cave, false, &trees, false, &ponds,
-                   noStalk, c.x, c.y, c.z, seed);
+                   -1, c.x, c.y, c.z, seed);
 }
 
 // The same, for a caller that ALREADY has the column. The far cascade sampler
@@ -4406,11 +4092,8 @@ fn genCell(c : vec3<i32>, seed : u32) -> u32 {
 fn genCellCol(col : Col, c : vec3<i32>, seed : u32) -> u32 {
   var cave : CaveBands;
   var trees : TreeCands;
-  var noStalk : Flower;
-  noStalk.mat = MAT_AIR;
-  noStalk.height = -1;   // "not memoized"; see the stalk block in genCellIn
   var ponds = pondScan(c.x, c.z, seed);
-  return genCellIn(col, &cave, false, &trees, false, &ponds, noStalk,
+  return genCellIn(col, &cave, false, &trees, false, &ponds, -1,
                    c.x, c.y, c.z, seed);
 }
 
@@ -4801,23 +4484,21 @@ fn genChunk(slot : u32, li : u32, actIdx : u32) {
       continue;
     }
 
-    // The upper-stalk flower answer, once per column instead of once per cell
-    // of the FLOWER_MAX_H band. Every term of the guard below is a property of
-    // the COLUMN — it is genCellIn's own guard for that block with the two
-    // y tests replaced by "does this chunk's 16-cell stack reach the band at
-    // all", which is the only part of it that is not column-invariant.
-    let stalkValid = !col.inRim && col.pond < 0 &&
-                     col.h < TREELINE && wmFlag(col.biome, WM_BF_GROUND_FLORA) &&
-                     !col.shore.onShore && !siteKeepOut(wx, wz) &&
-                     base.y + i32(CHUNK) > col.h + 1 &&
-                     base.y <= col.h + FLOWER_MAX_H;
-    var stalk : Flower;
-    stalk.mat = MAT_AIR;
-    stalk.height = -1;     // the "nobody memoized this" sentinel
-    if (stalkValid) { stalk = flowerAt(wx, wz, T.seed, UG_COVER_EDGE); }
+    // The column's CANOPY COVER, once per column instead of once per cell of
+    // the cover band (P-G): the 25-tile scan behind the cover rows'
+    // canopyMin / canopyMax conditions. Every term of the guard is a property
+    // of the COLUMN -- the cover stack's own guard with the y test replaced by
+    // "does this chunk's 16-cell stack reach the band at all". -1 = not
+    // computed; genCellIn scans on demand.
+    var canopy = -1;
+    if (wmFlag(col.biome, WM_BF_CANOPY_ROWS) && !col.inRim && col.pond < 0 &&
+        !siteKeepOut(wx, wz) &&
+        base.y + i32(CHUNK) > col.h + 1 && base.y <= col.h + skyMargin) {
+      canopy = undergrowthSite(wx, wz, T.seed, &ponds).cover;
+    }
     for (var ly = unrollFenceU(); ly < CHUNK; ly += 1u) {
       let i = lx + ly * CHUNK + lz * CHUNK * CHUNK;
-      let w = genCellIn(col, &cave, caveValid, &trees, true, &ponds, stalk,
+      let w = genCellIn(col, &cave, caveValid, &trees, true, &ponds, canopy,
                         wx, base.y + i32(ly), wz, T.seed);
       // Chunk-linear: the slot's page resolved once, per §2.1's second entry
       // point. genChunk overwrites the WHOLE chunk, so the CPU materializes

@@ -1,11 +1,15 @@
 # PLAN: the Environment tab is the truth about the world
 
-Status: IN PROGRESS. Supersedes `PLAN_biomes.md` §5 (the wiring order) and
-closes the follow-up list in `PLAN_world_map.md`. **Landed:** P-A, P-B, P-C
-(2026-09-04), P-D, P-E (2026-09-05), P-F (2026-09-06: lakes are map content,
-presets carve the bowl). **Open:** P-G, P-H, P-I, run in that order as one
-worktree + one rebaseline each, under the §5 brief below (owner, 2026-09-05),
-which widens P-F and P-G so the map — not tuning — is the whole environment.
+Status: LANDED, all packages. Supersedes `PLAN_biomes.md` §5 (the wiring
+order) and closes the follow-up list in `PLAN_world_map.md`. **Landed:** P-A,
+P-B, P-C (2026-09-04), P-D, P-E, P-H (2026-09-05), P-F (2026-09-06: lakes are
+map content, presets carve the bowl), **P-G and P-I (2026-09-07, branch
+`env-pg-pi`, one worktree + one rebaseline: the terrain is authored on the
+map, the biomes carry their relief, the flora chain is rows, the Worldgen
+tab is gone and Environment → World map is the one front door)** — under the
+§5 brief below (owner, 2026-09-05), which widened P-F and P-G so the map — not
+tuning — is the whole environment. As-built deviations are recorded under
+each package.
 
 ## 0. Why edits do not show today (measured on main 482b756)
 
@@ -343,7 +347,78 @@ widened by §5. As built:
   floor is what the fixtures were written against (a `spawn_lake` preset
   with the same numbers exists for the day it becomes a site).
 
-### P-G  Terrain per biome and per map
+### P-G  Terrain per biome and per map — LANDED 2026-09-07
+
+As built (branch `env-pg-pi`), against the §5 brief:
+
+- **Per map:** `map.json terrain` carries `refVoxelsPerMetre`, `baseHeight`,
+  `landformRangeVox` (the old `contAmplitude`: what a painted 0..255 spans),
+  the four seeded octaves (`range/hill/detail/grain` `Amplitude` + `Log2`),
+  `fbmAtten`, `homeArea {y, radius, fade}` (the old `spawnPlain*`), the six
+  `sed*` words and `treeline`. Packed as header words `kHTerrainBaseHeight`..
+  `kHTerrainRefVpm` (32..53; `kHeaderWords` 64), read by name inside the
+  height mirror on both sides (`wmTerrain` / `wmTerrainU`, token-identical),
+  rescaled from `refVoxelsPerMetre` at load exactly as `LoadTuning` rescaled
+  the rows. `refVoxelsPerMetre` is ALSO the prelude constant
+  `REF_VOXELS_PER_METRE` (the shader's `vlen()` divides module-scope consts
+  by it), mirrored by `scripts/map_terrain.py` for `check_shaders.sh`, and
+  `Simulation::UploadEnvironment` recompiles when a reload moves it.
+  **Deviation:** there is no `contAmplitude`/`contLog2` pair beside
+  `landformRangeVox` — the painted plane has been the continental rung since
+  P4, so a continental NOISE octave would have been a new feature, not a
+  moved knob; the brief's "five octaves" are the plane plus four.
+  `scripts/seed_worldmap.py` and `scripts/seed_terrain_rows.py` write the
+  same defaults.
+- **Per biome:** `terrain.curve[9]` (Q14) and `terrain.hill/detail/grain`
+  (Q8) replace `terrain.overrides` and the 36 curve knobs; packed as
+  `kB_CurveKnot0..kB_GrainMul` (`kBiomeRecWords` 32 → 48), read through
+  `biomeMixAt` / `curveKnotAt` / `biomeReliefAt` — **bilinear over the four
+  map cells around the column**, the landform plane's own lattice, so two
+  biomes' curves crossfade over a whole cell and the old `biomeBlend`
+  ceiling is moot. Table reads, never constants: `CURVE_IDENT_ALL` and the
+  36-constant select chain are gone, and the identity is still bit-exact
+  (four equal knots mix to the knot). One `biomeMixAt` per column, handed to
+  both readers; the `terrain` gate's C1 passes 9,409/9,409.
+- **Landform sites, Tier A:** `{kind: "landform", shape: peak | ridge |
+  basin | plateau, at, radius, heightVox, rotation?}`, overlaid onto the
+  packed plane at load by `OverlayLandformSites` (cone / elliptical ridge at
+  a heading, a third as wide as long / sunk cone / flat top inside 60 %,
+  ramped out; units `landformRangeVox / 256` voxels each). Not in the site
+  table, never in the mirror. The shipped map declares `east_range`.
+- **Deleted:** every `worldgen.*` row — the 68 knobs listed in §5 including
+  the seven dead ones — from `tuning_params.def`, `tuning.h`, `LoadTuning`,
+  `tuning.json`, `tuner_schema.js`, the regenerated `tuning_prelude.py`;
+  `WorldgenDefaultsJson`, `--dump-tuning-defaults` and `/api/tuning-defaults`
+  with them, and `check_invariants.py`'s `wgunits` / `wgdefaults` checks.
+  `vegetation` is `debug.vegetation` (Tuning → Dev switches); `mapLayer` /
+  `editLayer` are `world.*`. The alpine block and its `alpineChance` are an
+  `alpine_cushion` row with `minY` at the treeline in alpine and tundra; the
+  cover stack's `h < TREELINE` gate is dropped and every seeded row carries
+  `maxY 227` so the snowline stays bare by data, not by code.
+- **env-truth finding 1:** the undergrowth / flower chain is cover rows with
+  `canopyMin` / `canopyMax` (`kC_CanopyMin/Max`, words 10..11): the shade set
+  at `canopyMin 96`, edge litter and the rose at `40..95`, gap flowers at
+  `canopyMax 95`, seeded at the chain's rates in front of each ground-flora
+  biome's own rows (they rolled first). `undergrowthSite` runs once per
+  column only where a row bounds the canopy (`kBF_CanopyRows`), memoised
+  into `genCellIn` where the flower stalk used to be. The gate asserts every
+  biome's rows; a canopy row is an interval (hi only) like a nearWater row;
+  the tile plants (`fern`, `mushroom_large`) and the proc cactus are the two
+  second sources left, reported, and tile-plant cells no row names are a
+  `tilePlant` bucket beside `unauthored`. `flowerAt`, `flowerHeight` and the
+  `UG_*` chain densities are deleted from the shader.
+- **env-truth finding 2:** the species caps moved up — every
+  `placement.minY/maxY` is −1 (they were 20–23 m, authored for a y32..y86
+  world) and the atlas is re-baked (`scripts/bake_trees.mjs`; the band is a
+  `.svtree` header word). The treeline is the cap; per-biome bands are the
+  biome rows' conditions, all −1 today.
+- **Map page:** a Terrain section (every per-map number, live), the
+  `--heightmap` backdrop over the whole saved map (Heights button), a
+  Landform tool (place / drag / shift-delete, a new-site panel for shape /
+  radius / height / heading) and the Sites panel below. `envlive.js` lists
+  every `terrain.*` field as read.
+
+What the plan said:
 
 - The per-biome relief curves (`curve<Biome>0..8`, four biomes × 9 knots,
   36 knobs) become `terrain.curve[9]` in each biome file; `terrain.
@@ -440,9 +515,26 @@ What it found, which is the point of a gate like this:
 4. Water bodies per km² is P-F's row (`TODO(P-F)` in the table): there is
    no per-biome pond table to measure against yet.
 
-### P-I  The Worldgen tab is deleted
+### P-I  The Worldgen tab is deleted — LANDED 2026-09-07
 
-After P-D..P-G nothing in `worldgen.*` is per-biome or per-map. What is left
+As built (branch `env-pg-pi`): the tab button and `#view-worldgen` are gone;
+the heightmap + voxel views' markup and glue stay in `tuner.html` as a hidden
+`#wgPreviewHost` that the World map page ADOPTS as its preview pane (`Show
+preview`; `?tab=environment&voxels=1` still opens the voxel view), with the
+one-click Vegetation switch beside the pane's regen note. `renderWorldgen`,
+the tuning-row column, `wgResetToDefaults` and `/api/tuning-defaults` are
+deleted. Environment → World map is the one entry: map + edits selectors
+(`world.mapLayer` / `world.editLayer` through the host's tuning, saved with
+Ctrl+S), the Terrain section, the Sites panel (pad / spawn / water / landform
+/ stamp: select / rename / delete, a per-kind panel), and the previews. The
+sidebar's Caves and Ground cover knob pages went with the group; the biome
+page's dead band strip is the Relief section. `tuning.json worldgen` is gone
+(`world` + `debug` remain); `check_invariants.py` lost `wgunits` /
+`wgdefaults`. F7 still means reload + regen and the game still prints
+`environment: map <name> <hash> | biomes | trees`; `check_worldview.sh` and
+`test_environment.mjs` pass; `environment_test.html` asserts the new pages.
+
+What the plan said: after P-D..P-G nothing in `worldgen.*` is per-biome or per-map. What is left
 (`mapLayer`, `editLayer`) moves to the World map page's map selector. The
 tab's heightmap and voxel views move to the World map page as the preview
 pane (they are previews, not authoring). `tuning.json worldgen` is empty and

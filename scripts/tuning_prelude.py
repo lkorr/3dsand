@@ -420,93 +420,10 @@ SPEC = [
     ("sim", "windEntrainRate", "TUNE_WIND_ENTRAIN_RATE", "f", 6.0),
     ("sim", "currentDrag", "TUNE_CURRENT_DRAG", "f", 6.0),
 
-    # worldgen (integer; needs a world regen to take effect)
-    ("worldgen", "refVoxelsPerMetre", "TUNE_REF_VOXELS_PER_METRE", "i", 10),
-    ("worldgen", "vegetation", "TUNE_VEGETATION", "u", 1),
-    ("worldgen", "treeline", "TUNE_TREELINE", "i", 228),
-    ("worldgen", "baseHeight", "TUNE_BASE_HEIGHT", "i", 200),
-    ("worldgen", "contAmplitude", "TUNE_CONT_AMPLITUDE", "i", 1024),
-    ("worldgen", "contLog2", "TUNE_CONT_LOG2", "u", 11),
-    ("worldgen", "rangeAmplitude", "TUNE_RANGE_AMPLITUDE", "i", 256),
-    ("worldgen", "rangeLog2", "TUNE_RANGE_LOG2", "u", 9),
-    ("worldgen", "hillAmplitude", "TUNE_HILL_AMPLITUDE", "i", 64),
-    ("worldgen", "hillLog2", "TUNE_HILL_LOG2", "u", 7),
-    ("worldgen", "detailAmplitude", "TUNE_DETAIL_AMPLITUDE", "i", 16),
-    ("worldgen", "detailLog2", "TUNE_DETAIL_LOG2", "u", 5),
-    ("worldgen", "grainAmplitude", "TUNE_GRAIN_AMPLITUDE", "i", 4),
-    ("worldgen", "grainLog2", "TUNE_GRAIN_LOG2", "u", 3),
-    ("worldgen", "fbmAtten", "TUNE_FBM_ATTEN", "i", 256),
-    ("worldgen", "spawnPlainY", "TUNE_SPAWN_PLAIN_Y", "i", 200),
-    ("worldgen", "spawnPlainR", "TUNE_SPAWN_PLAIN_R", "i", 320),
-    ("worldgen", "spawnPlainFade", "TUNE_SPAWN_PLAIN_FADE", "i", 2048),
-    ("worldgen", "sedCeil", "TUNE_SED_CEIL", "i", 264),
-    ("worldgen", "sedFraction", "TUNE_SED_FRACTION", "i", 64),
-    ("worldgen", "sedStrip", "TUNE_SED_STRIP", "i", 6),
-    ("worldgen", "sedSlope", "TUNE_SED_SLOPE", "i", 96),
-    ("worldgen", "sedMax", "TUNE_SED_MAX", "i", 32),
-    ("worldgen", "sedTopsoil", "TUNE_SED_TOPSOIL", "i", 4),
-    ("worldgen", "biomeLog2", "TUNE_BIOME_LOG2", "u", 9),
-    ("worldgen", "desertThreshold", "TUNE_DESERT_THRESHOLD", "u", 214),
-    ("worldgen", "pineThreshold", "TUNE_PINE_THRESHOLD", "u", 176),
-    ("worldgen", "meadowThreshold", "TUNE_MEADOW_THRESHOLD", "u", 92),
+    # worldgen: NOT KNOBS ANY MORE (P-G, docs/PLAN_environment_truth.md)
 
-    # per-biome height curves (13.3.3)
-
-    # THE CEILING ON HOW FAR TWO ADJACENT BIOMES MAY DIFFER
-
-    # AND WHY THE SHIPPED SET IS STILL THE IDENTITY
-    ("worldgen", "curveForest0", "TUNE_CURVE_FOREST0", "i", -16384),
-    ("worldgen", "curveForest1", "TUNE_CURVE_FOREST1", "i", -12288),
-    ("worldgen", "curveForest2", "TUNE_CURVE_FOREST2", "i", -8192),
-    ("worldgen", "curveForest3", "TUNE_CURVE_FOREST3", "i", -4096),
-    ("worldgen", "curveForest4", "TUNE_CURVE_FOREST4", "i", 0),
-    ("worldgen", "curveForest5", "TUNE_CURVE_FOREST5", "i", 4096),
-    ("worldgen", "curveForest6", "TUNE_CURVE_FOREST6", "i", 8192),
-    ("worldgen", "curveForest7", "TUNE_CURVE_FOREST7", "i", 12288),
-    ("worldgen", "curveForest8", "TUNE_CURVE_FOREST8", "i", 16384),
-    ("worldgen", "curvePine0", "TUNE_CURVE_PINE0", "i", -16384),
-    ("worldgen", "curvePine1", "TUNE_CURVE_PINE1", "i", -12288),
-    ("worldgen", "curvePine2", "TUNE_CURVE_PINE2", "i", -8192),
-    ("worldgen", "curvePine3", "TUNE_CURVE_PINE3", "i", -4096),
-    ("worldgen", "curvePine4", "TUNE_CURVE_PINE4", "i", 0),
-    ("worldgen", "curvePine5", "TUNE_CURVE_PINE5", "i", 4096),
-    ("worldgen", "curvePine6", "TUNE_CURVE_PINE6", "i", 8192),
-    ("worldgen", "curvePine7", "TUNE_CURVE_PINE7", "i", 12288),
-    ("worldgen", "curvePine8", "TUNE_CURVE_PINE8", "i", 16384),
-    ("worldgen", "curveMeadow0", "TUNE_CURVE_MEADOW0", "i", -16384),
-    ("worldgen", "curveMeadow1", "TUNE_CURVE_MEADOW1", "i", -12288),
-    ("worldgen", "curveMeadow2", "TUNE_CURVE_MEADOW2", "i", -8192),
-    ("worldgen", "curveMeadow3", "TUNE_CURVE_MEADOW3", "i", -4096),
-    ("worldgen", "curveMeadow4", "TUNE_CURVE_MEADOW4", "i", 0),
-    ("worldgen", "curveMeadow5", "TUNE_CURVE_MEADOW5", "i", 4096),
-    ("worldgen", "curveMeadow6", "TUNE_CURVE_MEADOW6", "i", 8192),
-    ("worldgen", "curveMeadow7", "TUNE_CURVE_MEADOW7", "i", 12288),
-    ("worldgen", "curveMeadow8", "TUNE_CURVE_MEADOW8", "i", 16384),
-    ("worldgen", "curveDesert0", "TUNE_CURVE_DESERT0", "i", -16384),
-    ("worldgen", "curveDesert1", "TUNE_CURVE_DESERT1", "i", -12288),
-    ("worldgen", "curveDesert2", "TUNE_CURVE_DESERT2", "i", -8192),
-    ("worldgen", "curveDesert3", "TUNE_CURVE_DESERT3", "i", -4096),
-    ("worldgen", "curveDesert4", "TUNE_CURVE_DESERT4", "i", 0),
-    ("worldgen", "curveDesert5", "TUNE_CURVE_DESERT5", "i", 4096),
-    ("worldgen", "curveDesert6", "TUNE_CURVE_DESERT6", "i", 8192),
-    ("worldgen", "curveDesert7", "TUNE_CURVE_DESERT7", "i", 12288),
-    ("worldgen", "curveDesert8", "TUNE_CURVE_DESERT8", "i", 16384),
-    ("worldgen", "biomeBlend", "TUNE_BIOME_BLEND", "i", 18),
-
-    # ponds and shores: NOT KNOBS ANY MORE (P-F)
-
-    # pond life: lilypads, reeds, kelp
-
-    # vines / climbers / hanging moss (worldgen agent B)
-
-    # desert / pine highland / alpine ground cover (worldgen agent E)
-    ("worldgen", "alpineChance", "TUNE_ALPINE_CHANCE", "u", 40),
-
-    # ruin pads (13.3.2)
-
-    # cave flora + the shaded face (13.3.4)
-    ("worldgen", "caveThreshold1", "TUNE_CAVE_THRESHOLD1", "u", 150),
-    ("worldgen", "caveThreshold2", "TUNE_CAVE_THRESHOLD2", "u", 148),
+    # debug
+    ("debug", "vegetation", "TUNE_VEGETATION", "u", 1),
 
     # oil / petroleum-like viscous liquids (shadeViscous)
     ("render", "oilSatLow", "TUNE_OIL_SAT_LOW", "f", 0.5),
