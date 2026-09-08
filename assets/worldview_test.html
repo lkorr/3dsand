@@ -25,7 +25,10 @@ function done(){
 (async function(){
   try {
     var cv = document.getElementById('cv');
-    var wv = new WorldView(cv, {seaY: 1024});
+    // seaY / the camera default follow the world datum (map.json terrain
+    // .baseHeight 200 since the terrain overhaul): a camera parked at the
+    // pre-overhaul y1080 streamed two empty shells and read nothing.
+    var wv = new WorldView(cv, {seaY: 200});
     say(true, 'WebGL2 context + programs built');
 
     var r = await fetch('/api/voxpalette');
@@ -44,7 +47,7 @@ function done(){
     var num = function (k, d) { var v = parseFloat(Q.get(k)); return isFinite(v) ? v : d; };
     wv.seed = num('seed', 1337);
     wv.cam.mode = 'fly';
-    wv.cam.pos = [num('x', 32), num('y', 1080), num('z', -40)];
+    wv.cam.pos = [num('x', 32), num('y', 260), num('z', -40)];
     wv.cam.yaw = num('yaw', 0); wv.cam.pitch = num('pitch', -0.5);
     wv.view.levels = num('levels', 2);
     wv.view.showRegions = Q.get('lod') === '1';
