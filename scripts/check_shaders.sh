@@ -474,6 +474,103 @@ fn ptTick() -> u32 { return ${u}.tick; }"
 done
 
 # ---------------------------------------------------------------------------
+# THE RAYMARCH'S SPECIALIZED VARIANT (W2-A).
+#
+# raymarch.wgsl declares three `const SPEC_* : bool = true;` lines and the
+# engine compiles a SECOND pipeline from the same assembled source with those
+# three flipped to `false` (Simulation::BuildRaymarchVariant). Two things have
+# to be true and neither is checked by validating the shipped spelling alone:
+#
+#   1. THE LEAN SPELLING MUST COMPILE. Dead code is still type-checked, and a
+#      `const false` arm that references a variable only the live arm declares
+#      is a real error nobody would see until a cold pipeline build.
+#   2. THE SUBSTITUTION MUST STILL MATCH. It is a string replacement on exact
+#      source lines; reformatting one of them (`= true ;`, a line break) turns
+#      the specialization silently into a second copy of the universal shader
+#      that nothing would ever report. So the substitution is performed HERE by
+#      the same three literals, and a miss is a hard failure.
+#
+# The SPIR-V instruction counts printed below are the size of what the
+# specialization removes, measured without a GPU: they are the cheap standing
+# answer to "is this variant worth a pipeline?".
+RAY_COMBINED="$TMP/raymarch.wgsl"
+if [ -f "$RAY_COMBINED" ]; then
+  RAY_LEAN="$TMP/raymarch_lean.wgsl"
+  cp "$RAY_COMBINED" "$RAY_LEAN"
+  specMiss=0
+  for k in SPEC_FLUID SPEC_DEBUG_VIZ SPEC_SHORT_RANGE; do
+    if ! grep -qF "const $k : bool = true;" "$RAY_LEAN"; then
+      failed=1; specMiss=1
+      echo "FAIL raymarch.wgsl — the variant substitution target"
+      echo "  \"const $k : bool = true;\" is not in the assembled source."
+      echo "  Simulation::BuildRaymarchVariant flips that exact line; keep the"
+      echo "  spelling or update BOTH it and scripts/check_shaders.sh."
+    fi
+  done
+  if [ "$specMiss" -eq 0 ]; then
+    sed -i \
+      -e 's/^const SPEC_FLUID : bool = true;$/const SPEC_FLUID : bool = false;/' \
+      -e 's/^const SPEC_DEBUG_VIZ : bool = true;$/const SPEC_DEBUG_VIZ : bool = false;/' \
+      -e 's/^const SPEC_SHORT_RANGE : bool = true;$/const SPEC_SHORT_RANGE : bool = false;/' \
+      "$RAY_LEAN"
+    if out="$("$TINT_BIN" -f wgsl "$RAY_LEAN" 2>&1 >/dev/null)" && [ -z "$out" ]; then
+      checked=$((checked + 1))
+      echo "check_shaders: raymarch.wgsl lean variant OK (SPEC_* all false)"
+    else
+      failed=1
+      echo "FAIL raymarch.wgsl (lean variant: SPEC_FLUID/DEBUG_VIZ/SHORT_RANGE false)"
+      printf '%s\n' "$out" | sed 's/^/  /'
+    fi
+    # ...and what the specialization actually deletes, in SPIR-V instructions.
+    # `fs` only: `vs` is three vertices of a fullscreen triangle and carries
+    # none of this. Reported, never a ceiling — the number is the EVIDENCE for
+    # the variant, and a shrinking one is good news, not a failure.
+    #
+    # AFTER spirv-opt, and that is the whole point of the extra invocation.
+    # Tint's SPIR-V writer keeps functions no entry point can reach: with
+    # SPEC_FLUID false, `fluidMarch`, `fluidMarchBlocky`, `traceRefraction` and
+    # `shadeMpmFluid` are all still IN the module Tint emits, and the raw count
+    # moves by 197 of 29,256 instructions (0.7%) — a number that reads as "the
+    # specialization does nothing" and is simply measuring the wrong artifact.
+    # The engine runs SPIRV-Tools' performance recipe over every module before
+    # the driver sees it (gpu/vk_spirv.cpp, ON by default since 2026-09-07), and
+    # THAT module is 156,482 -> 118,637 instructions, -24.2%. Same recipe here,
+    # same target env, so the two numbers are comparable to the engine's.
+    #
+    # spirv-opt comes from the Vulkan SDK's Bin directory. Optional: without it
+    # the pre-opt counts are printed with a note, because a checker that fails
+    # on a missing diagnostic tool is a checker people stop running.
+    if command -v spirv-opt >/dev/null 2>&1; then optSpv=1; else optSpv=0; fi
+    for pair in "universal:$RAY_COMBINED" "lean:$RAY_LEAN"; do
+      tag="${pair%%:*}"; src="${pair#*:}"
+      spv="$TMP/raymarch_${tag}.spv"
+      "$TINT_BIN" -f spirv -ep fs -o "$spv" "$src" >/dev/null 2>&1 || {
+        echo "check_shaders: could not emit SPIR-V for raymarch.wgsl:fs ($tag)" >&2
+        continue; }
+      note="(pre-optimizer; spirv-opt not on PATH, so this UNDER-REPORTS)"
+      if [ "$optSpv" -eq 1 ] &&
+         spirv-opt -O --preserve-interface --target-env=vulkan1.1 \
+                   "$spv" -o "$TMP/raymarch_${tag}_opt.spv" >/dev/null 2>&1; then
+        spv="$TMP/raymarch_${tag}_opt.spv"
+        note="(after the engine's spirv-opt recipe)"
+      fi
+      n="$(python -c "
+import struct,sys
+b=open(sys.argv[1],'rb').read()
+w=struct.unpack('<%dI'%(len(b)//4),b)
+i,n=5,0
+while i<len(w):
+    l=w[i]>>16
+    if l==0: break
+    i+=l; n+=1
+print(n)
+" "$spv")" || continue
+      echo "check_shaders: raymarch.wgsl:fs $tag — $n SPIR-V instructions $note"
+    done
+  fi
+fi
+
+# ---------------------------------------------------------------------------
 # SPIR-V SIZE CEILING for worldgen.wgsl.
 #
 # WHAT THIS DEFENDS AGAINST, precisely: on 2026-09-07 a cold

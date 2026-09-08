@@ -744,6 +744,11 @@ void SavePipelineCache(const Device& d) {
   if (vk::Backend* be = NativeBackend(d)) be->SavePipelineCache();
 }
 
+std::string ModuleSource(const ShaderModule& m) {
+  if (!m) return {};
+  return static_cast<VkrShaderModule*>(m.Get())->source;
+}
+
 TextureView WrapSwapchainImage(vk::Image* img) {
   if (!img) return {};
   auto v = std::make_shared<VkrTextureView>();

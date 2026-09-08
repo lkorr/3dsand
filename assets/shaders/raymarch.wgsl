@@ -151,6 +151,38 @@ fn rsAdd(slot : u32, n : u32) {
 // and the call site disappears from the compiled fragment shader.
 const SHADOW_CACHE : bool = SHADOW_CACHE_AVAILABLE && TUNE_SHADOW_CACHE != 0;
 
+// ---- PER-FRAME PIPELINE SPECIALIZATION (W2-A) ------------------------------
+// Three booleans, and each one is the COMPILE-TIME MIRROR OF A UNIFORM THE CPU
+// WROTE FOR THIS FRAME. That phrasing is the whole correctness argument and it
+// is deliberately narrow: every predicate below is a value WriteRenderParams
+// (src/test/support.cpp) computed on the CPU and put into RenderParams itself,
+// so a variant compiled with `false` cannot disagree with the frame it draws —
+// there is nothing to infer, no CPU mirror to consult, no readback. If the
+// prediction is wrong, the frame simply does not select the variant and the
+// universal pipeline draws it (Simulation::DrawWorld).
+//
+//   SPEC_FLUID       <-> R.fluidCount > 0u
+//   SPEC_DEBUG_VIZ   <-> (R.flags & 2u) != 0u   (dev panel: active-voxel edges)
+//   SPEC_SHORT_RANGE <-> (R.flags & 4u) != 0u   (dev panel: 100 m ray ceiling)
+//
+// WHY A SECOND PIPELINE RATHER THAN THE UNIFORM BRANCH THAT IS ALREADY THERE.
+// The same reason the `shadow0` arm exists beside `noshadow` (see the block
+// above): a branch not taken still owns its registers, and trace() sits on a
+// measured occupancy cliff where 168 registers cost 3.5 ms against 128 (the
+// long note at trace()). `R.fluidCount > 0u` is a uniform, so no compiler can
+// fold it — the MPM march, its two nested marches and shadeMpmFluid are in
+// every compiled fragment shader whether or not one particle exists, and their
+// peak register demand is the whole shader's allocation.
+//
+// THE VALUES HERE ARE THE UNIVERSAL VARIANT and must stay literal `true`:
+// Simulation::BuildRaymarchVariant flips these exact three lines to `false` by
+// string substitution on the source LoadShader assembled (see there for why the
+// substitution is at the caller and not in the prelude). scripts/check_shaders.sh
+// validates both spellings and reports the SPIR-V size of each.
+const SPEC_FLUID : bool = true;
+const SPEC_DEBUG_VIZ : bool = true;
+const SPEC_SHORT_RANGE : bool = true;
+
 fn isVoxActive(idx : u32) -> bool {
   return (actVoxViz[idx >> 5u] & (1u << (idx & 31u))) != 0u;
 }
@@ -2174,7 +2206,7 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool) -> Hit {
   // value of a different knob. Same min()-only shape, same wantMedia gate
   // (shadow/reflection rays are budget-capped elsewhere and must not report
   // "lit" because they gave up at the ceiling).
-  if (wantMedia && (R.flags & 4u) != 0u) {
+  if (SPEC_SHORT_RANGE && wantMedia && (R.flags & 4u) != 0u) {
     tExit = min(tExit, max(tEnter, TUNE_SHORT_RANGE_DIST / VOXEL_METERS));
   }
 
@@ -2484,7 +2516,7 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool) -> Hit {
           cellOp = f32(materials[mat].opacity) / 255.0;
           cellTint = (unpackColor(materials[mat].color0) +
                       unpackColor(materials[mat].color1)) * 0.5;
-          if ((R.flags & 2u) != 0u) {
+          if (SPEC_DEBUG_VIZ && (R.flags & 2u) != 0u) {
             let gs = vec3<u32>(cell & vec3<i32>(WORLD_MASK));
             let ge = pageTable[chunkIndexOf(gs)];
             if ((ge & PT_SENTINEL_BIT) == 0u) {
@@ -2894,7 +2926,7 @@ fn traceFar(ro : vec3f, rdIn : vec3f, tStart : f32, px : vec2f) -> FarHit {
   // no-ops on a uniform branch the compiler folds. Not `select` on the whole
   // clamp, because that would duplicate the expression at both use sites.
   let tCeil = select(1e30, TUNE_SHORT_RANGE_DIST / VOXEL_METERS,
-                     (R.flags & 4u) != 0u);
+                     SPEC_SHORT_RANGE && (R.flags & 4u) != 0u);
 
   // Window -> level 1 seam. tStart is where the ray left the residency window;
   // the fine march already found no hit out to there, so starting level 1 up to
@@ -3399,7 +3431,7 @@ fn aerialFrac(tFine : f32) -> f32 {
   // ring all the way round the camera, which is the same visual defect one
   // step further down the pipe. The two exp() are of uniform arguments and
   // fold to constants; only the x^2 is per-pixel.
-  if ((R.flags & 4u) != 0u) {
+  if (SPEC_SHORT_RANGE && (R.flags & 4u) != 0u) {
     let startM = TUNE_SHORT_RANGE_DIST * TUNE_SHORT_RANGE_FOG_START;
     let span = max(TUNE_SHORT_RANGE_DIST - startM, 1e-3);
     let x = clamp((dM - startM) / span, 0.0, 1.0);
@@ -7957,7 +7989,7 @@ fn fs(in : VSOut) -> FSOut {
   var mf : FluidHit;
   mf.hit = false;
   mf.blocky = false;
-  if (R.fluidCount > 0u) {
+  if (SPEC_FLUID && R.fluidCount > 0u) {
     let sceneT = select(h.tExit, h.t, h.hit || h.saturated);
     let mode = i32(round(TUNE_FLUID_SURFACE));
     if (mode == 1) {
@@ -8033,7 +8065,7 @@ fn fs(in : VSOut) -> FSOut {
   // the same "> 0.05" skip for a submerged camera. Raster geometry (droplet
   // spray, debris) behind the surface is covered by it; spray in front of it
   // draws over it — which is exactly what a splash should do.
-  if (mf.hit && mf.t > 0.05 && (tDepth < 0.0 || mf.t < tDepth)) {
+  if (SPEC_FLUID && mf.hit && mf.t > 0.05 && (tDepth < 0.0 || mf.t < tDepth)) {
     tDepth = mf.t;
   }
   // Half-opaque gas: same nearest-wins rule as the two interfaces above, and
@@ -8520,7 +8552,7 @@ fn fs(in : VSOut) -> FSOut {
     if (h.liqT <= 0.0) { color = applyAerial(color, rd, h.t); }
 
     // ---- active-voxel debug highlight (dev panel toggle) ----
-    if ((R.flags & 2u) != 0u) {
+    if (SPEC_DEBUG_VIZ && (R.flags & 2u) != 0u) {
       let avs = vec3<u32>(h.cell & vec3<i32>(WORLD_MASK));
       let ave = pageTable[chunkIndexOf(avs)];
       if ((ave & PT_SENTINEL_BIT) == 0u) {
@@ -8605,7 +8637,7 @@ fn fs(in : VSOut) -> FSOut {
       // apart. `caShadedLiquid` below carries the answer to the MPM path, so
       // the two cannot drift back out of agreement the way two independent
       // tests did.
-      let mpmOwned = mf.hit
+      let mpmOwned = SPEC_FLUID && mf.hit
                      && materials[lm].moveEvery <= 1u
                      && (mf.inside || mf.t <= h.liqT + 1.0);
 
@@ -8700,7 +8732,7 @@ fn fs(in : VSOut) -> FSOut {
   //     Fresnel and specular glint and all, tens of voxels under the real
   //     surface. It cannot be a real interface: the ray was inside water before
   //     it got there, which is precisely what caShadedLiquid records.
-  if (mf.hit && !caShadedLiquid) {
+  if (SPEC_FLUID && mf.hit && !caShadedLiquid) {
     let caMatRaw = select(MAT_AIR, voxMat(voxWordAt(h.liqCell)), h.liqT > 0.0);
     let viscousNearer = h.liqT > 0.05 && h.liqT < mf.t
                         && isViscousLiquid(materials[voxMat(voxWordAt(h.liqCell))]);

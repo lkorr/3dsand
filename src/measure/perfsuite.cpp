@@ -1792,6 +1792,13 @@ struct RenderArm {
   bool shadows;           // the RenderParams shadow bit for this arm
   uint32_t widthDiv;      // 1 = full res, 2 = half res in each axis
   const char* means;      // what the delta from baseline is the cost OF
+  // Force the UNIVERSAL raymarch pipeline, i.e. undo the per-frame
+  // specialization (W2-A). Not a tuning mutation and deliberately not one: a
+  // `render.*` row would put a new TUNE_* line into every shader's prelude, and
+  // the SPIR-V disk cache keys on assembled source — one line would be a cache
+  // miss for all 21 shaders including worldgen's `far`. Last, with a default,
+  // so every existing aggregate initializer above and below still compiles.
+  bool universalShader = false;
 };
 
 const RenderArm kRenderArms[] = {
@@ -1955,6 +1962,25 @@ static_assert((int)PerfCounter::Count - (int)PerfCounter::RmPixels ==
 //      feature is free. An arm that cannot fire on a camera does not belong in
 //      that camera's table.
 const RenderArm kExtraArms[] = {
+    // ---- the specialized raymarch variant (W2-A) -----------------------
+    // THE THIRD MEMBER OF THE noshadow / shadow0 FAMILY, and it is read the
+    // same way. `baseline` draws the LEAN pipeline on any camera whose frame
+    // has no MPM fluid, no debug highlight and no short-range ceiling — which
+    // is every camera in this table. `nospec` draws the universal one, the
+    // same picture out of a fragment shader 24% larger in optimized SPIR-V.
+    // The delta is therefore pure OCCUPANCY: not one instruction of work
+    // differs between the two, only how many registers the compiled shader
+    // needed for code neither frame executes.
+    //
+    // An arm on every camera, unlike its neighbours here, because that is
+    // exactly the claim: a footprint tax is paid by every pixel of every
+    // picture, so a single camera cannot establish or refute it.
+    {"nospec", "raymarch specialization off (universal pipeline)", nullptr,
+     true, 1,
+     "the OCCUPANCY TAX of the MPM fluid march, the active-voxel debug probe "
+     "and the short-range ceiling being compiled into a shader that runs none "
+     "of them",
+     /*universalShader=*/true},
     {"nogodray", "godRaySteps 14 -> 0",
      [](Tuning& t) { t.render.godRaySteps = 0; }, true, 1,
      "the whole underwater god-ray march — 14 steps, each with its own shadow "
@@ -2474,22 +2500,22 @@ bool CamCanopy(Scene& s, uint32_t& tick, std::string& why) {
 }
 
 const char* const kArmsReduced[] = {
-    "baseline", "noshadow", "nofar", "noreflect", "halfres", nullptr};
+    "baseline", "noshadow", "nofar", "noreflect", "halfres", "nospec", nullptr};
 // The cascade camera: the far march IS the frame here, so the rows that matter
 // are the ones that price it and the ones that bound what is left. `nofar` is
 // the ceiling on everything the cascade could ever cost.
 const char* const kArmsCascade[] = {
-    "baseline", "nofar", "noshadow", "halfres", nullptr};
+    "baseline", "nofar", "noshadow", "halfres", "nospec", nullptr};
 // The foliage cameras: the picture-dependent rows plus the ceilings that only
 // mean something with plants in the frame. `nomicro` is the ceiling on the
 // whole plant march; `micro1` / `plantlod4` price its two knobs; `lod8` and
 // `fine2m` bound the fine march the plants are part of.
 const char* const kArmsFoliage[] = {
     "baseline", "noshadow",  "nogi", "nofar",  "halfres", "nomicro",
-    "micro1",   "plantlod4", "lod8", "fine2m", nullptr};
+    "micro1",   "plantlod4", "lod8", "fine2m", "nospec",  nullptr};
 const char* const kArmsSubmerged[] = {
-    "baseline", "noshadow", "nofar",       "noreflect",
-    "halfres",  "nogodray", "godshadow0",  nullptr};
+    "baseline", "noshadow", "nofar",      "noreflect",
+    "halfres",  "nogodray", "godshadow0", "nospec", nullptr};
 
 const BudgetCam kBudgetCams[] = {
     {"noon",
@@ -2592,6 +2618,12 @@ class RenderBudgetRunner {
       }
     }
 
+    // Which raymarch pipeline this arm draws with (W2-A). Set from the arm on
+    // EVERY arm, not only on `nospec`, so it restores itself the way the tuning
+    // copy above does — the `halfres`-measured-at-shadowSteps-32 bug in the
+    // comment above is what an un-restored arm state looks like.
+    sim_.SetForceUniversalRaymarch(arm.universalShader);
+
     const uint32_t d = arm.widthDiv;
     const uint32_t W = opt_.width / d, H = opt_.height / d;
     const rhi::TextureView& view = view_[d == 1 ? 0 : 1];
@@ -2674,6 +2706,7 @@ class RenderBudgetRunner {
   // the shot, the next camera, or a later harness in the same process.
   void RestoreBase(const Tuning& base) {
     SetCurrentTuning(base);
+    sim_.SetForceUniversalRaymarch(false);
     sim_.ReloadShaders(ctx_.device);
     dirty_ = false;
   }

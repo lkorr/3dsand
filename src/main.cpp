@@ -3681,6 +3681,24 @@ int main(int argc, char** argv) {
         fluidBench || shaderStats || !shotMob.empty() || !sweepParam.empty();
     const bool voxelTool = voxserve || !voxdumpArgs.empty();
     sim.AllowDeferredFar(!checkedOutput || voxelTool);
+    // The specialized raymarch variant follows the same rule and for the same
+    // reason (Simulation::AllowDeferredRaymarchVariant): the interactive game
+    // must not stall on a second compile of the biggest fragment shader, and a
+    // checked output must not depend on when that compile happened to land.
+    sim.AllowDeferredRaymarchVariant(!checkedOutput || voxelTool);
+    // SANDVOX_NO_RAYMARCH_SPEC=1 draws every frame with the universal
+    // pipeline. Two uses, and the second is the reason it is an env var rather
+    // than an argument: it is the A/B arm for "the two variants produce
+    // identical pixels" (--shot the same frame with and without it and diff),
+    // and it is the first thing to try if a driver ever miscompiles the
+    // variant — the same escape hatch, for the same reason, as
+    // SANDVOX_SPIRV_OPT=0.
+    if (const char* v = std::getenv("SANDVOX_NO_RAYMARCH_SPEC")) {
+      if (*v && std::strcmp(v, "0") != 0) {
+        sim.SetForceUniversalRaymarch(true);
+        std::printf("raymarch specialization DISABLED (SANDVOX_NO_RAYMARCH_SPEC)\n");
+      }
+    }
   }
 
   // --verify first: it is the union of three modes below on this one context.

@@ -11,6 +11,7 @@
 
 #include "gpu/resources.h"
 #include "sim/pagetable.h"
+#include "sim/renderspec.h"  // LastRenderSpec(): which raymarch variant this frame takes
 #include "sim/tuning.h"      // fluidExciteMode gates the seam recording
 #include "gpu/rhi_record.h"  // the Vulkan table-recording bridge (phase 4a)
 #include "gpu/rhi_vk.h"      // rhi::vkr::SavePipelineCache (EnsureRenderPipelines)
@@ -1048,12 +1049,88 @@ class PipelineBuildPool {
 constexpr unsigned kBuildThreads = 6;
 }  // namespace
 
+// ---- the specialized raymarch variant (W2-A) -------------------------------
+//
+// voxelbit.net compiles two variants of its trace pipeline and selects one per
+// frame; the branch it specializes away — its see-through-foliage check — cost
+// +0.169 ms even fully disabled, because a dynamic branch in a hot loop is paid
+// in REGISTERS whether or not it is taken. This engine has the same shape and
+// a measured cliff to go with it: 168 registers cost 3.5 ms against 128 in
+// trace() (the long note there), and `shadow0` minus `noshadow` prices one
+// call site's mere existence at 3.59 ms.
+//
+// WHY THE SUBSTITUTION IS HERE AND NOT IN THE PRELUDE. The natural home for a
+// per-variant `const` is ShaderConstantPrelude() in gpu/resources.cpp, next to
+// RENDER_STATS which is exactly this pattern. Two reasons it is not there:
+//
+//   1. That file was held by a concurrent session when this landed.
+//   2. THE ONE THAT WOULD HAVE DECIDED IT ANYWAY: the prelude goes into EVERY
+//      shader, and the SPIR-V disk cache keys on assembled source. One new
+//      prelude line is a cache miss for all 21 shaders — including worldgen's
+//      `far`, which is 170 s of driver compile with the optimizer on and 746 s
+//      without it. A per-variant constant must touch ONLY the shader it
+//      specializes, and taking the assembled source back out of the module is
+//      how that is achieved without a second copy of LoadShader's
+//      concatenation (rhi::vkr::ModuleSource says the same from its side).
+//
+// The cost of the mechanism, stated plainly: the substitution targets are three
+// literal lines of raymarch.wgsl, and nothing but scripts/check_shaders.sh
+// (which performs the same substitution and fails if a target is missing)
+// stops a reformat from silently disabling the feature.
+void Simulation::BuildRaymarchVariant(const rhi::Device& device,
+                                      const rhi::ShaderModule& base) {
+  raymarchLeanModule_ = {};
+  if (!base) return;
+  std::string src = rhi::vkr::ModuleSource(base);
+  if (src.empty()) return;
+  static const char* const kSpecConsts[] = {"SPEC_FLUID", "SPEC_DEBUG_VIZ",
+                                            "SPEC_SHORT_RANGE"};
+  for (const char* name : kSpecConsts) {
+    const std::string from = std::string("const ") + name + " : bool = true;";
+    const std::string to = std::string("const ") + name + " : bool = false;";
+    const size_t at = src.find(from);
+    if (at == std::string::npos) {
+      std::fprintf(stderr,
+                   "raymarch specialization: \"%s\" not found in the assembled "
+                   "source — the variant is disabled and every frame will draw "
+                   "the universal pipeline. Fix the spelling in "
+                   "assets/shaders/raymarch.wgsl (and note that "
+                   "scripts/check_shaders.sh checks the same three lines).\n",
+                   from.c_str());
+      return;
+    }
+    // find() once, not replace-all: each const is declared exactly once, and a
+    // second occurrence would mean the marker text had leaked into a comment,
+    // which is worth failing on rather than silently patching.
+    src.replace(at, from.size(), to);
+  }
+  raymarchLeanModule_ = device.CreateShaderModule(src, "raymarch.lean");
+}
+
+// Main thread only, and every field it touches is main-thread-only, so there is
+// no atomic here and none is needed: the future IS the happens-before edge, and
+// `wait_for(0)` is the non-blocking half of the same question `get()` answers.
+void Simulation::PollRaymarchVariant(bool block) {
+  if (rayLeanPublished_) return;
+  if (!rayLeanFuture_.valid()) { rayLeanPublished_ = true; return; }
+  if (!block && rayLeanFuture_.wait_for(std::chrono::seconds(0)) !=
+                    std::future_status::ready) {
+    return;
+  }
+  raymarchLean_ = rayLeanFuture_.get();
+  rayLeanPublished_ = true;
+}
+
 bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   // F5 REBUILDS MUST NOT RACE THE DEFERRED SET. vkCreateComputePipelines is
   // not cancellable, and the modules the background thread is compiling from
   // are owned by the previous call's locals. Join first, always — a no-op on
   // the first build and on any build whose predecessor already published.
   WaitForFarPipelines();
+  // Same argument for the raymarch variant's background compile: F5 replaces
+  // the module it is reading from.
+  PollRaymarchVariant(/*block=*/true);
+  raymarchLean_ = {};
 
   // `--shader-stats` forces the whole build serial: capture is a create flag
   // and the executable-properties query it feeds reads per-pipeline driver
@@ -1336,6 +1413,11 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   }
 
   raymarchModule_ = mRay;
+  // The lean variant's MODULE (its pipeline is deferred, in
+  // EnsureRenderPipelines). Derived here, serially, and deliberately not inside
+  // the load pool above: it reads mRay's assembled source, which does not exist
+  // until that pool has joined.
+  BuildRaymarchVariant(device, mRay);
   taaModule_ = mTaa;
   debrisModule_ = mDebris;
   microBodyModule_ = mMicroBody;
@@ -2319,6 +2401,11 @@ void Simulation::DrawTaa(const rhi::RenderPass& pass) {
 void Simulation::EnsureRenderPipelines(rhi::TextureFormat format) {
   if (format == targetFormat_) return;
   targetFormat_ = format;
+  // A format change re-creates every pipeline including the variant, so a
+  // compile still in flight from the previous format must be joined and
+  // dropped first.
+  PollRaymarchVariant(/*block=*/true);
+  raymarchLean_ = {};
   // Part of the startup timeline (main.cpp StartupMark): the graphics
   // pipelines are created lazily on the first draw, which puts the driver's
   // compile of the raymarch fragment shader INSIDE the first frame.
@@ -2517,6 +2604,51 @@ void Simulation::EnsureRenderPipelines(rhi::TextureFormat format) {
     pool.Add([this, d] { taaResolve_ = device_.CreateRenderPipeline(d); });
   }
   pool.Run(buildThreads);
+
+  // ---- deferred: the SPECIALIZED raymarch (W2-A) --------------------------
+  // The same argument the far cascades' deferral runs on, one level smaller.
+  // This is a SECOND full compile of the biggest fragment shader in the engine
+  // — the block above is 45-64 s cold and the raymarch dominates it — and
+  // nothing needs it to be finished: a frame whose predicates say "lean" draws
+  // the universal pipeline instead, which is the same picture. So it must not
+  // be on the path to the first frame, and it is not; it lands a few tens of
+  // seconds later on a cold cache and instantly on a warm one, because the
+  // SPIR-V disk cache keys on source and only this variant's key is new.
+  //
+  // Captured BY VALUE (device, layout, module, format, depth state) exactly as
+  // the far block is, so the thread names no Simulation member. Serial under
+  // --shader-stats for that mode's own reason: it exists to interrogate every
+  // pipeline the driver compiled this run, and this is one of them.
+  if (raymarchLeanModule_) {
+    rhi::RenderPipelineDesc dl{};
+    dl.label = "raymarchLean";
+    dl.layout = renderPL_;
+    dl.vertexModule = raymarchLeanModule_;
+    dl.vertexEntry = "vs";
+    dl.fragmentModule = raymarchLeanModule_;
+    dl.fragmentEntry = "fs";
+    dl.colorFormat = format;
+    dl.topology = rhi::PrimitiveTopology::TriangleList;
+    dl.depth = dsAlways;
+    const rhi::Device dev = device_;
+    auto build = [dev, dl]() {
+      rhi::RenderPipeline p = dev.CreateRenderPipeline(dl);
+      // Persist from this thread the moment it exists, for the reason the two
+      // saves in BuildPipelines exist: the save at the bottom of this function
+      // ran long before this compile finished, so without this the variant's
+      // ISA is recompiled on every launch.
+      rhi::vkr::SavePipelineCache(dev);
+      return p;
+    };
+    if (buildThreads <= 1) {
+      raymarchLean_ = build();
+      rayLeanPublished_ = true;
+    } else {
+      rayLeanFuture_ = std::async(std::launch::async, build);
+      rayLeanPublished_ = false;
+    }
+  }
+
   // Decided after the join, from the same two inputs the shadow cache's flag is:
   // the device must allow a fragment shader to write storage (the history IS a
   // fragment-stage write), and the pipeline must actually have compiled. A
@@ -2602,7 +2734,23 @@ rhi::RenderPass Simulation::BeginOverlayRenderPass(const rhi::CommandEncoder& en
 }
 
 void Simulation::DrawWorld(const rhi::RenderPass& pass) {
-  pass.SetPipeline(raymarch_);
+  // ---- pick this frame's raymarch pipeline (W2-A) --------------------------
+  // `LastRenderSpec()` is the flag word and fluidCount WriteRenderParams
+  // uploaded for THIS frame, not a prediction of them (support.h), so "every
+  // specialized branch is off" is a fact about the uniform the shader is about
+  // to read. When it holds, the lean variant draws the identical picture with
+  // ~24% less compiled shader; when it does not, or the variant is not
+  // published, or --render-budget's `nospec` arm forced it, the universal
+  // pipeline draws — which is always correct.
+  bool lean = !forceUniversalRay_ && sandvox::LastRenderSpec().AllOff() &&
+              (bool)raymarchLeanModule_;
+  if (lean) {
+    // Blocks only for a caller that did not opt into deferral, i.e. never for
+    // the interactive game and always for a checked output.
+    PollRaymarchVariant(/*block=*/!deferRayVariantOk_);
+    lean = (bool)raymarchLean_;
+  }
+  pass.SetPipeline(lean ? raymarchLean_ : raymarch_);
   pass.SetBindGroup(0, renderBG_);
   pass.SetBindGroup(1, renderPartBG_[page_]);
   pass.Draw(3);

@@ -408,6 +408,28 @@ class Simulation {
   // checked output can depend on when the driver happened to finish.
   void AllowDeferredFar(bool on) { deferFarOk_ = on; }
 
+  // ---- the SPECIALIZED raymarch variant (W2-A) ------------------------------
+  // Same deal as AllowDeferredFar and set from the same line in main.cpp. The
+  // lean raymarch pipeline (raymarch.wgsl's SPEC_* block) compiles in the
+  // background; when a frame is eligible for it and it is not published yet,
+  // DrawWorld either draws the universal pipeline (deferral allowed: the
+  // interactive game, which must not stall) or BLOCKS until the variant exists
+  // (deferral not allowed: every --shot, gate and budget arm).
+  //
+  // The two pipelines are required to produce identical pixels — the
+  // specialization is dead-code removal and nothing else — so the difference is
+  // in principle unobservable. The blocking default is here anyway, because
+  // "the picture is identical" is a claim this package MEASURED rather than a
+  // property the type system enforces, and a checked output whose shader
+  // depends on when a driver thread finished is not a checked output.
+  void AllowDeferredRaymarchVariant(bool on) { deferRayVariantOk_ = on; }
+
+  // Draw with the UNIVERSAL raymarch pipeline whatever the frame's predicates
+  // say. The `nospec` --render-budget arm, which is the A/B this feature is
+  // judged by: `baseline` minus `nospec` is what the variant is worth, measured
+  // the same way `shadow0` measures the shadow call site's footprint.
+  void SetForceUniversalRaymarch(bool on) { forceUniversalRay_ = on; }
+
   // Publish a finished background compile and return true EXACTLY ONCE: on the
   // call that made the pipelines live. That is the caller's cue to
   // FarField::FullRefill — every fill queued while they were missing was
@@ -447,6 +469,17 @@ class Simulation {
   void EnsureAuxDepth(uint32_t width, uint32_t height);
   void EnsureOverlayDepth(uint32_t width, uint32_t height);
   void EnsureRenderPipelines(rhi::TextureFormat format);
+  // Derive raymarchLeanModule_ from an already-loaded raymarch module by
+  // flipping the three `const SPEC_* : bool = true;` lines in the source
+  // LoadShader assembled. Leaves the module invalid (and says so on stderr) if
+  // any of the three lines is not found verbatim — the only failure mode a
+  // string substitution has, and one that would otherwise ship a "specialized"
+  // pipeline byte-identical to the universal one.
+  void BuildRaymarchVariant(const rhi::Device& device,
+                            const rhi::ShaderModule& base);
+  // Move a finished background compile onto raymarchLean_. Main thread only;
+  // never blocks unless `block` is set.
+  void PollRaymarchVariant(bool block);
   // Stamp the cached art palette into a material table being (re)built.
   void ApplyArtPalette(std::vector<MaterialGpu>& table) const;
 
@@ -558,6 +591,20 @@ class Simulation {
       fluidDraw_;
   rhi::ShaderModule raymarchModule_, debrisModule_, microBodyModule_,
       debugLineModule_, debugWindModule_, debugCurModule_;
+  // ---- the specialized raymarch (W2-A) --------------------------------------
+  // `raymarchLeanModule_` is raymarchModule_'s assembled source with the three
+  // SPEC_* consts flipped to false (BuildRaymarchVariant). `raymarchLean_` is
+  // the pipeline built from it, on a background thread like the far cascades,
+  // published on the main thread by PollRaymarchVariant. INVALID until then,
+  // and DrawWorld treats an invalid handle as "not available", never as an
+  // error: a variant that failed to compile is a frame drawn by the universal
+  // pipeline, which is the correct picture in every case.
+  rhi::ShaderModule raymarchLeanModule_;
+  rhi::RenderPipeline raymarchLean_;
+  std::future<rhi::RenderPipeline> rayLeanFuture_;
+  bool rayLeanPublished_ = true;   // "nothing pending", the pre-build state
+  bool deferRayVariantOk_ = false;
+  bool forceUniversalRay_ = false;
   rhi::TextureFormat targetFormat_ = rhi::TextureFormat::Undefined;
 
   rhi::Texture depthTex_;

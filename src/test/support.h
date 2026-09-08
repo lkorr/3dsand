@@ -19,6 +19,7 @@
 #include "phys/debris.h"
 #include "game/mob.h"
 #include "sim/biomes.h"
+#include "sim/renderspec.h"
 #include "sim/simulation.h"
 #include "sim/tuning.h"
 #include "sim/world.h"
@@ -76,6 +77,10 @@ void WriteRenderParams(const rhi::Queue& queue, const World& world,
                        uint32_t fluidCount = 0,
                        float frameFrac = 0.0f,
                        uint32_t extraFlags = 0);
+
+// WriteRenderParams also publishes the raymarch's per-frame specialization
+// record — sim/renderspec.h, included above, says what it is and why it is
+// written from here and nowhere else.
 
 // ---- the TAA camera jitter (render.taa; assets/shaders/taa.wgsl) -----------
 //

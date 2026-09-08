@@ -230,6 +230,13 @@ void ApplyTaaJitter(const Camera& cam, const Vec3& eye, float aspect,
   outTaa.jitterY = (-ny * 0.5f) * (float)renderH;
 }
 
+// The SPEC_* record (sim/renderspec.h). Written only by WriteRenderParams
+// below, read only by Simulation::DrawWorld.
+namespace {
+RenderSpec gRenderSpec;
+}
+const RenderSpec& LastRenderSpec() { return gRenderSpec; }
+
 void WriteRenderParams(const rhi::Queue& queue, const World& world,
                        const Vec3& eye, const Camera& cam, float aspect,
                        bool shadows, float time,
@@ -250,6 +257,12 @@ void WriteRenderParams(const rhi::Queue& queue, const World& world,
   // bit 2 = short-range mode. Bit 2 is OR'd in here rather than passed by the
   // caller so that every drawing path gets it — see ShortRangeMode above.
   rp.flags = (shadows ? 1u : 0u) | extraFlags | (ShortRangeMode() ? 4u : 0u);
+  // Publish the SPEC_* predicates for this frame (support.h RenderSpec). Read
+  // off `rp` rather than off the arguments, so the record is the WORD THAT WAS
+  // UPLOADED and not a second derivation of it.
+  gRenderSpec.fluid = rp.fluidCount > 0u;
+  gRenderSpec.debugViz = (rp.flags & 2u) != 0u;
+  gRenderSpec.shortRange = (rp.flags & 4u) != 0u;
   // ---- the shadow cache's clock (world.h kShadowCacheBuckets) ----
   // ONE CALL HERE IS ONE RENDERED FRAME, which is exactly the clock the cache
   // needs and the reason the counter lives in this function rather than in the

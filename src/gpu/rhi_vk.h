@@ -14,6 +14,7 @@
 #pragma once
 
 #include <memory>
+#include <string>
 
 #include "gpu/rhi.h"
 #include "gpu/vk_loader.h"  // VkCommandBuffer for the overlay accessor
@@ -67,6 +68,21 @@ bool CaptureStats(const Device& d);
 // routinely taskkilled before Shutdown would have saved it (vk::Backend::
 // SavePipelineCache has the measurement). No-op on a non-Vulkan device.
 void SavePipelineCache(const Device& d);
+
+// The WGSL a shader module was created from — the string LoadShader assembled
+// (prelude + tuning + common + body), which the backend keeps because Tint runs
+// at pipeline creation, not here (CreateShaderModule in rhi_vk.cpp).
+//
+// EXISTS FOR ONE CALLER: Simulation::BuildRaymarchVariant, which derives the
+// specialized raymarch pipeline (raymarch.wgsl's SPEC_* block) by substituting
+// three const lines in this exact string. Taking the ASSEMBLED source rather
+// than re-reading the file is the whole point — the variant is then guaranteed
+// byte-identical to the shipping shader everywhere except those three lines,
+// with no second reproduction of LoadShader's concatenation, its common.wgsl
+// block stripping or its generated ptSeed() accessors.
+//
+// Empty for an invalid module or a non-Vulkan device.
+std::string ModuleSource(const ShaderModule& m);
 
 // ---- windowed path (phase 4b D3) ------------------------------------------
 
