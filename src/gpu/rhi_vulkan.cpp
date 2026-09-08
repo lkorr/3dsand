@@ -1324,7 +1324,17 @@ VkShaderModule Backend::GetShaderModule(const std::string& wgsl, const std::stri
   // key because Tint emits a SINGLE-entry-point module: the engine builds
   // several pipelines from one .wgsl file (worldgen.wgsl alone yields main /
   // list / far / fardown), and those are genuinely different SPIR-V modules.
+  //
+  // The SPIRV-Tools recipe (`SANDVOX_SPIRV_OPT`) is mixed into the source hash,
+  // not appended to the key string, because the same number is what names the
+  // DISK cache file below. Without it an optimized blob and an unoptimized one
+  // built from identical WGSL collide on one filename, and whichever run wrote
+  // last silently supplies both — which would make an A/B of the two measure
+  // nothing. Tag 0 (the default, opt off) reproduces the historical hash, so no
+  // existing shader_cache/ entry is invalidated by this line.
   size_t srcHash = std::hash<std::string>{}(wgsl);
+  if (uint32_t optTag = vkspv::OptimizerCacheTag())
+    srcHash ^= (size_t)optTag * 0x9e3779b97f4a7c15ull;
   std::string key = label + "\x1f" + entryPoint + "\x1f" +
                     std::to_string(srcHash);
   {

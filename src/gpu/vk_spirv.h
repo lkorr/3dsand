@@ -54,4 +54,31 @@ CompileResult Compile(const std::string& wgsl, const std::string& label,
 // Compile so the two cannot disagree about whether a trailing newline counts.
 uint32_t CountLines(const std::string& s);
 
+// SPIR-V POST-PROCESSING (`SANDVOX_SPIRV_OPT`).
+//
+// Tint hands the driver unoptimized SPIR-V: every WGSL local is an OpVariable
+// in the Function storage class with load/store traffic around it, and every
+// helper is a real OpFunctionCall. On the NVIDIA ICD the front end that has to
+// undo all of that is where a cold `vkCreateComputePipelines` on
+// worldgen.wgsl's `far` entry spends ~750 s (docs/PLAN_shader_compile.md).
+// Running SPIRV-Tools' optimizer in between is the experiment: same semantics,
+// far fewer instructions to chew through.
+//
+// Measured 2026-09-07 (two cold arms, table in vk_spirv.cpp): worldgen `far`
+// 622 s -> 171 s, whole worldgen set 861 s -> 299 s, same world hash both ways.
+// So it is ON BY DEFAULT and the env var is an opt-OUT.
+//
+// Values: unset / "1" / "perf" = RegisterPerformancePasses (the default).
+// "0" / "off" = disabled, the raw Tint blob. "legal" = the LunarG legalization
+// recipe (inline-exhaustive, private-to-local, scalar replacement, SSA rewrite,
+// simplify, aggressive DCE). Anything the optimizer refuses falls through to the
+// unoptimized blob with a stderr note — this must never be able to break a boot.
+//
+// `OptimizerCacheTag()` is 0 when disabled and a small non-zero id per recipe
+// otherwise. The SPIR-V disk cache MUST mix it into its key: the cache
+// otherwise keys on WGSL source alone and an optimized blob written by one run
+// would be served to a run that asked for the unoptimized one (and vice versa),
+// which would silently corrupt any A/B of the two.
+uint32_t OptimizerCacheTag();
+
 }  // namespace vkspv
