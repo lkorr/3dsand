@@ -573,3 +573,20 @@ tarns, so the hashed world moves through the shore/berm reach of tarns just
 outside it and through the lattice's tile hashes, not through the fixtures'
 ground. The twice-run comparison is the invariant; the pin is the
 notification.
+
+### 2026-09-07 — environment truth P-G + P-I (branch `env-pg-pi`)
+
+`determinismHash` did NOT move (44fa72cb), and that is the expected reading,
+not a surprise: the hashed window is the harness pad site, which bans every
+tree, cover row and tarn, and its ground is the same numbers it always was —
+`map.json terrain` carries exactly the values the deleted `worldgen.*` rows
+had, every biome ships the identity relief curve and 256 multipliers, and the
+declared `east_range` landform is 45 km east. What moved is `treeAtlasHash`
+(the species height caps were lifted to -1 and every `.svtree` re-baked; the
+band is a header word) and the smoke probes (the flora chain became cover
+rows with a canopy condition, so every ground-flora biome's floor rolls
+differently; the alpine cushion is a row; the cover stack has no treeline
+gate). The twice-run comparison is the invariant; the pins are the
+notification. `env-truth` records: unauthored cover is 0.00–0.31 % in every
+biome (was 5.97 % in the forest); forest trees 122/ha against a page of 153
+(was 93).

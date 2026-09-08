@@ -158,7 +158,10 @@ double NominalCoverPct(const biomes::CoverRow& r) {
 
 struct RowStat {
   std::string material;
-  bool exact = true;         // asserted, or report-only (flora chain / proc cactus)
+  bool exact = true;         // asserted, or report-only (tile plant / proc cactus)
+  int group = -1;            // index of the FIRST row naming this material (P-G): a voxel
+                             // cannot say which of two rows of one material placed it, so
+                             // rows sharing a material are asserted as ONE sum
   double nominalPct = 0;     // the page's number
   double expLo = 0, expHi = 0, sigma = 0;   // expected COUNT over eligible columns
   int measured = 0;
@@ -584,14 +587,35 @@ Status GateEnvTruth(Ctx& c, std::string& detail) {
         st.problems.push_back(Format("trees: %d at %d sites, expected %.1f..%.1f (+-%.1f sigma x %.0f, slack %.0f)",
                                      st.treesMeasured, st.sites, st.treeLo, st.treeHi, st.treeSigma, sigmas, treeSlack));
     }
+    // Rows are asserted per MATERIAL (P-G): the seeded chain rows and a
+    // biome's own rows can name the same plant (forest has a canopy
+    // mushroom_cluster row AND its old one), and the voxel at h + 1 cannot
+    // say which row placed it -- rowOf credits the first. So the group's
+    // expectation is the SUM over its rows (lo, hi, sigma in quadrature) and
+    // the group is exact only if every row in it is.
     for (size_t i = 0; i < st.rows.size(); i++) {
-      RowStat& rs = st.rows[i];
-      if (!rs.exact || st.columns == 0) continue;
-      const double tol = std::max(std::max(sigmas * rs.sigma, coverRelTol * rs.expHi), coverAbsTolPct / 100.0 * st.columns);
-      if (rs.measured < rs.expLo - tol || rs.measured > rs.expHi + tol)
+      st.rows[i].group = static_cast<int>(i);
+      for (size_t j = 0; j < i; j++)
+        if (st.rows[j].material == st.rows[i].material) { st.rows[i].group = st.rows[j].group; break; }
+    }
+    for (size_t i = 0; i < st.rows.size(); i++) {
+      if (st.rows[i].group != static_cast<int>(i) || st.columns == 0) continue;
+      double lo = 0, hi = 0, var = 0;
+      bool exact = true;
+      int measured = 0;
+      for (size_t j = i; j < st.rows.size(); j++) {
+        if (st.rows[j].group != static_cast<int>(i)) continue;
+        lo += st.rows[j].expLo; hi += st.rows[j].expHi; var += st.rows[j].sigma * st.rows[j].sigma;
+        exact = exact && st.rows[j].exact;
+        measured += st.rows[j].measured;
+      }
+      if (!exact) continue;
+      const double sigma = std::sqrt(var);
+      const double tol = std::max(std::max(sigmas * sigma, coverRelTol * hi), coverAbsTolPct / 100.0 * st.columns);
+      if (measured < lo - tol || measured > hi + tol)
         st.problems.push_back(Format("cover %s: %d columns (%s), expected %.0f..%.0f (%s..%s), tol %.0f",
-                                     rs.material.c_str(), rs.measured, Pct(static_cast<double>(rs.measured) / st.columns).c_str(),
-                                     rs.expLo, rs.expHi, Pct(rs.expLo / st.columns).c_str(), Pct(rs.expHi / st.columns).c_str(), tol));
+                                     st.rows[i].material.c_str(), measured, Pct(static_cast<double>(measured) / st.columns).c_str(),
+                                     lo, hi, Pct(lo / st.columns).c_str(), Pct(hi / st.columns).c_str(), tol));
     }
     if (st.columns > 0) {
       const double skinPct = 100.0 * st.skinOk / st.columns, subPct = 100.0 * st.subOk / st.columns;
@@ -630,11 +654,17 @@ Status GateEnvTruth(Ctx& c, std::string& detail) {
                 Pct(st.columns ? static_cast<double>(st.unauthored) / st.columns : 0).c_str(),
                 st.tGen, st.tTwin, st.tRead,
                 st.flora ? "  [tile plants: fern / mushroom_large rows reported, not asserted]" : (st.cacti ? "  [proc cactus: cactus rows reported, not asserted]" : ""));
-    for (const RowStat& rs : st.rows)
-      std::printf("env-truth:   %-8s cover %-18s page %5.2f%%  expected %5.2f..%5.2f%%  measured %5.2f%% (%d)%s\n", "",
+    for (size_t i = 0; i < st.rows.size(); i++) {
+      const RowStat& rs = st.rows[i];
+      const bool first = rs.group == static_cast<int>(i);
+      int others = 0;
+      for (const RowStat& o : st.rows) if (&o != &rs && o.group == rs.group) others++;
+      std::printf("env-truth:   %-8s cover %-18s page %5.2f%%  expected %5.2f..%5.2f%%  measured %5.2f%% (%d)%s%s\n", "",
                   rs.material.c_str(), rs.nominalPct,
                   st.columns ? 100.0 * rs.expLo / st.columns : 0.0, st.columns ? 100.0 * rs.expHi / st.columns : 0.0,
-                  st.columns ? 100.0 * rs.measured / st.columns : 0.0, rs.measured, rs.exact ? "" : "  (report only)");
+                  st.columns ? 100.0 * rs.measured / st.columns : 0.0, rs.measured, rs.exact ? "" : "  (report only)",
+                  others ? (first ? "  (measured: this material over all its rows)" : "  (counted with the first row of this material)") : "");
+    }
     std::printf("env-truth:   %-8s water bodies per km2: TODO(P-F) -- the pond table is the water preset's from P-F on\n", "");
     for (const std::string& p : st.problems) std::printf("env-truth:   %s: %s\n", st.name.c_str(), p.c_str());
     js += "    \"" + st.name + "\": {\"index\": " + std::to_string(st.index) + ", \"columns\": " + std::to_string(st.columns) +
