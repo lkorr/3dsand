@@ -191,7 +191,8 @@ fn vsParticle(@builtin(vertex_index) vi : u32,
   // a particle is a free cube in the air, so there is no crease for the glow to
   // be occluded by, and the openness term above already carries what enclosure
   // it sits in.
-  out.color += glowLight(bt.albedo, 1.0, glowAtPos(world, &glow));
+  out.color += glowLight(bt.albedo, 1.0, glowAtPos(world, &glow),
+                         TUNE_GLOW_STRENGTH);
   return out;
 }
 
@@ -266,7 +267,8 @@ fn fsBody(in : BodyVSOut) -> @location(0) vec4f {
   //
   // `in.misc.y` is the ambient openness multiplier the vertex stage measured —
   // the same occlusion the ambient takes, for the same reason.
-  col += glowLight(in.albedo, in.misc.y, glowAtPos(in.world, &glow));
+  col += glowLight(in.albedo, in.misc.y, glowAtPos(in.world, &glow),
+                   TUNE_GLOW_STRENGTH);
   // Same tonemap as fs() and as the terrain: a cube must match the ground it
   // lands on at any time of day.
   return vec4f(tonemapHdr(col), 1.0);

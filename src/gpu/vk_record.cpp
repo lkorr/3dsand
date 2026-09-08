@@ -13,6 +13,20 @@
 #include "sim/world.h"  // kExplosionWg, kNumChunks (pass::kPassStride is in pass_table.h)
 
 namespace vk {
+
+// A SILENT OVERFLOW MADE LOUD. Both pipeline tables -- `Bindings::pipelines` in
+// vk_record.h and `TableBindings::pipelines` in rhi_record.h -- are fixed at 64
+// and indexed by `(int)pass::Pipe`, which grows every time a system adds a
+// kernel. The glow field's three entry points took it to 62. Nothing checked
+// it, and the failure would have been a write past the array inside the
+// recorder rather than a compile error. Lives in this .cpp rather than in
+// either header because a hub header costs the whole tree a recompile and this
+// assertion needs to hold in exactly one place to hold everywhere. Raise BOTH
+// literals together if it ever fires.
+static_assert((int)pass::Pipe::ShadowResolve < 64,
+              "pass::Pipe has outgrown the 64-entry pipeline tables in "
+              "rhi_record.h and vk_record.h -- raise BOTH");
+
 namespace {
 
 // ---- barrier_graph §3.2: Acc -> (stage, access) ---------------------------

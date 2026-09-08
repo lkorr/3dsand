@@ -358,7 +358,8 @@ fn fs(in : VSOut) -> FSOut {
   // `open.x` as the occlusion, not 1.0: unlike a loose particle a limb is a
   // solid body with creases, and this is the same multiplier the ambient took
   // one line up.
-  col += glowLight(albedo, open.x, glowAtPos(worldPos, &glow));
+  col += glowLight(albedo, open.x, glowAtPos(worldPos, &glow),
+                   TUNE_GLOW_STRENGTH);
 
   // ---- THE HIT FLASH -------------------------------------------------------
   // ADDITIVE, and BEFORE the tonemap, because litColor's output is linear HDR

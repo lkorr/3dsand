@@ -283,7 +283,7 @@
   "glow.minNearLum": "0.005",
   "glow.maxFarLum": "0.0",
   "glow.maxRemainPct": "0.0",
-  "glow.srcLumObserved": "0",
-  "glow.nearLumObserved": "0",
+  "glow.srcLumObserved": "0.2924",
+  "glow.nearLumObserved": "0.0602",
   "glow": "pass"
 }

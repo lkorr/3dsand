@@ -249,9 +249,20 @@ fn glowFieldAt(wc : vec3<i32>, block : u32) -> vec3f {
 }
 
 // One chunk's 64 field words, one per thread.
+//
+// THE STAMP GUARD IS NOT OPTIONAL AND IT IS ABOUT THE RING, NOT ABOUT READING.
+// `field`'s expensive branch writes the 3x3x3 chunk neighbourhood of a chunk
+// that changed, and at the edge of the residency window some of those 26
+// neighbours are NOT RESIDENT: `chunkSlotIndex` folds them onto slots holding
+// chunks up to 51.2 m away. Writing there would put an emitter's light into a
+// chunk on the far side of the world, and the reader could not catch it —
+// the slot's stamp is valid, it just names a different chunk than the one whose
+// light we computed. `glowSrcOf` already refuses to READ across that seam;
+// this is the same refusal on the WRITE side, which is the half that corrupts.
 fn glowWriteField(wc : vec3<i32>, block : u32) {
-  glow[glowFieldIndex(chunkSlotIndex(wc), block)] =
-      packRgb9e5(glowFieldAt(wc, block));
+  let slot = chunkSlotIndex(wc);
+  if (glow[glowSrcIndex(slot) + 1u] != opennessStamp(wc)) { return; }
+  glow[glowFieldIndex(slot, block)] = packRgb9e5(glowFieldAt(wc, block));
 }
 
 // ---------------------------------------------------------------- passes ----

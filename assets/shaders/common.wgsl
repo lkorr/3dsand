@@ -3652,7 +3652,7 @@ fn glowAtPos(worldPos : vec3f, gl : ptr<storage, array<u32>, read>) -> vec3f {
 }
 
 // THE ONE PLACE A GLOW WORD BECOMES LIGHT ON A SURFACE, so every consumer
-// weights it identically and `render.glowStrength` moves all of them.
+// weights it identically.
 //
 // `albedo *` because this is incident light being reflected, not emission: a
 // black rock beside lava stays dark and a white one goes orange, which is the
@@ -3660,8 +3660,19 @@ fn glowAtPos(worldPos : vec3f, gl : ptr<storage, array<u32>, read>) -> vec3f {
 // the GI bounce both take it — glow does not reach into a crease either — and
 // NOT the openness scale, which measures SKY and would darken a torch-lit cave
 // to nothing.
-fn glowLight(albedo : vec3f, ao : f32, g : vec3f) -> vec3f {
-  return albedo * ao * g * TUNE_GLOW_STRENGTH;
+//
+// `strength` IS A PARAMETER AND NOT A DIRECT TUNE_GLOW_STRENGTH READ, which is
+// a build-time constraint rather than a style choice. Since the shader cache
+// key names only the tuning consts a module can SEE (resources.cpp
+// ReferencedTuningBlock), a TUNE_ const named anywhere in the un-stripped part
+// of common.wgsl is named by EVERY shader — including worldgen.wgsl, whose
+// `far` entry point is the ~10-minute compile this repo spent a package
+// shortening. Reading the const at the three call sites instead keeps
+// `render.glowStrength` out of worldgen's key, so the `noglow` A/B arm rebuilds
+// three small shaders rather than the world generator. The arithmetic still
+// lives in exactly one place, which is what the invariant was about.
+fn glowLight(albedo : vec3f, ao : f32, g : vec3f, strength : f32) -> vec3f {
+  return albedo * ao * g * strength;
 }
 
 // ---- VOXEL-KEYED SHADOW CACHE (src/sim/world.h kShadowCacheBuckets) --------

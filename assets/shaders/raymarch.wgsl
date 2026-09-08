@@ -8359,7 +8359,8 @@ fn fs(in : VSOut) -> FSOut {
     // raster body paths, which have NO other source of emitter light at all,
     // are the case this field was built for and they are on unconditionally.
     if (TUNE_GLOW_TERRAIN != 0) {
-      color += glowLight(albedo, ao, glowAtCell(h.cell, &glow));
+      color += glowLight(albedo, ao, glowAtCell(h.cell, &glow),
+                         TUNE_GLOW_STRENGTH);
     }
     // ---- one-bounce indirect light, phase P1 (docs/PLAN_gi.md §3) ----
     // What P0 could not do: a sealed room went to zero ambient and stayed

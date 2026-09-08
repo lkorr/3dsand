@@ -5693,6 +5693,133 @@ and `render.heatSpillStrength` are gone.
 - Later: volumetrics for gases; a bilinear over the emitter faces if the
   block-scale edge of a bounce patch ever matters.
 
+### 9.g The glow field — emitter light for the paths a ray cannot reach (added 2026-09-08; `assets/shaders/sim_glow.wgsl`, `src/sim/world.h` `kGlowBytes`)
+
+**The problem is NOT that emission is derived ad hoc.** That was true and §9.y's
+P3 fixed it: `heatSpill` and the per-ray ember probe are deleted, every site
+funnels through `burnTint()`, and `check_burn_tint_sites` in
+`scripts/check_invariants.py` refuses the raw `emission / 255.0` idiom outside
+one. Terrain receives emitter light through the irradiance grid.
+
+**The problem is that three consumers are outside that path, for structural
+reasons rather than for want of wiring.** `giGather` is nine coarse DDA rays
+over `occupancy`; it needs `voxels`, `occupancy` and `pageTable` bound in the
+FRAGMENT stage, and it reaches `render.giGatherBlocks` blocks — 1.2 m at the
+shipped 3.
+
+* `debris.wgsl`'s rigid-body and particle cubes shade in the **vertex** stage,
+  where `renderBGL_` marks `voxels` (0) and `pageTable` (9) Fragment-only. They
+  can neither march a ray nor read a voxel (§9.z).
+* `microbody.wgsl`'s mob limbs shade per fragment but already pay for a sun ray
+  and an openness probe per limb voxel.
+* Neither irradiance injector can **see** a body at all: `shadow_resolve.wgsl`
+  and `sim_openness.wgsl` both read the voxel grid, and a rigid body is not in
+  it.
+
+So a mob standing in a lava pit, a severed limb beside a fire and the burning
+crown that falls off a tree were lit by the **sky alone**.
+
+**What it is.** A coarse world-space field answering "how much emitter light is
+at this POINT" from nothing but a world position, in **one buffer load and no
+ray** — the only shape of answer those paths can consume. Two regions of one
+buffer (one binding per layout, not two):
+
+| region | granularity | contents |
+|---|---|---|
+| source | per chunk slot (1.6 m), 4 words | RGB9E5 emitted radiance, `OpennessStamp`, emitter cell count, changed flag |
+| field | per 4³ block (40 cm), 1 word | RGB9E5 incident glow |
+
+8.5 MiB, against 12 MiB of openness and 48 MiB of irradiance. RGB9E5 rather
+than a scalar because `packRgb9e5`/`unpackRgb9e5` already exist (no second
+packing convention), the HDR exponent lets a lava lake and one ember differ by
+three orders of magnitude with no global scale constant, and it carries the
+COLOUR that makes lava orange and `gem_arcane` violet.
+
+**Why the two granularities differ, which is the design.** The field at a point
+is a sum over emitters within `render.glowReach`, and gather cost goes as the
+CUBE of the reach in source cells: per-voxel sources at 2.4 m would be a 48³ =
+110,592-tap gather per output. Quantising the SOURCE to a chunk makes the same
+reach a 27-tap gather over a 512 KiB region. Evaluating the FALLOFF at 40 cm is
+what keeps the result looking like light rather than a stack of 1.6 m cubes.
+Source quantisation costs precision about *where* the emitter is, invisible at
+1.6 m against a 2.4 m falloff; a coarse field would cost the *shape* of the
+falloff, which is not. Blocks reuse the sub-occupancy index, so the reader adds
+no arithmetic and the feature needs no new prelude constant.
+
+**It cannot latch.** The irradiance grid is an EMA with two writers and only one
+that can discharge, and a face its walk declines to measure keeps yesterday's
+sun forever (§9.y, and the night-glow bug that found it). This field has **no
+memory**: every visit recomputes the source word from the voxels standing in the
+chunk now and overwrites it. Remove the emitter, the removal dirties the chunk,
+the source goes to 0, the change flag fires, and the whole 3×3×3 ring of field
+words is rewritten to 0 on the same tick. There is no decay constant because
+there is nothing to decay, and the gate asserts EXACTLY zero rather than a
+tolerance for that reason.
+
+**Three ceilings, none of them a tuned threshold** (rule 2):
+
+1. The source is a MEAN over the emitting cells times a SATURATING fill factor,
+   so no amount of lava can make a chunk brighter than one lava voxel's own
+   surface. A sum would have had no ceiling at all.
+2. The 27-chunk ring rewrite — the only expensive branch — fires only when the
+   quantised source word actually MOVES. A rippling lava pool takes it zero
+   times; a settled world does no work.
+3. Even when a grove catches fire at once, only the first
+   `render.glowRingBudget` workgroups of the compacted dirty list take it. A
+   prefix of a slot-ordered list, so which chunks win is stable rather than
+   scheduling-dependent, and no atomic and no allocation are involved.
+
+It writes no voxel, no dirty flag and no page-fault word, so it cannot wake a
+chunk — the same claim §9.x makes for the openness walk, and `--gate sleep`
+would notice.
+
+**Two dispatches, and the barrier between them is the point.** `src` writes every
+dirty chunk's source word; `field` gathers the 3×3×3 neighbourhood of those
+words. The second reads what the first wrote for OTHER chunks on the same list,
+so merging them into one entry point would be a race. The `RW(Glow)` →
+`RW(Glow)` edge `vk_record` derives from the two `pass_table.def` rows is what
+makes it a read-after-write. A third entry point, `refresh`, walks
+`render.glowChunksPerFrame` slots per tick doing both stages, as the backstop
+for a cold start, a streamed-in slot and a chunk the ring budget turned away.
+
+**Both sides of the toroidal seam take the stamp.** `glowSrcOf` refuses to READ a
+neighbour whose slot holds a different world chunk; `glowWriteField` refuses to
+WRITE one. The write side is the half that corrupts: the ring rewrite touches 26
+neighbours, and at the window edge `chunkSlotIndex` folds some of them onto
+slots holding chunks 51.2 m away, where the stamp is valid and simply names
+something else.
+
+**Not occluded, and said out loud.** A glow word says what emitters within reach
+are throwing at a point, not whether a wall is in the way. At 1.6 m source
+granularity and a 2.4 m reach the leak is bounded to about one chunk through a
+thin wall, and the term is additive and soft, so the failure mode is a faint
+warm haze behind a lava pit's rim rather than a light in the wrong room. If it
+ever needs occlusion the honest fix is to attenuate along the line by the
+sub-occupancy mask, not to shorten the reach until nobody notices.
+
+**`render.glowTerrain` defaults OFF, and that is a correctness call.** Terrain
+already receives emitter light through `giGather`, so sampling the field at the
+near-field hit as well DOUBLE-COUNTS every emitter inside the gather's 1.2 m. On,
+it extends emitter light to `glowReach` on terrain at the cost of that overlap.
+The raster paths, which have no other source at all, are on unconditionally.
+
+**Verified by** `--selftest --gate glow`, four passes over one fixture: a 4³
+block of `crystal` (a solid mineral, emission 120, no reactions) buried 12 cells
+under the surface, so nothing can move it and the floating-voxel pass cannot
+lift it into a rigid body. A: the source counted all 64 cells and is bright.
+B: the field one block away, across a chunk boundary, is nonzero. C: the field
+two CHUNKS away — outside the gather stencil by construction — is zero, which is
+what stops a producer that returned bright everywhere from passing A, B and D.
+D: the emitter is replaced with stone and both go back to exactly zero.
+`determinismHash` unmoved: no sim pass has a binding for this buffer.
+
+- Later: a `--shot` fixture that puts a rigid body or a mob beside an emitter.
+  None exists today, so the shipping default's visual effect has no camera and
+  the gate's field values are the claim. Also: reconsider whether the irradiance
+  grid should stop carrying emission and let this field own it end to end,
+  which would make `glowTerrain` free of double-counting — that is a change to a
+  cache with its own convergence and wants its own package.
+
 ### 9.t TAA and temporal upscale (added 2026-09-07; `assets/shaders/taa.wgsl`)
 
 `render.renderScale` renders the world at a fraction of the window and blits it
