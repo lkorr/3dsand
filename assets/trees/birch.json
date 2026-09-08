@@ -123,7 +123,7 @@
       "desert": 0
     },
     "minY": -1,
-    "maxY": 22,
+    "maxY": -1,
     "maxSlope": 460,
     "sparsity": 1,
     "shade": 95

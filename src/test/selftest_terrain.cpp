@@ -105,6 +105,7 @@
 #include <vector>
 
 #include "sim/tuning.h"
+#include "sim/worldmap.h"
 #include "test/selftest.h"
 #include "test/support.h"
 
@@ -408,7 +409,7 @@ PassAOut PassA(World& world, uint32_t seed, std::string* log) {
   // What still must hold is that the treeline is reachable SOMEWHERE the
   // transects see: below it there are trees, above it there is snow.
   {
-    const int treeline = CurrentTuning().worldgen.treeline;
+    const int treeline = worldmap::CurrentTerrain().treeline;
     if (treeline <= o.farMin || treeline >= o.farMax) {
       o.ok = false;
       o.why += Format("%streeline y%d outside the far-transect surface band "
@@ -424,20 +425,22 @@ PassAOut PassA(World& world, uint32_t seed, std::string* log) {
   // moved to vnoise2d, whose cell is a LOG2 SHIFT: there is no cs^2 left to
   // overflow, and the failure mode became a range one instead. Below 3 the
   // Q15 in-cell fraction has no bits left; above 15 q15frac shifts DOWN and the
-  // field goes blocky. LoadTuning clamps to that window; this asserts the clamp
-  // is actually reaching these three knobs.
+  // field goes blocky. LoadWorldMap clamps the map's terrain to that window
+  // (P-G: the cells are map.json `terrain`); this asserts the clamp is
+  // actually reaching the four live octaves.
   {
-    const auto& w = CurrentTuning().worldgen;
+    const worldmap::TerrainParams& w = worldmap::CurrentTerrain();
     const struct { const char* name; int log2; } cells[] = {
+        {"rangeLog2", w.rangeLog2},
         {"hillLog2", w.hillLog2},
         {"detailLog2", w.detailLog2},
-        {"biomeLog2", w.biomeLog2},
+        {"grainLog2", w.grainLog2},
     };
     for (const auto& c : cells) {
       if (c.log2 < 3 || c.log2 > 15) {
         o.ok = false;
-        o.why += Format("%sworldgen.%s = %d is outside vnoise2d's 3..15 log2 "
-                        "window (LoadTuning is supposed to clamp it)",
+        o.why += Format("%sterrain.%s = %d is outside vnoise2d's 3..15 log2 "
+                        "window (LoadWorldMap is supposed to clamp it)",
                         o.why.empty() ? "" : "; ", c.name, c.log2);
       }
     }

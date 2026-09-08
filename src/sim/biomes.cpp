@@ -60,6 +60,8 @@ Conditions ReadCond(const json& j) {
   c.nearWaterMaxM = Get<float>(s, "nearWaterMax", c.nearWaterMaxM);
   c.nearWaterMinM = Get<float>(s, "nearWaterMin", c.nearWaterMinM);
   c.patchThreshold = Get<int>(s, "patchThreshold", c.patchThreshold);
+  c.canopyMin = std::clamp(Get<int>(s, "canopyMin", c.canopyMin), 0, 255);
+  c.canopyMax = std::clamp(Get<int>(s, "canopyMax", c.canopyMax), 0, 255);
   return c;
 }
 
@@ -168,9 +170,22 @@ bool LoadBiomeSet(const std::string& assetDir, const std::vector<MaterialDef>& m
       row.cond = ReadCond(r);
       b.caves.push_back(row);
     }
-    const json& ov = Sub(Sub(j, "terrain"), "overrides");
-    for (auto it = ov.begin(); it != ov.end(); ++it)
-      if (it->is_number()) b.terrainOverrides[it.key()] = it->get<double>();
+    // P-G: the relief record. A file without it (or with a short curve)
+    // keeps the identity, which is exactly what a biome that says nothing
+    // about its terrain means: the map's relief, unchanged.
+    {
+      const json& te = Sub(j, "terrain");
+      const json& cv = te.contains("curve") ? te["curve"] : json();
+      if (cv.is_array() && cv.size() == 9) {
+        bool all = true;
+        for (const json& k : cv) all = all && k.is_number();
+        if (all)
+          for (int i = 0; i < 9; i++) b.terrain.curve[i] = std::clamp(cv[static_cast<size_t>(i)].get<int>(), -16384, 16384);
+      }
+      b.terrain.hill = std::clamp(Get<int>(te, "hill", 256), 0, 4096);
+      b.terrain.detail = std::clamp(Get<int>(te, "detail", 256), 0, 4096);
+      b.terrain.grain = std::clamp(Get<int>(te, "grain", 256), 0, 4096);
+    }
     out.biomes.push_back(std::move(b));
   }
 

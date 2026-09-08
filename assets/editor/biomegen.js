@@ -153,9 +153,21 @@ export function defaultConditions() {
     maxSlope: 1024,      // Q8 landform slope gate (256 = 45 deg = repose)
     nearWaterMax: -1,    // metres; only within this distance of a water body
     nearWaterMin: 0,     // metres; keep at least this far from water
-    patchThreshold: 0    // 0..255; only where the row's patch noise is above this
+    patchThreshold: 0,   // 0..255; only where the row's patch noise is above this
+    // P-G: the CANOPY band (cover rows only). worldgen's undergrowthSite
+    // cover, 0 = open sky .. 255 = deep under overlapping crowns; 0 / 255 =
+    // unbounded. What the engine's hard-coded undergrowth / flower chain
+    // became: the shade plants author canopyMin 96, the gap flowers
+    // canopyMax 95, the woodland-margin rose 40..95.
+    canopyMin: 0,
+    canopyMax: 255
   };
 }
+
+/** The identity relief curve: nine Q14 knots on a uniform grid, exactly the
+ *  diagonal, so a biome that authors nothing keeps the map's relief bit for
+ *  bit (worldgen.wgsl curveOne). */
+export const CURVE_IDENTITY = [-16384, -12288, -8192, -4096, 0, 4096, 8192, 12288, 16384];
 
 export function defaultBiome() {
   return {
@@ -168,7 +180,13 @@ export function defaultBiome() {
       notes: ''
     },
     terrain: {
-      overrides: {}                  // worldgen.<key>: value — this biome's terrain knobs
+      // P-G: the biome's RELIEF, read by the height mirror through the biome
+      // record (worldmap.h kB_CurveKnot0..kB_GrainMul), blended over the four
+      // map cells around a column so biomes never meet on a cliff.
+      curve: CURVE_IDENTITY.slice(),   // 9 Q14 knots over the coarse relief's swing; below the diagonal = flatter
+      hill: 256,                       // Q8 multipliers on the map's hill / detail / grain octaves (256 = the map's)
+      detail: 256,
+      grain: 256
     },
     cover: {
       skin: 'grass',                 // the topmost ground cell
@@ -216,7 +234,27 @@ function merge(dst, src) {
   return dst;
 }
 
-export function normalizeConditions(c) { return merge(defaultConditions(), c || {}); }
+export function normalizeConditions(c) {
+  const out = merge(defaultConditions(), c || {});
+  out.canopyMin = Math.min(255, Math.max(0, out.canopyMin | 0));
+  out.canopyMax = Math.min(255, Math.max(0, out.canopyMax | 0));
+  return out;
+}
+
+/** The biome's terrain block, coerced: nine integer knots in -16384..16384
+ *  and three Q8 multipliers in 0..4096, exactly what the loader clamps to. */
+export function normalizeTerrain(t) {
+  const src = t && typeof t === 'object' ? t : {};
+  const curve = Array.isArray(src.curve) && src.curve.length === 9
+      ? src.curve.map(k => Math.min(16384, Math.max(-16384, Math.round(+k || 0))))
+      : CURVE_IDENTITY.slice();
+  const q8 = (v) => Math.min(4096, Math.max(0, Math.round(v === undefined ? 256 : +v || 0)));
+  return {curve, hill: q8(src.hill), detail: q8(src.detail), grain: q8(src.grain)};
+}
+export function terrainIsIdentity(t) {
+  const n = normalizeTerrain(t);
+  return n.hill === 256 && n.detail === 256 && n.grain === 256 && n.curve.every((k, i) => k === CURVE_IDENTITY[i]);
+}
 
 /** One default row per stack — the shape normalizeBiome coerces every row to,
  *  what the biome page's "+ row" buttons push, and what test_environment.mjs
@@ -235,6 +273,7 @@ export function defaultRows() {
 
 export function normalizeBiome(src) {
   const b = merge(defaultBiome(), src || {});
+  b.terrain = normalizeTerrain(src && src.terrain);
   b.cover.groundFlora = b.cover.groundFlora !== false;
   b.cover.cacti = !!b.cover.cacti;
   b.cover.sandCap = !!b.cover.sandCap;

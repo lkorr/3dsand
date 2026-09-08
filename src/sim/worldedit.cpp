@@ -143,7 +143,7 @@ WorldEdits& WorldEditLayer() {
 }
 
 void LoadWorldEditLayerFromTuning(const std::string& assetDir) {
-  const std::string& name = CurrentTuning().worldgen.editLayer;
+  const std::string& name = CurrentTuning().world.editLayer;
   if (name.empty()) {
     if (!WorldEditLayer().Empty()) {
       std::printf("world edits: layer cleared\n");

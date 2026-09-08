@@ -1328,7 +1328,7 @@ bool ReloadEnvironment(GpuContext& ctx, Simulation& sim,
                        const std::vector<MaterialDef>& mats,
                        biomes::EnvironmentStamp& stamp, std::string& log) {
   const std::string assetDir = AssetDir();
-  const std::string mapName = CurrentTuning().worldgen.mapLayer;
+  const std::string mapName = CurrentTuning().world.mapLayer;
   // The same three loads, in the same order and with the same refusals, as
   // boot (main.cpp): the biome set first because it is the id space the other
   // two are laid out in.

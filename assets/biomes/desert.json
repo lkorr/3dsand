@@ -8,7 +8,20 @@
     "notes": "Biome noise above desertThreshold."
   },
   "terrain": {
-    "overrides": {}
+    "curve": [
+      -16384,
+      -12288,
+      -8192,
+      -4096,
+      0,
+      4096,
+      8192,
+      12288,
+      16384
+    ],
+    "hill": 256,
+    "detail": 256,
+    "grain": 256
   },
   "cover": {
     "skin": "sand",
@@ -26,11 +39,13 @@
         "height": 0.3,
         "conditions": {
           "minY": -1,
-          "maxY": -1,
+          "maxY": 227,
           "maxSlope": 1024,
           "nearWaterMax": -1,
           "nearWaterMin": 0,
-          "patchThreshold": 0
+          "patchThreshold": 0,
+          "canopyMin": 0,
+          "canopyMax": 255
         }
       },
       {
@@ -40,11 +55,13 @@
         "height": 0.5,
         "conditions": {
           "minY": -1,
-          "maxY": -1,
+          "maxY": 227,
           "maxSlope": 1024,
           "nearWaterMax": -1,
           "nearWaterMin": 0,
-          "patchThreshold": 0
+          "patchThreshold": 0,
+          "canopyMin": 0,
+          "canopyMax": 255
         }
       },
       {
@@ -54,11 +71,13 @@
         "height": 1.2,
         "conditions": {
           "minY": -1,
-          "maxY": -1,
+          "maxY": 227,
           "maxSlope": 1024,
           "nearWaterMax": -1,
           "nearWaterMin": 0,
-          "patchThreshold": 0
+          "patchThreshold": 0,
+          "canopyMin": 0,
+          "canopyMax": 255
         }
       }
     ],

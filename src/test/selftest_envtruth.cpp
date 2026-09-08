@@ -39,17 +39,20 @@
 // EXPECTED numbers (nominal, thinned onto the engine's one lattice, gated by
 // height, patch and order) are what the GPU is held to.
 //
-// WHAT IT DOES NOT ASSERT, AND SAYS SO. Biomes with the ground-flora flag
-// (forest, meadow, pine, swamp, tundra) run the canopy-inverted undergrowth /
-// flower chain BEFORE the cover stack, with materials hard-coded in the
-// shader — fern, moss, bramble, grass tufts, flowers. That chain is a second,
-// unauthored source of the same materials the rows place, so a row's measured
-// fraction in those biomes is neither bounded above nor below by its page
-// number. Those rows are REPORTED with the unauthored fraction beside them and
-// not asserted; that fraction is recorded through --rebaseline so the day the
-// chain becomes rows (P-G) shows up as a number going to zero. The desert's
-// cactus row shares its material with the proc cactus shape and is treated
-// the same way. Water bodies per km² is P-F's row: `TODO(P-F)` below.
+// WHAT IT DOES NOT ASSERT, AND SAYS SO. Since P-G the shader's undergrowth /
+// flower chain is COVER ROWS (with a canopy condition), so every biome's rows
+// are asserted -- with two exceptions that are still a second source of a
+// row's material: the TILE plants (plantColumnAt's ferns and big toadstools,
+// PLANT_* in common.wgsl, an analytic footprint the renderer rebuilds and
+// not a row) and the desert's proc cactus shape. A row naming one of those
+// materials is REPORTED, not asserted, and a tile-plant cell at h + 1 that no
+// row names is counted as `tilePlant`, beside `unauthored` -- which is now
+// what its name says: a plant NOTHING authored, and its recorded value
+// (envTruthUnauthoredPct_*) is the number that should stay at zero. A row
+// with a CANOPY condition puts its whole share in `hi` and none in `lo`, like
+// a nearWater row: the canopy cover has no CPU twin (it is the 25-tile tree
+// scan), so the row is bounded, not predicted. Water bodies per km² is
+// P-F's row: `TODO(P-F)` below.
 //
 // Thresholds live in tests/baseline.json (envTruth*), not here. Every run
 // writes build/env_truth.json (the per-biome table, predicted and measured)
@@ -155,7 +158,10 @@ double NominalCoverPct(const biomes::CoverRow& r) {
 
 struct RowStat {
   std::string material;
-  bool exact = true;         // asserted, or report-only (flora chain / proc cactus)
+  bool exact = true;         // asserted, or report-only (tile plant / proc cactus)
+  int group = -1;            // index of the FIRST row naming this material (P-G): a voxel
+                             // cannot say which of two rows of one material placed it, so
+                             // rows sharing a material are asserted as ONE sum
   double nominalPct = 0;     // the page's number
   double expLo = 0, expHi = 0, sigma = 0;   // expected COUNT over eligible columns
   int measured = 0;
@@ -170,7 +176,7 @@ struct BiomeStat {
   double treeLo = 0, treeHi = 0, treeSigma = 0;
   int treesMeasured = 0;
   double treesPerHa = 0;
-  int skinOk = 0, subOk = 0, unauthored = 0, treeGround = 0;
+  int skinOk = 0, subOk = 0, unauthored = 0, treeGround = 0, tilePlant = 0;
   bool flora = false, cacti = false;
   double tGen = 0, tTwin = 0, tRead = 0;   // seconds: pack+upload+worldgen, the CPU twins, the readback
   std::vector<RowStat> rows;
@@ -178,6 +184,9 @@ struct BiomeStat {
 };
 
 std::string Pct(double f) { return Format("%.2f%%", f * 100.0); }
+// The tile plants (worldgen.wgsl plantColumnAt, common.wgsl PLANT_*): placed
+// by footprint, not by row, so a row naming them is a second source.
+bool IsTilePlant(const std::string& material) { return material == "fern" || material == "mushroom_large"; }
 
 }  // namespace
 
@@ -200,9 +209,8 @@ Status GateEnvTruth(Ctx& c, std::string& detail) {
   TreeAtlas atlas;
   if (!LoadTreeAtlas(dir + "/trees", c.mats, set, atlas, log)) return fail("tree atlas did not load: " + log);
   const worldmap::WorldMapData real = worldmap::CurrentWorldMap();   // a COPY: the synthetic maps derive from it
-  if (!real.Loaded()) return fail("no world map loaded (worldgen.mapLayer = " + CurrentTuning().worldgen.mapLayer + ")");
-  const Tuning& tune = CurrentTuning();
-  const int treeline = tune.worldgen.treeline;
+  if (!real.Loaded()) return fail("no world map loaded (world.mapLayer = " + CurrentTuning().world.mapLayer + ")");
+  const int treeline = worldmap::CurrentTerrain().treeline;
 
   // ---- thresholds (tests/baseline.json) -----------------------------------------
   const double sigmas = BaselineNumber("envTruthSigmas", 3.0);
@@ -319,7 +327,7 @@ Status GateEnvTruth(Ctx& c, std::string& detail) {
   // or its shore.
   World::AuthoredPool pools[World::kAuthoredPools];
   World::AuthoredPoolList(pools);
-  const int pRim = (80 * kVoxelsPerMetre) / std::max(1, tune.worldgen.refVoxelsPerMetre);
+  const int pRim = (80 * kVoxelsPerMetre) / std::max(1, worldmap::CurrentTerrain().refVoxelsPerMetre);
   auto inRim = [&](int x, int z) {
     for (const World::AuthoredPool& p : pools) {
       const long long dx = x - p.cx, dz = z - p.cz;
@@ -385,7 +393,7 @@ Status GateEnvTruth(Ctx& c, std::string& detail) {
     const uint32_t nRows = R[worldmap::kB_CoverCount];
     const uint32_t* rows = words.data() + R[worldmap::kB_CoverOff];
     const double chanceQ16 = R[worldmap::kB_TreeChanceQ16] / 65536.0;
-    struct Row { uint32_t mat, head, chance; int minY, maxY, nwMax, nwMin, patch; double pf; };
+    struct Row { uint32_t mat, head, chance; int minY, maxY, nwMax, nwMin, patch, canopyMin, canopyMax; double pf; };
     std::vector<Row> rowv;
     for (uint32_t i = 0; i < nRows; i++) {
       const uint32_t* r = rows + static_cast<size_t>(i) * worldmap::kCoverRowWords;
@@ -393,15 +401,17 @@ Status GateEnvTruth(Ctx& c, std::string& detail) {
       row.mat = r[worldmap::kC_Mat]; row.head = r[worldmap::kC_Head]; row.chance = r[worldmap::kC_Chance];
       row.minY = static_cast<int32_t>(r[worldmap::kC_MinY]); row.maxY = static_cast<int32_t>(r[worldmap::kC_MaxY]);
       row.nwMax = static_cast<int32_t>(r[worldmap::kC_NearWaterMax]); row.nwMin = static_cast<int32_t>(r[worldmap::kC_NearWaterMin]);
+      row.canopyMin = static_cast<int>(r[worldmap::kC_CanopyMin]); row.canopyMax = static_cast<int>(r[worldmap::kC_CanopyMax]);
       row.patch = std::max(bThresh, static_cast<int>(r[worldmap::kC_PatchThreshold]));
       row.pf = PatchPassFraction(row.patch, pLog2);
       rowv.push_back(row);
       RowStat rs;
       rs.material = row.mat < c.mats.size() ? c.mats[row.mat].name : Format("id%u", row.mat);
       rs.nominalPct = i < b.cover.size() ? NominalCoverPct(b.cover[i]) : 0.0;
-      // Exact only where nothing but the row can place its material: no flora
-      // chain in this biome, and not a cactus material beside the proc cactus.
-      rs.exact = !st.flora && !(st.cacti && rs.material.find("cactus") != std::string::npos);
+      // Exact only where nothing but the row can place its material: not a
+      // tile plant (plantColumnAt places ferns and big toadstools by
+      // footprint) and not a cactus material beside the proc cactus.
+      rs.exact = !IsTilePlant(rs.material) && !(st.cacti && rs.material.find("cactus") != std::string::npos);
       st.rows.push_back(rs);
     }
     auto rowOf = [&](uint32_t m) -> int {
@@ -443,8 +453,9 @@ Status GateEnvTruth(Ctx& c, std::string& detail) {
           if (r.minY >= 0 && h < r.minY) p = 0;
           if (r.maxY >= 0 && h > r.maxY) p = 0;
           p *= r.pf;
-          const bool water = r.nwMax >= 0 || r.nwMin > 0;
-          const double pLo = water ? 0.0 : p, pHi = p;
+          // A nearWater or a canopy condition has no CPU twin: hi only.
+          const bool bounded = r.nwMax >= 0 || r.nwMin > 0 || r.canopyMin > 0 || r.canopyMax < 255;
+          const double pLo = bounded ? 0.0 : p, pHi = p;
           st.rows[i].expLo += remainLo * pLo;
           st.rows[i].expHi += remainHi * pHi;
           st.rows[i].sigma += remainHi * pHi * (1.0 - remainHi * pHi);
@@ -556,6 +567,7 @@ Status GateEnvTruth(Ctx& c, std::string& detail) {
             const int ri = rowOf(above);
             if (ri >= 0) st.rows[ri].measured++;
             else if (treeGroundMats.count(above)) st.treeGround++;
+            else if (above < c.mats.size() && IsTilePlant(c.mats[above].name)) st.tilePlant++;
             else st.unauthored++;
           }
         }
@@ -575,14 +587,35 @@ Status GateEnvTruth(Ctx& c, std::string& detail) {
         st.problems.push_back(Format("trees: %d at %d sites, expected %.1f..%.1f (+-%.1f sigma x %.0f, slack %.0f)",
                                      st.treesMeasured, st.sites, st.treeLo, st.treeHi, st.treeSigma, sigmas, treeSlack));
     }
+    // Rows are asserted per MATERIAL (P-G): the seeded chain rows and a
+    // biome's own rows can name the same plant (forest has a canopy
+    // mushroom_cluster row AND its old one), and the voxel at h + 1 cannot
+    // say which row placed it -- rowOf credits the first. So the group's
+    // expectation is the SUM over its rows (lo, hi, sigma in quadrature) and
+    // the group is exact only if every row in it is.
     for (size_t i = 0; i < st.rows.size(); i++) {
-      RowStat& rs = st.rows[i];
-      if (!rs.exact || st.columns == 0) continue;
-      const double tol = std::max(std::max(sigmas * rs.sigma, coverRelTol * rs.expHi), coverAbsTolPct / 100.0 * st.columns);
-      if (rs.measured < rs.expLo - tol || rs.measured > rs.expHi + tol)
+      st.rows[i].group = static_cast<int>(i);
+      for (size_t j = 0; j < i; j++)
+        if (st.rows[j].material == st.rows[i].material) { st.rows[i].group = st.rows[j].group; break; }
+    }
+    for (size_t i = 0; i < st.rows.size(); i++) {
+      if (st.rows[i].group != static_cast<int>(i) || st.columns == 0) continue;
+      double lo = 0, hi = 0, var = 0;
+      bool exact = true;
+      int measured = 0;
+      for (size_t j = i; j < st.rows.size(); j++) {
+        if (st.rows[j].group != static_cast<int>(i)) continue;
+        lo += st.rows[j].expLo; hi += st.rows[j].expHi; var += st.rows[j].sigma * st.rows[j].sigma;
+        exact = exact && st.rows[j].exact;
+        measured += st.rows[j].measured;
+      }
+      if (!exact) continue;
+      const double sigma = std::sqrt(var);
+      const double tol = std::max(std::max(sigmas * sigma, coverRelTol * hi), coverAbsTolPct / 100.0 * st.columns);
+      if (measured < lo - tol || measured > hi + tol)
         st.problems.push_back(Format("cover %s: %d columns (%s), expected %.0f..%.0f (%s..%s), tol %.0f",
-                                     rs.material.c_str(), rs.measured, Pct(static_cast<double>(rs.measured) / st.columns).c_str(),
-                                     rs.expLo, rs.expHi, Pct(rs.expLo / st.columns).c_str(), Pct(rs.expHi / st.columns).c_str(), tol));
+                                     st.rows[i].material.c_str(), measured, Pct(static_cast<double>(measured) / st.columns).c_str(),
+                                     lo, hi, Pct(lo / st.columns).c_str(), Pct(hi / st.columns).c_str(), tol));
     }
     if (st.columns > 0) {
       const double skinPct = 100.0 * st.skinOk / st.columns, subPct = 100.0 * st.subOk / st.columns;
@@ -611,28 +644,36 @@ Status GateEnvTruth(Ctx& c, std::string& detail) {
   std::string js = "{\n  \"treeTileVox\": " + std::to_string(T) + ",\n  \"biomes\": {\n";
   for (size_t bi = 0; bi < stats.size(); bi++) {
     const BiomeStat& st = stats[bi];
-    std::printf("env-truth: %-7s %6d cols %5.2f ha | trees %3d / %3d sites, exp %5.1f..%5.1f (+-%.1f) = %6.1f/ha (page %6.1f) | skin %s sub %s | tree-ground %s unauthored %s | gen %.2f twin %.2f read %.2f s%s\n",
+    std::printf("env-truth: %-7s %6d cols %5.2f ha | trees %3d / %3d sites, exp %5.1f..%5.1f (+-%.1f) = %6.1f/ha (page %6.1f) | skin %s sub %s | tree-ground %s tile-plant %s unauthored %s | gen %.2f twin %.2f read %.2f s%s\n",
                 st.name.c_str(), st.columns, st.areaHa, st.treesMeasured, st.sites, st.treeLo, st.treeHi, st.treeSigma,
                 st.treesPerHa, st.nominalTreesPerHa,
                 Pct(st.columns ? static_cast<double>(st.skinOk) / st.columns : 0).c_str(),
                 Pct(st.columns ? static_cast<double>(st.subOk) / st.columns : 0).c_str(),
                 Pct(st.columns ? static_cast<double>(st.treeGround) / st.columns : 0).c_str(),
+                Pct(st.columns ? static_cast<double>(st.tilePlant) / st.columns : 0).c_str(),
                 Pct(st.columns ? static_cast<double>(st.unauthored) / st.columns : 0).c_str(),
                 st.tGen, st.tTwin, st.tRead,
-                st.flora ? "  [ground-flora chain: rows reported, not asserted]" : (st.cacti ? "  [proc cactus: cactus rows reported, not asserted]" : ""));
-    for (const RowStat& rs : st.rows)
-      std::printf("env-truth:   %-8s cover %-18s page %5.2f%%  expected %5.2f..%5.2f%%  measured %5.2f%% (%d)%s\n", "",
+                st.flora ? "  [tile plants: fern / mushroom_large rows reported, not asserted]" : (st.cacti ? "  [proc cactus: cactus rows reported, not asserted]" : ""));
+    for (size_t i = 0; i < st.rows.size(); i++) {
+      const RowStat& rs = st.rows[i];
+      const bool first = rs.group == static_cast<int>(i);
+      int others = 0;
+      for (const RowStat& o : st.rows) if (&o != &rs && o.group == rs.group) others++;
+      std::printf("env-truth:   %-8s cover %-18s page %5.2f%%  expected %5.2f..%5.2f%%  measured %5.2f%% (%d)%s%s\n", "",
                   rs.material.c_str(), rs.nominalPct,
                   st.columns ? 100.0 * rs.expLo / st.columns : 0.0, st.columns ? 100.0 * rs.expHi / st.columns : 0.0,
-                  st.columns ? 100.0 * rs.measured / st.columns : 0.0, rs.measured, rs.exact ? "" : "  (report only)");
+                  st.columns ? 100.0 * rs.measured / st.columns : 0.0, rs.measured, rs.exact ? "" : "  (report only)",
+                  others ? (first ? "  (measured: this material over all its rows)" : "  (counted with the first row of this material)") : "");
+    }
     std::printf("env-truth:   %-8s water bodies per km2: TODO(P-F) -- the pond table is the water preset's from P-F on\n", "");
     for (const std::string& p : st.problems) std::printf("env-truth:   %s: %s\n", st.name.c_str(), p.c_str());
     js += "    \"" + st.name + "\": {\"index\": " + std::to_string(st.index) + ", \"columns\": " + std::to_string(st.columns) +
           Format(", \"areaHa\": %.4f, \"sites\": %d, \"treesMeasured\": %d, \"treesExpectedLo\": %.3f, \"treesExpectedHi\": %.3f, \"treesSigma\": %.3f, \"treesPerHa\": %.2f, \"treesPerHaPage\": %.2f",
                  st.areaHa, st.sites, st.treesMeasured, st.treeLo, st.treeHi, st.treeSigma, st.treesPerHa, st.nominalTreesPerHa) +
-          Format(", \"skinPct\": %.3f, \"subsoilPct\": %.3f, \"treeGroundPct\": %.3f, \"unauthoredPct\": %.3f, \"groundFlora\": %s",
+          Format(", \"skinPct\": %.3f, \"subsoilPct\": %.3f, \"treeGroundPct\": %.3f, \"tilePlantPct\": %.3f, \"unauthoredPct\": %.3f, \"groundFlora\": %s",
                  st.columns ? 100.0 * st.skinOk / st.columns : 0.0, st.columns ? 100.0 * st.subOk / st.columns : 0.0,
-                 st.columns ? 100.0 * st.treeGround / st.columns : 0.0, st.columns ? 100.0 * st.unauthored / st.columns : 0.0,
+                 st.columns ? 100.0 * st.treeGround / st.columns : 0.0, st.columns ? 100.0 * st.tilePlant / st.columns : 0.0,
+                 st.columns ? 100.0 * st.unauthored / st.columns : 0.0,
                  st.flora ? "true" : "false") +
           ", \"cover\": [";
     for (size_t i = 0; i < st.rows.size(); i++) {

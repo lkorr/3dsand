@@ -7,11 +7,15 @@
  * structure: a biome is not a sibling of a tree species, it is the thing that
  * SELECTS tree species. So this tab has a sidebar with two groups —
  *
- *   BIOMES       one page per assets/biomes/<name>.json: the feature stacks
- *                (cover, trees, water, caves) and a composed swatch
+ *   WORLD        the World map page: THE FRONT DOOR (PLAN_environment_truth
+ *                P-I). Where the biomes are, the terrain numbers, every site
+ *                (pad, spawn, water, landform, stamp), the map + edit layer
+ *                the game loads, and the heightmap / voxel previews.
+ *   BIOMES       one page per assets/biomes/<name>.json: the relief record,
+ *                the feature stacks (cover, trees, water, caves) and a
+ *                composed swatch
  *   COMPONENTS   the libraries the stacks pick from: Trees (the existing
- *                editor, unchanged, mounted here), Water bodies (new), and the
- *                engine's Caves and Ground cover knobs as they exist today
+ *                editor, unchanged, mounted here) and Water bodies
  *
  * — and the pages link to each other: a biome's tree row has "edit species →",
  * a water row has "edit preset →", and the band strip on the climate section
@@ -42,8 +46,8 @@ let dirtyBy = {};
 let els = {};
 let envActive = false;
 
-const PAGE_ORDER = ['map', 'biome', 'trees', 'water', 'caves', 'cover'];
-const PAGE_LABEL = {map: 'World map', trees: 'Trees', water: 'Water bodies', caves: 'Caves', cover: 'Ground cover'};
+const PAGE_ORDER = ['map', 'biome', 'trees', 'water'];
+const PAGE_LABEL = {map: 'World map', trees: 'Trees', water: 'Water bodies'};
 
 const CSS = `
 #view-environment.active{display:flex;gap:10px;height:calc(100vh - 150px);min-height:520px}
@@ -87,7 +91,7 @@ function showPage(id) {
 }
 
 function apiOf(id) {
-  return id === 'trees' ? Trees : id === 'water' ? Water : id === 'biome' ? Biome : null;
+  return id === 'trees' ? Trees : id === 'water' ? Water : id === 'biome' ? Biome : id === 'map' ? WorldMap : null;
 }
 
 /** Deep link from a page: open a biome / species / preset by name. */
@@ -100,62 +104,10 @@ async function openPage(id, name) {
   } catch (e) { H.toast('could not open ' + id + '/' + name + ': ' + (e && e.message || e), true); }
 }
 
-/* ---------------------------------------------------------------------------
- * the engine-knob pages (Caves, Ground cover): the Worldgen tab's rows for one
- * subject, built by the same tuneRow so a knob has one definition.
- * ------------------------------------------------------------------------- */
-function knobPage(id, intro, match) {
-  const el = H.el;
-  const page = pages[id];
-  page.innerHTML = '';
-  page.classList.add('envknobs');
-  page.append(el('div', {class: 'envintro'}, ...intro));
-  const T = H.tuning && H.tuning();
-  const tab = T && T.schema ? T.schema.find(t => t.id === 'worldgen') : null;
-  if (!tab || !T.tune) {
-    page.append(el('div', {class: 'hint'}, 'No tuning.json loaded — run the tuner through python scripts/tuner_server.py.'));
-    return;
-  }
-  const body = el('div', {class: 'trows'});
-  let n = 0, sec = null, secHas = false;
-  for (const pr of tab.params) {
-    if (pr.sec) { sec = pr.sec; secHas = false; continue; }
-    if (!match(pr.k)) continue;
-    if (sec && !secHas) {
-      body.append(el('div', {class: 'tsec'}, el('b', {}, sec.t), sec.d ? el('span', {}, sec.d) : null));
-      secHas = true;
-    }
-    body.append(T.tuneRow(tab, pr, T.paramGroup(tab, pr), T.touchTune));
-    n++;
-  }
-  if (!n) body.append(el('div', {class: 'hint'}, 'No worldgen knob matches this subject.'));
-  page.append(body);
-}
-
-const CAVE_KEYS = /^cave|lava|magma/i;
-const COVER_KEYS = /^(flower|grass|tallGrass|tussock|scrub|desertPatch|heath|alpine|cactus|undergrowth|fern|moss|mushroom|bramble|sapling|litter|meadow|sed|treeline)/i;
-
-function paintKnobPages() {
-  const el = H.el;
-  knobPage('caves', [
-    el('b', {}, 'Caves — the engine today. '),
-    'worldgen carves two bands world-wide: a near-surface band under caveThreshold1 and a deep band under ',
-    'caveThreshold2, both stone-walled, with lava below LAVA_LEVEL through the one caveFill() route. These are ',
-    'the live knobs (they write tuning.json; a new world shows them). ',
-    el('b', {}, 'Per-biome caves'), ': each biome page’s cave stack sets THIS biome’s two thresholds (read; a ',
-    'biome with no row keeps these globals). caveMushroomChance / caveCrystalChance become per-biome rows in ',
-    'P-E of docs/PLAN_environment_truth.md, which deletes those two knobs here.'
-  ], k => CAVE_KEYS.test(k));
-  knobPage('cover', [
-    el('b', {}, 'Ground cover — the engine today. '),
-    'The flora worldgen paints per column: meadow tall grass and flowers, desert tussock and scrub behind a ',
-    'patch mask, pine heath, the alpine cushion above the treeline, and the undergrowth layer that reads ',
-    'canopy shade rather than biome. These knobs are world-wide; the ',
-    el('b', {}, 'per-biome version is each biome page’s Ground cover stack'), ', which worldgen READS (the cover ',
-    'rows, the patch mask, the groundFlora / cacti / sandCap flags that gate these blocks). cactusChance and ',
-    'saguaroFraction move onto the biome page in P-E of docs/PLAN_environment_truth.md, which deletes them here.'
-  ], k => COVER_KEYS.test(k));
-}
+/* (The Caves and Ground cover knob pages that stood here rendered the
+ * Worldgen tab's tuning rows for one subject each. Those rows are gone with
+ * the group -- P-G moved the terrain to the map and the flora to the biome
+ * files, P-I deleted the tab -- so the pages went with them.) */
 
 /* ---------------------------------------------------------------------------
  * sidebar
@@ -208,11 +160,11 @@ async function paintNav() {
   nav.append(add);
 
   nav.append(el('h4', {}, 'Components'));
-  for (const id of ['trees', 'water', 'caves', 'cover']) {
+  for (const id of ['trees', 'water']) {
     const b = el('button', {'data-page': id, class: current === id ? 'on' : ''},
                  el('span', {}, PAGE_LABEL[id]),
                  el('span', {class: 'pill' + (dirtyBy[id] ? ' dirty' : '')},
-                    dirtyBy[id] ? 'unsaved' : (id === 'caves' || id === 'cover' ? 'engine knobs' : 'library')));
+                    dirtyBy[id] ? 'unsaved' : 'library'));
     b.addEventListener('click', () => showPage(id));
     nav.append(b);
   }
@@ -317,7 +269,6 @@ export function attach(hooks) {
   Water.attach(shared('water'));
   Biome.attach(shared('biome'));
   WorldMap.attach(shared('map'));
-  paintKnobPages();
   paintNav();
   current = 'map';
 
@@ -330,10 +281,9 @@ export function attach(hooks) {
 export function activate() {
   envActive = root.classList.contains('active');
   // tuning.json arrives asynchronously in the tuner, usually AFTER this module
-  // attached: rebuild the knob pages (idempotent) and let the biome page add
-  // its band strip and terrain rows once tuning is there.
-  paintKnobPages();
+  // attached: the map page's selectors (world.mapLayer / editLayer) read it.
   if (Biome.tuningAvailable) Biome.tuningAvailable();
+  if (WorldMap.tuningAvailable) WorldMap.tuningAvailable();
   showPage(current || 'map');
   paintNav();
 }
@@ -342,7 +292,6 @@ export function activate() {
 export function saveFromHost() {
   const api = apiOf(current);
   if (api && api.saveFromHost) api.saveFromHost();
-  else if (H.saveTuning) H.saveTuning();     // the knob pages edit tuning.json
 }
 export function isDirty() { return Object.values(dirtyBy).some(Boolean); }
 
@@ -350,4 +299,4 @@ export function isDirty() { return Object.values(dirtyBy).some(Boolean); }
 export function _pages() { return pages; }
 export function _current() { return current; }
 export function _open(id, name) { return openPage(id, name); }
-export const _modules = {Trees, Water, Biome};
+export const _modules = {Trees, Water, Biome, WorldMap};

@@ -122,8 +122,8 @@
       "pine": 34,
       "desert": 0
     },
-    "minY": 19,
-    "maxY": 23.6,
+    "minY": -1,
+    "maxY": -1,
     "maxSlope": 640,
     "sparsity": 1,
     "shade": 240

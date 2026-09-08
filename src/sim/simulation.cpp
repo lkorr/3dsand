@@ -18,6 +18,8 @@
 // The pond lattice the live shaders were compiled with (POND_TILE), so an
 // environment reload that moves it recompiles them (UploadEnvironment).
 static int sPondTileCompiled = -1;
+// The same for the map's reference scale (REF_VOXELS_PER_METRE, P-G).
+static int sRefVpmCompiled = -1;
 
 // kPassStride (the passUBO dynamic-offset slice stride) moved to pass_table.h
 // when the Vulkan recorder became a second consumer of it — see the note there.
@@ -43,6 +45,7 @@ bool Simulation::Init(const rhi::Device& device, World& world,
   // CurrentWorldMap by the caller); remembered so UploadEnvironment knows
   // whether a reload moved it under the compiled shaders.
   sPondTileCompiled = worldmap::CurrentWorldMap().pondTile;
+  sRefVpmCompiled = worldmap::CurrentTerrain().refVoxelsPerMetre;
 
   // The baked tree atlas. Sized to what the assets actually hold rather than to
   // a ceiling constant: it is load-time asset data, it never grows, and the
@@ -813,6 +816,7 @@ void Simulation::UploadEnvironment(const rhi::Device& device, const rhi::Queue& 
       if (!ReloadShaders(device))
         std::fprintf(stderr, "environment: shader reload FAILED; the old lattice's pipelines stay live\n");
       sPondTileCompiled = worldmap::CurrentWorldMap().pondTile;
+  sRefVpmCompiled = worldmap::CurrentTerrain().refVoxelsPerMetre;
     }
   }
   // The pond lattice (POND_TILE) is a prelude constant for the same reason
@@ -820,11 +824,14 @@ void Simulation::UploadEnvironment(const rhi::Device& device, const rhi::Queue& 
   // would roll the old lattice against the new rows.
   {
     const int want = worldmap::CurrentWorldMap().pondTile;
-    if (want != sPondTileCompiled) {
-      std::printf("environment: pond lattice %d -> %d, recompiling shaders\n", sPondTileCompiled, want);
+    const int wantRef = worldmap::CurrentTerrain().refVoxelsPerMetre;
+    if (want != sPondTileCompiled || wantRef != sRefVpmCompiled) {
+      std::printf("environment: pond lattice %d -> %d / reference scale %d -> %d, recompiling shaders\n",
+                  sPondTileCompiled, want, sRefVpmCompiled, wantRef);
       if (!ReloadShaders(device))
         std::fprintf(stderr, "environment: shader reload FAILED; the old lattice's pipelines stay live\n");
       sPondTileCompiled = want;
+      sRefVpmCompiled = wantRef;
     }
   }
 }
