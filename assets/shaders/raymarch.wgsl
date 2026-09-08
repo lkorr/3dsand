@@ -2878,22 +2878,56 @@ fn traceFar(ro : vec3f, rdIn : vec3f, tStart : f32, px : vec2f) -> FarHit {
     let tEnter = max(max(tmin.x, tmin.y), max(tmin.z, tPrev / s));
     let tExit = min(tmax.x, min(tmax.y, tmax.z));
     if (tExit <= tEnter) { continue; }   // box missed (or fully behind tPrev)
+    // TEMP-DIAG (W1-B): borrowed slot, remove before commit
+    rsAdd(RS_PX_SUB, 1u);
 
-    var t = tEnter + 1e-4;
-    var p = roL + rd * t;
-    let loI = org * i32(CHUNK);
-    var cell = clamp(vec3<i32>(floor(p)), loI, loI + vec3<i32>(i32(FAR_N) - 1));
+    // ---- NESTED TRAVERSAL: a CHUNK cursor over a CELL cursor ---------------
+    // (2026-09-07.) This was ONE flat cell DDA with a re-seed hack: every time
+    // it found an EMPTY level chunk it recomputed that chunk's three exit
+    // planes, took floor() of the ray at the exit t, forced the exit axis and
+    // rebuilt all three tMax — and, marching a chunk that was NOT empty, it
+    // re-read farOcc on every one of the sixteen cells after the one that had
+    // already told it what the chunk holds.
+    //
+    // MEASURED, --render-budget noon — the overlook, the camera every far-field
+    // number in this repo comes from: the cascade resolves ZERO pixels there
+    // (rmPxFar 0.000) and still costs 68.7 far steps per FRAME pixel, 120.7 per
+    // SKY ray. The cascade geometry says exactly where those go and there is no
+    // content in the answer: the levels are nested boxes whose half-extent
+    // DOUBLES, so a ray marches the SHELL of level k, which is FAR_N/4..FAR_N/2
+    // cells = 8..16 chunks across, and there are FAR_LEVELS shells. ~8 x ~15 =
+    // ~120 chunk crossings, every one of them a full re-seed of empty air.
+    //
+    // Two cursors (voxelbit's L2/L1 split): the CHUNK cursor advances with one
+    // compare and one add and is all an empty chunk ever costs; the CELL cursor
+    // is seeded ONLY for a chunk with something in it. Same cells tested, same
+    // hit, one farOcc load per CHUNK instead of one per cell.
+    //
+    // THE TWO CURSORS ARE INDEPENDENT — the cell cursor never advances the
+    // chunk cursor — so their floating-point accumulations cannot drift into
+    // disagreeing about which chunk comes next. A cell cursor that drifts a
+    // hair past its chunk's exit only tests a cell of the NEXT chunk one step
+    // early, and farByteAt is addressed by POSITION, not by chunk, so that is
+    // the same answer sooner. Coverage stays contiguous because the inner loop
+    // is bounded by the chunk cursor's own exit time, which is where the next
+    // chunk's inner loop starts.
     let stepv = vec3<i32>(sign(rd));
     let tDelta = abs(inv);
-    var tMax : vec3f;
-    for (var a = 0; a < 3; a++) {
-      let boundary = f32(cell[a]) + select(0.0, 1.0, rd[a] > 0.0);
-      tMax[a] = (boundary - roL[a]) * inv[a];
-    }
+    let cDelta = tDelta * f32(CHUNK);
+    let loI = org * i32(CHUNK);
+
     var axis = 0;
     if (tmin.y > tmin.x && tmin.y > tmin.z) { axis = 1; }
     else if (tmin.z > tmin.x && tmin.z > tmin.y) { axis = 2; }
-    var tCur = t;
+
+    var tCur = tEnter + 1e-4;
+    var cc = worldChunkOf(clamp(vec3<i32>(floor(roL + rd * tCur)),
+                                loI, loI + vec3<i32>(i32(FAR_N) - 1)));
+    var cNext : vec3f;
+    for (var a = 0; a < 3; a++) {
+      let b = f32((cc[a] + select(0, 1, rd[a] > 0.0)) * i32(CHUNK));
+      cNext[a] = (b - roL[a]) * inv[a];
+    }
 
     // Where this level's COVERAGE ends, for the seam below: the box exit
     // unless the step budget runs out first. A ray that exhausts
@@ -2902,124 +2936,134 @@ fn traceFar(ro : vec3f, rdIn : vec3f, tStart : f32, px : vec2f) -> FarHit {
     // and a grazing ray over a long terrain band could open a sky-coloured hole
     // in a hillside. Now the next (coarser) level picks up at the stop point:
     // the budget is an LOD handoff, not a cliff, and farSteps can be tuned for
-    // the frame instead of for the worst ray.
+    // the frame instead of for the worst ray. The stop point reported is the
+    // CHUNK cursor's, i.e. the entry face of the chunk the budget died in —
+    // conservative by up to one chunk, which makes the next level re-cover a
+    // little instead of leaving a hole.
     var tStop = tExit;
+    var budget = TUNE_FAR_STEPS;
 
-    for (var i = 0; i < TUNE_FAR_STEPS; i++) {
+    while (budget > 0) {
       rsAdd(RS_FAR, 1u);
-      if (i == TUNE_FAR_STEPS - 1) { tStop = tCur; }
-      if (!farInBox(cell, org)) { break; }
-      let occ = farOcc[farOccIndex(level, cell)];
-      let ch = worldChunkOf(cell);
-      // Where this level chunk ends along the ray, for the two skips below.
-      let clo = vec3f(ch * i32(CHUNK));
-      let ex = max((clo - roL) * inv, (clo + f32(CHUNK) - roL) * inv);
-      let tOut = max(min(ex.x, min(ex.y, ex.z)), tCur);
-      var toExit = occ == 0u;
-      if (!toExit) {
+      // TEMP-DIAG (W1-B): borrowed slot, remove before commit
+      rsAdd(RS_MICRO, 1u);
+      budget -= 1;
+      if (!farInBox(cc * i32(CHUNK), org)) { break; }
+      if (tCur >= tExit) { break; }
+      let tOut = min(cNext.x, min(cNext.y, cNext.z));
+      let occ = farOcc[farOccIndex(level, cc * i32(CHUNK))];
+      if (occ != 0u) {
         // ---- THE ROW SKIP (the farOcc word, common.wgsl) ----
         // Above the chunk's highest non-empty row there is nothing to hit. An
-        // ascending ray leaves through the exit face; a descending one drops
-        // straight onto that row — the DDA resumes there with the y crossing
-        // forced, exactly as the seam-safe chunk jump forces its exit axis.
+        // ascending ray is done with the chunk before the cell cursor is even
+        // seeded; a descending one is dropped straight onto that row, with the
+        // y crossing forced exactly as the flat march used to force it.
         // Every cell skipped is air by the producers' own accounting, so the
         // hit (and the miss) is the one the cell-by-cell march would find.
+        var tIn = tCur;
+        var walk = true;
         let top = farOccTop(occ);
-        let yTop = ch.y * i32(CHUNK) + i32(top);
-        if (top != 0u && cell.y >= yTop) {
-          let tPlane = max((f32(yTop) - roL.y) * inv.y, tCur);
-          if (rd.y >= 0.0 || tPlane + 1e-4 >= tOut) {
-            toExit = true;
-          } else {
-            t = tPlane + 1e-4;
-            if (t >= tExit) { break; }
-            p = roL + rd * t;
-            var nc = vec3<i32>(floor(p));
-            nc.y = yTop - 1;
-            if (!farInBox(nc, org)) { break; }
-            cell = nc;
-            for (var a = 0; a < 3; a++) {
-              let boundary = f32(cell[a]) + select(0.0, 1.0, rd[a] > 0.0);
-              tMax[a] = (boundary - roL[a]) * inv[a];
+        if (top != 0u) {
+          let yTop = cc.y * i32(CHUNK) + i32(top);
+          let yEnter = roL.y + rd.y * (tIn + 1e-4);
+          if (yEnter >= f32(yTop)) {
+            if (rd.y >= 0.0) {
+              walk = false;
+            } else {
+              let tPlane = max((f32(yTop) - roL.y) * inv.y, tIn);
+              if (tPlane + 1e-4 >= tOut) {
+                walk = false;
+              } else {
+                tIn = tPlane + 1e-4;
+                axis = 1;
+                // TEMP-DIAG (W1-B): borrowed slot, remove before commit
+                rsAdd(RS_FLUID, 1u);
+              }
             }
-            tCur = t;
-            axis = 1;
-            continue;
+          }
+        }
+        if (walk) {
+          // Seed the CELL cursor inside this chunk. Clamped into the chunk
+          // because the entry point sits ON a face and floor() of it can land
+          // a hair either side.
+          let cLo = cc * i32(CHUNK);
+          var vCur = tIn;
+          var vc = clamp(vec3<i32>(floor(roL + rd * (tIn + 1e-4))),
+                         cLo, cLo + vec3<i32>(i32(CHUNK) - 1));
+          var vMax : vec3f;
+          for (var a = 0; a < 3; a++) {
+            let boundary = f32(vc[a]) + select(0.0, 1.0, rd[a] > 0.0);
+            vMax[a] = (boundary - roL[a]) * inv[a];
+          }
+          // 3 * CHUNK is the most cells a 3D DDA can visit crossing a CHUNK^3
+          // box; the loop leaves on tOut long before that for any ray that is
+          // not a body diagonal.
+          for (var j = 0; j < 3 * i32(CHUNK); j++) {
+            if (budget <= 0) { break; }
+            rsAdd(RS_FAR, 1u);
+            // TEMP-DIAG (W1-B): borrowed slot, remove before commit
+            rsAdd(RS_GODRAY, 1u);
+            budget -= 1;
+            let cellByte = farByteAt(level, vc);
+            var mat = cellByte & FAR_MAT_MASK;
+            // THE BLOCKER FLAG AS A PRIMARY HIT, behind render.farBlockerHitLevel.
+            //
+            // Shadows take the flag at every level (farShadowDist) because a
+            // shadow that is half a cell too tall on the horizon costs nothing.
+            // The VISIBLE surface cannot: the flag is set for every cell whose
+            // floor is at or below the ground, so honouring it raises the
+            // terrain by up to one cell EVERYWHERE — 0.4 m at level 1, 51 m at
+            // level 8. Past the knob the horizon stops being a ridge and
+            // becomes the staircase 13.2.2 predicted, which is why this is a
+            // level cap and not a boolean. 0 is exactly the behaviour before
+            // this flag existed and const-folds the block away.
+            if (mat == 0u && (cellByte & FAR_BLOCKER_BIT) != 0u &&
+                i32(level) <= TUNE_FAR_BLOCKER_HIT_LEVEL) {
+              // The flag carries no material of its own, so take the nearest
+              // one below in this column. NEVER shade air: an unbacked flag (a
+              // cave roof with nothing under it in this level, a cell at the
+              // bottom edge of the box) falls through and the march continues,
+              // which is the old behaviour and the safe direction.
+              var probe = vc;
+              for (var d = 0; d < 3; d++) {
+                probe.y -= 1;
+                if (!farInBox(probe, org)) { break; }
+                let below = farMatAt(level, probe);
+                if (below != 0u) { mat = below; break; }
+              }
+            }
+            if (mat != 0u) {
+              out.hit = true;
+              out.t = vCur * s;   // back to fine-voxel units
+              out.axis = axis;
+              out.sgn = sign(rd[axis]);
+              out.mat = mat;
+              out.cell = vc;
+              out.level = level;
+              return out;
+            }
+            if (vMax.x < vMax.y && vMax.x < vMax.z) {
+              vc.x += stepv.x; vCur = vMax.x; vMax.x += tDelta.x; axis = 0;
+            } else if (vMax.y < vMax.z) {
+              vc.y += stepv.y; vCur = vMax.y; vMax.y += tDelta.y; axis = 1;
+            } else {
+              vc.z += stepv.z; vCur = vMax.z; vMax.z += tDelta.z; axis = 2;
+            }
+            if (vCur >= tOut || vCur >= tExit) { break; }
           }
         }
       }
-      if (toExit) {
-        // empty level chunk (or nothing left in it above the ray): jump to its
-        // exit face (same seam-safe jump as the fine march — force the
-        // crossing on the exit axis)
-        t = tOut + 1e-4;
-        if (t >= tExit) { break; }
-        p = roL + rd * t;
-        var nc = vec3<i32>(floor(p));
-        if (ex.x <= ex.y && ex.x <= ex.z) {
-          nc.x = select(ch.x * i32(CHUNK) - 1, (ch.x + 1) * i32(CHUNK), rd.x > 0.0);
-        } else if (ex.y <= ex.z) {
-          nc.y = select(ch.y * i32(CHUNK) - 1, (ch.y + 1) * i32(CHUNK), rd.y > 0.0);
-        } else {
-          nc.z = select(ch.z * i32(CHUNK) - 1, (ch.z + 1) * i32(CHUNK), rd.z > 0.0);
-        }
-        if (!farInBox(nc, org)) { break; }
-        cell = nc;
-        for (var a = 0; a < 3; a++) {
-          let boundary = f32(cell[a]) + select(0.0, 1.0, rd[a] > 0.0);
-          tMax[a] = (boundary - roL[a]) * inv[a];
-        }
-        tCur = t;
-        continue;
-      }
-
-      let cellByte = farByteAt(level, cell);
-      var mat = cellByte & FAR_MAT_MASK;
-      // THE BLOCKER FLAG AS A PRIMARY HIT, behind render.farBlockerHitLevel.
-      //
-      // Shadows take the flag at every level (farShadowed) because a shadow
-      // that is half a cell too tall on the horizon costs nothing. The VISIBLE
-      // surface cannot: the flag is set for every cell whose floor is at or
-      // below the ground, so honouring it raises the terrain by up to one cell
-      // EVERYWHERE — 0.4 m at level 1, 51 m at level 8. Past the knob the
-      // horizon stops being a ridge and becomes the staircase 13.2.2 predicted,
-      // which is why this is a level cap and not a boolean. 0 is exactly the
-      // behaviour before this flag existed and const-folds the block away.
-      if (mat == 0u && (cellByte & FAR_BLOCKER_BIT) != 0u &&
-          i32(level) <= TUNE_FAR_BLOCKER_HIT_LEVEL) {
-        // The flag carries no material of its own, so take the nearest one
-        // below in this column. NEVER shade air: an unbacked flag (a cave roof
-        // with nothing under it in this level, a cell at the bottom edge of the
-        // box) falls through and the march continues, which is the old
-        // behaviour and the safe direction.
-        var probe = cell;
-        for (var d = 0; d < 3; d++) {
-          probe.y -= 1;
-          if (!farInBox(probe, org)) { break; }
-          let below = farMatAt(level, probe);
-          if (below != 0u) { mat = below; break; }
-        }
-      }
-      if (mat != 0u) {
-        out.hit = true;
-        out.t = tCur * s;   // back to fine-voxel units
-        out.axis = axis;
-        out.sgn = sign(rd[axis]);
-        out.mat = mat;
-        out.cell = cell;
-        out.level = level;
-        return out;
-      }
-
-      if (tMax.x < tMax.y && tMax.x < tMax.z) {
-        cell.x += stepv.x; tCur = tMax.x; tMax.x += tDelta.x; axis = 0;
-      } else if (tMax.y < tMax.z) {
-        cell.y += stepv.y; tCur = tMax.y; tMax.y += tDelta.y; axis = 1;
+      // The chunk cursor: one compare and one add, and it is ALL an empty
+      // level chunk costs now.
+      if (cNext.x <= cNext.y && cNext.x <= cNext.z) {
+        tCur = cNext.x; cNext.x += cDelta.x; cc.x += stepv.x;
+      } else if (cNext.y <= cNext.z) {
+        tCur = cNext.y; cNext.y += cDelta.y; cc.y += stepv.y;
       } else {
-        cell.z += stepv.z; tCur = tMax.z; tMax.z += tDelta.z; axis = 2;
+        tCur = cNext.z; cNext.z += cDelta.z; cc.z += stepv.z;
       }
-      if (tCur >= tExit) { break; }
     }
+    if (budget <= 0) { tStop = tCur; }
     // Level k -> k+1 seam. The outer level's cells are 2s fine voxels, so half
     // a coarse cell is s: pull this handoff up to s nearer and the ring where
     // level k's box ends dissolves. Still max()'d against the running tPrev so
@@ -3095,6 +3139,29 @@ fn farLevelForDist(distFine : f32) -> u32 {
   return FAR_LEVELS;
 }
 
+// MATERIAL CELLS ONLY — the conservative blocker flag is NOT a shadow caster
+// (changed in the LOD-seam pass, 2026-09-04; it was, at every level, since
+// 13.2.2). The flag marks every cell whose footprint MAY hold terrain, which on
+// a slope or a terrace is the whole band of cells the ground surface passes
+// through — including the row a surface receiver's ray starts in and the rows
+// its neighbours' flags occupy. Honouring it shadowed most of the far surface
+// at near-zero distance. The old flat x0.3 lift turned that into a general
+// dimming (the far meadow rendered ~20% darker than the near one, measured on
+// screenshot_ground), and the near field's contact-dark softening law made it a
+// black stipple.
+//
+// Measured, same frame, far-meadow mean RGB against the near meadow's
+// (126, 172, 110): flags honoured 94/123/90; flags honoured only above the
+// start row 94/123/90 (no better — the flagged band is not one row deep); flags
+// ignored 126/165/109; far shadows off entirely 128/168/111. Material cells
+// carry every caster a shadow can show at cascade scale; what the flag adds is
+// a half-cell crest that the near field would not shadow either. The flag keeps
+// its other reader (traceFar's primary-hit path, behind
+// render.farBlockerHitLevel).
+fn farShadowBlocked(level : u32, vc : vec3<i32>) -> bool {
+  return (farByteAt(level, vc) & FAR_MAT_MASK) != 0u;
+}
+
 // Returns the distance to the blocker in FINE voxels, or -1.0 when the ray
 // left the level box / its reach unblocked. The distance is what lets a far
 // receiver take the SAME softening law the near field uses
@@ -3114,103 +3181,99 @@ fn farShadowDist(level : u32, roFine : vec3f) -> f32 {
   let tt1 = (lo + f32(FAR_N) - roL) * inv;
   let tExit = min(max(tt0.x, tt1.x), min(max(tt0.y, tt1.y), max(tt0.z, tt1.z)));
 
-  var cell = vec3<i32>(floor(roL));
+  // ---- THE SAME NESTED CURSOR traceFar RUNS (2026-09-07) -------------------
+  // An occlusion ray is already ANY-HIT with an immediate exit here (the
+  // `return tCur * s` on the first material cell below): it keeps no nearest
+  // bookkeeping and never walks past a caster. What it did NOT have was cheap
+  // empty space — it re-seeded a whole DDA per empty level chunk and re-read
+  // farOcc on every cell of an occupied one. Reach is TUNE_FAR_SHADOW_REACH
+  // (24 m), which at level 1 is 7.5 level chunks and at level 2 is 3.7, so
+  // most of a sun ray's budget was spent crossing chunks, not testing cells.
+  //
+  // The two other occlusion disciplines a cascade ray could want are already
+  // here or do not apply, and it is worth saying which is which:
+  //   - FACING AWAY FROM THE SUN: the call sites gate on `lambert > 0.0`
+  //     (wrapDiffuse), which is this engine's back-face test — a face past the
+  //     wrap terminator never reaches this function at all. Cutting at
+  //     dot(n,sun) <= 0 instead would not save a ray that is cast today, it
+  //     would RESHADE the wrapped band, so it belongs to lighting, not to
+  //     traversal.
+  //   - A WORLD CEILING: the row skip below IS that test, at chunk
+  //     granularity and from data that already exists (farOccTop). A ray above
+  //     a chunk's highest non-empty row and climbing is done with the chunk
+  //     without touching a cell. A far shadow ray STARTS on a far surface, so
+  //     a global above-the-terrain test could never fire for it.
   let stepv = vec3<i32>(sign(rd));
   let tDelta = abs(inv);
-  var tMax : vec3f;
-  for (var a = 0; a < 3; a++) {
-    let boundary = f32(cell[a]) + select(0.0, 1.0, rd[a] > 0.0);
-    tMax[a] = (boundary - roL[a]) * inv[a];
-  }
+  let cDelta = tDelta * f32(CHUNK);
+
   var tCur = 0.0;
-  let steps = farShadowSteps(level);
-  for (var i = 0; i < steps; i++) {
+  var cc = worldChunkOf(vec3<i32>(floor(roL)));
+  var cNext : vec3f;
+  for (var a = 0; a < 3; a++) {
+    let b = f32((cc[a] + select(0, 1, rd[a] > 0.0)) * i32(CHUNK));
+    cNext[a] = (b - roL[a]) * inv[a];
+  }
+  var budget = farShadowSteps(level);
+  while (budget > 0) {
     rsAdd(RS_FAR_SHADOW, 1u);
-    if (!farInBox(cell, org)) { return -1.0; }
-    let occ = farOcc[farOccIndex(level, cell)];
-    let ch = worldChunkOf(cell);
-    let clo = vec3f(ch * i32(CHUNK));
-    let ex = max((clo - roL) * inv, (clo + f32(CHUNK) - roL) * inv);
-    let tOut = max(min(ex.x, min(ex.y, ex.z)), tCur);
-    var toExit = occ == 0u;
-    if (!toExit) {
+    budget -= 1;
+    if (!farInBox(cc * i32(CHUNK), org)) { return -1.0; }
+    if (tCur >= tExit) { return -1.0; }
+    let tOut = min(cNext.x, min(cNext.y, cNext.z));
+    let occ = farOcc[farOccIndex(level, cc * i32(CHUNK))];
+    if (occ != 0u) {
       // The row skip (traceFar has the full note): a sun ray that has climbed
       // above the chunk's highest non-empty row cannot be blocked in it.
+      var tIn = tCur;
+      var walk = true;
       let top = farOccTop(occ);
-      let yTop = ch.y * i32(CHUNK) + i32(top);
-      if (top != 0u && cell.y >= yTop) {
-        let tPlane = max((f32(yTop) - roL.y) * inv.y, tCur);
-        if (rd.y >= 0.0 || tPlane + 1e-4 >= tOut) {
-          toExit = true;
-        } else {
-          let t = tPlane + 1e-4;
-          if (t >= tExit) { return -1.0; }
-          let p = roL + rd * t;
-          var nc = vec3<i32>(floor(p));
-          nc.y = yTop - 1;
-          if (!farInBox(nc, org)) { return -1.0; }
-          cell = nc;
-          for (var a = 0; a < 3; a++) {
-            let boundary = f32(cell[a]) + select(0.0, 1.0, rd[a] > 0.0);
-            tMax[a] = (boundary - roL[a]) * inv[a];
+      if (top != 0u) {
+        let yTop = cc.y * i32(CHUNK) + i32(top);
+        let yEnter = roL.y + rd.y * (tIn + 1e-4);
+        if (yEnter >= f32(yTop)) {
+          if (rd.y >= 0.0) {
+            walk = false;
+          } else {
+            let tPlane = max((f32(yTop) - roL.y) * inv.y, tIn);
+            if (tPlane + 1e-4 >= tOut) { walk = false; }
+            else { tIn = tPlane + 1e-4; }
           }
-          tCur = t;
-          continue;
+        }
+      }
+      if (walk) {
+        let cLo = cc * i32(CHUNK);
+        var vCur = tIn;
+        var vc = clamp(vec3<i32>(floor(roL + rd * (tIn + 1e-4))),
+                       cLo, cLo + vec3<i32>(i32(CHUNK) - 1));
+        var vMax : vec3f;
+        for (var a = 0; a < 3; a++) {
+          let boundary = f32(vc[a]) + select(0.0, 1.0, rd[a] > 0.0);
+          vMax[a] = (boundary - roL[a]) * inv[a];
+        }
+        for (var j = 0; j < 3 * i32(CHUNK); j++) {
+          if (budget <= 0) { break; }
+          rsAdd(RS_FAR_SHADOW, 1u);
+          budget -= 1;
+          if (farShadowBlocked(level, vc)) { return vCur * s; }
+          if (vMax.x < vMax.y && vMax.x < vMax.z) {
+            vc.x += stepv.x; vCur = vMax.x; vMax.x += tDelta.x;
+          } else if (vMax.y < vMax.z) {
+            vc.y += stepv.y; vCur = vMax.y; vMax.y += tDelta.y;
+          } else {
+            vc.z += stepv.z; vCur = vMax.z; vMax.z += tDelta.z;
+          }
+          if (vCur >= tOut || vCur >= tExit) { break; }
         }
       }
     }
-    if (toExit) {
-      // empty level chunk (or nothing left above the ray): jump to its exit
-      // face (seam-safe, as in traceFar)
-      let t = tOut + 1e-4;
-      if (t >= tExit) { return -1.0; }
-      let p = roL + rd * t;
-      var nc = vec3<i32>(floor(p));
-      if (ex.x <= ex.y && ex.x <= ex.z) {
-        nc.x = select(ch.x * i32(CHUNK) - 1, (ch.x + 1) * i32(CHUNK), rd.x > 0.0);
-      } else if (ex.y <= ex.z) {
-        nc.y = select(ch.y * i32(CHUNK) - 1, (ch.y + 1) * i32(CHUNK), rd.y > 0.0);
-      } else {
-        nc.z = select(ch.z * i32(CHUNK) - 1, (ch.z + 1) * i32(CHUNK), rd.z > 0.0);
-      }
-      if (!farInBox(nc, org)) { return -1.0; }
-      cell = nc;
-      for (var a = 0; a < 3; a++) {
-        let boundary = f32(cell[a]) + select(0.0, 1.0, rd[a] > 0.0);
-        tMax[a] = (boundary - roL[a]) * inv[a];
-      }
-      tCur = t;
-      continue;
-    }
-    // MATERIAL CELLS ONLY — the conservative blocker flag is NOT a shadow
-    // caster (changed in the LOD-seam pass, 2026-09-04; it was, at every level,
-    // since 13.2.2). The flag marks every cell whose footprint MAY hold
-    // terrain, which on a slope or a terrace is the whole band of cells the
-    // ground surface passes through — including the row a surface receiver's
-    // ray starts in and the rows its neighbours' flags occupy. Honouring it
-    // shadowed most of the far surface at near-zero distance. The old flat
-    // x0.3 lift turned that into a general dimming (the far meadow rendered
-    // ~20% darker than the near one, measured on screenshot_ground), and the
-    // near field's contact-dark softening law made it a black stipple.
-    //
-    // Measured, same frame, far-meadow mean RGB against the near meadow's
-    // (126, 172, 110): flags honoured 94/123/90; flags honoured only above the
-    // start row 94/123/90 (no better — the flagged band is not one row deep);
-    // flags ignored 126/165/109; far shadows off entirely 128/168/111. Material
-    // cells carry every caster a shadow can show at cascade scale; what the
-    // flag adds is a half-cell crest that the near field would not shadow
-    // either. The flag keeps its other reader (traceFar's primary-hit path,
-    // behind render.farBlockerHitLevel).
-    let byte = farByteAt(level, cell);
-    if ((byte & FAR_MAT_MASK) != 0u) { return tCur * s; }
-    if (tMax.x < tMax.y && tMax.x < tMax.z) {
-      cell.x += stepv.x; tCur = tMax.x; tMax.x += tDelta.x;
-    } else if (tMax.y < tMax.z) {
-      cell.y += stepv.y; tCur = tMax.y; tMax.y += tDelta.y;
+    if (cNext.x <= cNext.y && cNext.x <= cNext.z) {
+      tCur = cNext.x; cNext.x += cDelta.x; cc.x += stepv.x;
+    } else if (cNext.y <= cNext.z) {
+      tCur = cNext.y; cNext.y += cDelta.y; cc.y += stepv.y;
     } else {
-      cell.z += stepv.z; tCur = tMax.z; tMax.z += tDelta.z;
+      tCur = cNext.z; cNext.z += cDelta.z; cc.z += stepv.z;
     }
-    if (tCur >= tExit) { return -1.0; }
   }
   return -1.0;
 }
