@@ -68,7 +68,13 @@ fn inBounds(c : vec3<i32>) -> bool { return inWindow(c, T.origin); }
 // Mark the chunk containing world cell c dirty for next tick, plus every
 // neighbor chunk c borders (cross-chunk neighbors re-evaluate; sleeping is
 // per-chunk). Chunks outside the residency window don't exist to mark.
-fn markDirty(c : vec3<i32>) {
+//
+// `reason` is one of common.wgsl's DIRTY_R_* bits and is ORed in rather than
+// stored, so a chunk's flag names every rule that asked for it this tick. See
+// the block there: the plain markDirty() below keeps the old call shape for
+// the write paths, which are the overwhelming majority of the call sites and
+// the only ones that also markVoxActive.
+fn markDirtyR(c : vec3<i32>, reason : u32) {
   let lo = c & vec3<i32>(CHUNK_MASK);
   let ch = worldChunkOf(c);
   var xs = array<i32, 2>(0, 0);
@@ -82,11 +88,59 @@ fn markDirty(c : vec3<i32>) {
       for (var k = 0; k < 2; k++) {
         let n = ch + vec3<i32>(xs[i], ys[j], zs[k]);
         if (chunkInWindow(n, T.origin)) {
-          atomicStore(&dirtyOut[chunkSlotIndex(n)], 1u);
+          atomicOr(&dirtyOut[chunkSlotIndex(n)], reason);
         }
       }
     }
   }
+}
+
+fn markDirty(c : vec3<i32>) { markDirtyR(c, DIRTY_R_WRITE); }
+
+// ---- WHICH STAGE of stepLiquid moved the mass, and was the mover SUBMERGED --
+//
+// DIRTY_R_MOVE established that a pond's chunks stay awake because water is
+// genuinely still being written, every tick, forever. It cannot say WHICH of
+// the seven liquid moves does it, and those have completely different
+// termination arguments: descent strictly decreases SUM(f*y), equalize / split
+// / bridge strictly decrease SUM(f*f), and the two film rules are NEUTRAL in
+// both. Only a neutral move can cycle, so naming the stage names the bug.
+//
+// SUBMERGED is the owner's invariant, measured rather than assumed: a cell with
+// the same liquid directly above it should be FULL, so it should never be the
+// SOURCE of a lateral transfer at all. If the lateral stages come back firing
+// on submerged cells, the interior of every pond is levelling itself sideways
+// forever and stage 3 has to become a free-surface stage.
+//
+// Local to this file rather than common.wgsl on purpose: common.wgsl is
+// prepended to every shader, so editing it invalidates the whole SPIR-V cache
+// and costs the ~9-minute worldgen far-cascade recompile. Diagnostic only —
+// nothing branches on these.
+const DIRTY_M_DOWN      : u32 = 4096u;    // stage 1: straight down
+const DIRTY_M_DIAG      : u32 = 8192u;    // stage 2: axis/corner down-diagonals
+const DIRTY_M_EQUAL     : u32 = 16384u;   // stage 3: same-liquid equalize
+const DIRTY_M_SPLIT     : u32 = 32768u;   // stage 3: halve into air
+const DIRTY_M_FILM      : u32 = 65536u;   // stage 3: last-eighth film step
+const DIRTY_M_DISPLACE  : u32 = 131072u;  // stage 3: displace a lighter fluid
+const DIRTY_M_BRIDGE    : u32 = 262144u;  // stage 4: level two neighbours
+const DIRTY_M_SUBMERGED : u32 = 524288u;  // the mover had its own liquid above
+const DIRTY_M_SPILL     : u32 = 1048576u; // RETIRED: the submerged whole-cell
+                                          // spill, kept as a reserved bit and a
+                                          // signpost to the block in stepLiquid
+                                          // that says why it is not a rule.
+// The non-liquid movers, so "MOVE with no liquid stage" stops being a blank.
+const DIRTY_M_POWDER    : u32 = 2097152u;
+const DIRTY_M_GAS       : u32 = 4194304u;
+const DIRTY_M_SOLO      : u32 = 8388608u;  // a one-voxel solid island falling
+
+// Is there more of this same liquid directly ABOVE c? Out of window reads as
+// "no": the residency edge is solid and inert, so a cell at the top of the
+// window counts as a free surface, which is the conservative direction — it may
+// still move, it is not frozen.
+fn liquidSubmerged(c : vec3<i32>, mat : u32) -> bool {
+  let a = c + vec3<i32>(0, 1, 0);
+  if (!inBounds(a)) { return false; }
+  return voxMat(voxWordAt(a)) == mat;
 }
 
 // Can a mover of (klass, density) enter the cell holding word tw?
@@ -154,8 +208,8 @@ fn tryMove(src : vec3<i32>, dst : vec3<i32>, myWord : u32, myDensity : i32, risi
   let si = voxWordIndex((src));
   voxStore(si, packVoxKeepStain(voxMat(tw), voxState(tw), stamp, tw));
   markVoxActive(si);
-  markDirty(src);
-  markDirty(dst);
+  markDirtyR(src, DIRTY_R_MOVE);
+  markDirtyR(dst, DIRTY_R_MOVE);
   // a powder sliding out from under a solid may leave it floating
   let myKlass = materials[voxMat(myWord)].klass;
   if (myKlass == CLASS_POWDER) { flagSupportLoss(src, myKlass, voxMat(tw)); }
@@ -186,8 +240,8 @@ fn transferLiquid(src : vec3<i32>, dst : vec3<i32>, mat : u32,
   markVoxActive(si);
   voxStore(di, packVoxKeepStain(mat, df + t - 1u, stamp, dw));
   markVoxActive(di);
-  markDirty(src);
-  markDirty(dst);
+  markDirtyR(src, DIRTY_R_MOVE);
+  markDirtyR(dst, DIRTY_R_MOVE);
 }
 
 // The six face directions with their RDIR_* bits: -y, +y, then laterals.
@@ -434,7 +488,7 @@ fn doReactions(c : vec3<i32>, idx : u32, slotIdx : u32, w : u32, mat : u32,
         if (rule.prodSelf == 0u) { voxStore(idx, 0u); }
         else { voxStore(idx, packVox(rule.prodSelf, productState(rule.prodSelf, rnd), stamp)); }
         markVoxActive(idx);
-        markDirty(c);
+        markDirtyR(c, DIRTY_R_REACTW);
         flagSupportLoss(c, m.klass, rule.prodSelf);  // ember->ash drops the wood above
         return true;
       }
@@ -451,8 +505,8 @@ fn doReactions(c : vec3<i32>, idx : u32, slotIdx : u32, w : u32, mat : u32,
         if ((rr % REACT_CHANCE_DEN) < rule.chance) {
           voxStore(ni, packVox(rule.prodNbr, productState(rule.prodNbr, rr >> 4u), stamp));
           markVoxActive(ni);
-          markDirty(n);
-          markDirty(c);
+          markDirtyR(n, DIRTY_R_REACTW);
+          markDirtyR(c, DIRTY_R_REACTW);
           if (rule.prodSelf != PROD_KEEP) {
             if (rule.prodSelf == 0u) { voxStore(idx, 0u); }
             else { voxStore(idx, packVox(rule.prodSelf, productState(rule.prodSelf, rnd), stamp)); }
@@ -495,7 +549,7 @@ fn doReactions(c : vec3<i32>, idx : u32, slotIdx : u32, w : u32, mat : u32,
             if (rule.prodNbr == 0u) { voxStore(ni, 0u); }
             else { voxStore(ni, packVox(rule.prodNbr, productState(rule.prodNbr, rr >> 4u), stamp)); }
             markVoxActive(ni);
-            markDirty(n);
+            markDirtyR(n, DIRTY_R_REACTW);
             if (!synthFluid) {
               flagSupportLoss(n, materials[nmat].klass, rule.prodNbr);
             }
@@ -504,18 +558,18 @@ fn doReactions(c : vec3<i32>, idx : u32, slotIdx : u32, w : u32, mat : u32,
             if (rule.prodSelf == 0u) { voxStore(idx, 0u); }
             else { voxStore(idx, packVox(rule.prodSelf, productState(rule.prodSelf, rnd), stamp)); }
             markVoxActive(idx);
-            markDirty(c);
+            markDirtyR(c, DIRTY_R_REACTW);
             flagSupportLoss(c, m.klass, rule.prodSelf);
             return true;
           }
-          markDirty(c);
+          markDirtyR(c, DIRTY_R_REACTW);
           return false;  // neighbor transformed; self may still move
         }
         break;  // one roll per rule per tick
       }
     }
   }
-  if (keepAwake) { markDirty(c); }
+  if (keepAwake) { markDirtyR(c, DIRTY_R_REACT); }
   return false;
 }
 
@@ -675,8 +729,8 @@ fn doStaining(c : vec3<i32>, idx : u32, m : Material, rnd : u32) -> bool {
       if (washed == 0u) { washedType = 0u; }
       voxStore(ni, (nw & ~STAIN_BITS) | packStain(washedType, washed));
       markVoxActive(ni);
-      markDirty(n);
-      markDirty(c);
+      markDirtyR(n, DIRTY_R_STAINW);
+      markDirtyR(c, DIRTY_R_STAINW);
       break;
     }
 
@@ -700,7 +754,7 @@ fn doStaining(c : vec3<i32>, idx : u32, m : Material, rnd : u32) -> bool {
     }
     voxStore(ni, (nw & ~STAIN_BITS) | packStain(stainType, amt));
     markVoxActive(ni);
-    markDirty(n);
+    markDirtyR(n, DIRTY_R_STAINW);
 
     // ---- absorption: the liquid SPENDS itself soaking in ----
     // Only when the ground actually declared a capacity, and only for a liquid
@@ -740,7 +794,7 @@ fn doStaining(c : vec3<i32>, idx : u32, m : Material, rnd : u32) -> bool {
       // The voxel that vanished may have been holding a solid up.
       flagSupportLoss(n, nk, MAT_AIR);
     }
-    markDirty(c);
+    markDirtyR(c, DIRTY_R_STAINW);
     break;  // one neighbour per tick — bounds the rule's rate (rule 2)
   }
   return progress;
@@ -1093,6 +1147,11 @@ fn bridgeLevel(c : vec3<i32>, mat : u32, apply : bool) -> bool {
 // step. Same shape as the powder path's "nothing to do: cell settles".
 fn canFlowAnywhere(c : vec3<i32>, w : u32, mat : u32, m : Material) -> bool {
   let f = voxState(w) + 1u;
+  // Mirrors stepLiquid's hydrostatic gate one for one -- see the long block
+  // there. Drift in the loose direction pins chunks awake forever, drift in the
+  // tight direction lets a cell sleep with work left, and this predicate is
+  // exactly where the never-sleeping pond was decided.
+  let submerged = liquidSubmerged(c, mat);
 
   // 1) down: a partial same-liquid cell to top up, or anything displaceable.
   if (canDescend(c, c + vec3<i32>(0, -1, 0), mat, m.density)) { return true; }
@@ -1122,6 +1181,7 @@ fn canFlowAnywhere(c : vec3<i32>, w : u32, mat : u32, m : Material) -> bool {
     let nw = voxWordAt(n);
     let nmat = voxMat(nw);
     if (nmat == mat) {
+      if (submerged) { continue; }
       if (voxState(nw) + 1u + TUNE_LIQUID_EQUALIZE <= f) { return true; }
     } else if (nmat == MAT_AIR) {
       if (f >= LIQ_SPLIT_MIN) { return true; }
@@ -1133,7 +1193,7 @@ fn canFlowAnywhere(c : vec3<i32>, w : u32, mat : u32, m : Material) -> bool {
   }
   // 4) last resort: level two of the neighbours THROUGH this cell. Same scan and
   //    same predicate as the moving path — one function, so they cannot drift.
-  return bridgeLevel(c, mat, false);
+  return !submerged && bridgeLevel(c, mat, false);
 }
 
 // Mass-conserving liquid flow (fullness in eighths, DESIGN.md §4).
@@ -1141,15 +1201,68 @@ fn canFlowAnywhere(c : vec3<i32>, w : u32, mat : u32, m : Material) -> bool {
 // decide whether a settled cell still has a reason to stay awake (defect 4).
 fn stepLiquid(c : vec3<i32>, idx : u32, w : u32, mat : u32, m : Material, rnd : u32) -> bool {
   let f = voxState(w) + 1u;  // fullness 1..8
+  // Diagnostic only (the DIRTY_M_* block above): tagged onto every successful
+  // move so ONE run says which stage keeps a settled pond awake, and whether
+  // the mover was under its own liquid at the time.
+  // ---- THE HYDROSTATIC INVARIANT: A SUBMERGED CELL IS A FULL CELL ---------
+  //
+  // An eighth is a SURFACE thing. Anything with this same liquid standing on
+  // top of it is full, and that is a statement about where lateral flow is
+  // allowed to come FROM -- which is why it is also the reason a settled pond
+  // could not sleep.
+  //
+  // MEASURED, by the DIRTY_M_* histogram this same block feeds: at the
+  // authored home_lake the chunks that never slept were marked
+  //   equalize 854 | bridge 912 | SUBMERGED 1180
+  // i.e. the pond was levelling its own INTERIOR sideways, an eighth at a
+  // time, forever. Both of those rules are same-liquid levelling -- they exist
+  // to flatten a free surface -- and running them at depth is what created the
+  // partial submerged cells that then gave them more work to do.
+  //
+  // WHAT CHANGES, and why each one keeps its termination argument:
+  //   * EQUALIZE (stage 3, same liquid) and BRIDGE (stage 4) are refused for a
+  //     submerged cell. Under the invariant they were unreachable anyway (two
+  //     full cells cannot differ by TUNE_LIQUID_EQUALIZE); the gate is what
+  //     stops a transient violation from feeding itself.
+  //   * SPLIT into air (stage 3) HALVES, which leaves the source submerged and
+  //     half empty -- the invariant broken by the very rule that drains a
+  //     breached wall. A submerged cell gives EVERYTHING instead, so the source
+  //     lands on AIR rather than on a partial cell. It is also the better
+  //     picture: pressure pushes a whole cell of water out of the hole and the
+  //     column above collapses into the gap, instead of the wall weeping.
+  //
+  // TERMINATION (rule 2) for the spill, which is the only genuinely new move.
+  // It is NEUTRAL in both of this file's Lyapunov functions -- same y, and
+  // (8,0) -> (0,8) has the same SUM(f*f) -- so it needs its own argument, and
+  // it gets one free from the gate. The source is SUBMERGED by definition, so
+  // once it empties there is liquid directly above an AIR cell, and stage 1
+  // descent moves that liquid down: SUM(f*y) strictly decreases, and it is a
+  // bounded integer. Every spill is therefore followed by a strict decrease, so
+  // there can only be finitely many of them. A cell that is not submerged
+  // cannot spill at all, which leaves the old halving (and its own proof) in
+  // charge of every free-surface case.
+  //
+  // NOT CHANGED, because they already preserve the invariant by construction:
+  // the film step and the displace-a-lighter-fluid branch are WHOLE-CELL moves,
+  // so their source ends as air or as the other fluid, never as a partial cell
+  // with water standing on it.
+  let submerged = liquidSubmerged(c, mat);
+  let sub = select(0u, DIRTY_M_SUBMERGED, submerged);
 
   // 1) straight down: top a partial same-liquid cell up, else move/swap whole.
-  if (tryDescend(c, c + vec3<i32>(0, -1, 0), w, mat, f, m.density)) { return true; }
+  if (tryDescend(c, c + vec3<i32>(0, -1, 0), w, mat, f, m.density)) {
+    markDirtyR(c, DIRTY_M_DOWN | sub);
+    return true;
+  }
 
   // 2a) the four AXIS down-diagonals, RNG order.
   let r = rnd >> 10u;
   for (var i = 0u; i < 4u; i++) {
     let d = lateralDir(i + r);
-    if (tryDescend(c, c + vec3<i32>(d.x, -1, d.y), w, mat, f, m.density)) { return true; }
+    if (tryDescend(c, c + vec3<i32>(d.x, -1, d.y), w, mat, f, m.density)) {
+      markDirtyR(c, DIRTY_M_DIAG | sub);
+      return true;
+    }
   }
   // 2b) the four CORNER down-diagonals, RNG order, after the axis ones (the
   //     shorter path wins) and only where the corner is a real path and not a
@@ -1157,7 +1270,10 @@ fn stepLiquid(c : vec3<i32>, idx : u32, w : u32, mat : u32, m : Material, rnd : 
   for (var i = 0u; i < 4u; i++) {
     let d = cornerDir(i + r);
     if (!cornerDescentOpen(c, d)) { continue; }
-    if (tryDescend(c, c + vec3<i32>(d.x, -1, d.y), w, mat, f, m.density)) { return true; }
+    if (tryDescend(c, c + vec3<i32>(d.x, -1, d.y), w, mat, f, m.density)) {
+      markDirtyR(c, DIRTY_M_DIAG | sub);
+      return true;
+    }
   }
 
   // 3) lateral: equalize into a same-liquid neighbor holding at least the
@@ -1194,15 +1310,43 @@ fn stepLiquid(c : vec3<i32>, idx : u32, w : u32, mat : u32, m : Material, rnd : 
     let nw = voxWordAt((n));
     let nmat = voxMat(nw);
     if (nmat == mat) {
+      // Free-surface stage: a submerged cell does not level sideways.
+      if (submerged) { continue; }
       let nf = voxState(nw) + 1u;
       if (nf + TUNE_LIQUID_EQUALIZE <= f) {
         transferLiquid(c, n, mat, f, nf, (f - nf) / 2u);
+        markDirtyR(c, DIRTY_M_EQUAL | sub);
         return true;
       }
     } else if (nmat == MAT_AIR) {
+      // THE SPILL, AND WHY IT IS NOT HERE.
+      //
+      // A submerged cell HALVING into a lateral void leaves the source
+      // submerged and half empty — the invariant broken by the very rule that
+      // drains a breached wall — so the obvious repair is to let a submerged
+      // cell give its WHOLE content instead, landing the source on air rather
+      // than on a partial cell. It was written, and it was MEASURED, and it
+      // costs rule 2: `ca-level` (216 eighths dropped on flat ground) went from
+      // "0 of 8 box chunks awake, quiet from tick 30" to "2 awake, quiet from
+      // -1" — never quiet at all, on the flattest fixture there is.
+      //
+      // That is the predictable price of the only move in this file that is
+      // NEUTRAL in BOTH Lyapunov functions: same y, and (8,0) -> (0,8) has the
+      // same SUM(f*f). Its termination argument leaned on the descent that
+      // refills the emptied source, and a descent that only USUALLY follows is
+      // not a proof. A rule that cannot show it terminates does not belong in
+      // the CA, however good the picture.
+      //
+      // So the halving below stays, and with it a TRANSIENT violation at a
+      // breach: the source drops to f/2 with water still standing on it, and
+      // the descent above refills it over the next few ticks. A settling
+      // artefact at a hole is a different thing from the permanent state of
+      // every pond INTERIOR, which is what the two gates above and below
+      // actually remove.
       // Split only if BOTH halves clear the film floor — see LIQ_MIN_FILM.
       if (f >= LIQ_SPLIT_MIN) {
         transferLiquid(c, n, mat, f, 0u, f / 2u);
+        markDirtyR(c, DIRTY_M_SPLIT | sub);
         return true;
       }
       // Too thin to split: the whole film steps. Two justifications, both
@@ -1216,9 +1360,11 @@ fn stepLiquid(c : vec3<i32>, idx : u32, w : u32, mat : u32, m : Material, rnd : 
       // the cone behind it is a stable resting shape.
       if ((pressed || filmStepAllowed(c, d)) &&
           tryMove(c, n, w, m.density, false)) {
+        markDirtyR(c, DIRTY_M_FILM | sub);
         return true;
       }
     } else if (tryMove(c, n, w, m.density, false)) {
+      markDirtyR(c, DIRTY_M_DISPLACE | sub);
       return true;
     }
   }
@@ -1228,7 +1374,10 @@ fn stepLiquid(c : vec3<i32>, idx : u32, w : u32, mat : u32, m : Material, rnd : 
   //    what drains a mound whose rim has already run away from it, and it is an
   //    ordinary equalize (SUM(f*f) strictly down), just reaching one cell
   //    further.
-  if (bridgeLevel(c, mat, true)) { return true; }
+  if (!submerged && bridgeLevel(c, mat, true)) {
+    markDirtyR(c, DIRTY_M_BRIDGE | sub);
+    return true;
+  }
   return false;  // settled — the caller decides whether to stay awake
 }
 
@@ -1612,7 +1761,10 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
     // reads as such. Failure does NOT markDirty: nothing here may keep a chunk
     // awake forever (CLAUDE.md rule 2), and any change around it re-dirties the
     // chunk through the ordinary paths.
-    if (tryMove(c, c + vec3<i32>(0, -1, 0), w, m.density, false)) { return; }
+    if (tryMove(c, c + vec3<i32>(0, -1, 0), w, m.density, false)) {
+      markDirtyR(c, DIRTY_M_SOLO);
+      return;
+    }
   }
 
   // Provably inert cell: no reaction bucket, no staining, and a SOLID class, so
@@ -1635,7 +1787,7 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
   // Keeps the chunk awake only while unstained surface remains in reach — see
   // the sleep note on doStaining.
   if (P.substep == 0u && matStains(m)) {
-    if (doStaining(c, idx, m, rnd)) { markDirty(c); }
+    if (doStaining(c, idx, m, rnd)) { markDirtyR(c, DIRTY_R_STAIN); }
     // Absorption can have emptied this cell (the liquid soaked away) or docked
     // its fullness and stamped it. Re-read before the movement code below acts
     // on a stale word: moving an already-spent eighth would create mass.
@@ -1664,7 +1816,7 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
   // around it (a wall broken, liquid added) marks it dirty through the normal
   // paths and wakes it back up.
   if (m.moveEvery > 1u && (T.tick % m.moveEvery) != 0u) {
-    if (canFlowAnywhere(c, w, mat, m)) { markDirty(c); }
+    if (canFlowAnywhere(c, w, mat, m)) { markDirtyR(c, DIRTY_R_VISCOUS); }
     return;
   }
 
@@ -1681,7 +1833,7 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
       // branch above does, and stay awake only while genuinely flow-unstable.
       // A flat pool answers false and the chunk sleeps, which is the guarantee
       // this line must not break (rule 2) — the `sleep` gate is its test.
-      if (canFlowAnywhere(c, lw, mat, m)) { markDirty(c); }
+      if (canFlowAnywhere(c, lw, mat, m)) { markDirtyR(c, DIRTY_R_FLOW); }
     }
     return;
   }
@@ -1712,8 +1864,16 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
     }
   }
 
+  // Diagnostic (DIRTY_M_*): which CLASS moved, so "MOVE with no liquid stage"
+  // names the mover instead of being a blank.
+  let cls = select(select(0u, DIRTY_M_POWDER, m.klass == CLASS_POWDER),
+                   DIRTY_M_GAS, m.klass == CLASS_GAS);
+
   // 1) straight fall / rise
-  if (tryMove(c, c + vec3<i32>(0, dy, 0), w, m.density, rising)) { return; }
+  if (tryMove(c, c + vec3<i32>(0, dy, 0), w, m.density, rising)) {
+    markDirtyR(c, cls);
+    return;
+  }
 
   // 2) the four diagonal cells one step down (up for gas), RNG order — started
   //    DOWNWIND with a probability set by the wind and the material's authored
@@ -1722,7 +1882,10 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
   let r = windLateralStart(c, rnd >> 10u, m, slotIdx);
   for (var i = 0u; i < 4u; i++) {
     let d = lateralDir(i + r);
-    if (tryMove(c, c + vec3<i32>(d.x, dy, d.y), w, m.density, rising)) { return; }
+    if (tryMove(c, c + vec3<i32>(d.x, dy, d.y), w, m.density, rising)) {
+      markDirtyR(c, cls);
+      return;
+    }
   }
 
   // 3) gases also spread laterally, RNG order — and this is the stage that

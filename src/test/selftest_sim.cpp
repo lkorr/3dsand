@@ -198,11 +198,50 @@ int settled = 0;  // tick at which the world went quiet (or the cap)
     rhi::ReadBufferBlocking(ctx.device, staging, 0, d_.data(), (size_t)(kNumChunks * 4));
     const uint32_t* d = d_.data();
 
-          for (uint32_t i = 0; i < kNumChunks; i++) {
-            if (d[i] != 0) {
+          // ---- WHY are they awake (common.wgsl's DIRTY_R_* / sim_step's
+          // DIRTY_M_*) ---------------------------------------------------
+          //
+          // The dirty word is a reason BITMASK, not the literal 1, so the
+          // buffer this loop already read names the rule that asked for each
+          // chunk. Printed unconditionally and on PASS as well as FAIL: "5
+          // chunks active" and "5 chunks active | MOVE 5 | powder 5" cost the
+          // same run and only one of them is a measurement.
+          //
+          // This exists because the alternative was measured. Diagnosing a
+          // never-sleeping pond from the awake COUNT took ~13 ten-minute
+          // world-probe runs and a bespoke sampler that had to be debugged
+          // three times; the reason bits answered it in one. That is
+          // CLAUDE.md rule 6 with a price tag on it.
+          //
+          // Bit order must match kName in world.cpp's snapshot fold.
+          {
+            static const char* kWhy[24] = {
+                "write",   "react-idle", "stain-idle",  "flow",
+                "viscous", "seam",       "part",        "wbody",
+                "mutate",  "MOVE",       "STAIN-WROTE", "REACT-FIRED",
+                "down",    "diag",       "equalize",    "split",
+                "film",    "displace",   "bridge",      "SUBMERGED",
+                "spill",   "powder",     "gas",         "solo"};
+            // ONE pass, and it is the SAME pass that fills `awake`. An earlier
+            // revision counted the reasons in a second loop over the same
+            // array and printed "write 128 ... wbody 32761" next to "0 / 32768
+            // chunks active" — two readings of one buffer that cannot both be
+            // true. Whatever the cause, the fix that makes it unable to happen
+            // again is not to have two loops.
+            uint32_t why[24] = {0};
+            for (uint32_t i = 0; i < kNumChunks; i++) {
+              const uint32_t w = d[i];
+              if (w == 0) continue;
               sleepActive++;
               awake.push_back(i);
+              for (int b = 0; b < 24; b++)
+                if (w & (1u << b)) why[b]++;
             }
+            std::printf("sleep: awake by reason (%u chunks):", sleepActive);
+            bool any = false;
+            for (int b = 0; b < 24; b++)
+              if (why[b]) { std::printf(" %s %u", kWhy[b], why[b]); any = true; }
+            std::printf("%s\n", any ? "" : " none - fully quiet");
           }
   }
 
@@ -233,11 +272,53 @@ int settled = 0;  // tick at which the world went quiet (or the cap)
     std::printf("\n");
   }
 }
+// ---- THE HYDROSTATIC INVARIANT, at the authored tarn --------------------
+//
+// "An eighth is a SURFACE thing; anything with the same liquid on top of it is
+// full." A partial cell with water standing on it is both physically wrong and
+// the fuel the lateral levelling rules used to burn forever, so a settled world
+// should contain none of them.
+//
+// Measured HERE rather than in a probe of its own because this gate already
+// generates the world, already settles it, and the map's harness pad already
+// contains the test tarn at (420,420) — the question costs one readback of the
+// chunk column over it instead of a ten-minute parked flight. (It was a parked
+// flight first. Nine of them, and the sampler kept missing the water.)
+//
+// The top row of each chunk is skipped: its neighbour is in the chunk above,
+// which this box may not have read. That costs 1/16 of the population and no
+// accuracy in an is-it-zero question.
+uint64_t subPartial = 0, subTotal = 0;
+{
+  std::vector<uint32_t> v((size_t)kChunkVol, 0);
+  for (int cy = 11; cy <= 14; cy++)
+    for (int cz = 24; cz <= 28; cz++)
+      for (int cx = 24; cx <= 28; cx++) {
+        const uint32_t slot = World::SlotChunkIndex({cx, cy, cz});
+        ReadVoxelsSync(ctx, world, slot, 1, v.data(), "tarnRead");
+        for (uint32_t z = 0; z < kChunk; z++)
+          for (uint32_t y = 0; y + 1 < kChunk; y++)
+            for (uint32_t x = 0; x < kChunk; x++) {
+              const uint32_t w = v[(z * kChunk + y) * kChunk + x];
+              const uint32_t m = w & 0xFFFu;
+              if (m == 0 || m >= mats.size()) continue;
+              if (mats[m].gpu.klass != CLASS_LIQUID) continue;
+              if ((v[(z * kChunk + y + 1) * kChunk + x] & 0xFFFu) != m) continue;
+              subTotal++;
+              if (((w >> 12) & 0xFu) != 7u) subPartial++;  // state = f - 1
+            }
+      }
+}
+std::printf("sleep: hydrostatic at the tarn: %llu of %llu submerged liquid "
+            "cells are PARTIAL\n",
+            (unsigned long long)subPartial, (unsigned long long)subTotal);
+
 bool sleepOk = sleepActive < 32 && particlesLeft == 0;
 std::printf("sleep: %s (%u / %u chunks active, %u particles alive, quiet "
-            "after ~%d settle ticks)\n",
+            "after ~%d settle ticks, %llu/%llu submerged cells partial)\n",
             sleepOk ? "PASS" : "FAIL", sleepActive, kNumChunks, particlesLeft,
-            settled);
+            settled, (unsigned long long)subPartial,
+            (unsigned long long)subTotal);
 
   // Verdict: the flag the moved body already computed.
   return sleepOk ? Status::Pass : Status::Fail;

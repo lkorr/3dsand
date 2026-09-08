@@ -24,7 +24,7 @@
   "woundBleedStopTicks": "400",
   "woundBleedRestChunks": "32",
   "treeAtlasHash": "53691eda995f232e",
-  "determinismHash": "44fa72cb",  "determinism": "pass",
+  "determinismHash": "ae16bd40",  "determinism": "pass",
   "sleep": "pass",
   "ca-slope": "pass",
   "ca-slope-hybrid": "fail",
