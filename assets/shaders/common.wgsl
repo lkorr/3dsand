@@ -3582,6 +3582,88 @@ fn irrSample(albedo : vec3f, n : vec3f, L : vec3f, sunCol : vec3f, lit : f32,
                    vec3f(emission * TUNE_EMISSIVE_STRENGTH));
 }
 
+// ============================ THE GLOW FIELD =================================
+// src/sim/world.h kGlowBytes; written by assets/shaders/sim_glow.wgsl. Read
+// here so the WRITER and every READER agree bit for bit about the two region
+// bases, the stamp and the block index — the same contract the openness block
+// above states for its byte index.
+//
+// WHAT IT ANSWERS AND WHY THE IRRADIANCE GRID CANNOT. "How much emitter light
+// is at this POINT", in ONE buffer read, from nothing but a world position.
+// `giGather` answers a strictly better question (it is directional, occluded
+// and carries sun bounce) but it needs nine coarse DDA rays and `occupancy` +
+// `voxels` + `pageTable` in the fragment stage, and it reaches
+// TUNE_GI_GATHER_BLOCKS blocks — 1.2 m at the shipped 3. The raster body paths
+// (debris.wgsl's rigid-body and particle cubes, microbody.wgsl's mob limbs)
+// have neither the bindings nor the budget, which is why a mob in a lava pit
+// and a burning crown falling off a tree are lit by the sky alone today.
+//
+// NOT AN OCCLUDED FIELD. A glow word says what emitters within
+// render.glowReach are throwing at a point; it does not say whether a wall is
+// in the way. At 1.6 m source granularity and a 2.4 m reach the leak is bounded
+// to about one chunk through a thin wall, and the term is additive and soft, so
+// the failure mode is a faint warm haze on the far side of a lava pit's rim
+// rather than a light in the wrong room. Stated rather than hidden: if this
+// ever needs occlusion, the honest fix is to attenuate by the sub-occupancy
+// mask along the line, not to shorten the reach until nobody notices.
+//
+// `glow` is declared per shader (binding 32 in the sim group, 20 in the render
+// group), so these take POINTERS for the reason opennessByteAt does:
+// common.wgsl is prepended before any shader declares a binding.
+
+// The FIELD region starts after the SRC region, which is kGlowSrcWordsPerSlot
+// (4) words per slot. Derived from NUM_CHUNKS, which the prelude already emits,
+// so the glow field costs no new prelude constant and no
+// ShaderConstantPrelude / check_shaders.sh edit. MUST MATCH
+// sandvox::kGlowFieldBaseWord (src/sim/world.h).
+const GLOW_SRC_WORDS_PER_SLOT : u32 = 4u;
+const GLOW_FIELD_BASE : u32 = NUM_CHUNKS * GLOW_SRC_WORDS_PER_SLOT;
+
+fn glowSrcIndex(slot : u32) -> u32 { return slot * GLOW_SRC_WORDS_PER_SLOT; }
+fn glowFieldIndex(slot : u32, block : u32) -> u32 {
+  return GLOW_FIELD_BASE + slot * OPEN_BLOCKS + block;
+}
+
+// The incident glow at a world CELL, or zero for a slot whose stamp does not
+// name the chunk standing in it — the same "unknown reads as the pre-feature
+// look" policy the openness grid uses, and the safe direction: a missing glow
+// is a body that is merely as dark as it was before this field existed.
+//
+// TWO LOADS: the stamp and the field word. The stamp is not optional, and it is
+// also the whole of the out-of-window test, exactly as it is in
+// `opennessByteAt` — `chunkIndexW` masks a cell into the toroidal window, so a
+// point WORLD_N cells away lands on the same slot, but its WORLD CHUNK COORD
+// differs and so does its stamp. Without it a mob 51 m from a lava pit would be
+// lit by the pit through the wrap. There is no separate `inWindow` call because
+// there is nothing left for it to catch.
+fn glowAtCell(c : vec3<i32>, gl : ptr<storage, array<u32>, read>) -> vec3f {
+  let slot = chunkIndexW(c);
+  if ((*gl)[glowSrcIndex(slot) + 1u] != opennessStamp(worldChunkOf(c))) {
+    return vec3f(0.0);
+  }
+  let lo = vec3<u32>(c & vec3<i32>(i32(CHUNK) - 1));
+  return unpackRgb9e5((*gl)[glowFieldIndex(slot, subOccBitLocal(lo))]);
+}
+
+// The same, from a float world position. The raster paths have a position and
+// no cell.
+fn glowAtPos(worldPos : vec3f, gl : ptr<storage, array<u32>, read>) -> vec3f {
+  return glowAtCell(vec3<i32>(floor(worldPos)), gl);
+}
+
+// THE ONE PLACE A GLOW WORD BECOMES LIGHT ON A SURFACE, so every consumer
+// weights it identically and `render.glowStrength` moves all of them.
+//
+// `albedo *` because this is incident light being reflected, not emission: a
+// black rock beside lava stays dark and a white one goes orange, which is the
+// difference between light and a decal. `ao *` for the reason the ambient and
+// the GI bounce both take it — glow does not reach into a crease either — and
+// NOT the openness scale, which measures SKY and would darken a torch-lit cave
+// to nothing.
+fn glowLight(albedo : vec3f, ao : f32, g : vec3f) -> vec3f {
+  return albedo * ao * g * TUNE_GLOW_STRENGTH;
+}
+
 // ---- VOXEL-KEYED SHADOW CACHE (src/sim/world.h kShadowCacheBuckets) --------
 // The identity and packing shared by the two halves of the cache:
 // raymarch.wgsl READS a patch's shadow factor and REGISTERS the patch, and

@@ -54,6 +54,9 @@ struct TableCtx {
   // Openness refresh budget this tick (docs/PLAN_gi.md §2). 0 = the grid
   // is off and neither openness row is recorded.
   uint32_t opennessChunks = 0;
+  // Glow-field refresh budget this tick (src/sim/world.h kGlowBytes). 0 = the
+  // field is off and NONE of the three glow rows is recorded.
+  uint32_t glowChunks = 0;
   bool hashEnable = false;
   bool particlesActive = false;
   // False under --residency paged (PLAN_page_table.md §3.5c).

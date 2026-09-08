@@ -216,6 +216,18 @@ inline constexpr PerfNodeDef kPerfNodes[] = {
      "dirty half is per EDIT, the refresh half is a flat "
      "render.opennessChunksPerFrame slots per tick. Zero when "
      "render.opennessStrength is 0 -- neither row is recorded at all."},
+    // Billed to `renderPass` for the openness node's reason one line up: the
+    // rows are on the TICK command buffer, but nothing in the sim reads the
+    // field and render.glowStrength is what makes the number go away.
+    {"glow", "Glow Field", "renderPass", PerfSide::Gpu, PerfScope::Count,
+     "glowSrc;glowField;glowRefresh",
+     "Coarse world-space emitter light (src/sim/world.h kGlowBytes): a per-chunk "
+     "source word and a per-4^3-block field, sampled with ONE buffer load by the "
+     "raster body and mob paths, which cannot reach the GI gather. Two dirty-walk "
+     "rows plus a rolling refresh. The expensive branch -- a changed chunk "
+     "rewriting its whole 3x3x3 neighbourhood -- is capped at "
+     "render.glowRingBudget workgroups per tick. Zero when render.glowStrength "
+     "is 0: no row is recorded at all."},
     // THE RENDER PASS IS SEVEN SPANS NOW, NOT ONE. It used to be a single
     // timestamp pair around BeginRenderPass..End billed here, which said "the
     // GPU frame is the render pass" and nothing else — a bare count in exactly

@@ -522,6 +522,10 @@ class Simulation {
   // window. Render-path passes on the TICK table — see the .def rows for why
   // they are not on the per-frame shadow table.
   rhi::ComputePipeline opennessDirty_, opennessRefresh_;
+  // The glow field (sim_glow.wgsl, src/sim/world.h kGlowBytes). Two stages of
+  // the dirty walk plus the rolling refresh; same standing as the openness pair
+  // above — render-path passes recorded on the TICK table.
+  rhi::ComputePipeline glowSrc_, glowField_, glowRefresh_;
   rhi::ComputePipeline pageFill_;   // JITTER page materialization (world.h)
   // Shadow cache (shadow_resolve.wgsl): `prepare` turns last frame's request
   // count into a dispatch size, `resolve` casts one media-blind shadow ray per

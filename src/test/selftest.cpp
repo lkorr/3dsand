@@ -169,7 +169,7 @@ const char* const kOrder[] = {
     // const-folded, so they do not exist without a reload) and restores the
     // baseline tuning before returning. It leaves no world state behind, so
     // it sits with the other rendering gates rather than at either end.
-    "screenshots", "fire-depth", "shadow-cache", "openness", "gi-bounce", "gi-nightfall", "plants",
+    "screenshots", "fire-depth", "shadow-cache", "openness", "gi-bounce", "gi-nightfall", "glow", "plants",
     // `taa` runs its own worldgen and leaves no world state behind — it only
     // draws the same view four ways and compares the images. It sits AFTER
     // `shadow-cache` because that gate reloads the shaders three times and

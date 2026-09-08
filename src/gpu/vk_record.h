@@ -94,6 +94,10 @@ struct RecordCtx {
   // clamped). Zero suppresses the row entirely, which is what makes
   // `opennessChunksPerFrame = 0` an exact "off" rather than a cheap path.
   uint32_t opennessChunks = 0;
+  // Chunks the glow refresh walks this tick (render.glowChunksPerFrame,
+  // clamped, and zeroed when render.glowStrength is 0). Suppresses all three
+  // glow rows, which is what makes the off switch exact.
+  uint32_t glowChunks = 0;
   bool hashEnable = false;
   bool particlesActive = false;
   // False under --residency paged: worldgen's whole-world dispatch is

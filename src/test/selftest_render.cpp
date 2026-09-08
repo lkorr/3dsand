@@ -1348,6 +1348,248 @@ Status GateGiNightfall(Ctx& c, std::string& detail) {
 }
 
 // ---------------------------------------------------------------------------
+// glow: the glow field carries an emitter's light into the space around it,
+// and takes it back when the emitter goes.
+//
+// WHY THIS GATE EXISTS, AND WHY IT IS SHAPED LIKE THIS. The field (src/sim/
+// world.h kGlowBytes, assets/shaders/sim_glow.wgsl) is render-only derived
+// data with two failure modes that no other check would see:
+//
+//   1. IT NEVER LIT ANYTHING. A producer that writes zeros everywhere renders
+//      identically to the feature being off, and the world hash cannot move
+//      either way. Pass A asserts the source word actually counted the
+//      emitters and pass B asserts the field beside it is nonzero.
+//   2. IT LATCHED. The named precedent is the irradiance charger with no
+//      expiry: a cache whose only refresher can decline to run keeps
+//      yesterday's light forever, and that bug shipped and was found by eye at
+//      night, weeks later. Pass D removes the emitter and asserts both words
+//      go back to zero. This field is a pure recompute so it should be exact
+//      rather than merely small, and the threshold says so.
+//
+// FOUR PASSES, and pass C is the one that makes the others mean something:
+// a field that returned "bright" for every cell in the world would sail
+// through A, B and D. C reads a block past render.glowReach and requires zero.
+// (The "a hash-identity test needs three arms" note, applied to a field.)
+//
+// SELF-SUFFICIENT: it worldgens its own ground and pokes its own chunks, so
+// `--gate glow` alone is a valid run. Thresholds in tests/baseline.json.
+uint32_t GlowWordAt(GpuContext& ctx, World& world, uint64_t wordIndex) {
+  rhi::Buffer stage =
+      CreateBuffer(ctx.device, 4,
+                   rhi::BufferUsage::MapRead | rhi::BufferUsage::CopyDst,
+                   "glowRead");
+  rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
+  enc.CopyBufferToBuffer(world.glow, wordIndex * 4, stage, 0, 4);
+  ctx.queue.Submit(enc.Finish());
+  uint32_t w = 0;
+  if (!rhi::ReadBufferBlocking(ctx.device, stage, 0, &w, 4)) return 0;
+  return w;
+}
+
+// The FIELD word for a world cell, mirroring glowAtCell in common.wgsl. The
+// stamp is checked here for the same reason the shader checks it AND for one
+// more: a mismatch means the CPU and the GPU disagree about what chunk is in
+// this slot, which is a bug in the identity rather than in the light, and the
+// gate must not report it as darkness.
+uint32_t GlowFieldWordAt(GpuContext& ctx, World& world, IVec3 c, bool* stampOk) {
+  const IVec3 wc{c.x >> 4, c.y >> 4, c.z >> 4};
+  const uint32_t slot = World::SlotChunkIndex(wc);
+  const uint32_t lx = (uint32_t)(c.x & 15), ly = (uint32_t)(c.y & 15),
+                 lz = (uint32_t)(c.z & 15);
+  const uint32_t block = (((lz >> kSubOccShift) * kSubOccDim +
+                           (ly >> kSubOccShift)) *
+                              kSubOccDim +
+                          (lx >> kSubOccShift));
+  const uint32_t stamp =
+      GlowWordAt(ctx, world, (uint64_t)slot * kGlowSrcWordsPerSlot + 1);
+  if (stampOk) *stampOk = (stamp == OpennessStamp(wc.x, wc.y, wc.z));
+  return GlowWordAt(ctx, world,
+                    kGlowFieldBaseWord +
+                        (uint64_t)slot * kOpenBlocksPerChunk + block);
+}
+
+Status GateGlow(Ctx& c, std::string& detail) {
+  GpuContext& ctx = c.ctx;
+  World& world = c.world;
+  Simulation& sim = c.sim;
+
+  // CRYSTAL, NOT LAVA, and the choice is the fixture. Lava is a LIQUID: it
+  // flows out of the block it was placed in within a few ticks, so "the field
+  // beside the emitter" would be measured against an emitter that had moved.
+  // Crystal is a solid `mineral` with emission 120, no reactions anywhere in
+  // reactions.json, and nothing that can make it move. What is being tested is
+  // the field, not lava.
+  const uint32_t mEmit = [&]() -> uint32_t {
+    for (size_t i = 0; i < c.mats.size(); i++)
+      if (c.mats[i].name == "crystal") return (uint32_t)i;
+    return 0;
+  }();
+  const uint32_t mFill = [&]() -> uint32_t {
+    for (size_t i = 0; i < c.mats.size(); i++)
+      if (c.mats[i].name == "stone") return (uint32_t)i;
+    return 0;
+  }();
+  if (!mEmit || !mFill) {
+    detail = "crystal or stone missing from materials.json";
+    return Status::Fail;
+  }
+  const Tuning base = CurrentTuning();
+  if (base.render.glowStrength <= 0.0f) {
+    detail = "render.glowStrength is 0 - no glow row is recorded at all";
+    return Status::Fail;
+  }
+  if (base.render.glowReach <= 0.0f) {
+    detail = "render.glowReach is 0 - the falloff kernel is a point";
+    return Status::Fail;
+  }
+
+  SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+  ctx.WaitIdle();
+
+  // BURIED, not floating, and that is the second half of "nothing may move".
+  // An isolated solid block in the air is exactly what the floating-voxel pass
+  // exists to detect: it would be lifted out of the grid into a rigid body,
+  // and a rigid body is not something the producer can see. Twelve cells under
+  // the surface it is supported on every side, the CA has nothing to do with
+  // it, and the field does not care that it cannot be seen -- the glow field
+  // is deliberately not occluded (common.wgsl THE GLOW FIELD).
+  const int kBlk = 1 << (int)kSubOccShift;
+  const int gx = 300, gz = 300;
+  const int ground = World::TerrainHeight(gx, gz, kDefaultSeed);
+  const int by = (ground - 12) & ~(kBlk - 1);
+  const int bx = gx & ~(kBlk - 1);
+  const int bz = gz & ~(kBlk - 1);
+  const IVec3 pchunk{bx / (int)kChunk, by / (int)kChunk, bz / (int)kChunk};
+
+  const IVec3 emitCell{bx, by, bz};
+  // NEAR is one 4^3 block over in +X: 40 cm from the emitter block, inside
+  // render.glowReach, in the NEXT chunk (bx = 300 sits four cells from chunk
+  // 18's top edge), so this is a claim about light crossing a chunk boundary
+  // through the gather stencil rather than about a source word being copied
+  // into its own cell.
+  const IVec3 nearCell{bx + kBlk, by, bz};
+  // FAR is two CHUNKS over, which is outside the producer's 3x3x3 chunk
+  // stencil by construction -- so this pass tests the stencil bound as well as
+  // the falloff, and cannot pass by a lucky quantisation to zero.
+  const IVec3 farCell{bx + 2 * (int)kChunk, by, bz};
+
+  std::vector<CellOp> place, clear;
+  bool sited = by > 8 && world.CellInWindow(emitCell) &&
+               world.CellInWindow(nearCell) && world.CellInWindow(farCell);
+  // A whole 4^3 BLOCK of emitter, not one cell. The source word is a MEAN
+  // radiance times a SATURATING fill fraction, so one cell in 4,096 is 1/128
+  // of saturation at the shipped render.glowFill and the gate would be
+  // measuring RGB9E5 quantisation rather than the field. 64 cells is 1/64 of
+  // the chunk, i.e. half saturation, which is comfortably above the noise and
+  // still short of the clamp.
+  for (int dz = 0; dz < kBlk && sited; dz++)
+    for (int dy = 0; dy < kBlk; dy++)
+      for (int dx = 0; dx < kBlk; dx++) {
+        const IVec3 cc{emitCell.x + dx, emitCell.y + dy, emitCell.z + dz};
+        if (!world.CellInWindow(cc)) { sited = false; break; }
+        place.push_back({World::SlotCellIndex(cc), PackVoxNew(mEmit, 0u)});
+        // The removal writes STONE, not air. Air would leave a 4^3 cavity in
+        // buried rock, which is a support-loss event and an island-detection
+        // input -- a second system in the frame of a test about a light field.
+        // Stone is inert, emits nothing, and takes the source word to exactly
+        // zero, which is the only property pass D is about.
+        clear.push_back({World::SlotCellIndex(cc), PackVoxNew(mFill, 0u)});
+      }
+  if (!sited || place.empty()) {
+    detail = "fixture site is outside the residency window";
+    return Status::Fail;
+  }
+
+  uint32_t tick = 90000;
+  auto step = [&](const std::vector<CellOp>& cells) {
+    SubmitTick(ctx, world, sim, ++tick, kDefaultSeed, {}, {}, cells, false,
+               pchunk, false, false);
+  };
+  // Rewriting the probe cells to STONE every tick puts their chunks on the
+  // dirty list without adding any emitter -- the same trick gi-nightfall's
+  // poke uses, and what makes this gate independent of the rolling refresh's
+  // budget and of the ring budget. Both probe cells are buried rock already,
+  // so the world does not move either.
+  const std::vector<CellOp> poke{
+      {World::SlotCellIndex(nearCell), PackVoxNew(mFill, 0u)},
+      {World::SlotCellIndex(farCell), PackVoxNew(mFill, 0u)}};
+
+  // ---- charge ----
+  step(place);
+  for (int i = 0; i < 4; i++) step(poke);
+  ctx.WaitIdle();
+
+  const uint32_t emitSlot = World::SlotChunkIndex(
+      IVec3{emitCell.x >> 4, emitCell.y >> 4, emitCell.z >> 4});
+  const uint32_t srcWord = GlowWordAt(
+      ctx, world, (uint64_t)emitSlot * kGlowSrcWordsPerSlot + 0);
+  const uint32_t srcCount = GlowWordAt(
+      ctx, world, (uint64_t)emitSlot * kGlowSrcWordsPerSlot + 2);
+  bool nearStamp = false, farStamp = false;
+  double srcRgb[3] = {0, 0, 0}, nearRgb[3] = {0, 0, 0}, farRgb[3] = {0, 0, 0};
+  UnpackRgb9e5(srcWord, srcRgb);
+  UnpackRgb9e5(GlowFieldWordAt(ctx, world, nearCell, &nearStamp), nearRgb);
+  UnpackRgb9e5(GlowFieldWordAt(ctx, world, farCell, &farStamp), farRgb);
+
+  auto lum = [](const double v[3]) {
+    return 0.299 * v[0] + 0.587 * v[1] + 0.114 * v[2];
+  };
+  const double lSrc = lum(srcRgb), lNear = lum(nearRgb), lFar = lum(farRgb);
+
+  // ---- discharge: take the emitter away ----
+  step(clear);
+  for (int i = 0; i < 4; i++) step(poke);
+  ctx.WaitIdle();
+  double offRgb[3] = {0, 0, 0};
+  UnpackRgb9e5(GlowFieldWordAt(ctx, world, nearCell, nullptr), offRgb);
+  const uint32_t offCount = GlowWordAt(
+      ctx, world, (uint64_t)emitSlot * kGlowSrcWordsPerSlot + 2);
+  const double lOff = lum(offRgb);
+
+  const uint32_t wantCount = (uint32_t)(kBlk * kBlk * kBlk);
+  const double minSrc = BaselineNumber("glow.minSrcLum", 0.02);
+  const double minNear = BaselineNumber("glow.minNearLum", 0.005);
+  const double maxFar = BaselineNumber("glow.maxFarLum", 0.0);
+  const double maxRemainPct = BaselineNumber("glow.maxRemainPct", 0.0);
+
+  const bool okA = srcCount == wantCount && lSrc >= minSrc;
+  const bool okB = nearStamp && lNear >= minNear;
+  const bool okC = farStamp && lFar <= maxFar;
+  const double remainPct = lNear > 0.0 ? 100.0 * lOff / lNear : 0.0;
+  const bool okD = offCount == 0u && remainPct <= maxRemainPct;
+  const bool ok = okA && okB && okC && okD;
+
+  RecordObserved("glow.srcLumObserved", lSrc);
+  RecordObserved("glow.nearLumObserved", lNear);
+
+  std::printf(
+      "glow: %s (A source %u/%u emitter cells, lum %.4f >= %.4f%s | "
+      "B near block +%d cells: lum %.4f >= %.4f%s | "
+      "C far block +%d cells: lum %.4f <= %.4f%s | "
+      "D emitter removed: %u cells left, lum %.4f = %.1f%% of charged "
+      "(<= %.1f%%)%s | block (%d,%d,%d) buried %d under ground, "
+      "glowReach %.2f m, glowFill %.0f)\n",
+      ok ? "PASS" : "FAIL", srcCount, wantCount, lSrc, minSrc,
+      okA ? "" : "  <-- FAIL", kBlk, lNear, minNear, okB ? "" : "  <-- FAIL",
+      2 * (int)kChunk, lFar, maxFar, okC ? "" : "  <-- FAIL", offCount, lOff,
+      remainPct, maxRemainPct, okD ? "" : "  <-- FAIL", bx, by, bz,
+      ground - by, base.render.glowReach, base.render.glowFill);
+  detail = Format(
+      "src %u cells lum %.4f, near %.4f, far %.4f, after removal %.4f "
+      "(%.1f%%)%s%s",
+      srcCount, lSrc, lNear, lFar, lOff, remainPct,
+      (nearStamp && farStamp) ? ""
+                              : " - STAMP MISMATCH (CPU/GPU slot identity)",
+      lNear >= minNear ? "" : " - NEVER CHARGED");
+
+  // Leave the world as found: this gate rewrites 64 buried cells and several
+  // gates after it in kOrder read the same terrain (CLAUDE.md rule 7).
+  SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+  ctx.WaitIdle();
+  return ok ? Status::Pass : Status::Fail;
+}
+
+// ---------------------------------------------------------------------------
 // shadow-cache: the voxel-keyed shadow cache agrees with the ray it replaced.
 //
 // WHY THIS GATE EXISTS. The cache does not reuse trace(). It cannot: trace()
@@ -2814,6 +3056,7 @@ const std::vector<Gate>& RenderGates() {
       // No render pass on purpose: the resolve pass must not be able to
       // contribute, or the gate would be measuring the charger.
       {"gi-nightfall", "render", {}, false, GateGiNightfall},
+      {"glow", "render", {}, false, GateGlow},
       // The only gate in the suite that DRAWS A RIGIDBODY. Three arms of one
       // fixture frame, and it spawns a body through the real destruction path.
       {"body-shade", "render", {}, false, GateBodyShade, /*needsRender=*/true},

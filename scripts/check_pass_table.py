@@ -108,6 +108,9 @@ PIPE_TO_MEMBER = {
     "PIPE_FAR_DOWN": "farDown_",
     "PIPE_OPENNESS_DIRTY": "opennessDirty_",
     "PIPE_OPENNESS_REFRESH": "opennessRefresh_",
+    "PIPE_GLOW_SRC": "glowSrc_",
+    "PIPE_GLOW_FIELD": "glowField_",
+    "PIPE_GLOW_REFRESH": "glowRefresh_",
     "PIPE_SHADOW_PREPARE": "shadowPrepare_",
     "PIPE_SHADOW_RESOLVE": "shadowResolve_",
     "PIPE_FLUID_SPAWN": "fluidSpawn_",
@@ -204,6 +207,9 @@ BUF_TO_WGSL = {
     # The irradiance grid (PLAN_gi.md 3): binding 29 of simBGL_, 8 of the
     # shadow group, 19 of the render group.
     "Irradiance": {"irradiance"},
+    # The glow field, binding 32 of simBGL_ / 20 of renderBGL_. ONE Buf id for
+    # both regions of one buffer -- see the pass_table.h note.
+    "Glow": {"glow"},
     # The deferred streaming wake's act verdict, binding 30.
     "GenAct": {"genAct"},
     "PageFaults": {"pageFaults"},
@@ -277,6 +283,8 @@ _SIM_GROUP0 = {
     "openness", "opennessGen",
     # The irradiance grid, binding 29.
     "irradiance",
+    # The glow field, binding 32.
+    "glow",
     # The deferred streaming wake's act verdict, binding 30.
     "genAct",
     # The authored world map, binding 31 (docs/PLAN_world_map.md).

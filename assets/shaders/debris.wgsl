@@ -27,6 +27,10 @@
 @group(0) @binding(9) var<storage, read> pageTable : array<u32>;
 @group(0) @binding(17) var<storage, read> openness    : array<u32>;
 @group(0) @binding(18) var<storage, read> opennessGen : array<u32>;
+// The glow field (src/sim/world.h kGlowBytes, common.wgsl THE GLOW FIELD).
+// ONE buffer load per shaded point, no ray and no voxel read, which is the only
+// shape of emitter light this path can consume.
+@group(0) @binding(20) var<storage, read> glow : array<u32>;
 
 @group(1) @binding(0) var<storage, read> particles : array<Particle>;
 
@@ -181,6 +185,13 @@ fn vsParticle(@builtin(vertex_index) vi : u32,
                     burnTintWeightH(pcg(inst * 2917u), R.time));
   out.color = litColorO(bt.albedo, n, world, bt.emis, R,
                         opennessScaleAtBody(world, &occupancy, &openness, &opennessGen));
+  // Emitter light from the glow field. A spark shower thrown out of a forge or
+  // a burning leaf tumbling past a lava pit is lit by it; before this the only
+  // light on a loose particle was the sky and its own emission. `ao` 1.0 —
+  // a particle is a free cube in the air, so there is no crease for the glow to
+  // be occluded by, and the openness term above already carries what enclosure
+  // it sits in.
+  out.color += glowLight(bt.albedo, 1.0, glowAtPos(world, &glow));
   return out;
 }
 
@@ -242,8 +253,20 @@ fn vsBody(@builtin(vertex_index) vi : u32,
 @fragment
 fn fsBody(in : BodyVSOut) -> @location(0) vec4f {
   let sh = bodySunShadow(in.world, in.wn, R, &occupancy, &materials);
-  let col = litColorS(in.albedo, in.wn, in.world, in.misc.x, R,
+  var col = litColorS(in.albedo, in.wn, in.world, in.misc.x, R,
                       in.misc.y, in.misc.z, sh);
+  // Emitter light from the glow field (common.wgsl THE GLOW FIELD), and this
+  // is the call site the whole feature exists for: THE CROWN THAT FALLS OFF A
+  // BURNING TREE COMES THROUGH HERE. A rigid body is not in the voxel grid, so
+  // neither irradiance injector can see it and `giGather` cannot be called for
+  // it — before this a body beside a lava pool was lit by the sky alone
+  // (docs/PLAN_rigidbody_lighting.md). PER FRAGMENT rather than in vsBody: the
+  // field is a 40 cm grid and a body cube is 10 cm, so a per-vertex sample
+  // would quantise the light across the cube's own corners.
+  //
+  // `in.misc.y` is the ambient openness multiplier the vertex stage measured —
+  // the same occlusion the ambient takes, for the same reason.
+  col += glowLight(in.albedo, in.misc.y, glowAtPos(in.world, &glow));
   // Same tonemap as fs() and as the terrain: a cube must match the ground it
   // lands on at any time of day.
   return vec4f(tonemapHdr(col), 1.0);

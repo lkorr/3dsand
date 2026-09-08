@@ -583,6 +583,66 @@ constexpr uint64_t kOpennessGenBytes = (uint64_t)kNumChunks * 4;   // 128 KiB
 constexpr uint64_t kIrradianceBytes =
     (uint64_t)kNumChunks * kOpenBlocksPerChunk * kOpenFaces * 4;   // 48 MiB at 512^3
 
+// ---- the GLOW field (docs/PLAN_glow.md; assets/shaders/sim_glow.wgsl) ------
+// A coarse, world-space, POSITION-KEYED field of the light emitters are
+// throwing into the space around them. Render-only derived data with exactly
+// the openness grid's standing: never hashed, never saved, the sim has no
+// binding for it, rebuilt from the voxels on load.
+//
+// WHY IT EXISTS, given the irradiance grid already carries emission. The
+// irradiance grid is keyed on a block FACE and is only readable through
+// `giGather` — nine coarse DDA rays that reach TUNE_GI_GATHER_BLOCKS (3) blocks
+// = 1.2 m, and that need `voxels`, `occupancy` and `pageTable` bound in the
+// FRAGMENT stage. Neither is available to the raster body paths: debris.wgsl
+// shades a rigid-body cube in the VERTEX stage, where renderBGL_ marks voxels
+// and pageTable Fragment-only, and it cannot afford nine rays per vertex
+// either. So a burning crown, a mob standing in a lava pit and a severed limb
+// beside a fire are all lit by the sky alone — the emitter half of
+// docs/PLAN_rigidbody_lighting.md's gap. This field answers "how much emitter
+// light is at this POINT" with ONE buffer read and no ray, which is the only
+// shape of answer those paths can consume.
+//
+// LAYOUT. Two regions in one buffer, so it costs ONE binding in each of the two
+// bind-group layouts that carry it rather than two.
+//
+//   SRC   [slot * 4 + 0] the chunk's own emitted radiance, RGB9E5
+//         [slot * 4 + 1] the world-chunk stamp (OpennessStamp — SAME hash)
+//         [slot * 4 + 2] how many emitting cells it holds (diagnostic; the
+//                        `glow` gate reads it, and "0 emitters" is a different
+//                        failure from "emitters but no field")
+//         [slot * 4 + 3] 1 if word 0 moved on this visit (the ring trigger)
+//   FIELD [kNumChunks * 4 + slot * kOpenBlocksPerChunk + block]
+//         the incident glow at that 4^3 block, RGB9E5
+//
+// GRANULARITY. The SOURCE is per CHUNK (1.6 m) and the FIELD is per 4^3 BLOCK
+// (40 cm) — the same block grid openness and the sub-occupancy mask already
+// index, so the reader reuses `subOccBitLocal` and adds no indexing math and no
+// prelude constant. Quantising the source to a chunk is what makes the producer
+// affordable: the field at a block is a 27-tap gather over a 512 KiB source
+// region, not a search over voxels. Quantising the FIELD to a chunk as well
+// would have been 128 KiB total, but a 1.6 m light blob reads as a cube; the
+// falloff has to be evaluated at a finer grid than the source for the result to
+// look like light. 40 cm blocks × 32,768 slots = 2,097,152 words = 8 MiB.
+//
+// RGB9E5, not voxelbit's four bits. Three reasons and only the first is size:
+// `packRgb9e5`/`unpackRgb9e5` already exist for the irradiance grid, so there
+// is no second packing convention to keep in agreement; the HDR exponent means
+// a lava lake and one ember differ by three orders of magnitude with no global
+// scale constant to tune; and it carries COLOUR, so lava is orange and
+// gem_arcane is violet — which a scalar cannot express and voxelbit works
+// around by testing the emitter's Y coordinate.
+constexpr uint32_t kGlowSrcWordsPerSlot = 4;
+constexpr uint64_t kGlowSrcWords =
+    (uint64_t)kNumChunks * kGlowSrcWordsPerSlot;                   // 512 KiB
+constexpr uint64_t kGlowFieldWords =
+    (uint64_t)kNumChunks * kOpenBlocksPerChunk;                    // 8 MiB
+constexpr uint64_t kGlowBytes = (kGlowSrcWords + kGlowFieldWords) * 4;
+// The WGSL side derives this as `NUM_CHUNKS * 4u` from constants the prelude
+// already emits, so the field needs no new prelude constant and no
+// ShaderConstantPrelude / check_shaders.sh edit. This mirror exists for the
+// gate's readback arithmetic only.
+constexpr uint64_t kGlowFieldBaseWord = kGlowSrcWords;
+
 // The residency window is toroidal, so a slot is reused by a new chunk as the
 // window walks. Its 384 openness bytes then describe geometry that is no longer
 // there, and the reader has no way to tell — the grid is not dirty-tracked the
@@ -2684,6 +2744,13 @@ class World {
   // walk (compute, per tick), read by the raymarch's gather; keyed like
   // `openness` and stamped by `opennessGen`. CopySrc for `--gate gi-bounce`.
   rhi::Buffer irradiance;     // kNumChunks * blocks * faces u32 (48 MiB)
+  // ---- glow field (the kGlowBytes block above) ----
+  // Same standing again: render-only, derived, disposable, never hashed or
+  // saved, no sim binding. CopySrc so `--gate glow` can read a source word and
+  // a field word back; CopyDst so it can be zeroed at creation and on load —
+  // an unzeroed stamp would read as valid for whatever the driver left, which
+  // is the failure mode the openness grid's own comment names.
+  rhi::Buffer glow;           // kGlowSrcWords + kGlowFieldWords u32 (8.5 MiB)
   // The second buffer a fragment shader writes, and the same argument applies:
   // measurement-only counters (kRenderStat* above), read back by the telemetry
   // path through rhi::CommandEncoder::CopyRenderWritten. 4 KiB.

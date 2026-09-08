@@ -2560,6 +2560,17 @@ struct Tuning {
     float giFeedback = 0.2f;            // P2 write-back weight, < giDecay
     int giGatherBlocks = 3;             // blocks per gather ray
 
+    // ---- the glow field (src/sim/world.h kGlowBytes) ----
+    // A coarse position-keyed field of emitter light, written by sim_glow.wgsl
+    // and read with ONE buffer load by the paths giGather cannot serve (the
+    // raster body/mob cubes). Render-only: the sim has no binding for it.
+    float glowStrength = 1.0f;          // 0 = both rows unrecorded, term folded
+    float glowReach = 2.4f;             // metres an emitter chunk throws light
+    float glowFill = 32.0f;             // emitting-cell fraction that saturates
+    int glowChunksPerFrame = 64;        // slots the rolling refresh walks/tick
+    int glowRingBudget = 64;            // dirty workgroups that may rewrite 3^3
+    int glowTerrain = 0;                // also sample at the terrain hit (dbl-counts giGather)
+
     // drifting particulate. Render-only motes suspended in the water, which is
     // what gives the light shafts something visible to catch.
     float siltDensity = 0.55f;

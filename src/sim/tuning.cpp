@@ -2132,6 +2132,12 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadF(*g, "giDecay", r.giDecay, out, at);
     ReadF(*g, "giFeedback", r.giFeedback, out, at);
     ReadI(*g, "giGatherBlocks", r.giGatherBlocks, out, at);
+    ReadF(*g, "glowStrength", r.glowStrength, out, at);
+    ReadF(*g, "glowReach", r.glowReach, out, at);
+    ReadF(*g, "glowFill", r.glowFill, out, at);
+    ReadI(*g, "glowChunksPerFrame", r.glowChunksPerFrame, out, at);
+    ReadI(*g, "glowRingBudget", r.glowRingBudget, out, at);
+    ReadI(*g, "glowTerrain", r.glowTerrain, out, at);
     ReadF(*g, "shortRangeDist", r.shortRangeDist, out, at);
     ReadF(*g, "shortRangeFogStart", r.shortRangeFogStart, out, at);
     ReadF(*g, "shortRangeFogDensity", r.shortRangeFogDensity, out, at);
@@ -2318,6 +2324,34 @@ bool LoadTuning(const std::string& path, Tuning& out) {
           "x strength must stay below 1); clamped to 3");
       r.giStrength = 3.0f;
     }
+    // The glow field (world.h kGlowBytes). glowReach is the one value here that
+    // is not merely a taste knob: sim_glow's gather stencil is 3x3x3 CHUNKS, so
+    // the NEAREST source it does not read sits 2 chunks from the block's own
+    // chunk centre, less the furthest a block centre can lean toward it
+    // (kChunk/2 - block/2). Past that distance the kernel is TRUNCATED rather
+    // than falling to zero, and a truncated falloff is a hard step in the light
+    // at a chunk boundary -- the same class of artifact the LOD seam work spent
+    // a package on. Widening the reach means widening the stencil (a 5^3 gather
+    // is 125 taps, not 27), so this is a clamp with a warning rather than a
+    // silent one.
+    {
+      const float kMaxReach =
+          (float)(2 * (int)kChunk -
+                  ((int)kChunk / 2 - (int)(1u << kSubOccShift) / 2)) *
+          kVoxelMeters;
+      if (r.glowReach < 0.0f) { r.glowReach = 0.0f; }
+      if (r.glowReach > kMaxReach) {
+        out.warnings.push_back(
+            "render.glowReach past the 3x3x3 chunk gather stencil truncates the "
+            "falloff (a hard step at a chunk boundary); clamped");
+        r.glowReach = kMaxReach;
+      }
+    }
+    if (r.glowStrength < 0.0f) { r.glowStrength = 0.0f; }
+    if (r.glowFill < 1.0f) { r.glowFill = 1.0f; }
+    r.glowChunksPerFrame = std::clamp(r.glowChunksPerFrame, 0, (int)kNumChunks);
+    r.glowRingBudget = std::clamp(r.glowRingBudget, 0, (int)kNumChunks);
+    r.glowTerrain = r.glowTerrain ? 1 : 0;
     // ---- short-range mode ----
     // The ceiling divides the fog ramp's span, so it must stay positive; 4 m
     // is under the near field's own reach and is already an absurd setting,

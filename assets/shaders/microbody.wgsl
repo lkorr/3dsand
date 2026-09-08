@@ -58,6 +58,10 @@
 @group(0) @binding(9) var<storage, read> pageTable : array<u32>;
 @group(0) @binding(17) var<storage, read> openness    : array<u32>;
 @group(0) @binding(18) var<storage, read> opennessGen : array<u32>;
+// The glow field (src/sim/world.h kGlowBytes, common.wgsl THE GLOW FIELD).
+// ONE buffer load per shaded point, no ray and no voxel read, which is the only
+// shape of emitter light this path can consume.
+@group(0) @binding(20) var<storage, read> glow : array<u32>;
 
 struct BodyXform {
   pos : vec3f, _p : f32,         // world voxels
@@ -345,6 +349,16 @@ fn fs(in : VSOut) -> FSOut {
   // (bodySunShadow -> shadowFromOpaqueHit, common.wgsl).
   let sh = bodySunShadow(worldPos, n, R, &occupancy, &materials);
   var col = litColorS(albedo, n, worldPos, emis, R, open.x, open.y, sh);
+  // Emitter light from the glow field (common.wgsl THE GLOW FIELD). ONE buffer
+  // load, no ray: this is the term that lights a mob standing in a lava pit or
+  // beside a burning tree, which nothing did before. It cannot come from the
+  // irradiance grid the terrain uses — `giGather` is nine coarse DDA rays and
+  // this shader already pays for a sun ray and an openness probe per fragment.
+  //
+  // `open.x` as the occlusion, not 1.0: unlike a loose particle a limb is a
+  // solid body with creases, and this is the same multiplier the ambient took
+  // one line up.
+  col += glowLight(albedo, open.x, glowAtPos(worldPos, &glow));
 
   // ---- THE HIT FLASH -------------------------------------------------------
   // ADDITIVE, and BEFORE the tonemap, because litColor's output is linear HDR

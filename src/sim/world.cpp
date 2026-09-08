@@ -123,6 +123,14 @@ void World::Init(const rhi::Device& device) {
   // rewrites every word of a chunk it visits.
   irradiance = CreateBuffer(device, kIrradianceBytes,
                             U::Storage | U::CopySrc | U::CopyDst, "irradiance");
+  // Glow field (world.h kGlowBytes block). The zero start is load-bearing in the
+  // SAME one place opennessGen's is: the per-slot stamp at [slot*4+1]. Zero is
+  // "never computed", so every reader returns no glow until sim_glow has walked
+  // the chunk, and EncodeLoadReset re-zeroes the source region so a loaded world
+  // cannot inherit the previous one's emitters. The 8 MiB field region needs no
+  // initial value — no reader reaches a field word whose slot stamp mismatches.
+  glow = CreateBuffer(device, kGlowBytes,
+                      U::Storage | U::CopySrc | U::CopyDst, "glow");
   shadowArgsStage = CreateBuffer(device, 16, U::Storage | U::CopySrc | U::CopyDst,
                                  "shadowArgsStage");
   // Indirect ONLY, and out of every bind group — same rule as dispatchArgs.

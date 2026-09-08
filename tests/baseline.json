@@ -277,5 +277,13 @@
   "bodyShade.maxRatio": "2.50",
   "_giNightfall_about": "No block-face keeps yesterday's sun, docs/PLAN_gi.md 3. Two floating 4x4 plates are charged by the openness walk at noon and then carved down to a single column each -- one on a column openSunSample probes, one on a block corner it does not -- and walked 24 more ticks at midnight. maxRemainPct is the most of the noon luminance either word may still hold; minDayLum is the floor the charge itself must clear, so \"it faded\" cannot pass on a word that was never lit. Before the five-column probe and the unconditional fade both words held 100%.",
   "giNightfall.maxRemainPct": "5.0",
-  "giNightfall.minDayLum": "0.02"
+  "giNightfall.minDayLum": "0.02",
+  "_glow_about": "The glow field, src/sim/world.h kGlowBytes and assets/shaders/sim_glow.wgsl: a coarse world-space field of emitter light that the raster body and mob paths can read with ONE buffer load, because giGather needs nine rays plus voxels/pageTable in the fragment stage and they have neither. Four passes over one fixture -- a 4x4x4 block of crystal (a solid mineral with emission 120, no reactions, buried 12 cells under the surface so nothing can move it and the floating-voxel pass cannot lift it into a rigid body). A: the source word counted all 64 emitting cells and is bright. B: the field one 4-cell block away, ACROSS a chunk boundary, is nonzero. C: the field two CHUNKS away -- outside the producer 3x3x3 gather stencil by construction -- is zero, which is what stops a producer that returned bright everywhere from passing A, B and D. D: the emitter is replaced with stone and both go back to EXACTLY zero. maxFarLum and maxRemainPct are 0 and not a small tolerance on purpose: unlike the irradiance grid this field is a pure recompute with no memory, so anything above zero is a bug rather than a decay that has not finished. minSrcLum/minNearLum are the floors that stop the zero assertions passing on a field that was never lit.",
+  "glow.minSrcLum": "0.02",
+  "glow.minNearLum": "0.005",
+  "glow.maxFarLum": "0.0",
+  "glow.maxRemainPct": "0.0",
+  "glow.srcLumObserved": "0",
+  "glow.nearLumObserved": "0",
+  "glow": "pass"
 }
