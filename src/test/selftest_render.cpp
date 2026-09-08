@@ -2696,48 +2696,73 @@ Status GateTaa(Ctx& c, std::string& detail) {
   const bool sharpWins = taaSharpEdge < taaPlainEdge;
   const double taaEdge = sharpWins ? taaSharpEdge : taaPlainEdge;
 
-  // ---- cost, three arms, no readbacks in the timed loop -------------------
-  auto drawOnly = [&](const rhi::TextureView& v, uint32_t w, uint32_t h) {
-    WriteRenderParams(ctx.queue, world, eye, cam, aspect, true, 0.0f,
-                      kFarFogDensity, (float)h);
-    rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
-    sim.EncodeShadowResolve(enc);
-    rhi::RenderPass rp =
-        sim.BeginRenderPass(enc, v, rhi::TextureFormat::RGBA8Unorm, w, h);
-    sim.DrawWorld(rp);
-    rp.End();
-    ctx.queue.Submit(enc.Finish());
+  // ---- TWO CAMERAS, because one of them cannot see the far field ----------
+  // The quality arms above use the overlook, which is the right subject for a
+  // RESOLUTION question (dense near-field detail). It is the wrong subject for
+  // a COST question: a camera pitched into the ground resolves almost no
+  // far-cascade pixels — every older --render-budget camera reports
+  // rmPxFar = 0.000 for exactly this reason — so it prices the near march and
+  // nothing else, and the renderer's other half never appears in the number.
+  // The horizon camera below is the far-field arm: high, nearly level, so the
+  // cascade is most of the frame. Between them they bracket what a scaled frame
+  // actually costs.
+  //
+  // Measured HERE rather than through --render-budget deliberately: a budget arm
+  // that mutates tuning changes the shared TUNE_ prelude and pays a worldgen
+  // `far` recompile of 500-1090 s. Nothing in this gate mutates tuning, so both
+  // cameras cost eight frames each and no compile at all.
+  const Vec3 eyeFar{(float)gx, (float)(ground + 90), (float)gz};
+  Camera camFar;
+  camFar.yaw = 0.785f;
+  camFar.pitch = -0.08f;   // nearly level: the horizon fills the frame
+
+  auto costArms = [&](const Vec3& e, const Camera& cm, double& native,
+                      double& half, double& halfTaa) {
+    auto drawOnly = [&](const rhi::TextureView& v, uint32_t w, uint32_t h) {
+      WriteRenderParams(ctx.queue, world, e, cm, aspect, true, 0.0f,
+                        kFarFogDensity, (float)h);
+      rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
+      sim.EncodeShadowResolve(enc);
+      rhi::RenderPass rp =
+          sim.BeginRenderPass(enc, v, rhi::TextureFormat::RGBA8Unorm, w, h);
+      sim.DrawWorld(rp);
+      rp.End();
+      ctx.queue.Submit(enc.Finish());
+    };
+    timeIt(8, native, [&](uint32_t) { drawOnly(c.view, W, H); });
+    timeIt(8, half, [&](uint32_t) { drawOnly(smallView, rw, rh); });
+    sim.ResetTaa();
+    sim.EnsureTaa(rw, rh, W, H);
+    // Timed with the LOD arm that WON above, so the cost quoted is the cost of
+    // the configuration the numbers just argued for and not of a third one.
+    const bool timeSharp = sharpWins;
+    timeIt(8, halfTaa, [&](uint32_t f) {
+      Camera jcam;
+      Simulation::TaaCamera taaCam{};
+      ApplyTaaJitter(cm, e, aspect, rw, rh, f, 1.0f, jcam, taaCam);
+      WriteRenderParams(ctx.queue, world, e, jcam, aspect, true, 0.0f,
+                        kFarFogDensity, timeSharp ? (float)H : (float)rh);
+      sim.WriteTaaParams(ctx.queue, taaCam, CurrentTuning().render.taaMaxHist,
+                         CurrentTuning().render.taaClamp, /*reset=*/f == 0,
+                         /*bgraSource=*/false);
+      rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
+      sim.EncodeShadowResolve(enc);
+      rhi::RenderPass rp = sim.BeginRenderPass(
+          enc, smallView, rhi::TextureFormat::RGBA8Unorm, rw, rh);
+      sim.DrawWorld(rp);
+      rp.End();
+      sim.EncodeTaaCapture(enc, small);
+      rhi::RenderPass rp2 = sim.BeginTaaRenderPass(
+          enc, c.view, rhi::TextureFormat::RGBA8Unorm, W, H);
+      sim.DrawTaa(rp2);
+      rp2.End();
+      ctx.queue.Submit(enc.Finish());
+      sim.FlipTaaPage();
+    });
   };
-  timeIt(8, msNative, [&](uint32_t) { drawOnly(c.view, W, H); });
-  timeIt(8, msHalf, [&](uint32_t) { drawOnly(smallView, rw, rh); });
-  sim.ResetTaa();
-  sim.EnsureTaa(rw, rh, W, H);
-  // Timed with the LOD arm that WON above, so the cost quoted is the cost of
-  // the configuration the numbers just argued for and not of a third one.
-  const bool timeSharp = sharpWins;
-  timeIt(8, msHalfTaa, [&](uint32_t f) {
-    Camera jcam;
-    Simulation::TaaCamera taaCam{};
-    ApplyTaaJitter(cam, eye, aspect, rw, rh, f, 1.0f, jcam, taaCam);
-    WriteRenderParams(ctx.queue, world, eye, jcam, aspect, true, 0.0f,
-                      kFarFogDensity, timeSharp ? (float)H : (float)rh);
-    sim.WriteTaaParams(ctx.queue, taaCam, CurrentTuning().render.taaMaxHist,
-                       CurrentTuning().render.taaClamp, /*reset=*/f == 0,
-                       /*bgraSource=*/false);
-    rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
-    sim.EncodeShadowResolve(enc);
-    rhi::RenderPass rp = sim.BeginRenderPass(
-        enc, smallView, rhi::TextureFormat::RGBA8Unorm, rw, rh);
-    sim.DrawWorld(rp);
-    rp.End();
-    sim.EncodeTaaCapture(enc, small);
-    rhi::RenderPass rp2 =
-        sim.BeginTaaRenderPass(enc, c.view, rhi::TextureFormat::RGBA8Unorm, W, H);
-    sim.DrawTaa(rp2);
-    rp2.End();
-    ctx.queue.Submit(enc.Finish());
-    sim.FlipTaaPage();
-  });
+  double msNativeFar = 0.0, msHalfFar = 0.0, msHalfTaaFar = 0.0;
+  costArms(eye, cam, msNative, msHalf, msHalfTaa);
+  costArms(eyeFar, camFar, msNativeFar, msHalfFar, msHalfTaaFar);
 
   // The margins are SLACK, not calibration. A resolve landing on the right
   // texel scores a small fraction of a one-pixel shift; one landing on the
@@ -2780,9 +2805,9 @@ Status GateTaa(Ctx& c, std::string& detail) {
       "taa: %s (alignment err %.2f vs 1px-shift %.2f | half-res whole-frame err "
       "@16/@%u frames: %.2f/%.2f sharpLod=0, %.2f/%.2f sharpLod=1, vs nearest "
       "%.2f; ON EDGES (top 20%% by gradient) @%u: %.2f / %.2f vs nearest %.2f, "
-      "sharpLod=%d wins | cost/frame %.2f ms full-res, %.2f ms half-res, "
-      "%.2f ms half-res+resolve = %+.2f ms for the resolve, %+.2f ms net vs "
-      "full-res)",
+      "sharpLod=%d wins | COST/frame ground cam: %.2f full-res / %.2f half-res "
+      "/ %.2f half-res+resolve (%+.2f ms resolve, %+.2f ms net); horizon cam: "
+      "%.2f / %.2f / %.2f (%+.2f ms resolve, %+.2f ms net))",
       alignOk ? (taaEdge < nearestEdge ? "aligned; edges beat the blit"
                                        : "aligned; reconstruction only LEVEL "
                                          "with the blit (advisory, see the "
@@ -2791,7 +2816,8 @@ Status GateTaa(Ctx& c, std::string& detail) {
       alignErr, shiftErr, (unsigned)kAccumFrames, taaPlain16, taaPlainErr,
       taaSharp16, taaSharpErr, nearestErr, (unsigned)kAccumFrames, taaPlainEdge,
       taaSharpEdge, nearestEdge, sharpWins ? 1 : 0, msNative, msHalf, msHalfTaa,
-      msHalfTaa - msHalf, msHalfTaa - msNative);
+      msHalfTaa - msHalf, msHalfTaa - msNative, msNativeFar, msHalfFar,
+      msHalfTaaFar, msHalfTaaFar - msHalfFar, msHalfTaaFar - msNativeFar);
   return alignOk ? Status::Pass : Status::Fail;
 }
 
