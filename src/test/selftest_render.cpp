@@ -830,22 +830,74 @@ Status GateOpenness(Ctx& c, std::string& detail) {
   ctx.WaitIdle();
 
   const int gx = 300, gz = 300;
-  const int ground = World::TerrainHeight(gx, gz, kDefaultSeed);
+  // THE GROUND IS READ, NOT PREDICTED (2026-09-05). This stood on
+  // World::TerrainHeight, the CPU mirror of the landform's BASE height, and
+  // the surface worldgen actually leaves under (300,300) is that plus the
+  // biome skin, the cover and whatever grows there -- since the environment-
+  // truth wave the two disagree by enough that the "floor" cell was air. Its
+  // block held no blocker, so the walk wrote 255 ("no surface"), and 255/255
+  // printed as `roofed 1.00`: the gate was known-failing while measuring
+  // nothing at all. Scan the column of REAL voxels from the top of the window
+  // down for the first ray blocker (the same predicate the walk uses; a
+  // canopy counts, and a slab 1.4 m over a canopy is still a roof).
+  int ground = -1;
+  {
+    const IVec3 org = world.WindowOrigin();
+    std::vector<uint32_t> chunk(kChunkVol, 0);
+    for (int cy = org.y + (int)kNChunk - 1; cy >= org.y && ground < 0; cy--) {
+      const IVec3 cc{gx >> 4, cy, gz >> 4};
+      if (!world.ChunkInWindow(cc)) continue;
+      ReadVoxelsSync(ctx, world, World::SlotChunkIndex(cc), 1, chunk.data(),
+                     "openness");
+      for (int ly = (int)kChunk - 1; ly >= 0; ly--) {
+        const uint32_t w =
+            chunk[((uint32_t)(gz & 15) * kChunk + (uint32_t)ly) * kChunk +
+                  (uint32_t)(gx & 15)];
+        const uint32_t m = w & 0xFFFu;
+        if (m == 0 || m >= c.mats.size()) continue;
+        const MaterialGpu& g = c.mats[m].gpu;
+        const bool blocker =
+            (g.flags & kMatFlagMicro) == 0 &&
+            (g.klass == CLASS_SOLID || g.klass == CLASS_POWDER ||
+             (g.klass == CLASS_LIQUID && (g.flags & kMatFlagOpaque) != 0));
+        if (blocker) { ground = cy * (int)kChunk + ly; break; }
+      }
+    }
+  }
+  if (ground < 0) {
+    detail = "no ray-blocking surface under (300,300) inside the window";
+    return Status::Fail;
+  }
   const int kHalf = 22;            // slab half-extent, voxels (2.2 m)
-  const int kLift = 14;            // slab underside above ground, voxels (1.4 m)
-  const int slabY = ground + kLift;
+  const int kLift = 14;            // roof underside above the floor top (1.4 m)
+  // THE FLOOR IS BUILT TOO (2026-09-05), floating well over the terrain like
+  // gi-bounce's slab, instead of being whatever ground worldgen left at
+  // (300,300). With the fixture pads gone the real ground there is a slope,
+  // and the probe cell sat one voxel below its 4x4 block's neighbours: the
+  // walk's four origin columns all started inside dirt, found no exposed
+  // face, wrote 255 ("could not march"), and the gate read "roofed 1.00"
+  // against a roof that was standing right there. A built floor has its own
+  // flat top; the roof goes kLift above it; both land in one tick, and the
+  // dirty walk that tick marches both chunks with both in place.
+  const int floorY = ground + 48;          // floor slab: floorY, floorY + 1
+  const int floorTop = floorY + 1;
+  const int slabY = floorTop + kLift;      // roof slab: slabY, slabY + 1
   const IVec3 pchunk{gx / 16, slabY / 16, gz / 16};
 
   std::vector<CellOp> slab;
   for (int dx = -kHalf; dx <= kHalf; dx++)
     for (int dy = 0; dy < 2; dy++)
-      for (int dz = -kHalf; dz <= kHalf; dz++) {
-        const IVec3 cc{gx + dx, slabY + dy, gz + dz};
-        if (!world.CellInWindow(cc)) continue;
-        slab.push_back({World::SlotCellIndex(cc), PackVoxNew(mStone, 0u)});
-      }
-  if (slab.empty()) {
-    detail = "slab site is outside the residency window";
+      for (int dz = -kHalf; dz <= kHalf; dz++)
+        for (int y0 : {floorY, slabY}) {
+          const IVec3 cc{gx + dx, y0 + dy, gz + dz};
+          if (!world.CellInWindow(cc)) continue;
+          slab.push_back({World::SlotCellIndex(cc), PackVoxNew(mStone, 0u)});
+        }
+  const IVec3 floorCell{gx, floorTop, gz};
+  const IVec3 topCell{gx, slabY + 1, gz};
+  if (slab.empty() || !world.CellInWindow(floorCell) ||
+      !world.CellInWindow(topCell)) {
+    detail = "fixture site is outside the residency window";
     return Status::Fail;
   }
 
@@ -854,25 +906,32 @@ Status GateOpenness(Ctx& c, std::string& detail) {
              false, false);
   ctx.WaitIdle();
 
-  // Tick B: one voxel in the FLOOR's chunk, so the floor is re-walked now that
-  // the roof exists. Written as stone into a cell that is already solid ground,
-  // so the geometry the measurement depends on does not move.
-  const IVec3 floorCell{gx, ground, gz};
-  if (!world.CellInWindow(floorCell)) {
-    detail = "floor site is outside the residency window";
-    return Status::Fail;
-  }
-  std::vector<CellOp> poke{
-      {World::SlotCellIndex(floorCell), PackVoxNew(mStone, 0u)}};
-  SubmitTick(ctx, world, sim, ++tick, kDefaultSeed, {}, {}, poke, false, pchunk,
-             false, false);
-  ctx.WaitIdle();
-
   bool okA = false, okB = false;
   const uint32_t roofByte = OpennessByteAt(ctx, world, floorCell, 3u, &okA);
-  const IVec3 topCell{gx, slabY + 1, gz};
   const uint32_t openByte = OpennessByteAt(ctx, world, topCell, 3u, &okB);
 
+  // ATTRIBUTION, printed on every run: the raw bytes (254 = measured fully
+  // open, 255 = no surface / could not march -- both print as "1.00" above)
+  // and the voxels actually standing at the probe cells after the ticks, so
+  // a failure names whether the fixture landed, the face was walked, or the
+  // walk measured the wrong thing.
+  auto matAt = [&](IVec3 cc) -> std::string {
+    const IVec3 wc{cc.x >> 4, cc.y >> 4, cc.z >> 4};
+    if (!world.ChunkInWindow(wc)) return "out-of-window";
+    std::vector<uint32_t> chunk(kChunkVol, 0);
+    ReadVoxelsSync(ctx, world, World::SlotChunkIndex(wc), 1, chunk.data(), "openness");
+    const uint32_t m = chunk[((uint32_t)(cc.z & 15) * kChunk + (uint32_t)(cc.y & 15)) * kChunk +
+                             (uint32_t)(cc.x & 15)] & 0xFFFu;
+    return m < c.mats.size() ? c.mats[m].name : "?";
+  };
+  std::printf(
+      "openness attribution: floor (%d,%d,%d) byte %u [%s, above %s]; slab top "
+      "(%d,%d,%d) byte %u [%s, above %s]; window origin chunk (%d,%d,%d)\n",
+      floorCell.x, floorCell.y, floorCell.z, roofByte, matAt(floorCell).c_str(),
+      matAt({floorCell.x, floorCell.y + 1, floorCell.z}).c_str(), topCell.x,
+      topCell.y, topCell.z, openByte, matAt(topCell).c_str(),
+      matAt({topCell.x, topCell.y + 1, topCell.z}).c_str(),
+      world.WindowOrigin().x, world.WindowOrigin().y, world.WindowOrigin().z);
   const double a = roofByte / 255.0;
   const double b = openByte / 255.0;
   const double aMax = BaselineNumber("openness.roofedMax", 0.30);
@@ -880,12 +939,12 @@ Status GateOpenness(Ctx& c, std::string& detail) {
   const bool ok = okA && okB && a < aMax && b > bMin;
 
   std::printf(
-      "openness: %s (ground under a %dx%d slab %.1f m up: %.2f, must be < %.2f;"
-      " the slab's own top face: %.2f, must be > %.2f; stamps %s/%s, %zu slab "
-      "cells at (%d,%d) ground y=%d)\n",
+      "openness: %s (built floor under a %dx%d slab %.1f m up: %.2f, must be < "
+      "%.2f; the slab's own top face: %.2f, must be > %.2f; stamps %s/%s, %zu "
+      "fixture cells at (%d,%d), ground y=%d, floor top y=%d)\n",
       ok ? "PASS" : "FAIL", kHalf * 2 + 1, kHalf * 2 + 1,
       kLift * (double)kVoxelMeters, a, aMax, b, bMin, okA ? "ok" : "STALE",
-      okB ? "ok" : "STALE", slab.size(), gx, gz, ground);
+      okB ? "ok" : "STALE", slab.size(), gx, gz, ground, floorTop);
   detail = Format("roofed %.2f (< %.2f), open %.2f (> %.2f), stamps %s/%s", a,
                   aMax, b, bMin, okA ? "ok" : "stale", okB ? "ok" : "stale");
   return ok ? Status::Pass : Status::Fail;

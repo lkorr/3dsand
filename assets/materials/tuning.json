@@ -742,6 +742,7 @@
     "giDecay": 0.25,
     "giFeedback": 0.2,
     "giGatherBlocks": 3,
+    "giCachePeriod": 8,
     "glowStrength": 1,
     "glowReach": 2.4,
     "glowFill": 32,

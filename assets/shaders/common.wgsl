@@ -3566,6 +3566,38 @@ fn irrIndexOfCell(c : vec3<i32>, face : u32) -> u32 {
   return irrIndex(chunkIndexW(c), subOccBitLocal(lo), face);
 }
 
+// ---- the second plane of `irradiance`: the GATHER CACHE ---------------------
+// (world.h kIrradiancePlanes, docs/PLAN_frame_perf.md §3 item 1.) At
+// GI_CACHE_BASE + irrIndex(...) sits the INCOMING irradiance giGather's nine
+// rays return at that block-face's centre, RGB9E5 with its low bit forced on:
+// 0 is "never gathered" and only 0 means that, so a gathered zero (a face in
+// the dark) is stored as the smallest representable red and never re-gathered
+// for being dark. Written by the raymarch on a slot's scheduled frame
+// (render.giCachePeriod, slots staggered) and for any 0 it meets; zeroed by
+// the openness walk for a slot the window reused, for a block with no surface,
+// and on every FULL walk (the geometry may have moved, so the next frame
+// re-gathers what it can see). Read under the openness stamp like everything
+// else in the two grids.
+const GI_CACHE_BASE : u32 = NUM_CHUNKS * OPEN_BLOCKS * OPEN_FACES;
+
+// ---- the second and third planes of `opennessGen` ---------------------------
+// (world.h kOpennessGenWords, PLAN_frame_perf.md §3 item 4.) Plane 0 is the
+// world-chunk stamp. Plane 1, OPEN_WALKED_BASE + slot, is the tick of the
+// slot's last FULL walk (the five-ray march). Plane 2, OPEN_TOUCH_BASE +
+// column, is per slot COLUMN (x, z): the tick something within opennessReach
+// of that column last changed geometry -- every dirty walk stamps the 17x17
+// columns around its chunk, and so does the refresh when it finds a chunk
+// that arrived in a slot with a stale stamp. The refresh skips the march for
+// a slot whose stamp matches and whose column was not touched since its last
+// full walk, and keeps only the irradiance maintenance. Slot-space columns
+// are toroidal like the slots; a column renamed by a window shift keeps its
+// old touch, which can only cost one extra walk, never a missed one.
+const OPEN_WALKED_BASE : u32 = NUM_CHUNKS;
+const OPEN_TOUCH_BASE : u32 = 2u * NUM_CHUNKS;
+fn openColumnOfSlot(slot : u32) -> u32 {
+  return (slot / (NCHUNK * NCHUNK)) * NCHUNK + (slot % NCHUNK);
+}
+
 // RGB9E5: three 9-bit mantissas under one 5-bit exponent (bias 15), the
 // GL_EXT_texture_shared_exponent layout. Chosen over three fixed-point lanes
 // because a noon deposit (~1.5) and a moonlit one (~0.004) differ by 400x and

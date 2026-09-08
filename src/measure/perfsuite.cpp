@@ -1907,6 +1907,17 @@ const RenderArm kRenderArms[] = {
      [](Tuning& t) { t.render.giStrength = 0.0f; }, true, 1,
      "the irradiance gather at every near-field hit plus both injection "
      "paths"},
+    // The gather CACHE (PLAN_frame_perf.md §3 item 1). giCachePeriod = 0
+    // const-folds the cache read away and puts the nine-ray gather back on
+    // every lit near pixel every frame -- the pre-cache shader, exactly -- so
+    // baseline - nogicache is what caching the gather per block-face is worth
+    // on this world. Only meaningful once the openness walk has stamped the
+    // visible slots (the cache is keyed under the openness stamp); the warm-up
+    // ticks below cover that.
+    {"nogicache", "giCachePeriod 8 -> 0 (per-pixel gather every frame)",
+     [](Tuning& t) { t.render.giCachePeriod = 0; }, true, 1,
+     "the gather cache: nine block rays per lit pixel per frame, less one "
+     "cached word per hit"},
     // ---- the glow field (src/sim/world.h kGlowBytes) ----
     // glowStrength = 0 makes C_GLOW false, so none of the three producer rows
     // is recorded, AND const-folds the sampled term out of every consumer -- so

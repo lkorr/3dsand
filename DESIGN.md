@@ -5503,6 +5503,28 @@ does not re-walk the floor, which darkens when the rolling refresh reaches it
 (`kNumChunks / render.opennessChunksPerFrame` ticks). Dilating the dirty list
 instead is not available — a 12 m reach dilates to a 15³ chunk neighbourhood.
 
+**The refresh skips a world where nothing changed** (2026-09-05,
+`docs/PLAN_frame_perf.md` §3 item 4). `opennessGen` carries two more planes
+(`kOpennessGenWords`; `OPEN_WALKED_BASE` / `OPEN_TOUCH_BASE` in
+`common.wgsl`): the tick of each slot's last FULL walk, and per slot COLUMN
+(x, z) the tick something within `opennessReach` of that column last changed
+geometry. Every dirty walk stamps the 17×17 columns around its chunk
+(`openTouchAround` — column STAMPS, not the chunk WALKS the paragraph above
+refuses), and so does the refresh when it meets a chunk that arrived in a slot
+with a stale stamp (its neighbours' faces were marched against whatever the
+slot held before). A refresh visit whose column was not touched since the
+slot's last full walk keeps its bytes and does only the irradiance
+maintenance — the coarse sun re-sample for a face that marched, the decay for
+one that could not — because that half must never stop (the
+charger-with-no-expiry bug). "Touched more recently than walked" is compared
+modulo 2³², so a tick clock that jumps between harness fixtures, or a slice
+the pass was not recorded on, cannot age a touch away. A solid sentinel chunk
+(`UNIFORM`/`JITTER` of a ray blocker) settles every interior face as buried
+without the four-column origin search; only a face on the chunk boundary can
+be exposed. The roof-over-floor case above therefore darkens the floor on its
+next visit rather than never, which the old flat refresh also did — the skip
+changed the cost, not the answer.
+
 **The readers.** `ambientAt`'s near-field terrain hit multiplies the hemisphere
 ambient by `opennessScale(opennessAt(...))`, alongside `ao` and never the sun
 (the sun has its own shadow ray). Far-cascade hits keep the plain lerp — the
@@ -5673,7 +5695,23 @@ not change to the eye, and the quadrature's 0.28 against a form factor of 0.5 is
 reason; 0 is an exact off switch — gather,
 resolve deposit and walk sample all const-fold, the `nogi` `--render-budget`
 arm), `giDecay` (0.25), `giFeedback` (0, P2; `LoadTuning` keeps it strictly
-below `giDecay`), `giGatherBlocks` (3).
+below `giDecay`), `giGatherBlocks` (3), `giCachePeriod` (8; 0 is the uncached
+per-pixel gather, the `nogicache` `--render-budget` arm).
+
+**The gather is cached per block-face** (2026-09-05, `docs/PLAN_frame_perf.md`
+§3 item 1). The nine rays are a function of the block-face and the geometry
+around it, not of the pixel, and they read a grid that is itself an EMA over
+frames — so `irradiance` has a second plane (`kIrradiancePlanes`,
+`GI_CACHE_BASE`) at the same index holding the INCOMING irradiance gathered at
+the block-face's centre (the same origin `sim_openness.wgsl`'s own rays start
+from), RGB9E5 with its low bit forced on so that 0 means "never gathered".
+`giBounceAt` re-runs `giGatherRays` only on a chunk slot's scheduled frame —
+slots are staggered over `giCachePeriod` frames, per SLOT rather than per block
+so the branch stays uniform across a warp — or for a word that reads 0, and
+reads the four block-faces in the face plane bilinearly, as `opennessAt` reads
+its bytes. The openness walk zeroes the cache word on every full walk and for
+a reused slot, so moved geometry re-gathers on the next frame that looks at
+it; a slot the walk has not stamped gathers live, as before.
 
 **Verified by** `--selftest --gate gi-bounce`: a white `bone` wall on the -X
 edge of a floating 41×41 `leaves` slab at noon; the wall's +X face rendered

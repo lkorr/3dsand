@@ -336,6 +336,13 @@ TP_F(render, giDecay, TUNE_GI_DECAY, 0.25f)
 TP_F(render, giFeedback, TUNE_GI_FEEDBACK, 0.2f)
 // 4^3 blocks each of the five gather rays steps through (3 = 1.2 m).
 TP_I(render, giGatherBlocks, TUNE_GI_GATHER_BLOCKS, 3)
+// The gather CACHE (PLAN_frame_perf.md s3 item 1): frames between re-gathers
+// of one chunk slot's block-faces. The nine rays run only on a slot's scheduled
+// frame (slots are staggered, so 1/N of the visible ones re-gather per frame)
+// and for a face never gathered; every other hit reads one cached word,
+// bilinear over the face plane. 0 = the old per-pixel gather every frame,
+// const-folded, which is the `nogicache` --render-budget arm.
+TP_I(render, giCachePeriod, TUNE_GI_CACHE_PERIOD, 8)
 
 // ---- the glow field (src/sim/world.h kGlowBytes, assets/shaders/sim_glow.wgsl)
 // Weight of the sampled emitter light added at a consumer. 0 is an EXACT off

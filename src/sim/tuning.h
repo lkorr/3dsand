@@ -2559,6 +2559,7 @@ struct Tuning {
     float giDecay = 0.25f;              // per-visit fade of unmeasurable faces
     float giFeedback = 0.2f;            // P2 write-back weight, < giDecay
     int giGatherBlocks = 3;             // blocks per gather ray
+    int giCachePeriod = 8;              // frames between a slot's re-gathers; 0 = uncached
 
     // ---- the glow field (src/sim/world.h kGlowBytes) ----
     // A coarse position-keyed field of emitter light, written by sim_glow.wgsl

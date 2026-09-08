@@ -2132,6 +2132,7 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadF(*g, "giDecay", r.giDecay, out, at);
     ReadF(*g, "giFeedback", r.giFeedback, out, at);
     ReadI(*g, "giGatherBlocks", r.giGatherBlocks, out, at);
+    ReadI(*g, "giCachePeriod", r.giCachePeriod, out, at);
     ReadF(*g, "glowStrength", r.glowStrength, out, at);
     ReadF(*g, "glowReach", r.glowReach, out, at);
     ReadF(*g, "glowFill", r.glowFill, out, at);
@@ -2314,6 +2315,8 @@ bool LoadTuning(const std::string& path, Tuning& out) {
       r.giFeedback = std::max(0.0f, r.giDecay * 0.5f);
     }
     r.giGatherBlocks = std::clamp(r.giGatherBlocks, 0, 8);
+    // Beyond 64 the bounce visibly lags the sun; 0 is the uncached path.
+    r.giCachePeriod = std::clamp(r.giCachePeriod, 0, 64);
     // Multi-bounce gain (P2): each bounce is albedo x the gather's 0.28 form
     // factor x giStrength, and the series converges only while that is below
     // 1 -- so with write-back on, giStrength above 3 can run away on a white

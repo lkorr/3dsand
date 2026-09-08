@@ -559,7 +559,21 @@ static_assert(kOpenBytesPerChunk % 4 == 0,
 constexpr uint32_t kOpenWordsPerChunk = kOpenBytesPerChunk / 4;
 constexpr uint64_t kOpennessBytes =
     (uint64_t)kNumChunks * kOpenWordsPerChunk * 4;          // 12 MiB at 512^3
-constexpr uint64_t kOpennessGenBytes = (uint64_t)kNumChunks * 4;   // 128 KiB
+// THREE PLANES, not one (2026-09-05, PLAN_frame_perf.md §3 item 4):
+//   [0, kNumChunks)              the world-chunk STAMP per slot (below)
+//   [kNumChunks, 2 kNumChunks)   the tick of the slot's last FULL walk
+//   [2 kNumChunks, + kNChunk^2)  per slot COLUMN (x, z): the tick something
+//                                within opennessReach of that column last
+//                                changed geometry (a dirty walk, or a chunk
+//                                arriving in a slot with a stale stamp).
+// The rolling refresh skips the five-ray march for a slot whose stamp matches
+// and whose column has not been touched since its last full walk, keeping only
+// the irradiance maintenance (sun re-sample / decay) that must not stop. The
+// DESIGN.md note that "dilating the dirty list is not available" still holds:
+// this is 17x17 column STAMPS per dirty chunk, not 15^3 chunk WALKS. WGSL
+// mirrors the layout as OPEN_WALKED_BASE / OPEN_TOUCH_BASE (common.wgsl).
+constexpr uint32_t kOpennessGenWords = 2 * kNumChunks + kNChunk * kNChunk;
+constexpr uint64_t kOpennessGenBytes = (uint64_t)kOpennessGenWords * 4;   // 260 KiB
 
 // ---- the IRRADIANCE grid (docs/PLAN_gi.md §3, W3 P1) -----------------------
 // One u32 per (slot, 4^3 block, face) — the SAME identity the openness byte
@@ -580,8 +594,18 @@ constexpr uint64_t kOpennessGenBytes = (uint64_t)kNumChunks * 4;   // 128 KiB
 // where deposits are dense and is bounded by construction. RGB9E5 rather than
 // three fixed-point lanes because the sun-lit day value and a moonlit night
 // value differ by ~400x and the tint of the bounce is the whole point.
+// TWO PLANES since 2026-09-05 (PLAN_frame_perf.md §3 item 1). The first is
+// the OUTGOING radiance above. The second, at the same index + GI_CACHE_BASE
+// (common.wgsl), is the GATHERED INCOMING irradiance at the block-face's
+// centre: what `giGather`'s nine rays return, cached so the raymarch reads one
+// word per hit and re-gathers a chunk slot's faces only on its scheduled frame
+// (render.giCachePeriod) or when a word is 0 ("never gathered" -- a gathered
+// zero is stored with its low bit set). Same stamp, same writers' standing:
+// the walk zeroes it for a slot the window reused, the raymarch fills it.
+constexpr uint32_t kIrradiancePlanes = 2;
 constexpr uint64_t kIrradianceBytes =
-    (uint64_t)kNumChunks * kOpenBlocksPerChunk * kOpenFaces * 4;   // 48 MiB at 512^3
+    (uint64_t)kNumChunks * kOpenBlocksPerChunk * kOpenFaces * 4 *
+    kIrradiancePlanes;   // 96 MiB at 512^3
 
 // ---- the GLOW field (docs/PLAN_glow.md; assets/shaders/sim_glow.wgsl) ------
 // A coarse, world-space, POSITION-KEYED field of the light emitters are
