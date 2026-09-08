@@ -134,12 +134,13 @@ Open follow-ups:
 ## Package C — WRITTEN 2026-09-07, NOT YET MEASURED (branch `worktree-agent-a665bf2ee69ebad8e`)
 
 Items 1 and 2 are implemented and compile-clean; item 3 is deliberately **not
-done** and the reason is a measurement, below. **Nothing here has been run yet**
-— the worktree's C++ compiled (981/981, sccache 94.4 % hit) but the link sat
-queued on `sv-gpu-lock` for ~90 minutes behind a `sandvox.exe` running out of the
-main checkout, so there is no determinism line, no far screenshot and no
-`pipelineCompileMs` table. **That is the whole of what is left.** See "How to
-finish it" at the bottom.
+done** and the reason is a measurement, below. **Nothing here has been RUN yet.**
+The worktree's exe IS built (compile 85 s, link 3962 s — the link spent 66 of
+those 66 minutes queued on `sv-gpu-lock` behind a `sandvox.exe` running out of
+the main checkout, which is why the session ended here), but no verification
+launch happened: there is no determinism line, no far screenshot and no
+`pipelineCompileMs` table. **That one launch is the whole of what is left.** See
+"How to finish it" at the bottom.
 
 ### Item 1 — `far` split into `far` (sweep) + `farpatch` (edit patch). DONE.
 
@@ -267,11 +268,15 @@ listed here because this is where it was found.
 
 ### How to finish it (the ONE remaining run)
 
-Nothing is verified. In the worktree:
+Nothing is verified, but **the binary exists**: the worktree's
+`build/Release/sandvox.exe` was linked 2026-09-07 22:41 (compile 85 s, link
+3962 s — of which essentially all was waiting on `sv-gpu-lock` behind a
+`sandvox.exe` running out of the main checkout, not linking). So the remaining
+work is ONE launch, not a build. In the worktree:
 
 ```bash
-bash scripts/build.sh                                   # link only; the objects are cached
-cp build/Release/sandvox.exe build/Release/sandvox_pkgc.exe
+# No build needed unless src/ moved: build/Release/sandvox.exe is current.
+cp build/Release/sandvox.exe build/Release/sandvox_pkgc.exe   # main's relink cannot delete it
 SANDVOX_SHADER_TIMING=1 bash scripts/run.sh ./build/Release/sandvox_pkgc.exe \
     --verify determinism --shot-frames screenshot_far > build/pkgc_verify.log 2>&1
 ```
