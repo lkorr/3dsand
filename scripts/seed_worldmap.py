@@ -109,6 +109,29 @@ meta = {
     "seaLevelY": 112,
     "oceanFadeCells": FADE,
     "warpAmpVox": 160,
+    # The TERRAIN, per map (PLAN_environment_truth P-G): every number that used
+    # to be a worldgen.* knob in tuning.json. src/sim/worldmap.h kHTerrain* is
+    # the packed form; scripts/seed_terrain_rows.py carries the same defaults.
+    "terrain": {
+        "about": ("The terrain, per MAP (P-G): what used to be worldgen.* in tuning.json. Lengths in "
+                  "voxels at refVoxelsPerMetre; log2 cells are shifts; fbmAtten / sedFraction / sedSlope "
+                  "are Q8 counts. baseHeight is the mean ground; a painted landform 0..255 spans "
+                  "landformRangeVox centred on 128; range/hill/detail/grain are the seeded octave "
+                  "ladder under the plane; homeArea is the calm ground around the spawn site; the "
+                  "sediment wedge and the treeline are what they were as knobs. Per-biome relief is "
+                  "each biome file's `terrain` block."),
+        "refVoxelsPerMetre": 10,
+        "baseHeight": 200,
+        "landformRangeVox": 1024,
+        "rangeAmplitude": 256, "rangeLog2": 9,
+        "hillAmplitude": 64, "hillLog2": 7,
+        "detailAmplitude": 16, "detailLog2": 5,
+        "grainAmplitude": 4, "grainLog2": 3,
+        "fbmAtten": 256,
+        "homeArea": {"y": 200, "radius": 320, "fade": 2048},
+        "sedCeil": 264, "sedFraction": 64, "sedStrip": 6, "sedSlope": 96, "sedMax": 32, "sedTopsoil": 4,
+        "treeline": 228,
+    },
     "biomes": BIOMES,
     "sites": [
         {"id": "harness", "kind": "pad", "min": [-128, -128], "max": [640, 640],
@@ -122,7 +145,15 @@ meta = {
         # on every seed, wearing the spawn_lake preset's geometry. East of
         # spawn by more than its radius + shore band.
         {"id": "home_lake", "kind": "water", "preset": "spawn_lake", "at": [1240, 900],
-         "about": "An AUTHORED lake (P-F): same place on every seed, the spawn_lake preset's geometry. East of spawn by more than its radius + shore band, so the spawn-site gate sees it as near-but-dry ground."}
+         "about": "An AUTHORED lake (P-F): same place on every seed, the spawn_lake preset's geometry. East of spawn by more than its radius + shore band, so the spawn-site gate sees it as near-but-dry ground."},
+        # A DECLARED landform (PLAN_environment_truth P-G): "there is always a
+        # mountain to the east". Overlaid onto the landform plane at load;
+        # Tier A, the same on every seed. 4.5 km east of the origin, a
+        # north-south crest 1.6 km long and 60 m high, well clear of the
+        # harness pad and the spawn.
+        {"id": "east_range", "kind": "landform", "shape": "ridge", "at": [45000, 0],
+         "radius": 8000, "heightVox": 600, "rotation": 90,
+         "about": "The mountain to the east (P-G): a ridge overlaid onto the landform plane at load, the same on every seed. radius is the crest's half-length in voxels (its width is a third of that), heightVox how far the plane is lifted at the crest, rotation the crest's heading in degrees."}
     ],
     "rules": []
 }

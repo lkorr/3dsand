@@ -79,7 +79,7 @@ Status GateWorldMap(Ctx& c, std::string& detail) {
   using sandvox::ReadVoxelsSync;
   const worldmap::WorldMapData& m = worldmap::CurrentWorldMap();
   if (!m.Loaded()) {
-    detail = "no world map loaded (worldgen.mapLayer = " + CurrentTuning().worldgen.mapLayer + ")";
+    detail = "no world map loaded (world.mapLayer = " + CurrentTuning().world.mapLayer + ")";
     std::printf("worldmap: FAIL (%s)\n", detail.c_str());
     return Status::Fail;
   }
@@ -108,7 +108,7 @@ Status GateWorldMap(Ctx& c, std::string& detail) {
   const IVec3 org = c.world.WindowOrigin();
   int skinOk = 0, skinN = 0, skipped = 0;
   std::string first;
-  const int treeline = CurrentTuning().worldgen.treeline;
+  const int treeline = worldmap::CurrentTerrain().treeline;
   for (int i = 0; i < 6; i++) {
     const int x = org.x * (int)kChunk + 40 + i * 52;
     const int z = org.z * (int)kChunk + 400 + i * 13;
@@ -161,7 +161,7 @@ Status GateSpawnSite(Ctx& c, std::string& detail) {
   using sandvox::kDefaultSeed;
   const worldmap::WorldMapData& m = worldmap::CurrentWorldMap();
   if (!m.Loaded()) {
-    detail = "no world map loaded (worldgen.mapLayer = " + CurrentTuning().worldgen.mapLayer + ")";
+    detail = "no world map loaded (world.mapLayer = " + CurrentTuning().world.mapLayer + ")";
     std::printf("spawn-site: FAIL (%s)\n", detail.c_str());
     return Status::Fail;
   }
@@ -197,7 +197,7 @@ Status GateSpawnSite(Ctx& c, std::string& detail) {
   std::snprintf(buf, sizeof buf,
                 "spawn (%d,%d) on %s: ground y%d (sea y%d, home y%d), %d vox past the harness box, "
                 "site cell %d, tarn %s%s",
-                sx, sz, bname.c_str(), h, m.seaLevelY, CurrentTuning().worldgen.spawnPlainY,
+                sx, sz, bname.c_str(), h, m.seaLevelY, worldmap::CurrentTerrain().homeY,
                 boxDist, siteCell, pq.inDisc ? "YES" : (pq.near ? "near" : "no"), why.c_str());
   detail = buf;
   std::printf("spawn-site: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
@@ -238,7 +238,7 @@ Status GateEnvReload(Ctx& c, std::string& detail) {
   // The column: in-window, below the treeline, whose twin biome has a skin
   // that is not what we will swap it to. Same sweep the worldmap gate uses.
   const IVec3 org = c.world.WindowOrigin();
-  const int treeline = CurrentTuning().worldgen.treeline;
+  const int treeline = worldmap::CurrentTerrain().treeline;
   int cx = 0, cz = 0, ch = 0;
   biomes::BiomeDef* target = nullptr;
   for (int i = 0; i < 12 && !target; i++) {

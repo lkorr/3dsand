@@ -48,16 +48,18 @@ const P = (why) => ({preview: true, why});
 // table (TA_H_COND_TABLE, TA_C_*) and compared in treeInfoAt after the species
 // pick, on top of the SPECIES FILE's own band/slope. Water and cave rows: not
 // packed at all.
-const ALL_CONDS = ['minY', 'maxY', 'maxSlope', 'nearWaterMax', 'nearWaterMin', 'patchThreshold'];
+const ALL_CONDS = ['minY', 'maxY', 'maxSlope', 'nearWaterMax', 'nearWaterMin', 'patchThreshold', 'canopyMin', 'canopyMax'];
+const COND_CANOPY = 'the canopy band is a COVER-ROW condition (P-G: WM_C_CANOPY_MIN / MAX against undergrowthSite); a tree, a water body or a cave has no canopy to read';
 function conditions(base, readSet, pkg, why) {
   const out = {};
   for (const k of ALL_CONDS)
-    out[base + '.conditions.' + k] = readSet.includes(k) ? R() : N(pkg, why);
+    out[base + '.conditions.' + k] = readSet.includes(k) ? R()
+        : (k === 'canopyMin' || k === 'canopyMax') ? N('later', COND_CANOPY) : N(pkg, why);
   return out;
 }
 
 const COND_TREE = 'P-D: the row’s conditions are packed per (biome, species) into the tree atlas (TA_C_*) and compared in treeInfoAt; a gated-out pick grows nothing.';
-const COND_COVER = 'P-D: enforced in the cover block (WM_C_MIN_Y/MAX_Y/MAX_SLOPE/PATCH_THRESH, nearWater via waterDistAt).';
+const COND_COVER = 'P-D: enforced in the cover block (WM_C_MIN_Y/MAX_Y/MAX_SLOPE/PATCH_THRESH, nearWater via waterDistAt); P-G: canopyMin/Max against the column canopy cover (WM_C_CANOPY_MIN/MAX), the condition the old undergrowth/flower chain became.';
 const COND_WATER = 'P-F: packed per row (WM_R_MIN_Y / MAX_Y / MAX_SLOPE) and tested at the pond centre in pondInfo; the water distance gates mean nothing for a body of water and the patch gate has no package yet.';
 const COND_CAVE = 'cave rows are read for their threshold only; per-row conditions have no package yet.';
 
@@ -72,14 +74,17 @@ export const LIVE = {
     'climate.moisture': N('later', 'the painted map decides the biome; climate coordinates select nothing (PLAN_environment_truth §4 keeps climate noise a non-goal)'),
     'climate.notes': R('free text, never read; kept enabled as notes'),
 
-    'terrain.overrides': N('P-G', 'parsed into BiomeDef::terrainOverrides and read by nothing; P-G turns it into the fixed hill/grain/detail record the height twin reads'),
+    'terrain.curve': R('P-G: WM_B_CURVE_KNOT0..8 — nine Q14 relief knots the height mirror blends over the four map cells around a column (biomeCurve); the identity is the map\u2019s relief unchanged'),
+    'terrain.hill': R('P-G: WM_B_HILL_MUL — Q8 multiplier on the map\u2019s hill octave (256 = the map\u2019s amplitude)'),
+    'terrain.detail': R('P-G: WM_B_DETAIL_MUL — Q8 multiplier on the map\u2019s detail octave'),
+    'terrain.grain': R('P-G: WM_B_GRAIN_MUL — Q8 multiplier on the map\u2019s grain octave'),
 
     'cover.skin': R('WM_B_SKIN'),
     'cover.skinDepth': R('WM_B_SKIN_DEPTH'),
     'cover.subsoil': R('WM_B_SUBSOIL'),
     'cover.patch.threshold': R('WM_B_PATCH_THRESH'),
     'cover.patch.cellLog2': R('WM_B_PATCH_LOG2'),
-    'cover.groundFlora': R('WM_BF_GROUND_FLORA: the flower/undergrowth/tall-grass blocks'),
+    'cover.groundFlora': R('WM_BF_GROUND_FLORA: the TILE plants (ferns, big toadstools by footprint); the flower / undergrowth chain it used to gate is cover rows with canopy conditions since P-G'),
     'cover.cacti': R('WM_BF_CACTI: the cactus block runs here'),
     'cover.sandCap': R('WM_BF_SAND_CAP: a 4-deep sand cap under the skin'),
     'cover.cactusChance': R('WM_B_CACTUS_CHANCE (percent of 2.5 m tiles, when cover.cacti is on)'),
@@ -142,7 +147,33 @@ export const LIVE = {
     'oceanFadeCells': R('WM_H_OCEAN_FADE'),
     'warpAmpVox': R('the biome-edge warp'),
     'biomes': R('the palette: plane byte -> biome file'),
-    'sites[]': R('the site table: the pad box, the spawn site (where the game starts; the calm home area centres on it), stamps, and kind "water" AUTHORED LAKES (P-F: a preset at a fixed centre, same on every seed)'),
+    'sites[]': R('the site table: the pad box, the spawn site (where the game starts; the calm home area centres on it), stamps, kind "water" AUTHORED LAKES (P-F: a preset at a fixed centre, same on every seed), and kind "landform" DECLARED MOUNTAINS (P-G: peak / ridge / basin / plateau overlaid onto the landform plane at load, same on every seed)'),
+    // P-G: the terrain, per map (worldmap.h kHTerrain*), read by the height
+    // mirror on both sides through the worldMap header. Every number that
+    // used to be a worldgen.* knob.
+    'terrain.about': R('free text'),
+    'terrain.refVoxelsPerMetre': R('WM_H_TERRAIN_REF_VPM / the prelude\u2019s REF_VOXELS_PER_METRE: the scale the lengths below are authored at; LoadWorldMap rescales them to the live voxel size'),
+    'terrain.baseHeight': R('WM_H_TERRAIN_BASE_HEIGHT: the world datum, the mean ground height'),
+    'terrain.landformRangeVox': R('WM_H_TERRAIN_LANDFORM_RANGE: what a painted landform 0..255 spans, centred on 128 (was worldgen.contAmplitude)'),
+    'terrain.rangeAmplitude': R('WM_H_TERRAIN_RANGE_AMPLITUDE: the seeded range octave under the plane'),
+    'terrain.rangeLog2': R('WM_H_TERRAIN_RANGE_LOG2'),
+    'terrain.hillAmplitude': R('WM_H_TERRAIN_HILL_AMPLITUDE (each biome scales it by its terrain.hill)'),
+    'terrain.hillLog2': R('WM_H_TERRAIN_HILL_LOG2'),
+    'terrain.detailAmplitude': R('WM_H_TERRAIN_DETAIL_AMPLITUDE (scaled per biome by terrain.detail)'),
+    'terrain.detailLog2': R('WM_H_TERRAIN_DETAIL_LOG2'),
+    'terrain.grainAmplitude': R('WM_H_TERRAIN_GRAIN_AMPLITUDE (scaled per biome by terrain.grain)'),
+    'terrain.grainLog2': R('WM_H_TERRAIN_GRAIN_LOG2'),
+    'terrain.fbmAtten': R('WM_H_TERRAIN_FBM_ATTEN: iq\u2019s derivative attenuation, Q8; the rule-2 mechanism that keeps the ladder under the angle of repose'),
+    'terrain.homeArea.y': R('WM_H_TERRAIN_HOME_Y: the calm home area\u2019s ground height around the spawn site (was spawnPlainY)'),
+    'terrain.homeArea.radius': R('WM_H_TERRAIN_HOME_R: Chebyshev radius held calm (was spawnPlainR)'),
+    'terrain.homeArea.fade': R('WM_H_TERRAIN_HOME_FADE: how far past it the coarse relief ramps back (was spawnPlainFade; the terrain gate\u2019s A4 measures the slope it builds)'),
+    'terrain.sedCeil': R('WM_H_TERRAIN_SED_CEIL: the sediment wedge (was sedCeil)'),
+    'terrain.sedFraction': R('WM_H_TERRAIN_SED_FRACTION'),
+    'terrain.sedStrip': R('WM_H_TERRAIN_SED_STRIP'),
+    'terrain.sedSlope': R('WM_H_TERRAIN_SED_SLOPE: the wedge\u2019s slope gate, a rule-2 knob (0 = off)'),
+    'terrain.sedMax': R('WM_H_TERRAIN_SED_MAX (clamped under the cave shell at load)'),
+    'terrain.sedTopsoil': R('WM_H_TERRAIN_SED_TOPSOIL'),
+    'terrain.treeline': R('WM_H_TERRAIN_TREELINE: snow and no trees at or above this ground Y'),
     'rules[]': R('seeded per-biome stamp placement'),
     'planes.biome': R('mapBiomeAt'),
     'planes.landform': R('mapLandformQ8: owns the continental rung of the height'),

@@ -796,9 +796,9 @@ MIRROR_RE = re.compile(
 
 # WGSL spellings that have no counterpart token on the C++ side, and vice versa.
 _WGSL_DROP = (r"\b(?:let|var|fn|i32|u32|f32|bool"
-              r"|N2|Oct|Land|Pond|PondSet|Shore|LandCol|CaveBands|TreeCands)\b")
+              r"|N2|Oct|Land|Pond|PondSet|Shore|LandCol|CaveBands|TreeCands|BiomeMix|BiomeRelief)\b")
 _CPP_DROP = (r"\b(?:static|inline|const|int|uint32_t|int32_t|unsigned|bool"
-             r"|N2|Oct|Land|Pond|PondSet|Shore|IV2)\b")
+             r"|N2|Oct|Land|Pond|PondSet|Shore|IV2|BiomeMix|BiomeRelief)\b")
 
 
 def _mirror_blocks(text, tag):
@@ -899,102 +899,6 @@ def check_worldgen_mirror():
             "worldgen mirror `landheight`: World::TerrainHeight (world.cpp) "
             "uses authored constants that landColumn (worldgen.wgsl) no longer "
             f"has: {stale}. The shader moved and the CPU copy did not.")
-
-
-# --------------------------------------------------- worldgen length units
-# Every `worldgen` tuning row is authored at refVoxelsPerMetre voxels/metre and
-# LoadTuning rescales it to the live kVoxelMeters -- but only if it declared
-# what KIND of quantity it is. A distance must be scaled, a noise cell (a log2
-# exponent) must be shifted, a probability or a 0..255 threshold or a Q8 gradient
-# must be left alone, and getting that wrong is invisible: the world simply
-# stops meaning the same thing at a different voxel size, in one feature.
-#
-# So the worldgen block of LoadTuning may not use the unit-less ReadI/ReadU at
-# all. This is not style -- it is what makes "add a row" a decision rather than a
-# default, which matters because package C of the terrain overhaul adds ~45 of
-# them. The one exception is refVoxelsPerMetre itself, which IS the scale.
-WG_READERS = ("ReadWgLen", "ReadWgCellLog2", "ReadWgPerLen", "ReadWgCount")
-
-
-def check_worldgen_units():
-    tuning, table = read("src/sim/tuning.cpp"), read("src/sim/tuning_params.def")
-    if not tuning or not table:
-        return
-    m = re.search(r'if \(const json\* g = Find\(j, "worldgen"\)\) \{(.*?)\n    // These divide',
-                  tuning, re.S)
-    if not m:
-        problems.append("worldgen units: could not find LoadTuning's worldgen "
-                        "block (check this regex against tuning.cpp)")
-        return
-    checked.append("worldgen length units")
-    body = _decomment(m.group(1))
-
-    for name in re.findall(r'\bReadI\(\*g, "(\w+)"', body) + \
-                re.findall(r'\bReadU\(\*g, "(\w+)"', body):
-        if name == "refVoxelsPerMetre":
-            continue
-        problems.append(
-            f"worldgen.{name} is read with a unit-less ReadI/ReadU. Every row in "
-            f"this group must declare whether it is a length, a noise-cell log2, "
-            f"a per-length rate or a pure count -- use one of {WG_READERS}, or "
-            f"the row silently means something different at a different voxel "
-            f"size (src/sim/world.h kVoxelsPerMetre)")
-
-    # And every row in the table must actually be read, or it is dead.
-    rows = {m2.group(1) for m2 in
-            re.finditer(r"^TP_[IUF]\(worldgen,\s*(\w+),", table, re.M)}
-    got = set()
-    for fn in WG_READERS + ("ReadI", "ReadU"):
-        got |= set(re.findall(rf'\b{fn}\(\*g, "(\w+)"', body))
-    for name in sorted(rows - got):
-        problems.append(
-            f"worldgen.{name} is a row in tuning_params.def but LoadTuning never "
-            f"reads it -- it will silently hold its tuning.h default and ignore "
-            f"tuning.json")
-
-
-def check_worldgen_defaults():
-    """LoadTuning's worldgen reader <-> WorldgenDefaultsJson().
-
-    The tuner's "Reset terrain" button applies whatever WorldgenDefaultsJson()
-    emits. A parameter added to the reader and forgotten in the emitter would
-    silently NOT reset -- the button would look like it worked and leave one
-    slider on an experimental value, which is the worst possible failure for a
-    control whose entire job is "put it back". Neither side has any reason to
-    notice, so this is what notices.
-    """
-    tuning = read("src/sim/tuning.cpp")
-    if not tuning:
-        return
-    m = re.search(r'if \(const json\* g = Find\(j, "worldgen"\)\) \{(.*?)\n    // These divide',
-                  tuning, re.S)
-    d = re.search(r'std::string WorldgenDefaultsJson\(\) \{(.*?)\n\}', tuning, re.S)
-    if not m or not d:
-        problems.append("worldgen defaults: could not find LoadTuning's worldgen "
-                        "block or WorldgenDefaultsJson (check these regexes "
-                        "against tuning.cpp)")
-        return
-    checked.append("worldgen defaults")
-    reader = _decomment(m.group(1))
-    dumper = _decomment(d.group(1))
-
-    want = []
-    for fn in WG_READERS + ("ReadI", "ReadU", "ReadStr"):
-        want += re.findall(r'\b%s\(\*g, "(\w+)"' % fn, reader)
-    got = set(re.findall(r'\b[ns]\("(\w+)"', dumper))
-
-    for name in want:
-        if name not in got:
-            problems.append(
-                f"worldgen.{name} is read by LoadTuning but not emitted by "
-                f"WorldgenDefaultsJson -- the tuner's Reset terrain button "
-                f"would leave it alone instead of restoring it")
-    for name in sorted(got - set(want)):
-        problems.append(
-            f"WorldgenDefaultsJson emits worldgen.{name}, which LoadTuning "
-            f"never reads -- either the reader lost a row or the key is a typo, "
-            f"and a reset would write a value the engine ignores")
-
 
 
 # ------------------------------------------------- the baked tree atlas layout
@@ -1638,8 +1542,6 @@ ALL = {
     "biomes": check_biome_order,
     "worldmap": check_worldmap_layout,
     "runword": check_run_word_layout,
-    "wgunits": check_worldgen_units,
-    "wgdefaults": check_worldgen_defaults,
     "sound": check_sound_slots,
     "substeps": check_fluid_substeps,
     "tuning": check_tuning_consts,
@@ -1662,9 +1564,9 @@ ALL = {
 RELEVANT = {
     "assets/sound_schema.js": ["sound"],
     "src/audio/cues.cpp": ["sound"],
-    "src/sim/tuning.cpp": ["tuning", "wgunits", "wgdefaults"],
+    "src/sim/tuning.cpp": ["tuning"],
     "src/sim/tuning.h": ["tuning"],
-    "src/sim/tuning_params.def": ["tuning", "substeps", "wgunits"],
+    "src/sim/tuning_params.def": ["tuning", "substeps"],
     "scripts/tuning_prelude.py": ["tuning"],
     "assets/tuner.html": ["render", "arch", "perfnodes"],
     "assets/perfview.js": ["perfscopes"],

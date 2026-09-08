@@ -273,6 +273,13 @@ std::string ShaderConstantPrelude() {
   // minutes to never. Simulation::UploadEnvironment recompiles when a reload
   // moves it. Mirrored by scripts/pond_lattice.py for check_shaders.sh.
   o << "const POND_TILE : i32 = " << worldmap::CurrentWorldMap().pondTile << ";\n";
+  // The scale the map's terrain is authored at (map.json terrain
+  // .refVoxelsPerMetre, P-G): worldgen.wgsl's vlen() divides its hardcoded
+  // lengths by it in module-scope consts, so it has to be a constant. LOAD-TIME
+  // ASSET DATA like the two lattices above; Simulation::UploadEnvironment
+  // recompiles when a reload moves it. Mirrored by scripts/map_terrain.py for
+  // check_shaders.sh.
+  o << "const REF_VOXELS_PER_METRE : i32 = " << worldmap::CurrentTerrain().refVoxelsPerMetre << ";\n";
   // The same number as an INTEGER reciprocal, for the sim/worldgen side. It has
   // to be integer and it has to come from here: everything worldgen authors in
   // metres (the whole tree and cactus size table) converts through it, and the

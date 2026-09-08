@@ -1819,7 +1819,6 @@
   <button data-tab="reactions">Reactions</button>
   <span class="tabsep"></span>
   <button data-tab="tuning">Tuning</button>
-  <button data-tab="worldgen">Worldgen</button>
   <button data-tab="items">Items</button>
   <button data-tab="models">Models</button>
   <button data-tab="environment">Environment</button>
@@ -1929,9 +1928,16 @@
     <div id="tuneGroups"></div>
   </section>
 
-  <!-- WORLDGEN MAP -->
+  <!-- THE WORLD PREVIEW PANE (was the Worldgen tab; PLAN_environment_truth
+       P-I). A hidden host that Environment > World map (assets/editor/map.js)
+       ADOPTS into its page: the heightmap and voxel views are previews of the
+       saved map / biome / tree files, not authoring surfaces, so they live
+       under the map they preview. The glue below (wg* / wv*) is unchanged in
+       spirit; what went with the tab is the tuning-row column and the
+       "Reset terrain" button — there are no worldgen.* knobs any more.
+  -->
   <!--
-    A map of the terrain the CURRENT worldgen parameters describe, drawn from
+    A map of the terrain the SAVED map and biome files describe, drawn from
     the engine's own height function.
 
     THE HEIGHTS ARE NOT COMPUTED HERE. The page asks /api/heightmap, which runs
@@ -1944,7 +1950,7 @@
     surfHeightAt) had silently gone stale. So the map costs a ~150 ms process
     launch per redraw and is exact, instead of being instant and a guess.
   -->
-  <section class="view" id="view-worldgen">
+  <div id="wgPreviewHost" style="display:none">
     <div class="toolbar">
       <button id="wgHome" title="Back to the world origin">&#8982; Origin</button>
       <button id="wgOut" title="Zoom out">&minus;</button>
@@ -1972,9 +1978,7 @@
       <button id="wvToggle" title="Switch to the voxel world view">&#9635; Voxels</button>
       <span class="tabsep"></span>
       <button id="wgVegToggle"
-              title="Flip worldgen.vegetation. Off generates a bare world: no trees, cacti, flowers, grass, undergrowth, cover rows, shore plants, pond life, cave flora, alpine cushion or wet moss. The frame-rate A/B lever. Press F7 in-game afterwards (reload + regen).">&#127793; Vegetation: &hellip;</button>
-      <button id="wgResetDefaults"
-              title="Put every terrain slider back to the engine's compiled-in default. The values come from the engine itself (--dump-tuning-defaults), not from a copy in this page.">&#8634; Reset terrain</button>
+              title="Flip debug.vegetation (a dev switch, not world content). Off generates a bare world: no trees, cacti, flowers, grass, undergrowth, cover rows, shore plants, pond life, cave flora, alpine cushion or wet moss. The frame-rate A/B lever. Press F7 in-game afterwards (reload + regen).">&#127793; Vegetation: &hellip;</button>
       <span class="spacer"></span>
       <span class="hint" id="wgStatus"></span>
     </div>
@@ -2030,9 +2034,9 @@
       </div>
       <div class="wgside">
         <div class="applybar" style="margin:0 0 10px">
-          <b>Live.</b> Moving a slider writes <code>tuning.json</code> and redraws
-          from the engine. In-game, worldgen changes need a fresh world
-          (regen / new seed) &mdash; this does not.
+          <b>A preview.</b> The heights are <code>World::TerrainHeight</code> over
+          the SAVED map and biome files; the voxels are the real worldgen. Author
+          on the map above and the biome pages, save, then refresh here.
         </div>
 
         <!-- EDITOR PANEL. Hidden with the 2D map, because none of it applies to
@@ -2112,15 +2116,14 @@
             Edits are a LAYER over worldgen, not a saved world. The engine applies
             <code>assets/worldedits/*.svedit</code> after generating a chunk and on
             every stream-in, so an edit survives flying away and composes with any
-            seed. Set <code>worldgen.editLayer</code> in <code>tuning.json</code> to
-            the layer name to make the game load it.
+            seed. Pick the layer in the map page's <b>edits</b> selector
+            (<code>tuning.json world.editLayer</code>) to make the game load it.
           </div>
         </div>
 
-        <div id="wgParams"></div>
       </div>
     </div>
-  </section>
+  </div>
 
   <!-- ITEMS -->
   <!--
@@ -2622,13 +2625,13 @@ document.querySelectorAll('nav.tabs button').forEach(b=>{
     document.querySelectorAll('nav.tabs button').forEach(x=>x.classList.toggle('active',x===b));
     document.querySelectorAll('.view').forEach(v=>v.classList.toggle('active',v.id==='view-'+activeTab));
     // wiki and notes render with whatever is loaded, including nothing.
-    if((mat&&rx)||['tuning','worldgen','models','environment','wiki','notes','engine'].includes(activeTab))renderAll();
+    if((mat&&rx)||['tuning','models','environment','wiki','notes','engine'].includes(activeTab))renderAll();
   });
 });
-// DEEP LINK: ?tab=worldgen&voxels=1 opens a tab, and optionally drops straight
-// into the voxel view. It exists so the view is REACHABLE WITHOUT A CLICK —
-// scripts/check_worldview.sh drives the real page through it, and "does the tab
-// still work" is otherwise only answerable by a human with a mouse.
+// DEEP LINK: ?tab=environment opens a tab; &voxels=1 additionally opens the
+// World map page's preview pane in its voxel view. It exists so the view is
+// REACHABLE WITHOUT A CLICK: "does the page still work" is otherwise only
+// answerable by a human with a mouse.
 function tunerDeepLink(){
   const q=new URLSearchParams(location.search);
   const tab=q.get('tab');
@@ -2636,7 +2639,11 @@ function tunerDeepLink(){
     const b=document.querySelector('nav.tabs button[data-tab="'+tab+'"]');
     if(b)b.click();
   }
-  if(q.get('voxels')==='1'&&typeof wvToggle==='function'&&!wvOn)wvToggle();
+  if(q.get('voxels')==='1'&&typeof wvToggle==='function'&&!wvOn){
+    const pv=$('#wgPreviewHost'); if(pv)pv.style.display='';
+    if(window.wgPreviewShow)wgPreviewShow();
+    wvToggle();
+  }
 }
 
 function gotoReactions(filter){
@@ -4546,7 +4553,7 @@ function wgPaint(){
   // as terrain rather than as a gradient: one voxel of step is 10 cm, and the
   // octave ladder's whole job is those edges.
   const zScale=2.2*(D.res/Math.max(D.span,1));
-  const wgTreeline=(tune&&tune.worldgen&&tune.worldgen.treeline)||228;
+  const wgTreeline=(window.wgTerrain&&window.wgTerrain.treeline)||228;
   for(let j=0;j<res;j++){
     for(let i=0;i<res;i++){
       const k=j*res+i;
@@ -4610,14 +4617,18 @@ function wgPaint(){
     return [(wx-(D.cx-D.span/2))/D.span*cv.width,
             (wz-(D.cz-D.span/2))/D.span*cv.height];
   };
-  const R=(tune&&tune.worldgen&&tune.worldgen.spawnPlainR)||0;
-  const F=(tune&&tune.worldgen&&tune.worldgen.spawnPlainFade)||0;
+  // The calm home area, around the SPAWN SITE (map.json; P-C), sized by the
+  // map's terrain.homeArea (P-G) -- both handed over by the map page.
+  const WT=window.wgTerrain||{};
+  const R=WT.homeR||0;
+  const F=WT.homeFade||0;
+  const SX=WT.spawnX||0, SZ=WT.spawnZ||0;
   ctx.lineWidth=1.5;
   const rings=[[R,'rgba(255,214,120,.85)',[]],
                [R+F,'rgba(255,214,120,.35)',[6,6]]];
   for(const ring of rings){
     if(ring[0]<=0)continue;
-    const a=toPx(-ring[0],-ring[0]),b2=toPx(ring[0],ring[0]);
+    const a=toPx(SX-ring[0],SZ-ring[0]),b2=toPx(SX+ring[0],SZ+ring[0]);
     ctx.setLineDash(ring[2]);ctx.strokeStyle=ring[1];
     ctx.strokeRect(a[0],a[1],b2[0]-a[0],b2[1]-a[1]);
   }
@@ -4769,25 +4780,25 @@ function wgWire(){
   });
   $('#wgMode').addEventListener('change',wgPaint);
   $('#wgRes').addEventListener('change',function(){wgRefresh(0);});
-  // The vegetation kill-switch: one click flips worldgen.vegetation, saves
-  // tuning.json (the Worldgen tab is live, so the map redraws from the engine
-  // as well), and re-labels itself. The checkbox row under #wgParams is the
-  // same value; this is just the one-click form of it for an A/B walk.
+  // The vegetation kill-switch: one click flips debug.vegetation (a dev
+  // switch, Tuning > Dev switches), saves tuning.json and re-labels itself.
+  // This is the one-click form of it for an A/B walk, beside the map's regen
+  // note as PLAN_environment_truth P-I asks.
   const wgVegPaint=function(){
     const b=$('#wgVegToggle'); if(!b)return;
-    const v=tune?getAt(tune,'worldgen','vegetation'):undefined;
+    const v=tune?getAt(tune,'debug','vegetation'):undefined;
     const on=v===undefined?true:!!v;
     b.innerHTML='&#127793; Vegetation: '+(on?'ON':'OFF');
     b.classList.toggle('primary',!on);
   };
   $('#wgVegToggle').addEventListener('click',async function(){
     if(!tune){toast('no tuning.json loaded');return;}
-    const on=!!getAt(tune,'worldgen','vegetation');
-    setTuned('worldgen','vegetation',on?0:1);
+    const on=!!getAt(tune,'debug','vegetation');
+    setTuned('debug','vegetation',on?0:1);
     touchTune();
     await saveAll();
     wgVegPaint();
-    renderWorldgen();
+    wgPreviewShow();
     toast('vegetation '+(on?'OFF':'ON')+' — press F7 in-game to reload + regen');
   });
   wgVegPaint();
@@ -4797,75 +4808,12 @@ function wgWire(){
     wgRefresh(0);
   });
   $('#wvToggle').addEventListener('click',wvToggle);
-  $('#wgResetDefaults').addEventListener('click',wgResetToDefaults);
 }
 
-/* ---- reset the terrain sliders to the ENGINE's defaults ------------------
-   Not to tuneBase. The Tuning tab's existing reset reverts to the file as it
-   was LOADED, and tuneBase is refreshed on every save — so once you have saved
-   an experiment it has nothing left to revert to. "Default" here means the
-   compiled-in values in src/sim/tuning.h.
-
-   The numbers therefore come from the ENGINE, over /api/tuning-defaults, and
-   not from a table in this page. That is the one thing tuner_schema.js
-   deliberately does not carry: a stale min/max there is a cosmetic slider bug,
-   but a stale DEFAULT would write a wrong number into tuning.json, which is a
-   different world. See WorldgenDefaultsJson() in src/sim/tuning.cpp. */
-let wgDefaults=null;
-
-async function wgResetToDefaults(){
-  const st=$('#wgStatus');
-  if(!tune){if(st)st.textContent='no tuning.json loaded';return;}
-  if(!server){
-    if(st)st.textContent='reset needs the tuner server (python scripts/tuner_server.py)';
-    return;
-  }
-  try{
-    if(!wgDefaults){
-      if(st)st.textContent='asking the engine for defaults…';
-      const r=await fetch('/api/tuning-defaults');
-      if(!r.ok){
-        let m='HTTP '+r.status;
-        try{m=(await r.json()).error||m;}catch(e){}
-        throw new Error(m);
-      }
-      wgDefaults=(await r.json()).worldgen||{};
-    }
-  }catch(e){
-    if(st)st.textContent='reset failed: '+(e.message||e);
-    return;
-  }
-  // Only the SLIDERS, which is what was asked for. editLayer is a text row
-  // naming a file you authored, not a terrain parameter — wiping it would
-  // silently unload your edits, which is not what a "reset the terrain" button
-  // should do.
-  const tab=(typeof TUNING_SCHEMA!=='undefined')
-    ? TUNING_SCHEMA.find(t=>t.id==='worldgen') : null;
-  if(!tab){if(st)st.textContent='no worldgen schema';return;}
-  const changed=[];
-  for(const pr of tab.params){
-    if(pr.type==='text')continue;
-    const g=paramGroup(tab,pr);
-    const d=wgDefaults[pr.k];
-    if(d===undefined)continue;              // engine does not own this row
-    if(sameVal(getAt(tune,g,pr.k),d))continue;
-    setTuned(g,pr.k,structuredClone(d));
-    changed.push(pr.n||pr.k);
-  }
-  if(!changed.length){
-    if(st)st.textContent='already at defaults';
-    toast('worldgen already at the engine defaults');
-    return;
-  }
-  touchTune();
-  renderWorldgen();
-  if(st)st.textContent='';
-  toast('reset '+changed.length+' terrain parameter'+(changed.length===1?'':'s'));
-  // Save-then-render, the same order every other path in this tab uses: the map
-  // and the voxel view are separate PROCESSES reading tuning.json off disk, so
-  // a reset that only changed this page's copy would redraw the old world.
-  wgRefresh(0);
-}
+/* (The "Reset terrain" button and its /api/tuning-defaults round trip went
+   with the worldgen.* group: the terrain is map.json's and the biome files'
+   now, edited on the World map page and the biome pages, and a map file has
+   no compiled-in default to reset to.) */
 
 /* ================= the voxel world view =================
    The old block here built ONE heightfield mesh out of the column map and
@@ -4918,14 +4866,14 @@ function wvFarColour(D, k, treeline){
 
 function wvPushFar(){
   if(!wv || !wgData || !wv.view.showFar) return;
-  var treeline = (tune && tune.worldgen && tune.worldgen.treeline) || 228;
+  var treeline = (window.wgTerrain && window.wgTerrain.treeline) || 228;
   try{ wv.setFarHeightfield(wgData, wvFarColour, treeline); }catch(e){}
 }
 
 function wvEnsure(){
   if(wv) return wv;
   var cv = $('#wvCanvas');
-  wv = new WorldView(cv, {seaY: (tune && tune.worldgen && tune.worldgen.spawnPlainY) || 1024});
+  wv = new WorldView(cv, {seaY: (window.wgTerrain && window.wgTerrain.homeY) || 1024});
   wv.onError = function(msg){
     var s = $('#wvStatus'); if(s) s.textContent = 'region failed: ' + msg;
   };
@@ -5111,7 +5059,7 @@ async function wvToggle(){
   // Park the camera where the map is looking, at the ground.
   wv.seed = parseInt($('#wgSeed').value, 10) || 1337;
   var y = wgData ? (wgData.h[(wgData.res>>1)*wgData.res + (wgData.res>>1)] + 40)
-                 : ((tune && tune.worldgen && tune.worldgen.spawnPlainY) || 1024) + 40;
+                 : ((window.wgTerrain && window.wgTerrain.homeY) || 1024) + 40;
   wv.cam.mode = 'fly';
   wv.cam.pos = [wgView.cx, y, wgView.cz - 60];
   wv.cam.yaw = 0; wv.cam.pitch = -0.35;
@@ -5171,7 +5119,7 @@ function wvWireControls(){
   });
   on('#wvGoSurface','click', wvDropToGround);
   on('#wvGoOrigin','click', function(){
-    var y = ((tune && tune.worldgen && tune.worldgen.spawnPlainY) || 1024) + 40;
+    var y = ((window.wgTerrain && window.wgTerrain.homeY) || 1024) + 40;
     wv.cam.pos = [0, y, -60]; wv.cam.target = [0, y-30, 0];
     wv.cam.yaw = 0; wv.cam.pitch = -0.35;
   });
@@ -5305,38 +5253,19 @@ async function wvLoadLayer(){
 }
 
 
-function renderWorldgen(){
+// The preview pane's entry (P-I): the map page calls this when it shows the
+// pane, and the deep link does. Wires the glue once and draws the heights.
+function wgPreviewShow(){
   wgWire();
-  if(window.wgVegPaint)wgVegPaint();   // label follows tuning.json once loaded
-  // The worldgen rows, built by the SAME tuneRow the Tuning tab uses, so a knob
-  // added to tuner_schema.js appears here with no second registration and the
-  // two tabs cannot drift about what a parameter means.
-  const host=$('#wgParams');
-  host.innerHTML='';
-  const tab=(typeof TUNING_SCHEMA!=='undefined')
-    ? TUNING_SCHEMA.find(function(t){return t.id==='worldgen';}) : null;
-  if(!tune||!tab){
-    host.append(el('div',{class:'hint',style:'padding:18px 2px;line-height:1.7'},
-      'No tuning.json loaded — run the tuner through ',
-      el('code',{},'python scripts/tuner_server.py'),'.'));
-  }else{
-    const touch=function(){touchTune();wgRefresh();};
-    for(const pr of tab.params){
-      if(pr.sec){
-        host.append(el('div',{class:'tsec'},el('b',{},pr.sec.t),
-                    pr.sec.d?el('span',{},pr.sec.d):null));
-      }
-      host.append(tuneRow(tab,pr,paramGroup(tab,pr),touch));
-    }
-  }
+  if(window.wgVegPaint)wgVegPaint();
   if(!wgData)wgRefresh(0); else wgPaint();
 }
+window.wgPreviewShow=wgPreviewShow;
 
 function renderAll(){
   // Tuning is independent of materials/reactions: it must render even when only
   // tuning.json has been loaded.
   if(activeTab==='tuning'){renderTuning();return;}
-  if(activeTab==='worldgen'){renderWorldgen();return;}
   // Items are independent of materials/reactions, like Tuning: an item file is
   // worth editing before any material names it.
   if(activeTab==='items'){renderItems();return;}
@@ -8297,11 +8226,11 @@ const ARCH_NODES={
     doc:['DESIGN.md','docs/RESEARCH_worldgen.md'],
     rule:1,
     children:['voxView','trees','biomes'],
-    wip:'Terrain overhaul packages D-H: a global sea level with a LAVA_LID, domain-warped mountain ranges, 3D caves behind a province mask, and the fixed-compass climate.',
+    wip:'The terrain is authored on the MAP now (P-G, 2026-09-07): map.json `terrain` (datum, landform range, the octave ladder, attenuation, home area, sediment, treeline, reference scale) in the worldMap header, each biome\u2019s relief curve + hill/detail/grain in its record, declared landform sites overlaid onto the plane at load, the flora chain as cover rows with a canopy condition. Remaining terrain overhaul packages: a global sea level with a LAVA_LID, 3D caves behind a province mask.',
     details:'Purity is what lets a chunk be evicted without saving and regenerated identically later — and what lets the JITTER sentinel stand in for a whole chunk of never-touched terrain. A chunk the player has DUG is not representable by any sentinel and must go to a real page.<br><br><b>THE HEIGHT CONTRACT:</b> <code>World::TerrainHeight(x,z,seed)</code> &equiv; <code>genColumn(x,z,seed).h</code>, exactly. The GROUND — octaves, authored pool floors and rims, the pond bowl carve, the tarn berm — not the topmost solid voxel, which would include canopy and ruin walls and cannot be mirrored cheaply. <code>surfHeightAt</code> was a fourth height function that hand-copied this and had already drifted; it is gone. <code>check_invariants.py</code> token-compares the <code>MIRROR-BEGIN</code> blocks in the shader and in world.cpp, and the <code>terrain</code> gate&rsquo;s pass C1 compares CPU and GPU per voxel.<br><br><b>Q14 noise:</b> <code>vnoise2d</code> takes its cell as a LOG2 SHIFT, so <code>fdiv</code> becomes <code>&gt;&gt;</code> and <code>fmodp</code> becomes <code>&amp;</code> — zero integer divides where the legacy <code>vnoise</code> did five, and 14 bits of value instead of 8 (at a 1024-voxel amplitude an 8-bit LSB is a FOUR-VOXEL terrace). The legacy noise stays for the 14 decorative fields that call it. <code>&gt;&gt;</code> on a negative signed int is arithmetic in WGSL and in C++20 alike — that is the one place the two languages could have diverged.<br><br><b>Column hoists:</b> cave bands and tree candidates are pure in (x,z) and are computed once per column in <code>genChunk</code>, not once per cell. A buried column was recomputing <code>caveAt</code> 16 times (~93% of a buried chunk&rsquo;s worldgen cost), and <code>treeAt</code>&rsquo;s world-wide <code>TREE_MAX_TOP</code> reject became <code>cands.top</code>, a correct LOCAL ceiling that survives a wider terrain band. The <code>far</code> cascade sieve is column-major too: one thread owns one z row and four x, so 256 columns replace 4096.<br><br><b>Lava at rest (12c187c):</b> <code>caveFill(y)</code> routes every carve: lava at/below <code>LAVA_LEVEL=-80</code>, air above. The lateral boundary is stone at every level, so the only lava/air interface is one flat plane. This cut active-chunk count under flight from 521 → 23 (p50) and pool high-water by 11%.<br><br><b>Perched tarns:</b> a pond&rsquo;s waterline comes from its own CENTRE column and the annulus outside the disc is FORCED to <code>surf + pondBerm</code>, so containment is STRUCTURAL rather than a rim-sampling density — and 192 hashes per pond OR shore column become 8. Two rule-2 traps came with it, both reported by <code>ca-skip</code> rather than by anything near worldgen: the parabolic bowl is steepest at its rim, so <code>pondDepth</code> is now clamped against <code>pondRadiusMin</code> or the sand bed sits over the angle of repose and avalanches forever; and snow is a POWDER, so the authored pool rims now suppress it (<code>!inRim</code>) or it slides onto the lava and <code>snow + tag:hot &rarr; water</code> lights a front that never goes out.<br><br><b>THE OCTAVE LADDER (package C):</b> five rungs, lacunarity 4, persistence 1/4, so every rung has the SAME amplitude/wavelength ratio of 0.5 — detail without extra slope. Octaves are CENTRED deviations, which is what makes <code>baseHeight</code> the world&rsquo;s MEAN and leaves as much room below the datum for basins as above it for mountains. iq&rsquo;s derivative attenuation divides each rung by <code>1 + fbmAtten*|g|&sup2;</code> against the gradient accumulated above it: that is a rule-2 mechanism, not a look knob, because plain fBm sums five 0.5 slopes into 2.5 and puts the entire world above the CA&rsquo;s angle of repose.<br><br><b>The calm home area</b> fades only the two COARSE octaves toward the origin — fading the whole deviation would pin spawn to an exact plane 64 m across. The fade WIDTH is load-bearing: a ramp of magnitude A over width W adds slope up to 1.5&middot;A/W, and the <code>terrain</code> gate&rsquo;s pass A4 measures it so nobody has to guess.<br><br><b>The sediment wedge</b> puts metres of dirt over gravel on low flat ground and none on ridges. Both powders, so its slope gate reads the LANDFORM gradient (through the hill octave) rather than the full one: d(slope)/dcolumn for the grain octave is 96 Q8 — the whole gate range in ONE step — which turns a 24-voxel wedge into a 24-voxel cliff. Gated on the landform instead, 108 chunks still awake at tick 120 became 8.<br><br><b>Trees are metre-true again:</b> <code>VOX_PER_M</code> was a hardcoded 16, correct when a voxel was 6.25 cm and left behind when the world moved to 10 cm. Every tree was 1.6&times; its own table&rsquo;s documented size for that whole interval. <b>worldgen.vegetation</b> (2026-09-05): the kill-switch for every plant the file places. A TP_U row, so a WGSL constant (<code>VEGETATION</code>); gated at the SOURCE of each feature so the candidate scans and the far crown proxy agree the world is bare. The Worldgen tab&rsquo;s <b>Vegetation: ON/OFF</b> button flips it; F7 reloads + regenerates.'},
 
   voxView:{label:'Voxel View + Edit Layer',tag:'cpu',
-    desc:'The Worldgen tab’s voxel-accurate terrain viewer and its WorldEdit-style editor. Streams real cells out of a headless `--voxserve` process, draws them in WebGL2, and writes hand edits into an authored .svedit layer the engine applies through the mutation queue.',
+    desc:'The World map page’s PREVIEW pane (was the Worldgen tab, deleted in P-I): a voxel-accurate terrain viewer and its WorldEdit-style editor. Streams real cells out of a headless `--voxserve` process, draws them in WebGL2, and writes hand edits into an authored .svedit layer the engine applies through the mutation queue.',
     files:['src/tools/voxregion.cpp','src/sim/worldedit.cpp','assets/worldview.js',
            'scripts/tuner_server.py','src/test/selftest_voxregion.cpp'],
     sym:['BuildVoxRegion','RunVoxServe','VoxPaletteJson','WorldEdits::Drain',
@@ -8714,13 +8643,13 @@ const ARCH_NODES={
     details:'<b>The rule:</b> no authored quantity representing a physical length may be expressed in CELLS without also recording the cells-per-metre it was authored at.<br><br><b>Why it was needed.</b> <code>kVoxelMeters</code> had not moved since v0.2. When it went 0.10 &rarr; 0.05 the player controller was fine (<code>player.h</code> has said <code>0.85f / kVoxelMeters</code> forever) and everything AUTHORED halved: the human became 0.85 m <i>inside a 1.7 m capsule</i>, every tree halved, and the entire selftest suite stayed green &mdash; because every existing assertion is a count in the asset&rsquo;s own lattice, and those ratios all held.<br><br><b>Three classes.</b> Procedural assets (trees) are re-baked at the engine&rsquo;s scale and the file records it. Hand-authored .vox declares <code>artVoxelsPerMetre</code> and <code>skinScale</code> is DERIVED &mdash; the human is 80 art vox/m, so skinScale is 8 at 10 cm and 4 at 5 cm with the art file untouched and the collider getting finer for free. Scalar constants are metres in source, converted at use.<br><br><b>Two lattices meet at the rig.</b> <code>ld.anchor</code> is authored; <code>AutoAnchor</code> is measured off the (possibly block-replicated) prefab. They need different divisors &mdash; using one for both collapses an upsampled rig toward its own origin while the art still looks correct.<br><br><b>The gate is deliberately non-circular.</b> Most size checks reduce algebraically to <code>box / artVoxelsPerMetre</code> and would agree with themselves at any scale. <code>scale</code> compares the avatar&rsquo;s art height against <code>Player::kHalfY</code>, which comes from a different place entirely, and validates metre pins recorded at one voxel size against another.<br><br><b>Not yet covered:</b> worldgen&rsquo;s POI literals (arena/platform/ruins never took <code>vlen()</code>), explosion and spell radii, <code>gore.*</code>, <code>debris.min*Voxels</code> and the <code>sim.*</code> integer rows. At 5 cm those are what the remaining gate failures are.'},
 
   biomes:{label:'Biomes + water presets (Environment tab)',tag:'gen',
-    desc:'A biome is a JSON file that SELECTS from component libraries — tree species, water-body presets, ground cover, cave bands — and says how often and where, one placement chain (rarity + conditions) per row. assets/water/*.json are body-of-water presets with a superellipse footprint, a depth-profile curve and vegetation by depth. The tuner\'s Environment tab hosts the biome pages and the Trees / Water bodies / Caves / Ground cover component pages.',
+    desc:'A biome is a JSON file that SELECTS from component libraries — tree species, water-body presets, ground cover, cave bands — and says how often and where, one placement chain (rarity + conditions) per row, plus its own RELIEF (a nine-knot height curve and hill/detail/grain multipliers on the map\'s octaves). assets/water/*.json are body-of-water presets with a superellipse footprint, a depth-profile curve and vegetation by depth. The tuner\'s Environment tab is the front door to the world: the World map page (biomes, landform, the terrain numbers, every site, the previews), the biome pages, and the Trees / Water bodies libraries.',
     files:['assets/editor/environment.js','assets/editor/biome.js','assets/editor/swatch_worker.js','assets/editor/water.js','assets/editor/envui.js','assets/editor/biomegen.js','assets/editor/watergen.js','assets/biomes/','assets/water/','src/sim/biomes.h','src/sim/biomes.cpp','src/test/selftest_biomes.cpp','scripts/seed_environment.mjs','scripts/test_environment.mjs','scripts/check_environment.sh','assets/environment_test.html','scripts/check_invariants.py','docs/PLAN_biomes.md'],
     sym:['generateWaterBody','columnAt','profileAt','generateSwatch','speciesWeightsFrom','validateBiome','LoadBiomeSet','ValidateBiomeSet'],
     tst:['biomes'],
     doc:['DESIGN.md','docs/PLAN_biomes.md'],
     rule:1,
-    wip:'World map P1+P2a (2026-09-04): worldgen READS the biome table (skin, tree density, cover rows, cave thresholds, flags) from the worldMap buffer, tree weights come from the biome files at load (no bake), and the BIOME ITSELF comes from the painted map assets/worldmap/default (mapBiomeAt; ocean outside the planes). The map is a script-drawn starting layout until the World Map tab (P3) can paint it. P2b deleted the deck, arena, oil/lava pools, ruin scatter, spawn clearing and fixture pads; the harness pad box + the (420,420) tarn are the only authored things left, read from the map. P3 added the Environment tab\'s World map page (paint biomes/landform/the pad box; saves assets/worldmap/<name>/). P4: the landform plane owns the continental rung of the height (landformOctave, contAmplitude = the span) and the sea fills below map.json seaLevelY. P5: the site table -- map.json sites[] (stamp: a .vox on a levelled pad) and rules[] (seeded per-biome placement), a per-cell site index, keep-outs; the far cascades see stamps at any distance. PLAN_environment_truth P-B (2026-09-05, honest pages): assets/editor/envlive.js is the one LIVE manifest -- every biome / water / map field is {read} or {read:false, package, why}, the pages render unread fields DISABLED with the package in the tooltip (trees.tile -> P-D, every conditions block -> P-D, water rows + presets -> P-F/P-E, terrain.overrides -> P-G, climate/moisture -> later), test_environment.mjs refuses a field missing from it, the trees/ha stat uses the ENGINE tile, the dead worldgen thresholds/biomeLog2/biomeBlend are deprecated on the Worldgen tab, and the P-E fields existed disabled until P-E landed. P-E (2026-09-05): the FLORA half of every water preset (shore.plants[], shore.mossChance, aquatic.emergent/floating/submerged) is packed as a water table in the same buffer (worldmap.h kW_*/kP_*) and read by worldgen; a pond wears its biome\'s FIRST water row\'s preset until P-F gives ponds their own. Cave flora (mushroomChance/crystalChance on the cave rows) and cacti (cover.cactusChance/saguaroFraction) are per biome; 19 worldgen.* knobs deleted; water GEOMETRY rows and terrain overrides are still not read. P-C (2026-09-04): spawn is a site too (kind spawn, at [x,z]; WM_H_SPAWN_X/Z) -- the game starts there, the calm home area centres on it (with a second fade from the harness box\'s edge so the fixtures keep their ground), the map page has a Spawn tool, and the spawn-site gate holds it outside the pad, on land, not in a tarn. The default map spawns at (900,900). P-F (2026-09-06): WATER PRESETS DRIVE POND GEOMETRY and LAKES ARE MAP CONTENT -- the geometry half of every preset (radius band, depth + a 17-knot profile sampled at sqrt(k/16) so the shader interpolates in d^2 with no sqrt, berm, shore band/lift/mud, bed by depth + a solid substrate for faces steeper than a powder bed can hold) is packed into the same water record (kW_* 22..49, 64 words); rolled ponds sit on ONE lattice (the finest water tile of any biome, WM_H_POND_TILE) thinned per biome by the biome\'s water rows (kR_*: preset, (T/tile)^2/rarity, minY/maxY/maxSlope), the tree rule again; an authored lake is a kind "water" site (preset + centre + optional radius) found through the site index plane, kept out by its disc + band rather than its cells; the twelve pond*/shore* knobs are gone; the basin registry\'s Profiled bowl inverts the mirrored bowlDepth by bisection; the map page has a Water tool. Still to come: P-G terrain per biome/map (+ the seven dead/duplicate worldgen rows), P-I delete the Worldgen tab.',
+    wip:'Environment truth P-A..P-I LANDED (2026-09-07): the map is the whole environment. Environment > World map is the ONE front door (biomes, landform, the terrain numbers, every site by kind, the map + edit layer the game loads, the heightmap / voxel previews); the biome pages author relief + every feature stack; the env-truth gate asserts every biome\u2019s cover and trees against the page. Open: towns and notable buildings as sites (the `proc:` kind), a global sea level with its LAVA_LID.',
     details:'<b>One owner per fact.</b> A species file owns what a tree looks like and what ground it tolerates; a water preset owns the shape of a body of water; a biome owns WHICH of them appear and how often. The tree WEIGHTS moved: they are edited on the biome page and mirrored into each species&rsquo; <code>placement.biomes</code> by <b>Sync atlas</b> (which re-bakes the changed <code>.svtree</code>s, so the world hash moves) or by <code>node scripts/seed_environment.mjs --sync</code>. The <code>biomes</code> gate and <code>check_invariants.py</code>&rsquo;s <code>biome order</code> hold the mirror and the five copies of the engine biome list together.<br><br><b>The placement chain.</b> Every feature row carries rarity + conditions (<code>minY</code>, <code>maxY</code>, <code>maxSlope</code> Q8, <code>nearWaterMin/Max</code> m, <code>patchThreshold</code>) &mdash; Minecraft&rsquo;s placed-feature model, chosen because it is the one modders already read. Rarity is authored in ONE form per stack and the others are shown read-only beside it (percent, per hectare, per km&sup2;), because &ldquo;1 in 4 of 44.8 m tiles&rdquo; is not a number anyone can picture.<br><br><b>watergen.js</b> is the one body-of-water shaper: superellipse footprint (<code>squareness</code> = the Lam&eacute; exponent) + fBm domain warp + smooth-min lobes + subtracted islands; a monotone-cubic depth PROFILE over the normalised radius (parabola / bathtub / shelf / cone / flat presets, editable by dragging points on the section canvas); fill + level; the engine&rsquo;s structural berm; bed by depth; a distance-ordered shore plant stack; emergent / floating / submerged bands by depth. Band widths are consequences of the bathymetry, not knobs. <code>columnAt()</code> is the one answer to &ldquo;what is at (x,z)&rdquo;, shared by the preset preview and the biome swatch.<br><br><b>biomegen.js</b> composes a swatch: a heightfield, the biome&rsquo;s water rows stamped through <code>columnAt</code> (showcase mode: one of each, centred &mdash; true rarity on a 24 m square is usually nothing; on the 96&ndash;128 m swatch it is the real picture), cover plants behind the patch mask, trees by weighted draw + conditions using the real treegen atlas cells. Deterministic: same files + seed = same cells, asserted by <code>test_environment.mjs</code>.<br><br><b>The swatch is a scale ladder</b> (16&ndash;128 m): up to 32 m it is 1:1; past that it bakes at the finest INTEGER vpm that keeps the side inside 384 cells (8 vpm at 48 m, 4 at 96, 3 at 128) and the viewer draws it at <code>lod = 10 / vpm</code>, because the swatch is a dense volume copied three times on its way to the screen and a 96 m swatch at 10 vpm would be 2 GB in flight. Composed in <code>swatch_worker.js</code> (a module worker: one request in flight, one queued, the page never blocks); the first swatch at a new scale bakes every species it places and says so.<br><br><b>Engine today (P-F, 2026-09-06):</b> <code>src/sim/biomes.cpp</code> loads and validates; worldgen reads the biome table for skin, cover, trees, caves AND water: a pond is the preset the biome row rolled (or the map site placed), carved as the preset&rsquo;s sampled profile by the height mirror (<code>pondInfo</code> / <code>bowlDepth</code> / <code>bermLift</code> / <code>pondNear</code>, twinned in <code>world.cpp</code>), with its berm, shore band, mud ring, bed and flora. <code>worldmap::WaterGeomOf</code> is the one metres-to-voxels conversion; the shipped presets are read as authored, and a face steeper than a voxel per column wears the preset&rsquo;s <code>bed.substrate</code> instead of its powder bed so the world still settles.'},
   trees:{label:'Trees (baked atlas)',tag:'gen',
     desc:'Every tree voxel in the game is baked offline by assets/editor/treegen.js and sampled by worldgen from one storage buffer. The editor is the ONLY voxelizer: there is deliberately no C++ or WGSL copy of the generation algorithm, so what the tuner Trees tab shows is byte-for-byte what the world grows.',
@@ -10430,6 +10359,7 @@ function renderEngine(){
   const recentSec=el('div',{class:'status-section'});
   recentSec.appendChild(el('h4',{},'Recently Landed'));
   const recentItems=[
+    {label:'The map IS the environment: the terrain is authored on it, the biomes carry their relief, the Worldgen tab is gone (P-G + P-I)',desc:'2026-09-07, the last two packages of <code>docs/PLAN_environment_truth.md</code>. <b>P-G:</b> the 68 <code>worldgen.*</code> knobs are gone from tuning.json. The per-map numbers (datum, what a painted landform spans, the octave ladder, attenuation, the calm home area, the sediment wedge, the treeline, the reference scale) are <code>map.json terrain</code>, packed into the worldMap header (<code>worldmap.h kHTerrain*</code>) and read by the height mirror on both sides by name; the per-biome relief (nine curve knots + hill/detail/grain multipliers) is each biome file&rsquo;s <code>terrain</code> block in the biome record, BLENDED over the four map cells around a column so biomes never meet on a cliff. A <code>kind: "landform"</code> site (peak / ridge / basin / plateau) is a declared mountain overlaid onto the landform plane at load &mdash; the shipped map has <code>east_range</code>. The shader&rsquo;s hard-coded undergrowth / flower chain and the alpine block are cover ROWS with a canopy condition (<code>canopyMin/Max</code>, the 25-tile scan paid once per column), so the env-truth gate asserts every biome&rsquo;s cover; the stale species height caps (authored for a y32..y86 world) are lifted and the atlas re-baked. <b>P-I:</b> Environment &rarr; World map is the one front door: map + edit layer selectors (<code>tuning.json world.*</code>), a Terrain section, a Sites panel (pad, spawn, water, landform, stamp: select / rename / delete), the heightmap backdrop, and the heightmap + voxel views re-homed as a preview pane. <code>debug.vegetation</code> (Dev switches) is the one knob left, an A/B lever.'},
     {label:'Lakes are map content, and a body of water is its preset: P-F of the environment truth plan',desc:'2026-09-06. The twelve <code>worldgen.pond*</code> / <code>shore*</code> knobs are gone. A body of water&rsquo;s geometry is its <code>assets/water/&lt;name&gt;.json</code> &mdash; radius band, depth and a PROFILE (sampled to 17 Q8 knots at sqrt(k/16) so the shader interpolates in d&sup2; with no sqrt), berm, shore band/lift/mud, bed by depth &mdash; packed into the worldMap buffer&rsquo;s water record (<code>kW_*</code> 22..49) and carved by the height mirror on both sides. WHERE it appears is the biome&rsquo;s <code>water.features[]</code> rows on ONE pond lattice (the finest water tile of any biome, thinned per row like the trees) &mdash; or a <code>kind: "water"</code> site on the World map: a preset at a fixed centre, the same on every seed, placed with the new <b>Water</b> tool. A bowl face steeper than a voxel per column wears the preset&rsquo;s substrate instead of its sand, so a preset may be as deep as its author drew it. The basin registry inverts the mirrored bowl by bisection (<code>Profiled</code>); <code>terrain</code> A6 and <code>waterbody</code> assert against the preset&rsquo;s own berm and profile; <code>biomes</code> refuses a row whose tile cannot hold its preset&rsquo;s widest disc.'},
     {label:'The biome page is measured against the world it grows: the env-truth gate',desc:'2026-09-05, PLAN_environment_truth P-H. For every biome file the gate packs a one-biome world in memory, uploads it through the F7 seam, runs the real GPU worldgen and reads the surface back: trees per lattice site (treeSite() replayed with the one hash mirror), cover per row from the voxel above ground, the skin at y == h. Expected values come from the packed words the shader reads, the CPU height twin per site and column, and the patch mask in distribution; the page\'s nominal numbers are held to the JS through a committed <code>tests/env_predictions.json</code>. Where nothing but a row can place its material the cover matches to a tenth of a percent (alpine cushion 2.15% vs 2.15%). What it surfaced: the shader\'s hard-coded undergrowth chain is a second, unauthored source of cover in five biomes (forest: 5.9% of columns), the species height caps (20.4&ndash;22 m) sit on the 20 m home-area height and gate out a quarter of the forest, and the page\'s subsoil is under 27% of the ground. Thresholds in baseline.json (envTruth*), table in build/env_truth.json, 27 s (eight full-window regens).'},
     {label:'One switch turns every plant off: worldgen.vegetation, the frame-rate A/B lever',desc:'2026-09-05. There was no way to ask "how much of the frame is foliage" without editing eight biome files and the water presets. <code>worldgen.vegetation</code> (a TP_U row, so a WGSL constant) now gates every placement block in <code>worldgen.wgsl</code> at its source &mdash; treeInfoAt, cactusInfo, flowerAt, plantColumnAt, caveFloraAt and the table-driven shore / pond / cover / alpine / wet-moss blocks &mdash; so the tree candidate scan, the undergrowth canopy scan and the far cascade&rsquo;s crown proxy all agree the world is bare, and none of them pays for plants that will not be placed. The Worldgen tab has a one-click <b>Vegetation: ON/OFF</b> button and a checkbox row; F7 in-game now takes the F5 path first (tuning + shaders) and then regenerates, so a worldgen knob is one key. Default 1: the hash is unmoved; 0 moves it, as any worldgen knob does. Proven reachable with <code>--sweep worldgen.vegetation=1,0</code>.'},
@@ -10528,8 +10458,7 @@ function renderEngine(){
   const plannedSec=el('div',{class:'status-section'});
   plannedSec.appendChild(el('h4',{},'Planned / Needed'));
   const plannedItems=[
-    {label:'A non-identity biome height curve set',badge:'needed',desc:'The curve mechanism is live and authorable but every biome ships the IDENTITY, because a global worldgen default moves the ground under <code>armor-react</code>\u2019s acid differential \u2014 it plants two creatures at <code>WindowOrigin + 250</code> and <code>+ 262</code> on raw procgen, and with an authored set the acid stopped reaching the control entirely (bare limb lost 0 skin against 357). Both arms measured at full suite scope; the same gate passes under <code>--gate armor-react</code>, which is why scope matters. The fix is that fixture standing on a levelled pad the way (60,60)\u2026(140,140) do, not a milder curve.'},
-    {label:'The Environment tab is the truth about the world (PLAN_environment_truth P-A..P-I)',badge:'needed',desc:'Worldgen reads the biome record (skin, cover rows, tree density + weights, cave thresholds, flags) and the painted map since 2026-09-04; P-B made every page honest about the rest (<code>assets/editor/envlive.js</code>: unread fields render disabled with their package). Remaining, one worktree and one rebaseline each: P-A reload + Apply button; P-C spawn as a map site outside the harness pad; P-D per-biome tree spacing by thinning ONE fine lattice (deletes <code>worldgen.treeTile</code>, makes every <code>conditions</code> block live); P-E shore / aquatic / cave-flora rows per preset and biome (deletes the shore*/reed*/lily*/kelp*/cactus*/caveMushroom*/caveCrystal* knobs); P-F pond geometry from the water presets through a C++ twin of the pond table (deletes pond*); P-G relief curves + terrain record per biome, map-level globals into map.json; P-H the <code>env-truth</code> gate measuring trees/ha, cover %, bodies/km&sup2; on the GPU against the page&rsquo;s predictions; P-I deletes the Worldgen tab. Every step moves the hash once; none moves determinism'},
+    {label:'Towns and notable buildings as map sites (PLAN_world_map follow-ups)',badge:'planned',desc:'The Sites panel on Environment &rarr; World map lists every site by kind (pad, spawn, water, landform, stamp) with select / rename / delete; the `proc:` kind &mdash; a town, a tower, a ruin field placed by name and generated at load &mdash; is the next thing to join it, now that the map is the whole environment (P-A..P-I landed 2026-09-07).'}},
     {label:'Terrain overhaul packages C–H',badge:'planned',desc:'The scale pass (five-octave ladder with derivative attenuation, calm home-area ramp, datum to ~y200, slope-gated sediment wedge), then a global sea level with its LAVA_LID, sine-of-contours mountain ranges, 3D caves behind a province mask, and fixed-compass climate. Today the world has 5.6 m of relief while the far cascades render to 6.6 km at 51.2 m per cell — levels 6–8 are drawing a flat plane. Package B landed the foundations; docs/RESEARCH_worldgen.md is the decision record'},
     {label:'Wind primitives (phase 2)',badge:'needed',desc:'Fans and spell gusts as parametric objects on the op stream, with a bounded footprint wake through the mutation path. Now blocking two things at once: player-interactable wind, and switching settled-powder entrainment on — the footprint is what makes the wind rule-2 clean AND what tells the page table which chunks a wind-moved grain can land in'},
     {label:'2048³ window + 5 cm voxels',badge:'planned',desc:'Grow kWorldN from 512 to 2048, retune kVoxelMeters 0.10 → 0.05 — needs occupancy re-measurement first'},

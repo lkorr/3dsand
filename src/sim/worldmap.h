@@ -122,7 +122,36 @@ enum : uint32_t {
   // disc before it knows which preset the disc wears.
   kHPondTile = 30,
   kHPondBand = 31,
-  kHeaderWords = 32,    // padded, like treeatlas::kFileHeaderWords
+  // ---- THE TERRAIN (P-G, docs/PLAN_environment_truth.md): per MAP -------------
+  // What used to be worldgen.* tuning rows is map.json `terrain`, packed here
+  // so the height mirror on both sides reads the same words (worldgen.wgsl
+  // wmTerrain(WM_H_TERRAIN_*) / world.cpp wmTerrain(WM_H_TERRAIN_*), token-
+  // identical inside the mirror). Lengths are VOXELS at the live voxel size
+  // (LoadWorldMap rescaled them from the map's refVoxelsPerMetre); log2 cells
+  // are shifts; fbmAtten / sedFraction / sedSlope are dimensionless.
+  kHTerrainBaseHeight = 32,      // the world datum: mean ground height
+  kHTerrainLandformRange = 33,   // what a painted landform 0..255 spans, voxels (was contAmplitude)
+  kHTerrainRangeAmplitude = 34,  // the seeded octave ladder under the plane
+  kHTerrainRangeLog2 = 35,
+  kHTerrainHillAmplitude = 36,
+  kHTerrainHillLog2 = 37,
+  kHTerrainDetailAmplitude = 38,
+  kHTerrainDetailLog2 = 39,
+  kHTerrainGrainAmplitude = 40,
+  kHTerrainGrainLog2 = 41,
+  kHTerrainFbmAtten = 42,        // Q8 derivative attenuation, 0..256
+  kHTerrainHomeY = 43,           // the calm home area (was spawnPlainY/R/Fade)
+  kHTerrainHomeR = 44,
+  kHTerrainHomeFade = 45,
+  kHTerrainSedCeil = 46,         // the sediment wedge (was sed*)
+  kHTerrainSedFraction = 47,
+  kHTerrainSedStrip = 48,
+  kHTerrainSedSlope = 49,
+  kHTerrainSedMax = 50,
+  kHTerrainSedTopsoil = 51,
+  kHTerrainTreeline = 52,        // snow and no trees at or above this ground Y
+  kHTerrainRefVpm = 53,          // the voxels-per-metre the map's terrain was authored at
+  kHeaderWords = 64,    // padded, like treeatlas::kFileHeaderWords
 };
 // Planes are packed FOUR CELLS PER WORD, little-endian: cell i of a plane at
 // word (off + (i >> 2)), byte (i & 3); i = cz * width + cx. The biome plane's
@@ -145,7 +174,7 @@ inline constexpr uint32_t kVersion = 1u;
 // metres), chances as 1-in-N, slopes in Q8. A cover row's `heightVox` is the
 // stalk height; `head` caps the top cell when non-zero.
 enum : uint32_t {
-  kBiomeRecWords = 32,
+  kBiomeRecWords = 48,
   kB_Skin = 0,            // material id of the y == h skin
   kB_Subsoil = 1,         // material id under the skin (the wedge's topsoil)
   kB_SkinDepth = 2,       // cells of skin, >= 1
@@ -184,7 +213,19 @@ enum : uint32_t {
   kB_CactusChance = 19,       // percent of CACTUS_TILE tiles that grow one (kBF_Cacti gates it)
   kB_SaguaroFraction = 20,    // percent of those that are saguaro columns, not barrels
   kB_WaterOff = 21,           // word offset of this biome's first water row (P-F)
-  // 22..31 reserved
+  // ---- P-G: the biome's TERRAIN record (assets/biomes/<name>.json terrain) ----
+  // Nine Q14 relief-curve knots (i32 in u32; the identity is -16384 + i*4096)
+  // and three Q8 multipliers on the map's hill / detail / grain amplitudes
+  // (256 = the map's own). The height mirror reads them through biomeCurve /
+  // biomeReliefAt, BILINEARLY over the four map cells around the column (the
+  // landform plane's own lattice), so two biomes' curves crossfade over a
+  // whole 102 m cell and never meet on a cliff. Packed by PackBiomeTerrain,
+  // the one conversion both the packer and the CPU twin use.
+  kB_CurveKnot0 = 22,         // ..30: knots 0..8
+  kB_HillMul = 31,
+  kB_DetailMul = 32,
+  kB_GrainMul = 33,
+  // 34..47 reserved
   kCoverRowWords = 12,
   kC_Mat = 0,
   kC_Head = 1,
@@ -196,7 +237,13 @@ enum : uint32_t {
   kC_PatchThreshold = 7,  // per-row extra gate on the biome patch field
   kC_NearWaterMax = 8,    // voxels from a pond rim, -1 = unbounded (P-D)
   kC_NearWaterMin = 9,    // at least this many voxels from a rim, 0 = off
-  // 10..11 reserved
+  // P-G: the CANOPY condition, what turned the shader's hard-coded
+  // undergrowth / flower chain into rows. undergrowthSite's cover 0..255
+  // (0 = open sky, 255 = deep under overlapping crowns) must lie in
+  // [canopyMin, canopyMax]; 0 / 255 = no bound. A biome with any bounded row
+  // carries kBF_CanopyRows so the stack pays the 25-tile scan only there.
+  kC_CanopyMin = 10,
+  kC_CanopyMax = 11,
   // ---- the biome's water rows (P-F) ----
   // Rolled in authored order per pond tile, first hit wins (the cover stack's
   // rule): a row's chance is `(T / tile)^2 / rarity` in Q16 on the shared
@@ -221,6 +268,7 @@ enum : uint32_t {
 inline constexpr uint32_t kBF_GroundFlora = 1u << 0;  // the canopy-inverted undergrowth + flower layer
 inline constexpr uint32_t kBF_Cacti = 1u << 1;        // the cactus proc shape
 inline constexpr uint32_t kBF_SandCap = 1u << 2;      // loose sand cap under the skin (the old desert rule)
+inline constexpr uint32_t kBF_CanopyRows = 1u << 3;   // some cover row bounds the canopy cover (P-G): scan the trees once per column
 
 // ---- the water preset table (P-E) --------------------------------------------
 // One fixed-stride record per assets/water/<name>.json at kHWaterRecords, in
@@ -359,6 +407,51 @@ namespace biomes { struct BiomeSet; struct BiomeDef; struct WaterPresetDef; }
 
 namespace worldmap {
 
+// ---- the map's terrain (P-G): map.json `terrain`, as the engine holds it ----
+// Every field is the kHTerrain* word of the same name, in the units the
+// header comment gives (voxels at the LIVE voxel size, log2 shifts, Q8).
+// `TerrainWords` is the ONE packing; LoadWorldMap keeps the result on
+// WorldMapData::terrainWords for the CPU twin, PackWorldMap writes it into
+// the header, so the two sides read the same integers by construction.
+struct TerrainParams {
+  int refVoxelsPerMetre = 10;     // the scale the map's lengths are authored at
+  int baseHeight = 200;
+  int landformRangeVox = 1024;    // a painted 0..255 spans this many voxels, centred on 128
+  int rangeAmplitude = 256, rangeLog2 = 9;
+  int hillAmplitude = 64, hillLog2 = 7;
+  int detailAmplitude = 16, detailLog2 = 5;
+  int grainAmplitude = 4, grainLog2 = 3;
+  int fbmAtten = 256;
+  int homeY = 200, homeR = 320, homeFade = 2048;
+  int sedCeil = 264, sedFraction = 64, sedStrip = 6, sedSlope = 96, sedMax = 32, sedTopsoil = 4;
+  int treeline = 228;
+};
+inline constexpr uint32_t kTerrainWords = kHTerrainRefVpm + 1 - kHTerrainBaseHeight;
+/** The terrain as header words kHTerrainBaseHeight..kHTerrainRefVpm. */
+void TerrainWords(const TerrainParams& t, uint32_t out[kTerrainWords]);
+/** The world's treeline, home height and reference scale, for the CPU code
+ *  that used to read worldgen.treeline / spawnPlainY / refVoxelsPerMetre.
+ *  The loaded map's, or the defaults above when no map is loaded. */
+const TerrainParams& CurrentTerrain();
+
+// ---- a biome's terrain record (P-G): the kB_CurveKnot0..kB_GrainMul words ----
+inline constexpr uint32_t kBiomeTerrainWords = kB_GrainMul + 1 - kB_CurveKnot0;
+struct BiomeTerrainPacked { uint32_t w[kBiomeTerrainWords] = {}; };
+
+// ---- an authored LANDFORM site (P-G, Tier A): a declared mountain ----------
+// `{kind: "landform", shape: peak | ridge | basin | plateau, at: [x, z],
+// radius, heightVox, rotation?}` in map.json sites[]. Overlaid onto the
+// packed landform PLANE at load (OverlayLandformSites), so the shader reads
+// the plane exactly as before and nothing new enters the height mirror. Not
+// in the site table: a landform keeps nothing out, it only shapes the ground.
+struct LandformSite {
+  std::string id, shape;
+  int x = 0, z = 0;               // world voxels
+  int radius = 1024;              // voxels: a peak's footprint, a ridge's half-length
+  int heightVox = 0;              // signed: how far the plane is lifted (or, for a basin, sunk)
+  int rotation = 0;               // degrees, ridges only
+};
+
 // ---- the geometry half of a water preset, as the engine holds it (P-F) ----
 // ONE conversion from assets/water/<name>.json to voxel integers + the sampled
 // profile, used by the packer (PackBiomeTable -> the kW_* words) AND kept on
@@ -395,6 +488,16 @@ int PondBandVox(const biomes::BiomeSet& set);
 std::vector<WaterRowPacked> PackWaterRows(const biomes::BiomeSet& set, const biomes::BiomeDef& b, int latticeVox);
 /** 1 + index of the preset by name, 0 if the set has none. */
 uint32_t WaterPresetIndex(const biomes::BiomeSet& set, const std::string& name);
+/** A biome's terrain record (curve knots clamped to +-16384, Q8 multipliers
+ *  clamped to 0..4096). Pure; the packer and the loader both call it. */
+BiomeTerrainPacked PackBiomeTerrain(const biomes::BiomeDef& b);
+/** Overlay `sites` onto a landform plane of `width` x `height` cells whose
+ *  cell (cx, cz) is centred on world column ((cx - ox) << log2) + half.
+ *  Cone / elliptical ridge / plateau / inverted cone in landform units,
+ *  heightVox * 256 / landformRangeVox per voxel; clamped 0..255. */
+void OverlayLandformSites(const std::vector<LandformSite>& sites, int landformRangeVox,
+                          int cellLog2, int width, int height, int originCellX, int originCellZ,
+                          std::vector<uint8_t>& landform);
 
 /**
  * Pack the loaded biome set into the `worldMap` buffer's words: header +
@@ -411,6 +514,10 @@ bool PackBiomeTable(const biomes::BiomeSet& set, std::vector<uint32_t>& words,
 // ---- the loaded map (P2) ---------------------------------------------------
 /** assets/worldmap/<name>/{map.json,map.svmap}, parsed and resolved. */
 struct WorldMapData {
+  // Even an UNLOADED map carries the default terrain words: the CPU twin reads
+  // them through CurrentWorldMap() before any map is loaded (tools, the
+  // heightmap route), and a zero homeFade there is a division by zero.
+  WorldMapData() { TerrainWords(terrain, terrainWords); }
   std::string name;
   int cellLog2 = 10;
   int width = 0, height = 0;
@@ -450,6 +557,13 @@ struct WorldMapData {
   std::vector<WaterGeom> water;
   std::vector<std::vector<WaterRowPacked>> biomeWater;
   int pondTile = 0, pondBand = 0;
+  // P-G: the map's terrain (map.json `terrain`), rescaled to the live voxel
+  // size, and the same as header words; each biome's terrain record by id;
+  // the authored landform sites (already overlaid onto `landform`).
+  TerrainParams terrain;
+  uint32_t terrainWords[kTerrainWords] = {};
+  std::vector<BiomeTerrainPacked> biomeTerrain;
+  std::vector<LandformSite> landformSites;
   std::vector<uint8_t> siteIndex;         // width*height, site id + 1, 0 = none
   uint8_t SiteCell(int cx, int cz) const {
     return siteIndex.empty() ? 0 : siteIndex[static_cast<size_t>(cz) * width + cx];

@@ -8,7 +8,20 @@
     "notes": "The wettest cell of the climate grid: mud underfoot, standing water everywhere, willows and reeds."
   },
   "terrain": {
-    "overrides": {}
+    "curve": [
+      -16384,
+      -12288,
+      -8192,
+      -4096,
+      0,
+      4096,
+      8192,
+      12288,
+      16384
+    ],
+    "hill": 256,
+    "detail": 256,
+    "grain": 256
   },
   "cover": {
     "skin": "shore_mud",
@@ -20,17 +33,163 @@
     },
     "plants": [
       {
+        "material": "mushroom_cluster",
+        "head": "",
+        "chance": 24,
+        "height": 0.2,
+        "conditions": {
+          "minY": -1,
+          "maxY": 227,
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0,
+          "canopyMin": 96,
+          "canopyMax": 255
+        }
+      },
+      {
+        "material": "bramble",
+        "head": "",
+        "chance": 46,
+        "height": 0.3,
+        "conditions": {
+          "minY": -1,
+          "maxY": 227,
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0,
+          "canopyMin": 96,
+          "canopyMax": 189
+        }
+      },
+      {
+        "material": "moss_patch",
+        "head": "",
+        "chance": 6,
+        "height": 0.1,
+        "conditions": {
+          "minY": -1,
+          "maxY": 227,
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 150,
+          "canopyMin": 96,
+          "canopyMax": 255
+        }
+      },
+      {
+        "material": "sapling",
+        "head": "",
+        "chance": 900,
+        "height": 0.5,
+        "conditions": {
+          "minY": -1,
+          "maxY": 227,
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0,
+          "canopyMin": 96,
+          "canopyMax": 255
+        }
+      },
+      {
+        "material": "leaf_litter",
+        "head": "",
+        "chance": 8,
+        "height": 0.1,
+        "conditions": {
+          "minY": -1,
+          "maxY": 227,
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0,
+          "canopyMin": 96,
+          "canopyMax": 255
+        }
+      },
+      {
+        "material": "leaf_litter",
+        "head": "",
+        "chance": 22,
+        "height": 0.1,
+        "conditions": {
+          "minY": -1,
+          "maxY": 227,
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0,
+          "canopyMin": 40,
+          "canopyMax": 95
+        }
+      },
+      {
+        "material": "flower_wildrose",
+        "head": "",
+        "chance": 900,
+        "height": 0.4,
+        "conditions": {
+          "minY": -1,
+          "maxY": 227,
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 0,
+          "canopyMin": 40,
+          "canopyMax": 95
+        }
+      },
+      {
+        "material": "flower_foxglove",
+        "head": "",
+        "chance": 900,
+        "height": 0.5,
+        "conditions": {
+          "minY": -1,
+          "maxY": 227,
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 180,
+          "canopyMin": 0,
+          "canopyMax": 95
+        }
+      },
+      {
+        "material": "flower_buttercup",
+        "head": "",
+        "chance": 700,
+        "height": 0.3,
+        "conditions": {
+          "minY": -1,
+          "maxY": 227,
+          "maxSlope": 1024,
+          "nearWaterMax": -1,
+          "nearWaterMin": 0,
+          "patchThreshold": 180,
+          "canopyMin": 0,
+          "canopyMax": 95
+        }
+      },
+      {
         "material": "cattail",
         "head": "cattail_head",
         "chance": 24,
         "height": 0.9,
         "conditions": {
           "minY": -1,
-          "maxY": -1,
+          "maxY": 227,
           "maxSlope": 1024,
           "nearWaterMax": -1,
           "nearWaterMin": 0,
-          "patchThreshold": 0
+          "patchThreshold": 0,
+          "canopyMin": 0,
+          "canopyMax": 255
         }
       },
       {
@@ -40,11 +199,13 @@
         "height": 0.6,
         "conditions": {
           "minY": -1,
-          "maxY": -1,
+          "maxY": 227,
           "maxSlope": 1024,
           "nearWaterMax": -1,
           "nearWaterMin": 0,
-          "patchThreshold": 0
+          "patchThreshold": 0,
+          "canopyMin": 0,
+          "canopyMax": 255
         }
       },
       {
@@ -54,11 +215,13 @@
         "height": 0.4,
         "conditions": {
           "minY": -1,
-          "maxY": -1,
+          "maxY": 227,
           "maxSlope": 1024,
           "nearWaterMax": -1,
           "nearWaterMin": 0,
-          "patchThreshold": 0
+          "patchThreshold": 0,
+          "canopyMin": 0,
+          "canopyMax": 255
         }
       },
       {
@@ -68,11 +231,13 @@
         "height": 0.1,
         "conditions": {
           "minY": -1,
-          "maxY": -1,
+          "maxY": 227,
           "maxSlope": 1024,
           "nearWaterMax": -1,
           "nearWaterMin": 0,
-          "patchThreshold": 0
+          "patchThreshold": 0,
+          "canopyMin": 0,
+          "canopyMax": 255
         }
       },
       {
@@ -82,11 +247,13 @@
         "height": 0.2,
         "conditions": {
           "minY": -1,
-          "maxY": -1,
+          "maxY": 227,
           "maxSlope": 1024,
           "nearWaterMax": -1,
           "nearWaterMin": 0,
-          "patchThreshold": 0
+          "patchThreshold": 0,
+          "canopyMin": 0,
+          "canopyMax": 255
         }
       }
     ],

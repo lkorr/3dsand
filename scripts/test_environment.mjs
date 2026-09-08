@@ -304,12 +304,13 @@ console.log('\n-- live manifest (envlive.js) --');
   };
   const R = BG.defaultRows();
   const biomeRows = {'cover.plants': R.coverPlant, 'trees.species': R.treeSpecies, 'water.features': R.waterFeature,
-                     'caves.features': R.caveFeature, 'terrain.overrides': null};
+                     'caves.features': R.caveFeature, 'terrain.curve': null};
   check('biome', leaves(BG.defaultBiome(), '', biomeRows));
   const wp = WG.defaultParams();
   check('water', leaves(wp, '', {'shore.plants': wp.shore.plants[0], 'bathymetry.profile': null}));
   const mapJson = readJson(join(ROOT, 'assets', 'worldmap', 'default', 'map.json'));
   const mapRows = {sites: {}, rules: {}, biomes: null, size: null, originCell: null};
+  // P-G: the terrain block is walked leaf by leaf (every number is read).
   const mapPaths = leaves(mapJson, '', mapRows).filter(p => !/^(sites|rules)\[\]\./.test(p))
       .concat(['sites[]', 'rules[]', 'planes.biome', 'planes.landform', 'planes.moisture']);
   check('map', [...new Set(mapPaths)]);

@@ -2851,131 +2851,31 @@ struct Tuning {
     float shadowMaxDist = 999.0f;
   } render;
 
-  // ---- worldgen (integer; regenerating the world is required to see edits) ----
-  struct Worldgen {
-    // The scale every LENGTH below is authored at. LoadTuning multiplies those
-    // rows by kVoxelsPerMetre / this, so the group means the same physical
-    // world at any voxel size. Dimensionless rows (chances, 0..255 thresholds,
-    // the Q8 slope) are untouched, because a probability and a gradient do not
-    // have a length in them.
-    int refVoxelsPerMetre = 10;
+  // ---- world: which authored map and edit layer the game loads ---------------
+  // NOT the terrain. Every number that shapes the ground moved to the map
+  // (assets/worldmap/<name>/map.json `terrain`) and to the biome files in
+  // P-G of docs/PLAN_environment_truth.md; what is left here is which files.
+  struct World {
+    // Names assets/worldmap/<mapLayer>/{map.json,map.svmap}: the painted
+    // biome/landform planes, the terrain numbers and the site table. NOT
+    // optional -- "default" ships, and a missing or unparsable map ABORTS at
+    // load rather than silently generating an all-ocean or all-forest world.
+    std::string mapLayer = "default";
+    // Names assets/worldedits/<editLayer>.svedit, the hand-built patch the
+    // World map page's voxel view writes. Applied through the MutationQueue
+    // to every chunk worldgen produces, so it survives streaming and composes
+    // with any seed. EMPTY BY DEFAULT, and no gate may set it: a layer moves
+    // the world hash by construction.
+    std::string editLayer;
+  } world;
+
+  // ---- debug: dev switches that are not world content ---------------------------
+  struct Debug {
     // 1 = plants generate, 0 = a bare world (trees, cacti, flowers, grass,
     // undergrowth, cover rows, shore/pond/cave flora, alpine cushion, wet moss
     // all off). A frame-rate A/B lever; see tuning_params.def.
     int vegetation = 1;
-    int treeline = 228;
-    // The world DATUM. Every octave below is a CENTRED deviation, so terrain
-    // sits at baseHeight on average and spans +- half the summed amplitudes.
-    int baseHeight = 200;
-    // THE OCTAVE LADDER: five rungs, lacunarity 4, persistence 1/4, so every
-    // rung has the same amplitude/wavelength ratio of 0.5 and detail is added
-    // without adding slope. Amplitudes are the FULL swing in voxels (the field
-    // spans +-amp/2); half-ranges sum to 682 voxels = 68 m each way.
-    //
-    // Noise cells are LOG2 EXPONENTS (11 = 2048 voxels, 3 = 8), which is what
-    // lets vnoise2d replace fdiv/fmodp with >> and & — see the Q14 noise block
-    // in worldgen.wgsl. LoadTuning clamps every one of them to 3..15.
-    int contAmplitude = 1024, contLog2 = 11;
-    int rangeAmplitude = 256, rangeLog2 = 9;
-    int hillAmplitude = 64, hillLog2 = 7;
-    int detailAmplitude = 16, detailLog2 = 5;
-    int grainAmplitude = 4, grainLog2 = 3;
-    // iq's derivative attenuation, Q8: each octave is scaled by
-    // 1/(1 + fbmAtten*|g|^2/256) against the gradient accumulated above it.
-    // 0 is plain fBm (five 0.5 slopes summing to 2.5, i.e. the whole world
-    // above the CA's angle of repose); 256 is the textbook form. This is a
-    // rule-2 mechanism, not a look knob.
-    int fbmAtten = 256;
-    // The calm home area: the two COARSE octaves fade toward the world origin
-    // so spawn is rolling country at spawnPlainY instead of a random point on
-    // a mountainside. The three fine octaves stay live, which is what makes it
-    // calm rather than flat. spawnPlainFade is load-bearing — a short fade
-    // builds a cliff at exactly the boundary; the `terrain` gate's A4 measures
-    // it.
-    int spawnPlainY = 200, spawnPlainR = 320, spawnPlainFade = 2048;
-    // The sediment wedge: low flat ground carries loose dirt over gravel,
-    // ridges carry none. thickness = (sedCeil - ground)*sedFraction/256 -
-    // sedStrip, slope-gated and clamped to sedMax. Dirt and gravel are
-    // POWDERS, so sedSlope is a rule-2 knob — ship it conservative and raise it
-    // under `--gate sleep`. sedMax must stay under caveBands' 40-voxel shell or
-    // a cavern breaches the wedge from below; LoadTuning enforces that.
-    int sedCeil = 264, sedFraction = 64, sedStrip = 6;
-    int sedSlope = 96, sedMax = 32, sedTopsoil = 4;
-    int biomeLog2 = 9;
-    int desertThreshold = 214, pineThreshold = 176, meadowThreshold = 92;
-    // ---- per-biome height curves ----
-    // Nine knots per biome on a uniform input grid spanning the coarse
-    // octaves' full swing, +-(contAmplitude + rangeAmplitude)/2, with values in
-    // Q14 over the same range. The default is the IDENTITY, -16384 + i*4096,
-    // which is exactly representable precisely because there are nine knots and
-    // not eight -- see the long note in tuning_params.def. biomeBlend is the
-    // crossfade width in biome-band units.
-    // LoadTuning clamps every knot to +-16384; curveTangent's i32 multiply
-    // depends on that bound. THIRTY-SIX SCALARS and not four arrays:
-    // check_invariants.py requires every tuning_params.def row to name a
-    // plain member, because TuningWgslBlock expands to `t.worldgen.<member>`.
-    int curveForest0 = -16384, curveForest1 = -12288, curveForest2 = -8192,
-        curveForest3 = -4096, curveForest4 = 0, curveForest5 = 4096,
-        curveForest6 = 8192, curveForest7 = 12288, curveForest8 = 16384;
-    int curvePine0 = -16384, curvePine1 = -12288, curvePine2 = -8192,
-        curvePine3 = -4096, curvePine4 = 0, curvePine5 = 4096,
-        curvePine6 = 8192, curvePine7 = 12288, curvePine8 = 16384;
-    int curveMeadow0 = -16384, curveMeadow1 = -12288, curveMeadow2 = -8192,
-        curveMeadow3 = -4096, curveMeadow4 = 0, curveMeadow5 = 4096,
-        curveMeadow6 = 8192, curveMeadow7 = 12288, curveMeadow8 = 16384;
-    int curveDesert0 = -16384, curveDesert1 = -12288, curveDesert2 = -8192,
-        curveDesert3 = -4096, curveDesert4 = 0, curveDesert5 = 4096,
-        curveDesert6 = 8192, curveDesert7 = 12288, curveDesert8 = 16384;
-    int biomeBlend = 18;
-    // There is no `treeTile` any more: the tree lattice is the finest
-    // `trees.tile` among assets/biomes/*.json (biomes.h FinestTreeTileVox),
-    // and each biome thins on it to its own density. One authoring surface.
-    // There are no pond* / shore* geometry knobs any more (P-F): a body of
-    // water's geometry is its preset's (assets/water/<name>.json, packed into
-    // the worldMap buffer's water table, worldmap.h kW_*), where it appears is
-    // the biome's water.features[] rows (kR_*) on the one pond lattice
-    // (kHPondTile) or an authored `kind: "water"` site on the map. One
-    // authoring surface, like the trees.
-    // Tree vines, hanging moss and trunk ivy USED TO BE TUNED HERE. They were
-    // implicit decoration worldgen drew on top of a tree, which is exactly the
-    // kind of divergence the .svtree bake exists to end: the tuner's Trees tab
-    // is the only tree authoring surface now, so a decoration is either baked
-    // into the atlas or it does not exist. Wall ivy is not tree decoration.
-    // ---- desert / pine highland / alpine ground cover ----
-    // Cacti are per biome since P-E (cover.cacti / cactusChance /
-    // saguaroFraction in assets/biomes/<name>.json, worldmap.h kB_*).
-    // The desert tussock/scrub and pine heath floors are no longer knobs: they
-    // are rows in assets/biomes/desert.json and pine.json (cover.plants),
-    // packed into the worldMap buffer's biome records (worldmap.h, P1).
-    // 1-in-N per column above TREELINE. The sparsest density here on purpose —
-    // the snowline is meant to read as harsh, so this is the one knob that can
-    // undo the intent of the whole alpine band by being made generous.
-    int alpineChance = 40;
-    // Ruin pads: the footprint is flattened to the median of its four corner
-    // tuning_params.def, the apron's own step is what the angle of repose
-    // bounds.
-    int caveThreshold1 = 150, caveThreshold2 = 148;
-    // Cave flora (mushrooms on the shallow band's floor, crystal on the deep
-    // band's floor and ceiling) is per biome since P-E: mushroomChance /
-    // crystalChance on the caves.features rows of assets/biomes/<name>.json.
-    // ---- the authored edit layer (src/sim/worldedit.h) ---------------------
-    // Names assets/worldedits/<editLayer>.svedit, the hand-built patch the
-    // Worldgen tab's voxel view writes. Applied through the MutationQueue to
-    // every chunk worldgen produces, so it survives streaming and composes with
-    // any seed.
-    //
-    // EMPTY BY DEFAULT, and no gate may set it: a layer moves the world hash by
-    // construction (it puts voxels in the world), so a shipped default would
-    // silently re-pin every determinism number in tests/baseline.json.
-    std::string editLayer;
-    // ---- the authored world map (src/sim/worldmap.h) ------------------------
-    // Names assets/worldmap/<mapLayer>/{map.json,map.svmap}: the painted
-    // biome/landform planes and the site table worldgen reads instead of
-    // deriving biome from noise. Unlike editLayer this is NOT optional --
-    // "default" ships, and a missing or unparsable map ABORTS at load rather
-    // than silently generating an all-ocean or all-forest world.
-    std::string mapLayer = "default";
-  } worldgen;
+  } debug;
 
   // Values that failed validation, for the overlay / console. Empty on success.
   std::vector<std::string> warnings;
@@ -3011,13 +2911,6 @@ bool SaveCombatTuning(const std::string& path, const Tuning& t, std::string& err
 // each shader by LoadShader() right after ShaderConstantPrelude(). Shaders
 // reference these names rather than literals.
 std::string TuningWgslBlock(const Tuning& t);
-
-// The `worldgen` group as the engine's own compiled-in defaults, as JSON — what
-// `--dump-tuning-defaults` writes and what the tuner's "Reset terrain" button
-// applies. Emitted from a DEFAULT-CONSTRUCTED Tuning, so the lengths are the
-// authored values LoadTuning would rescale, not already-rescaled ones. See the
-// note over the definition.
-std::string WorldgenDefaultsJson();
 
 // Process-wide current tuning. Read by the shader prelude and by the CPU-side
 // systems; replaced wholesale on reload.

@@ -74,7 +74,7 @@ function readLit(wv, cv){
     say(mats.length > 50, 'materials.json: ' + mats.length + ' materials');
     var tune = null;
     try { tune = JSON.parse(files.tuning); } catch (e) {}
-    say(!!(tune && tune.worldgen), 'tuning.json loaded (worldgen group present)');
+    say(!!(tune && tune.world && !tune.worldgen), 'tuning.json loaded (world group present, no worldgen group: P-G/P-I)');
 
     var toasts = [];
     var host = document.getElementById('host');
@@ -109,8 +109,8 @@ function readLit(wv, cv){
     var E = await import('./editor/environment.js');
     E.attach(hooks);
     var pages = E._pages();
-    say(!!pages.biome && !!pages.trees && !!pages.water && !!pages.caves && !!pages.cover,
-        'five pages mounted: biome, trees, water, caves, cover');
+    say(!!pages.map && !!pages.biome && !!pages.trees && !!pages.water && !pages.caves && !pages.cover,
+        'four pages mounted: map, biome, trees, water (the caves / cover knob pages went with the worldgen group)');
     say(pages.trees.id === 'view-trees' && !pages.trees.classList.contains('view'),
         'trees page is #view-trees WITHOUT class "view" (check_tabs.sh would count it otherwise)');
     E.activate();
@@ -120,7 +120,7 @@ function readLit(wv, cv){
     say(ok, 'sidebar lists ' + biomeBtns.length + ' biomes from /api/models');
     ok = await waitFor(function(){ return !/unsaved biome/.test(nav.textContent); }, 20000);
     say(ok, 'no "(unsaved biome)" placeholder while the first biome is merely loading');
-    say(nav.querySelectorAll('button[data-page]').length >= 8, 'and the four component pages');
+    say(nav.querySelectorAll('button[data-page]').length >= 6, 'and the map + two component pages');
 
     // ---- 3. the biome page --------------------------------------------------------------------------
     // Since the World map page (P3) the tab opens on the map, so the biome
@@ -138,10 +138,11 @@ function readLit(wv, cv){
     say(/valid/.test(valid.textContent), 'forest validates: ' + valid.textContent.slice(0, 80));
     var stackRows = pages.biome.querySelectorAll('.bmstackrow').length;
     say(stackRows >= 10, 'feature stacks built ' + stackRows + ' rows (cover + trees + water + caves)');
-    var band = pages.biome.querySelector('.bmband');
-    say(!!band && band.querySelectorAll('.bmseg').length === 4 && band.querySelectorAll('.bmgrip').length === 0 &&
-        band.classList.contains('bmdead'),
-        'biome band strip: 4 segments, NO grips, greyed as dead (biomeAt reads the painted map)');
+    say(!pages.biome.querySelector('.bmband'), 'no biome band strip: the noise thresholds are gone with the worldgen group (P-G)');
+    var curve = pages.biome.querySelector('canvas.bmcurve');
+    say(!!curve && !curve.parentNode.classList.contains('bmdead'), 'the relief curve canvas is built and live (terrain.curve)');
+    var hillRow = rowOf(pages.biome, 'bm', 'hills \u00d7');
+    say(!!hillRow && !hillRow.classList.contains('bmdead') && !hillRow.querySelector('.bmlivepill'), 'terrain.hill renders live');
     // ---- 3b. honest pages (PLAN_environment_truth P-B) ---------------------------------------------
     // Unread fields render disabled with the package in a pill; live ones do not.
     function rowOf(page, cls, label) {
@@ -150,19 +151,17 @@ function readLit(wv, cv){
       return hit;
     }
     var tileRow = rowOf(pages.biome, 'bm', 'tile (m)'), densRow = rowOf(pages.biome, 'bm', 'density (%)');
-    say(!!tileRow && tileRow.classList.contains('bmdead') && tileRow.querySelector('input').disabled &&
-        /P-D/.test((tileRow.querySelector('.bmlivepill') || {}).textContent || ''),
-        'trees.tile renders disabled with a P-D pill: ' + (tileRow && tileRow.title.split('\n').pop().slice(0, 70)));
+    say(!!tileRow && !tileRow.classList.contains('bmdead') && !tileRow.querySelector('input').disabled,
+        'trees.tile renders live (P-D: one lattice, thinned per biome)');
     say(!!densRow && !densRow.classList.contains('bmdead') && !densRow.querySelector('input').disabled && !densRow.querySelector('.bmlivepill'),
         'trees.density renders live (no pill, enabled)');
     var dstat = null;
     pages.biome.querySelectorAll('.bmderived').forEach(function (d) { if (/trees per hectare/.test(d.textContent)) dstat = dstat || d; });
-    say(!!dstat && /ENGINE tile worldgen\.treeTile = [\d.]+ m/.test(dstat.textContent),
-        'the density stat uses the engine tile: ' + (dstat && dstat.textContent.slice(0, 90)));
+    say(!!dstat && /trees per hectare/.test(dstat.textContent),
+        'the density stat: ' + (dstat && dstat.textContent.slice(0, 90)));
     var covRow = rowOf(pages.biome, 'bm', 'ground flora blocks'), cacRow = rowOf(pages.biome, 'bm', 'cactus 1-in-N');
-    say(!!covRow && !covRow.classList.contains('bmdead') && !!cacRow && cacRow.classList.contains('bmdead') &&
-        /P-E/.test((cacRow.querySelector('.bmlivepill') || {}).textContent || ''),
-        'the packed flags are live rows; cactusChance is a disabled P-E row');
+    say(!!covRow && !covRow.classList.contains('bmdead') && !!cacRow && !cacRow.classList.contains('bmdead'),
+        'the packed flags and cactusChance are live rows');
     say(pages.biome.querySelectorAll('.bmlive-unknown').length === 0, 'no field on the biome page is outside the manifest');
     // A LIVE slider regenerates and coalesces into one undo step (the drag test
     // lived on the water page until every water field became not-read).
@@ -265,18 +264,30 @@ function readLit(wv, cv){
         (weightRow && weightRow.textContent.slice(0, 60)));
     say(!pages.trees.querySelector('.tgrow label[title]') || true, 'ok');
 
-    // ---- 6. the knob pages degrade without tuneRow ----------------------------------------------------------
-    E._open('caves');
-    say(pages.caves.classList.contains('active') && /Caves/.test(pages.caves.textContent), 'caves page shows its intro');
-    E._open('cover');
-    say(pages.cover.classList.contains('active') && /Ground cover/.test(pages.cover.textContent), 'ground cover page shows its intro');
+    // ---- 6. the World map page: the front door (P-I) ----------------------------------------------------------
+    E._open('map');
+    var M = E._modules.WorldMap;
+    ok = await waitFor(function(){ return !!M._map(); }, 30000);
+    say(ok && pages.map.classList.contains('active'), 'map page loaded ' + (M._map() && M._map().name));
+    say(!!pages.map.querySelector('.mapterrain') && pages.map.querySelectorAll('.mapterrain-grid input').length >= 20,
+        'Terrain section built with ' + pages.map.querySelectorAll('.mapterrain-grid input').length + ' inputs');
+    var siteRows = pages.map.querySelectorAll('.mapsite');
+    say(siteRows.length >= 4, 'Sites panel lists ' + siteRows.length + ' sites');
+    var lf = [].slice.call(siteRows).filter(function (r) { return /landform/.test(r.querySelector('.mapkind').textContent); });
+    say(lf.length >= 1, 'a landform site is listed (' + lf.length + ')');
+    if (lf.length) {
+      lf[0].querySelector('button').click();
+      say(M._selected() && M._selected().kind === 'landform' && !!pages.map.querySelector('.mapsites-panel select'),
+          'selecting it opens the shape / radius / height panel');
+    }
+    say(!!pages.map.querySelector('#wgPreviewHost'), 'the preview pane (heightmap + voxels) is adopted under the map');
 
     // ---- 7. hidden tab -> no active page ------------------------------------------------------------------------
     host.classList.remove('active');
     ok = await waitFor(function(){ return !Object.values(pages).some(function (p) { return p.classList.contains('active'); }); }, 5000);
     say(ok, 'deactivating the tab deactivates every page (render loops go quiet)');
     host.classList.add('active');
-    ok = await waitFor(function(){ return pages.cover.classList.contains('active'); }, 5000);
+    ok = await waitFor(function(){ return pages.map.classList.contains('active'); }, 5000);
     say(ok, 'reactivating restores the current page');
 
     // ---- 8. save routes for the two new directories -----------------------------------------------------------
