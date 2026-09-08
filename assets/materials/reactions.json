@@ -68,12 +68,12 @@
       }
     },
     {
-      "note": "foliage is CONSUMED and leaves no ash: a burning canopy should vanish in flame, not decay into thousands of ash voxels raining through the crown. Chances are high because leaves are thin fuel; the burn is bounded by the canopy itself (leaf_burning leaves nothing that grows). ALL FOLIAGE CHANCES WERE CUT 3x on owner report that a crown went up too readily (leaves 225->75->25, needles 380->127, autumn 400->133): a tree should catch and take a while about it rather than flashing over the instant an ember touches it. The RATIOS between the three fuels are preserved -- dry needles and dead autumn leaf still catch several times faster than green leaves, which is the read that makes a pine forest frightening and an oak wood merely flammable. NONE OF THOSE NUMBERS MOVED for the leaf_burning change below and none of them should: they are how fast a crown catches, which the owner has already tuned twice.\n\nWHAT DID CHANGE IS THE PRODUCT. These rules used to read `selfBecomes: fire`, and that is why a lit tree cooked the top of the crown and left the bottom-most layer of leaves alone. `fire` is a GAS that rises with probability 1 in calm air, so a burnt leaf turned itself into the one thing that immediately leaves the neighbourhood: the leaf directly below got exactly one 2.5% roll before its only heat source floated away, and nothing would ever bring heat back down to it. Wood never had this problem because it ignites to `ember`, a stationary tag:hot solid. Foliage now does the same through `leaf_burning`, which is ember-for-leaves: it stands still, cooks all six of its faces for the length of its burn, and decays to air rather than ash. Spread is now a front with a direction-free shape instead of a rising plume."
+      "note": "foliage is CONSUMED and leaves no ash: a burning canopy should vanish in flame, not decay into thousands of ash voxels raining through the crown. Chances are high because leaves are thin fuel; the burn is bounded by the canopy itself (leaf_burning leaves nothing that grows). ALL FOLIAGE CHANCES WERE CUT 3x on owner report that a crown went up too readily (leaves 225->75->25, needles 380->127, autumn 400->133): a tree should catch and take a while about it rather than flashing over the instant an ember touches it. THEN, on 2026-09-08, THE SPREAD BETWEEN THE THREE FUELS WAS DELETED: the owner's report was that only autumn leaves burned like leaves and the other two families barely caught at all, so green leaves went 25 -> 133 and needles 127 -> 133 and every tree-leaf family now catches at autumn's rate. The old ratio was authored as a read -- dry needle and dead leaf catching several times faster than green foliage, a pine forest frightening and an oak wood merely flammable -- and green leaves at a fifth of autumn's chance turned out to be the wrong end of it to have tuned: 25 per-mille per hot face is a crown that smoulders at the ignition point instead of one that burns. If the families are ever to differ again, do it by moving needles and autumn UP from 133, not by moving green leaves back down. These are how fast a crown CATCHES; how far the fire then travels is leaf_burning's decay total below, which is the better lever and did not move.\n\nWHAT DID CHANGE IS THE PRODUCT. These rules used to read `selfBecomes: fire`, and that is why a lit tree cooked the top of the crown and left the bottom-most layer of leaves alone. `fire` is a GAS that rises with probability 1 in calm air, so a burnt leaf turned itself into the one thing that immediately leaves the neighbourhood: the leaf directly below got exactly one 2.5% roll before its only heat source floated away, and nothing would ever bring heat back down to it. Wood never had this problem because it ignites to `ember`, a stationary tag:hot solid. Foliage now does the same through `leaf_burning`, which is ember-for-leaves: it stands still, cooks all six of its faces for the length of its burn, and decays to air rather than ash. Spread is now a front with a direction-free shape instead of a rising plume."
     },
     {
       "self": "leaves",
       "neighbor": "tag:hot",
-      "chance": 25,
+      "chance": 133,
       "selfBecomes": "leaf_burning",
       "neighborChance": {
         "fire": 0.0625
@@ -82,7 +82,7 @@
     {
       "self": "pine_needles",
       "neighbor": "tag:hot",
-      "chance": 127,
+      "chance": 133,
       "selfBecomes": "pine_burning",
       "neighborChance": {
         "fire": 0.0625
@@ -103,7 +103,7 @@
     {
       "self": "leaves_dark",
       "neighbor": "tag:hot",
-      "chance": 25,
+      "chance": 133,
       "selfBecomes": "leaf_burning",
       "neighborChance": {
         "fire": 0.0625
@@ -112,7 +112,7 @@
     {
       "self": "leaves_lit",
       "neighbor": "tag:hot",
-      "chance": 25,
+      "chance": 133,
       "selfBecomes": "leaf_burning",
       "neighborChance": {
         "fire": 0.0625
@@ -121,7 +121,7 @@
     {
       "self": "pine_dark",
       "neighbor": "tag:hot",
-      "chance": 127,
+      "chance": 133,
       "selfBecomes": "pine_burning",
       "neighborChance": {
         "fire": 0.0625
@@ -130,7 +130,7 @@
     {
       "self": "pine_lit",
       "neighbor": "tag:hot",
-      "chance": 127,
+      "chance": 133,
       "selfBecomes": "pine_burning",
       "neighborChance": {
         "fire": 0.0625
@@ -173,7 +173,7 @@
       }
     },
     {
-      "note": "-------- leaf_burning: ember for leaves. Stands still, cooks its neighbours in every direction, leaves nothing --------\nTHE DECAY TOTAL IS THE WHOLE TUNING SURFACE HERE. 80 per-mille is ~12.5 ticks (0.4 s) per leaf voxel, against `fire`'s ~6, and that number is chosen for reach rather than for looks: a green leaf catches at 25 per-mille per hot face, so a neighbour exposed for 12.5 ticks catches with probability 1 - 0.975^12.5 = 27%, and a leaf with four foliage neighbours passes the fire on ~1.1 times before it is spent. Just over unity, which is what a crown that burns through looks like -- and it is bounded the way the file has always bounded foliage, by the fuel being CONSUMED into something that authors no rules, not by the growth factor. Per TICK the growth is 0.09, well inside rule 2.\n\nCut this total and the front stalls out in the interior of a canopy; raise it and a single spark takes the whole forest. It is the one number to reach for if a burning tree feels wrong, and it is a much better lever than the ignition chances above, which the owner has already tuned twice and which control how readily a crown catches at all rather than how far the fire then travels.\n\nNo ash branch AT ALL, deliberately, where cloth and flesh both keep a rare one: a crown is tens of thousands of voxels and even a 0.33 per-mille ash branch would rain a floor of it under every burnt tree. Smoke is the visible residue instead.\n\nDouse first, then emit, then the decays -- the ember ordering, for the ember reason: water must beat the burn to the tick."
+      "note": "-------- leaf_burning: ember for leaves. Stands still, cooks its neighbours in every direction, leaves nothing --------\nTHE DECAY TOTAL IS THE WHOLE TUNING SURFACE HERE. 80 per-mille is ~12.5 ticks (0.4 s) per leaf voxel, against `fire`'s ~6, and that number is chosen for reach rather than for looks: every leaf now catches at 133 per-mille per hot face (2026-09-08; it was 25 for the green family when this paragraph was first written, and the arithmetic below is the reason that number was a problem), so a neighbour exposed for 12.5 ticks catches with probability 1 - 0.867^12.5 = 83%, and a leaf with four foliage neighbours passes the fire on ~3.3 times before it is spent. Comfortably above unity: a crown that catches anywhere burns through everywhere, which is the read the owner asked for. At the old 25 it was ~1.1 -- barely propagating, and a front that marginal dies out against any gap in the canopy, which is exactly what a green tree that would not burn looked like. It is bounded the way this file has always bounded foliage, by the fuel being CONSUMED into something that authors no rules, not by the growth factor. Per TICK the growth is 4 x 0.133 = 0.53, still inside rule 2's subcritical ceiling.\n\nCut this total and the front stalls out in the interior of a canopy; raise it and a single spark takes the whole forest. It is the one number to reach for if a burning tree feels wrong, and it is a much better lever than the ignition chances above, which the owner has already tuned twice and which control how readily a crown catches at all rather than how far the fire then travels.\n\nNo ash branch AT ALL, deliberately, where cloth and flesh both keep a rare one: a crown is tens of thousands of voxels and even a 0.33 per-mille ash branch would rain a floor of it under every burnt tree. Smoke is the visible residue instead.\n\nDouse first, then emit, then the decays -- the ember ordering, for the ember reason: water must beat the burn to the tick."
     },
     {
       "self": "leaf_burning",
