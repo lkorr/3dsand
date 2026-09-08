@@ -1828,7 +1828,9 @@ fn wmSiteTopAt(x : i32, z : i32, seed : u32) -> i32 {
   if (sid == 0u) { return -1048576; }
   let blk = u32(wmSiteI(sid, WM_S_STAMP_OFF));
   if (blk == 0u) { return -1048576; }
-  let padY = landColumnBare(wmSiteI(sid, WM_S_X), wmSiteI(sid, WM_S_Z), seed).h;
+  var padCol : LandCol;
+  landColumnBare(wmSiteI(sid, WM_S_X), wmSiteI(sid, WM_S_Z), seed, &padCol);
+  let padY = padCol.h;
   return padY + 1 + i32(worldMap[blk + WM_STAMP_NY]);
 }
 
@@ -3115,7 +3117,8 @@ fn plantSiteAt(cx : i32, cz : i32, seed : u32, needCover : bool) -> PlantSite {
   ps.h = 0;
   if (siteKeepOut(cx, cz)) { return ps; }
   if (!wmFlag(biomeAt(cx, cz, seed), WM_BF_GROUND_FLORA)) { return ps; }
-  var L = landColumn(cx, cz, seed);
+  var L : LandCol;
+  landColumn(cx, cz, seed, &L);
   ps.h = L.h;
   if (L.h >= treeline() || L.pond >= 0 || L.inRim || L.inPoolFloor) { return ps; }
   if (L.near.onShore && L.near.past < wmWaterI(L.near.wp, WM_W_SHORE_BAND)) { return ps; }
@@ -3248,26 +3251,36 @@ struct LandCol {
 // itself is not a function. Everything the height contract is made of lives
 // here EXCEPT the pad, which is the one override that needs to know about
 // columns other than its own.
-fn landColumnBare(x : i32, z : i32, seed : u32) -> LandCol {
-  var L : LandCol;
-  L.pond = -1;
-  L.pw = vec2<i32>(-1, -1);
-  L.fluid = MAT_AIR;
-  L.fluidTop = -1;
-  L.near.onShore = false; L.near.past = 0; L.near.surf = -1; L.near.wp = 0u;
-  L.wp = 0u;
-  L.bedSolid = false;
-  L.ponds = pondSetNone();
+fn landColumnBare(x : i32, z : i32, seed : u32,
+                  L : ptr<function, LandCol>) {
+  // OUT-PARAMETER, not a return value (PLAN_shader_compile.md package C
+  // item 2). LandCol is ~65 words -- the fourteen column fields plus the
+  // embedded PondSet -- and this function is inlined five to nine times
+  // inside the far entry points alone (farColTop -> landColumn ->
+  // landColumnBare, and again through sitePadAt). Returning it by value
+  // left one full aggregate copy per inline site for the driver's front
+  // end to promote, which is the documented NVIDIA cost. The caller's
+  // `var L : LandCol` is zero-initialised exactly as this local was, so
+  // the early `return` in the lab branch below leaves the same values
+  // behind it did before.
+  (*L).pond = -1;
+  (*L).pw = vec2<i32>(-1, -1);
+  (*L).fluid = MAT_AIR;
+  (*L).fluidTop = -1;
+  (*L).near.onShore = false; (*L).near.past = 0; (*L).near.surf = -1; (*L).near.wp = 0u;
+  (*L).wp = 0u;
+  (*L).bedSolid = false;
+  (*L).ponds = pondSetNone();
   // The fluid lab's flat slab — the same guard genColumn takes below, taken
   // here as well so World::TerrainHeight sees the slab through the contract
   // rather than through a second copy of the constant.
   if (T.labMode != 0u) {
-    L.h = LAB_SLAB_Y;
-    L.slope = 0;
-    L.sed = 0;
-    L.inPoolFloor = true;
-    L.inRim = true;
-    return L;
+    (*L).h = LAB_SLAB_Y;
+    (*L).slope = 0;
+    (*L).sed = 0;
+    (*L).inPoolFloor = true;
+    (*L).inRim = true;
+    return;
   }
   // THE SEDIMENT WEDGE IS DECIDED BEFORE THE HEIGHT IS COMPOSED, which is why
   // the disc tests below run before anything is added to `bed` rather than
@@ -3285,7 +3298,7 @@ fn landColumnBare(x : i32, z : i32, seed : u32) -> LandCol {
   // chunks awake at tick 120 against 7 with the wedge disabled entirely, all of
   // them tarn banks and the rock under them.
   let land = landAt(x, z, seed);
-  L.slope = land.slope;
+  (*L).slope = land.slope;
   let bed = land.h - land.sed;
 
   // ---- authored origin-area set pieces (absolute world coords) ----
@@ -3320,8 +3333,8 @@ fn landColumnBare(x : i32, z : i32, seed : u32) -> LandCol {
   let pdx = x - 420; let pdz = z - 420;
   let pd2 = pdx * pdx + pdz * pdz;
   let pR = vlen(68); let pRim = vlen(80);
-  L.inPoolFloor = pd2 < pR * pR;
-  L.inRim = pd2 < pRim * pRim;
+  (*L).inPoolFloor = pd2 < pR * pR;
+  (*L).inRim = pd2 < pRim * pRim;
 
   // ---- disc ponds, queried before the height is composed ----
   // pondInfo's keep-out list excludes the pool areas, so a disc never overlaps
@@ -3331,35 +3344,35 @@ fn landColumnBare(x : i32, z : i32, seed : u32) -> LandCol {
   // there is nothing outside to be near.
   // The column's pond candidates, scanned ONCE (the only table reads on this
   // path) and handed to the bowl, the shore and, through LandCol, every scan.
-  L.ponds = pondScan(x, z, seed);
-  let pc = pondCover(L.ponds, x, z, seed);
-  L.pw = bowlAt(pc, x, z);
-  if (L.pw.y < 0 && !L.inRim) { L.near = pondNear(L.ponds, x, z, seed); }
-  L.wp = select(L.near.wp, pc.wp, pc.present);
+  (*L).ponds = pondScan(x, z, seed);
+  let pc = pondCover((*L).ponds, x, z, seed);
+  (*L).pw = bowlAt(pc, x, z);
+  if ((*L).pw.y < 0 && !(*L).inRim) { (*L).near = pondNear((*L).ponds, x, z, seed); }
+  (*L).wp = select((*L).near.wp, pc.wp, pc.present);
 
   // ---- the wedge, after everything that has to suppress it ----
   // The pond band ramps rather than switches, over the same width `pondNear`
   // scans for THIS preset, so the wedge thins to nothing as it reaches the
   // water instead of ending in a wall of loose gravel above a bowl of sand.
   var sed = land.sed;
-  if (L.inRim || L.pw.y >= 0) {
+  if ((*L).inRim || (*L).pw.y >= 0) {
     sed = 0;
-  } else if (L.near.onShore) {
-    let band = max(wmWaterI(L.near.wp, WM_W_BAND), 1);
-    sed = (sed * min(L.near.past, band)) / band;
+  } else if ((*L).near.onShore) {
+    let band = max(wmWaterI((*L).near.wp, WM_W_BAND), 1);
+    sed = (sed * min((*L).near.past, band)) / band;
   }
   var h = bed + sed;
 
   if (pd2 < pR * pR) {
     h = poolY;
-    L.fluid = M_WATER; L.fluidTop = poolY + vlen(24);
+    (*L).fluid = M_WATER; (*L).fluidTop = poolY + vlen(24);
   } else if (pd2 < pRim * pRim) {
     h = max(h, poolY + vlen(26));    // containment rim
   }
 
   // ---- carve the bowl inside a disc, raise the berm outside ----
-  if (L.pw.y >= 0) {
-    L.pond = L.pw.y;
+  if ((*L).pw.y >= 0) {
+    (*L).pond = (*L).pw.y;
     // THE BOWL REPLACES THE TERRAIN, it does not merely cut into it, and that
     // is the difference between a bounded bed and an avalanche. As `min(h,
     // floor)` the bowl described the floor only where the natural ground was
@@ -3379,23 +3392,23 @@ fn landColumnBare(x : i32, z : i32, seed : u32) -> LandCol {
     // On sloping ground this fills the downhill half as well as cutting the
     // uphill one, which is what a dammed tarn IS; pondInfo's radius-aware gate
     // above is what keeps the fill from becoming a wall.
-    h = L.pw.x;
+    h = (*L).pw.x;
     // The fill is the preset's (water, lava, or none for a dry playa), and
     // the bed is a powder only where the face can hold it (bowlSteep).
     let fill = wmWater(pc.wp, WM_W_FILL);
-    if (L.fluidTop < 0 && fill != 0u) { L.fluid = fill; L.fluidTop = L.pw.y; }
-    L.bedSolid = bowlSteep(pc, x, z);
-  } else if (!L.inRim && L.near.onShore &&
-             L.near.past < wmWaterI(L.near.wp, WM_W_BERM_W)) {
-    h = bermLift(L.near.wp, h, L.near.surf, L.near.past);
+    if ((*L).fluidTop < 0 && fill != 0u) { (*L).fluid = fill; (*L).fluidTop = (*L).pw.y; }
+    (*L).bedSolid = bowlSteep(pc, x, z);
+  } else if (!(*L).inRim && (*L).near.onShore &&
+             (*L).near.past < wmWaterI((*L).near.wp, WM_W_BERM_W)) {
+    h = bermLift((*L).near.wp, h, (*L).near.surf, (*L).near.past);
   }
   // THE SEA (P4): ground under the map's sea level is under water. One
   // global plane (RESEARCH_worldgen 6.5's option (a)), which is what lets
   // the ocean ring past the painted map be water without a tile scheme.
-  if (h < seaLevelY() && L.fluidTop < 0) { L.fluid = M_WATER; L.fluidTop = seaLevelY(); }
-  L.h = h;
-  L.sed = sed;
-  return L;
+  if (h < seaLevelY() && (*L).fluidTop < 0) { (*L).fluid = M_WATER; (*L).fluidTop = seaLevelY(); }
+  (*L).h = h;
+  (*L).sed = sed;
+  return;
 }
 
 
@@ -3418,21 +3431,24 @@ fn sitePadAt(x : i32, z : i32, h : i32, seed : u32) -> i32 {
   let margin = max(wmSiteI(sid, WM_S_PAD_MARGIN), 1);
   let d = max(max(abs(x - sx), abs(z - sz)) - r, 0);
   if (d >= margin) { return h; }
-  let padY = landColumnBare(sx, sz, seed).h;
+  var padCol : LandCol;
+  landColumnBare(sx, sz, seed, &padCol);
+  let padY = padCol.h;
   let w = ((margin - d) * 256) / margin;
   return h + (((padY - h) * w) >> 8);
 }
 
-fn landColumn(x : i32, z : i32, seed : u32) -> LandCol {
-  var L = landColumnBare(x, z, seed);
-  let hp = sitePadAt(x, z, L.h, seed);
-  if (hp != L.h) {
+fn landColumn(x : i32, z : i32, seed : u32,
+              L : ptr<function, LandCol>) {
+  landColumnBare(x, z, seed, L);
+  let hp = sitePadAt(x, z, (*L).h, seed);
+  if (hp != (*L).h) {
     // Cut-and-fill under a building: the loose wedge goes with it, for the
     // reason the pond-bank block gives (powder under a stone floor creeps).
-    L.h = hp;
-    L.sed = 0;
+    (*L).h = hp;
+    (*L).sed = 0;
   }
-  return L;
+  return;
 }
 // MIRROR-END landheight
 
@@ -3440,7 +3456,9 @@ fn landColumn(x : i32, z : i32, seed : u32) -> LandCol {
 // rest of the struct); this is the entry point for anything that only wants the
 // ground — and it is what World::TerrainHeight mirrors.
 fn colHeightAt(x : i32, z : i32, seed : u32) -> i32 {
-  return landColumn(x, z, seed).h;
+  var L : LandCol;
+  landColumn(x, z, seed, &L);
+  return L.h;
 }
 
 fn genColumn(x : i32, z : i32, seed : u32) -> Col {
@@ -3481,7 +3499,8 @@ fn genColumn(x : i32, z : i32, seed : u32) -> Col {
   // THE GROUND, and everything derived from it, in one call. This is the same
   // `h` World::TerrainHeight returns — that equality is the whole point of the
   // split (see the height contract above landColumn).
-  let L = landColumn(x, z, seed);
+  var L : LandCol;
+  landColumn(x, z, seed, &L);
   let h = L.h;
   let biome = biomeAt(x, z, seed);
 
@@ -3567,24 +3586,33 @@ fn genColumn(x : i32, z : i32, seed : u32) -> Col {
 // seed with no fallback spelling at all, so every caller passes the same two
 // numbers and the only question is how often it bothered to compute them. See
 // the Poi struct.
-fn genCellIn(col : Col,
+// `col` BY POINTER, not by value (PLAN_shader_compile.md package C item 2).
+// Col is ~20 words with two nested structs, and this function is inlined into
+// every worldgen entry point — the whole-window sweep, the streamed list, the
+// far sieve's 16x4 cell loop. NVIDIA's front end charges for the per-call
+// aggregate copy an inlined by-value parameter leaves behind (the same
+// pathology the pond scans were restructured for, and the same reason `cave`,
+// `trees` and `ponds` above are already pointers). The body destructures into
+// scalars on the first twelve lines either way, so nothing downstream of here
+// changes shape and the values are identical.
+fn genCellIn(col : ptr<function, Col>,
              cave : ptr<function, CaveBands>, caveValid : bool,
              trees : ptr<function, TreeCands>, treeValid : bool,
              ponds : ptr<function, PondSet>,
              canopyMemo : i32,
              x : i32, y : i32, z : i32, seed : u32) -> u32 {
-  let h = col.h;
-  let sed = col.sed;
-  let biome = col.biome;
-  let pond = col.pond;
-  let pw = col.pw;
-  let fluid = col.fluid;
-  let fluidTop = col.fluidTop;
-  let inPoolFloor = col.inPoolFloor;
-  let inRim = col.inRim;
-  let shore = col.shore;
-  let wp = col.wp;               // the preset this column's pond or shore wears (P-F)
-  let bedSolid = col.bedSolid;
+  let h = (*col).h;
+  let sed = (*col).sed;
+  let biome = (*col).biome;
+  let pond = (*col).pond;
+  let pw = (*col).pw;
+  let fluid = (*col).fluid;
+  let fluidTop = (*col).fluidTop;
+  let inPoolFloor = (*col).inPoolFloor;
+  let inRim = (*col).inRim;
+  let shore = (*col).shore;
+  let wp = (*col).wp;            // the preset this column's pond or shore wears (P-F)
+  let bedSolid = (*col).bedSolid;
   var mat = MAT_AIR;
 
   if (y <= h) {
@@ -3883,9 +3911,9 @@ fn genCellIn(col : Col,
     }
   }
 
-  if (mat == MAT_AIR && col.plant.mat != MAT_AIR && y > col.plant.base &&
-      y <= col.plant.top) {
-    mat = col.plant.mat;
+  if (mat == MAT_AIR && (*col).plant.mat != MAT_AIR && y > (*col).plant.base &&
+      y <= (*col).plant.top) {
+    mat = (*col).plant.mat;
   }
 
 
@@ -3981,7 +4009,7 @@ fn genCellIn(col : Col,
       if (minY >= 0 && h < minY) { continue; }
       if (maxY >= 0 && h > maxY) { continue; }
       let rSlope = i32(wmCover(biome, i, WM_C_MAX_SLOPE));
-      if (rSlope > 0 && rSlope < 1024 && col.slope > rSlope) { continue; }
+      if (rSlope > 0 && rSlope < 1024 && (*col).slope > rSlope) { continue; }
       let nwMax = bitcast<i32>(wmCover(biome, i, WM_C_NEAR_WATER_MAX));
       let nwMin = i32(wmCover(biome, i, WM_C_NEAR_WATER_MIN));
       if (nwMax >= 0 || nwMin > 0) {
@@ -4047,7 +4075,9 @@ fn genCellIn(col : Col,
   {
     let sid = wmSiteAt(x, z);
     if (sid != 0u && y > h - 2) {
-      let padY = landColumnBare(wmSiteI(sid, WM_S_X), wmSiteI(sid, WM_S_Z), seed).h;
+      var padCol : LandCol;
+      landColumnBare(wmSiteI(sid, WM_S_X), wmSiteI(sid, WM_S_Z), seed, &padCol);
+      let padY = padCol.h;
       let sm = wmStampCell(sid, x, y, z, padY);
       if (sm != MAT_AIR) { mat = sm; }
     }
@@ -4077,7 +4107,8 @@ fn genCell(c : vec3<i32>, seed : u32) -> u32 {
   var cave : CaveBands;
   var trees : TreeCands;
   var ponds = pondScan(c.x, c.z, seed);
-  return genCellIn(genColumn(c.x, c.z, seed), &cave, false, &trees, false, &ponds,
+  var col = genColumn(c.x, c.z, seed);
+  return genCellIn(&col, &cave, false, &trees, false, &ponds,
                    -1, c.x, c.y, c.z, seed);
 }
 
@@ -4089,7 +4120,7 @@ fn genCell(c : vec3<i32>, seed : u32) -> u32 {
 // is column-major over a level chunk and the anchors are constant over the
 // whole DISPATCH, so the kernel builds them once. A caller with nothing to
 // amortize over passes `poiAnchors(seed)` and is exactly where it was.
-fn genCellCol(col : Col, c : vec3<i32>, seed : u32) -> u32 {
+fn genCellCol(col : ptr<function, Col>, c : vec3<i32>, seed : u32) -> u32 {
   var cave : CaveBands;
   var trees : TreeCands;
   var ponds = pondScan(c.x, c.z, seed);
@@ -4162,11 +4193,11 @@ fn treeCanopyAt(x : i32, z : i32, seed : u32, ponds : ptr<function, PondSet>) ->
 // boundaries (the invariant the `far downsample` selftest gate protects). `col`
 // must be genColumn at (fine.x, fine.z) — that shared requirement is what keeps
 // the sieve and the downsample on one code path now that surfHeightAt is gone.
-fn farSurfaceMat(col : Col, mat : u32, fine : vec3<i32>, shift : u32,
+fn farSurfaceMat(col : ptr<function, Col>, mat : u32, fine : vec3<i32>, shift : u32,
                  seed : u32) -> u32 {
   let k = materials[mat].klass;
   if (k != CLASS_SOLID && k != CLASS_POWDER) { return mat; }  // fluids keep their ID
-  var h = col.h;
+  var h = (*col).h;
   // "Topmost solid cell of this column": solid means center <= h, and the cell
   // above (center + 2^shift) samples past h. NOT "cell span contains h" — when
   // h lands in a cell's lower half that cell's center samples air (the cell is
@@ -4256,7 +4287,8 @@ fn farColTopFrom(h : i32, fluidTop : i32, x : i32, z : i32, seed : u32) -> i32 {
 // `genColumn`: the top needs the height contract and the ruin pad and nothing
 // else, and the biome/shore/undergrowth half of a Col is pure cost here.
 fn farColTop(x : i32, z : i32, seed : u32) -> i32 {
-  let L = landColumn(x, z, seed);
+  var L : LandCol;
+  landColumn(x, z, seed, &L);
   return farColTopFrom(L.h, L.fluidTop, x, z, seed);
 }
 
@@ -4375,7 +4407,7 @@ fn genChunk(slot : u32, li : u32, actIdx : u32) {
     let lz = ci / CHUNK;
     let wx = base.x + i32(lx);
     let wz = base.z + i32(lz);
-    let col = genColumn(wx, wz, T.seed);
+    var col = genColumn(wx, wz, T.seed);
     // The column's pond candidates, ONCE, by pointer into the scans (like
     // `trees`): the tree/cactus scans and the near-water conditions read it
     // per candidate as arithmetic, never as table reads.
@@ -4498,7 +4530,7 @@ fn genChunk(slot : u32, li : u32, actIdx : u32) {
     }
     for (var ly = unrollFenceU(); ly < CHUNK; ly += 1u) {
       let i = lx + ly * CHUNK + lz * CHUNK * CHUNK;
-      let w = genCellIn(col, &cave, caveValid, &trees, true, &ponds, canopy,
+      let w = genCellIn(&col, &cave, caveValid, &trees, true, &ponds, canopy,
                         wx, base.y + i32(ly), wz, T.seed);
       // Chunk-linear: the slot's page resolved once, per §2.1's second entry
       // point. genChunk overwrites the WHOLE chunk, so the CPU materializes
@@ -4704,17 +4736,19 @@ fn pagefill(@builtin(workgroup_id) wg : vec3<u32>,
 @group(1) @binding(4) var<storage, read> farDirty : array<u32>;
 // Cascade EDIT PATCHES (world.h kFarPatch*, src/sim/faredits.h). Header pairs
 // (payload offset, count) indexed by DISPATCH entry, then the payload:
-// (mat << 12) | cellIndexInLevelChunk. See the patch block in `far`.
+// (mat << 12) | cellIndexInLevelChunk. Read by the `farpatch` entry below.
 @group(1) @binding(5) var<storage, read> farPatch : array<u32>;
 
 var<workgroup> wgFarCount : atomic<u32>;
-// Non-air cells contributed by the patch pass. Kept apart from wgFarCount
-// because the two are answers to different questions and only their SUM is
-// safe to publish (see the farOcc note at the bottom of `far`).
+// Non-air cells contributed by the patch pass (`farpatch`). Kept apart from
+// wgFarCount because the two are answers to different questions and only their
+// SUM is safe to publish (see the farOcc note at the bottom of `farpatch`).
 var<workgroup> wgFarPatchNZ : atomic<u32>;
-// One plus the chunk-local row of the highest non-empty cell, sweep and patch
-// together (common.wgsl FAR_OCC_TOP_SHIFT: the far readers skip the air above
-// it). 0 when the chunk is empty.
+// One plus the chunk-local row of the highest non-empty cell. Both entries use
+// it — `far` for its sweep, `farpatch` for its own cells — and each initialises
+// it for itself, because they are separate dispatches and workgroup memory does
+// not survive one (common.wgsl FAR_OCC_TOP_SHIFT: the far readers skip the air
+// above it). 0 when the chunk is empty.
 var<workgroup> wgFarTop : atomic<u32>;
 
 @compute @workgroup_size(64)
@@ -4723,7 +4757,6 @@ fn far(@builtin(workgroup_id) wg : vec3<u32>,
   if (wg.x >= T.farCount) { return; }
   if (li == 0u) {
     atomicStore(&wgFarCount, 0u);
-    atomicStore(&wgFarPatchNZ, 0u);
     atomicStore(&wgFarTop, 0u);
   }
   workgroupBarrier();
@@ -4810,8 +4843,8 @@ fn far(@builtin(workgroup_id) wg : vec3<u32>,
       let cc = base + vec3<i32>(i32(x0 + b), i32(yi), i32(zi));
       // the sieve: fine-voxel center of the 2^shift-wide region this cell covers
       let fine = (cc << vec3<u32>(shift)) + vec3<i32>(1 << (shift - 1u));
-      let col = cols[b];
-      let mat = genCellCol(col, fine, T.seed) & 0xFFFu;
+      var col = cols[b];
+      let mat = genCellCol(&col, fine, T.seed) & 0xFFFu;
       // The conservative flag first: it is what a cell keeps when the centre
       // sample found nothing (common.wgsl FAR_BLOCKER_BIT). This is
       // farBlockerBitAt flattened onto the hoisted `tops`/`btops` — see the
@@ -4825,7 +4858,7 @@ fn far(@builtin(workgroup_id) wg : vec3<u32>,
       }
       if (farCellIsSolid(mat)) {
         // shape from the center sample, color from the surface skin (phase 4)
-        byteV |= min(farSurfaceMat(col, mat, fine, shift, T.seed), FAR_MAT_MASK);
+        byteV |= min(farSurfaceMat(&col, mat, fine, shift, T.seed), FAR_MAT_MASK);
       }
       // farOcc counts NON-EMPTY cells, which now includes blocker-only ones —
       // it gates empty-space skipping for every far reader, and a reader that
@@ -4834,7 +4867,7 @@ fn far(@builtin(workgroup_id) wg : vec3<u32>,
       word |= byteV << (b * 8u);
     }
     // The cell index in this level chunk is x + y*CHUNK + z*CHUNK*CHUNK (see the
-    // patch loop's unpack below), so in words of four x-consecutive cells that
+    // `farpatch` entry's unpack), so in words of four x-consecutive cells that
     // is x/4 + y*(CHUNK/4) + z*(CHUNK*CHUNK/4). x0 is a multiple of 4, so byte
     // `b` of the word is cell x0+b and the packing above is the same one the
     // flat form used.
@@ -4844,34 +4877,79 @@ fn far(@builtin(workgroup_id) wg : vec3<u32>,
   }
   atomicAdd(&wgFarCount, count);
   atomicMax(&wgFarTop, top);
-  // ---- THE EDIT PATCH (far-field edit persistence) ---------------------
-  //
-  // The sweep above is PRISTINE PROCGEN, and that is the whole problem this
-  // block exists to fix: `fardown` writes the player's edits into these same
-  // cells from the live grid, and every refill of this level chunk — an
-  // incoming plane after the player walked out and back, a teleport, a world
-  // load — used to erase them. FarField::PrepareTick now hands each fill entry
-  // the cells its CPU-side index (src/sim/faredits.h) knows were edited, taken
-  // from the persisted chunk store, and they are re-applied here.
-  //
-  // SAME RULE, SAME FUNCTION. The patch carries only the RAW MATERIAL at the
-  // cell's sample voxel; the surface-skin recolor is `farSurfaceMat`, exactly
-  // as in the sweep above and in `fardown`. That is what makes a patched cell
-  // byte-identical to what the live downsample would have written, so a region
-  // that flips between "resident and downsampled" and "refilled and patched"
-  // does not change appearance, and the sieve/downsample boundary agreement
-  // the `far-downsample` gate protects still holds.
-  //
-  // The barrier is UNCONDITIONAL and sits outside the loop: the sweep's
-  // whole-word atomicStores must land before the byte-granular read-modify-
-  // writes below, and a control barrier may not sit in non-uniform control
-  // flow (the counts come from a storage buffer, so a guarded barrier would
-  // fail WGSL's uniformity analysis).
-  //
-  // No cross-workgroup race, unlike `fardown`: a farVox word packs 4 cells
-  // that are consecutive in x WITHIN this level chunk, so every byte of every
-  // word this workgroup touches belongs to this workgroup alone.
-  storageBarrier();
+  workgroupBarrier();
+  if (li == 0u) {
+    // farOcc only ever gates EMPTY-SPACE SKIPPING, so it must never be too
+    // small and may be too large: an over-count costs one marched level chunk,
+    // an under-count hides real terrain (the same conservative direction
+    // `fardown`'s atomicMax takes).
+    // The top row rides the same word (common.wgsl FAR_OCC_TOP_SHIFT).
+    // `farpatch` below folds its own contribution into BOTH halves of this
+    // word afterwards, in the same conservative direction.
+    atomicStore(&farOcc[(level - 1u) * FAR_NUM_CHUNKS + slot],
+                farOccPack(min(atomicLoad(&wgFarCount), CHUNK_VOL),
+                           atomicLoad(&wgFarTop)));
+  }
+}
+
+// ---- THE EDIT PATCH (far-field edit persistence) ---------------------------
+//
+// The sweep above is PRISTINE PROCGEN, and that is the whole problem this
+// entry exists to fix: `fardown` writes the player's edits into these same
+// cells from the live grid, and every refill of this level chunk — an
+// incoming plane after the player walked out and back, a teleport, a world
+// load — used to erase them. FarField::PrepareTick hands each fill entry the
+// cells its CPU-side index (src/sim/faredits.h) knows were edited, taken from
+// the persisted chunk store, and they are re-applied here.
+//
+// SAME RULE, SAME FUNCTION. The patch carries only the RAW MATERIAL at the
+// cell's sample voxel; the surface-skin recolor is `farSurfaceMat`, exactly as
+// in the sweep above and in `fardown`. That is what makes a patched cell
+// byte-identical to what the live downsample would have written, so a region
+// that flips between "resident and downsampled" and "refilled and patched"
+// does not change appearance, and the sieve/downsample boundary agreement the
+// `far-downsample` gate protects still holds.
+//
+// WHY IT IS ITS OWN ENTRY POINT (PLAN_shader_compile.md package C item 1).
+// This block used to sit at the bottom of `far`, after a storageBarrier. It
+// carries a SECOND full genColumn inline copy and — through farBlockerBitAt —
+// four more farColTop/landColumn copies that the sweep's hoisted `tops`/
+// `btops` form does not have. NVIDIA's front end charges superlinearly in
+// entry-point size, so the two halves in one entry cost far more than the two
+// halves apart, and Package A's PipelineBuildPool compiles separate entries in
+// PARALLEL: the wall clock becomes max(sweep, patch) instead of one bigger
+// whole. The barrier that used to be the in-kernel storageBarrier is now the
+// pass table's edge between the two PT_FARFILL rows (src/sim/pass_table.def) —
+// same hazard, same direction, generated rather than hand-written.
+//
+// SAME DISPATCH SHAPE as the sweep: one workgroup per farList entry, so
+// `wg.x` indexes farPatch's header pairs exactly as it did inside `far`.
+// An entry with no patched cells does no work and rewrites its farOcc word
+// with the identical value (pnz = 0, top = 0 fold to the identity below) —
+// there is deliberately no early return on `pCnt`, because it comes from a
+// storage buffer and a barrier under it would fail WGSL's uniformity analysis.
+//
+// No cross-workgroup race, unlike `fardown`: a farVox word packs 4 cells that
+// are consecutive in x WITHIN this level chunk, so every byte of every word
+// this workgroup touches belongs to this workgroup alone.
+@compute @workgroup_size(64)
+fn farpatch(@builtin(workgroup_id) wg : vec3<u32>,
+            @builtin(local_invocation_index) li : u32) {
+  if (wg.x >= T.farCount) { return; }
+  if (li == 0u) {
+    atomicStore(&wgFarPatchNZ, 0u);
+    atomicStore(&wgFarTop, 0u);
+  }
+  workgroupBarrier();
+
+  let packed = farList[wg.x];
+  let level = (packed >> FAR_SLOT_SHIFT) + 1u;   // 1-based
+  let slot = packed & FAR_SLOT_MASK;
+  let sc = vec3<i32>(vec3<u32>(slot % FAR_NCHUNK, (slot / FAR_NCHUNK) % FAR_NCHUNK,
+                               slot / (FAR_NCHUNK * FAR_NCHUNK)));
+  let base = farSlotToChunk(sc, F.origins[level - 1u].xyz) * i32(CHUNK);
+  let shift = farCellShift(level);
+
   let pOff = farPatch[wg.x * 2u];
   let pCnt = farPatch[wg.x * 2u + 1u];
   var pnz = 0u;
@@ -4884,17 +4962,17 @@ fn far(@builtin(workgroup_id) wg : vec3<u32>,
     let pcc = base + pl;
     let pfine = (pcc << vec3<u32>(shift)) + vec3<i32>(1 << (shift - 1u));
     // Its own genColumn: a patch cell is an arbitrary cell of this level
-    // chunk, so it shares no column with the thread's four. Patches are rare
+    // chunk, so it shares no column with the sweep's four. Patches are rare
     // (only cells the player edited), so this is the one place in the kernel
-    // that still pays a column per cell — and now it pays it unconditionally,
+    // that still pays a column per cell — and it pays it unconditionally,
     // because the blocker flag is a property of the TERRAIN under the patch
     // and has to survive a patch that clears the cell's material.
-    let pcol = genColumn(pfine.x, pfine.z, T.seed);
+    var pcol = genColumn(pfine.x, pfine.z, T.seed);
     var byteV = farBlockerBitAt(
         farColTopFrom(pcol.h, pcol.fluidTop, pfine.x, pfine.z, T.seed),
         pcc, shift, T.seed);
     if (farCellIsSolid(pmat)) {
-      byteV |= min(farSurfaceMat(pcol, pmat, pfine, shift, T.seed), FAR_MAT_MASK);
+      byteV |= min(farSurfaceMat(&pcol, pmat, pfine, shift, T.seed), FAR_MAT_MASK);
     }
     if (byteV != 0u) { pnz += 1u; atomicMax(&wgFarTop, u32(pl.y) + 1u); }
     let bi = (level - 1u) * FAR_VOX + slot * CHUNK_VOL + ci;
@@ -4905,19 +4983,19 @@ fn far(@builtin(workgroup_id) wg : vec3<u32>,
   atomicAdd(&wgFarPatchNZ, pnz);
   workgroupBarrier();
   if (li == 0u) {
-    // farOcc only ever gates EMPTY-SPACE SKIPPING, so it must never be too
-    // small and may be too large: an over-count costs one marched level chunk,
-    // an under-count hides real terrain (the same conservative direction
-    // `fardown`'s atomicMax takes). The sum double-counts a patched cell that
-    // was already non-air in the sweep and ignores a patch that cleared one —
-    // both land on the safe side.
-    // The top row rides the same word (common.wgsl FAR_OCC_TOP_SHIFT); it
-    // is the max over the sweep and the patch, so it is conservative-high in
-    // exactly the way the count is.
-    atomicStore(&farOcc[(level - 1u) * FAR_NUM_CHUNKS + slot],
-                farOccPack(min(atomicLoad(&wgFarCount) + atomicLoad(&wgFarPatchNZ),
+    // The SAME publication `far` used to do at the bottom of the merged entry,
+    // read-modify-written instead of composed in registers: the sweep's word is
+    // already in farOcc and only this workgroup ever touches this slot, in
+    // either dispatch. The sum double-counts a patched cell that was already
+    // non-air in the sweep and ignores a patch that cleared one — both land on
+    // the safe (over-count) side, which is the only direction farOcc may err.
+    // With pCnt == 0 this is the exact identity on the stored word.
+    let oi = (level - 1u) * FAR_NUM_CHUNKS + slot;
+    let cur = atomicLoad(&farOcc[oi]);
+    atomicStore(&farOcc[oi],
+                farOccPack(min((cur & 0xFFFFu) + atomicLoad(&wgFarPatchNZ),
                                CHUNK_VOL),
-                           atomicLoad(&wgFarTop)));
+                           max(farOccTop(cur), atomicLoad(&wgFarTop))));
   }
 }
 
@@ -5007,7 +5085,7 @@ fn fardown(@builtin(workgroup_id) wg : vec3<u32>,
       // two, so a cell pays ONE genColumn instead of one for the flag and
       // another for the skin. That makes an air cell dearer than it was (it
       // used to pay none) and a solid cell exactly as dear as it was.
-      let pcol = genColumn(fine.x, fine.z, T.seed);
+      var pcol = genColumn(fine.x, fine.z, T.seed);
       var byteV = farBlockerBitAt(
           farColTopFrom(pcol.h, pcol.fluidTop, fine.x, fine.z, T.seed),
           cc, shift, T.seed);
@@ -5025,7 +5103,7 @@ fn fardown(@builtin(workgroup_id) wg : vec3<u32>,
         // a downsampled chunk byte-identical to a refilled one at their shared
         // boundary, and it is why farSurfaceMat takes the column rather than
         // deriving a height of its own (surfHeightAt used to, and drifted).
-        byteV |= min(farSurfaceMat(pcol, mat, fine, shift, T.seed), FAR_MAT_MASK);
+        byteV |= min(farSurfaceMat(&pcol, mat, fine, shift, T.seed), FAR_MAT_MASK);
       }
       let bi = farVoxByteIndex(level, cc);
       let bsh = (bi & 3u) * 8u;

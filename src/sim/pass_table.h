@@ -220,7 +220,12 @@ enum class Pipe : uint8_t {
   WaterQuiet, WaterLedger, WaterReduce, WaterShave, WaterDrain, WaterHole,
   // M5: the scheduled container sweep and its split labelling.
   WaterSweep, WaterSplit,
-  FarFill, FarDown,
+  // The far-fill sieve and the edit-patch half it was split into
+  // (docs/PLAN_shader_compile.md package C item 1: worldgen.wgsl `far` and
+  // `farpatch`). Two pipelines, two rows on PT_FARFILL, recorded back to back
+  // — the pass table's edge between them is the storageBarrier that used to
+  // sit inside the merged entry.
+  FarFill, FarPatchFill, FarDown,
   // The openness grid (sim_openness.wgsl). Two entry points: the dirty walk
   // (indirect on the compacted dirty list, exactly like occupancyDirty) and the
   // rolling refresh. BEFORE ShadowPrepare so the pipeline-copy loop's bound in

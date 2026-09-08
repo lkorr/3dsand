@@ -646,7 +646,27 @@ PASS(ho_occupancyFull, "occupancyFull(hashOnly)", PT_HASHONLY, PIPE_OCCUPANCY, K
 // transfer->compute RAW is as load-bearing as farList's: the header pairs are
 // indexed by dispatch entry and a stale one points the patch loop at another
 // entry's payload.
+// TWO ROWS, ONE DISPATCH SHAPE (docs/PLAN_shader_compile.md package C item 1).
+// worldgen.wgsl's `far` was split into the pristine SWEEP and the edit-PATCH
+// loop, because the driver's compile cost is superlinear in entry-point size
+// and the two halves compile in parallel. They are recorded back to back over
+// the same D_FARCOUNT extent, so `wg.x` still indexes farPatch's header pairs.
+//
+// THE EDGE BETWEEN THEM IS LOAD-BEARING and is the whole reason the split is
+// safe: the sweep's whole-word atomicStores into farVox must land before the
+// patch's byte-granular atomicAnd/atomicOr read-modify-writes, and the patch's
+// farOcc update reads the word the sweep just wrote. Inside the merged entry
+// that was a hand-written storageBarrier; here both rows declare A(FarVox)
+// A(FarOcc) and the recorder generates it (barrier_graph §3.8).
 PASS(farFill, "farFill", PT_FARFILL, PIPE_FAR_FILL, K_COMPUTE, D_FARCOUNT,1,1,
+     GRP_SLIM_FAR, DYN_NONE, C_FARCOUNT, 1,
+     USES(R(Materials) U(TickUBO) R(FarList) U(FarUBO)
+          A(FarVox) A(FarOcc) R(TreeAtlas) R(WorldMap)))
+// R(FarPatch) lives on THIS row now, not on the sweep: the sweep no longer
+// reads the patch buffer at all, and a read declared where it does not happen
+// is the spurious-barrier direction the checker warns about.
+PASS(farPatchFill, "farPatchFill", PT_FARFILL, PIPE_FAR_PATCH_FILL, K_COMPUTE,
+     D_FARCOUNT,1,1,
      GRP_SLIM_FAR, DYN_NONE, C_FARCOUNT, 1,
      USES(R(Materials) U(TickUBO) R(FarList) U(FarUBO) R(FarPatch)
           A(FarVox) A(FarOcc) R(TreeAtlas) R(WorldMap)))
@@ -843,6 +863,11 @@ PASS(fluidGridUp, "fluid(substep)", PT_FLUID, PIPE_FLUID_GRIDUP, K_INDIRECT, IND
 // there costs sync and nothing else) and under-declaring is a silent
 // cross-vendor desync, which is why all four go in as read rather than being
 // argued down one at a time.
+//
+// Found TWICE, independently, on two branches the same day (package C's copy of
+// the checker fix scraped the same four out of the same row) — which is the
+// strongest available evidence that the finding is the checker's and not one
+// author's reading.
 PASS(fluidG2p, "fluid(substep)", PT_FLUID, PIPE_FLUID_G2P, K_INDIRECT, IND_FLUIDPARGS,0,0, GRP_SLIM_FLUID, DYN_NONE, C_ALWAYS, 1,
      USES(U(TickUBO) RW(FluidParticlesWrite) R(FluidBlockMap) RW(FluidGrid)
           W(ParticlesWrite) A(ParticleCounts) A(FluidArgsStage)

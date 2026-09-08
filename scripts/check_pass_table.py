@@ -105,6 +105,8 @@ PIPE_TO_MEMBER = {
     "PIPE_P_ARGS2": "pArgs2_",
     "PIPE_P_RESOLVE": "pResolve_",
     "PIPE_FAR_FILL": "farFill_",
+    # The edit-patch half `far` was split into (PLAN_shader_compile package C).
+    "PIPE_FAR_PATCH_FILL": "farPatchFill_",
     "PIPE_FAR_DOWN": "farDown_",
     "PIPE_OPENNESS_DIRTY": "opennessDirty_",
     "PIPE_OPENNESS_REFRESH": "opennessRefresh_",
@@ -358,30 +360,57 @@ def parse_pipeline_entries():
     scrape any pipeline mapping" — i.e. the whole barrier check was dark, and
     the failure looked like a broken regex rather than a missing barrier, which
     is exactly the way a safety net stops being one. Match both.
+
+    AND BOTH SHAPES OF THE SECOND. Package A moved the far set off the boot
+    thread, so those calls do not assign a `member_` at all:
+
+        r.fill = MakeComputePipeline(dev, layout, module, "far", "farFill");
+
+    — a background lambda filling a `FarPipelines` struct from lambda-local
+    copies of the layout and the module, published later by
+    PublishFarPipelines. FAR_FIELD maps the struct's fields onto the members
+    they are published to, and the DEBUG LABEL pass below is the general
+    fallback for any other call whose result does not land in a `member_`.
     """
     txt = read(SIM)
     mods = {}   # module variable -> shader file name
     for m in re.finditer(r"(\w+)\s*=\s*mod\(\s*\"([\w.]+\.wgsl)\"\s*\)", txt):
         mods[m.group(1)] = m.group(2)
-    for m in re.finditer(r"mod\(\s*&(\w+)\s*,\s*\"([\w.]+\.wgsl)\"\s*\)", txt):
+    for m in re.finditer(r"\bmod\(\s*&(\w+)\s*,\s*\"([\w.]+\.wgsl)\"\s*\)", txt):
         mods[m.group(1)] = m.group(2)
     # One level of ALIASING, for the deferred far build: it copies the module
     # into a `const rhi::ShaderModule module = mWorldgen;` local so the compile
     # thread captures a handle it owns, and the MakeComputePipeline calls name
     # that local. Declared-type-anchored so this cannot match an arbitrary
     # assignment.
-    for m in re.finditer(r"rhi::ShaderModule\s+(\w+)\s*=\s*(\w+)\s*;", txt):
+    for m in re.finditer(r"\brhi::ShaderModule\s+(\w+)\s*=\s*(\w+)\s*;", txt):
         if m.group(2) in mods:
             mods[m.group(1)] = mods[m.group(2)]
+    # ...and the same one level for the LAYOUT (`const rhi::PipelineLayout
+    # layout = farPL_;`). Without it the far rows resolve to the lambda-local
+    # name, LAYOUT_BINDINGS has no entry for it, and the "can this layout even
+    # bind what the kernel uses" check below silently skips those rows — a
+    # check that passes by not running.
+    layout_alias = {}
+    for m in re.finditer(r"\brhi::PipelineLayout\s+(\w+)\s*=\s*(\w+_)\s*;", txt):
+        layout_alias[m.group(1)] = m.group(2)
+
+    FAR_FIELD = {"fill": "farFill_", "patch": "farPatchFill_", "down": "farDown_"}
 
     out = {}
     for m in re.finditer(
-            r"(\w+_)\s*=\s*MakeComputePipeline\(\s*\w+\s*,\s*(\w+)\s*,\s*(\w+)\s*,"
+            r"(?:(\w+)\.)?(\w+)\s*=\s*MakeComputePipeline\(\s*\w+\s*,\s*(\w+)\s*,\s*(\w+)\s*,"
             r"\s*\"(\w+)\"", txt):
-        member, layout, module, entry = m.groups()
+        obj, member, layout, module, entry = m.groups()
+        if obj is not None:
+            member = FAR_FIELD.get(member)
+            if not member:
+                continue
+        elif not member.endswith("_"):
+            continue
         f = mods.get(module)
         if f:
-            out[member] = (f, entry, layout)
+            out[member] = (f, entry, layout_alias.get(layout, layout))
     # …and by DEBUG LABEL, for the calls whose result does not go straight into
     # a `member_`. The deferred far set is the case: it is compiled on a
     # background thread into a `FarPipelines` struct (`r.fill = ...`) and
@@ -399,7 +428,8 @@ def parse_pipeline_entries():
         layout, module, entry, label = m.groups()
         f = mods.get(module)
         if f:
-            out.setdefault(label + "_", (f, entry, layout))
+            out.setdefault(label + "_",
+                           (f, entry, layout_alias.get(layout, layout)))
     return out
 
 

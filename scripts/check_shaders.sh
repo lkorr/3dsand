@@ -607,7 +607,10 @@ if [ -f "$WORLDGEN_COMBINED" ]; then
   # aggregate copies inside the entry, not the raw count. What the ceiling
   # catches is the failure mode that actually happened: worldgen quietly
   # doubling in size and nobody noticing until a cold boot.
-  for spec in "far:25000" "fardown:25000"; do
+  # `farpatch` is the edit-patch half `far` was split into (package C item 1);
+  # it carries its own genColumn + farBlockerBitAt copies, so it gets the same
+  # ceiling as the sweep it came out of rather than riding on it.
+  for spec in "far:25000" "farpatch:25000" "fardown:25000"; do
     ep="${spec%%:*}"; ceil="${spec##*:}"
     spv="$TMP/worldgen_${ep}.spv"
     if ! "$TINT_BIN" -f spirv -ep "$ep" -o "$spv" "$WORLDGEN_COMBINED" >/dev/null 2>&1; then

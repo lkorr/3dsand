@@ -449,9 +449,13 @@ class Simulation {
   // "both are ready" test is one wait and the completion work (MarkFarReady,
   // SavePipelineCache) has one place to happen.
   struct FarPipelines {
-    rhi::ComputePipeline fill, down;
+    // `fill` is worldgen.wgsl's `far` sweep, `patch` its `farpatch` half
+    // (PLAN_shader_compile package C item 1). Both are deferred and both are
+    // waited on together: a cascade filled by the sweep alone would drop every
+    // far-field edit, which is a WRONG horizon rather than a missing one.
+    rhi::ComputePipeline fill, patch, down;
   };
-  // Move the future's result onto farFill_/farDown_. Main thread only.
+  // Move the future's result onto the three far pipeline members. Main thread only.
   void PublishFarPipelines();
   // Blocks unless the caller opted into deferral. Called from EncodeFarFill
   // with work to do — the one point where a caller is about to depend on
@@ -542,7 +546,7 @@ class Simulation {
       pArgs2_, pResolve_;
   // Live only after PublishFarPipelines. Until then both are INVALID handles
   // and the recorder skips their rows (vk_record.cpp's null-pipeline continue).
-  rhi::ComputePipeline farFill_, farDown_;
+  rhi::ComputePipeline farFill_, farPatchFill_, farDown_;
   // The background compile. Valid between BuildPipelines and the publish;
   // `farPublished_` and `deferFarOk_` are main-thread-only, `farReady_` is the
   // one field any other thread may observe.
