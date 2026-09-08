@@ -2963,7 +2963,6 @@ fn traceFar(ro : vec3f, rdIn : vec3f, tStart : f32, px : vec2f) -> FarHit {
     // chunk's inner loop starts.
     let stepv = vec3<i32>(sign(rd));
     let tDelta = abs(inv);
-    let cDelta = tDelta * f32(CHUNK);
     let loI = org * i32(CHUNK);
 
     var axis = 0;
@@ -3097,14 +3096,26 @@ fn traceFar(ro : vec3f, rdIn : vec3f, tStart : f32, px : vec2f) -> FarHit {
           }
         }
       }
-      // The chunk cursor: one compare and one add, and it is ALL an empty
-      // level chunk costs now.
+      // The chunk cursor, and it is ALL an empty level chunk costs now.
+      //
+      // THE CROSSED AXIS IS RE-DERIVED, NOT ACCUMULATED. `cNext[a] += cDelta[a]`
+      // is the textbook DDA advance and it is wrong HERE, because this cursor
+      // does not just terminate a loop — it seeds the cell cursor and it feeds
+      // the row-skip plane test. A level-8 ray crosses ~16 chunks at t in the
+      // tens of thousands of cells, so fifteen accumulated adds drift the exit
+      // time by more than the 1e-4 the seeding epsilon allows for, and the
+      // seeded cell lands one off. Recomputing the ONE axis that changed costs
+      // a subtract and a multiply and makes cNext exact at all times: each
+      // component is the plane equation for the boundary it currently names.
       if (cNext.x <= cNext.y && cNext.x <= cNext.z) {
-        tCur = cNext.x; cNext.x += cDelta.x; cc.x += stepv.x;
+        tCur = cNext.x; cc.x += stepv.x;
+        cNext.x = (f32((cc.x + max(stepv.x, 0)) * i32(CHUNK)) - roL.x) * inv.x;
       } else if (cNext.y <= cNext.z) {
-        tCur = cNext.y; cNext.y += cDelta.y; cc.y += stepv.y;
+        tCur = cNext.y; cc.y += stepv.y;
+        cNext.y = (f32((cc.y + max(stepv.y, 0)) * i32(CHUNK)) - roL.y) * inv.y;
       } else {
-        tCur = cNext.z; cNext.z += cDelta.z; cc.z += stepv.z;
+        tCur = cNext.z; cc.z += stepv.z;
+        cNext.z = (f32((cc.z + max(stepv.z, 0)) * i32(CHUNK)) - roL.z) * inv.z;
       }
     }
     if (budget <= 0) { tStop = tCur; }
@@ -3249,7 +3260,6 @@ fn farShadowDist(level : u32, roFine : vec3f) -> f32 {
   //     a global above-the-terrain test could never fire for it.
   let stepv = vec3<i32>(sign(rd));
   let tDelta = abs(inv);
-  let cDelta = tDelta * f32(CHUNK);
 
   var tCur = 0.0;
   var cc = worldChunkOf(vec3<i32>(floor(roL)));
@@ -3311,12 +3321,16 @@ fn farShadowDist(level : u32, roFine : vec3f) -> f32 {
         }
       }
     }
+    // Re-derived, not accumulated — see the note on traceFar's chunk cursor.
     if (cNext.x <= cNext.y && cNext.x <= cNext.z) {
-      tCur = cNext.x; cNext.x += cDelta.x; cc.x += stepv.x;
+      tCur = cNext.x; cc.x += stepv.x;
+      cNext.x = (f32((cc.x + max(stepv.x, 0)) * i32(CHUNK)) - roL.x) * inv.x;
     } else if (cNext.y <= cNext.z) {
-      tCur = cNext.y; cNext.y += cDelta.y; cc.y += stepv.y;
+      tCur = cNext.y; cc.y += stepv.y;
+      cNext.y = (f32((cc.y + max(stepv.y, 0)) * i32(CHUNK)) - roL.y) * inv.y;
     } else {
-      tCur = cNext.z; cNext.z += cDelta.z; cc.z += stepv.z;
+      tCur = cNext.z; cc.z += stepv.z;
+      cNext.z = (f32((cc.z + max(stepv.z, 0)) * i32(CHUNK)) - roL.z) * inv.z;
     }
   }
   return -1.0;
