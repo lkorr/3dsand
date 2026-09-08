@@ -1,13 +1,16 @@
 #include "gpu/resources.h"
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
 #include <mutex>
 #include <sstream>
+#include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 
 #include "sim/treeatlas.h"   // CurrentTreeLattice: the TREE_* prelude consts
 #include "sim/tuning.h"
@@ -402,6 +405,64 @@ std::string StripBlock(const std::string& common, const char* beginTag,
          common.substr(eLine + 1);
 }
 
+// Keep only the `const NAME : ...` lines of the tuning block whose NAME occurs
+// as a whole identifier somewhere in `text` -- the shader body plus whatever of
+// common.wgsl survived the block stripping above it. Comment lines stay so the
+// block still says where it came from.
+//
+// WHY: TuningWgslBlock emits every row of tuning_params.def (351 consts), and
+// the assembled source is the shader cache key (rhi_vulkan.cpp GetShaderModule
+// hashes it; shader_cache/ and the in-process module cache are both keyed on
+// it). Pasting all of them made EVERY shader's text change whenever ANY knob
+// moved, so a selftest gate that flips render.giStrength or a sim.fluid* row
+// and calls ReloadShaders re-keyed worldgen.wgsl -- which reads none of those
+// -- and paid a cold `far` compile (~10 min since P-F) per flip: five of them
+// in one 85-minute --selftest on 2026-09-07, each followed 0.3 s later by the
+// restore arm's cache hit. An unreferenced `const` never reaches SPIR-V, so
+// dropping it changes nothing the driver sees; the key just stops lying about
+// what the pipeline is compiled from.
+std::string ReferencedTuningBlock(const std::string& block, const std::string& text) {
+  std::unordered_set<std::string> idents;
+  {
+    const size_t n = text.size();
+    auto isStart = [](char c) { return std::isalpha((unsigned char)c) || c == '_'; };
+    auto isBody = [](char c) { return std::isalnum((unsigned char)c) || c == '_'; };
+    size_t i = 0;
+    while (i < n) {
+      if (isStart(text[i])) {
+        size_t j = i + 1;
+        while (j < n && isBody(text[j])) j++;
+        idents.emplace(text.substr(i, j - i));
+        i = j;
+      } else {
+        i++;
+      }
+    }
+  }
+  std::string out;
+  out.reserve(block.size());
+  size_t pos = 0;
+  while (pos < block.size()) {
+    size_t eol = block.find('\n', pos);
+    if (eol == std::string::npos) eol = block.size();
+    std::string_view line(block.data() + pos, eol - pos);
+    bool keep = true;
+    if (line.rfind("const ", 0) == 0) {
+      const size_t nameEnd = line.find(' ', 6);
+      const std::string name(line.substr(6, nameEnd == std::string_view::npos
+                                                ? std::string_view::npos
+                                                : nameEnd - 6));
+      keep = idents.count(name) != 0;
+    }
+    if (keep) {
+      out.append(line.data(), line.size());
+      out.push_back('\n');
+    }
+    pos = eol + 1;
+  }
+  return out;
+}
+
 rhi::ShaderModule LoadShader(const rhi::Device& device, const std::string& shaderDir,
                              const std::string& name) {
   std::string common, body;
@@ -444,9 +505,12 @@ rhi::ShaderModule LoadShader(const rhi::Device& device, const std::string& shade
   // ptSeed sits BEFORE common.wgsl: the page block calls it. WGSL module scope
   // is order-independent, but keeping the definition ahead of its use matches
   // how every other generated declaration here reads.
-  std::string src = ShaderConstantPrelude() + "\n" +
-                    TuningWgslBlock(CurrentTuning()) + "\n" + ptSeed + common +
-                    "\n" + body;
+  // Only the tuning consts this shader can see (ReferencedTuningBlock above):
+  // the rest would only make the cache key move when they do.
+  const std::string tuningBlock =
+      ReferencedTuningBlock(TuningWgslBlock(CurrentTuning()), ptSeed + common + body);
+  std::string src = ShaderConstantPrelude() + "\n" + tuningBlock + "\n" + ptSeed +
+                    common + "\n" + body;
 
   return device.CreateShaderModule(src, name.c_str());
 }
