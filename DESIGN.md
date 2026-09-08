@@ -4689,8 +4689,16 @@ where you hear from either (§12b, "The ears are on the character").
   from those region files by `FarEdits::RebuildFromStore` on load.
   `FarField::PrepareTick` attaches each fill entry's patch list to the dispatch
   (the `farPatch` buffer: an (offset, count) header per dispatch entry, then a
-  payload of `(mat << 12) | cellIndex`), and the same `far` workgroup applies
-  them right after its pristine sweep, behind one `storageBarrier()`. The patch
+  payload of `(mat << 12) | cellIndex`), and a SECOND entry point, `farpatch`,
+  applies them over the same dispatch extent immediately after the sweep. It
+  used to be a block at the bottom of `far` behind one in-kernel
+  `storageBarrier()`; it was split out for compile time
+  (docs/PLAN_shader_compile.md package C — the patch loop is a second full
+  `genColumn` inline copy, and NVIDIA's pipeline compile is superlinear in
+  entry-point size), and the barrier is now the pass table's generated edge
+  between the two `PT_FARFILL` rows. Same hazard, same order, same values; each
+  entry publishes its own half of the `farOcc` word (the sweep stores its count
+  and top, the patch folds its own in conservatively-high). The patch
   carries the raw material and NOT a finished byte, so `farSurfaceMat` — the
   same function the sieve and the downsample call — still decides the color: a
   patched cell is byte-identical to what `fardown` would have written for it,

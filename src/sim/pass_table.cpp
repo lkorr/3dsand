@@ -51,6 +51,7 @@ namespace {
 #define PIPE_P_RESOLVE       Pipe::PResolve
 #define PIPE_PAGEFILL        Pipe::PageFill
 #define PIPE_FAR_FILL        Pipe::FarFill
+#define PIPE_FAR_PATCH_FILL  Pipe::FarPatchFill
 #define PIPE_FAR_DOWN        Pipe::FarDown
 #define PIPE_OPENNESS_DIRTY   Pipe::OpennessDirty
 #define PIPE_OPENNESS_REFRESH Pipe::OpennessRefresh

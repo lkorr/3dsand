@@ -1204,13 +1204,20 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
     const rhi::ShaderModule module = mWorldgen;
     auto build = [dev, layout, module]() {
       FarPipelines r;
-      // `fardown` on its own thread beside `far`: sequentially they are 844 s,
-      // in parallel they are max(746, 98) = 746 s, which is the wall clock
-      // this whole package is bounded by.
+      // One thread per entry point: sequentially these are the sum, in
+      // parallel they are max(), which is the wall clock this whole package is
+      // bounded by. `farpatch` joined the set with package C's split of `far`
+      // into sweep + edit-patch — the split only pays if the halves compile
+      // CONCURRENTLY, so it gets a thread of its own like `fardown` did.
       std::thread down([&] {
         r.down = MakeComputePipeline(dev, layout, module, "fardown", "farDown");
       });
+      std::thread patch([&] {
+        r.patch = MakeComputePipeline(dev, layout, module, "farpatch",
+                                      "farPatchFill");
+      });
       r.fill = MakeComputePipeline(dev, layout, module, "far", "farFill");
+      patch.join();
       down.join();
       MarkFarReady();
       // THE HORIZON'S ARRIVAL TIME, printed unconditionally. It is the number
@@ -1231,6 +1238,7 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
     if (buildThreads <= 1) {
       FarPipelines r = build();
       farFill_ = std::move(r.fill);
+      farPatchFill_ = std::move(r.patch);
       farDown_ = std::move(r.down);
       farPublished_ = true;
       farReady_.store(true, std::memory_order_release);
@@ -1248,7 +1256,7 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   // there — but on Vulkan a null pipeline would make the recorder silently
   // skip the row, which is a wrong SIM, not a crash. Fail the build instead.
   //
-  // farFill_/farDown_ are NOT in this list: they may still be compiling, and a
+  // The far set is NOT in this list: it may still be compiling, and a
   // skipped far row is a missing horizon rather than a wrong sim. Their
   // verdict is checked where they are published (PublishFarPipelines).
   if (!worldgen_ || !worldgenList_ || !pageFill_ || !mutate_ ||
@@ -1281,7 +1289,7 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
 
 // ---- the deferred far set's three main-thread entry points ----------------
 //
-// Only this thread ever writes farFill_/farDown_ (the compile thread writes
+// Only this thread ever writes the far pipelines (the compile thread writes
 // them into the future's result and nothing else), so PassPipeline's reads
 // need no synchronization: a row either sees the pre-publish INVALID handle
 // and is skipped, or sees the published one. `farReady_` is the release/
@@ -1290,15 +1298,16 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
 void Simulation::PublishFarPipelines() {
   FarPipelines r = farFuture_.get();  // blocks if the thread is still running
   farFill_ = std::move(r.fill);
+  farPatchFill_ = std::move(r.patch);
   farDown_ = std::move(r.down);
   farPublished_ = true;
   farReady_.store(true, std::memory_order_release);
   // Not fatal: a failed far compile costs the horizon, not the sim. Say so
   // once — silence here would read as "the cascades are just empty".
-  if (!farFill_ || !farDown_)
+  if (!farFill_ || !farPatchFill_ || !farDown_)
     std::fprintf(stderr,
                  "far-cascade pipelines failed to compile; the horizon will "
-                 "stay empty (worldgen.wgsl far/fardown)\n");
+                 "stay empty (worldgen.wgsl far/farpatch/fardown)\n");
 }
 
 bool Simulation::PollFarPipelines() {
@@ -1315,7 +1324,7 @@ void Simulation::WaitForFarPipelines() {
   // for up to twelve minutes with no output.
   if (farFuture_.wait_for(std::chrono::seconds(0)) != std::future_status::ready)
     std::printf("waiting for the deferred far-cascade pipelines "
-                "(worldgen.wgsl far/fardown)...\n");
+                "(worldgen.wgsl far/farpatch/fardown)...\n");
   std::fflush(stdout);
   PublishFarPipelines();
 }
@@ -1501,6 +1510,7 @@ const rhi::ComputePipeline& Simulation::PassPipeline(pass::Pipe p) const {
     case P::PArgs2:         return pArgs2_;
     case P::PResolve:       return pResolve_;
     case P::FarFill:        return farFill_;
+    case P::FarPatchFill:   return farPatchFill_;
     case P::FarDown:        return farDown_;
     case P::OpennessDirty:   return opennessDirty_;
     case P::OpennessRefresh: return opennessRefresh_;
@@ -1646,7 +1656,10 @@ void Simulation::EncodeFarFill(const rhi::CommandEncoder& enc, uint32_t count) {
   // recorder would skip the row anyway, but its drain loop has already popped
   // these entries out of FarField's queue, so returning early keeps that a
   // cheap no-op. Simulation::PollFarPipelines -> FullRefill re-queues them.
-  if (!farFill_) return;
+  // Both halves or neither: the sweep alone would write PRISTINE procgen over
+  // cells the player has edited, which is a wrong horizon rather than a
+  // missing one (the patch entry is what puts the edits back).
+  if (!farFill_ || !farPatchFill_) return;
   RecordCtx cx{};
   cx.farCount = count;
   RecordTable(enc, pass::Table::FarFill, &cx);

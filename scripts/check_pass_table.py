@@ -105,6 +105,8 @@ PIPE_TO_MEMBER = {
     "PIPE_P_ARGS2": "pArgs2_",
     "PIPE_P_RESOLVE": "pResolve_",
     "PIPE_FAR_FILL": "farFill_",
+    # The edit-patch half `far` was split into (PLAN_shader_compile package C).
+    "PIPE_FAR_PATCH_FILL": "farPatchFill_",
     "PIPE_FAR_DOWN": "farDown_",
     "PIPE_OPENNESS_DIRTY": "opennessDirty_",
     "PIPE_OPENNESS_REFRESH": "opennessRefresh_",
@@ -339,22 +341,53 @@ def parse_pipeline_entries():
     a different entry point cannot silently keep the old row's R/W expectations.
     The shape there is:
 
-        mStep    = mod("sim_step.wgsl");
-        step_    = MakeComputePipeline(device, simPL_, mStep, "main", "step");
+        mod(&mStep, "sim_step.wgsl");
+        step_ = MakeComputePipeline(device, simPL_, mStep, "main", "step");
+
+    TWO SHAPES OF ASSIGNMENT, because PLAN_shader_compile package A moved the
+    loads and the far set off the boot thread:
+
+      * `mod(&mStep, "sim_step.wgsl")` -- the threaded module loader's
+        out-parameter form (it replaced `mStep = mod("sim_step.wgsl")`, and
+        when it did, this scraper silently matched NOTHING and the whole check
+        degraded to "could not scrape"; hence both forms are accepted).
+      * `r.fill = MakeComputePipeline(dev, layout, module, "far", "farFill")` --
+        the deferred far build runs on a background thread and writes a
+        FarPipelines struct, with lambda-local copies of the layout and module.
+        FAR_FIELD maps its fields onto the members PublishFarPipelines moves
+        them to.
     """
     txt = read(SIM)
     mods = {}   # module variable -> shader file name
     for m in re.finditer(r"(\w+)\s*=\s*mod\(\s*\"([\w.]+\.wgsl)\"\s*\)", txt):
         mods[m.group(1)] = m.group(2)
+    for m in re.finditer(r"\bmod\(\s*&(\w+)\s*,\s*\"([\w.]+\.wgsl)\"\s*\)", txt):
+        mods[m.group(1)] = m.group(2)
+    # Lambda-local aliases: `const rhi::ShaderModule module = mWorldgen;`
+    for m in re.finditer(r"\brhi::ShaderModule\s+(\w+)\s*=\s*(\w+)\s*;", txt):
+        if m.group(2) in mods:
+            mods[m.group(1)] = mods[m.group(2)]
+    # ... and `const rhi::PipelineLayout layout = farPL_;`
+    layout_alias = {}
+    for m in re.finditer(r"\brhi::PipelineLayout\s+(\w+)\s*=\s*(\w+_)\s*;", txt):
+        layout_alias[m.group(1)] = m.group(2)
+
+    FAR_FIELD = {"fill": "farFill_", "patch": "farPatchFill_", "down": "farDown_"}
 
     out = {}
     for m in re.finditer(
-            r"(\w+_)\s*=\s*MakeComputePipeline\(\s*\w+\s*,\s*(\w+)\s*,\s*(\w+)\s*,"
+            r"(?:(\w+)\.)?(\w+)\s*=\s*MakeComputePipeline\(\s*\w+\s*,\s*(\w+)\s*,\s*(\w+)\s*,"
             r"\s*\"(\w+)\"", txt):
-        member, layout, module, entry = m.groups()
+        obj, member, layout, module, entry = m.groups()
+        if obj is not None:
+            member = FAR_FIELD.get(member)
+            if not member:
+                continue
+        elif not member.endswith("_"):
+            continue
         f = mods.get(module)
         if f:
-            out[member] = (f, entry, layout)
+            out[member] = (f, entry, layout_alias.get(layout, layout))
     return out
 
 
