@@ -245,6 +245,14 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         // (27/28), irradiance (29) and genAct (30) landed. This layout is a
         // dense 0..30, so 31 is the first free slot.
         entry(31, T::ReadOnlyStorage), // worldMap
+        // The glow field (src/sim/world.h kGlowBytes). Storage, not
+        // ReadOnlyStorage: sim_glow.wgsl is its only writer and it reads the
+        // slot's previous source word back to decide whether it moved. 32 is
+        // the first free slot in this dense 0..31 layout, and it is NOT
+        // mirrored in simSlimBGL_ -- the one-identifier-one-binding-number rule
+        // above only binds layouts a shader declaring `glow` is recorded
+        // against, and no slim-group pipeline names it.
+        entry(32, T::Storage),         // glow (sources + field)
     };
     simBGL_ = device.CreateBindGroupLayout(entries, std::size(entries));
 
@@ -415,6 +423,16 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         // P2's write-back (the receiver's gathered term feeds its own face)
         // needs no layout change; P1's raymarch declares it `read`.
         entry(19, T::Storage, S::Fragment),           // irradiance
+        // The glow field (src/sim/world.h kGlowBytes). READ-ONLY here and
+        // read_write only in the sim group, the same arrow openness has at 17.
+        //
+        // Fragment | Vertex, and the VERTEX half is the entire point of the
+        // feature: debris.wgsl shades a rigid-body cube in the vertex stage,
+        // where `voxels` (0) and `pageTable` (9) are Fragment-only, so it can
+        // neither march a ray nor read a voxel. One position-keyed buffer load
+        // is a shape it CAN consume, which is what lets the crown that falls
+        // off a burning tree be lit by the fire it fell out of.
+        entry(20, T::ReadOnlyStorage, S::Fragment | S::Vertex),   // glow
     };
     renderBGL_ = device.CreateBindGroupLayout(entries, std::size(entries));
 
@@ -549,6 +567,7 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         b(17, world_->openness),
         b(18, world_->opennessGen),
         b(19, world_->irradiance),
+        b(20, world_->glow),
     };
     renderBG_ = device.CreateBindGroup(renderBGL_, entries, std::size(entries), "renderBG");
   }
@@ -778,6 +797,7 @@ void Simulation::BuildSimBindGroups(const rhi::Device& device) {
         b(29, world_->irradiance),
         b(30, world_->genAct),
         b(31, worldMapBuf_),
+        b(32, world_->glow),
     };
     simBG_[page] = device.CreateBindGroup(simBGL_, entries, std::size(entries), "simBG");
 
@@ -1054,6 +1074,11 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   // place F5 recompiles, and the pass and the raymarch's reader must be
   // rebuilt together or one of them is a tick behind the other's layout.
   rhi::ShaderModule mOpenness;
+  // The glow field's writer (src/sim/world.h kGlowBytes). A render-path module
+  // among the sim ones for mOpenness's reason: BuildPipelines is the single
+  // place F5 recompiles, and the producer and its readers must be rebuilt
+  // together or one of them is a tick behind the other's layout.
+  rhi::ShaderModule mGlow;
   // The shadow cache's resolve. A RENDER-path module living among the sim ones
   // because BuildPipelines is the single place F5 recompiles, and the cache's
   // enable flag has to be recomputed in lockstep with raymarch.wgsl's const.
@@ -1078,6 +1103,7 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
     mod(&mOcc, "sim_occupancy.wgsl");
     mod(&mPick, "sim_pick.wgsl");
     mod(&mOpenness, "sim_openness.wgsl");
+    mod(&mGlow, "sim_glow.wgsl");
     mod(&mShadow, "shadow_resolve.wgsl");
     mod(&mExplode, "sim_explode.wgsl");
     mod(&mParticle, "sim_particle.wgsl");
@@ -1094,7 +1120,7 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
     loads.Run(buildThreads);
   }
   if (!mWorldgen || !mMutate || !mCompact || !mStep || !mOcc || !mPick ||
-      !mOpenness ||
+      !mOpenness || !mGlow ||
       !mExplode || !mParticle || !mFluid || !mFluidSeam || !mWaterBody ||
       !mRay || !mDebris ||
       !mMicroBody || !mDebugLines || !mDebugWind || !mDebugCur) {
@@ -1152,6 +1178,9 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   pool.Add([&] { occupancyDirty_ = MakeComputePipeline(device, simPL_, mOcc, "mainDirty", "occupancyDirty"); });
   pool.Add([&] { opennessDirty_ = MakeComputePipeline(device, simPL_, mOpenness, "dirty", "opennessDirty"); });
   pool.Add([&] { opennessRefresh_ = MakeComputePipeline(device, simPL_, mOpenness, "refresh", "opennessRefresh"); });
+  pool.Add([&] { glowSrc_ = MakeComputePipeline(device, simPL_, mGlow, "src", "glowSrc"); });
+  pool.Add([&] { glowField_ = MakeComputePipeline(device, simPL_, mGlow, "field", "glowField"); });
+  pool.Add([&] { glowRefresh_ = MakeComputePipeline(device, simPL_, mGlow, "refresh", "glowRefresh"); });
   pool.Add([&] { pick_ = MakeComputePipeline(device, simPL_, mPick, "main", "pick"); });
 
   pool.Add([&] { explodeMark_ = MakeComputePipeline(device, simPL2_, mExplode, "mark", "explodeMark"); });
@@ -1418,6 +1447,10 @@ struct RecordCtx {
   // a zero here is C_OPENNESS false and NOTHING recorded -- which is what makes
   // the `noopenness` --render-budget arm measure the pass as well as the reads.
   uint32_t opennessChunks = 0;
+  // Chunks the glow refresh walks this tick (src/sim/world.h kGlowBytes).
+  // Derived from render.glowChunksPerFrame and gated on render.glowStrength, so
+  // a zero here is C_GLOW false and NOTHING recorded.
+  uint32_t glowChunks = 0;
   bool hashEnable = false;
   bool particlesActive = false;
   // False under --residency paged: worldgen's whole-world dispatch is replaced
@@ -1508,6 +1541,7 @@ const rhi::Buffer& Simulation::PassBuffer(pass::Buf b) const {
     case B::Openness:            return world_->openness;
     case B::OpennessGen:         return world_->opennessGen;
     case B::Irradiance:          return world_->irradiance;
+    case B::Glow:                return world_->glow;
     case B::GenAct:              return world_->genAct;
     case B::WaterBodyState:      return world_->waterBodyState;
     case B::TreeAtlas:           return treeAtlasBuf_;
@@ -1542,6 +1576,9 @@ const rhi::ComputePipeline& Simulation::PassPipeline(pass::Pipe p) const {
     case P::FarDown:        return farDown_;
     case P::OpennessDirty:   return opennessDirty_;
     case P::OpennessRefresh: return opennessRefresh_;
+    case P::GlowSrc:         return glowSrc_;
+    case P::GlowField:       return glowField_;
+    case P::GlowRefresh:     return glowRefresh_;
     case P::ShadowPrepare:  return shadowPrepare_;
     case P::ShadowResolve:  return shadowResolve_;
     case P::FluidSpawn:     return fluidSpawn_;
@@ -1615,6 +1652,7 @@ void Simulation::RecordTable(const rhi::CommandEncoder& enc, pass::Table which,
   tc.waterDrainBodies = cx.waterDrainBodies;
   tc.waterSweepSlot = cx.waterSweepSlot;
   tc.opennessChunks = cx.opennessChunks;
+  tc.glowChunks = cx.glowChunks;
   tc.hashEnable = cx.hashEnable;
   tc.particlesActive = cx.particlesActive;
   tc.denseWorldgen = cx.denseWorldgen;
@@ -1937,6 +1975,23 @@ void Simulation::EncodeTick(const rhi::CommandEncoder& enc, uint32_t opsCount,
         tn.render.opennessStrength > 0.0f
             ? (uint32_t)std::min<int>(std::max(tn.render.opennessChunksPerFrame, 0),
                                       (int)kNumChunks)
+            : 0u;
+    // The glow field's refresh budget (src/sim/world.h kGlowBytes), same shape
+    // and same reasoning. It gates ALL THREE glow rows, not just the refresh
+    // one: a zero here means the two dirty-walk rows go unrecorded too, so
+    // `render.glowStrength = 0` is an exact off switch for the producer AND the
+    // consumers' const-folded reads, which is what the `noglow` --render-budget
+    // arm needs to measure.
+    //
+    // max(..., 1) and not max(..., 0): this ONE value carries two meanings —
+    // C_GLOW's on/off and the refresh row's extent — so a
+    // `glowChunksPerFrame = 0` typed into the tuner would silently turn the
+    // whole field off, dirty walk included, which is not what that row says it
+    // does. `render.glowStrength` is the off switch and it is the only one.
+    cx.glowChunks =
+        tn.render.glowStrength > 0.0f
+            ? (uint32_t)std::min<int>(
+                  std::max(tn.render.glowChunksPerFrame, 1), (int)kNumChunks)
             : 0u;
   }
 

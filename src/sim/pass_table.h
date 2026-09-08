@@ -152,6 +152,14 @@ enum class Buf : uint8_t {
   // through CopyTracked and the recorder needs the compute-write -> transfer-
   // read hazard (docs/RESEARCH_streaming_hitch.md R1).
   GenAct,
+  // ---- the glow field (world.h kGlowBytes, assets/shaders/sim_glow.wgsl) ----
+  // ONE Buf id for BOTH regions of one buffer (the per-chunk sources and the
+  // per-block field): they live in one allocation so the field costs one
+  // binding in each layout that carries it rather than two, and the recorder
+  // wants exactly this granularity anyway — the `src` row writes the source
+  // words and the `field` row reads them back, so the RW -> RW edge between the
+  // two rows IS the barrier that makes the two-stage split correct.
+  Glow,
   kCount,
 };
 
@@ -219,6 +227,13 @@ enum class Pipe : uint8_t {
   // Simulation::RecordTable — which is `(int)Pipe::ShadowResolve + 1` — still
   // covers them without moving.
   OpennessDirty, OpennessRefresh,
+  // The glow field (sim_glow.wgsl). Three entry points: the two-stage dirty
+  // walk (`src` then `field`, both indirect on the compacted dirty list) and
+  // the rolling refresh. BEFORE ShadowPrepare for the reason stated above —
+  // the pipeline-copy loop's bound in Simulation::RecordTable is
+  // `(int)Pipe::ShadowResolve + 1` and a Pipe added past it is silently never
+  // copied into the recorder's table.
+  GlowSrc, GlowField, GlowRefresh,
   // Voxel-keyed shadow cache (shadow_resolve.wgsl). AFTER FarDown, which the
   // note at the fluid block says must stay last — so the copy loop's bound in
   // Simulation::RecordTable moves to ShadowResolve with these. Both are render
@@ -309,6 +324,12 @@ enum class Cond : uint8_t {
   // `noopenness` arm in --render-budget measure the pass AND the reads rather
   // than the reads alone.
   Openness,
+  // glowChunks > 0: the glow field is on (render.glowStrength > 0) AND its
+  // per-tick refresh budget is nonzero. All three rows carry it, so
+  // `glowStrength = 0` records NOTHING — which is what makes the `noglow`
+  // --render-budget arm measure the passes AND the reads rather than the reads
+  // alone, exactly as `noopenness` does one line up.
+  Glow,
 };
 
 // Which command buffer a row belongs to — one per Encode* entry point.
@@ -355,6 +376,9 @@ enum class DispatchSel : uint32_t {
   // render.opennessChunksPerFrame. A knob, not a count of live work, so it is a
   // selector rather than a literal extent: changing it must not need a rebuild.
   OpennessChunks,
+  // Same shape for the glow field's rolling refresh, from
+  // render.glowChunksPerFrame.
+  GlowChunks,
   WaterChunks,       // waterChunkCount — one WORKGROUP per listed chunk
   WaterChunks64,     // (waterChunkCount + 63) / 64 — one THREAD per chunk
   // One THREAD per RESERVED drain spawn-op slot. Every slot in the block has

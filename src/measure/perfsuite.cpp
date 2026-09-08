@@ -1900,6 +1900,21 @@ const RenderArm kRenderArms[] = {
      [](Tuning& t) { t.render.giStrength = 0.0f; }, true, 1,
      "the irradiance gather at every near-field hit plus both injection "
      "paths"},
+    // ---- the glow field (src/sim/world.h kGlowBytes) ----
+    // glowStrength = 0 makes C_GLOW false, so none of the three producer rows
+    // is recorded, AND const-folds the sampled term out of every consumer -- so
+    // baseline - noglow is the compute passes plus the reads, in one number, on
+    // one world, exactly as noopenness is above.
+    //
+    // EXPECT A SMALL NUMBER ON A TERRAIN CAMERA, and that is the design rather
+    // than a disappointment: at the shipped render.glowTerrain = 0 the terrain
+    // path reads nothing at all, so on a frame with no rigid bodies and no mobs
+    // in it this arm measures the PRODUCER alone. Point it at a body or a mob
+    // to see the consumer half.
+    {"noglow", "glow field off (three rows unrecorded + reads const-folded)",
+     [](Tuning& t) { t.render.glowStrength = 0.0f; }, true, 1,
+     "the two-stage dirty walk and the rolling refresh that build the field, "
+     "plus the one-load sample on the raster body/mob paths"},
     // ---- waterfall mist on opaque hits (Lin follow-ups T5.3) ----
     // mistDensity = 0 folds the liquid-pixel veil AND the three-cell probe
     // every opaque near-field pixel now makes toward a neighbouring fall.

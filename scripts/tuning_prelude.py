@@ -231,6 +231,12 @@ SPEC = [
     ("render", "giDecay", "TUNE_GI_DECAY", "f", 0.25),
     ("render", "giFeedback", "TUNE_GI_FEEDBACK", "f", 0.2),
     ("render", "giGatherBlocks", "TUNE_GI_GATHER_BLOCKS", "i", 3),
+    ("render", "glowStrength", "TUNE_GLOW_STRENGTH", "f", 1.0),
+    ("render", "glowReach", "TUNE_GLOW_REACH", "f", 2.4),
+    ("render", "glowFill", "TUNE_GLOW_FILL", "f", 32.0),
+    ("render", "glowChunksPerFrame", "TUNE_GLOW_CHUNKS", "i", 64),
+    ("render", "glowRingBudget", "TUNE_GLOW_RING_BUDGET", "i", 64),
+    ("render", "glowTerrain", "TUNE_GLOW_TERRAIN", "i", 0),
 
     # drifting particulate (silt)
     ("render", "siltDensity", "TUNE_SILT_DENSITY", "f", 0.55),

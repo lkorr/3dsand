@@ -337,6 +337,40 @@ TP_F(render, giFeedback, TUNE_GI_FEEDBACK, 0.2f)
 // 4^3 blocks each of the five gather rays steps through (3 = 1.2 m).
 TP_I(render, giGatherBlocks, TUNE_GI_GATHER_BLOCKS, 3)
 
+// ---- the glow field (src/sim/world.h kGlowBytes, assets/shaders/sim_glow.wgsl)
+// Weight of the sampled emitter light added at a consumer. 0 is an EXACT off
+// switch: both producer rows go unrecorded (C_GLOW) and every consumer's term
+// const-folds away, which is what the `noglow` --render-budget arm measures.
+TP_F(render, glowStrength, TUNE_GLOW_STRENGTH, 1.0f)
+// How far an emitter chunk throws light, in metres. LoadTuning clamps this to
+// one chunk plus half a block diagonal, because the producer's stencil is 3x3x3
+// CHUNKS and a reach past that would be a truncated kernel -- a hard edge at
+// the stencil boundary instead of a falloff that reaches zero on its own.
+TP_F(render, glowReach, TUNE_GLOW_REACH, 2.4f)
+// Emitting-cell fraction at which a chunk reads as a full-strength light
+// source. 32 means 1/32 of the chunk (128 of 4,096 cells) saturates it, so a
+// lava pool's surface layer counts fully while four stray embers do not. This
+// is the only knob between "how much lava" and "how bright"; the ceiling itself
+// is structural (see glowStoreSrc) and does not depend on it.
+TP_F(render, glowFill, TUNE_GLOW_FILL, 32.0f)
+// Chunk slots the rolling refresh revisits per TICK. Every EDIT is covered by
+// the dirty walk, so this only has to cover cold start, streaming, and chunks
+// the ring budget below turned away.
+TP_I(render, glowChunksPerFrame, TUNE_GLOW_CHUNKS, 64)
+// The per-tick ceiling on the expensive branch: how many of the dirty list's
+// workgroups may rewrite their whole 3x3x3 neighbourhood when their source word
+// moves. A prefix of the compacted list, so it is stable rather than
+// scheduling-dependent. 64 x 27 x 64 = 110,592 stores is the worst tick.
+TP_I(render, glowRingBudget, TUNE_GLOW_RING_BUDGET, 64)
+// Sample the field at the near-field TERRAIN hit as well as on the raster body
+// paths. OFF by default and that is a correctness call, not caution: terrain
+// already receives emitter light through giGather over the irradiance grid,
+// which carries emission since PLAN_gi.md P3, so adding this there
+// DOUBLE-COUNTS every emitter within the gather's 1.2 m reach. On, it extends
+// emitter light to render.glowReach on terrain at the cost of that overlap --
+// worth having as a knob, not as a default.
+TP_I(render, glowTerrain, TUNE_GLOW_TERRAIN, 0)
+
 // ---- drifting particulate (silt) ----
 // Render-only motes in the water volume. This is what gives the shafts
 // something to catch, and it is most of why footage reads as underwater.

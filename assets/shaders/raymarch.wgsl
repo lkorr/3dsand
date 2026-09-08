@@ -86,6 +86,11 @@
 // third buffer a fragment shader writes, with shadowCache's argument: render-
 // private derived data the renderer itself produced.
 @group(0) @binding(19) var<storage, read_write> irradiance : array<u32>;
+// The glow field (src/sim/world.h kGlowBytes, common.wgsl THE GLOW FIELD).
+// Declared here so the terrain path CAN sample it under render.glowTerrain, and
+// because renderBGL_ is one layout shared with debris.wgsl and microbody.wgsl,
+// which are the paths it exists for.
+@group(0) @binding(20) var<storage, read> glow : array<u32>;
 const RS_PX : u32 = 0u;          // sampled pixels (denominator)
 const RS_PRIMARY : u32 = 1u;     // trace() steps from fs's camera ray
 const RS_MEDIA : u32 = 2u;       // cells that accumulated media tau in trace()
@@ -8339,6 +8344,24 @@ fn fs(in : VSOut) -> FSOut {
     // NOT — it already has its own shadow ray, and multiplying it by AO too
     // double-darkens contact regions into black smears.
     color = albedo * face * (ambientAt(n) * ao * openAmb + sun);
+    // ---- the glow field, on terrain (src/sim/world.h kGlowBytes) ----
+    // OFF BY DEFAULT, and that is a correctness call rather than caution.
+    // Terrain ALREADY receives emitter light: since P3 of docs/PLAN_gi.md,
+    // lava, embers and burning foliage deposit their emission into the
+    // irradiance grid through `irrSample`, and `giGather` below picks it up. So
+    // adding a glow sample here DOUBLE-COUNTS every emitter inside the gather's
+    // TUNE_GI_GATHER_BLOCKS reach (1.2 m at the shipped 3).
+    //
+    // What it buys when it IS on is the range past that: the glow field reaches
+    // render.glowReach (2.4 m) and needs no ray, so a lava pool lights rock the
+    // gather cannot reach. The knob exists because that is a real trade and the
+    // answer depends on the scene, not because the default is unsettled — the
+    // raster body paths, which have NO other source of emitter light at all,
+    // are the case this field was built for and they are on unconditionally.
+    if (TUNE_GLOW_TERRAIN != 0) {
+      color += glowLight(albedo, ao, glowAtCell(h.cell, &glow),
+                         TUNE_GLOW_STRENGTH);
+    }
     // ---- one-bounce indirect light, phase P1 (docs/PLAN_gi.md §3) ----
     // What P0 could not do: a sealed room went to zero ambient and stayed
     // there. giGather reads the direct-lit radiance the surrounding block-faces

@@ -441,6 +441,61 @@ PASS(opennessRefresh, "openness", PT_TICK, PIPE_OPENNESS_REFRESH, K_COMPUTE, D_O
      USES(R(Voxels) R(Materials) U(TickUBO) U(RenderUBO) R(Occupancy) R(PageTable)
           W(Openness) W(OpennessGen) W(Irradiance)))
 
+// ---- phase 5d: the glow field --------------------------------------------
+// src/sim/world.h kGlowBytes; assets/shaders/sim_glow.wgsl states the design.
+// RENDER-ONLY DERIVED DATA on the TICK table, with exactly the standing farDown
+// and the openness walk above it have, and for the same two reasons: its input
+// is the tick's compacted dirty list, so recording it per FRAME would re-walk
+// the same chunks two or three times per tick for an identical answer (cost
+// that scales with FRAMERATE, which rule 2 forbids); and the COMPUTE ->
+// VERTEX/FRAGMENT hop is covered by the global memory barrier every command
+// buffer opens with (barrier_graph §3.4), so no per-row edge is needed for the
+// read side.
+//
+// AFTER the openness rows and last on the tick table on purpose: nothing here
+// reads openness or irradiance, so the placement is free, and putting the
+// engine's newest derived-data pass at the end keeps the diff to the rows above
+// it at zero.
+//
+// No W(Voxels), no A(DirtyIn), no A(DirtyOut), no A(PageFaults): the kernel
+// writes exactly one buffer and cannot wake a chunk. That is the whole of its
+// claim to being render-only, and it is checkable — `--gate sleep` would
+// notice.
+
+// STAGE 1. One workgroup per dirty chunk, reading every cell of it once (the
+// same per-cell budget occupancyDirty already pays for the same list) and
+// writing ONE source word. RW(Glow) rather than W(Glow) because glowStoreSrc
+// READS the slot's previous word to decide whether it moved — the `changed`
+// flag stage 2 gates its expensive branch on. Declaring it W would omit the
+// hazard against the PREVIOUS tick's stage 2 read and against the refresh row.
+PASS(glowSrc, "glow", PT_TICK, PIPE_GLOW_SRC, K_INDIRECT, IND_DISPATCHARGS,0,0,
+     GRP_SIM, DYN_ZERO, C_GLOW, 1,
+     USES(R(Voxels) R(Materials) U(TickUBO) R(DirtyList) I(DispatchArgs)
+          R(PageTable) RW(Glow)))
+// STAGE 2. THE ROW ORDER IS LOAD-BEARING and this is the whole reason the
+// producer is two dispatches instead of one: `field` gathers the 3x3x3 chunk
+// neighbourhood of source words, which the row above is writing for every chunk
+// on the same list. The RW(Glow) -> RW(Glow) edge the recorder derives between
+// these two rows is what makes that a read-after-write instead of a race, and
+// merging them into one entry point would delete it.
+//
+// No voxel, material or page-table use: everything this row needs is already in
+// the source words. That is the point of the two-stage split — the gather is
+// 27 taps of a 512 KiB region rather than a search over cells.
+PASS(glowField, "glow", PT_TICK, PIPE_GLOW_FIELD, K_INDIRECT, IND_DISPATCHARGS,0,0,
+     GRP_SIM, DYN_ZERO, C_GLOW, 1,
+     USES(U(TickUBO) R(DirtyList) I(DispatchArgs) RW(Glow)))
+// The rolling refresh: render.glowChunksPerFrame slots per tick, round robin,
+// doing both stages in one workgroup. The dirty walk above covers every EDIT;
+// this covers what it cannot — the cold start, a chunk that streamed into a
+// slot whose old words are still there, and a chunk the ring budget turned
+// away. Deliberately NOT conditioned on C_DIRTYTICK, for the openness refresh's
+// reason: a hash tick compacts no dirty list, so the two rows above it are
+// skipped and this is the only thing keeping the field alive across it.
+PASS(glowRefresh, "glow", PT_TICK, PIPE_GLOW_REFRESH, K_COMPUTE, D_GLOWCHUNKS,1,1,
+     GRP_SIM, DYN_ZERO, C_GLOW, 1,
+     USES(R(Voxels) R(Materials) U(TickUBO) R(PageTable) RW(Glow)))
+
 // (The MLS-MPM spawn row moved into PT_FLUIDSEAM: with settle deleting
 // particles and excite creating them GPU-side, appends go through the seam's
 // compaction-owned count, not a CPU base.)
@@ -551,6 +606,16 @@ PASS(lr_fill_drawArgs, nullptr, PT_LOADRESET, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE
 // off must not leave stale stamps behind for the moment it is turned back on.
 PASS(lr_fill_opennessGen, nullptr, PT_LOADRESET, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE, DYN_NONE, C_ALWAYS, 1,
      USES(TW(OpennessGen)))
+// The glow field, for the identical reason one line up — and the whole buffer
+// rather than only its stamps, because a Fill row is VK_WHOLE_SIZE by
+// construction (vk_record.cpp) and 8.5 MiB of vkCmdFillBuffer on a LOAD is
+// free next to the voxel upload beside it. The stamps are what matters: a
+// loaded world replaces every chunk in the window, so every slot's source word
+// describes emitters that are gone, and only the stamp tells a reader that.
+// C_ALWAYS rather than C_GLOW for the openness row's reason: turning the field
+// off must not leave stale stamps behind for the moment it is turned back on.
+PASS(lr_fill_glow, nullptr, PT_LOADRESET, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE, DYN_NONE, C_ALWAYS, 1,
+     USES(TW(Glow)))
 PASS(lr_occupancyFull, "occupancyFull(loadReset)", PT_LOADRESET, PIPE_OCCUPANCY, K_COMPUTE, D_CHUNKS,1,1,
      GRP_SIM, DYN_ZERO, C_ALWAYS, 1,
      USES(R(Voxels) R(Materials) U(TickUBO) W(Occupancy) A(Hash) R(PageTable)))

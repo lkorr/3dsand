@@ -13,6 +13,20 @@
 #include "sim/world.h"  // kExplosionWg, kNumChunks (pass::kPassStride is in pass_table.h)
 
 namespace vk {
+
+// A SILENT OVERFLOW MADE LOUD. Both pipeline tables -- `Bindings::pipelines` in
+// vk_record.h and `TableBindings::pipelines` in rhi_record.h -- are fixed at 64
+// and indexed by `(int)pass::Pipe`, which grows every time a system adds a
+// kernel. The glow field's three entry points took it to 62. Nothing checked
+// it, and the failure would have been a write past the array inside the
+// recorder rather than a compile error. Lives in this .cpp rather than in
+// either header because a hub header costs the whole tree a recompile and this
+// assertion needs to hold in exactly one place to hold everywhere. Raise BOTH
+// literals together if it ever fires.
+static_assert((int)pass::Pipe::ShadowResolve < 64,
+              "pass::Pipe has outgrown the 64-entry pipeline tables in "
+              "rhi_record.h and vk_record.h -- raise BOTH");
+
 namespace {
 
 // ---- barrier_graph §3.2: Acc -> (stage, access) ---------------------------
@@ -103,6 +117,7 @@ bool Recorder::CondHolds(pass::Cond c, const RecordCtx& cx) {
     case pass::Cond::WaterDrain: return cx.waterDrainBodies > 0;
     case pass::Cond::WaterSweep: return cx.waterSweepSlot < kWaterBodyCap;
     case pass::Cond::Openness:   return cx.opennessChunks > 0;
+    case pass::Cond::Glow:       return cx.glowChunks > 0;
   }
   return false;
 }
@@ -125,6 +140,7 @@ uint32_t Recorder::Extent(uint32_t v, const RecordCtx& cx) {
     // chunk's columns); one THREAD per listed chunk for the quiescence probe.
     case pass::DispatchSel::WaterChunks:   return cx.waterChunkCount;
     case pass::DispatchSel::OpennessChunks: return cx.opennessChunks;
+    case pass::DispatchSel::GlowChunks: return cx.glowChunks;
     case pass::DispatchSel::WaterChunks64: return (cx.waterChunkCount + 63) / 64;
     case pass::DispatchSel::WaterDrainSel:
       return (cx.waterDrainBodies * kWaterDrainOpsPerBody + 63) / 64;
