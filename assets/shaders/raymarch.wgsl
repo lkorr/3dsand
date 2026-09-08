@@ -151,7 +151,18 @@ fn rsAdd(slot : u32, n : u32) {
 // and the call site disappears from the compiled fragment shader.
 const SHADOW_CACHE : bool = SHADOW_CACHE_AVAILABLE && TUNE_SHADOW_CACHE != 0;
 
-// ---- PER-FRAME PIPELINE SPECIALIZATION (W2-A) ------------------------------
+// ---- PER-FRAME PIPELINE SPECIALIZATION (W2-A) — MEASURED, DEFAULT OFF ------
+//
+// THE VERDICT FIRST, because these three consts read like a live feature and
+// are not one: specializing them away deletes 24.2% of the optimized SPIR-V and
+// buys 0.03-0.04 ms of a 6.83 / 20.94 ms frame, which is noise. --shader-stats
+// says why in one line — the fragment binary goes 1,605,888 -> 1,223,424 bytes
+// and the REGISTER COUNT STAYS AT 168, so occupancy never moves. The variant
+// therefore ships OFF (kRaymarchVariantOn, sim/simulation.cpp), where the full
+// numbers and the reason `shadow0`'s 3.59 ms does not generalize are recorded.
+// The consts stay `true` here and everything below stays wired, so flipping
+// that one line re-runs the experiment.
+//
 // Three booleans, and each one is the COMPILE-TIME MIRROR OF A UNIFORM THE CPU
 // WROTE FOR THIS FRAME. That phrasing is the whole correctness argument and it
 // is deliberately narrow: every predicate below is a value WriteRenderParams

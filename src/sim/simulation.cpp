@@ -1051,13 +1051,68 @@ constexpr unsigned kBuildThreads = 6;
 
 // ---- the specialized raymarch variant (W2-A) -------------------------------
 //
-// voxelbit.net compiles two variants of its trace pipeline and selects one per
-// frame; the branch it specializes away — its see-through-foliage check — cost
-// +0.169 ms even fully disabled, because a dynamic branch in a hot loop is paid
-// in REGISTERS whether or not it is taken. This engine has the same shape and
-// a measured cliff to go with it: 168 registers cost 3.5 ms against 128 in
-// trace() (the long note there), and `shadow0` minus `noshadow` prices one
-// call site's mere existence at 3.59 ms.
+// IMPLEMENTED, MEASURED, DEFAULT OFF. Kept in the shape this repo keeps its
+// other refuted optimizations (SUBOCC_SKIP in raymarch.wgsl, A3's cascade
+// shadow): flip the const below and the whole experiment re-runs, with the
+// `nospec` --render-budget arm as its instrument. Everything from here down is
+// live code; the only thing `false` costs the shipping build is that
+// BuildRaymarchVariant returns immediately, so no second module is assembled,
+// no second pipeline is compiled and no second SPIR-V cache entry exists.
+//
+// THE PREMISE. voxelbit.net compiles two variants of its trace pipeline and
+// selects one per frame; the branch it specializes away — its see-through-
+// foliage check — cost +0.169 ms even fully DISABLED, because a dynamic branch
+// in a hot loop is paid in REGISTERS whether or not it is taken. This engine
+// has the same shape and a measured cliff to go with it: 168 registers cost
+// 3.5 ms against 128 in trace() (the long note there), and `shadow0` minus
+// `noshadow` prices one call site's mere existence at 3.59 ms.
+//
+// WHAT IT ACTUALLY BOUGHT (RTX 3060 Ti, 1920x1080, exclusive lock,
+// --budget-arms baseline,nospec, 2026-09-08):
+//
+//   cascade camera   6.83 ms specialized   6.86 universal   -0.03 ms (-0.4%)
+//   meadow camera   20.94 ms specialized  20.98 universal   -0.04 ms (-0.2%)
+//
+// Nothing. Both deltas are inside the run-to-run spread of the harness.
+//
+// AND --shader-stats SAYS WHY, which is the part worth inheriting:
+//
+//   pipeline        Register Count   Binary Size   spill
+//   raymarch                   168     1,605,888   +192 B/thread
+//   raymarchLean               168     1,223,424   +192 B/thread
+//
+// The BINARY shrank 23.8% (matching the 24.2% the optimized SPIR-V shrank) and
+// the REGISTER COUNT DID NOT MOVE AT ALL. Occupancy is what buys frames on this
+// shader, and the specialization did not touch it.
+//
+// THE LESSON, because it is the opposite of what `shadow0` taught and the two
+// look identical from a distance: a call site costs registers when its live
+// ranges INTERLEAVE with the code around it. `sunShadowAt` was an inlined
+// trace() in the middle of the primary shading path, so its values and the
+// shading's values were alive at the same program points and the allocator had
+// to hold both. `fluidMarch` is called ONCE, into a 4-field struct, under a
+// uniform branch; its internal values die inside its own region and never
+// coexist with trace()'s DDA, which is what actually sets this shader's
+// 168-register ceiling. Deleting it removes a quarter of the BINARY and none of
+// the PEAK. Instruction footprint is not occupancy, and this shader is not
+// instruction-fetch bound.
+//
+// So the general form of "specialize a frame-constant branch out of the hot
+// shader" is NOT free money here. The test to apply before trying it again is
+// not "how much code does the branch guard" — it is "does that code's register
+// pressure coexist with the hot loop's". --shader-stats answers it for a few
+// minutes and no code at all.
+//
+// WHAT IT COSTS WHEN ON, since that is the other half of the verdict: a second
+// full compile of the biggest fragment shader in the engine. Measured on this
+// tree, cold: spirv-opt 7.6-48.8 s for `raymarch.lean:fs` on top of the
+// universal's 11.7-17.8 s (the wide range is contention with the far cascades'
+// own optimizer run on a neighbouring thread), plus its driver compile, plus a
+// second SPIR-V disk-cache entry. Deferred off the first-frame path, so it is
+// not latency the player sees — but it is real machine time for a measured
+// zero.
+//
+constexpr bool kRaymarchVariantOn = false;
 //
 // WHY THE SUBSTITUTION IS HERE AND NOT IN THE PRELUDE. The natural home for a
 // per-variant `const` is ShaderConstantPrelude() in gpu/resources.cpp, next to
@@ -1080,6 +1135,11 @@ constexpr unsigned kBuildThreads = 6;
 void Simulation::BuildRaymarchVariant(const rhi::Device& device,
                                       const rhi::ShaderModule& base) {
   raymarchLeanModule_ = {};
+  // The one line the refutation above costs the shipping build. Everything
+  // downstream keys on `raymarchLeanModule_` being invalid, so an off build
+  // assembles no second source, compiles no second pipeline, and adds no
+  // second SPIR-V cache entry.
+  if (!kRaymarchVariantOn) return;
   if (!base) return;
   std::string src = rhi::vkr::ModuleSource(base);
   if (src.empty()) return;

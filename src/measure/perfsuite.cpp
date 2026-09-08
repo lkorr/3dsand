@@ -2499,23 +2499,31 @@ bool CamCanopy(Scene& s, uint32_t& tick, std::string& why) {
   return true;
 }
 
+// NOTE ON `nospec`, which is in kExtraArms and deliberately in NONE of these
+// lists: the raymarch variant it measures ships OFF (kRaymarchVariantOn in
+// sim/simulation.cpp, where the refutation is recorded), so on a default build
+// the arm draws the same pipeline as `baseline` and prints 0.00 ms. A standing
+// 0.00 row reads as "this feature is free" rather than "this feature is not
+// compiled", which is the trap this repo already names as "absolute zero is a
+// rate claim". Ask for it explicitly — `--budget-arms baseline,nospec` — when
+// you have flipped the const back on and want the experiment re-run.
 const char* const kArmsReduced[] = {
-    "baseline", "noshadow", "nofar", "noreflect", "halfres", "nospec", nullptr};
+    "baseline", "noshadow", "nofar", "noreflect", "halfres", nullptr};
 // The cascade camera: the far march IS the frame here, so the rows that matter
 // are the ones that price it and the ones that bound what is left. `nofar` is
 // the ceiling on everything the cascade could ever cost.
 const char* const kArmsCascade[] = {
-    "baseline", "nofar", "noshadow", "halfres", "nospec", nullptr};
+    "baseline", "nofar", "noshadow", "halfres", nullptr};
 // The foliage cameras: the picture-dependent rows plus the ceilings that only
 // mean something with plants in the frame. `nomicro` is the ceiling on the
 // whole plant march; `micro1` / `plantlod4` price its two knobs; `lod8` and
 // `fine2m` bound the fine march the plants are part of.
 const char* const kArmsFoliage[] = {
     "baseline", "noshadow",  "nogi", "nofar",  "halfres", "nomicro",
-    "micro1",   "plantlod4", "lod8", "fine2m", "nospec",  nullptr};
+    "micro1",   "plantlod4", "lod8", "fine2m", nullptr};
 const char* const kArmsSubmerged[] = {
-    "baseline", "noshadow", "nofar",      "noreflect",
-    "halfres",  "nogodray", "godshadow0", "nospec", nullptr};
+    "baseline", "noshadow", "nofar",       "noreflect",
+    "halfres",  "nogodray", "godshadow0",  nullptr};
 
 const BudgetCam kBudgetCams[] = {
     {"noon",
