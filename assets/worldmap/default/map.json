@@ -41,8 +41,8 @@
       "id": "spawn",
       "kind": "spawn",
       "at": [
-        900,
-        900
+        -3879,
+        2522
       ],
       "about": "Where the game starts, and the centre of the calm home area (worldgen.spawnPlain*). Outside the harness pad by more than the widest crown reach (115 vox past x/z 640), on forced forest, on land: the spawn-site gate checks all of that."
     },

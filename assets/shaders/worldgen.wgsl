@@ -1714,6 +1714,25 @@ fn wmWaterRow(b : u32, i : u32, w : u32) -> i32 {
 // sides; the driver folds it.
 fn pondTile() -> i32 { return POND_TILE; }
 fn pondBand() -> i32 { return i32(worldMap[WM_H_POND_BAND]); }
+// ---- THE UNROLL FENCE ------------------------------------------------------
+// An OPAQUE ZERO: always 0 at runtime (no authored pond tile or shore band
+// reaches 1<<20 voxels = 52 km), but unprovable at compile time. Added to the
+// start of a constant-trip-count loop it changes nothing the GPU executes and
+// everything the driver's optimizer does: a loop whose trip count it cannot
+// prove is a loop it cannot UNROLL, so the loop body — for the loops below,
+// a full landColumn or treeInfoAt inline, ~half of worldgen each — exists in
+// the kernel ONCE instead of 4/16/25 times. P-F's pond table grew landColumn
+// past the driver's superlinear compile cliff, and the `far` entry point
+// (4-corner blocker scan x 16x4 cell loop over that code) went from part of a
+// slow minute to tens of minutes at ~10 GB — a load screen that never ends.
+// Same trick as moving the curve knots off the prelude (2026-09-02): starve
+// the const-folder, keep the values.
+fn unrollFence() -> i32 {
+  return i32((worldMap[WM_H_POND_TILE] | worldMap[WM_H_POND_BAND]) >> 20u);
+}
+fn unrollFenceU() -> u32 {
+  return (worldMap[WM_H_POND_TILE] | worldMap[WM_H_POND_BAND]) >> 20u;
+}
 // Knot k (0..16) of the preset's depth profile, Q8; two per word, low first.
 fn waterKnot(p : u32, k : u32) -> i32 {
   return i32((wmWater(p, WM_W_KNOTS + (k >> 1u)) >> ((k & 1u) * 16u)) & 0xFFFFu);
@@ -2392,8 +2411,8 @@ fn treeCandsInto(c : ptr<function, TreeCands>, x : i32, z : i32, seed : u32, pon
   let maxReach = treeMaxReach();
   let tx = fdiv(x, TREE_TILE);
   let tz = fdiv(z, TREE_TILE);
-  for (var oz = -TREE_SCAN; oz <= TREE_SCAN; oz++) {
-    for (var ox = -TREE_SCAN; ox <= TREE_SCAN; ox++) {
+  for (var oz = -TREE_SCAN + unrollFence(); oz <= TREE_SCAN; oz++) {
+    for (var ox = -TREE_SCAN + unrollFence(); ox <= TREE_SCAN; ox++) {
       // Horizontal reject on the trunk site alone (one hash), against the
       // WIDEST species in the atlas. Only the tiles whose trunk can reach
       // this column go on to the noise queries below; on a coarse lattice
@@ -2747,8 +2766,8 @@ fn cactusCell(c : Cactus, x : i32, y : i32, z : i32, seed : u32) -> u32 {
 fn cactusAt(x : i32, y : i32, z : i32, seed : u32, ponds : ptr<function, PondSet>) -> u32 {
   let tx = fdiv(x, CACTUS_TILE);
   let tz = fdiv(z, CACTUS_TILE);
-  for (var oz = -CACTUS_SCAN; oz <= CACTUS_SCAN; oz++) {
-    for (var ox = -CACTUS_SCAN; ox <= CACTUS_SCAN; ox++) {
+  for (var oz = -CACTUS_SCAN + unrollFence(); oz <= CACTUS_SCAN; oz++) {
+    for (var ox = -CACTUS_SCAN + unrollFence(); ox <= CACTUS_SCAN; ox++) {
       let c = cactusInfo(tx + ox, tz + oz, seed, ponds);
       if (!c.present) { continue; }
       // HORIZONTAL reject. Must cover the widest thing the species can produce
@@ -2940,8 +2959,8 @@ fn undergrowthSite(x : i32, z : i32, seed : u32, ponds : ptr<function, PondSet>)
 
   let tx = fdiv(x, TREE_TILE);
   let tz = fdiv(z, TREE_TILE);
-  for (var oz = -TREE_SCAN; oz <= TREE_SCAN; oz++) {
-    for (var ox = -TREE_SCAN; ox <= TREE_SCAN; ox++) {
+  for (var oz = -TREE_SCAN + unrollFence(); oz <= TREE_SCAN; oz++) {
+    for (var ox = -TREE_SCAN + unrollFence(); ox <= TREE_SCAN; ox++) {
       let t = treeInfo(tx + ox, tz + oz, seed, ponds);
       if (!t.present) { continue; }
       let dx = x - t.wx;
@@ -4414,8 +4433,8 @@ fn genCellCol(col : Col, c : vec3<i32>, seed : u32) -> u32 {
 fn treeCanopyAt(x : i32, z : i32, seed : u32, ponds : ptr<function, PondSet>) -> u32 {
   let tx = fdiv(x, TREE_TILE);
   let tz = fdiv(z, TREE_TILE);
-  for (var oz = -TREE_SCAN; oz <= TREE_SCAN; oz++) {
-    for (var ox = -TREE_SCAN; ox <= TREE_SCAN; ox++) {
+  for (var oz = -TREE_SCAN + unrollFence(); oz <= TREE_SCAN; oz++) {
+    for (var ox = -TREE_SCAN + unrollFence(); ox <= TREE_SCAN; ox++) {
       let t = treeInfo(tx + ox, tz + oz, seed, ponds);
       if (!t.present) { continue; }
       // The species' own far-field proxy material, out of the atlas: the mid
@@ -4593,10 +4612,15 @@ fn farBlockerBitAt(topC : i32, cc : vec3<i32>, shift : u32, seed : u32) -> u32 {
   let x0 = cc.x << shift; let x1 = x0 + step - 1;
   let z0 = cc.z << shift; let z1 = z0 + step - 1;
   var top = topC;
-  top = max(top, farColTop(x0, z0, seed));
-  top = max(top, farColTop(x1, z0, seed));
-  top = max(top, farColTop(x0, z1, seed));
-  top = max(top, farColTop(x1, z1, seed));
+  // One rolled loop, not four straight-line calls: each farColTop inlines a
+  // full landColumn, and the unroll fence keeps this body in the kernel once
+  // (see unrollFence(); this function is what made `far`/`fardown` compile
+  // forever after P-F grew landColumn).
+  for (var ci = unrollFenceU(); ci < 4u; ci++) {
+    let cx = select(x0, x1, (ci & 1u) != 0u);
+    let cz = select(z0, z1, (ci & 2u) != 0u);
+    top = max(top, farColTop(cx, cz, seed));
+  }
   return select(0u, FAR_BLOCKER_BIT, y0 <= top);
 }
 
@@ -4771,7 +4795,7 @@ fn genChunk(slot : u32, li : u32, actIdx : u32) {
     colTop = max(colTop, trees.top);
     colTop = max(colTop, wmSiteTopAt(wx, wz, T.seed));
     if (!wmFlag(col.biome, WM_BF_CACTI) && base.y > colTop) {
-      for (var ly = 0u; ly < CHUNK; ly += 1u) {
+      for (var ly = unrollFenceU(); ly < CHUNK; ly += 1u) {
         voxStore(voxWordInChunk(slot, lx + ly * CHUNK + lz * CHUNK * CHUNK), 0u);
       }
       continue;
@@ -4791,7 +4815,7 @@ fn genChunk(slot : u32, li : u32, actIdx : u32) {
     stalk.mat = MAT_AIR;
     stalk.height = -1;     // the "nobody memoized this" sentinel
     if (stalkValid) { stalk = flowerAt(wx, wz, T.seed, UG_COVER_EDGE); }
-    for (var ly = 0u; ly < CHUNK; ly += 1u) {
+    for (var ly = unrollFenceU(); ly < CHUNK; ly += 1u) {
       let i = lx + ly * CHUNK + lz * CHUNK * CHUNK;
       let w = genCellIn(col, &cave, caveValid, &trees, true, &ponds, stalk,
                         wx, base.y + i32(ly), wz, T.seed);
@@ -5060,25 +5084,64 @@ fn far(@builtin(workgroup_id) wg : vec3<u32>,
   // Column tops for the blocker bit, hoisted out of the y loop for the same
   // reason the columns themselves are: they depend on (x, z) alone.
   var tops : array<i32, 4>;
-  for (var b = 0u; b < 4u; b++) {
+  // Corner-max tops for the ONE surface-band cell of each column — the middle
+  // band of farBlockerBitAt — hoisted out of the y loop like `tops`, but for
+  // COMPILE cost, not run cost. farBlockerBitAt's middle band inlines FOUR
+  // farColTop, each a full landColumn, and calling it from the 16x4 cell loop
+  // put those four copies inside the loop body the driver unrolls; after P-F
+  // grew landColumnBare with the pond-table machinery (pondScan + two
+  // pondGates) the driver's compile of this entry point went from part of a
+  // slow minute to tens of minutes at ~10 GB, which read as "the game never
+  // loads". For a fixed topC exactly one multiple of `step` lies inside
+  // (topC, topC + step), so the middle band fires for at most one cc.y per
+  // column: compute that row's corner max here, once per column, and the cell
+  // loop below is pure arithmetic — same values, same laziness.
+  var btops : array<i32, 4>;
+  let step = 1 << shift;
+  for (var b = unrollFenceU(); b < 4u; b++) {
     let cc = base + vec3<i32>(i32(x0 + b), 0, i32(zi));
     let fine = (cc << vec3<u32>(shift)) + vec3<i32>(1 << (shift - 1u));
     cols[b] = genColumn(fine.x, fine.z, T.seed);
     tops[b] = farColTopFrom(cols[b].h, cols[b].fluidTop, fine.x, fine.z, T.seed);
+    btops[b] = tops[b];
+    // The only cell row whose span can straddle the top: y0 = bcy * step is
+    // the one multiple of step in (topC, topC + step]. Strictly inside means
+    // the middle band exists; the range test means it is one of OUR rows.
+    let bcy = fdiv(tops[b], step) + 1;
+    if (bcy * step - tops[b] < step &&
+        bcy >= base.y && bcy < base.y + i32(CHUNK)) {
+      let cx0 = cc.x << shift; let cx1 = cx0 + step - 1;
+      let cz0 = cc.z << shift; let cz1 = cz0 + step - 1;
+      var t = tops[b];
+      for (var ci = unrollFenceU(); ci < 4u; ci++) {
+        let cx = select(cx0, cx1, (ci & 1u) != 0u);
+        let cz = select(cz0, cz1, (ci & 2u) != 0u);
+        t = max(t, farColTop(cx, cz, T.seed));
+      }
+      btops[b] = t;
+    }
   }
   let planeBase = ((level - 1u) * FAR_VOX + slot * CHUNK_VOL) / 4u;
   var top = 0u;   // one plus the highest row with a non-empty cell, this thread
-  for (var yi = 0u; yi < CHUNK; yi++) {
+  for (var yi = unrollFenceU(); yi < CHUNK; yi++) {
     var word = 0u;
-    for (var b = 0u; b < 4u; b++) {
+    for (var b = unrollFenceU(); b < 4u; b++) {
       let cc = base + vec3<i32>(i32(x0 + b), i32(yi), i32(zi));
       // the sieve: fine-voxel center of the 2^shift-wide region this cell covers
       let fine = (cc << vec3<u32>(shift)) + vec3<i32>(1 << (shift - 1u));
       let col = cols[b];
       let mat = genCellCol(col, fine, T.seed) & 0xFFFu;
       // The conservative flag first: it is what a cell keeps when the centre
-      // sample found nothing (common.wgsl FAR_BLOCKER_BIT).
-      var byteV = farBlockerBitAt(tops[b], cc, shift, T.seed);
+      // sample found nothing (common.wgsl FAR_BLOCKER_BIT). This is
+      // farBlockerBitAt flattened onto the hoisted `tops`/`btops` — see the
+      // comment above the b loop; the three bands are byte-identical.
+      let y0 = cc.y << shift;
+      var byteV = 0u;
+      if (y0 <= tops[b]) {
+        byteV = FAR_BLOCKER_BIT;
+      } else if (y0 - tops[b] < step) {
+        byteV = select(0u, FAR_BLOCKER_BIT, y0 <= btops[b]);
+      }
       if (farCellIsSolid(mat)) {
         // shape from the center sample, color from the surface skin (phase 4)
         byteV |= min(farSurfaceMat(col, mat, fine, shift, T.seed), FAR_MAT_MASK);
