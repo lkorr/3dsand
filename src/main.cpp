@@ -2814,7 +2814,7 @@ int main(int argc, char** argv) {
           "  --perf-out <path>     Where --perf writes its JSON\n"
           "  --perf-w/--perf-h <n> Offscreen render size for --perf/--render-budget\n"
           "  --render-budget       Where INSIDE the raymarch the GPU frame went\n"
-          "  --budget-cams <list>  --render-budget cameras (noon,dusk,submerged,meadow,canopy; default all)\n"
+          "  --budget-cams <list>  --render-budget cameras (noon,dusk,cascade,submerged,meadow,canopy; default all)\n"
           "  --shader-stats        Per-shader registers/spills from the driver\n"
           "                        -> build/shader_stats.json (headless)\n\n"
           "Residency:\n"
@@ -2938,8 +2938,8 @@ int main(int argc, char** argv) {
       perfOpt.only = argv[++i];
       perf = true;
     }
-    // `--budget-cams noon,dusk,submerged,meadow,canopy` picks which of
-    // --render-budget's cameras run (default: all five). It does NOT imply --render-budget —
+    // `--budget-cams noon,dusk,cascade,submerged,meadow,canopy` picks which of
+    // --render-budget's cameras run (default: all six). It does NOT imply --render-budget —
     // unlike --scenario, which has to imply --perf because that is the only
     // harness it means anything to. This one is a modifier on a mode you
     // already asked for, and silently turning a 3-camera budget on because

@@ -2043,6 +2043,33 @@ bool CamDusk(Scene& s, uint32_t& tick, std::string& why) {
   return true;
 }
 
+// THE CASCADE CAMERA — the far field's own budget, and it did not exist until
+// 2026-09-07 even though the far march is the largest single term in a flight
+// frame. Every camera above looks DOWN from moderate height, so nearly every
+// pixel lands inside the residency window: measured on the overlook, the
+// cascade resolves ZERO pixels (rmPxFar 0.000) while still costing 1.77 ms of a
+// 14.06 ms frame. That is a real and quotable number — it is the price of
+// SEARCHING empty air — but it can never report what the cascade costs when it
+// is actually DRAWING, so no arm of any far-field change could be judged here.
+//
+// The numbers are `screenshot_cascade`'s (main.cpp), deliberately, so the frame
+// this times is the frame the look review looks at. Both are load-bearing and
+// the comment there says why: the eye must be well ABOVE the terrain, because
+// the residency window is only half a window edge in radius (25.6 m), and the
+// pitch must be near-horizontal or the frame fills with the window again.
+// ~50% of its pixels come from traceFar.
+bool CamCascade(Scene& s, uint32_t& tick, std::string& why) {
+  (void)why;
+  const int h108 = World::TerrainHeight(108, 108, kDefaultSeed);
+  s.eye = {108.0f, (float)(h108 + 300), 108.0f};
+  s.cam.yaw = 0.785f;
+  s.cam.pitch = -0.06f;
+  s.note = "300 voxels over the terrain, near-horizontal — the far cascades "
+           "ARE this frame (~50% of its pixels)";
+  tick = FindNoonTick(CurrentTuning());
+  return true;
+}
+
 // INSIDE the lake. `shadeSubmerged` — god rays, silt, the caustic web on the
 // bed, Snell's window at the underside of the surface — is reached by exactly
 // one predicate in the whole renderer (`raymarch.wgsl`, `h.liqT < 0.05`), and
@@ -2433,6 +2460,11 @@ bool CamCanopy(Scene& s, uint32_t& tick, std::string& why) {
 
 const char* const kArmsReduced[] = {
     "baseline", "noshadow", "nofar", "noreflect", "halfres", nullptr};
+// The cascade camera: the far march IS the frame here, so the rows that matter
+// are the ones that price it and the ones that bound what is left. `nofar` is
+// the ceiling on everything the cascade could ever cost.
+const char* const kArmsCascade[] = {
+    "baseline", "nofar", "noshadow", "halfres", nullptr};
 // The foliage cameras: the picture-dependent rows plus the ceilings that only
 // mean something with plants in the frame. `nomicro` is the ceiling on the
 // whole plant march; `micro1` / `plantlod4` price its two knobs; `lod8` and
@@ -2451,6 +2483,9 @@ const BudgetCam kBudgetCams[] = {
      CamNoon, nullptr},
     {"dusk", "the same overlook with the sun ~8 deg above the horizon",
      CamDusk, kArmsReduced},
+    {"cascade",
+     "300 voxels up, near-horizontal — the only camera the FAR FIELD draws",
+     CamCascade, kArmsCascade},
     {"submerged",
      "eye inside the authored lake — god rays, caustics, Snell's window",
      CamSubmerged, kArmsSubmerged},
@@ -2692,8 +2727,20 @@ class RenderBudgetRunner {
   //
   // Returns false (and leaves `out` zero) when the device compiled the
   // counters out — fragment atomics are a capability, not a given.
-  bool Stats(const Scene& s, double out[kRenderStatSlots]) {
+  // THE COUNTERS MUST BE TAKEN AT THE BASELINE TUNING, and until 2026-09-07
+  // they were taken at whatever the LAST ARM left behind. `Measure` applies an
+  // arm to a copy of the base and leaves it applied — the next arm restores it,
+  // and after the last arm nobody does. With the default arm list that is
+  // invisible: `halfres` is last, it mutates no tuning, and its own
+  // SetCurrentTuning(base) puts the world back. Name a subset and it is not:
+  // `--budget-arms baseline,nofar` printed a whole counter table measured with
+  // farSteps = 0, i.e. `rmFarSteps 0.000` on a camera whose far march is 12% of
+  // the frame. Restoring `base` here is the fix and costs nothing — Measure
+  // already reloads whenever `dirty_` says the constants are stale, and this
+  // reload was happening anyway.
+  bool Stats(const Tuning& base, const Scene& s, double out[kRenderStatSlots]) {
     for (uint32_t k = 0; k < kRenderStatSlots; k++) out[k] = 0;
+    SetCurrentTuning(base);
     SetRenderStatsEnabled(true);
     const bool reloaded = sim_.ReloadShaders(ctx_.device);
     SetRenderStatsEnabled(false);
@@ -3007,7 +3054,7 @@ int RunRenderBudget(GpuContext& ctx, World& world, Simulation& sim,
       cr.arms.push_back(r);
     }
     // The counters, from a second compile at the baseline tuning (Stats).
-    cr.haveStats = runner.Stats(scene, cr.stats);
+    cr.haveStats = runner.Stats(base, scene, cr.stats);
     runner.RestoreBase(base);
     // `noon` keeps writing build/render_budget.bmp under its old name as well:
     // that path is what every previous run and every reader already knows.
