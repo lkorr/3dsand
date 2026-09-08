@@ -1505,6 +1505,64 @@ void SubmitWorldgen(GpuContext& ctx, World& world, Simulation& sim, uint32_t see
       }
       world.pages->FlushTableWrites(ctx.queue);
     }
+    // ---- THE WAKE THE CPU MIRROR NEVER LEARNED ------------------------
+    //
+    // genChunk WAKES WHAT IT GENERATES: its tail stores
+    // dirtyIn[slot] = dirtyOut[slot] = 1 for every slot holding a cell that
+    // `matCanAct` (worldgen.wgsl, "THE STREAMING WAKE"). That is a dirty-set
+    // MUTATION, and §3.2a's rule for those is that the CPU mirror must learn
+    // the same set in the same breath — Simulation::EncodeWakeAll says it in
+    // as many words and does both halves in one call, because two operations
+    // that must agree is the shape this repo has checkers for everywhere.
+    //
+    // This path did neither half. ResetAllEmpty above clears cpuDirty, and
+    // nothing here ever put the woken chunks back, so the FIRST TICK AFTER
+    // ANY WORLDGEN dispatched the CA over every acting chunk in the window
+    // while the mirror believed the world was asleep. Materialize's set was
+    // that tick's op ring alone; every CA write that crossed a chunk
+    // boundary into a chunk still held as a sentinel resolved to PT_NO_WORD
+    // and voxStore DROPPED IT. Measured on main at ad35ed7: `lost sand
+    // (id 3) | FIRST sim_step tick 80001 chunk (352,208,480) entry
+    // 0x80000000` — tick 80001 is the first step of the gi-nightfall gate,
+    // whose base tick is 80000 and which regenerates the world one line
+    // before it. Exactly the streaming path's 217-fault bug with the sides
+    // swapped (see PageTable::RefilledSlot), and invisible until the map
+    // edit at 49137b8 moved spawn and repainted the planes: the fault needs
+    // acting matter sitting on a chunk boundary with an ALL-AIR chunk on the
+    // other side of it, which is a cliff edge, and which terrain the window
+    // happens to hold decides.
+    //
+    // READ THE FLAGS BACK rather than recomputing matCanAct on the CPU. The
+    // GPU's dirty buffer IS the wake, so a mirror taken from it cannot
+    // disagree with it; a second implementation of the act predicate is the
+    // divergence rule 3 of the design guidelines forbids. 128 KiB once per
+    // worldgen, beside the 16 synchronous 32 MiB voxel reads the loop above
+    // already pays.
+    //
+    // RefilledSlot, NOT WakeAll, and the difference is CLAUDE.md rule 2.
+    // Contributor (d) is defined for precisely this case ("a slot the CPU
+    // wrote dirty[0] AND dirty[1] for"), it is unioned AFTER the next tick's
+    // tightening so an intersection cannot undo it, and it rides the C(j)
+    // ring. WakeAll would also be sound and would be WRONG: it declares all
+    // 32,768 slots, so Materialize's hasMatter half would page in every
+    // buried stone chunk in the window plus its 26-ring — the JITTER
+    // compression win deleted at every worldgen, in the one band CLAUDE.md
+    // names as what actually fills the pool. The act set is DEMAND: these
+    // are the chunks the CA is about to be dispatched over anyway, and their
+    // ring is the write reach (<= 1 cell, rule 1) of that dispatch and
+    // nothing wider.
+    uint32_t woken = 0;
+    {
+      std::vector<uint32_t> woke((size_t)kNumChunks, 0u);
+      rhi::ReadbackBlocking(ctx.device, ctx.queue, world.dirty[0], 0,
+                            woke.data(), (size_t)kNumChunks * 4, "wgWake");
+      for (uint32_t s = 0; s < kNumChunks; s++) {
+        if (woke[s] == 0u) continue;
+        world.pages->RefilledSlot(s);
+        woken++;
+      }
+    }
+
     // ZERO THE FAULT COUNTER AFTER WORLDGEN, and only here.
     //
     // Worldgen is the one writer that legitimately stores through sentinels:
@@ -1523,11 +1581,11 @@ void SubmitWorldgen(GpuContext& ctx, World& world, Simulation& sim, uint32_t see
     const uint32_t faultZero[kPageFaultWords] = {};
     ctx.queue.WriteBuffer(world.pageFaults, 0, faultZero, sizeof(faultZero));
     std::printf("worldgen (paged, %u-slot batches): %u pages in use "
-                "(%.1f MiB of %.1f MiB pool), high water %u\n",
+                "(%.1f MiB of %.1f MiB pool), high water %u, woke %u chunks\n",
                 kGenBatch, world.pages->PagesInUse(),
                 (double)world.pages->PagesInUse() * kChunkVol * 4.0 / 1048576.0,
                 (double)world.pages->PoolPages() * kChunkVol * 4.0 / 1048576.0,
-                world.pages->PagesHighWater());
+                world.pages->PagesHighWater(), woken);
     return;
   }
 }
