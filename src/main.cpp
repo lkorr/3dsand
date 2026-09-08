@@ -274,7 +274,34 @@ bool g_autoflyPark = false;
 // there. The manual half of the melee gates — `swing` and `swing-plane` assert
 // the trajectory and the wound, and this is where a person judges the FEEL.
 bool g_duelDummy = false;
-constexpr uint32_t kParkFlyTicks = 300;    // fly this far out, then stop
+// SANDVOX_PARK_AT="x,y,z": park at a NAMED PLACE instead of wherever the
+// procedural surface route happens to stop.
+//
+// The route is dt-integrated, so where it ends is not a choice anybody made —
+// the 2026-08-24 answer below came back "97% of the survivors contain LAVA"
+// because that is what the flight passed over, and a re-run on 2026-09-08
+// landed in open desert and settled to 0 active chunks. Neither run says
+// anything about a material it never flew over. "Which materials hold a chunk
+// awake" is a question about a PLACE, and this engine has places at known
+// addresses: `World::AuthoredPoolList` gives the authored lake's centre and
+// waterline, `--voxdump`'s coordinates give any other.
+//
+//   SANDVOX_PARK_AT=420,230,420 ./sandvox.exe --autofly-park --frames 600
+//
+// With it set the fly phase is skipped (the point is the sample, not the
+// route), so the settle window starts almost immediately.
+bool ParkAtPos(Vec3& out) {
+  static const char* e = getenv("SANDVOX_PARK_AT");
+  if (!e) return false;
+  float v[3] = {0, 0, 0};
+  if (std::sscanf(e, "%f,%f,%f", &v[0], &v[1], &v[2]) != 3) return false;
+  out = Vec3{v[0], v[1], v[2]};
+  return true;
+}
+uint32_t ParkFlyTicks() {
+  Vec3 unused;
+  return ParkAtPos(unused) ? 5u : 300u;   // fly this far out, then stop
+}
 // Settle window, in ticks, before the sample is taken. Overridable because the
 // whole question is "does this decay or plateau", and one duration cannot
 // answer it: SANDVOX_PARK_SETTLE=3000 is what separates a very slow settle from
@@ -294,6 +321,12 @@ Vec3 g_parkPos{};
 // material that is in every active chunk is only a suspect if it is NOT in
 // every chunk. Cleared between the two samples.
 std::vector<IVec3> g_parkActiveIds, g_parkIdleIds;
+// A third arm that is a PLACE rather than a population: every chunk in a box
+// around the park point. The active/idle arms answer "what is awake"; they
+// stride over the whole 512^3 window, so parked at a pond they mostly sample
+// desert and reported "0 of 0 submerged liquid cells" twice. To ask a question
+// ABOUT WATER you have to go and fetch the water.
+std::vector<IVec3> g_parkBoxIds;
 
 // Where the active chunks are and what they are made of, at one instant.
 // Split out from the schedule below because the SAME question has to be asked
@@ -344,6 +377,31 @@ void ParkSampleRequest(World& world, const char* label) {
   };
   sample(true, g_parkActiveIds);
   sample(false, g_parkIdleIds);
+
+  // The box arm. 9 x 5 x 9 = 405 chunks against a fetch ring of 64/tick and 40
+  // ticks before the report, so it lands comfortably. Centred on the park point
+  // and taller downward than upward, because a body of water is UNDER the
+  // camera, not around it.
+  g_parkBoxIds.clear();
+  if (g_parkPosSet) {
+    // Anchored to the GROUND under the park point, not to the camera. The
+    // camera's altitude is whatever SANDVOX_PARK_AT was told; the water is at
+    // terrain height, and a box hung off the camera missed a pond by ~90
+    // voxels and reported "0 of 0 submerged liquid cells" twice.
+    const int px = (int)std::floor(g_parkPos.x);
+    const int pz = (int)std::floor(g_parkPos.z);
+    const int gh = World::TerrainHeight(px, pz, kDefaultSeed);
+    const IVec3 pc{px >> 4, gh >> 4, pz >> 4};
+    std::printf("park[%s]: box centre world chunk (%d,%d,%d), ground y %d\n",
+                label, pc.x, pc.y, pc.z, gh);
+    for (int dz = -4; dz <= 4; dz++)
+      for (int dy = -3; dy <= 2; dy++)
+        for (int dx = -4; dx <= 4; dx++) {
+          const IVec3 wc{pc.x + dx, pc.y + dy, pc.z + dz};
+          world.RequestChunkFetch(wc);
+          g_parkBoxIds.push_back(wc);
+        }
+  }
 }
 
 void ParkSampleReport(World& world, const std::vector<MaterialDef>& mats,
@@ -373,6 +431,78 @@ void ParkSampleReport(World& world, const std::vector<MaterialDef>& mats,
   // can decline to wake, and if it is empty the predicate cannot pay whatever
   // else is true. Same three tests as matCanAct in common.wgsl, on the CPU
   // copy of the same table.
+  // ---- THE HYDROSTATIC INVARIANT, COUNTED ---------------------------------
+  //
+  // "An eighth is a SURFACE thing; anything with water on top of it is full."
+  // That is a per-CELL statement, and the dirty-reason histogram cannot check
+  // it: those bits are OR'd per CHUNK, so `equalize` and `SUBMERGED` appearing
+  // together says only that both happened somewhere in the same 16^3 box, not
+  // that one happened to the other. (That distinction cost a wrong reading of
+  // the first stage histogram — worth stating, because every per-chunk mask in
+  // this engine has the same trap in it.)
+  //
+  // So count the thing itself, out of the voxels the park probe has already
+  // fetched: a liquid cell with the SAME liquid directly above it, holding
+  // fewer than 8 eighths. Zero is the invariant holding. The top row of each
+  // chunk is skipped because its neighbour lives in a chunk this sample may not
+  // have pulled; that costs 1/16 of the population and no accuracy in an
+  // is-it-zero question.
+  auto underfull = [&](const std::vector<IVec3>& ids) {
+    uint64_t submerged = 0, partial = 0;
+    for (const IVec3& wc : ids) {
+      const CachedChunk* cc = world.Cached(wc);
+      if (!cc || cc->voxels.size() != kChunkVol) continue;
+      for (uint32_t z = 0; z < kChunk; z++)
+        for (uint32_t y = 0; y + 1 < kChunk; y++)
+          for (uint32_t x = 0; x < kChunk; x++) {
+            const uint32_t w = cc->voxels[(z * kChunk + y) * kChunk + x];
+            const uint32_t m = w & 0xFFFu;
+            if (m == 0 || m >= mats.size()) continue;
+            if (mats[m].gpu.klass != CLASS_LIQUID) continue;
+            const uint32_t a = cc->voxels[(z * kChunk + y + 1) * kChunk + x];
+            if ((a & 0xFFFu) != m) continue;   // free surface: may be partial
+            submerged++;
+            if (((w >> 12) & 0xFu) != 7u) partial++;  // state nibble = f - 1
+          }
+    }
+    return std::pair<uint64_t, uint64_t>(partial, submerged);
+  };
+  {
+    const auto a = underfull(g_parkActiveIds), b = underfull(g_parkIdleIds);
+    const auto x = underfull(g_parkBoxIds);
+    std::printf("park[%s]: HYDROSTATIC submerged-but-PARTIAL: box %llu/%llu "
+                "(%.2f%%) | active %llu/%llu | idle %llu/%llu\n", label,
+                (unsigned long long)x.first, (unsigned long long)x.second,
+                x.second ? 100.0 * (double)x.first / (double)x.second : 0.0,
+                (unsigned long long)a.first, (unsigned long long)a.second,
+                (unsigned long long)b.first, (unsigned long long)b.second);
+    // The SHAPE of the answer, not just its size: where the eighths actually
+    // are. A healthy body is "surface cells hold 1..8, submerged cells hold 8".
+    uint64_t surfH[9] = {0}, subH[9] = {0};
+    for (const IVec3& wc : g_parkBoxIds) {
+      const CachedChunk* cc = world.Cached(wc);
+      if (!cc || cc->voxels.size() != kChunkVol) continue;
+      for (uint32_t z = 0; z < kChunk; z++)
+        for (uint32_t y = 0; y + 1 < kChunk; y++)
+          for (uint32_t xx = 0; xx < kChunk; xx++) {
+            const uint32_t w = cc->voxels[(z * kChunk + y) * kChunk + xx];
+            const uint32_t m = w & 0xFFFu;
+            if (m == 0 || m >= mats.size()) continue;
+            if (mats[m].gpu.klass != CLASS_LIQUID) continue;
+            const uint32_t f = ((w >> 12) & 0xFu) + 1u;
+            const uint32_t a2 = cc->voxels[(z * kChunk + y + 1) * kChunk + xx];
+            if ((a2 & 0xFFFu) == m) subH[f]++; else surfH[f]++;
+          }
+    }
+    std::printf("park[%s]: fullness histogram (eighths 1..8) surface:", label);
+    for (int i = 1; i <= 8; i++)
+      std::printf(" %llu", (unsigned long long)surfH[i]);
+    std::printf("  submerged:");
+    for (int i = 1; i <= 8; i++)
+      std::printf(" %llu", (unsigned long long)subH[i]);
+    std::printf("\n");
+  }
+
   auto inertOnly = [&](const std::vector<IVec3>& ids) {
     uint32_t n = 0, tot = 0;
     for (const IVec3& wc : ids) {
@@ -439,10 +569,10 @@ void ParkProbe(World& world, const std::vector<MaterialDef>& mats, uint32_t tick
   // MID-FLIGHT sample, taken while the window is still shifting: this is the
   // regime the 550-chunk p50 was measured in, and it is the one that decides
   // whether narrowing genChunk's wake predicate is worth anything.
-  if (tick == kParkFlyTicks - 120u) ParkSampleRequest(world, "fly");
-  if (tick == kParkFlyTicks - 80u) ParkSampleReport(world, mats, "fly");
-  const uint32_t fetchTick = kParkFlyTicks + ParkSettleTicks();
-  if (tick >= kParkFlyTicks && (tick % 25u) == 0u)
+  if (tick == ParkFlyTicks() - 120u) ParkSampleRequest(world, "fly");
+  if (tick == ParkFlyTicks() - 80u) ParkSampleReport(world, mats, "fly");
+  const uint32_t fetchTick = ParkFlyTicks() + ParkSettleTicks();
+  if (tick >= ParkFlyTicks() && (tick % 25u) == 0u)
     std::printf("park: t%u  active %u  (snap t%u)\n", tick, s.activeChunks,
                 s.tick);
   if (tick == fetchTick) ParkSampleRequest(world, "parked");
@@ -5011,7 +5141,7 @@ int main(int argc, char** argv) {
         // Park: hold ONE regime and stop the forward axis. The regime hop is
         // 115 voxels, i.e. a 7-chunk vertical shift, so leaving it alternating
         // would keep the streaming wake this probe exists to remove.
-        if (g_autoflyPark && tick >= kParkFlyTicks) {
+        if (g_autoflyPark && tick >= ParkFlyTicks()) {
           pin.forward = 0.f;
           pin.sprint = false;
           g_autoflySurfaceHigh = false;
@@ -5503,9 +5633,13 @@ int main(int argc, char** argv) {
       // input axis is not enough on its own — fly mode integrates velocity, so
       // a coast of even a few voxels crosses a chunk boundary and shifts the
       // window, which is precisely the stimulus under test.
-      if (g_autoflyPark && tick >= kParkFlyTicks) {
+      if (g_autoflyPark && tick >= ParkFlyTicks()) {
         if (!g_parkPosSet) {
-          g_parkPos = player.pos;
+          // SANDVOX_PARK_AT wins over the route's endpoint, and it is read
+          // AFTER the surface-follow above rewrote pos.y: the whole point of
+          // naming a place is that the probe holds THAT altitude, which over a
+          // lake is not TerrainHeight's.
+          if (!ParkAtPos(g_parkPos)) g_parkPos = player.pos;
           g_parkPosSet = true;
           std::printf("park: stopped at (%.1f, %.1f, %.1f) on tick %u\n",
                       g_parkPos.x, g_parkPos.y, g_parkPos.z, tick);

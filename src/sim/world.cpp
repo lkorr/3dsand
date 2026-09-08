@@ -12,6 +12,15 @@
 #include "sim/tuning.h"
 #include "sim/worldmap.h"
 
+// SANDVOX_DIRTY_REASONS=<n>: print the DIRTY_R_* histogram every n snapshots
+// (see the fold in the snapshot builder below). 0 = off, which is the default
+// and costs one compare per snapshot.
+static const uint32_t kDirtyReasonEvery = [] {
+  const char* e = getenv("SANDVOX_DIRTY_REASONS");
+  const int v = e ? atoi(e) : 0;
+  return v > 0 ? (uint32_t)v : 0u;
+}();
+
 // Readback slot layout (offsets in bytes).
 constexpr uint64_t kChunkBytes = kChunkVol * 4;                 // 16 KB
 constexpr uint64_t kMirrorBytes = 27 * kChunkBytes;             // 432 KB
@@ -551,6 +560,45 @@ void World::KickReadback() {
             }
             snap_.activeChunks = active;
             snap_.voxelTotal = total;
+            // ---- SANDVOX_DIRTY_REASONS=<n>: WHY are these chunks awake? ----
+            //
+            // The dirty word is a DIRTY_R_* bitmask now (common.wgsl), not the
+            // literal 1, and this is the one place the whole per-chunk array is
+            // already in cached RAM. CLAUDE.md rule 6: "58 page faults" and
+            // "108 chunks awake" are the same shape of non-measurement, and the
+            // answer is attribution at the reporter, not a fortnight of A/B
+            // arms. `active 219, water in 98% of them` says nothing about which
+            // RULE asked; `flow 214 | react 5` says all of it.
+            //
+            // Printed every <n> snapshots and gated on an env var because it is
+            // a diagnostic, not telemetry: the fold above stays one pass and
+            // costs nothing when the var is unset.
+            if (kDirtyReasonEvery != 0 &&
+                (snap_.tick % kDirtyReasonEvery) == 0 && active != 0) {
+              uint32_t hist[24] = {0};
+              uint32_t multi = 0;
+              for (uint32_t i = 0; i < kNumChunks; i++) {
+                const uint32_t d = dirtyW[i];
+                if (d == 0) continue;
+                if ((d & (d - 1)) != 0) multi++;
+                for (int bit = 0; bit < 24; bit++)
+                  if (d & (1u << bit)) hist[bit]++;
+              }
+              static const char* kName[24] = {
+                  "write",      "react-idle",  "stain-idle", "flow",
+                  "viscous",    "seam",        "part",       "wbody",
+                  "mutate",     "MOVE",        "STAIN-WROTE","REACT-FIRED",
+                  // sim_step's DIRTY_M_* liquid-stage split
+                  "down",       "diag",        "equalize",   "split",
+                  "film",       "displace",    "bridge",     "SUBMERGED",
+                  "spill",      "powder",      "gas",        "solo"};
+              std::printf("dirty-reasons t%u: active %u (%u multi-cause)",
+                          snap_.tick, active, multi);
+              for (int bit = 0; bit < 24; bit++)
+                if (hist[bit]) std::printf(" | %s %u", kName[bit], hist[bit]);
+              std::printf("\n");
+              std::fflush(stdout);
+            }
             std::memcpy(&snap_.worldHash, b + kHashOff, 4);
             std::memcpy(&snap_.pageFaults, p + kPageFaultOff, 4);
             std::memcpy(snap_.pick, b + kPickOff, 32);

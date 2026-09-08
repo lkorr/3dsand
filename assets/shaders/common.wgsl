@@ -175,6 +175,44 @@ fn matCanAct(m : Material) -> bool {
   return m.klass != CLASS_SOLID || m.reactCount > 0u || matStains(m);
 }
 
+// ---- DIRTY REASON BITS: why is this chunk awake? ---------------------------
+//
+// The dirty flag used to be the literal 1u, and every reader in the engine
+// (sim_compact's two entries, sim_waterbody's quiescence read, the CPU
+// snapshot fold in world.cpp) has always tested it as `!= 0`. So the word can
+// carry WHICH RULE marked it at no cost: markDirty atomicOrs a bit instead of
+// storing 1, the OR is order-independent so nothing about determinism changes,
+// and the fill that zeroes DirtyOut every tick (pass_table.def phase 0) keeps
+// the mask per-tick rather than cumulative.
+//
+// WHY THIS EXISTS (CLAUDE.md rule 6, "a bare count is not a measurement"). The
+// active-chunk overlay says a pond's chunks never sleep; the ACTIVE-VOXEL
+// overlay beside it says nothing is being written there. Those two are
+// consistent because `markVoxActive` is called only from sim_step's WRITE
+// paths, while `markDirty` has four callers that write no voxel at all — a
+// reaction rule that matched and did not fire, a stain with unsaturated
+// surface still in reach, and the two `canFlowAnywhere` "settled but not
+// stable" arms — plus three other shaders with their own marks. A count of
+// awake chunks cannot tell those apart. This mask can, in one run.
+//
+// The bits are diagnostic only: nothing branches on them, and a reader that
+// wants the old boolean gets it from `!= 0` exactly as before.
+const DIRTY_R_WRITE    : u32 = 1u;    // sim_step wrote a voxel (move/react/stain)
+const DIRTY_R_REACT    : u32 = 2u;    // doReactions: rule MATCHED, did not fire
+const DIRTY_R_STAIN    : u32 = 4u;    // doStaining: unsaturated surface in reach
+const DIRTY_R_FLOW     : u32 = 8u;    // canFlowAnywhere true, stepLiquid moved nothing
+const DIRTY_R_VISCOUS  : u32 = 16u;   // viscous off-tick with somewhere to go
+const DIRTY_R_SEAM     : u32 = 32u;   // sim_fluid_seam (excite / settle / stain)
+const DIRTY_R_PARTICLE : u32 = 64u;   // sim_particle resolve
+const DIRTY_R_WATERBODY: u32 = 128u;  // sim_waterbody shave
+const DIRTY_R_MUTATE   : u32 = 256u;  // MutationQueue / explosion / worldgen
+// The WRITE bit split three ways, because "sim_step wrote a voxel" is still
+// a bare count: water FLOWING and water being SOAKED INTO A BANK are the same
+// bit and completely different bugs.
+const DIRTY_R_MOVE     : u32 = 512u;   // tryMove / transferLiquid: matter moved
+const DIRTY_R_STAINW   : u32 = 1024u;  // doStaining actually wrote a stain
+const DIRTY_R_REACTW   : u32 = 2048u;  // a reaction rule FIRED
+
 // Is this a VISCOUS liquid — blood, and anything authored like it?
 //
 // Render-side classification, and it is deliberately made of AUTHORED DATA

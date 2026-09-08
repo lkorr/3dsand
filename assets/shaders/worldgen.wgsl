@@ -4586,8 +4586,8 @@ fn genChunk(slot : u32, li : u32, actIdx : u32) {
       atomicStore(&dirtyIn[slot], 0u);
       atomicStore(&dirtyOut[slot], 0u);
     } else if (canAct) {
-      atomicStore(&dirtyIn[slot], 1u);
-      atomicStore(&dirtyOut[slot], 1u);
+      atomicOr(&dirtyIn[slot], DIRTY_R_MUTATE);
+      atomicOr(&dirtyOut[slot], DIRTY_R_MUTATE);
     } else {
       atomicStore(&dirtyIn[slot], 0u);
       atomicStore(&dirtyOut[slot], 0u);

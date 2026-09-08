@@ -49,8 +49,8 @@ fn markBoth(c : vec3<i32>) {
         let n = ch + vec3<i32>(xs[i], ys[j], zs[k]);
         if (chunkInWindow(n, T.origin)) {
           let ci = chunkSlotIndex(n);
-          atomicStore(&dirtyIn[ci], 1u);   // simulate this tick
-          atomicStore(&dirtyOut[ci], 1u);  // and re-check next tick
+          atomicOr(&dirtyIn[ci], DIRTY_R_MUTATE);   // simulate this tick
+          atomicOr(&dirtyOut[ci], DIRTY_R_MUTATE);  // and re-check next tick
         }
       }
     }
@@ -201,6 +201,6 @@ fn windWake(@builtin(global_invocation_id) gid : vec3<u32>) {
   // The list is four slots to a std140 row (world.h TickParams).
   let slot = T.windWake[gid.x / 4u][gid.x % 4u];
   if (slot >= NCHUNK * NCHUNK * NCHUNK) { return; }
-  atomicStore(&dirtyIn[slot], 1u);
-  atomicStore(&dirtyOut[slot], 1u);
+  atomicOr(&dirtyIn[slot], DIRTY_R_MUTATE);
+  atomicOr(&dirtyOut[slot], DIRTY_R_MUTATE);
 }

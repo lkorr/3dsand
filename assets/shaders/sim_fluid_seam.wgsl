@@ -242,7 +242,7 @@ fn markDirtyNext(c : vec3<i32>) {
       for (var k = 0; k < 2; k++) {
         let n = ch + vec3<i32>(xs[i], ys[j], zs[k]);
         if (chunkInWindow(n, T.origin)) {
-          atomicStore(&dirtyOut[chunkSlotIndex(n)], 1u);
+          atomicOr(&dirtyOut[chunkSlotIndex(n)], DIRTY_R_SEAM);
         }
       }
     }

@@ -53,8 +53,8 @@ fn hardnessAt(c : vec3<i32>) -> i32 {
 
 fn markBoth(c : vec3<i32>) {  // callers have bounds-checked c
   let ci = chunkIndexW(c);
-  atomicStore(&dirtyIn[ci], 1u);
-  atomicStore(&dirtyOut[ci], 1u);
+  atomicOr(&dirtyIn[ci], DIRTY_R_MUTATE);
+  atomicOr(&dirtyOut[ci], DIRTY_R_MUTATE);
 }
 
 fn maskIndex(opIdx : u32, local : vec3<i32>) -> u32 {

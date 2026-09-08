@@ -241,6 +241,18 @@ gets a cache miss and recompiles automatically. Workflow: edit shader → run
 `check_shaders.sh` → run the existing binary. A C++ rebuild for a WGSL change is
 wasted time.
 
+**...but a `common.wgsl` edit is NOT a cheap WGSL edit.** It is prepended to every
+shader, so touching it misses the SPIR-V cache for ALL of them and pays the
+worldgen far-cascade cliff. Measured 2026-09-08, same session, same machine:
+adding eight diagnostic `const`s to `common.wgsl` cost **536 s** of pipeline
+compile on the next run; putting the same kind of constants in `sim_step.wgsl`
+alone cost **under 1 s**. Everything else that day was 0.5–34 s.
+
+So: **a constant only one shader reads is declared in that shader.** Diagnostics,
+scratch bits, per-kernel thresholds — all of it goes next to its consumer.
+`common.wgsl` is for things two shaders must AGREE on, and the price of putting
+anything else there is nine minutes per iteration for the rest of the session.
+
 **A WGSL/tuning worktree needs NO BUILD AT ALL.** The exe locates `assets/` by a
 compiled-in absolute path, which is why four of seven WGSL-only agents on
 2026-09-01 each paid a cold worktree build to test a shader. The
