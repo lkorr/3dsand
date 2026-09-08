@@ -590,3 +590,37 @@ gate). The twice-run comparison is the invariant; the pins are the
 notification. `env-truth` records: unauthored cover is 0.00–0.31 % in every
 biome (was 5.97 % in the forest); forest trees 122/ha against a page of 153
 (was 93).
+
+## 2026-09-08 — smoke probes re-pinned; determinismHash could NOT be
+
+`smokeQuiet` (5 probes) and `smokeLoud` (19) move to a tick-0 world of
+`899b9bff` (was `c87b49c4`). The cause is the page-fault fix in `bfbe2ff`:
+batched `SubmitWorldgen` never told the CPU materialize set about the wake
+`genChunk` performs on the GPU, so the first tick after every worldgen dropped
+24 boundary-crossing sim writes into chunks still held as `PT_EMPTY`
+sentinels. Those 24 voxels now exist, so every hashed table that samples a
+post-worldgen world moves. `page faults over the suite: 0` for the first time,
+and `--suite acceptance` reports `--vk-smoke PASS` and `--vk-smoke-loud PASS`
+against these values.
+
+Measured twice, on two trees and two binaries: `7a06c86` (wave 1) and
+`b2e1408` (wave 1 + the LoadShader prelude filter) produced all 24 probes
+byte-identically, which independently confirms the cache-key change is
+hash-neutral.
+
+**`determinismHash` is still `44fa72cb` and is STALE — the world is
+`ee34787c`.** `--selftest --rebaseline` refuses while the suite has errors,
+and it currently has nine, none of them caused by this work:
+`env-reload`, `env-truth`, `waterbody`, `ca-skip`, `ca-level-pond`,
+`fluid-det`, `fluid-settle`, `fluid-excite`, `fluid-react`. Each was
+confirmed failing with byte-identical detail strings on a binary built WITHOUT
+the wave-1 changes, and they belong to the environment and fluid owners.
+`check_invariants.py` fails on the same axis (stale
+`tests/env_predictions.json`, `biomesHash c1481fcd` vs `73dc273a`).
+
+Until those are fixed or recorded as known-failing, every run prints one
+expected `determinism: PIN MOVED` line. The twice-run comparison PASSES
+throughout — the sim reproduces itself; only the recorded number is behind.
+Do not chase `ee34787c`, and do not hand-edit it in to silence the line: the
+refusal is the guard that stops a real regression being rebaselined away, and
+routing around it by hand is the one thing it cannot defend against.
