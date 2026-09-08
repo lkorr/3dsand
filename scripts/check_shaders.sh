@@ -463,6 +463,78 @@ fn ptTick() -> u32 { return ${u}.tick; }"
   fi
 done
 
+# ---------------------------------------------------------------------------
+# SPIR-V SIZE CEILING for worldgen.wgsl.
+#
+# WHAT THIS DEFENDS AGAINST, precisely: on 2026-09-07 a cold
+# vkCreateComputePipelines on worldgen's `far` entry took 746 s on the NVIDIA
+# driver (docs/PLAN_shader_compile.md), and before that the pond work made `far`
+# never finish compiling at all. Both shipped, because nothing in the repo
+# measured how big the shader was — the cost only shows up on a cold cache, in a
+# run nobody makes while iterating on WGSL. Driver front-end cost is superlinear
+# in ENTRY POINT size, so the cheap deterministic proxy is the SPIR-V
+# instruction count, and this is the one place that already assembles the exact
+# source the engine compiles.
+#
+# Only worldgen.wgsl, and only its two biggest entries: every other shader in
+# the tree compiles in milliseconds, and paying five extra tint invocations on
+# every shader edit to prove that again is not worth the seconds.
+#
+# WHEN THIS FIRES: it is not "revert". It is "you just made the cold boot
+# noticeably slower, say so in the commit message and raise the number, or split
+# the entry point" (PLAN_shader_compile.md package C lists the splits). The
+# ceilings are ~1.5x the count measured the day they were set, which is room for
+# real work and not room for another 700 s regression.
+WORLDGEN_COMBINED="$TMP/worldgen.wgsl"
+if [ -f "$WORLDGEN_COMBINED" ]; then
+  # entry point -> ceiling in SPIR-V instructions, ~1.5x the count measured
+  # 2026-09-07 on the tree that carries the unrollFence: far 16,778 /
+  # fardown 16,767. (main 16,552 and list 16,579 are within 1.5 % of those and
+  # share the same inlined genColumn body, so guarding the two cascade entries
+  # guards them too without two more tint invocations per shader edit.
+  # `pagefill` is 745 and is not worth a line.)
+  #
+  # NOTE, so nobody over-reads this number: instruction count is a size proxy,
+  # NOT a compile-time model. far and fardown are the same size and cost 746 s
+  # and 98 s respectively — the driver's blow-up is about control flow and
+  # aggregate copies inside the entry, not the raw count. What the ceiling
+  # catches is the failure mode that actually happened: worldgen quietly
+  # doubling in size and nobody noticing until a cold boot.
+  for spec in "far:25000" "fardown:25000"; do
+    ep="${spec%%:*}"; ceil="${spec##*:}"
+    spv="$TMP/worldgen_${ep}.spv"
+    if ! "$TINT_BIN" -f spirv -ep "$ep" -o "$spv" "$WORLDGEN_COMBINED" >/dev/null 2>&1; then
+      echo "check_shaders: could not emit SPIR-V for worldgen.wgsl:$ep (size ceiling not checked)" >&2
+      continue
+    fi
+    # SPIR-V is a word stream: a 5-word header, then instructions whose first
+    # word carries its own length in its high 16 bits. Counting instructions
+    # rather than bytes keeps the number comparable across constant-data
+    # changes.
+    n="$(python -c "
+import struct,sys
+b=open(sys.argv[1],'rb').read()
+w=struct.unpack('<%dI'%(len(b)//4),b)
+i,n=5,0
+while i<len(w):
+    l=w[i]>>16
+    if l==0: break
+    i+=l; n+=1
+print(n)
+" "$spv")" || { echo "check_shaders: SPIR-V instruction count failed for $ep" >&2; continue; }
+    if [ "$n" -gt "$ceil" ]; then
+      failed=1
+      echo "FAIL worldgen.wgsl:$ep — $n SPIR-V instructions, ceiling $ceil"
+      echo "  Driver pipeline-compile time is superlinear in entry-point size;"
+      echo "  worldgen 'far' already costs ~750 s cold. Split the entry point"
+      echo "  (docs/PLAN_shader_compile.md package C) or raise the ceiling in"
+      echo "  scripts/check_shaders.sh and say why in the commit message."
+    else
+      echo "check_shaders: worldgen.wgsl:$ep $n SPIR-V instructions (ceiling $ceil)"
+    fi
+  done
+fi
+
 if [ "$failed" -eq 0 ]; then
   echo "check_shaders: ${checked} shader(s) OK"
 fi

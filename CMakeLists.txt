@@ -559,6 +559,16 @@ set(SANDVOX_LINK_LIBS
   Vulkan::Headers
   tint_lang_wgsl_reader
   tint_lang_spirv_writer
+  # SPIRV-Tools' optimizer, for src/gpu/vk_spirv.cpp's SANDVOX_SPIRV_OPT pass
+  # between Tint and vkCreateComputePipelines (docs/PLAN_shader_compile.md
+  # package B). Not a new fetch: Dawn's third_party/CMakeLists.txt already
+  # add_subdirectory's spirv-tools whenever TINT_BUILD_SPV_WRITER is ON, which
+  # it is forced to be above — the target exists and is already built for the
+  # SPIR-V writer's own use, it is just EXCLUDE_FROM_ALL like the tint targets,
+  # so naming it here is the whole integration. It carries its own PUBLIC
+  # include directories (spirv-tools/optimizer.hpp) and pulls in SPIRV-Tools
+  # core for the validator that guards the optimizer's output.
+  SPIRV-Tools-opt
 )
 target_link_libraries(sandvox_core PRIVATE ${SANDVOX_LINK_LIBS})
 # `sandvox_compile` = "compile everything sandvox links, link nothing". An
