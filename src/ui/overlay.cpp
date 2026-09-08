@@ -610,6 +610,32 @@ void Overlay::Draw(UIState& s) {
   ImGui::SameLine();
   ImGui::Checkbox("shadows", &s.shadows);
 
+  // ---- short range: the 100 m + fog comparison arm -------------------------
+  // Next to `shadows` because it is the same kind of switch: session state
+  // that reaches the shader as a RenderParams flag, not a tuning value (see
+  // State::shortRange for why that distinction is load-bearing here).
+  //
+  // The metres readout beside it is the whole reason the row is two widgets:
+  // "short range" is a claim, and the effective draw distance dropping from
+  // four digits to 100 the instant it is ticked is the evidence for it. It
+  // also shows the cascade REFILLING after a teleport, since the normal value
+  // is the filled radius rather than the theoretical horizon.
+  ImGui::Checkbox("short range (100 m + fog)", &s.shortRange);
+  ImGui::SameLine();
+  ImGui::TextDisabled("draw %.0f m", s.renderRangeM);
+  if (ImGui::IsItemHovered())
+    ImGui::SetTooltip(
+        "Effective draw distance, in metres.\n\n"
+        "Normally this is the far cascade's FILLED radius, so it dips while\n"
+        "the cascade refills after a teleport or a fast sprint and climbs\n"
+        "back to the full horizon when every level has landed.\n\n"
+        "With 'short range' ticked it is render.shortRangeDist, and that is a\n"
+        "hard ceiling on every ray: the fine march and all eight cascade\n"
+        "levels stop there. This is a PERF mode - the frame stops paying for\n"
+        "the horizon - not a fog filter over a full-range image.\n\n"
+        "Shape it under Rendering: shortRangeDist, shortRangeFogStart,\n"
+        "shortRangeFogDensity. The toggle itself is not saved to tuning.json.");
+
   // ---- celestial time -------------------------------------------------
   // Scales the clock the SKY and the daylight-gated reactions both run on
   // (sim/world.h CelestialClock). The sim tick rate is untouched — sand still

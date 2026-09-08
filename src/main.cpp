@@ -2892,6 +2892,13 @@ int main(int argc, char** argv) {
     // stroke can be judged against a body rather than against the sky. Phase B's
     // AI/spawn panel supersedes it; keep the footprint here at one bool.
     else if (a == "--duel-dummy") g_duelDummy = true;
+    // `--short-range` is the headless handle on the dev panel's "short range
+    // (100 m + fog)" checkbox: no offscreen path can press a checkbox, and the
+    // whole point of the mode is a LOOK and a frame time to compare, both of
+    // which are captured by --shot / --render-budget. Equivalent to
+    // SANDVOX_SHORT_RANGE=1. In the windowed game it only sets the checkbox's
+    // starting position — the panel stays the live authority from frame 1.
+    else if (a == "--short-range") SetShortRange(true);
     else if (a == "--autofly") g_autofly = true;
     else if (a == "--autofly-hard") { g_autofly = true; g_autoflyHard = true; }
     else if (a == "--autofly-surface") { g_autofly = true; g_autoflySurface = true; }
@@ -3815,6 +3822,12 @@ int main(int argc, char** argv) {
   // without a keypress — which is what makes the overlay reachable from a
   // headless run.
   ui.showWindField = CurrentTuning().wind.dbgWindField;
+  // Same idea for short range: `--short-range` / SANDVOX_SHORT_RANGE set the
+  // checkbox's starting position, and from here the checkbox is the authority
+  // (the frame loop re-asserts it into SetShortRange every frame). Without
+  // this seed the flag would be latched in support.cpp and the panel would
+  // show the box unticked while the frame rendered at 100 m.
+  ui.shortRange = ShortRangeMode();
   {
     const auto& fs = CurrentTuning().sim;
     ui.fGravity     = fs.fluidGravity;
@@ -7606,6 +7619,21 @@ int main(int argc, char** argv) {
       float fogTarget = std::clamp(kFogOpticalDepths / far.SafeRadiusMeters(),
                                    kFarFogDensity, kFarFogDensityMax);
       fogSmooth += (fogTarget - fogSmooth) * kFogLerpPerFrame;
+      // ---- short range: the panel checkbox is the live authority ----------
+      // Pushed into support.cpp rather than OR'd into extraFlags below so that
+      // ONE place decides the flag bit for every drawing path — the portrait
+      // pass, the lab and --shot all write RenderParams through the same
+      // function and would otherwise each need their own copy of this.
+      SetShortRange(ui.shortRange);
+      // The panel's draw-distance readout, and the evidence that ticking the
+      // box did something. Normally the cascade's FILLED radius (the same
+      // number the adaptive fog is pinned to just above, so the two cannot
+      // disagree about how far the world is trusted); the ceiling when the
+      // mode is on. render.shortRangeDist is read live so the tuner's slider
+      // moves this the moment F5 lands.
+      ui.renderRangeM = ui.shortRange
+                            ? CurrentTuning().render.shortRangeDist
+                            : far.SafeRadiusMeters();
       // HOISTED INTO A LAMBDA because it may have to run TWICE. world.renderUBO
       // is one buffer, so the avatar portrait's camera necessarily clobbers
       // the main camera; the portrait pass writes its own params, submits, and

@@ -324,6 +324,11 @@ SPEC = [
     ("render", "lodHandoffDist", "TUNE_LOD_HANDOFF_DIST", "f", 24.0),
     ("render", "shadowMaxDist", "TUNE_SHADOW_MAX_DIST", "f", 999.0),
 
+    # SHORT-RANGE MODE (dev panel checkbox, RenderParams flag bit 2)
+    ("render", "shortRangeDist", "TUNE_SHORT_RANGE_DIST", "f", 100.0),
+    ("render", "shortRangeFogStart", "TUNE_SHORT_RANGE_FOG_START", "f", 0.65),
+    ("render", "shortRangeFogDensity", "TUNE_SHORT_RANGE_FOG_DENSITY", "f", 5.0),
+
     # wind: the SHAPE of the field (docs/RESEARCH_wind.md, DESIGN.md 12)
     ("wind", "gustWavelength", "TUNE_WIND_GUST_WAVELENGTH", "f", 4.8),
     ("wind", "gustSpeed", "TUNE_WIND_GUST_SPEED", "f", 1.1),
