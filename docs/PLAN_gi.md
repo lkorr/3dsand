@@ -347,3 +347,15 @@ now z 8 chunks so the cameras are at least in-window; whoever re-authors the poo
 - Putting the payload in the shadow cache slot (no bits; wrong granularity; wrong pass).
 - Photon rays from the sun (the resolve pass and the refresh walk already know what is lit).
 - Anything the sim can read. The grid is render data, like `farVox` and `shadowCache`.
+
+## 8. 2026-09-05 — the gather cache and the refresh skip
+
+Both landed from `PLAN_frame_perf.md` §3 (items 1 and 4); the numbers are
+there. `irradiance` has a second plane (`GI_CACHE_BASE`): the gather at each
+block-face's centre, re-run per chunk slot every `render.giCachePeriod` frames
+or when the word reads 0, read bilinearly across the face plane.
+`opennessGen` has a walked-tick plane and a per-column touch plane
+(`OPEN_WALKED_BASE` / `OPEN_TOUCH_BASE`); the refresh keeps a slot's bytes
+when nothing within reach was touched since its last full walk and does only
+the sun re-sample and decay. §7's "putting the payload in the shadow cache
+slot" refusal stands — the cache is keyed at the grid's own granularity.
