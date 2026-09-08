@@ -52,6 +52,26 @@ struct UIState {
   bool stepOnce = false;
   bool shadows = true;
   bool fly = true;
+  // ---- SHORT-RANGE MODE ----------------------------------------------------
+  // The comparison arm against the dense-100 m WebGPU voxel engines: clamp
+  // EVERY ray to render.shortRangeDist and hide the wall behind a fog ramp
+  // (raymarch.wgsl aerialFrac / traceFar's tCeil). A perf mode as much as a
+  // look — the frame stops marching the ~6.5 km cascade rather than fogging it
+  // after paying for it.
+  //
+  // IT LIVES HERE AND NOT IN TUNING ON PURPOSE. The running game writes
+  // tuning.json (the tuner's Save, the F5 round trip), so a view toggle stored
+  // as a tuning value could overwrite the user's saved defaults just by being
+  // ticked. It reaches the shader as RenderParams flag bit 2, exactly the way
+  // `shadows` (bit 0) and `showDirtyVoxels` (bit 1) already do. The SHAPE of
+  // the mode — ceiling, fog start fraction, fog density — is tuning, because
+  // that is authored data; whether it is on is session state.
+  bool shortRange = false;
+  // Effective draw distance in METRES, written by main each frame for the
+  // panel readout: the cascade's filled radius normally, the short-range
+  // ceiling while the mode is on. Read-only in the UI — it is evidence that
+  // the checkbox did something, not a second place to set it.
+  float renderRangeM = 0.0f;
   // Celestial time multiplier: 1 = normal, 0 = frozen, negative = reverse,
   // 100 = fast-forward. Drives the CelestialClock (sim/world.h), which feeds
   // BOTH the rendered sky and the sim's integer day phase — so cranking it

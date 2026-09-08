@@ -2115,6 +2115,7 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadI(*g, "presentMode", r.presentMode, out, at);
     ReadF(*g, "fpsCap", r.fpsCap, out, at);
     ReadF(*g, "shadowMaxDist", r.shadowMaxDist, out, at);
+
     ReadF(*g, "shadowCoarseDist", r.shadowCoarseDist, out, at);
     ReadF(*g, "opennessReach", r.opennessReach, out, at);
     ReadI(*g, "opennessChunksPerFrame", r.opennessChunksPerFrame, out, at);
@@ -2125,6 +2126,9 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadF(*g, "giDecay", r.giDecay, out, at);
     ReadF(*g, "giFeedback", r.giFeedback, out, at);
     ReadI(*g, "giGatherBlocks", r.giGatherBlocks, out, at);
+    ReadF(*g, "shortRangeDist", r.shortRangeDist, out, at);
+    ReadF(*g, "shortRangeFogStart", r.shortRangeFogStart, out, at);
+    ReadF(*g, "shortRangeFogDensity", r.shortRangeFogDensity, out, at);
     // Zero step budgets compile fine and render nothing; a zero white point or
     // gamma divides by zero in the tonemap. Guard the ones that break the
     // image rather than merely change it.
@@ -2254,6 +2258,7 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     // 0 is meaningful here (all shadows go through the cascade), so only
     // negatives are refused.
     if (r.shadowMaxDist < 0.0f) { r.shadowMaxDist = 0.0f; }
+
     // 0 is the OFF value (the shader const-folds the coarse march away), so
     // only negatives are refused — a negative would make every ray coarse from
     // its first cell, which is what god rays ask for explicitly and no shadow
@@ -2294,6 +2299,17 @@ bool LoadTuning(const std::string& path, Tuning& out) {
           "x strength must stay below 1); clamped to 3");
       r.giStrength = 3.0f;
     }
+    // ---- short-range mode ----
+    // The ceiling divides the fog ramp's span, so it must stay positive; 4 m
+    // is under the near field's own reach and is already an absurd setting,
+    // but it is a setting rather than a NaN frame.
+    if (r.shortRangeDist < 4.0f) { r.shortRangeDist = 4.0f; }
+    // The start fraction is a fraction. 0.95 rather than 1.0 at the top so the
+    // ramp always has a span to run over.
+    if (r.shortRangeFogStart < 0.0f) { r.shortRangeFogStart = 0.0f; }
+    if (r.shortRangeFogStart > 0.95f) { r.shortRangeFogStart = 0.95f; }
+    // Zero density would renormalise 0/0 at the ceiling.
+    if (r.shortRangeFogDensity < 0.05f) { r.shortRangeFogDensity = 0.05f; }
   }
 
   // ---- world / debug: what is left of the old `worldgen` group (P-G) ---------

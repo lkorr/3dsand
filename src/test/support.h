@@ -54,6 +54,18 @@ SkyState SkyForTick(const Tuning& t, uint32_t tick);
 // site is the ordinary way for two places to stop agreeing.
 uint32_t DayPhaseNow(uint32_t tick);
 
+// ---- short-range mode (dev panel "short range (100 m + fog)") --------------
+// Whether every ray is ceilinged at render.shortRangeDist with a fog ramp over
+// the last stretch (RenderParams flag bit 2). WriteRenderParams OR's this into
+// the flag word for EVERY drawing path, so --shot, the perf harness, the lab
+// and the portrait all honour it without a per-call-site argument.
+//
+// Default comes from SANDVOX_SHORT_RANGE (or `--short-range`, which calls the
+// setter); the windowed game re-asserts the panel checkbox every frame, so the
+// checkbox wins there. Render-only — it reaches no sim input.
+bool ShortRangeMode();
+void SetShortRange(bool on);
+
 // fluidCount: live MLS-MPM particle count — nonzero enables the fluid surface
 // march in raymarch.wgsl; zero costs the renderer nothing.
 void WriteRenderParams(const rhi::Queue& queue, const World& world,

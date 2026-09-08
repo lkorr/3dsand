@@ -1026,7 +1026,10 @@ struct RenderParams {
   camPos     : vec3f,  tanHalfFov : f32,
   camRight   : vec3f,  aspect     : f32,
   camUp      : vec3f,  time       : f32,
-  camFwd     : vec3f,  flags      : u32,   // bit0 = sun shadows
+  // flags: bit0 = sun shadows, bit1 = active-voxel debug highlight,
+  //        bit2 = short-range mode (ray ceiling + fog ramp, raymarch.wgsl).
+  // Written in ONE place: WriteRenderParams (src/test/support.cpp).
+  camFwd     : vec3f,  flags      : u32,
   sunDir     : vec3f,  fogDensity : f32,   // per meter (pinned to far extent)
   origin     : vec3<i32>,                  // residency window origin, CHUNK units
   viewPx     : f32,    // render target HEIGHT in pixels — pixel angular size

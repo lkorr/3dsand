@@ -2160,6 +2160,19 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool) -> Hit {
     tExit = min(tExit, max(tEnter, TUNE_LOD_HANDOFF_DIST / VOXEL_METERS));
   }
 
+  // ---- SHORT-RANGE MODE (RenderParams flag bit 2) ----
+  // The same shortening, against the mode's ray ceiling. At the default
+  // 100 m this is inert — the window is only 25.6 m half-extent and the LOD
+  // handoff above already ended the fine march at 24 m — and it is here so
+  // that "no ray goes past render.shortRangeDist" stays true if the ceiling is
+  // pulled BELOW the window, rather than being a claim about the current
+  // value of a different knob. Same min()-only shape, same wantMedia gate
+  // (shadow/reflection rays are budget-capped elsewhere and must not report
+  // "lit" because they gave up at the ceiling).
+  if (wantMedia && (R.flags & 4u) != 0u) {
+    tExit = min(tExit, max(tEnter, TUNE_SHORT_RANGE_DIST / VOXEL_METERS));
+  }
+
   if (tExit <= tEnter) { return out; }
   out.tExit = tExit;
 
@@ -2858,6 +2871,26 @@ fn traceFar(ro : vec3f, rdIn : vec3f, tStart : f32, px : vec2f) -> FarHit {
   // instead of re-randomizing into per-level speckle.
   let dith = farDither(px);
 
+  // ---- SHORT-RANGE MODE: THE RAY CEILING (RenderParams flag bit 2) --------
+  // The dev panel's "short range" checkbox is a PERF arm, not a filter, and
+  // this one value is what makes that true: every cascade level's tExit is
+  // min()'d against it below, so a ray that would have walked 6.5 km of
+  // level-8 cells stops at 100 m and the frame stops paying for the horizon.
+  // Fogging a fully-marched ray afterwards would have cost exactly as much as
+  // not fogging it.
+  //
+  // A min() on tExit and nothing else, for the same reason the LOD handoff in
+  // trace() is (see the long note there): tExit is already the loop's
+  // termination contract and the seam's tPrev bookkeeping is expressed against
+  // it, so shortening it cannot open a gap — the march simply ends earlier and
+  // fs() falls through to the sky.
+  //
+  // 1e30 when the mode is off: unreachable for any t, so the min()s below are
+  // no-ops on a uniform branch the compiler folds. Not `select` on the whole
+  // clamp, because that would duplicate the expression at both use sites.
+  let tCeil = select(1e30, TUNE_SHORT_RANGE_DIST / VOXEL_METERS,
+                     (R.flags & 4u) != 0u);
+
   // Window -> level 1 seam. tStart is where the ray left the residency window;
   // the fine march already found no hit out to there, so starting level 1 up to
   // half a level-1 cell earlier only lets it re-cover the last sliver of
@@ -2876,7 +2909,11 @@ fn traceFar(ro : vec3f, rdIn : vec3f, tStart : f32, px : vec2f) -> FarHit {
     let tmin = min(tt0, tt1);
     let tmax = max(tt0, tt1);
     let tEnter = max(max(tmin.x, tmin.y), max(tmin.z, tPrev / s));
-    let tExit = min(tmax.x, min(tmax.y, tmax.z));
+    // tCeil is in FINE voxels; this level's t is in level cells, hence /s.
+    // Once tPrev has passed the ceiling every remaining (coarser) level takes
+    // the `continue` below, so the mode also skips the levels it cannot reach
+    // rather than entering and immediately breaking out of each one.
+    let tExit = min(min(tmax.x, min(tmax.y, tmax.z)), tCeil / s);
     if (tExit <= tEnter) { continue; }   // box missed (or fully behind tPrev)
 
     var t = tEnter + 1e-4;
@@ -3253,12 +3290,43 @@ fn farVoxelAO(level : u32, cell : vec3<i32>, n : vec3<i32>, a1 : i32, a2 : i32,
   return clamp(1.0 - (occ / 3.0) * TUNE_AO_STRENGTH * reach, 0.0, 1.0);
 }
 
+// ---- the fog fraction, split out so short-range mode can replace the ramp --
+// 0 = the surface is shown as shaded, 1 = it has dissolved entirely into the
+// sky in that direction. Every fogged path goes through here, so the two ramps
+// cannot disagree about what "fully fogged" means.
+fn aerialFrac(tFine : f32) -> f32 {
+  let dM = tFine * VOXEL_METERS;
+  // ---- SHORT-RANGE MODE (RenderParams flag bit 2) ----
+  // The ordinary ramp is a global exponential pinned to the cascade radius: it
+  // starts thinning the image at the camera, which is right for kilometres of
+  // atmosphere and wrong for a 100 m wall. The dense-100 m engines this mode
+  // exists to compare against read as CLEAR up close and then close in over
+  // the last third, so that is the curve here: nothing before the start
+  // fraction, then 1 - exp(-k x^2) over the remainder.
+  //
+  // RENORMALISED so it reaches exactly 1.0 at the ceiling. Without that the
+  // mode would trade the geometric cliff for a colour one — terrain at 99.9 m
+  // sitting a few percent short of the sky it is about to be replaced by, in a
+  // ring all the way round the camera, which is the same visual defect one
+  // step further down the pipe. The two exp() are of uniform arguments and
+  // fold to constants; only the x^2 is per-pixel.
+  if ((R.flags & 4u) != 0u) {
+    let startM = TUNE_SHORT_RANGE_DIST * TUNE_SHORT_RANGE_FOG_START;
+    let span = max(TUNE_SHORT_RANGE_DIST - startM, 1e-3);
+    let x = clamp((dM - startM) / span, 0.0, 1.0);
+    let full = 1.0 - exp(-TUNE_SHORT_RANGE_FOG_DENSITY);
+    return clamp((1.0 - exp(-TUNE_SHORT_RANGE_FOG_DENSITY * x * x)) / full,
+                 0.0, 1.0);
+  }
+  return 1.0 - exp(-dM * R.fogDensity);
+}
+
 // Aerial perspective: distance fog that converges EXACTLY to the sky color in
 // that ray's direction. The old `skyColor * 0.9` target left every distant
 // surface hanging slightly darker than the sky it should dissolve into, which
 // read as a gray veil over the whole horizon instead of atmosphere.
 fn applyAerial(color : vec3f, rd : vec3f, tFine : f32) -> vec3f {
-  let f = 1.0 - exp(-tFine * VOXEL_METERS * R.fogDensity);
+  let f = aerialFrac(tFine);
   // Star-free sky. Aerial perspective is AIR between the eye and a SOLID
   // surface, so it must converge to the airglow in that direction and nothing
   // else. Using the full skyColor() here mixes the starfield, moon and
