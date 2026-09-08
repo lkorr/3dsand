@@ -455,6 +455,15 @@ TP_I(render, farBlockerHitLevel, TUNE_FAR_BLOCKER_HIT_LEVEL, 0)
 TP_F(render, lodHandoffDist, TUNE_LOD_HANDOFF_DIST, 24.0f)
 TP_F(render, shadowMaxDist, TUNE_SHADOW_MAX_DIST, 999.0f)
 
+// ---- SHORT-RANGE MODE (dev panel checkbox, RenderParams flag bit 2) ----
+// The look/perf comparison arm: a hard ray ceiling plus a fog ramp that hides
+// it, the way the fixed-100 m WebGPU voxel engines do it. These three shape
+// the mode; whether it is ON is NOT a tuning value (it is overlay state, so
+// toggling it cannot rewrite the user's tuning.json).
+TP_F(render, shortRangeDist, TUNE_SHORT_RANGE_DIST, 100.0f)
+TP_F(render, shortRangeFogStart, TUNE_SHORT_RANGE_FOG_START, 0.65f)
+TP_F(render, shortRangeFogDensity, TUNE_SHORT_RANGE_FOG_DENSITY, 5.0f)
+
 // ---- wind: the SHAPE of the field (docs/RESEARCH_wind.md, DESIGN.md 12) ----
 // These are the parts of windAt() that are authored once and const-folded into
 // every shader. The parts that EVOLVE (direction, speed, gust amplitude) are

@@ -70,8 +70,40 @@ struct TickGpuSpan {
 };
 }
 
+
 void SetSubmitTickPassTimer(::PassTimer* t) { g_tickTimer = t; }
 ::PassTimer* SubmitTickPassTimer() { return g_tickTimer; }
+
+
+// ---- SHORT-RANGE MODE, the headless handle -------------------------------
+// The mode is normally driven by the dev panel checkbox, which no headless
+// path can press. Rather than thread a bool through --shot, the perf harness,
+// the lab and the mob portrait — five call sites that would each have to
+// remember — it is latched HERE, in the one function every drawing path
+// already goes through to write RenderParams.
+//
+// Set it with `--short-range` or SANDVOX_SHORT_RANGE=1; the windowed game
+// calls SetShortRange() from the frame loop so the checkbox stays the live
+// authority there. Render-only: it touches no sim input and cannot reach the
+// world hash.
+namespace {
+bool g_shortRange = false;
+bool g_shortRangeEnvRead = false;
+}
+
+bool ShortRangeMode() {
+  if (!g_shortRangeEnvRead) {
+    g_shortRangeEnvRead = true;
+    const char* e = std::getenv("SANDVOX_SHORT_RANGE");
+    if (e && e[0] && e[0] != '0') g_shortRange = true;
+  }
+  return g_shortRange;
+}
+
+void SetShortRange(bool on) {
+  ShortRangeMode();   // consume the env default first, then override it
+  g_shortRange = on;
+}
 
 // Time of day used by --shot, as a 0..1 fraction of the cycle (0 = midnight,
 // 0.5 = noon). Set by `--time`; see RunShots.
@@ -214,7 +246,10 @@ void WriteRenderParams(const rhi::Queue& queue, const World& world,
   rp.tanHalfFov = std::tan(CurrentTuning().camera.fovY * 0.5f);
   rp.aspect = aspect;
   rp.time = time;
-  rp.flags = (shadows ? 1u : 0u) | extraFlags;
+  // bit 0 = sun shadows, bit 1 = active-voxel debug highlight (extraFlags),
+  // bit 2 = short-range mode. Bit 2 is OR'd in here rather than passed by the
+  // caller so that every drawing path gets it — see ShortRangeMode above.
+  rp.flags = (shadows ? 1u : 0u) | extraFlags | (ShortRangeMode() ? 4u : 0u);
   // ---- the shadow cache's clock (world.h kShadowCacheBuckets) ----
   // ONE CALL HERE IS ONE RENDERED FRAME, which is exactly the clock the cache
   // needs and the reason the counter lives in this function rather than in the

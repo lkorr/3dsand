@@ -2899,6 +2899,34 @@ struct Tuning {
     // sunShadowAt in raymarch.wgsl for why, and for what would actually work.
     // Kept as a knob so the experiment is re-runnable, not as a feature.
     float shadowMaxDist = 999.0f;
+
+    // ---- SHORT-RANGE MODE (dev panel "short range (100 m + fog)") ----
+    // A comparison arm against the dense-100 m WebGPU voxel engines
+    // (voxelbit.net and friends): they draw ~100 m of 5 cm voxels at 190 fps
+    // and hide the cutoff behind fog, where this engine draws a ~6.5 km
+    // cascade. The mode is a PERF mode, not a filter: every ray — the fine
+    // march and every cascade level — is ceilinged at shortRangeDist, so the
+    // frame genuinely stops paying for the horizon instead of fogging it after
+    // marching it.
+    //
+    // WHETHER THE MODE IS ON IS NOT HERE, ON PURPOSE. It is overlay state
+    // (Overlay::State::shortRange) and reaches the shader as RenderParams flag
+    // bit 2, because the running game writes tuning.json and a view toggle
+    // must not be able to clobber the user's saved defaults. These three rows
+    // only say what the mode LOOKS like when it is on.
+    //
+    // Ray ceiling in METERS. Nothing past this is marched at all.
+    float shortRangeDist = 100.0f;
+    // Where the fog ramp starts, as a FRACTION of shortRangeDist. Below it the
+    // image is unfogged; the mode's whole point is that the near field looks
+    // untouched and only the wall dissolves. 0.65 = fog begins at 65 m of 100.
+    float shortRangeFogStart = 0.65f;
+    // Steepness of the ramp between the start fraction and the ceiling. The
+    // curve is 1 - exp(-density * x^2) renormalised so it reaches EXACTLY 1 at
+    // the ceiling — the renormalisation is what stops the mode from trading a
+    // geometric cliff for a colour one. Higher = the fog closes sooner and
+    // the last few metres are pure sky; lower = a longer, thinner haze.
+    float shortRangeFogDensity = 5.0f;
   } render;
 
   // ---- world: which authored map and edit layer the game loads ---------------
