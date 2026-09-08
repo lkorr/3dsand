@@ -2607,10 +2607,17 @@ int RunVerify(GpuContext& ctx, World& world, Simulation& sim,
   // empty one) rather than emitting a second file nobody would look for.
   {
     std::string doc = gatesJson;
-    size_t close = doc.rfind('}');
+    // Cut at the gates document's own pipelineCompileMs section rather than at
+    // its closing brace: that section is re-emitted below with the numbers as
+    // of NOW, and the gates ran before the shots, which is when the deferred
+    // far compile usually lands. Keeping both would be a duplicate key.
+    size_t close = doc.find("\"pipelineCompileMs\"");
+    if (close == std::string::npos) close = doc.rfind('}');
     if (close == std::string::npos) doc = "{\n  \"gates\": {}";
     else doc = doc.substr(0, close);
-    while (!doc.empty() && (doc.back() == '\n' || doc.back() == ' ')) doc.pop_back();
+    while (!doc.empty() &&
+           (doc.back() == '\n' || doc.back() == ' ' || doc.back() == ','))
+      doc.pop_back();
     auto esc = [](const std::string& s) {
       std::string o;
       for (char ch : s) {
@@ -2634,7 +2641,9 @@ int RunVerify(GpuContext& ctx, World& world, Simulation& sim,
              "\", \"ok\": " + (rows[i].ok ? "true" : "false") + ", " + num +
              ", \"why\": \"" + esc(rows[i].why) + "\"}";
     }
-    doc += "],\n  \"failures\": " + std::to_string(failures) + "\n}\n";
+    doc += "],\n  \"failures\": " + std::to_string(failures) + ",\n";
+    doc += PipelineTimingJson("  ");
+    doc += "\n}\n";
     std::ofstream out("build/last_run.json");
     if (out) { out << doc; std::printf("wrote build/last_run.json (gates + shots + budget)\n"); }
     else std::fprintf(stderr, "--verify: cannot write build/last_run.json\n");
@@ -3660,6 +3669,28 @@ int main(int argc, char** argv) {
   FarField far;
   far.Init(&world);
   StartupMark("physics, debris, mobs, far-field init");
+
+  // WHO MAY RUN WHILE `far`/`fardown` ARE STILL COMPILING
+  // (docs/PLAN_shader_compile.md package A). Simulation::BuildPipelines
+  // returned before those two exist — 746 s + 98 s of driver work — so the
+  // game is playable in ~100 s after a worldgen edit instead of ~17 min. The
+  // cascades are render-only derived data, so a world without them ticks,
+  // hashes and saves identically; it just has no horizon.
+  //
+  // The DEFAULT is to block (Simulation::EnsureFarPipelines), so getting this
+  // list wrong costs a mode an unnecessary wait, never a wrong answer. Two
+  // things opt out:
+  //   - the interactive game and --frames, which are the whole point;
+  //   - --voxdump / --voxserve, which read terrain through worldgen and never
+  //     touch a cascade at all (a tuner region request must not wait 12 min).
+  {
+    const bool checkedOutput =
+        selftest || verify || measure || perf || renderBudget || budgetArms ||
+        shot || shotFrames || shotWaterfall || shotFluid || shotFluidPond ||
+        fluidBench || shaderStats || !shotMob.empty() || !sweepParam.empty();
+    const bool voxelTool = voxserve || !voxdumpArgs.empty();
+    sim.AllowDeferredFar(!checkedOutput || voxelTool);
+  }
 
   // --verify first: it is the union of three modes below on this one context.
   if (verify) {
@@ -5705,6 +5736,13 @@ int main(int argc, char** argv) {
         // residual was billed to the input row.
         sandvox::PerfSpan spanStream(sandvox::PerfScope::Stream);
         stream.Update(playerChunkNow, tick);
+        // THE HORIZON ARRIVING. `far`/`fardown` compile on a background thread
+        // (docs/PLAN_shader_compile.md package A) and this is the one place
+        // that notices they landed. Every fill queued before then was popped
+        // by PrepareTick below and dropped on the floor — EncodeFarFill had no
+        // pipeline to record — so nothing short of a wholesale refill puts
+        // terrain back past the residency window. Fires exactly once.
+        if (sim.PollFarPipelines()) far.FullRefill(playerChunkNow);
         // far-field cascades track the player the same way (render-only)
         far.Update(playerChunkNow);
         farCount = far.PrepareTick(ctx.queue);

@@ -1,11 +1,23 @@
 #include "gpu/rhi_vulkan.h"
 
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>  // std::abort — the staging ring's unserviceable-write path
 #include <cstring>
 #include <filesystem>
 #include <functional>
 #include <iterator>  // std::make_move_iterator — AbandonCommands re-queue
+
+// The pipeline cache's temp-file name carries the PID: SANDVOX_PIPELINE_CACHE
+// lets several processes share one cache file, and two of them renaming the
+// same "<path>.tmp" would hand the survivor a half-written blob.
+#ifdef _WIN32
+#include <process.h>  // _getpid
+#define SANDVOX_GETPID _getpid()
+#else
+#include <unistd.h>  // getpid
+#define SANDVOX_GETPID getpid()
+#endif
 
 #include "gpu/vk_spirv.h"
 #include "sim/microvox.h"  // MicroBrickGpu — Class A boundary assert
@@ -182,7 +194,13 @@ VKAPI_ATTR VkBool32 VKAPI_CALL DebugCallback(
                     VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT)))
     return VK_FALSE;
   auto* be = (Backend*)user;
-  if (be) be->validationMsgs_.push_back(data->pMessage);
+  if (be) {
+    // The layers call back on whatever thread provoked the message, and since
+    // pipeline creation was threaded (docs/PLAN_shader_compile.md package A)
+    // that is no longer always the main one.
+    std::lock_guard<std::mutex> lock(be->validationMutex_);
+    be->validationMsgs_.push_back(data->pMessage);
+  }
   return VK_FALSE;  // never abort the call
 }
 
@@ -350,8 +368,19 @@ bool Backend::Init(bool lowPower, bool validation, bool syncValidation,
   // Pipeline cache: driver-compiled ISA cached across runs so startup skips
   // both Tint WGSL->SPIR-V and the driver's own compilation on subsequent
   // launches with unchanged shaders.
+  //
+  // SANDVOX_PIPELINE_CACHE overrides the path (absolute, or relative to the
+  // CWD). The default is CWD-relative, so every worktree, every fresh run
+  // directory and every `cd` paid worldgen's multi-minute compile from cold
+  // (docs/PLAN_shader_compile.md item 4). Pointed at one shared file, several
+  // processes may write it concurrently: the save is temp+rename, and the
+  // blob a loser overwrites is a SUPERSET of what it loaded, so last writer
+  // wins and nobody reads a torn file.
   {
-    pipelineCachePath_ = "sandvox_pipeline_cache.bin";
+    if (const char* env = std::getenv("SANDVOX_PIPELINE_CACHE"))
+      pipelineCachePath_ = env;
+    else
+      pipelineCachePath_ = "sandvox_pipeline_cache.bin";
     std::vector<uint8_t> blob;
     if (FILE* f = std::fopen(pipelineCachePath_.c_str(), "rb")) {
       std::fseek(f, 0, SEEK_END);
@@ -1274,6 +1303,23 @@ VkShaderModule Backend::GetShaderModule(const std::string& wgsl, const std::stri
                                         const std::string& entryPoint,
                                         uint32_t bodyLineOffset,
                                         std::string& diagnostics) {
+  // THREAD-SAFE, AND CONCURRENT ACROSS KEYS. Threaded pipeline creation
+  // (Simulation::BuildPipelines) reaches this from several threads at once.
+  // The lock covers the CACHE ONLY, never the compile: the expensive middle —
+  // Tint, the SPIR-V optimizer, vkCreateShaderModule — runs unlocked, which is
+  // the whole point. Serializing it would have been ~free while Tint was the
+  // only cost there, and is not once an optimizer pass sits in the same span
+  // (docs/PLAN_shader_compile.md package B measured ~181 s of it).
+  //
+  // Two threads asking for the SAME key do not both compile: the second waits
+  // on `shaderCv_` for the first to publish. That never happens in the current
+  // build (each entry point is asked for once), and it is what stops the
+  // no-duplicate-work property from being an accident of the call pattern.
+  //
+  // Everything else on this path is already per-key private: the shader_cache
+  // file name is a hash of (source, entry point), so no two keys touch the
+  // same file, and vkspv::Compile holds no state between calls.
+  //
   // Cache by (label, entry point, source hash). The entry point is part of the
   // key because Tint emits a SINGLE-entry-point module: the engine builds
   // several pipelines from one .wgsl file (worldgen.wgsl alone yields main /
@@ -1281,8 +1327,21 @@ VkShaderModule Backend::GetShaderModule(const std::string& wgsl, const std::stri
   size_t srcHash = std::hash<std::string>{}(wgsl);
   std::string key = label + "\x1f" + entryPoint + "\x1f" +
                     std::to_string(srcHash);
-  auto it = moduleCache_.find(key);
-  if (it != moduleCache_.end()) return it->second;
+  {
+    std::unique_lock<std::mutex> lock(shaderMutex_);
+    for (;;) {
+      auto it = moduleCache_.find(key);
+      if (it != moduleCache_.end()) return it->second;
+      if (!moduleInFlight_.count(key)) break;  // ours to compile
+      shaderCv_.wait(lock);
+    }
+    moduleInFlight_.insert(key);
+  }
+  // From here to the publish below, THIS THREAD OWNS `key` and holds no lock.
+  // Every early return has to hand the claim back, so the compile body is
+  // wrapped in a lambda and there is exactly one exit path.
+  VkShaderModule out = VK_NULL_HANDLE;
+  auto compile = [&]() -> VkShaderModule {
 
   // SPIR-V disk cache: skip Tint entirely on subsequent launches when the
   // assembled WGSL hasn't changed. The key is a hash of (source, entry point);
@@ -1345,8 +1404,20 @@ VkShaderModule Backend::GetShaderModule(const std::string& wgsl, const std::stri
     }
     return VK_NULL_HANDLE;
   }
-  moduleCache_[key] = m;
   return m;
+  };  // compile
+
+  out = compile();
+  // Publish and release the claim in one critical section, then wake anyone
+  // who was waiting on this key — including on FAILURE, where nothing is
+  // cached and the waiter re-runs the compile and gets the same diagnostics.
+  {
+    std::lock_guard<std::mutex> lock(shaderMutex_);
+    moduleInFlight_.erase(key);
+    if (out != VK_NULL_HANDLE) moduleCache_[key] = out;
+  }
+  shaderCv_.notify_all();
+  return out;
 }
 
 VkDescriptorSetLayout Backend::CreateSetLayout(const rhi::BindGroupLayoutEntry* entries,
@@ -1405,7 +1476,12 @@ VkPipeline Backend::CreateComputePipeline(VkPipelineLayout layout, VkShaderModul
                                   captureStats_ ? VK_NULL_HANDLE : pipelineCache_, 1,
                                   &ci, nullptr, &p) != VK_SUCCESS)
     return VK_NULL_HANDLE;
-  pipelines_.push_back({p, label ? label : entry, /*compute=*/true});
+  // The one piece of shared state on this path (see the header note on why the
+  // Vulkan call itself needs no lock).
+  {
+    std::lock_guard<std::mutex> lock(pipelineMutex_);
+    pipelines_.push_back({p, label ? label : entry, /*compute=*/true});
+  }
   return p;
 }
 
@@ -1600,7 +1676,13 @@ VkPipeline Backend::CreateGraphicsPipeline(VkPipelineLayout layout, VkShaderModu
                                    captureStats_ ? VK_NULL_HANDLE : pipelineCache_, 1,
                                    &ci, nullptr, &p) != VK_SUCCESS)
     return VK_NULL_HANDLE;
-  pipelines_.push_back({p, label ? label : "(unlabelled)", /*compute=*/false});
+  // Locked for the same reason the compute path is: EnsureRenderPipelines is
+  // still serial and still on the main thread, but a deferred `far` compile
+  // may be appending to this vector at the same moment.
+  {
+    std::lock_guard<std::mutex> lock(pipelineMutex_);
+    pipelines_.push_back({p, label ? label : "(unlabelled)", /*compute=*/false});
+  }
   return p;
 }
 
@@ -1637,7 +1719,16 @@ std::vector<PipelineExecutable> Backend::CollectPipelineStats() const {
     return n;
   };
 
-  for (const PipelineRec& rec : pipelines_) {
+  // A snapshot, so the walk cannot be invalidated by a create finishing on
+  // another thread. --shader-stats forces the whole build serial anyway (see
+  // Simulation::BuildPipelines), but that is a caller's promise, not this
+  // function's, and the copy is 60 handles.
+  std::vector<PipelineRec> snapshot;
+  {
+    std::lock_guard<std::mutex> lock(pipelineMutex_);
+    snapshot = pipelines_;
+  }
+  for (const PipelineRec& rec : snapshot) {
     if (rec.pipe == VK_NULL_HANDLE) continue;
     VkPipelineInfoKHR pi{VK_STRUCTURE_TYPE_PIPELINE_INFO_KHR};
     pi.pipeline = rec.pipe;
@@ -2058,12 +2149,17 @@ VkDescriptorSet Backend::CreateDescriptorSet(VkDescriptorSetLayout layout,
   return set;
 }
 
+// Both take validationMutex_ because DebugCallback appends from whatever
+// thread provoked a message. The SCOPE itself is still single-threaded — one
+// F5 rebuild at a time — so the mark is a plain index, not a per-thread one.
 void Backend::PushValidationScope() {
+  std::lock_guard<std::mutex> lock(validationMutex_);
   validationScopeOpen_ = true;
   validationScopeMark_ = validationMsgs_.size();
 }
 
 bool Backend::PopValidationScope(std::string& messages) {
+  std::lock_guard<std::mutex> lock(validationMutex_);
   if (!validationScopeOpen_) return false;
   validationScopeOpen_ = false;
   bool any = validationMsgs_.size() > validationScopeMark_;
@@ -2105,14 +2201,31 @@ void Backend::SavePipelineCache() {
   // Write-then-rename, so a process killed mid-write (the whole reason this
   // function exists) cannot leave a truncated cache for the next launch to
   // hand the driver.
-  const std::string tmp = pipelineCachePath_ + ".tmp";
+  //
+  // The temp name is PER PROCESS AND PER CALL. With SANDVOX_PIPELINE_CACHE
+  // pointing several worktrees at one file, a shared "<path>.tmp" would let
+  // process B's fopen truncate the file process A is about to rename into
+  // place — and the result reads as a corrupt cache, i.e. as a full cold
+  // compile, which is exactly what the override exists to avoid. Racing
+  // RENAMES are fine: each is atomic and each blob is a superset of what its
+  // writer loaded, so last writer wins and no reader sees a partial file.
+  static std::atomic<uint32_t> saveSeq{0};
+  char suffix[48];
+  std::snprintf(suffix, sizeof(suffix), ".%d.%u.tmp", (int)SANDVOX_GETPID,
+                saveSeq.fetch_add(1));
+  const std::string tmp = pipelineCachePath_ + suffix;
   FILE* f = std::fopen(tmp.c_str(), "wb");
   if (!f) return;
   const size_t wrote = std::fwrite(blob.data(), 1, sz, f);
   std::fclose(f);
   if (wrote != sz) { std::remove(tmp.c_str()); return; }
+  // std::rename onto an existing file is implementation-defined on Windows and
+  // fails, so the target is removed first. That leaves a window in which a
+  // concurrent reader finds no cache at all, which costs it a cold compile but
+  // cannot give it a wrong one — the failure mode the temp file rules out.
   std::remove(pipelineCachePath_.c_str());
-  std::rename(tmp.c_str(), pipelineCachePath_.c_str());
+  if (std::rename(tmp.c_str(), pipelineCachePath_.c_str()) != 0)
+    std::remove(tmp.c_str());
 }
 
 void Backend::Shutdown() {

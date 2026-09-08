@@ -54,6 +54,13 @@ Stats LastStats(const Device& d);
 // whose driver lacks VK_KHR_pipeline_executable_properties.
 void SetCaptureStats(const Device& d, bool on);
 
+// Is that flag armed on this device? Simulation::BuildPipelines asks because
+// `--shader-stats` must build SERIALLY: the executable-properties query walks
+// pipelines the driver compiled this run, and running several compiles at once
+// is exactly the case the extension's per-pipeline attribution is worst at.
+// False on a non-Vulkan device.
+bool CaptureStats(const Device& d);
+
 // Write the driver's pipeline cache to disk now. Called by the frame loop right
 // after the graphics pipelines are first built (and after every F5 rebuild):
 // that compile is 45-52 s on this machine and the processes that pay it are

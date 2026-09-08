@@ -45,10 +45,13 @@
 
 #pragma once
 
+#include <condition_variable>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "gpu/rhi.h"
@@ -481,6 +484,12 @@ class Backend {
   // Compiles WGSL to SPIR-V through Tint and creates a VkShaderModule. Cached
   // by (label, source hash) so the 12 shader files that produce 20+ pipelines
   // compile once each rather than once per entry point.
+  //
+  // THREAD-SAFE AND CONCURRENT (Simulation::BuildPipelines fans the creates
+  // out over a pool). `shaderMutex_` covers the cache lookup and the publish,
+  // NOT the compile: Tint and — once package B lands — the SPIR-V optimizer
+  // run outside it, which is where the parallel win is. Two threads asking for
+  // the same key compile it once; the second waits on `shaderCv_`.
   VkShaderModule GetShaderModule(const std::string& wgsl, const std::string& label,
                                  const std::string& entryPoint, uint32_t bodyLineOffset,
                                  std::string& diagnostics);
@@ -489,6 +498,13 @@ class Backend {
   VkDescriptorSetLayout CreateSetLayout(const rhi::BindGroupLayoutEntry* entries,
                                         size_t count);
   VkPipelineLayout CreatePipelineLayout(const VkDescriptorSetLayout* sets, size_t count);
+  // THREAD-SAFE. vkCreateComputePipelines is internally synchronized with
+  // respect to the VkPipelineCache handed to it (Vulkan 1.3 §10.6: pipeline
+  // cache objects are the one exception to the "externally synchronized"
+  // default), and neither `layout` nor `module` is an externally-synchronized
+  // parameter of the call. The only thing here that was NOT safe is our own
+  // bookkeeping — the `pipelines_` label table — which now appends under
+  // `pipelineMutex_`.
   VkPipeline CreateComputePipeline(VkPipelineLayout layout, VkShaderModule module,
                                    const char* entry, const char* label);
   // Allocates and writes a descriptor set. A binding with size 0 means "rest of
@@ -680,6 +696,12 @@ class Backend {
   std::vector<VkFence> retiredRetained_;
 
   std::unordered_map<std::string, VkShaderModule> moduleCache_;
+  // Keys some thread is compiling RIGHT NOW. A second asker for the same key
+  // waits on shaderCv_ instead of compiling it a second time; see
+  // GetShaderModule for why the compile itself is NOT under the lock.
+  std::unordered_set<std::string> moduleInFlight_;
+  std::mutex shaderMutex_;               // guards moduleCache_ + moduleInFlight_
+  std::condition_variable shaderCv_;     // a key left moduleInFlight_
   VkPipelineCache pipelineCache_ = VK_NULL_HANDLE;
   std::string pipelineCachePath_;
   std::vector<VkDescriptorSetLayout> setLayouts_;
@@ -695,9 +717,18 @@ class Backend {
     bool compute = false;
   };
   std::vector<PipelineRec> pipelines_;
+  // Guards pipelines_ only. Separate from shaderMutex_ so a create that is
+  // already inside the driver does not block the next thread's Tint lookup.
+  // Mutable so the const readers (CollectPipelineStats) can take it too.
+  mutable std::mutex pipelineMutex_;
   bool captureStats_ = false;
 
   std::vector<std::string> validationMsgs_;
+  // DebugCallback runs on whatever thread provoked the message, and since
+  // pipeline creation is threaded that is no longer always the main one.
+  // Guards the vector's mutation and the scope pop; ValidationMessages()
+  // hands out a reference and is for after-the-join readers only.
+  std::mutex validationMutex_;
   bool validationScopeOpen_ = false;
   size_t validationScopeMark_ = 0;
 

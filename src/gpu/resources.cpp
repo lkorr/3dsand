@@ -5,7 +5,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <mutex>
 #include <sstream>
+#include <unordered_map>
 
 #include "sim/treeatlas.h"   // CurrentTreeLattice: the TREE_* prelude consts
 #include "sim/tuning.h"
@@ -442,21 +444,116 @@ rhi::ShaderModule LoadShader(const rhi::Device& device, const std::string& shade
   return device.CreateShaderModule(src, name.c_str());
 }
 
+// ---- pipeline compile times ------------------------------------------------
+namespace {
+std::mutex& PipeTimingMutex() {
+  static std::mutex m;
+  return m;
+}
+std::vector<PipelineCompileRecord>& PipeTimingRecords() {
+  static std::vector<PipelineCompileRecord> v;
+  return v;
+}
+// The zero of both milestone clocks. Taken on the first call rather than at
+// static-init so it is the first pipeline create, not whatever the loader
+// decided to run first.
+std::chrono::steady_clock::time_point& PipeTimingEpoch() {
+  static std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+  return t0;
+}
+double gInteractiveReadyMs = -1;
+double gFarReadyMs = -1;
+}  // namespace
+
+void RecordPipelineCompile(const char* label, const char* entry, double ms) {
+  std::lock_guard<std::mutex> lock(PipeTimingMutex());
+  PipeTimingEpoch();  // start the clock on the first create
+  PipeTimingRecords().push_back({label ? label : "?", entry ? entry : "?", ms});
+}
+
+std::vector<PipelineCompileRecord> PipelineCompileRecords() {
+  std::lock_guard<std::mutex> lock(PipeTimingMutex());
+  return PipeTimingRecords();
+}
+
+void MarkInteractiveReady() {
+  std::lock_guard<std::mutex> lock(PipeTimingMutex());
+  gInteractiveReadyMs = std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - PipeTimingEpoch())
+                            .count();
+}
+
+void MarkFarReady() {
+  std::lock_guard<std::mutex> lock(PipeTimingMutex());
+  gFarReadyMs = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - PipeTimingEpoch())
+                    .count();
+}
+
+double InteractiveReadyMs() {
+  std::lock_guard<std::mutex> lock(PipeTimingMutex());
+  return gInteractiveReadyMs;
+}
+
+double FarReadyMs() {
+  std::lock_guard<std::mutex> lock(PipeTimingMutex());
+  return gFarReadyMs;
+}
+
+std::string PipelineTimingJson(const char* indent) {
+  const std::string ind = indent ? indent : "  ";
+  std::vector<PipelineCompileRecord> recs = PipelineCompileRecords();
+  std::string out = ind + "\"pipelineCompileMs\": {";
+  // LAST value wins per key. F5 and --sweep call BuildPipelines again, and a
+  // JSON object with the same key twice is a document whose meaning depends on
+  // the parser. The rebuild's number is the interesting one anyway.
+  std::vector<std::string> order;
+  std::unordered_map<std::string, double> byKey;
+  for (const PipelineCompileRecord& r : recs) {
+    // label::entry, because worldgen alone contributes five rows and the label
+    // is what pass_table.def names but the entry is what the driver compiled.
+    const std::string key = r.label + "::" + r.entry;
+    if (!byKey.count(key)) order.push_back(key);
+    byKey[key] = r.ms;
+  }
+  for (size_t i = 0; i < order.size(); i++) {
+    char num[32];
+    std::snprintf(num, sizeof(num), "%.1f", byKey[order[i]]);
+    out += std::string(i ? ", " : "") + "\"" + order[i] + "\": " + num;
+  }
+  out += "},\n";
+  char a[64], b[64];
+  std::snprintf(a, sizeof(a), "%.1f", InteractiveReadyMs());
+  std::snprintf(b, sizeof(b), "%.1f", FarReadyMs());
+  out += ind + "\"interactiveReadyMs\": " + a + ",\n";
+  out += ind + "\"farReadyMs\": " + b;
+  return out;
+}
+
 rhi::ComputePipeline MakeComputePipeline(const rhi::Device& device,
                                          const rhi::PipelineLayout& layout,
                                          const rhi::ShaderModule& module,
                                          const char* entry, const char* label) {
-  // SANDVOX_SHADER_TIMING=1: one line per pipeline with the driver's compile
-  // time, so a cold `sim init` that takes minutes names the entry point that
-  // took them instead of being one number (CLAUDE.md verification rule 6).
-  // worldgen.wgsl alone is FIVE entry points (main, list, pagefill, far,
-  // fardown), each a full compile of the kernel; that is where the minutes go.
+  // The driver's compile time is ALWAYS measured and recorded (it lands in
+  // build/last_run.json via PipelineTimingJson). SANDVOX_SHADER_TIMING=1 only
+  // decides whether it is also PRINTED, one line per pipeline, so a cold `sim
+  // init` that takes minutes names the entry point that took them instead of
+  // being one number (CLAUDE.md verification rule 6). worldgen.wgsl alone is
+  // FIVE entry points (main, list, pagefill, far, fardown), each a full
+  // compile of the kernel; that is where the minutes go.
   static const bool timing = std::getenv("SANDVOX_SHADER_TIMING") != nullptr;
-  if (!timing) return device.CreateComputePipeline(layout, module, entry, label);
   const auto t0 = std::chrono::steady_clock::now();
   rhi::ComputePipeline p = device.CreateComputePipeline(layout, module, entry, label);
   const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-  std::printf("pipeline %-16s %-10s %9.1f ms\n", label, entry, ms);
-  std::fflush(stdout);
+  RecordPipelineCompile(label, entry, ms);
+  if (timing) {
+    // ONE printf per pipeline under one lock: the build pool means several
+    // threads finish inside microseconds of each other, and an interleaved
+    // line is the one piece of output this mode exists to produce.
+    static std::mutex printMutex;
+    std::lock_guard<std::mutex> lock(printMutex);
+    std::printf("pipeline %-16s %-10s %9.1f ms\n", label, entry, ms);
+    std::fflush(stdout);
+  }
   return p;
 }

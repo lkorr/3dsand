@@ -1,4 +1,6 @@
 #pragma once
+#include <atomic>
+#include <future>
 #include <string>
 #include <vector>
 
@@ -327,8 +329,55 @@ class Simulation {
     EnsureRenderPipelines(format);
   }
 
+  // ---- deferred far pipelines (docs/PLAN_shader_compile.md package A) ------
+  //
+  // worldgen's `far` (746 s of NVIDIA driver compile) and `fardown` (98 s) are
+  // built on a background thread and BuildPipelines returns without them, so a
+  // worldgen edit is playable in ~100 s instead of ~17 min. That is only sound
+  // because the cascades are RENDER-ONLY DERIVED DATA (worldgen.wgsl's far
+  // block, DESIGN.md §9): the world ticks, hashes and saves identically
+  // without them, it just has no horizon.
+
+  // Who is allowed to run while they are still compiling. DEFAULT IS NO, so a
+  // mode added later is correct without knowing this exists; main.cpp opts in
+  // the interactive game (the point of the exercise) and the voxel-region
+  // tools (which read no cascade at all). Everything else — every gate, every
+  // --shot frame, every --render-budget arm, every smoke probe — blocks, so no
+  // checked output can depend on when the driver happened to finish.
+  void AllowDeferredFar(bool on) { deferFarOk_ = on; }
+
+  // Publish a finished background compile and return true EXACTLY ONCE: on the
+  // call that made the pipelines live. That is the caller's cue to
+  // FarField::FullRefill — every fill queued while they were missing was
+  // popped by PrepareTick and dropped, so the cascades are empty and only a
+  // wholesale refill puts a horizon back. Never blocks.
+  bool PollFarPipelines();
+  bool FarPipelinesReady() const {
+    return farReady_.load(std::memory_order_acquire);
+  }
+  // Block until the deferred compile finishes, then publish. Idempotent, and a
+  // no-op when the far pipelines were never deferred.
+  void WaitForFarPipelines();
+
  private:
   bool BuildPipelines(const rhi::Device& device, std::string* err);
+  // What the deferred thread returns. A struct rather than two futures so the
+  // "both are ready" test is one wait and the completion work (MarkFarReady,
+  // SavePipelineCache) has one place to happen.
+  struct FarPipelines {
+    rhi::ComputePipeline fill, down;
+  };
+  // Move the future's result onto farFill_/farDown_. Main thread only.
+  void PublishFarPipelines();
+  // Blocks unless the caller opted into deferral. Called from EncodeFarFill
+  // with work to do — the one point where a caller is about to depend on
+  // cascade CONTENT. Recording a far row against a pipeline that does not
+  // exist yet is legal (the recorder skips a null pipeline); what is not
+  // acceptable is a checked output that silently depends on driver timing.
+  void EnsureFarPipelines() {
+    if (deferFarOk_ || farReady_.load(std::memory_order_acquire)) return;
+    WaitForFarPipelines();
+  }
   // The full and slim sim bind groups, both pages. Called by Init and again by
   // UploadEnvironment when a table buffer had to be recreated.
   void BuildSimBindGroups(const rhi::Device& device);
@@ -396,7 +445,16 @@ class Simulation {
   rhi::ComputePipeline windWake_;
   rhi::ComputePipeline explodeMark_, explodeApply_, pArgs1_, pSpawn_, pIntegrate_,
       pArgs2_, pResolve_;
+  // Live only after PublishFarPipelines. Until then both are INVALID handles
+  // and the recorder skips their rows (vk_record.cpp's null-pipeline continue).
   rhi::ComputePipeline farFill_, farDown_;
+  // The background compile. Valid between BuildPipelines and the publish;
+  // `farPublished_` and `deferFarOk_` are main-thread-only, `farReady_` is the
+  // one field any other thread may observe.
+  std::future<FarPipelines> farFuture_;
+  std::atomic<bool> farReady_{false};
+  bool farPublished_ = false;
+  bool deferFarOk_ = false;
   // The openness grid (sim_openness.wgsl, docs/PLAN_gi.md §2): `dirty` walks
   // the tick's compacted dirty list, `refresh` walks a rolling slice of the
   // window. Render-path passes on the TICK table — see the .def rows for why

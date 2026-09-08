@@ -1,9 +1,12 @@
 #include "sim/simulation.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <functional>
+#include <thread>
 
 #include "gpu/resources.h"
 #include "sim/pagetable.h"
@@ -931,34 +934,121 @@ void Simulation::UploadMicroBodies(const rhi::Queue& queue, MicroBodySet& set) {
   SetArtPalette(queue, set.artColors);
 }
 
+// ---------------------------------------------------------------------------
+// THE PIPELINE BUILD POOL (docs/PLAN_shader_compile.md package A)
+//
+// A cold build was ~17 minutes, serial, on the boot thread: the cost is
+// vkCreateComputePipelines in the NVIDIA driver, one entry point at a time,
+// and worldgen.wgsl alone is five of them (main 80 s, list 75 s, far 746 s,
+// fardown 98 s, pagefill).
+//
+// WHY PARALLEL IS LEGAL. vkCreateComputePipelines takes no externally-
+// synchronized parameter, and the VkPipelineCache every call here shares is
+// the one Vulkan object explicitly documented as internally synchronized. The
+// unsafe part was OURS — vk::Backend's label table and Tint module cache —
+// and both are now under their own mutex (rhi_vulkan.h). Nothing in a create
+// touches Simulation state; each job writes exactly one member and the join
+// is the happens-before edge for every reader after it.
+//
+// Deliberately not a general thread pool: the jobs are a fixed batch issued
+// once at load (and once per F5), they never enqueue more work, and a
+// pull-from-an-atomic-index worker needs no condition variable to prove.
+namespace {
+class PipelineBuildPool {
+ public:
+  void Add(std::function<void()> job) { jobs_.push_back(std::move(job)); }
+  // Runs everything queued and returns when the last job has finished. One
+  // thread means SERIAL and no thread is spawned at all — which is what
+  // `--shader-stats` needs (concurrent pipeline-executable-properties queries
+  // are exactly the case the extension attributes worst).
+  void Run(unsigned threads) {
+    if (jobs_.empty()) return;
+    if (threads <= 1) {
+      for (auto& j : jobs_) j();
+      jobs_.clear();
+      return;
+    }
+    std::atomic<size_t> next{0};
+    std::vector<std::thread> pool;
+    const unsigned n = std::min<unsigned>(threads, (unsigned)jobs_.size());
+    for (unsigned i = 0; i < n; i++)
+      pool.emplace_back([this, &next] {
+        for (size_t k = next.fetch_add(1); k < jobs_.size(); k = next.fetch_add(1))
+          jobs_[k]();
+      });
+    for (std::thread& t : pool) t.join();
+    jobs_.clear();
+  }
+
+ private:
+  std::vector<std::function<void()>> jobs_;
+};
+
+// Six, matching scripts/build.sh's core cap: the driver compile is one busy
+// core per call and this machine has to stay usable while it runs.
+constexpr unsigned kBuildThreads = 6;
+}  // namespace
+
 bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
-  auto mod = [&](const char* name) { return LoadShader(device, shaderDir_, name); };
-  rhi::ShaderModule mWorldgen = mod("worldgen.wgsl");
-  rhi::ShaderModule mMutate = mod("sim_mutate.wgsl");
-  rhi::ShaderModule mCompact = mod("sim_compact.wgsl");
-  rhi::ShaderModule mStep = mod("sim_step.wgsl");
-  rhi::ShaderModule mOcc = mod("sim_occupancy.wgsl");
-  rhi::ShaderModule mPick = mod("sim_pick.wgsl");
+  // F5 REBUILDS MUST NOT RACE THE DEFERRED SET. vkCreateComputePipelines is
+  // not cancellable, and the modules the background thread is compiling from
+  // are owned by the previous call's locals. Join first, always — a no-op on
+  // the first build and on any build whose predecessor already published.
+  WaitForFarPipelines();
+
+  // `--shader-stats` forces the whole build serial: capture is a create flag
+  // and the executable-properties query it feeds reads per-pipeline driver
+  // state, which is not a thing to interrogate from six threads at once.
+  const unsigned buildThreads =
+      rhi::vkr::CaptureStats(device) ? 1u : kBuildThreads;
+
+  // ---- module loads, in parallel -----------------------------------------
+  // LoadShader is a file read plus the generated preludes, and today that is
+  // cheap: Tint runs LATER, inside GetShaderModule, because the entry point is
+  // not known until pipeline creation — so this batch is fanned out mostly to
+  // be the right shape. Each job reads only globals that were set before this
+  // function was entered (the tuning, the tree lattice, the world map) and
+  // writes only its own handle.
+  rhi::ShaderModule mWorldgen, mMutate, mCompact, mStep, mOcc, mPick;
   // The openness grid's writer (docs/PLAN_gi.md §2). A RENDER-path module among
   // the sim ones for shadow_resolve.wgsl's reason: BuildPipelines is the single
   // place F5 recompiles, and the pass and the raymarch's reader must be
   // rebuilt together or one of them is a tick behind the other's layout.
-  rhi::ShaderModule mOpenness = mod("sim_openness.wgsl");
+  rhi::ShaderModule mOpenness;
   // The shadow cache's resolve. A RENDER-path module living among the sim ones
   // because BuildPipelines is the single place F5 recompiles, and the cache's
   // enable flag has to be recomputed in lockstep with raymarch.wgsl's const.
-  rhi::ShaderModule mShadow = mod("shadow_resolve.wgsl");
-  rhi::ShaderModule mExplode = mod("sim_explode.wgsl");
-  rhi::ShaderModule mParticle = mod("sim_particle.wgsl");
-  rhi::ShaderModule mFluid = mod("sim_fluid.wgsl");
-  rhi::ShaderModule mFluidSeam = mod("sim_fluid_seam.wgsl");
-  rhi::ShaderModule mWaterBody = mod("sim_waterbody.wgsl");
-  rhi::ShaderModule mRay = mod("raymarch.wgsl");
-  rhi::ShaderModule mDebris = mod("debris.wgsl");
-  rhi::ShaderModule mMicroBody = mod("microbody.wgsl");
-  rhi::ShaderModule mDebugLines = mod("debug_lines.wgsl");
-  rhi::ShaderModule mDebugWind = mod("debug_wind.wgsl");
-  rhi::ShaderModule mDebugCur = mod("debug_current.wgsl");
+  rhi::ShaderModule mShadow;
+  rhi::ShaderModule mExplode, mParticle, mFluid, mFluidSeam, mWaterBody;
+  rhi::ShaderModule mRay, mDebris, mMicroBody, mDebugLines, mDebugWind, mDebugCur;
+  {
+    PipelineBuildPool loads;
+    auto mod = [&](rhi::ShaderModule* into, const char* name) {
+      loads.Add([this, into, name, &device] {
+        *into = LoadShader(device, shaderDir_, name);
+      });
+    };
+    mod(&mWorldgen, "worldgen.wgsl");
+    mod(&mMutate, "sim_mutate.wgsl");
+    mod(&mCompact, "sim_compact.wgsl");
+    mod(&mStep, "sim_step.wgsl");
+    mod(&mOcc, "sim_occupancy.wgsl");
+    mod(&mPick, "sim_pick.wgsl");
+    mod(&mOpenness, "sim_openness.wgsl");
+    mod(&mShadow, "shadow_resolve.wgsl");
+    mod(&mExplode, "sim_explode.wgsl");
+    mod(&mParticle, "sim_particle.wgsl");
+    mod(&mFluid, "sim_fluid.wgsl");
+    mod(&mFluidSeam, "sim_fluid_seam.wgsl");
+    mod(&mWaterBody, "sim_waterbody.wgsl");
+    mod(&mRay, "raymarch.wgsl");
+    mod(&mDebris, "debris.wgsl");
+    mod(&mMicroBody, "microbody.wgsl");
+    mod(&mDebugLines, "debug_lines.wgsl");
+    mod(&mDebugWind, "debug_wind.wgsl");
+    mod(&mDebugCur, "debug_current.wgsl");
+    loads.Run(buildThreads);
+  }
   if (!mWorldgen || !mMutate || !mCompact || !mStep || !mOcc || !mPick ||
       !mOpenness ||
       !mExplode || !mParticle || !mFluid || !mFluidSeam || !mWaterBody ||
@@ -968,110 +1058,193 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
     return false;
   }
 
-  worldgen_ = MakeComputePipeline(device, simPL_, mWorldgen, "main", "worldgen");
-  worldgenList_ = MakeComputePipeline(device, simPL_, mWorldgen, "list", "worldgenList");
-  // Same module as worldgen: the JITTER page fill shares genChunk's slot->world
-  // mapping and must not drift from it (world.h's JITTER block).
-  pageFill_ = MakeComputePipeline(device, simPL_, mWorldgen, "pagefill", "pageFill");
-  farFill_ = MakeComputePipeline(device, farPL_, mWorldgen, "far", "farFill");
-  farDown_ = MakeComputePipeline(device, farPL_, mWorldgen, "fardown", "farDown");
-  // Persist the driver's pipeline cache NOW, exactly as EnsureRenderPipelines
-  // does after its own build: worldgen's five entry points are the multi-minute
-  // compile, and a launch killed anywhere past this line (build.sh's taskkill,
-  // a user giving up on a stalled load) would otherwise throw that work away
-  // and pay it again on every retry.
+  // ---- batch A: worldgen's SYNCHRONOUS entry points --------------------
+  // Its own batch, and not merged with batch B, so the cache save below still
+  // means what it meant when this was serial: worldgen's entry points are the
+  // multi-minute compile, and a launch killed anywhere past that line
+  // (build.sh's taskkill, a user giving up on a stalled load) would otherwise
+  // throw the work away and pay it again on every retry. `far`/`fardown` are
+  // NOT here — see the deferred block after batch B.
+  {
+    PipelineBuildPool pool;
+    pool.Add([&] {
+      worldgen_ = MakeComputePipeline(device, simPL_, mWorldgen, "main", "worldgen");
+    });
+    pool.Add([&] {
+      worldgenList_ =
+          MakeComputePipeline(device, simPL_, mWorldgen, "list", "worldgenList");
+    });
+    // Same module as worldgen: the JITTER page fill shares genChunk's
+    // slot->world mapping and must not drift from it (world.h's JITTER block).
+    pool.Add([&] {
+      pageFill_ = MakeComputePipeline(device, simPL_, mWorldgen, "pagefill", "pageFill");
+    });
+    pool.Run(buildThreads);
+  }
   rhi::vkr::SavePipelineCache(device_);
+
+  // ---- batch B: everything else that is not far ------------------------
+  // ~45 pipelines, 30-60 s of driver work on a cold cache when it was serial
+  // (raymarch and the fluid family dominate). Every job writes exactly one
+  // member, so the pool's join is all the synchronization the reads below
+  // need.
+  PipelineBuildPool pool;
   // The shadow cache's two render-path kernels. Loaded unconditionally even
   // when the cache is compiled out of raymarch.wgsl: the pipelines are cheap,
   // and EncodeShadowResolve is what decides whether they ever run, so the
   // enable path is ONE test in one place rather than a load-time fork.
-  shadowPrepare_ = MakeComputePipeline(device, shadowPL_, mShadow, "prepare", "shadowPrepare");
-  shadowResolve_ = MakeComputePipeline(device, shadowPL_, mShadow, "resolve", "shadowResolve");
-  // Decided HERE, in the function that also compiles raymarch.wgsl, and from the
-  // same two inputs its SHADOW_CACHE const is built from. That co-location is
-  // the point: the pass and the shader must agree, and F5 recompiles both
-  // through this function, so a tuning flip cannot leave one side switched.
-  shadowCacheOn_ = FragmentStoresAvailable() &&
-                   CurrentTuning().render.shadowCache != 0 &&
-                   (bool)shadowPrepare_ && (bool)shadowResolve_;
-  mutate_ = MakeComputePipeline(device, simPL_, mMutate, "main", "mutate");
-  mutateCells_ = MakeComputePipeline(device, simPL_, mMutate, "cells", "mutateCells");
+  pool.Add([&] { shadowPrepare_ = MakeComputePipeline(device, shadowPL_, mShadow, "prepare", "shadowPrepare"); });
+  pool.Add([&] { shadowResolve_ = MakeComputePipeline(device, shadowPL_, mShadow, "resolve", "shadowResolve"); });
+  pool.Add([&] { mutate_ = MakeComputePipeline(device, simPL_, mMutate, "main", "mutate"); });
+  pool.Add([&] { mutateCells_ = MakeComputePipeline(device, simPL_, mMutate, "cells", "mutateCells"); });
   // The wind primitive footprint wake — same module, third entry point. It
   // needs only dirtyIn/dirtyOut and TickParams, all of which simPL_ already
   // binds, so a fan costs no new binding and no new layout.
-  windWake_ = MakeComputePipeline(device, simPL_, mMutate, "windWake", "windWake");
-  compact_ = MakeComputePipeline(device, simPL_, mCompact, "main", "compact");
-  compactNext_ = MakeComputePipeline(device, simPL_, mCompact, "mainNext", "compactNext");
-  step_ = MakeComputePipeline(device, simPL_, mStep, "main", "step");
-  occupancy_ = MakeComputePipeline(device, simPL_, mOcc, "main", "occupancy");
-  occupancyDirty_ = MakeComputePipeline(device, simPL_, mOcc, "mainDirty", "occupancyDirty");
-  opennessDirty_ =
-      MakeComputePipeline(device, simPL_, mOpenness, "dirty", "opennessDirty");
-  opennessRefresh_ =
-      MakeComputePipeline(device, simPL_, mOpenness, "refresh", "opennessRefresh");
-  pick_ = MakeComputePipeline(device, simPL_, mPick, "main", "pick");
+  pool.Add([&] { windWake_ = MakeComputePipeline(device, simPL_, mMutate, "windWake", "windWake"); });
+  pool.Add([&] { compact_ = MakeComputePipeline(device, simPL_, mCompact, "main", "compact"); });
+  pool.Add([&] { compactNext_ = MakeComputePipeline(device, simPL_, mCompact, "mainNext", "compactNext"); });
+  pool.Add([&] { step_ = MakeComputePipeline(device, simPL_, mStep, "main", "step"); });
+  pool.Add([&] { occupancy_ = MakeComputePipeline(device, simPL_, mOcc, "main", "occupancy"); });
+  pool.Add([&] { occupancyDirty_ = MakeComputePipeline(device, simPL_, mOcc, "mainDirty", "occupancyDirty"); });
+  pool.Add([&] { opennessDirty_ = MakeComputePipeline(device, simPL_, mOpenness, "dirty", "opennessDirty"); });
+  pool.Add([&] { opennessRefresh_ = MakeComputePipeline(device, simPL_, mOpenness, "refresh", "opennessRefresh"); });
+  pool.Add([&] { pick_ = MakeComputePipeline(device, simPL_, mPick, "main", "pick"); });
 
-  explodeMark_ = MakeComputePipeline(device, simPL2_, mExplode, "mark", "explodeMark");
-  explodeApply_ = MakeComputePipeline(device, simPL2_, mExplode, "apply", "explodeApply");
-  pArgs1_ = MakeComputePipeline(device, simPL2_, mParticle, "args1", "pArgs1");
-  pSpawn_ = MakeComputePipeline(device, simPL2_, mParticle, "spawn", "pSpawn");
-  pIntegrate_ = MakeComputePipeline(device, simPL2_, mParticle, "integrate", "pIntegrate");
-  pArgs2_ = MakeComputePipeline(device, simPL2_, mParticle, "args2", "pArgs2");
-  pResolve_ = MakeComputePipeline(device, simPL2_, mParticle, "resolve", "pResolve");
+  pool.Add([&] { explodeMark_ = MakeComputePipeline(device, simPL2_, mExplode, "mark", "explodeMark"); });
+  pool.Add([&] { explodeApply_ = MakeComputePipeline(device, simPL2_, mExplode, "apply", "explodeApply"); });
+  pool.Add([&] { pArgs1_ = MakeComputePipeline(device, simPL2_, mParticle, "args1", "pArgs1"); });
+  pool.Add([&] { pSpawn_ = MakeComputePipeline(device, simPL2_, mParticle, "spawn", "pSpawn"); });
+  pool.Add([&] { pIntegrate_ = MakeComputePipeline(device, simPL2_, mParticle, "integrate", "pIntegrate"); });
+  pool.Add([&] { pArgs2_ = MakeComputePipeline(device, simPL2_, mParticle, "args2", "pArgs2"); });
+  pool.Add([&] { pResolve_ = MakeComputePipeline(device, simPL2_, mParticle, "resolve", "pResolve"); });
 
-  fluidMark_ = MakeComputePipeline(device, fluidPL_, mFluid, "mark", "fluidMark");
-  fluidAlloc_ = MakeComputePipeline(device, fluidPL_, mFluid, "alloc", "fluidAlloc");
-  fluidClear_ = MakeComputePipeline(device, fluidPL_, mFluid, "clearGrid", "fluidClear");
-  fluidP2g_ = MakeComputePipeline(device, fluidPL_, mFluid, "p2g1", "fluidP2g1");
-  fluidP2g2_ = MakeComputePipeline(device, fluidPL_, mFluid, "p2g2", "fluidP2g2");
-  fluidGridUp_ = MakeComputePipeline(device, fluidPL_, mFluid, "gridUpdate", "fluidGridUp");
-  fluidG2p_ = MakeComputePipeline(device, fluidPL_, mFluid, "g2p", "fluidG2p");
+  pool.Add([&] { fluidMark_ = MakeComputePipeline(device, fluidPL_, mFluid, "mark", "fluidMark"); });
+  pool.Add([&] { fluidAlloc_ = MakeComputePipeline(device, fluidPL_, mFluid, "alloc", "fluidAlloc"); });
+  pool.Add([&] { fluidClear_ = MakeComputePipeline(device, fluidPL_, mFluid, "clearGrid", "fluidClear"); });
+  pool.Add([&] { fluidP2g_ = MakeComputePipeline(device, fluidPL_, mFluid, "p2g1", "fluidP2g1"); });
+  pool.Add([&] { fluidP2g2_ = MakeComputePipeline(device, fluidPL_, mFluid, "p2g2", "fluidP2g2"); });
+  pool.Add([&] { fluidGridUp_ = MakeComputePipeline(device, fluidPL_, mFluid, "gridUpdate", "fluidGridUp"); });
+  pool.Add([&] { fluidG2p_ = MakeComputePipeline(device, fluidPL_, mFluid, "g2p", "fluidG2p"); });
 
   // The excite/settle seam (sim_fluid_seam.wgsl; fluidSpawn_ moved here —
   // appends go through the seam's GPU-owned count now).
-  fluidSpawn_ = MakeComputePipeline(device, fluidSeamPL_, mFluidSeam, "spawnAppend", "seamSpawn");
-  fluidCompactCount_ = MakeComputePipeline(device, fluidSeamPL_, mFluidSeam, "compactCount", "seamCompactCount");
-  fluidCompactScan_ = MakeComputePipeline(device, fluidSeamPL_, mFluidSeam, "compactScan", "seamCompactScan");
-  fluidCompactScatter_ = MakeComputePipeline(device, fluidSeamPL_, mFluidSeam, "compactScatter", "seamCompactScatter");
-  fluidExciteDetect_ = MakeComputePipeline(device, fluidSeamPL_, mFluidSeam, "exciteDetect", "seamExciteDetect");
-  fluidExciteScan_ = MakeComputePipeline(device, fluidSeamPL_, mFluidSeam, "exciteScan", "seamExciteScan");
-  fluidExciteEmit_ = MakeComputePipeline(device, fluidSeamPL_, mFluidSeam, "exciteEmit", "seamExciteEmit");
-  fluidPTick_ = MakeComputePipeline(device, fluidSeamPL_, mFluidSeam, "particleTick", "seamParticleTick");
-  fluidSettleJudge_ = MakeComputePipeline(device, fluidSeamPL_, mFluidSeam, "settleJudge", "seamSettleJudge");
-  fluidSettleScan_ = MakeComputePipeline(device, fluidSeamPL_, mFluidSeam, "settleScan", "seamSettleScan");
-  fluidSettleBin_ = MakeComputePipeline(device, fluidSeamPL_, mFluidSeam, "settleBin", "seamSettleBin");
-  fluidSettleCheck_ = MakeComputePipeline(device, fluidSeamPL_, mFluidSeam, "settleCheck", "seamSettleCheck");
-  fluidSettleCommit_ = MakeComputePipeline(device, fluidSeamPL_, mFluidSeam, "settleCommit", "seamSettleCommit");
-  fluidSettleKill_ = MakeComputePipeline(device, fluidSeamPL_, mFluidSeam, "settleKill", "seamSettleKill");
-  fluidConsumeApply_ = MakeComputePipeline(device, fluidSeamPL_, mFluidSeam, "consumeApply", "seamConsumeApply");
-  fluidStainApply_ = MakeComputePipeline(device, fluidSeamPL_, mFluidSeam, "stainApply", "seamStainApply");
-  fluidMirrorFold_ = MakeComputePipeline(device, fluidSeamPL_, mFluidSeam, "mirrorFold", "seamMirrorFold");
-  fluidCellClear_ = MakeComputePipeline(device, fluidSeamPL_, mFluidSeam, "cellClear", "seamCellClear");
+  pool.Add([&] { fluidSpawn_ = MakeComputePipeline(device, fluidSeamPL_, mFluidSeam, "spawnAppend", "seamSpawn"); });
+  pool.Add([&] { fluidCompactCount_ = MakeComputePipeline(device, fluidSeamPL_, mFluidSeam, "compactCount", "seamCompactCount"); });
+  pool.Add([&] { fluidCompactScan_ = MakeComputePipeline(device, fluidSeamPL_, mFluidSeam, "compactScan", "seamCompactScan"); });
+  pool.Add([&] { fluidCompactScatter_ = MakeComputePipeline(device, fluidSeamPL_, mFluidSeam, "compactScatter", "seamCompactScatter"); });
+  pool.Add([&] { fluidExciteDetect_ = MakeComputePipeline(device, fluidSeamPL_, mFluidSeam, "exciteDetect", "seamExciteDetect"); });
+  pool.Add([&] { fluidExciteScan_ = MakeComputePipeline(device, fluidSeamPL_, mFluidSeam, "exciteScan", "seamExciteScan"); });
+  pool.Add([&] { fluidExciteEmit_ = MakeComputePipeline(device, fluidSeamPL_, mFluidSeam, "exciteEmit", "seamExciteEmit"); });
+  pool.Add([&] { fluidPTick_ = MakeComputePipeline(device, fluidSeamPL_, mFluidSeam, "particleTick", "seamParticleTick"); });
+  pool.Add([&] { fluidSettleJudge_ = MakeComputePipeline(device, fluidSeamPL_, mFluidSeam, "settleJudge", "seamSettleJudge"); });
+  pool.Add([&] { fluidSettleScan_ = MakeComputePipeline(device, fluidSeamPL_, mFluidSeam, "settleScan", "seamSettleScan"); });
+  pool.Add([&] { fluidSettleBin_ = MakeComputePipeline(device, fluidSeamPL_, mFluidSeam, "settleBin", "seamSettleBin"); });
+  pool.Add([&] { fluidSettleCheck_ = MakeComputePipeline(device, fluidSeamPL_, mFluidSeam, "settleCheck", "seamSettleCheck"); });
+  pool.Add([&] { fluidSettleCommit_ = MakeComputePipeline(device, fluidSeamPL_, mFluidSeam, "settleCommit", "seamSettleCommit"); });
+  pool.Add([&] { fluidSettleKill_ = MakeComputePipeline(device, fluidSeamPL_, mFluidSeam, "settleKill", "seamSettleKill"); });
+  pool.Add([&] { fluidConsumeApply_ = MakeComputePipeline(device, fluidSeamPL_, mFluidSeam, "consumeApply", "seamConsumeApply"); });
+  pool.Add([&] { fluidStainApply_ = MakeComputePipeline(device, fluidSeamPL_, mFluidSeam, "stainApply", "seamStainApply"); });
+  pool.Add([&] { fluidMirrorFold_ = MakeComputePipeline(device, fluidSeamPL_, mFluidSeam, "mirrorFold", "seamMirrorFold"); });
+  pool.Add([&] { fluidCellClear_ = MakeComputePipeline(device, fluidSeamPL_, mFluidSeam, "cellClear", "seamCellClear"); });
 
   // Water bodies (docs/PLAN_water_master.md M2). On simPL_ like the CA:
   // everything the shave needs to write a voxel — voxels, dirtyOut,
   // pageTable, pageFaults, TickParams — is already in that layout, and the
   // ledger buffer is one added binding rather than a new group.
-  waterQuiet_ = MakeComputePipeline(device, simPL_, mWaterBody, "wbQuiet", "waterQuiet");
-  waterLedger_ = MakeComputePipeline(device, simPL_, mWaterBody, "wbLedger", "waterLedger");
-  waterReduce_ = MakeComputePipeline(device, simPL_, mWaterBody, "wbReduce", "waterReduce");
-  waterShave_ = MakeComputePipeline(device, simPL_, mWaterBody, "wbShave", "waterShave");
-  waterDrain_ = MakeComputePipeline(device, simPL_, mWaterBody, "wbDrain", "waterDrain");
-  waterHole_ = MakeComputePipeline(device, simPL_, mWaterBody, "wbHole", "waterHole");
+  pool.Add([&] { waterQuiet_ = MakeComputePipeline(device, simPL_, mWaterBody, "wbQuiet", "waterQuiet"); });
+  pool.Add([&] { waterLedger_ = MakeComputePipeline(device, simPL_, mWaterBody, "wbLedger", "waterLedger"); });
+  pool.Add([&] { waterReduce_ = MakeComputePipeline(device, simPL_, mWaterBody, "wbReduce", "waterReduce"); });
+  pool.Add([&] { waterShave_ = MakeComputePipeline(device, simPL_, mWaterBody, "wbShave", "waterShave"); });
+  pool.Add([&] { waterDrain_ = MakeComputePipeline(device, simPL_, mWaterBody, "wbDrain", "waterDrain"); });
+  pool.Add([&] { waterHole_ = MakeComputePipeline(device, simPL_, mWaterBody, "wbHole", "waterHole"); });
   // M5: the scheduled container sweep (components 2 case 2 + 10).
-  waterSweep_ = MakeComputePipeline(device, simPL_, mWaterBody, "wbSweep", "waterSweep");
-  waterSplit_ = MakeComputePipeline(device, simPL_, mWaterBody, "wbSplit", "waterSplit");
+  pool.Add([&] { waterSweep_ = MakeComputePipeline(device, simPL_, mWaterBody, "wbSweep", "waterSweep"); });
+  pool.Add([&] { waterSplit_ = MakeComputePipeline(device, simPL_, mWaterBody, "wbSplit", "waterSplit"); });
+  pool.Run(buildThreads);
+
+  // Decided HERE, in the function that also compiles raymarch.wgsl, and from the
+  // same two inputs its SHADOW_CACHE const is built from. That co-location is
+  // the point: the pass and the shader must agree, and F5 recompiles both
+  // through this function, so a tuning flip cannot leave one side switched.
+  // AFTER the join, because it reads two pipelines the pool produced.
+  shadowCacheOn_ = FragmentStoresAvailable() &&
+                   CurrentTuning().render.shadowCache != 0 &&
+                   (bool)shadowPrepare_ && (bool)shadowResolve_;
 
   // Second save: the rest of the compute block above is another 30-60 s of
   // driver work on a cold cache (raymarch and the fluid family dominate).
   rhi::vkr::SavePipelineCache(device_);
+
+  // ---- deferred: the far cascades --------------------------------------
+  //
+  // `far` is 746 s of driver compile and `fardown` 98 s — between them, the
+  // whole reason a cold boot was 17 minutes. worldgen.wgsl's far block and
+  // DESIGN.md §9 both say the cascades are RENDER-ONLY DERIVED DATA with no
+  // determinism attached, so the world can tick, hash and save without them;
+  // all that is missing is the horizon. So they are built off the critical
+  // path and this function returns while they are still compiling.
+  //
+  // Everything the deferred thread touches is captured BY VALUE (the device,
+  // the layout, the module — all seam handles, all shared_ptr) so it names no
+  // Simulation member and cannot race this object. The result is published on
+  // the main thread by PollFarPipelines / WaitForFarPipelines.
+  //
+  // Serial under `--shader-stats` for the same reason the pool is: that mode
+  // exists to interrogate every pipeline the driver compiled this run.
+  {
+    const rhi::Device dev = device;
+    const rhi::PipelineLayout layout = farPL_;
+    const rhi::ShaderModule module = mWorldgen;
+    auto build = [dev, layout, module]() {
+      FarPipelines r;
+      // `fardown` on its own thread beside `far`: sequentially they are 844 s,
+      // in parallel they are max(746, 98) = 746 s, which is the wall clock
+      // this whole package is bounded by.
+      std::thread down([&] {
+        r.down = MakeComputePipeline(dev, layout, module, "fardown", "farDown");
+      });
+      r.fill = MakeComputePipeline(dev, layout, module, "far", "farFill");
+      down.join();
+      MarkFarReady();
+      // THE HORIZON'S ARRIVAL TIME, printed unconditionally. It is the number
+      // this whole package is measured by and there is no other record of it
+      // in a windowed run (build/last_run.json is a headless-mode artifact),
+      // so it must not be behind SANDVOX_SHADER_TIMING.
+      std::printf("far-cascade pipelines ready %.1f s after the first pipeline "
+                  "create (the game has been running since %.1f s)\n",
+                  FarReadyMs() / 1000.0, InteractiveReadyMs() / 1000.0);
+      std::fflush(stdout);
+      // The horizon's ISA is the single most expensive thing on this disk.
+      // Saved from this thread the moment it exists, for the same reason the
+      // two saves above exist: the next launch must not pay it again because
+      // this one was killed.
+      rhi::vkr::SavePipelineCache(dev);
+      return r;
+    };
+    if (buildThreads <= 1) {
+      FarPipelines r = build();
+      farFill_ = std::move(r.fill);
+      farDown_ = std::move(r.down);
+      farPublished_ = true;
+      farReady_.store(true, std::memory_order_release);
+    } else {
+      farFuture_ = std::async(std::launch::async, build);
+      farPublished_ = false;
+      farReady_.store(false, std::memory_order_release);
+    }
+  }
+  MarkInteractiveReady();
 
   // A backend that fails pipeline creation returns an INVALID handle (Vulkan:
   // Tint or vkCreateComputePipelines refused). Dawn reports errors through its
   // async error scope and always returns a valid handle, so this check is free
   // there — but on Vulkan a null pipeline would make the recorder silently
   // skip the row, which is a wrong SIM, not a crash. Fail the build instead.
-  if (!worldgen_ || !worldgenList_ || !pageFill_ || !farFill_ || !farDown_ || !mutate_ ||
+  //
+  // farFill_/farDown_ are NOT in this list: they may still be compiling, and a
+  // skipped far row is a missing horizon rather than a wrong sim. Their
+  // verdict is checked where they are published (PublishFarPipelines).
+  if (!worldgen_ || !worldgenList_ || !pageFill_ || !mutate_ ||
       !mutateCells_ || !windWake_ || !compact_ || !compactNext_ || !step_ || !occupancy_ ||
       !occupancyDirty_ || !pick_ || !explodeMark_ || !explodeApply_ || !pArgs1_ ||
       !pSpawn_ || !pIntegrate_ || !pArgs2_ || !pResolve_ || !fluidSpawn_ ||
@@ -1097,6 +1270,47 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   debugCurModule_ = mDebugCur;
   targetFormat_ = rhi::TextureFormat::Undefined;  // force render pipeline rebuild
   return true;
+}
+
+// ---- the deferred far set's three main-thread entry points ----------------
+//
+// Only this thread ever writes farFill_/farDown_ (the compile thread writes
+// them into the future's result and nothing else), so PassPipeline's reads
+// need no synchronization: a row either sees the pre-publish INVALID handle
+// and is skipped, or sees the published one. `farReady_` is the release/
+// acquire edge that makes the second case's handle fully constructed.
+
+void Simulation::PublishFarPipelines() {
+  FarPipelines r = farFuture_.get();  // blocks if the thread is still running
+  farFill_ = std::move(r.fill);
+  farDown_ = std::move(r.down);
+  farPublished_ = true;
+  farReady_.store(true, std::memory_order_release);
+  // Not fatal: a failed far compile costs the horizon, not the sim. Say so
+  // once — silence here would read as "the cascades are just empty".
+  if (!farFill_ || !farDown_)
+    std::fprintf(stderr,
+                 "far-cascade pipelines failed to compile; the horizon will "
+                 "stay empty (worldgen.wgsl far/fardown)\n");
+}
+
+bool Simulation::PollFarPipelines() {
+  if (farPublished_ || !farFuture_.valid()) return false;
+  if (farFuture_.wait_for(std::chrono::seconds(0)) != std::future_status::ready)
+    return false;
+  PublishFarPipelines();
+  return true;
+}
+
+void Simulation::WaitForFarPipelines() {
+  if (farPublished_ || !farFuture_.valid()) return;
+  // Announced, because from the outside this is a headless run sitting silent
+  // for up to twelve minutes with no output.
+  if (farFuture_.wait_for(std::chrono::seconds(0)) != std::future_status::ready)
+    std::printf("waiting for the deferred far-cascade pipelines "
+                "(worldgen.wgsl far/fardown)...\n");
+  std::fflush(stdout);
+  PublishFarPipelines();
 }
 
 bool Simulation::ReloadShaders(const rhi::Device& device) {
@@ -1412,6 +1626,20 @@ void Simulation::EncodeGenList(const rhi::CommandEncoder& enc, uint32_t count) {
 }
 
 void Simulation::EncodeFarFill(const rhi::CommandEncoder& enc, uint32_t count) {
+  // THE ONE PLACE THE DEFERRED FAR COMPILE IS WAITED ON. A caller with fills
+  // to dispatch is a caller that is about to LOOK at the cascades — a --shot
+  // frame, a far gate, a load's FullRefill drain — so unless it opted into
+  // deferral it blocks here and its output cannot depend on when the driver
+  // finished. `count == 0` is the settled case (SubmitTick passes it every
+  // tick) and records nothing either way, so it must not wait: making it wait
+  // charged every gate in the suite `far`'s 746 s for no dispatch at all.
+  if (count == 0) return;
+  EnsureFarPipelines();
+  // The opted-in caller (the game) whose compile has not landed yet. The
+  // recorder would skip the row anyway, but its drain loop has already popped
+  // these entries out of FarField's queue, so returning early keeps that a
+  // cheap no-op. Simulation::PollFarPipelines -> FullRefill re-queues them.
+  if (!farFill_) return;
   RecordCtx cx{};
   cx.farCount = count;
   RecordTable(enc, pass::Table::FarFill, &cx);
@@ -1625,6 +1853,14 @@ void Simulation::EncodeTick(const rhi::CommandEncoder& enc, uint32_t opsCount,
                             uint32_t waterChunkCount,
                             uint32_t waterDrainBodies,
                             uint32_t waterSweepSlot) {
+  // NOTE ON `farDown`: this table's downsample row is a far pipeline, and it
+  // is simply SKIPPED while the deferred compile is outstanding (the recorder
+  // drops a row whose pipeline is null, touching no buffer state). That is
+  // sound and it is not a wait, because the row only refreshes cascade cells
+  // under edited chunks — render-only derived data — and every caller that
+  // will actually READ a cascade fills it first through EncodeFarFill, which
+  // is where the blocking lives. Waiting here instead would have made every
+  // gate in the suite pay `far`'s 746 s for a row most of them never use.
   RecordCtx cx{};
   cx.opsCount = opsCount;
   cx.cellCount = cellCount;
@@ -1773,6 +2009,13 @@ void Simulation::EnsureOverlayDepth(uint32_t width, uint32_t height) {
   overlayDepthView_ = overlayDepthTex_.CreateView();
 }
 
+// STILL SERIAL, deliberately (docs/PLAN_shader_compile.md package A audited
+// it). The compute build fans out because its 50 calls are independent
+// one-liners; this function builds nine pipelines by MUTATING one shared
+// RenderPipelineDesc between them (`d.vertexEntry = "vsSprite"` and so on), so
+// threading it means first splitting every desc, which is a bigger edit than
+// the win: the whole block is 45-52 s against `far`'s 746, and it is not on
+// the boot path at all — it runs on the first draw.
 void Simulation::EnsureRenderPipelines(rhi::TextureFormat format) {
   if (format == targetFormat_) return;
   targetFormat_ = format;

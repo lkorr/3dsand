@@ -497,7 +497,12 @@ void WriteJson(const std::string& path, const std::vector<Result>& results) {
       << ", \"detail\": \"" << detail << "\"}"
       << (i + 1 < results.size() ? "," : "") << "\n";
   }
-  f << "  }\n}\n";
+  f << "  },\n";
+  // What the driver charged for each pipeline this run, always
+  // (docs/PLAN_shader_compile.md package A item 4). A cold worldgen compile is
+  // minutes and the entry point that took them is not otherwise recorded
+  // anywhere a later reader can find.
+  f << PipelineTimingJson("  ") << "\n}\n";
   std::printf("wrote %s\n", path.c_str());
 }
 

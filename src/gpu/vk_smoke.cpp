@@ -60,6 +60,7 @@
 #include <vector>
 
 #include "gpu/context.h"
+#include "gpu/resources.h"  // PipelineTimingJson — the compile-ms section
 #include "gpu/rhi_vk.h"
 #include "gpu/rhi_vulkan.h"
 #include "sim/materials.h"
@@ -618,7 +619,10 @@ void WriteSmokeJson(const char* path, const char* scenario, const RunResult& run
   if (run.shifts > 0)
     f << "  \"shifts\": " << run.shifts << ",\n"
       << "  \"storeCount\": " << run.storeCount << ",\n";
-  f << "  \"pinnedCount\": " << pinnedCount << "\n";
+  f << "  \"pinnedCount\": " << pinnedCount << ",\n";
+  // Per-pipeline driver compile ms + the two readiness milestones
+  // (docs/PLAN_shader_compile.md package A item 4).
+  f << PipelineTimingJson("  ") << "\n";
   f << "}\n";
   std::printf("wrote %s\n", path);
 }

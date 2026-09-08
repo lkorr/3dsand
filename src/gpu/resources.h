@@ -73,3 +73,40 @@ rhi::ComputePipeline MakeComputePipeline(const rhi::Device& device,
                                          const rhi::PipelineLayout& layout,
                                          const rhi::ShaderModule& module,
                                          const char* entry, const char* label);
+
+// ---- pipeline compile times (docs/PLAN_shader_compile.md) ------------------
+//
+// What the driver charged for each entry point, ALWAYS recorded — not only
+// under SANDVOX_SHADER_TIMING, which is the flag that prints them. A cold
+// worldgen compile is ~17 min and the whole reason the plan exists, so "which
+// entry point cost what on this run" belongs in build/last_run.json next to
+// the gate verdicts rather than in a terminal somebody has to have thought to
+// enable (CLAUDE.md verification rule 6: attribution in the reporter, not one
+// A/B run per hypothesis).
+//
+// THREAD-SAFE: MakeComputePipeline runs on the build pool.
+struct PipelineCompileRecord {
+  std::string label;
+  std::string entry;
+  double ms = 0;
+};
+void RecordPipelineCompile(const char* label, const char* entry, double ms);
+std::vector<PipelineCompileRecord> PipelineCompileRecords();
+
+// Wall-clock milliseconds from process start (the first call to
+// MarkInteractiveReady/MarkFarReady's clock, which is a static set on first
+// use in resources.cpp) to the two milestones the plan is about:
+//   interactiveReadyMs — BuildPipelines returned, i.e. the game can run.
+//   farReadyMs         — the deferred `far`/`fardown` compiles landed, i.e.
+//                        the horizon exists. -1 while still pending.
+// Set by Simulation::BuildPipelines and its deferred completion.
+void MarkInteractiveReady();
+void MarkFarReady();
+double InteractiveReadyMs();
+double FarReadyMs();
+
+// The three of them as a JSON fragment: `"pipelineCompileMs": {...},
+// "interactiveReadyMs": N, "farReadyMs": N`, with no leading or trailing
+// comma. Every writer of build/last_run.json splices this in (selftest,
+// --verify, --vk-smoke) so the record does not depend on which mode ran.
+std::string PipelineTimingJson(const char* indent);

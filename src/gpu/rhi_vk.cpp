@@ -735,6 +735,11 @@ void SetCaptureStats(const Device& d, bool on) {
   if (vk::Backend* be = NativeBackend(d)) be->SetCaptureStats(on);
 }
 
+bool CaptureStats(const Device& d) {
+  vk::Backend* be = NativeBackend(d);
+  return be && be->CaptureStats();
+}
+
 void SavePipelineCache(const Device& d) {
   if (vk::Backend* be = NativeBackend(d)) be->SavePipelineCache();
 }
