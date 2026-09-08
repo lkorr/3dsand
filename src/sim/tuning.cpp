@@ -2117,6 +2117,7 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadF(*g, "taaClamp", r.taaClamp, out, at);
     ReadF(*g, "taaJitter", r.taaJitter, out, at);
     ReadI(*g, "taaSharpLod", r.taaSharpLod, out, at);
+    ReadF(*g, "taaSharpness", r.taaSharpness, out, at);
     ReadI(*g, "presentMode", r.presentMode, out, at);
     ReadF(*g, "fpsCap", r.fpsCap, out, at);
     ReadF(*g, "shadowMaxDist", r.shadowMaxDist, out, at);
@@ -2267,6 +2268,10 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     if (r.taaClamp < 0.0f) { r.taaClamp = 0.0f; }
     if (r.taaJitter < 0.0f) { r.taaJitter = 0.0f; }
     if (r.taaJitter > 2.0f) { r.taaJitter = 2.0f; }
+    // 0 would make every tap weigh the same, i.e. a box filter over the
+    // whole 3x3 and no reconstruction at all.
+    if (r.taaSharpness < 0.05f) { r.taaSharpness = 0.05f; }
+    if (r.taaSharpness > 64.0f) { r.taaSharpness = 64.0f; }
     if (r.presentMode < 0 || r.presentMode > 2) { r.presentMode = 1; }
     if (r.fpsCap < 0.0f) { r.fpsCap = 0.0f; }
     // 0 is meaningful here (all shadows go through the cascade), so only

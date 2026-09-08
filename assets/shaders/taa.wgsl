@@ -43,7 +43,11 @@ struct TaaParams {
   // the jitter, because main.cpp folds the jitter into the basis it uploads.
   camRight   : vec3f, tanHalfFov : f32,
   camUp      : vec3f, aspect     : f32,
-  camFwd     : vec3f, pad3       : f32,
+  // sharpness: the reconstruction filter's Gaussian exponent, in NATIVE pixels
+  // (render.taaSharpness). Its own uniform lane rather than a shader constant
+  // precisely so it can be swept with `--gate taa` and a tuning.json edit and
+  // NO rebuild — see the open question in the header.
+  camFwd     : vec3f, sharpness  : f32,
   // …and the PREVIOUS frame's, likewise jittered. Reprojection is a projection
   // through this basis, so it must be the basis that produced the history.
   pRight     : vec3f, maxHist    : f32,
@@ -196,8 +200,33 @@ fn fs(in : VSOut) -> @location(0) vec4f {
       // At renderScale 1 `scale` is 1 and this is exactly the old expression,
       // which is why the alignment arm is unaffected by the change.
       let d = ((vec2f(p) + 0.5) - src) / scale;
-      // exp(-2.29 d^2): ~0.10 at one native pixel away, ~0.01 at two.
-      let w = exp(-2.29 * dot(d, d));
+      // exp(-k d^2), k = render.taaSharpness. At the shipped 2.29 a sample one
+      // native pixel away still counts for 10%, which is a filter about half a
+      // native pixel wide.
+      //
+      // ---- THE OPEN QUESTION IN THIS PASS, and it lives on this line -------
+      // MEASURED (`--gate taa`, 1080p from 960x540): the accumulated error
+      // against a full-resolution render RISES with frame count — 1.19 at 16
+      // frames, 1.42 at 48 — and lands level with a plain NEAREST blit (1.20
+      // whole-frame, 3.69 vs 3.73 on the top 20% of pixels by gradient). An
+      // accumulator cannot get worse with more samples unless it is converging
+      // to something other than the reference, and what it converges to here is
+      // the weighted mean of every sample within this filter: a BLUR of about
+      // half a native pixel. Against a point-sampled reference a blur and a
+      // half-pixel shift score about the same, which is why the metric cannot
+      // separate them and why the gate no longer asserts on it.
+      //
+      // (Ruled out on the way: a stale reference. The reference render was
+      // taken to 64 frames so the irradiance EMA is at its fixed point before
+      // anything is measured, and the numbers did not move at all — 1.18/1.42
+      // before, 1.19/1.42 after.)
+      //
+      // So k is the dial, and it is a UNIFORM rather than a TUNE_ constant so
+      // that sweeping it costs a tuning.json edit and one `--gate taa`, with no
+      // rebuild and no shader recompile. Larger = only the frames whose
+      // jittered sample landed nearly on this pixel are allowed to speak for
+      // it, which is sharper but starves pixels the sequence keeps missing.
+      let w = exp(-P.sharpness * dot(d, d));
       cur = cur + c * w;
       wsum = wsum + w;
       wBest = max(wBest, w);

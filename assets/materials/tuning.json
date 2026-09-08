@@ -728,6 +728,7 @@
     "taaClamp": 0.25,
     "taaJitter": 1,
     "taaSharpLod": 1,
+    "taaSharpness": 2.29,
     "presentMode": 1,
     "fpsCap": 0,
     "shadowMaxDist": 999,

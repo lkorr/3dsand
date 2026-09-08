@@ -2072,7 +2072,7 @@ namespace {
 struct TaaParamsGpu {
   float camRight[3]; float tanHalfFov;
   float camUp[3];    float aspect;
-  float camFwd[3];   float pad3;
+  float camFwd[3];   float sharpness;
   float pRight[3];   float maxHist;
   float pUp[3];      float clampK;
   float pFwd[3];     float pad0;
@@ -2189,6 +2189,10 @@ void Simulation::WriteTaaParams(const rhi::Queue& queue, const TaaCamera& cam,
   }
   p.tanHalfFov = cam.tanHalfFov;
   p.aspect = cam.aspect;
+  // Read here rather than passed in: it is a pure look knob with no call site
+  // that would ever want a different value, and routing it through the two
+  // callers would only be two more places to forget it.
+  p.sharpness = CurrentTuning().render.taaSharpness;
   p.maxHist = maxHist;
   p.clampK = clampK;
   p.jitter[0] = cam.jitterX;

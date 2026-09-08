@@ -5767,14 +5767,38 @@ copy are derived data in the §9 sense — never read by the sim, never hashed,
 never saved, and the jitter never reaches the camera the game logic uses. The
 world hash is identical with `render.taa` at 0 and at 1.
 
-**Gated by `--gate taa`**, which asserts two things and pins no constants: that
-the resolve at 1:1 with no jitter is closer to a plain render than a ONE-PIXEL
-SHIFT of that render is (the alignment claim — every plausible mapping bug fails
-it by a mile), and that sixteen jittered half-resolution frames resolve closer to
-the full-resolution render than a NEAREST upscale of the same half-resolution
-frame does (the product claim). Both are relative to another arm of the same
-run, so neither needs rebaselining when the scene or the harness resolution
-moves.
+**Gated by `--gate taa`**, which ASSERTS one thing and REPORTS the rest. The
+assertion is alignment: the resolve at 1:1 with no jitter must be closer to a
+plain render than a ONE-PIXEL SHIFT of that render is (0.32 against 0.89 as
+shipped). It is calibrated against the frame itself rather than against a pinned
+number, so it means the same thing on any scene or resolution, and every
+plausible bug in the pass — a dropped half-pixel, an inverted Y, a jitter sign
+measured the wrong way round — fails it by a mile.
+
+**The reconstruction claim is NOT established, and the gate reports it instead
+of asserting it.** Measured at 1080p from 960x540, over 48 accumulated frames:
+whole-frame mean absolute error against a full-resolution render is 1.42 for the
+resolve against 1.20 for a NEAREST blit, and on the top 20% of pixels by
+gradient 3.73 against 3.69 — level. Worse, the error RISES with frame count
+(1.19 at 16 frames, 1.42 at 48), and an accumulator cannot get worse with more
+samples unless it is converging to something other than the reference. What it
+converges to is the weighted mean of every sample inside the reconstruction
+filter: a blur about half a native pixel wide. Against a point-sampled reference
+a blur and a half-pixel shift score about the same, so MAE cannot separate them
+— which is the deeper reason this was never going to be the deciding
+measurement.
+
+Ruled out on the way, and worth not re-testing: a stale reference. The gate now
+renders its reference to 64 frames so the irradiance EMA sits at its fixed point
+before anything is measured, and the numbers did not move at all.
+
+`render.taaSharpness` is the dial that would settle it, and it is a UNIFORM lane
+rather than a shader constant precisely so that sweeping it costs a
+`tuning.json` edit and one `--gate taa` — no rebuild, no shader recompile. The
+assertion goes back in when either that sweep finds a width where the 48-frame
+error falls BELOW the 16-frame one (which is what converging looks like), or
+somebody replaces the metric with one that can tell a blur from a blocky shift.
+**`render.taa` therefore ships at 0.**
 
 **What is NOT here.** A separate SVGF-style denoiser for the lighting terms,
 which was the other half of the package this came from. That port assumes one

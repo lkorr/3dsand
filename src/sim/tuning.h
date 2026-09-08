@@ -2878,6 +2878,19 @@ struct Tuning {
     // costs time). 0 keeps the old behaviour and is the A/B arm; `--gate taa`
     // measures both arms in one run and prints both errors.
     int taaSharpLod = 1;
+    // taaSharpness: the reconstruction filter's Gaussian exponent, in NATIVE
+    // pixels — exp(-taaSharpness * d^2). At 2.29 a sample one native pixel away
+    // still counts for 10%, i.e. a filter about half a native pixel wide.
+    //
+    // THIS IS THE PASS'S OPEN QUESTION, and it is a knob rather than a shader
+    // constant so the next person can answer it with a tuning.json edit and one
+    // `--gate taa`, no rebuild. Measured at 2.29 the accumulated error RISES
+    // with frame count (1.19 at 16 frames, 1.42 at 48) and finishes level with
+    // a plain NEAREST blit: the accumulator is converging to a half-pixel blur
+    // rather than to the reference. Larger values let only the frames whose
+    // jittered sample landed nearly on the pixel speak for it — sharper, at the
+    // cost of starving pixels the jitter sequence keeps missing.
+    float taaSharpness = 2.29f;
     // presentMode: 0 fifo (vsync, quantises a 22 ms frame to 33), 1 mailbox
     // (newest frame at each vblank, no tearing, no quantisation), 2 immediate
     // (tears). Applied when it CHANGES (a swapchain recreate). Use fifo or an
