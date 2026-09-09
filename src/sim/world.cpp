@@ -575,10 +575,12 @@ void World::KickReadback() {
             const uint32_t* occW = (const uint32_t*)(b + kOccOff);
             const uint32_t* supW = (const uint32_t*)(b + kSupportOff);
             uint32_t active = 0;
+            uint32_t reasonOr = 0;
             uint64_t total = 0;
             for (uint32_t i = 0; i < kNumSlots; i++) {
               snap_.dirtyFlags[i] = dirtyW[i] != 0 ? 1 : 0;
               active += snap_.dirtyFlags[i];
+              reasonOr |= dirtyW[i];
               // GPU word packs [31] anyStain | [30..16] blockers | [15..0]
               // nonAir (packOccStain, common.wgsl). Existing CPU consumers
               // (streaming evict, voxelTotal) want the non-air COUNT, so that
@@ -596,6 +598,7 @@ void World::KickReadback() {
               snap_.supportFlags[i] = supW[i] != 0 ? 1 : 0;
             }
             snap_.activeChunks = active;
+            snap_.dirtyReasonOr = reasonOr;
             snap_.voxelTotal = total;
             // ---- SANDVOX_DIRTY_REASONS=<n>: WHY are these chunks awake? ----
             //

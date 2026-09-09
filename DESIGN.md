@@ -879,18 +879,75 @@ for a gas.
   claim per parcel per tick, deterministic winner, losers retry. That is the ONE
   place a gas parcel meets the page system, and it is why gas that leaves is not
   gas that is lost: it rejoins the reaction system on landing.
-- **Rendering** is `gasOuter`, a coarse density box: one byte per cell,
-  four to a `u32`, 128³ cells over exactly two window edges, centred on the
-  window, 2 MiB, at `renderBGL_` binding 21. Cleared and re-splatted every tick
-  (`atomicAdd` of a byte lane, so the result is scheduling-independent), sampled
-  by the far march after the near hit exits. Render-only derived data: the sim
-  never reads it, the world hash never covers it, it is never stale.
-  Saturating at 192/cell rather than carrying into the neighbouring byte.
+- **Rendering** is `gasOuter`, a coarse density box: one 16-bit COUNT per cell,
+  two to a `u32`, 128³ cells over exactly two window edges, centred on the
+  window, 4 MiB, at `renderBGL_` binding 21 / GAS group 6 / `simBGL_` 34.
+  Cleared and re-splatted every tick (`atomicAdd` of a half-word lane, so the
+  result is scheduling-independent), sampled once per pixel by `gasOuterFill`.
+  Render-only derived data: the sim never reads it, the world hash never covers
+  it, it is never stale. Saturating at 60,000/cell rather than carrying into the
+  neighbouring cell's half of the word.
   **Deviation from the plan:** the cell is 0.8 m, not 0.4 m. The plan asked for
   0.4 m cells AND a 2x-window span AND 2 MiB; 128³ bytes IS 2 MiB and 128 ×
-  0.4 m is half the stated span, so the three never agreed. Span and memory are
-  kept. **Second deviation:** the splat is folded into `gasResolve` rather than
+  0.4 m is half the stated span, so the three never agreed. Span is kept.
+  **Second deviation:** the parcel splat is folded into `gasResolve` rather than
   given its own dispatch, because resolve already walks every live parcel once.
+
+#### Stage 1b: the two representations CROSSFADE, they do not abut
+
+Stage 1 left an explicit seam. Inside the window gas is a 0.1 m voxel; outside
+it is a parcel drawn from 0.8 m cells; the two met at the window face with no
+overlap, so there was a visible line 25.6 m from the window centre where crisp
+voxel smoke became 64x-larger soft cells. The fix is entirely on the render
+side — **the sim is untouched and the determinism hash does not move (9bfed213
+before and after)**, because sim behaviour that depended on camera distance
+would be a rule-1 violation and in-window gas must stay a voxel to keep the
+reaction system.
+
+- **The CA splats too.** `sim_step.wgsl`'s `gasOuterSplat` adds every in-window
+  gas voxel to the same box, ONCE per tick (substep 0, after the stamp gate,
+  before the move), gated on `sim.gasMode` so a world with the gas rows
+  unrecorded cannot accumulate into an uncleared box. The box therefore holds
+  BOTH populations, which is what makes a crossfade possible at all: a voxel
+  can only fade out into a coarse cell that has something in it. `gasOuter`
+  joins the CA at `simBGL_` binding 34 and the `ca` row's R/W set as
+  `A(GasOuter)`.
+- **The byte became a u16** for this: 192/512 = 37.5% full was a ceiling nobody
+  saw while the box only held distant parcels, and a crossfade INTO it would
+  have thinned every dense plume exactly at the seam.
+- **The weight is the max-norm distance from the WINDOW CENTRE**, smoothstepped
+  from `render.gasBlendStart` × 25.6 m to 25.6 m. The centre and not the camera:
+  the max-norm distance is exactly the half-extent at every point of all six
+  faces, so the weight is 1 at every face regardless of where the camera stands.
+  A camera-relative ramp would have to be re-tuned per view and would still
+  leave a seam on the faces it was not tuned for.
+- **Voxels fade out** by `1 - b` in `trace()`'s media branch (gases only; a
+  liquid has no coarse representation), and **only into a non-empty coarse
+  cell** — the CA visits awake chunks only, so a settled plume in a sleeping
+  chunk is in no coarse cell and keeps its full opacity instead of fading into
+  nothing. That one extra fetch is what makes the sleeping-chunk hole a
+  non-event rather than a disappearing plume.
+- **The coarse fill fades in** over the same shell: `gasOuterFill` grew a second
+  segment, from the inner box out to the window face, weighted by the same
+  ramp and with its own step budget so widening the band cannot thin the
+  distant plume. It now runs for rays that HIT inside the window too, bounded by
+  the near hit rather than by "did the ray leave".
+- **RenderParams bit 3 (`RFLAG_GAS`)** is what keeps all of it free in a world
+  with no smoke. `Simulation::EncodeTick` publishes it through
+  `SetGasRenderActive` (renderspec.h) from a latch armed by live parcels OR the
+  gas dirty-reason bits in the snapshot, held one second past the last sighting.
+  It is a correctness gate as well as a budget: `gasOuter` is only cleared on
+  ticks the sim records the gas rows, so with the flag off the box is stale and
+  must not be sampled. NOT a `SPEC_` constant — it flips whenever a fire starts
+  or goes out.
+- **Measured cost:** raymarch fragment register count 168 → 168, no spills,
+  binary +0.18%; the CA's `step` kernel 56 → 56 registers, binary +0.11%.
+- **Known and not repaired:** the coarse contribution still does not feed
+  `gasHalfT` or `fireGlow`. Stage 1's argument for that was geometric (every
+  coarse voxel-length was beyond the window exit); stage 1b's band is inside the
+  window, so a raster body can stand behind coarse gas the depth raster does not
+  know about. Bounded by the crossfade weight — zero at the inner edge, and only
+  fully coarse at the face, 25 m away.
 - **Own buffers, not a share of `kParticleCap`.** `gasParticles[2]` at
   `kGasParticleCap` = 262,144, plus `gasCounts` / `gasClaim` / `gasSpawn` (the
   CA's outbox, whose 8-word header is this tick's counters) / `gasSpawnOps` (the

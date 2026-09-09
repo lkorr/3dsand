@@ -127,6 +127,41 @@ const_assert (GAS_OUTER_N << GAS_OUTER_SHIFT) == 2u * WORLD_N;
 // undersampling is correct here: this is smoke tens of metres away and soft is
 // what it should look like.
 const GAS_OUTER_STEPS : u32 = 16u;
+// Samples across the IN-BAND part of the ray (stage 1b), i.e. the shell
+// between the inner box and the window face where the two representations
+// overlap. Its own budget rather than a share of the one above, so widening
+// the crossfade cannot thin the distant plume: that segment is at most one
+// window half-extent per axis (~22 m on the diagonal at gasBlendStart 0.5) and
+// 12 samples is ~1.8 m apart at worst, about two cells.
+const GAS_BAND_STEPS  : u32 = 12u;
+// R.flags bit 3: GAS MAY BE PRESENT this frame. Set by the CPU from the sim's
+// own gas latch (Simulation::GasRenderActive) and OFF in a world with no
+// smoke in it, which is what keeps the whole of the crossfade — the band
+// sampling, the per-cell fade in trace(), the coarse fold in fs() — at exactly
+// zero cost in the common case. Every one of those three tests it.
+const RFLAG_GAS : u32 = 8u;
+
+// ---- THE CROSSFADE WEIGHT (stage 1b) ---------------------------------------
+// 0 where gas is drawn as VOXELS and 1 where it is drawn from the coarse box,
+// smoothstepped between over the outer shell of the residency window.
+//
+// MEASURED FROM THE WINDOW CENTRE IN THE MAX NORM, not from the camera, and
+// that is the whole of why this works: the max-norm distance to the centre is
+// exactly the window half-extent at every point of all six faces, so the
+// weight is exactly 1 at every face no matter where the camera stands or what
+// it looks at. A camera-relative ramp would have to be re-tuned per view and
+// would still leave a seam on the faces it was not tuned for.
+//
+// render.gasBlendStart is the inner edge as a fraction of the half-extent: 0.5
+// fades from 12.8 m to 25.6 m. At 1.0 the band collapses to 2.6 cm (the 0.99
+// below is what keeps smoothstep's two edges apart) and the stage-1 hard edge
+// is back, which is how to A/B this with F5 and no rebuild.
+fn gasBlendW(p : vec3f) -> f32 {
+  let halfExt = f32(WORLD_N) * 0.5;
+  let ctr = vec3f(R.origin * i32(CHUNK)) + vec3f(halfExt);
+  let d = max(max(abs(p.x - ctr.x), abs(p.y - ctr.y)), abs(p.z - ctr.z));
+  return smoothstep(min(TUNE_GAS_BLEND_START, 0.99) * halfExt, halfExt, d);
+}
 const RS_PX : u32 = 0u;          // sampled pixels (denominator)
 const RS_PRIMARY : u32 = 1u;     // trace() steps from fs's camera ray
 const RS_MEDIA : u32 = 2u;       // cells that accumulated media tau in trace()
@@ -211,6 +246,9 @@ const SHADOW_CACHE : bool = SHADOW_CACHE_AVAILABLE && TUNE_SHADOW_CACHE != 0;
 //   SPEC_FLUID       <-> R.fluidCount > 0u
 //   SPEC_DEBUG_VIZ   <-> (R.flags & 2u) != 0u   (dev panel: active-voxel edges)
 //   SPEC_SHORT_RANGE <-> (R.flags & 4u) != 0u   (dev panel: 100 m ray ceiling)
+// Bit 3 (RFLAG_GAS) is NOT specialized: it changes every frame a fire starts
+// or goes out, and a pipeline variant that flips that often would spend more
+// on compiles than the branch costs.
 //
 // WHY A SECOND PIPELINE RATHER THAN THE UNIFORM BRANCH THAT IS ALREADY THERE.
 // The same reason the `shadow0` arm exists beside `noshadow` (see the block
@@ -2807,11 +2845,50 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool) -> Hit {
         let trans = exp(-out.mediaTau * VOXEL_METERS * MEDIA_ABSORB);
         out.fireGlow += seg * cellFire * trans;
       }
-      let dTau = seg * cellOp;
+      // ---- THE VOXEL HALF OF THE CROSSFADE (stage 1b) --------------------
+      // A gas voxel's optical depth is faded OUT across the outer shell of the
+      // window, where gasOuterFill is fading the same gas IN from the coarse
+      // box. The two ramps are the same smoothstep, so the total is continuous
+      // and there is no longer a face where 0.1 m voxels become 0.8 m cells in
+      // one pixel.
+      //
+      // LIQUIDS ARE UNTOUCHED (cellLiq > 0 keeps fade at 1): they have no
+      // coarse representation, they never leave the window, and fading one out
+      // would simply delete the far half of a lake.
+      //
+      // AND ONLY INTO A CELL THAT HAS SOMETHING IN IT. The CA splats gas from
+      // AWAKE chunks only (sim_step.wgsl gasOuterSplat), so a settled plume in
+      // a sleeping chunk is in no coarse cell — fading it would fade it into
+      // nothing. One extra fetch, taken only for a gas cell already inside the
+      // band, turns that known hole into a non-event: such a voxel keeps its
+      // full opacity instead of disappearing.
+      var fade = 1.0;
+      if ((R.flags & RFLAG_GAS) != 0u && cellLiq == 0.0) {
+        let bw = gasBlendW(ro + rd * tCur);
+        if (bw > 0.0 && gasOuterCountAt(ro + rd * tCur) > 0.0) {
+          fade = 1.0 - bw;
+        }
+      }
+      let dTau = seg * cellOp * fade;
       out.mediaTau += dTau;
       rsAdd(RS_MEDIA, 1u);
       out.mediaTint += cellTint * dTau;
       if (cellLiq == 0.0) {
+        // FADED, deliberately, and it decides two things.
+        //
+        // gasHalfT is the depth the raster passes order against, and it should
+        // track what this march actually DRAWS: the opacity it stopped drawing
+        // is supplied by the coarse path instead, which fs() folds into the
+        // same media accumulator afterwards. The residual is that a raster body
+        // deep inside a faded plume orders against the voxel half only — the
+        // same limitation the coarse box has had since stage 1, and stated in
+        // the same place (see the note after the fold in fs()).
+        //
+        // The media early-out below is the load-bearing half. Its claim is
+        // "the pixel cannot change any more", which is about drawn opacity: an
+        // UN-faded gasTau would let a fully faded-out plume saturate the ray,
+        // set out.saturated, and thereby suppress the coarse fill that was
+        // supposed to replace it. That is a plume that vanishes at the band.
         gasTau += dTau;
         // First crossing of half opacity: latched once, never revised.
         if (out.gasHalfT == 0.0 &&
@@ -3003,14 +3080,27 @@ fn gasOuterMat() -> u32 {
   return 0u;
 }
 
-// Integrate parcel volume along the ray, from where it LEAVES THE WINDOW to
-// wherever the far field stopped it. Returns voxel-lengths of pure gas — the
-// same unit trace() accumulates into mediaTau before multiplying by opacity,
-// which is what lets fs() feed the result into the one media accumulator
-// instead of inventing a second shading path for it.
+// Integrate coarse gas volume along the ray. Returns voxel-lengths of pure gas
+// — the same unit trace() accumulates into mediaTau before multiplying by
+// opacity, which is what lets fs() feed the result into the one media
+// accumulator instead of inventing a second shading path for it.
 //
-// `tEnd` is the far march's hit distance (1e30 for a ray that reached sky), so
-// a plume behind a hill is occluded by it.
+// TWO SEGMENTS SINCE STAGE 1b, with their own step budgets:
+//
+//   * THE BAND, inside the window, from wherever the ray leaves the inner box
+//     of half-extent render.gasBlendStart x WORLD_N/2 out to the window face.
+//     Each sample is weighted by gasBlendW, which is 0 at the inner edge and
+//     1 at the face — the exact complement of the fade trace() applies to the
+//     voxels over the same shell. This is the half that did not exist before,
+//     and it is why the box now holds in-window gas as well as parcels.
+//   * OUTSIDE THE WINDOW, stage 1's segment, unchanged and at weight 1
+//     (gasBlendW is 1 everywhere past the face).
+//
+// `tEnd` is where the ray stopped: the near hit for a ray that resolved a
+// surface inside the window, the far-field hit for one that did not, 1e30 for
+// one that reached sky. A plume behind a hill is occluded by the hill, and a
+// plume behind a wall five metres away is occluded by the wall — which is what
+// makes it safe to run this on rays that DID hit.
 fn gasOuterFill(ro : vec3f, rdIn : vec3f, tEnd : f32, px : vec2f) -> f32 {
   var rd = rdIn;
   if (abs(rd.x) < 1e-6) { rd.x = select(-1e-6, 1e-6, rd.x >= 0.0); }
@@ -3031,30 +3121,72 @@ fn gasOuterFill(ro : vec3f, rdIn : vec3f, tEnd : f32, px : vec2f) -> f32 {
   let tmaxW = max(tt0, tt1);
   let ext = f32(WORLD_N) * 0.5 * abs(inv);
 
-  // START AT THE WINDOW EXIT, not at trace()'s tExit. Inside the window smoke
-  // is a voxel and the near march has already shaded it (§2.5), so sampling
-  // there would double-count anything mid-reconversion; and trace()'s tExit is
-  // not the window exit anyway — the in-window LOD handoff shortens it to
-  // render.lodHandoffDist, which would have put the start of this segment tens
-  // of metres INSIDE the window.
-  let tA = max(max(min(tmaxW.x, min(tmaxW.y, tmaxW.z)),
-                   max(max(tminW.x - ext.x, tminW.y - ext.y),
-                       max(tminW.z - ext.z, 0.0))), 0.0);
-  let tB = min(min(tmaxW.x + ext.x, min(tmaxW.y + ext.y, tmaxW.z + ext.z)),
-               tEnd);
-  if (tB <= tA) { return 0.0; }
-
-  let dt = (tB - tA) / f32(GAS_OUTER_STEPS);
   // Screen-space, time-free jitter: the same farDither the cascade seams use,
   // for the same reason and with the same two rules (no time input, keyed on
   // the pixel). Without it a fixed sample cadence draws the plume as a set of
   // concentric shells centred on the camera, which is the volumetric version
-  // of the LOD ring that dither exists to break.
-  var t = tA + dt * farDither(px);
+  // of the LOD ring that dither exists to break. ONE draw, shared by both
+  // segments — two independent dithers would decorrelate the two halves of the
+  // crossfade and stipple the seam back in.
+  let jit = farDither(px);
   var acc = 0.0;
-  for (var i = 0u; i < GAS_OUTER_STEPS; i++) {
-    acc += gasOuterCountAt(ro + rd * t);
-    t += dt;
+
+  // ---- OUTSIDE THE WINDOW (stage 1's segment) ------------------------------
+  // Starts at the WINDOW EXIT, not at trace()'s tExit: trace()'s tExit is not
+  // the window exit — the in-window LOD handoff shortens it to
+  // render.lodHandoffDist, which would have put the start of this segment tens
+  // of metres inside the window.
+  let tExitW = min(tmaxW.x, min(tmaxW.y, tmaxW.z));
+  let tA = max(max(tExitW,
+                   max(max(tminW.x - ext.x, tminW.y - ext.y),
+                       max(tminW.z - ext.z, 0.0))), 0.0);
+  let tB = min(min(tmaxW.x + ext.x, min(tmaxW.y + ext.y, tmaxW.z + ext.z)),
+               tEnd);
+  // `acc` is count x LENGTH, not a bare sum, because the two segments have
+  // different step budgets and therefore different dt. Each loop multiplies in
+  // its own.
+  if (tB > tA) {
+    let dt = (tB - tA) / f32(GAS_OUTER_STEPS);
+    var t = tA + dt * jit;
+    for (var i = 0u; i < GAS_OUTER_STEPS; i++) {
+      acc += gasOuterCountAt(ro + rd * t) * dt;
+      t += dt;
+    }
+  }
+
+  // ---- THE BAND, INSIDE THE WINDOW (stage 1b) ------------------------------
+  // The inner box is the window box shrunk by (1 - gasBlendStart) x half a
+  // window on every side, so the SAME six slab distances serve it: shrinking a
+  // box pulls both of an axis's plane distances toward each other by
+  // shrink*abs(inv), exactly as the outer box pushes them apart by `ext`. Six
+  // divides for three boxes, which is the trick this function already used.
+  //
+  // The segment runs from the inner box's EXIT (when the camera is inside it,
+  // which is the standing case — the player is near the window's centre) to
+  // the window face. When the camera is NOT inside the inner box the whole
+  // window crossing is sampled instead, and the part of it that lies inside
+  // the inner box contributes nothing because gasBlendW is 0 there: wasteful
+  // in a rare configuration, never wrong in any.
+  let shrink = (1.0 - min(TUNE_GAS_BLEND_START, 0.99)) * f32(WORLD_N) * 0.5
+               * abs(inv);
+  let tmaxI = tmaxW - shrink;
+  let tminI = tminW + shrink;
+  let tExitI = min(tmaxI.x, min(tmaxI.y, tmaxI.z));
+  let tEnterI = max(max(tminI.x, tminI.y), tminI.z);
+  let insideInner = tEnterI <= 0.0 && tExitI > 0.0;
+  let bandA = max(max(max(tminW.x, tminW.y), max(tminW.z, 0.0)),
+                  select(0.0, tExitI, insideInner));
+  let bandB = min(tExitW, tEnd);
+  if (bandB > bandA) {
+    let dt = (bandB - bandA) / f32(GAS_BAND_STEPS);
+    var t = bandA + dt * jit;
+    for (var i = 0u; i < GAS_BAND_STEPS; i++) {
+      let p = ro + rd * t;
+      // The count is weighted by the SAME ramp trace() faded the voxels by,
+      // so the two representations sum to one plume across the whole shell.
+      acc += gasOuterCountAt(p) * gasBlendW(p) * dt;
+      t += dt;
+    }
   }
   // Count -> volume fraction: one parcel IS one fine voxel of gas (that is
   // what left the window), and a cell holds (1 << SHIFT)^3 of them. So the
@@ -3069,7 +3201,7 @@ fn gasOuterFill(ro : vec3f, rdIn : vec3f, tEnd : f32, px : vec2f) -> f32 {
   // 192/512 = 0.375 full, which was a visible ceiling on brightness the moment
   // in-window voxels started splatting into the same box.
   let cellVox = f32(1u << GAS_OUTER_SHIFT);
-  return acc * dt / (cellVox * cellVox * cellVox);
+  return acc / (cellVox * cellVox * cellVox);
 }
 
 fn traceFar(ro : vec3f, rdIn : vec3f, tStart : f32, px : vec2f) -> FarHit {
@@ -8264,19 +8396,33 @@ fn fs(in : VSOut) -> FSOut {
     far = traceFar(R.camPos, rd, h.tExit, in.pos.xy);
   }
 
-  // ---- gas beyond the window (docs/PLAN_gas_particles.md §2.5) ------------
-  // Same condition as the far march above, and for the same reason: a ray that
-  // resolved a surface or was absorbed inside the window never reaches the
-  // outside, so there is nothing out there it can see. Bounded by far.t, so a
-  // plume behind a hill is hidden by the hill.
+  // ---- coarse gas (docs/PLAN_gas_particles.md §2.5 + stage 1b) ------------
+  // Stage 1 ran this only for rays that reached the outside, on the argument
+  // that a ray which resolved a surface inside the window never gets there.
+  // Stage 1b moves the coarse representation INSIDE the window — it now fades
+  // in over the outer shell, where the voxels fade out — so a ray that hits a
+  // wall at 20 m may well have crossed band gas at 15 m, and gating on `!hit`
+  // would delete exactly the half of the crossfade that is supposed to be
+  // invisible. The bound moves from "did it leave" to "where did it stop": the
+  // near hit for a ray that resolved or saturated inside the window, the far
+  // hit for one the cascade stopped, unbounded for one that reached sky.
+  //
+  // R.flags bit 3 (RFLAG_GAS) is what keeps this free in a world with no
+  // smoke: without it, giving every terrain pixel a 28-sample volume walk
+  // would be a per-frame cost paid by worlds that have nothing to draw with
+  // it. gasOuter is also only CLEARED on ticks the sim records the gas rows
+  // (C_GAS), so the flag is not merely an optimization — it is what stops a
+  // stale box from being sampled at all.
   //
   // The value is voxel-lengths of gas; it becomes optical depth in the media
   // block far below, where the near march's tau is turned into a tint. This is
   // the whole of the render side: one number, folded into one accumulator.
   var gasFarFill = 0.0;
-  if (!h.hit && !h.saturated) {
-    gasFarFill = gasOuterFill(R.camPos, rd, select(1e30, far.t, far.hit),
-                              in.pos.xy);
+  if ((R.flags & RFLAG_GAS) != 0u) {
+    var tStop = 1e30;
+    if (h.hit || h.saturated) { tStop = h.t; }
+    else if (far.hit) { tStop = far.t; }
+    gasFarFill = gasOuterFill(R.camPos, rd, tStop, in.pos.xy);
   }
 
   // ---- MPM fluid march (see the MPM FLUID SURFACE / VOXELIZED blocks) ----
@@ -8923,13 +9069,21 @@ fn fs(in : VSOut) -> FSOut {
     }
   }
   //
-  // NOT fed back into gasHalfT or fireGlow, and that is a property of the
-  // geometry rather than an omission. Both exist to order things INSIDE the
-  // window against the raymarch — gasHalfT is the depth raster mobs and debris
-  // test against, fireGlow is flame dimmed by the smoke in front of it — and
-  // every voxel-length this box contributes is strictly beyond the window
-  // exit, i.e. behind every raster body and every fire in the frame. There is
-  // nothing out there for either to order.
+  // NOT fed back into gasHalfT or fireGlow. Stage 1's argument for that was
+  // geometric and complete: every voxel-length the box contributed was
+  // strictly beyond the window exit, i.e. behind every raster body and every
+  // fire in the frame, so there was nothing out there for either to order.
+  //
+  // STAGE 1b WEAKENS IT AND DOES NOT REPAIR IT, which is worth naming rather
+  // than leaving to be discovered. The band segment is INSIDE the window, so a
+  // raster body can now stand behind coarse gas that gasHalfT does not know
+  // about, and a fire can stand behind coarse gas that does not dim it. Both
+  // are bounded by the crossfade's own weight — at the inner edge of the band
+  // the coarse contribution is zero and the voxel path (which DOES feed both)
+  // carries all of it; only at the face is it entirely coarse, and there the
+  // plume is 25 m away. Ordering the two properly needs the coarse fill to
+  // happen inside trace()'s loop, which is exactly what
+  // gotcha-raymarch-register-cliff says not to do for a soft volumetric.
   if (mediaMat != 0u && materials[mediaMat].klass == CLASS_GAS) {
     let mm = materials[mediaMat];
     var mc = (unpackColor(mm.color0) + unpackColor(mm.color1)) * 0.5;

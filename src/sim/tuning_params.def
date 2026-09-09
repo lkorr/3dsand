@@ -492,6 +492,9 @@ TP_I(render, farSteps, TUNE_FAR_STEPS, 384)
 TP_F(render, farShadowReach, TUNE_FAR_SHADOW_REACH, 60.0f)
 TP_I(render, farBlockerHitLevel, TUNE_FAR_BLOCKER_HIT_LEVEL, 0)
 
+// ---- gas voxel -> parcel crossfade (PLAN_gas_particles.md stage 1b) ----
+TP_F(render, gasBlendStart, TUNE_GAS_BLEND_START, 0.5f)
+
 // ---- in-window LOD handoff (PLAN_surface_flight_perf.md A1) ----
 TP_F(render, lodHandoffDist, TUNE_LOD_HANDOFF_DIST, 24.0f)
 TP_F(render, shadowMaxDist, TUNE_SHADOW_MAX_DIST, 999.0f)

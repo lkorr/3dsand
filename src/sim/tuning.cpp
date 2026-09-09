@@ -2149,6 +2149,7 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadI(*g, "farSteps", r.farSteps, out, at);
     ReadF(*g, "farShadowReach", r.farShadowReach, out, at);
     ReadI(*g, "farBlockerHitLevel", r.farBlockerHitLevel, out, at);
+    ReadF(*g, "gasBlendStart", r.gasBlendStart, out, at);
     ReadF(*g, "lodHandoffDist", r.lodHandoffDist, out, at);
     ReadF(*g, "renderScale", r.renderScale, out, at);
     ReadI(*g, "taa", r.taa, out, at);
@@ -2299,6 +2300,11 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     // absurdly near but is a knob setting rather than a broken frame. There is
     // deliberately no ceiling — >= 25.6 m disables the handoff, which is the
     // documented way to A/B it.
+    // A fraction of the window half-extent. Below 0 the band would start
+    // outside the box on the far side; above 1 it would never reach 1 at the
+    // face and the seam would come back with a step in it.
+    if (r.gasBlendStart < 0.0f) { r.gasBlendStart = 0.0f; }
+    if (r.gasBlendStart > 1.0f) { r.gasBlendStart = 1.0f; }
     if (r.lodHandoffDist < 2.0f) { r.lodHandoffDist = 2.0f; }
     // A scale above 1 would be supersampling the most expensive shader in the
     // engine; below a quarter the frame is 400x225 and the UI text on top is

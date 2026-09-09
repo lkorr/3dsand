@@ -234,8 +234,15 @@ void ApplyTaaJitter(const Camera& cam, const Vec3& eye, float aspect,
 // below, read only by Simulation::DrawWorld.
 namespace {
 RenderSpec gRenderSpec;
+// The sim's gas latch, published by Simulation::EncodeTick and read by
+// WriteRenderParams below (renderspec.h). A file-local flag for the reason
+// gRenderSpec above is one: the value crosses from simulation.cpp to the one
+// author of the flag word, and neither TU may include the other's header.
+bool gGasRenderActive = false;
 }
 const RenderSpec& LastRenderSpec() { return gRenderSpec; }
+void SetGasRenderActive(bool active) { gGasRenderActive = active; }
+bool GasRenderActive() { return gGasRenderActive; }
 
 void WriteRenderParams(const rhi::Queue& queue, const World& world,
                        const Vec3& eye, const Camera& cam, float aspect,
@@ -254,9 +261,12 @@ void WriteRenderParams(const rhi::Queue& queue, const World& world,
   rp.aspect = aspect;
   rp.time = time;
   // bit 0 = sun shadows, bit 1 = active-voxel debug highlight (extraFlags),
-  // bit 2 = short-range mode. Bit 2 is OR'd in here rather than passed by the
-  // caller so that every drawing path gets it — see ShortRangeMode above.
-  rp.flags = (shadows ? 1u : 0u) | extraFlags | (ShortRangeMode() ? 4u : 0u);
+  // bit 2 = short-range mode, bit 3 = gas may be present (the crossfade;
+  // docs/PLAN_gas_particles.md stage 1b). Bits 2 and 3 are OR'd in here rather
+  // than passed by the caller so that every drawing path gets them — see
+  // ShortRangeMode above and SetGasRenderActive in renderspec.h.
+  rp.flags = (shadows ? 1u : 0u) | extraFlags | (ShortRangeMode() ? 4u : 0u) |
+             (GasRenderActive() ? 8u : 0u);
   // Publish the SPEC_* predicates for this frame (support.h RenderSpec). Read
   // off `rp` rather than off the arguments, so the record is the WORD THAT WAS
   // UPLOADED and not a second derivation of it.
@@ -1089,6 +1099,11 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
       // The C_GAS latch's disarming input. Latent by design — see the block in
       // Simulation::EncodeTick for why a stale zero cannot turn gas off.
       sim.NoteGasLive(sn.gasCount);
+      // The RENDER flag's arming input (RenderParams bit 3). Parcels OR gas
+      // voxels: a plume that never leaves the window has no parcels and still
+      // has to crossfade at the faces. See Simulation::NoteGasSeen.
+      sim.NoteGasSeen(sn.gasCount > 0 ||
+                      (sn.dirtyReasonOr & kDirtyGasMask) != 0);
     }
   }
 

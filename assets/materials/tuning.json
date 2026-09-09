@@ -726,6 +726,7 @@
     "farSteps": 384,
     "farShadowReach": 24,
     "farBlockerHitLevel": 0,
+    "gasBlendStart": 0.5,
     "lodHandoffDist": 26,
     "renderScale": 1,
     "taa": 0,

@@ -378,6 +378,37 @@ inline constexpr const char* kDirtyReasonName[kDirtyReasonBits] = {
     // gas whose intent pointed out of the residency window (the sink).
     "gas-lat",    "gas-edge"};
 
+// The bit for a reason NAME, resolved from the one table above rather than
+// written down as a number a second time -- 22/24/25 in a header is exactly
+// the drift the single-list rule exists to stop. Returns 0 for an unknown
+// name, which the static_assert below turns into a build error.
+constexpr uint32_t DirtyReasonBit(const char* name) {
+  for (int i = 0; i < kDirtyReasonBits; i++) {
+    const char* a = kDirtyReasonName[i];
+    const char* b = name;
+    while (*a != '\0' && *a == *b) { a++; b++; }
+    if (*a == '\0' && *b == '\0') return 1u << i;
+  }
+  return 0u;
+}
+
+// Every mark a MOVING GAS VOXEL leaves on its chunk. The renderer's "gas may
+// be present this frame" flag (RenderParams bit 3, PLAN_gas_particles stage
+// 1b) is armed from this OR'd over the whole dirty array plus the live parcel
+// count: parcels alone are not enough, because in-window smoke is a voxel and
+// leaves no parcel behind until it reaches a face.
+constexpr uint32_t kDirtyGasMask = DirtyReasonBit("gas") |
+                                   DirtyReasonBit("gas-lat") |
+                                   DirtyReasonBit("gas-edge");
+static_assert(kDirtyGasMask == (DirtyReasonBit("gas") |
+                                DirtyReasonBit("gas-lat") |
+                                DirtyReasonBit("gas-edge")) &&
+                  DirtyReasonBit("gas") != 0 &&
+                  DirtyReasonBit("gas-lat") != 0 &&
+                  DirtyReasonBit("gas-edge") != 0,
+              "a gas dirty-reason name was renamed in kDirtyReasonName without "
+              "updating kDirtyGasMask");
+
 // Particle system sizes — must match common.wgsl.
 constexpr uint32_t kParticleCap = 262144;
 constexpr uint32_t kClaimSize = 262144;
@@ -2555,6 +2586,12 @@ struct WorldSnapshot {
   IVec3 mirrorBase{};                 // WORLD chunk coord of the 3x3x3 mirror corner
   std::vector<uint32_t> mirror;       // 27 chunks of voxel words
   uint32_t activeChunks = 0;
+  // Every dirty-reason bit set by ANY chunk this snapshot, OR'd in the fold
+  // that already walks the array for `activeChunks`. One `|=` per chunk, so it
+  // is free where the diagnostic histogram (SANDVOX_DIRTY_REASONS) is not, and
+  // it answers the one always-on question the histogram was too expensive for:
+  // WHICH KINDS of rule are running at all. Read by the gas render flag.
+  uint32_t dirtyReasonOr = 0;
   uint64_t voxelTotal = 0;
   uint32_t worldHash = 0;
   uint32_t pick[8] = {};

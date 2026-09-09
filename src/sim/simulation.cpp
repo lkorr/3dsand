@@ -2350,6 +2350,21 @@ void Simulation::EncodeTick(const rhi::CommandEncoder& enc, uint32_t opsCount,
                            gasLive_ > 0 || gasIdleTicks_ < kGasIdleTicks);
   gasSpawnsThisTick_ = 0;
 
+  // ---- THE RENDER FLAG, which is a DIFFERENT question ---------------------
+  // cx.gasActive above answers "must the gas PASSES run", and it is true
+  // whenever the CA is, because a gas parcel can be created on any tick a
+  // voxel reaches a face. That is the right answer for the sim and the wrong
+  // one for the renderer: it would put the crossfade's band sampling on every
+  // terrain pixel of every frame in any world with a running CA, including
+  // every world that has never had a fire in it.
+  //
+  // So this one asks "is there gas ANYWHERE" -- parcels or in-window voxels --
+  // and holds for kGasSeenTicks past the last snapshot that saw either. When
+  // the plume is really gone the flag drops and raymarch.wgsl skips the fade,
+  // the band and the fold entirely. See renderspec.h.
+  if (gasSeenHold_ > 0) gasSeenHold_--;
+  sandvox::SetGasRenderActive(gasOn && gasSeenHold_ > 0);
+
   RecordTable(enc, pass::Table::Tick, &cx);
 
   // MLS-MPM fluid: seam front half (compaction, spawns, excite), the substep

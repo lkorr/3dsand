@@ -17,6 +17,33 @@ converted at the edge. That pair is the whole of stage 1 in two numbers.
 P0's measurement stands as written in §0, and its headline finding — that
 `treeburn` does not run on the shipped map — is still open for whoever owns
 worldgen. P2 (stage 2, §2.10) is optional and unstarted.
+
+**STAGE 1b IS ALSO COMPLETE (2026-09-09): the two representations crossfade.**
+Stage 1 left the seam it created: voxel smoke inside the window, parcel smoke
+outside it, meeting at the face with no overlap, so there was a visible line
+where 0.1 m voxels became 0.8 m cells. Three changes, all render-side, sim
+untouched, `determinism` hash unmoved at `9bfed213`:
+
+1. `gasOuter`'s cell went from a BYTE to a u16 (4 MiB). A byte capped a 0.8 m
+   cell at 192/512 = 37.5% full, invisible while the box held only distant
+   parcels and a visible thinning the moment a dense in-window plume crossfaded
+   into it.
+2. The CA splats every in-window gas VOXEL into the same box, once per tick
+   (`sim_step.wgsl` `gasOuterSplat`, `simBGL_` binding 34, `A(GasOuter)` on the
+   `ca` row). Without this there is nothing on the coarse side to fade IN.
+3. `raymarch.wgsl` crossfades over the outer shell of the window: a smoothstep
+   on the max-norm distance from the WINDOW CENTRE (so the weight is exactly 1
+   at all six faces regardless of camera), inner edge at the new
+   `render.gasBlendStart` (default 0.5 = 12.8 m). Voxels fade out by `1 - b`,
+   and only into a non-empty coarse cell; `gasOuterFill` grew a second segment
+   with its own step budget covering the same shell and now runs for rays that
+   HIT inside the window. RenderParams bit 3 keeps the whole path at zero cost
+   in a world with no gas.
+
+DESIGN.md §5 "Stage 1b" has the full argument. Known and stated rather than
+solved: gas in a SLEEPING chunk is not visited by the CA and so is not splatted
+(mitigated — a voxel never fades into an empty cell), and the coarse
+contribution still does not feed `gasHalfT` or `fireGlow`.
 Companion: `docs/PLAN_chunk_tickets.md` (independent; tickets are for matter
 that LANDS, particles are for gas that KEEPS GOING).
 

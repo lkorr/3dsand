@@ -2861,6 +2861,21 @@ struct Tuning {
     // Set >= WINDOW_HALF_EXTENT_METERS (25.6 m) to disable the handoff
     // entirely and get the old "switch only at window exit" behaviour — which
     // is exactly how to A/B it without a rebuild (F5 reloads it).
+    // ---- the gas crossfade (docs/PLAN_gas_particles.md stage 1b) --------
+    // Where the voxel representation of gas starts handing over to the coarse
+    // one, as a FRACTION of the residency window's half-extent measured from
+    // the window CENTRE in the max norm. 0.5 = the fade runs over the outer
+    // half, from 12.8 m to the face at 25.6 m.
+    //
+    // The window CENTRE and not the camera, which is the whole trick: the
+    // weight is then exactly 1 at every one of the six faces regardless of
+    // where the camera is, so the seam the fade exists to remove disappears on
+    // all of them at once rather than on the one the camera happens to face.
+    //
+    // 1.0 disables the crossfade (voxels at full opacity right up to the face,
+    // coarse gas starting at the face) and gets stage 1's hard edge back --
+    // which is how to A/B it without a rebuild, since F5 reloads this.
+    float gasBlendStart = 0.5f;
     float lodHandoffDist = 24.0f;
     // ---- frame pacing and internal resolution (CPU-only: no .def row, no
     // TUNE_* constant — nothing here reaches a shader) ----------------------

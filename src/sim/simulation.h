@@ -207,6 +207,15 @@ class Simulation {
   }
   void NoteGasSpawns(uint32_t n) { gasSpawnsThisTick_ += n; }
   uint32_t GasLive() const { return gasLive_; }
+  // NoteGasSeen: is there gas ANYWHERE the renderer would have to draw --
+  // parcels outside the window OR gas voxels inside it. The second half is the
+  // reason this is not just `gasLive_ > 0`: in-window smoke is a VOXEL and
+  // leaves no parcel behind until it reaches a face, so a plume that never
+  // leaves the window would arm nothing and the crossfade would be off exactly
+  // where it matters most. Both halves come off the snapshot ring, so this is
+  // latent in the same way and by the same amount as everything else there;
+  // the hold in EncodeTick is what covers the latency.
+  void NoteGasSeen(bool seen) { if (seen) gasSeenHold_ = kGasSeenTicks; }
 
   void NoteSnapshot(uint32_t snapTick, uint32_t activeChunks,
                     uint32_t particleCount);
@@ -677,6 +686,14 @@ class Simulation {
   rhi::BindGroup gasBG_[2];
   // C_GAS latch state — see the block in EncodeTick.
   static constexpr uint32_t kGasIdleTicks = 8;
+  // How long the RENDER flag (RenderParams bit 3) is held past the last
+  // snapshot that saw gas. Much longer than kGasIdleTicks because it is a
+  // FRAME-RATE-facing latch and its failure mode is different: the pass latch
+  // going false one tick early costs a tick of simulation, while the render
+  // flag going false one frame early makes a plume blink. One second of hold
+  // against a ring that is a handful of ticks latent, so it cannot flicker.
+  static constexpr uint32_t kGasSeenTicks = 60;
+  uint32_t gasSeenHold_ = 0;
   uint32_t gasLive_ = 0;
   uint32_t gasSpawnsThisTick_ = 0;
   uint32_t gasIdleTicks_ = kGasIdleTicks;
