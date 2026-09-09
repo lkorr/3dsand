@@ -620,10 +620,41 @@ TP_I(sim, fluidExciteStep, TUNE_FLUID_EXCITE_STEP, 2)
 // 0 restores the WP4 behaviour where the two representations pass through each
 // other. See the seeding block in sim_fluid.wgsl clearGrid.
 TP_F(sim, fluidSettledMass, TUNE_FLUID_SETTLED_MASS, 1.0f)
+// Does SUBMERGED settled liquid act as a boundary for MPM particles? The
+// static mass above puts a density STEP at the interface, which stops a slow
+// particle, but the field below it is flat rest with no depth profile — so a
+// particle with downward momentum punches through and free-falls through water
+// the solver cannot see. A buried particle can never settle back (a submerged
+// column has no room by construction), so this is the termination fix, not a
+// cosmetic one. 0 is the control arm for `--sweep sim.fluidSubmergedSolid=0,1`.
+TP_I(sim, fluidSubmergedSolid, TUNE_FLUID_SUBMERGED_SOLID, 1)
 TP_F(sim, fluidSettleEps, TUNE_FLUID_SETTLE_EPS, 6.0f)
 TP_F(sim, fluidWakeSpeed, TUNE_FLUID_WAKE_SPEED, 24.0f)
 TP_I(sim, fluidSettleTicks, TUNE_FLUID_SETTLE_TICKS, 24)
 TP_F(sim, fluidStainRate, TUNE_FLUID_STAIN_RATE, 8.0f)
+
+// ---- THE FORCE-SETTLE BACKSTOP (rule 2's termination guarantee) ------------
+// settleColumn walks its own 16 cells plus SETTLE_SPILL more, so a SUBMERGED
+// column has no room by construction and refuses forever. Measured at the
+// authored home_lake 2026-09-08: 7,610 particles alive and flat in a world with
+// 0 awake chunks, 40 of 40 picked blocks refused, 2,060 columns per 20 ticks
+// hitting the spill ceiling and 0 for any other reason, 0 eighths converted —
+// 3.7 ms/frame of solver that can never finish. These three knobs are the
+// escape hatch, and turning stuckTicks to 0 disables the whole path.
+//
+// The age must key on particle EXISTENCE, not on refusal: once submerged cells
+// can no longer excite, the stuck blocks are never CALM either, so they are
+// never picked and a refusal-triggered counter would never fire.
+TP_I(sim, fluidStuckTicks, TUNE_FLUID_STUCK_TICKS, 96)
+// Forced blocks per tick. Small on purpose: a forced walk's write set reaches
+// past SETTLE_SPILL, so forced picks take a stricter exclusion (no two may
+// share an (x,z) chunk column) and the budget bounds the drain rate.
+TP_I(sim, fluidForceBlocks, TUNE_FLUID_FORCE_BLOCKS, 4)
+// How many cells past the spill ceiling a forced walk may climb looking for
+// room. Buried mass belongs at the column's free surface; this bounds the
+// search. Exhausting it means a genuinely sealed column, which is counted
+// rather than silently retried.
+TP_I(sim, fluidForceReach, TUNE_FLUID_FORCE_REACH, 64)
 
 // ---- WATER BODIES (docs/PLAN_water_master.md, M1) ----
 // A still lake gets a NAME and a small record of aggregates, so that from M2

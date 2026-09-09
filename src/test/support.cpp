@@ -1819,9 +1819,12 @@ void ReadWaterLedgerSync(GpuContext& ctx, World& world, int32_t* out) {
                         "waterLedgerRead");
 }
 
+// `out32` must have room for kFluidArgsWords (world.h), which is what every
+// caller declares. The size used to be a literal 32 here and a literal 128 in
+// three places in world.cpp; they are one constant now.
 void ReadFluidArgsSync(GpuContext& ctx, World& world, uint32_t* out32) {
   rhi::ReadbackBlocking(ctx.device, ctx.queue, world.fluidArgsStage, 0, out32,
-                        32 * 4, "fluidArgsRead");
+                        kFluidArgsBytes, "fluidArgsRead");
 }
 
 void ReadPageFaultsSync(GpuContext& ctx, World& world, uint32_t out[4]) {

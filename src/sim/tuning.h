@@ -1538,6 +1538,13 @@ struct Tuning {
     // is the live A/B oracle for anything this changed. Above ~1 the boundary
     // over-pressurises and ejects particles off the surface.
     float fluidSettledMass = 1.0f;
+    int fluidSubmergedSolid = 1;  // SUBMERGED settled liquid is a boundary, so
+                                  // particles ride the free surface instead of
+                                  // sinking into water that has no depth
+                                  // profile to push them back out. A buried
+                                  // particle can never settle (its column has
+                                  // no room), so this is what makes settle able
+                                  // to terminate. 0 = the pass-through control
     float fluidSettleEps = 6.0f;  // vox/s: a fluid block whose FASTEST
                                   // particle stays below this for
                                   // settleTicks in a row counts as calm and
@@ -1589,6 +1596,21 @@ struct Tuning {
     float fluidStainRate = 8.0f;  // chances/s that an excited-fluid contact
                                   // stains an adjacent solid cell — the MPM
                                   // counterpart of CA liquid staining
+    int fluidStuckTicks = 96;     // ticks a chunk slot may hold particles
+                                  // before its blocks are force-settled
+                                  // regardless of calm. 0 disables the
+                                  // backstop entirely. Keyed on EXISTENCE, not
+                                  // on refusal: a submerged block is never
+                                  // calm, so it is never picked, so a
+                                  // refusal-triggered age would never fire
+    int fluidForceBlocks = 4;     // forced blocks per tick; bounds the drain
+                                  // rate, and forced picks take a stricter
+                                  // (x,z)-column exclusion because their write
+                                  // set reaches past SETTLE_SPILL
+    int fluidForceReach = 64;     // cells past the spill ceiling a forced walk
+                                  // may climb looking for room. Exhausting it
+                                  // means a sealed column — counted, not
+                                  // silently retried
 
     // ---- water bodies (docs/PLAN_water_master.md; src/sim/waterbody.h) ----
     //
