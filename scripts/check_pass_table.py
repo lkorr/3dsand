@@ -312,6 +312,12 @@ _SIM_GROUP0 = {
     # where the same buffer is binding 3. The numbers differ legally because
     # the two modules declare it independently rather than through common.wgsl.
     "gasSpawn",
+    # The outer gas density box, binding 34 (stage 1b). The CA splats every
+    # in-window gas VOXEL into it once per tick so the renderer can crossfade
+    # a voxel plume into the coarse one; sim_gas splats the PARCELS into the
+    # same buffer through the GAS group, where it is binding 6, and raymarch
+    # samples it at 21. Three independent declarations, three legal numbers.
+    "gasOuter",
 }
 # The slim group is 0..4 PLUS the two page buffers at 17/18 — not a dense
 # prefix any more. One WGSL identifier cannot carry two binding numbers

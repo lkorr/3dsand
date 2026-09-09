@@ -63,6 +63,19 @@ const PT_KERNEL : u32 = PT_K_STEP;
 // before the CA runs, so the header words double as this tick's gas counters
 // (they are read back with the snapshot ring; see GAS_SP_* below).
 @group(0) @binding(33) var<storage, read_write> gasSpawn : array<atomic<u32>>;
+// ---- THE OUTER GAS DENSITY BOX (docs/PLAN_gas_particles.md §2.5, stage 1b) -
+// RENDER-ONLY DERIVED DATA, and the CA writes it for one reason: gas inside
+// the window is a voxel and gas outside it is a parcel, the two are drawn from
+// different representations at 64x different resolution, and until stage 1b
+// they met at the window face with NO overlap — a hard edge in the sky where
+// crisp voxel smoke became soft 0.8 m cells. The renderer crossfades between
+// them across the outer half of the window now, and it can only do that if the
+// coarse box holds the in-window plume as well as the parcels.
+//
+// The sim never reads this buffer, the world hash never covers it, and it is
+// cleared by fill_gasOuter before the CA runs. So the splat below cannot move
+// a voxel or a hash — it is exactly as observable as `actVoxViz` at 23.
+@group(0) @binding(34) var<storage, read_write> gasOuter : array<atomic<u32>>;
 
 // gasSpawn's header. Words 0..2 are written HERE (the CA is the only producer
 // of edge conversions); words 3..7 are written by sim_gas.wgsl. Must agree with
@@ -84,6 +97,17 @@ const GAS_SP_STRIDE   : u32 = 8u;  // u32 per record (a 32-byte Particle)
 // is scheduling-dependent, and a loser stays in the grid where the world hash
 // can see it. `gas-leave` asserts the refusal count is zero.
 const GAS_SPAWN_CAP   : u32 = 65536u;
+// The outer density box's shape. MIRRORED FROM world.h's kGasOuterN /
+// kGasOuterShift, not imported through common.wgsl: a constant only a few
+// shaders read is declared in each of them, because a common.wgsl edit misses
+// the SPIR-V cache for EVERY shader and pays the worldgen far-cascade compile
+// (CLAUDE.md). check_invariants.py's `pairs` table is what holds the three
+// copies (here, sim_gas.wgsl, raymarch.wgsl) in step with world.h — the
+// splatter and the sampler disagreeing about cell size draws a plume in the
+// wrong place, silently.
+const GAS_OUTER_N     : u32 = 128u;
+const GAS_OUTER_SHIFT : u32 = 3u;
+const GAS_OUTER_MAX   : u32 = 60000u;
 // sim.gasMode, on the tick stream (TickParams). 0 makes the residency edge a
 // WALL again: the branch below never runs, no record is appended, and the CPU
 // reads the same value to leave every gas pass unrecorded — so `gasMode = 0`
@@ -1707,6 +1731,48 @@ fn gasIntent(c : vec3<i32>, m : Material, slotIdx : u32, base : u32) -> GasInten
 // SPAWN-LIST ORDER IS SCHEDULING-DEPENDENT and nothing keys on it: each record
 // is a complete particle state, and the particle system's rule is that
 // behaviour is derived from state, never from a buffer slot.
+// ---- THE IN-WINDOW SPLAT (stage 1b) ----------------------------------------
+// Every gas voxel in an awake chunk adds ONE to the 0.8 m cell it sits in, so
+// the coarse box holds the whole plume and not just the part of it that has
+// already left. The renderer needs that overlap to crossfade: a voxel fading
+// out at the window face has to be fading INTO something.
+//
+// IDENTICAL CELL MAPPING to sim_gas.wgsl's gasOuterOrigin/gasOuterCell and to
+// raymarch.wgsl's gasOuterOriginVox — that agreement IS the interface, and the
+// constants it is built from are pinned by check_invariants.py. T.origin is in
+// CHUNK units; the box is two window edges centred on the window, so its min
+// corner is half a window below the window's, which is a multiple of the cell
+// size and needs no rounding.
+//
+// ONCE PER VOXEL PER TICK. The CA runs 2 gravity substeps x 27 colour phases;
+// the stamp gate at the top of stepCell lets a voxel act at most once per
+// SUBSTEP, so `P.substep == 0u` at the call site is what makes this once per
+// tick. Called BEFORE the voxel moves, so a voxel that leaves the window this
+// tick is splatted at the cell it left from and sim_gas splats the parcel it
+// became at the cell it arrived at — one contribution each, from two
+// populations that do not overlap.
+//
+// RENDER-ONLY: no voxel is written, nothing is hashed, and the load-then-add
+// is a benign race for the same reason it is in sim_gas.wgsl. See
+// GAS_OUTER_MAX there for what the guard buys.
+//
+// KNOWN LIMITATION, stated rather than solved: gas in a SLEEPING chunk is not
+// visited by the CA and so is not splatted. The renderer's fade is gated on
+// the coarse cell being non-empty for exactly that reason — a voxel never
+// fades out into a cell with nothing in it — so a settled plume in a sleeping
+// chunk keeps its full voxel opacity instead of vanishing.
+fn gasOuterSplat(c : vec3<i32>) {
+  let d = (c - (T.origin * i32(CHUNK) - vec3<i32>(i32(WORLD_N) / 2)))
+          >> vec3<u32>(GAS_OUTER_SHIFT);
+  let n = i32(GAS_OUTER_N);
+  if (d.x < 0 || d.y < 0 || d.z < 0 || d.x >= n || d.y >= n || d.z >= n) { return; }
+  let li = (u32(d.z) * GAS_OUTER_N + u32(d.y)) * GAS_OUTER_N + u32(d.x);
+  let word = li >> 1u;
+  let sh = 16u * (li & 1u);
+  if (((atomicLoad(&gasOuter[word]) >> sh) & 0xFFFFu) >= GAS_OUTER_MAX) { return; }
+  atomicAdd(&gasOuter[word], 1u << sh);
+}
+
 fn gasLeave(c : vec3<i32>, idx : u32, w : u32, dst : vec3<i32>) -> bool {
   let slot = atomicAdd(&gasSpawn[GAS_SP_COUNT], 1u);
   if (slot >= GAS_SPAWN_CAP) {
@@ -1989,6 +2055,13 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
   // that EXISTS as a callable thing. What the powder path keeps is stages
   // 1, 2, 4 and 5 with dy = -1, which is all it ever used.
   if (m.klass == CLASS_GAS) {
+    // The render-only density splat, ONCE PER TICK (substep 0) and BEFORE the
+    // move, so this voxel contributes to the cell it is in rather than to the
+    // one it is about to be in. Gated on gasMode for the reason the sink is:
+    // with GAS_MODE_OFF no gas row is recorded at all, fill_gasOuter never
+    // clears the box, and a splat into an uncleared box would accumulate
+    // forever. See gasOuterSplat.
+    if (T.gasMode != GAS_MODE_OFF && P.substep == 0u) { gasOuterSplat(c); }
     stepGas(c, idx, w, m, slotIdx, rnd);
     return;
   }

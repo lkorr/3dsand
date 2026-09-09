@@ -243,11 +243,19 @@ PASS(copy_argsStage_dispatchArgs, nullptr, PT_TICK, PIPE_NONE, K_COPY, 0,0,12, G
 // (sim_step's gasLeave), and sim_gas's spawn pass reads the list back in this
 // same command buffer. That RAW hop crosses from the colour loop into the
 // particle phase and has no other source of synchronisation.
+//
+// A(GasOuter): stage 1b's in-window density splat (sim_step's gasOuterSplat).
+// Atomic-store-only, like ActVoxViz beside it, so it orders against nothing
+// WITHIN the loop -- what the row buys is the two hops it sits between:
+// fill_gasOuter clears the box under C_GAS before this runs (WAW), and
+// sim_gas's resolve adds the parcels to the same box afterwards (WAW again),
+// both in this same command buffer. Leave it off and the clear is free to sink
+// past the splat, which reads as a plume that flickers out one frame in N.
 PASS(ca, "ca(54 color x substep)", PT_TICK, PIPE_STEP, K_INDIRECT, IND_DISPATCHARGS,0,0, GRP_SIM, DYN_CA, C_CAACTIVE, 54,
      USES(R(Materials) U(TickUBO) U(PassUBO) R(Reactions) R(DirtyIn) R(DirtyList) I(DispatchArgs)
           RW(Voxels) A(DirtyOut) A(Support) R(PageTable) A(PageFaults)
           R(FluidBlockMap) R(FluidGrid) A(FluidCellScratch) A(ActVoxViz)
-          A(GasSpawn)))
+          A(GasSpawn) A(GasOuter)))
 
 // ---- phase 3b: water bodies (docs/PLAN_water_master.md M2) ----------------
 //

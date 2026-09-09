@@ -262,6 +262,16 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         // is the condition the one-identifier-one-binding-number rule above is
         // about. 33 is the first free slot in this dense 0..32 layout.
         entry(33, T::Storage),         // gasSpawn (header + records)
+        // The outer gas density box (docs/PLAN_gas_particles.md §2.5). Bound
+        // to the CA since stage 1b, which splats every in-window gas VOXEL
+        // into it once per tick so the renderer can crossfade a voxel plume
+        // into the coarse one instead of cutting between them at the face.
+        // Binding 6 in the GAS group and 21 in renderBGL_; the numbers differ
+        // for gasSpawn's reason -- `gasOuter` is declared in three modules
+        // that do NOT share the declaration through common.wgsl, which is the
+        // condition the one-identifier-one-binding-number rule is about.
+        // 34 is the first free slot in this dense 0..33 layout.
+        entry(34, T::Storage),         // gasOuter (render-only density box)
     };
     simBGL_ = device.CreateBindGroupLayout(entries, std::size(entries));
 
@@ -865,6 +875,7 @@ void Simulation::BuildSimBindGroups(const rhi::Device& device) {
         b(31, worldMapBuf_),
         b(32, world_->glow),
         b(33, world_->gasSpawn),
+        b(34, world_->gasOuter),
     };
     simBG_[page] = device.CreateBindGroup(simBGL_, entries, std::size(entries), "simBG");
 

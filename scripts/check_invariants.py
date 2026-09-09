@@ -1569,14 +1569,18 @@ def check_gas_consts():
                                                ("sim_step.wgsl", step)]),
         ("kGasCpuSpawnPerTick", "GAS_CPU_SPAWN_CAP", [("sim_gas.wgsl", gas)]),
         ("kGasCeilingVox", "GAS_CEILING_VOX", [("sim_gas.wgsl", gas)]),
-        # raymarch.wgsl declares its own copies rather than importing them:
-        # the far march is their only render-side reader, and a common.wgsl
-        # constant costs the whole SPIR-V cache. That is the right trade and
-        # this is the price of it -- the splatter and the sampler disagreeing
-        # about the cell size is a plume drawn in the wrong place.
+        # THREE modules declare their own copies rather than importing them:
+        # sim_gas splats parcels into the box, sim_step splats in-window gas
+        # VOXELS into it (stage 1b, so the renderer can crossfade between the
+        # two representations), and raymarch samples it. A common.wgsl constant
+        # would cost the whole SPIR-V cache. That is the right trade and this is
+        # the price of it -- any two of the three disagreeing about the cell
+        # size is a plume drawn in the wrong place, silently.
         ("kGasOuterN", "GAS_OUTER_N", [("sim_gas.wgsl", gas),
+                                       ("sim_step.wgsl", step),
                                        ("raymarch.wgsl", raymarch)]),
         ("kGasOuterShift", "GAS_OUTER_SHIFT", [("sim_gas.wgsl", gas),
+                                               ("sim_step.wgsl", step),
                                                ("raymarch.wgsl", raymarch)]),
     ]
     for cname, wname, shaders in pairs:
