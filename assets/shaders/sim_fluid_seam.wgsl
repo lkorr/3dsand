@@ -142,6 +142,10 @@ const SP_COLBAD : u32 = SP_BINS + SETTLE_MAX * CHUNK_VOL * 2u;  // + listIdx*8
 const SP_SCRATCH_WORDS : u32 = SP_COLBAD + SETTLE_MAX * 8u;
 const MARK_SETTLING : u32 = 0x80000000u;
 const MARK_REFUSED : u32 = 0x40000000u;
+// This block was picked by settleScan's FORCED phase, not its calm one: its
+// column walk may climb past the spill ceiling and its stability veto is
+// skipped. Read by settleColumn, settleCheck and settleCommit.
+const MARK_FORCED : u32 = 0x20000000u;
 const MARK_LIST_MASK : u32 = 0x1Fu;
 
 // ---- tuning -> per-tick fixed point (same const-eval discipline as the
@@ -342,6 +346,10 @@ fn compactScan(@builtin(local_invocation_index) li : u32) {
     atomicStore(&fluidArgs[FA_CLAMPED], 0u);
     atomicStore(&fluidArgs[FA_SETREFUSED], 0u);
     atomicStore(&fluidArgs[FA_SETUNSTABLE], 0u);
+    atomicStore(&fluidArgs[FA_SETCEIL], 0u);
+    atomicStore(&fluidArgs[FA_SETFLOOR], 0u);
+    atomicStore(&fluidArgs[FA_FORCED], 0u);
+    atomicStore(&fluidArgs[FA_SEALED], 0u);
     atomicStore(&fluidArgs[FA_EXSEEN], 0u);
     atomicStore(&fluidArgs[FA_EXCANDID], 0u);
     atomicStore(&fluidArgs[FA_SPAWNDEAD], 0u);
@@ -700,12 +708,48 @@ fn exciteDetect(@builtin(workgroup_id) wg : vec3<u32>,
     if (!seamLiquid(mat)) { continue; }
     atomicAdd(&fluidArgs[FA_EXSEEN], 1u);   // reach probe, see common.wgsl
 
+    // ---- SUBMERGED WATER IS FULL WATER, AND IT IS ALSO UNEXCITABLE --------
+    //
+    // The THIRD member of the family ab6ce9c named. That commit gave the CA's
+    // same-liquid equalize, bridgeLevel and canFlowAnywhere one shared gate —
+    // "a cell with its own liquid directly above it is not a free surface" —
+    // and said in as many words that those must agree or a chunk never sleeps.
+    // The seam's excite triggers are the third place the rule has to hold, and
+    // they did not have it. Trigger (d) already tested it locally; (a) and the
+    // perch pair did not, so the gate is hoisted here and shared.
+    //
+    // WHY IT IS NOT MERELY TIDINESS: settle can NEVER put a submerged particle
+    // back. settleColumn walks its own 16 cells plus SETTLE_SPILL more, and in
+    // a submerged column every one of those is already full water — there is no
+    // room, the column refuses, and the block is refused whole, forever.
+    // MEASURED at the authored home_lake, `--gate sleep` 2026-09-08, twenty
+    // quiet ticks in a world with 0 awake chunks: 7,610 particles alive and
+    // flat, 40 blocks picked, 40 refused infeasible, and the refusal split says
+    // 2,060 columns hit the SPILL CEILING against 0 for no-floor-or-trapped.
+    // Not one eighth ever converted, and 0 were re-excited — so this is not a
+    // wake loop or a stability veto, it is arithmetic that cannot come out.
+    // That population costs the full 9-substep solver table every tick forever:
+    // 3.7 ms/frame in a settled world, which is what rule 2 forbids.
+    //
+    // The CA is the correct owner of what this refuses. ab6ce9c left DESCENT
+    // untouched, so a submerged cell with air under it still collapses — the
+    // deficit migrates up to the free surface where the eighths belong, and
+    // that is the CA's job, not the solver's. Out-of-window above is solid and
+    // inert by the residency rule, so it is not "more of my own liquid".
+    var atSurface = true;
+    {
+      let above = c + vec3<i32>(0, 1, 0);
+      if (inWindow(above, T.origin)) {
+        atSurface = voxMat(voxWordAt(above)) != mat;
+      }
+    }
+
     // Trigger (a), gated by the tick input stream: the cell would FALL — air
     // below. This is the disturbance trigger (carve, explosion, mutation);
     // while the CA still owns liquid movement it stays off by default.
     var excite = false;
     var byFall = false;
-    if (T.fluidExciteEnable != 0u) {
+    if (T.fluidExciteEnable != 0u && atSurface) {
       let below = c + vec3<i32>(0, -1, 0);
       if (inWindow(below, T.origin) && voxMat(voxWordAt(below)) == MAT_AIR) {
         excite = true;
@@ -753,13 +797,10 @@ fn exciteDetect(@builtin(workgroup_id) wg : vec3<u32>,
       // submerged cell and convert a splash in one burst instead of peeling it
       // a layer at a time. `onBase` is deliberately NOT required — a splash
       // sitting on a pool is the case, and its base cell is water by definition.
+      // (`atSurface` is hoisted above and shared with triggers (a)/(b)/(c) —
+      // this test is where it started, and it now gates all four.)
       if (!excite && SEAM_EX_STEP > 0) {
-        let above = c + vec3<i32>(0, 1, 0);
-        var atSurface = true;
-        if (inWindow(above, T.origin)) {
-          atSurface = voxMat(voxWordAt(above)) != mat;
-        }
-        if (atSurface && seamSurfaceStep(c)) { excite = true; }
+        if (seamSurfaceStep(c)) { excite = true; }
       }
     }
     // Trigger (e), THE DRAIN SHELL (component 7). Deliberately OUTSIDE the
@@ -1346,15 +1387,34 @@ fn settleJudge(@builtin(global_invocation_id) gid : vec3<u32>) {
   let slot = gid.x;
   if (slot >= NUM_CHUNKS) { return; }
   let sp = atomicLoad(&settleScratch[SP_SPEED + slot]);
+  // ONE THREAD OWNS ONE SLOT, so the load/modify/store below needs no atomic
+  // read-modify-write and is order-independent by construction (rule 1). The
+  // atomics are here only because the buffer is atomic-typed for the passes
+  // that DO contend on it.
+  let cur = atomicLoad(&fluidCalm[slot]);
+  var calm = cur & CALM_MASK;
+  var age = cur >> 16u;
   if (sp == 0u) {
-    atomicStore(&fluidCalm[slot], 0u);
-    return;
-  }
-  if (i32(sp - 1u) <= SEAM_SETTLE2) {
-    atomicAdd(&fluidCalm[slot], 1u);
+    // No particles in this slot: both counters reset, so a re-flooded chunk
+    // starts its calm window over AND cannot inherit a stale stuck age.
+    calm = 0u;
+    age = 0u;
   } else {
-    atomicStore(&fluidCalm[slot], 0u);
+    // The stuck age counts ticks this slot has CONTINUOUSLY HELD PARTICLES,
+    // whether or not they are calm. That is the monotone quantity the
+    // termination argument rests on: it can only rise while the particles
+    // remain, so every stuck block reaches the threshold in bounded time.
+    age = min(age + 1u, CALM_MAX);
+    if (i32(sp - 1u) <= SEAM_SETTLE2) {
+      // Saturating, unlike the atomicAdd this replaces: that one was unbounded
+      // (nothing clamped it, it was only ever compared >=) and would now carry
+      // into the age field above it.
+      calm = min(calm + 1u, CALM_MAX);
+    } else {
+      calm = 0u;
+    }
   }
+  atomicStore(&fluidCalm[slot], (age << 16u) | calm);
 }
 
 // settleScan: pick up to SETTLE_MAX calm blocks, in slot order, with a greedy
@@ -1386,6 +1446,7 @@ fn settleJudge(@builtin(global_invocation_id) gid : vec3<u32>) {
 // column unstable; those columns keep their water as particles and retry next
 // tick, which is the same graceful path a refusal always took.
 var<workgroup> ssPart : array<u32, 256>;
+var<workgroup> ssForce : array<u32, 256>;   // stuck-slot count per partition
 
 @compute @workgroup_size(256)
 fn settleScan(@builtin(local_invocation_index) li : u32) {
@@ -1403,12 +1464,20 @@ fn settleScan(@builtin(local_invocation_index) li : u32) {
   let asleep = atomicLoad(&fluidArgs[FA_LIVE]) == 0u;
   let span = NUM_CHUNKS / 256u;
   var n = 0u;
+  var nf = 0u;
   if (!asleep) {
     for (var s = li * span; s < (li + 1u) * span; s++) {
-      if (atomicLoad(&fluidCalm[s]) >= SEAM_CALM_TICKS) { n += 1u; }
+      let cw = atomicLoad(&fluidCalm[s]);
+      if ((cw & CALM_MASK) >= SEAM_CALM_TICKS) { n += 1u; }
+      // The stuck half. Counted in the SAME partition walk rather than a
+      // second pass: the walk is the expensive part and both answers come off
+      // one load. The `asleep` guard above covers this too, so a world with no
+      // particles still costs nothing (rule 2).
+      if (SEAM_STUCK_TICKS > 0u && (cw >> 16u) >= SEAM_STUCK_TICKS) { nf += 1u; }
     }
   }
   ssPart[li] = n;
+  ssForce[li] = nf;
   workgroupBarrier();
   if (li != 0u) { return; }
   if (asleep) {
@@ -1421,7 +1490,7 @@ fn settleScan(@builtin(local_invocation_index) li : u32) {
   for (var t = 0u; t < 256u && count < SETTLE_MAX; t++) {
     if (ssPart[t] == 0u) { continue; }
     for (var s = t * span; s < (t + 1u) * span && count < SETTLE_MAX; s++) {
-      if (atomicLoad(&fluidCalm[s]) < SEAM_CALM_TICKS) { continue; }
+      if ((atomicLoad(&fluidCalm[s]) & CALM_MASK) < SEAM_CALM_TICKS) { continue; }
       let sc = vec3<i32>(i32(s % NCHUNK), i32((s / NCHUNK) % NCHUNK),
                          i32(s / (NCHUNK * NCHUNK)));
       var clash = false;
@@ -1446,6 +1515,52 @@ fn settleScan(@builtin(local_invocation_index) li : u32) {
         atomicStore(&settleScratch[SP_COLBAD + count * 8u + q], 0u);
       }
       count += 1u;
+    }
+  }
+
+  // ---- PHASE 2: the forced picks (the backstop) ---------------------------
+  // Runs AFTER the calm picks and only fills what they left, so ordinary
+  // settling always wins the budget: forcing is the path for water that has
+  // provably stopped being able to settle on its own, not a faster lane.
+  //
+  // THE EXCLUSION IS STRICTER HERE, and it has to be. A calm block's write set
+  // is its own chunk plus SETTLE_SPILL rows, which is what makes "same (x,z)
+  // column AND within one chunk in y" sufficient above. A FORCED block's walk
+  // climbs up to SEAM_FORCE_REACH cells looking for the free surface, so it can
+  // reach any chunk in its own column — the test drops the `dw.y` term
+  // entirely and refuses to share an (x,z) column with ANY pick, forced or not.
+  var forced = 0u;
+  for (var t = 0u; t < 256u && count < SETTLE_MAX &&
+                   forced < SEAM_FORCE_BLOCKS; t++) {
+    if (ssForce[t] == 0u) { continue; }
+    for (var s = t * span; s < (t + 1u) * span && count < SETTLE_MAX &&
+                           forced < SEAM_FORCE_BLOCKS; s++) {
+      let cw = atomicLoad(&fluidCalm[s]);
+      if (SEAM_STUCK_TICKS == 0u || (cw >> 16u) < SEAM_STUCK_TICKS) { continue; }
+      // A slot the calm phase already took is settling normally this tick;
+      // leave it alone rather than converting its pick into a forced one.
+      if ((atomicLoad(&settleScratch[SP_MARK + s]) & MARK_SETTLING) != 0u) {
+        continue;
+      }
+      let sc = vec3<i32>(i32(s % NCHUNK), i32((s / NCHUNK) % NCHUNK),
+                         i32(s / (NCHUNK * NCHUNK)));
+      var clash = false;
+      for (var q = 0u; q < count; q++) {
+        let d = abs(sc - picked[q]);
+        let m = i32(NCHUNK);
+        let dw = min(d, vec3<i32>(m) - d);
+        if (dw.x == 0 && dw.z == 0) { clash = true; break; }
+      }
+      if (clash) { continue; }
+      picked[count] = sc;
+      atomicStore(&settleScratch[SP_LIST + count], s);
+      atomicStore(&settleScratch[SP_MARK + s],
+                  MARK_SETTLING | MARK_FORCED | count);
+      for (var q = 0u; q < 8u; q++) {
+        atomicStore(&settleScratch[SP_COLBAD + count * 8u + q], 0u);
+      }
+      count += 1u;
+      forced += 1u;
     }
   }
   atomicStore(&settleScratch[SP_COUNT], count);
@@ -1524,6 +1639,68 @@ fn seamSupport(c : vec3<i32>) -> bool {
 // 4 words per column, 4 KiB per workgroup.
 const SETTLE_SPILL : i32 = 8;
 const SETTLE_LEVELS : i32 = 16 + SETTLE_SPILL;   // 24
+
+// ---- WHERE a column refused, which FA_SETREFUSED cannot say ---------------
+// FA_SETREFUSED counts BLOCKS, and "infeasible" folds three unrelated
+// geometries into one number: content with no floor under it, content trapped
+// under an interior blocker, and content that ran out of column before the
+// spill ceiling. Those are opposite bugs with opposite fixes, and telling them
+// apart by turning things off costs one run per hypothesis (CLAUDE.md rule 6).
+// These two count COLUMNS, on the feasibility pass only (`rec`), which is why
+// they are not comparable to FA_SETREFUSED's block count and are labelled so.
+//
+// Declared HERE and not in common.wgsl on purpose: nothing else writes or reads
+// them from a shader, and a const added to common.wgsl re-keys every shader in
+// the engine and pays the worldgen far-compile cliff (measured 536 s). The
+// slots are common.wgsl's spare [30..31].
+const FA_SETCEIL  : u32 = 30u;  // pool left at the SPILL CEILING: no room above
+const FA_SETFLOOR : u32 = 31u;  // pool with no floor, or trapped under a blocker
+// The backstop's own two, and they are opposite outcomes: FORCED counts blocks
+// the long walk got out, SEALED counts blocks whose column was still full after
+// SEAM_FORCE_REACH cells. A rising SEALED with a flat particle count is the one
+// state this whole mechanism cannot fix, so it gets a name rather than looking
+// like "the backstop is running".
+const FA_FORCED : u32 = 32u;
+const FA_SEALED : u32 = 33u;
+
+// ---- THE FORCE-SETTLE BACKSTOP -------------------------------------------
+// Termination, as a mechanism rather than a hope. `settleColumn` walks 16 + 8
+// cells, so a SUBMERGED column has no room by construction and refuses every
+// tick forever; measured at the authored home_lake, 2,060 columns per 20 ticks
+// hitting the ceiling and 0 for any other reason, with 0 eighths ever
+// converted. These let a stuck block climb past the spill ceiling to the
+// column's free surface, which is where buried water actually belongs.
+//
+// THE AGE KEYS ON EXISTENCE, NOT ON REFUSAL, and that is the whole reason it
+// works: once submerged cells can no longer excite, a stuck block is never
+// CALM either, so it is never picked, so it is never refused — a
+// refusal-triggered counter would sit at zero while the particles sat there.
+// `sim.fluidStuckTicks` 0 disables the path (the arm for an A/B).
+const SEAM_STUCK_TICKS : u32 = u32(clamp(TUNE_FLUID_STUCK_TICKS, 0, 6000));
+const SEAM_FORCE_BLOCKS : u32 = u32(clamp(TUNE_FLUID_FORCE_BLOCKS, 0, 16));
+const SEAM_FORCE_REACH : i32 = clamp(TUNE_FLUID_FORCE_REACH, 0, 512);
+// fluidCalm packs TWO 16-bit counters: [0..15] consecutive CALM ticks (the
+// original meaning) and [16..31] the stuck AGE. One buffer, so no new binding
+// and no pass-table row changes. Both saturate rather than wrap — the calm
+// half used to be an unbounded atomicAdd, which would now carry into the age.
+const CALM_MASK : u32 = 0xFFFFu;
+const CALM_MAX : u32 = 0xFFFFu;
+// Set the CALM half, keep the AGE half. Every cooldown in settleCheck used to
+// be a bare atomicStore of a small number; with the age packed above it, a bare
+// store silently zeroes the backstop's clock and the block can never become
+// eligible for forcing — the failure would look exactly like the backstop not
+// working, with nothing pointing at the cooldown that erased it.
+fn seamSetCalm(slot : u32, calm : u32) {
+  let age = atomicLoad(&fluidCalm[slot]) >> 16u;
+  atomicStore(&fluidCalm[slot], (age << 16u) | (calm & CALM_MASK));
+}
+// The forced path's own cooldown: a SEALED column (still no room after
+// SEAM_FORCE_REACH) must not be re-walked every tick — that walk is 256 columns
+// x up to 512 cells and rule 2 does not allow paying it forever for an answer
+// that is not changing. Zeroing the age makes it re-earn SEAM_STUCK_TICKS.
+fn seamResetAge(slot : u32) {
+  atomicStore(&fluidCalm[slot], atomicLoad(&fluidCalm[slot]) & CALM_MASK);
+}
 var<workgroup> wgFill : array<u32, 768>;   // [col*3 + y/8], nibble (y%8)*4
 var<workgroup> wgBlk : array<u32, 256>;    // bit y = level y blocks flow
 // bit y = level y is BYTE-IDENTICAL to the voxel already there: this settle
@@ -1542,15 +1719,23 @@ fn wgSameAt(col : u32, y : i32) -> bool {
 }
 
 fn settleColumn(listIdx : u32, base : vec3<i32>, cx : i32, cz : i32,
-                write : bool, rec : bool, col : u32) -> bool {
+                write : bool, rec : bool, col : u32, force : bool) -> bool {
+  // THE FORCED WALK IS THE SAME WALK, ONLY TALLER. A submerged column's own 24
+  // levels are all full water, so the ordinary ceiling refusal is unavoidable
+  // there and permanent. Raising the ceiling lets the pool keep rising until it
+  // reaches a cell with room — which, in a column of standing water, is the
+  // FREE SURFACE, and that is exactly where buried mass belongs physically.
+  // Everything else about the walk is unchanged, so the all-or-nothing
+  // arithmetic that makes refusal sound still holds.
+  let yTop = 16 + SETTLE_SPILL + select(0, SEAM_FORCE_REACH, force);
   var floorOk = seamSupport(base + vec3<i32>(cx, -1, cz));
   var pool = 0u;         // eighths waiting to be placed in this segment
   var poolMatStain = 0u; // packed identity of the pooled content
-  for (var y = 0; y <= 16 + SETTLE_SPILL; y++) {
-    var blocked = y == 16 + SETTLE_SPILL;  // the spill ceiling ends the walk
+  for (var y = 0; y <= yTop; y++) {
+    var blocked = y == yTop;               // the spill ceiling ends the walk
     var w = 0u;
     var idx = PT_NO_WORD;
-    if (y < 16 + SETTLE_SPILL) {
+    if (y < yTop) {
       let c = base + vec3<i32>(cx, y, cz);
       idx = voxWordIndex(c);
       if (idx != PT_NO_WORD) { w = voxels[idx]; }
@@ -1565,7 +1750,17 @@ fn settleColumn(listIdx : u32, base : vec3<i32>, cx : i32, cz : i32,
     if (blocked) {
       if (rec && y < SETTLE_LEVELS) { wgBlk[col] |= 1u << u32(y); }
       // Close the segment: everything pooled must have been placed.
-      if (pool > 0u) { return false; }
+      if (pool > 0u) {
+        // The ceiling and an interior blocker are different diagnoses: the
+        // first says the column had no ROOM (a submerged block whose spill
+        // cells are themselves full water has none by construction), the
+        // second says the mass is trapped under something solid.
+        if (rec) {
+          if (y == yTop) { atomicAdd(&fluidArgs[FA_SETCEIL], 1u); }
+          else { atomicAdd(&fluidArgs[FA_SETFLOOR], 1u); }
+        }
+        return false;
+      }
       floorOk = true;  // content above rests on this blocker
       // A particle can end its calm life FRACTIONALLY inside a blocker (the
       // node BC stops momentum at the face, not the cell centre), which bins
@@ -1625,7 +1820,10 @@ fn settleColumn(listIdx : u32, base : vec3<i32>, cx : i32, cz : i32,
     if (write && existing > 0u) {
       atomicSub(&fluidArgs[FA_SETTLED], existing);
     }
-    if (pool > 0u && !floorOk) { return false; }
+    if (pool > 0u && !floorOk) {
+      if (rec) { atomicAdd(&fluidArgs[FA_SETFLOOR], 1u); }
+      return false;
+    }
     let place = min(pool, 8u);
     pool -= place;
     if (rec && y < SETTLE_LEVELS) {
@@ -1713,8 +1911,10 @@ fn settleCheck(@builtin(workgroup_id) wg : vec3<u32>,
   let live = wg.x < atomicLoad(&settleScratch[SP_COUNT]);
   var ci = 0u;
   var base = vec3<i32>(0, 0, 0);
+  var forced = false;
   if (live) {
     ci = atomicLoad(&settleScratch[SP_LIST + wg.x]);
+    forced = (atomicLoad(&settleScratch[SP_MARK + ci]) & MARK_FORCED) != 0u;
     let sc = vec3<i32>(vec3<u32>(ci % NCHUNK, (ci / NCHUNK) % NCHUNK,
                                  ci / (NCHUNK * NCHUNK)));
     base = slotToWorldChunk(sc, T.origin) * i32(CHUNK);
@@ -1722,7 +1922,7 @@ fn settleCheck(@builtin(workgroup_id) wg : vec3<u32>,
   let cx = i32(li & 15u);
   let cz = i32(li >> 4u);
   // ---- test 1: feasibility (and publish the resulting column) -------------
-  if (live && !settleColumn(wg.x, base, cx, cz, false, true, li)) {
+  if (live && !settleColumn(wg.x, base, cx, cz, false, true, li, forced)) {
     atomicOr(&wgBad, 1u);
   }
   workgroupBarrier();   // every column's record is now readable
@@ -1730,7 +1930,14 @@ fn settleCheck(@builtin(workgroup_id) wg : vec3<u32>,
   // ---- test 2: excite stability -------------------------------------------
   // Skipped once the block is already doomed: the answer cannot change and
   // the walk is the expensive part.
-  if (live && atomicLoad(&wgBad) == 0u) {
+  // FORCED BLOCKS SKIP THE VETO ENTIRELY. Test 2 exists to stop settle
+  // creating a configuration excite would immediately tear up again — a
+  // one-tick oscillation. A forced block is the opposite situation: its water
+  // has been stuck for SEAM_STUCK_TICKS and the whole point is to get it out.
+  // The existing asymmetry note above (settle refusing MORE than excite takes
+  // is the safe direction) is what makes this a sound exception rather than a
+  // hole: the veto is a conservatism, not an invariant.
+  if (live && !forced && atomicLoad(&wgBad) == 0u) {
     var unstable = false;
     for (var y = 0; y < SETTLE_LEVELS && !unstable; y++) {
       let full = wgFillAt(li, y);
@@ -1838,16 +2045,32 @@ fn settleCheck(@builtin(workgroup_id) wg : vec3<u32>,
     // A block that lost columns to the veto has NOT finished converting, so
     // it must not bank a fresh calm window against unchanged geometry
     // (WP3 item 3's cooldown, same halving as a full refusal).
-    atomicStore(&fluidCalm[ci], SEAM_CALM_TICKS / 2u);
+    seamSetCalm(ci, SEAM_CALM_TICKS / 2u);
+  }
+  // A forced block that got its water out. Counted separately from the calm
+  // settles because "the backstop is carrying this world" is a thing worth
+  // being able to see in one number.
+  if (live && li == 0u && forced && !infeasible) {
+    atomicAdd(&fluidArgs[FA_FORCED], 1u);
   }
   if (live && li == 0u && infeasible) {
     atomicOr(&settleScratch[SP_MARK + ci], MARK_REFUSED);
+    // A SEALED column: the forced walk climbed SEAM_FORCE_REACH cells and still
+    // found no room, so this water is inside a fully enclosed body. That is a
+    // genuinely different situation from "not settled yet" and the one case
+    // this mechanism cannot resolve, so it gets its own counter instead of
+    // hiding inside FA_SETREFUSED — and its age resets, or the expensive walk
+    // would repeat every tick against geometry that is not changing.
+    if (forced) {
+      atomicAdd(&fluidArgs[FA_SEALED], 1u);
+      seamResetAge(ci);
+    }
     // Refused blocks HALVE their calm window rather than zeroing it (WP3 item
     // 3). Zeroing made a geometrically-awkward pool re-run the full 45-tick
     // bin/check/refuse cycle forever against unchanging geometry; halving
     // keeps a real cooldown (rule 2) while still letting a block that only
     // just missed retry soon.
-    atomicStore(&fluidCalm[ci], SEAM_CALM_TICKS / 2u);
+    seamSetCalm(ci, SEAM_CALM_TICKS / 2u);
     // Two counters, because they are opposite diagnoses: INFEASIBLE means the
     // column arithmetic did not fit (geometry/coverage), UNSTABLE means it fit
     // and would have wanted to move again immediately (WP3's whole point).
@@ -1861,7 +2084,12 @@ fn settleCommit(@builtin(workgroup_id) wg : vec3<u32>,
                 @builtin(local_invocation_index) li : u32) {
   if (wg.x >= atomicLoad(&settleScratch[SP_COUNT])) { return; }
   let ci = atomicLoad(&settleScratch[SP_LIST + wg.x]);
-  if ((atomicLoad(&settleScratch[SP_MARK + ci]) & MARK_REFUSED) != 0u) { return; }
+  let mark = atomicLoad(&settleScratch[SP_MARK + ci]);
+  if ((mark & MARK_REFUSED) != 0u) { return; }
+  // MUST match what settleCheck passed, or the commit walks a different column
+  // shape than the one that was declared feasible — the two run "the identical
+  // arithmetic" and that is the whole basis of all-or-nothing refusal.
+  let forced = (mark & MARK_FORCED) != 0u;
   let sc = vec3<i32>(vec3<u32>(ci % NCHUNK, (ci / NCHUNK) % NCHUNK,
                                ci / (NCHUNK * NCHUNK)));
   let base = slotToWorldChunk(sc, T.origin) * i32(CHUNK);
@@ -1872,7 +2100,7 @@ fn settleCommit(@builtin(workgroup_id) wg : vec3<u32>,
   // why the ledger stays exact without any special case: settleKill spares
   // the same particles by the same bit.
   if (!seamColumnRefused(wg.x, li)) {
-    settleColumn(wg.x, base, cx, cz, true, false, li);
+    settleColumn(wg.x, base, cx, cz, true, false, li, forced);
   }
   if (li == 0u) { atomicStore(&fluidCalm[ci], 0u); }
 }

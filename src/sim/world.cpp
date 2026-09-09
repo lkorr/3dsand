@@ -196,9 +196,9 @@ void World::Init(const rhi::Device& device) {
   // per-species mass x3, foam — 32 MiB of per-substep scratch at 256 blocks.
   fluidGrid = CreateBuffer(device, (uint64_t)kFluidBlocks * kChunkVol * 32,
                            U::Storage, "fluidGrid");
-  // 32 u32 — the FA_* word map in common.wgsl. CopyDst: the seam relies on a
+  // The FA_* word map (kFluidArgsWords, world.h). CopyDst: the seam relies on a
   // zeroed live count after worldgen/reset (fill-cleared there).
-  fluidArgsStage = CreateBuffer(device, 128,
+  fluidArgsStage = CreateBuffer(device, kFluidArgsBytes,
                                 U::Storage | U::CopySrc | U::CopyDst,
                                 "fluidArgsStage");
   fluidDispatchArgs = CreateBuffer(device, 12, U::Indirect | U::CopyDst,
@@ -430,7 +430,7 @@ bool World::EncodeReadbacks(const rhi::Device&, const rhi::CommandEncoder& enc,
   // list. 1.3 KB per snapshot; the block list is what keeps every chunk the
   // seam may write materialized (PageTable::UpdateFluidChunks).
   enc.CopyTracked(pass::Buf::FluidArgsStage, fluidArgsStage, 0, s.buf,
-                  kFluidArgsOff, 128);
+                  kFluidArgsOff, kFluidArgsBytes);
   enc.CopyTracked(pass::Buf::FluidBlockList, fluidBlockList, 0, s.buf,
                   kFluidBlocksOff, kFluidBlocksBytes);
   enc.CopyTracked(pass::Buf::FluidMirror, fluidMirror, 0, s.buf,
@@ -608,8 +608,8 @@ void World::KickReadback() {
                 std::min(pcounts[sl.particleLivePage & 1], kParticleCap);
             // MLS-MPM fluid seam: live count, event counters, block list.
             {
-              uint32_t fa[32];
-              std::memcpy(fa, p + kFluidArgsOff, 128);
+              uint32_t fa[kFluidArgsWords];
+              std::memcpy(fa, p + kFluidArgsOff, kFluidArgsBytes);
               snap_.fluidLive = std::min(fa[7], kFluidCap);
               snap_.fluidSettledEighths = fa[10];
               snap_.fluidExcitedEighths = fa[11];

@@ -947,6 +947,27 @@ constexpr uint32_t kPtNoWord = 0xFFFFFFFFu;
 // §6). A slot is an identity only within one origin.
 constexpr uint32_t kPageFaultWords = 32;
 constexpr uint32_t kPageFaultBytes = kPageFaultWords * 4;
+
+// ---- fluidArgsStage: the FA_* word map -------------------------------------
+// The seam's counter block (common.wgsl's FA_* names, plus the two refusal-site
+// counters and the two force-settle counters declared in sim_fluid_seam.wgsl
+// itself — a const only one shader reads belongs next to its consumer, and
+// adding it to common.wgsl re-keys every shader in the engine).
+//
+// A NAMED SIZE because it USED to be the literal 128 in four places (the
+// allocation, the snapshot copy, the snapshot decode and ReadFluidArgsSync's
+// read) and the member comment still claimed "16 u32" long after the map had
+// grown to 32. Four literals and a stale comment is exactly the "two places
+// must agree" shape that goes wrong silently: a shader writing past the end
+// scribbles on whatever the allocator put next.
+constexpr uint32_t kFluidArgsWords = 40;
+constexpr uint32_t kFluidArgsBytes = kFluidArgsWords * 4;
+// The snapshot ring gives this block a fixed 256-byte slot (kFluidArgsOff ..
+// kFluidBlocksOff in world.cpp). Growing the map past that would silently
+// overwrite the block list that follows it.
+static_assert(kFluidArgsBytes <= 256,
+              "fluidArgs no longer fits its snapshot-ring slot; widen the "
+              "gap between kFluidArgsOff and kFluidBlocksOff first");
 // Where the per-kernel tally starts inside the record. Mirrored in
 // common.wgsl's voxStore as PT_FAULT_KBASE — the one place a WGSL constant for
 // it would have to be threaded through the prelude for no other reader.
@@ -2837,7 +2858,7 @@ class World {
   rhi::Buffer fluidBlockList;    // kFluidBlocks u32: blockIdx -> chunk slot
   rhi::Buffer fluidGrid;         // kFluidBlocks * 4096 nodes * 8 i32 (mass,
                                  // mom xyz, species mass x3, foam — FLUID_GW)
-  rhi::Buffer fluidArgsStage;    // 16 u32 — the FA_* word map in common.wgsl:
+  rhi::Buffer fluidArgsStage;    // kFluidArgsWords u32 — the FA_* word map:
                                  // node args + live count + event counters
   rhi::Buffer fluidDispatchArgs; // 3 u32, indirect-only (see dispatchArgs note)
   rhi::Buffer fluidPDispatchArgs; // 3 u32, indirect-only: per-particle passes

@@ -251,6 +251,10 @@ const FLUID_MASS_MIN : i32 = 16;
 // whole mechanism out and restores WP4's pass-through behaviour exactly.
 const FLUID_SETTLED_Q8 : i32 =
     i32(round(clamp(TUNE_FLUID_SETTLED_MASS, 0.0, 2.0) * 256.0));
+// "Ride the surface": does SUBMERGED settled liquid act as a boundary? See the
+// long block at fluidSolid. 0 restores the pass-through behaviour, which is the
+// control arm for `--sweep sim.fluidSubmergedSolid=0,1`.
+const FLUID_SUBMERGED_SOLID : i32 = clamp(TUNE_FLUID_SUBMERGED_SOLID, 0, 1);
 // Gravity, EOS (stiffness / rest density / power / cohesion), the species
 // attraction pair, viscosity and damping all come from tuning (sim.* —
 // integer, F5-reloadable, the "fluid" rows of tuning_params.def). LoadTuning
@@ -333,10 +337,57 @@ fn nodeWordBase(bm : u32, nc : vec3<i32>) -> u32 {
 // seedSettledMass below gives it. Out-of-window is solid and inert.
 fn fluidSolid(c : vec3<i32>) -> bool {
   if (!inWindow(c, T.origin)) { return true; }
-  let mat = voxMat(voxWordAt(c));
+  let w = voxWordAt(c);
+  let mat = voxMat(w);
   if (mat == MAT_AIR) { return false; }
   let k = materials[mat].klass;
-  return k == CLASS_SOLID || k == CLASS_POWDER;
+  if (k == CLASS_SOLID || k == CLASS_POWDER) { return true; }
+  // ---- RIDE THE SURFACE (sim.fluidSubmergedSolid) -------------------------
+  //
+  // SUBMERGED liquid is a floor; free-surface liquid is not. The block above
+  // says a settled liquid stops a particle by WEIGHING something, and that is
+  // true at the interface — seedSettledMass puts a density step there and the
+  // EOS pushes back. It is not true one cell down: the seeded field is a flat
+  // `rest` with no depth profile, so it has no gradient, so a particle that
+  // arrives with downward momentum punches through the step and then free-falls
+  // through water the solver cannot see. Meanwhile the excite path DOES model
+  // depth (SEAM_HYDRO pre-compresses J), so the particle believes it is denser
+  // than its surroundings. The two halves disagree and the particle sinks.
+  //
+  // WHY THIS AND NOT A HYDROSTATIC SEED. Real buoyancy needs rho to rise with
+  // depth, which needs a per-cell depth field the solver can read every
+  // substep. None exists — the only depth in the engine is 4 bits of excite
+  // scratch, capped at 15 cells and alive for one tick. A one-way floor costs
+  // one voxel read and gets the property that actually matters.
+  //
+  // WHY IT IS THE TERMINATION FIX and not a cosmetic one: settleColumn can only
+  // place water where there is room, and a submerged column has none by
+  // construction. So a buried particle is unsettleable, permanently. Keeping
+  // particles at the free surface — where there IS room above — is what makes
+  // settle able to finish at all. Measured without it: the force-settle
+  // backstop returns 3,743 eighths to the surface per 20 ticks and excite takes
+  // 4,862 straight back, so the population pins at its ceiling forever and the
+  // settled-world tick goes 0.52 -> 6.28 ms.
+  //
+  // INTERIOR, NOT MERELY FULL: the cell must be full AND have its own liquid
+  // continuing above it. That is the same "submerged water is FULL water"
+  // predicate ab6ce9c gave the CA's levelling stages and canFlowAnywhere, and
+  // that exciteDetect now shares — this is its fifth place, and they must agree
+  // or water is a floor to one system and empty space to another.
+  //
+  // A splash therefore lands ON the pool and spreads instead of plunging
+  // through it (the owner's call, this session). Particles already inside when
+  // the rule turns on are handled by the back-projection below — it reverts and
+  // zeroes velocity, so they go CALM, which is exactly what lets the seam's
+  // force-settle backstop pick them up and drain them.
+  if (FLUID_SUBMERGED_SOLID != 0 && k == CLASS_LIQUID &&
+      voxState(w) + 1u >= 8u) {
+    let above = c + vec3<i32>(0, 1, 0);
+    if (inWindow(above, T.origin) && voxMat(voxWordAt(above)) == mat) {
+      return true;
+    }
+  }
+  return false;
 }
 
 // The live particle population is GPU-OWNED now (the seam's compaction /

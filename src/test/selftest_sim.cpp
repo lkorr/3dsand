@@ -151,6 +151,8 @@ Status GateSleep(Ctx& c, std::string& detail) {
 // Includes an explosion: every ejected particle must reinsert and die.
 uint32_t sleepActive = 0;
 uint32_t particlesLeft = 0;
+uint32_t faLive1 = 0;  // MLS-MPM particles still alive; read below, verdict at the end
+uint32_t particlesEnd = 0;  // ejecta re-read AFTER the quiet window (see below)
 int settled = 0;  // tick at which the world went quiet (or the cap)
 {
   SubmitWorldgen(ctx, world, sim, kDefaultSeed);
@@ -165,7 +167,20 @@ int settled = 0;  // tick at which the world went quiet (or the cap)
   for (int i = 0; i < 3000; i++) {
     std::vector<ExplosionOp> exps;
     if (i == 30) exps.push_back({110, 76, 110, 12, 350, 0, 0, 0});  // wood slab
-    bool pactive = i >= 30 && i < 460;
+    // A FIXTURE THAT OUTLASTS WHAT IT MEASURES. This used to close at i < 460,
+    // which was fine while the world settled in ~500 ticks: the explosion at 30
+    // threw ejecta, the window covered their flight, and they were all dead
+    // before it shut. The MPM seam now sheds splash droplets throughout
+    // settling, and settling can run to the 3000-tick cap — so droplets emitted
+    // after 460 were never stepped again and therefore could never die. The
+    // gate reported 262,144 particles alive (exactly kParticleCap) and blamed
+    // the engine for a pool the FIXTURE had frozen.
+    //
+    // Still a pure function of the tick, which is the determinism requirement
+    // this flag carries (see SelftestParticlesActive and the note in
+    // simulation.h): the caller must derive it only from tick-deterministic
+    // inputs, and "have we reached tick 30" is one.
+    bool pactive = i >= 30;
     SubmitTick(ctx, world, sim, ++t, kDefaultSeed, {}, exps, {}, false, {8, 3, 8},
                false, pactive);
     if (i >= 500 && i % 100 == 0) {
@@ -185,6 +200,80 @@ int settled = 0;  // tick at which the world went quiet (or the cap)
                false, false);
   ctx.WaitIdle();
   std::printf("sim settled: %.3f ms/tick\n", (NowSeconds() - s0) * 1000.0 / 100.0);
+
+  // ---- THE MPM HALF OF "SETTLED", WHICH THIS GATE NEVER LOOKED AT --------
+  //
+  // `particlesLeft` above reads world.particleCounts — the EJECTA/debris
+  // system. The MLS-MPM water particles live in world.fluidArgsStage and had
+  // no assertion anywhere in the suite, which is how a lake could hold ~7,700
+  // of them alive forever while this gate printed "0 particles alive" and
+  // PASSED. Measured 2026-09-08 by `--perf --scenario idle`: activeChunks 0
+  // (so ab6ce9c's CA fix is genuinely working) and fluidLive 7,680 flat for
+  // 240 ticks, costing 3.7 ms/frame of solver that rule 2 says must sleep.
+  //
+  // WHY A PROBE WINDOW AND NOT ONE READ. FA_LIVE is state, but every settle
+  // counter is ZEROED per tick (seam_fill_settle), so a single sample says
+  // nothing about a steady state. Twenty ticks with a read after each turns
+  // "nothing settled" into WHICH of the three opposite causes it was:
+  //   blocks 0                  -> never went calm (settleJudge/settleScan)
+  //   blocks > 0, refused high  -> column arithmetic did not fit (geometry)
+  //   blocks > 0, unstable high -> settleCheck's excite-stability veto
+  //   settled > 0, live flat    -> converting and being re-excited (a loop)
+  // That is the whole ladder, bought in one run instead of one hypothesis per
+  // run (CLAUDE.md "When to run what", rule 6).
+  // Slot indices are common.wgsl's FA_* map, spelled as raw subscripts with the
+  // name in a comment because that is how every other fluid gate reads this
+  // buffer (selftest_ca.cpp:471, selftest_water.cpp:1008) — one convention,
+  // not a fourth mirror of the same table.
+  uint32_t faLive0 = 0;
+  uint64_t faBlocks = 0, faRefused = 0, faUnstable = 0, faSettled = 0,
+           faExcited = 0, faExSeen = 0, faExCandid = 0, faCeil = 0, faFloor = 0,
+           faForced = 0, faSealed = 0;
+  {
+    uint32_t fa[kFluidArgsWords] = {};  // ReadFluidArgsSync fills the whole map
+    ReadFluidArgsSync(ctx, world, fa);
+    faLive0 = fa[7];                    // FA_LIVE
+    for (int i = 0; i < 20; i++) {
+      SubmitTick(ctx, world, sim, ++t, kDefaultSeed, {}, {}, {}, false,
+                 {8, 3, 8}, false, false);
+      ctx.WaitIdle();
+      ReadFluidArgsSync(ctx, world, fa);
+      faBlocks += fa[13];               // FA_SETBLOCKS
+      faRefused += fa[25];              // FA_SETREFUSED
+      faUnstable += fa[26];             // FA_SETUNSTABLE
+      faSettled += fa[10];              // FA_SETTLED
+      faExcited += fa[11];              // FA_EXCITED
+      faExSeen += fa[27];               // FA_EXSEEN
+      faExCandid += fa[28];             // FA_EXCANDID
+      faCeil += fa[30];                 // FA_SETCEIL  (sim_fluid_seam.wgsl)
+      faFloor += fa[31];                // FA_SETFLOOR (sim_fluid_seam.wgsl)
+      faForced += fa[32];               // FA_FORCED   (sim_fluid_seam.wgsl)
+      faSealed += fa[33];               // FA_SEALED   (sim_fluid_seam.wgsl)
+    }
+    faLive1 = fa[7];                    // FA_LIVE
+  }
+  // THE EJECTA COUNT, RE-READ AT THE END. `particlesLeft` above is sampled the
+  // instant the settle loop exits, which is the WRONG MOMENT for a claim about
+  // a settled world: a busy settle leaves a backlog of splash droplets that the
+  // next hundred ticks retire perfectly well, and reading it early cannot tell
+  // that backlog apart from a leak. The verdict uses this one; the early value
+  // is kept and printed beside it because the DIFFERENCE is the diagnosis.
+  {
+    uint32_t counts2[2] = {};
+    ReadCountsSync(ctx, world, counts2);
+    particlesEnd = std::min(counts2[sim.Page()], kParticleCap);
+  }
+  std::printf("sleep: MPM %u -> %u particles over 20 quiet ticks | picked %llu "
+              "blocks, refused %llu infeasible (columns: %llu no-room-at-ceiling, "
+              "%llu no-floor/trapped), %llu unstable | forced %llu, sealed %llu"
+              " | settled %llu eighths, excited %llu (seen %llu, candidates "
+              "%llu)\n",
+              faLive0, faLive1, (unsigned long long)faBlocks,
+              (unsigned long long)faRefused, (unsigned long long)faCeil,
+              (unsigned long long)faFloor, (unsigned long long)faUnstable,
+              (unsigned long long)faForced, (unsigned long long)faSealed,
+              (unsigned long long)faSettled, (unsigned long long)faExcited,
+              (unsigned long long)faExSeen, (unsigned long long)faExCandid);
 
   rhi::Buffer staging = CreateBuffer(ctx.device, kNumChunks * 4,
                                       rhi::BufferUsage::MapRead | rhi::BufferUsage::CopyDst,
@@ -313,11 +402,17 @@ std::printf("sleep: hydrostatic at the tarn: %llu of %llu submerged liquid "
             "cells are PARTIAL\n",
             (unsigned long long)subPartial, (unsigned long long)subTotal);
 
-bool sleepOk = sleepActive < 32 && particlesLeft == 0;
-std::printf("sleep: %s (%u / %u chunks active, %u particles alive, quiet "
-            "after ~%d settle ticks, %llu/%llu submerged cells partial)\n",
-            sleepOk ? "PASS" : "FAIL", sleepActive, kNumChunks, particlesLeft,
-            settled, (unsigned long long)subPartial,
+// THREE conditions now, and the third is the one this gate was missing: the
+// MPM population must reach zero, not merely stop growing. Rule 2 is about
+// COST, and a settled world that still holds particles pays the whole 9-substep
+// solver table every tick forever (measured 3.7 ms/frame at the authored
+// home_lake). `particlesLeft` is the EJECTA system; `faLive1` is the water.
+bool sleepOk = sleepActive < 32 && particlesEnd == 0 && faLive1 == 0;
+std::printf("sleep: %s (%u / %u chunks active, %u particles alive (%u at "
+            "settle), %u MPM particles alive, quiet after ~%d settle ticks, "
+            "%llu/%llu submerged cells partial)\n",
+            sleepOk ? "PASS" : "FAIL", sleepActive, kNumChunks, particlesEnd,
+            particlesLeft, faLive1, settled, (unsigned long long)subPartial,
             (unsigned long long)subTotal);
 
   // Verdict: the flag the moved body already computed.

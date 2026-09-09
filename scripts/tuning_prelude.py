@@ -402,10 +402,14 @@ SPEC = [
     ("sim", "fluidExcitePerch", "TUNE_FLUID_EXCITE_PERCH", "i", 0),
     ("sim", "fluidExciteStep", "TUNE_FLUID_EXCITE_STEP", "i", 2),
     ("sim", "fluidSettledMass", "TUNE_FLUID_SETTLED_MASS", "f", 1.0),
+    ("sim", "fluidSubmergedSolid", "TUNE_FLUID_SUBMERGED_SOLID", "i", 1),
     ("sim", "fluidSettleEps", "TUNE_FLUID_SETTLE_EPS", "f", 6.0),
     ("sim", "fluidWakeSpeed", "TUNE_FLUID_WAKE_SPEED", "f", 24.0),
     ("sim", "fluidSettleTicks", "TUNE_FLUID_SETTLE_TICKS", "i", 24),
     ("sim", "fluidStainRate", "TUNE_FLUID_STAIN_RATE", "f", 8.0),
+    ("sim", "fluidStuckTicks", "TUNE_FLUID_STUCK_TICKS", "i", 96),
+    ("sim", "fluidForceBlocks", "TUNE_FLUID_FORCE_BLOCKS", "i", 4),
+    ("sim", "fluidForceReach", "TUNE_FLUID_FORCE_REACH", "i", 64),
 
     # WATER BODIES (docs/PLAN_water_master.md, M1)
     ("sim", "waterBodyMode", "TUNE_WATER_BODY_MODE", "i", 0),
