@@ -53,6 +53,7 @@
   "gasLeaveSheetMax": "8",
   "gasLeaveFirstTick": "100",
   "gasLeaveProbeTick": "200",
+  "gasLeaveSplatTick": "20",
   "gasReenterParcels": "256",
   "gasReenterTicks": "20",
   "gasReenterMinLanded": "128",

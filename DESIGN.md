@@ -914,7 +914,7 @@ reaction system.
   `A(GasOuter)`.
 - **The byte became a u16** for this: 192/512 = 37.5% full was a ceiling nobody
   saw while the box only held distant parcels, and a crossfade INTO it would
-  have thinned every dense plume exactly at the seam.
+  have thinned every dense plume exactly at the seam. Measured by `gas-leave`: the in-window splat reaches **204 in a single 0.8 m cell** twenty ticks after a 4,096-voxel puff, so the byte's 192 guard was not a theoretical ceiling -- it clips this fixture.
 - **The weight is the max-norm distance from the WINDOW CENTRE**, smoothstepped
   from `render.gasBlendStart` × 25.6 m to 25.6 m. The centre and not the camera:
   the max-norm distance is exactly the half-extent at every point of all six
@@ -942,6 +942,15 @@ reaction system.
   or goes out.
 - **Measured cost:** raymarch fragment register count 168 → 168, no spills,
   binary +0.18%; the CA's `step` kernel 56 → 56 registers, binary +0.11%.
+- **Both live wires are ASSERTED, not argued.** `gas-leave` now fails if the
+  render flag never arms over a 400-tick run with a live plume (it is on for
+  320 of them) and if `gasOuter` is empty INSIDE the window at t20 with the
+  whole plume still in it (sum 3,437, max 204). Either zero leaves every other
+  number in that gate untouched and simply turns the crossfade off, which is
+  the definition of a thing that needs its own assertion. The in-window probe
+  is deliberately EARLY: at the main t200 probe this fixture's plume has
+  entirely left through the ceiling, and the first version read 0 there and
+  reported a dead splat on a run where it had worked for a hundred ticks.
 - **Known and not repaired:** the coarse contribution still does not feed
   `gasHalfT` or `fireGlow`. Stage 1's argument for that was geometric (every
   coarse voxel-length was beyond the window exit); stage 1b's band is inside the

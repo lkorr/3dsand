@@ -1600,6 +1600,37 @@ def check_gas_consts():
                     f"{want} -- a cap raised on one side only is a buffer "
                     f"overrun the GPU will not report")
 
+    # ---- the gas DIRTY-REASON bits ------------------------------------
+    # world.h's kDirtyReasonName is a positional table -- the bit is the row
+    # index -- and world.h's kDirtyGasMask is built from it BY NAME, which
+    # catches a rename but not a renumber. The renumber is the one that
+    # matters: kDirtyGasMask is what arms the renderer's "gas may be present"
+    # flag (RenderParams bit 3), so a DIRTY_M_GAS* constant moved in
+    # sim_step.wgsl without a matching row inserted here turns the whole
+    # voxel->parcel crossfade off in every frame, silently, with every gate
+    # still green.
+    names = re.findall(r'"([^"]*)"', wh.split("kDirtyReasonName")[1]
+                       .split("};")[0])
+    for wgsl_name, row in (("DIRTY_M_GAS", "gas"),
+                           ("DIRTY_M_GASLAT", "gas-lat"),
+                           ("DIRTY_M_GASEDGE", "gas-edge")):
+        got = wgsl(step, wgsl_name)
+        if got is None:
+            problems.append(f"gas: sim_step.wgsl does not declare {wgsl_name}")
+            continue
+        if row not in names:
+            problems.append(
+                f"gas: world.h kDirtyReasonName has no {row!r} row, so "
+                f"kDirtyGasMask cannot name {wgsl_name}")
+            continue
+        want = 1 << names.index(row)
+        if got != want:
+            problems.append(
+                f"gas: sim_step.wgsl {wgsl_name} = {got} but world.h's "
+                f"kDirtyReasonName puts {row!r} at bit {names.index(row)} "
+                f"({want}) -- kDirtyGasMask is built from that index, and a "
+                f"mismatch leaves the render crossfade permanently off")
+
     # The gasSpawn header word indices, which BOTH shaders and the C++ readback
     # index into. sim_step writes words 0..2, sim_gas writes 3..8, and
     # World::EncodeReadbacks folds the lot into the snapshot BY OFFSET -- so a

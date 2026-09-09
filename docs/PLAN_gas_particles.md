@@ -27,7 +27,8 @@ untouched, `determinism` hash unmoved at `9bfed213`:
 1. `gasOuter`'s cell went from a BYTE to a u16 (4 MiB). A byte capped a 0.8 m
    cell at 192/512 = 37.5% full, invisible while the box held only distant
    parcels and a visible thinning the moment a dense in-window plume crossfaded
-   into it.
+   into it. Measured by `gas-leave`: the in-window splat reaches **204 in one
+   cell** twenty ticks after the 4,096-voxel puff, so 192 clips this fixture.
 2. The CA splats every in-window gas VOXEL into the same box, once per tick
    (`sim_step.wgsl` `gasOuterSplat`, `simBGL_` binding 34, `A(GasOuter)` on the
    `ca` row). Without this there is nothing on the coarse side to fade IN.
@@ -39,6 +40,11 @@ untouched, `determinism` hash unmoved at `9bfed213`:
    with its own step budget covering the same shell and now runs for rays that
    HIT inside the window. RenderParams bit 3 keeps the whole path at zero cost
    in a world with no gas.
+
+`gas-leave` grew two hard assertions for the two things that would otherwise
+turn the whole crossfade off with every other number still green: the render
+flag must arm (320/400 ticks) and `gasOuter` must be non-empty INSIDE the
+window at `gasLeaveSplatTick` (sum 3,437, max 204).
 
 DESIGN.md §5 "Stage 1b" has the full argument. Known and stated rather than
 solved: gas in a SLEEPING chunk is not visited by the CA and so is not splatted

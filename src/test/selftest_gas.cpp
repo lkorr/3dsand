@@ -51,6 +51,7 @@
 #include <vector>
 
 #include "gpu/resources.h"
+#include "sim/renderspec.h"
 #include "sim/tuning.h"
 #include "sim/wind.h"
 #include "test/selftest.h"
@@ -164,6 +165,22 @@ struct LeaveRun {
   // finding now.
   uint32_t skipWithParcels = 0, skipFirstTick = 0, skipParcelsThere = 0;
   uint32_t quietWithParcels = 0;
+  // ---- stage 1b: the crossfade's two live wires ---------------------------
+  // Both of these are things the render path needs and that NOTHING ELSE in
+  // this gate would notice the absence of -- a broken latch or a dead splat
+  // leaves every number above untouched and simply turns the crossfade off.
+  //
+  // renderFlagTicks: ticks on which Simulation::EncodeTick published the
+  // "gas may be present" flag (RenderParams bit 3). Zero means the flag never
+  // arms and the whole of the crossfade is dead code in every frame.
+  //
+  // outerInWindow: gasOuter's content INSIDE the window, which only the CA's
+  // gasOuterSplat can put there (a parcel only exists outside). Zero means the
+  // coarse side has nothing for the voxels to fade INTO, which is exactly the
+  // hard edge stage 1b exists to remove.
+  uint32_t renderFlagTicks = 0;
+  uint64_t outerInWindow = 0;
+  uint32_t outerInWindowMax = 0;
 };
 
 Status GateGasLeave(Ctx& c, std::string& detail) {
@@ -182,6 +199,7 @@ Status GateGasLeave(Ctx& c, std::string& detail) {
   const uint32_t sheetTick = (uint32_t)BaselineNumber("gasLeaveSheetTick", 150);
   const uint32_t firstTick = (uint32_t)BaselineNumber("gasLeaveFirstTick", 100);
   const uint32_t probeTick = (uint32_t)BaselineNumber("gasLeaveProbeTick", 200);
+  const uint32_t splatTick = (uint32_t)BaselineNumber("gasLeaveSplatTick", 20);
   const uint32_t ticks = (uint32_t)BaselineNumber("gasLeaveTicks", 400);
 
   const IVec3 wo = world.WindowOrigin();
@@ -237,6 +255,8 @@ Status GateGasLeave(Ctx& c, std::string& detail) {
       }
       if (sn.valid && sn.activeChunks == 0 && sn.gasCount > 0)
         r.quietWithParcels++;
+      // A CPU-side latch read, same cost and same class as CaSkipped() above.
+      if (sandvox::GasRenderActive()) r.renderFlagTicks++;
       if (sn.valid && r.series.find(sn.tick) == r.series.end()) {
         Sample s;
         s.live = sn.gasCount;
@@ -266,6 +286,31 @@ Status GateGasLeave(Ctx& c, std::string& detail) {
       // half of the twice-run comparison and a value only one arm measures
       // cannot be compared. The other three are arm 0's alone; a readback
       // cannot change what the sim does, so the control does not need them.
+      // ---- THE CA SPLAT PROBE, and it is EARLY on purpose --------------
+      // gasOuter's content INSIDE the window can only have been put there by
+      // sim_step's gasOuterSplat: a parcel exists only outside. But it has to
+      // be read while there IS in-window smoke, and by the main probe at t200
+      // this fixture's plume has entirely left through the ceiling -- the
+      // first version of this check read 0 there and reported a dead splat on
+      // a run in which it had worked perfectly for a hundred ticks. The puff
+      // lands at t2 and rises about a voxel a tick from 96 below the face, so
+      // t20 is deep inside the window with the whole plume still in it.
+      //
+      // Arm 0 only, and a segment boundary like the probe below: a readback
+      // cannot change what the sim does, so the control does not need it.
+      if (i == splatTick && arm == 0) {
+        ctx.WaitIdle();
+        ctx.ProcessEvents();
+        uint32_t bandMax = 0, aboveMax = 0;
+        uint64_t bandSum = 0, aboveSum = 0;
+        // A difference of two "above Y" folds, because that is the reader that
+        // exists. Both Y values are whole multiples of the cell size from the
+        // box origin, so no cell is split between the two halves.
+        ReadGasOuterAboveSync(ctx, world, fy0, &bandMax, &bandSum);
+        ReadGasOuterAboveSync(ctx, world, topY, &aboveMax, &aboveSum);
+        r.outerInWindow = bandSum - aboveSum;
+        r.outerInWindowMax = bandMax;
+      }
       if (i == probeTick) {
         ctx.WaitIdle();
         ctx.ProcessEvents();
@@ -402,11 +447,19 @@ Status GateGasLeave(Ctx& c, std::string& detail) {
       a.skipWithParcels, a.skipFirstTick, a.skipParcelsThere,
       a.quietWithParcels);
 
+  // Stage 1b's two live wires (see LeaveRun). Both are hard asserts and not
+  // reports: neither is latent, neither is a threshold, and a zero in either
+  // means the crossfade is not running at all.
+  const bool flagOk = a.renderFlagTicks > 0;
+  const bool splatOk = a.outerInWindow > 0;
+
   detail = Format(
       "top chunk plane t%u: %u awake (max %u) | edge hits %llu, converted %llu "
       "| parcels %u by t%u, peak %u, %u left at t%u | above the window t%u: %u "
       "(GPU) / %u (page walk, of %u live) | gasOuter above the top: max %u, "
-      "sum %llu | refusals %llu list + %llu pool over %u/%u snapshot ticks | "
+      "sum %llu | in-window at t%u: sum %llu max %u (the CA splat) | render "
+      "flag on %u/%u ticks | refusals %llu list + %llu pool over %u/%u "
+      "snapshot ticks | "
       "twice-run %s over %u hashed ticks, digest at t%u %08x vs %08x over %u "
       "vs %u live parcels, live at t%u %u vs %u | paged "
       "vs dense is a --residency arm, not a gate arm (see the file comment)",
@@ -414,6 +467,8 @@ Status GateGasLeave(Ctx& c, std::string& detail) {
       (unsigned long long)a.accepted, liveByFirst, firstTick, a.peakLive,
       a.liveEnd, ticks, probeTick, aboveSnap, a.aboveProbe, a.liveProbe,
       a.outerMax, (unsigned long long)a.outerSum,
+      splatTick, (unsigned long long)a.outerInWindow, a.outerInWindowMax,
+      a.renderFlagTicks, ticks,
       (unsigned long long)(a.refused + b.refused),
       (unsigned long long)(a.poolFull + b.poolFull), a.coverage, ticks,
       stable ? "identical" : "DIVERGED", compared, probeTick, a.digestProbe,
@@ -435,6 +490,17 @@ Status GateGasLeave(Ctx& c, std::string& detail) {
                      riseAt, risePrev, riseNow, rises, lastEmit);
   if (!aboveOk) detail += " -- nothing is above the window top";
   if (!outerOk) detail += " -- gasOuter is empty above the window top";
+  if (!flagOk)
+    detail +=
+        " -- the gas RENDER flag never armed: RenderParams bit 3 is off on "
+        "every tick of a run with a live plume, so the whole crossfade is dead "
+        "code (Simulation::EncodeTick / renderspec.h)";
+  if (!splatOk)
+    detail +=
+        Format(" -- gasOuter is EMPTY inside the window at t%u, with the "
+               "whole plume still in it: the CA's gasOuterSplat put nothing "
+               "there, so the voxels have nothing to crossfade into and the "
+               "window face is a hard edge again", splatTick);
   if (!noRefusals)
     detail +=
         " -- spawn refusals are NONZERO: which voxel is refused is decided by "
@@ -444,7 +510,7 @@ Status GateGasLeave(Ctx& c, std::string& detail) {
                          : " -- the gas digest / population did not reproduce";
 
   const bool ok = sheetOk && reachedEdge && spawned && monotone && aboveOk &&
-                  outerOk && noRefusals && stable;
+                  outerOk && noRefusals && stable && flagOk && splatOk;
   std::printf("gas-leave: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
 
   // Leave the world as it was found: the gates after this one place fixtures on
