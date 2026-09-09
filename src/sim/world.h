@@ -396,6 +396,12 @@ constexpr uint32_t kClaimSize = 262144;
 //
 // Must match the GAS_* block in assets/shaders/sim_gas.wgsl (and GAS_SPAWN_CAP
 // in sim_step.wgsl); scripts/check_invariants.py compares them.
+// sim.gasMode. Two states, and the names say what each PROMISES rather than
+// what it switches: at Wall the edge behaves as it did before stage 1 and no
+// gas pass is recorded, so the feature cannot be seen at all.
+constexpr uint32_t kGasModeWall = 0;
+constexpr uint32_t kGasModeSink = 1;
+
 constexpr uint32_t kGasParticleCap = 262144;   // 8 MiB per page, 16 MiB paired
 // 65,536 and not the 8,192 this shipped with for one afternoon, and the reason
 // is RULE 1 rather than throughput. `gasLeave` charges a shared atomicAdd
@@ -1108,7 +1114,7 @@ constexpr uint32_t kPtNoWord = 0xFFFFFFFFu;
 //   [17]     first fault: the in-chunk local index
 //   [18]     LAST fault: the page-table entry (racy store)
 //   [19]     reserved
-//   [20..31] per-kernel fault tally, indexed by PT_K_*
+//   [20..32] per-kernel fault tally, indexed by PT_K_*
 //
 // [16]/[18] are what separate a FREED page (PT_EMPTY) from a DEMOTED one
 // (UNIFORM / JITTER): the first is the hysteresis free path, the second is
@@ -1120,7 +1126,12 @@ constexpr uint32_t kPtNoWord = 0xFFFFFFFFu;
 // origin names a chunk that has nothing to do with the fault. That decode cost
 // an hour of chasing chunks nothing had touched (RESEARCH_streaming_hitch.md
 // §6). A slot is an identity only within one origin.
-constexpr uint32_t kPageFaultWords = 32;
+// 40, not 32: the per-kernel tally starts at word 20 and is PT_K_COUNT wide,
+// and PT_K_COUNT went 12 -> 13 when sim_gas.wgsl got its own bank. At 32 the
+// gas kernel's counter would have been word 32 — one past the end — which the
+// GPU would have written into whatever followed the buffer without a word of
+// complaint. Sized with headroom for the same reason kMaxUses is.
+constexpr uint32_t kPageFaultWords = 40;
 constexpr uint32_t kPageFaultBytes = kPageFaultWords * 4;
 
 // ---- fluidArgsStage: the FA_* word map -------------------------------------
@@ -2022,7 +2033,14 @@ struct TickParams {
   // the hash. See DESIGN.md §9c.
   uint32_t currentMode = 0;
   uint32_t currentPrimCount = 0;
-  uint32_t padCp0 = 0, padCp1 = 0;
+  // sim.gasMode (docs/PLAN_gas_particles.md). 0 = the residency edge is a
+  // WALL, 1 = a SINK. Read CPU-side per tick like windMode and dayPhase, so it
+  // is part of the tick input stream a replay reproduces and the twice-run
+  // determinism gate compares. It was the padCp0 pad word, so the struct
+  // layout — which check_invariants.py compares against common.wgsl on TOTAL
+  // SIZE — is unchanged.
+  uint32_t gasMode = 1;
+  uint32_t padCp1 = 0;
   int32_t currentPrimLo[3] = {1, 1, 1};   // union AABB, inclusive world cells
   int32_t padCp2 = 0;                     // (lo > hi = no primitives)
   int32_t currentPrimHi[3] = {0, 0, 0};

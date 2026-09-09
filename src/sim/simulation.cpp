@@ -2166,7 +2166,22 @@ void Simulation::NoteSnapshot(uint32_t snapTick, uint32_t activeChunks,
   // the safe direction, and it is bounded in practice: the counts are zeroed
   // per tick while the particle pipeline runs, so the population genuinely
   // reaches 0 a couple of ticks after the last particle dies and stays there.
-  if (activeChunks != 0 || particleCount != 0) {
+  //
+  // GAS PARCELS COUNT HERE TOO, and the omission was a real hole rather than a
+  // tidiness point. A parcel outside the residency window is a GPU-side dirty
+  // writer with no CPU-known target in exactly the sense fact (3) describes:
+  // `gasResolve` can land it as a voxel through the claim path and dirty that
+  // chunk, on a tick the CPU had proved settled. The landing is not LOST — the
+  // gas rows are recorded under their own condition and the mark reaches
+  // dirtyOut — but the chunk would then be simulated a tick or two late,
+  // whenever the snapshot ring got around to reporting it, and "how late"
+  // depends on readback scheduling. That is a scheduling-dependent outcome
+  // (rule 1), and it is the same argument that put `particleCount` in this
+  // conjunct in the first place.
+  //
+  // `gasLive_` is the snapshot's parcel count, so it is stale in the same
+  // bounded way `particleCount` is, and staleness can only COST a skip.
+  if (activeChunks != 0 || particleCount != 0 || gasLive_ != 0) {
     settledProven_ = false;
     return;
   }
@@ -2263,9 +2278,15 @@ void Simulation::EncodeTick(const rhi::CommandEncoder& enc, uint32_t opsCount,
   // settled world with a fan pointed at a dune would otherwise prove itself
   // idle and skip the CA rows the wake had just made necessary — the fan would
   // mark chunks nothing then simulated.
+  // gasSpawnsThisTick_ is in the disjunction for windWakeCount's reason: a
+  // CPU-authored gas parcel IS a chunk-dirtying input, because it can re-enter
+  // the window and land as a voxel. gasLeave conversions are deliberately NOT
+  // here and do not need to be — a voxel can only reach the edge on a tick the
+  // CA ran, and the CA running already means this world was not proved idle.
   const bool inputsThisTick = opsCount > 0 || expCount > 0 || cellCount > 0 ||
                               spawnCount > 0 || windWakeCount > 0 ||
-                              fluidCount > 0 || fluidSpawnCount > 0;
+                              fluidCount > 0 || fluidSpawnCount > 0 ||
+                              gasSpawnsThisTick_ > 0;
   if (inputsThisTick) {
     lastDirtyTick_ = curTick_;
     settledProven_ = false;
@@ -2306,8 +2327,16 @@ void Simulation::EncodeTick(const rhi::CommandEncoder& enc, uint32_t opsCount,
   } else if (gasIdleTicks_ < kGasIdleTicks) {
     gasIdleTicks_++;
   }
-  cx.gasActive = cx.caActive || gasSpawnsThisTick_ > 0 || gasLive_ > 0 ||
-                 gasIdleTicks_ < kGasIdleTicks;
+  // sim.gasMode 0 is an EXACT off switch, not a cheap path: no gas row is
+  // recorded at all, so the buffers are never cleared, the passes never
+  // dispatch, and the only remaining gas code in the build is a branch in the
+  // CA that tests this same value. Read from CurrentTuning() here rather than
+  // passed in, for the openness/glow budgets' reason — it is a KNOB, not a
+  // count of this tick's work, and every caller of EncodeTick would otherwise
+  // have to forward a value none of them owns.
+  const bool gasOn = CurrentTuning().sim.gasMode != (int)kGasModeWall;
+  cx.gasActive = gasOn && (cx.caActive || gasSpawnsThisTick_ > 0 ||
+                           gasLive_ > 0 || gasIdleTicks_ < kGasIdleTicks);
   gasSpawnsThisTick_ = 0;
 
   RecordTable(enc, pass::Table::Tick, &cx);

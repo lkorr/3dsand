@@ -825,7 +825,11 @@ Noita's "Bloody Zombies" technique, on GPU:
   `resolve` in the same tick — a landing is never invisible to the snapshot of
   its own tick, and a particle that lands is still counted on the tick it lands.
   **A new GPU-side particle source must land inside that count**, or both
-  mechanisms will reason a world settled while matter is still moving.
+  mechanisms will reason a world settled while matter is still moving. Gas
+  parcels (below) are the second source and are inside it: `NoteSnapshot`
+  disqualifies on `gasLive_` beside `particleCount`. That obligation was
+  discharged only after the `gas-leave` gate went looking for it, which is the
+  argument for the gate measuring it rather than the design doc asserting it.
 
 **Gameplay projectiles are a separate CPU system** (§8) — they carry game logic.
 
@@ -916,30 +920,35 @@ the CA flags cells that want to leave and a second pass converts them in a
 deterministic order, which is the pattern `sim_explode` already uses for exactly
 this reason.
 
-**The SECOND open problem, and this section's own paragraph above names it.**
-"A new GPU-side particle source must land inside that count, or both mechanisms
-will reason a world settled while matter is still moving" — and gas parcels do
-NOT. `Simulation::NoteSnapshot` licenses the settled-tick skip on
-`activeChunks == 0 && particleCount == 0`, `particleCount` is the ballistic
-population only, and `inputsThisTick` in `EncodeTick` has no gas term either.
-The C_GAS latch keeps the gas ROWS recorded (arm on either creator, hold
-`kGasIdleTicks` past the last, and a snapshot reporting live parcels holds it
-armed indefinitely), so parcels keep flying — but a re-entry landing is a
-voxel write at a cell the CPU did not choose, on a tick the CA rows may not have
-been recorded for, and the snapshot that would notice it is several ticks late.
-Not a lost voxel (the landing writes, and the next snapshot un-latches the
-skip), but a chunk processed late, which is exactly the class of defect the
-`ca-skip` gate exists to catch and which a single-run hash cannot see. The
-`gas-leave` gate MEASURES and PRINTS how many ticks of its run fall in that
-window rather than asserting on it — **measured 0 of 400 on 2026-09-09**, so
-the hazard is structural rather than currently reached: that fixture's own
-plume keeps the window busy for the whole run, and the case that would enter it
-is a fire that burns out completely while its smoke is still drifting outside.
-The fix belongs with the settled-tick machinery in `simulation.cpp` — either
-fold the gas count into `NoteSnapshot`'s disqualifier the way `particleCount`
-is folded in, or make a live gas population a `lastDirtyTick_` re-stamp. Until
-then the number is on the gate's own line and a change that starts reaching the
-window will move it off zero.
+**The settled-tick skip vs parcels in flight — FOUND BY THE GATE, FIXED IN
+`simulation.cpp`.** This section's own paragraph above states the obligation:
+"a new GPU-side particle source must land inside that count, or both mechanisms
+will reason a world settled while matter is still moving". Gas parcels did not.
+`Simulation::NoteSnapshot` licensed the settled-tick skip on
+`activeChunks == 0 && particleCount == 0`, `particleCount` is the BALLISTIC
+population only, and `inputsThisTick` in `EncodeTick` had no gas term. The
+C_GAS latch was never the answer to this and was briefly reported as though it
+were: it decides whether the gas ROWS are recorded, so parcels kept flying — but
+a re-entry landing is a voxel write at a cell the CPU did not choose, and if it
+happened on a tick the CA rows were skipped for, that chunk would be simulated
+one or two ticks late, "how late" depending on when the readback ring got round
+to reporting it. Late is not lost; scheduling-dependent is a rule-1 break.
+
+Both halves are closed now. `NoteSnapshot` disqualifies on `gasLive_ != 0`
+alongside `particleCount`, `NoteGasLive` additionally clears `settledProven_`
+directly so the fix does not depend on call order, and `gasSpawnsThisTick_` is
+in `inputsThisTick` for the reason `windWakeCount` is — a CPU-queued parcel can
+re-enter and land, so it is a chunk-dirtying input. `gasLeave` conversions are
+deliberately not in that disjunction and do not need to be: a voxel can only
+reach the residency edge on a tick the CA ran, and the CA running already means
+the world was not proved idle.
+
+The `gas-leave` gate keeps counting ticks that fall in the window and printing
+the number on its own line. It measured **0 of 400 before the fix** — that
+fixture's own plume keeps the window busy for the whole run, so it never
+entered the hazard — and it should now be provably zero rather than
+incidentally zero. It stays because the assertion is cheap and because the next
+GPU-side source to arrive will need exactly this measurement made for it.
 
 **Gates:** `gas-leave` (4,096 smoke six chunks under the window's top face,
 open shaft above, 400 ticks twice) and `gas-reenter` (256 CPU-queued parcels two

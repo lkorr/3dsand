@@ -910,7 +910,7 @@ int Run(Ctx& c, const Options& opt) {
     static const char* const kKernelName[] = {
         "?", "sim_step", "sim_mutate", "sim_explode", "sim_particle",
         "sim_occupancy", "sim_pick", "sim_fluid_seam", "sim_waterbody",
-        "worldgen:main", "worldgen:list", "worldgen:pagefill"};
+        "worldgen:main", "worldgen:list", "worldgen:pagefill", "sim_gas"};
     auto kname = [&](uint32_t idPlus1) {
       const uint32_t id = idPlus1 - 1;
       return id < (uint32_t)(sizeof kKernelName / sizeof *kKernelName)

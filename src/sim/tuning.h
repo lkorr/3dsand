@@ -1724,6 +1724,18 @@ struct Tuning {
     // promises about rule 2 — 2 is deliberately NOT rule-2 clean yet and is
     // there to be looked at, not shipped.
     int windMode = 1;
+    // ---- gas particles (docs/PLAN_gas_particles.md stage 1) ----
+    // THE EDGE. 0 = wall: `gasLeave` never fires and a gas voxel pressed
+    // against the residency boundary spreads along it, which is the top-plane
+    // sheet that used to hold up to 1,024 chunks awake over a big fire. 1 =
+    // sink: it becomes a parcel that keeps rising and drifting outside the
+    // window under the same buoyancy/wind model, bounded by its authored decay
+    // and an outer box, and reconverts to a voxel if it drifts back in.
+    //
+    // At 0 the CPU records NO gas pass (Cond::Gas is false) and the kernel
+    // branch is never reached, so this is an exact identity in the windMode /
+    // waterBodyMode sense rather than merely a cheap path.
+    int gasMode = 1;
     // Ballistic debris and spray: fraction of the gap between a particle's
     // velocity and the local wind that closes per SECOND, at a material's full
     // windResponse of 15. A drag law rather than a push, because drag is

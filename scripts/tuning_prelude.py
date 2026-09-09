@@ -427,6 +427,9 @@ SPEC = [
     ("sim", "drainCd", "TUNE_DRAIN_CD", "f", 0.6),
     ("sim", "drainGravity", "TUNE_DRAIN_GRAVITY", "f", 900.0),
     ("sim", "windMode", "TUNE_WIND_MODE", "i", 1),
+
+    # gas particles (docs/PLAN_gas_particles.md)
+    ("sim", "gasMode", "TUNE_GAS_MODE", "i", 1),
     ("sim", "windDrag", "TUNE_WIND_DRAG", "f", 3.0),
     ("sim", "windFluidGain", "TUNE_WIND_FLUID_GAIN", "f", 0.35),
     ("sim", "windFluidMass", "TUNE_WIND_FLUID_MASS", "f", 0.5),

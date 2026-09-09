@@ -1544,15 +1544,16 @@ def check_gas_consts():
     this file exists to police: a cap raised in world.h and not in the shader
     is a spawn list the CA overruns silently.
 
-    It also checks the TEMP-DUP block. Phase A copies the shared gas motion
-    functions into sim_gas.wgsl verbatim because package T0 holds common.wgsl;
-    phase B deletes the copy and moves the originals there. Until then the two
-    must not diverge, and "must not diverge" without a checker is a comment.
+    It also checks that the shared gas MOTION model has exactly one definition,
+    in common.wgsl -- see the block at the bottom of this function for why a
+    re-introduced local copy is the failure that nothing else would catch.
     """
     checked.append("gas")
     wh = read(ROOT / "src/sim/world.h")
     gas = read(ROOT / "assets/shaders/sim_gas.wgsl")
     step = read(ROOT / "assets/shaders/sim_step.wgsl")
+    common = read(ROOT / "assets/shaders/common.wgsl")
+    raymarch = read(ROOT / "assets/shaders/raymarch.wgsl")
 
     def cxx(name):
         m = re.search(r"\b" + name + r"\s*=\s*(-?\d+)", wh)
@@ -1568,8 +1569,15 @@ def check_gas_consts():
                                                ("sim_step.wgsl", step)]),
         ("kGasCpuSpawnPerTick", "GAS_CPU_SPAWN_CAP", [("sim_gas.wgsl", gas)]),
         ("kGasCeilingVox", "GAS_CEILING_VOX", [("sim_gas.wgsl", gas)]),
-        ("kGasOuterN", "GAS_OUTER_N", [("sim_gas.wgsl", gas)]),
-        ("kGasOuterShift", "GAS_OUTER_SHIFT", [("sim_gas.wgsl", gas)]),
+        # raymarch.wgsl declares its own copies rather than importing them:
+        # the far march is their only render-side reader, and a common.wgsl
+        # constant costs the whole SPIR-V cache. That is the right trade and
+        # this is the price of it -- the splatter and the sampler disagreeing
+        # about the cell size is a plume drawn in the wrong place.
+        ("kGasOuterN", "GAS_OUTER_N", [("sim_gas.wgsl", gas),
+                                       ("raymarch.wgsl", raymarch)]),
+        ("kGasOuterShift", "GAS_OUTER_SHIFT", [("sim_gas.wgsl", gas),
+                                               ("raymarch.wgsl", raymarch)]),
     ]
     for cname, wname, shaders in pairs:
         want = cxx(cname)
@@ -1605,39 +1613,42 @@ def check_gas_consts():
                     f"gas: {fname} {wname} = {got} but world.h {cname} = "
                     f"{want} -- the header is read back by offset")
 
-    # ---- TEMP-DUP: phase A's copy must stay byte-identical -----------------
-    fns = ["gasRndK", "windLateralCode", "windLateralStartK", "windAxisFrac",
-           "gasLateralRot", "gasIntentK", "gasLadderStep"]
-
-    def body(txt, name):
-        m = re.search(r"^fn\s+" + name + r"\s*\(", txt, re.M)
-        if not m:
-            return None
-        end = re.compile(r"^\}", re.M).search(txt, m.start())
-        if not end:
-            return None
-        src = txt[m.start():end.end()]
-        # Comments and whitespace may differ; code may not.
-        src = re.sub(r"//[^\n]*", "", src)
-        return re.sub(r"\s+", " ", src).strip()
-
-    for name in fns:
-        a, b = body(step, name), body(gas, name)
-        if a is None:
+    # ---- ONE DEFINITION, and the checker's job is to keep it that way ------
+    # These moved to common.wgsl when the gas particle kernel landed, because
+    # "two shaders must AGREE" is the whole criterion for that file: the CA
+    # moves a gas VOXEL and sim_gas moves a gas PARCEL, and the plan's
+    # requirement is that they make the SAME move.
+    #
+    # They spent one commit duplicated (common.wgsl was held by another package
+    # at the time) with a rule here comparing the two bodies token for token.
+    # That rule has nothing left to compare — so it is replaced by the check
+    # that matters now, which is that nobody re-introduces a local copy. A
+    # second definition of gasIntentK in sim_step.wgsl would not fail to
+    # compile and would not fail a gate; it would simply mean the voxel and the
+    # parcel had quietly stopped agreeing.
+    moved = ["gasRndK", "windLateralCode", "windLateralStartK", "windAxisFrac",
+             "gasLateralRot", "gasIntentK", "gasLadderStep"]
+    for name in moved:
+        if not re.search(r"^fn\s+" + name + r"\s*\(", common, re.M):
             problems.append(
-                f"gas TEMP-DUP: sim_step.wgsl no longer declares {name} -- if "
-                f"phase B moved it to common.wgsl, delete this check's entry "
-                f"and the copy in sim_gas.wgsl in the same commit")
-        elif b is None:
-            problems.append(
-                f"gas TEMP-DUP: sim_gas.wgsl no longer declares {name}")
-        elif a != b:
-            problems.append(
-                f"gas TEMP-DUP: {name} DIFFERS between sim_step.wgsl and "
-                f"sim_gas.wgsl -- a gas particle must take the moves a voxel "
-                f"would (PLAN_gas_particles.md 2.2), and these are two copies "
-                f"of ONE function until phase B moves it to common.wgsl")
-
+                f"gas: common.wgsl no longer defines {name} -- the CA and the "
+                f"gas particle kernel both call it and it is the single "
+                f"definition they agree on")
+        for fname, txt in (("sim_step.wgsl", step), ("sim_gas.wgsl", gas)):
+            if re.search(r"^fn\s+" + name + r"\s*\(", txt, re.M):
+                problems.append(
+                    f"gas: {fname} defines its OWN {name}, shadowing the one in "
+                    f"common.wgsl -- a gas parcel must take the moves a gas "
+                    f"voxel would (PLAN_gas_particles.md 2.2), and a local copy "
+                    f"is how that stops being true without anything failing")
+    for name in ("GasIntent",):
+        if not re.search(r"^struct\s+" + name + r"\b", common, re.M):
+            problems.append(f"gas: common.wgsl no longer defines struct {name}")
+        for fname, txt in (("sim_step.wgsl", step), ("sim_gas.wgsl", gas)):
+            if re.search(r"^struct\s+" + name + r"\b", txt, re.M):
+                problems.append(
+                    f"gas: {fname} defines its own struct {name}, shadowing "
+                    f"common.wgsl's")
 
 ALL = {
     "envpred": check_env_predictions,
@@ -1699,6 +1710,7 @@ RELEVANT = {
     "src/measure/perfsuite.cpp": ["autofly"],
     "src/main.cpp": ["arch", "autofly"],
     "assets/shaders/sim_gas.wgsl": ["gas"],
+    "assets/shaders/raymarch.wgsl": ["gas"],
     "tests/env_predictions.json": ["envpred"],
     "scripts/test_environment.mjs": ["envpred"],
 }

@@ -492,6 +492,10 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
     tp.windSpeedQ = wq.speed;
     tp.windGustQ = wq.gust;
     tp.windMode = (uint32_t)wtun.sim.windMode;
+    // The gas edge (docs/PLAN_gas_particles.md). Read here, from the same
+    // tuning snapshot windMode comes from, so the value the kernel branches on
+    // and the value Simulation gates Cond::Gas on are one read.
+    tp.gasMode = (uint32_t)wtun.sim.gasMode;
     // The two dev force multipliers, Q8. Rounded half-away-from-zero by hand
     // for the WindQuantize reason — the rounding mode is part of what the sim
     // sees, so it is written here rather than left to a compiler flag. At the

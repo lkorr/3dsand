@@ -197,7 +197,14 @@ class Simulation {
   // ticks latent). NoteGasSpawns: CPU-authored spawns uploaded for THIS tick,
   // which the latch must see before EncodeTick decides whether to record the
   // drain that consumes them.
-  void NoteGasLive(uint32_t live) { gasLive_ = live; }
+  // Also disarms the settled-tick skip directly, so the fix does not depend on
+  // whether a caller happens to call this before or after NoteSnapshot. Both
+  // orders are safe and both are in the conservative direction: a live parcel
+  // can only COST a skip, never license one.
+  void NoteGasLive(uint32_t live) {
+    gasLive_ = live;
+    if (live != 0) settledProven_ = false;
+  }
   void NoteGasSpawns(uint32_t n) { gasSpawnsThisTick_ += n; }
   uint32_t GasLive() const { return gasLive_; }
 

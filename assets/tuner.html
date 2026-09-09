@@ -8106,7 +8106,7 @@ const ARCH_NODES={
 
   gasSys:{label:'Gas Particles',tag:'gpu',wip:'stage 1 landed on branch gas-stage1 (stage 2 - smoke off the grid INSIDE the window too - is optional and unstarted)',
     desc:'Gas that has LEFT the residency window, as particles. Inside the window smoke is still a voxel with the whole reaction system available to it - what changed is that the window edge is a SINK instead of a wall. A gas voxel whose buoyancy/wind intent points out of the window deletes itself and becomes a parcel that keeps rising and drifting outside, bounded by its authored decay and an outer box, and reconverts to a voxel if it drifts back in.',
-    files:['assets/shaders/sim_gas.wgsl','assets/shaders/sim_step.wgsl (gasLeave)','assets/shaders/raymarch.wgsl (far-march sampling)','src/sim/pass_table.def'],
+    files:['assets/shaders/sim_gas.wgsl','assets/shaders/sim_step.wgsl','assets/shaders/raymarch.wgsl','assets/shaders/common.wgsl','src/sim/pass_table.def'],
     sym:['gasSpawnStep','gasArgs1','gasIntegrate','gasArgs2','gasResolve','gasLeave','gasSplat'],
     cst:['world.h  kGasParticleCap','world.h  kGasSpawnPerTick','world.h  kGasCpuSpawnPerTick','world.h  kGasCeilingVox','world.h  kGasOuterN','renderBGL_ binding 21 (gasOuter)'],
     tst:['gas-leave','gas-reenter','determinism','sleep'],

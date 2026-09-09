@@ -38,10 +38,12 @@
 @group(0) @binding(4)  var<uniform> T : TickParams;
 @group(0) @binding(17) var<storage, read> pageTable : array<u32>;
 @group(0) @binding(18) var<storage, read_write> pageFaults : array<atomic<u32>>;
-// PHASE A: shares the ballistic particle kernel's fault-tally bank. The
-// PT_K_* block is in common.wgsl, which package T0 holds this cycle; phase B
-// gives gas its own PT_K_GAS and widens PT_K_COUNT.
-const PT_KERNEL : u32 = PT_K_PARTICLE;
+// This module's page-fault identity (common.wgsl's PT_K_* block). Its own bank
+// rather than a share of the ballistic kernel's: the two populations fault for
+// completely different reasons — a parcel lands through the claim path where
+// debris lands through a DDA — and "which kernel dropped the store" is the
+// whole point of the per-kernel tally.
+const PT_KERNEL : u32 = PT_K_GAS;
 
 @group(1) @binding(0)  var<storage, read_write> gasRead : array<Particle>;
 @group(1) @binding(1)  var<storage, read_write> gasWrite : array<Particle>;
@@ -85,7 +87,6 @@ const GAS_SP_STRIDE    : u32 = 8u;
 const GAS_SPAWN_CAP    : u32 = 65536u;   // kGasSpawnPerTick
 const GAS_CPU_SPAWN_CAP: u32 = 1024u;    // kGasCpuSpawnPerTick
 const GAS_PARTICLE_CAP : u32 = 262144u;  // kGasParticleCap
-const PFLAG_GAS        : u32 = 8192u;
 
 // The outer density box (§2.5). GAS_OUTER_N cells per axis, GAS_OUTER_SHIFT
 // fine voxels per cell, so the box edge is 2x the residency window's and it is
@@ -106,7 +107,18 @@ const GAS_CEILING_VOX : i32 = 192;
 const GAS_KEY_SALT   : u32 = 0x9A17u;
 const GAS_DECAY_SALT : u32 = 0x2C05u;
 
-fn inBounds(c : vec3<i32>) -> bool { return inWindow(c, T.origin); }
+// (a) RESIDENCY, in the tickets-P0 sense (docs/tickets_p0_audit.md): every
+// caller here asks "may I read or write this cell", never "where is the window
+// box". Re-entry proposes a voxel, gasBlocked asks whether the GRID is the
+// authority at a cell, and the splat asks whether the parcel is already being
+// drawn as a voxel — all three are true for a ticket chunk, which is resident
+// and simulated and rendered even though it is nowhere near the window.
+//
+// The WINDOW-BOX questions in this file are gasOuterOrigin/gasCeilY, and they
+// deliberately keep saying WORLD_N: the outer density box really is two window
+// edges centred on the window, and the kill ceiling really is measured from the
+// window's top face. That is class (c) and it does not move.
+fn inBounds(c : vec3<i32>) -> bool { return cellResident(c, T.origin); }
 
 fn gasLive(page : u32) -> u32 {
   return min(atomicLoad(&gasCounts[page]), GAS_PARTICLE_CAP);
@@ -117,130 +129,16 @@ fn gasAppend(p : Particle) {
   if (slot < GAS_PARTICLE_CAP) { gasWrite[slot] = p; }
 }
 
-// ============================================================================
-// TEMP-DUP (phase B moves this to common.wgsl; do not diverge from
-// sim_step.wgsl). These are byte-for-byte the functions sim_step.wgsl declares,
-// in the refactored form that takes the identity key and the substep as
-// arguments instead of reading the CA's slot index and PassParams. When
-// common.wgsl is free again the block below is DELETED and the copies in
-// sim_step.wgsl move there; nothing else changes.
+// The gas motion model — gasRndK, windLateralStartK, gasIntentK, gasLadderStep
+// and the GasIntent struct — is in common.wgsl, which is where it belongs and
+// where the CA reads it from too. That is the plan's §2.2 requirement made
+// structural: a parcel takes the moves a voxel would because it calls the same
+// function, not because two copies were kept in step.
 //
-// scripts/check_invariants.py compares the two copies.
-// ============================================================================
-
-const WIND_DRIFT_REF : i32 = i32(round(
-    clamp(TUNE_WIND_DRIFT_SPEED, 0.0, 200.0) * 65536.0));
-const WIND_DRIFT_CAP : i32 = i32(round(clamp(TUNE_WIND_DRIFT_MAX, 0.0, 0.95) * 1024.0));
-const WIND_RNG_SALT : u32 = 0x5719u;
-
-fn gasRndK(key : u32, stream : u32, substep : u32) -> u32 {
-  return hash3(T.seed ^ WIND_RNG_SALT ^ (stream * 0x9E37u),
-               T.tick * 2u + substep, key);
-}
-
-fn windLateralCode(w : vec3<i32>) -> u32 {
-  if (abs(w.x) >= abs(w.z)) { return select(2u, 0u, w.x > 0); }
-  return select(3u, 1u, w.z > 0);
-}
-
-fn windLateralStartK(c : vec3<i32>, base : u32, m : Material,
-                     key : u32, substep : u32) -> u32 {
-  if (T.windMode == WIND_MODE_OFF) { return base; }
-  let resp = i32(matWindResponse(m));
-  if (resp == 0) { return base; }
-  let w = windAtQ(c, &T);
-  let mag = max(abs(w.x), abs(w.z));
-  if (mag == 0) { return base; }
-  let frac = (min(mag, WIND_DRIFT_REF) >> 10u) * 1024 /
-             max(WIND_DRIFT_REF >> 10u, 1);
-  var p = ((frac * WIND_DRIFT_CAP) / 1024) * resp / 15;
-  if (T.windGasScaleQ != WINDQ_SCALE_ONE) {
-    p = min((p * T.windGasScaleQ) / WINDQ_SCALE_ONE, 1024);
-  }
-  if (i32(gasRndK(key, 0u, substep) & 1023u) < p) { return windLateralCode(w); }
-  return base;
-}
-
-fn windAxisFrac(v : i32, resp : i32) -> i32 {
-  let lim = 3 * WIND_DRIFT_REF;
-  let a = min(abs(v), lim);
-  var f = ((a >> 10u) * 1024) / max(WIND_DRIFT_REF >> 10u, 1);
-  f = (f * resp) / 15;
-  if (T.windGasScaleQ != WINDQ_SCALE_ONE) {
-    f = (f * T.windGasScaleQ) / WINDQ_SCALE_ONE;
-  }
-  f = min(f, 3072);
-  return select(f, -f, v < 0);
-}
-
-fn gasLateralRot(w : vec3<i32>, fh : i32, base : u32, r : u32) -> u32 {
-  if (i32(r & 1023u) < fh) { return windLateralCode(w); }
-  return base;
-}
-
-struct GasIntent {
-  dir  : vec3<i32>,
-  rise : bool,
-  rot  : u32,
-};
-
-fn gasIntentK(c : vec3<i32>, m : Material, key : u32, base : u32,
-              substep : u32) -> GasIntent {
-  var g : GasIntent;
-  g.dir = vec3<i32>(0, 1, 0);
-  g.rise = true;
-  g.rot = base;
-  if (T.windMode == WIND_MODE_OFF) { return g; }
-  let resp = i32(matWindResponse(m));
-  if (resp == 0) { return g; }
-  let w = windAtQ(c, &T);
-  let fy = windAxisFrac(w.y, resp);
-  let fh = min(1024, max(abs(windAxisFrac(w.x, resp)),
-                         abs(windAxisFrac(w.z, resp))));
-  let down = max(0, -fy);
-  let up   = max(0,  fy);
-  let rise = clamp(1024 - down, 0, 1024);
-  let sink = clamp((down - 1024) / 2, 0, 1024);
-  let lean = clamp(fh - up, 0, 1024);
-  if (rise == 1024 && lean == 0) { return g; }
-  let r = gasRndK(key, 1u, substep);
-  let tier = i32(r & 1023u);
-  let leanRoll = i32((r >> 10u) & 1023u);
-  g.rot = gasLateralRot(w, fh, base, r >> 20u);
-  let d = lateralDir(g.rot);
-  if (tier < rise) {
-    if (leanRoll < lean) { g.dir = vec3<i32>(d.x, 1, d.y); }
-    return g;
-  }
-  g.rise = false;
-  if (tier < 1024 - sink) {
-    g.dir = vec3<i32>(d.x, 0, d.y);
-    return g;
-  }
-  g.dir = select(vec3<i32>(0, -1, 0), vec3<i32>(d.x, -1, d.y), leanRoll < lean);
-  return g;
-}
-
-const GAS_LADDER_N    : u32 = 14u;
-const GAS_LADDER_RING : u32 = 6u;
-
-fn gasLadderStep(g : GasIntent, rUp : u32, rLat : u32, i : u32) -> vec4<i32> {
-  if (i == 0u) { return vec4<i32>(g.dir, 1); }
-  if (i < 5u) {
-    if (g.rise) { return vec4<i32>(0, 0, 0, 0); }
-    let d = lateralDir((i - 1u) + g.rot);
-    return vec4<i32>(d.x, 0, d.y, 1);
-  }
-  if (i == 5u) { return vec4<i32>(0, 1, 0, 1); }
-  if (i < 10u) {
-    let d = lateralDir((i - 6u) + rUp);
-    return vec4<i32>(d.x, 1, d.y, 1);
-  }
-  let d = lateralDir((i - 10u) + rLat);
-  return vec4<i32>(d.x, 0, d.y, 1);
-}
-
-// ======================= END TEMP-DUP =======================================
+// The one thing this kernel supplies differently is the roll's inputs. The CA
+// keys on its cell's slot index and rolls once per gravity SUBSTEP; a parcel
+// keys on gasKey (a hash of its cell and payload) and rolls once per TICK, so
+// every call below passes substep 0.
 
 // ---- the outer box ---------------------------------------------------------
 // T.origin is in CHUNK units. The box edge is 2x the window's and centred on
@@ -340,8 +238,9 @@ fn gasMarkDirtyNext(c : vec3<i32>) {
     for (var j = 0; j < 2; j++) {
       for (var k = 0; k < 2; k++) {
         let n = ch + vec3<i32>(xs[i], ys[j], zs[k]);
-        if (chunkInWindow(n, T.origin)) {
-          atomicOr(&dirtyOut[chunkSlotIndex(n)], DIRTY_R_PARTICLE);
+        let ns = chunkSlotOf(n, T.origin);
+        if (ns != SLOT_NONE) {
+          atomicOr(&dirtyOut[ns], DIRTY_R_PARTICLE);
         }
       }
     }
@@ -521,8 +420,8 @@ fn gasIntegrate(@builtin(global_invocation_id) gid : vec3<u32>) {
   }
 
   // ---- motion: the grid model, verbatim (§2.2) -----------------------------
-  let rnd = gasRndK(key, 2u, 0u);
-  let g = gasIntentK(c, m, key, rnd >> 10u, 0u);
+  let rnd = gasRndK(key, 2u, 0u, &T);
+  let g = gasIntentK(c, m, key, rnd >> 10u, 0u, &T);
   var tgt = c;
   var found = false;
   for (var i = 0u; i < GAS_LADDER_RING; i++) {
@@ -532,8 +431,8 @@ fn gasIntegrate(@builtin(global_invocation_id) gid : vec3<u32>) {
     if (!gasBlocked(n)) { tgt = n; found = true; break; }
   }
   if (!found) {
-    let rUp  = windLateralStartK(c, rnd >> 10u, m, key, 0u);
-    let rLat = windLateralStartK(c, rnd >> 14u, m, key, 0u);
+    let rUp  = windLateralStartK(c, rnd >> 10u, m, key, 0u, &T);
+    let rLat = windLateralStartK(c, rnd >> 14u, m, key, 0u, &T);
     for (var i = GAS_LADDER_RING; i < GAS_LADDER_N; i++) {
       let n = c + gasLadderStep(g, rUp, rLat, i).xyz;
       if (!gasBlocked(n)) { tgt = n; found = true; break; }

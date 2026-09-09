@@ -1,10 +1,22 @@
 # PLAN: gas particles — voxel smoke inside the window, particle smoke outside it
 
-Status: **P1 stage 1 LANDED on branch `gas-stage1`** — sim side `6ba9421`,
-renderer binding `1859036`, far-march sampling + gates + docs on top of them.
-P0's measurement stands as written in §0 (and its headline finding, that
-`treeburn` does not run on the shipped map, is still open for whoever owns
-worldgen). P2 (stage 2, §2.10) is optional and unstarted.
+Status: **P1 stage 1 COMPLETE on branch `gas-stage1`**, rebased onto chunk
+tickets P0 (`e808931`) and finished with the one batched `common.wgsl` edit
+§2.2 always called for. The gas motion model — `gasRndK`, `windLateralStartK`,
+`windAxisFrac`, `gasLateralRot`, `GasIntent`, `gasIntentK`, `gasLadderStep` and
+the two wind ramp constants — has ONE definition there, which both the CA and
+the particle kernel call; `PFLAG_GAS` and `PT_K_GAS` joined their own blocks;
+and `sim.gasMode` is on the tick stream through the full `TUNE_*` pipeline.
+
+**`sim.gasMode = 0` reproduces the world exactly as it was without any of
+this** — determinism hash `ffd2807b`, which is the value chunk tickets P0
+recorded, and `gas-leave` then FAILS with the top chunk plane sheeting across
+47 awake chunks. At 1 the same plane is quiet (0 awake) and 2,656 voxels
+converted at the edge. That pair is the whole of stage 1 in two numbers.
+
+P0's measurement stands as written in §0, and its headline finding — that
+`treeburn` does not run on the shipped map — is still open for whoever owns
+worldgen. P2 (stage 2, §2.10) is optional and unstarted.
 Companion: `docs/PLAN_chunk_tickets.md` (independent; tickets are for matter
 that LANDS, particles are for gas that KEEPS GOING).
 

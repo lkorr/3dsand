@@ -267,6 +267,7 @@ bool SetSimField(Tuning& t, const std::string& name, float value) {
     {"drainMaxEighthsPerTick", &Tuning::Sim::drainMaxEighthsPerTick},
     {"drainExciteRadius", &Tuning::Sim::drainExciteRadius},
     {"windMode", &Tuning::Sim::windMode},
+    {"gasMode", &Tuning::Sim::gasMode},
     {"currentMode", &Tuning::Sim::currentMode},
     {"currentVortexRadius", &Tuning::Sim::currentVortexRadius},
     {"currentStreamMinSlope", &Tuning::Sim::currentStreamMinSlope},
@@ -1210,6 +1211,7 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadF(*g, "drainCd", s.drainCd, out, at);
     ReadF(*g, "drainGravity", s.drainGravity, out, at);
     ReadI(*g, "windMode", s.windMode, out, at);
+    ReadI(*g, "gasMode", s.gasMode, out, at);
     ReadF(*g, "windDrag", s.windDrag, out, at);
     ReadF(*g, "windFluidGain", s.windFluidGain, out, at);
     ReadF(*g, "windFluidMass", s.windFluidMass, out, at);
@@ -1482,6 +1484,13 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     // Wind coupling. The gate first: an unknown mode must not fall through to
     // "some wind", because the whole hash argument for shipping this is that
     // mode 0 means literally no kernel reads the field.
+    // The gas edge is a two-state gate; anything else is a typo, and silently
+    // treating a 2 as "on" would hide the day someone means to add a mode.
+    if (s.gasMode < (int)kGasModeWall || s.gasMode > (int)kGasModeSink) {
+      out.warnings.push_back("sim.gasMode out of 0..1; clamped");
+      s.gasMode = s.gasMode < (int)kGasModeWall ? (int)kGasModeWall
+                                                : (int)kGasModeSink;
+    }
     if (s.windMode < (int)kWindModeOff || s.windMode > (int)kWindModeEntrain) {
       out.warnings.push_back("sim.windMode out of 0..2; clamped");
       s.windMode = s.windMode < (int)kWindModeOff ? (int)kWindModeOff

@@ -140,16 +140,28 @@ struct LeaveRun {
   // only quantity in the engine that can see it — a parcel outside the window
   // touches no voxel, so the world hash cannot.
   uint32_t digestProbe = 0, liveAtProbe = 0;
-  // ---- REPORTED, NOT ASSERTED: the settled-tick skip vs parcels in flight ---
-  // DESIGN.md §5 already states the rule — "a new GPU-side particle source must
-  // land inside that count" — because `Simulation::NoteSnapshot` licenses the
-  // CA skip on `activeChunks == 0 && particleCount == 0`, and a gas parcel is a
-  // GPU-side dirty-writer whose landing cell the CPU cannot predict. Gas is not
-  // in `particleCount` and not in `inputsThisTick`. Whether that window is ever
-  // ENTERED is a measurement, not an argument, so the gate counts it: ticks on
-  // which the CA rows were skipped while parcels were alive outside. Printed,
-  // never asserted — the fix is in simulation.cpp, which this package does not
-  // own, and a gate that failed for it would be reporting someone else's work.
+  // ---- THE SETTLED-TICK SKIP vs PARCELS IN FLIGHT --------------------------
+  // DESIGN.md §5 states the rule — "a new GPU-side particle source must land
+  // inside that count" — because `Simulation::NoteSnapshot` licenses the CA
+  // skip on `activeChunks == 0 && particleCount == 0`, and a gas parcel is a
+  // GPU-side dirty-writer whose landing cell the CPU cannot predict.
+  //
+  // WHEN THIS COUNTER WAS WRITTEN gas was in neither `particleCount` nor
+  // `inputsThisTick`, and it was printed rather than asserted because the fix
+  // belonged in a file that package did not own. It measured 0 of 400 — which
+  // was this fixture never ENTERING the window, not the hole being closed.
+  // Naming it is what got it closed: `NoteSnapshot` disqualifies on
+  // `gasLive_` now, `NoteGasLive` clears `settledProven_` directly so the fix
+  // does not depend on call order, and `gasSpawnsThisTick_` is in
+  // `inputsThisTick`.
+  //
+  // STILL REPORTED RATHER THAN ASSERTED, deliberately. The disqualifier reads
+  // the SNAPSHOT's parcel count, which is latent by construction, so a stale
+  // zero can in principle still license a skip on the tick a parcel is born —
+  // a residual window that is bounded but not provably empty, and a gate that
+  // failed on it would be flaky rather than informative. What changed is the
+  // MEANING of a non-zero reading: it was an expected condition, and it is a
+  // finding now.
   uint32_t skipWithParcels = 0, skipFirstTick = 0, skipParcelsThere = 0;
   uint32_t quietWithParcels = 0;
 };
@@ -375,18 +387,18 @@ Status GateGasLeave(Ctx& c, std::string& detail) {
   RecordObserved("gasLeave.outerSumObserved", (double)a.outerSum);
   RecordObserved("gasLeave.caSkipWithParcelsObserved", (double)a.skipWithParcels);
 
-  // REPORTED, NOT ASSERTED. See LeaveRun::skipWithParcels: this is DESIGN.md
-  // §5's "a new GPU-side particle source must land inside that count" measured
-  // rather than argued about. Its own printf so it is legible whether the gate
-  // passes or fails, and so that a future fix in simulation.cpp can be checked
-  // against a number that already exists.
+  // See LeaveRun::skipWithParcels. This is DESIGN.md §5's "a new GPU-side
+  // particle source must land inside that count" measured rather than argued
+  // about — and measuring it is what got the hole in simulation.cpp closed.
+  // Its own printf so it is legible whether the gate passes or fails.
   std::printf(
       "gas-leave: settled-tick skip vs parcels in flight: CA rows SKIPPED on "
       "%u ticks with parcels alive (first t%u, %u parcels), 0 active chunks on "
-      "%u such ticks -- gas is not in NoteSnapshot's particleCount nor in "
-      "EncodeTick's inputsThisTick, so a re-entry landing on one of those ticks "
-      "is a GPU-chosen dirty write the skip did not account for. REPORTED, not "
-      "asserted: the fix is in simulation.cpp.\n",
+      "%u such ticks -- gasLive_ is in NoteSnapshot's disqualifier and "
+      "gasSpawnsThisTick_ is in inputsThisTick now, so this should read 0; the "
+      "residual is a stale-zero snapshot on the tick a parcel is born. "
+      "REPORTED, not asserted (a latent count cannot carry a hard assert), but "
+      "a non-zero value here is a FINDING.\n",
       a.skipWithParcels, a.skipFirstTick, a.skipParcelsThere,
       a.quietWithParcels);
 

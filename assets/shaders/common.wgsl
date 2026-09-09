@@ -646,7 +646,17 @@ struct TickParams {
   // Same shape as windMode and waterBodyMode.
   currentMode      : u32,
   currentPrimCount : u32,
-  padCp0 : u32,
+  // ---- sim.gasMode (docs/PLAN_gas_particles.md) ----
+  // 0 = the residency edge is a WALL, which is what it was before stage 1:
+  // gasLeave never fires, no gas row is recorded at all (the CPU reads this
+  // same value for C_GAS), and the pinned world hash cannot move. 1 = the edge
+  // is a SINK. Same shape as windMode / waterBodyMode / fluidExciteMode, and
+  // it rides the tick input stream for their reason: a replay reproduces the
+  // stream and the twice-run determinism gate compares it, so anything the
+  // world hash can see has to arrive this way.
+  //
+  // It was the padCp0 pad word, so the struct layout is unchanged.
+  gasMode : u32,
   padCp1 : u32,
   currentPrimLo : vec3<i32>,   // union AABB, inclusive world cells; lo > hi
   padCp2 : i32,                // means "no primitives"
@@ -2716,6 +2726,15 @@ const PFLAG_PENDING : u32 = 2u;        // proposed a reinsertion this tick
 // in and storing it from every droplet that landed would be a read-modify-write
 // race and would break the world hash.
 const PFLAG_MICRO   : u32 = 4u;
+// ---- GAS parcels (docs/PLAN_gas_particles.md) ------------------------------
+// Set on every particle in the GAS pool (sim_gas.wgsl), which has its own
+// buffers, its own claim hash and its own count words — so nothing depends on
+// this bit to tell the populations apart. It is here so that a parcel handed
+// to the wrong kernel through a mis-bound buffer is LOUD rather than silently
+// simulated as ballistic debris, and because bits 0..12 are spoken for
+// (ALIVE / PENDING / MICRO plus the micro scale and life fields) and the next
+// author needs to know 13 is taken.
+const PFLAG_GAS     : u32 = 8192u;
 const PMICRO_SCALE_SHIFT : u32 = 3u;
 const PMICRO_SCALE_MASK  : u32 = 3u;
 const PMICRO_LIFE_SHIFT  : u32 = 5u;
@@ -4106,6 +4125,293 @@ fn lateralDir(i : u32) -> vec2<i32> {
   }
 }
 
+// ======================= THE GAS MOTION MODEL ==============================
+// docs/PLAN_gas_particles.md §2.2. HERE, and not next to either consumer,
+// because "two shaders must AGREE" is the whole criterion for this file: the
+// CA (sim_step.wgsl) moves a gas VOXEL and sim_gas.wgsl moves a gas PARCEL
+// that has left the residency window, and the plan's requirement is that the
+// parcel takes THE MOVES A VOXEL WOULD — not a plausible approximation of
+// them. Two hand-kept copies of a fourteen-step fallback ladder is exactly the
+// pair that drifts, and it drifted within one afternoon of being written: this
+// block spent phase A duplicated under a TEMP-DUP banner with a
+// check_invariants rule comparing the two bodies, which is the cost of NOT
+// being here.
+//
+// EVERYTHING TAKES `T` AS A POINTER. Nothing at module scope in common.wgsl
+// can name the TickParams uniform — each shader declares its own binding — so
+// the whole family threads it, exactly as windAtQ above does.
+//
+// AND EVERYTHING TAKES THE KEY AND THE SUBSTEP. The CA rolls once per gravity
+// SUBSTEP and keys on its cell's slot index; a parcel rolls once per TICK and
+// keys on a hash of its cell and payload. Both are position-derived and
+// neither is a buffer slot (rule 1), but they are not the same value, so the
+// functions take what they need instead of reading a kernel-local global.
+
+// The wind speed at which the drift bias saturates, in the Q16.16 world-cells
+// -per-second windAtQ speaks. Human numbers in, integers out, at shader compile
+// time — the sim_fluid.wgsl discipline, IEEE-exact const folding so the kernel
+// stays integer and deterministic.
+//
+// `/ VOXEL_METERS` IS LOAD-BEARING and it is the reason this constant is here
+// rather than copied: the knob is authored in METRES per second and windAtQ
+// answers in VOXELS, so dropping the conversion makes the reference ten times
+// too small and every gas saturates the bias almost immediately. That is
+// exactly what happened while this block was briefly duplicated — the copy in
+// the gas particle kernel was retyped rather than moved, and a parcel leaned
+// downwind on a scale no voxel ever used. The check that would have caught it
+// compared FUNCTION BODIES and not constants; the check that catches it now is
+// that there is only one definition.
+const WIND_DRIFT_REF : i32 = i32(round(
+    clamp(TUNE_WIND_DRIFT_SPEED, 0.5, 200.0) * 65536.0 / VOXEL_METERS));
+// That cap, in 1024ths. Below 1024 by construction (LoadTuning clamps to 0.95):
+// at certainty the RNG order is gone entirely and a gas stops looking like a
+// gas and starts looking like a conveyor belt.
+const WIND_DRIFT_CAP : i32 = i32(round(clamp(TUNE_WIND_DRIFT_MAX, 0.0, 0.95) * 1024.0));
+
+// Distinct salt for the wind RNG stream. NOT a bit-slice of `rnd`: the movement
+// tail already spends bits 10.., 14.. and 18.. of that word on the direction
+// rotations these decisions sit next to, and correlating "does it go downwind"
+// with "which way did it pick" is exactly the kind of hidden coupling the
+// worldgen salt rule exists to forbid. One extra hash3, drawn only when a
+// material actually responds to wind.
+const WIND_RNG_SALT : u32 = 0x5719u;
+
+fn gasRndK(key : u32, stream : u32, substep : u32,
+           T : ptr<uniform, TickParams>) -> u32 {
+  return hash3((*T).seed ^ WIND_RNG_SALT ^ (stream * 0x9E37u),
+               (*T).tick * 2u + substep, key);
+}
+
+// Which of lateralDir's four codes points most nearly downwind. lateralDir is
+// 0:+x 1:+z 2:-x 3:-z, so this is the dominant horizontal axis and its sign.
+fn windLateralCode(w : vec3<i32>) -> u32 {
+  if (abs(w.x) >= abs(w.z)) { return select(2u, 0u, w.x > 0); }
+  return select(3u, 1u, w.z > 0);
+}
+
+// The starting index for a 4-direction lateral rotation, biased downwind.
+//
+// Returns `base` (the RNG's own offset) unchanged in every case where wind
+// should not apply, so the two call sites read as "the same rotation, sometimes
+// started somewhere else". That framing is the safety argument: no branch here
+// can add a move candidate, only reorder the four that were already going to be
+// tried, so tryMove's write reach and the stamp discipline are untouched.
+fn windLateralStartK(c : vec3<i32>, base : u32, m : Material,
+                     key : u32, substep : u32,
+                     T : ptr<uniform, TickParams>) -> u32 {
+  if ((*T).windMode == WIND_MODE_OFF) { return base; }
+  let resp = i32(matWindResponse(m));
+  if (resp == 0) { return base; }          // most materials: one compare
+  let w = windAtQ(c, T);
+  let mag = max(abs(w.x), abs(w.z));
+  if (mag == 0) { return base; }
+  // Ramp to the cap over [0, WIND_DRIFT_REF], then scale by the authored
+  // response. Both operands are pre-scaled by 1024 before multiplying: a
+  // storm-force Q16.16 speed times 1024 leaves i32, and this runs per moving
+  // voxel per substep.
+  let frac = (min(mag, WIND_DRIFT_REF) >> 10u) * 1024 /
+             max(WIND_DRIFT_REF >> 10u, 1);            // 0..1024
+  var p = ((frac * WIND_DRIFT_CAP) / 1024) * resp / 15;
+  // The dev force multiplier, applied to the PROBABILITY and AFTER the cap —
+  // not to the field, and the difference is the whole reason this tier scales
+  // a different quantity from the particle tier (windAtScaledQ says so at
+  // length). `frac` above saturates once the wind passes windDriftSpeed, which
+  // the default weather already nearly does, so a velocity multiplier here
+  // would move the slider for the first ~2x and then do nothing. Scaling `p`
+  // instead runs all the way to CERTAINTY: at the top of the range every moving
+  // gas voxel tries downwind first and smoke stops looking like smoke and
+  // starts looking like a conveyor belt, which is exactly the thing a "what
+  // does drastic look like" control exists to show.
+  //
+  // The == is an exact-identity guard, not an optimisation: at the shipping 1x
+  // this is arithmetically untouched, so "the slider is at 1x" and "the pinned
+  // hash holds" are one statement.
+  if ((*T).windGasScaleQ != WINDQ_SCALE_ONE) {
+    p = min((p * (*T).windGasScaleQ) / WINDQ_SCALE_ONE, 1024);
+  }
+  if (i32(gasRndK(key, 0u, substep, T) & 1023u) < p) { return windLateralCode(w); }
+  return base;
+}
+
+// ---- THE GAS VERTICAL MODEL (buoyancy vs wind) ----------------------------
+// A gas used to rise UNCONDITIONALLY — step 1 of the movement tail is a bare
+// tryMove straight up, and it returns on success. So for a plume with open sky
+// above it the wind code below never executed at all, and no amount of drift
+// bias could make smoke lean: the bias only ever reordered the FALLBACK
+// candidates, which a freely-rising column never reaches. That, and not a
+// tuning value, is why smoke went straight up in a gale.
+//
+// THE MODEL. Buoyancy is a PROBABILITY, and wind redistributes it. Everything
+// is in 1024ths of a move attempt:
+//
+//     rise = 1024 - down          the move carries +1 Y
+//     sink = (down - 1024) / 2    the move carries -1 Y
+//     flat = the remainder        the move is horizontal only
+//     lean = fh - up              a rising move ALSO carries a downwind step
+//
+// where `down`/`up` are the vertical wind as a fraction of the CA saturation
+// speed (sim.windDriftSpeed) and `fh` is the horizontal one, both scaled by the
+// material's authored response and the dev multiplier. Read off the ladder:
+//
+//     calm              1024 rise, 0 lean   -> straight up, every time
+//     slight crosswind  1024 rise, 102 lean -> 90% straight up, 10% up-diagonal
+//     half downdraft     512 rise, 512 flat -> half the rises become sideways
+//     full downdraft        0 rise, 1024 flat -> buoyancy cancelled, spreads flat
+//     2x downdraft          0 rise, 512 sink -> half its moves are DOWNWARD
+//
+// WHY THE LEAN IS A DIAGONAL and not a flat sideways step. Both spend the same
+// one move, but the diagonal spends it on +1 up AND +1 downwind, so a plume
+// leans without slowing its climb. Paying for drift out of the rise rate would
+// make a 45-degree plume climb at half speed, which is not what a gas in a
+// crosswind does — and the up-diagonals are candidates this kernel already
+// tries, so nothing about write reach changes.
+//
+// AN UPDRAFT straightens rather than accelerates: `rise` is already at
+// certainty in calm air and there is nothing above 1024, so the only way for
+// lift to read as MORE vertical is for it to cancel the lean. That is what
+// `fh - up` says, and it is the correct reading of "goes up relative to the
+// rest" once you notice that "up" was never the scarce thing.
+//
+// HONESTY ABOUT THE SAFETY ARGUMENT. The drift bias could claim it "only
+// reorders candidates the voxel was already going to try". This CANNOT: the
+// sink tier is a genuinely new move, downward, that no gas could make before.
+// So the bound is argued directly instead — every candidate is reach 1, every
+// one goes through the ordinary tryMove (so the stamp discipline, the density
+// test and markDirty are untouched), and a gas can only ever enter a cell
+// LIGHTER-than-air rejects, which is the same test that gated its lateral
+// spread. `canDisplace` is a density comparison, not a direction one, so
+// downward motion needed no change there.
+
+// Signed wind on one axis as a fraction of the CA saturation speed, in 1024ths,
+// scaled by the material's response and the dev multiplier. Clamped to +-3072
+// because 3x saturation is where the sink ramp reaches certainty.
+//
+// abs-then-shift-then-resign, NOT a bare arithmetic shift: >> on a negative i32
+// rounds toward -inf, and an asymmetric round here reads as a permanent drift
+// down-axis. That is the mq() lesson, and it is exactly the kind of bug a world
+// hash cannot tell you about.
+fn windAxisFrac(v : i32, resp : i32, T : ptr<uniform, TickParams>) -> i32 {
+  let lim = 3 * WIND_DRIFT_REF;
+  let a = min(abs(v), lim);
+  var f = ((a >> 10u) * 1024) / max(WIND_DRIFT_REF >> 10u, 1);   // 0..3072
+  f = (f * resp) / 15;
+  if ((*T).windGasScaleQ != WINDQ_SCALE_ONE) {
+    f = (f * (*T).windGasScaleQ) / WINDQ_SCALE_ONE;
+  }
+  f = min(f, 3072);
+  return select(f, -f, v < 0);
+}
+
+// Which lateral the horizontal share takes: downwind with probability `fh`,
+// uniform otherwise.
+//
+// NOT windLateralStartK's ramp, and the difference matters. That cap
+// (sim.windDriftMax) exists because there the bias is the ONLY thing limiting
+// how much a voxel moves downwind, so letting it reach certainty turns smoke
+// into a conveyor belt. Here the AMOUNT is already metered by `lean` and
+// `flat` — capping the DIRECTION too would scatter a share the model has
+// already decided should go downwind, and a 10% southward lean would come out
+// only 6% southward. The uniform fallback is load-bearing at the other end: a
+// pure downdraft has no horizontal wind, `windLateralCode` would hand back a
+// fixed axis for a zero vector, and every gas in the world would spread the
+// same way. fh = 0 must mean "no opinion", which is what "equal chance in any
+// horizontal direction" asks for.
+fn gasLateralRot(w : vec3<i32>, fh : i32, base : u32, r : u32) -> u32 {
+  if (i32(r & 1023u) < fh) { return windLateralCode(w); }
+  return base;
+}
+
+struct GasIntent {
+  dir  : vec3<i32>,   // the primary candidate, relative to the cell
+  rise : bool,        // did the roll choose to go UP (see the fallback note)
+  rot  : u32,         // lateral rotation for the flat/sink fallback scan
+};
+
+// The one roll. Returns straight up — bit for bit what step 1 would have tried
+// — whenever wind is off, the material does not respond, or the air is calm,
+// so a windless world moves exactly as it did before this existed.
+fn gasIntentK(c : vec3<i32>, m : Material, key : u32, base : u32,
+              substep : u32, T : ptr<uniform, TickParams>) -> GasIntent {
+  var g : GasIntent;
+  g.dir = vec3<i32>(0, 1, 0);
+  g.rise = true;
+  g.rot = base;
+  if ((*T).windMode == WIND_MODE_OFF) { return g; }
+  let resp = i32(matWindResponse(m));
+  if (resp == 0) { return g; }              // most materials: one compare
+  let w = windAtQ(c, T);
+  let fy = windAxisFrac(w.y, resp, T);
+  let fh = min(1024, max(abs(windAxisFrac(w.x, resp, T)),
+                         abs(windAxisFrac(w.z, resp, T))));
+  let down = max(0, -fy);
+  let up   = max(0,  fy);
+  let rise = clamp(1024 - down, 0, 1024);
+  let sink = clamp((down - 1024) / 2, 0, 1024);
+  let lean = clamp(fh - up, 0, 1024);
+  // Dead calm is rise=1024, lean=0 — the identity path, and it is checked
+  // rather than computed through so "there is no wind here" and "this cell
+  // moves as it always did" are one statement.
+  if (rise == 1024 && lean == 0) { return g; }
+  let r = gasRndK(key, 1u, substep, T);
+  let tier = i32(r & 1023u);
+  let leanRoll = i32((r >> 10u) & 1023u);
+  g.rot = gasLateralRot(w, fh, base, r >> 20u);
+  let d = lateralDir(g.rot);
+  if (tier < rise) {
+    // It rises. Straight up, or up AND downwind in the same move.
+    if (leanRoll < lean) { g.dir = vec3<i32>(d.x, 1, d.y); }
+    return g;
+  }
+  g.rise = false;
+  if (tier < 1024 - sink) {
+    g.dir = vec3<i32>(d.x, 0, d.y);         // buoyancy cancelled: spread flat
+    return g;
+  }
+  // Driven down, leaning downwind if there is also a crosswind.
+  g.dir = select(vec3<i32>(0, -1, 0), vec3<i32>(d.x, -1, d.y), leanRoll < lean);
+  return g;
+}
+
+// ---- THE GAS FALLBACK LADDER, as a pure index -> candidate function --------
+//
+// The fourteen candidates a gas tries, in the exact order the CA has always
+// tried them:
+//
+//   0        the gasIntent primary — where the buoyancy/wind roll wants to go
+//   1..4     its flat ring, tried ONLY when the roll did not choose to rise
+//            (a downdraft-pinned parcel exhausts the horizontal ring before it
+//            is allowed to fall back on rising; see the call site's note)
+//   5        straight up
+//   6..9     the four up-diagonals, rotation started at rUp
+//   10..13   the four flat laterals, rotation started at rLat
+//
+// `w` is 0 for a candidate that does not exist in this configuration, which is
+// how the conditional ring stays inside a fixed index space.
+//
+// THE TWO ROTATIONS ARE PARAMETERS because they are computed LAZILY at the
+// call site: `windLateralStartK` evaluates the wind field, and a freely rising
+// plume returns at index 0 without ever reaching a ring. Folding them in here
+// would make every rising gas voxel in the world pay for two field samples it
+// never uses.
+const GAS_LADDER_N    : u32 = 14u;
+const GAS_LADDER_RING : u32 = 6u;   // first index that needs rUp / rLat
+
+fn gasLadderStep(g : GasIntent, rUp : u32, rLat : u32, i : u32) -> vec4<i32> {
+  if (i == 0u) { return vec4<i32>(g.dir, 1); }
+  if (i < 5u) {
+    if (g.rise) { return vec4<i32>(0, 0, 0, 0); }
+    let d = lateralDir((i - 1u) + g.rot);
+    return vec4<i32>(d.x, 0, d.y, 1);
+  }
+  if (i == 5u) { return vec4<i32>(0, 1, 0, 1); }
+  if (i < 10u) {
+    let d = lateralDir((i - 6u) + rUp);
+    return vec4<i32>(d.x, 1, d.y, 1);
+  }
+  let d = lateralDir((i - 10u) + rLat);
+  return vec4<i32>(d.x, 0, d.y, 1);
+}
+
 // ============================ PAGE TABLE ACCESSORS ==========================
 // docs/PLAN_page_table.md §2. THE SEAM: every world-coordinate voxel access in
 // every kernel routes through these, so no sim kernel's own code has to know
@@ -4741,7 +5047,8 @@ const PT_K_WATERBODY : u32 = 8u;
 const PT_K_WORLDGEN  : u32 = 9u;   // worldgen.wgsl `main` — the whole world
 const PT_K_GENLIST   : u32 = 10u;  // worldgen.wgsl `list` — a streamed plane
 const PT_K_PAGEFILL  : u32 = 11u;  // worldgen.wgsl `pagefill` — JITTER realize
-const PT_K_COUNT     : u32 = 12u;  // per-kernel tally bank width in pageFaults
+const PT_K_GAS       : u32 = 12u;  // sim_gas.wgsl `gasResolve` — re-entry landing
+const PT_K_COUNT     : u32 = 13u;  // per-kernel tally bank width in pageFaults
 const PT_FAULT_KBASE : u32 = 20u;  // where that bank starts (world.h mirrors it)
 var<private> gPtKernel : u32 = PT_KERNEL;
 
