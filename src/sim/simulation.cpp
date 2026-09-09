@@ -465,6 +465,18 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         // is a shape it CAN consume, which is what lets the crown that falls
         // off a burning tree be lit by the fire it fell out of.
         entry(20, T::ReadOnlyStorage, S::Fragment | S::Vertex),   // glow
+        // The outer gas density box (docs/PLAN_gas_particles.md 2.5). Declared
+        // HERE, on the SIM side, so the far-march sampling that consumes it is
+        // a WGSL-only change: a binding a shader names must exist in the layout
+        // or the pipeline will not build, and that is the one thing a renderer
+        // edit cannot add for itself.
+        //
+        // READ-ONLY and fragment-only. sim_gas's resolve is the sole writer,
+        // on the TICK command buffer, and the raymarcher reads it in the
+        // FRAGMENT stage of the same frame -- the compute->fragment hop that
+        // has no other source of synchronisation in this engine, which is why
+        // GasOuter is on the pass table at all.
+        entry(21, T::ReadOnlyStorage, S::Fragment),               // gasOuter
     };
     renderBGL_ = device.CreateBindGroupLayout(entries, std::size(entries));
 
@@ -621,6 +633,7 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         b(18, world_->opennessGen),
         b(19, world_->irradiance),
         b(20, world_->glow),
+        b(21, world_->gasOuter),
     };
     renderBG_ = device.CreateBindGroup(renderBGL_, entries, std::size(entries), "renderBG");
   }
