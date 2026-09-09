@@ -104,6 +104,10 @@ void DrainFullRefill(GpuContext& ctx, World& world, Simulation& sim,
 // flag: the shadow half is a shading difference no assertion covers.
 static bool CheckFarBlockerFlag(GpuContext& ctx, World& world) {
   constexpr uint32_t kBlockerBit = 0x80u;
+  // The low seven bits are a far PALETTE SLOT, not a material id
+  // (common.wgsl FAR_PAL_MASK). Both claims below only ask whether the
+  // cell HAS a material, and slot 0 is air in both directions, so this
+  // gate never needs the reverse table.
   constexpr uint32_t kMatMask = 0x7Fu;
   const int shift1 = (int)(1 + kFarShiftBase);
   int columns = 0, recovered = 0, disordered = 0;

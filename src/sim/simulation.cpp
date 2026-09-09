@@ -1002,6 +1002,21 @@ void Simulation::UploadTables(const rhi::Queue& queue,
       table[kTintPaletteBaseGpu + base + i].color0 = ArtRgbToGpu(d.tints[i]);
   }
 
+  // Far slot palette, a fourth reserved run (world.h kFarPaletteBaseGpu) and
+  // the REVERSE of the slot every material carries in its own flags word. A
+  // far cascade cell's byte is seven bits of palette slot; raymarch.wgsl's
+  // farPalMat() reads the material id back out of `flags` here, and sim_gas
+  // does the same to ask whether a plume is drifting into a solid.
+  //
+  // `flags` and not a colour field, because what a slot maps to is a MATERIAL
+  // -- the far field wants its palette jitter, its opacity and its class, not
+  // just an RGB. Only the owner writes: an alias shares the slot precisely so
+  // that the byte resolves to the material it named.
+  for (size_t i = 0; i < mats.size() && i < 4096; i++) {
+    if (!mats[i].farPalOwner) continue;
+    table[kFarPaletteBaseGpu + mats[i].farPalSlot].flags = (uint32_t)i;
+  }
+
   // Art palette, same trick one range lower (world.h). Re-applied here because
   // this function rebuilds the WHOLE table: without it, hot-reloading
   // materials.json would silently repaint every mob in its raw material

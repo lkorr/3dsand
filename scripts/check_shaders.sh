@@ -185,6 +185,13 @@ W_TINTSLOTS="$(cpp_const kTintPaletteSlotsGpu)"
   echo "check_shaders: cannot parse kTintPaletteSlotsGpu from $WORLD_H" >&2; exit 1; }
 W_TINTBASE=$((W_ARTBASE - W_TINTSLOTS))
 
+# Far slot palette - the fourth reserved run (world.h kFarPaletteBaseGpu),
+# mapping a far cascade cell's 7-bit FAR SLOT back to the material it paints.
+W_FARSLOTS="$(cpp_const kFarPaletteSlotsGpu)"
+[ -n "$W_FARSLOTS" ] || {
+  echo "check_shaders: cannot parse kFarPaletteSlotsGpu from $WORLD_H" >&2; exit 1; }
+W_FARBASE=$((W_TINTBASE - W_FARSLOTS))
+
 # Static micro-detail brick pool (render-only). kMicroPoolWordsWorld is written
 # as a shift expression in world.h, so scrape the shift and redo the arithmetic
 # rather than trying to parse `1u << 20`.
@@ -297,6 +304,7 @@ PRELUDE_TEXT="$(printf '%s\n' \
   "const STAIN_PALETTE_BASE : u32 = ${W_STAINBASE}u;" \
   "const ART_PALETTE_BASE : u32 = ${W_ARTBASE}u;" \
   "const TINT_PALETTE_BASE : u32 = ${W_TINTBASE}u;" \
+  "const FAR_PALETTE_BASE : u32 = ${W_FARBASE}u;" \
   "const MICRO_POOL_WORDS : u32 = ${W_MICROPOOL}u;" \
   "const MICRO_BODY_POOL_WORDS : u32 = ${W_MBPOOL}u;" \
   "const MATERIAL_SLOTS : u32 = ${W_MATSLOTS}u;" \

@@ -1287,62 +1287,122 @@ def check_plant_tiles():
 
 
 def check_far_material_bits():
-    """A far cascade cell is 7 bits of material id + 1 blocker flag (13.2.2).
+    """A far cascade cell is a 7-bit FAR PALETTE SLOT + 1 blocker flag (13.2.2).
 
-    Three places have to agree that a material id fits in seven bits:
-    common.wgsl's FAR_MAT_MASK (what every reader masks with), materials.cpp's
-    load-time refusal, and the size of materials.json itself. Nothing crashes
-    when they stop agreeing -- the 128th material simply renders as a different
-    colour at distance and claims a blocker wherever bit 7 falls -- so this is
-    the only thing that would ever say so. The JSON side is checked HERE rather
-    than only in the loader because adding a material is a data edit that needs
-    no build, and a data edit that silently breaks the horizon should fail at
-    the same moment it is made.
+    Those seven bits used to be a material id outright, which is why the loader
+    refused a 129th material. They are now an index into the far palette (world.h
+    kFarPaletteBaseGpu), so the ceiling counts DISTINCT FAR COLOURS, not
+    materials: a look-alike shares a slot by authoring `"far": "<material>"`.
+
+    Four places have to agree about the width, and one about the contents:
+    common.wgsl FAR_PAL_MASK (what every reader masks with), common.wgsl
+    MATF_FAR_PAL_MASK (what every writer packs into the material flags word),
+    materials.h kMatFarPal* (the C++ mirror of that field), and world.h
+    kFarPaletteSlotsGpu (the size of the reverse run). Nothing crashes when they
+    stop agreeing -- the far field just paints the wrong material and claims a
+    blocker wherever a stray bit falls -- so this is the only thing that would
+    say so.
+
+    materials.json is checked HERE and not only in the loader because adding a
+    material is a data edit that needs no build, and a data edit that silently
+    breaks the horizon should fail at the moment it is made.
     """
-    wgsl, cpp = read("assets/shaders/common.wgsl"), read("src/sim/materials.cpp")
+    wgsl = read("assets/shaders/common.wgsl")
+    hpp = read("src/sim/materials.h")
+    wh = read("src/sim/world.h")
     js = read("assets/materials/materials.json")
-    if not wgsl or not cpp or not js:
+    if not wgsl or not hpp or not wh or not js:
         return
-    checked.append("far cell material bits")
+    checked.append("far cell palette slot bits")
 
-    m = re.search(r"FAR_MAT_MASK\s*:\s*u32\s*=\s*0x([0-9A-Fa-f]+)u", wgsl)
+    m = re.search(r"FAR_PAL_MASK\s*:\s*u32\s*=\s*0x([0-9A-Fa-f]+)u", wgsl)
     if not m:
-        problems.append("far cell material bits: common.wgsl has no FAR_MAT_MASK "
-                        "-- the 7-bit split cannot be checked")
+        problems.append("far cell palette slot bits: common.wgsl has no "
+                        "FAR_PAL_MASK -- the 7-bit split cannot be checked")
         return
     mask = int(m.group(1), 16)
+    want = mask + 1                       # slots 0..mask, so mask+1 of them
     if mask != 0x7F:
-        problems.append(f"far cell material bits: FAR_MAT_MASK is 0x{mask:X}, not "
-                        "0x7F -- bit 7 is the blocker flag (FAR_BLOCKER_BIT)")
+        problems.append(f"far cell palette slot bits: FAR_PAL_MASK is 0x{mask:X}, "
+                        "not 0x7F -- bit 7 is the blocker flag (FAR_BLOCKER_BIT)")
 
-    # the SECOND `mats.size() > N` refusal in the file; the first is the
-    # 12-bit voxel-word limit (4096) and is a different fact.
-    lims = [int(x) for x in re.findall(r"mats\.size\(\) > (\d+)\)", cpp)]
-    limit = min(lims) if lims else None
-    want = mask + 1                       # ids 0..mask, so mask+1 entries
-    if limit is None:
-        problems.append("far cell material bits: materials.cpp has no "
-                        "`mats.size() > N` refusal for the 7-bit far id -- a "
-                        "128th material would corrupt the far field silently")
-    elif limit != want:
-        problems.append(
-            f"far cell material bits: materials.cpp refuses past {limit} "
-            f"materials but FAR_MAT_MASK 0x{mask:X} allows {want} (ids 0..{mask})")
+    # The material -> slot direction rides in the flags word. Both sides of the
+    # language boundary declare its shift and mask, and a disagreement would
+    # write the slot into the tint base or the wind nibbles.
+    def num(text, pat, label):
+        mm = re.search(pat, text)
+        if not mm:
+            problems.append(f"far cell palette slot bits: cannot find {label}")
+            return None
+        g = mm.group(1)
+        return int(g, 16) if g.lower().startswith("0x") else int(g)
 
-    # The JSON does not list air; the loader prepends it at id 0.
+    wsh = num(wgsl, r"MATF_FAR_PAL_SHIFT\s*:\s*u32\s*=\s*(\d+)u",
+              "common.wgsl MATF_FAR_PAL_SHIFT")
+    wmk = num(wgsl, r"MATF_FAR_PAL_MASK\s*:\s*u32\s*=\s*(0x[0-9A-Fa-f]+)u",
+              "common.wgsl MATF_FAR_PAL_MASK")
+    csh = num(hpp, r"kMatFarPalShift\s*=\s*(\d+)", "materials.h kMatFarPalShift")
+    cmk = num(hpp, r"kMatFarPalMask\s*=\s*(0x[0-9A-Fa-f]+)",
+              "materials.h kMatFarPalMask")
+    if None not in (wsh, csh) and wsh != csh:
+        problems.append(f"far cell palette slot bits: MATF_FAR_PAL_SHIFT is {wsh} "
+                        f"in common.wgsl but kMatFarPalShift is {csh} in "
+                        "materials.h")
+    if None not in (wmk, cmk) and wmk != cmk:
+        problems.append(f"far cell palette slot bits: MATF_FAR_PAL_MASK is "
+                        f"0x{wmk:X} in common.wgsl but kMatFarPalMask is "
+                        f"0x{cmk:X} in materials.h")
+    if wmk is not None and wmk != mask:
+        problems.append(f"far cell palette slot bits: the flags field holds "
+                        f"0x{wmk:X} but the cell byte holds 0x{mask:X} -- a slot "
+                        "would survive one and be truncated by the other")
+    # The flags word: bits 0..7 MATF_* booleans, 8..15 wind, 16..23 tint base,
+    # 24..30 far slot. A shift that let the slot run past bit 31 would drop it.
+    if wsh is not None and wmk is not None and wsh + wmk.bit_length() > 32:
+        problems.append(f"far cell palette slot bits: a {wmk.bit_length()}-bit "
+                        f"slot at shift {wsh} runs off the end of the 32-bit "
+                        "material flags word")
+
+    slots = num(wh, r"kFarPaletteSlotsGpu\s*=\s*(\d+)",
+                "world.h kFarPaletteSlotsGpu")
+    if slots is not None and slots != want:
+        problems.append(f"far cell palette slot bits: world.h reserves {slots} "
+                        f"far palette entries but FAR_PAL_MASK 0x{mask:X} can "
+                        f"only name {want} -- the extra ones are unreachable")
+    cslots = num(hpp, r"kMatFarPalSlots\s*=\s*(\d+)", "materials.h kMatFarPalSlots")
+    if None not in (slots, cslots) and slots != cslots:
+        problems.append(f"far cell palette slot bits: world.h reserves {slots} "
+                        f"far palette entries but materials.h hands out {cslots}")
+
+    # The JSON does not list air; the loader prepends it at id 0 and it always
+    # owns slot 0. Every material without a "far" alias needs a slot of its own.
     try:
         import json as _json
         rows = _json.loads(js).get("materials", [])
     except Exception as e:                                    # noqa: BLE001
-        problems.append(f"far cell material bits: materials.json will not parse ({e})")
+        problems.append(f"far cell palette slot bits: materials.json will not "
+                        f"parse ({e})")
         return
-    if len(rows) + 1 > want:
+    byname = {r.get("id"): r for r in rows if isinstance(r, dict)}
+    for r in rows:
+        far = r.get("far")
+        if not far:
+            continue
+        if far not in byname:
+            problems.append(f'far cell palette slot bits: materials.json "'
+                            f'{r.get("id")}" has far alias "{far}", which is '
+                            "not a material")
+        elif byname[far].get("far"):
+            problems.append(f'far cell palette slot bits: materials.json "'
+                            f'{r.get("id")}" aliases "{far}", which is itself an '
+                            "alias -- name the material that owns the slot")
+    owned = 1 + sum(1 for r in rows if not r.get("far"))   # +1 = implicit air
+    if owned > want:
         problems.append(
-            f"far cell material bits: materials.json declares {len(rows)} "
-            f"materials, {len(rows) + 1} with the implicit air -- the far "
-            f"cascade stores an id in 7 bits and holds at most {want} "
-            f"(ids 0..{mask}). Widen the far cell or drop a material.")
-
+            f"far cell palette slot bits: materials.json needs {owned} distinct "
+            f"far palette slots (with the implicit air) but the far cell byte "
+            f"holds {want}. Give the look-alikes a \"far\": \"<material>\" so "
+            "they share a slot, or widen the far cell.")
 
 # ------------------------------------------------------- readback ring depth
 def check_readback_ring():

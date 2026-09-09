@@ -1540,7 +1540,30 @@ constexpr uint32_t kArtPaletteBaseGpu = kStainPaletteBase - kArtPaletteSlotsGpu;
 // (ids are assigned from the bottom up).
 constexpr uint32_t kTintPaletteSlotsGpu = 256;
 constexpr uint32_t kTintPaletteBaseGpu = kArtPaletteBaseGpu - kTintPaletteSlotsGpu;
-static_assert(kTintPaletteBaseGpu > 1024,
+
+// ---- the FAR SLOT palette (far-field cascade — sim/materials.h) ------------
+// Fourth reserved run, same trick as the three above and for the same reason:
+// the renderer needs index -> material for something that is not a material id.
+//
+// A far cascade cell is ONE byte: seven bits and a conservative blocker flag
+// (common.wgsl FAR_SLOT_MASK / FAR_BLOCKER_BIT). Those seven bits used to BE a
+// material id, which is why `LoadMaterials` refused a 129th material — the far
+// field would have started painting the wrong colour at distance and claiming
+// a blocker wherever bit 7 landed, with nothing to say so. They are now a FAR
+// SLOT: an index into this run, where entry `kFarPaletteBaseGpu + slot` holds
+// (in its `flags` word) the material id that slot paints. Materials that look
+// alike at cascade distance share a slot by authoring `"far": "<material>"` in
+// materials.json, so the 128 is now a budget on DISTINGUISHABLE FAR COLOURS
+// rather than on the material table.
+//
+// Slots are assigned identity-first (material i takes slot i while i < 128), so
+// a table with no aliases writes byte-for-byte what it wrote before this run
+// existed. See LoadMaterials' slot assignment for the aliasing rules.
+//
+// 128 entries exactly fills the 7-bit field; a bigger run would be unreachable.
+constexpr uint32_t kFarPaletteSlotsGpu = 128;
+constexpr uint32_t kFarPaletteBaseGpu = kTintPaletteBaseGpu - kFarPaletteSlotsGpu;
+static_assert(kFarPaletteBaseGpu > 1024,
               "reserved palette runs have grown down into the material id "
               "space — raise kMaterialSlots or shrink a run");
 

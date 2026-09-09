@@ -214,6 +214,12 @@ std::string ShaderConstantPrelude() {
   // a MATF_TINTED material's state nibble indexes (world.h). paletteColor()
   // reads materials[TINT_PALETTE_BASE + tintBase + state].
   o << "const TINT_PALETTE_BASE : u32 = " << kTintPaletteBaseGpu << "u;\n";
+  // Far slot palette: a fourth reserved run mapping a far cascade cell's 7-bit
+  // FAR SLOT back to the material id it paints (world.h). raymarch.wgsl's
+  // farSlotMat() reads materials[FAR_PALETTE_BASE + slot].flags; the forward
+  // direction (material -> slot) rides in every real material's own `flags`
+  // word at MATF_FAR_SLOT_SHIFT, so worldgen needs no table lookup at all.
+  o << "const FAR_PALETTE_BASE : u32 = " << kFarPaletteBaseGpu << "u;\n";
   // Static micro-detail (render-only, DESIGN.md §9): the size of the brick pool
   // the raymarcher bounds-checks its nested DDA fetches against.
   o << "const MICRO_POOL_WORDS : u32 = " << kMicroPoolWordsWorld << "u;\n";

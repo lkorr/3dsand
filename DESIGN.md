@@ -4918,7 +4918,7 @@ where you hear from either (§12b, "The ears are on the character").
 - **Far-field cascades (implemented 2026-08-19; docs/PLAN_far_field_cascades.md):**
   view distance beyond the residency window comes from kFarLevels nested
   toroidal kFarN³ (512³ since 2026-08-29; was 256³) volumes centered on the player, one byte per
-  cell (7 bits of material id + 1 conservative blocker flag; see below). The far grid is DECOUPLED from the window size (phase 5, when the
+  cell (7 bits of FAR PALETTE SLOT + 1 conservative blocker flag; see below). The far grid is DECOUPLED from the window size (phase 5, when the
   window went 512³): level k cells span 2^(k + kFarShiftBase) fine voxels with
   the shift base chosen so level k's box edge is always 2^k WINDOW edges —
   cascade distances scale with the window at constant memory (1024 MiB total at
@@ -5115,16 +5115,58 @@ where you hear from either (§12b, "The ears are on the character").
   a dense cascade level costs volume — see `docs/PLAN_far_field_cascades.md`
   §5.6 for why `kFarN` is the only knob and what a sparse near level would
   take.
+  **Those seven bits are a PALETTE SLOT, not a material id (2026-09-09):**
+  a far cell byte names one of 128 entries in the FAR PALETTE — the fourth
+  reserved run of the GPU material table (`kFarPaletteBaseGpu`, world.h,
+  under the stain / art / tint runs and costing no new binding). Entry
+  `FAR_PALETTE_BASE + slot` holds, in its `flags` word, the material id that
+  slot paints. Two directions, two homes, neither of them a new buffer:
+
+  - **material → slot** rides in every real material's own `flags` word at
+    `MATF_FAR_PAL_SHIFT` (bits 24..30; `kMatFarPalShift` in materials.h is the
+    C++ mirror). The three sites in `worldgen.wgsl` that write a far cell —
+    the sieve `far`, the edit patch `farpatch` and the downsample `fardown` —
+    read it through `matFarPal()`, so a writer pays one field of a material it
+    was already fetching and no table lookup at all.
+  - **slot → material** is `farPalMat()` (common.wgsl), used by
+    `raymarch.wgsl`'s `farMatAt` and by `sim_gas.wgsl`'s `gasFarBlocked`. The
+    "is anything here" tests do NOT translate: slot 0 is air, nothing else
+    maps to material 0, so `farPalAt(..) != 0` is the same answer without the
+    read, which is what AO, `farShadowBlocked` and the occupancy count use.
+
+  WHY. Before this, the byte WAS the id, so `LoadMaterials` had to refuse a
+  129th material outright — the voxel word had room for 4096 and this byte had
+  room for 128 — and nothing else in the engine would have noticed if the
+  refusal were deleted: the 129th material would simply have painted the wrong
+  colour at distance and claimed a blocker wherever bit 7 landed. The
+  indirection turns 128 into a budget on how many things may look DIFFERENT
+  FROM EACH OTHER at cascade scale, which is a far-field question, instead of a
+  cap on the material table, which is not one. Two materials that are
+  indistinguishable at 50 m share a slot:
+
+  ```json
+  { "id": "sandstone", "class": "solid", "far": "sand" }
+  ```
+
+  resolved by name at load. An alias may not point at another alias (one hop,
+  so the slot a byte names always belongs to a material that paints itself) and
+  may not point at air (slot 0 means an EMPTY far cell, not a transparent one).
+  The loader now errors only when the number of materials WITHOUT an alias
+  exceeds 128, and says which knob fixes it; `check_invariants.py` counts the
+  same thing off materials.json, since adding a material is a data edit that
+  needs no build.
+
+  Slots are handed out IDENTITY-FIRST — material `i` takes slot `i` while `i <
+  128`, and only the ids pushed past seven bits take whatever the aliases
+  freed. That is deliberate and load-bearing rather than tidy: on an unaliased
+  table every far byte is bit-for-bit the byte the same worldgen wrote before
+  the palette existed, which is why introducing the whole indirection moved
+  neither the world hash nor a single smoke probe.
   **The far cell byte is 7 + 1, not 8 (13.2.2, 2026-09-01):** bit 7 of every
   far cell is a CONSERVATIVE BLOCKER FLAG — "pristine worldgen puts something a
-  ray would stop on somewhere inside this cell's fine footprint" — and the
-  material id lives in the low seven (`FAR_MAT_MASK` / `FAR_BLOCKER_BIT`,
-  common.wgsl; every reader masks). The id fits because there are 117
-  materials, and it KEEPS fitting because `LoadMaterials` refuses a table past
-  128 entries and `check_invariants.py` refuses a materials.json that would
-  grow one; nothing else in the engine would notice, since a 129th material
-  would merely paint the wrong colour at distance and claim a blocker wherever
-  bit 7 landed. The flag is a pure function of (coords, seed)
+  ray would stop on somewhere inside this cell's fine footprint" — and the low
+  seven are a FAR PALETTE SLOT (`FAR_PAL_MASK` / `FAR_BLOCKER_BIT`,
+  common.wgsl; every reader masks). The flag is a pure function of (coords, seed)
   (`farBlockerBitAt` in worldgen.wgsl) for the same reason `farSurfaceMat` is:
   the sieve has no live grid, so a flag derived from real voxels in the
   downsample would disagree with it at their shared boundary. Its cost is one

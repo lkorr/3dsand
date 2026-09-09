@@ -123,6 +123,27 @@ constexpr uint32_t kMatWindRespShift = 8, kMatWindRespMask = 0xF;
 constexpr uint32_t kMatWindFricShift = 12, kMatWindFricMask = 0xF;
 constexpr uint32_t kMatWindMax = 15;
 
+// ---- far palette slot, bits 24..30 of the SAME flags word ----------------
+// Which of the far-field cascade's 128 palette slots this material paints at
+// distance. A far cell is one byte -- seven bits and a conservative blocker
+// flag (common.wgsl FAR_PAL_MASK / FAR_BLOCKER_BIT) -- and those seven bits
+// used to BE a material id, which is the only reason this loader ever refused
+// a 129th material. They are now an index into the far palette (world.h
+// kFarPaletteBaseGpu), so 128 bounds how many things can look DIFFERENT at
+// cascade scale rather than how many materials may exist.
+//
+// AssignFarSlots below hands them out identity-first, so a table whose
+// materials all fit in seven bits writes byte-for-byte what it wrote before
+// the palette existed. Materials that are indistinguishable at 50 m share a
+// slot by authoring `"far": "<material>"`. Mirrors MATF_FAR_PAL_SHIFT in
+// common.wgsl; worldgen's three far-cell writers read it through matFarPal().
+//
+// Packed into `flags` for the reason the wind nibbles and the tint base give:
+// MaterialGpu is exactly 64 bytes with no spare word. Bit 31 is now the last
+// free bit in it.
+constexpr uint32_t kMatFarPalShift = 24, kMatFarPalMask = 0x7F;
+constexpr uint32_t kMatFarPalSlots = 128;   // == world.h kFarPaletteSlotsGpu
+
 // The default when a material authors no "wind" block, so that adding wind did
 // not mean editing 96 materials — and so that a NEW material is windy on the
 // day it is added rather than inert until someone remembers.
@@ -355,6 +376,22 @@ struct MaterialDef {
   // knowing the layout. Always populated, whether authored or derived.
   uint32_t windResponse = 0;
   uint32_t windFriction = 0;
+  // FAR-FIELD LOOK-ALIKE (materials.json "far": "<material name>"). Names the
+  // material whose far palette slot this one shares -- "at cascade distance I
+  // am that". Empty = this material owns a slot of its own. Resolved by name
+  // at load; an alias may not point at another alias (one hop, so the slot a
+  // byte names is always a material that actually paints itself).
+  std::string farAlias;
+  // Unpacked mirror of gpu.flags bits 24..30 (kMatFarPalShift), kept like
+  // windResponse for anything that wants to read the slot back without knowing
+  // the layout -- including UploadTables, which builds the REVERSE table from
+  // it. The packed word is the truth.
+  uint32_t farPalSlot = 0;
+  // True for the material that OWNS farPalSlot -- i.e. the one the reverse
+  // table maps that slot back to. Exactly one material per live slot has it,
+  // and it is what UploadTables walks: an alias must not overwrite the entry
+  // for the slot it borrowed.
+  bool farPalOwner = false;
   // Sound sets for this surface, keyed by SLOT ("footstep", "impact",
   // "break", ...). Each value names a set relative to the slot's namespace, so
   // "footstep": "leaf" resolves to the set "footsteps/leaf" — one FOLDER under

@@ -195,10 +195,15 @@ fn gasFarBlocked(c : vec3<i32>) -> bool {
   let bi = farVoxByteIndex(1u, cell);
   let b = (farVox[bi >> 2u] >> (8u * (bi & 3u))) & 0xFFu;
   if (b == 0u) { return false; }               // air
-  if (b >= arrayLength(&materials)) { return true; }  // clamped id / blocker flag
+  // The blocker flag alone is terrain the centre sample missed — solid, and
+  // it carries no material of its own. (This used to fall out of indexing the
+  // material table with the whole byte: 128..255 are unwritten entries, whose
+  // zeroed klass is CLASS_SOLID. Same answer, said on purpose.)
+  if ((b & FAR_BLOCKER_BIT) != 0u) { return true; }
   // A gas does not block a gas — smoke downsampled into the cascade must not
-  // wall its own plume off.
-  return materials[b].klass != CLASS_GAS;
+  // wall its own plume off. The byte is a far PALETTE SLOT, so translate it
+  // back to a material first (common.wgsl FAR_PAL_MASK).
+  return materials[farPalMat(&materials, b & FAR_PAL_MASK)].klass != CLASS_GAS;
 }
 
 // Can this parcel enter cell `c`? Inside the window the grid answers (and the

@@ -4853,8 +4853,12 @@ fn far(@builtin(workgroup_id) wg : vec3<u32>,
         byteV = select(0u, FAR_BLOCKER_BIT, y0 <= btops[b]);
       }
       if (farCellIsSolid(mat)) {
-        // shape from the center sample, color from the surface skin (phase 4)
-        byteV |= min(farSurfaceMat(&col, mat, fine, shift, T.seed), FAR_MAT_MASK);
+        // shape from the center sample, color from the surface skin (phase 4).
+        // What lands in the byte is the skin material's FAR PALETTE SLOT, not
+        // its id (common.wgsl FAR_PAL_MASK); slots are identity while the id
+        // fits in seven bits, so an unaliased material table writes exactly
+        // the byte this line wrote before the palette existed.
+        byteV |= matFarPal(&materials, farSurfaceMat(&col, mat, fine, shift, T.seed));
       }
       // farOcc counts NON-EMPTY cells, which now includes blocker-only ones —
       // it gates empty-space skipping for every far reader, and a reader that
@@ -4968,7 +4972,7 @@ fn farpatch(@builtin(workgroup_id) wg : vec3<u32>,
         farColTopFrom(pcol.h, pcol.fluidTop, pfine.x, pfine.z, T.seed),
         pcc, shift, T.seed);
     if (farCellIsSolid(pmat)) {
-      byteV |= min(farSurfaceMat(&pcol, pmat, pfine, shift, T.seed), FAR_MAT_MASK);
+      byteV |= matFarPal(&materials, farSurfaceMat(&pcol, pmat, pfine, shift, T.seed));
     }
     if (byteV != 0u) { pnz += 1u; atomicMax(&wgFarTop, u32(pl.y) + 1u); }
     let bi = (level - 1u) * FAR_VOX + slot * CHUNK_VOL + ci;
@@ -5097,7 +5101,7 @@ fn fardown(@builtin(workgroup_id) wg : vec3<u32>,
         // a downsampled chunk byte-identical to a refilled one at their shared
         // boundary, and it is why farSurfaceMat takes the column rather than
         // deriving a height of its own (surfHeightAt used to, and drifted).
-        byteV |= min(farSurfaceMat(&pcol, mat, fine, shift, T.seed), FAR_MAT_MASK);
+        byteV |= matFarPal(&materials, farSurfaceMat(&pcol, mat, fine, shift, T.seed));
       }
       let bi = farVoxByteIndex(level, cc);
       let bsh = (bi & 3u) * 8u;

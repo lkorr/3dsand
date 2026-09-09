@@ -2997,16 +2997,25 @@ struct FarHit {
   level : u32,         // which cascade level the hit lives in (shadow march)
 };
 
-// The raw far cell byte: 7 bits of material id plus the conservative blocker
-// flag (common.wgsl FAR_BLOCKER_BIT). EVERY reader of farVox goes through one
-// of the three functions below — an unmasked byte read would treat a flagged
-// air cell as material 128.
+// The raw far cell byte: 7 bits of far PALETTE SLOT plus the conservative
+// blocker flag (common.wgsl FAR_BLOCKER_BIT). EVERY reader of farVox goes
+// through one of the four functions below — an unmasked byte read would treat a
+// flagged air cell as slot 128, which does not exist.
 fn farByteAt(level : u32, c : vec3<i32>) -> u32 {
   let bi = farVoxByteIndex(level, c);
   return (farVox[bi >> 2u] >> ((bi & 3u) * 8u)) & 0xFFu;
 }
+// The cell's palette slot, untranslated. This is what the "is there anything
+// here" tests want: slot 0 is air and NOTHING ELSE maps to material 0, so
+// `farPalAt(..) != 0` is exactly `farMatAt(..) != 0` without the table read.
+fn farPalAt(level : u32, c : vec3<i32>) -> u32 {
+  return farByteAt(level, c) & FAR_PAL_MASK;
+}
+// The cell's MATERIAL, translated through the far palette (common.wgsl
+// farPalMat). Everything downstream — shading, the palette jitter, the blocker
+// union, AO — takes a real material id, so the indirection stops here.
 fn farMatAt(level : u32, c : vec3<i32>) -> u32 {
-  return farByteAt(level, c) & FAR_MAT_MASK;
+  return farPalMat(&materials, farPalAt(level, c));
 }
 // "Would a ray stop here?" — the flag OR a real material. A cell can carry
 // material without the flag (an edit downsampled into mid-air) and the flag
@@ -3397,7 +3406,7 @@ fn traceFar(ro : vec3f, rdIn : vec3f, tStart : f32, px : vec2f) -> FarHit {
             rsAdd(RS_FAR, 1u);
             budget -= 1;
             let cellByte = farByteAt(level, vc);
-            var mat = cellByte & FAR_MAT_MASK;
+            var mat = farPalMat(&materials, cellByte & FAR_PAL_MASK);
             // THE BLOCKER FLAG AS A PRIMARY HIT, behind render.farBlockerHitLevel.
             //
             // Shadows take the flag at every level (farShadowDist) because a
@@ -3563,7 +3572,7 @@ fn farLevelForDist(distFine : f32) -> u32 {
 // its other reader (traceFar's primary-hit path, behind
 // render.farBlockerHitLevel).
 fn farShadowBlocked(level : u32, vc : vec3<i32>) -> bool {
-  return (farByteAt(level, vc) & FAR_MAT_MASK) != 0u;
+  return farPalAt(level, vc) != 0u;
 }
 
 // Returns the distance to the blocker in FINE voxels, or -1.0 when the ray
@@ -3702,7 +3711,7 @@ fn farShadowed(level : u32, roFine : vec3f) -> bool {
 // Cells outside the level box do not occlude, as unloaded space does not near.
 fn farAoSolidAt(level : u32, c : vec3<i32>) -> f32 {
   if (!farInBox(c, F.origins[level - 1u].xyz)) { return 0.0; }
-  return select(0.0, 1.0, farMatAt(level, c) != 0u);
+  return select(0.0, 1.0, farPalAt(level, c) != 0u);
 }
 
 fn farVoxelAO(level : u32, cell : vec3<i32>, n : vec3<i32>, a1 : i32, a2 : i32,
@@ -8637,7 +8646,7 @@ fn fs(in : VSOut) -> FSOut {
       // painted onto the surface cell and nothing sits above it to occlude.
       let up = far.cell + vec3<i32>(0, 1, 0);
       if (farInBox(up, F.origins[far.level - 1u].xyz) &&
-          farMatAt(far.level, up) != 0u) { ao *= TUNE_AO_FAR; }
+          farPalAt(far.level, up) != 0u) { ao *= TUNE_AO_FAR; }
       // Same lighting model as the near field (hemisphere ambient x AO, plus
       // direct sun) so the two representations agree across the seam.
       let fsun = keyLightColor() * lambert;
