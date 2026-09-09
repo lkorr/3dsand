@@ -339,7 +339,7 @@ void ParkSampleRequest(World& world, const char* label) {
   g_parkIdleIds.clear();
   std::map<int, uint32_t> yhist;
   uint32_t emptyActive = 0, totalActive = 0;
-  for (uint32_t i = 0; i < kNumChunks; i++) {
+  for (uint32_t i = 0; i < kNumSlots; i++) {
     if (!s.dirtyFlags[i]) continue;
     totalActive++;
     if (s.occupancy[i] == 0) emptyActive++;
@@ -355,7 +355,7 @@ void ParkSampleRequest(World& world, const char* label) {
   // nothing else.
   auto sample = [&](bool wantActive, std::vector<IVec3>& arm) {
     uint32_t pool = 0;
-    for (uint32_t i = 0; i < kNumChunks; i++) {
+    for (uint32_t i = 0; i < kNumSlots; i++) {
       const bool act = s.dirtyFlags[i] != 0;
       if (act != wantActive) continue;
       // Control arm is non-empty chunks only - comparing against sky would
@@ -365,7 +365,7 @@ void ParkSampleRequest(World& world, const char* label) {
     }
     const uint32_t stride = pool > kArm ? pool / kArm : 1u;
     uint32_t seenN = 0;
-    for (uint32_t i = 0; i < kNumChunks && arm.size() < kArm; i++) {
+    for (uint32_t i = 0; i < kNumSlots && arm.size() < kArm; i++) {
       const bool act = s.dirtyFlags[i] != 0;
       if (act != wantActive) continue;
       if (!act && s.occupancy[i] == 0) continue;
@@ -7891,7 +7891,7 @@ int main(int argc, char** argv) {
       ui.tickCpuMs = tickMsSmooth;
       ui.tick = tick;
       ui.activeChunks = world.Snap().activeChunks;
-      ui.totalChunks = kNumChunks;
+      ui.totalChunks = kNumSlots;
       ui.voxelTotal = world.Snap().voxelTotal;
       ui.worldHash = world.Snap().worldHash;
       ui.mirrorValid = world.Snap().valid;
@@ -9014,9 +9014,9 @@ int main(int argc, char** argv) {
       }
       if (ui.showDirtyChunks) {
         const WorldSnapshot& dsnap = world.Snap();
-        if (dsnap.valid && dsnap.dirtyFlags.size() == kNumChunks) {
+        if (dsnap.valid && dsnap.dirtyFlags.size() == kNumSlots) {
           constexpr float h = (float)kChunk * 0.5f;
-          for (uint32_t i = 0; i < kNumChunks && dbg.size() < kMaxDebugBoxes; i++) {
+          for (uint32_t i = 0; i < kNumSlots && dbg.size() < kMaxDebugBoxes; i++) {
             if (!dsnap.dirtyFlags[i]) continue;
             IVec3 wc = world.SlotToWorldChunk(i);
             DebugBox b{};

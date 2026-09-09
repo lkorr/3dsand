@@ -388,8 +388,8 @@ int RunVkInfo(bool lowPower) {
   struct BufSpec { const char* label; uint64_t size; rhi::BufferUsage usage; };
   const BufSpec bufs[] = {
       {"voxels(sample)", 16u << 20, rhi::BufferUsage::Storage | rhi::BufferUsage::CopySrc},
-      {"dirty0", (uint64_t)kNumChunks * 4, rhi::BufferUsage::Storage},
-      {"dirtyList", (uint64_t)kNumChunks * 4, rhi::BufferUsage::Storage},
+      {"dirty0", (uint64_t)kNumSlots * 4, rhi::BufferUsage::Storage},
+      {"dirtyList", (uint64_t)kNumSlots * 4, rhi::BufferUsage::Storage},
       // The five with no CopyDst today — exactly the ones a hand-written
       // zero-init list forgets, which is why the registry exists.
       {"argsStage", 16, rhi::BufferUsage::Storage | rhi::BufferUsage::CopySrc},

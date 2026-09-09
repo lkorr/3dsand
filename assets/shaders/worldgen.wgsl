@@ -6,7 +6,7 @@
 // floor-division fixes for negative coordinates.
 //
 // Two entries, both one workgroup (64 threads) per chunk:
-//   main — full residency window (NUM_CHUNKS workgroups), startup / regen
+//   main — the whole slot space (NUM_SLOTS workgroups), startup / regen
 //   list — T.genCount slot indices from genList, streamed-in chunks
 // Each workgroup fills its chunk, computes its occupancy count in-kernel (the
 // renderer skips occ==0 chunks, so a late count would flicker the horizon),
@@ -4377,9 +4377,7 @@ fn genChunk(slot : u32, li : u32, actIdx : u32) {
   }
   workgroupBarrier();
 
-  let sc = vec3<i32>(vec3<u32>(slot % NCHUNK, (slot / NCHUNK) % NCHUNK,
-                               slot / (NCHUNK * NCHUNK)));
-  let base = slotToWorldChunk(sc, T.origin) * i32(CHUNK);
+  let base = slotWorldChunk(slot, T.origin) * i32(CHUNK);
   var count = 0u;
   var block = 0u;
   var act = 0u;
@@ -4627,7 +4625,7 @@ fn genChunk(slot : u32, li : u32, actIdx : u32) {
   }
 }
 
-// Full residency window: NUM_CHUNKS workgroups.
+// The whole slot space: NUM_SLOTS workgroups.
 @compute @workgroup_size(64)
 fn main(@builtin(workgroup_id) wg : vec3<u32>,
         @builtin(local_invocation_index) li : u32) {
@@ -4691,9 +4689,7 @@ fn pagefill(@builtin(workgroup_id) wg : vec3<u32>,
   gPtKernel = PT_K_PAGEFILL;
   let slot  = pageFillList[wg.x * 2u];
   let entry = pageFillList[wg.x * 2u + 1u];
-  let sc = vec3<i32>(vec3<u32>(slot % NCHUNK, (slot / NCHUNK) % NCHUNK,
-                               slot / (NCHUNK * NCHUNK)));
-  let base = slotToWorldChunk(sc, T.origin) * i32(CHUNK);
+  let base = slotWorldChunk(slot, T.origin) * i32(CHUNK);
   for (var i = li; i < CHUNK_VOL; i += 64u) {
     let l = vec3<i32>(vec3<u32>(i % CHUNK, (i / CHUNK) % CHUNK,
                                 i / (CHUNK * CHUNK)));
@@ -5042,9 +5038,7 @@ fn fardown(@builtin(workgroup_id) wg : vec3<u32>,
            @builtin(local_invocation_index) li : u32) {
   // world fine-voxel base of the dirty chunk this workgroup owns
   let slot = farDirty[wg.x];
-  let sc = vec3<i32>(vec3<u32>(slot % NCHUNK, (slot / NCHUNK) % NCHUNK,
-                               slot / (NCHUNK * NCHUNK)));
-  let base = slotToWorldChunk(sc, T.origin) * i32(CHUNK);
+  let base = slotWorldChunk(slot, T.origin) * i32(CHUNK);
   // Constant over the whole dispatch, like in `far` above (see Poi).
 
   for (var level = 1u; level <= FAR_LEVELS; level++) {

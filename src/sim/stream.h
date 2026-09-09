@@ -129,7 +129,7 @@ class Stream {
     DiscardPendingShifts();  // the verdicts describe the REPLACED world
     store_.Clear();
     farEdits_.Clear();
-    modified_.assign(kNumChunks, 0);
+    modified_.assign(kNumSlots, 0);
   }
 
   ChunkStore& Store() { return store_; }

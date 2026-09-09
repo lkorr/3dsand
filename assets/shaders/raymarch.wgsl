@@ -908,7 +908,7 @@ struct Hit {
   micKey   : u32,     // palette key of the plant PART struck (0 = per cell)
 };
 
-fn inBounds(c : vec3<i32>) -> bool { return inWindow(c, R.origin); }
+fn inBounds(c : vec3<i32>) -> bool { return cellResident(c, R.origin); }
 
 fn chunkOcc(cell : vec3<i32>) -> u32 {
   return occupancy[chunkIndexW(cell)];
@@ -6778,8 +6778,9 @@ struct FSOut {
 // First WORD of node c's grid row, or -1 when the node has no block.
 fn fluidNodeBase(c : vec3<i32>) -> i32 {
   let wc = worldChunkOf(c);
-  if (!chunkInWindow(wc, R.origin)) { return -1; }
-  let bm = fluidBlockMapR[chunkSlotIndex(wc)];
+  let fsl = chunkSlotOf(wc, R.origin);
+  if (fsl == SLOT_NONE) { return -1; }
+  let bm = fluidBlockMapR[fsl];
   if (bm == 0u) { return -1; }
   let lo = vec3<u32>(c & vec3<i32>(CHUNK_MASK));
   return i32(((bm - 1u) * CHUNK_VOL + (lo.z * CHUNK + lo.y) * CHUNK + lo.x) *
@@ -6827,10 +6828,10 @@ fn fluidCellAt(c : vec3<i32>) -> vec3f {
   // fluidFieldAt 2-3 rows, and fluidNormalAt 4 fields — ~32 per water-pixel
   // normal, on top of the march's own budget. Same words read, same order.
   let wc = worldChunkOf(c);
-  let slot = chunkSlotIndex(wc);
+  let slot = chunkSlotOf(wc, R.origin);
   var m = 0.0;
   var vy = 0.0;
-  if (chunkInWindow(wc, R.origin)) {
+  if (slot != SLOT_NONE) {
     let bm = fluidBlockMapR[slot];
     if (bm != 0u) {
       let lo = vec3<u32>(c & vec3<i32>(CHUNK_MASK));
@@ -7192,19 +7193,20 @@ const FLUID_SEAM_SHELL : i32 = 2;
 // block is routinely all air. The Y-occupancy mask (common.wgsl) is the answer,
 // and a zero mask means the block is empty.
 fn fluidChunkWater(wc : vec3<i32>) -> bool {
-  if (!chunkInWindow(wc, R.origin)) { return false; }
-  let slot = chunkSlotIndex(wc);
+  let slot = chunkSlotOf(wc, R.origin);
+  if (slot == SLOT_NONE) { return false; }
   return fluidBlockMapR[slot] != 0u &&
          fluidBlockMapR[fbmYMaskIndex(slot)] != 0u;
 }
 
 fn fluidYMaskOf(wc : vec3<i32>) -> u32 {
-  if (!chunkInWindow(wc, R.origin)) { return 0u; }
-  return fluidBlockMapR[fbmYMaskIndex(chunkSlotIndex(wc))];
+  let ysl = chunkSlotOf(wc, R.origin);
+  if (ysl == SLOT_NONE) { return 0u; }
+  return fluidBlockMapR[fbmYMaskIndex(ysl)];
 }
 
 fn fluidChunkClass(wc : vec3<i32>) -> u32 {
-  if (!chunkInWindow(wc, R.origin)) { return 0u; }
+  if (!chunkResident(wc, R.origin)) { return 0u; }
   if (fluidChunkWater(wc)) { return 1u; }
   // A chunk with only settled CA water has no MPM block allocation, but
   // fluidCellAt still returns non-zero density there (virtual mass from
@@ -7398,6 +7400,10 @@ fn fluidMarch(ro : vec3f, rdIn : vec3f, tMax : f32) -> FluidHit {
       let p = ro + rd * t;
       let c = vec3<i32>(floor(p));
       let wc = worldChunkOf(c);
+      // (d) IDENTITY, not addressing: this only detects "different chunk than
+      // last step" for the memo below, so the plain fold is the right tool and
+      // a ticket needs no entry here. (Two chunks NCHUNK apart alias, which is
+      // pre-existing and harmless: the window clip bounds the march first.)
       let slot = chunkSlotIndex(wc);
       if (slot != heldSlot) {
         heldSlot = slot;
@@ -7677,6 +7683,10 @@ fn fluidMarchBlocky(ro : vec3f, rdIn : vec3f, tMax : f32,
       let p = ro + rd * t;
       let c = vec3<i32>(floor(p));
       let wc = worldChunkOf(c);
+      // (d) IDENTITY, not addressing: this only detects "different chunk than
+      // last step" for the memo below, so the plain fold is the right tool and
+      // a ticket needs no entry here. (Two chunks NCHUNK apart alias, which is
+      // pre-existing and harmless: the window clip bounds the march first.)
       let slot = chunkSlotIndex(wc);
       if (slot != heldSlot) {
         heldSlot = slot;

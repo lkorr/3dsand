@@ -1920,7 +1920,7 @@ void Simulation::EncodeWakeAll(const rhi::Queue& queue) {
   // dirty[page_] is the buffer the NEXT compact pass reads (dirtyIn). One u32
   // flag per chunk; 32768 chunks = 128 KB, far inside the ~1 MB/tick CPU->GPU
   // budget, and only written on a phase boundary.
-  static const std::vector<uint32_t> ones(kNumChunks, 1u);
+  static const std::vector<uint32_t> ones(kNumSlots, 1u);
   queue.WriteBuffer(world_->dirty[page_], 0, ones.data(),
                     ones.size() * sizeof(uint32_t));
 

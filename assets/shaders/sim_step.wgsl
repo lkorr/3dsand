@@ -64,7 +64,7 @@ fn markVoxActive(idx : u32) {
 
 // Unloaded space is solid and inert (DESIGN.md §3): the sim's world edge is
 // the residency window, not a fixed cube.
-fn inBounds(c : vec3<i32>) -> bool { return inWindow(c, T.origin); }
+fn inBounds(c : vec3<i32>) -> bool { return cellResident(c, T.origin); }
 
 // flagSupportLoss now lives in common.wgsl (the SUPPORT_LOSS block): the
 // MutationQueue and blast kernels raise it too, and two copies of the rule
@@ -94,8 +94,9 @@ fn markDirtyR(c : vec3<i32>, reason : u32) {
     for (var j = 0; j < 2; j++) {
       for (var k = 0; k < 2; k++) {
         let n = ch + vec3<i32>(xs[i], ys[j], zs[k]);
-        if (chunkInWindow(n, T.origin)) {
-          atomicOr(&dirtyOut[chunkSlotIndex(n)], reason);
+        let ns = chunkSlotOf(n, T.origin);
+        if (ns != SLOT_NONE) {
+          atomicOr(&dirtyOut[ns], reason);
         }
       }
     }
@@ -438,8 +439,9 @@ fn lightMatches(rule : Reaction, c : vec3<i32>) -> bool {
 // gated on the block map so a fluid-free world pays one zero-load.
 fn fluidOccMat(n : vec3<i32>) -> u32 {
   let wc = worldChunkOf(n);
-  if (!chunkInWindow(wc, T.origin)) { return 0u; }
-  let bm = fluidBlockMapS[chunkSlotIndex(wc)];
+  let wsl = chunkSlotOf(wc, T.origin);
+  if (wsl == SLOT_NONE) { return 0u; }
+  let bm = fluidBlockMapS[wsl];
   if (bm == 0u) { return 0u; }
   let lo = vec3<u32>(n & vec3<i32>(CHUNK_MASK));
   let ci = (bm - 1u) * CHUNK_VOL + (lo.z * CHUNK + lo.y) * CHUNK + lo.x;
@@ -452,8 +454,9 @@ fn fluidOccMat(n : vec3<i32>) -> u32 {
 // atomicOr — order-free, idempotent.
 fn flagFluidConsume(n : vec3<i32>) {
   let wc = worldChunkOf(n);
-  if (!chunkInWindow(wc, T.origin)) { return; }
-  let bm = fluidBlockMapS[chunkSlotIndex(wc)];
+  let wsl = chunkSlotOf(wc, T.origin);
+  if (wsl == SLOT_NONE) { return; }
+  let bm = fluidBlockMapS[wsl];
   if (bm == 0u) { return; }
   let lo = vec3<u32>(n & vec3<i32>(CHUNK_MASK));
   let ci = (bm - 1u) * CHUNK_VOL + (lo.z * CHUNK + lo.y) * CHUNK + lo.x;
@@ -1846,9 +1849,7 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
   // FILM_LICENCE block — this is what stops a neutral rule from keeping a
   // shoreline puddle awake forever.
   gFilmLicence = (dirtyIn[ci] & FILM_LICENCE) != 0u;
-  let sc = vec3<i32>(vec3<u32>(ci % NCHUNK, (ci / NCHUNK) % NCHUNK,
-                               ci / (NCHUNK * NCHUNK)));
-  let wc = slotToWorldChunk(sc, T.origin);
+  let wc = slotWorldChunk(ci, T.origin);
   let base = wc * i32(CHUNK);  // world cell of the chunk corner (may be < 0)
   // The color lattice is GLOBAL in WORLD coords: cell ≡ colorPhase (mod 3).
   // Coloring by slot coords would race at the toroidal wrap (world-adjacent

@@ -251,10 +251,7 @@ fn wbComp(flags : i32) -> u32 {
 // as many words, and the reason a body's chunk list is slots while every test
 // below is in world cells.
 fn wbSlotWorldChunk(slot : u32) -> vec3<i32> {
-  let sc = vec3<i32>(i32(slot % NCHUNK),
-                     i32((slot / NCHUNK) % NCHUNK),
-                     i32(slot / (NCHUNK * NCHUNK)));
-  return slotToWorldChunk(sc, T.origin);
+  return slotWorldChunk(slot, T.origin);
 }
 
 // Next-tick dirty mark including boundary neighbours — the seam's convention,
@@ -279,8 +276,9 @@ fn wbMarkDirty(c : vec3<i32>) {
     for (var j = 0; j < 2; j++) {
       for (var k = 0; k < 2; k++) {
         let n = ch + vec3<i32>(xs[i], ys[j], zs[k]);
-        if (chunkInWindow(n, T.origin)) {
-          atomicOr(&dirtyOut[chunkSlotIndex(n)], DIRTY_R_WATERBODY);
+        let ns = chunkSlotOf(n, T.origin);
+        if (ns != SLOT_NONE) {
+          atomicOr(&dirtyOut[ns], DIRTY_R_WATERBODY);
         }
       }
     }

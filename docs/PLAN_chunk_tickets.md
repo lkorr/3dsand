@@ -1,0 +1,322 @@
+# PLAN: chunk tickets — the CA outside the residency window
+
+Status: **P0 LANDED 2026-09-08 on branch `tickets-p0`** (slot space + the
+addressing audit, `kTicketMax = 0`, bit-identical: the per-site classification
+and the three site classes this plan did not anticipate are in
+`docs/tickets_p0_audit.md`, and its "Deviations" section is the short list of
+what P1 inherits). P1 onward is design. Named "tickets" rather
+than "islands" because `docs/PLAN_rigidbody_islands.md` already owns that word
+for disconnected solid components. Companion: `docs/PLAN_gas_particles.md`
+(independent; phase 2 here can consume its `farVox` blocking).
+
+## 0. Why (read from the code)
+
+- The residency window is a box because a chunk's SLOT is its world coordinate
+  modulo the window: `chunkSlotIndex(wc) = wc & NCHUNK_MASK`
+  (`common.wgsl:3103`). There are exactly `kNumChunks` slots and arithmetic
+  assigns them. A chunk 32 chunks away wants the slot a near chunk holds.
+  "Activate a distant chunk" cannot be done by allocating a page: page space
+  is not the constraint, slot identity is.
+- Out-of-window space is "solid and inert" (`inWindow`, `sim_step.wgsl:66`);
+  a particle leaving the window is deleted (`sim_particle.wgsl:135`, `:235`).
+  Walk away and everything freezes.
+- `Stream::FillSlots(slots, deferWake)` and `EvictSlots(slots, filter)` already
+  take ARBITRARY slot lists, not planes (`stream.h:231,257`). `ChunkStore` is
+  keyed by world chunk coordinate (`Put(IVec3 wc, rle)` / `Get(IVec3 wc)`,
+  `chunkstore.h:31,34`). `FarEdits` keeps cascade cells from healing over an
+  edit. The persistence half exists.
+- The per-cell RNG keys on `cellIndexW(c)` = world position mod 512
+  (`sim_step.wgsl:1931`: `rnd = hash3(T.seed, T.tick*2+substep, slotIdx)`),
+  NOT on the storage slot. So a chunk stored in an extra slot rolls the same
+  dice it would in the window. (An earlier draft of this idea claimed the
+  opposite; it was wrong.)
+- Minecraft precedent, for the policy shape: tickets run at FULL fidelity
+  (there is no cheap distant tier), are explicit / fixed / time-limited
+  (`/forceload`, spawn chunks, portal tickets), and **entities never create
+  tickets** — an arrow does not load the chunks it flies into, because that
+  would let any player load the world by shooting at it.
+
+## 1. Goals and non-goals
+
+Goals
+1. A bounded number of resident chunk GROUPS outside the window ("tickets"),
+   simulated by the SAME CA at the SAME tick rate.
+2. Movement (powder, CA liquid, gas voxels, particle landing) and DECAY
+   reactions run there. A pile that lands out of range settles; an ember that
+   drifts out of range burns out; smoke fades. Things finish instead of
+   freezing.
+3. Rules 1–3 hold. Ticket activation is a MutationQueue op; the twice-run
+   gate is the test.
+4. Phase 0 moves NO hash: a build with `kTicketMax = 0` is bit-identical.
+
+Non-goals (v1)
+- No reduced tick rate. Reaction chances are per-tick probabilities and
+  `1-(1-p)^n` is not `n*p`; a slower ticket would burn, spread and settle
+  differently from the window. Full rate, fewer chunks.
+- No EMIT / PAIR reactions in tickets. Movement and decay TERMINATE — bounded
+  by the matter present. Emit/pair PROPAGATE — bounded only by fuel, which
+  runs past the ticket's edge, so either the ticket grows without bound (rule
+  2) or the fire stops at a straight chunk-aligned edge. Phase 5 makes that a
+  design decision with a cap; it is not v1.
+- No MPM / fluid seam in tickets. CA liquid only.
+- Tickets are not a bigger window. Distant reactions between voxels that both
+  live inside one ticket work; anything that needs the window's full
+  machinery (mobs, physics bodies, the CPU mirror) does not.
+
+## 2. Design
+
+### 2.1 Slot space
+
+Slots `[0, kNumChunks)` are the window, unchanged. Slots
+`[kNumChunks, kNumChunks + kTicketSlots)` are ticket slots.
+
+A ticket is a **5×5×5 chunk box** (125 slots, 2 MiB of pages) of which the
+**inner 3×3×3 is ACTIVE** (dispatched) and the shell is RESIDENT ONLY (read
+by neighbours, written to by reach-1 moves, never dispatched). 3×3×3 with only
+the centre active is too small to hold a pile; 5³/3³ is the smallest box whose
+active region has a full 26-neighbourhood everywhere.
+
+`kTicketMax = 16` → 2,000 slots → `kTicketSlots = 2,048`. `kPoolPages +=
+kTicketSlots` (+32 MiB, and the pool proof in `world.h:1032` still holds: one
+page per slot plus the retire ceiling).
+
+Every per-slot buffer grows by `kTicketSlots`. Known list (audit for more —
+`grep -n "kNumChunks" src/sim/world.h` gives 8 sizing sites; the CPU mirrors
+in `Stream`/`PageTable` have their own):
+`pageTable`, `dirty[2]`, `dirtyList`, `occupancy` (+ sub-occupancy),
+`hasMatter`, `openness`, `opennessGen`, `irradiance` (both planes), `glow`
+src + field, `fluidCellScratch`, `supportOut`, the CPU `modified_`,
+`shiftEvicted_`, `cpuDirty`, snapshot `dirtyFlags`, and `sim_compact`'s
+dispatch `NUM_CHUNKS/64`.
+
+The shadow-cache request record packs a WINDOW-RELATIVE cell in 30 bits
+(`world.h:829`); ticket cells are not window-relative. **Ticket chunks do not
+participate in the shadow cache** (they render via the cascade in v1, §2.7).
+
+### 2.2 Address resolution
+
+New in `common.wgsl` (one deliberate edit; it is the definition two dozen
+shaders must agree on):
+
+```
+const SLOT_NONE : u32 = 0xFFFFFFFFu;
+fn chunkSlotOf(wc) -> u32   // window: wc & MASK. else: probe ticketMap. else SLOT_NONE
+fn chunkResident(wc) -> bool // chunkSlotOf(wc) != SLOT_NONE
+fn cellResident(c)   -> bool // chunkResident(worldChunkOf(c))
+```
+
+`ticketMap`: open-addressed table, `2 * kTicketSlots` entries of
+`(packed wc, slot)`, keyed on a hash of the world chunk coordinate. **CPU-built,
+uploaded between ticks, GPU read-only.** Lookups are order-free; the only
+writer is `Tickets` on the CPU, and it writes as a consequence of a logged op
+(§2.4), so the table is a deterministic function of the op stream.
+
+`slotToWorldChunk(sc, o)` gains the inverse: a slot `>= NUM_CHUNKS` reads its
+world chunk from a `ticketSlotWc[]` array (CPU-written beside the map). Every
+kernel that reconstructs `wc` from a dirty-list slot (`sim_step` main,
+`sim_occupancy`, `sim_openness`, `worldgen` genChunk/fardown, `sim_glow`) goes
+through it.
+
+**The call-site audit IS phase 0.** Counts of `NUM_CHUNKS | chunkSlotIndex |
+chunkInWindow | inWindow | cellIndexW | slotToWorldChunk | WORLD_MASK` per
+shader: common 33, sim_fluid_seam 41, raymarch 21, sim_fluid 15, sim_step 10,
+worldgen 7, sim_particle 7, sim_glow 6, sim_mutate 5, sim_waterbody 4,
+sim_compact 3, sim_openness 3, sim_explode 2, occupancy/pick 1 each. Each
+site is classified as exactly one of:
+- (a) **residency test** ("may I read/write here?") → `cellResident` /
+  `chunkResident`;
+- (b) **storage addressing** (slot for a buffer index) → `chunkSlotOf`;
+- (c) **window-box geometry** (the raymarch's `wloI/wloHi` break, streaming
+  planes, `SpawnWindowOrigin`, the toroidal wrap in `slotToWorldChunk`) →
+  UNCHANGED;
+- (d) **identity** (`cellIndexW` as an RNG / hash / claim key) → UNCHANGED
+  (position-derived already). A ticket cell shares its RNG stream with the
+  window cell 512 voxels away on each axis: deterministic, position-derived,
+  statistically correlated. Accepted for v1; keying every roll on the full
+  world coordinate fixes it and moves the hash — a later, separate commit.
+
+**The hazard to grep for:** any place a STORAGE slot (`ci`, `slot`, a
+`dirtyList[]` entry) is used as a hash / RNG / claim key. `gFilmLicence =
+dirtyIn[ci]` is storage (fine); `hash3(..., ci)` anywhere would be the
+paged-vs-dense divergence class of bug already paid for once (`sim_step.wgsl`
+"TWO BASES" comment).
+
+`voxWordAt` / `voxWordIndex` / `voxStore` are the ONLY voxel accessors
+(CLAUDE.md); they take a cell, resolve its slot, then its page. They change
+in exactly one place each. `World::PageOffsetOfSlot` on the CPU likewise.
+
+### 2.3 Active vs resident
+
+`ticketActive[slot]` bit (one u32 per ticket slot, CPU-written). `sim_compact`
+skips a dirty ticket slot whose active bit is clear. Shell chunks therefore:
+- are readable (neighbourhood is complete for the active interior);
+- receive reach-1 writes from the interior (a grain rolling one cell into the
+  shell lands there and STAYS — frozen until the ticket is released or
+  re-centred, §3 P4);
+- are never dispatched, never react, never mark anything.
+
+That gives every active chunk a full 26-neighbourhood, which is the whole
+reason for the shell. Matter that reaches the shell is the ticket's
+boundary condition, exactly as the window edge is today — but one that is
+resident, so nothing is LOST, it is merely paused.
+
+### 2.4 Lifecycle — a MutationQueue op (rule 3)
+
+New `src/sim/tickets.{h,cpp}`, owned beside `Stream`, driven from
+`Stream::Update` (between ticks, like a shift).
+
+**Ops.** `TicketActivate{centre wc, reason, tick}` and `TicketRelease{id}`
+are MutationQueue ops. That is what makes them deterministic: the sim is
+reproducible with respect to the logged op stream, exactly as brush edits
+are, and the replay log / save carries them. A request that arrives from the
+GPU by async readback (a particle landing, §3 P2) has frame-pacing-dependent
+LATENCY in the game — but it becomes an op at a definite tick and the op is
+what the sim sees. The selftest drives requests synchronously, so its ops
+land at fixed ticks and twice-run compares equal.
+
+**Policy** (all deterministic given the op stream):
+- cap `kTicketMax`; a request past the cap is REFUSED (budget charged before
+  emission — the existing convention), never queued unboundedly;
+- dedupe: a request whose centre falls inside an existing ticket's 5³ box is
+  absorbed (no-op);
+- a request inside the WINDOW is a no-op (the window already simulates it);
+- priority when two requests compete for the last ticket: lower tick, then
+  lexicographic `wc`;
+- **timeout**: released when its active chunks have all been asleep for
+  `kTicketIdleTicks` (from the snapshot `dirtyFlags` the CPU already reads
+  back) OR after `kTicketMaxTicks` regardless — the Minecraft portal-ticket
+  shape, so a waterfall spraying debris cannot pin tickets forever;
+- release: `EvictSlots` → `ChunkStore.Put(wc, rle)` for all 125 chunks →
+  `FarEdits` records the sample voxels → map entries removed, slots returned.
+
+**Activation.** `FillSlots(slots)` with an explicit `slot → wc` list (today it
+derives `wc` from `origin`; it needs the ticket override). Per chunk:
+`ChunkStore.Get(wc)` hit → decode and upload; miss → worldgen `genChunk` for
+that slot (the worldgen dispatch takes a slot list and reconstructs `wc`
+through §2.2's inverse). Deferred wake as the plane fill does.
+
+**Window interaction.** Before a `ShiftAxis` whose incoming plane overlaps a
+ticket's box, RELEASE that ticket first (evict to store), so the plane fill
+decodes the ticket's chunks from the store and nothing is simulated twice or
+lost. Ordering rule in `Stream::Update`, before `CompleteDueShifts`.
+
+### 2.5 Reactions in tickets
+
+`sim_step.wgsl` main: `let isTicket = ci >= NUM_CHUNKS;` (workgroup-uniform,
+one compare). In `doReactions`: `if (isTicket && kind != RK_DECAY) { continue; }`.
+Decay is strictly consumptive, so rule 2 needs no budget for it — the same
+argument `reactions.json` makes for evaporation. `keepAwake` for skipped
+rules is NOT set, so a ticket holding only pair/emit-reactive matter sleeps
+and times out.
+
+Movement is untouched. `flagSupportLoss` / island detection: the CPU
+rigidbody-island scan reads the mirror, which does not cover tickets; a
+ticket's floating voxels stay floating in v1 (they do today outside the
+window too). Stated limitation.
+
+### 2.6 Rule 2 accounting
+
+`kTicketMax * 27` active chunks is the ceiling (432 at 16), above the
+`sleep` gate's 32-at-rest bound. The bound becomes: **at rest there are zero
+tickets** — the timeout guarantees it — and `sleep` asserts both (`awake ≤
+32` and `tickets == 0`). `SANDVOX_PT_AUDIT=1` accounting learns the extra slot
+range.
+
+### 2.7 Rendering
+
+v1: ticket chunks are visible ONLY through the far-field cascade. `fardown`
+runs over the dirty list, so ticket slots downsample into the cascade like
+window chunks do (they need §2.2's inverse to find their `wc`). Coarse, and
+enough to see "the pile is there".
+
+P4: the raymarch, after `tExit`, tests at most `kTicketMax` AABBs (a
+uniform array; 16 slab tests) and runs the ordinary DDA inside a hit box,
+with `cellResident` in place of the `wloI/wloHi` break. Ticket chunks then
+render at full voxel resolution from any distance.
+
+### 2.8 Determinism summary
+
+Op-stream-defined activation; CPU-built map uploaded between ticks; GPU
+reads only; position-keyed RNG unchanged; `dirtyList` order still irrelevant
+(colour lattice is world-coordinate). `--gate determinism` twice-run, and
+`--residency dense` must produce the same hash as paged with tickets active
+(dense has the same extra slots; the map is the same).
+
+## 3. Phases
+
+**P0 — slot space + `chunkSlotOf` + the audit.** Grow every per-slot buffer,
+add the map (empty), route every (a)/(b) site through the new functions,
+`kTicketMax = 0`. **Acceptance is bit-identity**: `determinismHash`, both
+`--vk-smoke` probe tables and `--shader-stats` register counts within noise
+(the accessors gained a compare + a rarely-taken probe; the raymarch DDA must
+not regress — `gotcha-raymarch-register-cliff`). This is the phase with the
+risk in it, and it ships alone.
+
+**P1 — lifecycle + a manual op + gate.** `Tickets` class, the two ops, cap /
+dedupe / timeout / release, `FillSlots` override, window-overlap rule,
+`--ticket x,y,z` debug flag (or a brush op) to activate one. Gate
+`ticket-settle` (§4).
+
+**P2 — particle landing requests.** Relax the two kills in `sim_particle.wgsl`
+for particles that are outside the window: block against `farVox` (from
+PLAN_gas_particles §2.2, or standalone), and on landing append to a
+`ticketReq` buffer (cell, material, tick) read back async; `Tickets` turns
+requests into ops, subject to §2.4's policy. The particle itself is HELD
+(not resolved) until its cell is resident — it parks, exactly as a claim
+loser does today, and lands the tick after activation. If refused (cap), it
+lands as a `FarEdit` only: visible in the cascade, materialised when the
+window arrives.
+
+**P3 — decay in tickets** (§2.5) + gate: an ember placed by op inside a
+ticket becomes ash within its authored lifetime; a `wood` voxel beside it
+does NOT ignite.
+
+**P4 — direct render + re-centring.** §2.7's AABB path. A ticket whose
+activity has moved into its shell re-centres (release + activate one chunk
+over, through the op stream) at most once per `kTicketRecentreTicks`.
+
+**P5 — propagating reactions (design decision, not scheduled).** Allow
+emit/pair in tickets; a burning active chunk requests neighbouring tickets;
+growth stops at the cap, and the fire stops at a straight edge. Or: coarse
+fire spread on the cascade feeding the gas field, converted to voxel fire
+when the window arrives. Decide when P3 has been lived with.
+
+## 4. Gates
+
+- `ticket-settle` (P1): activate a ticket 40 chunks outside the window over
+  real terrain; pour 2,048 sand by op at its centre; 200 ticks. Assert: the
+  sand's column count is conserved; the active chunks are asleep by tick
+  150; the ticket releases by `kTicketIdleTicks` later; `ChunkStore.Get`
+  returns the pile; shifting the window there and reading the mirror finds
+  the pile; twice-run hash equal; paged == dense.
+- `ticket-land` (P2): drop a stone particle off the window edge at 20 m/s;
+  assert a ticket activates within `L` ticks of the landing (L fixed in the
+  harness), the stone is in the store afterwards, and a second stone landing
+  inside the same box does NOT open a second ticket.
+- `ticket-decay` (P3): as §3.
+- `sleep`: `awake ≤ 32 AND tickets == 0` at rest.
+- `determinism`, `page-roundtrip`, `SANDVOX_PT_AUDIT` clean with tickets
+  active.
+
+## 5. Risks and open decisions
+
+- **Audit breadth** (~160 sites, 15 shaders; `sim_fluid_seam.wgsl` alone is
+  41). Misclassifying one (b) site as (c) reads another chunk's memory —
+  which is exactly the failure the page table's own plan spent two review
+  rounds on. P0 is one commit, reviewed against the classification list, and
+  its acceptance is bit-identity.
+- **`FillSlots` / `genChunk` assume slot→wc is `origin`-derived.** Both need
+  the override; `genChunk` must not touch the window's `origin`-dependent
+  state (stamps, openness gen words) for a ticket slot.
+- **Shadow cache** excludes tickets (packing). Fine in v1 because they
+  render via cascade; P4 must either widen the record or keep tickets
+  unshadowed.
+- **Memory**: +32 MiB pool, +~4% on every per-slot table.
+- **Frozen shell.** Matter that rolls into the shell pauses. Re-centring (P4)
+  is the fix; v1 states it.
+- **Selftest fixture.** The gate needs terrain 40 chunks out; `--voxserve` /
+  `TerrainHeight` give the column height without a readback.
+- **Not a bigger window.** A user who wants a distant forest to burn needs
+  P5 or a bigger window (see the `kWorldN` discussion: 1024×512×1024 is 4x
+  memory, fits both `static_assert`s). Tickets are for things that LEAVE the
+  window, not for simulating a region continuously.

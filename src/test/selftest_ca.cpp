@@ -442,9 +442,9 @@ Status RunCaSlope(Ctx& c, std::string& detail, const SlopeArm& arm) {
           divergeBy = expect - (long long)standing;
         }
       }
-      std::vector<uint32_t> flags(kNumChunks, 0);
+      std::vector<uint32_t> flags(kNumSlots, 0);
       rhi::ReadbackBlocking(ctx.device, ctx.queue, sim.DirtyActive(), 0,
-                            flags.data(), kNumChunks * 4, "slopeActive");
+                            flags.data(), kNumSlots * 4, "slopeActive");
       activeInBox = 0;
       for (uint32_t ci : boxChunks)
         if (flags[ci] != 0) activeInBox++;
@@ -662,9 +662,9 @@ Status RunCaLevel(Ctx& c, std::string& detail, const LevelArm& arm) {
     }
     if (i >= 20 && i % 10 == 0) {
       ctx.WaitIdle();
-      std::vector<uint32_t> flags(kNumChunks, 0);
+      std::vector<uint32_t> flags(kNumSlots, 0);
       rhi::ReadbackBlocking(ctx.device, ctx.queue, sim.DirtyActive(), 0,
-                            flags.data(), kNumChunks * 4, "levelActive");
+                            flags.data(), kNumSlots * 4, "levelActive");
       activeInBox = 0;
       for (uint32_t ci : boxChunks)
         if (flags[ci] != 0) activeInBox++;
@@ -926,9 +926,9 @@ Status GateCaGutter(Ctx& c, std::string& detail) {
                {6, 7, 6}, false, false);
     if (i >= 20 && i % 10 == 0) {
       ctx.WaitIdle();
-      std::vector<uint32_t> flags(kNumChunks, 0);
+      std::vector<uint32_t> flags(kNumSlots, 0);
       rhi::ReadbackBlocking(ctx.device, ctx.queue, sim.DirtyActive(), 0,
-                            flags.data(), kNumChunks * 4, "gutterActive");
+                            flags.data(), kNumSlots * 4, "gutterActive");
       activeInBox = 0;
       for (uint32_t ci : boxChunks)
         if (flags[ci] != 0) activeInBox++;

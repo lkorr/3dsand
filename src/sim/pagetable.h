@@ -51,7 +51,7 @@
 // world's cpuDirty is empty and dilating it iterates zero elements.
 class SlotSet {
  public:
-  SlotSet() : bits_((kNumChunks + 63) / 64, 0) {}
+  SlotSet() : bits_((kNumSlots + 63) / 64, 0) {}
 
   bool Has(uint32_t s) const { return (bits_[s >> 6] >> (s & 63)) & 1u; }
   bool Add(uint32_t s) {
@@ -68,8 +68,8 @@ class SlotSet {
   }
   void SetAll() {
     members_.clear();
-    members_.reserve(kNumChunks);
-    for (uint32_t i = 0; i < kNumChunks; i++) members_.push_back(i);
+    members_.reserve(kNumSlots);
+    for (uint32_t i = 0; i < kNumSlots; i++) members_.push_back(i);
     for (uint64_t& w : bits_) w = ~0ull;
   }
   const std::vector<uint32_t>& Members() const { return members_; }
@@ -518,7 +518,7 @@ class PageTable {
 
   // SANDVOX_PT_AUDIT=1: recount the page accounting from the page table, the
   // free list and the retire queue, and abort on the first tick they do not
-  // add up to poolPages_. Off by default (an O(kNumChunks) walk per tick);
+  // add up to poolPages_. Off by default (an O(kNumSlots) walk per tick);
   // `where` names the call site in the report. See the .cpp for why this is
   // separate from the exhaustion report: a slow leak reaches the bottom of a
   // 32,768-page pool thousands of ticks after the tick that caused it.
@@ -533,7 +533,7 @@ class PageTable {
   uint32_t PagesHighWater() const { return pagesHighWater_; }
   // ---- residency attribution (see PageCensus above) ------------------------
   // `Census()` is the most recent tick's, recomputed inside ConsumeOccupancy's
-  // existing kNumChunks walk. `CensusAtHighWater()` is a copy latched on the
+  // existing kNumSlots walk. `CensusAtHighWater()` is a copy latched on the
   // tick pagesInUse_ last set a new maximum — which is the tick a --frames run
   // actually wants to explain, and which is gone by the time it exits.
   const PageCensus& Census() const { return census_; }
@@ -574,7 +574,7 @@ class PageTable {
   void DrainRetired(uint32_t tick);
 
   World* world_ = nullptr;
-  uint32_t poolPages_ = kNumChunks;
+  uint32_t poolPages_ = kNumSlots;
   bool paged_ = false;
   bool auditEnabled_ = false;             // SANDVOX_PT_AUDIT
 
@@ -656,7 +656,7 @@ class PageTable {
   bool jitterEnabled_ = true;
 
   // Consecutive snapshots reporting occTotal == 0, per slot. Maintained in the
-  // loop that already walks all kNumChunks occupancy entries, so a settled
+  // loop that already walks all kNumSlots occupancy entries, so a settled
   // world does one extra uint8 increment per chunk inside a loop it was
   // already running and takes NO further action. That is the rule-2 story, and
   // it is honest: not free, but not a new scan either.
@@ -751,7 +751,7 @@ class PageTable {
   // allocator; one that cannot is a leak with extra steps.
   //
   // THE VALUE LIVES IN world.h, because kPoolPages is derived from it: the
-  // pool must exceed kNumChunks by this cap times kRetireTicks or the free
+  // pool must exceed kNumSlots by this cap times kRetireTicks or the free
   // list can empty while thousands of slots are still sentinels. Aliased here
   // rather than restated so the two cannot drift.
   static constexpr size_t kMaxFreeProbesPerTick = kPageFreeProbesPerTick;
@@ -791,13 +791,13 @@ class PageTable {
   // is not copied at all, so it has no in-flight reference to have.
   //
   // Like kMaxFreeProbesPerTick, the VALUE lives in world.h next to kPoolPages,
-  // which is sized as kNumChunks + the product of the two. The static_assert
+  // which is sized as kNumSlots + the product of the two. The static_assert
   // below is the mechanical statement of that dependency: it fires if anyone
   // ever sets kPoolPages independently of the queue that eats into it.
   struct Retired { uint32_t page; uint32_t tick; };
   std::deque<Retired> retire_;
   static constexpr uint32_t kRetireTicks = kPageRetireTicks;
-  static_assert(kPoolPages >= kNumChunks + kPageRetireCeiling,
+  static_assert(kPoolPages >= kNumSlots + kPageRetireCeiling,
                 "page pool must cover one page per chunk slot PLUS every page "
                 "the retire queue can hold out of the free list; otherwise "
                 "Alloc() can abort while slots are still sentinels");

@@ -602,14 +602,14 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
       const std::vector<uint32_t>& lbl = wb.ChunkBody();
       auto touch = [&](IVec3 wc, IVec3 cell) {
         if (worldEdited || !world.ChunkInWindow(wc)) return;
-        if (lbl.size() == kNumChunks && lbl[World::SlotChunkIndex(wc)] != 0) {
+        if (lbl.size() == kNumSlots && lbl[World::SlotChunkIndex(wc)] != 0) {
           worldEdited = true;
           editCell = cell;
         }
       };
       for (uint32_t i = 0; i < cellCount && !worldEdited; i++) {
         const uint32_t slot = cells[i].cellIdx / kChunkVol;
-        if (slot < kNumChunks && lbl.size() == kNumChunks && lbl[slot] != 0) {
+        if (slot < kNumSlots && lbl.size() == kNumSlots && lbl[slot] != 0) {
           worldEdited = true;
           // The op carries a SLOT-linear index, so the world position comes
           // back through the window (SlotToWorldChunk) plus the in-chunk
@@ -1548,8 +1548,8 @@ void SubmitWorldgen(GpuContext& ctx, World& world, Simulation& sim, uint32_t see
     std::vector<uint32_t> batch;
     std::vector<uint32_t> vox((size_t)kGenBatch * kChunkVol);
     batch.reserve(kGenBatch);
-    for (uint32_t base = 0; base < kNumChunks; base += kGenBatch) {
-      const uint32_t n = std::min(kGenBatch, kNumChunks - base);
+    for (uint32_t base = 0; base < kNumSlots; base += kGenBatch) {
+      const uint32_t n = std::min(kGenBatch, kNumSlots - base);
       batch.clear();
       for (uint32_t k = 0; k < n; k++) {
         batch.push_back(base + k);
@@ -1625,10 +1625,10 @@ void SubmitWorldgen(GpuContext& ctx, World& world, Simulation& sim, uint32_t see
     // nothing wider.
     uint32_t woken = 0;
     {
-      std::vector<uint32_t> woke((size_t)kNumChunks, 0u);
+      std::vector<uint32_t> woke((size_t)kNumSlots, 0u);
       rhi::ReadbackBlocking(ctx.device, ctx.queue, world.dirty[0], 0,
-                            woke.data(), (size_t)kNumChunks * 4, "wgWake");
-      for (uint32_t s = 0; s < kNumChunks; s++) {
+                            woke.data(), (size_t)kNumSlots * 4, "wgWake");
+      for (uint32_t s = 0; s < kNumSlots; s++) {
         if (woke[s] == 0u) continue;
         world.pages->RefilledSlot(s);
         woken++;
@@ -1833,11 +1833,11 @@ void ReadPageFaultsSync(GpuContext& ctx, World& world, uint32_t out[4]) {
 }
 
 uint32_t ReadActiveChunksSync(GpuContext& ctx, World& world, Simulation& sim) {
-  std::vector<uint32_t> flags(kNumChunks, 0);
+  std::vector<uint32_t> flags(kNumSlots, 0);
   rhi::ReadbackBlocking(ctx.device, ctx.queue, sim.DirtyActive(), 0, flags.data(),
-                        kNumChunks * 4, "activeRead");
+                        kNumSlots * 4, "activeRead");
   uint32_t n = 0;
-  for (uint32_t i = 0; i < kNumChunks; i++)
+  for (uint32_t i = 0; i < kNumSlots; i++)
     if (flags[i] != 0) n++;
   return n;
 }

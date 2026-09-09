@@ -125,15 +125,15 @@ const EX_EXCITED_LIVE : u32 = 3u; // of those, EXCITE-origin (FP_EXCITED) — th
                                   // population the ceiling actually bounds
 const EX_ARGS : u32 = 4u;         // [4..6] emit dispatch args (listCount,1,1)
 const EX_COUNTS : u32 = 16u;                       // + slot
-const EX_BASES : u32 = 16u + NUM_CHUNKS;           // + slot
-const EX_LIST : u32 = 16u + 2u * NUM_CHUNKS;       // + list index
+const EX_BASES : u32 = 16u + NUM_SLOTS;            // + slot
+const EX_LIST : u32 = 16u + 2u * NUM_SLOTS;        // + list index
 const EX_REFUSED : u32 = 0xFFFFFFFFu;
 // Settle scratch layout.
 const SP_SPEED : u32 = 0u;                         // + slot
-const SP_MARK : u32 = NUM_CHUNKS;                  // + slot
-const SP_COUNT : u32 = 2u * NUM_CHUNKS;            // settle list count
-const SP_LIST : u32 = 2u * NUM_CHUNKS + 1u;        // + list index (16)
-const SP_BINS : u32 = 2u * NUM_CHUNKS + 18u;       // + (listIdx*CHUNK_VOL+cell)*2
+const SP_MARK : u32 = NUM_SLOTS;                   // + slot
+const SP_COUNT : u32 = 2u * NUM_SLOTS;             // settle list count
+const SP_LIST : u32 = 2u * NUM_SLOTS + 1u;         // + list index (16)
+const SP_BINS : u32 = 2u * NUM_SLOTS + 18u;        // + (listIdx*CHUNK_VOL+cell)*2
 const SETTLE_MAX : u32 = 16u;                      // kFluidSettleMax
 // Per-COLUMN excite-unstable mask: 256 columns per settling block, 8 words of
 // bits each. Feasibility refusal stays whole-block (see settleCheck), but
@@ -245,8 +245,9 @@ fn markDirtyNext(c : vec3<i32>) {
     for (var j = 0; j < 2; j++) {
       for (var k = 0; k < 2; k++) {
         let n = ch + vec3<i32>(xs[i], ys[j], zs[k]);
-        if (chunkInWindow(n, T.origin)) {
-          atomicOr(&dirtyOut[chunkSlotIndex(n)], DIRTY_R_SEAM);
+        let ns = chunkSlotOf(n, T.origin);
+        if (ns != SLOT_NONE) {
+          atomicOr(&dirtyOut[ns], DIRTY_R_SEAM);
         }
       }
     }
@@ -467,8 +468,9 @@ fn seamLiquid(mat : u32) -> bool {
 // -> whole-particles conversion mirrorFold uses.
 fn seamExcitedEighths(c : vec3<i32>) -> u32 {
   let wc = worldChunkOf(c);
-  if (!chunkInWindow(wc, T.origin)) { return 0u; }
-  let bm = atomicLoad(&fluidBlockMapR[chunkSlotIndex(wc)]);
+  let wsl = chunkSlotOf(wc, T.origin);
+  if (wsl == SLOT_NONE) { return 0u; }
+  let bm = atomicLoad(&fluidBlockMapR[wsl]);
   if (bm == 0u) { return 0u; }
   return u32(clamp(fluidGridR[seamNodeBase(bm, c)] >> 10u, 0, 8));
 }
@@ -479,7 +481,7 @@ fn seamExcitedEighths(c : vec3<i32>) -> u32 {
 // content and are simply skipped by every test below — water resting against
 // stone is stable, which is the whole point of a basin.
 fn seamNeighbourState(c : vec3<i32>) -> vec2<u32> {
-  if (!inWindow(c, T.origin)) { return vec2<u32>(1u, 0u); }
+  if (!cellResident(c, T.origin)) { return vec2<u32>(1u, 0u); }
   let w = voxWordAt(c);
   let mat = voxMat(w);
   if (mat == MAT_AIR) { return vec2<u32>(0u, seamExcitedEighths(c)); }
@@ -689,9 +691,7 @@ fn seamDrainShellHit(c : vec3<i32>, mat : u32) -> bool {
 fn exciteDetect(@builtin(workgroup_id) wg : vec3<u32>,
                 @builtin(local_invocation_index) li : u32) {
   let ci = dirtyList[wg.x];
-  let sc = vec3<i32>(vec3<u32>(ci % NCHUNK, (ci / NCHUNK) % NCHUNK,
-                               ci / (NCHUNK * NCHUNK)));
-  let wc = slotToWorldChunk(sc, T.origin);
+  let wc = slotWorldChunk(ci, T.origin);
   let base = wc * i32(CHUNK);
   for (var s = 0u; s < 16u; s++) {
     let localIdx = li * 16u + s;
@@ -739,7 +739,7 @@ fn exciteDetect(@builtin(workgroup_id) wg : vec3<u32>,
     var atSurface = true;
     {
       let above = c + vec3<i32>(0, 1, 0);
-      if (inWindow(above, T.origin)) {
+      if (cellResident(above, T.origin)) {
         atSurface = voxMat(voxWordAt(above)) != mat;
       }
     }
@@ -751,7 +751,7 @@ fn exciteDetect(@builtin(workgroup_id) wg : vec3<u32>,
     var byFall = false;
     if (T.fluidExciteEnable != 0u && atSurface) {
       let below = c + vec3<i32>(0, -1, 0);
-      if (inWindow(below, T.origin) && voxMat(voxWordAt(below)) == MAT_AIR) {
+      if (cellResident(below, T.origin) && voxMat(voxWordAt(below)) == MAT_AIR) {
         excite = true;
         byFall = true;
       }
@@ -777,7 +777,7 @@ fn exciteDetect(@builtin(workgroup_id) wg : vec3<u32>,
       // configuration excite immediately tears up again.
       var onBase = true;
       let bw = c + vec3<i32>(0, -1, 0);
-      if (inWindow(bw, T.origin)) {
+      if (cellResident(bw, T.origin)) {
         onBase = !seamLiquid(voxMat(voxWordAt(bw)));
       }
       if (!excite && onBase && SEAM_EX_PERCH) {
@@ -838,8 +838,9 @@ fn exciteDetect(@builtin(workgroup_id) wg : vec3<u32>,
         else if (f == 4u) { d.z = 1; } else { d.z = -1; }
         let n = c + d;
         let nwc = worldChunkOf(n);
-        if (!chunkInWindow(nwc, T.origin)) { continue; }
-        let bm = atomicLoad(&fluidBlockMapR[chunkSlotIndex(nwc)]);
+        let nsl = chunkSlotOf(nwc, T.origin);
+        if (nsl == SLOT_NONE) { continue; }
+        let bm = atomicLoad(&fluidBlockMapR[nsl]);
         if (bm == 0u) { continue; }
         let nb = seamNodeBase(bm, n);
         if (fluidGridR[nb] < 16) { continue; }  // FLUID_MASS_MIN
@@ -881,7 +882,7 @@ fn exciteDetect(@builtin(workgroup_id) wg : vec3<u32>,
     if (byFall || byShell) {
       for (var d = 1; d <= 15; d++) {
         let a = c + vec3<i32>(0, d, 0);
-        if (!inWindow(a, T.origin) || voxMat(voxWordAt(a)) != mat) { break; }
+        if (!cellResident(a, T.origin) || voxMat(voxWordAt(a)) != mat) { break; }
         depth += 1u;
       }
     }
@@ -906,7 +907,7 @@ var<workgroup> exBudget : u32;
 
 @compute @workgroup_size(256)
 fn exciteScan(@builtin(local_invocation_index) li : u32) {
-  let span = NUM_CHUNKS / 256u;
+  let span = NUM_SLOTS / 256u;
   var slots = 0u;
   var parts = 0u;
   for (var s = li * span; s < (li + 1u) * span; s++) {
@@ -1078,9 +1079,7 @@ fn exciteEmit(@builtin(workgroup_id) wg : vec3<u32>,
       atomicStore(&fluidArgs[FA_LASTSLOT], ci);
     }
   }
-  let sc = vec3<i32>(vec3<u32>(ci % NCHUNK, (ci / NCHUNK) % NCHUNK,
-                               ci / (NCHUNK * NCHUNK)));
-  let wc = slotToWorldChunk(sc, T.origin);
+  let wc = slotWorldChunk(ci, T.origin);
   let base = wc * i32(CHUNK);
   // Per-thread candidate-particle count over its 16 cells, for the prefix.
   var mine = 0u;
@@ -1203,8 +1202,9 @@ fn consumeApply(@builtin(global_invocation_id) gid : vec3<u32>) {
   var p = fluidParticles[gid.x];
   if (!fpAlive(p.attr)) { return; }
   let cell = vec3<i32>(p.px >> 16u, p.py >> 16u, p.pz >> 16u);
-  if (!inWindow(cell, T.origin)) { return; }
-  let bm = atomicLoad(&fluidBlockMapR[chunkSlotIndex(worldChunkOf(cell))]);
+  let csl = chunkSlotOf(worldChunkOf(cell), T.origin);
+  if (csl == SLOT_NONE) { return; }
+  let bm = atomicLoad(&fluidBlockMapR[csl]);
   if (bm == 0u) { return; }
   let lo = vec3<u32>(cell & vec3<i32>(CHUNK_MASK));
   let ci = (bm - 1u) * CHUNK_VOL + (lo.z * CHUNK + lo.y) * CHUNK + lo.x;
@@ -1253,8 +1253,8 @@ fn particleTick(@builtin(global_invocation_id) gid : vec3<u32>) {
   let p = fluidParticles[gid.x];
   if (!fpAlive(p.attr)) { return; }
   let cell = vec3<i32>(p.px >> 16u, p.py >> 16u, p.pz >> 16u);
-  if (!inWindow(cell, T.origin)) { return; }
-  let slot = chunkSlotIndex(worldChunkOf(cell));
+  let slot = chunkSlotOf(worldChunkOf(cell), T.origin);
+  if (slot == SLOT_NONE) { return; }
   // seamRestVy: strip the free-surface gravity bias (see the const block).
   let sx = p.vx >> 8u; let sy = seamRestVy(p.vy) >> 8u; let sz = p.vz >> 8u;
   let s2 = u32(sx * sx + sy * sy + sz * sz);
@@ -1289,13 +1289,15 @@ fn particleTick(@builtin(global_invocation_id) gid : vec3<u32>) {
     else if (f == 2u) { d.y = 1; } else if (f == 3u) { d.y = -1; }
     else if (f == 4u) { d.z = 1; } else { d.z = -1; }
     let n = cell + d;
-    if (!inWindow(n, T.origin)) { continue; }
+    if (!cellResident(n, T.origin)) { continue; }
     let nmat = voxMat(voxWordAt(n));
     if (nmat == MAT_AIR) { continue; }
     let nk = materials[nmat].klass;
     if (nk != CLASS_SOLID && nk != CLASS_POWDER) { continue; }
     let nwc = worldChunkOf(n);
-    let nbm = atomicLoad(&fluidBlockMapR[chunkSlotIndex(nwc)]);
+    let nsl2 = chunkSlotOf(nwc, T.origin);
+    if (nsl2 == SLOT_NONE) { continue; }
+    let nbm = atomicLoad(&fluidBlockMapR[nsl2]);
     if (nbm == 0u) { continue; }  // outside particle support: no block, and
                                   // no contact that matters
     let nlo = vec3<u32>(n & vec3<i32>(CHUNK_MASK));
@@ -1322,9 +1324,7 @@ fn stainApply(@builtin(workgroup_id) wg : vec3<u32>,
   let sType = intent & 0x7u;
   let sAmt = (intent >> 3u) & 0xFu;
   let slot = fluidBlockList[block];
-  let sc = vec3<i32>(i32(slot % NCHUNK), i32((slot / NCHUNK) % NCHUNK),
-                     i32(slot / (NCHUNK * NCHUNK)));
-  let wc = slotToWorldChunk(sc, T.origin);
+  let wc = slotWorldChunk(slot, T.origin);
   let lo = vec3<i32>(i32(localIdx & 15u), i32((localIdx >> 4u) & 15u),
                      i32(localIdx >> 8u));
   let c = wc * i32(CHUNK) + lo;
@@ -1385,7 +1385,7 @@ fn stainApply(@builtin(workgroup_id) wg : vec3<u32>,
 @compute @workgroup_size(256)
 fn settleJudge(@builtin(global_invocation_id) gid : vec3<u32>) {
   let slot = gid.x;
-  if (slot >= NUM_CHUNKS) { return; }
+  if (slot >= NUM_SLOTS) { return; }
   let sp = atomicLoad(&settleScratch[SP_SPEED + slot]);
   // ONE THREAD OWNS ONE SLOT, so the load/modify/store below needs no atomic
   // read-modify-write and is order-independent by construction (rule 1). The
@@ -1452,7 +1452,7 @@ var<workgroup> ssForce : array<u32, 256>;   // stuck-slot count per partition
 fn settleScan(@builtin(local_invocation_index) li : u32) {
   // TRUE SLEEP (plan §7 item 2). This scan and the solver's `alloc` are the
   // only fluid passes whose cost does NOT come from an indirect arg — both are
-  // single-workgroup walks of all NUM_CHUNKS slots, so a world that poured once
+  // single-workgroup walks of all NUM_SLOTS slots, so a world that poured once
   // and settled kept paying them forever (the CPU-side fluidCount is monotone
   // by design, so the TABLE keeps being recorded — that is the determinism
   // contract, and the sanctioned way to make it free is exactly this).
@@ -1462,7 +1462,7 @@ fn settleScan(@builtin(local_invocation_index) li : u32) {
   // storage read is non-uniform to the compiler, and a barrier in non-uniform
   // control flow is a WGSL validation error. Skipping the WORK is enough.)
   let asleep = atomicLoad(&fluidArgs[FA_LIVE]) == 0u;
-  let span = NUM_CHUNKS / 256u;
+  let span = NUM_SLOTS / 256u;
   var n = 0u;
   var nf = 0u;
   if (!asleep) {
@@ -1576,8 +1576,8 @@ fn settleBin(@builtin(global_invocation_id) gid : vec3<u32>) {
   let p = fluidParticles[gid.x];
   if (!fpAlive(p.attr)) { return; }
   let cell = vec3<i32>(p.px >> 16u, p.py >> 16u, p.pz >> 16u);
-  if (!inWindow(cell, T.origin)) { return; }
-  let slot = chunkSlotIndex(worldChunkOf(cell));
+  let slot = chunkSlotOf(worldChunkOf(cell), T.origin);
+  if (slot == SLOT_NONE) { return; }
   let mark = atomicLoad(&settleScratch[SP_MARK + slot]);
   if ((mark & MARK_SETTLING) == 0u) { return; }
   let listIdx = mark & MARK_LIST_MASK;
@@ -1602,7 +1602,7 @@ fn seamColumnRefused(listIdx : u32, col : u32) -> bool {
 // Support under a settling column: what water can rest on. Out-of-window is
 // solid and inert (the residency rule).
 fn seamSupport(c : vec3<i32>) -> bool {
-  if (!inWindow(c, T.origin)) { return true; }
+  if (!cellResident(c, T.origin)) { return true; }
   let w = voxWordAt(c);
   let mat = voxMat(w);
   if (mat == MAT_AIR) { return false; }
@@ -1915,9 +1915,7 @@ fn settleCheck(@builtin(workgroup_id) wg : vec3<u32>,
   if (live) {
     ci = atomicLoad(&settleScratch[SP_LIST + wg.x]);
     forced = (atomicLoad(&settleScratch[SP_MARK + ci]) & MARK_FORCED) != 0u;
-    let sc = vec3<i32>(vec3<u32>(ci % NCHUNK, (ci / NCHUNK) % NCHUNK,
-                                 ci / (NCHUNK * NCHUNK)));
-    base = slotToWorldChunk(sc, T.origin) * i32(CHUNK);
+    base = slotWorldChunk(ci, T.origin) * i32(CHUNK);
   }
   let cx = i32(li & 15u);
   let cz = i32(li >> 4u);
@@ -2090,9 +2088,7 @@ fn settleCommit(@builtin(workgroup_id) wg : vec3<u32>,
   // shape than the one that was declared feasible — the two run "the identical
   // arithmetic" and that is the whole basis of all-or-nothing refusal.
   let forced = (mark & MARK_FORCED) != 0u;
-  let sc = vec3<i32>(vec3<u32>(ci % NCHUNK, (ci / NCHUNK) % NCHUNK,
-                               ci / (NCHUNK * NCHUNK)));
-  let base = slotToWorldChunk(sc, T.origin) * i32(CHUNK);
+  let base = slotWorldChunk(ci, T.origin) * i32(CHUNK);
   let cx = i32(li & 15u);
   let cz = i32(li >> 4u);
   // Columns the stability test refused keep their water as particles. Their
@@ -2117,8 +2113,9 @@ fn mirrorFold(@builtin(workgroup_id) wg : vec3<u32>,
   let wc = T.mirrorBase + vec3<i32>(i32(m % 3u), i32((m / 3u) % 3u),
                                     i32(m / 9u));
   var bm = 0u;
-  if (chunkInWindow(wc, T.origin)) {
-    bm = atomicLoad(&fluidBlockMapR[chunkSlotIndex(wc)]);
+  let msl = chunkSlotOf(wc, T.origin);
+  if (msl != SLOT_NONE) {
+    bm = atomicLoad(&fluidBlockMapR[msl]);
   }
   for (var wpos = li * 4u; wpos < li * 4u + 4u; wpos++) {
     var packed = 0u;
@@ -2142,8 +2139,8 @@ fn settleKill(@builtin(global_invocation_id) gid : vec3<u32>) {
   var p = fluidParticles[gid.x];
   if (!fpAlive(p.attr)) { return; }
   let cell = vec3<i32>(p.px >> 16u, p.py >> 16u, p.pz >> 16u);
-  if (!inWindow(cell, T.origin)) { return; }
-  let slot = chunkSlotIndex(worldChunkOf(cell));
+  let slot = chunkSlotOf(worldChunkOf(cell), T.origin);
+  if (slot == SLOT_NONE) { return; }
   let mark = atomicLoad(&settleScratch[SP_MARK + slot]);
   if ((mark & MARK_SETTLING) == 0u || (mark & MARK_REFUSED) != 0u) { return; }
   // Per-column veto: this particle's own column may have been refused while

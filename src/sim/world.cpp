@@ -25,21 +25,21 @@ static const uint32_t kDirtyReasonEvery = [] {
 constexpr uint64_t kChunkBytes = kChunkVol * 4;                 // 16 KB
 constexpr uint64_t kMirrorBytes = 27 * kChunkBytes;             // 432 KB
 constexpr uint64_t kDirtyOff = kMirrorBytes;
-constexpr uint64_t kDirtyBytes = kNumChunks * 4;
+constexpr uint64_t kDirtyBytes = kNumSlots * 4;
 constexpr uint64_t kActVoxVizWords = (uint64_t)kPoolPages * kChunkVol / 32;
 constexpr uint64_t kActVoxVizBytes = kActVoxVizWords * sizeof(uint32_t);
 constexpr uint64_t kOccOff = kDirtyOff + kDirtyBytes;
 // The COUNT half of the occupancy buffer — the only half the snapshot ring
 // carries. The sub-chunk bitmask that follows it on the GPU is render-only and
 // no CPU reader wants it, so the staging slot stays exactly the size it was.
-constexpr uint64_t kOccBytes = kNumChunks * 4;
+constexpr uint64_t kOccBytes = kNumSlots * 4;
 // Render-only tail of the same GPU buffer; never staged, never read back.
-constexpr uint64_t kSubOccBytes = (uint64_t)kNumChunks * kSubOccStride * 4;
+constexpr uint64_t kSubOccBytes = (uint64_t)kNumSlots * kSubOccStride * 4;
 constexpr uint64_t kHashOff = kOccOff + kOccBytes;
 constexpr uint64_t kPickOff = kHashOff + 256;
 constexpr uint64_t kPCountOff = kPickOff + 256;
 constexpr uint64_t kSupportOff = kPCountOff + 256;
-constexpr uint64_t kSupportBytes = kNumChunks * 4;
+constexpr uint64_t kSupportBytes = kNumSlots * 4;
 constexpr uint64_t kPageFaultOff = kSupportOff + kSupportBytes;
 // MLS-MPM fluid seam: fluidArgsStage (16 u32, the FA_* map) + the block list
 // (kFluidBlocks u32). Small enough to ride every snapshot; the block list
@@ -57,12 +57,12 @@ constexpr uint64_t kSlotBytes = kFetchOff + (uint64_t)World::kFetchPerTick * kCh
 void World::Init(const rhi::Device& device) {
   using U = rhi::BufferUsage;
   // THE PAGE POOL. Sized by the residency mode: dense reserves one page per
-  // slot (kNumChunks) so the identity map is address-identical to the
+  // slot (kNumSlots) so the identity map is address-identical to the
   // pre-paging buffer; paged reserves kPoolPages. This is the ONLY place the
   // pool size is decided, and PoolPages() is the ONLY reader of the mode.
   voxels = CreateBuffer(device, (uint64_t)PoolPages() * kChunkVol * 4,
                         U::Storage | U::CopySrc | U::CopyDst, "voxels");
-  pageTable = CreateBuffer(device, (uint64_t)kNumChunks * 4,
+  pageTable = CreateBuffer(device, (uint64_t)kNumSlots * 4,
                            U::Storage | U::CopySrc | U::CopyDst, "pageTable");
   pageFaults = CreateBuffer(device, kPageFaultBytes,
                             U::Storage | U::CopySrc | U::CopyDst, "pageFaults");
@@ -78,14 +78,14 @@ void World::Init(const rhi::Device& device) {
   pages->Init(device, *this);
   dirty[0] = CreateBuffer(device, kDirtyBytes, U::Storage | U::CopySrc | U::CopyDst, "dirtyA");
   dirty[1] = CreateBuffer(device, kDirtyBytes, U::Storage | U::CopySrc | U::CopyDst, "dirtyB");
-  dirtyList = CreateBuffer(device, kNumChunks * 4, U::Storage, "dirtyList");
+  dirtyList = CreateBuffer(device, kNumSlots * 4, U::Storage, "dirtyList");
   argsStage = CreateBuffer(device, 12, U::Storage | U::CopySrc | U::CopyDst, "argsStage");
   dispatchArgs = CreateBuffer(device, 12, U::Indirect | U::CopyDst, "dispatchArgs");
   // Counts first, then the sub-chunk bitmask (world.h kSubOccShift). One
   // buffer so every existing Occupancy barrier and bind-group entry covers the
   // mask too. Uninitialised content is not a hazard the way it would be for a
   // standalone buffer: every producer of the counts is also a producer of the
-  // mask, and the first thing that ever runs over all kNumChunks slots is
+  // mask, and the first thing that ever runs over all kNumSlots slots is
   // worldgen `main` (or lr_occupancyFull on a load) — the same pass the counts
   // already depend on for not being garbage.
   occupancy = CreateBuffer(device, kOccBytes + kSubOccBytes,
@@ -185,10 +185,10 @@ void World::Init(const rhi::Device& device) {
                                    U::Storage | U::CopySrc, "fluidParticlesB");
   fluidSpawnOps = CreateBuffer(device, kMaxFluidSpawnsPerTick * sizeof(FluidSpawnOp),
                                U::Storage | U::CopyDst, "fluidSpawnOps");
-  // TWO kNumChunks arrays: [slot] = blockIdx+1, [kNumChunks + slot] = the
+  // TWO kNumSlots arrays: [slot] = blockIdx+1, [kNumSlots + slot] = the
   // chunk's 16-bit Y-OCCUPANCY mask (world.h). The whole-buffer Fill at the
   // head of PT_FLUIDMAP clears both halves, which is what the mask needs.
-  fluidBlockMap = CreateBuffer(device, (uint64_t)kNumChunks * 2 * 4,
+  fluidBlockMap = CreateBuffer(device, (uint64_t)kNumSlots * 2 * 4,
                                U::Storage | U::CopyDst, "fluidBlockMap");
   fluidBlockList = CreateBuffer(device, (uint64_t)kFluidBlocks * 4,
                                 U::Storage | U::CopySrc, "fluidBlockList");
@@ -217,14 +217,14 @@ void World::Init(const rhi::Device& device) {
   // excite, and validation answered immediately with 10x
   // VUID-vkCmdCopyBuffer-srcBuffer-00118.
   fluidExciteScratch = CreateBuffer(device,
-                                    (uint64_t)(16 + 3 * kNumChunks) * 4,
+                                    (uint64_t)(16 + 3 * kNumSlots) * 4,
                                     U::Storage | U::CopySrc | U::CopyDst,
                                     "fluidExciteScratch");
-  fluidCalm = CreateBuffer(device, (uint64_t)kNumChunks * 4,
+  fluidCalm = CreateBuffer(device, (uint64_t)kNumSlots * 4,
                            U::Storage | U::CopyDst, "fluidCalm");
   fluidSettleScratch = CreateBuffer(
       device,
-      (uint64_t)(2 * kNumChunks + 16 + 2 + kFluidSettleMax * kChunkVol * 2 +
+      (uint64_t)(2 * kNumSlots + 16 + 2 + kFluidSettleMax * kChunkVol * 2 +
                  kFluidSettleMax * 8) * 4,
       U::Storage | U::CopyDst, "fluidSettleScratch");
   // THREE arrays of one word per 256-particle compaction span, not two:
@@ -245,7 +245,7 @@ void World::Init(const rhi::Device& device) {
                                "bodyInstances");
   bodyXforms = CreateBuffer(device, (uint64_t)kMaxBodySlots * 32,
                             U::Storage | U::CopyDst, "bodyXforms");
-  genList = CreateBuffer(device, kNumChunks * 4, U::Storage | U::CopyDst, "genList");
+  genList = CreateBuffer(device, kNumSlots * 4, U::Storage | U::CopyDst, "genList");
   // The deferred-wake act verdict (world.h's genAct note). CopySrc because
   // Stream reads it back — one small copy per window shift, never mapped in
   // the frame path.
@@ -257,7 +257,7 @@ void World::Init(const rhi::Device& device) {
   // while a page fill drains at the head of the next command buffer, so the two
   // deferred writes interleave. Sharing produced a stale-list read that
   // diverged the world hash only after a window shift (loud smoke ticks 86/88).
-  pageFillList = CreateBuffer(device, (uint64_t)kNumChunks * 8,
+  pageFillList = CreateBuffer(device, (uint64_t)kNumSlots * 8,
                               U::Storage | U::CopyDst, "pageFillList");
 
   // Far-field cascades (render-only LOD). Zero-initialized = air, so unfilled
@@ -282,10 +282,10 @@ void World::Init(const rhi::Device& device) {
     s.inFlight = false;
   }
   snap_.mirror.assign(27 * kChunkVol, 0);
-  snap_.dirtyFlags.assign(kNumChunks, 0);
-  snap_.supportFlags.assign(kNumChunks, 0);
-  snap_.occupancy.assign(kNumChunks, 0);
-  snap_.occStain.assign(kNumChunks, 0);
+  snap_.dirtyFlags.assign(kNumSlots, 0);
+  snap_.supportFlags.assign(kNumSlots, 0);
+  snap_.occupancy.assign(kNumSlots, 0);
+  snap_.occStain.assign(kNumSlots, 0);
   snap_.fluidBlocks.assign(kFluidBlocks, 0);
   snap_.fluidMirror.assign(27ull * kChunkVol, 0);
 
@@ -539,7 +539,7 @@ void World::KickReadback() {
             const uint32_t* supW = (const uint32_t*)(b + kSupportOff);
             uint32_t active = 0;
             uint64_t total = 0;
-            for (uint32_t i = 0; i < kNumChunks; i++) {
+            for (uint32_t i = 0; i < kNumSlots; i++) {
               snap_.dirtyFlags[i] = dirtyW[i] != 0 ? 1 : 0;
               active += snap_.dirtyFlags[i];
               // GPU word packs [31] anyStain | [30..16] blockers | [15..0]
@@ -577,7 +577,7 @@ void World::KickReadback() {
                 (snap_.tick % kDirtyReasonEvery) == 0 && active != 0) {
               uint32_t hist[24] = {0};
               uint32_t multi = 0;
-              for (uint32_t i = 0; i < kNumChunks; i++) {
+              for (uint32_t i = 0; i < kNumSlots; i++) {
                 const uint32_t d = dirtyW[i];
                 if (d == 0) continue;
                 if ((d & (d - 1)) != 0) multi++;

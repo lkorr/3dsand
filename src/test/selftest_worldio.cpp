@@ -452,13 +452,13 @@ bool streamOk = false;
         ctx.WaitIdle();
         const uint32_t poolPages = world.PoolPages();
         std::vector<uint32_t> slotOfPage(poolPages, 0xFFFFFFFFu);
-        for (uint32_t sl = 0; sl < kNumChunks; sl++) {
+        for (uint32_t sl = 0; sl < kNumSlots; sl++) {
           const uint32_t e = world.PageEntryOfSlot(sl);
           if ((e & kPtSentinelBit) == 0u && e < poolPages) slotOfPage[e] = sl;
         }
-        std::vector<uint32_t> digRaw(kNumChunks, 2166136261u);
-        std::vector<uint32_t> digHsh(kNumChunks, 2166136261u);
-        std::vector<uint32_t> occ(kNumChunks, 0u);
+        std::vector<uint32_t> digRaw(kNumSlots, 2166136261u);
+        std::vector<uint32_t> digHsh(kNumSlots, 2166136261u);
+        std::vector<uint32_t> occ(kNumSlots, 0u);
         std::map<uint32_t, std::vector<uint32_t>> gotWords;
         auto fold = [](uint32_t h, uint32_t v) { return (h ^ v) * 16777619u; };
         auto digestWords = [&](uint32_t sl, const uint32_t* w) {
@@ -495,7 +495,7 @@ bool streamOk = false;
         }
         // sentinel slots: synthesize what they would materialize into
         std::vector<uint32_t> syn(kChunkVol);
-        for (uint32_t sl = 0; sl < kNumChunks; sl++) {
+        for (uint32_t sl = 0; sl < kNumSlots; sl++) {
           const uint32_t e = world.PageEntryOfSlot(sl);
           if ((e & kPtSentinelBit) == 0u) continue;
           const IVec3 wc = world.SlotToWorldChunk(sl);
@@ -508,19 +508,19 @@ bool streamOk = false;
                                  world.pages->WorldSeed());
           digestWords(sl, syn.data());
         }
-        std::vector<uint32_t> d0(kNumChunks, 0u), d1(kNumChunks, 0u),
-            occBuf(kNumChunks, 0u);
+        std::vector<uint32_t> d0(kNumSlots, 0u), d1(kNumSlots, 0u),
+            occBuf(kNumSlots, 0u);
         rhi::ReadbackBlocking(ctx.device, ctx.queue, world.dirty[0], 0,
-                              d0.data(), kNumChunks * 4, "p5id0");
+                              d0.data(), kNumSlots * 4, "p5id0");
         rhi::ReadbackBlocking(ctx.device, ctx.queue, world.dirty[1], 0,
-                              d1.data(), kNumChunks * 4, "p5id1");
+                              d1.data(), kNumSlots * 4, "p5id1");
         rhi::ReadbackBlocking(ctx.device, ctx.queue, world.occupancy, 0,
-                              occBuf.data(), kNumChunks * 4, "p5iocc");
+                              occBuf.data(), kNumSlots * 4, "p5iocc");
         char dpath[512];
         std::snprintf(dpath, sizeof(dpath), "%s", digestOut);
         if (FILE* df = std::fopen(dpath, "w")) {
           std::fprintf(df, "# slot entry raw hashlike nonair wc.x wc.y wc.z d0 d1 occ tick %u hash %08x origin %d %d %d\n", t, hh, world.WindowOrigin().x, world.WindowOrigin().y, world.WindowOrigin().z);
-          for (uint32_t sl = 0; sl < kNumChunks; sl++) {
+          for (uint32_t sl = 0; sl < kNumSlots; sl++) {
             const IVec3 wc = world.SlotToWorldChunk(sl);
             std::fprintf(df, "%u %08X %08X %08X %u %d %d %d %u %u %08X\n",
                          sl, world.PageEntryOfSlot(sl), digRaw[sl], digHsh[sl],

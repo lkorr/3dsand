@@ -106,9 +106,7 @@ fn openBlockBlocked(c : vec3<i32>) -> bool {
 // uniform read out of 384 call sites per workgroup, so the honest version is
 // also the faster one.
 fn openWorldChunk(slot : u32, origin : vec3<i32>) -> vec3<i32> {
-  let sc = vec3<i32>(i32(slot % NCHUNK), i32((slot / NCHUNK) % NCHUNK),
-                     i32(slot / (NCHUNK * NCHUNK)));
-  return slotToWorldChunk(sc, origin);
+  return slotWorldChunk(slot, origin);
 }
 
 // The openness of one (block, face), as a 0..255 byte.

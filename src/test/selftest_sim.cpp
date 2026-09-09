@@ -163,7 +163,7 @@ int settled = 0;  // tick at which the world went quiet (or the cap)
   // pocket in 32 m of world), and freshly generated liquid legitimately
   // takes longer to equalize. Tick until the world is quiet, hard-capped —
   // the cap is what still catches never-sleeping content (rule 2).
-  uint32_t quiet = kNumChunks;
+  uint32_t quiet = kNumSlots;
   for (int i = 0; i < 3000; i++) {
     std::vector<ExplosionOp> exps;
     if (i == 30) exps.push_back({110, 76, 110, 12, 350, 0, 0, 0});  // wood slab
@@ -275,16 +275,16 @@ int settled = 0;  // tick at which the world went quiet (or the cap)
               (unsigned long long)faSettled, (unsigned long long)faExcited,
               (unsigned long long)faExSeen, (unsigned long long)faExCandid);
 
-  rhi::Buffer staging = CreateBuffer(ctx.device, kNumChunks * 4,
+  rhi::Buffer staging = CreateBuffer(ctx.device, kNumSlots * 4,
                                       rhi::BufferUsage::MapRead | rhi::BufferUsage::CopyDst,
                                       "dirtyRead");
   rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
-  enc.CopyBufferToBuffer(sim.DirtyActive(), 0, staging, 0, kNumChunks * 4);
+  enc.CopyBufferToBuffer(sim.DirtyActive(), 0, staging, 0, kNumSlots * 4);
   ctx.queue.Submit(enc.Finish());
   std::vector<uint32_t> awake;
   {
-    std::vector<uint32_t> d_((kNumChunks * 4) / 4, 0);
-    rhi::ReadBufferBlocking(ctx.device, staging, 0, d_.data(), (size_t)(kNumChunks * 4));
+    std::vector<uint32_t> d_((kNumSlots * 4) / 4, 0);
+    rhi::ReadBufferBlocking(ctx.device, staging, 0, d_.data(), (size_t)(kNumSlots * 4));
     const uint32_t* d = d_.data();
 
           // ---- WHY are they awake (common.wgsl's DIRTY_R_* / sim_step's
@@ -318,7 +318,7 @@ int settled = 0;  // tick at which the world went quiet (or the cap)
             // true. Whatever the cause, the fix that makes it unable to happen
             // again is not to have two loops.
             uint32_t why[24] = {0};
-            for (uint32_t i = 0; i < kNumChunks; i++) {
+            for (uint32_t i = 0; i < kNumSlots; i++) {
               const uint32_t w = d[i];
               if (w == 0) continue;
               sleepActive++;
@@ -557,7 +557,7 @@ bool sleepOk = sleepActive < 32 && particlesEnd == 0 && faLive1 == 0;
 std::printf("sleep: %s (%u / %u chunks active, %u particles alive (%u at "
             "settle), %u MPM particles alive, quiet after ~%d settle ticks, "
             "%llu/%llu submerged cells partial)\n",
-            sleepOk ? "PASS" : "FAIL", sleepActive, kNumChunks, particlesEnd,
+            sleepOk ? "PASS" : "FAIL", sleepActive, kNumSlots, particlesEnd,
             particlesLeft, faLive1, settled, (unsigned long long)subPartial,
             (unsigned long long)subTotal);
 
@@ -655,9 +655,9 @@ bool evapOk = false;
                {6, 7, 6}, false, false);
   ctx.WaitIdle();
 
-  std::vector<uint32_t> vox(kNumChunks * (size_t)kChunkVol);
+  std::vector<uint32_t> vox(kNumSlots * (size_t)kChunkVol);
   {
-    ReadVoxelsSync(ctx, world, 0, kNumChunks, vox.data(), "evapRead");  // §2.1a
+    ReadVoxelsSync(ctx, world, 0, kNumSlots, vox.data(), "evapRead");  // §2.1a
   }
   auto readCell = [&](int x, int y, int z) {
     return vox[World::SlotCellIndex({x, y, z})] & 0xFFFu;
@@ -760,9 +760,9 @@ bool stainOk = false;
                {6, 7, 6}, false, false);
   ctx.WaitIdle();
 
-  std::vector<uint32_t> vox(kNumChunks * (size_t)kChunkVol);
+  std::vector<uint32_t> vox(kNumSlots * (size_t)kChunkVol);
   {
-    ReadVoxelsSync(ctx, world, 0, kNumChunks, vox.data(), "stainRead");  // §2.1a
+    ReadVoxelsSync(ctx, world, 0, kNumSlots, vox.data(), "stainRead");  // §2.1a
   }
 
   // Count stained floor voxels, and check every stain in the world is
@@ -923,9 +923,9 @@ bool fullOk = false;
     ctx.ProcessEvents();
   }
 
-  std::vector<uint32_t> fv(kNumChunks * (size_t)kChunkVol);
+  std::vector<uint32_t> fv(kNumSlots * (size_t)kChunkVol);
   {
-    ReadVoxelsSync(ctx, world, 0, kNumChunks, fv.data(), "fullRead");  // §2.1a
+    ReadVoxelsSync(ctx, world, 0, kNumSlots, fv.data(), "fullRead");  // §2.1a
   }
   // Count landed blood and how much of it is at less than full fullness.
   // Blood FLOWS once it lands, and flowing splits a cell's fullness across
@@ -2532,15 +2532,15 @@ Status GatePageRoundtrip(Ctx& c, std::string& detail) {
   }
 
   // Standalone (--gate) the world is the untouched identity map: every CHUNK
-  // SLOT holds a real page (ResetIdentity claims kNumChunks of them) and there
+  // SLOT holds a real page (ResetIdentity claims kNumSlots of them) and there
   // is no sentinel anywhere, so the sky walk below finds no EMPTY chunk. This
-  // used to compare against PoolPages(), which was kNumChunks until
-  // 2026-08-30; the pool is kNumChunks + kPageRetireCeiling since, so the
+  // used to compare against PoolPages(), which was kNumSlots until
+  // 2026-08-30; the pool is kNumSlots + kPageRetireCeiling since, so the
   // test never fired and the gate failed standalone with "no EMPTY chunk in
   // the column" — the identity map, not a page-pool problem. In-suite the
   // previous gates have long since generated and demoted, so this never
   // fires there.
-  if (paged && pt.PagesInUse() >= kNumChunks) {
+  if (paged && pt.PagesInUse() >= kNumSlots) {
     SubmitWorldgen(ctx, world, sim, kDefaultSeed);
     ctx.WaitIdle();
   }
@@ -3036,8 +3036,8 @@ Status GateFireDown(Ctx& c, std::string& detail) {
                {12, 12, 12}, false, false);
   ctx.WaitIdle();
 
-  std::vector<uint32_t> vox(kNumChunks * (size_t)kChunkVol);
-  ReadVoxelsSync(ctx, world, 0, kNumChunks, vox.data(), "fireDownRead");
+  std::vector<uint32_t> vox(kNumSlots * (size_t)kChunkVol);
+  ReadVoxelsSync(ctx, world, 0, kNumSlots, vox.data(), "fireDownRead");
   auto at = [&](int x, int y, int z) {
     return vox[World::SlotCellIndex({x, y, z})] & 0xFFFu;
   };
@@ -3295,15 +3295,15 @@ Status GateSupportFlag(Ctx& c, std::string& detail) {
   // The flags are therefore collected the way their real consumer collects
   // them (DebrisSystem::QueueSupportEvents): union of snap.supportFlags over a
   // window of ticks, so whichever snapshot happens to drain them is caught.
-  std::vector<uint8_t> seen(kNumChunks, 0);
+  std::vector<uint8_t> seen(kNumSlots, 0);
   auto collect = [&](int ticks) {
     for (int i = 0; i < ticks; i++) {
       SubmitTick(ctx, world, sim, ++t, kDefaultSeed, {}, {}, {}, false,
                  {gx >> 4, kGapY >> 4, gz >> 4}, true, false);
       ctx.WaitIdle();
       const WorldSnapshot& sn = world.Snap();
-      if (!sn.valid || sn.supportFlags.size() != kNumChunks) continue;
-      for (uint32_t ci = 0; ci < kNumChunks; ci++)
+      if (!sn.valid || sn.supportFlags.size() != kNumSlots) continue;
+      for (uint32_t ci = 0; ci < kNumSlots; ci++)
         if (sn.supportFlags[ci]) seen[ci] = 1;
     }
   };
@@ -3331,8 +3331,8 @@ Status GateSupportFlag(Ctx& c, std::string& detail) {
   // exact-cell erase between two solids flags BOTH chunks) is untouched; only
   // the moment at which "the fixture was really there" is a meaningful question
   // has moved, from after the mutation to before it.
-  std::vector<uint32_t> voxPre(kNumChunks * (size_t)kChunkVol);
-  ReadVoxelsSync(ctx, world, 0, kNumChunks, voxPre.data(), "supportVoxPre");
+  std::vector<uint32_t> voxPre(kNumSlots * (size_t)kChunkVol);
+  ReadVoxelsSync(ctx, world, 0, kNumSlots, voxPre.data(), "supportVoxPre");
   auto matPre = [&](int x, int y, int z) {
     return voxPre[World::SlotCellIndex({x, y, z})] & 0xFFFu;
   };
@@ -3348,8 +3348,8 @@ Status GateSupportFlag(Ctx& c, std::string& detail) {
   ctx.WaitIdle();
   {
     const WorldSnapshot& sn = world.Snap();
-    if (sn.valid && sn.supportFlags.size() == kNumChunks)
-      for (uint32_t ci = 0; ci < kNumChunks; ci++)
+    if (sn.valid && sn.supportFlags.size() == kNumSlots)
+      for (uint32_t ci = 0; ci < kNumSlots; ci++)
         if (sn.supportFlags[ci]) seen[ci] = 1;
   }
   collect(12);
@@ -3362,12 +3362,12 @@ Status GateSupportFlag(Ctx& c, std::string& detail) {
   // genuinely not raised — and "home=0" alone cannot tell them apart. So the
   // verdict line carries the fixture census and both windows' flag counts.
   uint32_t nBefore = 0, nAfter = 0;
-  for (uint32_t i = 0; i < kNumChunks; i++) {
+  for (uint32_t i = 0; i < kNumSlots; i++) {
     nBefore += before[i] ? 1u : 0u;
     nAfter += after[i] ? 1u : 0u;
   }
-  std::vector<uint32_t> vox(kNumChunks * (size_t)kChunkVol);
-  ReadVoxelsSync(ctx, world, 0, kNumChunks, vox.data(), "supportVox");
+  std::vector<uint32_t> vox(kNumSlots * (size_t)kChunkVol);
+  ReadVoxelsSync(ctx, world, 0, kNumSlots, vox.data(), "supportVox");
   auto matAt = [&](int x, int y, int z) {
     return vox[World::SlotCellIndex({x, y, z})] & 0xFFFu;
   };

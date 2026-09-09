@@ -768,7 +768,7 @@ Status GateFireDepth(Ctx& c, std::string& detail) {
 // The slab is 14 voxels above the ground, which is a different chunk, so
 // stamping the slab does NOT re-walk the floor it now shades — the floor's
 // openness only changes when the rolling refresh reaches it, up to
-// kNumChunks / render.opennessChunksPerFrame ticks later. Tick B writes one
+// kNumSlots / render.opennessChunksPerFrame ticks later. Tick B writes one
 // voxel into the floor's own chunk to put it on the dirty list. If that
 // latency is ever a visible problem the fix is a bigger refresh budget, not a
 // dilated dirty list: a 12 m reach dilates to a 15^3 chunk neighbourhood.
@@ -1237,7 +1237,7 @@ Status GateGiBounce(Ctx& c, std::string& detail) {
 // ever discharge it. The shadow resolve pass deposits full sunlight for any
 // patch that is ON SCREEN and stops the instant the camera looks away, so it
 // is a charger with no expiry. The openness walk is the discharger: it visits
-// every face every kNumChunks / opennessChunksPerFrame ticks whether anyone is
+// every face every kNumSlots / opennessChunksPerFrame ticks whether anyone is
 // looking or not, and that is the ONLY thing standing between a face and a
 // value from noon.
 //

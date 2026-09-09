@@ -2837,7 +2837,7 @@ const FLUID_ONE       : i32 = 65536;    // 1.0 in Q16.16
 const FLUID_GW        : u32 = 8u;
 
 // ---- fluid block map: the Y-OCCUPANCY half (world.h fluidBlockMap) ---------
-// The buffer is 2 * NUM_CHUNKS words. The first half is the chunk -> block
+// The buffer is 2 * NUM_SLOTS words. The first half is the chunk -> block
 // index map the solver builds. The second half is one 16-bit mask per chunk:
 // bit L set means "local y level L of this chunk can carry fluid density".
 //
@@ -2853,7 +2853,7 @@ const FLUID_GW        : u32 = 8u;
 // contributes virtual mass to the isosurface), cleared by the same whole-buffer
 // Fill that clears the index half. Render-only DERIVED data: no solver kernel
 // reads it, so it is not hashed and cannot move the sim.
-fn fbmYMaskIndex(slot : u32) -> u32 { return NUM_CHUNKS + slot; }
+fn fbmYMaskIndex(slot : u32) -> u32 { return NUM_SLOTS + slot; }
 // The bits a source at local y level L lights up. The B-spline support is 1.5
 // cells and the trilinear tap cube adds another half, so a source at L can
 // raise the field at L-2 .. L+2.
@@ -3107,6 +3107,73 @@ fn chunkSlotIndex(wc : vec3<i32>) -> u32 {
 // world chunk resident in slot chunk sc under window origin o
 fn slotToWorldChunk(sc : vec3<i32>, o : vec3<i32>) -> vec3<i32> {
   return o + ((sc - o) & vec3<i32>(NCHUNK_MASK));
+}
+
+// ---- TICKET SLOTS: residency the window's arithmetic cannot express --------
+// docs/PLAN_chunk_tickets.md §2.2. THIS BLOCK IS THE DEFINITION EVERY SHADER
+// AGREES ON, which is why it is here and not next to any one consumer.
+//
+// Slots [0, NUM_CHUNKS) are the window and `chunkSlotIndex` is a total function
+// onto them: mask, done. Slots [NUM_CHUNKS, NUM_SLOTS) are TICKETS — chunks far
+// outside the window that are resident anyway — and no arithmetic reaches them,
+// only a CPU-built lookup. So a world chunk now has three possible answers to
+// "where do you live?": a window slot, a ticket slot, or nowhere; and the four
+// functions below are the only sanctioned way to ask.
+//
+//   chunkSlotOf(wc, o)   the storage slot, or SLOT_NONE. Replaces every
+//                        chunkSlotIndex() call whose caller had to prove
+//                        residency first — the SLOT_NONE test IS that proof
+//                        now, so those sites lose a redundant compare.
+//   chunkResident(wc,o)  / cellResident(c, o)   replace chunkInWindow /
+//                        inWindow wherever the question was "may I touch this",
+//                        NOT where it was "is this inside the window box"
+//                        (the raymarch's clip, streaming planes: those stay).
+//   slotWorldChunk(s,o)  the inverse. Replaces the four-line
+//                        `sc = (s % NCHUNK, ...)` + slotToWorldChunk decode
+//                        that ten kernels had copy-pasted, because that decode
+//                        is simply WRONG for a slot >= NUM_CHUNKS.
+//
+// P0 SHIPS kTicketMax = 0. `TICKET_SLOTS != 0u` is a const-expression, so every
+// ticket branch below is dead code the compiler removes, chunkSlotOf collapses
+// to chunkSlotIndex, cellResident collapses to inWindow, and the emitted SPIR-V
+// is what it was before this block existed. That is deliberate: it is what lets
+// P0's acceptance be bit-identity AND keeps the raymarch DDA's register count
+// off the cliff in gotcha-raymarch-register-cliff. P1 fills in the two stubs.
+const SLOT_NONE : u32 = 0xFFFFFFFFu;
+
+// P0 STUB. P1 replaces this with the open-addressed probe of `ticketMap`
+// (2 * TICKET_SLOTS entries of (packed wc, slot), CPU-built, uploaded between
+// ticks, GPU read-only) and binds that map into every sim shader. Keeping the
+// binding out of P0 is why P0 touches no bind-group layout and no pass table.
+fn ticketSlotOf(wc : vec3<i32>) -> u32 {
+  return SLOT_NONE;
+}
+// P0 STUB. P1 reads `ticketSlotWc[slot - NUM_CHUNKS]`, written beside the map.
+fn ticketSlotWorldChunk(slot : u32) -> vec3<i32> {
+  return vec3<i32>(0);
+}
+
+fn chunkSlotOf(wc : vec3<i32>, o : vec3<i32>) -> u32 {
+  if (chunkInWindow(wc, o)) { return chunkSlotIndex(wc); }
+  if (TICKET_SLOTS != 0u) { return ticketSlotOf(wc); }
+  return SLOT_NONE;
+}
+fn chunkResident(wc : vec3<i32>, o : vec3<i32>) -> bool {
+  if (chunkInWindow(wc, o)) { return true; }
+  return TICKET_SLOTS != 0u && ticketSlotOf(wc) != SLOT_NONE;
+}
+fn cellResident(c : vec3<i32>, o : vec3<i32>) -> bool {
+  if (inWindow(c, o)) { return true; }
+  return TICKET_SLOTS != 0u && ticketSlotOf(worldChunkOf(c)) != SLOT_NONE;
+}
+// The inverse of chunkSlotOf: which world chunk lives in this LINEAR slot.
+fn slotWorldChunk(slot : u32, o : vec3<i32>) -> vec3<i32> {
+  if (TICKET_SLOTS != 0u && slot >= NUM_CHUNKS) {
+    return ticketSlotWorldChunk(slot);
+  }
+  let sc = vec3<i32>(vec3<u32>(slot % NCHUNK, (slot / NCHUNK) % NCHUNK,
+                               slot / (NCHUNK * NCHUNK)));
+  return slotToWorldChunk(sc, o);
 }
 
 // ---- far-field cascades (render-only LOD — DESIGN.md §9) ----
@@ -3578,7 +3645,7 @@ fn irrIndexOfCell(c : vec3<i32>, face : u32) -> u32 {
 // and on every FULL walk (the geometry may have moved, so the next frame
 // re-gathers what it can see). Read under the openness stamp like everything
 // else in the two grids.
-const GI_CACHE_BASE : u32 = NUM_CHUNKS * OPEN_BLOCKS * OPEN_FACES;
+const GI_CACHE_BASE : u32 = NUM_SLOTS * OPEN_BLOCKS * OPEN_FACES;
 
 // ---- the second and third planes of `opennessGen` ---------------------------
 // (world.h kOpennessGenWords, PLAN_frame_perf.md §3 item 4.) Plane 0 is the
@@ -3592,8 +3659,8 @@ const GI_CACHE_BASE : u32 = NUM_CHUNKS * OPEN_BLOCKS * OPEN_FACES;
 // full walk, and keeps only the irradiance maintenance. Slot-space columns
 // are toroidal like the slots; a column renamed by a window shift keeps its
 // old touch, which can only cost one extra walk, never a missed one.
-const OPEN_WALKED_BASE : u32 = NUM_CHUNKS;
-const OPEN_TOUCH_BASE : u32 = 2u * NUM_CHUNKS;
+const OPEN_WALKED_BASE : u32 = NUM_SLOTS;
+const OPEN_TOUCH_BASE : u32 = 2u * NUM_SLOTS;
 fn openColumnOfSlot(slot : u32) -> u32 {
   return (slot / (NCHUNK * NCHUNK)) * NCHUNK + (slot % NCHUNK);
 }
@@ -3682,12 +3749,12 @@ fn irrSample(albedo : vec3f, n : vec3f, L : vec3f, sunCol : vec3f, lit : f32,
 // common.wgsl is prepended before any shader declares a binding.
 
 // The FIELD region starts after the SRC region, which is kGlowSrcWordsPerSlot
-// (4) words per slot. Derived from NUM_CHUNKS, which the prelude already emits,
+// (4) words per slot. Derived from NUM_SLOTS, which the prelude already emits,
 // so the glow field costs no new prelude constant and no
 // ShaderConstantPrelude / check_shaders.sh edit. MUST MATCH
 // sandvox::kGlowFieldBaseWord (src/sim/world.h).
 const GLOW_SRC_WORDS_PER_SLOT : u32 = 4u;
-const GLOW_FIELD_BASE : u32 = NUM_CHUNKS * GLOW_SRC_WORDS_PER_SLOT;
+const GLOW_FIELD_BASE : u32 = NUM_SLOTS * GLOW_SRC_WORDS_PER_SLOT;
 
 fn glowSrcIndex(slot : u32) -> u32 { return slot * GLOW_SRC_WORDS_PER_SLOT; }
 fn glowFieldIndex(slot : u32, block : u32) -> u32 {
@@ -4138,11 +4205,23 @@ fn pageEntryOf(chunkSlot : u32) -> u32 { return pageTable[chunkSlot]; }
 // `T` in a sim kernel and `R` in the renderer, and common.wgsl is prepended
 // before either is declared. Generating the accessor keeps all 46 voxWordAt
 // call sites unchanged and keeps the seed out of every signature.
+// THE slot resolver for a world CELL, and the one place the window mask and
+// the ticket probe meet. The mask is the fast path and stays FIRST and
+// branch-free; the probe is a cold tail behind a const-expression, so at
+// kTicketMax = 0 this is exactly `chunkIndexOf(c & WORLD_MASK)` and the DDA
+// that calls it thousands of times a ray gains nothing to spill
+// (gotcha-raymarch-register-cliff).
+fn voxSlotOfCell(c : vec3<i32>) -> u32 {
+  if (TICKET_SLOTS != 0u) {
+    let wc = worldChunkOf(c);
+    if (!chunkInWindow(wc, ptOrigin())) { return ticketSlotOf(wc); }
+  }
+  return chunkIndexOf(vec3<u32>(c & vec3<i32>(WORLD_MASK)));
+}
 fn voxWordAt(c : vec3<i32>) -> u32 {
-  let s = vec3<u32>(c & vec3<i32>(WORLD_MASK));
-  let e = pageTable[chunkIndexOf(s)];
+  let e = pageTable[voxSlotOfCell(c)];
   if ((e & PT_SENTINEL_BIT) != 0u) { return synthWordAt(e, c, ptSeed()); }
-  let lo = s % CHUNK;
+  let lo = vec3<u32>(c & vec3<i32>(CHUNK_MASK));
   return voxels[e * CHUNK_VOL + (lo.z * CHUNK + lo.y) * CHUNK + lo.x];
 }
 
@@ -4509,10 +4588,7 @@ fn shadowCoarseFromT() -> f32 {
 // chunk in the window the variant pattern of whichever world chunk last
 // occupied that slot.
 fn worldCellOfSlotLocal(chunkSlot : u32, localIdx : u32) -> vec3<i32> {
-  let sc = vec3<i32>(i32(chunkSlot % NCHUNK),
-                     i32((chunkSlot / NCHUNK) % NCHUNK),
-                     i32(chunkSlot / (NCHUNK * NCHUNK)));
-  let wc = slotToWorldChunk(sc, ptOrigin());
+  let wc = slotWorldChunk(chunkSlot, ptOrigin());
   let lo = vec3<i32>(i32(localIdx % CHUNK),
                      i32((localIdx / CHUNK) % CHUNK),
                      i32(localIdx / (CHUNK * CHUNK)));
@@ -4670,10 +4746,9 @@ const PT_FAULT_KBASE : u32 = 20u;  // where that bank starts (world.h mirrors it
 var<private> gPtKernel : u32 = PT_KERNEL;
 
 fn voxWordIndex(c : vec3<i32>) -> u32 {
-  let s = vec3<u32>(c & vec3<i32>(WORLD_MASK));
-  let slot = chunkIndexOf(s);
+  let slot = voxSlotOfCell(c);
   let e = pageTable[slot];
-  let lo = s % CHUNK;
+  let lo = vec3<u32>(c & vec3<i32>(CHUNK_MASK));
   if ((e & PT_SENTINEL_BIT) != 0u) {
     gPtSlot = slot;
     gPtEntry = e;
@@ -4740,10 +4815,7 @@ fn voxStore(idx : u32, w : u32) {
     if (gPtKernel < PT_K_COUNT) {
       atomicAdd(&pageFaults[PT_FAULT_KBASE + gPtKernel], 1u);
     }
-    let sc = vec3<i32>(i32(gPtSlot % NCHUNK),
-                       i32((gPtSlot / NCHUNK) % NCHUNK),
-                       i32(gPtSlot / (NCHUNK * NCHUNK)));
-    let wc = slotToWorldChunk(sc, ptOrigin());
+    let wc = slotWorldChunk(gPtSlot, ptOrigin());
     // FIRST fault (prev == 0 is exactly one invocation, whichever wins the
     // atomic) and LAST fault (a plain store, so it races and reports SOME late
     // fault rather than provably the last one — enough to say whether the

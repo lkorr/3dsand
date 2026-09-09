@@ -137,6 +137,50 @@ Three properties this rests on, all load-bearing:
   claim lattice all key on the slot. Feeding a page index into any of them
   would make the simulation a function of allocation history.
 
+#### Ticket slots: the slot space is no longer the window
+
+**The slot space and the window are two different things as of
+`docs/PLAN_chunk_tickets.md` P0.** They used to be the same thing by
+construction: a chunk's slot WAS its world coordinate modulo the window
+(`chunkSlotIndex` = a bitmask), so there were exactly `kNumChunks` slots and
+arithmetic assigned every one of them. That is why "simulate a chunk 40 chunks
+away" could not be done by allocating a page — page space was never the
+constraint, **slot identity** was, and a distant chunk wants the slot a near
+chunk already holds.
+
+So storage now runs `[0, kNumSlots)` where `kNumSlots = kNumChunks +
+kTicketSlots`. Slots below `kNumChunks` are the window, addressed by the same
+mask as ever. Slots above it are TICKETS — chunks far outside the window, held
+resident so matter that leaves can finish falling, burning or settling instead
+of freezing — and **no arithmetic reaches them**, only a CPU-built map. The
+resulting rule, which every buffer and every kernel now follows:
+
+> `kNumChunks` / `NUM_CHUNKS` is a statement about the WINDOW's geometry: what
+> the toroidal mask wraps at, what `chunkInWindow` measures, what the raymarch
+> clips to. `kNumSlots` / `NUM_SLOTS` is a statement about STORAGE: buffer
+> extents, dispatch bounds over the slot space, and the plane strides inside
+> multi-plane per-slot buffers. Conflating them is how a ticket slot ends up
+> reading a window chunk's memory.
+
+`kPoolPages` follows `kNumSlots` rather than `kNumChunks`, and the exhaustion
+proof above is unchanged because its first line already counted slots.
+
+Four functions in `common.wgsl` are the only sanctioned way to cross between
+world coordinates and slots — `chunkSlotOf(wc, o)` (the slot, or `SLOT_NONE`),
+`chunkResident` / `cellResident` (replacing `chunkInWindow` / `inWindow`
+wherever the question was "may I touch this", never where it was "where is the
+box"), and `slotWorldChunk(slot, o)` (the inverse, which replaced ten
+copy-pasted decodes that could not express a ticket slot). `voxWordAt`,
+`voxWordIndex` and `voxStore` resolve through one shared `voxSlotOfCell`.
+
+**P0 ships `kTicketMax = 0`**, so `kNumSlots == kNumChunks`, every ticket branch
+is a dead const-expression, and the world hash and both smoke probe tables are
+bit-identical — which is the whole acceptance criterion for a commit that
+touched 15 shaders and every per-slot buffer. The lifecycle (activation as a
+MutationQueue op, the cap, dedupe, timeout, release to `ChunkStore`) is P1; the
+per-site classification, and the three site classes the plan did not anticipate,
+are recorded in `docs/tickets_p0_audit.md`.
+
 A GPU kernel cannot allocate, so every page a kernel might write is
 materialized from the CPU BEFORE the command buffer is submitted, driven by a
 conservative CPU mirror of the dirty set. Writes are structurally incapable of

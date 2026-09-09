@@ -430,7 +430,7 @@ bool RunScenario(bool loud, bool lowPower, bool sledgehammer, bool validation,
         if (tick == (uint32_t)atoi(dt)) {
           ctx.WaitIdle();
           std::vector<uint32_t> words(kChunkVol);
-          for (uint32_t s = 0; s < kNumChunks; s++) {
+          for (uint32_t s = 0; s < kNumSlots; s++) {
             const uint32_t entry = world.PageEntryOfSlot(s);
             uint32_t h = 2166136261u;
             if ((entry & kPtSentinelBit) == 0u) {

@@ -74,6 +74,19 @@ if [ -z "$W_N" ] || [ -z "$W_CHUNK" ] || [ -z "$W_VOX" ] || [ -z "$W_IFAIR" ] \
 fi
 W_NCHUNK=$((W_N / W_CHUNK))
 
+# TICKET SLOTS (world.h kTicketMax block, docs/PLAN_chunk_tickets.md 2.1).
+# kTicketSlots and kNumSlots are expressions in world.h, so scrape the two
+# literals and redo the arithmetic exactly as world.h does. NUM_CHUNKS stays
+# the window cube; NUM_SLOTS is the allocated slot space.
+W_TICKETMAX="$(cpp_const kTicketMax)"
+W_TICKETBOXN="$(cpp_const kTicketBoxN)"
+: "${W_TICKETMAX:=0}"
+: "${W_TICKETBOXN:=5}"
+W_TICKETCHUNKS=$((W_TICKETBOXN * W_TICKETBOXN * W_TICKETBOXN))
+W_TICKETSLOTS=$(( ((W_TICKETMAX * W_TICKETCHUNKS + 63) / 64) * 64 ))
+W_NUMCHUNKS=$((W_NCHUNK * W_NCHUNK * W_NCHUNK))
+W_NUMSLOTS=$((W_NUMCHUNKS + W_TICKETSLOTS))
+
 # Sub-chunk occupancy bitmask (world.h kSubOccShift block). kSubOccDim and
 # kSubOccStride are expressions there, so scrape the two literals and redo the
 # arithmetic the same way world.h does.
@@ -247,7 +260,9 @@ PRELUDE_TEXT="$(printf '%s\n' \
   "const WORLD_N : u32 = ${W_N}u;" \
   "const CHUNK : u32 = ${W_CHUNK}u;" \
   "const NCHUNK : u32 = ${W_NCHUNK}u;" \
-  "const NUM_CHUNKS : u32 = $((W_NCHUNK * W_NCHUNK * W_NCHUNK))u;" \
+  "const NUM_CHUNKS : u32 = ${W_NUMCHUNKS}u;" \
+  "const TICKET_SLOTS : u32 = ${W_TICKETSLOTS}u;" \
+  "const NUM_SLOTS : u32 = ${W_NUMSLOTS}u;" \
   "const CHUNK_VOL : u32 = $((W_CHUNK * W_CHUNK * W_CHUNK))u;" \
   "const CHUNK_SHIFT : u32 = ${W_SHIFT}u;" \
   "const CHUNK_MASK : i32 = $((W_CHUNK - 1));" \
@@ -258,7 +273,7 @@ PRELUDE_TEXT="$(printf '%s\n' \
   "const SUBOCC_DIM : u32 = ${W_SUBDIM}u;" \
   "const SUBOCC_WORDS : u32 = ${W_SUBWORDS}u;" \
   "const SUBOCC_STRIDE : u32 = ${W_SUBSTRIDE}u;" \
-  "const SUBOCC_BASE : u32 = $((W_NCHUNK * W_NCHUNK * W_NCHUNK))u;" \
+  "const SUBOCC_BASE : u32 = ${W_NUMSLOTS}u;" \
   "const OPEN_FACES : u32 = ${W_OPENFACES}u;" \
   "const OPEN_WORDS_PER_CHUNK : u32 = ${W_OPENWORDS}u;" \
   "const WORLD_SHIFT : u32 = ${W_WORLDSHIFT}u;" \

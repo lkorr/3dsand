@@ -321,8 +321,9 @@ fn axisOf(p : i32) -> Axis {
 // block this substep (out of window, unmarked, or past the block budget).
 fn nodeBlock(nc : vec3<i32>) -> u32 {
   let wc = worldChunkOf(nc);
-  if (!chunkInWindow(wc, T.origin)) { return 0u; }
-  return atomicLoad(&fluidBlockMap[chunkSlotIndex(wc)]);
+  let slot = chunkSlotOf(wc, T.origin);
+  if (slot == SLOT_NONE) { return 0u; }
+  return atomicLoad(&fluidBlockMap[slot]);
 }
 
 // First WORD of node nc's accumulator row (block bm), i.e. index * FLUID_GW.
@@ -336,7 +337,7 @@ fn nodeWordBase(bm : u32, nc : vec3<i32>) -> u32 {
 // the way it stops a particle is by weighing something, which is what
 // seedSettledMass below gives it. Out-of-window is solid and inert.
 fn fluidSolid(c : vec3<i32>) -> bool {
-  if (!inWindow(c, T.origin)) { return true; }
+  if (!cellResident(c, T.origin)) { return true; }
   let w = voxWordAt(c);
   let mat = voxMat(w);
   if (mat == MAT_AIR) { return false; }
@@ -383,7 +384,7 @@ fn fluidSolid(c : vec3<i32>) -> bool {
   if (FLUID_SUBMERGED_SOLID != 0 && k == CLASS_LIQUID &&
       voxState(w) + 1u >= 8u) {
     let above = c + vec3<i32>(0, 1, 0);
-    if (inWindow(above, T.origin) && voxMat(voxWordAt(above)) == mat) {
+    if (cellResident(above, T.origin) && voxMat(voxWordAt(above)) == mat) {
       return true;
     }
   }
@@ -417,7 +418,7 @@ fn mark(@builtin(global_invocation_id) gid : vec3<u32>) {
   if (gid.x >= liveTotal()) { return; }
   let p = fluidParticles[gid.x];
   let cell = vec3<i32>(p.px >> 16u, p.py >> 16u, p.pz >> 16u);
-  if (!inWindow(cell, T.origin)) { return; }  // frozen out-of-window
+  if (!cellResident(cell, T.origin)) { return; }  // frozen out-of-residency
   let ax = axisOf(p.px); let ay = axisOf(p.py); let az = axisOf(p.pz);
   let lo = vec3<i32>(ax.base, ay.base, az.base) - vec3<i32>(FLUID_MARK_PAD);
   let hi = vec3<i32>(ax.base, ay.base, az.base) +
@@ -429,8 +430,9 @@ fn mark(@builtin(global_invocation_id) gid : vec3<u32>) {
                                select(lo.y, hi.y, j == 1),
                                select(lo.z, hi.z, k == 1));
         let wc = worldChunkOf(corner);
-        if (chunkInWindow(wc, T.origin)) {
-          atomicOr(&fluidBlockMap[chunkSlotIndex(wc)], 1u);
+        let cs = chunkSlotOf(wc, T.origin);
+        if (cs != SLOT_NONE) {
+          atomicOr(&fluidBlockMap[cs], 1u);
         }
       }
     }
@@ -451,7 +453,7 @@ var<workgroup> allocTotal : u32;
 fn alloc(@builtin(local_invocation_index) li : u32) {
   // TRUE SLEEP (plan §7 item 2). Every other row of this table dispatches off
   // an indirect arg and so costs nothing with no particles; this one is a fixed
-  // single-workgroup walk of all NUM_CHUNKS slots (the seam's settleScan is the
+  // single-workgroup walk of all NUM_SLOTS slots (the seam's settleScan is the
   // other). Whether the table is RECORDED stays a pure function of the
   // CPU-owned monotone count — never a readback, that is the determinism trap
   // in plan §7 — so a world that poured once and settled goes on recording
@@ -462,7 +464,7 @@ fn alloc(@builtin(local_invocation_index) li : u32) {
   // storage read is non-uniform to the compiler, and a barrier in non-uniform
   // control flow is a WGSL validation error. Skipping the WORK is enough.)
   let asleep = min(atomicLoad(&fluidArgs[FA_LIVE]), FLUID_CAP) == 0u;
-  let span = NUM_CHUNKS / 256u;   // 128 slots per thread
+  let span = NUM_SLOTS / 256u;    // 128 slots per thread
   var n = 0u;
   if (!asleep) {
     for (var s = li * span; s < (li + 1u) * span; s++) {
@@ -578,14 +580,12 @@ fn clearGrid(@builtin(workgroup_id) wg : vec3<u32>,
   // can reach this tick, so it needs no representation here.
   if (FLUID_SETTLED_Q8 <= 0) { return; }
   let slot = fluidBlockList[block];
-  let sc = vec3<i32>(i32(slot % NCHUNK), i32((slot / NCHUNK) % NCHUNK),
-                     i32(slot / (NCHUNK * NCHUNK)));
   let lo = vec3<i32>(i32(localIdx & 15u), i32((localIdx >> 4u) & 15u),
                      i32(localIdx >> 8u));
   // Node nc sits at the CENTRE of cell nc (see axisOf / the dpos terms in p2g),
   // so "this node's cell" is an identity, not an approximation.
-  let c = slotToWorldChunk(sc, T.origin) * i32(CHUNK) + lo;
-  if (!inWindow(c, T.origin)) { return; }
+  let c = slotWorldChunk(slot, T.origin) * i32(CHUNK) + lo;
+  if (!cellResident(c, T.origin)) { return; }
   let w = voxWordAt(c);
   let mat = voxMat(w);
   if (mat == MAT_AIR) { return; }
@@ -612,7 +612,7 @@ fn p2g1(@builtin(global_invocation_id) gid : vec3<u32>) {
   if (gid.x >= liveTotal()) { return; }
   let p = fluidParticles[gid.x];
   let cell = vec3<i32>(p.px >> 16u, p.py >> 16u, p.pz >> 16u);
-  if (!inWindow(cell, T.origin)) { return; }
+  if (!cellResident(cell, T.origin)) { return; }
   let ax = axisOf(p.px); let ay = axisOf(p.py); let az = axisOf(p.pz);
 
   // ---- loop-invariant work, lifted out of the 27 taps ----------------------
@@ -691,7 +691,7 @@ fn p2g2(@builtin(global_invocation_id) gid : vec3<u32>) {
   if (gid.x >= liveTotal()) { return; }
   var p = fluidParticles[gid.x];
   let cell = vec3<i32>(p.px >> 16u, p.py >> 16u, p.pz >> 16u);
-  if (!inWindow(cell, T.origin)) { return; }
+  if (!cellResident(cell, T.origin)) { return; }
   let ax = axisOf(p.px); let ay = axisOf(p.py); let az = axisOf(p.pz);
 
   // The (i,j) weight product, hoisted out of BOTH 27-tap loops below — see the
@@ -874,9 +874,7 @@ fn gridUpdate(@builtin(workgroup_id) wg : vec3<u32>,
 
   // Node cell from the block's chunk slot + this thread's local coords.
   let slot = fluidBlockList[block];
-  let sc = vec3<i32>(i32(slot % NCHUNK), i32((slot / NCHUNK) % NCHUNK),
-                     i32(slot / (NCHUNK * NCHUNK)));
-  let wc = slotToWorldChunk(sc, T.origin);
+  let wc = slotWorldChunk(slot, T.origin);
   let lo = vec3<i32>(i32(localIdx & 15u), i32((localIdx >> 4u) & 15u),
                      i32(localIdx >> 8u));
   let c = wc * i32(CHUNK) + lo;
@@ -1026,7 +1024,7 @@ fn g2p(@builtin(global_invocation_id) gid : vec3<u32>) {
   if (gid.x >= liveTotal()) { return; }
   var p = fluidParticles[gid.x];
   let cell = vec3<i32>(p.px >> 16u, p.py >> 16u, p.pz >> 16u);
-  if (!inWindow(cell, T.origin)) { return; }
+  if (!cellResident(cell, T.origin)) { return; }
   if (fluidSolid(cell)) {
     p.attr = 0u;
     fluidParticles[gid.x] = p;

@@ -50,6 +50,50 @@ constexpr uint32_t kNumChunks = kNChunk * kNChunk * kNChunk;  // 32768
 constexpr uint32_t kChunkVol = kChunk * kChunk * kChunk;      // 4096
 constexpr uint64_t kVoxelCount = (uint64_t)kWorldN * kWorldN * kWorldN;
 
+// ---- TICKET SLOTS: storage that is resident but not in the window ----------
+// docs/PLAN_chunk_tickets.md §2.1. THE SLOT SPACE IS NO LONGER THE WINDOW.
+//
+// A chunk's slot used to be its world coordinate modulo the window
+// (`chunkSlotIndex`, common.wgsl), so there were exactly kNumChunks slots and
+// arithmetic assigned every one of them. That is why "simulate a chunk 40
+// chunks away" could not be done by allocating a page: page space was never the
+// constraint, slot IDENTITY was. Tickets add slots that no window coordinate
+// maps to, so a distant chunk can be resident without evicting a near one.
+//
+//   slots [0, kNumChunks)           the window, addressed by the toroidal mask.
+//                                   UNCHANGED, and still the only slots the
+//                                   mask can produce.
+//   slots [kNumChunks, kNumSlots)   ticket slots, addressed only through the
+//                                   ticket map (a CPU-built wc -> slot table).
+//
+// THE DISTINCTION THAT MATTERS EVERYWHERE BELOW: kNumChunks is a statement
+// about the WINDOW's geometry (how many chunks fit in the box, what the mask
+// wraps at); kNumSlots is a statement about STORAGE (how many per-slot records
+// exist). Anything that sizes a buffer, bounds a dispatch over slots, or is a
+// plane stride inside a per-slot buffer is kNumSlots. Anything that describes
+// the window box — the wrap, `chunkInWindow`, the raymarch's clip — stays
+// kNumChunks. Conflating them is how a ticket slot ends up reading a window
+// chunk's memory, which is the failure docs/PLAN_chunk_tickets.md §5 names as
+// the risk of this phase.
+//
+// P0 SHIPS kTicketMax = 0, so kTicketSlots is 0 and kNumSlots == kNumChunks
+// exactly. Every buffer is byte-identical, every dispatch is the same size, and
+// the acceptance for this phase is that the world hash and the smoke probes do
+// not move. What P0 buys is that the ~160 addressing sites are CLASSIFIED and
+// routed through named functions, so P1 turns tickets on by changing this one
+// constant plus the ticket map's contents, not by re-auditing 15 shaders.
+constexpr uint32_t kTicketMax = 0;          // concurrent tickets; P1 raises it
+constexpr uint32_t kTicketBoxN = 5;         // 5^3 chunk box, inner 3^3 active
+constexpr uint32_t kTicketChunks = kTicketBoxN * kTicketBoxN * kTicketBoxN;  // 125
+// Rounded up to a multiple of 64 because sim_compact dispatches 64 slots per
+// workgroup over the whole slot space and kNumChunks is already a multiple of
+// 64; a ragged tail would need a second bound in the shader.
+constexpr uint32_t kTicketSlots =
+    ((kTicketMax * kTicketChunks + 63u) / 64u) * 64u;          // 0 at kTicketMax=0
+constexpr uint32_t kNumSlots = kNumChunks + kTicketSlots;      // 32768 at P0
+static_assert(kNumSlots % 64 == 0,
+              "sim_compact dispatches kNumSlots/64 workgroups of 64");
+
 // ---- the fluid lab's flat-slab worldgen mode (docs/PLAN_fluid_overhaul.md §4)
 // The `--lab` / `--fluid-bench` test world: solid stone for y <= kLabSlabY,
 // air above, no biomes/trees/caves/ponds/POIs/flora. It is a MODE TAP through
@@ -558,7 +602,7 @@ static_assert(kOpenBytesPerChunk % 4 == 0,
               "openness bytes per chunk must be a whole number of words");
 constexpr uint32_t kOpenWordsPerChunk = kOpenBytesPerChunk / 4;
 constexpr uint64_t kOpennessBytes =
-    (uint64_t)kNumChunks * kOpenWordsPerChunk * 4;          // 12 MiB at 512^3
+    (uint64_t)kNumSlots * kOpenWordsPerChunk * 4;           // 12 MiB at 512^3
 // THREE PLANES, not one (2026-09-05, PLAN_frame_perf.md §3 item 4):
 //   [0, kNumChunks)              the world-chunk STAMP per slot (below)
 //   [kNumChunks, 2 kNumChunks)   the tick of the slot's last FULL walk
@@ -572,7 +616,11 @@ constexpr uint64_t kOpennessBytes =
 // DESIGN.md note that "dilating the dirty list is not available" still holds:
 // this is 17x17 column STAMPS per dirty chunk, not 15^3 chunk WALKS. WGSL
 // mirrors the layout as OPEN_WALKED_BASE / OPEN_TOUCH_BASE (common.wgsl).
-constexpr uint32_t kOpennessGenWords = 2 * kNumChunks + kNChunk * kNChunk;
+// The first two planes are PER SLOT (kNumSlots, so ticket slots get a stamp and
+// a walk tick like any other). The third is per window COLUMN and stays
+// kNChunk^2: a ticket has no place in the window's (x, z) column grid, and the
+// refresh cursor that reads it only ever walks window slots.
+constexpr uint32_t kOpennessGenWords = 2 * kNumSlots + kNChunk * kNChunk;
 constexpr uint64_t kOpennessGenBytes = (uint64_t)kOpennessGenWords * 4;   // 260 KiB
 
 // ---- the IRRADIANCE grid (docs/PLAN_gi.md §3, W3 P1) -----------------------
@@ -604,7 +652,7 @@ constexpr uint64_t kOpennessGenBytes = (uint64_t)kOpennessGenWords * 4;   // 260
 // the walk zeroes it for a slot the window reused, the raymarch fills it.
 constexpr uint32_t kIrradiancePlanes = 2;
 constexpr uint64_t kIrradianceBytes =
-    (uint64_t)kNumChunks * kOpenBlocksPerChunk * kOpenFaces * 4 *
+    (uint64_t)kNumSlots * kOpenBlocksPerChunk * kOpenFaces * 4 *
     kIrradiancePlanes;   // 96 MiB at 512^3
 
 // ---- the GLOW field (docs/PLAN_glow.md; assets/shaders/sim_glow.wgsl) ------
@@ -657,9 +705,9 @@ constexpr uint64_t kIrradianceBytes =
 // around by testing the emitter's Y coordinate.
 constexpr uint32_t kGlowSrcWordsPerSlot = 4;
 constexpr uint64_t kGlowSrcWords =
-    (uint64_t)kNumChunks * kGlowSrcWordsPerSlot;                   // 512 KiB
+    (uint64_t)kNumSlots * kGlowSrcWordsPerSlot;                    // 512 KiB
 constexpr uint64_t kGlowFieldWords =
-    (uint64_t)kNumChunks * kOpenBlocksPerChunk;                    // 8 MiB
+    (uint64_t)kNumSlots * kOpenBlocksPerChunk;                     // 8 MiB
 constexpr uint64_t kGlowBytes = (kGlowSrcWords + kGlowFieldWords) * 4;
 // The WGSL side derives this as `NUM_CHUNKS * 4u` from constants the prelude
 // already emits, so the field needs no new prelude constant and no
@@ -1037,13 +1085,20 @@ constexpr uint32_t kPageRetireCeiling = kPageFreeProbesPerTick * kPageRetireTick
 // unlikely, and the proof is three lines:
 //
 //   - Alloc() is only ever reached for a SENTINEL slot, so at the moment of a
-//     request at most kNumChunks - 1 slots hold a page.
+//     request at most kNumSlots - 1 slots hold a page.
 //   - The retire queue holds at most kPageRetireCeiling.
 //   - freePages = kPoolPages - resident - retired >= 1. Always.
 //
 // It is not "headroom for an unbounded demand" — it is a pool that exceeds a
 // demand with a hard geometric ceiling. There cannot be a request for page
-// kNumChunks + 1 because there is no chunk slot to hand it to.
+// kNumSlots + 1 because there is no chunk slot to hand it to.
+//
+// TICKETS KEEP THE PROOF (docs/PLAN_chunk_tickets.md §2.1) because the first
+// line of it counts SLOTS, not window chunks: a ticket slot can hold a page
+// exactly as a window slot can, so the demand ceiling moves from kNumChunks to
+// kNumSlots and the pool follows it. This is the same "derived, never a
+// literal" rule kWorldN already gets — raise kTicketMax and the pool grows with
+// it, at 2 MiB per ticket's 125 chunks.
 //
 // CHANGE kWorldN AND THIS FOLLOWS, which is the point: the pool tracks the
 // window instead of being re-measured and re-guessed every time the window
@@ -1102,7 +1157,7 @@ constexpr uint32_t kPageRetireCeiling = kPageFreeProbesPerTick * kPageRetireTick
 // for the 5 cm / extended-radius target, where volume grows 8x and bulk
 // terrain gets MORE internally uniform, not less — sentinel compression
 // improves at finer resolution while sky compression stays flat.
-constexpr uint32_t kPoolPages = kNumChunks + kPageRetireCeiling;
+constexpr uint32_t kPoolPages = kNumSlots + kPageRetireCeiling;
 
 // THE WINDOW-SIZE GUARD RAIL. `voxels` is ONE storage buffer of kPoolPages
 // pages, and Vulkan's maxStorageBufferRange is a uint32_t — so 4 GiB - 1 is
@@ -2482,13 +2537,30 @@ class World {
     return SlotChunkIndex({c.x >> 4, c.y >> 4, c.z >> 4}) * kChunkVol +
            (lz * kChunk + ly) * kChunk + lx;
   }
+  // The C++ twin of common.wgsl's `slotWorldChunk`. A ticket slot is NOT
+  // window-coordinate arithmetic (docs/PLAN_chunk_tickets.md §2.2), so it reads
+  // its world chunk from the CPU-side ticket table instead. At kTicketMax = 0
+  // there are no such slots and the branch is dead.
   IVec3 SlotToWorldChunk(uint32_t slotIdx) const {
+    if (kTicketSlots != 0 && slotIdx >= kNumChunks) {
+      return TicketSlotWorldChunk(slotIdx);
+    }
     IVec3 s{(int)(slotIdx % kNChunk), (int)((slotIdx / kNChunk) % kNChunk),
             (int)(slotIdx / (kNChunk * kNChunk))};
     int m = (int)kNChunk - 1;
     return {origin_.x + ((s.x - origin_.x) & m), origin_.y + ((s.y - origin_.y) & m),
             origin_.z + ((s.z - origin_.z) & m)};
   }
+  // P0 STUB, the C++ half of common.wgsl's ticketSlotWorldChunk. P1 gives
+  // `Tickets` a slot -> wc vector and returns from it; until then no slot can
+  // reach here (kTicketSlots == 0) and the compiler drops the caller's branch.
+  IVec3 TicketSlotWorldChunk(uint32_t slotIdx) const {
+    (void)slotIdx;
+    return {0, 0, 0};
+  }
+  // Is this slot one the window's arithmetic can produce? Everything that
+  // decomposes a slot into (x, y, z) window-chunk coords must ask first.
+  static bool IsWindowSlot(uint32_t slotIdx) { return slotIdx < kNumChunks; }
   static uint64_t PackChunkKey(IVec3 wc) {
     auto u = [](int v) { return (uint64_t)(uint32_t)(v + (1 << 20)) & 0x1FFFFF; };
     return u(wc.x) | (u(wc.y) << 21) | (u(wc.z) << 42);
@@ -2539,8 +2611,12 @@ class World {
   // selected automatically, always available.
   enum class Residency { Dense, Paged };
   Residency residency = Residency::Dense;
+  // Dense is the IDENTITY map — page i for slot i — so it needs one page per
+  // slot, ticket slots included (docs/PLAN_chunk_tickets.md §2.8: dense with
+  // tickets active must produce the same hash as paged, which it cannot do if
+  // a ticket slot has no page to be the identity of).
   uint32_t PoolPages() const {
-    return residency == Residency::Dense ? kNumChunks : kPoolPages;
+    return residency == Residency::Dense ? kNumSlots : kPoolPages;
   }
 
   // The CPU table itself. Read freely; the MUTABLE accessor is for PageTable
