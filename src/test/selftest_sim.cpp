@@ -310,7 +310,7 @@ int settled = 0;  // tick at which the world went quiet (or the cap)
                 "mutate",  "MOVE",       "STAIN-WROTE", "REACT-FIRED",
                 "down",    "diag",       "equalize",    "split",
                 "film",    "displace",   "bridge",      "SUBMERGED",
-                "spill",   "powder",     "gas",         "solo"};
+                "film-press","powder",   "gas",         "solo"};
             // ONE pass, and it is the SAME pass that fills `awake`. An earlier
             // revision counted the reasons in a second loop over the same
             // array and printed "write 128 ... wbody 32761" next to "0 / 32768
@@ -389,6 +389,95 @@ int settled = 0;  // tick at which the world went quiet (or the cap)
                 "%u)%s\n",
                 words, n, matCh, stateCh, stainCh, stampOnly,
                 words == 0 ? "  <-- FALSE WAKE: nothing is writing" : "");
+
+    // ---- AND WHAT DOES THE GEOMETRY LOOK LIKE THERE? ---------------------
+    //
+    // CLAUDE.md rule 6, one rung further. "27 words changed, 21 of them back
+    // where they started" says a rule is CYCLING; it does not say which rule or
+    // in what shape, and the liquid rules are told apart by exactly that — a
+    // film against one riser is the terrace tread the rule was written for, a
+    // film between two facing risers is the 2-cycle it cannot see. Those differ
+    // only in cells the shader itself is forbidden to read, so the only place
+    // the distinction can be made is HERE, on the CPU, with no lattice bound.
+    //
+    // Measured cost of not having this: the first repair of the never-sleeping
+    // shoreline was aimed at the riser branch on an inference from
+    // `fullness 0` — plausible, cheap to make, and it left 14 chunks awake
+    // instead of 8. One printout of the neighbourhood would have aimed it.
+    //
+    // Prints a 5x5 plan view at the changed cell's own level and the level
+    // below it (the floor), reading a 3x3x3 SLOT-chunk block so a cell on a
+    // chunk border still gets a true neighbourhood instead of a wall of
+    // out-of-buffer. '#' is anything solid the CA cannot enter, '.' air,
+    // '1'-'8' this liquid's fullness in eighths, '*' some other material.
+    if (words != 0) {
+      uint32_t waterId = 0;
+      for (size_t mi = 0; mi < c.mats.size(); mi++)
+        if (c.mats[mi].name == "water") waterId = (uint32_t)mi;
+      // The first awake chunk that actually moved something. One chunk is
+      // enough — these come in families, and six cells of one is a shape.
+      for (size_t i = 0; i < n; i++) {
+        ReadVoxelsSync(ctx, world, awake[i], 1, now.data(), "sleepShape");
+        std::vector<uint32_t> chg;
+        for (size_t v = 0; v < kChunkVol; v++)
+          if (before[i][v] != now[v]) chg.push_back((uint32_t)v);
+        if (chg.empty()) continue;
+
+        // 3x3x3 slot chunks around this one -> a 48^3 block, centre at +16.
+        const int ccx = (int)(awake[i] % kNChunk),
+                  ccy = (int)((awake[i] / kNChunk) % kNChunk),
+                  ccz = (int)(awake[i] / (kNChunk * kNChunk));
+        std::vector<uint32_t> blk((size_t)48 * 48 * 48, 0);
+        std::vector<uint32_t> cbuf((size_t)kChunkVol);
+        for (int dz = -1; dz <= 1; dz++)
+          for (int dy = -1; dy <= 1; dy++)
+            for (int dx = -1; dx <= 1; dx++) {
+              const int nx = ((ccx + dx) % (int)kNChunk + (int)kNChunk) % (int)kNChunk;
+              const int ny = ((ccy + dy) % (int)kNChunk + (int)kNChunk) % (int)kNChunk;
+              const int nz = ((ccz + dz) % (int)kNChunk + (int)kNChunk) % (int)kNChunk;
+              ReadVoxelsSync(ctx, world,
+                             (uint32_t)(nz * (int)kNChunk * (int)kNChunk +
+                                        ny * (int)kNChunk + nx),
+                             1, cbuf.data(), "sleepShapeN");
+              for (uint32_t k = 0; k < kChunkVol; k++)
+                blk[(size_t)((dz + 1) * 16 + (int)(k / 256)) * 48 * 48 +
+                    (size_t)((dy + 1) * 16 + (int)((k / 16) % 16)) * 48 +
+                    (size_t)((dx + 1) * 16 + (int)(k % 16))] = cbuf[k];
+            }
+        auto glyph = [&](int bx, int by, int bz) -> char {
+          if (bx < 0 || bx >= 48 || by < 0 || by >= 48 || bz < 0 || bz >= 48)
+            return '?';
+          const uint32_t w = blk[(size_t)bz * 48 * 48 + (size_t)by * 48 + bx];
+          const uint32_t m = w & 0xFFFu;
+          if (m == 0) return '.';
+          if (m == waterId) return (char)('1' + ((w >> 12) & 7u));
+          if (m >= c.mats.size()) return '*';
+          const uint32_t k = c.mats[m].gpu.klass;
+          return (k == CLASS_SOLID || k == CLASS_POWDER) ? '#' : '*';
+        };
+        std::printf("sleep: shape of the movers in awake chunk (%d,%d,%d) "
+                    "[rows are z-2..z+2, columns x-2..x+2]\n",
+                    ccx, ccy, ccz);
+        for (size_t j = 0; j < chg.size() && j < 6; j++) {
+          const int lx = (int)(chg[j] % 16), ly = (int)((chg[j] / 16) % 16),
+                    lz = (int)(chg[j] / 256);
+          const int bx = 16 + lx, by = 16 + ly, bz = 16 + lz;
+          const uint32_t a = before[i][chg[j]], b = now[chg[j]];
+          std::printf("  local(%2d,%2d,%2d) %04x/f%u -> %04x/f%u   own level | "
+                      "the floor under it\n",
+                      lx, ly, lz, a & 0xFFFu, ((a >> 12) & 7u) + 1u,
+                      b & 0xFFFu, ((b >> 12) & 7u) + 1u);
+          for (int rz = -2; rz <= 2; rz++) {
+            std::printf("    ");
+            for (int rx = -2; rx <= 2; rx++) std::printf("%c", glyph(bx + rx, by, bz + rz));
+            std::printf("   ");
+            for (int rx = -2; rx <= 2; rx++) std::printf("%c", glyph(bx + rx, by - 1, bz + rz));
+            std::printf("%s\n", rz == 0 ? "   <- the cell's row" : "");
+          }
+        }
+        break;
+      }
+    }
   }
 
   // diagnosis on failure: where are the awake chunks, and what's in them?

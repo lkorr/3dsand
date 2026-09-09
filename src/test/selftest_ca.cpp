@@ -812,6 +812,178 @@ Status GateCaSlopeHybrid(Ctx& c, std::string& detail) {
   return s;
 }
 
+// ---- ca-gutter -----------------------------------------------------------
+//
+// THE GEOMETRY THE THIN-FILM RISER STEP CANNOT SEE, as a gate.
+//
+// `ca-slope` asks whether water gets DOWN a stepped hill, and the rule that
+// makes it — a lone eighth may step away from a riser exactly one voxel proud
+// of its own level — was written for the 2-cell TREAD in that gate's ramp.
+// sim_step.wgsl's own block admitted, at the time, the one shape it does not
+// terminate on: two such risers FACING each other with two air cells between
+// them. A film in there steps away from one riser into the foot of the other,
+// forever, and no reach-1 predicate can break the tie because the two cells
+// have byte-identical 3x3x3 neighbourhoods.
+//
+// It was left to the `sleep` gate to say whether the generated world contains
+// that shape. On 2026-09-08 it did: eight chunks awake permanently at the
+// authored home_lake, `MOVE 8 film 8`, and 21 of the 27 words that changed over
+// 20 further ticks came back to the value they started with. A 2-cycle, at a
+// shoreline, at a third of a voxel per tick, forever — CLAUDE.md rule 2 with
+// nothing to show for it, and invisible in the game because there is nothing
+// to SEE.
+//
+// So build the shape on purpose and assert it sleeps. This is a slot cut two
+// cells wide into a stone plateau: the floor of the slot is one voxel below the
+// plateau top, so every interior cell has a one-voxel riser behind it whichever
+// way it faces, and the sky above the rim is open so the riser test's
+// `!liquidWall(back + up)` clause is satisfied. One full cell of water (8
+// eighths) is dropped in, which halves out to eight cells of one eighth — the
+// resting state of the CA at minFilm 1, and the state from which nothing but
+// the riser step can move.
+//
+// WHAT IT ASSERTS, and the second one is the point:
+//   1. MASS is exact. A slot that "settles" by losing its water is not a pass.
+//   2. The box goes IDLE. Every chunk of the structure asleep, with the tick it
+//      went quiet reported, because "quiet from 40" and "quiet from -1" is the
+//      whole difference between the fix and the bug.
+//
+// The fix is FILM_LICENCE in sim_step.wgsl: the riser step may only fire in a
+// chunk where something that strictly decreases one of the CA's Lyapunov
+// functions happened last tick, so it cannot be its own cause. Run this gate
+// against the shader without it and it reports `2 of 4 box chunks awake ...
+// (quiet from -1)`.
+Status GateCaGutter(Ctx& c, std::string& detail) {
+  GpuContext& ctx = c.ctx;
+  World& world = c.world;
+  Simulation& sim = c.sim;
+
+  uint32_t waterId = 0;
+  for (size_t i = 0; i < c.mats.size(); i++)
+    if (c.mats[i].name == "water") { waterId = (uint32_t)i; break; }
+  if (waterId == 0) { detail = "no 'water' material"; return Status::Fail; }
+
+  // Dim dawn and no seam, for the reason ca-slope records: freezing and
+  // evaporation are authored mass sinks and would make the audit inexact, and
+  // an excited film is the MPM's problem, not the CA's.
+  Tuning dawn = CurrentTuning();
+  dawn.dayNight.freeze = 1;
+  dawn.dayNight.freezePhase = (int)(kDaySunrise + 1024u);
+  dawn.sim.fluidExciteMode = 0;
+  Tuning saved = CurrentTuning();
+  SetCurrentTuning(dawn);
+
+  const int px = 96, py = 120, pz = 96;
+  const int kHalf = 6;                  // chamber interior half-width
+  const int kSlotZ = 3;                 // slot half-length in z (6 cells long)
+  const int kTicks = 300;
+  const int floorY = py;                // slot floor; water rests at floorY+1
+  const int rimY = floorY + 1;          // the plateau top == the water's level
+  const int roofY = py + 6;
+  const int x0 = px - kHalf, x1 = px + kHalf;
+  const int z0 = pz - kHalf, z1 = pz + kHalf;
+  // The slot: TWO cells wide in x, which is the width the rule cannot resolve.
+  const int sx0 = px, sx1 = px + 1;
+  const int sz0 = pz - kSlotZ, sz1 = pz + kSlotZ - 1;
+
+  SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+  ctx.WaitIdle();
+
+  // A sealed chamber, and inside it a stone plateau at rimY with the slot cut
+  // out of it. Everything at or below floorY is solid, rimY is solid EXCEPT the
+  // slot, and everything above is air up to the roof.
+  std::vector<CellOp> build;
+  for (int z = z0 - 1; z <= z1 + 1; z++)
+    for (int x = x0 - 1; x <= x1 + 1; x++)
+      for (int y = floorY; y <= roofY; y++) {
+        const bool wall = x < x0 || x > x1 || z < z0 || z > z1;
+        const bool inSlot = x >= sx0 && x <= sx1 && z >= sz0 && z <= sz1;
+        const bool solid = wall || y >= roofY || y <= floorY ||
+                           (y == rimY && !inSlot);
+        build.push_back({World::SlotCellIndex({x, y, z}),
+                         solid ? (uint32_t)kMatStone : 0u});
+      }
+
+  // One full cell of water, standing on the slot floor in the middle of it.
+  // Eight eighths, so the level answer is eight cells of one eighth and the
+  // slot (12 cells) has room for it with none left over to stack.
+  const std::vector<CellOp> drop = {
+      {World::SlotCellIndex({sx0, rimY, pz}), (waterId & 0xFFFu) | (7u << 12)}};
+  const uint64_t placed = 8;
+
+  std::vector<uint32_t> boxChunks;
+  for (int cz = (z0 - 1) >> 4; cz <= ((z1 + 1) >> 4); cz++)
+    for (int cy = floorY >> 4; cy <= (roofY >> 4); cy++)
+      for (int cx = (x0 - 1) >> 4; cx <= ((x1 + 1) >> 4); cx++)
+        boxChunks.push_back(World::SlotChunkIndex({cx, cy, cz}));
+
+  uint32_t t = 44000;
+  int quietAt = -1;
+  uint32_t activeInBox = 0;
+  for (int i = 0; i < kTicks; i++) {
+    SubmitTick(ctx, world, sim, ++t, kDefaultSeed, {}, {},
+               i == 0 ? build : i == 4 ? drop : std::vector<CellOp>{}, false,
+               {6, 7, 6}, false, false);
+    if (i >= 20 && i % 10 == 0) {
+      ctx.WaitIdle();
+      std::vector<uint32_t> flags(kNumChunks, 0);
+      rhi::ReadbackBlocking(ctx.device, ctx.queue, sim.DirtyActive(), 0,
+                            flags.data(), kNumChunks * 4, "gutterActive");
+      activeInBox = 0;
+      for (uint32_t ci : boxChunks)
+        if (flags[ci] != 0) activeInBox++;
+      if (activeInBox == 0 && quietAt < 0) quietAt = i;
+      else if (activeInBox != 0) quietAt = -1;
+    }
+  }
+  ctx.WaitIdle();
+
+  // The resting shape. Everything is inside the chamber by construction — the
+  // rim is at the water's own level and nothing in the CA lifts water — so a
+  // sweep of the chamber is the whole ledger.
+  uint64_t standing = 0;
+  uint32_t wetted = 0, profile[9] = {}, outsideSlot = 0;
+  {
+    std::vector<uint32_t> cbuf((size_t)kChunkVol);
+    for (int cz = (z0 - 1) >> 4; cz <= ((z1 + 1) >> 4); cz++)
+      for (int cy = floorY >> 4; cy <= (roofY >> 4); cy++)
+        for (int cx = (x0 - 1) >> 4; cx <= ((x1 + 1) >> 4); cx++) {
+          ReadVoxelsSync(ctx, world, World::SlotChunkIndex({cx, cy, cz}), 1,
+                         cbuf.data(), "gutterVox");
+          for (uint32_t k = 0; k < kChunkVol; k++) {
+            if ((cbuf[k] & 0xFFFu) != waterId) continue;
+            const int x = (int)(k % 16) + cx * 16,
+                      y = (int)((k / 16) % 16) + cy * 16,
+                      z = (int)(k / 256) + cz * 16;
+            if (x < x0 - 1 || x > x1 + 1 || z < z0 - 1 || z > z1 + 1) continue;
+            if (y < floorY || y > roofY) continue;
+            standing += ((cbuf[k] >> 12) & 0xFu) + 1u;
+            profile[((cbuf[k] >> 12) & 0xFu) + 1u]++;
+            wetted++;
+            if (x < sx0 || x > sx1 || z < sz0 || z > sz1 || y != rimY)
+              outsideSlot++;
+          }
+        }
+  }
+  SetCurrentTuning(saved);
+
+  const bool massOk = standing == placed;
+  const bool idleOk = activeInBox == 0;
+  const bool ok = massOk && idleOk && outsideSlot == 0;
+  detail = Format(
+      "one full cell dropped in a 2-wide rimmed slot: at rest over %u cells "
+      "(profile 1:%u 2:%u 3:%u 4:%u 5:%u 6:%u 7:%u 8:%u), %u outside the slot, "
+      "mass %s (standing %llu of %llu), %u of %zu box chunks awake at tick %d "
+      "(quiet from %d)",
+      wetted, profile[1], profile[2], profile[3], profile[4], profile[5],
+      profile[6], profile[7], profile[8], outsideSlot,
+      massOk ? "EXACT" : "LEAK", (unsigned long long)standing,
+      (unsigned long long)placed, activeInBox, boxChunks.size(), kTicks,
+      quietAt);
+  std::printf("ca-gutter: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& CaGates() {
@@ -822,6 +994,7 @@ const std::vector<Gate>& CaGates() {
       {"ca-level-one", "sim", {}, false, GateCaLevelOne},
       {"ca-level", "sim", {}, false, GateCaLevel},
       {"ca-level-pond", "sim", {}, false, GateCaLevelPond},
+      {"ca-gutter", "sim", {}, false, GateCaGutter},
   };
   return g;
 }

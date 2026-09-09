@@ -161,6 +161,11 @@ const char* const kOrder[] = {
     "current",
     "determinism", "sleep",       "ca-skip",     "ca-slope",
     "ca-slope-hybrid", "ca-level-one", "ca-level", "ca-level-pond",
+    // Right after the other liquid-shape gates: same fixture neighbourhood,
+    // same dim-dawn pinning, and it is the negative of `ca-slope` — the
+    // 2-wide geometry the thin-film riser step CANNOT resolve, asserted to go
+    // to sleep rather than to drain.
+    "ca-gutter",
     "evaporation", "wind",      "wind-gas",   "wind-prim",
     "blood-stain", "flung-liquid", "fluid-det",     "fluid-settle",
     "fluid-excite", "fluid-onwater", "fluid-stain", "fluid-react", "far-fog",  "far-downsample",

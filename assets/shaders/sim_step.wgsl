@@ -13,6 +13,13 @@
 // flow for liquids, viscosity gate, critter wander).
 
 @group(0) @binding(0) var<storage, read_write> voxels   : array<u32>;
+// THIS tick's dirty set, i.e. the reason bits every rule ORed in LAST tick. Read
+// only, and stable for the whole 54-iteration colour loop: mutate/explode write
+// it before sim_compact builds the dispatch list and nothing touches it after.
+// Same read, and the same "was this chunk actually disturbed" question, as
+// sim_waterbody's quiescence pass (pass_table.def's R(DirtyIn) note). One scalar
+// load per workgroup — see FILM_LICENCE below for the only thing that uses it.
+@group(0) @binding(1) var<storage, read>       dirtyIn  : array<u32>;
 @group(0) @binding(2) var<storage, read_write> dirtyOut : array<atomic<u32>>;
 @group(0) @binding(3) var<storage, read>       materials : array<Material>;
 @group(0) @binding(4) var<uniform> T : TickParams;
@@ -120,18 +127,120 @@ const DIRTY_M_DOWN      : u32 = 4096u;    // stage 1: straight down
 const DIRTY_M_DIAG      : u32 = 8192u;    // stage 2: axis/corner down-diagonals
 const DIRTY_M_EQUAL     : u32 = 16384u;   // stage 3: same-liquid equalize
 const DIRTY_M_SPLIT     : u32 = 32768u;   // stage 3: halve into air
-const DIRTY_M_FILM      : u32 = 65536u;   // stage 3: last-eighth film step
+const DIRTY_M_FILM      : u32 = 65536u;   // stage 3: film step off a RISER
 const DIRTY_M_DISPLACE  : u32 = 131072u;  // stage 3: displace a lighter fluid
 const DIRTY_M_BRIDGE    : u32 = 262144u;  // stage 4: level two neighbours
 const DIRTY_M_SUBMERGED : u32 = 524288u;  // the mover had its own liquid above
-const DIRTY_M_SPILL     : u32 = 1048576u; // RETIRED: the submerged whole-cell
-                                          // spill, kept as a reserved bit and a
-                                          // signpost to the block in stepLiquid
-                                          // that says why it is not a rule.
+// Bit 20 WAS DIRTY_M_SPILL — the submerged whole-cell spill, retired, and the
+// block in stepLiquid that says why it is not a rule is still there. It now
+// carries the OTHER film branch, because "film" naming two rules with two
+// completely different termination arguments is exactly the blank CLAUDE.md
+// rule 6 is about: one of them is provably finite and the other was the
+// never-sleeping shoreline. `film` is the riser step, `film-press` is the
+// pressed one, and a histogram that says which is a diagnosis instead of a
+// direction to go looking.
+const DIRTY_M_FILMPRESS : u32 = 1048576u; // stage 3: film step under PRESSURE
 // The non-liquid movers, so "MOVE with no liquid stage" stops being a blank.
 const DIRTY_M_POWDER    : u32 = 2097152u;
 const DIRTY_M_GAS       : u32 = 4194304u;
 const DIRTY_M_SOLO      : u32 = 8388608u;  // a one-voxel solid island falling
+
+// ---- THE FILM LICENCE: a neutral rule may not license ITSELF ---------------
+//
+// THE BUG, measured at the authored home_lake on 2026-09-08. The owner, from
+// the live game: F6 lights a handful of chunks permanently and the active-voxel
+// overlay inside them is empty. `sleep` printed
+//
+//   awake by reason (14 chunks): MOVE 14 film-press 14
+//   awake chunks over 20 more ticks: 47 words changed in 14 chunks
+//     (material 10, fullness 0, stain 0, STAMP-ONLY 37)
+//
+// and then, because a count is not a measurement (CLAUDE.md rule 6), the plan
+// view the same gate now dumps — the movers' own level beside the level under
+// them:
+//
+//     .1122   88888
+//     .1.22   88888
+//     .1122   88888   <- the cell's row
+//     .1112   88888
+//     ..112   88888
+//
+// FULL WATER UNDERNEATH. This is not a puddle in a hollow and it is not the
+// 2-wide gutter the riser step cannot resolve — it is the TOP LAYER OF THE
+// LAKE, a patchwork of one- and two-eighth cells with holes in it, endlessly
+// rearranging itself over a surface it can never finish levelling. 37 of 47
+// changed words came back to the value they started with: a shuffle, not work.
+//
+// WHICH RULE. `film-press`, and the bit that says so was split out of `film`
+// for this: the two film branches have completely different termination
+// arguments and a histogram that folds them together names neither. The first
+// repair went to the RISER branch on an inference from `fullness 0` — every
+// filmPressed advance is supposed to be followed by the split that justifies
+// it, and a split moves fullness, so nothing splitting looked like nothing
+// pressing. Wrong, and wrong in the informative direction: the splits are not
+// happening, and THAT IS THE BUG.
+//
+// WHY THE PROOF FAILS. filmPressed's argument (see its block) is that the cell
+// the film VACATES is a face neighbour of the cell that pressed it, which holds
+// >= LIQ_SPLIT_MIN and CAN therefore split into the hole — strictly decreasing
+// SUM(f*f). "Can" is not "does". On an open surface there are films on every
+// side of that hole, and one of THEM advances into it first; the pressing cell
+// still holds its two eighths, nothing split, SUM(f*f) is unchanged, and the
+// configuration has merely rotated. A potential argument that assumes the hole
+// waits its turn is not a termination argument on a crowd.
+//
+// The riser branch (filmStepAllowed) has the same shape of hole in it, admitted
+// in its own block: two risers facing each other exactly 3 apart is a 2-cycle
+// no reach-1 predicate can break, because a terrace tread's inner cell and a
+// 2-wide rimmed gutter's cell have byte-identical 3x3x3 neighbourhoods and the
+// one read that separates them, `c + 2d`, is racy by construction — the colour
+// lattice keeps acting cells >= 3 apart and each writes within 1, so a cell
+// exactly 2 away is exactly the cell another thread may be writing this pass.
+//
+// SO GATE BOTH ON PROGRESS INSTEAD OF ON GEOMETRY. Both film moves are NEUTRAL
+// in both of this file's Lyapunov functions (same SUM(f*y), same SUM(f*f)) —
+// they only relocate a film. Every OTHER liquid rule strictly decreases one of
+// them. So the whole defect is that a neutral move can be its own cause, and
+// the repair is to say it cannot: a film may only step in a chunk where
+// something that DID decrease a Lyapunov function happened last tick.
+//
+// TERMINATION, and it is the whole point. Every bit below is either a move that
+// strictly decreases a bounded integer (descent SUM(f*y); equalize / split /
+// bridge SUM(f*f); powder and gas their own) or an EXTERNAL input (a mutation,
+// the seam, a particle landing, a reaction firing). None of them can be caused
+// by a film step. So in a world with no new input the licence is granted on
+// finitely many ticks, hence finitely many film steps happen, hence the chunk
+// sleeps. The rules keep every case they were written for — while a pour, a
+// spill or a dome is actually draining the chunk is full of descents and
+// splits, the licence is on every tick, and the films step exactly as before —
+// and lose only the case they never should have had: being the last thing
+// awake, moving a third of a voxel per tick, forever, with nothing to show.
+//
+// WHAT IT COSTS, measured rather than assumed: `ca-slope` is unchanged to the
+// digit (96.9% of the pour in the basin, 0 eighths left on the ramp, quiet from
+// tick 90), and so are ca-level-one and ca-level. A drain is a chunk full of
+// progress; that is exactly when the licence is granted.
+//
+// WHAT IS DELIBERATELY *NOT* IN THE SET, because it is the trap: DIRTY_R_FLOW
+// and DIRTY_R_VISCOUS. Those are the settled path's "this cell HAS an option"
+// marks, not "this cell DID something", and canFlowAnywhere reports the riser
+// step as an option — so licensing on either would let the oscillation license
+// itself one tick later and buy nothing but a longer period. DIRTY_R_MOVE is
+// out for the same reason (a film step is a move). DIRTY_R_REACT and
+// DIRTY_R_STAIN are the matched-but-did-not-fire / unsaturated-neighbour idle
+// marks; their WROTE counterparts are what count.
+const FILM_LICENCE : u32 =
+    DIRTY_R_WRITE | DIRTY_R_SEAM | DIRTY_R_PARTICLE | DIRTY_R_WATERBODY |
+    DIRTY_R_MUTATE | DIRTY_R_STAINW | DIRTY_R_REACTW |
+    DIRTY_M_DOWN | DIRTY_M_DIAG | DIRTY_M_EQUAL | DIRTY_M_SPLIT |
+    DIRTY_M_DISPLACE | DIRTY_M_BRIDGE | DIRTY_M_POWDER | DIRTY_M_GAS |
+    DIRTY_M_SOLO;
+
+// Set once per workgroup at the top of main from dirtyIn[ci]; read by BOTH film
+// predicates, which is what makes canFlowAnywhere inherit it for free — the
+// moving path and the settled path MUST agree or a chunk either pins awake or
+// sleeps with work left.
+var<private> gFilmLicence : bool = false;
 
 // Is there more of this same liquid directly ABOVE c? Out of window reads as
 // "no": the residency edge is solid and inert, so a cell at the top of the
@@ -921,6 +1030,14 @@ fn canDescend(c : vec3<i32>, n : vec3<i32>, mat : u32, dens : i32) -> bool {
 // is the arbiter for whether the generated world contains it. The "one voxel
 // tall" clause is what keeps the far more common case (a 2-wide slot between
 // two ordinary walls) out of the rule entirely.
+//
+// THE `sleep` GATE FOUND ONE (2026-09-08, the authored home_lake: 8 chunks
+// awake forever, `MOVE 8 film 8`, 21 of 27 changed words back where they
+// started). The termination argument above is therefore FALSE as written, and
+// what repairs it is not a better predicate — see the FILM_LICENCE block near
+// the top of this file for why no reach-1 predicate exists — but a licence:
+// this rule may only fire in a chunk where something that DOES decrease a
+// Lyapunov function happened last tick, so it can no longer be its own cause.
 // ---- the MINIMUM FILM, and why the halving needed a floor -------------------
 //
 // The rule above says a lone eighth may not wander. This one says how the
@@ -976,6 +1093,11 @@ const LIQ_MIN_FILM : u32 = clamp(TUNE_LIQUID_MIN_FILM, 1u, 4u);
 const LIQ_SPLIT_MIN : u32 = 2u * LIQ_MIN_FILM;
 
 fn filmStepAllowed(c : vec3<i32>, d : vec2<i32>) -> bool {
+  // The licence comes FIRST: it is a workgroup-uniform bool and the two loads
+  // below are not. See the FILM_LICENCE block — the geometry test is unchanged
+  // and still cannot tell a tread from a gutter; what changed is that a rule
+  // neutral in both Lyapunov functions is no longer allowed to be its own cause.
+  if (!gFilmLicence) { return false; }
   let back = c - vec3<i32>(d.x, 0, d.y);
   return liquidWall(back) && !liquidWall(back + vec3<i32>(0, 1, 0));
 }
@@ -1035,7 +1157,24 @@ fn filmStepAllowed(c : vec3<i32>, d : vec2<i32>) -> bool {
 // neighbour merely thicker than the film can still be too thin to split into the
 // hole the film leaves, and at minFilm > 1 that gap is where the proof (and the
 // settling) breaks.
+//
+// AND THE PROOF IS STILL NOT ENOUGH, measured 2026-09-08 (FILM_LICENCE, near the
+// top of this file). "That cell CAN therefore split into the hole" quantifies
+// over an OPPORTUNITY. On a lake surface — films on every side of every hole —
+// some other film advances into the hole first, the pressing cell keeps its two
+// eighths, nothing splits, SUM(f*f) does not move and the configuration has
+// merely rotated. Fourteen chunks of the authored home_lake did that forever.
+// The licence at the top of this function is what closes it: no split anywhere
+// in the chunk last tick means no advance this tick.
 fn filmPressed(c : vec3<i32>, mat : u32) -> bool {
+  // THE LICENCE FIRST, and the paragraph above is why it is needed: "that cell
+  // CAN therefore split into the hole" is a statement about what is available,
+  // not about what happens, and on an open water surface another film reaches
+  // the hole first. Measured at the home_lake — 14 chunks awake forever, marked
+  // `film-press`, 37 of 47 changed words back where they started, and not one
+  // split in 20 ticks. See the FILM_LICENCE block: a move neutral in both
+  // Lyapunov functions may not be its own cause.
+  if (!gFilmLicence) { return false; }
   for (var i = 0u; i < 4u; i++) {
     let d = lateralDir(i);
     let n = c + vec3<i32>(d.x, 0, d.y);
@@ -1169,8 +1308,10 @@ fn canFlowAnywhere(c : vec3<i32>, w : u32, mat : u32, m : Material) -> bool {
   }
 
   // 3) laterals: equalize into a same-liquid neighbour holding >= 2 less,
-  //    split into air, step a film off a riser or out from under the water
-  //    pressing on it, or displace something lighter.
+  //    split into air, step a film off a riser (only under FILM_LICENCE — and
+  //    filmStepAllowed tests it, so this mirror inherits it for free, which is
+  //    the whole reason the licence lives in the shared predicate) or out from
+  //    under the water pressing on it, or displace something lighter.
   // Hoisted out of the direction loop: it does not depend on `d`, and it is only
   // ever asked of a cell too thin to split.
   let pressed = f < LIQ_SPLIT_MIN && filmPressed(c, mat);
@@ -1353,14 +1494,21 @@ fn stepLiquid(c : vec3<i32>, idx : u32, w : u32, mat : u32, m : Material, rnd : 
       // reach-1 and both with their own termination argument (see the blocks
       // on filmStepAllowed and filmPressed):
       //   * it is standing against a one-voxel riser — the terrace tread case,
-      //     and the cell it vacates is air so the move cannot repeat; or
+      //     and the cell it vacates is air so the move cannot repeat UNLESS a
+      //     second riser faces the first, which is why that branch now also
+      //     needs the chunk to have done something else last tick
+      //     (FILM_LICENCE); or
       //   * water thick enough to split is pressing on it from behind, so
       //     advancing hands that neighbour a split and the puddle levels.
       // The second is what dissolves a dome; without it the rim is frozen and
       // the cone behind it is a stable resting shape.
-      if ((pressed || filmStepAllowed(c, d)) &&
-          tryMove(c, n, w, m.density, false)) {
-        markDirtyR(c, DIRTY_M_FILM | sub);
+      // The two branches are marked SEPARATELY: they have different termination
+      // arguments and only one of them was the shoreline that never slept, so a
+      // histogram that folds them together cannot name the bug.
+      let riser = filmStepAllowed(c, d);
+      if ((pressed || riser) && tryMove(c, n, w, m.density, false)) {
+        markDirtyR(c, select(0u, DIRTY_M_FILM, riser) |
+                      select(0u, DIRTY_M_FILMPRESS, pressed) | sub);
         return true;
       }
     } else if (tryMove(c, n, w, m.density, false)) {
@@ -1693,6 +1841,11 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
   // one workgroup per compacted dirty chunk (indirect dispatch). The list
   // holds SLOT indices; reconstruct the world chunk from the window origin.
   let ci = dirtyList[wg.x];
+  // Workgroup-uniform, one scalar load, read only by the riser film step: did
+  // anything that is not itself a film step happen in this chunk last tick?
+  // FILM_LICENCE block — this is what stops a neutral rule from keeping a
+  // shoreline puddle awake forever.
+  gFilmLicence = (dirtyIn[ci] & FILM_LICENCE) != 0u;
   let sc = vec3<i32>(vec3<u32>(ci % NCHUNK, (ci / NCHUNK) % NCHUNK,
                                ci / (NCHUNK * NCHUNK)));
   let wc = slotToWorldChunk(sc, T.origin);

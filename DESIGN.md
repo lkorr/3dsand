@@ -477,6 +477,30 @@ SSBO lists of chunk indices.
     in `SUM(f*f)`, so the gate is chosen to make it terminate: the cell it
     vacates is a face neighbour of the cell that justified the move, which can
     therefore split into the hole, and splitting strictly decreases `SUM(f*f)`.
+- **A NEUTRAL RULE MAY NOT LICENSE ITSELF — `FILM_LICENCE`** (2026-09-08). The
+  argument above quantifies over an OPPORTUNITY (*"which CAN therefore split"*),
+  and on an open water surface the opportunity is taken by somebody else: films
+  surround every hole, one of them advances into it before the pressing cell
+  splits, nothing splits, `SUM(f*f)` does not move and the configuration has
+  merely rotated. Measured at the authored `home_lake`: 14 chunks awake forever,
+  reasons `MOVE 14 film-press 14`, 37 of 47 changed words back where they
+  started over 20 ticks, not one split — a shuffle at a third of a voxel per
+  tick, invisible in the game and a permanent breach of rule 2. The riser branch
+  (`filmStepAllowed`) has the same shape of hole, admitted in its own block:
+  two one-voxel risers facing each other 3 apart is a 2-cycle, and no reach-1
+  predicate can break it because a terrace tread's inner cell and a 2-wide
+  rimmed gutter's cell have byte-identical 3×3×3 neighbourhoods (the one read
+  that separates them, `c + 2d`, is racy — acting cells are ≥3 apart and each
+  writes within 1, so a cell exactly 2 away is the one another thread may be
+  writing). **Both film branches now require a licence**: they may only fire in
+  a chunk where something that DID strictly decrease a Lyapunov function — a
+  descent, an equalize, a split, a bridge, a powder or gas move — or an external
+  input (mutation, seam, particle, reaction) marked the chunk last tick. The CA
+  reads its own previous verdict, `dirtyIn[chunk]`, one scalar per workgroup
+  (`R(DirtyIn)` on the `ca` row, the same read `waterQuiet` already makes). Cost,
+  measured: `ca-slope` unchanged to the digit (96.9% into the basin, 0 eighths
+  left on the ramp), `ca-level-one` and `ca-level` unchanged; `sleep` goes from
+  14 chunks awake forever to **0, fully quiet**. Pinned by `ca-gutter`.
   - **`bridgeLevel`** — a cell may equalize between TWO OF ITS OWN lateral
     neighbours. Write reach is unchanged (both are one cell away — the same
     licence `tryMove` spends on self and one neighbour), but the pair straddles
@@ -497,7 +521,9 @@ SSBO lists of chunk indices.
   - Gates: `ca-level-one` (one placed voxel → 8 cells of one eighth, no slack),
     `ca-level` (216 eighths → 135 wetted columns, one cell deep, ≤4 eighths
     anywhere; was 57 columns and 6 eighths), `ca-level-pond` (the reported case:
-    the same blob on standing water).
+    the same blob on standing water), `ca-gutter` (the negative of `ca-slope`:
+    a 2-wide slot cut into a plateau, the geometry the riser step cannot
+    resolve, asserted to SLEEP rather than to drain).
 - **Gas**: inverse powder (up, then up-diagonals, then lateral), plus decay chance.
 - **Solid**: doesn't move; participates in reactions and structural checks only.
 - **Density displacement**: a mover entering a cell occupied by a less-dense

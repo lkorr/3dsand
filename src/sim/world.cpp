@@ -591,7 +591,7 @@ void World::KickReadback() {
                   // sim_step's DIRTY_M_* liquid-stage split
                   "down",       "diag",        "equalize",   "split",
                   "film",       "displace",    "bridge",     "SUBMERGED",
-                  "spill",      "powder",      "gas",        "solo"};
+                  "film-press", "powder",      "gas",        "solo"};
               std::printf("dirty-reasons t%u: active %u (%u multi-cause)",
                           snap_.tick, active, multi);
               for (int bit = 0; bit < 24; bit++)

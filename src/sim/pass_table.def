@@ -214,8 +214,16 @@ PASS(copy_argsStage_dispatchArgs, nullptr, PT_TICK, PIPE_NONE, K_COPY, 0,0,12, G
 // tick's block map + node mass + the seam's intent word, and flags the cell
 // for consumption when a rule takes it. All three are last-tick state during
 // the whole 54-iteration loop — no intra-loop hazard, one inter-table one.
+// R(DirtyIn), same read and the same question as waterQuiet below: the CA reads
+// its OWN previous verdict for this chunk, one scalar per workgroup, to decide
+// whether the thin-film riser step is licensed this tick (FILM_LICENCE in
+// sim_step.wgsl — a rule neutral in both Lyapunov functions may not be its own
+// cause, or a rimmed puddle never sleeps). DirtyIn is last written by
+// mutate/explode, well before `compact` builds this dispatch list, and nothing
+// writes it again during the 54 iterations — so this is a stable read, not a
+// read-your-own-write: the CA's marks this tick go to DirtyOut.
 PASS(ca, "ca(54 color x substep)", PT_TICK, PIPE_STEP, K_INDIRECT, IND_DISPATCHARGS,0,0, GRP_SIM, DYN_CA, C_CAACTIVE, 54,
-     USES(R(Materials) U(TickUBO) U(PassUBO) R(Reactions) R(DirtyList) I(DispatchArgs)
+     USES(R(Materials) U(TickUBO) U(PassUBO) R(Reactions) R(DirtyIn) R(DirtyList) I(DispatchArgs)
           RW(Voxels) A(DirtyOut) A(Support) R(PageTable) A(PageFaults)
           R(FluidBlockMap) R(FluidGrid) A(FluidCellScratch) A(ActVoxViz)))
 
