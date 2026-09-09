@@ -33,6 +33,11 @@ const std::vector<Gate>& EnvTruthGates();
 const std::vector<Gate>& ScaleGates();
 const std::vector<Gate>& SimGates();
 const std::vector<Gate>& CaGates();
+// The two gas-particle gates (docs/PLAN_gas_particles.md §4). Their own TU
+// because they are their own domain — the window edge as a SINK — and because
+// both build a 50k-op mutation fixture that has nothing to do with the CA
+// gates' chambers.
+const std::vector<Gate>& GasGates();
 const std::vector<Gate>& WindGates();
 const std::vector<Gate>& WaterGates();
 const std::vector<Gate>& RenderGates();
@@ -228,6 +233,21 @@ const char* const kOrder[] = {
     // 900 ticks, and it regenerates the world on the way out so the gates
     // after it still find pristine terrain (rule 7).
     "fire-down",
+    // ---- THE WINDOW EDGE AS A SINK (docs/PLAN_gas_particles.md §4) --------
+    // Straight after `fire-down`, and for exactly the reasons the three gates
+    // above it give. Both of these light no fire, but they do the same KIND of
+    // damage to the shared world: a 55k-cell air shaft and a 4,096-voxel smoke
+    // puff at absolute coordinates, 800 ticks of CA, and a wind field turned up
+    // to 20 m/s and put back. Each regenerates worldgen on the way out, so the
+    // gates after them still find pristine terrain (CLAUDE.md rule 7), and
+    // neither declares a dependency — both build their own world, so neither
+    // can be silently SKIPPED behind a known-failing gate.
+    //
+    // They sit here rather than beside `sleep` because the property they assert
+    // is about smoke leaving the CEILING, which is the same subject as the fire
+    // gates and the same class of perturbation; `sleep` wants a world nobody
+    // has thrown 4,096 gas voxels into.
+    "gas-leave", "gas-reenter",
     // The swing's OTHER half. `swing` up top is MeleeState alone and costs
     // milliseconds; this one stands an avatar on real terrain with the blade
     // drawn, spawns a dummy to cut, and measures the sword's world trajectory
@@ -346,7 +366,7 @@ const std::vector<Gate>& Registry() {
   static std::vector<Gate> all = [] {
     std::vector<Gate> pool;
     for (const auto* g : {&TerrainGates(), &TreeGates(), &BiomeGates(), &EnvTruthGates(), &ScaleGates(),
-                          &SimGates(), &CaGates(), &WindGates(), &WaterGates(),
+                          &SimGates(), &CaGates(), &GasGates(), &WindGates(), &WaterGates(),
                           &RenderGates(),
                           &PlayerGates(),
                           &MobGates(), &BodyGates(), &FloaterGates(),

@@ -378,8 +378,18 @@ are deduplicated across mob defs, so 128 slots cover a whole cast.
   22,652 (65%) → 25,831 (74%) of 34,816. K is one `constexpr` and the whole
   trade-off curve was measured — K=2 gives back the residency but leaves the
   fence in place on 76% of shifts.
-- **Unloaded space is treated as solid and inert** so liquids can't drain off the
-  edge of the loaded world (Burkelbear's solution; adopt it verbatim).
+- **Unloaded space is treated as solid, inert, and a SINK FOR GAS** so liquids
+  can't drain off the edge of the loaded world (Burkelbear's solution; adopted
+  verbatim) — with one deliberate exception since 2026-09-09. Solid and inert is
+  the right answer for anything that would FALL out of the world and for
+  everything that would react out there. It is the wrong answer for a gas, whose
+  whole behaviour is to leave: a smoke voxel refused at the window's top face
+  could not tell that refusal from a stone wall, fell through to the lateral
+  ring, and sheeted across the entire top chunk plane until it decayed. So the
+  edge is one-way for `CLASS_GAS`: a gas voxel whose intent points out of the
+  window deletes itself and becomes a gas PARTICLE (§5), which keeps moving
+  outside under the same model and reconverts to a voxel if it drifts back in.
+  Nothing else crosses, and nothing reacts out there.
 - Overworld draw distance beyond the window is handled by the render-only
   far-field cascades (§9) — the streaming horizon is no longer visible from
   the surface. Underground, darkness still hides it.
@@ -818,6 +828,124 @@ Noita's "Bloody Zombies" technique, on GPU:
   mechanisms will reason a world settled while matter is still moving.
 
 **Gameplay projectiles are a separate CPU system** (§8) — they carry game logic.
+
+### Gas particles: the window edge is a sink (2026-09-09; `sim_gas.wgsl`, docs/PLAN_gas_particles.md stage 1)
+
+A SECOND particle population, with its own buffers, for the one kind of matter
+whose whole behaviour is to leave the world: gas.
+
+**The defect.** `tryMove` returns false out of the residency window, and a gas
+voxel could not tell that refusal from a stone wall. It fell through to the gas
+ladder's lateral ring and SHEETED across the entire top chunk plane — up to
+1,024 chunks plus the dilated layer under them — until its decay rule fired
+(smoke is 9/1000, so ~111 ticks of it). That sheet is the chunk outline visible
+in the sky over a big fire, and at 27 colour phases × 2 substeps × 4,096 cells
+per awake chunk it was most of the fire's CA cost. §3's "unloaded space is solid
+and inert" is right for everything that would fall out of the world and wrong
+for a gas.
+
+- **Representation.** The same 32-byte `Particle`: `payload` bits 0..11 material
+  and 12..15 state, plus `PFLAG_GAS`. Position is 24.8 fixed with a **zero
+  fraction** — a parcel lives ON a cell and moves in whole cells — and velocity
+  is always zero, which keeps `particlePriority` a pure function of the visible
+  state. No age field: death is rolled from the material's own bucket.
+- **Edge conversion.** In `sim_step.wgsl`'s gas tail, a `tryMove` that fails
+  because the target is out of the window (as opposed to failing on
+  `canDisplace`) calls `gasLeave`: the cell becomes air, the chunk is marked,
+  and a record is appended to `gasSpawn`. Reach 0 — it writes only its own cell,
+  and the target was never writable. Any face, not only +Y.
+- **Motion outside is the grid model verbatim.** The same `gasIntent` roll,
+  `windLateralStart` order and fourteen-candidate fallback ladder the CA uses,
+  refactored to take the identity key and the substep as arguments so both
+  kernels call one definition. Not a reduced-fidelity puff.
+- **Blocking outside is `farVox`**, the far cascade's level-1 byte — the same
+  test the far march uses. Dense toroidal array, direct index, **not the page
+  table**: the page table does not extend past the window and has no business
+  being asked about smoke 60 m away. Outside the cascade reads as OPEN, not as
+  blocked, or every plume would pin against an invisible wall.
+- **Bounds (rule 2), all three stateless tests on the parcel's own position:**
+  the outer box, `origin.y + WORLD_N + kGasCeilingVox`, and the authored decay.
+  `gasDecayProduct` walks the material's `RK_DECAY` entries exactly as
+  `doReactions` does, so the chance an author tunes for the voxel is the one the
+  parcel obeys; a gas product morphs, `air` dies, a grid product proposes a
+  landing. Neighbour-COUNT scaled rules are skipped — out there a parcel has no
+  neighbours and `scaledChance`'s answer would be a fabrication.
+- **Re-entry = RECONVERT.** A parcel whose next cell is inside the window
+  proposes itself as a voxel through the ordinary `atomicMax` claim path, one
+  claim per parcel per tick, deterministic winner, losers retry. That is the ONE
+  place a gas parcel meets the page system, and it is why gas that leaves is not
+  gas that is lost: it rejoins the reaction system on landing.
+- **Rendering** is `gasOuter`, a coarse density box: one byte per cell,
+  four to a `u32`, 128³ cells over exactly two window edges, centred on the
+  window, 2 MiB, at `renderBGL_` binding 21. Cleared and re-splatted every tick
+  (`atomicAdd` of a byte lane, so the result is scheduling-independent), sampled
+  by the far march after the near hit exits. Render-only derived data: the sim
+  never reads it, the world hash never covers it, it is never stale.
+  Saturating at 192/cell rather than carrying into the neighbouring byte.
+  **Deviation from the plan:** the cell is 0.8 m, not 0.4 m. The plan asked for
+  0.4 m cells AND a 2x-window span AND 2 MiB; 128³ bytes IS 2 MiB and 128 ×
+  0.4 m is half the stated span, so the three never agreed. Span and memory are
+  kept. **Second deviation:** the splat is folded into `gasResolve` rather than
+  given its own dispatch, because resolve already walks every live parcel once.
+- **Own buffers, not a share of `kParticleCap`.** `gasParticles[2]` at
+  `kGasParticleCap` = 262,144, plus `gasCounts` / `gasClaim` / `gasSpawn` (the
+  CA's outbox, whose 8-word header is this tick's counters) / `gasSpawnOps` (the
+  CPU op stream, rule 3) / `gasArgs` / `gasOuter`. The two populations must not
+  be able to starve each other: a fight full of ballistic debris must not thin a
+  plume, and a forest fire must not stop a sword from shattering.
+- **Determinism, and the hole it had to close.** A parcel outside the window
+  touches no voxel, so the world hash **cannot see it** — a scheduling-dependent
+  step out there would reproduce a matching hash sequence for a whole run and
+  only surface a hundred ticks later when the parcel landed. The population
+  therefore carries its own digest (`kGasSpDigest`: the SUM of every surviving
+  parcel's `particlePriority`, a sum because the pool's append order is
+  scheduling-dependent by construction), which the `determinism` gate compares
+  across its two runs alongside the hash series.
+
+**The open problem, recorded because sizing a cap is not the same as fixing
+it.** `gasLeave` charges a shared `atomicAdd` cursor, so WHICH voxels are
+refused when the per-tick list fills is decided by which workgroup arrived
+first — and a refused voxel STAYS IN THE GRID, where the world hash can see it.
+That is scheduling-dependent output, i.e. a rule-1 hazard. It is held off by
+sizing `kGasSpawnPerTick` (65,536, a quarter of the window's top face in ONE
+tick) out of reach, which makes the POOL the binding constraint instead — and a
+dropped parcel is already outside the window and cannot move a voxel. The
+`gas-leave` gate asserts refusals == 0, so the day that is not enough it is a
+printed number rather than a silent divergence. **The real fix is mark+apply**:
+the CA flags cells that want to leave and a second pass converts them in a
+deterministic order, which is the pattern `sim_explode` already uses for exactly
+this reason.
+
+**The SECOND open problem, and this section's own paragraph above names it.**
+"A new GPU-side particle source must land inside that count, or both mechanisms
+will reason a world settled while matter is still moving" — and gas parcels do
+NOT. `Simulation::NoteSnapshot` licenses the settled-tick skip on
+`activeChunks == 0 && particleCount == 0`, `particleCount` is the ballistic
+population only, and `inputsThisTick` in `EncodeTick` has no gas term either.
+The C_GAS latch keeps the gas ROWS recorded (arm on either creator, hold
+`kGasIdleTicks` past the last, and a snapshot reporting live parcels holds it
+armed indefinitely), so parcels keep flying — but a re-entry landing is a
+voxel write at a cell the CPU did not choose, on a tick the CA rows may not have
+been recorded for, and the snapshot that would notice it is several ticks late.
+Not a lost voxel (the landing writes, and the next snapshot un-latches the
+skip), but a chunk processed late, which is exactly the class of defect the
+`ca-skip` gate exists to catch and which a single-run hash cannot see. The
+`gas-leave` gate MEASURES and PRINTS how many ticks of its run fall in that
+window rather than asserting on it — **measured 0 of 400 on 2026-09-09**, so
+the hazard is structural rather than currently reached: that fixture's own
+plume keeps the window busy for the whole run, and the case that would enter it
+is a fire that burns out completely while its smoke is still drifting outside.
+The fix belongs with the settled-tick machinery in `simulation.cpp` — either
+fold the gas count into `NoteSnapshot`'s disqualifier the way `particleCount`
+is folded in, or make a live gas population a `lastDirtyTick_` re-stamp. Until
+then the number is on the gate's own line and a change that starts reaching the
+window will move it off zero.
+
+**Gates:** `gas-leave` (4,096 smoke six chunks under the window's top face,
+open shaft above, 400 ticks twice) and `gas-reenter` (256 CPU-queued parcels two
+cells outside an X face into an inward wind). The first never asserts the quiet
+top plane alone — the same run must show that smoke reached the face and left
+through it, or a broken fixture passes too.
 
 ### MLS-MPM liquid (2026-08-22..23; `sim_fluid.wgsl` + `sim_fluid_seam.wgsl`, docs/PLAN_mpm_fluids.md)
 

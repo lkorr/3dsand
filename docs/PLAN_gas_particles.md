@@ -1,8 +1,56 @@
 # PLAN: gas particles — voxel smoke inside the window, particle smoke outside it
 
-Status: design, 2026-09-08, revision 2 (staged). No code has been written.
+Status: **P1 stage 1 LANDED on branch `gas-stage1`** — sim side `6ba9421`,
+renderer binding `1859036`, far-march sampling + gates + docs on top of them.
+P0's measurement stands as written in §0 (and its headline finding, that
+`treeburn` does not run on the shipped map, is still open for whoever owns
+worldgen). P2 (stage 2, §2.10) is optional and unstarted.
 Companion: `docs/PLAN_chunk_tickets.md` (independent; tickets are for matter
 that LANDS, particles are for gas that KEEPS GOING).
+
+**What stage 1 shipped, against §4's acceptance.** `gas-leave` and
+`gas-reenter` are in `src/test/selftest_gas.cpp`, thresholds in
+`tests/baseline.json` (`gasLeave*` / `gasReenter*`), both green:
+
+    gas-leave    top chunk plane at t150: 0 awake (bound 8), while 2,658
+                 voxels converted at the face; parcels 2,522 by t100, peak
+                 2,522, 0 left at t400; above the window at t200: 680 (GPU
+                 counter) / 669 (CPU page walk); gasOuter above the top: max
+                 44, sum 669; refusals 0 list + 0 pool over 400/400 snapshot
+                 ticks; twice-run identical over 400 hashed ticks with the
+                 gas digest compared at t200 over a live population
+    gas-reenter  256/256 queued and drained; 251 reconverted, first landing 2
+                 ticks after the spawn; 207 smoke voxels still standing 20
+                 ticks later (decay predicts ~210); population back to 0
+
+Deviations from this document, all deliberate and all recorded in `world.h` or
+DESIGN.md §5 beside the code:
+
+- `gasOuter`'s cell is **0.8 m, not the 0.4 m of §2.5**. The section asked for
+  0.4 m cells AND a 2x-window span AND 2 MiB and those three never agreed:
+  128³ bytes IS 2 MiB, and 128 × 0.4 m is 51.2 m, half the stated span. Span
+  and memory are kept.
+- **The splat is folded into `gasResolve`** rather than given its own dispatch
+  (§2.5 implies a `gasSplat` pass): resolve already walks every live parcel
+  exactly once, and the splat is one atomic per parcel.
+- **`--residency dense` is not an arm a gate can run.** §4 asks `gas-leave` for
+  "paged == dense"; `World::Residency` is fixed at Init and process-level, and
+  a gate that switched it would re-point every other gate's page table
+  underneath it. The gate asserts twice-run equality (hash series, gas digest,
+  population) and the dense arm is run the way `determinism`'s is, by giving
+  the binary `--residency dense`.
+
+**The open rule-1 problem, and it is stated rather than closed.**
+`gasLeave` charges a shared `atomicAdd` cursor, so WHICH voxels are refused
+when the per-tick list fills is decided by which workgroup arrived first — and
+a refused voxel STAYS IN THE GRID, where the world hash can see it. That is
+scheduling-dependent output. It is held off, not fixed, by sizing
+`kGasSpawnPerTick` (65,536, a quarter of the window's top face in one tick) out
+of reach so the POOL is the binding constraint instead — a dropped parcel is
+already outside the window and cannot move a voxel — and `gas-leave` asserts
+refusals == 0 so the day that is not enough is a printed number rather than a
+silent divergence. **The real fix is mark+apply**, the pattern `sim_explode`
+already uses for exactly this reason.
 
 **Revision 2 changelog.** Revision 1 moved smoke off the grid everywhere. The
 owner's requirement that gases stay full reaction participants (combine, fuse,
@@ -293,7 +341,14 @@ shipped map (0 foliage voxels near spawn), `explosion` measured as the
 substitute, and the `sleep` histogram's gas column — which was a blank for the
 case it exists to name — split into `gas` / `gas-lat` / `gas-edge`.
 
-**P1 — stage 1.** `PFLAG_GAS`; motion port (§2.2, the one `common.wgsl`
+**P1 — stage 1. LANDED 2026-09-09 on branch `gas-stage1`** (see the status
+block at the top of this file for the measured acceptance, the three
+deviations and the one open rule-1 problem). One thing in the list below is
+deferred rather than done: the motion port is a TEMP-DUP copy inside
+`sim_gas.wgsl` compared byte-for-byte by `scripts/check_invariants.py`, not a
+move into `common.wgsl`, because package T0 held that file — phase B moves it
+and nothing else changes.
+`PFLAG_GAS`; motion port (§2.2, the one `common.wgsl`
 edit); `gasLeave` + `gasSpawn` (§2.3); `farVox` blocking + kill bounds
 (§2.4); `gasOuter` + splat + far-march sampling (§2.5); re-entry (§2.6);
 decay from the bucket (§2.7); pool decision (§2.9); gate `gas-leave`.
