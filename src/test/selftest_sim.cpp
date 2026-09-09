@@ -334,6 +334,63 @@ int settled = 0;  // tick at which the world went quiet (or the cap)
           }
   }
 
+  // ---- DO THE AWAKE CHUNKS ACTUALLY WRITE ANYTHING? ----------------------
+  //
+  // The owner's report, from the live game: F6 shows a handful of chunks lit
+  // permanently, and the "active voxels" overlay — which draws a red wireframe
+  // on every voxel the CA WROTE this tick — shows nothing inside them. Those
+  // two claims cannot both be right, and until now this gate could not say
+  // which was lying: it printed a COUNT and a reason histogram, and a reason
+  // bit records that markDirty was CALLED, not that a word changed.
+  //
+  // So diff the words, the way selftest_terrain.cpp's move pass already does
+  // for the same question. WHICH FIELD moved is the whole point: a pond soaking
+  // into its bed changes stain, a film creeping changes fullness, and a rule
+  // that re-stamps without writing changes nothing at all — three different
+  // bugs that all read as "N chunks awake".
+  //
+  // RUNS ON PASS TOO, unlike the block below it. "8 chunks are awake and every
+  // one of them is genuinely working" and "8 chunks are awake and not one word
+  // is moving" are opposite findings, and the second is a FALSE WAKE that the
+  // <32 threshold would hide forever.
+  if (!awake.empty()) {
+    const size_t n = std::min<size_t>(awake.size(), 16);
+    std::vector<std::vector<uint32_t>> before(n);
+    for (size_t i = 0; i < n; i++) {
+      before[i].assign(kChunkVol, 0);
+      ReadVoxelsSync(ctx, world, awake[i], 1, before[i].data(), "sleepMove0");
+    }
+    for (int i = 0; i < 20; i++)
+      SubmitTick(ctx, world, sim, ++t, kDefaultSeed, {}, {}, {}, false,
+                 {8, 3, 8}, false, false);
+    ctx.WaitIdle();
+    uint32_t words = 0, matCh = 0, stateCh = 0, stainCh = 0, stampOnly = 0;
+    std::vector<uint32_t> now(kChunkVol, 0);
+    for (size_t i = 0; i < n; i++) {
+      ReadVoxelsSync(ctx, world, awake[i], 1, now.data(), "sleepMove1");
+      for (size_t v = 0; v < kChunkVol; v++) {
+        const uint32_t a = before[i][v], b = now[v];
+        if (a == b) continue;
+        words++;
+        const bool m = (a & 0xFFFu) != (b & 0xFFFu);
+        const bool s = ((a >> 12) & 0xFu) != ((b >> 12) & 0xFu);
+        const bool st = (a & 0x7F000000u) != (b & 0x7F000000u);
+        if (m) matCh++;
+        if (s) stateCh++;
+        if (st) stainCh++;
+        // Only the tick stamp (bits 16..18) and/or the excite scratch moved:
+        // the cell was VISITED and re-stamped without its content changing,
+        // which is what "awake but the overlay is empty" looks like from here.
+        if (!m && !s && !st) stampOnly++;
+      }
+    }
+    std::printf("sleep: awake chunks over 20 more ticks: %u words changed in "
+                "%zu chunks (material %u, fullness %u, stain %u, STAMP-ONLY "
+                "%u)%s\n",
+                words, n, matCh, stateCh, stainCh, stampOnly,
+                words == 0 ? "  <-- FALSE WAKE: nothing is writing" : "");
+  }
+
   // diagnosis on failure: where are the awake chunks, and what's in them?
   if (sleepActive >= 32 && !awake.empty()) {
     for (size_t i = 0; i < awake.size() && i < 12; i++) {
