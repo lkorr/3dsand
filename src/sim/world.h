@@ -426,8 +426,8 @@ constexpr uint32_t kGasCpuSpawnPerTick = 1024; // CPU-authored gas spawns per ti
 constexpr uint32_t kGasClaimSize = kClaimSize; // re-entry claim hash
 constexpr int32_t  kGasCeilingVox = 192;       // die this far above the window top
 
-// The outer density box: one BYTE per cell, four to a word, GAS_OUTER_N cells
-// per axis at 2^kGasOuterShift fine voxels each. The edge is 2x the window's
+// The outer density box: one 16-BIT COUNT per cell, two to a word, GAS_OUTER_N
+// cells per axis at 2^kGasOuterShift fine voxels each. The edge is 2x the window's
 // and the box is centred on the window, which is what makes the mapping the
 // renderer reproduces a single expression with no per-frame state:
 //
@@ -441,7 +441,16 @@ constexpr int32_t  kGasCeilingVox = 192;       // die this far above the window 
 constexpr uint32_t kGasOuterN = 128;
 constexpr uint32_t kGasOuterShift = 3;
 constexpr uint32_t kGasOuterCells = kGasOuterN * kGasOuterN * kGasOuterN;
-constexpr uint32_t kGasOuterWords = kGasOuterCells / 4;   // 512 Ki u32 = 2 MiB
+// WIDENED FROM A BYTE (stage 1b). A byte capped a 0.8 m cell at the 192 the
+// splat guard allowed, i.e. 192/512 = 37.5% full, which was fine while the box
+// only ever held PARCELS — everything in it had already left the window and was
+// tens of metres away. Stage 1b splats every in-window gas voxel into the same
+// box so the two representations can be crossfaded, and an in-window smoke
+// column is routinely denser than that: a cell can legitimately be all 512 of
+// its fine voxels, and several parcels may share one on top. Fading a crisp
+// voxel plume INTO a representation that saturates at 37.5% would visibly thin
+// the plume exactly where the crossfade is supposed to be invisible. 4 MiB.
+constexpr uint32_t kGasOuterWords = kGasOuterCells / 2;   // 1 Mi u32 = 4 MiB
 static_assert(kGasOuterN << kGasOuterShift == 2 * kWorldN,
               "the gas outer box must span exactly two window edges — the "
               "renderer derives its origin from that identity");
@@ -3109,7 +3118,7 @@ class World {
   rhi::Buffer gasDispatchArgs;  // 3 u32, indirect-only (see dispatchArgs note)
   // The outer density box: RENDER-ONLY derived data. Not hashed, not saved,
   // rebuilt from scratch every tick. CopySrc so a gate can read it back.
-  rhi::Buffer gasOuter;         // kGasOuterWords u32 (packed bytes)
+  rhi::Buffer gasOuter;         // kGasOuterWords u32 (two u16 counts each)
 
   // ---- MLS-MPM fluid (see the fluid block above kFluidCap) ----
   // fluidGrid, fluidBlockMap and fluidBlockList are per-substep scratch,

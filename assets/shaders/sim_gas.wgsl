@@ -90,14 +90,25 @@ const GAS_PARTICLE_CAP : u32 = 262144u;  // kGasParticleCap
 
 // The outer density box (§2.5). GAS_OUTER_N cells per axis, GAS_OUTER_SHIFT
 // fine voxels per cell, so the box edge is 2x the residency window's and it is
-// centred on the window. One BYTE per cell, four to a word.
+// centred on the window. One 16-BIT COUNT per cell, two to a word (stage 1b
+// widened it from a byte; world.h kGasOuterWords has the argument).
 //
 // DEVIATION from the plan text, which asked for 0.4 m cells AND 2x the window
 // edge AND 2 MiB — three numbers that cannot all hold (128^3 bytes is 2 MiB
-// and 128 * 0.4 m is 51.2 m, half the stated span). Coverage and memory are
-// kept; the cell is 8 voxels = 0.8 m.
+// and 128 * 0.4 m is 51.2 m, half the stated span). Coverage is kept; the cell
+// is 8 voxels = 0.8 m and, since stage 1b, 4 MiB rather than 2.
 const GAS_OUTER_N     : u32 = 128u;
 const GAS_OUTER_SHIFT : u32 = 3u;
+// The per-cell saturation guard. The cell is a 16-BIT count now (stage 1b:
+// world.h kGasOuterWords), two to a word, and what the guard buys is unchanged
+// from the byte era — that an add cannot CARRY into the neighbouring cell's
+// half of the word, which would read as a bright cell one over. 60,000 leaves
+// 5,535 of headroom above it, and the most simultaneous adders a cell can have
+// between the load and the add is the 512 fine voxels it contains plus the
+// parcels stacked in it, so the carry is out of reach rather than merely
+// unlikely. A plume dense enough to reach 60,000 in a 0.8 m cell saturates,
+// which is what it should look like anyway.
+const GAS_OUTER_MAX   : u32 = 60000u;
 // Die this many voxels above the window's top face (kGasCeilingVox). Inside
 // the outer box on purpose, so the ceiling is a test that can be observed to
 // fire rather than one the box would have caught anyway.
@@ -206,18 +217,23 @@ fn gasBlocked(c : vec3<i32>) -> bool {
 // ---- the splat (§2.5) ------------------------------------------------------
 // RENDER-ONLY DERIVED DATA. The sim never reads gasOuter, the world hash never
 // covers it, and it is rebuilt from scratch every tick — so the load-then-add
-// below is a benign race and is stated as one rather than defended. What the
-// guard buys is that a byte cannot CARRY into its neighbour, which would read
-// as a bright cell one over; a plume dense enough to overshoot 192 in a 0.8 m
-// cell simply saturates, which is what it should look like anyway.
+// below is a benign race and is stated as one rather than defended. See
+// GAS_OUTER_MAX above for what the guard buys.
+//
+// TWO SPLATTERS SHARE THIS BOX (stage 1b). This one takes a PARCEL, and the
+// CA's gasOuterSplat in sim_step.wgsl takes an in-window VOXEL, once per tick.
+// They are separate functions because the two kernels bind gasOuter at
+// different numbers and neither may declare it in common.wgsl (the SPIR-V
+// cache), but the CELL MAPPING is the same expression in both and
+// check_invariants.py pins the constants it is built from.
 fn gasSplat(c : vec3<i32>) {
   let d = gasOuterCell(c);
   let n = i32(GAS_OUTER_N);
   if (d.x < 0 || d.y < 0 || d.z < 0 || d.x >= n || d.y >= n || d.z >= n) { return; }
   let li = (u32(d.z) * GAS_OUTER_N + u32(d.y)) * GAS_OUTER_N + u32(d.x);
-  let word = li >> 2u;
-  let sh = 8u * (li & 3u);
-  if (((atomicLoad(&gasOuter[word]) >> sh) & 0xFFu) >= 192u) { return; }
+  let word = li >> 1u;
+  let sh = 16u * (li & 1u);
+  if (((atomicLoad(&gasOuter[word]) >> sh) & 0xFFFFu) >= GAS_OUTER_MAX) { return; }
   atomicAdd(&gasOuter[word], 1u << sh);
 }
 

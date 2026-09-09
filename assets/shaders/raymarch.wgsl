@@ -94,9 +94,12 @@
 // ---- THE OUTER GAS DENSITY BOX (docs/PLAN_gas_particles.md §2.5) -----------
 // Gas that leaves the residency window stops being a voxel and becomes a
 // parcel (sim_gas.wgsl), so from here out it has no voxel to be drawn as. What
-// it has instead is this: one BYTE per GAS_OUTER_SHIFT-cubed block of fine
-// voxels, holding a COUNT of parcels, splatted fresh every tick over a box
-// twice the window's edge and centred on it.
+// it has instead is this: one 16-BIT COUNT per GAS_OUTER_SHIFT-cubed block of
+// fine voxels, splatted fresh every tick over a box twice the window's edge and
+// centred on it. Since stage 1b the box holds BOTH populations: sim_gas.wgsl
+// splats every parcel and sim_step.wgsl splats every in-window gas VOXEL, which
+// is what makes the crossfade below possible — a voxel can only fade out into a
+// coarse cell that has something in it.
 //
 // READ-ONLY here and written only by the gas resolve pass on the tick command
 // buffer (pass_table.def GasOuter). Render-only derived data: never hashed,
@@ -2972,7 +2975,7 @@ fn gasOuterCountAt(p : vec3f) -> f32 {
     return 0.0;
   }
   let li = (u32(d.z) * GAS_OUTER_N + u32(d.y)) * GAS_OUTER_N + u32(d.x);
-  return f32((gasOuter[li >> 2u] >> (8u * (li & 3u))) & 0xFFu);
+  return f32((gasOuter[li >> 1u] >> (16u * (li & 1u))) & 0xFFFFu);
 }
 
 // WHICH gas the box is made of. gasOuter stores a count and no material (§2.5:
@@ -3060,9 +3063,11 @@ fn gasOuterFill(ro : vec3f, rdIn : vec3f, tEnd : f32, px : vec2f) -> f32 {
   // per unit length in trace()'s media branch (weight = 1, cellOp applied
   // after). No look constant anywhere in the conversion.
   //
-  // The splat saturates near 192 (sim_gas.wgsl gasSplat), so the densest cell
-  // this can report is 192/512 = 0.375 full. That is a ceiling on brightness,
-  // not on correctness, and it is the plan's stated v1 behaviour.
+  // The splat saturates at GAS_OUTER_MAX = 60,000 (sim_gas.wgsl), which is
+  // 117x a full cell, so a cell full of gas reads as exactly full and a cell
+  // with parcels stacked in it reads brighter. Stage 1's byte capped this at
+  // 192/512 = 0.375 full, which was a visible ceiling on brightness the moment
+  // in-window voxels started splatting into the same box.
   let cellVox = f32(1u << GAS_OUTER_SHIFT);
   return acc * dt / (cellVox * cellVox * cellVox);
 }

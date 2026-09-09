@@ -1919,7 +1919,9 @@ void ReadGasOuterAboveSync(GpuContext& ctx, World& world, int32_t worldY,
   const int32_t oy = wo.y * (int32_t)kChunk - (int32_t)(kWorldN / 2);
   uint32_t mx = 0;
   uint64_t sum = 0;
-  const uint8_t* b = (const uint8_t*)g.data();
+  // Two 16-bit counts per word since stage 1b (world.h kGasOuterWords), so the
+  // linear cell index indexes a u16 array and not a byte one.
+  const uint16_t* b = (const uint16_t*)g.data();
   for (uint32_t cy = 0; cy < kGasOuterN; cy++) {
     if (oy + (int32_t)(cy << kGasOuterShift) < worldY) continue;
     for (uint32_t cz = 0; cz < kGasOuterN; cz++)
