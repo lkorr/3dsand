@@ -129,6 +129,13 @@ inline constexpr PerfNodeDef kPerfNodes[] = {
      "particleSpawn;particleArgs1;particleIntegrate;particleArgs2;particleResolve",
      "Scales with the live particle count, not the world. Integrate is the "
      "DDA; resolve is the atomicMax claim."},
+    {"gasSys", "Gas Particles", "simTick", PerfSide::Gpu, PerfScope::Count,
+     "gasSpawn;gasArgs1;gasIntegrate;gasArgs2;gasResolve",
+     "Gas that has left the residency window (docs/PLAN_gas_particles.md). "
+     "Scales with the live parcel count, not the world, and is recorded at all "
+     "only while parcels exist or the CA has work. What it BUYS is on the "
+     "caLoop row: the top-plane smoke sheet that used to hold up to 1,024 "
+     "chunks awake stops existing."},
     {"fluidSys", "MLS-MPM Fluid", "simTick", PerfSide::Gpu, PerfScope::Count,
      "fluidMark;fluidAlloc;fluidClear;fluidP2g1;fluidP2g2;fluidGridUp;fluidG2p;"
      "seam_compact_count;seam_compact_scan;seam_compact_scatter;seam_spawn;"
@@ -319,6 +326,7 @@ constexpr int kPerfNodeCount = (int)(sizeof(kPerfNodes) / sizeof(kPerfNodes[0]))
 enum class PerfCounter : uint8_t {
   ActiveChunks,      // dirty chunks the CA dispatched over
   Particles,         // live ballistic particles
+  GasParticles,      // live gas parcels outside the residency window
   FluidParticles,    // live MPM particles
   Ops,               // MutationQueue brush ops this tick
   CellOps,           // MutationQueue exact-cell ops this tick
@@ -384,6 +392,7 @@ struct PerfCounterDef {
 inline constexpr PerfCounterDef kPerfCounters[] = {
     {"activeChunks", "active chunks", "caLoop", false},
     {"particles", "particles", "particleSys", false},
+    {"gasParticles", "gas parcels", "gasSys", false},
     {"fluidParticles", "MPM particles", "fluidSys", false},
     {"ops", "brush ops", "mutQueue", false},
     {"cellOps", "cell ops", "mutQueue", false},

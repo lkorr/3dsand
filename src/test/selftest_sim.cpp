@@ -37,6 +37,20 @@ Status GateDeterminism(Ctx& c, std::string& detail) {
 
 // determinism: two identical runs must produce identical hash sequences
 std::vector<uint32_t> hashes[2];
+// ---- GAS PARTICLES ARE NOT IN THE WORLD HASH, AND CANNOT BE ---------------
+// A parcel outside the residency window touches no voxel, so the hash the
+// occupancy pass folds cannot see it at all. It becomes visible only when it
+// re-enters and lands, which is potentially a hundred ticks after the motion
+// that decided where. That is a real hole: a scheduling-dependent gas step
+// out there would reproduce a matching hash sequence for the whole run.
+//
+// So the gas population carries its OWN digest (kGasSpDigest) — the sum of
+// every surviving parcel's particlePriority, order-independent because the
+// pool's append order is not. Read ONCE per run rather than per tick: it is a
+// blocking readback, the failure it catches is persistent (a divergence does
+// not heal), and 400 extra stalls for a claim two make is exactly the
+// verification budget CLAUDE.md is about.
+uint32_t gasDigest[2] = {}, gasLiveEnd[2] = {};
 for (int run = 0; run < 2; run++) {
   SubmitWorldgen(ctx, world, sim, kDefaultSeed);
   ctx.WaitIdle();
@@ -46,8 +60,17 @@ for (int run = 0; run < 2; run++) {
                SelftestParticlesActive(t));
     hashes[run].push_back(ReadHashSync(ctx, world));
   }
+  uint32_t gs[kGasSpHdr] = {};
+  ReadGasStatsSync(ctx, world, gs);
+  gasDigest[run] = gs[kGasSpDigest];
+  gasLiveEnd[run] = GasAliveSync(ctx, world, sim);
 }
-bool deterministic = hashes[0] == hashes[1];
+const bool gasSame =
+    gasDigest[0] == gasDigest[1] && gasLiveEnd[0] == gasLiveEnd[1];
+bool deterministic = hashes[0] == hashes[1] && gasSame;
+std::printf("determinism: gas %u parcels alive, digest %08x (%s)\n",
+            gasLiveEnd[0], gasDigest[0],
+            gasSame ? "reproduced" : "DIVERGED between the two runs");
 
 // ---- THE TWO CHECKS ARE DIFFERENT CLAIMS. DO NOT CONFLATE THEM. ------------
 //
@@ -304,32 +327,36 @@ int settled = 0;  // tick at which the world went quiet (or the cap)
           //
           // Bit order must match kName in world.cpp's snapshot fold.
           {
-            static const char* kWhy[24] = {
-                "write",   "react-idle", "stain-idle",  "flow",
-                "viscous", "seam",       "part",        "wbody",
-                "mutate",  "MOVE",       "STAIN-WROTE", "REACT-FIRED",
-                "down",    "diag",       "equalize",    "split",
-                "film",    "displace",   "bridge",      "SUBMERGED",
-                "film-press","powder",   "gas",         "solo"};
+            // The names come from kDirtyReasonName in world.h. They used to be
+            // a private copy here, with a comment on each of the two saying it
+            // must match the other; the first bit added after that comment was
+            // written broke it, and a histogram that silently drops its last
+            // bits is worse than no histogram (rule 6).
             // ONE pass, and it is the SAME pass that fills `awake`. An earlier
             // revision counted the reasons in a second loop over the same
             // array and printed "write 128 ... wbody 32761" next to "0 / 32768
             // chunks active" — two readings of one buffer that cannot both be
             // true. Whatever the cause, the fix that makes it unable to happen
             // again is not to have two loops.
-            uint32_t why[24] = {0};
+            // kNumSlots, not kNumChunks: the dirty buffer is STORAGE, indexed
+            // by slot, so a ticket slot's reason bits are in it too (tickets
+            // P0, class (b)).
+            uint32_t why[kDirtyReasonBits] = {0};
             for (uint32_t i = 0; i < kNumSlots; i++) {
               const uint32_t w = d[i];
               if (w == 0) continue;
               sleepActive++;
               awake.push_back(i);
-              for (int b = 0; b < 24; b++)
+              for (int b = 0; b < kDirtyReasonBits; b++)
                 if (w & (1u << b)) why[b]++;
             }
             std::printf("sleep: awake by reason (%u chunks):", sleepActive);
             bool any = false;
-            for (int b = 0; b < 24; b++)
-              if (why[b]) { std::printf(" %s %u", kWhy[b], why[b]); any = true; }
+            for (int b = 0; b < kDirtyReasonBits; b++)
+              if (why[b]) {
+                std::printf(" %s %u", kDirtyReasonName[b], why[b]);
+                any = true;
+              }
             std::printf("%s\n", any ? "" : " none - fully quiet");
           }
   }

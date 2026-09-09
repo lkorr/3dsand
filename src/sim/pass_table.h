@@ -59,6 +59,28 @@ enum class Buf : uint8_t {
   ExpMask,
   SpawnOps,
   DrawArgs,
+  // ---- gas particles (docs/PLAN_gas_particles.md stage 1) ----
+  // The pair is SYMBOLIC like ParticlesRead/Write: page_ resolves which
+  // concrete buffer each names, same parity convention.
+  //
+  // GasSpawn carries a WRITE from sim_step (the CA appends every voxel that
+  // left the window) and a READ from sim_gas's spawn pass in the same command
+  // buffer — one of the few genuine CA -> non-CA hazards in the tick, and the
+  // reason it is on the table rather than being "just an op list".
+  // GasDispatchArgs is indirect-only and never bound, like DispatchArgs.
+  GasParticlesRead,
+  GasParticlesWrite,
+  GasCounts,
+  GasClaim,
+  GasSpawn,
+  GasSpawnOps,
+  GasArgsStage,
+  GasDispatchArgs,
+  // Render-only derived data, on the table for the shadow cache's reason: the
+  // splat WRITES it on the tick command buffer and the raymarcher READS it in
+  // the fragment stage, and a hazard the table does not know about generates
+  // no barrier.
+  GasOuter,
   FarVox,
   FarOcc,
   FarList,
@@ -198,6 +220,11 @@ enum class Pipe : uint8_t {
   Pick,
   ExplodeMark, ExplodeApply,
   PArgs1, PSpawn, PIntegrate, PArgs2, PResolve,
+  // Gas particles (sim_gas.wgsl, docs/PLAN_gas_particles.md). Five entry
+  // points shaped like the ballistic five, in the same order and for the same
+  // reasons; GasArgs1 additionally zeroes the write page's cursor, which is
+  // why the gas pool needs no per-tick fill.
+  GasArgs1, GasSpawnP, GasIntegrate, GasArgs2, GasResolve,
   // MLS-MPM fluid. Inserted BEFORE FarDown deliberately: the
   // pipeline-copy loop in Simulation::RecordTable is bounded by
   // `(int)Pipe::FarDown + 1`, so FarDown must stay the last enumerator or a
@@ -245,11 +272,22 @@ enum class Pipe : uint8_t {
   // -path passes: they run once per FRAME from EncodeShadowResolve, not on the
   // tick table.
   ShadowPrepare, ShadowResolve,
+  // Not a pipeline: the array bound the two recorder-side mirrors size
+  // themselves by. It was a LITERAL 64 in vk_record.h and rhi_record.h, and
+  // the enum reached 63 before gas added five — one more addition anywhere
+  // would have written past the end of both, silently, with the row that
+  // overran being whichever came last. A count that derives from the list it
+  // counts cannot go stale.
+  kPipeCount,
 };
 
 // Bind-group set. GRP_SIM also carries the dynamic passUBO offset.
 enum class Groups : uint8_t { None, Sim, SlimPart, SlimFar, SlimFluid,
                               SlimFluidSeam,
+                              // gasBGL_ — the gas pool, its claim/args/outbox,
+                              // plus farVox + FarParams (blocking outside the
+                              // window) and reactions (the decay bucket).
+                              SlimGas,
                               // shadowBGL_ — voxels/occupancy/materials/
                               // renderUBO/pageTable plus the cache's own three.
                               Shadow };
@@ -335,6 +373,13 @@ enum class Cond : uint8_t {
   // --render-budget arm measure the passes AND the reads rather than the reads
   // alone, exactly as `noopenness` does one line up.
   Glow,
+  // Gas particles exist OR the CA has work this tick. Both halves are needed
+  // and neither alone is enough: a parcel already in flight must be stepped
+  // even in a chunk-quiet world, and a gas voxel can only reach the window
+  // edge from a chunk the CA is running. In a settled world with no plume both
+  // are false and every gas row records NOTHING — which is what makes the
+  // system free when it is not being used (rule 2).
+  Gas,
 };
 
 // Which command buffer a row belongs to — one per Encode* entry point.
@@ -396,6 +441,14 @@ enum class DispatchSel : uint32_t {
   // from a TableCtx field the way farCount does — nothing on the CPU knows it,
   // and asking would mean a readback in the frame path.
   IndShadowArgs,
+  // ---- gas particles ----
+  // FIXED extent: one thread per slot of BOTH spawn lists, whose caps are
+  // compile-time constants. Threads past either list's live count return on
+  // one load, so the constant dispatch buys a kernel that needs no CPU-side
+  // knowledge of how many voxels left the window this tick (nothing on the CPU
+  // knows, and asking would mean a readback in the tick path).
+  GasSpawnSel,
+  IndGasDispatchArgs,  // indirect: world.gasDispatchArgs @ 0
 };
 
 // Max `uses` entries on any row. Asserted against the widest row at compile
@@ -407,7 +460,10 @@ enum class DispatchSel : uint32_t {
 // 12 rather than 11 so the next row addition does not repeat it.
 // Raised 12 -> 16 by the MPM seam: `ca` gains the excited-fluid coupling
 // (R(FluidBlockMap) R(FluidGrid) A(FluidCellScratch)) -> 14 uses.
-inline constexpr int kMaxUses = 16;
+// Raised 16 -> 20 by the gas package: `ca` gains A(GasSpawn), the window-edge
+// outbox, -> 17 uses. Four of headroom rather than one, for the reason the
+// page-table note above gives.
+inline constexpr int kMaxUses = 20;
 
 struct Row {
   const char* name;

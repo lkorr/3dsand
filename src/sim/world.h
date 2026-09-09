@@ -356,9 +356,136 @@ constexpr uint32_t kMaxExplosionsPerTick = 8;
 constexpr int32_t kMaxExplosionRadius = 20;  // EXP_R_MAX in common.wgsl
 constexpr uint32_t kExplosionWg = 11;        // EXP_WG in common.wgsl
 
+// ---- THE DIRTY-REASON NAMES, in ONE place ---------------------------------
+// Bit b of a chunk's dirty word is the rule that asked for it: bits 0..11 are
+// common.wgsl's DIRTY_R_*, bits 12.. are sim_step.wgsl's DIRTY_M_*. This table
+// used to exist twice — once in World's snapshot fold and once in the `sleep`
+// gate — with a comment on each saying it must match the other. It did not
+// survive the first bit added after that comment was written, which is the
+// standing argument against two lists (tuning_params.def, pass_table.def).
+//
+// Order is bit order. Adding a bit means adding a row HERE and nowhere else.
+constexpr int kDirtyReasonBits = 26;
+inline constexpr const char* kDirtyReasonName[kDirtyReasonBits] = {
+    "write",      "react-idle", "stain-idle", "flow",
+    "viscous",    "seam",       "part",       "wbody",
+    "mutate",     "MOVE",       "STAIN-WROTE","REACT-FIRED",
+    // sim_step's DIRTY_M_* liquid-stage split
+    "down",       "diag",       "equalize",   "split",
+    "film",       "displace",   "bridge",     "SUBMERGED",
+    "film-press", "powder",     "gas",        "solo",
+    // docs/PLAN_gas_particles.md P0: gas moving FLAT (the top-plane sheet) and
+    // gas whose intent pointed out of the residency window (the sink).
+    "gas-lat",    "gas-edge"};
+
 // Particle system sizes — must match common.wgsl.
 constexpr uint32_t kParticleCap = 262144;
 constexpr uint32_t kClaimSize = 262144;
+
+// ---- GAS PARTICLES (docs/PLAN_gas_particles.md stage 1) --------------------
+// Gas that has left the residency window. Its OWN pool, not a share of
+// kParticleCap, and the plan's §2.9 recommendation for two reasons that both
+// turned out to matter: the density splat wants to walk gas and only gas, and
+// the two populations must not be able to starve each other — a fight full of
+// ballistic debris must not thin a plume, and a forest fire must not stop a
+// sword from shattering.
+//
+// EVERY ONE OF THESE IS A BOUND (rule 2). At the caps the system degrades:
+// gasLeave is refused and the voxel behaves exactly as it does today, which is
+// the old behaviour, not a failure.
+//
+// Must match the GAS_* block in assets/shaders/sim_gas.wgsl (and GAS_SPAWN_CAP
+// in sim_step.wgsl); scripts/check_invariants.py compares them.
+constexpr uint32_t kGasParticleCap = 262144;   // 8 MiB per page, 16 MiB paired
+// 65,536 and not the 8,192 this shipped with for one afternoon, and the reason
+// is RULE 1 rather than throughput. `gasLeave` charges a shared atomicAdd
+// cursor, so WHICH voxels are refused when the list fills is decided by which
+// workgroup arrived first — and a refused voxel STAYS IN THE GRID, so that
+// choice is visible in the world hash. (The same shape as sim_particle's
+// `append` at kParticleCap, which the engine has always had; the difference is
+// that a vaporized particle writes no voxel on the tick it is dropped.)
+//
+// Two ways out, and this is the cheap one: make the cap unreachable so the
+// binding constraint is the POOL instead, whose overflow drops a parcel that
+// is already outside the window and therefore cannot move a voxel. 65,536 is a
+// quarter of the window's top face in ONE tick, and four such ticks exhaust
+// kGasParticleCap anyway. The `gas-leave` gate asserts refusals == 0, so the
+// day this is not enough it is a printed number and not a silent divergence.
+//
+// The real fix, if that day comes, is mark+apply: the CA flags cells that want
+// to leave and a second pass converts them in a deterministic order, which is
+// the pattern sim_explode already uses for exactly this reason.
+constexpr uint32_t kGasSpawnPerTick = 65536;   // window-edge conversions per tick
+constexpr uint32_t kGasCpuSpawnPerTick = 1024; // CPU-authored gas spawns per tick
+constexpr uint32_t kGasClaimSize = kClaimSize; // re-entry claim hash
+constexpr int32_t  kGasCeilingVox = 192;       // die this far above the window top
+
+// The outer density box: one BYTE per cell, four to a word, GAS_OUTER_N cells
+// per axis at 2^kGasOuterShift fine voxels each. The edge is 2x the window's
+// and the box is centred on the window, which is what makes the mapping the
+// renderer reproduces a single expression with no per-frame state:
+//
+//     originVox = windowOriginChunks * kChunkSize - kWorldN/2
+//     cell      = (worldVoxel - originVox) >> kGasOuterShift
+//
+// DEVIATION from the plan, which asked for 0.4 m cells AND a 2x-window span
+// AND 2 MiB. 128^3 bytes IS 2 MiB and 128 x 0.4 m is 51.2 m, half the stated
+// span — the three numbers never agreed. Span and memory are kept; the cell is
+// 8 voxels = 0.8 m.
+constexpr uint32_t kGasOuterN = 128;
+constexpr uint32_t kGasOuterShift = 3;
+constexpr uint32_t kGasOuterCells = kGasOuterN * kGasOuterN * kGasOuterN;
+constexpr uint32_t kGasOuterWords = kGasOuterCells / 4;   // 512 Ki u32 = 2 MiB
+static_assert(kGasOuterN << kGasOuterShift == 2 * kWorldN,
+              "the gas outer box must span exactly two window edges — the "
+              "renderer derives its origin from that identity");
+
+// gasSpawn / gasSpawnOps header words. The buffer is an 8-word header followed
+// by Particle-shaped records; the header doubles as this tick's gas counters,
+// which is free because the whole buffer is cleared before the CA runs.
+// Must match GAS_SP_* in sim_gas.wgsl and sim_step.wgsl.
+enum : uint32_t {
+  kGasSpCount = 0,     // gasLeave append cursor (may exceed kGasSpawnPerTick)
+  kGasSpRefused = 1,   // gasLeave refused: the per-tick list was full
+  kGasSpEdge = 2,      // gas voxels whose intent pointed out of the window
+  kGasSpPoolFull = 3,  // spawn refused: the particle pool was full
+  kGasSpReenter = 4,   // particles that became voxels this tick
+  kGasSpDied = 5,      // decay / outer box / ceiling
+  kGasSpAbove = 6,     // live particles above the window's top face
+  kGasSpLive = 7,      // live particles after integrate
+  // The gas population's DETERMINISM DIGEST: the sum of every surviving
+  // parcel's particlePriority. A sum because it must be ORDER-INDEPENDENT —
+  // append order in the pool is scheduling-dependent by construction, so a
+  // digest that depended on it would report a false divergence every run. It
+  // covers position and payload, which is the whole of a gas parcel's state
+  // (velocity is always zero). Outside the window a parcel touches no voxel,
+  // so the world hash cannot see it and this is the only thing that can.
+  kGasSpDigest = 8,
+  kGasSpHdr = 16,      // first record word
+  kGasSpStride = 8,    // u32 per record (a 32-byte Particle)
+  kGasSpHdrBytes = kGasSpHdr * 4,
+};
+
+// One CPU-authored gas spawn. Same 32-byte record the GPU list holds, so the
+// two streams are drained by one kernel: position is 24.8 with a ZERO fraction
+// (a gas parcel lives ON a cell), velocity is zero, and the flags are forced
+// GPU-side. `WorldVoxel` builds one from a cell.
+struct GasSpawnOp {
+  int32_t px = 0, py = 0, pz = 0;   // 24.8 fixed voxels
+  int32_t vx = 0, vy = 0, vz = 0;   // always zero for gas
+  uint32_t payload = 0;             // bits 0..11 material, 12..15 state
+  uint32_t flags = 0;               // forced to PFLAG_ALIVE|PFLAG_GAS on the GPU
+};
+static_assert(sizeof(GasSpawnOp) == 32, "GasSpawnOp is a Particle record");
+inline GasSpawnOp MakeGasSpawn(int32_t cx, int32_t cy, int32_t cz,
+                               uint32_t mat, uint32_t state = 0) {
+  GasSpawnOp o{};
+  o.px = cx << 8;
+  o.py = cy << 8;
+  o.pz = cz << 8;
+  o.payload = (mat & 0xFFFu) | ((state & 0xFu) << 12);
+  return o;
+}
 
 // ---- MLS-MPM fluid (docs/PLAN_mpm_fluids.md; excite/settle seam Phase 2) ----
 // The EXCITED state of liquid: GPU particles simulated by the fixed-point
@@ -2405,6 +2532,20 @@ struct WorldSnapshot {
   uint32_t worldHash = 0;
   uint32_t pick[8] = {};
   uint32_t particleCount = 0;         // live particles (post-resolve that tick)
+  // ---- gas particles (docs/PLAN_gas_particles.md) ----
+  // Async, one tick latent, exactly like everything else on this ring. The
+  // per-tick counters come from gasSpawn's header, which is cleared before the
+  // CA runs, so each is "this tick" and not a running total. `gasCount` is the
+  // live population; the rest are the attributions CLAUDE.md rule 6 asks for,
+  // so "the plume is thin" is answered by a number that names WHICH bound bit.
+  uint32_t gasCount = 0;         // live gas particles (post-resolve that tick)
+  uint32_t gasLeaveAccepted = 0; // voxels converted at the window edge
+  uint32_t gasLeaveRefused = 0;  // conversions refused: the spawn list was full
+  uint32_t gasEdgeHits = 0;      // gas voxels whose intent left the window
+  uint32_t gasPoolRefused = 0;   // spawns dropped: the gas pool was full
+  uint32_t gasReentered = 0;     // particles that became voxels again
+  uint32_t gasDied = 0;          // decay / outer box / ceiling
+  uint32_t gasAboveWindow = 0;   // live parcels above the window's top face
   uint32_t tick = 0;                  // sim tick this snapshot was captured at
   std::vector<uint8_t> dirtyFlags;    // per-chunk next-tick dirty (kNumChunks)
   // Per-chunk support-loss flags (kNumChunks): the sim saw a supporting voxel
@@ -2665,6 +2806,25 @@ class World {
   // Record this tick's CPU-known spawn cells so a fresh pour is visible on the
   // frame it lands, rather than when the block list gets back from the GPU a
   // few ticks later. Render-only, and NOT an input to any sim decision.
+  // ---- CPU-authored gas spawns (docs/PLAN_gas_particles.md) --------------
+  //
+  // RULE 3, and it is why this is a queue rather than a buffer write: a gas
+  // parcel created from the CPU is an INPUT OP, on the same footing as a
+  // BrushOp or a ParticleSpawn. It rides the per-tick stream, the GPU forces
+  // its liveness bits, and a replay of the stream reproduces it. Nothing here
+  // touches a voxel or a particle buffer directly.
+  //
+  // Queue before the tick; SubmitTick drains the list into `gasSpawnOps` and
+  // tells Simulation how many there were (the C_GAS latch has to know, or the
+  // pass that consumes them may not be recorded). Over kGasCpuSpawnPerTick in
+  // one tick is REFUSED, not silently truncated at the far end: the budget is
+  // charged where the caller can see it.
+  //
+  // Returns how many were accepted.
+  uint32_t QueueGasSpawns(const GasSpawnOp* ops, uint32_t n);
+  void TakeGasSpawns(std::vector<GasSpawnOp>& out);
+  uint32_t PendingGasSpawns() const { return (uint32_t)pendingGasSpawns_.size(); }
+
   void NoteFluidSpawnBounds(const FluidSpawnOp* ops, uint32_t n, uint32_t tick);
   // Inclusive world-voxel AABB of everything the fluid surface march can hit,
   // already dilated by kFluidRenderPadVox. Returns false when there is no
@@ -2914,6 +3074,25 @@ class World {
   rhi::Buffer spawnOps;        // kMaxParticleSpawnsPerTick ParticleSpawn
   rhi::Buffer sprites;         // kMaxSprites Sprite (CPU-written, render-only)
 
+  // ---- gas particles (docs/PLAN_gas_particles.md stage 1) ----
+  // Their OWN pool, paged with the same parity convention as `particles`:
+  // gasParticles[Page()] is the buffer this tick READS, [1-Page()] the one it
+  // writes, and after FlipPage the roles swap. The two populations never share
+  // a buffer, a count word or a claim slot — see kGasParticleCap.
+  rhi::Buffer gasParticles[2];  // kGasParticleCap Particle (32 B)
+  rhi::Buffer gasCounts;        // 4 u32: [0]/[1] = live count per page
+  rhi::Buffer gasClaim;         // kGasClaimSize u32 — re-entry claim hash
+  // The CA's outbox AND this tick's gas counters (the 8-word header). Cleared
+  // whole before the CA runs, appended to by sim_step's gasLeave, drained by
+  // sim_gas's spawn pass later in the same tick.
+  rhi::Buffer gasSpawn;         // kGasSpHdr + kGasSpawnPerTick*8 u32
+  rhi::Buffer gasSpawnOps;      // same shape, CPU-authored (kGasCpuSpawnPerTick)
+  rhi::Buffer gasArgs;          // 8 u32: [4..6] dispatch args
+  rhi::Buffer gasDispatchArgs;  // 3 u32, indirect-only (see dispatchArgs note)
+  // The outer density box: RENDER-ONLY derived data. Not hashed, not saved,
+  // rebuilt from scratch every tick. CopySrc so a gate can read it back.
+  rhi::Buffer gasOuter;         // kGasOuterWords u32 (packed bytes)
+
   // ---- MLS-MPM fluid (see the fluid block above kFluidCap) ----
   // fluidGrid, fluidBlockMap and fluidBlockList are per-substep scratch,
   // cleared and rebuilt inside the tick. fluidParticles[2] is the carried
@@ -3059,6 +3238,8 @@ class World {
   int lastSlot_ = -1;
   WorldSnapshot snap_;
   IVec3 origin_{0, 0, 0};
+  // Drained into gasSpawnOps by SubmitTick, once, at the head of the tick.
+  std::vector<GasSpawnOp> pendingGasSpawns_;
 
   // Recent CPU-side fluid spawn box (render bounds only — see
   // NoteFluidSpawnBounds). Held for kFluidSpawnBoundsTicks so a pour is

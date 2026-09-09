@@ -116,6 +116,22 @@ PASS(fill_hash, nullptr, PT_TICK, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE, DYN_NONE, 
      USES(TW(Hash)))
 PASS(fill_actVoxViz, nullptr, PT_TICK, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE, DYN_NONE, C_VIZACTIVE, 1,
      USES(TW(ActVoxViz)))
+// ---- gas particles (docs/PLAN_gas_particles.md stage 1) -------------------
+// Three fills, all under C_GAS, so a world with no plume and a settled CA
+// records none of them.
+//
+// gasSpawn is cleared HERE, before the CA, because the CA is what fills it —
+// and because its 8-word header is this tick's gas counter block, which has to
+// start at zero for "this tick" to mean anything. gasOuter is cleared every
+// tick because it is a per-tick SPLAT, not an accumulator: a stale byte is a
+// plume that stopped existing several seconds ago still hanging in the sky.
+// gasClaim mirrors fill_claim exactly.
+PASS(fill_gasSpawn, nullptr, PT_TICK, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE, DYN_NONE, C_GAS, 1,
+     USES(TW(GasSpawn)))
+PASS(fill_gasClaim, nullptr, PT_TICK, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE, DYN_NONE, C_GAS, 1,
+     USES(TW(GasClaim)))
+PASS(fill_gasOuter, nullptr, PT_TICK, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE, DYN_NONE, C_GAS, 1,
+     USES(TW(GasOuter)))
 
 // ---- phase 1: prep (one ComputePassEncoder today: mutate+explode+compact) --
 // D_OPS/D_CELLS/D_EXP/D_SPAWN are dispatch-extent selectors resolved from the
@@ -222,10 +238,16 @@ PASS(copy_argsStage_dispatchArgs, nullptr, PT_TICK, PIPE_NONE, K_COPY, 0,0,12, G
 // mutate/explode, well before `compact` builds this dispatch list, and nothing
 // writes it again during the 54 iterations — so this is a stable read, not a
 // read-your-own-write: the CA's marks this tick go to DirtyOut.
+//
+// A(GasSpawn): the CA is the ONLY producer of window-edge gas conversions
+// (sim_step's gasLeave), and sim_gas's spawn pass reads the list back in this
+// same command buffer. That RAW hop crosses from the colour loop into the
+// particle phase and has no other source of synchronisation.
 PASS(ca, "ca(54 color x substep)", PT_TICK, PIPE_STEP, K_INDIRECT, IND_DISPATCHARGS,0,0, GRP_SIM, DYN_CA, C_CAACTIVE, 54,
      USES(R(Materials) U(TickUBO) U(PassUBO) R(Reactions) R(DirtyIn) R(DirtyList) I(DispatchArgs)
           RW(Voxels) A(DirtyOut) A(Support) R(PageTable) A(PageFaults)
-          R(FluidBlockMap) R(FluidGrid) A(FluidCellScratch) A(ActVoxViz)))
+          R(FluidBlockMap) R(FluidGrid) A(FluidCellScratch) A(ActVoxViz)
+          A(GasSpawn)))
 
 // ---- phase 3b: water bodies (docs/PLAN_water_master.md M2) ----------------
 //
@@ -363,6 +385,60 @@ PASS(particleResolve, "particleResolve", PT_TICK, PIPE_P_RESOLVE, K_INDIRECT, IN
      GRP_SLIM_PART, DYN_NONE, C_PARTICLES, 1,
      USES(R(Materials) U(TickUBO) A(Claim) A(ParticleCounts) I(PDispatchArgs)
           RW(Voxels) RW(ParticlesWrite) A(DirtyOut) R(PageTable) A(PageFaults)))
+
+// ---- phase 4b: gas particles (docs/PLAN_gas_particles.md stage 1) ---------
+//
+// AFTER particleResolve, and that ordering is load-bearing rather than
+// incidental. Both populations can propose a voxel into the same air cell in
+// the same tick, and they claim through DIFFERENT buffers (Claim vs GasClaim)
+// — so the only thing that keeps the outcome from depending on which workgroup
+// arrived first is that gasResolve runs strictly after, behind the RW(Voxels)
+// barrier the recorder derives, and re-reads the cell. A ballistic landing is
+// simply already there and the parcel backs off. Interleaving these two passes,
+// or merging their barrier, is the removal of rule 1.
+//
+// The spawn pass drains BOTH streams into the READ page before gasArgs1 sizes
+// the integrate dispatch, so a voxel that left the grid this tick flies this
+// tick — the same one-pass latency the ballistic `spawn` row has.
+PASS(gasSpawn, "gasSpawn+args1", PT_TICK, PIPE_GAS_SPAWN, K_COMPUTE, D_GASSPAWN,1,1,
+     GRP_SLIM_GAS, DYN_NONE, C_GAS, 1,
+     USES(U(TickUBO) A(GasSpawn) R(GasSpawnOps) A(GasCounts) W(GasParticlesRead)))
+// gasArgs1 also ZEROES the write page's cursor — the one point in the tick
+// after the last read of its old value and before the first append into it.
+// That is why there is no fill_gasCounts row above.
+PASS(gasArgs1, "gasSpawn+args1", PT_TICK, PIPE_GAS_ARGS1, K_COMPUTE, 1,1,1,
+     GRP_SLIM_GAS, DYN_NONE, C_GAS, 1,
+     USES(U(TickUBO) A(GasCounts) W(GasArgsStage)))
+PASS(copy_gasArgs_dispatch1, nullptr, PT_TICK, PIPE_NONE, K_COPY, 16,0,12, GRP_NONE, DYN_NONE, C_GAS, 1,
+     USES(TR(GasArgsStage) TW(GasDispatchArgs)))
+// read-only in practice: `voxels` is read_write for the module because
+// `gasResolve` writes it when a parcel rejoins the grid. `gasIntegrate` only
+// tests cells, to tell "blocked" from "free" and to notice that the next cell
+// is back inside the window.
+// R(FarVox) + U(FarUBO): blocking outside the window, the cascade's level-1
+// byte. Dense toroidal array, direct index, NOT the page table.
+// R(Reactions): the material's own RK_DECAY bucket (§2.7).
+PASS(gasIntegrate, "gasIntegrate+args2", PT_TICK, PIPE_GAS_INTEGRATE, K_INDIRECT, IND_GASARGS,0,0,
+     GRP_SLIM_GAS, DYN_NONE, C_GAS, 1,
+     USES(R(Voxels) R(Materials) R(Reactions) U(TickUBO) U(FarUBO) R(FarVox)
+          I(GasDispatchArgs) RW(GasParticlesRead) W(GasParticlesWrite)
+          A(GasCounts) A(GasClaim) A(GasSpawn) R(PageTable)))
+PASS(gasArgs2, "gasIntegrate+args2", PT_TICK, PIPE_GAS_ARGS2, K_COMPUTE, 1,1,1,
+     GRP_SLIM_GAS, DYN_NONE, C_GAS, 1,
+     USES(U(TickUBO) A(GasCounts) A(GasSpawn) W(GasArgsStage)))
+// The second copy overwrites args the integrate dispatch above FETCHED — the
+// WAR against an in-flight indirect read, exactly as copy_pArgs_pDispatch2.
+PASS(copy_gasArgs_dispatch2, nullptr, PT_TICK, PIPE_NONE, K_COPY, 16,0,12, GRP_NONE, DYN_NONE, C_GAS, 1,
+     USES(TR(GasArgsStage) TW(GasDispatchArgs)))
+// A(GasOuter): the density splat is folded into resolve rather than given its
+// own dispatch — this is already the pass that walks every live parcel exactly
+// once, and the splat is one atomic. Render-only derived data; the sim never
+// reads it and the world hash never covers it.
+PASS(gasResolve, "gasResolve", PT_TICK, PIPE_GAS_RESOLVE, K_INDIRECT, IND_GASARGS,0,0,
+     GRP_SLIM_GAS, DYN_NONE, C_GAS, 1,
+     USES(R(Materials) U(TickUBO) A(GasClaim) A(GasCounts) A(GasSpawn)
+          I(GasDispatchArgs) RW(Voxels) RW(GasParticlesWrite) A(DirtyOut)
+          A(GasOuter) R(PageTable) A(PageFaults)))
 
 // ---- phase 5a: hash tick (whole-world scan; also refreshes occupancy) ------
 PASS(occupancyFull, "occupancyFull+pick(hashTick)", PT_TICK, PIPE_OCCUPANCY, K_COMPUTE, D_CHUNKS,1,1, GRP_SIM, DYN_ZERO, C_HASH, 1,
@@ -524,6 +600,18 @@ PASS(wg_fill_pCounts, nullptr, PT_WORLDGEN, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE, 
      USES(TW(ParticleCounts)))
 PASS(wg_fill_claim, nullptr, PT_WORLDGEN, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE, DYN_NONE, C_ALWAYS, 1,
      USES(TW(Claim)))
+// Gas particles do not survive a regen either: the pool's live counts, the
+// re-entry claim hash, the CA's outbox (whose header is the counter block) and
+// the render-only density box are all cleared, so a plume from the last world
+// cannot reappear over the new one.
+PASS(wg_fill_gasCounts, nullptr, PT_WORLDGEN, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE, DYN_NONE, C_ALWAYS, 1,
+     USES(TW(GasCounts)))
+PASS(wg_fill_gasClaim, nullptr, PT_WORLDGEN, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE, DYN_NONE, C_ALWAYS, 1,
+     USES(TW(GasClaim)))
+PASS(wg_fill_gasSpawn, nullptr, PT_WORLDGEN, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE, DYN_NONE, C_ALWAYS, 1,
+     USES(TW(GasSpawn)))
+PASS(wg_fill_gasOuter, nullptr, PT_WORLDGEN, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE, DYN_NONE, C_ALWAYS, 1,
+     USES(TW(GasOuter)))
 // no ghost particles: drawArgs retains the last active tick's instance count
 PASS(wg_fill_drawArgs, nullptr, PT_WORLDGEN, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE, DYN_NONE, C_ALWAYS, 1,
      USES(TW(DrawArgs)))
@@ -597,6 +685,15 @@ PASS(lr_fill_pCounts, nullptr, PT_LOADRESET, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE,
      USES(TW(ParticleCounts)))
 PASS(lr_fill_claim, nullptr, PT_LOADRESET, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE, DYN_NONE, C_ALWAYS, 1,
      USES(TW(Claim)))
+// Same for gas: a loaded world starts with no parcels in flight.
+PASS(lr_fill_gasCounts, nullptr, PT_LOADRESET, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE, DYN_NONE, C_ALWAYS, 1,
+     USES(TW(GasCounts)))
+PASS(lr_fill_gasClaim, nullptr, PT_LOADRESET, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE, DYN_NONE, C_ALWAYS, 1,
+     USES(TW(GasClaim)))
+PASS(lr_fill_gasSpawn, nullptr, PT_LOADRESET, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE, DYN_NONE, C_ALWAYS, 1,
+     USES(TW(GasSpawn)))
+PASS(lr_fill_gasOuter, nullptr, PT_LOADRESET, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE, DYN_NONE, C_ALWAYS, 1,
+     USES(TW(GasOuter)))
 PASS(lr_fill_fluidArgs, nullptr, PT_LOADRESET, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE, DYN_NONE, C_ALWAYS, 1,
      USES(TW(FluidArgsStage)))
 PASS(lr_fill_fluidCalm, nullptr, PT_LOADRESET, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE, DYN_NONE, C_ALWAYS, 1,

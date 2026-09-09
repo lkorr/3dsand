@@ -777,6 +777,24 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
     ctx.queue.WriteBuffer(world.particleCounts, (1 - sim.Page()) * 4, &zero, 4);
   }
 
+  // ---- CPU-authored gas spawns (docs/PLAN_gas_particles.md) --------------
+  // Uploaded EVERY tick, header included, even when the list is empty: the
+  // count lives in word 0 of the buffer itself, so a tick that skipped the
+  // write would re-spawn the previous tick's ops. 32 bytes when idle.
+  //
+  // Simulation is told the count BEFORE EncodeTick because the C_GAS latch
+  // decides there whether the pass that drains this list is recorded at all.
+  {
+    std::vector<GasSpawnOp> gas;
+    world.TakeGasSpawns(gas);
+    std::vector<uint32_t> hdr(kGasSpHdr + gas.size() * kGasSpStride, 0u);
+    hdr[kGasSpCount] = (uint32_t)gas.size();
+    if (!gas.empty())
+      std::memcpy(hdr.data() + kGasSpHdr, gas.data(), gas.size() * sizeof(GasSpawnOp));
+    ctx.queue.WriteBuffer(world.gasSpawnOps, 0, hdr.data(), hdr.size() * 4);
+    sim.NoteGasSpawns((uint32_t)gas.size());
+  }
+
   // Day/night sleep handshake. The daylight-gated reactions deliberately do
   // NOT hold a chunk awake while their condition is unmet, so a pond that went
   // to sleep at dusk would never notice sunrise. Wake the world on the ticks
@@ -1062,7 +1080,12 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
     // and shows nothing in flight — `resolve` is a dirty-writer whose target
     // the CPU never chose, so activeChunks alone does not mean settled.
     const WorldSnapshot& sn = world.Snap();
-    if (sn.valid) sim.NoteSnapshot(sn.tick, sn.activeChunks, sn.particleCount);
+    if (sn.valid) {
+      sim.NoteSnapshot(sn.tick, sn.activeChunks, sn.particleCount);
+      // The C_GAS latch's disarming input. Latent by design — see the block in
+      // Simulation::EncodeTick for why a stale zero cannot turn gas off.
+      sim.NoteGasLive(sn.gasCount);
+    }
   }
 
   // THE genList UPLOAD MUST HAPPEN BEFORE THE ENCODER EXISTS, and this is a
@@ -1825,6 +1848,85 @@ void ReadWaterLedgerSync(GpuContext& ctx, World& world, int32_t* out) {
 void ReadFluidArgsSync(GpuContext& ctx, World& world, uint32_t* out32) {
   rhi::ReadbackBlocking(ctx.device, ctx.queue, world.fluidArgsStage, 0, out32,
                         kFluidArgsBytes, "fluidArgsRead");
+}
+
+// ---- gas particles: the gates' readback surface ---------------------------
+// SYNCHRONOUS, and only ever called from a gate. The frame path reads gas
+// through the snapshot ring (WorldSnapshot::gas*), exactly like everything
+// else; nothing here is on it.
+
+// Live gas parcels per PAGE. `GasAliveSync` picks the one the tick just wrote.
+void ReadGasCountsSync(GpuContext& ctx, World& world, uint32_t out[2]) {
+  rhi::ReadbackBlocking(ctx.device, ctx.queue, world.gasCounts, 0, out, 8,
+                        "gasCountsRead");
+}
+
+// This tick's gas counters: gasSpawn's 8-word header, cleared before the CA
+// runs, so every word is per-tick and not a running total. Index with the
+// kGasSp* enum in world.h.
+void ReadGasStatsSync(GpuContext& ctx, World& world, uint32_t* out16) {
+  rhi::ReadbackBlocking(ctx.device, ctx.queue, world.gasSpawn, 0, out16,
+                        kGasSpHdrBytes, "gasStatsRead");
+}
+
+uint32_t GasAliveSync(GpuContext& ctx, World& world, Simulation& sim) {
+  uint32_t c[2] = {};
+  ReadGasCountsSync(ctx, world, c);
+  // Same parity as the ballistic count: after SubmitTick's FlipPage, Page() is
+  // the buffer the tick just wrote.
+  return std::min(c[sim.Page() & 1], kGasParticleCap);
+}
+
+// Reads the live gas page back and counts the parcels at or above `worldY`.
+// The whole page, because there is no ordering to exploit — a parcel's slot
+// says nothing about where it is (rule 1: behaviour is derived from state,
+// never from a buffer slot, and that cuts both ways).
+uint32_t GasAboveYSync(GpuContext& ctx, World& world, Simulation& sim,
+                       int32_t worldY, uint32_t* outTotal) {
+  const uint32_t n = GasAliveSync(ctx, world, sim);
+  if (outTotal) *outTotal = n;
+  if (n == 0) return 0;
+  std::vector<uint32_t> p((size_t)n * 8, 0u);
+  rhi::ReadbackBlocking(ctx.device, ctx.queue, world.gasParticles[sim.Page() & 1], 0,
+                        p.data(), (size_t)n * 32, "gasParticlesRead");
+  uint32_t above = 0;
+  for (uint32_t i = 0; i < n; i++) {
+    const uint32_t* r = p.data() + (size_t)i * 8;
+    if ((r[7] & kPFlagAlive) == 0) continue;   // flags
+    const int32_t py = (int32_t)r[1] >> 8;     // 24.8 -> cell
+    if (py >= worldY) above++;
+  }
+  return above;
+}
+
+// The outer density box, folded over the cells at or above `worldY`. `outMax`
+// is the densest cell and `outSum` the total, which is what a gate asserting
+// "there is a plume up there" wants — a max alone cannot tell one stray parcel
+// from a column, and a sum alone cannot tell a column from a haze.
+//
+// The mapping is world.h's, restated nowhere: originVox = windowOrigin -
+// kWorldN/2, cell = (voxel - originVox) >> kGasOuterShift.
+void ReadGasOuterAboveSync(GpuContext& ctx, World& world, int32_t worldY,
+                           uint32_t* outMax, uint64_t* outSum) {
+  std::vector<uint32_t> g(kGasOuterWords, 0u);
+  rhi::ReadbackBlocking(ctx.device, ctx.queue, world.gasOuter, 0, g.data(),
+                        (size_t)kGasOuterWords * 4, "gasOuterRead");
+  const IVec3 wo = world.WindowOrigin();   // CHUNK units
+  const int32_t oy = wo.y * (int32_t)kChunk - (int32_t)(kWorldN / 2);
+  uint32_t mx = 0;
+  uint64_t sum = 0;
+  const uint8_t* b = (const uint8_t*)g.data();
+  for (uint32_t cy = 0; cy < kGasOuterN; cy++) {
+    if (oy + (int32_t)(cy << kGasOuterShift) < worldY) continue;
+    for (uint32_t cz = 0; cz < kGasOuterN; cz++)
+      for (uint32_t cx = 0; cx < kGasOuterN; cx++) {
+        const uint32_t v = b[(cz * kGasOuterN + cy) * kGasOuterN + cx];
+        if (v > mx) mx = v;
+        sum += v;
+      }
+  }
+  if (outMax) *outMax = mx;
+  if (outSum) *outSum = sum;
 }
 
 void ReadPageFaultsSync(GpuContext& ctx, World& world, uint32_t out[4]) {

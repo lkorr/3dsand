@@ -38,6 +38,14 @@ constexpr uint64_t kSubOccBytes = (uint64_t)kNumSlots * kSubOccStride * 4;
 constexpr uint64_t kHashOff = kOccOff + kOccBytes;
 constexpr uint64_t kPickOff = kHashOff + 256;
 constexpr uint64_t kPCountOff = kPickOff + 256;
+// The particle-count block reserves 256 B and uses 16. The gas system's two
+// small readbacks live in the slack rather than reflowing every offset below:
+// 16 B of per-page live counts and the 32-byte gasSpawn header, which is this
+// tick's gas counters (cleared before the CA, so each word is per-tick).
+constexpr uint64_t kGasCountOff = kPCountOff + 16;   // 16 B
+constexpr uint64_t kGasStatOff = kPCountOff + 64;    // kGasSpHdrBytes
+static_assert(kGasStatOff + kGasSpHdrBytes <= kPCountOff + 256,
+              "gas readback overruns the particle-count block's slack");
 constexpr uint64_t kSupportOff = kPCountOff + 256;
 constexpr uint64_t kSupportBytes = kNumSlots * 4;
 constexpr uint64_t kPageFaultOff = kSupportOff + kSupportBytes;
@@ -173,6 +181,29 @@ void World::Init(const rhi::Device& device) {
                           U::Storage | U::CopyDst, "spawnOps");
   sprites = CreateBuffer(device, kMaxSprites * sizeof(Sprite), U::Storage | U::CopyDst,
                          "sprites");
+
+  // ---- gas particles (docs/PLAN_gas_particles.md stage 1) ----
+  // CopySrc on gasCounts/gasSpawn/gasOuter is for the snapshot ring and the
+  // gas gates; nothing on the frame path reads any of it synchronously.
+  gasParticles[0] = CreateBuffer(device, (uint64_t)kGasParticleCap * 32,
+                                 U::Storage | U::CopySrc, "gasParticlesA");
+  gasParticles[1] = CreateBuffer(device, (uint64_t)kGasParticleCap * 32,
+                                 U::Storage | U::CopySrc, "gasParticlesB");
+  gasCounts = CreateBuffer(device, 16, U::Storage | U::CopySrc | U::CopyDst,
+                           "gasCounts");
+  gasClaim = CreateBuffer(device, (uint64_t)kGasClaimSize * 4,
+                          U::Storage | U::CopyDst, "gasClaim");
+  gasSpawn = CreateBuffer(
+      device, (uint64_t)(kGasSpHdr + kGasSpawnPerTick * kGasSpStride) * 4,
+      U::Storage | U::CopySrc | U::CopyDst, "gasSpawn");
+  gasSpawnOps = CreateBuffer(
+      device, (uint64_t)(kGasSpHdr + kGasCpuSpawnPerTick * kGasSpStride) * 4,
+      U::Storage | U::CopyDst, "gasSpawnOps");
+  gasArgs = CreateBuffer(device, 32, U::Storage | U::CopySrc, "gasArgs");
+  gasDispatchArgs = CreateBuffer(device, 12, U::Indirect | U::CopyDst,
+                                 "gasDispatchArgs");
+  gasOuter = CreateBuffer(device, (uint64_t)kGasOuterWords * 4,
+                          U::Storage | U::CopySrc | U::CopyDst, "gasOuter");
 
   // MLS-MPM fluid (world.h fluid block). CopySrc on the particle pair is for
   // the fluid gates' mass audits; the frame path reads back only the small
@@ -413,6 +444,12 @@ bool World::EncodeReadbacks(const rhi::Device&, const rhi::CommandEncoder& enc,
   enc.CopyTracked(pass::Buf::Hash, hash, 0, s.buf, kHashOff, 16);
   enc.CopyTracked(pass::Buf::Pick, pick, 0, s.buf, kPickOff, 32);
   enc.CopyTracked(pass::Buf::ParticleCounts, particleCounts, 0, s.buf, kPCountOff, 16);
+  // Gas: the live per-page counts and the 8-word counter header. Async and one
+  // tick latent like every other row here — no gas path anywhere reads back
+  // synchronously on the frame path.
+  enc.CopyTracked(pass::Buf::GasCounts, gasCounts, 0, s.buf, kGasCountOff, 16);
+  enc.CopyTracked(pass::Buf::GasSpawn, gasSpawn, 0, s.buf, kGasStatOff,
+                  kGasSpHdrBytes);
   // support-loss flags are one-shot: consume into this slot, then clear so the
   // next window of ticks accumulates fresh flags (no readback = they persist).
   // The copy-then-clear pair is a genuine transfer WAR (barrier_graph §7.4);
@@ -575,27 +612,19 @@ void World::KickReadback() {
             // costs nothing when the var is unset.
             if (kDirtyReasonEvery != 0 &&
                 (snap_.tick % kDirtyReasonEvery) == 0 && active != 0) {
-              uint32_t hist[24] = {0};
+              uint32_t hist[kDirtyReasonBits] = {0};
               uint32_t multi = 0;
               for (uint32_t i = 0; i < kNumSlots; i++) {
                 const uint32_t d = dirtyW[i];
                 if (d == 0) continue;
                 if ((d & (d - 1)) != 0) multi++;
-                for (int bit = 0; bit < 24; bit++)
+                for (int bit = 0; bit < kDirtyReasonBits; bit++)
                   if (d & (1u << bit)) hist[bit]++;
               }
-              static const char* kName[24] = {
-                  "write",      "react-idle",  "stain-idle", "flow",
-                  "viscous",    "seam",        "part",       "wbody",
-                  "mutate",     "MOVE",        "STAIN-WROTE","REACT-FIRED",
-                  // sim_step's DIRTY_M_* liquid-stage split
-                  "down",       "diag",        "equalize",   "split",
-                  "film",       "displace",    "bridge",     "SUBMERGED",
-                  "film-press", "powder",      "gas",        "solo"};
               std::printf("dirty-reasons t%u: active %u (%u multi-cause)",
                           snap_.tick, active, multi);
-              for (int bit = 0; bit < 24; bit++)
-                if (hist[bit]) std::printf(" | %s %u", kName[bit], hist[bit]);
+              for (int bit = 0; bit < kDirtyReasonBits; bit++)
+                if (hist[bit]) std::printf(" | %s %u", kDirtyReasonName[bit], hist[bit]);
               std::printf("\n");
               std::fflush(stdout);
             }
@@ -606,6 +635,23 @@ void World::KickReadback() {
             std::memcpy(pcounts, b + kPCountOff, 8);
             snap_.particleCount =
                 std::min(pcounts[sl.particleLivePage & 1], kParticleCap);
+            {
+              uint32_t gcounts[4];
+              std::memcpy(gcounts, b + kGasCountOff, 16);
+              // Same parity as the ballistic count: the page the tick just
+              // wrote is the one `resolve` ran over.
+              snap_.gasCount =
+                  std::min(gcounts[sl.particleLivePage & 1], kGasParticleCap);
+              uint32_t g[kGasSpHdr];
+              std::memcpy(g, b + kGasStatOff, kGasSpHdrBytes);
+              snap_.gasLeaveAccepted = std::min(g[kGasSpCount], kGasSpawnPerTick);
+              snap_.gasLeaveRefused = g[kGasSpRefused];
+              snap_.gasEdgeHits = g[kGasSpEdge];
+              snap_.gasPoolRefused = g[kGasSpPoolFull];
+              snap_.gasReentered = g[kGasSpReenter];
+              snap_.gasDied = g[kGasSpDied];
+              snap_.gasAboveWindow = g[kGasSpAbove];
+            }
             // MLS-MPM fluid seam: live count, event counters, block list.
             {
               uint32_t fa[kFluidArgsWords];
@@ -1875,6 +1921,18 @@ void World::AuthoredPoolList(AuthoredPool out[kAuthoredPools]) {
 // See the RenderParams block in world.h. Render-only DERIVED data: no sim
 // kernel and no sim decision reads either of these, so the readback latency
 // they ride is a picture question, never a determinism one.
+
+uint32_t World::QueueGasSpawns(const GasSpawnOp* ops, uint32_t n) {
+  const size_t room = kGasCpuSpawnPerTick - pendingGasSpawns_.size();
+  const uint32_t take = (uint32_t)std::min<size_t>(n, room);
+  pendingGasSpawns_.insert(pendingGasSpawns_.end(), ops, ops + take);
+  return take;
+}
+
+void World::TakeGasSpawns(std::vector<GasSpawnOp>& out) {
+  out.swap(pendingGasSpawns_);
+  pendingGasSpawns_.clear();
+}
 
 void World::NoteFluidSpawnBounds(const FluidSpawnOp* ops, uint32_t n,
                                  uint32_t tick) {

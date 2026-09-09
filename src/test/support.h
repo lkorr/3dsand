@@ -326,6 +326,24 @@ void ReadPageFaultsSync(GpuContext& ctx, World& world, uint32_t out[4]);
 // and component 7 excites a shell, and a gate that cannot see it reports a
 // leak that is sitting in the particle pool.
 void ReadFluidArgsSync(GpuContext& ctx, World& world, uint32_t* out32);
+// ---- gas particles (docs/PLAN_gas_particles.md stage 1) -------------------
+// Gate-only synchronous reads. The frame path uses WorldSnapshot::gas* on the
+// async ring instead; nothing below is on it.
+//   ReadGasCountsSync      live parcels per page (index with sim.Page())
+//   ReadGasStatsSync       this tick's counters — index with the kGasSp* enum
+//                          in world.h (leave/refuse/edge/pool/reenter/died/
+//                          above/live). Cleared before the CA, so per-tick.
+//   GasAliveSync           live parcels on the page the tick just wrote
+//   GasAboveYSync          how many of them sit at or above a world Y
+//                          (`outTotal`, optional, gets the live count)
+//   ReadGasOuterAboveSync  the outer density box folded above a world Y
+void ReadGasCountsSync(GpuContext& ctx, World& world, uint32_t out[2]);
+void ReadGasStatsSync(GpuContext& ctx, World& world, uint32_t* out16);
+uint32_t GasAliveSync(GpuContext& ctx, World& world, Simulation& sim);
+uint32_t GasAboveYSync(GpuContext& ctx, World& world, Simulation& sim,
+                       int32_t worldY, uint32_t* outTotal = nullptr);
+void ReadGasOuterAboveSync(GpuContext& ctx, World& world, int32_t worldY,
+                           uint32_t* outMax, uint64_t* outSum);
 uint32_t ReadActiveChunksSync(GpuContext& ctx, World& world, Simulation& sim);
 
 // THE CPU SEAM for gate voxel dumps (PLAN_page_table.md §2.1a, fifth site).

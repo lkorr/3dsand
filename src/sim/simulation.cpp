@@ -254,6 +254,14 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         // above only binds layouts a shader declaring `glow` is recorded
         // against, and no slim-group pipeline names it.
         entry(32, T::Storage),         // glow (sources + field)
+        // The window-edge gas outbox (docs/PLAN_gas_particles.md §2.3).
+        // sim_step's gasLeave appends to it; sim_gas drains it later in the
+        // same tick through the GAS group, where it is binding 3. The two
+        // numbers differ on purpose and legally: `gasSpawn` is declared in two
+        // modules that do NOT share the declaration through common.wgsl, which
+        // is the condition the one-identifier-one-binding-number rule above is
+        // about. 33 is the first free slot in this dense 0..32 layout.
+        entry(33, T::Storage),         // gasSpawn (header + records)
     };
     simBGL_ = device.CreateBindGroupLayout(entries, std::size(entries));
 
@@ -303,6 +311,29 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         entry(7, T::ReadOnlyStorage),  // CPU particle spawns (debris shatter)
     };
     particleBGL_ = device.CreateBindGroupLayout(pentries, std::size(pentries));
+
+    // group 1: gas particles (sim_gas.wgsl, docs/PLAN_gas_particles.md).
+    //
+    // Its OWN group rather than an extension of particleBGL_, and the reason is
+    // farVox: gas needs the far cascade to know what it is drifting into
+    // outside the window, and that lives in farBGL_. A layout carrying both
+    // would have to be bound by every ballistic row for no hazard, and the
+    // fluid pair already established that a system with its own buffers gets
+    // its own group-1.
+    rhi::BindGroupLayoutEntry gentries[] = {
+        entry(0, T::Storage),          // gasRead  (gasParticles[page])
+        entry(1, T::Storage),          // gasWrite (gasParticles[1-page])
+        entry(2, T::Storage),          // gasCounts (atomic)
+        entry(3, T::Storage),          // gasSpawn: the CA's outbox + counters
+        entry(4, T::Storage),          // gasClaim (re-entry claim hash)
+        entry(5, T::Storage),          // gasArgs staging
+        entry(6, T::Storage),          // gasOuter (render-only density box)
+        entry(7, T::ReadOnlyStorage),  // farVox: blocking outside the window
+        entry(8, T::Uniform),          // FarParams (the cascade origins)
+        entry(9, T::ReadOnlyStorage),  // reactions: the RK_DECAY bucket
+        entry(10, T::ReadOnlyStorage), // gasSpawnOps (CPU-authored spawns)
+    };
+    gasBGL_ = device.CreateBindGroupLayout(gentries, std::size(gentries));
 
     // group 1: MLS-MPM fluid prototype (sim_fluid.wgsl). Same slim-group-0
     // pairing as the particle pipelines. fluidDispatchArgs is deliberately
@@ -508,6 +539,9 @@ bool Simulation::Init(const rhi::Device& device, World& world,
 
     rhi::BindGroupLayout fluidSeamGroups[] = {simSlimBGL_, fluidSeamBGL_};
     fluidSeamPL_ = device.CreatePipelineLayout(fluidSeamGroups, 2);
+
+    rhi::BindGroupLayout gasGroups[] = {simSlimBGL_, gasBGL_};
+    gasPL_ = device.CreatePipelineLayout(gasGroups, 2);
   }
 
   // ---- bind groups ----
@@ -532,6 +566,24 @@ bool Simulation::Init(const rhi::Device& device, World& world,
     };
     particleBG_[page] =
         device.CreateBindGroup(particleBGL_, pentries, std::size(pentries), "particleBG");
+
+    // Gas: same parity convention as particleBG_ — gasParticles[page] is what
+    // this tick READS and [1-page] is what it writes, and FlipPage swaps them.
+    rhi::BindGroupEntry gentries[] = {
+        b(0, world_->gasParticles[page]),
+        b(1, world_->gasParticles[1 - page]),
+        b(2, world_->gasCounts),
+        b(3, world_->gasSpawn),
+        b(4, world_->gasClaim),
+        b(5, world_->gasArgs),
+        b(6, world_->gasOuter),
+        b(7, world_->farVox),
+        b(8, world_->farUBO),
+        b(9, reactionBuf_),
+        b(10, world_->gasSpawnOps),
+    };
+    gasBG_[page] =
+        device.CreateBindGroup(gasBGL_, gentries, std::size(gentries), "gasBG");
 
     rhi::BindGroupEntry rpentries[] = {
         b(0, world_->particles[page]),
@@ -799,6 +851,7 @@ void Simulation::BuildSimBindGroups(const rhi::Device& device) {
         b(30, world_->genAct),
         b(31, worldMapBuf_),
         b(32, world_->glow),
+        b(33, world_->gasSpawn),
     };
     simBG_[page] = device.CreateBindGroup(simBGL_, entries, std::size(entries), "simBG");
 
@@ -1220,7 +1273,7 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   // because BuildPipelines is the single place F5 recompiles, and the cache's
   // enable flag has to be recomputed in lockstep with raymarch.wgsl's const.
   rhi::ShaderModule mShadow;
-  rhi::ShaderModule mExplode, mParticle, mFluid, mFluidSeam, mWaterBody;
+  rhi::ShaderModule mExplode, mParticle, mFluid, mFluidSeam, mWaterBody, mGas;
   rhi::ShaderModule mRay, mDebris, mMicroBody, mDebugLines, mDebugWind, mDebugCur;
   // The TAA resolve (taa.wgsl). Its own tiny module on purpose: the render
   // pipeline it feeds must stay a fast driver compile, and growing raymarch's
@@ -1244,6 +1297,7 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
     mod(&mShadow, "shadow_resolve.wgsl");
     mod(&mExplode, "sim_explode.wgsl");
     mod(&mParticle, "sim_particle.wgsl");
+    mod(&mGas, "sim_gas.wgsl");
     mod(&mFluid, "sim_fluid.wgsl");
     mod(&mFluidSeam, "sim_fluid_seam.wgsl");
     mod(&mWaterBody, "sim_waterbody.wgsl");
@@ -1258,7 +1312,7 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   }
   if (!mWorldgen || !mMutate || !mCompact || !mStep || !mOcc || !mPick ||
       !mOpenness || !mGlow ||
-      !mExplode || !mParticle || !mFluid || !mFluidSeam || !mWaterBody ||
+      !mExplode || !mParticle || !mGas || !mFluid || !mFluidSeam || !mWaterBody ||
       !mRay || !mDebris ||
       !mMicroBody || !mDebugLines || !mDebugWind || !mDebugCur) {
     if (err) *err = "shader file read failure";
@@ -1327,6 +1381,11 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   pool.Add([&] { pIntegrate_ = MakeComputePipeline(device, simPL2_, mParticle, "integrate", "pIntegrate"); });
   pool.Add([&] { pArgs2_ = MakeComputePipeline(device, simPL2_, mParticle, "args2", "pArgs2"); });
   pool.Add([&] { pResolve_ = MakeComputePipeline(device, simPL2_, mParticle, "resolve", "pResolve"); });
+  pool.Add([&] { gArgs1_ = MakeComputePipeline(device, gasPL_, mGas, "gasArgs1", "gasArgs1"); });
+  pool.Add([&] { gSpawn_ = MakeComputePipeline(device, gasPL_, mGas, "gasSpawnStep", "gasSpawn"); });
+  pool.Add([&] { gIntegrate_ = MakeComputePipeline(device, gasPL_, mGas, "gasIntegrate", "gasIntegrate"); });
+  pool.Add([&] { gArgs2_ = MakeComputePipeline(device, gasPL_, mGas, "gasArgs2", "gasArgs2"); });
+  pool.Add([&] { gResolve_ = MakeComputePipeline(device, gasPL_, mGas, "gasResolve", "gasResolve"); });
 
   pool.Add([&] { fluidMark_ = MakeComputePipeline(device, fluidPL_, mFluid, "mark", "fluidMark"); });
   pool.Add([&] { fluidAlloc_ = MakeComputePipeline(device, fluidPL_, mFluid, "alloc", "fluidAlloc"); });
@@ -1465,7 +1524,9 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   if (!worldgen_ || !worldgenList_ || !pageFill_ || !mutate_ ||
       !mutateCells_ || !windWake_ || !compact_ || !compactNext_ || !step_ || !occupancy_ ||
       !occupancyDirty_ || !pick_ || !explodeMark_ || !explodeApply_ || !pArgs1_ ||
-      !pSpawn_ || !pIntegrate_ || !pArgs2_ || !pResolve_ || !fluidSpawn_ ||
+      !pSpawn_ || !pIntegrate_ || !pArgs2_ || !pResolve_ ||
+      !gArgs1_ || !gSpawn_ || !gIntegrate_ || !gArgs2_ || !gResolve_ ||
+      !fluidSpawn_ ||
       !fluidMark_ || !fluidAlloc_ || !fluidClear_ || !fluidP2g_ ||
       !fluidP2g2_ || !fluidGridUp_ || !fluidG2p_ || !fluidCompactCount_ ||
       !fluidCompactScan_ || !fluidCompactScatter_ || !fluidExciteDetect_ ||
@@ -1611,6 +1672,8 @@ struct RecordCtx {
   // vk_record.h's field; defaults TRUE so the CA records unless proven idle.
   bool caActive = true;
   bool vizActive = false;
+  // Gas particles (docs/PLAN_gas_particles.md). See the latch in EncodeTick.
+  bool gasActive = false;
 };
 
 // NOTE: the condition and dispatch-extent resolvers that used to live here
@@ -1697,6 +1760,15 @@ const rhi::Buffer& Simulation::PassBuffer(pass::Buf b) const {
     case B::WaterBodyState:      return world_->waterBodyState;
     case B::TreeAtlas:           return treeAtlasBuf_;
     case B::WorldMap:            return worldMapBuf_;
+    case B::GasParticlesRead:    return world_->gasParticles[page_];
+    case B::GasParticlesWrite:   return world_->gasParticles[1 - page_];
+    case B::GasCounts:           return world_->gasCounts;
+    case B::GasClaim:            return world_->gasClaim;
+    case B::GasSpawn:            return world_->gasSpawn;
+    case B::GasSpawnOps:         return world_->gasSpawnOps;
+    case B::GasArgsStage:        return world_->gasArgs;
+    case B::GasDispatchArgs:     return world_->gasDispatchArgs;
+    case B::GasOuter:            return world_->gasOuter;
     default:                return world_->voxels;
   }
 }
@@ -1718,6 +1790,11 @@ const rhi::ComputePipeline& Simulation::PassPipeline(pass::Pipe p) const {
     case P::Pick:           return pick_;
     case P::ExplodeMark:    return explodeMark_;
     case P::ExplodeApply:   return explodeApply_;
+    case P::GasArgs1:       return gArgs1_;
+    case P::GasSpawnP:      return gSpawn_;
+    case P::GasIntegrate:   return gIntegrate_;
+    case P::GasArgs2:       return gArgs2_;
+    case P::GasResolve:     return gResolve_;
     case P::PArgs1:         return pArgs1_;
     case P::PSpawn:         return pSpawn_;
     case P::PIntegrate:     return pIntegrate_;
@@ -1810,6 +1887,7 @@ void Simulation::RecordTable(const rhi::CommandEncoder& enc, pass::Table which,
   tc.denseWorldgen = cx.denseWorldgen;
   tc.caActive = cx.caActive;
   tc.vizActive = cx.vizActive;
+  tc.gasActive = cx.gasActive;
 
   rhi::TableBindings tb{};
   for (int i = 0; i < (int)pass::Buf::kCount; i++)
@@ -1824,6 +1902,7 @@ void Simulation::RecordTable(const rhi::CommandEncoder& enc, pass::Table which,
   tb.slimFarLayout = farPL_;
   tb.slimFluidLayout = fluidPL_;
   tb.slimFluidSeamLayout = fluidSeamPL_;
+  tb.slimGasLayout = gasPL_;
   tb.shadowLayout = shadowPL_;
   tb.simSet = simBG_[page_];
   tb.slimSet = simSlimBG_[page_];
@@ -1831,6 +1910,7 @@ void Simulation::RecordTable(const rhi::CommandEncoder& enc, pass::Table which,
   tb.farSet = farBG_;
   tb.fluidSet = fluidBG_[page_];
   tb.fluidSeamSet = fluidSeamBG_[page_];
+  tb.gasSet = gasBG_[page_];
   tb.shadowSet = shadowBG_;
 
   rhi::RecordTableVulkan(enc, which, tc, tb,
@@ -2192,6 +2272,30 @@ void Simulation::EncodeTick(const rhi::CommandEncoder& enc, uint32_t opsCount,
   }
   caSkipped_ = !cx.caActive;
   if (caSkipped_) caSkipCount_++;
+
+  // ---- C_GAS: a LATCH, not a live count ----------------------------------
+  // A gas parcel can only be CREATED on a tick the CA runs (sim_step's
+  // gasLeave) or one the CPU queued spawns on, so those two are the arming
+  // conditions. The disarming one cannot be either of them: parcels persist
+  // for ~111 ticks after the fire that made them goes out, and the only count
+  // of them is `gasLive_`, which arrives on the snapshot ring several ticks
+  // late. Turning the rows off on a stale zero would freeze a plume in the sky
+  // permanently — and it would stay frozen, because the pass that would have
+  // stepped it is the one that is not recorded.
+  //
+  // So: arm on either creator, hold for kGasIdleTicks past the last one (long
+  // enough for the ring to speak), and let a snapshot that says parcels are
+  // alive keep it armed indefinitely. When the plume really is gone the count
+  // reaches zero, the latch runs out, and not one gas row is recorded — which
+  // is the rule-2 claim this whole condition exists to make.
+  if (cx.caActive || gasSpawnsThisTick_ > 0) {
+    gasIdleTicks_ = 0;
+  } else if (gasIdleTicks_ < kGasIdleTicks) {
+    gasIdleTicks_++;
+  }
+  cx.gasActive = cx.caActive || gasSpawnsThisTick_ > 0 || gasLive_ > 0 ||
+                 gasIdleTicks_ < kGasIdleTicks;
+  gasSpawnsThisTick_ = 0;
 
   RecordTable(enc, pass::Table::Tick, &cx);
 

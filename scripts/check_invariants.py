@@ -1534,6 +1534,111 @@ def check_env_predictions():
     checked.append("env predictions")
 
 
+def check_gas_consts():
+    """The gas package's three-way agreement (docs/PLAN_gas_particles.md).
+
+    world.h owns the numbers; sim_gas.wgsl and sim_step.wgsl each declare their
+    own copies rather than putting them in common.wgsl, because a common.wgsl
+    edit invalidates the whole SPIR-V cache and pays the worldgen far-cascade
+    recompile (CLAUDE.md). That is the right trade and it is exactly the shape
+    this file exists to police: a cap raised in world.h and not in the shader
+    is a spawn list the CA overruns silently.
+
+    It also checks the TEMP-DUP block. Phase A copies the shared gas motion
+    functions into sim_gas.wgsl verbatim because package T0 holds common.wgsl;
+    phase B deletes the copy and moves the originals there. Until then the two
+    must not diverge, and "must not diverge" without a checker is a comment.
+    """
+    checked.append("gas")
+    wh = read(ROOT / "src/sim/world.h")
+    gas = read(ROOT / "assets/shaders/sim_gas.wgsl")
+    step = read(ROOT / "assets/shaders/sim_step.wgsl")
+
+    def cxx(name):
+        m = re.search(r"\b" + name + r"\s*=\s*(-?\d+)", wh)
+        return int(m.group(1)) if m else None
+
+    def wgsl(txt, name):
+        m = re.search(r"const\s+" + name + r"\s*:\s*[iu]32\s*=\s*(-?\d+)", txt)
+        return int(m.group(1)) if m else None
+
+    pairs = [
+        ("kGasParticleCap", "GAS_PARTICLE_CAP", [("sim_gas.wgsl", gas)]),
+        ("kGasSpawnPerTick", "GAS_SPAWN_CAP", [("sim_gas.wgsl", gas),
+                                               ("sim_step.wgsl", step)]),
+        ("kGasCpuSpawnPerTick", "GAS_CPU_SPAWN_CAP", [("sim_gas.wgsl", gas)]),
+        ("kGasCeilingVox", "GAS_CEILING_VOX", [("sim_gas.wgsl", gas)]),
+        ("kGasOuterN", "GAS_OUTER_N", [("sim_gas.wgsl", gas)]),
+        ("kGasOuterShift", "GAS_OUTER_SHIFT", [("sim_gas.wgsl", gas)]),
+    ]
+    for cname, wname, shaders in pairs:
+        want = cxx(cname)
+        if want is None:
+            problems.append(f"gas: src/sim/world.h has no {cname}")
+            continue
+        for fname, txt in shaders:
+            got = wgsl(txt, wname)
+            if got is None:
+                problems.append(
+                    f"gas: {fname} does not declare {wname}, which must equal "
+                    f"world.h's {cname} ({want})")
+            elif got != want:
+                problems.append(
+                    f"gas: {fname} {wname} = {got} but world.h {cname} = "
+                    f"{want} -- a cap raised on one side only is a buffer "
+                    f"overrun the GPU will not report")
+
+    # The gasSpawn header word indices, which BOTH shaders and the C++ readback
+    # index into. sim_step writes words 0..2, sim_gas writes 3..8, and
+    # World::EncodeReadbacks folds the lot into the snapshot BY OFFSET -- so a
+    # mismatch reports one counter's value under another counter's name.
+    for cname, wname in [("kGasSpCount", "GAS_SP_COUNT"),
+                         ("kGasSpRefused", "GAS_SP_REFUSED"),
+                         ("kGasSpEdge", "GAS_SP_EDGE"),
+                         ("kGasSpHdr", "GAS_SP_HDR"),
+                         ("kGasSpStride", "GAS_SP_STRIDE")]:
+        want = cxx(cname)
+        for fname, txt in (("sim_gas.wgsl", gas), ("sim_step.wgsl", step)):
+            got = wgsl(txt, wname)
+            if got is not None and want is not None and got != want:
+                problems.append(
+                    f"gas: {fname} {wname} = {got} but world.h {cname} = "
+                    f"{want} -- the header is read back by offset")
+
+    # ---- TEMP-DUP: phase A's copy must stay byte-identical -----------------
+    fns = ["gasRndK", "windLateralCode", "windLateralStartK", "windAxisFrac",
+           "gasLateralRot", "gasIntentK", "gasLadderStep"]
+
+    def body(txt, name):
+        m = re.search(r"^fn\s+" + name + r"\s*\(", txt, re.M)
+        if not m:
+            return None
+        end = re.compile(r"^\}", re.M).search(txt, m.start())
+        if not end:
+            return None
+        src = txt[m.start():end.end()]
+        # Comments and whitespace may differ; code may not.
+        src = re.sub(r"//[^\n]*", "", src)
+        return re.sub(r"\s+", " ", src).strip()
+
+    for name in fns:
+        a, b = body(step, name), body(gas, name)
+        if a is None:
+            problems.append(
+                f"gas TEMP-DUP: sim_step.wgsl no longer declares {name} -- if "
+                f"phase B moved it to common.wgsl, delete this check's entry "
+                f"and the copy in sim_gas.wgsl in the same commit")
+        elif b is None:
+            problems.append(
+                f"gas TEMP-DUP: sim_gas.wgsl no longer declares {name}")
+        elif a != b:
+            problems.append(
+                f"gas TEMP-DUP: {name} DIFFERS between sim_step.wgsl and "
+                f"sim_gas.wgsl -- a gas particle must take the moves a voxel "
+                f"would (PLAN_gas_particles.md 2.2), and these are two copies "
+                f"of ONE function until phase B moves it to common.wgsl")
+
+
 ALL = {
     "envpred": check_env_predictions,
     "autofly": check_autofly_surface,
@@ -1558,6 +1663,7 @@ ALL = {
     "ringdepth": check_readback_ring,
     "burntint": check_burn_tint_sites,
     "plants": check_plant_tiles,
+    "gas": check_gas_consts,
 }
 
 # The hook passes the edited file; run only the checks that file can break.
@@ -1592,6 +1698,7 @@ RELEVANT = {
     "src/measure/perfnodes.h": ["perfnodes"],
     "src/measure/perfsuite.cpp": ["autofly"],
     "src/main.cpp": ["arch", "autofly"],
+    "assets/shaders/sim_gas.wgsl": ["gas"],
     "tests/env_predictions.json": ["envpred"],
     "scripts/test_environment.mjs": ["envpred"],
 }

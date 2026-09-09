@@ -188,6 +188,19 @@ class Simulation {
   // the same evidence the rest of §3.4 uses. Both counts come off the SAME
   // snapshot word, captured at the same point in the tick, which is what makes
   // the reinsertion window closed rather than merely narrow — see the .cpp.
+  // ---- gas particles (docs/PLAN_gas_particles.md stage 1) ----------------
+  // Two one-line inputs to the C_GAS latch in EncodeTick, kept separate from
+  // NoteSnapshot so adding gas did not change a signature every caller of the
+  // settled-tick machinery already forwards.
+  //
+  // NoteGasLive: the live parcel count from the snapshot ring (async, several
+  // ticks latent). NoteGasSpawns: CPU-authored spawns uploaded for THIS tick,
+  // which the latch must see before EncodeTick decides whether to record the
+  // drain that consumes them.
+  void NoteGasLive(uint32_t live) { gasLive_ = live; }
+  void NoteGasSpawns(uint32_t n) { gasSpawnsThisTick_ += n; }
+  uint32_t GasLive() const { return gasLive_; }
+
   void NoteSnapshot(uint32_t snapTick, uint32_t activeChunks,
                     uint32_t particleCount);
   // Everything that wakes chunks outside the op path funnels here, so a caller
@@ -534,9 +547,9 @@ class Simulation {
   // pipelines pair it with particleBGL_ to stay under the 16-storage-buffer
   // per-stage pipeline-layout limit (Dawn counts layout entries, not usage).
   rhi::BindGroupLayout simBGL_, simSlimBGL_, particleBGL_, renderBGL_, renderPartBGL_,
-      farBGL_, microBodyBGL_, fluidBGL_, fluidSeamBGL_, shadowBGL_;
+      farBGL_, microBodyBGL_, fluidBGL_, fluidSeamBGL_, shadowBGL_, gasBGL_;
   rhi::PipelineLayout simPL_, simPL2_, renderPL_, farPL_, microBodyPL_, fluidPL_,
-      fluidSeamPL_, shadowPL_;
+      fluidSeamPL_, shadowPL_, gasPL_;
   rhi::ComputePipeline worldgen_, worldgenList_, mutate_, mutateCells_, compact_,
       compactNext_, step_, occupancy_, occupancyDirty_, pick_;
   // Wind primitive footprint wake (sim_mutate.wgsl `windWake`) — see
@@ -544,6 +557,9 @@ class Simulation {
   rhi::ComputePipeline windWake_;
   rhi::ComputePipeline explodeMark_, explodeApply_, pArgs1_, pSpawn_, pIntegrate_,
       pArgs2_, pResolve_;
+  // Gas particles (sim_gas.wgsl, docs/PLAN_gas_particles.md stage 1). Five
+  // entry points shaped like the ballistic five above.
+  rhi::ComputePipeline gArgs1_, gSpawn_, gIntegrate_, gArgs2_, gResolve_;
   // Live only after PublishFarPipelines. Until then both are INVALID handles
   // and the recorder skips their rows (vk_record.cpp's null-pipeline continue).
   rhi::ComputePipeline farFill_, farPatchFill_, farDown_;
@@ -650,6 +666,13 @@ class Simulation {
   // Two bind groups: page 0 reads dirty[0]/writes dirty[1], page 1 reversed.
   // Particle groups follow the same paging (b0 = read page, b1 = write page).
   rhi::BindGroup simBG_[2], simSlimBG_[2], particleBG_[2];
+  // Gas pages exactly like particleBG_: binding 0 is the read page.
+  rhi::BindGroup gasBG_[2];
+  // C_GAS latch state — see the block in EncodeTick.
+  static constexpr uint32_t kGasIdleTicks = 8;
+  uint32_t gasLive_ = 0;
+  uint32_t gasSpawnsThisTick_ = 0;
+  uint32_t gasIdleTicks_ = kGasIdleTicks;
   // fluidBG_ pages like particleBG_: binding 6 is THIS tick's particle write
   // page (next tick's read page), the splash droplets' destination. Binding 0
   // is the tick's WORKING fluid particle buffer, fluidParticles[1 - page]

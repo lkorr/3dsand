@@ -55,6 +55,39 @@
 // a fault that reports as "unknown".
 const PT_KERNEL : u32 = PT_K_STEP;
 @group(0) @binding(23) var<storage, read_write> actVoxViz  : array<atomic<u32>>;
+// ---- THE WINDOW EDGE'S OUTBOX (docs/PLAN_gas_particles.md §2.3) -----------
+// An 8-word header followed by kGasSpawnPerTick Particle-shaped records. A gas
+// voxel whose intended move leaves the residency window appends itself here
+// and deletes itself from the grid; sim_gas.wgsl's spawn pass turns the list
+// into gas particles LATER IN THIS SAME TICK. Cleared by a whole-buffer fill
+// before the CA runs, so the header words double as this tick's gas counters
+// (they are read back with the snapshot ring; see GAS_SP_* below).
+@group(0) @binding(33) var<storage, read_write> gasSpawn : array<atomic<u32>>;
+
+// gasSpawn's header. Words 0..2 are written HERE (the CA is the only producer
+// of edge conversions); words 3..7 are written by sim_gas.wgsl. Must agree with
+// the GAS_SP_* block in sim_gas.wgsl and with kGasSp* in src/sim/world.h —
+// check_invariants.py compares the three.
+const GAS_SP_COUNT    : u32 = 0u;  // gasLeave append cursor (may exceed the cap)
+const GAS_SP_REFUSED  : u32 = 1u;  // gasLeave refused: the per-tick list was full
+const GAS_SP_EDGE     : u32 = 2u;  // gas voxels whose intent pointed out of the window
+const GAS_SP_HDR      : u32 = 16u; // first record word (words 8..15: sim_gas)
+const GAS_SP_STRIDE   : u32 = 8u;  // u32 per record (a 32-byte Particle)
+// kGasSpawnPerTick (src/sim/world.h). The BUDGET on edge conversions, charged
+// before the write: a refused conversion leaves the voxel exactly where it was
+// and it takes today's lateral ladder, so the edge is a rate-limited sink and
+// never a hole that loses mass.
+//
+// AND IT IS SIZED TO BE UNREACHABLE, which is a rule-1 requirement and not a
+// throughput one — the long note beside kGasSpawnPerTick in world.h has it:
+// the cursor below is a shared atomicAdd, so WHICH voxels lose when it fills
+// is scheduling-dependent, and a loser stays in the grid where the world hash
+// can see it. `gas-leave` asserts the refusal count is zero.
+const GAS_SPAWN_CAP   : u32 = 65536u;
+// PFLAG_GAS (phase B moves this to common.wgsl beside the other PFLAG_*).
+// Bits 0..12 of Particle.flags are spoken for (ALIVE/PENDING/MICRO + the micro
+// scale and life fields); 13 is the first free one.
+const PFLAG_GAS       : u32 = 8192u;
 
 fn markVoxActive(idx : u32) {
   if (T.vizActive != 0u && idx != PT_NO_WORD) {
@@ -145,6 +178,38 @@ const DIRTY_M_FILMPRESS : u32 = 1048576u; // stage 3: film step under PRESSURE
 const DIRTY_M_POWDER    : u32 = 2097152u;
 const DIRTY_M_GAS       : u32 = 4194304u;
 const DIRTY_M_SOLO      : u32 = 8388608u;  // a one-voxel solid island falling
+
+// ---- WHY A GAS CHUNK IS AWAKE (docs/PLAN_gas_particles.md P0) -------------
+//
+// DIRTY_M_GAS existed before this and was a BLANK for the case it is most
+// wanted in. It was set at exactly two of the gas ladder's five stages — the
+// bare rise and the four up-diagonals — and a plume in calm air never reaches
+// either: gasIntent returns straight up, the tryMove in front of the chain
+// succeeds, and the cell returns having marked only DIRTY_R_MOVE. So the
+// `sleep` gate's "gas" column read 0 for a world full of rising smoke, and the
+// top-plane SHEET — which is stage 3, the flat lateral ring, and also never
+// marked — was invisible in the histogram that exists to name it.
+//
+// Now every successful gas move marks, split by the axis it moved on:
+//
+//   DIRTY_M_GAS     the move changed the parcel's HEIGHT (rise, sink, or an
+//                   up-diagonal). Progress: a gas that keeps rising leaves
+//                   through the ceiling or decays, so this terminates.
+//   DIRTY_M_GASLAT  the move was purely horizontal. This is the sheet, and it
+//                   is NEUTRAL — a gas spreading flat under a lid can do it
+//                   forever, which is exactly the shape of the never-sleeping
+//                   chunk this plan exists to delete.
+//   DIRTY_M_GASEDGE the parcel's PRIMARY intent pointed out of the residency
+//                   window. Whether it converted to a particle or was refused
+//                   by the per-tick budget, this names the cells at the sink.
+//
+// Only DIRTY_M_GAS is in FILM_LICENCE, and the split above is why: the licence
+// means "something that decreased a Lyapunov function happened here", and a
+// flat gas spread decreases nothing. GASLAT and GASEDGE are diagnostics only —
+// adding them to the licence would let a sheet license a film step, which is
+// the precise defect the licence was written to remove.
+const DIRTY_M_GASLAT    : u32 = 16777216u;  // gas moved HORIZONTALLY (the sheet)
+const DIRTY_M_GASEDGE   : u32 = 33554432u;  // gas wanted out of the window
 
 // ---- THE FILM LICENCE: a neutral rule may not license ITSELF ---------------
 //
@@ -1601,9 +1666,19 @@ const WIND_RNG_SALT : u32 = 0x5719u;
 // argument the salt itself rests on: "does it go downwind" and "does it rise
 // this tick" are different questions and must not be answerable from each
 // other. Stream 0 XORs zero, so every existing caller is bit-identical.
-fn windRndS(slotIdx : u32, stream : u32) -> u32 {
+//
+// ---- SUBSTEP PASSED IN, NOT READ FROM `P` ---------------------------------
+// The gas motion model below is shared with sim_gas.wgsl's particle kernel,
+// which has no PassParams: particles run ONCE per tick, not once per gravity
+// substep. So the key-derivation takes the substep as an argument and the two
+// CA-facing wrappers supply P.substep. Every existing caller is bit-identical
+// — this is a signature change, not a behaviour one.
+fn gasRndK(key : u32, stream : u32, substep : u32) -> u32 {
   return hash3(T.seed ^ WIND_RNG_SALT ^ (stream * 0x9E37u),
-               T.tick * 2u + P.substep, slotIdx);
+               T.tick * 2u + substep, key);
+}
+fn windRndS(slotIdx : u32, stream : u32) -> u32 {
+  return gasRndK(slotIdx, stream, P.substep);
 }
 fn windRnd(slotIdx : u32) -> u32 { return windRndS(slotIdx, 0u); }
 
@@ -1621,8 +1696,8 @@ fn windLateralCode(w : vec3<i32>) -> u32 {
 // started somewhere else". That framing is the safety argument: no branch here
 // can add a move candidate, only reorder the four that were already going to be
 // tried, so tryMove's write reach and the stamp discipline are untouched.
-fn windLateralStart(c : vec3<i32>, base : u32, m : Material,
-                    slotIdx : u32) -> u32 {
+fn windLateralStartK(c : vec3<i32>, base : u32, m : Material,
+                     key : u32, substep : u32) -> u32 {
   if (T.windMode == WIND_MODE_OFF) { return base; }
   let resp = i32(matWindResponse(m));
   if (resp == 0) { return base; }          // most materials: one compare
@@ -1653,8 +1728,14 @@ fn windLateralStart(c : vec3<i32>, base : u32, m : Material,
   if (T.windGasScaleQ != WINDQ_SCALE_ONE) {
     p = min((p * T.windGasScaleQ) / WINDQ_SCALE_ONE, 1024);
   }
-  if (i32(windRnd(slotIdx) & 1023u) < p) { return windLateralCode(w); }
+  if (i32(gasRndK(key, 0u, substep) & 1023u) < p) { return windLateralCode(w); }
   return base;
+}
+// The CA's call shape, unchanged: the key IS the slot index and the substep is
+// this pass's.
+fn windLateralStart(c : vec3<i32>, base : u32, m : Material,
+                    slotIdx : u32) -> u32 {
+  return windLateralStartK(c, base, m, slotIdx, P.substep);
 }
 
 // ==================== THE GAS VERTICAL MODEL (buoyancy vs wind) =============
@@ -1754,7 +1835,8 @@ struct GasIntent {
 // The one roll. Returns straight up — bit for bit what step 1 would have tried
 // — whenever wind is off, the material does not respond, or the air is calm,
 // so a windless world moves exactly as it did before this existed.
-fn gasIntent(c : vec3<i32>, m : Material, slotIdx : u32, base : u32) -> GasIntent {
+fn gasIntentK(c : vec3<i32>, m : Material, key : u32, base : u32,
+              substep : u32) -> GasIntent {
   var g : GasIntent;
   g.dir = vec3<i32>(0, 1, 0);
   g.rise = true;
@@ -1775,7 +1857,7 @@ fn gasIntent(c : vec3<i32>, m : Material, slotIdx : u32, base : u32) -> GasInten
   // rather than computed through so "there is no wind here" and "this cell
   // moves as it always did" are one statement.
   if (rise == 1024 && lean == 0) { return g; }
-  let r = windRndS(slotIdx, 1u);
+  let r = gasRndK(key, 1u, substep);
   let tier = i32(r & 1023u);
   let leanRoll = i32((r >> 10u) & 1023u);
   g.rot = gasLateralRot(w, fh, base, r >> 20u);
@@ -1793,6 +1875,158 @@ fn gasIntent(c : vec3<i32>, m : Material, slotIdx : u32, base : u32) -> GasInten
   // Driven down, leaning downwind if there is also a crosswind.
   g.dir = select(vec3<i32>(0, -1, 0), vec3<i32>(d.x, -1, d.y), leanRoll < lean);
   return g;
+}
+// The CA's call shape, unchanged.
+fn gasIntent(c : vec3<i32>, m : Material, slotIdx : u32, base : u32) -> GasIntent {
+  return gasIntentK(c, m, slotIdx, base, P.substep);
+}
+
+// ---- THE GAS FALLBACK LADDER, as a pure index -> candidate function --------
+//
+// The fourteen candidates a gas voxel tries, in the exact order the CA has
+// always tried them, hoisted out of the movement tail so sim_gas.wgsl's
+// particle kernel can walk the SAME ladder instead of a re-typed copy of it
+// (docs/PLAN_gas_particles.md §2.2 — "a particle takes the moves a voxel
+// would" is a requirement, and two hand-kept copies of a fourteen-step order
+// is exactly the kind of pair that drifts).
+//
+//   0        the gasIntent primary — where the buoyancy/wind roll wants to go
+//   1..4     its flat ring, tried ONLY when the roll did not choose to rise
+//            (a downdraft-pinned parcel exhausts the horizontal ring before it
+//            is allowed to fall back on rising; see the call site's note)
+//   5        straight up
+//   6..9     the four up-diagonals, rotation started at rUp
+//   10..13   the four flat laterals, rotation started at rLat
+//
+// `w` is 0 for a candidate that does not exist in this configuration, which is
+// how the conditional ring stays inside a fixed index space.
+//
+// THE TWO ROTATIONS ARE PARAMETERS because they are computed LAZILY at the
+// call site: `windLateralStart` evaluates the wind field, and a freely rising
+// plume returns at index 0 without ever reaching a ring. Folding them in here
+// would make every rising gas voxel in the world pay for two field samples it
+// never uses.
+const GAS_LADDER_N    : u32 = 14u;
+const GAS_LADDER_RING : u32 = 6u;   // first index that needs rUp / rLat
+
+fn gasLadderStep(g : GasIntent, rUp : u32, rLat : u32, i : u32) -> vec4<i32> {
+  if (i == 0u) { return vec4<i32>(g.dir, 1); }
+  if (i < 5u) {
+    if (g.rise) { return vec4<i32>(0, 0, 0, 0); }
+    let d = lateralDir((i - 1u) + g.rot);
+    return vec4<i32>(d.x, 0, d.y, 1);
+  }
+  if (i == 5u) { return vec4<i32>(0, 1, 0, 1); }
+  if (i < 10u) {
+    let d = lateralDir((i - 6u) + rUp);
+    return vec4<i32>(d.x, 1, d.y, 1);
+  }
+  let d = lateralDir((i - 10u) + rLat);
+  return vec4<i32>(d.x, 0, d.y, 1);
+}
+
+// ---- THE WINDOW EDGE IS A SINK (docs/PLAN_gas_particles.md §2.3) -----------
+//
+// `tryMove` returns false out of window, and until now a gas voxel could not
+// tell that refusal apart from a solid wall: it fell through to the lateral
+// ring and SHEETED across the whole top chunk plane — up to 1,024 chunks held
+// awake by smoke pressed against a lid that is not a lid, it is the edge of
+// what happens to be resident. That sheet is the "chunk outline in the sky"
+// and it is most of a big fire's CA cost.
+//
+// So the two refusals are split. A gas whose intent points OUT of the window
+// leaves: the cell becomes air and a record goes to gasSpawn, which sim_gas
+// turns into a gas PARTICLE later this same tick. Outside the window it keeps
+// rising and drifting under the same model, bounded by its authored decay and
+// an outer box, and it comes back as a voxel if it drifts back in.
+//
+// REACH 0. This writes ONE word — its own cell. The destination is outside the
+// residency window and was never writable from here, so nothing about the
+// colour lattice's write-disjointness argument changes (rule 1).
+//
+// BUDGET CHARGED BEFORE THE WRITE, the engine's standing convention: the slot
+// is reserved first and the voxel is deleted only if it was granted. A refusal
+// therefore leaves the voxel exactly where it was, taking today's ladder — the
+// edge degrades into the old behaviour under load instead of losing mass.
+//
+// SPAWN-LIST ORDER IS SCHEDULING-DEPENDENT and nothing keys on it: each record
+// is a complete particle state, and the particle system's rule is that
+// behaviour is derived from state, never from a buffer slot.
+fn gasLeave(c : vec3<i32>, idx : u32, w : u32, dst : vec3<i32>) -> bool {
+  let slot = atomicAdd(&gasSpawn[GAS_SP_COUNT], 1u);
+  if (slot >= GAS_SPAWN_CAP) {
+    atomicAdd(&gasSpawn[GAS_SP_REFUSED], 1u);
+    return false;
+  }
+  // Position is 24.8 with a ZERO FRACTION: a gas particle lives ON a cell and
+  // moves in whole cells, exactly as the voxel did. Velocity words stay zero,
+  // which is what keeps particlePriority a pure function of the visible state.
+  let b = GAS_SP_HDR + slot * GAS_SP_STRIDE;
+  atomicStore(&gasSpawn[b + 0u], bitcast<u32>(dst.x << 8u));
+  atomicStore(&gasSpawn[b + 1u], bitcast<u32>(dst.y << 8u));
+  atomicStore(&gasSpawn[b + 2u], bitcast<u32>(dst.z << 8u));
+  atomicStore(&gasSpawn[b + 3u], 0u);
+  atomicStore(&gasSpawn[b + 4u], 0u);
+  atomicStore(&gasSpawn[b + 5u], 0u);
+  // Material AND state nibble travel: a gas's nibble is its palette variant,
+  // and dropping it would make every plume that leaves the window change shade
+  // at the seam.
+  atomicStore(&gasSpawn[b + 6u], voxMat(w) | (voxState(w) << 12u));
+  atomicStore(&gasSpawn[b + 7u], PFLAG_ALIVE | PFLAG_GAS);
+  voxStore(idx, 0u);
+  markVoxActive(idx);
+  markDirty(c);
+  return true;
+}
+
+// ---- THE GAS MOVEMENT TAIL -------------------------------------------------
+// Everything a CLASS_GAS voxel does once reactions and staining are done with
+// it. Returns true if the cell is finished (it moved, or it left the window).
+//
+// A gas that exhausts all fourteen candidates returns false and the caller
+// returns anyway: stages 4 and 5 of the old chain (wandering powders and
+// saltation) both test CLASS_POWDER, so a gas falling through them was always
+// a no-op. Naming that here rather than letting it fall out is the difference
+// between "gas is done" and "gas happens to do nothing next".
+fn stepGas(c : vec3<i32>, idx : u32, w : u32, m : Material, slotIdx : u32,
+           rnd : u32) -> bool {
+  let g = gasIntent(c, m, slotIdx, rnd >> 10u);
+
+  // Indices 0..5 need no lateral rotation. Split from the loop below so the
+  // common case — a plume with open sky above it, returning at index 0 —
+  // never evaluates the wind field for a ring it does not reach.
+  for (var i = 0u; i < GAS_LADDER_RING; i++) {
+    let s = gasLadderStep(g, 0u, 0u, i);
+    if (s.w == 0) { continue; }
+    let d = s.xyz;
+    if (tryMove(c, c + d, w, m.density, true)) {
+      // Height changed => progress (it will leave or decay); flat => the sheet.
+      markDirtyR(c, select(DIRTY_M_GASLAT, DIRTY_M_GAS, d.y != 0));
+      return true;
+    }
+    // Only the PRIMARY intent converts, and that is the whole rule: it is the
+    // move the parcel actually wanted, it is what a plume at the top face
+    // makes on every single tick, and confining the sink to it keeps a gas
+    // that merely BRUSHES the edge on a fallback candidate inside the world.
+    if (i == 0u && !inBounds(c + d)) {
+      atomicAdd(&gasSpawn[GAS_SP_EDGE], 1u);
+      markDirtyR(c, DIRTY_M_GASEDGE);
+      if (gasLeave(c, idx, w, c + d)) { return true; }
+      // Refused: fall through and behave exactly as this voxel does today.
+    }
+  }
+
+  let rUp  = windLateralStart(c, rnd >> 10u, m, slotIdx);
+  let rLat = windLateralStart(c, rnd >> 14u, m, slotIdx);
+  for (var i = GAS_LADDER_RING; i < GAS_LADDER_N; i++) {
+    let s = gasLadderStep(g, rUp, rLat, i);
+    let d = s.xyz;
+    if (tryMove(c, c + d, w, m.density, true)) {
+      markDirtyR(c, select(DIRTY_M_GASLAT, DIRTY_M_GAS, d.y != 0));
+      return true;
+    }
+  }
+  return false;
 }
 
 // Saltation: a settled grain of powder pulled loose by a wind that beats its
@@ -1992,64 +2226,39 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
     return;
   }
 
-  let rising = m.klass == CLASS_GAS;
-  let dy = select(-1, 1, rising);
-
-  // 0) GASES ONLY: buoyancy as a probability the wind redistributes. Placed in
-  //    FRONT of the chain rather than woven into it, because the chain is a
-  //    fallback ladder and this is a choice — and because putting it here makes
-  //    the no-wind case provable by inspection: gasIntent returns (0,1,0), the
-  //    tryMove below is the same one step 1 would have made, and step 1 is then
-  //    a dead branch that costs one bounds check. Nothing downstream changes.
-  if (rising) {
-    let g = gasIntent(c, m, slotIdx, rnd >> 10u);
-    if (tryMove(c, c + g.dir, w, m.density, true)) { return; }
-    // A move the wind chose can be blocked. If it wanted to go DOWN or SIDEWAYS
-    // and could not, exhaust the horizontal ring before falling through — the
-    // ordinary chain leads with "straight up", and letting a downdraft-pinned
-    // parcel rise on its first refusal would undo the downdraft against every
-    // ceiling and floor in the world. A rising intent needs no such guard: the
-    // chain it falls into already leads with exactly what it wanted.
-    if (!g.rise) {
-      for (var i = 0u; i < 4u; i++) {
-        let d = lateralDir(i + g.rot);
-        if (tryMove(c, c + vec3<i32>(d.x, 0, d.y), w, m.density, true)) { return; }
-      }
-    }
+  // ---- GASES: the whole tail, in stepGas ----------------------------------
+  // Stages 0..3 of the old chain used to be written out here with `dy` and
+  // `rising` shared between gas and powder. They are one function now for one
+  // reason: sim_gas.wgsl's particle kernel must take the moves a voxel would
+  // (PLAN_gas_particles.md §2.2), and it can only do that against a ladder
+  // that EXISTS as a callable thing. What the powder path keeps is stages
+  // 1, 2, 4 and 5 with dy = -1, which is all it ever used.
+  if (m.klass == CLASS_GAS) {
+    stepGas(c, idx, w, m, slotIdx, rnd);
+    return;
   }
 
   // Diagnostic (DIRTY_M_*): which CLASS moved, so "MOVE with no liquid stage"
-  // names the mover instead of being a blank.
-  let cls = select(select(0u, DIRTY_M_POWDER, m.klass == CLASS_POWDER),
-                   DIRTY_M_GAS, m.klass == CLASS_GAS);
+  // names the mover instead of being a blank. Only powders reach here — solids
+  // and liquids returned above, gases into stepGas.
+  let cls = DIRTY_M_POWDER;
 
-  // 1) straight fall / rise
-  if (tryMove(c, c + vec3<i32>(0, dy, 0), w, m.density, rising)) {
+  // 1) straight fall
+  if (tryMove(c, c + vec3<i32>(0, -1, 0), w, m.density, false)) {
     markDirtyR(c, cls);
     return;
   }
 
-  // 2) the four diagonal cells one step down (up for gas), RNG order — started
+  // 2) the four diagonal cells one step down, RNG order — started
   //    DOWNWIND with a probability set by the wind and the material's authored
   //    response (windLateralStart; no-op when the gate is off). The rotation
   //    itself is unchanged: this only decides where it begins.
   let r = windLateralStart(c, rnd >> 10u, m, slotIdx);
   for (var i = 0u; i < 4u; i++) {
     let d = lateralDir(i + r);
-    if (tryMove(c, c + vec3<i32>(d.x, dy, d.y), w, m.density, rising)) {
+    if (tryMove(c, c + vec3<i32>(d.x, -1, d.y), w, m.density, false)) {
       markDirtyR(c, cls);
       return;
-    }
-  }
-
-  // 3) gases also spread laterally, RNG order — and this is the stage that
-  //    actually makes smoke stream downwind, since a gas that has already risen
-  //    as far as it can spends most of its life here.
-  if (m.klass == CLASS_GAS) {
-    let r2 = windLateralStart(c, rnd >> 14u, m, slotIdx);
-    for (var i = 0u; i < 4u; i++) {
-      let d = lateralDir(i + r2);
-      if (tryMove(c, c + vec3<i32>(d.x, 0, d.y), w, m.density, rising)) { return; }
     }
   }
 

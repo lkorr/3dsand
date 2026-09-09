@@ -1,0 +1,606 @@
+// sim_gas.wgsl — gas that has left the residency window, as particles.
+// docs/PLAN_gas_particles.md stage 1.
+//
+// INSIDE the window nothing changes: smoke is a CLASS_GAS voxel with the whole
+// reaction system available to it. What this file owns is what used to be
+// impossible — a gas parcel whose next move leaves the window. `tryMove`
+// returned false there, indistinguishable from a wall, and the parcel sheeted
+// across the top chunk plane until it decayed. sim_step's `gasLeave` now
+// deletes that voxel and appends a record here instead; the edge is a SINK.
+//
+// A gas particle is deliberately NOT a ballistic particle:
+//
+//   * Its position is 24.8 with a ZERO FRACTION. It lives ON a cell and moves
+//     one whole cell per tick, because it must take the moves a voxel would —
+//     the same gasIntent buoyancy/wind roll and the same fourteen-step
+//     fallback ladder, called out of sim_step.wgsl rather than re-typed.
+//   * Its velocity words stay zero, which keeps `particlePriority` a pure
+//     function of the visible state.
+//   * It carries no age. Death is rolled from the material's OWN RK_DECAY
+//     rules in reactions.json, keyed on (seed, tick, position-derived key) —
+//     the same shape of roll the CA makes, so the decay chance an author tunes
+//     for the voxel is the one the particle obeys.
+//
+// EVERYTHING IS BOUNDED (rule 2): the per-tick conversion budget, the pool
+// cap, an outer box, a ceiling, and the authored decay. A gas particle wakes
+// no chunk except when it RE-ENTERS the window, which is the one place it
+// meets the page table.
+//
+// DETERMINISM (rule 1): every roll keys on (seed, tick, a key derived from the
+// particle's CELL and payload), never on a buffer slot. Write reach is <=1
+// cell and only through the claim path. The one place order does not matter
+// and is not made to is `gasOuter`, which is render-only derived data the sim
+// never reads and the world hash never covers.
+
+@group(0) @binding(0)  var<storage, read_write> voxels : array<u32>;
+@group(0) @binding(2)  var<storage, read_write> dirtyOut : array<atomic<u32>>;
+@group(0) @binding(3)  var<storage, read> materials : array<Material>;
+@group(0) @binding(4)  var<uniform> T : TickParams;
+@group(0) @binding(17) var<storage, read> pageTable : array<u32>;
+@group(0) @binding(18) var<storage, read_write> pageFaults : array<atomic<u32>>;
+// PHASE A: shares the ballistic particle kernel's fault-tally bank. The
+// PT_K_* block is in common.wgsl, which package T0 holds this cycle; phase B
+// gives gas its own PT_K_GAS and widens PT_K_COUNT.
+const PT_KERNEL : u32 = PT_K_PARTICLE;
+
+@group(1) @binding(0)  var<storage, read_write> gasRead : array<Particle>;
+@group(1) @binding(1)  var<storage, read_write> gasWrite : array<Particle>;
+@group(1) @binding(2)  var<storage, read_write> gasCounts : array<atomic<u32>>;
+// The CA's outbox: GAS_SP_HDR header words then Particle-shaped records. Declared
+// atomic here only because sim_step declares it so; this module's reads of the
+// records are plain loads through atomicLoad.
+@group(1) @binding(3)  var<storage, read_write> gasSpawn : array<atomic<u32>>;
+@group(1) @binding(4)  var<storage, read_write> gasClaim : array<atomic<u32>>;
+@group(1) @binding(5)  var<storage, read_write> gasArgs : array<u32>;
+@group(1) @binding(6)  var<storage, read_write> gasOuter : array<atomic<u32>>;
+@group(1) @binding(7)  var<storage, read> farVox : array<u32>;
+@group(1) @binding(8)  var<uniform> farP : FarParams;
+@group(1) @binding(9)  var<storage, read> reactions : array<Reaction>;
+// CPU-authored gas spawns (the gas-reenter gate; any future emitter that is
+// not a grid cell). Same shape as gasSpawn: word 0 is the count, records from
+// word GAS_SP_HDR. Part of the per-tick input stream, exactly like spawnOps.
+@group(1) @binding(10) var<storage, read> gasSpawnOps : array<u32>;
+
+// ---- constants that must agree with sim_step.wgsl and src/sim/world.h ------
+// Kept out of common.wgsl on purpose (CLAUDE.md: a constant only its consumers
+// read is declared next to them; a common.wgsl edit costs the whole SPIR-V
+// cache and the worldgen far-cascade recompile). check_invariants.py compares
+// these against world.h.
+const GAS_SP_COUNT     : u32 = 0u;
+const GAS_SP_REFUSED   : u32 = 1u;
+const GAS_SP_EDGE      : u32 = 2u;
+const GAS_SP_POOLFULL  : u32 = 3u;  // spawn refused: the particle pool was full
+const GAS_SP_REENTER   : u32 = 4u;  // particles that became voxels this tick
+const GAS_SP_DIED      : u32 = 5u;  // decay / outer box / ceiling
+const GAS_SP_ABOVE     : u32 = 6u;  // live particles above the window's top face
+const GAS_SP_LIVE      : u32 = 7u;  // live particles after integrate
+// The determinism digest: SUM of every surviving parcel's particlePriority.
+// A sum because pool append order is scheduling-dependent and a digest that
+// depended on it would report a false divergence on every run. Outside the
+// window a parcel touches no voxel, so the world hash cannot see it and this
+// is the only thing that can — see the determinism gate.
+const GAS_SP_DIGEST    : u32 = 8u;
+const GAS_SP_HDR       : u32 = 16u;
+const GAS_SP_STRIDE    : u32 = 8u;
+const GAS_SPAWN_CAP    : u32 = 65536u;   // kGasSpawnPerTick
+const GAS_CPU_SPAWN_CAP: u32 = 1024u;    // kGasCpuSpawnPerTick
+const GAS_PARTICLE_CAP : u32 = 262144u;  // kGasParticleCap
+const PFLAG_GAS        : u32 = 8192u;
+
+// The outer density box (§2.5). GAS_OUTER_N cells per axis, GAS_OUTER_SHIFT
+// fine voxels per cell, so the box edge is 2x the residency window's and it is
+// centred on the window. One BYTE per cell, four to a word.
+//
+// DEVIATION from the plan text, which asked for 0.4 m cells AND 2x the window
+// edge AND 2 MiB — three numbers that cannot all hold (128^3 bytes is 2 MiB
+// and 128 * 0.4 m is 51.2 m, half the stated span). Coverage and memory are
+// kept; the cell is 8 voxels = 0.8 m.
+const GAS_OUTER_N     : u32 = 128u;
+const GAS_OUTER_SHIFT : u32 = 3u;
+// Die this many voxels above the window's top face (kGasCeilingVox). Inside
+// the outer box on purpose, so the ceiling is a test that can be observed to
+// fire rather than one the box would have caught anyway.
+const GAS_CEILING_VOX : i32 = 192;
+// RNG salts. Distinct streams so the decay roll, the motion roll and the key
+// derivation cannot alias.
+const GAS_KEY_SALT   : u32 = 0x9A17u;
+const GAS_DECAY_SALT : u32 = 0x2C05u;
+
+fn inBounds(c : vec3<i32>) -> bool { return inWindow(c, T.origin); }
+
+fn gasLive(page : u32) -> u32 {
+  return min(atomicLoad(&gasCounts[page]), GAS_PARTICLE_CAP);
+}
+
+fn gasAppend(p : Particle) {
+  let slot = atomicAdd(&gasCounts[1u - T.page], 1u);
+  if (slot < GAS_PARTICLE_CAP) { gasWrite[slot] = p; }
+}
+
+// ============================================================================
+// TEMP-DUP (phase B moves this to common.wgsl; do not diverge from
+// sim_step.wgsl). These are byte-for-byte the functions sim_step.wgsl declares,
+// in the refactored form that takes the identity key and the substep as
+// arguments instead of reading the CA's slot index and PassParams. When
+// common.wgsl is free again the block below is DELETED and the copies in
+// sim_step.wgsl move there; nothing else changes.
+//
+// scripts/check_invariants.py compares the two copies.
+// ============================================================================
+
+const WIND_DRIFT_REF : i32 = i32(round(
+    clamp(TUNE_WIND_DRIFT_SPEED, 0.0, 200.0) * 65536.0));
+const WIND_DRIFT_CAP : i32 = i32(round(clamp(TUNE_WIND_DRIFT_MAX, 0.0, 0.95) * 1024.0));
+const WIND_RNG_SALT : u32 = 0x5719u;
+
+fn gasRndK(key : u32, stream : u32, substep : u32) -> u32 {
+  return hash3(T.seed ^ WIND_RNG_SALT ^ (stream * 0x9E37u),
+               T.tick * 2u + substep, key);
+}
+
+fn windLateralCode(w : vec3<i32>) -> u32 {
+  if (abs(w.x) >= abs(w.z)) { return select(2u, 0u, w.x > 0); }
+  return select(3u, 1u, w.z > 0);
+}
+
+fn windLateralStartK(c : vec3<i32>, base : u32, m : Material,
+                     key : u32, substep : u32) -> u32 {
+  if (T.windMode == WIND_MODE_OFF) { return base; }
+  let resp = i32(matWindResponse(m));
+  if (resp == 0) { return base; }
+  let w = windAtQ(c, &T);
+  let mag = max(abs(w.x), abs(w.z));
+  if (mag == 0) { return base; }
+  let frac = (min(mag, WIND_DRIFT_REF) >> 10u) * 1024 /
+             max(WIND_DRIFT_REF >> 10u, 1);
+  var p = ((frac * WIND_DRIFT_CAP) / 1024) * resp / 15;
+  if (T.windGasScaleQ != WINDQ_SCALE_ONE) {
+    p = min((p * T.windGasScaleQ) / WINDQ_SCALE_ONE, 1024);
+  }
+  if (i32(gasRndK(key, 0u, substep) & 1023u) < p) { return windLateralCode(w); }
+  return base;
+}
+
+fn windAxisFrac(v : i32, resp : i32) -> i32 {
+  let lim = 3 * WIND_DRIFT_REF;
+  let a = min(abs(v), lim);
+  var f = ((a >> 10u) * 1024) / max(WIND_DRIFT_REF >> 10u, 1);
+  f = (f * resp) / 15;
+  if (T.windGasScaleQ != WINDQ_SCALE_ONE) {
+    f = (f * T.windGasScaleQ) / WINDQ_SCALE_ONE;
+  }
+  f = min(f, 3072);
+  return select(f, -f, v < 0);
+}
+
+fn gasLateralRot(w : vec3<i32>, fh : i32, base : u32, r : u32) -> u32 {
+  if (i32(r & 1023u) < fh) { return windLateralCode(w); }
+  return base;
+}
+
+struct GasIntent {
+  dir  : vec3<i32>,
+  rise : bool,
+  rot  : u32,
+};
+
+fn gasIntentK(c : vec3<i32>, m : Material, key : u32, base : u32,
+              substep : u32) -> GasIntent {
+  var g : GasIntent;
+  g.dir = vec3<i32>(0, 1, 0);
+  g.rise = true;
+  g.rot = base;
+  if (T.windMode == WIND_MODE_OFF) { return g; }
+  let resp = i32(matWindResponse(m));
+  if (resp == 0) { return g; }
+  let w = windAtQ(c, &T);
+  let fy = windAxisFrac(w.y, resp);
+  let fh = min(1024, max(abs(windAxisFrac(w.x, resp)),
+                         abs(windAxisFrac(w.z, resp))));
+  let down = max(0, -fy);
+  let up   = max(0,  fy);
+  let rise = clamp(1024 - down, 0, 1024);
+  let sink = clamp((down - 1024) / 2, 0, 1024);
+  let lean = clamp(fh - up, 0, 1024);
+  if (rise == 1024 && lean == 0) { return g; }
+  let r = gasRndK(key, 1u, substep);
+  let tier = i32(r & 1023u);
+  let leanRoll = i32((r >> 10u) & 1023u);
+  g.rot = gasLateralRot(w, fh, base, r >> 20u);
+  let d = lateralDir(g.rot);
+  if (tier < rise) {
+    if (leanRoll < lean) { g.dir = vec3<i32>(d.x, 1, d.y); }
+    return g;
+  }
+  g.rise = false;
+  if (tier < 1024 - sink) {
+    g.dir = vec3<i32>(d.x, 0, d.y);
+    return g;
+  }
+  g.dir = select(vec3<i32>(0, -1, 0), vec3<i32>(d.x, -1, d.y), leanRoll < lean);
+  return g;
+}
+
+const GAS_LADDER_N    : u32 = 14u;
+const GAS_LADDER_RING : u32 = 6u;
+
+fn gasLadderStep(g : GasIntent, rUp : u32, rLat : u32, i : u32) -> vec4<i32> {
+  if (i == 0u) { return vec4<i32>(g.dir, 1); }
+  if (i < 5u) {
+    if (g.rise) { return vec4<i32>(0, 0, 0, 0); }
+    let d = lateralDir((i - 1u) + g.rot);
+    return vec4<i32>(d.x, 0, d.y, 1);
+  }
+  if (i == 5u) { return vec4<i32>(0, 1, 0, 1); }
+  if (i < 10u) {
+    let d = lateralDir((i - 6u) + rUp);
+    return vec4<i32>(d.x, 1, d.y, 1);
+  }
+  let d = lateralDir((i - 10u) + rLat);
+  return vec4<i32>(d.x, 0, d.y, 1);
+}
+
+// ======================= END TEMP-DUP =======================================
+
+// ---- the outer box ---------------------------------------------------------
+// T.origin is in CHUNK units. The box edge is 2x the window's and centred on
+// it, so its min corner sits half a window below the window's min corner. The
+// window origin is chunk-aligned (a multiple of 16 voxels) and half a window
+// is 256, so this is always a multiple of the cell size: no rounding, and the
+// mapping the renderer reproduces is exactly this expression.
+fn gasOuterOrigin() -> vec3<i32> {
+  return T.origin * i32(CHUNK) - vec3<i32>(i32(WORLD_N) / 2);
+}
+
+// The kill ceiling, in world voxels.
+fn gasCeilY() -> i32 {
+  return T.origin.y * i32(CHUNK) + i32(WORLD_N) + GAS_CEILING_VOX;
+}
+
+fn gasOuterCell(c : vec3<i32>) -> vec3<i32> {
+  return (c - gasOuterOrigin()) >> vec3<u32>(GAS_OUTER_SHIFT);
+}
+
+fn gasInOuterBox(c : vec3<i32>) -> bool {
+  let d = gasOuterCell(c);
+  let n = i32(GAS_OUTER_N);
+  return d.x >= 0 && d.y >= 0 && d.z >= 0 && d.x < n && d.y < n && d.z < n;
+}
+
+// ---- blocking outside the window (§2.4) ------------------------------------
+// The far cascade's level-1 byte, which is the same test the far march uses to
+// decide the ray hit something. A dense toroidal array addressed directly —
+// NOT the page table, which does not extend past the window and has no
+// business being consulted for a parcel of smoke 60 m away. Coarse (one byte
+// per 2^(1+FAR_SHIFT_BASE) fine voxels) and right for a plume: what it is for
+// is "does the plume go around the hill", not per-voxel collision.
+//
+// OUTSIDE THE CASCADE reads as OPEN, not as blocked. The conservative
+// direction elsewhere in the engine is "assume solid" (the residency edge is
+// inert), but here the parcel is already outside the simulated world and the
+// alternative is a wall at the cascade boundary that would pin every plume
+// against an invisible surface.
+fn gasFarBlocked(c : vec3<i32>) -> bool {
+  let cell = c >> vec3<u32>(farCellShift(1u));
+  if (!farInBox(cell, farP.origins[0].xyz)) { return false; }
+  let bi = farVoxByteIndex(1u, cell);
+  let b = (farVox[bi >> 2u] >> (8u * (bi & 3u))) & 0xFFu;
+  if (b == 0u) { return false; }               // air
+  if (b >= arrayLength(&materials)) { return true; }  // clamped id / blocker flag
+  // A gas does not block a gas — smoke downsampled into the cascade must not
+  // wall its own plume off.
+  return materials[b].klass != CLASS_GAS;
+}
+
+// Can this parcel enter cell `c`? Inside the window the grid answers (and the
+// caller then RE-ENTERS rather than moving); outside, the cascade does.
+// Gas particles do not exclude each other: several may share a cell, which is
+// what makes the outer density box a density instead of an occupancy map.
+fn gasBlocked(c : vec3<i32>) -> bool {
+  if (inBounds(c)) {
+    let mm = voxMat(voxWordAt(c));
+    if (mm == MAT_AIR) { return false; }
+    return materials[mm].klass != CLASS_GAS;
+  }
+  return gasFarBlocked(c);
+}
+
+// ---- the splat (§2.5) ------------------------------------------------------
+// RENDER-ONLY DERIVED DATA. The sim never reads gasOuter, the world hash never
+// covers it, and it is rebuilt from scratch every tick — so the load-then-add
+// below is a benign race and is stated as one rather than defended. What the
+// guard buys is that a byte cannot CARRY into its neighbour, which would read
+// as a bright cell one over; a plume dense enough to overshoot 192 in a 0.8 m
+// cell simply saturates, which is what it should look like anyway.
+fn gasSplat(c : vec3<i32>) {
+  let d = gasOuterCell(c);
+  let n = i32(GAS_OUTER_N);
+  if (d.x < 0 || d.y < 0 || d.z < 0 || d.x >= n || d.y >= n || d.z >= n) { return; }
+  let li = (u32(d.z) * GAS_OUTER_N + u32(d.y)) * GAS_OUTER_N + u32(d.x);
+  let word = li >> 2u;
+  let sh = 8u * (li & 3u);
+  if (((atomicLoad(&gasOuter[word]) >> sh) & 0xFFu) >= 192u) { return; }
+  atomicAdd(&gasOuter[word], 1u << sh);
+}
+
+// Next-tick dirty mark incl. boundary neighbours — the gas passes run after
+// the CA, so a re-entry landing is next tick's business. Same rule and the
+// same reason bit as sim_particle.wgsl's markDirtyNext: a gas particle
+// rejoining the grid IS a particle landing.
+fn gasMarkDirtyNext(c : vec3<i32>) {
+  let lo = c & vec3<i32>(CHUNK_MASK);
+  let ch = worldChunkOf(c);
+  var xs = array<i32, 2>(0, 0);
+  var ys = array<i32, 2>(0, 0);
+  var zs = array<i32, 2>(0, 0);
+  if (lo.x == 0) { xs[1] = -1; } else if (lo.x == CHUNK_MASK) { xs[1] = 1; }
+  if (lo.y == 0) { ys[1] = -1; } else if (lo.y == CHUNK_MASK) { ys[1] = 1; }
+  if (lo.z == 0) { zs[1] = -1; } else if (lo.z == CHUNK_MASK) { zs[1] = 1; }
+  for (var i = 0; i < 2; i++) {
+    for (var j = 0; j < 2; j++) {
+      for (var k = 0; k < 2; k++) {
+        let n = ch + vec3<i32>(xs[i], ys[j], zs[k]);
+        if (chunkInWindow(n, T.origin)) {
+          atomicOr(&dirtyOut[chunkSlotIndex(n)], DIRTY_R_PARTICLE);
+        }
+      }
+    }
+  }
+}
+
+// ---- the identity key ------------------------------------------------------
+// Derived from the parcel's CELL and its payload, never from its buffer slot
+// (rule 1, and the particle system's standing rule). Two parcels sharing a
+// cell AND a payload therefore roll identically and move together, which is
+// correct rather than merely tolerable: they are indistinguishable states, and
+// making them diverge would need per-particle identity the 32-byte record does
+// not carry. The payload's state nibble (worldgen's palette variant) gives a
+// plume a few independent sub-populations for free.
+fn gasKey(c : vec3<i32>, payload : u32) -> u32 {
+  return hash3(GAS_KEY_SALT ^ payload, bitcast<u32>(c.x),
+               bitcast<u32>(c.y) ^ pcg(bitcast<u32>(c.z)));
+}
+
+// ---- decay, from the material's own bucket (§2.7) --------------------------
+// Walks reactOffset..+reactCount for RK_DECAY entries and rolls each once,
+// first hit wins — the same shape as doReactions. Returns 0xFFFFFFFF for "no
+// rule fired"; otherwise the product material id (0 = air = die).
+//
+// TWO KINDS OF RULE ARE SKIPPED, both because the information is not out here:
+//   * neighbour-COUNT scaled rules (RSCALE_ON). Outside the window a parcel
+//     has no neighbours to count, and scaledChance's answer would be a
+//     fabrication. Skipping is the conservative direction: the rule simply
+//     does not apply to gas that has left.
+//   * nothing else. RCOND_SKY is SATISFIED by construction — a parcel above
+//     the window has nothing over it — and the day/night gates read T.dayPhase
+//     exactly as the CA does.
+fn gasDecayProduct(m : Material, key : u32) -> u32 {
+  let day = daylightStrength(T.dayPhase);
+  for (var ri = 0u; ri < m.reactCount; ri++) {
+    let rule = reactions[m.reactOffset + ri];
+    if ((rule.packed & 3u) != RK_DECAY) { continue; }
+    if ((rule.cond & RSCALE_ON) != 0u) { continue; }
+    let cond = rule.cond & 0xFFu;
+    if (cond != 0u) {
+      if ((cond & RCOND_DAY) != 0u && day == 0u) { continue; }
+      if ((cond & RCOND_NIGHT) != 0u && day != 0u) { continue; }
+      if (day < ((rule.cond >> 8u) & 0xFFu)) { continue; }
+    }
+    let rr = hash3(key, ri, GAS_DECAY_SALT);
+    if ((rr % REACT_CHANCE_DEN) < rule.chance) { return rule.prodSelf; }
+  }
+  return 0xFFFFFFFFu;
+}
+
+// ============================== entry points ================================
+
+// pArgs-shaped: [4..6] indirect dispatch {groups, 1, 1}. Gas particles are not
+// drawn as instances (they render through gasOuter, in the far march), so the
+// draw-args words the ballistic pair carries are absent here.
+@compute @workgroup_size(1)
+fn gasArgs1() {
+  // ZERO THE WRITE PAGE'S CURSOR, here and only here. This kernel is the one
+  // point in the tick that runs after the last read of the write page's old
+  // value (last tick's resolve) and before the first append into it (this
+  // tick's integrate) — so the gas pool needs no per-tick buffer fill, and the
+  // "who resets the count" question has one answer instead of a convention.
+  atomicStore(&gasCounts[1u - T.page], 0u);
+  let n = gasLive(T.page);
+  gasArgs[4] = (n + 63u) / 64u;
+  gasArgs[5] = 1u;
+  gasArgs[6] = 1u;
+}
+
+@compute @workgroup_size(1)
+fn gasArgs2() {
+  let n = gasLive(1u - T.page);
+  gasArgs[4] = (n + 63u) / 64u;
+  gasArgs[5] = 1u;
+  gasArgs[6] = 1u;
+  atomicStore(&gasSpawn[GAS_SP_LIVE], n);
+}
+
+// Drains BOTH spawn streams into the READ page, before gasArgs1 sizes the
+// integrate dispatch — so a parcel that left the grid this tick flies this
+// tick, the same latency the ballistic `spawn` path has.
+//
+// One dispatch covers both lists: [0, GAS_SPAWN_CAP) is the CA's outbox and
+// [GAS_SPAWN_CAP, +GAS_CPU_SPAWN_CAP) is the CPU's. Threads past either
+// list's live count return immediately, so the fixed dispatch costs one load
+// per idle thread and nothing else.
+@compute @workgroup_size(64)
+fn gasSpawnStep(@builtin(global_invocation_id) gid : vec3<u32>) {
+  var p : Particle;
+  if (gid.x < GAS_SPAWN_CAP) {
+    if (gid.x >= min(atomicLoad(&gasSpawn[GAS_SP_COUNT]), GAS_SPAWN_CAP)) { return; }
+    let b = GAS_SP_HDR + gid.x * GAS_SP_STRIDE;
+    p.px = bitcast<i32>(atomicLoad(&gasSpawn[b + 0u]));
+    p.py = bitcast<i32>(atomicLoad(&gasSpawn[b + 1u]));
+    p.pz = bitcast<i32>(atomicLoad(&gasSpawn[b + 2u]));
+    p.payload = atomicLoad(&gasSpawn[b + 6u]);
+  } else {
+    let i = gid.x - GAS_SPAWN_CAP;
+    if (i >= min(gasSpawnOps[GAS_SP_COUNT], GAS_CPU_SPAWN_CAP)) { return; }
+    let b = GAS_SP_HDR + i * GAS_SP_STRIDE;
+    p.px = bitcast<i32>(gasSpawnOps[b + 0u]);
+    p.py = bitcast<i32>(gasSpawnOps[b + 1u]);
+    p.pz = bitcast<i32>(gasSpawnOps[b + 2u]);
+    p.payload = gasSpawnOps[b + 6u];
+  }
+  // Velocity is ZERO for every gas particle, always: this population moves in
+  // whole cells by the CA's ladder, and a nonzero velocity word would change
+  // particlePriority without changing anything visible.
+  p.vx = 0; p.vy = 0; p.vz = 0;
+  // Liveness and pendingness are FORCED, exactly as sim_particle's `spawn`
+  // forces them: a malformed op must not be able to inject a particle that is
+  // already claiming a cell.
+  p.flags = PFLAG_ALIVE | PFLAG_GAS;
+  let slot = atomicAdd(&gasCounts[T.page], 1u);
+  if (slot >= GAS_PARTICLE_CAP) {
+    // At the cap the parcel vaporizes. Degradation, not failure — and it is
+    // counted, so "the pool was the bound" is a printed number rather than an
+    // inference from a plume that looks thin.
+    atomicAdd(&gasSpawn[GAS_SP_POOLFULL], 1u);
+    return;
+  }
+  gasRead[slot] = p;
+}
+
+@compute @workgroup_size(64)
+fn gasIntegrate(@builtin(global_invocation_id) gid : vec3<u32>) {
+  if (gid.x >= gasLive(T.page)) { return; }
+  var p = gasRead[gid.x];
+  if ((p.flags & PFLAG_ALIVE) == 0u) { return; }
+
+  let c = vec3<i32>(p.px >> 8u, p.py >> 8u, p.pz >> 8u);
+
+  // ---- kill bounds (rule 2). All three are stateless tests on the parcel's
+  // own position, so nothing has to remember anything about it.
+  if (!gasInOuterBox(c) || c.y >= gasCeilY()) {
+    atomicAdd(&gasSpawn[GAS_SP_DIED], 1u);
+    return;                       // not appended: the slot is reclaimed
+  }
+  if (c.y >= T.origin.y * i32(CHUNK) + i32(WORLD_N)) {
+    atomicAdd(&gasSpawn[GAS_SP_ABOVE], 1u);
+  }
+
+  let key = gasKey(c, p.payload);
+  var mat = p.payload & 0xFFFu;
+  var m = materials[mat];
+
+  // ---- decay, before motion: a parcel that dies this tick does not move ----
+  let prod = gasDecayProduct(m, key);
+  if (prod != 0xFFFFFFFFu && prod != PROD_KEEP) {
+    if (prod == 0u) {                       // -> air: gone
+      atomicAdd(&gasSpawn[GAS_SP_DIED], 1u);
+      return;
+    }
+    let pm = materials[prod];
+    if (pm.klass == CLASS_GAS) {
+      // Morph and keep going. The state nibble is re-derived from the key so
+      // the new material gets its own palette variant rather than inheriting
+      // an index that means something else in its table.
+      mat = prod;
+      m = pm;
+      p.payload = prod | (((key >> 24u) % 3u) << 12u);
+    } else {
+      // A grid product (steam -> water). It can only land where the grid
+      // exists: inside the window it proposes itself through the claim path
+      // below; outside, it is rain on unloaded space, which is nothing today
+      // either.
+      if (!inBounds(c)) {
+        atomicAdd(&gasSpawn[GAS_SP_DIED], 1u);
+        return;
+      }
+      p.payload = prod | (((key >> 24u) % 3u) << 12u);
+      p.flags |= PFLAG_PENDING;
+      atomicMax(&gasClaim[claimSlot(cellIndexW(c))], particlePriority(p));
+      gasAppend(p);
+      return;
+    }
+  }
+
+  // ---- motion: the grid model, verbatim (§2.2) -----------------------------
+  let rnd = gasRndK(key, 2u, 0u);
+  let g = gasIntentK(c, m, key, rnd >> 10u, 0u);
+  var tgt = c;
+  var found = false;
+  for (var i = 0u; i < GAS_LADDER_RING; i++) {
+    let s = gasLadderStep(g, 0u, 0u, i);
+    if (s.w == 0) { continue; }
+    let n = c + s.xyz;
+    if (!gasBlocked(n)) { tgt = n; found = true; break; }
+  }
+  if (!found) {
+    let rUp  = windLateralStartK(c, rnd >> 10u, m, key, 0u);
+    let rLat = windLateralStartK(c, rnd >> 14u, m, key, 0u);
+    for (var i = GAS_LADDER_RING; i < GAS_LADDER_N; i++) {
+      let n = c + gasLadderStep(g, rUp, rLat, i).xyz;
+      if (!gasBlocked(n)) { tgt = n; found = true; break; }
+    }
+  }
+  // Nowhere to go: stay put and try again next tick. Bounded by the decay.
+
+  p.px = tgt.x << 8u;
+  p.py = tgt.y << 8u;
+  p.pz = tgt.z << 8u;
+
+  // ---- re-entry = RECONVERT (§2.6) ----------------------------------------
+  // A parcel whose next cell is inside the window has nowhere to render (there
+  // is no inner density volume in stage 1) and, more to the point, it has
+  // rejoined a place where reactions happen. So it proposes itself as a voxel
+  // through the SAME atomicMax claim path the ballistic particles use: one
+  // claim per parcel per tick, deterministic winner, losers retry.
+  if (inBounds(tgt)) {
+    p.flags |= PFLAG_PENDING;
+    atomicMax(&gasClaim[claimSlot(cellIndexW(tgt))], particlePriority(p));
+  }
+  gasAppend(p);
+}
+
+@compute @workgroup_size(64)
+fn gasResolve(@builtin(global_invocation_id) gid : vec3<u32>) {
+  if (gid.x >= gasLive(1u - T.page)) { return; }
+  var p = gasWrite[gid.x];
+  if ((p.flags & PFLAG_ALIVE) == 0u) { return; }
+  let cell = vec3<i32>(p.px >> 8u, p.py >> 8u, p.pz >> 8u);
+
+  if ((p.flags & PFLAG_PENDING) != 0u) {
+    // TWO BASES, the same rule as sim_particle's resolve: the claim hashes on
+    // the SLOT cell index (an identity), and only the store uses the physical
+    // word index (an address).
+    let tgtSlot = cellIndexW(cell);
+    let won = atomicLoad(&gasClaim[claimSlot(tgtSlot)]) == particlePriority(p);
+    if (won && inBounds(cell) && voxMat(voxWordAt(cell)) == MAT_AIR) {
+      let mat = p.payload & 0xFFFu;
+      var state = (p.payload >> 12u) & 0xFu;
+      if (materials[mat].klass == CLASS_LIQUID) { state = LIQ_FULL_STATE; }
+      // STAMP_NEVER: it has not acted as a grid voxel yet, so it may move on
+      // the tick it lands.
+      voxStore(voxWordIndex(cell), packVox(mat, state, STAMP_NEVER));
+      gasMarkDirtyNext(cell);
+      atomicAdd(&gasSpawn[GAS_SP_REENTER], 1u);
+      p.flags = 0u;                       // dead: it is a voxel now
+      gasWrite[gid.x] = p;
+      return;
+    }
+    // Lost the claim, or the cell was taken between integrate and resolve.
+    // Stay a parcel and retry next tick; it is not stuck, because next tick
+    // the cell reads non-air and the ladder routes it somewhere else.
+    p.flags = PFLAG_ALIVE | PFLAG_GAS;
+    gasWrite[gid.x] = p;
+  }
+
+  // The splat, folded into resolve rather than given its own dispatch: it is
+  // one atomic per live parcel and this is already the pass that walks every
+  // live parcel exactly once. Only cells OUTSIDE the window splat — inside,
+  // smoke is a voxel and renders as one, and counting it twice would put a
+  // bright halo on the window boundary.
+  if (!inBounds(cell)) { gasSplat(cell); }
+
+  // The determinism digest. Every parcel that is still a parcel after this
+  // pass contributes; one that became a voxel returned above and is covered by
+  // the world hash instead, so the two never double-count a parcel and never
+  // drop one.
+  atomicAdd(&gasSpawn[GAS_SP_DIGEST], particlePriority(p));
+}

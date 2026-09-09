@@ -65,6 +65,10 @@ struct TableCtx {
   // + the args copy + all 54 CA iterations (ROADMAP_scale.md §3.4).
   bool caActive = true;
   bool vizActive = false;
+  // Gas particles exist OR the CA has work this tick (docs/PLAN_gas_particles
+  // .md). False on every tick of a settled world with no plume, and then not
+  // one gas row is recorded.
+  bool gasActive = false;
 };
 
 // The live resources a table row resolves against, as SEAM handles. The
@@ -73,12 +77,13 @@ struct TableCtx {
 // place in the flow (record time) it always has.
 struct TableBindings {
   Buffer buffers[(int)pass::Buf::kCount];
-  ComputePipeline pipelines[64];  // indexed by (int)pass::Pipe
+  ComputePipeline pipelines[(int)pass::Pipe::kPipeCount];  // by (int)pass::Pipe
   PipelineLayout simLayout;       // GRP_SIM (simPL_)
   PipelineLayout slimPartLayout;  // GRP_SLIM_PART (simPL2_)
   PipelineLayout slimFarLayout;   // GRP_SLIM_FAR (farPL_)
   PipelineLayout slimFluidLayout; // GRP_SLIM_FLUID (fluidPL_)
   PipelineLayout slimFluidSeamLayout; // GRP_SLIM_FLUIDSEAM (fluidSeamPL_)
+  PipelineLayout slimGasLayout;   // GRP_SLIM_GAS (gasPL_)
   PipelineLayout shadowLayout;    // GRP_SHADOW (shadowPL_) — ONE set, unlike
                                   // every Slim* pair above: the resolve pass
                                   // shares no buffer with the sim groups.
@@ -88,6 +93,7 @@ struct TableBindings {
   BindGroup farSet;               // farBG_
   BindGroup fluidSet;             // fluidBG_
   BindGroup fluidSeamSet;         // fluidSeamBG_[page]
+  BindGroup gasSet;               // gasBG_[page]
   BindGroup shadowSet;            // shadowBG_
 };
 
