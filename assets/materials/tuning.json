@@ -739,7 +739,7 @@
     "trampleLean": 0.35,
     "trampleRadius": 1.5,
     "primarySteps": 4096,
-    "farSteps": 384,
+    "farSteps": 896,
     "farShadowReach": 24,
     "farBlockerHitLevel": 0,
     "gasBlendStart": 0.5,
