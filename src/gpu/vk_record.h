@@ -111,6 +111,12 @@ struct RecordCtx {
   // True only while the per-voxel activity overlay is on. Gates the ActVoxViz
   // write so the debug buffer costs nothing when the dev toggle is off.
   bool vizActive = false;
+  // Gas particles (docs/PLAN_gas_particles.md). True when parcels are already
+  // in flight OR the CA has work this tick — a voxel can only reach the window
+  // edge from a chunk the CA is running, and a parcel already out there has to
+  // be stepped whether or not any chunk is awake. False on every tick of a
+  // settled world with no plume, and then no gas row is recorded at all.
+  bool gasActive = false;
 };
 
 // The live GPU objects a table row resolves against. The recorder is handed one
@@ -124,12 +130,13 @@ struct RecordCtx {
 // resolve to the same buffer, which Bind() asserts.
 struct Bindings {
   Buffer* buffers[(int)pass::Buf::kCount] = {};
-  VkPipeline pipelines[64] = {};        // indexed by (int)pass::Pipe
+  VkPipeline pipelines[(int)pass::Pipe::kPipeCount] = {};  // by (int)pass::Pipe
   VkPipelineLayout simLayout = VK_NULL_HANDLE;      // GRP_SIM: one set
   VkPipelineLayout slimPartLayout = VK_NULL_HANDLE; // GRP_SLIM_PART: slim + particle
   VkPipelineLayout slimFarLayout = VK_NULL_HANDLE;  // GRP_SLIM_FAR: slim + far
   VkPipelineLayout slimFluidLayout = VK_NULL_HANDLE;// GRP_SLIM_FLUID: slim + fluid
   VkPipelineLayout slimFluidSeamLayout = VK_NULL_HANDLE; // GRP_SLIM_FLUIDSEAM
+  VkPipelineLayout slimGasLayout = VK_NULL_HANDLE;  // GRP_SLIM_GAS: slim + gas
   VkPipelineLayout shadowLayout = VK_NULL_HANDLE;   // GRP_SHADOW: one set
   VkDescriptorSet simSet = VK_NULL_HANDLE;          // simBG_[page]
   VkDescriptorSet slimSet = VK_NULL_HANDLE;         // simSlimBG_[page]
@@ -137,6 +144,7 @@ struct Bindings {
   VkDescriptorSet farSet = VK_NULL_HANDLE;          // farBG_
   VkDescriptorSet fluidSet = VK_NULL_HANDLE;        // fluidBG_
   VkDescriptorSet fluidSeamSet = VK_NULL_HANDLE;    // fluidSeamBG_[page]
+  VkDescriptorSet gasSet = VK_NULL_HANDLE;          // gasBG_[page]
   VkDescriptorSet shadowSet = VK_NULL_HANDLE;       // shadowBG_
 };
 

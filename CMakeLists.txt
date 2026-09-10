@@ -479,6 +479,7 @@ add_library(sandvox_core OBJECT
   src/test/selftest_scale.cpp
   src/test/selftest_sim.cpp
   src/test/selftest_ca.cpp
+  src/test/selftest_gas.cpp
   src/test/selftest_wind.cpp
   src/test/selftest_water.cpp
   src/test/selftest_render.cpp

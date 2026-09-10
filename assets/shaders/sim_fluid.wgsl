@@ -251,6 +251,10 @@ const FLUID_MASS_MIN : i32 = 16;
 // whole mechanism out and restores WP4's pass-through behaviour exactly.
 const FLUID_SETTLED_Q8 : i32 =
     i32(round(clamp(TUNE_FLUID_SETTLED_MASS, 0.0, 2.0) * 256.0));
+// "Ride the surface": does SUBMERGED settled liquid act as a boundary? See the
+// long block at fluidSolid. 0 restores the pass-through behaviour, which is the
+// control arm for `--sweep sim.fluidSubmergedSolid=0,1`.
+const FLUID_SUBMERGED_SOLID : i32 = clamp(TUNE_FLUID_SUBMERGED_SOLID, 0, 1);
 // Gravity, EOS (stiffness / rest density / power / cohesion), the species
 // attraction pair, viscosity and damping all come from tuning (sim.* —
 // integer, F5-reloadable, the "fluid" rows of tuning_params.def). LoadTuning
@@ -317,8 +321,9 @@ fn axisOf(p : i32) -> Axis {
 // block this substep (out of window, unmarked, or past the block budget).
 fn nodeBlock(nc : vec3<i32>) -> u32 {
   let wc = worldChunkOf(nc);
-  if (!chunkInWindow(wc, T.origin)) { return 0u; }
-  return atomicLoad(&fluidBlockMap[chunkSlotIndex(wc)]);
+  let slot = chunkSlotOf(wc, T.origin);
+  if (slot == SLOT_NONE) { return 0u; }
+  return atomicLoad(&fluidBlockMap[slot]);
 }
 
 // First WORD of node nc's accumulator row (block bm), i.e. index * FLUID_GW.
@@ -332,11 +337,58 @@ fn nodeWordBase(bm : u32, nc : vec3<i32>) -> u32 {
 // the way it stops a particle is by weighing something, which is what
 // seedSettledMass below gives it. Out-of-window is solid and inert.
 fn fluidSolid(c : vec3<i32>) -> bool {
-  if (!inWindow(c, T.origin)) { return true; }
-  let mat = voxMat(voxWordAt(c));
+  if (!cellResident(c, T.origin)) { return true; }
+  let w = voxWordAt(c);
+  let mat = voxMat(w);
   if (mat == MAT_AIR) { return false; }
   let k = materials[mat].klass;
-  return k == CLASS_SOLID || k == CLASS_POWDER;
+  if (k == CLASS_SOLID || k == CLASS_POWDER) { return true; }
+  // ---- RIDE THE SURFACE (sim.fluidSubmergedSolid) -------------------------
+  //
+  // SUBMERGED liquid is a floor; free-surface liquid is not. The block above
+  // says a settled liquid stops a particle by WEIGHING something, and that is
+  // true at the interface — seedSettledMass puts a density step there and the
+  // EOS pushes back. It is not true one cell down: the seeded field is a flat
+  // `rest` with no depth profile, so it has no gradient, so a particle that
+  // arrives with downward momentum punches through the step and then free-falls
+  // through water the solver cannot see. Meanwhile the excite path DOES model
+  // depth (SEAM_HYDRO pre-compresses J), so the particle believes it is denser
+  // than its surroundings. The two halves disagree and the particle sinks.
+  //
+  // WHY THIS AND NOT A HYDROSTATIC SEED. Real buoyancy needs rho to rise with
+  // depth, which needs a per-cell depth field the solver can read every
+  // substep. None exists — the only depth in the engine is 4 bits of excite
+  // scratch, capped at 15 cells and alive for one tick. A one-way floor costs
+  // one voxel read and gets the property that actually matters.
+  //
+  // WHY IT IS THE TERMINATION FIX and not a cosmetic one: settleColumn can only
+  // place water where there is room, and a submerged column has none by
+  // construction. So a buried particle is unsettleable, permanently. Keeping
+  // particles at the free surface — where there IS room above — is what makes
+  // settle able to finish at all. Measured without it: the force-settle
+  // backstop returns 3,743 eighths to the surface per 20 ticks and excite takes
+  // 4,862 straight back, so the population pins at its ceiling forever and the
+  // settled-world tick goes 0.52 -> 6.28 ms.
+  //
+  // INTERIOR, NOT MERELY FULL: the cell must be full AND have its own liquid
+  // continuing above it. That is the same "submerged water is FULL water"
+  // predicate ab6ce9c gave the CA's levelling stages and canFlowAnywhere, and
+  // that exciteDetect now shares — this is its fifth place, and they must agree
+  // or water is a floor to one system and empty space to another.
+  //
+  // A splash therefore lands ON the pool and spreads instead of plunging
+  // through it (the owner's call, this session). Particles already inside when
+  // the rule turns on are handled by the back-projection below — it reverts and
+  // zeroes velocity, so they go CALM, which is exactly what lets the seam's
+  // force-settle backstop pick them up and drain them.
+  if (FLUID_SUBMERGED_SOLID != 0 && k == CLASS_LIQUID &&
+      voxState(w) + 1u >= 8u) {
+    let above = c + vec3<i32>(0, 1, 0);
+    if (cellResident(above, T.origin) && voxMat(voxWordAt(above)) == mat) {
+      return true;
+    }
+  }
+  return false;
 }
 
 // The live particle population is GPU-OWNED now (the seam's compaction /
@@ -366,7 +418,7 @@ fn mark(@builtin(global_invocation_id) gid : vec3<u32>) {
   if (gid.x >= liveTotal()) { return; }
   let p = fluidParticles[gid.x];
   let cell = vec3<i32>(p.px >> 16u, p.py >> 16u, p.pz >> 16u);
-  if (!inWindow(cell, T.origin)) { return; }  // frozen out-of-window
+  if (!cellResident(cell, T.origin)) { return; }  // frozen out-of-residency
   let ax = axisOf(p.px); let ay = axisOf(p.py); let az = axisOf(p.pz);
   let lo = vec3<i32>(ax.base, ay.base, az.base) - vec3<i32>(FLUID_MARK_PAD);
   let hi = vec3<i32>(ax.base, ay.base, az.base) +
@@ -378,8 +430,9 @@ fn mark(@builtin(global_invocation_id) gid : vec3<u32>) {
                                select(lo.y, hi.y, j == 1),
                                select(lo.z, hi.z, k == 1));
         let wc = worldChunkOf(corner);
-        if (chunkInWindow(wc, T.origin)) {
-          atomicOr(&fluidBlockMap[chunkSlotIndex(wc)], 1u);
+        let cs = chunkSlotOf(wc, T.origin);
+        if (cs != SLOT_NONE) {
+          atomicOr(&fluidBlockMap[cs], 1u);
         }
       }
     }
@@ -400,7 +453,7 @@ var<workgroup> allocTotal : u32;
 fn alloc(@builtin(local_invocation_index) li : u32) {
   // TRUE SLEEP (plan §7 item 2). Every other row of this table dispatches off
   // an indirect arg and so costs nothing with no particles; this one is a fixed
-  // single-workgroup walk of all NUM_CHUNKS slots (the seam's settleScan is the
+  // single-workgroup walk of all NUM_SLOTS slots (the seam's settleScan is the
   // other). Whether the table is RECORDED stays a pure function of the
   // CPU-owned monotone count — never a readback, that is the determinism trap
   // in plan §7 — so a world that poured once and settled goes on recording
@@ -411,7 +464,7 @@ fn alloc(@builtin(local_invocation_index) li : u32) {
   // storage read is non-uniform to the compiler, and a barrier in non-uniform
   // control flow is a WGSL validation error. Skipping the WORK is enough.)
   let asleep = min(atomicLoad(&fluidArgs[FA_LIVE]), FLUID_CAP) == 0u;
-  let span = NUM_CHUNKS / 256u;   // 128 slots per thread
+  let span = NUM_SLOTS / 256u;    // 128 slots per thread
   var n = 0u;
   if (!asleep) {
     for (var s = li * span; s < (li + 1u) * span; s++) {
@@ -527,14 +580,12 @@ fn clearGrid(@builtin(workgroup_id) wg : vec3<u32>,
   // can reach this tick, so it needs no representation here.
   if (FLUID_SETTLED_Q8 <= 0) { return; }
   let slot = fluidBlockList[block];
-  let sc = vec3<i32>(i32(slot % NCHUNK), i32((slot / NCHUNK) % NCHUNK),
-                     i32(slot / (NCHUNK * NCHUNK)));
   let lo = vec3<i32>(i32(localIdx & 15u), i32((localIdx >> 4u) & 15u),
                      i32(localIdx >> 8u));
   // Node nc sits at the CENTRE of cell nc (see axisOf / the dpos terms in p2g),
   // so "this node's cell" is an identity, not an approximation.
-  let c = slotToWorldChunk(sc, T.origin) * i32(CHUNK) + lo;
-  if (!inWindow(c, T.origin)) { return; }
+  let c = slotWorldChunk(slot, T.origin) * i32(CHUNK) + lo;
+  if (!cellResident(c, T.origin)) { return; }
   let w = voxWordAt(c);
   let mat = voxMat(w);
   if (mat == MAT_AIR) { return; }
@@ -561,7 +612,7 @@ fn p2g1(@builtin(global_invocation_id) gid : vec3<u32>) {
   if (gid.x >= liveTotal()) { return; }
   let p = fluidParticles[gid.x];
   let cell = vec3<i32>(p.px >> 16u, p.py >> 16u, p.pz >> 16u);
-  if (!inWindow(cell, T.origin)) { return; }
+  if (!cellResident(cell, T.origin)) { return; }
   let ax = axisOf(p.px); let ay = axisOf(p.py); let az = axisOf(p.pz);
 
   // ---- loop-invariant work, lifted out of the 27 taps ----------------------
@@ -640,7 +691,7 @@ fn p2g2(@builtin(global_invocation_id) gid : vec3<u32>) {
   if (gid.x >= liveTotal()) { return; }
   var p = fluidParticles[gid.x];
   let cell = vec3<i32>(p.px >> 16u, p.py >> 16u, p.pz >> 16u);
-  if (!inWindow(cell, T.origin)) { return; }
+  if (!cellResident(cell, T.origin)) { return; }
   let ax = axisOf(p.px); let ay = axisOf(p.py); let az = axisOf(p.pz);
 
   // The (i,j) weight product, hoisted out of BOTH 27-tap loops below — see the
@@ -823,9 +874,7 @@ fn gridUpdate(@builtin(workgroup_id) wg : vec3<u32>,
 
   // Node cell from the block's chunk slot + this thread's local coords.
   let slot = fluidBlockList[block];
-  let sc = vec3<i32>(i32(slot % NCHUNK), i32((slot / NCHUNK) % NCHUNK),
-                     i32(slot / (NCHUNK * NCHUNK)));
-  let wc = slotToWorldChunk(sc, T.origin);
+  let wc = slotWorldChunk(slot, T.origin);
   let lo = vec3<i32>(i32(localIdx & 15u), i32((localIdx >> 4u) & 15u),
                      i32(localIdx >> 8u));
   let c = wc * i32(CHUNK) + lo;
@@ -975,7 +1024,7 @@ fn g2p(@builtin(global_invocation_id) gid : vec3<u32>) {
   if (gid.x >= liveTotal()) { return; }
   var p = fluidParticles[gid.x];
   let cell = vec3<i32>(p.px >> 16u, p.py >> 16u, p.pz >> 16u);
-  if (!inWindow(cell, T.origin)) { return; }
+  if (!cellResident(cell, T.origin)) { return; }
   if (fluidSolid(cell)) {
     p.attr = 0u;
     fluidParticles[gid.x] = p;

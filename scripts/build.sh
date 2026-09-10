@@ -148,6 +148,45 @@ if [ "$GEN" = "$GEN_NINJA" ]; then
     | grep -E '^(Compile requests executed|Cache hits|Cache misses|Non-cacheable compilations)\s' \
     | sed 's/  */ /g' | tr '\n' ';' | sed 's/^/build.sh: sccache /; s/;$/\n/' || true
 fi
+
+# -- Phase 1b: refuse to link objects from a SIBLING WORKTREE ---------------
+# sccache is keyed on preprocessed source, so two worktrees whose headers agree
+# share objects -- correct, and most of why a cold worktree build is fast. The
+# trap is the /showIncludes reply it replays alongside a cached object: it names
+# the ORIGINATING tree's headers, so ninja records this object as depending on a
+# sibling's world.h/tuning.h and never rebuilds it when YOURS change. The linker
+# then happily combines two layouts of the same struct.
+#
+# The symptom is an access violation at startup in code nobody touched, and the
+# give-away is that crash.log's frames name another worktree's source paths.
+# Three times now: 2026-09-04 (MaterialDef stride, in LoadMicroVox), 2026-09-08
+# (pass::Pipe entries, in PageTable::ResetIdentity), 2026-09-09 (Tuning gained
+# render.gasBlendStart, so main.cpp read tune.warnings 4 bytes short and died on
+# the first std::string). Each one cost a diagnosis from scratch, so the build
+# now does the diagnosis instead: scan, purge, recompile ONCE, and abort rather
+# than hand over an exe that is a coin flip.
+#
+# Affordable on every build because of --newer-than: only objects written since
+# the last clean check are read, which in the steady state is only what this
+# build just compiled.
+POISON_STAMP="$ROOT/build/.poison_check_stamp"
+if [ "$BUILD_EXIT" -eq 0 ] && [ "$GEN" = "$GEN_NINJA" ]; then
+  if ! python "$SCRIPT_DIR/find_poisoned_objs.py"        --config "$CONFIG" --newer-than "$POISON_STAMP" --exit-code --delete; then
+    echo "build.sh: ^^ those objects came from another worktree; recompiling them" >&2
+    SCCACHE_RECACHE=1 cmake --build "$ROOT/build" --config "$CONFIG"       --target "$COMPILE_TARGET" "${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}" || BUILD_EXIT=$?
+    # One repair attempt. A second round of foreign objects means the cache is
+    # serving them back even under SCCACHE_RECACHE, and linking would produce
+    # exactly the mixed-layout exe this check exists to prevent.
+    if [ "$BUILD_EXIT" -eq 0 ] &&        ! python "$SCRIPT_DIR/find_poisoned_objs.py"          --config "$CONFIG" --newer-than "$POISON_STAMP" --exit-code; then
+      svlock_release "$SVLOCK_COMPILE"
+      echo "build.sh: POISONED OBJECTS SURVIVED A RECACHE -- refusing to link." >&2
+      echo "build.sh: try 'bash scripts/build.sh --fresh', or clear C:/sv-deps/sccache." >&2
+      exit 1
+    fi
+  fi
+  [ "$BUILD_EXIT" -eq 0 ] && : > "$POISON_STAMP"
+fi
+
 svlock_release "$SVLOCK_COMPILE"
 T_COMPILE=$(date +%s)
 

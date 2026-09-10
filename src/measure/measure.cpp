@@ -50,8 +50,8 @@ namespace {
 // Blocking read of the whole per-chunk occupancy buffer (kNumChunks u32 =
 // 128 KiB at 512^3 / 16^3). Measurement harness only.
 std::vector<uint32_t> ReadOccupancySync(GpuContext& ctx, World& world) {
-  const uint64_t bytes = (uint64_t)kNumChunks * 4;
-  std::vector<uint32_t> out(kNumChunks, 0);
+  const uint64_t bytes = (uint64_t)kNumSlots * 4;
+  std::vector<uint32_t> out(kNumSlots, 0);
   rhi::ReadbackBlocking(ctx.device, ctx.queue, world.occupancy, 0, out.data(),
                         (size_t)bytes, "occRead");
   return out;
@@ -60,10 +60,10 @@ std::vector<uint32_t> ReadOccupancySync(GpuContext& ctx, World& world) {
 // The sub-chunk bitmask that follows the counts in the same buffer (world.h
 // kSubOccShift). Read separately so the histogram above keeps its exact shape.
 std::vector<uint32_t> ReadSubOccSync(GpuContext& ctx, World& world) {
-  const uint64_t bytes = (uint64_t)kNumChunks * kSubOccStride * 4;
-  std::vector<uint32_t> out((size_t)kNumChunks * kSubOccStride, 0);
+  const uint64_t bytes = (uint64_t)kNumSlots * kSubOccStride * 4;
+  std::vector<uint32_t> out((size_t)kNumSlots * kSubOccStride, 0);
   rhi::ReadbackBlocking(ctx.device, ctx.queue, world.occupancy,
-                        (uint64_t)kNumChunks * 4, out.data(), (size_t)bytes,
+                        (uint64_t)kNumSlots * 4, out.data(), (size_t)bytes,
                         "subOccRead");
   return out;
 }
@@ -89,7 +89,7 @@ void MeasureSubOcc(GpuContext& ctx, World& world) {
     uint64_t slabs = 0, emptySlabs = 0;
   };
   Acc mixed, full;  // "mixed" = 1..CHUNK_VOL-1 cells, "full" = all cells
-  for (uint32_t i = 0; i < kNumChunks; i++) {
+  for (uint32_t i = 0; i < kNumSlots; i++) {
     const uint32_t count = occ[i] & 0xFFFFu;
     if (count == 0) continue;  // chunk-level skip already handles these
     uint32_t set = 0;
@@ -192,7 +192,7 @@ void MeasureOccupancy(GpuContext& ctx, World& world) {
   struct Layer { uint64_t empty = 0, full = 0, mixed = 0, nonAir = 0; };
   std::vector<Layer> layers(kNChunk);
 
-  for (uint32_t i = 0; i < kNumChunks; i++) {
+  for (uint32_t i = 0; i < kNumSlots; i++) {
     uint32_t count = occ[i] & 0xFFFFu;
     uint32_t block = occ[i] >> 16;
     nonAir.Add(count);
@@ -346,8 +346,8 @@ void MeasureUniformity(GpuContext& ctx, World& world) {
   // chunks spread over 20 materials".
   std::unordered_map<uint32_t, uint64_t> oneWordMats;
 
-  for (uint32_t base = 0; base < kNumChunks; base += kBatchChunks) {
-    const uint32_t n = std::min(kBatchChunks, kNumChunks - base);
+  for (uint32_t base = 0; base < kNumSlots; base += kBatchChunks) {
+    const uint32_t n = std::min(kBatchChunks, kNumSlots - base);
     if (!rhi::ReadbackBlocking(ctx.device, ctx.queue, world.voxels,
                                (uint64_t)base * kChunkVol * 4, batch.data(),
                                (size_t)n * kChunkVol * 4, "uniformityRead")) {
@@ -574,10 +574,10 @@ void SamplePhaseOccupancy(GpuContext& ctx, World& world, Simulation& sim,
                           bool inputsThisTick) {
   static std::vector<uint32_t> flags;
   static std::vector<uint32_t> chunk;
-  flags.assign(kNumChunks, 0);
+  flags.assign(kNumSlots, 0);
   chunk.resize(kChunkVol);
   rhi::ReadbackBlocking(ctx.device, ctx.queue, sim.DirtyActive(), 0,
-                        flags.data(), (size_t)kNumChunks * 4, "phaseDirtyRead");
+                        flags.data(), (size_t)kNumSlots * 4, "phaseDirtyRead");
 
   // matCanAct, on the CPU, from the same compiled table the GPU is handed.
   auto canAct = [&mats](uint32_t mat) {
@@ -589,8 +589,8 @@ void SamplePhaseOccupancy(GpuContext& ctx, World& world, Simulation& sim,
   bool nonAir[27] = {}, act[27] = {};
   uint64_t dirty = 0;
   bool grew = false;  // did a chunk ENTER the dirty set since the last sample?
-  if (h.prevDirty.size() != kNumChunks) { h.prevDirty.assign(kNumChunks, 0); grew = true; }
-  for (uint32_t slot = 0; slot < kNumChunks; slot++) {
+  if (h.prevDirty.size() != kNumSlots) { h.prevDirty.assign(kNumSlots, 0); grew = true; }
+  for (uint32_t slot = 0; slot < kNumSlots; slot++) {
     if (flags[slot] == 0) continue;
     if (!h.prevDirty[slot]) grew = true;
     dirty++;
@@ -671,7 +671,7 @@ void SamplePhaseOccupancy(GpuContext& ctx, World& world, Simulation& sim,
     else h.staleSoundSum += se;
   }
   std::memcpy(h.prevAct, act, sizeof(act));
-  for (uint32_t i = 0; i < kNumChunks; i++) h.prevDirty[i] = flags[i] ? 1u : 0u;
+  for (uint32_t i = 0; i < kNumSlots; i++) h.prevDirty[i] = flags[i] ? 1u : 0u;
   h.prevValid = true;
 
   if (dirty == 0) { h.settledTicks++; return; }

@@ -1287,62 +1287,122 @@ def check_plant_tiles():
 
 
 def check_far_material_bits():
-    """A far cascade cell is 7 bits of material id + 1 blocker flag (13.2.2).
+    """A far cascade cell is a 7-bit FAR PALETTE SLOT + 1 blocker flag (13.2.2).
 
-    Three places have to agree that a material id fits in seven bits:
-    common.wgsl's FAR_MAT_MASK (what every reader masks with), materials.cpp's
-    load-time refusal, and the size of materials.json itself. Nothing crashes
-    when they stop agreeing -- the 128th material simply renders as a different
-    colour at distance and claims a blocker wherever bit 7 falls -- so this is
-    the only thing that would ever say so. The JSON side is checked HERE rather
-    than only in the loader because adding a material is a data edit that needs
-    no build, and a data edit that silently breaks the horizon should fail at
-    the same moment it is made.
+    Those seven bits used to be a material id outright, which is why the loader
+    refused a 129th material. They are now an index into the far palette (world.h
+    kFarPaletteBaseGpu), so the ceiling counts DISTINCT FAR COLOURS, not
+    materials: a look-alike shares a slot by authoring `"far": "<material>"`.
+
+    Four places have to agree about the width, and one about the contents:
+    common.wgsl FAR_PAL_MASK (what every reader masks with), common.wgsl
+    MATF_FAR_PAL_MASK (what every writer packs into the material flags word),
+    materials.h kMatFarPal* (the C++ mirror of that field), and world.h
+    kFarPaletteSlotsGpu (the size of the reverse run). Nothing crashes when they
+    stop agreeing -- the far field just paints the wrong material and claims a
+    blocker wherever a stray bit falls -- so this is the only thing that would
+    say so.
+
+    materials.json is checked HERE and not only in the loader because adding a
+    material is a data edit that needs no build, and a data edit that silently
+    breaks the horizon should fail at the moment it is made.
     """
-    wgsl, cpp = read("assets/shaders/common.wgsl"), read("src/sim/materials.cpp")
+    wgsl = read("assets/shaders/common.wgsl")
+    hpp = read("src/sim/materials.h")
+    wh = read("src/sim/world.h")
     js = read("assets/materials/materials.json")
-    if not wgsl or not cpp or not js:
+    if not wgsl or not hpp or not wh or not js:
         return
-    checked.append("far cell material bits")
+    checked.append("far cell palette slot bits")
 
-    m = re.search(r"FAR_MAT_MASK\s*:\s*u32\s*=\s*0x([0-9A-Fa-f]+)u", wgsl)
+    m = re.search(r"FAR_PAL_MASK\s*:\s*u32\s*=\s*0x([0-9A-Fa-f]+)u", wgsl)
     if not m:
-        problems.append("far cell material bits: common.wgsl has no FAR_MAT_MASK "
-                        "-- the 7-bit split cannot be checked")
+        problems.append("far cell palette slot bits: common.wgsl has no "
+                        "FAR_PAL_MASK -- the 7-bit split cannot be checked")
         return
     mask = int(m.group(1), 16)
+    want = mask + 1                       # slots 0..mask, so mask+1 of them
     if mask != 0x7F:
-        problems.append(f"far cell material bits: FAR_MAT_MASK is 0x{mask:X}, not "
-                        "0x7F -- bit 7 is the blocker flag (FAR_BLOCKER_BIT)")
+        problems.append(f"far cell palette slot bits: FAR_PAL_MASK is 0x{mask:X}, "
+                        "not 0x7F -- bit 7 is the blocker flag (FAR_BLOCKER_BIT)")
 
-    # the SECOND `mats.size() > N` refusal in the file; the first is the
-    # 12-bit voxel-word limit (4096) and is a different fact.
-    lims = [int(x) for x in re.findall(r"mats\.size\(\) > (\d+)\)", cpp)]
-    limit = min(lims) if lims else None
-    want = mask + 1                       # ids 0..mask, so mask+1 entries
-    if limit is None:
-        problems.append("far cell material bits: materials.cpp has no "
-                        "`mats.size() > N` refusal for the 7-bit far id -- a "
-                        "128th material would corrupt the far field silently")
-    elif limit != want:
-        problems.append(
-            f"far cell material bits: materials.cpp refuses past {limit} "
-            f"materials but FAR_MAT_MASK 0x{mask:X} allows {want} (ids 0..{mask})")
+    # The material -> slot direction rides in the flags word. Both sides of the
+    # language boundary declare its shift and mask, and a disagreement would
+    # write the slot into the tint base or the wind nibbles.
+    def num(text, pat, label):
+        mm = re.search(pat, text)
+        if not mm:
+            problems.append(f"far cell palette slot bits: cannot find {label}")
+            return None
+        g = mm.group(1)
+        return int(g, 16) if g.lower().startswith("0x") else int(g)
 
-    # The JSON does not list air; the loader prepends it at id 0.
+    wsh = num(wgsl, r"MATF_FAR_PAL_SHIFT\s*:\s*u32\s*=\s*(\d+)u",
+              "common.wgsl MATF_FAR_PAL_SHIFT")
+    wmk = num(wgsl, r"MATF_FAR_PAL_MASK\s*:\s*u32\s*=\s*(0x[0-9A-Fa-f]+)u",
+              "common.wgsl MATF_FAR_PAL_MASK")
+    csh = num(hpp, r"kMatFarPalShift\s*=\s*(\d+)", "materials.h kMatFarPalShift")
+    cmk = num(hpp, r"kMatFarPalMask\s*=\s*(0x[0-9A-Fa-f]+)",
+              "materials.h kMatFarPalMask")
+    if None not in (wsh, csh) and wsh != csh:
+        problems.append(f"far cell palette slot bits: MATF_FAR_PAL_SHIFT is {wsh} "
+                        f"in common.wgsl but kMatFarPalShift is {csh} in "
+                        "materials.h")
+    if None not in (wmk, cmk) and wmk != cmk:
+        problems.append(f"far cell palette slot bits: MATF_FAR_PAL_MASK is "
+                        f"0x{wmk:X} in common.wgsl but kMatFarPalMask is "
+                        f"0x{cmk:X} in materials.h")
+    if wmk is not None and wmk != mask:
+        problems.append(f"far cell palette slot bits: the flags field holds "
+                        f"0x{wmk:X} but the cell byte holds 0x{mask:X} -- a slot "
+                        "would survive one and be truncated by the other")
+    # The flags word: bits 0..7 MATF_* booleans, 8..15 wind, 16..23 tint base,
+    # 24..30 far slot. A shift that let the slot run past bit 31 would drop it.
+    if wsh is not None and wmk is not None and wsh + wmk.bit_length() > 32:
+        problems.append(f"far cell palette slot bits: a {wmk.bit_length()}-bit "
+                        f"slot at shift {wsh} runs off the end of the 32-bit "
+                        "material flags word")
+
+    slots = num(wh, r"kFarPaletteSlotsGpu\s*=\s*(\d+)",
+                "world.h kFarPaletteSlotsGpu")
+    if slots is not None and slots != want:
+        problems.append(f"far cell palette slot bits: world.h reserves {slots} "
+                        f"far palette entries but FAR_PAL_MASK 0x{mask:X} can "
+                        f"only name {want} -- the extra ones are unreachable")
+    cslots = num(hpp, r"kMatFarPalSlots\s*=\s*(\d+)", "materials.h kMatFarPalSlots")
+    if None not in (slots, cslots) and slots != cslots:
+        problems.append(f"far cell palette slot bits: world.h reserves {slots} "
+                        f"far palette entries but materials.h hands out {cslots}")
+
+    # The JSON does not list air; the loader prepends it at id 0 and it always
+    # owns slot 0. Every material without a "far" alias needs a slot of its own.
     try:
         import json as _json
         rows = _json.loads(js).get("materials", [])
     except Exception as e:                                    # noqa: BLE001
-        problems.append(f"far cell material bits: materials.json will not parse ({e})")
+        problems.append(f"far cell palette slot bits: materials.json will not "
+                        f"parse ({e})")
         return
-    if len(rows) + 1 > want:
+    byname = {r.get("id"): r for r in rows if isinstance(r, dict)}
+    for r in rows:
+        far = r.get("far")
+        if not far:
+            continue
+        if far not in byname:
+            problems.append(f'far cell palette slot bits: materials.json "'
+                            f'{r.get("id")}" has far alias "{far}", which is '
+                            "not a material")
+        elif byname[far].get("far"):
+            problems.append(f'far cell palette slot bits: materials.json "'
+                            f'{r.get("id")}" aliases "{far}", which is itself an '
+                            "alias -- name the material that owns the slot")
+    owned = 1 + sum(1 for r in rows if not r.get("far"))   # +1 = implicit air
+    if owned > want:
         problems.append(
-            f"far cell material bits: materials.json declares {len(rows)} "
-            f"materials, {len(rows) + 1} with the implicit air -- the far "
-            f"cascade stores an id in 7 bits and holds at most {want} "
-            f"(ids 0..{mask}). Widen the far cell or drop a material.")
-
+            f"far cell palette slot bits: materials.json needs {owned} distinct "
+            f"far palette slots (with the implicit air) but the far cell byte "
+            f"holds {want}. Give the look-alikes a \"far\": \"<material>\" so "
+            "they share a slot, or widen the far cell.")
 
 # ------------------------------------------------------- readback ring depth
 def check_readback_ring():
@@ -1534,6 +1594,157 @@ def check_env_predictions():
     checked.append("env predictions")
 
 
+def check_gas_consts():
+    """The gas package's three-way agreement (docs/PLAN_gas_particles.md).
+
+    world.h owns the numbers; sim_gas.wgsl and sim_step.wgsl each declare their
+    own copies rather than putting them in common.wgsl, because a common.wgsl
+    edit invalidates the whole SPIR-V cache and pays the worldgen far-cascade
+    recompile (CLAUDE.md). That is the right trade and it is exactly the shape
+    this file exists to police: a cap raised in world.h and not in the shader
+    is a spawn list the CA overruns silently.
+
+    It also checks that the shared gas MOTION model has exactly one definition,
+    in common.wgsl -- see the block at the bottom of this function for why a
+    re-introduced local copy is the failure that nothing else would catch.
+    """
+    checked.append("gas")
+    wh = read(ROOT / "src/sim/world.h")
+    gas = read(ROOT / "assets/shaders/sim_gas.wgsl")
+    step = read(ROOT / "assets/shaders/sim_step.wgsl")
+    common = read(ROOT / "assets/shaders/common.wgsl")
+    raymarch = read(ROOT / "assets/shaders/raymarch.wgsl")
+
+    def cxx(name):
+        m = re.search(r"\b" + name + r"\s*=\s*(-?\d+)", wh)
+        return int(m.group(1)) if m else None
+
+    def wgsl(txt, name):
+        m = re.search(r"const\s+" + name + r"\s*:\s*[iu]32\s*=\s*(-?\d+)", txt)
+        return int(m.group(1)) if m else None
+
+    pairs = [
+        ("kGasParticleCap", "GAS_PARTICLE_CAP", [("sim_gas.wgsl", gas)]),
+        ("kGasSpawnPerTick", "GAS_SPAWN_CAP", [("sim_gas.wgsl", gas),
+                                               ("sim_step.wgsl", step)]),
+        ("kGasCpuSpawnPerTick", "GAS_CPU_SPAWN_CAP", [("sim_gas.wgsl", gas)]),
+        ("kGasCeilingVox", "GAS_CEILING_VOX", [("sim_gas.wgsl", gas)]),
+        # THREE modules declare their own copies rather than importing them:
+        # sim_gas splats parcels into the box, sim_step splats in-window gas
+        # VOXELS into it (stage 1b, so the renderer can crossfade between the
+        # two representations), and raymarch samples it. A common.wgsl constant
+        # would cost the whole SPIR-V cache. That is the right trade and this is
+        # the price of it -- any two of the three disagreeing about the cell
+        # size is a plume drawn in the wrong place, silently.
+        ("kGasOuterN", "GAS_OUTER_N", [("sim_gas.wgsl", gas),
+                                       ("sim_step.wgsl", step),
+                                       ("raymarch.wgsl", raymarch)]),
+        ("kGasOuterShift", "GAS_OUTER_SHIFT", [("sim_gas.wgsl", gas),
+                                               ("sim_step.wgsl", step),
+                                               ("raymarch.wgsl", raymarch)]),
+    ]
+    for cname, wname, shaders in pairs:
+        want = cxx(cname)
+        if want is None:
+            problems.append(f"gas: src/sim/world.h has no {cname}")
+            continue
+        for fname, txt in shaders:
+            got = wgsl(txt, wname)
+            if got is None:
+                problems.append(
+                    f"gas: {fname} does not declare {wname}, which must equal "
+                    f"world.h's {cname} ({want})")
+            elif got != want:
+                problems.append(
+                    f"gas: {fname} {wname} = {got} but world.h {cname} = "
+                    f"{want} -- a cap raised on one side only is a buffer "
+                    f"overrun the GPU will not report")
+
+    # ---- the gas DIRTY-REASON bits ------------------------------------
+    # world.h's kDirtyReasonName is a positional table -- the bit is the row
+    # index -- and world.h's kDirtyGasMask is built from it BY NAME, which
+    # catches a rename but not a renumber. The renumber is the one that
+    # matters: kDirtyGasMask is what arms the renderer's "gas may be present"
+    # flag (RenderParams bit 3), so a DIRTY_M_GAS* constant moved in
+    # sim_step.wgsl without a matching row inserted here turns the whole
+    # voxel->parcel crossfade off in every frame, silently, with every gate
+    # still green.
+    names = re.findall(r'"([^"]*)"', wh.split("kDirtyReasonName")[1]
+                       .split("};")[0])
+    for wgsl_name, row in (("DIRTY_M_GAS", "gas"),
+                           ("DIRTY_M_GASLAT", "gas-lat"),
+                           ("DIRTY_M_GASEDGE", "gas-edge")):
+        got = wgsl(step, wgsl_name)
+        if got is None:
+            problems.append(f"gas: sim_step.wgsl does not declare {wgsl_name}")
+            continue
+        if row not in names:
+            problems.append(
+                f"gas: world.h kDirtyReasonName has no {row!r} row, so "
+                f"kDirtyGasMask cannot name {wgsl_name}")
+            continue
+        want = 1 << names.index(row)
+        if got != want:
+            problems.append(
+                f"gas: sim_step.wgsl {wgsl_name} = {got} but world.h's "
+                f"kDirtyReasonName puts {row!r} at bit {names.index(row)} "
+                f"({want}) -- kDirtyGasMask is built from that index, and a "
+                f"mismatch leaves the render crossfade permanently off")
+
+    # The gasSpawn header word indices, which BOTH shaders and the C++ readback
+    # index into. sim_step writes words 0..2, sim_gas writes 3..8, and
+    # World::EncodeReadbacks folds the lot into the snapshot BY OFFSET -- so a
+    # mismatch reports one counter's value under another counter's name.
+    for cname, wname in [("kGasSpCount", "GAS_SP_COUNT"),
+                         ("kGasSpRefused", "GAS_SP_REFUSED"),
+                         ("kGasSpEdge", "GAS_SP_EDGE"),
+                         ("kGasSpHdr", "GAS_SP_HDR"),
+                         ("kGasSpStride", "GAS_SP_STRIDE")]:
+        want = cxx(cname)
+        for fname, txt in (("sim_gas.wgsl", gas), ("sim_step.wgsl", step)):
+            got = wgsl(txt, wname)
+            if got is not None and want is not None and got != want:
+                problems.append(
+                    f"gas: {fname} {wname} = {got} but world.h {cname} = "
+                    f"{want} -- the header is read back by offset")
+
+    # ---- ONE DEFINITION, and the checker's job is to keep it that way ------
+    # These moved to common.wgsl when the gas particle kernel landed, because
+    # "two shaders must AGREE" is the whole criterion for that file: the CA
+    # moves a gas VOXEL and sim_gas moves a gas PARCEL, and the plan's
+    # requirement is that they make the SAME move.
+    #
+    # They spent one commit duplicated (common.wgsl was held by another package
+    # at the time) with a rule here comparing the two bodies token for token.
+    # That rule has nothing left to compare — so it is replaced by the check
+    # that matters now, which is that nobody re-introduces a local copy. A
+    # second definition of gasIntentK in sim_step.wgsl would not fail to
+    # compile and would not fail a gate; it would simply mean the voxel and the
+    # parcel had quietly stopped agreeing.
+    moved = ["gasRndK", "windLateralCode", "windLateralStartK", "windAxisFrac",
+             "gasLateralRot", "gasIntentK", "gasLadderStep"]
+    for name in moved:
+        if not re.search(r"^fn\s+" + name + r"\s*\(", common, re.M):
+            problems.append(
+                f"gas: common.wgsl no longer defines {name} -- the CA and the "
+                f"gas particle kernel both call it and it is the single "
+                f"definition they agree on")
+        for fname, txt in (("sim_step.wgsl", step), ("sim_gas.wgsl", gas)):
+            if re.search(r"^fn\s+" + name + r"\s*\(", txt, re.M):
+                problems.append(
+                    f"gas: {fname} defines its OWN {name}, shadowing the one in "
+                    f"common.wgsl -- a gas parcel must take the moves a gas "
+                    f"voxel would (PLAN_gas_particles.md 2.2), and a local copy "
+                    f"is how that stops being true without anything failing")
+    for name in ("GasIntent",):
+        if not re.search(r"^struct\s+" + name + r"\b", common, re.M):
+            problems.append(f"gas: common.wgsl no longer defines struct {name}")
+        for fname, txt in (("sim_step.wgsl", step), ("sim_gas.wgsl", gas)):
+            if re.search(r"^struct\s+" + name + r"\b", txt, re.M):
+                problems.append(
+                    f"gas: {fname} defines its own struct {name}, shadowing "
+                    f"common.wgsl's")
+
 ALL = {
     "envpred": check_env_predictions,
     "autofly": check_autofly_surface,
@@ -1558,6 +1769,7 @@ ALL = {
     "ringdepth": check_readback_ring,
     "burntint": check_burn_tint_sites,
     "plants": check_plant_tiles,
+    "gas": check_gas_consts,
 }
 
 # The hook passes the edited file; run only the checks that file can break.
@@ -1592,6 +1804,8 @@ RELEVANT = {
     "src/measure/perfnodes.h": ["perfnodes"],
     "src/measure/perfsuite.cpp": ["autofly"],
     "src/main.cpp": ["arch", "autofly"],
+    "assets/shaders/sim_gas.wgsl": ["gas"],
+    "assets/shaders/raymarch.wgsl": ["gas"],
     "tests/env_predictions.json": ["envpred"],
     "scripts/test_environment.mjs": ["envpred"],
 }

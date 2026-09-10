@@ -49,6 +49,10 @@ void DilateN26(const SlotSet& in, SlotSet& out) {
   const int m = n - 1;
   for (uint32_t s : in.Members()) {
     out.Add(s);
+    // Slot -> WINDOW chunk coords below, so a ticket slot has no business
+    // here: its neighbourhood lives inside its own 5^3 box, which P1's
+    // Tickets owns (docs/PLAN_chunk_tickets.md §2.3). Dead at kTicketMax=0.
+    if (!World::IsWindowSlot(s)) { continue; }
     const int sx = (int)(s % kNChunk);
     const int sy = (int)((s / kNChunk) % kNChunk);
     const int sz = (int)(s / (kNChunk * kNChunk));
@@ -78,13 +82,13 @@ void PageTable::Init(const rhi::Device& device, World& world) {
     jitterEnabled_ = !(nj[0] == '1');
   auditEnabled_ = getenv("SANDVOX_PT_AUDIT") != nullptr;
   poolPages_ = world.PoolPages();
-  tableDirtyMark_.assign(kNumChunks, 0);
+  tableDirtyMark_.assign(kNumSlots, 0);
   ResetIdentity(device.GetQueue());
 }
 
 void PageTable::ResetAllEmpty(const rhi::Queue& queue) {
   auto& t = world_->pageTableCpuMutable();
-  t.assign(kNumChunks, kPtEmpty);
+  t.assign(kNumSlots, kPtEmpty);
   freePages_.clear();
   freePages_.reserve(poolPages_);
   // Pushed high-to-low so the LIFO pop order starts at page 0, which keeps a
@@ -93,7 +97,7 @@ void PageTable::ResetAllEmpty(const rhi::Queue& queue) {
   // assignment is not part of the world (§3.7, review m4).
   for (uint32_t i = poolPages_; i-- > 0;) freePages_.push_back(i);
   pagesInUse_ = 0;
-  queue.WriteBuffer(world_->pageTable, 0, t.data(), (uint64_t)kNumChunks * 4);
+  queue.WriteBuffer(world_->pageTable, 0, t.data(), (uint64_t)kNumSlots * 4);
   // ZERO THE FAULT COUNTER. It is a permanently-bound atomic that nothing else
   // ever resets, and CreateBuffer does not zero — so without this it starts at
   // whatever the driver left behind (measured 134,217,728 == 2^27 on a 3060
@@ -120,13 +124,13 @@ void PageTable::ResetAllEmpty(const rhi::Queue& queue) {
   pendingFills_.clear();
   pendingJitterFills_.clear();
   retire_.clear();
-  zeroStreak_.assign(kNumChunks, 0);
+  zeroStreak_.assign(kNumSlots, 0);
   // The bulk resets are the two paths that hand out pages WITHOUT going
   // through Materialize or EnsurePageForOverwrite, so they stamp the write-
   // reach clock themselves (P4-H). `tick_` is right and "never" would be
   // wrong: worldgen writes every one of these slots at this tick, and only a
   // snapshot that POSTDATES it may be trusted to describe them.
-  reachTick_.assign(kNumChunks, tick_);
+  reachTick_.assign(kNumSlots, tick_);
   totals_ = PageCensus{};
 }
 
@@ -137,18 +141,18 @@ void PageTable::ResetIdentity(const rhi::Queue& queue) {
   // ~84.8% all-air chunks into PT_EMPTY sentinels (§3.5c). Starting dense and
   // demoting is what lets worldgen be a plain whole-world dispatch.
   auto& t = world_->pageTableCpuMutable();
-  t.assign(kNumChunks, 0u);
+  t.assign(kNumSlots, 0u);
   freePages_.clear();
   pagesInUse_ = 0;
-  for (uint32_t i = 0; i < kNumChunks && i < poolPages_; i++) {
+  for (uint32_t i = 0; i < kNumSlots && i < poolPages_; i++) {
     t[i] = i;
     pagesInUse_++;
   }
   // Slots past the pool (paged mode) start EMPTY rather than resident.
-  for (uint32_t i = poolPages_; i < kNumChunks; i++) t[i] = kPtEmpty;
+  for (uint32_t i = poolPages_; i < kNumSlots; i++) t[i] = kPtEmpty;
   // PAGES PAST THE SLOT COUNT ARE THE RETIRE HEADROOM, and they must be seeded
   // onto the free list HERE or they are unreachable for the life of the
-  // process. The identity seeding above can only hand out pages 0..kNumChunks-1
+  // process. The identity seeding above can only hand out pages 0..kNumSlots-1
   // (one per slot), and nothing else ever invents a page index — Alloc only
   // pops what is on this list. So without this loop the headroom is allocated
   // in VRAM, counted by kPoolPages, and never usable: raising the pool would
@@ -156,20 +160,20 @@ void PageTable::ResetIdentity(const rhi::Queue& queue) {
   // is worldgen and LoadWorld, i.e. all of them.
   //
   // This spot previously held a comment asserting there were no such pages.
-  // That was true only while kPoolPages was capped at kNumChunks, and it is
+  // That was true only while kPoolPages was capped at kNumSlots, and it is
   // exactly the kind of invariant-by-comment that survives the change which
   // invalidates it. Pushed high-to-low so the LIFO pops the lowest first,
   // matching ResetAllEmpty.
-  for (uint32_t p = poolPages_; p-- > kNumChunks;) freePages_.push_back(p);
+  for (uint32_t p = poolPages_; p-- > kNumSlots;) freePages_.push_back(p);
   //
   // pagesHighWater_ is deliberately NOT latched here. Identity seeding claims
-  // min(kNumChunks, poolPages_) pages BY CONSTRUCTION — in paged mode a
+  // min(kNumSlots, poolPages_) pages BY CONSTRUCTION — in paged mode a
   // transient state that batched worldgen immediately replaces via
   // ResetAllEmpty. Latching it made every high-water report read the pool
   // size regardless of real demand, which is what invalidated the first
   // kPoolPages sizing attempt. The high-water is real demand only if its sole
   // writer is Alloc().
-  queue.WriteBuffer(world_->pageTable, 0, t.data(), (uint64_t)kNumChunks * 4);
+  queue.WriteBuffer(world_->pageTable, 0, t.data(), (uint64_t)kNumSlots * 4);
   // ZERO THE FAULT COUNTER. It is a permanently-bound atomic that nothing else
   // ever resets, and CreateBuffer does not zero — so without this it starts at
   // whatever the driver left behind (measured 134,217,728 == 2^27 on a 3060
@@ -196,13 +200,13 @@ void PageTable::ResetIdentity(const rhi::Queue& queue) {
   pendingFills_.clear();
   pendingJitterFills_.clear();
   retire_.clear();
-  zeroStreak_.assign(kNumChunks, 0);
+  zeroStreak_.assign(kNumSlots, 0);
   // The bulk resets are the two paths that hand out pages WITHOUT going
   // through Materialize or EnsurePageForOverwrite, so they stamp the write-
   // reach clock themselves (P4-H). `tick_` is right and "never" would be
   // wrong: worldgen writes every one of these slots at this tick, and only a
   // snapshot that POSTDATES it may be trusted to describe them.
-  reachTick_.assign(kNumChunks, tick_);
+  reachTick_.assign(kNumSlots, tick_);
   totals_ = PageCensus{};
 }
 
@@ -311,7 +315,7 @@ uint32_t PageTable::Alloc() {
                  "retire queue while %u slots are still sentinels. The pool "
                  "needs %zu pages of headroom over the window, not a bigger "
                  "window budget.\n",
-                 retire_.size(), kNumChunks - a.resident, retire_.size());
+                 retire_.size(), kNumSlots - a.resident, retire_.size());
   std::fprintf(stderr,
                "See docs/PLAN_page_table.md §3.8: exhaustion is a fatal error "
                "in every mode, deliberately.\n");
@@ -339,7 +343,7 @@ PageTable::PageAudit PageTable::AuditPages() const {
     if (page >= poolPages_) { a.outOfRange++; return; }
     owner[page] |= bit;
   };
-  for (uint32_t s = 0; s < kNumChunks; s++) {
+  for (uint32_t s = 0; s < kNumSlots; s++) {
     const uint32_t e = t[s];
     if ((e & kPtSentinelBit) == 0u) { a.resident++; mark(e, 1u); continue; }
     if (e == kPtEmpty) a.sEmpty++;
@@ -364,7 +368,7 @@ PageTable::PageAudit PageTable::AuditPages() const {
 // 32,768-page pool, and by then the report describes the aftermath, not the
 // cause. This fires on the tick the accounting first breaks, with the tick
 // number, which is the difference between "something leaks" and "the shift at
-// tick N leaks". Off by default — it is an O(kNumChunks) walk per tick.
+// tick N leaks". Off by default — it is an O(kNumSlots) walk per tick.
 void PageTable::AuditInvariant(const char* where) {
   if (!paged_) return;
   if (!auditEnabled_) return;
@@ -443,7 +447,7 @@ uint64_t PageTable::EnsurePageForOverwrite(uint32_t slot) {
   // the very snapshot after it is repopulated, using occupancy that predates
   // the fill. Stream::FillSlots also calls ResetStreaks over the whole plane,
   // which covers the shift path; this covers the ones that are not a plane.
-  if (zeroStreak_.size() == kNumChunks) zeroStreak_[slot] = 0;
+  if (zeroStreak_.size() == kNumSlots) zeroStreak_[slot] = 0;
   t[slot] = p;
   MarkTableDirty(slot);
   return (uint64_t)p * kChunkVol * 4;
@@ -736,7 +740,7 @@ void PageTable::UpdateFluidChunks(const std::vector<uint32_t>& blockSlots,
 
   SlotSet seeds;
   for (uint32_t s : blockSlots)
-    if (s < kNumChunks) seeds.Add(s);
+    if (s < kNumSlots) seeds.Add(s);
   for (const IVec3& c : spawnCells) {
     if (!world.CellInWindow(c)) continue;   // out-of-window is inert
     seeds.Add(World::SlotChunkIndex({c.x >> 4, c.y >> 4, c.z >> 4}));
@@ -779,7 +783,7 @@ void PageTable::TightenFromSnapshot(const std::vector<uint8_t>& dirtyFlags,
   }
 
   SlotSet snap;
-  for (uint32_t i = 0; i < kNumChunks; i++)
+  for (uint32_t i = 0; i < kNumSlots; i++)
     if (dirtyFlags[i]) snap.Add(i);
   SlotSet rolled;
   for (uint32_t r = 0; r < rolls; r++) {
@@ -956,12 +960,12 @@ void PageTable::ApplyParticleShell(const WorldSnapshot& snap,
   // in cpuDirty by the marks the tightening keeps, resident, and therefore
   // ringed by the bracketed half.
   //
-  // The scan below is O(kNumChunks) per tick WHILE PARTICLES FLY — bounded by
+  // The scan below is O(kNumSlots) per tick WHILE PARTICLES FLY — bounded by
   // the same activity that pays for the particle passes themselves, and zero
   // when the world settles.
   scratch_.Clear();
-  if (snap.valid && snap.occupancy.size() == kNumChunks) {
-    for (uint32_t s = 0; s < kNumChunks; s++)
+  if (snap.valid && snap.occupancy.size() == kNumSlots) {
+    for (uint32_t s = 0; s < kNumSlots; s++)
       if (snap.occupancy[s] != 0u) scratch_.Add(s);
   } else {
     // No snapshot yet (startup, or the ring declined every slot so far):
@@ -970,7 +974,7 @@ void PageTable::ApplyParticleShell(const WorldSnapshot& snap,
     // as above if sustained — but it is bounded by the first snapshot's
     // arrival, after which the occupancy seed takes over.
     const auto& t = world_->pageTableCpu();
-    for (uint32_t s = 0; s < kNumChunks; s++) {
+    for (uint32_t s = 0; s < kNumSlots; s++) {
       const uint32_t e = t[s];
       const bool empty =
           (e & kPtSentinelBit) != 0u && (e & kPtMatMask) == kMatAir;
@@ -1179,7 +1183,7 @@ void PageTable::Materialize(const rhi::Queue& queue) {
   // Cost: two byte-stores per member of two sets this function already
   // iterates. A settled world's cpuDirty is empty and this is zero work, which
   // is the rule-2 story the whole mechanism is built on.
-  if (reachTick_.size() != kNumChunks) reachTick_.assign(kNumChunks, 0u);
+  if (reachTick_.size() != kNumSlots) reachTick_.assign(kNumSlots, 0u);
   for (uint32_t s : materialized_.Members()) reachTick_[s] = tick_;
   for (uint32_t s : cpuDirty_.Members()) reachTick_[s] = tick_;
 
@@ -1232,7 +1236,7 @@ void PageTable::Materialize(const rhi::Queue& queue) {
 // queue is full, which is the whole rate limit made explicit at the producer.
 //
 // THE CEILING IS NOW ENFORCED, NOT MERELY ASSERTED (P4-H). kPoolPages is
-// derived as kNumChunks + kPageRetireCeiling, and that derivation is only
+// derived as kNumSlots + kPageRetireCeiling, and that derivation is only
 // sound while the queue really cannot exceed the ceiling - which used to
 // follow from "one producer, capped at kPageFreeProbesPerTick per tick" and a
 // FATAL in RetirePages if the reading was ever wrong. With a second producer
@@ -1274,10 +1278,10 @@ void PageTable::ConsumeOccupancy(const std::vector<uint32_t>& occupancy,
                                  const std::vector<uint8_t>& occStain,
                                  uint32_t tick) {
   if (!paged_) return;
-  if (zeroStreak_.size() != kNumChunks) zeroStreak_.assign(kNumChunks, 0);
-  if (reachTick_.size() != kNumChunks) reachTick_.assign(kNumChunks, 0u);
+  if (zeroStreak_.size() != kNumSlots) zeroStreak_.assign(kNumSlots, 0);
+  if (reachTick_.size() != kNumSlots) reachTick_.assign(kNumSlots, 0u);
   const auto& t = world_->pageTableCpu();
-  const bool haveStainFlags = occStain.size() == kNumChunks;
+  const bool haveStainFlags = occStain.size() == kNumSlots;
   // ---- THE FREE-PATH MODE, ONE BINARY, THREE ARMS (P4-H) ------------------
   //
   // An #if-guarded second form tests only itself, so the pre-P4-H free path
@@ -1333,10 +1337,10 @@ void PageTable::ConsumeOccupancy(const std::vector<uint32_t>& occupancy,
   // time. Deterministic in `tick`, which matters only for reproducible debug
   // output — the page table is not hashed.
   const uint32_t scanStart =
-      (uint32_t)((uint64_t)tick * (uint64_t)kMaxFreeProbesPerTick % kNumChunks);
+      (uint32_t)((uint64_t)tick * (uint64_t)kMaxFreeProbesPerTick % kNumSlots);
   uint32_t eligible = 0;
-  for (uint32_t i = 0; i < kNumChunks; i++) {
-    const uint32_t s = i + scanStart >= kNumChunks ? i + scanStart - kNumChunks
+  for (uint32_t i = 0; i < kNumSlots; i++) {
+    const uint32_t s = i + scanStart >= kNumSlots ? i + scanStart - kNumSlots
                                                    : i + scanStart;
     if (occupancy[s] != 0) { zeroStreak_[s] = 0; continue; }
     if (zeroStreak_[s] < 255) zeroStreak_[s]++;
@@ -1683,7 +1687,7 @@ void PageTable::ConsumeOccupancy(const std::vector<uint32_t>& occupancy,
 // See the PageCensus comment in the header for the priority order and why it is
 // that order.
 //
-// COST: two more walks of kNumChunks (one to find each slot column's top of
+// COST: two more walks of kNumSlots (one to find each slot column's top of
 // matter, one to bill), on top of the walk ConsumeOccupancy was already doing.
 // Measured shape, not cost: ~98k branch-light iterations per tick, no
 // allocation after the first call, no readback and no GPU work. It runs
@@ -1693,9 +1697,9 @@ void PageTable::ConsumeOccupancy(const std::vector<uint32_t>& occupancy,
 void PageTable::RunCensus(const std::vector<uint32_t>& occupancy,
                           const std::vector<uint8_t>& occStain) {
   if (!paged_) return;
-  if (occupancy.size() != kNumChunks) return;
+  if (occupancy.size() != kNumSlots) return;
   const auto& t = world_->pageTableCpu();
-  const bool haveStain = occStain.size() == kNumChunks;
+  const bool haveStain = occStain.size() == kNumSlots;
 
   PageCensus c;
   c.valid = true;
@@ -1755,8 +1759,9 @@ void PageTable::RunCensus(const std::vector<uint32_t>& occupancy,
     colTop_.assign((size_t)kNChunk * kNChunk, kColNone);
   else
     std::fill(colTop_.begin(), colTop_.end(), kColNone);
-  for (uint32_t s = 0; s < kNumChunks; s++) {
+  for (uint32_t s = 0; s < kNumSlots; s++) {
     if (occupancy[s] == 0u) continue;
+    if (!World::IsWindowSlot(s)) continue;   // colTop_ is a WINDOW column grid
     const uint32_t sx = s % kNChunk;
     const uint32_t sz = s / (kNChunk * kNChunk);
     const int32_t wy = world_->SlotToWorldChunk(s).y;
@@ -1765,10 +1770,10 @@ void PageTable::RunCensus(const std::vector<uint32_t>& occupancy,
   }
 
   // Pass B: bill the resident pages.
-  for (uint32_t s = 0; s < kNumChunks; s++) {
+  for (uint32_t s = 0; s < kNumSlots; s++) {
     if ((t[s] & kPtSentinelBit) != 0u) continue;   // sentinel: not a page
     const uint32_t occ = occupancy[s];
-    const uint8_t streak = zeroStreak_.size() == kNumChunks ? zeroStreak_[s] : 0;
+    const uint8_t streak = zeroStreak_.size() == kNumSlots ? zeroStreak_[s] : 0;
     if (cpuDirty_.Has(s)) c.rDirty++;
     else if (materialized_.Has(s)) c.rRing++;
     else if (occ >= kChunkVol) c.rFull++;
@@ -1784,13 +1789,14 @@ void PageTable::RunCensus(const std::vector<uint32_t>& occupancy,
     // is a false positive on the one number this census exists to make true.
     else if (streak < 255) c.rCand++;
     // SATURATED: 247 consecutive empty snapshots and still not freed. The drain
-    // is kPageFreeProbesPerTick per tick against a kNumChunks window, so even
+    // is kPageFreeProbesPerTick per tick against a kNumSlots window, so even
     // the worst post-flight backlog measured here (5,189) clears in ~40 ticks.
     // A page sitting eligible for 247 is not backlog, it is a page the free
     // path cannot reach — which is exactly what the `==` trigger produced and
     // what this bucket exists to catch coming back.
     else c.rOrphan++;
 
+    if (!World::IsWindowSlot(s)) { continue; }  // no column band for a ticket
     const uint32_t sx = s % kNChunk;
     const uint32_t sz = s / (kNChunk * kNChunk);
     const int32_t top = colTop_[sz * kNChunk + sx];
@@ -1894,7 +1900,7 @@ void PrintPageCensus(const PageCensus& c, const char* label) {
 }
 
 void PageTable::ResetStreaks(const std::vector<uint32_t>& slots) {
-  if (zeroStreak_.size() != kNumChunks) return;
+  if (zeroStreak_.size() != kNumSlots) return;
   for (uint32_t s : slots) zeroStreak_[s] = 0;
 }
 
@@ -1914,7 +1920,7 @@ void PageTable::RetirePages(uint32_t tick) {
   DrainRetired(tick);
   // THE PREMISE kPoolPages IS SIZED AGAINST, CHECKED RATHER THAN ASSUMED.
   //
-  // The pool exceeds kNumChunks by exactly kPageRetireCeiling, on the argument
+  // The pool exceeds kNumSlots by exactly kPageRetireCeiling, on the argument
   // that at most kMaxFreeProbesPerTick pages are parked per tick and nothing
   // stays parked longer than kRetireTicks. That argument is a reading of three
   // constants and a call site — the same species of reasoning that produced a

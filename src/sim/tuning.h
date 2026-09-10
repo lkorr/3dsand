@@ -1581,6 +1581,13 @@ struct Tuning {
     // is the live A/B oracle for anything this changed. Above ~1 the boundary
     // over-pressurises and ejects particles off the surface.
     float fluidSettledMass = 1.0f;
+    int fluidSubmergedSolid = 1;  // SUBMERGED settled liquid is a boundary, so
+                                  // particles ride the free surface instead of
+                                  // sinking into water that has no depth
+                                  // profile to push them back out. A buried
+                                  // particle can never settle (its column has
+                                  // no room), so this is what makes settle able
+                                  // to terminate. 0 = the pass-through control
     float fluidSettleEps = 6.0f;  // vox/s: a fluid block whose FASTEST
                                   // particle stays below this for
                                   // settleTicks in a row counts as calm and
@@ -1632,6 +1639,21 @@ struct Tuning {
     float fluidStainRate = 8.0f;  // chances/s that an excited-fluid contact
                                   // stains an adjacent solid cell — the MPM
                                   // counterpart of CA liquid staining
+    int fluidStuckTicks = 96;     // ticks a chunk slot may hold particles
+                                  // before its blocks are force-settled
+                                  // regardless of calm. 0 disables the
+                                  // backstop entirely. Keyed on EXISTENCE, not
+                                  // on refusal: a submerged block is never
+                                  // calm, so it is never picked, so a
+                                  // refusal-triggered age would never fire
+    int fluidForceBlocks = 4;     // forced blocks per tick; bounds the drain
+                                  // rate, and forced picks take a stricter
+                                  // (x,z)-column exclusion because their write
+                                  // set reaches past SETTLE_SPILL
+    int fluidForceReach = 64;     // cells past the spill ceiling a forced walk
+                                  // may climb looking for room. Exhausting it
+                                  // means a sealed column — counted, not
+                                  // silently retried
 
     // ---- water bodies (docs/PLAN_water_master.md; src/sim/waterbody.h) ----
     //
@@ -1745,6 +1767,18 @@ struct Tuning {
     // promises about rule 2 — 2 is deliberately NOT rule-2 clean yet and is
     // there to be looked at, not shipped.
     int windMode = 1;
+    // ---- gas particles (docs/PLAN_gas_particles.md stage 1) ----
+    // THE EDGE. 0 = wall: `gasLeave` never fires and a gas voxel pressed
+    // against the residency boundary spreads along it, which is the top-plane
+    // sheet that used to hold up to 1,024 chunks awake over a big fire. 1 =
+    // sink: it becomes a parcel that keeps rising and drifting outside the
+    // window under the same buoyancy/wind model, bounded by its authored decay
+    // and an outer box, and reconverts to a voxel if it drifts back in.
+    //
+    // At 0 the CPU records NO gas pass (Cond::Gas is false) and the kernel
+    // branch is never reached, so this is an exact identity in the windMode /
+    // waterBodyMode sense rather than merely a cheap path.
+    int gasMode = 1;
     // Ballistic debris and spray: fraction of the gap between a particle's
     // velocity and the local wind that closes per SECOND, at a material's full
     // windResponse of 15. A drag law rather than a push, because drag is
@@ -2870,6 +2904,21 @@ struct Tuning {
     // Set >= WINDOW_HALF_EXTENT_METERS (25.6 m) to disable the handoff
     // entirely and get the old "switch only at window exit" behaviour — which
     // is exactly how to A/B it without a rebuild (F5 reloads it).
+    // ---- the gas crossfade (docs/PLAN_gas_particles.md stage 1b) --------
+    // Where the voxel representation of gas starts handing over to the coarse
+    // one, as a FRACTION of the residency window's half-extent measured from
+    // the window CENTRE in the max norm. 0.5 = the fade runs over the outer
+    // half, from 12.8 m to the face at 25.6 m.
+    //
+    // The window CENTRE and not the camera, which is the whole trick: the
+    // weight is then exactly 1 at every one of the six faces regardless of
+    // where the camera is, so the seam the fade exists to remove disappears on
+    // all of them at once rather than on the one the camera happens to face.
+    //
+    // 1.0 disables the crossfade (voxels at full opacity right up to the face,
+    // coarse gas starting at the face) and gets stage 1's hard edge back --
+    // which is how to A/B it without a rebuild, since F5 reloads this.
+    float gasBlendStart = 0.5f;
     float lodHandoffDist = 24.0f;
     // ---- frame pacing and internal resolution (CPU-only: no .def row, no
     // TUNE_* constant — nothing here reaches a shader) ----------------------

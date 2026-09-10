@@ -79,8 +79,24 @@ svlock_acquire() {
       # Refresh only while the pid file is still ours, so a stolen lock is
       # never kept alive by the loser. Written to a temp name and renamed so
       # a reader never sees the truncated file `>` leaves mid-write.
-      ( while true; do
-          sleep 60
+      #
+      # THE SLEEP IS A BACKGROUND CHILD AND THE LOOP `wait`S ON IT. Not for
+      # style: svlock_release kills this subshell and then reaps it, and a
+      # bash blocked in a foreground `sleep 60` does not act on the TERM until
+      # the sleep returns — so every release used to cost the REMAINDER OF
+      # THE CURRENT MINUTE (measured 2026-09-09: 28 s, 44 s, 48 s and 50 s on
+      # four consecutive run.sh invocations, and `run.sh true` took 60 s).
+      # Twice per GPU lock (the legacy lock has its own heartbeat), once per
+      # compile lock: every build.sh and run.sh in every session paid it.
+      # `wait` IS interruptible by a trap, so the TERM handler runs at once,
+      # kills the sleep and exits, and the reaper's wait returns in
+      # milliseconds.
+      ( hb_sleep=
+        trap '[ -n "$hb_sleep" ] && kill "$hb_sleep" 2>/dev/null; exit 0' TERM INT
+        while true; do
+          sleep 60 & hb_sleep=$!
+          wait "$hb_sleep" 2>/dev/null || true
+          hb_sleep=
           [ "$(cat "$dir/pid" 2>/dev/null)" = "$$" ] || exit 0
           date +%s > "$dir/ts.new" 2>/dev/null || exit 0
           mv -f "$dir/ts.new" "$dir/ts" 2>/dev/null || exit 0

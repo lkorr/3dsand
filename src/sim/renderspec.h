@@ -37,4 +37,23 @@ struct RenderSpec {
 
 const RenderSpec& LastRenderSpec();
 
+// ---- the gas render flag (docs/PLAN_gas_particles.md stage 1b) -------------
+// RenderParams bit 3: "gas may be present in this frame". NOT a SPEC_ constant
+// -- it flips whenever a fire starts or goes out, far too often to justify a
+// pipeline variant -- but it lives here for this header's reason and no other:
+// Simulation::EncodeTick owns the value (it is the same latch that decides
+// whether the gas passes are recorded at all) and WriteRenderParams owns the
+// upload, and this dependency-free header is the only seam between them that
+// does not drag the avatar, the mob system and the GPU context into
+// simulation.cpp.
+//
+// What the bit buys the shader: raymarch.wgsl's crossfade -- the per-cell fade
+// in trace(), the in-band coarse sampling for rays that HIT, and the fold in
+// fs() -- all test it, so a world with no smoke pays nothing for any of it.
+// It is also a correctness gate and not only a budget: gasOuter is cleared
+// only on ticks the sim records the gas rows, so with the flag off the box is
+// stale and must not be sampled.
+void SetGasRenderActive(bool active);
+bool GasRenderActive();
+
 }  // namespace sandvox

@@ -327,6 +327,9 @@ SPEC = [
     ("render", "farShadowReach", "TUNE_FAR_SHADOW_REACH", "f", 60.0),
     ("render", "farBlockerHitLevel", "TUNE_FAR_BLOCKER_HIT_LEVEL", "i", 0),
 
+    # gas voxel -> parcel crossfade (PLAN_gas_particles.md stage 1b)
+    ("render", "gasBlendStart", "TUNE_GAS_BLEND_START", "f", 0.5),
+
     # in-window LOD handoff (PLAN_surface_flight_perf.md A1)
     ("render", "lodHandoffDist", "TUNE_LOD_HANDOFF_DIST", "f", 24.0),
     ("render", "shadowMaxDist", "TUNE_SHADOW_MAX_DIST", "f", 999.0),
@@ -402,10 +405,14 @@ SPEC = [
     ("sim", "fluidExcitePerch", "TUNE_FLUID_EXCITE_PERCH", "i", 0),
     ("sim", "fluidExciteStep", "TUNE_FLUID_EXCITE_STEP", "i", 2),
     ("sim", "fluidSettledMass", "TUNE_FLUID_SETTLED_MASS", "f", 1.0),
+    ("sim", "fluidSubmergedSolid", "TUNE_FLUID_SUBMERGED_SOLID", "i", 1),
     ("sim", "fluidSettleEps", "TUNE_FLUID_SETTLE_EPS", "f", 6.0),
     ("sim", "fluidWakeSpeed", "TUNE_FLUID_WAKE_SPEED", "f", 24.0),
     ("sim", "fluidSettleTicks", "TUNE_FLUID_SETTLE_TICKS", "i", 24),
     ("sim", "fluidStainRate", "TUNE_FLUID_STAIN_RATE", "f", 8.0),
+    ("sim", "fluidStuckTicks", "TUNE_FLUID_STUCK_TICKS", "i", 96),
+    ("sim", "fluidForceBlocks", "TUNE_FLUID_FORCE_BLOCKS", "i", 4),
+    ("sim", "fluidForceReach", "TUNE_FLUID_FORCE_REACH", "i", 64),
 
     # WATER BODIES (docs/PLAN_water_master.md, M1)
     ("sim", "waterBodyMode", "TUNE_WATER_BODY_MODE", "i", 0),
@@ -423,6 +430,9 @@ SPEC = [
     ("sim", "drainCd", "TUNE_DRAIN_CD", "f", 0.6),
     ("sim", "drainGravity", "TUNE_DRAIN_GRAVITY", "f", 900.0),
     ("sim", "windMode", "TUNE_WIND_MODE", "i", 1),
+
+    # gas particles (docs/PLAN_gas_particles.md)
+    ("sim", "gasMode", "TUNE_GAS_MODE", "i", 1),
     ("sim", "windDrag", "TUNE_WIND_DRAG", "f", 3.0),
     ("sim", "windFluidGain", "TUNE_WIND_FLUID_GAIN", "f", 0.35),
     ("sim", "windFluidMass", "TUNE_WIND_FLUID_MASS", "f", 0.5),

@@ -192,6 +192,11 @@ export function defaultBiome() {
       skin: 'grass',                 // the topmost ground cell
       skinDepth: 1,                  // cells of skin (desert sand is 4)
       subsoil: 'dirt',
+      // worldmap.h kB_FirmCover: the SOLID a POWDER cover (a sand cap, or a
+      // powder skin like sand or snow) becomes where the ground is too steep
+      // to hold loose matter. '' = fall back to the subsoil if that is solid,
+      // else stone.
+      firmSkin: '',
       patch: {threshold: 0, cellLog2: 5},   // shared patch mask for the plant rows
       // The three kBF_* flags PackBiomeTable packs (src/sim/worldmap.cpp);
       // defaults match the C++ reader's (biomes.cpp LoadBiomeSet).
@@ -277,6 +282,7 @@ export function normalizeBiome(src) {
   b.cover.groundFlora = b.cover.groundFlora !== false;
   b.cover.cacti = !!b.cover.cacti;
   b.cover.sandCap = !!b.cover.sandCap;
+  b.cover.firmSkin = String(b.cover.firmSkin || '');
   b.cover.cactusChance = Math.max(0, b.cover.cactusChance | 0);
   b.cover.saguaroFraction = Math.min(100, Math.max(0, b.cover.saguaroFraction | 0));
   b.cover.plants = (b.cover.plants || []).map(p => ({

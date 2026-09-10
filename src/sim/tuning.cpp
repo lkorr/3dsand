@@ -250,6 +250,10 @@ bool SetSimField(Tuning& t, const std::string& name, float value) {
     {"fluidExcitePerch", &Tuning::Sim::fluidExcitePerch},
     {"fluidExciteStep", &Tuning::Sim::fluidExciteStep},
     {"fluidSettleTicks", &Tuning::Sim::fluidSettleTicks},
+    {"fluidSubmergedSolid", &Tuning::Sim::fluidSubmergedSolid},
+    {"fluidStuckTicks", &Tuning::Sim::fluidStuckTicks},
+    {"fluidForceBlocks", &Tuning::Sim::fluidForceBlocks},
+    {"fluidForceReach", &Tuning::Sim::fluidForceReach},
     {"fluidSplashScaleIdx", &Tuning::Sim::fluidSplashScaleIdx},
     {"fluidFoamScaleIdx", &Tuning::Sim::fluidFoamScaleIdx},
     {"waterBodyMode", &Tuning::Sim::waterBodyMode},
@@ -263,6 +267,7 @@ bool SetSimField(Tuning& t, const std::string& name, float value) {
     {"drainMaxEighthsPerTick", &Tuning::Sim::drainMaxEighthsPerTick},
     {"drainExciteRadius", &Tuning::Sim::drainExciteRadius},
     {"windMode", &Tuning::Sim::windMode},
+    {"gasMode", &Tuning::Sim::gasMode},
     {"currentMode", &Tuning::Sim::currentMode},
     {"currentVortexRadius", &Tuning::Sim::currentVortexRadius},
     {"currentStreamMinSlope", &Tuning::Sim::currentStreamMinSlope},
@@ -1207,9 +1212,13 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadI(*g, "fluidExcitePerch", s.fluidExcitePerch, out, at);
     ReadI(*g, "fluidExciteStep", s.fluidExciteStep, out, at);
     ReadF(*g, "fluidSettledMass", s.fluidSettledMass, out, at);
+    ReadI(*g, "fluidSubmergedSolid", s.fluidSubmergedSolid, out, at);
     ReadF(*g, "fluidSettleEps", s.fluidSettleEps, out, at);
     ReadF(*g, "fluidWakeSpeed", s.fluidWakeSpeed, out, at);
     ReadI(*g, "fluidSettleTicks", s.fluidSettleTicks, out, at);
+    ReadI(*g, "fluidStuckTicks", s.fluidStuckTicks, out, at);
+    ReadI(*g, "fluidForceBlocks", s.fluidForceBlocks, out, at);
+    ReadI(*g, "fluidForceReach", s.fluidForceReach, out, at);
     ReadF(*g, "fluidStainRate", s.fluidStainRate, out, at);
     ReadI(*g, "waterBodyMode", s.waterBodyMode, out, at);
     ReadI(*g, "waterBodyMinVolume", s.waterBodyMinVolume, out, at);
@@ -1224,6 +1233,7 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadF(*g, "drainCd", s.drainCd, out, at);
     ReadF(*g, "drainGravity", s.drainGravity, out, at);
     ReadI(*g, "windMode", s.windMode, out, at);
+    ReadI(*g, "gasMode", s.gasMode, out, at);
     ReadF(*g, "windDrag", s.windDrag, out, at);
     ReadF(*g, "windFluidGain", s.windFluidGain, out, at);
     ReadF(*g, "windFluidMass", s.windFluidMass, out, at);
@@ -1438,6 +1448,10 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     // FLUID_SETTLED_Q8); past ~2 the static boundary out-pressures the fluid
     // and fires particles off a still pool.
     clampWarnF(s.fluidSettledMass, 0.0f, 2.0f, "fluidSettledMass");
+    if (s.fluidSubmergedSolid < 0 || s.fluidSubmergedSolid > 1) {
+      out.warnings.push_back("sim.fluidSubmergedSolid is 0 or 1; clamped");
+      s.fluidSubmergedSolid = s.fluidSubmergedSolid < 0 ? 0 : 1;
+    }
     clampWarnF(s.fluidSettleEps, 0.05f, 20.0f, "fluidSettleEps");
     clampWarnF(s.fluidWakeSpeed, 0.1f, 50.0f, "fluidWakeSpeed");
     if (s.fluidSettleTicks < 8 || s.fluidSettleTicks > 600) {
@@ -1445,6 +1459,24 @@ bool LoadTuning(const std::string& path, Tuning& out) {
       s.fluidSettleTicks = s.fluidSettleTicks < 8 ? 8 : 600;
     }
     clampWarnF(s.fluidStainRate, 0.0f, 30.0f, "fluidStainRate");
+    // The force-settle backstop. 0 is a legal value for stuckTicks — it is the
+    // off switch — so the floor is 0, not the 8 fluidSettleTicks needs. The
+    // ceiling on reach is what bounds the forced walk's write set, and the
+    // block budget is capped at kFluidSettleMax because the forced picks share
+    // settleScan's list with the calm ones.
+    if (s.fluidStuckTicks < 0 || s.fluidStuckTicks > 6000) {
+      out.warnings.push_back("sim.fluidStuckTicks out of 0..6000; clamped");
+      s.fluidStuckTicks = s.fluidStuckTicks < 0 ? 0 : 6000;
+    }
+    if (s.fluidForceBlocks < 0 || s.fluidForceBlocks > (int)kFluidSettleMax) {
+      out.warnings.push_back("sim.fluidForceBlocks out of 0..kFluidSettleMax; clamped");
+      s.fluidForceBlocks =
+          s.fluidForceBlocks < 0 ? 0 : (int)kFluidSettleMax;
+    }
+    if (s.fluidForceReach < 0 || s.fluidForceReach > 512) {
+      out.warnings.push_back("sim.fluidForceReach out of 0..512; clamped");
+      s.fluidForceReach = s.fluidForceReach < 0 ? 0 : 512;
+    }
     // ---- the discharge law (component 6) -------------------------------
     // The rate cap is the rule-2 bound on the jet AND the size of the spawn-op
     // block the CPU reserves, so it is clamped to kWaterDrainOpsPerBody here
@@ -1474,6 +1506,13 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     // Wind coupling. The gate first: an unknown mode must not fall through to
     // "some wind", because the whole hash argument for shipping this is that
     // mode 0 means literally no kernel reads the field.
+    // The gas edge is a two-state gate; anything else is a typo, and silently
+    // treating a 2 as "on" would hide the day someone means to add a mode.
+    if (s.gasMode < (int)kGasModeWall || s.gasMode > (int)kGasModeSink) {
+      out.warnings.push_back("sim.gasMode out of 0..1; clamped");
+      s.gasMode = s.gasMode < (int)kGasModeWall ? (int)kGasModeWall
+                                                : (int)kGasModeSink;
+    }
     if (s.windMode < (int)kWindModeOff || s.windMode > (int)kWindModeEntrain) {
       out.warnings.push_back("sim.windMode out of 0..2; clamped");
       s.windMode = s.windMode < (int)kWindModeOff ? (int)kWindModeOff
@@ -2132,6 +2171,7 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadI(*g, "farSteps", r.farSteps, out, at);
     ReadF(*g, "farShadowReach", r.farShadowReach, out, at);
     ReadI(*g, "farBlockerHitLevel", r.farBlockerHitLevel, out, at);
+    ReadF(*g, "gasBlendStart", r.gasBlendStart, out, at);
     ReadF(*g, "lodHandoffDist", r.lodHandoffDist, out, at);
     ReadF(*g, "renderScale", r.renderScale, out, at);
     ReadI(*g, "taa", r.taa, out, at);
@@ -2282,6 +2322,11 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     // absurdly near but is a knob setting rather than a broken frame. There is
     // deliberately no ceiling — >= 25.6 m disables the handoff, which is the
     // documented way to A/B it.
+    // A fraction of the window half-extent. Below 0 the band would start
+    // outside the box on the far side; above 1 it would never reach 1 at the
+    // face and the seam would come back with a step in it.
+    if (r.gasBlendStart < 0.0f) { r.gasBlendStart = 0.0f; }
+    if (r.gasBlendStart > 1.0f) { r.gasBlendStart = 1.0f; }
     if (r.lodHandoffDist < 2.0f) { r.lodHandoffDist = 2.0f; }
     // A scale above 1 would be supersampling the most expensive shader in the
     // engine; below a quarter the frame is 400x225 and the UI text on top is

@@ -569,6 +569,8 @@ struct VkrDevice final : DeviceImpl {
     return true;
   }
 
+  int PendingMapCount() override { return (int)st->maps.size(); }
+
   void WaitIdle() override {
     // §4.9: a drain must not strand deferred uploads. If FillSlots (or any
     // QueueWrite) enqueued writes and nothing recorded a command buffer since,
@@ -776,7 +778,7 @@ void RecordTableVulkan(const CommandEncoder& enc, pass::Table which, const Table
 
   vk::Bindings bd{};
   for (int i = 0; i < (int)pass::Buf::kCount; i++) bd.buffers[i] = NB(tb.buffers[i]);
-  for (int i = 0; i < 64; i++) {
+  for (int i = 0; i < (int)pass::Pipe::kPipeCount; i++) {
     bd.pipelines[i] =
         tb.pipelines[i] ? static_cast<VkrComputePipeline*>(tb.pipelines[i].Get())->p
                         : VK_NULL_HANDLE;
@@ -792,6 +794,7 @@ void RecordTableVulkan(const CommandEncoder& enc, pass::Table which, const Table
   bd.slimFarLayout = layout(tb.slimFarLayout);
   bd.slimFluidLayout = layout(tb.slimFluidLayout);
   bd.slimFluidSeamLayout = layout(tb.slimFluidSeamLayout);
+  bd.slimGasLayout = layout(tb.slimGasLayout);
   bd.shadowLayout = layout(tb.shadowLayout);
   bd.simSet = set(tb.simSet);
   bd.slimSet = set(tb.slimSet);
@@ -799,6 +802,7 @@ void RecordTableVulkan(const CommandEncoder& enc, pass::Table which, const Table
   bd.farSet = set(tb.farSet);
   bd.fluidSet = set(tb.fluidSet);
   bd.fluidSeamSet = set(tb.fluidSeamSet);
+  bd.gasSet = set(tb.gasSet);
   bd.shadowSet = set(tb.shadowSet);
 
   e->rec->SetBindings(bd);
@@ -829,6 +833,7 @@ void RecordTableVulkan(const CommandEncoder& enc, pass::Table which, const Table
   cxv.waterDrainBodies = cx.waterDrainBodies;
   cxv.waterSweepSlot = cx.waterSweepSlot;
   cxv.opennessChunks = cx.opennessChunks;
+  cxv.gasActive = cx.gasActive;
   cxv.glowChunks = cx.glowChunks;
   cxv.hashEnable = cx.hashEnable;
   cxv.particlesActive = cx.particlesActive;

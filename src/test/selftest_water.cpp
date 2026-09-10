@@ -1004,7 +1004,7 @@ Status GateWaterBody(Ctx& c, std::string& detail) {
 
     const VoxelTruth h1 = SweepBasin(c, lakeGeo, lakeDesc, matId, boxLo, boxHi);
     const LedgerView lv = ReadLedger(c);
-    uint32_t fa[32] = {};
+    uint32_t fa[kFluidArgsWords] = {};   // ReadFluidArgsSync fills the whole map
     ReadFluidArgsSync(c.ctx, world, fa);
     // ONE EIGHTH PER PARTICLE (every seam-born particle carries fullness 1),
     // minus the dead tail of this tick's reserved discharge block.

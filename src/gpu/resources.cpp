@@ -110,6 +110,17 @@ std::string ShaderConstantPrelude() {
   o << "const NCHUNK : u32 = " << kNChunk << "u;\n";
   o << "const NUM_CHUNKS : u32 = " << kNumChunks << "u;\n";
   o << "const CHUNK_VOL : u32 = " << kChunkVol << "u;\n";
+  // TICKET SLOTS (world.h kTicketMax, docs/PLAN_chunk_tickets.md §2.1). The
+  // split every shader below depends on:
+  //   NUM_CHUNKS   how many chunks the WINDOW holds. The toroidal mask wraps at
+  //                it, chunkInWindow measures against it, and the raymarch clips
+  //                to it. Purely geometric.
+  //   NUM_SLOTS    how many per-slot RECORDS exist. Buffer extents, dispatch
+  //                bounds over the slot space, and the plane strides inside
+  //                multi-plane per-slot buffers are all this.
+  // At kTicketMax = 0 they are equal, which is what makes P0 bit-identical.
+  o << "const TICKET_SLOTS : u32 = " << kTicketSlots << "u;\n";
+  o << "const NUM_SLOTS : u32 = " << kNumSlots << "u;\n";
   // Toroidal addressing masks/shifts (DESIGN.md §3) — sizes are powers of two,
   // so world->slot mapping is a bitmask even for negative world coords.
   uint32_t chunkShift = 0;
@@ -127,7 +138,9 @@ std::string ShaderConstantPrelude() {
   o << "const SUBOCC_DIM : u32 = " << kSubOccDim << "u;\n";
   o << "const SUBOCC_WORDS : u32 = " << kSubOccWords << "u;\n";
   o << "const SUBOCC_STRIDE : u32 = " << kSubOccStride << "u;\n";
-  o << "const SUBOCC_BASE : u32 = " << kNumChunks << "u;\n";
+  // NUM_SLOTS, not NUM_CHUNKS: this is the word where the COUNT half of the
+  // occupancy buffer ends, and that half is one word per SLOT.
+  o << "const SUBOCC_BASE : u32 = " << kNumSlots << "u;\n";
   // Openness grid (world.h kOpenFaces block). Its own buffer, so what the
   // shaders need is the per-chunk WORD stride and the face count; the block
   // count is SUBOCC_DIM^3, already above.
@@ -201,6 +214,12 @@ std::string ShaderConstantPrelude() {
   // a MATF_TINTED material's state nibble indexes (world.h). paletteColor()
   // reads materials[TINT_PALETTE_BASE + tintBase + state].
   o << "const TINT_PALETTE_BASE : u32 = " << kTintPaletteBaseGpu << "u;\n";
+  // Far slot palette: a fourth reserved run mapping a far cascade cell's 7-bit
+  // FAR SLOT back to the material id it paints (world.h). raymarch.wgsl's
+  // farSlotMat() reads materials[FAR_PALETTE_BASE + slot].flags; the forward
+  // direction (material -> slot) rides in every real material's own `flags`
+  // word at MATF_FAR_SLOT_SHIFT, so worldgen needs no table lookup at all.
+  o << "const FAR_PALETTE_BASE : u32 = " << kFarPaletteBaseGpu << "u;\n";
   // Static micro-detail (render-only, DESIGN.md §9): the size of the brick pool
   // the raymarcher bounds-checks its nested DDA fetches against.
   o << "const MICRO_POOL_WORDS : u32 = " << kMicroPoolWordsWorld << "u;\n";

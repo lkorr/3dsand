@@ -8,6 +8,7 @@
 
 #include "phys/lattice.h"
 #include "phys/marching_cubes.h"
+#include "measure/perfscope.h"
 #include "sim/bytestream.h"
 #include "sim/reactcpu.h"
 #include "sim/rng.h"
@@ -40,6 +41,23 @@ constexpr int kMaxRegionCells = 80;      // <= 5 chunks per axis (bounded fill)
 constexpr uint32_t kMaxIslandVoxels = 32000;  // DESIGN.md §7 abort threshold
 constexpr uint32_t kTerrainEvictTicks = 300;
 constexpr uint32_t kTerrainRefreshTicks = 8;
+// Real marching-cubes + Jolt rebuilds per tick (ManageTerrain). Six covers a
+// chunk-boundary crossing's new face of anchor chunks in two ticks; the
+// unbudgeted version did 64 in one and that was the walking hitch.
+constexpr uint32_t kTerrainBuildsPerTick = 6;
+// The A/B arm for that number, in ONE binary (CLAUDE.md: a differential
+// measured across two builds measures the builds too). Unset = the constant;
+// SANDVOX_TERRAIN_BUILDS_PER_TICK=100000 is the pre-budget behaviour.
+static uint32_t TerrainBuildsPerTick() {
+  static const uint32_t v = [] {
+    if (const char* e = std::getenv("SANDVOX_TERRAIN_BUILDS_PER_TICK")) {
+      const long n = std::strtol(e, nullptr, 10);
+      if (n >= 1) return (uint32_t)n;
+    }
+    return kTerrainBuildsPerTick;
+  }();
+  return v;
+}
 // Support-loss events: a chunk re-flags constantly while sand pours or fire
 // burns, so rescans are rate-limited per chunk. The final flags after activity
 // stops always land (pendingSupport_ is never dropped), so the cooldown only
@@ -504,6 +522,7 @@ bool DebrisSystem::AddDestructionEvent(uint32_t tick, IVec3 lo, IVec3 hi,
 
 void DebrisSystem::QueueSupportEvents(const WorldSnapshot& snap) {
   if (!snap.valid || snap.tick == lastSupportSnapTick_) return;  // one pass per snapshot
+  sandvox::PerfSpan span(sandvox::PerfScope::Debris, sandvox::PerfScope::GameLogic);
   lastSupportSnapTick_ = snap.tick;
   int m = (int)kNChunk - 1;
   for (uint32_t ci = 0; ci < (uint32_t)snap.supportFlags.size(); ci++) {
@@ -1103,6 +1122,9 @@ void DebrisSystem::RunIslandDetection(const Event& e, uint32_t tick, World& worl
 
 void DebrisSystem::PreTick(uint32_t tick, World& world, std::vector<CellOp>& cellOps,
                            std::vector<ParticleSpawn>& spawns) {
+  // Billed as `debris` on the Performance tab, debited from the game-logic
+  // span this runs inside; ManageTerrain at the bottom debits THIS one.
+  sandvox::PerfSpan span(sandvox::PerfScope::Debris, sandvox::PerfScope::GameLogic);
   // Cheap and idempotent: an unchanged art palette early-outs on a stamp
   // compare. Here rather than at a load-time call site because the palette is
   // rebuilt by the mob loader, the item loader and every R hot-reload, and the
@@ -2994,12 +3016,26 @@ bool DebrisSystem::BodyLatticeOf(uint64_t handle, std::vector<PrefabVoxel>& out,
 }
 
 void DebrisSystem::ManageTerrain(uint32_t tick, World& world) {
+  // Its own row on the Performance tab, debited from the game-logic span it
+  // runs inside. This function was the "Game Systems spiked to 50-100 ms while
+  // walking" report: it rebuilt every stale patch it wanted in ONE tick, and a
+  // chunk-boundary crossing (or a mob acquiring a target, which widens its
+  // anchor to navRadius) stales a whole face of them at once — up to
+  // World::kFetchPerTick = 64 landing on the same tick, each one a marching-
+  // cubes pass, a Jolt mesh tree build and a broadphase add/remove.
+  sandvox::PerfSpan span(sandvox::PerfScope::TerrainMesh,
+                         sandvox::PerfScope::Debris);
   const WorldSnapshot& snap = world.Snap();
   lastTerrainTick_ = tick;
 
-  // which chunks need collision right now? (around every dynamic body and
-  // this tick's registered mob-limb anchors)
-  std::vector<IVec3> needed;
+  // Which chunks need collision right now? Around every dynamic body and this
+  // tick's registered mob-limb anchors. Each entry carries the squared distance
+  // from the chunk's centre to the anchor that asked for it: that is the BUILD
+  // ORDER under the budget below, so the ground under a body is always the
+  // first patch made and the far edge of a navigating mob's 30-voxel horizon
+  // (which only the A* planner reads, through the fetch) is the last.
+  std::vector<std::pair<IVec3, float>>& needed = terrainNeed_;
+  needed.clear();
   auto needAround = [&](Vec3 pos, float radius) {
     float r = radius + 6.0f;
     int lo[3] = {ifloor(pos.x - r) >> 4, ifloor(pos.y - r) >> 4,
@@ -3008,20 +3044,45 @@ void DebrisSystem::ManageTerrain(uint32_t tick, World& world) {
                  ifloor(pos.z + r) >> 4};
     for (int cz = lo[2]; cz <= hi[2]; cz++)
       for (int cy = lo[1]; cy <= hi[1]; cy++)
-        for (int cx = lo[0]; cx <= hi[0]; cx++)
-          if (world.ChunkInWindow({cx, cy, cz})) needed.push_back({cx, cy, cz});
+        for (int cx = lo[0]; cx <= hi[0]; cx++) {
+          if (!world.ChunkInWindow({cx, cy, cz})) continue;
+          const float dx = (float)(cx * (int)kChunk + (int)kChunk / 2) - pos.x;
+          const float dy = (float)(cy * (int)kChunk + (int)kChunk / 2) - pos.y;
+          const float dz = (float)(cz * (int)kChunk + (int)kChunk / 2) - pos.z;
+          needed.push_back({{cx, cy, cz}, dx * dx + dy * dy + dz * dz});
+        }
   };
   for (const Body& b : bodies_) needAround(b.xf.pos, b.radiusVoxels);
   for (const auto& [pos, r] : extraAnchors_) needAround(pos, r);
   extraAnchors_.clear();
-  auto keyLess = [](IVec3 a, IVec3 b) {
-    return World::PackChunkKey(a) < World::PackChunkKey(b);
-  };
-  auto keyEq = [](IVec3 a, IVec3 b) { return a.x == b.x && a.y == b.y && a.z == b.z; };
-  std::sort(needed.begin(), needed.end(), keyLess);
-  needed.erase(std::unique(needed.begin(), needed.end(), keyEq), needed.end());
+  // Dedupe by chunk, keeping the NEAREST distance any anchor gave it, then
+  // order nearest-first. Sorted by (key, d2) so unique's survivor is the
+  // minimum; stable so equal distances keep a deterministic order (this runs
+  // under the selftest, whose debris gates compare against a baseline).
+  std::sort(needed.begin(), needed.end(),
+            [](const std::pair<IVec3, float>& a,
+               const std::pair<IVec3, float>& b) {
+              const uint64_t ka = World::PackChunkKey(a.first);
+              const uint64_t kb = World::PackChunkKey(b.first);
+              return ka != kb ? ka < kb : a.second < b.second;
+            });
+  needed.erase(std::unique(needed.begin(), needed.end(),
+                           [](const std::pair<IVec3, float>& a,
+                              const std::pair<IVec3, float>& b) {
+                             return a.first.x == b.first.x &&
+                                    a.first.y == b.first.y &&
+                                    a.first.z == b.first.z;
+                           }),
+               needed.end());
+  std::stable_sort(needed.begin(), needed.end(),
+                   [](const std::pair<IVec3, float>& a,
+                      const std::pair<IVec3, float>& b) {
+                     return a.second < b.second;
+                   });
 
-  for (IVec3 wc : needed) {
+  uint32_t builds = 0;
+  for (const auto& need : needed) {
+    const IVec3 wc = need.first;
     TerrainEntry& t = terrain_[World::PackChunkKey(wc)];
     t.wc = wc;
     t.lastNeeded = tick;
@@ -3041,6 +3102,19 @@ void DebrisSystem::ManageTerrain(uint32_t tick, World& world) {
     if (t.builtVersion >= cc->version && t.handle != 0) continue;
     if (t.builtVersion >= cc->version && t.handle == 0 && t.builtVersion != 0)
       continue;  // built empty at this version
+
+    // ---- THE BUDGET ------------------------------------------------------
+    // A stale patch that does not fit this tick stays stale (builtVersion
+    // behind the cache) and is the first thing the next tick's sweep finds,
+    // nearest-first. A COUNT, not a time budget, on purpose: the debris gates
+    // run this under the selftest and a body that lands on a patch one tick
+    // later on a slower machine would settle somewhere else. What the count
+    // limits is REAL rebuilds — the unchanged-surface early-out below is a
+    // hash compare and costs nothing against it.
+    if (builds >= TerrainBuildsPerTick()) {
+      settle_.terrainDeferred++;
+      continue;
+    }
 
     // (re)build the marching-cubes patch. Solids AND powders carry weight;
     // liquids don't (debris sinks). Missing neighbor chunks sample as empty —
@@ -3089,29 +3163,35 @@ void DebrisSystem::ManageTerrain(uint32_t tick, World& world) {
                   McOccSet(occ, x, y, z);
               }
         }
+
+    // ---- IDENTICAL COLLISION SURFACE => NO MESH, NO JOLT, NO WAKE ---------
+    // The mesh is a pure function of (origin, occ), so the occupancy box IS the
+    // surface's identity, and it is known BEFORE the polygonizer runs. The old
+    // check hashed the mesh bytes AFTER building them, which caught the "liquid
+    // flowed, blood dried, gas moved" case (do NOT wake sleeping bodies) but
+    // still paid the marching cubes for it — and every chunk with a dirty flag
+    // is re-fetched on an 8-tick cadence whether or not its solids moved, so
+    // that was most of the rebuilds under a settling world. Hashing 183 words
+    // instead of ~50 KB of mesh is the smaller half of the win.
+    uint64_t h = 1469598103934665603ull;  // FNV-1a over the occupancy words
+    for (uint32_t i = 0; i < kMcOccWords; i++)
+      h = (h ^ occ[i]) * 1099511628211ull;
+    if (t.builtVersion != 0 && h == t.occHash) {
+      t.builtVersion = cc->version;
+      settle_.terrainSame++;
+      continue;
+    }
+    builds++;
+    settle_.terrainBuilds++;
+
     std::vector<float> verts;
     std::vector<uint32_t> indices;
     PolygonizeChunk(origin, occ, verts, indices);
 
-    // identical collision surface (liquids flowed, blood dried, gases moved):
-    // keep the existing mesh and — critically — do NOT wake sleeping bodies.
-    // Without this, a drying pool re-wakes every settled body nearby forever.
-    uint64_t h = 1469598103934665603ull;  // FNV-1a over the mesh bytes
-    auto mix = [&h](const void* p, size_t n) {
-      const uint8_t* b = (const uint8_t*)p;
-      for (size_t i = 0; i < n; i++) h = (h ^ b[i]) * 1099511628211ull;
-    };
-    mix(verts.data(), verts.size() * sizeof(float));
-    mix(indices.data(), indices.size() * sizeof(uint32_t));
-    if (t.builtVersion != 0 && h == t.meshHash) {
-      t.builtVersion = cc->version;
-      continue;
-    }
-
     if (t.handle) phys_->RemoveBody(t.handle);
     t.handle = indices.empty() ? 0 : phys_->CreateTerrainMesh(verts, indices);
     t.builtVersion = cc->version;
-    t.meshHash = h;
+    t.occHash = h;
     // ground under sleeping debris may have moved: let them re-settle
     settle_.terrainWakes++;
     settle_.lastWakeTick = tick;

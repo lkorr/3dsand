@@ -104,6 +104,10 @@ void DrainFullRefill(GpuContext& ctx, World& world, Simulation& sim,
 // flag: the shadow half is a shading difference no assertion covers.
 static bool CheckFarBlockerFlag(GpuContext& ctx, World& world) {
   constexpr uint32_t kBlockerBit = 0x80u;
+  // The low seven bits are a far PALETTE SLOT, not a material id
+  // (common.wgsl FAR_PAL_MASK). Both claims below only ask whether the
+  // cell HAS a material, and slot 0 is air in both directions, so this
+  // gate never needs the reverse table.
   constexpr uint32_t kMatMask = 0x7Fu;
   const int shift1 = (int)(1 + kFarShiftBase);
   int columns = 0, recovered = 0, disordered = 0;
@@ -203,6 +207,39 @@ bool fogOk = false;
           std::abs(prevR - wantFull) < 1e-3f;
   std::printf("far fog radius: %s (cold %.1f m -> filled %.1f m, monotone=%d)\n",
               fogOk ? "PASS" : "FAIL", coldR, prevR, monotone ? 1 : 0);
+
+  // THE VALID BOX (farfield.h FaceWord). Step the player kHyst level-1 chunks
+  // in +x so level 1's origin steps once and ONE plane is queued on its +x
+  // face. The face word must name exactly that face from the step until the
+  // plane's LAST entry is dispatched, and read zero after — released early it
+  // is the stale slab the renderer drew as the terrain behind the player;
+  // never released it is a permanent hole in level 1's +x edge. The drain
+  // runs at the play cap (16 ticks for a 1,024-entry plane), which is what
+  // makes the window in which the word matters real.
+  {
+    IVec3 pc{108 >> 4, 122 >> 4, 108 >> 4};
+    pc.x += 2 << (1 + kFarShiftBase);   // kHyst level-1 chunks, in fine chunks
+    far.Update(pc);
+    const uint32_t wantFace = 1u << 4;  // nibble 1 = +x
+    bool held = far.FaceWord(0) == wantFace;
+    uint32_t ticks = 0;
+    while ((n = far.PrepareTick(ctx.queue)) > 0) {
+      TickParams tp{0, kDefaultSeed, 0, 0};
+      tp.farCount = n;
+      ctx.queue.WriteBuffer(world.tickUBO, 0, &tp, sizeof(tp));
+      rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
+      sim.EncodeFarFill(enc, n);
+      ctx.queue.Submit(enc.Finish());
+      ticks++;
+      const uint32_t w = far.FaceWord(0);
+      if (far.PendingFills() > 0 ? w != wantFace : w != 0) held = false;
+    }
+    ctx.WaitIdle();
+    const bool faceOk = held && ticks > 1 && far.FaceWord(0) == 0;
+    std::printf("far valid box: %s (+x plane word 0x%x held over %u ticks, final 0x%x)\n",
+                faceOk ? "PASS" : "FAIL", wantFace, ticks, far.FaceWord(0));
+    fogOk = fogOk && faceOk;
+  }
 }
 
   // Verdict: the flag the moved body already computed, plus the blocker bit.
@@ -768,7 +805,7 @@ Status GateFireDepth(Ctx& c, std::string& detail) {
 // The slab is 14 voxels above the ground, which is a different chunk, so
 // stamping the slab does NOT re-walk the floor it now shades — the floor's
 // openness only changes when the rolling refresh reaches it, up to
-// kNumChunks / render.opennessChunksPerFrame ticks later. Tick B writes one
+// kNumSlots / render.opennessChunksPerFrame ticks later. Tick B writes one
 // voxel into the floor's own chunk to put it on the dirty list. If that
 // latency is ever a visible problem the fix is a bigger refresh budget, not a
 // dilated dirty list: a 12 m reach dilates to a 15^3 chunk neighbourhood.
@@ -1237,7 +1274,7 @@ Status GateGiBounce(Ctx& c, std::string& detail) {
 // ever discharge it. The shadow resolve pass deposits full sunlight for any
 // patch that is ON SCREEN and stops the instant the camera looks away, so it
 // is a charger with no expiry. The openness walk is the discharger: it visits
-// every face every kNumChunks / opennessChunksPerFrame ticks whether anyone is
+// every face every kNumSlots / opennessChunksPerFrame ticks whether anyone is
 // looking or not, and that is the ONLY thing standing between a face and a
 // value from noon.
 //

@@ -188,6 +188,35 @@ class Simulation {
   // the same evidence the rest of §3.4 uses. Both counts come off the SAME
   // snapshot word, captured at the same point in the tick, which is what makes
   // the reinsertion window closed rather than merely narrow — see the .cpp.
+  // ---- gas particles (docs/PLAN_gas_particles.md stage 1) ----------------
+  // Two one-line inputs to the C_GAS latch in EncodeTick, kept separate from
+  // NoteSnapshot so adding gas did not change a signature every caller of the
+  // settled-tick machinery already forwards.
+  //
+  // NoteGasLive: the live parcel count from the snapshot ring (async, several
+  // ticks latent). NoteGasSpawns: CPU-authored spawns uploaded for THIS tick,
+  // which the latch must see before EncodeTick decides whether to record the
+  // drain that consumes them.
+  // Also disarms the settled-tick skip directly, so the fix does not depend on
+  // whether a caller happens to call this before or after NoteSnapshot. Both
+  // orders are safe and both are in the conservative direction: a live parcel
+  // can only COST a skip, never license one.
+  void NoteGasLive(uint32_t live) {
+    gasLive_ = live;
+    if (live != 0) settledProven_ = false;
+  }
+  void NoteGasSpawns(uint32_t n) { gasSpawnsThisTick_ += n; }
+  uint32_t GasLive() const { return gasLive_; }
+  // NoteGasSeen: is there gas ANYWHERE the renderer would have to draw --
+  // parcels outside the window OR gas voxels inside it. The second half is the
+  // reason this is not just `gasLive_ > 0`: in-window smoke is a VOXEL and
+  // leaves no parcel behind until it reaches a face, so a plume that never
+  // leaves the window would arm nothing and the crossfade would be off exactly
+  // where it matters most. Both halves come off the snapshot ring, so this is
+  // latent in the same way and by the same amount as everything else there;
+  // the hold in EncodeTick is what covers the latency.
+  void NoteGasSeen(bool seen) { if (seen) gasSeenHold_ = kGasSeenTicks; }
+
   void NoteSnapshot(uint32_t snapTick, uint32_t activeChunks,
                     uint32_t particleCount);
   // Everything that wakes chunks outside the op path funnels here, so a caller
@@ -408,6 +437,24 @@ class Simulation {
   // checked output can depend on when the driver happened to finish.
   void AllowDeferredFar(bool on) { deferFarOk_ = on; }
 
+  // WHEN the far set compiles at all. `Eager` starts the background build at
+  // the end of BuildPipelines, which is right for anything that will render a
+  // horizon (the game, every --shot, the full suite). `Lazy` starts it only
+  // when a caller DEMANDS cascade content (EnsureFarPipelines with fills to
+  // record), and a run that never does never compiles it.
+  //
+  // The reason this exists is what a deferred-but-eager build cost the modes
+  // that never look at a cascade: --voxdump, --voxserve and every `--gate`
+  // that is not a far gate. Their three far threads (Tint + spirv-opt + the
+  // driver, ~100 s of CPU each after a worldgen edit) ran alongside the real
+  // work, slowing it, and then the process could not EXIT until they finished
+  // — a std::async future's destructor joins its thread — so a 5 s gate sat
+  // silent for minutes after printing its result. Measured 2026-09-09, one
+  // --voxdump after a one-line genCellIn edit: see docs/PLAN_shader_compile.md
+  // "Lazy far". Set BEFORE Init: BuildPipelines reads it.
+  enum class FarBuild { Eager, Lazy };
+  void SetFarBuild(FarBuild b) { farBuild_ = b; }
+
   // ---- the SPECIALIZED raymarch variant (W2-A) ------------------------------
   // Same deal as AllowDeferredFar and set from the same line in main.cpp. The
   // lean raymarch pipeline (raymarch.wgsl's SPEC_* block) compiles in the
@@ -457,13 +504,19 @@ class Simulation {
   };
   // Move the future's result onto the three far pipeline members. Main thread only.
   void PublishFarPipelines();
+  // Launch the far set's compile from `farModule_` on farPL_. Idempotent per
+  // BuildPipelines (farStarted_). `threads <= 1` builds serially, in place,
+  // and publishes before returning (--shader-stats).
+  void StartFarBuild(unsigned threads);
   // Blocks unless the caller opted into deferral. Called from EncodeFarFill
   // with work to do — the one point where a caller is about to depend on
   // cascade CONTENT. Recording a far row against a pipeline that does not
   // exist yet is legal (the recorder skips a null pipeline); what is not
   // acceptable is a checked output that silently depends on driver timing.
+  // Under FarBuild::Lazy this is also where the compile STARTS.
   void EnsureFarPipelines() {
     if (deferFarOk_ || farReady_.load(std::memory_order_acquire)) return;
+    StartFarBuild(farBuildThreads_);
     WaitForFarPipelines();
   }
   // The full and slim sim bind groups, both pages. Called by Init and again by
@@ -534,9 +587,9 @@ class Simulation {
   // pipelines pair it with particleBGL_ to stay under the 16-storage-buffer
   // per-stage pipeline-layout limit (Dawn counts layout entries, not usage).
   rhi::BindGroupLayout simBGL_, simSlimBGL_, particleBGL_, renderBGL_, renderPartBGL_,
-      farBGL_, microBodyBGL_, fluidBGL_, fluidSeamBGL_, shadowBGL_;
+      farBGL_, microBodyBGL_, fluidBGL_, fluidSeamBGL_, shadowBGL_, gasBGL_;
   rhi::PipelineLayout simPL_, simPL2_, renderPL_, farPL_, microBodyPL_, fluidPL_,
-      fluidSeamPL_, shadowPL_;
+      fluidSeamPL_, shadowPL_, gasPL_;
   rhi::ComputePipeline worldgen_, worldgenList_, mutate_, mutateCells_, compact_,
       compactNext_, step_, occupancy_, occupancyDirty_, pick_;
   // Wind primitive footprint wake (sim_mutate.wgsl `windWake`) — see
@@ -544,6 +597,9 @@ class Simulation {
   rhi::ComputePipeline windWake_;
   rhi::ComputePipeline explodeMark_, explodeApply_, pArgs1_, pSpawn_, pIntegrate_,
       pArgs2_, pResolve_;
+  // Gas particles (sim_gas.wgsl, docs/PLAN_gas_particles.md stage 1). Five
+  // entry points shaped like the ballistic five above.
+  rhi::ComputePipeline gArgs1_, gSpawn_, gIntegrate_, gArgs2_, gResolve_;
   // Live only after PublishFarPipelines. Until then both are INVALID handles
   // and the recorder skips their rows (vk_record.cpp's null-pipeline continue).
   rhi::ComputePipeline farFill_, farPatchFill_, farDown_;
@@ -554,6 +610,13 @@ class Simulation {
   std::atomic<bool> farReady_{false};
   bool farPublished_ = false;
   bool deferFarOk_ = false;
+  FarBuild farBuild_ = FarBuild::Eager;
+  // What StartFarBuild compiles from: worldgen.wgsl's module as BuildPipelines
+  // last loaded it, and the thread count that build used. Held so a Lazy start
+  // thousands of ticks later compiles exactly what an Eager one would have.
+  rhi::ShaderModule farModule_;
+  unsigned farBuildThreads_ = 1;
+  bool farStarted_ = false;
   // The openness grid (sim_openness.wgsl, docs/PLAN_gi.md §2): `dirty` walks
   // the tick's compacted dirty list, `refresh` walks a rolling slice of the
   // window. Render-path passes on the TICK table — see the .def rows for why
@@ -650,6 +713,21 @@ class Simulation {
   // Two bind groups: page 0 reads dirty[0]/writes dirty[1], page 1 reversed.
   // Particle groups follow the same paging (b0 = read page, b1 = write page).
   rhi::BindGroup simBG_[2], simSlimBG_[2], particleBG_[2];
+  // Gas pages exactly like particleBG_: binding 0 is the read page.
+  rhi::BindGroup gasBG_[2];
+  // C_GAS latch state — see the block in EncodeTick.
+  static constexpr uint32_t kGasIdleTicks = 8;
+  // How long the RENDER flag (RenderParams bit 3) is held past the last
+  // snapshot that saw gas. Much longer than kGasIdleTicks because it is a
+  // FRAME-RATE-facing latch and its failure mode is different: the pass latch
+  // going false one tick early costs a tick of simulation, while the render
+  // flag going false one frame early makes a plume blink. One second of hold
+  // against a ring that is a handful of ticks latent, so it cannot flicker.
+  static constexpr uint32_t kGasSeenTicks = 60;
+  uint32_t gasSeenHold_ = 0;
+  uint32_t gasLive_ = 0;
+  uint32_t gasSpawnsThisTick_ = 0;
+  uint32_t gasIdleTicks_ = kGasIdleTicks;
   // fluidBG_ pages like particleBG_: binding 6 is THIS tick's particle write
   // page (next tick's read page), the splash droplets' destination. Binding 0
   // is the tick's WORKING fluid particle buffer, fluidParticles[1 - page]

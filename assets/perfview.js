@@ -316,6 +316,19 @@ const PV_SCOPE_NOTE = {
            + 'ring full` counters say whether the ring or the GPU was the limit.',
   audio:     'Cue dispatch and feeding the spatializer. Fixed small cost; '
            + 'silent in headless.',
+  terrainMesh:
+             'DebrisSystem::ManageTerrain: the marching-cubes collision patch '
+           + 'and Jolt static body for every chunk under a debris body or a '
+           + 'mob/player anchor. Debited from gameLogic, so the two rows are '
+           + 'disjoint. Bounded at kTerrainBuildsPerTick real rebuilds per '
+           + 'tick (the rest wait a tick); a chunk whose 18^3 occupancy box '
+           + 'has not changed is a hash compare and no mesh. Before the budget '
+           + 'this was the 50-100 ms "game systems" spike on every chunk '
+           + 'boundary the player crossed.',
+  debris:    'DebrisSystem::PreTick without the terrain patches: support-loss '
+           + 'flags from the snapshot, the island flood fills (bounded by '
+           + 'kIslandScanCellsPerTick) and body spawns. Debited from '
+           + 'gameLogic. Zero while nothing has lost support.',
   renderCpu: 'Encoding the render pass: draw calls, instance buffers and the '
            + 'overlay. This is the CPU DESCRIBING the frame — the GPU time it '
            + 'produces shows up in the GPU bars, not here.',
@@ -482,6 +495,8 @@ const PV_NODE_FALLBACK = {
   drawDebug:     'Debug draws',
   uiOverlay:     'Overlay + swapchain wait',
   readbackStall: 'Snapshot Stall',
+  terrainMesh:   'Terrain Collision',
+  debrisSys:     'Debris System',
 };
 function pvNodeLabel(id){
   const n = pvNodeById(id);

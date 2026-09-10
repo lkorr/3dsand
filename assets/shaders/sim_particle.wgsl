@@ -28,7 +28,7 @@ const PT_KERNEL : u32 = PT_K_PARTICLE;
 @group(1) @binding(4) var<storage, read_write> pArgs  : array<u32>;
 @group(1) @binding(7) var<storage, read>       spawnOps : array<Particle>;
 
-fn inBounds(c : vec3<i32>) -> bool { return inWindow(c, T.origin); }
+fn inBounds(c : vec3<i32>) -> bool { return cellResident(c, T.origin); }
 
 // ---- wind (docs/RESEARCH_wind.md §4.6, phase 3) -----------------------------
 // windAtQ speaks Q16.16 world cells per SECOND; particles speak Q24.8 cells per
@@ -66,8 +66,9 @@ fn markDirtyNext(c : vec3<i32>) {
     for (var j = 0; j < 2; j++) {
       for (var k = 0; k < 2; k++) {
         let n = ch + vec3<i32>(xs[i], ys[j], zs[k]);
-        if (chunkInWindow(n, T.origin)) {
-          atomicOr(&dirtyOut[chunkSlotIndex(n)], DIRTY_R_PARTICLE);
+        let ns = chunkSlotOf(n, T.origin);
+        if (ns != SLOT_NONE) {
+          atomicOr(&dirtyOut[ns], DIRTY_R_PARTICLE);
         }
       }
     }

@@ -17,7 +17,7 @@
 // a fault that reports as "unknown".
 const PT_KERNEL : u32 = PT_K_PICK;
 
-fn inBounds(c : vec3<i32>) -> bool { return inWindow(c, R.origin); }
+fn inBounds(c : vec3<i32>) -> bool { return cellResident(c, R.origin); }
 
 @compute @workgroup_size(1)
 fn main() {

@@ -81,21 +81,26 @@ inline void PerfScopesDrain(double* out) {
 // SubmitTick is one of these waiting to happen.
 struct PerfSpan {
   PerfScope scope;
+  // NESTING. Scopes are meant to be DISJOINT — the page sums them into the
+  // frame — so a span opened INSIDE another scope's span names that scope as
+  // `debit`, and the elapsed time moves from the outer row to this one instead
+  // of being counted twice. PerfScope::Count = no debit (a top-level span).
+  PerfScope debit;
   double t0;
   bool on;
-  explicit PerfSpan(PerfScope s)
-      : scope(s), t0(0), on(PerfScopesOn()) {
+  explicit PerfSpan(PerfScope s, PerfScope debitFrom = PerfScope::Count)
+      : scope(s), debit(debitFrom), t0(0), on(PerfScopesOn()) {
     if (on) t0 = NowSeconds();
   }
-  ~PerfSpan() {
-    if (on) PerfScopes().ms[(int)scope] += (NowSeconds() - t0) * 1000.0;
-  }
+  ~PerfSpan() { Close(); }
   // Close early and bill now, for the cases where the span ends in the middle
   // of a block rather than at a brace. Idempotent.
   void Close() {
     if (!on) return;
     on = false;
-    PerfScopes().ms[(int)scope] += (NowSeconds() - t0) * 1000.0;
+    const double ms = (NowSeconds() - t0) * 1000.0;
+    PerfScopes().ms[(int)scope] += ms;
+    if (debit != PerfScope::Count) PerfScopes().ms[(int)debit] -= ms;
   }
   PerfSpan(const PerfSpan&) = delete;
   PerfSpan& operator=(const PerfSpan&) = delete;

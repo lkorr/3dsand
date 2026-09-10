@@ -104,6 +104,11 @@ PIPE_TO_MEMBER = {
     "PIPE_P_INTEGRATE": "pIntegrate_",
     "PIPE_P_ARGS2": "pArgs2_",
     "PIPE_P_RESOLVE": "pResolve_",
+    "PIPE_GAS_ARGS1": "gArgs1_",
+    "PIPE_GAS_SPAWN": "gSpawn_",
+    "PIPE_GAS_INTEGRATE": "gIntegrate_",
+    "PIPE_GAS_ARGS2": "gArgs2_",
+    "PIPE_GAS_RESOLVE": "gResolve_",
     "PIPE_FAR_FILL": "farFill_",
     # The edit-patch half `far` was split into (PLAN_shader_compile package C).
     "PIPE_FAR_PATCH_FILL": "farPatchFill_",
@@ -178,6 +183,17 @@ BUF_TO_WGSL = {
     "ShadowReq": {"shadowReq"},
     "ShadowArgsStage": {"shadowArgs"},
     "ShadowArgs": set(),
+    # ---- gas particles (docs/PLAN_gas_particles.md stage 1) ----
+    # GasDispatchArgs is indirect-only and never bound, like ShadowArgs above.
+    "GasParticlesRead": {"gasRead"},
+    "GasParticlesWrite": {"gasWrite"},
+    "GasCounts": {"gasCounts"},
+    "GasClaim": {"gasClaim"},
+    "GasSpawn": {"gasSpawn"},
+    "GasSpawnOps": {"gasSpawnOps"},
+    "GasArgsStage": {"gasArgs"},
+    "GasDispatchArgs": set(),
+    "GasOuter": {"gasOuter"},
     "RenderUBO": {"R"},
     "Reactions": {"reactions"},
     "DirtyList": {"dirtyList", "farDirty"},
@@ -197,7 +213,7 @@ BUF_TO_WGSL = {
     "FarVox": {"farVox"},
     "FarOcc": {"farOcc"},
     "FarList": {"farList"},
-    "FarUBO": {"F"},
+    "FarUBO": {"F", "farP"},
     "FarPatch": {"farPatch"},
     "PageTable": {"pageTable"},
     # The openness (sky-visibility) grid, bindings 27/28 of simBGL_
@@ -291,6 +307,17 @@ _SIM_GROUP0 = {
     "genAct",
     # The authored world map, binding 31 (docs/PLAN_world_map.md).
     "worldMap",
+    # The window-edge gas outbox, binding 33 (docs/PLAN_gas_particles.md).
+    # sim_step is the only writer; sim_gas reads it through the GAS group,
+    # where the same buffer is binding 3. The numbers differ legally because
+    # the two modules declare it independently rather than through common.wgsl.
+    "gasSpawn",
+    # The outer gas density box, binding 34 (stage 1b). The CA splats every
+    # in-window gas VOXEL into it once per tick so the renderer can crossfade
+    # a voxel plume into the coarse one; sim_gas splats the PARCELS into the
+    # same buffer through the GAS group, where it is binding 6, and raymarch
+    # samples it at 21. Three independent declarations, three legal numbers.
+    "gasOuter",
 }
 # The slim group is 0..4 PLUS the two page buffers at 17/18 — not a dense
 # prefix any more. One WGSL identifier cannot carry two binding numbers
@@ -323,6 +350,13 @@ _SLIM_GROUP0 = {"voxels", "dirtyIn", "dirtyOut", "materials", "T",
 _PARTICLE_GROUP1 = {"pRead", "pReadBuf", "pWrite", "counts", "claim", "pArgs",
                     "expOps", "expMask", "spawnOps"}
 _FAR_GROUP1 = {"farVox", "farOcc", "farList", "F", "farDirty", "farPatch"}
+# Gas particles (docs/PLAN_gas_particles.md stage 1). farVox + farP are in this
+# group as well as the far one: a parcel outside the residency window asks the
+# cascade what it is drifting into, and that is the whole reason gas has a
+# group of its own rather than an extension of the particle group.
+_GAS_GROUP1 = {"gasRead", "gasWrite", "gasCounts", "gasSpawn", "gasClaim",
+               "gasArgs", "gasOuter", "farVox", "farP", "reactions",
+               "gasSpawnOps"}
 _FLUID_GROUP1 = {"fluidParticles", "fluidSpawnOps", "fluidBlockMap",
                  "fluidBlockList", "fluidGrid", "fluidArgs",
                  # splash coupling: particle write page + counts (bindings 6/7)
@@ -339,6 +373,7 @@ LAYOUT_BINDINGS = {
     "farPL_": _SLIM_GROUP0 | _FAR_GROUP1,
     "fluidPL_": _SLIM_GROUP0 | _FLUID_GROUP1,
     "fluidSeamPL_": _SLIM_GROUP0 | _FLUID_SEAM_GROUP1,
+    "gasPL_": _SLIM_GROUP0 | _GAS_GROUP1,
 }
 
 
@@ -383,6 +418,15 @@ def parse_pipeline_entries():
     # thread captures a handle it owns, and the MakeComputePipeline calls name
     # that local. Declared-type-anchored so this cannot match an arbitrary
     # assignment.
+    # The far build now starts from a MEMBER (`farModule_ = mWorldgen;` in
+    # BuildPipelines, read by StartFarBuild, which may run many frames later
+    # under Simulation::FarBuild::Lazy), so the member assignment is one alias
+    # level and the lambda-local `const rhi::ShaderModule module = farModule_;`
+    # is the next. Members first, so the declared-type pass below can resolve
+    # through them. Trailing-underscore anchored: only members are matched.
+    for m in re.finditer(r"\b(\w+_)\s*=\s*(\w+)\s*;", txt):
+        if m.group(2) in mods:
+            mods[m.group(1)] = mods[m.group(2)]
     for m in re.finditer(r"\brhi::ShaderModule\s+(\w+)\s*=\s*(\w+)\s*;", txt):
         if m.group(2) in mods:
             mods[m.group(1)] = mods[m.group(2)]

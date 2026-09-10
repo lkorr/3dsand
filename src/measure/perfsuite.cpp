@@ -318,9 +318,9 @@ struct Trunk {
 // caller must force one (HashWorldNow) before calling — a stale read here is a
 // tree that was found where there is now a crater.
 std::vector<uint32_t> ReadOccupancy(GpuContext& ctx, World& world) {
-  std::vector<uint32_t> occ(kNumChunks, 0);
+  std::vector<uint32_t> occ(kNumSlots, 0);
   rhi::ReadbackBlocking(ctx.device, ctx.queue, world.occupancy, 0, occ.data(),
-                        (size_t)kNumChunks * 4, "perfOcc");
+                        (size_t)kNumSlots * 4, "perfOcc");
   return occ;
 }
 

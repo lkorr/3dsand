@@ -3100,6 +3100,28 @@
       ],
       "tags": [
         "mineral"
-      ]    }
+      ]    },
+    {
+      "comment": "The firm half of a sand cover. A powder cap laid on ground at or past the angle of repose avalanches out from under itself on the tick it is generated -- worldgen's job is to make matter AT REST -- so genCellIn lays SANDSTONE wherever the slope gate takes the loose depth to zero, and over the whole cap on a lake's berm wall, which the analytic noise slope cannot see at all. Sand's own colours a shade darker and greyer, so a cut bank reads as rock rather than as loose sand that forgot to fall. `far` aliases sand: at cascade distance a dune and the cliff behind it are one thing, and the 128 far palette slots were already full.",
+      "id": "sandstone",
+      "arcane": 1,
+      "footstep": "path",
+      "class": "solid",
+      "density": 2200,
+      "hardness": 14,
+      "rubble": "sand",
+      "far": "sand",
+      "colors": [
+        "#c2ae79",
+        "#b9a671",
+        "#cbb785"
+      ],
+      "tags": [
+        "mineral",
+        "meltable",
+        "dissolvable"
+      ],
+      "molten": "molten_glass"
+    }
   ]
 }

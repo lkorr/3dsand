@@ -8,7 +8,8 @@
 // same-pass writes disjoint, so processing order cannot affect sim state —
 // bit-determinism holds (DESIGN.md §4).
 //
-// Dispatch: (NUM_CHUNKS / 64, 1, 1) workgroups of 64 threads.
+// Dispatch: (NUM_SLOTS / 64, 1, 1) workgroups of 64 threads — the whole slot
+// space, window slots and ticket slots alike (docs/PLAN_chunk_tickets.md).
 
 @group(0) @binding(1) var<storage, read_write> dirtyIn : array<u32>;
 @group(0) @binding(2) var<storage, read_write> dirtyOut : array<u32>;
@@ -23,7 +24,7 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
     atomicStore(&args[1], 1u);
     atomicStore(&args[2], 1u);
   }
-  if (i >= NUM_CHUNKS) { return; }
+  if (i >= NUM_SLOTS) { return; }
   if (dirtyIn[i] != 0u) {
     let slot = atomicAdd(&args[0], 1u);
     dirtyList[slot] = i;
@@ -40,7 +41,7 @@ fn mainNext(@builtin(global_invocation_id) gid : vec3<u32>) {
     atomicStore(&args[1], 1u);
     atomicStore(&args[2], 1u);
   }
-  if (i >= NUM_CHUNKS) { return; }
+  if (i >= NUM_SLOTS) { return; }
   if (dirtyOut[i] != 0u) {
     let slot = atomicAdd(&args[0], 1u);
     dirtyList[slot] = i;

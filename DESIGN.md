@@ -137,6 +137,50 @@ Three properties this rests on, all load-bearing:
   claim lattice all key on the slot. Feeding a page index into any of them
   would make the simulation a function of allocation history.
 
+#### Ticket slots: the slot space is no longer the window
+
+**The slot space and the window are two different things as of
+`docs/PLAN_chunk_tickets.md` P0.** They used to be the same thing by
+construction: a chunk's slot WAS its world coordinate modulo the window
+(`chunkSlotIndex` = a bitmask), so there were exactly `kNumChunks` slots and
+arithmetic assigned every one of them. That is why "simulate a chunk 40 chunks
+away" could not be done by allocating a page — page space was never the
+constraint, **slot identity** was, and a distant chunk wants the slot a near
+chunk already holds.
+
+So storage now runs `[0, kNumSlots)` where `kNumSlots = kNumChunks +
+kTicketSlots`. Slots below `kNumChunks` are the window, addressed by the same
+mask as ever. Slots above it are TICKETS — chunks far outside the window, held
+resident so matter that leaves can finish falling, burning or settling instead
+of freezing — and **no arithmetic reaches them**, only a CPU-built map. The
+resulting rule, which every buffer and every kernel now follows:
+
+> `kNumChunks` / `NUM_CHUNKS` is a statement about the WINDOW's geometry: what
+> the toroidal mask wraps at, what `chunkInWindow` measures, what the raymarch
+> clips to. `kNumSlots` / `NUM_SLOTS` is a statement about STORAGE: buffer
+> extents, dispatch bounds over the slot space, and the plane strides inside
+> multi-plane per-slot buffers. Conflating them is how a ticket slot ends up
+> reading a window chunk's memory.
+
+`kPoolPages` follows `kNumSlots` rather than `kNumChunks`, and the exhaustion
+proof above is unchanged because its first line already counted slots.
+
+Four functions in `common.wgsl` are the only sanctioned way to cross between
+world coordinates and slots — `chunkSlotOf(wc, o)` (the slot, or `SLOT_NONE`),
+`chunkResident` / `cellResident` (replacing `chunkInWindow` / `inWindow`
+wherever the question was "may I touch this", never where it was "where is the
+box"), and `slotWorldChunk(slot, o)` (the inverse, which replaced ten
+copy-pasted decodes that could not express a ticket slot). `voxWordAt`,
+`voxWordIndex` and `voxStore` resolve through one shared `voxSlotOfCell`.
+
+**P0 ships `kTicketMax = 0`**, so `kNumSlots == kNumChunks`, every ticket branch
+is a dead const-expression, and the world hash and both smoke probe tables are
+bit-identical — which is the whole acceptance criterion for a commit that
+touched 15 shaders and every per-slot buffer. The lifecycle (activation as a
+MutationQueue op, the cap, dedupe, timeout, release to `ChunkStore`) is P1; the
+per-site classification, and the three site classes the plan did not anticipate,
+are recorded in `docs/tickets_p0_audit.md`.
+
 A GPU kernel cannot allocate, so every page a kernel might write is
 materialized from the CPU BEFORE the command buffer is submitted, driven by a
 conservative CPU mirror of the dirty set. Writes are structurally incapable of
@@ -334,8 +378,18 @@ are deduplicated across mob defs, so 128 slots cover a whole cast.
   22,652 (65%) → 25,831 (74%) of 34,816. K is one `constexpr` and the whole
   trade-off curve was measured — K=2 gives back the residency but leaves the
   fence in place on 76% of shifts.
-- **Unloaded space is treated as solid and inert** so liquids can't drain off the
-  edge of the loaded world (Burkelbear's solution; adopt it verbatim).
+- **Unloaded space is treated as solid, inert, and a SINK FOR GAS** so liquids
+  can't drain off the edge of the loaded world (Burkelbear's solution; adopted
+  verbatim) — with one deliberate exception since 2026-09-09. Solid and inert is
+  the right answer for anything that would FALL out of the world and for
+  everything that would react out there. It is the wrong answer for a gas, whose
+  whole behaviour is to leave: a smoke voxel refused at the window's top face
+  could not tell that refusal from a stone wall, fell through to the lateral
+  ring, and sheeted across the entire top chunk plane until it decayed. So the
+  edge is one-way for `CLASS_GAS`: a gas voxel whose intent points out of the
+  window deletes itself and becomes a gas PARTICLE (§5), which keeps moving
+  outside under the same model and reconverts to a voxel if it drifts back in.
+  Nothing else crosses, and nothing reacts out there.
 - Overworld draw distance beyond the window is handled by the render-only
   far-field cascades (§9) — the streaming horizon is no longer visible from
   the surface. Underground, darkness still hides it.
@@ -477,6 +531,30 @@ SSBO lists of chunk indices.
     in `SUM(f*f)`, so the gate is chosen to make it terminate: the cell it
     vacates is a face neighbour of the cell that justified the move, which can
     therefore split into the hole, and splitting strictly decreases `SUM(f*f)`.
+- **A NEUTRAL RULE MAY NOT LICENSE ITSELF — `FILM_LICENCE`** (2026-09-08). The
+  argument above quantifies over an OPPORTUNITY (*"which CAN therefore split"*),
+  and on an open water surface the opportunity is taken by somebody else: films
+  surround every hole, one of them advances into it before the pressing cell
+  splits, nothing splits, `SUM(f*f)` does not move and the configuration has
+  merely rotated. Measured at the authored `home_lake`: 14 chunks awake forever,
+  reasons `MOVE 14 film-press 14`, 37 of 47 changed words back where they
+  started over 20 ticks, not one split — a shuffle at a third of a voxel per
+  tick, invisible in the game and a permanent breach of rule 2. The riser branch
+  (`filmStepAllowed`) has the same shape of hole, admitted in its own block:
+  two one-voxel risers facing each other 3 apart is a 2-cycle, and no reach-1
+  predicate can break it because a terrace tread's inner cell and a 2-wide
+  rimmed gutter's cell have byte-identical 3×3×3 neighbourhoods (the one read
+  that separates them, `c + 2d`, is racy — acting cells are ≥3 apart and each
+  writes within 1, so a cell exactly 2 away is the one another thread may be
+  writing). **Both film branches now require a licence**: they may only fire in
+  a chunk where something that DID strictly decrease a Lyapunov function — a
+  descent, an equalize, a split, a bridge, a powder or gas move — or an external
+  input (mutation, seam, particle, reaction) marked the chunk last tick. The CA
+  reads its own previous verdict, `dirtyIn[chunk]`, one scalar per workgroup
+  (`R(DirtyIn)` on the `ca` row, the same read `waterQuiet` already makes). Cost,
+  measured: `ca-slope` unchanged to the digit (96.9% into the basin, 0 eighths
+  left on the ramp), `ca-level-one` and `ca-level` unchanged; `sleep` goes from
+  14 chunks awake forever to **0, fully quiet**. Pinned by `ca-gutter`.
   - **`bridgeLevel`** — a cell may equalize between TWO OF ITS OWN lateral
     neighbours. Write reach is unchanged (both are one cell away — the same
     licence `tryMove` spends on self and one neighbour), but the pair straddles
@@ -497,7 +575,9 @@ SSBO lists of chunk indices.
   - Gates: `ca-level-one` (one placed voxel → 8 cells of one eighth, no slack),
     `ca-level` (216 eighths → 135 wetted columns, one cell deep, ≤4 eighths
     anywhere; was 57 columns and 6 eighths), `ca-level-pond` (the reported case:
-    the same blob on standing water).
+    the same blob on standing water), `ca-gutter` (the negative of `ca-slope`:
+    a 2-wide slot cut into a plateau, the geometry the riser step cannot
+    resolve, asserted to SLEEP rather than to drain).
 - **Gas**: inverse powder (up, then up-diagonals, then lateral), plus decay chance.
 - **Solid**: doesn't move; participates in reactions and structural checks only.
 - **Density displacement**: a mover entering a cell occupied by a less-dense
@@ -745,9 +825,202 @@ Noita's "Bloody Zombies" technique, on GPU:
   `resolve` in the same tick — a landing is never invisible to the snapshot of
   its own tick, and a particle that lands is still counted on the tick it lands.
   **A new GPU-side particle source must land inside that count**, or both
-  mechanisms will reason a world settled while matter is still moving.
+  mechanisms will reason a world settled while matter is still moving. Gas
+  parcels (below) are the second source and are inside it: `NoteSnapshot`
+  disqualifies on `gasLive_` beside `particleCount`. That obligation was
+  discharged only after the `gas-leave` gate went looking for it, which is the
+  argument for the gate measuring it rather than the design doc asserting it.
 
 **Gameplay projectiles are a separate CPU system** (§8) — they carry game logic.
+
+### Gas particles: the window edge is a sink (2026-09-09; `sim_gas.wgsl`, docs/PLAN_gas_particles.md stage 1)
+
+A SECOND particle population, with its own buffers, for the one kind of matter
+whose whole behaviour is to leave the world: gas.
+
+**The defect.** `tryMove` returns false out of the residency window, and a gas
+voxel could not tell that refusal from a stone wall. It fell through to the gas
+ladder's lateral ring and SHEETED across the entire top chunk plane — up to
+1,024 chunks plus the dilated layer under them — until its decay rule fired
+(smoke is 9/1000, so ~111 ticks of it). That sheet is the chunk outline visible
+in the sky over a big fire, and at 27 colour phases × 2 substeps × 4,096 cells
+per awake chunk it was most of the fire's CA cost. §3's "unloaded space is solid
+and inert" is right for everything that would fall out of the world and wrong
+for a gas.
+
+- **Representation.** The same 32-byte `Particle`: `payload` bits 0..11 material
+  and 12..15 state, plus `PFLAG_GAS`. Position is 24.8 fixed with a **zero
+  fraction** — a parcel lives ON a cell and moves in whole cells — and velocity
+  is always zero, which keeps `particlePriority` a pure function of the visible
+  state. No age field: death is rolled from the material's own bucket.
+- **Edge conversion.** In `sim_step.wgsl`'s gas tail, a `tryMove` that fails
+  because the target is out of the window (as opposed to failing on
+  `canDisplace`) calls `gasLeave`: the cell becomes air, the chunk is marked,
+  and a record is appended to `gasSpawn`. Reach 0 — it writes only its own cell,
+  and the target was never writable. Any face, not only +Y.
+- **Motion outside is the grid model verbatim.** The same `gasIntent` roll,
+  `windLateralStart` order and fourteen-candidate fallback ladder the CA uses,
+  refactored to take the identity key and the substep as arguments so both
+  kernels call one definition. Not a reduced-fidelity puff.
+- **Blocking outside is `farVox`**, the far cascade's level-1 byte — the same
+  test the far march uses. Dense toroidal array, direct index, **not the page
+  table**: the page table does not extend past the window and has no business
+  being asked about smoke 60 m away. Outside the cascade reads as OPEN, not as
+  blocked, or every plume would pin against an invisible wall.
+- **Bounds (rule 2), all three stateless tests on the parcel's own position:**
+  the outer box, `origin.y + WORLD_N + kGasCeilingVox`, and the authored decay.
+  `gasDecayProduct` walks the material's `RK_DECAY` entries exactly as
+  `doReactions` does, so the chance an author tunes for the voxel is the one the
+  parcel obeys; a gas product morphs, `air` dies, a grid product proposes a
+  landing. Neighbour-COUNT scaled rules are skipped — out there a parcel has no
+  neighbours and `scaledChance`'s answer would be a fabrication.
+- **Re-entry = RECONVERT.** A parcel whose next cell is inside the window
+  proposes itself as a voxel through the ordinary `atomicMax` claim path, one
+  claim per parcel per tick, deterministic winner, losers retry. That is the ONE
+  place a gas parcel meets the page system, and it is why gas that leaves is not
+  gas that is lost: it rejoins the reaction system on landing.
+- **Rendering** is `gasOuter`, a coarse density box: one 16-bit COUNT per cell,
+  two to a `u32`, 128³ cells over exactly two window edges, centred on the
+  window, 4 MiB, at `renderBGL_` binding 21 / GAS group 6 / `simBGL_` 34.
+  Cleared and re-splatted every tick (`atomicAdd` of a half-word lane, so the
+  result is scheduling-independent), sampled once per pixel by `gasOuterFill`.
+  Render-only derived data: the sim never reads it, the world hash never covers
+  it, it is never stale. Saturating at 60,000/cell rather than carrying into the
+  neighbouring cell's half of the word.
+  **Deviation from the plan:** the cell is 0.8 m, not 0.4 m. The plan asked for
+  0.4 m cells AND a 2x-window span AND 2 MiB; 128³ bytes IS 2 MiB and 128 ×
+  0.4 m is half the stated span, so the three never agreed. Span is kept.
+  **Second deviation:** the parcel splat is folded into `gasResolve` rather than
+  given its own dispatch, because resolve already walks every live parcel once.
+
+#### Stage 1b: the two representations CROSSFADE, they do not abut
+
+Stage 1 left an explicit seam. Inside the window gas is a 0.1 m voxel; outside
+it is a parcel drawn from 0.8 m cells; the two met at the window face with no
+overlap, so there was a visible line 25.6 m from the window centre where crisp
+voxel smoke became 64x-larger soft cells. The fix is entirely on the render
+side — **the sim is untouched and the determinism hash does not move (9bfed213
+before and after)**, because sim behaviour that depended on camera distance
+would be a rule-1 violation and in-window gas must stay a voxel to keep the
+reaction system.
+
+- **The CA splats too.** `sim_step.wgsl`'s `gasOuterSplat` adds every in-window
+  gas voxel to the same box, ONCE per tick (substep 0, after the stamp gate,
+  before the move), gated on `sim.gasMode` so a world with the gas rows
+  unrecorded cannot accumulate into an uncleared box. The box therefore holds
+  BOTH populations, which is what makes a crossfade possible at all: a voxel
+  can only fade out into a coarse cell that has something in it. `gasOuter`
+  joins the CA at `simBGL_` binding 34 and the `ca` row's R/W set as
+  `A(GasOuter)`.
+- **The byte became a u16** for this: 192/512 = 37.5% full was a ceiling nobody
+  saw while the box only held distant parcels, and a crossfade INTO it would
+  have thinned every dense plume exactly at the seam. Measured by `gas-leave`: the in-window splat reaches **204 in a single 0.8 m cell** twenty ticks after a 4,096-voxel puff, so the byte's 192 guard was not a theoretical ceiling -- it clips this fixture.
+- **The weight is the max-norm distance from the WINDOW CENTRE**, smoothstepped
+  from `render.gasBlendStart` × 25.6 m to 25.6 m. The centre and not the camera:
+  the max-norm distance is exactly the half-extent at every point of all six
+  faces, so the weight is 1 at every face regardless of where the camera stands.
+  A camera-relative ramp would have to be re-tuned per view and would still
+  leave a seam on the faces it was not tuned for.
+- **Voxels fade out** by `1 - b` in `trace()`'s media branch (gases only; a
+  liquid has no coarse representation), and **only into a non-empty coarse
+  cell** — the CA visits awake chunks only, so a settled plume in a sleeping
+  chunk is in no coarse cell and keeps its full opacity instead of fading into
+  nothing. That one extra fetch is what makes the sleeping-chunk hole a
+  non-event rather than a disappearing plume.
+- **The coarse fill fades in** over the same shell: `gasOuterFill` grew a second
+  segment, from the inner box out to the window face, weighted by the same
+  ramp and with its own step budget so widening the band cannot thin the
+  distant plume. It now runs for rays that HIT inside the window too, bounded by
+  the near hit rather than by "did the ray leave".
+- **RenderParams bit 3 (`RFLAG_GAS`)** is what keeps all of it free in a world
+  with no smoke. `Simulation::EncodeTick` publishes it through
+  `SetGasRenderActive` (renderspec.h) from a latch armed by live parcels OR the
+  gas dirty-reason bits in the snapshot, held one second past the last sighting.
+  It is a correctness gate as well as a budget: `gasOuter` is only cleared on
+  ticks the sim records the gas rows, so with the flag off the box is stale and
+  must not be sampled. NOT a `SPEC_` constant — it flips whenever a fire starts
+  or goes out.
+- **Measured cost:** raymarch fragment register count 168 → 168, no spills,
+  binary +0.18%; the CA's `step` kernel 56 → 56 registers, binary +0.11%.
+- **Both live wires are ASSERTED, not argued.** `gas-leave` now fails if the
+  render flag never arms over a 400-tick run with a live plume (it is on for
+  320 of them) and if `gasOuter` is empty INSIDE the window at t20 with the
+  whole plume still in it (sum 3,437, max 204). Either zero leaves every other
+  number in that gate untouched and simply turns the crossfade off, which is
+  the definition of a thing that needs its own assertion. The in-window probe
+  is deliberately EARLY: at the main t200 probe this fixture's plume has
+  entirely left through the ceiling, and the first version read 0 there and
+  reported a dead splat on a run where it had worked for a hundred ticks.
+- **Known and not repaired:** the coarse contribution still does not feed
+  `gasHalfT` or `fireGlow`. Stage 1's argument for that was geometric (every
+  coarse voxel-length was beyond the window exit); stage 1b's band is inside the
+  window, so a raster body can stand behind coarse gas the depth raster does not
+  know about. Bounded by the crossfade weight — zero at the inner edge, and only
+  fully coarse at the face, 25 m away.
+- **Own buffers, not a share of `kParticleCap`.** `gasParticles[2]` at
+  `kGasParticleCap` = 262,144, plus `gasCounts` / `gasClaim` / `gasSpawn` (the
+  CA's outbox, whose 8-word header is this tick's counters) / `gasSpawnOps` (the
+  CPU op stream, rule 3) / `gasArgs` / `gasOuter`. The two populations must not
+  be able to starve each other: a fight full of ballistic debris must not thin a
+  plume, and a forest fire must not stop a sword from shattering.
+- **Determinism, and the hole it had to close.** A parcel outside the window
+  touches no voxel, so the world hash **cannot see it** — a scheduling-dependent
+  step out there would reproduce a matching hash sequence for a whole run and
+  only surface a hundred ticks later when the parcel landed. The population
+  therefore carries its own digest (`kGasSpDigest`: the SUM of every surviving
+  parcel's `particlePriority`, a sum because the pool's append order is
+  scheduling-dependent by construction), which the `determinism` gate compares
+  across its two runs alongside the hash series.
+
+**The open problem, recorded because sizing a cap is not the same as fixing
+it.** `gasLeave` charges a shared `atomicAdd` cursor, so WHICH voxels are
+refused when the per-tick list fills is decided by which workgroup arrived
+first — and a refused voxel STAYS IN THE GRID, where the world hash can see it.
+That is scheduling-dependent output, i.e. a rule-1 hazard. It is held off by
+sizing `kGasSpawnPerTick` (65,536, a quarter of the window's top face in ONE
+tick) out of reach, which makes the POOL the binding constraint instead — and a
+dropped parcel is already outside the window and cannot move a voxel. The
+`gas-leave` gate asserts refusals == 0, so the day that is not enough it is a
+printed number rather than a silent divergence. **The real fix is mark+apply**:
+the CA flags cells that want to leave and a second pass converts them in a
+deterministic order, which is the pattern `sim_explode` already uses for exactly
+this reason.
+
+**The settled-tick skip vs parcels in flight — FOUND BY THE GATE, FIXED IN
+`simulation.cpp`.** This section's own paragraph above states the obligation:
+"a new GPU-side particle source must land inside that count, or both mechanisms
+will reason a world settled while matter is still moving". Gas parcels did not.
+`Simulation::NoteSnapshot` licensed the settled-tick skip on
+`activeChunks == 0 && particleCount == 0`, `particleCount` is the BALLISTIC
+population only, and `inputsThisTick` in `EncodeTick` had no gas term. The
+C_GAS latch was never the answer to this and was briefly reported as though it
+were: it decides whether the gas ROWS are recorded, so parcels kept flying — but
+a re-entry landing is a voxel write at a cell the CPU did not choose, and if it
+happened on a tick the CA rows were skipped for, that chunk would be simulated
+one or two ticks late, "how late" depending on when the readback ring got round
+to reporting it. Late is not lost; scheduling-dependent is a rule-1 break.
+
+Both halves are closed now. `NoteSnapshot` disqualifies on `gasLive_ != 0`
+alongside `particleCount`, `NoteGasLive` additionally clears `settledProven_`
+directly so the fix does not depend on call order, and `gasSpawnsThisTick_` is
+in `inputsThisTick` for the reason `windWakeCount` is — a CPU-queued parcel can
+re-enter and land, so it is a chunk-dirtying input. `gasLeave` conversions are
+deliberately not in that disjunction and do not need to be: a voxel can only
+reach the residency edge on a tick the CA ran, and the CA running already means
+the world was not proved idle.
+
+The `gas-leave` gate keeps counting ticks that fall in the window and printing
+the number on its own line. It measured **0 of 400 before the fix** — that
+fixture's own plume keeps the window busy for the whole run, so it never
+entered the hazard — and it should now be provably zero rather than
+incidentally zero. It stays because the assertion is cheap and because the next
+GPU-side source to arrive will need exactly this measurement made for it.
+
+**Gates:** `gas-leave` (4,096 smoke six chunks under the window's top face,
+open shaft above, 400 ticks twice) and `gas-reenter` (256 CPU-queued parcels two
+cells outside an X face into an inward wind). The first never asserts the quiet
+top plane alone — the same run must show that smoke reached the face and left
+through it, or a broken fixture passes too.
 
 ### MLS-MPM liquid (2026-08-22..23; `sim_fluid.wgsl` + `sim_fluid_seam.wgsl`, docs/PLAN_mpm_fluids.md)
 
@@ -1726,6 +1999,58 @@ rather than a tuning row now, so `--sweep` cannot reach it; the `terrain`
 gate's C1 (the CPU twin against the GPU per voxel) is the proof the words the
 map carries are the words the kernel reads.
 
+##### A loose cover is born at rest too (2026-09-09)
+
+The sediment wedge's slope gate was the only one. The desert / ocean **sand
+cap** was four voxels of POWDER laid on ground of any steepness, and those two
+biomes also author their *skin* as `sand`, where the skin branch had always
+assumed a solid ("a powder shell on a slope avalanches out from under itself").
+
+Measured on raw worldgen output (`--voxdump`, no CA), in a 128x96x128 box at the
+authored lake: **1,249 of 10,539 sand cells had a legal CA down-move on tick 0,
+and 418 of them went straight into the water.** The water itself is born
+perfectly at rest -- every cell full, flat top, solid floor, zero violations --
+so the reported bug (freshly streamed lake terrain stays awake for seconds) was
+never the water. It was the bank falling into it.
+
+`looseCoverDepth` splits a cover the way the wedge is split: the LOOSE part
+keeps its authored depth on ground the wedge already calls flat
+(`terrain.sedSlope`), tapers to zero at the CA's own angle of repose
+(`CAP_REPOSE_Q8 = 256`, one voxel per column -- not a knob, it is the constant
+`sim_step`'s diagonal slide defines), and whatever the taper takes away becomes
+the biome's `cover.firmSkin` (`WM_B_FIRM_COVER`; desert and ocean say
+`sandstone`, a material that far-aliases `sand` so it costs no palette slot).
+On flat ground the loose depth is the full authored 4 and nothing changes.
+
+Two authored discontinuities force it to zero outright, because **neither is in
+the noise field and the analytic gradient reads both as level plateau**: a water
+body's bermed / excavated bank (`Col.nearWater`) and an authored pool's rim
+annulus (`inRim`). `nearWater` is deliberately *not* `shore.onShore` -- that
+flag carries the shore feature's bluff cut, which turns itself off on exactly
+the tallest cut walls in the world.
+
+The skin half is gated on the authored class AND on the biome having authored a
+`firmSkin`. The opt-in is the author's veto: tundra's skin is snow, also a
+powder, and firming a tenth of the tundra broke its own authored claim ("99% of
+columns wear snow at `y == h`", the `env-truth` gate) for a settle transient
+tundra has always accepted.
+
+**Known gap, not fixed here.** This gate reads `Land.slope`, the *landform*
+gradient, which by design excludes the detail and grain octaves (see the note
+above -- gating on the full gradient turns the wedge into a cliff). So the
++-2-voxel steps fine noise puts on an otherwise gentle dune face are invisible
+to it: the open dune field still measured **645 movers before and after**. The
+lake case is fixed; the dune case needs a different instrument (a local step
+test, not a gradient), and the tuning that did catch it by brute force also
+stripped 87% of the desert's loose sand.
+
+`bowlSteep` carries a second known gap of the same shape, documented at its
+definition: it compares against the next integer radius *ring* rather than the
+four axis neighbour columns, and under-reads the step where the profile crosses
+two voxels between rings (168 bed grains on one marsh bowl face). The exact fix
+is written and works, but it moves the harness pool's bed enough to need the
+`waterbody` gate's conservation ledger reconciled with it.
+
 ##### Per-biome height curves (2026-09-01, Lin 13.3.3)
 
 "This biome is flat plains, that one is jagged mountains", authored as nine
@@ -2589,6 +2914,24 @@ neighbors, so this needs an explicit connectivity pass:
   at edge midpoints, i.e. on a half-integer lattice, so identical positions
   dedupe exactly by integer key with no epsilon compare, and ~4× fewer vertices
   reach Jolt's `MeshShape` build (the dominant cost of a rebuild).
+- **Rebuilds are BUDGETED (2026-09-09):** `ManageTerrain` used to rebuild every
+  stale patch it wanted in the tick it wanted it, and a chunk-boundary crossing
+  stales a whole face of anchor chunks at once — a mob that has just acquired a
+  target widens its anchor to `navRadius + 4` (~216 chunks), arriving at
+  `World::kFetchPerTick` = 64 per snapshot and all polygonized, tree-built and
+  broadphase-added on the tick they landed. That was the 50-100 ms "Game
+  Systems" spike while walking. Now `kTerrainBuildsPerTick` (6) real rebuilds
+  per tick, nearest anchor first (the ground under a body is always the first
+  patch made; the far edge of a planner's horizon, which only the fetch
+  serves, is the last), and the surface's identity is the hash of the 18³
+  occupancy box taken BEFORE marching cubes — the mesh is a pure function of
+  it, so a re-fetched chunk whose solids did not move (the 8-tick dirty-flag
+  refresh, liquids flowing, blood drying) costs one sample and no mesh, no
+  Jolt body and no wake. A COUNT budget, not a time budget: the debris gates
+  run this under the selftest, and a body landing on a patch one tick later
+  on a slower machine would settle somewhere else. `terrainMesh` is its own
+  row on the Performance tab, debited from `gameLogic`;
+  `SANDVOX_TERRAIN_BUILDS_PER_TICK` is the one-binary A/B arm.
 - Sleeping: settled bodies deactivate entirely until another body or force
   intersects their AABB (Jolt does this natively).
 
@@ -4731,7 +5074,7 @@ where you hear from either (§12b, "The ears are on the character").
 - **Far-field cascades (implemented 2026-08-19; docs/PLAN_far_field_cascades.md):**
   view distance beyond the residency window comes from kFarLevels nested
   toroidal kFarN³ (512³ since 2026-08-29; was 256³) volumes centered on the player, one byte per
-  cell (7 bits of material id + 1 conservative blocker flag; see below). The far grid is DECOUPLED from the window size (phase 5, when the
+  cell (7 bits of FAR PALETTE SLOT + 1 conservative blocker flag; see below). The far grid is DECOUPLED from the window size (phase 5, when the
   window went 512³): level k cells span 2^(k + kFarShiftBase) fine voxels with
   the shift base chosen so level k's box edge is always 2^k WINDOW edges —
   cascade distances scale with the window at constant memory (1024 MiB total at
@@ -4745,7 +5088,30 @@ where you hear from either (§12b, "The ears are on the character").
   Levels are filled on the GPU by sampling `genCell()` at stride
   (worldgen.wgsl `far` — the "sieve"), recentered with hysteresis like the
   streaming window, and refilled a plane at a time (≤ kFarListCap
-  level-chunks/tick, managed by `sim/farfield`). **Edits reach the far field
+  level-chunks/tick, managed by `sim/farfield`; planes drain at
+  `kPlayFillCap` = 64 in play, resets at the list cap). **The renderer marches
+  a VALID box, not the level box (2026-09-10).** A level is toroidal, so when
+  its origin steps one level chunk the incoming face's SLOTS are the outgoing
+  face's and hold the outgoing face's bytes until the sieve refills them —
+  ~16 ticks per plane under the play cap, deeper under sprint flight. Marched
+  from the full box the tick the origin moved, those bytes were the hillside
+  BEHIND the player drawn ahead of them, and the underground of the bottom
+  face drawn in the sky when the box stepped up. `FarField` now keeps one
+  record per queued plane (FIFO beside the entry queue) and a count of planes
+  outstanding on each of a level's six faces, released when a plane's LAST
+  entry is dispatched; `FarField::FaceWord` packs the six counts (4 bits each)
+  plus a whole-level-pending bit into `FarParams.origins[k].w`, the word no
+  other reader used, so neither `common.wgsl` nor `world.h` changed for it.
+  raymarch.wgsl `farBox` unpacks it and every far reader (`traceFar`,
+  `farShadowDist`, the far AO taps) marches the full box less those faces —
+  empty during a reset — so a ray in an excluded slab leaves the level at the
+  shrunken face and the next coarser level, which is filled, picks it up at
+  the same t by the seam contract `traceFar` already keeps for a ray out of
+  `farSteps`. Always conservative: a landed face is published a tick late, a
+  reversed face is excluded on both sides until both records drain, and a
+  reset voids the level's older records via an epoch. The `far-fog` gate
+  steps the player one level-1 hysteresis in +x and asserts the +x nibble
+  holds through the 16-tick drain and clears after. **Edits reach the far field
   (phase 2):** each tick, `worldgen.wgsl fardown` runs one workgroup per entry
   of the compacted dirty list — the same `DispatchWorkgroupsIndirect` args the
   occupancy update uses, so a settled world dispatches nothing — and re-derives
@@ -4928,16 +5294,58 @@ where you hear from either (§12b, "The ears are on the character").
   a dense cascade level costs volume — see `docs/PLAN_far_field_cascades.md`
   §5.6 for why `kFarN` is the only knob and what a sparse near level would
   take.
+  **Those seven bits are a PALETTE SLOT, not a material id (2026-09-09):**
+  a far cell byte names one of 128 entries in the FAR PALETTE — the fourth
+  reserved run of the GPU material table (`kFarPaletteBaseGpu`, world.h,
+  under the stain / art / tint runs and costing no new binding). Entry
+  `FAR_PALETTE_BASE + slot` holds, in its `flags` word, the material id that
+  slot paints. Two directions, two homes, neither of them a new buffer:
+
+  - **material → slot** rides in every real material's own `flags` word at
+    `MATF_FAR_PAL_SHIFT` (bits 24..30; `kMatFarPalShift` in materials.h is the
+    C++ mirror). The three sites in `worldgen.wgsl` that write a far cell —
+    the sieve `far`, the edit patch `farpatch` and the downsample `fardown` —
+    read it through `matFarPal()`, so a writer pays one field of a material it
+    was already fetching and no table lookup at all.
+  - **slot → material** is `farPalMat()` (common.wgsl), used by
+    `raymarch.wgsl`'s `farMatAt` and by `sim_gas.wgsl`'s `gasFarBlocked`. The
+    "is anything here" tests do NOT translate: slot 0 is air, nothing else
+    maps to material 0, so `farPalAt(..) != 0` is the same answer without the
+    read, which is what AO, `farShadowBlocked` and the occupancy count use.
+
+  WHY. Before this, the byte WAS the id, so `LoadMaterials` had to refuse a
+  129th material outright — the voxel word had room for 4096 and this byte had
+  room for 128 — and nothing else in the engine would have noticed if the
+  refusal were deleted: the 129th material would simply have painted the wrong
+  colour at distance and claimed a blocker wherever bit 7 landed. The
+  indirection turns 128 into a budget on how many things may look DIFFERENT
+  FROM EACH OTHER at cascade scale, which is a far-field question, instead of a
+  cap on the material table, which is not one. Two materials that are
+  indistinguishable at 50 m share a slot:
+
+  ```json
+  { "id": "sandstone", "class": "solid", "far": "sand" }
+  ```
+
+  resolved by name at load. An alias may not point at another alias (one hop,
+  so the slot a byte names always belongs to a material that paints itself) and
+  may not point at air (slot 0 means an EMPTY far cell, not a transparent one).
+  The loader now errors only when the number of materials WITHOUT an alias
+  exceeds 128, and says which knob fixes it; `check_invariants.py` counts the
+  same thing off materials.json, since adding a material is a data edit that
+  needs no build.
+
+  Slots are handed out IDENTITY-FIRST — material `i` takes slot `i` while `i <
+  128`, and only the ids pushed past seven bits take whatever the aliases
+  freed. That is deliberate and load-bearing rather than tidy: on an unaliased
+  table every far byte is bit-for-bit the byte the same worldgen wrote before
+  the palette existed, which is why introducing the whole indirection moved
+  neither the world hash nor a single smoke probe.
   **The far cell byte is 7 + 1, not 8 (13.2.2, 2026-09-01):** bit 7 of every
   far cell is a CONSERVATIVE BLOCKER FLAG — "pristine worldgen puts something a
-  ray would stop on somewhere inside this cell's fine footprint" — and the
-  material id lives in the low seven (`FAR_MAT_MASK` / `FAR_BLOCKER_BIT`,
-  common.wgsl; every reader masks). The id fits because there are 117
-  materials, and it KEEPS fitting because `LoadMaterials` refuses a table past
-  128 entries and `check_invariants.py` refuses a materials.json that would
-  grow one; nothing else in the engine would notice, since a 129th material
-  would merely paint the wrong colour at distance and claim a blocker wherever
-  bit 7 landed. The flag is a pure function of (coords, seed)
+  ray would stop on somewhere inside this cell's fine footprint" — and the low
+  seven are a FAR PALETTE SLOT (`FAR_PAL_MASK` / `FAR_BLOCKER_BIT`,
+  common.wgsl; every reader masks). The flag is a pure function of (coords, seed)
   (`farBlockerBitAt` in worldgen.wgsl) for the same reason `farSurfaceMat` is:
   the sieve has no live grid, so a flag derived from real voxels in the
   downsample would disagree with it at their shared boundary. Its cost is one
@@ -8206,6 +8614,21 @@ is a relabelled GPU wait — the CPU would have spent the same time in `present`
 so it now has its own row and its own two counters: `snapshotStalls` (the waits)
 and `readbackDeclined` (readback requests the ring refused). Declines
 without stalls mean the ring is the limit; stalls with declines mean the GPU is.
+
+**The GPU-lag throttle (2026-09-09).** The 4-tick catch-up is right for a CPU
+hitch and wrong for a GPU one: every tick submits a plane of worldgen, a CA
+pass and a snapshot copy, so paying three of them into a queue already a frame
+behind lengthens the next frame, which owes more ticks — the loop that ends in
+the two blocking waits on the frame path (the staleness fence above, and
+`Stream`'s T+`kWakeLatency` wake fence, billed to World Storage). The tick loop
+now reads the lag instead of guessing it — `rhi::Device::PendingMapCount()`,
+the snapshot readbacks whose fence has not signalled, is exactly the ticks the
+GPU has not finished — and runs a second tick in a frame only while the GPU
+owes fewer than two, dropping the surplus debt (sim time dilates by those
+ticks) rather than banking it into a burst. Pure pacing: which ticks run and
+what they compute is unchanged, nothing hashed moves, and the headless
+harnesses never reach the branch. `--frames` prints the count as `gpu-lag
+throttle`; the live page shows it as `ticksThisFrame` sticking at 1.
 
 **Verify the page, not just the numbers.** `scripts/check_perfview.sh` drives the
 real tab in real headless Chrome and asserts both content (charts built from the

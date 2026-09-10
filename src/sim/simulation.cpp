@@ -254,6 +254,24 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         // above only binds layouts a shader declaring `glow` is recorded
         // against, and no slim-group pipeline names it.
         entry(32, T::Storage),         // glow (sources + field)
+        // The window-edge gas outbox (docs/PLAN_gas_particles.md §2.3).
+        // sim_step's gasLeave appends to it; sim_gas drains it later in the
+        // same tick through the GAS group, where it is binding 3. The two
+        // numbers differ on purpose and legally: `gasSpawn` is declared in two
+        // modules that do NOT share the declaration through common.wgsl, which
+        // is the condition the one-identifier-one-binding-number rule above is
+        // about. 33 is the first free slot in this dense 0..32 layout.
+        entry(33, T::Storage),         // gasSpawn (header + records)
+        // The outer gas density box (docs/PLAN_gas_particles.md §2.5). Bound
+        // to the CA since stage 1b, which splats every in-window gas VOXEL
+        // into it once per tick so the renderer can crossfade a voxel plume
+        // into the coarse one instead of cutting between them at the face.
+        // Binding 6 in the GAS group and 21 in renderBGL_; the numbers differ
+        // for gasSpawn's reason -- `gasOuter` is declared in three modules
+        // that do NOT share the declaration through common.wgsl, which is the
+        // condition the one-identifier-one-binding-number rule is about.
+        // 34 is the first free slot in this dense 0..33 layout.
+        entry(34, T::Storage),         // gasOuter (render-only density box)
     };
     simBGL_ = device.CreateBindGroupLayout(entries, std::size(entries));
 
@@ -303,6 +321,29 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         entry(7, T::ReadOnlyStorage),  // CPU particle spawns (debris shatter)
     };
     particleBGL_ = device.CreateBindGroupLayout(pentries, std::size(pentries));
+
+    // group 1: gas particles (sim_gas.wgsl, docs/PLAN_gas_particles.md).
+    //
+    // Its OWN group rather than an extension of particleBGL_, and the reason is
+    // farVox: gas needs the far cascade to know what it is drifting into
+    // outside the window, and that lives in farBGL_. A layout carrying both
+    // would have to be bound by every ballistic row for no hazard, and the
+    // fluid pair already established that a system with its own buffers gets
+    // its own group-1.
+    rhi::BindGroupLayoutEntry gentries[] = {
+        entry(0, T::Storage),          // gasRead  (gasParticles[page])
+        entry(1, T::Storage),          // gasWrite (gasParticles[1-page])
+        entry(2, T::Storage),          // gasCounts (atomic)
+        entry(3, T::Storage),          // gasSpawn: the CA's outbox + counters
+        entry(4, T::Storage),          // gasClaim (re-entry claim hash)
+        entry(5, T::Storage),          // gasArgs staging
+        entry(6, T::Storage),          // gasOuter (render-only density box)
+        entry(7, T::ReadOnlyStorage),  // farVox: blocking outside the window
+        entry(8, T::Uniform),          // FarParams (the cascade origins)
+        entry(9, T::ReadOnlyStorage),  // reactions: the RK_DECAY bucket
+        entry(10, T::ReadOnlyStorage), // gasSpawnOps (CPU-authored spawns)
+    };
+    gasBGL_ = device.CreateBindGroupLayout(gentries, std::size(gentries));
 
     // group 1: MLS-MPM fluid prototype (sim_fluid.wgsl). Same slim-group-0
     // pairing as the particle pipelines. fluidDispatchArgs is deliberately
@@ -434,6 +475,18 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         // is a shape it CAN consume, which is what lets the crown that falls
         // off a burning tree be lit by the fire it fell out of.
         entry(20, T::ReadOnlyStorage, S::Fragment | S::Vertex),   // glow
+        // The outer gas density box (docs/PLAN_gas_particles.md 2.5). Declared
+        // HERE, on the SIM side, so the far-march sampling that consumes it is
+        // a WGSL-only change: a binding a shader names must exist in the layout
+        // or the pipeline will not build, and that is the one thing a renderer
+        // edit cannot add for itself.
+        //
+        // READ-ONLY and fragment-only. sim_gas's resolve is the sole writer,
+        // on the TICK command buffer, and the raymarcher reads it in the
+        // FRAGMENT stage of the same frame -- the compute->fragment hop that
+        // has no other source of synchronisation in this engine, which is why
+        // GasOuter is on the pass table at all.
+        entry(21, T::ReadOnlyStorage, S::Fragment),               // gasOuter
     };
     renderBGL_ = device.CreateBindGroupLayout(entries, std::size(entries));
 
@@ -508,6 +561,9 @@ bool Simulation::Init(const rhi::Device& device, World& world,
 
     rhi::BindGroupLayout fluidSeamGroups[] = {simSlimBGL_, fluidSeamBGL_};
     fluidSeamPL_ = device.CreatePipelineLayout(fluidSeamGroups, 2);
+
+    rhi::BindGroupLayout gasGroups[] = {simSlimBGL_, gasBGL_};
+    gasPL_ = device.CreatePipelineLayout(gasGroups, 2);
   }
 
   // ---- bind groups ----
@@ -532,6 +588,24 @@ bool Simulation::Init(const rhi::Device& device, World& world,
     };
     particleBG_[page] =
         device.CreateBindGroup(particleBGL_, pentries, std::size(pentries), "particleBG");
+
+    // Gas: same parity convention as particleBG_ — gasParticles[page] is what
+    // this tick READS and [1-page] is what it writes, and FlipPage swaps them.
+    rhi::BindGroupEntry gentries[] = {
+        b(0, world_->gasParticles[page]),
+        b(1, world_->gasParticles[1 - page]),
+        b(2, world_->gasCounts),
+        b(3, world_->gasSpawn),
+        b(4, world_->gasClaim),
+        b(5, world_->gasArgs),
+        b(6, world_->gasOuter),
+        b(7, world_->farVox),
+        b(8, world_->farUBO),
+        b(9, reactionBuf_),
+        b(10, world_->gasSpawnOps),
+    };
+    gasBG_[page] =
+        device.CreateBindGroup(gasBGL_, gentries, std::size(gentries), "gasBG");
 
     rhi::BindGroupEntry rpentries[] = {
         b(0, world_->particles[page]),
@@ -569,6 +643,7 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         b(18, world_->opennessGen),
         b(19, world_->irradiance),
         b(20, world_->glow),
+        b(21, world_->gasOuter),
     };
     renderBG_ = device.CreateBindGroup(renderBGL_, entries, std::size(entries), "renderBG");
   }
@@ -799,6 +874,8 @@ void Simulation::BuildSimBindGroups(const rhi::Device& device) {
         b(30, world_->genAct),
         b(31, worldMapBuf_),
         b(32, world_->glow),
+        b(33, world_->gasSpawn),
+        b(34, world_->gasOuter),
     };
     simBG_[page] = device.CreateBindGroup(simBGL_, entries, std::size(entries), "simBG");
 
@@ -923,6 +1000,21 @@ void Simulation::UploadTables(const rhi::Queue& queue,
     const uint32_t base = (d.gpu.flags >> kMatTintBaseShift) & kMatTintBaseMask;
     for (size_t i = 0; i < d.tints.size() && i < kMatTintsMax; i++)
       table[kTintPaletteBaseGpu + base + i].color0 = ArtRgbToGpu(d.tints[i]);
+  }
+
+  // Far slot palette, a fourth reserved run (world.h kFarPaletteBaseGpu) and
+  // the REVERSE of the slot every material carries in its own flags word. A
+  // far cascade cell's byte is seven bits of palette slot; raymarch.wgsl's
+  // farPalMat() reads the material id back out of `flags` here, and sim_gas
+  // does the same to ask whether a plume is drifting into a solid.
+  //
+  // `flags` and not a colour field, because what a slot maps to is a MATERIAL
+  // -- the far field wants its palette jitter, its opacity and its class, not
+  // just an RGB. Only the owner writes: an alias shares the slot precisely so
+  // that the byte resolves to the material it named.
+  for (size_t i = 0; i < mats.size() && i < 4096; i++) {
+    if (!mats[i].farPalOwner) continue;
+    table[kFarPaletteBaseGpu + mats[i].farPalSlot].flags = (uint32_t)i;
   }
 
   // Art palette, same trick one range lower (world.h). Re-applied here because
@@ -1220,7 +1312,7 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   // because BuildPipelines is the single place F5 recompiles, and the cache's
   // enable flag has to be recomputed in lockstep with raymarch.wgsl's const.
   rhi::ShaderModule mShadow;
-  rhi::ShaderModule mExplode, mParticle, mFluid, mFluidSeam, mWaterBody;
+  rhi::ShaderModule mExplode, mParticle, mFluid, mFluidSeam, mWaterBody, mGas;
   rhi::ShaderModule mRay, mDebris, mMicroBody, mDebugLines, mDebugWind, mDebugCur;
   // The TAA resolve (taa.wgsl). Its own tiny module on purpose: the render
   // pipeline it feeds must stay a fast driver compile, and growing raymarch's
@@ -1244,6 +1336,7 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
     mod(&mShadow, "shadow_resolve.wgsl");
     mod(&mExplode, "sim_explode.wgsl");
     mod(&mParticle, "sim_particle.wgsl");
+    mod(&mGas, "sim_gas.wgsl");
     mod(&mFluid, "sim_fluid.wgsl");
     mod(&mFluidSeam, "sim_fluid_seam.wgsl");
     mod(&mWaterBody, "sim_waterbody.wgsl");
@@ -1258,7 +1351,7 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   }
   if (!mWorldgen || !mMutate || !mCompact || !mStep || !mOcc || !mPick ||
       !mOpenness || !mGlow ||
-      !mExplode || !mParticle || !mFluid || !mFluidSeam || !mWaterBody ||
+      !mExplode || !mParticle || !mGas || !mFluid || !mFluidSeam || !mWaterBody ||
       !mRay || !mDebris ||
       !mMicroBody || !mDebugLines || !mDebugWind || !mDebugCur) {
     if (err) *err = "shader file read failure";
@@ -1327,6 +1420,11 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   pool.Add([&] { pIntegrate_ = MakeComputePipeline(device, simPL2_, mParticle, "integrate", "pIntegrate"); });
   pool.Add([&] { pArgs2_ = MakeComputePipeline(device, simPL2_, mParticle, "args2", "pArgs2"); });
   pool.Add([&] { pResolve_ = MakeComputePipeline(device, simPL2_, mParticle, "resolve", "pResolve"); });
+  pool.Add([&] { gArgs1_ = MakeComputePipeline(device, gasPL_, mGas, "gasArgs1", "gasArgs1"); });
+  pool.Add([&] { gSpawn_ = MakeComputePipeline(device, gasPL_, mGas, "gasSpawnStep", "gasSpawn"); });
+  pool.Add([&] { gIntegrate_ = MakeComputePipeline(device, gasPL_, mGas, "gasIntegrate", "gasIntegrate"); });
+  pool.Add([&] { gArgs2_ = MakeComputePipeline(device, gasPL_, mGas, "gasArgs2", "gasArgs2"); });
+  pool.Add([&] { gResolve_ = MakeComputePipeline(device, gasPL_, mGas, "gasResolve", "gasResolve"); });
 
   pool.Add([&] { fluidMark_ = MakeComputePipeline(device, fluidPL_, mFluid, "mark", "fluidMark"); });
   pool.Add([&] { fluidAlloc_ = MakeComputePipeline(device, fluidPL_, mFluid, "alloc", "fluidAlloc"); });
@@ -1392,65 +1490,25 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   // DESIGN.md §9 both say the cascades are RENDER-ONLY DERIVED DATA with no
   // determinism attached, so the world can tick, hash and save without them;
   // all that is missing is the horizon. So they are built off the critical
-  // path and this function returns while they are still compiling.
+  // path (StartFarBuild) and this function returns while they are still
+  // compiling — or, under FarBuild::Lazy, before they have started: a run that
+  // never asks for cascade content never compiles them at all.
   //
-  // Everything the deferred thread touches is captured BY VALUE (the device,
-  // the layout, the module — all seam handles, all shared_ptr) so it names no
-  // Simulation member and cannot race this object. The result is published on
-  // the main thread by PollFarPipelines / WaitForFarPipelines.
-  //
+  // The previous build's far set is dropped here whichever policy applies.
+  // WaitForFarPipelines at the top of this function joined its thread, so
+  // nothing is compiling from the module these handles came from.
+  farFill_ = {};
+  farPatchFill_ = {};
+  farDown_ = {};
+  farPublished_ = false;
+  farStarted_ = false;
+  farReady_.store(false, std::memory_order_release);
+  farModule_ = mWorldgen;
+  farBuildThreads_ = buildThreads;
   // Serial under `--shader-stats` for the same reason the pool is: that mode
-  // exists to interrogate every pipeline the driver compiled this run.
-  {
-    const rhi::Device dev = device;
-    const rhi::PipelineLayout layout = farPL_;
-    const rhi::ShaderModule module = mWorldgen;
-    auto build = [dev, layout, module]() {
-      FarPipelines r;
-      // One thread per entry point: sequentially these are the sum, in
-      // parallel they are max(), which is the wall clock this whole package is
-      // bounded by. `farpatch` joined the set with package C's split of `far`
-      // into sweep + edit-patch — the split only pays if the halves compile
-      // CONCURRENTLY, so it gets a thread of its own like `fardown` did.
-      std::thread down([&] {
-        r.down = MakeComputePipeline(dev, layout, module, "fardown", "farDown");
-      });
-      std::thread patch([&] {
-        r.patch = MakeComputePipeline(dev, layout, module, "farpatch",
-                                      "farPatchFill");
-      });
-      r.fill = MakeComputePipeline(dev, layout, module, "far", "farFill");
-      patch.join();
-      down.join();
-      MarkFarReady();
-      // THE HORIZON'S ARRIVAL TIME, printed unconditionally. It is the number
-      // this whole package is measured by and there is no other record of it
-      // in a windowed run (build/last_run.json is a headless-mode artifact),
-      // so it must not be behind SANDVOX_SHADER_TIMING.
-      std::printf("far-cascade pipelines ready %.1f s after the first pipeline "
-                  "create (the game has been running since %.1f s)\n",
-                  FarReadyMs() / 1000.0, InteractiveReadyMs() / 1000.0);
-      std::fflush(stdout);
-      // The horizon's ISA is the single most expensive thing on this disk.
-      // Saved from this thread the moment it exists, for the same reason the
-      // two saves above exist: the next launch must not pay it again because
-      // this one was killed.
-      rhi::vkr::SavePipelineCache(dev);
-      return r;
-    };
-    if (buildThreads <= 1) {
-      FarPipelines r = build();
-      farFill_ = std::move(r.fill);
-      farPatchFill_ = std::move(r.patch);
-      farDown_ = std::move(r.down);
-      farPublished_ = true;
-      farReady_.store(true, std::memory_order_release);
-    } else {
-      farFuture_ = std::async(std::launch::async, build);
-      farPublished_ = false;
-      farReady_.store(false, std::memory_order_release);
-    }
-  }
+  // exists to interrogate every pipeline the driver compiled this run — so it
+  // is also never lazy.
+  if (farBuild_ == FarBuild::Eager || buildThreads <= 1) StartFarBuild(buildThreads);
   MarkInteractiveReady();
 
   // A backend that fails pipeline creation returns an INVALID handle (Vulkan:
@@ -1465,7 +1523,9 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   if (!worldgen_ || !worldgenList_ || !pageFill_ || !mutate_ ||
       !mutateCells_ || !windWake_ || !compact_ || !compactNext_ || !step_ || !occupancy_ ||
       !occupancyDirty_ || !pick_ || !explodeMark_ || !explodeApply_ || !pArgs1_ ||
-      !pSpawn_ || !pIntegrate_ || !pArgs2_ || !pResolve_ || !fluidSpawn_ ||
+      !pSpawn_ || !pIntegrate_ || !pArgs2_ || !pResolve_ ||
+      !gArgs1_ || !gSpawn_ || !gIntegrate_ || !gArgs2_ || !gResolve_ ||
+      !fluidSpawn_ ||
       !fluidMark_ || !fluidAlloc_ || !fluidClear_ || !fluidP2g_ ||
       !fluidP2g2_ || !fluidGridUp_ || !fluidG2p_ || !fluidCompactCount_ ||
       !fluidCompactScan_ || !fluidCompactScatter_ || !fluidExciteDetect_ ||
@@ -1503,6 +1563,61 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
 // need no synchronization: a row either sees the pre-publish INVALID handle
 // and is skipped, or sees the published one. `farReady_` is the release/
 // acquire edge that makes the second case's handle fully constructed.
+
+void Simulation::StartFarBuild(unsigned threads) {
+  if (farStarted_ || !farModule_) return;
+  farStarted_ = true;
+  // Everything the compile thread touches is captured BY VALUE (the device,
+  // the layout, the module — all seam handles, all shared_ptr) so it names no
+  // Simulation member and cannot race this object. The result is published on
+  // the main thread by PollFarPipelines / WaitForFarPipelines.
+  const rhi::Device dev = device_;
+  const rhi::PipelineLayout layout = farPL_;
+  const rhi::ShaderModule module = farModule_;
+  auto build = [dev, layout, module]() {
+    FarPipelines r;
+    // One thread per entry point: sequentially these are the sum, in
+    // parallel they are max(), which is the wall clock this whole package is
+    // bounded by. `farpatch` joined the set with package C's split of `far`
+    // into sweep + edit-patch — the split only pays if the halves compile
+    // CONCURRENTLY, so it gets a thread of its own like `fardown` did.
+    std::thread down([&] {
+      r.down = MakeComputePipeline(dev, layout, module, "fardown", "farDown");
+    });
+    std::thread patch([&] {
+      r.patch = MakeComputePipeline(dev, layout, module, "farpatch",
+                                    "farPatchFill");
+    });
+    r.fill = MakeComputePipeline(dev, layout, module, "far", "farFill");
+    patch.join();
+    down.join();
+    MarkFarReady();
+    // THE HORIZON'S ARRIVAL TIME, printed unconditionally. It is the number
+    // this whole package is measured by and there is no other record of it
+    // in a windowed run (build/last_run.json is a headless-mode artifact),
+    // so it must not be behind SANDVOX_SHADER_TIMING.
+    std::printf("far-cascade pipelines ready %.1f s after the first pipeline "
+                "create (the game has been running since %.1f s)\n",
+                FarReadyMs() / 1000.0, InteractiveReadyMs() / 1000.0);
+    std::fflush(stdout);
+    // The horizon's ISA is the single most expensive thing on this disk.
+    // Saved from this thread the moment it exists, for the same reason the
+    // two saves in BuildPipelines exist: the next launch must not pay it
+    // again because this one was killed.
+    rhi::vkr::SavePipelineCache(dev);
+    return r;
+  };
+  if (threads <= 1) {
+    FarPipelines r = build();
+    farFill_ = std::move(r.fill);
+    farPatchFill_ = std::move(r.patch);
+    farDown_ = std::move(r.down);
+    farPublished_ = true;
+    farReady_.store(true, std::memory_order_release);
+  } else {
+    farFuture_ = std::async(std::launch::async, build);
+  }
+}
 
 void Simulation::PublishFarPipelines() {
   FarPipelines r = farFuture_.get();  // blocks if the thread is still running
@@ -1611,6 +1726,8 @@ struct RecordCtx {
   // vk_record.h's field; defaults TRUE so the CA records unless proven idle.
   bool caActive = true;
   bool vizActive = false;
+  // Gas particles (docs/PLAN_gas_particles.md). See the latch in EncodeTick.
+  bool gasActive = false;
 };
 
 // NOTE: the condition and dispatch-extent resolvers that used to live here
@@ -1697,6 +1814,15 @@ const rhi::Buffer& Simulation::PassBuffer(pass::Buf b) const {
     case B::WaterBodyState:      return world_->waterBodyState;
     case B::TreeAtlas:           return treeAtlasBuf_;
     case B::WorldMap:            return worldMapBuf_;
+    case B::GasParticlesRead:    return world_->gasParticles[page_];
+    case B::GasParticlesWrite:   return world_->gasParticles[1 - page_];
+    case B::GasCounts:           return world_->gasCounts;
+    case B::GasClaim:            return world_->gasClaim;
+    case B::GasSpawn:            return world_->gasSpawn;
+    case B::GasSpawnOps:         return world_->gasSpawnOps;
+    case B::GasArgsStage:        return world_->gasArgs;
+    case B::GasDispatchArgs:     return world_->gasDispatchArgs;
+    case B::GasOuter:            return world_->gasOuter;
     default:                return world_->voxels;
   }
 }
@@ -1718,6 +1844,11 @@ const rhi::ComputePipeline& Simulation::PassPipeline(pass::Pipe p) const {
     case P::Pick:           return pick_;
     case P::ExplodeMark:    return explodeMark_;
     case P::ExplodeApply:   return explodeApply_;
+    case P::GasArgs1:       return gArgs1_;
+    case P::GasSpawnP:      return gSpawn_;
+    case P::GasIntegrate:   return gIntegrate_;
+    case P::GasArgs2:       return gArgs2_;
+    case P::GasResolve:     return gResolve_;
     case P::PArgs1:         return pArgs1_;
     case P::PSpawn:         return pSpawn_;
     case P::PIntegrate:     return pIntegrate_;
@@ -1810,6 +1941,7 @@ void Simulation::RecordTable(const rhi::CommandEncoder& enc, pass::Table which,
   tc.denseWorldgen = cx.denseWorldgen;
   tc.caActive = cx.caActive;
   tc.vizActive = cx.vizActive;
+  tc.gasActive = cx.gasActive;
 
   rhi::TableBindings tb{};
   for (int i = 0; i < (int)pass::Buf::kCount; i++)
@@ -1824,6 +1956,7 @@ void Simulation::RecordTable(const rhi::CommandEncoder& enc, pass::Table which,
   tb.slimFarLayout = farPL_;
   tb.slimFluidLayout = fluidPL_;
   tb.slimFluidSeamLayout = fluidSeamPL_;
+  tb.slimGasLayout = gasPL_;
   tb.shadowLayout = shadowPL_;
   tb.simSet = simBG_[page_];
   tb.slimSet = simSlimBG_[page_];
@@ -1831,6 +1964,7 @@ void Simulation::RecordTable(const rhi::CommandEncoder& enc, pass::Table which,
   tb.farSet = farBG_;
   tb.fluidSet = fluidBG_[page_];
   tb.fluidSeamSet = fluidSeamBG_[page_];
+  tb.gasSet = gasBG_[page_];
   tb.shadowSet = shadowBG_;
 
   rhi::RecordTableVulkan(enc, which, tc, tb,
@@ -1920,7 +2054,7 @@ void Simulation::EncodeWakeAll(const rhi::Queue& queue) {
   // dirty[page_] is the buffer the NEXT compact pass reads (dirtyIn). One u32
   // flag per chunk; 32768 chunks = 128 KB, far inside the ~1 MB/tick CPU->GPU
   // budget, and only written on a phase boundary.
-  static const std::vector<uint32_t> ones(kNumChunks, 1u);
+  static const std::vector<uint32_t> ones(kNumSlots, 1u);
   queue.WriteBuffer(world_->dirty[page_], 0, ones.data(),
                     ones.size() * sizeof(uint32_t));
 
@@ -2073,7 +2207,22 @@ void Simulation::NoteSnapshot(uint32_t snapTick, uint32_t activeChunks,
   // the safe direction, and it is bounded in practice: the counts are zeroed
   // per tick while the particle pipeline runs, so the population genuinely
   // reaches 0 a couple of ticks after the last particle dies and stays there.
-  if (activeChunks != 0 || particleCount != 0) {
+  //
+  // GAS PARCELS COUNT HERE TOO, and the omission was a real hole rather than a
+  // tidiness point. A parcel outside the residency window is a GPU-side dirty
+  // writer with no CPU-known target in exactly the sense fact (3) describes:
+  // `gasResolve` can land it as a voxel through the claim path and dirty that
+  // chunk, on a tick the CPU had proved settled. The landing is not LOST — the
+  // gas rows are recorded under their own condition and the mark reaches
+  // dirtyOut — but the chunk would then be simulated a tick or two late,
+  // whenever the snapshot ring got around to reporting it, and "how late"
+  // depends on readback scheduling. That is a scheduling-dependent outcome
+  // (rule 1), and it is the same argument that put `particleCount` in this
+  // conjunct in the first place.
+  //
+  // `gasLive_` is the snapshot's parcel count, so it is stale in the same
+  // bounded way `particleCount` is, and staleness can only COST a skip.
+  if (activeChunks != 0 || particleCount != 0 || gasLive_ != 0) {
     settledProven_ = false;
     return;
   }
@@ -2170,9 +2319,15 @@ void Simulation::EncodeTick(const rhi::CommandEncoder& enc, uint32_t opsCount,
   // settled world with a fan pointed at a dune would otherwise prove itself
   // idle and skip the CA rows the wake had just made necessary — the fan would
   // mark chunks nothing then simulated.
+  // gasSpawnsThisTick_ is in the disjunction for windWakeCount's reason: a
+  // CPU-authored gas parcel IS a chunk-dirtying input, because it can re-enter
+  // the window and land as a voxel. gasLeave conversions are deliberately NOT
+  // here and do not need to be — a voxel can only reach the edge on a tick the
+  // CA ran, and the CA running already means this world was not proved idle.
   const bool inputsThisTick = opsCount > 0 || expCount > 0 || cellCount > 0 ||
                               spawnCount > 0 || windWakeCount > 0 ||
-                              fluidCount > 0 || fluidSpawnCount > 0;
+                              fluidCount > 0 || fluidSpawnCount > 0 ||
+                              gasSpawnsThisTick_ > 0;
   if (inputsThisTick) {
     lastDirtyTick_ = curTick_;
     settledProven_ = false;
@@ -2192,6 +2347,53 @@ void Simulation::EncodeTick(const rhi::CommandEncoder& enc, uint32_t opsCount,
   }
   caSkipped_ = !cx.caActive;
   if (caSkipped_) caSkipCount_++;
+
+  // ---- C_GAS: a LATCH, not a live count ----------------------------------
+  // A gas parcel can only be CREATED on a tick the CA runs (sim_step's
+  // gasLeave) or one the CPU queued spawns on, so those two are the arming
+  // conditions. The disarming one cannot be either of them: parcels persist
+  // for ~111 ticks after the fire that made them goes out, and the only count
+  // of them is `gasLive_`, which arrives on the snapshot ring several ticks
+  // late. Turning the rows off on a stale zero would freeze a plume in the sky
+  // permanently — and it would stay frozen, because the pass that would have
+  // stepped it is the one that is not recorded.
+  //
+  // So: arm on either creator, hold for kGasIdleTicks past the last one (long
+  // enough for the ring to speak), and let a snapshot that says parcels are
+  // alive keep it armed indefinitely. When the plume really is gone the count
+  // reaches zero, the latch runs out, and not one gas row is recorded — which
+  // is the rule-2 claim this whole condition exists to make.
+  if (cx.caActive || gasSpawnsThisTick_ > 0) {
+    gasIdleTicks_ = 0;
+  } else if (gasIdleTicks_ < kGasIdleTicks) {
+    gasIdleTicks_++;
+  }
+  // sim.gasMode 0 is an EXACT off switch, not a cheap path: no gas row is
+  // recorded at all, so the buffers are never cleared, the passes never
+  // dispatch, and the only remaining gas code in the build is a branch in the
+  // CA that tests this same value. Read from CurrentTuning() here rather than
+  // passed in, for the openness/glow budgets' reason — it is a KNOB, not a
+  // count of this tick's work, and every caller of EncodeTick would otherwise
+  // have to forward a value none of them owns.
+  const bool gasOn = CurrentTuning().sim.gasMode != (int)kGasModeWall;
+  cx.gasActive = gasOn && (cx.caActive || gasSpawnsThisTick_ > 0 ||
+                           gasLive_ > 0 || gasIdleTicks_ < kGasIdleTicks);
+  gasSpawnsThisTick_ = 0;
+
+  // ---- THE RENDER FLAG, which is a DIFFERENT question ---------------------
+  // cx.gasActive above answers "must the gas PASSES run", and it is true
+  // whenever the CA is, because a gas parcel can be created on any tick a
+  // voxel reaches a face. That is the right answer for the sim and the wrong
+  // one for the renderer: it would put the crossfade's band sampling on every
+  // terrain pixel of every frame in any world with a running CA, including
+  // every world that has never had a fire in it.
+  //
+  // So this one asks "is there gas ANYWHERE" -- parcels or in-window voxels --
+  // and holds for kGasSeenTicks past the last snapshot that saw either. When
+  // the plume is really gone the flag drops and raymarch.wgsl skips the fade,
+  // the band and the fold entirely. See renderspec.h.
+  if (gasSeenHold_ > 0) gasSeenHold_--;
+  sandvox::SetGasRenderActive(gasOn && gasSeenHold_ > 0);
 
   RecordTable(enc, pass::Table::Tick, &cx);
 

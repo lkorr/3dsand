@@ -191,6 +191,14 @@ bool g_autoflyHard = false;  // --autofly-hard: adversarial traversal for pool s
 // surface case is where the frame cost lives (docs/PLAN_surface_flight_perf.md
 // Part A), and it is exactly the case the descent cannot reach.
 bool g_autoflySurface = false;
+// --autowalk: the WALKING harness. Forward held on foot (no fly), a hop every
+// 45 ticks to clear low obstacles, and a quarter turn every 240 ticks so a
+// wall does not end the walk. Exists because the two CPU spikes reported
+// from live play (terrain-collider rebuilds on a chunk-boundary crossing,
+// the GPU-lag catch-up loop) never fire under fly mode: a flying player has
+// no ground to collide with and crosses chunk boundaries too fast to walk
+// into a mob's nav horizon. Pair with --duel-dummy for a hostile follower.
+bool g_autoWalk = false;
 // Which of the two --autofly-surface regimes the current frame is in, set from
 // the tick phase in the input block and consumed by the altitude pin after
 // player.Update. Two sites because the phase is known where every other autofly
@@ -235,6 +243,21 @@ std::vector<double> g_frameScopeSeries[sandvox::kPerfScopeCount];
 uint64_t g_frameSnapStalls = 0;      // total paged-staleness WaitIdle stalls
 uint64_t g_frameSnapStallFrames = 0; // frames that paid at least one
 uint64_t g_frameRbDeclines = 0;      // readback requests the ring refused
+// Ticks the GPU-lag throttle (the tick loop) pushed to a later frame because
+// the GPU still owed two or more snapshot readbacks. Sim time dilates by that
+// many ticks instead of the frame stalling on a fence.
+uint64_t g_ticksThrottled = 0;
+// --frames: the GPU side of the same picture. The live telemetry path already
+// bills every timestamped pass to its Engine-map node per frame; the harness
+// keeps the per-frame series so the summary can say WHICH GPU row spiked,
+// which is the question every stall on the CPU side ends in.
+std::vector<double> g_frameGpuSeries[sandvox::kPerfNodeCount];
+// ...and per PASS, because a node is a sum: `farField` is farDown (the
+// dirty-list downsample) + farFill (the sieve) + farPatchFill, and they
+// scale with different things. Keyed by pass name; a frame in which a pass
+// did not run is a zero for it, padded at print time.
+std::map<std::string, std::vector<double>> g_frameGpuPassSeries;
+size_t g_frameGpuFrames = 0;
 // P2-D: WHICH cause and WHICH arm (support.h SnapshotStallStats). Accumulated
 // over the harness frames only, like the three counters above.
 sandvox::SnapshotStallStats g_frameStallStats{};
@@ -339,7 +362,7 @@ void ParkSampleRequest(World& world, const char* label) {
   g_parkIdleIds.clear();
   std::map<int, uint32_t> yhist;
   uint32_t emptyActive = 0, totalActive = 0;
-  for (uint32_t i = 0; i < kNumChunks; i++) {
+  for (uint32_t i = 0; i < kNumSlots; i++) {
     if (!s.dirtyFlags[i]) continue;
     totalActive++;
     if (s.occupancy[i] == 0) emptyActive++;
@@ -355,7 +378,7 @@ void ParkSampleRequest(World& world, const char* label) {
   // nothing else.
   auto sample = [&](bool wantActive, std::vector<IVec3>& arm) {
     uint32_t pool = 0;
-    for (uint32_t i = 0; i < kNumChunks; i++) {
+    for (uint32_t i = 0; i < kNumSlots; i++) {
       const bool act = s.dirtyFlags[i] != 0;
       if (act != wantActive) continue;
       // Control arm is non-empty chunks only - comparing against sky would
@@ -365,7 +388,7 @@ void ParkSampleRequest(World& world, const char* label) {
     }
     const uint32_t stride = pool > kArm ? pool / kArm : 1u;
     uint32_t seenN = 0;
-    for (uint32_t i = 0; i < kNumChunks && arm.size() < kArm; i++) {
+    for (uint32_t i = 0; i < kNumSlots && arm.size() < kArm; i++) {
       const bool act = s.dirtyFlags[i] != 0;
       if (act != wantActive) continue;
       if (!act && s.occupancy[i] == 0) continue;
@@ -2787,6 +2810,10 @@ int RunVerify(GpuContext& ctx, World& world, Simulation& sim,
 int main(int argc, char** argv) {
   InstallCrashHandler();
   StartupMark("main");
+  // The last mark a run prints: after every local in main() is gone and
+  // before static destructors. The gap from the previous mark is the cost of
+  // tearing the engine down.
+  std::atexit([] { StartupMark("atexit: all of main()'s locals destroyed"); });
 
   // --crash-test: fault on purpose, so the crash REPORTER is verifiable.
   // The handler is the one piece of code whose correctness cannot be observed
@@ -2936,6 +2963,7 @@ int main(int argc, char** argv) {
           "  --autofly             Enable autofly camera\n"
           "  --autofly-hard        Adversarial autofly (diagonal + descent)\n"
           "  --autofly-surface     Surface-following autofly\n"
+          "  --autowalk            Walk on foot: forward held, hop /45 ticks, quarter turn /240\n"
           "  --autofly-park        Surface autofly that stops (sleep discriminator)\n"
           "  --measure             Vulkan sizing harness (occupancy + GPU timings)\n"
           "  --perf                Performance suite -> build/perf.json (tuner Performance tab)\n"
@@ -3030,6 +3058,7 @@ int main(int argc, char** argv) {
     // starting position — the panel stays the live authority from frame 1.
     else if (a == "--short-range") SetShortRange(true);
     else if (a == "--autofly") g_autofly = true;
+    else if (a == "--autowalk") g_autoWalk = true;
     else if (a == "--autofly-hard") { g_autofly = true; g_autoflyHard = true; }
     else if (a == "--autofly-surface") { g_autofly = true; g_autoflySurface = true; }
     // `--autofly-park` is --autofly-surface that STOPS (see ParkProbe): the
@@ -3624,7 +3653,7 @@ int main(int argc, char** argv) {
   // the TimestampQuery device feature (per-pass GPU timings).
   if (!ctx.Init(window, 1600, 900, lowPowerAdapter,
                 /*wantTimestamps=*/measure || perf || renderBudget || fluidBench ||
-                    budgetArms || telemetryEnabled,
+                    budgetArms || telemetryEnabled || g_harnessFrames > 0,
                 backend, vkValidation,
                 sledgehammer))
     return 1;
@@ -3646,6 +3675,34 @@ int main(int argc, char** argv) {
   world.Init(ctx.device);
   StartupMark("world buffers (page pool, far cascades)");
   Simulation sim;
+  // WHETHER THE FAR CASCADES COMPILE AT ALL (Simulation::FarBuild). Decided
+  // before Init because BuildPipelines is what would start them. Eager for
+  // anything that will render a horizon — the game and --frames, every --shot
+  // family, --measure / --perf / --render-budget, --shader-stats (which must
+  // see every pipeline), and the FULL selftest suite, which contains the far
+  // gates. Lazy for the iteration tools: --voxdump / --voxserve, a filtered
+  // `--gate` / `--verify` run, --sweep, the fluid bench. Lazy is not "never":
+  // a far gate under `--gate far-fog` still gets its pipelines, it just pays
+  // for them when it asks (Simulation::EnsureFarPipelines) instead of the
+  // whole run paying at exit for a horizon nobody looked at.
+  {
+    const bool voxelTool = voxserve || !voxdumpArgs.empty();
+    const bool checkedOutput =
+        selftest || verify || measure || perf || renderBudget || budgetArms ||
+        shot || shotFrames || shotWaterfall || shotFluid || shotFluidPond ||
+        fluidBench || shaderStats || !shotMob.empty() || !sweepParam.empty();
+    const bool rendersHorizon =
+        shot || shotFrames || shotWaterfall || shotFluid || shotFluidPond ||
+        !shotMob.empty() || measure || perf || renderBudget || budgetArms ||
+        shaderStats || suiteAcceptance ||
+        (selftest && stOpt.only.empty() && !stOpt.list && sweepParam.empty());
+    const bool eager = (!checkedOutput && !voxelTool) || rendersHorizon;
+    sim.SetFarBuild(eager ? Simulation::FarBuild::Eager
+                          : Simulation::FarBuild::Lazy);
+    if (!eager)
+      std::printf("far-cascade pipelines: lazy (compiled only if this run asks "
+                  "for cascade content)\n");
+  }
   if (!sim.Init(ctx.device, world, mats, reactions, micro, treeAtlas, worldMapWords,
                 assetDir + "/shaders"))
     return 1;
@@ -3682,7 +3739,9 @@ int main(int argc, char** argv) {
   // only if the RENDER_STATS const actually compiled in (fragment atomics).
   sandvox::RenderStatsRing liveStats;
   bool liveStatsOn = false;
-  if (telemetryEnabled) {
+  // The `--frames` harness takes the timers too (not the port): its summary
+  // prints the per-node GPU rows beside the CPU scopes, from the same samples.
+  if (telemetryEnabled || g_harnessFrames > 0) {
     if (liveTimer.Init(ctx, 192)) {
       liveTimer.SetRowGranularity(true);
       sim.SetPassTimer(&liveTimer);
@@ -3691,10 +3750,11 @@ int main(int argc, char** argv) {
     }
     liveStatsOn = RenderStatsEnabled() && FragmentStoresAvailable() &&
                   liveStats.Init(ctx);
-    std::printf("telemetry: live on port %u, GPU pass timings %s, raymarch "
-                "step counters %s\n",
-                telemetryPort, liveTimed ? "ON" : "unavailable (no timestamps)",
-                liveStatsOn ? "ON" : "off");
+    if (telemetryEnabled)
+      std::printf("telemetry: live on port %u, GPU pass timings %s, raymarch "
+                  "step counters %s\n",
+                  telemetryPort, liveTimed ? "ON" : "unavailable (no timestamps)",
+                  liveStatsOn ? "ON" : "off");
   }
   // The frame being accumulated, and the map from a frame number to the sample
   // still waiting for its GPU numbers. Three deep: a deferred timestamp map
@@ -3702,7 +3762,11 @@ int main(int argc, char** argv) {
   // been sent cannot be corrected.
   sandvox::PerfSample liveSample;
   uint32_t liveFrameNo = 0;
-  struct LivePending { uint32_t frame; sandvox::PerfSample s; };
+  struct LivePending {
+    uint32_t frame;
+    sandvox::PerfSample s;
+    std::vector<std::pair<const char*, double>> passes;  // harness only
+  };
   std::vector<LivePending> livePending;
 
   Physics phys;
@@ -3945,7 +4009,13 @@ int main(int argc, char** argv) {
     if (stOpt.list) return selftest::List();
     selftest::Ctx sc{ctx,   world,  sim,    mats,  reactions,
                      phys,  debris, mobs,   stream, items};
-    return selftest::Run(sc, stOpt);
+    const int rc = selftest::Run(sc, stOpt);
+    // The gate has printed its verdict; everything after this line is
+    // destructors. Marked because a headless run was measured sitting 45 s
+    // between its last line and process exit (2026-09-09), and without a
+    // clock on it that time is invisible.
+    StartupMark("selftest returned; teardown begins");
+    return rc;
   }
 
   // BEFORE Overlay::Init — ImGui's own scroll callback chains to whatever was
@@ -4559,7 +4629,14 @@ int main(int argc, char** argv) {
   while (!glfwWindowShouldClose(window)) {
     if (g_harnessFrames > 0) {
       frameCounter++;
-      if (frameCounter == g_harnessFrames / 2) {
+      // The mid-run reload verifies the F5 path, but it also recompiles every
+      // pipeline in the foreground and the far set on three background
+      // threads for the next ~40 s, which is half the run — so the frame-time
+      // tail of a default `--frames` run is the compiler, not the game.
+      // SANDVOX_FRAMES_NO_RELOAD=1 is the measurement arm.
+      static const bool noReload =
+          std::getenv("SANDVOX_FRAMES_NO_RELOAD") != nullptr;
+      if (frameCounter == g_harnessFrames / 2 && !noReload) {
         std::printf("--frames harness: triggering shader reload (F5 path)\n");
         ui.reloadShaders = true;
       }
@@ -5092,6 +5169,20 @@ int main(int argc, char** argv) {
     // --autofly: hold W+sprint in fly mode, no human at the keyboard. Exists to
     // reproduce the streaming-shift stutter, which only appears when the window
     // origin moves several chunks per second.
+    if (g_autoWalk) {
+      player.fly = false;
+      ui.fly = false;
+      pin.forward = 1.f;
+      pin.strafe = 0.f;
+      pin.sprint = false;
+      static uint32_t lastHopTick = ~0u;
+      if (tick % 45u == 0u && lastHopTick != tick) {
+        pin.jumpPressed = true;
+        lastHopTick = tick;
+      }
+      // A fixed tick schedule, like the autofly phases: reproducible run to run.
+      cam.yaw = 2.35f + (float)((tick / 240u) % 4u) * 1.5707963f;
+    }
     if (g_autofly) {
       player.fly = true;
       ui.fly = true;
@@ -5850,6 +5941,45 @@ int main(int argc, char** argv) {
     // them, so a slow frame used to shift two or three times and get slower.
     stream.BeginFrame();
     while (accumulator >= kTickDt && ticksThisFrame < kMaxTicksPerFrame) {
+      // ---- THE GPU-LAG THROTTLE: a second tick only if the GPU can take it.
+      //
+      // The 4-tick catch-up above is Gaffer's clamp and it is right for a CPU
+      // hitch: the CPU owes the world some ticks and pays them. It is WRONG
+      // when the long frame was the GPU's: every tick submits a plane of
+      // worldgen, a CA pass and a snapshot copy, so paying three of them into
+      // a queue that is already a frame behind makes the next frame longer,
+      // which owes more ticks, which is the loop that ends in the two blocking
+      // waits on this path — SubmitTick's snapshot-staleness fence (Snapshot
+      // Stall) and Stream's T+kWakeLatency wake fence (billed to World
+      // Storage). Measured `--frames 900 --autofly-surface` before this:
+      // stalls on 14.8% of frames, 215 fences for 7.95 s, whole-frame p99
+      // 539 ms.
+      //
+      // The lag is READ, not guessed: each submitted tick kicks one snapshot
+      // readback (KickReadback) and its map ticket stays pending until that
+      // submit's fence signals, so PendingMapCount after a pump is exactly
+      // how many ticks the GPU has not finished. The first tick of a frame
+      // always runs; each further one runs only while the GPU owes fewer than
+      // two. When it owes more, the surplus debt is DROPPED (sim time dilates
+      // by those ticks) rather than banked, or the frame the GPU catches up
+      // on would fire a four-tick burst and put it straight back behind.
+      //
+      // Pure pacing: which ticks run and what they compute is unchanged, so
+      // no hashed state moves and the headless harnesses never see this
+      // branch (they have no frame loop). Read the `ticksThisFrame` counter
+      // on the Performance tab, or the harness's `gpu-lag throttle` line.
+      // SANDVOX_NO_GPU_THROTTLE=1 is the A/B arm in one binary: the pre-throttle
+      // loop, for measuring what the throttle buys on a given scene.
+      static const bool noThrottle = std::getenv("SANDVOX_NO_GPU_THROTTLE") != nullptr;
+      if (ticksThisFrame > 0 && !noThrottle) {
+        ctx.ProcessEvents();  // retire what the GPU finished during the tick above
+        constexpr int kGpuLagThrottleTicks = 2;
+        if (ctx.PendingMapCount() >= kGpuLagThrottleTicks) {
+          g_ticksThrottled++;
+          accumulator = std::min(accumulator, (double)kTickDt);
+          break;
+        }
+      }
       accumulator -= kTickDt;
       if (ui.paused && !ui.stepOnce) break;
       ui.stepOnce = false;
@@ -7943,7 +8073,7 @@ int main(int argc, char** argv) {
       ui.tickCpuMs = tickMsSmooth;
       ui.tick = tick;
       ui.activeChunks = world.Snap().activeChunks;
-      ui.totalChunks = kNumChunks;
+      ui.totalChunks = kNumSlots;
       ui.voxelTotal = world.Snap().voxelTotal;
       ui.worldHash = world.Snap().worldHash;
       ui.mirrorValid = world.Snap().valid;
@@ -9066,9 +9196,9 @@ int main(int argc, char** argv) {
       }
       if (ui.showDirtyChunks) {
         const WorldSnapshot& dsnap = world.Snap();
-        if (dsnap.valid && dsnap.dirtyFlags.size() == kNumChunks) {
+        if (dsnap.valid && dsnap.dirtyFlags.size() == kNumSlots) {
           constexpr float h = (float)kChunk * 0.5f;
-          for (uint32_t i = 0; i < kNumChunks && dbg.size() < kMaxDebugBoxes; i++) {
+          for (uint32_t i = 0; i < kNumSlots && dbg.size() < kMaxDebugBoxes; i++) {
             if (!dsnap.dirtyFlags[i]) continue;
             IVec3 wc = world.SlotToWorldChunk(i);
             DebugBox b{};
@@ -9309,7 +9439,8 @@ int main(int argc, char** argv) {
       // The shadow-cache resolve runs BEFORE the pass and is timed by the pass
       // table (its `shadowCache` row); it is no longer inside the raymarch
       // number, so the two rows no longer double-count it.
-      const bool liveRenderTimed = liveTimed && telemetry.HasClient();
+      const bool liveRenderTimed =
+          liveTimed && (telemetry.HasClient() || g_harnessFrames > 0);
       struct LiveSpan { uint32_t b = 0, e = 0; bool on = false; };
       auto spanBegin = [&](const char* name) {
         LiveSpan sp;
@@ -9663,7 +9794,7 @@ int main(int argc, char** argv) {
     // frame early and "correcting" it later is not an option — the page has
     // already drawn it, and a bar that retroactively grows is worse than one
     // that is honestly marked as having no GPU data.
-    if (telemetry.HasClient()) {
+    if (telemetry.HasClient() || g_harnessFrames > 0) {
       using sandvox::PerfScope;
       liveSample.frame = liveFrameNo;
       liveSample.wallMs = frameWallMs;
@@ -9721,6 +9852,7 @@ int main(int argc, char** argv) {
             if (node < 0) continue;
             lp.s.gpuMs[node] += (double)ps.ns / 1e6;
             lp.s.gpuValid = true;
+            if (g_harnessFrames > 0) lp.passes.push_back({ps.name, (double)ps.ns / 1e6});
           }
           break;
         }
@@ -9752,7 +9884,28 @@ int main(int argc, char** argv) {
       while (!livePending.empty() &&
              (livePending.front().s.gpuValid ||
               liveFrameNo - livePending.front().frame >= 3)) {
-        telemetry.BroadcastSample(livePending.front().s);
+        if (telemetry.HasClient()) telemetry.BroadcastSample(livePending.front().s);
+        // The harness keeps the GPU rows of every frame that got them; a
+        // frame whose queries never resolved is left out rather than logged
+        // as zero (same rule as the page's gpuValid).
+        // Same warm-up exclusion as the CPU table (frame > 60): the first
+        // frames hold the startup horizon refill (262k far entries at
+        // kFarListCap per tick) and would own every GPU p99 otherwise.
+        if (g_harnessFrames > 0 && livePending.front().s.gpuValid &&
+            livePending.front().frame > 60) {
+          for (int n = 0; n < sandvox::kPerfNodeCount; n++)
+            g_frameGpuSeries[n].push_back(livePending.front().s.gpuMs[n]);
+          // Per pass: sum this frame's spans by name, then append one
+          // value per pass (padding to the frame count happens at print).
+          std::map<std::string, double> perPass;
+          for (const auto& pr : livePending.front().passes) perPass[pr.first] += pr.second;
+          for (const auto& pr : perPass) {
+            std::vector<double>& v = g_frameGpuPassSeries[pr.first];
+            v.resize(g_frameGpuFrames, 0.0);
+            v.push_back(pr.second);
+          }
+          g_frameGpuFrames++;
+        }
         livePending.erase(livePending.begin());
       }
       liveSample = sandvox::PerfSample{};
@@ -9835,6 +9988,66 @@ int main(int argc, char** argv) {
         }
         // The bug counter, printed whether or not it fired — "0 stalls" is a
         // result and a missing line is not.
+        // ---- THE GPU ROWS, same shape, same reason -------------------------
+        {
+          size_t gn = 0;
+          for (int n = 0; n < sandvox::kPerfNodeCount; n++)
+            gn = std::max(gn, g_frameGpuSeries[n].size());
+          if (gn > 0) {
+            std::printf("--frames harness: GPU node attribution over %zu timed frames "
+                        "(ms/frame; rows under 0.05 mean omitted)\n", gn);
+            std::printf("    %-16s %8s %8s %8s %8s\n", "node", "mean", "p50", "p99", "max");
+            int gorder[sandvox::kPerfNodeCount];
+            double gsum[sandvox::kPerfNodeCount];
+            for (int n = 0; n < sandvox::kPerfNodeCount; n++) {
+              gorder[n] = n;
+              gsum[n] = 0;
+              for (double v : g_frameGpuSeries[n]) gsum[n] += v;
+            }
+            std::sort(gorder, gorder + sandvox::kPerfNodeCount,
+                      [&](int a, int b) { return gsum[a] > gsum[b]; });
+            for (int oi = 0; oi < sandvox::kPerfNodeCount; oi++) {
+              const int n = gorder[oi];
+              std::vector<double>& v = g_frameGpuSeries[n];
+              if (v.empty() || gsum[n] / (double)v.size() < 0.05) continue;
+              std::sort(v.begin(), v.end());
+              std::printf("    %-16s %8.3f %8.3f %8.3f %8.3f\n",
+                          sandvox::kPerfNodes[n].node, gsum[n] / (double)v.size(),
+                          v[(size_t)(0.50 * (v.size() - 1))],
+                          v[(size_t)(0.99 * (v.size() - 1))], v.back());
+            }
+          }
+        }
+        if (g_frameGpuFrames > 0) {
+          std::printf("--frames harness: GPU PASS attribution (ms/frame; rows under 0.05 mean omitted)\n");
+          std::printf("    %-22s %8s %8s %8s %8s\n", "pass", "mean", "p50", "p99", "max");
+          std::vector<std::pair<double, std::string>> order;
+          for (auto& kv : g_frameGpuPassSeries) {
+            kv.second.resize(g_frameGpuFrames, 0.0);
+            double sum = 0;
+            for (double v : kv.second) sum += v;
+            order.push_back({sum / (double)g_frameGpuFrames, kv.first});
+          }
+          std::sort(order.begin(), order.end(),
+                    [](const auto& a, const auto& b) { return a.first > b.first; });
+          for (const auto& o : order) {
+            if (o.first < 0.05) continue;
+            std::vector<double>& v = g_frameGpuPassSeries[o.second];
+            std::sort(v.begin(), v.end());
+            std::printf("    %-22s %8.3f %8.3f %8.3f %8.3f\n", o.second.c_str(), o.first,
+                        v[(size_t)(0.50 * (v.size() - 1))],
+                        v[(size_t)(0.99 * (v.size() - 1))], v.back());
+          }
+        }
+        {
+          const DebrisSystem::SettleProbe& sp = debris.Settle();
+          std::printf("    terrain patches: %u rebuilt, %u deferred by the per-tick "
+                      "budget, %u refreshed with an identical occupancy box\n",
+                      sp.terrainBuilds, sp.terrainDeferred, sp.terrainSame);
+        }
+        std::printf("    gpu-lag throttle: %llu ticks deferred to a later frame "
+                    "(the GPU owed >= 2 snapshots when a second tick was due)\n",
+                    (unsigned long long)g_ticksThrottled);
         std::printf("    snapshot stalls (blocking WaitIdle on the frame path):"
                     " %llu over %llu frames (%.1f%% of frames) | readback "
                     "requests the ring refused: %llu\n",

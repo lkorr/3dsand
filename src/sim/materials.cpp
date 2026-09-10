@@ -283,6 +283,14 @@ static bool LoadMaterialsJson(const std::string& path, std::vector<MaterialDef>&
       d.gpu.flags |= kMatFlagBurnTint;
     }
 
+    // ---- far-field look-alike (sim/materials.h kMatFarPalShift) ------------
+    //
+    //   "far": "stone"        at cascade distance I am stone
+    //
+    // Resolved to a slot in a POST-PASS below, for the reason the tint runs
+    // give: it names another material, which may not have been read yet.
+    d.farAlias = m.value("far", std::string{});
+
     // ---- tints: GRID colour, per material (sim/materials.h kMatFlagTinted) --
     //
     //   "tints": ["#3b2f6b", "#8b1a1a", ...]      up to kMatTintsMax
@@ -458,25 +466,105 @@ static bool LoadMaterialsJson(const std::string& path, std::vector<MaterialDef>&
   }
 
   if (mats.size() > 4096) errors += path + ": more than 4095 materials (12-bit ID limit)\n";
-  // ---- THE FAR-FIELD CASCADE OWNS BIT 7 OF ITS MATERIAL BYTE --------------
-  // A far cell is ONE byte: seven bits of material id and one conservative
-  // "something is here" flag (common.wgsl FAR_BLOCKER_BIT, 13.2.2). That split
-  // is only legal while every id fits in seven bits, and nothing else in the
-  // engine would notice if it stopped: the 118th material would simply start
-  // painting the wrong colour at distance and claiming a blocker wherever bit
-  // 7 landed, with no crash and no failing gate to name it. So the loader
-  // refuses, here, where the table is built and the number is known.
+
+  // ---- assign FAR PALETTE SLOTS (sim/materials.h kMatFarPalShift) ----------
+  // A far cascade cell is ONE byte: seven bits and one conservative "something
+  // is here" flag (common.wgsl FAR_PAL_MASK / FAR_BLOCKER_BIT, 13.2.2). Those
+  // seven bits USED to be a material id, and that is the only reason this
+  // loader ever refused a 129th material: the voxel word had room for 4096 and
+  // this byte had room for 128, and nothing in the engine would have noticed the
+  // difference -- the 129th material would simply have started painting the
+  // wrong colour at distance and claiming a blocker wherever bit 7 landed, with
+  // no crash and no failing gate to name it.
   //
-  // `mats` includes the implicit air at index 0, so 128 entries is ids 0..127
-  // and exactly fills the field. scripts/check_invariants.py refuses a
-  // materials.json that would cross the same line without a build.
-  if (mats.size() > 128)
-    errors += path + ": " + std::to_string(mats.size()) +
-              " materials (including the implicit air at id 0), but the far-field"
-              " cascade packs a material id into SEVEN bits of its per-cell byte"
-              " and bit 7 is the conservative blocker flag -- the maximum id is"
-              " 127, i.e. 128 materials. Widen the far cell (farVox is already"
-              " 1 GiB) or drop a material; do NOT raise this limit alone.\n";
+  // They are now an index into the FAR PALETTE (world.h kFarPaletteBaseGpu), so
+  // the 128 bounds how many things may look DIFFERENT FROM EACH OTHER at
+  // cascade scale -- a far-field question -- instead of how many materials may
+  // exist, which is not one. Two materials that are indistinguishable at 50 m
+  // share a slot by authoring `"far": "<material>"`.
+  //
+  // IDENTITY FIRST, and that is load-bearing rather than tidy: while every
+  // material's id fits in seven bits, slot == id, so every far byte the
+  // worldgen writes is bit-for-bit the byte it wrote before the palette
+  // existed. Aliases only ever FREE slots, and pass 2 hands the freed ones to
+  // the ids that no longer fit.
+  {
+    std::vector<int> aliasOf(mats.size(), -1);
+    for (size_t i = 0; i < mats.size(); i++) {
+      if (mats[i].farAlias.empty()) continue;
+      int t = FindMaterial(mats, mats[i].farAlias);
+      if (t < 0) {
+        errors += path + ": material \"" + mats[i].name + "\": far alias \"" +
+                  mats[i].farAlias + "\" is not a material\n";
+      } else if ((size_t)t == i) {
+        errors += path + ": material \"" + mats[i].name +
+                  "\": far alias points at itself\n";
+      } else if (t == 0) {
+        // Slot 0 is how every reader spells "nothing here" -- farOcc counts a
+        // zero byte as an empty cell. A material that aliased to air would not
+        // be "drawn as air at distance", it would delete the cell from the
+        // cascade's occupancy, which is not what anyone means by it.
+        errors += path + ": material \"" + mats[i].name +
+                  "\": far alias \"air\" -- slot 0 means an EMPTY far "
+                  "cell, not a transparent one\n";
+      } else {
+        aliasOf[i] = t;
+      }
+    }
+    // ONE HOP ONLY, checked against the snapshot so the diagnosis does not
+    // depend on file order: the slot a far byte names must always belong to a
+    // material that paints itself, or a reader would have to chase a chain it
+    // has no table for.
+    const std::vector<int> alias0 = aliasOf;
+    for (size_t i = 0; i < mats.size(); i++) {
+      if (alias0[i] < 0 || alias0[alias0[i]] < 0) continue;
+      errors += path + ": material \"" + mats[i].name + "\": far alias \"" +
+                mats[i].farAlias + "\" is itself an alias (of \"" +
+                mats[alias0[i]].farAlias + "\") -- name the material that owns "
+                "the slot\n";
+      aliasOf[i] = -1;
+    }
+
+    size_t owned = 0;
+    for (size_t i = 0; i < mats.size(); i++)
+      if (aliasOf[i] < 0) owned++;
+    if (owned > kMatFarPalSlots)
+      errors += path + ": " + std::to_string(owned) +
+                " materials (including the implicit air at id 0) each want their"
+                " own colour in the far-field cascade, which has only " +
+                std::to_string(kMatFarPalSlots) +
+                " palette slots -- seven bits of a per-cell byte, whose eighth"
+                " bit is the conservative blocker flag. Give the ones that look"
+                " alike at cascade distance a `\"far\": \"<existing material>\"`"
+                " in materials.json so they share a slot, or widen the far cell"
+                " (farVox is already 1 GiB).\n";
+
+    std::vector<int> ownerOf(kMatFarPalSlots, -1);   // slot -> material
+    std::vector<int> slotOf(mats.size(), -1);
+    for (size_t i = 0; i < mats.size() && i < kMatFarPalSlots; i++) {
+      if (aliasOf[i] >= 0) continue;
+      ownerOf[i] = (int)i;
+      slotOf[i] = (int)i;
+    }
+    uint32_t probe = 0;
+    for (size_t i = 0; i < mats.size(); i++) {
+      if (aliasOf[i] >= 0 || slotOf[i] >= 0) continue;
+      while (probe < kMatFarPalSlots && ownerOf[probe] >= 0) probe++;
+      if (probe >= kMatFarPalSlots) break;   // already reported above
+      ownerOf[probe] = (int)i;
+      slotOf[i] = (int)probe;
+    }
+    for (size_t i = 0; i < mats.size(); i++)
+      if (aliasOf[i] >= 0) slotOf[i] = slotOf[aliasOf[i]];
+    for (size_t i = 0; i < mats.size(); i++) {
+      // A material with no slot only exists on a table that already errored;
+      // 0 keeps it out of the cascade rather than aliasing it onto someone.
+      uint32_t slot = slotOf[i] < 0 ? 0u : (uint32_t)slotOf[i];
+      mats[i].farPalSlot = slot;
+      mats[i].farPalOwner = slotOf[i] >= 0 && ownerOf[slot] == (int)i;
+      mats[i].gpu.flags |= (slot & kMatFarPalMask) << kMatFarPalShift;
+    }
+  }
   return true;
 }
 

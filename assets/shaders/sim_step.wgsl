@@ -13,6 +13,13 @@
 // flow for liquids, viscosity gate, critter wander).
 
 @group(0) @binding(0) var<storage, read_write> voxels   : array<u32>;
+// THIS tick's dirty set, i.e. the reason bits every rule ORed in LAST tick. Read
+// only, and stable for the whole 54-iteration colour loop: mutate/explode write
+// it before sim_compact builds the dispatch list and nothing touches it after.
+// Same read, and the same "was this chunk actually disturbed" question, as
+// sim_waterbody's quiescence pass (pass_table.def's R(DirtyIn) note). One scalar
+// load per workgroup — see FILM_LICENCE below for the only thing that uses it.
+@group(0) @binding(1) var<storage, read>       dirtyIn  : array<u32>;
 @group(0) @binding(2) var<storage, read_write> dirtyOut : array<atomic<u32>>;
 @group(0) @binding(3) var<storage, read>       materials : array<Material>;
 @group(0) @binding(4) var<uniform> T : TickParams;
@@ -48,6 +55,66 @@
 // a fault that reports as "unknown".
 const PT_KERNEL : u32 = PT_K_STEP;
 @group(0) @binding(23) var<storage, read_write> actVoxViz  : array<atomic<u32>>;
+// ---- THE WINDOW EDGE'S OUTBOX (docs/PLAN_gas_particles.md §2.3) -----------
+// An 8-word header followed by kGasSpawnPerTick Particle-shaped records. A gas
+// voxel whose intended move leaves the residency window appends itself here
+// and deletes itself from the grid; sim_gas.wgsl's spawn pass turns the list
+// into gas particles LATER IN THIS SAME TICK. Cleared by a whole-buffer fill
+// before the CA runs, so the header words double as this tick's gas counters
+// (they are read back with the snapshot ring; see GAS_SP_* below).
+@group(0) @binding(33) var<storage, read_write> gasSpawn : array<atomic<u32>>;
+// ---- THE OUTER GAS DENSITY BOX (docs/PLAN_gas_particles.md §2.5, stage 1b) -
+// RENDER-ONLY DERIVED DATA, and the CA writes it for one reason: gas inside
+// the window is a voxel and gas outside it is a parcel, the two are drawn from
+// different representations at 64x different resolution, and until stage 1b
+// they met at the window face with NO overlap — a hard edge in the sky where
+// crisp voxel smoke became soft 0.8 m cells. The renderer crossfades between
+// them across the outer half of the window now, and it can only do that if the
+// coarse box holds the in-window plume as well as the parcels.
+//
+// The sim never reads this buffer, the world hash never covers it, and it is
+// cleared by fill_gasOuter before the CA runs. So the splat below cannot move
+// a voxel or a hash — it is exactly as observable as `actVoxViz` at 23.
+@group(0) @binding(34) var<storage, read_write> gasOuter : array<atomic<u32>>;
+
+// gasSpawn's header. Words 0..2 are written HERE (the CA is the only producer
+// of edge conversions); words 3..7 are written by sim_gas.wgsl. Must agree with
+// the GAS_SP_* block in sim_gas.wgsl and with kGasSp* in src/sim/world.h —
+// check_invariants.py compares the three.
+const GAS_SP_COUNT    : u32 = 0u;  // gasLeave append cursor (may exceed the cap)
+const GAS_SP_REFUSED  : u32 = 1u;  // gasLeave refused: the per-tick list was full
+const GAS_SP_EDGE     : u32 = 2u;  // gas voxels whose intent pointed out of the window
+const GAS_SP_HDR      : u32 = 16u; // first record word (words 8..15: sim_gas)
+const GAS_SP_STRIDE   : u32 = 8u;  // u32 per record (a 32-byte Particle)
+// kGasSpawnPerTick (src/sim/world.h). The BUDGET on edge conversions, charged
+// before the write: a refused conversion leaves the voxel exactly where it was
+// and it takes today's lateral ladder, so the edge is a rate-limited sink and
+// never a hole that loses mass.
+//
+// AND IT IS SIZED TO BE UNREACHABLE, which is a rule-1 requirement and not a
+// throughput one — the long note beside kGasSpawnPerTick in world.h has it:
+// the cursor below is a shared atomicAdd, so WHICH voxels lose when it fills
+// is scheduling-dependent, and a loser stays in the grid where the world hash
+// can see it. `gas-leave` asserts the refusal count is zero.
+const GAS_SPAWN_CAP   : u32 = 65536u;
+// The outer density box's shape. MIRRORED FROM world.h's kGasOuterN /
+// kGasOuterShift, not imported through common.wgsl: a constant only a few
+// shaders read is declared in each of them, because a common.wgsl edit misses
+// the SPIR-V cache for EVERY shader and pays the worldgen far-cascade compile
+// (CLAUDE.md). check_invariants.py's `pairs` table is what holds the three
+// copies (here, sim_gas.wgsl, raymarch.wgsl) in step with world.h — the
+// splatter and the sampler disagreeing about cell size draws a plume in the
+// wrong place, silently.
+const GAS_OUTER_N     : u32 = 128u;
+const GAS_OUTER_SHIFT : u32 = 3u;
+const GAS_OUTER_MAX   : u32 = 60000u;
+// sim.gasMode, on the tick stream (TickParams). 0 makes the residency edge a
+// WALL again: the branch below never runs, no record is appended, and the CPU
+// reads the same value to leave every gas pass unrecorded — so `gasMode = 0`
+// is an off switch that costs nothing, not a cheap path. Same shape as
+// windMode and waterBodyMode.
+const GAS_MODE_OFF    : u32 = 0u;
+// PFLAG_GAS is in common.wgsl now, beside the other PFLAG_* bits.
 
 fn markVoxActive(idx : u32) {
   if (T.vizActive != 0u && idx != PT_NO_WORD) {
@@ -57,7 +124,7 @@ fn markVoxActive(idx : u32) {
 
 // Unloaded space is solid and inert (DESIGN.md §3): the sim's world edge is
 // the residency window, not a fixed cube.
-fn inBounds(c : vec3<i32>) -> bool { return inWindow(c, T.origin); }
+fn inBounds(c : vec3<i32>) -> bool { return cellResident(c, T.origin); }
 
 // flagSupportLoss now lives in common.wgsl (the SUPPORT_LOSS block): the
 // MutationQueue and blast kernels raise it too, and two copies of the rule
@@ -87,8 +154,9 @@ fn markDirtyR(c : vec3<i32>, reason : u32) {
     for (var j = 0; j < 2; j++) {
       for (var k = 0; k < 2; k++) {
         let n = ch + vec3<i32>(xs[i], ys[j], zs[k]);
-        if (chunkInWindow(n, T.origin)) {
-          atomicOr(&dirtyOut[chunkSlotIndex(n)], reason);
+        let ns = chunkSlotOf(n, T.origin);
+        if (ns != SLOT_NONE) {
+          atomicOr(&dirtyOut[ns], reason);
         }
       }
     }
@@ -120,18 +188,152 @@ const DIRTY_M_DOWN      : u32 = 4096u;    // stage 1: straight down
 const DIRTY_M_DIAG      : u32 = 8192u;    // stage 2: axis/corner down-diagonals
 const DIRTY_M_EQUAL     : u32 = 16384u;   // stage 3: same-liquid equalize
 const DIRTY_M_SPLIT     : u32 = 32768u;   // stage 3: halve into air
-const DIRTY_M_FILM      : u32 = 65536u;   // stage 3: last-eighth film step
+const DIRTY_M_FILM      : u32 = 65536u;   // stage 3: film step off a RISER
 const DIRTY_M_DISPLACE  : u32 = 131072u;  // stage 3: displace a lighter fluid
 const DIRTY_M_BRIDGE    : u32 = 262144u;  // stage 4: level two neighbours
 const DIRTY_M_SUBMERGED : u32 = 524288u;  // the mover had its own liquid above
-const DIRTY_M_SPILL     : u32 = 1048576u; // RETIRED: the submerged whole-cell
-                                          // spill, kept as a reserved bit and a
-                                          // signpost to the block in stepLiquid
-                                          // that says why it is not a rule.
+// Bit 20 WAS DIRTY_M_SPILL — the submerged whole-cell spill, retired, and the
+// block in stepLiquid that says why it is not a rule is still there. It now
+// carries the OTHER film branch, because "film" naming two rules with two
+// completely different termination arguments is exactly the blank CLAUDE.md
+// rule 6 is about: one of them is provably finite and the other was the
+// never-sleeping shoreline. `film` is the riser step, `film-press` is the
+// pressed one, and a histogram that says which is a diagnosis instead of a
+// direction to go looking.
+const DIRTY_M_FILMPRESS : u32 = 1048576u; // stage 3: film step under PRESSURE
 // The non-liquid movers, so "MOVE with no liquid stage" stops being a blank.
 const DIRTY_M_POWDER    : u32 = 2097152u;
 const DIRTY_M_GAS       : u32 = 4194304u;
 const DIRTY_M_SOLO      : u32 = 8388608u;  // a one-voxel solid island falling
+
+// ---- WHY A GAS CHUNK IS AWAKE (docs/PLAN_gas_particles.md P0) -------------
+//
+// DIRTY_M_GAS existed before this and was a BLANK for the case it is most
+// wanted in. It was set at exactly two of the gas ladder's five stages — the
+// bare rise and the four up-diagonals — and a plume in calm air never reaches
+// either: gasIntent returns straight up, the tryMove in front of the chain
+// succeeds, and the cell returns having marked only DIRTY_R_MOVE. So the
+// `sleep` gate's "gas" column read 0 for a world full of rising smoke, and the
+// top-plane SHEET — which is stage 3, the flat lateral ring, and also never
+// marked — was invisible in the histogram that exists to name it.
+//
+// Now every successful gas move marks, split by the axis it moved on:
+//
+//   DIRTY_M_GAS     the move changed the parcel's HEIGHT (rise, sink, or an
+//                   up-diagonal). Progress: a gas that keeps rising leaves
+//                   through the ceiling or decays, so this terminates.
+//   DIRTY_M_GASLAT  the move was purely horizontal. This is the sheet, and it
+//                   is NEUTRAL — a gas spreading flat under a lid can do it
+//                   forever, which is exactly the shape of the never-sleeping
+//                   chunk this plan exists to delete.
+//   DIRTY_M_GASEDGE the parcel's PRIMARY intent pointed out of the residency
+//                   window. Whether it converted to a particle or was refused
+//                   by the per-tick budget, this names the cells at the sink.
+//
+// Only DIRTY_M_GAS is in FILM_LICENCE, and the split above is why: the licence
+// means "something that decreased a Lyapunov function happened here", and a
+// flat gas spread decreases nothing. GASLAT and GASEDGE are diagnostics only —
+// adding them to the licence would let a sheet license a film step, which is
+// the precise defect the licence was written to remove.
+const DIRTY_M_GASLAT    : u32 = 16777216u;  // gas moved HORIZONTALLY (the sheet)
+const DIRTY_M_GASEDGE   : u32 = 33554432u;  // gas wanted out of the window
+
+// ---- THE FILM LICENCE: a neutral rule may not license ITSELF ---------------
+//
+// THE BUG, measured at the authored home_lake on 2026-09-08. The owner, from
+// the live game: F6 lights a handful of chunks permanently and the active-voxel
+// overlay inside them is empty. `sleep` printed
+//
+//   awake by reason (14 chunks): MOVE 14 film-press 14
+//   awake chunks over 20 more ticks: 47 words changed in 14 chunks
+//     (material 10, fullness 0, stain 0, STAMP-ONLY 37)
+//
+// and then, because a count is not a measurement (CLAUDE.md rule 6), the plan
+// view the same gate now dumps — the movers' own level beside the level under
+// them:
+//
+//     .1122   88888
+//     .1.22   88888
+//     .1122   88888   <- the cell's row
+//     .1112   88888
+//     ..112   88888
+//
+// FULL WATER UNDERNEATH. This is not a puddle in a hollow and it is not the
+// 2-wide gutter the riser step cannot resolve — it is the TOP LAYER OF THE
+// LAKE, a patchwork of one- and two-eighth cells with holes in it, endlessly
+// rearranging itself over a surface it can never finish levelling. 37 of 47
+// changed words came back to the value they started with: a shuffle, not work.
+//
+// WHICH RULE. `film-press`, and the bit that says so was split out of `film`
+// for this: the two film branches have completely different termination
+// arguments and a histogram that folds them together names neither. The first
+// repair went to the RISER branch on an inference from `fullness 0` — every
+// filmPressed advance is supposed to be followed by the split that justifies
+// it, and a split moves fullness, so nothing splitting looked like nothing
+// pressing. Wrong, and wrong in the informative direction: the splits are not
+// happening, and THAT IS THE BUG.
+//
+// WHY THE PROOF FAILS. filmPressed's argument (see its block) is that the cell
+// the film VACATES is a face neighbour of the cell that pressed it, which holds
+// >= LIQ_SPLIT_MIN and CAN therefore split into the hole — strictly decreasing
+// SUM(f*f). "Can" is not "does". On an open surface there are films on every
+// side of that hole, and one of THEM advances into it first; the pressing cell
+// still holds its two eighths, nothing split, SUM(f*f) is unchanged, and the
+// configuration has merely rotated. A potential argument that assumes the hole
+// waits its turn is not a termination argument on a crowd.
+//
+// The riser branch (filmStepAllowed) has the same shape of hole in it, admitted
+// in its own block: two risers facing each other exactly 3 apart is a 2-cycle
+// no reach-1 predicate can break, because a terrace tread's inner cell and a
+// 2-wide rimmed gutter's cell have byte-identical 3x3x3 neighbourhoods and the
+// one read that separates them, `c + 2d`, is racy by construction — the colour
+// lattice keeps acting cells >= 3 apart and each writes within 1, so a cell
+// exactly 2 away is exactly the cell another thread may be writing this pass.
+//
+// SO GATE BOTH ON PROGRESS INSTEAD OF ON GEOMETRY. Both film moves are NEUTRAL
+// in both of this file's Lyapunov functions (same SUM(f*y), same SUM(f*f)) —
+// they only relocate a film. Every OTHER liquid rule strictly decreases one of
+// them. So the whole defect is that a neutral move can be its own cause, and
+// the repair is to say it cannot: a film may only step in a chunk where
+// something that DID decrease a Lyapunov function happened last tick.
+//
+// TERMINATION, and it is the whole point. Every bit below is either a move that
+// strictly decreases a bounded integer (descent SUM(f*y); equalize / split /
+// bridge SUM(f*f); powder and gas their own) or an EXTERNAL input (a mutation,
+// the seam, a particle landing, a reaction firing). None of them can be caused
+// by a film step. So in a world with no new input the licence is granted on
+// finitely many ticks, hence finitely many film steps happen, hence the chunk
+// sleeps. The rules keep every case they were written for — while a pour, a
+// spill or a dome is actually draining the chunk is full of descents and
+// splits, the licence is on every tick, and the films step exactly as before —
+// and lose only the case they never should have had: being the last thing
+// awake, moving a third of a voxel per tick, forever, with nothing to show.
+//
+// WHAT IT COSTS, measured rather than assumed: `ca-slope` is unchanged to the
+// digit (96.9% of the pour in the basin, 0 eighths left on the ramp, quiet from
+// tick 90), and so are ca-level-one and ca-level. A drain is a chunk full of
+// progress; that is exactly when the licence is granted.
+//
+// WHAT IS DELIBERATELY *NOT* IN THE SET, because it is the trap: DIRTY_R_FLOW
+// and DIRTY_R_VISCOUS. Those are the settled path's "this cell HAS an option"
+// marks, not "this cell DID something", and canFlowAnywhere reports the riser
+// step as an option — so licensing on either would let the oscillation license
+// itself one tick later and buy nothing but a longer period. DIRTY_R_MOVE is
+// out for the same reason (a film step is a move). DIRTY_R_REACT and
+// DIRTY_R_STAIN are the matched-but-did-not-fire / unsaturated-neighbour idle
+// marks; their WROTE counterparts are what count.
+const FILM_LICENCE : u32 =
+    DIRTY_R_WRITE | DIRTY_R_SEAM | DIRTY_R_PARTICLE | DIRTY_R_WATERBODY |
+    DIRTY_R_MUTATE | DIRTY_R_STAINW | DIRTY_R_REACTW |
+    DIRTY_M_DOWN | DIRTY_M_DIAG | DIRTY_M_EQUAL | DIRTY_M_SPLIT |
+    DIRTY_M_DISPLACE | DIRTY_M_BRIDGE | DIRTY_M_POWDER | DIRTY_M_GAS |
+    DIRTY_M_SOLO;
+
+// Set once per workgroup at the top of main from dirtyIn[ci]; read by BOTH film
+// predicates, which is what makes canFlowAnywhere inherit it for free — the
+// moving path and the settled path MUST agree or a chunk either pins awake or
+// sleeps with work left.
+var<private> gFilmLicence : bool = false;
 
 // Is there more of this same liquid directly ABOVE c? Out of window reads as
 // "no": the residency edge is solid and inert, so a cell at the top of the
@@ -329,8 +531,9 @@ fn lightMatches(rule : Reaction, c : vec3<i32>) -> bool {
 // gated on the block map so a fluid-free world pays one zero-load.
 fn fluidOccMat(n : vec3<i32>) -> u32 {
   let wc = worldChunkOf(n);
-  if (!chunkInWindow(wc, T.origin)) { return 0u; }
-  let bm = fluidBlockMapS[chunkSlotIndex(wc)];
+  let wsl = chunkSlotOf(wc, T.origin);
+  if (wsl == SLOT_NONE) { return 0u; }
+  let bm = fluidBlockMapS[wsl];
   if (bm == 0u) { return 0u; }
   let lo = vec3<u32>(n & vec3<i32>(CHUNK_MASK));
   let ci = (bm - 1u) * CHUNK_VOL + (lo.z * CHUNK + lo.y) * CHUNK + lo.x;
@@ -343,8 +546,9 @@ fn fluidOccMat(n : vec3<i32>) -> u32 {
 // atomicOr — order-free, idempotent.
 fn flagFluidConsume(n : vec3<i32>) {
   let wc = worldChunkOf(n);
-  if (!chunkInWindow(wc, T.origin)) { return; }
-  let bm = fluidBlockMapS[chunkSlotIndex(wc)];
+  let wsl = chunkSlotOf(wc, T.origin);
+  if (wsl == SLOT_NONE) { return; }
+  let bm = fluidBlockMapS[wsl];
   if (bm == 0u) { return; }
   let lo = vec3<u32>(n & vec3<i32>(CHUNK_MASK));
   let ci = (bm - 1u) * CHUNK_VOL + (lo.z * CHUNK + lo.y) * CHUNK + lo.x;
@@ -921,6 +1125,14 @@ fn canDescend(c : vec3<i32>, n : vec3<i32>, mat : u32, dens : i32) -> bool {
 // is the arbiter for whether the generated world contains it. The "one voxel
 // tall" clause is what keeps the far more common case (a 2-wide slot between
 // two ordinary walls) out of the rule entirely.
+//
+// THE `sleep` GATE FOUND ONE (2026-09-08, the authored home_lake: 8 chunks
+// awake forever, `MOVE 8 film 8`, 21 of 27 changed words back where they
+// started). The termination argument above is therefore FALSE as written, and
+// what repairs it is not a better predicate — see the FILM_LICENCE block near
+// the top of this file for why no reach-1 predicate exists — but a licence:
+// this rule may only fire in a chunk where something that DOES decrease a
+// Lyapunov function happened last tick, so it can no longer be its own cause.
 // ---- the MINIMUM FILM, and why the halving needed a floor -------------------
 //
 // The rule above says a lone eighth may not wander. This one says how the
@@ -976,6 +1188,11 @@ const LIQ_MIN_FILM : u32 = clamp(TUNE_LIQUID_MIN_FILM, 1u, 4u);
 const LIQ_SPLIT_MIN : u32 = 2u * LIQ_MIN_FILM;
 
 fn filmStepAllowed(c : vec3<i32>, d : vec2<i32>) -> bool {
+  // The licence comes FIRST: it is a workgroup-uniform bool and the two loads
+  // below are not. See the FILM_LICENCE block — the geometry test is unchanged
+  // and still cannot tell a tread from a gutter; what changed is that a rule
+  // neutral in both Lyapunov functions is no longer allowed to be its own cause.
+  if (!gFilmLicence) { return false; }
   let back = c - vec3<i32>(d.x, 0, d.y);
   return liquidWall(back) && !liquidWall(back + vec3<i32>(0, 1, 0));
 }
@@ -1035,7 +1252,24 @@ fn filmStepAllowed(c : vec3<i32>, d : vec2<i32>) -> bool {
 // neighbour merely thicker than the film can still be too thin to split into the
 // hole the film leaves, and at minFilm > 1 that gap is where the proof (and the
 // settling) breaks.
+//
+// AND THE PROOF IS STILL NOT ENOUGH, measured 2026-09-08 (FILM_LICENCE, near the
+// top of this file). "That cell CAN therefore split into the hole" quantifies
+// over an OPPORTUNITY. On a lake surface — films on every side of every hole —
+// some other film advances into the hole first, the pressing cell keeps its two
+// eighths, nothing splits, SUM(f*f) does not move and the configuration has
+// merely rotated. Fourteen chunks of the authored home_lake did that forever.
+// The licence at the top of this function is what closes it: no split anywhere
+// in the chunk last tick means no advance this tick.
 fn filmPressed(c : vec3<i32>, mat : u32) -> bool {
+  // THE LICENCE FIRST, and the paragraph above is why it is needed: "that cell
+  // CAN therefore split into the hole" is a statement about what is available,
+  // not about what happens, and on an open water surface another film reaches
+  // the hole first. Measured at the home_lake — 14 chunks awake forever, marked
+  // `film-press`, 37 of 47 changed words back where they started, and not one
+  // split in 20 ticks. See the FILM_LICENCE block: a move neutral in both
+  // Lyapunov functions may not be its own cause.
+  if (!gFilmLicence) { return false; }
   for (var i = 0u; i < 4u; i++) {
     let d = lateralDir(i);
     let n = c + vec3<i32>(d.x, 0, d.y);
@@ -1169,8 +1403,10 @@ fn canFlowAnywhere(c : vec3<i32>, w : u32, mat : u32, m : Material) -> bool {
   }
 
   // 3) laterals: equalize into a same-liquid neighbour holding >= 2 less,
-  //    split into air, step a film off a riser or out from under the water
-  //    pressing on it, or displace something lighter.
+  //    split into air, step a film off a riser (only under FILM_LICENCE — and
+  //    filmStepAllowed tests it, so this mirror inherits it for free, which is
+  //    the whole reason the licence lives in the shared predicate) or out from
+  //    under the water pressing on it, or displace something lighter.
   // Hoisted out of the direction loop: it does not depend on `d`, and it is only
   // ever asked of a cell too thin to split.
   let pressed = f < LIQ_SPLIT_MIN && filmPressed(c, mat);
@@ -1353,14 +1589,21 @@ fn stepLiquid(c : vec3<i32>, idx : u32, w : u32, mat : u32, m : Material, rnd : 
       // reach-1 and both with their own termination argument (see the blocks
       // on filmStepAllowed and filmPressed):
       //   * it is standing against a one-voxel riser — the terrace tread case,
-      //     and the cell it vacates is air so the move cannot repeat; or
+      //     and the cell it vacates is air so the move cannot repeat UNLESS a
+      //     second riser faces the first, which is why that branch now also
+      //     needs the chunk to have done something else last tick
+      //     (FILM_LICENCE); or
       //   * water thick enough to split is pressing on it from behind, so
       //     advancing hands that neighbour a split and the puddle levels.
       // The second is what dissolves a dome; without it the rim is frozen and
       // the cone behind it is a stable resting shape.
-      if ((pressed || filmStepAllowed(c, d)) &&
-          tryMove(c, n, w, m.density, false)) {
-        markDirtyR(c, DIRTY_M_FILM | sub);
+      // The two branches are marked SEPARATELY: they have different termination
+      // arguments and only one of them was the shoreline that never slept, so a
+      // histogram that folds them together cannot name the bug.
+      let riser = filmStepAllowed(c, d);
+      if ((pressed || riser) && tryMove(c, n, w, m.density, false)) {
+        markDirtyR(c, select(0u, DIRTY_M_FILM, riser) |
+                      select(0u, DIRTY_M_FILMPRESS, pressed) | sub);
         return true;
       }
     } else if (tryMove(c, n, w, m.density, false)) {
@@ -1421,13 +1664,14 @@ fn stepLiquid(c : vec3<i32>, idx : u32, w : u32, mat : u32, m : Material, rnd : 
 // Wind speed at which the drift bias reaches its cap, Q16.16 world cells/s
 // (windAtQ's unit). Authored in m/s; converted at const-eval, so the kernel is
 // integer (the sim_fluid.wgsl discipline).
-const WIND_DRIFT_REF : i32 = i32(round(
-    clamp(TUNE_WIND_DRIFT_SPEED, 0.5, 200.0) * 65536.0 / VOXEL_METERS));
-// That cap, in 1024ths. Below 1024 by construction (LoadTuning clamps to 0.95):
-// at certainty the RNG order is gone entirely and a gas stops looking like a
-// gas and starts looking like a conveyor belt.
-const WIND_DRIFT_CAP : i32 = i32(round(clamp(TUNE_WIND_DRIFT_MAX, 0.0, 0.95) * 1024.0));
-// Per-axis wind that just lifts a settled grain of windFriction 1, same units.
+// ---- SALTATION's two constants, which stay HERE ---------------------------
+// windEntrain is the only reader and it is in this file: a constant only one
+// shader reads is declared next to its consumer (CLAUDE.md), and adding it to
+// common.wgsl would re-key every shader in the engine for nothing.
+//
+// Per-axis wind that just lifts a settled grain of windFriction 1, in the same
+// units WIND_DRIFT_REF speaks — including the same `/ VOXEL_METERS`, for the
+// same reason.
 const WIND_ENTRAIN_REF : i32 = i32(round(
     clamp(TUNE_WIND_ENTRAIN_SPEED, 0.5, 200.0) * 65536.0 / VOXEL_METERS));
 // ...and how often a grain over that threshold actually hops, in 1024ths per
@@ -1436,212 +1680,174 @@ const WIND_ENTRAIN_REF : i32 = i32(round(
 // bound that makes a dune creep instead of detonate (rule 2).
 const WIND_ENTRAIN_CHANCE : i32 =
     i32(round(clamp(TUNE_WIND_ENTRAIN_RATE, 0.0, 30.0) * 1024.0 / 30.0));
-// Distinct salt for the wind RNG stream. NOT a bit-slice of `rnd`: the movement
-// tail already spends bits 10.., 14.. and 18.. of that word on the direction
-// rotations these decisions sit next to, and correlating "does it go downwind"
-// with "which way did it pick" is exactly the kind of hidden coupling the
-// worldgen salt rule exists to forbid. One extra hash3, drawn only when a
-// material actually responds to wind.
-const WIND_RNG_SALT : u32 = 0x5719u;
 
-// Stream 0 is the drift bias / entrainment roll; stream 1 is the gas vertical
-// model below, which needs 30 independent bits of its own. Folding the stream
-// into the SALT rather than slicing more bits out of one word is the same
-// argument the salt itself rests on: "does it go downwind" and "does it rise
-// this tick" are different questions and must not be answerable from each
-// other. Stream 0 XORs zero, so every existing caller is bit-identical.
+// ---- THE GAS MOTION MODEL LIVES IN common.wgsl -----------------------------
+// gasRndK / windLateralCode / windLateralStartK / windAxisFrac / gasLateralRot
+// / GasIntent / gasIntentK / gasLadderStep, plus WIND_DRIFT_REF, WIND_DRIFT_CAP
+// and WIND_RNG_SALT, moved there when the gas particle kernel landed: the CA
+// moves a gas VOXEL and sim_gas.wgsl moves a gas PARCEL, and the plan's
+// requirement is that they make the SAME move. See the block there.
+//
+// What stays here is the CA's call shape. The shared functions take the
+// identity key and the substep as arguments because a parcel has neither a
+// slot index nor a PassParams; these three wrappers supply the CA's, so every
+// call site in this file reads exactly as it did before the move.
 fn windRndS(slotIdx : u32, stream : u32) -> u32 {
-  return hash3(T.seed ^ WIND_RNG_SALT ^ (stream * 0x9E37u),
-               T.tick * 2u + P.substep, slotIdx);
+  return gasRndK(slotIdx, stream, P.substep, &T);
 }
 fn windRnd(slotIdx : u32) -> u32 { return windRndS(slotIdx, 0u); }
-
-// Which of lateralDir's four codes points most nearly downwind. lateralDir is
-// 0:+x 1:+z 2:-x 3:-z, so this is the dominant horizontal axis and its sign.
-fn windLateralCode(w : vec3<i32>) -> u32 {
-  if (abs(w.x) >= abs(w.z)) { return select(2u, 0u, w.x > 0); }
-  return select(3u, 1u, w.z > 0);
-}
-
-// The starting index for a 4-direction lateral rotation, biased downwind.
-//
-// Returns `base` (the RNG's own offset) unchanged in every case where wind
-// should not apply, so the two call sites read as "the same rotation, sometimes
-// started somewhere else". That framing is the safety argument: no branch here
-// can add a move candidate, only reorder the four that were already going to be
-// tried, so tryMove's write reach and the stamp discipline are untouched.
 fn windLateralStart(c : vec3<i32>, base : u32, m : Material,
                     slotIdx : u32) -> u32 {
-  if (T.windMode == WIND_MODE_OFF) { return base; }
-  let resp = i32(matWindResponse(m));
-  if (resp == 0) { return base; }          // most materials: one compare
-  let w = windAtQ(c, &T);
-  let mag = max(abs(w.x), abs(w.z));
-  if (mag == 0) { return base; }
-  // Ramp to the cap over [0, WIND_DRIFT_REF], then scale by the authored
-  // response. Both operands are pre-scaled by 1024 before multiplying: a
-  // storm-force Q16.16 speed times 1024 leaves i32, and this runs per moving
-  // voxel per substep.
-  let frac = (min(mag, WIND_DRIFT_REF) >> 10u) * 1024 /
-             max(WIND_DRIFT_REF >> 10u, 1);            // 0..1024
-  var p = ((frac * WIND_DRIFT_CAP) / 1024) * resp / 15;
-  // The dev force multiplier, applied to the PROBABILITY and AFTER the cap —
-  // not to the field, and the difference is the whole reason this tier scales
-  // a different quantity from the particle tier (windAtScaledQ says so at
-  // length). `frac` above saturates once the wind passes windDriftSpeed, which
-  // the default weather already nearly does, so a velocity multiplier here
-  // would move the slider for the first ~2x and then do nothing. Scaling `p`
-  // instead runs all the way to CERTAINTY: at the top of the range every moving
-  // gas voxel tries downwind first and smoke stops looking like smoke and
-  // starts looking like a conveyor belt, which is exactly the thing a "what
-  // does drastic look like" control exists to show.
-  //
-  // The == is an exact-identity guard, not an optimisation: at the shipping 1x
-  // this is arithmetically untouched, so "the slider is at 1x" and "the pinned
-  // hash holds" are one statement.
-  if (T.windGasScaleQ != WINDQ_SCALE_ONE) {
-    p = min((p * T.windGasScaleQ) / WINDQ_SCALE_ONE, 1024);
-  }
-  if (i32(windRnd(slotIdx) & 1023u) < p) { return windLateralCode(w); }
-  return base;
+  return windLateralStartK(c, base, m, slotIdx, P.substep, &T);
 }
-
-// ==================== THE GAS VERTICAL MODEL (buoyancy vs wind) =============
-// A gas used to rise UNCONDITIONALLY — step 1 of the movement tail is a bare
-// tryMove straight up, and it returns on success. So for a plume with open sky
-// above it the wind code below never executed at all, and no amount of drift
-// bias could make smoke lean: the bias only ever reordered the FALLBACK
-// candidates, which a freely-rising column never reaches. That, and not a
-// tuning value, is why smoke went straight up in a gale.
-//
-// THE MODEL. Buoyancy is a PROBABILITY, and wind redistributes it. Everything
-// is in 1024ths of a move attempt:
-//
-//     rise = 1024 - down          the move carries +1 Y
-//     sink = (down - 1024) / 2    the move carries -1 Y
-//     flat = the remainder        the move is horizontal only
-//     lean = fh - up              a rising move ALSO carries a downwind step
-//
-// where `down`/`up` are the vertical wind as a fraction of the CA saturation
-// speed (sim.windDriftSpeed) and `fh` is the horizontal one, both scaled by the
-// material's authored response and the dev multiplier. Read off the ladder:
-//
-//     calm              1024 rise, 0 lean   -> straight up, every time
-//     slight crosswind  1024 rise, 102 lean -> 90% straight up, 10% up-diagonal
-//     half downdraft     512 rise, 512 flat -> half the rises become sideways
-//     full downdraft        0 rise, 1024 flat -> buoyancy cancelled, spreads flat
-//     2x downdraft          0 rise, 512 sink -> half its moves are DOWNWARD
-//
-// WHY THE LEAN IS A DIAGONAL and not a flat sideways step. Both spend the same
-// one move, but the diagonal spends it on +1 up AND +1 downwind, so a plume
-// leans without slowing its climb. Paying for drift out of the rise rate would
-// make a 45-degree plume climb at half speed, which is not what a gas in a
-// crosswind does — and the up-diagonals are candidates this kernel already
-// tries, so nothing about write reach changes.
-//
-// AN UPDRAFT straightens rather than accelerates: `rise` is already at
-// certainty in calm air and there is nothing above 1024, so the only way for
-// lift to read as MORE vertical is for it to cancel the lean. That is what
-// `fh - up` says, and it is the correct reading of "goes up relative to the
-// rest" once you notice that "up" was never the scarce thing.
-//
-// HONESTY ABOUT THE SAFETY ARGUMENT. The drift bias could claim it "only
-// reorders candidates the voxel was already going to try". This CANNOT: the
-// sink tier is a genuinely new move, downward, that no gas could make before.
-// So the bound is argued directly instead — every candidate is reach 1, every
-// one goes through the ordinary tryMove (so the stamp discipline, the density
-// test and markDirty are untouched), and a gas can only ever enter a cell
-// LIGHTER-than-air rejects, which is the same test that gated its lateral
-// spread. `canDisplace` is a density comparison, not a direction one, so
-// downward motion needed no change there.
-
-// Signed wind on one axis as a fraction of the CA saturation speed, in 1024ths,
-// scaled by the material's response and the dev multiplier. Clamped to +-3072
-// because 3x saturation is where the sink ramp reaches certainty.
-//
-// abs-then-shift-then-resign, NOT a bare arithmetic shift: >> on a negative i32
-// rounds toward -inf, and an asymmetric round here reads as a permanent drift
-// down-axis. That is the mq() lesson, and it is exactly the kind of bug a world
-// hash cannot tell you about.
-fn windAxisFrac(v : i32, resp : i32) -> i32 {
-  let lim = 3 * WIND_DRIFT_REF;
-  let a = min(abs(v), lim);
-  var f = ((a >> 10u) * 1024) / max(WIND_DRIFT_REF >> 10u, 1);   // 0..3072
-  f = (f * resp) / 15;
-  if (T.windGasScaleQ != WINDQ_SCALE_ONE) {
-    f = (f * T.windGasScaleQ) / WINDQ_SCALE_ONE;
-  }
-  f = min(f, 3072);
-  return select(f, -f, v < 0);
-}
-
-// Which lateral the horizontal share takes: downwind with probability `fh`,
-// uniform otherwise.
-//
-// NOT windLateralStart's ramp, and the difference matters. That cap
-// (sim.windDriftMax) exists because there the bias is the ONLY thing limiting
-// how much a voxel moves downwind, so letting it reach certainty turns smoke
-// into a conveyor belt. Here the AMOUNT is already metered by `lean` and
-// `flat` — capping the DIRECTION too would scatter a share the model has
-// already decided should go downwind, and a 10% southward lean would come out
-// only 6% southward. The uniform fallback is load-bearing at the other end: a
-// pure downdraft has no horizontal wind, `windLateralCode` would hand back a
-// fixed axis for a zero vector, and every gas in the world would spread the
-// same way. fh = 0 must mean "no opinion", which is what "equal chance in any
-// horizontal direction" asks for.
-fn gasLateralRot(w : vec3<i32>, fh : i32, base : u32, r : u32) -> u32 {
-  if (i32(r & 1023u) < fh) { return windLateralCode(w); }
-  return base;
-}
-
-struct GasIntent {
-  dir  : vec3<i32>,   // the primary candidate, relative to the cell
-  rise : bool,        // did the roll choose to go UP (see the fallback note)
-  rot  : u32,         // lateral rotation for the flat/sink fallback scan
-};
-
-// The one roll. Returns straight up — bit for bit what step 1 would have tried
-// — whenever wind is off, the material does not respond, or the air is calm,
-// so a windless world moves exactly as it did before this existed.
 fn gasIntent(c : vec3<i32>, m : Material, slotIdx : u32, base : u32) -> GasIntent {
-  var g : GasIntent;
-  g.dir = vec3<i32>(0, 1, 0);
-  g.rise = true;
-  g.rot = base;
-  if (T.windMode == WIND_MODE_OFF) { return g; }
-  let resp = i32(matWindResponse(m));
-  if (resp == 0) { return g; }              // most materials: one compare
-  let w = windAtQ(c, &T);
-  let fy = windAxisFrac(w.y, resp);
-  let fh = min(1024, max(abs(windAxisFrac(w.x, resp)),
-                         abs(windAxisFrac(w.z, resp))));
-  let down = max(0, -fy);
-  let up   = max(0,  fy);
-  let rise = clamp(1024 - down, 0, 1024);
-  let sink = clamp((down - 1024) / 2, 0, 1024);
-  let lean = clamp(fh - up, 0, 1024);
-  // Dead calm is rise=1024, lean=0 — the identity path, and it is checked
-  // rather than computed through so "there is no wind here" and "this cell
-  // moves as it always did" are one statement.
-  if (rise == 1024 && lean == 0) { return g; }
-  let r = windRndS(slotIdx, 1u);
-  let tier = i32(r & 1023u);
-  let leanRoll = i32((r >> 10u) & 1023u);
-  g.rot = gasLateralRot(w, fh, base, r >> 20u);
-  let d = lateralDir(g.rot);
-  if (tier < rise) {
-    // It rises. Straight up, or up AND downwind in the same move.
-    if (leanRoll < lean) { g.dir = vec3<i32>(d.x, 1, d.y); }
-    return g;
+  return gasIntentK(c, m, slotIdx, base, P.substep, &T);
+}
+
+// ---- THE WINDOW EDGE IS A SINK (docs/PLAN_gas_particles.md §2.3) -----------
+//
+// `tryMove` returns false out of window, and until now a gas voxel could not
+// tell that refusal apart from a solid wall: it fell through to the lateral
+// ring and SHEETED across the whole top chunk plane — up to 1,024 chunks held
+// awake by smoke pressed against a lid that is not a lid, it is the edge of
+// what happens to be resident. That sheet is the "chunk outline in the sky"
+// and it is most of a big fire's CA cost.
+//
+// So the two refusals are split. A gas whose intent points OUT of the window
+// leaves: the cell becomes air and a record goes to gasSpawn, which sim_gas
+// turns into a gas PARTICLE later this same tick. Outside the window it keeps
+// rising and drifting under the same model, bounded by its authored decay and
+// an outer box, and it comes back as a voxel if it drifts back in.
+//
+// REACH 0. This writes ONE word — its own cell. The destination is outside the
+// residency window and was never writable from here, so nothing about the
+// colour lattice's write-disjointness argument changes (rule 1).
+//
+// BUDGET CHARGED BEFORE THE WRITE, the engine's standing convention: the slot
+// is reserved first and the voxel is deleted only if it was granted. A refusal
+// therefore leaves the voxel exactly where it was, taking today's ladder — the
+// edge degrades into the old behaviour under load instead of losing mass.
+//
+// SPAWN-LIST ORDER IS SCHEDULING-DEPENDENT and nothing keys on it: each record
+// is a complete particle state, and the particle system's rule is that
+// behaviour is derived from state, never from a buffer slot.
+// ---- THE IN-WINDOW SPLAT (stage 1b) ----------------------------------------
+// Every gas voxel in an awake chunk adds ONE to the 0.8 m cell it sits in, so
+// the coarse box holds the whole plume and not just the part of it that has
+// already left. The renderer needs that overlap to crossfade: a voxel fading
+// out at the window face has to be fading INTO something.
+//
+// IDENTICAL CELL MAPPING to sim_gas.wgsl's gasOuterOrigin/gasOuterCell and to
+// raymarch.wgsl's gasOuterOriginVox — that agreement IS the interface, and the
+// constants it is built from are pinned by check_invariants.py. T.origin is in
+// CHUNK units; the box is two window edges centred on the window, so its min
+// corner is half a window below the window's, which is a multiple of the cell
+// size and needs no rounding.
+//
+// ONCE PER VOXEL PER TICK. The CA runs 2 gravity substeps x 27 colour phases;
+// the stamp gate at the top of stepCell lets a voxel act at most once per
+// SUBSTEP, so `P.substep == 0u` at the call site is what makes this once per
+// tick. Called BEFORE the voxel moves, so a voxel that leaves the window this
+// tick is splatted at the cell it left from and sim_gas splats the parcel it
+// became at the cell it arrived at — one contribution each, from two
+// populations that do not overlap.
+//
+// RENDER-ONLY: no voxel is written, nothing is hashed, and the load-then-add
+// is a benign race for the same reason it is in sim_gas.wgsl. See
+// GAS_OUTER_MAX there for what the guard buys.
+//
+// KNOWN LIMITATION, stated rather than solved: gas in a SLEEPING chunk is not
+// visited by the CA and so is not splatted. The renderer's fade is gated on
+// the coarse cell being non-empty for exactly that reason — a voxel never
+// fades out into a cell with nothing in it — so a settled plume in a sleeping
+// chunk keeps its full voxel opacity instead of vanishing.
+fn gasOuterSplat(c : vec3<i32>) {
+  let d = (c - (T.origin * i32(CHUNK) - vec3<i32>(i32(WORLD_N) / 2)))
+          >> vec3<u32>(GAS_OUTER_SHIFT);
+  let n = i32(GAS_OUTER_N);
+  if (d.x < 0 || d.y < 0 || d.z < 0 || d.x >= n || d.y >= n || d.z >= n) { return; }
+  let li = (u32(d.z) * GAS_OUTER_N + u32(d.y)) * GAS_OUTER_N + u32(d.x);
+  let word = li >> 1u;
+  let sh = 16u * (li & 1u);
+  if (((atomicLoad(&gasOuter[word]) >> sh) & 0xFFFFu) >= GAS_OUTER_MAX) { return; }
+  atomicAdd(&gasOuter[word], 1u << sh);
+}
+
+fn gasLeave(c : vec3<i32>, idx : u32, w : u32, dst : vec3<i32>) -> bool {
+  let slot = atomicAdd(&gasSpawn[GAS_SP_COUNT], 1u);
+  if (slot >= GAS_SPAWN_CAP) {
+    atomicAdd(&gasSpawn[GAS_SP_REFUSED], 1u);
+    return false;
   }
-  g.rise = false;
-  if (tier < 1024 - sink) {
-    g.dir = vec3<i32>(d.x, 0, d.y);         // buoyancy cancelled: spread flat
-    return g;
+  // Position is 24.8 with a ZERO FRACTION: a gas particle lives ON a cell and
+  // moves in whole cells, exactly as the voxel did. Velocity words stay zero,
+  // which is what keeps particlePriority a pure function of the visible state.
+  let b = GAS_SP_HDR + slot * GAS_SP_STRIDE;
+  atomicStore(&gasSpawn[b + 0u], bitcast<u32>(dst.x << 8u));
+  atomicStore(&gasSpawn[b + 1u], bitcast<u32>(dst.y << 8u));
+  atomicStore(&gasSpawn[b + 2u], bitcast<u32>(dst.z << 8u));
+  atomicStore(&gasSpawn[b + 3u], 0u);
+  atomicStore(&gasSpawn[b + 4u], 0u);
+  atomicStore(&gasSpawn[b + 5u], 0u);
+  // Material AND state nibble travel: a gas's nibble is its palette variant,
+  // and dropping it would make every plume that leaves the window change shade
+  // at the seam.
+  atomicStore(&gasSpawn[b + 6u], voxMat(w) | (voxState(w) << 12u));
+  atomicStore(&gasSpawn[b + 7u], PFLAG_ALIVE | PFLAG_GAS);
+  voxStore(idx, 0u);
+  markVoxActive(idx);
+  markDirty(c);
+  return true;
+}
+
+// ---- THE GAS MOVEMENT TAIL -------------------------------------------------
+// Everything a CLASS_GAS voxel does once reactions and staining are done with
+// it. Returns true if the cell is finished (it moved, or it left the window).
+//
+// A gas that exhausts all fourteen candidates returns false and the caller
+// returns anyway: stages 4 and 5 of the old chain (wandering powders and
+// saltation) both test CLASS_POWDER, so a gas falling through them was always
+// a no-op. Naming that here rather than letting it fall out is the difference
+// between "gas is done" and "gas happens to do nothing next".
+fn stepGas(c : vec3<i32>, idx : u32, w : u32, m : Material, slotIdx : u32,
+           rnd : u32) -> bool {
+  let g = gasIntent(c, m, slotIdx, rnd >> 10u);
+
+  // Indices 0..5 need no lateral rotation. Split from the loop below so the
+  // common case — a plume with open sky above it, returning at index 0 —
+  // never evaluates the wind field for a ring it does not reach.
+  for (var i = 0u; i < GAS_LADDER_RING; i++) {
+    let s = gasLadderStep(g, 0u, 0u, i);
+    if (s.w == 0) { continue; }
+    let d = s.xyz;
+    if (tryMove(c, c + d, w, m.density, true)) {
+      // Height changed => progress (it will leave or decay); flat => the sheet.
+      markDirtyR(c, select(DIRTY_M_GASLAT, DIRTY_M_GAS, d.y != 0));
+      return true;
+    }
+    // Only the PRIMARY intent converts, and that is the whole rule: it is the
+    // move the parcel actually wanted, it is what a plume at the top face
+    // makes on every single tick, and confining the sink to it keeps a gas
+    // that merely BRUSHES the edge on a fallback candidate inside the world.
+    if (T.gasMode != GAS_MODE_OFF && i == 0u && !inBounds(c + d)) {
+      atomicAdd(&gasSpawn[GAS_SP_EDGE], 1u);
+      markDirtyR(c, DIRTY_M_GASEDGE);
+      if (gasLeave(c, idx, w, c + d)) { return true; }
+      // Refused: fall through and behave exactly as this voxel does today.
+    }
   }
-  // Driven down, leaning downwind if there is also a crosswind.
-  g.dir = select(vec3<i32>(0, -1, 0), vec3<i32>(d.x, -1, d.y), leanRoll < lean);
-  return g;
+
+  let rUp  = windLateralStart(c, rnd >> 10u, m, slotIdx);
+  let rLat = windLateralStart(c, rnd >> 14u, m, slotIdx);
+  for (var i = GAS_LADDER_RING; i < GAS_LADDER_N; i++) {
+    let s = gasLadderStep(g, rUp, rLat, i);
+    let d = s.xyz;
+    if (tryMove(c, c + d, w, m.density, true)) {
+      markDirtyR(c, select(DIRTY_M_GASLAT, DIRTY_M_GAS, d.y != 0));
+      return true;
+    }
+  }
+  return false;
 }
 
 // Saltation: a settled grain of powder pulled loose by a wind that beats its
@@ -1693,9 +1899,12 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
   // one workgroup per compacted dirty chunk (indirect dispatch). The list
   // holds SLOT indices; reconstruct the world chunk from the window origin.
   let ci = dirtyList[wg.x];
-  let sc = vec3<i32>(vec3<u32>(ci % NCHUNK, (ci / NCHUNK) % NCHUNK,
-                               ci / (NCHUNK * NCHUNK)));
-  let wc = slotToWorldChunk(sc, T.origin);
+  // Workgroup-uniform, one scalar load, read only by the riser film step: did
+  // anything that is not itself a film step happen in this chunk last tick?
+  // FILM_LICENCE block — this is what stops a neutral rule from keeping a
+  // shoreline puddle awake forever.
+  gFilmLicence = (dirtyIn[ci] & FILM_LICENCE) != 0u;
+  let wc = slotWorldChunk(ci, T.origin);
   let base = wc * i32(CHUNK);  // world cell of the chunk corner (may be < 0)
   // The color lattice is GLOBAL in WORLD coords: cell ≡ colorPhase (mod 3).
   // Coloring by slot coords would race at the toroidal wrap (world-adjacent
@@ -1838,64 +2047,46 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
     return;
   }
 
-  let rising = m.klass == CLASS_GAS;
-  let dy = select(-1, 1, rising);
-
-  // 0) GASES ONLY: buoyancy as a probability the wind redistributes. Placed in
-  //    FRONT of the chain rather than woven into it, because the chain is a
-  //    fallback ladder and this is a choice — and because putting it here makes
-  //    the no-wind case provable by inspection: gasIntent returns (0,1,0), the
-  //    tryMove below is the same one step 1 would have made, and step 1 is then
-  //    a dead branch that costs one bounds check. Nothing downstream changes.
-  if (rising) {
-    let g = gasIntent(c, m, slotIdx, rnd >> 10u);
-    if (tryMove(c, c + g.dir, w, m.density, true)) { return; }
-    // A move the wind chose can be blocked. If it wanted to go DOWN or SIDEWAYS
-    // and could not, exhaust the horizontal ring before falling through — the
-    // ordinary chain leads with "straight up", and letting a downdraft-pinned
-    // parcel rise on its first refusal would undo the downdraft against every
-    // ceiling and floor in the world. A rising intent needs no such guard: the
-    // chain it falls into already leads with exactly what it wanted.
-    if (!g.rise) {
-      for (var i = 0u; i < 4u; i++) {
-        let d = lateralDir(i + g.rot);
-        if (tryMove(c, c + vec3<i32>(d.x, 0, d.y), w, m.density, true)) { return; }
-      }
-    }
+  // ---- GASES: the whole tail, in stepGas ----------------------------------
+  // Stages 0..3 of the old chain used to be written out here with `dy` and
+  // `rising` shared between gas and powder. They are one function now for one
+  // reason: sim_gas.wgsl's particle kernel must take the moves a voxel would
+  // (PLAN_gas_particles.md §2.2), and it can only do that against a ladder
+  // that EXISTS as a callable thing. What the powder path keeps is stages
+  // 1, 2, 4 and 5 with dy = -1, which is all it ever used.
+  if (m.klass == CLASS_GAS) {
+    // The render-only density splat, ONCE PER TICK (substep 0) and BEFORE the
+    // move, so this voxel contributes to the cell it is in rather than to the
+    // one it is about to be in. Gated on gasMode for the reason the sink is:
+    // with GAS_MODE_OFF no gas row is recorded at all, fill_gasOuter never
+    // clears the box, and a splat into an uncleared box would accumulate
+    // forever. See gasOuterSplat.
+    if (T.gasMode != GAS_MODE_OFF && P.substep == 0u) { gasOuterSplat(c); }
+    stepGas(c, idx, w, m, slotIdx, rnd);
+    return;
   }
 
   // Diagnostic (DIRTY_M_*): which CLASS moved, so "MOVE with no liquid stage"
-  // names the mover instead of being a blank.
-  let cls = select(select(0u, DIRTY_M_POWDER, m.klass == CLASS_POWDER),
-                   DIRTY_M_GAS, m.klass == CLASS_GAS);
+  // names the mover instead of being a blank. Only powders reach here — solids
+  // and liquids returned above, gases into stepGas.
+  let cls = DIRTY_M_POWDER;
 
-  // 1) straight fall / rise
-  if (tryMove(c, c + vec3<i32>(0, dy, 0), w, m.density, rising)) {
+  // 1) straight fall
+  if (tryMove(c, c + vec3<i32>(0, -1, 0), w, m.density, false)) {
     markDirtyR(c, cls);
     return;
   }
 
-  // 2) the four diagonal cells one step down (up for gas), RNG order — started
+  // 2) the four diagonal cells one step down, RNG order — started
   //    DOWNWIND with a probability set by the wind and the material's authored
   //    response (windLateralStart; no-op when the gate is off). The rotation
   //    itself is unchanged: this only decides where it begins.
   let r = windLateralStart(c, rnd >> 10u, m, slotIdx);
   for (var i = 0u; i < 4u; i++) {
     let d = lateralDir(i + r);
-    if (tryMove(c, c + vec3<i32>(d.x, dy, d.y), w, m.density, rising)) {
+    if (tryMove(c, c + vec3<i32>(d.x, -1, d.y), w, m.density, false)) {
       markDirtyR(c, cls);
       return;
-    }
-  }
-
-  // 3) gases also spread laterally, RNG order — and this is the stage that
-  //    actually makes smoke stream downwind, since a gas that has already risen
-  //    as far as it can spends most of its life here.
-  if (m.klass == CLASS_GAS) {
-    let r2 = windLateralStart(c, rnd >> 14u, m, slotIdx);
-    for (var i = 0u; i < 4u; i++) {
-      let d = lateralDir(i + r2);
-      if (tryMove(c, c + vec3<i32>(d.x, 0, d.y), w, m.density, rising)) { return; }
     }
   }
 

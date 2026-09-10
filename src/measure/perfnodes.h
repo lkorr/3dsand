@@ -67,6 +67,8 @@ enum class PerfScope : uint8_t {
   Readback,     // snapshot map callbacks, mirror rebuild (never blocks)
   ReadbackStall,// the paged-mirror staleness fallback: a BLOCKING fence wait
   Audio,        // cue dispatch + spatializer feed
+  TerrainMesh,  // DebrisSystem::ManageTerrain: marching-cubes + Jolt static patches
+  Debris,       // DebrisSystem::PreTick minus ManageTerrain: support events, island scans
   RenderCpu,    // render-pass encode: draw calls, instance buffers, overlay
   Present,      // AcquireFrame + Present (this is where vsync waits land)
   Other,        // THE RESIDUAL: frame time no scope above claimed. Not a system.
@@ -129,6 +131,13 @@ inline constexpr PerfNodeDef kPerfNodes[] = {
      "particleSpawn;particleArgs1;particleIntegrate;particleArgs2;particleResolve",
      "Scales with the live particle count, not the world. Integrate is the "
      "DDA; resolve is the atomicMax claim."},
+    {"gasSys", "Gas Particles", "simTick", PerfSide::Gpu, PerfScope::Count,
+     "gasSpawn;gasArgs1;gasIntegrate;gasArgs2;gasResolve",
+     "Gas that has left the residency window (docs/PLAN_gas_particles.md). "
+     "Scales with the live parcel count, not the world, and is recorded at all "
+     "only while parcels exist or the CA has work. What it BUYS is on the "
+     "caLoop row: the top-plane smoke sheet that used to hold up to 1,024 "
+     "chunks awake stops existing."},
     {"fluidSys", "MLS-MPM Fluid", "simTick", PerfSide::Gpu, PerfScope::Count,
      "fluidMark;fluidAlloc;fluidClear;fluidP2g1;fluidP2g2;fluidGridUp;fluidG2p;"
      "seam_compact_count;seam_compact_scan;seam_compact_scatter;seam_spawn;"
@@ -286,6 +295,21 @@ inline constexpr PerfNodeDef kPerfNodes[] = {
     {"audioSys", "Audio", "gameSystems", PerfSide::Cpu, PerfScope::Audio, "",
      "Cue dispatch and the occlusion ray per voice. Silent under a headless "
      "harness."},
+    // SPLIT OUT of `gameLogic` (2026-09-09): the two DebrisSystem spans below
+    // are DEBITED from GameLogic by PerfSpan, so the rows stay disjoint and
+    // the CPU total still sums to the frame. They exist because "Game Systems
+    // spiked to 80 ms while walking" was a bare number: the spike was an
+    // unbudgeted terrain-collider rebuild, and nothing on the page said so.
+    {"terrainMesh", "Terrain Collision", "gameSystems", PerfSide::Cpu,
+     PerfScope::TerrainMesh, "",
+     "Marching-cubes + Jolt static mesh per chunk under every body and mob "
+     "anchor. Budgeted to kTerrainBuildsPerTick rebuilds; a chunk whose "
+     "occupancy box is unchanged costs one 18^3 sample and no mesh."},
+    {"debrisSys", "Debris System", "gameSystems", PerfSide::Cpu,
+     PerfScope::Debris, "",
+     "Support-loss flags -> island scans -> bodies: the event drain, the "
+     "flood fills (kIslandScanCellsPerTick) and body spawns. Zero when "
+     "nothing has lost support."},
 
     // ---- physics ----
     {"physicsSys", "Physics (Jolt)", nullptr, PerfSide::Cpu, PerfScope::Physics,
@@ -319,6 +343,7 @@ constexpr int kPerfNodeCount = (int)(sizeof(kPerfNodes) / sizeof(kPerfNodes[0]))
 enum class PerfCounter : uint8_t {
   ActiveChunks,      // dirty chunks the CA dispatched over
   Particles,         // live ballistic particles
+  GasParticles,      // live gas parcels outside the residency window
   FluidParticles,    // live MPM particles
   Ops,               // MutationQueue brush ops this tick
   CellOps,           // MutationQueue exact-cell ops this tick
@@ -384,6 +409,7 @@ struct PerfCounterDef {
 inline constexpr PerfCounterDef kPerfCounters[] = {
     {"activeChunks", "active chunks", "caLoop", false},
     {"particles", "particles", "particleSys", false},
+    {"gasParticles", "gas parcels", "gasSys", false},
     {"fluidParticles", "MPM particles", "fluidSys", false},
     {"ops", "brush ops", "mutQueue", false},
     {"cellOps", "cell ops", "mutQueue", false},
@@ -508,7 +534,8 @@ inline double PerfGpuTotal(const PerfSample& s) {
 inline constexpr const char* kPerfScopeKeys[] = {
     "input", "stream", "gameLogic", "waterBody", "upload",
     "pageTableCpu", "encode", "submit", "physics", "postStep",
-    "readback", "readbackStall", "audio", "renderCpu", "present", "other",
+    "readback", "readbackStall", "audio", "terrainMesh", "debris", "renderCpu",
+    "present", "other",
 };
 static_assert((int)(sizeof(kPerfScopeKeys) / sizeof(kPerfScopeKeys[0])) ==
                   kPerfScopeCount,

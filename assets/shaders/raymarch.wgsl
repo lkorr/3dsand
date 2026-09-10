@@ -91,6 +91,77 @@
 // because renderBGL_ is one layout shared with debris.wgsl and microbody.wgsl,
 // which are the paths it exists for.
 @group(0) @binding(20) var<storage, read> glow : array<u32>;
+// ---- THE OUTER GAS DENSITY BOX (docs/PLAN_gas_particles.md §2.5) -----------
+// Gas that leaves the residency window stops being a voxel and becomes a
+// parcel (sim_gas.wgsl), so from here out it has no voxel to be drawn as. What
+// it has instead is this: one 16-BIT COUNT per GAS_OUTER_SHIFT-cubed block of
+// fine voxels, splatted fresh every tick over a box twice the window's edge and
+// centred on it. Since stage 1b the box holds BOTH populations: sim_gas.wgsl
+// splats every parcel and sim_step.wgsl splats every in-window gas VOXEL, which
+// is what makes the crossfade below possible — a voxel can only fade out into a
+// coarse cell that has something in it.
+//
+// READ-ONLY here and written only by the gas resolve pass on the tick command
+// buffer (pass_table.def GasOuter). Render-only derived data: never hashed,
+// never saved, and nothing in the sim reads it — so the float math below is
+// outside rule 1 entirely, the same way every other line of this shader is.
+@group(0) @binding(21) var<storage, read> gasOuter : array<u32>;
+// MIRRORED FROM sim_gas.wgsl, not from common.wgsl — a constant only one
+// shader reads is declared in that shader, and this pair is read by exactly
+// two (the splatter and this sampler). check_invariants.py's `pairs` table
+// already pins sim_gas.wgsl's copies to world.h's kGasOuterN / kGasOuterShift;
+// adding ("raymarch.wgsl", raymarch) to those two rows is a one-line follow-up
+// that would pin this copy too, and until it lands the const_assert below is
+// what refuses a silent disagreement: the box edge MUST be exactly two window
+// edges, because that identity is the whole of the origin derivation in
+// gasOuterOriginVox() (world.h static_asserts the same expression).
+const GAS_OUTER_N     : u32 = 128u;
+const GAS_OUTER_SHIFT : u32 = 3u;
+const_assert (GAS_OUTER_N << GAS_OUTER_SHIFT) == 2u * WORLD_N;
+// Samples taken across the segment of the ray that is outside the window and
+// inside the box. FIXED, and deliberately not derived from the segment length:
+// the far march's step budget (render.farSteps) is a budget, and §2.5's rule
+// for this sampler is that it must not add steps to it. The longest possible
+// segment is half a window on each axis, ~44 m on the diagonal, so 16 samples
+// is 2.8 m apart at worst and about one cell at best. That undersamples, and
+// undersampling is correct here: this is smoke tens of metres away and soft is
+// what it should look like.
+const GAS_OUTER_STEPS : u32 = 16u;
+// Samples across the IN-BAND part of the ray (stage 1b), i.e. the shell
+// between the inner box and the window face where the two representations
+// overlap. Its own budget rather than a share of the one above, so widening
+// the crossfade cannot thin the distant plume: that segment is at most one
+// window half-extent per axis (~22 m on the diagonal at gasBlendStart 0.5) and
+// 12 samples is ~1.8 m apart at worst, about two cells.
+const GAS_BAND_STEPS  : u32 = 12u;
+// R.flags bit 3: GAS MAY BE PRESENT this frame. Set by the CPU from the sim's
+// own gas latch (Simulation::GasRenderActive) and OFF in a world with no
+// smoke in it, which is what keeps the whole of the crossfade — the band
+// sampling, the per-cell fade in trace(), the coarse fold in fs() — at exactly
+// zero cost in the common case. Every one of those three tests it.
+const RFLAG_GAS : u32 = 8u;
+
+// ---- THE CROSSFADE WEIGHT (stage 1b) ---------------------------------------
+// 0 where gas is drawn as VOXELS and 1 where it is drawn from the coarse box,
+// smoothstepped between over the outer shell of the residency window.
+//
+// MEASURED FROM THE WINDOW CENTRE IN THE MAX NORM, not from the camera, and
+// that is the whole of why this works: the max-norm distance to the centre is
+// exactly the window half-extent at every point of all six faces, so the
+// weight is exactly 1 at every face no matter where the camera stands or what
+// it looks at. A camera-relative ramp would have to be re-tuned per view and
+// would still leave a seam on the faces it was not tuned for.
+//
+// render.gasBlendStart is the inner edge as a fraction of the half-extent: 0.5
+// fades from 12.8 m to 25.6 m. At 1.0 the band collapses to 2.6 cm (the 0.99
+// below is what keeps smoothstep's two edges apart) and the stage-1 hard edge
+// is back, which is how to A/B this with F5 and no rebuild.
+fn gasBlendW(p : vec3f) -> f32 {
+  let halfExt = f32(WORLD_N) * 0.5;
+  let ctr = vec3f(R.origin * i32(CHUNK)) + vec3f(halfExt);
+  let d = max(max(abs(p.x - ctr.x), abs(p.y - ctr.y)), abs(p.z - ctr.z));
+  return smoothstep(min(TUNE_GAS_BLEND_START, 0.99) * halfExt, halfExt, d);
+}
 const RS_PX : u32 = 0u;          // sampled pixels (denominator)
 const RS_PRIMARY : u32 = 1u;     // trace() steps from fs's camera ray
 const RS_MEDIA : u32 = 2u;       // cells that accumulated media tau in trace()
@@ -175,6 +246,9 @@ const SHADOW_CACHE : bool = SHADOW_CACHE_AVAILABLE && TUNE_SHADOW_CACHE != 0;
 //   SPEC_FLUID       <-> R.fluidCount > 0u
 //   SPEC_DEBUG_VIZ   <-> (R.flags & 2u) != 0u   (dev panel: active-voxel edges)
 //   SPEC_SHORT_RANGE <-> (R.flags & 4u) != 0u   (dev panel: 100 m ray ceiling)
+// Bit 3 (RFLAG_GAS) is NOT specialized: it changes every frame a fire starts
+// or goes out, and a pipeline variant that flips that often would spend more
+// on compiles than the branch costs.
 //
 // WHY A SECOND PIPELINE RATHER THAN THE UNIFORM BRANCH THAT IS ALREADY THERE.
 // The same reason the `shadow0` arm exists beside `noshadow` (see the block
@@ -908,7 +982,7 @@ struct Hit {
   micKey   : u32,     // palette key of the plant PART struck (0 = per cell)
 };
 
-fn inBounds(c : vec3<i32>) -> bool { return inWindow(c, R.origin); }
+fn inBounds(c : vec3<i32>) -> bool { return cellResident(c, R.origin); }
 
 fn chunkOcc(cell : vec3<i32>) -> u32 {
   return occupancy[chunkIndexW(cell)];
@@ -2771,11 +2845,50 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool) -> Hit {
         let trans = exp(-out.mediaTau * VOXEL_METERS * MEDIA_ABSORB);
         out.fireGlow += seg * cellFire * trans;
       }
-      let dTau = seg * cellOp;
+      // ---- THE VOXEL HALF OF THE CROSSFADE (stage 1b) --------------------
+      // A gas voxel's optical depth is faded OUT across the outer shell of the
+      // window, where gasOuterFill is fading the same gas IN from the coarse
+      // box. The two ramps are the same smoothstep, so the total is continuous
+      // and there is no longer a face where 0.1 m voxels become 0.8 m cells in
+      // one pixel.
+      //
+      // LIQUIDS ARE UNTOUCHED (cellLiq > 0 keeps fade at 1): they have no
+      // coarse representation, they never leave the window, and fading one out
+      // would simply delete the far half of a lake.
+      //
+      // AND ONLY INTO A CELL THAT HAS SOMETHING IN IT. The CA splats gas from
+      // AWAKE chunks only (sim_step.wgsl gasOuterSplat), so a settled plume in
+      // a sleeping chunk is in no coarse cell — fading it would fade it into
+      // nothing. One extra fetch, taken only for a gas cell already inside the
+      // band, turns that known hole into a non-event: such a voxel keeps its
+      // full opacity instead of disappearing.
+      var fade = 1.0;
+      if ((R.flags & RFLAG_GAS) != 0u && cellLiq == 0.0) {
+        let bw = gasBlendW(ro + rd * tCur);
+        if (bw > 0.0 && gasOuterCountAt(ro + rd * tCur) > 0.0) {
+          fade = 1.0 - bw;
+        }
+      }
+      let dTau = seg * cellOp * fade;
       out.mediaTau += dTau;
       rsAdd(RS_MEDIA, 1u);
       out.mediaTint += cellTint * dTau;
       if (cellLiq == 0.0) {
+        // FADED, deliberately, and it decides two things.
+        //
+        // gasHalfT is the depth the raster passes order against, and it should
+        // track what this march actually DRAWS: the opacity it stopped drawing
+        // is supplied by the coarse path instead, which fs() folds into the
+        // same media accumulator afterwards. The residual is that a raster body
+        // deep inside a faded plume orders against the voxel half only — the
+        // same limitation the coarse box has had since stage 1, and stated in
+        // the same place (see the note after the fold in fs()).
+        //
+        // The media early-out below is the load-bearing half. Its claim is
+        // "the pixel cannot change any more", which is about drawn opacity: an
+        // UN-faded gasTau would let a fully faded-out plume saturate the ray,
+        // set out.saturated, and thereby suppress the coarse fill that was
+        // supposed to replace it. That is a plume that vanishes at the band.
         gasTau += dTau;
         // First crossing of half opacity: latched once, never revised.
         if (out.gasHalfT == 0.0 &&
@@ -2884,16 +2997,25 @@ struct FarHit {
   level : u32,         // which cascade level the hit lives in (shadow march)
 };
 
-// The raw far cell byte: 7 bits of material id plus the conservative blocker
-// flag (common.wgsl FAR_BLOCKER_BIT). EVERY reader of farVox goes through one
-// of the three functions below — an unmasked byte read would treat a flagged
-// air cell as material 128.
+// The raw far cell byte: 7 bits of far PALETTE SLOT plus the conservative
+// blocker flag (common.wgsl FAR_BLOCKER_BIT). EVERY reader of farVox goes
+// through one of the four functions below — an unmasked byte read would treat a
+// flagged air cell as slot 128, which does not exist.
 fn farByteAt(level : u32, c : vec3<i32>) -> u32 {
   let bi = farVoxByteIndex(level, c);
   return (farVox[bi >> 2u] >> ((bi & 3u) * 8u)) & 0xFFu;
 }
+// The cell's palette slot, untranslated. This is what the "is there anything
+// here" tests want: slot 0 is air and NOTHING ELSE maps to material 0, so
+// `farPalAt(..) != 0` is exactly `farMatAt(..) != 0` without the table read.
+fn farPalAt(level : u32, c : vec3<i32>) -> u32 {
+  return farByteAt(level, c) & FAR_PAL_MASK;
+}
+// The cell's MATERIAL, translated through the far palette (common.wgsl
+// farPalMat). Everything downstream — shading, the palette jitter, the blocker
+// union, AO — takes a real material id, so the indirection stops here.
 fn farMatAt(level : u32, c : vec3<i32>) -> u32 {
-  return farByteAt(level, c) & FAR_MAT_MASK;
+  return farPalMat(&materials, farPalAt(level, c));
 }
 // "Would a ray stop here?" — the flag OR a real material. A cell can carry
 // material without the flag (an edit downsampled into mid-air) and the flag
@@ -2901,6 +3023,229 @@ fn farMatAt(level : u32, c : vec3<i32>) -> u32 {
 // missed), so this is a union and not either one alone.
 fn farBlockerAt(level : u32, c : vec3<i32>) -> bool {
   return farByteAt(level, c) != 0u;
+}
+
+// ======================= THE OUTER GAS DENSITY BOX =========================
+// docs/PLAN_gas_particles.md §2.5. Three small functions and one loop, called
+// once per pixel from fs() AFTER traceFar has returned — deliberately not from
+// inside either march. The far loop is where the plan expected this to live,
+// and the reason it does not is gotcha-raymarch-register-cliff: trace() and
+// traceFar() are what set this shader's register high-water mark, a fetch and
+// an accumulator added to either raises it for every pixel in the frame, and
+// this sampler needs neither of their loop state. Hoisting it out costs one
+// extra pass over a segment that is at most half a window long and buys the
+// two hot loops being byte-identical to what they were.
+
+// The box's min corner in world voxels. IDENTICAL EXPRESSION to sim_gas.wgsl's
+// gasOuterOrigin(), and it has to be: the splatter and the sampler agreeing on
+// where cell (0,0,0) is IS the interface. R.origin is the window origin in
+// chunk units, the window origin is a multiple of 16 voxels and half a window
+// is 256, so the subtraction lands on a cell boundary with no rounding.
+fn gasOuterOriginVox() -> vec3<i32> {
+  return R.origin * i32(CHUNK) - vec3<i32>(i32(WORLD_N) / 2);
+}
+
+// Parcel count in the cell containing world position `p`, 0 outside the box.
+// NEAREST, not trilinear — §2.5 asked for trilinear and this is the one
+// deviation in the sampler. Trilinear is eight byte fetches from four words
+// per sample and seven lerps of live state; nearest is one. The smoothing it
+// would buy is already bought twice over by the sampler being coarser than the
+// cell (see GAS_OUTER_STEPS) and by the per-pixel jitter below, which turns
+// the sample cadence into a stipple rather than into shells. If a future plume
+// reads as blocky at close range, the cheap fix is more steps, not filtering.
+fn gasOuterCountAt(p : vec3f) -> f32 {
+  // Arithmetic shift, so the mapping is floor division and matches the sim's
+  // `(c - origin) >> shift` for negative coordinates as well as positive.
+  let d = (vec3<i32>(floor(p)) - gasOuterOriginVox()) >> vec3<u32>(GAS_OUTER_SHIFT);
+  if (any(d < vec3<i32>(0)) || any(d >= vec3<i32>(i32(GAS_OUTER_N)))) {
+    return 0.0;
+  }
+  let li = (u32(d.z) * GAS_OUTER_N + u32(d.y)) * GAS_OUTER_N + u32(d.x);
+  return f32((gasOuter[li >> 1u] >> (16u * (li & 1u))) & 0xFFFFu);
+}
+
+// WHICH gas the box is made of. gasOuter stores a count and no material (§2.5:
+// "one gas material in stage 1"), so the renderer has to name one, and it
+// names it by PROPERTY rather than by id — hardcoding a material id in a
+// shader is the one thing the materials-are-data convention forbids outright.
+// The property is "the first non-emissive absorbing gas in the table": on the
+// shipped table that resolves to `smoke`, because `fire` is emissive (and
+// would paint every distant plume orange) and `steam` sorts after it. Returns
+// 0 if the table has no such material, which reads as MAT_AIR and disables the
+// whole path.
+//
+// Walked once per pixel and ONLY on a pixel that already found gas, which is
+// why a linear scan is affordable: a world with no gas material has no gas
+// parcels either, so the loop is unreachable in exactly the case where its
+// cost would not be paid for.
+fn gasOuterMat() -> u32 {
+  let n = arrayLength(&materials);
+  for (var i = 1u; i < n; i++) {
+    if (materials[i].klass == CLASS_GAS && materials[i].emission == 0u &&
+        materials[i].opacity > 0u) {
+      return i;
+    }
+  }
+  return 0u;
+}
+
+// Integrate coarse gas volume along the ray. Returns voxel-lengths of pure gas
+// — the same unit trace() accumulates into mediaTau before multiplying by
+// opacity, which is what lets fs() feed the result into the one media
+// accumulator instead of inventing a second shading path for it.
+//
+// TWO SEGMENTS SINCE STAGE 1b, with their own step budgets:
+//
+//   * THE BAND, inside the window, from wherever the ray leaves the inner box
+//     of half-extent render.gasBlendStart x WORLD_N/2 out to the window face.
+//     Each sample is weighted by gasBlendW, which is 0 at the inner edge and
+//     1 at the face — the exact complement of the fade trace() applies to the
+//     voxels over the same shell. This is the half that did not exist before,
+//     and it is why the box now holds in-window gas as well as parcels.
+//   * OUTSIDE THE WINDOW, stage 1's segment, unchanged and at weight 1
+//     (gasBlendW is 1 everywhere past the face).
+//
+// `tEnd` is where the ray stopped: the near hit for a ray that resolved a
+// surface inside the window, the far-field hit for one that did not, 1e30 for
+// one that reached sky. A plume behind a hill is occluded by the hill, and a
+// plume behind a wall five metres away is occluded by the wall — which is what
+// makes it safe to run this on rays that DID hit.
+fn gasOuterFill(ro : vec3f, rdIn : vec3f, tEnd : f32, px : vec2f) -> f32 {
+  var rd = rdIn;
+  if (abs(rd.x) < 1e-6) { rd.x = select(-1e-6, 1e-6, rd.x >= 0.0); }
+  if (abs(rd.y) < 1e-6) { rd.y = select(-1e-6, 1e-6, rd.y >= 0.0); }
+  if (abs(rd.z) < 1e-6) { rd.z = select(-1e-6, 1e-6, rd.z >= 0.0); }
+  let inv = 1.0 / rd;
+
+  // ONE slab test for BOTH boxes (§ scope: "skip sampling entirely when the
+  // ray segment misses the box"). The window and the outer box are concentric
+  // and the outer half-extent is exactly twice the window's — the identity the
+  // const_assert at the top of this file pins — so for every axis the outer
+  // box's two plane distances are the window's shifted out by half a window
+  // along that axis, i.e. by WORLD_N/2 * abs(inv). Six divides, not twelve.
+  let wlo = vec3f(R.origin * i32(CHUNK));
+  let tt0 = (wlo - ro) * inv;
+  let tt1 = (wlo + f32(WORLD_N) - ro) * inv;
+  let tminW = min(tt0, tt1);
+  let tmaxW = max(tt0, tt1);
+  let ext = f32(WORLD_N) * 0.5 * abs(inv);
+
+  // Screen-space, time-free jitter: the same farDither the cascade seams use,
+  // for the same reason and with the same two rules (no time input, keyed on
+  // the pixel). Without it a fixed sample cadence draws the plume as a set of
+  // concentric shells centred on the camera, which is the volumetric version
+  // of the LOD ring that dither exists to break. ONE draw, shared by both
+  // segments — two independent dithers would decorrelate the two halves of the
+  // crossfade and stipple the seam back in.
+  let jit = farDither(px);
+  var acc = 0.0;
+
+  // ---- OUTSIDE THE WINDOW (stage 1's segment) ------------------------------
+  // Starts at the WINDOW EXIT, not at trace()'s tExit: trace()'s tExit is not
+  // the window exit — the in-window LOD handoff shortens it to
+  // render.lodHandoffDist, which would have put the start of this segment tens
+  // of metres inside the window.
+  let tExitW = min(tmaxW.x, min(tmaxW.y, tmaxW.z));
+  let tA = max(max(tExitW,
+                   max(max(tminW.x - ext.x, tminW.y - ext.y),
+                       max(tminW.z - ext.z, 0.0))), 0.0);
+  let tB = min(min(tmaxW.x + ext.x, min(tmaxW.y + ext.y, tmaxW.z + ext.z)),
+               tEnd);
+  // `acc` is count x LENGTH, not a bare sum, because the two segments have
+  // different step budgets and therefore different dt. Each loop multiplies in
+  // its own.
+  if (tB > tA) {
+    let dt = (tB - tA) / f32(GAS_OUTER_STEPS);
+    var t = tA + dt * jit;
+    for (var i = 0u; i < GAS_OUTER_STEPS; i++) {
+      acc += gasOuterCountAt(ro + rd * t) * dt;
+      t += dt;
+    }
+  }
+
+  // ---- THE BAND, INSIDE THE WINDOW (stage 1b) ------------------------------
+  // The inner box is the window box shrunk by (1 - gasBlendStart) x half a
+  // window on every side, so the SAME six slab distances serve it: shrinking a
+  // box pulls both of an axis's plane distances toward each other by
+  // shrink*abs(inv), exactly as the outer box pushes them apart by `ext`. Six
+  // divides for three boxes, which is the trick this function already used.
+  //
+  // The segment runs from the inner box's EXIT (when the camera is inside it,
+  // which is the standing case — the player is near the window's centre) to
+  // the window face. When the camera is NOT inside the inner box the whole
+  // window crossing is sampled instead, and the part of it that lies inside
+  // the inner box contributes nothing because gasBlendW is 0 there: wasteful
+  // in a rare configuration, never wrong in any.
+  let shrink = (1.0 - min(TUNE_GAS_BLEND_START, 0.99)) * f32(WORLD_N) * 0.5
+               * abs(inv);
+  let tmaxI = tmaxW - shrink;
+  let tminI = tminW + shrink;
+  let tExitI = min(tmaxI.x, min(tmaxI.y, tmaxI.z));
+  let tEnterI = max(max(tminI.x, tminI.y), tminI.z);
+  let insideInner = tEnterI <= 0.0 && tExitI > 0.0;
+  let bandA = max(max(max(tminW.x, tminW.y), max(tminW.z, 0.0)),
+                  select(0.0, tExitI, insideInner));
+  let bandB = min(tExitW, tEnd);
+  if (bandB > bandA) {
+    let dt = (bandB - bandA) / f32(GAS_BAND_STEPS);
+    var t = bandA + dt * jit;
+    for (var i = 0u; i < GAS_BAND_STEPS; i++) {
+      let p = ro + rd * t;
+      // The count is weighted by the SAME ramp trace() faded the voxels by,
+      // so the two representations sum to one plume across the whole shell.
+      acc += gasOuterCountAt(p) * gasBlendW(p) * dt;
+      t += dt;
+    }
+  }
+  // Count -> volume fraction: one parcel IS one fine voxel of gas (that is
+  // what left the window), and a cell holds (1 << SHIFT)^3 of them. So the
+  // integral of (count / cellVolume) along the ray is exactly the number of
+  // voxel-lengths of solid gas crossed, which is what a full cell contributes
+  // per unit length in trace()'s media branch (weight = 1, cellOp applied
+  // after). No look constant anywhere in the conversion.
+  //
+  // The splat saturates at GAS_OUTER_MAX = 60,000 (sim_gas.wgsl), which is
+  // 117x a full cell, so a cell full of gas reads as exactly full and a cell
+  // with parcels stacked in it reads brighter. Stage 1's byte capped this at
+  // 192/512 = 0.375 full, which was a visible ceiling on brightness the moment
+  // in-window voxels started splatting into the same box.
+  let cellVox = f32(1u << GAS_OUTER_SHIFT);
+  return acc / (cellVox * cellVox * cellVox);
+}
+
+// ---- THE VALID BOX (2026-09-10): the box a far reader may march ------------
+// A level's box is toroidal: when its origin steps one level chunk toward the
+// player, the incoming face's SLOTS are the outgoing face's, and they keep the
+// outgoing face's bytes until the sieve refills them — ~16 ticks per plane
+// under the play fill cap (farfield.h kPlayFillCap), and sprint flight backlogs
+// planes deep. Marched as terrain from the full [origin, origin + FAR_N) box,
+// those bytes were the hillside BEHIND the player drawn ahead of them, and the
+// underground of the bottom face drawn in the sky when the box stepped up.
+//
+// F.origins[k].w is the pending-face word FarField::FaceWord packs: six 4-bit
+// counts of planes still queued on each face (-x,+x,-y,+y,-z,+z, low nibble
+// first) and bit 24 = the whole level is a reset in flight. The box every far
+// reader marches is the full box less those faces (empty during a reset), so a
+// ray in an excluded slab leaves this level at the shrunken face and the next
+// coarser level — filled — picks it up at the same t, by the seam contract
+// traceFar already keeps for a ray that runs out of TUNE_FAR_STEPS. Nothing
+// here reads a slot before the sieve has written it. Same-tick origin step and
+// face shrink arrive in one UBO write; a landed face is published a tick late.
+struct FarBox { lo : vec3<i32>, hi : vec3<i32> };   // level-CELL coords, [lo, hi)
+fn farBox(level : u32) -> FarBox {
+  let o = F.origins[level - 1u];
+  let w = u32(o.w);
+  var b : FarBox;
+  b.lo = o.xyz * i32(CHUNK);
+  if ((w & (1u << 24u)) != 0u) { b.hi = b.lo; return b; }   // reset in flight
+  let lo = vec3<i32>(i32(w & 15u), i32((w >> 8u) & 15u), i32((w >> 16u) & 15u));
+  let hi = vec3<i32>(i32((w >> 4u) & 15u), i32((w >> 12u) & 15u), i32((w >> 20u) & 15u));
+  b.lo = (o.xyz + lo) * i32(CHUNK);
+  b.hi = (o.xyz + vec3<i32>(i32(FAR_NCHUNK)) - hi) * i32(CHUNK);
+  return b;
+}
+fn farInValid(c : vec3<i32>, b : FarBox) -> bool {
+  return all(c >= b.lo) && all(c < b.hi);
 }
 
 fn traceFar(ro : vec3f, rdIn : vec3f, tStart : f32, px : vec2f) -> FarHit {
@@ -2948,12 +3293,11 @@ fn traceFar(ro : vec3f, rdIn : vec3f, tStart : f32, px : vec2f) -> FarHit {
 
   for (var level = 1u; level <= FAR_LEVELS; level++) {
     let s = f32(1u << farCellShift(level));   // fine voxels per level cell
-    let org = F.origins[level - 1u].xyz;
+    let box = farBox(level);                  // the VALID box, see farBox
     // everything below is in LEVEL-CELL coords: pos/s, t/s (same rd)
     let roL = ro / s;
-    let lo = vec3f(org * i32(CHUNK));
-    let tt0 = (lo - roL) * inv;
-    let tt1 = (lo + f32(FAR_N) - roL) * inv;
+    let tt0 = (vec3f(box.lo) - roL) * inv;
+    let tt1 = (vec3f(box.hi) - roL) * inv;
     let tmin = min(tt0, tt1);
     let tmax = max(tt0, tt1);
     let tEnter = max(max(tmin.x, tmin.y), max(tmin.z, tPrev / s));
@@ -3011,7 +3355,6 @@ fn traceFar(ro : vec3f, rdIn : vec3f, tStart : f32, px : vec2f) -> FarHit {
     // chunk's inner loop starts.
     let stepv = vec3<i32>(sign(rd));
     let tDelta = abs(inv);
-    let loI = org * i32(CHUNK);
 
     var axis = 0;
     if (tmin.y > tmin.x && tmin.y > tmin.z) { axis = 1; }
@@ -3019,7 +3362,7 @@ fn traceFar(ro : vec3f, rdIn : vec3f, tStart : f32, px : vec2f) -> FarHit {
 
     var tCur = tEnter + 1e-4;
     var cc = worldChunkOf(clamp(vec3<i32>(floor(roL + rd * tCur)),
-                                loI, loI + vec3<i32>(i32(FAR_N) - 1)));
+                                box.lo, box.hi - vec3<i32>(1)));
     var cNext : vec3f;
     for (var a = 0; a < 3; a++) {
       let b = f32((cc[a] + select(0, 1, rd[a] > 0.0)) * i32(CHUNK));
@@ -3043,7 +3386,7 @@ fn traceFar(ro : vec3f, rdIn : vec3f, tStart : f32, px : vec2f) -> FarHit {
     while (budget > 0) {
       rsAdd(RS_FAR, 1u);
       budget -= 1;
-      if (!farInBox(cc * i32(CHUNK), org)) { break; }
+      if (!farInValid(cc * i32(CHUNK), box)) { break; }
       if (tCur >= tExit) { break; }
       let tOut = min(cNext.x, min(cNext.y, cNext.z));
       let occ = farOcc[farOccIndex(level, cc * i32(CHUNK))];
@@ -3096,7 +3439,7 @@ fn traceFar(ro : vec3f, rdIn : vec3f, tStart : f32, px : vec2f) -> FarHit {
             rsAdd(RS_FAR, 1u);
             budget -= 1;
             let cellByte = farByteAt(level, vc);
-            var mat = cellByte & FAR_MAT_MASK;
+            var mat = farPalMat(&materials, cellByte & FAR_PAL_MASK);
             // THE BLOCKER FLAG AS A PRIMARY HIT, behind render.farBlockerHitLevel.
             //
             // Shadows take the flag at every level (farShadowDist) because a
@@ -3118,7 +3461,7 @@ fn traceFar(ro : vec3f, rdIn : vec3f, tStart : f32, px : vec2f) -> FarHit {
               var probe = vc;
               for (var d = 0; d < 3; d++) {
                 probe.y -= 1;
-                if (!farInBox(probe, org)) { break; }
+                if (!farInValid(probe, box)) { break; }
                 let below = farMatAt(level, probe);
                 if (below != 0u) { mat = below; break; }
               }
@@ -3262,7 +3605,7 @@ fn farLevelForDist(distFine : f32) -> u32 {
 // its other reader (traceFar's primary-hit path, behind
 // render.farBlockerHitLevel).
 fn farShadowBlocked(level : u32, vc : vec3<i32>) -> bool {
-  return (farByteAt(level, vc) & FAR_MAT_MASK) != 0u;
+  return farPalAt(level, vc) != 0u;
 }
 
 // Returns the distance to the blocker in FINE voxels, or -1.0 when the ray
@@ -3278,10 +3621,9 @@ fn farShadowDist(level : u32, roFine : vec3f) -> f32 {
   let inv = 1.0 / rd;
   let s = f32(1u << farCellShift(level));
   let roL = roFine / s;
-  let org = F.origins[level - 1u].xyz;
-  let lo = vec3f(org * i32(CHUNK));
-  let tt0 = (lo - roL) * inv;
-  let tt1 = (lo + f32(FAR_N) - roL) * inv;
+  let box = farBox(level);   // the valid box, as traceFar
+  let tt0 = (vec3f(box.lo) - roL) * inv;
+  let tt1 = (vec3f(box.hi) - roL) * inv;
   let tExit = min(max(tt0.x, tt1.x), min(max(tt0.y, tt1.y), max(tt0.z, tt1.z)));
 
   // ---- THE SAME NESTED CURSOR traceFar RUNS (2026-09-07) -------------------
@@ -3320,7 +3662,7 @@ fn farShadowDist(level : u32, roFine : vec3f) -> f32 {
   while (budget > 0) {
     rsAdd(RS_FAR_SHADOW, 1u);
     budget -= 1;
-    if (!farInBox(cc * i32(CHUNK), org)) { return -1.0; }
+    if (!farInValid(cc * i32(CHUNK), box)) { return -1.0; }
     if (tCur >= tExit) { return -1.0; }
     let tOut = min(cNext.x, min(cNext.y, cNext.z));
     let occ = farOcc[farOccIndex(level, cc * i32(CHUNK))];
@@ -3400,8 +3742,8 @@ fn farShadowed(level : u32, roFine : vec3f) -> bool {
 // stamp AO onto a meadow here any more than it can inside (isRayBlocker).
 // Cells outside the level box do not occlude, as unloaded space does not near.
 fn farAoSolidAt(level : u32, c : vec3<i32>) -> f32 {
-  if (!farInBox(c, F.origins[level - 1u].xyz)) { return 0.0; }
-  return select(0.0, 1.0, farMatAt(level, c) != 0u);
+  if (!farInValid(c, farBox(level))) { return 0.0; }
+  return select(0.0, 1.0, farPalAt(level, c) != 0u);
 }
 
 fn farVoxelAO(level : u32, cell : vec3<i32>, n : vec3<i32>, a1 : i32, a2 : i32,
@@ -6778,8 +7120,9 @@ struct FSOut {
 // First WORD of node c's grid row, or -1 when the node has no block.
 fn fluidNodeBase(c : vec3<i32>) -> i32 {
   let wc = worldChunkOf(c);
-  if (!chunkInWindow(wc, R.origin)) { return -1; }
-  let bm = fluidBlockMapR[chunkSlotIndex(wc)];
+  let fsl = chunkSlotOf(wc, R.origin);
+  if (fsl == SLOT_NONE) { return -1; }
+  let bm = fluidBlockMapR[fsl];
   if (bm == 0u) { return -1; }
   let lo = vec3<u32>(c & vec3<i32>(CHUNK_MASK));
   return i32(((bm - 1u) * CHUNK_VOL + (lo.z * CHUNK + lo.y) * CHUNK + lo.x) *
@@ -6827,10 +7170,10 @@ fn fluidCellAt(c : vec3<i32>) -> vec3f {
   // fluidFieldAt 2-3 rows, and fluidNormalAt 4 fields — ~32 per water-pixel
   // normal, on top of the march's own budget. Same words read, same order.
   let wc = worldChunkOf(c);
-  let slot = chunkSlotIndex(wc);
+  let slot = chunkSlotOf(wc, R.origin);
   var m = 0.0;
   var vy = 0.0;
-  if (chunkInWindow(wc, R.origin)) {
+  if (slot != SLOT_NONE) {
     let bm = fluidBlockMapR[slot];
     if (bm != 0u) {
       let lo = vec3<u32>(c & vec3<i32>(CHUNK_MASK));
@@ -7192,19 +7535,20 @@ const FLUID_SEAM_SHELL : i32 = 2;
 // block is routinely all air. The Y-occupancy mask (common.wgsl) is the answer,
 // and a zero mask means the block is empty.
 fn fluidChunkWater(wc : vec3<i32>) -> bool {
-  if (!chunkInWindow(wc, R.origin)) { return false; }
-  let slot = chunkSlotIndex(wc);
+  let slot = chunkSlotOf(wc, R.origin);
+  if (slot == SLOT_NONE) { return false; }
   return fluidBlockMapR[slot] != 0u &&
          fluidBlockMapR[fbmYMaskIndex(slot)] != 0u;
 }
 
 fn fluidYMaskOf(wc : vec3<i32>) -> u32 {
-  if (!chunkInWindow(wc, R.origin)) { return 0u; }
-  return fluidBlockMapR[fbmYMaskIndex(chunkSlotIndex(wc))];
+  let ysl = chunkSlotOf(wc, R.origin);
+  if (ysl == SLOT_NONE) { return 0u; }
+  return fluidBlockMapR[fbmYMaskIndex(ysl)];
 }
 
 fn fluidChunkClass(wc : vec3<i32>) -> u32 {
-  if (!chunkInWindow(wc, R.origin)) { return 0u; }
+  if (!chunkResident(wc, R.origin)) { return 0u; }
   if (fluidChunkWater(wc)) { return 1u; }
   // A chunk with only settled CA water has no MPM block allocation, but
   // fluidCellAt still returns non-zero density there (virtual mass from
@@ -7398,6 +7742,10 @@ fn fluidMarch(ro : vec3f, rdIn : vec3f, tMax : f32) -> FluidHit {
       let p = ro + rd * t;
       let c = vec3<i32>(floor(p));
       let wc = worldChunkOf(c);
+      // (d) IDENTITY, not addressing: this only detects "different chunk than
+      // last step" for the memo below, so the plain fold is the right tool and
+      // a ticket needs no entry here. (Two chunks NCHUNK apart alias, which is
+      // pre-existing and harmless: the window clip bounds the march first.)
       let slot = chunkSlotIndex(wc);
       if (slot != heldSlot) {
         heldSlot = slot;
@@ -7677,6 +8025,10 @@ fn fluidMarchBlocky(ro : vec3f, rdIn : vec3f, tMax : f32,
       let p = ro + rd * t;
       let c = vec3<i32>(floor(p));
       let wc = worldChunkOf(c);
+      // (d) IDENTITY, not addressing: this only detects "different chunk than
+      // last step" for the memo below, so the plain fold is the right tool and
+      // a ticket needs no entry here. (Two chunks NCHUNK apart alias, which is
+      // pre-existing and harmless: the window clip bounds the march first.)
       let slot = chunkSlotIndex(wc);
       if (slot != heldSlot) {
         heldSlot = slot;
@@ -8085,6 +8437,35 @@ fn fs(in : VSOut) -> FSOut {
     far = traceFar(R.camPos, rd, h.tExit, in.pos.xy);
   }
 
+  // ---- coarse gas (docs/PLAN_gas_particles.md §2.5 + stage 1b) ------------
+  // Stage 1 ran this only for rays that reached the outside, on the argument
+  // that a ray which resolved a surface inside the window never gets there.
+  // Stage 1b moves the coarse representation INSIDE the window — it now fades
+  // in over the outer shell, where the voxels fade out — so a ray that hits a
+  // wall at 20 m may well have crossed band gas at 15 m, and gating on `!hit`
+  // would delete exactly the half of the crossfade that is supposed to be
+  // invisible. The bound moves from "did it leave" to "where did it stop": the
+  // near hit for a ray that resolved or saturated inside the window, the far
+  // hit for one the cascade stopped, unbounded for one that reached sky.
+  //
+  // R.flags bit 3 (RFLAG_GAS) is what keeps this free in a world with no
+  // smoke: without it, giving every terrain pixel a 28-sample volume walk
+  // would be a per-frame cost paid by worlds that have nothing to draw with
+  // it. gasOuter is also only CLEARED on ticks the sim records the gas rows
+  // (C_GAS), so the flag is not merely an optimization — it is what stops a
+  // stale box from being sampled at all.
+  //
+  // The value is voxel-lengths of gas; it becomes optical depth in the media
+  // block far below, where the near march's tau is turned into a tint. This is
+  // the whole of the render side: one number, folded into one accumulator.
+  var gasFarFill = 0.0;
+  if ((R.flags & RFLAG_GAS) != 0u) {
+    var tStop = 1e30;
+    if (h.hit || h.saturated) { tStop = h.t; }
+    else if (far.hit) { tStop = far.t; }
+    gasFarFill = gasOuterFill(R.camPos, rd, tStop, in.pos.xy);
+  }
+
   // ---- MPM fluid march (see the MPM FLUID SURFACE / VOXELIZED blocks) ----
   // Bounded by the terrain hit, or by the window exit for rays that leave
   // (the fluid only exists inside the window). Zero fluid anywhere, or the
@@ -8296,8 +8677,8 @@ fn fs(in : VSOut) -> FSOut {
       // ground under a flattened canopy at levels >= 5, where the crown is
       // painted onto the surface cell and nothing sits above it to occlude.
       let up = far.cell + vec3<i32>(0, 1, 0);
-      if (farInBox(up, F.origins[far.level - 1u].xyz) &&
-          farMatAt(far.level, up) != 0u) { ao *= TUNE_AO_FAR; }
+      if (farInValid(up, farBox(far.level)) &&
+          farPalAt(far.level, up) != 0u) { ao *= TUNE_AO_FAR; }
       // Same lighting model as the near field (hemisphere ambient x AO, plus
       // direct sun) so the two representations agree across the seam.
       let fsun = keyLightColor() * lambert;
@@ -8696,11 +9077,59 @@ fn fs(in : VSOut) -> FSOut {
   // Liquids used to be tinted here too, and that is precisely why water looked
   // like blue fog — an absorbing volume with no surface. They now take the
   // shadeWater() path below instead.
-  if (h.mediaMat != 0u && materials[h.mediaMat].klass == CLASS_GAS) {
-    let mm = materials[h.mediaMat];
+  //
+  // ---- AND THE OUTER BOX JOINS THE SAME ACCUMULATOR (§2.5) ----------------
+  // The three locals below start as copies of the near march's fields and the
+  // parcel gas is added INTO them, so there is exactly one place where gas
+  // optical depth becomes a colour. That is the point of doing it here rather
+  // than compositing a second layer afterwards: the tau-weighted tint average
+  // is what makes a ray that crosses in-window smoke and then a distant plume
+  // shade as one volume, and a second mix() would instead paint the far plume
+  // over the near one at full strength.
+  var mediaMat  = h.mediaMat;
+  var mediaTau  = h.mediaTau;
+  var mediaTint = h.mediaTint;
+  if (gasFarFill > 1e-4) {
+    let gm = gasOuterMat();
+    if (gm != 0u) {
+      // Voxel-lengths x per-voxel opacity, exactly as the media branch of
+      // trace() computes dTau, and in the same units — so the tau -> alpha
+      // curve below, and everything downstream that reads mediaTau, needs no
+      // knowledge that any of this came from outside the window.
+      let dTau = gasFarFill * f32(materials[gm].opacity) / 255.0;
+      mediaTau += dTau;
+      mediaTint += (unpackColor(materials[gm].color0) +
+                    unpackColor(materials[gm].color1)) * 0.5 * dTau;
+      // A ray that crossed no near-field media at all: the far plume is the
+      // only thing making this pixel a gas pixel, so it names the material.
+      // If the near march already recorded a LIQUID (looking at a plume from
+      // under water) the liquid keeps the field and the far gas is dropped —
+      // it has no compositing order against shadeWater() and inventing one is
+      // not stage 1's business.
+      if (mediaMat == 0u) { mediaMat = gm; }
+    }
+  }
+  //
+  // NOT fed back into gasHalfT or fireGlow. Stage 1's argument for that was
+  // geometric and complete: every voxel-length the box contributed was
+  // strictly beyond the window exit, i.e. behind every raster body and every
+  // fire in the frame, so there was nothing out there for either to order.
+  //
+  // STAGE 1b WEAKENS IT AND DOES NOT REPAIR IT, which is worth naming rather
+  // than leaving to be discovered. The band segment is INSIDE the window, so a
+  // raster body can now stand behind coarse gas that gasHalfT does not know
+  // about, and a fire can stand behind coarse gas that does not dim it. Both
+  // are bounded by the crossfade's own weight — at the inner edge of the band
+  // the coarse contribution is zero and the voxel path (which DOES feed both)
+  // carries all of it; only at the face is it entirely coarse, and there the
+  // plume is 25 m away. Ordering the two properly needs the coarse fill to
+  // happen inside trace()'s loop, which is exactly what
+  // gotcha-raymarch-register-cliff says not to do for a soft volumetric.
+  if (mediaMat != 0u && materials[mediaMat].klass == CLASS_GAS) {
+    let mm = materials[mediaMat];
     var mc = (unpackColor(mm.color0) + unpackColor(mm.color1)) * 0.5;
-    if (h.mediaTau > 1e-5) { mc = h.mediaTint / h.mediaTau; }
-    let tau = h.mediaTau * VOXEL_METERS * MEDIA_ABSORB;
+    if (mediaTau > 1e-5) { mc = mediaTint / mediaTau; }
+    let tau = mediaTau * VOXEL_METERS * MEDIA_ABSORB;
     let a = 1.0 - exp(-tau);
     color = mix(color, mc, a);
   }

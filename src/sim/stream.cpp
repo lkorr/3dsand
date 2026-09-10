@@ -186,7 +186,7 @@ void Stream::Init(GpuContext* ctx, World* world, Simulation* sim, uint32_t seed)
   // Publish the far-field edit index so FarField can reach it through World
   // (world.h's `farEdits`, forward-declared exactly like `pages`).
   world_->farEdits = &farEdits_;
-  modified_.assign(kNumChunks, 0);
+  modified_.assign(kNumSlots, 0);
 }
 
 void Stream::OnMaterialsReloaded(const std::vector<MaterialDef>& mats) {
@@ -220,7 +220,7 @@ void Stream::Update(IVec3 playerChunk, uint32_t tick) {
   // latent; see the accepted-race note in stream.h)
   const WorldSnapshot& snap = world_->Snap();
   if (snap.valid) {
-    for (uint32_t i = 0; i < kNumChunks; i++) modified_[i] |= snap.dirtyFlags[i];
+    for (uint32_t i = 0; i < kNumSlots; i++) modified_[i] |= snap.dirtyFlags[i];
   }
   timing_.dirtyFoldMs += PtNowMs() - uT1;
 
@@ -302,7 +302,7 @@ void Stream::ShiftAxis(int axis, int dir) {
   // refill below can tell its own eviction (whose bytes it does not need)
   // from a genuine earlier doubled-back one (whose bytes it does). See the
   // shiftEvicted_ note in stream.h.
-  if (shiftEvicted_.size() != kNumChunks) shiftEvicted_.assign(kNumChunks, 0);
+  if (shiftEvicted_.size() != kNumSlots) shiftEvicted_.assign(kNumSlots, 0);
   for (uint32_t s : slots) shiftEvicted_[s] = 1;
 
   // A pending entry from an EARLIER shift may name some of these slots (two
@@ -735,7 +735,7 @@ void Stream::FillSlots(const std::vector<uint32_t>& slots, bool deferWake) {
       ctx_->queue.WriteBuffer(world_->occupancy, (uint64_t)s * 4, &occ, 4);
       // ...and the sub-chunk mask in the tail of the same buffer (world.h).
       ctx_->queue.WriteBuffer(world_->occupancy,
-                              ((uint64_t)kNumChunks + (uint64_t)s * kSubOccStride) * 4,
+                              ((uint64_t)kNumSlots + (uint64_t)s * kSubOccStride) * 4,
                               sub, sizeof(sub));
       // wake once: neighbors may have changed since this chunk was saved
       ctx_->queue.WriteBuffer(world_->dirty[0], (uint64_t)s * 4, &one, 4);
@@ -858,7 +858,7 @@ void Stream::FillSlots(const std::vector<uint32_t>& slots, bool deferWake) {
     // of the completion but must take the WAKE at the same tick as paged, or
     // the two modes would not hash identically — and `--residency dense` is
     // the only live differential oracle this system has.
-    const uint64_t occBytes = (uint64_t)kNumChunks * 4;
+    const uint64_t occBytes = (uint64_t)kNumSlots * 4;
     const uint64_t actBytes = (uint64_t)genSlots.size() * 4;
     if (deferWake) {
       // genAct is sized to ONE PLANE, which is the only thing that defers.
@@ -902,7 +902,7 @@ void Stream::FillSlots(const std::vector<uint32_t>& slots, bool deferWake) {
       // no plane-sized bound to respect, so this keeps the old fence.
       const double dT0 = PtNowMs();
       std::vector<uint32_t>& occ = genOccScratch_;
-      if (occ.size() != kNumChunks) occ.assign(kNumChunks, 0);
+      if (occ.size() != kNumSlots) occ.assign(kNumSlots, 0);
       bool occValid = false;
       if (world_->residency == World::Residency::Paged) {
         if (!genOccStaging_)
@@ -918,7 +918,7 @@ void Stream::FillSlots(const std::vector<uint32_t>& slots, bool deferWake) {
         omap.Wait();
         occValid = omap.Succeeded() && omap.Data();
         if (occValid)
-          std::memcpy(occ.data(), omap.Data(), (size_t)kNumChunks * 4);
+          std::memcpy(occ.data(), omap.Data(), (size_t)kNumSlots * 4);
         else
           std::fill(occ.begin(), occ.end(), 0u);  // failed: fall back to all
         omap.Unmap();
@@ -939,7 +939,7 @@ rhi::Buffer Stream::AcquireShiftStaging() {
     return b;
   }
   return CreateBuffer(
-      ctx_->device, ((uint64_t)kNumChunks + (uint64_t)kNChunk * kNChunk) * 4,
+      ctx_->device, ((uint64_t)kNumSlots + (uint64_t)kNChunk * kNChunk) * 4,
       rhi::BufferUsage::MapRead | rhi::BufferUsage::CopyDst, "shiftVerdict");
 }
 
@@ -948,7 +948,7 @@ void Stream::InvalidatePendingSlots(const std::vector<uint32_t>& slots) {
   // A plane is 1,024 of 32,768 slots and the intersection with another axis's
   // plane is 32 of them, so a membership bitmap beats a per-entry sort.
   std::vector<uint8_t>& mark = shiftMark_;
-  if (mark.size() != kNumChunks) mark.assign(kNumChunks, 0);
+  if (mark.size() != kNumSlots) mark.assign(kNumSlots, 0);
   for (uint32_t s : slots) mark[s] = 1;
   for (PendingShift& ps : pendingShifts_)
     for (size_t i = 0; i < ps.genSlots.size(); i++)
@@ -990,15 +990,15 @@ void Stream::CompleteDueShifts(uint32_t tick) {
 
 void Stream::CompleteShift(PendingShift& ps, uint32_t tick) {
   const double dT0 = PtNowMs();
-  const uint64_t occBytes = (uint64_t)kNumChunks * 4;
+  const uint64_t occBytes = (uint64_t)kNumSlots * 4;
   std::vector<uint32_t>& occ = genOccScratch_;
   std::vector<uint32_t>& act = genActScratch_;
-  if (occ.size() != kNumChunks) occ.assign(kNumChunks, 0);
+  if (occ.size() != kNumSlots) occ.assign(kNumSlots, 0);
   act.assign(ps.genSlots.size(), 0u);
   bool occValid = false;
   if (ps.map.Succeeded() && ps.map.Data()) {
     const uint8_t* base = (const uint8_t*)ps.map.Data();
-    std::memcpy(occ.data(), base, (size_t)kNumChunks * 4);
+    std::memcpy(occ.data(), base, (size_t)kNumSlots * 4);
     std::memcpy(act.data(), base + occBytes, ps.genSlots.size() * 4);
     occValid = true;
   } else {
@@ -1349,7 +1349,7 @@ void Stream::ReloadWindow(IVec3 origin) {
   DiscardDemotes();  // same: old-world bytes must never classify the new one
   DiscardPendingShifts();  // and so do any un-enacted shift verdicts
   world_->SetWindowOrigin(origin);
-  modified_.assign(kNumChunks, 0);
+  modified_.assign(kNumSlots, 0);
   std::vector<uint32_t> slots(kNumChunks);
   for (uint32_t i = 0; i < kNumChunks; i++) slots[i] = i;
   // deferWake=false: this is the WHOLE window (32,768 slots, far past genAct's

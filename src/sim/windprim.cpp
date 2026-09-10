@@ -251,10 +251,10 @@ void WindPrimSystem::BuildWake(const World& world,
   // Dedup by slot. A bitset over the window's chunk slots costs 4 KiB of stack
   // and one clear; the alternative (sorting the output) would make the wake
   // order depend on the sort, and the wake list is an input to the sim.
-  static constexpr size_t kWords = (size_t)kNumChunks / 64;
+  static constexpr size_t kWords = (size_t)kNumSlots / 64;
   std::vector<uint64_t> seen(kWords, 0ull);
 
-  const bool haveOcc = occupancy.size() >= (size_t)kNumChunks;
+  const bool haveOcc = occupancy.size() >= (size_t)kNumSlots;
 
   for (const WindPrim& p : live_) {
     if ((p.flags & kWindPrimEntrain) == 0) continue;  // no licence, no wake

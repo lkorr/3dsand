@@ -57,6 +57,8 @@ class GpuContext {
   // Blocks on the oldest outstanding snapshot readback only — see the contract
   // on rhi::Device::WaitOldestPendingMap. False = nothing was in flight.
   bool WaitOldestPendingMap();
+  // Snapshot readbacks the GPU still owes (rhi::Device::PendingMapCount).
+  int PendingMapCount() const;
   // Blocks until all submitted GPU work completes (selftest timing / shutdown).
   void WaitIdle();
 

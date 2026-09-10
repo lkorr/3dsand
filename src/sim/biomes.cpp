@@ -122,6 +122,8 @@ bool LoadBiomeSet(const std::string& assetDir, const std::vector<MaterialDef>& m
     b.subsoil = GetS(cv, "subsoil", "dirt");
     b.skinId = matId(b.skin);
     b.subsoilId = matId(b.subsoil);
+    b.firmSkin = GetS(cv, "firmSkin", "");
+    b.firmSkinId = b.firmSkin.empty() ? 0u : matId(b.firmSkin);
     b.skinDepth = Get<int>(cv, "skinDepth", 1);
     const json& patch = Sub(cv, "patch");
     b.patchThreshold = Get<int>(patch, "threshold", 0);
@@ -454,6 +456,8 @@ int ValidateBiomeSet(const BiomeSet& set, std::vector<std::string>& out) {
     if (b.file != b.name + ".json") bad(at + "file name does not match name \"" + b.name + "\"");
     if (!b.skinId && b.skin != "air") bad(at + "cover.skin \"" + b.skin + "\" is not a material");
     if (!b.subsoilId && b.subsoil != "air") bad(at + "cover.subsoil \"" + b.subsoil + "\" is not a material");
+    if (!b.firmSkinId && !b.firmSkin.empty())
+      bad(at + "cover.firmSkin \"" + b.firmSkin + "\" is not a material");
     for (size_t i = 0; i < b.cover.size(); i++) {
       const CoverRow& r = b.cover[i];
       if (!r.materialId) bad(at + "cover.plants[" + std::to_string(i) + "] material \"" + r.material + "\" is not a material");

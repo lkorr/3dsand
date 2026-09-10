@@ -78,6 +78,40 @@ OptRecipe CurrentRecipe() {
   return r;
 }
 
+bool RecipeFromEnv() {
+  static const bool set = [] {
+    const char* v = std::getenv("SANDVOX_SPIRV_OPT");
+    return v && *v;
+  }();
+  return set;
+}
+
+// The recipe THIS shader gets. An explicit SANDVOX_SPIRV_OPT applies to every
+// shader (it is the A/B and the escape hatch, and both need one arm to mean
+// one thing). Otherwise worldgen.wgsl takes the legalization recipe and
+// everything else the performance one, on this measurement (2026-09-09, RTX
+// 3060 Ti, one-line genCellIn edit, --voxdump, main and list compiling
+// concurrently; docs/PLAN_shader_compile.md "Lazy far"):
+//
+//   worldgen main       perf recipe    legal recipe
+//   Tint                   0.13 s          0.15 s
+//   spirv-opt             60.9  s          9.8  s   (671k vs 1,100k words out)
+//   driver                27.7  s         34.3  s
+//   pipeline total        88.7  s         44.3  s
+//
+// The performance recipe's extra passes (loop unrolling, CCP, redundancy
+// elimination, several DCE/SSA rounds) cost 51 s of CPU per worldgen entry
+// and buy the driver back 6.6 s. Worldgen kernels run once per generated
+// chunk, so their ISA quality is worth far less than their compile time —
+// which is the number every worldgen edit pays, five entry points over. The
+// other 58 entry points spend ~12 s of CPU in the optimizer between them, so
+// the performance recipe stays where ISA quality matters (raymarch, the CA).
+OptRecipe RecipeFor(const std::string& label) {
+  if (RecipeFromEnv()) return CurrentRecipe();
+  if (label == "worldgen.wgsl") return OptRecipe::kLegalization;
+  return CurrentRecipe();
+}
+
 bool TimingOn() {
   static const bool on = std::getenv("SANDVOX_SHADER_TIMING") != nullptr;
   return on;
@@ -232,6 +266,12 @@ uint32_t CountLines(const std::string& s) {
 CompileResult Compile(const std::string& wgsl, const std::string& label,
                       const std::string& entryPoint, uint32_t bodyLineOffset) {
   CompileResult r;
+  // Tint's own time (parse + IR + SPIR-V writer), printed under
+  // SANDVOX_SHADER_TIMING beside the spirv-opt and pipeline lines, so the three
+  // costs a worldgen edit pays per entry point read as three numbers instead of
+  // one. Every entry point re-parses the whole assembled file — Tint's writer
+  // takes a Program, not a cached IR — which is what this line makes visible.
+  const auto tTint0 = std::chrono::steady_clock::now();
 
   // 1. WGSL -> AST program. Parse errors surface here with source locations.
   tint::Source::File file(label, wgsl);
@@ -280,16 +320,26 @@ CompileResult Compile(const std::string& wgsl, const std::string& label,
   }
 
   r.spirv = std::move(spv.Get().spirv);
+  if (TimingOn()) {
+    const double ms = std::chrono::duration<double, std::milli>(
+                          std::chrono::steady_clock::now() - tTint0)
+                          .count();
+    std::printf("tint      %-16s %-10s %8zu words              %8.1f ms\n",
+                label.c_str(), entryPoint.c_str(), r.spirv.size(), ms);
+    std::fflush(stdout);
+  }
 
   // 4. (optional) SPIRV-Tools. Never fatal: Optimize() leaves r.spirv alone and
   //    says so on stderr if anything goes wrong.
-  if (OptRecipe recipe = CurrentRecipe(); recipe != OptRecipe::kOff)
+  if (OptRecipe recipe = RecipeFor(label); recipe != OptRecipe::kOff)
     Optimize(r.spirv, recipe, label, entryPoint);
 
   r.ok = true;
   return r;
 }
 
-uint32_t OptimizerCacheTag() { return (uint32_t)CurrentRecipe(); }
+uint32_t OptimizerCacheTag(const std::string& label) {
+  return (uint32_t)RecipeFor(label);
+}
 
 }  // namespace vkspv

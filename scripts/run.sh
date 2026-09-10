@@ -32,6 +32,28 @@ source "$SCRIPT_DIR/svlock.sh"
 
 [ $# -ge 1 ] || { echo "usage: run.sh <command...>" >&2; exit 2; }
 
+# SHARED COMPILE CACHES, machine-global, unless the caller already chose.
+# Both caches were CWD-relative by default, so a worktree's first run paid
+# Tint + spirv-opt for every entry point (shader_cache/) AND the driver's full
+# compile of every pipeline (sandvox_pipeline_cache.bin) that the main checkout
+# had already done from identical source. Both are content-keyed on the engine
+# side: the SPIR-V file name is a hash of (assembled source, entry point,
+# optimizer recipe), and the driver blob is keyed by the driver on the SPIR-V
+# it was handed - so a worktree sharing them with main hits exactly when its
+# shaders are byte-identical and misses exactly when they are not. Same
+# directory as the sccache object cache, for the same reason it lives there.
+#
+# The first switch-over seeds the shared pipeline cache from the CWD's warm
+# one, if there is one, so nobody pays a cold compile for the move.
+export SANDVOX_SHADER_CACHE="${SANDVOX_SHADER_CACHE:-C:/sv-deps/shader_cache}"
+export SANDVOX_PIPELINE_CACHE="${SANDVOX_PIPELINE_CACHE:-C:/sv-deps/sandvox_pipeline_cache.bin}"
+if [ ! -f "$SANDVOX_PIPELINE_CACHE" ] && [ -f sandvox_pipeline_cache.bin ]; then
+  mkdir -p "$(dirname "$SANDVOX_PIPELINE_CACHE")"
+  cp sandvox_pipeline_cache.bin "$SANDVOX_PIPELINE_CACHE.seed.$$" \
+    && mv "$SANDVOX_PIPELINE_CACHE.seed.$$" "$SANDVOX_PIPELINE_CACHE" \
+    && echo "run.sh: seeded $SANDVOX_PIPELINE_CACHE from ./sandvox_pipeline_cache.bin"
+fi
+
 WHO="run:$(basename "$(pwd)")"
 if [ -n "${SANDVOX_RUN_EXCLUSIVE:-}" ]; then
   svlock_acquire "$SVLOCK_COMPILE" "$WHO (exclusive)"

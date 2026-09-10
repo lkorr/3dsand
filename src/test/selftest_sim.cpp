@@ -37,6 +37,20 @@ Status GateDeterminism(Ctx& c, std::string& detail) {
 
 // determinism: two identical runs must produce identical hash sequences
 std::vector<uint32_t> hashes[2];
+// ---- GAS PARTICLES ARE NOT IN THE WORLD HASH, AND CANNOT BE ---------------
+// A parcel outside the residency window touches no voxel, so the hash the
+// occupancy pass folds cannot see it at all. It becomes visible only when it
+// re-enters and lands, which is potentially a hundred ticks after the motion
+// that decided where. That is a real hole: a scheduling-dependent gas step
+// out there would reproduce a matching hash sequence for the whole run.
+//
+// So the gas population carries its OWN digest (kGasSpDigest) — the sum of
+// every surviving parcel's particlePriority, order-independent because the
+// pool's append order is not. Read ONCE per run rather than per tick: it is a
+// blocking readback, the failure it catches is persistent (a divergence does
+// not heal), and 400 extra stalls for a claim two make is exactly the
+// verification budget CLAUDE.md is about.
+uint32_t gasDigest[2] = {}, gasLiveEnd[2] = {};
 for (int run = 0; run < 2; run++) {
   SubmitWorldgen(ctx, world, sim, kDefaultSeed);
   ctx.WaitIdle();
@@ -46,8 +60,17 @@ for (int run = 0; run < 2; run++) {
                SelftestParticlesActive(t));
     hashes[run].push_back(ReadHashSync(ctx, world));
   }
+  uint32_t gs[kGasSpHdr] = {};
+  ReadGasStatsSync(ctx, world, gs);
+  gasDigest[run] = gs[kGasSpDigest];
+  gasLiveEnd[run] = GasAliveSync(ctx, world, sim);
 }
-bool deterministic = hashes[0] == hashes[1];
+const bool gasSame =
+    gasDigest[0] == gasDigest[1] && gasLiveEnd[0] == gasLiveEnd[1];
+bool deterministic = hashes[0] == hashes[1] && gasSame;
+std::printf("determinism: gas %u parcels alive, digest %08x (%s)\n",
+            gasLiveEnd[0], gasDigest[0],
+            gasSame ? "reproduced" : "DIVERGED between the two runs");
 
 // ---- THE TWO CHECKS ARE DIFFERENT CLAIMS. DO NOT CONFLATE THEM. ------------
 //
@@ -151,6 +174,8 @@ Status GateSleep(Ctx& c, std::string& detail) {
 // Includes an explosion: every ejected particle must reinsert and die.
 uint32_t sleepActive = 0;
 uint32_t particlesLeft = 0;
+uint32_t faLive1 = 0;  // MLS-MPM particles still alive; read below, verdict at the end
+uint32_t particlesEnd = 0;  // ejecta re-read AFTER the quiet window (see below)
 int settled = 0;  // tick at which the world went quiet (or the cap)
 {
   SubmitWorldgen(ctx, world, sim, kDefaultSeed);
@@ -161,11 +186,24 @@ int settled = 0;  // tick at which the world went quiet (or the cap)
   // pocket in 32 m of world), and freshly generated liquid legitimately
   // takes longer to equalize. Tick until the world is quiet, hard-capped —
   // the cap is what still catches never-sleeping content (rule 2).
-  uint32_t quiet = kNumChunks;
+  uint32_t quiet = kNumSlots;
   for (int i = 0; i < 3000; i++) {
     std::vector<ExplosionOp> exps;
     if (i == 30) exps.push_back({110, 76, 110, 12, 350, 0, 0, 0});  // wood slab
-    bool pactive = i >= 30 && i < 460;
+    // A FIXTURE THAT OUTLASTS WHAT IT MEASURES. This used to close at i < 460,
+    // which was fine while the world settled in ~500 ticks: the explosion at 30
+    // threw ejecta, the window covered their flight, and they were all dead
+    // before it shut. The MPM seam now sheds splash droplets throughout
+    // settling, and settling can run to the 3000-tick cap — so droplets emitted
+    // after 460 were never stepped again and therefore could never die. The
+    // gate reported 262,144 particles alive (exactly kParticleCap) and blamed
+    // the engine for a pool the FIXTURE had frozen.
+    //
+    // Still a pure function of the tick, which is the determinism requirement
+    // this flag carries (see SelftestParticlesActive and the note in
+    // simulation.h): the caller must derive it only from tick-deterministic
+    // inputs, and "have we reached tick 30" is one.
+    bool pactive = i >= 30;
     SubmitTick(ctx, world, sim, ++t, kDefaultSeed, {}, exps, {}, false, {8, 3, 8},
                false, pactive);
     if (i >= 500 && i % 100 == 0) {
@@ -186,16 +224,90 @@ int settled = 0;  // tick at which the world went quiet (or the cap)
   ctx.WaitIdle();
   std::printf("sim settled: %.3f ms/tick\n", (NowSeconds() - s0) * 1000.0 / 100.0);
 
-  rhi::Buffer staging = CreateBuffer(ctx.device, kNumChunks * 4,
+  // ---- THE MPM HALF OF "SETTLED", WHICH THIS GATE NEVER LOOKED AT --------
+  //
+  // `particlesLeft` above reads world.particleCounts — the EJECTA/debris
+  // system. The MLS-MPM water particles live in world.fluidArgsStage and had
+  // no assertion anywhere in the suite, which is how a lake could hold ~7,700
+  // of them alive forever while this gate printed "0 particles alive" and
+  // PASSED. Measured 2026-09-08 by `--perf --scenario idle`: activeChunks 0
+  // (so ab6ce9c's CA fix is genuinely working) and fluidLive 7,680 flat for
+  // 240 ticks, costing 3.7 ms/frame of solver that rule 2 says must sleep.
+  //
+  // WHY A PROBE WINDOW AND NOT ONE READ. FA_LIVE is state, but every settle
+  // counter is ZEROED per tick (seam_fill_settle), so a single sample says
+  // nothing about a steady state. Twenty ticks with a read after each turns
+  // "nothing settled" into WHICH of the three opposite causes it was:
+  //   blocks 0                  -> never went calm (settleJudge/settleScan)
+  //   blocks > 0, refused high  -> column arithmetic did not fit (geometry)
+  //   blocks > 0, unstable high -> settleCheck's excite-stability veto
+  //   settled > 0, live flat    -> converting and being re-excited (a loop)
+  // That is the whole ladder, bought in one run instead of one hypothesis per
+  // run (CLAUDE.md "When to run what", rule 6).
+  // Slot indices are common.wgsl's FA_* map, spelled as raw subscripts with the
+  // name in a comment because that is how every other fluid gate reads this
+  // buffer (selftest_ca.cpp:471, selftest_water.cpp:1008) — one convention,
+  // not a fourth mirror of the same table.
+  uint32_t faLive0 = 0;
+  uint64_t faBlocks = 0, faRefused = 0, faUnstable = 0, faSettled = 0,
+           faExcited = 0, faExSeen = 0, faExCandid = 0, faCeil = 0, faFloor = 0,
+           faForced = 0, faSealed = 0;
+  {
+    uint32_t fa[kFluidArgsWords] = {};  // ReadFluidArgsSync fills the whole map
+    ReadFluidArgsSync(ctx, world, fa);
+    faLive0 = fa[7];                    // FA_LIVE
+    for (int i = 0; i < 20; i++) {
+      SubmitTick(ctx, world, sim, ++t, kDefaultSeed, {}, {}, {}, false,
+                 {8, 3, 8}, false, false);
+      ctx.WaitIdle();
+      ReadFluidArgsSync(ctx, world, fa);
+      faBlocks += fa[13];               // FA_SETBLOCKS
+      faRefused += fa[25];              // FA_SETREFUSED
+      faUnstable += fa[26];             // FA_SETUNSTABLE
+      faSettled += fa[10];              // FA_SETTLED
+      faExcited += fa[11];              // FA_EXCITED
+      faExSeen += fa[27];               // FA_EXSEEN
+      faExCandid += fa[28];             // FA_EXCANDID
+      faCeil += fa[30];                 // FA_SETCEIL  (sim_fluid_seam.wgsl)
+      faFloor += fa[31];                // FA_SETFLOOR (sim_fluid_seam.wgsl)
+      faForced += fa[32];               // FA_FORCED   (sim_fluid_seam.wgsl)
+      faSealed += fa[33];               // FA_SEALED   (sim_fluid_seam.wgsl)
+    }
+    faLive1 = fa[7];                    // FA_LIVE
+  }
+  // THE EJECTA COUNT, RE-READ AT THE END. `particlesLeft` above is sampled the
+  // instant the settle loop exits, which is the WRONG MOMENT for a claim about
+  // a settled world: a busy settle leaves a backlog of splash droplets that the
+  // next hundred ticks retire perfectly well, and reading it early cannot tell
+  // that backlog apart from a leak. The verdict uses this one; the early value
+  // is kept and printed beside it because the DIFFERENCE is the diagnosis.
+  {
+    uint32_t counts2[2] = {};
+    ReadCountsSync(ctx, world, counts2);
+    particlesEnd = std::min(counts2[sim.Page()], kParticleCap);
+  }
+  std::printf("sleep: MPM %u -> %u particles over 20 quiet ticks | picked %llu "
+              "blocks, refused %llu infeasible (columns: %llu no-room-at-ceiling, "
+              "%llu no-floor/trapped), %llu unstable | forced %llu, sealed %llu"
+              " | settled %llu eighths, excited %llu (seen %llu, candidates "
+              "%llu)\n",
+              faLive0, faLive1, (unsigned long long)faBlocks,
+              (unsigned long long)faRefused, (unsigned long long)faCeil,
+              (unsigned long long)faFloor, (unsigned long long)faUnstable,
+              (unsigned long long)faForced, (unsigned long long)faSealed,
+              (unsigned long long)faSettled, (unsigned long long)faExcited,
+              (unsigned long long)faExSeen, (unsigned long long)faExCandid);
+
+  rhi::Buffer staging = CreateBuffer(ctx.device, kNumSlots * 4,
                                       rhi::BufferUsage::MapRead | rhi::BufferUsage::CopyDst,
                                       "dirtyRead");
   rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
-  enc.CopyBufferToBuffer(sim.DirtyActive(), 0, staging, 0, kNumChunks * 4);
+  enc.CopyBufferToBuffer(sim.DirtyActive(), 0, staging, 0, kNumSlots * 4);
   ctx.queue.Submit(enc.Finish());
   std::vector<uint32_t> awake;
   {
-    std::vector<uint32_t> d_((kNumChunks * 4) / 4, 0);
-    rhi::ReadBufferBlocking(ctx.device, staging, 0, d_.data(), (size_t)(kNumChunks * 4));
+    std::vector<uint32_t> d_((kNumSlots * 4) / 4, 0);
+    rhi::ReadBufferBlocking(ctx.device, staging, 0, d_.data(), (size_t)(kNumSlots * 4));
     const uint32_t* d = d_.data();
 
           // ---- WHY are they awake (common.wgsl's DIRTY_R_* / sim_step's
@@ -215,34 +327,184 @@ int settled = 0;  // tick at which the world went quiet (or the cap)
           //
           // Bit order must match kName in world.cpp's snapshot fold.
           {
-            static const char* kWhy[24] = {
-                "write",   "react-idle", "stain-idle",  "flow",
-                "viscous", "seam",       "part",        "wbody",
-                "mutate",  "MOVE",       "STAIN-WROTE", "REACT-FIRED",
-                "down",    "diag",       "equalize",    "split",
-                "film",    "displace",   "bridge",      "SUBMERGED",
-                "spill",   "powder",     "gas",         "solo"};
+            // The names come from kDirtyReasonName in world.h. They used to be
+            // a private copy here, with a comment on each of the two saying it
+            // must match the other; the first bit added after that comment was
+            // written broke it, and a histogram that silently drops its last
+            // bits is worse than no histogram (rule 6).
             // ONE pass, and it is the SAME pass that fills `awake`. An earlier
             // revision counted the reasons in a second loop over the same
             // array and printed "write 128 ... wbody 32761" next to "0 / 32768
             // chunks active" — two readings of one buffer that cannot both be
             // true. Whatever the cause, the fix that makes it unable to happen
             // again is not to have two loops.
-            uint32_t why[24] = {0};
-            for (uint32_t i = 0; i < kNumChunks; i++) {
+            // kNumSlots, not kNumChunks: the dirty buffer is STORAGE, indexed
+            // by slot, so a ticket slot's reason bits are in it too (tickets
+            // P0, class (b)).
+            uint32_t why[kDirtyReasonBits] = {0};
+            for (uint32_t i = 0; i < kNumSlots; i++) {
               const uint32_t w = d[i];
               if (w == 0) continue;
               sleepActive++;
               awake.push_back(i);
-              for (int b = 0; b < 24; b++)
+              for (int b = 0; b < kDirtyReasonBits; b++)
                 if (w & (1u << b)) why[b]++;
             }
             std::printf("sleep: awake by reason (%u chunks):", sleepActive);
             bool any = false;
-            for (int b = 0; b < 24; b++)
-              if (why[b]) { std::printf(" %s %u", kWhy[b], why[b]); any = true; }
+            for (int b = 0; b < kDirtyReasonBits; b++)
+              if (why[b]) {
+                std::printf(" %s %u", kDirtyReasonName[b], why[b]);
+                any = true;
+              }
             std::printf("%s\n", any ? "" : " none - fully quiet");
           }
+  }
+
+  // ---- DO THE AWAKE CHUNKS ACTUALLY WRITE ANYTHING? ----------------------
+  //
+  // The owner's report, from the live game: F6 shows a handful of chunks lit
+  // permanently, and the "active voxels" overlay — which draws a red wireframe
+  // on every voxel the CA WROTE this tick — shows nothing inside them. Those
+  // two claims cannot both be right, and until now this gate could not say
+  // which was lying: it printed a COUNT and a reason histogram, and a reason
+  // bit records that markDirty was CALLED, not that a word changed.
+  //
+  // So diff the words, the way selftest_terrain.cpp's move pass already does
+  // for the same question. WHICH FIELD moved is the whole point: a pond soaking
+  // into its bed changes stain, a film creeping changes fullness, and a rule
+  // that re-stamps without writing changes nothing at all — three different
+  // bugs that all read as "N chunks awake".
+  //
+  // RUNS ON PASS TOO, unlike the block below it. "8 chunks are awake and every
+  // one of them is genuinely working" and "8 chunks are awake and not one word
+  // is moving" are opposite findings, and the second is a FALSE WAKE that the
+  // <32 threshold would hide forever.
+  if (!awake.empty()) {
+    const size_t n = std::min<size_t>(awake.size(), 16);
+    std::vector<std::vector<uint32_t>> before(n);
+    for (size_t i = 0; i < n; i++) {
+      before[i].assign(kChunkVol, 0);
+      ReadVoxelsSync(ctx, world, awake[i], 1, before[i].data(), "sleepMove0");
+    }
+    for (int i = 0; i < 20; i++)
+      SubmitTick(ctx, world, sim, ++t, kDefaultSeed, {}, {}, {}, false,
+                 {8, 3, 8}, false, false);
+    ctx.WaitIdle();
+    uint32_t words = 0, matCh = 0, stateCh = 0, stainCh = 0, stampOnly = 0;
+    std::vector<uint32_t> now(kChunkVol, 0);
+    for (size_t i = 0; i < n; i++) {
+      ReadVoxelsSync(ctx, world, awake[i], 1, now.data(), "sleepMove1");
+      for (size_t v = 0; v < kChunkVol; v++) {
+        const uint32_t a = before[i][v], b = now[v];
+        if (a == b) continue;
+        words++;
+        const bool m = (a & 0xFFFu) != (b & 0xFFFu);
+        const bool s = ((a >> 12) & 0xFu) != ((b >> 12) & 0xFu);
+        const bool st = (a & 0x7F000000u) != (b & 0x7F000000u);
+        if (m) matCh++;
+        if (s) stateCh++;
+        if (st) stainCh++;
+        // Only the tick stamp (bits 16..18) and/or the excite scratch moved:
+        // the cell was VISITED and re-stamped without its content changing,
+        // which is what "awake but the overlay is empty" looks like from here.
+        if (!m && !s && !st) stampOnly++;
+      }
+    }
+    std::printf("sleep: awake chunks over 20 more ticks: %u words changed in "
+                "%zu chunks (material %u, fullness %u, stain %u, STAMP-ONLY "
+                "%u)%s\n",
+                words, n, matCh, stateCh, stainCh, stampOnly,
+                words == 0 ? "  <-- FALSE WAKE: nothing is writing" : "");
+
+    // ---- AND WHAT DOES THE GEOMETRY LOOK LIKE THERE? ---------------------
+    //
+    // CLAUDE.md rule 6, one rung further. "27 words changed, 21 of them back
+    // where they started" says a rule is CYCLING; it does not say which rule or
+    // in what shape, and the liquid rules are told apart by exactly that — a
+    // film against one riser is the terrace tread the rule was written for, a
+    // film between two facing risers is the 2-cycle it cannot see. Those differ
+    // only in cells the shader itself is forbidden to read, so the only place
+    // the distinction can be made is HERE, on the CPU, with no lattice bound.
+    //
+    // Measured cost of not having this: the first repair of the never-sleeping
+    // shoreline was aimed at the riser branch on an inference from
+    // `fullness 0` — plausible, cheap to make, and it left 14 chunks awake
+    // instead of 8. One printout of the neighbourhood would have aimed it.
+    //
+    // Prints a 5x5 plan view at the changed cell's own level and the level
+    // below it (the floor), reading a 3x3x3 SLOT-chunk block so a cell on a
+    // chunk border still gets a true neighbourhood instead of a wall of
+    // out-of-buffer. '#' is anything solid the CA cannot enter, '.' air,
+    // '1'-'8' this liquid's fullness in eighths, '*' some other material.
+    if (words != 0) {
+      uint32_t waterId = 0;
+      for (size_t mi = 0; mi < c.mats.size(); mi++)
+        if (c.mats[mi].name == "water") waterId = (uint32_t)mi;
+      // The first awake chunk that actually moved something. One chunk is
+      // enough — these come in families, and six cells of one is a shape.
+      for (size_t i = 0; i < n; i++) {
+        ReadVoxelsSync(ctx, world, awake[i], 1, now.data(), "sleepShape");
+        std::vector<uint32_t> chg;
+        for (size_t v = 0; v < kChunkVol; v++)
+          if (before[i][v] != now[v]) chg.push_back((uint32_t)v);
+        if (chg.empty()) continue;
+
+        // 3x3x3 slot chunks around this one -> a 48^3 block, centre at +16.
+        const int ccx = (int)(awake[i] % kNChunk),
+                  ccy = (int)((awake[i] / kNChunk) % kNChunk),
+                  ccz = (int)(awake[i] / (kNChunk * kNChunk));
+        std::vector<uint32_t> blk((size_t)48 * 48 * 48, 0);
+        std::vector<uint32_t> cbuf((size_t)kChunkVol);
+        for (int dz = -1; dz <= 1; dz++)
+          for (int dy = -1; dy <= 1; dy++)
+            for (int dx = -1; dx <= 1; dx++) {
+              const int nx = ((ccx + dx) % (int)kNChunk + (int)kNChunk) % (int)kNChunk;
+              const int ny = ((ccy + dy) % (int)kNChunk + (int)kNChunk) % (int)kNChunk;
+              const int nz = ((ccz + dz) % (int)kNChunk + (int)kNChunk) % (int)kNChunk;
+              ReadVoxelsSync(ctx, world,
+                             (uint32_t)(nz * (int)kNChunk * (int)kNChunk +
+                                        ny * (int)kNChunk + nx),
+                             1, cbuf.data(), "sleepShapeN");
+              for (uint32_t k = 0; k < kChunkVol; k++)
+                blk[(size_t)((dz + 1) * 16 + (int)(k / 256)) * 48 * 48 +
+                    (size_t)((dy + 1) * 16 + (int)((k / 16) % 16)) * 48 +
+                    (size_t)((dx + 1) * 16 + (int)(k % 16))] = cbuf[k];
+            }
+        auto glyph = [&](int bx, int by, int bz) -> char {
+          if (bx < 0 || bx >= 48 || by < 0 || by >= 48 || bz < 0 || bz >= 48)
+            return '?';
+          const uint32_t w = blk[(size_t)bz * 48 * 48 + (size_t)by * 48 + bx];
+          const uint32_t m = w & 0xFFFu;
+          if (m == 0) return '.';
+          if (m == waterId) return (char)('1' + ((w >> 12) & 7u));
+          if (m >= c.mats.size()) return '*';
+          const uint32_t k = c.mats[m].gpu.klass;
+          return (k == CLASS_SOLID || k == CLASS_POWDER) ? '#' : '*';
+        };
+        std::printf("sleep: shape of the movers in awake chunk (%d,%d,%d) "
+                    "[rows are z-2..z+2, columns x-2..x+2]\n",
+                    ccx, ccy, ccz);
+        for (size_t j = 0; j < chg.size() && j < 6; j++) {
+          const int lx = (int)(chg[j] % 16), ly = (int)((chg[j] / 16) % 16),
+                    lz = (int)(chg[j] / 256);
+          const int bx = 16 + lx, by = 16 + ly, bz = 16 + lz;
+          const uint32_t a = before[i][chg[j]], b = now[chg[j]];
+          std::printf("  local(%2d,%2d,%2d) %04x/f%u -> %04x/f%u   own level | "
+                      "the floor under it\n",
+                      lx, ly, lz, a & 0xFFFu, ((a >> 12) & 7u) + 1u,
+                      b & 0xFFFu, ((b >> 12) & 7u) + 1u);
+          for (int rz = -2; rz <= 2; rz++) {
+            std::printf("    ");
+            for (int rx = -2; rx <= 2; rx++) std::printf("%c", glyph(bx + rx, by, bz + rz));
+            std::printf("   ");
+            for (int rx = -2; rx <= 2; rx++) std::printf("%c", glyph(bx + rx, by - 1, bz + rz));
+            std::printf("%s\n", rz == 0 ? "   <- the cell's row" : "");
+          }
+        }
+        break;
+      }
+    }
   }
 
   // diagnosis on failure: where are the awake chunks, and what's in them?
@@ -313,11 +575,17 @@ std::printf("sleep: hydrostatic at the tarn: %llu of %llu submerged liquid "
             "cells are PARTIAL\n",
             (unsigned long long)subPartial, (unsigned long long)subTotal);
 
-bool sleepOk = sleepActive < 32 && particlesLeft == 0;
-std::printf("sleep: %s (%u / %u chunks active, %u particles alive, quiet "
-            "after ~%d settle ticks, %llu/%llu submerged cells partial)\n",
-            sleepOk ? "PASS" : "FAIL", sleepActive, kNumChunks, particlesLeft,
-            settled, (unsigned long long)subPartial,
+// THREE conditions now, and the third is the one this gate was missing: the
+// MPM population must reach zero, not merely stop growing. Rule 2 is about
+// COST, and a settled world that still holds particles pays the whole 9-substep
+// solver table every tick forever (measured 3.7 ms/frame at the authored
+// home_lake). `particlesLeft` is the EJECTA system; `faLive1` is the water.
+bool sleepOk = sleepActive < 32 && particlesEnd == 0 && faLive1 == 0;
+std::printf("sleep: %s (%u / %u chunks active, %u particles alive (%u at "
+            "settle), %u MPM particles alive, quiet after ~%d settle ticks, "
+            "%llu/%llu submerged cells partial)\n",
+            sleepOk ? "PASS" : "FAIL", sleepActive, kNumSlots, particlesEnd,
+            particlesLeft, faLive1, settled, (unsigned long long)subPartial,
             (unsigned long long)subTotal);
 
   // Verdict: the flag the moved body already computed.
@@ -414,9 +682,9 @@ bool evapOk = false;
                {6, 7, 6}, false, false);
   ctx.WaitIdle();
 
-  std::vector<uint32_t> vox(kNumChunks * (size_t)kChunkVol);
+  std::vector<uint32_t> vox(kNumSlots * (size_t)kChunkVol);
   {
-    ReadVoxelsSync(ctx, world, 0, kNumChunks, vox.data(), "evapRead");  // §2.1a
+    ReadVoxelsSync(ctx, world, 0, kNumSlots, vox.data(), "evapRead");  // §2.1a
   }
   auto readCell = [&](int x, int y, int z) {
     return vox[World::SlotCellIndex({x, y, z})] & 0xFFFu;
@@ -519,9 +787,9 @@ bool stainOk = false;
                {6, 7, 6}, false, false);
   ctx.WaitIdle();
 
-  std::vector<uint32_t> vox(kNumChunks * (size_t)kChunkVol);
+  std::vector<uint32_t> vox(kNumSlots * (size_t)kChunkVol);
   {
-    ReadVoxelsSync(ctx, world, 0, kNumChunks, vox.data(), "stainRead");  // §2.1a
+    ReadVoxelsSync(ctx, world, 0, kNumSlots, vox.data(), "stainRead");  // §2.1a
   }
 
   // Count stained floor voxels, and check every stain in the world is
@@ -682,9 +950,9 @@ bool fullOk = false;
     ctx.ProcessEvents();
   }
 
-  std::vector<uint32_t> fv(kNumChunks * (size_t)kChunkVol);
+  std::vector<uint32_t> fv(kNumSlots * (size_t)kChunkVol);
   {
-    ReadVoxelsSync(ctx, world, 0, kNumChunks, fv.data(), "fullRead");  // §2.1a
+    ReadVoxelsSync(ctx, world, 0, kNumSlots, fv.data(), "fullRead");  // §2.1a
   }
   // Count landed blood and how much of it is at less than full fullness.
   // Blood FLOWS once it lands, and flowing splits a cell's fullness across
@@ -2291,15 +2559,15 @@ Status GatePageRoundtrip(Ctx& c, std::string& detail) {
   }
 
   // Standalone (--gate) the world is the untouched identity map: every CHUNK
-  // SLOT holds a real page (ResetIdentity claims kNumChunks of them) and there
+  // SLOT holds a real page (ResetIdentity claims kNumSlots of them) and there
   // is no sentinel anywhere, so the sky walk below finds no EMPTY chunk. This
-  // used to compare against PoolPages(), which was kNumChunks until
-  // 2026-08-30; the pool is kNumChunks + kPageRetireCeiling since, so the
+  // used to compare against PoolPages(), which was kNumSlots until
+  // 2026-08-30; the pool is kNumSlots + kPageRetireCeiling since, so the
   // test never fired and the gate failed standalone with "no EMPTY chunk in
   // the column" — the identity map, not a page-pool problem. In-suite the
   // previous gates have long since generated and demoted, so this never
   // fires there.
-  if (paged && pt.PagesInUse() >= kNumChunks) {
+  if (paged && pt.PagesInUse() >= kNumSlots) {
     SubmitWorldgen(ctx, world, sim, kDefaultSeed);
     ctx.WaitIdle();
   }
@@ -2795,8 +3063,8 @@ Status GateFireDown(Ctx& c, std::string& detail) {
                {12, 12, 12}, false, false);
   ctx.WaitIdle();
 
-  std::vector<uint32_t> vox(kNumChunks * (size_t)kChunkVol);
-  ReadVoxelsSync(ctx, world, 0, kNumChunks, vox.data(), "fireDownRead");
+  std::vector<uint32_t> vox(kNumSlots * (size_t)kChunkVol);
+  ReadVoxelsSync(ctx, world, 0, kNumSlots, vox.data(), "fireDownRead");
   auto at = [&](int x, int y, int z) {
     return vox[World::SlotCellIndex({x, y, z})] & 0xFFFu;
   };
@@ -3054,15 +3322,15 @@ Status GateSupportFlag(Ctx& c, std::string& detail) {
   // The flags are therefore collected the way their real consumer collects
   // them (DebrisSystem::QueueSupportEvents): union of snap.supportFlags over a
   // window of ticks, so whichever snapshot happens to drain them is caught.
-  std::vector<uint8_t> seen(kNumChunks, 0);
+  std::vector<uint8_t> seen(kNumSlots, 0);
   auto collect = [&](int ticks) {
     for (int i = 0; i < ticks; i++) {
       SubmitTick(ctx, world, sim, ++t, kDefaultSeed, {}, {}, {}, false,
                  {gx >> 4, kGapY >> 4, gz >> 4}, true, false);
       ctx.WaitIdle();
       const WorldSnapshot& sn = world.Snap();
-      if (!sn.valid || sn.supportFlags.size() != kNumChunks) continue;
-      for (uint32_t ci = 0; ci < kNumChunks; ci++)
+      if (!sn.valid || sn.supportFlags.size() != kNumSlots) continue;
+      for (uint32_t ci = 0; ci < kNumSlots; ci++)
         if (sn.supportFlags[ci]) seen[ci] = 1;
     }
   };
@@ -3090,8 +3358,8 @@ Status GateSupportFlag(Ctx& c, std::string& detail) {
   // exact-cell erase between two solids flags BOTH chunks) is untouched; only
   // the moment at which "the fixture was really there" is a meaningful question
   // has moved, from after the mutation to before it.
-  std::vector<uint32_t> voxPre(kNumChunks * (size_t)kChunkVol);
-  ReadVoxelsSync(ctx, world, 0, kNumChunks, voxPre.data(), "supportVoxPre");
+  std::vector<uint32_t> voxPre(kNumSlots * (size_t)kChunkVol);
+  ReadVoxelsSync(ctx, world, 0, kNumSlots, voxPre.data(), "supportVoxPre");
   auto matPre = [&](int x, int y, int z) {
     return voxPre[World::SlotCellIndex({x, y, z})] & 0xFFFu;
   };
@@ -3107,8 +3375,8 @@ Status GateSupportFlag(Ctx& c, std::string& detail) {
   ctx.WaitIdle();
   {
     const WorldSnapshot& sn = world.Snap();
-    if (sn.valid && sn.supportFlags.size() == kNumChunks)
-      for (uint32_t ci = 0; ci < kNumChunks; ci++)
+    if (sn.valid && sn.supportFlags.size() == kNumSlots)
+      for (uint32_t ci = 0; ci < kNumSlots; ci++)
         if (sn.supportFlags[ci]) seen[ci] = 1;
   }
   collect(12);
@@ -3121,12 +3389,12 @@ Status GateSupportFlag(Ctx& c, std::string& detail) {
   // genuinely not raised — and "home=0" alone cannot tell them apart. So the
   // verdict line carries the fixture census and both windows' flag counts.
   uint32_t nBefore = 0, nAfter = 0;
-  for (uint32_t i = 0; i < kNumChunks; i++) {
+  for (uint32_t i = 0; i < kNumSlots; i++) {
     nBefore += before[i] ? 1u : 0u;
     nAfter += after[i] ? 1u : 0u;
   }
-  std::vector<uint32_t> vox(kNumChunks * (size_t)kChunkVol);
-  ReadVoxelsSync(ctx, world, 0, kNumChunks, vox.data(), "supportVox");
+  std::vector<uint32_t> vox(kNumSlots * (size_t)kChunkVol);
+  ReadVoxelsSync(ctx, world, 0, kNumSlots, vox.data(), "supportVox");
   auto matAt = [&](int x, int y, int z) {
     return vox[World::SlotCellIndex({x, y, z})] & 0xFFFu;
   };

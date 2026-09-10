@@ -360,6 +360,10 @@ bool PackBiomeTable(const biomes::BiomeSet& set, std::vector<uint32_t>& W,
     uint32_t* r = W.data() + rec0 + static_cast<size_t>(i) * kBiomeRecWords;
     r[kB_Skin] = b.skinId;
     r[kB_Subsoil] = b.subsoilId;
+    // 0 = the biome authored no cover.firmSkin; genCellIn falls back to the
+    // subsoil (if solid) or stone. The class test lives in the shader because
+    // the packer has no material table to ask.
+    r[kB_FirmCover] = b.firmSkinId;
     r[kB_SkinDepth] = U(std::max(1, b.skinDepth));
     r[kB_PatchThreshold] = U(std::clamp(b.patchThreshold, 0, 255));
     r[kB_PatchCellLog2] = U(std::clamp(b.patchCellLog2, 2, 12));

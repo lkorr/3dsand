@@ -529,6 +529,12 @@ class Device {
   // an unrelated map and the caller's loop must re-check its own predicate —
   // which the SubmitTick caller already does.
   bool WaitOldestPendingMap() const;
+  // The number of MapReadAsync tickets whose fence has not signalled — i.e. how
+  // many snapshot readbacks (one per submitted tick, world.cpp KickReadback)
+  // the GPU still owes. Non-blocking, no fence poll: it reports what the last
+  // ProcessEvents observed. The frame loop reads it between ticks to decide
+  // whether the GPU can take another one (the GPU-lag throttle in main.cpp).
+  int PendingMapCount() const;
 
   // Block until all submitted GPU work has completed.
   void WaitIdle() const;

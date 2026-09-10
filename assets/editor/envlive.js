@@ -87,6 +87,7 @@ export const LIVE = {
     'cover.groundFlora': R('WM_BF_GROUND_FLORA: the TILE plants (ferns, big toadstools by footprint); the flower / undergrowth chain it used to gate is cover rows with canopy conditions since P-G'),
     'cover.cacti': R('WM_BF_CACTI: the cactus block runs here'),
     'cover.sandCap': R('WM_BF_SAND_CAP: a 4-deep sand cap under the skin'),
+    'cover.firmSkin': R('WM_B_FIRM_COVER: the solid a loose cover turns into on ground too steep to hold a powder (and on a berm wall)'),
     'cover.cactusChance': R('WM_B_CACTUS_CHANCE (percent of 2.5 m tiles, when cover.cacti is on)'),
     'cover.saguaroFraction': R('WM_B_SAGUARO_FRACTION (percent of those cacti that are columns)'),
     'cover.plants[].material': R('WM_C_MAT'),
