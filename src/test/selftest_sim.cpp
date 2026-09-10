@@ -3682,6 +3682,155 @@ Status GateSupportFlag(Ctx& c, std::string& detail) {
   return fails.empty() ? Status::Pass : Status::Fail;
 }
 
+
+// ---- snapshot-latency ---------------------------------------------------
+//
+// THE CLAIM: a gameplay decision made at tick T reads the world at tick
+// T - World::kSnapshotLatency, on every machine and at every frame rate.
+//
+// Before docs/PLAN_multiplayer_now.md N1 that was false in two directions at
+// once (RESEARCH_multiplayer_readiness.md L1 / L1'). The game published
+// "whatever the last MapAsync callback delivered", so the AGE of the world a
+// brush stroke, a mob's ground probe or a spell's ladder read was a function of
+// how fast this machine's GPU came back -- one tick on a fast one, several on a
+// loaded one, and older still whenever the readback ring saturated and declined
+// a copy outright. The harness hid it: SetHarnessSnapshotDrain blocked for the
+// map every tick, so `--selftest` pinned a hash for a fixed ONE-tick latency
+// that the shipped game never ran at.
+//
+// So this gate is a DIFFERENTIAL on GPU pacing, which is the only thing that
+// can catch the failure it exists for:
+//
+//   pass A  the harness ordering (drain on): every submit retires before the
+//           next tick is encoded. The GPU is never behind.
+//   pass B  no drain: ticks pile into the queue exactly as they do in the
+//           game's kMaxTicksPerFrame catch-up burst, and the publish is the
+//           only thing that ever waits on a fence.
+//
+// Both must report Snap().tick == t - K on EVERY tick and must produce the
+// SAME world hash over the same 64 ticks. A pipeline whose latency is a timing
+// property cannot do that; one whose latency is a constant cannot do anything
+// else.
+Status GateSnapshotLatency(Ctx& c, std::string& detail) {
+  constexpr uint32_t kTicks = 64;
+  const uint32_t K = World::kSnapshotLatency;
+  GpuContext& ctx = c.ctx;
+  World& world = c.world;
+  Simulation& sim = c.sim;
+
+  // Pinned in tests/baseline.json so K itself and the drained arm's wait budget
+  // are tunable without a rebuild (CLAUDE.md: thresholds live in JSON).
+  const uint32_t pinnedK = (uint32_t)BaselineNumber("snapshotLatencyK", (double)K);
+  const uint64_t drainedWaitBudget =
+      (uint64_t)BaselineNumber("snapshotDrainedMaxWaits", 0.0);
+
+  const bool hadDrain = HarnessSnapshotDrain();
+  uint32_t finalHash[2] = {};
+  uint32_t badCount[2] = {};
+  uint32_t firstBadTick[2] = {};
+  uint32_t firstBadGot[2] = {};
+  World::SnapshotPipeStats pipe[2];
+
+  for (int pass = 0; pass < 2; pass++) {
+    // Pass B is the whole point: with the drain off nothing waits for the GPU
+    // except the publish itself, so by tick K+1 there are K ticks in the queue
+    // -- the kMaxTicksPerFrame case, reproduced without a frame loop.
+    SetHarnessSnapshotDrain(pass == 0);
+    SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+    ctx.WaitIdle();
+    ctx.ProcessEvents();
+    world.TakeSnapshotPipe();  // zero the counters for this arm
+    for (uint32_t t = 1; t <= kTicks; t++) {
+      SubmitTick(ctx, world, sim, t, kDefaultSeed, SelftestOps(t, kDefaultSeed),
+                 SelftestExps(t, kDefaultSeed), {}, true, {8, 3, 8}, false,
+                 SelftestParticlesActive(t));
+      // THE INVARIANT, ON EVERY TICK. SubmitWorldgen invalidated the pipeline,
+      // so the first readback is tick 1's and the first publishable target is
+      // tick 1 -- reached at t = K + 1. Before that Snap() must be INVALID and
+      // not merely old: "no snapshot for the first K ticks after a reset" is
+      // itself a constant, and a leftover snapshot of the previous gate's world
+      // showing through here would be the exact bug this gate exists for.
+      const WorldSnapshot& sn = world.Snap();
+      const bool wantValid = t >= K + 1;
+      const bool ok = wantValid ? (sn.valid && sn.tick == t - K) : !sn.valid;
+      if (!ok) {
+        if (badCount[pass] == 0) {
+          firstBadTick[pass] = t;
+          firstBadGot[pass] = sn.valid ? sn.tick : 0xFFFFFFFFu;
+        }
+        badCount[pass]++;
+      }
+    }
+    pipe[pass] = world.TakeSnapshotPipe();
+    finalHash[pass] = ReadHashSync(ctx, world);
+  }
+  SetHarnessSnapshotDrain(hadDrain);
+
+  std::string fails;
+  auto fail = [&](const std::string& m) {
+    if (!fails.empty()) fails += "; ";
+    fails += m;
+  };
+  if (K != pinnedK)
+    fail(Format("K is %u, baseline pins %u", K, pinnedK));
+  for (int pass = 0; pass < 2; pass++) {
+    const char* nm = pass == 0 ? "drained" : "deep-queue";
+    if (badCount[pass])
+      fail(Format("%s: %u of %u ticks read the wrong snapshot (first at tick "
+                  "%u: got %d, wanted %d)",
+                  nm, badCount[pass], kTicks, firstBadTick[pass],
+                  (int)firstBadGot[pass],
+                  (int)(firstBadTick[pass] - K)));
+    // A DECLINE BREAKS THE CONSTANT, so it is a failure and not a statistic:
+    // the tick that got no copy has no snapshot to hand over K ticks later.
+    if (pipe[pass].declines)
+      fail(Format("%s: ring declined %llu readbacks", nm,
+                  (unsigned long long)pipe[pass].declines));
+    if (pipe[pass].missing > K)
+      fail(Format("%s: %llu ticks had no snapshot at their target (expected %u,"
+                  " the post-reset warm-up)",
+                  nm, (unsigned long long)pipe[pass].missing, K));
+  }
+  // The drained arm waits for the whole device after every submit, so a wait
+  // here means the publish could not find a snapshot that had provably already
+  // landed -- a pipeline bug, not a slow GPU.
+  if (pipe[0].waits + pipe[0].slotWaits > drainedWaitBudget)
+    fail(Format("drained arm blocked %llu times (budget %llu)",
+                (unsigned long long)(pipe[0].waits + pipe[0].slotWaits),
+                (unsigned long long)drainedWaitBudget));
+  // THE DIFFERENTIAL. Same seed, same ops, same 64 ticks, two different GPU
+  // pacings. Equal hashes is the property "the world does not depend on how far
+  // behind the GPU is", which is what a replicated sim needs and what a
+  // freshest-wins snapshot cannot give.
+  if (finalHash[0] != finalHash[1])
+    fail(Format("pacing changed the world: drained %08x vs deep-queue %08x",
+                finalHash[0], finalHash[1]));
+
+  RecordObserved("snapshotLatencyK", (double)K);
+  RecordObserved("snapshotDrainedMaxWaits",
+                 (double)(pipe[0].waits + pipe[0].slotWaits));
+
+  // The deep-queue arm's wait count is REPORTED, never asserted: a headless
+  // loop submits a tick and immediately needs the snapshot from K ticks ago
+  // with no frame of real work in between, so it blocks by construction. The
+  // wait budget that matters is the GAME's, and it is measured with
+  // `--frames 600 --autofly-surface` (package N1's kill criterion), not here.
+  detail = Format(
+      "%s (K=%u, %u ticks x2 | drained: %llu waits, %llu slot-waits | "
+      "deep-queue: %llu waits, %llu slot-waits | hash %08x both%s%s)",
+      fails.empty() ? "PASS" : "FAIL", K, kTicks,
+      (unsigned long long)pipe[0].waits, (unsigned long long)pipe[0].slotWaits,
+      (unsigned long long)pipe[1].waits, (unsigned long long)pipe[1].slotWaits,
+      finalHash[0], fails.empty() ? "" : " | ", fails.c_str());
+  std::printf("snapshot-latency: %s\n", detail.c_str());
+
+  // Leave pristine terrain: this gate regenerated twice and then ran 64 ticks
+  // of the selftest op stream over it (CLAUDE.md rule 7 / the kOrder note).
+  SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+  ctx.WaitIdle();
+  return fails.empty() ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& SimGates() {
@@ -3705,6 +3854,7 @@ const std::vector<Gate>& SimGates() {
       {"fire-down", "sim", {}, false, GateFireDown},
       {"daylight-boundary", "sim", {}, false, GateDaylightBoundary},
       {"support-flag", "sim", {}, false, GateSupportFlag},
+      {"snapshot-latency", "sim", {}, false, GateSnapshotLatency},
       // No draw of its own, but its verdict reads bestFrameMs, which only the
       // screenshots gate sets — so it needs the render path transitively.
       {"perf", "sim", {"screenshots"}, true, GatePerf, /*needsRender=*/true},

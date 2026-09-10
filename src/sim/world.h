@@ -3367,7 +3367,8 @@ struct FarParams {
 
 enum class CellKind { Unknown, Air, Solid, Liquid, Gas };
 
-// CPU-visible snapshot of GPU state, one tick latent by design (DESIGN.md §2).
+// CPU-visible snapshot of GPU state, exactly World::kSnapshotLatency ticks
+// latent by design (DESIGN.md §2) — a FIXED age, not a readback-timing one.
 struct WorldSnapshot {
   bool valid = false;
   IVec3 windowOrigin{};               // residency window origin AT CAPTURE (chunks)
@@ -3385,7 +3386,7 @@ struct WorldSnapshot {
   uint32_t pick[8] = {};
   uint32_t particleCount = 0;         // live particles (post-resolve that tick)
   // ---- gas particles (docs/PLAN_gas_particles.md) ----
-  // Async, one tick latent, exactly like everything else on this ring. The
+  // Async, K ticks latent, exactly like everything else on this ring. The
   // per-tick counters come from gasSpawn's header, which is cleared before the
   // CA runs, so each is "this tick" and not a running total. `gasCount` is the
   // live population; the rest are the attributions CLAUDE.md rule 6 asks for,
@@ -3694,8 +3695,51 @@ class World {
   // queue.Submit.
   void KickReadback();
 
-  // Latest consumed snapshot (updated by MapAsync callbacks during
-  // instance.ProcessEvents()).
+  // ---- K: THE FIXED SNAPSHOT LATENCY (docs/PLAN_multiplayer_now.md N1) ----
+  //
+  // `World::Snap()` at tick T is the snapshot of tick T - kSnapshotLatency,
+  // EXACTLY, on every machine and at every frame rate. Not "one tick latent,
+  // older when the ring is saturated" — that was a readback-timing property,
+  // and every gameplay decision that reads the snapshot (Brush::BuildOp, the
+  // mob ground probe, the spell ladder, island EventReady, the wind wake)
+  // inherited it. A decision whose input depends on how fast the GPU came
+  // back is not reproducible across machines, which is finding L1 of
+  // docs/RESEARCH_multiplayer_readiness.md; L1' is that the harness hid it,
+  // because SetHarnessSnapshotDrain blocked for the map every tick and so
+  // tested a 1-tick latency the game never ran at.
+  //
+  // IT IS THE SAME NUMBER AND THE SAME ARGUMENT as Stream::kWakeLatency
+  // (sim/stream.h): K constant => the outcome is a pure function of
+  // (inputs, tick), so the twice-run determinism comparison is untouched and
+  // the value of K only moves the world hash once, when it is chosen.
+  //
+  // THE CEILING is SubmitTick's kPagedSnapshotMaxGap (test/support.cpp): the
+  // page-table mirror tightens against a snapshot that is K ticks old and
+  // dilates one N26 ring per tick of that gap, so K is an exponent on the
+  // materialization set and not a latency knob. K must stay <= that gap; both
+  // are 4 today.
+  static constexpr uint32_t kSnapshotLatency = 4;
+
+  // The fixed-latency pipeline, counted. `waits` is the kill criterion of N1:
+  // a tick that had to BLOCK for the snapshot it is contractually owed. Never
+  // a skip, never a stale read — the wait is the price of the constant.
+  struct SnapshotPipeStats {
+    uint64_t ticks = 0;        // ticks that ran the publish
+    uint64_t published = 0;    // ticks whose target snapshot was published
+    uint64_t missing = 0;      // ticks with NO snapshot at the target (resets)
+    uint64_t waits = 0;        // blocking waits (fences) the publish paid
+    uint64_t slotWaits = 0;    // blocking waits to free a ring slot to encode
+    uint64_t declines = 0;     // EncodeReadbacks refusals; must stay 0
+    uint64_t dropped = 0;      // parsed snapshots discarded by a reset/rewind
+  };
+
+  // THE PUBLISHED SNAPSHOT. At tick T this is the snapshot of tick
+  // T - kSnapshotLatency, exactly (see that constant). It is NOT "whatever the
+  // last MapAsync callback happened to deliver": callbacks now parse into a
+  // holding queue and SubmitTick publishes exactly one of them per tick, so a
+  // fast GPU cannot run the CPU's world view ahead and a slow one cannot let
+  // it fall behind. `valid` is false only for the first kSnapshotLatency ticks
+  // after a world reset, which is itself a constant.
   const WorldSnapshot& Snap() const { return snap_; }
   // A world RESET (worldgen, LoadWorld) makes the held snapshot a description
   // of a DEAD WORLD, and callers must not be able to consume it: harness
@@ -3710,10 +3754,36 @@ class World {
   // the entry: the body-stain gate (ticks 29000+) after corpse-bleed (61000+)
   // wrote stone and blood the GPU held and the CPU mirror never showed, and
   // reported a contact pass that "saw nothing" (2026-09-13).
-  void InvalidateSnapshot() {
-    snap_.valid = false;
-    cache_.clear();
+  //
+  // Also drops every parsed-but-unpublished snapshot and every readback still
+  // in flight (they describe the dead world too), by bumping the pipeline
+  // epoch: a callback that fires for an older epoch frees its slot and throws
+  // the bytes away.
+  void InvalidateSnapshot();
+
+  // ---- the fixed-latency pipeline (SubmitTick drives all three) -----------
+  //
+  // True when EncodeReadbacks would find a free ring slot. THE RING MAY NEVER
+  // DECLINE on the sim path: a tick with no copy encoded has no snapshot to
+  // publish K ticks later, and the latency would stop being a constant. The
+  // caller waits (WaitOldestPendingMap) until this is true instead.
+  bool ReadbackSlotFree() const;
+  // True when some slot is still in flight for a tick at or before `tick` —
+  // i.e. a snapshot the publish at `tick + kSnapshotLatency` is owed has not
+  // landed yet. The caller blocks on it.
+  bool ReadbackPendingAtOrBefore(uint32_t tick) const;
+  // Publish, in tick order, every delivered snapshot whose tick is <= target;
+  // `snap_` ends holding the NEWEST of them. Anything newer stays queued for
+  // the ticks that own it. Returns true if `snap_` describes exactly `target`.
+  bool PublishSnapshotsUpTo(uint32_t target);
+  const SnapshotPipeStats& SnapshotPipe() const { return snapPipe_; }
+  SnapshotPipeStats TakeSnapshotPipe() {
+    const SnapshotPipeStats s = snapPipe_;
+    snapPipe_ = SnapshotPipeStats{};
+    return s;
   }
+  void NoteSnapshotWait() { snapPipe_.waits++; }
+  void NoteSnapshotSlotWait() { snapPipe_.slotWaits++; }
 
   // ---- MPM fluid render bounds (RenderParams::fluidLo/fluidHi) ------------
   // Record this tick's CPU-known spawn cells so a fresh pour is visible on the
@@ -4167,6 +4237,10 @@ class World {
   static constexpr int kReadbackSlots =
       kMaxTicksPerFrame * (kFramesInFlight + 1);
 
+  // K, the fixed snapshot latency, and the pipeline's counters live up with
+  // Snap() -- a nested type has to be declared before the member functions
+  // that name it. See World::kSnapshotLatency.
+
  private:
   struct Slot {
     rhi::Buffer buf;
@@ -4175,6 +4249,7 @@ class World {
     IVec3 origin{};    // window origin at encode time
     uint32_t particleLivePage = 0;
     uint32_t tick = 0;
+    uint32_t epoch = 0;  // pipeline epoch at encode time (see snapEpoch_)
     std::vector<IVec3> fetchIds;  // world chunks riding this slot
     // Sentinel slots are not copied at all (§2.1a); their table entry is
     // recorded here at encode time and their 4,096 words are synthesized on
@@ -4186,6 +4261,27 @@ class World {
   Slot slots_[kSlots];
   int lastSlot_ = -1;
   WorldSnapshot snap_;
+  // ---- the holding queue that makes the latency a CONSTANT ---------------
+  //
+  // A map callback fires whenever its fence retires, and ProcessEvents fires
+  // EVERY ready map at once, so on a fast GPU several ticks' snapshots land in
+  // one pump. Consuming them straight into `snap_` is what made the latency a
+  // timing property. They are parsed into `ready_` instead (tick order — the
+  // Vulkan backend fires pending maps in submission order, rhi_vk.cpp
+  // FirePendingMaps) and PublishSnapshotsUpTo moves exactly the one tick T is
+  // owed into `snap_`. Storage is recycled through `snapPool_`, so the steady
+  // state is kSnapshotLatency + 1 WorldSnapshots, not kReadbackSlots.
+  std::deque<WorldSnapshot> ready_;
+  std::vector<WorldSnapshot> snapPool_;
+  // Bumped by InvalidateSnapshot and by a TICK REWIND (a harness scene
+  // restarting its counter — see kOrder in test/selftest.cpp). Everything from
+  // an older epoch is dropped rather than compared against the new tick base,
+  // which unsigned arithmetic would otherwise read as "four billion ticks in
+  // the future".
+  uint32_t snapEpoch_ = 0;
+  uint32_t lastEncodeTick_ = 0;
+  bool haveEncodeTick_ = false;
+  SnapshotPipeStats snapPipe_;
   IVec3 origin_{0, 0, 0};
   // Drained into gasSpawnOps by SubmitTick, once, at the head of the tick.
   std::vector<GasSpawnOp> pendingGasSpawns_;

@@ -59,8 +59,16 @@ controller and physics need to know what voxels are where) without stalls:
   has-liquid, boundary-face occupancy bits) read back asynchronously each tick —
   kilobytes, not megabytes.
 - For precise queries (player capsule, rigidbody contacts), read back **only the
-  16³ chunks intersecting active colliders**, one tick latent, double-buffered.
-  At 30 Hz sim, one tick of latency on terrain collision is invisible.
+  16³ chunks intersecting active colliders**, double-buffered, at a **FIXED
+  latency K = `World::kSnapshotLatency` = 4 ticks**. `World::Snap()` at tick T is
+  the snapshot of tick T−K, exactly, on every machine and at every frame rate —
+  not "whatever the readback ring last delivered". The distinction is the whole
+  point: a gameplay decision whose input age depends on how fast this GPU came
+  back is not reproducible, so it could not be replicated (§10). K is a constant
+  for the same reason `Stream::kWakeLatency` is, and it is the same number. At
+  30 Hz sim, four ticks of latency on terrain collision is still invisible; the
+  readback callbacks queue and `SubmitTick` publishes exactly one per tick,
+  blocking (counted) rather than skipping if the one it is owed has not landed.
 - All CPU→GPU writes (spells, explosions, brush edits, worldgen) are accumulated
   into a per-frame **MutationQueue** and uploaded as one batched transfer.
   This queue is a load-bearing design element: it is also the serialization format
@@ -12936,7 +12944,8 @@ Targets (mid-range desktop GPU, e.g. RTX 3060-class):
     never a timer — a 400-tick post-explosion timer disabled that skip for 13.3
     seconds after every blast (ROADMAP_scale.md §3.2d).
 - Per-tick CPU↔GPU traffic: metadata mirror + collider-region readbacks + mutation
-  uploads, target < 1 MB/tick, always batched, always async (one tick latent).
+  uploads, target < 1 MB/tick, always batched, always async (a FIXED
+  `World::kSnapshotLatency` ticks latent — see §2).
 - Instrument from day one: dirty-chunk count, particles alive, sim/render GPU ms,
   readback stalls. On-screen debug overlay. Burkelbear couldn't hold 30 FPS while
   screen-recording in early builds — expect the same wall, profile before adding.

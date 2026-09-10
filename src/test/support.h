@@ -158,47 +158,49 @@ bool ReloadEnvironment(GpuContext& ctx, Simulation& sim,
 
 // ---- harness snapshot drain (PLAN_page_table.md, phase 7b) ----------------
 //
-// THE PROBLEM. `World::Snap().valid` is false on every tick of every HEADLESS
-// harness. The async map is issued (KickReadback) and ProcessEvents is pumped,
-// but a harness submits and pumps in lockstep within one loop iteration, so
-// the fence for the just-submitted work has not retired when the callback
-// would fire — and the next iteration overwrites the ring slot. The windowed
-// game does not have this shape: real frames elapse between submit and pump,
-// so its snapshots arrive normally (main.cpp's frame loop, ProcessEvents).
+// WHAT IT USED TO BE. `World::Snap().valid` was false on every tick of every
+// HEADLESS harness: the async map was issued (KickReadback) and ProcessEvents
+// pumped, but a harness submits and pumps in lockstep within one loop
+// iteration, so the fence for the just-submitted work had not retired when the
+// callback would fire — and the next iteration overwrote the ring slot. This
+// flag made the harness block after a kicked readback until the map completed,
+// which gave it a snapshot at all, and gave it a ONE-TICK-LATENT one.
 //
-// This is PRE-EXISTING and orthogonal to paging — it is why World::KindAt has
-// always returned Unknown under the harnesses — but paging is the first system
-// that DEPENDS on the snapshot arriving: §3.2 step (2)'s intersection
-// tightening is the only thing that shrinks the conservative dirty mirror, and
-// §3.6's free condition reads occupancy from the same snapshot.
+// WHY THAT WAS A BUG AND NOT A FIX (finding L1' of
+// docs/RESEARCH_multiplayer_readiness.md). The windowed game never ran at that
+// latency — its snapshot was "whenever ProcessEvents retired the fence", one to
+// several ticks — so `--selftest` was pinning a hash for a world the game did
+// not simulate. Every gameplay decision that reads Snap() inherited the
+// difference.
 //
-// THE FIX, and why it is here and not in the tick path. When this is set, the
-// harness blocks after a kicked readback until the map completes, which makes
-// a harness tick behave like a game frame rather than changing what a tick
-// does. Blocking is sanctioned in exactly this place: CLAUDE.md names the
-// selftest's synchronous reads as the one exception to the no-sync-readback
-// rule, and this is the same exception in the same layer.
+// WHAT IT IS NOW. `World::kSnapshotLatency` is the one answer for both: the
+// publish at the head of SubmitTick hands over tick T − K and nothing else,
+// under the harness and under the game alike. What survives here is a
+// TEST-ORDERING requirement and nothing more — gates read the world through
+// blocking hash/occupancy reads either side of a tick and several depend on
+// every submit having retired before they look (selftest.h's ordering note).
+// So this flag can no longer change WHAT Snap() reports, only how long the
+// publish has to wait for it, which is why the harness pays zero snapshot
+// waits and the game pays a measured few.
 //
-// OFF BY DEFAULT, so main.cpp's frame loop — which shares SubmitTick — is
-// untouched and never pays a sync point. Only the harnesses opt in.
+// OFF BY DEFAULT: main.cpp's frame loop shares SubmitTick and must never pay a
+// device drain. Only the harnesses opt in.
 void SetHarnessSnapshotDrain(bool on);
 bool HarnessSnapshotDrain();
 
-// THE PAGED SNAPSHOT-STALENESS STALL, counted.
+// THE SNAPSHOT WAIT, counted.
 //
-// SubmitTick's paged self-defence (see the long comment at its tail) runs
-// `ctx.WaitIdle(); ctx.ProcessEvents();` when the snapshot in hand is older
-// than `kPagedSnapshotMaxGap` ticks. On a harness that is a sanctioned sync
-// point. On the GAME frame path it is a full-device stall — it waits for the
-// render of the frame in front of it as well as the tick — and it is the one
-// place the frame loop can block for milliseconds without any system looking
-// busy. It fires from a CADENCE, not from anything the player did, which is
-// exactly why it reads as "submit spikes randomly while I do nothing".
+// SubmitTick's publish (docs/PLAN_multiplayer_now.md N1) blocks when the
+// snapshot tick T is owed — T − World::kSnapshotLatency — has not landed. It is
+// one targeted fence (WaitOldestPendingMap), never a WaitIdle: the old
+// staleness fallback drained the whole device and measured ~93 ms on the frame
+// it fired, most of it the render of the frame in front.
 //
-// So it is counted rather than argued about. Read-and-clear, per frame, and
-// the Performance tab shows it as the denominator of the `readback` bar:
-// "readback 12.4 ms over 2 snapshot stalls" is a diagnosis, "readback 12.4 ms"
-// is not (CLAUDE.md rule 6).
+// It is counted rather than argued about, and the count is package N1's KILL
+// CRITERION: waits must stay under 1% of ticks. Read-and-clear, per frame; the
+// Performance tab shows it as the denominator of the `readback` bar, because
+// "readback 12.4 ms over 2 snapshot waits" is a diagnosis and "readback
+// 12.4 ms" is not (CLAUDE.md rule 6).
 uint32_t TakeSnapshotStalls();
 // Ticks since the last call whose readback REQUEST was refused because every
 // slot of World's ring was still in flight (EncodeReadbacks returned false).
@@ -213,26 +215,25 @@ uint32_t TakeReadbackDeclines();
 // per run. These say which of the two structurally different causes fired and
 // which arm paid for it:
 //
-//   refusedArm  the ring had no free slot on this tick, so NO copy was issued
-//               for it. The newest snapshot the ring can ever deliver is older
-//               than this tick, and if it is older than maxGap the wait loop
-//               cannot succeed no matter how long it blocks. That is a RING
-//               DEPTH problem.
-//   issuedArm   a copy WAS issued for this tick (and for the ticks before it);
-//               they simply have not landed because the GPU queue is deep.
-//               That is a LATENCY problem, and blocking is the only answer
-//               short of tolerating a bigger gap.
+//   refusedArm  World::EncodeReadbacks still found no free slot AFTER SubmitTick
+//               waited for one, so no copy was issued for this tick. That is a
+//               RING DEPTH problem and it must be zero — the snapshot-latency
+//               gate asserts World::SnapshotPipe().declines == 0.
+//   issuedArm   a copy WAS issued for the tick being published; it simply has
+//               not landed, because the GPU queue is deep. That is a LATENCY
+//               problem and blocking is the whole answer: the pipeline never
+//               skips and never reads a stale snapshot instead.
 //
-//   mapArm      the WaitOldestPendingMap loop reached freshness (targeted, one
-//               fence per iteration).
-//   idleArm     it did not, and the full ctx.WaitIdle() drain ran.
-//   idleFutile  ... and the snapshot was STILL stale afterwards. WaitIdle
-//               cannot manufacture a snapshot that was never encoded, so every
-//               count here is a full device drain that bought nothing.
+//   mapArm      the publish delivered exactly the tick it was owed.
+//   idleArm     dead. The full-device WaitIdle fallback is GONE: it waited for
+//   idleFutile  WORK, and work was never what was missing — a snapshot that was
+//   proceedStale never encoded cannot be drained into existence, and one that
+//               was is covered by a single targeted fence.
 //
-// gapHist[i] is the staleness (tick - snap.tick) at the moment of the stall,
-// clamped, with slot 9 meaning "no valid snapshot at all". mapArmMs/idleArmMs
-// split the blocked wall time the same way ReadbackStall aggregates it.
+// gapHist[i] is the age of the snapshot being waited for, which under a fixed
+// latency is always World::kSnapshotLatency; slot 9 (no valid snapshot at all)
+// can no longer occur on the publish path. mapArmMs is the blocked wall time,
+// aggregated the same way ReadbackStall is.
 struct SnapshotStallStats {
   uint32_t stalls = 0;
   uint32_t refusedArm = 0;

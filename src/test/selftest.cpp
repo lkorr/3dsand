@@ -544,6 +544,14 @@ const char* const kOrder[] = {
     // against the rig's own idle wobble — so it goes where nothing else can
     // leave a body standing in its fixture.
     "hit-react",
+    // ---- THE SNAPSHOT LATENCY IS A CONSTANT (PLAN_multiplayer_now N1) ----
+    // As late as it can go, by the rule the `floaters` block above spells out.
+    // It regenerates worldgen three times (once per pacing arm and once on the
+    // way out) and runs 64 ticks of the selftest op stream, so it disturbs the
+    // shared World about as much as `determinism` does -- and from here there
+    // is nothing left for it to disturb but `voxregion`, which resets the
+    // window and the page table itself.
+    "snapshot-latency",
     // LAST of the world-touching gates, and it must be: BuildVoxRegion moves
     // the residency window and resets the page table, which is the state every
     // other gate's fixture placement assumes. It restores both before it

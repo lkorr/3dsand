@@ -160,10 +160,13 @@ class Simulation {
   //     a WRONG "active" costs 141 µs.   a WRONG "idle" loses world state.
   //
   // so every uncertain case must resolve to "active". Uncertainty here is
-  // mostly staleness: the snapshot is one tick latent (DESIGN.md §2) and can be
-  // older when the readback ring is saturated, so `SettledSnapshot` requires
-  // the snapshot to be NEWER than the last tick anything could have dirtied,
-  // never merely non-zero.
+  // staleness, and it is now a KNOWN staleness: the snapshot is exactly
+  // `World::kSnapshotLatency` ticks latent (DESIGN.md §2), on every machine and
+  // at every frame rate, rather than "one tick latent, older when the readback
+  // ring is saturated". `SettledSnapshot` still requires the snapshot to be
+  // NEWER than the last tick anything could have dirtied, never merely
+  // non-zero — the fixed age makes that test's outcome reproducible, it does
+  // not make the test unnecessary.
   //
   // Determinism (rule 1) is not at risk here in the way a sim change would be,
   // and the reason is worth stating precisely rather than assuming: skipping
