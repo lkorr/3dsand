@@ -5,6 +5,41 @@
 //
 // Dispatch: (4 * opsCount, 4, 4) workgroups of 4x4x4 threads — each op gets a
 // 16^3 thread box centered on it (max brush radius 7).
+//
+// ---- TWO OPS ON ONE CELL IN ONE TICK: THE WINNER IS DEFINED ---------------
+//
+// Until docs/PLAN_multiplayer_now.md N3 it was not. Both entry points below
+// were plain voxStores over one dispatch with no ordering between
+// invocations, so a cell covered by two brush ops of the same tick took
+// whichever write the driver happened to schedule last — the exact class of
+// scheduling-dependent outcome CLAUDE.md rule 1 forbids, sitting on the one
+// path every CPU mutation in the engine goes through.
+//
+// THE RULE, and it is `sim_explode.wgsl`'s rule word for word: the LOWEST op
+// index that covers the cell AND would write it owns the cell. A thread for op
+// i returns as soon as it finds a j < i that qualifies. Op index is push
+// order, push order is deterministic (a fixed sequence in the CPU tick body),
+// so the outcome is a pure function of the op list.
+//
+// "WOULD WRITE IT" is the full predicate, not just the sphere: op j's mode and
+// its transmute from-filter are re-evaluated against the same occupant this
+// thread read. A paint-into-air op that lands on stone does NOT get to shadow
+// a later overwrite there, because it was never going to write anything.
+// `opWouldWrite` below is that predicate and `main` must keep agreeing with
+// it — the two are deliberately adjacent for that reason.
+//
+// WHAT THIS DOES NOT FIX, stated so nobody reads more into it than is there:
+// each thread evaluates the predicate against ONE read of the occupant, and a
+// lower op's store can still land between that read and this thread's
+// decision. Closing that last window needs the two-phase mark/apply
+// sim_explode uses (a per-op scratch buffer), which is a binding, a pass-table
+// row and a buffer — a separate change. What is closed here is the common
+// case: for overlaps where the ops disagree about a cell (paint vs melt, two
+// materials), exactly one invocation now writes it.
+//
+// CELL OPS (the `cells` entry) dedupe on the CPU instead — an 8-byte op has no
+// room for a predicate a shader could re-derive, and the choke point can sort.
+// See sim/oprecord.h's CanonicalizeCells.
 
 @group(0) @binding(0) var<storage, read_write> voxels   : array<u32>;
 @group(0) @binding(1) var<storage, read_write> dirtyIn  : array<atomic<u32>>;
@@ -57,6 +92,24 @@ fn markBoth(c : vec3<i32>) {
   }
 }
 
+// Would op `o` write world cell `c`, given the occupant material `prevMat`?
+// EXACTLY the gate sequence `main` applies to its own op, restated as a
+// predicate so the overlap dedupe can ask it about an EARLIER op. Any change
+// to main's gates has to land here in the same edit or the two disagree and
+// the dedupe starts shadowing writes that would never have happened.
+fn opWouldWrite(o : BrushOp, c : vec3<i32>, prevMat : u32) -> bool {
+  let d = c - vec3<i32>(o.cx, o.cy, o.cz);
+  if (dot(d, d) > o.radius * o.radius) { return false; }
+  if (o.mode == 0u) { return prevMat == MAT_AIR; }  // paint fills air only
+  // the spell transmute's from-filter (see the note in main)
+  if (o._p0 != 0u && prevMat != o._p0) { return false; }
+  if ((o._p1 & 1u) != 0u && prevMat == MAT_AIR) { return false; }
+  if (o.mode == 2u) {  // melt: air and 255-hardness matter are immune
+    return prevMat != MAT_AIR && materials[prevMat].hardness < 255u;
+  }
+  return true;
+}
+
 @compute @workgroup_size(4, 4, 4)
 fn main(@builtin(workgroup_id) wg : vec3<u32>,
         @builtin(local_invocation_id) lid : vec3<u32>) {
@@ -77,6 +130,14 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
   // mode's air test, the melt mode's source material, and the support-loss
   // flag at the bottom, which needs what was here BEFORE the store.
   let prevMat = voxMat(voxWordAt(c));
+  // OVERLAP DEDUPE (see the header): the lowest op index that covers this cell
+  // and would write it owns it. One read of the occupant feeds every decision
+  // in this thread, so the answer is a function of the op list and that read.
+  // opsCount <= 64 and the loop only runs for ops after the first, so a tick
+  // with one brush op pays a single compare.
+  for (var j = 0u; j < opIdx; j++) {
+    if (opWouldWrite(ops[j], c, prevMat)) { return; }
+  }
   if (op.mode == 0u && prevMat != MAT_AIR) { return; }  // paint fills air only
   // A spell's transmute (game/spell.cpp Convert) is an overwrite with a FROM
   // filter: _p0 names the only material it may replace (0 = any), and bit 0 of

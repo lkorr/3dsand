@@ -8,6 +8,7 @@
 
 #include "gpu/context.h"
 #include "gpu/resources.h"
+#include "sim/oprecord.h"    // the gen list is part of the tick's recorded input
 #include "sim/pagetable.h"
 #include "sim/pass_table.h"  // pass::Buf::Voxels for the tracked eviction copy
 #include "sim/simulation.h"
@@ -807,6 +808,12 @@ void Stream::FillSlots(const std::vector<uint32_t>& slots, bool deferWake) {
       // kWakeLatency ticks from now, which is exactly as early as it needs to
       // be — nothing dispatches the plane until the same call wakes it.
     }
+    // The streamer's own TickParams write (below) is a SECOND per-tick input
+    // the op record has to carry: a replay that did not know which slots were
+    // regenerated on this tick would rebuild different planes and diverge on
+    // the first window shift. Stashed here, folded into this tick's frame by
+    // SubmitTick. Free unless a record or a replay is armed.
+    sandvox::opstream::NoteGenList(lastTick_, genSlots);
     ctx_->queue.WriteBuffer(world_->genList, 0, genSlots.data(),
                             genSlots.size() * 4);
     TickParams tp{};

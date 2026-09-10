@@ -342,6 +342,19 @@ inline uint32_t DaylightStrengthCpu(uint32_t phase) {
 }
 
 // Must match BrushOp in common.wgsl (32 bytes).
+//
+// IDENTITY AND ORDER. An op carries no tick and no sequence number: its
+// identity is (tick, index in this vector), and the index is its PRIORITY.
+// CPU push order is deterministic (a fixed sequence in the tick body), and
+// since docs/PLAN_multiplayer_now.md N3 the shader honours it — sim_mutate's
+// `main` gives a contested cell to the LOWEST op index that covers it and
+// would write it, the same rule sim_explode's `apply` has always used. Two
+// brush ops on one cell in one tick therefore have a defined winner.
+//
+// `_p0/_p1` are NOT spare: the spell transmute's from-filter owns them
+// (game/spell.cpp Convert). The AUTHOR of an op lives in a CPU-side side table
+// (sim/oprecord.h's OpMeta) rather than here, because the GPU has no use for
+// it and this struct is full.
 struct BrushOp {
   int32_t x, y, z;
   int32_t radius;
@@ -354,11 +367,19 @@ constexpr uint32_t kMaxOpsPerTick = 64;
 // Must match ExplosionOp in common.wgsl (32 bytes). Part of the MutationQueue
 // discipline: explosions enter the sim only through this op stream, so saves/
 // replays/networking capture them for free (DESIGN.md §2).
+//
+// `author` was `pad0`. It is the ONE op that carries its author in the uploaded
+// record rather than only in the CPU side table, because an explosion is the
+// one op that FANS OUT — it destroys a ball of cells and ejects particles from
+// them, so "who did this" is the question asked about it most often and the
+// word was free. Zero = the local player. The shader ignores it; the layout is
+// unchanged (three pad words became two plus a named one).
 struct ExplosionOp {
   int32_t x, y, z;
   int32_t radius;   // <= kMaxExplosionRadius
   int32_t power;    // hardness budget at the center
-  uint32_t pad0 = 0, pad1 = 0, pad2 = 0;
+  uint32_t author = 0;
+  uint32_t pad1 = 0, pad2 = 0;
 };
 constexpr uint32_t kMaxExplosionsPerTick = 8;
 constexpr int32_t kMaxExplosionRadius = 20;  // EXP_R_MAX in common.wgsl
@@ -909,6 +930,14 @@ constexpr uint32_t kMaxDebugBoxes = 1024;
 
 // Exact-cell MutationQueue op (8 bytes) — island removal / rubble handoff
 // (DESIGN.md §7). Must match sim_mutate.wgsl entry `cells`.
+//
+// DEDUPED CPU-SIDE, not in the shader. There is no room in eight bytes for a
+// filter a shader could re-derive, and the `cells` dispatch is one invocation
+// per op with no ordering between them — two ops on one cellIdx raced. So the
+// choke point (support.cpp's SubmitTick) canonicalizes the stream before
+// upload: keep-FIRST in push order, survivors in push order, which leaves a
+// duplicate-free tick byte-identical to what the producers built. See
+// sim/oprecord.h's CanonicalizeCells.
 struct CellOp {
   uint32_t cellIdx;  // linear chunk-major cell index
   uint32_t word;     // full voxel word to store (stamp field included)

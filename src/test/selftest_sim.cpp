@@ -18,6 +18,7 @@
 #include "test/selftest.h"
 #include "test/support.h"
 
+#include "sim/oprecord.h"  // the op record + replay (ops-replay gate)
 #include "sim/pagetable.h"
 #include "sim/rng_simd.h"  // rng::Pcg8 / JitterStateInRow8 (the simd gate)
 #include "sim/scan.h"      // scan::FirstIndexWhereMasked   (the simd gate)
@@ -3831,6 +3832,277 @@ Status GateSnapshotLatency(Ctx& c, std::string& detail) {
   return fails.empty() ? Status::Pass : Status::Fail;
 }
 
+// ---- ops-replay --------------------------------------------------------
+//
+// THE TWO CLAIMS, and they are different claims (docs/PLAN_multiplayer_now.md
+// N3):
+//
+//   A. A RECORDED SESSION REPLAYS TO THE SAME HASH. The op stream plus the
+//      per-tick TickParams is a COMPLETE description of a tick's input: feed
+//      the record back into the same SubmitTick and the world walks the same
+//      path. CLAUDE.md rule 3 has claimed this for the op stream since the
+//      beginning; nothing tested it, and nothing could, because the queue was
+//      uploaded and forgotten.
+//   B. TWO OPS ON ONE CELL IN ONE TICK HAVE A DEFINED WINNER. Overlapping
+//      brush ops used to race inside sim_mutate's single dispatch, and
+//      duplicate cell ops raced inside `cells`. The rule is now the one
+//      sim_explode already used — lowest op index that would write the cell
+//      owns it — enforced in the shader for brushes and at the CPU choke point
+//      for cell ops.
+//
+// Claim B is checked by CONSTRUCTION, not by a statistic: the scene aims two
+// overlapping same-tick brush ops of different materials at one place and asks
+// what is there afterwards. Before the dedupe landed the answer was whatever
+// the driver scheduled last, so this probe is capable of failing.
+//
+// SELF-CONTAINED (no deps): it runs its own worldgen twice, exactly as
+// `determinism` does, so `--gate ops-replay` alone is a complete run.
+namespace opsreplay {
+
+constexpr int kTicks = 200;
+constexpr uint32_t kProbeEvery = 15;
+
+// The scripted scene. A PURE FUNCTION OF THE TICK, like SelftestOps, so the
+// record and the replay are comparing the same world rather than two arbitrary
+// ones — and so the L5 fixture below lands at a known place.
+struct Scene {
+  uint32_t seed;
+  int ox, oz;  // window-relative origin in world cells
+  // The L5 fixture: two mode-1 (overwrite) ops of DIFFERENT materials whose
+  // spheres intersect. Op index 0 is stone, index 1 is wood, and the rule says
+  // stone owns every cell they share.
+  int ax, ay, az;  // op 0 centre
+
+  std::vector<BrushOp> Ops(uint32_t t) const {
+    std::vector<BrushOp> ops;
+    // a sand column into air, and a water pour: the ordinary brush traffic
+    if (t >= 5 && t < 120) {
+      ops.push_back({ox + 100, FixtureY(ox + 100, oz + 100, seed, 110), oz + 100,
+                     6, kMatSand, 0, 0, 0});
+      ops.push_back({ox + 176, FixtureY(ox + 176, oz + 176, seed, 90), oz + 176,
+                     5, kMatWater, 0, 0, 0});
+    }
+    // THE OVERLAP. Repeated over five ticks so a single scheduling accident
+    // cannot decide the gate; idempotent, since op 0 rewrites its own stone.
+    if (t >= 40 && t < 45) {
+      ops.push_back({ax, ay, az, 5, kMatStone, 1u, 0, 0});
+      ops.push_back({ax + 4, ay, az, 5, kMatWood, 1u, 0, 0});
+    }
+    // fire on the far side, for reaction coverage
+    if (t >= 70 && t < 100) {
+      ops.push_back({ox + 110, FixtureY(ox + 110, oz + 110, seed, 20), oz + 110,
+                     3, kMatFire, 0, 0, 0});
+    }
+    return ops;
+  }
+
+  std::vector<ExplosionOp> Exps(uint32_t t) const {
+    std::vector<ExplosionOp> exps;
+    if (t == 60) {
+      const int h = World::TerrainHeight(ox + 100, oz + 100, seed);
+      // `author` is the renamed pad0: zero is the local player, which is what
+      // every explosion in a single-player build is.
+      exps.push_back({ox + 100, h, oz + 100, 14, 400, 0, 0, 0});
+    }
+    return exps;
+  }
+
+  // The exact-cell arm, standing in for a prefab stamp: an 8^3 box of stone
+  // written through the `cells` entry, WITH A DELIBERATE DUPLICATE. The last
+  // op repeats the box's first cell with water in it, so CanonicalizeCells has
+  // something to drop and keep-first is observable at CellProbe() below.
+  std::vector<CellOp> Cells(uint32_t t) const {
+    std::vector<CellOp> cells;
+    if (t != 20) return cells;
+    const IVec3 b = BoxOrigin();
+    for (int dz = 0; dz < 8; dz++)
+      for (int dy = 0; dy < 8; dy++)
+        for (int dx = 0; dx < 8; dx++)
+          cells.push_back({World::SlotCellIndex({b.x + dx, b.y + dy, b.z + dz}),
+                           PackVoxNew(kMatStone, 0)});
+    cells.push_back({World::SlotCellIndex(b), PackVoxNew(kMatWater, 8)});
+    return cells;
+  }
+
+  IVec3 BoxOrigin() const {
+    return {ox + 60, FixtureY(ox + 60, oz + 60, seed, 40), oz + 60};
+  }
+  // The contested brush cell: two from op 0's centre, two from op 1's, so both
+  // spheres cover it.
+  IVec3 BrushProbe() const { return {ax + 2, ay, az}; }
+  // A cell only op 0 covers, as the control: if this is not stone the fixture
+  // never landed and the contested probe means nothing.
+  IVec3 BrushControl() const { return {ax - 3, ay, az}; }
+  IVec3 CellProbe() const { return BoxOrigin(); }
+};
+
+uint32_t MatAt(GpuContext& ctx, World& world, IVec3 cell) {
+  std::vector<uint32_t> chunk(kChunkVol);
+  const IVec3 wc{cell.x >> 4, cell.y >> 4, cell.z >> 4};
+  ReadVoxelsSync(ctx, world, World::SlotChunkIndex(wc), 1, chunk.data(),
+                 "opsReplayProbe");
+  const uint32_t k = (uint32_t)((cell.z & 15) * 256 + (cell.y & 15) * 16 +
+                                (cell.x & 15));
+  return chunk[k] & 0xFFFu;
+}
+
+// Drive one pass of the scene, collecting a hash every kProbeEvery ticks.
+void RunScene(Ctx& c, const Scene& sc, std::vector<uint32_t>& hashes) {
+  SubmitWorldgen(c.ctx, c.world, c.sim, sc.seed);
+  c.ctx.WaitIdle();
+  hashes.clear();
+  for (uint32_t t = 1; t <= (uint32_t)kTicks; t++) {
+    SubmitTick(c.ctx, c.world, c.sim, t, sc.seed, sc.Ops(t), sc.Exps(t),
+               sc.Cells(t), true, {8, 3, 8}, false, t >= 60);
+    if (t % kProbeEvery == 0 || t == (uint32_t)kTicks)
+      hashes.push_back(ReadHashSync(c.ctx, c.world));
+  }
+}
+
+}  // namespace opsreplay
+
+Status GateOpsReplay(Ctx& c, std::string& detail) {
+  using namespace opsreplay;
+  namespace ops = sandvox::opstream;
+
+  const uint32_t seed = kDefaultSeed;
+  const IVec3 wo = c.world.WindowOrigin();
+  Scene sc;
+  sc.seed = seed;
+  sc.ox = wo.x * (int)kChunk;
+  sc.oz = wo.z * (int)kChunk;
+  sc.ax = sc.ox + 140;
+  sc.az = sc.oz + 140;
+  sc.ay = FixtureY(sc.ax, sc.az, seed, 40);
+
+  const std::string path = "build/ops_replay.svops";
+  if (ops::Recording())
+    std::printf("ops-replay: taking over the recorder (a SANDVOX_RECORD_OPS "
+                "recording ends here)\n");
+  std::string err;
+  if (!ops::StartRecording(path, seed, c.mats, err)) {
+    detail = "cannot record: " + err;
+    std::printf("ops-replay: FAIL (%s)\n", detail.c_str());
+    return Status::Fail;
+  }
+
+  // ---- pass A: play the scene with the recorder on ------------------------
+  std::vector<uint32_t> hashA;
+  RunScene(c, sc, hashA);
+  const uint32_t matBrushA = MatAt(c.ctx, c.world, sc.BrushProbe());
+  const uint32_t matCtrlA = MatAt(c.ctx, c.world, sc.BrushControl());
+  const uint32_t matCellA = MatAt(c.ctx, c.world, sc.CellProbe());
+  const uint64_t bytes = ops::RecordedBytes();
+  const uint32_t frames = ops::RecordedFrames();
+  ops::StopRecording();
+
+  // ---- pass B: replay the file --------------------------------------------
+  ops::Log log;
+  if (!log.Load(path, c.mats, err)) {
+    detail = "record refused on load: " + err;
+    std::printf("ops-replay: FAIL (%s)\n", detail.c_str());
+    return Status::Fail;
+  }
+  // RAII, because every early return below has to disarm the replay or the
+  // NEXT gate would have its gas spawns replaced out from under it.
+  struct ReplayArm {
+    explicit ReplayArm(const ops::Log* l) {
+      ops::ResetReplayStats();
+      ops::SetReplay(l);
+    }
+    ~ReplayArm() { ops::SetReplay(nullptr); }
+  } arm(&log);
+
+  SubmitWorldgen(c.ctx, c.world, c.sim, log.header.seed);
+  c.ctx.WaitIdle();
+  std::vector<uint32_t> hashB;
+  for (const ops::Frame& f : log.frames) {
+    SubmitTick(c.ctx, c.world, c.sim, f.in.tick, f.in.seed, f.ops, f.exps,
+               f.cells, f.in.hashEnable != 0,
+               {f.in.playerChunk[0], f.in.playerChunk[1], f.in.playerChunk[2]},
+               f.in.wantReadback != 0, f.in.particlesActive != 0, f.spawns,
+               f.in.farCount, f.fluid, f.in.fluidLive,
+               f.in.hasSplashMat ? f.in.fluidSplashMat : nullptr,
+               f.in.vizActive != 0);
+    if (f.in.tick % kProbeEvery == 0 || f.in.tick == (uint32_t)kTicks)
+      hashB.push_back(ReadHashSync(c.ctx, c.world));
+  }
+  const uint32_t matBrushB = MatAt(c.ctx, c.world, sc.BrushProbe());
+  const uint32_t matCellB = MatAt(c.ctx, c.world, sc.CellProbe());
+  const uint32_t paramMiss = ops::ReplayParamMismatches();
+
+  // ---- the verdict --------------------------------------------------------
+  std::string fails;
+  auto fail = [&](const std::string& s) {
+    if (!fails.empty()) fails += "; ";
+    fails += s;
+  };
+  if ((uint32_t)log.frames.size() != (uint32_t)kTicks)
+    fail(Format("record has %zu frames, scene ran %d ticks", log.frames.size(),
+                kTicks));
+  size_t firstDiff = hashA.size();
+  for (size_t i = 0; i < hashA.size() && i < hashB.size(); i++)
+    if (hashA[i] != hashB[i]) { firstDiff = i; break; }
+  if (hashA.size() != hashB.size() || firstDiff < hashA.size())
+    fail(Format("replay diverged at probe %zu (tick %zu): %08x vs %08x",
+                firstDiff, (firstDiff + 1) * kProbeEvery,
+                firstDiff < hashA.size() ? hashA[firstDiff] : 0u,
+                firstDiff < hashB.size() ? hashB[firstDiff] : 0u));
+  if (paramMiss != 0)
+    fail(Format("%u TickParams words rebuilt differently (first at tick %u, "
+                "word %u) - a per-tick knob is being read from outside the "
+                "input stream",
+                paramMiss, ops::ReplayFirstMismatchTick(),
+                ops::ReplayFirstMismatchWord()));
+  // L5: the contested brush cell belongs to op index 0 (stone), not op 1
+  // (wood), and it says so on BOTH runs.
+  if (matCtrlA != kMatStone)
+    fail(Format("fixture never landed: op-0-only cell is mat %u, not stone",
+                matCtrlA));
+  if (matBrushA != kMatStone)
+    fail(Format("contested brush cell is mat %u, not stone (op 0 must win)",
+                matBrushA));
+  if (matBrushA != matBrushB)
+    fail(Format("contested brush cell differs between record and replay: %u "
+                "vs %u",
+                matBrushA, matBrushB));
+  // The cell-op arm: keep-FIRST, so the duplicate's water never lands.
+  if (matCellA != kMatStone)
+    fail(Format("duplicated cell op is mat %u, not stone (keep-first)",
+                matCellA));
+  if (matCellA != matCellB)
+    fail(Format("duplicated cell op differs on replay: %u vs %u", matCellA,
+                matCellB));
+
+  // Informational pins. Byte size is not a correctness property — it moves
+  // whenever TickParams grows — so it REPORTS rather than fails, the way an
+  // absent baseline key is treated everywhere else in this harness.
+  RecordObserved("opsReplayBytes", (double)bytes);
+  RecordObserved("opsReplayFrames", (double)frames);
+  const double pinnedBytes = BaselineNumber("opsReplayBytes", 0.0);
+  char note[128] = "";
+  if (pinnedBytes > 0.0 && (double)bytes != pinnedBytes)
+    std::snprintf(note, sizeof(note), ", record %llu B (pin says %.0f)",
+                  (unsigned long long)bytes, pinnedBytes);
+  else
+    std::snprintf(note, sizeof(note), ", record %llu B", (unsigned long long)bytes);
+
+  const ops::StreamCounts& sccount = ops::Counts();
+  char buf[640];
+  std::snprintf(buf, sizeof(buf),
+                "%s (%u frames, %zu hash probes reproduced%s | contested brush "
+                "cell -> mat %u on both runs | cell dupes dropped %u over %u "
+                "ticks | clamps b%u e%u c%u s%u f%u%s%s)",
+                fails.empty() ? "PASS" : "FAIL", frames, hashA.size(), note,
+                matBrushA, sccount.cellDupes, sccount.ticksWithDupes,
+                sccount.brushTrunc, sccount.expTrunc, sccount.cellTrunc,
+                sccount.spawnTrunc, sccount.fluidTrunc,
+                fails.empty() ? "" : " | ", fails.c_str());
+  detail = buf;
+  std::printf("ops-replay: %s\n", buf);
+  return fails.empty() ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& SimGates() {
@@ -3838,6 +4110,7 @@ const std::vector<Gate>& SimGates() {
       {"simd", "sim", {}, false, GateSimd},
       {"weak-flame", "sim", {}, false, GateWeakFlame},
       {"determinism", "sim", {}, false, GateDeterminism},
+      {"ops-replay", "sim", {}, false, GateOpsReplay},
       {"sleep", "sim", {}, false, GateSleep},
       {"evaporation", "sim", {}, false, GateEvaporation},
       {"blood-stain", "sim", {}, false, GateBloodStain},

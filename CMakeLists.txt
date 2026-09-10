@@ -427,6 +427,7 @@ add_library(sandvox_core OBJECT
   src/sim/pagetable.cpp
   src/sim/worldio.cpp
   src/sim/worldedit.cpp
+  src/sim/oprecord.cpp
   src/sim/stream.cpp
   src/sim/farfield.cpp
   src/sim/faredits.cpp

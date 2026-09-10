@@ -18,6 +18,7 @@
 #include "sim/biomes.h"
 #include "sim/farfield.h"
 #include "sim/farplumes.h"
+#include "sim/oprecord.h"
 #include "sim/treeatlas.h"
 #include "sim/worldmap.h"
 #include "sim/wind.h"
@@ -475,9 +476,9 @@ void WriteRenderParams(const rhi::Queue& queue, const World& world,
 // derived only from tick-deterministic inputs (explosion history + a settled
 // particle count), never from frame timing — see DESIGN.md §2/§4.
 void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
-                uint32_t seed, const std::vector<BrushOp>& ops,
-                const std::vector<ExplosionOp>& exps,
-                const std::vector<CellOp>& cells, bool hashEnable,
+                uint32_t seed, const std::vector<BrushOp>& opsIn,
+                const std::vector<ExplosionOp>& expsIn,
+                const std::vector<CellOp>& cellsIn, bool hashEnable,
                 IVec3 playerChunk, bool wantReadback, bool particlesActive,
                 const std::vector<ParticleSpawn>& spawns,
                 uint32_t farCount,
@@ -485,6 +486,49 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
                 uint32_t fluidLive,
                 const uint32_t* fluidSplashMat,
                 bool vizActive) {
+  // ---- THE CHOKE POINT, AND WHAT IT NOW OWES THE STREAM -------------------
+  //
+  // Three of the six op vectors were clamped here and three were not: `cells`,
+  // `spawns` and `fluid` were min()'d against their caps and SILENTLY
+  // truncated, while `ops` and `exps` were uploaded at whatever size the
+  // producers had built — into buffers sized kMaxOpsPerTick * 32 and
+  // kMaxExplosionsPerTick * 32 (world.cpp). Two producers push BrushOps in a
+  // loop without consulting the cap at all (mob.cpp's bleed drip,
+  // avatar.cpp's sever stain), so the overrun was one busy tick away.
+  //
+  // So every stream is clamped HERE, at the one place all of them pass
+  // through, and every refusal is COUNTED (sim/oprecord.h). A truncation that
+  // is only a missing voxel is the bare-count failure CLAUDE.md rule 6 is
+  // about; a truncation with a number beside it in build/last_run.json is a
+  // measurement. The producer-side checks stay as the belt to this brace.
+  //
+  // The parameters are renamed rather than the body rewritten: rebinding the
+  // three names here means the four hundred lines below keep reading `ops`,
+  // `exps` and `cells` and go on describing what actually reached the GPU.
+  std::vector<BrushOp> opsClamp;
+  std::vector<ExplosionOp> expsClamp;
+  std::vector<CellOp> cellsCanon;
+  uint32_t brushTrunc = 0, expTrunc = 0;
+  if (opsIn.size() > kMaxOpsPerTick) {
+    brushTrunc = (uint32_t)opsIn.size() - kMaxOpsPerTick;
+    opsClamp.assign(opsIn.begin(), opsIn.begin() + kMaxOpsPerTick);
+  }
+  if (expsIn.size() > kMaxExplosionsPerTick) {
+    expTrunc = (uint32_t)expsIn.size() - kMaxExplosionsPerTick;
+    expsClamp.assign(expsIn.begin(), expsIn.begin() + kMaxExplosionsPerTick);
+  }
+  // Cell ops: DEDUPE before the cap, so a stream that only overflows because
+  // it repeats itself is not truncated for it. Keep-first in push order; a
+  // tick with no duplicates leaves `cellsIn` untouched and allocates nothing.
+  {
+    uint32_t dupeCell = 0xFFFFFFFFu;
+    const uint32_t dropped =
+        opstream::CanonicalizeCells(cellsIn, cellsCanon, &dupeCell);
+    if (dropped) opstream::NoteCellDupes(tick, dropped, dupeCell);
+  }
+  const std::vector<BrushOp>& ops = brushTrunc ? opsClamp : opsIn;
+  const std::vector<ExplosionOp>& exps = expTrunc ? expsClamp : expsIn;
+  const std::vector<CellOp>& cells = cellsCanon.empty() ? cellsIn : cellsCanon;
   // ---- HOW THIS FUNCTION IS BILLED ---------------------------------------
   //
   // SubmitTick used to be ONE bar on the Performance tab, called "submit", with
@@ -564,6 +608,13 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
   fluidLive = std::min(fluidLive, kFluidCap);
   if (fluidSpawnCount > kFluidCap - fluidLive)
     fluidSpawnCount = kFluidCap - fluidLive;
+  // Every refusal in one ledger. `cells` is charged against the CANONICAL
+  // stream, so a duplicate that was already dropped is not counted twice --
+  // it is reported as a dupe, which is a different fault from an overflow.
+  opstream::NoteTruncation(
+      brushTrunc, expTrunc, (uint32_t)cells.size() - cellCount,
+      (uint32_t)spawns.size() - spawnCount,
+      (uint32_t)fluidSpawns.size() - fluidSpawnCount, 0);
   TickParams tp{tick, seed, (uint32_t)ops.size(), hashEnable ? 1u : 0u,
                 (uint32_t)exps.size(), sim.Page(), cellCount, 0};
   tp.spawnCount = spawnCount;
@@ -970,9 +1021,15 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
   //
   // Simulation is told the count BEFORE EncodeTick because the C_GAS latch
   // decides there whether the pass that drains this list is recorded at all.
+  std::vector<GasSpawnOp> gas;
   {
-    std::vector<GasSpawnOp> gas;
     world.TakeGasSpawns(gas);
+    // REPLAY takes this list from the record instead. Gas spawns are the one
+    // op stream SubmitTick does not receive as an argument -- it drains a CPU
+    // queue that the fire/reaction systems filled earlier in the tick -- so a
+    // replay that only re-fed the arguments would silently drop them. No-op
+    // unless a Log is armed.
+    opstream::ReplaceGasIfReplaying(tick, gas);
     std::vector<uint32_t> hdr(kGasSpHdr + gas.size() * kGasSpStride, 0u);
     hdr[kGasSpCount] = (uint32_t)gas.size();
     if (!gas.empty())
@@ -1009,6 +1066,38 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
     if (plumes.TakeUpload(&pw, &pn))
       ctx.queue.WriteBuffer(world.gasFarEmit, 0, pw, (size_t)pn * 4);
     sim.NoteFarPlumes(plumes.Count(), plumes.CountWide());
+  }
+
+  // ---- THE TICK, AS A RECORD (docs/PLAN_multiplayer_now.md N3) ------------
+  //
+  // HERE and not at function entry, because what a replay has to reproduce is
+  // what REACHED THE GPU: the clamped, canonical op vectors and the completed
+  // TickParams, not what the producers hoped to send. TickParams specifically:
+  // world.h says many sim.* words ride it per tick "so a replay reproduces the
+  // stream", and a record that carried only the op payloads would replay a
+  // different wind, a different day phase and a different fluid gate.
+  //
+  // Under replay this COMPARES instead of writing -- see RecordFrame. One bool
+  // test when neither is armed.
+  {
+    opstream::TickInputs in;
+    in.tick = tick;
+    in.seed = seed;
+    in.hashEnable = hashEnable ? 1u : 0u;
+    in.wantReadback = wantReadback ? 1u : 0u;
+    in.particlesActive = particlesActive ? 1u : 0u;
+    in.vizActive = vizActive ? 1u : 0u;
+    in.playerChunk[0] = playerChunk.x;
+    in.playerChunk[1] = playerChunk.y;
+    in.playerChunk[2] = playerChunk.z;
+    in.farCount = farCount;
+    in.fluidLive = fluidLive;
+    in.hasSplashMat = fluidSplashMat ? 1u : 0u;
+    if (fluidSplashMat)
+      for (int i = 0; i < 4; i++) in.fluidSplashMat[i] = fluidSplashMat[i];
+    opstream::RecordFrame(in, tp, ops, exps, cells.data(), cellCount,
+                          spawns.data(), spawnCount, fluidSpawns.data(),
+                          fluidSpawnCount, gas);
   }
 
   // Day/night sleep handshake. The daylight-gated reactions deliberately do

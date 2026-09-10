@@ -71,8 +71,28 @@ controller and physics need to know what voxels are where) without stalls:
   blocking (counted) rather than skipping if the one it is owed has not landed.
 - All CPU→GPU writes (spells, explosions, brush edits, worldgen) are accumulated
   into a per-frame **MutationQueue** and uploaded as one batched transfer.
-  This queue is a load-bearing design element: it is also the serialization format
-  for saves, the replication stream for networking, and the replay log for debugging.
+  This queue is a load-bearing design element — and as of `sim/oprecord.h`
+  (docs/PLAN_multiplayer_now.md N3) it is *implemented* as exactly one of the
+  three things that sentence used to promise:
+  - **Replay log: yes, and gated.** A run records one framed record per tick —
+    the whole `TickParams` struct (many `sim.*` knobs ride it per tick precisely
+    so a replay reproduces the stream), all six op vectors, the streamer's gen
+    list, and a CPU-side author side table — and replaying that file into the
+    same `SubmitTick` reproduces the world hash probe for probe. The
+    `ops-replay` gate asserts it; the header refuses a record made by a build
+    with a different window size, chunk size, voxel scale or material name
+    table, the way `meta.svm` does.
+  - **Serialization format for saves: no, and not planned here.** Saves are
+    still chunk snapshots (`sim/worldio.cpp` + `ChunkStore`); a record replays
+    only from the worldgen seed its header names, so it is a debugging and
+    validation artifact, not a save file.
+  - **Replication stream: not yet, but the gaps are closed.** Ops now have a
+    defined winner when two land on one cell in one tick (lowest op index that
+    would write it — `sim_mutate.wgsl` for brushes, a keep-first CPU
+    canonicalization for cell ops), every stream is clamped at the choke point
+    with the refusals counted into `build/last_run.json`, and every op can
+    carry an author. What is still missing is transport, host authority and
+    the input struct — see docs/PLAN_multiplayer_now.md.
 
 **Second GPU consequence — determinism is a choice, not a casualty.** A naive GPU
 sim (scheduling-dependent atomics, float math, stateful RNG) is non-reproducible

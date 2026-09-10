@@ -12,6 +12,7 @@
 
 #include "game/rigrender.h"
 #include "sim/bytestream.h"
+#include "sim/oprecord.h"  // the op stream's author side table (N3)
 #include "sim/rng.h"
 #include "sim/tuning.h"
 
@@ -2514,6 +2515,12 @@ void PlayerAvatar::ApplyFallDamage(Vec3 impactDeltaV, Vec3 centerWorldVoxel,
                                    uint32_t tick,
                                    World& world, std::vector<BrushOp>& ops,
                                    std::vector<ParticleSpawn>& spawns) {
+  // THE FIRST PRODUCER TO ADOPT THE AUTHOR SCOPE (sim/oprecord.h). Everything
+  // this function pushes into `ops` is the player's own body coming apart, so
+  // the record attributes that range to the avatar rather than to "unknown".
+  // CPU-side only: it reaches no shader and cannot move the world hash.
+  sandvox::opstream::BrushAuthorScope author(
+      ops, sandvox::opstream::Producer::Avatar, 0);
   if (!spawned_ || !alive_ || !def_) return;
   const float impactVox = impactDeltaV.len();
   if (impactVox < 1e-3f) return;
@@ -2601,9 +2608,13 @@ void PlayerAvatar::ApplyFallDamage(Vec3 impactDeltaV, Vec3 centerWorldVoxel,
         spawns.push_back(MakeDroplet(center, dir * sp, def.bleedMat, false,
                                      0, 0));
       }
-      // Blood stain at the impact site.
-      ops.push_back({ifloor(center.x), ifloor(center.y),
-                     ifloor(center.z), 2, def.bleedMat, 0, 0, 0});
+      // Blood stain at the impact site. Budget charged BEFORE emission
+      // (CLAUDE.md): the brush stream is capped at kMaxOpsPerTick and
+      // SubmitTick refuses the overflow, so a producer that pushes past the
+      // cap is authoring an op that silently never happens.
+      if (ops.size() < kMaxOpsPerTick)
+        ops.push_back({ifloor(center.x), ifloor(center.y),
+                       ifloor(center.z), 2, def.bleedMat, 0, 0, 0});
     }
     return;
   }

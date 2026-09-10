@@ -7510,6 +7510,7 @@ void Mob::BleedTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
     // the budget is debited by the volume actually painted (1/7/33/123) and
     // not by 1. Charging the real cost is what keeps bleedBudgetCap a true
     // bound on matter entering the CA once clump size leaves 0 (rule 2).
+    if (ops.size() >= kMaxOpsPerTick) break;  // charge the CAP before emitting
     ops.push_back({ifloor(w.x), ifloor(w.y), ifloor(w.z), clumpR,
                    def.bleedMat, 0 /*paint into air*/, 0, 0});
     const float clumpVox = (float)BleedClumpVoxels(clumpR);
