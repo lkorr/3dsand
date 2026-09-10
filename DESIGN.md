@@ -2165,8 +2165,13 @@ y32..y86 world and sitting on the 20 m home area) are lifted and the atlas
 re-baked.
 
 **What is left in tuning.json:** `world.mapLayer` / `world.editLayer` (which
-files the game loads; the map page's selectors) and `debug.vegetation` (the
-dev A/B switch, Tuning → Dev switches). The Worldgen tab is gone (P-I):
+files the game loads; the map page's selectors) and the two plant dev
+switches, `debug.vegetation` and `debug.groundCover` (Tuning → Dev switches).
+They are one axis, not two features: `groundCover` off removes every plant a
+body walks through (biome cover rows, tile plants, shore rows, pond life, wet
+moss, cave flora) and leaves the trees and cacti standing; `vegetation` off is
+the extreme end and takes those too. The shader ANDs them (`GROUND_COVER` in
+worldgen.wgsl), so there is no fourth state. The Worldgen tab is gone (P-I):
 Environment → World map is the one front door — map + edit layer, the
 Terrain section, the Sites panel (pad, spawn, water, landform, stamp:
 select / rename / delete), the heightmap backdrop, and the heightmap + voxel

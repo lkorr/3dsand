@@ -390,7 +390,9 @@ As built (branch `env-pg-pi`), against the §5 brief:
   `tuning.json`, `tuner_schema.js`, the regenerated `tuning_prelude.py`;
   `WorldgenDefaultsJson`, `--dump-tuning-defaults` and `/api/tuning-defaults`
   with them, and `check_invariants.py`'s `wgunits` / `wgdefaults` checks.
-  `vegetation` is `debug.vegetation` (Tuning → Dev switches); `mapLayer` /
+  `vegetation` is `debug.vegetation` (Tuning → Dev switches), joined
+  2026-09-10 by `debug.groundCover`, the small-plant half of the same axis
+  (trees and cacti stay); `mapLayer` /
   `editLayer` are `world.*`. The alpine block and its `alpineChance` are an
   `alpine_cushion` row with `minY` at the treeline in alpine and tundra; the
   cover stack's `h < TREELINE` gate is dropped and every seeded row carries

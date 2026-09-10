@@ -1024,7 +1024,7 @@ export function attach(hooks) {
     const head = el('div', {class: 'mapbar'},
       el('b', {}, 'Preview'),
       el('span', {class: 'mapnote'}, ' the engine\u2019s heights (--heightmap) or its real voxels (--voxserve) for the SAVED files: previews, not authoring. ' +
-         'Regen note: the game re-reads the map, the biomes and the trees on F7 / Apply; the Vegetation button is the dev A/B switch (tuning.json debug.vegetation).'));
+         'Regen note: the game re-reads the map, the biomes and the trees on F7 / Apply; the Plants button cycles the two dev A/B switches (tuning.json debug.groundCover, debug.vegetation) through ALL / no ground cover / none.'));
     const pvToggle = el('button', {}, 'Show preview');
     pvToggle.addEventListener('click', () => {
       const on = pv.style.display === 'none';

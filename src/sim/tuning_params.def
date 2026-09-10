@@ -748,6 +748,27 @@ TP_F(sim, currentDrag, TUNE_CURRENT_DRAG, 6.0f)
 // caves and ruins are untouched. MOVES THE WORLD HASH at 0.
 TP_U(debug, vegetation, TUNE_VEGETATION, 1)
 
+// THE GROUND-COVER SWITCH -- the SMALL half of the one above. 0 removes every
+// plant a body walks through and nothing else: the biome cover rows (tall
+// grass, wildflowers, undergrowth, scrub, the alpine cushion), the tile plants
+// (ferns, big toadstools), the shore rows, the pond life (reeds, lilypads,
+// kelp), the wet moss skin and the cave flora. TREES AND CACTI STAY -- they
+// are the landmark half of the flora and removing them changes what the world
+// IS, not how much small stuff is in front of the camera.
+//
+// Why two switches and not one: `vegetation` was the only lever, so the one
+// click that cleared the grass also cleared the wood, and there was no way to
+// look at bare terrain under a canopy. This is the lever you want almost
+// always; `vegetation` above is the extreme end of the same axis and stays
+// because the tree candidate scan and the crown proxy are their own cost.
+//
+// Gated at the SOURCE like the master (plantColumnAt, caveFloraAt and the
+// table-driven blocks in genCellIn), so the undergrowth canopy scan is not
+// paid for either. IMPLIED OFF when vegetation is 0 -- GROUND_COVER in
+// worldgen.wgsl is the AND of the two, so the master stays the extreme end.
+// MOVES THE WORLD HASH at 0.
+TP_U(debug, groundCover, TUNE_GROUND_COVER, 1)
+
 // ---- oil / petroleum-like viscous liquids (shadeViscous) ----
 // Oil and blood share the viscous SURFACE path but look nothing alike, and the
 // blood constants applied to oil rendered the pool as flat beige mud. These are

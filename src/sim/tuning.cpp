@@ -2460,6 +2460,8 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     const std::string at = "debug";
     ReadI(*g, "vegetation", d.vegetation, out, at);
     d.vegetation = (d.vegetation != 0) ? 1 : 0;   // a flag: anything nonzero is on
+    ReadI(*g, "groundCover", d.groundCover, out, at);
+    d.groundCover = (d.groundCover != 0) ? 1 : 0;
   }
 
   return true;

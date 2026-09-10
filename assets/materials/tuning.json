@@ -891,7 +891,8 @@
     "editLayer": ""
   },
   "debug": {
-    "vegetation": 1
+    "vegetation": 1,
+    "groundCover": 1
   },
   "dayNight": {
     "cycleMinutes": 6,

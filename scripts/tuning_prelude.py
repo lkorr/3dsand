@@ -446,6 +446,7 @@ SPEC = [
 
     # debug
     ("debug", "vegetation", "TUNE_VEGETATION", "u", 1),
+    ("debug", "groundCover", "TUNE_GROUND_COVER", "u", 1),
 
     # oil / petroleum-like viscous liquids (shadeViscous)
     ("render", "oilSatLow", "TUNE_OIL_SAT_LOW", "f", 0.5),

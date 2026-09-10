@@ -468,14 +468,32 @@ const HSCALE : i32 = 1;
 // stands. map.json `terrain.treeline` (P-G), read from the worldMap header so
 // the C++ side (worldmap::CurrentTerrain().treeline) sees the same number.
 fn treeline() -> i32 { return wmTerrain(WM_H_TERRAIN_TREELINE); }
-// worldgen.vegetation: the kill-switch for every plant this file places. Gated
-// at the SOURCE of each feature (the *Info / *At functions and the table-driven
-// blocks in genCellIn), not by a material test at the end, so the tree
-// candidate scan, the undergrowth canopy scan and the far cascade's crown
-// proxy all see the same treeless, coverless world -- and none of them pays
-// for plants that will not be placed. A frame-rate A/B lever; terrain, water,
-// caves and ruins are untouched.
+// worldgen.vegetation: the kill-switch for every plant this file places,
+// TREES AND CACTI INCLUDED. Gated at the SOURCE of each feature (the *Info /
+// *At functions and the table-driven blocks in genCellIn), not by a material
+// test at the end, so the tree candidate scan, the undergrowth canopy scan and
+// the far cascade's crown proxy all see the same treeless, coverless world --
+// and none of them pays for plants that will not be placed. A frame-rate A/B
+// lever; terrain, water, caves and ruins are untouched.
+//
+// THE PAIR. This is the EXTREME end of the axis, not the everyday one: it also
+// takes the wood away, and a world with no trees in it is a different world
+// rather than the same world with less clutter. `groundCover` below is the
+// half that removes only what a body walks through. Anything that reads as a
+// LANDMARK -- a tree, a saguaro -- answers to this flag alone.
 const VEGETATION : bool = TUNE_VEGETATION != 0u;
+// worldgen.groundCover: the SMALL half of the switch above. Off leaves the
+// trees and the cacti standing and removes everything a body walks THROUGH --
+// the biome cover rows (tall grass, wildflowers, undergrowth, scrub, alpine
+// cushion), the tile plants (ferns, big toadstools), the shore rows, the pond
+// life, the wet moss skin and the cave flora. ANDed with VEGETATION, so the
+// master switch is still the extreme end of the same axis and a reader never
+// has to check two flags to know whether anything grows.
+//
+// Gated at each feature's SOURCE for the same reason the master is: the
+// undergrowth canopy scan and the tile-plant site scan are the expensive part,
+// and a material test at the end would still pay for them.
+const GROUND_COVER : bool = VEGETATION && TUNE_GROUND_COVER != 0u;
 
 // ---- PER-BIOME RELIEF (P-G): the curve and the multipliers, FROM THE MAP ----
 //
@@ -2113,6 +2131,7 @@ fn treeInfoAt(s : TreeSite, land : Land, seed : u32, ponds : ptr<function, PondS
 
   let ns = taSpeciesCount();
   if (ns <= 0) { return t; }            // no atlas: a legal, treeless world
+  // The master switch only: a tree is a landmark, so `groundCover` leaves it.
   if (!VEGETATION) { return t; }        // worldgen.vegetation = 0: no trees
 
   let hsh = s.hsh;
@@ -2579,6 +2598,11 @@ fn cactusInfo(tx : i32, tz : i32, seed : u32, ponds : ptr<function, PondSet>) ->
   // Only where the biome says so (cover.cacti), and never on the keep-out
   // ground every other feature avoids: the spawn clearing, the selftest
   // fixture pads, or a pond.
+  //
+  // A saguaro is metre-scale and reads as a landmark the way a tree does, so
+  // it answers to the MASTER switch only -- `groundCover` off leaves the cacti
+  // standing and takes the scrub-and-tussock floor out from under them (that
+  // floor is a biome cover row, gated with the rest of the stack below).
   if (!VEGETATION) { return c; }
   let cb = biomeAt(c.wx, c.wz, seed);
   if (!wmFlag(cb, WM_BF_CACTI)) { return c; }
@@ -3021,7 +3045,7 @@ fn caveAt(x : i32, y : i32, z : i32, h : i32, biome : u32, seed : u32) -> i32 {
 //
 // Returns MAT_AIR for "leave the cave open".
 fn caveFloraAt(b : CaveBands, biome : u32, x : i32, y : i32, z : i32, seed : u32) -> u32 {
-  if (!VEGETATION) { return MAT_AIR; }
+  if (!GROUND_COVER) { return MAT_AIR; }
   // Never in the flooded band, and never within reach of it.
   if (y <= LAVA_LEVEL + CAVE_LAVA_MARGIN) { return MAT_AIR; }
 
@@ -3155,7 +3179,7 @@ fn plantColumnAt(x : i32, z : i32, seed : u32, biome : u32) -> PlantCol {
   pc.mat = MAT_AIR;
   pc.base = 0;
   pc.top = -1;
-  if (!VEGETATION) { return pc; }
+  if (!GROUND_COVER) { return pc; }
   // The tile plants belong to biomes with the ground-flora layer (the
   // world map's flag), not to two hard-coded ids.
   if (!wmFlag(biome, WM_BF_GROUND_FLORA)) { return pc; }
@@ -3870,7 +3894,7 @@ fn genCellIn(col : ptr<function, Col>,
     // pond-life block below and is what once turned scattered planting into a
     // solid wall. Chance and material are the water preset's (shore.mossChance
     // / mossMaterial); a biome with no water rows reads 0 and grows none.
-    if (VEGETATION && mat == M_STONE && y == h && shore.onShore) {
+    if (GROUND_COVER && mat == M_STONE && y == h && shore.onShore) {
         let mossMat = wmWater(wp, WM_W_MOSS_MAT);
       if (mossMat != 0u &&
           rollChance(hash3(seed ^ 0x4D05u, bitcast<u32>(x), bitcast<u32>(z)),
@@ -3910,7 +3934,7 @@ fn genCellIn(col : ptr<function, Col>,
   // rolled it or the site that placed it; P-F). Depths are voxels of water
   // over the bed, heights cells above the bed. A band with chance 0 rolls
   // nothing (rollChance).
-  if (VEGETATION && mat == M_WATER && pond >= 0) {
+  if (GROUND_COVER && mat == M_WATER && pond >= 0) {
     let bed = min(h, pw.x);          // the carved bowl floor at this column
     let depth = pond - bed;          // water column height in voxels
     let above = pond - y;            // how far under the surface this cell is
@@ -3953,7 +3977,7 @@ fn genCellIn(col : ptr<function, Col>,
   // so they are the same features as the water-cell block above continued
   // upward — same hashes, same column tests, so a reed is one continuous stalk
   // through the surface rather than two unrelated halves.
-  if (VEGETATION && mat == MAT_AIR && pond >= 0 && y > pond) {
+  if (GROUND_COVER && mat == MAT_AIR && pond >= 0 && y > pond) {
     let bed = min(h, pw.x);
     let depth = pond - bed;
     let hLily = hash3(seed ^ 0x71A9u, bitcast<u32>(x), bitcast<u32>(z));
@@ -4023,7 +4047,7 @@ fn genCellIn(col : ptr<function, Col>,
   // on the SAME hash is what keeps a head from floating over no stalk.
   // worldmap.cpp's MaxPlantH includes the jitter, so the sky-skip and far
   // blocker ceilings cover the tallest column a row can produce.
-  if (VEGETATION && mat == MAT_AIR && shore.onShore && y > h) {
+  if (GROUND_COVER && mat == MAT_AIR && shore.onShore && y > h) {
     let up = y - h;                  // voxels above this column's ground
     let nRows = wmWater(wp, WM_W_SHORE_COUNT);
     for (var i = 0u; i < nRows; i++) {
@@ -4114,7 +4138,7 @@ fn genCellIn(col : ptr<function, Col>,
   // a biome that authors such a row (WM_BF_CANOPY_ROWS): genChunk hands the
   // column's answer in as `canopyMemo` (the far cascade's single-cell callers
   // pass -1 and pay the scan here, once, for the surface cell they ask for).
-  if (VEGETATION && mat == MAT_AIR && y > h && !inRim && pond < 0 &&
+  if (GROUND_COVER && mat == MAT_AIR && y > h && !inRim && pond < 0 &&
       !siteKeepOut(x, z)) {
     let up = y - h;
     let nRows = wmBiome(biome, WM_B_COVER_COUNT);

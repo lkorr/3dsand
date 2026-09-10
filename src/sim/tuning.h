@@ -3078,6 +3078,11 @@ struct Tuning {
     // undergrowth, cover rows, shore/pond/cave flora, alpine cushion, wet moss
     // all off). A frame-rate A/B lever; see tuning_params.def.
     int vegetation = 1;
+    // 1 = the small plants generate, 0 = trees and cacti stand on bare ground
+    // (cover rows, tile plants, shore rows, pond life, wet moss and cave flora
+    // all off). The half of `vegetation` you usually want; ANDed with it, so
+    // vegetation = 0 is still the bare world. See tuning_params.def.
+    int groundCover = 1;
   } debug;
 
   // Values that failed validation, for the overlay / console. Empty on success.

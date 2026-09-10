@@ -2405,8 +2405,8 @@ bool CamMeadow(Scene& s, uint32_t& tick, std::string& why) {
   uint32_t score = 0;
   const int ci = f.Best(f.plantSat, kMeadowRadius, score);
   if (ci < 0 || score == 0) {
-    why = "no plant cells in the residency window (debug.vegetation off, "
-          "or no cover in this biome)";
+    why = "no plant cells in the residency window (debug.groundCover or "
+          "debug.vegetation off, or no cover in this biome)";
     return false;
   }
   const int ix = ci % f.span, iz = ci / f.span;
