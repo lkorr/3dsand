@@ -61,6 +61,7 @@
 #include "sim/simulation.h"
 #include "sim/tuning.h"
 #include "sim/stream.h"
+#include "sim/tuningstamp.h"
 #include "sim/voxload.h"
 #include "sim/waterbody.h"
 #include "sim/wind.h"
@@ -1201,7 +1202,7 @@ int RunShots(GpuContext& ctx, World& world, Simulation& sim) {
   ctx.WaitIdle();
   FarField far;
   far.Init(&world);
-  far.FullRefill({8, 3, 8});
+  far.FullRefill(IVec3{8, 3, 8});
   uint32_t n;
   while ((n = far.PrepareTick(ctx.queue)) > 0) {
     TickParams tp{0, kDefaultSeed, 0, 0};
@@ -2108,7 +2109,7 @@ int RunWaterfallShot(GpuContext& ctx, World& world, Simulation& sim) {
   ctx.WaitIdle();
   FarField far;
   far.Init(&world);
-  far.FullRefill({8, 3, 8});
+  far.FullRefill(IVec3{8, 3, 8});
   uint32_t nfar;
   while ((nfar = far.PrepareTick(ctx.queue)) > 0) {
     TickParams tp{0, kDefaultSeed, 0, 0};
@@ -4979,6 +4980,14 @@ int main(int argc, char** argv) {
   biomes::EnvironmentStamp envStamp =
       biomes::StampEnvironment(assetDir, CurrentTuning().world.mapLayer);
   std::printf("%s\n", envStamp.Line().c_str());
+  // ...and the inputs that shape the world AFTER worldgen: tuning.json,
+  // materials.json, reactions.json (src/sim/tuningstamp.h). All three
+  // hot-reload and none is in the save, so they are what two machines running
+  // "the same build" are most likely to differ on. One line here is the whole
+  // of the desync-cause elimination we can afford before a transport exists;
+  // under DESIGN.md §10's model these three numbers go in the join handshake.
+  const sandvox::TuningStamp tuneStamp = sandvox::StampTuning(assetDir);
+  std::printf("%s\n", tuneStamp.Line().c_str());
   auto envStampMessage = [&envStamp]() {
     return std::string("{\"v\":3,\"type\":\"environment\",\"stamp\":") + envStamp.Json() + "}";
   };
@@ -5769,8 +5778,8 @@ int main(int argc, char** argv) {
   }
   // seed the far-field cascades around spawn (coarsest first; the queue
   // drains at kFarListCap level-chunks per tick through SubmitTick)
-  far.FullRefill({ifloor(player.pos.x) >> 4, ifloor(player.pos.y) >> 4,
-                  ifloor(player.pos.z) >> 4});
+  far.FullRefill(IVec3{ifloor(player.pos.x) >> 4, ifloor(player.pos.y) >> 4,
+                       ifloor(player.pos.z) >> 4});
   StartupMark("far-field refill queued");
   // kinematic capsule proxy so debris collides with (and is shoved by) the
   // player; terrain collision stays in the AABB controller
@@ -8196,6 +8205,18 @@ int main(int argc, char** argv) {
       if (world.farPlumes)
         world.farPlumes->SetEye({ifloor(player.pos.x), ifloor(player.pos.y),
                                  ifloor(player.pos.z)});
+
+      // ---- THE INTEREST SET (src/sim/interest.h) -----------------------
+      // Residency's input, built explicitly here rather than passed as a bare
+      // IVec3, because THIS is the call site a second player arrives at. One
+      // local player => one entry, and it is primary; the streaming and
+      // cascade calls below are then behaviour-identical to what they were.
+      // A remote player adds a chunk coord to this vector and nothing else
+      // changes shape (what the window then DOES about it is the chunk
+      // authority decision, DESIGN.md §10).
+      InterestSet interest;
+      interest.chunks.push_back(playerChunkNow);
+      interest.primary = 0;
       uint32_t farCount = 0;
       {
         // ---- STREAM: the row that flying lights up --------------------
@@ -8204,13 +8225,13 @@ int main(int argc, char** argv) {
         // as "input" — it had no timer, so it fell into the residual, and the
         // residual was billed to the input row.
         sandvox::PerfSpan spanStream(sandvox::PerfScope::Stream);
-        stream.Update(playerChunkNow, tick);
+        stream.Update(interest, tick);
         // THE HORIZON ARRIVING. `far`/`fardown` compile on a background thread
         // (docs/PLAN_shader_compile.md package A) and this is the one place
         // that notices they landed. Nothing was recorded for the cascades
         // before that, so a wholesale refill is what puts terrain back past
         // the residency window. Fires exactly once.
-        if (sim.PollFarPipelines()) far.FullRefill(playerChunkNow);
+        if (sim.PollFarPipelines()) far.FullRefill(interest);
         // ...and until it does, FarField MUST NOT DRAIN (2026-09-10). It used
         // to: PrepareTick popped, EncodeFarFill found no pipeline and dropped
         // the entries, and pending_ emptied — so for the whole compile (2.5 s
@@ -8234,8 +8255,8 @@ int main(int argc, char** argv) {
         // reason: what it trades against is the sieve's per-entry GPU cost,
         // which a shader edit can move by more than 2x without a rebuild.
         far.SetPlaneCap((uint32_t)CurrentTuning().render.farPlaneFillRate);
-        // far-field cascades track the player the same way (render-only)
-        if (!farBlind) far.Update(playerChunkNow);
+        // far-field cascades track the same interest set (render-only)
+        if (!farBlind) far.Update(interest);
         farCount = far.PrepareTick(ctx.queue, !farBlind);
         if (farCount) {
           g_farEntries += farCount;

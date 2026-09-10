@@ -12954,52 +12954,110 @@ links, save routes), `--selftest --gate biomes` (the engine's side),
 `check_trees.sh` still pass: the tree editor mounts into a `div#view-trees`
 inside the Environment section, without class `view`.
 
-## 10. Networking (design now, build later)
+## 10. Networking — the model of record (decided 2026-09-10)
 
-With the determinism discipline of §2/§4, **both** classic models are viable, and
-we defer the final choice to M9. What we do *now* is keep both doors open — which
-turns out to be nearly the same set of day-one rules either way.
+Until 2026-09-10 this section said "both classic models are viable, decide at
+M9, keep both doors open". That is no longer the position: the audit
+`docs/RESEARCH_multiplayer_readiness.md` costed both against the tree as built
+and §5 of it is now the **decision of record**, confirmed by the user and
+being implemented by `docs/PLAN_multiplayer_now.md`.
 
-**Option A — Lockstep (deterministic sim, inputs-only on the wire):**
-- Every machine runs the identical sim; only player commands are exchanged.
-  Bandwidth is tiny and independent of how much chaos is on screen — a huge win
-  for a simulation game where chunk deltas would spike exactly when the fun peaks.
-- Requirements: bit-deterministic GPU kernels (checkerboard/two-phase, integer
-  math, counter RNG — §4), deterministic CPU physics (Jolt supports a
-  cross-platform-deterministic build flag), fixed tick, per-tick state hash for
-  desync detection.
-- Costs to respect: late join needs a full state snapshot (resident region is
-  ~hundreds of MB — needs streaming join or joins at checkpoints); every client
-  simulates the full active set (min-spec bound by the slowest GPU; interest
-  management can't reduce sim cost, only render cost); a single determinism bug
-  desyncs everyone, so the per-tick hash check must exist from the first
-  multiplayer build; all clients hold full world state (cheat visibility).
+**The decision: host-authoritative op stream + deterministic client-side CA +
+chunk authority + hash-triggered per-chunk resync. Singleplayer is the host,
+talking to itself over a loopback.**
 
-**Option B — Server-authoritative (chunk-delta replication):**
-- One machine runs the real sim; clients render + predict. Each tick the server
-  already knows exactly which chunks changed (the dirty system computes this).
-  Compress deltas (XOR vs. last acked + RLE + LZ4), send only chunks within each
-  client's **interest radius**.
-- Tolerant of nondeterminism and client heterogeneity; drop-in join is trivial
-  (stream the interest region). Cost: bandwidth scales with visible chaos, and
-  the server GPU carries everyone's simulation.
-- Client prediction: player movement reconciled (standard); cosmetic particles
-  and purely visual CA effects run client-side without authority — divergence in
-  a splash pattern self-corrects on the next delta.
+**The model in one paragraph.** One machine is the authority for each chunk —
+the host for all of them by default, the nearest player under distributed
+authority later. Only the authority runs the op-emitting gameplay for its
+chunks (mobs, debris, spells, brush, explosions). The resulting per-tick op
+records go over a reliable ordered stream. Every client runs the identical
+integer CA (§4) on its own residency window from those same records, so the
+wire carries **ops plus corrections, never voxel deltas** — bandwidth is flat
+in how much chaos is on screen, which is the one property a falling-sand game
+cannot buy any other way. Entities (players, mobs, bodies) are state-synced
+with an interest radius and prediction, as Teardown does. Per-chunk hashes
+detect drift; on mismatch the authority re-sends that chunk, at chunk
+granularity rather than Factorio's whole-world re-download. Late join streams
+chunks from the `ChunkStore`, which is already the right shape.
 
-**Do now, cheaply (serves both options):**
-- Determinism-first kernels and integer sim math (§4) — cheap now, near-impossible
-  to retrofit. This also buys bit-exact replay debugging in single-player.
-- **All world mutations flow through the MutationQueue** (§2) — locally it feeds
-  the GPU; under lockstep it's the command stream; under server-auth it feeds
-  replication. Building every tool, spell, and explosion against this API from
-  day one is the whole anti-tech-debt play.
+**Why not the alternatives.** Pure lockstep needs every client to simulate the
+same active set: impossible with per-client residency windows and a min-spec
+GPU bound, and interest management cannot reduce sim cost under it, only render
+cost. Pure server-authority with voxel deltas is the model Teardown measured
+and abandoned for bandwidth, and it throws away the determinism this engine has
+already paid for. The chosen model spends the determinism and keeps the
+interest management.
+
+**Singleplayer is the host.** There is no second code path to rot: the local
+game is a one-client session whose transport is a loopback, so every gate that
+runs today is running the multiplayer host's code with one player in the
+interest set. That is also why the op recorder is a single-player debugging
+tool the day it lands rather than netcode nobody exercises.
+
+**What is built (wave 1, 2026-09-10):**
+- **Fixed-latency snapshot.** `World::kSnapshotLatency = 4`; `Snap()` on tick T
+  is the snapshot of tick T−K exactly, never "whatever the fence delivered".
+  Gate: `snapshot-latency`. This is what makes an authority's decisions a
+  function of tick instead of of GPU timing.
+- **Op-stream hygiene.** `src/sim/oprecord.h`: a per-tick record of the six op
+  vectors plus replay, an author side table, lowest-op-index-wins dedupe in
+  `sim_mutate.wgsl` (matching what `sim_explode.wgsl` always did), and counted
+  clamps at every choke point. Gate: `ops-replay`. Recording is
+  `SANDVOX_RECORD_OPS=<file>`.
+- **Integer wind weather and integer landform bake.** No libm on the hashed
+  tick input stream, so the CA is the same integers on another machine's
+  toolchain and not only on another copy of this binary.
+- **The interest set.** `src/sim/interest.h` — `Stream::Update` and
+  `FarField::Update`/`FullRefill` take an `InterestSet`, and it is the ONLY way
+  to move the residency window or the far cascades. One point today, and one
+  place for the second point to be declared.
+
+**What M9 still needs** (the audit's "later" column, against the tree above):
+transport and lobby (Steam / WebRTC; browser builds have no raw UDP, and both
+an ordered op stream and a chunk re-send survive a WebSocket or DataChannel
+fine); entity state sync with interest radius and prediction, which first needs
+items keyed on game ids rather than Jolt body handles; late-join chunk
+streaming; the tuning / materials / reactions hashes and tick+seed in the join
+handshake and in `meta.svm` — the numbers now exist (`src/sim/tuningstamp.h`,
+printed at boot beside the environment stamp and written into
+`build/last_run.json`) but nothing refuses a mismatch yet; a per-chunk hash
+keyed on world coord plus the chunk re-send path; hash coverage over the
+particle / fluid / gas buffers, without which a divergence is invisible until
+it lands; ticket slots or a second host window IF the chunk-authority decision
+makes the host simulate near remote players (`docs/PLAN_chunk_tickets.md`, P0
+landed with `kTicketMax = 0`, and its non-goals bound what such a region could
+be); container-order and comparator hardening for a client on a different
+binary or STL; a particle-cap refusal gate; a Tint const-eval check; local
+pacing under network pacing; `Stream`'s second `tickUBO` write folded into the
+tick record; dev-UI sim inputs made client-local or replicated.
+
+**Two rules, in force from today, for every system built before M9:**
+
+1. **No sim-affecting process global keyed on the window origin.** A global
+   that is a pure function of `(seed, window origin, tuning)` and rebuilds on
+   every shift — `WaterBodies()` is the live example — is correct for exactly
+   one window. Two windows on one host, or a host and a client whose windows
+   are centred differently, make it two different answers to the same question,
+   and the divergence is silent. Key such state on the CHUNK, or derive it per
+   query from world coords.
+2. **No new gameplay decision reads the snapshot outside the fixed-latency
+   path.** Anything that authors or gates a mutation — pick cells, ground
+   probes, collision fallbacks, island detection, activity counters — reads
+   `Snap()` at T−K or does not read it at all. "Skip this tick, the readback
+   was not ready" is a decision made by fence timing, and under this model an
+   authority's decisions must be reproducible by every client from the tick
+   number.
+
+**Do now, cheaply (unchanged by the decision):**
+- Determinism-first kernels and integer sim math (§4) — cheap now,
+  near-impossible to retrofit. This also buys bit-exact replay debugging in
+  single-player.
+- **All world mutations flow through the MutationQueue** (§2) — locally it
+  feeds the GPU; on the wire it IS the op stream. Building every tool, spell
+  and explosion against this API from day one is the whole anti-tech-debt play.
 - Fixed tick, versioned chunk serialization, entity IDs never raw pointers,
   gameplay separated from render, a headless build target, per-tick world hash.
-- Punt entirely: netcode library choice, final model selection, anti-cheat.
-- Browser note: web builds network via WebSocket/WebRTC (no raw UDP). Both
-  options survive this — lockstep needs only ordered command delivery; server-
-  authoritative streams chunk deltas over a DataChannel/WebSocket fine.
+- Punt entirely: netcode library choice, anti-cheat.
 
 ## 11. Performance Budget & Principles
 

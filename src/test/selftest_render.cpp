@@ -180,7 +180,7 @@ bool fogOk = false;
 {
   FarField far;
   far.Init(&world);
-  far.FullRefill({108 >> 4, 122 >> 4, 108 >> 4});
+  far.FullRefill(IVec3{108 >> 4, 122 >> 4, 108 >> 4});
 
   // ---- THE BLIND WINDOW (farfield.h PrepareTick's `drain`) ---------------
   // The game runs for seconds with `far`/`farpatch` still compiling, and
@@ -2405,7 +2405,7 @@ Status GateShadowCache(Ctx& c, std::string& detail) {
   auto shiftX = [&](int dir) -> bool {
     const IVec3 o = world.WindowOrigin();
     // kHysteresis is 2 chunks: a player 2 chunks off centre moves the window.
-    c.stream.Update({o.x + halfC + 2 * dir, o.y + halfC, o.z + halfC}, tick);
+    c.stream.Update(IVec3{o.x + halfC + 2 * dir, o.y + halfC, o.z + halfC}, tick);
     ctx.WaitIdle();
     const bool moved = world.WindowOrigin().x == o.x + dir;
     if (moved) shifted = !shifted;

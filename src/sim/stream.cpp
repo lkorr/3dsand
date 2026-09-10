@@ -205,12 +205,17 @@ void Stream::OnMaterialsReloaded(const std::vector<MaterialDef>& mats) {
                            (m.gpu.flags & kMatFlagOpaque) != 0)));
 }
 
-void Stream::Update(IVec3 playerChunk, uint32_t tick) {
+void Stream::Update(const InterestSet& interest, uint32_t tick) {
   // Unconditional, not behind PtDbg(): see the Timing comment in stream.h.
   // Six clock reads against a pass whose p99 is 42 ms is not a measurement
   // cost, and gating them on an env var is what let the prose about this
   // function's cost go 8x stale without anyone noticing.
   const double uT0 = PtNowMs();
+  // ONE window, so one centre. Every other point in the set is a residency
+  // OBLIGATION this function cannot discharge (see interest.h) — reading
+  // Primary() here is what makes today's behaviour identical to the old
+  // Update(IVec3, tick), not an accident to be tidied away later.
+  const IVec3 playerChunk = interest.Primary();
   lastTick_ = tick;
   // harvest evictions whose readback completed since last tick (non-blocking)
   while (!pending_.empty() && pending_.front().map.Ready())
@@ -230,8 +235,16 @@ void Stream::Update(IVec3 playerChunk, uint32_t tick) {
 
   IVec3 o = world_->WindowOrigin();
   int half = (int)kNChunk / 2;
-  int d[3] = {playerChunk.x - (o.x + half), playerChunk.y - (o.y + half),
-              playerChunk.z - (o.z + half)};
+  // No point of interest => no shift, but the harvests above and the pending
+  // shift completions below still run: they are owed work from EARLIER ticks
+  // and their deadlines are in ticks, not in player motion. Skipping them
+  // would leave a plane inert past its T+kWakeLatency wake.
+  int d[3] = {0, 0, 0};
+  if (!interest.Empty()) {
+    d[0] = playerChunk.x - (o.x + half);
+    d[1] = playerChunk.y - (o.y + half);
+    d[2] = playerChunk.z - (o.z + half);
+  }
   // ONE AXIS PER CALL, and the axis that is furthest out of centre first.
   //
   // A shift cannot be split across frames - the whole plane must be evicted

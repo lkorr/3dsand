@@ -20,6 +20,7 @@
 #include "gpu/resources.h"
 #include "sim/oprecord.h"   // op-stream clamp counters + SANDVOX_RECORD_OPS
 #include "sim/pagetable.h"  // PagesHighWater for the pool-margin report
+#include "sim/tuningstamp.h"  // the tuning/materials/reactions desync stamp
 #include "test/support.h"
 
 using namespace sandvox;
@@ -759,6 +760,14 @@ void WriteJson(const std::string& path, const std::vector<Result>& results) {
       << ", \"firstDupeCell\": " << (int64_t)(int32_t)oc.firstDupeCell
       << "},\n";
   }
+  // ---- WHAT THIS RUN'S SIM CONSTANTS WERE (PLAN_multiplayer_now N6) -------
+  //
+  // tuning.json / materials.json / reactions.json all hot-reload and none is
+  // in the save, so a hash that differs between two machines "on the same
+  // build" is most cheaply explained by one of these three. Recorded next to
+  // the result rather than printed only at boot, so the explanation is still
+  // there when somebody reads last_run.json a day later.
+  f << "  \"tuningStamp\": " << sandvox::StampTuning(AssetDir()).Json() << ",\n";
   // What the driver charged for each pipeline this run, always
   // (docs/PLAN_shader_compile.md package A item 4). A cold worldgen compile is
   // minutes and the entry point that took them is not otherwise recorded
