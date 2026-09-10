@@ -1861,6 +1861,33 @@ Status GateDuel(Ctx& c, std::string& detail) {
   // "somebody swung" and is satisfied by one duelist beating a statue.
   int reqRed = 0, reqBlue = 0, cutRed = 0, cutBlue = 0;
   int awakePeak = 0;
+  // ---- THE WAKE WINDOW IS THE FIGHT, NOT THE FIXTURE'S WORLDGEN ----------
+  //
+  // `awakePeak` is a MAX over 600 samples of a whole-world dirty count, and it
+  // used to be sampled with no check at all: `Snap().activeChunks`, whatever
+  // that was. Two things are wrong with that and N1's fixed snapshot latency
+  // made both visible at once.
+  //
+  // First, Snap() is INVALID for the first World::kSnapshotLatency ticks after
+  // a world reset, and `activeChunks` then still holds the last published
+  // value -- from the PREVIOUS GATE'S world. A max over another gate's numbers
+  // is not a measurement of this one.
+  //
+  // Second and larger: OpenStage regenerates the world, and a fresh worldgen
+  // wakes ~1,680 chunks. The stand-up phase above is exactly four ticks, so
+  // that wake used to be published and consumed just BEFORE this loop opened
+  // and was never sampled (measured peak 199-232 across three months of logs).
+  // At K = 4 the same four snapshots arrive four ticks later -- inside the
+  // window -- and the gate reported 1,446 for a fight whose gore was
+  // unchanged (red lost the same 3,328 voxels in every run).
+  //
+  // So sample only snapshots that DESCRIBE THIS FIGHT. Under the old
+  // zero-latency harness every sample satisfied this, which is why the check
+  // was never needed; it is what the gate always meant. Not a threshold
+  // change: `duel.awakeChunksMax` is untouched, and a fight that really did
+  // wake the world still fails.
+  const uint32_t fightFromTick = tick.tick + 1;
+  int wakeSamples = 0;
   int bothAlive = 0, sawRed = 0, sawBlue = 0;
   float redNearest = 1e9f, blueNearest = 1e9f;
   const char* blueIntent = "(never ticked)";
@@ -1878,7 +1905,13 @@ Status GateDuel(Ctx& c, std::string& detail) {
     const NpcStroke* sb = c.mobs.MobStroke(blue);
     if (sr != nullptr && sr->Cutting()) { strokes++; cutRed++; }
     if (sb != nullptr && sb->Cutting()) { strokes++; cutBlue++; }
-    awakePeak = std::max(awakePeak, (int)c.world.Snap().activeChunks);
+    {
+      const WorldSnapshot& sn = c.world.Snap();
+      if (sn.valid && sn.tick >= fightFromTick) {
+        awakePeak = std::max(awakePeak, (int)sn.activeChunks);
+        wakeSamples++;
+      }
+    }
     // WHAT EACH BRAIN IS DOING, sampled while BOTH are still standing. A duel
     // that one side never joins has four causes -- it never saw the other, it
     // saw and would not close, it closed and would not swing, or it was dead
@@ -1928,6 +1961,10 @@ Status GateDuel(Ctx& c, std::string& detail) {
   // BOUNDED WAKE (CLAUDE.md rule 2): a fight is gore and blood, and gore is
   // CellOps into the grid. It must not wake the world.
   const int awakeMax = (int)BaselineNumber("duel.awakeChunksMax", 900);
+  // ...and the wake claim needs SAMPLES, or "peak 0" is a gate that can only
+  // pass (CLAUDE.md: an absolute zero is a rate claim). A window that saw no
+  // in-fight snapshot at all is a fixture failure, not a bounded wake.
+  check(wakeSamples > 0, "the wake window sampled the fight at all");
   check(awakePeak <= awakeMax, "the fight left the world's wake bounded");
 
   RecordObserved("duel.redLostObserved", (double)redLost);
@@ -1941,9 +1978,9 @@ Status GateDuel(Ctx& c, std::string& detail) {
   std::printf(
       "duel: %d attack requests (red %d, blue %d), %d cut ticks (red %d, blue "
       "%d), %d parries over %d ticks; red lost %u vox, blue lost %u; peak "
-      "awake chunks %d (max %d)\n",
+      "awake chunks %d (max %d, over %d in-fight snapshots of %d ticks)\n",
       requests, reqRed, reqBlue, strokes, cutRed, cutBlue, blocks, ticks,
-      redLost, blueLost, awakePeak, awakeMax);
+      redLost, blueLost, awakePeak, awakeMax, wakeSamples, ticks);
 
   CloseStage(c);
   detail = Format("%d checks", checks);

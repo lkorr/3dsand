@@ -3776,6 +3776,36 @@ class World {
   // `snap_` ends holding the NEWEST of them. Anything newer stays queued for
   // the ticks that own it. Returns true if `snap_` describes exactly `target`.
   bool PublishSnapshotsUpTo(uint32_t target);
+
+  // ---- THE FRESHEST DELIVERED SNAPSHOT: DERIVED DATA ONLY ----------------
+  //
+  // `Snap()` is the fixed-latency GAMEPLAY view and must stay exactly that.
+  // The PAGE TABLE is a different customer with the opposite requirement, and
+  // conflating the two is what N1's first cut got wrong:
+  //
+  //   * the page table is DERIVED data (PLAN_page_table.md: not hashed, not
+  //     saved, reconstructible), so reading a timing-dependent snapshot there
+  //     cannot make the world non-reproducible;
+  //   * and it NEEDS freshness for cost reasons that turn into correctness
+  //     ones. TightenFromSnapshot dilates the mirror one N26 ring per tick of
+  //     gap, so at gap K the materialization set is the wrong SHAPE as well as
+  //     ~2.3^K bigger, and chunks the GPU is about to write stop being
+  //     materialized. A page fault IS that: a store dropped into a chunk that
+  //     was left a sentinel. Measured on the first cut of N1, which routed the
+  //     page table through the fixed view and removed the settle-window drain:
+  //     `daylight-boundary` pageFaults 1 and `ca-level-pond` a 2-eighth mass
+  //     leak, from a suite that had neither.
+  //
+  // Publishing and DELIVERY are separate now, which is what lets ONE ring
+  // serve both: this returns the newest snapshot the GPU has handed back,
+  // whatever its age, and SubmitTick may drain toward freshness for it without
+  // ever letting Snap() run ahead of T - kSnapshotLatency.
+  //
+  // NOTHING THAT FEEDS THE SIM MAY READ THIS. It is timing-dependent by
+  // construction; that is the entire reason Snap() exists.
+  const WorldSnapshot& LatestDelivered() const {
+    return ready_.empty() ? snap_ : ready_.back();
+  }
   const SnapshotPipeStats& SnapshotPipe() const { return snapPipe_; }
   SnapshotPipeStats TakeSnapshotPipe() {
     const SnapshotPipeStats s = snapPipe_;

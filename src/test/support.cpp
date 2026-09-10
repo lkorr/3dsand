@@ -1218,11 +1218,16 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
   }
   {
     // fluidChunks(N): every chunk the MLS-MPM seam may write a voxel into —
-    // the active block slots from the one-tick-latent snapshot readback plus
+    // the active block slots from the latest DELIVERED snapshot readback plus
     // this tick's CPU-known fluid spawn cells, dilated one ring inside
     // UpdateFluidChunks. The settle converter's >= 8 calm-tick floor is what
     // makes the readback latency safe (world.h fluid block).
-    const WorldSnapshot& sn = world.Snap();
+    //
+    // LatestDelivered(), not Snap(): this materializes pages, which is page
+    // TABLE work — derived data that wants the freshest thing the GPU has
+    // handed back, not the fixed-age view gameplay decisions read. See the
+    // block comment on World::LatestDelivered.
+    const WorldSnapshot& sn = world.LatestDelivered();
     std::vector<uint32_t> blockSlots;
     if (sn.valid && sn.fluidBlockCount > 0) {
       blockSlots.assign(sn.fluidBlocks.begin(),
@@ -1236,7 +1241,12 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
     pt.UpdateFluidChunks(blockSlots, fluidCells, world);
   }
   {
-    const WorldSnapshot& sn = world.Snap();
+    // LatestDelivered(), not Snap(), and the freshness is load-bearing rather
+    // than nice: the tightening is the ONLY thing that shrinks cpuDirty, and
+    // it rolls a stale snapshot forward one N26 ring per tick of gap. Pointing
+    // it at the fixed T-K view is what produced page faults and a mass leak in
+    // N1's first cut. Derived data, so this may be timing-dependent.
+    const WorldSnapshot& sn = world.LatestDelivered();
     if (sn.valid) pt.TightenFromSnapshot(sn.dirtyFlags, sn.tick, tick);
     // Contributor (e), the particle flight shell — strictly AFTER the
     // tightening, like (c)/(d): a union applied after an intersection cannot
@@ -1255,8 +1265,12 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
   //
   // Both steps read data the CPU already has: the occupancy the snapshot
   // already carries, and a tick counter. No new readback, no new scan.
-  if (world.Snap().valid)
-    pt.ConsumeOccupancy(world.Snap().occupancy, world.Snap().occStain, tick);
+  // LatestDelivered() for the same reason the tightening uses it: the free
+  // path is page-table bookkeeping, and freeing against a K-tick-old occupancy
+  // reading is how a chunk that just gained matter gets demoted under it.
+  if (world.LatestDelivered().valid)
+    pt.ConsumeOccupancy(world.LatestDelivered().occupancy,
+                        world.LatestDelivered().occStain, tick);
   pt.RetirePages(tick);
 
   // ---- the §3.4 settled-skip latch ----------------------------------------
@@ -1434,6 +1448,75 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
     sandvox::PerfSpan spanWait(PerfScope::ReadbackStall);
     ctx.WaitIdle();
     ctx.ProcessEvents();
+  }
+  // ---- THE PAGE TABLE'S OWN SNAPSHOT CADENCE, AND WHY IT SURVIVED N1 ------
+  //
+  // This is the paged self-defence that predates N1, restored deliberately
+  // after N1's first cut deleted it. The reasoning that deleted it was: "with
+  // an exact latency the staleness predicate is a compile-time constant, so
+  // the fallback is dead code". That was true of the predicate and false of
+  // the NEED. §3.2's intersection is the only thing that shrinks cpuDirty, and
+  // TightenFromSnapshot dilates one N26 ring per tick of gap — so pinning the
+  // page table to a K-tick-old snapshot does not make it stale-but-fine, it
+  // makes the materialization set the wrong SHAPE. Chunks the GPU is about to
+  // write stop being materialized, and a store into an unmaterialized chunk is
+  // a PAGE FAULT: a lost voxel. Measured on that first cut: `daylight-boundary`
+  // pageFaults 1 and `ca-level-pond` leaking two eighths of water, in a suite
+  // that had neither before.
+  //
+  // WHAT CHANGED, and it is the whole reason both customers can be served: the
+  // drain now waits for DELIVERY and not for PUBLICATION. Snap() is advanced
+  // by PublishSnapshotsUpTo at the head of the tick and by nothing else, so
+  // draining here cannot move it a single tick — the fixed latency is
+  // untouched, and the page table gets the fresh readback it has always
+  // needed. Before N1 these were the same act, which is why the conflict was
+  // invisible.
+  //
+  // Two thresholds, unchanged: gap 0 inside PageTable::InSettleWindow (a
+  // freshly generated world's dirty set is at its lifetime maximum and even a
+  // 2-4 tick lag measured 16,347 pages in use by tick 8 against 9,396 for the
+  // same settle at gap 0), and kPagedSnapshotMaxGap after it. Dense takes none
+  // of this: the identity map has no mirror to starve.
+  //
+  // RAISING kPagedSnapshotMaxGap TO BUY FEWER STALLS IS STILL A TRAP. The
+  // tightening ends in `IntersectWith(snap); UnionWith(snap)`, which is
+  // (A n S) u S == S, so this constant is the EXPONENT on the materialization
+  // set and not a latency knob. Measure with SANDVOX_PT_DEBUG=1 before
+  // granting it more rings; SANDVOX_SNAP_MAXGAP makes that one run per
+  // candidate instead of one rebuild per candidate.
+  static const uint32_t kPagedSnapshotMaxGap = [] {
+    constexpr uint32_t kDefault = 4;
+    if (const char* e = std::getenv("SANDVOX_SNAP_MAXGAP")) {
+      const long n = std::strtol(e, nullptr, 10);
+      if (n >= 1 && n <= 13) {
+        std::printf("[snap] SANDVOX_SNAP_MAXGAP=%ld (default %u)\n", n,
+                    kDefault);
+        return (uint32_t)n;
+      }
+    }
+    return kDefault;
+  }();
+  if (world.residency == World::Residency::Paged) {
+    const uint32_t maxGap =
+        world.pages->InSettleWindow(tick) ? 0u : kPagedSnapshotMaxGap;
+    auto delivered = [&] {
+      const WorldSnapshot& ld = world.LatestDelivered();
+      return ld.valid && tick <= ld.tick + maxGap;
+    };
+    if (!delivered()) ctx.ProcessEvents();  // free: a fence that already fired
+    // Bounded by the ring depth — each iteration retires at least one slot and
+    // nothing re-arms one from in here. One targeted fence per iteration, never
+    // a device drain: WaitIdle waits for WORK, and work is not what is missing.
+    for (int i = 0; i < World::kReadbackSlots && !delivered(); i++) {
+      sandvox::PerfSpan spanWait(PerfScope::ReadbackStall);
+      if (!ctx.WaitOldestPendingMap()) break;
+      world.NoteSnapshotSlotWait();
+      g_snapshotStalls++;
+      g_stallStats.stalls++;
+      g_stallStats.issuedArm++;
+      g_stallStats.mapWaits++;
+    }
+    if (!delivered()) g_stallStats.proceedStale++;
   }
 }
 
