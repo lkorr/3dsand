@@ -1999,6 +1999,58 @@ rather than a tuning row now, so `--sweep` cannot reach it; the `terrain`
 gate's C1 (the CPU twin against the GPU per voxel) is the proof the words the
 map carries are the words the kernel reads.
 
+##### A loose cover is born at rest too (2026-09-09)
+
+The sediment wedge's slope gate was the only one. The desert / ocean **sand
+cap** was four voxels of POWDER laid on ground of any steepness, and those two
+biomes also author their *skin* as `sand`, where the skin branch had always
+assumed a solid ("a powder shell on a slope avalanches out from under itself").
+
+Measured on raw worldgen output (`--voxdump`, no CA), in a 128x96x128 box at the
+authored lake: **1,249 of 10,539 sand cells had a legal CA down-move on tick 0,
+and 418 of them went straight into the water.** The water itself is born
+perfectly at rest -- every cell full, flat top, solid floor, zero violations --
+so the reported bug (freshly streamed lake terrain stays awake for seconds) was
+never the water. It was the bank falling into it.
+
+`looseCoverDepth` splits a cover the way the wedge is split: the LOOSE part
+keeps its authored depth on ground the wedge already calls flat
+(`terrain.sedSlope`), tapers to zero at the CA's own angle of repose
+(`CAP_REPOSE_Q8 = 256`, one voxel per column -- not a knob, it is the constant
+`sim_step`'s diagonal slide defines), and whatever the taper takes away becomes
+the biome's `cover.firmSkin` (`WM_B_FIRM_COVER`; desert and ocean say
+`sandstone`, a material that far-aliases `sand` so it costs no palette slot).
+On flat ground the loose depth is the full authored 4 and nothing changes.
+
+Two authored discontinuities force it to zero outright, because **neither is in
+the noise field and the analytic gradient reads both as level plateau**: a water
+body's bermed / excavated bank (`Col.nearWater`) and an authored pool's rim
+annulus (`inRim`). `nearWater` is deliberately *not* `shore.onShore` -- that
+flag carries the shore feature's bluff cut, which turns itself off on exactly
+the tallest cut walls in the world.
+
+The skin half is gated on the authored class AND on the biome having authored a
+`firmSkin`. The opt-in is the author's veto: tundra's skin is snow, also a
+powder, and firming a tenth of the tundra broke its own authored claim ("99% of
+columns wear snow at `y == h`", the `env-truth` gate) for a settle transient
+tundra has always accepted.
+
+**Known gap, not fixed here.** This gate reads `Land.slope`, the *landform*
+gradient, which by design excludes the detail and grain octaves (see the note
+above -- gating on the full gradient turns the wedge into a cliff). So the
++-2-voxel steps fine noise puts on an otherwise gentle dune face are invisible
+to it: the open dune field still measured **645 movers before and after**. The
+lake case is fixed; the dune case needs a different instrument (a local step
+test, not a gradient), and the tuning that did catch it by brute force also
+stripped 87% of the desert's loose sand.
+
+`bowlSteep` carries a second known gap of the same shape, documented at its
+definition: it compares against the next integer radius *ring* rather than the
+four axis neighbour columns, and under-reads the step where the profile crosses
+two voxels between rings (168 bed grains on one marsh bowl face). The exact fix
+is written and works, but it moves the harness pool's bed enough to need the
+`waterbody` gate's conservation ledger reconciled with it.
+
 ##### Per-biome height curves (2026-09-01, Lin 13.3.3)
 
 "This biome is flat plains, that one is jagged mountains", authored as nine

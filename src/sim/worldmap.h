@@ -225,7 +225,16 @@ enum : uint32_t {
   kB_HillMul = 31,
   kB_DetailMul = 32,
   kB_GrainMul = 33,
-  // 34..47 reserved
+  // FIRM COVER (cover.firmSkin): the SOLID this biome's loose cover turns
+  // into where the ground is too steep to hold a powder. genCellIn ramps a
+  // sand cap's loose depth to zero on the same slope gate the sediment wedge
+  // uses (kHTerrainSedSlope) and lays this material in the rest of the cap --
+  // and lays it over the WHOLE cap on a shore column, where the berm wall is a
+  // cliff the analytic noise gradient cannot see. Same treatment for a POWDER
+  // skin (desert / ocean author `sand`); a solid skin is untouched.
+  // 0 = unset: the biome's subsoil if that is solid, else stone.
+  kB_FirmCover = 34,
+  // 35..47 reserved
   kCoverRowWords = 12,
   kC_Mat = 0,
   kC_Head = 1,

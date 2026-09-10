@@ -1040,6 +1040,14 @@ fn isqrtLe(v : i32, hi0 : i32) -> i32 {
 // powder bed (genCellIn), so a steep authored tarn stays settled (rule 2)
 // instead of avalanching its sand forever -- which is why the preset's depth
 // no longer has to be bounded by its radius.
+//
+// KNOWN GAP (2026-09-09, measured): the ring comparison under-reads the step
+// where the profile crosses 2 voxels between integer radius rings -- 168 bed
+// grains on one marsh bowl face sat submerged at a >=2 step this test called
+// 1, and slid on tick 0. The exact fix (test the four axis neighbours' own
+// bowlDepth) exists and works, but it changes the harness pool's bed enough
+// to need the waterbody-gate ledger reconciled with it, so it ships with
+// that reconciliation, not here.
 fn bowlSteep(p : Pond, x : i32, z : i32) -> bool {
   let dx = x - p.cx;
   let dz = z - p.cz;
@@ -1543,6 +1551,10 @@ const WM_B_CURVE_KNOT0   : u32 = 22u;   // ..30u
 const WM_B_HILL_MUL      : u32 = 31u;
 const WM_B_DETAIL_MUL    : u32 = 32u;
 const WM_B_GRAIN_MUL     : u32 = 33u;
+// The SOLID this biome's loose cover becomes where the ground is too steep to
+// hold a powder (worldmap.h kB_FirmCover, biomes/<name>.json cover.firmSkin).
+// 0 = unauthored; coverFirmMat below falls back to the subsoil or to stone.
+const WM_B_FIRM_COVER    : u32 = 34u;
 const WM_C_WORDS         : u32 = 12u;
 const WM_C_MAT           : u32 = 0u;
 const WM_C_HEAD          : u32 = 1u;
@@ -3080,6 +3092,15 @@ struct Col {
   inPoolFloor : bool,
   inRim       : bool,
   shore       : Shore,
+  // The shore band WITHOUT the bluff cut `shore` applies. `shore.onShore` asks
+  // "does a wet fringe belong here", and answers NO on a column standing well
+  // above the waterline -- a bluff is dry bank, not marsh, and that test is the
+  // most load-bearing one in the shore feature. But "is the ground here shaped
+  // by a water body rather than by the noise" is a DIFFERENT question with the
+  // opposite answer on exactly that column: a bluff over a lake is a cut wall
+  // 17 voxels tall that the analytic gradient reads as level plateau. So the
+  // cover gate (looseCoverDepth) reads this flag and the marsh reads the other.
+  nearWater   : bool,
   wp          : u32,         // the water preset this column's pond or shore wears; 0 = none (P-F)
   bedSolid    : bool,        // inside a disc: the bowl face here is steeper than a powder bed can hold
   plant       : PlantCol,    // the tile plant whose footprint covers this column
@@ -3489,6 +3510,7 @@ fn genColumn(x : i32, z : i32, seed : u32) -> Col {
     lab.shore.past = 0;
     lab.shore.surf = -1;
     lab.shore.wp = 0u;
+    lab.nearWater = false;
     lab.wp = 0u;
     lab.bedSolid = false;
     lab.plant.mat = MAT_AIR;
@@ -3541,6 +3563,11 @@ fn genColumn(x : i32, z : i32, seed : u32) -> Col {
       shore.onShore = false;
     }
   }
+  // Deliberately NOT gated on the bluff cut above, nor on the treeline: this is
+  // the geometric question ("is this column's ground the wall of a bowl someone
+  // dug"), not the ecological one. See Col.nearWater.
+  let nearWater = L.near.onShore &&
+                  L.near.past < wmWaterI(L.near.wp, WM_W_SHORE_BAND);
 
   var col : Col;
   col.h = h;
@@ -3554,10 +3581,92 @@ fn genColumn(x : i32, z : i32, seed : u32) -> Col {
   col.inPoolFloor = L.inPoolFloor;
   col.inRim = L.inRim;
   col.shore = shore;
+  col.nearWater = nearWater;
   col.wp = L.wp;
   col.bedSolid = L.bedSolid;
   col.plant = plantColumnAt(x, z, seed, biome);
   return col;
+}
+
+// ---- A LOOSE COVER HAS TO BE BORN AT REST ---------------------------------
+//
+// Worldgen's contract (the magma-table note below) is that generated matter is
+// generated AT REST: a cell the CA would move on tick 0 is a chunk that never
+// sleeps, and rule 2 of CLAUDE.md is that cost scales with activity. Every
+// other loose layer already honours it -- the sediment wedge is slope-gated in
+// landAt, and the mud ring and the grass skin are deliberately SOLID because
+// "a powder shell on a slope avalanches out from under itself".
+//
+// The sand cap and a POWDER ground skin were the two that did not. Measured on
+// raw worldgen output (--voxdump, no CA): 1,249 of 10,539 sand cells in a
+// 128x96x128 box at the authored lake had a legal down-move on tick 0 and 418
+// of those went straight into the water, which is why freshly streamed lake
+// terrain stayed awake for seconds. The water itself is born perfectly at rest;
+// it only churned because the bank fell into it.
+//
+// The fix is not to delete the cap -- a desert wants loose sand where loose
+// sand can lie -- but to split it in two, exactly the way the sediment wedge is
+// split: `looseCoverDepth` ramps the powder part to zero on the SAME gate
+// (`(sedSlope - slope) / sedSlope`, slope in Q8 where 256 = 1 voxel/column ==
+// the CA's angle of repose, knob worldgen.sedSlope), and whatever the ramp
+// takes away becomes the biome's firm cover instead. On flat ground the ramp
+// returns the full authored depth and NOTHING changes.
+//
+// `Col.nearWater` is the second half and it is not an approximation. A water
+// body's bank is CUT, not eroded: bermLift forces h up to surf + bermHeight
+// inside the shore band, and the bowl is excavated out from under the band's
+// inner edge. Neither wall is in the noise field at all, so `slope` reads a
+// 17-voxel cliff as the level plateau it was cut from. The analytic gradient
+// can never see it; the shore band can, so inside the band loose depth is 0.
+//
+// It reads `nearWater` and NOT `shore.onShore` because the latter carries the
+// shore feature's BLUFF CUT, which turns itself off on a column standing well
+// above the waterline -- correct for a marsh fringe, and exactly backwards
+// here, since a bluff over a lake is the tallest cut wall in the world. Using
+// the filtered flag left 76 sand cells poised over a 17-voxel drop into the
+// authored lake: the same bug, one tick later.
+// The CA's angle of repose in landform-gradient units: sim_step slides a
+// powder into any free down-diagonal, so the steepest pile it holds is one
+// voxel per column = 256 in the Q8 slope Land carries. Declared here and not
+// in common.wgsl: only this kernel reads it (the common.wgsl compile cliff).
+const CAP_REPOSE_Q8 : i32 = 256;
+
+fn looseCoverDepth(col : ptr<function, Col>, depth : i32) -> i32 {
+  // Every AUTHORED discontinuity, none of which is in the noise field:
+  //   nearWater -- a water body's bermed / excavated bank (see above)
+  //   inRim     -- the annulus of an authored pool, a forced cylinder wall.
+  //                Measured: 76 of the 164 grains left on the first cut of
+  //                this gate stood on the lip of the (420,420) pool's rim
+  //                over a 41-voxel drop into its water. `inRim` is already
+  //                what the snow cap, the caves and the sediment wedge use
+  //                to mean "this ground was placed, not grown".
+  if ((*col).nearWater || (*col).inRim) { return 0; }
+  // A CLAMPED taper, not a straight line from slope 0. Full authored depth up
+  // to worldgen.sedSlope (the ground the sediment wedge already calls flat),
+  // then tapering to zero at the CA's OWN angle of repose -- 256 Q8 = 1
+  // voxel/column, the constant sim_step's diagonal slide defines. Both ends
+  // were measured and both are wrong alone: a straight ramp to sedSlope (96)
+  // stripped 87% of the dune field's loose cells for ground that holds sand
+  // fine, and a straight ramp to repose kept one thin loose voxel on rough
+  // near-repose faces where the detail octaves' +-2 steps shed it anyway.
+  // The taper's start is the wedge's knob on purpose (one definition of
+  // "flat"); its END is not a knob, because repose is the CA's constant, not
+  // an aesthetic.
+  let flat = wmTerrain(WM_H_TERRAIN_SED_SLOPE);
+  let span = max(CAP_REPOSE_Q8 - flat, 1);
+  return clamp((depth * (CAP_REPOSE_Q8 - (*col).slope)) / span, 0, depth);
+}
+
+// The material the ramp above hands the rest of the cap to: the biome's
+// authored cover.firmSkin (WM_B_FIRM_COVER; desert and ocean say `sandstone`).
+// A biome that authored none keeps its subsoil where that is already a solid,
+// and otherwise gets stone -- either way a SOLID, which is the whole point.
+fn coverFirmMat(biome : u32) -> u32 {
+  let firm = wmBiome(biome, WM_B_FIRM_COVER);
+  if (firm != MAT_AIR) { return firm; }
+  let sub = wmBiome(biome, WM_B_SUBSOIL);
+  if (sub != MAT_AIR && materials[sub].klass == CLASS_SOLID) { return sub; }
+  return M_STONE;
 }
 
 // ---- THE CELL HALF: everything that actually depends on y -----------------
@@ -3644,7 +3753,15 @@ fn genCellIn(col : ptr<function, Col>,
       if (bedSolid) { bed = wmWater(wp, WM_W_BED_SUBSTRATE); }
       mat = select(bed, select(M_SAND, M_STONE, bedSolid), bed == 0u);
     } else if (wmFlag(biome, WM_BF_SAND_CAP) && y > h - 4) {
-      mat = M_SAND;                        // loose cap — avalanches into repose piles
+      // The loose cap, but only as deep as this column's ground can HOLD loose
+      // matter (looseCoverDepth above). Flat desert: loose == 4 and every cell
+      // here is sand, unchanged. At or past the angle of repose, or anywhere on
+      // a pond's berm wall: loose == 0 and the whole cap is the firm material,
+      // so a cut bank reads as sandstone rock instead of as sand that has not
+      // fallen yet. In between the two split at the ramp, which is what a real
+      // dune face looks like anyway.
+      let loose = looseCoverDepth(col, 4);
+      mat = select(coverFirmMat(biome), M_SAND, y > h - loose);
     } else if (shore.onShore && shore.past < wmWaterI(wp, WM_W_MUD_WIDTH) &&
                y > h - 2) {
       // WET MUD, in the inner ring only. This is the transition the whole
@@ -3668,9 +3785,25 @@ fn genCellIn(col : ptr<function, Col>,
     } else if (y > h - i32(wmBiome(biome, WM_B_SKIN_DEPTH))) {
       // The biome's ground skin (assets/biomes/<name>.json cover.skin /
       // skinDepth): grass on the forest floor, snow on the tundra, mud in the
-      // marsh. A SOLID, for the reason the sediment note below gives -- a
-      // powder skin on a slope avalanches out from under itself.
-      mat = wmBiome(biome, WM_B_SKIN);
+      // marsh. USUALLY a solid, for the reason the sediment note below gives --
+      // a powder skin on a slope avalanches out from under itself.
+      //
+      // But desert and ocean author `sand`, a POWDER, and nothing stopped that
+      // one from being laid down a cliff. So the skin gets the same split the
+      // cap above gets -- gated on the AUTHORED CLASS, and ONLY where the
+      // biome has authored a cover.firmSkin. The opt-in is the author's veto:
+      // tundra's skin is snow, also a powder, and firming a tenth of the
+      // tundra to subsoil broke its own authored claim ("99% of columns wear
+      // snow at y == h", the env-truth gate) for a settle transient tundra
+      // has always accepted. A biome that WANTS its powder skin held at rest
+      // authors the firm material; one that does not is bit-identical to
+      // before, exactly like a solid skin.
+      let skin = wmBiome(biome, WM_B_SKIN);
+      let depth = i32(wmBiome(biome, WM_B_SKIN_DEPTH));
+      let loose = select(depth, looseCoverDepth(col, depth),
+                         skin != MAT_AIR && materials[skin].klass == CLASS_POWDER &&
+                         wmBiome(biome, WM_B_FIRM_COVER) != MAT_AIR);
+      mat = select(coverFirmMat(biome), skin, y > h - loose);
     } else if (y > h - sed) {
       // NOT ON A FIXTURE PAD. The pad keeps its authored loose SAND cap on
       // purpose ("avalanches into repose piles"), but the four voxels under it
