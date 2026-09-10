@@ -4212,6 +4212,24 @@ int main(int argc, char** argv) {
   std::string voxdumpArgs;
   std::string voxdumpOut = "build/voxregion.bin";
   bool voxserve = false;
+  // ---- THE OP RECORD, ON THE COMMAND LINE (PLAN_multiplayer_now N3/N5) ----
+  //
+  // N3 built the recorder but could not wire these two flags: main.cpp was
+  // claimed, so recording was reachable only through SANDVOX_RECORD_OPS and
+  // only from `selftest::Run`. That left the one path the record exists FOR —
+  // the game's own frame loop — unrecordable, and it is the path whose
+  // per-tick input a network layer will have to carry.
+  //
+  // `--record-ops <file>` arms the recorder for whatever mode this invocation
+  // runs (the windowed game, `--frames`, `--sweep`, `--selftest`); it is the
+  // env var with an argv door, and it wins over the env var when both are set.
+  // `--replay-ops <file>` is a MODE: no window, no player, no frame loop — it
+  // loads the record, boots worldgen from the seed in the header and feeds
+  // SubmitTick the recorded frames, which is the `ops-replay` gate's drive
+  // loop pointed at a file the game wrote instead of a scene the gate scripted.
+  std::string recordOpsPath;
+  std::string replayOpsPath;
+  uint32_t replayTicks = 0;  // --ticks N: stop the replay after N frames
   selftest::Options stOpt;
   for (int i = 1; i < argc; i++) {
     std::string a = argv[i];
@@ -4233,6 +4251,10 @@ int main(int argc, char** argv) {
           "  --budget-arms p,q     Only these --render-budget arms (e.g. baseline,noshadow)\n"
           "  --sweep sim.X=a,b,c   In-process parameter sweep (hash per value)\n"
           "  --sweep-gate <name>   Gate for --sweep (default: determinism)\n\n"
+          "Op record (sim/oprecord.h — the MutationQueue as a replay log):\n"
+          "  --record-ops <file>   Record every tick this run submits\n"
+          "  --replay-ops <file>   Replay a record headlessly, hash every 15 ticks\n"
+          "  --ticks <N>           Stop --replay-ops after N recorded ticks\n\n"
           "Shot / screenshot modes:\n"
           "  --shot                Screenshot-only look iteration\n"
           "  --shot-fluid          MPM fluid screenshot mode\n"
@@ -4639,6 +4661,18 @@ int main(int argc, char** argv) {
       voxdumpOut = argv[++i];
     }
     else if (a == "--voxserve") voxserve = true;
+    else if (a == "--record-ops") {
+      if (i + 1 >= argc) { std::fprintf(stderr, "--record-ops requires a path\n"); return 1; }
+      recordOpsPath = argv[++i];
+    }
+    else if (a == "--replay-ops") {
+      if (i + 1 >= argc) { std::fprintf(stderr, "--replay-ops requires a path\n"); return 1; }
+      replayOpsPath = argv[++i];
+    }
+    else if (a == "--ticks") {
+      if (i + 1 >= argc) { std::fprintf(stderr, "--ticks requires a count\n"); return 1; }
+      replayTicks = (uint32_t)std::max(0, std::atoi(argv[++i]));
+    }
     else {
       std::fprintf(stderr, "unrecognized argument: '%s'\n"
                            "Run with --help for usage.\n", a.c_str());
@@ -5323,6 +5357,77 @@ int main(int argc, char** argv) {
                          shotStrikeA, shotStrikeStyle, shotStrikeB,
                          shotStrikeTail);
   if (rebaseline) stOpt.rebaseline = true;
+
+  // ---- --replay-ops <file> [--ticks N]: the record, played back ------------
+  //
+  // The `ops-replay` gate's pass B, pointed at a file somebody else wrote. It
+  // is a MODE and it returns: no window, no player, no frame loop, so what
+  // reproduces the world is the record and nothing else. SetReplay also arms
+  // the TickParams comparison inside SubmitTick, which is the interesting half
+  // — it asserts that every per-tick knob (wind, day phase, the fluid gates,
+  // the water bodies) is a pure function of the recorded input rather than of
+  // some CPU state the replay does not have.
+  //
+  // Checked BEFORE --record-ops arms anything: replaying into a recorder would
+  // append the replay's own frames to whatever file argv named.
+  if (!replayOpsPath.empty()) {
+    namespace ops = sandvox::opstream;
+    ops::Log log;
+    std::string err;
+    if (!log.Load(replayOpsPath, mats, err)) {
+      std::fprintf(stderr, "--replay-ops: %s\n", err.c_str());
+      return 1;
+    }
+    std::printf("=== replay %s: %zu frames, seed %u, record version %u ===\n",
+                replayOpsPath.c_str(), log.frames.size(), log.header.seed,
+                log.header.version);
+    // A harness tick has to block for its readback the way a game frame's
+    // pacing does, or World::Snap() never becomes valid (test/support.h).
+    SetHarnessSnapshotDrain(true);
+    ops::ResetReplayStats();
+    ops::SetReplay(&log);
+    SubmitWorldgen(ctx, world, sim, log.header.seed);
+    ctx.WaitIdle();
+    constexpr uint32_t kProbeEvery = 15;
+    uint32_t played = 0, lastHash = 0;
+    for (const ops::Frame& f : log.frames) {
+      if (replayTicks && played >= replayTicks) break;
+      SubmitTick(ctx, world, sim, f.in.tick, f.in.seed, f.ops, f.exps, f.cells,
+                 f.in.hashEnable != 0,
+                 {f.in.playerChunk[0], f.in.playerChunk[1], f.in.playerChunk[2]},
+                 f.in.wantReadback != 0, f.in.particlesActive != 0, f.spawns,
+                 f.in.farCount, f.fluid, f.in.fluidLive,
+                 f.in.hasSplashMat ? f.in.fluidSplashMat : nullptr,
+                 f.in.vizActive != 0);
+      played++;
+      if (f.in.tick % kProbeEvery == 0 || played == log.frames.size()) {
+        lastHash = ReadHashSync(ctx, world);
+        std::printf("  tick %6u  hash %08x\n", f.in.tick, lastHash);
+      }
+    }
+    ops::SetReplay(nullptr);
+    const uint32_t miss = ops::ReplayParamMismatches();
+    std::printf("replay: %u ticks, final hash %08x, TickParams words rebuilt "
+                "differently: %u%s\n",
+                played, lastHash, miss,
+                miss ? "  *** a per-tick knob is read from outside the input "
+                       "stream ***"
+                     : "");
+    return miss ? 1 : 0;
+  }
+
+  // ---- --record-ops <file>: arm the recorder for whatever runs below ------
+  // Before the sweep, the selftest and the frame loop, so all three record.
+  // The env var stays as N3 left it; argv wins when both name a file.
+  if (!recordOpsPath.empty()) {
+    std::string err;
+    if (!sandvox::opstream::StartRecording(recordOpsPath, kDefaultSeed, mats,
+                                          err)) {
+      std::fprintf(stderr, "--record-ops: %s\n", err.c_str());
+      return 1;
+    }
+    std::printf("op record: writing %s\n", recordOpsPath.c_str());
+  }
 
   // --sweep sim.X=a,b,c [--sweep-gate <gate>]: run the determinism check at
   // each value, in-process, without touching any files. Proves a tuning knob
@@ -13582,6 +13687,16 @@ int main(int argc, char** argv) {
     }
   }
 
+  // Close the op record explicitly rather than leaving it to the CRT: a
+  // `--frames` run that is killed by the harness would otherwise lose the
+  // buffered tail, and the whole use of this file is a byte-for-byte compare.
+  if (sandvox::opstream::Recording()) {
+    std::printf("op record: %u frames, %llu bytes -> %s\n",
+                sandvox::opstream::RecordedFrames(),
+                (unsigned long long)sandvox::opstream::RecordedBytes(),
+                recordOpsPath.c_str());
+    sandvox::opstream::StopRecording();
+  }
   telemetry.Shutdown();
   ctx.WaitIdle();
   // Windowed Vulkan: print (and count) everything the debug messenger
