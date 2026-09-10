@@ -14,6 +14,7 @@
 #include <nlohmann/json.hpp>
 
 #include "sim/biomes.h"
+#include "sim/intmath.h"   // the landform bake's integer sine/sqrt (no libm)
 #include "sim/rng.h"
 #include "sim/tuning.h"
 #include "sim/voxload.h"
@@ -198,20 +199,43 @@ BiomeTerrainPacked PackBiomeTerrain(const biomes::BiomeDef& b) {
 //            turned `rotation` degrees, so it reads as a range with a crest
 // The value is accumulated in whole units and clamped to the byte at the end,
 // so a peak painted over a basin sums rather than replaces.
+//
+// INTEGER, AND WHY. This bake used to run in doubles with libm cos and sin on
+// the ridge rotation. The plane it writes is read by worldgen — by the shader
+// AND by the CPU height twin — so one byte that differs between two machines
+// is a terrain that differs between two machines, which is a desync no gate on
+// one box can see. libm is not specified to be correctly rounded and is not
+// bit-identical across platforms or compiler versions, so the bake is now
+// integer end to end: imath::BamFromDegreesI turns whole degrees into an exact
+// BAM (90 degrees really is a quarter turn), imath's Q30 sine replaces libm's,
+// distances come out of an exact integer sqrt, and the accumulator is Q16.16
+// landform units rounded half-up at the end. See docs/PLAN_multiplayer_now.md
+// L6. `+ - * / sqrt` on floats WOULD have been safe (IEEE specifies them
+// exactly, which is why ProfileAt above still uses std::sqrt); cos and sin are
+// the two that are not.
 void OverlayLandformSites(const std::vector<LandformSite>& sites, int landformRangeVox,
                           int cellLog2, int width, int height, int originCellX, int originCellZ,
                           std::vector<uint8_t>& landform) {
   if (sites.empty() || landform.size() != static_cast<size_t>(width) * height) return;
-  const double unitsPerVox = 256.0 / static_cast<double>(std::max(1, landformRangeVox));
-  const int half = 1 << (cellLog2 - 1);
-  std::vector<double> acc(landform.size());
-  for (size_t i = 0; i < landform.size(); i++) acc[i] = landform[i];
+  const int64_t range = std::max(1, landformRangeVox);
+  const int64_t half = 1 << (cellLog2 - 1);
+  // Q16.16 landform units. The plane's own bytes seed it, so a site adds to
+  // what the author painted rather than replacing it.
+  std::vector<int64_t> acc(landform.size());
+  for (size_t i = 0; i < landform.size(); i++) acc[i] = static_cast<int64_t>(landform[i]) << 16;
   for (const LandformSite& st : sites) {
-    const double r = std::max(1, st.radius);
-    const double amp = std::fabs(static_cast<double>(st.heightVox)) * unitsPerVox * (st.shape == "basin" ? -1.0 : 1.0);
-    if (amp == 0.0) continue;
-    const double ang = st.rotation * 3.14159265358979323846 / 180.0;
-    const double ca = std::cos(ang), sa = std::sin(ang);
+    const int64_t r = std::max(1, st.radius);
+    const int64_t hv = st.heightVox < 0 ? -static_cast<int64_t>(st.heightVox)
+                                        : static_cast<int64_t>(st.heightVox);
+    // heightVox * 256 / range landform units, Q16.16; a basin sinks the plane.
+    int64_t ampQ = imath::DivRound(hv * 256 * 65536, range);
+    if (st.shape == "basin") ampQ = -ampQ;
+    if (ampQ == 0) continue;
+    const uint32_t rotBam = imath::BamFromDegreesI(st.rotation);
+    const int64_t ca = imath::CosQ30(rotBam), sa = imath::SinQ30(rotBam);
+    // The ridge's cross-crest semi-axis, radius / 3, kept as Q16.16 so the
+    // thirds are not thrown away on a small footprint.
+    const int64_t bQ = std::max<int64_t>(65536, (r * 65536) / 3);
     // cells the footprint can reach, +1 for the ridge's rotated corners
     int c0x, c0z, c1x, c1z;
     const auto cellOf = [&](int x, int z, int* cx, int* cz) {
@@ -224,27 +248,46 @@ void OverlayLandformSites(const std::vector<LandformSite>& sites, int landformRa
     c1x = std::min(c1x + 1, width - 1); c1z = std::min(c1z + 1, height - 1);
     for (int cz = c0z; cz <= c1z; cz++)
       for (int cx = c0x; cx <= c1x; cx++) {
-        const double wx = ((cx - originCellX) << cellLog2) + half;
-        const double wz = ((cz - originCellZ) << cellLog2) + half;
-        const double dx = wx - st.x, dz = wz - st.z;
-        double t;
+        const int64_t wx = (static_cast<int64_t>(cx - originCellX) << cellLog2) + half;
+        const int64_t wz = (static_cast<int64_t>(cz - originCellZ) << cellLog2) + half;
+        const int64_t dx = wx - st.x, dz = wz - st.z;
+        int64_t tQ;  // normalised distance from the centre, Q16.16
         if (st.shape == "ridge") {
-          // into the ridge's frame: `u` along the crest, `v` across it
-          const double u = dx * ca + dz * sa, v = -dx * sa + dz * ca;
-          const double a = r, b = std::max(1.0, r / 3.0);
-          t = std::sqrt((u * u) / (a * a) + (v * v) / (b * b));
+          // into the ridge's frame: `u` along the crest, `v` across it. The
+          // Q30 sine times a whole-voxel offset is a Q30 length; >>14 (rounded,
+          // never a bare arithmetic shift, which would floor both signs the
+          // same way and drag the crest one way) lands it in Q16.16.
+          const int64_t uQ = imath::DivRound(dx * ca + dz * sa, 1 << 14);
+          const int64_t vQ = imath::DivRound(-dx * sa + dz * ca, 1 << 14);
+          const int64_t ru = imath::DivRound(uQ, r);         // u / a, Q16.16
+          const int64_t rv = imath::DivRound(vQ << 16, bQ);  // v / b, Q16.16
+          // Two Q16.16s squared make a Q32.32; its exact integer sqrt is a
+          // Q16.16 again, with no intermediate rounding to argue about.
+          tQ = static_cast<int64_t>(imath::Sqrt64(static_cast<uint64_t>(ru * ru + rv * rv)));
         } else {
-          t = std::sqrt(dx * dx + dz * dz) / r;
+          const uint64_t d2 = static_cast<uint64_t>(dx * dx + dz * dz);
+          tQ = imath::DivRound(static_cast<int64_t>(imath::Sqrt64(d2 << 32)), r);
         }
-        if (t >= 1.0) continue;
-        double f;
-        if (st.shape == "plateau") f = t <= 0.6 ? 1.0 : 1.0 - (t - 0.6) / 0.4;
-        else f = 1.0 - t;
-        acc[static_cast<size_t>(cz) * width + cx] += amp * f;
+        if (tQ >= 65536) continue;
+        int64_t fQ;
+        if (st.shape == "plateau") {
+          // 1 inside 0.6, then 1 - (t - 0.6) / 0.4 == (5 - 5t) / 2. Written as
+          // exact fifths rather than as 0.6/0.4 rounded into Q16.16, so the
+          // flat top ends exactly where the comment above says it does.
+          fQ = (5 * tQ <= 3 * 65536) ? 65536 : imath::DivRound(5 * (65536 - tQ), 2);
+        } else {
+          fQ = 65536 - tQ;
+        }
+        acc[static_cast<size_t>(cz) * width + cx] += imath::MulShiftRound(ampQ, fQ, 16);
       }
   }
-  for (size_t i = 0; i < landform.size(); i++)
-    landform[i] = static_cast<uint8_t>(std::clamp(static_cast<int>(std::lround(acc[i])), 0, 255));
+  for (size_t i = 0; i < landform.size(); i++) {
+    // Explicit integer half-up: +0.5 then floor, the floor being the
+    // arithmetic shift. Written out rather than left to std::lround because
+    // the rounding MODE is part of the byte the whole world reads.
+    const int64_t v = (acc[i] + 32768) >> 16;
+    landform[i] = static_cast<uint8_t>(std::clamp<int64_t>(v, 0, 255));
+  }
 }
 
 namespace {

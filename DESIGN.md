@@ -2131,7 +2131,15 @@ const-eval block at the top of `sim_fluid.wgsl` (IEEE-exact folding, so
 identical JSON yields identical solver constants everywhere; the kernel never
 sees a runtime float). This is the one documented exception to "sim.* is
 integer-only"; LoadTuning clamps the human values to ranges whose conversions
-satisfy the kernel's i32 overflow audit. All fixed-point multiplies truncate
+satisfy the kernel's i32 overflow audit. **"IEEE-exact" means `+ - * / sqrt
+round` and nothing else, and it was not literally true until 2026-09-10**:
+`FLUID_FOAM_DECAY` took the substep-th root of the per-tick survival with
+`exp(log(x)/N)`, and a const block folds on the HOST's libm, which is not
+specified to be correctly rounded. It is now the per-substep Euler rate
+`1 - 1/(life*30*SUBSTEPS)` — the same first order as the per-tick form it was
+rooting, 65426 against 65425 in Q16 at the shipped 2.2 s and 9 substeps — and
+no transcendental remains in any const block in the engine
+(`docs/PLAN_multiplayer_now.md` L6). All fixed-point multiplies truncate
 on the MAGNITUDE (round toward zero): flooring negative products biased every
 force toward -x/-y/-z and the whole fluid crept along that diagonal on a flat
 floor.
@@ -2919,6 +2927,22 @@ an elongated cone at a heading, a sunk cone, a flat top ramped out, in
 landform units of `landformRangeVox / 256` voxels each), so the shader reads
 the plane exactly as before and nothing new enters the mirror. Tier A: no
 seed anywhere near it. The shipped map declares `east_range`.
+
+**The bake is INTEGER (2026-09-10, `docs/PLAN_multiplayer_now.md` L6).** It ran
+in doubles with libm cos/sin on the ridge rotation until then, and the plane it
+writes is read by both worldgen mirrors — so one byte that differed between two
+machines was a terrain that differed between two machines, which no gate on a
+single box can see. `OverlayLandformSites` now converts whole degrees to an
+exact BAM (`imath::BamFromDegreesI`, so `rotation: 90` really is a quarter
+turn), takes its sine from `src/sim/intmath.h`'s Q30 BAM polynomial, its
+distances from an exact integer sqrt, and accumulates in Q16.16 landform units
+rounded half-up at the end. `+ - * / sqrt` on floats would have been safe — IEEE
+specifies them exactly, which is why the water-preset `ProfileAt` sampling still
+uses `std::sqrt` — but cos and sin are not specified to be correctly rounded and
+are not bit-identical across platforms. Measured on the shipped map the change
+is the identity (0 of 38,416 bytes move); over 40 randomised site sets (all four
+shapes, radii 3..30,000, rotations ±720°) the worst case is 4 bytes moving by
+exactly 1.
 
 **The ground flora is rows.** The shader's hard-coded undergrowth / flower
 chain (mushrooms under crowns, brambles, moss, saplings, litter; flowers, tall
@@ -10365,13 +10389,30 @@ the same wind with bigger gusts.
 
 `windSampleAt` / `windAt` live in **`assets/shaders/common.wgsl`**, which is
 prepended to every shader, so the field is in scope everywhere without being
-copied anywhere. The evolving weather comes from **`WindWeather`
+copied anywhere. The evolving weather comes from **`WindWeatherQ`
 (`src/sim/wind.h`)** — a pure function of (tuning, seed, tick) that holds no
 state and integrates nothing, so asking for tick 90,000 costs the same as tick
-1 and gives the same answer on every machine. Its three outputs ride
-`RenderParams` today and will also ride `TickParams` in phase 4 (the `dayPhase`
-precedent: CPU-computed inputs that replay and the determinism gates must
-capture belong on the tick input stream).
+1 and gives the same answer on every machine. Its four outputs ride
+`TickParams` (phase 4) and `RenderParams` (the `dayPhase` precedent:
+CPU-computed inputs that replay and the determinism gates must capture belong
+on the tick input stream).
+
+**That weather is INTEGER end to end as of 2026-09-10
+(`docs/PLAN_multiplayer_now.md` L6), and the direction of the dependency is now
+the other way round.** It used to be computed in floats — libm cos, sin and
+atan2 — and quantised to Q16.16 at the end, on the argument that quantisation
+made libm's cross-platform wobble harmless. That argument was probabilistic,
+and once `sim.windMode` shipped at 1 the four words became a per-tick INPUT to
+the CA: one machine rounding one of them differently desyncs a session
+silently, for as long as it runs. So `WindWeatherQ` is now the producer —
+Q24 draws off the same `hash3` stream, headings as BAM32 angles, the epoch
+blend as a vector lerp normalised with an exact integer sqrt, `intmath.h`'s Q30
+sine in place of libm's — and `WindWeather` is a VIEW of it that divides the
+integers out into the floats `RenderParams` wants. Nothing derives the weather
+twice. The draw MASK was kept at `h & 0x00FFFFFF`, the one `rng::Unit01` used,
+so this is a change of arithmetic and not of weather: the same seed draws the
+same headings and the same storms, and the four Q16.16 words differ from the
+float ones by at most 1 LSB (3 on gust) over 30,770 sampled ticks.
 
 ### Invariants
 

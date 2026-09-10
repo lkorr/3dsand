@@ -178,13 +178,27 @@ const FLUID_SPRAY_RHO : i32 =
 const FLUID_FOAM_FULL : i32 = 65536;
 const FLUID_FOAM_GAIN : i32 = 26214;   // 0.4 per full-potential substep
 // Per-SUBSTEP survival, Q16. Applied once per substep in gridUpdate, it
-// compounds over FLUID_SUBSTEPS to the per-tick survival implied by the foam
-// lifetime — so the tuner's "seconds" really are seconds. Expressed as the
-// substep-th root via exp/log at const-eval time (the shader compiler folds
-// it; no float ever reaches the kernel).
-const FLUID_FOAM_DECAY : i32 = i32(round(65536.0 *
-    exp(log(max(1.0 - 1.0 / max(TUNE_FLUID_FOAM_LIFE * 30.0, 2.0), 0.001)) /
-        f32(FLUID_SUBSTEPS))));
+// compounds over FLUID_SUBSTEPS to the per-tick survival the foam lifetime
+// implies — so the tuner's "seconds" really are seconds.
+//
+// FIRST-ORDER, DELIBERATELY. This used to be the exact FLUID_SUBSTEPS-th root
+// of the per-tick survival, taken with exp(log(x)/N). But the per-tick
+// survival it was rooting is ITSELF the Euler form 1 - 1/(life*30), so an
+// exact root was precision laid on top of an approximation. The per-substep
+// Euler rate 1 - 1/(life*30*SUBSTEPS) compounds to the same per-tick decay to
+// the same order — 65426 against the old 65425 in Q16 at the shipped 2.2 s and
+// 9 substeps, one part in 65,000 — and it uses nothing but `-`, `*`, `/` and
+// `round`, all of which IEEE specifies exactly.
+//
+// exp and log do not have that guarantee, and this was the LAST transcendental
+// in any const block in the engine. A const block folds on whichever host
+// compiles the shader, so two machines could have disagreed on this integer,
+// and foam reaches stain, which is hashed state — a silent cross-machine
+// desync in a value no gate on one box can see. docs/PLAN_multiplayer_now.md
+// L6; the same argument retired the libm calls in sim/wind.h and the world-map
+// landform bake.
+const FLUID_FOAM_DECAY : i32 = i32(round(65536.0 - 65536.0 /
+    max(TUNE_FLUID_FOAM_LIFE * 30.0 * f32(FLUID_SUBSTEPS), 2.0)));
 // ---- wind on the grid (docs/RESEARCH_wind.md §4.6, phase 3) ----------------
 // Same const-eval discipline as every row above: human units in tuning.json,
 // integers here, nothing but i32 in the kernel.

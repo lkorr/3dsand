@@ -624,3 +624,39 @@ throughout — the sim reproduces itself; only the recorded number is behind.
 Do not chase `ee34787c`, and do not hand-edit it in to silence the line: the
 refusal is the guard that stops a real regression being rebaselined away, and
 routing around it by hand is the one thing it cannot defend against.
+
+## 2026-09-10 — `determinismHash` eb284643 -> 6a5a1468 (N4: the CPU's wind weather and the landform bake go integer)
+
+`docs/PLAN_multiplayer_now.md` L6. Three libm calls sat between the seed and
+hashed state, on the CPU side of the determinism boundary, where nothing that
+runs twice on one machine can see them:
+
+- `WindWeather` (`src/sim/wind.h`) computed the per-tick weather with cos, sin
+  and atan2 and quantised four scalars to Q16.16. `sim.windMode` ships at 1, so
+  those four words are a per-tick INPUT to the CA.
+- `OverlayLandformSites` (`src/sim/worldmap.cpp`) baked the declared landforms
+  into the map's byte plane with cos and sin on the ridge rotation.
+- `FLUID_FOAM_DECAY` (`sim_fluid.wgsl`) took an Nth root with `exp(log(x)/N)`
+  in a const block, which folds on the host's libm. Foam reaches stain, which
+  is hashed.
+
+All three are now integer (`src/sim/intmath.h`, new: a Q30 BAM sine, an exact
+`Sqrt64`, and sign-symmetric rounding helpers). The hash moved because the
+arithmetic did, by design.
+
+**How far it moved, measured before the run rather than guessed:**
+
+| what | delta |
+|---|---|
+| landform bytes, shipped map | **0 of 38,416** — the integer bake is the identity here |
+| landform bytes, 40 randomised site sets (all 4 shapes, radii 3..30,000, rotations +-720 deg) | worst case **4 of 38,416, all by exactly 1** |
+| the four wind words vs the float ones, 30,770 sampled ticks | **<= 1 Q16.16 LSB** (3 on gust) |
+| `FLUID_FOAM_DECAY` at the shipped 2.2 s / 9 substeps | 65425 -> **65426** |
+
+The draw mask stayed `h & 0x00FFFFFF` — the one `rng::Unit01` used — so the
+same seed still draws the same headings and the same storm epochs. This is a
+change of arithmetic, not a change of weather.
+
+The twice-run comparison PASSED throughout (`determinism: ... sim reproduces
+itself`); only the recorded number moved. `--gate determinism --rebaseline`
+wrote the pin: 0 gates changed status, 0 page faults over the suite.
