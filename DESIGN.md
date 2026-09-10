@@ -3512,7 +3512,7 @@ and the projectile dies when it is spent; lifetimes, live projectile counts,
 multiplicity, fan count and generation are capped in `glyphs.json` and clamped
 against engine ceilings at load.
 
-#### The grammar (docs/PLAN_magic_grammar.md §1–§3; `ParseSpell`, `LowerSpell`)
+#### The grammar (three rules; `ParseSpell`, `LowerBox`, `LowerSpell`)
 
 Hundreds of glyphs, uncountably many sequences, every one does the predictable
 literal thing, and nobody ever writes a rule for a specific combination. The
@@ -3521,83 +3521,175 @@ way to get that is the way programming languages get it: a handful of
 effect lowers to, and a **tariff** that prices what the spell does to the
 world rather than the words it used.
 
-Five sorts, declared per glyph in `glyphs.json` (`sort`): **Matter** (a
+Six sorts, declared per glyph in `glyphs.json` (`sort`): **Matter** (a
 material by name; `air` is the void, `anything` the wildcard), **Effect**
 (something that happens at a point: a `verb` plus parameters), **Delivery**
 (how an Effect reaches a point: `mech` instant | flight | continuous plus the
 record fields), **Mod** (a field edit on the delivery record: `field`, `op`,
 `amount`), **Operator** (a verb with argument slots — `left`/`right` list the
 sorts each accepts, `result` the sort produced; every unary operator takes the
-word BEFORE it, only `transmute` is infix). Nothing in C++ knows which words
-exist. The C++ vocabulary is the sort names, the verb names (`spray`, `place`,
-`convert`, `explode`, `wind`, `mend`, `trail`, `sustain`, `filter`, `repeat`)
-and the record field names — each verb maps to ONE op type or ONE engine seam,
-and `ApplySpellEffect` switches on the verb and nothing else.
+one item BEFORE it, only `transmute` is infix), and
+**Separator** (`also`, which ends one sentence and starts the next). Nothing
+in C++ knows which words exist. The C++ vocabulary is the sort names, the verb
+names (`spray`, `place`, `convert`, `explode`, `wind`, `mend`, `trail`,
+`sustain`, `filter`, `repeat`, `launch`) and the record field names — each verb
+maps to ONE op type or ONE engine seam, and `ApplySpellEffect` switches on the
+verb and nothing else.
 
-Six parse rules, and they are the whole grammar:
+**Three rules, and they are the whole grammar** (rewritten 2026-09-10; the
+2026-09-04 six-rule version is superseded, and `docs/PLAN_magic_grammar.md` §2
+R4/R6 and §11.4 are marked as such):
 
-- **R1 runs merge.** `shotgun shotgun shotgun` is `shotgun×3`; capped
-  (`budgets.maxMultiplicity`). Matter and Effects ADD (×N of the verb's declared
-  axis: spray voxels, explode power); Mods COMPOSE (applied again: shotgun
-  3/9/27, swift ×2/×4, float −1g/−2g).
-- **R2 operators bind their neighbours, greedily, on their declared side,**
-  left to right. A bound group is one item of the operator's result sort, and
-  the HUD's brackets are *derived from the binding*, so what you see is what
-  bound.
-- **R3 an operator with an empty required slot is INCOMPLETE:** charged its
-  word, does nothing, drawn as `_`. There are no defaults — `anything` and
-  `air` are words — so "unmake whatever is there" is spelled `anything
-  transmute air`.
-- **R4 a Delivery closes the clause.** `explosive projectile fire bomb` is two
-  casts. A second Delivery starts a new clause rather than replacing the first,
-  because that is the only total reading that never discards a spoken word.
-- **R5 a clause without a Delivery is delivered by `hand`,** at reach in front
-  of the caster. A bare `explosive` goes off there, and yes, it hurts.
-- **R6 order inside a bag does not matter.** Only operators (R2) and clause
-  boundaries (R4) are order-sensitive. The lowering rebuilds each clause from
-  its bag in a CANONICAL order (by key), because mods compose through integer
-  arithmetic that does not commute under clamping (49 halved then doubled is
-  48) — without that `swift slow` and `slow swift` would be two different
-  records and R6 would be a lie.
+- **1. A NOUN GOES INTO THE PILE.** A Matter word, an Effect word, or an
+  operator group whose result sort is Effect is pushed onto the PILE. Order
+  inside the pile does not matter: runs merge (`shotgun shotgun` is
+  `shotgun×2`, capped by `budgets.maxMultiplicity`), identical non-adjacent
+  items merge too, and the lowering rebuilds the pile in a CANONICAL order (by
+  key) because mods compose through integer arithmetic that does not commute
+  under clamping — 49 halved then doubled is 48. Matter and Effects ADD (×N of
+  the verb's declared axis); Mods COMPOSE.
+- **2. A DELIVERY BOXES THE PILE, AND SPEAKING CONTINUES.** The Delivery word
+  takes the WHOLE pile and wraps it into ONE Effect value of verb `launch`:
+  that delivery's `DeliveryRec`, the pile's Effects as its payload, the pile's
+  pending Mods stuck to its record. The pile becomes exactly that one value —
+  so a box is a noun again and can be boxed once more, taken by an operator, or
+  spoken beside other nouns. **Deliveries NEST, and word order is what decides
+  what is inside what.** `explosive projectile projectile` is a bolt that, when
+  it hits, fires a bolt that explodes. Deliveries are the one sort that does
+  NOT merge on repeat, precisely because each one boxes what is in front of it.
+- **3. A MOD STICKS TO THE BOX THAT CLOSES THE PILE.** A Mod word — or an
+  operator group of result sort Mod, which is `trail` — goes into the pile as
+  PENDING and is applied to the record of the NEXT delivery spoken. So
+  `explosive shotgun projectile` and `shotgun explosive projectile` are the
+  same three fanned exploding bolts, while `explosive projectile shotgun` is
+  one bolt fired from three fanned points and `explosive projectile shotgun
+  projectile` is three bolts that each fire one. With no delivery to close the
+  pile a mod sticks to `hand`, the implicit outermost delivery, where `shotgun`
+  is three fanned resolve points and `float` is the hop — and **every other mod
+  on the hand is a charged no-op**, named in the describe line ("`swift` is
+  wasted: it landed on your hand, which has no speed") rather than quietly
+  editing a field nobody reads.
 
-`ParseSpell` (R1–R4, R6) produces a `SpellTree`; `LowerSpell` turns each clause
-into a `SpellCast` — a `DeliveryRec` (the record Mods edit), a payload of
-`EffectInst`s, an instance count, the four rule-2 budgets and the price split
-into word / tariff / carry; `CastList` is what `Cast()` runs, what a projectile
-carries and what backfire runs. Every sequence lowers to a definite cast list;
-there is no misfire state, and the imprecision penalty lives entirely in the
-mana/health crossover.
+The outermost box is ALWAYS `hand`, so the whole utterance lowers to ONE cast —
+unless **`also`** is spoken. `also` is a new sort (`separator`, word cost 0):
+it closes the current pile as a finished cast, hand-delivered if no delivery
+closed it, and starts a new one. **Law L4 (cost additivity, union of emissions)
+attaches to `also`**, not to a delivery, because a delivery no longer ends
+anything.
+
+Unary operators (`trail`, `aura`, `echo`, `null`, `mend`) take the ONE item
+immediately before them, which may now be a launch box: `explosive projectile
+echo` is a turret and `explosive projectile aura self` a sustained status that
+fires a bolt every tick. `transmute` is still the one infix word. An operator
+with an empty required slot is still INCOMPLETE — charged, does nothing, drawn
+as `_`. `trail` still yields a Mod, so it is pending and sticks to the closing
+delivery, and its inner effect may itself be a launch; on any record that does
+not travel it is charged and does nothing.
+
+An **empty box** — a delivery spoken with nothing in front of it — is a carrier
+with an empty payload, which is today's kinetic hit (`impactRadius`). It is
+legal, total and priced.
+
+**`split` is gone.** `explosive projectile shotgun projectile` subsumes it and
+says what it does; the `children` field, `ModField::Children` and the resolve
+lambda's children branch went with it. `SpellFan` stayed.
+
+**A nested launch, at runtime.** `SpellVerb::Launch` is an `EffectInst` that
+carries a `DeliveryRec` and its payload in `inner`. `ApplySpellEffect` stays
+op-stream-only (thesis 1): a Launch appends a `SpellLaunchReq` to
+`SpellEmission::launches`, and `SpellSystem` adopts those at the end of `Cast()`
+and inside `Tick()` exactly the way it adopts statuses, echoes and filters
+(`AdoptLaunches`, then `Adopt`). Flights go through `Launch()`, bombs through
+`RequestBody()`, a nested `beam` runs ANCHORED — from the point along its
+direction for its tick cap, unheld, because that is the only bounded reading —
+and a nested `self` resolves its payload at the caster's body when the owner's
+`SpellBodyProbe::bodyPos` can say where that is, otherwise where the parent
+resolved. The drain loops (bounded by `maxGeneration + 2` passes) because an
+instant nested box resolves in place and may ask for carriers of its own.
+
+**Where a child launches from, and which way.** From the parent's LAST FREE
+position (the `from` in the resolve lambda — a child born inside the wall its
+parent hit would impact on its own first sub-step and chain), with direction =
+the parent's incoming direction REFLECTED off the surface it hit, per axis,
+using the same probe `bounce` uses. With no surface — a bomb at rest, a fuse
+resolve, an orb expiring, a `self` — it goes straight up. `shotgun` fans around
+that direction with the existing `SpellFan`.
+
+**Two bounds on a nest (rule 2).** Each nested launch is generation + 1 and
+nothing past `budgets.maxGeneration` launches — the existing check in
+`Launch()`, plus the same check in `AdoptLaunches`. And the LEAF instance count
+(the product of the fans down each path, summed over paths) is capped at
+`budgets.maxInstances`: a box whose fan would overrun it is clamped at lowering
+and the describe line says so. `SpellCast` carries `depth`, `leaves` and
+`instancesClamped` beside the four old numbers.
+
+**Price is recursive, and carry composes multiplicatively.** A launch effect's
+tariff is (payload tariff + trail tariff) × instances × the carry of its
+delivery, so a bolt that fires a bolt pays 3.0 × 3.0 on whatever the inner one
+finally does — which is exactly the "you are paying to move it twice" reading
+carry exists to give. Word costs sum over the whole tree. `priceUnknown`
+propagates. `CastList` still exposes wordCost / tariff / carryCost / manaCost;
+the tariff is the tree's base and the carry line is every premium in it.
+
+**Fatal casts FLATTEN.** `ApplySpellEffect` takes a `flatten` flag, and a Fatal
+outcome runs the payload at the caster with it set: every Launch resolves its
+own payload IN PLACE, recursively, and no carrier is created. So an overcast
+`explosive projectile projectile bomb` goes off in the chest with everything it
+was ever going to do. Law L11 asserts a Fatal cast emits no launches at all. A
+misfire (live-projectile cap, generation cap) flattens for the same reason.
+
+`ParseSpell` (the three rules, in one left-to-right pass — operator binding has
+to happen there, because the item to an operator's left may be a box a delivery
+just made) produces a `SpellTree` of `SpellNode`s that are now raw words,
+operator groups, or BOXES; `LowerSpell` calls `LowerBox` on each clause's root
+and recurses, turning each box into a `SpellCast` — a `DeliveryRec` (the record
+Mods edit), a payload of `EffectInst`s whose Launch entries are the nested
+boxes, an instance count, the rule-2 budgets and the price split into word /
+tariff / carry. Every sequence lowers to a definite cast list; there is no
+misfire state, and the imprecision penalty lives entirely in the mana/health
+crossover. The HUD's brackets are derived from the tree, so a box draws as
+`[ … DELIVERY]` and what you see is what nested.
 
 **The reference interpreter is the oracle.** `scripts/magic_grammar.py`
-implements R1–R6 over the same glyph table and generates
-`docs/MAGIC_PERMUTATIONS.md` (every word, every brief sentence, every pair over
-a 19-word alphabet, every triple over a 10-word core). `--oracle` writes
+implements the same three rules over the same glyph table and generates
+`docs/MAGIC_PERMUTATIONS.md` (the worked sets, every word, every brief
+sentence, every pair over a 19-word alphabet, every triple over a 10-word
+core), with a header metric per alphabet: orderings vs distinct spells vs
+distinct spells that do anything at all. `--oracle` writes
 `assets/spells/grammar_oracle.json`, and the `spells-oracle` gate parses every
 entry with the C++ and compares the bracket string and the clause structure.
 A row of the permutation table that reads wrong is a rule that is wrong; fix
-the rule in both places and regenerate.
+the rule in both places and regenerate. Never hand-edit the generated files.
 
 **The laws are the gate, not a pinned list.** The `spells` gate asserts
 algebraic properties over every sequence of length ≤ 3 drawn from that
 alphabet, generated in the test: L1 totality (non-empty cast list, finite
-cost, non-empty description), L2 bag commutativity (a permutation with the
-same canonical form lowers to an IDENTICAL cast list, compared field by
-field), L3 multiplicity (`g g` ≡ `g×2` exactly until the cap: spray voxels ×N,
-explode power ×N, a mod's field edited once more per word, cost monotone),
-L6 local binding (an operator's bound arguments do not change when a word is
-inserted anywhere that does not land inside or adjacent to ANY operator
-group's spoken span — "any", because greedy binding means a word dropped into
-another operator's slot region can steal its argument and free a word for this
-one; locality is about where the word lands relative to every binding), L4
-clause independence (`cost(A ‖ B) = cost(A) + cost(B)` and the casts are the
-union whenever the parse of A+B is the parses side by side), L7 tariff
-monotonicity (`A transmute B` non-decreasing in `arcane(B) − arcane(A)` and in
-volume; a spray in its voxel count), L5 delivery invariance (the payload of
-`E… projectile`, `E… bomb` and `E… self` is identical; only the record
-differs), L8 budgets (every lowered cast declares finite ticks, voxels,
-instances and generation). A change that breaks a law breaks a *class* of
-spells, which is what the line says; a change that moves one spell's numbers
-is a rebaseline.
+cost, non-empty description), L2 pile commutativity (permuting nouns and
+pending mods within one pile lowers to an IDENTICAL cast list, compared field
+by field), L3 multiplicity (`g g` ≡ `g×2` exactly until the cap — except a
+delivery, which nests N deep, and `also`, which is N+1 sentences), L4 `also`
+additivity (`cost(A also B) = cost(A) + cost(B)` and the casts are the union),
+L5 delivery invariance (the payload INSIDE the box of `E… D` is identical for
+every flight D; only the record differs), L6 locality (a unary operator's
+operand is exactly the item to its left, and inserting a word anywhere outside
+that item's span does not change it), L7 tariff monotonicity, L8 budgets (finite
+ticks, voxels, instances, generation, plus leaves ≤ `maxInstances` and a finite
+depth — what stops a deep nest from FIRING is the generation cap, asserted at
+runtime, since a sentence may legally SAY more than the engine will do),
+**L9 nesting** (for any E and flight deliveries D1, D2, the payload of the
+`E D1 D2` box is exactly one Launch whose payload is bit-for-bit the lowering
+of `E D1`), **L10 mod placement** (`E μ D` ≡ `μ E D`, and in `E D μ` the mod is
+on the hand record and never reaches inside the box), **L11 flattening** (a
+Fatal cast of any sequence emits no launches). A change that breaks a law
+breaks a *class* of spells, which is what the line says; a change that moves one
+spell's numbers is a rebaseline.
+
+Gate `spells` check (8), the nest at runtime: `explosive projectile projectile`
+launches exactly one child and it is the child that explodes; `explosive
+projectile fuse projectile` rests on impact and launches the child exactly
+`fuse` ticks later; `explosive projectile shotgun projectile` launches three
+children over three blasts; and five nested deliveries never reach past
+`budgets.maxGeneration`.
 
 **Sustained things are the `aura` operator, one word for wards and curses
 alike (plan §7; `SpellStatus`, `SpellSystem::Adopt`).** `X aura` produces an
@@ -3688,23 +3780,25 @@ at tick 811 of 1500 on the human.
 **Deliveries are three mechanisms, and Mods are field edits on their record
 (plan §5; `DeliveryRec`, `ApplyMod`).** `hand`/`self` are *instant* at a
 point; `projectile`/`bolt`/`lob`/`orb`/`bomb` are *flight* (speed, gravity,
-lifetime, bounces, pierce, seek, fuse, count, children, resolve radius, a
-trail with its budget); `beam` is *continuous*. A Mod names ONE field and
-how to edit it (`field`/`op`/`amount` in `glyphs.json`) and repeating it
-applies the edit again — `shotgun` ×count, `float` −1 g, `swift` ×speed,
-`long` ×lifetime (and ×fuse, and ×reach when anchored), `wide` ×radius,
-`bounce`/`pierce`/`seek` +1, `fuse` +30 ticks, `split` ×children. Adding a
-Mod is one JSON entry naming a field. The runtime reads the record and
-nothing else: a bounce reflects the axis that entered the solid (each axis
-probed alone) and loses a fifth of the speed; a pierce passes through one
-wall and resolves on the next; a fused bolt rests where it landed and counts
-down; a seeking bolt turns toward the nearest target the owner names
-(`SpellBodyProbe::nearestTarget`, integer steering after one float→fixed
-conversion at the query boundary); `split` launches children with the same
-payload from the last free position, one generation down, and nothing past
-`budgets.maxGeneration` launches (rule 2). A gravity Mod on an anchored
-delivery is reported as `casterImpulseVps` for the owner to apply to the
-body — `float self` hops.
+lifetime, bounces, pierce, seek, fuse, count, resolve radius, a trail with
+its budget); `beam` is *continuous*. A Mod names ONE field and how to edit it
+(`field`/`op`/`amount` in `glyphs.json`), sticks to the box that closes the
+pile (rule 3), and repeating it applies the edit again — `shotgun` ×count,
+`float` −1 g, `swift` ×speed, `long` ×lifetime (and ×fuse, and ×reach when
+anchored), `wide` ×radius, `bounce`/`pierce`/`seek` +1, `fuse` +30 ticks.
+Adding a Mod is one JSON entry naming a field. A record only HAS the fields
+its mechanism means (`ModMeansAnything`): a mod that lands on one without the
+field is charged and named in the readout rather than editing something nobody
+reads, which is what makes rule 3's "every other mod on the hand is a no-op"
+honest. The runtime reads the record and nothing else: a bounce reflects the
+axis that entered the solid (each axis probed alone) and loses a fifth of the
+speed; a pierce passes through one wall and resolves on the next; a fused bolt
+rests where it landed and counts down; a seeking bolt turns toward the nearest
+target the owner names (`SpellBodyProbe::nearestTarget`, integer steering
+after one float→fixed conversion at the query boundary). A gravity Mod on an
+anchored delivery is reported as `casterImpulseVps` for the owner to apply to
+the body — `float self` hops. `split` is GONE: `explosive projectile shotgun
+projectile` says what it did and says it better.
 
 **A bomb is a rigid body through the existing debris path.** The VM cannot
 create a body (that is physics, the owner's business), so `bomb` reports a

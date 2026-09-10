@@ -47,28 +47,52 @@
 // cast carries those four numbers (SpellCast::ticks/voxels/instances/
 // generation) and law L8 in the `spells` gate asserts they are finite.
 //
-// ---- THE GRAMMAR (docs/PLAN_magic_grammar.md §1–§3) -------------------------
+// ---- THE GRAMMAR (docs/PLAN_magic_grammar.md; DESIGN.md §8) ------------------
 //
-// Five SORTS: Matter (a material by name), Effect (something that happens at a
-// point), Delivery (how an Effect reaches a point), Mod (a field edit on the
+// Six SORTS: Matter (a material by name), Effect (something that happens at a
+// point), Delivery (how an Effect reaches a point), Mod (a field edit on a
 // delivery record), Operator (a word with argument slots that produces one of
-// the others). Six PARSE RULES:
+// the others), Separator (`also`: ends one sentence and starts the next).
 //
-//   R1 runs merge            fire fire            -> fire×2
-//   R2 operators bind        dirt transmute water -> (dirt ⋈ water), greedily,
-//                            on their declared side, left to right
-//   R3 empty slot = INCOMPLETE  transmute water   -> (_ ⋈ water): charged,
-//                            does nothing. No defaults; `anything` and `air`
-//                            are words of their own
-//   R4 a Delivery closes the clause   explosive projectile fire bomb -> two casts
-//   R5 no Delivery -> hand   the payload resolves at reach in front of the caster
-//   R6 bag order is irrelevant   explosive shotgun projectile == shotgun
-//                            explosive projectile
+// THREE RULES, and everything else is a consequence of them:
+//
+//   1. A NOUN GOES INTO THE PILE. A Matter word, an Effect word, or an
+//      operator group whose result sort is Effect is pushed onto the PILE.
+//      Order inside the pile does not matter: identical items merge (×N,
+//      capped) and the lowering rebuilds the pile in a CANONICAL order.
+//
+//   2. A DELIVERY BOXES THE PILE, AND SPEAKING CONTINUES. The Delivery word
+//      takes the WHOLE pile and wraps it into ONE Effect value of verb
+//      `launch`: {that delivery's DeliveryRec, the pile's Effects as its
+//      payload, the pile's pending Mods stuck to its record}. The pile becomes
+//      exactly that one value. So deliveries NEST and word order matters:
+//      `explosive projectile projectile` is a bolt that fires a bolt that
+//      explodes.
+//
+//   3. A MOD STICKS TO THE BOX THAT CLOSES THE PILE. A Mod word (or an
+//      operator group of result sort Mod, i.e. `trail`) goes into the pile as
+//      PENDING and is applied to the record of the NEXT delivery spoken. If no
+//      delivery closes the pile it sticks to `hand`, the implicit outermost
+//      delivery, where `shotgun` is three fanned resolve points and `float` is
+//      the hop; every other mod on the hand is a charged no-op and the
+//      describe line says so.
+//
+// The outermost box is always `hand`, so the whole sentence lowers to ONE cast
+// — unless `also` is spoken, which closes the current pile as a finished
+// cast and starts a new one (law L4 attaches to `also`, not to a delivery).
+//
+// Unary operators (`trail`, `aura`, `echo`, `null`, `mend`) take the ONE item
+// immediately before them, which may itself be a launch box (`explosive
+// projectile echo` is a turret). `transmute` is the one infix word. An
+// operator with an empty required slot is INCOMPLETE: charged, does nothing.
+// Runs merge (`shotgun shotgun` is `shotgun×2`) for Matter, Effects and Mods
+// — but NOT for deliveries, because each delivery boxes what is in front of
+// it.
 //
 // scripts/magic_grammar.py is the executable reference for these rules; the
-// `spells-oracle` gate compares this parser against every pair it generates.
-// Nothing in this file knows which words exist: sorts, valence, verbs, axes
-// and costs are read from assets/spells/glyphs.json.
+// `spells-oracle` gate compares this parser against every sentence it
+// generates. Nothing in this file knows which words exist: sorts, valence,
+// verbs, axes and costs are read from assets/spells/glyphs.json.
 
 // ---- fixed point -----------------------------------------------------------
 // 24.8 voxels, matching ParticleSpawn (world.h). One unit = 1/256 voxel.
@@ -98,8 +122,9 @@ enum class GlyphSort : uint8_t {
   Delivery,
   Mod,
   Operator,
+  Separator,   // `also`: closes the pile as a finished cast, starts a new one
 };
-constexpr int kGlyphSortCount = 5;
+constexpr int kGlyphSortCount = 6;
 const char* GlyphSortName(GlyphSort s);   // "matter" | "effect" | ...
 bool ParseGlyphSort(const std::string& s, GlyphSort& out);
 
@@ -110,7 +135,8 @@ constexpr uint8_t kSortBitEffect = 1u << (int)GlyphSort::Effect;
 constexpr uint8_t kSortBitDelivery = 1u << (int)GlyphSort::Delivery;
 constexpr uint8_t kSortBitMod = 1u << (int)GlyphSort::Mod;
 constexpr uint8_t kSortBitOperator = 1u << (int)GlyphSort::Operator;
-constexpr uint8_t kSortAny = 0x1F;
+constexpr uint8_t kSortBitSeparator = 1u << (int)GlyphSort::Separator;
+constexpr uint8_t kSortAny = 0x3F;
 
 // The primitives an Effect can lower to (plan §5). Hundreds of glyphs, but the
 // C++ knows only these verbs — each maps to ONE op type on the MutationQueue or
@@ -128,6 +154,7 @@ enum class SpellVerb : uint8_t {
   Sustain,   // (operator) attach the inner Effect/Mod to a body as a status
   Filter,    // (operator) an entry in the caster's op filter
   Repeat,    // (operator) the inner Effect again every few ticks, bounded
+  Launch,    // (rule 2) a BOX: a DeliveryRec carrying `inner` as its payload
 };
 const char* SpellVerbName(SpellVerb v);
 bool ParseSpellVerb(const std::string& s, SpellVerb& out);
@@ -145,7 +172,6 @@ enum class DeliveryMech : uint8_t {
 enum class ModField : uint8_t {
   None = 0,
   Count,      // instances (shotgun)
-  Children,   // children on resolve (split), generation-capped
   Gravity,    // per-mille of g on the flight, or on the anchored body
   Speed,
   Lifetime,   // ticks; a bomb's fuse too
@@ -251,6 +277,9 @@ struct GlyphDef {
   bool body = false;             // flight as a rigid body (bomb)
   bool resolveOnExpiry = false;  // orb: life running out is a resolve, not a fizzle
   GlyphLook look;                // how it is drawn (render-only)
+  // What the describe line calls one of these ("a bolt", "a bomb"). Content,
+  // so a modder's new carrier reads as itself; defaults to the glyph id.
+  std::string noun;
 
   // ---- mod ----
   ModField field = ModField::None;
@@ -348,28 +377,37 @@ struct SpellStack {
 // UI state too — an unbounded stack is an unbounded mana cost).
 constexpr int kSpellStackMax = 16;
 
-// ---- the parse tree (plan §2, §6) --------------------------------------------
+// ---- the parse tree (the three rules) ----------------------------------------
 
-// One item of the tree: a raw word with multiplicity, or an operator group
-// with its bound children. The HUD draws the brackets straight off this, so
-// what you see is what bound.
+// One item of the tree: a raw word with multiplicity, an operator group with
+// its bound children, or a BOX (rule 2) — a delivery holding the pile it
+// closed. The HUD draws the brackets straight off this, so what you see is
+// what bound.
 struct SpellNode {
-  int glyph = -1;        // library index
-  int32_t n = 1;         // multiplicity (R1 / R6), capped
+  int glyph = -1;        // library index; on a box, the delivery (-1 = hand)
+  int32_t n = 1;         // multiplicity (runs merge), capped
   bool group = false;    // an operator application
-  int left = -1;         // child node, -1 = empty slot (or no slot)
+  bool box = false;      // a delivery box: `glyph` is the delivery, `items`
+                         // the pile it closed (nouns AND pending mods)
+  int left = -1;         // operator child, -1 = empty slot (or no slot)
   int right = -1;
-  bool complete = true;  // false: a required slot is empty (R3)
+  std::vector<int> items;   // box: the closed pile, first-seen order, merged
+  bool complete = true;  // false: a required slot is empty
   // Spoken span [first, last] of this item and everything under it, for the
-  // HUD highlight and the L6 law; `at` is the operator word's own position.
+  // HUD highlight and the L6 law; `at` is the operator/delivery word's own
+  // position.
   int first = -1, last = -1;
   int at = -1;
 };
 
+// One sentence: everything up to an `also`, or up to the end. Its root is
+// ALWAYS the implicit `hand` box (rule 3), so `delivery`/`weight` below are
+// the hand's and the nesting lives inside `bag`.
 struct SpellClause {
-  int delivery = -1;     // glyph index of the Delivery, -1 = hand
-  int32_t weight = 1;    // Delivery multiplicity
-  std::vector<int> bag;  // node indices after R6 merge, first-seen order
+  int root = -1;         // the outermost box node
+  int delivery = -1;     // == nodes[root].glyph; -1 = hand, and always is
+  int32_t weight = 1;
+  std::vector<int> bag;  // == nodes[root].items
 };
 
 struct SpellTree {
@@ -378,27 +416,32 @@ struct SpellTree {
   bool Empty() const { return clauses.empty(); }
 };
 
-// R1 → R2/R3 → R4/R6. Total: any sequence of valid glyph indices parses.
+// The three rules, left to right. Total: any sequence of valid glyph indices
+// parses.
 SpellTree ParseSpell(const GlyphLibrary& lib, const SpellStack& stack);
 
 // The sort an item denotes: a raw word's sort, or an operator's result sort.
 GlyphSort NodeSort(const GlyphLibrary& lib, const SpellTree& t, int node);
-// The R6 identity of an item, multiplicity excluded: `fire`,
-// `(dirt|transmute|water)`, `(|trail|)`. What the reference script calls key().
+// The identity of an item under rule 1, multiplicity excluded: `fire`,
+// `(dirt|transmute|water)`, `(|trail|)`, `[fire#1|projectile]`. What the
+// reference script calls key().
 std::string NodeKey(const GlyphLibrary& lib, const SpellTree& t, int node);
 
 enum class BracketStyle : uint8_t {
   Oracle = 0,   // the reference script's exact spelling (× ‖ ⋈ ◂ and **bold**)
   Hud,          // ASCII for the pixel font: x2, |, ><, <, DELIVERY in caps
 };
-// An item with its brackets: `fire×2`, `(dirt ⋈ water)`, `(_ ◂trail)`.
+// An item with its brackets: `fire×2`, `(dirt ⋈ water)`, `(_ ◂trail)`, and a
+// box as `[ ... **projectile**]`.
 std::string ShowNode(const GlyphLibrary& lib, const SpellTree& t, int node,
                      BracketStyle style = BracketStyle::Oracle);
-// The whole sentence: bag items, then the delivery, clauses joined by ‖.
+// The whole sentence: the hand box's items, clauses (`also`) joined by ‖.
 std::string BracketSpell(const GlyphLibrary& lib, const SpellTree& t,
                          BracketStyle style = BracketStyle::Oracle);
 
 // ---- the lowered cast (plan §5, §6) -------------------------------------------
+
+struct DeliveryRec;
 
 // One thing that happens at a point. ApplySpellEffect switches on `verb` —
 // the only switch in the system.
@@ -412,8 +455,14 @@ struct EffectInst {
   bool anyA = false, anyB = false;   // the wildcard on either side
   int glyphA = -1, glyphB = -1;      // the Matter glyphs those came from (names)
   int32_t radius = 1;        // resolve radius, after `wide`
-  // The wrapped effect(s) for trail / sustain / repeat.
+  // The wrapped effect(s) for trail / sustain / repeat — and, for a Launch,
+  // the payload the box carries.
   std::vector<EffectInst> inner;
+  // A LAUNCH's delivery record (rule 2). Exactly one entry when
+  // `verb == SpellVerb::Launch`, empty otherwise. A vector rather than a
+  // by-value member because DeliveryRec holds EffectInsts of its own — the
+  // same knot `inner` ties, tied the same way.
+  std::vector<DeliveryRec> launch;
   // A sustained MOD (float aura ...): the field edit the status applies.
   ModField modField = ModField::None;
   ModOp modOp = ModOp::Mul;
@@ -435,7 +484,6 @@ struct DeliveryRec {
   int32_t fuseTicks = 0;
   int32_t reach = 0;
   int32_t count = 1;         // instances (shotgun)
-  int32_t children = 0;      // split
   int32_t bounces = 0, pierce = 0, seek = 0;
   int32_t radiusMille = 1000;   // wide: resolve radius multiplier
   bool body = false;         // rigid body flight (bomb)
@@ -462,6 +510,16 @@ struct SpellCast {
   int32_t ticks = 0;
   int32_t voxels = 0;
   int32_t generation = 0;
+  // The nesting (rule 2): how deep the launch boxes go under this one, and
+  // how many LEAF instances the whole tree can produce (the product of the
+  // counts down each path, summed over paths). `instancesClamped` says the
+  // leaf cap cut the fan back, which the describe line reports.
+  int32_t depth = 0;
+  int32_t leaves = 1;
+  bool instancesClamped = false;
+  // Mod words that landed on a record with nothing to edit (rule 3: the hand
+  // has no speed, no fuse, nothing to bounce). Charged; named in the readout.
+  std::vector<int> wastedMods;
   int clause = -1;
 
   int32_t Cost() const { return wordCost + tariff + carryCost; }
@@ -628,6 +686,10 @@ struct SpellBeam {
   int32_t instability = 0;
   bool held = true;
   bool prepaid = true;       // the cast paid for the first resolve
+  // A NESTED beam (`explosive beam projectile`) is not the caster's aim: it
+  // burns from where the parent resolved, along the direction it was given,
+  // until its tick cap. HoldBeam leaves it alone.
+  bool anchored = false;
 };
 
 // An ECHO: the inner effect again at the point every `period` ticks, a
@@ -659,6 +721,27 @@ struct SpellRestore {
   uint64_t casterId = 0;
   uint32_t material = 0;
   int32_t count = 0;
+};
+
+// A NESTED LAUNCH ASKING TO BE BORN (rule 2). `ApplySpellEffect` stays
+// op-stream-only: a Launch effect appends one of these rather than reaching
+// into the system, and `SpellSystem` adopts them at the end of the call that
+// produced them, exactly the way it adopts statuses, echoes and filters.
+//
+// `at`/`dir` are filled in by whoever emitted the payload, not by the payload:
+// a child launches from its parent's LAST FREE position, along the parent's
+// direction reflected off the surface it hit (the same per-axis reflection
+// `bounce` uses), or straight up when there was no surface. `generation` < 0
+// means "not stamped yet".
+struct SpellLaunchReq {
+  DeliveryRec delivery;
+  std::vector<EffectInst> payload;
+  SpellFxVec at{};
+  SpellFxVec dir{0, kSpellFxOne, 0};
+  int32_t generation = -1;
+  uint64_t casterId = 0;
+  int32_t instability = 0;
+  uint32_t salt = 0;
 };
 
 // A per-tick charge the owner applies to a caster (statuses, beams).
@@ -758,6 +841,8 @@ struct SpellEmission {
   std::vector<SpellStatus> statuses;
   std::vector<SpellEcho> echoes;
   std::vector<SpellFilter> filters;
+  // Nested launches (rule 2). Adopted by the system; empty after Cast/Tick.
+  std::vector<SpellLaunchReq> launches;
   std::vector<SpellBill> bills;
   std::vector<SpellBodyImpulse> bodyImpulses;
   std::vector<SpellRestore> restores;
@@ -778,10 +863,16 @@ SpellProbe WorldSpellProbe(const World& world);
 // THE POSITION-PARAMETERIZED EFFECT PAYLOAD (thesis 2). Runs every EffectInst
 // of `payload` at `atFx` along `dirFx`. `strength` is 0..1000 per-mille;
 // `instability` (0..1000) is the melt share of an unstable convert (plan §4).
+//
+// `flatten` is what a Fatal cast is: every Launch resolves its own payload IN
+// PLACE, recursively, instead of asking for a carrier. So an overcast
+// `explosive projectile projectile bomb` goes off in the caster's chest with
+// everything it was ever going to do, and nothing leaves the body.
 void ApplySpellEffect(const GlyphLibrary& lib, const std::vector<EffectInst>& payload,
                       SpellFxVec atFx, SpellFxVec dirFx, int32_t strengthMille,
                       SpellEmission& out, const SpellProbe* probe = nullptr,
-                      int32_t instabilityMille = 0, uint32_t salt = 0);
+                      int32_t instabilityMille = 0, uint32_t salt = 0,
+                      bool flatten = false);
 
 // ---- the system ------------------------------------------------------------
 
@@ -868,7 +959,13 @@ class SpellSystem {
 
   // Take the sustained things a payload asked for into the system's state,
   // attaching statuses to the body at their point (per-caster cap applied).
-  void Adopt(SpellEmission& out, const SpellBodyProbe* bodies);
+  // Nested launches are adopted FIRST, and an instant one (`self`) resolves
+  // its own payload here, which may ask for more of everything — so the
+  // launch drain loops, bounded by the generation cap.
+  void Adopt(SpellEmission& out, const SpellBodyProbe* bodies, uint32_t tick,
+             const SpellProbe* probe);
+  void AdoptLaunches(SpellEmission& out, const SpellBodyProbe* bodies, uint32_t tick,
+                     const SpellProbe* probe);
   bool FilterRefuses(const SpellFilter& f, int32_t x, int32_t y, int32_t z,
                      uint32_t material, int kindMode) const;
 
@@ -879,6 +976,10 @@ class SpellSystem {
   std::vector<SpellBeam> beams_;
   std::vector<SpellEcho> echoes_;
   std::vector<SpellFilter> filters_;
+  // Where a nested `self` resolves during a Cast() that named a body part
+  // (the character screen). Valid only for the duration of that call.
+  SpellFxVec selfAt_{};
+  bool selfAtValid_ = false;
   uint32_t nextToken_ = 0;
   uint32_t nextStatusId_ = 0;
   uint32_t nextSeq_ = 0;

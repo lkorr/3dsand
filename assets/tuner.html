@@ -6916,74 +6916,103 @@ function magicStability(host){
 /* ---- the language ---- */
 function magicLanguage(host){
   const b=el('div',{});
-  b.append(mlead('Compiling a spell is a fold over the spoken stack, and it is TOTAL: '+
-    'every sequence compiles into something that does something. Two rules give it that totality.'));
-  host.append(wsec('❡ Totality',null,true,b));
+  b.append(mlead('Folding a spell is one left-to-right pass over the spoken words, and it is '+
+    'TOTAL: every sequence folds into something that does something. THREE rules give it that, '+
+    'and everything else in the language is a consequence of them.'));
+  b.append(mpara('The sentence is not a list of settings. It is a NEST: each delivery you speak '+
+    'wraps everything before it, so ',el('b',{},'word order decides what is inside what'),'. That '+
+    'is the whole difference between this and a wand with slots.'));
+  host.append(wsec('\u2761 Totality, in three rules',null,true,b));
 
   const r1=el('div',{});
-  r1.append(mpara(el('b',{},'Saying a word again means it harder.'),' The Nth utterance of a '+
-    'glyph contributes 2^(N-1) and costs 2^(N-1) times its mana. So each extra word costs as '+
-    'much as everything before it combined.'));
-  const sand=glyphById('sand'), sm=sand?sand.mana:3;
-  r1.append(mtable(['spoken','effect','this word costs','running total'],[
-    ['sand','×1',String(sm),String(sm)],
-    ['sand sand','×2',String(sm*2),String(sm*3)],
-    ['sand sand sand','×4',String(sm*4),String(sm*7)],
-    ['sand ×N','×2^(N-1)','—','(2^N − 1) × '+sm],
-  ]));
-  r1.append(mpara('Why doubling rather than counting: a linear ramp makes repetition a tedious '+
-    'way to buy a small increase. The interesting decision — ',el('em',{},'"is this worth an '+
-    'entire extra mana bar?"'),' — only exists if the curve is steep. It also makes the cost '+
-    'legible without arithmetic.'));
-  r1.append(mrule('Capped at 2⁶ = 64×',
-    'Past the cap an extra word is FREE and does nothing. That is the honest behaviour: better '+
-    'than silently charging for an effect the budget will refuse to deliver. It is also what '+
-    'stops a stuck key authoring an unbounded particle count (rule 2). The stack itself is '+
-    'bounded at 16 words for the same reason.'));
-  r1.append(mrule('A DIFFERENT element replaces; it does not stack',
-    'Speaking ',mcode('water lava'),' throws lava, not both — and it RESETS the amplification. '+
-    'An element is what the spell is MADE of, and "made of two things" has no meaning here, '+
-    'whereas "more of it" does. Same for a different form. Only repeats amplify.'));
-  host.append(wsec('① Repetition amplifies',null,true,r1));
+  r1.append(mrule('1 \u00b7 A noun goes into the PILE',
+    'A matter word, an effect word, or an operator result of sort Effect is pushed onto the pile. '+
+    'Order inside the pile does not matter: identical items merge (',mcode('shotgun shotgun'),
+    ' is shotgun\u00d72, capped), matter and effects ADD along their axis, mods COMPOSE, and the '+
+    'lowering rebuilds the pile in a canonical order \u2014 without that, ',mcode('swift slow'),
+    ' and ',mcode('slow swift'),' would differ, because 49 halved then doubled is 48.'));
+  r1.append(mrule('2 \u00b7 A delivery BOXES the pile, and speaking continues',
+    'The delivery takes the WHOLE pile and wraps it into one Effect value: its own record, the '+
+    'pile\u2019s effects as the payload, the pile\u2019s pending mods stuck to that record. The pile '+
+    'becomes exactly that box \u2014 which is a noun again, so it can be boxed once more, handed to '+
+    'an operator, or spoken beside other nouns. ',el('b',{},'Deliveries nest.'),' A delivery is the '+
+    'one sort that does NOT merge on repeat, precisely because each one boxes what is in front of it.'));
+  r1.append(mrule('3 \u00b7 A mod sticks to the box that CLOSES the pile',
+    'A mod word (or ',mcode('trail'),', the one operator that yields a mod) waits in the pile and '+
+    'lands on the next delivery spoken. With no delivery it lands on ',mcode('hand'),', where '+
+    mcode('shotgun'),' is three fanned resolve points and ',mcode('float'),' is a hop \u2014 and every '+
+    'other mod is charged and does nothing, which the readout says out loud rather than letting it '+
+    'edit a field nobody reads.'));
+  host.append(wsec('\u2460 The three rules',3,true,r1));
 
-  const r2=el('div',{});
-  r2.append(mpara('Spray is ',el('b',{},'not'),' "no form" — it is the default form every spell '+
-    'falls back to when no form glyph was spoken: a handful of loose voxels of the element flung '+
-    'out of your hand as ballistic particles, riding the existing gore/ejecta pipeline.'));
-  r2.append(mpara('This is what makes the language total. A bare element used to misfire, which '+
-    'taught the player that half a spell is a mistake. Now ',el('b',{},'the shortest legal spell '+
-    'is one word'),' and every longer sequence reads as an elaboration of it rather than a correction.'));
-  r2.append(mtable(['spoken','yields'],[
-    ['sand','a spray of '+magicBudget('sprayVoxels',3)+' sand voxels'],
-    ['sand sand','×2 — '+(magicBudget('sprayVoxels',3)*2)+' voxels, for twice the mana'],
-    ['projectile','a form with nothing to shape: fizzles, and still charges for the attempt'],
-    ['sand projectile','a sand bolt'],
+  const nest=el('div',{});
+  nest.append(mpara('The same four words in different orders are four different spells. This is '+
+    'the table to read if you read nothing else:'));
+  nest.append(mtable(['spoken','what happens'],[
+    ['explosive shotgun projectile','three fanned bolts; when each hits, each explodes'],
+    ['explosive projectile shotgun','from three fanned points in front of you, one bolt; when it hits, it explodes'],
+    ['shotgun projectile explosive','an explosion at reach in front of you, and three fanned bolts that only knock what they hit'],
+    ['explosive projectile projectile','a bolt; when it hits it fires a bolt; when THAT hits, it explodes'],
+    ['explosive projectile shotgun projectile','three fanned bolts; when each hits, each fires a bolt that explodes'],
+    ['explosive projectile fuse projectile','a bolt; when it hits it waits 30 ticks, then fires a bolt that explodes'],
+    ['explosive fuse projectile projectile','a bolt; when it hits it fires a bolt; when that hits it waits 30 ticks, then explodes'],
+    ['explosive projectile projectile fuse','the same as with no fuse \u2014 the fuse landed on your hand'],
   ]));
-  host.append(wsec('② An unspoken form is spray',null,true,r2));
+  nest.append(mrule('The outermost box is always your hand',
+    'So an utterance is ONE cast however many deliveries nest inside it. ',mcode('also'),
+    ' is the word that ends a sentence and starts the next; cost is additive across it, and both '+
+    'go off together. It is the only additive seam in the language.'));
+  nest.append(mrule('split is gone',mcode('explosive projectile shotgun projectile'),
+    ' says what split said, and says which bolt fans.'));
+  host.append(wsec('\u2461 What the nest buys',8,true,nest));
 
-  const fold=el('div',{});
-  fold.append(mpara('How each glyph type folds in:'));
-  fold.append(mtable(['type','on repeat','on a different one'],[
-    [el('span',{},GLYPH_ICON.element+' element'),'amplifies ×2 per repeat','REPLACES, and resets amplification'],
-    [el('span',{},GLYPH_ICON.form+' form'),'faster and longer-lived — "more projectile" is a harder throw, not a second bolt','replaces'],
-    [el('span',{},GLYPH_ICON.modifier+' modifier'),'listed once, carries its own repeat count — "trail trail" is ONE trail with twice the budget','both apply, in spoken order'],
+  const op=el('div',{});
+  op.append(mpara('Every unary operator takes the ',el('b',{},'ONE item immediately before it'),
+    ' \u2014 which may be a whole box. Only ',mcode('transmute'),' is infix.'));
+  op.append(mtable(['spoken','operand','result'],[
+    ['fire trail explosive projectile','trail took fire','a bolt trailing fire that explodes on impact'],
+    ['fire explosive trail projectile','trail took explosive','a bolt that EXPLODES along its path and sprays fire on impact'],
+    ['explosive projectile echo','echo took the whole box','a turret: it fires that bolt again every few ticks'],
+    ['explosive projectile aura self','aura took the whole box','a status on you that fires that bolt every tick'],
+    ['explosive projectile fire trail','trail took fire, then landed on your hand','the trail is wasted \u2014 your hand does not travel'],
   ]));
-  fold.append(mrule('Transmute widens by VOLUME, not by radius',
-    'Repeating ',mcode('transmute'),' grows the radius as the ',el('b',{},'cube root'),
-    ' of the multiplier (×5/4 per doubling), so a ×2 spell converts twice the MATTER rather '+
-    'than eight times. The multiplier means the same thing everywhere: "twice as much".'));
-  host.append(wsec('\u{1F9EE} Folding the stack',3,true,fold));
+  op.append(mrule('An empty required slot is INCOMPLETE, never an error',
+    'It is charged and does nothing, and the readout draws it as ',mcode('_'),
+    '. There are no defaults: ',mcode('anything'),' and ',mcode('air'),' are real words.'));
+  host.append(wsec('\u2462 Operators take the item before them',5,true,op));
+
+  const px=el('div',{});
+  px.append(mpara('Price is recursive, and the delivery premium ',el('b',{},'composes '+
+    'multiplicatively down the nest'),': a launch costs (its payload + its trail) \u00d7 its '+
+    'instances \u00d7 its own carry. A bolt that fires a bolt pays 3.0 \u00d7 3.0 on whatever the '+
+    'inner one finally does \u2014 which is exactly the \u201cyou are paying to move it twice\u201d '+
+    'reading carry exists to give. Word costs simply sum.'));
+  px.append(mrule('Two bounds on a nest, and rule 2 needs both',
+    'Depth: each nested launch is one generation down and nothing past ',
+    mcode('maxGeneration'),' ever flies. Breadth: instances MULTIPLY down the tree (three bolts '+
+    'each firing three is nine), so the number that is capped is the LEAF instance count, and a '+
+    'fan that would overrun it is clamped at compile time with the readout saying so.'));
+  px.append(mrule('A fatal cast FLATTENS',
+    'Over mana and health, every nested carrier resolves its payload IN PLACE, recursively, at the '+
+    'caster. Nothing leaves the body. It is the same payload function with one flag \u2014 backfire '+
+    'is still not per-spell code.'));
+  host.append(wsec('\u{1F9EE} Price and bounds',3,true,px));
 
   const rd=el('div',{});
   rd.append(mpara('The readout exists because a clear statement of what a sequence WILL do is '+
-    'worth more than validation. It says what happens, not whether it is allowed — which is the '+
-    'more useful thing to show, and the only honest one in a language with no illegal sentences.'));
-  rd.append(mtable(['verdict','means'],[
+    'worth more than validation. It says what happens, not whether it is allowed \u2014 the only '+
+    'honest thing to show in a language with no illegal sentences. Brackets are derived from the '+
+    'fold, so ',mcode('[ \u2026 DELIVERY]'),' is a box and what you see is what nested.'));
+  rd.append(mtable(['readout','means'],[
     ['silence','nothing spoken'],
-    ['no element — the form has nothing to shape, it will fizzle','a form with no matter. Still cast, still charged.'],
-    ['spray: N voxels from your hand','the default form'],
-    ['bolt ×N + trail ×M','a projectile with its modifiers and their multipliers'],
+    ['[explosive PROJECTILE]','one box: a bolt carrying an explosion'],
+    ['[[explosive PROJECTILE] PROJECTILE]','a bolt whose payload is another bolt'],
+    ['[fire (explosive <trail) PROJECTILE]','trail grabbed explosive; fire is the payload'],
+    ['`swift` is wasted: it landed on your hand, which has no speed','a mod with no box to stick to'],
   ]));
+  rd.append(mpara('Generated truth for every permutation: ',mcode('docs/MAGIC_PERMUTATIONS.md'),
+    ', written by ',mcode('scripts/magic_grammar.py'),', which is also the oracle the ',
+    mcode('spells-oracle'),' gate compares the C++ parser against.'));
   host.append(wsec('\u{1F4DC} The readout',null,false,rd));
 }
 
@@ -8313,11 +8342,11 @@ const ARCH_NODES={
     details:'<code>items.json</code> is BEHAVIOUR the engine switches on (kind, damage, reach, carveBonus); the per-asset sidecar is art and grip. The scene-to-engine rotation mapping is applied on read so art and hitbox rotate together.'},
 
   glyphs:{label:'Glyphs & the grimoire',tag:'cpu',
-    desc:'The magic grammar (docs/PLAN_magic_grammar.md): 44 words of five sorts — matter, effect, delivery, mod, operator — parsed by six rules into clauses, lowered to a cast list, priced by a tariff on what the cast does to the world. Two banks on the number row, a grimoire of macros. Hot-reloads with R. Landed 2026-09-05: flights collide past the CPU mirror (chunk cache the flight prefetches, then the TerrainHeight ground contract) and with bodies by ray, so payloads land; speeds are 24.8 fixed and ten times slower; each delivery has a render-only look block (bolt / ball / orb / spark + impact flashes); right-click writes a word onto the open grimoire page.',
+    desc:'The magic grammar (DESIGN.md §8): 44 words of six sorts — matter, effect, delivery, mod, operator, separator — folded by THREE rules into a nest of delivery boxes, lowered to a cast list, priced by a tariff on what the cast does to the world. A delivery does not end a sentence, it WRAPS what came before it, so deliveries nest and word order decides what is inside what. Two banks on the number row, a grimoire of macros. Hot-reloads with R. Landed 2026-09-05: flights collide past the CPU mirror (chunk cache the flight prefetches, then the TerrainHeight ground contract) and with bodies by ray, so payloads land; speeds are 24.8 fixed and ten times slower; each delivery has a render-only look block (bolt / ball / orb / spark + impact flashes); right-click writes a word onto the open grimoire page.',
     files:['assets/spells/glyphs.json','assets/spells/grammar_oracle.json','scripts/magic_grammar.py','src/game/spell.h','src/game/spell.cpp','src/game/caster.h','src/game/caster.cpp','src/ui/inventory_ui.cpp'],
-    sym:['GlyphDef','GlyphLibrary','ParseSpell','LowerSpell','EffectTariff','ApplySpellEffect','SpellSystem','Grimoire','ExpandWords'],
+    sym:['GlyphDef','GlyphLibrary','ParseSpell','LowerBox','LowerSpell','EffectTariff','ApplySpellEffect','SpellSystem','SpellLaunchReq','Grimoire','ExpandWords'],
     tst:['spells','spells-oracle','grimoire','player-kit'],
-    details:'<b>Five sorts, six rules.</b> A glyph is <code>{sort, verb, valence, word, axis}</code> in glyphs.json; nothing in C++ knows which words exist. R1 runs merge (matter and effects ADD, mods COMPOSE: shotgun³ is 27), R2 operators bind their neighbours greedily on their declared side, R3 an empty required slot is INCOMPLETE (charged, does nothing; <code>anything</code> and <code>air</code> are the explicit words), R4 a delivery closes the clause, R5 no delivery = <code>hand</code>, R6 bag order is irrelevant. <code>scripts/magic_grammar.py</code> is the executable reference: it generates docs/MAGIC_PERMUTATIONS.md and the oracle the <code>spells-oracle</code> gate parses (407 sentences). The <code>spells</code> gate asserts the LAWS over every sequence of length ≤ 3 from a 19-word alphabet (totality, commutativity, exact ×N, clause independence, delivery invariance, locality, tariff monotonicity, finite budgets), not a pinned list.<br><br><b>You pay for voxels, not words.</b> Every material has an <code>arcane</code> value (materials.json); spray/place/convert/explode/wind/mend are priced on the volume they touch, deliveries carry a per-mille premium, instances multiply everything. <code>anything</code> is priced when it lands and billed after the fact. An unstable transmute lands a melt-mode share.<br><br><b>Deliveries are records, mods are field edits.</b> hand/self instant; projectile/bolt/lob/orb/bomb flight (bomb is a real rigid body through the debris path, resolved where it rests when the fuse runs out); beam continuous. <code>aura</code> sustains an effect or mod on the body at the point, billed per tick and reserved out of the max; <code>null</code> is the op-stream filter at the MutationQueue splice; <code>echo</code> repeats; <code>mend</code> grafts what it takes from the world into the anatomy recipe, and a charred wound stops bleeding.<br><br><b>The tongue and the grimoire.</b> <code>1-0</code> speak bank A, <code>Shift+1-0</code> bank B; <code>=</code> captures the stack as a page; the character screen’s arsenal is a full column (bound keys, then every word as a table banded by sort, with the §9 info box in small type) and the grimoire is its own panel beside it, above the pack: page list, composer, drag a page onto a key to bind it (nesting depth 4, cycle refusal, 16-word overflow). PLYR v4 saves pages and the twenty slots by name and still loads v3. Verify: <code>--gate spells</code>, <code>--gate spells-oracle</code>, <code>--gate grimoire</code>, <code>--shot-inventory</code> (three frames).'},
+    details:'<b>Six sorts, THREE rules.</b> A glyph is <code>{sort, verb, valence, word, axis}</code> in glyphs.json; nothing in C++ knows which words exist. <b>(1) A NOUN GOES INTO THE PILE</b> — matter, an effect, or an operator result of sort Effect; order inside the pile does not matter, runs merge (matter and effects ADD, mods COMPOSE: shotgun³ is 27) and the lowering rebuilds it in a canonical order. <b>(2) A DELIVERY BOXES THE PILE</b> into ONE Effect value of verb <code>launch</code> — its record, the pile’s effects as its payload, the pile’s pending mods stuck to its record — and speaking CONTINUES. So deliveries NEST: <code>explosive projectile projectile</code> is a bolt that, when it hits, fires a bolt that explodes. <b>(3) A MOD STICKS TO THE BOX THAT CLOSES THE PILE</b>, i.e. the next delivery spoken; with none it sticks to <code>hand</code>, where <code>shotgun</code> is three fanned resolve points and <code>float</code> is the hop and every other mod is a charged no-op the readout names. The outermost box is always <code>hand</code>, so an utterance is ONE cast unless <code>also</code> (the new separator word) splits it. An operator with an empty required slot is INCOMPLETE (charged, does nothing; <code>anything</code> and <code>air</code> are the explicit words), and every unary operator takes the ONE item before it — which may be a box, so <code>explosive projectile echo</code> is a turret. <code>split</code> was removed: <code>explosive projectile shotgun projectile</code> subsumes it.<br><br><b>The oracle.</b> <code>scripts/magic_grammar.py</code> is the executable reference: it generates docs/MAGIC_PERMUTATIONS.md (with a per-alphabet metric — orderings vs distinct spells vs distinct spells that do anything) and the oracle the <code>spells-oracle</code> gate parses (434 sentences). The <code>spells</code> gate asserts the LAWS over every sequence of length ≤ 3 from a 19-word alphabet, not a pinned list: L1 totality, L2 pile commutativity, L3 multiplicity (a delivery NESTS N deep instead of merging), L4 <code>also</code> additivity, L5 delivery invariance, L6 locality, L7 tariff monotonicity, L8 budgets (leaves ≤ the instance cap), L9 nesting, L10 mod placement, L11 flattening.<br><br><b>You pay for voxels, not words, and carry composes down the nest.</b> Every material has an <code>arcane</code> value (materials.json); spray/place/convert/explode/wind/mend are priced on the volume they touch, deliveries carry a per-mille premium, instances multiply everything — and a launch’s tariff is (payload + trail) × instances × its own carry, so a bolt that fires a bolt pays 3.0 × 3.0. <code>anything</code> is priced when it lands and billed after the fact. An unstable transmute lands a melt-mode share. A FATAL cast FLATTENS: every nested carrier resolves in place and nothing leaves the body.<br><br><b>Deliveries are records, mods are field edits.</b> hand/self instant; projectile/bolt/lob/orb/bomb flight (bomb is a real rigid body through the debris path, resolved where it rests when the fuse runs out); beam continuous, and a NESTED beam is anchored where its parent resolved rather than held. A record only HAS the fields its mechanism means, so a mod that lands somewhere with no such field is charged and named rather than editing something nobody reads. A child launches from its parent’s last free position, along the parent’s direction reflected off the surface it hit (straight up when there was none), one generation down, and nothing past <code>maxGeneration</code> flies. <code>aura</code> sustains an effect or mod on the body at the point, billed per tick and reserved out of the max; <code>null</code> is the op-stream filter at the MutationQueue splice; <code>echo</code> repeats; <code>mend</code> grafts what it takes from the world into the anatomy recipe, and a charred wound stops bleeding.<br><br><b>The tongue and the grimoire.</b> <code>1-0</code> speak bank A, <code>Shift+1-0</code> bank B; <code>=</code> captures the stack as a page; the character screen’s arsenal is a full column (bound keys, then every word as a table banded by sort, with the info box in small type) and the grimoire is its own panel beside it, above the pack: page list, composer, drag a page onto a key to bind it (nesting depth 4, cycle refusal, 16-word overflow). PLYR v4 saves pages and the twenty slots by name and still loads v3. Verify: <code>--gate spells</code>, <code>--gate spells-oracle</code>, <code>--gate grimoire</code>, <code>--shot-inventory</code> (three frames).'},
 
   microDetail:{label:'Micro Detail',tag:'cpu',
     desc:'Sub-voxel geometry with zero storage and zero sim cost. A material may declare a "micro" block; the world cell stays an ordinary voxel of that material and only the RAYMARCHER substitutes a finer subdiv^3 model when a primary ray lands on it.',

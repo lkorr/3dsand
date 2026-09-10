@@ -72,6 +72,18 @@ Sorts are declared per glyph in `glyphs.json` and shown in the glyph's info box
 
 ## 2. The six parse rules
 
+> **SUPERSEDED 2026-09-10 for R4 and R6 — see DESIGN.md §8, "The grammar
+> (three rules)".** R1, R2, R3 and R5 stand as written. R4 and R6 do not: a
+> Delivery no longer CLOSES a clause, it BOXES the pile into one `launch`
+> Effect value and speaking continues, so deliveries NEST and word order
+> decides what is inside what; and a Mod is PENDING, sticking to the box that
+> closes the pile rather than to whatever clause it happened to land in. The
+> sentence separator is the new word `also`, and law L4's additivity attaches
+> to it. `split` was removed (`explosive projectile shotgun projectile`
+> subsumes it). The reference interpreter `scripts/magic_grammar.py` and the
+> generated `docs/MAGIC_PERMUTATIONS.md` are the executable form of the new
+> rules; everything below is kept for the reasoning that led here.
+
 A spoken sequence is parsed left to right into **clauses**, each clause into a
 **bag** of free items plus zero or one head. These rules are the whole grammar.
 
@@ -487,8 +499,15 @@ rebuild for content.
    engine's explosion already relates `power` and `radius` (`ExplosionOp`), so
    the plan scales `power` and lets the existing law set the radius. If the
    look is wrong that is a tuning row, not a grammar change.
-4. **Second Delivery: new clause (assumed) or replace (today).** New clause is
-   the only total reading that never discards a spoken word.
+4. ~~**Second Delivery: new clause (assumed) or replace (today).**~~
+   **RE-DECIDED 2026-09-10 — SUPERSEDED, see DESIGN.md §8.** Neither. A
+   second Delivery WRAPS the first: it boxes the whole pile (the first box
+   included) into one new `launch` Effect and speaking continues. That is
+   still total — no spoken word is discarded — and it is the reading that
+   makes word order carry meaning, which "new clause" did not: under the
+   clause reading `explosive projectile fire bomb` was two unrelated casts,
+   and under the box reading it is a bomb that fires a bolt that explodes. The
+   additive seam the clause reading provided is now the explicit word `also`.
 5. **Names.** `aura` for the sustain operator (DECIDED 2026-09-04: grip and
    aura are one word; aura-on-self is just aura + self), `null` for the
    negation operator, `mend` for the graft, `echo` for the repeater. "Ward"

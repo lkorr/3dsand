@@ -3,12 +3,16 @@
 // Two gates:
 //
 //   spells        — the runtime invariants (trail budget, the overcast, linear
-//                   amplification, the cast latch) and THE LAWS of the grammar
-//                   (docs/PLAN_magic_grammar.md §8), asserted over every
-//                   sequence of length <= 3 drawn from a generated alphabet.
-//                   A law that fails breaks a CLASS of spells, which is what
-//                   the line says; a change that moves one spell's numbers is
-//                   a rebaseline.
+//                   amplification, the cast latch, THE NEST) and THE LAWS of
+//                   the grammar (DESIGN.md §8), asserted over every sequence of
+//                   length <= 3 drawn from a generated alphabet. A law that
+//                   fails breaks a CLASS of spells, which is what the line
+//                   says; a change that moves one spell's numbers is a
+//                   rebaseline.
+//                   L1 totality, L2 pile commutativity, L3 multiplicity,
+//                   L4 `also` additivity, L5 delivery invariance, L6 locality,
+//                   L7 tariff monotonicity, L8 budgets, L9 nesting,
+//                   L10 mod placement, L11 flattening.
 //   spells-oracle — the C++ parser against scripts/magic_grammar.py, which is
 //                   the executable reference: every sentence in the brief and
 //                   every ordered pair over the 19-word alphabet, as canonical
@@ -41,9 +45,9 @@ namespace {
 // The test alphabet: the reference script's ALPHA2. Generated over, never
 // pinned — the gate asserts algebraic properties, not sequences.
 const char* const kAlphabet[] = {
-    "fire", "gold", "air",  "anything", "explosive", "gust",       "transmute",
-    "mend", "trail", "null", "aura",    "echo",      "shotgun",    "float",
-    "split", "projectile", "bomb", "self", "beam",
+    "fire", "gold",  "air",        "anything", "explosive", "gust",       "transmute",
+    "mend", "trail", "null",       "aura",     "echo",      "shotgun",    "float",
+    "also", "projectile", "bomb",  "self",     "beam",
 };
 
 struct FakeHealth {
@@ -58,6 +62,8 @@ struct FakeHealth {
 
 // Every field of a lowered cast list, as one string, so two lowerings can be
 // compared for IDENTITY rather than for a few hand-picked numbers.
+void SigRecord(const GlyphLibrary& lib, const DeliveryRec& d, std::string& s);
+
 void SigEffect(const GlyphLibrary& lib, const EffectInst& e, std::string& s) {
   char buf[256];
   std::snprintf(buf, sizeof buf, "{%s g%d n%d c%d A%u/%d B%u/%d r%d f%d o%d a%d m%d",
@@ -65,26 +71,39 @@ void SigEffect(const GlyphLibrary& lib, const EffectInst& e, std::string& s) {
                 e.anyA ? 1 : 0, e.matB, e.anyB ? 1 : 0, e.radius, (int)e.modField,
                 (int)e.modOp, e.modAmount, e.modN);
   s += buf;
+  // A Launch carries a whole delivery record of its own: without it two nests
+  // that differ only in the carrier would compare equal and L9/L10 would be
+  // asserting nothing.
+  for (const DeliveryRec& d : e.launch) SigRecord(lib, d, s);
   for (const EffectInst& i : e.inner) SigEffect(lib, i, s);
   s += "}";
 }
+
+void SigRecord(const GlyphLibrary& lib, const DeliveryRec& d, std::string& s) {
+  char buf[384];
+  std::snprintf(buf, sizeof buf,
+                "<d%d m%d w%d c%d sp%d lt%d ir%d g%d fu%d re%d n%d b%d p%d s%d rm%d "
+                "body%d x%d tb%d te%d",
+                d.glyph, (int)d.mech, d.weight, d.carryMille, d.speedFx, d.lifetimeTicks,
+                d.impactRadius, d.gravityMille, d.fuseTicks, d.reach, d.count, d.bounces,
+                d.pierce, d.seek, d.radiusMille, d.body ? 1 : 0, d.resolveOnExpiry ? 1 : 0,
+                d.trailBudget, d.trailEvery);
+  s += buf;
+  for (const EffectInst& e : d.trail) SigEffect(lib, e, s);
+  s += ">";
+}
 std::string CastsSignature(const GlyphLibrary& lib, const CastList& l) {
   std::string s;
-  char buf[512];
+  char buf[256];
   for (const SpellCast& c : l.casts) {
-    const DeliveryRec& d = c.delivery;
+    SigRecord(lib, c.delivery, s);
     std::snprintf(buf, sizeof buf,
-                  "[d%d m%d w%d c%d sp%d lt%d ir%d g%d fu%d re%d n%d ch%d b%d p%d "
-                  "s%d rm%d body%d x%d tb%d te%d | inst%d word%d tar%d carry%d unk%d "
-                  "t%d v%d gen%d]",
-                  d.glyph, (int)d.mech, d.weight, d.carryMille, d.speedFx, d.lifetimeTicks,
-                  d.impactRadius, d.gravityMille, d.fuseTicks, d.reach, d.count,
-                  d.children, d.bounces, d.pierce, d.seek, d.radiusMille, d.body ? 1 : 0,
-                  d.resolveOnExpiry ? 1 : 0, d.trailBudget, d.trailEvery, c.instances,
-                  c.wordCost, c.tariff, c.carryCost, c.priceUnknown ? 1 : 0, c.ticks,
-                  c.voxels, c.generation);
+                  "[inst%d word%d tar%d carry%d unk%d t%d v%d gen%d dep%d lv%d clamp%d]",
+                  c.instances, c.wordCost, c.tariff, c.carryCost, c.priceUnknown ? 1 : 0,
+                  c.ticks, c.voxels, c.generation, c.depth, c.leaves,
+                  c.instancesClamped ? 1 : 0);
     s += buf;
-    for (const EffectInst& e : d.trail) SigEffect(lib, e, s);
+    for (int m : c.wastedMods) s += "!" + std::to_string(m);
     s += "|";
     for (const EffectInst& e : c.payload) SigEffect(lib, e, s);
   }
@@ -97,27 +116,47 @@ std::string CastSignature(const GlyphLibrary& lib, const CastList& l) {
   return CastsSignature(lib, l) + buf;
 }
 
-// The R6 canonical form of a parse: per clause (delivery, weight, sorted
-// (key, n)). Two sequences with the same canonical form are the same cast by
-// definition; L2 asserts the lowering agrees.
+// The canonical form of a parse under rule 1: every BOX is its delivery plus
+// its pile SORTED, all the way down. Two sequences with the same canonical
+// form are the same cast by definition; L2 asserts the lowering agrees.
+std::string CanonNode(const GlyphLibrary& lib, const SpellTree& t, int node) {
+  if (node < 0 || node >= (int)t.nodes.size()) return "";
+  const SpellNode& n = t.nodes[node];
+  if (!n.box) return NodeKey(lib, t, node);
+  std::vector<std::string> items;
+  for (int ii : n.items)
+    items.push_back(CanonNode(lib, t, ii) + "#" + std::to_string(t.nodes[ii].n));
+  std::sort(items.begin(), items.end());
+  std::string s = "[";
+  for (const std::string& i : items) s += i + ",";
+  return s + "|" + lib.Delivery(n.glyph).id + "]";
+}
 std::string Canon(const GlyphLibrary& lib, const SpellTree& t) {
   std::string s;
-  for (const SpellClause& c : t.clauses) {
-    std::vector<std::string> items;
-    for (int ni : c.bag)
-      items.push_back(NodeKey(lib, t, ni) + "#" + std::to_string(t.nodes[ni].n));
-    std::sort(items.begin(), items.end());
-    s += "<" + std::to_string(c.delivery) + "x" + std::to_string(c.weight) + ":";
-    for (const std::string& i : items) s += i + ",";
-    s += ">";
-  }
+  for (const SpellClause& c : t.clauses) s += "<" + CanonNode(lib, t, c.root) + ">";
   return s;
+}
+
+// The record of the FIRST carrier a cast fires. Under rule 2 a spoken
+// delivery is a box inside the hand cast's payload, not the cast's own record
+// — so a fixture that wants "the bomb's fuse" has to look one level in.
+const DeliveryRec* BoxRecord(const SpellCast& c) {
+  for (const EffectInst& e : c.payload)
+    if (e.verb == SpellVerb::Launch && !e.launch.empty()) return &e.launch[0];
+  return nullptr;
+}
+
+// How deep the launch boxes nest under a node, the hand box counted.
+int BoxDepth(const SpellTree& t, int node) {
+  if (node < 0 || node >= (int)t.nodes.size() || !t.nodes[node].box) return 0;
+  int d = 0;
+  for (int ii : t.nodes[node].items) d = std::max(d, BoxDepth(t, ii));
+  return d + 1;
 }
 
 int32_t RecordField(const DeliveryRec& d, ModField f) {
   switch (f) {
     case ModField::Count: return d.count;
-    case ModField::Children: return d.children;
     case ModField::Gravity: return d.gravityMille;
     case ModField::Speed: return d.speedFx;
     case ModField::Lifetime: return d.lifetimeTicks;
@@ -309,7 +348,9 @@ Status GateSpells(Ctx& c, std::string& detail) {
     // than three ticks); and within the fall rather than at the lifetime
     // bound.
     deliverOk = deliverColumn && launched && resolved && deliverY >= deliverGround - 1 &&
-                deliverTicks >= 3 && deliverTicks < sp.casts[0].delivery.lifetimeTicks;
+                deliverTicks >= 3 &&
+                deliverTicks < (BoxRecord(sp.casts[0]) ? BoxRecord(sp.casts[0])->lifetimeTicks
+                                                       : sp.casts[0].delivery.lifetimeTicks);
   }
 
   // ---- (2) the overcast ------------------------------------------------------
@@ -477,10 +518,16 @@ Status GateSpells(Ctx& c, std::string& detail) {
         const CastList l = CompileSpell(lib, stackOf(s));
         const int32_t want = std::min(N, cap);
         bool ok = !l.casts.empty() && l.manaCost >= prevCost;
-        // Every item of the parse carries n == min(N, cap): the delivery's
-        // weight for a delivery word, the node for everything else.
+        // Every item of the parse carries n == min(N, cap) - EXCEPT a
+        // delivery, which does not merge at all: each one boxes what is in
+        // front of it, so N of them are N nested boxes under the hand (rule
+        // 2). And `also` is N+1 sentences, not one word said N times.
         if (gd.sort == GlyphSort::Delivery) {
-          ok = ok && l.tree.clauses.size() == 1 && l.tree.clauses[0].weight == want;
+          ok = ok && l.tree.clauses.size() == 1 &&
+               BoxDepth(l.tree, l.tree.clauses[0].root) == (int)N + 1 &&
+               l.casts[0].depth == (int)N;
+        } else if (gd.sort == GlyphSort::Separator) {
+          ok = ok && (int)l.tree.clauses.size() == (int)N + 1;
         } else {
           ok = ok && l.tree.clauses.size() == 1 && l.tree.clauses[0].bag.size() == 1 &&
                l.tree.nodes[l.tree.clauses[0].bag[0]].n == want;
@@ -578,36 +625,37 @@ Status GateSpells(Ctx& c, std::string& detail) {
     }
   }
 
-  // L4 clause independence — cost(A ‖ B) = cost(A) + cost(B) and the casts
-  // are the union, whenever the boundary holds: the parse of A+B is the parse
-  // of A beside the parse of B. (A B that opens with an operator whose left
-  // slot takes A's delivery word — `projectile null` — is a different
-  // sentence, and the canonical-form precondition excludes it.)
+  // L4 sentence independence - `A also B` costs cost(A) + cost(B) and its
+  // casts are the union. THE BOUNDARY IS `also` NOW, not a delivery: a
+  // delivery no longer ends anything, it boxes what came before it and the
+  // sentence carries on (rule 2), so the only additive seam left is the one
+  // word whose whole job is to be a seam.
   int l4 = 0, l4cases = 0;
   {
-    std::vector<std::vector<int>> as, bs;
-    std::vector<CastList> lbs;
+    const int gAlso = lib.Find("also");
+    std::vector<std::vector<int>> shortSeqs;
+    std::vector<CastList> lowered;
     for (const auto& s : seqs) {
       if (s.size() > 2) continue;
-      bs.push_back(s);
-      lbs.push_back(CompileSpell(lib, stackOf(s)));
-      if (lib.glyphs[s.back()].sort == GlyphSort::Delivery) as.push_back(s);
+      shortSeqs.push_back(s);
+      lowered.push_back(CompileSpell(lib, stackOf(s)));
     }
-    for (const auto& a : as) {
-      const CastList la = CompileSpell(lib, stackOf(a));
+    for (size_t ai = 0; gAlso >= 0 && ai < shortSeqs.size(); ai++) {
+      const CastList& la = lowered[ai];
       const std::string ca = Canon(lib, la.tree);
       const std::string sa = CastsSignature(lib, la);
-      for (size_t bi = 0; bi < bs.size(); bi++) {
-        const CastList& lb = lbs[bi];
-        std::vector<int> ab = a;
-        ab.insert(ab.end(), bs[bi].begin(), bs[bi].end());
+      for (size_t bi = 0; bi < shortSeqs.size(); bi++) {
+        const CastList& lb = lowered[bi];
+        std::vector<int> ab = shortSeqs[ai];
+        ab.push_back(gAlso);
+        ab.insert(ab.end(), shortSeqs[bi].begin(), shortSeqs[bi].end());
         const CastList lab = CompileSpell(lib, stackOf(ab));
         if (Canon(lib, lab.tree) != ca + Canon(lib, lb.tree)) continue;
         l4cases++;
         const bool ok = lab.manaCost == la.manaCost + lb.manaCost &&
                         lab.priceUnknown == (la.priceUnknown || lb.priceUnknown) &&
                         CastsSignature(lib, lab) == sa + CastsSignature(lib, lb);
-        if (!ok) fail("L4", spell(a) + " || " + spell(bs[bi]));
+        if (!ok) fail("L4", spell(shortSeqs[ai]) + " also " + spell(shortSeqs[bi]));
         else l4++;
       }
     }
@@ -650,27 +698,148 @@ Status GateSpells(Ctx& c, std::string& detail) {
     }
   }
 
-  // L5 delivery invariance — the payload of `E... projectile`, `E... bomb`
-  // and `E... self` is IDENTICAL; only the delivery record differs.
+  // L5 delivery invariance - the PAYLOAD INSIDE the box of `E... D` is
+  // identical for every flight D; only the record differs. The box itself
+  // differs, of course: that is the whole of rule 2.
   int l5 = 0;
   {
-    const int gProj = lib.Find("projectile"), gBomb = lib.Find("bomb"), gSelf = lib.Find("self");
+    const int ds[4] = {lib.Find("projectile"), lib.Find("bolt"), lib.Find("lob"),
+                       lib.Find("orb")};
     for (const auto& s : seqs) {
       if (s.size() > 2) continue;
       bool hasDelivery = false;
-      for (int g : s) hasDelivery = hasDelivery || lib.glyphs[g].sort == GlyphSort::Delivery;
+      for (int g : s)
+        hasDelivery = hasDelivery || lib.glyphs[g].sort == GlyphSort::Delivery ||
+                      lib.glyphs[g].sort == GlyphSort::Separator;
       if (hasDelivery) continue;
-      std::string sig[3];
-      const int ds[3] = {gProj, gBomb, gSelf};
-      for (int k = 0; k < 3; k++) {
+      std::string sig[4];
+      bool got[4] = {false, false, false, false};
+      for (int k = 0; k < 4; k++) {
+        if (ds[k] < 0) continue;
         std::vector<int> sd = s;
         sd.push_back(ds[k]);
         const CastList l = CompileSpell(lib, stackOf(sd));
-        if (l.casts.size() != 1) continue;
-        for (const EffectInst& e : l.casts[0].payload) SigEffect(lib, e, sig[k]);
+        if (l.casts.size() != 1 || l.casts[0].payload.size() != 1) continue;
+        const EffectInst& bx = l.casts[0].payload[0];
+        if (bx.verb != SpellVerb::Launch) continue;
+        for (const EffectInst& e : bx.inner) SigEffect(lib, e, sig[k]);
+        got[k] = true;
       }
-      if (sig[0] != sig[1] || sig[0] != sig[2]) fail("L5", spell(s) + " + delivery");
+      bool ok = true;
+      for (int k = 1; k < 4; k++)
+        if (got[0] && got[k] && sig[k] != sig[0]) ok = false;
+      if (!ok) fail("L5", spell(s) + " + delivery");
       else l5++;
+    }
+  }
+
+
+  // L9 nesting - for any E and flight deliveries D1, D2, the payload of the
+  // `E D1 D2` box is EXACTLY ONE Launch, and that Launch is bit-for-bit the
+  // one `E D1` lowers to. This is rule 2 stated as an equation: a delivery
+  // wraps what came before it and changes nothing about it.
+  int l9 = 0, l9cases = 0;
+  {
+    std::vector<int> flights;
+    for (int i = 0; i < (int)lib.glyphs.size(); i++)
+      if (lib.glyphs[i].sort == GlyphSort::Delivery &&
+          lib.glyphs[i].mech == DeliveryMech::Flight)
+        flights.push_back(i);
+    for (const auto& e : seqs) {
+      if (e.size() > 1) continue;
+      bool clean = true;
+      for (int g : e)
+        clean = clean && lib.glyphs[g].sort != GlyphSort::Delivery &&
+                lib.glyphs[g].sort != GlyphSort::Separator;
+      if (!clean) continue;
+      for (int d1 : flights) {
+        std::vector<int> s1 = e;
+        s1.push_back(d1);
+        const CastList l1 = CompileSpell(lib, stackOf(s1));
+        if (l1.casts.size() != 1 || l1.casts[0].payload.size() != 1) continue;
+        std::string want;
+        SigEffect(lib, l1.casts[0].payload[0], want);
+        for (int d2 : flights) {
+          std::vector<int> s2 = s1;
+          s2.push_back(d2);
+          const CastList l2 = CompileSpell(lib, stackOf(s2));
+          l9cases++;
+          bool ok = l2.casts.size() == 1 && l2.casts[0].payload.size() == 1 &&
+                    l2.casts[0].payload[0].verb == SpellVerb::Launch &&
+                    l2.casts[0].payload[0].inner.size() == 1;
+          if (ok) {
+            std::string got;
+            SigEffect(lib, l2.casts[0].payload[0].inner[0], got);
+            ok = got == want;
+          }
+          if (!ok) fail("L9", spell(s2) + " is not [" + spell(s1) + "] boxed");
+          else l9++;
+        }
+      }
+    }
+  }
+
+  // L10 mod placement - `E mod D` and `mod E D` are the same cast (a pending
+  // mod does not care when in the pile it was spoken), and in `E D mod` the
+  // mod landed on the HAND instead: the box `E D` made is untouched by it.
+  int l10 = 0, l10cases = 0;
+  {
+    std::vector<int> mods, effects, deliveries;
+    for (int g : alpha) {
+      if (lib.glyphs[g].sort == GlyphSort::Mod) mods.push_back(g);
+      if (lib.glyphs[g].sort == GlyphSort::Effect || lib.glyphs[g].sort == GlyphSort::Matter)
+        effects.push_back(g);
+      if (lib.glyphs[g].sort == GlyphSort::Delivery) deliveries.push_back(g);
+    }
+    for (int e : effects)
+      for (int m : mods)
+        for (int d : deliveries) {
+          const CastList a = CompileSpell(lib, stackOf({e, m, d}));
+          const CastList b2 = CompileSpell(lib, stackOf({m, e, d}));
+          l10cases++;
+          if (CastSignature(lib, a) != CastSignature(lib, b2))
+            fail("L10", spell({e, m, d}) + "  vs  " + spell({m, e, d}));
+          else l10++;
+          // `E D mod`: the box is the one `E D` made, unchanged; the mod is on
+          // the hand record and shows up in the cast's wasted list or its own
+          // fields, never inside the box.
+          const CastList plain = CompileSpell(lib, stackOf({e, d}));
+          const CastList after = CompileSpell(lib, stackOf({e, d, m}));
+          l10cases++;
+          bool ok = plain.casts.size() == 1 && after.casts.size() == 1 &&
+                    plain.casts[0].payload.size() == 1 && after.casts[0].payload.size() == 1;
+          if (ok) {
+            std::string want, got;
+            SigEffect(lib, plain.casts[0].payload[0], want);
+            SigEffect(lib, after.casts[0].payload[0], got);
+            ok = want == got;
+          }
+          if (!ok) fail("L10", spell({e, d, m}) + ": the mod reached inside the box");
+          else l10++;
+        }
+  }
+
+  // L11 flattening - a Fatal cast of ANY sequence emits no launches: nothing
+  // leaves the caster's body, whatever the sentence nested.
+  int l11 = 0;
+  {
+    SpellSystem fsys;
+    fsys.SetLibrary(&lib);
+    for (const auto& sq : seqs) {
+      const CastList l = CompileSpell(lib, stackOf(sq));
+      if (l.manaCost <= 0) continue;   // a free spell never resolves Fatal
+      CasterState cs;
+      cs.mana = 0;
+      cs.manaMax = 100;
+      FakeHealth hp(0);
+      SpellEmission e;
+      const CastResult res =
+          fsys.Cast(l, cs, hp.cb, 4242, {0, 0, 0}, {kSpellFxOne, 0, 0}, 7, e);
+      if (res.outcome != CastOutcome::Fatal || !e.launches.empty() ||
+          fsys.LiveCount() != 0 || fsys.BombCount() != 0 || !e.carveCaster)
+        fail("L11", spell(sq));
+      else l11++;
+      fsys.Clear();
     }
   }
 
@@ -707,7 +876,8 @@ Status GateSpells(Ctx& c, std::string& detail) {
     bsys.Cast(sp, cs, hp.cb, 5, origin, {kSpellFxOne, 0, 0}, 1, e0);
     const bool requested = e0.bodyRequests.size() == 1 && e0.explosions.empty() &&
                            bsys.BombCount() == 1 && bsys.LiveCount() == 0;
-    const int32_t fuse = sp.casts.empty() ? 0 : sp.casts[0].delivery.fuseTicks;
+    const DeliveryRec* bombRec = sp.casts.empty() ? nullptr : BoxRecord(sp.casts[0]);
+    const int32_t fuse = bombRec ? bombRec->fuseTicks : 0;
     bool adopted = requested && bsys.AdoptBody(e0.bodyRequests[0].token, 77);
     // The owner reports the body rolling 20 voxels away over the fuse.
     fake.at = Vec3{SpellFxToFloat(origin.x) + 20.0f, SpellFxToFloat(origin.y),
@@ -736,7 +906,10 @@ Status GateSpells(Ctx& c, std::string& detail) {
   // and generation; nothing lowers to an unbounded process (rule 2).
   int l8 = 0;
   {
-    const int32_t tickBound = 2 * lib.budgets.maxLifetimeTicks + lib.budgets.maxStatusTicks;
+    // A nest chains clocks: every level adds its own lifetime + fuse before
+    // the next one starts, and a length-3 sentence can nest 3 deep.
+    const int32_t tickBound =
+        6 * lib.budgets.maxLifetimeTicks + lib.budgets.maxStatusTicks;
     for (const auto& s : seqs) {
       const CastList l = CompileSpell(lib, stackOf(s));
       bool ok = true;
@@ -744,7 +917,15 @@ Status GateSpells(Ctx& c, std::string& detail) {
         ok = ok && c.ticks >= 1 && c.ticks <= tickBound && c.voxels >= 0 &&
              c.voxels < (1 << 30) && c.instances >= 1 &&
              c.instances <= lib.budgets.maxInstances && c.generation >= 0 &&
-             c.generation <= lib.budgets.maxGeneration;
+             c.generation <= lib.budgets.maxGeneration &&
+             // The nest is bounded twice over: the LEAF instance count (the
+             // product of the fans down each path) never exceeds the instance
+             // cap, and the depth never exceeds the words that could have made
+             // it. What stops a deep nest from FIRING is the generation cap,
+             // asserted at runtime in check (8) - a sentence may SAY more than
+             // the engine will do, and saying so is not an unbounded process.
+             c.leaves >= 1 && c.leaves <= lib.budgets.maxInstances &&
+             c.depth >= 0 && c.depth <= kSpellStackMax;
       if (!ok) fail("L8", spell(s));
       else l8++;
     }
@@ -1097,23 +1278,112 @@ Status GateSpells(Ctx& c, std::string& detail) {
                 parentVox, charredAtEnd, burningAtEnd, cookedAtEnd);
   }
 
+
+  // ---- (8) THE NEST, AT RUNTIME (rule 2) -------------------------------------
+  // A box that says "fire a bolt" must actually fire one, from the parent's
+  // impact, one generation down, and the chain must STOP at the generation
+  // cap. Four sentences, one fixture: bolts fired horizontally through open
+  // air inside the window, ticked until nothing is left.
+  bool nestOk = false;
+  int nestChild = -1, nestFuseGap = -1, nestFan = 0, nestDeep = 0;
+  {
+    const IVec3 worg = world.WindowOrigin();
+    const SpellFxVec origin{SpellFxFromFloat((float)(worg.x * (int)kChunk + 8)),
+                            SpellFxFromFloat((float)(worg.y * (int)kChunk + (int)kWorldN / 2)),
+                            SpellFxFromFloat((float)(worg.z * (int)kChunk + (int)kWorldN / 2))};
+    // What a flight reports: how many CHILDREN (generation >= 1 carriers) were
+    // ever born, the tick the first one appeared, the tick a parent settled on
+    // its fuse, the deepest generation reached, and how many blasts landed.
+    struct Flight {
+      int children = 0, firstChildTick = -1, restTick = -1, maxGen = 0, blasts = 0;
+    };
+    auto fly = [&](std::initializer_list<const char*> words) {
+      Flight f;
+      SpellSystem nsys;
+      nsys.SetLibrary(&lib);
+      CastList sp = CompileSpell(lib, speak(words));
+      CasterState cs;
+      cs.mana = 1 << 28;
+      cs.manaMax = 1 << 28;
+      FakeHealth hp(1 << 28);
+      SpellEmission e0;
+      nsys.Cast(sp, cs, hp.cb, 31, origin, {kSpellFxOne, 0, 0}, 1, e0);
+      std::vector<uint32_t> childSeqs;
+      for (int t = 0; t < 3 * (int)lib.budgets.maxLifetimeTicks; t++) {
+        SpellEmission e;
+        nsys.Tick((uint32_t)(4000 + t), world, classOf, e, nullptr);
+        f.blasts += (int)e.explosions.size();
+        for (const SpellProjectile& pr : nsys.Live()) {
+          f.maxGen = std::max(f.maxGen, (int)pr.gen);
+          if (pr.resting && f.restTick < 0) f.restTick = t;
+          if (pr.gen < 1) continue;
+          bool known = false;
+          for (uint32_t q : childSeqs) known = known || q == pr.seq;
+          if (known) continue;
+          childSeqs.push_back(pr.seq);
+          f.children++;
+          if (f.firstChildTick < 0) f.firstChildTick = t;
+        }
+        if (nsys.LiveCount() == 0 && nsys.BombCount() == 0 && t > 2) break;
+      }
+      return f;
+    };
+
+    // (a) ONE child, launched where the parent hit, and IT is what explodes.
+    const Flight a2 = fly({"explosive", "projectile", "projectile"});
+    const bool oneChild = a2.children == 1 && a2.blasts == 1 && a2.maxGen == 1;
+    nestChild = a2.children;
+    // (b) `fuse` on the OUTER box: the parent rests where it landed and the
+    // child is born exactly `fuse` ticks later.
+    const Flight b2 = fly({"explosive", "projectile", "fuse", "projectile"});
+    const int gFuse = lib.Find("fuse");
+    const int32_t fuseTicks = gFuse >= 0 ? lib.glyphs[gFuse].amount : 0;
+    nestFuseGap = (b2.firstChildTick >= 0 && b2.restTick >= 0)
+                      ? b2.firstChildTick - b2.restTick
+                      : -1;
+    const bool fused = b2.children == 1 && nestFuseGap == fuseTicks && b2.blasts == 1;
+    // (c) `shotgun` between the two deliveries: three carriers fan, and each
+    // fires one child, so three children explode.
+    const Flight c2 = fly({"explosive", "projectile", "shotgun", "projectile"});
+    nestFan = c2.children;
+    const bool fanned = c2.children == 3 && c2.blasts == 3;
+    // (d) THE DEPTH CAP. Five nested boxes is a legal, priced, total sentence;
+    // the engine simply stops making carriers past budgets.maxGeneration
+    // (rule 2), and nothing here runs away.
+    const Flight d2 = fly({"explosive", "projectile", "projectile", "projectile",
+                           "projectile", "projectile"});
+    nestDeep = d2.maxGen;
+    const bool capped = d2.maxGen <= lib.budgets.maxGeneration;
+    nestOk = oneChild && fused && fanned && capped;
+    std::printf("spell nest: %s (one child: %d born, gen %d, %d blast(s); fuse gap %d/%d "
+                "(rest t%d, child t%d); shotgun children %d over %d blasts; five deliveries "
+                "reach gen %d of %d)\n",
+                nestOk ? "PASS" : "FAIL", a2.children, a2.maxGen, a2.blasts, nestFuseGap,
+                fuseTicks, b2.restTick, b2.firstChildTick, nestFan, c2.blasts, nestDeep,
+                lib.budgets.maxGeneration);
+  }
+
   const bool lawsOk = alphaOk && lawFail == 0 && l1 > 0 && l2pairs > 0 && l3 > 0 &&
-                      l6cases > 0 && l4cases > 0 && l7 > 0 && l5 > 0 && l8 > 0;
+                      l6cases > 0 && l4cases > 0 && l7 > 0 && l5 > 0 && l8 > 0 &&
+                      l9cases > 0 && l10cases > 0 && l11 > 0;
   const bool spellOk = budgetOk && deliverOk && fatalOk && carveAsked && fatalEmitted &&
-                       sprayOk && latchOk && lawsOk && bombOk && sustainOk && mendOk;
+                       sprayOk && latchOk && lawsOk && bombOk && sustainOk && mendOk &&
+                       nestOk;
   std::printf(
       "spells: %s (trail authorized %lld/%d voxels over %d ticks, died=%d; "
       "delivered=%d at y=%d over ground %d (%d,%d; column=%d mirrored=%d) after %d ticks; "
       "overcast fatal=%d carve=%d payload=%d; spray %d/%d/%d voxels for "
-      "%d/%d/%d mana; bomb=%d sustain=%d mend=%d; laws over %zu sequences: L1 %d, L2 %d/%d, "
-      "L3 %d, L4 %d/%d, L5 %d, L6 %d/%d, L7 %d, L8 %d, %d failures)\n",
+      "%d/%d/%d mana; bomb=%d sustain=%d mend=%d nest=%d; laws over %zu sequences: "
+      "L1 %d, L2 %d/%d, L3 %d, L4 %d/%d, L5 %d, L6 %d/%d, L7 %d, L8 %d, L9 %d/%d, "
+      "L10 %d/%d, L11 %d, %d failures)\n",
       spellOk ? "PASS" : "FAIL", (long long)trailVolume, authoredBudget, flownTicks,
       diedWithBudget ? 1 : 0, deliverOk ? 1 : 0, deliverY, deliverGround, deliverSx, deliverSz,
       deliverColumn ? 1 : 0, deliverMirrored ? 1 : 0, deliverTicks,
       fatalOk ? 1 : 0, carveAsked ? 1 : 0, fatalEmitted ? 1 : 0,
       sprayN[0], sprayN[1], sprayN[2], sprayCost[0], sprayCost[1], sprayCost[2],
-      bombOk ? 1 : 0, sustainOk ? 1 : 0, mendOk ? 1 : 0, seqs.size(), l1, l2, l2pairs, l3, l4,
-      l4cases, l5, l6, l6cases, l7, l8, lawFail);
+      bombOk ? 1 : 0, sustainOk ? 1 : 0, mendOk ? 1 : 0, nestOk ? 1 : 0, seqs.size(), l1,
+      l2, l2pairs, l3, l4, l4cases, l5, l6, l6cases, l7, l8, l9, l9cases, l10, l10cases,
+      l11, lawFail);
   detail = Format("laws %zu seq, %d failures", seqs.size(), lawFail);
   return spellOk ? Status::Pass : Status::Fail;
 }
