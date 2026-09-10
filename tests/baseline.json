@@ -28,7 +28,7 @@
   "ragdollBlastMaxTravel": "120",
   "ragdollGetUpMaxTicks": "400",
   "treeAtlasHash": "53691eda995f232e",
-  "determinismHash": "9bfed213",  "determinism": "pass",
+  "determinismHash": "eb284643",  "determinism": "pass",
   "sleep": "pass",
   "ca-slope": "pass",
   "ca-slope-hybrid": "fail",
