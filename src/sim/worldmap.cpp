@@ -266,7 +266,19 @@ void OverlayLandformSites(const std::vector<LandformSite>& sites, int landformRa
           tQ = static_cast<int64_t>(imath::Sqrt64(static_cast<uint64_t>(ru * ru + rv * rv)));
         } else {
           const uint64_t d2 = static_cast<uint64_t>(dx * dx + dz * dz);
-          tQ = imath::DivRound(static_cast<int64_t>(imath::Sqrt64(d2 << 32)), r);
+          // `d2 << 32` is exact only while d2 < 2^32, i.e. while the distance
+          // is under 65,536 voxels; past that it wraps the u64 and bakes
+          // garbage. That is REACHABLE, because the loader clamps radius to
+          // 1 << 20 (a 105 km site), so take the root first and shift after
+          // for the far branch: the fraction it drops is under one voxel out
+          // of a distance already past 65,536, hence under 1/65,536 of t --
+          // below the Q16.16 LSB, let alone the byte the plane stores.
+          // The ridge branch needs no such guard: dx * ca peaks at
+          // 2^20 * 2^30 = 2^50, vQ << 16 at 2^52, and ru / rv are bounded by
+          // ~2^18 each, so its ru*ru + rv*rv sits around 2^36.
+          tQ = d2 < (1ull << 32)
+                   ? imath::DivRound(static_cast<int64_t>(imath::Sqrt64(d2 << 32)), r)
+                   : imath::DivRound(static_cast<int64_t>(imath::Sqrt64(d2) << 16), r);
         }
         if (tQ >= 65536) continue;
         int64_t fQ;

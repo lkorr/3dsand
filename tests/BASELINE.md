@@ -650,6 +650,7 @@ arithmetic did, by design.
 |---|---|
 | landform bytes, shipped map | **0 of 38,416** — the integer bake is the identity here |
 | landform bytes, 40 randomised site sets (all 4 shapes, radii 3..30,000, rotations +-720 deg) | worst case **4 of 38,416, all by exactly 1** |
+| landform bytes, 40 more at radii 50,000..1<<20 (the loader's clamp) | worst case **59 of 38,416, none by more than 1** |
 | the four wind words vs the float ones, 30,770 sampled ticks | **<= 1 Q16.16 LSB** (3 on gust) |
 | `FLUID_FOAM_DECAY` at the shipped 2.2 s / 9 substeps | 65425 -> **65426** |
 

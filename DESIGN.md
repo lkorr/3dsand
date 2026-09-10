@@ -2942,7 +2942,17 @@ uses `std::sqrt` — but cos and sin are not specified to be correctly rounded a
 are not bit-identical across platforms. Measured on the shipped map the change
 is the identity (0 of 38,416 bytes move); over 40 randomised site sets (all four
 shapes, radii 3..30,000, rotations ±720°) the worst case is 4 bytes moving by
-exactly 1.
+exactly 1, and over 40 more at radii 50,000..1<<20 it is 59 bytes, still none by
+more than 1.
+
+**The distance has two branches and the split is load-bearing.** The exact form
+is `sqrt(d2 << 32)`, which is a Q16.16 distance with nothing rounded on the way;
+it is only valid while `d2 < 2^32`, i.e. under 65,536 voxels. Past that it wraps
+the u64 and bakes garbage — and it IS reachable, because the site loader clamps
+`radius` to `1 << 20`. So beyond that distance the root is taken first and the
+shift applied after, dropping under one voxel out of at least 65,536, which is
+below the Q16.16 LSB and far below the byte the plane stores. The ridge branch
+needs no guard: `dx * ca` peaks at 2^50 and its `ru*ru + rv*rv` sits near 2^36.
 
 **The ground flora is rows.** The shader's hard-coded undergrowth / flower
 chain (mushrooms under crowns, brambles, moss, saplings, litter; flowers, tall
