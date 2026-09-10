@@ -205,6 +205,7 @@ bool Device::PopValidationScopeBlocking() const { return p_->PopValidationScopeB
 void Device::ProcessEvents() const { p_->ProcessEvents(); }
 
 bool Device::WaitOldestPendingMap() const { return p_->WaitOldestPendingMap(); }
+int Device::PendingMapCount() const { return p_ ? p_->PendingMapCount() : 0; }
 
 void Device::WaitIdle() const { p_->WaitIdle(); }
 

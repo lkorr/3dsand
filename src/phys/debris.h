@@ -393,6 +393,12 @@ class DebrisSystem {
     uint32_t lastWakeTick = 0;      // the most recent of either
     IVec3 lastWakeChunk{};          // ...and the chunk whose mesh changed
     uint32_t maxInactiveTicks = 0;  // longest quiet run ANY body managed
+    // ManageTerrain's budget, observed: real rebuilds, rebuilds pushed to a
+    // later tick by kTerrainBuildsPerTick, and stale entries whose occupancy
+    // box hashed identical (no mesh, no Jolt, no wake).
+    uint32_t terrainBuilds = 0;
+    uint32_t terrainDeferred = 0;
+    uint32_t terrainSame = 0;
   };
   const SettleProbe& Settle() const { return settle_; }
   void ResetSettleProbe() { settle_ = SettleProbe{}; }
@@ -615,8 +621,10 @@ class DebrisSystem {
     uint32_t builtVersion = 0;
     uint32_t lastNeeded = 0;
     uint32_t lastRefreshReq = 0;
-    uint64_t meshHash = 0;  // collision-surface identity: liquids flowing
-                            // through a chunk must not rebuild-and-wake
+    uint64_t occHash = 0;   // collision-surface identity: the hash of the 18^3
+                            // occupancy box the mesh is a pure function of, so
+                            // liquids flowing through a chunk neither rebuild
+                            // nor wake, and the compare runs BEFORE the mesh
   };
 
   // Are every one of this region's chunks cached at or past `required`? When
@@ -793,6 +801,7 @@ class DebrisSystem {
   // cost that capped the scan rate. Kept between calls and `assign`ed, so the
   // zeroing stays and the allocator leaves the hot path.
   std::vector<uint32_t> scanWords_;
+  std::vector<std::pair<IVec3, float>> terrainNeed_;  // ManageTerrain scratch
   std::vector<uint8_t> scanSolid_;
   std::vector<int32_t> scanLabel_;
   std::vector<std::pair<Vec3, float>> extraAnchors_;    // mob limbs, this tick

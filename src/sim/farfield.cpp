@@ -48,11 +48,15 @@ void FarField::ResetLevel(uint32_t k, IVec3 desired) {
   origins_[k] = desired;
   uboDirty_ = true;
   for (uint32_t slot = 0; slot < kFarNumChunks; slot++) Enqueue(k, slot);
+  bulkPending_[k] += kFarNumChunks;
 }
 
 void FarField::FullRefill(IVec3 playerChunk) {
   queue_.clear();
-  for (uint32_t k = 0; k < kFarLevels; k++) pending_[k] = 0;
+  for (uint32_t k = 0; k < kFarLevels; k++) {
+    pending_[k] = 0;
+    bulkPending_[k] = 0;
+  }
   // coarsest first: the horizon band appears before the near bands refine
   for (int k = (int)kFarLevels - 1; k >= 0; k--)
     ResetLevel((uint32_t)k, DesiredOrigin(playerChunk, (uint32_t)k));
@@ -67,7 +71,17 @@ float FarField::SafeRadiusMeters() const {
     // level k+1 (1-based) is incomplete; trust out to level k's half-extent,
     // or — if even level 1 is incomplete — only the residency window itself,
     // which is the pre-cascade draw distance.
-    return k == 0 ? kWindowHalfExtentMeters : kFarHalfExtentMeters(k);
+    const float inner = k == 0 ? kWindowHalfExtentMeters : kFarHalfExtentMeters(k);
+    if (bulkPending_[k] > 0) return inner;
+    // Only PLANES outstanding: the level was complete and what is missing is
+    // its incoming face, one level chunk thick, on the side the player is
+    // moving toward. Everything inside that face is filled, so the trusted
+    // radius is the level's own half-extent less the face — under the play
+    // cap a plane takes ~16 ticks to land, and fogging the whole level out
+    // for that long would pulse the horizon on every chunk boundary crossed.
+    const float face =
+        (float)(kChunk << (k + 1 + kFarShiftBase)) * kVoxelMeters;
+    return std::max(inner, kFarHalfExtentMeters(k + 1) - face);
   }
   return kFarHalfExtentMeters(kFarLevels);   // everything filled: full horizon
 }
@@ -110,7 +124,12 @@ uint32_t FarField::PrepareTick(const rhi::Queue& queue) {
     uboDirty_ = false;
   }
   if (queue_.empty()) return 0;
-  const uint32_t cap = (uint32_t)std::min(queue_.size(), (size_t)kFarListCap);
+  // A reset (teleport, load, the startup horizon) drains at the list cap; in
+  // play, incoming planes drain at kPlayFillCap (see farfield.h).
+  bool bulk = false;
+  for (uint32_t k = 0; k < kFarLevels; k++) bulk = bulk || bulkPending_[k] > 0;
+  const uint32_t cap = (uint32_t)std::min(
+      queue_.size(), (size_t)(bulk ? kFarListCap : kPlayFillCap));
   std::vector<uint32_t> list;
   list.reserve(cap);
   patchHeader_.clear();
@@ -156,6 +175,7 @@ uint32_t FarField::PrepareTick(const rhi::Queue& queue) {
     // filled from here on — SafeRadiusMeters is read on the render path of the
     // same frame, one submit behind at worst.
     pending_[k]--;
+    if (bulkPending_[k] > 0) bulkPending_[k]--;  // FIFO: resets pop first
   }
   const uint32_t count = (uint32_t)list.size();
   if (count == 0) return 0;   // first entry alone blew the budget: cannot happen

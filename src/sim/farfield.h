@@ -83,6 +83,37 @@ class FarField {
   // SafeRadiusMeters O(kFarLevels)). Incremented on every enqueue, decremented
   // as PrepareTick pops.
   uint32_t pending_[kFarLevels] = {};
+  // Of those, how many came from a RESET (ResetLevel / FullRefill: a whole
+  // level, 32,768 entries) rather than from an incoming plane. Popped first,
+  // because the queue is FIFO and a reset's entries precede any plane queued
+  // after it. Two consumers: PrepareTick's cap (a reset takes kFarListCap per
+  // tick — the horizon has to exist — while planes take kPlayFillCap), and
+  // SafeRadiusMeters (a plane-incomplete level is trusted out to its edge
+  // minus the plane; a reset-incomplete one only to the level inside it).
+  uint32_t bulkPending_[kFarLevels] = {};
+  // THE PLAY CAP (2026-09-09). A far entry is a 16^3-cell sieve — 4,096
+  // genCell evaluations plus the surface skin — and measured ~0.2 ms of GPU
+  // each on an RTX 3060 Ti: a level's incoming plane is 1,024 of them, so
+  // walking across a level-1 chunk boundary (every 32 voxels) put 180-240 ms
+  // of GPU into ONE tick. `--frames 900 --autowalk`: farField p50 0.002 ms,
+  // p99 184 ms, max 206 ms — the largest GPU spike in the walking frame, and
+  // what the CPU saw as a present wait or, before the tick throttle, a
+  // snapshot stall. 64 per tick is ~12 ms of GPU, spreads a plane over 16
+  // ticks, and covers walking demand (~50 entries/tick across all levels)
+  // with headroom. Sprint flight demands ~700/tick and backlogs at ANY cap the
+  // frame can afford; that is the render-only horizon lagging the player,
+  // which the adaptive fog already covers, and it drains the moment the
+  // player slows. Resets are exempt (see bulkPending_).
+  //
+  // The MEAN is inherent, only the shape moves: walking costs ~8.5 ms/tick of
+  // sieve whatever the cap (an L1 plane per 32 voxels ~ 5 ms per voxel of
+  // travel, plus the coarser levels). Measured `--autowalk --duel-dummy`,
+  // whole-frame p50 / p95 / p99 / max, >33 ms: uncapped 19.8 / 28 / 52 / 153,
+  // 2.5%; cap 64: 20.6 / 43 / 54 / 73, 19%; cap 32: 29.1 / 48 / 64 / 81, 42%.
+  // 32 put ~5 ms on nearly every frame and the median frame lost a vblank;
+  // 64 keeps the median and only cuts the tail. The next lever is the sieve's
+  // per-entry cost, not this number.
+  static constexpr uint32_t kPlayFillCap = 64;
   bool uboDirty_ = true;
   // Reused across ticks so a fill-heavy frame does not reallocate: the header
   // is 2 u32 per dispatched entry, the payload is the concatenated patch runs.

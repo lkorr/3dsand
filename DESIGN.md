@@ -2914,6 +2914,24 @@ neighbors, so this needs an explicit connectivity pass:
   at edge midpoints, i.e. on a half-integer lattice, so identical positions
   dedupe exactly by integer key with no epsilon compare, and ~4× fewer vertices
   reach Jolt's `MeshShape` build (the dominant cost of a rebuild).
+- **Rebuilds are BUDGETED (2026-09-09):** `ManageTerrain` used to rebuild every
+  stale patch it wanted in the tick it wanted it, and a chunk-boundary crossing
+  stales a whole face of anchor chunks at once — a mob that has just acquired a
+  target widens its anchor to `navRadius + 4` (~216 chunks), arriving at
+  `World::kFetchPerTick` = 64 per snapshot and all polygonized, tree-built and
+  broadphase-added on the tick they landed. That was the 50-100 ms "Game
+  Systems" spike while walking. Now `kTerrainBuildsPerTick` (6) real rebuilds
+  per tick, nearest anchor first (the ground under a body is always the first
+  patch made; the far edge of a planner's horizon, which only the fetch
+  serves, is the last), and the surface's identity is the hash of the 18³
+  occupancy box taken BEFORE marching cubes — the mesh is a pure function of
+  it, so a re-fetched chunk whose solids did not move (the 8-tick dirty-flag
+  refresh, liquids flowing, blood drying) costs one sample and no mesh, no
+  Jolt body and no wake. A COUNT budget, not a time budget: the debris gates
+  run this under the selftest, and a body landing on a patch one tick later
+  on a slower machine would settle somewhere else. `terrainMesh` is its own
+  row on the Performance tab, debited from `gameLogic`;
+  `SANDVOX_TERRAIN_BUILDS_PER_TICK` is the one-binary A/B arm.
 - Sleeping: settled bodies deactivate entirely until another body or force
   intersects their AABB (Jolt does this natively).
 
@@ -8487,6 +8505,21 @@ is a relabelled GPU wait — the CPU would have spent the same time in `present`
 so it now has its own row and its own two counters: `snapshotStalls` (the waits)
 and `readbackDeclined` (readback requests the ring refused). Declines
 without stalls mean the ring is the limit; stalls with declines mean the GPU is.
+
+**The GPU-lag throttle (2026-09-09).** The 4-tick catch-up is right for a CPU
+hitch and wrong for a GPU one: every tick submits a plane of worldgen, a CA
+pass and a snapshot copy, so paying three of them into a queue already a frame
+behind lengthens the next frame, which owes more ticks — the loop that ends in
+the two blocking waits on the frame path (the staleness fence above, and
+`Stream`'s T+`kWakeLatency` wake fence, billed to World Storage). The tick loop
+now reads the lag instead of guessing it — `rhi::Device::PendingMapCount()`,
+the snapshot readbacks whose fence has not signalled, is exactly the ticks the
+GPU has not finished — and runs a second tick in a frame only while the GPU
+owes fewer than two, dropping the surplus debt (sim time dilates by those
+ticks) rather than banking it into a burst. Pure pacing: which ticks run and
+what they compute is unchanged, nothing hashed moves, and the headless
+harnesses never reach the branch. `--frames` prints the count as `gpu-lag
+throttle`; the live page shows it as `ticksThisFrame` sticking at 1.
 
 **Verify the page, not just the numbers.** `scripts/check_perfview.sh` drives the
 real tab in real headless Chrome and asserts both content (charts built from the

@@ -150,6 +150,10 @@ struct DeviceImpl {
   virtual bool PopValidationScopeBlocking() = 0;
   virtual void ProcessEvents() = 0;
   virtual bool WaitOldestPendingMap() = 0;
+  // How many MapReadAsync tickets are still waiting on their fence. Each is
+  // one submitted snapshot readback the GPU has not finished, so on the game
+  // path this IS the GPU's lag behind the CPU, in ticks (main.cpp's throttle).
+  virtual int PendingMapCount() = 0;
   virtual void WaitIdle() = 0;
   // The blocking read of a MapRead buffer whose producing work is submitted.
   virtual bool ReadBufferBlocking(const Buffer& src, uint64_t offset, void* out,

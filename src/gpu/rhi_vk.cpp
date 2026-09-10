@@ -569,6 +569,8 @@ struct VkrDevice final : DeviceImpl {
     return true;
   }
 
+  int PendingMapCount() override { return (int)st->maps.size(); }
+
   void WaitIdle() override {
     // §4.9: a drain must not strand deferred uploads. If FillSlots (or any
     // QueueWrite) enqueued writes and nothing recorded a command buffer since,
