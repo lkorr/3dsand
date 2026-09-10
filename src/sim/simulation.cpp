@@ -1490,65 +1490,25 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   // DESIGN.md §9 both say the cascades are RENDER-ONLY DERIVED DATA with no
   // determinism attached, so the world can tick, hash and save without them;
   // all that is missing is the horizon. So they are built off the critical
-  // path and this function returns while they are still compiling.
+  // path (StartFarBuild) and this function returns while they are still
+  // compiling — or, under FarBuild::Lazy, before they have started: a run that
+  // never asks for cascade content never compiles them at all.
   //
-  // Everything the deferred thread touches is captured BY VALUE (the device,
-  // the layout, the module — all seam handles, all shared_ptr) so it names no
-  // Simulation member and cannot race this object. The result is published on
-  // the main thread by PollFarPipelines / WaitForFarPipelines.
-  //
+  // The previous build's far set is dropped here whichever policy applies.
+  // WaitForFarPipelines at the top of this function joined its thread, so
+  // nothing is compiling from the module these handles came from.
+  farFill_ = {};
+  farPatchFill_ = {};
+  farDown_ = {};
+  farPublished_ = false;
+  farStarted_ = false;
+  farReady_.store(false, std::memory_order_release);
+  farModule_ = mWorldgen;
+  farBuildThreads_ = buildThreads;
   // Serial under `--shader-stats` for the same reason the pool is: that mode
-  // exists to interrogate every pipeline the driver compiled this run.
-  {
-    const rhi::Device dev = device;
-    const rhi::PipelineLayout layout = farPL_;
-    const rhi::ShaderModule module = mWorldgen;
-    auto build = [dev, layout, module]() {
-      FarPipelines r;
-      // One thread per entry point: sequentially these are the sum, in
-      // parallel they are max(), which is the wall clock this whole package is
-      // bounded by. `farpatch` joined the set with package C's split of `far`
-      // into sweep + edit-patch — the split only pays if the halves compile
-      // CONCURRENTLY, so it gets a thread of its own like `fardown` did.
-      std::thread down([&] {
-        r.down = MakeComputePipeline(dev, layout, module, "fardown", "farDown");
-      });
-      std::thread patch([&] {
-        r.patch = MakeComputePipeline(dev, layout, module, "farpatch",
-                                      "farPatchFill");
-      });
-      r.fill = MakeComputePipeline(dev, layout, module, "far", "farFill");
-      patch.join();
-      down.join();
-      MarkFarReady();
-      // THE HORIZON'S ARRIVAL TIME, printed unconditionally. It is the number
-      // this whole package is measured by and there is no other record of it
-      // in a windowed run (build/last_run.json is a headless-mode artifact),
-      // so it must not be behind SANDVOX_SHADER_TIMING.
-      std::printf("far-cascade pipelines ready %.1f s after the first pipeline "
-                  "create (the game has been running since %.1f s)\n",
-                  FarReadyMs() / 1000.0, InteractiveReadyMs() / 1000.0);
-      std::fflush(stdout);
-      // The horizon's ISA is the single most expensive thing on this disk.
-      // Saved from this thread the moment it exists, for the same reason the
-      // two saves above exist: the next launch must not pay it again because
-      // this one was killed.
-      rhi::vkr::SavePipelineCache(dev);
-      return r;
-    };
-    if (buildThreads <= 1) {
-      FarPipelines r = build();
-      farFill_ = std::move(r.fill);
-      farPatchFill_ = std::move(r.patch);
-      farDown_ = std::move(r.down);
-      farPublished_ = true;
-      farReady_.store(true, std::memory_order_release);
-    } else {
-      farFuture_ = std::async(std::launch::async, build);
-      farPublished_ = false;
-      farReady_.store(false, std::memory_order_release);
-    }
-  }
+  // exists to interrogate every pipeline the driver compiled this run — so it
+  // is also never lazy.
+  if (farBuild_ == FarBuild::Eager || buildThreads <= 1) StartFarBuild(buildThreads);
   MarkInteractiveReady();
 
   // A backend that fails pipeline creation returns an INVALID handle (Vulkan:
@@ -1603,6 +1563,61 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
 // need no synchronization: a row either sees the pre-publish INVALID handle
 // and is skipped, or sees the published one. `farReady_` is the release/
 // acquire edge that makes the second case's handle fully constructed.
+
+void Simulation::StartFarBuild(unsigned threads) {
+  if (farStarted_ || !farModule_) return;
+  farStarted_ = true;
+  // Everything the compile thread touches is captured BY VALUE (the device,
+  // the layout, the module — all seam handles, all shared_ptr) so it names no
+  // Simulation member and cannot race this object. The result is published on
+  // the main thread by PollFarPipelines / WaitForFarPipelines.
+  const rhi::Device dev = device_;
+  const rhi::PipelineLayout layout = farPL_;
+  const rhi::ShaderModule module = farModule_;
+  auto build = [dev, layout, module]() {
+    FarPipelines r;
+    // One thread per entry point: sequentially these are the sum, in
+    // parallel they are max(), which is the wall clock this whole package is
+    // bounded by. `farpatch` joined the set with package C's split of `far`
+    // into sweep + edit-patch — the split only pays if the halves compile
+    // CONCURRENTLY, so it gets a thread of its own like `fardown` did.
+    std::thread down([&] {
+      r.down = MakeComputePipeline(dev, layout, module, "fardown", "farDown");
+    });
+    std::thread patch([&] {
+      r.patch = MakeComputePipeline(dev, layout, module, "farpatch",
+                                    "farPatchFill");
+    });
+    r.fill = MakeComputePipeline(dev, layout, module, "far", "farFill");
+    patch.join();
+    down.join();
+    MarkFarReady();
+    // THE HORIZON'S ARRIVAL TIME, printed unconditionally. It is the number
+    // this whole package is measured by and there is no other record of it
+    // in a windowed run (build/last_run.json is a headless-mode artifact),
+    // so it must not be behind SANDVOX_SHADER_TIMING.
+    std::printf("far-cascade pipelines ready %.1f s after the first pipeline "
+                "create (the game has been running since %.1f s)\n",
+                FarReadyMs() / 1000.0, InteractiveReadyMs() / 1000.0);
+    std::fflush(stdout);
+    // The horizon's ISA is the single most expensive thing on this disk.
+    // Saved from this thread the moment it exists, for the same reason the
+    // two saves in BuildPipelines exist: the next launch must not pay it
+    // again because this one was killed.
+    rhi::vkr::SavePipelineCache(dev);
+    return r;
+  };
+  if (threads <= 1) {
+    FarPipelines r = build();
+    farFill_ = std::move(r.fill);
+    farPatchFill_ = std::move(r.patch);
+    farDown_ = std::move(r.down);
+    farPublished_ = true;
+    farReady_.store(true, std::memory_order_release);
+  } else {
+    farFuture_ = std::async(std::launch::async, build);
+  }
+}
 
 void Simulation::PublishFarPipelines() {
   FarPipelines r = farFuture_.get();  // blocks if the thread is still running

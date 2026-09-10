@@ -437,6 +437,24 @@ class Simulation {
   // checked output can depend on when the driver happened to finish.
   void AllowDeferredFar(bool on) { deferFarOk_ = on; }
 
+  // WHEN the far set compiles at all. `Eager` starts the background build at
+  // the end of BuildPipelines, which is right for anything that will render a
+  // horizon (the game, every --shot, the full suite). `Lazy` starts it only
+  // when a caller DEMANDS cascade content (EnsureFarPipelines with fills to
+  // record), and a run that never does never compiles it.
+  //
+  // The reason this exists is what a deferred-but-eager build cost the modes
+  // that never look at a cascade: --voxdump, --voxserve and every `--gate`
+  // that is not a far gate. Their three far threads (Tint + spirv-opt + the
+  // driver, ~100 s of CPU each after a worldgen edit) ran alongside the real
+  // work, slowing it, and then the process could not EXIT until they finished
+  // — a std::async future's destructor joins its thread — so a 5 s gate sat
+  // silent for minutes after printing its result. Measured 2026-09-09, one
+  // --voxdump after a one-line genCellIn edit: see docs/PLAN_shader_compile.md
+  // "Lazy far". Set BEFORE Init: BuildPipelines reads it.
+  enum class FarBuild { Eager, Lazy };
+  void SetFarBuild(FarBuild b) { farBuild_ = b; }
+
   // ---- the SPECIALIZED raymarch variant (W2-A) ------------------------------
   // Same deal as AllowDeferredFar and set from the same line in main.cpp. The
   // lean raymarch pipeline (raymarch.wgsl's SPEC_* block) compiles in the
@@ -486,13 +504,19 @@ class Simulation {
   };
   // Move the future's result onto the three far pipeline members. Main thread only.
   void PublishFarPipelines();
+  // Launch the far set's compile from `farModule_` on farPL_. Idempotent per
+  // BuildPipelines (farStarted_). `threads <= 1` builds serially, in place,
+  // and publishes before returning (--shader-stats).
+  void StartFarBuild(unsigned threads);
   // Blocks unless the caller opted into deferral. Called from EncodeFarFill
   // with work to do — the one point where a caller is about to depend on
   // cascade CONTENT. Recording a far row against a pipeline that does not
   // exist yet is legal (the recorder skips a null pipeline); what is not
   // acceptable is a checked output that silently depends on driver timing.
+  // Under FarBuild::Lazy this is also where the compile STARTS.
   void EnsureFarPipelines() {
     if (deferFarOk_ || farReady_.load(std::memory_order_acquire)) return;
+    StartFarBuild(farBuildThreads_);
     WaitForFarPipelines();
   }
   // The full and slim sim bind groups, both pages. Called by Init and again by
@@ -586,6 +610,13 @@ class Simulation {
   std::atomic<bool> farReady_{false};
   bool farPublished_ = false;
   bool deferFarOk_ = false;
+  FarBuild farBuild_ = FarBuild::Eager;
+  // What StartFarBuild compiles from: worldgen.wgsl's module as BuildPipelines
+  // last loaded it, and the thread count that build used. Held so a Lazy start
+  // thousands of ticks later compiles exactly what an Eager one would have.
+  rhi::ShaderModule farModule_;
+  unsigned farBuildThreads_ = 1;
+  bool farStarted_ = false;
   // The openness grid (sim_openness.wgsl, docs/PLAN_gi.md §2): `dirty` walks
   // the tick's compacted dirty list, `refresh` walks a rolling slice of the
   // window. Render-path passes on the TICK table — see the .def rows for why

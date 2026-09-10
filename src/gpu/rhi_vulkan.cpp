@@ -1,6 +1,7 @@
 #include "gpu/rhi_vulkan.h"
 
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>  // std::abort — the staging ring's unserviceable-write path
 #include <cstring>
@@ -1333,7 +1334,7 @@ VkShaderModule Backend::GetShaderModule(const std::string& wgsl, const std::stri
   // nothing. Tag 0 (the default, opt off) reproduces the historical hash, so no
   // existing shader_cache/ entry is invalidated by this line.
   size_t srcHash = std::hash<std::string>{}(wgsl);
-  if (uint32_t optTag = vkspv::OptimizerCacheTag())
+  if (uint32_t optTag = vkspv::OptimizerCacheTag(label))
     srcHash ^= (size_t)optTag * 0x9e3779b97f4a7c15ull;
   std::string key = label + "\x1f" + entryPoint + "\x1f" +
                     std::to_string(srcHash);
@@ -1359,9 +1360,18 @@ VkShaderModule Backend::GetShaderModule(const std::string& wgsl, const std::stri
   // source and produces a new hash, so stale cache entries are harmless (just
   // unreferenced files). F5 hot-reload bypasses this via the in-memory cache
   // above, which is populated on the first compile or disk-cache hit.
+  //
+  // SANDVOX_SHADER_CACHE overrides the directory, for the same reason
+  // SANDVOX_PIPELINE_CACHE overrides the driver blob's path: the default is
+  // CWD-relative, so a worktree's first run re-ran Tint and spirv-opt for every
+  // entry point the main checkout had already compiled from identical source.
+  // Sharing is safe by construction — the file name IS the content key, and
+  // the write below is whole-file, so two processes producing the same key
+  // write the same bytes.
   namespace fs = std::filesystem;
   static const fs::path cacheDir = [] {
-    fs::path d("shader_cache");
+    const char* env = std::getenv("SANDVOX_SHADER_CACHE");
+    fs::path d(env && *env ? env : "shader_cache");
     std::error_code ec;
     fs::create_directories(d, ec);
     return d;
@@ -2246,8 +2256,17 @@ void Backend::Shutdown() {
     }
     return;
   }
+  // Timed, always, one line: a headless run was measured spending ~45 s
+  // between its last printed line and process exit (2026-09-09), and the two
+  // candidates in here — the device drain and serializing a 200+ MiB pipeline
+  // cache — are the only ones that cannot be seen from outside.
+  const auto tShut0 = std::chrono::steady_clock::now();
+  auto msSince = [](std::chrono::steady_clock::time_point t) {
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t).count();
+  };
   std::string err;
   WaitIdle(err);
+  const double waitMs = msSince(tShut0);
 
   for (const PipelineRec& p : pipelines_) dfn_.DestroyPipeline(device_, p.pipe, nullptr);
   pipelines_.clear();
@@ -2259,11 +2278,17 @@ void Backend::Shutdown() {
   for (auto& kv : moduleCache_) dfn_.DestroyShaderModule(device_, kv.second, nullptr);
   moduleCache_.clear();
 
+  const auto tSave0 = std::chrono::steady_clock::now();
   SavePipelineCache();
+  const double saveMs = msSince(tSave0);
   if (pipelineCache_) {
     dfn_.DestroyPipelineCache(device_, pipelineCache_, nullptr);
     pipelineCache_ = VK_NULL_HANDLE;
   }
+  std::fprintf(stderr,
+               "[shutdown] vulkan backend: wait-idle %.0f ms, pipeline cache "
+               "saved in %.0f ms (%s)\n",
+               waitMs, saveMs, pipelineCachePath_.c_str());
 
   for (auto& f : inFlight_) {
     dfn_.FreeCommandBuffers(device_, cmdPool_, 1, &f.cmd);

@@ -2787,6 +2787,10 @@ int RunVerify(GpuContext& ctx, World& world, Simulation& sim,
 int main(int argc, char** argv) {
   InstallCrashHandler();
   StartupMark("main");
+  // The last mark a run prints: after every local in main() is gone and
+  // before static destructors. The gap from the previous mark is the cost of
+  // tearing the engine down.
+  std::atexit([] { StartupMark("atexit: all of main()'s locals destroyed"); });
 
   // --crash-test: fault on purpose, so the crash REPORTER is verifiable.
   // The handler is the one piece of code whose correctness cannot be observed
@@ -3646,6 +3650,34 @@ int main(int argc, char** argv) {
   world.Init(ctx.device);
   StartupMark("world buffers (page pool, far cascades)");
   Simulation sim;
+  // WHETHER THE FAR CASCADES COMPILE AT ALL (Simulation::FarBuild). Decided
+  // before Init because BuildPipelines is what would start them. Eager for
+  // anything that will render a horizon — the game and --frames, every --shot
+  // family, --measure / --perf / --render-budget, --shader-stats (which must
+  // see every pipeline), and the FULL selftest suite, which contains the far
+  // gates. Lazy for the iteration tools: --voxdump / --voxserve, a filtered
+  // `--gate` / `--verify` run, --sweep, the fluid bench. Lazy is not "never":
+  // a far gate under `--gate far-fog` still gets its pipelines, it just pays
+  // for them when it asks (Simulation::EnsureFarPipelines) instead of the
+  // whole run paying at exit for a horizon nobody looked at.
+  {
+    const bool voxelTool = voxserve || !voxdumpArgs.empty();
+    const bool checkedOutput =
+        selftest || verify || measure || perf || renderBudget || budgetArms ||
+        shot || shotFrames || shotWaterfall || shotFluid || shotFluidPond ||
+        fluidBench || shaderStats || !shotMob.empty() || !sweepParam.empty();
+    const bool rendersHorizon =
+        shot || shotFrames || shotWaterfall || shotFluid || shotFluidPond ||
+        !shotMob.empty() || measure || perf || renderBudget || budgetArms ||
+        shaderStats || suiteAcceptance ||
+        (selftest && stOpt.only.empty() && !stOpt.list && sweepParam.empty());
+    const bool eager = (!checkedOutput && !voxelTool) || rendersHorizon;
+    sim.SetFarBuild(eager ? Simulation::FarBuild::Eager
+                          : Simulation::FarBuild::Lazy);
+    if (!eager)
+      std::printf("far-cascade pipelines: lazy (compiled only if this run asks "
+                  "for cascade content)\n");
+  }
   if (!sim.Init(ctx.device, world, mats, reactions, micro, treeAtlas, worldMapWords,
                 assetDir + "/shaders"))
     return 1;
@@ -3945,7 +3977,13 @@ int main(int argc, char** argv) {
     if (stOpt.list) return selftest::List();
     selftest::Ctx sc{ctx,   world,  sim,    mats,  reactions,
                      phys,  debris, mobs,   stream, items};
-    return selftest::Run(sc, stOpt);
+    const int rc = selftest::Run(sc, stOpt);
+    // The gate has printed its verdict; everything after this line is
+    // destructors. Marked because a headless run was measured sitting 45 s
+    // between its last line and process exit (2026-09-09), and without a
+    // clock on it that time is invisible.
+    StartupMark("selftest returned; teardown begins");
+    return rc;
   }
 
   // BEFORE Overlay::Init — ImGui's own scroll callback chains to whatever was

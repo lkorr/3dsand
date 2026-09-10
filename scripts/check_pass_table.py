@@ -418,6 +418,15 @@ def parse_pipeline_entries():
     # thread captures a handle it owns, and the MakeComputePipeline calls name
     # that local. Declared-type-anchored so this cannot match an arbitrary
     # assignment.
+    # The far build now starts from a MEMBER (`farModule_ = mWorldgen;` in
+    # BuildPipelines, read by StartFarBuild, which may run many frames later
+    # under Simulation::FarBuild::Lazy), so the member assignment is one alias
+    # level and the lambda-local `const rhi::ShaderModule module = farModule_;`
+    # is the next. Members first, so the declared-type pass below can resolve
+    # through them. Trailing-underscore anchored: only members are matched.
+    for m in re.finditer(r"\b(\w+_)\s*=\s*(\w+)\s*;", txt):
+        if m.group(2) in mods:
+            mods[m.group(1)] = mods[m.group(2)]
     for m in re.finditer(r"\brhi::ShaderModule\s+(\w+)\s*=\s*(\w+)\s*;", txt):
         if m.group(2) in mods:
             mods[m.group(1)] = mods[m.group(2)]
