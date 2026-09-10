@@ -208,12 +208,50 @@ svlock_acquire_gpu "link:$(basename "$ROOT")"
 # lock was taken, which made it useless under the load it exists to handle:
 # agent A killed the exe, then waited minutes behind the mutex, and by the time
 # it linked, agent B had launched a fresh sandvox.exe — LNK1104 anyway.
-taskkill //F //IM sandvox.exe 2>/dev/null || true
+#
+# ...and WAIT for it to be gone. `taskkill //F` returns when the terminate
+# request is QUEUED, not when the process has released its image: a game with
+# a Vulkan device and half a gigabyte of buffers takes hundreds of ms to tear
+# down, and link.exe opening the output 20 ms after the kill found the old
+# image still mapped -- LNK1104 "cannot open file 'Release\sandvox.exe'",
+# with every object freshly compiled (2026-09-10, a tuner Build with the
+# game open). The tuner's /api/heightmap also launches the exe OUTSIDE this
+# lock (a ~150 ms GPU-free run per map redraw), so an instance can appear
+# mid-link; the link therefore retries ONCE after a second kill+wait.
+kill_sandvox_and_wait() {
+  taskkill //F //IM sandvox.exe 2>/dev/null || true
+  local waited=0
+  while tasklist //FI "IMAGENAME eq sandvox.exe" 2>/dev/null | grep -q -i 'sandvox\.exe'; do
+    if [ "$waited" -ge 100 ]; then   # 10 s: something is not dying; link anyway
+      echo "build.sh: a sandvox.exe is still alive 10 s after taskkill; linking anyway" >&2
+      break
+    fi
+    sleep 0.1; waited=$(( waited + 1 ))
+  done
+  [ "$waited" -gt 0 ] && echo "build.sh: waited $(( waited * 100 )) ms for the old sandvox.exe to exit"
+  return 0
+}
+kill_sandvox_and_wait
 
 echo "build.sh: linking sandvox ($CONFIG)..."
+LINK_LOG="$ROOT/build/link.log"
 LINK_EXIT=0
-cmake --build "$ROOT/build" --config "$CONFIG" --target sandvox \
-  "${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}" || LINK_EXIT=$?
+for attempt in 1 2; do
+  LINK_EXIT=0
+  cmake --build "$ROOT/build" --config "$CONFIG" --target sandvox \
+    "${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}" > "$LINK_LOG" 2>&1 || LINK_EXIT=$?
+  cat "$LINK_LOG"
+  [ "$LINK_EXIT" -eq 0 ] && break
+  # Only the "output file is open" failure is worth a second try; a real link
+  # error (unresolved external, bad object) fails the same way twice.
+  if [ "$attempt" -eq 1 ] && grep -q 'LNK1104' "$LINK_LOG"; then
+    echo "build.sh: LNK1104 -- sandvox.exe was held open during the link; killing it again and retrying once" >&2
+    sleep 1
+    kill_sandvox_and_wait
+    continue
+  fi
+  break
+done
 T_LINK=$(date +%s)
 if [ "$LINK_EXIT" -ne 0 ]; then
   svlock_release_gpu

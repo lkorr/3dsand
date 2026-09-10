@@ -474,6 +474,36 @@ _hm_lock = threading.Lock()
 _play_procs = []
 
 
+def _link_holder():
+    """Who holds the GPU lock, if that holder is a build.sh LINK step; else None.
+
+    build.sh writes `link:<tree>` into C:/sv-gpu-lock/who for the seconds it
+    overwrites sandvox.exe. Two routes here launch the exe WITHOUT that lock --
+    /api/heightmap (GPU-free, ~150 ms, every map redraw) and /api/play (the
+    game, which a selftest-length lock wait would make unlaunchable) -- and an
+    exe started during those seconds holds the image open: LNK1104 "cannot
+    open file 'Release\\sandvox.exe'" with every object freshly compiled
+    (2026-09-10). A game launched under run.sh holds the same lock for its whole
+    session, so "lock held" alone is not the question; "held by a link" is."""
+    try:
+        with open(os.path.join(RUNLOCK_DIR, "who")) as f:
+            who = f.read().strip()
+    except OSError:
+        return None
+    return who if who.startswith("link:") else None
+
+
+def _wait_for_link(timeout):
+    """Block while a link holds the GPU lock, up to `timeout` seconds. Returns
+    the holder if it is still linking afterwards, else None."""
+    deadline = time.time() + timeout
+    while True:
+        who = _link_holder()
+        if who is None or time.time() > deadline:
+            return who
+        time.sleep(0.2)
+
+
 def _text(s):
     return s if isinstance(s, str) else s.decode("utf-8", "replace")
 
@@ -903,6 +933,14 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(503, {"ok": False,
                                     "error": "build/Release/sandvox.exe not built yet "
                                              "— press Build"})
+        # Not while build.sh is overwriting the exe (see _link_holder). A link is
+        # ~20 s, so wait it out rather than fail the redraw; the page's debounce
+        # queue coalesces whatever the drag produced meanwhile.
+        who = _wait_for_link(45.0)
+        if who is not None:
+            return self._json(503, {"ok": False,
+                                    "error": "sandvox.exe is being linked (%s); "
+                                             "the map redraws on the next change" % who})
         with _hm_lock:
             try:
                 r = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True,
@@ -1629,6 +1667,16 @@ class Handler(BaseHTTPRequestHandler):
             if not os.path.isfile(EXE):
                 return self._json(400, {"ok": False,
                                         "error": "sandvox.exe not found — build first"})
+            # A game started during a build is killed by that build's link step
+            # anyway (build.sh taskkills before linking), and one started DURING
+            # the link holds the image open and fails it. Refuse both.
+            with _lock:
+                building = _build["running"]
+            who = building and "build" or _link_holder()
+            if who:
+                return self._json(409, {"ok": False,
+                                        "error": "sandvox.exe is being rebuilt (%s) "
+                                                 "— play when the build finishes" % who})
             # Launch mode from the tuner's run dropdown. WHITELISTED, never
             # spliced from client text: the browser picks a mode, this table
             # owns the argv. "lab" is the fluid testing world
