@@ -245,6 +245,34 @@ void StartupMark(const char* phase) {
   tPrev = t;
   cPrev = c;
 }
+// ---- SANDVOX_TICKS_PER_FRAME=<n>: DETERMINISTIC HARNESS PACING, OFF BY
+// ---- DEFAULT (docs/PLAN_multiplayer_now.md N5, step 5)
+//
+// A `--frames N` run's TICK SCHEDULE is a function of the wall clock: the
+// accumulator fills at real dt, the GPU-lag throttle drops a tick when the
+// device is behind, and streaming's R4 clamp is per FRAME. Every scripted
+// input in this file is already a pure function of `tick` (the autofly phase
+// comments say so in as many words), so what varies between two runs of the
+// SAME binary is only HOW MANY ticks N frames contained — measured 143 and 145
+// over two back-to-back `--frames 600 --autofly-hard` runs. Anything recorded
+// off the frame loop is therefore not reproducible, which makes an op record
+// useless as a before/after oracle for a refactor.
+//
+// Set, this switch makes a frame run EXACTLY n ticks (n clamped to the same
+// backlog cap), bypasses the GPU-lag throttle, and DROPS THE MOUSE — the OS
+// cursor is not input to a scripted harness, and a stray delta at tick 321 was
+// the second reason two identical runs diverged. It changes only WHICH ticks
+// run and what the camera is pointed at, never what a tick computes, so
+// nothing hashed can move and no headless suite reaches it (they have no
+// frame loop). Same family as SANDVOX_NO_GPU_THROTTLE / SANDVOX_FRAMES_NO_RELOAD.
+int HarnessTicksPerFrame() {
+  static const int n = [] {
+    const char* s = std::getenv("SANDVOX_TICKS_PER_FRAME");
+    if (!s) return 0;
+    return std::max(0, std::min(std::atoi(s), World::kMaxTicksPerFrame));
+  }();
+  return n;
+}
 bool g_autofly = false;
 bool g_autoflyHard = false;  // --autofly-hard: adversarial traversal for pool sizing
 // --autofly-surface: the RENDERER's adversarial traversal, the complement of
@@ -5408,11 +5436,28 @@ int main(int argc, char** argv) {
     ops::SetReplay(nullptr);
     const uint32_t miss = ops::ReplayParamMismatches();
     std::printf("replay: %u ticks, final hash %08x, TickParams words rebuilt "
-                "differently: %u%s\n",
-                played, lastHash, miss,
-                miss ? "  *** a per-tick knob is read from outside the input "
-                       "stream ***"
-                     : "");
+                "differently: %u\n",
+                played, lastHash, miss);
+    if (miss) {
+      // Rule 6: name the WORD, not the count. The word index is a u32 offset
+      // into TickParams, so `offsetof(TickParams, field) / 4` in world.h reads
+      // it straight off.
+      std::printf("  first at tick %u, word %u: record %u, rebuilt %u | "
+                  "distinct words (u32 offsets into TickParams):",
+                  ops::ReplayFirstMismatchTick(), ops::ReplayFirstMismatchWord(),
+                  ops::ReplayFirstMismatchRecorded(),
+                  ops::ReplayFirstMismatchRebuilt());
+      const std::vector<uint32_t>& w = ops::ReplayMismatchWords();
+      for (size_t k = 0; k < w.size() && k < 24; k++) std::printf(" %u", w[k]);
+      if (w.size() > 24) std::printf(" ... (%zu total)", w.size());
+      std::printf("\n  *** a per-tick knob is read from outside the input "
+                  "stream ***\n");
+      // Known and structural, not a regression: the residency window ORIGIN
+      // (TickParams.origin / mirrorBase) is moved by Stream::Update from the
+      // tick body, and no recorded input carries it — so a replay of a session
+      // that FLEW rebuilds the window where it started. The `ops-replay` gate
+      // cannot see this: its scene never leaves one window.
+    }
     return miss ? 1 : 0;
   }
 
@@ -6914,7 +6959,14 @@ int main(int argc, char** argv) {
     // view 88 degrees and planted the oak in the wrong place with 0 cells,
     // and a hand on the mouse mid-run would move the very view the drawBodies
     // number is measured through.
-    if (captured && !g_fellSiteSet)
+    //
+    // THE OS CURSOR IS NOT INPUT TO A SCRIPTED HARNESS either. Under
+    // SANDVOX_TICKS_PER_FRAME the delta is dropped for the camera and for the
+    // command alike, so `--autofly-hard`'s path is the tick phase and nothing
+    // else. A stray cursor event at tick 321 was the second reason two runs of
+    // one binary produced different op records.
+    const bool harnessInput = HarnessTicksPerFrame() > 0;
+    if (captured && !g_fellSiteSet && !harnessInput)
       cam.ApplyMouse((float)(mx - mx0) * lookSensNow,
                      (float)(my - my0) * lookSensNow);
     // The swing gets the RAW delta — deliberately not scaled with the view
@@ -6957,7 +7009,8 @@ int main(int argc, char** argv) {
     // motion into the accumulator and bend every authored cut. The SPLIT now
     // happens at the tick, not here: one look delta goes into the command and
     // the tick body routes it by mode.
-    if (captured) feeder.Look((float)(mx - mx0), (float)(my - my0));
+    if (captured && !harnessInput)
+      feeder.Look((float)(mx - mx0), (float)(my - my0));
     mx0 = mx;
     my0 = my;
 
@@ -8007,6 +8060,11 @@ int main(int argc, char** argv) {
     constexpr int kMaxTicksPerFrame = World::kMaxTicksPerFrame;
     if (accumulator > kMaxTicksPerFrame * kTickDt)
       accumulator = kMaxTicksPerFrame * kTickDt;
+    // SANDVOX_TICKS_PER_FRAME: exactly n ticks this frame, whatever the clock
+    // says. See HarnessTicksPerFrame's comment for why the harness needs it.
+    const int fixedTicksPerFrame = HarnessTicksPerFrame();
+    if (fixedTicksPerFrame > 0)
+      accumulator = (double)fixedTicksPerFrame * kTickDt;
     int ticksThisFrame = 0;
     bool mouseL = captured && glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS;
     bool mouseR = captured && glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_RIGHT) == GLFW_PRESS;
@@ -8201,7 +8259,10 @@ int main(int argc, char** argv) {
       // SANDVOX_NO_GPU_THROTTLE=1 is the A/B arm in one binary: the pre-throttle
       // loop, for measuring what the throttle buys on a given scene.
       static const bool noThrottle = std::getenv("SANDVOX_NO_GPU_THROTTLE") != nullptr;
-      if (ticksThisFrame > 0 && !noThrottle) {
+      // SANDVOX_TICKS_PER_FRAME bypasses it too: the whole point of that
+      // switch is a tick schedule that does not depend on how far behind the
+      // GPU happens to be on this machine, this second.
+      if (ticksThisFrame > 0 && !noThrottle && fixedTicksPerFrame == 0) {
         ctx.ProcessEvents();  // retire what the GPU finished during the tick above
         constexpr int kGpuLagThrottleTicks = 2;
         if (ctx.PendingMapCount() >= kGpuLagThrottleTicks) {

@@ -309,6 +309,15 @@ void ReplaceGasIfReplaying(uint32_t tick, std::vector<GasSpawnOp>& gas);
 uint32_t ReplayParamMismatches();
 uint32_t ReplayFirstMismatchTick();
 uint32_t ReplayFirstMismatchWord();
+// The two VALUES behind that first word, and every DISTINCT word index that
+// ever differed. CLAUDE.md rule 6: a bare "416 words rebuilt differently" is a
+// count and buys one hypothesis per run; "words 8,9,10,34,35,36 — word 8 was
+// 1714 in the record, 1712 on replay" names the fields (here: TickParams
+// origin[3] and mirrorBase[3], i.e. the residency window, which no recorded
+// input carries).
+uint32_t ReplayFirstMismatchRecorded();
+uint32_t ReplayFirstMismatchRebuilt();
+const std::vector<uint32_t>& ReplayMismatchWords();
 void ResetReplayStats();
 
 // The material NAME table hash the header carries. Exposed so a caller can
