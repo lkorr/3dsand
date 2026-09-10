@@ -88,6 +88,11 @@ class Physics {
   // where the origin sits — microbody.wgsl).
   uint64_t CreateSphereBody(Vec3 centerVoxel, float radiusVoxels,
                             float densityKgM3, Vec3 originOffsetVox = Vec3{});
+  // Mass in kg, 0 for a dead handle. Read off the motion properties, which a
+  // kinematic body also carries (mob limbs are kinematic while animated), so
+  // a rig's total mass is known BEFORE it goes dynamic — which is when the
+  // blast launch needs it (Mob::BlastRadial).
+  float BodyMass(uint64_t handle) const;
   // Linear/angular velocity in voxel units (split halves keep momentum).
   bool GetBodyVelocities(uint64_t handle, Vec3& lin, Vec3& angRadPerSec) const;
   void SetBodyVelocities(uint64_t handle, Vec3 lin, Vec3 angRadPerSec);

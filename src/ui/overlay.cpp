@@ -962,6 +962,10 @@ void Overlay::Draw(UIState& s) {
   ImGui::SameLine();
 
   if (ImGui::Button("detonate at crosshair (X)")) s.pendingDetonate = true;
+  ImGui::SameLine();
+  // The player's body goes limp for ragdoll.devSeconds, then gets back up:
+  // the whole live-ragdoll path (Mob::StartRagdoll -> BeginGetUp) on demand.
+  if (ImGui::Button("ragdoll me")) s.ragdollMe = true;
 
   // rolling sphere: rigidbody ball of the current brush material, so its
   // mass — and how far the player can shove it — comes from the material
@@ -1126,6 +1130,8 @@ void Overlay::Draw(UIState& s) {
           ImGui::TextDisabled("paths in, holds range, circles");
           ImGui::Separator();
           if (ImGui::Button("kill all spawned##ai")) s.aiKillSpawned = true;
+          ImGui::SameLine();
+          if (ImGui::Button("ragdoll all spawned##ai")) s.aiRagdollSpawned = true;
           ImGui::Separator();
           ImGui::Checkbox("debug viz (path / target / band)", &s.showAiDebug);
           ImGui::Checkbox("...include the range-band ring", &s.showAiRing);

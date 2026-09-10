@@ -210,6 +210,18 @@ class PlayerAvatar : public Mob {
   void CarveRadial(Vec3 centerWorldVoxel, float radiusVoxels, World& world,
                    std::vector<ParticleSpawn>& spawns);
 
+  // ---- live ragdoll (Mob::StartRagdoll), the player's side ----------------
+  // While the body is limp or getting up THE PLAYER FOLLOWS THE BODY, not the
+  // other way round: main.cpp skips Player::Update and moves the capsule to
+  // wherever this says every tick. Limp: the pelvis, wherever Jolt has flung
+  // it. Getting up: the standing spot BeginGetUp chose, so the controller
+  // resumes exactly where the animation ends. False when not ragdolled.
+  //
+  // The capsule itself is inert meanwhile — no gravity, no sweeps, no
+  // impact latch — which is also why a body knocked flying by a blast does
+  // not take fall damage on landing: the controller never saw the fall.
+  bool RagdollFollow(Vec3& outPlayerPos) const;
+
   // Impact damage, driven by Player::impactDeltaV — the velocity a collision
   // sweep refused. Covers falls and horizontal wall slams with one path.
   // `centerWorldVoxel` is the player AABB centre (mid-torso), NOT origin_.

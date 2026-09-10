@@ -883,6 +883,19 @@ void Physics::SetBodyVelocity(uint64_t handle, Vec3 velVoxelsPerSec) {
                                      VoxToM(velVoxelsPerSec.z)));
 }
 
+float Physics::BodyMass(uint64_t handle) const {
+  if (!system_ || handle == 0) return 0.0f;
+  JPH::BodyID id = ToBodyID(handle);
+  // Unchecked, for the same reason FrictionTorque uses it: the checked
+  // accessor asserts on a kinematic body, and the mass it holds is right.
+  JPH::BodyLockRead lock(system_->GetBodyLockInterface(), id);
+  if (!lock.Succeeded()) return 0.0f;
+  const JPH::MotionProperties* mp = lock.GetBody().GetMotionPropertiesUnchecked();
+  if (!mp) return 0.0f;
+  const float inv = mp->GetInverseMassUnchecked();
+  return inv > 0.0f ? 1.0f / inv : 0.0f;
+}
+
 bool Physics::GetBodyVelocities(uint64_t handle, Vec3& lin,
                                 Vec3& angRadPerSec) const {
   if (!system_ || handle == 0) return false;

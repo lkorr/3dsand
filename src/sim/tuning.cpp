@@ -665,6 +665,28 @@ bool LoadTuning(const std::string& path, Tuning& out) {
       d.minBodyVoxels = 1;
     }
   }
+  if (const json* g = Find(j, "ragdoll")) {
+    auto& r = out.ragdoll;
+    const std::string at = "ragdoll";
+    ReadF(*g, "fallSeconds", r.fallSeconds, out, at);
+    ReadF(*g, "blastRadiusScale", r.blastRadiusScale, out, at);
+    ReadF(*g, "blastImpulseScale", r.blastImpulseScale, out, at);
+    ReadF(*g, "blastMinSpeed", r.blastMinSpeed, out, at);
+    ReadF(*g, "maxLaunchSpeed", r.maxLaunchSpeed, out, at);
+    ReadF(*g, "blastUpBias", r.blastUpBias, out, at);
+    ReadF(*g, "minSeconds", r.minSeconds, out, at);
+    ReadF(*g, "settleSpeed", r.settleSpeed, out, at);
+    ReadF(*g, "settleSeconds", r.settleSeconds, out, at);
+    ReadF(*g, "maxSeconds", r.maxSeconds, out, at);
+    ReadF(*g, "getUpSeconds", r.getUpSeconds, out, at);
+    ReadF(*g, "getUpPitchDeg", r.getUpPitchDeg, out, at);
+    ReadF(*g, "getUpDropFrac", r.getUpDropFrac, out, at);
+    ReadF(*g, "devSeconds", r.devSeconds, out, at);
+    if (r.getUpSeconds < 0.1f) {
+      out.warnings.push_back("ragdoll.getUpSeconds < 0.1; clamped to 0.1");
+      r.getUpSeconds = 0.1f;
+    }
+  }
 
   if (const json* g = Find(j, "gore")) {
     auto& e = out.gore;

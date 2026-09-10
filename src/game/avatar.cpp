@@ -1532,7 +1532,30 @@ void PlayerAvatar::PreTick(uint32_t tick, const Player& player, float heading,
   // combatfx.flashSever forever (the reported permanent glow).
   DecayHitFlash(dt);
 
-  if (alive_) {
+  if (alive_ && ragdoll_ == RagdollPhase::Limp) {
+    // ---- LIMP: Jolt has the body; the player is a passenger ----
+    // Same as the NPC loop (MobSystem::PreTick): no driver, no pose, the
+    // limbs are dynamic and PostStep reads them back. The air clocks are
+    // held at zero so the landing edge below cannot fire "land" or a fall
+    // clip against a body that is lying down.
+    TickRagdollLimp(world, dt);
+    airOffTime_ = 0.0f;
+    airTime_ = 0.0f;
+    wasGrounded_ = true;
+    hangActive_ = false;
+    hangIkWeight_ = 0.0f;
+  } else if (alive_ && ragdoll_ == RagdollPhase::GetUp) {
+    // ---- GETTING UP: the shared pipeline, no player input ----
+    // origin_/heading_ are what BeginGetUp derived from where the pelvis
+    // lay, NOT the player's (the capsule is being moved to us, see
+    // RagdollFollow). Grounded, standing still: the get-up blend in
+    // SubmitPose does the rest.
+    TickGetUp(dt);
+    hangActive_ = false;
+    crouchWant_ = false;
+    UpdateAnimation(dt, world, /*grounded=*/true, Vec3{});
+    SubmitPose(dt, /*writeXf=*/true);
+  } else if (alive_) {
     // The body follows the PLAYER, which is the whole difference from a mob.
     origin_ = Vec3{player.pos.x - def.worldSize.x * 0.5f,
                    player.pos.y - Player::kHalfY,
@@ -1654,6 +1677,16 @@ void PlayerAvatar::PreTick(uint32_t tick, const Player& player, float heading,
       // (see Player::jumped), so it says what the edge could not.
       if (jumpLatched_ && !wasHanging_) PlayClip("jump");
       airTime_ += dt;
+      // ---- LONG ENOUGH IN THE AIR TO GO LIMP (sim/tuning.h Ragdoll) ----
+      // The same rule an NPC falls under (MobSystem::UpdateFall). The limbs
+      // take the player's velocity with them so the body keeps falling at
+      // the speed it had instead of stalling for a tick; from here the
+      // capsule follows the pelvis (RagdollFollow) until the get-up ends.
+      if (airTime_ >= CurrentTuning().ragdoll.fallSeconds && !Ragdolled() &&
+          !player.fly && !hangingNow) {
+        StartRagdoll(CurrentTuning().ragdoll.minSeconds, "fall");
+        SetLimbVelocities(player.vel);
+      }
       // ...AND A FALL IS A DROP. Air time alone says nothing about height:
       // `supportY_` records where the body last had something under it, so the
       // clip waits for real distance to have been given up. A step-down never
@@ -1811,6 +1844,22 @@ void PlayerAvatar::PreTick(uint32_t tick, const Player& player, float heading,
   // the avatar's own per-tick op counter ----
   int bleedOps = 0;
   BleedTick(tick, world, ops, spawns, bleedOps);
+}
+
+bool PlayerAvatar::RagdollFollow(Vec3& outPlayerPos) const {
+  if (!spawned_ || !alive_ || !def_ || !Ragdolled()) return false;
+  const MobDef& def = *def_;
+  if (ragdoll_ == RagdollPhase::Limp) {
+    // The pelvis body's origin is its lattice corner; lift a little so the
+    // camera boom pivots inside the body rather than at its underside.
+    outPlayerPos = RootWorldPos() + Vec3{0.0f, MetresToCells(0.2f), 0.0f};
+  } else {
+    // The standing spot: the inverse of the origin_ line in PreTick.
+    outPlayerPos = Vec3{origin_.x + def.worldSize.x * 0.5f,
+                        origin_.y + Player::kHalfY,
+                        origin_.z + def.worldSize.z * 0.5f};
+  }
+  return true;
 }
 
 // ---- damage -----------------------------------------------------------------

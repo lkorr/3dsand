@@ -594,6 +594,49 @@ struct Tuning {
     float sphereAngularDamping = 0.05f;
   } physics;
 
+  // ---- live ragdoll: a creature goes limp and gets back up (game/mob.h) ----
+  // CPU-only floats, never in a shader: a ragdoll is Jolt presentation state
+  // and re-enters the grid only through the ordinary body paths. Metres and
+  // seconds, converted at the point of use.
+  struct Ragdoll {
+    // Continuous freefall before a creature goes limp mid-air. NPCs fall under
+    // the same gravity as the player since this landed (they used to hang).
+    float fallSeconds = 3.0f;
+    // A blast within radius * blastRadiusScale of a body launches it. The
+    // impulse at the centre is power * blastImpulseScale (kg*m/s), falling
+    // off linearly to zero at that reach; launch speed is impulse / body mass,
+    // so a heavy creature flies less far than a light one from the same
+    // charge, and a grenade (power 380) sends ~70 kg about 5 m/s.
+    float blastRadiusScale = 3.0f;
+    float blastImpulseScale = 1.0f;
+    // Below this launch speed (m/s) a blast does not knock the creature down
+    // at all; above maxLaunchSpeed it is clamped, which is what keeps a large
+    // charge from putting a body into orbit. "Across the room, not across
+    // the map" — a massive explosion still tops out here.
+    float blastMinSpeed = 1.5f;
+    float maxLaunchSpeed = 14.0f;
+    // Fraction of straight-up mixed into the launch direction, so a body on
+    // the floor beside a blast arcs rather than skidding along the ground.
+    float blastUpBias = 0.45f;
+    // Shortest time a creature stays limp before it may start getting up,
+    // and the stillness test that then lets it: the pelvis has moved slower
+    // than settleSpeed (m/s) for settleSeconds. maxSeconds is the ceiling
+    // for a body that never settles (wedged, twitching on a slope).
+    float minSeconds = 1.0f;
+    float settleSpeed = 0.35f;
+    float settleSeconds = 0.5f;
+    float maxSeconds = 8.0f;
+    // The procedural get-up: every limb blends from where it landed into a
+    // crouched pose (torso pitched getUpPitchDeg forward about the feet, hips
+    // dropped getUpDropFrac of the standing hip height), which then rises to
+    // the ordinary standing pose over getUpSeconds in total.
+    float getUpSeconds = 1.5f;
+    float getUpPitchDeg = 60.0f;
+    float getUpDropFrac = 0.45f;
+    // How long the dev panel's "ragdoll me" keeps the player down.
+    float devSeconds = 3.0f;
+  } ragdoll;
+
   // ---- debris / island -> rigidbody conversion ----
   struct Debris {
     int minBodyVoxels = 8;

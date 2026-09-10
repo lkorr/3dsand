@@ -168,6 +168,22 @@
     "sphereRestitution": 0.3,
     "sphereAngularDamping": 0.05
   },
+  "ragdoll": {
+    "fallSeconds": 3,
+    "blastRadiusScale": 3,
+    "blastImpulseScale": 1,
+    "blastMinSpeed": 1.5,
+    "maxLaunchSpeed": 14,
+    "blastUpBias": 0.45,
+    "minSeconds": 1,
+    "settleSpeed": 0.35,
+    "settleSeconds": 0.5,
+    "maxSeconds": 8,
+    "getUpSeconds": 1.5,
+    "getUpPitchDeg": 60,
+    "getUpDropFrac": 0.45,
+    "devSeconds": 3
+  },
   "debris": {
     "minBodyVoxels": 8,
     "minBurnFragmentVoxels": 24,

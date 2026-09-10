@@ -764,6 +764,51 @@ class Mob {
   const MobDef* Def() const { return def_; }
   Vec3 Origin() const { return origin_; }
   float BodyY() const { return bodyY_; }
+
+  // ---- LIVE RAGDOLL: limp, then back on its feet (sim/tuning.h Ragdoll) -----
+  //
+  // A creature that is knocked down is not a corpse. Die() flips every limb
+  // dynamic and HANDS IT TO DebrisSystem — there is no way back from that.
+  // This is the same flip with the limbs kept: every body stays owned by the
+  // mob, its joints stay, its collision group stays, and the animation
+  // pipeline simply stops re-posing it (SubmitPose skips a limp limb the way
+  // it skips a sever hold), so PostStep's read-back is what places it. When
+  // the pelvis has come to rest the limbs are made kinematic again where they
+  // lie and a procedural get-up blends each one from there into the ordinary
+  // standing pose (RagdollPhase::GetUp, the SubmitPose blend).
+  //
+  // Reachable from three places and nothing else: a blast (BlastRadial),
+  // freefall past ragdoll.fallSeconds (MobSystem::UpdateFall / the avatar's
+  // own air clock), and the dev panel. Rendering, bleeding, burning and
+  // carving all keep working on a limp body because none of them ever asked
+  // whether a limb was kinematic.
+  enum class RagdollPhase : uint8_t { None, Limp, GetUp };
+  RagdollPhase Ragdoll() const { return ragdoll_; }
+  bool Ragdolled() const { return ragdoll_ != RagdollPhase::None; }
+  // Go limp. `minSeconds` is how long the body stays down before the settle
+  // test may stand it up (a blast passes ragdoll.minSeconds, the dev button
+  // ragdoll.devSeconds). No-op on a dead creature or one already limp; a
+  // creature mid-get-up drops again. `why` is a static string for the log.
+  void StartRagdoll(float minSeconds, const char* why);
+  // Set every live limb's linear velocity (voxels/s). The blast launch and
+  // the mid-air flip both use it: one uniform velocity across the rig, so the
+  // joints are not yanked by a per-limb impulse/mass spread.
+  void SetLimbVelocities(Vec3 velVoxPerSec);
+  // The blast entry point. `impulseKgMs` is the impulse at the centre,
+  // falling off linearly to zero at `radiusVoxels`; launch speed is that over
+  // the rig's mass, clamped to ragdoll.maxLaunchSpeed and ignored below
+  // ragdoll.blastMinSpeed. Returns true if the creature was knocked down.
+  bool BlastRadial(Vec3 centerWorldVoxel, float radiusVoxels, float impulseKgMs);
+  // Sum of the live limbs' Jolt masses, kg.
+  float BodyMassKg() const;
+  // Where the creature IS: the root limb's live body origin, or origin_ when
+  // the rig has no root body. Mob::origin_ is the walk driver's anchor and
+  // stops meaning anything while the body is limp.
+  Vec3 RootWorldPos() const;
+  // Seconds in the current ragdoll phase.
+  float RagdollSeconds() const { return ragdollT_; }
+  // Continuous freefall so far (NPC gravity; the avatar keeps its own clock).
+  float AirSeconds() const { return airTime_; }
   // Rig size INCLUDING a borrowed item slot (limbDefs_ tracks limbs_).
   int LimbCount() const { return (int)limbDefs_.size(); }
   const MobLimbDef& LimbDefAt(int i) const { return limbDefs_[i]; }
@@ -1116,8 +1161,14 @@ class Mob {
                         uint32_t color) const;
   uint32_t LimbBodyCount() const;
 
+  // `outUnknown`, when given, is set true when the answer is "I cannot see"
+  // (cell outside the window, chunk not yet cached) rather than "no ground
+  // within the scan" — the two used to be one `false`, and the gravity added
+  // for ragdolls must not drop a creature through terrain it merely has not
+  // fetched yet (the projectile trap in CLAUDE.md, mob edition).
   bool GroundHeightAt(World& world, int wx, int wz, int yFrom, int& outY,
-                      uint32_t* outMat = nullptr) const;
+                      uint32_t* outMat = nullptr,
+                      bool* outUnknown = nullptr) const;
 
   // Release a body's burn index and front (lattice compacted / rig torn down).
   static void DropBurnIndex(BodyBurnState& st);
@@ -1188,6 +1239,21 @@ class Mob {
   // world voxels). Seeds the per-instance rig copy (skel_/limbDefs_). False =
   // physics refused a body; everything created so far is torn down.
   bool BuildRig(const MobDef& def, Vec3 origin);
+
+  // ---- live ragdoll internals -----------------------------------------------
+  // One tick of the limp phase: settle test, then BeginGetUp. Called by the
+  // NPC loop and the avatar driver in place of their locomotion stages.
+  void TickRagdollLimp(World& world, float dt);
+  // Re-derive origin_/heading_ from where the pelvis lies, make every limb
+  // kinematic again where it is, and start the blend (RagdollPhase::GetUp).
+  void BeginGetUp(World& world);
+  // One tick of the get-up clock; ends the ragdoll when the blend completes.
+  void TickGetUp(float dt);
+  // The kinematic target SubmitPose would give limb `i` for a body placed at
+  // `bodyOrigin` with rotation `bodyRot` — factored out so BeginGetUp can ask
+  // "where would the root be if I stood here" with the same arithmetic.
+  void LimbTargetFor(size_t i, Vec3 bodyOrigin, Quat bodyRot, Vec3 yawPivot,
+                     Vec3& outPos, Quat& outRot) const;
 
   // ---- carving internals (docs/DESIGN.md §7) --------------------------------
   using LimbCarveKeep = std::function<bool(int, int, int)>;
@@ -1407,6 +1473,22 @@ class Mob {
   float speedNow_ = 0;         // measured planar speed, voxels/sec
   Vec3 bodyUp_{0, 1, 0};       // foot-plane normal (slope tilt)
   float bodyY_ = 0;            // prefab MIN CORNER height (same frame as origin_.y)
+  // ---- live ragdoll state (see RagdollPhase above) ----
+  RagdollPhase ragdoll_ = RagdollPhase::None;
+  float ragdollT_ = 0;         // seconds in the current phase
+  float ragdollMinT_ = 0;      // Limp: shortest stay before the settle test
+  float ragdollStillT_ = 0;    // Limp: seconds the pelvis has been under settleSpeed
+  // GetUp: each limb's world pose the moment it was made kinematic again —
+  // the "from" side of the get-up blend, parallel to limbs_.
+  std::vector<BodyTransform> getUpFrom_;
+  // ---- NPC freefall (MobSystem::UpdateFall) ----
+  // The walk driver snaps origin_.y to the probed ground; when the ground is
+  // further below than a step, the creature falls under physics.gravity
+  // instead of drifting (or, with nothing in reach, hanging). fallVel_ is
+  // voxels/s, negative down; airTime_ is what the ragdoll rule reads.
+  float fallVel_ = 0;
+  float airTime_ = 0;
+  bool airborne_ = false;
   float restSoleY_ = 0;        // rest sole height above the min corner
   // Rest height of the leg chain's ROOT (the hip anchor) above the min corner,
   // measured off the rig in BuildRig beside restSoleY_. The pair of them is the
@@ -1823,6 +1905,17 @@ class MobSystem {
   // Every live limb of every mob within the blast — the explosion entry point.
   void CarveMobsRadial(Vec3 centerWorldVoxel, float radiusVoxels, World& world,
                        std::vector<ParticleSpawn>& spawns);
+  // The blast's OTHER half: knock every creature in reach off its feet
+  // (Mob::BlastRadial). Runs after the carve, on what survived it. Returns
+  // how many were knocked down.
+  int BlastMobsRadial(Vec3 centerWorldVoxel, float radiusVoxels,
+                      float impulseKgMs);
+  // Dev panel / tests: put one creature (or every live one) on the floor.
+  bool RagdollMob(uint64_t mobId, float minSeconds);
+  int RagdollAll(float minSeconds);
+  // Introspection for the gates: 0 none, 1 limp, 2 getting up; -1 no such mob.
+  int RagdollPhaseOf(uint64_t mobId) const;
+  Vec3 MobRootPos(uint64_t mobId) const;
   // Detach a limb now (laser crossing the joint). Root/vital kills instead.
   void Sever(uint64_t mobId, int limbIndex);
   // Nearest live limb of any mob to a body handle; -1 if none.
@@ -2288,6 +2381,10 @@ class MobSystem {
   // a sound event, a nav query — has one obvious place to join.
   struct GroundSense {
     bool haveGround = false;
+    // No ground because the column is NOT KNOWN (outside the window or not
+    // cached yet), as opposed to no ground within the scan. Gravity waits on
+    // the first and acts on the second.
+    bool groundUnknown = false;
     int groundY = 0;           // ground under the mob's centre column
     // Probes fanned around the mob at kProbeCount evenly spaced yaws, each at
     // the mob's own step-out radius. `clear[i]` is whether a body could walk
@@ -2321,6 +2418,11 @@ class MobSystem {
   // ACTUAL facing (never the desired one — that is what makes a turn arc).
   void DriveLocomotion(Mob& mob, const MobDef& def, const GroundSense& sense,
                        float align, float dt);
+  // NPC gravity, BEFORE the drive: true while the creature is in freefall
+  // (the drive is skipped that tick). Flips it into a ragdoll once the fall
+  // has lasted ragdoll.fallSeconds.
+  bool UpdateFall(Mob& mob, const MobDef& def, const GroundSense& sense,
+                  float dt);
 
   // Animation pipeline stages 1-5 plus the procedural gait layer; leaves the
   // model-space pose in mob.anim.model. Pure float, no grid contact.

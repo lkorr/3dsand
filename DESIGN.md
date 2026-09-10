@@ -3828,6 +3828,92 @@ handmade art becomes matter the existing destruction pipeline already breaks.
   Jolt `GroupFilterTable` — adjacent limb boxes otherwise fight their joints
   and the ragdoll never sleeps. Mob limbs render as extra body slots appended
   after the debris bodies (shared 12-bit slot space, `kMaxBodySlots`).
+### A creature knocked down gets back up: the live ragdoll (2026-09-09; `Mob::StartRagdoll`, `sim/tuning.h` Ragdoll)
+
+Until now the only ragdoll was death. `Mob::Die` flips every limb dynamic and
+hands it to `DebrisSystem::AdoptBody`, and there is no path back from that —
+so an explosion beside a living creature could carve it (`CarveMobsRadial`)
+but never MOVE it, because `Physics::ApplyRadialImpulse` walks the dynamic
+body list and a living limb is kinematic. Blasts tore chunks off people who
+stood there and took it.
+
+**The live ragdoll is the same flip with the limbs kept.** `Mob::StartRagdoll`
+makes every owned limb dynamic in place — joints stay, the intra-mob collision
+group stays, `limb.body` stays the mob's — and sets `RagdollPhase::Limp`. The
+NPC loop (`MobSystem::PreTick`) and the avatar driver (`PlayerAvatar::PreTick`)
+then run nothing: no sense/intent/steer/drive, no animation, no submit.
+`PostStep`'s read-back already places a dynamic body, so rendering, bleeding,
+burning and carving all keep working on a limp creature because none of them
+ever asked whether a limb was kinematic (`RebuildLimbBody` gained the one
+exception: a carve mid-ragdoll rebuilds a DYNAMIC limb). Three things reach it
+and nothing else: a blast (`Mob::BlastRadial`), freefall past
+`ragdoll.fallSeconds` (NPC: `MobSystem::UpdateFall`; avatar: its own air
+clock), and the dev panel ("ragdoll me"; "ragdoll all spawned" in the NPC AI
+window). An NPC's limbs go through `ReleaseToWorldWhenClear` on the flip, for
+the reason `Die()` documents — a body that goes dynamic inside the player's
+capsule otherwise fires out of it.
+
+**The launch is a velocity, not an impulse, and it is capped.** A blast's
+other half runs beside the debris impulse in the explosion loop:
+`MobSystem::BlastMobsRadial(ec, radius × blastRadiusScale, power ×
+blastImpulseScale)`. Per creature: impulse at the pelvis by linear falloff,
+divided by the rig's Jolt mass (`Physics::BodyMass`, readable on a kinematic
+body), gives a speed in m/s; below `blastMinSpeed` nothing happens (a distant
+boom rattles, it does not floor you), above `maxLaunchSpeed` it is clamped —
+that clamp is the "across the room, not across the map" rule, so a massive
+charge still tops out at 14 m/s (~20 m at 45°). The direction is
+away-from-the-blast with `blastUpBias` of straight-up mixed in so a floor
+blast arcs the body rather than skidding it. The speed is set UNIFORMLY on
+every limb: Jolt's per-body `AddImpulse` would give a hand ten times the
+velocity of the torso and the joints would do the launching, badly. A grenade
+(power 380) sends a ~70 kg human about 5 m/s; mass comes from material
+density, so a heavier creature flies less far from the same charge with no
+per-creature number.
+
+**NPCs fall now.** The walk drive snapped `origin_.y` toward the probed ground
+at 3 cm a tick and, with none within the 2.4 m scan, returned early — a
+creature over a drop HUNG. `UpdateFall` runs before the drive: supported
+(ground within a step) means the snap owns the height as before; further than
+a step, or with nothing in reach, the creature falls under `physics.gravity`
+(the number Jolt applies to its limbs, so a body that goes limp mid-fall keeps
+its speed) and lands on the surface the probe reports. "I cannot see the
+ground" is a third state (`GroundSense::groundUnknown`, from a new out-param
+on `GroundHeightAt`): gravity waits on an unfetched column rather than
+dropping the creature through terrain the mirror has not delivered — the
+projectile trap in CLAUDE.md, mob edition. The gait is off while airborne
+(it would IK the legs to the floor being fallen toward). Vertical only: an
+NPC has no planar velocity state, and a body that needs to fly is a ragdoll.
+
+**The get-up is procedural and nothing is authored.** `TickRagdollLimp`
+watches the pelvis: past `minSeconds`, once it has moved slower than
+`settleSpeed` for `settleSeconds` (or `maxSeconds` have passed and it is at
+least not flying), `BeginGetUp` re-derives the creature from where it lies —
+heading from the way the chest faces, or the way the head points if the chest
+faces floor or sky; `origin_` from "where would the standing pelvis be for a
+min corner here" solved through the same `LimbTargetFor` arithmetic
+`SubmitPose` uses; height from the ground probe under that footprint — makes
+every limb kinematic again exactly where it is, records that pose
+(`getUpFrom_`), and re-plants the feet. `SubmitPose` then blends each limb
+from the recorded pose toward its animated target with a modifier on the
+body frame: the target starts as a CROUCH (pitched `getUpPitchDeg` forward
+about the feet, hips down `getUpDropFrac` of the standing hip height) and
+straightens over the back three quarters of `getUpSeconds`, while the
+per-limb blend completes by 55%. So the limbs gather under the body into an
+on-hands-and-knees shape, then the shape rises — a get-up rather than a corpse
+levitating upright. The player's capsule is a passenger throughout
+(`PlayerAvatar::RagdollFollow`): `main.cpp` skips `Player::Update`, rides the
+pelvis while limp, and sits on the get-up's standing spot so the controller
+resumes exactly where the animation ends. That is also why a body thrown by a
+blast takes no fall damage on landing — the controller never saw the fall.
+
+Every number is CPU-only float in the `ragdoll` tuning group (F5, no shader,
+no rebaseline). Gate `ragdoll`: the X-detonate charge 6 voxels from a dummy
+knocks it limp and moves its pelvis within a `tests/baseline.json` band in
+1.5 s; it is back on its feet within `ragdollGetUpMaxTicks` with every limb
+still its own and no body adopted by `DebrisSystem`; and a dummy spawned 2.2 m
+up descends under gravity, goes limp past a fixture-short `fallSeconds`, and
+stands up on the ground.
+
 ### Mob steering: intent vs actuation (2026-08-21; `game/mob.cpp`)
 
 Locomotion was one block that read the ground, snapped `heading += 90°` when

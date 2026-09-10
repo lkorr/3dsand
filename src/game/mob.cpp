@@ -1421,6 +1421,12 @@ void MobSystem::Reset(bool rewindIds) {
 // of despawn/reset — the avatar's Despawn and the mob despawn sweep both end
 // here, so neither can forget the brick return or the hold release.
 void Mob::ReleaseRig() {
+  ragdoll_ = RagdollPhase::None;
+  ragdollT_ = 0.0f;
+  getUpFrom_.clear();
+  airborne_ = false;
+  fallVel_ = 0.0f;
+  airTime_ = 0.0f;
   for (MobLimb& l : limbs_) {
     // held pieces are DebrisSystem's now; only drop the kinematic hold
     if (l.holdBody) {
@@ -1812,7 +1818,8 @@ bool Mob::BuildRig(const MobDef& def, Vec3 origin) {
 }
 
 bool Mob::GroundHeightAt(World& world, int wx, int wz, int yFrom,
-                         int& outY, uint32_t* outMat) const {
+                         int& outY, uint32_t* outMat, bool* outUnknown) const {
+  if (outUnknown != nullptr) *outUnknown = false;
   // scan down through the chunk cache; request fetches for missing chunks
   // (bounded: one column per creature per tick)
   // 2.4 m of downward scan. Authored in metres: a fixed 24 cells is 2.4 m at
@@ -1821,11 +1828,15 @@ bool Mob::GroundHeightAt(World& world, int wx, int wz, int yFrom,
   const int kScanDepth = MetresToCellsI(2.4f);
   for (int y = yFrom; y > yFrom - kScanDepth; y--) {
     IVec3 cell{wx, y, wz};
-    if (!world.CellInWindow(cell)) return false;
+    if (!world.CellInWindow(cell)) {
+      if (outUnknown != nullptr) *outUnknown = true;
+      return false;
+    }
     IVec3 wc{wx >> 4, y >> 4, wz >> 4};
     const CachedChunk* cc = world.Cached(wc);
     if (!cc || cc->voxels.size() != kChunkVol) {
       world.RequestChunkFetch(wc);
+      if (outUnknown != nullptr) *outUnknown = true;
       return false;
     }
     uint32_t lx = (uint32_t)(wx & 15), ly = (uint32_t)(y & 15),
@@ -1877,7 +1888,8 @@ MobSystem::GroundSense MobSystem::SenseGround(const Mob& mob, const MobDef& def,
   const float cx = mob.origin_.x + def.worldSize.x * 0.5f;
   const float cz = mob.origin_.z + def.worldSize.z * 0.5f;
   const int yFrom = ifloor(mob.origin_.y) + kMobProbeLiftCells;
-  s.haveGround = mob.GroundHeightAt(world, ifloor(cx), ifloor(cz), yFrom, s.groundY);
+  s.haveGround = mob.GroundHeightAt(world, ifloor(cx), ifloor(cz), yFrom,
+                                    s.groundY, nullptr, &s.groundUnknown);
 
   // Probe at the mob's own footprint plus a margin, so a wide creature notices
   // a wall before its shoulder is already inside it. The reach is taken
@@ -2489,6 +2501,63 @@ float MobSystem::Steer(Mob& mob, const MobDef& def, float dt) {
 }
 
 // ---- locomotion stage 3: drive ---------------------------------------------
+// ---- locomotion stage 2.5: gravity ------------------------------------------
+// NPCs had no vertical velocity at all: the drive below snaps origin_.y toward
+// the probed ground at 3 cm a tick, and with no ground within the 2.4 m scan it
+// returns early and the creature HANGS. Both were invisible on flat fixtures and
+// both are wrong the moment a body is thrown off a ledge or a floor is blown
+// out from under it — which the live ragdoll now does routinely.
+//
+// So: supported (ground within a step of the min corner) means the drive's
+// snap owns the height, exactly as before. Further than a step above the
+// ground, or with none in reach, the creature falls under physics.gravity
+// (the same number Jolt applies to its limbs, so a body that goes limp mid-fall
+// keeps falling at the speed it had) and lands on the surface the probe
+// reports. "I cannot see the ground" is neither: gravity WAITS on an
+// unfetched column rather than dropping the creature through terrain the
+// mirror has not delivered yet (GroundSense::groundUnknown).
+//
+// Vertical only. An NPC has no planar velocity state to carry into the air,
+// and a body that needs to fly — a blast — is a ragdoll, which Jolt carries.
+bool MobSystem::UpdateFall(Mob& mob, const MobDef& def,
+                           const GroundSense& sense, float dt) {
+  (void)def;
+  if (sense.groundUnknown && !sense.haveGround) return mob.airborne_;
+  const float drop =
+      sense.haveGround ? mob.origin_.y - (float)sense.groundY : 1.0e9f;
+  if (!mob.airborne_) {
+    if (sense.haveGround && drop <= (float)kMobStepUpCells + 0.01f)
+      return false;  // supported: the drive's snap owns the height
+    mob.airborne_ = true;
+    mob.fallVel_ = 0.0f;
+    mob.airTime_ = 0.0f;
+  }
+  const auto& tune = CurrentTuning();
+  const float g = MetresToCells(tune.physics.gravity);
+  const float terminal = MetresToCells(50.0f);
+  mob.airTime_ += dt;
+  mob.fallVel_ = std::max(mob.fallVel_ - g * dt, -terminal);
+  const float ny = mob.origin_.y + mob.fallVel_ * dt;
+  // The scan reaches 2.1 m below the min corner and a tick at terminal
+  // velocity covers 1.7 m, so a landing is always seen before it is passed.
+  if (sense.haveGround && ny <= (float)sense.groundY) {
+    mob.origin_.y = (float)sense.groundY;
+    mob.airborne_ = false;
+    mob.fallVel_ = 0.0f;
+    mob.airTime_ = 0.0f;
+    return false;  // on the ground again: the drive may run this tick
+  }
+  mob.origin_.y = ny;
+  if (mob.airTime_ >= tune.ragdoll.fallSeconds && !mob.Ragdolled()) {
+    // Long enough in the air to go limp. The limbs take the fall speed with
+    // them: MoveKinematic gave them a velocity, but that is one tick's worth
+    // of the animated pose, not the drop.
+    mob.StartRagdoll(tune.ragdoll.minSeconds, "fall");
+    mob.SetLimbVelocities(Vec3{0.0f, mob.fallVel_, 0.0f});
+  }
+  return true;
+}
+
 void MobSystem::DriveLocomotion(Mob& mob, const MobDef& def,
                                 const GroundSense& sense, float align,
                                 float dt) {
@@ -2861,7 +2930,11 @@ void MobSystem::UpdateAnimation(Mob& mob, const MobDef& def, World& world,
   // ---- gait + stage 5: IK, strictly a POST-PROCESS on the flattened pose ----
   // IK must never be a blended layer: blending two IK results produces a pose
   // that satisfies neither end-effector constraint, which defeats the point.
-  const bool gaitActive = g.present && !clipOwnsPose;
+  // ...and not while FALLING: the gait plants feet on whatever ground the
+  // probe finds below, so a creature dropping past a ledge would stretch its
+  // legs to the floor it is falling toward. The else branch lets the body
+  // height follow origin_.y down instead.
+  const bool gaitActive = g.present && !clipOwnsPose && !mob.airborne_;
   if (gaitActive) {
     UpdateGait(mob, def, world, dt);
   } else {
@@ -3026,7 +3099,23 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
     // terrain collision anchors for every live limb (ManageTerrain sweep)
     mob.RegisterTerrainAnchor();
 
-    if (mob.alive_) {
+    // ---- LIMP: Jolt owns the body, the driver has nothing to say ----
+    // No sense/intent/steer/drive, no animation, no submit: the limbs are
+    // dynamic and PostStep reads them back. TickRagdollLimp watches the
+    // pelvis and starts the get-up when it has come to rest. Bleeding below
+    // still runs — a body knocked flat goes on bleeding from where it lies.
+    if (mob.alive_ && mob.ragdoll_ == Mob::RagdollPhase::Limp) {
+      mob.TickRagdollLimp(world, dt);
+    } else if (mob.alive_ && mob.ragdoll_ == Mob::RagdollPhase::GetUp) {
+      // ---- GETTING UP: the pose pipeline runs, the driver does not ----
+      // The rig is kinematic again and animates a standing pose at the spot
+      // it landed; SubmitPose blends each limb from where it lay into that
+      // pose (the crouch-then-rise curve). No intent and no drive, so it
+      // cannot walk off before its feet are under it.
+      mob.TickGetUp(dt);
+      UpdateAnimation(mob, def, world, dt);
+      mob.SubmitPose(dt, /*writeXf=*/false);
+    } else if (mob.alive_) {
       // ---- locomotion: sense -> intent -> steer -> drive ----
       // Four stages with one direction of data flow. Only DecideIntent has an
       // opinion about where to go; only Steer may move `heading`, and it does
@@ -3039,7 +3128,16 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
       const size_t attacksBefore = attacks_.size();
       DecideIntent(mob, def, sense, tick, dt);
       float align = Steer(mob, def, dt);
-      DriveLocomotion(mob, def, sense, align, dt);
+      // Gravity first: a falling creature does not walk. UpdateFall may flip
+      // the mob into a ragdoll mid-air, in which case this tick's pose is the
+      // last one the driver submits and the limbs are dynamic from the next.
+      const bool falling = UpdateFall(mob, def, sense, dt);
+      if (!falling) DriveLocomotion(mob, def, sense, align, dt);
+      if (mob.ragdoll_ == Mob::RagdollPhase::Limp) {
+        mob.BleedTick(tick, world, ops, spawns, bleedOps);
+        mi++;
+        continue;
+      }
 
       // ---- EXECUTE THE SWING (game/strokes.h, MobSystem::StepStroke) -------
       //
@@ -3253,22 +3351,55 @@ void Mob::SubmitPose(float dt, bool writeXf) {
   // of the def, not of where the creature currently stands.
   Vec3 yawPivot{def.worldSize.x * 0.5f, 0, def.worldSize.z * 0.5f};
   Vec3 bodyOrigin{origin_.x, bodyY_, origin_.z};
+
+  // ---- THE GET-UP (RagdollPhase::GetUp) ---------------------------------
+  // Two curves over ragdoll.getUpSeconds, `u` in 0..1. `blendW` is how far
+  // each limb has travelled from where it lay (getUpFrom_) toward its
+  // animated target, done by 55%. The target itself starts as a CROUCH —
+  // the body pitched getUpPitchDeg forward about its own feet with the hips
+  // dropped getUpDropFrac of the standing hip height — and straightens over
+  // the back three quarters. So the limbs first gather under the body into
+  // an on-hands-and-knees shape, then the shape rises: a get-up rather than
+  // a corpse levitating upright. Nothing here is authored; it is a
+  // modifier on the same body frame every standing pose goes through.
+  float blendW = 1.0f;
+  if (ragdoll_ == RagdollPhase::GetUp) {
+    const auto& rg = CurrentTuning().ragdoll;
+    const float u = std::clamp(ragdollT_ / std::max(rg.getUpSeconds, 0.1f),
+                               0.0f, 1.0f);
+    auto smooth = [](float x) {
+      x = std::clamp(x, 0.0f, 1.0f);
+      return x * x * (3.0f - 2.0f * x);
+    };
+    blendW = smooth(u / 0.55f);
+    const float rise = smooth((u - 0.25f) / 0.75f);
+    const float pitch = rg.getUpPitchDeg * (3.14159265f / 180.0f) * (1.0f - rise);
+    const float drop = rg.getUpDropFrac * restHipY_ * (1.0f - rise);
+    // Pitch in the MODEL frame (applied before the yaw), about +X = the
+    // body's right: positive tips +Y toward +Z, the facing direction.
+    bodyRot = QuatNormalize(Mul(bodyRot, AxisAngle({1, 0, 0}, pitch)));
+    bodyOrigin.y -= drop;
+  }
+
   for (size_t i = 0; i < limbs_.size(); i++) {
     MobLimb& limb = limbs_[i];
     if (!limb.body) continue;
     // a severed part in its hold window keeps its last pose and is not
     // re-driven; the countdown lives in TickSeveredHolds
     if (limb.holdSeconds > 0) continue;
-    Quat local = i < anim_.model.size() ? anim_.model[i].rot : Quat{};
-    Vec3 modelPos = i < anim_.model.size() ? anim_.model[i].pos : Vec3{};
-    Quat rot = QuatNormalize(Mul(bodyRot, local));
-    // modelPos is ALREADY in prefab coordinates: AnimFlatten seeds the root
-    // from its rest.pos, which IS rootAnchor, so every part's model pos
-    // carries the root offset. Adding rootAnchor again lifts the whole rig
-    // by the root anchor — on a biped that is the hip height.
-    Vec3 anchorW = bodyOrigin + yawPivot +
-                   Rotate(bodyRot, modelPos - yawPivot);
-    Vec3 pos = anchorW - Rotate(rot, limb.anchorLimb);
+    // a LIMP limb is dynamic: Jolt places it and PostStep reads it back.
+    // (Reached only by the avatar; the NPC loop skips SubmitPose entirely.)
+    if (ragdoll_ == RagdollPhase::Limp) continue;
+    Vec3 pos;
+    Quat rot;
+    LimbTargetFor(i, bodyOrigin, bodyRot, yawPivot, pos, rot);
+    if (ragdoll_ == RagdollPhase::GetUp && blendW < 1.0f &&
+        i < getUpFrom_.size()) {
+      const BodyTransform& f = getUpFrom_[i];
+      const Quat fq{f.quat[0], f.quat[1], f.quat[2], f.quat[3]};
+      pos = f.pos + (pos - f.pos) * blendW;
+      rot = QuatNormalize(QuatSlerp(fq, rot, blendW));
+    }
     float q[4] = {rot.x, rot.y, rot.z, rot.w};
     phys_->MoveKinematicBody(limb.body, pos, q, dt);
     // `writeXf` stores the submitted pose immediately: the avatar's held-item
@@ -3318,6 +3449,266 @@ void Mob::SubmitPose(float dt, bool writeXf) {
       }
     }
   }
+}
+
+void Mob::LimbTargetFor(size_t i, Vec3 bodyOrigin, Quat bodyRot,
+                        Vec3 yawPivot, Vec3& outPos, Quat& outRot) const {
+  const MobLimb& limb = limbs_[i];
+  Quat local = i < anim_.model.size() ? anim_.model[i].rot : Quat{};
+  Vec3 modelPos = i < anim_.model.size() ? anim_.model[i].pos : Vec3{};
+  Quat rot = QuatNormalize(Mul(bodyRot, local));
+  // modelPos is ALREADY in prefab coordinates: AnimFlatten seeds the root
+  // from its rest.pos, which IS rootAnchor, so every part's model pos
+  // carries the root offset. Adding rootAnchor again lifts the whole rig
+  // by the root anchor — on a biped that is the hip height.
+  Vec3 anchorW = bodyOrigin + yawPivot + Rotate(bodyRot, modelPos - yawPivot);
+  outPos = anchorW - Rotate(rot, limb.anchorLimb);
+  outRot = rot;
+}
+
+// ---- LIVE RAGDOLL -------------------------------------------------------------
+
+Vec3 Mob::RootWorldPos() const {
+  const int rl = def_ ? def_->rootLimb : -1;
+  if (rl >= 0 && rl < (int)limbs_.size() && limbs_[rl].body)
+    return limbs_[rl].xf.pos;
+  return origin_;
+}
+
+float Mob::BodyMassKg() const {
+  float m = 0.0f;
+  if (!phys_) return m;
+  for (const MobLimb& l : limbs_)
+    if (l.body) m += phys_->BodyMass(l.body);
+  return m;
+}
+
+void Mob::StartRagdoll(float minSeconds, const char* why) {
+  if (!alive_ || !phys_ || ragdoll_ == RagdollPhase::Limp) return;
+  // A stroke in flight is over: the arm it was driving is about to be Jolt's.
+  stroke_.Reset();
+  weapon_ = WeaponPose{};
+  int flipped = 0;
+  for (size_t i = 0; i < limbs_.size(); i++) {
+    MobLimb& limb = limbs_[i];
+    if (!limb.body) continue;
+    if (limb.holdSeconds > 0) continue;  // a severed piece mid-hold is not ours to flip
+    // Fresh transform first: the kinematic target this tick already went to
+    // Jolt, and the read-back below is what the get-up will start from if
+    // the body never moves (a creature flipped standing still).
+    phys_->GetTransform(limb.body, limb.xf);
+    phys_->SetBodyKinematic(limb.body, false);
+    phys_->ActivateBody(limb.body);
+    // An NPC's limbs live on the plain MOVING layer. Flipping them dynamic
+    // inside the player's capsule — a blast at sword's reach — is the same
+    // unresolvable overlap Die() documents, and the answer is the same: off
+    // the player's contact layer until the piece has fallen clear, then an
+    // ordinary body that can be stood on and bumped into. The avatar's own
+    // limbs are exempt for good already (AvatarLayer).
+    if (!AvatarLayer()) phys_->ReleaseToWorldWhenClear(limb.body);
+    flipped++;
+  }
+  if (flipped == 0) return;
+  ragdoll_ = RagdollPhase::Limp;
+  ragdollT_ = 0.0f;
+  ragdollMinT_ = std::max(minSeconds, 0.0f);
+  ragdollStillT_ = 0.0f;
+  getUpFrom_.clear();
+  std::printf("mob %llu ragdoll: limp (%s, %d limbs, %.1f kg)\n",
+              (unsigned long long)id_, why ? why : "", flipped, BodyMassKg());
+}
+
+void Mob::SetLimbVelocities(Vec3 velVoxPerSec) {
+  if (!phys_) return;
+  for (MobLimb& l : limbs_)
+    if (l.body && l.holdSeconds <= 0) phys_->SetBodyVelocity(l.body, velVoxPerSec);
+}
+
+bool Mob::BlastRadial(Vec3 centerWorldVoxel, float radiusVoxels,
+                      float impulseKgMs) {
+  if (!alive_ || !phys_ || radiusVoxels <= 0.0f) return false;
+  const auto& rg = CurrentTuning().ragdoll;
+  // Measured at the pelvis, so a creature is "in the blast" by where its
+  // body is and not by its walk anchor (which is a floor corner).
+  const Vec3 at = RootWorldPos() + Vec3{0.0f, MetresToCells(0.4f), 0.0f};
+  Vec3 d = at - centerWorldVoxel;
+  const float dist = d.len();
+  if (dist > radiusVoxels) return false;
+  const float falloff = 1.0f - dist / radiusVoxels;
+  const float mass = std::max(BodyMassKg(), 1.0f);
+  // impulse / mass is a speed in m/s; clamp it to the authored ceiling, and
+  // ignore a shove too weak to knock anyone over.
+  float speedMs = impulseKgMs * falloff / mass;
+  if (speedMs < rg.blastMinSpeed) return false;
+  speedMs = std::min(speedMs, rg.maxLaunchSpeed);
+  Vec3 dir = dist > 1e-3f ? d * (1.0f / dist) : Vec3{0, 1, 0};
+  dir.y += rg.blastUpBias;
+  dir = dir.normalized();
+  if (dir.len() < 0.5f) dir = {0, 1, 0};
+  const bool wasLimp = ragdoll_ == RagdollPhase::Limp;
+  StartRagdoll(rg.minSeconds, "blast");
+  if (ragdoll_ != RagdollPhase::Limp) return false;
+  // A body already limp keeps what it had and takes the new shove on top;
+  // a standing one is launched clean.
+  const Vec3 launch = dir * MetresToCells(speedMs);
+  for (MobLimb& l : limbs_) {
+    if (!l.body || l.holdSeconds > 0) continue;
+    Vec3 lin{}, ang{};
+    if (wasLimp && phys_->GetBodyVelocities(l.body, lin, ang))
+      phys_->SetBodyVelocities(l.body, lin + launch, ang);
+    else
+      phys_->SetBodyVelocity(l.body, launch);
+  }
+  ragdollStillT_ = 0.0f;
+  std::printf("mob %llu ragdoll: blast launch %.1f m/s (impulse %.0f, mass %.1f kg, "
+              "falloff %.2f)\n",
+              (unsigned long long)id_, speedMs, impulseKgMs, mass, falloff);
+  return true;
+}
+
+void Mob::TickRagdollLimp(World& world, float dt) {
+  const auto& rg = CurrentTuning().ragdoll;
+  ragdollT_ += dt;
+  const int rl = def_ ? def_->rootLimb : -1;
+  float speedVox = 0.0f;
+  if (rl >= 0 && rl < (int)limbs_.size() && limbs_[rl].body) {
+    Vec3 lin{}, ang{};
+    if (phys_->GetBodyVelocities(limbs_[rl].body, lin, ang)) speedVox = lin.len();
+    // Keep the walk anchor under the body while it flies: the window
+    // despawn, the AI's actor list and every "where is this creature"
+    // reader look at origin_. Approximate — the exact solve is BeginGetUp's.
+    origin_ = limbs_[rl].xf.pos - limbs_[rl].restOffset;
+  } else {
+    // No pelvis left to watch: stand what remains straight back up.
+    BeginGetUp(world);
+    return;
+  }
+  if (speedVox < MetresToCells(rg.settleSpeed)) ragdollStillT_ += dt;
+  else ragdollStillT_ = 0.0f;
+  const bool settled = ragdollStillT_ >= rg.settleSeconds;
+  // The ceiling only applies to a body that is at least not FLYING: a
+  // creature eight seconds into a long fall would otherwise be stood up in
+  // mid-air, then dropped again three seconds later.
+  const bool overdue =
+      ragdollT_ >= rg.maxSeconds && speedVox < MetresToCells(2.0f);
+  if (ragdollT_ >= ragdollMinT_ && (settled || overdue)) BeginGetUp(world);
+}
+
+void Mob::BeginGetUp(World& world) {
+  if (!phys_ || !def_) return;
+  const MobDef& def = *def_;
+  const int rl = def.rootLimb;
+  const bool haveRoot = rl >= 0 && rl < (int)limbs_.size() && limbs_[rl].body;
+  if (haveRoot) {
+    MobLimb& root = limbs_[rl];
+    phys_->GetTransform(root.body, root.xf);
+    const Quat rq{root.xf.quat[0], root.xf.quat[1], root.xf.quat[2],
+                  root.xf.quat[3]};
+    // Face the way the chest faces; a body flat on its face or back has its
+    // chest pointing at the floor or the sky, so then face the way the head
+    // points along the ground.
+    Vec3 f = Rotate(rq, Vec3{0, 0, 1});
+    Vec3 fxz{f.x, 0, f.z};
+    if (fxz.len() < 0.5f) {
+      const Vec3 u = Rotate(rq, Vec3{0, 1, 0});
+      fxz = Vec3{u.x, 0, u.z};
+    }
+    if (fxz.len() > 1e-3f) heading_ = std::atan2(fxz.x, fxz.z);
+    desiredHeading_ = heading_;
+    turnVel_ = 0.0f;
+    bodyUp_ = {0, 1, 0};
+    // Where would the standing pelvis be for a body whose min corner is at
+    // the origin? Put the min corner where that lands the pelvis on top of
+    // the one lying there.
+    const Vec3 yawPivot{def.worldSize.x * 0.5f, 0, def.worldSize.z * 0.5f};
+    Vec3 sp;
+    Quat sr;
+    LimbTargetFor((size_t)rl, Vec3{0, 0, 0}, AxisAngle({0, 1, 0}, heading_),
+                  yawPivot, sp, sr);
+    origin_.x = root.xf.pos.x - sp.x;
+    origin_.z = root.xf.pos.z - sp.z;
+    const float cx = origin_.x + def.worldSize.x * 0.5f;
+    const float cz = origin_.z + def.worldSize.z * 0.5f;
+    int gy = 0;
+    if (GroundHeightAt(world, ifloor(cx), ifloor(cz),
+                       ifloor(root.xf.pos.y) + kMobProbeLiftCells, gy))
+      origin_.y = (float)gy;
+    else
+      origin_.y = root.xf.pos.y - sp.y;  // no floor in reach: stand where it lies
+  }
+  bodyY_ = origin_.y;
+  airborne_ = false;
+  fallVel_ = 0.0f;
+  airTime_ = 0.0f;
+  // The animation state must not see the teleport as a sprint, and the gait
+  // must re-plant every foot under the new stance instead of IK-ing the legs
+  // back to where they were planted before the flight.
+  anim_.lastPos = origin_;
+  anim_.velocity = {};
+  for (FootState& f : anim_.feet) f.valid = false;
+  footInit_ = false;
+  // Freeze every limb where it lies: that is the "from" pose of the blend.
+  getUpFrom_.assign(limbs_.size(), BodyTransform{});
+  for (size_t i = 0; i < limbs_.size(); i++) {
+    MobLimb& limb = limbs_[i];
+    if (!limb.body || limb.holdSeconds > 0) continue;
+    phys_->GetTransform(limb.body, limb.xf);
+    getUpFrom_[i] = limb.xf;
+    phys_->SetBodyKinematic(limb.body, true);
+  }
+  ragdoll_ = RagdollPhase::GetUp;
+  ragdollT_ = 0.0f;
+  std::printf("mob %llu ragdoll: get up at (%.1f, %.1f, %.1f) heading %.2f\n",
+              (unsigned long long)id_, origin_.x, origin_.y, origin_.z, heading_);
+}
+
+void Mob::TickGetUp(float dt) {
+  ragdollT_ += dt;
+  if (ragdollT_ >= CurrentTuning().ragdoll.getUpSeconds) {
+    ragdoll_ = RagdollPhase::None;
+    ragdollT_ = 0.0f;
+    getUpFrom_.clear();
+  }
+}
+
+int MobSystem::BlastMobsRadial(Vec3 centerWorldVoxel, float radiusVoxels,
+                               float impulseKgMs) {
+  int n = 0;
+  for (Mob& mob : mobs_)
+    if (mob.alive_ && mob.BlastRadial(centerWorldVoxel, radiusVoxels, impulseKgMs))
+      n++;
+  return n;
+}
+
+bool MobSystem::RagdollMob(uint64_t mobId, float minSeconds) {
+  for (Mob& mob : mobs_)
+    if (mob.id_ == mobId) {
+      mob.StartRagdoll(minSeconds, "dev");
+      return mob.ragdoll_ == Mob::RagdollPhase::Limp;
+    }
+  return false;
+}
+
+int MobSystem::RagdollAll(float minSeconds) {
+  int n = 0;
+  for (Mob& mob : mobs_) {
+    if (!mob.alive_) continue;
+    mob.StartRagdoll(minSeconds, "dev");
+    if (mob.ragdoll_ == Mob::RagdollPhase::Limp) n++;
+  }
+  return n;
+}
+
+int MobSystem::RagdollPhaseOf(uint64_t mobId) const {
+  for (const Mob& mob : mobs_)
+    if (mob.id_ == mobId) return (int)mob.ragdoll_;
+  return -1;
+}
+
+Vec3 MobSystem::MobRootPos(uint64_t mobId) const {
+  for (const Mob& mob : mobs_)
+    if (mob.id_ == mobId) return mob.RootWorldPos();
+  return {};
 }
 
 void Mob::BleedTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
@@ -5167,7 +5558,10 @@ bool Mob::RebuildLimbBody(int limbIndex) {
     child.joint = phys_->CreateJoint(nh, child.body,
                                      JointDescFor(limbDefs_[k], anchorW));
   }
-  bool kinematic = alive_;
+  // Alive AND not limp: a carve during a live ragdoll (a second blast, acid
+  // on a body on the floor) rebuilds a DYNAMIC limb, or the rebuilt piece
+  // would freeze in mid-air while the rest of the rig fell.
+  bool kinematic = alive_ && ragdoll_ != RagdollPhase::Limp;
   phys_->RemoveBody(limb.body);
   limb.body = nh;
   phys_->SetBodyKinematic(limb.body, kinematic);
@@ -7470,6 +7864,11 @@ void MobSystem::PushVoice(const Mob& mob, VoiceKind kind, Vec3 posVoxel,
 void Mob::Die() {
   if (!alive_) return;
   alive_ = false;
+  // A live ragdoll that dies is just a corpse now: the limbs below go to
+  // DebrisSystem exactly as from standing (SetBodyKinematic(false) on an
+  // already-dynamic body is a no-op).
+  ragdoll_ = RagdollPhase::None;
+  getUpFrom_.clear();
   // The cause outlives the husk: an NPC corpse is swept out of mobs_ on the
   // next PreTick, and a gate that asks "why did it die" one tick later would
   // otherwise find nobody to ask (MobSystem::DeathCause falls back to this).

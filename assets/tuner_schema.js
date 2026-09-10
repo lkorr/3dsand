@@ -757,6 +757,30 @@ const TUNING_SCHEMA = [
   },
 
   {
+    id: 'ragdoll',
+    title: 'Ragdoll',
+    icon: '\u{1F938}',
+    apply: 'cpu',
+    blurb: 'A living creature going limp \u2014 knocked flying by a blast or falling too long \u2014 and the procedural get-up that follows. Jolt presentation state only; nothing here touches the hashed grid.',
+    params: [
+      {k:'fallSeconds', n:'fall before limp', d:'Continuous freefall before a creature (NPC or player) goes limp in the air. NPCs fall under real gravity now; they used to hang over a drop.', min:0.2, max:10, step:0.1, u:'s'},
+      {k:'blastRadiusScale', n:'blast knockdown reach', d:'A blast knocks bodies down within this multiple of its destruction radius. Same idea as the debris impulse reach in Physics.', min:0.5, max:10, step:0.1, u:'\u00d7'},
+      {k:'blastImpulseScale', n:'blast launch impulse', d:'Impulse at the blast centre is power \u00d7 this, in kg\u00b7m/s, falling off linearly to zero at the reach. Launch speed is impulse / body mass, so a grenade (power 380) sends ~70 kg about 5 m/s and a heavier creature less.', min:0, max:10, step:0.05},
+      {k:'blastMinSpeed', n:'knockdown threshold', d:'A blast that would launch the body slower than this does not knock it down at all \u2014 a distant boom rattles, it does not floor you.', min:0, max:10, step:0.1, u:'m/s'},
+      {k:'maxLaunchSpeed', n:'launch speed cap', d:'The launch speed clamp. This is the across-the-room-not-across-the-map knob: a massive charge still tops out here (14 m/s at 45\u00b0 is a ~20 m flight).', min:1, max:60, step:0.5, u:'m/s'},
+      {k:'blastUpBias', n:'launch up-bias', d:'Fraction of straight-up mixed into the launch direction, so a body next to a floor blast arcs instead of skidding.', min:0, max:2, step:0.05},
+      {k:'minSeconds', n:'min time down', d:'Shortest time a creature stays limp before it may start getting up.', min:0, max:10, step:0.1, u:'s'},
+      {k:'settleSpeed', n:'settle speed', d:'The pelvis must be moving slower than this to count as settled.', min:0.05, max:3, step:0.05, u:'m/s'},
+      {k:'settleSeconds', n:'settle time', d:'How long the pelvis must stay under the settle speed before the get-up starts.', min:0, max:5, step:0.05, u:'s'},
+      {k:'maxSeconds', n:'max time down', d:'Ceiling for a body that never settles (wedged, twitching on a slope): it gets up anyway.', min:1, max:60, step:0.5, u:'s'},
+      {k:'getUpSeconds', n:'get-up duration', d:'Total length of the procedural get-up: limbs blend from where they landed into a crouch, which rises to standing.', min:0.1, max:6, step:0.05, u:'s'},
+      {k:'getUpPitchDeg', n:'get-up crouch pitch', d:'How far forward the body is pitched about its feet at the start of the get-up \u2014 the on-hands-and-knees shape it rises out of.', min:0, max:90, step:1, u:'\u00b0'},
+      {k:'getUpDropFrac', n:'get-up crouch drop', d:'How far the hips start below standing height, as a fraction of the rig\u2019s hip height.', min:0, max:1, step:0.01},
+      {k:'devSeconds', n:'dev button hold', d:'How long the dev panel\u2019s \u201cragdoll me\u201d keeps the player limp before the get-up may begin.', min:0.5, max:30, step:0.5, u:'s'},
+    ],
+  },
+
+  {
     id: 'debris',
     title: 'Debris',
     icon: '\u{1F9F1}',

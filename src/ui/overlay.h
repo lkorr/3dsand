@@ -152,6 +152,7 @@ struct UIState {
   bool reloadMaterials = false;
   bool regenWorld = false;
   bool pendingDetonate = false;  // X key / UI button: explode at crosshair
+  bool ragdollMe = false;        // one-shot: the player goes limp for ragdoll.devSeconds
   bool saveWorld = false;        // F9
   bool loadWorld = false;        // F10
 
@@ -321,6 +322,7 @@ struct UIState {
   bool aiSpawnStatic = false;
   bool aiSpawnDuelist = false;
   bool aiKillSpawned = false;     // one-shot: despawn everything this panel made
+  bool aiRagdollSpawned = false;  // one-shot: knock everything this panel made flat
   bool aiSaveBehaviors = false;   // one-shot: write assets/mobs/behaviors.json
   bool aiApplyBehavior = false;   // one-shot: aiBehaviorPick -> the selected mob
   bool showAiDebug = false;       // in-world path / target / band viz

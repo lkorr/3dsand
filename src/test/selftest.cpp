@@ -245,6 +245,10 @@ const char* const kOrder[] = {
     // its group, so it inherits state instead of changing what everything
     // after it inherits.
     "ai-dummy", "ai-face", "ai-approach",
+    // Live ragdoll: a blast knocks a creature flying and it gets back up; a
+    // long fall does the same. Appended last in the group for the reason
+    // above; it restores the world on its way out.
+    "ragdoll",
     // ---- THE WOUND MODEL ---------------------------------------------------
     // LAST of the mob gates, and the position is a lesson rather than a
     // preference.

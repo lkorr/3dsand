@@ -4712,6 +4712,168 @@ Status GateAiApproach(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---- LIVE RAGDOLL (DESIGN.md "A creature knocked down gets back up") --------
+//
+// Three claims, each a number this gate prints, so `--gate ragdoll` alone is
+// the whole iteration loop:
+//   A. a blast beside a standing creature knocks it LIMP (phase 1) and moves
+//      its pelvis at least ragdollBlastMinTravel voxels — and no more than
+//      ragdollBlastMaxTravel ("across the room, not across the map");
+//   B. it gets back UP: phase returns to 0 within ragdollGetUpMaxTicks, still
+//      alive, every limb still its own (LimbBodyCount unchanged, no body
+//      adopted by DebrisSystem), standing on the ground where it landed and
+//      still standing 60 ticks later;
+//   C. dropped from a height it FALLS under gravity (origin_.y descends, the
+//      old code hung it in the air), goes limp once the fall has lasted
+//      ragdoll.fallSeconds — shortened for the fixture, the harness mirror is
+//      only 2.4 m deep — and gets back up on the ground.
+// Thresholds are in tests/baseline.json (BaselineNumber), so retuning what
+// counts as "across the room" is a JSON edit, not a rebuild.
+Status GateRagdoll(Ctx& c, std::string& detail) {
+  GpuContext& ctx = c.ctx;
+  World& world = c.world;
+  Simulation& sim = c.sim;
+  DebrisSystem& debris = c.debris;
+  MobSystem& mobs = c.mobs;
+  debris.Reset();
+  mobs.Reset();
+  SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+  ctx.WaitIdle();
+  int dummyDef = -1;
+  for (size_t i = 0; i < mobs.Defs().size(); i++)
+    if (mobs.Defs()[i].name == "dummy") dummyDef = (int)i;
+  if (dummyDef < 0) {
+    detail = "no dummy mob def";
+    return Status::Fail;
+  }
+  const int nLimbs = (int)mobs.Defs()[dummyDef].limbs.size();
+  // The AI gates' fixture: a flat spot at the CENTRE OF THE RESIDENCY
+  // WINDOW, never an absolute coordinate — an earlier gate leaves the window
+  // elsewhere and a mob spawned outside it is despawned on its first tick
+  // (AiFixtureCentre's note; this gate relearned it in-suite).
+  int relief = 0;
+  const IVec3 anchor = AiFixtureCentre(world);
+  const IVec3 spot = AiFlatSpot(anchor.x, anchor.z, 96, 16, kDefaultSeed, relief);
+  const int h = spot.y;
+  AiTicker ticker{c, 9000, {spot.x >> 4, spot.y >> 4, spot.z >> 4}};
+  auto tickOnce = [&]() { ticker(); };
+  const double minTravel = BaselineNumber("ragdollBlastMinTravel", 6.0);
+  const double maxTravel = BaselineNumber("ragdollBlastMaxTravel", 120.0);
+  const int getUpMaxTicks = (int)BaselineNumber("ragdollGetUpMaxTicks", 400.0);
+  bool ok = true;
+
+  // ---- A. the blast --------------------------------------------------------
+  uint64_t id = mobs.Spawn(dummyDef, {spot.x, h + 1, spot.z});
+  if (id == 0) {
+    detail = "spawn failed";
+    return Status::Fail;
+  }
+  std::printf("  ragdoll fixture: spot (%d, %d, %d), relief %d\n", spot.x, h,
+              spot.z, relief);
+  for (int i = 0; i < 45; i++) tickOnce();  // stand, settle the feet
+  const uint32_t debrisBefore = debris.BodyCount();
+  const Vec3 p0 = mobs.MobRootPos(id);
+  const int phaseBefore = mobs.RagdollPhaseOf(id);
+  // The X-detonate charge (tools.detonateRadius/Power) 6 voxels to the side,
+  // at pelvis height, through the same scale main.cpp's explosion loop uses.
+  const auto& tune = CurrentTuning();
+  const Vec3 ec{p0.x - 6.0f, p0.y + 2.0f, p0.z};
+  const float reach = (float)tune.tools.detonateRadius * tune.ragdoll.blastRadiusScale;
+  const float impulse = (float)tune.tools.detonatePower * tune.ragdoll.blastImpulseScale;
+  const int knocked = mobs.BlastMobsRadial(ec, reach, impulse);
+  const int phaseAfter = mobs.RagdollPhaseOf(id);
+  for (int i = 0; i < 45; i++) tickOnce();  // 1.5 s of flight
+  const Vec3 p1 = mobs.MobRootPos(id);
+  const float travel = Vec3{p1.x - p0.x, 0, p1.z - p0.z}.len();
+  const bool blastOk = knocked == 1 && phaseBefore == 0 && phaseAfter == 1 &&
+                       mobs.IsAlive(id) && travel >= (float)minTravel &&
+                       travel <= (float)maxTravel;
+  std::printf("  ragdoll blast: %s (knocked %d, phase %d->%d, pelvis travelled "
+              "%.1f vox in 1.5 s, band %.0f..%.0f, alive %d)\n",
+              blastOk ? "PASS" : "FAIL", knocked, phaseBefore, phaseAfter, travel,
+              minTravel, maxTravel, (int)mobs.IsAlive(id));
+  ok = ok && blastOk;
+
+  // ---- B. the get-up -------------------------------------------------------
+  int upAt = -1;
+  for (int i = 0; i < getUpMaxTicks; i++) {
+    tickOnce();
+    if (mobs.RagdollPhaseOf(id) == 0) {
+      upAt = i + 1;
+      break;
+    }
+  }
+  const Vec3 up = mobs.MobOrigin(id);
+  const int gh = World::TerrainHeight(ifloor(up.x + 1.5f), ifloor(up.z + 1.5f),
+                                      kDefaultSeed);
+  for (int i = 0; i < 60; i++) tickOnce();  // ...and stays up, walking
+  const Vec3 later = mobs.MobOrigin(id);
+  const bool upOk = upAt > 0 && mobs.IsAlive(id) &&
+                    mobs.LimbBodyCount() == (uint32_t)nLimbs &&
+                    debris.BodyCount() == debrisBefore &&
+                    std::fabs(up.y - (float)(gh + 1)) < 16.0f &&
+                    mobs.RagdollPhaseOf(id) == 0 &&
+                    std::fabs(later.y - (float)(gh + 1)) < 16.0f;
+  std::printf("  ragdoll get-up: %s (up after %d ticks, alive %d, limbs %u/%d, "
+              "debris +%d, stood at y %.1f vs ground %d, 60 ticks later y %.1f "
+              "phase %d)\n",
+              upOk ? "PASS" : "FAIL", upAt, (int)mobs.IsAlive(id),
+              mobs.LimbBodyCount(), nLimbs, (int)(debris.BodyCount() - debrisBefore),
+              up.y, gh + 1, later.y, mobs.RagdollPhaseOf(id));
+  ok = ok && upOk;
+
+  // ---- C. the fall ---------------------------------------------------------
+  // 2.2 m up, inside the harness mirror's 2.4 m ground scan, and a
+  // fixture-short fallSeconds so the limp fires before the landing.
+  mobs.Reset();
+  debris.Reset();
+  const Tuning saved = CurrentTuning();
+  {
+    Tuning tt = saved;
+    tt.ragdoll.fallSeconds = 0.3f;
+    SetCurrentTuning(tt);
+  }
+  uint64_t fid =
+      mobs.Spawn(dummyDef, {spot.x, h + 1 + MetresToCellsI(2.2f), spot.z});
+  const Vec3 f0 = mobs.MobOrigin(fid);
+  for (int i = 0; i < 5; i++) tickOnce();
+  const Vec3 f1 = mobs.MobOrigin(fid);
+  int limpAt = -1;
+  for (int i = 0; i < 30; i++) {
+    tickOnce();
+    if (mobs.RagdollPhaseOf(fid) == 1) {
+      limpAt = i + 6;
+      break;
+    }
+  }
+  int fUpAt = -1;
+  for (int i = 0; i < getUpMaxTicks; i++) {
+    tickOnce();
+    if (mobs.RagdollPhaseOf(fid) == 0) {
+      fUpAt = i + 1;
+      break;
+    }
+  }
+  const Vec3 f2 = mobs.MobOrigin(fid);
+  const bool fallOk = fid != 0 && f1.y < f0.y - 0.5f && limpAt > 0 &&
+                      fUpAt > 0 && mobs.IsAlive(fid) &&
+                      std::fabs(f2.y - (float)(h + 1)) < 16.0f;
+  std::printf("  ragdoll fall: %s (spawned %.0f up, dropped %.2f vox in 5 ticks, "
+              "limp at tick %d, up after %d more, final y %.1f vs ground %d, "
+              "alive %d)\n",
+              fallOk ? "PASS" : "FAIL", f0.y - (float)(h + 1), f0.y - f1.y,
+              limpAt, fUpAt, f2.y, h + 1, (int)mobs.IsAlive(fid));
+  ok = ok && fallOk;
+  SetCurrentTuning(saved);
+
+  mobs.Reset();
+  debris.Reset();
+  SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+  ctx.WaitIdle();
+  if (!ok) detail = "see the ragdoll lines above";
+  return ok ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& MobGates() {
@@ -4735,6 +4897,8 @@ const std::vector<Gate>& MobGates() {
       {"ai-dummy", "mob", {}, false, GateAiDummy, /*needsRender=*/false},
       {"ai-face", "mob", {}, false, GateAiFace, /*needsRender=*/false},
       {"ai-approach", "mob", {}, false, GateAiApproach, /*needsRender=*/false},
+      // Live ragdoll: blast knockdown, get-up, NPC gravity. Counts only.
+      {"ragdoll", "mob", {}, false, GateRagdoll, /*needsRender=*/false},
   };
   return g;
 }

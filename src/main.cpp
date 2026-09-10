@@ -5570,8 +5570,15 @@ int main(int argc, char** argv) {
     {
       static bool wasInLiquid = false;
       const float enterSpeed = -player.vel.y;
-      player.Update(dt, pin, cam.FlatForward(), cam.Right(), cam.Forward(),
-                    kindAt);
+      // A limp or rising body owns the player, not the controller: no
+      // input, no gravity, no sweeps. The capsule is moved onto the body
+      // after each physics step (PlayerAvatar::RagdollFollow, below).
+      if (avatar.Spawned() && avatar.Ragdolled()) {
+        player.vel = {};
+      } else {
+        player.Update(dt, pin, cam.FlatForward(), cam.Right(), cam.Forward(),
+                      kindAt);
+      }
       if (player.inLiquid && !wasInLiquid && enterSpeed > 2.0f) {
         // Crest height in metres, from the entry speed, capped: a splash from
         // a great fall is bigger, but not without limit — an unbounded
@@ -6118,6 +6125,22 @@ int main(int argc, char** argv) {
         for (uint64_t mid : aiSpawnedMobs)
           if (Mob* m = mobs.FindMobById(mid)) m->Die();
         aiSpawnedMobs.clear();
+      }
+      if (ui.aiRagdollSpawned) {
+        ui.aiRagdollSpawned = false;
+        for (uint64_t mid : aiSpawnedMobs)
+          mobs.RagdollMob(mid, CurrentTuning().ragdoll.devSeconds);
+      }
+      if (ui.ragdollMe) {
+        ui.ragdollMe = false;
+        if (avatar.Spawned() && avatar.IsAlive()) {
+          avatar.StartRagdoll(CurrentTuning().ragdoll.devSeconds, "dev button");
+          // A nudge backwards and up so the body keels over instead of
+          // folding straight down onto its own feet.
+          const Vec3 back{-std::sin(avatarHeading), 0.35f,
+                          -std::cos(avatarHeading)};
+          avatar.SetLimbVelocities(back.normalized() * MetresToCells(1.5f));
+        }
       }
       if (ui.aiApplyBehavior) {
         ui.aiApplyBehavior = false;
@@ -7322,6 +7345,18 @@ int main(int argc, char** argv) {
               Vec3{(float)e.x, (float)e.y, (float)e.z},
               (float)e.radius * CurrentTuning().physics.explosionImpulseRadiusScale,
               (float)e.power * CurrentTuning().physics.explosionImpulseScale);
+          // ...and the LIVING are knocked flying. A standing creature's limbs
+          // are kinematic, so the impulse above never touched them; this is
+          // the blast's other half (Mob::BlastRadial): go limp, take a launch
+          // velocity of impulse / body mass toward away-from-the-blast,
+          // capped at ragdoll.maxLaunchSpeed, and get back up once landed.
+          {
+            const auto& rg = CurrentTuning().ragdoll;
+            const float reach = (float)e.radius * rg.blastRadiusScale;
+            const float impulse = (float)e.power * rg.blastImpulseScale;
+            mobs.BlastMobsRadial(ec, reach, impulse);
+            if (avatar.Spawned()) avatar.BlastRadial(ec, reach, impulse);
+          }
           stream.MarkModifiedBox({e.x - e.radius, e.y - e.radius, e.z - e.radius},
                                  {e.x + e.radius, e.y + e.radius, e.z + e.radius});
         }
@@ -7418,9 +7453,26 @@ int main(int argc, char** argv) {
       debris.PostStep();
       mobs.PostStep();
       avatar.PostStep();
+      // ---- the player follows a ragdolled body ----
+      // Limp: the capsule rides the pelvis wherever Jolt threw it, so the
+      // camera goes with the body. Getting up: it sits on the standing spot
+      // the get-up chose, so the controller resumes exactly there. The body
+      // facing is copied back into the heading policy so the first driven
+      // tick after the get-up does not snap the rig round to the camera.
+      bool avatarRagdolled = false;
+      {
+        Vec3 follow;
+        if (avatar.RagdollFollow(follow)) {
+          player.pos = follow;
+          player.vel = {};
+          avatarHeading = avatar.Heading();
+          avatarRagdolled = true;
+        }
+      }
       // debris that ended the step overlapping the player pushes the player
-      // out (fly mode ignores collision entirely, matching the voxel rules)
-      if (!player.fly)
+      // out (fly mode ignores collision entirely, matching the voxel rules;
+      // a ragdolled player is being placed by the body, not the solver)
+      if (!player.fly && !avatarRagdolled)
         player.ApplyPush(phys.PlayerPushOut(playerBody, player.pos), kindAt);
       double tEnd = NowSeconds();
       tickMsSmooth += ((float)((tEnd - t0) * 1000.0) - tickMsSmooth) * 0.1f;
