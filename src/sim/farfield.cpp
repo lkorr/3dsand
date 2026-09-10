@@ -31,6 +31,14 @@ void FarField::Enqueue(uint32_t k, uint32_t slot) {
 void FarField::EnqueuePlane(uint32_t k, int axis, int wcoord) {
   int m = (int)kFarNChunk - 1;
   int sa = wcoord & m;
+  // The incoming plane is the box's high face when the origin stepped toward
+  // +axis (wcoord = o + N - 1) and its low face otherwise (wcoord = o).
+  const int oa = axis == 0 ? origins_[k].x : axis == 1 ? origins_[k].y
+                                                     : origins_[k].z;
+  const int side = wcoord == oa + (int)kFarNChunk - 1 ? 1 : 0;
+  recs_.push_back({k, axis, side, kFarNChunk * kFarNChunk, epoch_[k]});
+  faces_[k][axis][side]++;
+  uboDirty_ = true;
   for (int b = 0; b < (int)kFarNChunk; b++) {
     for (int a = 0; a < (int)kFarNChunk; a++) {
       int s[3];
@@ -49,13 +57,20 @@ void FarField::ResetLevel(uint32_t k, IVec3 desired) {
   uboDirty_ = true;
   for (uint32_t slot = 0; slot < kFarNumChunks; slot++) Enqueue(k, slot);
   bulkPending_[k] += kFarNumChunks;
+  // Every plane record queued for this level is now meaningless — the whole
+  // level is invalid until the reset lands — so it stops owning a face.
+  epoch_[k]++;
+  for (int a = 0; a < 3; a++) faces_[k][a][0] = faces_[k][a][1] = 0;
+  recs_.push_back({k, -1, 0, kFarNumChunks, epoch_[k]});
 }
 
 void FarField::FullRefill(IVec3 playerChunk) {
   queue_.clear();
+  recs_.clear();
   for (uint32_t k = 0; k < kFarLevels; k++) {
     pending_[k] = 0;
     bulkPending_[k] = 0;
+    for (int a = 0; a < 3; a++) faces_[k][a][0] = faces_[k][a][1] = 0;
   }
   // coarsest first: the horizon band appears before the near bands refine
   for (int k = (int)kFarLevels - 1; k >= 0; k--)
@@ -84,6 +99,18 @@ float FarField::SafeRadiusMeters() const {
     return std::max(inner, kFarHalfExtentMeters(k + 1) - face);
   }
   return kFarHalfExtentMeters(kFarLevels);   // everything filled: full horizon
+}
+
+uint32_t FarField::FaceWord(uint32_t k) const {
+  // Layout documented at the declaration (farfield.h) and at the reader
+  // (raymarch.wgsl farBox): nibble (axis * 2 + side) holds the planes queued on
+  // that face, saturated at 15; bit 24 says the whole level is pending.
+  if (bulkPending_[k] > 0) return 1u << 24;
+  uint32_t w = 0;
+  for (int a = 0; a < 3; a++)
+    for (int side = 0; side < 2; side++)
+      w |= std::min(faces_[k][a][side], 15u) << (4 * (a * 2 + side));
+  return w;
 }
 
 void FarField::Update(IVec3 playerChunk) {
@@ -118,7 +145,7 @@ uint32_t FarField::PrepareTick(const rhi::Queue& queue) {
       fp.origins[k][0] = origins_[k].x;
       fp.origins[k][1] = origins_[k].y;
       fp.origins[k][2] = origins_[k].z;
-      fp.origins[k][3] = 0;
+      fp.origins[k][3] = (int32_t)FaceWord(k);   // the render's valid box
     }
     queue.WriteBuffer(world_->farUBO, 0, &fp, sizeof(fp));
     uboDirty_ = false;
@@ -176,6 +203,18 @@ uint32_t FarField::PrepareTick(const rhi::Queue& queue) {
     // same frame, one submit behind at worst.
     pending_[k]--;
     if (bulkPending_[k] > 0) bulkPending_[k]--;  // FIFO: resets pop first
+    // The plane this entry belongs to is the front record (same FIFO). Its
+    // face is released when its last entry is dispatched — published next
+    // tick, after this tick's sieve is in the queue.
+    PlaneRec& r = recs_.front();
+    if (--r.remaining == 0) {
+      if (r.axis >= 0 && r.epoch == epoch_[r.level] &&
+          faces_[r.level][r.axis][r.side] > 0) {
+        faces_[r.level][r.axis][r.side]--;
+        uboDirty_ = true;
+      }
+      recs_.pop_front();
+    }
   }
   const uint32_t count = (uint32_t)list.size();
   if (count == 0) return 0;   // first entry alone blew the budget: cannot happen

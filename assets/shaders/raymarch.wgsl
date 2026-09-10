@@ -3213,6 +3213,41 @@ fn gasOuterFill(ro : vec3f, rdIn : vec3f, tEnd : f32, px : vec2f) -> f32 {
   return acc / (cellVox * cellVox * cellVox);
 }
 
+// ---- THE VALID BOX (2026-09-10): the box a far reader may march ------------
+// A level's box is toroidal: when its origin steps one level chunk toward the
+// player, the incoming face's SLOTS are the outgoing face's, and they keep the
+// outgoing face's bytes until the sieve refills them — ~16 ticks per plane
+// under the play fill cap (farfield.h kPlayFillCap), and sprint flight backlogs
+// planes deep. Marched as terrain from the full [origin, origin + FAR_N) box,
+// those bytes were the hillside BEHIND the player drawn ahead of them, and the
+// underground of the bottom face drawn in the sky when the box stepped up.
+//
+// F.origins[k].w is the pending-face word FarField::FaceWord packs: six 4-bit
+// counts of planes still queued on each face (-x,+x,-y,+y,-z,+z, low nibble
+// first) and bit 24 = the whole level is a reset in flight. The box every far
+// reader marches is the full box less those faces (empty during a reset), so a
+// ray in an excluded slab leaves this level at the shrunken face and the next
+// coarser level — filled — picks it up at the same t, by the seam contract
+// traceFar already keeps for a ray that runs out of TUNE_FAR_STEPS. Nothing
+// here reads a slot before the sieve has written it. Same-tick origin step and
+// face shrink arrive in one UBO write; a landed face is published a tick late.
+struct FarBox { lo : vec3<i32>, hi : vec3<i32> };   // level-CELL coords, [lo, hi)
+fn farBox(level : u32) -> FarBox {
+  let o = F.origins[level - 1u];
+  let w = u32(o.w);
+  var b : FarBox;
+  b.lo = o.xyz * i32(CHUNK);
+  if ((w & (1u << 24u)) != 0u) { b.hi = b.lo; return b; }   // reset in flight
+  let lo = vec3<i32>(i32(w & 15u), i32((w >> 8u) & 15u), i32((w >> 16u) & 15u));
+  let hi = vec3<i32>(i32((w >> 4u) & 15u), i32((w >> 12u) & 15u), i32((w >> 20u) & 15u));
+  b.lo = (o.xyz + lo) * i32(CHUNK);
+  b.hi = (o.xyz + vec3<i32>(i32(FAR_NCHUNK)) - hi) * i32(CHUNK);
+  return b;
+}
+fn farInValid(c : vec3<i32>, b : FarBox) -> bool {
+  return all(c >= b.lo) && all(c < b.hi);
+}
+
 fn traceFar(ro : vec3f, rdIn : vec3f, tStart : f32, px : vec2f) -> FarHit {
   var out : FarHit;
   out.hit = false;
@@ -3258,12 +3293,11 @@ fn traceFar(ro : vec3f, rdIn : vec3f, tStart : f32, px : vec2f) -> FarHit {
 
   for (var level = 1u; level <= FAR_LEVELS; level++) {
     let s = f32(1u << farCellShift(level));   // fine voxels per level cell
-    let org = F.origins[level - 1u].xyz;
+    let box = farBox(level);                  // the VALID box, see farBox
     // everything below is in LEVEL-CELL coords: pos/s, t/s (same rd)
     let roL = ro / s;
-    let lo = vec3f(org * i32(CHUNK));
-    let tt0 = (lo - roL) * inv;
-    let tt1 = (lo + f32(FAR_N) - roL) * inv;
+    let tt0 = (vec3f(box.lo) - roL) * inv;
+    let tt1 = (vec3f(box.hi) - roL) * inv;
     let tmin = min(tt0, tt1);
     let tmax = max(tt0, tt1);
     let tEnter = max(max(tmin.x, tmin.y), max(tmin.z, tPrev / s));
@@ -3321,7 +3355,6 @@ fn traceFar(ro : vec3f, rdIn : vec3f, tStart : f32, px : vec2f) -> FarHit {
     // chunk's inner loop starts.
     let stepv = vec3<i32>(sign(rd));
     let tDelta = abs(inv);
-    let loI = org * i32(CHUNK);
 
     var axis = 0;
     if (tmin.y > tmin.x && tmin.y > tmin.z) { axis = 1; }
@@ -3329,7 +3362,7 @@ fn traceFar(ro : vec3f, rdIn : vec3f, tStart : f32, px : vec2f) -> FarHit {
 
     var tCur = tEnter + 1e-4;
     var cc = worldChunkOf(clamp(vec3<i32>(floor(roL + rd * tCur)),
-                                loI, loI + vec3<i32>(i32(FAR_N) - 1)));
+                                box.lo, box.hi - vec3<i32>(1)));
     var cNext : vec3f;
     for (var a = 0; a < 3; a++) {
       let b = f32((cc[a] + select(0, 1, rd[a] > 0.0)) * i32(CHUNK));
@@ -3353,7 +3386,7 @@ fn traceFar(ro : vec3f, rdIn : vec3f, tStart : f32, px : vec2f) -> FarHit {
     while (budget > 0) {
       rsAdd(RS_FAR, 1u);
       budget -= 1;
-      if (!farInBox(cc * i32(CHUNK), org)) { break; }
+      if (!farInValid(cc * i32(CHUNK), box)) { break; }
       if (tCur >= tExit) { break; }
       let tOut = min(cNext.x, min(cNext.y, cNext.z));
       let occ = farOcc[farOccIndex(level, cc * i32(CHUNK))];
@@ -3428,7 +3461,7 @@ fn traceFar(ro : vec3f, rdIn : vec3f, tStart : f32, px : vec2f) -> FarHit {
               var probe = vc;
               for (var d = 0; d < 3; d++) {
                 probe.y -= 1;
-                if (!farInBox(probe, org)) { break; }
+                if (!farInValid(probe, box)) { break; }
                 let below = farMatAt(level, probe);
                 if (below != 0u) { mat = below; break; }
               }
@@ -3588,10 +3621,9 @@ fn farShadowDist(level : u32, roFine : vec3f) -> f32 {
   let inv = 1.0 / rd;
   let s = f32(1u << farCellShift(level));
   let roL = roFine / s;
-  let org = F.origins[level - 1u].xyz;
-  let lo = vec3f(org * i32(CHUNK));
-  let tt0 = (lo - roL) * inv;
-  let tt1 = (lo + f32(FAR_N) - roL) * inv;
+  let box = farBox(level);   // the valid box, as traceFar
+  let tt0 = (vec3f(box.lo) - roL) * inv;
+  let tt1 = (vec3f(box.hi) - roL) * inv;
   let tExit = min(max(tt0.x, tt1.x), min(max(tt0.y, tt1.y), max(tt0.z, tt1.z)));
 
   // ---- THE SAME NESTED CURSOR traceFar RUNS (2026-09-07) -------------------
@@ -3630,7 +3662,7 @@ fn farShadowDist(level : u32, roFine : vec3f) -> f32 {
   while (budget > 0) {
     rsAdd(RS_FAR_SHADOW, 1u);
     budget -= 1;
-    if (!farInBox(cc * i32(CHUNK), org)) { return -1.0; }
+    if (!farInValid(cc * i32(CHUNK), box)) { return -1.0; }
     if (tCur >= tExit) { return -1.0; }
     let tOut = min(cNext.x, min(cNext.y, cNext.z));
     let occ = farOcc[farOccIndex(level, cc * i32(CHUNK))];
@@ -3710,7 +3742,7 @@ fn farShadowed(level : u32, roFine : vec3f) -> bool {
 // stamp AO onto a meadow here any more than it can inside (isRayBlocker).
 // Cells outside the level box do not occlude, as unloaded space does not near.
 fn farAoSolidAt(level : u32, c : vec3<i32>) -> f32 {
-  if (!farInBox(c, F.origins[level - 1u].xyz)) { return 0.0; }
+  if (!farInValid(c, farBox(level))) { return 0.0; }
   return select(0.0, 1.0, farPalAt(level, c) != 0u);
 }
 
@@ -8645,7 +8677,7 @@ fn fs(in : VSOut) -> FSOut {
       // ground under a flattened canopy at levels >= 5, where the crown is
       // painted onto the surface cell and nothing sits above it to occlude.
       let up = far.cell + vec3<i32>(0, 1, 0);
-      if (farInBox(up, F.origins[far.level - 1u].xyz) &&
+      if (farInValid(up, farBox(far.level)) &&
           farPalAt(far.level, up) != 0u) { ao *= TUNE_AO_FAR; }
       // Same lighting model as the near field (hemisphere ambient x AO, plus
       // direct sun) so the two representations agree across the seam.

@@ -5002,7 +5002,30 @@ where you hear from either (§12b, "The ears are on the character").
   Levels are filled on the GPU by sampling `genCell()` at stride
   (worldgen.wgsl `far` — the "sieve"), recentered with hysteresis like the
   streaming window, and refilled a plane at a time (≤ kFarListCap
-  level-chunks/tick, managed by `sim/farfield`). **Edits reach the far field
+  level-chunks/tick, managed by `sim/farfield`; planes drain at
+  `kPlayFillCap` = 64 in play, resets at the list cap). **The renderer marches
+  a VALID box, not the level box (2026-09-10).** A level is toroidal, so when
+  its origin steps one level chunk the incoming face's SLOTS are the outgoing
+  face's and hold the outgoing face's bytes until the sieve refills them —
+  ~16 ticks per plane under the play cap, deeper under sprint flight. Marched
+  from the full box the tick the origin moved, those bytes were the hillside
+  BEHIND the player drawn ahead of them, and the underground of the bottom
+  face drawn in the sky when the box stepped up. `FarField` now keeps one
+  record per queued plane (FIFO beside the entry queue) and a count of planes
+  outstanding on each of a level's six faces, released when a plane's LAST
+  entry is dispatched; `FarField::FaceWord` packs the six counts (4 bits each)
+  plus a whole-level-pending bit into `FarParams.origins[k].w`, the word no
+  other reader used, so neither `common.wgsl` nor `world.h` changed for it.
+  raymarch.wgsl `farBox` unpacks it and every far reader (`traceFar`,
+  `farShadowDist`, the far AO taps) marches the full box less those faces —
+  empty during a reset — so a ray in an excluded slab leaves the level at the
+  shrunken face and the next coarser level, which is filled, picks it up at
+  the same t by the seam contract `traceFar` already keeps for a ray out of
+  `farSteps`. Always conservative: a landed face is published a tick late, a
+  reversed face is excluded on both sides until both records drain, and a
+  reset voids the level's older records via an epoch. The `far-fog` gate
+  steps the player one level-1 hysteresis in +x and asserts the +x nibble
+  holds through the 16-tick drain and clears after. **Edits reach the far field
   (phase 2):** each tick, `worldgen.wgsl fardown` runs one workgroup per entry
   of the compacted dirty list — the same `DispatchWorkgroupsIndirect` args the
   occupancy update uses, so a settled world dispatches nothing — and re-derives

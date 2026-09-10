@@ -207,6 +207,39 @@ bool fogOk = false;
           std::abs(prevR - wantFull) < 1e-3f;
   std::printf("far fog radius: %s (cold %.1f m -> filled %.1f m, monotone=%d)\n",
               fogOk ? "PASS" : "FAIL", coldR, prevR, monotone ? 1 : 0);
+
+  // THE VALID BOX (farfield.h FaceWord). Step the player kHyst level-1 chunks
+  // in +x so level 1's origin steps once and ONE plane is queued on its +x
+  // face. The face word must name exactly that face from the step until the
+  // plane's LAST entry is dispatched, and read zero after — released early it
+  // is the stale slab the renderer drew as the terrain behind the player;
+  // never released it is a permanent hole in level 1's +x edge. The drain
+  // runs at the play cap (16 ticks for a 1,024-entry plane), which is what
+  // makes the window in which the word matters real.
+  {
+    IVec3 pc{108 >> 4, 122 >> 4, 108 >> 4};
+    pc.x += 2 << (1 + kFarShiftBase);   // kHyst level-1 chunks, in fine chunks
+    far.Update(pc);
+    const uint32_t wantFace = 1u << 4;  // nibble 1 = +x
+    bool held = far.FaceWord(0) == wantFace;
+    uint32_t ticks = 0;
+    while ((n = far.PrepareTick(ctx.queue)) > 0) {
+      TickParams tp{0, kDefaultSeed, 0, 0};
+      tp.farCount = n;
+      ctx.queue.WriteBuffer(world.tickUBO, 0, &tp, sizeof(tp));
+      rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
+      sim.EncodeFarFill(enc, n);
+      ctx.queue.Submit(enc.Finish());
+      ticks++;
+      const uint32_t w = far.FaceWord(0);
+      if (far.PendingFills() > 0 ? w != wantFace : w != 0) held = false;
+    }
+    ctx.WaitIdle();
+    const bool faceOk = held && ticks > 1 && far.FaceWord(0) == 0;
+    std::printf("far valid box: %s (+x plane word 0x%x held over %u ticks, final 0x%x)\n",
+                faceOk ? "PASS" : "FAIL", wantFace, ticks, far.FaceWord(0));
+    fogOk = fogOk && faceOk;
+  }
 }
 
   // Verdict: the flag the moved body already computed, plus the blocker bit.
