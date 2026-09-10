@@ -335,8 +335,16 @@
       "sort": "delivery",
       "word": 6,
       "mech": "flight",
+      "noun": "bolt",
       "speed": 4.8,
-      "look": { "shape": "ball", "size": 0.7, "tail": 4, "tailStep": 0.8, "glow": 1.2, "color": "#FFB040" },
+      "look": {
+        "shape": "ball",
+        "size": 0.7,
+        "tail": 4,
+        "tailStep": 0.8,
+        "glow": 1.2,
+        "color": "#FFB040"
+      },
       "lifetimeTicks": 150,
       "impactRadius": 3,
       "gravity": 1000,
@@ -350,8 +358,16 @@
       "sort": "delivery",
       "word": 8,
       "mech": "flight",
+      "noun": "dart",
       "speed": 9.6,
-      "look": { "shape": "bolt", "size": 0.45, "tail": 8, "tailStep": 0.9, "glow": 1.6, "color": "#80D0FF" },
+      "look": {
+        "shape": "bolt",
+        "size": 0.45,
+        "tail": 8,
+        "tailStep": 0.9,
+        "glow": 1.6,
+        "color": "#80D0FF"
+      },
       "lifetimeTicks": 150,
       "impactRadius": 1,
       "gravity": 250,
@@ -365,8 +381,16 @@
       "sort": "delivery",
       "word": 4,
       "mech": "flight",
+      "noun": "ball",
       "speed": 2.4,
-      "look": { "shape": "ball", "size": 1.0, "tail": 2, "tailStep": 1.0, "glow": 0.9, "color": "#C0A060" },
+      "look": {
+        "shape": "ball",
+        "size": 1.0,
+        "tail": 2,
+        "tailStep": 1.0,
+        "glow": 0.9,
+        "color": "#C0A060"
+      },
       "lifetimeTicks": 200,
       "impactRadius": 4,
       "gravity": 1000,
@@ -380,8 +404,15 @@
       "sort": "delivery",
       "word": 7,
       "mech": "flight",
+      "noun": "orb",
       "speed": 1,
-      "look": { "shape": "orb", "size": 1.2, "tail": 6, "glow": 1.4, "color": "#C080FF" },
+      "look": {
+        "shape": "orb",
+        "size": 1.2,
+        "tail": 6,
+        "glow": 1.4,
+        "color": "#C080FF"
+      },
       "lifetimeTicks": 300,
       "impactRadius": 3,
       "gravity": 0,
@@ -397,8 +428,14 @@
       "word": 3,
       "material": "stone",
       "mech": "flight",
+      "noun": "bomb",
       "speed": 1.6,
-      "look": { "shape": "spark", "size": 0.3, "glow": 2.0, "color": "#FFE080" },
+      "look": {
+        "shape": "spark",
+        "size": 0.3,
+        "glow": 2.0,
+        "color": "#FFE080"
+      },
       "lifetimeTicks": 300,
       "impactRadius": 4,
       "gravity": 1000,
@@ -414,6 +451,7 @@
       "sort": "delivery",
       "word": 5,
       "mech": "continuous",
+      "noun": "beam",
       "reach": 48,
       "ticks": 90,
       "impactRadius": 1,
@@ -427,6 +465,7 @@
       "sort": "delivery",
       "word": 2,
       "mech": "instant",
+      "noun": "touch",
       "reach": 0,
       "impactRadius": 2,
       "carry": 1000,
@@ -444,17 +483,6 @@
       "example": "explosive shotgun shotgun projectile",
       "axis": "count x3 (3, 9, 27 ...), fanned",
       "desc": "Three of it, fanned. Said again: nine. Everything behind it is paid that many times."
-    },
-    {
-      "id": "split",
-      "sort": "mod",
-      "word": 6,
-      "field": "children",
-      "op": "mul",
-      "amount": 2,
-      "example": "split explosive projectile",
-      "axis": "children x2 on resolve, gen+1",
-      "desc": "On resolve, two children with the same payload. Generation-capped."
     },
     {
       "id": "float",
@@ -565,6 +593,14 @@
       "example": "explosive fuse projectile",
       "axis": "delay +30 ticks",
       "desc": "Waits after impact before resolving; on a bomb, a longer fuse."
+    },
+    {
+      "id": "also",
+      "sort": "separator",
+      "word": 0,
+      "example": "explosive projectile also fire",
+      "axis": "sentences",
+      "desc": "Ends this sentence and starts the next. Everything spoken before it is one finished cast, delivered by hand if no delivery closed it; everything after is a second. Costs add and both go off together. Without it a whole utterance is ONE cast, however many deliveries nest inside it."
     }
   ],
   "conjoined": {
