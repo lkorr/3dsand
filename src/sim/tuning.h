@@ -580,6 +580,14 @@ struct Tuning {
     float terrainFriction = 0.85f, playerProxyFriction = 0.3f;
     float explosionImpulseScale = 0.15f;
     float explosionImpulseRadiusScale = 3.0f;
+    // The fastest the per-body blast impulse may make any ONE body go, m/s.
+    // impulse / mass is unbounded from below in mass: a 0.05 kg gobbet carved
+    // off a creature by the same explosion took 1000 m/s (Jolt's own ceiling
+    // is 500) and, born inside the limb it came from, rammed the rig it had
+    // just left — "bodies zoom across the map" when a blast was big enough to
+    // carve. Ordinary debris (a 2.5 kg stone voxel takes 20 m/s from the
+    // X-detonate charge) never reaches this.
+    float explosionMaxSpeed = 30.0f;
     // How far an explosion actually BLOWS VOXELS OFF bodies, as a multiple of
     // the destruction radius. Kept separate from the impulse reach on purpose:
     // the blast should push objects from further away than it dismembers them,

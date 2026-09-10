@@ -1160,6 +1160,11 @@ class Mob {
   void AppendDebugBoxes(std::vector<DebugBox>& out, size_t limit,
                         uint32_t color) const;
   uint32_t LimbBodyCount() const;
+  // Every body this LIVING creature still owns (attached limbs, worn shells,
+  // the held item; not a severed piece in its hold). The explosion loop hands
+  // these to Physics::ApplyRadialImpulse as its skip list: a rig is launched
+  // as one thing by BlastRadial, never limb by limb.
+  void AppendLiveLimbBodies(std::vector<uint64_t>& out) const;
 
   // `outUnknown`, when given, is set true when the answer is "I cannot see"
   // (cell outside the window, chunk not yet cached) rather than "no ground
@@ -1910,6 +1915,8 @@ class MobSystem {
   // how many were knocked down.
   int BlastMobsRadial(Vec3 centerWorldVoxel, float radiusVoxels,
                       float impulseKgMs);
+  // Mob::AppendLiveLimbBodies over every live NPC.
+  void AppendLiveLimbBodies(std::vector<uint64_t>& out) const;
   // Dev panel / tests: put one creature (or every live one) on the floor.
   bool RagdollMob(uint64_t mobId, float minSeconds);
   int RagdollAll(float minSeconds);

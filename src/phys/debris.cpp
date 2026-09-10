@@ -2218,6 +2218,9 @@ void DebrisSystem::ShatterBody(Body& b, World& world, std::vector<Body>& fragmen
       nb.handle =
           phys_->CreateDebrisBodyXf(parts[c], nb.xf, densityOf_, false, pitch);
       if (nb.handle != 0) {
+        // Born where the parent is: a piece splitting off a body that is
+        // still inside the player is inside the player too (CarryLayer).
+        phys_->CarryLayer(b.handle, nb.handle);
         phys_->SetBodyVelocities(nb.handle, lin, ang);
         nb.voxels = std::move(parts[c]);
         float r = 0;
@@ -2964,6 +2967,7 @@ bool DebrisSystem::SplitBody(uint64_t handle, Vec3 planePointVoxel,
       if (h == 1 && newBodies[0].handle) phys_->RemoveBody(newBodies[0].handle);
       return false;
     }
+    phys_->CarryLayer(b.handle, newBodies[h].handle);  // same place as the parent
     newBodies[h].voxels = std::move(halves[h]);
     newBodies[h].xf = xf;
     float r = 0;

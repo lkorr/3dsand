@@ -7471,10 +7471,20 @@ int main(int argc, char** argv) {
           // point (game/mob.h).
           mobs.CarveMobsRadial(ec, edr, world, spawns);
           avatar.CarveRadial(ec, edr, world, spawns);
+          // The per-body impulse is for DEBRIS. A living creature's limbs are
+          // skipped whether kinematic (standing) or dynamic (already limp
+          // from an earlier blast): impulse / limb mass on a 0.3 kg hand is
+          // 170 m/s and the joints drag the rest of the rig after it —
+          // "bodies zoom across the map". The rig takes ONE launch below.
+          std::vector<uint64_t> rigBodies;
+          mobs.AppendLiveLimbBodies(rigBodies);
+          if (avatar.Spawned()) avatar.AppendLiveLimbBodies(rigBodies);
+          std::sort(rigBodies.begin(), rigBodies.end());
           phys.ApplyRadialImpulse(
               Vec3{(float)e.x, (float)e.y, (float)e.z},
               (float)e.radius * CurrentTuning().physics.explosionImpulseRadiusScale,
-              (float)e.power * CurrentTuning().physics.explosionImpulseScale);
+              (float)e.power * CurrentTuning().physics.explosionImpulseScale,
+              &rigBodies);
           // ...and the LIVING are knocked flying. A standing creature's limbs
           // are kinematic, so the impulse above never touched them; this is
           // the blast's other half (Mob::BlastRadial): go limp, take a launch

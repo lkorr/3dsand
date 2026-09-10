@@ -4257,6 +4257,48 @@ still its own and no body adopted by `DebrisSystem`; and a dummy spawned 2.2 m
 up descends under gravity, goes limp past a fixture-short `fallSeconds`, and
 stands up on the ground.
 
+**"Bodies zoom across the map" and "burning clothes launch me" (2026-09-10).**
+Both reports arrived together after the ragdoll landed, and neither was the
+launch clamp. The gate above called `BlastMobsRadial` on its own and so never
+saw the rest of the explosion block; it now runs the block verbatim (`ragdoll
+repeat blast`) and puts the player avatar on fire with the capsule proxy in
+the world (`ragdoll player on fire`). What it found, in order of damage:
+
+- *The carve's gobbets rammed the rig.* A blast big enough to carve
+  (`explosionBodyDamageScale`) makes `EmitCarvedFragment` bodies of 0.05 kg,
+  born inside the limb they came off. The per-body debris impulse then gave
+  each one `impulse / mass` = 1000 m/s (Jolt caps at 500), and the same tick's
+  launch had just flipped the rig dynamic, so they hit it. Measured: a carved
+  upper leg at 41.8 m/s on the blast tick, 449 voxels of travel. Three
+  elimination arms inside the gate (no carve / no impulse / no crater) named
+  it in one run. `physics.explosionMaxSpeed` (30 m/s) bounds the SPEED the
+  impulse may give any one body — a 2.5 kg stone voxel takes 20 m/s from the
+  X-detonate charge and is untouched; only the confetti is.
+- *A limp rig took the per-body impulse limb by limb.* Live limbs are in
+  `dynamicBodies_` whether kinematic or not; standing they were skipped by
+  Jolt's `IsDynamic` check, limp they were not, and the launch stacked on top.
+  `Physics::ApplyRadialImpulse` takes a skip list (`Mob::AppendLiveLimbBodies`,
+  every body a living creature still owns) and `BlastRadial` holds the stacked
+  velocity under `max(maxLaunchSpeed, what it already had)`.
+- *A carve while limp rebuilt the limb wrong twice.* `RebuildLimbBody`
+  re-read Jolt's transform, discarding the rebase shift `ReskinLimbMicro` had
+  just applied to `xf.pos`/`anchorLimb` (harmless on a kinematic limb, which
+  is re-posed next tick; a dynamic one had its joint anchor one shift off and
+  Jolt closed the gap by force), and the new body started at rest with no
+  layer. It now keeps the carve's frame when limp, carries the old velocity,
+  and `Physics::CarryLayer` carries the object layer plus the
+  `ReleaseToWorldWhenClear` entry — the same helper `ReplaceBody` and the
+  debris split now use, because a burning gobbet that shrank was rebuilt on
+  the plain MOVING layer inside the player every time.
+- *`PlayerPushOut` summed one hit per voxel box and took orders from
+  confetti.* A gobbet born beside or above the capsule is released to MOVING
+  at once (it does not overlap the proxy's AABB), the avatar's own kinematic
+  arm sweeps it INTO the capsule, and `CollideShape` reported it as eight hits
+  of the same depth, summed: 62 voxels in one tick, 432 before the player
+  burned to death. The push is now the deepest hit per body, and a body under
+  5% of `playerMassKg` cannot push the player at all (the 80 kg proxy pushes
+  it instead). Standing on a log or being shoved by a corpse is unchanged.
+
 ### Mob steering: intent vs actuation (2026-08-21; `game/mob.cpp`)
 
 Locomotion was one block that read the ground, snapped `heading += 90°` when

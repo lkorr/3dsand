@@ -574,13 +574,46 @@ Vec3 Physics::PlayerPushOut(uint64_t handle, Vec3 centerVoxel) const {
       shape, JPH::Vec3::sReplicate(1.0f), JPH::RMat44::sTranslation(center),
       settings, JPH::RVec3::sZero(), collector, {}, movingOnly, ignoreSelf);
 
-  JPH::Vec3 push = JPH::Vec3::sZero();
+  // ONE DEPTH PER BODY, and only from a body heavy enough to move you.
+  //
+  // CollideShape reports a hit per SUB-SHAPE: a compound of eight voxel boxes
+  // buried in the capsule comes back as eight hits of the same depth, and
+  // summing them asked the player to move eight body-depths in one tick — a
+  // 0.06 kg burn gobbet carried into the capsule by the avatar's own swinging
+  // arm shoved the player 12 voxels a tick (36 m/s) for as long as it sat
+  // there. Measured in the `ragdoll` gate's avatar-on-fire block: 62 voxels in
+  // one tick, 432 voxels before the player burned to death. The deepest hit
+  // per body is the whole of what that body asks for.
+  //
+  // And a body you could kick aside cannot move you: below kPushMinMassFrac of
+  // the player's mass the depenetration is the body's problem (the proxy is a
+  // dynamic 80 kg capsule and the solver pushes the light body out), not the
+  // player's. Above it — a log, a boulder, a corpse's torso — the full push
+  // applies, so standing on debris and being shoved by heavy things is as it
+  // was. Kinematic limbs (a living creature's) report their rig mass and
+  // keep pushing; the avatar's own are on Layers::AVATAR and never seen here.
+  constexpr float kPushMinMassFrac = 0.05f;
+  const float minMass = kPushMinMassFrac * std::max(CurrentTuning().physics.playerMassKg, 1.0f);
+  struct Deepest { JPH::BodyID id; JPH::Vec3 axis; float depth; };
+  std::vector<Deepest> perBody;
   for (const JPH::CollideShapeResult& hit : collector.mHits) {
     float len = hit.mPenetrationAxis.Length();
     if (len < 1e-6f || hit.mPenetrationDepth <= 0) continue;
+    bool merged = false;
+    for (Deepest& d : perBody) {
+      if (d.id != hit.mBodyID2) continue;
+      if (hit.mPenetrationDepth > d.depth) { d.depth = hit.mPenetrationDepth; d.axis = hit.mPenetrationAxis / len; }
+      merged = true;
+      break;
+    }
+    if (!merged) perBody.push_back({hit.mBodyID2, hit.mPenetrationAxis / len, hit.mPenetrationDepth});
+  }
+  JPH::Vec3 push = JPH::Vec3::sZero();
+  for (const Deepest& d : perBody) {
+    if (BodyMass(FromBodyID(d.id)) < minMass) continue;
     // mPenetrationAxis points the way shape 2 (the body) moves to separate;
     // the player moves the opposite way
-    push -= hit.mPenetrationAxis * (hit.mPenetrationDepth / len);
+    push -= d.axis * d.depth;
   }
   return Vec3{push.GetX(), push.GetY(), push.GetZ()} * (1.0f / kVoxelMeters);
 }
@@ -785,8 +818,8 @@ void Physics::ReplaceBody(uint64_t oldHandle, uint64_t newHandle) {
       JPH::BodyLockWrite lock(bli, newId);
       if (lock.Succeeded()) lock.GetBody().SetCollisionGroup(group);
     }
-    bi.SetObjectLayer(newId, bi.GetObjectLayer(oldId));
   }
+  CarryLayer(oldHandle, newHandle);
   if (joints_) {
     auto bit = joints_->byBody.find(oldHandle);
     if (bit != joints_->byBody.end()) {
@@ -797,6 +830,27 @@ void Physics::ReplaceBody(uint64_t oldHandle, uint64_t newHandle) {
   // Whatever could not be moved (a joint whose other body is gone) dies with
   // the old body, as it always did.
   RemoveBody(oldHandle);
+}
+
+void Physics::CarryLayer(uint64_t from, uint64_t to) {
+  if (!system_ || from == 0 || to == 0 || from == to) return;
+  JPH::BodyInterface& bi = system_->GetBodyInterface();
+  const JPH::BodyID fromId = ToBodyID(from), toId = ToBodyID(to);
+  if (!bi.IsAdded(fromId) || !bi.IsAdded(toId)) return;
+  bi.SetObjectLayer(toId, bi.GetObjectLayer(fromId));
+  bool fromPending = false, toPending = false;
+  for (uint64_t h : pendingRelease_) {
+    fromPending |= h == from;
+    toPending |= h == to;
+  }
+  if (fromPending && !toPending) {
+    if (pendingRelease_.size() >= kMaxPendingRelease) {
+      const JPH::BodyID old = ToBodyID(pendingRelease_.front());
+      if (bi.IsAdded(old)) bi.SetObjectLayer(old, Layers::MOVING);
+      pendingRelease_.erase(pendingRelease_.begin());
+    }
+    pendingRelease_.push_back(to);
+  }
 }
 
 uint32_t Physics::JointCount(uint64_t handle) const {
@@ -1195,12 +1249,14 @@ void Physics::ActivateBody(uint64_t handle) {
 }
 
 void Physics::ApplyRadialImpulse(Vec3 centerVoxel, float radiusVoxels,
-                                 float impulse) {
+                                 float impulse,
+                                 const std::vector<uint64_t>* skipSorted) {
   if (!system_) return;
   JPH::BodyInterface& bi = system_->GetBodyInterface();
   JPH::RVec3 c(VoxToM(centerVoxel.x), VoxToM(centerVoxel.y), VoxToM(centerVoxel.z));
   float rM = VoxToM(radiusVoxels);
   for (uint64_t h : dynamicBodies_) {
+    if (skipSorted && std::binary_search(skipSorted->begin(), skipSorted->end(), h)) continue;
     JPH::BodyID id = ToBodyID(h);
     if (!bi.IsAdded(id)) continue;
     JPH::RVec3 p = bi.GetCenterOfMassPosition(id);
@@ -1209,8 +1265,14 @@ void Physics::ApplyRadialImpulse(Vec3 centerVoxel, float radiusVoxels,
     if (dist > rM) continue;
     JPH::Vec3 dir = dist > 1e-4f ? d / dist : JPH::Vec3(0, 1, 0);
     float falloff = 1.0f - dist / rM;
+    // Bound the SPEED this impulse buys, not the impulse: impulse / mass on
+    // a 0.05 kg gobbet is 1000 m/s (physics.explosionMaxSpeed).
+    float mag = impulse * falloff;
+    const float mass = BodyMass(h);
+    const float maxSpeed = std::max(CurrentTuning().physics.explosionMaxSpeed, 0.0f);
+    if (mass > 0.0f && mag > mass * maxSpeed) mag = mass * maxSpeed;
     bi.ActivateBody(id);
-    bi.AddImpulse(id, dir * (impulse * falloff));
+    bi.AddImpulse(id, dir * mag);
   }
 }
 

@@ -162,6 +162,7 @@
     "playerProxyFriction": 0.3,
     "explosionImpulseScale": 0.15,
     "explosionImpulseRadiusScale": 3,
+    "explosionMaxSpeed": 30,
     "explosionBodyDamageScale": 1,
     "playerMassKg": 80,
     "sphereFriction": 0.5,

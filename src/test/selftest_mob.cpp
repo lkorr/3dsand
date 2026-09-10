@@ -4727,6 +4727,17 @@ Status GateAiApproach(Ctx& c, std::string& detail) {
 //      old code hung it in the air), goes limp once the fall has lasted
 //      ragdoll.fallSeconds — shortened for the fixture, the harness mirror is
 //      only 2.4 m deep — and gets back up on the ground.
+//   D. through main.cpp's WHOLE explosion block (crater, debris damage, the
+//      carve, the per-body debris impulse, then the rig launch) a standing
+//      wizard and then the SAME wizard already limp never have a limb faster
+//      than ragdollRepeatBlastMaxSpeed. The per-body impulse used to reach a
+//      limp rig's limbs one at a time — impulse / 0.3 kg on a hand — and the
+//      launch stacked on top of it: "bodies zoom across the map".
+//   E. the PLAYER on fire, wearing cloth, with the capsule proxy in the world:
+//      what burns off the body (gobbets, shed cloth) may not shove the player
+//      through PlayerPushOut by more than ragdollBurnMaxPushVox in a tick, nor
+//      move them more than ragdollBurnMaxTravel over the burn. Measured before
+//      the fix: 62 voxels in one tick, 432 voxels before death.
 // Thresholds are in tests/baseline.json (BaselineNumber), so retuning what
 // counts as "across the room" is a JSON edit, not a rebuild.
 Status GateRagdoll(Ctx& c, std::string& detail) {
@@ -4735,15 +4746,18 @@ Status GateRagdoll(Ctx& c, std::string& detail) {
   Simulation& sim = c.sim;
   DebrisSystem& debris = c.debris;
   MobSystem& mobs = c.mobs;
+  Physics& phys = c.phys;
   debris.Reset();
   mobs.Reset();
   SubmitWorldgen(ctx, world, sim, kDefaultSeed);
   ctx.WaitIdle();
-  int dummyDef = -1;
-  for (size_t i = 0; i < mobs.Defs().size(); i++)
+  int dummyDef = -1, wizDef = -1;
+  for (size_t i = 0; i < mobs.Defs().size(); i++) {
     if (mobs.Defs()[i].name == "dummy") dummyDef = (int)i;
-  if (dummyDef < 0) {
-    detail = "no dummy mob def";
+    if (mobs.Defs()[i].name == kAvatarDefName) wizDef = (int)i;
+  }
+  if (dummyDef < 0 || wizDef < 0) {
+    detail = "no dummy / avatar mob def";
     return Status::Fail;
   }
   const int nLimbs = (int)mobs.Defs()[dummyDef].limbs.size();
@@ -4865,6 +4879,182 @@ Status GateRagdoll(Ctx& c, std::string& detail) {
               limpAt, fUpAt, f2.y, h + 1, (int)mobs.IsAlive(fid));
   ok = ok && fallOk;
   SetCurrentTuning(saved);
+
+  // ---- D. the second blast ---------------------------------------------------
+  // main.cpp's explosion block, verbatim in shape: destruction event, debris
+  // damage, the mob carve, the per-body debris impulse WITH the rig skip
+  // list, then the rig launch. A gate that calls BlastMobsRadial alone (A
+  // above) never saw the per-body impulse reach a limp rig.
+  {
+    mobs.Reset();
+    debris.Reset();
+    SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+    ctx.WaitIdle();
+    uint32_t tick = ticker.tick;
+    const IVec3 pchunk{spot.x >> 4, spot.y >> 4, spot.z >> 4};
+    auto explodeTick = [&](const ExplosionOp* e) {
+      std::vector<BrushOp> ops;
+      std::vector<CellOp> cellOps;
+      std::vector<ParticleSpawn> spawns;
+      std::vector<ExplosionOp> exps;
+      mobs.PreTick(tick + 1, world, ops, cellOps, spawns);
+      debris.QueueSupportEvents(world.Snap());
+      debris.PreTick(tick + 1, world, cellOps, spawns);
+      if (e) {
+        exps.push_back(*e);
+        debris.AddDestructionEvent(tick + 1,
+                                   {e->x - e->radius, e->y - e->radius, e->z - e->radius},
+                                   {e->x + e->radius, e->y + e->radius, e->z + e->radius});
+        const Vec3 ec{(float)e->x + 0.5f, (float)e->y + 0.5f, (float)e->z + 0.5f};
+        const float edr = (float)e->radius * tune.physics.explosionBodyDamageScale;
+        debris.DamageBodiesRadial(ec, edr, world, spawns);
+        mobs.CarveMobsRadial(ec, edr, world, spawns);
+        std::vector<uint64_t> rig;
+        mobs.AppendLiveLimbBodies(rig);
+        std::sort(rig.begin(), rig.end());
+        phys.ApplyRadialImpulse(Vec3{(float)e->x, (float)e->y, (float)e->z},
+                                (float)e->radius * tune.physics.explosionImpulseRadiusScale,
+                                (float)e->power * tune.physics.explosionImpulseScale, &rig);
+        mobs.BlastMobsRadial(ec, (float)e->radius * tune.ragdoll.blastRadiusScale,
+                             (float)e->power * tune.ragdoll.blastImpulseScale);
+      }
+      ++tick;
+      SubmitTick(ctx, world, sim, tick, kDefaultSeed, ops, exps, cellOps, false,
+                 pchunk, true, true, spawns);
+      ctx.WaitIdle();
+      ctx.ProcessEvents();
+      phys.Step(kTickDt);
+      debris.PostStep();
+      mobs.PostStep();
+    };
+    const int nWiz = (int)mobs.Defs()[wizDef].limbs.size();
+    // The fastest limb of the rig this tick, m/s. Every limb, not the pelvis:
+    // the per-body impulse hit the LIGHT limbs hardest.
+    auto fastestLimb = [&](uint64_t id) {
+      float best = 0.0f;
+      for (int l = 0; l < nWiz; l++) {
+        const uint64_t hb = mobs.LimbBody(id, l);
+        Vec3 lin{}, ang{};
+        if (hb && phys.GetBodyVelocities(hb, lin, ang))
+          best = std::max(best, lin.len() * kVoxelMeters);
+      }
+      return best;
+    };
+    auto flight = [&](uint64_t id, int ticks, const ExplosionOp& e) {
+      float peak = 0.0f;
+      for (int i = 0; i < ticks; i++) {
+        explodeTick(i == 0 ? &e : nullptr);
+        peak = std::max(peak, fastestLimb(id));
+      }
+      return peak;
+    };
+    const double maxSpeed = BaselineNumber("ragdollRepeatBlastMaxSpeed", 21.0);
+    const uint64_t wid = mobs.Spawn(wizDef, {spot.x, h + 1, spot.z});
+    for (int i = 0; i < 45; i++) explodeTick(nullptr);
+    const Vec3 w0 = mobs.MobRootPos(wid);
+    const ExplosionOp e1{ifloor(w0.x) - 6, ifloor(w0.y) + 2, ifloor(w0.z),
+                         tune.tools.detonateRadius, tune.tools.detonatePower, 0, 0, 0};
+    const float peak1 = flight(wid, 20, e1);
+    const int phase1 = mobs.RagdollPhaseOf(wid);
+    const Vec3 w1 = mobs.MobRootPos(wid);
+    const ExplosionOp e2{ifloor(w1.x) - 6, ifloor(w1.y) + 2, ifloor(w1.z),
+                         tune.tools.detonateRadius, tune.tools.detonatePower, 0, 0, 0};
+    const float peak2 = flight(wid, 40, e2);
+    const Vec3 w2 = mobs.MobRootPos(wid);
+    const float travel2 = (w2 - w1).len();
+    const bool repeatOk = wid != 0 && phase1 == 1 && mobs.IsAlive(wid) &&
+                          peak1 <= (float)maxSpeed && peak2 <= (float)maxSpeed &&
+                          travel2 <= (float)maxTravel;
+    std::printf("  ragdoll repeat blast: %s (fastest limb %.1f m/s standing, %.1f m/s "
+                "already limp, ceiling %.0f; second blast moved the pelvis %.1f vox "
+                "in 1.3 s, band ..%.0f; phase after first %d, alive %d)\n",
+                repeatOk ? "PASS" : "FAIL", peak1, peak2, maxSpeed, travel2, maxTravel,
+                phase1, (int)mobs.IsAlive(wid));
+    ok = ok && repeatOk;
+    ticker.tick = tick;
+  }
+
+  // ---- E. the player on fire -------------------------------------------------
+  // The avatar with the capsule proxy in the world (PlayerPushOut needs one),
+  // wearing the stock cloth, every part alight. What comes off — burn
+  // gobbets, a robe burnt through — is born beside or on top of the capsule,
+  // gets swept into it by the avatar's own kinematic limbs, and used to be
+  // read by PlayerPushOut as one hit per voxel box, summed.
+  {
+    mobs.Reset();
+    debris.Reset();
+    SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+    ctx.WaitIdle();
+    uint32_t tick = ticker.tick;
+    const IVec3 pchunk{spot.x >> 4, spot.y >> 4, spot.z >> 4};
+    PlayerAvatar avatar;
+    avatar.Init(&phys, &world, &debris, c.mats, &mobs);
+    avatar.SetDefs(&mobs.Defs(), kAvatarDefName);
+    Player pl;
+    pl.fly = false;
+    pl.grounded = true;
+    pl.pos = Vec3{(float)spot.x + 0.5f, (float)(h + 2) + Player::kHalfY, (float)spot.z + 0.5f};
+    const bool spawned = avatar.Spawn(pl, 0.0f);
+    const uint64_t proxy = phys.CreatePlayerBody(Player::kHalfXZ, Player::kHalfY);
+    const char* wear[3] = {"hood", "robe", "boots"};
+    const int slots[3] = {0, 1, 3};  // EquipSlotId Head, Chest, Boots
+    int worn = 0;
+    for (int k = 0; k < 3; k++) {
+      const ItemDef* d = c.items.At(c.items.Find(wear[k]));
+      if (d && avatar.WearItem(d, slots[k])) worn++;
+    }
+    auto avTick = [&]() {
+      std::vector<BrushOp> ops;
+      std::vector<ParticleSpawn> spawns;
+      std::vector<CellOp> cellOps;
+      phys.MovePlayerBody(proxy, pl.pos, kTickDt);
+      avatar.PreTick(tick + 1, pl, 0.0f, kTickDt, world, ops, cellOps, spawns);
+      debris.QueueSupportEvents(world.Snap());
+      debris.PreTick(tick + 1, world, cellOps, spawns);
+      ++tick;
+      SubmitTick(ctx, world, sim, tick, kDefaultSeed, ops, {}, cellOps, false,
+                 pchunk, true, true, spawns);
+      ctx.WaitIdle();
+      ctx.ProcessEvents();
+      phys.Step(kTickDt);
+      debris.PostStep();
+      avatar.PostStep();
+    };
+    for (int i = 0; i < 30; i++) avTick();
+    for (int l = 0; l < avatar.PartCount(); l++) avatar.IgnitePart(l, 200);
+    const double maxPush = BaselineNumber("ragdollBurnMaxPushVox", 0.5);
+    const double maxMoved = BaselineNumber("ragdollBurnMaxTravel", 6.0);
+    const Vec3 start = pl.pos;
+    float peakPush = 0.0f;
+    int pushTicks = 0;
+    uint32_t gobbets = 0;
+    for (int i = 0; i < 400 && avatar.IsAlive(); i++) {
+      avTick();
+      Vec3 push = phys.PlayerPushOut(proxy, pl.pos);
+      // Player::ApplyPush's clamp, without its terrain sweeps.
+      const float len = push.len();
+      const float kMaxPush = 2.0f * Player::kHalfXZ;
+      if (len > kMaxPush) push = push * (kMaxPush / len);
+      Vec3 follow;
+      if (avatar.RagdollFollow(follow)) pl.pos = follow;
+      else pl.pos += push;
+      peakPush = std::max(peakPush, len);
+      if (len > 0.05f) pushTicks++;
+      gobbets = std::max(gobbets, debris.BodyCount());
+    }
+    const float moved = (pl.pos - start).len();
+    const bool burnOk = spawned && worn == 3 && peakPush <= (float)maxPush &&
+                        moved <= (float)maxMoved;
+    std::printf("  ragdoll player on fire: %s (peak push %.2f vox/tick, ceiling %.2f; "
+                "%d ticks pushed; moved %.1f vox, ceiling %.0f; up to %u pieces off; "
+                "worn %d/3, alive %d)\n",
+                burnOk ? "PASS" : "FAIL", peakPush, maxPush, pushTicks, moved, maxMoved,
+                gobbets, worn, (int)avatar.IsAlive());
+    ok = ok && burnOk;
+    avatar.Despawn();
+    phys.RemoveBody(proxy);
+    ticker.tick = tick;
+  }
 
   mobs.Reset();
   debris.Reset();

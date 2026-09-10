@@ -171,6 +171,15 @@ class Physics {
   // shoulders and both hips in the same call (gate `corpse-intact`). A body
   // comes apart only where something cuts it apart.
   void ReplaceBody(uint64_t oldHandle, uint64_t newHandle);
+  // The layer half of ReplaceBody on its own, for a rebuild that re-makes its
+  // joints itself (Mob::RebuildLimbBody) and for a SPLIT, where the parent
+  // stays. `to` takes `from`'s object layer, and if `from` was waiting in
+  // ReleaseToWorldWhenClear's list, `to` is added to it (never in place of
+  // `from`: a dead parent is forgotten by the next Step, a live one keeps its
+  // own entry). Without this a body rebuilt or split INSIDE the player came
+  // back on the plain MOVING layer and shoved them — a burning gobbet that
+  // shrinks (DebrisSystem's burn rebuild) did exactly that, every rebuild.
+  void CarryLayer(uint64_t from, uint64_t to);
   // Joints currently attached to one body / alive in the whole system.
   uint32_t JointCount(uint64_t handle) const;
   uint32_t JointCount() const;
@@ -334,7 +343,12 @@ class Physics {
                           size_t limit) const;
   // Radial impulse (explosions). center/radius in voxels, impulse in kg*m/s
   // at the center, falling off linearly to zero at radius.
-  void ApplyRadialImpulse(Vec3 centerVoxel, float radiusVoxels, float impulse);
+  // `skipSorted` (ascending handles, optional) names bodies the impulse must
+  // NOT touch: the limbs a living creature still owns. Those are launched as
+  // ONE rig by Mob::BlastRadial — a per-body impulse/mass on a 0.3 kg hand is
+  // 170 m/s, and the joints drag the rest of the body after it.
+  void ApplyRadialImpulse(Vec3 centerVoxel, float radiusVoxels, float impulse,
+                          const std::vector<uint64_t>* skipSorted = nullptr);
   // Wake dynamic bodies whose AABB intersects the given voxel-space sphere
   // (terrain changed under them).
   void WakeNear(Vec3 centerVoxel, float radiusVoxels);

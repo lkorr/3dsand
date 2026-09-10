@@ -644,6 +644,7 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadF(*g, "playerProxyFriction", p.playerProxyFriction, out, at);
     ReadF(*g, "explosionImpulseScale", p.explosionImpulseScale, out, at);
     ReadF(*g, "explosionImpulseRadiusScale", p.explosionImpulseRadiusScale, out, at);
+    ReadF(*g, "explosionMaxSpeed", p.explosionMaxSpeed, out, at);
     ReadF(*g, "explosionBodyDamageScale", p.explosionBodyDamageScale, out, at);
     ReadF(*g, "playerMassKg", p.playerMassKg, out, at);
     ReadF(*g, "sphereFriction", p.sphereFriction, out, at);

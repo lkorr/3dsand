@@ -748,6 +748,7 @@ const TUNING_SCHEMA = [
       {k:'playerProxyFriction', n:'player friction', d:'Friction of the player capsule against bodies. Kept low so the player does not drag debris around.', min:0, max:2, step:0.01},
       {k:'explosionImpulseScale', n:'blast impulse', d:'How hard an explosion throws debris — the how-far-does-a-plank-fly knob.', min:0, max:2, step:0.005},
       {k:'explosionImpulseRadiusScale', n:'blast impulse reach', d:'Impulse radius as a multiple of the destruction radius, so bodies just outside the crater still get pushed.', min:0.5, max:10, step:0.1, u:'×'},
+      {k:'explosionMaxSpeed', n:'blast max body speed', d:'Ceiling on the speed the blast impulse gives any one body. Bounds impulse / mass for the tiny pieces (a carved-off gobbet) that would otherwise leave at hundreds of m/s and ram whatever they were born inside.', min:5, max:200, step:1, u:'m/s'},
       {k:'explosionBodyDamageScale', n:'blast body damage reach', d:'How far a blast blows voxels OFF rigidbodies, as a multiple of the destruction radius. Below the impulse reach, so blasts push objects from further than they dismember them.', min:0, max:4, step:0.05, u:'×'},
       {k:'playerMassKg', n:'player mass', d:'Mass of the player contact proxy. Contact impulses split by mass ratio against a body\'s density-derived mass, so this is the how-hard-can-I-shove-things knob.', min:10, max:500, step:1, u:'kg'},
       {k:'sphereFriction', n:'sphere friction', d:'Grip of rolling sphere bodies. Higher converts more sliding into rolling.', min:0, max:2, step:0.01},

@@ -3518,6 +3518,16 @@ void Mob::StartRagdoll(float minSeconds, const char* why) {
               (unsigned long long)id_, why ? why : "", flipped, BodyMassKg());
 }
 
+void Mob::AppendLiveLimbBodies(std::vector<uint64_t>& out) const {
+  if (!alive_) return;
+  for (const MobLimb& l : limbs_)
+    if (l.body && l.holdSeconds <= 0) out.push_back(l.body);
+}
+
+void MobSystem::AppendLiveLimbBodies(std::vector<uint64_t>& out) const {
+  for (const Mob& m : mobs_) m.AppendLiveLimbBodies(out);
+}
+
 void Mob::SetLimbVelocities(Vec3 velVoxPerSec) {
   if (!phys_) return;
   for (MobLimb& l : limbs_)
@@ -3549,15 +3559,26 @@ bool Mob::BlastRadial(Vec3 centerWorldVoxel, float radiusVoxels,
   StartRagdoll(rg.minSeconds, "blast");
   if (ragdoll_ != RagdollPhase::Limp) return false;
   // A body already limp keeps what it had and takes the new shove on top;
-  // a standing one is launched clean.
+  // a standing one is launched clean. The sum is held under the same ceiling
+  // as a single launch — or the speed it already had, if that was higher (a
+  // long fall is not slowed by being blasted) — so eight grenades in one
+  // tick, or a cluster spell's eight ExplosionOps, cannot stack to 8x
+  // maxLaunchSpeed. Measured before this clamp: a second X-detonate on a
+  // limp wizard put the pelvis at 17.9 m/s against a 14 m/s ceiling.
   const Vec3 launch = dir * MetresToCells(speedMs);
+  const float ceiling = MetresToCells(rg.maxLaunchSpeed);
   for (MobLimb& l : limbs_) {
     if (!l.body || l.holdSeconds > 0) continue;
     Vec3 lin{}, ang{};
-    if (wasLimp && phys_->GetBodyVelocities(l.body, lin, ang))
-      phys_->SetBodyVelocities(l.body, lin + launch, ang);
-    else
+    if (wasLimp && phys_->GetBodyVelocities(l.body, lin, ang)) {
+      Vec3 sum = lin + launch;
+      const float cap = std::max(ceiling, lin.len());
+      const float len = sum.len();
+      if (len > cap && len > 1e-6f) sum = sum * (cap / len);
+      phys_->SetBodyVelocities(l.body, sum, ang);
+    } else {
       phys_->SetBodyVelocity(l.body, launch);
+    }
   }
   ragdollStillT_ = 0.0f;
   std::printf("mob %llu ragdoll: blast launch %.1f m/s (impulse %.0f, mass %.1f kg, "
@@ -5534,10 +5555,32 @@ bool Mob::RebuildLimbBody(int limbIndex) {
   // COLLIDER pitch: limb.voxels are physScale units, so the Jolt body is built
   // at 1/physScale.
   const float pitch = 1.0f / (float)std::max(1u, PhysScaleOf(limb));
-  phys_->GetTransform(limb.body, limb.xf);
+  // WHERE THE NEW BODY GOES. A KINEMATIC limb is rebuilt where Jolt has the
+  // old one: the next SubmitPose re-poses it from restOffset anyway, so the
+  // carve's rebase shift (ReskinLimbMicro moves xf.pos and anchorLimb in
+  // opposite directions) is restored a tick later and nothing shows. A LIMP
+  // limb is DYNAMIC and nobody re-poses it: re-reading Jolt here threw the
+  // rebase shift away, so the rebuilt collider sat one shift off the art and
+  // the rebuilt joint anchor one shift off its parent's — and Jolt closed that
+  // gap by force. Measured (`ragdoll` gate, second blast on a limp wizard):
+  // a carved upper leg at 41.8 m/s on the tick it was rebuilt. limb.xf is
+  // PostStep's read-back of this very body plus the carve's shift, which is
+  // exactly the frame the new lattice was computed in.
+  if (!(alive_ && ragdoll_ == RagdollPhase::Limp))
+    phys_->GetTransform(limb.body, limb.xf);
+  // What the old body was doing, for a LIMP limb: a rebuilt body starts at
+  // rest, and a limb flying at 10 m/s that a burn or acid bite rebuilt at
+  // zero was yanked back up to speed by its own joints.
+  Vec3 oldLin{}, oldAng{};
+  const bool hadVel = phys_->GetBodyVelocities(limb.body, oldLin, oldAng);
   uint64_t nh = phys_->CreateDebrisBodyXf(limb.voxels, limb.xf, DensityOf(),
                                           true /*allowKinematic*/, pitch);
   if (nh == 0) return false;  // Jolt refused: keep the old collider, stay carved
+  // ...and where the old body was allowed to be: its object layer and its
+  // place in ReleaseToWorldWhenClear's list (an NPC knocked limp beside the
+  // player is off the player's contact layer until it has fallen clear, and
+  // the rebuilt limb must be too, or it shoves them). Before RemoveBody.
+  phys_->CarryLayer(limb.body, nh);
 
   // The handle CHANGES, so every reference to the old one must be re-pointed
   // in the same breath or the limb silently detaches:
@@ -5565,6 +5608,7 @@ bool Mob::RebuildLimbBody(int limbIndex) {
   phys_->RemoveBody(limb.body);
   limb.body = nh;
   phys_->SetBodyKinematic(limb.body, kinematic);
+  if (!kinematic && hadVel) phys_->SetBodyVelocities(limb.body, oldLin, oldAng);
   // ...and the AVATAR-LAYER EXEMPTION, which is part of "every reference to the
   // old handle" exactly as much as the joints above are. A new handle starts on
   // the plain MOVING layer, and a still-attached avatar limb on MOVING is back
