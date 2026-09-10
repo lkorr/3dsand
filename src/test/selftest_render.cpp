@@ -180,6 +180,33 @@ bool fogOk = false;
   FarField far;
   far.Init(&world);
   far.FullRefill({108 >> 4, 122 >> 4, 108 >> 4});
+
+  // ---- THE BLIND WINDOW (farfield.h PrepareTick's `drain`) ---------------
+  // The game runs for seconds with `far`/`farpatch` still compiling, and
+  // EncodeFarFill records nothing until they land. PrepareTick used to pop
+  // into that hole: the entries were thrown away but pending_ emptied, so the
+  // fog reported the full horizon and the valid box reported every level
+  // marchable over cascade buffers that were still zeros — the renderer drew
+  // the sky, clouds and all, THROUGH the ground. Three properties, asserted
+  // before the real drain below because they describe the same queue:
+  // nothing pops, every level still reads "reset in flight", and the trusted
+  // radius is the residency window and nothing more.
+  bool blindOk = true;
+  {
+    const size_t before = far.PendingFills();
+    for (int i = 0; i < 3; i++) {
+      if (far.PrepareTick(ctx.queue, /*drain=*/false) != 0) blindOk = false;
+    }
+    if (far.PendingFills() != before) blindOk = false;
+    for (uint32_t k = 0; k < kFarLevels; k++)
+      if (far.FaceWord(k) != (1u << 24)) blindOk = false;
+    if (std::abs(far.SafeRadiusMeters() - kWindowHalfExtentMeters) > 1e-3f)
+      blindOk = false;
+    std::printf("far blind drain: %s (%zu queued, held over 3 ticks, "
+                "radius %.1f m)\n", blindOk ? "PASS" : "FAIL",
+                far.PendingFills(), far.SafeRadiusMeters());
+  }
+
   const float coldR = far.SafeRadiusMeters();
   float prevR = coldR;
   bool monotone = true;
@@ -203,7 +230,7 @@ bool fogOk = false;
   // moved, failing the gate for a change that was correct.
   const float wantCold = kWindowHalfExtentMeters;
   const float wantFull = kFarHalfExtentMeters(kFarLevels);
-  fogOk = std::abs(coldR - wantCold) < 1e-3f && monotone &&
+  fogOk = blindOk && std::abs(coldR - wantCold) < 1e-3f && monotone &&
           std::abs(prevR - wantFull) < 1e-3f;
   std::printf("far fog radius: %s (cold %.1f m -> filled %.1f m, monotone=%d)\n",
               fogOk ? "PASS" : "FAIL", coldR, prevR, monotone ? 1 : 0);

@@ -5228,9 +5228,40 @@ where you hear from either (§12b, "The ears are on the character").
   worst case and the one player-built content lands in.
   Levels are filled on the GPU by sampling `genCell()` at stride
   (worldgen.wgsl `far` — the "sieve"), recentered with hysteresis like the
-  streaming window, and refilled a plane at a time (≤ kFarListCap
-  level-chunks/tick, managed by `sim/farfield`; planes drain at
-  `kPlayFillCap` = 64 in play, resets at the list cap). **The renderer marches
+  streaming window, and refilled a plane at a time (managed by
+  `sim/farfield`; planes drain at `kPlayFillCap` = 64 in play, a wholesale
+  reset at `render.farRefillRate` in the game and at `kFarListCap` in the
+  headless drain loops).
+  **A wholesale refill is FINEST level first and is BUDGETED (2026-09-10).**
+  A `FullRefill` — startup, `LoadWorld`, regen, a teleport past a level's
+  window — is `kFarLevels × kFarNumChunks` = 262,144 sieve entries. Drained at
+  `kFarListCap` that is 64 ticks of 267 ms, i.e. 2 fps for the ~16 s after the
+  deferred `far` pipelines land mid-play, which was the largest stall in the
+  frame and was reported as such. It now takes `render.farRefillRate` (1024)
+  entries per tick and at most one slice per FRAME (`FarField::BeginFrame`,
+  the rule `Stream::BeginFrame` already applies to window shifts, because a
+  catch-up frame runs up to four ticks). Finest first, because the valid box
+  makes coarsest-first actively wrong: with only level 8 filled every ray
+  leaving the window marches 25.6 m cells, so the first thing outside the
+  window is a field of house-sized blocks. Finest first, each landed level
+  doubles the trusted radius (51.2 m, 102, 205, …) and the fog opens a band at
+  a time. The trade is real in both directions — a smaller slice costs more
+  total GPU, because a far dispatch has a large fixed cost — and the measured
+  table lives on the knob (`Tuning::Render::farRefillRate`).
+  **And the queue is HELD while those pipelines compile.** `EncodeFarFill`
+  records nothing until `far`/`farpatch` land, but `PrepareTick` used to pop
+  and drop the entries anyway, which emptied `pending_` — so for the whole
+  compile (2.5 s warm, 20.6 s on a cold SPIR-V cache) the fog reported the
+  full 6.5 km horizon and `FaceWord` reported every level marchable, over
+  cascade buffers that were still zeros. Rays escaped through the ground and
+  the sky, clouds included, was drawn UNDER the terrain. `Simulation::
+  FarFillsDeferred` is true exactly when the fills would be dropped and the
+  caller has opted into deferral (the game and the voxel tools; never a gate
+  or a `--shot`, which block instead), and the frame loop then skips both
+  `FarField::Update` and the drain, publishing only the UBO. The `far-fog`
+  gate asserts it: nothing pops, every level reads "reset in flight", radius
+  = the residency window. `SANDVOX_FAR_DELAY_S=<n>` holds the compile so the
+  transient is reachable without a cold cache. **The renderer marches
   a VALID box, not the level box (2026-09-10).** A level is toroidal, so when
   its origin steps one level chunk the incoming face's SLOTS are the outgoing
   face's and hold the outgoing face's bytes until the sieve refills them —
@@ -5517,11 +5548,19 @@ where you hear from either (§12b, "The ears are on the character").
   temporal key crawls, a world-space key re-aligns into arcs as the boxes
   recenter. Fog density is a uniform tracking the cascade radius that is
   actually FILLED: `FarField` counts pending fills per level and reports the
-  half-extent of the level below the innermost incomplete one, so a cold start
-  or teleport fogs out the bands still in the queue instead of showing sky
-  through them, clamped between the full-horizon pin (`kFarFogDensity`) and a
-  ceiling at level 2's half-extent (`kFarFogDensityMax`, so the residency
-  window is never fogged away) and eased over a few frames. Determinism is
+  half-extent of the FARTHEST COMPLETE one, so a cold start or teleport fogs
+  out the bands still in the queue instead of showing sky through them,
+  clamped between the full-horizon pin (`kFarFogDensity`) and a ceiling at
+  level 2's half-extent (`kFarFogDensityMax`, so the residency window is never
+  fogged away) and eased over a few frames. *Farthest complete*, not "the one
+  below the innermost incomplete", which is what it read until 2026-09-10: the
+  levels are nested boxes all centred on the player and `traceFar` tests each
+  independently, so a level `farBox` has collapsed is skipped and the next one
+  picks the ray up at the same `t` — a complete level covers everything inside
+  its half-extent as well as at it. Reading it the pessimistic way pinned the
+  fog on the residency window for the whole of a refill and then snapped it to
+  6.5 km, which is the "everything suddenly goes extremely foggy" half of the
+  report that also produced the two paragraphs below. Determinism is
   untouched by construction: cascades are derived render-only data — never
   read by the sim, never hashed, no MutationQueue involvement (the selftest's
   `far-downsample` gate proves the propagation works, `far-persist` proves it

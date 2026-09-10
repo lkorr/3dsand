@@ -36,18 +36,57 @@ class FarField {
   // entirely stale (teleport, load) resets and refills wholesale.
   void Update(IVec3 playerChunk);
 
-  // Pop up to kFarListCap queued fills, upload farList + farPatch (+ farUBO
-  // when origins changed), and return the dispatch count for this tick's
-  // TickParams.farCount / EncodeFarFill. May pop FEWER than kFarListCap when
-  // this tick's patch payload budget (kFarPatchCap) is spent — the rest stay
-  // queued, exactly as they do when the dispatch cap is the binding one.
-  uint32_t PrepareTick(const rhi::Queue& queue);
+  // Pop up to the current cap of queued fills, upload farList + farPatch
+  // (+ farUBO when origins changed), and return the dispatch count for this
+  // tick's TickParams.farCount / EncodeFarFill. May pop FEWER than the cap
+  // when this tick's patch payload budget (kFarPatchCap) is spent — the rest
+  // stay queued, exactly as they do when the dispatch cap is the binding one.
+  //
+  // `drain = false` publishes the UBO and pops NOTHING. It exists for the one
+  // caller whose fills would be thrown away: the game runs for seconds with
+  // the `far`/`farpatch` pipelines still compiling on a background thread, and
+  // EncodeFarFill records no row until they land. Popping into that hole did
+  // not merely waste the entries — it emptied pending_, so SafeRadiusMeters
+  // reported the FULL 6.5 km horizon and FaceWord reported every face valid
+  // while every cascade byte was still zero. The renderer marched those empty
+  // levels, rays escaped through the ground, and the sky (clouds included) was
+  // drawn UNDER the terrain until the pipelines arrived and the wholesale
+  // refill slammed the fog shut. Not draining keeps the bookkeeping true: the
+  // fog stays closed on the residency window and the valid box stays empty,
+  // which is what "the horizon has not been built yet" is supposed to look
+  // like.
+  uint32_t PrepareTick(const rhi::Queue& queue, bool drain = true);
+
+  // Entries a RESET may pop per tick (see bulkCap_). Defaults to kFarListCap,
+  // which is what the headless drain loops want; the game lowers it.
+  void SetBulkCap(uint32_t n) { bulkCap_ = n ? n : 1u; }
+
+  // ---- AT MOST ONE BULK SLICE PER FRAME ----------------------------------
+  // Stream::BeginFrame's rule (stream.h R4), for the same reason and with the
+  // same shape. PrepareTick is a per-TICK call and the frame loop runs up to
+  // four ticks on a catch-up frame, so a frame that was already slow paid the
+  // refill slice four times and got slower — measured before this gate,
+  // `--frames 2500 --autowalk` with a 256-entry slice (~13 ms of GPU) read
+  // farFill p99 35.2 ms and max 38.3, i.e. two and three slices landing on
+  // one frame. The refill is render-only derived data with no deadline, so
+  // deferring the extra slices to the next frame costs nothing but wall
+  // clock, which is the axis this whole cap trades on anyway.
+  //
+  // ONLY the bulk path is gated. Incoming planes (kPlayFillCap) stay per
+  // tick: they are the horizon keeping up with a player who is moving, they
+  // are 64 entries, and holding them back is what puts a stale slab on the
+  // leading face.
+  //
+  // Callers without a frame loop never call this, so `frameGated_` stays
+  // false and every PrepareTick may take a full slice — which is what the
+  // selftest gates and the smokes already did.
+  void BeginFrame() { frameGated_ = true; bulkThisFrame_ = false; }
 
   // Patch words uploaded by the last PrepareTick (diagnostics / selftest).
   uint32_t LastPatchWords() const { return lastPatchWords_; }
 
-  // Re-derive every origin around the player and refill all levels, coarsest
-  // first so a horizon exists immediately (startup, load, regen).
+  // Re-derive every origin around the player and refill all levels, FINEST
+  // first (startup, load, regen). See the order note in farfield.cpp.
   void FullRefill(IVec3 playerChunk);
 
   size_t PendingFills() const { return queue_.size(); }
@@ -157,6 +196,20 @@ class FarField {
   // 64 keeps the median and only cuts the tail. The next lever is the sieve's
   // per-entry cost, not this number.
   static constexpr uint32_t kPlayFillCap = 64;
+  // THE RESET CAP, and why it is no longer kFarListCap in the game
+  // (2026-09-10). A full refill is kFarLevels x kFarNumChunks = 262,144 sieve
+  // entries. kFarListCap (4,096) slices that into 64 ticks of 267 ms —
+  // measured `--frames 1500 --autowalk`: farField p99 210 ms, max 267 ms, 63
+  // frames over 100 ms — which is the 2 fps stall the horizon's arrival was
+  // reported as from live play. The game therefore spends a bounded slice per
+  // tick (render.farRefillRate, whose comment carries the measured table of
+  // what each slice size costs) and lets the refill take longer in wall clock
+  // while staying interactive. The headless drain loops
+  // (selftest_render.cpp's DrainFullRefill, the far gates) have no frame to
+  // protect and keep the default.
+  uint32_t bulkCap_ = kFarListCap;
+  bool frameGated_ = false;   // BeginFrame has been called at least once
+  bool bulkThisFrame_ = false;
   bool uboDirty_ = true;
   // Reused across ticks so a fill-heavy frame does not reallocate: the header
   // is 2 u32 per dispatched entry, the payload is the concatenated patch runs.

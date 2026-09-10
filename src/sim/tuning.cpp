@@ -2170,6 +2170,7 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadF(*g, "trampleRadius", r.trampleRadius, out, at);
     ReadI(*g, "primarySteps", r.primarySteps, out, at);
     ReadI(*g, "farSteps", r.farSteps, out, at);
+    ReadI(*g, "farRefillRate", r.farRefillRate, out, at);
     ReadF(*g, "farShadowReach", r.farShadowReach, out, at);
     ReadI(*g, "farBlockerHitLevel", r.farBlockerHitLevel, out, at);
     ReadF(*g, "gasBlendStart", r.gasBlendStart, out, at);
@@ -2306,6 +2307,10 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     if (r.shadowCacheSubdiv > 8) { r.shadowCacheSubdiv = 8; }
     if (r.reflectionSteps < 0) { r.reflectionSteps = 0; }
     if (r.farSteps < 1) { r.farSteps = 1; }
+    // 0 would stall a refill forever (the horizon would never come back) and
+    // the top is the whole farList buffer, which is the dispatch's own limit.
+    if (r.farRefillRate < 1) { r.farRefillRate = 1; }
+    if (r.farRefillRate > (int)kFarListCap) { r.farRefillRate = (int)kFarListCap; }
     // A zero/negative reach would clamp to the 8-step floor everywhere and
     // silently drop far shadows; keep it positive.
     if (r.farShadowReach < 1.0f) { r.farShadowReach = 1.0f; }

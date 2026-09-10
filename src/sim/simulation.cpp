@@ -1591,6 +1591,23 @@ void Simulation::StartFarBuild(unsigned threads) {
     r.fill = MakeComputePipeline(dev, layout, module, "far", "farFill");
     patch.join();
     down.join();
+    // SANDVOX_FAR_DELAY_S: hold the horizon back by N seconds. The cascades'
+    // arrival is a several-second transient the game has to survive — the
+    // frame loop holds FarField's queue for the whole of it
+    // (Simulation::FarFillsDeferred) so the fog and the valid box do not
+    // claim a horizon that does not exist yet — and the only way to reach
+    // that state honestly was a cold SPIR-V cache, i.e. a ~12 minute driver
+    // compile of `far`. One env var makes it a normal run, which is the
+    // difference between a path that is tested and one that is argued about.
+    if (const char* d = std::getenv("SANDVOX_FAR_DELAY_S")) {
+      const double secs = std::atof(d);
+      if (secs > 0.0) {
+        std::printf("far-cascade pipelines: holding %.1f s "
+                    "(SANDVOX_FAR_DELAY_S)\n", secs);
+        std::fflush(stdout);
+        std::this_thread::sleep_for(std::chrono::duration<double>(secs));
+      }
+    }
     MarkFarReady();
     // THE HORIZON'S ARRIVAL TIME, printed unconditionally. It is the number
     // this whole package is measured by and there is no other record of it

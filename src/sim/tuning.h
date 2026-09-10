@@ -2857,6 +2857,40 @@ struct Tuning {
     // specifically want foliage running off the shared clock.
     float microSwaySpeed = 1.0f;
 
+    // ---- how fast the cascade REBUILDS, in sieve entries per tick --------
+    // CPU-ONLY (never reaches a shader): FarField::SetBulkCap. Applies to a
+    // wholesale refill — the startup horizon, a load, a teleport — not to the
+    // incoming planes of ordinary travel, which have their own cap inside
+    // FarField (kPlayFillCap).
+    //
+    // A refill is kFarLevels x kFarNumChunks = 262,144 sieve entries; this
+    // number is how many of them a tick may take. It used to be kFarListCap
+    // = 4,096 with no knob, i.e. 267 ms of GPU in ONE tick and 2 fps until
+    // the queue drained — the horizon's arrival was the largest stall in the
+    // walking frame, reported from live play as "everything goes foggy and
+    // the fps dies for ten seconds".
+    //
+    // THE SLICE IS NOT FREE TO SHRINK, which is the non-obvious half.
+    // Measured `--frames 2500 --autowalk`, same binary, same walk, one full
+    // refill each (the entry count is printed by that harness):
+    //
+    //   cap   frame p50/p95/p99/max   >33ms  >100ms   far GPU total  far ticks
+    //   4096   17.2  42.0  57.2  374   11.8%    10       5.7 s          456
+    //   1024   21.3  63.7  79.9  287   22.7%     3      15.3 s          847
+    //    256   23.5  56.8  69.7  151   34.3%     1      20.6 s         1506
+    //
+    // Same ~290k entries in all three, but the TOTAL GPU cost is 3.6x higher
+    // at 256 than at 4096: a far dispatch has a large fixed cost (its two
+    // rows barrier against farDown's writes to a 1 GiB farVox), and the whole
+    // machine runs hotter for longer, which shows up on the raymarch row too.
+    // So this trades peak hitch against total work, not against nothing.
+    //
+    // 1024 is the knee: it turns 63 frames over 100 ms into 3 and keeps the
+    // median within 4 ms of the cheapest arm. Raise it toward 4096 to get the
+    // horizon back sooner and accept the hitches; lower it toward 256 if a
+    // dropped frame matters more than a busy minute. Hot-reloads on F5.
+    int farRefillRate = 1024;
+
     // budgets
     int primarySteps = 4096;
     int farSteps = 384;

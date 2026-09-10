@@ -247,6 +247,17 @@ uint64_t g_frameRbDeclines = 0;      // readback requests the ring refused
 // the GPU still owed two or more snapshot readbacks. Sim time dilates by that
 // many ticks instead of the frame stalling on a fence.
 uint64_t g_ticksThrottled = 0;
+// ---- THE CASCADE REFILL, AS ENTRIES AND NOT AS A MEAN (CLAUDE.md rule 6) ---
+// `farField` on the GPU table is one mean over the whole run and it cannot
+// distinguish 'the refill finished cheaply' from 'the refill never finished'.
+// Diagnosing the horizon's arrival needed exactly that distinction — a
+// 256-entry slice measured 4.4x the TOTAL far GPU time of a 4096-entry one
+// for what should have been the same 262,144 entries — and there was no way
+// to read the entry count off a run. These three say how much sieve actually
+// ran, in how many ticks, and how much was still queued at exit.
+uint64_t g_farEntries = 0;    // sieve entries dispatched over the run
+uint64_t g_farTicks = 0;      // ticks that dispatched at least one
+uint64_t g_farBiggest = 0;    // the largest single tick's count
 // --frames: the GPU side of the same picture. The live telemetry path already
 // bills every timestamped pass to its Engine-map node per frame; the harness
 // keeps the per-frame series so the summary can say WHICH GPU row spiked,
@@ -5940,6 +5951,9 @@ int main(int argc, char** argv) {
     // Stream::Update is a per-TICK call and the clamp below runs up to four of
     // them, so a slow frame used to shift two or three times and get slower.
     stream.BeginFrame();
+    // ...and one cascade-refill slice per frame, for the same reason
+    // (farfield.h BeginFrame).
+    far.BeginFrame();
     while (accumulator >= kTickDt && ticksThisFrame < kMaxTicksPerFrame) {
       // ---- THE GPU-LAG THROTTLE: a second tick only if the GPU can take it.
       //
@@ -6036,14 +6050,36 @@ int main(int argc, char** argv) {
         stream.Update(playerChunkNow, tick);
         // THE HORIZON ARRIVING. `far`/`fardown` compile on a background thread
         // (docs/PLAN_shader_compile.md package A) and this is the one place
-        // that notices they landed. Every fill queued before then was popped
-        // by PrepareTick below and dropped on the floor — EncodeFarFill had no
-        // pipeline to record — so nothing short of a wholesale refill puts
-        // terrain back past the residency window. Fires exactly once.
+        // that notices they landed. Nothing was recorded for the cascades
+        // before that, so a wholesale refill is what puts terrain back past
+        // the residency window. Fires exactly once.
         if (sim.PollFarPipelines()) far.FullRefill(playerChunkNow);
+        // ...and until it does, FarField MUST NOT DRAIN (2026-09-10). It used
+        // to: PrepareTick popped, EncodeFarFill found no pipeline and dropped
+        // the entries, and pending_ emptied — so for the whole compile (2.5 s
+        // warm, 20.6 s on a cold shader cache, measured) the fog reported the
+        // full 6.5 km horizon and the valid box reported every level marchable
+        // over cascade buffers that were still zeros. Rays escaped through the
+        // ground into the sky and the clouds were drawn UNDER the terrain,
+        // then the refill landed and slammed the fog onto the window. Holding
+        // the queue keeps both readings honest for those seconds — closed fog,
+        // empty valid box — and costs nothing else, since the entries were
+        // being thrown away anyway. Update() is held with it: recentring while
+        // blind would pile incoming planes onto a queue the FullRefill above
+        // is about to clear.
+        const bool farBlind = sim.FarFillsDeferred();
+        // The refill's per-tick slice, live from tuning so F5 moves it (see
+        // Tuning::Render::farRefillRate — this is the knob that turned the
+        // horizon's arrival from a 16 s 2 fps stall into a fog that opens).
+        far.SetBulkCap((uint32_t)CurrentTuning().render.farRefillRate);
         // far-field cascades track the player the same way (render-only)
-        far.Update(playerChunkNow);
-        farCount = far.PrepareTick(ctx.queue);
+        if (!farBlind) far.Update(playerChunkNow);
+        farCount = far.PrepareTick(ctx.queue, !farBlind);
+        if (farCount) {
+          g_farEntries += farCount;
+          g_farTicks++;
+          g_farBiggest = std::max<uint64_t>(g_farBiggest, farCount);
+        }
       }
       // ---- GAME LOGIC: the rest of the tick body up to the submit ---------
       // Brush, laser, melee, spells, mob/avatar/debris PreTick, explosions.
@@ -10058,6 +10094,16 @@ int main(int argc, char** argv) {
         std::printf("    gpu-lag throttle: %llu ticks deferred to a later frame "
                     "(the GPU owed >= 2 snapshots when a second tick was due)\n",
                     (unsigned long long)g_ticksThrottled);
+        // A full refill is kFarLevels * kFarNumChunks entries; anything less
+        // than that here means the horizon was still arriving at exit.
+        std::printf("    far-cascade sieve: %llu entries over %llu ticks "
+                    "(biggest tick %llu, cap %d) | %zu still queued at exit "
+                    "(a full refill is %u)\n",
+                    (unsigned long long)g_farEntries,
+                    (unsigned long long)g_farTicks,
+                    (unsigned long long)g_farBiggest,
+                    CurrentTuning().render.farRefillRate, far.PendingFills(),
+                    kFarLevels * kFarNumChunks);
         std::printf("    snapshot stalls (blocking WaitIdle on the frame path):"
                     " %llu over %llu frames (%.1f%% of frames) | readback "
                     "requests the ring refused: %llu\n",

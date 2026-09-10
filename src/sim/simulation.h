@@ -479,12 +479,27 @@ class Simulation {
 
   // Publish a finished background compile and return true EXACTLY ONCE: on the
   // call that made the pipelines live. That is the caller's cue to
-  // FarField::FullRefill — every fill queued while they were missing was
-  // popped by PrepareTick and dropped, so the cascades are empty and only a
-  // wholesale refill puts a horizon back. Never blocks.
+  // FarField::FullRefill — the cascades are empty (nothing was ever recorded
+  // for them) and only a wholesale refill puts a horizon back. Never blocks.
   bool PollFarPipelines();
   bool FarPipelinesReady() const {
     return farReady_.load(std::memory_order_acquire);
+  }
+  // EncodeFarFill will record NOTHING this tick and is not allowed to block
+  // to fix that: the deferred build is started but not landed, and this
+  // caller opted into deferral. A caller in that state must not let FarField
+  // pop entries into the hole (FarField::PrepareTick's `drain` argument, and
+  // the long note there about the sky being drawn under the ground).
+  //
+  // All three conjuncts matter. Without `deferFarOk_` this would also fire
+  // for --shot / --perf / the gates, which do NOT opt in: they block inside
+  // EncodeFarFill until the pipelines exist, so their fills are never
+  // dropped and holding their queue would only delay a checked output.
+  // Without `farStarted_` it would fire forever under FarBuild::Lazy, where
+  // nothing is compiling and nothing is coming.
+  bool FarFillsDeferred() const {
+    return deferFarOk_ && farStarted_ &&
+           !farReady_.load(std::memory_order_acquire);
   }
   // Block until the deferred compile finishes, then publish. Idempotent, and a
   // no-op when the far pipelines were never deferred.

@@ -72,22 +72,61 @@ void FarField::FullRefill(IVec3 playerChunk) {
     bulkPending_[k] = 0;
     for (int a = 0; a < 3; a++) faces_[k][a][0] = faces_[k][a][1] = 0;
   }
-  // coarsest first: the horizon band appears before the near bands refine
-  for (int k = (int)kFarLevels - 1; k >= 0; k--)
-    ResetLevel((uint32_t)k, DesiredOrigin(playerChunk, (uint32_t)k));
+  // ---- FINEST FIRST, and the order is load-bearing (2026-09-10) ----------
+  // This ran COARSEST first, on the argument that "a horizon band appears
+  // before the near bands refine". The valid box makes that argument true
+  // and undesirable at the same time: a level whose reset is in flight
+  // publishes bit 24, raymarch.wgsl's farBox collapses its box to empty, and
+  // the ray falls straight through to the next level that HAS data. So with
+  // only the coarsest level filled a ray leaving the residency window at
+  // 25.6 m immediately marches level-8 cells — 25.6 m across, one cell per
+  // window — and the first thing outside the window the player sees is a
+  // field of house-sized blocks. It is a horizon, but it is the wrong
+  // picture, and it stays wrong for the ~15 s the remaining levels take.
+  //
+  // Finest first is the same total work with the fog telling the truth about
+  // it: level 1 lands and everything out to 51.2 m is correct at 0.2 m cells
+  // with fog beyond, then 102 m, 205 m, ... — SafeRadiusMeters doubles as
+  // each level completes and kFogLerpPerFrame eases the horizon open. The
+  // player never sees a cell bigger than the distance it is at can hide,
+  // which is the invariant the whole cascade geometry is built on
+  // (world.h's "constant angular resolution" note).
+  for (uint32_t k = 0; k < kFarLevels; k++)
+    ResetLevel(k, DesiredOrigin(playerChunk, k));
 }
 
 float FarField::SafeRadiusMeters() const {
-  // Half-extent of cascade level k (1-based) comes from world.h
-  // (kFarHalfExtentMeters), so this tracks kFarN / kFarShiftBase / kFarLevels
-  // automatically instead of restating the box-size relation.
+  // THE FARTHEST COMPLETE LEVEL, not the nearest incomplete one (2026-09-10).
+  //
+  // This used to stop at the innermost level with work outstanding and trust
+  // nothing past it, on the reading that a complete coarse level "is only
+  // reachable through the gap at level k, so it cannot be trusted to be
+  // visible". That reading is wrong about the geometry the renderer actually
+  // walks: the levels are NESTED boxes all centred on the player, and
+  // traceFar's loop tests each level's box independently — a level whose box
+  // farBox has collapsed is `continue`d and the next one picks the ray up at
+  // the same t (raymarch.wgsl's valid-box note). A complete level therefore
+  // covers everything inside its own half-extent as well as at it, at its own
+  // cell size, whatever the levels inside it are doing.
+  //
+  // Reading it the old way cost the whole point of the adaptive fog during a
+  // refill: with all eight levels queued, level 1 completes last, so the fog
+  // sat pinned on the residency window (25.6 m) for the entire drain and then
+  // snapped to 6.5 km — "the entire area suddenly gets extremely foggy",
+  // reported from live play. Taking the max instead lets the horizon open one
+  // level at a time as FullRefill's finest-first order lands them.
+  //
+  // Half-extents come from world.h (kFarHalfExtentMeters), so this tracks
+  // kFarN / kFarShiftBase / kFarLevels instead of restating the box relation.
+  // The floor is the residency window: the fine march always covers that, and
+  // it is the pre-cascade draw distance.
+  float best = kWindowHalfExtentMeters;
   for (uint32_t k = 0; k < kFarLevels; k++) {
-    if (pending_[k] == 0) continue;
-    // level k+1 (1-based) is incomplete; trust out to level k's half-extent,
-    // or — if even level 1 is incomplete — only the residency window itself,
-    // which is the pre-cascade draw distance.
-    const float inner = k == 0 ? kWindowHalfExtentMeters : kFarHalfExtentMeters(k);
-    if (bulkPending_[k] > 0) return inner;
+    if (pending_[k] == 0) {                    // complete: trust its whole box
+      best = std::max(best, kFarHalfExtentMeters(k + 1));
+      continue;
+    }
+    if (bulkPending_[k] > 0) continue;         // reset in flight: no data at all
     // Only PLANES outstanding: the level was complete and what is missing is
     // its incoming face, one level chunk thick, on the side the player is
     // moving toward. Everything inside that face is filled, so the trusted
@@ -96,9 +135,9 @@ float FarField::SafeRadiusMeters() const {
     // for that long would pulse the horizon on every chunk boundary crossed.
     const float face =
         (float)(kChunk << (k + 1 + kFarShiftBase)) * kVoxelMeters;
-    return std::max(inner, kFarHalfExtentMeters(k + 1) - face);
+    best = std::max(best, kFarHalfExtentMeters(k + 1) - face);
   }
-  return kFarHalfExtentMeters(kFarLevels);   // everything filled: full horizon
+  return best;
 }
 
 uint32_t FarField::FaceWord(uint32_t k) const {
@@ -137,7 +176,7 @@ void FarField::Update(IVec3 playerChunk) {
   }
 }
 
-uint32_t FarField::PrepareTick(const rhi::Queue& queue) {
+uint32_t FarField::PrepareTick(const rhi::Queue& queue, bool drain) {
   if (!world_) return 0;
   if (uboDirty_) {
     FarParams fp{};
@@ -150,13 +189,23 @@ uint32_t FarField::PrepareTick(const rhi::Queue& queue) {
     queue.WriteBuffer(world_->farUBO, 0, &fp, sizeof(fp));
     uboDirty_ = false;
   }
-  if (queue_.empty()) return 0;
-  // A reset (teleport, load, the startup horizon) drains at the list cap; in
+  // The UBO above is published either way — a caller that is not draining
+  // still has to tell the renderer which levels it may march.
+  if (!drain || queue_.empty()) return 0;
+  // A reset (teleport, load, the startup horizon) drains at the bulk cap; in
   // play, incoming planes drain at kPlayFillCap (see farfield.h).
   bool bulk = false;
   for (uint32_t k = 0; k < kFarLevels; k++) bulk = bulk || bulkPending_[k] > 0;
+  // One bulk slice per FRAME under the frame gate (farfield.h BeginFrame).
+  // A second tick in the same frame falls back to the play cap rather than to
+  // nothing: whatever planes the player's travel queued behind the reset
+  // still have to keep up, and they are 64 entries.
+  if (bulk && frameGated_) {
+    if (bulkThisFrame_) bulk = false;
+    else bulkThisFrame_ = true;
+  }
   const uint32_t cap = (uint32_t)std::min(
-      queue_.size(), (size_t)(bulk ? kFarListCap : kPlayFillCap));
+      queue_.size(), (size_t)(bulk ? bulkCap_ : kPlayFillCap));
   std::vector<uint32_t> list;
   list.reserve(cap);
   patchHeader_.clear();
