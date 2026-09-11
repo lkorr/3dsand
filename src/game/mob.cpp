@@ -2954,6 +2954,47 @@ void MobSystem::DriveLocomotion(Mob& mob, const MobDef& def,
   mob.phase_ += applied.len() * 2.2f;
 }
 
+// ---- THE HEIGHT THE BODY IS ACTUALLY DRAWN AT ------------------------------
+//
+// `bodyY_` is what every limb transform is built from (SubmitPose), so it is
+// the thing a player LOOKS AT. `origin_` is the collider. Fixing the second and
+// not the first is why the first pass at "NPCs walk through hills" changed
+// nothing on screen: the collision origin rode the slope correctly and the
+// visible creature stayed buried in it.
+//
+// This was `clamp(target - bodyY_, -0.4f, +0.4f)`, open-coded at three call
+// sites, and it is wrong twice over:
+//
+//   * 0.4 is PER TICK. At kTickDt = 1/30 and 10 cm voxels that is 12 voxels a
+//     second, and it silently doubles or halves whenever the tick rate or the
+//     voxel size moves — the same class of bug the drive's ground snap and the
+//     step budget both had.
+//   * THE RATE IS BOUNDED BUT THE ERROR IS NOT. Worldgen here produces slopes
+//     of up to 3 voxels per column (the `terrain` gate measures it), and a mob
+//     covers one to two columns per tick, so climbing demands up to 6 voxels of
+//     vertical a tick against the 0.4 it was allowed. The shortfall does not
+//     level off: it accumulates every tick the creature keeps climbing, so the
+//     drawn body sinks further into the hillside the longer it walks up one.
+//     Fifteen times too slow is not a smoothing constant that needs tuning, it
+//     is a missing constraint.
+//
+// So: a rate in metres per second (the smoothing a footfall wants), plus a HARD
+// BOUND ON THE LAG. Small corrections — stepping onto a block, a foot planting
+// — are still eased exactly as before, because they are inside the bound. A
+// climb faster than the ease can follow is clamped instead of accumulating,
+// which is the honest answer: you cannot smooth away six voxels a tick, and
+// pretending to just puts the creature underground.
+void MobSystem::EaseBodyY(Mob& mob, float targetY, float dt) {
+  const float rate = MetresToCells(1.2f) * std::max(dt, 1e-4f);
+  mob.bodyY_ += std::clamp(targetY - mob.bodyY_, -rate, rate);
+  // Asymmetric for the same reason the clamp above is: trailing the target
+  // upward is a body catching up to a rise it is climbing, which is fine and
+  // invisible; trailing it downward is the body standing inside the ground.
+  const float lagUp = MetresToCells(0.10f);
+  const float lagDown = MetresToCells(0.03f);
+  mob.bodyY_ = std::clamp(mob.bodyY_, targetY - lagUp, targetY + lagDown);
+}
+
 // Procedural gait layer. Writes foot targets into mob.anim_.feet and derives
 // the body height/tilt from the resulting foot plane; the IK pass in
 // UpdateAnimation then places the legs.
@@ -3017,6 +3058,15 @@ void MobSystem::UpdateGait(Mob& mob, const MobDef& def, World& world, float dt) 
 
   float sumY = 0;
   int nFeet = 0;
+  // THE SWING SLOT IS AWARDED, NOT CLAIMED. See the long note where these are
+  // resolved, below the loop: whoever wants it most gets it.
+  struct StepBid {
+    size_t chain = 0;
+    int group = -1;
+    float drift = 0;
+    Vec3 to{};
+  };
+  std::vector<StepBid> bids;
 
   for (size_t c = 0; c < sk.chains.size() && c < mob.anim_.feet.size(); c++) {
     const IkChain& ch = sk.chains[c];
@@ -3084,22 +3134,60 @@ void MobSystem::UpdateGait(Mob& mob, const MobDef& def, World& world, float dt) 
     } else {
       Vec3 drift = ideal - f.planted;
       float driftLen = std::sqrt(drift.x * drift.x + drift.z * drift.z);
-      // unplant only when BOTH conditions hold: this foot has drifted far
-      // enough AND no other leg in the same group is mid-swing
+      // This foot WANTS to step. Whether it gets to is decided after the loop,
+      // once every leg has said how badly it needs the slot.
       int myGroup = -1;
       for (size_t gi = 0; gi < g.groups.size(); gi++)
         for (int p : g.groups[gi])
           if (p == ch.effector || p == ch.parts[0]) myGroup = (int)gi;
-      bool groupFree = swingingGroup < 0 || swingingGroup == myGroup;
-      if (driftLen > g.stepThreshold * f.legLength && groupFree) {
-        f.swinging = true;
-        f.swingT = 0;
-        f.swingFrom = f.planted;
-        f.swingTo = ideal;
-        swingingGroup = myGroup >= 0 ? myGroup : (int)c;
-      }
+      if (driftLen > g.stepThreshold * f.legLength)
+        bids.push_back(StepBid{c, myGroup >= 0 ? myGroup : (int)c, driftLen,
+                               ideal});
       sumY += f.planted.y;
       nFeet++;
+    }
+  }
+
+  // ---- WHO GETS TO STEP -----------------------------------------------------
+  //
+  // Exactly one GROUP may swing at a time, and that single constraint is the
+  // whole gait state machine (see the note where `swingingGroup` is found).
+  // What was missing is that nothing decided WHICH group, so the slot went to
+  // whichever chain the loop happened to reach first — and it kept going there.
+  //
+  // THE FAILURE IS INVISIBLE ON FLAT GROUND AND RUINS SLOPES. A leg re-bids the
+  // instant it lands, because by then the body has moved; on a rig walking two
+  // voxels a tick against a 1.74-voxel step threshold that is EVERY tick, so
+  // chain 0 re-claimed the slot forever and chain 1 never took a single step.
+  // Measured on a 16-voxel ramp: `[leg y221.0] [leg y204.0]` — one foot tracking
+  // the ground it was climbing, the other still welded to the bottom of the
+  // hill. The body height is the average of the planted feet, so the drawn body
+  // hung sixteen voxels under the surface while the collider rode the slope
+  // correctly. On level ground a stuck foot sits at the same height as a moving
+  // one and nothing whatsoever shows, which is why this survived every flat
+  // fixture in the suite and reads in play as "NPCs walk into hills".
+  //
+  // So the slot is AWARDED TO THE NEEDIEST LEG: the largest drift past
+  // threshold wins. That is self-balancing rather than a turn-taking table —
+  // the leg that has gone longest without stepping has by construction drifted
+  // furthest — and it generalises to any leg count, which a hard-coded
+  // alternation would not. Ties keep the list order, so it stays deterministic.
+  if (!bids.empty()) {
+    if (swingingGroup < 0) {
+      const StepBid* best = &bids[0];
+      for (const StepBid& b : bids)
+        if (b.drift > best->drift) best = &b;
+      swingingGroup = best->group;
+    }
+    // Every member of the winning group steps together: that is what makes a
+    // diagonal pair a trot rather than two independent legs.
+    for (const StepBid& b : bids) {
+      if (b.group != swingingGroup) continue;
+      FootState& f = mob.anim_.feet[b.chain];
+      f.swinging = true;
+      f.swingT = 0;
+      f.swingFrom = f.planted;
+      f.swingTo = b.to;
     }
   }
 
@@ -3129,14 +3217,72 @@ void MobSystem::UpdateGait(Mob& mob, const MobDef& def, World& world, float dt) 
       }
     float stance = (g.rideHeight - 1.0f) * legLen;
     float targetY = sumY / (float)nFeet - mob.restSoleY_ + stance;
+    // ---- THE FEET ARE A DETAIL, THE GROUND IS THE TRUTH -------------------
+    //
+    // Deriving body height from the foot average is what makes a voxel
+    // staircase work with no slope code, and it is right up to the point where
+    // the feet stop being able to keep up with the body. They do: a foot
+    // re-plants once it has drifted `stepThreshold * legLength` (1.74 voxels on
+    // this rig) and the swing then takes `stepDuration` to land, while the body
+    // covers two voxels a TICK. On level ground a stale foot is at the same
+    // height as a fresh one and none of this is visible. On a slope every voxel
+    // of staleness is a voxel of height, and the average of one fresh foot and
+    // one a stride behind put the DRAWN body ten voxels under the surface while
+    // the collider rode the slope correctly — which in play is "NPCs walk into
+    // hills", and is what the collider-only version of the ai-slope gate
+    // certified as fixed.
+    //
+    // So the foot average is kept, and BOUNDED against where the body would
+    // stand if its feet were on the ground its own footprint reports. Half a
+    // leg span of authority: enough for the gentle rise and fall of a real
+    // stride and for straddling a step, not enough to bury the creature. This
+    // is a constraint, not a smoothing constant — the ease in EaseBodyY handles
+    // smoothness and could not have fixed this, because the error it was asked
+    // to absorb grows for as long as the mob keeps climbing.
+    const float groundTarget = mob.origin_.y - mob.restSoleY_ + stance;
+    // AND THE AUTHORITY IS ASYMMETRIC, because the two directions are not the
+    // same claim. A foot planted on a HIGHER step legitimately lifts the body —
+    // you stand on the high foot, and that is most of what makes a staircase
+    // read right — so upward it gets as much room as the drift that triggers a
+    // step (`stepThreshold`, 0.3 of a leg). Downward it gets almost none: a
+    // body below the ground its own footprint reports is not a pose, it is the
+    // bug, and the only reason the average ever asks for it is that the feet
+    // are stale.
+    const float upAuthority =
+        std::max(1.0f, legLen * std::max(0.15f, g.stepThreshold));
+    const float downAuthority = std::max(0.5f, legLen * 0.08f);
+    targetY = std::clamp(targetY, groundTarget - downAuthority,
+                         groundTarget + upAuthority);
+    // SANDVOX_GAIT_DEBUG=1: where the body height is actually coming from.
+    // "the drawn body is underground" has at least three causes that look
+    // identical from outside (the ease lagging, the feet not stepping, the rig
+    // offsets wrong), and a number per tick separates them in one run instead
+    // of one hypothesis per run.
+    static const bool kGaitDebug =
+        std::getenv("SANDVOX_GAIT_DEBUG") != nullptr;
+    if (kGaitDebug) {
+      std::printf("gait: origin %.2f body %.2f target %.2f | feet %d/%zu avg "
+                  "%.2f sole %.2f stance %.2f legLen %.2f |",
+                  mob.origin_.y, mob.bodyY_, targetY, nFeet,
+                  mob.anim_.feet.size(), sumY / (float)nFeet, mob.restSoleY_,
+                  stance, legLen);
+      for (size_t c2 = 0; c2 < sk.chains.size() && c2 < mob.anim_.feet.size();
+           c2++)
+        std::printf(" [%s%s%s y%.1f d%.2f]", sk.chains[c2].tag.c_str(),
+                    mob.anim_.feet[c2].valid ? "" : "!",
+                    mob.anim_.feet[c2].swinging ? "~" : "",
+                    mob.anim_.feet[c2].planted.y,
+                    mob.anim_.feet[c2].legLength * g.stepThreshold);
+      std::printf("\n");
+    }
     if (!mob.footInit_) {
       mob.bodyY_ = targetY;
       mob.footInit_ = true;
     } else {
-      mob.bodyY_ += std::clamp(targetY - mob.bodyY_, -0.4f, 0.4f);
+      EaseBodyY(mob, targetY, dt);
     }
   } else {
-    mob.bodyY_ += std::clamp(mob.origin_.y - mob.bodyY_, -0.4f, 0.4f);
+    EaseBodyY(mob, mob.origin_.y, dt);
     mob.footInit_ = true;
   }
   // ---- BODY TILT: FROM THE GROUND, IN THE BODY'S OWN FRAME, CLAMPED -------
@@ -3374,7 +3520,7 @@ void MobSystem::UpdateAnimation(Mob& mob, const MobDef& def, World& world,
     // plus the state's authored offset, and the slope tilt eases back flat.
     // This is the same settle UpdateGait applies when every foot is lost.
     float targetY = mob.origin_.y + (loco ? loco->bodyYOffset : 0.0f);
-    mob.bodyY_ += std::clamp(targetY - mob.bodyY_, -0.4f, 0.4f);
+    EaseBodyY(mob, targetY, dt);
     mob.footInit_ = true;
     mob.bodyUp_ = (mob.bodyUp_ * 0.85f + Vec3{0, 1, 0} * 0.15f).normalized();
     if (mob.bodyUp_.len() < 0.5f) mob.bodyUp_ = {0, 1, 0};
@@ -8598,6 +8744,12 @@ Vec3 MobSystem::MobFacing(uint64_t mobId) const {
 float MobSystem::MobHeading(uint64_t mobId) const {
   for (const Mob& mob : mobs_)
     if (mob.id_ == mobId) return mob.heading_;
+  return 0;
+}
+
+float MobSystem::MobBodyY(uint64_t mobId) const {
+  for (const Mob& mob : mobs_)
+    if (mob.id_ == mobId) return mob.bodyY_;
   return 0;
 }
 

@@ -2213,6 +2213,10 @@ class MobSystem {
   // a ramp" is an ANGLE, and a test that has to infer it from limb transforms
   // is a test nobody will keep honest.
   Vec3 MobBodyUp(uint64_t mobId) const;
+  // The height the body is DRAWN at (Mob::bodyY_), which is not the collision
+  // origin and is the one a player can see. A gate that asserts only on
+  // `MobOrigin` is asserting the collider; ai-slope learned that the hard way.
+  float MobBodyY(uint64_t mobId) const;
   // This body's resolved step-up budget in cells (anim.h LocomotionDef). A
   // gate that hard-codes 2 here is a gate that fails the day a rig is
   // re-authored, which is the trap `AiFlatSpot` exists to avoid for terrain.
@@ -2527,6 +2531,10 @@ class MobSystem {
   // model-space pose in mob.anim.model. Pure float, no grid contact.
   void UpdateAnimation(Mob& mob, const MobDef& def, World& world, float dt);
   void UpdateGait(Mob& mob, const MobDef& def, World& world, float dt);
+  // Ease the DRAWN body height (Mob::bodyY_) toward `targetY`: a rate in
+  // metres per second AND a hard bound on the lag. See the long note at the
+  // definition for why the bound is the load-bearing half.
+  static void EaseBodyY(Mob& mob, float targetY, float dt);
 
   Physics* phys_ = nullptr;
   World* world_ = nullptr;

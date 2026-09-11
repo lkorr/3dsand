@@ -4122,15 +4122,23 @@ Status GateMobBurn(Ctx& c, std::string& detail) {
 // live in tests/baseline.json, not here.
 // ============================================================================
 
-// The humanoid rig the AI gates drive. Chosen by CAPABILITY rather than by
-// name: it has to publish a `held_right` socket or the sword cannot be
-// equipped, and the whole fixture would silently be testing an unarmed mob.
-// The stock player model wins the tie when several qualify.
+// The humanoid rig the AI gates drive. Chosen by CAPABILITY first — it has to
+// publish a `held_right` socket or the sword cannot be equipped and the whole
+// fixture is silently testing an unarmed mob — and the tie goes to `human`.
+//
+// IT USED TO GO TO `mina`, AND THAT QUIETLY MADE EVERY AI GATE A TEST OF A
+// CREATURE NOBODY FIGHTS. It is not a cosmetic difference: mina walks 60
+// voxels a second against the human's 31.5, which is two columns a tick
+// instead of one, and the locomotion failures that matter are all about whether
+// the body can keep up with the ground it is crossing. Measured on the slope
+// fixture, the two rigs disagreed about the SIZE of every number this file
+// asserts. A gate should drive what is in play; when that changes, this
+// function is the one line to change.
 int AiHumanoidDef(const MobSystem& mobs) {
   int best = -1;
   for (size_t i = 0; i < mobs.Defs().size(); i++) {
     if (mobs.Defs()[i].FindSocket("held_right") < 0) continue;
-    if (best < 0 || mobs.Defs()[i].name == "mina") best = (int)i;
+    if (best < 0 || mobs.Defs()[i].name == "human") best = (int)i;
   }
   return best;
 }
@@ -4912,12 +4920,20 @@ Status GateAiSlope(Ctx& c, std::string& detail) {
   // to guess.
   const int kHalfX = 20, kRampLen = 16, kCrestLen = 18;
   const int rampZ0 = spot.z + 8;
-  const int crestY = h0 + kRampLen;
+  // ONE VOXEL OF RISE PER VOXEL OF RUN: a 45-degree hill, which is steep and
+  // walkable. Tried at 3 first, on the reasoning that `terrain` reports this
+  // world at "slope max 3" — and 3 per voxel of run is a 71-degree cliff, which
+  // the drive correctly REFUSES after a few columns and the player could not
+  // walk either. That is a fixture measuring the step rule, not the thing this
+  // gate is for; the rise-per-column number in a terrain report is a maximum
+  // over a whole window and includes its cliff faces.
+  const int kRampRise = 1;
+  const int crestY = h0 + kRampLen * kRampRise;
   {
     std::vector<CellOp> ops;
     for (int dz = 0; dz < kRampLen + kCrestLen; dz++) {
       const int wz = rampZ0 + dz;
-      const int topY = h0 + std::min(dz, kRampLen);
+      const int topY = h0 + std::min(dz, kRampLen) * kRampRise;
       for (int wx = spot.x - kHalfX; wx <= spot.x + kHalfX; wx++) {
         // From each column's OWN terrain height, so undulation cannot leave the
         // ramp floating over a dip or buried in a rise.
@@ -4980,7 +4996,7 @@ Status GateAiSlope(Ctx& c, std::string& detail) {
   for (int i = 0; i < 120; i++) {
     bool all = true;
     for (int dz = 0; dz < kRampLen; dz++) {
-      const IVec3 cell{spot.x, h0 + dz, rampZ0 + dz};
+      const IVec3 cell{spot.x, h0 + dz * kRampRise, rampZ0 + dz};
       if (cachedSolid(cell)) continue;
       all = false;
       c.world.RequestChunkFetch({cell.x >> 4, cell.y >> 4, cell.z >> 4});
@@ -4991,7 +5007,7 @@ Status GateAiSlope(Ctx& c, std::string& detail) {
   int rampSeen = 0, rampCols = 0;
   for (int dz = 0; dz < kRampLen; dz++) {
     rampCols++;
-    if (cachedSolid(IVec3{spot.x, h0 + dz, rampZ0 + dz})) rampSeen++;
+    if (cachedSolid(IVec3{spot.x, h0 + dz * kRampRise, rampZ0 + dz})) rampSeen++;
   }
 
   // ---- the run -----------------------------------------------------------
@@ -5005,9 +5021,27 @@ Status GateAiSlope(Ctx& c, std::string& detail) {
   // target deep enough onto the flat means the band can only be met from the
   // crest itself.
   const int targetZ = rampZ0 + kRampLen + 12;
-  c.mobs.SetPlayerActor(
-      Vec3{(float)spot.x, (float)crestY + 8.0f, (float)targetZ}, 3.0f, 17.0f,
-      true);
+  // ---- THE TARGET HAS TO BE VISIBLE FROM THE BOTTOM OF THE RAMP ----------
+  // A creature standing below a plateau cannot see anything standing ON it:
+  // the sight ray grazes the crest lip, which is solid, and `requireLos` then
+  // reports no target at all. The gate duly said "climbed 0.0" about a mob that
+  // was idle because it had nothing to walk towards — a PERCEPTION failure
+  // wearing a locomotion failure's clothes, which is the exact confusion
+  // ai-approach documents at length about its wall.
+  //
+  // So the target is lifted until the ray clears the lip. It floats, and that
+  // is fine: everything the duelist decides with it -- the stand-off band, the
+  // attack reach -- is measured PLANAR, so the height changes nothing except
+  // whether the creature can see the carrot it is being asked to climb towards.
+  // `targeted` is reported, so if this ever stops working it names itself.
+  const float mobChest = (float)(h0 + 1) + def.worldSize.y * 0.5f;
+  const float lipT = (float)(rampZ0 + kRampLen - spot.z) /
+                     std::max(1.0f, (float)(targetZ - spot.z));
+  const float targetY =
+      std::max((float)crestY + 8.0f,
+               mobChest + ((float)crestY + 3.0f - mobChest) / std::max(lipT, 0.1f));
+  c.mobs.SetPlayerActor(Vec3{(float)spot.x, targetY, (float)targetZ}, 3.0f,
+                        17.0f, true);
 
   std::string why;
   const uint64_t id =
@@ -5034,8 +5068,9 @@ Status GateAiSlope(Ctx& c, std::string& detail) {
   // The SPAWN height, so `climbed` is the whole climb rather than whatever was
   // left of it when the measuring started.
   const float startY = (float)(h0 + 1);
-  float maxDepth = 0, maxTiltDeg = 0, topY = startY;
+  float maxDepth = 0, maxDrawnDepth = 0, maxTiltDeg = 0, topY = startY;
   int buriedTicks = 0, deepestTick = -1;
+  int drawnBuriedTicks = 0, drawnDeepestTick = -1;
   Vec3 worstAt{};
   int ranTicks = 0;
   int intentTicks[(int)ai::Intent::Count] = {};
@@ -5047,6 +5082,7 @@ Status GateAiSlope(Ctx& c, std::string& detail) {
     const Vec3 o = c.mobs.MobOrigin(id);
     if (o.x == 0 && o.y == 0 && o.z == 0) break;   // despawned
     topY = std::max(topY, o.y);
+    const float drawnY = c.mobs.MobBodyY(id);
     // ATTRIBUTION, not a bare "climbed 0". A creature that never saw its
     // target, one that saw it and refused the slope, and one that climbed and
     // slid back down all report the same zero, and only the first is not a
@@ -5058,13 +5094,17 @@ Status GateAiSlope(Ctx& c, std::string& detail) {
       if (br->path.valid) everPathed = true;
     }
     nearestZ = std::min(nearestZ, (float)targetZ - o.z);
-    if ((i % 100) == 0 && br != nullptr)
+    // Dense over the first ticks and sparse after: the climb IS the first
+    // twenty ticks on a rig that walks two columns a tick, and an every-100
+    // sample steps straight over the only part of the run under test.
+    if ((i < 20 || (i % 100) == 0) && br != nullptr)
       std::printf(
-          "    ai-slope t%3d: at (%+6.1f,%+6.1f,%+6.1f) dz %5.1f  %-9s tgt %d "
+          "    ai-slope t%3d: at (%+6.1f,%+6.1f,%+6.1f) drawn%+7.2f dz %5.1f  "
+          "%-9s tgt %d "
           " path %2zu/%2zu  cols %u probed / %u unknown / %u blocked / %u "
           "steep\n",
           i, o.x - (float)spot.x, o.y - startY, o.z - (float)spot.z,
-          (float)targetZ - o.z, ai::IntentName(br->intent),
+          drawnY - o.y, (float)targetZ - o.z, ai::IntentName(br->intent),
           br->hasTarget ? 1 : 0, br->path.cursor, br->path.pts.size(),
           br->path.colsProbed, br->path.colsUnknown, br->path.colsBlocked,
           br->path.colsSteep);
@@ -5074,11 +5114,21 @@ Status GateAiSlope(Ctx& c, std::string& detail) {
     // step-up or a body ten voxels into a hillside, and those are different
     // bugs. Measured at the footprint's own columns, from the SAME mirror the
     // locomotion reads (see the note on cachedSolid above).
+    //
+    // AND MEASURED TWICE, AT BOTH HEIGHTS THE CREATURE HAS. `MobOrigin` is the
+    // COLLIDER; `MobBodyY` is where the body is DRAWN, and every limb transform
+    // is built from the second one. The first version of this gate asserted
+    // only on the collider, reported a clean 0.00, and was reported from the
+    // game as having changed nothing — because it had not: the collision origin
+    // rode the slope correctly while the visible creature stayed buried in it,
+    // held back by a body-height ease fifteen times too slow to follow the
+    // ground. A gate that measures the half of a fix that is easy to measure is
+    // worse than no gate, because it certifies the bug.
     const float hx = std::max(0.0f, def.worldSize.x * 0.5f - 0.5f);
     const float hz = std::max(0.0f, def.worldSize.z * 0.5f - 0.5f);
     const float cx = o.x + def.worldSize.x * 0.5f;
     const float cz = o.z + def.worldSize.z * 0.5f;
-    float depth = 0;
+    float depth = 0, drawnDepth = 0;
     for (int iz = -1; iz <= 1; iz++)
       for (int ix = -1; ix <= 1; ix++) {
         const int wx = ifloor(cx + hx * (float)ix);
@@ -5086,13 +5136,19 @@ Status GateAiSlope(Ctx& c, std::string& detail) {
         const int s = surfaceAt(wx, wz, ifloor(o.y) + 4);
         if (s == INT32_MIN) continue;
         depth = std::max(depth, (float)s - o.y);
+        drawnDepth = std::max(drawnDepth, (float)s - drawnY);
       }
     if (depth > maxDepth) {
       maxDepth = depth;
       deepestTick = i;
       worstAt = o;
     }
+    if (drawnDepth > maxDrawnDepth) {
+      maxDrawnDepth = drawnDepth;
+      drawnDeepestTick = i;
+    }
     if (depth > 0.01f) buriedTicks++;
+    if (drawnDepth > 0.01f) drawnBuriedTicks++;
 
     const Vec3 up = c.mobs.MobBodyUp(id);
     const float dot = std::clamp(up.y / std::max(up.len(), 1e-4f), -1.0f, 1.0f);
@@ -5116,21 +5172,36 @@ Status GateAiSlope(Ctx& c, std::string& detail) {
   const int stepUp = c.mobs.MobStepUpCells(id);
   const int minStepUp = (int)BaselineNumber("aiSlopeMinStepUpCells", 4);
 
+  // TWO ALLOWANCES, because the two heights are making different promises.
+  // The COLLIDER must be exactly on the surface — "do not be inside the ground"
+  // is not a preference, and it measures 0.00. The DRAWN body may dip a little
+  // as a foot plants on lower ground, which is what a stride looks like; what
+  // it may not do is follow feet that have gone stale down into a hillside.
+  // A tenth of a metre on a 1.7 m figure is the sole grazing, not a creature
+  // walking through a hill.
+  const float maxDrawnAllowed =
+      (float)BaselineNumber("aiSlopeMaxDrawnDepthVox", 1.2);
   const bool ok = rampSeen == rampCols && climbed >= minClimb &&
-                  maxDepth <= maxDepthAllowed && maxTiltDeg <= maxTiltAllowed &&
-                  stepUp >= minStepUp;
+                  maxDepth <= maxDepthAllowed &&
+                  maxDrawnDepth <= maxDrawnAllowed &&
+                  maxTiltDeg <= maxTiltAllowed && stepUp >= minStepUp;
   RecordObserved("aiSlopeClimbedVox", (double)climbed);
   RecordObserved("aiSlopeMaxDepthObservedVox", (double)maxDepth);
+  RecordObserved("aiSlopeMaxDrawnDepthObservedVox", (double)maxDrawnDepth);
   RecordObserved("aiSlopeMaxTiltObservedDeg", (double)maxTiltDeg);
   detail = Format(
-      "ramp %d/%d columns in mirror (1 vox/col over %d, crest +%d), climbed "
-      "%.1f vox of %d (>= %.1f), deepest below surface %.2f vox (<= %.2f) at "
-      "tick %d, %d/%d ticks with the body inside the ground, max body tilt "
+      "ramp %d/%d columns in mirror (%d vox/col over %d, crest +%d), climbed "
+      "%.1f vox of %d (>= %.1f), collider deepest below surface %.2f vox "
+      "(<= %.2f) at tick %d (%d/%d ticks in the ground), DRAWN body deepest "
+      "%.2f vox (<= %.2f) at tick %d (%d/%d ticks in the ground), max body tilt "
       "%.1f deg (<= %.1f), step budget %d cells (>= %d), relief %d, %d ticks "
       "run, targeted %d, pathed %d, closed to dz %.1f, intents "
       "idle/face/appr/hold/circ/atk %d/%d/%d/%d/%d/%d",
-      rampSeen, rampCols, kRampLen, kRampLen, climbed, kRampLen, minClimb,
-      maxDepth, maxDepthAllowed, deepestTick, buriedTicks, budget, maxTiltDeg,
+      rampSeen, rampCols, kRampRise, kRampLen, kRampLen * kRampRise, climbed,
+      kRampLen * kRampRise, minClimb,
+      maxDepth, maxDepthAllowed, deepestTick, buriedTicks, budget,
+      maxDrawnDepth, maxDrawnAllowed, drawnDeepestTick, drawnBuriedTicks,
+      budget, maxTiltDeg,
       maxTiltAllowed, stepUp, minStepUp, relief, ranTicks,
       everTargeted ? 1 : 0, everPathed ? 1 : 0, nearestZ, intentTicks[0],
       intentTicks[1], intentTicks[2], intentTicks[3], intentTicks[4],
