@@ -199,6 +199,64 @@ fn poolVoxAt(base : u32, dims : vec3<i32>, p : vec3<i32>) -> u32 {
   return (pool[w] >> ((idx & 1u) * 16u)) & 0xFFFFu;
 }
 
+// ---- the smooth body normal (2026-09-11) ------------------------------------
+//
+// A limb's face normal comes from the DDA's last-stepped axis, so a rounded arm
+// made of 8 mm skin voxels shades as a staircase of six flat tones — the same
+// defect `shadeViscous` fixes for blood in raymarch.wgsl, and the same one the
+// Grimorium renderer's slime shader addresses by treating the body as a density
+// field. The cure is the same one: differentiate the OCCUPANCY field the brick
+// already stores and shade against its gradient, so neighbouring micro voxels
+// agree on their normal and the cube structure dissolves.
+//
+// 26 taps (the 3^3 neighbourhood less the centre) weighted by 1/|d|, NOT a
+// 6-tap central difference: on a binary field a 6-tap gradient can only take
+// values in {-1, 0, 1} per axis, which quantises the normal to the same 26
+// directions the staircase already had. The diagonal taps are what make it
+// continuous.
+//
+// A BLEND, not a replacement. At 1.0 a one-voxel spur reads as a sphere and a
+// deliberately square limb (a shield, an iron pauldron) loses its edges; the
+// face normal carries the silhouette's intent and the gradient carries the
+// curvature. BODY_SMOOTH_N is the mix.
+//
+// Declared here rather than as a TUNE_ row for CLAUDE.md's reason: a constant
+// only one shader reads is declared in that shader. It is NOT in common.wgsl,
+// where it would cost every other shader a SPIR-V cache miss.
+//
+// COST: 26 pool reads on the primary body fragment only — this shader has no
+// secondary rays. Set to 0.0 and the whole block const-folds away, leaving the
+// face normal bit-identical to what shipped before.
+const BODY_SMOOTH_N : f32 = 0.55;
+
+fn bodySolidAt(base : u32, dims : vec3<i32>, p : vec3<i32>) -> f32 {
+  // Outside the brick is EMPTY, deliberately: that is what makes a silhouette
+  // voxel's gradient point outward and round the edge, instead of the brick's
+  // bounding box reading as a solid wall.
+  if (p.x < 0 || p.y < 0 || p.z < 0 ||
+      p.x >= dims.x || p.y >= dims.y || p.z >= dims.z) { return 0.0; }
+  return select(0.0, 1.0, (poolVoxAt(base, dims, p) & 0xFFu) != 0u);
+}
+
+// Object-space outward normal from the occupancy gradient, or the zero vector
+// when the neighbourhood is uniform (a fully buried voxel, or an isolated one)
+// — the caller keeps its face normal in that case rather than normalizing 0.
+fn bodyFieldNormal(base : u32, dims : vec3<i32>, c : vec3<i32>) -> vec3f {
+  var g = vec3f(0.0);
+  for (var dz = -1; dz <= 1; dz++) {
+    for (var dy = -1; dy <= 1; dy++) {
+      for (var dx = -1; dx <= 1; dx++) {
+        if (dx == 0 && dy == 0 && dz == 0) { continue; }
+        let d = vec3f(f32(dx), f32(dy), f32(dz));
+        let s = bodySolidAt(base, dims, c + vec3<i32>(dx, dy, dz));
+        // Density rises INTO the body, so the outward direction is -grad.
+        g -= d * (s / length(d));
+      }
+    }
+  }
+  return g;
+}
+
 struct FSOut {
   @location(0) color : vec4f,
   @builtin(frag_depth) depth : f32,
@@ -290,8 +348,19 @@ fn fs(in : VSOut) -> FSOut {
   if (hitMat == 0u) { discard; }
 
   // ---- shading ----
-  // Object-space face normal from the last-stepped axis, back to world space.
-  let nLocal = axisVec(axis, -f32(axisPickI(stepv, axis)));
+  // Object-space face normal from the last-stepped axis, back to world space,
+  // rounded toward the occupancy field's gradient (see BODY_SMOOTH_N).
+  let nFace = axisVec(axis, -f32(axisPickI(stepv, axis)));
+  var nLocal = nFace;
+  if (BODY_SMOOTH_N > 0.0) {
+    let g = bodyFieldNormal(in.base, dims, c);
+    let gl = length(g);
+    // A uniform neighbourhood gives g == 0 and no opinion; keep the face
+    // normal rather than normalizing a zero vector.
+    if (gl > 1e-4) {
+      nLocal = normalize(mix(nFace, g / gl, BODY_SMOOTH_N));
+    }
+  }
   let n = quatRotate(in.quat, nLocal);
 
   let mat = materials[hitMat];

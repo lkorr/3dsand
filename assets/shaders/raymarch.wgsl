@@ -1329,6 +1329,119 @@ const PK_FLOWER   : u32 = 2u;
 const PK_MUSHROOM : u32 = 3u;
 const PK_FERN     : u32 = 4u;
 
+// ---- plant-kind compile gates (2026-09-11) ---------------------------------
+// `tracePlant` adds 144 B/thread of register SPILL to the raymarch fragment —
+// +160 with plants, +16 without, measured by --shader-stats with
+// `microMaxPerRay` moved in tuning.json — and that spill is 7.41 ms (47%) of
+// the `meadow` camera's frame even though the frame evaluates ZERO plants
+// (docs/PLAN_frame_perf.md). It is paid by every pixel, sky included, because
+// the call sits inside trace()'s DDA loop where its live ranges interleave
+// with the march's.
+//
+// These four consts partition that 144 B by BRANCH: fold one to false, run
+// --shader-stats, read the local-memory line. All true is the shipping shader
+// and is bit-identical to what shipped before they existed.
+//
+// They are declared HERE and not in common.wgsl on purpose: a constant only
+// one shader reads belongs in that shader, and a common.wgsl edit is a SPIR-V
+// cache miss for all 23 of them (CLAUDE.md measured it at 536 s).
+const PLANT_GRASS_ON : bool = true;
+const PLANT_FLOWER_ON : bool = true;
+const PLANT_SHROOM_ON : bool = true;
+const PLANT_FERN_ON : bool = true;
+
+// ============================================================================
+// DEFERRED DETAIL — why the detail model is resolved AFTER the march
+// ============================================================================
+// A cell whose material carries MATF_MICRO does not shade as a voxel: a finer
+// model stands in for it (a brick flipbook, an analytic plant, and — by
+// construction — anything later that spans more than one cell: a banner, a
+// chain, a signpost). Resolving one is a large, register-hungry kernel, and
+// until 2026-09-11 it ran from INSIDE trace()'s DDA loop.
+//
+// That placement, not the kernel, was the cost. The march carries ~25
+// loop-live values (tMax, tDelta, cell, tCur, stepv, the per-chunk cache, the
+// media accumulators) plus a 26-field `Hit`, and all of them are live ACROSS
+// the call. The allocator caps the fragment at 168 registers and spills the
+// rest — so the loop's own state moved to scratch memory and every iteration
+// of every ray in the frame paid the fill traffic, INCLUDING rays that never
+// meet a plant. Measured (RTX 3060 Ti, 1080p, `--render-budget --budget-cams
+// meadow`): 7.41 ms of a 15.70 ms frame, 47%, on a frame whose own counters
+// read rmPlantEvals = 0. Register count was 168 with plants and without;
+// local memory was +160 B/thread with and +16 B without.
+//
+// So the fix is not to make evaluations cheaper or rarer — there were none to
+// make cheaper. It is to get the kernel OUT of the loop:
+//
+//   PHASE 1 (in the DDA, below in trace()): a primary ray that enters a detail
+//     cell within the LOD distance does NOT evaluate it. It records the cell
+//     and its entry t in a fixed set of scalars and keeps marching, treating
+//     the cell as air — which is what a MISS already did, and a miss is the
+//     overwhelmingly common outcome (a grass cell is mostly air).
+//   PHASE 2 (at trace()'s tail): walk the records in t order, evaluate each,
+//     and take the first hit nearer than the opaque hit the march resolved.
+//
+// The registers phase 2 needs are then free — the march's loop state is dead
+// by the time it runs — and any residual spill is paid only by the pixels that
+// actually recorded something, instead of by the sky.
+//
+// FOUR PROPERTIES OF THE OLD PLACEMENT THAT THIS HAS TO KEEP, all of which are
+// load-bearing and none of which are obvious:
+//
+//   * BUDGET. `render.microMaxPerRay` bounds how many detail models one ray
+//     may resolve, and once it is spent the next detail cell is treated as a
+//     SOLID cube, not as air — a ray that flew on through would punch a hole
+//     through a whole meadow. Phase 1 charges the budget at RECORD time and
+//     falls through to the plain-solid branch once it is spent, so the bound
+//     and its failure mode are exactly what they were.
+//   * ONE EVALUATION PER TILE PLANT. A fern or a big toadstool is one organism
+//     across a 3x3xH footprint and tracePlant intersects all of it in one
+//     call, so a ray crossing four of its cells must evaluate it once. The old
+//     code kept a one-slot memo (a whole MicroHit + key + t, ~13 live values)
+//     in the march; phase 1 compares the tile's KEY against the last record
+//     and does not record it twice, which is the same collapse for one u32.
+//     A COLUMN plant is NOT collapsed — tracePlant clips it to one cell, so
+//     the collapse would delete every cell above the first. See plantTileKey.
+//   * THE CLIP BOUND IS ALSO THE FOOTPRINT CULL BOUND. tracePlant derives its
+//     per-blade XZ reject box from `entry.xz + rd.xz * tHiIn`. Handing it 1e9
+//     blows that box up to the whole world and silently disables the cull that
+//     makes the blade loop cheap. A COLUMN plant's bound is the ray's exit
+//     from the CELL; a TILE plant's is 1e9 because plantTileAt already bounds
+//     the footprint. Phase 2 rebuilds the cell exit from the cell corner —
+//     the march's tMax is gone by then, and storing it would be four more
+//     live values in the loop for something two multiplies reproduce.
+//   * THE MODEL IS CLIPPED TO THE CELLS THAT EXIST. A hit that lands in a cell
+//     worldgen never painted (dug out, cut by a trunk) is not reported.
+//
+// And one that is NEW, because marching through a cell the ray then turns out
+// to have hit is new: the volumetrics accumulated BEHIND the winning surface
+// have to be unwound. See the unwind block in phase 2.
+//
+// DETAIL_SLOTS is the number of records the ray can hold. They are separate
+// scalars and not an array on purpose: WGSL puts a dynamically indexed
+// var<private> or function-local array in local memory, which is the exact
+// thing this change exists to remove. `render.microMaxPerRay` is clamped to
+// this — raising the knob past DETAIL_SLOTS buys nothing.
+//
+// WHERE A NEW MULTI-CELL MODEL PLUGS IN — a banner, a chain, a signpost, any
+// prefab that is one object across several cells. Nothing here is plant-shaped;
+// the branch keys on MATF_MICRO and the only per-kind decisions are three, all
+// in one place each:
+//   1. phase 1's LOD arm: how far out does the model become a solid proxy, and
+//      which of its cells is the proxy (a tile plant's centre column).
+//   2. phase 1's `key`: the model's IDENTITY, so a ray crossing four of its
+//      cells records it once and spends one budget slot. Return 0 for a model
+//      that really is per-cell. Any hash family works as long as it ors in a 1
+//      so it can never collide with the 0 a per-cell model records under.
+//   3. phase 2's clip bound: the extent tracePlant/traceMicro is allowed to
+//      intersect, which is ALSO the footprint cull bound. A model that bounds
+//      its own footprint passes 1e9; one that does not must pass the ray's
+//      exit from whatever it IS bounded to.
+// A model that reports a hit outside the cell the ray entered also wants
+// phase 2's `isTile` arm, which is what decides whether an unpainted cell
+// under the hit clips the model or is a rounding artifact.
+const DETAIL_SLOTS : i32 = 4;
+
 struct PlantDef {
   kind : u32,
   body : u32, tip : u32, accent : u32, accent2 : u32, stem : u32,
@@ -1365,24 +1478,49 @@ fn plantP(d : PlantDef, i : u32) -> f32 {
 // Which tile plant covers this cell. Salt/geometry by kind so the renderer and
 // worldgen ask plantTileAt the same question (the PLANT_* consts in
 // common.wgsl are the shared truth; the def's tile/foot must equal them).
-fn plantTileOf(d : PlantDef, cell : vec3<i32>) -> PlantTile {
-  if (d.kind == PK_FERN) {
+//
+// These three take the KIND rather than the whole PlantDef so that phase 1 of
+// the deferred resolve (trace()'s DDA) can answer "is this the tile centre" and
+// "which plant is this" from two pool words instead of materializing all
+// thirteen PlantDef fields inside the march. See DEFERRED DETAIL below.
+fn plantTileOf(kind : u32, cell : vec3<i32>) -> PlantTile {
+  if (kind == PK_FERN) {
     return plantTileAt(cell.x, cell.z, R.seed, PLANT_FERN_SALT, PLANT_FERN_TILE,
                        PLANT_FERN_FOOT, PLANT_FERN_MINH, PLANT_FERN_MAXH, 100u);
   }
   return plantTileAt(cell.x, cell.z, R.seed, PLANT_SHROOM_SALT, PLANT_SHROOM_TILE,
                      PLANT_SHROOM_FOOT, PLANT_SHROOM_MINH, PLANT_SHROOM_MAXH, 100u);
 }
-// Per-ray memo key for a tile plant: one evaluation per (tile, material).
-fn plantTileKey(d : PlantDef, cell : vec3<i32>, mat : u32) -> u32 {
-  let tile = select(PLANT_SHROOM_TILE, PLANT_FERN_TILE, d.kind == PK_FERN);
+// Identity of a tile plant: one RECORD, and so one evaluation, per (tile,
+// material) per ray. See the record block in trace()'s phase 1.
+fn plantTileKey(kind : u32, cell : vec3<i32>, mat : u32) -> u32 {
+  let tile = select(PLANT_SHROOM_TILE, PLANT_FERN_TILE, kind == PK_FERN);
   let tx = plantFdiv(cell.x, tile);
   let tz = plantFdiv(cell.z, tile);
   return hash3(bitcast<u32>(tx) ^ (mat * 0x9E37u), bitcast<u32>(tz), 0x71E5u) | 1u;
 }
+// THERE IS NO EQUIVALENT FOR A COLUMN PLANT, and the reason is worth keeping:
+// one was written on 2026-09-11 (a `plantColumnKey`, same shape as the tile key
+// above) on the argument that grass and flowers are re-evaluated in every cell
+// a ray crosses and the wind sample and plantColumnExtent walk are per-COLUMN
+// constants. The argument is true and the memo is still wrong, because it
+// mistakes what tracePlant returns.
+//
+// tracePlant's column branch reconstructs the whole plant but intersects only
+// THE SEGMENT INSIDE THE CELL IT WAS CALLED FOR: yTop is min(1, sH - rise0),
+// the two Y half-planes clip to [0, yTop] in CELL-LOCAL coordinates, and the
+// chord is clamped into that cell's own XZ footprint. So a "remembered" hit
+// can only ever lie in the cell it was computed in, and every later cell of
+// the column resolves to a memo MISS — the ray passes through the four cells
+// above the one it entered and their blades are never drawn. It is visible in
+// the plants gate's own picture as horizontal bands of missing blade at every
+// cell boundary of the stand (37k pixels over 24 SAD, 1.8% of the frame).
+//
+// A column memo therefore needs tracePlant to intersect the WHOLE column in
+// one call first. That is a different change, and a bigger one.
 // Is this cell the centre column of its tile plant (the LOD stand-in)?
-fn plantTileCentre(d : PlantDef, cell : vec3<i32>) -> bool {
-  let pt = plantTileOf(d, cell);
+fn plantTileCentre(kind : u32, cell : vec3<i32>) -> bool {
+  let pt = plantTileOf(kind, cell);
   return pt.cx == cell.x && pt.cz == cell.z;
 }
 
@@ -1679,7 +1817,7 @@ fn tracePlant(b : MicroBrick, d : PlantDef, mat : u32, cell : vec3<i32>,
     // Plant-local ray origin: the plant's base is the bottom of its first cell.
     let o = entry + vec3f(0.0, rise0, 0.0);
 
-    if (d.kind == PK_GRASS) {
+    if (PLANT_GRASS_ON && d.kind == PK_GRASS) {
       let halfW = plantP(d, 0u);
       let thick = plantP(d, 1u);
       let taper = plantP(d, 2u);
@@ -1921,7 +2059,7 @@ fn tracePlant(b : MicroBrick, d : PlantDef, mat : u32, cell : vec3<i32>,
   }
 
   // ======================= mushrooms =======================================
-  if (d.kind == PK_MUSHROOM) {
+  if (PLANT_SHROOM_ON && d.kind == PK_MUSHROOM) {
     let capRMin = plantP(d, 0u);
     let capRMax = plantP(d, 1u);
     let capHr = plantP(d, 2u);
@@ -1980,7 +2118,7 @@ fn tracePlant(b : MicroBrick, d : PlantDef, mat : u32, cell : vec3<i32>,
     }
     // SINGLE big toadstool: a tile plant, stem in the centre column, cap over
     // the whole footprint.
-    let pt = plantTileOf(d, cell);
+    let pt = plantTileOf(d.kind, cell);
     let half = d.foot / 2;
     if (abs(cell.x - pt.cx) > half || abs(cell.z - pt.cz) > half) { return out; }
     let cc = vec3<i32>(pt.cx, cell.y, pt.cz);
@@ -2023,7 +2161,7 @@ fn tracePlant(b : MicroBrick, d : PlantDef, mat : u32, cell : vec3<i32>,
   }
 
   // ======================= fern: a rosette of arching fronds ===============
-  if (d.kind == PK_FERN) {
+  if (PLANT_FERN_ON && d.kind == PK_FERN) {
     let frondCount = max(u32(plantP(d, 0u)), 1u);
     let frondLen = plantP(d, 1u);
     let rise = plantP(d, 2u);
@@ -2033,7 +2171,7 @@ fn tracePlant(b : MicroBrick, d : PlantDef, mat : u32, cell : vec3<i32>,
     let swayScale = plantP(d, 6u);
     let rachisW = plantP(d, 7u);
     let spreadJitter = plantP(d, 8u);
-    let pt = plantTileOf(d, cell);
+    let pt = plantTileOf(d.kind, cell);
     let half = d.foot / 2;
     if (abs(cell.x - pt.cx) > half || abs(cell.z - pt.cz) > half) { return out; }
     let cc = vec3<i32>(pt.cx, cell.y, pt.cz);
@@ -2168,13 +2306,26 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool) -> Hit {
   out.micN = vec3f(0.0, 1.0, 0.0);
   out.micSmooth = 0u;
   out.micKey = 0u;
-  // Tile-plant memo (see the MICROF_PLANT branch below): a fern or a big
-  // toadstool is ONE plant across a 3x3xH footprint, so it is intersected
-  // once per ray and the result is carried across every cell of that tile.
-  var pKey = 0u;
-  var pHit : MicroHit;
-  pHit.hit = false;
-  var pT = 0.0;
+  // ---- DEFERRED DETAIL RECORDS (phase 1; see DEFERRED DETAIL above) --------
+  // Everything the march needs to remember about a detail cell it walked
+  // through without resolving: the cell, packed into the window-local 10 bits
+  // per axis the residency window can address, and the t at which the ray
+  // entered it. Records are written in increasing t (the DDA visits cells in
+  // order), which is what lets phase 2 stop at the first hit.
+  //
+  // `detKey` is the last recorded plant's identity — the collapse that keeps a
+  // ray from spending its whole budget on the four cells of ONE tuft. It is
+  // 0 for a brick, which never collapses (a brick IS per-cell).
+  //
+  // `detTau`/`detFire` snapshot the media accumulated in FRONT of the first
+  // record, so a winning hit can unwind the plume the march kept walking
+  // through behind it.
+  var detN = 0;
+  var detKey = 0u;
+  var det0 = 0u;  var det1 = 0u;  var det2 = 0u;  var det3 = 0u;
+  var detT0 = 0.0; var detT1 = 0.0; var detT2 = 0.0; var detT3 = 0.0;
+  var detTau = 0.0;
+  var detFire = 0.0;
 
   // ---- micro-detail budget for THIS ray ----
   // `wantMedia` is exactly "this is the primary camera ray" at every call site
@@ -2187,7 +2338,7 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool) -> Hit {
   // correctly (grass shadows at 6 cm are sub-pixel at any normal viewing
   // distance) and costs nothing, where marching a brick per shadow ray would
   // multiply the most expensive ray in the frame by 3*subdiv.
-  var microBudget = select(0, TUNE_MICRO_MAX_PER_RAY, wantMedia);
+  let detMax = select(0, min(TUNE_MICRO_MAX_PER_RAY, DETAIL_SLOTS), wantMedia);
 
   var rd = rdIn;
   if (abs(rd.x) < 1e-6) { rd.x = select(-1e-6, 1e-6, rd.x >= 0.0); }
@@ -2443,7 +2594,7 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool) -> Hit {
         out.axis = axis;
         out.sgn = sign(rd[axis]);
         out.word = synthWordAt(ptEntry, cell, ptSeed());
-        return out;
+        break;   // to the deferred-detail resolve at the tail, never past it
       } else if (!wantMedia && (materials[sMat].flags & MATF_MICRO) != 0u) {
         // A chunk of nothing but grass, seen by a shadow ray: passes straight
         // through, per the micro shadow policy at the top of trace().
@@ -2654,29 +2805,46 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool) -> Hit {
           out.tsMat = mat;
         }
         // fall through and keep marching
-      } else if (microBudget > 0 && (materials[mat].flags & MATF_MICRO) != 0u &&
+      } else if (detN < detMax && (materials[mat].flags & MATF_MICRO) != 0u &&
                  microBricks[mat].base != MICRO_NONE) {
-        // ---- static micro-detail: substitute a subdiv^3 model for this cell --
-        // See traceMicro. The cell is an ordinary solid voxel as far as the sim
-        // is concerned; only the RAY treats it as a finer model.
+        // ---- static micro-detail: substitute a finer model for this cell ----
+        // See traceMicro and tracePlant. The cell is an ordinary solid voxel as
+        // far as the sim is concerned; only the RAY treats it as a finer model.
+        //
+        // PHASE 1 ONLY (see DEFERRED DETAIL, next to the PK_* constants). The
+        // model is NOT evaluated here — the register pressure of doing so
+        // inside this loop is what spilled the march. Two decisions are taken,
+        // and both are cheap enough to keep in the march:
         //
         // LOD: past TUNE_MICRO_LOD_DIST a world cell is roughly one pixel, so
         // the nested march is spending 3*subdiv steps to decide the colour of a
         // sub-pixel — the model's silhouette cannot survive the sample anyway.
         // Beyond it the cell shades as a plain voxel, which is not merely
         // cheaper but the SAME answer averaged, and it keeps distant meadows
-        // reading as continuous ground instead of dissolving into stipple.
+        // reading as continuous ground instead of dissolving into stipple. That
+        // is an OPAQUE hit, so it has to be taken in the march: deferring it
+        // would let the ray keep accumulating media behind a solid surface.
+        //
+        // RECORD: everything nearer than the LOD is written to a record slot
+        // and the ray keeps going, treating the cell as air.
         rsAdd(RS_MICRO_ENTER, 1u);
         let mb = microBricks[mat];
         let isPlant = (mb.flags & MICROF_PLANT) != 0u;
-        var pd : PlantDef;
-        if (isPlant) { pd = plantDefOf(mb); }
-        let tileMode = isPlant && pd.tile != 0;
+        // Two pool words, not a whole PlantDef. plantDefOf unpacks thirteen
+        // fields and every one of them would be live across the rest of the
+        // step; the LOD decision needs the kind and the tile size only, and
+        // phase 2 materializes the rest where there is room for it.
+        var pKind = 0u;
+        var pTile = 0;
+        if (isPlant) {
+          pKind = microPool[mb.base] & 0xFFu;
+          pTile = i32((microPool[mb.base + 1u] >> 16u) & 0xFFu);
+        }
+        let tileMode = isPlant && pTile != 0;
         // A COLUMN plant (grass, flower, small mushroom) takes the shorter of
         // the two cuts: its blades are sub-pixel long before its cell is, and
-        // an evaluation is a wind sample plus six to eight blade tests, paid
-        // for every cell a grazing ray crosses up to microBudget. A tile plant
-        // is 30-50 cm of geometry and keeps TUNE_MICRO_LOD_DIST.
+        // an evaluation is a wind sample plus six to eight blade tests. A tile
+        // plant is 30-50 cm of geometry and keeps TUNE_MICRO_LOD_DIST.
         let lodDist = select(TUNE_MICRO_LOD_DIST,
                              min(TUNE_MICRO_LOD_DIST, TUNE_PLANT_LOD_DIST),
                              isPlant && !tileMode);
@@ -2684,88 +2852,70 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool) -> Hit {
           // A tile plant's footprint is mostly air: past the LOD only its
           // CENTRE column stands in as the solid proxy, the eight outer
           // columns pass through as air (or a distant fern is a 30 cm cube).
-          if (!(tileMode && !plantTileCentre(pd, cell))) {
+          if (!(tileMode && !plantTileCentre(pKind, cell))) {
             out.hit = true;
             out.t = tCur;
             out.cell = cell;
             out.axis = axis;
             out.sgn = sign(rd[axis]);
             out.word = w;
-            return out;
+            break;
           }
         } else {
-          // Cell-local entry point. tCur is where the ray crossed INTO this
-          // cell (the DDA sets it at the step that arrived here), so ro +
-          // rd*tCur minus the cell corner is a 0..1 coordinate on each axis.
-          // tMax still holds the NEXT boundary on each axis, so its minimum
-          // is where the ray leaves this cell — the clip for a plant test.
-          let entry = clamp((ro + rd * tCur) - vec3f(cell), vec3f(0.0), vec3f(1.0));
-          let tExitCell = min(tMax.x, min(tMax.y, tMax.z));
-          var mh : MicroHit;
-          mh.hit = false;
-          var evaluated = true;
-          // ONE evaluation per (tile, material) per ray for a tile plant,
-          // unclipped; every later cell of the same tile only asks whether the
-          // remembered hit lies inside it. A hit that falls in a cell worldgen
-          // never painted (dug out, cut by a trunk) is simply never reported —
-          // the plant is clipped to the cells that exist, as it must be.
-          // A column plant is clipped to this cell and re-evaluated per cell.
-          // tracePlant has exactly ONE call site on purpose: it is a large
-          // kernel and every instantiation is paid again at driver compile.
+          // ---- record it and keep marching ----
+          // ONE RECORD PER TILE PLANT, and one per CELL for everything else —
+          // exactly the split the in-march memo ran (see plantColumnKey's
+          // absence, next to plantTileKey, for why a column plant may not be
+          // collapsed this way). A tile plant is one organism across a 3x3xH
+          // footprint and tracePlant intersects all of it in one call, so a
+          // ray crossing four of its cells must not spend four budget slots on
+          // it and then treat the next tuft as a solid cube. The key is
+          // compared against the LAST record only — which is all a single-slot
+          // memo ever did, and an alternating A,B,A crossing records A twice
+          // exactly as it used to evaluate it twice.
+          //
+          // A column plant and a brick get key 0 and are always recorded, so
+          // the budget is spent per CELL for them and the ray goes solid after
+          // TUNE_MICRO_MAX_PER_RAY of them — the shipped bound, unchanged.
           var key = 0u;
-          if (tileMode) { key = plantTileKey(pd, cell, mat); }
-          if (tileMode && key == pKey) {
-            evaluated = false;
-            if (pHit.hit && pT >= tCur - 1e-3 && pT <= tExitCell + 1e-3) {
-              mh = pHit;
-              mh.t = pT - tCur;
-            }
-          } else if (isPlant) {
-            let tClip = select(tExitCell - tCur + 1e-3, 1e9, tileMode);
-            mh = tracePlant(mb, pd, mat, cell, entry, rd, tClip);
-            if (tileMode) {
-              pKey = key;
-              pHit = mh;
-              pT = tCur + mh.t;
-              if (pT > tExitCell + 1e-3) { mh.hit = false; }
-            }
-          } else {
-            mh = traceMicro(mb, cell, entry, rd, R.tick);
-          }
-          if (evaluated) { microBudget -= 1; rsAdd(RS_PLANT_EVAL, 1u); }
-          if (mh.hit) {
-            out.hit = true;
-            out.t = tCur + mh.t;
-            out.cell = cell;
-            out.axis = mh.axis;
-            out.sgn = mh.sgn;
-            // Keep the world voxel's word (stamp/stain/state travel with the
-            // CELL, not with the sub-voxel) but report the micro material
-            // separately, so fs() shades the blade's colour on the tuft's
-            // stain.
-            out.word = w;
-            out.micMat = mh.mat;
-            out.micN = mh.n;
-            out.micSmooth = select(0u, 1u, mh.curved);
-            out.micKey = mh.key;
-            return out;
+          if (tileMode) { key = plantTileKey(pKind, cell, mat); }
+          if (key == 0u || key != detKey) {
+            // Only a TILE overwrites the slot. A grass cell crossed between two
+            // cells of one fern must not make the renderer forget the fern —
+            // the in-march memo only ever wrote pKey inside its tileMode arm,
+            // and this is that, restated.
+            if (key != 0u) { detKey = key; }
+            // Window-local, 10 bits per axis. The residency window is
+            // WORLD_N = 512 cells on a side and world.h refuses 1024 (the
+            // voxel buffer would pass Vulkan's 4 GiB binding ceiling), so 30
+            // bits covers every cell this loop can reach — and the loop has
+            // already bounds-checked `cell` against the window this step.
+            let lc = vec3<u32>(cell - wloI);
+            let packed = lc.x | (lc.y << 10u) | (lc.z << 20u);
+            if (detN == 0) {
+              det0 = packed; detT0 = tCur;
+              detTau = out.mediaTau; detFire = out.fireGlow;
+            } else if (detN == 1) { det1 = packed; detT1 = tCur; }
+            else if (detN == 2) { det2 = packed; detT2 = tCur; }
+            else { det3 = packed; detT3 = tCur; }
+            detN += 1;
           }
         }
-        // MISS — and this is the crucial half. The ray passes through: fall out
-        // of the `if` and let the world DDA step past the cell exactly as if it
-        // were air. A micro cell that blocked on a miss would render every tuft
-        // of grass as a solid 6 cm cube.
+        // DEFER — and this is the crucial half. The ray passes through: fall
+        // out of the `if` and let the world DDA step past the cell exactly as
+        // if it were air. A micro cell that blocked here would render every
+        // tuft of grass as a solid 6 cm cube.
         //
-        // Note what happens once `microBudget` reaches 0: this branch stops
+        // Note what happens once the records are spent: this branch stops
         // matching and control drops to the plain-solid `else` at the bottom,
-        // so a ray that has already entered TUNE_MICRO_MAX_PER_RAY bricks
+        // so a ray that has already recorded TUNE_MICRO_MAX_PER_RAY models
         // treats the next micro cell as SOLID. That is the intended bound —
-        // terminating is bounded and reads as distant ground, where letting the
-        // ray fly on unbounded would punch a hole through a whole meadow.
+        // terminating is bounded and reads as distant ground, where letting
+        // the ray fly on unbounded would punch a hole through a whole meadow.
       } else if (!wantMedia && (materials[mat].flags & MATF_MICRO) != 0u) {
         // ---- shadow / reflection ray meets a micro cell ----
         // Pass straight through. These rays never march bricks (see the
-        // microBudget comment at the top of trace), and treating the cell as
+        // detail-budget comment at the top of trace), and treating the cell as
         // solid instead would make a grass blade cast a full 6 cm cube of
         // shadow — the exact artifact isRayBlocker's micro exclusion exists to
         // prevent, and the two must agree or chunk skipping and per-cell
@@ -2779,7 +2929,7 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool) -> Hit {
         out.axis = axis;
         out.sgn = sign(rd[axis]);
         out.word = w;
-        return out;
+        break;   // to the deferred-detail resolve at the tail, never past it
       }
     }
 
@@ -2933,6 +3083,149 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool) -> Hit {
       break;
     }
     if (tCur >= tExit) { break; }
+  }
+
+  // ======================== PHASE 2: resolve the detail =====================
+  // The march is over and every value it carried is dead, so the model kernels
+  // get the registers the allocator was previously forced to spill the march
+  // into. This runs only for rays that recorded something — the sky, the
+  // hillside behind the meadow and every shadow ray fall straight through.
+  //
+  // Records are in increasing t, so the FIRST hit found is the nearest and the
+  // loop stops there. `tLimit` is the opaque backdrop the march resolved: a
+  // detail surface behind it is hidden by it and is never evaluated.
+  if (detN > 0) {
+    let tLimit = select(1e30, out.t, out.hit || out.saturated);
+    for (var r = 0; r < DETAIL_SLOTS; r++) {
+      if (r >= detN) { break; }
+      // Statically indexed. An array here would live in local memory, which is
+      // the cost this whole change exists to remove.
+      var pc = det0;
+      var pt = detT0;
+      if (r == 1) { pc = det1; pt = detT1; }
+      else if (r == 2) { pc = det2; pt = detT2; }
+      else if (r == 3) { pc = det3; pt = detT3; }
+      if (pt >= tLimit) { break; }
+      let dc = wloI + vec3<i32>(vec3<u32>(pc & 0x3FFu, (pc >> 10u) & 0x3FFu,
+                                          (pc >> 20u) & 0x3FFu));
+      let dw = voxWordAt(dc);
+      let dm = voxMat(dw);
+      let mb = microBricks[dm];
+      // The cell has not changed under us — the buffers are read-only for the
+      // whole draw — so this is a re-read, not a re-test. It is here because
+      // the record carries the CELL and not the word: four more live u32s in
+      // the march would have been four more the allocator had to place.
+      if (dm == MAT_AIR || (materials[dm].flags & MATF_MICRO) == 0u ||
+          mb.base == MICRO_NONE) { continue; }
+      // Cell-local entry point, exactly as the march would have computed it:
+      // `pt` is where the ray crossed INTO this cell.
+      let entry = clamp((ro + rd * pt) - vec3f(dc), vec3f(0.0), vec3f(1.0));
+      var mh : MicroHit;
+      mh.hit = false;
+      var isTile = false;
+      rsAdd(RS_PLANT_EVAL, 1u);
+      if ((mb.flags & MICROF_PLANT) != 0u) {
+        let pd = plantDefOf(mb);
+        isTile = pd.tile != 0;
+        // THE CLIP BOUND IS ALSO THE FOOTPRINT CULL BOUND (see DEFERRED
+        // DETAIL). A tile plant is bounded by plantTileAt, so 1e9. A column
+        // plant's geometry is clipped to THIS CELL by tracePlant itself, so
+        // the bound is the ray's exit from the cell — the DDA's
+        // min(tMax.x, tMax.y, tMax.z), rebuilt here from the cell corner
+        // because the march's tMax is long dead. Handing it 1e9 instead would
+        // blow segLo/segHi up to the whole world and silently disable the
+        // per-blade cull that makes the blade loop cheap.
+        let bnd = (vec3f(dc) + select(vec3f(0.0), vec3f(1.0), rd > vec3f(0.0))
+                   - ro) * inv;
+        let tCellExit = min(bnd.x, min(bnd.y, bnd.z));
+        let tClip = select(max(tCellExit - pt, 1e-3) + 1e-3, 1e9, isTile);
+        mh = tracePlant(mb, pd, dm, dc, entry, rd, tClip);
+      } else {
+        mh = traceMicro(mb, dc, entry, rd, R.tick);
+      }
+      if (!mh.hit) { continue; }
+      let tHit = pt + mh.t;
+      if (tHit >= tLimit) { continue; }
+      // WHICH CELL IS THE SURFACE IN. A TILE plant is one organism over a
+      // 3x3xH footprint, so a hit can land in a cell other than the one the
+      // ray entered through, and that cell is where stain and state come from
+      // — the march used to find it by walking on and asking the memo. A
+      // COLUMN plant and a brick are clipped to the record cell by
+      // construction, and for them this is only a precision question: a hit
+      // exactly on a cell face can floor() either way.
+      //
+      // Hence the two arms. THE MODEL IS CLIPPED TO THE CELLS THAT EXIST: a
+      // TILE hit that lands where worldgen never painted (dug out, cut by a
+      // trunk) is not reported, exactly as before. But a column hit that
+      // floor()ed onto the dirt under its own blade is a rounding artifact,
+      // not a hole in the plant, and falls back to the cell that was recorded.
+      let hc = clamp(vec3<i32>(floor(ro + rd * tHit)), wloI,
+                     wloHi - vec3<i32>(1));
+      let hw = voxWordAt(hc);
+      let hm = voxMat(hw);
+      let hcOk = hm != MAT_AIR && (materials[hm].flags & MATF_MICRO) != 0u;
+      if (!hcOk && isTile) { continue; }
+
+      out.hit = true;
+      out.saturated = false;
+      out.t = tHit;
+      out.cell = select(dc, hc, hcOk);
+      out.axis = mh.axis;
+      out.sgn = mh.sgn;
+      // Keep the world voxel's word (stamp/stain/state travel with the CELL,
+      // not with the sub-voxel) but report the micro material separately, so
+      // fs() shades the blade's colour on the tuft's stain.
+      out.word = select(dw, hw, hcOk);
+      out.micMat = mh.mat;
+      out.micN = mh.n;
+      out.micSmooth = select(0u, 1u, mh.curved);
+      out.micKey = mh.key;
+
+      // ---- unwind the volumetrics the march accumulated BEHIND this --------
+      // Phase 1 walked THROUGH the detail cell, so a water surface, a glacier
+      // or a smoke plume further along the ray was accumulated for a backdrop
+      // this surface now covers. Left alone, fs() draws a pond's surface in
+      // FRONT of the reeds standing in it — it shades h.liqT whenever liqT is
+      // non-zero, with no ordering test against h.t.
+      //
+      // The latched "first crossing" fields are exact: a crossing recorded at
+      // or beyond tHit is entirely behind the surface, so it and its path go.
+      // The media accumulators restore to the snapshot taken at the FIRST
+      // record, which is exact when that record is the one that won (the
+      // common case — a ray records at most four, and the nearest tuft is the
+      // one it hits) and otherwise drops the media between the first record
+      // and the hit: at most a few cells inside one plant cluster.
+      //
+      // KNOWN RESIDUAL: a liquid entered in FRONT of the surface keeps the
+      // whole path it accumulated, including the part behind. That over-tints
+      // a blade seen through water by the water behind it — sub-voxel geometry
+      // inside a body of water, which is the same case the old code could not
+      // render at all because it stopped the march at the blade.
+      if (out.mediaTau > detTau) {
+        out.mediaTint *= select(0.0, detTau / out.mediaTau, out.mediaTau > 1e-6);
+        out.mediaTau = detTau;
+        out.fireGlow = detFire;
+        if (detTau <= 0.0) {
+          out.mediaMat = 0u;
+          out.mediaSurf = 0.0;
+          out.fireMat = 0u;
+        }
+      }
+      if (out.liqT >= tHit) {
+        out.liqT = 0.0;
+        out.liqPath = 0.0;
+        out.liqCell = vec3<i32>(0);
+        out.liqAxis = 1;
+        out.liqSgn = -1.0;
+      }
+      if (out.tsT >= tHit) {
+        out.tsT = 0.0;
+        out.tsPath = 0.0;
+        out.tsMat = 0u;
+      }
+      if (out.gasHalfT >= tHit) { out.gasHalfT = 0.0; }
+      break;
+    }
   }
   return out;
 }

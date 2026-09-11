@@ -5964,9 +5964,13 @@ packs all frames of all such materials into one brick pool (`array<u32>`, four
 voxel shades through the existing material table with no new colour path.
 
 **Where it hooks.** In `trace()` (`raymarch.wgsl`), when the world DDA lands on a
-solid cell whose material carries `MATF_MICRO`, a nested Amanatides–Woo DDA runs
-over the `subdiv³` brick in cell-local space. A hit reports the sub-voxel's
-material and the face it was entered through; a **miss lets the ray continue past
+solid cell whose material carries `MATF_MICRO`, the cell is RECORDED and the
+march continues; after the march resolves, a nested Amanatides–Woo DDA runs over
+the `subdiv³` brick in cell-local space for each record (see "The detail model
+is resolved in a SECOND PASS" under analytic plants below — the same two-phase
+machinery carries bricks, analytic plants and anything later that spans more
+than one cell). A hit reports the sub-voxel's material and the face it was
+entered through; a **miss lets the ray continue past
 the cell**, which is the load-bearing half — a grass cell is mostly air, and a
 micro cell that blocked on a miss would draw every tuft as a solid 6 cm cube.
 Per-cell variety is a quarter-turn yaw swizzle plus an optional whole-sub-voxel
@@ -6056,12 +6060,79 @@ transcribed to `sim/plants.h` for the `--shot` harness, and restated per
 species in `materials.json` for the loader — `check_invariants.py plants` holds
 the three equal.
 
-**One evaluation per tile per ray.** `trace()` memoises the last tile plant it
-intersected (`pKey`/`pHit`/`pT`): the first cell of a tile evaluates the plant
-UNCLIPPED and every later cell of that tile only asks whether the remembered hit
-lies inside it. A hit that falls in a cell worldgen never painted — dug out, cut
-by a trunk — is never reported, which is exactly the clipping a partial plant
-must have. Only evaluations charge `microBudget`; carried cells are free. Past
+**One evaluation per TILE plant per ray — and NOT per column.** A fern or a big
+toadstool is one organism across a 3×3×H footprint and `tracePlant` intersects
+all of it in one call, so phase 1 records it once (`plantTileKey`, compared
+against the last record) and every later cell of the same tile is free. A
+COLUMN plant may NOT be collapsed this way, and one attempt to was reverted on
+2026-09-11: `tracePlant`'s column branch intersects only the segment of the
+plant **inside the cell it was called for** (`yTop = min(1, sH - rise0)`, Y
+half-planes in cell-local coordinates), so a remembered hit can only lie in the
+cell it was computed in and every later cell of the column resolves to a miss —
+the blades above the first cell a ray enters are simply never drawn, visible in
+the `plants` gate picture as horizontal bands of missing blade at every cell
+boundary (37,097 px over 24 SAD). Collapsing a column needs `tracePlant` to
+intersect the whole column in one call first. The clip bound for a column is
+therefore the ray's exit from the CELL, NOT 1e9: `tracePlant`'s per-blade
+footprint cull derives `segLo`/`segHi` from it, and 1e9 would silently disable
+the cull that makes the blade loop cheap. A tile plant's bound IS 1e9, because
+`plantTileAt`'s non-overlapping footprints already bound it.
+
+**The detail model is resolved in a SECOND PASS, after the march (2026-09-11).**
+`trace()` used to call `tracePlant`/`traceMicro` from inside its DDA loop, and
+that placement — not the kernel — was most of the frame. The march carries ~25
+loop-live values plus `out : Hit` (26 fields), all live across the call; the
+allocator capped the fragment at 168 registers and spilled, so the loop's own
+state moved to scratch and **every pixel in the frame paid the fill traffic,
+sky included**. The `meadow` `--render-budget` camera measured `microMaxPerRay`
+→ 0 at **8.95 ms of a 19.73 ms frame (45%)**, on a frame whose counters read
+`rmMicroEnters = rmPlantEvals = 0.0` — nothing was evaluated; removing the code
+was what saved the time.
+
+So the fix is not to make evaluations cheaper or rarer. It is to get the kernel
+out of the loop. **Phase 1**, inside the DDA: a primary ray entering a
+`MATF_MICRO` cell within the LOD records `(cell, tEnter)` into one of
+`DETAIL_SLOTS` fixed scalar pairs — window-local cell packed 10 bits per axis —
+and keeps marching, treating the cell as air, which is what a MISS already did
+and a miss is the common outcome. **Phase 2**, at the function's tail: walk the
+records in `t` order, evaluate each, take the first hit nearer than the opaque
+hit the march resolved. Records are scalars and never an array, because WGSL
+puts a dynamically indexed array in local memory — the exact thing being
+removed. The three in-loop `return out` became `break` so the tail has a single
+exit to run in.
+
+| | Register Count | local memory | meadow | noon |
+|---|---|---|---|---|
+| in-march | 168 | +160 B/thread | 19.73 ms | 16.54 ms |
+| **two-phase** | **128** | +160 B/thread | **9.35 / 8.69 ms** | **9.54 / 9.49 ms** |
+
+**The mechanism is OCCUPANCY, not spill.** The spill did not move by one byte;
+the register count fell 168 → 128, which is 16 warps per SM instead of 12 —
+and `trace()`'s own `sgn3` note already measured that trade in the other
+direction (hoisting a dynamic index bought 128 → 168 regs and zero spill, and
+cost 3.5 ms). What moving the call bought was the allocator's freedom to take
+the low-register plan, plus the fact that whatever spill traffic remains is now
+executed only by the pixels that recorded a detail cell. Image parity on the
+`plants` gate fixture (grass, fern, toadstool): 678 px over 24 SAD against a
+same-shader re-run control of 617 — measured at the SAME gate scope on both
+arms, which matters: the same frame taken inside a four-gate `--verify` instead
+of alone differs from itself by 162k px.
+
+Two things phase 2 must do that the in-march form did not. It must **unwind the
+volumetrics accumulated behind a winning surface** — the march walked through
+the cell, so a water interface, a glacier or a plume past it was recorded for a
+backdrop the detail hit now covers, and `fs()` shades `liqT` with no ordering
+test against `h.t`; latched crossings at or beyond the hit are cleared with
+their path, and the media accumulators restore to a snapshot taken at the first
+record. And it must keep **clipping the model to the cells that exist**: a hit
+that falls in a cell worldgen never painted — dug out, cut by a trunk — is not
+reported, which is exactly the clipping a partial plant must have.
+
+Only records charge `microBudget`; cells collapsed onto an existing record are
+free, and `render.microMaxPerRay` is clamped to `DETAIL_SLOTS` (4). The
+traversal cost of a REAL meadow remains unmeasured — the harness world holds
+756 plant cells and no leaves at all, so everything above is a PRESENCE cost.
+Full arm tables in `docs/PLAN_frame_perf.md`. Past
 `TUNE_MICRO_LOD_DIST` only the centre column of a tile plant stands in as the
 solid proxy; the outer eight pass as air, or a distant fern is a 30 cm cube.
 Column plants take the SHORTER of that and `render.plantLodDist` (16 m): an
