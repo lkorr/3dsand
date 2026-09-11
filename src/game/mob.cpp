@@ -4135,32 +4135,173 @@ bool Mob::BlastRadial(Vec3 centerWorldVoxel, float radiusVoxels,
   const bool wasLimp = ragdoll_ == RagdollPhase::Limp;
   StartRagdoll(rg.minSeconds, "blast");
   if (ragdoll_ != RagdollPhase::Limp) return false;
+  const float launchVox = MetresToCells(speedMs);
+  const float ceiling = MetresToCells(rg.maxLaunchSpeed);
+
+  // ---- WHERE THE BLAST HITS, LIMB BY LIMB ---------------------------------
+  // Everything above is one number for the whole creature, measured at the
+  // pelvis: that is what decides IF it is knocked down and how fast the rig
+  // travels, and it stays the authority for both. What follows only decides
+  // how that same launch is DISTRIBUTED over the body — a charge at the
+  // ankles must lift the legs before the head, which is the difference
+  // between a body tumbling away from an explosion and a mannequin sliding
+  // away from one still standing to attention.
+  //
+  // Measured at each limb's CENTRE OF MASS, not `xf.pos`: that is the voxel
+  // lattice's origin corner, which on a thigh is up at the knee.
+  struct BlastLimb {
+    size_t idx;
+    Vec3 com;
+    float mass;
+    float falloff;
+    Vec3 vel;
+  };
+  std::vector<BlastLimb> hit;
+  hit.reserve(limbs_.size());
+  Vec3 comSum{};
+  float massSum = 0.0f;
+  for (size_t i = 0; i < limbs_.size(); i++) {
+    MobLimb& l = limbs_[i];
+    if (!l.body || l.holdSeconds > 0) continue;
+    BlastLimb b{};
+    b.idx = i;
+    if (!phys_->BodyCenterOfMass(l.body, b.com)) b.com = l.xf.pos;
+    b.mass = std::max(phys_->BodyMass(l.body), 1e-3f);
+    const float dl = (b.com - centerWorldVoxel).len();
+    b.falloff = std::clamp(1.0f - dl / radiusVoxels, 0.0f, 1.0f);
+    comSum += b.com * b.mass;
+    massSum += b.mass;
+    hit.push_back(b);
+  }
+  if (hit.empty() || massSum <= 0.0f) return false;
+  const Vec3 com = comSum * (1.0f / massSum);
+
+  // The per-limb falloff is used as a RATIO against the rig's mass-weighted
+  // mean, so `blastLimbBias` redistributes the launch instead of adding to
+  // it: a limb nearer the charge than the body's average takes more than the
+  // flat share, one further away takes less, and the mass-weighted mean of
+  // the scale is exactly 1 whatever the geometry. (A charge on the far side
+  // of the knockdown reach can leave every limb at falloff 0 while the
+  // pelvis probe — which uses a different sample point — was inside it; then
+  // there is no ratio to take and the flat launch is the answer.)
+  float meanFalloff = 0.0f;
+  for (const BlastLimb& b : hit) meanFalloff += b.falloff * b.mass;
+  meanFalloff /= massSum;
+  const float bias =
+      meanFalloff > 1e-4f ? std::clamp(rg.blastLimbBias, 0.0f, 1.0f) : 0.0f;
+
+  for (BlastLimb& b : hit) {
+    // Each limb's own away-from-the-charge line, carrying the same up-bias
+    // the whole-body direction does, blended toward that whole-body direction
+    // by `bias`. Near the charge the two are very different (a limb a metre
+    // to one side of a point blast is shoved sideways); far away they agree.
+    Vec3 dl = b.com - centerWorldVoxel;
+    const float dlen = dl.len();
+    Vec3 dirL = dlen > 1e-3f ? dl * (1.0f / dlen) : dir;
+    dirL.y += rg.blastUpBias;
+    dirL = dirL.normalized();
+    if (dirL.len() < 0.5f) dirL = dir;
+    Vec3 mix = (dir * (1.0f - bias) + dirL * bias).normalized();
+    if (mix.len() < 0.5f) mix = dir;
+    const float scale =
+        std::max(1.0f + bias * (b.falloff / std::max(meanFalloff, 1e-4f) - 1.0f),
+                 0.0f);
+    b.vel = mix * (launchVox * scale);
+  }
+
+  // ---- ...REDUCED TO ONE RIGID MOTION -------------------------------------
+  // Those per-limb velocities are NOT what gets set. A rig is a chain of
+  // constraints and the limbs disagreeing about where they are going is a
+  // constraint violation Jolt resolves in one step — badly, with the joints
+  // doing the launching (the note this file has carried since the launch was
+  // made uniform). So the differential is collapsed into the one motion a
+  // jointed body can actually perform: the linear momentum it adds up to, and
+  // the spin about the centre of mass its angular momentum implies. Nothing
+  // is violated, so the whole tumble survives the first step intact.
+  Vec3 p{}, angMom{};
+  for (const BlastLimb& b : hit) {
+    p += b.vel * b.mass;
+    angMom += (b.com - com).cross(b.vel * b.mass);
+  }
+  Vec3 vCom = p * (1.0f / massSum);
+  Vec3 omega{};
+  const float lLen = angMom.len();
+  if (lLen > 1e-6f) {
+    const Vec3 n = angMom * (1.0f / lLen);
+    // Moment of inertia about that axis, limbs as point masses — each limb's
+    // own spin inertia is left out, which UNDER-states I and so over-states
+    // the spin; `blastSpinGain` is the correction and the dial.
+    float inertia = 0.0f;
+    for (const BlastLimb& b : hit) {
+      const Vec3 r = b.com - com;
+      const Vec3 perp = r - n * r.dot(n);
+      inertia += b.mass * perp.dot(perp);
+    }
+    if (inertia > 1e-4f) {
+      const float w = std::min(lLen / inertia * std::max(rg.blastSpinGain, 0.0f),
+                               std::max(rg.blastMaxSpin, 0.0f));
+      omega = n * w;
+    }
+  }
+
+  // THE TUMBLE REDISTRIBUTES THE LAUNCH; IT NEVER ADDS SPEED. An outflung
+  // limb carries |omega x r| on top of the centre's, so without this the
+  // fastest limb leaves a blast slightly faster than the flat launch used to
+  // send every limb — 6.4 m/s against 6.0 in the `ragdoll repeat blast`
+  // fixture. A body is blown OVER by the spin, not blown apart, and the
+  // launch ceiling is a statement about the whole creature: scale the rigid
+  // motion — both halves together, so it stays rigid — until no limb exceeds
+  // what the uniform launch would have given it. ~0.94 at the stock gain, and
+  // the tumble is untouched to the eye.
+  //
+  // This is an invariant, not a fix for anything: it was written while
+  // chasing an in-suite death on the launch tick and did NOT stop it (6.1 m/s
+  // after the scale, same death). The cause of that is a fixture already on a
+  // knife edge, not the spin adding speed — `ragdoll repeat blast` says so in
+  // its own line now.
+  {
+    float fastest = 0.0f;
+    for (const BlastLimb& b : hit)
+      fastest = std::max(fastest, (vCom + omega.cross(b.com - com)).len());
+    if (fastest > launchVox && fastest > 1e-6f) {
+      const float k = launchVox / fastest;
+      vCom = vCom * k;
+      omega = omega * k;
+    }
+  }
+
   // A body already limp keeps what it had and takes the new shove on top;
   // a standing one is launched clean. The sum is held under the same ceiling
   // as a single launch — or the speed it already had, if that was higher (a
   // long fall is not slowed by being blasted) — so eight grenades in one
   // tick, or a cluster spell's eight ExplosionOps, cannot stack to 8x
   // maxLaunchSpeed. Measured before this clamp: a second X-detonate on a
-  // limp wizard put the pelvis at 17.9 m/s against a 14 m/s ceiling.
-  const Vec3 launch = dir * MetresToCells(speedMs);
-  const float ceiling = MetresToCells(rg.maxLaunchSpeed);
-  for (MobLimb& l : limbs_) {
-    if (!l.body || l.holdSeconds > 0) continue;
+  // limp wizard put the pelvis at 17.9 m/s against a 14 m/s ceiling. The
+  // ceiling is now per LIMB rather than one figure for the rig, because the
+  // tumble means the limbs no longer share a speed: an outflung hand carries
+  // |omega x r| on top of the centre's.
+  for (const BlastLimb& b : hit) {
+    MobLimb& l = limbs_[b.idx];
+    const Vec3 v = vCom + omega.cross(b.com - com);
     Vec3 lin{}, ang{};
-    if (wasLimp && phys_->GetBodyVelocities(l.body, lin, ang)) {
-      Vec3 sum = lin + launch;
-      const float cap = std::max(ceiling, lin.len());
-      const float len = sum.len();
-      if (len > cap && len > 1e-6f) sum = sum * (cap / len);
-      phys_->SetBodyVelocities(l.body, sum, ang);
-    } else {
-      phys_->SetBodyVelocity(l.body, launch);
-    }
+    const bool had = wasLimp && phys_->GetBodyVelocities(l.body, lin, ang);
+    Vec3 sum = had ? lin + v : v;
+    const float cap = had ? std::max(ceiling, lin.len()) : ceiling;
+    const float len = sum.len();
+    if (len > cap && len > 1e-6f) sum = sum * (cap / len);
+    Vec3 spin = had ? ang + omega : omega;
+    const float spinCap =
+        had ? std::max(rg.blastMaxSpin, ang.len()) : std::max(rg.blastMaxSpin, 0.0f);
+    const float spinLen = spin.len();
+    if (spinLen > spinCap && spinLen > 1e-6f) spin = spin * (spinCap / spinLen);
+    phys_->SetBodyVelocities(l.body, sum, spin);
   }
   ragdollStillT_ = 0.0f;
   std::printf("mob %llu ragdoll: blast launch %.1f m/s (impulse %.0f, mass %.1f kg, "
-              "falloff %.2f)\n",
-              (unsigned long long)id_, speedMs, impulseKgMs, mass, falloff);
+              "falloff %.2f, spin %.1f rad/s about (%.2f, %.2f, %.2f))\n",
+              (unsigned long long)id_, speedMs, impulseKgMs, mass, falloff,
+              omega.len(), omega.normalized().x, omega.normalized().y,
+              omega.normalized().z);
   return true;
 }
 

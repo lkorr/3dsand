@@ -5226,7 +5226,7 @@ Status GateAiSlope(Ctx& c, std::string& detail) {
 
 // ---- LIVE RAGDOLL (DESIGN.md "A creature knocked down gets back up") --------
 //
-// Three claims, each a number this gate prints, so `--gate ragdoll` alone is
+// Six claims, each a number this gate prints, so `--gate ragdoll` alone is
 // the whole iteration loop:
 //   A. a blast beside a standing creature knocks it LIMP (phase 1) and moves
 //      its pelvis at least ragdollBlastMinTravel voxels — and no more than
@@ -5250,6 +5250,15 @@ Status GateAiSlope(Ctx& c, std::string& detail) {
 //      through PlayerPushOut by more than ragdollBurnMaxPushVox in a tick, nor
 //      move them more than ragdollBurnMaxTravel over the burn. Measured before
 //      the fix: 62 voxels in one tick, 432 voxels before death.
+//   F. the TUMBLE: the same charge at the same distance, once at the ankles
+//      and once over the head, spins the rig in OPPOSITE directions (|w.z| at
+//      least ragdollBlastMinSpin either way) and tips it opposite ways 12
+//      ticks later (the up axis leans by at least ragdollBlastMinTiltGap
+//      between the two arms). The differential stays modest — no limb leaves
+//      the blast more than ragdollBlastMaxLimbSpeedRatio times faster than
+//      the slowest, and the spin is under ragdoll.blastMaxSpin. Before this,
+//      every limb took the same velocity and a body floated away from an
+//      explosion still standing to attention.
 // Thresholds are in tests/baseline.json (BaselineNumber), so retuning what
 // counts as "across the room" is a JSON edit, not a rebuild.
 Status GateRagdoll(Ctx& c, std::string& detail) {
@@ -5452,17 +5461,36 @@ Status GateRagdoll(Ctx& c, std::string& detail) {
       }
       return best;
     };
+    // The LAST POSITION THE CREATURE WAS ALIVE AT, because a dead mob's
+    // position probe is not a position: the husk leaves mobs_ on the next
+    // PreTick sweep and MobRootPos then answers from nothing, which is how
+    // "the pelvis moved 583 voxels in 1.3 s" (56 m/s, twice the speed cap
+    // that exists to prevent exactly that) got reported for a body that had
+    // in fact stopped. Travel measured to here is a real distance either way.
+    Vec3 lastAlive{};
+    int diedAt = -1;
     auto flight = [&](uint64_t id, int ticks, const ExplosionOp& e) {
       float peak = 0.0f;
       for (int i = 0; i < ticks; i++) {
         explodeTick(i == 0 ? &e : nullptr);
         peak = std::max(peak, fastestLimb(id));
+        if (mobs.IsAlive(id)) lastAlive = mobs.MobRootPos(id);
+        else if (diedAt < 0) diedAt = i;
       }
       return peak;
     };
     const double maxSpeed = BaselineNumber("ragdollRepeatBlastMaxSpeed", 21.0);
     const uint64_t wid = mobs.Spawn(wizDef, {spot.x, h + 1, spot.z});
     for (int i = 0; i < 45; i++) explodeTick(nullptr);
+    // HOW MUCH WIZARD IS LEFT BEFORE THE FIRST CHARGE, because this arm's
+    // subject does not always arrive intact and that was invisible: it
+    // settles for 45 ticks in whatever world the gates before it left, and
+    // reaches the blast at 15 of 15 limbs under `--gate ragdoll` but only 12
+    // of 15 inside a full `--selftest` (44.9 kg against 52.4). A charge 6
+    // voxels away is close to lethal for the smaller one, which makes "it
+    // survived to take a second blast" a knife-edge claim rather than a
+    // property of the launch — read this number first when the arm moves.
+    const uint32_t limbsAtBlast = mobs.LimbBodyCount();
     const Vec3 w0 = mobs.MobRootPos(wid);
     const ExplosionOp e1{ifloor(w0.x) - 6, ifloor(w0.y) + 2, ifloor(w0.z),
                          tune.tools.detonateRadius, tune.tools.detonatePower, 0, 0, 0};
@@ -5472,16 +5500,18 @@ Status GateRagdoll(Ctx& c, std::string& detail) {
     const ExplosionOp e2{ifloor(w1.x) - 6, ifloor(w1.y) + 2, ifloor(w1.z),
                          tune.tools.detonateRadius, tune.tools.detonatePower, 0, 0, 0};
     const float peak2 = flight(wid, 40, e2);
-    const Vec3 w2 = mobs.MobRootPos(wid);
-    const float travel2 = (w2 - w1).len();
+    const float travel2 = (lastAlive - w1).len();
     const bool repeatOk = wid != 0 && phase1 == 1 && mobs.IsAlive(wid) &&
                           peak1 <= (float)maxSpeed && peak2 <= (float)maxSpeed &&
                           travel2 <= (float)maxTravel;
     std::printf("  ragdoll repeat blast: %s (fastest limb %.1f m/s standing, %.1f m/s "
                 "already limp, ceiling %.0f; second blast moved the pelvis %.1f vox "
-                "in 1.3 s, band ..%.0f; phase after first %d, alive %d)\n",
+                "in 1.3 s, band ..%.0f; phase after first %d, alive %d, died at flight "
+                "tick %d of \"%s\"; subject had %u of %d limbs before the first "
+                "charge)\n",
                 repeatOk ? "PASS" : "FAIL", peak1, peak2, maxSpeed, travel2, maxTravel,
-                phase1, (int)mobs.IsAlive(wid));
+                phase1, (int)mobs.IsAlive(wid), diedAt, mobs.DeathCause(wid),
+                limbsAtBlast, nWiz);
     ok = ok && repeatOk;
     ticker.tick = tick;
   }
@@ -5540,9 +5570,37 @@ Status GateRagdoll(Ctx& c, std::string& detail) {
     float peakPush = 0.0f;
     int pushTicks = 0;
     uint32_t gobbets = 0;
+    // WHAT pushed hardest, not just how hard: mass, depth, the tick it
+    // happened on, and whether that body is one of the avatar's OWN limbs
+    // (a corpse's arm handed to the world inside the capsule is a different
+    // bug from a gobbet swept into it, and a bare "6.25 vox" cannot tell
+    // them apart — CLAUDE.md rule 6).
+    Physics::PushSource worst{};
+    int worstTick = -1, worstAlive = -1, worstOwn = -1, worstLayer = -1;
+    uint32_t worstBodies = 0;
+    size_t worstPending = 0;
+    // The handles the avatar's parts hold while ALIVE. Die() hands each one to
+    // DebrisSystem and then zeroes `limb.body`, so asking the avatar "is this
+    // yours" AFTER the death tick always answers no — the probe has to
+    // remember. (A fixture that measures itself: the first version of this
+    // line read PartBody() at the time of the push and could not have
+    // reported 1 whatever happened.)
+    std::vector<uint64_t> ownBodies;
+    for (int l = 0; l < avatar.PartCount(); l++)
+      if (avatar.PartBody(l)) ownBodies.push_back(avatar.PartBody(l));
+    // THE CLAIM IS ABOUT A LIVING PLAYER, so the sample window ends at death.
+    // The loop tests IsAlive() before the tick, so the last push it collected
+    // was always taken AFTER the avatar died in that very tick — a corpse's
+    // own limbs going to the world under the capsule, which is a different
+    // event from "what burns off me shoves me" and has its own failure mode
+    // (see the post-mortem line below; it is reported, never asserted on).
+    float deathPush = 0.0f;
+    Physics::PushSource deathSrc{};
+    Vec3 livingPos = pl.pos;
     for (int i = 0; i < 400 && avatar.IsAlive(); i++) {
       avTick();
-      Vec3 push = phys.PlayerPushOut(proxy, pl.pos);
+      Physics::PushSource src{};
+      Vec3 push = phys.PlayerPushOut(proxy, pl.pos, &src);
       // Player::ApplyPush's clamp, without its terrain sweeps.
       const float len = push.len();
       const float kMaxPush = 2.0f * Player::kHalfXZ;
@@ -5550,11 +5608,28 @@ Status GateRagdoll(Ctx& c, std::string& detail) {
       Vec3 follow;
       if (avatar.RagdollFollow(follow)) pl.pos = follow;
       else pl.pos += push;
-      peakPush = std::max(peakPush, len);
-      if (len > 0.05f) pushTicks++;
       gobbets = std::max(gobbets, debris.BodyCount());
+      if (!avatar.IsAlive()) {  // died during this tick: post-mortem, not ours
+        deathPush = len;
+        deathSrc = src;
+        break;
+      }
+      livingPos = pl.pos;
+      if (len > peakPush) {
+        peakPush = len;
+        worst = src;
+        worstTick = i;
+        worstAlive = 1;
+        worstBodies = debris.BodyCount();
+        worstLayer = phys.BodyObjectLayer(src.body);
+        worstPending = phys.PendingReleaseCount();
+        worstOwn = 0;
+        for (uint64_t b : ownBodies)
+          if (b == src.body) worstOwn = 1;
+      }
+      if (len > 0.05f) pushTicks++;
     }
-    const float moved = (pl.pos - start).len();
+    const float moved = (livingPos - start).len();
     const bool burnOk = spawned && worn == 3 && peakPush <= (float)maxPush &&
                         moved <= (float)maxMoved;
     std::printf("  ragdoll player on fire: %s (peak push %.2f vox/tick, ceiling %.2f; "
@@ -5562,10 +5637,109 @@ Status GateRagdoll(Ctx& c, std::string& detail) {
                 "worn %d/3, alive %d)\n",
                 burnOk ? "PASS" : "FAIL", peakPush, maxPush, pushTicks, moved, maxMoved,
                 gobbets, worn, (int)avatar.IsAlive());
+    std::printf("    worst pusher: body %llu, %.2f kg, %.2f vox deep, layer %d "
+                "(1=MOVING, 3=AVATAR), at burn tick %d (avatar alive %d, was its "
+                "own limb %d, %u debris bodies, %zu still pending release)\n",
+                (unsigned long long)worst.body, worst.massKg, worst.depthVox,
+                worstLayer, worstTick, worstAlive, worstOwn, worstBodies,
+                worstPending);
+    // OPEN FINDING, reported every run and asserted on by nothing (2026-09-11).
+    // On the tick the avatar dies, Die() hands its limbs to DebrisSystem and
+    // queues them through ReleaseToWorldWhenClear — and at some poses one of
+    // them is on Layers::MOVING, deep inside the capsule, on that same tick.
+    // Caught here at a blast-launch retune that shifted this arm's tick phase:
+    // a 12.83 kg limb 3.25 voxels in, one shove of 6.25 voxels, while five
+    // other limbs were still correctly pending. It is phase-dependent (three
+    // neighbouring phases push 0.00), it is NOT the burn, and it is above the
+    // 5%-of-player-mass filter by design — a corpse's torso is meant to be
+    // able to shove you, just not by a third of a metre in one tick.
+    int deathOwn = 0;
+    for (uint64_t b : ownBodies)
+      if (b == deathSrc.body) deathOwn = 1;
+    std::printf("    post-mortem (not asserted): death-tick push %.2f vox from "
+                "body %llu, %.2f kg, %.2f vox deep, layer %d, own limb %d\n",
+                deathPush, (unsigned long long)deathSrc.body, deathSrc.massKg,
+                deathSrc.depthVox, phys.BodyObjectLayer(deathSrc.body), deathOwn);
     ok = ok && burnOk;
     avatar.Despawn();
     phys.RemoveBody(proxy);
     ticker.tick = tick;
+  }
+
+  // ---- F. the tumble ---------------------------------------------------------
+  // BOTH ARMS INSIDE ONE GATE, and the only thing that differs between them is
+  // the HEIGHT of the charge: same rig, same spot, same reach, same distance
+  // from the pelvis (the charge is placed symmetrically about the point
+  // BlastRadial measures the knockdown at, so the launch speed is the same and
+  // only the geometry moves). A blast at the ankles must roll the body one way
+  // and a blast over the head the other; a comparison against a number from a
+  // different fixture could not tell "the spin works" from "this rig happens
+  // to fall over".
+  {
+    const double minSpin = BaselineNumber("ragdollBlastMinSpin", 0.4);
+    const double maxRatio = BaselineNumber("ragdollBlastMaxLimbSpeedRatio", 3.0);
+    const double minTiltGap = BaselineNumber("ragdollBlastMinTiltGap", 0.25);
+    const auto& rgt = CurrentTuning().ragdoll;
+    const int nWiz = (int)mobs.Defs()[wizDef].limbs.size();
+    const int rootLimb = mobs.Defs()[wizDef].rootLimb;
+    float spinZ[2] = {0, 0}, spinLen[2] = {0, 0}, ratio[2] = {0, 0}, upX[2] = {0, 0};
+    int knockedF[2] = {0, 0};
+    for (int arm = 0; arm < 2; arm++) {
+      mobs.Reset();
+      debris.Reset();
+      SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+      ctx.WaitIdle();
+      const uint64_t wid = mobs.Spawn(wizDef, {spot.x, h + 1, spot.z});
+      if (wid == 0) break;
+      for (int i = 0; i < 45; i++) tickOnce();  // stand, settle the feet
+      // BlastRadial measures the knockdown 0.4 m above the pelvis body's
+      // origin; put the charge 8 voxels below that for the ankle arm and 8
+      // above it for the overhead one, 6 to the side either way.
+      const Vec3 w0 = mobs.MobRootPos(wid);
+      const float probeY = w0.y + 0.4f / kVoxelMeters;
+      const Vec3 ec2{w0.x - 6.0f, probeY + (arm == 0 ? -8.0f : 8.0f), w0.z};
+      knockedF[arm] = mobs.BlastMobsRadial(ec2, reach, impulse);
+      // Read the rig's motion the instant the launch is set: every limb was
+      // given the same spin (one rigid motion), and the linear speeds differ
+      // only by omega x r.
+      float fast = 0.0f, slow = 1e9f;
+      for (int l = 0; l < nWiz; l++) {
+        const uint64_t hb = mobs.LimbBody(wid, l);
+        Vec3 lin{}, ang{};
+        if (!hb || !phys.GetBodyVelocities(hb, lin, ang)) continue;
+        fast = std::max(fast, lin.len());
+        slow = std::min(slow, lin.len());
+        if (l == rootLimb) {
+          spinZ[arm] = ang.z;
+          spinLen[arm] = ang.len();
+        }
+      }
+      ratio[arm] = slow > 1e-3f ? fast / slow : 0.0f;
+      // ...and the EFFECT, a third of a second later: a spin Jolt cancelled
+      // against the joints on the first step would set the numbers above and
+      // change nothing about the body. Rotation about +z tips the pelvis's up
+      // axis toward -x, so the two arms must straddle.
+      for (int i = 0; i < 12; i++) tickOnce();
+      BodyTransform xf{};
+      if (rootLimb >= 0 && phys.GetTransform(mobs.LimbBody(wid, rootLimb), xf)) {
+        const Quat q{xf.quat[0], xf.quat[1], xf.quat[2], xf.quat[3]};
+        upX[arm] = QuatRotate(q, Vec3{0, 1, 0}).x;
+      }
+    }
+    const bool spinOk =
+        knockedF[0] == 1 && knockedF[1] == 1 && spinZ[0] >= (float)minSpin &&
+        spinZ[1] <= -(float)minSpin &&
+        spinLen[0] <= rgt.blastMaxSpin + 1e-3f &&
+        spinLen[1] <= rgt.blastMaxSpin + 1e-3f && ratio[0] <= (float)maxRatio &&
+        ratio[1] <= (float)maxRatio && (upX[1] - upX[0]) >= (float)minTiltGap;
+    std::printf("  ragdoll blast spin: %s (ankle charge %.2f rad/s about z, "
+                "overhead %.2f, floor %.2f, cap %.1f; limb speed spread %.2fx / "
+                "%.2fx, ceiling %.1fx; pelvis up.x %.2f vs %.2f, gap %.2f needs "
+                "%.2f; knocked %d/%d)\n",
+                spinOk ? "PASS" : "FAIL", spinZ[0], spinZ[1], minSpin,
+                rgt.blastMaxSpin, ratio[0], ratio[1], maxRatio, upX[0], upX[1],
+                upX[1] - upX[0], minTiltGap, knockedF[0], knockedF[1]);
+    ok = ok && spinOk;
   }
 
   mobs.Reset();

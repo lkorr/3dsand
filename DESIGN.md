@@ -4305,12 +4305,56 @@ boom rattles, it does not floor you), above `maxLaunchSpeed` it is clamped —
 that clamp is the "across the room, not across the map" rule, so a massive
 charge still tops out at 14 m/s (~20 m at 45°). The direction is
 away-from-the-blast with `blastUpBias` of straight-up mixed in so a floor
-blast arcs the body rather than skidding it. The speed is set UNIFORMLY on
-every limb: Jolt's per-body `AddImpulse` would give a hand ten times the
-velocity of the torso and the joints would do the launching, badly. A grenade
-(power 380) sends a ~70 kg human about 5 m/s; mass comes from material
-density, so a heavier creature flies less far from the same charge with no
-per-creature number.
+blast arcs the body rather than skidding it. A grenade (power 380) sends a
+~70 kg human about 5 m/s; mass comes from material density, so a heavier
+creature flies less far from the same charge with no per-creature number.
+
+**...and it TUMBLES, without any limb being launched on its own
+(2026-09-11).** That whole-body speed used to be set UNIFORMLY on every limb,
+because Jolt's per-body `AddImpulse` gives a hand ten times the velocity of
+the torso and then the joints do the launching, badly — so a body floated away
+from an explosion still standing to attention, whatever the charge was
+standing next to. Both halves are now true at once. Each limb is measured at
+its own CENTRE OF MASS (`Physics::BodyCenterOfMass`, not `GetTransform`'s pos,
+which is the lattice's origin corner and on a thigh sits up at the knee) and
+gets its own falloff and its own away-from-the-charge line, blended toward the
+whole-body ones by `blastLimbBias`. The falloff enters as a RATIO against the
+rig's mass-weighted mean, so the bias redistributes the launch instead of
+adding to it — the mass-weighted mean scale is exactly 1 whatever the geometry.
+
+Those per-limb velocities are never set. They are collapsed into the one
+motion a jointed body can actually perform: the linear momentum they add up to
+(`vCom = Σ m v / M`) and the spin their angular momentum implies about the
+centre of mass (`ω = L / I`, with `blastSpinGain` correcting for a point-mass
+`I` that leaves out each limb's own inertia, capped at `blastMaxSpin`). Every
+limb is then set to `vCom + ω × r` and to the same `ω`. No constraint is
+violated, so the tumble survives the first solver step intact instead of being
+resolved away — and a charge at the ankles rolls the body one way while one
+over the head rolls it the other. Measured at the stock 0.35 / 0.65: ±0.6
+rad/s from the X-detonate charge, limb speeds spread 1.12x from slowest to
+fastest. The gate arm is `ragdoll blast spin`, which runs both heights inside
+one fixture so the claim is a reversal and not a number from another world.
+
+**The tumble redistributes the launch; it never adds speed.** An outflung limb
+carries `|ω × r|` on top of the centre's, so the whole rigid motion is scaled
+(both halves together — it stays rigid) until no limb exceeds what the uniform
+launch would have given it: ~0.94 at the stock gain, invisible on screen. The
+launch ceiling is a statement about the creature, not about its centre of mass.
+
+**Known, in-suite only: `ragdoll repeat blast` fails inside a full
+`--selftest` and passes under `--gate ragdoll`.** That arm's subject settles
+for 45 ticks in whatever world the gates before it left and reaches the first
+charge at 15 of 15 limbs standalone but **12 of 15 (44.9 kg vs 52.4) in
+suite** — and a charge 6 voxels away is close to lethal for the smaller one.
+The flat launch left it alive by a hair (travel 109.4 against a 120 ceiling,
+91% of the band); with the tumble it loses a vital limb on the launch tick and
+dies, so the second-blast claim has nothing left to measure. The spin adding
+speed is NOT the mechanism — capping the fastest limb at the uniform launch
+speed (above) leaves the death exactly where it was. The arm now prints the
+limb count it started with, the death tick and the death cause, and the pelvis
+travel is measured to the last position the creature was ALIVE at, because a
+dead mob's position probe answers from an empty list (that is where "the
+pelvis moved 583 voxels in 1.3 s" — 56 m/s against a 30 m/s cap — came from).
 
 **NPCs fall now.** The walk drive snapped `origin_.y` toward the probed ground
 at 3 cm a tick and, with none within the 2.4 m scan, returned early — a
@@ -4355,6 +4399,19 @@ knocks it limp and moves its pelvis within a `tests/baseline.json` band in
 still its own and no body adopted by `DebrisSystem`; and a dummy spawned 2.2 m
 up descends under gravity, goes limp past a fixture-short `fallSeconds`, and
 stands up on the ground.
+
+**One open finding the gate prints and asserts nothing on (2026-09-11).** On
+the tick the burning avatar DIES, one of its own limbs can be on
+`Layers::MOVING` deep inside the capsule while its siblings are still
+correctly queued in `ReleaseToWorldWhenClear` — measured at 12.83 kg and 3.25
+voxels in, one shove of 6.25 voxels, with five limbs still pending. It is not
+the burn (the 265 living ticks before it push 0.00), it is phase-dependent
+(three neighbouring tick phases never see it), and it clears the 5%-of-player
+mass filter by design: a corpse's torso is meant to be able to shove you, just
+not by a third of a metre in one tick. The avatar-on-fire arm's sample window
+now ends at death, where its claim always was, and the death-tick shove is
+printed on its own `post-mortem` line every run. Found by a blast-launch
+retune that moved this arm's tick phase, not by anything that changed it.
 
 **"Bodies zoom across the map" and "burning clothes launch me" (2026-09-10).**
 Both reports arrived together after the ragdoll landed, and neither was the

@@ -556,7 +556,9 @@ void Physics::MovePlayerBody(uint64_t handle, Vec3 centerVoxel, float dt) {
   bi.SetLinearVelocity(id, vel);
 }
 
-Vec3 Physics::PlayerPushOut(uint64_t handle, Vec3 centerVoxel) const {
+Vec3 Physics::PlayerPushOut(uint64_t handle, Vec3 centerVoxel,
+                            PushSource* outWorst) const {
+  if (outWorst) *outWorst = PushSource{};
   if (!system_ || handle == 0) return {0, 0, 0};
   const JPH::BodyInterface& bi = system_->GetBodyInterface();
   JPH::BodyID id = ToBodyID(handle);
@@ -610,10 +612,13 @@ Vec3 Physics::PlayerPushOut(uint64_t handle, Vec3 centerVoxel) const {
   }
   JPH::Vec3 push = JPH::Vec3::sZero();
   for (const Deepest& d : perBody) {
-    if (BodyMass(FromBodyID(d.id)) < minMass) continue;
+    const float m = BodyMass(FromBodyID(d.id));
+    if (m < minMass) continue;
     // mPenetrationAxis points the way shape 2 (the body) moves to separate;
     // the player moves the opposite way
     push -= d.axis * d.depth;
+    if (outWorst && d.depth / kVoxelMeters > outWorst->depthVox)
+      *outWorst = PushSource{FromBodyID(d.id), m, d.depth / kVoxelMeters};
   }
   return Vec3{push.GetX(), push.GetY(), push.GetZ()} * (1.0f / kVoxelMeters);
 }
@@ -948,6 +953,26 @@ float Physics::BodyMass(uint64_t handle) const {
   if (!mp) return 0.0f;
   const float inv = mp->GetInverseMassUnchecked();
   return inv > 0.0f ? 1.0f / inv : 0.0f;
+}
+
+int Physics::BodyObjectLayer(uint64_t handle) const {
+  if (!system_ || handle == 0) return -1;
+  const JPH::BodyInterface& bi = system_->GetBodyInterface();
+  JPH::BodyID id = ToBodyID(handle);
+  if (!bi.IsAdded(id)) return -1;
+  return (int)bi.GetObjectLayer(id);
+}
+
+bool Physics::BodyCenterOfMass(uint64_t handle, Vec3& outVoxel) const {
+  if (!system_ || handle == 0) return false;
+  const JPH::BodyInterface& bi = system_->GetBodyInterface();
+  JPH::BodyID id = ToBodyID(handle);
+  if (!bi.IsAdded(id)) return false;
+  JPH::RVec3 p = bi.GetCenterOfMassPosition(id);
+  const float inv = 1.0f / kVoxelMeters;
+  outVoxel = Vec3{(float)p.GetX() * inv, (float)p.GetY() * inv,
+                  (float)p.GetZ() * inv};
+  return true;
 }
 
 bool Physics::GetBodyVelocities(uint64_t handle, Vec3& lin,

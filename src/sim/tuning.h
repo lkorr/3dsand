@@ -626,6 +626,23 @@ struct Tuning {
     // Fraction of straight-up mixed into the launch direction, so a body on
     // the floor beside a blast arcs rather than skidding along the ground.
     float blastUpBias = 0.45f;
+    // ---- THE TUMBLE (Mob::BlastRadial) -------------------------------------
+    // How much a limb's OWN distance to the charge varies the shove it takes,
+    // as a fraction: 0 is the flat launch every limb used to get (a body that
+    // floats away from the blast facing the same way it stood), 1 would scale
+    // each limb by its own falloff over the rig's mean. The differential is
+    // deliberately small — enough that a blast at the ankles clearly lifts the
+    // legs before the head, not enough to tear a rig apart.
+    float blastLimbBias = 0.35f;
+    // The per-limb differential is reduced to ONE rigid motion — a launch
+    // velocity at the rig's centre of mass plus a spin about it — so no
+    // constraint is violated and the joints do no launching (see
+    // Mob::BlastRadial). The spin comes from the angular impulse over a
+    // POINT-MASS inertia (each limb's own spin inertia is ignored, which
+    // overstates it), so this gain corrects for that and is the dial for how
+    // hard a body tumbles. The cap is the "not a helicopter" rule.
+    float blastSpinGain = 0.65f;
+    float blastMaxSpin = 8.0f;  // rad/s
     // Shortest time a creature stays limp before it may start getting up,
     // and the stillness test that then lets it: the pelvis has moved slower
     // than settleSpeed (m/s) for settleSeconds. maxSeconds is the ceiling

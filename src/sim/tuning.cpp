@@ -680,6 +680,9 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadF(*g, "blastMinSpeed", r.blastMinSpeed, out, at);
     ReadF(*g, "maxLaunchSpeed", r.maxLaunchSpeed, out, at);
     ReadF(*g, "blastUpBias", r.blastUpBias, out, at);
+    ReadF(*g, "blastLimbBias", r.blastLimbBias, out, at);
+    ReadF(*g, "blastSpinGain", r.blastSpinGain, out, at);
+    ReadF(*g, "blastMaxSpin", r.blastMaxSpin, out, at);
     ReadF(*g, "minSeconds", r.minSeconds, out, at);
     ReadF(*g, "settleSpeed", r.settleSpeed, out, at);
     ReadF(*g, "settleSeconds", r.settleSeconds, out, at);

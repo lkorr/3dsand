@@ -93,6 +93,11 @@ class Physics {
   // a rig's total mass is known BEFORE it goes dynamic — which is when the
   // blast launch needs it (Mob::BlastRadial).
   float BodyMass(uint64_t handle) const;
+  // Where the body's MASS is, in world voxels — not `GetTransform`'s pos,
+  // which is the voxel lattice's origin corner. A blast that must know how
+  // far each limb of a rig is from the charge has to measure from the mass
+  // (Mob::BlastRadial): a min corner puts a thigh's "position" at its knee.
+  bool BodyCenterOfMass(uint64_t handle, Vec3& outVoxel) const;
   // Linear/angular velocity in voxel units (split halves keep momentum).
   bool GetBodyVelocities(uint64_t handle, Vec3& lin, Vec3& angRadPerSec) const;
   void SetBodyVelocities(uint64_t handle, Vec3 lin, Vec3 angRadPerSec);
@@ -281,7 +286,23 @@ class Physics {
   // Depenetration vector (voxel units) to move the player out of any debris
   // bodies overlapping the proxy shape at centerVoxel. Zero when clear.
   // The caller applies it through its own terrain sweeps.
-  Vec3 PlayerPushOut(uint64_t handle, Vec3 centerVoxel) const;
+  //
+  // `outWorst` names WHAT pushed hardest, because a bare push length is not a
+  // measurement (CLAUDE.md rule 6): the `ragdoll` gate's avatar-on-fire arm
+  // reports a number, and telling "a 0.06 kg gobbet summed eight times" from
+  // "one 9 kg corpse limb released inside the capsule" by turning features off
+  // costs a run per hypothesis. Optional and free when null.
+  struct PushSource {
+    uint64_t body = 0;
+    float massKg = 0;
+    float depthVox = 0;
+  };
+  // Which object layer a body is on: 0 STATIC, 1 MOVING, 2 PLAYER, 3 AVATAR,
+  // -1 dead. The layer is the whole of whether a body can shove the player,
+  // so a push that should have been impossible is answered by this.
+  int BodyObjectLayer(uint64_t handle) const;
+  Vec3 PlayerPushOut(uint64_t handle, Vec3 centerVoxel,
+                     PushSource* outWorst = nullptr) const;
 
   // ---- contact reporting (audio; DESIGN.md §12b) --------------------------
   //
