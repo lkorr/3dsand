@@ -1035,10 +1035,20 @@ bool LoadMobDefs(const std::string& dir, const std::vector<MaterialDef>& mats,
         ld.driveAlignFull = l.value("driveAlignFull", ld.driveAlignFull);
         ld.driveAlignZero = l.value("driveAlignZero", ld.driveAlignZero);
         ld.turnRateMoving = l.value("turnRateMoving", ld.turnRateMoving);
+        // Terrain budgets, authored in metres (anim.h). Absent = the player's
+        // own numbers, which is the point: a creature that cannot walk what the
+        // player walks reads as broken rather than as different.
+        ld.stepUpM = l.value("stepUpM", ld.stepUpM);
+        ld.stepDownM = l.value("stepDownM", ld.stepDownM);
+        ld.headroomM = l.value("headroomM", ld.headroomM);
+        ld.tiltMaxDeg = l.value("tiltMaxDeg", ld.tiltMaxDeg);
         // A zero-width align band would divide by zero in the drive scale.
         if (ld.driveAlignZero <= ld.driveAlignFull)
           ld.driveAlignZero = ld.driveAlignFull + 1e-3f;
         if (ld.turnRate < 0) ld.turnRate = 0;
+        if (ld.stepUpM < 0) ld.stepUpM = 0;
+        if (ld.stepDownM < 0) ld.stepDownM = 0;
+        if (ld.tiltMaxDeg < 0) ld.tiltMaxDeg = 0;
       }
 
       for (const auto& c : j.value("chains", json::array())) {
@@ -1812,46 +1822,247 @@ bool Mob::BuildRig(const MobDef& def, Vec3 origin) {
     restHipY_ = any ? hipOfLowest : 0.0f;
     restFootAhead_ = any ? aheadOfLowest : 0.0f;
   }
+
+  // ---- the terrain budgets, resolved ONCE per body -----------------------
+  // Authored in metres (anim.h LocomotionDef), converted here, and read from
+  // here by the drive, the sense fan, the freefall test AND the A* planner —
+  // one number, four consumers, no chance of the drive and the planner
+  // disagreeing about what a wall is.
+  //
+  // The step-up is CLAMPED BY THE RIG'S OWN LEG SPAN. A default authored for a
+  // human is nonsense on a beetle, and the failure it produces is invisible:
+  // the creature would clear ledges taller than itself and look like it was
+  // gliding up walls. `restHipY_ - restSoleY_` is the standing hip-to-ankle
+  // distance measured off the rig in the block above, so this scales with the
+  // art rather than with a table somebody has to remember to extend.
+  {
+    const float legSpan = std::max(1.0f, restHipY_ - restSoleY_);
+    const int cap = std::max(1, (int)(legSpan * 0.9f));
+    stepUpCells_ = std::clamp(MetresToCellsI(def.skel.loco.stepUpM), 1, cap);
+    stepDownCells_ = std::max(1, MetresToCellsI(def.skel.loco.stepDownM));
+    headroomCells_ = std::max(1, MetresToCellsI(def.skel.loco.headroomM));
+  }
+
   anim_.lastPos = origin_;
   bodyY_ = origin_.y;
   return true;
 }
 
 bool Mob::GroundHeightAt(World& world, int wx, int wz, int yFrom,
-                         int& outY, uint32_t* outMat, bool* outUnknown) const {
+                         int& outY, uint32_t* outMat, bool* outUnknown,
+                         bool* outBlocked) const {
   if (outUnknown != nullptr) *outUnknown = false;
+  if (outBlocked != nullptr) *outBlocked = false;
   // scan down through the chunk cache; request fetches for missing chunks
   // (bounded: one column per creature per tick)
   // 2.4 m of downward scan. Authored in metres: a fixed 24 cells is 2.4 m at
   // 10 cm and 1.2 m at 5 cm, which silently shortens how far a mob can find
   // the ground below it and turns walkable terrain into an invisible drop.
   const int kScanDepth = MetresToCellsI(2.4f);
-  for (int y = yFrom; y > yFrom - kScanDepth; y--) {
-    IVec3 cell{wx, y, wz};
+  // How far UP the probe may climb out of matter it started INSIDE. 1.2 m is
+  // enough to escape a body that outran its own ground snap on a slope, or one
+  // a settling powder buried to the knee; short enough that a creature entombed
+  // under a collapse stays entombed rather than surfacing on top of the
+  // mountain above it (the same "capped, upward only" policy the player's
+  // UnstickRise uses, player.cpp).
+  const int kEscapeUp = MetresToCellsI(1.2f);
+
+  const std::vector<uint32_t>& cls = ClassOf();
+  // ONE chunk lookup per 16 cells, not per cell. `World::Cached` is a hash
+  // lookup and this walks up to 24 consecutive cells of a single column, which
+  // touches two chunks at most. Holding the pointer across the run is what pays
+  // for the extra columns the footprint collider below probes: the per-column
+  // cost drops by an order of magnitude while the column COUNT roughly triples.
+  const CachedChunk* cc = nullptr;
+  int ccY = INT32_MIN;
+  uint32_t lastMat = 0;
+  bool unknown = false;
+  auto supports = [&](int y) -> bool {
+    unknown = false;
+    const IVec3 cell{wx, y, wz};
     if (!world.CellInWindow(cell)) {
-      if (outUnknown != nullptr) *outUnknown = true;
+      unknown = true;
       return false;
     }
-    IVec3 wc{wx >> 4, y >> 4, wz >> 4};
-    const CachedChunk* cc = world.Cached(wc);
-    if (!cc || cc->voxels.size() != kChunkVol) {
-      world.RequestChunkFetch(wc);
-      if (outUnknown != nullptr) *outUnknown = true;
-      return false;
+    const int cy = y >> 4;
+    if (cc == nullptr || cy != ccY) {
+      ccY = cy;
+      cc = world.Cached({wx >> 4, cy, wz >> 4});
+      if (cc != nullptr && cc->voxels.size() != kChunkVol) cc = nullptr;
+      if (cc == nullptr) {
+        world.RequestChunkFetch({wx >> 4, cy, wz >> 4});
+        unknown = true;
+        return false;
+      }
     }
-    uint32_t lx = (uint32_t)(wx & 15), ly = (uint32_t)(y & 15),
-             lz = (uint32_t)(wz & 15);
-    uint32_t mat = cc->voxels[(lz * kChunk + ly) * kChunk + lx] & 0xFFF;
+    const uint32_t lx = (uint32_t)(wx & 15), ly = (uint32_t)(y & 15),
+                   lz = (uint32_t)(wz & 15);
+    const uint32_t mat = cc->voxels[(lz * kChunk + ly) * kChunk + lx] & 0xFFF;
     // solids/powders carry weight; liquids/gases don't (creatures wade, not
     // walk on blood pools)
-    if (mat != 0 && mat < ClassOf().size() &&
-        (ClassOf()[mat] == CLASS_SOLID || ClassOf()[mat] == CLASS_POWDER)) {
-      outY = y + 1;
-      if (outMat != nullptr) *outMat = mat;
+    if (mat != 0 && mat < cls.size() &&
+        (cls[mat] == CLASS_SOLID || cls[mat] == CLASS_POWDER)) {
+      lastMat = mat;
       return true;
+    }
+    return false;
+  };
+
+  // ---- THE PROBE MAY START INSIDE THE GROUND ------------------------------
+  //
+  // This scanned DOWNWARD ONLY, which is correct exactly while the body is
+  // above the surface and catastrophic the moment it is not. A body buried a
+  // voxel deep asked "what is the first solid below me?" and was told "the one
+  // I am standing in", so `outY` came back INSIDE the hill — and every consumer
+  // believed it. `SenseGround` then measured its whole fan of rises against
+  // that fiction and reported flat ground in all eight directions, the drive
+  // walked on, the body sank further, and the creature strolled the rest of the
+  // way through the hill under the surface. That is the "NPCs run through
+  // voxels on a hill" bug, and this is the half of it that made the failure
+  // SELF-SUSTAINING rather than a one-tick glitch.
+  //
+  // So: if the start cell carries weight, walk UP to the first cell that does
+  // not and report that as the surface. A probe taken from a legal standing
+  // position is unaffected (its start cell is air, and the loop below is
+  // reached with nothing done).
+  if (supports(yFrom)) {
+    for (int y = yFrom + 1; y <= yFrom + kEscapeUp; y++) {
+      const uint32_t below = lastMat;
+      if (supports(y)) continue;
+      if (unknown) break;   // ran out of mirror mid-climb: report unknown
+      outY = y;
+      if (outMat != nullptr) *outMat = below;
+      return true;
+    }
+    // Buried deeper than the escape cap, or the mirror ended mid-climb: say so
+    // instead of inventing a surface. `groundUnknown` is what makes gravity
+    // WAIT rather than drop the body through terrain it cannot see
+    // (MobSystem::UpdateFall).
+    //
+    // AND SAY WHICH KIND OF "NO". We know for certain there is weight-bearing
+    // matter in this column at the probe height — we started inside it — and a
+    // caller that reads that as open walks a body into a wall. See the note on
+    // `outBlocked` in mob.h: this was a duelist strolling through the centre of
+    // a stone barrier, and it only appeared when the chunk ABOVE the wall was
+    // not yet in the mirror, so the same fixture passed standalone and failed
+    // in the suite.
+    if (outUnknown != nullptr) *outUnknown = unknown;
+    if (outBlocked != nullptr) *outBlocked = true;
+    return false;
+  }
+  if (unknown) {
+    if (outUnknown != nullptr) *outUnknown = true;
+    return false;
+  }
+
+  for (int y = yFrom - 1; y > yFrom - kScanDepth; y--) {
+    if (supports(y)) {
+      outY = y + 1;
+      if (outMat != nullptr) *outMat = lastMat;
+      return true;
+    }
+    if (unknown) {
+      if (outUnknown != nullptr) *outUnknown = true;
+      return false;
     }
   }
   return false;
+}
+
+bool Mob::CellSupportsWeight(World& world, IVec3 cell) const {
+  if (!world.CellInWindow(cell)) return false;          // outside = open
+  const CachedChunk* cc =
+      world.Cached({cell.x >> 4, cell.y >> 4, cell.z >> 4});
+  if (cc == nullptr || cc->voxels.size() != kChunkVol) return false;  // unknown = open
+  const uint32_t lx = (uint32_t)(cell.x & 15), ly = (uint32_t)(cell.y & 15),
+                 lz = (uint32_t)(cell.z & 15);
+  const uint32_t mat = cc->voxels[(lz * kChunk + ly) * kChunk + lx] & 0xFFF;
+  const std::vector<uint32_t>& cls = ClassOf();
+  if (mat == 0 || mat >= cls.size()) return false;
+  return cls[mat] == CLASS_SOLID || cls[mat] == CLASS_POWDER;
+}
+
+Mob::Footing Mob::FootprintFooting(World& world, const MobDef& def, float cx,
+                                   float cz, float fromY) const {
+  Footing out;
+  // A 3x3 grid over the body box rather than the four corners alone: a
+  // humanoid's footprint spans about six voxels, and corners-only leaves a
+  // one-voxel post standing in the middle of a face unsampled — which is the
+  // shape a shattered wall leaves behind, and the shape this world produces
+  // constantly. Nine columns is also cheap now that GroundHeightAt holds its
+  // chunk pointer across a column scan (see the note there): the per-column
+  // cost fell by roughly an order of magnitude in the same change that raised
+  // the column count.
+  //
+  // INSET BY HALF A VOXEL so a box whose face lands exactly on a cell boundary
+  // does not claim the cell beyond it. Without that a body standing flush
+  // against a wall reports the wall as its own footing and shoves itself up it.
+  const float hx = std::max(0.0f, def.worldSize.x * 0.5f - 0.5f);
+  const float hz = std::max(0.0f, def.worldSize.z * 0.5f - 0.5f);
+  // The probe starts above the body, never at it: a scan begun at the sole
+  // cannot see the lip of the step in front of it.
+  const int yFrom = ifloor(fromY) + kMobProbeLiftCells;
+  // A COLUMN MORE THAN A STEP ABOVE US IS A WALL, NOT FOOTING. Without this
+  // line `groundY` is the max over the whole box including anything the box is
+  // merely pressed against, and the drive's hard upward settle then treats the
+  // top of that as the floor. Measured: a duelist rode an eight-voxel wall like
+  // an escalator and crossed a fixture built to make it walk around.
+  const float standCeil = fromY + (float)stepUpCells_ + 0.01f;
+
+  int best = INT32_MIN;
+  int centreY = INT32_MIN;
+  for (int iz = -1; iz <= 1; iz++) {
+    for (int ix = -1; ix <= 1; ix++) {
+      const int wx = ifloor(cx + hx * (float)ix);
+      const int wz = ifloor(cz + hz * (float)iz);
+      int y = 0;
+      bool blocked = false;
+      if (!GroundHeightAt(world, wx, wz, yFrom, y, nullptr, nullptr,
+                          &blocked)) {
+        // Unknown is open; SOLID-AND-UNMEASURABLE is a wall. The distinction is
+        // the whole point of `outBlocked` — see its note in mob.h.
+        if (blocked) {
+          out.known = true;
+          out.wall = true;
+        }
+        continue;
+      }
+      out.known = true;
+      if (ix == 0 && iz == 0) centreY = y;
+      if ((float)y > standCeil) {
+        out.wall = true;
+        continue;
+      }
+      if (y > best) best = y;
+    }
+  }
+  if (!out.known) return out;
+  // Every column a wall — the body is pressed into something on all sides, or
+  // buried. Fall back to its own centre column so the caller still has a floor
+  // to reason about rather than a garbage height; `wall` already tells it the
+  // move should be refused.
+  out.groundY = best != INT32_MIN ? best
+                                  : (centreY != INT32_MIN ? centreY
+                                                          : ifloor(fromY));
+
+  // Headroom, over the surface the body would actually stand on. Deliberately
+  // a SHORT band, not the creature's height: the same argument the navigator's
+  // UpdatePath makes at length — demanding a full body height over every column
+  // refuses everything under a canopy, a ledge or an arch that the mob would in
+  // fact walk straight through. This rejects a crawlspace and nothing else, and
+  // being looser than reality is the safe direction to be wrong in.
+  for (int iz = -1; iz <= 1 && out.fits; iz++) {
+    for (int ix = -1; ix <= 1 && out.fits; ix++) {
+      const int wx = ifloor(cx + hx * (float)ix);
+      const int wz = ifloor(cz + hz * (float)iz);
+      for (int k = 0; k < headroomCells_; k++) {
+        if (!CellSupportsWeight(world, IVec3{wx, out.groundY + k, wz})) continue;
+        out.fits = false;
+        break;
+      }
+    }
+  }
+  return out;
 }
 
 void Mob::PlayClip(const std::string& name) {
@@ -1888,8 +2099,25 @@ MobSystem::GroundSense MobSystem::SenseGround(const Mob& mob, const MobDef& def,
   const float cx = mob.origin_.x + def.worldSize.x * 0.5f;
   const float cz = mob.origin_.z + def.worldSize.z * 0.5f;
   const int yFrom = ifloor(mob.origin_.y) + kMobProbeLiftCells;
-  s.haveGround = mob.GroundHeightAt(world, ifloor(cx), ifloor(cz), yFrom,
-                                    s.groundY, nullptr, &s.groundUnknown);
+  s.stepUpCells = mob.StepUpCells();
+  // THE FOOTPRINT, NOT THE CENTRE COLUMN. `groundY` is the height the body
+  // actually rests at, so it is the height the BOX is supported at — the max
+  // over the footprint. Taking the centre column made a body on a slope settle
+  // to a reading its own uphill corner was already buried in, and that sinking
+  // is the first link in the "NPCs walk through hills" chain (see the note in
+  // Mob::GroundHeightAt).
+  const Mob::Footing foot =
+      mob.FootprintFooting(world, def, cx, cz, mob.origin_.y);
+  s.haveGround = foot.known;
+  s.groundY = foot.groundY;
+  if (!s.haveGround) {
+    // No column under the box could be answered at all. Distinguish "the mirror
+    // has not delivered this ground yet" from "there is nothing within scan
+    // depth": gravity waits on the first and acts on the second.
+    int probe = 0;
+    mob.GroundHeightAt(world, ifloor(cx), ifloor(cz), yFrom, probe, nullptr,
+                       &s.groundUnknown);
+  }
 
   // Probe at the mob's own footprint plus a margin, so a wide creature notices
   // a wall before its shoulder is already inside it. The reach is taken
@@ -1913,8 +2141,8 @@ MobSystem::GroundSense MobSystem::SenseGround(const Mob& mob, const MobDef& def,
       // treating unknown as blocked makes a mob stop dead at the edge of its
       // own knowledge — it reads as an invisible wall, and it is the mob-scale
       // version of the projectile bug in CLAUDE.md (Unknown is not the same
-      // test as out-of-window). The drive's own ground check still refuses to
-      // walk off into space, so nothing here can strand a mob in the air.
+      // test as out-of-window). The drive's own footprint collider still
+      // refuses to walk into rock, so nothing here can strand a mob.
       //
       // `stepUp` is left at 0 rather than INT_MAX so the intent layer's
       // flatness tie-break does not treat "I cannot see" as "a cliff".
@@ -1924,15 +2152,18 @@ MobSystem::GroundSense MobSystem::SenseGround(const Mob& mob, const MobDef& def,
     }
     const int rise = s.haveGround ? py - s.groundY : 0;
     s.stepUp[i] = rise;
-    // Beyond 20 cm of rise is past step-up reach; a big DROP is survivable but
-    // not desirable, so it is walkable and the intent layer merely prefers
+    // Beyond this body's own step-up reach is a wall; a big DROP is survivable
+    // but not desirable, so it is walkable and the intent layer merely prefers
     // flatter ground.
     //
-    // METRES, like the player's own kMaxStepUpVoxels (player.h:190) which has
-    // derived its budget from kStepUpM since v0.2. This one was a bare 2, so a
-    // mob's step-up silently halved in real terms at 5 cm while the player's
-    // held: the same kerb the player walks over becomes a wall to a mob.
-    s.clear[i] = rise <= kMobStepUpCells;
+    // THE BUDGET IS THE CREATURE'S (anim.h LocomotionDef::stepUpM, resolved in
+    // Mob::BuildRig), not a constant. It was a flat 0.20 m against the player's
+    // 0.58 m, so the same kerb the player strides over read as a wall here: the
+    // forward probe went blocked, the steering deflected to the nearest clear
+    // direction, and the mob crabbed sideways across ground it should have
+    // walked straight up. That is most of the "NPCs move nothing like the
+    // player" complaint, and it is one number.
+    s.clear[i] = rise <= s.stepUpCells;
   }
   return s;
 }
@@ -1961,23 +2192,19 @@ namespace {
 struct AiProbeCtx {
   const Mob* mob = nullptr;
   World* world = nullptr;
-  const std::vector<uint32_t>* classOf = nullptr;
+  // `classOf` was a third copy of "which materials carry weight", read only by
+  // the blocked adapter. That adapter now defers to Mob::CellSupportsWeight,
+  // which reads the mob's own ClassOf() — so this is gone rather than left
+  // around to be picked up by the next adapter that needs the same answer.
 };
 
-// Is this cell something a body cannot stand in? Reads the SAME collision
-// classes the ground probe does, so "walkable" means one thing in this engine.
+// Is this cell something a body cannot stand in? ONE implementation, shared
+// with the drive's footprint collider and the ground probe — a second copy of
+// "what counts as solid" is a copy that eventually disagrees with the
+// locomotion it is steering (ai_nav.h rule 2, applied to the other half of the
+// probe pair).
 bool AiCellBlocked(const AiProbeCtx& c, int x, int y, int z) {
-  const IVec3 cell{x, y, z};
-  if (!c.world->CellInWindow(cell)) return false;      // outside = open
-  const IVec3 wc{x >> 4, y >> 4, z >> 4};
-  const CachedChunk* cc = c.world->Cached(wc);
-  if (cc == nullptr || cc->voxels.size() != kChunkVol) return false;  // unknown = open
-  const uint32_t lx = (uint32_t)(x & 15), ly = (uint32_t)(y & 15),
-                 lz = (uint32_t)(z & 15);
-  const uint32_t mat = cc->voxels[(lz * kChunk + ly) * kChunk + lx] & 0xFFF;
-  if (mat == 0 || mat >= c.classOf->size()) return false;
-  const uint32_t k = (*c.classOf)[mat];
-  return k == CLASS_SOLID || k == CLASS_POWDER;
+  return c.mob->CellSupportsWeight(*c.world, IVec3{x, y, z});
 }
 
 bool AiProbeGround(void* ctx, int x, int z, int yFrom, int& outY) {
@@ -2339,7 +2566,7 @@ void MobSystem::DecideIntent(Mob& mob, const MobDef& def,
   // whole integration: the AI is another OPINION at this seam, and it may still
   // write nothing but desiredHeading and the local drive vector.
   if (mob.ai_.profile >= 0 && world_ != nullptr) {
-    AiProbeCtx pctx{&mob, world_, &classOf_};
+    AiProbeCtx pctx{&mob, world_};
     ai::SelfView self;
     self.id = mob.id_;
     self.origin = mob.origin_;
@@ -2351,6 +2578,12 @@ void MobSystem::DecideIntent(Mob& mob, const MobDef& def,
     // circles (Steer couples turn rate to speed by turnRateMoving).
     self.turnRate = mob.skel_.loco.turnRate *
                     std::max(0.05f, mob.skel_.loco.turnRateMoving);
+    // The planner plans with THE BODY'S OWN budgets, so A* and the walk drive
+    // refuse the same wall by construction rather than by two numbers that
+    // happen to agree (ai_behavior.h SelfView).
+    self.stepUpCells = mob.StepUpCells();
+    self.stepDownCells = mob.StepDownCells();
+    self.headroomCells = mob.HeadroomCells();
     const ai::Profile* prof = behaviors_.At(mob.ai_.profile);
     self.faction = prof != nullptr ? ai::FactionId(prof->faction) : 0u;
 
@@ -2500,7 +2733,6 @@ float MobSystem::Steer(Mob& mob, const MobDef& def, float dt) {
                     (lo.driveAlignZero - lo.driveAlignFull);
 }
 
-// ---- locomotion stage 3: drive ---------------------------------------------
 // ---- locomotion stage 2.5: gravity ------------------------------------------
 // NPCs had no vertical velocity at all: the drive below snaps origin_.y toward
 // the probed ground at 3 cm a tick, and with no ground within the 2.4 m scan it
@@ -2526,7 +2758,11 @@ bool MobSystem::UpdateFall(Mob& mob, const MobDef& def,
   const float drop =
       sense.haveGround ? mob.origin_.y - (float)sense.groundY : 1.0e9f;
   if (!mob.airborne_) {
-    if (sense.haveGround && drop <= (float)kMobStepUpCells + 0.01f)
+    // Supported = the footprint's ground is within one of THIS body's steps.
+    // The budget is the creature's own (Mob::StepUpCells), not the old shared
+    // constant: a rig authored with a longer stride would otherwise be judged
+    // airborne while standing on ground its walk drive was happily climbing.
+    if (sense.haveGround && drop <= (float)mob.StepUpCells() + 0.01f)
       return false;  // supported: the drive's snap owns the height
     mob.airborne_ = true;
     mob.fallVel_ = 0.0f;
@@ -2558,16 +2794,31 @@ bool MobSystem::UpdateFall(Mob& mob, const MobDef& def,
   return true;
 }
 
+// ---- locomotion stage 3: drive ---------------------------------------------
+//
+// THE WALK RESOLVES AGAINST THE BODY'S OWN BOX. This used to be one line —
+// `origin_ += vel * dt` — with the only restraint an 8-way fan of single-column
+// probes taken BEFORE the move. Three things follow from that and all three are
+// visible in play:
+//
+//   * The fan is eight rays, not a collider. A body is a box several voxels
+//     wide, and a wall reached between two probe bearings was simply not
+//     there. The mob drove into it.
+//   * `clear[i]` compares a probe column against the mob's CENTRE column, so
+//     it answers "is the ground over there a step up from the ground under my
+//     middle" — not "does my body fit over there".
+//   * A refused direction stopped the drive dead rather than sliding along the
+//     obstacle, so the only way past a wall was for the steering to turn off
+//     it, and the only way the steering learns to turn is that same fan.
+//
+// So the move is now resolved the way the player's is: try the whole step, and
+// if the body does not fit, try each axis alone. Sliding falls out of that —
+// a mob grazing a rock walks along it instead of stalling against it — and so
+// does climbing, because "fits" includes a legal step up onto the destination.
 void MobSystem::DriveLocomotion(Mob& mob, const MobDef& def,
                                 const GroundSense& sense, float align,
                                 float dt) {
   if (!sense.haveGround) return;  // walk only when footing is known
-
-  // settle feet onto the ground
-  // 3 cm per tick of ground snap. A rate in cells would double in real terms
-  // every time the voxel halved, turning a smooth settle into a pop.
-  const float snap = MetresToCells(0.03f);
-  mob.origin_.y += std::clamp((float)sense.groundY - mob.origin_.y, -snap, snap);
 
   // A maimed mob keeps moving, just slower: the active dismemberment state
   // scales the drive speed (a crawl covers ground at a fraction of a walk; a
@@ -2590,29 +2841,117 @@ void MobSystem::DriveLocomotion(Mob& mob, const MobDef& def,
   // is squarely facing has an alignment of 1 and a sidestep to make, and one
   // giving ground is deliberately walking the way it is NOT looking.
   const float base = def.speed * speedScale;
-  float fwdDrive = base * mob.driveScale_ * align;
-  float sideDrive = base * mob.driveStrafe_;
-
-  // Do not walk into a wall we can already feel, PER DIRECTION. The mob keeps
-  // turning (Steer ran before this and is unaffected), so it grinds along the
-  // obstacle and turns off it rather than freezing against it. The fan is in
-  // the mob's own frame at 45-degree steps, so probe 0 is ahead, 2 is its
-  // right, 4 behind and 6 its left — a back-pedal that ignored probe 4 would
-  // reverse straight into the rock it just stepped away from.
-  if (fwdDrive > 0 && !sense.clear[0]) fwdDrive = 0;
-  if (fwdDrive < 0 && !sense.clear[4]) fwdDrive = 0;
-  if (sideDrive > 0 && !sense.clear[2]) sideDrive = 0;
-  if (sideDrive < 0 && !sense.clear[6]) sideDrive = 0;
-  if (fwdDrive == 0.0f && sideDrive == 0.0f) return;
+  const float fwdDrive = base * mob.driveScale_ * align;
+  const float sideDrive = base * mob.driveStrafe_;
 
   const Vec3 fwd{std::sin(mob.heading_), 0, std::cos(mob.heading_)};
   const Vec3 rgt{std::cos(mob.heading_), 0, -std::sin(mob.heading_)};
-  const Vec3 vel = fwd * fwdDrive + rgt * sideDrive;
-  mob.origin_ += vel * dt;
+
+  // 3 cm per tick of ground settle. A rate in cells would double in real terms
+  // every time the voxel halved, turning a smooth settle into a pop.
+  const float snap = MetresToCells(0.03f);
+  // THE SETTLE IS ASYMMETRIC, AND THAT ASYMMETRY IS THE FIX.
+  //
+  // It was `clamp(groundY - y, -snap, +snap)` — rate-limited in BOTH
+  // directions, with no floor under the body at all. A humanoid walks 31.5
+  // cells/s and the settle climbs 18; on anything steeper than about thirty
+  // degrees the body outruns its own snap and ends up under the surface, at
+  // which point the ground probe used to start reporting the rock BELOW the
+  // buried body as the floor and the creature walked out the far side of the
+  // hill. Downward is still eased, because a soft descent is what a settle is
+  // for; upward is a HARD CLAMP, because "do not be inside the ground" is not a
+  // preference. The rendered height (`bodyY_`) is eased separately in
+  // UpdateGait, so nothing about this pops visually — it is the collision
+  // origin that stops lying.
+  auto settle = [&](float groundY) {
+    if (mob.origin_.y < groundY) mob.origin_.y = groundY;
+    else mob.origin_.y -= std::min(mob.origin_.y - groundY, snap);
+  };
+
+  if ((fwdDrive == 0.0f && sideDrive == 0.0f) || world_ == nullptr) {
+    settle((float)sense.groundY);   // standing still still stands ON something
+    return;
+  }
+
+  // Do not walk into a wall we can already feel, PER DIRECTION. Kept in front
+  // of the collider rather than replaced by it: the fan is what the STEERING
+  // reads, so leaving the drive to discover the same wall a tick later would
+  // let a mob spend that tick pressed into rock. The fan is in the mob's own
+  // frame at 45-degree steps, so probe 0 is ahead, 2 is its right, 4 behind and
+  // 6 its left — a back-pedal that ignored probe 4 would reverse straight into
+  // the rock it just stepped away from.
+  const bool fwdBlocked = (fwdDrive > 0 && !sense.clear[0]) ||
+                          (fwdDrive < 0 && !sense.clear[4]);
+  const bool sideBlocked = (sideDrive > 0 && !sense.clear[2]) ||
+                           (sideDrive < 0 && !sense.clear[6]);
+  Vec3 want{};
+  if (!fwdBlocked) want += fwd * (fwdDrive * dt);
+  if (!sideBlocked) want += rgt * (sideDrive * dt);
+  if (want.x == 0.0f && want.z == 0.0f) {
+    settle((float)sense.groundY);
+    return;
+  }
+
+  // ---- resolve, then settle onto WHERE THE BODY ENDED UP -----------------
+  const float hx = def.worldSize.x * 0.5f, hz = def.worldSize.z * 0.5f;
+  const int stepDown = mob.StepDownCells();
+  float landY = (float)sense.groundY;
+
+  // Can the body stand with its footprint centred here, coming from where it is
+  // now? Unknown footing is walkable (ai_nav.h rule 1) and keeps the height it
+  // came from, so a creature is never fenced in by the edge of the CPU mirror.
+  auto fits = [&](float nx, float nz, float& outStandY) {
+    const Mob::Footing f =
+        mob.FootprintFooting(*world_, def, nx + hx, nz + hz, mob.origin_.y);
+    if (!f.known) {
+      outStandY = mob.origin_.y;
+      return true;
+    }
+    if (f.wall) return false;      // part of the box would be inside something
+    if (!f.fits) return false;     // an overhang
+    const float rise = (float)f.groundY - mob.origin_.y;
+    // A drop past the step budget is not refused, it is DEFERRED: the body
+    // keeps the height it had and MobSystem::UpdateFall takes it from there
+    // next tick. Refusing would weld a creature to the lip of every ledge,
+    // and dropping it here would make the walk drive a second falling model.
+    outStandY = rise < -(float)stepDown ? mob.origin_.y : (float)f.groundY;
+    return true;
+  };
+
+  float standY = 0;
+  Vec3 applied{};
+  if (fits(mob.origin_.x + want.x, mob.origin_.z + want.z, standY)) {
+    applied = want;
+    landY = standY;
+  } else {
+    // WALL SLIDE. Each axis alone, longer component first so a body moving
+    // mostly along a wall keeps the motion that matters. Both may fail, and
+    // that is a legal answer — the steering is still turning.
+    const bool xFirst = std::abs(want.x) >= std::abs(want.z);
+    for (int pass = 0; pass < 2; pass++) {
+      const bool doX = (pass == 0) == xFirst;
+      const float dx = doX ? want.x : 0.0f;
+      const float dz = doX ? 0.0f : want.z;
+      if (dx == 0.0f && dz == 0.0f) continue;
+      if (!fits(mob.origin_.x + dx, mob.origin_.z + dz, standY)) continue;
+      applied = Vec3{dx, 0, dz};
+      landY = standY;
+      break;
+    }
+    if (applied.x == 0.0f && applied.z == 0.0f) {
+      settle((float)sense.groundY);
+      return;
+    }
+  }
+  mob.origin_.x += applied.x;
+  mob.origin_.z += applied.z;
+  settle(landY);
+
   // Stride frequency follows the SPEED, not the forward component: a mob
   // sidestepping is still taking steps, and driving the gait off `fwdDrive`
-  // alone would leave it gliding.
-  mob.phase_ += vel.len() * dt * 2.2f;
+  // alone would leave it gliding. Measured from the distance ACTUALLY covered,
+  // so a body sliding along a wall does not march on the spot.
+  mob.phase_ += applied.len() * 2.2f;
 }
 
 // Procedural gait layer. Writes foot targets into mob.anim_.feet and derives
@@ -2622,6 +2961,36 @@ void MobSystem::UpdateGait(Mob& mob, const MobDef& def, World& world, float dt) 
   const AnimSkeleton& sk = mob.skel_;
   const GaitDef& g = sk.gait;
   if (sk.chains.empty()) return;
+
+  // ---- ONLY LEGS WALK -----------------------------------------------------
+  //
+  // `sk.chains` holds every IK chain the rig publishes, and on every current
+  // humanoid that is two legs AND TWO ARMS. This loop treated all four as feet:
+  // the hands were handed ground contact points, dragged into the body-height
+  // average, and folded into the foot plane the body's TILT was derived from.
+  //
+  // On flat ground all four "feet" land at the same height and nothing shows.
+  // On a slope they emphatically do not, and a quadrilateral whose corners are
+  // two feet and two hands has a normal nothing like the ground's — which is
+  // the "an NPC standing on a ramp is rotated 45 degrees" bug, and why it only
+  // ever appeared on sloped terrain. It also IK-solved both arms down to the
+  // dirt every tick, which the weapon-arm override then partly undid.
+  //
+  // `Mob::BuildRig` has filtered on this exact tag since restSoleY_ was
+  // written. The gait never did.
+  //
+  // The fallback is deliberate: a rig that tags NO chain "leg" is a legacy rig
+  // whose chains are all legs by convention, and silently giving it no gait at
+  // all would be a worse failure than the one being fixed.
+  bool anyLegTag = false;
+  for (const IkChain& ch : sk.chains)
+    if (ch.tag == "leg") {
+      anyLegTag = true;
+      break;
+    }
+  auto isLeg = [&](size_t c) {
+    return !anyLegTag || sk.chains[c].tag == "leg";
+  };
 
   Vec3 fwd{std::sin(mob.heading_), 0, std::cos(mob.heading_)};
   // Scale stride and lift by SPEED so a standing mob's feet are perfectly
@@ -2648,12 +3017,19 @@ void MobSystem::UpdateGait(Mob& mob, const MobDef& def, World& world, float dt) 
 
   float sumY = 0;
   int nFeet = 0;
-  Vec3 planeAccum{};
-  std::vector<Vec3> plantedPts;
 
   for (size_t c = 0; c < sk.chains.size() && c < mob.anim_.feet.size(); c++) {
     const IkChain& ch = sk.chains[c];
     FootState& f = mob.anim_.feet[c];
+    // Not a leg: no contact point, and `valid = false` is also what makes
+    // UpdateAnimation's IK pass give this chain zero weight, so an arm falls
+    // through to whatever the clips and the weapon-arm override pose it as
+    // instead of reaching for the floor.
+    if (!isLeg(c)) {
+      f.valid = false;
+      f.swinging = false;
+      continue;
+    }
     // limb loss: stop scheduling this leg's steps entirely. The body-from-feet
     // average below then re-centers on the survivors for free.
     bool alive = true;
@@ -2724,7 +3100,6 @@ void MobSystem::UpdateGait(Mob& mob, const MobDef& def, World& world, float dt) 
       }
       sumY += f.planted.y;
       nFeet++;
-      plantedPts.push_back(f.planted);
     }
   }
 
@@ -2743,7 +3118,16 @@ void MobSystem::UpdateGait(Mob& mob, const MobDef& def, World& world, float dt) 
     // its own art rather than a leg-length above it — the raw
     // `footAvg + rideHeight*legLength` treated a min corner as a hip and is
     // the other half of why mobs hovered.
-    float stance = (g.rideHeight - 1.0f) * mob.anim_.feet[0].legLength;
+    // A LEG's length, not chain zero's. They are the same on every current
+    // rig only because legs happen to be listed first; a sidecar that lists an
+    // arm first would silently scale the whole stance by an arm.
+    float legLen = mob.anim_.feet[0].legLength;
+    for (size_t c = 0; c < sk.chains.size() && c < mob.anim_.feet.size(); c++)
+      if (isLeg(c)) {
+        legLen = mob.anim_.feet[c].legLength;
+        break;
+      }
+    float stance = (g.rideHeight - 1.0f) * legLen;
     float targetY = sumY / (float)nFeet - mob.restSoleY_ + stance;
     if (!mob.footInit_) {
       mob.bodyY_ = targetY;
@@ -2755,25 +3139,72 @@ void MobSystem::UpdateGait(Mob& mob, const MobDef& def, World& world, float dt) 
     mob.bodyY_ += std::clamp(mob.origin_.y - mob.bodyY_, -0.4f, 0.4f);
     mob.footInit_ = true;
   }
-  // Body TILT from the foot-plane normal — same idea as the height: the mob
-  // leans to match the ground it is actually standing on, derived, not coded.
+  // ---- BODY TILT: FROM THE GROUND, IN THE BODY'S OWN FRAME, CLAMPED -------
+  //
+  // This used to fit a plane through the planted feet with Newell's method and
+  // take its normal. Four things were wrong with that, and only one of them was
+  // that two of the "feet" were hands (see the legs-only note at the top):
+  //
+  //   * A BIPED has at most two planted feet, so the `>= 3` gate never fired
+  //     and a two-legged creature never leaned at all. Two rigs, two different
+  //     slope behaviours, neither authored.
+  //   * A QUADRUPED's contact set changes every time a foot swings, so the
+  //     normal jittered with the gait rather than with the ground.
+  //   * The only bound on the result was `up.y > 0.6`, which admits 53 degrees
+  //     of lean in ANY direction — including pure ROLL. A body rolled that far
+  //     about its own forward axis is exactly the "standing on a ramp and
+  //     rotated for no reason" complaint.
+  //   * A tilt derived from contact points is a SURFACE ALIGNMENT. A walking
+  //     animal's torso stays near vertical and leans a little into the grade;
+  //     it does not lie down parallel to the hill.
+  //
+  // Asking the GROUND instead answers all four at once. Four probes fore/aft
+  // and left/right of the footprint give a pitch and a roll directly, in the
+  // mob's own frame, each clamped by its own authored ceiling
+  // (LocomotionDef::tiltMaxDeg). Any leg count, no gait coupling, and a bound
+  // stated in degrees rather than one that falls out of a dot product.
   Vec3 targetUp{0, 1, 0};
-  if (plantedPts.size() >= 3) {
-    // Newell's method: a robust plane normal from any polygon of contact
-    // points (handles non-planar and near-degenerate foot sets gracefully,
-    // unlike a single cross product of three arbitrary feet).
-    Vec3 n{};
-    for (size_t i = 0; i < plantedPts.size(); i++) {
-      const Vec3& a = plantedPts[i];
-      const Vec3& b = plantedPts[(i + 1) % plantedPts.size()];
-      n.x += (a.y - b.y) * (a.z + b.z);
-      n.y += (a.z - b.z) * (a.x + b.x);
-      n.z += (a.x - b.x) * (a.y + b.y);
-    }
-    if (n.y < 0) n = n * -1.0f;
-    Vec3 up = n.normalized();
-    // cap the lean: a foot on a 1-voxel ledge shouldn't tip the mob over
-    if (up.len() > 0.5f && up.y > 0.6f) targetUp = up;
+  {
+    const Vec3 rgt{std::cos(mob.heading_), 0, -std::sin(mob.heading_)};
+    // The baseline the grade is measured over. A body's own footprint is the
+    // right scale: shorter and single voxels of surface noise read as cliffs,
+    // longer and the creature leans to terrain it is nowhere near.
+    const float span =
+        std::max(1.5f, std::max(def.worldSize.x, def.worldSize.z) * 0.5f);
+    const float cx = mob.origin_.x + def.worldSize.x * 0.5f;
+    const float cz = mob.origin_.z + def.worldSize.z * 0.5f;
+    const int yFrom = ifloor(mob.origin_.y) + kMobProbeLiftCells;
+    // The GRADIENT under the body, as a rise over a run, in the mob's own
+    // frame. No trig on the terrain at all: the horizontal part of a plane's
+    // up-vector IS the negated gradient, and its length is tan(lean) — so the
+    // lean is clamped by clamping that length, which needs one tangent of a
+    // per-rig constant and nothing else.
+    auto grade = [&](Vec3 dir) {
+      int hi = 0, lo = 0;
+      const bool okHi = mob.GroundHeightAt(world, ifloor(cx + dir.x * span),
+                                           ifloor(cz + dir.z * span), yFrom, hi);
+      const bool okLo = mob.GroundHeightAt(world, ifloor(cx - dir.x * span),
+                                           ifloor(cz - dir.z * span), yFrom, lo);
+      // Unknown ground is FLAT ground here, not a cliff — the same rule the
+      // rest of the locomotion layer lives by, and the reason a mob at the edge
+      // of the CPU mirror does not suddenly lurch.
+      return (okHi && okLo) ? (float)(hi - lo) / (2.0f * span) : 0.0f;
+    };
+    // Negated because `up` leans AWAY from the rise: ground higher ahead tips
+    // the body back, not forward.
+    Vec3 lean = fwd * -grade(fwd) + rgt * -grade(rgt);
+    // ONE CEILING ON THE TOTAL LEAN, not one per axis. Clamping pitch and roll
+    // separately lets a body standing on a corner combine both and end up
+    // sqrt(2) times the number the rig authored — which is not what
+    // "tiltMaxDeg" says, and the extra 40% lands squarely in the range that
+    // reads as a creature lying over sideways. What the engine promises is a
+    // maximum angle off vertical, so that is the thing that is bounded.
+    const float leanMax = std::tan(std::clamp(mob.skel_.loco.tiltMaxDeg,
+                                              0.0f, 60.0f) * 0.0174532925f);
+    const float leanLen = lean.len();
+    if (leanLen > leanMax) lean = lean * (leanMax / std::max(leanLen, 1e-6f));
+    targetUp = (Vec3{0, 1, 0} + lean).normalized();
+    if (targetUp.y < 0.5f) targetUp = Vec3{0, 1, 0};
   }
   // ease toward the target normal so stepping onto a new block doesn't snap
   mob.bodyUp_ = (mob.bodyUp_ * 0.85f + targetUp * 0.15f).normalized();
@@ -8167,6 +8598,24 @@ Vec3 MobSystem::MobFacing(uint64_t mobId) const {
 float MobSystem::MobHeading(uint64_t mobId) const {
   for (const Mob& mob : mobs_)
     if (mob.id_ == mobId) return mob.heading_;
+  return 0;
+}
+
+Vec3 MobSystem::MobBodyUp(uint64_t mobId) const {
+  for (const Mob& mob : mobs_)
+    if (mob.id_ == mobId) return mob.bodyUp_;
+  return {0, 1, 0};
+}
+
+int MobSystem::MobStepUpCells(uint64_t mobId) const {
+  for (const Mob& mob : mobs_)
+    if (mob.id_ == mobId) return mob.StepUpCells();
+  return 1;
+}
+
+float MobSystem::MobTiltMaxDeg(uint64_t mobId) const {
+  for (const Mob& mob : mobs_)
+    if (mob.id_ == mobId) return mob.skel_.loco.tiltMaxDeg;
   return 0;
 }
 

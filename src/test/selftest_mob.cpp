@@ -4479,22 +4479,95 @@ Status GateAiApproach(Ctx& c, std::string& detail) {
       if (c.mats[i].name == "stone") return (uint32_t)i;
     return 1u;
   }();
-  const int kWallHalfX = 16, kWallHeight = 8;
+
+  // ---- THE CREATURE FIRST, AND PINNED ------------------------------------
+  //
+  // Two reasons, both learned the hard way, and both about the fixture rather
+  // than about the AI.
+  //
+  //   * The wall's height has to be measured against THIS BODY'S STRIDE, and
+  //     the only honest source for that is the body (Mob::StepUpCells, resolved
+  //     from the rig). A literal was fine while every mob stepped 0.20 m and
+  //     became a test of nothing the day they got the player's 0.58 m.
+  //   * A mob with no profile WANDERS. Every tick spent writing the wall and
+  //     pulling it into the mirror was a tick the subject spent walking, and it
+  //     arrived at the measured loop wherever it happened to get to — once
+  //     already past the barrier. `dummy` is the authored profile whose whole
+  //     content is `mobile: false`, so the creature stands still until the
+  //     fixture is built and the duel is switched on below.
+  //
+  // Spawn so the mob's CENTRE lands on the flat spot: Spawn takes the prefab's
+  // min corner, and a humanoid's box is wide enough that ignoring that puts the
+  // creature half a body off the line the wall is built across.
+  std::string why;
+  const uint64_t id =
+      AiSpawn(c, defIndex,
+              {spot.x - (int)(def.worldSize.x * 0.5f), spot.y + 1,
+               spot.z - (int)(def.worldSize.z * 0.5f)},
+              "dummy", why);
+  if (id == 0) {
+    detail = why;
+    SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+    c.ctx.WaitIdle();
+    return Status::Fail;
+  }
+  const int stepUp = c.mobs.MobStepUpCells(id);
+  const float mobStand = (float)(spot.y + 1);
+  // THE WALL'S HEIGHT IS RELATIVE TO THE CREATURE, NOT A LITERAL 8.
+  //
+  // It was eight voxels above EACH COLUMN'S OWN TERRAIN, which is two
+  // assumptions that both went stale the moment mobs were given the player's
+  // stride (0.58 m, five cells) instead of their old 0.20 m:
+  //
+  //   * eight is only a wall to a body that cannot step five, and
+  //   * "above its own column" is not "above the approach" on undulating
+  //     ground — with three voxels of relief the mob walked up to a barrier
+  //     whose top was four voxels above ITS feet and stepped onto it, exactly
+  //     as it would a kerb.
+  //
+  // The gate then reported "crossed the wall plane, 0.2 voxels from centre",
+  // which reads like walking through solid rock and was in fact a legal climb
+  // over a fixture that had quietly stopped being a wall. So: one ABSOLUTE top,
+  // derived from the tallest ground anywhere near the approach plus twice any
+  // sane step budget, and every column filled up to it. A fixture that measures
+  // itself against the thing under test cannot rot when that thing is retuned.
+  const int kWallHalfX = 16;
+  int wallTop = 0, wallRise = 0;
   {
-    std::vector<CellOp> wall;
     const int wz = spot.z + gapVox / 2;
+    int highest = th;
+    for (int wx = spot.x - kWallHalfX; wx <= spot.x + kWallHalfX; wx++)
+      for (int dz = -2; dz <= 3; dz++)
+        highest = std::max(highest,
+                           World::TerrainHeight(wx, wz + dz, kDefaultSeed));
+    highest = std::max(highest, World::TerrainHeight(spot.x, spot.z, kDefaultSeed));
+    // TWO CELLS PAST WHAT THIS BODY CAN STEP, measured from where it STANDS —
+    // and no taller, because the gate also needs the duelist to SEE its target
+    // over the barrier the whole time (a wall that breaks line of sight makes a
+    // perception failure look like a navigation failure, which is the one
+    // confusion this fixture exists to avoid). Also never below the local
+    // terrain, or undulation punches a hole in it.
+    wallTop = std::max(highest + 1, (int)mobStand + stepUp + 2);
+    wallRise = wallTop - (int)mobStand;
+    std::vector<CellOp> wall;
     for (int wx = spot.x - kWallHalfX; wx <= spot.x + kWallHalfX; wx++) {
       const int wh = World::TerrainHeight(wx, wz, kDefaultSeed);
       // Two voxels thick: the ground probe samples columns, and a one-voxel
       // sheet can be stepped across diagonally between two column centres.
       for (int dz = 0; dz < 2; dz++)
-        for (int k = 0; k < kWallHeight; k++) {
-          const IVec3 cell{wx, wh + 1 + k, wz + dz};
+        for (int y = wh + 1; y <= wallTop; y++) {
+          const IVec3 cell{wx, y, wz + dz};
           if (!c.world.CellInWindow(cell)) continue;
           wall.push_back(CellOp{World::SlotCellIndex(cell), stone});
         }
     }
-    tick({}, wall);
+    // Several thousand cells now; feed the queue in slices rather than assuming
+    // one submission swallows them all.
+    const size_t kSlice = 4000;
+    for (size_t i = 0; i < wall.size(); i += kSlice)
+      tick({}, std::vector<CellOp>(
+                   wall.begin() + (ptrdiff_t)i,
+                   wall.begin() + (ptrdiff_t)std::min(i + kSlice, wall.size())));
   }
   // ---- get the wall into the mirror the NAVIGATOR reads --------------------
   //
@@ -4525,8 +4598,7 @@ Status GateAiApproach(Ctx& c, std::string& detail) {
     for (int i = 0; i < 60; i++) {
       bool all = true;
       for (int wx = spot.x - kWallHalfX; wx <= spot.x + kWallHalfX; wx += 4) {
-        const int wh = World::TerrainHeight(wx, wz, kDefaultSeed);
-        const IVec3 cell{wx, wh + 2, wz};
+        const IVec3 cell{wx, wallTop, wz};
         if (cachedSolid(cell)) continue;
         all = false;
         c.world.RequestChunkFetch({cell.x >> 4, cell.y >> 4, cell.z >> 4});
@@ -4537,26 +4609,58 @@ Status GateAiApproach(Ctx& c, std::string& detail) {
     }
   }
 
-  // Spawn so the mob's CENTRE lands on the flat spot: Spawn takes the prefab's
-  // min corner, and a humanoid's box is wide enough that ignoring that puts the
-  // creature half a body off the line the wall was built across — which showed
-  // up as a start distance of 11 voxels on a 20-voxel fixture, already inside
-  // the band the gate was about to test.
-  std::string why;
-  const uint64_t id =
-      AiSpawn(c, defIndex,
-              {spot.x - (int)(def.worldSize.x * 0.5f), spot.y + 1,
-               spot.z - (int)(def.worldSize.z * 0.5f)},
-              "duelist", why);
-  if (id == 0) {
-    detail = why;
+  // ---- THE SIGHT LINE RISES WITH THE WALL --------------------------------
+  // The target used to sit a flat eight voxels over its own ground, which
+  // cleared a seven-voxel barrier and nothing taller. Solve for it instead:
+  // the ray from the mob's chest to the target's passes over the wall plane at
+  // the midpoint of the gap, so putting the target where that midpoint clears
+  // `wallTop` by three keeps the duelist's eyes on it for ANY wall this gate
+  // decides it needs — which is the property the fixture actually wants, rather
+  // than a number that happened to work once.
+  const float mobChest = mobStand + def.worldSize.y * 0.5f;
+  const float targetY =
+      std::max((float)th + 8.0f, 2.0f * ((float)wallTop + 3.0f) - mobChest);
+  c.mobs.SetPlayerActor(Vec3{(float)tx, targetY, (float)tz}, 3.0f, 17.0f, true);
+  // ...and NOW it is a duelist. Everything above ran with the creature pinned.
+  if (!c.mobs.SetMobBehavior(id, "duelist")) {
+    detail = "no behaviour profile \"duelist\"";
     SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
     c.ctx.WaitIdle();
     return Status::Fail;
   }
-  c.mobs.SetPlayerActor(Vec3{(float)tx, (float)th + 8.0f, (float)tz}, 3.0f,
-                        17.0f, true);
-  for (int i = 0; i < 20; i++) tick();   // anchors fetch the chunks around the mob
+  // THE CROSSING DETECTOR HAS TO WATCH THE WARM-UP TICKS TOO.
+  //
+  // It did not, and the failure that taught this is the exact one `ai-slope`
+  // hit from the other direction: these twenty ticks are a creature walking
+  // with nobody looking, and the fastest rig in the pack covers a voxel a tick.
+  // When it happened to be past the wall by the first measured sample, the gate
+  // recorded "crossed at tick 0, 0.2 voxels from the wall's centre" — which
+  // reads exactly like walking THROUGH the barrier and was in fact a detour
+  // completed off-camera. Two runs went into telling those apart, and the same
+  // fixture ran GREEN standalone and RED in-suite purely because the residency
+  // window put it on different terrain and changed how far it got.
+  //
+  // So the crossing is recorded from the tick the creature exists, and a
+  // crossing during the warm-up is reported with a NEGATIVE tick rather than
+  // being silently attributed to the first observed frame.
+  const float wallZ = (float)(spot.z + gapVox / 2);
+  const float wallHalfX = (float)kWallHalfX;
+  float crossX = 0, crossY = 0;
+  int crossTick = INT32_MIN;
+  int stepNo = -20;
+  auto noteCross = [&]() {
+    if (crossTick != INT32_MIN) return;
+    const Vec3 ctr = AiMobCentre(c.mobs, id, def);
+    if (ctr.z <= wallZ) return;
+    crossTick = stepNo;
+    crossX = std::abs(ctr.x - (float)spot.x);
+    crossY = c.mobs.MobOrigin(id).y;   // OVER the wall and AROUND it differ
+  };
+  for (int i = 0; i < 20; i++) {   // anchors fetch the chunks around the mob
+    tick();
+    noteCross();
+    stepNo++;
+  }
 
   // Does the CHUNK CACHE have the wall, and is it CONTINUOUS? Every column, at
   // the ground+2 the step-up limit cares about, read out of the same mirror the
@@ -4566,9 +4670,12 @@ Status GateAiApproach(Ctx& c, std::string& detail) {
   {
     const int wz = spot.z + gapVox / 2;
     for (int wx = spot.x - kWallHalfX; wx <= spot.x + kWallHalfX; wx++) {
-      const int wh = World::TerrainHeight(wx, wz, kDefaultSeed);
       wallCols++;
-      if (cachedSolid(IVec3{wx, wh + 2, wz})) wallSeen++;
+      // AT THE TOP, not at ground+2. The claim that matters is "the barrier is
+      // as tall as this gate built it, everywhere" — a mirror that has the
+      // bottom of the wall and not the top is precisely the state in which a
+      // creature steps over it.
+      if (cachedSolid(IVec3{wx, wallTop, wz})) wallSeen++;
     }
   }
 
@@ -4578,7 +4685,7 @@ Status GateAiApproach(Ctx& c, std::string& detail) {
   const float bandTol = (float)BaselineNumber("aiApproachBandTolVox", 2.5);
   const float minClear = (float)BaselineNumber("aiApproachMinClearVox", 3.0);
 
-  const Vec3 targetC{(float)tx, (float)th + 8.0f, (float)tz};
+  const Vec3 targetC{(float)tx, targetY, (float)tz};
   const float startDist = AiPlanar(AiMobCentre(c.mobs, id, def), targetC);
   int arriveTick = -1;
   float minDist = 1e9f;
@@ -4595,22 +4702,13 @@ Status GateAiApproach(Ctx& c, std::string& detail) {
   // WHERE it crossed the wall's plane, not merely that it got past. A detour is
   // a crossing at |x| beyond the wall's end; walking THROUGH one is a crossing
   // at x ~ 0, and the two are indistinguishable from "arrived at tick N".
-  const float wallZ = (float)(spot.z + gapVox / 2);
-  const float wallHalfX = (float)kWallHalfX;
-  float crossX = 0;
-  int crossTick = -1;
-  int stepNo = 0;
   Vec3 prevPos = c.mobs.MobOrigin(id);
   auto step = [&]() {
     tick();
     const Vec3 now = c.mobs.MobOrigin(id);
     travelled += AiPlanar(now, prevPos);
     prevPos = now;
-    const Vec3 ctr = AiMobCentre(c.mobs, id, def);
-    if (crossTick < 0 && ctr.z > wallZ) {
-      crossTick = stepNo;
-      crossX = std::abs(ctr.x - (float)spot.x);
-    }
+    noteCross();
     stepNo++;
     const ai::Brain* br = c.mobs.MobBrain(id);
     if (br != nullptr) {
@@ -4628,6 +4726,7 @@ Status GateAiApproach(Ctx& c, std::string& detail) {
     // it" and "it oscillated". Cheap and off by default in spirit — 12 lines
     // over a 600-tick run.
     if (br != nullptr && (stepNo % 50) == 0) {
+      const Vec3 ctr = AiMobCentre(c.mobs, id, def);
       const bool haveWp = !br->path.Done();
       const Vec3 wp = haveWp ? br->path.Current() : Vec3{};
       std::printf(
@@ -4668,6 +4767,10 @@ Status GateAiApproach(Ctx& c, std::string& detail) {
   }
 
   const int outAllowed = (int)BaselineNumber("aiApproachOutOfBandTicks", 12);
+  // The fixture has to be a wall FOR THIS CREATURE. Asserted rather than
+  // assumed: a rig re-authored with a longer stride would otherwise turn this
+  // gate into a test of nothing, silently and in the passing direction.
+  const bool wallIsAWall = wallRise > stepUp;
   // A duel with no swings in it is not a duel. This is the one assertion that
   // ties the whole chain — perceive, path, hold range, aim — to the seam Phase
   // C consumes: the arbiter can score perfectly and still never fire if the
@@ -4678,22 +4781,25 @@ Status GateAiApproach(Ctx& c, std::string& detail) {
   // Without this the gate is satisfied by a mob that walks straight over a
   // 6-voxel step the locomotion is supposed to refuse, which would make it a
   // test of nothing.
-  const bool detoured = crossTick >= 0 && crossX > wallHalfX * 0.6f;
-  const bool ok = wallSeen == wallCols && arriveTick >= 0 && everPathed &&
-                  detoured &&
+  const bool detoured =
+      crossTick != INT32_MIN && crossX > wallHalfX * 0.6f;
+  const bool ok = wallSeen == wallCols && wallIsAWall && arriveTick >= 0 &&
+                  everPathed && detoured &&
                   minDist >= minClear && outOfBand <= outAllowed &&
                   attacks >= minAttacks;
   RecordObserved("aiApproachArriveTick", (double)arriveTick);
   RecordObserved("aiApproachAttacks", (double)attacks);
   detail = Format(
-      "wall %d/%d columns in mirror (half-width %.0f), start %.1f vox, crossed "
-      "the wall "
-      "plane at tick %d, |x| %.1f from centre (detour %d), arrived tick %d/%d "
+      "wall %d/%d columns in mirror (half-width %.0f, rises %d vox over the "
+      "approach vs a %d-cell stride: wall %d), start %.1f vox, crossed the wall "
+      "plane at tick %d, |x| %.1f from centre at y %+.1f (detour %d), arrived "
+      "tick %d/%d "
       "(%.0f vox walked), pathed %d, band [%.1f,%.1f]+-%.1f: %d/%d ticks out "
       "(worst %.2f), closest %.2f (>= %.1f), %d attacks (>= %d), %u replans, "
       "intents idle/face/appr/hold/circ/atk %d/%d/%d/%d/%d/%d, relief %d",
-      wallSeen, wallCols, wallHalfX, startDist, crossTick, crossX,
-      detoured ? 1 : 0,
+      wallSeen, wallCols, wallHalfX, wallRise, stepUp, wallIsAWall ? 1 : 0,
+      startDist, crossTick, crossX,
+      crossY - (float)spot.y, detoured ? 1 : 0,
       arriveTick, budget, travelled, everPathed ? 1 : 0, dp.movement.rangeMin,
       dp.movement.rangeMax, bandTol, outOfBand, holdTicks, worstOut, minDist,
       minClear, attacks, minAttacks,
@@ -4707,6 +4813,341 @@ Status GateAiApproach(Ctx& c, std::string& detail) {
   c.mobs.Reset();
   // The wall is real grid state and the gates after this one place fixtures by
   // absolute coordinate (CLAUDE.md rule 7).
+  SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+  c.ctx.WaitIdle();
+  return ok ? Status::Pass : Status::Fail;
+}
+
+// ---- ai-slope ---------------------------------------------------------------
+//
+// THE TWO WAYS AN NPC MOVES WRONG ON A HILL, AS TWO NUMBERS.
+//
+// Everything above this gate tests navigation on FLAT ground: `ai-approach`
+// builds a vertical wall precisely so the creature has to go AROUND it, and a
+// vertical wall is the one obstacle whose failure mode is visible in a planar
+// distance. That left the whole sloped-terrain regime — which is most of the
+// world — asserted by nothing at all, and both bugs this gate pins lived there
+// for as long as the AI has existed:
+//
+//   depthVox  How far the body's own min corner ever got BELOW the surface it
+//             was standing on. The walk drive settled the origin toward the
+//             probed ground at 3 cm a tick while a humanoid walks 3.15 m/s, so
+//             on anything steeper than about thirty degrees the body outran its
+//             own settle and sank. Once it was under the surface the ground
+//             probe — which only ever scanned DOWNWARD — reported the rock
+//             beneath the buried body as the floor, every one of the eight
+//             sense probes read flat against that fiction, and the creature
+//             walked the rest of the way through the hill. Must stay at zero:
+//             this is not a tolerance, it is "the body is not inside the
+//             ground".
+//   tiltDeg   How far the body ever leaned off vertical. The lean came from a
+//             plane fitted through the "planted feet", except that the gait
+//             counted every IK chain as a foot and a humanoid publishes two
+//             legs AND TWO ARMS — so the plane was fitted through two feet and
+//             two hands, which on a slope are nowhere near coplanar with the
+//             ground. Bounded only by "the normal's y is above 0.6", i.e. 53
+//             degrees, in any direction including pure roll. That is the
+//             "standing on a ramp and rotated 45 degrees for no reason"
+//             complaint, and it is why it only ever showed up on slopes.
+//
+// A THIRD CLAIM, and the reason the fixture is a ramp rather than a cliff:
+// the creature must actually GET UP IT. A body that refuses every slope passes
+// both numbers above trivially by standing still, and that was very nearly the
+// old behaviour — the mob's step-up budget was a flat 0.20 m against the
+// player's 0.58 m, so a kerb the player strides over read as a wall, the
+// forward probe went blocked, and the steering deflected sideways. `climbedVox`
+// is what separates "does not sink" from "does not move".
+//
+// THE FIXTURE IS A STAIRCASE, NOT A SMOOTH WEDGE. Each column is one voxel
+// higher than the one behind it, so every individual step is comfortably inside
+// any sane budget and the gate is testing the SETTLE RATE rather than the step
+// rule. A smooth 45-degree wedge would confound the two.
+Status GateAiSlope(Ctx& c, std::string& detail) {
+  c.debris.Reset();
+  c.mobs.Reset();
+  SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+  c.ctx.WaitIdle();
+
+  const int defIndex = AiHumanoidDef(c.mobs);
+  if (defIndex < 0) {
+    detail = "no mob def publishes a held_right socket";
+    return Status::Fail;
+  }
+  const MobDef& def = c.mobs.Defs()[defIndex];
+  if (c.mobs.Behaviors().Find("duelist") < 0) {
+    detail = "no \"duelist\" profile in assets/mobs/behaviors.json";
+    return Status::Fail;
+  }
+
+  int relief = 0;
+  const IVec3 anchor = AiFixtureCentre(c.world);
+  const IVec3 spot = AiFlatSpot(anchor.x, anchor.z, 96, 26, kDefaultSeed, relief);
+  const int h0 = World::TerrainHeight(spot.x, spot.z, kDefaultSeed);
+
+  AiTicker tick{c, 7600, {spot.x >> 4, spot.y >> 4, spot.z >> 4}};
+
+  const uint32_t stone = [&] {
+    for (size_t i = 0; i < c.mats.size(); i++)
+      if (c.mats[i].name == "stone") return (uint32_t)i;
+    return 1u;
+  }();
+
+  // ---- the ramp ----------------------------------------------------------
+  // Rises from `rampZ0` toward +Z at one voxel per column, then a flat crest to
+  // stand the target on. Wide enough (+-kHalfX) that walking round it is not a
+  // shortcut inside the planner's radius, so the creature is genuinely being
+  // asked to climb.
+  // THE RAMP STARTS WELL CLEAR OF THE SPAWN, and that gap is load-bearing
+  // rather than tidy. The first version put it four voxels away, and the
+  // fastest rig in the pack walks a voxel a tick: the creature had climbed the
+  // entire thing during the warm-up ticks, before the measuring loop began, and
+  // the gate reported "climbed 0.0" about a mob standing serenely on the crest.
+  // A fixture whose subject finishes the test before the test starts is the
+  // worst kind of green.
+  // The whole fixture has to fit inside the duelist's 46-voxel sight range,
+  // measured PLANAR from the spawn — a ramp long enough to be interesting and a
+  // crest deep enough to hold on adds up fast, and a creature that never
+  // perceives its target reports the same "climbed 0.0" as one that refused the
+  // slope. The gate says which (`targeted`) rather than leaving the next reader
+  // to guess.
+  const int kHalfX = 20, kRampLen = 16, kCrestLen = 18;
+  const int rampZ0 = spot.z + 8;
+  const int crestY = h0 + kRampLen;
+  {
+    std::vector<CellOp> ops;
+    for (int dz = 0; dz < kRampLen + kCrestLen; dz++) {
+      const int wz = rampZ0 + dz;
+      const int topY = h0 + std::min(dz, kRampLen);
+      for (int wx = spot.x - kHalfX; wx <= spot.x + kHalfX; wx++) {
+        // From each column's OWN terrain height, so undulation cannot leave the
+        // ramp floating over a dip or buried in a rise.
+        const int base = World::TerrainHeight(wx, wz, kDefaultSeed);
+        // A column whose own terrain already stands above the ramp profile is
+        // filled to the terrain, not skipped: `for (y = base; y <= topY)` with
+        // base > topY writes nothing at all, and a hole in the middle of the
+        // ramp turns this into a test of something else entirely.
+        for (int y = base; y <= std::max(topY, base); y++) {
+          const IVec3 cell{wx, y, wz};
+          if (!c.world.CellInWindow(cell)) continue;
+          ops.push_back(CellOp{World::SlotCellIndex(cell), stone});
+        }
+      }
+    }
+    // The queue is bounded per tick; feed it in slices rather than assuming one
+    // submission swallows a few thousand cells.
+    const size_t kSlice = 4000;
+    for (size_t i = 0; i < ops.size(); i += kSlice) {
+      std::vector<CellOp> slice(ops.begin() + (ptrdiff_t)i,
+                                ops.begin() + (ptrdiff_t)std::min(i + kSlice,
+                                                                 ops.size()));
+      tick({}, slice);
+    }
+  }
+
+  // ---- get the ramp into the mirror the LOCOMOTION reads -----------------
+  // Same trap `ai-approach` documents at length: two CPU mirrors exist and the
+  // ground probe reads the CHUNK CACHE, which holds whatever version was last
+  // fetched. A chunk an earlier gate pulled in before the ramp existed stays
+  // that way until something asks again, and the creature then walks through a
+  // ramp its own probe cannot see — which would make this gate pass for the
+  // wrong reason.
+  auto cachedSolid = [&](IVec3 cell) {
+    const CachedChunk* cc =
+        c.world.Cached({cell.x >> 4, cell.y >> 4, cell.z >> 4});
+    if (cc == nullptr || cc->voxels.size() != kChunkVol) return false;
+    const uint32_t m =
+        cc->voxels[(((uint32_t)cell.z & 15u) * kChunk +
+                    ((uint32_t)cell.y & 15u)) *
+                       kChunk +
+                   ((uint32_t)cell.x & 15u)] &
+        0xFFFu;
+    return m != 0;
+  };
+  // The topmost solid at or below `from` in this column, +1 — the surface a
+  // body would stand on, read out of the same mirror the mob reads.
+  auto surfaceAt = [&](int wx, int wz, int from) {
+    for (int y = from; y > from - 64; y--)
+      if (cachedSolid(IVec3{wx, y, wz})) return y + 1;
+    return INT32_MIN;
+  };
+  // EVERY COLUMN, not every third. The loop sampled a stride of three and the
+  // census below checked all of them, so it broke out as soon as its OWN
+  // samples were cached while columns in between — in chunks nothing had asked
+  // for — were still missing. That reported "ramp 8/16 columns in mirror" in
+  // one suite run and 16/16 in the next, from identical code: a check whose
+  // exit condition is weaker than its assertion is a flaky check, not a
+  // tolerant one.
+  for (int i = 0; i < 120; i++) {
+    bool all = true;
+    for (int dz = 0; dz < kRampLen; dz++) {
+      const IVec3 cell{spot.x, h0 + dz, rampZ0 + dz};
+      if (cachedSolid(cell)) continue;
+      all = false;
+      c.world.RequestChunkFetch({cell.x >> 4, cell.y >> 4, cell.z >> 4});
+    }
+    if (all) break;
+    tick();
+  }
+  int rampSeen = 0, rampCols = 0;
+  for (int dz = 0; dz < kRampLen; dz++) {
+    rampCols++;
+    if (cachedSolid(IVec3{spot.x, h0 + dz, rampZ0 + dz})) rampSeen++;
+  }
+
+  // ---- the run -----------------------------------------------------------
+  // Target on the crest, so "walk to the thing" IS "climb the ramp". The mob
+  // starts on the flat below it.
+  // FOURTEEN VOXELS ONTO THE CREST, not at its lip. The duelist's stand-off
+  // band is 7..11 voxels and it is measured PLANAR — the intent layer has no
+  // opinion about height at all — so a target parked at the top of the slope is
+  // satisfied by a creature standing part-way up it, and "climbed 16 of 22"
+  // would have been a pass for a body that never reached the top. Putting the
+  // target deep enough onto the flat means the band can only be met from the
+  // crest itself.
+  const int targetZ = rampZ0 + kRampLen + 12;
+  c.mobs.SetPlayerActor(
+      Vec3{(float)spot.x, (float)crestY + 8.0f, (float)targetZ}, 3.0f, 17.0f,
+      true);
+
+  std::string why;
+  const uint64_t id =
+      AiSpawn(c, defIndex,
+              {spot.x - (int)(def.worldSize.x * 0.5f), h0 + 1,
+               spot.z - (int)(def.worldSize.z * 0.5f)},
+              "duelist", why);
+  if (id == 0) {
+    detail = why;
+    SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+    c.ctx.WaitIdle();
+    return Status::Fail;
+  }
+  // NO WARM-UP TICKS, and that is the second half of the fixture lesson above.
+  // A warm-up is ground the creature covers with nobody watching, and on a rig
+  // that walks a voxel a tick it was enough to climb most of the ramp before
+  // the first depth sample was taken — so the one measurement this gate exists
+  // for was being skipped over exactly where it mattered. The ramp chunks are
+  // already in the mirror (the fetch loop above proved it column by column) and
+  // the mob's own anchors fetch what it stands on within a tick or two; until
+  // they do the drive simply declines to walk, which costs a few ticks of the
+  // budget and nothing else.
+  const int budget = (int)BaselineNumber("aiSlopeTicks", 700);
+  // The SPAWN height, so `climbed` is the whole climb rather than whatever was
+  // left of it when the measuring started.
+  const float startY = (float)(h0 + 1);
+  float maxDepth = 0, maxTiltDeg = 0, topY = startY;
+  int buriedTicks = 0, deepestTick = -1;
+  Vec3 worstAt{};
+  int ranTicks = 0;
+  int intentTicks[(int)ai::Intent::Count] = {};
+  bool everTargeted = false, everPathed = false;
+  float nearestZ = 1e9f;
+  for (int i = 0; i < budget; i++) {
+    tick();
+    ranTicks = i + 1;
+    const Vec3 o = c.mobs.MobOrigin(id);
+    if (o.x == 0 && o.y == 0 && o.z == 0) break;   // despawned
+    topY = std::max(topY, o.y);
+    // ATTRIBUTION, not a bare "climbed 0". A creature that never saw its
+    // target, one that saw it and refused the slope, and one that climbed and
+    // slid back down all report the same zero, and only the first is not a
+    // locomotion bug at all.
+    const ai::Brain* br = c.mobs.MobBrain(id);
+    if (br != nullptr) {
+      intentTicks[(int)br->intent]++;
+      if (br->hasTarget) everTargeted = true;
+      if (br->path.valid) everPathed = true;
+    }
+    nearestZ = std::min(nearestZ, (float)targetZ - o.z);
+    if ((i % 100) == 0 && br != nullptr)
+      std::printf(
+          "    ai-slope t%3d: at (%+6.1f,%+6.1f,%+6.1f) dz %5.1f  %-9s tgt %d "
+          " path %2zu/%2zu  cols %u probed / %u unknown / %u blocked / %u "
+          "steep\n",
+          i, o.x - (float)spot.x, o.y - startY, o.z - (float)spot.z,
+          (float)targetZ - o.z, ai::IntentName(br->intent),
+          br->hasTarget ? 1 : 0, br->path.cursor, br->path.pts.size(),
+          br->path.colsProbed, br->path.colsUnknown, br->path.colsBlocked,
+          br->path.colsSteep);
+
+    // HOW DEEP, not merely "is it inside". A bare "buried" boolean tells the
+    // next reader nothing about whether this was a float-epsilon graze on a
+    // step-up or a body ten voxels into a hillside, and those are different
+    // bugs. Measured at the footprint's own columns, from the SAME mirror the
+    // locomotion reads (see the note on cachedSolid above).
+    const float hx = std::max(0.0f, def.worldSize.x * 0.5f - 0.5f);
+    const float hz = std::max(0.0f, def.worldSize.z * 0.5f - 0.5f);
+    const float cx = o.x + def.worldSize.x * 0.5f;
+    const float cz = o.z + def.worldSize.z * 0.5f;
+    float depth = 0;
+    for (int iz = -1; iz <= 1; iz++)
+      for (int ix = -1; ix <= 1; ix++) {
+        const int wx = ifloor(cx + hx * (float)ix);
+        const int wz = ifloor(cz + hz * (float)iz);
+        const int s = surfaceAt(wx, wz, ifloor(o.y) + 4);
+        if (s == INT32_MIN) continue;
+        depth = std::max(depth, (float)s - o.y);
+      }
+    if (depth > maxDepth) {
+      maxDepth = depth;
+      deepestTick = i;
+      worstAt = o;
+    }
+    if (depth > 0.01f) buriedTicks++;
+
+    const Vec3 up = c.mobs.MobBodyUp(id);
+    const float dot = std::clamp(up.y / std::max(up.len(), 1e-4f), -1.0f, 1.0f);
+    maxTiltDeg = std::max(maxTiltDeg, std::acos(dot) * 57.2957795f);
+  }
+
+  const float climbed = topY - startY;
+  const float minClimb = (float)BaselineNumber("aiSlopeMinClimbVox", 16.0);
+  const float maxDepthAllowed = (float)BaselineNumber("aiSlopeMaxDepthVox", 0.5);
+  // THE RIG'S OWN CEILING PLUS A SLACK, not an independent number. The claim is
+  // "the lean is clamped to what the rig authored" (anim.h
+  // LocomotionDef::tiltMaxDeg); pinning a literal here would assert something
+  // else, and would go quietly stale the day somebody re-authors the cap.
+  // The clamp is on the TOTAL lean (one angle off vertical, not one per axis),
+  // so this is tight on purpose: a slack wide enough to absorb a corner would
+  // also absorb the 53-degree roll this gate exists to refuse. Measured, the
+  // pre-fix code reached 17.7 degrees on this exact ramp.
+  const float tiltCap = c.mobs.MobTiltMaxDeg(id);
+  const float maxTiltAllowed =
+      tiltCap + (float)BaselineNumber("aiSlopeTiltSlackDeg", 1.0);
+  const int stepUp = c.mobs.MobStepUpCells(id);
+  const int minStepUp = (int)BaselineNumber("aiSlopeMinStepUpCells", 4);
+
+  const bool ok = rampSeen == rampCols && climbed >= minClimb &&
+                  maxDepth <= maxDepthAllowed && maxTiltDeg <= maxTiltAllowed &&
+                  stepUp >= minStepUp;
+  RecordObserved("aiSlopeClimbedVox", (double)climbed);
+  RecordObserved("aiSlopeMaxDepthObservedVox", (double)maxDepth);
+  RecordObserved("aiSlopeMaxTiltObservedDeg", (double)maxTiltDeg);
+  detail = Format(
+      "ramp %d/%d columns in mirror (1 vox/col over %d, crest +%d), climbed "
+      "%.1f vox of %d (>= %.1f), deepest below surface %.2f vox (<= %.2f) at "
+      "tick %d, %d/%d ticks with the body inside the ground, max body tilt "
+      "%.1f deg (<= %.1f), step budget %d cells (>= %d), relief %d, %d ticks "
+      "run, targeted %d, pathed %d, closed to dz %.1f, intents "
+      "idle/face/appr/hold/circ/atk %d/%d/%d/%d/%d/%d",
+      rampSeen, rampCols, kRampLen, kRampLen, climbed, kRampLen, minClimb,
+      maxDepth, maxDepthAllowed, deepestTick, buriedTicks, budget, maxTiltDeg,
+      maxTiltAllowed, stepUp, minStepUp, relief, ranTicks,
+      everTargeted ? 1 : 0, everPathed ? 1 : 0, nearestZ, intentTicks[0],
+      intentTicks[1], intentTicks[2], intentTicks[3], intentTicks[4],
+      intentTicks[5]);
+  if (!ok && maxDepth > maxDepthAllowed)
+    detail += Format("; deepest at (%.1f,%.1f,%.1f)", worstAt.x, worstAt.y,
+                     worstAt.z);
+
+  // LEAVE THE SUITE EXACTLY AS `ai-approach` DOES. A gate in a shared-World run
+  // owns its teardown, and the omission here was not the voxels — it was the
+  // PLAYER ACTOR. Leaving one registered hands every later mob gate a phantom
+  // enemy standing on this gate's crest, and `corpse-burn` (fifteen gates
+  // downstream) duly reported its corpse evaporating instead of burning.
+  c.mobs.ClearPlayerActor();
+  c.mobs.ClearAttackRequests();
+  c.debris.Reset();
+  c.mobs.Reset();
   SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
   c.ctx.WaitIdle();
   return ok ? Status::Pass : Status::Fail;
@@ -5087,6 +5528,10 @@ const std::vector<Gate>& MobGates() {
       {"ai-dummy", "mob", {}, false, GateAiDummy, /*needsRender=*/false},
       {"ai-face", "mob", {}, false, GateAiFace, /*needsRender=*/false},
       {"ai-approach", "mob", {}, false, GateAiApproach, /*needsRender=*/false},
+      // The sloped-terrain regime the three above never touch: a real ramp,
+      // asserting the body stays ON it (never inside it) and does not lean
+      // like furniture while climbing.
+      {"ai-slope", "mob", {}, false, GateAiSlope, /*needsRender=*/false},
       // Live ragdoll: blast knockdown, get-up, NPC gravity. Counts only.
       {"ragdoll", "mob", {}, false, GateRagdoll, /*needsRender=*/false},
   };

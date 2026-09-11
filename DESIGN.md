@@ -4414,7 +4414,75 @@ responsibility:
 | sense | `SenseGround` | — | One terrain probe per tick, an 8-way fan in the *mob's own frame*. Intent and drive can no longer disagree about the ground (they each ran their own probe before), and a future sensor — vision cone, sound event, nav query — has one obvious place to join. |
 | intent | `DecideIntent` | `desiredHeading`, `driveScale`, `driveStrafe` | **The AI seam.** The only stage allowed an opinion. A mob with an authored `behavior` is driven by the utility arbiter in `game/ai_behavior.cpp` (next section); one without falls through to the original wander-and-avoid, unchanged. |
 | steer | `Steer` | `heading`, `turnVel` | The only writer of body facing, and it moves it at a bounded, ramped rate. |
-| drive | `DriveLocomotion` | `origin`, `phase` | Translates a **local 2D velocity** — forward along the actual facing, plus a lateral term — with the alignment scale applied to the forward component only. |
+| drive | `DriveLocomotion` | `origin`, `phase` | Translates a **local 2D velocity** — forward along the actual facing, plus a lateral term — with the alignment scale applied to the forward component only, then **resolves that step against the body's own footprint** (below). |
+
+### A walking body is a box, and it has a budget (2026-09-10)
+
+The drive used to be one line — `origin += vel * dt` — with the only restraint
+an eight-way fan of single-column probes taken *before* the move. Reported as
+"NPCs run into a hill and keep going underneath the voxels, and standing on a
+ramp they're rotated 45 degrees". It was four independent faults that only
+compose on sloped ground, which is why flat fixtures never saw any of them:
+
+1. **The ground settle was symmetric and had no floor.** `clamp(groundY − y,
+   −snap, +snap)` at 3 cm a tick against a humanoid walking 3.15 m/s: past
+   roughly thirty degrees the body outruns its own settle and sinks.
+2. **`Mob::GroundHeightAt` only ever scanned DOWNWARD.** A body one voxel under
+   the surface asked "what is the first solid below me?" and was told "the one I
+   am standing in", so the reported ground was *inside the hill*. The fan then
+   measured its eight rises against that fiction, read flat in every direction,
+   and the creature walked the rest of the way through. **This is what made the
+   sinking self-sustaining rather than a one-tick glitch.**
+3. **The mob step-up budget was 0.20 m against the player's 0.58 m.** A kerb the
+   player strides over was a wall to an NPC: the forward probe went blocked, the
+   steering deflected to the nearest clear bearing, and the creature crabbed
+   sideways across ground it should have walked straight up.
+4. **The gait counted every IK chain as a foot.** Every humanoid publishes two
+   legs *and two arms*; the hands were given ground contact points, folded into
+   the body-height average, and fitted into the plane the body's **tilt** came
+   from. On flat ground all four sit at the same height and nothing shows; on a
+   slope a quad of two feet and two hands has a normal nothing like the
+   ground's, bounded only by "the normal's y is above 0.6" — 53 degrees, in any
+   direction including pure roll. That is the "rotated 45 degrees" report, and
+   `PlayerAvatar::UpdateGait` has filtered on the `leg` tag since it was written.
+
+What replaced them:
+
+- **`Mob::FootprintFooting` is the one place a walking body meets the terrain.**
+  Nine columns over the body box, reporting the height it would *rest* at, a
+  `wall` flag for any column standing more than a step above it, and headroom.
+  `SenseGround`, the drive and the freefall test all read it.
+- **The settle is asymmetric.** Downward is still eased (that is what a settle
+  is *for*); upward is a hard clamp, because "do not be inside the ground" is
+  not a preference. The rendered height `bodyY_` is eased separately, so nothing
+  pops.
+- **The move is resolved like the player's:** try the whole step, and if the box
+  does not fit, try each axis alone. Wall *sliding* falls out of that, and so
+  does climbing — "fits" includes a legal step up onto the destination.
+- **The terrain budgets are authored per rig in metres** (`LocomotionDef::
+  stepUpM` / `stepDownM` / `headroomM` / `tiltMaxDeg`, defaulting to the
+  player's own numbers and clamped to the rig's leg span) and resolved once in
+  `BuildRig`. The A* planner reads the same numbers through
+  `ai::SelfView::stepUpCells`, so it and the drive cannot come to disagree about
+  what a wall is — they used to be a literal in `mob.h` and a different literal
+  in `behaviors.json`.
+- **The gait owns leg-tagged chains only**, and the tilt is taken from the
+  *ground* rather than from the contact points: two grades fore/aft and
+  left/right of the footprint, clamped as a single total lean off vertical.
+  Bipeds and quadrupeds now use one path (the old `>= 3 planted points` gate
+  meant a biped never leaned at all), it does not jitter with the swing phase,
+  and the bound is stated in degrees instead of falling out of a dot product.
+
+**`GroundHeightAt` has three outcomes, not two.** A probe that starts inside
+weight-bearing matter and cannot climb out of it has not failed to see
+anything — it has seen rock and merely cannot measure it. Reporting that as
+"unknown", which every caller correctly reads as *open*, let a duelist walk
+through the middle of a stone wall whenever the chunk above the wall was not yet
+cached. `outBlocked` is that third answer.
+
+Gate: **`ai-slope`** — a real stone ramp, asserting the body climbs it, never
+gets below the surface (0.00 voxels; the pre-fix code reached 2.70 for 53 of 700
+ticks), and never leans past its rig's authored ceiling.
 
 The drive stage takes a signed forward term and a lateral one rather than a
 single forward scalar, and that is a *combat* requirement rather than a
@@ -4541,8 +4609,10 @@ the steering layer already lives by); an unknown column inherits the height of
 whoever reached it. *The probe is injected, not reimplemented* — `NavProbe` is a
 pair of function pointers and the caller binds `Mob::GroundHeightAt`, so the
 planner cannot come to disagree with the locomotion it is steering; the step-up
-limit likewise has to match what `SenseGround` will climb, or the planner hands
-the drive a path it refuses to walk. *The straight line is tried first*, which
+limit likewise has to match what the drive will climb, or the planner hands it a
+path it refuses to walk — so since 2026-09-10 there is only ONE number, the
+creature's own (`ai::SelfView::stepUpCells`, resolved from its rig), and a
+profile's `maxStepUp` is an optional override rather than a second copy. *The straight line is tried first*, which
 is both the cheap case and the graceful-degradation case: with no plan and a
 clear line, "walk at them" is exactly right, and a failed search falls back to
 direct steering plus the existing fan avoidance rather than to standing still.
@@ -4901,9 +4971,14 @@ contact is `hip + fwd·strideBias + vel·leadTime`, snapped down through
 one constraint *is* the gait state machine: singleton groups give a walk,
 diagonal pairs give a trot, and losing a leg just means the survivors take
 their turns sooner. Stride and lift scale by speed so an idle mob's feet are
-genuinely still. **Body height and tilt are derived from the foot average and
-the foot-plane normal (Newell's method)** — which is why walking up voxel
-stairs works with zero slope-handling code. Pelvis bob runs at 2× step
+genuinely still. **The gait owns `leg`-tagged chains only** — it walked
+`sk.chains` whole until 2026-09-10, which meant a humanoid's hands were being
+planted on the ground (see "A walking body is a box" above). **Body height is
+derived from the foot average**, which is why walking up voxel stairs works with
+zero slope-handling code; **body tilt is derived from the GROUND** — two grades
+fore/aft and left/right of the footprint, clamped as one total lean — rather
+than from a plane fitted through the contact points, which jittered with the
+swing phase and never fired at all on a two-legged rig. Pelvis bob runs at 2× step
 frequency (one rise per footfall), sway/roll at 1×, plus spine
 counter-rotation and a progressive phase lag per hierarchy level.
 

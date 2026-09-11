@@ -198,7 +198,13 @@ struct MobSocketDef {
 // 5 cm voxels a mob could step up half as far as it used to and probe half
 // as high for its own footing while the player was unaffected. Same world,
 // two different physics.
-inline constexpr int kMobStepUpCells = MetresToCellsI(0.20f);
+// RETIRED as a locomotion budget — see LocomotionDef::stepUpM (anim.h) and
+// Mob::StepUpCells(). It survived as a flat 0.20 m against the player's 0.58 m
+// and was most of why NPCs read as worse at moving than the player on the same
+// ground. Kept only as the FLOOR a rig's authored value is clamped against
+// being useful for, so nothing silently authors a body that cannot cross a
+// pebble.
+inline constexpr int kMobMinStepUpCells = 1;
 // How far above the mob's origin a ground probe starts looking down.
 inline constexpr int kMobProbeLiftCells = MetresToCellsI(0.30f);
 
@@ -1171,9 +1177,64 @@ class Mob {
   // within the scan" — the two used to be one `false`, and the gravity added
   // for ragdolls must not drop a creature through terrain it merely has not
   // fetched yet (the projectile trap in CLAUDE.md, mob edition).
+  // `outBlocked` is the THIRD outcome, and conflating it with the second is a
+  // bug this engine has now paid for twice in the same shape. A probe that
+  // starts inside weight-bearing matter and cannot climb out of it has NOT
+  // failed to see anything — it has seen rock, and merely does not know how
+  // tall the rock is. Reporting that as "unknown", which every caller correctly
+  // reads as OPEN (ai_nav.h rule 1), let a duelist walk through the middle of
+  // an eight-voxel stone wall whenever the chunk above the wall happened not to
+  // be cached yet. "I cannot see" and "I can see something and cannot see past
+  // it" are opposite answers.
   bool GroundHeightAt(World& world, int wx, int wz, int yFrom, int& outY,
-                      uint32_t* outMat = nullptr,
-                      bool* outUnknown = nullptr) const;
+                      uint32_t* outMat = nullptr, bool* outUnknown = nullptr,
+                      bool* outBlocked = nullptr) const;
+
+  // This body's terrain budgets in CELLS, resolved from its rig (see the
+  // members). Public because the AI layer plans with them: the planner and the
+  // drive must refuse the same wall, and the only way to guarantee that is for
+  // both to read the creature's own number.
+  int StepUpCells() const { return stepUpCells_; }
+  int StepDownCells() const { return stepDownCells_; }
+  int HeadroomCells() const { return headroomCells_; }
+
+  // ---- THE ONE PLACE A WALKING BODY MEETS THE TERRAIN ---------------------
+  //
+  // What the ground under a body's FOOTPRINT is doing, as one answer. A body is
+  // a box, and every question the locomotion asks about terrain is really about
+  // that box rather than about the single column under its middle.
+  //
+  //   groundY  The height the body would REST at: the highest surface under the
+  //            box that it could actually step onto. Walking onto a slope, the
+  //            uphill corner is already inside the hill while the centre column
+  //            still reads a voxel lower, and settling to the centre reading is
+  //            what walked the whole box into the ground (see the long note in
+  //            GroundHeightAt for what happens next).
+  //   wall     A column under the box stands MORE than a step above `fromY`.
+  //            This is the distinction that makes the two useful together, and
+  //            it cost a regression to learn: fold a wall's top into `groundY`
+  //            as if it were footing and a creature whose shoulder grazes a
+  //            wall is lifted onto it. `ai-approach`'s mob levitated over an
+  //            eight-voxel barrier it is supposed to walk around.
+  //   fits     Headroom above `groundY` is clear.
+  //
+  // `known` is false when NO sampled column could be answered, which the caller
+  // must read as WALKABLE (ai_nav.h rule 1) and never as blocked.
+  struct Footing {
+    bool known = false;
+    int groundY = 0;
+    bool wall = false;
+    bool fits = true;
+  };
+  Footing FootprintFooting(World& world, const MobDef& def, float cx, float cz,
+                           float fromY) const;
+
+  // Does this cell carry a body's weight? THE definition of "solid" for
+  // locomotion, shared by the ground probe, the footprint collider and the
+  // navigator's `blocked` adapter, so "walkable" means one thing in this
+  // engine. A cell the CPU mirror cannot answer for is NOT solid — unknown is
+  // open, everywhere, always (ai_nav.h rule 1).
+  bool CellSupportsWeight(World& world, IVec3 cell) const;
 
   // Release a body's burn index and front (lattice compacted / rig torn down).
   static void DropBurnIndex(BodyBurnState& st);
@@ -1494,6 +1555,18 @@ class Mob {
   float fallVel_ = 0;
   float airTime_ = 0;
   bool airborne_ = false;
+  // ---- this body's terrain budgets, in CELLS (anim.h LocomotionDef) -------
+  // Authored in metres per rig and resolved once in BuildRig. THE ONE COPY:
+  // the walk drive's footprint collider, the 8-way sense fan, the freefall
+  // test and the A* planner all read these, so "how big a ledge is a wall" has
+  // a single answer per creature. They were three unrelated constants —
+  // kMobStepUpCells in the drive, a literal 2 in behaviors.json for the
+  // planner, a literal 3 for headroom — and the first two disagreed with the
+  // player's own step budget by 3x, which is why a mob crabbed sideways across
+  // slopes the player walks straight up.
+  int stepUpCells_ = 2;
+  int stepDownCells_ = 5;
+  int headroomCells_ = 3;
   float restSoleY_ = 0;        // rest sole height above the min corner
   // Rest height of the leg chain's ROOT (the hip anchor) above the min corner,
   // measured off the rig in BuildRig beside restSoleY_. The pair of them is the
@@ -2135,6 +2208,20 @@ class MobSystem {
   float MobHeading(uint64_t mobId) const;
   float MobDesiredHeading(uint64_t mobId) const;
   float MobTurnVel(uint64_t mobId) const;
+  // The body's slope lean (Mob::bodyUp_, MobSystem::UpdateGait). Exposed so a
+  // gate can assert on it directly: "the creature is rotated for no reason on
+  // a ramp" is an ANGLE, and a test that has to infer it from limb transforms
+  // is a test nobody will keep honest.
+  Vec3 MobBodyUp(uint64_t mobId) const;
+  // This body's resolved step-up budget in cells (anim.h LocomotionDef). A
+  // gate that hard-codes 2 here is a gate that fails the day a rig is
+  // re-authored, which is the trap `AiFlatSpot` exists to avoid for terrain.
+  int MobStepUpCells(uint64_t mobId) const;
+  // ...and its authored lean ceiling, for the same reason: a gate that pins the
+  // tilt to a literal 20 degrees is asserting a number nobody authored. What
+  // this engine actually promises is that the lean never exceeds the CAP the
+  // rig asked for, so the test compares against the cap plus a slack.
+  float MobTiltMaxDeg(uint64_t mobId) const;
   // Steering override for tests and (later) scripted behaviour: sets the
   // desired heading directly, leaving the turn-rate clamp fully in force. The
   // wander behaviour re-takes control as soon as it next wants to turn.
@@ -2399,6 +2486,11 @@ class MobSystem {
     static constexpr int kProbeCount = 8;
     bool clear[kProbeCount] = {};
     int stepUp[kProbeCount] = {};   // rise at that probe, voxels (INT_MAX = unknown)
+    // The budget `clear[]` was decided against, copied out of the creature's
+    // own rig (Mob::StepUpCells). Carried on the sense rather than re-read by
+    // each consumer so the drive, the intent layer and the debug readout can
+    // never be quoting a different number from the one the fan used.
+    int stepUpCells = 2;
   };
   GroundSense SenseGround(const Mob& mob, const MobDef& def, World& world) const;
 

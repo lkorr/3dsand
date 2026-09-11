@@ -1480,6 +1480,21 @@ Status GateCorpseBurn(Ctx& c, std::string& detail) {
     detail = "spawn refused";
     return Status::Fail;
   }
+  // HOLD THE CREATURE IN PLACE, structurally.
+  //
+  // The window-centre inset above was chosen to buy margin against exactly one
+  // thing: "a burning NPC runs", 32 voxels of it while dying. Margin is not a
+  // fix, it is a bet on how far the locomotion will carry a body — and the bet
+  // was lost the moment NPCs got the player's step budget and a footprint
+  // collider that slides along obstacles instead of stalling against them. The
+  // corpse ended up two voxels past the window edge, where no chunk is fetched,
+  // and the gate reported "0 alight / 0 spent, 0 fire ops" about a body falling
+  // through unfetched space. Nothing about the wander is what this gate tests.
+  //
+  // `dummy` is the authored profile whose entire content is `mobile: false`, so
+  // this pins the subject without adding a test-only code path to the mob
+  // driver — the same profile `ai-dummy` uses to assert exactly zero motion.
+  mobs.SetMobBehavior(id, "dummy");
 
   uint32_t tick = 71000;
   uint32_t debrisFireOps = 0, debrisResidueOps = 0;

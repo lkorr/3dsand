@@ -270,6 +270,10 @@ const char* const kOrder[] = {
     // its group, so it inherits state instead of changing what everything
     // after it inherits.
     "ai-dummy", "ai-face", "ai-approach",
+    // ...and the same group's sloped-terrain half, appended last in it for the
+    // reason above: `ai-slope` writes a real stone ramp and regenerates on the
+    // way out, exactly as `ai-approach` does with its wall.
+    "ai-slope",
     // Live ragdoll: a blast knocks a creature flying and it gets back up; a
     // long fall does the same. Appended last in the group for the reason
     // above; it restores the world on its way out.
