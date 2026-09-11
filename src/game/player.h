@@ -94,6 +94,15 @@ class Player {
   // avatar reads it for the knee bend. Fly mode clears it (Ctrl is descend).
   bool crouching = false;
   bool inLiquid = false;
+  // THE DROP IS RATE-LIMITED BY THE MIRROR: the body is descending faster than
+  // the CPU mirror can answer for the cells beneath it, so this frame's fall is
+  // clamped to the distance the mirror does vouch for and gravity is not added
+  // on top (see KnownDrop in player.cpp). Fall speed is kept, so the drop
+  // resumes at its real rate the moment the snapshot catches up. Exposed
+  // because a fall that visibly drags is the only symptom, and without a name
+  // for it the next person to see one has nothing to grep for: it is a starved
+  // readback, not a physics bug.
+  bool blindFall = false;
   // Fraction of the body under liquid, 0..1. Every liquid effect (drag,
   // buoyancy, wade speed) scales with this rather than switching on the first
   // submerged sample, so ankle-deep and fully-under are different states.

@@ -1666,6 +1666,27 @@ void PlayerAvatar::PreTick(uint32_t tick, const Player& player, float heading,
         if (ff.mat != 0) footfalls_.push_back(ff);
       }
       airTime_ = 0;
+    } else if (player.inLiquid) {
+      // WATER IS NOT AIR.
+      //
+      // `grounded` is false for the whole time a body is in liquid by
+      // construction (Player::Update sets `onGround = drop >= 0 && !inLiquid`),
+      // so nothing above this made a swimmer anything but airborne and the air
+      // clock ran the entire swim. Every airborne rule fired off it: the fall
+      // flail opened the arms out underwater, and at ragdoll.fallSeconds — 3 s,
+      // which is a short swim — the swimmer went limp in the water.
+      //
+      // Buoyancy carries the weight, so the water is support for the air
+      // clock even though it is not ground. Holding airTime_ at zero disarms
+      // all three rules at once: no limp, no flail weight (the ramp below is
+      // driven by airTime_), and no landing clip on climbing out, since that
+      // one is gated on airTime_ > 0.25 s. A fall INTO water zeroes it on the
+      // frame of entry, which is correct: the splash ends the fall.
+      //
+      // The gait is untouched — `supported` and `airOffTime_` still read the
+      // swimmer as off the ground, which is what the leg IK needs.
+      airTime_ = 0;
+      lastFallSpeed_ = 0.0f;
     } else {
       // A JUMP IS A LAUNCH, NOT A LOSS OF CONTACT.
       //
@@ -1682,8 +1703,12 @@ void PlayerAvatar::PreTick(uint32_t tick, const Player& player, float heading,
       // take the player's velocity with them so the body keeps falling at
       // the speed it had instead of stalling for a tick; from here the
       // capsule follows the pelvis (RagdollFollow) until the get-up ends.
+      // `blindFall` means the controller is HOLDING the drop because the CPU
+      // mirror cannot see the ground yet (Player::blindFall) — the body is not
+      // moving, so it has not fallen far enough to go limp however long the
+      // clock has run.
       if (airTime_ >= CurrentTuning().ragdoll.fallSeconds && !Ragdolled() &&
-          !player.fly && !hangingNow) {
+          !player.fly && !hangingNow && !player.blindFall) {
         StartRagdoll(CurrentTuning().ragdoll.minSeconds, "fall");
         SetLimbVelocities(player.vel);
       }

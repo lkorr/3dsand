@@ -62,8 +62,16 @@ bool Collides(const Vec3& p, const Player::Box& b,
 // It is also capped in count: at small kVoxelMeters a frame's motion is many
 // voxels long (fly-sprint at 0.05 m voxels is ~11 vox/frame), and an uncapped
 // voxel-sized substep makes the AABB test count blow up with 1/kVoxelMeters.
-// Past the cap we take longer strides — tunneling there is bounded by the
-// same physical distance regardless of voxel size.
+//
+// Past the cap we take longer strides, and what keeps THAT safe is the box,
+// not the stride: the stride is `dist / kMaxSubsteps` and `dist` is bounded by
+// Player::Update's 50 ms dt clamp, so the longest one available is maxFall's
+// 26.8 voxels over 8 substeps — 3.4 voxels, against a collision box 15 rows
+// tall (12 crouched). A body cannot step over a floor it is four times taller
+// than. Raising maxFall, lowering kVoxelMeters or shrinking the box is what
+// would break that, and the `player-fastfall` gate is where it would show:
+// it drops a body onto a ONE-VOXEL slab at terminal velocity with the dt
+// clamp in force, which is the worst case the controller can be handed.
 bool SweepAxis(Vec3& pos, float delta, int axis, const Player::Box& b,
                const Player::KindFn& kindAt) {
   if (delta == 0) return false;
@@ -101,6 +109,55 @@ bool SweepAxis(Vec3& pos, float delta, int axis, const Player::Box& b,
     }
   }
   return false;
+}
+
+// How far may the body descend into cells the mirror can actually answer for?
+//
+// KindAt reports Unknown outside the 3x3x3 CPU mirror and Collides has to
+// treat Unknown as air — an unfetched cell must not become an invisible wall.
+// That is safe for a body the mirror is centred ON and ruinous for one that
+// has OUTRUN it. The cube is centred on the player's CHUNK, so it holds only
+// 16 to 32 voxels below the feet, and it is rebuilt from a GPU readback that
+// is several frames old. A body at maxFall covers 8.9 voxels in a 60 Hz frame
+// and 26.8 in one at Player::Update's 50 ms dt clamp, so two or three frames
+// of readback latency is the whole margin: the snapshot that lands describes a
+// cube the feet have already left. Every cell under them then reads Unknown,
+// the sweep finds no floor, gravity adds another metre per second, and the
+// next frame is further outside the mirror than this one. THE FALL IS WHAT
+// SUSTAINS THE FALL, which is why it never recovers and why it takes a long
+// drop to start.
+//
+// MobSystem::UpdateFall has had the rule since NPCs were given gravity — "I
+// cannot see the ground" is not "there is no ground", and gravity waits on an
+// unfetched column rather than dropping the creature through terrain the
+// mirror has not delivered yet. This is its twin for the player.
+//
+// IT CLAMPS THE DESCENT; IT DOES NOT VETO IT. The first version answered a
+// yes/no "is the destination row known" and held the whole frame when it was
+// not — which deadlocks at exactly the speed it exists for: one 26.8-voxel
+// step is LONGER than the mirror's entire below-feet margin, so the answer is
+// permanently no and the body hovers for good. Returning the distance instead
+// lets the fall proceed at the rate the readback delivers (~16-19 voxels a
+// frame) while still never sweeping into a cell that might hold a floor.
+// Scanned from the sole DOWNWARD and stopped at `want`, so an ordinary frame —
+// where the whole step is inside the cube — pays one row of lookups per voxel
+// of travel and no more.
+float KnownDrop(const Vec3& p, float want, const Player::Box& b,
+                const Player::KindFn& kindAt) {
+  const float hx = b.hx - kSkin;
+  const float sole = p.y + b.yLo + kSkin;
+  const int z0 = ifloor(p.z - hx), z1 = ifloor(p.z + hx);
+  const int x0 = ifloor(p.x - hx), x1 = ifloor(p.x + hx);
+  const int yTop = ifloor(sole) - 1;           // first row under the sole
+  const int yBot = ifloor(sole - want) - 1;    // last row the sweep would enter
+  for (int y = yTop; y >= yBot; y--)
+    for (int z = z0; z <= z1; z++)
+      for (int x = x0; x <= x1; x++)
+        if (kindAt({x, y, z}) == CellKind::Unknown)
+          // Stop ON TOP of the unknown row rather than short of it by a
+          // substep: that face is the last place the mirror vouches for.
+          return std::max(sole - (float)(y + 1), 0.0f);
+  return want;
 }
 
 // Horizontal distance squared travelled from `from` to `to`. Vertical gain is
@@ -448,6 +505,7 @@ Player::Box Player::BoxFor(bool crouched) const {
 void Player::Update(float dt, const PlayerInput& in, const Vec3& flatFwd,
                     const Vec3& right, const Vec3& lookFwd, const KindFn& kindAt) {
   dt = std::min(dt, 0.05f);
+  blindFall = false;  // set again below if the walk path holds a descent
   ledgeGrabbed = false;  // one-frame flag; set again below if a grab latches
   ledgeInReach = false;  // recomputed below (hang block or the walk probe)
 
@@ -816,6 +874,20 @@ void Player::Update(float dt, const PlayerInput& in, const Vec3& flatFwd,
     bool onGround = drop >= 0.0f && !inLiquid;
     if (onGround) coyoteTimer = T().coyoteTime;
 
+    // ---- the blind fall: the drop waits on a mirror it has outrun ---------
+    // See KnownDrop. A DESCENT only — rising is how a body leaves an unknown
+    // region and must never be held — and only while genuinely off the
+    // ground, so nothing a walk can produce reaches this. Velocity is kept
+    // rather than zeroed, so the drop resumes at its real speed the frame the
+    // snapshot lands: a starved mirror costs a slower descent, not the body's
+    // whole relationship with the floor.
+    const float wantDrop = vel.y < 0.0f ? -vel.y * dt : 0.0f;
+    float allowedDrop = wantDrop;
+    if (wantDrop > 0.0f && !onGround && !inLiquid && !hanging &&
+        mantleTimer <= 0.0f)
+      allowedDrop = KnownDrop(pos, wantDrop, b, kindAt);
+    blindFall = allowedDrop < wantDrop - 1e-4f;
+
     const float gravity = T().gravity / kVoxelMeters;
     // Buoyancy lerps in with submersion rather than switching on at the first
     // sample: at 1/5 under you are barely lightened, fully under you get the
@@ -823,7 +895,7 @@ void Player::Update(float dt, const PlayerInput& in, const Vec3& flatFwd,
     // swimming proper is unchanged; what changes is the shallow end.
     float accel =
         inLiquid ? (1.0f + (T().liquidGravityScale - 1.0f) * submersion) : 1.0f;
-    vel.y -= gravity * accel * dt;
+    if (!blindFall) vel.y -= gravity * accel * dt;
 
     // Wade speed also scales with submersion: ankle-deep water should barely
     // slow you, chest-deep should be the authored liquidSpeedScale.
@@ -943,7 +1015,10 @@ void Player::Update(float dt, const PlayerInput& in, const Vec3& flatFwd,
     const Vec3 velBeforeSweep = vel;
 
     // ---- vertical move ----
-    bool blockedY = SweepAxis(pos, vel.y * dt, 1, b, kindAt);
+    // A held descent still moves as far as the mirror vouches for (see
+    // KnownDrop) — `blindFall` rate-limits the fall, it does not freeze it.
+    const float moveY = blindFall ? -allowedDrop : vel.y * dt;
+    bool blockedY = moveY == 0.0f ? false : SweepAxis(pos, moveY, 1, b, kindAt);
     if (blockedY) vel.y = 0;
 
     // ---- horizontal move, with step-up ----

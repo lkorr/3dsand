@@ -194,6 +194,7 @@ const char* const kOrder[] = {
     // assert over BodyCount().
     "body-shade",
     "player-walk", "player-waterjump", "player-ledgegrab", "player-crouch",
+    "player-fastfall",
     "player-plants", "debris",
     "audio-impact", "audio-mob-voice", "audio-ambience",
     // "mob" restored to its original slot (it sat between prefab and

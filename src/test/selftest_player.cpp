@@ -738,6 +738,107 @@ Status GatePlayerCrouch(Ctx&, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+
+// ---- player-fastfall ---------------------------------------------------
+//
+// A LONG DROP MUST END ON THE FLOOR, NOT UNDER THE WORLD.
+//
+// Both arms run at dt = 0.05 s, which is not an arbitrary slow frame: it is
+// the clamp Player::Update applies (a longer frame is integrated as 50 ms), so
+// it is the WORST step the controller can ever be handed, and it is what a
+// shader-compile or streaming hitch actually delivers. maxFall is 535 vox/s at
+// kVoxelMeters 0.10, so one such step is 26.8 voxels of travel. Neither claim
+// is visible in a gate that drops the body thirty voxels.
+//
+//  (a) THE SWEEP RESOLVES A FULL-SPEED FALL onto a ONE-VOXEL slab. SweepAxis
+//      caps its substep COUNT, so its stride grows with the distance asked of
+//      it; today the longest available is 3.4 voxels against a 15-row box,
+//      which cannot step over anything. This pins that margin rather than a
+//      past bug: raising maxFall, lowering kVoxelMeters or shrinking the
+//      collision box eats it, and this is where that shows up.
+//
+//  (b) THE BLIND FALL, which IS a fixed bug. KindAt reports Unknown outside
+//      the 3x3x3 CPU mirror and Collides has to treat Unknown as air.
+//      `staleMirror` is that mirror exactly: the same chunk cube MirrorBaseFor
+//      picks, centred on where the body was kLatency frames ago, because the
+//      cube is built from a readback that old. It holds 16-32 voxels below the
+//      feet while the body covers 26.8 a frame, so the snapshot describes a
+//      cube the feet have left, the sweep finds no floor, and the fall feeds
+//      itself — the body used to sail through the ground and keep going. It
+//      must now stop on the floor inside that cube, and Player::blindFall must
+//      have fired, or the arm proved nothing about the clamp.
+//
+//      The hold is a CLAMP, not a veto, and the frame count is what says so:
+//      one full step is longer than the mirror's whole below-feet margin, so a
+//      veto would answer "no" forever and the body would hover. `held` close
+//      to the frame total with the body still arriving on the ground is the
+//      shape of a descent rate-limited by the readback.
+Status GatePlayerFastFall(Ctx&, std::string& detail) {
+  const Vec3 fwd{1, 0, 0}, right{0, 0, 1};
+  const float dt = 0.05f;       // the dt clamp: the worst step Update can see
+  const int kFloor = 100;       // top solid row is kFloor - 1 in arm (b)
+  const float kStart = 1700.0f; // 160 m up: terminal velocity on arrival
+  const float terminal = CurrentTuning().player.maxFall / kVoxelMeters;
+
+  // (a) a one-voxel floor, fully known. Nothing may pass it.
+  Player::KindFn slab = [&](IVec3 c) {
+    return c.y == kFloor ? CellKind::Solid : CellKind::Air;
+  };
+  Player thin;
+  thin.fly = false;
+  thin.pos = Vec3{140.5f, kStart, 140.5f};
+  float thinPeak = 0.0f;
+  for (int i = 0; i < 400 && !thin.grounded; i++) {
+    thin.Update(dt, PlayerInput{}, fwd, right, fwd, slab);
+    thinPeak = std::max(thinPeak, -thin.vel.y);
+  }
+  const float thinFeet = thin.pos.y + thin.CurrentBox().yLo;
+  // Terminal velocity must actually have been reached, or the fixture is a
+  // short drop wearing a long one's name.
+  const bool fastEnough = thinPeak > 0.95f * terminal;
+  const bool thinOk = thin.grounded &&
+                      std::abs(thinFeet - (float)(kFloor + 1)) < 0.5f;
+
+  // (b) the same fall against a mirror that is kLatency frames stale.
+  constexpr int kLatency = 3;
+  float centreHist[kLatency] = {kStart, kStart, kStart};
+  float mirrorCentre = kStart;
+  Player::KindFn staleMirror = [&](IVec3 c) {
+    const int mc = ifloor(mirrorCentre) >> 4;   // the mirror's centre chunk
+    const int cc = c.y >> 4;
+    if (cc < mc - 1 || cc > mc + 1) return CellKind::Unknown;
+    return c.y < kFloor ? CellKind::Solid : CellKind::Air;
+  };
+  Player blind;
+  blind.fly = false;
+  blind.pos = Vec3{140.5f, kStart, 140.5f};
+  int heldFrames = 0;
+  int frames = 0;
+  for (; frames < 2000 && !blind.grounded; frames++) {
+    // The snapshot delivered THIS frame was encoded kLatency frames ago.
+    mirrorCentre = centreHist[frames % kLatency];
+    centreHist[frames % kLatency] = blind.pos.y;
+    blind.Update(dt, PlayerInput{}, fwd, right, fwd, staleMirror);
+    if (blind.blindFall) heldFrames++;
+  }
+  const float blindFeet = blind.pos.y + blind.CurrentBox().yLo;
+  const bool blindOk = blind.grounded && heldFrames > 0 &&
+                       std::abs(blindFeet - (float)kFloor) < 1.0f;
+
+  const bool ok = thinOk && fastEnough && blindOk;
+  char buf[320];
+  std::snprintf(buf, sizeof buf,
+                "1-vox slab: grounded=%d feet %.2f (want %d) peak %.0f of "
+                "terminal %.0f vox/s | %d-frame stale mirror: grounded=%d "
+                "feet %.2f (want %d) held %d of %d frames",
+                thin.grounded ? 1 : 0, thinFeet, kFloor + 1, thinPeak, terminal,
+                kLatency, blind.grounded ? 1 : 0, blindFeet, kFloor, heldFrames,
+                frames);
+  detail = buf;
+  std::printf("player fastfall: %s (%s)\n", ok ? "PASS" : "FAIL", buf);
+  return ok ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& PlayerGates() {
@@ -747,6 +848,7 @@ const std::vector<Gate>& PlayerGates() {
       {"player-ledgegrab", "player", {}, false, GatePlayerLedgeGrab},
       {"player-crouch", "player", {}, false, GatePlayerCrouch},
       {"player-plants", "player", {}, false, GatePlayerPlants},
+      {"player-fastfall", "player", {}, false, GatePlayerFastFall},
   };
   return g;
 }
