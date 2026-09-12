@@ -200,7 +200,7 @@ bool fogOk = false;
     }
     if (far.PendingFills() != before) blindOk = false;
     for (uint32_t k = 0; k < kFarLevels; k++)
-      if (far.FaceWord(k) != (1u << 24)) blindOk = false;
+      if (far.FaceWord(k) != kFarFaceAllPending) blindOk = false;
     if (std::abs(far.SafeRadiusMeters() - kWindowHalfExtentMeters) > 1e-3f)
       blindOk = false;
     std::printf("far blind drain: %s (%zu queued, held over 3 ticks, "
@@ -242,13 +242,14 @@ bool fogOk = false;
   // plane's LAST entry is dispatched, and read zero after — released early it
   // is the stale slab the renderer drew as the terrain behind the player;
   // never released it is a permanent hole in level 1's +x edge. The drain
-  // runs at the play cap (16 ticks for a 1,024-entry plane), which is what
-  // makes the window in which the word matters real.
+  // runs at the play cap (several ticks for a 1,024-entry plane), which is
+  // what makes the window in which the word matters real.
   {
     IVec3 pc{108 >> 4, 122 >> 4, 108 >> 4};
     pc.x += 2 << (1 + kFarShiftBase);   // kHyst level-1 chunks, in fine chunks
     far.Update(pc);
-    const uint32_t wantFace = 1u << 4;  // nibble 1 = +x
+    // field 1 = +x, one plane deep (world.h's kFarFace* block owns the layout)
+    const uint32_t wantFace = 1u << kFarFaceBits;
     bool held = far.FaceWord(0) == wantFace;
     uint32_t ticks = 0;
     while ((n = far.PrepareTick(ctx.queue)) > 0) {
@@ -267,6 +268,41 @@ bool fogOk = false;
     std::printf("far valid box: %s (+x plane word 0x%x held over %u ticks, final 0x%x)\n",
                 faceOk ? "PASS" : "FAIL", wantFace, ticks, far.FaceWord(0));
     fogOk = fogOk && faceOk;
+
+    // ---- A BACKLOGGED FACE MAY NOT UNDER-REPORT (2026-09-12) -------------
+    // The count above was one plane deep, which is the case a face field of
+    // ANY width gets right. The one that mattered is the deep one: the field
+    // was four bits against a box kFarNChunk = 32 chunks across, so a face
+    // more than 15 planes behind published 15, raymarch.wgsl's farBox excluded
+    // fifteen chunk layers of the twenty that were stale, and the renderer
+    // marched the difference AS TERRAIN — the outgoing face's bytes, which are
+    // the ground from behind the player, drawn in front of them until the
+    // sieve caught up. Reached in about a second of flight at the old fill cap.
+    //
+    // Step the player one level-1 chunk at a time WITHOUT draining, so exactly
+    // one +x plane queues per Update and the count walks past the field. Every
+    // value up to kFarFaceMax must be named exactly; past it the only honest
+    // answer is "nothing in this level is trustworthy", because a clamped
+    // count is precisely the under-exclusion above.
+    {
+      bool deepOk = true;
+      uint32_t planes = 0;
+      uint32_t firstBad = 0;
+      for (uint32_t i = 0; i < kFarNChunk + 2; i++) {
+        pc.x += 1 << (1 + kFarShiftBase);   // one level-1 chunk, in fine chunks
+        far.Update(pc);
+        planes++;
+        const uint32_t w = far.FaceWord(0);
+        const uint32_t want = planes <= kFarFaceMax
+                                  ? (planes << kFarFaceBits)
+                                  : kFarFaceAllPending;
+        if (w != want && deepOk) { deepOk = false; firstBad = planes; }
+      }
+      std::printf("far face depth: %s (%u planes queued on +x, exact to %u "
+                  "then escalates; first wrong at %u)\n",
+                  deepOk ? "PASS" : "FAIL", planes, kFarFaceMax, firstBad);
+      fogOk = fogOk && deepOk;
+    }
   }
 }
 
@@ -2375,10 +2411,14 @@ Status GateShadowCache(Ctx& c, std::string& detail) {
     if (moved) shifted = !shifted;
     return moved;
   };
+  // The tick every walk/creep frame is rendered at. The walk holds it at noon
+  // — its motion is the CAMERA's — and the creep arm below is the one that
+  // moves it, because a creeping shadow is a moving SUN and nothing else.
+  uint32_t sunTick = noonTick;
   auto renderOne = [&](bool shadows, const Vec3& e, const Camera& cm,
                        std::vector<uint8_t>* out) -> bool {
     WriteRenderParams(ctx.queue, world, e, cm, (float)W / H, shadows, 0.0f,
-                      kFarFogDensity, (float)H, noonTick);
+                      kFarFogDensity, (float)H, sunTick);
     rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
     sim.EncodeShadowResolve(enc);
     rhi::RenderPass rp = sim.BeginRenderPass(
@@ -2520,6 +2560,94 @@ Status GateShadowCache(Ctx& c, std::string& detail) {
     wf.agreeSettled = acc / (double)((size_t)W * H);
   }
   if (shifted) shiftX(-1);
+
+  // ---- THE CREEP: the shadow of a tree, at the speed the sun actually moves -
+  //
+  // WHAT THIS MEASURES that nothing above does. The static arms hold the sun
+  // still and the walk arm moves the CAMERA; neither can see a defect in how
+  // the published value CHANGES, because in both of them it barely does. The
+  // owner's report of 2026-09-12 is entirely about that: a shadow creeping
+  // across the ground as the sun moves advanced in visible jumps, because
+  // kShadowSamples binary verdicts can only estimate the solar disc's coverage
+  // at 1/16 and a patch therefore holds a value and then steps ~9 of 255 when
+  // a blocker's edge crosses one of the sixteen sample directions.
+  //
+  // SO THE ASSERTION IS ON THE STEP, NOT ON THE VALUE. The cache buffer is
+  // read back each frame and every slot that is still the SAME patch (key and
+  // verifier both unchanged, valid in both frames) contributes its per-frame
+  // delta. What must be rare is a LARGE delta: the glide in shadow_resolve.wgsl
+  // caps an ordinary frame's motion at SHADOW_GLIDE of the distance to the
+  // window's answer, so a creeping patch moves a unit or three, while the
+  // unglided window moved a whole 1/16 at once or nothing at all.
+  //
+  // THE BOUND IS A FRACTION, on purpose, and a loose one. Big deltas are
+  // LEGITIMATE in a minority of slots — a patch whose window is still filling,
+  // a slot that has just changed hands, and the deliberate snap past
+  // SHADOW_GLIDE_SNAP — so the honest claim is not "no slot ever jumps", it is
+  // "jumping is not how a shadow moves". Unglided, essentially every slot that
+  // moves at all moves by a whole window step, so the measured fraction is
+  // near 1.0 against a bound of 0.25: a 4x margin, in a quantity that has no
+  // reason to drift.
+  //
+  // ONE TICK PER FRAME is the real thing, not an exaggeration of it:
+  // dayNight.cycleMinutes is 6, so a tick of sun is ~1/60 of a degree and the
+  // 32 frames here cover about a quarter of the 2-degree cone this softens
+  // over. A faster sweep would hide the defect rather than expose it — at the
+  // walk arm's rates the answer changes so much per frame that the glide
+  // snaps, which is exactly what it should do and exactly what this must not
+  // measure.
+  const uint32_t kCreep = 32;
+  const int kCreepStep = 5;      // units of 255 that count as a JUMP
+  size_t creepMoved = 0, creepJumps = 0;
+  int creepMax = 0;
+  auto readCache = [&](std::vector<uint32_t>& out) -> bool {
+    rhi::Buffer stage = CreateBuffer(
+        ctx.device, kShadowCacheBytes,
+        rhi::BufferUsage::MapRead | rhi::BufferUsage::CopyDst, "shadowCreepRead");
+    rhi::CommandEncoder cenc = ctx.device.CreateCommandEncoder();
+    cenc.CopyBufferToBuffer(world.shadowCache, 0, stage, 0, kShadowCacheBytes);
+    ctx.queue.Submit(cenc.Finish());
+    out.assign((size_t)kShadowCacheBuckets * kShadowCacheWords, 0);
+    return rhi::ReadBufferBlocking(ctx.device, stage, 0, out.data(),
+                                   out.size() * 4);
+  };
+  bool creepOk = walkOk && setCache(1);
+  std::vector<uint32_t> creepPrev, creepCur;
+  if (creepOk) {
+    // Warmed past the window (kShadowSamples = 16) at the START tick, so the
+    // first delta measured is a creep delta and not a fill delta.
+    sunTick = noonTick;
+    for (uint32_t w = 0; w < 20 && creepOk; w++)
+      creepOk = renderOne(true, eye, cam, nullptr);
+    creepOk = creepOk && readCache(creepPrev);
+  }
+  for (uint32_t f = 1; creepOk && f <= kCreep; f++) {
+    sunTick = noonTick + f;
+    creepOk = renderOne(true, eye, cam, nullptr) && readCache(creepCur);
+    if (!creepOk) break;
+    for (uint32_t b = 0; b < kShadowCacheBuckets; b++) {
+      const uint32_t k0 = creepPrev[b * 2], k1 = creepCur[b * 2];
+      if (!k0 || k0 != k1) continue;              // empty, or a different patch
+      const uint32_t s0 = creepPrev[b * 2 + 1], s1 = creepCur[b * 2 + 1];
+      if (!(s0 & 0x10000u) || !(s1 & 0x10000u)) continue;   // not valid in both
+      if (((s0 >> 17) & 0x7FFFu) != ((s1 >> 17) & 0x7FFFu)) continue;  // verifier
+      const int d = (int)(s1 & 0xFFu) - (int)(s0 & 0xFFu);
+      if (d == 0) continue;
+      creepMoved++;
+      creepMax = std::max(creepMax, std::abs(d));
+      if (std::abs(d) > kCreepStep) creepJumps++;
+    }
+    creepPrev.swap(creepCur);
+  }
+  sunTick = noonTick;
+  const double creepJumpFrac =
+      creepMoved ? (double)creepJumps / (double)creepMoved : 0.0;
+  // No slot moved at all over 32 ticks of sun means the arm measured nothing —
+  // a fixture with no moving shadow in it, not a pass (the "absolute zero is a
+  // rate claim" trap).
+  const bool creepPass = creepMoved >= 1000 && creepJumpFrac <= 0.25;
+  got = got && creepOk;   // the I/O only; the CLAIM joins `ok` at the end
+
   double walkMean = 0.0, settledMean = 0.0;
   size_t holesMax = 0, phantomsMax = 0;
   uint32_t holesF = 0, phantomsF = 0, reqMin = 0xFFFFFFFFu, reqMax = 0;
@@ -2616,7 +2744,7 @@ Status GateShadowCache(Ctx& c, std::string& detail) {
   const bool walkPass = walkMean < signal * kAgreeFrac &&
                         walk[worstF].agree < signal * kWalkWorstFrac;
   const bool ok = signal > kSignalMin && agree < signal * kAgreeFrac &&
-                  flicker < signal * kFlickerFrac && walkPass;
+                  flicker < signal * kFlickerFrac && walkPass && creepPass;
   std::printf("shadow cache: %s (cache vs per-pixel rays: mean |dL| %.2f; "
               "per-pixel rays vs no shadows: %.2f, must exceed %.1f; agreement "
               "must be under %.0f%% of that, i.e. %.2f; frame-to-frame flicker "
@@ -2645,6 +2773,11 @@ Status GateShadowCache(Ctx& c, std::string& detail) {
               holesF, phantomsMax,
               phantomsF, walk[kShiftAt].agree, walk[kShiftAt].holes,
               walk[kShiftAt].phantoms, reqMin, reqMax, kShadowReqCap, worstF);
+  std::printf("              creep (%u frames, one TICK of sun each — %s): "
+              "%zu slot-frames moved, %zu of them by more than %d/255 "
+              "(%.1f%%, must be under 25%%), largest step %d/255\n",
+              kCreep, creepPass ? "smooth" : "STEPPING", creepMoved,
+              creepJumps, kCreepStep, creepJumpFrac * 100.0, creepMax);
   std::printf("              per frame, moving|settled: |dL| / holes / "
               "phantoms (and rays resolved):");
   for (uint32_t f = 0; f < kWalk; f++)
@@ -2655,10 +2788,10 @@ Status GateShadowCache(Ctx& c, std::string& detail) {
   std::printf("\n");
   detail = Format("agree %.2f, signal %.2f, budget %.2f, flicker %.3f (ref "
                   "%.3f), %u requested; walk mean %.2f (settled %.2f) worst "
-                  "%.2f@%u",
+                  "%.2f@%u; creep %.1f%% of %zu moves jumped",
                   agree, signal, signal * kAgreeFrac, flicker, refFlicker,
                   reqStats[0], walkMean, settledMean, walk[worstF].agree,
-                  worstF);
+                  worstF, creepJumpFrac * 100.0, creepMoved);
   return ok ? Status::Pass : Status::Fail;
 }
 

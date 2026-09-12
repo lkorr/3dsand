@@ -153,12 +153,23 @@ bool LoadItemAsset(const std::string& dir, size_t materialCount,
       cv.size = cm.size;
       cv.modelOffset = cm.offset;
       cv.voxels = cm.voxels;
+      cv.cutFaces = MicroBodyCutFaces(d.prefab, ci);
       // Same shared pool the rigs and the held item use: a shell is drawn by
       // the borrowed slot's own micro path, so it must live where that path
       // looks.
       if (d.scale > 1) {
+        // ...WITH ITS JOINT MASK. A garment is a MULTI-MODEL prefab in one
+        // shared frame, exactly like a mob: the sleeve's top is pressed against
+        // the yoke, its bottom against the cuff, the hem against the skirt.
+        // Packed with the default 0 these panels each grew a rounded end CAP at
+        // every one of those planes and the two caps at a seam shaded away from
+        // each other, so a robe pulsed along every join as the arm swung
+        // (owner report 2026-09-12) -- the same defect MicroBodyCutFaces was
+        // written for on a mob's limbs, and it applies here for the same
+        // reason. A single-model garment measures 0 and is unaffected.
         cv.microModel = MicroBodyPack(micro, cv.voxels, cv.size, d.scale,
-                                      "item/" + d.name + "/" + cv.part, errors);
+                                      "item/" + d.name + "/" + cv.part, errors,
+                                      cv.cutFaces);
         if (cv.microModel < 0)
           errors += "items: \"" + d.name + "\" shell \"" + cv.part +
                     "\" has no micro brick and will not render\n";

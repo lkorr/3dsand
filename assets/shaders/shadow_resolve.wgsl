@@ -133,6 +133,66 @@ const SHADOW_LIFT_SHIFT : u32 = 21u;
 // fluid/wind rows: the kernel that reads it is the only consumer.
 const SHADOW_CONE_TAN : f32 = tan(TUNE_SHADOW_SUN_ANGLE * 0.017453292);
 
+// ============ THE WINDOW HAS SEVENTEEN LEVELS; THE SUN HAS NONE =============
+//
+// WHAT THIS FIXES (owner report 2026-09-12, the follow-up to the one above).
+// The cone made the shadow a gradient in SPACE. It is still a staircase in
+// TIME, because SHADOW_SAMPLES binary verdicts can only estimate the disc's
+// coverage at 1/16, and a patch therefore holds a value for a while and then
+// jumps 6.25% of full contrast when the blocker's edge crosses one of the
+// sixteen sample directions. Do the arithmetic at the tuning this ships with:
+// dayNight.cycleMinutes is 6, so the sun crosses a degree of sky per SECOND
+// and sweeps the whole 2 deg cone in two — sixteen levels in two seconds is a
+// visible step every 7 or 8 frames, for as long as the shadow is moving. That
+// is "the pixels still discretely jump in a bunch of small steps".
+//
+// MORE SAMPLES IS NOT THE ANSWER and there is no room for them anyway: the
+// window, its fill count and the lift byte already use 29 of a word's 32 bits,
+// and doubling the sample count halves the step while doubling the warm-up.
+// Sixty-four levels would still step.
+//
+// SO THE PUBLISHED BYTE GLIDES. The window output is low-passed on its way
+// into the slot, which turns each 1/16 jump into a ramp a few frames long; the
+// ramps of a moving shadow run into each other and what comes out is a
+// continuous slide at 1/255, which is the byte's own resolution and the end of
+// the road.
+//
+// THIS IS NOT THE EMA THE BLOCK ABOVE REFUSES, and the distinction is the
+// whole reason it is safe. That one would have averaged the RAW SAMPLES — a
+// cycling sequence, so its output oscillates with the sequence's period
+// forever and never settles. This one averages the WINDOW'S OUTPUT, which in a
+// static scene is not a sequence at all: it is one number, bit-identical every
+// frame, because the same slot is rewritten with the same bit. A low-pass fed
+// a constant converges to that constant and stops. The flicker arm of
+// --gate shadow-cache is what holds that claim honest.
+//
+// EXACT IN INTEGERS, for the same reason. The glide is computed on the stored
+// BYTE, not on a float that is re-quantised at the write: a float blend that
+// lands 0.4 units short of its target rounds back and forth between two
+// adjacent bytes forever, which is a 1/255 flicker — small, but "0 pixels
+// moved between two warmed frames" is a claim about zero. Integer steps with a
+// minimum magnitude of one unit reach the target exactly and then produce a
+// delta of exactly zero.
+//
+// A SNAP THRESHOLD keeps it from costing responsiveness. The sun creeps; a
+// blocker that appears or vanishes (a block mined, a door opened) moves the
+// answer by a large fraction at once, and there is no reason to smear that
+// over a third of a second. Past SHADOW_GLIDE_SNAP the new answer is taken
+// whole. The sun's own 1/16 steps are nowhere near it, and neither is the
+// lift byte's 16-frame refresh, so both glide.
+//
+// THE LAG IS BOUNDED AND SMALL. Below |d*rate| = 1 the step floors at one unit
+// per frame, so a steadily-moving shadow settles into a constant-velocity
+// slide with a standing error of about 1/rate units — ~17 of 255 at the rate
+// below, which is one window step, which is a couple of centimetres of shadow
+// position. A constant-velocity slide is the smoothest thing this can be.
+//
+// OFF AT A ZERO CONE ANGLE, so `render.shadowSunAngle = 0` still reproduces
+// the pre-2026-09-11 hard shadow exactly, value for value, and stays the
+// differential oracle it was.
+const SHADOW_GLIDE : f32 = 0.06;        // per frame, on the 0..255 byte
+const SHADOW_GLIDE_SNAP : i32 = 64;     // >= this many units: take it whole
+
 // A stable orthonormal pair spanning the plane normal to `n`. Frisvad's branch
 // is avoided in favour of picking the axis `n` leans on least, which costs two
 // compares and cannot degenerate.
@@ -220,6 +280,12 @@ fn resolve(@builtin(global_invocation_id) gid : vec3<u32>) {
   let fresh = !shadowStateValid(old0) || shadowStateVerifier(old0) != ver;
   var hist = select(shadowHist[bucket], 0u, fresh);
   var fill = (hist >> SHADOW_FILL_SHIFT) & SHADOW_FILL_MASK;
+  // Read BEFORE the increment below: the glide may only run once the window is
+  // a full window. While it is filling, the divisor itself is changing, so the
+  // output moves for a reason that has nothing to do with the scene and
+  // smoothing it would only delay the first honest answer — and would leave
+  // the value still creeping after the warm-up --gate shadow-cache pays for.
+  let wasFull = fill >= SHADOW_SAMPLES;
   let slotIdx = R.frameIdx % SHADOW_SAMPLES;
 
   // THE CENTRE RAY IS NOT JITTERED, and which frames take it is load-bearing.
@@ -315,7 +381,29 @@ fn resolve(@builtin(global_invocation_id) gid : vec3<u32>) {
   // first time publishes its one centre ray's answer, same as it always did.
   let openF = f32(countOneBits(hist & SHADOW_HIST_MASK)) / f32(max(fill, 1u));
   let liftF = f32(liftB) * (1.0 / 255.0);
-  let v = clamp(openF + (1.0 - openF) * liftF, 0.0, 1.0);
+  let aim = clamp(openF + (1.0 - openF) * liftF, 0.0, 1.0);
+  // ---- the glide (see THE WINDOW HAS SEVENTEEN LEVELS, above) ----
+  // Integer units of the stored byte throughout, so the fixed point is exact.
+  var valU = i32(aim * 255.0 + 0.5);   // `aim` not `target`: reserved word
+  // SHADOW_GLIDE = 0 is the differential oracle: it takes the window's answer
+  // whole, which is the pre-2026-09-12 behaviour, and `--gate shadow-cache`'s
+  // creep arm goes from 0.8% of moves jumping to 99.2% — and from 43,928
+  // slot-frames moving at all to 7,146, because moving a LITTLE EVERY FRAME
+  // rather than a lot occasionally is precisely what the fix is. One WGSL
+  // const, no rebuild: that is the whole A/B.
+  if (SHADOW_GLIDE > 0.0 && SHADOW_CONE_TAN > 0.0 && wasFull && !fresh) {
+    let prevU = i32(old0 & 0xFFu);
+    let d = valU - prevU;
+    if (d != 0 && abs(d) < SHADOW_GLIDE_SNAP) {
+      var s = i32(round(f32(d) * SHADOW_GLIDE));
+      // At least one unit toward the target — a rate that rounds to zero would
+      // park the byte a quantum short and never arrive.
+      if (s == 0) { s = select(-1, 1, d > 0); }
+      if (abs(s) > abs(d)) { s = d; }   // never overshoot
+      valU = prevU + s;
+    }
+  }
+  let v = f32(valU) * (1.0 / 255.0);
   // Written UNGUARDED, unlike the publish below. If the slot has changed hands
   // since the request was queued, the value write is dropped but this one is
   // not — and that is harmless by construction: the new owner's verifier will
@@ -364,7 +452,10 @@ fn resolve(@builtin(global_invocation_id) gid : vec3<u32>) {
   if (atomicLoad(&shadowCache[bucket * 2u]) != key) { return; }
   let old = atomicLoad(&shadowCache[bucket * 2u + 1u]);
   if (shadowStateVerifier(old) != ver) { return; }
+  // `valU` and not `u32(v * 255.0 + 0.5)`: the byte IS the state the glide
+  // above iterates on, and a round trip through a float is the one place a
+  // fixed point could pick up a unit of drift.
   atomicStore(&shadowCache[bucket * 2u + 1u],
-              shadowPackState(u32(v * 255.0 + 0.5), R.frameIdx & 15u,
+              shadowPackState(u32(valU), R.frameIdx & 15u,
                               shadowStateRequested(old), !buried, ver));
 }

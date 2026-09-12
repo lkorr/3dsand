@@ -233,13 +233,37 @@ std::vector<uint8_t> MicroBodyMergeArt(MicroBodySet& set,
 //
 // `cutFaces` is the 6-bit joint mask described on MicroBodyModelGpu::cutFaces.
 // It defaults to 0 — "every boundary plane of this brick is the edge of the
-// model" — which is the right answer for everything that is not one limb of a
-// jointed body: an item, a debris chunk, a carved COW clone. Only the mob
-// loader knows better, because only it has the other limbs of the same prefab
-// to measure against (mob.cpp LimbCutFaces).
+// model" — which is the right answer for a prefab that is ONE model: an item's
+// blade, a debris chunk, a carved COW clone. Anything packed out of a
+// MULTI-model prefab — a mob's limbs, a garment's panels — should pass
+// MicroBodyCutFaces below.
 int MicroBodyPack(MicroBodySet& set, const std::vector<PrefabVoxel>& voxels,
                   IVec3 dims, uint32_t scale, const std::string& label,
                   std::string& log, uint32_t cutFaces = 0);
+
+// ---- WHICH OF A BRICK'S SIX FACES IS A JOINT --------------------------------
+//
+// The `cutFaces` value for model `self` of `pf`: the 6-bit mask, `axis * 2 +
+// positive`, of the boundary planes that ANOTHER model of the same prefab is
+// pressed against. See MicroBodyModelGpu::cutFaces for what the shader does
+// with it and why the shader cannot work it out for itself.
+//
+// A FRACTION, NOT A PREDICATE, because parts meet imperfectly: art with a
+// one-voxel taper at the shoulder leaves part of the cap uncovered, and a held
+// prop can graze a face it is not jointed to. Half the solid boundary cells
+// covered is the line, which no single stray voxel can cross and no ordinary
+// joint fails.
+//
+// Returns 0 for a single-model prefab, which is the pre-2026-09-11 behaviour.
+//
+// NOT MOB-SPECIFIC, and it lived in mob.cpp for one day before that cost
+// something: a WORN ITEM is shaped exactly like a mob — one named model per
+// covered limb, in one shared frame — so a robe packed with cutFaces = 0 grew
+// a rounded end cap on every sleeve, yoke and hem, and the caps' shading swung
+// with the joint they straddled (owner report 2026-09-12: "the overlapping
+// parts are pulsing like crazy"). The rule is about MULTI-MODEL PREFABS, so it
+// belongs beside the packer every multi-model prefab goes through.
+uint32_t MicroBodyCutFaces(const Prefab& pf, int self);
 
 // ---- copy-on-write: destructible micro bodies -------------------------------
 //

@@ -6329,12 +6329,45 @@ boundary plane with unknown beyond — and shape does not separate them either:
 on chunky voxel art the flat side of an arm is as solid a boundary plane as its
 cap. What knows is the ART: every limb of a mob is one model of ONE prefab in
 one shared frame, so a joint is exactly a face another model is pressed against.
-`mob.cpp LimbCutFaces` measures that once at load (half the solid boundary cells
-covered is the line, so no stray voxel crosses it and no ordinary joint fails)
-and packs six bits onto the model record's spare word. The shader clamps the
-field across a cut face and treats every other face as air. A single-model
-prefab — an item, a debris chunk, a carved COW clone — gets 0 and the
-pre-2026-09-11 behaviour exactly.
+`MicroBodyCutFaces` (`sim/microbody.cpp`) measures that once at load (half the
+solid boundary cells covered is the line, so no stray voxel crosses it and no
+ordinary joint fails) and packs six bits onto the model record's spare word. The
+shader clamps the field across a cut face and treats every other face as air. A
+single-model prefab — an item, a debris chunk, a carved COW clone — gets 0 and
+the pre-2026-09-11 behaviour exactly. (`return 0u` from
+`microBodyCutFaces()` in the shader is the oracle: one WGSL line, no rebuild.)
+
+**The rule is about MULTI-MODEL PREFABS, not about creatures** (2026-09-12).
+It lived in `mob.cpp` for one day and that cost something: a WORN ITEM has
+exactly the same shape — one named model per covered limb, in one shared frame
+(`game/item.h ItemCover`) — so every garment packed with `cutFaces = 0` and grew
+a rounded end cap on each sleeve, yoke, cuff and hem, with the caps at a seam
+shading away from each other as the joint they straddle swings. It is now
+measured for item covers too, carried on `ItemCover::cutFaces` so the FIT
+resample (`Mob::AppendWornShell`) hands the same mask to the re-packed brick —
+a resample moves cells, never the question of which plane is a seam.
+
+**Two bricks that own the same cell.** A garment's panels deliberately OVERLAP:
+`scripts/gen_stock_armor.py` gives the armpit cells to BOTH the sleeve and the
+body panel, because whichever side cedes them shows a stripe of bare skin
+through half the gait (the sleeve's inner wall is what you see when the arm
+swings forward, the torso's side column when it swings back). That was free
+while both bricks shaded a shared cell identically — the generator says as much,
+"z-fighting is only a defect between things that look different" — and
+`BODY_SMOOTH_N` made them look different, because each brick differentiates its
+OWN field and cannot see the other. The tie that now decides which shading you
+see is float noise: the two panels ride different limbs, so the same world plane
+is reached through two different quaternions, `tCur` agrees only to rounding,
+`GreaterEqual` picks per PIXEL, and every idle-sway frame re-rolls it (owner
+report 2026-09-12: the overlapping parts of a robe pulsing and swapping). So the
+order is made explicit — `BODY_Z_PRIORITY` in `microbody.wgsl` pulls each body
+toward the camera by a relative slice of its view depth keyed on its render
+slot. Any consistent winner removes the flicker; both panels still cover the
+body, so the choice only decides which one's shading shows at the seam, and a
+seam that holds still reads as a seam. Relative and not absolute, so it is a
+fixed number of depth steps at any distance: the largest bias is 1.9e-3 of view
+depth, four thousand times the rounding it must beat and under a hundredth of a
+voxel at arm's length.
 
 **Bounds and cost.** The per-fragment DDA is hard-capped at `3·maxDim + 4` steps
 (worst-case diagonal of the brick) with no data-dependent loop bound anywhere.
@@ -6588,6 +6621,44 @@ held this slot before me"; nothing but the resolve pass sets it, so `!valid` is
 exactly "claimed since the last publish" and the window resets. The write-back
 is unguarded (unlike the value publish) because a slot that changed hands
 self-corrects on the next frame's verifier mismatch.
+
+**The window has seventeen levels; the sun has none** (added 2026-09-12,
+`SHADOW_GLIDE` in `shadow_resolve.wgsl`). The cone made the shadow a gradient in
+SPACE and left it a staircase in TIME: 16 binary verdicts estimate coverage at
+1/16, so a patch holds a value and then steps ~9 of 255 when a blocker's edge
+crosses one of the sixteen sample directions. `dayNight.cycleMinutes` is 6, so
+the sun crosses a degree of sky per SECOND and sweeps the whole 2° cone in two —
+sixteen levels in two seconds is a visible step every seven or eight frames, for
+as long as the shadow moves (owner report 2026-09-12, "the pixels still
+discretely jump in a bunch of small steps"). More samples cannot fix it and
+there is no room for them: 29 of the word's 32 bits are already spoken for, and
+64 levels would still step.
+
+So the published byte GLIDES: each frame it moves `SHADOW_GLIDE` of the way to
+the window's answer, which turns each 1/16 jump into a short ramp, and the ramps
+of a moving shadow run into each other. **This is not the EMA the paragraph
+above refuses** — that one would average the raw SAMPLES, a cycling sequence
+whose EMA oscillates forever; this averages the WINDOW'S OUTPUT, which in a
+static scene is one number, bit-identical every frame, and a low-pass fed a
+constant converges and stops. It is computed in integer units of the stored byte
+with a minimum step of one unit, so the fixed point is exact and a settled patch
+publishes a delta of exactly zero (a float blend landing 0.4 units short rounds
+back and forth forever — a 1/255 flicker, and "0 pixels moved" is a claim about
+zero). Past `SHADOW_GLIDE_SNAP` = 64/255 the new answer is taken whole, so a
+mined block or an opened door is instant and only the sun creeps. Below
+`|d·rate| = 1` the step floors at one unit per frame, so a steadily moving shadow
+settles into a constant-VELOCITY slide with a standing error of ~1/rate units —
+a couple of centimetres of shadow position, and the smoothest thing this can be.
+
+`--gate shadow-cache` gained a **creep arm** for it: a pinned camera, one TICK
+of sun per frame (the real rate — the walk arm's 1.4°/frame changes the answer
+so much that the glide correctly snaps and measures nothing), 32 frames, and the
+cache buffer read back each frame so every slot that is still the same patch
+contributes its per-frame delta. Measured: **0.8%** of slot-frame moves step by
+more than 5/255, against a bound of 25%. With `SHADOW_GLIDE = 0` — the oracle,
+one WGSL const and no rebuild — it is **99.2%**, largest step exactly 16/255,
+and the number of slot-frames that move at all falls from 43,928 to 7,146.
+Moving a little every frame rather than a lot occasionally IS the fix.
 
 **What is NOT here.** Soft shadows on the raster body paths. `bodySunShadow`
 casts one ray per FRAGMENT with nowhere to accumulate, so a limb still takes a

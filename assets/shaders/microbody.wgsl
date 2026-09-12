@@ -234,6 +234,49 @@ fn poolVoxAt(base : u32, dims : vec3<i32>, p : vec3<i32>) -> u32 {
 // face normal bit-identical to what shipped before.
 const BODY_SMOOTH_N : f32 = 0.55;
 
+// ---- TWO BRICKS THAT OWN THE SAME CELL (2026-09-12) ------------------------
+//
+// WHAT THIS FIXES. A garment's panels deliberately OVERLAP. A robe's sleeve is
+// a tube around the arm and its body panel is a tube around the torso; the two
+// meet in the armpit and, where the torso tapers at the waist, along a whole
+// column, and scripts/gen_stock_armor.py gives those cells to BOTH on purpose —
+// whichever side cedes them shows a stripe of bare skin through half the gait,
+// because the sleeve's inner wall is exactly what you see when the arm swings
+// forward and the torso's side column is exactly what you see when it swings
+// back.
+//
+// That was free while both bricks shaded a shared cell identically: the note
+// in the generator says as much — "z-fighting is only a defect between things
+// that look different". BODY_SMOOTH_N made them look different. Each brick
+// differentiates its OWN occupancy field and can see no other, so the sleeve's
+// copy of an armpit cell gets a normal pointing away from the arm and the
+// torso's copy gets one pointing away from the chest. Now the depth tie decides
+// which of two visibly different shadings you see.
+//
+// AND THE TIE IS NOISE. The two panels ride different limbs, so the same world
+// plane is reached through two different quaternions and two different brick
+// origins; `tCur` for the shared cell agrees only to float rounding, the
+// GreaterEqual test therefore picks a winner per PIXEL, and every idle-sway
+// frame re-rolls it. That is the owner report of 2026-09-12: the overlapping
+// parts of a robe pulsing, flashing and swapping with each other.
+//
+// SO THE ORDER IS MADE EXPLICIT. Each body is pulled toward the camera by a
+// relative slice of its view depth keyed on its render SLOT, which is stable
+// frame to frame (mob.cpp AppendMicroInsts walks limbs in a fixed order). Any
+// consistent winner removes the flicker — both panels still cover the body, so
+// the choice only decides which one's shading you see at the seam, and a seam
+// that holds still reads as a seam instead of as a rendering fault.
+//
+// RELATIVE, NOT ABSOLUTE, so it is a fixed number of depth-buffer steps at any
+// distance. The largest bias is 63 * this = 1.9e-3 of view depth — four
+// thousand times the ~1e-6 rounding it has to beat, and still under a
+// hundredth of a voxel at arm's length, so nothing sinks into or floats off the
+// terrain it is composited against. 64 distinct priorities cover every slot of
+// a dressed humanoid (about 15 limbs plus 6 robe panels), which is all that is
+// asked of it: two bodies far enough apart in slot index to alias are two
+// bodies that are not sharing a cell.
+const BODY_Z_PRIORITY : f32 = 3.0e-5;
+
 // ---- WHAT LIES OUTSIDE THE BRICK (the cut-face mask, 2026-09-11) -----------
 //
 // The word common.wgsl's MicroBodyModel mirror still calls `_pad` is NOT
@@ -496,7 +539,12 @@ fn fs(in : VSOut) -> FSOut {
   // the raymarcher writes, just with an unnormalized rd on both sides. Any
   // deviation here (a normalized direction, a different near constant) shows up
   // as micro bodies punching through terrain or sinking into it.
-  let viewZ = tCur * dot(rdWorld, R.camFwd);
+  // The slot priority (BODY_Z_PRIORITY) is folded in here and nowhere else:
+  // shrinking the view depth is what "nearer" means under reversed-Z, and
+  // doing it to viewZ rather than to the packed depth keeps the one conversion
+  // this file shares with raymarch.wgsl byte for byte.
+  let viewZ = tCur * dot(rdWorld, R.camFwd) *
+              (1.0 - f32(in.slot & 63u) * BODY_Z_PRIORITY);
   var out : FSOut;
   // litColor is linear HDR; same tonemap as terrain + the cube path, or a
   // live limb and the severed one beside it would shade differently.
