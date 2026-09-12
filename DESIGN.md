@@ -5426,9 +5426,31 @@ where you hear from either (§12b, "The ears are on the character").
   Levels are filled on the GPU by sampling `genCell()` at stride
   (worldgen.wgsl `far` — the "sieve"), recentered with hysteresis like the
   streaming window, and refilled a plane at a time (managed by
-  `sim/farfield`; planes drain at `kPlayFillCap` = 64 in play, a wholesale
-  reset at `render.farRefillRate` in the game and at `kFarListCap` in the
-  headless drain loops).
+  `sim/farfield`; planes drain at `render.farPlaneFillRate` (256) in play, a
+  wholesale reset at `render.farRefillRate` in the game and at `kFarListCap`
+  in the headless drain loops).
+  **The sieve skips the sky (2026-09-12).** `far` ran a full `genCellCol` for
+  all 4,096 cells of a level chunk whatever its altitude, and a level box is
+  `kFarN` cells tall — 13 km at level 8 against a few hundred metres of
+  terrain — so most of a coarse level's fill was generating air. It now takes
+  the ceiling `genChunk` has always had: above `max(farColTopFrom over the
+  thread's columns, treeMaxTop())` a row stores the zero word it was going to
+  store and skips the sample. Bit-identical output (the bound is exactly the
+  three arms `farBlockerBitAt` and `farCellIsSolid` can answer above), and
+  measured on one exe against two asset trees, `--frames 900
+  --autofly-surface`, the same 265k entries over the same 306 ticks:
+  `farField` GPU mean **15.90 → 6.65 ms/frame**, p99 65.5 → 37.3, max 150 →
+  47 — 44.5 µs to 18.6 µs per sieve entry. That per-entry cost is what the
+  fill caps trade against, which is why they moved with it.
+  **The plane backlog is BOUNDED (2026-09-12).** Sustained travel queues
+  planes faster than any per-tick cap drains them (measured in surface flight:
+  ~1,065 entries/tick of demand), and nothing capped the queue — a flight left
+  437,248 entries, 3.8 minutes of drain, still queued. `FarField::Update` now
+  coalesces: a face `kFarNChunk` planes deep has turned over the whole box, so
+  the level is reset instead, which costs the same entries, prunes the
+  superseded ones (`PruneLevel`), drains on the bulk cap and leaves the level
+  CORRECT rather than partly stale. Per-level backlog is then bounded by one
+  level, and "the horizon is minutes behind" becomes the state a load leaves.
   **A wholesale refill is FINEST level first and is BUDGETED (2026-09-10).**
   A `FullRefill` — startup, `LoadWorld`, regen, a teleport past a level's
   window — is `kFarLevels × kFarNumChunks` = 262,144 sieve entries. Drained at
@@ -5468,9 +5490,16 @@ where you hear from either (§12b, "The ears are on the character").
   face drawn in the sky when the box stepped up. `FarField` now keeps one
   record per queued plane (FIFO beside the entry queue) and a count of planes
   outstanding on each of a level's six faces, released when a plane's LAST
-  entry is dispatched; `FarField::FaceWord` packs the six counts (4 bits each)
-  plus a whole-level-pending bit into `FarParams.origins[k].w`, the word no
-  other reader used, so neither `common.wgsl` nor `world.h` changed for it.
+  entry is dispatched; `FarField::FaceWord` packs the six counts (5 bits each)
+  plus a whole-level-pending bit (30) into `FarParams.origins[k].w`, the word
+  no other reader used. **The field must hold the whole box (2026-09-12):** it
+  was four bits, saturating at 15 against a box `kFarNChunk` = 32 chunks
+  across, so a face more than 15 planes behind published 15 and the renderer
+  marched the other stale layers AS TERRAIN — the ground from behind a moving
+  player, drawn in front of them until the sieve caught up, reached in about a
+  second of flight. `world.h`'s `kFarFace*` block now derives the width from
+  `kFarNChunk`, a count that will not fit escalates to the pending bit rather
+  than clamping, and `scripts/check_invariants.py` pins the WGSL literals.
   raymarch.wgsl `farBox` unpacks it and every far reader (`traceFar`,
   `farShadowDist`, the far AO taps) marches the full box less those faces —
   empty during a reset — so a ray in an excluded slab leaves the level at the
@@ -5478,9 +5507,13 @@ where you hear from either (§12b, "The ears are on the character").
   the same t by the seam contract `traceFar` already keeps for a ray out of
   `farSteps`. Always conservative: a landed face is published a tick late, a
   reversed face is excluded on both sides until both records drain, and a
-  reset voids the level's older records via an epoch. The `far-fog` gate
-  steps the player one level-1 hysteresis in +x and asserts the +x nibble
-  holds through the 16-tick drain and clears after. **Edits reach the far field
+  reset voids the level's older records via an epoch. `SafeRadiusMeters`
+  subtracts one level chunk PER QUEUED PLANE, not one: the excluded slab is
+  that deep, and subtracting one fogged open over exactly the band the
+  renderer was refusing to march. The `far-fog` gate steps the player one
+  level-1 hysteresis in +x and asserts the +x field holds through the drain
+  and clears after, then queues `kFarNChunk + 2` planes on one face and
+  asserts the word is exact to `kFarFaceMax` and escalates past it. **Edits reach the far field
   (phase 2):** each tick, `worldgen.wgsl fardown` runs one workgroup per entry
   of the compacted dirty list — the same `DispatchWorkgroupsIndirect` args the
   occupancy update uses, so a settled world dispatches nothing — and re-derives

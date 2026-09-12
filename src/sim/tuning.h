@@ -2923,6 +2923,18 @@ struct Tuning {
     // dropped frame matters more than a busy minute. Hot-reloads on F5.
     int farRefillRate = 1024;
 
+    // ---- THE ORDINARY-TRAVEL CAP (farfield.h kPlayFillCap) -----------------
+    // Entries an INCOMING PLANE may drain per tick: the horizon keeping up
+    // with a player who is walking, sprinting or flying, as opposed to the
+    // wholesale refill above. It was a hard-coded 64 until 2026-09-12, sized
+    // when a sieve entry cost ~45 us of GPU; the `far` kernel's sky early-out
+    // took that to ~19 us, and 64 was by then the reason the queue backlogged
+    // at all — 437k entries (3.8 minutes of drain) after 22 s of flight, deep
+    // enough that the valid-box face counts overflowed and the renderer fell
+    // through to house-sized cells at 40 m. 256 is ~4.8 ms/tick of sieve,
+    // still under what 64 was sized to spend. Hot-reloads on F5.
+    int farPlaneFillRate = 256;
+
     // budgets
     int primarySteps = 4096;
     int farSteps = 384;

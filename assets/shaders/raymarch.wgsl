@@ -3659,24 +3659,35 @@ fn gasOuterFill(ro : vec3f, rdIn : vec3f, tEnd : f32, px : vec2f) -> f32 {
 // those bytes were the hillside BEHIND the player drawn ahead of them, and the
 // underground of the bottom face drawn in the sky when the box stepped up.
 //
-// F.origins[k].w is the pending-face word FarField::FaceWord packs: six 4-bit
-// counts of planes still queued on each face (-x,+x,-y,+y,-z,+z, low nibble
-// first) and bit 24 = the whole level is a reset in flight. The box every far
-// reader marches is the full box less those faces (empty during a reset), so a
+// F.origins[k].w is the pending-face word FarField::FaceWord packs: six 5-bit
+// counts of level-chunk layers still queued on each face (-x,+x,-y,+y,-z,+z,
+// low field first) and bit 30 = the whole level is unusable (a reset in
+// flight, or a face so far behind its count no longer fits — see world.h's
+// kFarFace* block, which owns this layout and which
+// scripts/check_invariants.py pins to the literals below).
+// The box every far reader marches is the full box less those faces
+// (empty during a reset), so a
 // ray in an excluded slab leaves this level at the shrunken face and the next
 // coarser level — filled — picks it up at the same t, by the seam contract
 // traceFar already keeps for a ray that runs out of TUNE_FAR_STEPS. Nothing
 // here reads a slot before the sieve has written it. Same-tick origin step and
 // face shrink arrive in one UBO write; a landed face is published a tick late.
 struct FarBox { lo : vec3<i32>, hi : vec3<i32> };   // level-CELL coords, [lo, hi)
+const FAR_FACE_BITS : u32 = 5u;          // world.h kFarFaceBits
+const FAR_FACE_MASK : u32 = 31u;         // world.h kFarFaceMax
+const FAR_FACE_ALL  : u32 = 1u << 30u;   // world.h kFarFaceAllPending
 fn farBox(level : u32) -> FarBox {
   let o = F.origins[level - 1u];
   let w = u32(o.w);
   var b : FarBox;
   b.lo = o.xyz * i32(CHUNK);
-  if ((w & (1u << 24u)) != 0u) { b.hi = b.lo; return b; }   // reset in flight
-  let lo = vec3<i32>(i32(w & 15u), i32((w >> 8u) & 15u), i32((w >> 16u) & 15u));
-  let hi = vec3<i32>(i32((w >> 4u) & 15u), i32((w >> 12u) & 15u), i32((w >> 20u) & 15u));
+  if ((w & FAR_FACE_ALL) != 0u) { b.hi = b.lo; return b; }   // nothing usable
+  let lo = vec3<i32>(i32((w >> (0u * FAR_FACE_BITS)) & FAR_FACE_MASK),
+                     i32((w >> (2u * FAR_FACE_BITS)) & FAR_FACE_MASK),
+                     i32((w >> (4u * FAR_FACE_BITS)) & FAR_FACE_MASK));
+  let hi = vec3<i32>(i32((w >> (1u * FAR_FACE_BITS)) & FAR_FACE_MASK),
+                     i32((w >> (3u * FAR_FACE_BITS)) & FAR_FACE_MASK),
+                     i32((w >> (5u * FAR_FACE_BITS)) & FAR_FACE_MASK));
   b.lo = (o.xyz + lo) * i32(CHUNK);
   b.hi = (o.xyz + vec3<i32>(i32(FAR_NCHUNK)) - hi) * i32(CHUNK);
   return b;
@@ -3935,14 +3946,33 @@ fn traceFar(ro : vec3f, rdIn : vec3f, tStart : f32, px : vec2f) -> FarHit {
       // seeded cell lands one off. Recomputing the ONE axis that changed costs
       // a subtract and a multiply and makes cNext exact at all times: each
       // component is the plane equation for the boundary it currently names.
+      //
+      // ---- IT ALSO SETS `axis`, WHICH IT DID NOT (2026-09-12) --------------
+      // `axis` is this march's hit NORMAL: fs() turns it into
+      // axisVec(far.axis, -far.sgn), reads TUNE_FACE_X/TUNE_FACE_Z off it,
+      // offsets the shadow ray's origin along it, and picks the two AO tangent
+      // axes from it. The CELL cursor below maintains it; this one never did.
+      // So a ray that crossed empty chunks — which is ALL the chunk cursor
+      // does, by design; that is the whole point of the nested traversal — and
+      // then hit on the FIRST cell of an occupied chunk reported whatever axis
+      // the cell cursor had last left behind, or, for a ray that had not walked
+      // a single cell yet, the level's BOX ENTRY axis from before the loop.
+      //
+      // That is the commonest shape this renderer draws: a ray flying through
+      // sky and landing on the entry face of a hillside. Those cells were lit
+      // as the wrong face — a full TUNE_FACE_X/Z brightness step, a sun term
+      // off by up to 90 degrees, and AO sampled in the wrong plane — which
+      // reads as facets of distant terrain shaded as if they pointed somewhere
+      // else. It did not show up as a hole or a seam, which is why it survived:
+      // the geometry was always right and only the lighting was wrong.
       if (cNext.x <= cNext.y && cNext.x <= cNext.z) {
-        tCur = cNext.x; cc.x += stepv.x;
+        tCur = cNext.x; cc.x += stepv.x; axis = 0;
         cNext.x = (f32((cc.x + max(stepv.x, 0)) * i32(CHUNK)) - roL.x) * inv.x;
       } else if (cNext.y <= cNext.z) {
-        tCur = cNext.y; cc.y += stepv.y;
+        tCur = cNext.y; cc.y += stepv.y; axis = 1;
         cNext.y = (f32((cc.y + max(stepv.y, 0)) * i32(CHUNK)) - roL.y) * inv.y;
       } else {
-        tCur = cNext.z; cc.z += stepv.z;
+        tCur = cNext.z; cc.z += stepv.z; axis = 2;
         cNext.z = (f32((cc.z + max(stepv.z, 0)) * i32(CHUNK)) - roL.z) * inv.z;
       }
     }

@@ -36,6 +36,7 @@ void FarField::EnqueuePlane(uint32_t k, int axis, int wcoord) {
   const int oa = axis == 0 ? origins_[k].x : axis == 1 ? origins_[k].y
                                                      : origins_[k].z;
   const int side = wcoord == oa + (int)kFarNChunk - 1 ? 1 : 0;
+  planes_++;
   recs_.push_back({k, axis, side, kFarNChunk * kFarNChunk, epoch_[k]});
   faces_[k][axis][side]++;
   uboDirty_ = true;
@@ -52,7 +53,27 @@ void FarField::EnqueuePlane(uint32_t k, int axis, int wcoord) {
   }
 }
 
+void FarField::PruneLevel(uint32_t k) {
+  if (pending_[k] == 0) return;
+  queue_.erase(std::remove_if(queue_.begin(), queue_.end(),
+                              [k](uint32_t e) {
+                                return (e >> kFarSlotShift) == k;
+                              }),
+               queue_.end());
+  recs_.erase(std::remove_if(recs_.begin(), recs_.end(),
+                             [k](const PlaneRec& r) { return r.level == k; }),
+              recs_.end());
+  pending_[k] = 0;
+  bulkPending_[k] = 0;
+}
+
 void FarField::ResetLevel(uint32_t k, IVec3 desired) {
+  resets_++;
+  // Whatever this level still had queued is superseded: every one of those
+  // entries names a SLOT the wholesale enqueue below is about to name again.
+  // Without this a coalesced reset ADDED kFarNumChunks entries to a backlog
+  // instead of replacing it, which is the opposite of the point.
+  PruneLevel(k);
   origins_[k] = desired;
   uboDirty_ = true;
   for (uint32_t slot = 0; slot < kFarNumChunks; slot++) Enqueue(k, slot);
@@ -65,6 +86,7 @@ void FarField::ResetLevel(uint32_t k, IVec3 desired) {
 }
 
 void FarField::FullRefill(IVec3 playerChunk) {
+  refills_++;
   queue_.clear();
   recs_.clear();
   for (uint32_t k = 0; k < kFarLevels; k++) {
@@ -128,27 +150,49 @@ float FarField::SafeRadiusMeters() const {
     }
     if (bulkPending_[k] > 0) continue;         // reset in flight: no data at all
     // Only PLANES outstanding: the level was complete and what is missing is
-    // its incoming face, one level chunk thick, on the side the player is
-    // moving toward. Everything inside that face is filled, so the trusted
-    // radius is the level's own half-extent less the face — under the play
-    // cap a plane takes ~16 ticks to land, and fogging the whole level out
-    // for that long would pulse the horizon on every chunk boundary crossed.
+    // its incoming face, one level chunk thick per queued plane, on the side
+    // the player is moving toward. Everything inside those faces is filled, so
+    // the trusted radius is the level's own half-extent less the DEEPEST
+    // face — under the play cap a plane takes several ticks to land, and
+    // fogging the whole level out for that long would pulse the horizon on
+    // every chunk boundary crossed.
+    //
+    // TIMES THE PLANES QUEUED, and it used to be times one (2026-09-12). The
+    // subtraction is the width of the slab raymarch.wgsl's farBox is excluding,
+    // and that slab is one level chunk PER QUEUED PLANE — so with a backlog
+    // this reported the level trustworthy out to a radius whose outer band the
+    // renderer was refusing to march. The fog then opened over exactly the
+    // region that had no data to show, which is the opposite of what the
+    // adaptive fog exists for. Agrees with FaceWord by construction: same
+    // counters, same "a face past the box is no data at all" escalation.
+    uint32_t layers = 0;
+    for (int a = 0; a < 3; a++)
+      for (int s = 0; s < 2; s++) layers = std::max(layers, faces_[k][a][s]);
+    if (layers >= kFarNChunk) continue;        // box fully excluded: no data
     const float face =
         (float)(kChunk << (k + 1 + kFarShiftBase)) * kVoxelMeters;
-    best = std::max(best, kFarHalfExtentMeters(k + 1) - face);
+    best = std::max(best, kFarHalfExtentMeters(k + 1) - face * (float)layers);
   }
   return best;
 }
 
 uint32_t FarField::FaceWord(uint32_t k) const {
   // Layout documented at the declaration (farfield.h) and at the reader
-  // (raymarch.wgsl farBox): nibble (axis * 2 + side) holds the planes queued on
-  // that face, saturated at 15; bit 24 says the whole level is pending.
-  if (bulkPending_[k] > 0) return 1u << 24;
+  // (raymarch.wgsl farBox): the 5-bit field (axis * 2 + side) holds the planes
+  // queued on that face; bit 30 says the whole level is pending.
+  if (bulkPending_[k] > 0) return kFarFaceAllPending;
   uint32_t w = 0;
-  for (int a = 0; a < 3; a++)
-    for (int side = 0; side < 2; side++)
-      w |= std::min(faces_[k][a][side], 15u) << (4 * (a * 2 + side));
+  for (int a = 0; a < 3; a++) {
+    for (int side = 0; side < 2; side++) {
+      // A count that does not fit is NOT clamped. Clamping is what made this
+      // word lie (farfield.h): the excluded slab would be narrower than the
+      // stale one and the renderer would march the difference as terrain.
+      // A face that has fallen a whole box behind has no trustworthy data in
+      // this level at all, which is exactly what bit 30 says.
+      if (faces_[k][a][side] > kFarFaceMax) return kFarFaceAllPending;
+      w |= faces_[k][a][side] << (kFarFaceBits * (a * 2 + side));
+    }
+  }
   return w;
 }
 
@@ -157,13 +201,18 @@ void FarField::Update(IVec3 playerChunk) {
     IVec3 desired = DesiredOrigin(playerChunk, k);
     int d[3] = {desired.x - origins_[k].x, desired.y - origins_[k].y,
                 desired.z - origins_[k].z};
-    if (std::abs(d[0]) >= (int)kFarNChunk || std::abs(d[1]) >= (int)kFarNChunk ||
-        std::abs(d[2]) >= (int)kFarNChunk) {
+    const uint32_t gap = (uint32_t)std::max({std::abs(d[0]), std::abs(d[1]),
+                                             std::abs(d[2])});
+    if (gap > worstGap_) { worstGap_ = gap; worstGapLevel_ = k + 1; }
+    if (gap >= kFarNChunk) {
+      gapResets_++;
       ResetLevel(k, desired);  // whole window stale (teleport / load)
       continue;
     }
+    bool stepped = false;
     for (int axis = 0; axis < 3; axis++) {
       if (std::abs(d[axis]) < kHyst) continue;
+      stepped = true;
       int dir = d[axis] > 0 ? 1 : -1;
       int* o = axis == 0 ? &origins_[k].x : axis == 1 ? &origins_[k].y
                                                       : &origins_[k].z;
@@ -172,6 +221,38 @@ void FarField::Update(IVec3 playerChunk) {
       // incoming plane: the window's leading face after the shift
       int wcoord = dir > 0 ? *o + (int)kFarNChunk - 1 : *o;
       EnqueuePlane(k, axis, wcoord);
+    }
+
+    // ---- COALESCE A FACE THAT HAS FALLEN A WHOLE BOX BEHIND (2026-09-12) ---
+    // The origin steps at most one level chunk per axis per tick and each step
+    // queues a 1,024-entry plane, but the drain is a per-tick cap — so sustained
+    // travel queues planes faster than they land and the backlog grows without
+    // any bound at all. Measured `--frames 900 --autofly-surface`: 342 planes
+    // queued in 329 ticks against a plane demand of ~1,065 entries/tick, and at
+    // the old 64/tick cap a flight left 437,248 entries — 3.8 MINUTES of drain
+    // — still queued when the run ended.
+    //
+    // At kFarNChunk planes deep the face has turned over the ENTIRE box: every
+    // slot on this axis has been recycled, so there is nothing left in the
+    // level worth keeping and FaceWord is already publishing kFarFaceAllPending
+    // for it. A reset costs kFarNumChunks entries; the planes it replaces cost
+    // kFarNChunk * kFarNChunk * kFarNChunk, which is the SAME number — except
+    // the reset also drops the redundant re-queues of slots the origin has
+    // wrapped past more than once, drains on the bulk cap rather than the play
+    // cap, and leaves the level CORRECT instead of partially stale.
+    //
+    // So the backlog per level is bounded by one level's worth of entries, and
+    // "the horizon is minutes behind" becomes "the horizon is one refill
+    // behind" — which the finest-first order and the adaptive fog already
+    // handle, because it is the same state a load leaves.
+    if (stepped) {
+      uint32_t worst = 0;
+      for (int a = 0; a < 3; a++)
+        for (int s = 0; s < 2; s++) worst = std::max(worst, faces_[k][a][s]);
+      if (worst >= kFarNChunk) {
+        coalesced_++;
+        ResetLevel(k, desired);
+      }
     }
   }
 }
@@ -199,13 +280,13 @@ uint32_t FarField::PrepareTick(const rhi::Queue& queue, bool drain) {
   // One bulk slice per FRAME under the frame gate (farfield.h BeginFrame).
   // A second tick in the same frame falls back to the play cap rather than to
   // nothing: whatever planes the player's travel queued behind the reset
-  // still have to keep up, and they are 64 entries.
+  // still have to keep up, and they are one plane cap's worth.
   if (bulk && frameGated_) {
     if (bulkThisFrame_) bulk = false;
     else bulkThisFrame_ = true;
   }
   const uint32_t cap = (uint32_t)std::min(
-      queue_.size(), (size_t)(bulk ? bulkCap_ : kPlayFillCap));
+      queue_.size(), (size_t)(bulk ? bulkCap_ : planeCap_));
   std::vector<uint32_t> list;
   list.reserve(cap);
   patchHeader_.clear();

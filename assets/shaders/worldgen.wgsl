@@ -4988,40 +4988,80 @@ fn far(@builtin(workgroup_id) wg : vec3<u32>,
       btops[b] = t;
     }
   }
+  // ---- THE SKY CEILING: the row above which this thread has nothing to do ----
+  //
+  // genChunk has had a sky-skip since it existed (the `trees.top` block below
+  // it); the sieve never did, so a level-8 chunk 3 km above the ground still
+  // ran 64 full genCellCol evaluations per thread to conclude "air". A level
+  // box is FAR_N cells tall — 13 km at level 8 — and the terrain occupies a few
+  // hundred metres of it, so MOST of a coarse level's fill was generating sky.
+  // That per-entry cost is what forces farfield.h's kPlayFillCap down, and the
+  // cap is what makes the horizon lag a moving player.
+  //
+  // THE BOUND, and why each term is needed. A row is skippable when its floor
+  // y0 is above everything a cell in it could report:
+  //   tops[b] + step   the column's own conservative top (ground, standing
+  //                    fluid, the cover stack, an authored stamp) plus one
+  //                    cell, because farBlockerBitAt's MIDDLE band fires for
+  //                    y0 in (tops, tops + step) and must not be skipped.
+  //   btops[b]         that band's corner max, which can exceed tops[b].
+  //   treeMaxTop()     trees are NOT in farColTopFrom (see its note) and a tree
+  //                    rooted on a neighbouring, higher column can lean over
+  //                    this one — so the tree term has to be the GLOBAL
+  //                    ceiling, which is exactly what treeAt's own first line
+  //                    tests. A trunk only stands below the treeline.
+  // Everything else genCellIn can put above ground is a gas, and
+  // farCellIsSolid drops those already.
+  //
+  // Conservative on the only axis that matters: it can only skip rows whose
+  // cells were all going to be zero, so the bytes, the count, the top row and
+  // farOcc are bit-identical to the full sweep. `fardown` and `farpatch` keep
+  // the full form — they visit single scattered cells with no row to amortize
+  // over — and still agree byte for byte (the `far-downsample` gate).
+  var skyCeil = treeMaxTop();
+  for (var b = unrollFenceU(); b < 4u; b++) {
+    skyCeil = max(skyCeil, max(tops[b] + step, btops[b]));
+  }
   let planeBase = ((level - 1u) * FAR_VOX + slot * CHUNK_VOL) / 4u;
   var top = 0u;   // one plus the highest row with a non-empty cell, this thread
   for (var yi = unrollFenceU(); yi < CHUNK; yi++) {
+    // The row's floor, shared by all four of its cells (cc.y is the same).
+    let yRow = (base.y + i32(yi)) << shift;
     var word = 0u;
-    for (var b = unrollFenceU(); b < 4u; b++) {
-      let cc = base + vec3<i32>(i32(x0 + b), i32(yi), i32(zi));
-      // the sieve: fine-voxel center of the 2^shift-wide region this cell covers
-      let fine = (cc << vec3<u32>(shift)) + vec3<i32>(1 << (shift - 1u));
-      var col = cols[b];
-      let mat = genCellCol(&col, fine, T.seed) & 0xFFFu;
-      // The conservative flag first: it is what a cell keeps when the centre
-      // sample found nothing (common.wgsl FAR_BLOCKER_BIT). This is
-      // farBlockerBitAt flattened onto the hoisted `tops`/`btops` — see the
-      // comment above the b loop; the three bands are byte-identical.
-      let y0 = cc.y << shift;
-      var byteV = 0u;
-      if (y0 <= tops[b]) {
-        byteV = FAR_BLOCKER_BIT;
-      } else if (y0 - tops[b] < step) {
-        byteV = select(0u, FAR_BLOCKER_BIT, y0 <= btops[b]);
+    // The store below stays UNCONDITIONAL: this slot may hold the bytes of the
+    // level chunk that used to live in it, and a skipped row still has to be
+    // cleared to the air it now is.
+    if (yRow <= skyCeil) {
+      for (var b = unrollFenceU(); b < 4u; b++) {
+        let cc = base + vec3<i32>(i32(x0 + b), i32(yi), i32(zi));
+        // the sieve: fine-voxel center of the 2^shift-wide region this cell covers
+        let fine = (cc << vec3<u32>(shift)) + vec3<i32>(1 << (shift - 1u));
+        var col = cols[b];
+        let mat = genCellCol(&col, fine, T.seed) & 0xFFFu;
+        // The conservative flag first: it is what a cell keeps when the centre
+        // sample found nothing (common.wgsl FAR_BLOCKER_BIT). This is
+        // farBlockerBitAt flattened onto the hoisted `tops`/`btops` — see the
+        // comment above the b loop; the three bands are byte-identical.
+        var byteV = 0u;
+        if (yRow <= tops[b]) {
+          byteV = FAR_BLOCKER_BIT;
+        } else if (yRow - tops[b] < step) {
+          byteV = select(0u, FAR_BLOCKER_BIT, yRow <= btops[b]);
+        }
+        if (farCellIsSolid(mat)) {
+          // shape from the center sample, color from the surface skin (phase 4).
+          // What lands in the byte is the skin material's FAR PALETTE SLOT, not
+          // its id (common.wgsl FAR_PAL_MASK); slots are identity while the id
+          // fits in seven bits, so an unaliased material table writes exactly
+          // the byte this line wrote before the palette existed.
+          byteV |= matFarPal(&materials, farSurfaceMat(&col, mat, fine, shift, T.seed));
+        }
+        // farOcc counts NON-EMPTY cells, which now includes blocker-only ones —
+        // it gates empty-space skipping for every far reader, and a reader that
+        // hits on the flag must not have its chunk skipped out from under it.
+        if (byteV != 0u) { count += 1u; top = yi + 1u; }
+        word |= byteV << (b * 8u);
       }
-      if (farCellIsSolid(mat)) {
-        // shape from the center sample, color from the surface skin (phase 4).
-        // What lands in the byte is the skin material's FAR PALETTE SLOT, not
-        // its id (common.wgsl FAR_PAL_MASK); slots are identity while the id
-        // fits in seven bits, so an unaliased material table writes exactly
-        // the byte this line wrote before the palette existed.
-        byteV |= matFarPal(&materials, farSurfaceMat(&col, mat, fine, shift, T.seed));
-      }
-      // farOcc counts NON-EMPTY cells, which now includes blocker-only ones —
-      // it gates empty-space skipping for every far reader, and a reader that
-      // hits on the flag must not have its chunk skipped out from under it.
-      if (byteV != 0u) { count += 1u; top = yi + 1u; }
-      word |= byteV << (b * 8u);
     }
     // The cell index in this level chunk is x + y*CHUNK + z*CHUNK*CHUNK (see the
     // `farpatch` entry's unpack), so in words of four x-consecutive cells that

@@ -2175,6 +2175,7 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadI(*g, "primarySteps", r.primarySteps, out, at);
     ReadI(*g, "farSteps", r.farSteps, out, at);
     ReadI(*g, "farRefillRate", r.farRefillRate, out, at);
+    ReadI(*g, "farPlaneFillRate", r.farPlaneFillRate, out, at);
     ReadF(*g, "farShadowReach", r.farShadowReach, out, at);
     ReadI(*g, "farBlockerHitLevel", r.farBlockerHitLevel, out, at);
     ReadF(*g, "gasBlendStart", r.gasBlendStart, out, at);
@@ -2323,6 +2324,12 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     // the top is the whole farList buffer, which is the dispatch's own limit.
     if (r.farRefillRate < 1) { r.farRefillRate = 1; }
     if (r.farRefillRate > (int)kFarListCap) { r.farRefillRate = (int)kFarListCap; }
+    // Same two bounds, same reasons: 0 would freeze the horizon wherever the
+    // player left it, and farList is the dispatch's own ceiling.
+    if (r.farPlaneFillRate < 1) { r.farPlaneFillRate = 1; }
+    if (r.farPlaneFillRate > (int)kFarListCap) {
+      r.farPlaneFillRate = (int)kFarListCap;
+    }
     // A zero/negative reach would clamp to the 8-step floor everywhere and
     // silently drop far shadows; keep it positive.
     if (r.farShadowReach < 1.0f) { r.farShadowReach = 1.0f; }

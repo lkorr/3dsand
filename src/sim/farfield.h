@@ -61,6 +61,14 @@ class FarField {
   // which is what the headless drain loops want; the game lowers it.
   void SetBulkCap(uint32_t n) { bulkCap_ = n ? n : 1u; }
 
+  // Entries an INCOMING PLANE may pop per tick (see planeCap_ / kPlayFillCap).
+  // A knob rather than a constant because what it trades against — the sieve's
+  // per-entry GPU cost — moved by 2.4x in one shader edit, and the next such
+  // edit should not need a rebuild to follow (render.farPlaneFillRate).
+  void SetPlaneCap(uint32_t n) {
+    planeCap_ = n ? (n > kFarListCap ? kFarListCap : n) : 1u;
+  }
+
   // ---- AT MOST ONE BULK SLICE PER FRAME ----------------------------------
   // Stream::BeginFrame's rule (stream.h R4), for the same reason and with the
   // same shape. PrepareTick is a per-TICK call and the frame loop runs up to
@@ -72,10 +80,9 @@ class FarField {
   // deferring the extra slices to the next frame costs nothing but wall
   // clock, which is the axis this whole cap trades on anyway.
   //
-  // ONLY the bulk path is gated. Incoming planes (kPlayFillCap) stay per
-  // tick: they are the horizon keeping up with a player who is moving, they
-  // are 64 entries, and holding them back is what puts a stale slab on the
-  // leading face.
+  // ONLY the bulk path is gated. Incoming planes (planeCap_) stay per tick:
+  // they are the horizon keeping up with a player who is moving, and holding
+  // them back is what puts a stale slab on the leading face.
   //
   // Callers without a frame loop never call this, so `frameGated_` stays
   // false and every PrepareTick may take a full slice — which is what the
@@ -90,6 +97,25 @@ class FarField {
   void FullRefill(IVec3 playerChunk);
 
   size_t PendingFills() const { return queue_.size(); }
+
+  // ---- WHERE THE QUEUE CAME FROM (2026-09-12) ----------------------------
+  // PendingFills alone is a bare count, and a bare count sends you A/B-ing
+  // (CLAUDE.md rule 6): the first thing tried against a 437k backlog was
+  // raising the plane cap, which moved it by 1.5% because the queue was not
+  // planes at all. These say which producer filled it. A RESET is a whole
+  // level (kFarNumChunks entries) and comes either from FullRefill or from an
+  // origin that fell a whole box behind; a PLANE is kFarNChunk^2 and comes
+  // from ordinary travel. They cost the same per entry and want completely
+  // different fixes.
+  uint64_t ResetsIssued() const { return resets_; }
+  uint64_t CoalescedResets() const { return coalesced_; }
+  uint64_t RefillsIssued() const { return refills_; }
+  uint64_t GapResetsIssued() const { return gapResets_; }
+  uint64_t PlanesIssued() const { return planes_; }
+  // The largest origin gap Update has had to close, in level chunks, and the
+  // level it happened on. kFarNChunk is where a step becomes a reset.
+  uint32_t WorstGap() const { return worstGap_; }
+  uint32_t WorstGapLevel() const { return worstGapLevel_; }
 
   // Radius (meters from the player) out to which cascade data is known to be
   // FILLED — the adaptive-fog input (plan phase 3B).
@@ -122,12 +148,25 @@ class FarField {
   // So the box the far readers march is the full box LESS the faces with
   // planes still queued (and empty while a reset is in flight), published in
   // FarParams.origins[k].w — the word every other reader ignores — as six
-  // 4-bit counts, one per face (-x,+x,-y,+y,-z,+z, low nibble first; the
-  // count saturates at 15), plus bit 24 = whole level pending. raymarch.wgsl
-  // `farBox` unpacks it; a ray in an excluded slab leaves the level at the
-  // shrunken face and the next coarser level, which is filled, picks up at the
-  // same t (the seam contract traceFar already keeps for TUNE_FAR_STEPS).
+  // 5-bit counts, one per face (-x,+x,-y,+y,-z,+z, low field first), plus
+  // bit 30 = whole level pending. raymarch.wgsl `farBox` unpacks it; a ray in
+  // an excluded slab leaves the level at the shrunken face and the next
+  // coarser level, which is filled, picks up at the same t (the seam contract
+  // traceFar already keeps for TUNE_FAR_STEPS).
   // Nothing on the render path reads a slot before the sieve has written it.
+  //
+  // ---- THE FIELD MUST HOLD THE WHOLE BOX (2026-09-12) ---------------------
+  // It was six FOUR-bit counts saturating at 15, and "always conservative"
+  // below was false because of it: a level is kFarNChunk = 32 chunks across,
+  // so a face with 20 planes queued had only 15 of its 20 stale chunk layers
+  // excluded and the renderer marched the other five AS TERRAIN. Those five
+  // hold the OUTGOING face's bytes — the torus has not been refilled yet — so
+  // what was drawn ahead of a moving player was the ground from behind them,
+  // which snapped to the real ground the moment the sieve caught up. Reached
+  // in about a second of flight at the old fill cap (see kPlayFillCap).
+  // Five bits holds all 32; past that the count is no longer expressible and
+  // the honest answer is bit 30, "this level has nothing you may trust",
+  // which costs a fall-through to the next level and never draws a wrong one.
   //
   // Counted per PLANE, not per entry: each EnqueuePlane / ResetLevel pushes a
   // record onto recs_ (FIFO, parallel to queue_) with its entry count, and a
@@ -142,6 +181,14 @@ class FarField {
 
  private:
   void ResetLevel(uint32_t k, IVec3 desired);        // origin jump + full refill
+  // Drop everything level k still has queued. Only ResetLevel calls it, and
+  // only when that level is about to be re-queued wholesale: the entries it
+  // removes would fill slots the reset is about to fill anyway, and leaving
+  // them in would make the reset COST more than the backlog it replaces
+  // instead of less. queue_ and recs_ stay parallel because a record owns a
+  // contiguous run of its own level's entries and both sides lose level k
+  // entirely (see PrepareTick's front-record bookkeeping).
+  void PruneLevel(uint32_t k);
   void EnqueuePlane(uint32_t k, int axis, int wcoord);  // one incoming plane
   void Enqueue(uint32_t k, uint32_t slot);           // queue + per-level counter
 
@@ -193,9 +240,36 @@ class FarField {
   // whole-frame p50 / p95 / p99 / max, >33 ms: uncapped 19.8 / 28 / 52 / 153,
   // 2.5%; cap 64: 20.6 / 43 / 54 / 73, 19%; cap 32: 29.1 / 48 / 64 / 81, 42%.
   // 32 put ~5 ms on nearly every frame and the median frame lost a vblank;
-  // 64 keeps the median and only cuts the tail. The next lever is the sieve's
-  // per-entry cost, not this number.
-  static constexpr uint32_t kPlayFillCap = 64;
+  // 64 keeps the median and only cuts the tail.
+  //
+  // ---- 64 WAS A COST, AND THE COST MOVED (2026-09-12) ---------------------
+  // "The next lever is the sieve's per-entry cost, not this number" is what
+  // this comment used to end on, and that lever got pulled: worldgen.wgsl's
+  // `far` gained the SKY CEILING early-out its sibling genChunk always had, so
+  // a level chunk above the terrain no longer runs 4,096 genCellCol calls to
+  // conclude "air". Measured `--frames 900 --autofly-surface`, one exe, two
+  // asset trees, exclusive lock, the same 265k entries over the same 306 ticks:
+  //   farField GPU  mean 15.90 -> 6.65 ms/frame, p99 65.5 -> 37.3, max 150 -> 47
+  // i.e. 44.5 us -> 18.6 us per entry. 64 entries is 1.2 ms of GPU now, not the
+  // ~12 ms this number was sized for, and the cap had stopped paying for
+  // itself: it was the reason the queue backlogged at all.
+  //
+  // WHY THE BACKLOG WAS NOT MERELY COSMETIC. Measured on the same harness
+  // before any of this: 437,248 entries — 427 planes, 1.7 whole refills — still
+  // queued after 22 s of flight, which at 64/tick is 3.8 MINUTES of drain. Two
+  // things break at that depth and neither is "the horizon is a bit behind":
+  // FaceWord's per-face counter saturated and stopped excluding the stale
+  // slabs (see FaceWord), and the levels it did exclude collapsed far enough
+  // that traceFar fell through to a COARSER one at short range — 3.2 m and
+  // 6.4 m cells at 40 m, which is what "the LOD is showing me house-sized
+  // blocks" actually was.
+  //
+  // 256 is 4.8 ms/tick at the measured per-entry cost, still under what 64 was
+  // sized to spend, and it covers sprinting diagonally (~130 entries/tick)
+  // with headroom instead of falling behind at a walk on two axes. It is a
+  // DEFAULT now, not a constant: render.farPlaneFillRate owns it, so the next
+  // time the sieve's cost moves this does not need a rebuild to follow.
+  static constexpr uint32_t kPlayFillCap = 256;
   // THE RESET CAP, and why it is no longer kFarListCap in the game
   // (2026-09-10). A full refill is kFarLevels x kFarNumChunks = 262,144 sieve
   // entries. kFarListCap (4,096) slices that into 64 ticks of 267 ms —
@@ -208,6 +282,10 @@ class FarField {
   // (selftest_render.cpp's DrainFullRefill, the far gates) have no frame to
   // protect and keep the default.
   uint32_t bulkCap_ = kFarListCap;
+  uint64_t resets_ = 0, gapResets_ = 0, planes_ = 0, refills_ = 0;
+  uint64_t coalesced_ = 0;
+  uint32_t worstGap_ = 0, worstGapLevel_ = 0;
+  uint32_t planeCap_ = kPlayFillCap;
   bool frameGated_ = false;   // BeginFrame has been called at least once
   bool bulkThisFrame_ = false;
   bool uboDirty_ = true;

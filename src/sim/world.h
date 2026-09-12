@@ -2612,6 +2612,33 @@ constexpr float kFarHalfExtentMeters(uint32_t k) {  // level-k half-extent, m
 // radius before any level has filled.
 constexpr float kWindowHalfExtentMeters = (float)(kWorldN >> 1) * kVoxelMeters;
 
+// ---- THE PENDING-FACE WORD: FarParams.origins[k].w -------------------------
+// Six counts of level-CHUNK layers still waiting on the sieve, one per box
+// face in the order (-x, +x, -y, +y, -z, +z), packed low field first, plus a
+// flag for "this whole level is a reset in flight". Written by
+// FarField::FaceWord (src/sim/farfield.cpp), read by raymarch.wgsl's farBox.
+// scripts/check_invariants.py pins the two together.
+//
+// THE FIELD IS SIZED BY kFarNChunk, not by convenience. It was four bits and
+// saturated at 15 while a level is 32 chunks across, so a deeper backlog left
+// stale toroidal slabs inside the box the renderer was told it could march
+// (farfield.h's FaceWord note has the failure). Five bits holds every layer a
+// box has; a count past that is not expressible and escalates to the flag.
+// kFarNChunk - 1 layers is the most an exclusion can usefully name: at
+// kFarNChunk the box is empty, which the flag already says.
+constexpr uint32_t kFarFaceBits = [] {
+  uint32_t b = 1;
+  while ((1u << b) < kFarNChunk) b++;
+  return b;
+}();
+constexpr uint32_t kFarFaceMax = (1u << kFarFaceBits) - 1u;
+static_assert(kFarFaceMax >= kFarNChunk - 1, "a face field must hold a whole box");
+// Kept clear of the sign bit: the word travels as int32_t in FarParams and the
+// WGSL side reads it with u32(), which is a value conversion, not a bitcast.
+constexpr uint32_t kFarFaceFlagBit = 30;
+static_assert(kFarFaceBits * 6 <= kFarFaceFlagBit, "face fields overlap the flag");
+constexpr uint32_t kFarFaceAllPending = 1u << kFarFaceFlagBit;
+
 // Fog reaches ~full opacity (exp(-4.5) ~= 1%) at whatever radius it is pinned
 // to; kFogOpticalDepths is that budget, shared by the static pin below and by
 // the adaptive term in WriteRenderParams.

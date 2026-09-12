@@ -6117,6 +6117,11 @@ int main(int argc, char** argv) {
         // Tuning::Render::farRefillRate — this is the knob that turned the
         // horizon's arrival from a 16 s 2 fps stall into a fog that opens).
         far.SetBulkCap((uint32_t)CurrentTuning().render.farRefillRate);
+        // And ORDINARY TRAVEL's slice, the one a moving player actually feels
+        // (Tuning::Render::farPlaneFillRate). Live from tuning for the same
+        // reason: what it trades against is the sieve's per-entry GPU cost,
+        // which a shader edit can move by more than 2x without a rebuild.
+        far.SetPlaneCap((uint32_t)CurrentTuning().render.farPlaneFillRate);
         // far-field cascades track the player the same way (render-only)
         if (!farBlind) far.Update(playerChunkNow);
         farCount = far.PrepareTick(ctx.queue, !farBlind);
@@ -10152,6 +10157,21 @@ int main(int argc, char** argv) {
                     (unsigned long long)g_farBiggest,
                     CurrentTuning().render.farRefillRate, far.PendingFills(),
                     kFarLevels * kFarNumChunks);
+    // WHAT PUT IT THERE (farfield.h's counters). A queue depth on its own does
+    // not say whether the fix is a bigger plane cap, a cheaper sieve entry, or
+    // an origin that keeps falling a whole box behind — and those want
+    // opposite changes.
+    std::printf("      produced by: %llu wholesale refills, %llu resets "
+                "(%llu an origin gap, %llu a coalesced backlog) "
+                "x %u entries + %llu planes x %u entries | worst origin gap "
+                "%u level chunks on level %u (reset at %u)\n",
+                (unsigned long long)far.RefillsIssued(),
+                (unsigned long long)far.ResetsIssued(),
+                (unsigned long long)far.GapResetsIssued(),
+                (unsigned long long)far.CoalescedResets(), kFarNumChunks,
+                (unsigned long long)far.PlanesIssued(),
+                kFarNChunk * kFarNChunk, far.WorstGap(),
+                far.WorstGapLevel(), kFarNChunk);
         std::printf("    snapshot stalls (blocking WaitIdle on the frame path):"
                     " %llu over %llu frames (%.1f%% of frames) | readback "
                     "requests the ring refused: %llu\n",

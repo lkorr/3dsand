@@ -1286,6 +1286,64 @@ def check_plant_tiles():
             f"RenderParams.tramples is array<vec4f, {arr.group(1)}>")
 
 
+def check_far_face_word():
+    """FarParams.origins[k].w: six per-face counts + a flag, packed in C++ and
+    unpacked in WGSL with nothing between them to keep the layout honest.
+
+    FarField::FaceWord (src/sim/farfield.cpp) writes it from world.h's
+    kFarFace* constants; raymarch.wgsl's farBox reads it back with literals,
+    because a prelude constant only two functions want would cost every shader
+    a recompile (CLAUDE.md's common.wgsl note). So the literals are pinned
+    here instead.
+
+    The failure this exists for is not a crash. The word says which chunk
+    layers of a cascade level are still waiting on the sieve and must NOT be
+    marched; a field too narrow silently under-excludes, and the renderer draws
+    the stale toroidal slab -- terrain from behind the player, in front of
+    them -- until the fill lands. That is exactly what a 4-bit field did
+    against a 32-chunk box before 2026-09-12.
+    """
+    wh = read("src/sim/world.h")
+    rm = read("assets/shaders/raymarch.wgsl")
+    if not wh or not rm:
+        return
+    n = re.search(r"constexpr\s+uint32_t\s+kFarN\s*=\s*(\d+)", wh)
+    ch = re.search(r"constexpr\s+uint32_t\s+kChunk\s*=\s*(\d+)", wh)
+    flag = re.search(r"constexpr\s+uint32_t\s+kFarFaceFlagBit\s*=\s*(\d+)", wh)
+    if not n or not ch or not flag:
+        return
+    checked.append("far pending-face word")
+
+    nchunk = int(n.group(1)) // int(ch.group(1))
+    bits = 1
+    while (1 << bits) < nchunk:
+        bits += 1
+    want = {"FAR_FACE_BITS": bits,
+            "FAR_FACE_MASK": (1 << bits) - 1,
+            "FAR_FACE_ALL": int(flag.group(1))}
+
+    got = {}
+    for name in want:
+        m = re.search(name + r"\s*:\s*u32\s*=\s*(?:1u\s*<<\s*)?(\d+)u?", rm)
+        if m:
+            got[name] = int(m.group(1))
+    for name, v in want.items():
+        if name not in got:
+            problems.append(
+                f"raymarch.wgsl does not declare {name} -- farBox unpacks the "
+                f"pending-face word and world.h owns its layout")
+        elif got[name] != v:
+            problems.append(
+                f"raymarch.wgsl {name} = {got[name]} but world.h derives {v} "
+                f"from kFarN/kChunk = {nchunk} chunks per level axis -- the "
+                f"valid box would exclude the wrong slab")
+
+    if bits * 6 > int(flag.group(1)):
+        problems.append(
+            f"world.h: six {bits}-bit face fields do not fit under "
+            f"kFarFaceFlagBit = {flag.group(1)}")
+
+
 def check_far_material_bits():
     """A far cascade cell is a 7-bit FAR PALETTE SLOT + 1 blocker flag (13.2.2).
 
@@ -1766,6 +1824,7 @@ ALL = {
     "curprim": check_current_prims,
     "counts": check_tick_counts,
     "farbits": check_far_material_bits,
+    "farface": check_far_face_word,
     "ringdepth": check_readback_ring,
     "burntint": check_burn_tint_sites,
     "plants": check_plant_tiles,
@@ -1787,6 +1846,8 @@ RELEVANT = {
     "assets/materials/materials.json": ["farbits", "plants"],
     "src/sim/plants.h": ["plants"],
     "src/gpu/resources.cpp": ["world"],
+    "src/sim/farfield.cpp": ["farface"],
+    "src/sim/farfield.h": ["farface"],
     "src/test/selftest.cpp": ["arch"],
     "src/sim/world.h": ["world", "params", "substeps", "windprim",
                         "curprim"],
@@ -1822,7 +1883,7 @@ if __name__ == "__main__":
                     run += checks
             if norm.endswith(".wgsl"):
                 run += ["tuning", "world", "params", "windprim",
-                        "curprim", "burntint", "plants"]
+                        "curprim", "burntint", "plants", "farface"]
         run = list(dict.fromkeys(run))
         if not run:
             sys.exit(0)  # edited file cannot break any pair
