@@ -3282,6 +3282,288 @@ Status GatePlants(Ctx& c, std::string& detail) {
 // motion is exercised by the game; what a gate can pin cheaply and repeatably
 // is the sampling geometry, and a moving camera would make the metric depend on
 // how fast the fixture streams rather than on whether the resolve is correct.
+// ---- denoise: the shading-LOD filter (assets/shaders/denoise.wgsl) --------
+// One mid-distance terrain view drawn twice, raw and filtered, read back
+// together with the depth the world pass wrote, and compared BY DISTANCE BAND
+// — because the whole claim of the pass is "this band and not that one":
+//
+//   A. NEAR (< 10 m) and SKY are BIT-IDENTICAL. The strength ramp is zero
+//      where a voxel projects to more than denoisePxStart pixels, and the
+//      shader returns the source texel untouched there (and refuses sky
+//      outright). A filter that softened the near field would fail this at
+//      the first voxel edge.
+//   B. MID (30..400 m) loses high-frequency luminance: the mean absolute
+//      residual against the 4-neighbour mean drops to at most
+//      denoise.midHfMaxRatio of the raw frame's. This is the speckle.
+//   C. MID keeps its mean: the kernel is normalised, so the band's average
+//      luminance moves by at most denoise.midMeanMaxDelta (0..255 units). A
+//      filter that darkened or bleached the horizon would pass B and fail
+//      this.
+//
+// The thresholds are baseline.json numbers; the observed ratio, the raw HF
+// level and the per-frame cost of the arm are recorded for --rebaseline.
+// Every comparison is between two arms of the SAME run at the SAME
+// resolution, so nothing here pins a scene.
+Status GateDenoise(Ctx& c, std::string& detail) {
+  GpuContext& ctx = c.ctx;
+  World& world = c.world;
+  Simulation& sim = c.sim;
+  const uint32_t W = c.width, H = c.height;
+  const float aspect = (float)W / (float)H;
+
+  SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+  ctx.WaitIdle();
+
+  // The complaint's camera: --shot's screenshot_ground site and heading (an
+  // open view down the valley), a few metres up and pitched a little down, so
+  // the frame runs from the ground at the feet through the 20-200 m band to
+  // the sky. NOT the other render gates' (300,300): that spot faces a
+  // hillside 7 m away and the first run of this gate found no mid band at all.
+  const int gx = 108, gz = 108;
+  const int ground = World::TerrainHeight(gx, gz, kDefaultSeed);
+  // The band under test is mostly OUTSIDE the residency window, so the far
+  // cascade has to be filled or every mid pixel is fogged sky at depth 0 —
+  // which is exactly what the first run of this gate measured.
+  DrainFullRefill(ctx, world, sim, {gx >> 4, ground >> 4, gz >> 4});
+  const Vec3 eye{(float)gx, (float)(ground + 30), (float)gz};
+  Camera cam;
+  cam.yaw = 0.785f;
+  cam.pitch = -0.10f;
+  const float thf = std::tan(CurrentTuning().camera.fovY * 0.5f);
+  // Mid-morning, like --shot: the speckle is a SUNLIT artefact (lit treads
+  // against contact-shadowed risers), and the first cut of this gate measured
+  // it at midnight, where the whole band is one flat moonlit tone.
+  const uint32_t sunTick =
+      (uint32_t)(TicksPerDayFromTuning(CurrentTuning()) * 0.38);
+
+  // The knob under test must not also be the knob the gate obeys: force it on
+  // for the filtered arm whatever tuning.json says, and restore after.
+  const Tuning base = CurrentTuning();
+  struct Restore {
+    const Tuning& t;
+    ~Restore() { SetCurrentTuning(t); }
+  } restore{base};
+
+  // ---- BOTH IMAGES COME FROM ONE FRAME, and that is the whole design ------
+  // The first version rendered a raw arm and a filtered arm and compared
+  // them, and the near band differed by 3/255: not the filter, the LIGHTING —
+  // the irradiance grid is an EMA over rendered frames, so the second arm's
+  // frame was a slightly different picture before the filter ever ran. So
+  // the filtered arm copies the world texture out TWICE, before and after
+  // EncodeDenoise, and every comparison is between those two copies of the
+  // same frame. The raw arm below exists only to price the pass.
+  auto renderArm = [&](bool filtered, uint32_t frames,
+                       std::vector<uint8_t>* before, std::vector<uint8_t>* after,
+                       std::vector<float>* depth, double& msPerFrame) -> bool {
+    Tuning t = base;
+    t.render.denoise = filtered ? 1 : 0;
+    if (t.render.denoiseIters < 1) t.render.denoiseIters = 3;
+    SetCurrentTuning(t);
+    using U = rhi::BufferUsage;
+    rhi::Buffer shotB, shotA, dshot;
+    if (before)
+      shotB = CreateBuffer(ctx.device, (uint64_t)W * H * 4,
+                           U::MapRead | U::CopyDst, "denoiseGateBefore");
+    if (after)
+      shotA = CreateBuffer(ctx.device, (uint64_t)W * H * 4,
+                           U::MapRead | U::CopyDst, "denoiseGateAfter");
+    if (depth)
+      dshot = CreateBuffer(ctx.device, (uint64_t)W * H * 4,
+                           U::MapRead | U::CopyDst, "denoiseGateDepth");
+    auto copyOut = [&](const rhi::CommandEncoder& enc, const rhi::Texture& tex,
+                       const rhi::Buffer& into) {
+      rhi::TexelCopyTexture srcT{};
+      srcT.texture = tex;
+      rhi::TexelCopyBuffer dstB{};
+      dstB.buffer = into;
+      dstB.bytesPerRow = W * 4;
+      dstB.rowsPerImage = H;
+      enc.CopyTextureToBuffer(srcT, dstB, rhi::Extent3D{W, H, 1});
+    };
+    ctx.WaitIdle();
+    const double t0 = NowSeconds();
+    for (uint32_t f = 0; f < frames; f++) {
+      WriteRenderParams(ctx.queue, world, eye, cam, aspect, true, 0.0f,
+                        kFarFogDensity, (float)H, sunTick);
+      if (filtered) {
+        sim.EnsureDenoise(W, H);
+        sim.WriteDenoiseParams(ctx.queue, W, H, thf, /*bgraSource=*/false);
+      }
+      rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
+      sim.EncodeShadowResolve(enc);
+      rhi::RenderPass rp =
+          sim.BeginRenderPass(enc, c.view, rhi::TextureFormat::RGBA8Unorm, W, H);
+      sim.DrawWorld(rp);
+      rp.End();
+      const bool last = f + 1 == frames;
+      // The world depth and the unfiltered colour, both BEFORE the filter (it
+      // does not write depth; the recorder tracks every copy either way).
+      if (last && depth) copyOut(enc, sim.DepthTexture(), dshot);
+      if (last && before) copyOut(enc, c.offscreen, shotB);
+      if (filtered)
+        sim.EncodeDenoise(enc, c.offscreen, c.view, rhi::TextureFormat::RGBA8Unorm,
+                          W, H);
+      if (last && after) copyOut(enc, c.offscreen, shotA);
+      ctx.queue.Submit(enc.Finish());
+    }
+    ctx.WaitIdle();
+    msPerFrame = (NowSeconds() - t0) * 1000.0 / (double)frames;
+    auto read = [&](const rhi::Buffer& b, void* into, size_t bytes) {
+      return rhi::ReadBufferBlocking(ctx.device, b, 0, into, bytes);
+    };
+    if (before) {
+      before->assign((size_t)W * H * 4, 0);
+      if (!read(shotB, before->data(), before->size())) return false;
+    }
+    if (after) {
+      after->assign((size_t)W * H * 4, 0);
+      if (!read(shotA, after->data(), after->size())) return false;
+    }
+    if (depth) {
+      depth->assign((size_t)W * H, 0.0f);
+      if (!read(dshot, depth->data(), depth->size() * sizeof(float)))
+        return false;
+    }
+    return true;
+  };
+
+  std::vector<uint8_t> raw, fil;
+  std::vector<float> dep;
+  double msWarm = 0.0, msRaw = 0.0, msFil = 0.0;
+  // 20 frames: the shadow cache's 16-frame penumbra window has to fill before
+  // the frame is the frame play shows (--gate shadow-cache learned the same).
+  if (!renderArm(true, 20, &raw, &fil, &dep, msWarm)) {
+    detail = "filtered arm readback failed";
+    return Status::Fail;
+  }
+  // Decided after the first draw, which is what builds the pipeline.
+  if (!sim.DenoiseAvailable()) {
+    detail = "denoise pipeline unavailable — nothing to test";
+    return Status::Skip;
+  }
+  // The two images, for eyes: the numbers below say how much speckle went,
+  // not whether the result looks like terrain. Written every run, like the
+  // screenshots gate's frames, so a tuning.json edit plus one --gate denoise
+  // is the whole look-iteration loop (no --shot, no worldgen wait).
+  WriteBmpFile("build/denoise_before.bmp", raw, W, H);
+  WriteBmpFile("build/denoise_after.bmp", fil, W, H);
+  // The price: raw and filtered frames of the same view, both after the
+  // warm-up above, ONE WaitIdle each. Advisory, like the taa gate's numbers —
+  // the difference between the two is honest where the absolutes are not.
+  if (!renderArm(false, 8, nullptr, nullptr, nullptr, msRaw) ||
+      !renderArm(true, 8, nullptr, nullptr, nullptr, msFil)) {
+    detail = "timing arm failed";
+    return Status::Fail;
+  }
+
+  // View depth in metres from the reversed-Z the world pass wrote: depth =
+  // KNEAR / viewZ, viewZ in fine voxels. KNEAR is common.wgsl's constant (0.4
+  // voxels); it only classifies bands here, so a drift would move a band edge
+  // by a constant factor, not break the comparison.
+  constexpr float kKnearVox = 0.4f;
+  auto zMetres = [&](size_t p) -> float {
+    const float d = dep[p];
+    if (d <= 1e-7f) return -1.0f;   // sky
+    return kKnearVox / d * kVoxelMeters;
+  };
+  auto luma = [](const std::vector<uint8_t>& img, size_t p) -> double {
+    return 0.299 * img[p * 4] + 0.587 * img[p * 4 + 1] + 0.114 * img[p * 4 + 2];
+  };
+  constexpr float kNearM = 10.0f, kMidLoM = 30.0f, kMidHiM = 400.0f;
+
+  // A. near + sky: bit-identical.
+  int nearMaxDiff = 0;
+  size_t nearCount = 0, skyCount = 0;
+  // B/C. mid band: HF residual and mean, both arms.
+  double hfRaw = 0.0, hfFil = 0.0, meanRaw = 0.0, meanFil = 0.0;
+  size_t midCount = 0, hfCount = 0;
+  // Silhouettes (depth jumps > 1.5x against the right neighbour): reported.
+  double edgeDiff = 0.0;
+  size_t edgeCount = 0;
+  for (uint32_t y = 1; y + 1 < H; y++) {
+    for (uint32_t x = 1; x + 1 < W; x++) {
+      const size_t p = (size_t)y * W + x;
+      const float z = zMetres(p);
+      if (z < 0.0f || z < kNearM) {
+        if (z < 0.0f) skyCount++; else nearCount++;
+        for (int k = 0; k < 3; k++)
+          nearMaxDiff = std::max(nearMaxDiff,
+                                 std::abs((int)fil[p * 4 + k] - (int)raw[p * 4 + k]));
+        continue;
+      }
+      const float zr = zMetres(p + 1);
+      if (zr > 0.0f && (zr > 1.5f * z || z > 1.5f * zr)) {
+        edgeDiff += std::fabs(luma(fil, p) - luma(raw, p));
+        edgeCount++;
+      }
+      if (z < kMidLoM || z > kMidHiM) continue;
+      midCount++;
+      meanRaw += luma(raw, p);
+      meanFil += luma(fil, p);
+      // 4-neighbour residual, only where every neighbour is also mid-band
+      // terrain, so a silhouette against the sky is not counted as detail.
+      const size_t n[4] = {p - 1, p + 1, p - W, p + W};
+      bool ok = true;
+      for (size_t q : n) {
+        const float zq = zMetres(q);
+        if (zq < kMidLoM || zq > kMidHiM) { ok = false; break; }
+      }
+      if (!ok) continue;
+      double mr = 0.0, mf = 0.0;
+      for (size_t q : n) { mr += luma(raw, q); mf += luma(fil, q); }
+      hfRaw += std::fabs(luma(raw, p) - 0.25 * mr);
+      hfFil += std::fabs(luma(fil, p) - 0.25 * mf);
+      hfCount++;
+    }
+  }
+  if (midCount < 1000 || hfCount < 1000) {
+    // Where did the depth land? Sampled down the centre column so a wrong
+    // unit, a wrong copy or an unfilled cascade each print differently.
+    std::string col;
+    for (uint32_t y = H / 10; y < H; y += H / 10) {
+      const size_t p = (size_t)y * W + W / 2;
+      col += Format(" y%u:d=%.3g(z=%.1fm)", y, dep[p], zMetres(p));
+    }
+    detail = Format("mid band too small to judge (%zu px, %zu with neighbours; "
+                    "near %zu, sky %zu of %u) centre column:%s",
+                    midCount, hfCount, nearCount, skyCount, W * H, col.c_str());
+    return Status::Fail;
+  }
+  hfRaw /= (double)hfCount;
+  hfFil /= (double)hfCount;
+  meanRaw /= (double)midCount;
+  meanFil /= (double)midCount;
+  const double hfRatio = hfRaw > 1e-6 ? hfFil / hfRaw : 1.0;
+  const double meanDelta = std::fabs(meanFil - meanRaw);
+  const double edgeMean = edgeCount ? edgeDiff / (double)edgeCount : 0.0;
+
+  const double maxRatio = BaselineNumber("denoise.midHfMaxRatio", 0.6);
+  const double maxMeanDelta = BaselineNumber("denoise.midMeanMaxDelta", 3.0);
+  const int maxNear = (int)BaselineNumber("denoise.nearMaxDiff", 0.0);
+  const bool okA = nearMaxDiff <= maxNear;
+  const bool okB = hfRatio <= maxRatio;
+  const bool okC = meanDelta <= maxMeanDelta;
+  const bool ok = okA && okB && okC;
+
+  RecordObserved("denoise.midHfRatioObserved", hfRatio);
+  RecordObserved("denoise.midHfRawObserved", hfRaw);
+  RecordObserved("denoise.midMeanDeltaObserved", meanDelta);
+  RecordObserved("denoise.costMsObserved", msFil - msRaw);
+
+  detail = Format(
+      "A near(<%.0f m, %zu px)+sky(%zu px) max diff %d <= %d%s | "
+      "B mid(%.0f-%.0f m, %zu px) HF %.3f -> %.3f, ratio %.3f <= %.3f%s | "
+      "C mid mean %.2f -> %.2f, delta %.2f <= %.2f%s | "
+      "silhouettes %zu px mean |dL| %.2f | %d iters, %.2f ms/frame raw, "
+      "%.2f filtered (+%.2f)",
+      kNearM, nearCount, skyCount, nearMaxDiff, maxNear, okA ? "" : "  <-- FAIL",
+      kMidLoM, kMidHiM, midCount, hfRaw, hfFil, hfRatio, maxRatio,
+      okB ? "" : "  <-- FAIL", meanRaw, meanFil, meanDelta, maxMeanDelta,
+      okC ? "" : "  <-- FAIL", edgeCount, edgeMean,
+      std::max(1, base.render.denoiseIters), msRaw, msFil, msFil - msRaw);
+  return ok ? Status::Pass : Status::Fail;
+}
+
 Status GateTaa(Ctx& c, std::string& detail) {
   GpuContext& ctx = c.ctx;
   World& world = c.world;
@@ -3749,6 +4031,10 @@ const std::vector<Gate>& RenderGates() {
       // relative to another arm of the same run, so it pins nothing that would
       // need rebaselining when the scene or the harness resolution moves.
       {"taa", "render", {}, false, GateTaa, /*needsRender=*/true},
+      // The shading-LOD filter: draws one terrain view raw and filtered and
+      // compares them by distance band (near + sky untouched, mid-band
+      // speckle down, mid-band mean kept). Own worldgen, no state left.
+      {"denoise", "render", {}, false, GateDenoise, /*needsRender=*/true},
   };
   return g;
 }

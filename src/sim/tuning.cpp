@@ -2187,6 +2187,13 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadF(*g, "taaJitter", r.taaJitter, out, at);
     ReadI(*g, "taaSharpLod", r.taaSharpLod, out, at);
     ReadF(*g, "taaSharpness", r.taaSharpness, out, at);
+    ReadI(*g, "denoise", r.denoise, out, at);
+    ReadI(*g, "denoiseIters", r.denoiseIters, out, at);
+    ReadF(*g, "denoisePxFull", r.denoisePxFull, out, at);
+    ReadF(*g, "denoisePxStart", r.denoisePxStart, out, at);
+    ReadF(*g, "denoiseDepthTol", r.denoiseDepthTol, out, at);
+    ReadF(*g, "denoiseChromaTol", r.denoiseChromaTol, out, at);
+    ReadF(*g, "denoiseStrength", r.denoiseStrength, out, at);
     ReadI(*g, "presentMode", r.presentMode, out, at);
     ReadF(*g, "fpsCap", r.fpsCap, out, at);
     ReadF(*g, "shadowMaxDist", r.shadowMaxDist, out, at);
@@ -2371,6 +2378,19 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     // whole 3x3 and no reconstruction at all.
     if (r.taaSharpness < 0.05f) { r.taaSharpness = 0.05f; }
     if (r.taaSharpness > 64.0f) { r.taaSharpness = 64.0f; }
+    // The shading-LOD filter: iterations are bounded by the bind groups
+    // Simulation allocates (kDenoiseMaxIters); the ramp edges must be ordered
+    // (smoothstep) and positive; the tolerances are widths, so > 0.
+    if (r.denoiseIters < 0) { r.denoiseIters = 0; }
+    if (r.denoiseIters > 4) { r.denoiseIters = 4; }
+    if (r.denoisePxFull < 0.1f) { r.denoisePxFull = 0.1f; }
+    if (r.denoisePxStart < r.denoisePxFull + 0.01f) {
+      r.denoisePxStart = r.denoisePxFull + 0.01f;
+    }
+    if (r.denoiseDepthTol < 0.001f) { r.denoiseDepthTol = 0.001f; }
+    if (r.denoiseChromaTol < 0.01f) { r.denoiseChromaTol = 0.01f; }
+    if (r.denoiseStrength < 0.0f) { r.denoiseStrength = 0.0f; }
+    if (r.denoiseStrength > 1.0f) { r.denoiseStrength = 1.0f; }
     if (r.presentMode < 0 || r.presentMode > 2) { r.presentMode = 1; }
     if (r.fpsCap < 0.0f) { r.fpsCap = 0.0f; }
     // 0 is meaningful here (all shadows go through the cascade), so only

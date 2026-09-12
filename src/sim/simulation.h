@@ -382,7 +382,45 @@ class Simulation {
   // or toggle change). Cheap: one flag, no allocation.
   void ResetTaa() { taaReset_ = true; }
 
+  // ---- the shading-LOD filter (assets/shaders/denoise.wgsl) ----------------
+  //
+  // A depth-guided a-trous pass over the finished world frame, IN PLACE, at
+  // render resolution, before TAA or the upscale blit. It averages the
+  // lighting of terrain whose voxels project smaller than `render.denoisePx*`
+  // pixels — the mid-distance staircase speckle — and leaves near geometry,
+  // the sky and depth edges alone. See the shader header for why a
+  // path-tracing denoiser is the wrong tool for that noise.
+  //
+  // ALL RENDER-ONLY DERIVED DATA, like TAA: no history, nothing hashed or
+  // saved, and the world is identical with the knob at 0 or 1.
+  //
+  // Same availability rule as TAA: the pipeline must have compiled. (No
+  // fragment stores are needed — the pass reads two storage buffers and
+  // writes its attachment.)
+  bool DenoiseAvailable() const { return denoiseAvailable_; }
+  static constexpr uint32_t kDenoiseMaxIters = 4;
+  // Size the capture buffers and the per-iteration bind groups. Idempotent.
+  void EnsureDenoise(uint32_t width, uint32_t height);
+  // Upload every iteration's params. `tanHalfFov` is the projection the frame
+  // was rendered with — the projected-size ramp is derived from it — and
+  // `iters` is clamped to kDenoiseMaxIters. Call BEFORE any render pass opens
+  // in the command buffer that will run the filter (a buffer write inside a
+  // rendering scope is illegal in Vulkan).
+  void WriteDenoiseParams(const rhi::Queue& queue, uint32_t width,
+                          uint32_t height, float tanHalfFov, bool bgraSource);
+  // Record the filter over `tex`: capture colour + depth, then one fullscreen
+  // pass per iteration, the result landing back in `tex`. MUST be recorded
+  // after the world pass has ENDED and before anything reads `tex`. Records
+  // nothing when unavailable or when the last WriteDenoiseParams asked for 0
+  // iterations.
+  void EncodeDenoise(const rhi::CommandEncoder& enc, const rhi::Texture& tex,
+                     const rhi::TextureView& view, rhi::TextureFormat format,
+                     uint32_t width, uint32_t height);
+
   static constexpr rhi::TextureFormat kDepthFormat = rhi::TextureFormat::Depth32Float;
+  // The world pass's depth attachment (reversed-Z, CopySrc-capable): the
+  // `denoise` gate reads it back to classify pixels by distance.
+  const rhi::Texture& DepthTexture() const { return depthTex_; }
 
   // Which dirty buffer the tick just encoded writes as "active next tick".
   const rhi::Buffer& DirtyNext() const { return world_->dirty[1 - page_]; }
@@ -724,6 +762,24 @@ class Simulation {
   bool taaAvailable_ = false;
   bool taaHavePrev_ = false;
   TaaCamera taaPrevCam_{};
+
+  // ---- shading-LOD filter (denoise.wgsl) -----------------------------------
+  // dnColor_ is refilled by a copy between iterations (the pass reads it and
+  // renders into the frame texture, which is then copied back); dnDepth_ is
+  // captured once per frame. One UBO and one bind group per iteration, because
+  // the a-trous step differs per pass and a uniform cannot change inside one
+  // command buffer without a second buffer.
+  rhi::Buffer dnColor_, dnDepth_, dnUBO_[kDenoiseMaxIters];
+  rhi::BindGroupLayout dnBGL_;
+  rhi::PipelineLayout dnPL_;
+  rhi::BindGroup dnBG_[kDenoiseMaxIters];
+  rhi::RenderPipeline dnPipe_;
+  rhi::ShaderModule dnModule_;
+  rhi::Texture dnDepthTex_;        // the pass's (unused) depth attachment
+  rhi::TextureView dnDepthView_;
+  uint32_t dnW_ = 0, dnH_ = 0;
+  uint32_t dnIters_ = 0;           // what the last WriteDenoiseParams asked for
+  bool denoiseAvailable_ = false;
 
   // Two bind groups: page 0 reads dirty[0]/writes dirty[1], page 1 reversed.
   // Particle groups follow the same paging (b0 = read page, b1 = write page).

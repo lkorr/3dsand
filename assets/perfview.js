@@ -493,6 +493,7 @@ const PV_NODE_FALLBACK = {
   drawMicro:     'Micro bodies',
   drawSprites:   'Sprites',
   drawDebug:     'Debug draws',
+  denoise:       'Shading-LOD filter',
   uiOverlay:     'Overlay + swapchain wait',
   readbackStall: 'Snapshot Stall',
   terrainMesh:   'Terrain Collision',

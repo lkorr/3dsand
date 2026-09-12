@@ -737,6 +737,26 @@ bool Simulation::Init(const rhi::Device& device, World& world,
     rhi::BindGroupLayout taaGroups[] = {taaBGL_};
     taaPL_ = device.CreatePipelineLayout(taaGroups, 1);
   }
+  // The shading-LOD filter (denoise.wgsl): same arrangement as TAA — the
+  // LAYOUT here, the bind groups in EnsureDenoise where the buffers exist.
+  {
+    auto e = [](uint32_t binding, rhi::BufferBindingType type) {
+      rhi::BindGroupLayoutEntry x{};
+      x.binding = binding;
+      x.visibility = rhi::ShaderStage::Fragment;
+      x.type = type;
+      return x;
+    };
+    using T = rhi::BufferBindingType;
+    rhi::BindGroupLayoutEntry entries[] = {
+        e(0, T::Uniform),            // DenoiseParams (one per iteration)
+        e(1, T::ReadOnlyStorage),    // srcColor  (render res)
+        e(2, T::ReadOnlyStorage),    // srcDepth  (render res)
+    };
+    dnBGL_ = device.CreateBindGroupLayout(entries, std::size(entries));
+    rhi::BindGroupLayout dnGroups[] = {dnBGL_};
+    dnPL_ = device.CreatePipelineLayout(dnGroups, 1);
+  }
   {
     rhi::BindGroupEntry entries[] = {
         b(0, world_->bodyXforms),
@@ -1324,6 +1344,7 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   // pipeline it feeds must stay a fast driver compile, and growing raymarch's
   // entry to hold it would put it behind the one shader on the critical path.
   rhi::ShaderModule mTaa;
+  rhi::ShaderModule mDenoise;
   {
     PipelineBuildPool loads;
     auto mod = [&](rhi::ShaderModule* into, const char* name) {
@@ -1353,6 +1374,7 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
     mod(&mDebugWind, "debug_wind.wgsl");
     mod(&mDebugCur, "debug_current.wgsl");
     mod(&mTaa, "taa.wgsl");
+    mod(&mDenoise, "denoise.wgsl");
     loads.Run(buildThreads);
   }
   if (!mWorldgen || !mMutate || !mCompact || !mStep || !mOcc || !mPick ||
@@ -1553,6 +1575,7 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   // until that pool has joined.
   BuildRaymarchVariant(device, mRay);
   taaModule_ = mTaa;
+  dnModule_ = mDenoise;
   debrisModule_ = mDebris;
   microBodyModule_ = mMicroBody;
   debugLineModule_ = mDebugLines;
@@ -2520,6 +2543,17 @@ struct TaaParamsGpu {
 static_assert(sizeof(TaaParamsGpu) == 160,
               "TaaParamsGpu must match TaaParams in taa.wgsl");
 static_assert(sizeof(TaaParamsGpu) % 16 == 0, "uniform must be 16-byte sized");
+
+// Mirrored by hand against `struct DenoiseParams` in denoise.wgsl, same rules.
+struct DenoiseParamsGpu {
+  uint32_t width, height, pitch, flags;
+  int32_t step;
+  uint32_t iter, iters, pad0;
+  float fpx, pxFull, pxStart, depthTol;
+  float chromaTol, strength, pad1, pad2;
+};
+static_assert(sizeof(DenoiseParamsGpu) == 64,
+              "DenoiseParamsGpu must match DenoiseParams in denoise.wgsl");
 }  // namespace
 
 // The R2 sequence (Roberts 2018): the 2D generalisation of the golden ratio,
@@ -2688,6 +2722,134 @@ void Simulation::DrawTaa(const rhi::RenderPass& pass) {
   pass.SetPipeline(taaResolve_);
   pass.SetBindGroup(0, taaBG_[taaPage_]);
   pass.Draw(3);
+}
+
+// ===========================================================================
+// The shading-LOD filter (assets/shaders/denoise.wgsl)
+// ===========================================================================
+//
+// The chain, per frame, recorded after the world pass has ended and before
+// anything consumes the world texture:
+//
+//   copy   world depth   -> dnDepth_        (transfer write, once)
+//   copy   world colour  -> dnColor_        (transfer write)
+//   pass 0 reads dnColor_/dnDepth_, renders into the world texture (Clear)
+//   copy   world colour  -> dnColor_        (WAR against pass 0's read)
+//   pass 1 ... and so on, up to dnIters_.
+//
+// EVERY barrier in it is derived by the recorder from state it already tracks:
+// CopyImageToBuffer routes its destination through TouchExtra (so the second
+// copy WARs against the previous pass's fragment read, which
+// FlushForRenderDomain recorded), and TransitionImage carries the texture
+// attachment-write -> transfer-read -> attachment-write. There is no
+// hand-written barrier here and there must not be. The IN-PLACE render is the
+// case the TAA gate's 1:1 arm already relies on: the pass reads only the
+// buffer the copy landed, never the image it draws into.
+void Simulation::EnsureDenoise(uint32_t width, uint32_t height) {
+  if (width == 0 || height == 0 || !dnBGL_) return;
+  if (dnW_ == width && dnH_ == height && dnBG_[0]) return;
+  using U = rhi::BufferUsage;
+  dnW_ = width;
+  dnH_ = height;
+  // 4 bytes per texel each: one 8:8:8:8 unorm word of colour, one f32 of
+  // depth. No row padding (Vulkan's bufferRowLength is in texels).
+  const uint64_t bytes = (uint64_t)width * height * 4;
+  dnColor_ = CreateBuffer(device_, bytes, U::Storage | U::CopyDst, "denoiseColor");
+  dnDepth_ = CreateBuffer(device_, bytes, U::Storage | U::CopyDst, "denoiseDepth");
+  for (uint32_t i = 0; i < kDenoiseMaxIters; i++) {
+    if (!dnUBO_[i])
+      dnUBO_[i] = CreateBuffer(device_, sizeof(DenoiseParamsGpu),
+                               U::Uniform | U::CopyDst, "denoiseUBO");
+  }
+  dnDepthTex_ = device_.CreateTexture({width, height, 1}, kDepthFormat,
+                                      rhi::TextureUsage::RenderAttachment,
+                                      "depthDenoise");
+  dnDepthView_ = dnDepthTex_.CreateView();
+  auto b = [](uint32_t binding, const rhi::Buffer& buf) {
+    rhi::BindGroupEntry e{};
+    e.binding = binding;
+    e.buffer = buf;
+    return e;
+  };
+  for (uint32_t i = 0; i < kDenoiseMaxIters; i++) {
+    rhi::BindGroupEntry entries[] = {b(0, dnUBO_[i]), b(1, dnColor_),
+                                     b(2, dnDepth_)};
+    dnBG_[i] = device_.CreateBindGroup(dnBGL_, entries, std::size(entries),
+                                       "denoiseBG");
+  }
+}
+
+void Simulation::WriteDenoiseParams(const rhi::Queue& queue, uint32_t width,
+                                    uint32_t height, float tanHalfFov,
+                                    bool bgraSource) {
+  const Tuning::Render& r = CurrentTuning().render;
+  dnIters_ = 0;
+  if (r.denoise == 0 || !dnUBO_[0] || width == 0 || height == 0) return;
+  dnIters_ = (uint32_t)std::clamp(r.denoiseIters, 0, (int)kDenoiseMaxIters);
+  for (uint32_t i = 0; i < dnIters_; i++) {
+    DenoiseParamsGpu p{};
+    p.width = width;
+    p.height = height;
+    p.pitch = width;
+    p.flags = bgraSource ? 1u : 0u;
+    p.step = 1 << i;   // a-trous: 1, 2, 4, 8
+    p.iter = i;
+    p.iters = dnIters_;
+    // Pixels per unit of depth at unit distance: a fine voxel at viewZ z
+    // (voxels) covers fpx / z pixels.
+    p.fpx = (float)height * 0.5f / std::max(tanHalfFov, 1e-4f);
+    p.pxFull = r.denoisePxFull;
+    // smoothstep's edges must be ordered; LoadTuning clamps but a hot reload
+    // can hand over anything.
+    p.pxStart = std::max(r.denoisePxStart, r.denoisePxFull + 0.01f);
+    p.depthTol = r.denoiseDepthTol;
+    p.chromaTol = r.denoiseChromaTol;
+    p.strength = r.denoiseStrength;
+    queue.WriteBuffer(dnUBO_[i], 0, &p, sizeof p);
+  }
+}
+
+void Simulation::EncodeDenoise(const rhi::CommandEncoder& enc,
+                               const rhi::Texture& tex,
+                               const rhi::TextureView& view,
+                               rhi::TextureFormat format, uint32_t width,
+                               uint32_t height) {
+  (void)format;
+  if (!denoiseAvailable_ || !dnPipe_ || dnIters_ == 0) return;
+  if (!tex || !view || !depthTex_ || !dnBG_[0]) return;
+  // The world depth is the one the world pass just wrote; a size mismatch
+  // means the caller sized the filter for a different frame.
+  if (dnW_ != width || dnH_ != height || depthW_ != width || depthH_ != height)
+    return;
+  rhi::TexelCopyTexture src{};
+  rhi::TexelCopyBuffer dst{};
+  rhi::Extent3D ext{width, height, 1};
+  dst.bytesPerRow = width * 4;
+  dst.rowsPerImage = height;
+  src.texture = depthTex_;
+  dst.buffer = dnDepth_;
+  enc.CopyTextureToBuffer(src, dst, ext);
+  for (uint32_t i = 0; i < dnIters_; i++) {
+    src.texture = tex;
+    dst.buffer = dnColor_;
+    enc.CopyTextureToBuffer(src, dst, ext);
+    rhi::RenderPassDesc d{};
+    d.label = "denoise";
+    d.color.view = view;
+    // CLEAR, not Load: the pass writes every pixel from the buffer copy.
+    d.color.loadOp = rhi::LoadOp::Clear;
+    d.color.storeOp = rhi::StoreOp::Store;
+    d.hasDepth = true;
+    d.depth.view = dnDepthView_;
+    d.depth.loadOp = rhi::LoadOp::Clear;
+    d.depth.storeOp = rhi::StoreOp::Discard;
+    d.depth.clearValue = 0.0f;
+    rhi::RenderPass rp = enc.BeginRenderPass(d);
+    rp.SetPipeline(dnPipe_);
+    rp.SetBindGroup(0, dnBG_[i]);
+    rp.Draw(3);
+    rp.End();
+  }
 }
 
 // STILL SERIAL, deliberately (docs/PLAN_shader_compile.md package A audited
@@ -2902,6 +3064,29 @@ void Simulation::EnsureRenderPipelines(rhi::TextureFormat format) {
     d.depth = dsIgnore;
     pool.Add([this, d] { taaResolve_ = device_.CreateRenderPipeline(d); });
   }
+  // The shading-LOD filter: a fullscreen pass at RENDER resolution, in place
+  // over the world frame. Its depth attachment is its own (EnsureDenoise) —
+  // the pass runs at render size, which is neither the world depth (still
+  // holding the depth the filter reads) nor the overlay's native size.
+  if (dnModule_) {
+    rhi::DepthState dsIgnore{};
+    dsIgnore.format = kDepthFormat;
+    dsIgnore.depthWriteEnabled = false;
+    dsIgnore.depthCompare = rhi::CompareFunction::Always;
+
+    rhi::RenderPipelineDesc d{};
+    d.label = "denoise";
+    d.layout = dnPL_;
+    d.vertexModule = dnModule_;
+    d.vertexEntry = "vs";
+    d.fragmentModule = dnModule_;
+    d.fragmentEntry = "fs";
+    d.colorFormat = format;
+    d.topology = rhi::PrimitiveTopology::TriangleList;
+    d.cullMode = rhi::CullMode::None;
+    d.depth = dsIgnore;
+    pool.Add([this, d] { dnPipe_ = device_.CreateRenderPipeline(d); });
+  }
   pool.Run(buildThreads);
 
   // ---- deferred: the SPECIALIZED raymarch (W2-A) --------------------------
@@ -2953,6 +3138,9 @@ void Simulation::EnsureRenderPipelines(rhi::TextureFormat format) {
   // fragment-stage write), and the pipeline must actually have compiled. A
   // machine that fails either renders the plain NEAREST blit and says nothing.
   taaAvailable_ = FragmentStoresAvailable() && (bool)taaResolve_;
+  // No fragment-store requirement: the filter only reads storage and writes
+  // its attachment. A shader that failed to compile leaves it off.
+  denoiseAvailable_ = (bool)dnPipe_;
   std::fprintf(stderr, "[startup] render pipelines built in %.2f s\n",
                std::chrono::duration<double>(std::chrono::steady_clock::now() -
                                              tRp0).count());

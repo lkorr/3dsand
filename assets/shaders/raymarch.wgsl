@@ -4282,6 +4282,39 @@ fn applyAerial(color : vec3f, rd : vec3f, tFine : f32) -> vec3f {
 }
 
 // ============================================================================
+// SHADING LOD: the contact terms fade where a voxel is smaller than a pixel
+// can resolve (DESIGN.md §9.u)
+// ============================================================================
+// Past ~20 m a hillside is a staircase of voxels (or cascade cells) whose
+// treads are contact-shadowed by the riser above them and whose creases carry
+// full AO, each face 2-6 px on screen. Those two terms are CORRECT for the
+// staircase and WRONG for the surface the staircase is a sampling of — a
+// smooth slope has no risers to shadow its treads — and sampled once per
+// pixel they are the salt-and-pepper the mid distance reads as noise. So both
+// fade with PROJECTED voxel size, the same law denoise.wgsl ramps its filter
+// on, and continuous across the window edge because it is a function of the
+// hit distance and nothing else: a far cell one voxel past the seam gets the
+// same fade the near voxel one voxel inside it got.
+//
+// The shadow lifts only to LOD_SHADE_SHADOW_LIFT, not to 1: a real cast
+// shadow (a ridge over a valley) has a distant blocker and already sits at
+// TUNE_SHADOW_LIFT from the near law, so max() leaves it alone and only the
+// contact-dark artefacts move. The direct lambert of the cube normal is NOT
+// touched: its average over the footprint is the smooth surface's lambert,
+// which is what the screen-space filter (denoise.wgsl) reconstructs.
+// The same pair as render.denoisePxFull / denoisePxStart ship with; consts
+// here rather than TUNE_ rows because only this kernel reads them.
+const LOD_SHADE_PX_FULL : f32 = 2.0;     // fully faded at/below this many px per voxel
+const LOD_SHADE_PX_START : f32 = 8.0;    // untouched at/above
+const LOD_SHADE_SHADOW_LIFT : f32 = 0.7; // contact shadows lift to this at full fade
+
+fn lodShadeFade(tVox : f32) -> f32 {
+  let fpx = R.viewPx * 0.5 / R.tanHalfFov;
+  let voxPx = fpx / max(tVox, 1.0);
+  return 1.0 - smoothstep(LOD_SHADE_PX_FULL, LOD_SHADE_PX_START, voxPx);
+}
+
+// ============================================================================
 // OPAQUE SURFACE LOOK (DESIGN.md §9)
 // ============================================================================
 // Everything below shades a solid/powder voxel face. It replaces what used to
@@ -9197,6 +9230,9 @@ fn fs(in : VSOut) -> FSOut {
         if (sd >= 0.0) {
           var sh = shadowFromOpaqueHit(true, sd, 0u);
           if (far.level >= 3u) { sh = max(sh, TUNE_SHADOW_FAR_LIFT); }
+          // Shading LOD (see lodShadeFade): the staircase's contact shadow
+          // is an artefact of the sampling at this projected size.
+          sh = mix(sh, max(sh, LOD_SHADE_SHADOW_LIFT), lodShadeFade(far.t));
           lambert *= sh;
         }
       }
@@ -9220,6 +9256,8 @@ fn fs(in : VSOut) -> FSOut {
       let up = far.cell + vec3<i32>(0, 1, 0);
       if (farInValid(up, farBox(far.level)) &&
           farPalAt(far.level, up) != 0u) { ao *= TUNE_AO_FAR; }
+      // Shading LOD: the crease AO of a staircase fades with its treads.
+      ao = mix(ao, 1.0, lodShadeFade(far.t));
       // Same lighting model as the near field (hemisphere ambient x AO, plus
       // direct sun) so the two representations agree across the seam.
       let fsun = keyLightColor() * lambert;
@@ -9317,7 +9355,11 @@ fn fs(in : VSOut) -> FSOut {
     // model's own self-shadowing would need a second march, which is exactly
     // the cost this feature exists to avoid, and grass genuinely does sit in
     // open sky.
-    let ao = select(voxelAO(h.cell, ni, a1, a2, uv), 1.0, isMicro);
+    var ao = select(voxelAO(h.cell, ni, a1, a2, uv), 1.0, isMicro);
+    // Shading LOD (lodShadeFade): the crease AO of a staircase fades where
+    // its treads are smaller than a pixel can resolve. Same law, same
+    // distance, as the far path one voxel across the window edge.
+    ao = mix(ao, 1.0, lodShadeFade(h.t));
 
     // Per-face constant: kept, but much gentler than the old 0.55/0.75/0.85
     // spread. That spread was doing the job real ambient should do, and doing
@@ -9374,6 +9416,9 @@ fn fs(in : VSOut) -> FSOut {
       } else {
         sh = sunShadowAt(hitP, n, in.pos.xy, h.t);
       }
+      // Shading LOD: contact shadows lift with projected size (see
+      // lodShadeFade); a real cast shadow is already above the lift.
+      sh = mix(sh, max(sh, LOD_SHADE_SHADOW_LIFT), lodShadeFade(h.t));
       // The distance-softened LIFT cannot reach a face that cannot see the
       // sky (shadowLiftCap, common.wgsl): a cave floor under a 10 m roof got
       // 45% sun through the rock before this. `openRaw` is read above, once,

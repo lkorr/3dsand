@@ -7190,6 +7190,136 @@ irradiance grid (§9.y). A screen-space denoiser needs screen-space noise, and
 this renderer's noise is in the QUANTISATION of those world-space caches, which
 is what the temporal accumulator above softens as a side effect.
 
+### 9.u The shading-LOD filter — the "denoiser" that is not one (added 2026-09-12; `assets/shaders/denoise.wgsl`, `raymarch.wgsl` `lodShadeFade`)
+
+Reported as "a ton of noise overlaying everything in the first far-field /
+medium-field ring, especially in daylight". Measured on `screenshot_ground`
+and `screenshot`: the noise is **not stochastic**. Every lighting term the
+raymarch evaluates is deterministic and evaluated once per pixel at one point
+on one voxel face — the sun through the shadow cache, AO from three fetches,
+the far shadow from one any-hit march. What the eye reads as noise is
+GEOMETRY: past ~20 m a hillside is a staircase of 10 cm voxels (40–160 cm
+cascade cells) whose treads are contact-shadowed by the riser above them,
+whose creases carry full AO and whose ±X/±Z faces take different lamberts,
+each face 2–6 px on screen. Point-sampling that staircase once per pixel is
+aliasing of the lighting, and it is the same picture every frame. The
+`denoise` gate puts a number on it: mean absolute luminance residual against
+the 4-neighbour mean over the 30–400 m band, **16.5** (0..255) at mid-morning
+against 3.0 at midnight — it is a sunlit artefact.
+
+**Why none of the five candidate denoisers was used.** OptiX (every mode,
+AOV-guided and temporal included) is CUDA and NVIDIA-only and would need
+CUDA↔Vulkan interop; DLSS Ray Reconstruction is RTX-only behind the NGX SDK;
+NRD/REBLUR is cross-vendor but wants a G-buffer this renderer does not have
+(normals, roughness, motion vectors, split diffuse/specular with hit
+distance), sampled images and samplers the rhi does not have, and HLSL
+through a toolchain the build does not have. None of that is the real
+objection. The real one is the MODEL: all five treat the input as a noisy
+estimate of a smooth signal and accumulate it over time, and a deterministic
+staircase has no variance to average away — the temporal stage would see the
+same value every frame and change nothing, and their spatial stages are
+guided by NORMALS, which would preserve exactly the riser-vs-tread contrast
+that is the defect. A denoiser needs noise; this is LOD.
+
+**What was built instead is the prefilter a texture mip chain gives a
+rasteriser for free, in two halves that share one law.** The law is
+projected size: `fpx / viewZ` (pixels one fine voxel covers at this pixel's
+depth, `fpx = renderH / 2·tanHalfFov`), ramped from 8 px per voxel (off) to
+2 px (full) — at 1080p / 70° that is 10 m to 39 m — and written in PIXELS so
+the band follows resolution and fov. Because the far cascade keeps a constant
+~6 px per CELL (§9's resolution law: 1.5 px per fine voxel at level 1, less
+beyond), everything past the window edge is at full strength. And because
+the law is a function of hit distance alone, it is continuous across the
+window edge — a far cell one voxel past the seam gets the fade the near voxel
+one voxel inside it got, which is what keeps this from being a new LOD ring.
+
+1. **In the raymarch (`lodShadeFade`, applied in both the near and the far
+   shade): the CONTACT terms fade.** A contact shadow lifts toward
+   `LOD_SHADE_SHADOW_LIFT` (0.7) via `max()`, so a real cast shadow — a ridge
+   over a valley, whose blocker is distant and which the near law already
+   holds at `TUNE_SHADOW_LIFT` — is untouched and only the contact-dark
+   artefacts move; the crease AO fades to 1. The direct lambert of the cube
+   normal is deliberately NOT touched: its average over the footprint IS the
+   smooth surface's lambert, which the second half reconstructs. Measured:
+   raw band residual 16.5 → 13.5 from this half alone. Three WGSL consts in
+   `raymarch.wgsl`, not `TUNE_` rows: only that kernel reads them, and
+   `common.wgsl` is the nine-minute file. `--shader-stats`: the raymarch
+   fragment stage stays at 128 registers.
+
+2. **A screen-space pass (`denoise.wgsl`): a depth-guided à-trous kernel over
+   the finished world frame, IN PLACE, at render resolution, between the
+   world pass and TAA / the upscale blit.** 5×5 B3-spline taps dilated
+   2^i per iteration (Dammertz 2010 — the SVGF spatial stage), with weights
+   from three things: the projected-size STRENGTH above; a DEPTH stop that is
+   relative and per pixel of offset (`|Δz| < denoiseDepthTol · z · dist`,
+   because a grazing ground plane changes depth ~1 %/px at 100 m and a fixed
+   tolerance stops on every tread or on nothing — this is what keeps a crest
+   from bleeding into the hill behind it, a mob from bleeding into the ground,
+   and the sky, depth 0, out of everything); and a CHROMA stop, deliberately
+   not a luminance one — the speckle is luminance (lit vs shadowed faces of
+   one material), a material boundary is mostly hue (sand/water, grass/rock).
+   No history: nothing ghosts, nothing resets, a still frame is bit-stable.
+
+**The plumbing is TAA's, reused.** No sampled images: the world colour and
+depth attachments are copied into two storage buffers, the pass reads them
+and renders into the world texture, and between iterations the texture is
+copied back into the colour buffer. Every barrier in that chain is DERIVED —
+`CopyImageToBuffer` routes its destination through the extras tracker (so
+the second copy WARs against the previous pass's fragment read, which
+`FlushForRenderDomain` recorded) and `TransitionImage` carries the
+attachment-write → transfer-read → attachment-write on the texture. There is
+no hand-written barrier and `--vk-validation` is clean. Like TAA it forces
+the offscreen path at render scale 1. It runs in `--shot` too, in place over
+the shot texture, because a look pass the look harness did not show would be
+untunable.
+
+**Shipped values, and what the alternatives looked like** (all from
+`--gate denoise`, which writes `build/denoise_before.bmp` / `_after.bmp`
+every run so a tuning.json edit plus one gate is the whole loop):
+
+| arm | band residual | verdict |
+|---|---|---|
+| raw, no fade | 16.5 | the report |
+| fade only | 13.5 | contact stipple mostly gone; the ±X/±Z face mosaic remains |
+| fade + 1 iteration, strength 1 | 2.3 | in focus, but the 6 px mosaic is still a mosaic |
+| **fade + 2 iterations, strength 0.7** | **0.7** | **shipped: mosaic averaged, terrace bands and relief survive** |
+| fade + 2 iterations, strength 1 | 0.6 | softer than it needs to be |
+| 3 iterations, strength 1 | 0.14 | every hillside reads out of focus |
+
+**The owner's verdict on the pass, 2026-09-12: it ships OFF** (`render.denoise`
+0). Even at two iterations the filtered hills read as out of focus. The
+in-raymarch fade (half 1) is what ships; the pass stays as the A/B arm and the
+gate keeps it working. The next lever for the remaining ±X/±Z face mosaic is a
+smoothed normal for the lighting at distance, in the raymarch, not a blur.
+
+The 15–31 m ramp of the first cut measured as a visible line where crisp
+voxels met filtered ones — the LOD-ring defect the cascade seam dither exists
+to break — hence the 10–39 m ramp. Cost, same gate, 1080p: **+1.2 ms** for two
+iterations (copies included); at `render.renderScale` 0.7 it is half that.
+`render.denoise` 0 is the A/B arm.
+
+**Gated by `--gate denoise`**, which draws one mid-morning valley view, copies
+the frame out BEFORE and AFTER the pass (one frame, so the irradiance EMA
+cannot differ between the two — the first cut compared two arms and found a
+3/255 lighting drift in the near band), reads the depth the world pass
+wrote, and asserts by distance band: pixels nearer than 10 m and the sky are
+**bit-identical** (`denoise.nearMaxDiff` 0 — the ramp is exactly zero there
+and the shader returns the source texel), the 30–400 m band's residual falls
+to at most `denoise.midHfMaxRatio` (0.6) of the raw frame's, and that band's
+mean luminance moves by at most `denoise.midMeanMaxDelta` (3). Every threshold
+is baseline.json; the observed ratio, raw residual and per-frame cost are
+recorded for `--rebaseline`.
+
+**What is NOT here.** An albedo guide: the pass reads colour and depth only,
+so a distant structure of a similar hue to its ground (the ruins at 100 m in
+`screenshot`) is softened along with the ground — the fix is a second
+attachment or a fragment store of albedo from the raymarch, which the chroma
+stop is standing in for. Soft shadows on the raster body paths (§9.s's open
+item) are unaffected either way — a body's pixels are nearer than the ramp.
+And nothing temporal: `render.taa`'s accumulator would integrate the same
+staircase over the jitter sequence and is the right next lever if the
+residual 0.7 still reads as texture at some resolution.
+
 ## 9b. Wind (added 2026-08-25)
 
 Plan of record: **`docs/RESEARCH_wind.md`** — the decision record, the industry

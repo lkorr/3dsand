@@ -3081,6 +3081,58 @@ struct Tuning {
     // jittered sample landed nearly on the pixel speak for it — sharper, at the
     // cost of starving pixels the jitter sequence keeps missing.
     float taaSharpness = 2.29f;
+    // ---- the shading-LOD filter (assets/shaders/denoise.wgsl) --------------
+    // CPU-ONLY, all seven: they reach denoise.wgsl through its own uniform
+    // (Simulation::WriteDenoiseParams), never the TUNE_ prelude, so a change
+    // is one tuning.json edit and no shader recompile.
+    //
+    // denoise: 1 runs a depth-guided a-trous filter over the world frame, at
+    // render resolution, before TAA or the upscale blit. It averages the
+    // lighting of terrain whose FINE voxels project smaller than denoisePx*
+    // pixels — the mid-distance staircase speckle of lit and shadowed cube
+    // faces — and leaves near geometry, the sky and depth edges alone. 0 is
+    // the A/B arm. Nothing here has a history: no ghosting, nothing to reset.
+    // SHIPS OFF (owner's call, 2026-09-12): with the filter on, distant
+    // terrain read as out of focus; the in-raymarch contact-term fade
+    // (raymarch.wgsl lodShadeFade) stays on and is the part that ships.
+    int denoise = 0;
+    // denoiseIters: a-trous iterations, each a 5x5 tap at dilation 2^i. 1 =
+    // a 5-px support (takes the 1-2 px stipple and leaves the 6 px cascade
+    // mosaic), 2 = 13 px (shipped: the mosaic averages, terrace bands and
+    // relief survive), 3 = 25 px (measured 2026-09-12: every hillside reads
+    // out of focus), 4 = 49 px. Cost is linear in it.
+    int denoiseIters = 2;
+    // denoisePxFull / denoisePxStart: the strength ramp, in PROJECTED PIXELS
+    // PER FINE VOXEL at the pixel's depth. Full strength at or below pxFull,
+    // off at or above pxStart. At 1080p / 70 deg a 10 cm voxel is 2 px at
+    // ~39 m and 8 px at ~10 m, so the shipped pair means "off inside 10 m,
+    // ramping in to 39 m, full beyond" — and the far cascade, at a constant
+    // ~6 px per CELL (= 1.5 px per fine voxel at level 1, less beyond), is
+    // always full. Written in pixels so the band follows resolution and fov.
+    // The ramp is this WIDE on purpose: a 15-31 m ramp measured as a visible
+    // line where crisp voxels met filtered ones, the same defect as the LOD
+    // ring the cascade seam dither exists to break.
+    float denoisePxFull = 2.0f;
+    float denoisePxStart = 8.0f;
+    // denoiseDepthTol: the depth edge stop, as a fraction of view depth per
+    // pixel of tap offset. A tap whose depth differs from the centre by more
+    // than about this is a different surface (a crest against the hill
+    // behind, a mob against the ground) and stops the filter. A grazing
+    // ground plane at 100 m changes depth by ~1% per pixel, which this must
+    // exceed or every tread becomes an edge.
+    float denoiseDepthTol = 0.03f;
+    // denoiseChromaTol: the chroma edge stop, the width of a Gaussian on the
+    // distance between two taps' luminance-normalised colours. The speckle is
+    // LUMINANCE (lit vs shadowed faces of one material); a material boundary
+    // is mostly hue. Smaller preserves more material edges and less of the
+    // lit/shadow averaging (shadow is slightly bluer than sun); larger blurs
+    // across everything.
+    float denoiseChromaTol = 0.25f;
+    // denoiseStrength: overall ceiling on the filter (0..1). 1 is the full
+    // average; 0.5 keeps half the original speckle under it. Shipped 0.7 with
+    // two iterations: the residual is what keeps the picture reading as
+    // in-focus terrain rather than a soft gradient.
+    float denoiseStrength = 0.7f;
     // presentMode: 0 fifo (vsync, quantises a 22 ms frame to 33), 1 mailbox
     // (newest frame at each vblank, no tearing, no quantisation), 2 immediate
     // (tears). Applied when it CHANGES (a swapchain recreate). Use fifo or an

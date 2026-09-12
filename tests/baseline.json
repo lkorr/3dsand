@@ -322,5 +322,10 @@
   "glow.maxRemainPct": "0.0",
   "glow.srcLumObserved": "0.2924",
   "glow.nearLumObserved": "0.0602",
-  "glow": "pass"
+  "glow": "pass",
+  "_denoise_about": "The shading-LOD filter, assets/shaders/denoise.wgsl: a depth-guided a-trous pass over the world frame that averages the lighting of terrain whose voxels project smaller than render.denoisePx* pixels (the mid-distance staircase speckle). One terrain view drawn raw and filtered, read back with the depth the world pass wrote, compared by distance band. A: pixels nearer than 10 m and the sky are bit-identical (nearMaxDiff, 0 on purpose: the strength ramp is exactly zero there and the shader returns the source texel). B: in the 30-400 m band the mean absolute residual against the 4-neighbour mean falls to at most midHfMaxRatio of the raw frame's. C: that band's mean luminance moves by at most midMeanMaxDelta (0..255). The *Observed values and the per-frame cost are recorded for --rebaseline.",
+  "denoise.midHfMaxRatio": "0.6",
+  "denoise.midMeanMaxDelta": "3.0",
+  "denoise.nearMaxDiff": "0",
+  "denoise": "pass"
 }

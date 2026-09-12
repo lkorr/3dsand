@@ -1060,9 +1060,20 @@ int RunShots(GpuContext& ctx, World& world, Simulation& sim) {
     // ~10 ms each cost nothing against the readback. Fresh RenderParams per
     // frame: the frame counter inside them is what the cache's stamps advance
     // on.
+    // The shading-LOD filter (render.denoise) runs in the shots exactly as it
+    // does in play, in place over `offscreen` after the world pass — a look
+    // pass that the look harness did not show would be untunable. Its params
+    // are uploaded before the pass opens, like everything else here.
+    const bool shotDenoise = CurrentTuning().render.denoise != 0;
     for (int f = 0; f < 4; f++) {
       WriteRenderParams(ctx.queue, world, eye, c, (float)W / H, true, kShotTime,
                         kFarFogDensity, 1080.0f, frameTick);
+      if (shotDenoise) {
+        sim.EnsureDenoise(W, H);
+        sim.WriteDenoiseParams(ctx.queue, W, H,
+                               std::tan(CurrentTuning().camera.fovY * 0.5f),
+                               /*bgraSource=*/false);
+      }
       rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
       sim.EncodeShadowResolve(enc);
       rhi::RenderPass rp =
@@ -1081,6 +1092,11 @@ int RunShots(GpuContext& ctx, World& world, Simulation& sim) {
                                    ? CurrentDebugArrowCount()
                                    : 0u);
       rp.End();
+      // A no-op until the first draw has built the pipeline (frame 0), so the
+      // grabbed fourth frame is always filtered.
+      if (shotDenoise)
+        sim.EncodeDenoise(enc, offscreen, view, rhi::TextureFormat::RGBA8Unorm,
+                          W, H);
       ctx.queue.Submit(enc.Finish());
     }
     ctx.WaitIdle();
@@ -8101,7 +8117,13 @@ int main(int argc, char** argv) {
       // swapchain image is not that.
       const bool taaOn = CurrentTuning().render.taa != 0 && sim.TaaAvailable() &&
                          ctx.SwapchainBlittable();
-      const bool offscreen = scaled || taaOn;
+      // ---- the shading-LOD filter (denoise.wgsl) ----------------------------
+      // Runs IN PLACE over the offscreen world frame between the world pass
+      // and whatever consumes it (TAA or the blit), so like TAA it forces the
+      // offscreen path at scale 1: the swapchain image cannot be copied out of.
+      const bool denoiseOn = CurrentTuning().render.denoise != 0 &&
+                             sim.DenoiseAvailable() && ctx.SwapchainBlittable();
+      const bool offscreen = scaled || taaOn || denoiseOn;
       //
       // THE JITTER IS A YAW/PITCH NUDGE, not a shear of the basis, and that is
       // the whole reason it is safe. Every path that draws this frame — the
@@ -9582,6 +9604,14 @@ int main(int argc, char** argv) {
                            CurrentTuning().render.taaClamp, /*reset=*/false,
                            ctx.surfaceFormat == rhi::TextureFormat::BGRA8Unorm);
       }
+      if (denoiseOn) {
+        // Same rule as WriteTaaParams above: uploaded before any render pass
+        // opens. The projection is the one WriteRenderParams uses.
+        sim.EnsureDenoise(renderW, renderH);
+        sim.WriteDenoiseParams(ctx.queue, renderW, renderH,
+                               std::tan(CurrentTuning().camera.fovY * 0.5f),
+                               ctx.surfaceFormat == rhi::TextureFormat::BGRA8Unorm);
+      }
       taaWasOn = taaOn;
       taaScaleWas = renderScale;
       rhi::RenderPass rp =
@@ -9639,6 +9669,15 @@ int main(int argc, char** argv) {
         // square), then open a native-size pass for the UI so text and panels
         // are never scaled.
         rp.End();
+        if (denoiseOn) {
+          // The filter's copies and passes, all derived-barrier: see
+          // Simulation::EncodeDenoise. The result lands back in scaledTex, so
+          // TAA and the blit below read the filtered frame without knowing.
+          const LiveSpan spd = spanBegin("rm_denoise");
+          sim.EncodeDenoise(enc, scaledTex, scaledView, ctx.surfaceFormat,
+                            renderW, renderH);
+          spanEnd(spd);
+        }
         if (taaOn) {
           // The copies MUST be outside a rendering scope — the recorder drops a
           // transfer recorded inside one, silently. `rp.End()` above is what

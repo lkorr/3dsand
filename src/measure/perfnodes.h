@@ -275,6 +275,12 @@ inline constexpr PerfNodeDef kPerfNodes[] = {
     {"drawDebug", "Debug draws", "renderPass", PerfSide::Gpu, PerfScope::Count,
      "", "Collision boxes, wind and current arrows. Zero when every debug view "
      "is off — a non-zero here in play is a toggle left on."},
+    {"denoise", "Shading-LOD filter", "renderPass", PerfSide::Gpu,
+     PerfScope::Count, "",
+     "The depth-guided a-trous pass over the world frame (render.denoise): "
+     "one image->buffer copy plus one fullscreen pass per iteration, at "
+     "render resolution, between the world pass and TAA / the blit. Zero "
+     "when the knob is off."},
     {"uiOverlay", "Overlay + swapchain wait", "renderPass", PerfSide::Both,
      PerfScope::Present,
      "", "GPU: the ImGui overlay draw. CPU: AcquireFrame + Present — under "
@@ -590,6 +596,7 @@ inline constexpr PerfRenderSpanDef kPerfRenderSpans[] = {
     {"rm_micro", "drawMicro"},
     {"rm_sprites", "drawSprites"},
     {"rm_debug", "drawDebug"},
+    {"rm_denoise", "denoise"},
     {"rm_overlay", "uiOverlay"},
     // The legacy whole-pass span. Still what --perf's RenderFrame writes when
     // it has no per-draw split (an offscreen harness frame is one draw), and

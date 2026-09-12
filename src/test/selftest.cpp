@@ -186,6 +186,9 @@ const char* const kOrder[] = {
     // restores the baseline tuning; running before it would put a shader
     // rebuild in the middle of a 16-frame accumulation.
     "taa",
+    // `denoise` is the same shape as `taa` (own worldgen, draws one view two
+    // ways, leaves nothing behind) and sits beside it for the same reason.
+    "denoise",
     // With the other render gates: `body-shade` runs its own worldgen and is
     // the one gate that draws a RIGIDBODY. It writes the body instance buffer
     // directly (like `fire-depth`) rather than going through the DebrisSystem,
