@@ -1929,6 +1929,7 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadF(*g, "shadowFarLift", r.shadowFarLift, out, at);
     ReadI(*g, "shadowCache", r.shadowCache, out, at);
     ReadI(*g, "shadowCacheSubdiv", r.shadowCacheSubdiv, out, at);
+    ReadF(*g, "shadowSunAngle", r.shadowSunAngle, out, at);
     ReadF(*g, "grainBroadScale", r.grainBroadScale, out, at);
     ReadF(*g, "grainFineScale", r.grainFineScale, out, at);
     ReadF(*g, "grainMix", r.grainMix, out, at);
@@ -2310,6 +2311,12 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     // clamp exists so the tuner slider cannot silently alias two patches onto
     // one key, not as the load-bearing guard.
     if (r.shadowCacheSubdiv > 8) { r.shadowCacheSubdiv = 8; }
+    // The penumbra cone's half-angle in degrees. 0 is legal and means "point
+    // sun", i.e. the hard single-ray shadow this replaced. The ceiling is
+    // where tan() stops being a small angle and the jittered ray would start
+    // missing the blocker it is supposed to be sampling the edge of.
+    if (r.shadowSunAngle < 0.0f) { r.shadowSunAngle = 0.0f; }
+    if (r.shadowSunAngle > 15.0f) { r.shadowSunAngle = 15.0f; }
     if (r.reflectionSteps < 0) { r.reflectionSteps = 0; }
     if (r.farSteps < 1) { r.farSteps = 1; }
     // 0 would stall a refill forever (the horizon would never come back) and

@@ -827,9 +827,17 @@ PASS(copy_shadowArgs, nullptr, PT_SHADOWCACHE, PIPE_NONE, K_COPY, 0,0,12, GRP_NO
 // atomic and the barrier mapping is the same.
 PASS(shadow_resolve, "shadowResolve", PT_SHADOWCACHE, PIPE_SHADOW_RESOLVE, K_INDIRECT, IND_SHADOWARGS,1,1,
      GRP_SHADOW, DYN_NONE, C_ALWAYS, 1,
+// W(ShadowHist) since the penumbra window (world.h kShadowHistBytes): the pass
+// reads its slot's word, folds this frame's sample into it and writes it back.
+// Both halves are this one row, so the only hazard it carries is the frame-to-
+// frame one every buffer's opening barrier already covers; it is declared so
+// that the table knows about the write rather than because a barrier is
+// missing. W, not A: the read-modify-write is plain, and a slot belongs to one
+// patch, so the only racer would be a duplicate claim — which the publish
+// guard below already drops.
      USES(R(Voxels) R(Occupancy) R(Materials) U(RenderUBO) R(PageTable)
           A(ShadowCache) A(ShadowReq) I(ShadowArgs) W(Irradiance) R(OpennessGen)
-          R(Openness)))
+          R(Openness) W(ShadowHist)))
 
 // =========================================================== PT_FLUID ======
 // ONE MLS-MPM SUBSTEP (docs/PLAN_mpm_fluids.md; sim_fluid.wgsl). Recorded

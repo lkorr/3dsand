@@ -116,6 +116,10 @@ struct VSOut {
   // insts[] per fragment is a dependent storage load on every pixel a limb
   // covers, for a value that is constant across the whole instance.
   @location(7) @interpolate(flat) flash : f32,
+  // The model's 6-bit joint mask (microBodyCutFaces). Flat and carried here for
+  // the same reason `base`/`dims` are: refetching insts -> models per fragment
+  // is two dependent storage loads for a value constant across the instance.
+  @location(8) @interpolate(flat) cut : u32,
 };
 
 // vi in 0..35 -> a corner of the unit box. Every face must wind the SAME way
@@ -187,6 +191,7 @@ fn vs(@builtin(vertex_index) vi : u32,
   out.scale = scale;
   out.slot = slot;
   out.flash = bitcast<f32>(insts[inst].flash_bits);
+  out.cut = microBodyCutFaces(m);
   return out;
 }
 
@@ -229,26 +234,62 @@ fn poolVoxAt(base : u32, dims : vec3<i32>, p : vec3<i32>) -> u32 {
 // face normal bit-identical to what shipped before.
 const BODY_SMOOTH_N : f32 = 0.55;
 
-fn bodySolidAt(base : u32, dims : vec3<i32>, p : vec3<i32>) -> f32 {
-  // Outside the brick is EMPTY, deliberately: that is what makes a silhouette
-  // voxel's gradient point outward and round the edge, instead of the brick's
-  // bounding box reading as a solid wall.
-  if (p.x < 0 || p.y < 0 || p.z < 0 ||
-      p.x >= dims.x || p.y >= dims.y || p.z >= dims.z) { return 0.0; }
-  return select(0.0, 1.0, (poolVoxAt(base, dims, p) & 0xFFu) != 0u);
+// ---- WHAT LIES OUTSIDE THE BRICK (the cut-face mask, 2026-09-11) -----------
+//
+// The word common.wgsl's MicroBodyModel mirror still calls `_pad` is NOT
+// padding: src/sim/microbody.h names it `cutFaces` and the mob loader fills it
+// in (mob.cpp LimbCutFaces). Six bits, `axis * 2 + positive`, one per boundary
+// plane of the brick, set when ANOTHER limb of the same prefab is pressed
+// against that plane — i.e. when the plane is a JOINT rather than the end of
+// the model.
+//
+// The mirror's name is stale and the rename is owed. It is held back only
+// because editing common.wgsl misses the SPIR-V cache for every shader in the
+// engine (CLAUDE.md: measured at 536 s), and this is the only reader.
+fn microBodyCutFaces(m : MicroBodyModel) -> u32 { return m._pad; }
+
+// Sample the brick's occupancy field, deciding what a sample OUTSIDE the brick
+// means.
+//
+// Past a face that is NOT a joint, the answer is EMPTY, deliberately: that is
+// what makes a silhouette voxel's gradient point outward and round the edge,
+// instead of the brick's bounding box reading as a solid wall.
+//
+// Past a JOINT face the answer is the boundary cell itself — the field
+// CONTINUES. Treating a joint as air instead was the "limb seams pulse and
+// flash" defect (owner report 2026-09-11): the last ring of voxels on an upper
+// arm got a gradient pointing straight out along the limb, i.e. a rounded end
+// CAP, while the forearm's first ring rounded the opposite way. That put a hard
+// bright/dark band across every shoulder, elbow, hip and knee, and because each
+// cap's normal swings with its own limb, the band's shading swung with the
+// animation while the two overlapping bricks traded depth ties under the TAA
+// jitter. The model has no cap there; nothing should be shaded as if it did.
+//
+// Clamping across a joint is exact for the axis that crosses it and costs
+// nothing for the others: a corner tap that leaves the brick through a joint
+// AND through an open face is still air, because the open face decides.
+fn bodySolidAt(base : u32, dims : vec3<i32>, p : vec3<i32>, cut : u32) -> f32 {
+  let lo = p < vec3<i32>(0);
+  let hi = p >= dims;
+  let cutLo = vec3<bool>((cut & 1u) != 0u, (cut & 4u) != 0u, (cut & 16u) != 0u);
+  let cutHi = vec3<bool>((cut & 2u) != 0u, (cut & 8u) != 0u, (cut & 32u) != 0u);
+  if (any(lo & !cutLo) || any(hi & !cutHi)) { return 0.0; }
+  let q = clamp(p, vec3<i32>(0), dims - vec3<i32>(1));
+  return select(0.0, 1.0, (poolVoxAt(base, dims, q) & 0xFFu) != 0u);
 }
 
 // Object-space outward normal from the occupancy gradient, or the zero vector
 // when the neighbourhood is uniform (a fully buried voxel, or an isolated one)
 // — the caller keeps its face normal in that case rather than normalizing 0.
-fn bodyFieldNormal(base : u32, dims : vec3<i32>, c : vec3<i32>) -> vec3f {
+fn bodyFieldNormal(base : u32, dims : vec3<i32>, c : vec3<i32>,
+                   cut : u32) -> vec3f {
   var g = vec3f(0.0);
   for (var dz = -1; dz <= 1; dz++) {
     for (var dy = -1; dy <= 1; dy++) {
       for (var dx = -1; dx <= 1; dx++) {
         if (dx == 0 && dy == 0 && dz == 0) { continue; }
         let d = vec3f(f32(dx), f32(dy), f32(dz));
-        let s = bodySolidAt(base, dims, c + vec3<i32>(dx, dy, dz));
+        let s = bodySolidAt(base, dims, c + vec3<i32>(dx, dy, dz), cut);
         // Density rises INTO the body, so the outward direction is -grad.
         g -= d * (s / length(d));
       }
@@ -353,7 +394,7 @@ fn fs(in : VSOut) -> FSOut {
   let nFace = axisVec(axis, -f32(axisPickI(stepv, axis)));
   var nLocal = nFace;
   if (BODY_SMOOTH_N > 0.0) {
-    let g = bodyFieldNormal(in.base, dims, c);
+    let g = bodyFieldNormal(in.base, dims, c, in.cut);
     let gl = length(g);
     // A uniform neighbourhood gives g == 0 and no opinion; keep the face
     // normal rather than normalizing a zero vector.

@@ -2480,6 +2480,18 @@ struct Tuning {
     // QUALITY knob, since the ray saving saturates well before it gets coarse.
     int shadowCache = 1;
     int shadowCacheSubdiv = 4;
+    // THE SUN'S APPARENT RADIUS AS THE SHADOW RAY SEES IT, in DEGREES, and the
+    // one knob that sets how wide a penumbra is (shadow_resolve.wgsl, world.h
+    // kShadowHistBytes). The resolve pass jitters its ray inside this cone and
+    // averages the last kShadowSamples verdicts, so a blocker `d` away casts an
+    // edge about 2*d*tan(angle) wide: crisp under a kerb, soft under a canopy.
+    //
+    // NOT dayNight.sunAngularRadius, which is the star's TRUE size (0.3 deg,
+    // and what the disc is drawn at and what eclipse geometry uses). At 0.3 deg
+    // a canopy 10 m up softens over 10 cm — one voxel — which is physically
+    // right and reads as the hard edge this replaced. This is the artistic one.
+    // 0 turns the cone off and restores the single-ray hard shadow exactly.
+    float shadowSunAngle = 1.0f;
 
     // grain
     float grainBroadScale = 11.0f, grainFineScale = 2.5f;

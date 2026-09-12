@@ -142,6 +142,100 @@ int FindModel(const Prefab& pf, const std::string& name) {
   return -1;
 }
 
+// ---- WHICH OF A LIMB BRICK'S SIX FACES IS A JOINT -------------------------
+// (microbody.h MicroBodyModelGpu::cutFaces; consumed by microbody.wgsl's
+// smooth-normal gradient.)
+//
+// THE PROBLEM THIS SOLVES. A limb is rendered as its own tightly-bounded brick
+// and the fragment shader can see no other limb, so when the smooth normal
+// differentiates the occupancy field it has to assume something about what lies
+// one cell outside the brick. "Air" is right past the SIDE of an arm — that is
+// what rounds the silhouette — and wrong past its END, where the forearm
+// actually is. Assuming air everywhere rounded the caps too, putting a hard
+// light/dark ring at every shoulder, elbow, hip and knee that swung with the
+// joint as it animated.
+//
+// WHY IT CANNOT BE MEASURED FROM THE BRICK ALONE. The two cases are locally
+// identical — a solid boundary plane with unknown beyond — and they are not
+// reliably told apart by shape either: on chunky voxel art the flat SIDE of an
+// arm is as solid a boundary plane as its cap is. The only thing that knows is
+// the art: every limb of a mob is one model of ONE prefab, in one shared
+// coordinate frame, and a joint is exactly a face that another model is pressed
+// against. So that is what this measures, once, at load.
+//
+// A FRACTION, NOT A PREDICATE, because limbs meet imperfectly: art with a
+// one-voxel taper at the shoulder leaves part of the cap uncovered, and a
+// held prop can graze a face it is not jointed to. Half the solid boundary
+// cells covered is the line, which no single stray voxel can cross and no
+// ordinary joint fails.
+//
+// Returns 0 — "every face is the edge of the model" — for a single-model
+// prefab, which is the pre-2026-09-11 behaviour and the right answer for an
+// item or a debris chunk.
+uint32_t LimbCutFaces(const Prefab& pf, int self) {
+  if (self < 0 || self >= (int)pf.models.size()) return 0;
+  const PrefabModel& m = pf.models[self];
+  if (m.size.x <= 0 || m.size.y <= 0 || m.size.z <= 0) return 0;
+
+  // Prefab-frame occupancy of every OTHER model. `voxels` are rebased to the
+  // model's own zero, so `offset` is what puts them back in the shared frame.
+  auto key = [](int x, int y, int z) {
+    return (uint64_t)(uint16_t)(int16_t)x | ((uint64_t)(uint16_t)(int16_t)y << 16) |
+           ((uint64_t)(uint16_t)(int16_t)z << 32);
+  };
+  std::unordered_set<uint64_t> others;
+  for (size_t i = 0; i < pf.models.size(); i++) {
+    if ((int)i == self) continue;
+    const PrefabModel& o = pf.models[i];
+    for (const PrefabVoxel& v : o.voxels) {
+      if ((v.material & 0xFFF) == 0) continue;
+      others.insert(key(v.x + o.offset.x, v.y + o.offset.y, v.z + o.offset.z));
+    }
+  }
+  if (others.empty()) return 0;
+
+  // This model's own occupancy, local coords.
+  const int dim[3] = {m.size.x, m.size.y, m.size.z};
+  std::vector<uint8_t> solid((size_t)dim[0] * dim[1] * dim[2], 0);
+  auto at = [&](int x, int y, int z) -> uint8_t& {
+    return solid[((size_t)z * dim[1] + y) * dim[0] + x];
+  };
+  for (const PrefabVoxel& v : m.voxels) {
+    if ((v.material & 0xFFF) == 0) continue;
+    if (v.x < 0 || v.y < 0 || v.z < 0 || v.x >= dim[0] || v.y >= dim[1] ||
+        v.z >= dim[2])
+      continue;
+    at(v.x, v.y, v.z) = 1;
+  }
+
+  uint32_t mask = 0;
+  for (int axis = 0; axis < 3; axis++) {
+    const int ta = (axis + 1) % 3, tb = (axis + 2) % 3;
+    for (int side = 0; side < 2; side++) {
+      const int plane = side ? dim[axis] - 1 : 0;
+      const int step = side ? 1 : -1;
+      int n = 0, covered = 0;
+      for (int u = 0; u < dim[ta]; u++)
+        for (int v = 0; v < dim[tb]; v++) {
+          int c[3];
+          c[axis] = plane;
+          c[ta] = u;
+          c[tb] = v;
+          if (!at(c[0], c[1], c[2])) continue;
+          n++;
+          c[axis] = plane + step;
+          if (others.count(key(c[0] + m.offset.x, c[1] + m.offset.y,
+                               c[2] + m.offset.z)))
+            covered++;
+        }
+      // Face encoding is axis * 2 + positive — the same one shadowFaceOf and
+      // microbody.wgsl's bodySolidAt use.
+      if (n > 0 && covered * 2 >= n) mask |= 1u << (axis * 2 + side);
+    }
+  }
+  return mask;
+}
+
 // Joint anchor from geometry: midpoint of the gap between the two limb AABBs
 // (prefab-local voxels). Works whenever the art keeps limbs adjacent; the
 // sidecar can still override with an explicit "anchor".
@@ -1215,7 +1309,8 @@ bool LoadMobDefs(const std::string& dir, const std::vector<MaterialDef>& mats,
         // The one PURE RENDER read in the loader: the brick is the art, so it
         // is packed at the authored skin resolution and never at physScale.
         ld.microModel = MicroBodyPack(micro, m.voxels, m.size, def.skinScale,
-                                      def.name + "/" + ld.name, log);
+                                      def.name + "/" + ld.name, log,
+                                      LimbCutFaces(def.prefab, mi));
         if (ld.microModel < 0)
           log += def.name + ": limb \"" + ld.name +
                  "\" has no micro brick and will not render (the cube path "

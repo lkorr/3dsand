@@ -62,7 +62,30 @@ struct MicroBodyModelGpu {
   // limits a limb anyway; packing them keeps the record at 16 bytes.
   uint32_t dims;
   uint32_t scale;  // micro voxels per world voxel: 2 or 4
-  uint32_t _pad;   // padding to 16 bytes; no flag bits are defined
+  // ---- THE CUT-FACE MASK (2026-09-11) --------------------------------------
+  // Six bits, `axis * 2 + positive` — the same face encoding shadowFaceOf uses
+  // — saying which of the brick's six boundary planes is a JOINT rather than
+  // the end of the model. Consumed only by microbody.wgsl's smooth-normal
+  // gradient (BODY_SMOOTH_N), which differentiates the occupancy field and
+  // needs to know what lies past the brick.
+  //
+  // WHY IT CANNOT BE DECIDED IN THE SHADER. A limb is its own brick, tightly
+  // bounded, and the shader can see no other limb. Past the SIDE of an arm is
+  // air, so treating outside-the-brick as empty is what rounds the silhouette;
+  // past the END of an upper arm is the FOREARM, and treating that as empty
+  // rounds the cap too — which put a hard light/dark ring at every shoulder,
+  // elbow, hip and knee, swinging with the joint as it animated (owner report:
+  // "the conjoining seams of limb nodes pulse and flash"). The two cases are
+  // locally identical: in both, the boundary cell is solid and the cell outside
+  // is unknown. What tells them apart is GLOBAL — a cut plane is a whole
+  // cross-section of the limb, a tangent row on a cylinder is a line — so it is
+  // measured once here at pack time and carried on the model.
+  //
+  // It rides the word that was padding. MicroBodyModelGpu must stay 16 bytes
+  // (the static_assert below, and the hand-written mirror in common.wgsl that
+  // nothing checks), so a new field is not available; this one was already
+  // there, uploaded, and documented as carrying nothing.
+  uint32_t cutFaces;
 };
 static_assert(sizeof(MicroBodyModelGpu) == 16,
               "must match common.wgsl MicroBodyModel");
@@ -207,9 +230,16 @@ std::vector<uint8_t> MicroBodyMergeArt(MicroBodySet& set,
 // drawn that way would be twice its real size — it simply does not render,
 // which the loader says out loud. A broken limb must not stop the mob from
 // loading (DESIGN.md §6).
+//
+// `cutFaces` is the 6-bit joint mask described on MicroBodyModelGpu::cutFaces.
+// It defaults to 0 — "every boundary plane of this brick is the edge of the
+// model" — which is the right answer for everything that is not one limb of a
+// jointed body: an item, a debris chunk, a carved COW clone. Only the mob
+// loader knows better, because only it has the other limbs of the same prefab
+// to measure against (mob.cpp LimbCutFaces).
 int MicroBodyPack(MicroBodySet& set, const std::vector<PrefabVoxel>& voxels,
                   IVec3 dims, uint32_t scale, const std::string& label,
-                  std::string& log);
+                  std::string& log, uint32_t cutFaces = 0);
 
 // ---- copy-on-write: destructible micro bodies -------------------------------
 //

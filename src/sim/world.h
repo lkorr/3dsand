@@ -997,6 +997,37 @@ constexpr uint64_t kShadowCacheBytes =
 // Load factor at the ~200k patches an overlook frame resolves is under 20%,
 // and with the bilinear taps' neighbour ring somewhat above; the Poisson tail
 // past 8 live patches in one set is ~1e-5 of patches at 20% load.
+// ---- THE PENUMBRA WINDOW (shadow_resolve.wgsl, 2026-09-11) -----------------
+// One word per bucket, PARALLEL to the cache and never read by the fragment
+// shader: a 16-frame sliding window of the patch's sun-visibility samples, plus
+// the lift byte, packed as
+//
+//   bits 0..15  one bit per sample slot, set when that sample saw the sun
+//   bits 16..20 how many slots have been filled since the slot was claimed
+//   bits 21..28 the softening lift (0..255) from the last CENTRE ray
+//
+// WHAT IT BUYS. The cache used to publish ONE ray's verdict, so a patch was
+// either lit or shadowed and a shadow edge was a hard step from full sun to
+// TUNE_SHADOW_LIFT, one patch wide however far away the blocker was. The sun is
+// not a point: with the ray jittered inside a cone each frame and the last 16
+// verdicts averaged, a patch's published value is the FRACTION of the disc it
+// can see, so the edge becomes a real penumbra that widens with blocker
+// distance (owner report: "shadows expand pixels at a time; it should be a
+// gradient").
+//
+// WHY A WINDOW AND NOT AN EXPONENTIAL BLEND. An EMA of a cycling sample set
+// never settles — it oscillates with the sequence's period forever, which is a
+// pulsing shadow, which is the defect next door. A sliding window over a fixed
+// 16-sample sequence is EXACT after 16 frames and then stops moving entirely
+// while the scene and the sun hold still: the same slot is rewritten with the
+// same bit. --gate shadow-cache's flicker arm asserts that.
+//
+// WHY IT IS ITS OWN BUFFER rather than two more words on the cache slot: the
+// reader probes a whole 8-way set on every lit pixel and that set is exactly
+// one 64-byte cache line (see kShadowCacheWords). Widening the slot would put
+// the hot path on two lines to carry state only the resolve pass ever touches.
+constexpr uint64_t kShadowHistBytes = (uint64_t)kShadowCacheBuckets * 4;  // 4 MiB
+constexpr uint32_t kShadowSamples = 16;   // window length; 16 bits of the word
 constexpr uint32_t kShadowReqHeaderWords = 4;   // [0] atomic count, [1] saved count, [2..3] stats
 constexpr uint32_t kShadowReqWords = 4;         // key, bucket, packed cell, packed face+sub
 // 2^20 records (16 MiB), not the 2^18 (4 MiB) it shipped with: a frame's
@@ -3111,6 +3142,10 @@ class World {
   // costs one frame of stale shadows, which is the same thing a teleport costs.
   rhi::Buffer shadowCache;    // kShadowCacheBuckets * 2 u32 (8 MiB)
   rhi::Buffer shadowReq;      // header + kShadowReqCap * 4 u32 request records
+  // The penumbra window (the kShadowHistBytes block above), one word per
+  // bucket. Written and read by the resolve pass alone; the fragment shader
+  // never touches it, which is the point of it being a separate buffer.
+  rhi::Buffer shadowHist;     // kShadowCacheBuckets u32 (4 MiB)
   // ---- openness grid (the kOpenFaces block above) ----
   // Same standing as the shadow cache: render-only, derived, disposable, never
   // hashed or saved. CopySrc so `--gate openness` can read a block-face back;

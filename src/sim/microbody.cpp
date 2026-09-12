@@ -160,7 +160,7 @@ std::vector<uint8_t> MicroBodyMergeArt(MicroBodySet& set,
 
 int MicroBodyPack(MicroBodySet& set, const std::vector<PrefabVoxel>& voxels,
                   IVec3 dims, uint32_t scale, const std::string& label,
-                  std::string& log) {
+                  std::string& log, uint32_t cutFaces) {
   if (voxels.empty()) return -1;
   if (dims.x <= 0 || dims.y <= 0 || dims.z <= 0) return -1;
   // 10 bits per axis in MicroBodyModelGpu.dims.
@@ -216,7 +216,7 @@ int MicroBodyPack(MicroBodySet& set, const std::vector<PrefabVoxel>& voxels,
   m.base = base;
   m.dims = (uint32_t)dims.x | ((uint32_t)dims.y << 10) | ((uint32_t)dims.z << 20);
   m.scale = scale;
-  m._pad = 0;
+  m.cutFaces = cutFaces & 0x3Fu;
   set.models.push_back(m);
   // Shared, not owned: load-time models back every instance of their def and
   // must survive any one instance being destroyed.

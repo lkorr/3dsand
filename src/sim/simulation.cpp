@@ -680,6 +680,11 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         // The openness bytes, so the deposit can cap the shadow lift by sky
         // visibility (shadowLiftCap in common.wgsl; see shadow_resolve.wgsl).
         entry(10, T::ReadOnlyStorage), // openness
+        // The penumbra window (world.h kShadowHistBytes): the 16-frame
+        // sliding window of sun-visibility samples per patch. Read-modify-
+        // written here and bound nowhere else — the fragment shader reads the
+        // published 8-bit value out of shadowCache and never this.
+        entry(11, T::Storage),         // shadowHist
     };
     shadowBGL_ = device.CreateBindGroupLayout(entries, std::size(entries));
 
@@ -695,6 +700,7 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         b(8, world_->irradiance),
         b(9, world_->opennessGen),
         b(10, world_->openness),
+        b(11, world_->shadowHist),
     };
     shadowBG_ = device.CreateBindGroup(shadowBGL_, bges, std::size(bges), "shadowBG");
     rhi::BindGroupLayout shadowGroups[] = {shadowBGL_};
@@ -1821,6 +1827,7 @@ const rhi::Buffer& Simulation::PassBuffer(pass::Buf b) const {
     case B::ActVoxViz:           return world_->actVoxViz;
     case B::ShadowCache:         return world_->shadowCache;
     case B::ShadowReq:           return world_->shadowReq;
+    case B::ShadowHist:          return world_->shadowHist;
     case B::ShadowArgsStage:     return world_->shadowArgsStage;
     case B::ShadowArgs:          return world_->shadowArgs;
     case B::Openness:            return world_->openness;

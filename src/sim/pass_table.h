@@ -153,6 +153,11 @@ enum class Buf : uint8_t {
   // ShadowArgs is indirect-only and never bound, like DispatchArgs.
   ShadowCache,
   ShadowReq,
+  // The penumbra window (world.h kShadowHistBytes). Read AND written by the
+  // resolve pass and by nothing else, so it generates no cross-stage hazard —
+  // it is on the table for the reason WorldMap is: a buffer the table does not
+  // know about is the failure mode this file exists to make impossible.
+  ShadowHist,
   ShadowArgsStage,
   ShadowArgs,
   // ---- the openness (sky-visibility) grid (world.h kOpenFaces) ----

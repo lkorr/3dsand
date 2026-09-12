@@ -117,6 +117,11 @@ void World::Init(const rhi::Device& device) {
   // count and the overflow after a frame. Diagnostics, never the frame path.
   shadowReq = CreateBuffer(device, kShadowReqBytes,
                            U::Storage | U::CopySrc | U::CopyDst, "shadowReq");
+  // The penumbra window (world.h kShadowHistBytes). A zero word is exactly
+  // "nothing sampled yet", which is the state a freshly claimed slot is reset
+  // to anyway, so the zero-initialized allocation IS the correct cold state.
+  shadowHist = CreateBuffer(device, kShadowHistBytes, U::Storage | U::CopyDst,
+                            "shadowHist");
   // RENDER_STATS counters (world.h kRenderStat*). CopySrc for the telemetry
   // readback; CopyDst so a reset path can zero it, though nothing needs to —
   // the CPU differences consecutive reads.

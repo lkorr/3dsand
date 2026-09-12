@@ -2308,10 +2308,18 @@ Status GateShadowCache(Ctx& c, std::string& detail) {
   // and the cache's flicker is only meaningful against that floor.
   std::vector<uint8_t> refPx, refPrevPx, cachePx, cachePrevPx, noShadowPx;
   uint32_t reqStats[4] = {0, 0, 0, 0};
-  // SANDVOX_SHADOW_GATE_FRAMES overrides the cache arm's warm-up length (4):
-  // a flicker that vanishes at 12 frames was convergence, one that persists is
+  // SANDVOX_SHADOW_GATE_FRAMES overrides the cache arm's warm-up length: a
+  // flicker that vanishes at more frames was convergence, one that persists is
   // steady-state contention, and that distinction is one run, not a debate.
-  uint32_t cacheFrames = 4;
+  //
+  // 20 RATHER THAN 4 SINCE THE PENUMBRA WINDOW (world.h kShadowHistBytes). A
+  // patch's published value is now the mean of its last kShadowSamples = 16
+  // sun-visibility samples, so it is still FILLING for the first 16 frames it
+  // is on screen and legitimately moves between consecutive ones. Past 16 it is
+  // bit-stable in a static scene — the same slot is rewritten with the same bit
+  // — which is what keeps the flicker claim below meaningful rather than
+  // merely satisfied. Anything under 17 measures the fill, not the cache.
+  uint32_t cacheFrames = 20;
   if (const char* e = std::getenv("SANDVOX_SHADOW_GATE_FRAMES")) {
     const int v = std::atoi(e);
     if (v >= 2) cacheFrames = (uint32_t)v;
@@ -2440,7 +2448,11 @@ Status GateShadowCache(Ctx& c, std::string& detail) {
   if (walkOk) {
     Vec3 e; Camera cm;
     walkPose(0, e, cm);
-    for (uint32_t w = 0; w < 3; w++) renderOne(true, e, cm, nullptr);
+    // Long enough to FILL the penumbra window (kShadowSamples = 16), not just
+    // to resolve once: a patch three frames old is publishing the mean of three
+    // samples, and the difference between that and its settled value is fill,
+    // not the motion error this arm is here to measure.
+    for (uint32_t w = 0; w < 18; w++) renderOne(true, e, cm, nullptr);
   }
   for (uint32_t f = 0; walkOk && f < kWalk; f++) {
     Vec3 e; Camera cm;

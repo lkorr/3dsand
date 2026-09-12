@@ -6309,6 +6309,33 @@ rays still never iterate MODELS, so no body shadows itself or another body and
 the per-fragment cost does not scale with the number of micro bodies. A coarse
 render-side occupancy proxy remains the stretch goal for body-on-body.
 
+**The smooth normal, and what a brick boundary means** (added 2026-09-11;
+`BODY_SMOOTH_N` in `microbody.wgsl`, `MicroBodyModelGpu::cutFaces`). The DDA's
+face normal is the last-stepped axis, so a rounded arm made of 8 mm skin voxels
+shaded as a staircase of six flat tones. The cure is `shadeViscous`'s: 26 taps
+of the occupancy field the brick already stores, weighted 1/|d|, mixed with the
+face normal at `BODY_SMOOTH_N` so a deliberately square limb keeps its edges.
+26 taps and not a 6-tap central difference, because on a binary field the latter
+can only quantise the normal to the 26 directions the staircase already had.
+
+That gradient has to decide what lies one cell OUTSIDE the brick, and there are
+two right answers. Past the SIDE of an arm is air, and assuming so is what
+rounds the silhouette. Past its END is the FOREARM, and assuming air there
+rounds the cap too — which put a hard light/dark ring at every shoulder, elbow,
+hip and knee, swinging with the joint as it animated while the two overlapping
+OBBs traded depth ties under the TAA jitter (owner report: "the conjoining seams
+of limb nodes pulse and flash"). The cases are locally identical — a solid
+boundary plane with unknown beyond — and shape does not separate them either:
+on chunky voxel art the flat side of an arm is as solid a boundary plane as its
+cap. What knows is the ART: every limb of a mob is one model of ONE prefab in
+one shared frame, so a joint is exactly a face another model is pressed against.
+`mob.cpp LimbCutFaces` measures that once at load (half the solid boundary cells
+covered is the line, so no stray voxel crosses it and no ordinary joint fails)
+and packs six bits onto the model record's spare word. The shader clamps the
+field across a cut face and treats every other face as air. A single-model
+prefab — an item, a debris chunk, a carved COW clone — gets 0 and the
+pre-2026-09-11 behaviour exactly.
+
 **Bounds and cost.** The per-fragment DDA is hard-capped at `3·maxDim + 4` steps
 (worst-case diagonal of the brick) with no data-dependent loop bound anywhere.
 The draw list is CPU-compacted, so the instance count IS the number of micro
@@ -6506,6 +6533,67 @@ position, with `occupancy`/`openness`/`opennessGen` widened to the vertex stage
 in `renderBGL_` — a burning ember in a cave no longer glows at full sky ambient.
 Particles, sprites and fluid still take that walk per VERTEX; the BODY path
 takes it once per cube (at the centre) and shades per FRAGMENT — see §9.z.
+
+### 9.s The penumbra window — the sun is not a point (added 2026-09-11; `shadow_resolve.wgsl`, `src/sim/world.h` `kShadowHistBytes`)
+
+**The defect.** One ray per patch answers a yes/no question, so the shadow cache
+could only publish "lit" or "shadowed at this blocker's lift". A shadow edge was
+therefore a hard step one patch wide however far away the blocker was, and
+walking the sun across the sky advanced that step one patch at a time — a shadow
+that visibly expands in jumps (owner report 2026-09-11). Subdivision does not
+fix it: a finer grid makes the step smaller, not softer.
+
+**The fix costs no extra rays.** The resolve pass jitters its ray inside a cone
+of half-angle `render.shadowSunAngle` and averages the last `kShadowSamples`
+= 16 verdicts, so a patch publishes the FRACTION of the solar disc it can see.
+The penumbra width then falls out of the geometry — a blocker `d` away spreads
+the cone over `2·d·tan(angle)`, so a kerb stays crisp and a canopy 10 m up
+softens over most of a metre.
+
+**`render.shadowSunAngle` is the ARTISTIC size of the sun, not the real one.**
+`dayNight.sunAngularRadius` (0.3°) is the star, and it drives the drawn disc and
+eclipse geometry; at 0.3° a canopy 10 m up softens over one voxel, which is
+physically right and reads as the hard edge this replaced. It ships at **1.0°**.
+0 restores the single-ray hard shadow exactly — the same value, the same code
+path, verified by the `shadow-cache` gate's agreement with the per-pixel
+reference tightening from 0.67 to 0.50 mean |dL| when the cone is switched off.
+
+**A sliding WINDOW, not an exponential blend, and that is the whole design.** An
+EMA over a cycling sample set never settles — it oscillates with the sequence's
+period forever, i.e. a shadow that pulses, which is the defect next door. A
+window over a FIXED 16-point sunflower sequence is exact after 16 frames and
+then stops moving entirely while the scene and the sun hold still, because the
+same slot is rewritten with the same bit. `--gate shadow-cache` measures
+**0 pixels moved** between two warmed frames, and its warm-up is 20 frames
+rather than 4 for exactly this reason: anything under 17 measures the fill.
+
+**Storage is one word per bucket in its own buffer** (`world.h kShadowHistBytes`,
+4 MiB): 16 sample bits, a 5-bit fill count, and the 8-bit lift. Its own buffer
+and not two more words on the cache slot, because the fragment shader probes a
+whole 8-way set on every lit pixel and that set is exactly one 64-byte cache
+line; widening the slot would put the hot path on two lines to carry state only
+the resolve pass touches. The reader is unchanged — it still reads one byte.
+
+**The lift is refreshed from ONE deterministic ray**, the undeflected one, on
+the frame a patch's window wraps (plus immediately on a fresh slot, so a newly
+visible patch never spends a frame at the reset value of contact black). There
+are no spare bits for a second 16-sample window, and a fixed ray is what keeps
+the byte — and therefore the published value — bit-stable in a static scene.
+The two compose as `open + (1 − open)·lift`, which degenerates to the pre-cone
+value exactly when every sample agrees.
+
+**A window belongs to a PATCH, not to a slot.** The slot's `valid` bit is the
+only signal that distinguishes "my samples" from "the samples of whatever patch
+held this slot before me"; nothing but the resolve pass sets it, so `!valid` is
+exactly "claimed since the last publish" and the window resets. The write-back
+is unguarded (unlike the value publish) because a slot that changed hands
+self-corrects on the next frame's verifier mismatch.
+
+**What is NOT here.** Soft shadows on the raster body paths. `bodySunShadow`
+casts one ray per FRAGMENT with nowhere to accumulate, so a limb still takes a
+hard edge; the terrain under it does not. Per-fragment cone jitter would dither
+it at the cost of noise on a moving body, which is the artifact this pass exists
+to avoid — the honest fix is a body-side cache, and it is not written.
 
 ### 9.z Raster body shading parity (added 2026-09-04)
 

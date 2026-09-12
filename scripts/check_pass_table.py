@@ -181,6 +181,7 @@ BUF_TO_WGSL = {
     # shader should name it".
     "ShadowCache": {"shadowCache"},
     "ShadowReq": {"shadowReq"},
+    "ShadowHist": {"shadowHist"},
     "ShadowArgsStage": {"shadowArgs"},
     "ShadowArgs": set(),
     # ---- gas particles (docs/PLAN_gas_particles.md stage 1) ----
