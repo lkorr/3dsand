@@ -2939,6 +2939,34 @@ neighbors, so this needs an explicit connectivity pass:
   `SANDVOX_TERRAIN_BUILDS_PER_TICK` is the one-binary A/B arm.
 - Sleeping: settled bodies deactivate entirely until another body or force
   intersects their AABB (Jolt does this natively).
+- **NOTHING PASSES THROUGH THE GROUND (2026-09-12):** a collision patch is a
+  sheet of triangles with no thickness, so the only margin a body has is the
+  thinnest box in its own collider — 2-3 voxels for a ragdoll limb, against
+  17.8 voxels of travel in one 30 Hz tick at `player.maxFall`. Debris and limp
+  rigs were going through the floor, and the guarantee needs THREE things,
+  because each one covers a case the others cannot:
+  1. **Jolt CCD.** Every dynamic world body is created `LinearCast`, not the
+     default `Discrete` (which advances by v·dt and only then asks what it
+     overlaps). Jolt pays for the shape cast only when a step exceeds 0.75 ×
+     the collider's inner radius, so a settled or walking body costs what it
+     always did. `Physics::CreateDebrisBody`'s note has the arithmetic; the
+     `body-fastfall` gate pins it against a real `PolygonizeChunk` patch.
+  2. **Patches requested ALONG the velocity.** A cast can only hit a triangle
+     that exists, and the anchor box reaches about one chunk past a
+     human-sized body while a patch costs a chunk fetch plus a slot in
+     `kTerrainBuildsPerTick`. `ManageTerrain` now also asks for the chunks the
+     swept segment passes through, 0.35 s ahead and capped at four chunks,
+     each carrying its distance from the SAMPLE so the build order puts the
+     ground a body is falling onto ahead of the ground it has left.
+  3. **A body may not enter space no collider describes.** The Jolt twin of
+     `Player::KnownDrop`: `DebrisSystem::UntunnelBody` puts a body that ended
+     its step in a chunk with no built patch back at the last vouched point on
+     the segment, keeping both velocities so it resumes the moment the patch
+     lands. A CLAMP, NOT A VETO — a body already out there is let through, and
+     one held for `kUntunnelHoldTicks` is released with a report, because the
+     deadlock at exactly the speed the fix exists for is what the player's
+     first blind-fall attempt hit. This is the "park a body whose chunks are
+     not cached yet" the `debris` gate's buried-ejecta finding asked for.
 
 ### Carving living bodies (2026-08-20; `game/mob.cpp`, `MobSystem::CarveLimb*`)
 
@@ -4390,7 +4418,39 @@ levitating upright. The player's capsule is a passenger throughout
 (`PlayerAvatar::RagdollFollow`): `main.cpp` skips `Player::Update`, rides the
 pelvis while limp, and sits on the get-up's standing spot so the controller
 resumes exactly where the animation ends. That is also why a body thrown by a
-blast takes no fall damage on landing — the controller never saw the fall.
+blast takes no fall damage on landing from the CONTROLLER — the controller
+never saw the fall.
+
+**A limp body still hits the ground (2026-09-12).** That last sentence used to
+be the whole story, and it made a long fall SAFER than a short one: fall 2.9 s
+and the sweep splatters you, fall 3.1 s and `ragdoll.fallSeconds` flips you limp
+first and you land for nothing. The missing measurement is the same one
+`Player::impactDeltaV` is — A SUDDEN DECELERATION — taken where it still exists,
+off the solver rather than off a sweep: `Mob::TickRagdollArrest` differences the
+rig's mass-weighted centre-of-mass velocity tick over tick, subtracts the gravity
+step so free flight reads as zero, and keeps only change that OPPOSES the travel,
+so neither gravity nor a blast (which SETS the velocity) can be read as a
+landing. `PlayerAvatar::PreTick`'s limp branch hands it to the same
+`ApplyFallDamage` and the same `player.fallDamageSpeed` / `fallSplatSpeed`
+thresholds the driven branch uses. Three things about it are not obvious and all
+three were found by measurement, not design:
+- **A rig does not stop in one tick.** The player's AABB sweep refuses the whole
+  velocity in the frame it meets the floor; a ragdoll meets it with its feet and
+  the deceleration reaches the other fourteen bodies through the joints. A
+  33 m/s landing showed 11 m/s in its worst single tick and the avatar walked
+  away from what should have been a splat. So the arrest is summed over a RUN of
+  consecutive braking ticks (≤ `kArrestRunTicks`, each above a floor that
+  `debrisLinearDamping` cannot reach) rather than peak-held per tick.
+- **A body cannot lose more than it arrived with.** Unbounded, the run goes on
+  billing while the rig FOLDS — gravity presses it into the floor for as long as
+  the joints take to collapse and the floor goes on refusing it, so a 15.0 m/s
+  landing summed to 21.2 m/s. The run is clamped to the speed the rig had on the
+  last tick nothing was touching it, which is exact and has no tuning in it.
+- **One landing, one bill.** A rig hits the floor twice (legs, then torso): two
+  events of 14.8 and 15.0 m/s were billed separately for three times what the
+  same speed costs a walking player. The peak is HELD until the rig has stopped
+  braking for `kArrestSettleTicks` and handed over once.
+NPCs are deliberately unchanged — they have no fall-damage path of their own.
 
 Every number is CPU-only float in the `ragdoll` tuning group (F5, no shader,
 no rebaseline). Gate `ragdoll`: the X-detonate charge 6 voxels from a dummy
@@ -4398,7 +4458,12 @@ knocks it limp and moves its pelvis within a `tests/baseline.json` band in
 1.5 s; it is back on its feet within `ragdollGetUpMaxTicks` with every limb
 still its own and no body adopted by `DebrisSystem`; and a dummy spawned 2.2 m
 up descends under gravity, goes limp past a fixture-short `fallSeconds`, and
-stands up on the ground.
+stands up on the ground. Gate `ragdoll-falldamage` is the avatar half and is
+THREE arms on purpose: a 15 m/s limp landing costs health and is survived, one
+above `fallSplatSpeed` kills, and 0.4 s of upward flight at the same speed costs
+nothing — the last is what fails if the deceleration test, the cap, the
+settle-hold or the `SetLimbVelocities` reseed goes, and a fix that killed the
+player for being in the air would be worse than the bug.
 
 **One open finding the gate prints and asserts nothing on (2026-09-11).** On
 the tick the burning avatar DIES, one of its own limbs can be on

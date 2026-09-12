@@ -92,7 +92,14 @@ class DebrisSystem {
 
   // Mob limbs need marching-cubes terrain too: register extra positions for
   // this tick's ManageTerrain sweep (call before PreTick; cleared after).
-  void AddTerrainAnchor(Vec3 posVoxel, float radiusVoxels);
+  //
+  // `velVoxPerSec` is optional and is the difference between a creature
+  // standing and a creature falling: a patch takes a chunk fetch plus a slot
+  // in the per-tick build budget to appear, so a body moving fast has to ask
+  // for the ground it is ABOUT to reach, not the ground it is standing on.
+  // See the lookahead sweep in ManageTerrain.
+  void AddTerrainAnchor(Vec3 posVoxel, float radiusVoxels,
+                        Vec3 velVoxPerSec = Vec3{});
 
   // Take ownership of an existing physics body (severed limb, ragdoll piece):
   // it becomes ordinary debris — culling, despawn, terrain upkeep. Any joints
@@ -371,6 +378,61 @@ class DebrisSystem {
       else empty++;
     }
   }
+
+  // ---- A BODY MAY NOT ENTER SPACE NO COLLIDER DESCRIBES -------------------
+  //
+  // The Jolt twin of Player::KnownDrop (game/player.cpp), and the other half
+  // of the anti-tunnelling guarantee that Physics' LinearCast motion quality
+  // starts (see the note above Physics::CreateDebrisBody). A shape cast can
+  // only hit a triangle that EXISTS, and the patch under a body is built by
+  // ManageTerrain some ticks after something asks for it: a chunk fetch has to
+  // land first, then a slot in kTerrainBuildsPerTick. A body that outruns that
+  // arrives in a chunk with no mesh in it at all, passes clean through
+  // whatever the voxels say is there, and ends the step further ahead of the
+  // patches than it started -- the fall feeds itself, exactly the way the
+  // player's blind fall did before 378972e.
+  //
+  // `prevPosVoxel` is where the body was BEFORE Physics::Step, which both
+  // callers already hold (Body::xf and MobLimb::xf are overwritten only after
+  // this has run). If the step ENDED in an unvouched chunk the body is put
+  // back at the last point along the segment that was vouched, keeping both
+  // velocities so it resumes at its real speed the moment the patch lands.
+  // The position tested is the body ORIGIN, so the test carries up to a
+  // body's-worth of slop -- which is the right scale, because this exists for
+  // errors measured in chunks and LinearCast owns the ones measured in voxels.
+  //
+  // IT IS A CLAMP, NOT A VETO, in two ways, and both matter:
+  //   - a body ALREADY in unvouched space is let through, or anything that
+  //     spawned out there (or whose patch was evicted under it) would be
+  //     pinned where it stands forever;
+  //   - a body held for kUntunnelHoldTicks consecutive steps is released with
+  //     a report, so no amount of streaming starvation can leave something
+  //     hovering in mid-air indefinitely.
+  //
+  // Returns true if the body was moved.
+  bool UntunnelBody(uint64_t handle, const Vec3& prevPosVoxel);
+
+  // Does this world chunk have a collision representation right now? A built
+  // patch vouches for it whether or not it produced triangles (a chunk of
+  // nothing but air, or nothing but solid, polygonizes EMPTY and is still a
+  // complete answer). So does being outside the residency window: there is no
+  // sim and no body out there, and a body that reaches it despawns.
+  bool ColliderVouched(IVec3 worldChunk) const;
+
+  // ---- why a body stopped in mid-air, or did not (CLAUDE.md rule 6) -------
+  // A clamp that fires is not a bug and a clamp that releases IS one, so the
+  // two are counted apart; `lastChunk` names the chunk with no patch in it,
+  // which is the only thing that turns "a body hung in the air" into a cause.
+  struct UntunnelProbe {
+    uint32_t holds = 0;        // steps a body was put back at the boundary
+    uint32_t bodiesHeld = 0;   // distinct bodies that have ever been held
+    uint32_t released = 0;     // held past kUntunnelHoldTicks and let through
+    float maxStepVox = 0.0f;   // longest single step this ever caught, voxels
+    IVec3 lastChunk{};         // ...and the unvouched chunk it was entering
+  };
+  const UntunnelProbe& Untunnel() const { return untunnel_; }
+  void ResetUntunnelProbe() { untunnel_ = UntunnelProbe{}; }
+
   bool BodyActive(uint32_t i) const;
   uint32_t PendingEvents() const { return (uint32_t)events_.size(); }
   uint32_t SettledBack() const { return settledBack_; }
@@ -804,7 +866,12 @@ class DebrisSystem {
   std::vector<std::pair<IVec3, float>> terrainNeed_;  // ManageTerrain scratch
   std::vector<uint8_t> scanSolid_;
   std::vector<int32_t> scanLabel_;
-  std::vector<std::pair<Vec3, float>> extraAnchors_;    // mob limbs, this tick
+  struct Anchor {
+    Vec3 pos;
+    float radius = 0.0f;
+    Vec3 vel{};  // voxels/s, for the lookahead sweep (may be zero)
+  };
+  std::vector<Anchor> extraAnchors_;                    // mob limbs, this tick
   std::unordered_map<uint64_t, TerrainEntry> terrain_;  // packed world chunk key
   uint32_t lastTerrainTick_ = 0;  // the sweep TerrainCensus reports on
   uint32_t lastCellWriteTick_ = 0;
@@ -813,6 +880,11 @@ class DebrisSystem {
   uint32_t settledBack_ = 0;
   SettleProbe settle_{};
   FloaterProbe floaters_{};
+  UntunnelProbe untunnel_{};
+  // Consecutive steps each body has been held at a collider boundary. Only
+  // bodies actually being held have an entry (erased the step they stop being
+  // held), so this is empty in every ordinary frame.
+  std::unordered_map<uint64_t, uint8_t> untunnelHold_;
   // Drained by main.cpp each frame; bounded by the same per-tick body budget
   // that bounds island creation, so this cannot grow without limit.
   std::vector<BreakEvent> breaks_;

@@ -21,6 +21,26 @@ class JobSystemThreadPool;
 class BodyInterface;
 }  // namespace JPH
 
+// ---- THE ANTI-TUNNEL A/B ARM, IN ONE BINARY --------------------------------
+//
+// "Nothing passes through the ground" is three mechanisms that landed together
+// (DESIGN.md, and the notes above Physics::CreateDebrisBody and
+// DebrisSystem::UntunnelBody), and all three change where a rigid body ends up
+// — so the next unexplained body-settling number is going to want to ask
+// "was it this?". A differential measured across two BUILDS measures the
+// builds too (CLAUDE.md), so it is an environment variable, exactly as
+// SANDVOX_TERRAIN_BUILDS_PER_TICK is for the patch budget:
+//
+//   SANDVOX_NO_ANTITUNNEL=1          all three off (Jolt's Discrete default,
+//                                    no lookahead, no clamp) = pre-2026-09-12
+//   SANDVOX_NO_ANTITUNNEL=ccd        Discrete motion quality only
+//   SANDVOX_NO_ANTITUNNEL=lookahead  ManageTerrain stops asking ahead
+//   SANDVOX_NO_ANTITUNNEL=clamp      UntunnelBody becomes a no-op
+//
+// Read once and cached; unset (the normal case) costs one predictable branch.
+enum class AntiTunnel { Ccd, Lookahead, Clamp };
+bool AntiTunnelOff(AntiTunnel part);
+
 struct BodyTransform {
   Vec3 pos;        // voxel units (body center of mass)
   float quat[4];   // x, y, z, w
@@ -201,6 +221,12 @@ class Physics {
   void MoveKinematicBody(uint64_t handle, Vec3 posVoxel, const float quat[4],
                          float dt);
   void SetBodyVelocity(uint64_t handle, Vec3 velVoxelsPerSec);
+
+  // Teleport a body, keeping its rotation and both velocities. A TELEPORT
+  // SKIPS COLLISION, so this is not a way to move anything: the one caller is
+  // DebrisSystem::UntunnelBody, which is undoing a step that ended somewhere
+  // no collider could have stopped it. Returns false if the handle is dead.
+  bool SetBodyPosition(uint64_t handle, Vec3 posVoxel);
 
   // Move a body onto (or off) the PLAYER-AVATAR collision layer. Bodies there
   // behave exactly like normal dynamic bodies except that they never generate

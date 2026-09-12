@@ -3919,8 +3919,23 @@ void Mob::RegisterTerrainAnchor() {
     if (pr != nullptr && pr->movement.mobile)
       r = std::max(r, pr->movement.navRadius + 4.0f);
   }
+  // A BODY IN FLIGHT ASKS FOR THE GROUND AHEAD OF IT. The anchor's box reaches
+  // about one chunk past a human, and a patch costs a chunk fetch plus a slot
+  // in ManageTerrain's build budget — a ragdoll seconds into a fall crosses
+  // that margin faster than a patch can appear, which is half of why a limp
+  // body used to pass through the floor (DebrisSystem::UntunnelBody is the
+  // other half). Only a LIMP rig has a velocity worth reading: a walking
+  // creature is driven kinematically at a few voxels a second and the plain
+  // anchor has always covered it.
+  Vec3 vel{};
+  const int rl = def_->rootLimb;
+  if (ragdoll_ == RagdollPhase::Limp && phys_ != nullptr && rl >= 0 &&
+      rl < (int)limbs_.size() && limbs_[rl].body) {
+    Vec3 ang{};
+    phys_->GetBodyVelocities(limbs_[rl].body, vel, ang);
+  }
   debris_->AddTerrainAnchor(
-      origin_ + Vec3{ws.x * 0.5f, ws.y * 0.5f, ws.z * 0.5f}, r);
+      origin_ + Vec3{ws.x * 0.5f, ws.y * 0.5f, ws.z * 0.5f}, r, vel);
 }
 
 void Mob::SubmitPose(float dt, bool writeXf) {
@@ -4098,6 +4113,13 @@ void Mob::StartRagdoll(float minSeconds, const char* why) {
   ragdollT_ = 0.0f;
   ragdollMinT_ = std::max(minSeconds, 0.0f);
   ragdollStillT_ = 0.0f;
+  // The arrest has nothing to difference against yet, and whatever is left in
+  // it belongs to a previous ragdoll. The limp's first tick seeds the reference.
+  ragdollVelValid_ = false;
+  ragdollImpact_ = Vec3{};
+  ragdollArrestRun_ = Vec3{};
+  ragdollArrestTicks_ = 0;
+  ragdollArrestQuiet_ = 0;
   getUpFrom_.clear();
   std::printf("mob %llu ragdoll: limp (%s, %d limbs, %.1f kg)\n",
               (unsigned long long)id_, why ? why : "", flipped, BodyMassKg());
@@ -4117,6 +4139,15 @@ void Mob::SetLimbVelocities(Vec3 velVoxPerSec) {
   if (!phys_) return;
   for (MobLimb& l : limbs_)
     if (l.body && l.holdSeconds <= 0) phys_->SetBodyVelocity(l.body, velVoxPerSec);
+  // A velocity SET is not a velocity LOST. Reseed the arrest reference so the
+  // next limp tick differences against what the rig was just given, or a flip
+  // into freefall (which hands the whole rig the player's downward velocity)
+  // would read as a landing of exactly that speed on the following tick.
+  ragdollLastVel_ = velVoxPerSec;
+  ragdollVelValid_ = true;
+  ragdollArrestRun_ = Vec3{};
+  ragdollArrestTicks_ = 0;
+  ragdollArrestQuiet_ = 0;
 }
 
 bool Mob::BlastRadial(Vec3 centerWorldVoxel, float radiusVoxels,
@@ -4305,6 +4336,13 @@ bool Mob::BlastRadial(Vec3 centerWorldVoxel, float radiusVoxels,
     phys_->SetBodyVelocities(l.body, sum, spin);
   }
   ragdollStillT_ = 0.0f;
+  // Per-limb SetBodyVelocities, so there is no single value to reseed the
+  // arrest reference with: skip one tick instead. A launch is not an impact and
+  // the tick it happens on has no arrest worth measuring (TakeRagdollImpact).
+  ragdollVelValid_ = false;
+  ragdollArrestRun_ = Vec3{};
+  ragdollArrestTicks_ = 0;
+  ragdollArrestQuiet_ = 0;
   std::printf("mob %llu ragdoll: blast launch %.1f m/s (impulse %.0f, mass %.1f kg, "
               "falloff %.2f, spin %.1f rad/s about (%.2f, %.2f, %.2f))\n",
               (unsigned long long)id_, speedMs, impulseKgMs, mass, falloff,
@@ -4321,6 +4359,7 @@ void Mob::TickRagdollLimp(World& world, float dt) {
   if (rl >= 0 && rl < (int)limbs_.size() && limbs_[rl].body) {
     Vec3 lin{}, ang{};
     if (phys_->GetBodyVelocities(limbs_[rl].body, lin, ang)) speedVox = lin.len();
+    TickRagdollArrest(dt);
     // Keep the walk anchor under the body while it flies: the window
     // despawn, the AI's actor list and every "where is this creature"
     // reader look at origin_. Approximate — the exact solve is BeginGetUp's.
@@ -4339,6 +4378,103 @@ void Mob::TickRagdollLimp(World& world, float dt) {
   const bool overdue =
       ragdollT_ >= rg.maxSeconds && speedVox < MetresToCells(2.0f);
   if (ragdollT_ >= ragdollMinT_ && (settled || overdue)) BeginGetUp(world);
+}
+
+// ---- THE ARREST: what a limp landing cost (Mob::TakeRagdollImpact) ----------
+//
+// A RIG DOES NOT STOP IN ONE TICK, and that is the whole difference from
+// Player::impactDeltaV. The player's controller is one AABB: the sweep refuses
+// the entire velocity in the frame it meets the floor, so "the largest single
+// arrest" is the impact. A ragdoll meets the floor with its feet, and the
+// deceleration reaches the rest of the 15-body chain through the joints over
+// two or three ticks — measured, a 33 m/s landing showed 11 m/s in its worst
+// single tick and the avatar walked away from what should have been a splat.
+//
+// So the arrest is summed over a RUN of consecutive braking ticks, and the peak
+// RUN is held rather than the peak tick. Two bounds are what keep that from
+// being an accumulator that kills a body for falling:
+//
+//   - a tick only opens or extends a run if it braked by more than
+//     `kArrestTickFloorVox`. Free flight is not silent: Jolt applies
+//     physics.debrisLinearDamping every step, which at 33 m/s takes about
+//     0.6 vox/s off per tick, and the gravity term below leaves a small
+//     residual of its own. The floor is ~17x the first and well clear of the
+//     second, and nothing else removes speed from a body in the air.
+//   - a run is at most `kArrestRunTicks` long, because an impact is SHORT. A
+//     body grinding down a slope brakes for as long as it likes and may not
+//     add it all up.
+//
+// Measured on the rig's mass-weighted centre-of-mass velocity, not on the
+// pelvis: individual limbs ring against their joint limits for several ticks
+// after a landing and the COM does not, so this is both the physically honest
+// signal and the quiet one.
+namespace {
+constexpr float kArrestTickFloorVox = 10.0f;  // 1 m/s lost in one tick
+constexpr uint8_t kArrestRunTicks = 4;        // 0.13 s at 30 Hz
+}  // namespace
+
+void Mob::TickRagdollArrest(float dt) {
+  // The rig's centre-of-mass velocity. Held limbs are excluded for the same
+  // reason every other ragdoll path excludes them: a severed piece mid-hold is
+  // kinematic and is not part of this body's momentum any more.
+  Vec3 mom{};
+  float massSum = 0.0f;
+  for (const MobLimb& l : limbs_) {
+    if (!l.body || l.holdSeconds > 0) continue;
+    Vec3 lv{}, la{};
+    if (!phys_->GetBodyVelocities(l.body, lv, la)) continue;
+    const float m = std::max(phys_->BodyMass(l.body), 1e-3f);
+    mom += lv * m;
+    massSum += m;
+  }
+  if (massSum <= 0.0f) return;
+  const Vec3 vel = mom * (1.0f / massSum);
+
+  if (ragdollVelValid_) {
+    // Where the rig WOULD be going if nothing had touched it. Subtracting the
+    // gravity step is what makes a free fall read as zero braking instead of as
+    // a steady trickle of it in the only direction that matters.
+    const float gDtVox = MetresToCells(CurrentTuning().physics.gravity) * dt;
+    const Vec3 expected = ragdollLastVel_ + Vec3{0.0f, -gDtVox, 0.0f};
+    const Vec3 lost = expected - vel;
+    // Velocity taken away ALONG the travel is braking; velocity added along it,
+    // or turned sideways, is not.
+    const bool braking = lost.dot(ragdollLastVel_) > 0.0f &&
+                         lost.len() > kArrestTickFloorVox;
+    if (braking) {
+      ragdollArrestQuiet_ = 0;
+      // An impact is SHORT. A run that has run its length while the body is
+      // still braking closes and a fresh one opens against the speed that is
+      // left, so a body grinding down a slope never adds the whole grind up.
+      if (ragdollArrestTicks_ >= kArrestRunTicks) {
+        ragdollArrestRun_ = Vec3{};
+        ragdollArrestTicks_ = 0;
+      }
+      // A BODY CANNOT LOSE MORE THAN IT ARRIVED WITH, and it needs saying
+      // because the run does not stop at the impact — it goes on billing while
+      // the rig FOLDS. Gravity presses the body into the floor for as long as
+      // the joints take to collapse and the floor goes on refusing it, so a
+      // 15.0 m/s landing summed to 21.2 (130 hp of 322 instead of 37) and a
+      // blast launch was about to start splattering people. The cap is exact
+      // and has no tuning in it: the speed the rig had on the last tick
+      // nothing was touching it is, by definition, the most a floor can take
+      // away from it.
+      if (ragdollArrestTicks_ == 0) ragdollArrestCap_ = ragdollLastVel_.len();
+      ragdollArrestRun_ += lost;
+      ragdollArrestTicks_++;
+      Vec3 run = ragdollArrestRun_;
+      const float runLen = run.len();
+      if (runLen > ragdollArrestCap_ && runLen > 1e-4f)
+        run = run * (ragdollArrestCap_ / runLen);
+      if (run.len() > ragdollImpact_.len()) ragdollImpact_ = run;
+    } else {
+      ragdollArrestRun_ = Vec3{};
+      ragdollArrestTicks_ = 0;
+      if (ragdollArrestQuiet_ < 255) ragdollArrestQuiet_++;
+    }
+  }
+  ragdollLastVel_ = vel;
+  ragdollVelValid_ = true;
 }
 
 void Mob::BeginGetUp(World& world) {
@@ -4879,8 +5015,19 @@ float MobSystem::BurnHealthCap(uint64_t mobId) const {
 }
 
 void Mob::PostStep() {
-  for (MobLimb& limb : limbs_)
-    if (limb.body) phys_->GetTransform(limb.body, limb.xf);
+  // A LIMP RIG IS THE ONLY THING HERE JOLT DRIVES. Every other state moves the
+  // limbs with MoveKinematicBody from the animated pose, so the anti-tunnel
+  // clamp would be arguing with the animation; a severed piece is DebrisSystem's
+  // by then and is clamped in its PostStep. limb.xf is still where the limb was
+  // when the step began, which is the segment UntunnelBody needs, so this runs
+  // BEFORE the read-back.
+  const bool limp = ragdoll_ == RagdollPhase::Limp;
+  for (MobLimb& limb : limbs_) {
+    if (!limb.body) continue;
+    if (limp && debris_ != nullptr && limb.holdSeconds <= 0)
+      debris_->UntunnelBody(limb.body, limb.xf.pos);
+    phys_->GetTransform(limb.body, limb.xf);
+  }
 }
 
 void MobSystem::PostStep() {

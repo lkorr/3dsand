@@ -22,6 +22,7 @@
 
 #include "audio/cues.h"
 #include "sim/materials.h"
+#include "sim/tuning.h"
 #include "test/selftest.h"
 #include "test/support.h"
 
@@ -42,6 +43,22 @@ namespace {
 // every resting face of every body on every step, and voicing those is a
 // machine gun. The speed gate lives in the contact listener, so this is the
 // only place it can be observed from.
+//
+// THE TABLE IS NOW ACTUALLY FLAT (2026-09-12), and that was never cosmetic.
+// It was a radius-6 SPHERE brush described in this comment as "a flat stone
+// table", which stopped mattering the day bodies got continuous collision.
+// With Jolt's Discrete default the block sank into the dome and was shoved
+// back out along a squared-up manifold normal, which read as a clean 6.4 m/s
+// landing and left it resting on the apex. With LinearCast the cast reports
+// the FIRST touch: a cube corner against a 56-degree facet, whose normal
+// component is 3.5 m/s of the same 6.3 m/s fall -- correct, since the rest of
+// that speed became sliding -- and the block then slid off the dome and landed
+// on the hillside 13 ticks into what this gate was calling its quiet window.
+// Neither assertion below was wrong; the fixture was, in the way `settle-back`
+// documents next door: A FIXTURE MUST NOT SUPPLY THE AWKWARD LANDING ITSELF.
+// The pad is exact CellOps now, and the landing-energy check is a floor
+// derived from the drop height rather than "greater than zero", so a future
+// change that makes real impacts report quietly fails here instead of passing.
 Status GateAudioImpact(Ctx& c, std::string& detail) {
   GpuContext& ctx = c.ctx;
   World& world = c.world;
@@ -78,8 +95,23 @@ Status GateAudioImpact(Ctx& c, std::string& detail) {
   // Lay the slab and let the chunk readbacks catch up: DebrisSystem builds a
   // marching-cubes collision patch from the CACHED chunk, so a body dropped
   // before the cache has the slab falls straight through it.
-  for (int i = 0; i < 4; i++)
-    tick({{px, slabY, pz, 6, kMatStone, 1, 0, 0}});
+  {
+    std::vector<CellOp> pad;
+    for (int z = -6; z <= 6; z++)
+      for (int x = -6; x <= 6; x++)
+        for (int y = slabY - 3; y <= slabY; y++)
+          pad.push_back(
+              {World::SlotCellIndex({px + x, y, pz + z}), (uint32_t)kMatStone});
+    std::vector<ParticleSpawn> spawns;
+    debris.PreTick(t + 1, world, pad, spawns);   // appends to `pad`
+    ++t;
+    SubmitTick(ctx, world, sim, t, kDefaultSeed, {}, {}, pad, false,
+               {px / 16, slabY / 16, pz / 16}, true, false, spawns);
+    ctx.WaitIdle();
+    ctx.ProcessEvents();
+    phys.Step(kTickDt);
+    debris.PostStep();
+  }
   for (int i = 0; i < 24; i++) tick({});
 
   // The falling block: a 3x3x3 stone cube, created in Jolt and handed to the
@@ -119,8 +151,25 @@ Status GateAudioImpact(Ctx& c, std::string& detail) {
 
   // The quiet window. Everything reported from here on is a settling contact,
   // and there must be none of it.
+  //
+  // WHICH TICK, AND HOW HARD (CLAUDE.md rule 6). "1 during 150 settled ticks"
+  // is a bare count and it cannot tell the two failures apart: the tail of a
+  // landing arriving a tick late (the loop above breaks on the FIRST contact,
+  // which is not the same event as the body coming to rest) is a fixture that
+  // opened its window too early, and a contact at tick 90 of 150 is the
+  // resting-contact machine gun this gate exists for. They want opposite fixes.
   debris.ClearImpactEvents();
-  for (int i = 0; i < 150; i++) tick({});
+  std::string late;
+  size_t seen = 0;
+  for (int i = 0; i < 150; i++) {
+    tick({});
+    for (size_t k = seen; k < debris.ImpactEvents().size(); k++) {
+      const DebrisSystem::ImpactEvent& e = debris.ImpactEvents()[k];
+      late += Format("%s+%d tick, energy %.2f, y %.1f", late.empty() ? "" : "; ",
+                     i, e.energy, e.posVoxel.y);
+    }
+    seen = debris.ImpactEvents().size();
+  }
   const size_t afterSettle = debris.ImpactEvents().size();
 
   const bool fired = landed > 0;
@@ -129,9 +178,20 @@ Status GateAudioImpact(Ctx& c, std::string& detail) {
   // rather than to 0 (which would mean "we could not tell what was hit" and
   // would leave the cue silent in play).
   const bool matOk = fired && first.material == kMatStone;
-  // Energy in (0,1]: a 26-voxel fall is well past the gate but the mapping
-  // must still be a ramp and not a constant.
-  const bool energyOk = fired && first.energy > 0.0f && first.energy <= 1.0f;
+  // Energy in (0,1] AND LOUD ENOUGH FOR THE DROP. "> 0" could not tell a
+  // correct landing from one reported at half speed, which is exactly what a
+  // grazing contact looks like -- so the floor is derived from the fixture:
+  // free fall over (dropY - slabY) voxels, through the same ramp CollectImpacts
+  // applies, at 60% to leave room for the block's last partial step and for the
+  // tuning moving underneath. A cue that goes quiet fails here.
+  const auto& ta = CurrentTuning().audio;
+  const float wantMs = std::sqrt(2.0f * CurrentTuning().physics.gravity *
+                                 (float)(dropY - slabY) * kVoxelMeters);
+  const float full = std::max(ta.impactFullSpeed, ta.impactMinSpeed + 0.1f);
+  const float wantEnergy = std::clamp(
+      (wantMs - ta.impactMinSpeed) / (full - ta.impactMinSpeed), 0.0f, 1.0f);
+  const bool energyOk = fired && first.energy <= 1.0f &&
+                        first.energy >= 0.6f * wantEnergy;
   // Within a body-length of the slab surface, in the column we dropped into.
   const bool posOk = fired && std::abs(first.posVoxel.x - (float)px) < 10.0f &&
                      std::abs(first.posVoxel.z - (float)pz) < 10.0f &&
@@ -141,10 +201,13 @@ Status GateAudioImpact(Ctx& c, std::string& detail) {
 
   const bool ok = fired && matOk && energyOk && posOk && quietOk;
   detail = Format(
-      "%zu impact(s) on landing at tick %d (mat %u, energy %.2f, y %.1f vs "
-      "slab %d); %zu during 150 settled ticks",
-      landed, landTick, first.material, first.energy, first.posVoxel.y, slabY,
-      afterSettle);
+      "%zu impact(s) on landing at tick %d (mat %u, energy %.2f of the %.2f a "
+      "%.1f m/s drop implies (floor %.2f), y %.1f vs slab %d); %zu during 150 "
+      "settled ticks%s%s%s",
+      landed, landTick, first.material, first.energy, wantEnergy, wantMs,
+      0.6f * wantEnergy, first.posVoxel.y, slabY,
+      afterSettle, late.empty() ? "" : " [", late.c_str(),
+      late.empty() ? "" : "]");
   std::printf("audio impact: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
   return ok ? Status::Pass : Status::Fail;
 }

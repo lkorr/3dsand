@@ -5750,6 +5750,160 @@ Status GateRagdoll(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---- ragdoll-falldamage -------------------------------------------------
+//
+// A LIMP BODY STILL HITS THE GROUND — AND A LIMP BODY IN FLIGHT DOES NOT.
+//
+// Three arms over one fixture, and the SET is the claim. Impact damage is
+// billed off Player::impactDeltaV, which is velocity the CONTROLLER'S SWEEP
+// refused; a ragdoll has no controller (main.cpp teleports the capsule onto the
+// pelvis with its velocity zeroed every tick), so the sweep never refuses
+// anything and a limp landing used to be free. That made a long fall SAFER than
+// a short one: fall 2.9 s and the sweep splatters you, fall 3.1 s and
+// ragdoll.fallSeconds flips you limp first and you land for nothing.
+// Mob::TakeRagdollImpact is the same measurement taken off the solver instead.
+//
+// The other two arms are the ones that stop the fix being worse than the bug.
+// The signal is a velocity DIFFERENCE, and two things change a limp body's
+// velocity without anything hitting it: gravity, every tick, forever; and a
+// blast, which SETS it outright. Either read as an impact would kill the player
+// for being in the air. Deceleration-only + peak-hold + the reseed on
+// SetLimbVelocities are what prevent it, and arms (b) and (c) are what say so.
+//
+// A gate, not a `ragdoll` arm: that gate's arms inherit each other's tick phase
+// and two of them are knife-edge on it.
+Status GateRagdollFallDamage(Ctx& c, std::string& detail) {
+  GpuContext& ctx = c.ctx;
+  World& world = c.world;
+  Simulation& sim = c.sim;
+  DebrisSystem& debris = c.debris;
+  MobSystem& mobs = c.mobs;
+  Physics& phys = c.phys;
+  const auto& pt = CurrentTuning().player;
+
+  int relief = 0;
+  const IVec3 anchor = AiFixtureCentre(world);
+  const IVec3 spot = AiFlatSpot(anchor.x, anchor.z, 96, 16, kDefaultSeed, relief);
+  const int h = spot.y;
+  const IVec3 pchunk{spot.x >> 4, spot.y >> 4, spot.z >> 4};
+
+  // One run of the fixture: spawn the avatar `liftVox` above the flat spot,
+  // settle it, flip it limp, hand the whole rig `hitVox` of downward velocity
+  // and tick. Returns the health it lost and whether it survived.
+  struct Run {
+    int32_t before = 0, after = 0;
+    bool alive = false, landed = false;
+    float lowest = 0.0f;
+  };
+  auto run = [&](float liftVox, float hitVox, int ticks) {
+    mobs.Reset();
+    debris.Reset();
+    SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+    ctx.WaitIdle();
+    uint32_t tick = 12000;
+    PlayerAvatar avatar;
+    avatar.Init(&phys, &world, &debris, c.mats, &mobs);
+    avatar.SetDefs(&mobs.Defs(), kAvatarDefName);
+    Player pl;
+    pl.fly = false;
+    pl.grounded = true;
+    pl.pos = Vec3{(float)spot.x + 0.5f, (float)(h + 2) + Player::kHalfY + liftVox,
+                  (float)spot.z + 0.5f};
+    Run r;
+    if (!avatar.Spawn(pl, 0.0f)) return r;
+    const uint64_t proxy = phys.CreatePlayerBody(Player::kHalfXZ, Player::kHalfY);
+    auto avTick = [&]() {
+      std::vector<BrushOp> ops;
+      std::vector<ParticleSpawn> spawns;
+      std::vector<CellOp> cellOps;
+      phys.MovePlayerBody(proxy, pl.pos, kTickDt);
+      avatar.PreTick(tick + 1, pl, 0.0f, kTickDt, world, ops, cellOps, spawns);
+      debris.QueueSupportEvents(world.Snap());
+      debris.PreTick(tick + 1, world, cellOps, spawns);
+      ++tick;
+      SubmitTick(ctx, world, sim, tick, kDefaultSeed, ops, {}, cellOps, false,
+                 pchunk, true, true, spawns);
+      ctx.WaitIdle();
+      ctx.ProcessEvents();
+      phys.Step(kTickDt);
+      debris.PostStep();
+      avatar.PostStep();
+      Vec3 follow;
+      if (avatar.RagdollFollow(follow)) pl.pos = follow;
+    };
+    // Standing still long enough for the feet to plant and, at lift > 0, for
+    // the collision patches around the body to exist: an arm about what a
+    // LANDING costs must not be measuring a streaming stutter.
+    for (int i = 0; i < 40; i++) avTick();
+    r.before = avatar.TotalHealth();
+    avatar.StartRagdoll(2.0f, "gate");
+    avatar.SetLimbVelocities(Vec3{0, -hitVox, 0});
+    r.lowest = 1e30f;
+    for (int i = 0; i < ticks && avatar.IsAlive(); i++) {
+      avTick();
+      r.lowest = std::min(r.lowest, avatar.RootWorldPos().y);
+    }
+    r.after = avatar.TotalHealth();
+    r.alive = avatar.IsAlive();
+    // The body is ON the ground, not through it. Generous: the pelvis sits
+    // about a metre up a standing rig and this is about tunnelling, not pose.
+    r.landed = r.lowest > (float)h - 8.0f;
+    avatar.Despawn();
+    phys.RemoveBody(proxy);
+    return r;
+  };
+
+  // (a) A SUB-LETHAL LANDING COSTS HEALTH. 15 m/s is comfortably over
+  //     fallDamageSpeed (8) and under fallSplatSpeed (25), so the assertion is
+  //     "hurt, not killed" — a threshold that moved either way would show.
+  const float subVox = 15.0f / kVoxelMeters;
+  const Run sub = run(0.0f, subVox, 40);
+  const bool subOk = sub.before > 0 && sub.after < sub.before && sub.alive &&
+                     sub.landed;
+  std::printf("  ragdoll fall damage: %s (limp landing at 15.0 m/s cost %d of "
+              "%d hp, alive %d, pelvis never below y=%.1f vs ground %d)\n",
+              subOk ? "PASS" : "FAIL", sub.before - sub.after, sub.before,
+              (int)sub.alive, sub.lowest, h);
+
+  // (b) A LETHAL ONE KILLS. Above fallSplatSpeed, which is the branch that
+  //     carves the body apart rather than spending health.
+  const float lethalVox = (pt.fallSplatSpeed + 8.0f) / kVoxelMeters;
+  const Run lethal = run(0.0f, lethalVox, 40);
+  const bool lethalOk = !lethal.alive && lethal.landed;
+  std::printf("  ragdoll splat: %s (limp landing at %.1f m/s vs splat speed "
+              "%.1f: alive %d, pelvis never below y=%.1f vs ground %d)\n",
+              lethalOk ? "PASS" : "FAIL", lethalVox * kVoxelMeters,
+              pt.fallSplatSpeed, (int)lethal.alive, lethal.lowest, h);
+
+  // (c) FLIGHT IS FREE. The same lethal velocity, but aimed UP from 24 voxels
+  //     off the ground and sampled only while the body is still rising: no
+  //     contact, so gravity is the only thing changing the velocity and the
+  //     arrest must read nothing. This is the arm that fails if the
+  //     deceleration test, the peak-hold or the SetLimbVelocities reseed goes.
+  //     12 ticks is 0.4 s — the body is still above where it started.
+  const Run flight = run(24.0f, -lethalVox, 12);
+  const bool flightOk = flight.before > 0 && flight.after == flight.before &&
+                        flight.alive;
+  std::printf("  ragdoll flight free: %s (launched UP at %.1f m/s, 12 ticks "
+              "with nothing touched: %d of %d hp left, alive %d)\n",
+              flightOk ? "PASS" : "FAIL", lethalVox * kVoxelMeters,
+              flight.after, flight.before, (int)flight.alive);
+
+  const bool ok = subOk && lethalOk && flightOk;
+  detail = Format(
+      "sub-lethal 15 m/s: -%d of %d hp alive %d; splat %.0f m/s: alive %d; "
+      "0.4 s of upward flight at %.0f m/s: -%d hp; fixture (%d,%d,%d) relief %d",
+      sub.before - sub.after, sub.before, (int)sub.alive,
+      lethalVox * kVoxelMeters, (int)lethal.alive, lethalVox * kVoxelMeters,
+      flight.before - flight.after, spot.x, h, spot.z, relief);
+  mobs.Reset();
+  debris.Reset();
+  SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+  ctx.WaitIdle();
+  std::printf("ragdoll falldamage: %s\n", ok ? "PASS" : "FAIL");
+  return ok ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& MobGates() {
@@ -5779,6 +5933,10 @@ const std::vector<Gate>& MobGates() {
       {"ai-slope", "mob", {}, false, GateAiSlope, /*needsRender=*/false},
       // Live ragdoll: blast knockdown, get-up, NPC gravity. Counts only.
       {"ragdoll", "mob", {}, false, GateRagdoll, /*needsRender=*/false},
+      // ...and what a limp landing COSTS. Its own gate rather than another
+      // `ragdoll` arm: that gate's arms inherit each other's tick phase.
+      {"ragdoll-falldamage", "mob", {}, false, GateRagdollFallDamage,
+       /*needsRender=*/false},
   };
   return g;
 }

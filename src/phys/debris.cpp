@@ -1,6 +1,7 @@
 #include "phys/debris.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
@@ -58,6 +59,27 @@ static uint32_t TerrainBuildsPerTick() {
   }();
   return v;
 }
+// ---- ANTI-TUNNELLING (DebrisSystem::UntunnelBody) ---------------------------
+// How far ahead along its own velocity a body asks for collision patches, and
+// the ceiling on that. 0.35 s is 21 ticks at 60 Hz, which comfortably covers a
+// chunk fetch plus a slot in kTerrainBuildsPerTick; the 64-voxel cap (four
+// chunks) is what keeps a body at Jolt's 500 m/s from asking for a corridor
+// across the whole window. The samples are the chunks the swept segment passes
+// through and nothing else -- a box around each would multiply the fetch
+// budget by the lookahead, and the ground a falling body needs is directly
+// under it.
+constexpr float kTerrainLookaheadSeconds = 0.35f;
+constexpr float kTerrainLookaheadVox = 64.0f;
+// Consecutive steps a body may be held at a collider boundary before it is let
+// through anyway. Half a second at 60 Hz: long enough that the patch normally
+// lands first, short enough that a starved readback reads as a stutter rather
+// than as a body frozen in the sky.
+constexpr uint8_t kUntunnelHoldTicks = 30;
+// Samples along the step when looking for where a body left vouched space.
+// A 60 Hz step at Jolt's velocity ceiling is 83 voxels, so this resolves every
+// reachable step to better than 1.5 voxels.
+constexpr int kUntunnelSamples = 64;
+
 // Support-loss events: a chunk re-flags constantly while sand pours or fire
 // burns, so rescans are rate-limited per chunk. The final flags after activity
 // stops always land (pendingSupport_ is never dropped), so the cooldown only
@@ -431,6 +453,9 @@ void DebrisSystem::Reset() {
   breaks_.clear();
   // Same reasoning for undrained impacts: the bodies that made them are gone.
   impacts_.clear();
+  // Every patch above was just removed, so every handle still being held at a
+  // boundary is being held against a chunk that no longer has an entry.
+  untunnelHold_.clear();
   instancesDirty_ = true;
   instanceCount_ = 0;
   // Body serials seed the burn RNG (Hash3(serial, tick, rule)), so a counter
@@ -2334,8 +2359,9 @@ bool DebrisSystem::AnyDirtyNear(const Body& b, const WorldSnapshot& snap,
   return false;
 }
 
-void DebrisSystem::AddTerrainAnchor(Vec3 posVoxel, float radiusVoxels) {
-  extraAnchors_.push_back({posVoxel, radiusVoxels});
+void DebrisSystem::AddTerrainAnchor(Vec3 posVoxel, float radiusVoxels,
+                                    Vec3 velVoxPerSec) {
+  extraAnchors_.push_back({posVoxel, radiusVoxels, velVoxPerSec});
 }
 
 void DebrisSystem::AdoptBody(uint64_t handle, std::vector<DebrisVoxel> voxels,
@@ -2396,6 +2422,7 @@ void DebrisSystem::ReleaseBody(Body& b) {
   // about it. Every path that lets go of a body funnels through here, which is
   // what makes one notification enough (see SetOnBodyGone).
   if (b.handle && onBodyGone_) onBodyGone_(b.handle);
+  if (b.handle) untunnelHold_.erase(b.handle);
   if (b.handle) phys_->RemoveBody(b.handle);
   b.handle = 0;
 }
@@ -3056,8 +3083,45 @@ void DebrisSystem::ManageTerrain(uint32_t tick, World& world) {
           needed.push_back({{cx, cy, cz}, dx * dx + dy * dy + dz * dz});
         }
   };
-  for (const Body& b : bodies_) needAround(b.xf.pos, b.radiusVoxels);
-  for (const auto& [pos, r] : extraAnchors_) needAround(pos, r);
+  // A FALLING BODY NEEDS THE GROUND IT IS ABOUT TO REACH.
+  //
+  // needAround's box reaches radius + 6 voxels, i.e. about one chunk past a
+  // human-sized body, and a patch is not free on demand: the chunk fetch is
+  // async and the polygonize then waits for a slot in kTerrainBuildsPerTick.
+  // A ragdoll three seconds into a fall covers that whole margin in three
+  // ticks and was arriving in chunks with no collision mesh in them at all.
+  // So ALSO ask for the chunks the body's own velocity says it is entering,
+  // sampled along the swept segment (just those chunks -- a box around each
+  // would multiply the fetch budget by the lookahead). They carry the distance
+  // from the SAMPLE, not from the body, so the build order below puts the
+  // ground a body is falling onto ahead of the ground it has already left.
+  const bool lookahead = !AntiTunnelOff(AntiTunnel::Lookahead);
+  auto needAhead = [&](Vec3 pos, float radius, Vec3 vel) {
+    needAround(pos, radius);
+    const float speed = vel.len();
+    if (!lookahead || speed < 1e-3f) return;
+    const float reach =
+        std::min(speed * kTerrainLookaheadSeconds, kTerrainLookaheadVox);
+    if (reach < (float)kChunk * 0.5f) return;
+    const Vec3 dir = vel * (1.0f / speed);
+    for (float t = (float)kChunk * 0.5f; t <= reach; t += (float)kChunk * 0.5f) {
+      const Vec3 p = pos + dir * t;
+      const IVec3 wc{ifloor(p.x) >> 4, ifloor(p.y) >> 4, ifloor(p.z) >> 4};
+      if (!world.ChunkInWindow(wc)) continue;
+      const float dx = (float)(wc.x * (int)kChunk + (int)kChunk / 2) - p.x;
+      const float dy = (float)(wc.y * (int)kChunk + (int)kChunk / 2) - p.y;
+      const float dz = (float)(wc.z * (int)kChunk + (int)kChunk / 2) - p.z;
+      needed.push_back({wc, dx * dx + dy * dy + dz * dz});
+    }
+  };
+  for (const Body& b : bodies_) {
+    // A sleeping body is not going anywhere and is not worth a Jolt lookup;
+    // GetBodyVelocities already answers in VOXELS per second.
+    Vec3 lin{}, ang{};
+    if (phys_->IsActive(b.handle)) phys_->GetBodyVelocities(b.handle, lin, ang);
+    needAhead(b.xf.pos, b.radiusVoxels, lin);
+  }
+  for (const Anchor& a : extraAnchors_) needAhead(a.pos, a.radius, a.vel);
   extraAnchors_.clear();
   // Dedupe by chunk, keeping the NEAREST distance any anchor gave it, then
   // order nearest-first. Sorted by (key, d2) so unique's survivor is the
@@ -3216,6 +3280,74 @@ void DebrisSystem::ManageTerrain(uint32_t tick, World& world) {
   }
 }
 
+bool DebrisSystem::ColliderVouched(IVec3 wc) const {
+  // Outside the residency window there is no sim, no voxel data and no body
+  // that survives arriving (PostStep despawns past kPad), and the occupancy
+  // sampler above reads it as solid — nothing to vouch for.
+  if (world_ == nullptr || !world_->ChunkInWindow(wc)) return true;
+  auto it = terrain_.find(World::PackChunkKey(wc));
+  // builtVersion != 0 is "polygonized at least once from real voxels", which
+  // is the same three-way split TerrainCensus reports: a patch with triangles
+  // and a patch that came out EMPTY both vouch, an unfetched one does not.
+  return it != terrain_.end() && it->second.builtVersion != 0;
+}
+
+bool DebrisSystem::UntunnelBody(uint64_t handle, const Vec3& prevPosVoxel) {
+  if (handle == 0 || phys_ == nullptr || world_ == nullptr) return false;
+  if (AntiTunnelOff(AntiTunnel::Clamp)) return false;
+  BodyTransform now{};
+  if (!phys_->GetTransform(handle, now)) return false;
+  auto chunkOf = [](const Vec3& p) {
+    return IVec3{ifloor(p.x) >> 4, ifloor(p.y) >> 4, ifloor(p.z) >> 4};
+  };
+  const IVec3 endChunk = chunkOf(now.pos);
+  if (ColliderVouched(endChunk)) {
+    untunnelHold_.erase(handle);
+    return false;
+  }
+  // Already out there before the step: let it go. A body that spawned in an
+  // unvouched chunk, or whose patch was evicted from under it, must not be
+  // pinned where it stands — that is the deadlock the player's first blind-fall
+  // fix walked into, and the reason this is a clamp and not a veto.
+  if (!ColliderVouched(chunkOf(prevPosVoxel))) {
+    untunnelHold_.erase(handle);
+    return false;
+  }
+  uint8_t& held = untunnelHold_[handle];
+  if (held == 0) untunnel_.bodiesHeld++;
+  if (held >= kUntunnelHoldTicks) {
+    // THE RELEASE IS THE BUG, not the hold: the patches never arrived. Report
+    // it once per release and get out of the body's way.
+    untunnel_.released++;
+    untunnelHold_.erase(handle);
+    std::printf("untunnel: released body %llu into unvouched chunk "
+                "(%d, %d, %d) after %u steps held\n",
+                (unsigned long long)handle, endChunk.x, endChunk.y, endChunk.z,
+                (unsigned)kUntunnelHoldTicks);
+    return false;
+  }
+  held++;
+
+  // Walk the step and keep the last sample that was vouched. Sample 0 is
+  // `prevPosVoxel`, which the test above proved vouched, so there is always an
+  // answer and the worst case is putting the body back where it started.
+  const Vec3 delta = now.pos - prevPosVoxel;
+  const float len = delta.len();
+  const int samples =
+      std::clamp((int)std::ceil(len), 1, kUntunnelSamples);
+  Vec3 last = prevPosVoxel;
+  for (int i = 1; i <= samples; i++) {
+    const Vec3 p = prevPosVoxel + delta * ((float)i / (float)samples);
+    if (!ColliderVouched(chunkOf(p))) break;
+    last = p;
+  }
+  phys_->SetBodyPosition(handle, last);
+  untunnel_.holds++;
+  untunnel_.maxStepVox = std::max(untunnel_.maxStepVox, len);
+  untunnel_.lastChunk = endChunk;
+  return true;
+}
+
 // The piece's MOST COMMON material, not the first voxel's: an island is
 // usually one substance, but a burnt stem carries a few ash voxels and a wall
 // a few of whatever hit it, and picking voxel 0 would let that minority decide
@@ -3347,6 +3479,9 @@ void DebrisSystem::PostStep() {
            (float)(wo.z * (int)kChunk)};
   for (size_t i = 0; i < bodies_.size();) {
     Body& b = bodies_[i];
+    // BEFORE the read-back, because b.xf is still where the body was when the
+    // step began and that is the segment this has to test (UntunnelBody).
+    UntunnelBody(b.handle, b.xf.pos);
     phys_->GetTransform(b.handle, b.xf);
     // bodies that leave the residency window despawn: there is no terrain to
     // collide with out there (Noita despawns offscreen bodies the same way)

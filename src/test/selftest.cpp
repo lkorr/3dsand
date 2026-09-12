@@ -212,6 +212,11 @@ const char* const kOrder[] = {
     // so is order-independent; it sits here to keep the armour gates together.
     "armor-track", "armor-stock",
     "ragdoll-joints",
+    // Beside `ragdoll-joints` and for the same reason: both are pure Jolt over
+    // their own fixture, 640 voxels from anything, and both remove every body
+    // and patch they make. Neither reads the shared World, so the slot is free
+    // — but it has to be AFTER the gates that assert over BodyCount().
+    "body-fastfall",
     "save-load",   "save-entities", "region-store", "streaming",     "spells",
     "page-roundtrip", "daylight-boundary",
     // Support-loss flagging from the MUTATION path. Cheap and
@@ -279,6 +284,10 @@ const char* const kOrder[] = {
     // long fall does the same. Appended last in the group for the reason
     // above; it restores the world on its way out.
     "ragdoll",
+    // Right after it: same fixture shape, and it resets mobs + debris and
+    // regenerates the world on both the way in and the way out, so it is
+    // order-independent past that.
+    "ragdoll-falldamage",
     // ---- THE WOUND MODEL ---------------------------------------------------
     // LAST of the mob gates, and the position is a lesson rather than a
     // preference.

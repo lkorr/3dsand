@@ -1539,6 +1539,24 @@ void PlayerAvatar::PreTick(uint32_t tick, const Player& player, float heading,
     // held at zero so the landing edge below cannot fire "land" or a fall
     // clip against a body that is lying down.
     TickRagdollLimp(world, dt);
+    // ---- A LIMP BODY STILL HITS THE GROUND -------------------------------
+    //
+    // The driven branch bills impact damage off Player::impactDeltaV, which is
+    // velocity the CONTROLLER'S SWEEP refused. A ragdoll has no controller:
+    // main.cpp teleports the capsule onto the pelvis and zeroes its velocity
+    // every tick (RagdollFollow), so the sweep never refuses anything and the
+    // whole of a limp fall was free — which is the wrong way round, since the
+    // reason a body is limp at all is usually that it has been falling for
+    // three seconds. Mob::TakeRagdollImpact is the SAME measurement (a sudden
+    // deceleration, peak-held, in voxels/s) taken where it still exists: off
+    // the solver, at the pelvis. One ApplyFallDamage, one set of thresholds
+    // (player.fallDamageSpeed / fallSplatSpeed), both paths.
+    //
+    // Billed at the pelvis rather than at player.pos: the capsule is a
+    // passenger here and RagdollFollow has not moved it yet this tick, so a
+    // splat would carve the body at where the camera was last frame.
+    ApplyFallDamage(TakeRagdollImpact(), RootWorldPos(), tick, world, ops,
+                    spawns);
     airOffTime_ = 0.0f;
     airTime_ = 0.0f;
     wasGrounded_ = true;
@@ -2015,6 +2033,14 @@ void PlayerAvatar::ApplyFallDamage(Vec3 impactDeltaV, Vec3 centerWorldVoxel,
 
   bool lethal = impactMs >= pt.fallSplatSpeed ||
                 damage >= (float)TotalHealth();
+  // ONE LINE PER HIT, because there are two producers now and they can
+  // disagree: the controller's sweep (Player::impactDeltaV) and the ragdoll's
+  // arrest (Mob::TakeRagdollImpact). "The fall killed me" and "four folds of the
+  // landing each billed" look identical in the health bar and nowhere else.
+  std::printf("avatar impact: %.1f m/s (%s, %.0f of %d hp) at (%.1f, %.1f, "
+              "%.1f)%s\n",
+              impactMs, Ragdolled() ? "limp" : "sweep", damage, TotalHealth(),
+              center.x, center.y, center.z, lethal ? " LETHAL" : "");
 
   if (lethal) {
     // --- splat: carve voxels out of the body, sever some limbs, die ---

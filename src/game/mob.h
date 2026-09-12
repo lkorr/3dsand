@@ -813,6 +813,36 @@ class Mob {
   Vec3 RootWorldPos() const;
   // Seconds in the current ragdoll phase.
   float RagdollSeconds() const { return ragdollT_; }
+
+  // ---- THE ARREST: how much velocity a limp body just lost ----------------
+  //
+  // The ragdoll twin of Player::impactDeltaV. A limp body has no controller and
+  // no sweep — the capsule is teleported onto the pelvis with its velocity
+  // zeroed every tick (PlayerAvatar::RagdollFollow) — so the ONLY thing that
+  // knows a ragdoll hit the ground is the solver, and the only trace it leaves
+  // is the velocity it refused. DECELERATION ONLY, so neither gravity nor a
+  // blast launch can be read as a landing; summed over one short braking RUN
+  // rather than held per tick, because a jointed rig takes two or three ticks
+  // to stop where the player's AABB takes one. The full reasoning, the two
+  // bounds that keep it from becoming an accumulator, and why it is measured on
+  // the rig's centre of mass are at Mob::TickRagdollArrest in mob.cpp.
+  //
+  // ONE LANDING, ONE BILL. A rig does not hit the floor once: measured, a
+  // 15 m/s limp landing braked hard, folded, and braked hard AGAIN as the torso
+  // came down after the legs -- two events of 14.8 and 15.0 m/s, billed
+  // separately, for three times the damage the same speed costs a walking
+  // player. So the peak is HELD until the rig has stopped braking for
+  // kArrestSettleTicks and only then handed over; asking mid-impact returns
+  // nothing. 0.1 s of latency on a fall-damage number nobody can see arrive.
+  //
+  // VOXELS per second, the same units ApplyFallDamage wants.
+  static constexpr uint8_t kArrestSettleTicks = 3;
+  Vec3 TakeRagdollImpact() {
+    if (ragdollArrestQuiet_ < kArrestSettleTicks) return Vec3{};
+    const Vec3 v = ragdollImpact_;
+    ragdollImpact_ = Vec3{};
+    return v;
+  }
   // Continuous freefall so far (NPC gravity; the avatar keeps its own clock).
   float AirSeconds() const { return airTime_; }
   // Rig size INCLUDING a borrowed item slot (limbDefs_ tracks limbs_).
@@ -1310,6 +1340,9 @@ class Mob {
   // One tick of the limp phase: settle test, then BeginGetUp. Called by the
   // NPC loop and the avatar driver in place of their locomotion stages.
   void TickRagdollLimp(World& world, float dt);
+  // One limp tick of the arrest measurement TakeRagdollImpact drains. See the
+  // long note at its definition.
+  void TickRagdollArrest(float dt);
   // Re-derive origin_/heading_ from where the pelvis lies, make every limb
   // kinematic again where it is, and start the blend (RagdollPhase::GetUp).
   void BeginGetUp(World& world);
@@ -1544,6 +1577,18 @@ class Mob {
   float ragdollT_ = 0;         // seconds in the current phase
   float ragdollMinT_ = 0;      // Limp: shortest stay before the settle test
   float ragdollStillT_ = 0;    // Limp: seconds the pelvis has been under settleSpeed
+  // The arrest, see TakeRagdollImpact. `ragdollLastVel_` is the root limb's
+  // velocity at the previous limp tick and is only meaningful while the flag
+  // beside it is set — the first tick of a limp has nothing to difference
+  // against, and SetLimbVelocities (a blast launch, the mid-air flip) reseeds
+  // both so a launch can never be read as a landing.
+  Vec3 ragdollLastVel_{};
+  bool ragdollVelValid_ = false;
+  Vec3 ragdollImpact_{};     // peak braking EVENT since last drained
+  Vec3 ragdollArrestRun_{};  // the braking event in progress
+  float ragdollArrestCap_ = 0.0f;  // ...and the speed it opened with
+  uint8_t ragdollArrestTicks_ = 0;
+  uint8_t ragdollArrestQuiet_ = 0;  // consecutive ticks nothing has braked
   // GetUp: each limb's world pose the moment it was made kinematic again —
   // the "from" side of the get-up blend, parallel to limbs_.
   std::vector<BodyTransform> getUpFrom_;

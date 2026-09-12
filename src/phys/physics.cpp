@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <cstdarg>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <unordered_map>
 
@@ -36,6 +38,7 @@
 #include <Jolt/Physics/Constraints/SwingTwistConstraint.h>
 #include <Jolt/Physics/Body/BodyLockInterface.h>
 #include <Jolt/Physics/Body/BodyLockMulti.h>
+#include <Jolt/Physics/Body/MotionQuality.h>
 #include <Jolt/Physics/Collision/GroupFilterTable.h>
 #include <Jolt/Physics/PhysicsSettings.h>
 #include <Jolt/Physics/PhysicsSystem.h>
@@ -241,6 +244,23 @@ struct Physics::JointImpls {
   std::unordered_map<uint64_t, std::vector<uint64_t>> byBody; // body -> joints
 };
 
+bool AntiTunnelOff(AntiTunnel part) {
+  // 0 = all on. Bit 0 ccd, bit 1 lookahead, bit 2 clamp.
+  static const unsigned mask = [] {
+    const char* e = std::getenv("SANDVOX_NO_ANTITUNNEL");
+    if (e == nullptr || *e == 0) return 0u;
+    if (std::strcmp(e, "ccd") == 0) return 1u;
+    if (std::strcmp(e, "lookahead") == 0) return 2u;
+    if (std::strcmp(e, "clamp") == 0) return 4u;
+    std::fprintf(stderr,
+                 "SANDVOX_NO_ANTITUNNEL=%s: all three anti-tunnel mechanisms "
+                 "OFF (pre-2026-09-12 behaviour)\n",
+                 e);
+    return 7u;
+  }();
+  return (mask & (1u << (unsigned)part)) != 0;
+}
+
 Physics::Physics() = default;
 Physics::~Physics() { Shutdown(); }
 
@@ -303,6 +323,30 @@ void Physics::Step(float dt) {
   TickPendingReleases();
 }
 
+// ---- WHY EVERY DYNAMIC WORLD BODY IS LinearCast (anti-tunnelling) -----------
+//
+// Jolt's default motion quality is Discrete: the body is advanced by v*dt and
+// only THEN asked what it overlaps. The thing it has to not miss is a
+// marching-cubes terrain patch, which is a sheet of triangles with no
+// thickness at all, so the margin is the thinnest box in the collider and
+// nothing else. A ragdoll forearm is 2-3 voxels = 20-30 cm through; a fall
+// that has had three seconds to build (ragdoll.fallSeconds, which is when a
+// creature goes limp in mid-air in the first place) is already at 29 m/s, or
+// 48 cm in a 60 Hz step, and keeps accelerating because nothing in this engine
+// models air drag on a rigid body. The ground was not being missed by a little.
+//
+// LinearCast shape-casts the step and stops the body at the first hit. It is
+// not free, but Jolt only pays for it when the step is longer than
+// mLinearCastThreshold (0.75) * the collider's inner radius -- the smallest
+// half-extent of any sub-box -- so a settled or walking body costs exactly
+// what it did before, and the bodies that do pay are the handful that are
+// moving fast enough to be about to leave the world.
+//
+// This is only half the guarantee: a cast can only hit a triangle that EXISTS,
+// and the patch under a fast-falling body is built by DebrisSystem::
+// ManageTerrain a few ticks after something asks for it. The other half --
+// a body may not enter space no collider describes at all -- is
+// DebrisSystem::UntunnelBody.
 uint64_t Physics::CreateDebrisBody(const std::vector<DebrisVoxel>& voxels,
                                    IVec3 originVoxel,
                                    const std::vector<float>& densityOfMat,
@@ -418,6 +462,8 @@ uint64_t Physics::CreateDebrisBodyXf(const std::vector<DebrisVoxel>& voxels,
   // Ghost contacts with internal edges of the marching-cubes terrain are what
   // make debris snag and hop on flat-looking ground; this is Jolt's fix.
   bcs.mEnhancedInternalEdgeRemoval = true;
+  if (!AntiTunnelOff(AntiTunnel::Ccd))
+    bcs.mMotionQuality = JPH::EMotionQuality::LinearCast;  // see note above
 
   JPH::BodyInterface& bi = system_->GetBodyInterface();
   JPH::BodyID id = bi.CreateAndAddBody(bcs, JPH::EActivation::Activate);
@@ -461,6 +507,10 @@ uint64_t Physics::CreateSphereBody(Vec3 centerVoxel, float radiusVoxels,
   // point of this shape, and the debris value is tuned to stop tumbling fast.
   bcs.mAngularDamping = pt.sphereAngularDamping;
   bcs.mEnhancedInternalEdgeRemoval = true;
+  // A ball's inner radius IS its radius, so the cast only fires on a genuinely
+  // fast roll or fall. See the note above CreateDebrisBody.
+  if (!AntiTunnelOff(AntiTunnel::Ccd))
+    bcs.mMotionQuality = JPH::EMotionQuality::LinearCast;
 
   JPH::BodyInterface& bi = system_->GetBodyInterface();
   JPH::BodyID id = bi.CreateAndAddBody(bcs, JPH::EActivation::Activate);
@@ -930,6 +980,22 @@ void Physics::MoveKinematicBody(uint64_t handle, Vec3 posVoxel,
                               VoxToM(posVoxel.z)),
                    JPH::Quat(quat[0], quat[1], quat[2], quat[3]).Normalized(),
                    std::max(dt, 1e-3f));
+}
+
+bool Physics::SetBodyPosition(uint64_t handle, Vec3 posVoxel) {
+  if (!system_ || handle == 0) return false;
+  JPH::BodyInterface& bi = system_->GetBodyInterface();
+  JPH::BodyID id = ToBodyID(handle);
+  if (!bi.IsAdded(id)) return false;
+  // Rotation kept: the caller is undoing a translation, not a tumble, and
+  // re-solving the orientation would fight the joints holding a rig together.
+  // EActivation::Activate rather than DontActivate so a body put back at a
+  // chunk boundary is still awake to resume the moment the patch lands.
+  bi.SetPosition(id,
+                 JPH::RVec3(VoxToM(posVoxel.x), VoxToM(posVoxel.y),
+                            VoxToM(posVoxel.z)),
+                 JPH::EActivation::Activate);
+  return true;
 }
 
 void Physics::SetBodyVelocity(uint64_t handle, Vec3 velVoxelsPerSec) {
