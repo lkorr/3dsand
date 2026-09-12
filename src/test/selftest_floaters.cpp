@@ -1242,12 +1242,18 @@ Status GateTreeFell(Ctx& c, std::string& detail) {
   // and a player's axe does not wait for it. Both doors, like the real game.
   debris.AddDestructionEvent(tick, {fx - 5, groundY + 10, fz - 5},
                              {fx + 5, groundY + 15, fz + 5});
-  uint32_t maxBodyVox = 0, bodiesMadeB = 0;
+  // The felled tree is an ASSEMBLY of shards (PLAN §5), so the claim is on
+  // the matter in bodies at once, not on the largest single body.
+  uint32_t maxBodyVox = 0, bodiesMadeB = 0, sumBodyVox = 0;
   for (int i = 0; i < 300; i++) {
     runTick({}, true);
     bodiesMadeB = std::max(bodiesMadeB, debris.BodyCount());
-    for (uint32_t b = 0; b < debris.BodyCount(); b++)
+    uint32_t sum = 0;
+    for (uint32_t b = 0; b < debris.BodyCount(); b++) {
       maxBodyVox = std::max(maxBodyVox, debris.BodyVoxelCount(b));
+      sum += debris.BodyVoxelCount(b);
+    }
+    sumBodyVox = std::max(sumBodyVox, sum);
   }
   const uint32_t woodAfterB = countMat(mWood, treeB.lo, treeB.hi);
   // The mirror's own answer to "is the tree still up there", independent of the
@@ -1267,7 +1273,7 @@ Status GateTreeFell(Ctx& c, std::string& detail) {
   const uint32_t felledFloor =
       (uint32_t)(woodBeforeB * BaselineNumber("treeFell.felledFraction", 0.30));
   const bool felled =
-      note(maxBodyVox >= felledFloor, "cut-trunk-fells-the-tree");
+      note(sumBodyVox >= felledFloor, "cut-trunk-fells-the-tree");
   // ...and the complementary half, which is what the owner actually sees: the
   // severed tree must not still be STANDING in the grid.
   const bool leftStanding =
@@ -1283,7 +1289,7 @@ Status GateTreeFell(Ctx& c, std::string& detail) {
   RecordObserved("treeFell.clumpsObserved",
                  (double)(swA.smallComps + swA.bigComps));
   RecordObserved("treeFell.burnFloatVoxels", (double)swA.voxels);
-  RecordObserved("treeFell.felledBodyVoxels", (double)maxBodyVox);
+  RecordObserved("treeFell.felledBodyVoxels", (double)sumBodyVox);
   RecordObserved("treeFell.standingVoxels", (double)swB.bigVoxels);
 
   std::string worst;
@@ -1301,7 +1307,10 @@ Status GateTreeFell(Ctx& c, std::string& detail) {
       "NATURAL burn-out [%s] (%u floating / %u hot at +1500); after QUENCH residue "
       "%u @+300, %u @+900, %u @+1800, CLEAN at +%d ticks; "
       "after a FORCED rescan %u/%u/%u (%u vox); "
-      "probe leaks oversize %u, in-place %u, stuck-event %u, defer-gaveup %u, "
+      "probe leaks oversize %u, in-place %u, stuck-event %u, defer-gaveup %u "
+      "(waiting on a fetch %u [waits: no-cache %u no-voxels %u stale %u; last gave up "
+      "on chunk (%d,%d,%d) inWindow %u cached %u for seed (%d,%d,%d)..(%d,%d,%d)], "
+      "unfetched-held %u, body-cap %u), "
       "queue-dropped %u; stuck-requeued %u, cooldown-held %u/rearmed %u; "
       "deferrals cellop %u, spawn-ring %u, oversize %u, spilled %u, "
       "settle-unsupported %u, backpressure %u; "
@@ -1325,7 +1334,13 @@ Status GateTreeFell(Ctx& c, std::string& detail) {
       residueAt300, residueAt900, residueAt1800, cleanTick,
       swA2.singles, swA2.smallComps, swA2.bigComps, swA2.bigVoxels,
       fpA.oversizeBboxSkipped, fpA.solidRubbleInPlace, fpA.stuckEventDropped,
-      fpA.deferGaveUp, fpA.eventQueueFullDropped, fpA.stuckEventRequeued,
+      fpA.deferGaveUp, fpA.deferGaveUpFetch, fpA.fetchWaitNoCache,
+      fpA.fetchWaitNoVoxels, fpA.fetchWaitStale, fpA.gaveUpChunk.x,
+      fpA.gaveUpChunk.y, fpA.gaveUpChunk.z, fpA.gaveUpChunkInWindow,
+      fpA.gaveUpChunkCached, fpA.gaveUpSeedLo.x, fpA.gaveUpSeedLo.y,
+      fpA.gaveUpSeedLo.z, fpA.gaveUpSeedHi.x, fpA.gaveUpSeedHi.y,
+      fpA.gaveUpSeedHi.z, fpA.deferredUnfetched,
+      fpA.deferredBodyCap, fpA.eventQueueFullDropped, fpA.stuckEventRequeued,
       fpA.supportLateHeld, fpA.supportLateRearmed,
       fpA.deferredCellOpBudget, fpA.deferredSpawnRing, fpA.deferredOversize,
       fpA.eventQueueFullSpilled, fpA.settleWithoutSupport,
@@ -1356,12 +1371,375 @@ Status GateTreeFell(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---------------------------------------------------------------------------
+// cactus-fell: the rigidbody handoff on a thing every cap already fits
+// ---------------------------------------------------------------------------
+//
+// WHY. `tree-fell` is red because a tree crosses kMaxRegionCells, and that is
+// a known, planned, structural limit (docs/PLAN_rigidbody_islands.md). The
+// owner reports the same symptom on a SAGUARO: sever the bole and the top
+// stands in the air. A saguaro is 30..50 voxels tall, its arms reach a few
+// voxels, it is one 6-connected component, and it stands on SAND. It fits the
+// scan box, the flood cap and the int8 body lattice with room to spare, so if
+// it does not fall the reason is not a cap — it is somewhere in the flag ->
+// event -> fetch -> scan -> body chain, and this gate is built to say where.
+//
+// THREE ARMS on one fixture, so one build attributes rather than eliminates:
+//   1. `game`   sand bed, the cut goes in as exact-cell ops ONLY (so the GPU
+//               support-loss flag is the only summons), and the mirror is NOT
+//               force-fetched afterwards: the debris system's own fetch
+//               requests (EventReady, ManageTerrain) are all it gets, which is
+//               what a player standing in the desert gives it.
+//   2. `cpu`    sand bed, plus the brush's CPU door (AddDestructionEvent) and
+//               forced fetches — the `tree-fell` cut recipe, on a cactus.
+//   3. `stone`  the same cut on a stone pad: the control the tree gate ran.
+// The claim per arm is the same: after 300 ticks a body at least half the
+// severed top's size exists (or existed), and the mirror holds nothing of the
+// cactus material above the cut plane that is still unsupported.
+
+struct CactusFixture {
+  IVec3 base{};            // bole foot, world cells (base.y is the first cactus cell)
+  int height = 0;
+  int radius = 0;
+  IVec3 lo{}, hi{};
+  uint32_t cells = 0;
+  uint32_t aboveCut = 0;   // cells strictly above the cut plane, as written
+};
+
+// One saguaro: a ribbed bole of radius r and height h, one arm leaving at 45%
+// height, reaching 3r out along +x and rising to 85% height. Same geometry as
+// worldgen's cactusCell for species 0, minus the bloom (passable matter is not
+// what this gate is about).
+CactusFixture BuildCactus(const World& world, IVec3 base, uint32_t flesh,
+                          uint32_t rib, int cutY, std::vector<CellOp>& ops) {
+  CactusFixture f;
+  f.base = base;
+  f.height = 40;
+  f.radius = 3;
+  const int r = f.radius, h = f.height;
+  const int attach = h * 45 / 100, ex = r * 3, ar = 2;
+  const int riseTop = attach + (h - attach) * 85 / 100;
+  f.lo = IVec3{base.x - r - 1, base.y, base.z - r - 1};
+  f.hi = IVec3{base.x + ex + ar + 1, base.y + h, base.z + r + 1};
+  for (int z = f.lo.z; z <= f.hi.z; z++)
+    for (int y = f.lo.y; y <= f.hi.y; y++)
+      for (int x = f.lo.x; x <= f.hi.x; x++) {
+        const int dx = x - base.x, dy = y - base.y, dz = z - base.z;
+        uint32_t m = 0;
+        const int d2 = dx * dx + dz * dz;
+        if (dy >= 0 && dy <= h && d2 <= r * r) {
+          const bool rim = d2 * 4 >= r * r * 3;
+          const int flute = (std::abs(dx) * 7 + std::abs(dz) * 11) % 5;
+          m = (rim || flute == 0) ? rib : flesh;
+        } else if (dx >= 0 && dx <= ex &&
+                   (dy - attach) * (dy - attach) + dz * dz <= ar * ar) {
+          m = rib;  // the arm's horizontal run, +x from the bole
+        } else if (dy >= attach && dy <= riseTop &&
+                   (dx - ex) * (dx - ex) + dz * dz <= ar * ar) {
+          m = rib;  // the arm's rise
+        }
+        if (!m) continue;
+        const IVec3 cc{x, y, z};
+        if (!world.CellInWindow(cc)) continue;
+        ops.push_back({World::SlotCellIndex(cc),
+                       PackVoxNew(m, DitherHash(x, y, z) % 3u)});
+        f.cells++;
+        if (y > cutY) f.aboveCut++;
+      }
+  return f;
+}
+
+Status GateCactusFell(Ctx& c, std::string& detail) {
+  World& world = c.world;
+  DebrisSystem& debris = c.debris;
+
+  auto matId = [&](const char* n) -> uint32_t {
+    for (size_t i = 0; i < c.mats.size(); i++)
+      if (c.mats[i].name == n) return (uint32_t)i;
+    return 0;
+  };
+  const uint32_t mFlesh = matId("cactus_flesh"), mRib = matId("cactus_rib"),
+                 mSand = matId("sand");
+  if (!mFlesh || !mRib || !mSand) {
+    detail = "cactus_flesh / cactus_rib / sand missing from materials.json";
+    return Status::Fail;
+  }
+
+  std::string failed;
+  auto note = [&failed](bool ok, const char* name) {
+    if (!ok) failed += failed.empty() ? name : (std::string(", ") + name);
+    return ok;
+  };
+
+  const IVec3 org = world.WindowOrigin();
+  const int fx = org.x * (int)kChunk + (int)(kWorldN / 2);
+  const int fz = org.z * (int)kChunk + (int)(kWorldN / 2);
+  const int groundY = World::TerrainHeight(fx, fz, kDefaultSeed);
+  const IVec3 fixtureChunk{fx >> 4, groundY >> 4, fz >> 4};
+  const bool siteInWindow = world.ChunkInWindow(fixtureChunk);
+
+  // Past whatever the suite has already submitted: the mirror ignores a fetch
+  // whose tick is older than the copy it holds (World::EncodeReadbacks), so a
+  // gate that rewinds the clock reads a world it never wrote.
+  uint32_t tick = std::max(93000u, world.Snap().tick + 1000u);
+  IVec3 fetchLo{}, fetchHi{};
+  auto runTick = [&](const std::vector<CellOp>& extra, bool fetch) {
+    std::vector<CellOp> cellOps;
+    std::vector<ParticleSpawn> spawns;
+    debris.QueueSupportEvents(world.Snap());
+    debris.PreTick(tick + 1, world, cellOps, spawns);
+    cellOps.insert(cellOps.end(), extra.begin(), extra.end());
+    if (fetch)
+      for (int cz = fetchLo.z >> 4; cz <= (fetchHi.z >> 4); cz++)
+        for (int cy = fetchLo.y >> 4; cy <= (fetchHi.y >> 4); cy++)
+          for (int cx = fetchLo.x >> 4; cx <= (fetchHi.x >> 4); cx++)
+            if (world.ChunkInWindow({cx, cy, cz}))
+              world.RequestChunkFetch({cx, cy, cz});
+    ++tick;
+    SubmitTick(c.ctx, world, c.sim, tick, kDefaultSeed, {}, {}, cellOps, false,
+               fixtureChunk, true, false, spawns);
+    c.ctx.WaitIdle();
+    c.ctx.ProcessEvents();
+    c.phys.Step(kTickDt);
+    debris.PostStep();
+  };
+  auto countMat = [&](uint32_t want, IVec3 lo, IVec3 hi) {
+    uint32_t n = 0;
+    for (int z = lo.z; z <= hi.z; z++)
+      for (int y = lo.y; y <= hi.y; y++)
+        for (int x = lo.x; x <= hi.x; x++) {
+          const IVec3 wc{x >> 4, y >> 4, z >> 4};
+          if (!world.ChunkInWindow(wc)) continue;
+          const CachedChunk* cc = world.Cached(wc);
+          if (!cc || cc->voxels.size() != kChunkVol) continue;
+          const uint32_t w =
+              cc->voxels[((((uint32_t)z) & 15u) * kChunk + (((uint32_t)y) & 15u)) *
+                             kChunk +
+                         (((uint32_t)x) & 15u)];
+          if ((w & 0xFFFu) == want) n++;
+        }
+    return n;
+  };
+
+  // Site: clear 60 up, fill to groundY with stone, then (sand arms) a 4-deep
+  // sand bed on top. The cactus foot is the first cell above the bed.
+  constexpr int kSiteR = 20, kSiteTop = 60;
+  auto plant = [&](bool sandBed, int& cutY) -> CactusFixture {
+    debris.Reset();
+    SubmitWorldgen(c.ctx, world, c.sim, kDefaultSeed);
+    c.ctx.WaitIdle();
+    fetchLo = IVec3{fx - kSiteR, groundY - 6, fz - kSiteR};
+    fetchHi = IVec3{fx + kSiteR, groundY + kSiteTop, fz + kSiteR};
+    for (int band = 0; band < kSiteTop; band += 15) {
+      std::vector<CellOp> ops;
+      for (int dz = -kSiteR; dz <= kSiteR; dz++)
+        for (int dx = -kSiteR; dx <= kSiteR; dx++)
+          for (int y = groundY + 1 + band; y < groundY + 1 + band + 15; y++) {
+            const IVec3 cc{fx + dx, y, fz + dz};
+            if (world.CellInWindow(cc) && ops.size() < kMaxCellOpsPerTick)
+              ops.push_back({World::SlotCellIndex(cc), 0u});
+          }
+      runTick(ops, true);
+    }
+    {
+      std::vector<CellOp> ops;
+      for (int dz = -kSiteR; dz <= kSiteR; dz++)
+        for (int dx = -kSiteR; dx <= kSiteR; dx++) {
+          const int th = World::TerrainHeight(fx + dx, fz + dz, kDefaultSeed);
+          for (int y = th + 1; y <= groundY; y++) {
+            const IVec3 cc{fx + dx, y, fz + dz};
+            if (world.CellInWindow(cc) && ops.size() < kMaxCellOpsPerTick)
+              ops.push_back({World::SlotCellIndex(cc),
+                             PackVoxNew(kMatStone, DitherHash(cc.x, y, cc.z) % 3u)});
+          }
+        }
+      runTick(ops, true);
+    }
+    const int bedTop = sandBed ? groundY + 4 : groundY;
+    if (sandBed) {
+      std::vector<CellOp> ops;
+      for (int dz = -kSiteR; dz <= kSiteR; dz++)
+        for (int dx = -kSiteR; dx <= kSiteR; dx++)
+          for (int y = groundY + 1; y <= bedTop; y++) {
+            const IVec3 cc{fx + dx, y, fz + dz};
+            if (world.CellInWindow(cc) && ops.size() < kMaxCellOpsPerTick)
+              ops.push_back({World::SlotCellIndex(cc),
+                             PackVoxNew(mSand, DitherHash(cc.x, y, cc.z) % 3u)});
+          }
+      runTick(ops, true);
+    }
+    for (int i = 0; i < 40; i++) runTick({}, true);  // sand settles, mirror lands
+    std::vector<CellOp> build;
+    cutY = bedTop + 1 + 8;  // cut plane: 8 cells up the bole
+    const CactusFixture f =
+        BuildCactus(world, {fx, bedTop + 1, fz}, mFlesh, mRib, cutY + 2, build);
+    runTick(build, true);
+    for (int i = 0; i < 14; i++) runTick({}, true);
+    return f;
+  };
+
+  struct ArmResult {
+    const char* name;
+    uint32_t before = 0, aboveBefore = 0, aboveAfter = 0, afterTotal = 0;
+    uint32_t bodies = 0, maxBody = 0;
+    int firstBodyTick = -1;
+    float bodyDrop = 0;  // how far the largest body's origin fell, cells
+    float dropAfterFetch = 0;  // ...and after 60 more ticks with the mirror forced fresh
+    uint32_t vacateTick = 0;   // sim tick the body left the grid
+    uint32_t colliderBuilt = 0, cacheVersion = 0;  // for the chunk holding the body
+    uint32_t terrainBuilds = 0, terrainSame = 0, terrainDeferred = 0;
+    SweepResult sweep;
+    DebrisSystem::FloaterProbe probe;
+    bool felled = false, cleared = false;
+  };
+  auto runArm = [&](const char* name, bool sandBed, bool cpuDoor,
+                    bool forceFetch) -> ArmResult {
+    ArmResult r;
+    r.name = name;
+    int cutY = 0;
+    const CactusFixture f = plant(sandBed, cutY);
+    const IVec3 aboveLo{f.lo.x, cutY + 3, f.lo.z};
+    r.before = countMat(mFlesh, f.lo, f.hi) + countMat(mRib, f.lo, f.hi);
+    r.aboveBefore = countMat(mFlesh, aboveLo, f.hi) + countMat(mRib, aboveLo, f.hi);
+    debris.ResetFloaterProbe();
+    {
+      std::vector<CellOp> cut;
+      for (int y = cutY; y < cutY + 3; y++)
+        for (int dz = -5; dz <= 5; dz++)
+          for (int dx = -5; dx <= 5; dx++) {
+            const IVec3 cc{fx + dx, y, fz + dz};
+            if (!world.CellInWindow(cc)) continue;
+            cut.push_back({World::SlotCellIndex(cc), 0u});
+          }
+      runTick(cut, forceFetch);
+    }
+    if (cpuDoor)
+      debris.AddDestructionEvent(tick, {fx - 5, cutY, fz - 5},
+                                 {fx + 5, cutY + 2, fz + 5});
+    float bodyY0 = 0;
+    uint32_t bestIdx = 0;
+    for (int i = 0; i < 300; i++) {
+      runTick({}, forceFetch);
+      r.bodies = std::max(r.bodies, debris.BodyCount());
+      for (uint32_t b = 0; b < debris.BodyCount(); b++) {
+        const uint32_t n = debris.BodyVoxelCount(b);
+        if (n > r.maxBody) {
+          r.maxBody = n;
+          bestIdx = b;
+          bodyY0 = debris.BodyPosition(b).y;
+          if (r.firstBodyTick < 0) {
+            r.firstBodyTick = i;
+            r.vacateTick = tick;
+          }
+        }
+      }
+      if (r.maxBody && bestIdx < debris.BodyCount() &&
+          debris.BodyVoxelCount(bestIdx) == r.maxBody)
+        r.bodyDrop = bodyY0 - debris.BodyPosition(bestIdx).y;
+    }
+    if (r.maxBody && bestIdx < debris.BodyCount()) {
+      const Vec3 bp = debris.BodyPosition(bestIdx);
+      const IVec3 wc{ifloor(bp.x + 4.0f) >> 4, ifloor(bp.y + 8.0f) >> 4,
+                     ifloor(bp.z + 4.0f) >> 4};
+      r.colliderBuilt = debris.TerrainBuiltVersion(wc);
+      const CachedChunk* cc = world.Cached(wc);
+      r.cacheVersion = cc ? cc->version : 0;
+    }
+    r.terrainBuilds = debris.Settle().terrainBuilds;
+    r.terrainSame = debris.Settle().terrainSame;
+    r.terrainDeferred = debris.Settle().terrainDeferred;
+    {
+      const float y1 = (r.maxBody && bestIdx < debris.BodyCount())
+                           ? debris.BodyPosition(bestIdx).y
+                           : 0.0f;
+      for (int i = 0; i < 70; i++) runTick({}, true);  // mirror forced fresh
+      if (r.maxBody && bestIdx < debris.BodyCount() &&
+          debris.BodyVoxelCount(bestIdx) == r.maxBody)
+        r.dropAfterFetch = y1 - debris.BodyPosition(bestIdx).y;
+    }
+    r.aboveAfter = countMat(mFlesh, aboveLo, f.hi) + countMat(mRib, aboveLo, f.hi);
+    r.afterTotal = countMat(mFlesh, f.lo, f.hi) + countMat(mRib, f.lo, f.hi);
+    r.sweep = SweepForFloaters(world, c.mats, fetchLo, fetchHi, 1);
+    r.probe = debris.Floaters();
+    r.felled = r.maxBody * 2 >= r.aboveBefore;
+    r.cleared = r.sweep.bigVoxels == 0;
+    return r;
+  };
+
+  const ArmResult game = runArm("game", true, false, false);
+  const ArmResult cpu = runArm("cpu", true, true, true);
+  const ArmResult stone = runArm("stone", false, true, true);
+
+  note(siteInWindow, "fixture-in-window");
+  note(game.before > 200, "cactus-was-written");
+  note(game.felled, "game-arm-fells-the-top");
+  // THE ASSERTION THIS GATE EXISTS FOR. Making the body is not felling the
+  // cactus: the body has to FALL. In the game arm it is made within three
+  // ticks and then stands in the air for the rest of the run, because the
+  // terrain collider around it was built from a mirror copy that still held
+  // the severed top (ManageTerrain re-fetches a cached chunk only while the
+  // snapshot shows it dirty, and never inside 8 ticks of the last request; the
+  // vacated chunk is asleep again before that window opens). The forced-fetch
+  // epilogue proves it: the same body drops a dozen cells the moment the
+  // mirror is refreshed.
+  note(game.bodyDrop >= (float)BaselineNumber("cactusFell.minDropCells", 2.0),
+       "game-arm-body-falls");
+  RecordObserved("cactusFell.gameBodyDrop", (double)game.bodyDrop);
+  RecordObserved("cactusFell.gameDropAfterFetch", (double)game.dropAfterFetch);
+  note(game.cleared, "game-arm-leaves-nothing-floating");
+  note(cpu.felled, "cpu-arm-fells-the-top");
+  note(stone.felled, "stone-arm-fells-the-top");
+  RecordObserved("cactusFell.gameBodyVoxels", (double)game.maxBody);
+  RecordObserved("cactusFell.cpuBodyVoxels", (double)cpu.maxBody);
+  RecordObserved("cactusFell.stoneBodyVoxels", (double)stone.maxBody);
+
+  auto armLine = [&](const ArmResult& r) {
+    const DebrisSystem::FloaterProbe& p = r.probe;
+    return Format(
+        "[%s: cactus %u cells, %u above the cut -> %u above / %u total after; "
+        "bodies %u, largest %u vox (first at +%d, fell %.1f cells); sweep "
+        "unsupported %u/%u/%u (%u vox, %u chunks absent), biggest %zu at "
+        "(%d,%d,%d) rests %d why %d; probe scans %u visited %llu, anchors "
+        "boundary %u / unknown %u / oversize %u, small powder-anchored %u, "
+        "freed %u, stuck dropped %u requeued %u, cooldown held %u rearmed %u, "
+        "spilled %u, defer cellop %u ring %u oversize %u, in-place %u; "
+        "COLLIDER for the body chunk built from mirror v%u vs cache v%u, "
+        "cells vacated at tick %u; terrain builds %u same %u deferred %u; "
+        "after 70 ticks of forced fetches the body fell a further %.1f cells]",
+        r.name, r.before, r.aboveBefore, r.aboveAfter, r.afterTotal, r.bodies,
+        r.maxBody, r.firstBodyTick, r.bodyDrop, r.sweep.singles,
+        r.sweep.smallComps, r.sweep.bigComps, r.sweep.bigVoxels,
+        r.sweep.chunksMissing, r.sweep.biggest, r.sweep.biggestLo.x,
+        r.sweep.biggestLo.y, r.sweep.biggestLo.z, r.sweep.biggestRests ? 1 : 0,
+        r.sweep.biggestRestWhy, p.scans, (unsigned long long)p.scanCellsVisited,
+        p.anchoredByRegionBoundary, p.anchoredByUnknownChunk,
+        p.anchoredByOversizeFlood, p.smallAnchoredPowder, p.smallUnanchored,
+        p.stuckEventDropped, p.stuckEventRequeued, p.supportLateHeld,
+        p.supportLateRearmed, p.eventQueueFullSpilled, p.deferredCellOpBudget,
+        p.deferredSpawnRing, p.deferredOversize, p.solidRubbleInPlace,
+        r.colliderBuilt, r.cacheVersion, r.vacateTick, r.terrainBuilds,
+        r.terrainSame, r.terrainDeferred, r.dropAfterFetch);
+  };
+  const bool ok = failed.empty();
+  detail = Format("at (%d,%d) ground %d inWindow %d %s %s %s%s%s", fx, fz,
+                  groundY, siteInWindow ? 1 : 0, armLine(game).c_str(),
+                  armLine(cpu).c_str(), armLine(stone).c_str(),
+                  failed.empty() ? "" : "; FAILED: ", failed.c_str());
+  std::printf("cactus-fell: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
+
+  debris.Reset();
+  SubmitWorldgen(c.ctx, world, c.sim, kDefaultSeed);
+  c.ctx.WaitIdle();
+  return ok ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& FloaterGates() {
   static const std::vector<Gate> g = {
       {"floaters", "phys", {}, false, GateFloaters},
       {"tree-fell", "phys", {}, false, GateTreeFell},
+      {"cactus-fell", "phys", {}, false, GateCactusFell},
   };
   return g;
 }

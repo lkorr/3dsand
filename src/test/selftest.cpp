@@ -374,6 +374,9 @@ const char* const kOrder[] = {
     // it burns a fixture, advances the tick stream hard, and regenerates
     // worldgen on the way out.
     "tree-fell",
+    // A saguaro-sized fixture that fits every cap tree-fell crosses: if THIS
+    // stays standing the handoff chain itself is at fault, not a limit.
+    "cactus-fell",
     // LAST of the world-touching gates, and it must be: BuildVoxRegion moves
     // the residency window and resets the page table, which is the state every
     // other gate's fixture placement assumes. It restores both before it

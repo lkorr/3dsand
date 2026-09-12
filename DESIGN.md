@@ -2693,22 +2693,56 @@ neighbors, so this needs an explicit connectivity pass:
   things: matter still smouldering (a burnt crown keeps making floaters for
   thousands of ticks), and the queue above dropping or starving the scans that
   would have cleared them.
-- Remaining accepted flaw, and it is now a **plan rather than an admission**
-  (`docs/PLAN_rigidbody_islands.md`): the scan is still local and conservative,
-  so a large floating section survives when it extends past the 80-cell region
-  (`kMaxRegionCells`), exceeds `kMaxIslandVoxels`, or touches an unfetched chunk
-  that reads as solid. Measured rather than assumed — cut an oak-sized tree
-  through the trunk and **28,573 voxels stay standing** while the scan makes a
-  25-voxel body, and the `anchoredBy*` counters name which cap did it. For that
-  tree only the first binds (28,573 is under 32,000 and every axis is under the
-  `int8` 120), but a `great_oak` at 159 × 230 fails all three. The chosen fix is
-  a sparse chunk-tiled flood that can span 256 cells, plus **sharding an
-  oversize component into ≤96-voxel sub-bodies welded with the cone-limited
-  joints ragdolls already use** — which also makes a felled trunk flex and snap
-  instead of falling as a rigid telephone pole. A global "connected to the
-  floor" sweep is no longer the presumed answer: the single-voxel case that
-  motivated it is handled locally and for free by the rule above. Gate:
-  `tree-fell`, assertion `cut-trunk-fells-the-tree`, red on purpose.
+- **The scan is sparse and the region is 256 cells (2026-09-12,
+  `docs/PLAN_rigidbody_islands.md` §4-§6, built).** `RunIslandDetection` no
+  longer builds a dense mask over its region; it floods a visited map keyed by
+  world cell, so a scan costs what it walks and the region can be 256 a side
+  (`kMaxRegionCells`), enough to judge a redwood whole. Chunks are read from
+  the mirror as the flood reaches them; one that is not cached is requested
+  and the event re-queues itself (`Event::fetchRetries`, its own ceiling)
+  **only if an unanchored component touched it** — anchoring is monotone, so a
+  component that is already anchored needs nothing behind an unfetched chunk.
+  Readiness (`EventReady`) is held to the event's tick for the SEED box only;
+  any cached copy serves elsewhere. Terrain is bounded by two anchors the old
+  box supplied by accident: a component reaching `kAnchorDropBelowSeed` (48)
+  under the changed box, or `kAnchorReachBesideSeed` (96) beside it while no
+  higher than its top, is the ground. The flood descends FIRST (the -y
+  neighbour is what the stack pops first), so it reaches that ground in about
+  as many steps as the structure is tall instead of wandering a crown. Measured
+  on the `tree-fell` fixture: the cut oak is now **one 28,478-voxel body**;
+  the burn pass went from 0.59 M cells visited (with the crown wrongly pinned
+  at the 80-cell wall) through 41 M (whole-tree re-walks) to 3.4 M with the
+  descent-first order and the terrain anchors.
+- **Oversize islands are SHARDED, not rejected (§5).** A component is diced on
+  a lattice of at most `kShardCells` (96) per axis; each lattice cell's
+  6-connected pieces become one rigid body each (an oak is one shard, a
+  redwood three), welded along a spanning tree rooted at the heaviest shard
+  with `JointType::Fixed` joints, collisions among them disabled, sharing a
+  `Body::assembly` id. Slivers under `kMinBodyVoxels` crumble as rubble.
+  Shards that fit the tick's op budget are made largest-first; the rest stay
+  in the grid and are re-derived by the re-queued event. `SettleBodies`
+  settles an assembly **as a unit or not at all**: every shard asleep,
+  aligned and unwounded, ground under ANY shard counts for all, one tick's
+  ops for the whole set.
+- **The debris system reads its own writes through an OVERLAY (2026-09-12,
+  gate `cactus-fell`).** A severed saguaro became a body within three ticks
+  and then stood in the air for as long as it liked: `ManageTerrain` had
+  meshed the collider around it from a mirror copy that still held the
+  severed top, and a cached chunk was only re-fetched while the snapshot
+  showed it dirty and never inside 8 ticks of the last request — the vacated
+  chunk was asleep again before that window opened. The mirror
+  (`World::cache_`) is fed only by explicit fetches, not by the player's 3x3x3
+  copy, so this held next to the player too. Now every cell this system
+  writes (island removal, rubble, settle-back) is recorded per chunk with the
+  word written (`NoteGridWrite`, `pendingVacate_`) until the mirror's copy is
+  at or past that tick; the flood and the collider occupancy both read the
+  mirror through it, and `ManageTerrain` re-fetches such a chunk whatever the
+  dirty flags say (`chunkWriteTick_`). A body is therefore never born inside a
+  mesh of its own former cells, a re-scan never converts cells a body already
+  took, and no event has to wait for a fresh copy of a chunk a fire rewrites
+  every tick. Empty (sky) collider builds no longer charge
+  `kTerrainBuildsPerTick`. Gates: `cactus-fell` (three arms: the game's own
+  fetch path, the brush's CPU door, a stone control), `tree-fell`.
 
 ### Rigidbodies
 - Detected islands are **removed from the grid** and become rigidbodies:

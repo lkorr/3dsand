@@ -463,6 +463,13 @@ class DebrisSystem {
     uint32_t terrainSame = 0;
   };
   const SettleProbe& Settle() const { return settle_; }
+  // Diagnostic: the mirror version the terrain collider for `wc` was last
+  // built from (0 = no entry). A body whose chunk reads older than the tick
+  // its cells were vacated is standing inside a collider of its own shape.
+  uint32_t TerrainBuiltVersion(IVec3 wc) const {
+    auto it = terrain_.find(World::PackChunkKey(wc));
+    return it == terrain_.end() ? 0u : it->second.builtVersion;
+  }
   void ResetSettleProbe() { settle_ = SettleProbe{}; }
 
   // ---- floater attribution (the grid <-> body handoff's leak sites) -------
@@ -546,6 +553,16 @@ class DebrisSystem {
     uint32_t smallAnchoredUnknown = 0;
     uint32_t smallAnchoredPowder = 0;  // resting on powder: a legitimate anchor
     uint32_t smallUnanchored = 0;      // ...and how many were freed, for scale
+    uint32_t deferredUnfetched = 0;    // components held for a chunk fetch
+    uint32_t deferGaveUpFetch = 0;     // ...of deferGaveUp, those waiting on one
+    uint32_t fetchWaitNoCache = 0;     // a flood met a chunk never fetched
+    uint32_t fetchWaitNoVoxels = 0;    // ...or cached without a voxel copy
+    uint32_t fetchWaitStale = 0;       // ...or cached older than the event
+    IVec3 gaveUpChunk{}, gaveUpSeedLo{}, gaveUpSeedHi{};  // the last fetch give-up
+    uint32_t gaveUpChunkInWindow = 0, gaveUpChunkCached = 0;
+    uint32_t deferredBodyCap = 0;      // an assembly did not fit kMaxBodies
+    uint32_t shardsMade = 0;           // bodies cut from islands
+    uint32_t weldsMade = 0;            // fixed joints between shards
   };
   const FloaterProbe& Floaters() const { return floaters_; }
   void ResetFloaterProbe() { floaters_ = FloaterProbe{}; }
@@ -611,6 +628,11 @@ class DebrisSystem {
     // exhaustion the give-up is COUNTED rather than silent, which is the whole
     // point of the floater probe below.
     uint8_t retries = 0;
+    // Deferred because the flood reached a chunk the mirror does not hold yet
+    // (requested; the scan runs again when it lands). Its own counter, with a
+    // higher ceiling, because a tree crown is fetched in rounds and none of
+    // those rounds is a budget failure.
+    uint8_t fetchRetries = 0;
     // The box the caller actually named, BEFORE the margin was added: the
     // erased cells, the flagged chunk. The flood seeds only from solids in
     // (and one cell around) this box -- see RunIslandDetection -- because a
@@ -656,6 +678,10 @@ class DebrisSystem {
     uint32_t bleedMat = 0;       // nonzero => body bleeds when carved
     BodyWound wound;             // where, and how much (see BodyWound)
     uint32_t inactiveTicks = 0;  // settle-back countdown (PLAN §B6)
+    // Nonzero = one shard of a welded island (PLAN_rigidbody_islands.md §5):
+    // every body sharing the id was cut from the same component and is joined
+    // to its neighbours by fixed joints. Settle-back treats the set as a unit.
+    uint32_t assembly = 0;
     // Impact cue bookkeeping. `domMat` is this body's most common material,
     // cached because it is the fallback the impact cue reaches for when the
     // struck side is another body rather than the grid, and recounting a
@@ -683,6 +709,9 @@ class DebrisSystem {
     uint32_t builtVersion = 0;
     uint32_t lastNeeded = 0;
     uint32_t lastRefreshReq = 0;
+    // Identity of the pending-vacate lists (this chunk and its 26 neighbours)
+    // the collider was last meshed against; a change forces a rebuild.
+    uint64_t vacateKey = 0;
     uint64_t occHash = 0;   // collision-surface identity: the hash of the 18^3
                             // occupancy box the mesh is a pure function of, so
                             // liquids flowing through a chunk neither rebuild
@@ -694,8 +723,9 @@ class DebrisSystem {
   // the region, which `solidOutside` reads and which nothing used to fetch, so
   // a component touching a scan-box face was anchored on a guess. The ring is
   // requested but never waited for; see the comment at the call site.
-  bool EventReady(const Event& e, World& world, uint32_t required,
-                  bool requestFetch = true) const;
+  bool EventReady(const Event& e, World& world, bool requestFetch = true) const;
+  uint32_t RequiredVersion(IVec3 wc, uint32_t eventTick) const;
+  void NoteGridWrite(const IVec3& c, uint32_t tick, uint32_t word);
   // Push every world chunk the (already clamped) region covers onto
   // pendingSupport_. The overflow path for a full event queue; deduped by
   // supportPending_ exactly like a GPU support flag, so a region spilled twice
@@ -862,10 +892,10 @@ class DebrisSystem {
   // MB allocated, zeroed and freed for every support-loss chunk, which is the
   // cost that capped the scan rate. Kept between calls and `assign`ed, so the
   // zeroing stays and the allocator leaves the hot path.
-  std::vector<uint32_t> scanWords_;
   std::vector<std::pair<IVec3, float>> terrainNeed_;  // ManageTerrain scratch
-  std::vector<uint8_t> scanSolid_;
-  std::vector<int32_t> scanLabel_;
+  // The flood's visited map, keyed by world cell (PLAN §4: sparse, so a scan
+  // costs what it walks, not the 256^3 region it may walk in).
+  std::unordered_map<uint64_t, int32_t> scanLabel_;
   struct Anchor {
     Vec3 pos;
     float radius = 0.0f;
@@ -874,7 +904,26 @@ class DebrisSystem {
   std::vector<Anchor> extraAnchors_;                    // mob limbs, this tick
   std::unordered_map<uint64_t, TerrainEntry> terrain_;  // packed world chunk key
   uint32_t lastTerrainTick_ = 0;  // the sweep TerrainCensus reports on
-  uint32_t lastCellWriteTick_ = 0;
+  // Per chunk, the tick of the last grid write this system made into it
+  // (island removal, rubble, settle-back). A scan may not read the chunk from
+  // a mirror copy older than that, and ManageTerrain re-fetches it until the
+  // copy catches up, whatever the dirty flags say. Pruned once satisfied.
+  std::unordered_map<uint64_t, uint32_t> chunkWriteTick_;
+  // THE OVERLAY: per chunk, every cell this system wrote since the mirror
+  // last caught up, with the word it wrote. The flood and the collider read
+  // the mirror THROUGH it, so neither ever sees a body's former cells as
+  // matter (a second body from the same cells, or a mesh the body is born
+  // inside -- gate `cactus-fell`), and neither has to wait for a fresh copy of
+  // a chunk a fire is rewriting every tick. Dropped once the mirror's copy is
+  // at or past `tick`.
+  struct PendingVacate {
+    uint32_t tick = 0;
+    uint32_t stamp = 0;
+    std::unordered_map<uint16_t, uint32_t> cells;  // local cell -> word
+  };
+  std::unordered_map<uint64_t, PendingVacate> pendingVacate_;
+  uint32_t nextVacateStamp_ = 1;
+  uint32_t nextAssembly_ = 1;
   bool instancesDirty_ = false;
   uint32_t instanceCount_ = 0;
   uint32_t settledBack_ = 0;

@@ -29,6 +29,10 @@ inline void McOccSet(uint32_t* occ, int x, int y, int z) {
   int i = McOccIndex(x, y, z);
   occ[i >> 5] |= 1u << (i & 31);
 }
+inline void McOccClear(uint32_t* occ, int x, int y, int z) {
+  int i = McOccIndex(x, y, z);
+  occ[i >> 5] &= ~(1u << (i & 31));
+}
 inline bool McOccGet(const uint32_t* occ, int x, int y, int z) {
   int i = McOccIndex(x, y, z);
   return (occ[i >> 5] >> (i & 31)) & 1u;

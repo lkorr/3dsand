@@ -1,8 +1,17 @@
 # Large islands: felling a tree, and everything shaped like one
 
-Status: **§1–§3 measured and landed (2026-09-04). §4 onward is designed, not
-built.** The acceptance test already exists and is already red on purpose:
-`--selftest --gate tree-fell`, assertion `cut-trunk-fells-the-tree`.
+Status: **§1–§3 landed 2026-09-04; §4, §5 and §6-E landed 2026-09-12.**
+`--selftest --gate tree-fell` passes, `cut-trunk-fells-the-tree` included: the
+cut oak becomes one 28,478-voxel body. What was built differs from §4 in one
+respect worth knowing: the flood is a visited map keyed by world cell rather
+than chunk tiles with face summaries, and readiness is incremental exactly as
+§4 asks (seed box held to the event tick, everything else fetched as reached,
+re-queued only when an unanchored component touched an unfetched chunk). Two
+terrain anchors the 80-cell box used to supply by accident had to be made
+explicit (`kAnchorDropBelowSeed`, `kAnchorReachBesideSeed`), and the flood
+descends first. The same work fixed a second bug it exposed: colliders meshed
+from a stale mirror copy (gate `cactus-fell`, DESIGN.md §7). See DESIGN.md §7
+for the landed shape; the sections below are kept as the design record.
 
 Owner decision 2026-09-04: **articulated general islands**, not a tree special
 case. A cut trunk, a blown bridge span, a severed cliff overhang and a toppled
