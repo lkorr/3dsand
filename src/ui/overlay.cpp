@@ -610,18 +610,41 @@ void Overlay::Draw(UIState& s) {
   ImGui::SameLine();
   ImGui::Checkbox("shadows", &s.shadows);
 
-  // ---- short range: the 100 m + fog comparison arm -------------------------
+  // ---- short range: the two ceiling + fog comparison arms -------------------
   // Next to `shadows` because it is the same kind of switch: session state
   // that reaches the shader as a RenderParams flag, not a tuning value (see
   // State::shortRange for why that distinction is load-bearing here).
   //
-  // The metres readout beside it is the whole reason the row is two widgets:
-  // "short range" is a claim, and the effective draw distance dropping from
-  // four digits to 100 the instant it is ticked is the evidence for it. It
-  // also shows the cascade REFILLING after a teleport, since the normal value
-  // is the filled radius rather than the theoretical horizon.
-  ImGui::Checkbox("short range (100 m + fog)", &s.shortRange);
+  // THREE radios rather than two checkboxes: the arms are mutually exclusive
+  // and "short range + near" as two independent ticks would let the user set a
+  // near arm that does nothing. The metres come from tuning and not from
+  // literals, so the labels track the sliders the moment F5 lands — a button
+  // that says "50 m" while the shader ceilings at 80 is worse than no label.
+  {
+    const auto& rt = CurrentTuning().render;
+    char nearLbl[24], farLbl[24];
+    std::snprintf(nearLbl, sizeof nearLbl, "%.0f m", rt.shortRangeNearDist);
+    std::snprintf(farLbl, sizeof farLbl, "%.0f m", rt.shortRangeDist);
+    ImGui::TextUnformatted("short range");
+    ImGui::SameLine();
+    if (ImGui::RadioButton("off", !s.shortRange)) s.shortRange = false;
+    ImGui::SameLine();
+    if (ImGui::RadioButton(nearLbl, s.shortRange && s.shortRangeNear)) {
+      s.shortRange = true;
+      s.shortRangeNear = true;
+    }
+    ImGui::SameLine();
+    if (ImGui::RadioButton(farLbl, s.shortRange && !s.shortRangeNear)) {
+      s.shortRange = true;
+      s.shortRangeNear = false;
+    }
+  }
   ImGui::SameLine();
+  // The metres readout is the whole reason the row carries one more widget:
+  // "short range" is a claim, and the effective draw distance dropping from
+  // four digits to the ceiling the instant it is picked is the evidence for
+  // it. It also shows the cascade REFILLING after a teleport, since the normal
+  // value is the filled radius rather than the theoretical horizon.
   ImGui::TextDisabled("draw %.0f m", s.renderRangeM);
   if (ImGui::IsItemHovered())
     ImGui::SetTooltip(
@@ -629,12 +652,15 @@ void Overlay::Draw(UIState& s) {
         "Normally this is the far cascade's FILLED radius, so it dips while\n"
         "the cascade refills after a teleport or a fast sprint and climbs\n"
         "back to the full horizon when every level has landed.\n\n"
-        "With 'short range' ticked it is render.shortRangeDist, and that is a\n"
+        "On either short-range arm it is that arm's ceiling, and that is a\n"
         "hard ceiling on every ray: the fine march and all eight cascade\n"
         "levels stop there. This is a PERF mode - the frame stops paying for\n"
         "the horizon - not a fog filter over a full-range image.\n\n"
-        "Shape it under Rendering: shortRangeDist, shortRangeFogStart,\n"
-        "shortRangeFogDensity. The toggle itself is not saved to tuning.json.");
+        "Shape it under Rendering: shortRangeDist (the far arm),\n"
+        "shortRangeNearDist (the near one), shortRangeFogStart,\n"
+        "shortRangeFogDensity. Both arms share the fog ramp's shape, so only\n"
+        "the wall moves between them. The choice itself is session state and\n"
+        "is not saved to tuning.json.");
 
   // ---- celestial time -------------------------------------------------
   // Scales the clock the SKY and the daylight-gated reactions both run on

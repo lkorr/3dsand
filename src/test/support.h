@@ -67,6 +67,19 @@ uint32_t DayPhaseNow(uint32_t tick);
 bool ShortRangeMode();
 void SetShortRange(bool on);
 
+// WHICH ceiling the mode uses: false = render.shortRangeDist (100 m by
+// default), true = render.shortRangeNearDist (50 m). RenderParams flag bit 4,
+// a SEPARATE bit from the mode's own bit 2 on purpose — bit 2 is what
+// SPEC_SHORT_RANGE specializes the pipeline on, and the arm is chosen far too
+// casually (it is a radio button in the dev panel) to be worth a second
+// pipeline variant. The shader reads bit 4 only inside code bit 2 already
+// guards, so the lean variant still pays nothing for either.
+//
+// Meaningless while ShortRangeMode() is false, and stays latched across a
+// toggle so flipping the mode off and on returns to the arm you last used.
+bool ShortRangeNear();
+void SetShortRangeNear(bool on);
+
 // fluidCount: live MLS-MPM particle count — nonzero enables the fluid surface
 // march in raymarch.wgsl; zero costs the renderer nothing.
 void WriteRenderParams(const rhi::Queue& queue, const World& world,

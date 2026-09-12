@@ -1036,11 +1036,19 @@ int RunShots(GpuContext& ctx, World& world, Simulation& sim) {
   uint32_t shotTicksPerDay = TicksPerDay(shotTun);
   uint32_t shotTick =
       (uint32_t)((double)g_shotTimeOfDay * (double)shotTicksPerDay) % shotTicksPerDay;
-  auto render = [&](Vec3 eye, float yaw, float pitch, const char* path) {
+  // `tickOverride` is for the ONE frame that has to pin its own time of day
+  // (the night sky, below): every other frame honours `--time` and passes -1.
+  // A negative sentinel rather than a second lambda, because the four-frame
+  // warm-up and the readback below are the part nobody should have a second
+  // copy of.
+  auto renderAt = [&](Vec3 eye, float yaw, float pitch, const char* path,
+                      int64_t tickOverride) {
     // --shot-frames: the scene setup around a frame (a pour, a spawn, a
     // window relocation) still runs — it is what the NEXT frames stand on —
     // but the render and the readback, which are the expensive part, do not.
     if (!ShotWanted(path)) return;
+    const uint32_t frameTick =
+        tickOverride < 0 ? shotTick : (uint32_t)tickOverride;
     Camera c;
     c.yaw = yaw;
     c.pitch = pitch;
@@ -1054,7 +1062,7 @@ int RunShots(GpuContext& ctx, World& world, Simulation& sim) {
     // on.
     for (int f = 0; f < 4; f++) {
       WriteRenderParams(ctx.queue, world, eye, c, (float)W / H, true, kShotTime,
-                        kFarFogDensity, 1080.0f, shotTick);
+                        kFarFogDensity, 1080.0f, frameTick);
       rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
       sim.EncodeShadowResolve(enc);
       rhi::RenderPass rp =
@@ -1078,6 +1086,10 @@ int RunShots(GpuContext& ctx, World& world, Simulation& sim) {
     ctx.WaitIdle();
     grab(path);
   };
+  // The ordinary frame: honours `--time` like everything else always has.
+  auto render = [&](Vec3 eye, float yaw, float pitch, const char* path) {
+    renderAt(eye, yaw, pitch, path, -1);
+  };
   int h108 = World::TerrainHeight(108, 108, kDefaultSeed);
   // Sky shot: aimed along the sun's azimuth and tilted up, so the frame holds
   // the sun disc, the halo, the scattering gradient AND long raking shadows on
@@ -1093,6 +1105,34 @@ int RunShots(GpuContext& ctx, World& world, Simulation& sim) {
     // entirely and the whole sun path goes unreviewed.
     float sunPitch = std::asin(std::clamp(ss.sunDir[1], -1.0f, 1.0f));
     render({108, (float)(h108 + 40), 108}, sunYaw, sunPitch, "screenshot_sky.bmp");
+  }
+  // NIGHT SKY shot: the only frame that reviews the dome's night half — the
+  // galactic band, the nebulae, the aurora curtains, the moons and the
+  // starfield's DEPTH ORDER against all of them (raymarch.wgsl SkyLayer.veil).
+  // Every other capture here is a daylight frame, so before this one the whole
+  // night path was unreviewed and the stars sat visibly on top of the aurora
+  // for as long as the aurora has existed.
+  //
+  // It PINS ITS OWN TICK rather than honouring `--time`, and that is the point:
+  // a night frame that goes blue whenever someone runs `--shot --time 0.5`
+  // reviews nothing.
+  //
+  // PITCH +0.35, and the number is load-bearing. nightGlow fades the aurora in
+  // above rd.y = 0.02 and back out from 0.35, so its density peaks in a band
+  // just above the horizon and is already down by a third at the zenith. An
+  // earlier +0.55 framing looked like more sky and reviewed a THINNER aurora:
+  // the densest block in that frame averaged 16/255 of purple, which is too
+  // faint for any occlusion change to read. This aims at the band.
+  {
+    // 0.02 of a cycle past midnight: fully dark, and OFF the exact midnight
+    // phase so a bug that only shows at dayT == 0 has no special case to hide
+    // in. Both moons are wherever their own orbits put them, which is the
+    // honest test of the disc/star occlusion — pinning them full would only
+    // test the easy case.
+    uint32_t nightTick =
+        (uint32_t)(0.02 * (double)shotTicksPerDay) % shotTicksPerDay;
+    renderAt({108, (float)(h108 + 60), 108}, 0.785f, 0.35f,
+             "screenshot_night_sky.bmp", (int64_t)nightTick);
   }
   render({108, (float)(h108 + 120), 108}, 0.785f, -0.35f, "screenshot.bmp");
   render({140, 220, 140}, 0.785f, -0.20f, "screenshot_far.bmp");
@@ -3061,13 +3101,17 @@ int main(int argc, char** argv) {
     // stroke can be judged against a body rather than against the sky. Phase B's
     // AI/spawn panel supersedes it; keep the footprint here at one bool.
     else if (a == "--duel-dummy") g_duelDummy = true;
-    // `--short-range` is the headless handle on the dev panel's "short range
-    // (100 m + fog)" checkbox: no offscreen path can press a checkbox, and the
-    // whole point of the mode is a LOOK and a frame time to compare, both of
-    // which are captured by --shot / --render-budget. Equivalent to
-    // SANDVOX_SHORT_RANGE=1. In the windowed game it only sets the checkbox's
-    // starting position — the panel stays the live authority from frame 1.
+    // `--short-range` is the headless handle on the dev panel's short-range
+    // row: no offscreen path can press a radio button, and the whole point of
+    // the mode is a LOOK and a frame time to compare, both of which are
+    // captured by --shot / --render-budget. Equivalent to
+    // SANDVOX_SHORT_RANGE=1. `--short-range-near` picks the tighter arm
+    // (render.shortRangeNearDist, 50 m by default) and implies the mode, so
+    // the near arm is one flag rather than two that must be given together.
+    // In the windowed game both only set the row's starting position — the
+    // panel stays the live authority from frame 1.
     else if (a == "--short-range") SetShortRange(true);
+    else if (a == "--short-range-near") { SetShortRange(true); SetShortRangeNear(true); }
     else if (a == "--autofly") g_autofly = true;
     else if (a == "--autowalk") g_autoWalk = true;
     else if (a == "--autofly-hard") { g_autofly = true; g_autoflyHard = true; }
@@ -4057,6 +4101,7 @@ int main(int argc, char** argv) {
   // this seed the flag would be latched in support.cpp and the panel would
   // show the box unticked while the frame rendered at 100 m.
   ui.shortRange = ShortRangeMode();
+  ui.shortRangeNear = ShortRangeNear();
   {
     const auto& fs = CurrentTuning().sim;
     ui.fGravity     = fs.fluidGravity;
@@ -8017,15 +8062,18 @@ int main(int argc, char** argv) {
       // pass, the lab and --shot all write RenderParams through the same
       // function and would otherwise each need their own copy of this.
       SetShortRange(ui.shortRange);
+      SetShortRangeNear(ui.shortRangeNear);
       // The panel's draw-distance readout, and the evidence that ticking the
       // box did something. Normally the cascade's FILLED radius (the same
       // number the adaptive fog is pinned to just above, so the two cannot
       // disagree about how far the world is trusted); the ceiling when the
       // mode is on. render.shortRangeDist is read live so the tuner's slider
       // moves this the moment F5 lands.
-      ui.renderRangeM = ui.shortRange
-                            ? CurrentTuning().render.shortRangeDist
-                            : far.SafeRadiusMeters();
+      ui.renderRangeM =
+          ui.shortRange ? (ui.shortRangeNear
+                               ? CurrentTuning().render.shortRangeNearDist
+                               : CurrentTuning().render.shortRangeDist)
+                        : far.SafeRadiusMeters();
       // HOISTED INTO A LAMBDA because it may have to run TWICE. world.renderUBO
       // is one buffer, so the avatar portrait's camera necessarily clobbers
       // the main camera; the portrait pass writes its own params, submits, and

@@ -245,7 +245,7 @@ const SHADOW_CACHE : bool = SHADOW_CACHE_AVAILABLE && TUNE_SHADOW_CACHE != 0;
 //
 //   SPEC_FLUID       <-> R.fluidCount > 0u
 //   SPEC_DEBUG_VIZ   <-> (R.flags & 2u) != 0u   (dev panel: active-voxel edges)
-//   SPEC_SHORT_RANGE <-> (R.flags & 4u) != 0u   (dev panel: 100 m ray ceiling)
+//   SPEC_SHORT_RANGE <-> (R.flags & 4u) != 0u   (dev panel: short-range ceiling)
 // Bit 3 (RFLAG_GAS) is NOT specialized: it changes every frame a fire starts
 // or goes out, and a pipeline variant that flips that often would spend more
 // on compiles than the branch costs.
@@ -267,6 +267,24 @@ const SHADOW_CACHE : bool = SHADOW_CACHE_AVAILABLE && TUNE_SHADOW_CACHE != 0;
 const SPEC_FLUID : bool = true;
 const SPEC_DEBUG_VIZ : bool = true;
 const SPEC_SHORT_RANGE : bool = true;
+
+// ---- which short-range ceiling this frame uses ----------------------------
+// The mode has TWO arms: the default far one (TUNE_SHORT_RANGE_DIST, 100 m)
+// and a near one (TUNE_SHORT_RANGE_NEAR_DIST, 50 m), picked by RenderParams
+// flag bit 4. Bit 4 is NOT a SPEC_ constant and must not become one: it
+// changes no branch's shape, only a distance inside branches bit 2 already
+// guards, so the lean variant still deletes the whole mode and the universal
+// one pays one select() of two compile-time constants.
+//
+// ONE FUNCTION because the ceiling is read in THREE places that must agree —
+// the fine march's tExit (the geometric wall), traceFar's tCeil (the same wall
+// for every cascade level) and aerialFrac's fog ramp (the colour that hides
+// it). Two of them disagreeing is exactly the defect the ramp's renormalisation
+// exists to prevent, one step further up.
+fn shortRangeCeilM() -> f32 {
+  return select(TUNE_SHORT_RANGE_DIST, TUNE_SHORT_RANGE_NEAR_DIST,
+                (R.flags & 16u) != 0u);
+}
 
 fn isVoxActive(idx : u32) -> bool {
   return (actVoxViz[idx >> 5u] & (1u << (idx & 31u))) != 0u;
@@ -486,6 +504,47 @@ fn fbm(p : vec3f, octaves : u32) -> f32 {
   return s;
 }
 
+// ---- a sky layer: what it emits, and how much it HIDES --------------------
+// Every layer of this sky is emissive and was composited by addition, which is
+// right for light and wrong for DEPTH: an additive starfield laid over an
+// aurora puts the stars in FRONT of it, and an aurora is 100 km up while the
+// stars are at infinity. `veil` is the missing z-order — the 0..1 fraction of
+// the background this layer covers — and every producer of one reports it here
+// so the tier chain can multiply the starfield down by whatever is in front of
+// it before adding the layer's own light on top.
+//
+// It is a COVERAGE, not an opacity in the alpha-blend sense: the layers keep
+// adding their emission unchanged, because a semi-transparent aurora does not
+// dim the sky behind it, it only drowns the point sources in it.
+struct SkyLayer {
+  c : vec3f,
+  veil : f32,
+};
+
+// ---- density is not opacity, and the difference is the whole effect --------
+// The aurora's `curtain` and the nebulae's masks are DENSITY fields: they are
+// noise products, and a filament that reads as plainly, unmistakably purple on
+// screen sits around 0.2 there — because its COLOUR is that density times
+// TUNE_AURORA_STRENGTH times a saturated tint, which is visible long before
+// the density is. Handing the raw density to the star cutout dimmed a star by
+// a fifth and moved 518 pixels of 2.07 M (measured on screenshot_night_sky,
+// before/after the first version of this): correct in sign, invisible in fact.
+//
+// So the densities are accumulated as an OPTICAL DEPTH and converted once with
+// Beer-Lambert at the end. These two constants are how many e-foldings a unit
+// of each density is worth — i.e. how thick the layer is, which is exactly the
+// thing the noise function never said. The aurora is much the denser of the
+// two because it is the only layer here that is genuinely in front: at
+// curtain = 0.2 it now hides 55% of a star instead of 20%, and a curtain dense
+// enough to read as a curtain edge hides essentially all of it.
+//
+// Local `const`s and not TUNE_ rows on purpose (CLAUDE.md "what needs a
+// rebuild"): only this shader reads them, and a constant in common.wgsl or the
+// tuning prelude misses the SPIR-V cache for all 23 shaders. Promote them if
+// they ever need to be dialled from the tuner.
+const AURORA_EXTINCT : f32 = 4.0;
+const NEBULA_EXTINCT : f32 = 1.2;
+
 // ---- the Shivering Isles night ------------------------------------------
 // The reference look is not "dark blue with dots": it is a sky with STRUCTURE
 // — a bright galactic band, coloured nebulae, and slow curtains of aurora that
@@ -493,8 +552,9 @@ fn fbm(p : vec3f, octaves : u32) -> f32 {
 // and any of them can be turned off.
 // Returns SMOOTH night emission only — no stars. Stars are added separately by
 // skyColorNoBodies(), so that fog and reflection lookups can take this and get
-// the right colour without point sources bleeding into solid geometry.
-fn nightGlow(rd : vec3f) -> vec3f {
+// the right colour without point sources bleeding into solid geometry. The
+// `veil` it returns is how much of the starfield this glow stands in front of.
+fn nightGlow(rd : vec3f) -> SkyLayer {
   // Base gradient: deep indigo overhead easing to a warmer, lighter horizon
   // (airglow plus whatever light pollution the world implies).
   let up = clamp(rd.y, 0.0, 1.0);
@@ -525,10 +585,20 @@ fn nightGlow(rd : vec3f) -> vec3f {
   let n1 = fbm(d * 2.2 + vec3f(31.0, 17.0, 5.0), 5u);
   let n2 = fbm(d * 1.7 + vec3f(-9.0, 23.0, 41.0), 5u);
   let nebMask = 0.35 + 0.65 * band;
-  c += TUNE_NEBULA_COOL * smoothstep(0.52, 0.86, n1) * nebMask *
-       TUNE_NEBULA_STRENGTH;
-  c += TUNE_NEBULA_WARM * smoothstep(0.58, 0.92, n2) * nebMask *
-       TUNE_NEBULA_STRENGTH * 0.8;
+  let neb1 = smoothstep(0.52, 0.86, n1) * nebMask;
+  let neb2 = smoothstep(0.58, 0.92, n2) * nebMask;
+  c += TUNE_NEBULA_COOL * neb1 * TUNE_NEBULA_STRENGTH;
+  c += TUNE_NEBULA_WARM * neb2 * TUNE_NEBULA_STRENGTH * 0.8;
+  // Nebula optical depth. THIN on purpose (NEBULA_EXTINCT is a third of the
+  // aurora's): real emission nebulae are transparent enough to see bright stars
+  // through, and a thick one would punch star-free holes the size of the fbm
+  // blobs. Enough to stop a star sitting crisply ON TOP of a purple cloud, not
+  // enough to delete the field wherever one drifts.
+  //
+  // The galactic BAND deliberately contributes nothing, even though its dust
+  // lanes physically do occlude: the band IS stars, and dimming the starfield
+  // exactly where the sky says stars are densest is backwards.
+  var tau = NEBULA_EXTINCT * (neb1 + neb2);
 
   // Aurora: vertical curtains that ripple. Modelled as a height-banded noise
   // field in the horizontal plane, faded in above the horizon and out toward
@@ -550,9 +620,16 @@ fn nightGlow(rd : vec3f) -> vec3f {
     let ramp = clamp(rd.y * 2.6, 0.0, 1.0);
     let auroraCol = mix(TUNE_AURORA_LOW, TUNE_AURORA_HIGH, ramp * ramp);
     c += auroraCol * curtain * TUNE_AURORA_STRENGTH;
+    // The aurora is the one layer in this sky that is genuinely in the
+    // foreground — ~100 km up against stars at light years — so it gets much
+    // the thicker extinction. Same `curtain` that drew the colour, so the
+    // cutout and the filament are the same shape by construction and cannot
+    // drift apart at the edges.
+    tau += AURORA_EXTINCT * curtain;
   }
 
-  return c;
+  // ONE conversion for the whole night sky: depths add, coverages don't.
+  return SkyLayer(c, 1.0 - exp(-max(tau, 0.0)));
 }
 
 // ---- the moons ------------------------------------------------------------
@@ -575,8 +652,15 @@ fn nightGlow(rd : vec3f) -> vec3f {
 //
 // Everything about the phase geometry is shared — the CPU hands each body the
 // same three numbers and this draws them the same way.
+//
+// Returns a SkyLayer: the emission, and the disc's own antialiased coverage.
+// The coverage is not decoration — a moon is a rock, and without it the
+// starfield is added over the disc and puts stars ON a new moon's dark limb,
+// where earthshine leaves nothing bright enough to hide them. The GLOW is not
+// coverage (it is scattered light in front of a sky you can still see), so
+// only the body counts.
 fn moonDisc(rd : vec3f, mDir : vec3f, mPhase : f32, mSign : f32, mRad : f32,
-            mSeed : vec3f, tint : vec3f, bright : f32) -> vec3f {
+            mSeed : vec3f, tint : vec3f, bright : f32) -> SkyLayer {
   let cosAng = dot(rd, mDir);
   // The glow falloff is tied to the disc size so a small moon does not carry a
   // halo sized for a large one. 0.03 rad is the reference the exponent 220 was
@@ -586,13 +670,15 @@ fn moonDisc(rd : vec3f, mDir : vec3f, mPhase : f32, mSign : f32, mRad : f32,
   // big a moon is.
   let glowP = 220.0 * (0.03 / max(mRad, 1e-4));
   if (cosAng < 0.9) {
-    // Far from the disc: only the broad glow, which is cheap.
+    // Far from the disc: only the broad glow, which is cheap. No coverage —
+    // this is scattered light, not the body.
     let glow = pow(max(cosAng, 0.0), glowP) * TUNE_MOON_GLOW;
-    return tint * glow * bright;
+    return SkyLayer(tint * glow * bright, 0.0);
   }
   let ang = acos(clamp(cosAng, -1.0, 1.0));
   let r = max(mRad, 1e-4);
   var c = vec3f(0.0);
+  var cover = 0.0;
 
   // Broad halo around the disc.
   c += tint * pow(max(cosAng, 0.0), glowP) * TUNE_MOON_GLOW * bright;
@@ -636,9 +722,14 @@ fn moonDisc(rd : vec3f, mDir : vec3f, mPhase : f32, mSign : f32, mRad : f32,
       let earthshine = TUNE_MOON_EARTHSHINE * (1.0 - lit);
       c += tint * disc * albedo *
            (lit * TUNE_MOON_BRIGHTNESS + earthshine) * bright;
+      // `disc` is already the limb antialiased against one pixel, so reusing
+      // it is what keeps the star cutout and the drawn edge the SAME edge —
+      // a second angular test here would be a second source of truth for
+      // where the rock ends, and would fringe by a pixel at grazing sizes.
+      cover = disc;
     }
   }
-  return c;
+  return SkyLayer(c, cover);
 }
 
 // Both moons, in the right order. Moon B is given the LARGER semi-major axis
@@ -647,17 +738,21 @@ fn moonDisc(rd : vec3f, mDir : vec3f, mPhase : f32, mSign : f32, mRad : f32,
 // B's disc A currently covers; multiplying B down by it is the whole
 // moon-on-moon eclipse, and it is correct because A's own disc is drawn on top
 // at exactly the covering geometry.
-fn moonLayer(rd : vec3f) -> vec3f {
+fn moonLayer(rd : vec3f) -> SkyLayer {
   // The seed vectors are the only thing making the two moons different ROCK
   // rather than the same face drawn twice — they offset the fbm that carves
   // maria and craters, so changing one rerolls that moon's surface entirely.
-  var c = moonDisc(rd, R.moon2Dir, R.moon2Phase, R.moon2PhaseSign,
+  let b = moonDisc(rd, R.moon2Dir, R.moon2Phase, R.moon2PhaseSign,
                    R.moon2AngRadius, TUNE_MOON2_MARIA_SEED,
-                   TUNE_MOON2_COLOR, TUNE_MOON2_BRIGHTNESS) *
-          (1.0 - R.lunarEclipse);
-  c += moonDisc(rd, R.moonDir, R.moonPhase, R.moonPhaseSign, R.moonAngRadius,
-                TUNE_MOON_MARIA_SEED, TUNE_MOON_COLOR, 1.0);
-  return c;
+                   TUNE_MOON2_COLOR, TUNE_MOON2_BRIGHTNESS);
+  let a = moonDisc(rd, R.moonDir, R.moonPhase, R.moonPhaseSign, R.moonAngRadius,
+                   TUNE_MOON_MARIA_SEED, TUNE_MOON_COLOR, 1.0);
+  // R.lunarEclipse dims B's LIGHT where A covers it, but B's rock is still
+  // there and still hides the stars behind it — so the eclipse scales the
+  // colour and NOT the coverage. (A eclipsed to black over a starfield that
+  // showed through would be the exact defect this coverage exists to fix.)
+  return SkyLayer(b.c * (1.0 - R.lunarEclipse) + a.c,
+                  1.0 - (1.0 - a.veil) * (1.0 - b.veil));
 }
 
 // ---- the day sky ---------------------------------------------------------
@@ -785,6 +880,16 @@ fn sunDisc(rd : vec3f) -> vec3f {
 // Tier 2 — skyColorNoBodies(): airglow + stars, no sun/moon discs. For a
 //          primary ray that reached space where a mirrored sun would double up.
 // Tier 3 — skyColor(): everything. Background pixels only.
+//
+// THE TIERS ARE ALSO THE DEPTH ORDER, and that is not a coincidence worth
+// leaving implicit. Every layer here is emissive and composites by ADDITION,
+// which carries no z at all — so the starfield, added last, used to land in
+// front of the aurora curtains and on the dark limb of a new moon. Each layer
+// that is physically in FRONT of the star sphere now reports a SkyLayer.veil
+// (aurora fully, nebulae partly, the moon discs by their own antialiased
+// limb), and skyColorStarsU multiplies the stars down by the product before
+// adding them. Stars take every veil and produce none: nothing this renderer
+// draws is behind them.
 // ---- eclipse weight -------------------------------------------------------
 // How much daylight an eclipse has taken away, 0..1. The sky is lit by the
 // sun's whole disc, so it dims by the covered AREA — but not linearly: a 50%
@@ -820,17 +925,48 @@ fn dayWeight() -> f32 {
 // and the day weight as arguments; the wrappers keep the old signatures, so
 // every existing call site is unchanged and the ones that already pass
 // normalize(...) are not made to pay for it twice.
-fn skyAirglowU(rd : vec3f, dayW : f32) -> vec3f {
+// The airglow AND the veil its night half accumulated. Everything above the
+// stars in this sky is smooth emission, so one call produces both and the star
+// layer below never re-evaluates a single fbm to find out what is in front of
+// it.
+fn skyAirglowV(rd : vec3f, dayW : f32) -> SkyLayer {
   var c = daySky(rd) * dayW;
-  if (dayW < 0.999) { c += nightGlow(rd) * (1.0 - dayW); }
+  var veil = 0.0;
+  if (dayW < 0.999) {
+    let n = nightGlow(rd);
+    c += n.c * (1.0 - dayW);
+    veil = n.veil;
+  }
+  return SkyLayer(max(c, vec3f(0.0)), veil);
+}
+
+fn skyAirglowU(rd : vec3f, dayW : f32) -> vec3f {
+  return skyAirglowV(rd, dayW).c;
+}
+
+// Airglow + stars, with `occ` as any FURTHER coverage the caller already knows
+// sits in front of the star sphere (skyColor passes the moon discs; nothing
+// else has any). Stars are the most distant thing this renderer draws, so they
+// are the one layer that takes every other layer's veil and never contributes
+// one.
+fn skyColorStarsU(rd : vec3f, dayW : f32, occ : f32) -> vec3f {
+  let g = skyAirglowV(rd, dayW);
+  var c = g.c;
+  // Stars fade out under daylight rather than popping off, and are hidden by
+  // whatever stands in front of them. The two are separate factors on purpose:
+  // (1 - dayW) is the sky getting brighter than they are, (1 - veil) is
+  // something being physically between the eye and them, and at night only the
+  // second is doing any work.
+  if (dayW < 0.999) {
+    let hidden = 1.0 - (1.0 - g.veil) * (1.0 - clamp(occ, 0.0, 1.0));
+    c += starField(rd) * (1.0 - dayW) * (1.0 - hidden);
+  }
   return max(c, vec3f(0.0));
 }
 
 fn skyColorNoBodiesU(rd : vec3f, dayW : f32) -> vec3f {
-  var c = skyAirglowU(rd, dayW);
-  // Stars fade out under daylight rather than popping off.
-  if (dayW < 0.999) { c += starField(rd) * (1.0 - dayW); }
-  return max(c, vec3f(0.0));
+  // No bodies means nothing to occult with: the moons are tier 3's business.
+  return skyColorStarsU(rd, dayW, 0.0);
 }
 
 fn skyAirglow(rdIn : vec3f) -> vec3f {
@@ -844,11 +980,19 @@ fn skyColorNoBodies(rdIn : vec3f) -> vec3f {
 fn skyColor(rdIn : vec3f) -> vec3f {
   let rd = normalize(rdIn);
   let dayW = dayWeight();
-  var c = skyColorNoBodiesU(rd, dayW);
   // The moons fade in as the sky darkens — including when it darkens because
   // one of them is in front of the sun. During totality the occulter is at
   // full strength, which is exactly what puts a black disc on the sun.
-  if (dayW < 0.999) { c += moonLayer(rd) * (1.0 - dayW); }
+  //
+  // EVALUATED BEFORE THE STARS, not after, which is the whole z-order fix on
+  // this tier: their coverage has to be known to cut the starfield out behind
+  // them, and they are then added on top unchanged. The FADE is not coverage —
+  // a moon rising into a bright dawn stops hiding stars at the same rate the
+  // stars stop being visible at all — so (1 - dayW) scales the colour only.
+  var moon = SkyLayer(vec3f(0.0), 0.0);
+  if (dayW < 0.999) { moon = moonLayer(rd); }
+  var c = skyColorStarsU(rd, dayW, moon.veil);
+  c += moon.c * (1.0 - dayW);
   // The sun disc uses the RAW sunUp, not dayWeight: the disc has its own
   // eclipse term (its uncovered area), and dimming it twice would erase the
   // bright ring of an annular eclipse and the diamond ring of a total one.
@@ -2433,17 +2577,17 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool) -> Hit {
     tExit = min(tExit, max(tEnter, TUNE_LOD_HANDOFF_DIST / VOXEL_METERS));
   }
 
-  // ---- SHORT-RANGE MODE (RenderParams flag bit 2) ----
-  // The same shortening, against the mode's ray ceiling. At the default
-  // 100 m this is inert — the window is only 25.6 m half-extent and the LOD
-  // handoff above already ended the fine march at 24 m — and it is here so
-  // that "no ray goes past render.shortRangeDist" stays true if the ceiling is
-  // pulled BELOW the window, rather than being a claim about the current
-  // value of a different knob. Same min()-only shape, same wantMedia gate
-  // (shadow/reflection rays are budget-capped elsewhere and must not report
-  // "lit" because they gave up at the ceiling).
+  // ---- SHORT-RANGE MODE (RenderParams flag bit 2, arm in bit 4) ----
+  // The same shortening, against the mode's ray ceiling. At either default
+  // (100 m far arm, 50 m near) this is inert — the window is only 25.6 m
+  // half-extent and the LOD handoff above already ended the fine march at
+  // 24 m — and it is here so that "no ray goes past the ceiling" stays true if
+  // the ceiling is pulled BELOW the window, rather than being a claim about
+  // the current value of a different knob. Same min()-only shape, same
+  // wantMedia gate (shadow/reflection rays are budget-capped elsewhere and
+  // must not report "lit" because they gave up at the ceiling).
   if (SPEC_SHORT_RANGE && wantMedia && (R.flags & 4u) != 0u) {
-    tExit = min(tExit, max(tEnter, TUNE_SHORT_RANGE_DIST / VOXEL_METERS));
+    tExit = min(tExit, max(tEnter, shortRangeCeilM() / VOXEL_METERS));
   }
 
   if (tExit <= tEnter) { return out; }
@@ -3574,7 +3718,7 @@ fn traceFar(ro : vec3f, rdIn : vec3f, tStart : f32, px : vec2f) -> FarHit {
   // 1e30 when the mode is off: unreachable for any t, so the min()s below are
   // no-ops on a uniform branch the compiler folds. Not `select` on the whole
   // clamp, because that would duplicate the expression at both use sites.
-  let tCeil = select(1e30, TUNE_SHORT_RANGE_DIST / VOXEL_METERS,
+  let tCeil = select(1e30, shortRangeCeilM() / VOXEL_METERS,
                      SPEC_SHORT_RANGE && (R.flags & 4u) != 0u);
 
   // Window -> level 1 seam. tStart is where the ray left the residency window;
@@ -4063,7 +4207,7 @@ fn farVoxelAO(level : u32, cell : vec3<i32>, n : vec3<i32>, a1 : i32, a2 : i32,
 // cannot disagree about what "fully fogged" means.
 fn aerialFrac(tFine : f32) -> f32 {
   let dM = tFine * VOXEL_METERS;
-  // ---- SHORT-RANGE MODE (RenderParams flag bit 2) ----
+  // ---- SHORT-RANGE MODE (RenderParams flag bit 2, arm in bit 4) ----
   // The ordinary ramp is a global exponential pinned to the cascade radius: it
   // starts thinning the image at the camera, which is right for kilometres of
   // atmosphere and wrong for a 100 m wall. The dense-100 m engines this mode
@@ -4078,8 +4222,12 @@ fn aerialFrac(tFine : f32) -> f32 {
   // step further down the pipe. The two exp() are of uniform arguments and
   // fold to constants; only the x^2 is per-pixel.
   if (SPEC_SHORT_RANGE && (R.flags & 4u) != 0u) {
-    let startM = TUNE_SHORT_RANGE_DIST * TUNE_SHORT_RANGE_FOG_START;
-    let span = max(TUNE_SHORT_RANGE_DIST - startM, 1e-3);
+    // Both arms share the START FRACTION and the density, so the ramp has the
+    // same shape at 50 m as at 100 — only the wall moves. That is the point of
+    // the fog start being a fraction and not a distance.
+    let ceilM = shortRangeCeilM();
+    let startM = ceilM * TUNE_SHORT_RANGE_FOG_START;
+    let span = max(ceilM - startM, 1e-3);
     let x = clamp((dM - startM) / span, 0.0, 1.0);
     let full = 1.0 - exp(-TUNE_SHORT_RANGE_FOG_DENSITY);
     return clamp((1.0 - exp(-TUNE_SHORT_RANGE_FOG_DENSITY * x * x)) / full,

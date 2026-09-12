@@ -67,6 +67,11 @@ struct UIState {
   // the mode — ceiling, fog start fraction, fog density — is tuning, because
   // that is authored data; whether it is on is session state.
   bool shortRange = false;
+  // WHICH ceiling, once the mode is on: false = render.shortRangeDist (the
+  // 100 m arm), true = render.shortRangeNearDist (the 50 m one). The panel
+  // draws the two as one off / 50 m / 100 m radio row, but the state stays two
+  // bools so the chosen ARM survives toggling the mode off and back on.
+  bool shortRangeNear = false;
   // Effective draw distance in METRES, written by main each frame for the
   // panel readout: the cascade's filled radius normally, the short-range
   // ceiling while the mode is on. Read-only in the UI — it is evidence that

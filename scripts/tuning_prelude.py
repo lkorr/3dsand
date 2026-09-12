@@ -337,6 +337,7 @@ SPEC = [
 
     # SHORT-RANGE MODE (dev panel checkbox, RenderParams flag bit 2)
     ("render", "shortRangeDist", "TUNE_SHORT_RANGE_DIST", "f", 100.0),
+    ("render", "shortRangeNearDist", "TUNE_SHORT_RANGE_NEAR_DIST", "f", 50.0),
     ("render", "shortRangeFogStart", "TUNE_SHORT_RANGE_FOG_START", "f", 0.65),
     ("render", "shortRangeFogDensity", "TUNE_SHORT_RANGE_FOG_DENSITY", "f", 5.0),
 

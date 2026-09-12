@@ -105,6 +105,28 @@ void SetShortRange(bool on) {
   g_shortRange = on;
 }
 
+// Which ceiling the mode uses (support.h ShortRangeNear). Same latch shape as
+// above so `--short-range-near` / SANDVOX_SHORT_RANGE_NEAR reach every headless
+// drawing path, and the panel's radio re-asserts it every frame in the game.
+namespace {
+bool g_shortRangeNear = false;
+bool g_shortRangeNearEnvRead = false;
+}
+
+bool ShortRangeNear() {
+  if (!g_shortRangeNearEnvRead) {
+    g_shortRangeNearEnvRead = true;
+    const char* e = std::getenv("SANDVOX_SHORT_RANGE_NEAR");
+    if (e && e[0] && e[0] != '0') g_shortRangeNear = true;
+  }
+  return g_shortRangeNear;
+}
+
+void SetShortRangeNear(bool on) {
+  ShortRangeNear();   // consume the env default first, then override it
+  g_shortRangeNear = on;
+}
+
 // Time of day used by --shot, as a 0..1 fraction of the cycle (0 = midnight,
 // 0.5 = noon). Set by `--time`; see RunShots.
 float g_shotTimeOfDay = 0.34f;
@@ -262,11 +284,16 @@ void WriteRenderParams(const rhi::Queue& queue, const World& world,
   rp.time = time;
   // bit 0 = sun shadows, bit 1 = active-voxel debug highlight (extraFlags),
   // bit 2 = short-range mode, bit 3 = gas may be present (the crossfade;
-  // docs/PLAN_gas_particles.md stage 1b). Bits 2 and 3 are OR'd in here rather
-  // than passed by the caller so that every drawing path gets them — see
-  // ShortRangeMode above and SetGasRenderActive in renderspec.h.
+  // docs/PLAN_gas_particles.md stage 1b), bit 4 = short-range NEAR arm (the
+  // 50 m ceiling instead of the 100 m one). Bits 2, 3 and 4 are OR'd in here
+  // rather than passed by the caller so that every drawing path gets them —
+  // see ShortRangeMode above and SetGasRenderActive in renderspec.h.
+  //
+  // Bit 4 is deliberately NOT reflected into RenderSpec: it picks a distance
+  // inside a branch bit 2 already guards, so it changes no shader's shape and
+  // must not double the pipeline variants.
   rp.flags = (shadows ? 1u : 0u) | extraFlags | (ShortRangeMode() ? 4u : 0u) |
-             (GasRenderActive() ? 8u : 0u);
+             (GasRenderActive() ? 8u : 0u) | (ShortRangeNear() ? 16u : 0u);
   // Publish the SPEC_* predicates for this frame (support.h RenderSpec). Read
   // off `rp` rather than off the arguments, so the record is the WORD THAT WAS
   // UPLOADED and not a second derivation of it.

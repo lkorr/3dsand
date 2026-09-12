@@ -1094,7 +1094,11 @@ struct RenderParams {
   camRight   : vec3f,  aspect     : f32,
   camUp      : vec3f,  time       : f32,
   // flags: bit0 = sun shadows, bit1 = active-voxel debug highlight,
-  //        bit2 = short-range mode (ray ceiling + fog ramp, raymarch.wgsl).
+  //        bit2 = short-range mode (ray ceiling + fog ramp, raymarch.wgsl),
+  //        bit3 = gas may be present (the smoke crossfade),
+  //        bit4 = short-range NEAR arm: read ONLY where bit2 is already set,
+  //               and it swaps TUNE_SHORT_RANGE_DIST for
+  //               TUNE_SHORT_RANGE_NEAR_DIST (raymarch.wgsl shortRangeCeilM).
   // Written in ONE place: WriteRenderParams (src/test/support.cpp).
   camFwd     : vec3f,  flags      : u32,
   sunDir     : vec3f,  fogDensity : f32,   // per meter (pinned to far extent)

@@ -3096,6 +3096,14 @@ struct Tuning {
     //
     // Ray ceiling in METERS. Nothing past this is marched at all.
     float shortRangeDist = 100.0f;
+    // The NEAR arm's ceiling, in metres: the same mode with a tighter wall, so
+    // the panel can compare two cutoffs without the tuner (dev panel radio
+    // "50 m" vs "100 m"). A SECOND DISTANCE rather than a fraction of the
+    // first, because the two are independent comparison points — halving
+    // shortRangeDist would silently move this one too the moment the far arm
+    // is retuned. Which arm is live is flag bit 4, not a tuning value, for the
+    // same reason the mode's on/off is not one.
+    float shortRangeNearDist = 50.0f;
     // Where the fog ramp starts, as a FRACTION of shortRangeDist. Below it the
     // image is unfogged; the mode's whole point is that the near field looks
     // untouched and only the wall dissolves. 0.65 = fog begins at 65 m of 100.

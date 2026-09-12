@@ -778,6 +778,7 @@
     "glowRingBudget": 64,
     "glowTerrain": 0,
     "shortRangeDist": 100,
+    "shortRangeNearDist": 50,
     "shortRangeFogStart": 0.65,
     "shortRangeFogDensity": 5,
     "skyRayleigh": 12,

@@ -2208,6 +2208,7 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadI(*g, "glowRingBudget", r.glowRingBudget, out, at);
     ReadI(*g, "glowTerrain", r.glowTerrain, out, at);
     ReadF(*g, "shortRangeDist", r.shortRangeDist, out, at);
+    ReadF(*g, "shortRangeNearDist", r.shortRangeNearDist, out, at);
     ReadF(*g, "shortRangeFogStart", r.shortRangeFogStart, out, at);
     ReadF(*g, "shortRangeFogDensity", r.shortRangeFogDensity, out, at);
     // Zero step budgets compile fine and render nothing; a zero white point or
@@ -2441,6 +2442,7 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     // is under the near field's own reach and is already an absurd setting,
     // but it is a setting rather than a NaN frame.
     if (r.shortRangeDist < 4.0f) { r.shortRangeDist = 4.0f; }
+    if (r.shortRangeNearDist < 4.0f) { r.shortRangeNearDist = 4.0f; }
     // The start fraction is a fraction. 0.95 rather than 1.0 at the top so the
     // ramp always has a span to run over.
     if (r.shortRangeFogStart < 0.0f) { r.shortRangeFogStart = 0.0f; }
