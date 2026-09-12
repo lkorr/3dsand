@@ -1467,8 +1467,8 @@ fn tonemapHdr(colorIn : vec3f) -> vec3f {
 // from the raymarched look in both directions.
 // litColor with the openness (sky-visibility) multiplier applied to the AMBIENT
 // term only — never to the key light, which has its own occlusion, exactly as
-// the raymarcher's `ambientAt(n) * ao + sun` split does. `openScale` comes from
-// opennessScaleAtBody() at the call site, because only the caller has the
+// the raymarcher's `ambientAt(n) * ao + sun` split does. `openScale`/`openRaw`
+// come from opennessAtBody() at the call site, because only the caller has the
 // `openness`/`opennessGen` bindings in scope (see the pointer note above).
 //
 // A SEPARATE ENTRY POINT rather than a widened litColor: debug_lines.wgsl and
@@ -1498,9 +1498,79 @@ fn tonemapHdr(colorIn : vec3f) -> vec3f {
 // pass's P1 deposit, and the openness walk's own sun sample. Not to the
 // PUBLISHED cache value, which stays the pure ray answer the shadow-cache
 // gate compares against the fragment-stage ray.
+// A FULLY LIT READING IS NOT EXEMPT WHEN THERE IS NO SKY (2026-09-11). The
+// `mix(o, 1, ...)` above passes v = 1 through untouched, on the argument that a
+// ray which hit NOTHING saw the whole solar disc and sky visibility has no
+// say. That argument has a hole: in a cell whose hemisphere is entirely
+// blocked, "the ray hit nothing" is a contradiction, and of the two statements
+// the openness byte is the trustworthy one — it is a five-ray measurement over
+// a 12 m reach, while v = 1 is what several paths return when they have not
+// MEASURED anything yet. The shadow cache returns exactly 1.0 for a patch
+// nobody has requested, so every surface a camera saw for the first time
+// inside a cave shaded with full daylight for a frame, and the P2 write-back
+// then recorded that into the irradiance grid where it stuck: measured
+// 2026-09-11, ALL of a sealed stone box's 2.7x noon/midnight swing, with every
+// openness byte and every injected word reading 0.
+//
+// So the exemption is itself gated on the face seeing SOME sky. Below ~5%
+// openness a full-sun reading is refused outright; above it nothing changes,
+// which is every outdoor pixel in the game. Continuous (a smoothstep, not a
+// step) because the openness byte is bilinear and a hard edge here would draw
+// a line across a cave mouth.
+//
+// Fixing it HERE rather than at the write-back is what keeps it free: the
+// alternative was to return "did the cache answer?" alongside the value and
+// carry that flag to the end of the shade, which cost 40 registers in an fs
+// already at the occupancy cliff (128 -> 168, measured with --shader-stats,
+// and it slowed cameras with no GI in them at all). This is one extra
+// smoothstep on a value that is already in a register, and it covers every
+// consumer — the raymarch, the resolve pass's deposit, the openness walk's sun
+// sample and the raster body path — instead of one of them.
 fn shadowLiftCap(v : f32, o : f32) -> f32 {
   if (o < 0.0) { return v; }
-  return v * mix(o, 1.0, smoothstep(min(TUNE_SHADOW_LIFT, 0.99), 1.0, v));
+  let full = smoothstep(min(TUNE_SHADOW_LIFT, 0.99), 1.0, v) *
+             smoothstep(0.0, 0.05, o);
+  return v * mix(o, 1.0, full);
+}
+
+// The whole ambient at a surface: the SKY term, scaled by how much sky the
+// face can see, PLUS the ENCLOSED term, weighted by how much it cannot.
+// `openScale` is opennessScale()'s output and `raw` the same probe's unscaled
+// 0..1 byte (-1 = no measurement) — both come out of one opennessAt /
+// opennessAtBody call, which is why those return a pair.
+//
+// WHY AN ADD AND NOT A FLOOR ON THE MULTIPLIER (2026-09-11). These are two
+// different lights. The sky term carries the time of day, the hemisphere
+// split that gives voxel terrain its shape, and the whole day/night palette;
+// the enclosed term is the light bouncing around inside a closed space, which
+// in a real cave is a property of the cave and not of the sky above it.
+// `max(o, floor)` multiplies the second by the first, so the second inherits
+// all of the first's behaviour — and that is exactly the bug: a sealed cave
+// lit at a constant fraction of the SUN, swinging 8.6x between noon and
+// midnight. See the long form on opennessScale; the bounce reach that lets
+// this enclosed constant be so small is render.giGatherBlocks.
+//
+// The canonical injection form in the literature has the same shape:
+// L = L_local + V_sky · L_sky, sky visibility multiplying the sky term with
+// nothing under it.
+//
+//   `raw` < 0  "no measurement" (a slot never walked, or streamed out from
+//              under us). No enclosed term either — the honest answer is the
+//              pre-P0 look, and the fallback is never a guess.
+//   `raw` = 1  open sky. The weight is exactly 0, so open ground is
+//              BIT-IDENTICAL to what it was. Every phase of the openness grid
+//              has been judged by that property and this keeps it.
+//
+// Scaled by TUNE_OPENNESS_STRENGTH with everything else, so the `noopenness`
+// --render-budget arm still folds the entire feature away.
+//
+// AO IS THE CALLER'S JOB and must multiply BOTH terms. Bounce light does not
+// reach into a crease either — the same argument the sky term's `ao` rests on
+// — so callers write `ambientOpen(...) * ao`, never `ambientOpen(amb * ao, ..)`.
+fn ambientOpen(amb : vec3f, openScale : f32, raw : f32) -> vec3f {
+  if (raw < 0.0) { return amb * openScale; }
+  return amb * openScale +
+         TUNE_ENCLOSED_AMBIENT * (TUNE_OPENNESS_STRENGTH * (1.0 - raw));
 }
 
 // ---- diffuse response ----
@@ -1573,7 +1643,8 @@ fn litColorS(albedo : vec3f, n : vec3f, worldPos : vec3f, emission : f32,
   if ((R.flags & 1u) != 0u) { lambert *= shadowLiftCap(sh, openRaw); }
 
   var c = albedo * face *
-          (ambientAtP(n, R) * openScale + keyLightColorP(R) * lambert);
+          (ambientOpen(ambientAtP(n, R), openScale, openRaw) +
+           keyLightColorP(R) * lambert);
   c += albedo * emission * 1.7;
   let dist = length(worldPos - R.camPos);
   // R.fogDensity, not a hardcoded 0.0128. They agreed at the shipped default
@@ -1592,22 +1663,33 @@ fn litColorS(albedo : vec3f, n : vec3f, worldPos : vec3f, emission : f32,
   return mix(c, fogTint, fog);
 }
 
-// The shadowless form. Every caller that has no voxel bindings to cast a ray
-// with keeps this: -1 openRaw ("no measurement", shadowLiftCap passes it
-// through untouched) and sh = 1.0, which the `R.flags` branch above then
-// multiplies in as a no-op. Face tint and wrapped diffuse DO reach these paths,
-// and that is intended — a particle cube is the same axis-aligned geometry the
-// terrain is and should bank the same way.
+// The shadowless form. Every caller that has no shadow ray to cast keeps this:
+// sh = 1.0, which the `R.flags` branch above multiplies in as a no-op (and
+// shadowLiftCap(1.0, o) is the identity for any o, so passing a real openness
+// here cannot darken the key light).
+//
+// IT TAKES THE PAIR, NOT THE SCALE (2026-09-11). It used to take the scalar
+// alone and hardcode openRaw = -1, which was harmless while the enclosed
+// ambient lived inside the scale as a floor — and became a real bug the moment
+// it did not: a particle or a debris cube deep in a cave would get the
+// floorless sky term (near zero, correctly) and NO enclosed term (because -1
+// means "no measurement"), i.e. black, while the terrain around it was lit.
+// `opennessAtBody` already returns both halves of the one probe; callers pass
+// it straight through.
+//
+// Face tint and wrapped diffuse DO reach these paths, and that is intended — a
+// particle cube is the same axis-aligned geometry the terrain is and should
+// bank the same way.
 fn litColorO(albedo : vec3f, n : vec3f, worldPos : vec3f, emission : f32,
-             R : RenderParams, openScale : f32) -> vec3f {
-  return litColorS(albedo, n, worldPos, emission, R, openScale, -1.0, 1.0);
+             R : RenderParams, open : vec2f) -> vec3f {
+  return litColorS(albedo, n, worldPos, emission, R, open.x, open.y, 1.0);
 }
 
 // The plain form: no spatial term, bit-identical to what every raster path had
 // before the openness grid landed.
 fn litColor(albedo : vec3f, n : vec3f, worldPos : vec3f, emission : f32,
             R : RenderParams) -> vec3f {
-  return litColorO(albedo, n, worldPos, emission, R, 1.0);
+  return litColorO(albedo, n, worldPos, emission, R, vec2f(1.0, -1.0));
 }
 
 // Emissive voxels (embers on burning debris, lava) pulse rather than sitting at
@@ -3597,18 +3679,34 @@ fn opennessAt(cell : vec3<i32>, p : vec3f, n : vec3f,
 // identically and lose the sky/ground split that gives voxel terrain its shape.
 // Multiplying keeps the hue and the shape and makes enclosure actually darken,
 // which is the sentence the phase is judged by.
-// THE FLOOR. A measured 0 is "no sky visible", and multiplying the ambient by
-// 0 is pitch black -- which a dug tunnel two metres from its mouth and a step
-// face on a meadow (whose horizontal rays hit a one-voxel rise within reach)
-// both became on 2026-09-02. Real enclosed surfaces keep light from the
-// surfaces around them; until the bounce grid carries all of that, the
-// multiplier never drops below render.opennessFloor. The lift cap
-// (shadowLiftCap) deliberately reads the RAW openness, not this: direct sun
-// still cannot enter a cave.
+// THE FLOOR IS NOT HERE ANY MORE, AND THAT IS THE WHOLE OF THE 2026-09-11 FIX.
+// It used to be `max(o, TUNE_OPENNESS_FLOOR)` -- an enclosed face kept 30% of
+// the hemisphere ambient. The bug is not the 30%, it is WHAT it was 30% OF:
+// `ambientAt` is the day/night signal and nothing else, swinging ~20x between
+// noon and a moonless midnight, so a sealed cave was lit at a constant
+// FRACTION OF THE SUN through solid rock. Measured in the `--shot` stone room
+// (mean linear luminance of the interior, noon vs midnight): the back wall
+// swung 8.6x and the deep floor 7.7x, against 14.6x for the open meadow
+// outside, and killing the floor alone dropped the noon wall from 0.0568 to
+// 0.00136 -- 97.6% of it was this term.
+//
+// What the floor was really standing in for ("real enclosed surfaces keep
+// light from the surfaces around them") is now two things that do not move
+// with the sun: `ambientOpen`'s enclosed term below, and the bounce gather,
+// whose reach went 1.2 m -> ~12 m in the same change.
+// render.opennessFloor survives at 0 as the A/B arm for the old look.
+//
+// The lift cap (shadowLiftCap) still reads the RAW openness, not this: direct
+// sun cannot enter a cave regardless.
 fn opennessScale(o : f32) -> f32 {
   return select(1.0, mix(1.0, max(o, TUNE_OPENNESS_FLOOR), TUNE_OPENNESS_STRENGTH),
                 o >= 0.0);
 }
+
+// `ambientOpen`, which turns this scale plus the raw byte into the whole
+// ambient, lives UP beside shadowLiftCap and litColorS: WGSL wants the
+// definition before the use and the raster body path is the earlier caller.
+// The reasoning for its shape is written there.
 
 // shadowLiftCap MOVED UP, next to litColorS (2026-09-04): the raster body
 // path needs it and WGSL wants the definition first. Its documentation went
@@ -3649,14 +3747,14 @@ fn opennessAtBody(worldPos : vec3f,
   return vec2f(1.0, -1.0);
 }
 
-// The scale alone, for the paths that cast no shadow ray and so have no use for
-// the raw byte (particles, sprites, fluid).
-fn opennessScaleAtBody(worldPos : vec3f,
-                       occ : ptr<storage, array<u32>, read>,
-                       op : ptr<storage, array<u32>, read>,
-                       og : ptr<storage, array<u32>, read>) -> f32 {
-  return opennessAtBody(worldPos, occ, op, og).x;
-}
+// `opennessScaleAtBody` — the scale alone, for the paths that cast no shadow
+// ray — IS GONE (2026-09-11). Since the enclosed ambient left the multiplier
+// (ambientOpen), the scale on its own is no longer a complete answer: a body
+// deep in a cave needs the RAW byte to pick up the enclosed term, and a path
+// that only had the scale would render it black. Every one of those call sites
+// (debris.wgsl's three) now takes the pair from opennessAtBody and hands it to
+// litColorO. Keeping a lossy shortcut beside the honest one is how the bug
+// would come back.
 
 // ---- IRRADIANCE GRID (src/sim/world.h kIrradianceBytes, PLAN_gi.md §3) -----
 // Phase P1 of indirect light. One RGB9E5 word per (slot, 4^3 block, face) at
@@ -3710,6 +3808,15 @@ fn irrIndexOfCell(c : vec3<i32>, face : u32) -> u32 {
 // re-gathers what it can see). Read under the openness stamp like everything
 // else in the two grids.
 const GI_CACHE_BASE : u32 = NUM_SLOTS * OPEN_BLOCKS * OPEN_FACES;
+
+// THERE IS NO MIP PYRAMID OVER PLANE 0, and that was a decision rather than an
+// omission. One was built on 2026-09-11 (three chunk-local levels, six faces
+// each, so a long gather ray could read a prefiltered cell instead of point-
+// sampling a 40 cm block-face) and removed the same day: reading it cost the
+// raymarch fragment shader 128 -> 168 registers, which is the wrong side of
+// its occupancy cliff, and slowed --render-budget cameras that contain no
+// indirect light at all. raymarch.wgsl's giGatherRays carries the full
+// argument and the one condition under which it is worth retrying.
 
 // ---- the second and third planes of `opennessGen` ---------------------------
 // (world.h kOpennessGenWords, PLAN_frame_perf.md §3 item 4.) Plane 0 is the
@@ -3793,8 +3900,9 @@ fn irrSample(albedo : vec3f, n : vec3f, L : vec3f, sunCol : vec3f, lit : f32,
 // is at this POINT", in ONE buffer read, from nothing but a world position.
 // `giGather` answers a strictly better question (it is directional, occluded
 // and carries sun bounce) but it needs nine coarse DDA rays and `occupancy` +
-// `voxels` + `pageTable` in the fragment stage, and it reaches
-// TUNE_GI_GATHER_BLOCKS blocks — 1.2 m at the shipped 3. The raster body paths
+// `voxels` + `pageTable` in the fragment stage, and it runs a bounded STEP
+// budget (TUNE_GI_GATHER_BLOCKS, ~12 m of open interior at the shipped 24 —
+// it was 1.2 m until 2026-09-11). The raster body paths
 // (debris.wgsl's rigid-body and particle cubes, microbody.wgsl's mob limbs)
 // have neither the bindings nor the budget, which is why a mob in a lava pit
 // and a burning crown falling off a tree are lit by the sky alone today.

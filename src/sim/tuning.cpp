@@ -2194,6 +2194,7 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadI(*g, "opennessChunksPerFrame", r.opennessChunksPerFrame, out, at);
     ReadF(*g, "opennessStrength", r.opennessStrength, out, at);
     ReadF(*g, "opennessFloor", r.opennessFloor, out, at);
+    ReadV3(*g, "enclosedAmbient", r.enclosedAmbient, out, at);
     ReadI(*g, "opennessBilinear", r.opennessBilinear, out, at);
     ReadF(*g, "giStrength", r.giStrength, out, at);
     ReadF(*g, "giDecay", r.giDecay, out, at);
@@ -2390,7 +2391,11 @@ bool LoadTuning(const std::string& path, Tuning& out) {
           "brighten without bound); clamped");
       r.giFeedback = std::max(0.0f, r.giDecay * 0.5f);
     }
-    r.giGatherBlocks = std::clamp(r.giGatherBlocks, 0, 8);
+    // A STEP budget, not a distance (tuning_params.def says why). The ceiling
+    // is what bounds the gather's cost: nine rays x this many iterations on a
+    // re-gather frame, amortised over giCachePeriod. 64 is already ~30 m of
+    // open interior, which is past the residency window's useful half.
+    r.giGatherBlocks = std::clamp(r.giGatherBlocks, 0, 64);
     // Beyond 64 the bounce visibly lags the sun; 0 is the uncached path.
     r.giCachePeriod = std::clamp(r.giCachePeriod, 0, 64);
     // Multi-bounce gain (P2): each bounce is albedo x the gather's 0.28 form

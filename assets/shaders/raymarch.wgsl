@@ -4186,12 +4186,65 @@ fn ambientAt(n : vec3f) -> vec3f {
 // would be light leaking straight through the wall. Skipping it (and marching
 // on) is the whole difference between a lit room and a lit cave.
 //
+// HOW FAR IT REACHES, AND WHY THAT WAS THE BUG (2026-09-11). The budget is
+// TUNE_GI_GATHER_BLOCKS ITERATIONS, not blocks of distance: traceOpaque jumps
+// a whole CHUNK per step wherever that chunk holds no blocker, so open air
+// costs a quarter of the steps a rough wall does. At the shipped 3 this
+// reached 1.2 m — light could not cross a room, so the gather delivered
+// essentially nothing to a wall ten metres from a doorway (measured: 0.00136
+// with it on, 0.00133 with it off), and `render.opennessFloor` was standing in
+// for the missing transport by leaking 30% of DAYLIGHT into sealed rock. At 24
+// it crosses ~12 m of open interior, which is what let that floor go to zero.
+// The extra steps are paid only on a re-gather frame (giCachePeriod), and a
+// distant hit reads a coarser level of the pyramid rather than a point sample.
+//
 // REGISTERS. This sits in fs, which is at the 128-register cap and spills; the
 // loop state is kept to the accumulator, the direction and two block coords,
 // with no dynamic vector indexing (select chains only, common.wgsl axisVec).
 // The cost is measured by --render-budget's `nogi` arm.
 const GI_W_NORMAL : f32 = 0.25;
 const GI_W_RING : f32 = 0.09375;
+// ---- WHY THERE IS NO MIP PYRAMID HERE, THOUGH THERE OBVIOUSLY SHOULD BE ----
+// The textbook companion to a long gather ray is a prefiltered pyramid: nine
+// rays standing for a hemisphere have footprints metres wide at 10 m, so
+// reading one 40 cm block-face out there is a point sample of an area, and the
+// fix is to read a coarser level as the hit gets further away. It was built
+// (three chunk-local levels, six faces each, reduced by sim_openness) and then
+// REMOVED on 2026-09-11, because of what it cost in this function:
+//
+//   raymarch fs registers, --shader-stats:  128 -> 168
+//
+// 168 is the wrong side of this shader's occupancy cliff -- the same one the
+// plant two-pass work crossed in the other direction -- and the frame paid for
+// it everywhere, including on the `cascade` and `submerged` --render-budget
+// cameras, which contain no indirect light at all. A branchless level select
+// measured 168 too: it is not the branches, it is the live state (the level,
+// the coarse block coord and a second index base) inside a loop that already
+// holds an accumulator, a direction and a hit.
+//
+// What it bought, measured on the same day against the same sealed-box fixture:
+// 14% of a leak term that a different fix then took to zero. That is not a
+// trade worth an occupancy cliff.
+//
+// If this is revisited, the thing to change is WHERE the gather runs, not what
+// it reads: a compute pass over block-faces has registers to spare and the
+// gather is already cached per block-face (giBounceAt), so it does not need to
+// be in the fragment shader at all. Adding taps to THIS loop will just find
+// the cliff again.
+//
+// ---- THE STEP BUDGET IS A COMPILE-TIME CONSTANT, AND MUST STAY ONE ---------
+// TUNE_GI_GATHER_BLOCKS is a module const, so `maxSteps` below folds and the
+// nine inlined traceOpaque loops keep no loop state. Making it depend on
+// anything per-pixel pushes this shader over the same cliff the pyramid did.
+// The obvious optimisation is to spend the reach only on ENCLOSED faces, since
+// an open one is mostly looking at sky that ambientAt() already delivers
+// analytically — it was written, and it measured 168 registers against 128 for
+// a constant budget of the same size. It is the DYNAMISM, not the count.
+//
+// If the outdoor waste ever needs addressing, skip the whole gather for an
+// open face at the CALL SITE (one branch on `openRaw`, which is already live
+// there) rather than varying this loop's bound.
+//
 // The nine rays from an origin already pushed clear of the receiver's block
 // (see giGather for the per-pixel origin and giBounceAt for the cached,
 // block-face-centre one).
@@ -4806,6 +4859,22 @@ fn shadowAppendRequest(key : u32, slot : u32, packedCell : u32, packedSub : u32)
 // single nearest tap — same request count as before filtering existed — and
 // the blend switches on exactly where its cost buys something visible.
 // `camDistFine` is the receiver's camera distance in fine voxels (h.t).
+// A MISS RETURNS 1.0 (lit), which is the cache's documented one-frame cost: a
+// patch nobody has requested yet renders unshadowed until the resolve pass
+// fills it in next frame, and a one-frame bright edge on a newly visible
+// surface is invisible in motion outdoors.
+//
+// INDOORS IT WAS NOT INVISIBLE, and the fix is NOT here. `shadowLiftCap` used
+// to pass v = 1 through untouched, so a miss inside a sealed cave shaded with
+// full daylight and the P2 write-back recorded that into the irradiance grid
+// permanently -- all of the 2.7x noon/midnight swing the `cave-time` gate
+// measured in a sealed box. That is now refused by shadowLiftCap itself
+// (common.wgsl), which costs nothing here and covers every other consumer of a
+// shadow term too. An earlier version of the fix returned "did the cache
+// answer?" from this function and carried the flag to the end of the shade;
+// it worked, and it cost 40 registers in an fs already at the occupancy cliff
+// (128 -> 168 measured with --shader-stats, slowing cameras with no GI in
+// them). Do not reintroduce per-pixel state to say what a grid already knows.
 fn shadowCached(hp : vec3f, cell : vec3<i32>, axis : i32, sgn : f32,
                 camDistFine : f32) -> f32 {
   rsAdd(RS_SC_TAPS, 1u);
@@ -6889,7 +6958,8 @@ fn shadeViscous(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
     }
     lambert *= shadowLiftCap(sunSh, openRaw);
   }
-  body *= ambientAt(n) * opennessScale(openRaw) + keyLightColor() * lambert;
+  body *= ambientOpen(ambientAt(n), opennessScale(openRaw), openRaw) +
+          keyLightColor() * lambert;
 
   // What comes back out: the surface behind, filtered by the film, plus the
   // blood's own scattered colour. Blood scatters strongly (it is a suspension,
@@ -9166,7 +9236,13 @@ fn fs(in : VSOut) -> FSOut {
     // light, and AO measures how much sky the point can see); direct sun is
     // NOT — it already has its own shadow ray, and multiplying it by AO too
     // double-darkens contact regions into black smears.
-    color = albedo * face * (ambientAt(n) * ao * openAmb + sun);
+    //
+    // `ambientOpen` (common.wgsl) is the sky term scaled by openness PLUS the
+    // enclosed term weighted by (1 - openness). It used to be one multiply
+    // with a 0.3 floor under it, which made a sealed cave a constant fraction
+    // of the TIME OF DAY — see the note on opennessScale. AO multiplies the
+    // whole thing: bounce light does not reach into a crease either.
+    color = albedo * face * (ambientOpen(ambientAt(n), openAmb, openRaw) * ao + sun);
     // ---- the glow field, on terrain (src/sim/world.h kGlowBytes) ----
     // OFF BY DEFAULT, and that is a correctness call rather than caution.
     // Terrain ALREADY receives emitter light: since P3 of docs/PLAN_gi.md,
@@ -9207,6 +9283,15 @@ fn fs(in : VSOut) -> FSOut {
       // word, same blend); a slot whose stamp does not match is left to the
       // walk. Micro hits skip it — their cell is the ground below, and a tuft
       // is not that surface.
+      //
+      // THIS IS THE ONLY INJECTION PATH WITH NO MEASUREMENT BEHIND IT: the
+      // openness walk and the resolve pass each cast a ray, while this one
+      // records whatever the PIXEL happened to shade with -- including a
+      // shadow-cache MISS, which shades as full sun. What stops that becoming
+      // permanent daylight in a cave is shadowLiftCap refusing a full-sun
+      // reading on a face that can see no sky (common.wgsl); `sun` below is
+      // already zero there, so `outgoing` is the bounce alone. See the
+      // `cave-time` gate for the measurement.
       if (TUNE_GI_FEEDBACK > 0.0 && !isMicro &&
           opennessGen[chunkIndexW(h.cell)] == opennessStamp(worldChunkOf(h.cell))) {
         let wi = irrIndexOfCell(h.cell, openFaceOfNormal(n));

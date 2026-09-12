@@ -6434,10 +6434,56 @@ floor, a room floor and the ground under an overhang all have AIR in the block
 in front of them, so they march. **The conservative direction for a lighting
 grid is the one that never darkens something wrongly.**
 
+**THE AMBIENT IS A SUM, NOT A FLOORED PRODUCT** (2026-09-11). The reader used
+to be `ambientAt(n) * ao * max(openness, render.opennessFloor)`, with the floor
+at 0.3 standing in for the bounce light P1 could not yet carry. The bug was not
+the 0.3, it was WHAT it was 0.3 OF: `ambientAt` is the day/night signal and
+nothing else, so a sealed cave was lit at a fixed fraction of the SUN and got
+brighter at noon through solid rock. Measured in the `--shot` stone room, mean
+linear luminance noon vs midnight: back wall **8.6x**, deep floor **7.7x**,
+against 14.6x for the open meadow outside — and removing the floor alone took
+the noon wall from 0.0568 to 0.00136, so **97.6% of it was that one term**.
+
+`ambientOpen()` (`common.wgsl`) is the fix and it is two lights instead of one:
+
+    ambientAt(n) * openScale  +  render.enclosedAmbient * (1 - openness)
+
+The sky term keeps the visibility multiplier with nothing under it; the second
+is a small constant that does not move with the sun, the moons or the sky, and
+it is what decides how bright a cave is. At full sky its weight is exactly 0, so
+open ground is bit-identical; `opennessStrength` scales both, so the
+`noopenness` arm still folds the whole feature away. This is the shape the
+literature uses for sky injection (`L = L_local + V_sky · L_sky`), and the
+failure it fixes is the one CRYENGINE's SVOGI documents for its own constant
+"diffuse bias" leaking into interiors.
+
+**A full-sun reading is no longer exempt from `shadowLiftCap`.** The cap passed
+`v = 1` through untouched, on the argument that a ray which hit nothing saw the
+whole solar disc. In a cell whose hemisphere is entirely blocked that is a
+contradiction, and several paths return 1.0 when they have not MEASURED
+anything — the shadow cache returns exactly 1.0 for a patch nobody has
+requested yet. So every surface a camera saw for the FIRST time inside a cave
+shaded with full daylight for a frame, and the P2 write-back recorded it into
+the irradiance grid where it stuck. That was the whole of a sealed box's
+remaining 2.7x swing, with every openness byte and every injected word reading
+0. The exemption is now gated on the face seeing some sky (a smoothstep over
+the bottom 5% of openness), which covers every consumer at once — the raymarch,
+the resolve pass's deposit, the walk's sun sample and the raster body path.
+
 **Knobs** (`render.*`): `opennessReach` (12 m), `opennessChunksPerFrame` (256
 slots/tick), `opennessStrength` (1.0 — and 0 is an EXACT off switch on both
 halves: it const-folds the reader and makes `C_OPENNESS` false so neither row is
-recorded), `opennessBilinear` (1).
+recorded), `enclosedAmbient` (0.012, 0.013, 0.016 — roughly what a moonless
+night gives open sky), `opennessFloor` (**0**; the pre-2026-09-11 leak, kept
+only as the A/B arm for the old look), `opennessBilinear` (1).
+
+**Gate:** `--selftest --gate cave-time` stamps a sealed 24-voxel stone box,
+puts the camera inside it and renders the same view at the sun's highest and
+lowest tick. Four arms, because "the cave does not change" is satisfiable by
+rendering black: the noon frame must clear a floor, the noon/midnight ratio must
+be ≤ 1.25x (it measures 1.1–1.2x), the box must stay under 15% of the open
+meadow outside, and the probed faces must hold no irradiance an earlier gate
+left behind — that last one reports as a FIXTURE failure, not a lighting one.
 
 **Cost**, RTX 3060 Ti, 1080p, 2026-09-02. The compute pass, from `--perf`'s
 `openness` node: p50 0.015 ms idle, 0.008 ms flying (streaming does not light it
@@ -6572,8 +6618,34 @@ not change to the eye, and the quadrature's 0.28 against a form factor of 0.5 is
 reason; 0 is an exact off switch — gather,
 resolve deposit and walk sample all const-fold, the `nogi` `--render-budget`
 arm), `giDecay` (0.25), `giFeedback` (0, P2; `LoadTuning` keeps it strictly
-below `giDecay`), `giGatherBlocks` (3), `giCachePeriod` (8; 0 is the uncached
-per-pixel gather, the `nogicache` `--render-budget` arm).
+below `giDecay`), `giGatherBlocks` (**12**), `giCachePeriod` (**16**; 0 is the
+uncached per-pixel gather, the `nogicache` `--render-budget` arm).
+
+**The gather reached 1.2 m, which is less than a room** (2026-09-11).
+`giGatherBlocks` is a STEP budget rather than a distance — `traceOpaque` jumps a
+whole chunk wherever that chunk holds no blocker, so open air costs a quarter of
+the steps a wall does — and at the shipped 3 the bounce could not cross a 10 m
+room: a wall ten metres from a sunlit doorway measured 0.00136 with GI on and
+0.00133 with it off. That shortfall is *why* the openness floor above existed.
+At 12 it crosses a room, and it is free: the cost is (rays × steps) /
+`giCachePeriod`, so doubling the period 8 → 16 absorbed the entire increase —
+0.78 ms on the noon overlook, against 0.79 ms before. What buys the reach is
+LATENCY: the bounce now trails the sun by up to 16 frames rather than 8.
+
+**Two obvious improvements were built and both removed the same day, for the
+same reason: this fragment shader has no register headroom.** (1) A three-level
+chunk-local mip pyramid over plane 0, so a distant hit reads a prefiltered cell
+instead of point-sampling one 40 cm block-face. (2) Scaling the step budget by
+the receiver's own sky visibility, so reach is not spent outdoors where
+`ambientAt` already answers analytically. Each measured **128 → 168 registers**
+on the `raymarch` fragment stage (`--shader-stats`), past its occupancy cliff,
+and slowed `--render-budget` cameras containing no indirect light at all; a
+branchless level select measured 168 too, and a CONSTANT budget of the same size
+measured 128, so it is the live state and the dynamism rather than the branches
+or the count. **The step budget must stay a value the shader can const-fold.**
+The thing to change, if this is revisited, is WHERE the gather runs — a compute
+pass over block-faces, which the per-block-face cache below already makes
+natural — not what it reads or how far it goes.
 
 **The gather is cached per block-face** (2026-09-05, `docs/PLAN_frame_perf.md`
 §3 item 1). The nine rays are a function of the block-face and the geometry
@@ -6627,8 +6699,8 @@ one. Terrain receives emitter light through the irradiance grid.
 **The problem is that three consumers are outside that path, for structural
 reasons rather than for want of wiring.** `giGather` is nine coarse DDA rays
 over `occupancy`; it needs `voxels`, `occupancy` and `pageTable` bound in the
-FRAGMENT stage, and it reaches `render.giGatherBlocks` blocks — 1.2 m at the
-shipped 3.
+FRAGMENT stage, and its reach is `render.giGatherBlocks` march STEPS — about a
+room at the shipped 12, and 1.2 m before 2026-09-11.
 
 * `debris.wgsl`'s rigid-body and particle cubes shade in the **vertex** stage,
   where `renderBGL_` marks `voxels` (0) and `pageTable` (9) Fragment-only. They

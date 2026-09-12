@@ -312,7 +312,24 @@ TP_I(render, opennessChunksPerFrame, TUNE_OPENNESS_CHUNKS, 256)
 // not recorded at all -- which is what the `noopenness` --render-budget arm
 // measures. 1 = full spatial attenuation.
 TP_F(render, opennessStrength, TUNE_OPENNESS_STRENGTH, 1.0f)
-TP_F(render, opennessFloor, TUNE_OPENNESS_FLOOR, 0.3f)
+// THE OLD LEAK, KEPT AS ITS OWN A/B ARM AND DEFAULTED OFF (2026-09-11). This
+// was the least the openness grid could scale the SKY ambient to, and because
+// the sky ambient is the entire day/night signal a sealed cave got a flat 30%
+// of the time of day through solid rock: measured in the `--shot` stone room,
+// 97.6% of a sealed wall's noon brightness was this term and the room's
+// noon/midnight ratio was 8.6x. What it was standing in for -- "real enclosed
+// surfaces keep light from the surfaces around them" -- is enclosedAmbient
+// below plus the bounce gather, neither of which moves with the sun.
+TP_F(render, opennessFloor, TUNE_OPENNESS_FLOOR, 0.0f)
+// The ambient an ENCLOSED face keeps, ADDED rather than multiplied in, and
+// deliberately NOT a function of the sun, the moons or the sky: this is the
+// term that decides how bright a cave is, and a cave must not know what time
+// it is. Scaled by (1 - openness), so open ground never sees it at all and the
+// meadow stays bit-identical; scaled by opennessStrength too, so the
+// `noopenness` arm still folds the whole feature away. Sits at about the
+// brightness a moonless night gives the open sky, which is the look the
+// measurement was aiming at: dim, navigable, and the same at noon.
+TP_V3(render, enclosedAmbient, TUNE_ENCLOSED_AMBIENT, 0.012f, 0.013f, 0.016f)
 // Bilinear over the four neighbouring blocks in the face plane. Nearest-only
 // tiles visibly on a flat wall at 40 cm blocks; this costs three more byte
 // reads on a hit that has already paid for a chunk lookup.
@@ -334,15 +351,30 @@ TP_F(render, giDecay, TUNE_GI_DECAY, 0.25f)
 // LoadTuning keeps it strictly below giDecay or the grid brightens without
 // bound.
 TP_F(render, giFeedback, TUNE_GI_FEEDBACK, 0.2f)
-// 4^3 blocks each of the five gather rays steps through (3 = 1.2 m).
-TP_I(render, giGatherBlocks, TUNE_GI_GATHER_BLOCKS, 3)
+// The STEP BUDGET of each of the nine gather rays, not a distance: traceOpaque
+// jumps a whole CHUNK (1.6 m) per step wherever the chunk holds no blocker and
+// a 4^3 block otherwise, so open air is crossed four times faster than the
+// name suggests. At the old 3 the gather reached 1.2 m and light could not
+// cross a room, and render.opennessFloor was leaking daylight into sealed rock
+// to stand in for the transport that was missing; 12 crosses a room.
+// MUST STAY A CONSTANT the shader can fold -- see giGatherRays in
+// raymarch.wgsl for the 128 -> 168 register cliff a per-pixel budget costs.
+// Paid for by doubling giCachePeriod below: measured 2026-09-11, 12 steps at
+// period 16 costs the same 0.78 ms as 3 steps at period 8.
+TP_I(render, giGatherBlocks, TUNE_GI_GATHER_BLOCKS, 12)
 // The gather CACHE (PLAN_frame_perf.md s3 item 1): frames between re-gathers
 // of one chunk slot's block-faces. The nine rays run only on a slot's scheduled
 // frame (slots are staggered, so 1/N of the visible ones re-gather per frame)
 // and for a face never gathered; every other hit reads one cached word,
 // bilinear over the face plane. 0 = the old per-pixel gather every frame,
 // const-folded, which is the `nogicache` --render-budget arm.
-TP_I(render, giCachePeriod, TUNE_GI_CACHE_PERIOD, 8)
+// 8 -> 16 on 2026-09-11, to pay for giGatherBlocks 3 -> 12: the gather's cost
+// is (rays x steps) / period, so doubling this absorbed the whole of the
+// reach increase (0.78 ms on the noon overlook, before and after). What it
+// buys the reach with is LATENCY -- the bounce now trails the sun and the
+// shadow cache by up to 16 frames instead of 8, about a quarter-second, which
+// is well under what the eye reads as a lag on a term this diffuse.
+TP_I(render, giCachePeriod, TUNE_GI_CACHE_PERIOD, 16)
 
 // ---- the glow field (src/sim/world.h kGlowBytes, assets/shaders/sim_glow.wgsl)
 // Weight of the sampled emitter light added at a consumer. 0 is an EXACT off

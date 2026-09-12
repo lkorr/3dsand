@@ -824,6 +824,17 @@ constexpr uint64_t kOpennessGenBytes = (uint64_t)kOpennessGenWords * 4;   // 260
 // zero is stored with its low bit set). Same stamp, same writers' standing:
 // the walk zeroes it for a slot the window reused, the raymarch fills it.
 constexpr uint32_t kIrradiancePlanes = 2;
+
+// NO MIP PYRAMID OVER PLANE 0 (tried and removed, 2026-09-11). A gather ray
+// that reaches ~12 m wants a prefiltered cell at the far end rather than a
+// point sample of one 40 cm block-face, and three chunk-local levels were
+// built for exactly that -- then deleted, because READING them cost the
+// raymarch fragment shader 128 -> 168 registers (--shader-stats), which is the
+// wrong side of its occupancy cliff, and slowed --render-budget cameras with
+// no indirect light in them at all. The gather's reach came from its STEP
+// BUDGET instead, which is free in registers. assets/shaders/raymarch.wgsl's
+// giGatherRays carries the full measurement and says what would have to change
+// (move the gather to a compute pass) before trying again.
 constexpr uint64_t kIrradianceBytes =
     (uint64_t)kNumSlots * kOpenBlocksPerChunk * kOpenFaces * 4 *
     kIrradiancePlanes;   // 96 MiB at 512^3

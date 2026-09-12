@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <set>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -1043,7 +1044,12 @@ Status GateOpenness(Ctx& c, std::string& detail) {
 // THE REGION is the middle of the frame — the wall fills it at this distance
 // and the slab and sky only enter at the edges — so the assertion is about
 // the wall and not about the floor's own (smaller, whiter) bounce off it.
-uint32_t IrradianceWordAt(GpuContext& ctx, World& world, IVec3 c, uint32_t face) {
+// `plane` 0 is the OUTGOING radiance the two injection paths write; plane 1 is
+// the GATHER CACHE at GI_CACHE_BASE — what giGatherRays returned for that
+// block-face's centre. Reading the second is how a gate tells "the surfaces
+// around this face are lit" from "the gather thinks they are".
+uint32_t IrradianceWordAt(GpuContext& ctx, World& world, IVec3 c, uint32_t face,
+                          uint32_t plane = 0u) {
   const IVec3 wc{c.x >> 4, c.y >> 4, c.z >> 4};
   const uint32_t slot = World::SlotChunkIndex(wc);
   const uint32_t lx = (uint32_t)(c.x & 15), ly = (uint32_t)(c.y & 15),
@@ -1052,6 +1058,7 @@ uint32_t IrradianceWordAt(GpuContext& ctx, World& world, IVec3 c, uint32_t face)
                  bz = lz >> kSubOccShift;
   const uint32_t block = (bz * kSubOccDim + by) * kSubOccDim + bx;
   const uint64_t idx =
+      (uint64_t)plane * kNumSlots * kOpenBlocksPerChunk * kOpenFaces +
       ((uint64_t)slot * kOpenBlocksPerChunk + block) * kOpenFaces + face;
   rhi::Buffer stage =
       CreateBuffer(ctx.device, 4,
@@ -1467,6 +1474,382 @@ Status GateGiNightfall(Ctx& c, std::string& detail) {
   detail = Format("A %.1f%% of day, B %.1f%% (<= %.1f%%); day lum %.4f/%.4f%s",
                   pctA, pctB, maxPct, lDayA, lDayB,
                   charged ? "" : " - NEVER CHARGED");
+  return ok ? Status::Pass : Status::Fail;
+}
+
+// ---------------------------------------------------------------------------
+// cave-time: a sealed room does not know what time it is.
+//
+// THE BUG THIS PINS (2026-09-11, reported as "deep underground it shouldn't
+// make a difference if it's daytime or nighttime outside"). The openness grid
+// measured the enclosure correctly -- a sealed face reads 0 -- but the reader
+// turned that 0 into `max(0, render.opennessFloor)` and MULTIPLIED the
+// hemisphere ambient by it. The hemisphere ambient is the entire day/night
+// signal, swinging ~20x between noon and a moonless midnight, so a sealed cave
+// was lit at a flat 30% of the TIME OF DAY through solid rock. Measured in the
+// `--shot` stone room before the fix: the interior's mean linear luminance
+// swung 8.6x (back wall) and 7.7x (deep floor) noon-to-midnight, against 14.6x
+// for the open meadow outside, and killing the floor alone dropped the noon
+// wall from 0.0568 to 0.00136 -- 97.6% of it was that one term.
+//
+// The fix splits the two lights (common.wgsl ambientOpen): the SKY term keeps
+// the openness multiplier with nothing under it, and a separate ENCLOSED term
+// (render.enclosedAmbient) is ADDED at (1 - openness) and does not move with
+// the sun. This gate is what stops the floor coming back -- and it is aimed at
+// the SYMPTOM, not the implementation, so any future scheme that relights
+// caves is free to replace all of it and still be judged the same way.
+//
+// THE FIXTURE IS A SEALED BOX, not the `--shot` stone room, and the difference
+// is the whole point. That room has a doorway, so real light really does enter
+// it and its noon/midnight ratio is legitimately above 1 (2.1x after the fix,
+// and the residual is the sun through the door, which is correct). A room with
+// no opening has exactly one correct answer, and it is the same answer at
+// every hour. Small on purpose (2.4 m of interior): aerial perspective mixes
+// toward the SKY's airglow, which is time-varying, so a long sight line indoors
+// would smuggle a little of the sky back in and the gate would be measuring
+// fog. At 1.2 m that term is ~0.1% and the claim stays about the ambient.
+//
+// THREE ARMS, because "the cave is the same at noon and midnight" is trivially
+// satisfiable by rendering black:
+//   A  the noon frame is not black          (>= caveTime.minDayLum)
+//   B  noon / midnight is within tolerance  (<= caveTime.maxDayNightRatio)
+//   C  the box is genuinely darker than the meadow it is buried beside, so a
+//      gate that passed by making the whole world dim would still fail
+Status GateCaveTime(Ctx& c, std::string& detail) {
+  GpuContext& ctx = c.ctx;
+  World& world = c.world;
+  Simulation& sim = c.sim;
+  const uint32_t W = c.width, H = c.height;
+
+  const uint32_t mStone = [&]() -> uint32_t {
+    for (size_t i = 0; i < c.mats.size(); i++)
+      if (c.mats[i].name == "stone") return (uint32_t)i;
+    return 0;
+  }();
+  if (!mStone) {
+    detail = "stone missing from materials.json";
+    return Status::Fail;
+  }
+  const Tuning base = CurrentTuning();
+
+  SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+  ctx.WaitIdle();
+
+  // Well clear of the ground so worldgen cannot poke a wall, and block-aligned
+  // so the interior faces line up with the openness grid's 4^3 cells.
+  const int kBlk = 1 << (int)kSubOccShift;
+  const int gx = 300, gz = 300;
+  const int ground = World::TerrainHeight(gx, gz, kDefaultSeed);
+  const int kIn = 24;                       // interior edge, voxels (2.4 m)
+  const int kWall = 2;                      // wall thickness: no ray slips between layers
+  const int y0 = (ground + 20) & ~(kBlk - 1);   // interior floor
+  const int x0 = gx & ~(kBlk - 1);
+  const int z0 = gz & ~(kBlk - 1);
+  const IVec3 pchunk{x0 / (int)kChunk, y0 / (int)kChunk, z0 / (int)kChunk};
+
+  std::vector<CellOp> shell;
+  bool sited = true;
+  for (int x = -kWall; x < kIn + kWall; x++)
+    for (int y = -kWall; y < kIn + kWall; y++)
+      for (int z = -kWall; z < kIn + kWall; z++) {
+        const bool inside = x >= 0 && x < kIn && y >= 0 && y < kIn &&
+                            z >= 0 && z < kIn;
+        const IVec3 cc{x0 + x, y0 + y, z0 + z};
+        if (!world.CellInWindow(cc)) { sited = false; continue; }
+        shell.push_back({World::SlotCellIndex(cc),
+                         PackVoxNew(inside ? 0u : mStone, 0u)});
+      }
+  if (!sited || shell.empty()) {
+    detail = "fixture site is outside the residency window";
+    return Status::Fail;
+  }
+
+  // Noon and midnight, scanned rather than hardcoded (the shadow-cache gate
+  // says why): what matters is the extremes of whatever cycle is tuned.
+  uint32_t noonTick = 0, midnightTick = 0;
+  {
+    float bestUp = -2.0f, worstUp = 2.0f;
+    for (uint32_t t = 0; t < 200000u; t += 64u) {
+      const float up = ComputeSky(base, (double)t).sunDir[1];
+      if (up > bestUp) { bestUp = up; noonTick = t; }
+      if (up < worstUp) { worstUp = up; midnightTick = t; }
+    }
+  }
+
+  uint32_t tick = 90000;
+  SubmitTick(ctx, world, sim, ++tick, kDefaultSeed, {}, {}, shell, false,
+             pchunk, false, false);
+  // ONE POKE PER CHUNK THE BOX TOUCHES, AND ENOUGH TICKS TO SCRUB WHAT WAS
+  // HERE BEFORE. Two jobs, and the second one is why this is not the single
+  // poke gi-nightfall uses.
+  //
+  //   (a) The walk has to have MARCHED the interior faces or they read
+  //       "unknown", shade from the plain n.y lerp, and pass arm B for the
+  //       wrong reason. Keeping the box's chunks on the dirty list runs the
+  //       walk there every tick instead of once per ~128-tick sweep.
+  //   (b) THE IRRADIANCE GRID IS NOT CLEARED BY STAMPING GEOMETRY OVER IT.
+  //       Gates share one World and several build fixtures around (300, 300);
+  //       this box lands on block-faces an earlier gate left CHARGED. Measured
+  //       2026-09-11: run standalone the fixture read 1.17x noon/midnight, and
+  //       inside the full suite 1.33x, with the floor row below reporting an
+  //       outgoing word of 0.208 -- identical at noon and midnight, so plainly
+  //       somebody else's sunlight rather than anything this frame computed.
+  //       The walk does discharge it (0.5 per visit for a face it can measure,
+  //       giDecay for one it cannot), but only on visits, and six was not
+  //       enough. Twenty takes the worse of the two rates to 0.3% of whatever
+  //       was there.
+  //
+  // Cheap: 27 CellOps a tick, and each is a rewrite of a cell to what it
+  // already is, so nothing about the fixture changes.
+  std::vector<CellOp> poke;
+  {
+    std::set<uint64_t> seen;
+    for (int x = -kWall; x < kIn + kWall; x += (int)kChunk / 2)
+      for (int y = -kWall; y < kIn + kWall; y += (int)kChunk / 2)
+        for (int z = -kWall; z < kIn + kWall; z += (int)kChunk / 2) {
+          const IVec3 cc{x0 + x, y0 + y, z0 + z};
+          if (!world.CellInWindow(cc)) continue;
+          const IVec3 wc{cc.x >> 4, cc.y >> 4, cc.z >> 4};
+          const uint64_t key = ((uint64_t)(uint32_t)wc.x << 42) ^
+                               ((uint64_t)(uint32_t)wc.y << 21) ^
+                               (uint64_t)(uint32_t)wc.z;
+          if (!seen.insert(key).second) continue;
+          const bool inside = x >= 0 && x < kIn && y >= 0 && y < kIn &&
+                              z >= 0 && z < kIn;
+          poke.push_back({World::SlotCellIndex(cc),
+                          PackVoxNew(inside ? 0u : mStone, 0u)});
+        }
+  }
+  for (int i = 0; i < 20; i++)
+    SubmitTick(ctx, world, sim, ++tick, kDefaultSeed, {}, {}, poke, false,
+               pchunk, false, false);
+  ctx.WaitIdle();
+
+  // Just off the middle of the floor, aimed into a corner so three interior
+  // faces (two walls and the floor) are in frame rather than one flat plane.
+  Camera cam;
+  cam.yaw = 0.7854f;
+  cam.pitch = -0.20f;
+  const Vec3 eye{(float)(x0 + kIn / 2) - 3.0f, (float)(y0 + kIn / 2),
+                 (float)(z0 + kIn / 2) - 3.0f};
+  // The meadow arm's camera: outside, above the box, looking at open ground.
+  Camera outCam;
+  outCam.yaw = 0.7854f;
+  outCam.pitch = -0.35f;
+  const Vec3 outEye{(float)gx - 30.0f, (float)(ground + 10), (float)gz - 30.0f};
+
+  auto shoot = [&](const Vec3& e, const Camera& cc, uint32_t skyTick,
+                   std::vector<uint8_t>& out) -> bool {
+    rhi::Buffer shot =
+        CreateBuffer(ctx.device, (uint64_t)W * H * 4,
+                     rhi::BufferUsage::MapRead | rhi::BufferUsage::CopyDst,
+                     "caveTimeShot");
+    // Six frames: the shadow cache resolves one frame behind the request and
+    // the resolve pass is also what deposits irradiance, so a single frame
+    // would show cold shadows and no bounce (the same reason --shot renders
+    // four).
+    for (uint32_t f = 0; f < 6; f++) {
+      WriteRenderParams(ctx.queue, world, e, cc, (float)W / H, true, 0.0f,
+                        kFarFogDensity, (float)H, skyTick);
+      rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
+      sim.EncodeShadowResolve(enc);
+      rhi::RenderPass rp = sim.BeginRenderPass(
+          enc, c.view, rhi::TextureFormat::RGBA8Unorm, W, H);
+      sim.DrawWorld(rp);
+      rp.End();
+      if (f == 5) {
+        rhi::TexelCopyTexture srcT{};
+        srcT.texture = c.offscreen;
+        rhi::TexelCopyBuffer dstB{};
+        dstB.buffer = shot;
+        dstB.bytesPerRow = W * 4;
+        dstB.rowsPerImage = H;
+        rhi::Extent3D ext{W, H, 1};
+        enc.CopyTextureToBuffer(srcT, dstB, ext);
+      }
+      ctx.queue.Submit(enc.Finish());
+    }
+    out.assign((size_t)W * H * 4, 0);
+    return rhi::ReadBufferBlocking(ctx.device, shot, 0, out.data(), out.size());
+  };
+
+  // LINEAR mean luminance. The frame is gamma-encoded and these values sit near
+  // the bottom of the range, where the encode expands small absolute
+  // differences into large code-value ones -- a ratio taken on the bytes would
+  // be measuring the curve, not the light.
+  auto meanLum = [&](const std::vector<uint8_t>& px) {
+    const double g = base.render.gamma > 0.0f ? (double)base.render.gamma : 2.2;
+    double acc = 0.0;
+    size_t n = 0;
+    for (uint32_t y = H / 8; y < H * 7 / 8; y++)
+      for (uint32_t x = W / 8; x < W * 7 / 8; x++) {
+        const size_t i = ((size_t)y * W + x) * 4;
+        const double r = std::pow((double)px[i] / 255.0, g);
+        const double gg = std::pow((double)px[i + 1] / 255.0, g);
+        const double b = std::pow((double)px[i + 2] / 255.0, g);
+        acc += 0.2126 * r + 0.7152 * gg + 0.0722 * b;
+        n++;
+      }
+    return n ? acc / (double)n : 0.0;
+  };
+
+  // ---- ATTRIBUTION, recorded at the point of failure -----------------------
+  // "The box swings 2.7x" is a bare number, and a bare number costs a run per
+  // hypothesis (CLAUDE.md's rule 6). Three probes on the two inputs the shade
+  // is made of, read at BOTH times of day, say which one moved: the openness
+  // byte (must be 0 on every interior face -- anything else means the grid did
+  // not see the enclosure, and 255 with a bad stamp means it was never walked
+  // and the face is shading from the plain n.y lerp) and the face's irradiance
+  // word (must be ~0 -- a sealed box has no lit surface, so a sun-varying word
+  // means an injection path is charging faces the sun cannot reach).
+  struct Probe { const char* name; IVec3 cell; uint32_t face; };
+  const Probe probes[3] = {
+      {"floor +Y", IVec3{x0 + kIn / 2, y0 - 1, z0 + kIn / 2}, 3u},
+      {"wall  +X", IVec3{x0 - 1, y0 + kIn / 2, z0 + kIn / 2}, 1u},
+      {"ceil  -Y", IVec3{x0 + kIn / 2, y0 + kIn, z0 + kIn / 2}, 2u},
+  };
+  uint32_t openByte[3] = {0, 0, 0};
+  bool openOk[3] = {false, false, false};
+  double irrDay[3] = {0, 0, 0}, irrNight[3] = {0, 0, 0};
+  double gatDay[3] = {0, 0, 0}, gatNight[3] = {0, 0, 0};
+  auto probeIrr = [&](double out[3], double gat[3]) {
+    for (int i = 0; i < 3; i++) {
+      double rgb[3] = {0, 0, 0};
+      UnpackRgb9e5(IrradianceWordAt(ctx, world, probes[i].cell, probes[i].face),
+                   rgb);
+      out[i] = 0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2];
+      // Plane 1: what the nine rays BROUGHT BACK to this face. Nonzero here
+      // with plane 0 at zero everywhere means the gather is finding light the
+      // injection never put in the box — i.e. a ray is reading a face it
+      // cannot see.
+      UnpackRgb9e5(IrradianceWordAt(ctx, world, probes[i].cell, probes[i].face,
+                                    1u),
+                   rgb);
+      gat[i] = 0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2];
+    }
+  };
+
+  std::vector<uint8_t> dayPx, nightPx, meadowPx;
+  bool got = shoot(eye, cam, noonTick, dayPx);
+  for (int i = 0; i < 3; i++)
+    openByte[i] = OpennessByteAt(ctx, world, probes[i].cell, probes[i].face,
+                                 &openOk[i]);
+  probeIrr(irrDay, gatDay);
+  got = got && shoot(eye, cam, midnightTick, nightPx);
+  probeIrr(irrNight, gatNight);
+  got = got && shoot(outEye, outCam, noonTick, meadowPx);
+  // The fourth arm SPLITS the noon frame, and it is attribution rather than a
+  // claim: whatever the probes above cannot explain is either the bounce or
+  // the ambient+sun, and one render with giStrength folded away says which.
+  std::vector<uint8_t> nogiPx;
+  {
+    Tuning t = base;
+    t.render.giStrength = 0.0f;
+    SetCurrentTuning(t);
+    got = got && sim.ReloadShaders(ctx.device) && shoot(eye, cam, noonTick, nogiPx);
+    SetCurrentTuning(base);
+    got = got && sim.ReloadShaders(ctx.device);
+  }
+  if (!got) {
+    detail = "render/readback failed";
+    return Status::Fail;
+  }
+  const double lDay = meanLum(dayPx);
+  const double lNight = meanLum(nightPx);
+  const double lMeadow = meanLum(meadowPx);
+  const double lNoGi = meanLum(nogiPx);
+
+  const double maxRatio = BaselineNumber("caveTime.maxDayNightRatio", 1.25);
+  const double minDay = BaselineNumber("caveTime.minDayLum", 0.0015);
+  const double maxOfMeadow = BaselineNumber("caveTime.maxFracOfMeadow", 0.15);
+  const double maxStale = BaselineNumber("caveTime.maxStaleOutgoing", 0.01);
+  const double ratio = lNight > 0.0 ? lDay / lNight : 1e9;
+  const double frac = lMeadow > 0.0 ? lDay / lMeadow : 1e9;
+  const bool lit = lDay >= minDay;
+  const bool steady = ratio <= maxRatio;
+  const bool dark = frac <= maxOfMeadow;
+  // THE FIXTURE'S OWN CLEANLINESS, checked FIRST and reported as a FIXTURE
+  // failure, the way body-shade checks its deck is really in shadow. Gates
+  // share one World, so this box is stamped over block-faces an earlier gate
+  // may have charged with sunlight, and the irradiance grid is not cleared by
+  // writing geometry over it. A charged face is somebody else's light: it
+  // makes the box brighter at every hour and it is not what this gate is
+  // about. If this trips, the scrub loop above needs more ticks or the fixture
+  // needs a quieter address -- it is NOT a lighting regression.
+  double staleMax = 0.0;
+  for (int i = 0; i < 3; i++)
+    staleMax = std::max(staleMax, std::max(irrDay[i], irrNight[i]));
+  const bool clean = staleMax <= maxStale;
+  const bool ok = clean && lit && steady && dark;
+
+  std::printf(
+      "cave-time: %s (sealed %d-voxel stone box, camera inside, mean LINEAR "
+      "luminance of the middle of the frame. noon %.5f (must be >= %.5f, or "
+      "'unchanged' is satisfied by black), midnight %.5f, ratio %.2fx (must be "
+      "<= %.2fx -- a sealed room has no time of day); the open meadow outside "
+      "reads %.5f, so the box is %.1f%% of it and must be <= %.1f%%. box at "
+      "(%d,%d,%d), ground y=%d, enclosedAmbient (%.3f, %.3f, %.3f), "
+      "opennessFloor %.2f)\n",
+      ok ? "PASS" : "FAIL", kIn, lDay, minDay, lNight, ratio, maxRatio,
+      lMeadow, 100.0 * frac, 100.0 * maxOfMeadow, x0, y0, z0, ground,
+      base.render.enclosedAmbient[0], base.render.enclosedAmbient[1],
+      base.render.enclosedAmbient[2], base.render.opennessFloor);
+  if (!clean)
+    std::printf(
+        "  cave-time: FIXTURE, not the lighting — a probed face still holds an "
+        "outgoing radiance of %.5f (cap %.5f) that this box did not put there. "
+        "Gates share one World and the irradiance grid is not cleared by "
+        "stamping geometry over it; the scrub loop needs more ticks or the "
+        "fixture needs a quieter address.\n",
+        staleMax, maxStale);
+  std::printf(
+      "  cave-time split: noon %.5f, noon with giStrength=0 %.5f, midnight "
+      "%.5f. bounce carries %.5f of the noon frame, ambient+sun the other "
+      "%.5f, and midnight is what the sun-independent terms alone look like\n",
+      lDay, lNoGi, lNight, lDay - lNoGi, lNoGi);
+  for (int i = 0; i < 3; i++)
+    std::printf(
+        "  cave-time probe %s at (%d,%d,%d): openness byte %u%s (0 = sealed, "
+        "255 = no opinion); OUTGOING word noon %.5f midnight %.5f (a sealed "
+        "box has no lit surface: both should be ~0); GATHERED word noon %.5f "
+        "midnight %.5f (nonzero while every outgoing word is zero means a ray "
+        "read a face it cannot see)\n",
+        probes[i].name, probes[i].cell.x, probes[i].cell.y, probes[i].cell.z,
+        openByte[i], openOk[i] ? "" : " STAMP MISMATCH - never walked",
+        irrDay[i], irrNight[i], gatDay[i], gatNight[i]);
+  if (!ok) {
+    // A ROW of floor block-faces across the box. "The bounce lands on the
+    // floor" is still a region, and the blocks near a wall behave differently
+    // from the ones in the middle: it was this row reading clean zero for the
+    // four blocks the camera could not see and nonzero for the two it could
+    // that named an ON-SCREEN-ONLY writer, after the three single probes above
+    // had all read clean and said nothing. Keep it. The bug it found (the P2
+    // write-back recording a shadow-cache MISS as a measurement) has exactly
+    // this signature and nothing else in the shade does.
+    std::printf("  cave-time floor row (face +Y, z=%d):\n", z0 + kIn / 2);
+    for (int bx = 0; bx < kIn; bx += kBlk) {
+      const IVec3 cc{x0 + bx + kBlk / 2, y0 - 1, z0 + kIn / 2};
+      bool okr = false;
+      const uint32_t ob = OpennessByteAt(ctx, world, cc, 3u, &okr);
+      double g[3] = {0, 0, 0}, o[3] = {0, 0, 0};
+      UnpackRgb9e5(IrradianceWordAt(ctx, world, cc, 3u, 1u), g);
+      UnpackRgb9e5(IrradianceWordAt(ctx, world, cc, 3u, 0u), o);
+      std::printf("    x=%3d open=%3u%s outgoing=%.5f gathered=%.5f\n", cc.x,
+                  ob, okr ? "" : "(stale)",
+                  0.2126 * o[0] + 0.7152 * o[1] + 0.0722 * o[2],
+                  0.2126 * g[0] + 0.7152 * g[1] + 0.0722 * g[2]);
+    }
+    WriteBmpFile("build/cave_time_day.bmp", dayPx, W, H);
+    WriteBmpFile("build/cave_time_night.bmp", nightPx, W, H);
+    WriteBmpFile("build/cave_time_meadow.bmp", meadowPx, W, H);
+    WriteBmpFile("build/cave_time_nogi.bmp", nogiPx, W, H);
+  }
+  detail = Format("noon %.5f, midnight %.5f, ratio %.2fx (<= %.2fx); %.1f%% of "
+                  "the meadow (<= %.1f%%); stale outgoing %.5f (<= %.5f)%s%s",
+                  lDay, lNight, ratio, maxRatio, 100.0 * frac,
+                  100.0 * maxOfMeadow, staleMax, maxStale,
+                  lit ? "" : " - TOO DARK TO JUDGE",
+                  clean ? "" : " - FIXTURE CONTAMINATED, not the lighting");
   return ok ? Status::Pass : Status::Fail;
 }
 
@@ -3205,6 +3588,11 @@ const std::vector<Gate>& RenderGates() {
       // No render pass on purpose: the resolve pass must not be able to
       // contribute, or the gate would be measuring the charger.
       {"gi-nightfall", "render", {}, false, GateGiNightfall},
+      // Draws the same sealed box twice (noon and midnight) plus the meadow
+      // outside it, and compares the three. It leaves a stone box in the world
+      // at (300, ground+20, 300), which is why it sits with the other fixture
+      // gates rather than before anything that reads that region.
+      {"cave-time", "render", {}, false, GateCaveTime, /*needsRender=*/true},
       {"glow", "render", {}, false, GateGlow},
       // The only gate in the suite that DRAWS A RIGIDBODY. Three arms of one
       // fixture frame, and it spawns a body through the real destruction path.

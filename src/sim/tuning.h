@@ -2651,7 +2651,10 @@ struct Tuning {
     float opennessReach = 12.0f;        // metres a hemisphere ray looks
     int opennessChunksPerFrame = 256;   // slots the rolling refresh walks/tick
     float opennessStrength = 1.0f;      // 0 = old lerp AND the pass unrecorded
-    float opennessFloor = 0.3f;         // least ambient multiplier an enclosed face keeps
+    float opennessFloor = 0.0f;         // the pre-2026-09-11 daylight leak, kept as its A/B arm
+    // The enclosed face's own ambient, ADDED at (1 - openness) and independent
+    // of the sun/moons: a cave must not know what time it is.
+    float enclosedAmbient[3] = {0.012f, 0.013f, 0.016f};
     int opennessBilinear = 1;           // blend the 4 blocks in the face plane
 
     // ---- one-bounce indirect light (docs/PLAN_gi.md §3) ----
@@ -2660,8 +2663,8 @@ struct Tuning {
     float giStrength = 2.0f;            // 0 = everything const-folded away
     float giDecay = 0.25f;              // per-visit fade of unmeasurable faces
     float giFeedback = 0.2f;            // P2 write-back weight, < giDecay
-    int giGatherBlocks = 3;             // blocks per gather ray
-    int giCachePeriod = 8;              // frames between a slot's re-gathers; 0 = uncached
+    int giGatherBlocks = 12;            // STEP budget per gather ray (a clear chunk = 1 step)
+    int giCachePeriod = 16;             // frames between a slot's re-gathers; 0 = uncached
 
     // ---- the glow field (src/sim/world.h kGlowBytes) ----
     // A coarse position-keyed field of emitter light, written by sim_glow.wgsl

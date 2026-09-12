@@ -184,7 +184,7 @@ fn vsParticle(@builtin(vertex_index) vi : u32,
   let bt = burnTint(m, albedo, f32(m.emission) / 255.0,
                     burnTintWeightH(pcg(inst * 2917u), R.time));
   out.color = litColorO(bt.albedo, n, world, bt.emis, R,
-                        opennessScaleAtBody(world, &occupancy, &openness, &opennessGen));
+                        opennessAtBody(world, &occupancy, &openness, &opennessGen));
   // Emitter light from the glow field. A spark shower thrown out of a forge or
   // a burning leaf tumbling past a lava pit is lit by it; before this the only
   // light on a loose particle was the sky and its own emission. `ao` 1.0 —
@@ -327,7 +327,7 @@ fn vsFluid(@builtin(vertex_index) vi : u32,
   var out : VSOut;
   out.pos = projectView(world - R.camPos, R);
   out.color = litColorO(albedo, n, world, 0.0, R,
-                        opennessScaleAtBody(world, &occupancy, &openness, &opennessGen));
+                        opennessAtBody(world, &occupancy, &openness, &opennessGen));
   return out;
 }
 
@@ -341,7 +341,7 @@ fn vsSprite(@builtin(vertex_index) vi : u32,
   var out : VSOut;
   out.pos = projectView(world - R.camPos, R);
   out.color = litColorO(unpackColor(s.color), n, world, s.emission, R,
-                        opennessScaleAtBody(world, &occupancy, &openness, &opennessGen));
+                        opennessAtBody(world, &occupancy, &openness, &opennessGen));
   return out;
 }
 
