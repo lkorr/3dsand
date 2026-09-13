@@ -750,6 +750,20 @@ uint32_t DebrisSystem::RequiredVersion(IVec3 wc, uint32_t eventTick) const {
 bool DebrisSystem::EventReady(const Event& e, World& world, bool requestFetch) const {
   bool ready = true;
   const int cx0 = std::max(e.lo.x, e.seedLo.x - 1) >> 4;
+  // A fetch-deferred event waits for the chunk its flood stopped at (Event::
+  // waiting). A chunk that streamed out meanwhile is not waited for: the
+  // re-scan reads it as UNKNOWN and anchors, which is the right verdict for
+  // matter that continues into the unloaded world.
+  // SANDVOX_NO_FETCH_WAIT=1: the pre-2026-09-12 behaviour (re-run at once),
+  // as an A/B arm in one binary.
+  static const bool noWait = std::getenv("SANDVOX_NO_FETCH_WAIT") != nullptr;
+  if (!noWait && e.waiting && world.ChunkInWindow(e.waitChunk)) {
+    const CachedChunk* cc = world.Cached(e.waitChunk);
+    if (!cc || cc->voxels.size() != kChunkVol) {
+      if (requestFetch) world.RequestChunkFetch(e.waitChunk);
+      return false;
+    }
+  }
   const int cx1 = std::min(e.hi.x, e.seedHi.x + 1) >> 4;
   const int cy0 = std::max(e.lo.y, e.seedLo.y - 1) >> 4;
   const int cy1 = std::min(e.hi.y, e.seedHi.y + 1) >> 4;
@@ -885,6 +899,10 @@ void DebrisSystem::RunIslandDetection(const Event& e, uint32_t tick, World& worl
     bool complete = true;         // `cells` is the whole component
     bool touchedUnfetched = false;  // reached a chunk the mirror lacks: not judged
   };
+    // The first cell that anchored this component (trace only): the answer to
+    // "anchored by WHAT" is a place, not a flag.
+    IVec3 anchorAt{};
+    bool anchorSet = false;
   std::vector<Comp> comps;
   std::unordered_map<uint64_t, int32_t>& label = scanLabel_;
   label.clear();
@@ -928,7 +946,7 @@ void DebrisSystem::RunIslandDetection(const Event& e, uint32_t tick, World& worl
       comp.words.push_back(w);
       floaters_.scanCellsVisited++;
       if (comp.cells.size() > kMaxIslandVoxels) {  // abort: too big to judge
-        comp.anchored = true;
+        comp.anchored = true; if (!comp.anchorSet) { comp.anchorSet = true; comp.anchorAt = c; }
         comp.oversizeAnchor = true;
       }
       if (c.y < e.seedLo.y - kAnchorDropBelowSeed ||  // this is the ground
@@ -937,7 +955,7 @@ void DebrisSystem::RunIslandDetection(const Event& e, uint32_t tick, World& worl
             c.x > e.seedHi.x + kAnchorReachBesideSeed ||
             c.z < e.seedLo.z - kAnchorReachBesideSeed ||
             c.z > e.seedHi.z + kAnchorReachBesideSeed))) {
-        comp.anchored = true;
+        comp.anchored = true; if (!comp.anchorSet) { comp.anchorSet = true; comp.anchorAt = c; }
         comp.boundaryAnchor = true;
       }
       // Leaving the region only anchors when the structure actually CONTINUES
@@ -950,7 +968,7 @@ void DebrisSystem::RunIslandDetection(const Event& e, uint32_t tick, World& worl
         uint32_t ow = 0;
         const int k = wordAt(nx, ny, nz, ow);
         if (k == CELL_AIR) continue;
-        comp.anchored = true;
+        comp.anchored = true; if (!comp.anchorSet) { comp.anchorSet = true; comp.anchorAt = c; }
         if (k == CELL_UNKNOWN) comp.unknownAnchor = true;
         else comp.boundaryAnchor = true;
       }
@@ -960,7 +978,7 @@ void DebrisSystem::RunIslandDetection(const Event& e, uint32_t tick, World& worl
         uint32_t bw = 0;
         if (inRegion(c.x, c.y - 1, c.z) &&
             wordAt(c.x, c.y - 1, c.z, bw) == CELL_POWDER) {
-          comp.anchored = true;
+          comp.anchored = true; if (!comp.anchorSet) { comp.anchorSet = true; comp.anchorAt = c; }
           comp.powderAnchor = true;
         }
       }
@@ -971,7 +989,7 @@ void DebrisSystem::RunIslandDetection(const Event& e, uint32_t tick, World& worl
         const int k = wordAt(nx, ny, nz, nw);
         if (k == CELL_UNKNOWN) {
           if (world.CellInWindow({nx, ny, nz})) comp.touchedUnfetched = true;
-          else { comp.anchored = true; comp.unknownAnchor = true; }
+          else { comp.anchored = true; if (!comp.anchorSet) { comp.anchorSet = true; comp.anchorAt = c; } comp.unknownAnchor = true; }
           continue;
         }
         if (k != CELL_SOLID) continue;
@@ -983,7 +1001,7 @@ void DebrisSystem::RunIslandDetection(const Event& e, uint32_t tick, World& worl
         } else if (it->second != next && comps[(size_t)it->second].anchored) {
           // touching a component already judged anchored: so is this one
           const Comp& other = comps[(size_t)it->second];
-          comp.anchored = true;
+          comp.anchored = true; if (!comp.anchorSet) { comp.anchorSet = true; comp.anchorAt = c; }
           comp.boundaryAnchor = comp.boundaryAnchor || other.boundaryAnchor;
           comp.unknownAnchor = comp.unknownAnchor || other.unknownAnchor;
           comp.oversizeAnchor = comp.oversizeAnchor || other.oversizeAnchor;
@@ -1366,10 +1384,60 @@ void DebrisSystem::RunIslandDetection(const Event& e, uint32_t tick, World& worl
   }
 
   if (deferEvent) {
+  // SANDVOX_ISLAND_TRACE=1: one line per scan, naming what the scan saw and
+  // what it is waiting for. The live --fell-tree harness found a cut tree
+  // that never became a body (99 scans, 3 fetch give-ups, 165k cells read
+  // from unfetched chunks) and the FloaterProbe totals could not say whether
+  // the fetches were never issued, never landed, or landed and were re-read
+  // stale. This line says it per scan; off unless asked.
+  static const bool traceScans = std::getenv("SANDVOX_ISLAND_TRACE") != nullptr;
+  if (traceScans) {
+    size_t largest = 0, cellsAll = 0;
+    int lFlags = 0;
+    IVec3 lLo{}, lHi{}, lAnchor{};
+    for (const Comp& cm : comps) {
+      cellsAll += cm.cells.size();
+      if (cm.cells.size() > largest) {
+        largest = cm.cells.size();
+        lFlags = (cm.anchored ? 1 : 0) | (cm.boundaryAnchor ? 2 : 0) |
+                 (cm.unknownAnchor ? 4 : 0) | (cm.oversizeAnchor ? 8 : 0) |
+                 (cm.powderAnchor ? 16 : 0) | (cm.touchedUnfetched ? 32 : 0) |
+                 (cm.complete ? 64 : 0);
+        lAnchor = cm.anchorAt;
+        lLo = lHi = cm.cells.empty() ? IVec3{} : cm.cells[0];
+        for (const IVec3& cc : cm.cells) {
+          lLo.x = std::min(lLo.x, cc.x); lLo.y = std::min(lLo.y, cc.y); lLo.z = std::min(lLo.z, cc.z);
+          lHi.x = std::max(lHi.x, cc.x); lHi.y = std::max(lHi.y, cc.y); lHi.z = std::max(lHi.z, cc.z);
+        }
+      }
+    }
+    const CachedChunk* fw = needFetch ? world.Cached(firstWait) : nullptr;
+    std::printf("island-trace: tick %u ev (%d,%d,%d)..(%d,%d,%d) seed (%d,%d,%d).."
+                "(%d,%d,%d) retry %u fetchRetry %u | comps %zu cells %zu largest "
+                "%zu flags %d (1 anch 2 bnd 4 unk 8 big 16 pwd 32 unf 64 done) box "
+                "(%d,%d,%d)..(%d,%d,%d) anchorAt (%d,%d,%d) | "
+                "fetches %u needFetch %d firstWait (%d,%d,%d) inWin %d cached %d "
+                "ver %u words %zu | defer %d made %u\n",
+                tick, e.lo.x, e.lo.y, e.lo.z, e.hi.x, e.hi.y, e.hi.z, e.seedLo.x,
+                e.seedLo.y, e.seedLo.z, e.seedHi.x, e.seedHi.y, e.seedHi.z,
+                (unsigned)e.retries, (unsigned)e.fetchRetries, comps.size(),
+                cellsAll, largest, lFlags, lLo.x, lLo.y, lLo.z, lHi.x, lHi.y,
+                lHi.z, lAnchor.x, lAnchor.y, lAnchor.z, fetchesIssued, needFetch ? 1 : 0,
+                firstWait.x, firstWait.y, firstWait.z,
+                world.ChunkInWindow(firstWait) ? 1 : 0, fw ? 1 : 0,
+                fw ? fw->version : 0u, fw ? fw->voxels.size() : (size_t)0,
+                deferEvent ? 1 : 0, madeThisScan);
+  }
     if (needFetch ? e.fetchRetries < kMaxFetchRetries : e.retries < kMaxEventRetries) {
       Event again = e;
-      if (needFetch) again.fetchRetries = (uint8_t)(e.fetchRetries + 1);
-      else again.retries = (uint8_t)(e.retries + 1);
+      if (needFetch) {
+        again.fetchRetries = (uint8_t)(e.fetchRetries + 1);
+        again.waiting = true;
+        again.waitChunk = firstWait;
+      } else {
+        again.retries = (uint8_t)(e.retries + 1);
+        again.waiting = false;
+      }
       // The event KEEPS its tick. Re-stamping it with the current tick made
       // every chunk fetched in the previous round stale for this one, so a
       // flood that needed three rounds to reach a crown never converged: it

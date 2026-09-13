@@ -36,6 +36,7 @@
 
 #include "test/selftest.h"
 #include "test/support.h"
+#include "test/treefixture.h"
 
 using namespace sandvox;
 
@@ -627,14 +628,7 @@ uint32_t DitherHash(int x, int y, int z) {
   return h;
 }
 
-struct TreeFixture {
-  IVec3 base{};            // trunk foot, world cells (base.y is the ground cell)
-  int height = 0;          // trunk top, cells above base.y
-  int crownR = 0;          // crown radius, cells
-  IVec3 lo{}, hi{};        // the whole tree's bounding box
-  uint32_t woodCells = 0;  // what was actually written
-  uint32_t leafCells = 0;
-};
+}  // namespace
 
 // Author one tree as exact-cell ops. Trunk, four sloping limbs, and a dithered
 // ellipsoid crown — the shape that matters here is not botanical accuracy but
@@ -761,6 +755,8 @@ TreeFixture BuildTree(const World& world, IVec3 base, uint32_t wood,
   }
   return t;
 }
+
+namespace {
 
 Status GateTreeFell(Ctx& c, std::string& detail) {
   World& world = c.world;

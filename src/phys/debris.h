@@ -717,6 +717,18 @@ class DebrisSystem {
     // here, and labelling the whole terrain slab in a 64^3 region for every
     // scan was most of what a scan cost.
     IVec3 seedLo{}, seedHi{};
+    // Deferred for a FETCH: the first chunk the flood reached that the mirror
+    // did not hold. EventReady holds the event until that chunk's copy has
+    // landed, and only then does the re-scan (and the next fetchRetries
+    // increment) happen. Without this the re-queued event was ready again
+    // the same tick -- its SEED box was cached, only the crown was not -- and
+    // the drain loop ran it 32 times in two ticks, long before any readback
+    // could land: in the live game every scan that left the 3x3x3 mirror gave
+    // up on the spot, and a cut tree 48 voxels from the player never fell.
+    // The gates never saw it because they force-fetch their whole fixture box
+    // every tick (--fell-tree, 2026-09-12: 99 scans, 3 give-ups, 0 bodies).
+    bool waiting = false;
+    IVec3 waitChunk{};
   };
   struct Body {
     uint64_t handle = 0;

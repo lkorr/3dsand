@@ -76,6 +76,7 @@
 #include "measure/renderstats.h"
 #include "test/support.h"
 #include "ui/overlay.h"
+#include "test/treefixture.h"
 #include "crash.h"
 
 // The sim/render plumbing these once defined in place now lives in
@@ -312,6 +313,22 @@ bool g_duelDummy = false;
 // procedural surface route happens to stop.
 //
 // The route is dt-integrated, so where it ends is not a choice anybody made —
+// --fell-tree: the tree-fell gate's fixture, planted 48 voxels ahead of the
+// player once the world has settled, cut 120 ticks later, and the 300-tick
+// fall profiled exactly as the gate profiles it. The gate is headless, so the
+// render half of the handoff (BuildInstances, the drawBodies span, the
+// whole-frame time) only exists as a number HERE, under --frames.
+bool g_fellTree = false;
+int g_fellTreeAt = 240;  // the plant tick; the cut is 120 ticks later
+// An optional site ("x,z"): the game then STARTS 48 voxels west of it looking
+// +X, so the tree stands there. Default is 48 voxels ahead of wherever the
+// player spawned -- which at the map's spawn site is inside a forest, and a
+// crown that touches a neighbour's is anchored through it (2026-09-12: the
+// flood walked 54 voxels west and 40 down through another tree and correctly
+// refused). The harness pad (map.json site `harness`, x/z -128..640) has no
+// trees by construction; --fell-tree 240 200,200 plants there.
+bool g_fellSiteSet = false;
+int g_fellSiteX = 0, g_fellSiteZ = 0;
 // the 2026-08-24 answer below came back "97% of the survivors contain LAVA"
 // because that is what the flight passed over, and a re-run on 2026-09-08
 // landed in open desert and settled to 0 active chunks. Neither run says
@@ -3121,6 +3138,15 @@ int main(int argc, char** argv) {
     // row: no offscreen path can press a radio button, and the whole point of
     // the mode is a LOOK and a frame time to compare, both of which are
     // captured by --shot / --render-budget. Equivalent to
+    else if (a == "--fell-tree") {
+      g_fellTree = true;
+      if (i + 1 < argc && argv[i + 1][0] != '-') g_fellTreeAt = std::atoi(argv[++i]);
+      if (i + 1 < argc && argv[i + 1][0] != '-' &&
+          std::sscanf(argv[i + 1], "%d,%d", &g_fellSiteX, &g_fellSiteZ) == 2) {
+        g_fellSiteSet = true;
+        i++;
+      }
+    }
     // SANDVOX_SHORT_RANGE=1. `--short-range-near` picks the tighter arm
     // (render.shortRangeNearDist, 50 m by default) and implies the mode, so
     // the near arm is one flag rather than two that must be given together.
@@ -4322,6 +4348,16 @@ int main(int argc, char** argv) {
   }
   // seed the far-field cascades around spawn (coarsest first; the queue
   // drains at kFarListCap level-chunks per tick through SubmitTick)
+  if (g_fellSiteSet) {
+    const int px = g_fellSiteX - 48;
+    player.pos = Vec3{(float)px,
+                      (float)(World::TerrainHeight(px, g_fellSiteZ, kDefaultSeed) + 10),
+                      (float)g_fellSiteZ};
+    cam.yaw = 0.0f;    // Forward() = +X: the tree is planted 48 voxels that way
+    cam.pitch = 0.0f;
+    std::printf("--fell-tree: spawn moved to (%d, %d) so the tree stands at (%d, %d)\n",
+                px, g_fellSiteZ, g_fellSiteX, g_fellSiteZ);
+  }
   far.FullRefill({ifloor(player.pos.x) >> 4, ifloor(player.pos.y) >> 4,
                   ifloor(player.pos.z) >> 4});
   StartupMark("far-field refill queued");
@@ -7497,6 +7533,117 @@ int main(int argc, char** argv) {
               else
                 hitStop.Request(fx.hitStopChipScale, fx.hitStopChipMs);
               // The impact cue, latched for the same reason and peak-held on
+      // ---- --fell-tree: the tree-fell gate's cut, in the live frame loop ----
+      // Same fixture (selftest::BuildTree), same cut (a 9x9x3 slab of air ten
+      // cells up plus the destruction event the brush would raise), same
+      // 300-tick profile window. What differs is that this loop RENDERS.
+      if (g_fellTree) {
+        static int fellPhase = 0;  // 0 waiting, 1 planted, 2 cut, 3 reported
+        static uint32_t fellPlantTick = 0, fellCutTick = 0;
+        static int fellGroundY = 0;
+        static size_t fellFrame0 = 0;
+        static bool fellBodySeen = false;
+        static selftest::TreeFixture fellTree;
+        auto matByName = [&](const char* n) -> uint32_t {
+          for (size_t i = 0; i < mats.size(); i++)
+            if (mats[i].name == n) return (uint32_t)i;
+          return 0u;
+        };
+        if ((tick % 60u) == 0u)
+          std::printf("--fell-tree: tick %u player (%.1f,%.1f,%.1f) yaw %.2f fly %d\n",
+                      tick, player.pos.x, player.pos.y, player.pos.z, cam.yaw,
+                      player.fly ? 1 : 0);
+        if (fellPhase == 0 && tick >= (uint32_t)g_fellTreeAt) {
+          const Vec3 fwd = cam.Forward();
+          const int bx = ifloor(player.pos.x + fwd.x * 48.0f);
+          const int bz = ifloor(player.pos.z + fwd.z * 48.0f);
+          fellGroundY = World::TerrainHeight(bx, bz, kDefaultSeed);
+          fellTree = selftest::BuildTree(world, {bx, fellGroundY + 1, bz},
+                                         matByName("wood"),
+                                         matByName("leaves"), cellOps);
+          fellPlantTick = tick;
+          fellPhase = 1;
+          // A crown that touches a hillside is anchored, and the cut then
+          // frees nothing: say what the ground does under the box.
+          int hillMax = fellGroundY;
+          for (int z = fellTree.lo.z; z <= fellTree.hi.z; z++)
+            for (int x = fellTree.lo.x; x <= fellTree.hi.x; x++)
+              hillMax = std::max(hillMax, World::TerrainHeight(x, z, kDefaultSeed));
+          std::printf("--fell-tree: ground under the box rises to y%d (trunk foot "
+                      "y%d, crown from y%d)\n", hillMax, fellGroundY + 1,
+                      fellGroundY + 1 + fellTree.height - 6 - fellTree.crownR / 2);
+          std::printf("--fell-tree: planted at (%d,%d,%d) tick %u: %u wood + %u "
+                      "leaves, box (%d,%d,%d)..(%d,%d,%d)\n",
+                      bx, fellGroundY + 1, bz, tick, fellTree.woodCells,
+                      fellTree.leafCells, fellTree.lo.x, fellTree.lo.y,
+                      fellTree.lo.z, fellTree.hi.x, fellTree.hi.y, fellTree.hi.z);
+          std::fflush(stdout);
+        } else if (fellPhase == 1 && tick >= fellPlantTick + 120) {
+          const int fx = fellTree.base.x, fz = fellTree.base.z;
+          const int cutY = fellGroundY + 11;
+          for (int y = cutY; y < cutY + 3; y++)
+            for (int dz = -4; dz <= 4; dz++)
+              for (int dx = -4; dx <= 4; dx++) {
+                const IVec3 cc{fx + dx, y, fz + dz};
+                if (!world.CellInWindow(cc)) continue;
+                if (cellOps.size() < kMaxCellOpsPerTick)
+                  cellOps.push_back({World::SlotCellIndex(cc), 0u});
+              }
+          debris.AddDestructionEvent(tick, {fx - 5, fellGroundY + 10, fz - 5},
+                                     {fx + 5, fellGroundY + 15, fz + 5});
+          debris.SetProfiling(true);
+          debris.ResetProfile();
+          debris.ResetFloaterProbe();
+          fellCutTick = tick;
+          fellFrame0 = g_frameMs.size();
+          fellPhase = 2;
+          std::printf("--fell-tree: cut at tick %u (frame %zu)\n", tick,
+                      fellFrame0);
+          std::fflush(stdout);
+        } else if (fellPhase == 2 && debris.BodyCount() > 0 && !fellBodySeen) {
+          fellBodySeen = true;
+          std::printf("--fell-tree: first body at tick %u (+%u after the cut), "
+                      "%u vox\n", tick, tick - fellCutTick,
+                      debris.BodyVoxelCount(0));
+          std::fflush(stdout);
+        } else if (fellPhase == 2 && tick >= fellCutTick + 300) {
+          fellPhase = 3;
+          const DebrisSystem::FloaterProbe& fp = debris.Floaters();
+          std::printf("--fell-tree: probe: scans %u, oversize-bbox %u, "
+                      "deferred-oversize %u, defer-gave-up %u (fetch %u), "
+                      "deferred-unfetched %u, fetch-wait no-cache %u no-vox %u, "
+                      "anchored boundary %u unknown %u oversize-flood %u, "
+                      "stuck-dropped %u, queue-full-dropped %u | last give-up: chunk "
+                      "(%d,%d,%d) inWin %u cached %u, seed (%d,%d,%d)..(%d,%d,%d)\n",
+                      fp.scans, fp.oversizeBboxSkipped, fp.deferredOversize,
+                      fp.deferGaveUp, fp.deferGaveUpFetch, fp.deferredUnfetched,
+                      fp.fetchWaitNoCache, fp.fetchWaitNoVoxels,
+                      fp.anchoredByRegionBoundary, fp.anchoredByUnknownChunk,
+                      fp.anchoredByOversizeFlood, fp.stuckEventDropped,
+                      fp.eventQueueFullDropped, fp.gaveUpChunk.x, fp.gaveUpChunk.y,
+                      fp.gaveUpChunk.z, fp.gaveUpChunkInWindow, fp.gaveUpChunkCached,
+                      fp.gaveUpSeedLo.x, fp.gaveUpSeedLo.y, fp.gaveUpSeedLo.z,
+                      fp.gaveUpSeedHi.x, fp.gaveUpSeedHi.y, fp.gaveUpSeedHi.z);
+          uint32_t bodies = debris.BodyCount(), vox = 0;
+          for (uint32_t b = 0; b < bodies; b++) vox += debris.BodyVoxelCount(b);
+          std::vector<double> win(g_frameMs.begin() + (ptrdiff_t)fellFrame0,
+                                  g_frameMs.end());
+          std::sort(win.begin(), win.end());
+          auto pct = [&](double p) {
+            return win.empty() ? 0.0 : win[(size_t)(p * (win.size() - 1))];
+          };
+          size_t over33 = 0;
+          for (double m : win) if (m > 33.0) over33++;
+          std::printf("--fell-tree: FALL over 300 ticks / %zu frames: whole-frame "
+                      "ms p50 %.1f p95 %.1f p99 %.1f max %.1f, >33ms %zu; bodies "
+                      "%u holding %u vox; COST %s\n",
+                      win.size(), pct(0.5), pct(0.95), pct(0.99),
+                      win.empty() ? 0.0 : win.back(), over33, bodies, vox,
+                      debris.ProfileReport().c_str());
+          std::fflush(stdout);
+          if (!std::getenv("SANDVOX_DEBRIS_PROFILE")) debris.SetProfiling(false);
+        }
+      }
               // power so one frame carrying four tick-hits plays the hardest
               // of them once rather than four overlapping copies of nearly the
               // same sound.
