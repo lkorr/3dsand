@@ -237,6 +237,16 @@ class Physics {
   // no collider could have stopped it. Returns false if the handle is dead.
   bool SetBodyPosition(uint64_t handle, Vec3 posVoxel);
 
+  // Teleport a body's POSITION AND ROTATION, keeping both velocities. Same
+  // "skips collision" caveat as SetBodyPosition, and the same reason to exist:
+  // a body whose pose is DERIVED from another body's has no pose of its own to
+  // solve for. Mob::DriveWornShells uses it to put a garment exactly on the
+  // limb it is strapped to, every tick — MoveKinematicBody could not, because
+  // it aims a body at a pose it reaches at the END of the next step, and one
+  // tick of lag on a limb falling at 40 m/s is four voxels of daylight between
+  // a hood and the head inside it.
+  bool SetBodyTransform(uint64_t handle, Vec3 posVoxel, const float quat[4]);
+
   // Move a body onto (or off) the PLAYER-AVATAR collision layer. Bodies there
   // behave exactly like normal dynamic bodies except that they never generate
   // contacts with the player proxy, and they are invisible to PlayerPushOut.

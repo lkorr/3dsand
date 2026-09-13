@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <climits>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -32,6 +33,30 @@ inline Quat AxisAngle(Vec3 axis, float angle) { return QuatAxisAngle(axis, angle
 inline Quat Mul(const Quat& a, const Quat& b) { return QuatMul(a, b); }
 inline Vec3 Rotate(const Quat& q, Vec3 v) { return QuatRotate(q, v); }
 inline Vec3 RotateInv(const Quat& q, Vec3 v) { return QuatRotateInv(q, v); }
+
+// ---- THE RIG-COHERENCE A/B ARM, IN ONE BINARY -------------------------------
+//
+// "A limp rig holds itself together" is two mechanisms that landed together on
+// 2026-09-13 for one owner report (a clothed human going limp mid-fall comes
+// apart into "a crazy tangled mess ball of limbs and clothes"):
+//
+//   1. a worn shell is a kinematic FOLLOWER of the limb it covers, with no
+//      constraint (MobLimb::wornHost, Mob::DriveWornShells);
+//   2. the whole limp rig is anti-tunnel-clamped as ONE object
+//      (DebrisSystem::UntunnelRig) instead of body by body.
+//
+// Both change where a rig's bodies end up, so the next unexplained ragdoll
+// number is going to want to ask "was it this?" — and a differential measured
+// across two BUILDS measures the builds (CLAUDE.md). SANDVOX_NO_RIGWELD=1
+// restores the pre-2026-09-13 behaviour of both: jointed dynamic shells and the
+// per-body clamp. Read once and cached; unset costs one predictable branch.
+bool RigWeldOff() {
+  static const bool kOff = [] {
+    const char* e = std::getenv("SANDVOX_NO_RIGWELD");
+    return e != nullptr && e[0] != '0';
+  }();
+  return kOff;
+}
 
 // sim/rng.h: a given (mob, limb, tick, index) always produces the same droplet.
 // Spray direction is presentation, but it is authored INTO the tick's spawn
@@ -4072,6 +4097,16 @@ void Mob::SubmitPose(float dt, bool writeXf) {
     // a severed part in its hold window keeps its last pose and is not
     // re-driven; the countdown lives in TickSeveredHolds
     if (limb.holdSeconds > 0) continue;
+    // A WORN SHELL IS POSED ONCE, IN PostStep, off the limb it covers
+    // (DriveWornShells). It used to be posed here too — its AnimPart rest is
+    // the identity, so the pose pipeline hands it the host's pose and the two
+    // agreed while both were kinematic. They stop agreeing the moment either
+    // one is placed by anything else: a limp host is placed by Jolt, a
+    // get-up host by a per-limb blend, and a rounding difference in a blend is
+    // still a garment floating off a shoulder. Deriving it in exactly one place
+    // is what makes "the clothes are on the body" true by construction rather
+    // than by two code paths agreeing.
+    if (limb.wornHost >= 0) continue;
     // a LIMP limb is dynamic: Jolt places it and PostStep reads it back.
     // (Reached only by the avatar; the NPC loop skips SubmitPose entirely.)
     if (ragdoll_ == RagdollPhase::Limp) continue;
@@ -4178,6 +4213,11 @@ void Mob::StartRagdoll(float minSeconds, const char* why) {
     MobLimb& limb = limbs_[i];
     if (!limb.body) continue;
     if (limb.holdSeconds > 0) continue;  // a severed piece mid-hold is not ours to flip
+    // A GARMENT DOES NOT GET A VOTE. A worn shell stays kinematic and stays a
+    // follower of the limb it covers (MobLimb::wornHost): it is the one kind of
+    // slot whose pose is derived rather than solved, and handing it to the
+    // solver here is what used to strip a falling body's clothes off it.
+    if (limb.wornHost >= 0) continue;
     // Fresh transform first: the kinematic target this tick already went to
     // Jolt, and the read-back below is what the get-up will start from if
     // the body never moves (a creature flipped standing still).
@@ -4222,8 +4262,11 @@ void MobSystem::AppendLiveLimbBodies(std::vector<uint64_t>& out) const {
 
 void Mob::SetLimbVelocities(Vec3 velVoxPerSec) {
   if (!phys_) return;
+  // Followers excluded: a worn shell's velocity is its host's, handed to it by
+  // DriveWornShells, and writing one here would be overwritten this same tick.
   for (MobLimb& l : limbs_)
-    if (l.body && l.holdSeconds <= 0) phys_->SetBodyVelocity(l.body, velVoxPerSec);
+    if (l.body && l.holdSeconds <= 0 && l.wornHost < 0)
+      phys_->SetBodyVelocity(l.body, velVoxPerSec);
   // A velocity SET is not a velocity LOST. Reseed the arrest reference so the
   // next limp tick differences against what the rig was just given, or a flip
   // into freefall (which hands the whole rig the player's downward velocity)
@@ -4406,6 +4449,11 @@ bool Mob::BlastRadial(Vec3 centerWorldVoxel, float radiusVoxels,
   // |omega x r| on top of the centre's.
   for (const BlastLimb& b : hit) {
     MobLimb& l = limbs_[b.idx];
+    // A follower's velocity is its host's (DriveWornShells overwrites whatever
+    // is written here later this same tick). Its MASS still counts, above: a
+    // body in plate is harder to throw and spins differently, which is the
+    // whole reason the rigid reduction is mass-weighted.
+    if (l.wornHost >= 0) continue;
     const Vec3 v = vCom + omega.cross(b.com - com);
     Vec3 lin{}, ang{};
     const bool had = wasLimp && phys_->GetBodyVelocities(l.body, lin, ang);
@@ -5145,14 +5193,89 @@ void Mob::PostStep() {
   // limbs with MoveKinematicBody from the animated pose, so the anti-tunnel
   // clamp would be arguing with the animation; a severed piece is DebrisSystem's
   // by then and is clamped in its PostStep. limb.xf is still where the limb was
-  // when the step began, which is the segment UntunnelBody needs, so this runs
+  // when the step began, which is the segment the clamp needs, so this runs
   // BEFORE the read-back.
+  //
+  // AND THE RIG IS CLAMPED AS ONE OBJECT (DebrisSystem::UntunnelRig). Per body
+  // it tore a falling ragdoll apart: the feet reach the unvouched chunk several
+  // ticks before the head, each leading body was teleported back to its own
+  // last vouched sample with its velocity intact while its neighbours kept
+  // going, and every tick of that opened a fresh multi-voxel violation at every
+  // joint for the solver to close by force. The long version is in debris.h.
   const bool limp = ragdoll_ == RagdollPhase::Limp;
+  if (limp && debris_ != nullptr) {
+    if (RigWeldOff()) {
+      for (MobLimb& limb : limbs_)
+        if (limb.body && limb.holdSeconds <= 0)
+          debris_->UntunnelBody(limb.body, limb.xf.pos);
+    } else {
+      // Followers are left out: a shell has no dynamics to clamp and is put
+      // back on its host below, after the host has been clamped. Held pieces
+      // are out for the reason every other ragdoll path excludes them — a
+      // severed piece mid-hold is not part of this rig any more.
+      rigHandles_.clear();
+      rigPrevPos_.clear();
+      for (const MobLimb& limb : limbs_) {
+        if (!limb.body || limb.holdSeconds > 0 || limb.wornHost >= 0) continue;
+        rigHandles_.push_back(limb.body);
+        rigPrevPos_.push_back(limb.xf.pos);
+      }
+      debris_->UntunnelRig(rigHandles_, rigPrevPos_);
+    }
+  }
   for (MobLimb& limb : limbs_) {
     if (!limb.body) continue;
-    if (limp && debris_ != nullptr && limb.holdSeconds <= 0)
-      debris_->UntunnelBody(limb.body, limb.xf.pos);
     phys_->GetTransform(limb.body, limb.xf);
+  }
+  // LAST, off transforms that are already final for this tick — see the note on
+  // the declaration. Nothing after this may move a host limb, or the garment on
+  // it is a tick behind for the frame that draws it.
+  DriveWornShells();
+}
+
+void Mob::DriveWornShells() {
+  if (phys_ == nullptr) return;
+  for (size_t i = 0; i < limbs_.size(); i++) {
+    MobLimb& shell = limbs_[i];
+    const int hi = shell.wornHost;
+    if (hi < 0 || !shell.body || shell.holdSeconds > 0) continue;
+    // A host that has come off takes its gear with it (ShedGearBeforeDetach
+    // runs before DetachLimb recurses), so this is belt-and-braces: a shell
+    // whose host is gone is simply left where it lies rather than following a
+    // body that no longer exists.
+    if (hi >= (int)limbs_.size() || !limbs_[(size_t)hi].body) continue;
+    const MobLimb& host = limbs_[(size_t)hi];
+    // THE SAME TWO STEPS AppendWornShell PLACED IT WITH, in the same order:
+    // reach the host's joint anchor through the host's live rotation, then back
+    // off to this shell's own corner. `anchorLimb` on a shell is that same
+    // anchor measured from the shell's corner, which is what makes the pair a
+    // rigid offset rather than a per-frame fit.
+    const Quat q{host.xf.quat[0], host.xf.quat[1], host.xf.quat[2],
+                 host.xf.quat[3]};
+    const Vec3 pos =
+        host.xf.pos + Rotate(q, host.anchorLimb) - Rotate(q, shell.anchorLimb);
+    const float quat[4] = {q.x, q.y, q.z, q.w};
+    if (!phys_->SetBodyTransform(shell.body, pos, quat)) continue;
+    // The host's velocities, so the garment agrees with the limb inside it
+    // DURING the next step as well as at the end of it: a kinematic body with a
+    // stale velocity integrates away from where it was just put, and one with
+    // no velocity at all reports every contact as a standing hit.
+    //
+    // The RIGID-BODY velocity at the shell's own origin, i.e. with the omega x r
+    // term, not the host's bare linear velocity. It matters for exactly one
+    // thing and matters completely for it: the instant a strap is cut the shell
+    // becomes debris carrying whatever velocity it had, and a pauldron on a
+    // spinning shoulder should leave along the tangent rather than along the
+    // shoulder's own line.
+    Vec3 lin{}, ang{};
+    if (phys_->GetBodyVelocities(host.body, lin, ang))
+      phys_->SetBodyVelocities(shell.body,
+                               lin + ang.cross(pos - host.xf.pos), ang);
+    shell.xf.pos = pos;
+    shell.xf.quat[0] = q.x;
+    shell.xf.quat[1] = q.y;
+    shell.xf.quat[2] = q.z;
+    shell.xf.quat[3] = q.w;
   }
 }
 
@@ -6653,7 +6776,12 @@ bool Mob::RebuildLimbBody(int limbIndex) {
   // a carved upper leg at 41.8 m/s on the tick it was rebuilt. limb.xf is
   // PostStep's read-back of this very body plus the carve's shift, which is
   // exactly the frame the new lattice was computed in.
-  if (!(alive_ && ragdoll_ == RagdollPhase::Limp))
+  // A FOLLOWER takes the limp branch for the same reason: its pose is DERIVED
+  // (from its host's transform and its own anchorLimb), so limb.xf plus the
+  // carve's rebase shift is the frame the new lattice was computed in, and
+  // re-reading Jolt would throw the shift away. DriveWornShells re-derives it
+  // from the new anchorLimb in this same tick's PostStep either way.
+  if (!(alive_ && (ragdoll_ == RagdollPhase::Limp || limb.wornHost >= 0)))
     phys_->GetTransform(limb.body, limb.xf);
   // What the old body was doing, for a LIMP limb: a rebuilt body starts at
   // rest, and a limb flying at 10 m/s that a burn or acid bite rebuilt at
@@ -6691,7 +6819,10 @@ bool Mob::RebuildLimbBody(int limbIndex) {
   // Alive AND not limp: a carve during a live ragdoll (a second blast, acid
   // on a body on the floor) rebuilds a DYNAMIC limb, or the rebuilt piece
   // would freeze in mid-air while the rest of the rig fell.
-  bool kinematic = alive_ && ragdoll_ != RagdollPhase::Limp;
+  // ...but a FOLLOWER is kinematic in every phase a live creature has: it is
+  // not solved for, so a limp rig's garment does not go dynamic with the limb
+  // it is on (MobLimb::wornHost).
+  bool kinematic = alive_ && (ragdoll_ != RagdollPhase::Limp || limb.wornHost >= 0);
   phys_->RemoveBody(limb.body);
   limb.body = nh;
   phys_->SetBodyKinematic(limb.body, kinematic);
@@ -6714,7 +6845,11 @@ bool Mob::RebuildLimbBody(int limbIndex) {
     phys_->DestroyJoint(limb.joint);
     limb.joint = 0;
   }
-  if (limbIndex != def.rootLimb) {
+  // A follower has no constraint to rebuild — that is what being strapped on
+  // rather than jointed on means. Without this test the rebuild would silently
+  // hand a garment back the Fixed joint AppendWornShell deliberately did not
+  // give it, and the first carve on a piece of armour would re-arm the motor.
+  if (limbIndex != def.rootLimb && limb.wornHost < 0) {
     for (size_t k = 0; k < limbDefs_.size(); k++) {
       if (limbDefs_[k].name != limbDefs_[limbIndex].parent) continue;
       if (!limbs_[k].body) break;  // parent already severed: no joint to make
@@ -9995,6 +10130,13 @@ void Mob::DetachLimb(int limbIndex, bool adopt) {
     // that body is, so `E` can pick it up (Mob::LostGear).
     if (!shedAs.empty() && sys_ && sys_->onItemShed_)
       sys_->onItemShed_(limb.holdBody, shedAs);
+    // A GARMENT THAT HAS LEFT IS NOT A FOLLOWER. It is DebrisSystem's now and
+    // has real dynamics of its own from the end of the sever hold; a shell that
+    // kept its host would be teleported back onto a limb it has fallen off,
+    // every tick, forever. (The hold body is a different handle from limb.body,
+    // which is zeroed below, but the SLOT survives until TickSeveredHolds
+    // sweeps it — so this has to be said explicitly.)
+    limb.wornHost = -1;
   } else {
     // Not adopted: nothing downstream will ever free this limb's brick, so it
     // must be returned here.
@@ -10089,6 +10231,32 @@ void Mob::Die() {
       piece.body = limbs_[heldSlot_].body;
       corpse.gear.push_back(std::move(piece));
     }
+  }
+  // ---- A GARMENT STOPS BEING A FOLLOWER AT THE MOMENT OF DEATH -------------
+  //
+  // Death is the one transition where a worn shell really does become a body of
+  // its own: the limbs leave this system for DebrisSystem, nothing derives a
+  // pose for them any more (DriveWornShells needs a live Mob), and a corpse must
+  // still be wearing its armour. So each follower gets the Fixed constraint it
+  // did without while it was being worn, anchored where the pair actually IS —
+  // which after a whole ragdoll's worth of falling is nowhere near the rest
+  // pose. Built before the adoption loop below because the handles it needs are
+  // the ones that loop is about to hand away (they do not change; ownership
+  // does).
+  //
+  // This is also the constraint the runaway note in phys/physics.cpp names as
+  // the armoured-corpse motor. It is kept because a corpse whose plate falls
+  // through it is a worse bug than a corpse the runaway net has to damp, and
+  // because the net exists; if it is ever cut, cut it here, deliberately, with
+  // the `corpse-armor` gate in front of you.
+  for (size_t i = 0; i < limbs_.size(); i++) {
+    MobLimb& shell = limbs_[i];
+    const int hi = shell.wornHost;
+    shell.wornHost = -1;   // no longer derived, whatever happens below
+    if (hi < 0 || !shell.body || shell.joint != 0) continue;
+    if (hi >= (int)limbs_.size() || !limbs_[(size_t)hi].body) continue;
+    shell.joint = phys_->CreateJoint(limbs_[(size_t)hi].body, shell.body,
+                                     JointDescFor(limbDefs_[i], shell.xf.pos));
   }
   // whole-body ragdoll: every limb goes dynamic and becomes debris; joints
   // stay so the corpse hangs together until pieces get culled or settle
@@ -11557,7 +11725,24 @@ int Mob::AppendWornShell(const ItemDef& item, const ItemCover& cover,
   phys_->SetBodyKinematic(p.body, true);
   if (AvatarLayer()) phys_->SetBodyAvatarLayer(p.body, true);
   p.xf = bxf;
-  p.joint = phys_->CreateJoint(host.body, p.body, JointDescFor(ld, p.xf.pos));
+  // ---- STRAPPED, NOT JOINTED ------------------------------------------------
+  //
+  // `wornHost` is the strap (see MobLimb::wornHost): from here this slot is a
+  // FOLLOWER, kinematic for as long as it is worn and posed only by
+  // DriveWornShells. There is deliberately NO constraint — a Fixed joint
+  // between a garment and the limb inside it does nothing at all while the
+  // creature is alive (both bodies are kinematic, so the solver never sees it),
+  // and the moment the rig goes limp it becomes the mass-ratio-across-a-deep-
+  // overlap motor that both the runaway note in phys/physics.cpp and the owner
+  // report about a fall-ragdoll's clothes describe. The corpse path recreates
+  // it in Mob::Die, which is the one phase a shell IS a body of its own.
+  // ONE SWITCH, ONE FIELD: `wornHost >= 0` IS "this slot is a follower", so the
+  // A/B arm sets neither it nor the drive and every test downstream takes the
+  // pre-2026-09-13 branch without a second env read.
+  if (RigWeldOff())
+    p.joint = phys_->CreateJoint(host.body, p.body, JointDescFor(ld, p.xf.pos));
+  else
+    p.wornHost = bodyLimb;
 
   anim_.partAlive.resize(skel_.parts.size(), 1);
   anim_.springs.resize(skel_.parts.size(), SpringState{});
