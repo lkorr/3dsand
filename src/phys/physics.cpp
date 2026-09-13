@@ -372,6 +372,54 @@ constexpr float kMaxInvInertia = 1.0e9f;
 constexpr float kInsaneSpin = 1.0e4f;
 constexpr float kInsaneSpeed = 1.0e5f;
 
+// ---- THE CEILINGS A BODY OF THIS WORLD IS BORN WITH ------------------------
+//
+// Jolt's defaults are 500 m/s and 47.124 rad/s, and one of those two numbers
+// is wrong for this engine by a factor of fifteen.
+//
+// 500 m/s is 8.3 METRES of travel in one 60 Hz step, which is 83 voxels. Every
+// dynamic body here is EMotionQuality::LinearCast (the long note below
+// CreateDebrisBody), so a step that long is a shape cast of a compound of up
+// to 1024 boxes swept 83 voxels through marching-cubes terrain, and the sweep
+// happens for every such body every step. Nothing in this world legitimately
+// travels at 500 m/s: the fastest legal values are physics.explosionMaxSpeed
+// (30 m/s), ragdoll.maxLaunchSpeed (14 m/s) and terminal velocity for a fall
+// the height of the whole residency window (sqrt(2 g * 51 m) = 32 m/s). 80 m/s
+// is more than twice the fastest of those and a sixth of Jolt's, which is the
+// point: it is a SAFETY ceiling, not a gameplay one, and nothing should ever
+// touch it.
+//
+// The ANGULAR ceiling is deliberately left at Jolt's own value. 47.1 rad/s is
+// 7.5 revolutions a second, which looks like a spasm on a severed arm, but it
+// is not absurd for a struck pebble and a smaller cap would make small rolling
+// spheres skid instead of roll (omega = v/r: a one-voxel ball rolling at 5 m/s
+// is at 100 rad/s legitimately). The problem the owner reported is not that a
+// limb reached this number; it is that it SAT on it. That is what
+// SweepRunawayRigs is for, and it is stated against the ceiling rather than
+// against a magic rad/s so the two cannot drift apart.
+constexpr float kBodyMaxSpeedMS = 80.0f;
+constexpr float kBodyMaxSpinRad = 0.25f * 3.14159265358979f * 60.0f;
+
+// A body is "hot" at 90% of its own ceiling. Not 100%: Jolt clamps TO the
+// ceiling, so a body the solver is driving reads exactly the ceiling, but a
+// body decelerating past it reads just under, and the net wants both.
+constexpr float kRunawayFrac = 0.9f;
+// Steps at the ceiling before the net slows the body, and before it cuts the
+// joints driving it. At 60 Hz: a fifth of a second, then (because the counter
+// falls by one for every quiet step) about a second and a half of a body that
+// keeps coming back. A piece genuinely thrown that hard is under the first
+// bar long before it reaches it.
+constexpr int kRunawayDampSteps = 12;
+constexpr int kRunawayCutSteps = 45;
+// What "slow it down" means. Hard enough that one application is visible in
+// the next step's reading, soft enough that it reads as the piece losing its
+// fight rather than as a teleport to rest.
+constexpr float kRunawayDampScale = 0.2f;
+// One Update longer than this is the symptom the owner actually reported --
+// "the framerate plummeted and the whole game froze". Report-only: wall clock
+// may not change what the simulation does, but it may say what it saw.
+constexpr double kStepWatchdogMs = 100.0;
+
 // True when every component is finite and under `limit`. No multiplies, so
 // this is safe to call on the garbage it is looking for.
 bool ComponentsUnder(JPH::Vec3Arg v, float limit) {
@@ -450,11 +498,24 @@ void Physics::InjectPhysFault() {
   // a hang; the sweep below is what turns it into a log line. Both halves are
   // the fix, which is why this injector runs BEFORE the sweep: the arm that
   // matters is the one the net is allowed to see.
+  //
+  // `SANDVOX_PHYS_FAULT=pos:<n>` is the THIRD arm, and it exists because the
+  // repair in SweepInsaneVelocities used to be a printf. A NaN POSITION is
+  // what actually wedges the process -- the quadtree gets a NaN AABB and the
+  // step stops coming back -- and neither of the two arms above can produce
+  // one directly: the velocity checks catch their garbage before it ever
+  // integrates, which is exactly what they are for. So this one writes the end
+  // state straight into the body, past everything, and the sweep has to put it
+  // back inside a finite world instead of narrating it.
   static const char* kFaultEnv = std::getenv("SANDVOX_PHYS_FAULT");
   static const bool kFaultRaw =
       kFaultEnv && std::strncmp(kFaultEnv, "spin:", 5) == 0;
+  static const bool kFaultPos =
+      kFaultEnv && std::strncmp(kFaultEnv, "pos:", 4) == 0;
   static const int kFaultAt =
-      kFaultEnv ? std::atoi(kFaultRaw ? kFaultEnv + 5 : kFaultEnv) : 0;
+      kFaultEnv ? std::atoi(kFaultRaw ? kFaultEnv + 5
+                                      : (kFaultPos ? kFaultEnv + 4 : kFaultEnv))
+                : 0;
   if (kFaultAt > 0 && ++faultStep_ == kFaultAt) {
     const uint32_t na = system_->GetNumActiveBodies(JPH::EBodyType::RigidBody);
     const JPH::BodyID* ab =
@@ -463,9 +524,21 @@ void Physics::InjectPhysFault() {
       std::fprintf(stderr,
                    "[phys] SANDVOX_PHYS_FAULT: injecting %s into body %u on "
                    "step %d\n",
-                   kFaultRaw ? "1e30 rad/s past every clamp" : "a NaN spin",
+                   kFaultPos ? "a NaN POSITION past every clamp"
+                             : (kFaultRaw ? "1e30 rad/s past every clamp"
+                                          : "a NaN spin"),
                    (unsigned)ab[0].GetIndex(), kFaultAt);
-      if (kFaultRaw) {
+      if (kFaultPos) {
+        // Straight at the body, under the write lock, with no notification to
+        // the broadphase: this is the state a body ends up in when a solver
+        // integrates a velocity nothing caught, and the sweep's repair is what
+        // has to notice it.
+        JPH::BodyLockWrite lock(system_->GetBodyLockInterface(), ab[0]);
+        if (lock.Succeeded())
+          lock.GetBody().SetPositionAndRotationInternal(
+              JPH::RVec3(std::numeric_limits<float>::quiet_NaN(), 0.0f, 0.0f),
+              JPH::Quat::sIdentity(), false);
+      } else if (kFaultRaw) {
         JPH::BodyLockWrite lock(system_->GetBodyLockInterface(), ab[0]);
         if (lock.Succeeded())
           if (JPH::MotionProperties* mp =
@@ -502,24 +575,57 @@ void Physics::SweepInsaneVelocities() {
     const bool badW = !ComponentsUnder(w, kInsaneSpin);
     const bool badV = !ComponentsUnder(v, kInsaneSpeed);
     const JPH::RVec3 p = bi.GetPosition(id);
-    // A NaN TRANSFORM IS THE END OF THE BODY AND THERE IS NO PUTTING IT BACK:
-    // the quadtree gets a NaN AABB, every overlap test against it answers
-    // neither yes nor no, and the step stops coming back (SANDVOX_PHYS_FAULT=
-    // spin:1 past the sweep: an 8-minute `corpse-intact` that normally takes
-    // 5 s). Zeroing the velocity cannot undo it -- the position is already
-    // gone. It is reported rather than repaired because the repair is to stop
-    // the velocity that causes it from entering Update at all, which is what
-    // the zeroing below is for; if this line ever appears, the thing to find
-    // is what got past the checks ABOVE it, not what to do about the NaN.
+    const JPH::Quat r = bi.GetRotation(id);
+    // A NaN TRANSFORM IS WHAT THE FREEZE IS MADE OF: the quadtree gets a NaN
+    // AABB, every overlap test against it answers neither yes nor no, and the
+    // step stops coming back (SANDVOX_PHYS_FAULT=spin:1 past the sweep: an
+    // 8-minute `corpse-intact` that normally takes 5 s, crash.log untouched).
+    //
+    // This USED TO BE REPORT-ONLY, on the argument that the position is
+    // already gone and the real repair is upstream. Both halves of that are
+    // true and it is still the wrong call, because the two failures are not
+    // the same size: the body being wrong is one dropped limb, and the
+    // broadphase stalling is the whole process wedged for minutes with a
+    // window that will not close. So the body is put back inside a FINITE
+    // world -- not a correct place, there is no correct place, just a defined
+    // one -- zeroed, and put to sleep. The ordinary debris cull collects it
+    // from there like any other piece that ended up somewhere silly.
+    //
+    // A NaN QUATERNION does the same damage by the same route (the rotated
+    // AABB), and nothing was checking for one, so it is replaced with the
+    // identity here rather than left to poison the transform that was just
+    // repaired.
     const bool badP = !ComponentsUnder(JPH::Vec3(p), 1.0e9f);
-    if (badP && insaneReports_ < 8) {
-      insaneReports_++;
-      std::fprintf(stderr,
-                   "[phys] body %u has an unusable TRANSFORM (%g, %g, %g) m -- "
-                   "it cannot be put back and the broadphase will stall on "
-                   "it. See the FP-trap note in phys/physics.cpp.\n",
-                   (unsigned)id.GetIndex(), (double)p.GetX(), (double)p.GetY(),
-                   (double)p.GetZ());
+    const bool badR = !std::isfinite(r.GetX()) || !std::isfinite(r.GetY()) ||
+                      !std::isfinite(r.GetZ()) || !std::isfinite(r.GetW()) ||
+                      !(r.LengthSq() > 1.0e-6f);
+    if (badP || badR) {
+      float f[3];
+      for (uint32_t a = 0; a < 3; a++) {
+        const float cc = JPH::Vec3(p)[a];
+        f[a] = std::isfinite(cc) ? std::max(-1.0e6f, std::min(1.0e6f, cc)) : 0.0f;
+      }
+      bi.SetPositionAndRotation(
+          id, JPH::RVec3(f[0], f[1], f[2]),
+          badR ? JPH::Quat::sIdentity() : r.Normalized(),
+          JPH::EActivation::DontActivate);
+      bi.SetLinearAndAngularVelocity(id, JPH::Vec3::sZero(), JPH::Vec3::sZero());
+      runaway_.repaired++;
+      if (insaneReports_ < 8) {
+        insaneReports_++;
+        std::fprintf(stderr,
+                     "[phys] body %u had an unusable TRANSFORM (%g, %g, %g) m, "
+                     "quat (%g, %g, %g, %g) -- the broadphase would have "
+                     "stalled on it, so it was put back at (%g, %g, %g) and "
+                     "stopped. Find what got past the velocity checks above "
+                     "this line; see the FP-trap note in phys/physics.cpp.\n",
+                     (unsigned)id.GetIndex(), (double)p.GetX(),
+                     (double)p.GetY(), (double)p.GetZ(), (double)r.GetX(),
+                     (double)r.GetY(), (double)r.GetZ(), (double)r.GetW(),
+                     (double)f[0], (double)f[1], (double)f[2]);
+      }
+      hotSteps_.erase(id.GetIndex());
+      continue;  // nothing further to say about a body that has been reset
     }
     if (!badW && !badV) continue;
     if (insaneReports_ < 8) {
@@ -542,12 +648,231 @@ void Physics::SweepInsaneVelocities() {
   }
 }
 
+float Physics::MaxBodySpeedVox() { return kBodyMaxSpeedMS / kVoxelMeters; }
+float Physics::MaxBodySpinRad() { return kBodyMaxSpinRad; }
+
+// ---- A CORPSE IN ARMOUR IS NOT ALLOWED TO BE A MOTOR ------------------------
+//
+// Owner report, 2026-09-13: a player-model NPC in a full set of armour, killed
+// after its head had been cut off. "The body spasmed out and flew in a billion
+// directions, all of his limbs moving dramatically and flying everywhere while
+// still technically being attached. The framerate plummeted and the whole game
+// froze for several minutes; closing it took a minute or two." No crash.log.
+//
+// WHY NOTHING ABOVE CATCHES IT. Every net in this file so far is looking for
+// GARBAGE -- a NaN, an inverse inertia of 1e20, a spin of 1e30 -- and this is
+// not garbage. `corpse-armor` reproduces it and measures the peak at 47.12
+// rad/s, which is Jolt's own mMaxAngularVelocity to five figures: the solver
+// asked for more and the clamp gave it exactly the ceiling. Everything about
+// that number is legal. kInsaneSpin is 1e4, three orders above it, and
+// correctly so -- lowering kInsaneSpin would not describe this failure, it
+// would just move the arbitrary line.
+//
+// WHAT IS ACTUALLY WRONG is not the value but its PERSISTENCE. A limb thrown
+// hard is fast for a few steps and then slower. A limb at the ceiling on step
+// after step is not being thrown, it is being DRIVEN, and in a dressed corpse
+// there is an obvious motor: every worn shell is its own Jolt body, FIXED to
+// the limb it wraps (Mob::AppendWornShell) and geometrically INSIDE it, so a
+// dressed corpse doubles the bodies, doubles the constraints, and puts an iron
+// mass ratio across every one of the new ones. A stiff constraint between
+// deeply overlapping bodies is the textbook way to make a sequential-impulse
+// solver gain energy, and the joints Mob::Die deliberately leaves on the
+// corpse are what spread it from one limb to all of them -- which is exactly
+// what "flying everywhere while still technically being attached" describes.
+//
+// AND WHY IT COSTS MINUTES RATHER THAN LOOKING SILLY. Two multipliers, both
+// already documented elsewhere in this file. Every dynamic body is
+// EMotionQuality::LinearCast, so once the linear velocity is large the step is
+// a swept compound-shape cast against marching-cubes terrain, per body, per
+// step (that is the other half of why the ceiling above came down from Jolt's
+// 500 m/s). And the contact solve sees `v + omega x r` at every contact point,
+// which is the same term the 46e3848 note identifies as what makes a step
+// stop coming back.
+//
+// THE NET, in two stages, and the escalation is the point:
+//
+//  1. A body at 90% of its own ceiling has its hot counter raised by one; a
+//     body under it has it lowered by one. Past kRunawayDampSteps the net
+//     scales both velocities by kRunawayDampScale every step. A piece that was
+//     merely thrown hard decays out of the counter and is never touched.
+//  2. A body that keeps coming back anyway reaches kRunawayCutSteps, and then
+//     the JOINTS come off. That is the motor, and it is also the only thing
+//     the damping cannot reach: slowing a body that a constraint is feeding
+//     just means the constraint feeds it again next step. Cut, zeroed, and
+//     deactivated -- the corpse comes apart, which is a far better outcome
+//     than the game stopping, and it is the outcome the player was going to
+//     get anyway one second later.
+//
+// Both stages are counted in RunawayProbe so a gate can assert on them, and
+// both are named on stderr the first few times they fire. Zero cost when
+// nothing is wrong: one length compare per active body and an empty map.
+void Physics::SweepRunawayRigs() {
+  // THE A/B ARM, IN ONE BINARY, for the same reason SANDVOX_NO_ANTITUNNEL
+  // exists a few hundred lines up: this changes where bodies end up, so the
+  // next unexplained settling number is going to want to ask "was it this?",
+  // and a differential measured across two BUILDS measures the builds. Off =
+  // the pre-2026-09-13 behaviour, ceilings included (the ceiling is applied at
+  // body birth, so it is listed here as a reminder that this switch does NOT
+  // undo it -- use a fresh world to A/B that half).
+  static const bool kOff = [] {
+    const char* e = std::getenv("SANDVOX_NO_RUNAWAY_NET");
+    return e != nullptr && e[0] != '0';
+  }();
+  runaway_.hot = 0;
+  if (kOff || !system_) return;
+  const uint32_t n = system_->GetNumActiveBodies(JPH::EBodyType::RigidBody);
+  if (n == 0) {
+    hotSteps_.clear();
+    return;
+  }
+  const JPH::BodyID* active =
+      system_->GetActiveBodiesUnsafe(JPH::EBodyType::RigidBody);
+  if (!active) return;
+  JPH::BodyInterface& bi = system_->GetBodyInterfaceNoLock();
+  const float spinBar = kRunawayFrac * kBodyMaxSpinRad;
+  const float speedBar = kRunawayFrac * kBodyMaxSpeedMS;
+  // DEFERRED, because DeactivateBody and DestroyJoint both reach into the very
+  // list being walked: GetActiveBodiesUnsafe hands out a pointer INTO the
+  // active array, and deactivating a body swaps the tail into its slot. The
+  // damping below is safe inline (it writes velocity and nothing else).
+  std::vector<JPH::BodyID> toCut;
+  for (uint32_t i = 0; i < n; i++) {
+    const JPH::BodyID id = active[i];
+    const JPH::Vec3 w = bi.GetAngularVelocity(id);
+    const JPH::Vec3 v = bi.GetLinearVelocity(id);
+    // Safe to square: SweepInsaneVelocities ran first and zeroed anything that
+    // could overflow here, which is the whole reason it runs first.
+    const float spin = w.Length(), speed = v.Length();
+    runaway_.peakSpinRad = std::max(runaway_.peakSpinRad, spin);
+    runaway_.peakSpeedVox =
+        std::max(runaway_.peakSpeedVox, speed / kVoxelMeters);
+    const uint32_t idx = id.GetIndex();
+    if (spin < spinBar && speed < speedBar) {
+      auto it = hotSteps_.find(idx);
+      if (it == hotSteps_.end()) continue;
+      if (it->second <= 1)
+        hotSteps_.erase(it);
+      else
+        it->second--;
+      continue;
+    }
+    runaway_.hot++;
+    // A KINEMATIC BODY IS NOT SIMULATED and therefore cannot be driven: a
+    // living mob's limbs are posed by the animation and MoveKinematicBody
+    // hands Jolt the velocity that move implies, so a fast clip or a respawn
+    // snap can read at the ceiling for a tick or two entirely correctly. The
+    // solver has no way to feed one, so there is nothing here to find and
+    // every intervention would be wrong.
+    //
+    // A live RAGDOLL is dynamic and jointed and so can still reach the cut,
+    // and that is deliberate: getting there takes 45 steps of being
+    // re-energised to the ceiling AFTER the damping has been cutting it to 20%
+    // every step, which is a rig nothing was going to recover gracefully.
+    // Losing a limb beats losing the frame budget.
+    if (bi.GetMotionType(id) != JPH::EMotionType::Dynamic) {
+      hotSteps_.erase(idx);
+      continue;
+    }
+    // ONLY A RIG, and this restriction is not caution, it is the diagnosis.
+    // The motor in the owner's report is a CONSTRAINT GRAPH -- a dressed
+    // corpse's fixed straps and its joints -- and a body with nothing attached
+    // to it has nobody to feed it. Meanwhile the thing that most often sits at
+    // the angular ceiling in ordinary play is a small rolling ball, which is
+    // there LEGITIMATELY: omega = v/r, so a one-voxel sphere rolling at 5 m/s
+    // is at 100 rad/s and Jolt is already clipping it to 47.1 every step. A
+    // net that did not check this would damp every pebble in the world to a
+    // skid and then put it to sleep mid-roll, which is a far more visible bug
+    // than the one being fixed.
+    const uint64_t h = FromBodyID(id);
+    if (!joints_ || joints_->byBody.find(h) == joints_->byBody.end()) {
+      hotSteps_.erase(idx);
+      continue;
+    }
+    uint16_t& steps = hotSteps_[idx];
+    if (steps < 0xFFFFu) steps++;
+    if (steps >= (uint16_t)kRunawayCutSteps) {
+      toCut.push_back(id);
+      continue;
+    }
+    if (steps < (uint16_t)kRunawayDampSteps) continue;
+    bi.SetLinearAndAngularVelocity(id, v * kRunawayDampScale,
+                                   w * kRunawayDampScale);
+    runaway_.damped++;
+    // ONCE PER EPISODE, not once per step. This fires every step for as long
+    // as the body keeps coming back, and eight identical lines about body 51
+    // is not eight times the information -- it is the global report budget
+    // spent on one body, so the SECOND body to go wrong says nothing. The
+    // escalation to the cut below is the line that reports the outcome.
+    if (steps == (uint16_t)kRunawayDampSteps && runawayReports_ < 8) {
+      runawayReports_++;
+      const JPH::RVec3 p = bi.GetPosition(id);
+      std::fprintf(stderr,
+                   "[phys] body %u at (%.1f, %.1f, %.1f) vox has been at its "
+                   "velocity ceiling for %u steps (lin %.1f vox/s of %.0f, ang "
+                   "%.1f rad/s of %.1f) -- slowed to %.0f%%. A body that stays "
+                   "here is being DRIVEN; see the runaway note in "
+                   "phys/physics.cpp.\n",
+                   (unsigned)idx, (double)p.GetX() / kVoxelMeters,
+                   (double)p.GetY() / kVoxelMeters,
+                   (double)p.GetZ() / kVoxelMeters, (unsigned)steps,
+                   (double)(speed / kVoxelMeters), (double)MaxBodySpeedVox(),
+                   (double)spin, (double)kBodyMaxSpinRad,
+                   (double)(kRunawayDampScale * 100.0f));
+    }
+  }
+  // A body that fell ASLEEP while hot is not on the active list any more, so
+  // the decay branch above can never reach its entry. Anything held here that
+  // is not active is by definition stale (only an active body is ever inserted
+  // or raised), so when the map outgrows the active list it is swept against
+  // it. O(active) and only when it is needed -- in the steady state the map is
+  // empty and this never runs.
+  if (hotSteps_.size() > (size_t)n) {
+    std::unordered_map<uint32_t, uint16_t> keep;
+    keep.reserve(hotSteps_.size());
+    for (uint32_t i = 0; i < n; i++) {
+      auto it = hotSteps_.find(active[i].GetIndex());
+      if (it != hotSteps_.end()) keep.insert(*it);
+    }
+    hotSteps_.swap(keep);
+  }
+  for (JPH::BodyID id : toCut) {
+    const uint64_t handle = FromBodyID(id);
+    uint32_t broke = 0;
+    if (joints_) {
+      auto bit = joints_->byBody.find(handle);
+      if (bit != joints_->byBody.end()) {
+        const std::vector<uint64_t> attached = bit->second;  // DestroyJoint
+        for (uint64_t j : attached) {                        // mutates the map
+          DestroyJoint(j);
+          broke++;
+        }
+      }
+    }
+    bi.SetLinearAndAngularVelocity(id, JPH::Vec3::sZero(), JPH::Vec3::sZero());
+    bi.DeactivateBody(id);
+    hotSteps_.erase(id.GetIndex());
+    runaway_.cut++;
+    if (runawayReports_ < 8) {
+      runawayReports_++;
+      std::fprintf(stderr,
+                   "[phys] body %u would not come off its velocity ceiling in "
+                   "%d steps: %u joint(s) cut and the body stopped. Something "
+                   "was feeding it; see the runaway note in "
+                   "phys/physics.cpp.\n",
+                   (unsigned)id.GetIndex(), kRunawayCutSteps, broke);
+    }
+  }
+}
+
 void Physics::Step(float dt) {
   if (!system_) return;
   // Before Update, so a body that was handed garbage while asleep never
   // reaches Jolt's own clamp — which overflows rather than clamping.
   InjectPhysFault();
   SweepInsaneVelocities();
+  // ...and straight after it, because it is written to assume the sweep has
+  // already removed everything that cannot safely be squared.
+  SweepRunawayRigs();
   // Gravity is re-applied here rather than only at Init so a tuning reload
   // takes effect without restarting the world.
   system_->SetGravity(JPH::Vec3(0, -CurrentTuning().physics.gravity, 0));
@@ -556,8 +881,30 @@ void Physics::Step(float dt) {
   // after Step sees exactly that step and nothing accumulates when nobody
   // drains (a headless run never reads this at all).
   if (contacts_) contacts_->impacts.clear();
+  // WALL CLOCK, REPORT ONLY. The owner's report was "the whole game froze for
+  // several minutes", and the one thing that was missing when it happened was
+  // any line saying so. This may not change what the simulation does -- a
+  // decision taken on wall clock is a decision that differs between machines
+  // -- but it may say what it saw, with the two numbers that attribute it.
+  const auto t0 = std::chrono::steady_clock::now();
   system_->Update(dt, CurrentTuning().physics.collisionSteps, tempAlloc_.get(),
                   jobs_.get());
+  const double ms = std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - t0)
+                        .count();
+  if (ms > runaway_.worstStepMs) runaway_.worstStepMs = ms;
+  if (ms >= kStepWatchdogMs && runawayReports_ < 8) {
+    runawayReports_++;
+    std::fprintf(stderr,
+                 "[phys] one Update took %.0f ms over %u active bodies "
+                 "(%u of them at their velocity ceiling; fastest %.0f vox/s, "
+                 "%.1f rad/s since the last probe reset). Every dynamic body "
+                 "is LinearCast, so a fast body pays a swept cast against "
+                 "terrain every step; see the runaway note in "
+                 "phys/physics.cpp.\n",
+                 ms, (unsigned)NumActiveBodies(), (unsigned)runaway_.hot,
+                 (double)runaway_.peakSpeedVox, (double)runaway_.peakSpinRad);
+  }
   // After the step, so a piece is judged against where it has fallen TO.
   TickPendingReleases();
 }
@@ -733,6 +1080,8 @@ uint64_t Physics::CreateDebrisBodyXf(const std::vector<DebrisVoxel>& voxels,
   bcs.mLinearDamping = pt.debrisLinearDamping;
   bcs.mAngularDamping = pt.debrisAngularDamping;
   bcs.mAllowDynamicOrKinematic = allowKinematic;
+  bcs.mMaxLinearVelocity = kBodyMaxSpeedMS;   // see the ceilings note above
+  bcs.mMaxAngularVelocity = kBodyMaxSpinRad;
   // Ghost contacts with internal edges of the marching-cubes terrain are what
   // make debris snag and hop on flat-looking ground; this is Jolt's fix.
   bcs.mEnhancedInternalEdgeRemoval = true;
@@ -793,6 +1142,10 @@ uint64_t Physics::CreateSphereBody(Vec3 centerVoxel, float radiusVoxels,
   // Deliberately lighter angular damping than debris: rolling is the entire
   // point of this shape, and the debris value is tuned to stop tumbling fast.
   bcs.mAngularDamping = pt.sphereAngularDamping;
+  // The linear ceiling, but NOT a lower angular one: omega = v/r, so a small
+  // ball rolling at a normal speed is legitimately at hundreds of rad/s and
+  // capping that would make it skid. See the ceilings note above.
+  bcs.mMaxLinearVelocity = kBodyMaxSpeedMS;
   bcs.mEnhancedInternalEdgeRemoval = true;
   // A ball's inner radius IS its radius, so the cast only fires on a genuinely
   // fast roll or fall. See the note above CreateDebrisBody.
@@ -1528,6 +1881,11 @@ void Physics::RemoveBody(uint64_t handle) {
   }
   JPH::BodyInterface& bi = system_->GetBodyInterface();
   JPH::BodyID id = ToBodyID(handle);
+  // JOLT REUSES BODY INDICES, and SweepRunawayRigs keys its escalation counter
+  // on one. A body removed while hot would otherwise hand a count of up to 44
+  // to whatever is created next in its slot, and that body would be cut on its
+  // fifth bad step instead of its forty-fifth.
+  hotSteps_.erase(id.GetIndex());
   bi.RemoveBody(id);
   bi.DestroyBody(id);
   if (handle == playerBody_) playerBody_ = 0;

@@ -1,6 +1,7 @@
 #pragma once
 #include <cstdint>
 #include <memory>
+#include <unordered_map>
 #include <vector>
 
 #include "math3d.h"
@@ -415,6 +416,34 @@ class Physics {
 
   uint32_t NumActiveBodies() const;
 
+  // ---- THE RUNAWAY-RIG NET (the long note is in physics.cpp) ---------------
+  //
+  // 46e3848 closed the case where a body's velocity became GARBAGE. This is
+  // the case where it stays entirely legal and is still a bug: a jointed rig
+  // whose solver gains energy every step until every piece sits AT Jolt's own
+  // clamp, spinning at 47.1 rad/s and never stopping. Nothing reports it,
+  // because 47.1 rad/s is a number physics is allowed to produce.
+  //
+  // What the caller gets is the account, so "the corpse exploded" can be
+  // answered with numbers instead of a bisect: how many bodies were at their
+  // ceiling on the last step, how many the net had to slow down, how many it
+  // had to cut free, and the worst single Update in wall clock.
+  struct RunawayProbe {
+    uint32_t hot = 0;       // bodies AT their own clamp on the last step
+    uint32_t damped = 0;    // ...that stayed there long enough to be slowed
+    uint32_t cut = 0;       // ...and then long enough to have their joints cut
+    uint32_t repaired = 0;  // transforms put back inside a finite world
+    float peakSpeedVox = 0.0f;  // fastest and fastest-spinning body seen since
+    float peakSpinRad = 0.0f;   // the probe was last reset
+    double worstStepMs = 0.0;   // longest single Update, wall clock
+  };
+  const RunawayProbe& Runaway() const { return runaway_; }
+  void ResetRunawayProbe() { runaway_ = RunawayProbe{}; }
+  // The ceilings every dynamic body this class creates is born with, so a test
+  // can assert against the engine's number rather than a copy of it.
+  static float MaxBodySpeedVox();
+  static float MaxBodySpinRad();
+
  private:
   std::unique_ptr<JPH::TempAllocatorImpl> tempAlloc_;
   std::unique_ptr<JPH::JobSystemThreadPool> jobs_;
@@ -450,6 +479,18 @@ class Physics {
   // neutralises (and names) any whose stored velocity is already past what
   // Jolt's own clamp could have produced. Zero cost when nothing is wrong.
   void SweepInsaneVelocities();
+  // Called from Step() straight after the sweep above: finds the bodies that
+  // are sitting AT their velocity ceiling rather than passing through it,
+  // slows them, and — if they are still there a moment later — cuts the joints
+  // that are driving them and puts them to sleep. See the note in physics.cpp.
+  void SweepRunawayRigs();
+  RunawayProbe runaway_{};
+  // Jolt body INDEX -> consecutive-ish steps spent at the ceiling. Climbs by
+  // one per hot step and falls by one per quiet one, so a body that is being
+  // DRIVEN escalates while a body that was merely thrown hard decays back to
+  // nothing. Bounded by the active list; entries are dropped at zero.
+  std::unordered_map<uint32_t, uint16_t> hotSteps_;
+  int runawayReports_ = 0;  // rate limit on the three reporters above
   // SANDVOX_PHYS_FAULT: the deliberate blow-up that proves the two above
   // (and the Jolt FP-exception setting) actually do something. No-op unset.
   void InjectPhysFault();

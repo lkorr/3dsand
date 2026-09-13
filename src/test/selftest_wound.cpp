@@ -1275,6 +1275,20 @@ Status GateCorpseArmor(Ctx& c, std::string& detail) {
     return Status::Fail;
   }
   const int bareLimbs = mob->LimbCount();
+  // WHOSE BODIES ARE THESE? Every measurement below is over DebrisSystem's
+  // whole list, and in a full --selftest that list is not empty when this gate
+  // starts: `corpse-armor` run alone saw 30 bodies and 28 joints, and the same
+  // gate inside the suite saw 33 and 43 -- an earlier gate's rig is still
+  // standing (SpawnTarget resets mobs and debris, it does not reset Physics,
+  // and the avatar outlives a MobSystem::Reset). Measuring "spread" against
+  // BodyPosition(0) then measured the distance from THIS corpse to a cactus
+  // two gates ago and reported 409 voxels, which is a fixture measuring the
+  // suite rather than the subject -- rule 7 in as few words as it gets. So the
+  // pre-existing set is recorded here and excluded from everything after it.
+  std::unordered_set<uint64_t> foreignBodies;
+  for (uint32_t b = 0; b < c.debris.BodyCount(); b++)
+    foreignBodies.insert(c.debris.BodyHandle(b));
+  const uint32_t foreignCount = (uint32_t)foreignBodies.size();
 
   // THE KILLER IS STANDING OVER THE BODY, because that is where the report
   // happened and because it is the one thing this fixture cannot get for free:
@@ -1405,8 +1419,28 @@ Status GateCorpseArmor(Ctx& c, std::string& detail) {
   }
   const bool died = !mobs.IsAlive(id);
   const uint32_t jointsDead = c.phys.JointCount();
+  // THE CORPSE, BY HANDLE, CAPTURED ONCE. Excluding the bodies that existed
+  // before the fixture ran is NOT enough, and the second version of this gate
+  // is how we know: in a full --selftest an earlier gate's creature is still
+  // standing when this one starts (43 joints in the world where this rig
+  // accounts for 28), and when it dies DURING the 180 ticks below its limbs
+  // enter DebrisSystem too -- 400 voxels away, which is exactly where "spread
+  // 398.8 vox, cap 60" came from while every piece of THIS corpse was inside
+  // 35. A snapshot taken before the fixture cannot see a body that arrives
+  // after it; a snapshot of the corpse itself can.
+  //
+  // A handle changes if DamageBody rebuilds a collider, and such a piece drops
+  // out of the measurement. Nothing carves during the settle below, so that
+  // does not happen today; if it starts to, the symptom is the surviving count
+  // falling over the run rather than a wrong number.
+  std::unordered_set<uint64_t> mine;
+  for (uint32_t b = 0; b < c.debris.BodyCount(); b++) {
+    const uint64_t h = c.debris.BodyHandle(b);
+    if (!foreignBodies.count(h)) mine.insert(h);
+  }
 
   // Three seconds of corpse, measured every tick over every piece.
+  c.phys.ResetRunawayProbe();
   float maxSpeed = 0.0f, maxSpin = 0.0f, maxSpread = 0.0f;
   int speedTick = -1, spinTick = -1;
   bool spinIsShell = false;
@@ -1429,6 +1463,7 @@ Status GateCorpseArmor(Ctx& c, std::string& detail) {
     bool haveAnchor = false;
     for (uint32_t b = 0; b < c.debris.BodyCount(); b++) {
       const uint64_t h = c.debris.BodyHandle(b);
+      if (!mine.count(h)) continue;   // not this corpse: see above
       const Vec3 p = c.debris.BodyPosition(b);
       Vec3 lin{}, ang{};
       if (c.phys.GetBodyVelocities(h, lin, ang)) {
@@ -1468,35 +1503,134 @@ Status GateCorpseArmor(Ctx& c, std::string& detail) {
       maxSpeed > 1e-3f ? (-peakVel.y / maxSpeed) : 0.0f;
   if (proxy) c.phys.RemoveBody(proxy);
 
-  const double speedCap = BaselineNumber("corpseArmorMaxSpeedVox", 120.0);
-  const double spinCap = BaselineNumber("corpseArmorMaxSpinRad", 40.0);
+  const Physics::RunawayProbe net = c.phys.Runaway();
+  uint32_t ours = 0;
+  for (uint32_t b = 0; b < c.debris.BodyCount(); b++)
+    if (mine.count(c.debris.BodyHandle(b))) ours++;
+
+  // ---- B. THE NET ITSELF, DRIVEN ON PURPOSE -------------------------------
+  //
+  // A safety net nobody has seen work is not a safety net -- the lesson
+  // 46e3848 paid SANDVOX_PHYS_FAULT to learn, applied again. Part A above
+  // measures an ORDINARY armoured corpse and the honest outcome there is that
+  // the net never fires, which would ship the whole of SweepRunawayRigs
+  // unexercised. So one surviving body is turned into the motor the report
+  // describes: its spin is written back to the ceiling every single tick,
+  // through the public setter and therefore through Jolt's own clamp, which is
+  // exactly the state a constraint that is feeding a body leaves it in.
+  //
+  // The net must then do both of its stages -- slow it, and when that does not
+  // take, cut whatever is attached and stop it. Driven this way there is no
+  // constraint to blame, so `cut` proves the escalation happens at all and the
+  // final reading proves the body ends up STOPPED rather than buzzing.
+  uint32_t drivenTicks = 0, drivenDamped = 0, drivenCut = 0;
+  uint32_t drivenJointsBefore = 0, drivenJointsAfter = 0;
+  bool netHeld = false;
+  float endSpin = -1.0f;
+  {
+    c.phys.ResetRunawayProbe();
+    // TWO FRESH BODIES AND A JOINT, not a piece of the corpse above. The first
+    // version of this arm drove a corpse limb and the limb was culled out from
+    // under it on tick 38 of the 45 the escalation needs, which is a fixture
+    // measuring its own bookkeeping rather than the net (and is why the arm
+    // reported "damped 26, cut 0" -- a true statement about a body that no
+    // longer existed). These two are owned by nothing, so they last exactly as
+    // long as this block.
+    Vec3 at{400.0f, 200.0f, 400.0f};
+    for (uint32_t b = 0; b < c.debris.BodyCount(); b++)
+      if (mine.count(c.debris.BodyHandle(b))) {
+        at = c.debris.BodyPosition(b);
+        break;
+      }
+    const Vec3 hi{at.x, at.y + 24.0f, at.z};
+    const uint64_t a = c.phys.CreateSphereBody(hi, 2.0f, 2000.0f, Vec3{});
+    const uint64_t b =
+        c.phys.CreateSphereBody(Vec3{hi.x + 4.0f, hi.y, hi.z}, 2.0f, 2000.0f,
+                                Vec3{});
+    Physics::JointDesc jd;
+    jd.type = Physics::JointType::Fixed;
+    jd.anchorVoxel = Vec3{hi.x + 2.0f, hi.y, hi.z};
+    const uint64_t j = (a && b) ? c.phys.CreateJoint(a, b, jd) : 0;
+    drivenJointsBefore = a ? c.phys.JointCount(a) : 0;
+    if (a) {
+      const float ceiling = Physics::MaxBodySpinRad();
+      // Written back to the ceiling EVERY tick, through the public setter and
+      // therefore through Jolt's own clamp -- which is exactly the state a
+      // constraint that is feeding a body leaves it in, and the one thing the
+      // FP net above deliberately passes because it is a legal number.
+      for (int i = 0; i < 200; i++) {
+        Vec3 lin{}, ang{};
+        if (!c.phys.GetBodyVelocities(a, lin, ang)) break;
+        c.phys.SetBodyVelocities(a, lin, Vec3{0.0f, 0.0f, ceiling});
+        c.phys.WakeNear(hi, 32.0f);
+        drivenTicks++;
+        step(nullptr);
+        if (c.phys.Runaway().cut > 0) break;   // the escalation has happened
+      }
+      Vec3 lin{}, ang{};
+      if (c.phys.GetBodyVelocities(a, lin, ang)) endSpin = ang.len();
+      drivenJointsAfter = c.phys.JointCount(a);
+    }
+    const Physics::RunawayProbe drivenNet = c.phys.Runaway();
+    drivenDamped = drivenNet.damped;
+    drivenCut = drivenNet.cut;
+    // Slowed, then cut -- joints and all -- and stopped. `endSpin` is read
+    // AFTER the cut, so a body still buzzing at the ceiling fails here even
+    // though both counters moved.
+    netHeld = a != 0 && b != 0 && j != 0 && drivenJointsBefore > 0 &&
+              drivenNet.damped > 0 && drivenNet.cut > 0 &&
+              drivenJointsAfter == 0 && endSpin >= 0.0f &&
+              endSpin < 0.9f * Physics::MaxBodySpinRad();
+    if (a) c.phys.RemoveBody(a);
+    if (b) c.phys.RemoveBody(b);
+    RecordObserved("corpseArmorNetDamped", (double)drivenNet.damped);
+    RecordObserved("corpseArmorNetCut", (double)drivenNet.cut);
+  }
+
+  const double speedCap = BaselineNumber("corpseArmorMaxSpeedVox", 150.0);
   const double spreadCap = BaselineNumber("corpseArmorMaxSpreadVox", 60.0);
+  const double peggedCap = BaselineNumber("corpseArmorMaxPeggedTicks", 4.0);
   RecordObserved("corpseArmorMaxSpeedVox", (double)maxSpeed);
   RecordObserved("corpseArmorMaxSpinRad", (double)maxSpin);
   RecordObserved("corpseArmorMaxSpreadVox", (double)maxSpread);
   RecordObserved("corpseArmorWorstStepMs", worstStepMs);
   RecordObserved("corpseArmorPeggedBodyTicks", (double)peggedSamples);
 
+  // THE PEAK SPIN IS RECORDED, NOT ASSERTED, and that is the whole shape of
+  // the fix. 47.12 rad/s is Jolt's clamp and a limb genuinely thrown by a
+  // sword blow may touch it for a tick; what may not happen is a limb SITTING
+  // there, which is `peggedSamples`, and what may never happen is the net
+  // having to intervene on an ordinary corpse, which is `cut` and `repaired`.
+  // An assertion on the peak would have to be set above the clamp to pass at
+  // all, and would then assert nothing.
   const bool ok = died && maxSpeed <= (float)speedCap &&
-                  maxSpin <= (float)spinCap && maxSpread <= (float)spreadCap;
+                  maxSpread <= (float)spreadCap &&
+                  (double)peggedSamples <= peggedCap && net.cut == 0 &&
+                  net.repaired == 0 && netHeld;
   detail = Format(
       "%s: %d base limbs + %d shells from %d worn pieces, %u joints dressed; "
-      "%s cut off in %d strokes (severed=%d), died=%d with %u joints, %u "
-      "debris bodies; over %d corpse ticks the fastest piece hit %.1f vox/s on "
+      "%s cut off in %d strokes (severed=%d), died=%d with %u joints, %u of "
+      "its %u debris bodies left (%u were in the world before it); over %d "
+      "corpse ticks the fastest piece hit %.1f vox/s on "
       "tick %d (cap %.0f) at (%.1f, %.1f, %.1f), %.1f vox under ground, %.0f%% "
-      "straight down; fastest spin %.2f rad/s on tick %d (%s, cap %.0f); spread "
+      "straight down; fastest spin %.2f rad/s on tick %d (%s, recorded not capped: %.2f); spread "
       "%.1f vox (cap %.0f); %u body-ticks pegged at Jolt's own clamp across %u "
-      "bodies (%u of them armour), last on tick %d; worst physics step %.1f ms "
-      "on tick %d",
+      "bodies (%u of them armour, cap %.0f), last on tick %d; the net damped "
+      "%u / cut %u / repaired %u; worst physics step %.1f ms on tick %d. "
+      "Driven arm: %u ticks at the ceiling -> damped %u, cut %u, joints %u -> "
+      "%u, ended at %.1f rad/s (%s)",
       t.defName.c_str(), bareLimbs, shells, wornPieces, jointsDressed,
       cutName.c_str(), strokes, severed ? 1 : 0, died ? 1 : 0, jointsDead,
-      c.debris.BodyCount(), kTicks, (double)maxSpeed, speedTick, speedCap,
+      ours, (unsigned)mine.size(), foreignCount, kTicks, (double)maxSpeed,
+      speedTick, speedCap,
       (double)peakPos.x, (double)peakPos.y, (double)peakPos.z,
       (double)peakUnderGround, (double)(fallFrac * 100.0f), (double)maxSpin,
-      spinTick, spinIsShell ? "armour" : "flesh", spinCap, (double)maxSpread,
-      spreadCap, peggedSamples,
-      (unsigned)peggedBodies.size(), (unsigned)peggedShells.size(), lastHotTick,
-      worstStepMs, worstStepTick);
+      spinTick, spinIsShell ? "armour" : "flesh", (double)maxSpin,
+      (double)maxSpread, spreadCap, peggedSamples,
+      (unsigned)peggedBodies.size(), (unsigned)peggedShells.size(), peggedCap,
+      lastHotTick, net.damped, net.cut, net.repaired, worstStepMs,
+      worstStepTick, drivenTicks, drivenDamped, drivenCut, drivenJointsBefore,
+      drivenJointsAfter, (double)endSpin, netHeld ? "held" : "DID NOT HOLD");
   mobs.Reset();
   c.debris.Reset();
   return ok ? Status::Pass : Status::Fail;

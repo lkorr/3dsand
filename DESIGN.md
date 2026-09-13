@@ -3170,6 +3170,86 @@ neighbors, so this needs an explicit connectivity pass:
      first blind-fall attempt hit. This is the "park a body whose chunks are
      not cached yet" the `debris` gate's buried-ejecta finding asked for.
 
+### A corpse in armour is not allowed to be a motor (2026-09-13; `Physics::SweepRunawayRigs`, gate `corpse-armor`)
+
+Owner report: an armoured NPC, killed after its head had been cut off, spasmed
+and flew apart **while still jointed**; the framerate collapsed and the game
+froze for minutes. No `crash.log`, so this is not the FP-overflow kill 46e3848
+closed — that one dies in `JobIntegrateVelocity` with `0xC0000091`.
+
+**Every net that existed before this one is looking for garbage, and this is not
+garbage.** `corpse-armor` reproduces it and measures the peak spin at
+**47.12 rad/s, which is Jolt's own `mMaxAngularVelocity` to five figures**: the
+solver asked for more and the clamp handed back exactly the ceiling. Every net
+above it (`kInsaneSpin` = 1e4, `GuardBodyInertia`, `VelocityIsSane`) is three
+orders away and correctly so. Lowering those thresholds would not describe this
+failure; it would only move an arbitrary line.
+
+**The bug is the persistence, not the value.** A limb thrown by a sword blow may
+touch the clamp for a tick. A limb that *sits* on it is being driven — and a
+dressed corpse has an obvious motor. A worn shell is its own Jolt body, `Fixed`
+to the limb it wraps (`Mob::AppendWornShell`) and geometrically *inside* it, so
+armour doubles the bodies, doubles the constraints, and puts an iron-against-
+flesh mass ratio across every new one. A stiff constraint between deeply
+overlapping bodies is the textbook way to make a sequential-impulse solver gain
+energy, and the joints `Mob::Die` deliberately leaves on the corpse (see
+`corpse-intact`) spread it from one limb to all of them. That is precisely what
+"flying everywhere while still technically being attached" describes.
+
+**Why it costs minutes rather than merely looking silly.** Two multipliers that
+this document already records elsewhere. Every dynamic body is
+`EMotionQuality::LinearCast`, so once the linear velocity is large each step is
+a swept compound-shape cast against marching-cubes terrain, per body, per step.
+And the contact solve sees `v + ω × r` at every contact point — the same term
+that turned a 5-second gate into an eight-minute hang when 1e30 rad/s was
+injected past the sweep.
+
+**Three nets, in `phys/physics.cpp`:**
+
+1. **The linear ceiling comes down from Jolt's 500 m/s to 80 m/s.** 500 m/s is
+   8.3 m — 83 voxels — of `LinearCast` sweep in one 60 Hz step. Nothing in this
+   world legitimately exceeds 32 m/s (terminal velocity for a fall the height of
+   the whole residency window); `physics.explosionMaxSpeed` is 30 and
+   `ragdoll.maxLaunchSpeed` is 14. **The angular ceiling deliberately stays at
+   Jolt's value**, because ω = v/r makes a one-voxel ball rolling at 5 m/s
+   legitimately 100 rad/s, and a lower cap would make every pebble skid.
+2. **`SweepRunawayRigs`**, before every `Update`, straight after
+   `SweepInsaneVelocities` (which has already removed anything that cannot
+   safely be squared). A per-body counter rises one per step spent at 90% of
+   that body's own ceiling and falls one per quiet step, so a piece merely
+   thrown hard decays out and is never touched. Past 12 the body is damped to
+   20%; past 45 the **joints are cut** and the body is zeroed and deactivated —
+   the motor is the constraint graph, and damping a body a constraint is feeding
+   just means it is fed again next step. A corpse that comes apart is a far
+   better outcome than a game that stops. **Jointed bodies only:** a body with
+   nothing attached has nobody to feed it, and damping every rolling pebble
+   would be a more visible bug than the one being fixed.
+3. **An unusable transform is repaired, not narrated.** It used to be a
+   `fprintf` on the argument that the position is already gone and the real fix
+   is upstream. Both halves are true and it is still the wrong call, because the
+   failures are not the same size: a wrong body is one dropped limb, a NaN AABB
+   is the whole process wedged with a window that will not close. The body is
+   put back inside a finite world, zeroed and slept, and the ordinary debris
+   cull collects it. A NaN *quaternion* does the same damage by the same route
+   and is now checked too.
+
+A `Physics::Step` over 100 ms reports itself on stderr with the active-body
+count and the fastest body attached — report-only, because wall clock may not
+decide what the simulation does, but it may say what it saw.
+
+**Neither stage ships unexercised.** `SANDVOX_PHYS_FAULT=pos:<n>` writes a NaN
+position straight into a live body past every clamp (the two existing arms
+cannot produce one — the velocity checks catch their garbage before it
+integrates, which is what they are for), and `corpse-armor` drives two jointed
+spheres at the ceiling on purpose and asserts damped > 0, cut > 0, joints 1 → 0
+and a final spin of zero. `SANDVOX_NO_RUNAWAY_NET=1` is the A/B arm in one
+binary, for the same reason `SANDVOX_NO_ANTITUNNEL` exists.
+
+**What this does not do.** It bounds the symptom; it does not remove the energy
+source. The armour constraint chain is still the thing that gains energy, and
+the honest next step is to stop a `Fixed` joint between a shell and the limb it
+overlaps from pumping in the first place — the gate is in place to measure it.
+
 ### Carving living bodies (2026-08-20; `game/mob.cpp`, `MobSystem::CarveLimb*`)
 
 Limb loss used to be a threshold: a limb had hp, hp hit zero, the whole limb
